@@ -25,8 +25,6 @@ mod prefix;
 mod profile_three_fixture;
 mod profile_three_invariants;
 mod profile_three_reserve;
-mod profile_two_binding;
-mod profile_two_refusal;
 mod recovery;
 mod refusals;
 mod removed_forms;
@@ -45,6 +43,7 @@ mod r0_assay;
 mod s1_family;
 mod s1c;
 mod s1c_oracle;
+mod state_blob_gate;
 
 mod s1c_review;
 

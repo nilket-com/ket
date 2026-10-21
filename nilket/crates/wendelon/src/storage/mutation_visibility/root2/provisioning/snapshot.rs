@@ -112,10 +112,7 @@ fn validate(s: &InventorySnapshot2) -> Result<(), SnapshotError2> {
 			(_, None) => {}
 		}
 		if let Some(t) = &e.terminal {
-			if e.profile != ManifestProfile2::Three
-				|| e.state != RootState2::Retired
-				|| e.record.is_some()
-				|| t.inventory_seq != e.last_seq
+			if e.state != RootState2::Retired || e.record.is_some() || t.inventory_seq != e.last_seq
 			{
 				return Err(SnapshotError2::Binding);
 			}
@@ -144,13 +141,6 @@ fn validate(s: &InventorySnapshot2) -> Result<(), SnapshotError2> {
 }
 fn encode(s: &InventorySnapshot2) -> Result<Vec<u8>, SnapshotError2> {
 	validate(s)?;
-	// Transitional: only profile-3 entries have a tag.
-	if s.entries
-		.iter()
-		.any(|e| e.profile != ManifestProfile2::Three)
-	{
-		return Err(SnapshotError2::ProfileTag);
-	}
 	let len = HEADER + s.entries.len() * ENTRY + TRAILER;
 	let version = if s.entries.iter().any(|e| e.terminal.is_some()) {
 		VERSION_FOUR

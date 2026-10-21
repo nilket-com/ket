@@ -820,17 +820,6 @@ fn vectors_match_reference() {
 		vv("holder_preimage")
 	);
 	assert_eq!(h.signature.to_vec(), vv("holder_signature"));
-	let v: serde_json::Value =
-		serde_json::from_str(include_str!("statement_vectors.json")).unwrap();
-	let grant: [u8; 337] = unhex(v["grant"]["bytes"].as_str().unwrap())
-		.try_into()
-		.unwrap();
-	assert_eq!(
-		admin_statement_preimage2(&grant).unwrap(),
-		vv("statement_preimage")
-	);
-	assert_eq!(grant[273..].to_vec(), vv("statement_signature"));
-	assert_eq!(sv("admin_public"), vv("statement_admin_public"));
 }
 
 #[test]

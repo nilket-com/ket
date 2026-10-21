@@ -61,9 +61,6 @@ pub(super) enum BindingError2 {
 pub(super) fn trusted_manifest2(bytes: &[u8]) -> Result<TrustedManifest2, &'static str> {
 	let any = AnyAdminManifest2::decode(bytes)
 		.map_err(|_| "the trusted manifest does not decode as an administrator manifest")?;
-	if !matches!(any, AnyAdminManifest2::Three(_)) {
-		return Err("the trusted manifest is not a profile-3 manifest");
-	}
 	let pin = any_manifest_digest2(&any.encode().map_err(|_| "manifest re-encode")?);
 	Ok(TrustedManifest2 {
 		bytes: bytes.to_vec(),

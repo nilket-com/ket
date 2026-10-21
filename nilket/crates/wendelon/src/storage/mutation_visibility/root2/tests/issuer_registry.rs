@@ -365,7 +365,7 @@ fn issuer_coordinates_join_lifecycle_and_retained_original_grants() {
 	// Permission enrollment/revocation also owns non-grant coordinates.
 	let v: serde_json::Value =
 		serde_json::from_str(include_str!("root_profile_vectors.json")).unwrap();
-	let hex = v["root_with_permissions"]["hex"].as_str().unwrap();
+	let hex = v["p3_root_with_permissions"]["hex"].as_str().unwrap();
 	let b = (0..hex.len())
 		.step_by(2)
 		.map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())

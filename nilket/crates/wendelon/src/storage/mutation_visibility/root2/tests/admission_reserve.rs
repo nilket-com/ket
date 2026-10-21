@@ -858,3 +858,38 @@ fn s1_root_goldens_are_governed() {
 	assert_eq!(n.state.parents.len(), 2);
 	assert_eq!(n.state.permissions.len(), 1);
 }
+/// r1 §5, at c2: every root is governed, and its commitment length is the profile-3 manifest's.
+/// The marker is state-only: 241 is governed (a Reserve without its permission is Denied(18));
+/// every other length is not a class at all (`ControlClass`). Moved here at c2.
+#[test]
+fn admission_governed_marker_is_the_profile_three_length() {
+	use super::profile_three_fixture::{M3_PRIMARY, chain_of};
+	use crate::storage::mutation_visibility::root2::validation::admission_permission;
+	let v: serde_json::Value = serde_json::from_str(include_str!("reserve_vectors.json")).unwrap();
+	// The first generated Reserve claim; its validity is not under test, only the marker.
+	let claim = v["commands"]
+		.as_object()
+		.unwrap()
+		.values()
+		.find_map(
+			|h| match Command2::decode(&unhex(h.as_str().unwrap())).unwrap().2 {
+				Command2::Reserve(claim) => Some(claim),
+				_ => None,
+			},
+		)
+		.unwrap();
+	let base = chain_of(&M3_PRIMARY, 241).rooted;
+	for length in (0..=242).chain([u64::MAX]) {
+		let s = with_control_len_for_test(&base, length);
+		let state = &root_and_origin2(&s).unwrap().0.state;
+		if length == 241 {
+			assert_eq!(admission_permission(state, &claim, 5), Ok(Some((18, None))));
+		} else {
+			assert_eq!(
+				admission_permission(state, &claim, 5),
+				Err(RootError2::ControlClass),
+				"{length}"
+			);
+		}
+	}
+}

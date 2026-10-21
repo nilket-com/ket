@@ -1187,7 +1187,6 @@ fn admin_items(file: &syn::File) -> Option<Vec<String>> {
 						"BootstrapRecord2",
 						"BootstrapObservation2",
 						"GovernanceRole2",
-						"AdminManifestTwo2",
 						"ManifestBytes2",
 						"RecoveryRole3",
 						"AdminManifestThree3",
@@ -1272,49 +1271,57 @@ fn admin_manifest_math_stays_private_and_has_no_provenance_producer() {
 		);
 	}
 	entrypoints.sort();
+	assert_eq!(entrypoints, ADMIN_ENTRYPOINTS);
+	// The profile-3-only census: decode x4, encode x4, new x3, base x1, governance x1.
+	let count = |n: &str| entrypoints.iter().filter(|e| *e == n).count();
 	assert_eq!(
-		entrypoints,
-		[
-			"actions",
-			"actions",
-			"admin_manifest_digest2",
-			"admin_manifest_two_digest2",
-			"admission",
-			"any_manifest_digest2",
-			"as_slice",
-			"base",
-			"base",
-			"check_admin_manifest_digest2",
-			"check_enrollable_admin_key2",
-			"decode",
-			"decode",
-			"decode",
-			"decode",
-			"decode",
-			"decode",
-			"encode",
-			"encode",
-			"encode",
-			"encode",
-			"encode",
-			"encode",
-			"first_mismatch",
-			"governance",
-			"governance",
-			"id",
-			"id",
-			"key",
-			"key",
-			"manifest_profile2",
-			"new",
-			"new",
-			"new",
-			"new",
-			"profile",
-			"recovery",
-		]
+		["decode", "encode", "new", "base", "governance"].map(count),
+		[4, 4, 3, 1, 1]
 	);
+	// Probe: a re-added digest entrypoint is a different census.
+	let mut probe = entrypoints.clone();
+	probe.extend(
+		admin_items(
+			&syn::parse_file(
+				"pub(in crate::storage::mutation_visibility::root2) fn legacy_digest2() {}",
+			)
+			.unwrap(),
+		)
+		.unwrap(),
+	);
+	probe.sort();
+	assert_ne!(probe, ADMIN_ENTRYPOINTS);
 }
+// The admin entrypoints once profile 3 is the only manifest form (c2): no profile-1/2 codec,
+// digest, digest check or structural peek remains.
+const ADMIN_ENTRYPOINTS: [&str; 26] = [
+	"actions",
+	"actions",
+	"admission",
+	"any_manifest_digest2",
+	"as_slice",
+	"base",
+	"check_enrollable_admin_key2",
+	"decode",
+	"decode",
+	"decode",
+	"decode",
+	"encode",
+	"encode",
+	"encode",
+	"encode",
+	"first_mismatch",
+	"governance",
+	"id",
+	"id",
+	"key",
+	"key",
+	"new",
+	"new",
+	"new",
+	"profile",
+	"recovery",
+];
 #[test]
 fn admin_guard_negative_examples_reject_widening_constructors_signing_and_io() {
 	for text in [
@@ -4749,215 +4756,112 @@ fn command_verification_is_single_site_and_unwired() {
 	);
 }
 
-// The pure VISADC01 administrator command envelope check: an exact item census; no signing, I/O,
-// clock, network, spawn, serde or authority construction (no VerifiedCommand2, TrustedEntry2,
-// CommittedEntry2 or Root2); the checked token is built only inside check_admin_command2; nothing
-// outside the module and the root2 tests names its surface. Syntax checks, not compiler resolution.
+// VISADC01 is deleted (c2, D-C1) and the operator-proof facade refuses the form outright. Successor
+// of the deleted VISADC01 census; its module name is a manifest-codec tombstone. Probed by
+// removing the facade arm.
+fn visadc01_facade_refuses(proof_rs: &str) -> bool {
+	let squash = |t: &str| t.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+	squash(proof_rs).contains("Some(b\"VISADC01\")=>returnErr(P::NoProductionForm),")
+}
 #[test]
-fn admin_command_envelope_is_pure_and_unwired() {
-	let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
-	let root = src.join("storage/mutation_visibility/root2");
-	let text = fs::read_to_string(root.join("admin_command.rs")).unwrap();
-	assert!(text.lines().count() <= 250);
-	let flat = without_test_items_deep(text.parse().unwrap())
-		.to_string()
-		.replace(' ', "");
-	// Identifier tokens only: doc comments are literals and may name the types they exclude.
-	fn idents(tokens: proc_macro2::TokenStream, out: &mut Vec<String>) {
-		for t in tokens {
-			match t {
-				proc_macro2::TokenTree::Ident(id) => out.push(id.to_string()),
-				proc_macro2::TokenTree::Group(g) => idents(g.stream(), out),
-				_ => {}
-			}
-		}
-	}
-	let mut names = Vec::new();
-	idents(without_test_items_deep(text.parse().unwrap()), &mut names);
-	for banned in [
-		"SigningKey",
-		"Signer",
-		"sign",
-		"fs",
-		"io",
-		"net",
-		"tokio",
-		"spawn",
-		"Instant",
-		"SystemTime",
-		"unsafe",
-		"serde",
-		"VerifiedCommand2",
-		"TrustedEntry2",
-		"CommittedEntry2",
-		"Root2",
-		"install_admin2",
-	] {
-		assert!(
-			!names.iter().any(|n| n == banned),
-			"admin_command.rs: {banned}"
-		);
-	}
-	// The checked token: declared, given accessors, and constructed exactly once, inside the check.
-	assert_eq!(flat.matches("(CheckedAdminCommand2{").count(), 1);
-	assert!(fn_body(&text, "check_admin_command2").contains("Ok(CheckedAdminCommand2 {"));
-	assert_eq!(flat.matches("verify_strict(").count(), 1);
-	let file = syn::parse_file(&text).unwrap();
-	let (mut types, mut exported, mut private, mut consts) = (vec![], vec![], vec![], vec![]);
-	for item in &file.items {
-		match item {
-			syn::Item::Fn(f) if root2_scoped(&f.vis) => exported.push(f.sig.ident.to_string()),
-			syn::Item::Fn(f) => {
-				assert!(matches!(f.vis, syn::Visibility::Inherited));
-				private.push(f.sig.ident.to_string())
-			}
-			syn::Item::Enum(e) => {
-				assert!(root2_scoped(&e.vis));
-				types.push(e.ident.to_string())
-			}
-			syn::Item::Struct(s) => {
-				assert!(root2_scoped(&s.vis));
-				assert!(
-					s.attrs.iter().all(|a| !a.path().is_ident("derive")),
-					"no derive"
-				);
-				for f in &s.fields {
-					assert!(
-						matches!(f.vis, syn::Visibility::Inherited),
-						"private fields"
-					);
-				}
-				types.push(s.ident.to_string())
-			}
-			syn::Item::Const(c) => consts.push((c.ident.to_string(), root2_scoped(&c.vis))),
-			syn::Item::Impl(i) => {
-				assert!(i.trait_.is_none(), "no trait impls");
-				let mut fns: Vec<_> = i
-					.items
-					.iter()
-					.map(|x| match x {
-						syn::ImplItem::Fn(m) => m.sig.ident.to_string(),
-						_ => panic!("impl items are methods only"),
-					})
-					.collect();
-				fns.sort();
-				assert_eq!(fns, ["command_digest", "context"]);
-			}
-			syn::Item::Use(_) | syn::Item::Macro(_) => {}
-			_ => panic!("admin_command.rs: unexpected item"),
-		}
-	}
-	types.sort();
-	exported.sort();
-	private.sort();
-	consts.sort();
-	assert_eq!(
-		types,
-		["CheckedAdminCommand2", "EnvelopeError2", "EnvelopeField2"]
-	);
-	assert_eq!(
-		exported,
-		[
-			"admin_command_preimage2",
-			"check_admin_command2",
-			"encode_admin_command2"
-		]
-	);
-	assert_eq!(
-		private,
-		["array", "check_context", "parse", "u64_at", "write"]
-	);
-	assert_eq!(
-		consts,
-		[
-			("ADMIN_COMMAND_BYTES2".to_string(), true),
-			("DOMAIN".to_string(), false),
-			("MAGIC".to_string(), false),
-			("SIGNED".to_string(), false),
-			("VERSION".to_string(), false)
-		]
-	);
-	// Dormant: nothing outside the module and the root2 tests names its surface.
-	let tests = root.join("tests");
-	let mut stack = vec![src];
-	while let Some(dir) = stack.pop() {
-		for e in fs::read_dir(dir).unwrap() {
-			let p = e.unwrap().path();
-			if p.is_dir() {
-				if p != tests {
-					stack.push(p);
-				}
-			} else if p.extension().is_some_and(|x| x == "rs")
-				&& !p.ends_with("root2/admin_command.rs")
-			{
-				let t = fs::read_to_string(&p).unwrap();
-				for name in [
-					"check_admin_command2",
-					"admin_command_preimage2",
-					"encode_admin_command2",
-					"CheckedAdminCommand2",
-					"EnvelopeError2",
-					"root2::admin_command",
-				] {
-					assert!(
-						!t.contains(name),
-						"production caller of {name} in {}",
-						p.display()
-					);
-				}
-			}
-		}
-	}
+fn visadc01_is_deleted_and_the_facade_refuses_it() {
+	let root =
+		PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/storage/mutation_visibility/root2");
+	let proof = fs::read_to_string(root.join("operator_proof/proof.rs")).unwrap();
+	assert!(visadc01_facade_refuses(&proof));
+	let arm = "Some(b\"VISADC01\") => return Err(P::NoProductionForm),";
+	assert!(proof.contains(arm));
+	assert!(!visadc01_facade_refuses(&proof.replace(arm, "")));
 }
 
-// Profile-2 manifest codec (M1): additive and dormant. Exact census of the new items in
-// admin/manifest.rs (struct fields private, the enums' two variants, the constants) and no
-// production name of them outside src/.../admin and the test modules, except the exact M2
-// per-file allowances in the owner/inventory/snapshot propagation. Syntax only.
+// The manifest names each production file may use only under its exact allowance.
+const TRACKED: [&str; 8] = [
+	"AdminManifestThree3",
+	"GovernanceRole2",
+	"ManifestProfile2",
+	"AnyAdminManifest2",
+	"ManifestBytes2",
+	"any_manifest_digest2",
+	"RecoveryRole3",
+	"ADMIN_MANIFEST_P3_BYTES3",
+];
+// The tombstone list of manifest_codec_census_is_exact_and_dormant: the removed profile-1/2,
+// class-0, VISADC01 and v1-directory names, which no root2 production file may name again.
+const TOMBSTONES: [&str; 17] = [
+	"AdminManifestTwo2",
+	"admin_manifest_two_digest2",
+	"manifest_profile2",
+	"ADMIN_MANIFEST_P2_BYTES2",
+	"ADMIN_MANIFEST_BYTES2",
+	"admin_manifest_digest2",
+	"check_admin_manifest_digest2",
+	"PROFILE_ONE",
+	"PROFILE_TWO",
+	"ProfileLength",
+	"RoleReuse",
+	"AdminClass2",
+	"LegacyNonManifestZero",
+	"admin_command",
+	"DirectoryFormat2",
+	"VISREP03",
+	"VERSION_TWO",
+];
+// The manifest codec census (renamed at c2 from the profile-2 census): profile 3 is the only form.
+// Exact census of admin/manifest.rs (struct fields private, the profile and manifest enums, the
+// constants) and no production name of a manifest item outside src/.../admin and the test
+// modules, except the exact per-file allowances. The tombstone names below must never return.
+// Syntax only.
 #[test]
-fn profile_two_manifest_codec_is_additive_and_dormant() {
+fn manifest_codec_census_is_exact_and_dormant() {
 	let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
 	let root = src.join("storage/mutation_visibility/root2");
 	let text = fs::read_to_string(root.join("admin/manifest.rs")).unwrap();
 	let file = syn::parse_file(&text).unwrap();
 	let mut consts = Vec::new();
+	let mut structs = Vec::new();
 	for item in &file.items {
 		match item {
-			syn::Item::Struct(s)
-				if s.ident == "GovernanceRole2"
-					|| s.ident == "AdminManifestTwo2"
-					|| s.ident == "ManifestBytes2"
-					|| s.ident == "RecoveryRole3"
-					|| s.ident == "AdminManifestThree3" =>
-			{
+			syn::Item::Struct(s) => {
 				let fields: Vec<_> = s
 					.fields
 					.iter()
 					.map(|f| {
-						assert!(
-							matches!(f.vis, syn::Visibility::Inherited),
-							"private fields"
-						);
+						if s.ident != "AdminManifest2" && s.ident != "AdminNamespace2" {
+							assert!(
+								matches!(f.vis, syn::Visibility::Inherited),
+								"private fields"
+							);
+						}
 						f.ident.as_ref().unwrap().to_string()
 					})
 					.collect();
 				let want: &[&str] = match s.ident.to_string().as_str() {
 					"GovernanceRole2" | "RecoveryRole3" => &["id", "key"],
 					"AdminManifestThree3" => &["base", "governance", "recovery"],
-					"AdminManifestTwo2" => &["base", "governance"],
-					_ => &["storage", "len"],
+					"ManifestBytes2" => &["storage", "len"],
+					"AdminManifest2" => &[
+						"generation",
+						"cluster",
+						"initial_epoch",
+						"admin_id",
+						"admin_key",
+						"namespace",
+					],
+					"AdminNamespace2" => &["tenant", "scope", "table", "schema"],
+					other => panic!("unexpected struct {other}"),
 				};
 				assert_eq!(fields, want);
+				structs.push(s.ident.to_string());
 			}
 			syn::Item::Enum(e) if e.ident == "ManifestProfile2" => {
 				let v: Vec<_> = e.variants.iter().map(|v| v.ident.to_string()).collect();
-				assert_eq!(v, ["One", "Two", "Three"]);
+				assert_eq!(v, ["Three"]);
 				assert!(
 					e.variants.iter().all(|v| v.fields.is_empty()),
 					"no role data"
 				);
 			}
-			// M2: exactly one manifest per variant, no conversion and no third shape.
+			// Exactly one manifest shape, no conversion.
 			syn::Item::Enum(e) if e.ident == "AnyAdminManifest2" => {
 				let v: Vec<_> = e
 					.variants
@@ -4972,55 +4876,53 @@ fn profile_two_manifest_codec_is_additive_and_dormant() {
 					.collect();
 				assert_eq!(
 					v,
-					[
-						("One".to_string(), "AdminManifest2".to_string()),
-						("Two".to_string(), "AdminManifestTwo2".to_string()),
-						("Three".to_string(), "AdminManifestThree3".to_string())
-					]
+					[("Three".to_string(), "AdminManifestThree3".to_string())]
 				);
 			}
+			syn::Item::Enum(e) => panic!("unexpected enum {}", e.ident),
 			syn::Item::Const(c) => consts.push((c.ident.to_string(), root2_scoped(&c.vis))),
 			_ => {}
 		}
 	}
+	structs.sort();
+	assert_eq!(
+		structs,
+		[
+			"AdminManifest2",
+			"AdminManifestThree3",
+			"AdminNamespace2",
+			"GovernanceRole2",
+			"ManifestBytes2",
+			"RecoveryRole3"
+		]
+	);
 	consts.sort();
 	assert_eq!(
 		consts,
 		[
 			("ACTIONS".to_string(), false),
-			("ADMIN_MANIFEST_BYTES2".to_string(), true),
-			("ADMIN_MANIFEST_P2_BYTES2".to_string(), true),
 			("ADMIN_MANIFEST_P3_BYTES3".to_string(), true),
 			("ADMIN_MANIFEST_READ_BOUND2".to_string(), true),
 			("DOMAIN".to_string(), false),
 			("GOVERNANCE_ACTIONS".to_string(), false),
 			("MAGIC".to_string(), false),
-			("PROFILE_ONE".to_string(), false),
-			("PROFILE_TWO".to_string(), false),
 			("RECOVERY_ACTIONS3".to_string(), false)
 		]
 	);
-	// The profile-1 decoder is untouched by profile 2: it never names the new items.
-	let decode = fn_body(&text, "decode");
-	assert!(!decode.contains("PROFILE_TWO") && !decode.contains("GovernanceRole2"));
-	// ManifestBytes2 is built at exactly one site (the end of AnyAdminManifest2::encode):
+	// ManifestBytes2 is built at exactly one site (the end of the manifest enum's encode):
 	// the declaration, its impl and that one literal.
 	assert_eq!(text.matches("ManifestBytes2 {").count(), 3);
 	assert_eq!(
 		text.matches("Ok(ManifestBytes2 { storage, len })").count(),
 		1
 	);
-	// Dormant: no production file outside admin/ names a profile-2 item, except these exact
-	// allowances: M2 (owner request -> event -> fold -> snapshot) and M3 (replica tuple, install,
-	// the governed marker). The issuer gate and C's verification use the length accessors only.
+	// Dormant: no production file outside admin/ names a manifest item, except these exact
+	// allowances: the owner request -> event -> fold -> snapshot path, the replica tuple, install,
+	// the governed marker and C's Bootstrap length conjunct (§4.2).
 	let allowed: &[(&str, &[&str])] = &[
 		(
 			"provisioning/inventory.rs",
-			&[
-				"ManifestProfile2",
-				"AnyAdminManifest2",
-				"any_manifest_digest2",
-			],
+			&["AnyAdminManifest2", "any_manifest_digest2"],
 		),
 		("provisioning/inventory/v2.rs", &["AnyAdminManifest2"]),
 		(
@@ -5031,10 +4933,7 @@ fn profile_two_manifest_codec_is_additive_and_dormant() {
 				"any_manifest_digest2",
 			],
 		),
-		(
-			"provisioning/owner_core/v2.rs",
-			&["any_manifest_digest2", "ManifestProfile2"],
-		),
+		("provisioning/owner_core/v2.rs", &["any_manifest_digest2"]),
 		("provisioning/snapshot.rs", &["ManifestProfile2"]),
 		(
 			"provisioning/terminal.rs",
@@ -5060,16 +4959,13 @@ fn profile_two_manifest_codec_is_additive_and_dormant() {
 			&[
 				"GovernanceRole2",
 				"ManifestProfile2",
-				"ADMIN_MANIFEST_P2_BYTES2",
 				"AnyAdminManifest2",
 				"RecoveryRole3",
 				"ADMIN_MANIFEST_P3_BYTES3",
 			],
 		),
-		(
-			"validation.rs",
-			&["ADMIN_MANIFEST_P2_BYTES2", "ADMIN_MANIFEST_P3_BYTES3"],
-		),
+		("validation.rs", &["ADMIN_MANIFEST_P3_BYTES3"]),
+		("verification.rs", &["ADMIN_MANIFEST_P3_BYTES3"]),
 		("governance_command.rs", &[]),
 		("role_epochs.rs", &["ADMIN_MANIFEST_P3_BYTES3"]),
 		("role_freeze.rs", &["ADMIN_MANIFEST_P3_BYTES3"]),
@@ -5117,20 +5013,7 @@ fn profile_two_manifest_codec_is_additive_and_dormant() {
 					.iter()
 					.find(|(f, _)| p == root.join(f))
 					.map_or(&[][..], |(_, names)| *names);
-				for name in [
-					"AdminManifestTwo2",
-					"GovernanceRole2",
-					"ManifestProfile2",
-					"admin_manifest_two_digest2",
-					"manifest_profile2",
-					"ADMIN_MANIFEST_P2_BYTES2",
-					"AnyAdminManifest2",
-					"ManifestBytes2",
-					"any_manifest_digest2",
-					"AdminManifestThree3",
-					"RecoveryRole3",
-					"ADMIN_MANIFEST_P3_BYTES3",
-				] {
+				for name in TRACKED {
 					assert_eq!(
 						t.contains(name),
 						allowance.contains(&name),
@@ -5138,9 +5021,23 @@ fn profile_two_manifest_codec_is_additive_and_dormant() {
 						p.display()
 					);
 				}
+				// The tombstones are root2 names; other subsystems may reuse a word.
+				if p.starts_with(&root) {
+					for name in TOMBSTONES {
+						assert!(!t.contains(name), "tombstone {name} in {}", p.display());
+					}
+				}
 			}
 		}
 	}
+	// Probes: a tombstone name, or a tracked name outside its allowance, in a synthetic production
+	// file is caught by the same per-name checks.
+	let probe = format!(
+		"mod {};\nfn f() -> ManifestBytes2 {{ todo!() }}",
+		TOMBSTONES[13]
+	);
+	assert!(TOMBSTONES.iter().any(|n| probe.contains(n)));
+	assert!(TRACKED.iter().any(|n| probe.contains(n)));
 }
 
 // The frozen old-reader copies are deleted (c1, §14.1): no `.in` file exists under src and no
@@ -5194,7 +5091,8 @@ fn no_vendored_reader_copy_exists_under_src() {
 
 // Directory format 2 is the only owner format (c1, D-O1): `open` refuses an unmarked directory with
 // `Unformatted` and a marked one holding a VISIEV02 log with `ForeignFormat`; the framing check and
-// the log read refuse VISIEV02; no format dispatch exists. Text pins, each probed by a mutation.
+// the log read refuse VISIEV02; the format-dispatch type name is a manifest-codec tombstone. Text
+// pins, each probed by a mutation.
 fn owner_directory_is_format_two_only(directory: &str, ops: &str) -> Result<(), &'static str> {
 	let squash = |t: &str| t.chars().filter(|c| !c.is_whitespace()).collect::<String>();
 	let open = directory
@@ -5225,9 +5123,6 @@ fn owner_directory_is_format_two_only(directory: &str, ops: &str) -> Result<(), 
 		.contains("ifbytes.starts_with(b\"VISIEV02\"){returnErr(OwnerIoError2::ForeignFormat);}")
 	{
 		return Err("log read accepts VISIEV02");
-	}
-	if directory.contains("DirectoryFormat2") || ops.contains("DirectoryFormat2") {
-		return Err("format dispatch");
 	}
 	Ok(())
 }
@@ -5270,18 +5165,14 @@ fn owner_directory_refuses_unmarked_and_v1_directories() {
 		),
 		Err("log read accepts VISIEV02")
 	);
-	assert_eq!(
-		owner_directory_is_format_two_only(&format!("{directory}\n// DirectoryFormat2"), &ops),
-		Err("format dispatch")
-	);
 }
 
-// M3: the profile-2 binding surface, exactly. Syntactic regression pins only (no name resolution,
+// M3: the administrator binding surface, exactly (renamed at c2). Syntactic regression pins only (no name resolution,
 // no proof against aliases or forwarding): the installed governance role is a descriptive copy
 // that no production code outside the admin codec reads, the installed view's fields and the tuple
 // field variants are exact, and the descriptive accessor has no production caller.
 #[test]
-fn profile_two_binding_surface_is_exact() {
+fn admin_binding_surface_is_exact() {
 	let root =
 		PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/storage/mutation_visibility/root2");
 	let install = fs::read_to_string(root.join("admin_install.rs")).unwrap();

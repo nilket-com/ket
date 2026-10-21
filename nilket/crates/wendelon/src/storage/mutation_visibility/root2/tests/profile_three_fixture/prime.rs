@@ -43,8 +43,6 @@ fn prime_is_its_constructor_build_with_a_pinned_digest() {
 	assert_eq!(sv_hex(&v["p3_manifest"]), M3_PRIME);
 	assert_eq!(sv_hex(&v["p3_manifest_pin"]), exact_pin(&M3_PRIME));
 	assert_eq!(sv_hex(&v["p3_admin_public"]), key(PRIME_ADMIN_SEED));
-	// The permission key is unchanged: M3_PRIME keeps the fixture's generation and namespace.
-	assert_eq!(v["p3_key"], v["key"]);
 }
 
 /// D-G3: each generated KAT statement is the Rust signature, by the published administrator seed,

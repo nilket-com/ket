@@ -2,7 +2,7 @@
 //! 01a12e44). On a coherent profile-3 governed root, an otherwise eligible Reserve is a consumed
 //! Denied(18) without its exact Admission permission, reserves once the permission is active, and
 //! is Denied(19) at the revocation coordinate after revocation; every step validates and
-//! round-trips. Fixture cut: `manifest_prime`'s Admission fields with the TEST administrator seed
+//! round-trips. Fixture cut: the G1d fixture manifest's Admission fields with the TEST administrator seed
 //! 0x5A (as `admin_command_reference.py`) and a TEST governance role, built through the published
 //! profile-3 constructors; the root, tuple and token builders are test-only FIXTURES, and the
 //! selector/authority/lineage/Reserve commands are the independent `reserve_vectors.json`. The
@@ -27,14 +27,11 @@ fn unhex(s: &str) -> Vec<u8> {
 		.map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
 		.collect()
 }
-fn sv() -> serde_json::Value {
-	serde_json::from_str(include_str!("statement_vectors.json")).unwrap()
-}
 fn rv() -> serde_json::Value {
 	serde_json::from_str(include_str!("reserve_vectors.json")).unwrap()
 }
 const ADMIN_SEED: u8 = 0x5A;
-/// `manifest_prime`'s Admission fields, inline (its own admin key, replaced below by the TEST
+/// the G1d fixture manifest's Admission fields, inline (its own admin key, replaced below by the TEST
 /// administrator seed).
 const PRIME_FIELDS: AdminManifest2 = AdminManifest2 {
 	generation: [0xa1; 16],
@@ -53,15 +50,7 @@ const PRIME_FIELDS: AdminManifest2 = AdminManifest2 {
 		schema: 2,
 	},
 };
-/// Bridge, deleted with the profile-1 decoder in c2: the inline fields are today's decoded
-/// `manifest_prime`, field for field.
-#[test]
-fn inline_prime_fields_equal_the_decoded_manifest_prime() {
-	let decoded = AdminManifest2::decode(&unhex(sv()["manifest_prime"].as_str().unwrap())).unwrap();
-	assert!(decoded == PRIME_FIELDS);
-	assert_eq!(decoded.encode().unwrap(), PRIME_FIELDS.encode().unwrap());
-}
-/// `manifest_prime` with the TEST admin key, upgraded to profile 3 with TEST governance and
+/// The G1d fixture manifest with the TEST admin key, upgraded to profile 3 with TEST governance and
 /// recovery roles: the shared `M3_PRIME` fixture.
 fn manifest_three() -> Vec<u8> {
 	let mut base = PRIME_FIELDS;

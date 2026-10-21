@@ -496,7 +496,7 @@ impl OwnerDir2 {
 			.iter()
 			.find(|r| r.identity == *identity)
 			.ok_or(OwnerIoError2::ExportNoSuchRoot)?;
-		if root.state != RootState2::Retired || root.manifest.profile() != ManifestProfile2::Three {
+		if root.state != RootState2::Retired {
 			return Err(OwnerIoError2::ExportNotTerminal(root.state));
 		}
 		// Every Retired root carries its terminal record: plain Retire no longer exists.

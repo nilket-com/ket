@@ -419,7 +419,7 @@ fn evidence_decode_checks_in_order() {
 	);
 	assert_eq!(check(&good[..156]), Some(Length));
 	assert_eq!(check(&vec![0; MAX_EVIDENCE_BYTES2 + 1]), Some(Length));
-	assert_eq!(check(&patched(0, b"VISREP03")), Some(Magic));
+	assert_eq!(check(&patched(0, b"VISREPXX")), Some(Magic));
 	assert_eq!(check(&patched(8, &2u16.to_le_bytes())), Some(Version));
 	assert_eq!(check(&patched(10, &[1])), Some(Format));
 	assert_eq!(check(&patched(64, &[1])), Some(Reserved));

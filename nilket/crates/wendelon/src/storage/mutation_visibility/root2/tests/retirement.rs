@@ -354,6 +354,16 @@ fn terminal_confirmation_mismatch_closure_and_mark_refusals() {
 		confirm_terminal2(&f.f.state, &other.pin).err(),
 		Some(InstallError2::Commitment(CommitmentField2::ControlDigest))
 	);
+	// admin_install.rs:304-305 (§4.1 invariant, IMPL-NOTES c2): its own tuple, against a retired
+	// state committed to any length but 241, is refused at the length; at 241 it confirms.
+	assert!(confirm_terminal2(&f.f.state, &f.f.pin).is_ok());
+	for wrong in [240, 242] {
+		assert_eq!(
+			confirm_terminal2(&with_control_len_for_test(&f.f.state, wrong), &f.f.pin).err(),
+			Some(InstallError2::Commitment(CommitmentField2::ControlLength)),
+			"{wrong}"
+		);
+	}
 }
 #[test]
 fn denied25_encode_decode_none_and_reference_refusal() {

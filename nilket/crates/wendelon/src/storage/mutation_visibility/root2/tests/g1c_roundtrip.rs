@@ -58,9 +58,6 @@ fn unhex(s: &str) -> Vec<u8> {
 		.map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
 		.collect()
 }
-// The profile-1 anchor manifest m1's pin (inlined at c1 from the removed `anchor_vectors.json`
-// key); only the legacy length-0 Bootstrap row still commits to it, until c2.
-const M1_PIN: &str = "9ff7fc086037177bfd8046f790a5765cb23c3cb30a69b7118ce4d793e14fefc2";
 fn canonical_genesis() -> Digest2 {
 	let v: serde_json::Value = serde_json::from_str(include_str!("install_vectors.json")).unwrap();
 	unhex(v["genesis"].as_str().unwrap()).try_into().unwrap()
@@ -77,13 +74,6 @@ struct Boot {
 	index: u64,
 }
 impl Boot {
-	fn standard() -> Self {
-		Self {
-			control: unhex(M1_PIN).try_into().unwrap(),
-			length: 137,
-			index: 2,
-		}
-	}
 	fn pre_root(&self) -> MutationAuthorityState2 {
 		let genesis =
 			CommittedEntry2::fixture(at(0, 0, 0), canonical_genesis(), EntryClass2::Membership);
@@ -272,16 +262,6 @@ fn observe_refusals() {
 			"{wrong}"
 		);
 	}
-	// Legacy zero is a valid raw-math class but never an installable manifest.
-	let short = Boot {
-		length: 0,
-		..Boot::standard()
-	}
-	.rooted();
-	assert_eq!(
-		observe_bootstrap2(&short).err(),
-		Some(ObserveError2::ControlLength)
-	);
 	// ObserveError2::Codec is defensive and unreachable through accepted transitions: Bootstrap
 	// refuses a zero epoch, the fixtures refuse zero generation or cluster, and an invalid Log2
 	// never reaches a rooted state. A zero control digest is not refused by the observation codec.

@@ -17,7 +17,7 @@ use super::*;
 use crate::storage::mutation_visibility::MutationScope;
 use crate::storage::mutation_visibility::root2::admin::manifest::{
 	AdminManifest2, AdminManifestThree3, AdminNamespace2, AnyAdminManifest2, GovernanceRole2,
-	RecoveryRole3, admin_manifest_digest2, admin_manifest_two_digest2,
+	RecoveryRole3,
 };
 use crate::storage::mutation_visibility::root2::admin::record::BootstrapRecord2;
 use crate::storage::mutation_visibility::root2::admin_install::*;
@@ -76,7 +76,7 @@ pub(super) fn key(seed: u8) -> Digest2 {
 	public(&[seed; 32])
 }
 
-/// Bytes 12..137 of the M2 profile-2 manifest "b", parsed by field (admin seed 0x42).
+/// The admission fields of the support fixtures (from the former profile-2 manifest "b"), by field.
 pub(super) const BASE_B: AdminManifest2 = AdminManifest2 {
 	generation: [0x42; 16],
 	cluster: [0x4d; 16],
@@ -337,15 +337,8 @@ fn at(term: u64, node: u32, index: u64) -> EntryPosition2 {
 }
 /// The digest over the exact supplied manifest bytes, by length.
 pub(super) fn exact_pin(bytes: &[u8]) -> Digest2 {
-	match bytes.len() {
-		137 => admin_manifest_digest2(bytes.try_into().unwrap()),
-		189 => admin_manifest_two_digest2(bytes.try_into().unwrap()),
-		241 => crate::storage::mutation_visibility::root2::codec::hash(
-			b"VISROOT2-ADMIN-MANIFEST\0",
-			bytes,
-		),
-		n => panic!("no canonical length {n}"),
-	}
+	assert_eq!(bytes.len(), 241, "the one canonical manifest length");
+	crate::storage::mutation_visibility::root2::codec::hash(b"VISROOT2-ADMIN-MANIFEST\0", bytes)
 }
 /// A coherent Part A tuple for this exact profile-3 manifest whose single Bound record is `record`,
 /// over the v3 snapshot; Part A must accept it.

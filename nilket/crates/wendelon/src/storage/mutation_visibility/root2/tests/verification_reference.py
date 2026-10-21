@@ -41,12 +41,6 @@ holder_preimage = unhex(AUTH["holder_preimage"])
 admission_signature = key.sign(admission_preimage)
 holder_signature = key.sign(holder_preimage)
 
-statement = unhex(STATEMENT["grant"]["bytes"])
-assert len(statement) == STATEMENT_BYTES
-statement_preimage = DOMAIN + statement[:SIGNED]
-admin_public = unhex(STATEMENT["admin_public"])
-Ed25519PublicKey.from_public_bytes(admin_public).verify(statement[SIGNED:], statement_preimage)
-
 # The profile-3 (M3_PRIME) grant, verified the same way under its published administrator key.
 p3_statement = unhex(STATEMENT["p3_grant"]["bytes"])
 assert len(p3_statement) == STATEMENT_BYTES
@@ -68,10 +62,6 @@ json.dump(
         "admission_signature": admission_signature.hex(),
         "holder_preimage": holder_preimage.hex(),
         "holder_signature": holder_signature.hex(),
-        "statement_preimage": statement_preimage.hex(),
-        "statement_signature": statement[SIGNED:].hex(),
-        "statement_admin_public": admin_public.hex(),
-        "statement_verified": True,
         "p3_statement_preimage": p3_preimage.hex(),
         "p3_statement_signature": p3_statement[SIGNED:].hex(),
         "p3_statement_admin_public": p3_admin_public.hex(),

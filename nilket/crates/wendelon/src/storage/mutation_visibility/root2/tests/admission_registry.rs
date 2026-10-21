@@ -26,7 +26,7 @@ fn vectors(field: &str) -> Vec<u8> {
 fn grant_statement() -> Vec<u8> {
 	let v: serde_json::Value =
 		serde_json::from_str(include_str!("statement_vectors.json")).unwrap();
-	unhex(v["grant"]["bytes"].as_str().unwrap())
+	unhex(v["p3_grant"]["bytes"].as_str().unwrap())
 }
 fn auth(id: u8, revision: u64) -> AuthorityRef2 {
 	AuthorityRef2 {
