@@ -4,6 +4,7 @@ use crate::crypto::CryptoManager;
 use crate::storage::io_uring::spawn_io_thread;
 use crate::storage::manager::{SlabManager, SlabManagerConfig};
 use crate::test_support::TestDir;
+use std::future::Future;
 #[path = "scope_assertions.rs"]
 mod scope_assertions;
 use scope_assertions::{Scope, ScopeAdapter};
@@ -324,79 +325,70 @@ async fn b1d_gate_waiter_and_new_caller_retain_same_arc_and_serialize() {
 		.await
 		.unwrap();
 	let key = ReplicaOpKey2::new(node(1), tenant(7), 1).unwrap();
-	let a = f.service.op_locks.entry(key).or_default().clone();
-	let a_guard = a.lock().await;
-	let w = f.service.op_locks.entry(key).or_default().clone();
-	let mut w_wait = Box::pin(w.lock());
-	blocked(w_wait.as_mut()).await;
-	assert_eq!(Arc::strong_count(&a), 3);
-	// Exercise the pending-removing phase under A's held gate, without a runtime hook.
+	let owner = ReplicaGate::admit(&f.service, key).await;
+	let identity = owner.identity.clone();
+	let mut waiter = Box::pin(ReplicaGate::admit(&f.service, key));
+	blocked(waiter.as_mut()).await;
+	// Preserve the original pending-to-absent transition under the held owner.
 	let (_, removed) = f.service.pending.remove(&key).unwrap();
 	f.slab
 		.counter_unindex_tentative(removed.tenant_id, removed.key_identity, removed.location);
 	assert!(!f.service.pending.contains_key(&key));
-	f.service.reclaim_gate2(key, &a);
 	assert!(f.service.op_locks.contains_key(&key));
-	let n = f.service.op_locks.entry(key).or_default().clone();
-	assert!(Arc::ptr_eq(&a, &w));
-	assert!(Arc::ptr_eq(&w, &n));
-	let mut n_wait = Box::pin(n.lock());
-	blocked(n_wait.as_mut()).await;
-	drop(a_guard);
-	drop(a);
-	let w_guard = w_wait.await;
-	blocked(n_wait.as_mut()).await;
-	f.service.reclaim_gate2(key, &w);
-	assert!(f.service.op_locks.contains_key(&key));
-	drop(w_guard);
-	drop(w);
-	let n_guard = n_wait.await;
-	f.service.reclaim_gate2(key, &n);
-	assert!(!f.service.op_locks.contains_key(&key));
-	drop(n_guard);
+	assert_eq!(f.service.op_locks.get(&key).unwrap().participants, 2);
+	let mut newcomer = Box::pin(ReplicaGate::admit(&f.service, key));
+	blocked(newcomer.as_mut()).await;
+	assert_eq!(f.service.op_locks.get(&key).unwrap().participants, 3);
+	drop(owner);
+	let waiter = waiter.await;
+	blocked(newcomer.as_mut()).await;
+	assert!(std::sync::Weak::ptr_eq(&identity, &waiter.identity));
+	drop(waiter);
+	let newcomer = newcomer.await;
+	assert!(std::sync::Weak::ptr_eq(&identity, &newcomer.identity));
+	drop(newcomer);
+	assert!(f.service.op_locks.is_empty());
 }
 #[tokio::test]
 async fn b1d_gate_without_waiters_is_reclaimed_and_next_call_gets_fresh_arc() {
 	let f = Fixture::new("counter-scope-gate-empty").await;
 	let key = ReplicaOpKey2::new(node(1), tenant(7), 1).unwrap();
-	let old = f.service.op_locks.entry(key).or_default().clone();
-	let guard = old.lock().await;
-	assert_eq!(Arc::strong_count(&old), 2);
-	f.service.reclaim_gate2(key, &old);
-	assert!(!f.service.op_locks.contains_key(&key));
-	drop(guard);
-	let new = f.service.op_locks.entry(key).or_default().clone();
-	assert!(!Arc::ptr_eq(&old, &new));
-	let guard = new.lock().await;
-	f.service.reclaim_gate2(key, &new);
-	drop(guard);
+	let old = ReplicaGate::admit(&f.service, key).await;
+	let identity = old.identity.clone();
+	drop(old);
+	assert!(f.service.op_locks.is_empty());
+	let new = ReplicaGate::admit(&f.service, key).await;
+	assert!(!std::sync::Weak::ptr_eq(&identity, &new.identity));
+	drop(new);
+	assert!(f.service.op_locks.is_empty());
 }
 #[tokio::test]
 async fn b1d_distinct_tenant_origin_and_op_gates_do_not_share_mutex() {
 	let f = Fixture::new("counter-scope-gate-distinct").await;
-	let a = ReplicaOpKey2::new(node(1), tenant(7), 1).unwrap();
-	let gate = f.service.op_locks.entry(a).or_default().clone();
-	let guard = gate.lock().await;
+	let key = ReplicaOpKey2::new(node(1), tenant(7), 1).unwrap();
+	let owner = ReplicaGate::admit(&f.service, key).await;
 	for key in [
 		ReplicaOpKey2::new(node(1), tenant(8), 1).unwrap(),
 		ReplicaOpKey2::new(node(2), tenant(7), 1).unwrap(),
 		ReplicaOpKey2::new(node(1), tenant(7), 2).unwrap(),
 	] {
-		let other = f.service.op_locks.entry(key).or_default().clone();
-		assert!(!Arc::ptr_eq(&gate, &other));
-		let other_guard = other.try_lock().expect("distinct scoped gate is unlocked");
-		f.service.reclaim_gate2(key, &other);
-		drop(other_guard);
+		let mut other = Box::pin(ReplicaGate::admit(&f.service, key));
+		let other = std::future::poll_fn(|cx| match other.as_mut().poll(cx) {
+			std::task::Poll::Ready(gate) => std::task::Poll::Ready(gate),
+			std::task::Poll::Pending => panic!("distinct scope must not queue"),
+		})
+		.await;
+		assert!(!std::sync::Weak::ptr_eq(&owner.identity, &other.identity));
+		drop(other);
 	}
-	f.service.reclaim_gate2(a, &gate);
-	drop(guard);
+	drop(owner);
+	assert!(f.service.op_locks.is_empty());
 }
 #[tokio::test]
 async fn b1d_service_tentative_waits_for_same_scope_gate_and_rechecks_pending() {
 	let f = Fixture::new("counter-scope-gate-recheck").await;
 	let key = ReplicaOpKey2::new(node(1), tenant(7), 1).unwrap();
-	let gate = f.service.op_locks.entry(key).or_default().clone();
-	let guard = gate.lock().await;
+	let guard = ReplicaGate::admit(&f.service, key).await;
 	let id = identity(b"pending");
 	let mut tentative =
 		Box::pin(
@@ -407,10 +399,8 @@ async fn b1d_service_tentative_waits_for_same_scope_gate_and_rechecks_pending() 
 	assert_eq!(f.service.pending_count(), 0);
 	drop(guard);
 	tentative.await.unwrap();
-	drop(gate);
 	let before = f.slab.local_l1_bytes().await;
-	let gate = f.service.op_locks.entry(key).or_default().clone();
-	let guard = gate.lock().await;
+	let guard = ReplicaGate::admit(&f.service, key).await;
 	let mut commit = Box::pin(f.service.commit(node(1), 1, tenant(7), id));
 	blocked(commit.as_mut()).await;
 	assert_eq!(f.service.pending_count(), 1);
@@ -737,8 +727,7 @@ mod network_scope_tests;
 async fn b1d_queued_tentative_and_commit_serialize_while_other_scope_completes() {
 	let f = Fixture::new("counter-scope-queued-phases").await;
 	let key = ReplicaOpKey2::new(node(1), tenant(7), 1).unwrap();
-	let gate = f.service.op_locks.entry(key).or_default().clone();
-	let guard = gate.lock().await;
+	let guard = ReplicaGate::admit(&f.service, key).await;
 	let a = identity(b"a");
 	let b = identity(b"b");
 	let mut tentative =
@@ -772,7 +761,6 @@ async fn b1d_queued_tentative_and_commit_serialize_while_other_scope_completes()
 		f.service.read_committed(tenant(8), b).await.unwrap(),
 		Some(22)
 	);
-	drop(gate);
 	let f = f.reopened().await;
 	assert_eq!(
 		f.service.read_committed(tenant(7), a).await.unwrap(),
@@ -786,3 +774,225 @@ async fn b1d_queued_tentative_and_commit_serialize_while_other_scope_completes()
 
 #[path = "visibility_tests.rs"]
 mod visibility_tests;
+
+/// These GREEN regressions use the real ReplicaGate owner and real service futures.
+/// Historical RED artifacts retain the prior manual borrowed-guard/local-Arc owner
+/// model; that narrower proof is not relabelled as a full owner RPC.
+mod replica_gate_cleanup {
+	use super::*;
+	use std::future::Future;
+	use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+	use std::sync::{Mutex as StdMutex, mpsc};
+	use std::task::{Context, Poll, Wake, Waker};
+	use std::time::Duration;
+	const DEADLINE: Duration = Duration::from_secs(60);
+	struct UnlockWake {
+		run: mpsc::SyncSender<()>,
+		finished: StdMutex<mpsc::Receiver<()>>,
+		inside: AtomicBool,
+		calls: AtomicUsize,
+		failed: AtomicBool,
+		wait_inside: bool,
+	}
+	impl Wake for UnlockWake {
+		fn wake(self: Arc<Self>) {
+			self.wake_by_ref();
+		}
+		fn wake_by_ref(self: &Arc<Self>) {
+			self.calls.fetch_add(1, Ordering::SeqCst);
+			self.inside.store(true, Ordering::SeqCst);
+			if self.run.try_send(()).is_err() {
+				self.failed.store(true, Ordering::SeqCst);
+			}
+			if self.wait_inside
+				&& self
+					.finished
+					.lock()
+					.unwrap()
+					.recv_timeout(DEADLINE)
+					.is_err()
+			{
+				self.failed.store(true, Ordering::SeqCst);
+			}
+			self.inside.store(false, Ordering::SeqCst);
+		}
+	}
+	struct Finished(mpsc::SyncSender<()>);
+	impl Drop for Finished {
+		fn drop(&mut self) {
+			let _ = self.0.try_send(());
+		}
+	}
+
+	async fn terminal_waiter(inside: bool, cancel: bool, create_pending: bool) {
+		let f = Fixture::new("replica-gate-terminal").await;
+		let key = ReplicaOpKey2::new(node(1), tenant(7), 1).unwrap();
+		let (run_tx, run_rx) = mpsc::sync_channel(1);
+		let (done_tx, done_rx) = mpsc::sync_channel(1);
+		let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+		let (owner_tx, owner_rx) = mpsc::sync_channel(1);
+		let wake = Arc::new(UnlockWake {
+			run: run_tx,
+			finished: StdMutex::new(done_rx),
+			inside: AtomicBool::new(false),
+			calls: AtomicUsize::new(0),
+			failed: AtomicBool::new(false),
+			wait_inside: inside,
+		});
+		let owner = ReplicaGate::admit(&f.service, key).await;
+		std::thread::scope(|scope| {
+			let service = &f.service;
+			let wake_ref = &wake;
+			let worker = scope.spawn(move || {
+				let _finished = Finished(done_tx);
+				let mut rollback: std::pin::Pin<
+					Box<dyn Future<Output = std::io::Result<()>> + '_>,
+				> = if create_pending {
+					Box::pin(service.replicate_tentative(
+						node(1),
+						1,
+						tenant(7),
+						identity(b"gate"),
+						11,
+						hlc(1),
+					))
+				} else {
+					Box::pin(service.rollback(node(1), 1, tenant(7), identity(b"gate")))
+				};
+				let waker = Waker::from(wake_ref.clone());
+				let queued = rollback
+					.as_mut()
+					.poll(&mut Context::from_waker(&waker))
+					.is_pending();
+				ready_tx.send(queued).unwrap();
+				assert!(queued);
+				run_rx.recv_timeout(DEADLINE).unwrap();
+				if !inside {
+					owner_rx.recv_timeout(DEADLINE).unwrap();
+				}
+				assert_eq!(wake_ref.inside.load(Ordering::SeqCst), inside);
+				// A short map borrow observes logical participants without another admission.
+				let count = {
+					let entry = service.op_locks.get(&key).unwrap();
+					entry.participants
+				};
+				assert_eq!(count, if inside { 2 } else { 1 });
+				if create_pending {
+					let runtime = tokio::runtime::Builder::new_current_thread()
+						.enable_all()
+						.build()
+						.unwrap();
+					runtime.block_on(async {
+						tokio::time::timeout(DEADLINE, rollback.as_mut())
+							.await
+							.unwrap()
+							.unwrap();
+					});
+				} else if !cancel {
+					match rollback
+						.as_mut()
+						.poll(&mut Context::from_waker(Waker::noop()))
+					{
+						Poll::Ready(result) => result.unwrap(),
+						Poll::Pending => panic!("real waiter must own assigned permit"),
+					}
+				}
+				drop(rollback);
+			});
+			let ready = ready_rx.recv_timeout(DEADLINE);
+			assert!(f.service.op_locks.contains_key(&key));
+			drop(owner);
+			let _ = owner_tx.try_send(());
+			let result = worker.join();
+			assert!(ready.unwrap());
+			result.unwrap();
+		});
+		assert!(!wake.failed.load(Ordering::SeqCst));
+		assert_eq!(wake.calls.load(Ordering::SeqCst), 1);
+		if create_pending {
+			assert!(f.service.pending.contains_key(&key));
+			assert_eq!(
+				f.service.op_locks.get(&key).unwrap().participants,
+				0,
+				"last retire must retain successor pending"
+			);
+			f.service
+				.rollback(node(1), 1, tenant(7), identity(b"gate"))
+				.await
+				.unwrap();
+		}
+		assert!(f.service.pending.is_empty());
+		let retained = f.service.op_locks.get(&key).map(|e| e.participants);
+		assert!(
+			f.service.op_locks.is_empty(),
+			"strict idle oracle: retained participants={retained:?}"
+		);
+	}
+	#[tokio::test]
+	async fn b1d_replica_cleanup_waiter_creates_pending_inside_owner_unlock() {
+		terminal_waiter(true, false, true).await;
+	}
+	#[tokio::test]
+	async fn b1d_replica_cleanup_terminal_inside_unlock() {
+		terminal_waiter(true, false, false).await;
+	}
+	#[tokio::test]
+	async fn b1d_replica_cleanup_terminal_after_owner_drop() {
+		terminal_waiter(false, false, false).await;
+	}
+	#[tokio::test]
+	async fn b1d_replica_cleanup_cancel_assigned_inside_unlock() {
+		terminal_waiter(true, true, false).await;
+	}
+	#[tokio::test]
+	async fn b1d_replica_cleanup_cancel_assigned_after_owner_drop() {
+		terminal_waiter(false, true, false).await;
+	}
+	#[tokio::test]
+	async fn b1d_replica_cleanup_cancel_queued_before_owner_reclaim() {
+		let f = Fixture::new("replica-gate-queued-cancel").await;
+		let key = ReplicaOpKey2::new(node(1), tenant(7), 1).unwrap();
+		let owner = ReplicaGate::admit(&f.service, key).await;
+		let mut waiter = Box::pin(f.service.rollback(node(1), 1, tenant(7), identity(b"gate")));
+		assert!(
+			waiter
+				.as_mut()
+				.poll(&mut Context::from_waker(Waker::noop()))
+				.is_pending()
+		);
+		drop(waiter);
+		drop(owner);
+		assert!(f.service.pending.is_empty());
+		assert!(f.service.op_locks.is_empty());
+	}
+	#[tokio::test]
+	async fn b1d_replica_cleanup_pending_retained_until_rollback() {
+		let f = Fixture::new("replica-gate-pending").await;
+		let id = identity(b"pending");
+		let key = ReplicaOpKey2::new(node(1), tenant(7), 1).unwrap();
+		f.service
+			.replicate_tentative(node(1), 1, tenant(7), id, 11, hlc(1))
+			.await
+			.unwrap();
+		assert!(f.service.pending.contains_key(&key));
+		assert!(f.service.op_locks.contains_key(&key));
+		assert_eq!(f.service.read_committed(tenant(7), id).await.unwrap(), None);
+		f.service.rollback(node(1), 1, tenant(7), id).await.unwrap();
+		assert!(f.service.pending.is_empty());
+		assert!(f.service.op_locks.is_empty());
+		f.service
+			.replicate_tentative(node(1), 2, tenant(7), id, 12, hlc(2))
+			.await
+			.unwrap();
+		let key = ReplicaOpKey2::new(node(1), tenant(7), 2).unwrap();
+		assert!(f.service.pending.contains_key(&key));
+		assert!(f.service.op_locks.contains_key(&key));
+		f.service.commit(node(1), 2, tenant(7), id).await.unwrap();
+		assert_eq!(
+			f.service.read_committed(tenant(7), id).await.unwrap(),
+			Some(12)
+		);
+		assert!(f.service.pending.is_empty());
+		assert!(f.service.op_locks.is_empty());
+	}
+}

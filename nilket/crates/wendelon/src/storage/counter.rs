@@ -887,12 +887,93 @@ struct PendingReplicaTentative {
 	value: u64,
 	location: RecordLocation,
 }
+/// Logical admissions for one replica operation, including queued futures.
+struct ReplicaGateEntry {
+	mutex: Arc<Mutex<()>>,
+	participants: usize,
+}
+
+pub(crate) struct ReplicaGate<'a> {
+	service: &'a CounterReplicaService,
+	key: ReplicaOpKey2,
+	identity: std::sync::Weak<Mutex<()>>,
+	guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+impl<'a> ReplicaGate<'a> {
+	/// Count actual reserved operations without retaining a shard across a yield.
+	#[cfg(test)]
+	pub(crate) fn participant_count(&self) -> usize {
+		let entry = self
+			.service
+			.op_locks
+			.get(&self.key)
+			.expect("live pause gate");
+		assert!(std::sync::Weak::ptr_eq(
+			&self.identity,
+			&Arc::downgrade(&entry.mutex)
+		));
+		entry.participants
+	}
+
+	async fn admit(service: &'a CounterReplicaService, key: ReplicaOpKey2) -> Self {
+		let mutex = {
+			let mut entry = service
+				.op_locks
+				.entry(key)
+				.or_insert_with(|| ReplicaGateEntry {
+					mutex: Arc::new(Mutex::new(())),
+					participants: 0,
+				});
+			entry.participants = entry
+				.participants
+				.checked_add(1)
+				.expect("replica admissions overflow");
+			entry.mutex.clone()
+		};
+		// The ticket exists before awaiting: cancellation retires its reservation.
+		let mut ticket = Self {
+			service,
+			key,
+			identity: Arc::downgrade(&mutex),
+			guard: None,
+		};
+		ticket.guard = Some(mutex.lock_owned().await);
+		ticket
+	}
+}
+impl Drop for ReplicaGate<'_> {
+	fn drop(&mut self) {
+		// Keep this admission counted while unlock can synchronously finish a waiter.
+		// Neither map may be borrowed across this reentrant callback.
+		drop(self.guard.take());
+		if let dashmap::mapref::entry::Entry::Occupied(mut entry) =
+			self.service.op_locks.entry(self.key)
+		{
+			assert!(
+				std::sync::Weak::ptr_eq(&self.identity, &Arc::downgrade(&entry.get().mutex)),
+				"live replica gate identity changed"
+			);
+			let count = &mut entry.get_mut().participants;
+			*count = count
+				.checked_sub(1)
+				.expect("replica admission retired twice");
+			// A successor may have inserted pending during unlock. Read it freshly
+			// at zero admissions, under the shard that also serializes new arrivals.
+			if *count == 0 && !self.service.pending.contains_key(&self.key) {
+				drop(entry.remove());
+			}
+		} else {
+			panic!("live replica gate disappeared");
+		}
+	}
+}
+
 /// The server-side counter replica over a [`SlabManager`].
 pub struct CounterReplicaService {
 	slab: Arc<crate::storage::manager::SlabManager>,
 	marked: Arc<EligibleCells<(TenantId, Identity)>>,
 	pending: DashMap<ReplicaOpKey2, PendingReplicaTentative>,
-	op_locks: DashMap<ReplicaOpKey2, Arc<Mutex<()>>>,
+	op_locks: DashMap<ReplicaOpKey2, ReplicaGateEntry>,
 }
 impl CounterReplicaService {
 	pub fn new(slab: Arc<crate::storage::manager::SlabManager>) -> Self {
@@ -902,16 +983,6 @@ impl CounterReplicaService {
 			pending: DashMap::new(),
 			op_locks: DashMap::new(),
 		}
-	}
-	// Called with the borrowed gate guard held and no DashMap refs retained. Under the shard
-	// write lock, two Arc owners mean exactly this caller and the map, with no old waiter.
-	fn reclaim_gate2(&self, key: ReplicaOpKey2, gate: &Arc<Mutex<()>>) {
-		if self.pending.contains_key(&key) {
-			return;
-		}
-		self.op_locks.remove_if(&key, |_, stored| {
-			Arc::ptr_eq(stored, gate) && Arc::strong_count(gate) == 2
-		});
 	}
 	/// Append one tentative; matching retries are idempotent only while pending exists.
 	pub async fn replicate_tentative(
@@ -933,8 +1004,7 @@ impl CounterReplicaService {
 			}) {
 			return Err(CounterReplicaRejection::TentativeConflict.into_error());
 		}
-		let gate = self.op_locks.entry(key).or_default().clone();
-		let _guard = gate.lock().await;
+		let _gate = ReplicaGate::admit(self, key).await;
 		if let Some(pending) = self.pending.get(&key).map(|entry| *entry.value()) {
 			return if (pending.key_identity, pending.value, pending.location.hlc)
 				== (key_identity, value, commit_hlc)
@@ -975,7 +1045,6 @@ impl CounterReplicaService {
 			}
 			Err(error) => Err(error),
 		};
-		self.reclaim_gate2(key, &gate);
 		result
 	}
 	/// Marker failures retain pending state for re-drive. Zero refuses before missing lookup.
@@ -988,8 +1057,7 @@ impl CounterReplicaService {
 	) -> std::io::Result<()> {
 		let key = ReplicaOpKey2::new(origin, tenant_id, op_id)?;
 		check_expected_key2(expected_key)?;
-		let gate = self.op_locks.entry(key).or_default().clone();
-		let _guard = gate.lock().await;
+		let _gate = ReplicaGate::admit(self, key).await;
 		let Some(pending) = self.pending.get(&key).map(|entry| *entry.value()) else {
 			let commit_hlc = HybridTimestamp {
 				physical_ms: op_id,
@@ -1000,7 +1068,6 @@ impl CounterReplicaService {
 				.marked
 				.committed_identity(&(tenant_id, expected_key), commit_hlc, origin)
 				.map_err(CounterVisibilityError::io)?;
-			self.reclaim_gate2(key, &gate);
 			return if committed.is_some() {
 				Ok(())
 			} else {
@@ -1038,7 +1105,6 @@ impl CounterReplicaService {
 			origin,
 		);
 		self.pending.remove(&key);
-		self.reclaim_gate2(key, &gate);
 		Ok(())
 	}
 	/// Remove only this operation's matching tentative; a missing nonzero key is a no-op.
@@ -1051,10 +1117,8 @@ impl CounterReplicaService {
 	) -> std::io::Result<()> {
 		let key = ReplicaOpKey2::new(origin, tenant_id, op_id)?;
 		check_expected_key2(expected_key)?;
-		let gate = self.op_locks.entry(key).or_default().clone();
-		let _guard = gate.lock().await;
+		let _gate = ReplicaGate::admit(self, key).await;
 		let Some(pending) = self.pending.get(&key).map(|entry| *entry.value()) else {
-			self.reclaim_gate2(key, &gate);
 			return Ok(());
 		};
 		if pending.tenant_id != tenant_id || pending.key_identity != expected_key {
@@ -1066,7 +1130,6 @@ impl CounterReplicaService {
 			pending.key_identity,
 			pending.location,
 		);
-		self.reclaim_gate2(key, &gate);
 		Ok(())
 	}
 	/// Only marker-eligible values; raw tentative lookup remains a distinct storage API.
@@ -1098,14 +1161,14 @@ impl CounterReplicaService {
 	}
 	/// Test-only deterministic remote pause; no production request or authority seam.
 	#[cfg(test)]
-	pub(crate) fn ctr4_pause_operation(
+	pub(crate) async fn ctr4_pause_operation(
 		&self,
 		origin: NodeId,
 		tenant: TenantId,
 		op: u64,
-	) -> Arc<Mutex<()>> {
+	) -> ReplicaGate<'_> {
 		let key = ReplicaOpKey2::new(origin, tenant, op).expect("fixture scope");
-		self.op_locks.entry(key).or_default().clone()
+		ReplicaGate::admit(self, key).await
 	}
 	#[cfg(test)]
 	pub(crate) fn pending_count(&self) -> usize {
