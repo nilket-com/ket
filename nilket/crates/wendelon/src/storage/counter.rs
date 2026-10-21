@@ -1622,7 +1622,7 @@ use file_ops::{CounterDurableFileOps, StdCounterDurableFileOps};
 pub use retention::{CounterRetentionConfig, DEFAULT_COUNTER_CLOCK_SKEW_MS};
 
 mod write_key;
-use write_key::{RecordedAdd, WriteKeyGate};
+use write_key::{RecordedAdd, WriteKeyGate, WriteKeyGates};
 
 /// The durable D4 dedup record a resolved witness compacts into: enough to
 /// replay the original outcome for a duplicate `CounterWriteKey` — plus the
@@ -2272,7 +2272,7 @@ pub struct CounterLeader<P> {
 	/// hashed). Lock order: write-key gate, then the counter-key lock, then the
 	/// participant op gates, then the store's file mutexes; reconcile and the
 	/// commit driver take neither leader gate.
-	write_gates: DashMap<CounterWriteKey, Arc<Mutex<()>>>,
+	write_gates: WriteKeyGates,
 	/// In-memory mirror of the pending witnesses (durable in `witness_store`).
 	witnesses: DashMap<u64, StoredWitness>,
 	/// Durable backing for the witnesses (survives leader restart).
