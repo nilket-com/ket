@@ -237,3 +237,37 @@ error. This is a checked per-file copy, without an atomic-snapshot or global
 writer-quiescence claim. All three forced-error controls passed. Receipts:
 `reviews/readiness-pd19-capture-focused-20261021/summary.json`. No current-source
 retention hunt or PD-19 causal closure follows from those helper controls.
+
+## PD-20: counter write-key gate reclamation (2026-10-21)
+
+The historical dropped-caller counter test failed its idle gate-count assertion
+5/40 times in the old hunt. A separate current-source deterministic regression
+now proves an idle gate leak: Tokio unlock can synchronously wake a terminal
+waiter before destroying the old guard's mutex Arc. Both destructors observe
+extra strong references and skip reclamation, leaving a map-only entry. The
+test uses the real mutex, a bounded waker handshake and a second OS thread;
+phase, exact reference counts and one wake are verified before the strict idle
+map assertion. Sole-owner and after-owner-destruction controls pass. This proves
+the mechanism without assigning it to the historical failure unconditionally.
+
+Signed repair `14bfbbb0c` reserves explicit logical admission tickets before
+waiting.
+Queued cancellation and acquired guards retire one ticket each; unlock runs
+outside the map lock, then the final logical participant removes the matching
+entry. Mutex reference counts no longer determine liveness. Nine reclamation
+controls and 17 write-key/crash-cut tests passed; the exact 26-test selection
+passed 30 nextest repetitions (780 executions) and 10 in-process repetitions at
+explicit 1024 threads (260 executions). Receipts:
+`reviews/readiness-counter-gate-logical-stress-20261021/summary.json`.
+
+The initial architecture result was 179/180 because its canonical-key map guard
+pinned the old direct mutex field type. The reviewed correction follows the
+new alias and retains the exact canonical-key map and mutex checks. The failed
+receipt remains; the fresh complete architecture run passed 180/180. Combined
+receipt: `reviews/readiness-counter-gate-logical-r2-architecture-20261021/summary.json`.
+These focused checks have no extra background suite load and do not close final v5
+adoption. The analogous replica `reclaim_gate2` source pattern is a separate
+unproven followup: retained idle entries are plausible, while duplicate
+admission or wrong counter values have not been established. Its audit and
+proposed deterministic control are recorded in
+`reviews/readiness-counter-replica-gate-source-audit-20261021.json`.
