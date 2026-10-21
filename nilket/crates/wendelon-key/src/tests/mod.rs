@@ -7,4 +7,8 @@ mod lifecycle;
 mod log_chain;
 mod passphrase_policy;
 mod secrets;
+mod signing;
+mod signing_cells;
+mod signing_refusals;
+mod signing_wys;
 mod support;

@@ -154,7 +154,7 @@ pub(super) fn verify(io: &mut dyn Io, a: &Args) -> Result<(), ToolError> {
 		held_at(&ctx, &backup.key, backup.role, backup.epoch)?;
 		writeln!(
 			io.out(),
-			"backup verified: {} role {} epoch {} (fingerprint {})",
+			"backup verified: {} role {} epoch {} (fingerprint {}); this proves the backup and its recovery, not the primary file's ciphertext",
 			hex(&backup.identity()),
 			backup.role,
 			backup.epoch,

@@ -85,9 +85,10 @@ pub(super) fn run(io: &mut dyn Io, a: &Args) -> Result<(), ToolError> {
 			Some(d) => d,
 			None => s.lock.create_subdir(PENDING)?,
 		};
-		must_be_free(&pending_dir, name)?;
-		// The destination's lock first: a busy pending/ refuses before the Bound file exists.
+		// The destination's lock first, so its name check runs under the lock that covers the move,
+		// and a busy pending/ refuses before the Bound file exists.
 		let pending_lock = pending_dir.lock()?;
+		must_be_free(&pending_dir, name)?;
 		must_be_free(s.dir, out)?;
 		let bound = fresh(
 			io,

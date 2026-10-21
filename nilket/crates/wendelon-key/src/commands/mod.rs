@@ -7,14 +7,85 @@ use std::process::ExitCode;
 
 mod backup;
 mod bind;
+mod build;
+mod describe;
 mod generate;
+mod merge;
 mod retire;
 mod show;
+mod sign;
 
 const OVERRIDE: &str = "--override-host-checks";
 
 /// Every subcommand with its flags; the parser refuses anything not listed.
 const COMMANDS: &[(&str, Spec)] = &[
+	(
+		"build",
+		Spec {
+			values: &[
+				"--dir",
+				"--context",
+				"--trusted-manifest",
+				"--out",
+				"--key",
+				"--action",
+				"--permission-key",
+				"--sidecar",
+			],
+			twice: &[],
+			switches: &[],
+		},
+	),
+	(
+		"sign",
+		Spec {
+			values: &[
+				"--dir",
+				"--key",
+				"--context",
+				"--trusted-manifest",
+				"--command",
+				"--partial",
+				"--with",
+				"--sidecar",
+				"--out",
+			],
+			twice: &[],
+			switches: &[OVERRIDE],
+		},
+	),
+	(
+		"sign-statement",
+		Spec {
+			values: &[
+				"--dir",
+				"--key",
+				"--context",
+				"--trusted-manifest",
+				"--action",
+				"--permission-key",
+				"--sidecar",
+				"--out",
+			],
+			twice: &[],
+			switches: &[OVERRIDE],
+		},
+	),
+	(
+		"merge",
+		Spec {
+			values: &[
+				"--dir",
+				"--context",
+				"--trusted-manifest",
+				"--command",
+				"--partial",
+				"--out",
+			],
+			twice: &["--partial"],
+			switches: &[],
+		},
+	),
 	(
 		"generate",
 		Spec {
@@ -110,7 +181,7 @@ const COMMANDS: &[(&str, Spec)] = &[
 	),
 ];
 
-const USAGE: &str = "usage: wendelon-key <generate|bind|show-public|backup|restore|restore-verify|retire-epoch|destroy> --dir <custody dir> [flags]";
+const USAGE: &str = "usage: wendelon-key <generate|bind|show-public|backup|restore|restore-verify|retire-epoch|destroy|build <kind>|sign|sign-statement|merge> --dir <custody dir> [flags]";
 
 /// Runs one command line; prints a refusal on stderr and returns exit code 2 for it.
 pub(crate) fn run(argv: &[String], io: &mut dyn Io) -> ExitCode {
@@ -132,9 +203,21 @@ fn dispatch(argv: &[String], io: &mut dyn Io) -> Result<(), ToolError> {
 			"unknown command {command:?}; {USAGE}"
 		)));
 	};
+	// `build` takes its kind as the first argument after the command.
+	let (kind, rest) = match (*name, rest.split_first()) {
+		("build", Some((kind, rest))) if !kind.starts_with("--") => (Some(kind.as_str()), rest),
+		("build", _) => {
+			return Err(ToolError::Usage(format!(
+				"build needs a kind; {}",
+				build::KINDS
+			)));
+		}
+		_ => (None, rest),
+	};
 	let a = args::parse(rest, spec)?;
 	let unauthenticated = *name == "show-public" && a.switch("--unauthenticated");
-	if !unauthenticated {
+	let keyless = matches!(*name, "build" | "merge");
+	if !unauthenticated && !keyless {
 		io.terminal_ready()?;
 	}
 	match *name {
@@ -146,6 +229,10 @@ fn dispatch(argv: &[String], io: &mut dyn Io) -> Result<(), ToolError> {
 		"restore-verify" => backup::verify(io, &a),
 		"retire-epoch" => retire::retire(io, &a),
 		"destroy" => retire::destroy(io, &a),
+		"build" => build::run(io, &a, kind.expect("checked above")),
+		"sign" => sign::sign(io, &a),
+		"sign-statement" => sign::statement(io, &a),
+		"merge" => merge::run(io, &a),
 		_ => unreachable!("every listed command is dispatched"),
 	}
 }

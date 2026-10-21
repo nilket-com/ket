@@ -79,8 +79,9 @@ pub(super) fn retire(io: &mut dyn Io, a: &Args) -> Result<(), ToolError> {
 			Some(d) => d,
 			None => s.lock.create_subdir(RETIRED)?,
 		};
-		must_be_free(&retired, name)?;
+		// The destination's lock first, so its name check runs under the lock that covers the move.
 		let retired_lock = retired.lock()?;
+		must_be_free(&retired, name)?;
 		s.lock.move_file(name, &retired_lock, name)?;
 		writeln!(
 			io.out(),

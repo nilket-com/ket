@@ -651,3 +651,38 @@ fn audit_lines_mark_identities_that_were_never_authenticated() {
 	let shown = line(&fx);
 	assert!(shown.identity.is_some() && shown.unauthenticated_identity.is_none());
 }
+
+#[test]
+fn a_busy_retired_directory_refuses_retire_and_changes_nothing() {
+	let fx = Fixture::new();
+	let mut io = fx.io();
+	let mut world = genesis(&fx, &mut io);
+	world.rotate(1, [0x51; 32]);
+	let rotated = fx.file("r", &world.export(1));
+	let retired = hold(&fx, "retired");
+	let held = retired.lock().unwrap();
+	let retire = |io: &mut TestIo| {
+		io.say(&["0"]);
+		let r = io.run(&[
+			"retire-epoch",
+			"--dir",
+			&fx.dir(),
+			"--key",
+			"admin0",
+			"--context",
+			&rotated,
+			"--trusted-manifest",
+			&fx.manifest(),
+		]);
+		io.secrets.clear();
+		r
+	};
+	let (ok, _, err) = retire(&mut io);
+	assert!(!ok && err.contains("locked by another operation"), "{err}");
+	assert!(fx.exists("admin0") && !fx.exists("retired/admin0"));
+	// Control: with retired/ free, the same retire moves the file.
+	drop(held);
+	let (ok, _, err) = retire(&mut io);
+	assert!(ok, "{err}");
+	assert!(!fx.exists("admin0") && fx.exists("retired/admin0"));
+}
