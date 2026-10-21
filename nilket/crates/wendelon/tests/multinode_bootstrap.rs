@@ -397,18 +397,6 @@ async fn send_join_request(
 	joining_id: u32,
 	joining_address: &str,
 ) -> JoinClusterResponseWire {
-	let pool = BufPool::new(8, 64 * 1024);
-	let conn = provider
-		.connect(
-			NodeId {
-				id: target_id,
-				_reserved: 0,
-			},
-			target_address,
-		)
-		.await
-		.unwrap();
-	let mut stream = conn.open_bi().await.unwrap();
 	let req = JoinClusterRequestWire {
 		node_id: joining_id,
 		advertise_address: joining_address.into(),
@@ -422,6 +410,27 @@ async fn send_join_request(
 		capability_bits: 0,
 		protocol: wendelon::schema::ProtocolVersionWindow::default(),
 	};
+	send_join_wire_request(provider, target_id, target_address, req).await
+}
+
+async fn send_join_wire_request(
+	provider: Arc<dyn TransportProvider>,
+	target_id: u32,
+	target_address: &str,
+	req: JoinClusterRequestWire,
+) -> JoinClusterResponseWire {
+	let pool = BufPool::new(8, 64 * 1024);
+	let conn = provider
+		.connect(
+			NodeId {
+				id: target_id,
+				_reserved: 0,
+			},
+			target_address,
+		)
+		.await
+		.unwrap();
+	let mut stream = conn.open_bi().await.unwrap();
 	let meta = wire::encode(&req).unwrap();
 	let header = FrameHeader {
 		magic: HRFT_MAGIC,
@@ -866,4 +875,565 @@ async fn partial_bring_up_orders_converge_to_same_final_ring() {
 	assert_eq!(three_then_two.final_epoch, 3);
 	assert_eq!(two_then_three.final_config, three_then_two.final_config);
 	assert_eq!(two_then_three.ring_signature, three_then_two.ring_signature);
+}
+
+#[cfg(feature = "test-support")]
+async fn observe_join_handoff(
+	stage: wendelon::network::control_server::join_test_support::JoinGateStage,
+) -> JoinClusterResponseWire {
+	use wendelon::network::control_server::join_test_support::JoinPromotionGate;
+	let gate = JoinPromotionGate::new(3, stage);
+	let _release_on_drop = gate.release_on_drop();
+	let registry = support::shared_loopback_registry();
+	let addresses = [
+		"loopback://join-handoff-1",
+		"loopback://join-handoff-2",
+		"loopback://join-handoff-3",
+	];
+	let (dir1, mut cfg1) = trusted_cfg("join-handoff-1", 1, addresses[0], 3, &[1, 2, 3], &[]);
+	let (dir2, mut cfg2) = trusted_cfg(
+		"join-handoff-2",
+		2,
+		addresses[1],
+		3,
+		&[1, 2, 3],
+		&[(1, addresses[0])],
+	);
+	let (dir3, mut cfg3) = trusted_cfg(
+		"join-handoff-3",
+		3,
+		addresses[2],
+		3,
+		&[1, 2, 3],
+		&[(1, addresses[0])],
+	);
+	cfg1.join_promotion_gate = Some(gate.clone());
+	cfg2.join_promotion_gate = Some(gate.clone());
+	cfg3.join_promotion_gate = Some(gate.clone());
+	let node1 = WendelonNode::bootstrap_with_provider(cfg1, provider_for(1, registry.clone()))
+		.await
+		.unwrap();
+	let node2 = WendelonNode::bootstrap_with_provider(cfg2, provider_for(2, registry.clone()))
+		.await
+		.unwrap();
+	// Only the joining voter initiates an election in this controlled handoff.
+	// Safety monitors and ordinary election behavior outside this instance remain active.
+	node1.raft.runtime_config().elect(false);
+	node2.raft.runtime_config().elect(false);
+	gate.record_election_intent(1, false);
+	gate.record_election_intent(2, false);
+	let mut node3_task = {
+		let registry = registry.clone();
+		tokio::spawn(async move {
+			WendelonNode::bootstrap_with_provider(cfg3, provider_for(3, registry)).await
+		})
+	};
+	gate.wait_promoted().await;
+	let incumbent = node1.raft.current_leader().await.unwrap();
+	assert_ne!(incumbent, 3, "joining voter has not taken leadership yet");
+	wait_for_voters(&node1, &[1, 2, 3]).await;
+	let snapshot = node1.state_machine.state_snapshot().await;
+	assert!(snapshot.last_membership.voter_ids().any(|id| id == 3));
+	eprintln!("promotion snapshot: {:?}", gate.observations());
+	if stage == wendelon::network::control_server::join_test_support::JoinGateStage::BeforeSuccess {
+		wait_for_cluster(&node1, 3, 3).await;
+		wait_for_cluster(&node2, 3, 3).await;
+		assert!(node2.epoch_tx.borrow().peers.contains_key(&NodeId {
+			id: 3,
+			_reserved: 0
+		}));
+	} else {
+		assert_eq!(
+			node1.ring.current_epoch(),
+			2,
+			"epoch completion intentionally parked"
+		);
+	}
+
+	if stage == wendelon::network::control_server::join_test_support::JoinGateStage::AfterPromotion
+	{
+		gate.wait_for_applied_membership(3, &snapshot.last_membership)
+			.await;
+	}
+	eprintln!(
+		"PRE_PARTITION_JOIN_READINESS: {}",
+		gate.metrics_observation()
+	);
+
+	let survivor = if incumbent == 1 { &node2 } else { &node1 };
+	if stage == wendelon::network::control_server::join_test_support::JoinGateStage::AfterPromotion
+	{
+		// First freeze the survivor's incoming incumbent streams while the
+		// incumbent and joining voter still form a majority. Applying the
+		// incumbent's fresh storage tail covers requests opened before this cut.
+		registry.block_bidirectional(
+			NodeId {
+				id: incumbent,
+				_reserved: 0,
+			},
+			survivor.local_node,
+		);
+		let incumbent_node = if incumbent == 1 { &node1 } else { &node2 };
+		let (before_state, before_vote) = incumbent_node
+			.raft
+			.with_raft_state(|state| (state.server_state.clone(), state.vote_ref().clone()))
+			.await
+			.unwrap();
+		assert_eq!(before_state, openraft::ServerState::Leader);
+		let mut incumbent_log = incumbent_node.log_store.clone();
+		let prefix = openraft::storage::RaftLogStorage::get_log_state(&mut incumbent_log)
+			.await
+			.unwrap()
+			.last_log_id
+			.expect("incumbent has a committed membership log")
+			.index;
+		gate.wait_for_applied_prefix(3, prefix).await;
+		let (after_state, after_vote) = incumbent_node
+			.raft
+			.with_raft_state(|state| (state.server_state.clone(), state.vote_ref().clone()))
+			.await
+			.unwrap();
+		assert_eq!(
+			after_state,
+			openraft::ServerState::Leader,
+			"first partition must preserve incumbent + joining voter majority; {}",
+			gate.metrics_observation()
+		);
+		assert_eq!(
+			before_vote, after_vote,
+			"incumbent term/vote must remain stable while bounding the prefix"
+		);
+		let survivor_tail = survivor.raft.metrics().borrow().last_log_index;
+		assert!(
+			survivor_tail.is_some_and(|index| index <= prefix),
+			"survivor tail must be covered by joining voter's applied prefix: prefix={prefix}, survivor={survivor_tail:?}; {}",
+			gate.metrics_observation()
+		);
+		eprintln!(
+			"PRE_SECOND_CUT_JOIN_PREFIX: index={prefix}; {}",
+			gate.metrics_observation()
+		);
+	}
+
+	for peer in [1, 2, 3].into_iter().filter(|id| *id != incumbent) {
+		registry.block_bidirectional(
+			NodeId {
+				id: incumbent,
+				_reserved: 0,
+			},
+			NodeId {
+				id: peer,
+				_reserved: 0,
+			},
+		);
+	}
+	gate.wait_for_leader(survivor.local_node.id, 3).await;
+	gate.wait_for_leader(3, 3).await;
+	for peer in [1, 2, 3].into_iter().filter(|id| *id != incumbent) {
+		registry.heal_bidirectional(
+			NodeId {
+				id: incumbent,
+				_reserved: 0,
+			},
+			NodeId {
+				id: peer,
+				_reserved: 0,
+			},
+		);
+	}
+	gate.wait_for_leader(1, 3).await;
+	gate.wait_for_leader(2, 3).await;
+	if stage == wendelon::network::control_server::join_test_support::JoinGateStage::BeforeSuccess {
+		let provider = provider_for(2, registry.clone());
+		let conn = provider
+			.connect(
+				NodeId {
+					id: 3,
+					_reserved: 0,
+				},
+				addresses[2],
+			)
+			.await
+			.unwrap();
+		let mut stream = conn.open_bi().await.unwrap();
+		let pool = BufPool::new(8, 64 * 1024);
+		let header = FrameHeader {
+			magic: HRFT_MAGIC,
+			version: 1,
+			msg_type: MsgType::STATUS_REQ.0,
+			flags: 0,
+			stream_id: 0,
+			meta_len: 0,
+			arrow_len: 0,
+			trailing_len: 0,
+		};
+		write_frame(&mut *stream, &header, &[], None, None)
+			.await
+			.unwrap();
+		stream.finish().await.unwrap();
+		let frame = read_frame(&mut *stream, &pool).await.unwrap();
+		assert_eq!(frame.header.msg_type, MsgType::STATUS_RESP.0);
+		let status: wendelon::client::ClusterStatusWire = wire::decode(&frame.meta).unwrap();
+		eprintln!("PRE_RETRY_LEADER_STATUS: {status:?}");
+		assert_eq!(status.leader, Some(3));
+		assert_eq!(status.epoch, 3);
+		assert_eq!(
+			status
+				.peers
+				.iter()
+				.map(|p| p.node_id)
+				.collect::<BTreeSet<_>>(),
+			BTreeSet::from([1, 2, 3])
+		);
+		let seed_snapshot = node2.state_machine.state_snapshot().await;
+		assert_eq!(
+			seed_snapshot
+				.last_membership
+				.voter_ids()
+				.collect::<BTreeSet<_>>(),
+			BTreeSet::from([1, 2, 3])
+		);
+		assert!(seed_snapshot.epoch_history.contains_key(&3));
+	}
+	let before_retry = node2.state_machine.state_snapshot().await;
+	let before_membership = before_retry.last_membership.clone();
+	let before_epochs = before_retry.epoch_history.clone();
+	let before_visible = completed_join_visible_config(&node2);
+	let before_mutations = gate.mutation_path_calls();
+	let request = gate.promoted_request();
+	let response =
+		send_join_wire_request(provider_for(3, registry.clone()), 2, addresses[1], request).await;
+	eprintln!(
+		"retry response: {response:?}; observations: {:?}",
+		gate.observations()
+	);
+	if stage == wendelon::network::control_server::join_test_support::JoinGateStage::BeforeSuccess
+		&& response.accepted
+	{
+		let after = node2.state_machine.state_snapshot().await;
+		assert_eq!(after.last_membership, before_membership);
+		assert_eq!(after.epoch_history, before_epochs);
+		assert_eq!(completed_join_visible_config(&node2), before_visible);
+		assert_eq!(
+			gate.mutation_path_calls(),
+			before_mutations,
+			"self replay must never enter JOIN mutation path"
+		);
+		assert_eq!(response.negotiated_protocol, Some(node2.protocol.current));
+	}
+	gate.release();
+	let original_outcome =
+		tokio::time::timeout(std::time::Duration::from_secs(10), &mut node3_task).await;
+	eprintln!(
+		"original pending bootstrap: {:?}",
+		original_outcome.as_ref().map(|join| join
+			.as_ref()
+			.map(|result| result.as_ref().map(|node| node.local_node)))
+	);
+	let original_succeeded = matches!(&original_outcome, Ok(Ok(Ok(_))));
+	let original_diagnostic = format!(
+		"{:?}",
+		original_outcome.as_ref().map(|join| join
+			.as_ref()
+			.map(|result| result.as_ref().map(|node| node.local_node)))
+	);
+	match original_outcome {
+		Ok(Ok(Ok(node3))) => node3.shutdown().await.unwrap(),
+		Err(_) => {
+			node3_task.abort();
+			let _ = node3_task.await;
+		}
+		_ => {}
+	}
+	node2.shutdown().await.unwrap();
+	node1.shutdown().await.unwrap();
+	drop((dir1, dir2, dir3));
+	if stage == wendelon::network::control_server::join_test_support::JoinGateStage::BeforeSuccess {
+		assert!(
+			original_succeeded,
+			"original completed JOIN/bootstrap must still succeed after release: {original_diagnostic}"
+		);
+	}
+	response
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn joining_voter_leader_replay_through_follower_completes_join() {
+	let response = observe_join_handoff(
+		wendelon::network::control_server::join_test_support::JoinGateStage::BeforeSuccess,
+	)
+	.await;
+	assert!(
+		response.accepted,
+		"matching replay of a committed join must succeed: {response:?}"
+	);
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn join_handoff_before_epoch_completion_is_observed_separately() {
+	let response = observe_join_handoff(
+		wendelon::network::control_server::join_test_support::JoinGateStage::AfterPromotion,
+	)
+	.await;
+	eprintln!("INCOMPLETE_EPOCH_OBSERVATION_ONLY: {response:?}");
+	assert!(
+		!response.accepted,
+		"voter promotion alone must not be acknowledged as a completed join"
+	);
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn completed_self_join_cannot_ack_on_an_isolated_removed_former_leader() {
+	use wendelon::network::control_server::join_test_support::{JoinGateStage, JoinPromotionGate};
+	let gate = JoinPromotionGate::new(0, JoinGateStage::BeforeSelfFence);
+	let _release = gate.release_on_drop();
+	let registry = support::shared_loopback_registry();
+	let addresses = [
+		"loopback://stale-self-1",
+		"loopback://stale-self-2",
+		"loopback://stale-self-3",
+	];
+	let mut dirs = Vec::new();
+	let mut nodes = Vec::new();
+	for id in 1..=3 {
+		let seeds = if id == 1 {
+			vec![]
+		} else {
+			vec![(1, addresses[0])]
+		};
+		let (dir, mut cfg) = trusted_cfg(
+			"stale-self",
+			id,
+			addresses[id as usize - 1],
+			3,
+			&[1, 2, 3],
+			&seeds,
+		);
+		cfg.join_promotion_gate = Some(gate.clone());
+		dirs.push(dir);
+		nodes.push(
+			WendelonNode::bootstrap_with_provider(cfg, provider_for(id, registry.clone()))
+				.await
+				.unwrap(),
+		);
+	}
+	for node in &nodes {
+		wait_for_cluster(node, 3, 3).await;
+	}
+	let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+	let old_leader = loop {
+		let leaders = [
+			nodes[0].raft.current_leader().await,
+			nodes[1].raft.current_leader().await,
+			nodes[2].raft.current_leader().await,
+		];
+		if leaders[0].is_some() && leaders.iter().all(|id| *id == leaders[0]) {
+			break leaders[0].unwrap();
+		}
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"cluster must agree on an initial leader: {leaders:?}"
+		);
+		tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+	};
+	let former = &nodes[old_leader as usize - 1];
+	let before = former.state_machine.state_snapshot().await;
+	let peer = former
+		.epoch_tx
+		.borrow()
+		.peers
+		.get(&former.local_node)
+		.unwrap()
+		.clone();
+	let request = JoinClusterRequestWire {
+		node_id: old_leader,
+		advertise_address: peer.address,
+		tier_bits: peer.tiers.as_u8(),
+		role_bits: peer.roles.as_u8(),
+		capability_bits: peer.capabilities.as_u8(),
+		protocol: former.protocol,
+	};
+	let mut retry = {
+		let registry = registry.clone();
+		let request = request.clone();
+		tokio::spawn(async move {
+			send_join_wire_request(
+				provider_for(old_leader, registry),
+				old_leader,
+				addresses[old_leader as usize - 1],
+				request,
+			)
+			.await
+		})
+	};
+	gate.wait_promoted().await;
+	// Change authoritative state AFTER preliminary shape/leader routing, but
+	// BEFORE the fresh proof. A cached approval must not survive this point.
+	for id in 1..=3 {
+		if id != old_leader {
+			registry.block_bidirectional(
+				NodeId {
+					id: old_leader,
+					_reserved: 0,
+				},
+				NodeId { id, _reserved: 0 },
+			);
+		}
+	}
+	let survivors = nodes
+		.iter()
+		.filter(|n| n.local_node.id != old_leader)
+		.collect::<Vec<_>>();
+	let new_leader = wait_for_failover_leader(survivors[0], survivors[1], old_leader).await;
+	let remaining = survivors
+		.iter()
+		.map(|n| n.local_node.id)
+		.collect::<BTreeSet<_>>();
+	nodes[new_leader as usize - 1]
+		.raft
+		.change_membership(remaining, true)
+		.await
+		.unwrap();
+	assert_eq!(
+		former.raft.current_leader().await,
+		Some(old_leader),
+		"cached former-leader claim remains tempting"
+	);
+	let stale = former.state_machine.state_snapshot().await;
+	assert_eq!(stale.last_membership, before.last_membership);
+	assert_eq!(stale.epoch_history, before.epoch_history);
+	let before_mutations = gate.mutation_path_calls();
+	gate.release();
+	let result = tokio::time::timeout(std::time::Duration::from_secs(10), &mut retry).await;
+	let accepted = match result {
+		Ok(Ok(response)) => {
+			eprintln!("STALE_FORMER_LEADER_REFUSAL: {response:?}");
+			response.accepted
+		}
+		Ok(Err(error)) => panic!("retry task failed: {error}"),
+		Err(_) => {
+			retry.abort();
+			let _ = retry.await;
+			eprintln!("STALE_FORMER_LEADER_FENCE_TIMEOUT_NO_ACK");
+			false
+		}
+	};
+	let after = former.state_machine.state_snapshot().await;
+	assert_eq!(after.last_membership, before.last_membership);
+	assert_eq!(after.epoch_history, before.epoch_history);
+	assert_eq!(gate.mutation_path_calls(), before_mutations);
+	for node in nodes.into_iter().rev() {
+		node.shutdown().await.unwrap();
+	}
+	drop(dirs);
+	assert!(
+		!accepted,
+		"partitioned removed former leader falsely acknowledged self replay"
+	);
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn completed_self_join_preserves_authorization_and_frame_validation() {
+	use wendelon::network::server::RequestContext;
+	use wendelon::network::tls::{ActorIdentity, ActorRole};
+	let (_dir, node) = support::bootstrap_node("self-join-auth", 1).await;
+	support::wait_for_local_leader(&node).await;
+	let peer = node
+		.epoch_tx
+		.borrow()
+		.peers
+		.get(&node.local_node)
+		.unwrap()
+		.clone();
+	let request = JoinClusterRequestWire {
+		node_id: 1,
+		advertise_address: peer.address,
+		tier_bits: peer.tiers.as_u8(),
+		role_bits: peer.roles.as_u8(),
+		capability_bits: peer.capabilities.as_u8(),
+		protocol: node.protocol,
+	};
+	let before = node.state_machine.state_snapshot().await;
+	for mode in 0..4 {
+		let meta = wire::encode_into(&node.pool, &request).unwrap();
+		let mut frame = wendelon::network::core::HrftFrame {
+			header: FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: MsgType::JOIN_REQ.0,
+				flags: 0,
+				stream_id: 0,
+				meta_len: meta.len() as u32,
+				arrow_len: 0,
+				trailing_len: 0,
+			},
+			meta,
+			arrow_payload: None,
+			trailing: None,
+		};
+		let mut actor = ActorIdentity::data_node(node.local_node);
+		if mode == 0 {
+			actor.role = ActorRole::ReadOnlyObserver;
+			actor.trust_domain = actor.role.trust_domain();
+		}
+		if mode == 1 {
+			frame.arrow_payload = Some(node.pool.acquire());
+		}
+		if mode == 2 {
+			frame.trailing = Some(node.pool.acquire());
+		}
+		if mode == 3 {
+			frame.meta.as_mut_vec().clear();
+			frame.header.meta_len = 0;
+		}
+		let response = node
+			.router
+			.handle_frame(
+				RequestContext {
+					remote: Some(node.local_node),
+					actor,
+				},
+				frame,
+			)
+			.await;
+		if let Ok(Some(frame)) = response {
+			let response: JoinClusterResponseWire = wire::decode(&frame.meta).unwrap();
+			assert!(
+				!response.accepted,
+				"invalid actor/frame accepted, mode={mode}"
+			);
+		}
+	}
+	let after = node.state_machine.state_snapshot().await;
+	assert_eq!(before.last_membership, after.last_membership);
+	assert_eq!(before.epoch_history, after.epoch_history);
+	node.shutdown().await.unwrap();
+}
+
+#[cfg(feature = "test-support")]
+fn completed_join_visible_config(node: &WendelonNode) -> wendelon::consensus::EpochConfig {
+	let visible = node.epoch_tx.borrow();
+	wendelon::consensus::EpochConfig {
+		epoch: visible.epoch,
+		peers: visible
+			.peers
+			.iter()
+			.map(|(id, peer)| {
+				(
+					id.id,
+					wendelon::consensus::EpochPeer {
+						node_id: *id,
+						address: peer.address.clone(),
+						tier_bits: peer.tiers.as_u8(),
+						role_bits: peer.roles.as_u8(),
+						capability_bits: peer.capabilities.as_u8(),
+					},
+				)
+			})
+			.collect(),
+	}
 }
