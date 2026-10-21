@@ -1,22 +1,32 @@
 //! The removed-forms corpus (`removed_forms.json`): the exact bytes of every admin form the
-//! profile-3-only slice removes, each with today's outcome. The plan pins the file's digest; this
-//! test proves every entry still behaves as recorded, so a later sub-slice can flip each one to its
-//! typed refusal against an accepted twin.
+//! profile-3-only slice removes, each with its recorded outcome. The plan pins the file's digest.
+//! N4-N12 (c1) are refused at their exact typed error and step, each against an accepted twin;
+//! N1-N3 and N13-N15 still behave as recorded until c2 flips them.
 use super::*;
 use crate::storage::mutation_visibility::root2::admin::errors::AdminManifestError2;
 use crate::storage::mutation_visibility::root2::admin::manifest::{
 	AdminManifestThree3, AnyAdminManifest2, ManifestProfile2,
 };
 use crate::storage::mutation_visibility::root2::compromise::compromise_audit2;
-use crate::storage::mutation_visibility::root2::provisioning::inventory::RootState2;
+use crate::storage::mutation_visibility::root2::provisioning::inventory::{
+	CorruptReason2, LogError2, RootState2,
+};
 use crate::storage::mutation_visibility::root2::provisioning::owner_core::{
-	Classification2, decode_evidence2,
+	Classification2, EvidenceError2, OwnerRequest2, op_id2,
 };
-use crate::storage::mutation_visibility::root2::provisioning::owner_log::OwnerDir2;
+use crate::storage::mutation_visibility::root2::provisioning::owner_log::{
+	OwnerDir2, OwnerIoError2,
+};
 use crate::storage::mutation_visibility::root2::provisioning::replica_anchor::{
-	ReplicaInputs2, tuple_manifest_len2, tuple_manifest2, validate_replica_tuple2,
+	ReplicaAnchorError2, ReplicaInput2, ReplicaInputs2, tuple_manifest_len2, tuple_manifest2,
+	validate_replica_tuple2,
 };
-use crate::storage::mutation_visibility::root2::provisioning::snapshot::decode_snapshot2;
+use crate::storage::mutation_visibility::root2::provisioning::snapshot::{
+	SnapshotError2, decode_snapshot2,
+};
+use crate::storage::mutation_visibility::root2::tests::profile_three_fixture::{
+	M3_PRIMARY, chain_of,
+};
 use serde_json::Value;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -119,106 +129,241 @@ fn removed_manifests_decode_today() {
 	);
 }
 
-#[test]
-fn removed_tuple_and_snapshots_are_accepted_today() {
-	let all = entries();
-	let n4 = of(&all, "N4")[0];
-	assert_eq!(n4["manifest"], "N1");
-	let manifest = one(&all, "N1");
-	let manifest_pin = hash(b"VISROOT2-ADMIN-MANIFEST\0", &manifest);
-	let snapshot = bytes(n4);
-	let inventory_pin = hash(b"", &snapshot);
-	let tuple = validate_replica_tuple2(&ReplicaInputs2 {
-		manifest: Some(&manifest),
+// ---- c1: N4-N12 refused, each at its typed error and step, against an accepted twin ----
+
+fn provisioning_vectors(name: &str) -> Value {
+	serde_json::from_str(match name {
+		"anchor" => include_str!("../provisioning/tests/anchor_vectors.json"),
+		"three" => include_str!("../provisioning/tests/profile_three_vectors.json"),
+		"terminal" => include_str!("../provisioning/tests/profile_three/terminal_vectors.json"),
+		"owner" => include_str!("../provisioning/tests/owner_vectors.json"),
+		_ => unreachable!(),
+	})
+	.unwrap()
+}
+fn reseal(mut b: Vec<u8>) -> Vec<u8> {
+	let n = b.len() - 32;
+	let sum = hash(b"", &b[..n]);
+	b[n..].copy_from_slice(&sum);
+	b
+}
+fn tuple(manifest: &[u8], snapshot: &[u8]) -> Result<(), ReplicaAnchorError2> {
+	let manifest_pin = hash(b"VISROOT2-ADMIN-MANIFEST\0", manifest);
+	let inventory_pin = hash(b"", snapshot);
+	validate_replica_tuple2(&ReplicaInputs2 {
+		manifest: Some(manifest),
 		manifest_pin: Some(&manifest_pin),
-		snapshot: Some(&snapshot),
+		snapshot: Some(snapshot),
 		inventory_pin: Some(&inventory_pin),
 	})
-	.unwrap();
-	// The tuple carries the 137-byte profile-1 manifest itself.
-	assert_eq!(tuple_manifest_len2(&tuple), 137);
-	assert_eq!(tuple_manifest2(&tuple).profile(), ManifestProfile2::One);
-	assert_eq!(
-		tuple_manifest2(&tuple).encode().unwrap().as_slice(),
-		manifest
-	);
-	for (id, version, count) in [
-		("N5", 2u16, 3usize),
-		("N6", 1, 1),
-		("N7", 3, 1),
-		("N8", 3, 3),
-	] {
-		let b = one(&all, id);
-		assert_eq!(u16::from_le_bytes([b[8], b[9]]), version, "{id}");
-		assert_eq!(decode_snapshot2(&b).unwrap().entries.len(), count, "{id}");
-	}
-	let n7 = decode_snapshot2(&one(&all, "N7")).unwrap();
-	assert_eq!(n7.entries[0].state, RootState2::Retired);
-	assert!(n7.entries[0].terminal.is_none() && n7.entries[0].record.is_none());
-	let n8 = decode_snapshot2(&one(&all, "N8")).unwrap();
-	assert_eq!(
-		n8.entries.iter().map(|e| e.profile).collect::<Vec<_>>(),
-		[
-			ManifestProfile2::One,
-			ManifestProfile2::Two,
-			ManifestProfile2::Three
-		]
-	);
+	.map(|_| ())
+}
+fn classification(log: &[u8]) -> Classification2 {
+	let s = Scratch::new();
+	drop(OwnerDir2::create_v2(&s.0).unwrap());
+	s.log(log);
+	OwnerDir2::open(&s.0)
+		.unwrap()
+		.inspect()
+		.unwrap()
+		.classification
 }
 
 #[test]
-fn removed_owner_forms_are_accepted_today() {
+fn removed_tuple_and_snapshots_are_refused_against_twins() {
 	let all = entries();
-	// N9: VISOEV02 RESERVE events with n = 137 and n = 189 fold in a v2 directory.
+	// N4: the 137-byte manifest is refused at its length, before any pin or parse.
+	let n4 = of(&all, "N4")[0];
+	assert_eq!(n4["manifest"], "N1");
+	assert_eq!(
+		tuple(&one(&all, "N1"), &bytes(n4)),
+		Err(ReplicaAnchorError2::Length(ReplicaInput2::Manifest))
+	);
+	let chain = chain_of(&M3_PRIMARY, 241);
+	assert_eq!(tuple_manifest_len2(&chain.tuple), 241);
+	assert_eq!(
+		tuple_manifest2(&chain.tuple).profile(),
+		ManifestProfile2::Three
+	);
+	// N5 (version 2) and N6 (version 1 with an entry) are refused at the version.
+	for id in ["N5", "N6"] {
+		assert_eq!(
+			decode_snapshot2(&one(&all, id)).err(),
+			Some(SnapshotError2::Version),
+			"{id}"
+		);
+	}
+	let anchor = provisioning_vectors("anchor");
+	let v3 = unhex(anchor["p3_snapshots"]["bound"]["bytes"].as_str().unwrap());
+	assert_eq!(u16::from_le_bytes([v3[8], v3[9]]), 3);
+	assert_eq!(decode_snapshot2(&v3).unwrap().entries.len(), 1);
+	// N7: a Retired entry with no terminal record passes Version, Trailer and ProfileTag and is
+	// refused at the S4 binding; the twin is the v4 terminal snapshot.
+	let n7 = one(&all, "N7");
+	assert_eq!(
+		(u16::from_le_bytes([n7[8], n7[9]]), n7[22 + 97], n7[22 + 96]),
+		(3, 3, 4)
+	);
+	assert_eq!(decode_snapshot2(&n7).err(), Some(SnapshotError2::Binding));
+	let terminal = provisioning_vectors("terminal");
+	let v4 = unhex(terminal["snapshot"].as_str().unwrap());
+	let t = decode_snapshot2(&v4).unwrap();
+	assert_eq!(u16::from_le_bytes([v4[8], v4[9]]), 4);
+	assert!(t.entries[0].state == RootState2::Retired && t.entries[0].terminal.is_some());
+	// N8: tags 1 and 2 are refused at the tag; the tag-3 entry alone is accepted.
+	let n8 = one(&all, "N8");
+	assert_eq!(&n8[22 + 97..22 + 98], &[1]);
+	assert_eq!(
+		decode_snapshot2(&n8).err(),
+		Some(SnapshotError2::ProfileTag)
+	);
+	let mut tag_two = n8.clone();
+	tag_two[22 + 97] = 3;
+	assert_eq!(tag_two[22 + 320 + 97], 2);
+	assert_eq!(
+		decode_snapshot2(&reseal(tag_two)).err(),
+		Some(SnapshotError2::ProfileTag)
+	);
+	let entry = &n8[22 + 2 * 320..22 + 3 * 320];
+	assert_eq!(entry[97], 3);
+	let mut alone = n8[..22].to_vec();
+	alone[10..14].copy_from_slice(&1u32.to_le_bytes());
+	alone.extend_from_slice(entry);
+	alone.extend_from_slice(&[0; 32]);
+	let alone = decode_snapshot2(&reseal(alone)).unwrap();
+	assert_eq!(alone.entries[0].profile, ManifestProfile2::Three);
+}
+
+#[test]
+fn removed_owner_forms_are_refused_against_twins() {
+	let all = entries();
+	let corrupt = |seq, reason| Classification2::Log(LogError2::Corrupt { seq, reason });
+	// N9: VISOEV02 RESERVE events with n = 137 and n = 189 are refused at the payload.
 	let n9 = one(&all, "N9");
 	let n = |e: &[u8]| u16::from_le_bytes([e[132], e[133]]);
 	assert_eq!([n(&n9[..512]), n(&n9[1024..])], [137, 189]);
+	assert_eq!(classification(&n9), corrupt(1, CorruptReason2::Payload));
+	let mut second = n9[1024..].to_vec();
+	second[12..20].copy_from_slice(&1u64.to_le_bytes());
+	assert_eq!(
+		classification(&reseal_event(second)),
+		corrupt(1, CorruptReason2::Payload)
+	);
+	// The twin: an n = 241 Reserve of M3_PRIMARY appends and folds.
+	let s = Scratch::new();
+	let mut o = OwnerDir2::create_v2(&s.0).unwrap();
+	o.apply(
+		&op_id2([9; 16]).unwrap(),
+		&OwnerRequest2::Reserve {
+			manifest: AnyAdminManifest2::decode(&M3_PRIMARY).unwrap(),
+		},
+	)
+	.unwrap();
+	let log = fs::read(s.0.join("inventory.log")).unwrap();
+	assert_eq!(n(&log), 241);
+	assert_eq!(
+		o.inspect().unwrap().classification,
+		Classification2::Clean { last_seq: 1 }
+	);
+	drop(o);
+	// N10: a plain RETIRE (n = 0) is refused at the payload, at its own sequence.
+	let n10 = one(&all, "N10");
+	let retire = &n10[6 * 512..];
+	assert_eq!(n(retire), 0);
+	// In context, after the profile-3 root's own prefix (the corpus log starts with N9's form).
+	let three = provisioning_vectors("three");
+	let p3: Vec<u8> = three["p3_events"]
+		.as_array()
+		.unwrap()
+		.iter()
+		.flat_map(|e| unhex(e.as_str().unwrap()))
+		.collect();
+	let mut plain = retire.to_vec();
+	plain[12..20].copy_from_slice(&3u64.to_le_bytes());
+	plain[36..132].copy_from_slice(&p3[512 + 36..512 + 132]);
+	assert_eq!(
+		classification(&[p3.clone(), reseal_event(plain)].concat()),
+		corrupt(3, CorruptReason2::Payload)
+	);
+	// The twin: the n = 156 terminal Retire of the profile-3 root folds it Retired.
+	let terminal = provisioning_vectors("terminal");
+	let event = unhex(terminal["event"].as_str().unwrap());
+	assert_eq!(n(&event), 156);
+	assert_eq!(
+		classification(&[p3, event].concat()),
+		Classification2::Clean { last_seq: 3 }
+	);
+	// N11: an unmarked directory is Unformatted, with this VISIEV02 log, with none, and with a
+	// VISOEV02 log; the twin is the same empty directory after create_v2.
+	let n11 = one(&all, "N11");
+	assert_eq!(&n11[..8], b"VISIEV02");
+	let mut visoev02 = vec![0u8; 512];
+	visoev02[..8].copy_from_slice(b"VISOEV02");
+	for log in [Some(n11), None, Some(visoev02)] {
+		let s = Scratch::new();
+		if let Some(log) = &log {
+			s.log(log);
+		}
+		assert_eq!(
+			OwnerDir2::open(&s.0).err(),
+			Some(OwnerIoError2::Unformatted)
+		);
+		if log.is_none() {
+			drop(OwnerDir2::create_v2(&s.0).unwrap());
+			assert!(OwnerDir2::open(&s.0).is_ok());
+		}
+	}
+	// N12: VISREP03 evidence passes the name and the length bound and is refused at the magic.
+	for e in of(&all, "N12") {
+		let b = bytes(e);
+		assert_eq!((b.len(), &b[..8]), (256, &b"VISREP03"[..]));
+		let s = Scratch::new();
+		drop(OwnerDir2::create_v2(&s.0).unwrap());
+		let repairs = s.0.join("repairs");
+		fs::create_dir(&repairs).unwrap();
+		fs::set_permissions(&repairs, fs::Permissions::from_mode(0o700)).unwrap();
+		fs::write(repairs.join(e["name"].as_str().unwrap()), &b).unwrap();
+		assert_eq!(
+			OwnerDir2::open(&s.0)
+				.unwrap()
+				.inspect()
+				.unwrap()
+				.classification,
+			Classification2::EvidenceInvalid {
+				index: 0,
+				error: EvidenceError2::Magic
+			},
+			"{}",
+			e["part"]
+		);
+	}
+	// The twin: VISREP04 evidence (the p3_ case) is accepted against its own torn log.
+	let owner = provisioning_vectors("owner");
+	let case = &owner["p3_cases"]["base"];
 	let s = Scratch::new();
 	drop(OwnerDir2::create_v2(&s.0).unwrap());
-	s.log(&n9);
-	assert_eq!(
+	s.log(&unhex(case["log"].as_str().unwrap()));
+	let repairs = s.0.join("repairs");
+	fs::create_dir(&repairs).unwrap();
+	fs::set_permissions(&repairs, fs::Permissions::from_mode(0o700)).unwrap();
+	fs::write(
+		repairs.join(case["name"].as_str().unwrap()),
+		unhex(case["evidence"].as_str().unwrap()),
+	)
+	.unwrap();
+	assert!(matches!(
 		OwnerDir2::open(&s.0)
 			.unwrap()
 			.inspect()
 			.unwrap()
 			.classification,
-		Classification2::Clean { last_seq: 3 }
-	);
-	// N10: a plain RETIRE (n = 0) of the profile-3 root folds and exports it Retired.
-	let n10 = one(&all, "N10");
-	assert_eq!(n(&n10[6 * 512..]), 0);
-	let (s, out) = (Scratch::new(), Scratch::new());
-	drop(OwnerDir2::create_v2(&s.0).unwrap());
-	s.log(&n10);
-	let mut o = OwnerDir2::open(&s.0).unwrap();
-	assert_eq!(
-		o.inspect().unwrap().classification,
-		Classification2::Clean { last_seq: 7 }
-	);
-	o.export(&out.0, "retired").unwrap();
-	let exported = decode_snapshot2(&fs::read(out.0.join("retired")).unwrap()).unwrap();
-	assert_eq!(
-		exported.entries.iter().map(|e| e.state).collect::<Vec<_>>(),
-		[RootState2::Bound, RootState2::Bound, RootState2::Retired]
-	);
-	assert!(exported.entries[2].terminal.is_none());
-	assert_eq!(exported.entries[2].profile, ManifestProfile2::Three);
-	drop(o);
-	// N11: a VISIEV02 log in an unmarked directory opens as v1.
-	let s = Scratch::new();
-	s.log(&one(&all, "N11"));
-	let status = OwnerDir2::open(&s.0).unwrap().inspect().unwrap();
-	assert!(!status.marker_present);
-	assert_eq!(
-		status.classification,
-		Classification2::Clean { last_seq: 6 }
-	);
-	// N12: VISREP03 evidence decodes under its `.rep` name.
-	for e in of(&all, "N12") {
-		let b = bytes(e);
-		assert_eq!((b.len(), &b[..8]), (256, &b"VISREP03"[..]));
-		assert!(decode_evidence2(e["name"].as_str().unwrap(), &b).is_ok());
-	}
+		Classification2::Pending { .. }
+	));
+}
+fn reseal_event(mut b: Vec<u8>) -> Vec<u8> {
+	let sum = hash(b"", &b[..480]);
+	b[480..].copy_from_slice(&sum);
+	b
 }
 
 #[test]

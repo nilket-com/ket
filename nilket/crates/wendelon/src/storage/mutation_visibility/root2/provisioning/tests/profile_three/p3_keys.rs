@@ -48,11 +48,6 @@ fn p3_repair_context_reopen_and_cross_evidence_refusal() {
 	assert_eq!(name, v["p3_repair"]["name"].as_str().unwrap());
 	assert_eq!(evidence, b(&v["p3_repair"]["bytes"]));
 	assert_eq!(evidence.len(), 124 + 5 + 32);
-	// The format-1 decoder refuses VISREP04 at the magic.
-	assert_eq!(
-		owner_core::decode_evidence2(&name, &evidence).err(),
-		Some(owner_core::EvidenceError2::Magic)
-	);
 	let s = Scratch::new();
 	drop(OwnerDir2::create_v2(&s.0).unwrap());
 	fs::write(s.at("inventory.log"), &torn).unwrap();
@@ -131,6 +126,12 @@ fn p3_max_tail_evidence_bounds_are_exact() {
 			.len(),
 		1023
 	);
+	// The log read bound (moved from the deleted mixed-profile row): one byte past the largest log.
+	let too_big = vec![0; 33554944];
+	assert!(matches!(
+		inventory::v2::fold_events2(&too_big),
+		Err(inventory::LogError2::TooLong)
+	));
 	let mut evidence = bytes;
 	evidence.push(0);
 	assert_eq!(

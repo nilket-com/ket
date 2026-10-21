@@ -250,21 +250,6 @@ fn encode_refuses_invalid_context() {
 	);
 }
 #[test]
-fn profile_one_refuses_before_context_digest_and_signature() {
-	let c = super::profile_two_binding::chain("a", 137);
-	let a = install_admin2(&c.rooted, &c.tuple).unwrap();
-	assert_eq!(
-		check_governance_command2(&a.view(), GovernanceAction2::Grant, &valid(), [0; 32]).err(),
-		Some(GovernanceCommandError2::NoGovernance)
-	);
-	let mut b = valid();
-	b[10] = 1;
-	assert_eq!(
-		check_governance_command2(&a.view(), GovernanceAction2::Grant, &b, [0; 32]).err(),
-		Some(GovernanceCommandError2::Reserved)
-	);
-}
-#[test]
 fn purpose_separation_reaches_signature_and_preserves_admin_checker() {
 	let body = valid();
 	let mut adc = encode_admin_command2(&context(), d1(), &[0; 64]).unwrap();

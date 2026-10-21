@@ -26,16 +26,6 @@ fn failure(
 #[test]
 #[cfg(target_endian = "little")]
 fn s3_private_envelope_scope_causes_and_signature_precedence() {
-	let f = Fixture::new("a");
-	let c = Command2::EnrollSelector(selector(&f));
-	let mut b = f.envelope(&f.state, &c, 0x93);
-	b[200] ^= 1;
-	assert_eq!(
-		failure(&f, &c, Some(&b)),
-		Ok(Some(Denial2::Envelope(
-			GovernanceCommandError2::NoGovernance
-		)))
-	);
 	let f = Fixture::primary();
 	let c = Command2::EnrollSelector(selector(&f));
 	let ctx = admin_context2(&install_admin2(&f.state, &f.pin).unwrap());

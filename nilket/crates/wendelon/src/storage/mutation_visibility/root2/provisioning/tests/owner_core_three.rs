@@ -6,6 +6,7 @@
 use super::*;
 use crate::storage::mutation_visibility::root2::admin::manifest::AnyAdminManifest2;
 use crate::storage::mutation_visibility::root2::admin::record::BootstrapObservation2;
+use crate::storage::mutation_visibility::root2::codec::hash;
 use crate::storage::mutation_visibility::root2::provisioning::inventory::v2::{
 	EVENT_BYTES2, MAX_LOG_BYTES2, fold_events2,
 };
@@ -25,7 +26,7 @@ const E: usize = EVENT_BYTES2;
 const B3: usize = 3 * E;
 
 fn sha(b: &[u8]) -> [u8; 32] {
-	crate::storage::mutation_visibility::root2::codec::hash(b"", b)
+	hash(b"", b)
 }
 fn op(n: u8) -> OpId2 {
 	op_id2([n; 16]).unwrap()
@@ -74,7 +75,7 @@ fn terminal() -> TerminalObservation3 {
 fn retire(identity: RootIdentity2) -> OwnerRequest2 {
 	OwnerRequest2::Retire {
 		identity,
-		terminal: Some(terminal()),
+		terminal: terminal(),
 	}
 }
 fn approve(id: RootIdentity2, o: BootstrapObservation2) -> OwnerRequest2 {

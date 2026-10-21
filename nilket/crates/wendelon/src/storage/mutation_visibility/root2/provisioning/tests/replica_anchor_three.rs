@@ -6,6 +6,7 @@ use crate::storage::mutation_visibility::root2::admin::manifest::{
 	AdminManifestThree3, AnyAdminManifest2, any_manifest_digest2,
 };
 use crate::storage::mutation_visibility::root2::admin::record::BootstrapRecord2;
+use crate::storage::mutation_visibility::root2::codec::hash;
 use crate::storage::mutation_visibility::root2::provisioning::inventory::*;
 use crate::storage::mutation_visibility::root2::provisioning::replica_anchor::*;
 use crate::storage::mutation_visibility::root2::provisioning::snapshot::{
@@ -14,7 +15,7 @@ use crate::storage::mutation_visibility::root2::provisioning::snapshot::{
 use ReplicaAnchorError2 as E;
 
 fn sha(b: &[u8]) -> [u8; 32] {
-	crate::storage::mutation_visibility::root2::codec::hash(b"", b)
+	hash(b"", b)
 }
 fn anchor_vectors() -> serde_json::Value {
 	serde_json::from_str(include_str!("anchor_vectors.json")).unwrap()
@@ -206,10 +207,7 @@ fn lengths_then_digests_then_codecs() {
 	// Malformed bytes whose own pins match reach the accepted codecs.
 	let mut zero_epoch = m.clone();
 	zero_epoch[44..52].copy_from_slice(&0u64.to_le_bytes());
-	let zp = crate::storage::mutation_visibility::root2::codec::hash(
-		b"VISROOT2-ADMIN-MANIFEST\0",
-		&zero_epoch,
-	);
+	let zp = hash(b"VISROOT2-ADMIN-MANIFEST\0", &zero_epoch);
 	assert!(matches!(
 		check(&zero_epoch, &zp, &s, &sp).err(),
 		Some(E::ManifestCodec(_))

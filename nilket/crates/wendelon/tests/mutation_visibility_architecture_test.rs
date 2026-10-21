@@ -1637,7 +1637,6 @@ fn provisioning_reader_has_two_documented_unsafe_blocks_and_no_trust_access() {
 		children,
 		[
 			"anchored",
-			"format",
 			"inventory",
 			"owner_core",
 			"owner_log",
@@ -1759,7 +1758,8 @@ fn quote_type(ty: &syn::Type) -> String {
 }
 // Pure inventory and snapshot codecs, the pure owner core and replica tuple validation: no I/O,
 // clock, networking, unsafe, trust or root construction; fixed entrypoints. Syntax over these
-// files only; owner_core/evidence.rs is held to the same checks as owner_core.rs.
+// files only. Directory format 2 is the only owner format: there is no v1 codec, owner core,
+// evidence module or format dispatch.
 #[test]
 fn provisioning_inventory_and_snapshot_are_pure_codecs() {
 	let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1819,7 +1819,6 @@ fn provisioning_inventory_and_snapshot_are_pure_codecs() {
 		"inventory.rs",
 		"snapshot.rs",
 		"owner_core.rs",
-		"owner_core/evidence.rs",
 		"replica_anchor.rs",
 		"terminal.rs",
 	] {
@@ -1857,10 +1856,6 @@ fn provisioning_inventory_and_snapshot_are_pure_codecs() {
 						matches!(&m.vis, syn::Visibility::Restricted(v) if v.in_token.is_none() && v.path.is_ident("super"))
 					);
 				}
-				syn::Item::Mod(m) if name == "owner_core.rs" && m.ident == "evidence" => {
-					assert!(m.content.is_none());
-					assert!(matches!(m.vis, syn::Visibility::Inherited));
-				}
 				syn::Item::Trait(_) | syn::Item::Static(_) | syn::Item::Mod(_) => {
 					panic!("{name}: no traits, statics or modules")
 				}
@@ -1870,12 +1865,7 @@ fn provisioning_inventory_and_snapshot_are_pure_codecs() {
 	}
 
 	// Exact new private format surface; retain the same no-I/O/no-trust token bans.
-	for name in [
-		"inventory/v2.rs",
-		"owner_core/v2.rs",
-		"owner_core/evidence.rs",
-		"format.rs",
-	] {
+	for name in ["inventory/v2.rs", "owner_core/v2.rs"] {
 		let text = fs::read_to_string(root.join(name)).unwrap();
 		assert_eq!(
 			banned(text.parse().unwrap()),
@@ -1883,7 +1873,6 @@ fn provisioning_inventory_and_snapshot_are_pure_codecs() {
 			"{name}: prohibited token"
 		);
 		let mut functions = Vec::new();
-		let mut methods = Vec::new();
 		let mut constants = Vec::new();
 		for item in syn::parse_file(&text).unwrap().items {
 			match item {
@@ -1900,40 +1889,14 @@ fn provisioning_inventory_and_snapshot_are_pure_codecs() {
 						functions.push(f.sig.ident.to_string());
 					}
 				}
-				syn::Item::Enum(e) if name == "format.rs" && e.ident == "DirectoryFormat2" => {
-					assert!(root2_scoped(&e.vis));
-					assert_eq!(
-						e.variants
-							.iter()
-							.map(|v| v.ident.to_string())
-							.collect::<Vec<_>>(),
-						["One", "Two"]
-					);
-					assert!(e.variants.iter().all(|v| v.fields.is_empty()));
-				}
-				syn::Item::Impl(i) if name == "format.rs" => {
-					assert!(i.trait_.is_none());
-					assert_eq!(quote_type(&i.self_ty), "DirectoryFormat2");
-					for item in i.items {
-						let syn::ImplItem::Fn(f) = item else {
-							panic!("format impl methods only")
-						};
-						assert!(
-							matches!(&f.vis,syn::Visibility::Restricted(v) if v.in_token.is_none()&&v.path.is_ident("super"))
-						);
-						methods.push(f.sig.ident.to_string());
-					}
-				}
 				_ => panic!("{name}: unexpected producer/type/module item"),
 			}
 		}
 		functions.sort();
-		methods.sort();
 		constants.sort();
-		let (f, m, c): (&[&str], &[&str], &[&str]) = match name {
+		let (f, c): (&[&str], &[&str]) = match name {
 			"inventory/v2.rs" => (
 				&["decode_event2", "encode_event2", "fold_events2"],
-				&[],
 				&["EVENT_BYTES2", "MAX_LOG_BYTES2", "MAX_TAIL2"],
 			),
 			"owner_core/v2.rs" => (
@@ -1947,81 +1910,53 @@ fn provisioning_inventory_and_snapshot_are_pure_codecs() {
 					"repair_context2",
 					"repair_op_id2",
 				],
-				&[],
 				&["MAX_EVIDENCE_BYTES2"],
 			),
-			"owner_core/evidence.rs" => (
-				&[
-					"decode_evidence2",
-					"encode_evidence2",
-					"evidence_name2",
-					"expected_repair_event2",
-					"repair_context2",
-					"repair_op_id2",
-				],
-				&[],
-				&[],
-			),
-			_ => (
-				&[],
-				&[
-					"classify",
-					"context",
-					"decide",
-					"decode_evidence",
-					"encode",
-					"encode_evidence",
-					"expected",
-					"fold",
-					"max_evidence",
-					"max_log",
-				],
-				&[],
-			),
+			_ => unreachable!("{name}"),
 		};
 		assert_eq!(functions, f, "{name}: free functions");
-		assert_eq!(methods, m, "{name}: methods");
 		assert_eq!(constants, c, "{name}: constants");
 	}
 
 	entrypoints.sort();
-	assert_eq!(
-		entrypoints,
-		[
-			"classify2",
-			"decide2",
-			"decode_event2",
-			"decode_evidence2",
-			"decode_snapshot2",
-			"decode_terminal3",
-			"encode_event2",
-			"encode_evidence2",
-			"encode_snapshot2",
-			"encode_terminal3",
-			"encode_terminal_artifact3",
-			"encode_terminal_observation3",
-			"event_request_key2",
-			"evidence_name2",
-			"expected_repair_event2",
-			"fold_events2",
-			"observation_digest3",
-			"op_id2",
-			"read_terminal3",
-			"repair_context2",
-			"repair_op_id2",
-			"request_key2",
-			"terminal_record3",
-			"tuple_entry_last_seq2",
-			"tuple_export_seq2",
-			"tuple_inventory_pin2",
-			"tuple_manifest2",
-			"tuple_manifest_len2",
-			"tuple_manifest_pin2",
-			"tuple_record2",
-			"validate_replica_tuple2"
-		]
-	);
+	assert_eq!(entrypoints, PROVISIONING_ENTRYPOINTS);
+	// Probe: one more root2-scoped free function in a scanned file is a different census.
+	let mut probe = entrypoints.clone();
+	let extra = "pub(in crate::storage::mutation_visibility::root2) fn decode_event2() {}";
+	for item in syn::parse_file(extra).unwrap().items {
+		if let syn::Item::Fn(f) = item
+			&& root2_scoped(&f.vis)
+		{
+			probe.push(f.sig.ident.to_string());
+		}
+	}
+	probe.sort();
+	assert_ne!(probe, PROVISIONING_ENTRYPOINTS);
 }
+// The exact provisioning entrypoints once format 2 is the only owner format: no v1 inventory codec
+// or fold, owner core, classifier or evidence codec remains outside the private `v2` children.
+const PROVISIONING_ENTRYPOINTS: [&str; 20] = [
+	"decode_snapshot2",
+	"decode_terminal3",
+	"encode_snapshot2",
+	"encode_terminal3",
+	"encode_terminal_artifact3",
+	"encode_terminal_observation3",
+	"event_request_key2",
+	"observation_digest3",
+	"op_id2",
+	"read_terminal3",
+	"request_key2",
+	"terminal_record3",
+	"tuple_entry_last_seq2",
+	"tuple_export_seq2",
+	"tuple_inventory_pin2",
+	"tuple_manifest2",
+	"tuple_manifest_len2",
+	"tuple_manifest_pin2",
+	"tuple_record2",
+	"validate_replica_tuple2",
+];
 // Owner I/O: std only, zero unsafe, libc constants only, no network, clock, env, trust or root
 // construction; exactly nine exported methods on OwnerDir2 and no exported free functions. Its
 // one private child, owner_log/ops.rs, obeys the same bans and exposes nothing beyond owner_log.
@@ -5082,10 +5017,7 @@ fn profile_two_manifest_codec_is_additive_and_dormant() {
 		(
 			"provisioning/inventory.rs",
 			&[
-				"AdminManifestTwo2",
 				"ManifestProfile2",
-				"manifest_profile2",
-				"ADMIN_MANIFEST_P2_BYTES2",
 				"AnyAdminManifest2",
 				"any_manifest_digest2",
 			],
@@ -5103,7 +5035,6 @@ fn profile_two_manifest_codec_is_additive_and_dormant() {
 			"provisioning/owner_core/v2.rs",
 			&["any_manifest_digest2", "ManifestProfile2"],
 		),
-		("provisioning/format.rs", &[]),
 		("provisioning/snapshot.rs", &["ManifestProfile2"]),
 		(
 			"provisioning/terminal.rs",
@@ -5118,12 +5049,7 @@ fn profile_two_manifest_codec_is_additive_and_dormant() {
 		("provisioning/owner_log/directory.rs", &[]),
 		(
 			"provisioning/replica_anchor.rs",
-			&[
-				"admin_manifest_two_digest2",
-				"ADMIN_MANIFEST_P2_BYTES2",
-				"AnyAdminManifest2",
-				"ADMIN_MANIFEST_P3_BYTES3",
-			],
+			&["AnyAdminManifest2", "ADMIN_MANIFEST_P3_BYTES3"],
 		),
 		(
 			"provisioning/replica_read.rs",
@@ -5217,64 +5143,137 @@ fn profile_two_manifest_codec_is_additive_and_dormant() {
 	}
 }
 
-// M2: the frozen d6ce07b8 codec copy used by the old-reader proof is test-only. It is reached only
-// through `#[cfg(test)] mod tests` in provisioning/mod.rs, its wrapper includes exactly the two
-// frozen excerpts, and no other file under src names it or includes a `.in` file.
+// The frozen old-reader copies are deleted (c1, §14.1): no `.in` file exists under src and no
+// source file includes one. The checker is probed with a synthetic vendored file and include.
+fn vendored_reader_findings(files: &[(PathBuf, Option<String>)]) -> Vec<String> {
+	let mut found = Vec::new();
+	for (path, text) in files {
+		if path.extension().is_some_and(|x| x == "in") {
+			found.push(format!("{}: .in file", path.display()));
+		}
+		if let Some(text) = text
+			&& text.contains(".in\")")
+		{
+			found.push(format!("{}: includes a .in file", path.display()));
+		}
+	}
+	found
+}
 #[test]
-fn frozen_published_codecs_are_test_only() {
+fn no_vendored_reader_copy_exists_under_src() {
 	let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
-	let provisioning = src.join("storage/mutation_visibility/root2/provisioning");
-	let module =
-		syn::parse_file(&fs::read_to_string(provisioning.join("mod.rs")).unwrap()).unwrap();
-	let tests = module
-		.items
-		.iter()
-		.find_map(|item| match item {
-			syn::Item::Mod(m) if m.ident == "tests" => Some(m),
-			_ => None,
-		})
-		.unwrap();
-	assert!(
-		tests.content.is_none()
-			&& matches!(tests.vis, syn::Visibility::Inherited)
-			&& tests
-				.attrs
-				.iter()
-				.any(|a| matches!(&a.meta, syn::Meta::List(l)
-				if l.path.is_ident("cfg") && l.tokens.to_string() == "test"))
-	);
-	let frozen = provisioning.join("tests/frozen_d6ce07b8");
-	let mut names: Vec<_> = fs::read_dir(&frozen)
-		.unwrap()
-		.map(|e| e.unwrap().file_name().into_string().unwrap())
-		.collect();
-	names.sort();
-	assert_eq!(names, ["inventory.in", "snapshot.in"]);
-	let wrapper_path = provisioning.join("tests/frozen_d6ce07b8.rs");
-	let wrapper = fs::read_to_string(&wrapper_path).unwrap();
-	assert_eq!(wrapper.matches("include!(").count(), 2);
-	assert!(wrapper.contains("include!(\"frozen_d6ce07b8/inventory.in\")"));
-	assert!(wrapper.contains("include!(\"frozen_d6ce07b8/snapshot.in\")"));
+	let mut files = Vec::new();
 	let mut stack = vec![src];
 	while let Some(dir) = stack.pop() {
 		for e in fs::read_dir(dir).unwrap() {
 			let p = e.unwrap().path();
 			if p.is_dir() {
-				if p != frozen {
-					stack.push(p);
-				}
-			} else if p.extension().is_some_and(|x| x == "rs") {
-				let t = fs::read_to_string(&p).unwrap();
-				let declares = p == provisioning.join("tests/mod.rs")
-					|| p == provisioning.join("tests/frozen_reader.rs")
-					|| p == wrapper_path;
-				assert_eq!(t.contains("frozen_d6ce07b8"), declares, "{}", p.display());
-				assert!(declares || !t.contains(".in\")"), "{}", p.display());
+				stack.push(p);
 			} else {
-				assert!(!p.extension().is_some_and(|x| x == "in"), "{}", p.display());
+				let text = if p.extension().is_some_and(|x| x == "rs") {
+					Some(fs::read_to_string(&p).unwrap())
+				} else {
+					None
+				};
+				files.push((p, text));
 			}
 		}
 	}
+	assert!(files.len() > 100);
+	assert_eq!(vendored_reader_findings(&files), Vec::<String>::new());
+	// Probes: a vendored excerpt and an include of one are each found.
+	let probe = [
+		(PathBuf::from("frozen/inventory.in"), None),
+		(
+			PathBuf::from("frozen.rs"),
+			Some(String::from("include!(\"frozen/inventory.in\");")),
+		),
+	];
+	assert_eq!(vendored_reader_findings(&probe).len(), 2);
+}
+
+// Directory format 2 is the only owner format (c1, D-O1): `open` refuses an unmarked directory with
+// `Unformatted` and a marked one holding a VISIEV02 log with `ForeignFormat`; the framing check and
+// the log read refuse VISIEV02; no format dispatch exists. Text pins, each probed by a mutation.
+fn owner_directory_is_format_two_only(directory: &str, ops: &str) -> Result<(), &'static str> {
+	let squash = |t: &str| t.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+	let open = directory
+		.find("fn open(")
+		.and_then(|a| {
+			directory[a..]
+				.find("fn check_framing(")
+				.map(|b| &directory[a..a + b])
+		})
+		.ok_or("open")?;
+	let open = squash(open);
+	if !open.contains("Err(OwnerIoError2::Unformatted)}") {
+		return Err("unmarked directory is not Unformatted");
+	}
+	if !open.contains(
+		"ifprefix==b\"VISIEV02\"{returnErr(OwnerIoError2::ForeignFormat);}returnOk(owner);",
+	) {
+		return Err("a marked directory with a VISIEV02 log opens");
+	}
+	let framing = directory
+		.find("fn check_framing(")
+		.map(|a| squash(&directory[a..]))
+		.ok_or("check_framing")?;
+	if !framing.contains("&&p==b\"VISIEV02\"{returnErr(OwnerIoError2::ForeignFormat);}") {
+		return Err("framing check accepts VISIEV02");
+	}
+	if !squash(ops)
+		.contains("ifbytes.starts_with(b\"VISIEV02\"){returnErr(OwnerIoError2::ForeignFormat);}")
+	{
+		return Err("log read accepts VISIEV02");
+	}
+	if directory.contains("DirectoryFormat2") || ops.contains("DirectoryFormat2") {
+		return Err("format dispatch");
+	}
+	Ok(())
+}
+#[test]
+fn owner_directory_refuses_unmarked_and_v1_directories() {
+	let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+		.join("src/storage/mutation_visibility/root2/provisioning");
+	let directory = fs::read_to_string(root.join("owner_log/directory.rs")).unwrap();
+	let ops = fs::read_to_string(root.join("owner_log/ops.rs")).unwrap();
+	assert_eq!(owner_directory_is_format_two_only(&directory, &ops), Ok(()));
+	assert!(!root.join("format.rs").exists());
+	assert!(!root.join("owner_core/evidence.rs").exists());
+	for (from, to, want) in [
+		(
+			"Err(OwnerIoError2::Unformatted)",
+			"Ok(owner)",
+			"unmarked directory is not Unformatted",
+		),
+		(
+			"if prefix == b\"VISIEV02\"",
+			"if prefix == b\"VISXXX02\"",
+			"a marked directory with a VISIEV02 log opens",
+		),
+		(
+			"&& p == b\"VISIEV02\"",
+			"&& p == b\"VISXXX02\"",
+			"framing check accepts VISIEV02",
+		),
+	] {
+		assert!(directory.contains(from), "{from}");
+		assert_eq!(
+			owner_directory_is_format_two_only(&directory.replace(from, to), &ops),
+			Err(want)
+		);
+	}
+	assert_eq!(
+		owner_directory_is_format_two_only(
+			&directory,
+			&ops.replace("bytes.starts_with(b\"VISIEV02\")", "false")
+		),
+		Err("log read accepts VISIEV02")
+	);
+	assert_eq!(
+		owner_directory_is_format_two_only(&format!("{directory}\n// DirectoryFormat2"), &ops),
+		Err("format dispatch")
+	);
 }
 
 // M3: the profile-2 binding surface, exactly. Syntactic regression pins only (no name resolution,

@@ -54,15 +54,6 @@ fn retire_current_epochs_domains_and_command_digest_bound() {
 	);
 }
 #[test]
-fn retire_profiles_one_two_canonical_denied8() {
-	let f = F::new();
-	let p = f.proof(&Command2::RetireRoot, [3, 0]);
-	for profile in ["a", "b"] {
-		let mut old = wire::Fixture::new(profile);
-		denied(old.apply(Command2::RetireRoot, Some(p.clone())), 8);
-	}
-}
-#[test]
 fn retire_kind20_payload_and_malformed_command_codec() {
 	let f = F::new();
 	let c = Command2::RetireRoot;

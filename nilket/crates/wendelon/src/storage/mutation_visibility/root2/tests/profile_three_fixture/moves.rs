@@ -130,7 +130,8 @@ fn s1_manifest_carries_the_s1_claim_namespace() {
 #[test]
 fn support_roots_are_unchanged_by_the_move() {
 	for (seed, literal) in [(13, M3_PRIMARY), (SIBLING_RECOVERY_SEED, M3_SIBLING)] {
-		let mut base = Fixture::new("b").any.admission().clone();
+		// `BASE_B` is manifest "b"'s admission part (T-MOVE (i)).
+		let mut base = BASE_B.clone();
 		base.admin_key = key(11);
 		let old = build_three(
 			base,

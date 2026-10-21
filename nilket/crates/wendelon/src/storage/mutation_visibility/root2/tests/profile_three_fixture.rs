@@ -390,7 +390,6 @@ pub(super) struct Chain {
 	pub any: AnyAdminManifest2,
 	pub cmd: Command2,
 	pub entry: TrustedEntry2,
-	pub committed: CommittedEntry2,
 	pub rooted: MutationAuthorityState2,
 	pub tuple: PinnedBoundTuple2,
 }
@@ -422,7 +421,7 @@ pub(super) fn chain_of(bytes: &[u8], length: u64) -> Chain {
 	let bytes = bytes.to_vec();
 	let any = AnyAdminManifest2::decode(&bytes).unwrap();
 	let pin = exact_pin(&bytes);
-	let (cmd, entry, committed, rooted) = rooted(&bytes, length);
+	let (cmd, entry, _, rooted) = rooted(&bytes, length);
 	let observation = observe_bootstrap2(&rooted).unwrap();
 	let record = BootstrapRecord2 {
 		identity: observation.identity,
@@ -457,7 +456,6 @@ pub(super) fn chain_of(bytes: &[u8], length: u64) -> Chain {
 		any,
 		cmd,
 		entry,
-		committed,
 		rooted,
 		tuple,
 	}

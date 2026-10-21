@@ -69,8 +69,9 @@ fn exact_snapshot_matches_current_wire_for_minimal_and_bulk_models() {
 }
 #[test]
 fn exact_snapshot_matches_positive_permission_and_mixed_states() {
-	// Fixed-width counts never change width at127/128 or255/256; test those values
-	// explicitly, plus empty/minimal and the supported permission-count limit.
+	// Fixed-width counts never change width at 127/128 or 255/256; test those values explicitly,
+	// plus the minimal section (counts 0 and 1 both leave only the twin's admitting permission)
+	// and the supported permission-count limit.
 	for count in [0, 1, 2, 127, 128, 255, 256, 4096] {
 		let mut r = model("E");
 		permissions(&mut r, count);

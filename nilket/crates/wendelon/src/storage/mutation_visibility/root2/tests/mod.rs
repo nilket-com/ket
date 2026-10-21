@@ -1,7 +1,6 @@
 use super::*;
 use super::{codec::*, validation::*};
 mod acquisition;
-mod admin_command;
 mod admin_install;
 mod admin_statement;
 mod admission_command;
@@ -27,9 +26,7 @@ mod profile_three_fixture;
 mod profile_three_invariants;
 mod profile_three_reserve;
 mod profile_two_binding;
-mod profile_two_chain;
 mod profile_two_refusal;
-mod profile_two_reserve;
 mod recovery;
 mod refusals;
 mod removed_forms;

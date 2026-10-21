@@ -184,33 +184,6 @@ fn malformed_carrier_sidecar_precedes_profile_and_auth() {
 	));
 }
 #[test]
-fn profile_one_two_new_forms_canonical_auth_denied8() {
-	for profile in ["a", "b"] {
-		let mut f = wire::Fixture::new(profile);
-		for c in [
-			Command2::RotateAdmin(key(40)),
-			Command2::RotateGovernance(key(41)),
-			Command2::RotateRecovery(key(42)),
-		] {
-			let p = role_command::encode_role_proof3(
-				role_command::context_digest(&install_admin2(&f.state, &f.pin).unwrap()),
-				c.digest(f.dep.generation, f.dep.cluster).unwrap(),
-				[(0, 0, false, [0; 64]); 2],
-			)
-			.unwrap();
-			deny(f.apply(c, Some(p.to_vec())), 8);
-		}
-		let a = install_admin2(&f.state, &f.pin).unwrap();
-		deny(
-			f.apply(
-				Command2::EpochAdmissionPermission(epoch_for(&a, 11, 0)),
-				None,
-			),
-			8,
-		);
-	}
-}
-#[test]
 fn installed_view_stale_cut_cannot_reach_admission_effect() {
 	let mut f = F::new();
 	let stale = f.installed();

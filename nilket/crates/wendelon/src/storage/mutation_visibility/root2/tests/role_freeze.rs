@@ -221,7 +221,7 @@ fn old_role_preimages_and_rotation_vectors_unchanged() {
 fn full_command_profile_frozen_state_matrix() {
 	let rows: serde_json::Value =
 		serde_json::from_str(include_str!("role_freeze/matrix.json")).unwrap();
-	assert_eq!(rows.as_array().unwrap().len(), 120);
+	assert_eq!(rows.as_array().unwrap().len(), 40);
 	let mut seen = std::collections::BTreeSet::new();
 	for row in rows.as_array().unwrap() {
 		let kind = row["kind"].as_u64().unwrap() as u8;
@@ -255,24 +255,23 @@ fn full_command_profile_frozen_state_matrix() {
 			.into_iter()
 			.find(|c| c.payload(f.f.dep.generation, f.f.dep.cluster).unwrap()[32] == kind)
 			.unwrap();
-		if frozen && profile < 3 {
-			let mut state = f.root().state.clone();
-			state.control_len = if profile == 1 { 137 } else { 189 };
-			assert!(super::super::validation::validate_state(&state).is_err());
-		} else {
-			let expected = frozen && [2, 3, 4, 5, 6, 7, 10, 11, 12, 13, 17].contains(&kind);
-			assert_eq!(
-				super::super::role_freeze::blocked(&f.root().state, &c),
-				expected
-			);
-		}
+		assert_eq!(profile, 3);
+		let expected = frozen && [2, 3, 4, 5, 6, 7, 10, 11, 12, 13, 17].contains(&kind);
+		assert_eq!(
+			super::super::role_freeze::blocked(&f.root().state, &c),
+			expected
+		);
 	}
-	for profile in ["a", "b"] {
-		for c in [Command2::Freeze(zero()), Command2::Unfreeze(zero())] {
-			let mut f = wire::Fixture::new(profile);
-			let proof = F::new().proof(&c);
-			deny(f.apply(c, Some(proof)), 8);
-		}
+	// A frozen state committed to any length but 241 is not a valid root.
+	let mut f = F::new();
+	f.freeze();
+	for length in [0, 240, 242] {
+		let mut state = f.root().state.clone();
+		state.control_len = length;
+		assert!(
+			super::super::validation::validate_state(&state).is_err(),
+			"{length}"
+		);
 	}
 }
 

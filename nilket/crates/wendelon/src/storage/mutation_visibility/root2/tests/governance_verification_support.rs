@@ -16,9 +16,7 @@ use crate::storage::mutation_visibility::root2::provisioning::inventory::{
 use crate::storage::mutation_visibility::root2::provisioning::replica_anchor::*;
 use crate::storage::mutation_visibility::root2::provisioning::snapshot::encode_snapshot2;
 use crate::storage::mutation_visibility::root2::recovery::Deployment2;
-use crate::storage::mutation_visibility::root2::tests::{
-	profile_three_fixture, profile_two_binding,
-};
+use crate::storage::mutation_visibility::root2::tests::profile_three_fixture;
 use crate::storage::mutation_visibility::root2::trust::{TrustedEntry2, VerifiedCommand2};
 use crate::storage::mutation_visibility::root2::types::*;
 use crate::storage::mutation_visibility::root2::verification::{VerifyError2, advance_verified2};
@@ -103,9 +101,6 @@ pub(in crate::storage::mutation_visibility::root2) struct Fixture {
 	pub(in crate::storage::mutation_visibility::root2) entries: Vec<E>,
 }
 impl Fixture {
-	pub(in crate::storage::mutation_visibility::root2) fn new(profile: &str) -> Self {
-		Self::from_manifest(profile_two_binding::manifest_bytes(profile))
-	}
 	/// The `M3_PRIMARY` root.
 	pub(in crate::storage::mutation_visibility::root2) fn primary() -> Self {
 		Self::profile_three(&profile_three_fixture::M3_PRIMARY)

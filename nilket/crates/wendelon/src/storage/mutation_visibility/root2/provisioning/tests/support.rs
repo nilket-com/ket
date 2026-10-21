@@ -1,3 +1,4 @@
+use crate::storage::mutation_visibility::root2::codec::hash;
 use crate::storage::mutation_visibility::root2::provisioning::inventory::*;
 
 pub(super) fn unhex(s: &str) -> Vec<u8> {
@@ -9,48 +10,22 @@ pub(super) fn unhex(s: &str) -> Vec<u8> {
 pub(super) fn vectors() -> serde_json::Value {
 	serde_json::from_str(include_str!("inventory_vectors.json")).unwrap()
 }
-pub(super) fn event_bytes(name: &str) -> Vec<u8> {
-	unhex(vectors()["events"][name].as_str().unwrap())
-}
-pub(super) fn log_bytes() -> Vec<u8> {
-	unhex(vectors()["log"].as_str().unwrap())
-}
+/// The kept empty v1 snapshot (`snapshots.empty`, §5): version 1 holds no entries.
 pub(super) fn snapshot_bytes(name: &str) -> Vec<u8> {
+	assert_eq!(name, "empty", "only the empty v1 snapshot is kept");
 	unhex(vectors()["snapshots"][name].as_str().unwrap())
-}
-pub(super) fn event(name: &str) -> Event2 {
-	decode_event2(&event_bytes(name)).unwrap()
-}
-// Recomputes the trailing SHA-256 so a test reaches the check it targets.
-pub(super) fn reseal_event(mut b: Vec<u8>) -> Vec<u8> {
-	let sum = crate::storage::mutation_visibility::root2::codec::hash(b"", &b[..352]);
-	b[352..].copy_from_slice(&sum);
-	b
 }
 pub(super) fn reseal_snapshot(mut b: Vec<u8>) -> Vec<u8> {
 	let n = b.len() - 32;
-	let sum = crate::storage::mutation_visibility::root2::codec::hash(b"", &b[..n]);
+	let sum = hash(b"", &b[..n]);
 	b[n..].copy_from_slice(&sum);
 	b
 }
-pub(super) fn encoded(e: &Event2) -> Vec<u8> {
-	encode_event2(e).unwrap().to_vec()
-}
-pub(super) fn repair_at(seq: u64, op: u64) -> Event2 {
-	let mut op_id = [0u8; 16];
-	op_id[..8].copy_from_slice(&op.to_le_bytes());
-	op_id[15] = 0xee;
-	Event2 {
-		seq,
-		op_id,
-		identity: None,
-		body: EventBody2::Repair {
-			tail_sha256: [0x77; 32],
-			original_len: (seq - 1) * 384 + 10,
-			boundary: (seq - 1) * 384,
-			tail_len: 10,
-		},
-	}
+/// A removed-format (VISIEV02) log prefix: only its magic matters to the framing refusal.
+pub(super) fn visiev02_bytes() -> Vec<u8> {
+	let mut b = vec![0u8; 384];
+	b[..8].copy_from_slice(b"VISIEV02");
+	b
 }
 
 // ---- Profile 3 over VISOEV02 (the `p3_` keys) ----
@@ -68,7 +43,7 @@ pub(super) fn p3_event(name: &str) -> Event2 {
 }
 /// Recomputes the trailing SHA-256 of a 512-byte VISOEV02 event.
 pub(super) fn reseal_event3(mut b: Vec<u8>) -> Vec<u8> {
-	let sum = crate::storage::mutation_visibility::root2::codec::hash(b"", &b[..480]);
+	let sum = hash(b"", &b[..480]);
 	b[480..].copy_from_slice(&sum);
 	b
 }
@@ -77,14 +52,20 @@ pub(super) fn encoded3(e: &Event2) -> Vec<u8> {
 }
 /// A valid VISOEV02 Repair at `seq`, claiming a 10-byte tail after the previous whole event.
 pub(super) fn repair_at3(seq: u64, op: u64) -> Event2 {
-	let mut e = repair_at(seq, op);
-	e.body = EventBody2::Repair {
-		tail_sha256: [0x77; 32],
-		original_len: (seq - 1) * v2::EVENT_BYTES2 as u64 + 10,
-		boundary: (seq - 1) * v2::EVENT_BYTES2 as u64,
-		tail_len: 10,
-	};
-	e
+	let mut op_id = [0u8; 16];
+	op_id[..8].copy_from_slice(&op.to_le_bytes());
+	op_id[15] = 0xee;
+	Event2 {
+		seq,
+		op_id,
+		identity: None,
+		body: EventBody2::Repair {
+			tail_sha256: [0x77; 32],
+			original_len: (seq - 1) * v2::EVENT_BYTES2 as u64 + 10,
+			boundary: (seq - 1) * v2::EVENT_BYTES2 as u64,
+			tail_len: 10,
+		},
+	}
 }
 /// A VISOEV02 event framed directly (no codec round trip); the fold is the one validator.
 pub(super) fn frame3(
@@ -128,10 +109,7 @@ pub(super) fn p3_reserve_frame(manifest: &[u8], seq: u64, op_id: [u8; 16]) -> Ve
 	let identity = RootIdentity2 {
 		generation: manifest[12..28].try_into().unwrap(),
 		cluster: manifest[28..44].try_into().unwrap(),
-		pin: crate::storage::mutation_visibility::root2::codec::hash(
-			b"VISROOT2-ADMIN-MANIFEST\0",
-			manifest,
-		),
+		pin: hash(b"VISROOT2-ADMIN-MANIFEST\0", manifest),
 		admin_key: manifest[68..100].try_into().unwrap(),
 	};
 	frame3(1, seq, op_id, Some(identity), manifest)
