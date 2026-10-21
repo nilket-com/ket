@@ -17303,12 +17303,17 @@ async fn expired_table_outcome_keeps_warm_cache_replay_but_cold_replay_is_indete
 		.unwrap();
 	let batch = typed_table_batch(vec![629]);
 	let mut meta = typed_table_meta(&descriptor, batch.num_rows());
-	meta.parent_write_id.idempotency_ttl_ms = 1000;
+	// The longest TTL the store admits, so no stall between the write and the
+	// next resolve can expire it early; expiry is then applied explicitly.
+	const TTL_MS: u32 = 300_000;
+	meta.parent_write_id.idempotency_ttl_ms = TTL_MS;
+	let before_write = crate::network::mutation_outcomes::now_ms_for_test();
 	let (first, _) = node
 		.data_server
 		.table_write(meta, batch.clone())
 		.await
 		.unwrap();
+	let after_write = crate::network::mutation_outcomes::now_ms_for_test();
 	assert_eq!(first.write.status, WriteStatus::OK);
 	assert_eq!(
 		first.write.mutation_commit_knowledge(),
@@ -17330,30 +17335,30 @@ async fn expired_table_outcome_keeps_warm_cache_replay_but_cold_replay_is_indete
 	);
 	let retained = node.data_server.idempotency.len();
 	let durable_bytes = node.slab.local_l1_bytes().await;
-	// The outcome store uses SystemTime, not Tokio time. Resolve until actual expiry,
-	// with a steady-clock bound: clock movement or a stalled host fails this control.
-	let wait_started = std::time::Instant::now();
-	let expired = loop {
-		let resolved = node
-			.data_server
-			.resolve_mutation_outcome(request)
-			.await
-			.unwrap();
-		if resolved.resolution == MutationResolutionStatus::EXPIRED {
-			break resolved;
-		}
-		assert_eq!(resolved.resolution, MutationResolutionStatus::PRESENT);
-		assert!(
-			wait_started.elapsed() < Duration::from_secs(5),
-			"outcome expiry not observed within 5s"
-		);
-		tokio::time::sleep(Duration::from_millis(25)).await;
-	};
+	// The write recorded its deadline TTL after its own commit, on the store's
+	// SystemTime clock. Check that deadline, then let it pass, instead of
+	// waiting out a wall-clock TTL that a stalled host can overrun between the
+	// write and the first resolve.
+	let deadline = node
+		.data_server
+		.mutation_outcomes
+		.expires_at_ms_for_test(meta.parent_write_id, meta.tenant_id)
+		.expect("the write recorded its outcome");
+	let ttl = u64::from(TTL_MS);
 	assert!(
-		wait_started.elapsed() <= Duration::from_secs(5),
-		"expiry observation exceeded the declared wait"
+		(before_write + ttl..=after_write + ttl).contains(&deadline),
+		"deadline {deadline} is not the write time plus the TTL"
 	);
-	let wait_ms = wait_started.elapsed().as_millis();
+	node.data_server
+		.mutation_outcomes
+		.expire_for_test(meta.parent_write_id, meta.tenant_id)
+		.await;
+	let expired = node
+		.data_server
+		.resolve_mutation_outcome(request)
+		.await
+		.unwrap();
+	assert_eq!(expired.resolution, MutationResolutionStatus::EXPIRED);
 	assert_eq!(expired.write.status, WriteStatus::WRITE_OPERATION_EXPIRED);
 	assert_eq!(
 		expired.write.mutation_stop_reason(),
@@ -17383,8 +17388,7 @@ async fn expired_table_outcome_keeps_warm_cache_replay_but_cold_replay_is_indete
 		.unwrap();
 	assert_eq!(after_warm.resolution, MutationResolutionStatus::EXPIRED);
 	println!(
-		"TTL_PIN ttl_ms=1000 wait_ms={} retained_entries={} expired_status={} expired_stop={} expired_commit={} warm_status={} warm_stop={} warm_commit={} resolution_after_warm=Expired",
-		wait_ms,
+		"TTL_PIN ttl_ms={TTL_MS} deadline_checked=true retained_entries={} expired_status={} expired_stop={} expired_commit={} warm_status={} warm_stop={} warm_commit={} resolution_after_warm=Expired",
 		retained,
 		expired.write.status.0,
 		expired.write.mutation_stop_reason().0,
