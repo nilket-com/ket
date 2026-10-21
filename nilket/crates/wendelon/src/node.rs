@@ -3465,7 +3465,7 @@ mod tests {
 		assert!(node.shutdown().await.is_err());
 		DataDirectoryOwner::acquire_existing(&dir).unwrap();
 		let error = retained_io
-			.submit_fsync(-1)
+			.submit_fsync(&Arc::new(std::fs::File::open("/dev/null").unwrap()))
 			.await
 			.err()
 			.expect("closed worker");
