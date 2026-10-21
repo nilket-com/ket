@@ -9245,17 +9245,25 @@ fn adr076_pending_witness_never_expires_on_peer_loss() {
 		"/// The leader's own (local) participant",
 	);
 	assert!(service.contains("pending: DashMap<ReplicaOpKey2, PendingReplicaTentative>"));
-	assert!(service.contains("op_locks: DashMap<ReplicaOpKey2, Arc<Mutex<()>>>"));
-	assert!(!service.contains("lock_owned") && !service.contains("blocking_lock"));
-	assert!(service.contains("self.op_locks.remove_if(&key, |_, stored|"));
-	assert!(service.contains("Arc::ptr_eq(stored, gate) && Arc::strong_count(gate) == 2"));
-	assert!(!service.contains("self.op_locks.remove("));
-	assert!(service.contains("if self.pending.contains_key(&key)"));
+	assert!(service.contains("op_locks: DashMap<ReplicaOpKey2, ReplicaGateEntry>"));
+	assert!(service.contains("ReplicaGate::admit(self, key).await"));
+	assert!(!service.contains("Arc::strong_count") && !service.contains("reclaim_gate2"));
+	let gate = source_region(
+		&counter,
+		"struct ReplicaGateEntry",
+		"/// The server-side counter replica over",
+	);
+	assert!(gate.contains("participants: usize"));
+	assert!(gate.contains("mutex.lock_owned().await"));
+	assert!(gate.contains("drop(self.guard.take());"));
+	assert!(gate.contains("*count == 0 && !self.service.pending.contains_key(&self.key)"));
 	for marker in ["pub async fn commit(", "pub async fn rollback("] {
 		let start = service.find(marker).unwrap();
 		let next = &service[start..];
 		let zero = next.find("check_expected_key2(expected_key)?;").unwrap();
-		let gate = next.find("let _guard = gate.lock().await;").unwrap();
+		let gate = next
+			.find("let _gate = ReplicaGate::admit(self, key).await;")
+			.unwrap();
 		let lookup = next.find("self.pending.get(&key)").unwrap();
 		let compare = next.find("pending.key_identity != expected_key").unwrap();
 		assert!(zero < gate && gate < lookup && lookup < compare);

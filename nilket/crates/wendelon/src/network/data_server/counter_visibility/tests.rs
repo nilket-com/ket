@@ -96,8 +96,9 @@ async fn ctr4_public_read_hides_tentative_before_failed_add_rollback() {
 	let gate = fx
 		.follower
 		.counter_replica
-		.ctr4_pause_operation(origin, tenant(), 1);
-	let hold = gate.lock().await;
+		.ctr4_pause_operation(origin, tenant(), 1)
+		.await;
+	let hold = gate;
 	let task = tokio::spawn(dispatch_counter_add_shared(
 		fx.leader.clone(),
 		fx.leader_node.pool.clone(),
@@ -131,7 +132,7 @@ async fn ctr4_public_read_hides_tentative_before_failed_add_rollback() {
 		"setup: remote gate must hold the in-flight add"
 	);
 	let gate_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-	while Arc::strong_count(&gate) < 3 {
+	while hold.participant_count() < 2 {
 		assert!(
 			tokio::time::Instant::now() < gate_deadline,
 			"setup: remote operation never reached held gate"
