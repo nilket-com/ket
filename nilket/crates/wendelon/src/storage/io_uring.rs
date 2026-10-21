@@ -24,12 +24,14 @@ use crate::storage::ownership::{
 };
 use io_uring::{IoUring, opcode, types};
 use std::alloc::{self, Layout};
-use std::collections::HashMap;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use tokio::sync::{mpsc, oneshot};
+
+mod lifetime;
+use lifetime::{InFlightRequests, cancel_outstanding, fail_ring, retryable_enter_error};
 
 /// Default SQ / CQ depth. Large enough to keep a PCIe 4/5 NVMe saturated.
 pub const DEFAULT_RING_DEPTH: u32 = 1024;
@@ -47,6 +49,8 @@ pub const DIRECT_IO_ALIGN: usize = 4096;
 pub struct AlignedBuf {
 	ptr: *mut u8,
 	len: usize,
+	#[cfg(test)]
+	drop_probe: Option<Arc<AtomicBool>>,
 }
 
 // Safety: `AlignedBuf` owns its allocation exclusively; ownership
@@ -70,7 +74,12 @@ impl AlignedBuf {
 		if ptr.is_null() {
 			alloc::handle_alloc_error(layout);
 		}
-		Self { ptr, len }
+		Self {
+			ptr,
+			len,
+			#[cfg(test)]
+			drop_probe: None,
+		}
 	}
 
 	pub fn len(&self) -> usize {
@@ -102,6 +111,10 @@ impl AlignedBuf {
 
 impl Drop for AlignedBuf {
 	fn drop(&mut self) {
+		#[cfg(test)]
+		if let Some(probe) = &self.drop_probe {
+			probe.store(true, Ordering::Release);
+		}
 		let layout =
 			Layout::from_size_align(self.len, DIRECT_IO_ALIGN).expect("valid page-aligned layout");
 		// Safety: `ptr` was allocated with this layout by `AlignedBuf::new`.
@@ -233,10 +246,24 @@ type ObservationCompletionGate = Arc<
 	>,
 >;
 
+#[cfg(test)]
+struct SubmitFault {
+	errno: i32,
+	submitted: std::sync::mpsc::SyncSender<()>,
+	release: std::sync::mpsc::Receiver<()>,
+}
+#[cfg(test)]
+type SubmitFaultSlot = Arc<std::sync::Mutex<Option<SubmitFault>>>;
+
+#[cfg(test)]
+mod submit_error_tests;
+
 #[derive(Clone)]
 pub struct IoRingHandle {
 	#[cfg(test)]
 	cqe_gate: ObservationCompletionGate,
+	#[cfg(test)]
+	submit_fault: SubmitFaultSlot,
 	worker: Arc<RingWorker>,
 	class: IoUringClass,
 	pending_submissions: Arc<AtomicU64>,
@@ -419,6 +446,8 @@ pub fn spawn_io_thread_named_for_class(
 	let (tx, rx) = mpsc::channel::<IoMessage>((depth as usize).saturating_mul(2).max(1));
 	#[cfg(test)]
 	let cqe_gate = Arc::new(std::sync::Mutex::new(None));
+	#[cfg(test)]
+	let submit_fault = Arc::new(std::sync::Mutex::new(None));
 	let pending_submissions = Arc::new(AtomicU64::new(0));
 	let thread_name = thread_name.into();
 	metrics().set_io_uring_submission_queue_depth(class, 0);
@@ -427,6 +456,8 @@ pub fn spawn_io_thread_named_for_class(
 		let pending_submissions = pending_submissions.clone();
 		#[cfg(test)]
 		let thread_gate = cqe_gate.clone();
+		#[cfg(test)]
+		let thread_fault = submit_fault.clone();
 		move || {
 			io_thread_loop(
 				ring,
@@ -435,12 +466,16 @@ pub fn spawn_io_thread_named_for_class(
 				pending_submissions,
 				#[cfg(test)]
 				thread_gate,
+				#[cfg(test)]
+				thread_fault,
 			)
 		}
 	})?;
 	Ok(IoRingHandle {
 		#[cfg(test)]
 		cqe_gate,
+		#[cfg(test)]
+		submit_fault,
 		worker: Arc::new(RingWorker {
 			tx,
 			closed: AtomicBool::new(false),
@@ -479,9 +514,10 @@ fn io_thread_loop(
 	class: IoUringClass,
 	pending_submissions: Arc<AtomicU64>,
 	#[cfg(test)] cqe_gate: ObservationCompletionGate,
+	#[cfg(test)] submit_fault: SubmitFaultSlot,
 ) {
 	let mut cookie: u64 = 1;
-	let mut in_flight: HashMap<u64, InFlightRequest> = HashMap::new();
+	let mut in_flight = InFlightRequests::default();
 
 	loop {
 		// 1. Block when idle. Shutdown signalled by channel close.
@@ -535,10 +571,22 @@ fn io_thread_loop(
 		let _enter = span.enter();
 
 		// 3. Submit + wait for at least one completion.
-		match ring.submit_and_wait(1) {
+		match submit_and_wait(
+			&ring,
+			#[cfg(test)]
+			&submit_fault,
+		) {
 			Ok(_) => {}
+			// An enter error is not a CQE. Reap anything already completed
+			// below, then retry with every other request's resources intact.
+			Err(e) if retryable_enter_error(&e) => {
+				metrics().observe_io_uring_error(class, "submit", e.raw_os_error().unwrap());
+				std::thread::yield_now();
+			}
 			Err(e) => {
-				// Fatal: tear down all pending oneshots with the error.
+				// Stop admission and prove cancellation before releasing resources.
+				// If that proof fails, fail_ring quarantines them until process exit.
+				rx.close();
 				let errno = e.raw_os_error().unwrap_or(5);
 				metrics().observe_io_uring_error(class, "submit", errno);
 				tracing::warn!(
@@ -547,7 +595,7 @@ fn io_thread_loop(
 					errno,
 					"io_uring submit_and_wait failed"
 				);
-				drain_with_error(&mut in_flight, class, &e);
+				fail_ring(ring, in_flight, class, &e, |ring| cancel_outstanding(ring));
 				metrics().set_io_uring_completion_queue_depth(class, 0);
 				return;
 			}
@@ -596,12 +644,25 @@ fn io_thread_loop(
 	}
 }
 
+fn submit_and_wait(ring: &IoUring, #[cfg(test)] fault: &SubmitFaultSlot) -> std::io::Result<usize> {
+	#[cfg(test)]
+	if let Some(fault) = fault.lock().unwrap().take() {
+		// Submit real kernel work before injecting the enter error. The gate lets
+		// the test verify that no CQE exists yet (a socket read awaits peer data).
+		ring.submit()?;
+		fault.submitted.send(()).unwrap();
+		fault.release.recv().unwrap();
+		return Err(std::io::Error::from_raw_os_error(fault.errno));
+	}
+	ring.submit_and_wait(1)
+}
+
 /// Destructure an [`IoRequest`], build the SQE, and register the
 /// buffer + reply in `in_flight` before pushing to the SQ.
 fn push_request(
 	ring: &mut IoUring,
 	cookie: &mut u64,
-	in_flight: &mut HashMap<u64, InFlightRequest>,
+	in_flight: &mut InFlightRequests,
 	req: QueuedIoRequest,
 ) {
 	let id = *cookie;
@@ -670,25 +731,6 @@ fn push_request(
 		ring.submission()
 			.push(&entry)
 			.expect("SQ push: checked !is_full() above");
-	}
-}
-
-/// Send an error result to every pending oneshot, dropping their buffers.
-fn drain_with_error(
-	in_flight: &mut HashMap<u64, InFlightRequest>,
-	class: IoUringClass,
-	err: &std::io::Error,
-) {
-	// EIO on Linux; used as a generic fallback when the std::io::Error
-	// carries no OS errno (avoiding a direct `libc` dep).
-	const GENERIC_IO_ERRNO: i32 = 5;
-	let errno = err.raw_os_error().unwrap_or(GENERIC_IO_ERRNO);
-	for (_id, request) in in_flight.drain() {
-		metrics().observe_io_uring_error(class, request.op.as_str(), errno);
-		let _ = request.reply.send(IoCompletion {
-			buf: request.buf,
-			result: -errno,
-		});
 	}
 }
 
@@ -795,6 +837,7 @@ mod adr629_p2b_observed_ring_tests {
 		let (tx, mut rx) = mpsc::channel(1);
 		let handle = IoRingHandle {
 			cqe_gate: Arc::new(std::sync::Mutex::new(None)),
+			submit_fault: Arc::new(std::sync::Mutex::new(None)),
 			worker: Arc::new(RingWorker {
 				tx,
 				closed: AtomicBool::new(false),
