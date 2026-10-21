@@ -12664,6 +12664,11 @@ async fn append_durable_coalesces_concurrent_fdatasyncs() {
 		per_write_cost_estimate: Duration::from_millis(20),
 	})
 	.await;
+	// Two callers inside one window share one fdatasync. Whether the second
+	// arrives within 20 ms of the first is the scheduler's choice under load, so
+	// the batch is held after its window closes until both are queued.
+	let active = Arc::clone(&mgr.state.lock().await.active);
+	let hold = active.hold_group_commit_batches_for_test().await;
 
 	let first = {
 		let mgr = mgr.clone();
@@ -12673,7 +12678,6 @@ async fn append_durable_coalesces_concurrent_fdatasyncs() {
 				.unwrap();
 		})
 	};
-	tokio::time::sleep(Duration::from_millis(1)).await;
 	let second = {
 		let mgr = mgr.clone();
 		tokio::spawn(async move {
@@ -12682,14 +12686,24 @@ async fn append_durable_coalesces_concurrent_fdatasyncs() {
 				.unwrap();
 		})
 	};
+	let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+	while active.pending_durable_waiters_for_test().await < 2 {
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"both durable appends never queued for one batch"
+		);
+		tokio::time::sleep(Duration::from_millis(1)).await;
+	}
+	assert_eq!(
+		active.fdatasync_call_count(),
+		0,
+		"the held batch has not synced"
+	);
+	hold.close();
 	first.await.unwrap();
 	second.await.unwrap();
 
-	let fdatasync_calls = {
-		let state = mgr.state.lock().await;
-		state.active.fdatasync_call_count()
-	};
-	assert_eq!(fdatasync_calls, 1);
+	assert_eq!(active.fdatasync_call_count(), 1);
 }
 
 #[tokio::test]
