@@ -5553,14 +5553,27 @@ async fn post_dispatch_expiry_resolves_and_replays_as_one_indeterminate_operatio
 
 	let batch = typed_table_batch(vec![79]);
 	let mut meta = typed_table_meta(&descriptor, batch.num_rows());
-	meta.deadline_remaining_millis = 100;
-	node.data_server
-		.delay_next_local_durable_append_for_test(Duration::from_millis(300));
-	let (expired, _) = node
-		.data_server
-		.table_write(meta, batch.clone())
+	// The deadline must expire after dispatch. A short deadline raced against a
+	// fixed append delay lets a loaded host spend it before dispatch, which is
+	// the KNOWN_NOT_COMMITTED case, not this one. Instead the local append is
+	// held at its gate once dispatched, the caller's deadline expires while it
+	// is held, and only then is the append released.
+	meta.deadline_remaining_millis = 20_000;
+	let bytes_before = node.slab.local_l1_bytes().await;
+	let entered = Arc::new(Notify::new());
+	let release = Arc::new(Notify::new());
+	*node.data_server.local_observation_gate.lock().unwrap() =
+		Some((entered.clone(), release.clone()));
+	let server = node.data_server.clone();
+	let write = tokio::spawn({
+		let batch = batch.clone();
+		async move { server.table_write(meta, batch).await }
+	});
+	tokio::time::timeout(Duration::from_secs(60), entered.notified())
 		.await
-		.unwrap();
+		.expect("the write never dispatched its local append");
+	let (expired, _) = write.await.unwrap().unwrap();
+	release.notify_one();
 	assert_eq!(expired.write.status, WriteStatus::WRITE_DEADLINE_EXCEEDED);
 	assert_eq!(
 		expired.write.mutation_stop_reason(),
@@ -5572,9 +5585,15 @@ async fn post_dispatch_expiry_resolves_and_replays_as_one_indeterminate_operatio
 	);
 	// `spawn` is deliberately not cancelled with the caller. Wait for the abandoned
 	// append to finish while its node-wide permit remains charged.
-	tokio::time::sleep(Duration::from_millis(350)).await;
+	let append_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+	while node.slab.local_l1_bytes().await <= bytes_before {
+		assert!(
+			tokio::time::Instant::now() < append_deadline,
+			"the post-dispatch append must have run"
+		);
+		tokio::time::sleep(Duration::from_millis(10)).await;
+	}
 	let durable_bytes = node.slab.local_l1_bytes().await;
-	assert!(durable_bytes > 0, "the post-dispatch append must have run");
 
 	shutdown_lease_node(node).await;
 	tokio::time::sleep(Duration::from_millis(25)).await;

@@ -806,8 +806,6 @@ pub struct WendelonDataServer {
 	#[cfg(test)]
 	fail_next_local_durable_append: Arc<StdMutex<Option<(ErrorKind, String)>>>,
 	#[cfg(test)]
-	delay_next_local_durable_append: Arc<StdMutex<Option<Duration>>>,
-	#[cfg(test)]
 	local_observation_gate: Arc<StdMutex<Option<(Arc<Notify>, Arc<Notify>)>>>,
 	#[cfg(test)]
 	orphan_witness_recovery_leadership_override: Arc<StdMutex<Option<bool>>>,
@@ -1207,8 +1205,6 @@ impl Clone for WendelonDataServer {
 			local_persistence_distrust_path: self.local_persistence_distrust_path.clone(),
 			#[cfg(test)]
 			fail_next_local_durable_append: self.fail_next_local_durable_append.clone(),
-			#[cfg(test)]
-			delay_next_local_durable_append: self.delay_next_local_durable_append.clone(),
 			#[cfg(test)]
 			local_observation_gate: self.local_observation_gate.clone(),
 			#[cfg(test)]
@@ -2294,8 +2290,6 @@ impl WendelonDataServer {
 			local_persistence_distrust_path,
 			#[cfg(test)]
 			fail_next_local_durable_append: Arc::new(StdMutex::new(None)),
-			#[cfg(test)]
-			delay_next_local_durable_append: Arc::new(StdMutex::new(None)),
 			#[cfg(test)]
 			local_observation_gate: Arc::new(StdMutex::new(None)),
 			#[cfg(test)]
