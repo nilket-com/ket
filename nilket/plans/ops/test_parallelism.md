@@ -201,3 +201,6 @@ the adoption gate above; none is handled by serialization.
   evidence candidates reconciled in the register.
 - PD-20: counter write-key gate reclamation, deterministically reproduced;
   focused repair evidence and full adoption status are tracked in the register.
+- PD-21: replica operation gate reclamation, deterministically reproduced;
+  logical admission repair passed focused stress and load controls; final
+  stacked v5 acceptance remains pending.

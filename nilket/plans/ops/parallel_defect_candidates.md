@@ -266,10 +266,9 @@ new alias and retains the exact canonical-key map and mutex checks. The failed
 receipt remains; the fresh complete architecture run passed 180/180. Combined
 receipt: `reviews/readiness-counter-gate-logical-r2-architecture-20261021/summary.json`.
 These focused checks have no extra background suite load and do not close final v5
-adoption. The analogous replica `reclaim_gate2` source pattern is a separate
-unproven followup: retained idle entries are plausible, while duplicate
-admission or wrong counter values have not been established. Its audit and
-proposed deterministic control are recorded in
+adoption. The analogous replica `reclaim_gate2` pattern was subsequently
+reproduced and repaired separately as PD-21 below. Duplicate admission or wrong
+counter values have not been established. The initial source-only audit remains
 `reviews/readiness-counter-replica-gate-source-audit-20261021.json`.
 
 PD-01–09 focused reconciliation (2026-10-21): all implementing commits above
@@ -295,3 +294,33 @@ pass. Receipt: `reviews/readiness-read-stall-execution-r2-20261021/summary.json`
 This lower-width process load does not recreate the old wide in-process hunt
 or establish why the historical failures disappeared. No stall budget or
 production timeout was changed.
+
+## PD-21: replica operation gate reclamation (2026-10-21)
+
+Three deterministic regressions reproduce idle replica gate retention: terminal
+rollback inside owner unlock, assigned-waiter cancellation inside unlock, and
+assigned-waiter cancellation after owner release. Each retains one map-only
+mutex. Three controls pass, including actual tentative/rollback/commit pending
+retention. Historical RED uses a manual owner with production drop ordering
+and a real rollback waiter; it is not a full owner RPC reproduction. No wrong
+counter value or duplicate mutation is established. Original source, executable
+and receipts: `reviews/readiness-counter-replica-red-20261021/summary.json`.
+
+Signed repair `e95ddbe06` replaces mutex reference-count cleanup with logical
+admission tickets reserved before waiting. Unlock runs outside map locks; final
+retirement checks pending state freshly under the admission-map shard, retaining
+gates for pending tentative data. Queued and assigned cancellation retire their
+tickets. The test pause helper also holds a counted admission. Regressions retain
+the original pending-to-empty handoff and add a waiter creating pending during
+unlock, which guards against a stale pending check. Independent source review:
+`reviews/readiness-replica-gate-repair-review-20261021-r2.json`.
+
+Firstpass: 141 passed and one existing measurement ignore; architecture: 180
+passed. The exact 26-test selection passed 30 nextest repetitions (780 executions),
+10 in-process repetitions at explicit 1024 threads (260), three baseline runs
+(78), and three runs overlapping recorded background library load (78). Source
+and executable hashes remained unchanged. The background run was deliberately
+stopped after foreground completion and is not a full-suite pass. Receipts:
+`reviews/readiness-counter-replica-green-20261021/summary.json`. Focused repair
+evidence does not close final stacked v5 adoption or establish storage append
+cancellation atomicity.
