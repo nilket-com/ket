@@ -4305,11 +4305,18 @@ mod tests {
 			.await
 			.expect("tier pointer should exist after background sweep");
 		assert!(pointer.l2_uri.starts_with("file://"));
-		assert!(
-			!dir.join(format!("slab_{:016x}.wnd", location.slab_id))
-				.exists(),
-			"tiered slab should be unlinked from local L1 after the background sweep"
-		);
+		// The slab reads as tiered as soon as the pointer is installed; the row
+		// refresh and the L1 unlink follow in the same apply
+		// (SlabManager::apply_tier_slab_committed). Wait for the unlink itself.
+		let local = dir.join(format!("slab_{:016x}.wnd", location.slab_id));
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+		while local.exists() {
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"tiered slab should be unlinked from local L1 after the background sweep"
+			);
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
 	}
 
 	#[tokio::test]
