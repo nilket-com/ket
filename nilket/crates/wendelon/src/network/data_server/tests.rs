@@ -6831,6 +6831,137 @@ async fn table_write_seals_secondary_index_active_buffer_after_slab_rotation() {
 	shutdown_lease_node(node).await;
 }
 
+/// The node's own secondary-index lifecycle driver runs throughout: indexed
+/// writes and slab rotations race its declaration cut, its backfills and the
+/// write path's active-buffer seals of the same source slabs. Coverage must
+/// converge with no seal, persist or backfill failure ever recorded, the driver
+/// must complete the index on its own, and every written row must be served
+/// through the index.
+#[tokio::test]
+async fn secondary_index_coverage_converges_while_the_lifecycle_driver_runs() {
+	let dir = bootstrap_tempdir("secondary-index-driver-converges");
+	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+		59,
+		dir.to_path_buf(),
+		"127.0.0.1:0".into(),
+	))
+	.await
+	.unwrap();
+	let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+	while node.raft.current_leader().await != Some(node.local_node.id) {
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"timed out waiting for leader"
+		);
+		tokio::time::sleep(Duration::from_millis(20)).await;
+	}
+	node.data_server
+		.refresh_leases_once(&node.ring, &*node.clock, 60_000)
+		.await;
+	let descriptor = typed_table_descriptor();
+	node.raft
+		.client_write(WendelonRequest::SchemaUpdate(typed_table_schema_update(
+			&descriptor,
+		)))
+		.await
+		.unwrap();
+
+	// History before the index exists, so the driver has slabs to backfill.
+	let names = (0..12).map(|n| format!("row-{n:02}")).collect::<Vec<_>>();
+	let mut last_commit = hlc(0, 0, 0);
+	let write = |n: usize| {
+		let batch = typed_table_batch_with_names(vec![(n as i64, names[n].as_str())]);
+		let mut meta = typed_table_meta(&descriptor, batch.num_rows());
+		meta.parent_write_id.sequence_no = 590 + n as u64;
+		(meta, batch)
+	};
+	for n in 0..3 {
+		let (meta, batch) = write(n);
+		let (resp, _) = node.data_server.table_write(meta, batch).await.unwrap();
+		assert_eq!(resp.write.status, WriteStatus::OK);
+		last_commit = resp.write.commit_hlc;
+		node.slab.force_seal_active_for_test().await;
+	}
+	let index = name_secondary_index_descriptor(&descriptor);
+	node.raft
+		.client_write(WendelonRequest::SchemaUpdate(
+			secondary_index_schema_update(&index),
+		))
+		.await
+		.unwrap();
+	// Writes and rotations spread across several driver ticks (one per second).
+	for n in 3..names.len() {
+		let (meta, batch) = write(n);
+		let (resp, _) = node.data_server.table_write(meta, batch).await.unwrap();
+		assert_eq!(resp.write.status, WriteStatus::OK);
+		last_commit = resp.write.commit_hlc;
+		if n % 2 == 0 {
+			node.slab.force_seal_active_for_test().await;
+		}
+		tokio::time::sleep(Duration::from_millis(300)).await;
+	}
+	node.slab.force_seal_active_for_test().await;
+
+	let key =
+		SecondaryIndexCoverageKey::from(SecondaryIndexIdentity::from_descriptor(tenant(), &index));
+	let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+	loop {
+		let ready = node
+			.state_machine
+			.state_snapshot()
+			.await
+			.secondary_indexes
+			.rows()
+			.into_iter()
+			.any(|(_, row)| {
+				row.descriptor.index_object_id == index.index_object_id
+					&& row.state == SecondaryIndexState::Ready
+			});
+		let coverage = node.slab.secondary_index_coverage_snapshot(key);
+		if let Some(coverage) = &coverage {
+			assert_eq!(
+				coverage.last_backfill_error, None,
+				"a seal, persist or backfill failed while the driver ran"
+			);
+		}
+		// The newest buffer may stay unsealed: it seals on the next indexed write
+		// to another slab, and reads consult it meanwhile.
+		let converged = coverage
+			.as_ref()
+			.is_some_and(|coverage| coverage.uncovered_slabs.is_empty());
+		if ready && converged {
+			break;
+		}
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"coverage did not converge: ready={ready} coverage={coverage:?}"
+		);
+		tokio::time::sleep(Duration::from_millis(50)).await;
+	}
+
+	for name in &names {
+		let program = name_eq_program(name);
+		let query_meta = table_query_meta_for_test(&descriptor, last_commit, program.len());
+		let plan = node
+			.data_server
+			.prepare_table_query_execution_plan_with_migration(
+				&query_meta,
+				&program,
+				DecodedRuntimeFilter::Absent,
+			)
+			.await
+			.unwrap();
+		assert!(
+			plan.secondary_index_access_plan.is_some(),
+			"{name} must be read through the Ready index"
+		);
+		assert_eq!(plan.response.status, ReadStatus::OK, "{name}");
+		assert_eq!(plan.response.rows, 1, "{name}");
+	}
+
+	shutdown_lease_node(node).await;
+}
+
 #[tokio::test]
 async fn table_query_secondary_index_execution_returns_sidecar_rows() {
 	let dir = bootstrap_tempdir("table-query-secondary-index-execution");

@@ -16510,3 +16510,6 @@ async fn encrypted_slab_with_a_leading_hole_round_trips_with_evidence() {
 
 #[path = "counter_visibility/tests.rs"]
 mod counter_visibility_tests;
+
+#[path = "secondary_index_persist/tests.rs"]
+mod secondary_index_persist_tests;

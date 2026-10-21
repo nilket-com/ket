@@ -380,6 +380,9 @@ impl SlabManager {
 			maintenance_publication_restart_required: AtomicBool::new(false),
 			maintenance_publication_fail_stop: std::sync::Mutex::new(None),
 			secondary_index_declaration_cuts: DashSet::new(),
+			secondary_index_persist_stripes: (0..crate::storage::manager::secondary_index_segments::SECONDARY_INDEX_PERSIST_STRIPES)
+				.map(|_| Mutex::new(()))
+				.collect(),
 			slab_rewrite_claims: DashMap::new(),
 			tiered_stats_cache: DashMap::new(),
 		};
