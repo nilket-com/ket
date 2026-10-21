@@ -95,12 +95,34 @@ pub(super) fn context_digest(a: &InstalledAdmin2) -> Digest2 {
 pub(super) fn context_digest3(c: &AdminContext2) -> Digest2 {
 	hash(b"VISROOT2-ROLE3-CONTEXT\0", &context_bytes(c))
 }
+/// What a containment proof binds in place of a command digest (activation §8.2, D-21): one root
+/// (`RootKey`), one node, one boot of it (its fresh 16-byte nonce) and the requested state. BLAKE3
+/// over the domain and the fields, through the crate's BLAKE3 boundary. Shared by the offline
+/// facade and, later, the node's containment check.
+pub(super) fn containment_digest3(
+	root_key: &Digest2,
+	node_id: u32,
+	boot_nonce: &[u8; 16],
+	on: bool,
+) -> Digest2 {
+	let mut h = crate::hash::blake3::Context::new();
+	h.update(b"wendelon/root2/containment-elect/v1\0");
+	h.update(root_key);
+	h.update(&node_id.to_le_bytes());
+	h.update(boot_nonce);
+	h.update(&[u8::from(on)]);
+	h.finish()
+}
 #[derive(Clone, Copy)]
 pub(super) enum RoleForm3 {
 	Legacy,
 	Freeze,
 	Unfreeze,
 	Retire,
+	/// The recovery role's process-local containment override (D-21): never an on-log form.
+	/// `role_requirement` never yields it; only the offline facade and the node's containment
+	/// check name it.
+	Containment,
 }
 /// The role pair and form a proof for `command` must carry, given the proof's slot-0 role, which
 /// alone separates RetireRoot `[3,0]` from `[1,2]` and Unfreeze `[1,3]` from `[2,3]`. `None` for
@@ -142,6 +164,7 @@ fn domain(
 		(Retire, [3, 0], 0) => b"VISROOT2-ROLE3-RETIRE-RECOVERY\0",
 		(Retire, [1, 2], 0) => b"VISROOT2-ROLE3-RETIRE-ADMIN-WITH-GOVERNANCE\0",
 		(Retire, [1, 2], 1) => b"VISROOT2-ROLE3-RETIRE-GOVERNANCE-WITH-ADMIN\0",
+		(Containment, [3, 0], 0) => b"VISROOT2-ROLE3-CONTAINMENT-RECOVERY\0",
 		_ => return Err(RoleProofError3::Domain),
 	})
 }

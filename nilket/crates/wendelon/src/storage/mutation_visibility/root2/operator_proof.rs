@@ -12,8 +12,8 @@ mod proof;
 
 pub use context::{AuditDerived, ContextRefusal, VerifiedContext, verify_context_export};
 pub use proof::{
-	ProofRefusal, Unsigned, check_new_role_key, merge, prepare, prepare_statement, self_check,
-	splice,
+	ProofRefusal, Unsigned, check_new_role_key, merge, prepare, prepare_containment,
+	prepare_statement, self_check, self_check_containment, splice,
 };
 
 pub(in crate::storage::mutation_visibility::root2) use context::Chain3;
