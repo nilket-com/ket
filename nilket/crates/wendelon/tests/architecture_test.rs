@@ -8608,7 +8608,10 @@ fn adr075_counter_add_reuses_client_write_id_idempotency() {
 	assert!(recorded.contains("delta: NonZeroU64,"));
 	assert!(write_key.contains("Some(recorded) if recorded == key && self.delta.get() == delta"));
 	assert!(!write_key.contains("counter_identity"));
-	assert!(counter.contains("write_gates: DashMap<CounterWriteKey, Arc<Mutex<()>>>"));
+	assert!(counter.contains("write_gates: WriteKeyGates,"));
+	assert!(write_key.contains("type WriteKeyGates = DashMap<CounterWriteKey, GateEntry>;"));
+	let gate_entry = source_region(&write_key, "pub(super) struct GateEntry {", "}");
+	assert!(gate_entry.contains("mutex: Arc<Mutex<()>>,"));
 	// The durable witness carries the dedup identity, and a resolved witness is
 	// compacted into the applied log BEFORE pruning (no dedup window).
 	assert!(counter.contains("write_key: CounterWriteKey,"));
