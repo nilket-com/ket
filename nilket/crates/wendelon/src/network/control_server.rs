@@ -701,6 +701,9 @@ pub struct RevocationAdminResponseWire {
 	pub message: Option<String>,
 }
 
+#[cfg(feature = "test-support")]
+pub mod join_test_support;
+
 pub struct WendelonControlServer {
 	raft: WendelonRaft,
 	state_machine: crate::consensus::raft_storage::WendelonStateMachine,
@@ -718,6 +721,8 @@ pub struct WendelonControlServer {
 	storage_manager: Option<Arc<SlabManager>>,
 	protocol: ProtocolVersionWindow,
 	reconcile_lock: Mutex<()>,
+	#[cfg(feature = "test-support")]
+	join_promotion_gate: Option<join_test_support::JoinPromotionGate>,
 }
 
 fn control_operation_permission(operation: ControlOperation) -> ActorPermission {
@@ -768,6 +773,8 @@ impl WendelonControlServer {
 			storage_manager: None,
 			protocol: ProtocolVersionWindow::default(),
 			reconcile_lock: Mutex::new(()),
+			#[cfg(feature = "test-support")]
+			join_promotion_gate: None,
 		}
 	}
 
@@ -789,6 +796,23 @@ impl WendelonControlServer {
 	pub fn with_storage_manager(mut self, storage_manager: Arc<SlabManager>) -> Self {
 		self.storage_manager = Some(storage_manager);
 		self
+	}
+
+	#[cfg(feature = "test-support")]
+	pub fn with_join_promotion_gate(
+		mut self,
+		gate: Option<join_test_support::JoinPromotionGate>,
+	) -> Self {
+		self.join_promotion_gate = gate;
+		self
+	}
+
+	#[cfg(feature = "test-support")]
+	async fn record_join_observation(&self, req: &JoinClusterRequestWire, stage: &str) {
+		if let Some(gate) = &self.join_promotion_gate {
+			let snapshot = self.state_machine.state_snapshot().await;
+			gate.record(format!("receiver={} request={req:?} stage={stage} leader={:?} membership={:?} epoch_history={:?} visible_epoch={:?}", self.local_node.id, self.raft.current_leader().await, snapshot.last_membership, snapshot.epoch_history, self.epoch_rx.borrow().clone()));
+		}
 	}
 
 	pub fn with_protocol_window(mut self, protocol: ProtocolVersionWindow) -> Self {
@@ -4052,23 +4076,43 @@ impl WendelonControlServer {
 				}
 			} else {
 				match self.validate_join_request(&req) {
-					Err(_) => JoinClusterResponseWire {
-						accepted: false,
-						reason_code: CONTROL_REASON_INVALID_CONFIG,
-						leader_hint: self.leader_hint().await,
-						local_protocol: self.protocol,
-						negotiated_protocol: None,
-					},
+					Err(_err) => {
+						#[cfg(feature = "test-support")]
+						self.record_join_observation(&req, &format!("validation rejected: {_err}"))
+							.await;
+						JoinClusterResponseWire {
+							accepted: false,
+							reason_code: CONTROL_REASON_INVALID_CONFIG,
+							leader_hint: self.leader_hint().await,
+							local_protocol: self.protocol,
+							negotiated_protocol: None,
+						}
+					}
 					Ok(()) if self.is_leader().await => {
 						match wire::negotiate_protocol(self.protocol, req.protocol) {
 							Ok(negotiated_protocol) => match self.accept_join(&req).await {
-								Ok(()) => JoinClusterResponseWire {
-									accepted: true,
-									reason_code: CONTROL_REASON_GRANTED,
-									leader_hint: Some(self.local_node.id),
-									local_protocol: self.protocol,
-									negotiated_protocol: Some(negotiated_protocol),
-								},
+								Ok(()) => {
+									#[cfg(feature = "test-support")]
+									if let Some(gate) = &self.join_promotion_gate {
+										self.record_join_observation(
+											&req,
+											"epoch complete before success response",
+										)
+										.await;
+										gate.pause(
+											join_test_support::JoinGateStage::BeforeSuccess,
+											&req,
+										)
+										.await?;
+									}
+									JoinClusterResponseWire {
+										accepted: true,
+										reason_code: CONTROL_REASON_GRANTED,
+										leader_hint: Some(self.local_node.id),
+										local_protocol: self.protocol,
+										negotiated_protocol: Some(negotiated_protocol),
+									}
+								}
 								Err(err) if err.kind() == ErrorKind::InvalidInput => {
 									JoinClusterResponseWire {
 										accepted: false,
@@ -4615,7 +4659,7 @@ impl WendelonControlServer {
 	}
 
 	fn validate_join_request(&self, req: &JoinClusterRequestWire) -> std::io::Result<()> {
-		if req.node_id == 0 || req.node_id == self.local_node.id {
+		if req.node_id == 0 {
 			return Err(Error::new(
 				ErrorKind::InvalidInput,
 				"join request must target a non-zero remote node id",
@@ -4646,6 +4690,42 @@ impl WendelonControlServer {
 	}
 
 	async fn accept_join(&self, req: &JoinClusterRequestWire) -> std::io::Result<()> {
+		if req.node_id == self.local_node.id {
+			#[cfg(feature = "test-support")]
+			if let Some(gate) = &self.join_promotion_gate {
+				gate.pause(join_test_support::JoinGateStage::BeforeSelfFence, req)
+					.await?;
+			}
+			// A cached leader ID is insufficient: a removed/partitioned former
+			// leader can retain locally tempting completed membership forever.
+			// Fence before taking either local lock, including the applied-index
+			// wait provided by OpenRaft's ensure_linearizable implementation.
+			self.raft.ensure_linearizable().await.map_err(|err| {
+				Error::new(
+					ErrorKind::NotConnected,
+					format!("self JOIN freshness fence failed: {err}"),
+				)
+			})?;
+			let _reconcile = self.reconcile_lock.lock().await;
+			let (membership, latest_epoch) = self.state_machine.join_completion_snapshot().await;
+			let visible = self.epoch_rx.borrow().clone();
+			// Production epoch publication holds reconcile_lock and publishes
+			// only after transition seeds are committed. Current full equality
+			// is its completion certificate; mature migration rows need not
+			// equal their original seeds. No state is repaired by this read.
+			return validate_completed_self_join(
+				req,
+				self.local_node.id,
+				self.protocol,
+				&membership,
+				latest_epoch.as_ref(),
+				&visible,
+			);
+		}
+		#[cfg(feature = "test-support")]
+		if let Some(gate) = &self.join_promotion_gate {
+			gate.record_mutation_path(req.node_id);
+		}
 		let joining = NodeId {
 			id: req.node_id,
 			_reserved: 0,
@@ -4696,6 +4776,13 @@ impl WendelonControlServer {
 			}
 		}
 
+		#[cfg(feature = "test-support")]
+		if let Some(gate) = &self.join_promotion_gate {
+			self.record_join_observation(req, "after voter promotion before epoch completion")
+				.await;
+			gate.pause(join_test_support::JoinGateStage::AfterPromotion, req)
+				.await?;
+		}
 		let visible = self.epoch_rx.borrow().clone();
 		let needs_epoch_advance = match visible.peers.get(&joining) {
 			Some(existing) => {
@@ -5387,6 +5474,53 @@ fn deterministic_migration_id(to_epoch: u64, range_start: u64, range_end: u64) -
 
 fn membership_eq(left: &MembershipEpoch, right: &MembershipEpoch) -> bool {
 	epoch_config_from_membership(left) == epoch_config_from_membership(right)
+}
+
+/// Current completed-state idempotence, not recognition of a historical actor
+/// key or operation receipt. The caller supplies a fresh quorum/applied fence.
+fn validate_completed_self_join(
+	req: &JoinClusterRequestWire,
+	local_id: u32,
+	protocol: ProtocolVersionWindow,
+	membership: &openraft::StoredMembership<u32, BasicNode>,
+	latest_epoch: Option<&(u64, EpochConfig)>,
+	visible: &MembershipEpoch,
+) -> std::io::Result<()> {
+	let mismatch = || {
+		Error::new(
+			ErrorKind::InvalidInput,
+			"self JOIN does not match current completed membership",
+		)
+	};
+	let configs = membership.membership().get_joint_config();
+	if req.node_id != local_id
+		|| membership.log_id().is_none()
+		|| configs.len() != 1
+		|| !configs[0].contains(&local_id)
+		|| membership
+			.membership()
+			.get_node(&local_id)
+			.map(|node| node.addr.as_str())
+			!= Some(req.advertise_address.as_str())
+		|| req.protocol != protocol
+	{
+		return Err(mismatch());
+	}
+	wire::negotiate_protocol(protocol, req.protocol)?;
+	let (epoch_key, durable) = latest_epoch.ok_or_else(mismatch)?;
+	if *epoch_key != durable.epoch || *durable != epoch_config_from_membership(visible) {
+		return Err(mismatch());
+	}
+	let peer = durable.peers.get(&local_id).ok_or_else(mismatch)?;
+	if peer.node_id.id != req.node_id
+		|| peer.address != req.advertise_address
+		|| peer.tier_bits != req.tier_bits
+		|| peer.role_bits != req.role_bits
+		|| peer.capability_bits != req.capability_bits
+	{
+		return Err(mismatch());
+	}
+	Ok(())
 }
 
 fn not_leader_error(leader_hint: Option<u32>) -> Error {
@@ -6646,3 +6780,7 @@ mod tests {
 		}
 	}
 }
+
+#[cfg(test)]
+#[path = "control_server/completed_join_tests.rs"]
+mod completed_join_tests;

@@ -982,6 +982,8 @@ impl RawConfig {
 		let cfg = NodeBootstrapConfig {
 			#[cfg(feature = "test-support")]
 			slab_file_ops: None,
+			#[cfg(feature = "test-support")]
+			join_promotion_gate: None,
 			node_id: self.node.node_id,
 			data_dir,
 			slab_max_bytes,

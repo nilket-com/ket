@@ -3569,6 +3569,23 @@ impl WendelonStateMachine {
 		self.publish_revocation_snapshot_if_changed(state);
 	}
 
+	/// Extract only the applied facts needed by the completed-JOIN read proof.
+	/// Both facts come from the same state-machine read; callers need not clone
+	/// unrelated table, migration, audit or finalization state.
+	pub(crate) async fn join_completion_snapshot(
+		&self,
+	) -> (StoredMembership<u32, BasicNode>, Option<(u64, EpochConfig)>) {
+		let guard = self.inner.read().await;
+		(
+			guard.state.last_membership.clone(),
+			guard
+				.state
+				.epoch_history
+				.last_key_value()
+				.map(|(key, epoch)| (*key, epoch.clone())),
+		)
+	}
+
 	/// Test / caller inspection hook — return a cloned snapshot
 	/// of the applied state without driving a full snapshot
 	/// build round-trip.

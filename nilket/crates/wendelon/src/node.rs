@@ -206,6 +206,9 @@ pub struct NodeBootstrapConfig {
 	/// File operations injected only by deterministic acceptance fixtures.
 	#[cfg(feature = "test-support")]
 	pub slab_file_ops: Option<TestSupportFileOps>,
+	#[cfg(feature = "test-support")]
+	pub join_promotion_gate:
+		Option<crate::network::control_server::join_test_support::JoinPromotionGate>,
 	/// ADR 079 cadence for unconditional CDC locality progress markers.
 	pub cdc_locality_heartbeat_interval: Duration,
 	/// ADR 080 HLC fencing window for Data Ring range leases. The
@@ -332,6 +335,8 @@ impl NodeBootstrapConfig {
 			storage_shutdown_timeout: Duration::from_secs(30),
 			#[cfg(feature = "test-support")]
 			slab_file_ops: None,
+			#[cfg(feature = "test-support")]
+			join_promotion_gate: None,
 			cdc_locality_heartbeat_interval: Duration::from_millis(
 				DEFAULT_CDC_LOCALITY_HEARTBEAT_INTERVAL_MILLIS,
 			),
@@ -1791,6 +1796,8 @@ impl WendelonNode {
 					)
 				})?,
 		);
+		#[cfg(feature = "test-support")]
+		let test_automatic_elections = raft_config.enable_elect;
 		let raft = WendelonRaft::new(
 			cfg.node_id,
 			raft_config,
@@ -1800,6 +1807,10 @@ impl WendelonNode {
 		)
 		.await
 		.map_err(|e| Error::new(ErrorKind::Other, format!("Raft::new: {e}")))?;
+		#[cfg(feature = "test-support")]
+		if let Some(gate) = &cfg.join_promotion_gate {
+			gate.register_metrics(cfg.node_id, raft.metrics(), test_automatic_elections);
+		}
 		let lease_timing = DataRingLeaseTiming::try_from_duration(cfg.data_ring_lease_ttl)?;
 
 		// 10. Ring router — starts empty, seeded by the first
@@ -1854,25 +1865,26 @@ impl WendelonNode {
 			WendelonRaftInternalServer::new(raft.clone(), pool.clone(), retention.clone())
 				.with_tracker(tracker.clone()),
 		);
-		let control_server = Arc::new(
-			WendelonControlServer::new(
-				raft.clone(),
-				state_machine.clone(),
-				crypto.clone(),
-				local_node,
-				epoch_tx.clone(),
-				epoch_rx.clone(),
-				factory.clone(),
-				pool.clone(),
-				cfg.rf as u32,
-				lease_timing.ttl_millis(),
-				audit_sink.clone(),
-			)
-			.with_protocol_window(cfg.protocol)
-			.with_lease_authority(lease_authority.clone())
-			.with_transfer_authority(transfer_authority.clone())
-			.with_storage_manager(slab.clone()),
-		);
+		let control_server = WendelonControlServer::new(
+			raft.clone(),
+			state_machine.clone(),
+			crypto.clone(),
+			local_node,
+			epoch_tx.clone(),
+			epoch_rx.clone(),
+			factory.clone(),
+			pool.clone(),
+			cfg.rf as u32,
+			lease_timing.ttl_millis(),
+			audit_sink.clone(),
+		)
+		.with_protocol_window(cfg.protocol)
+		.with_lease_authority(lease_authority.clone())
+		.with_transfer_authority(transfer_authority.clone())
+		.with_storage_manager(slab.clone());
+		#[cfg(feature = "test-support")]
+		let control_server = control_server.with_join_promotion_gate(cfg.join_promotion_gate.clone());
+		let control_server = Arc::new(control_server);
 
 		// 13. Ring-aware dispatch — the single `HrftService` the QUIC
 		//     listener hands every inbound frame to.
