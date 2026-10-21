@@ -30,5 +30,11 @@ def snapshot(ms,version,retired=False):
 prefix=b''.join(events);tail=b'abcde';boundary=len(prefix);original=boundary+len(tail)
 context=sha(b'VISROOT2-REPAIR-CONTEXT-V2\0'+sha(prefix)+struct.pack('<QQ',boundary,original)+sha(tail));op=sha(b'VISROOT2-REPAIR-OP-V2\0'+context)[:16]
 evidence=b'VISREP04'+struct.pack('<HH',1,2)+sha(prefix)+struct.pack('<QQI',boundary,original,len(tail))+bytes(4)+sha(tail)+op+struct.pack('<Q',7)+tail;evidence+=sha(evidence)
+# p3_: the profile-3 root alone, its events renumbered as seq 1-2, its snapshot and a repair over them.
+p3_events=[event(1,1,identity(M[2]),M[2]),event(2,2,identity(M[2]),record(M[2],2))]
+p3_three=b'VISINV02'+struct.pack('<HIQ',3,1,2)+identity(M[2])+bytes([2,3])+bytes(6)+struct.pack('<Q',2)+record(M[2],2);p3_three+=sha(p3_three)
+p3_prefix=b''.join(p3_events);p3_boundary=len(p3_prefix);p3_original=p3_boundary+len(tail)
+p3_context=sha(b'VISROOT2-REPAIR-CONTEXT-V2\0'+sha(p3_prefix)+struct.pack('<QQ',p3_boundary,p3_original)+sha(tail));p3_op=sha(b'VISROOT2-REPAIR-OP-V2\0'+p3_context)[:16]
+p3_evidence=b'VISREP04'+struct.pack('<HH',1,2)+sha(p3_prefix)+struct.pack('<QQI',p3_boundary,p3_original,len(tail))+bytes(4)+sha(tail)+p3_op+struct.pack('<Q',3)+tail;p3_evidence+=sha(p3_evidence)
 marker=b'VISOWN02'+struct.pack('<HHI',2,512,0);marker+=sha(marker)
-print(json.dumps({'marker':marker.hex(),'generator':'profile_three_reference.py','manifests':[m.hex()for m in M],'events':[e.hex()for e in events],'retire':event(4,7,identity(M[2]),b'').hex(),'snapshots':{'one':snapshot(M[:1],1).hex(),'two':snapshot(M[:2],2).hex(),'three':snapshot(M,3).hex(),'retired':snapshot(M,3,True).hex()},'repair':{'tail':tail.hex(),'name':context.hex()+'.rep','context':context.hex(),'bytes':evidence.hex()}},indent=2))
+print(json.dumps({'marker':marker.hex(),'generator':'profile_three_reference.py','manifests':[m.hex()for m in M],'events':[e.hex()for e in events],'retire':event(4,7,identity(M[2]),b'').hex(),'snapshots':{'one':snapshot(M[:1],1).hex(),'two':snapshot(M[:2],2).hex(),'three':snapshot(M,3).hex(),'retired':snapshot(M,3,True).hex()},'repair':{'tail':tail.hex(),'name':context.hex()+'.rep','context':context.hex(),'bytes':evidence.hex()},'p3_events':[e.hex()for e in p3_events],'p3_three':p3_three.hex(),'p3_repair':{'tail':tail.hex(),'name':p3_context.hex()+'.rep','context':p3_context.hex(),'bytes':p3_evidence.hex()}},indent=2))

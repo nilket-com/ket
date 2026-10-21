@@ -202,3 +202,54 @@ fn terminal_event_and_snapshot_match_independent_python_vectors() {
 	);
 	assert_eq!(folded.roots[0].manifest.profile(), ManifestProfile2::Three);
 }
+/// The profile-3 rows of the matrix with the Retired prefix reached by the committed terminal
+/// Retire (not a plain Retire): each state and observation option gets its profile-3 decision.
+#[test]
+fn terminal_profile_three_matrix_with_a_terminal_retired_prefix() {
+	for state in [
+		RootState2::Prepared,
+		RootState2::Bound,
+		RootState2::Conflicted,
+		RootState2::Retired,
+	] {
+		let (bytes, id, obs) = if state == RootState2::Retired {
+			let (prefix, event) = terminal_event();
+			let (_, id, obs) = prefix_parts();
+			let raw = inventory::v2::encode_event2(&event).unwrap();
+			([prefix.as_slice(), raw.as_slice()].concat(), id, obs)
+		} else {
+			prefix(2, state)
+		};
+		let folded = inventory::v2::fold_events2(&bytes).unwrap();
+		assert_eq!(folded.roots[0].state, state);
+		assert_eq!(
+			folded.roots[0].terminal.is_some(),
+			state == RootState2::Retired
+		);
+		for terminal in [None, Some(obs)] {
+			let q = OwnerRequest2::Retire {
+				identity: id,
+				terminal,
+			};
+			let result = owner_core::v2::decide2(&bytes, &op(9), &q);
+			match (state, terminal) {
+				// The recorded terminal retirement: only its own observation is a no-op.
+				(RootState2::Retired, None) => {
+					assert_eq!(result, Decision2::Refuse(OwnerError2::RetirementMismatch))
+				}
+				(RootState2::Retired, Some(_)) => {
+					assert_eq!(result, Decision2::NoOp(RootState2::Retired))
+				}
+				(_, None) => assert_eq!(
+					result,
+					Decision2::Refuse(OwnerError2::CommittedRetirementRequired)
+				),
+				(RootState2::Bound, Some(_)) => assert!(matches!(result, Decision2::Append(_))),
+				(_, Some(_)) => assert_eq!(result, Decision2::Refuse(OwnerError2::NotBound)),
+			}
+		}
+	}
+}
+fn prefix_parts() -> (Vec<u8>, RootIdentity2, TerminalObservation3) {
+	prefix(2, RootState2::Bound)
+}

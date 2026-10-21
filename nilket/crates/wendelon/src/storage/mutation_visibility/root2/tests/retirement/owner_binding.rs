@@ -616,3 +616,53 @@ fn terminal_export_refusal_order_and_reader_profile_manifest_negatives() {
 		Err(TerminalError3::Binding)
 	);
 }
+/// N16: the VISTRM03 profile word (bytes 10..12) is checked after the version and before the
+/// trailer: on a profile-3 manifest, word 1 or 2 is `Profile` whether or not the trailer was
+/// resealed; word 3 is the accepted twin.
+#[test]
+fn terminal_artifact_profile_word_is_checked_before_the_trailer() {
+	let f = F::new();
+	let (_b, id) = bound(&f);
+	let (retired, o) = observation();
+	let pin = [17; 32];
+	let a = TerminalArtifact3 {
+		identity: id,
+		terminal: terminal_record3(&o, 3).unwrap(),
+		inventory_pin: pin,
+		export_seq: 3,
+	};
+	let bytes = encode_terminal_artifact3(&a).unwrap().to_vec();
+	assert_eq!(&bytes[10..12], &3u16.to_le_bytes());
+	assert_eq!(read_terminal3(&bytes, &retired.f.any, pin).unwrap(), a);
+	let with_word = |word: u16, reseal: bool| {
+		let mut b = bytes.clone();
+		b[10..12].copy_from_slice(&word.to_le_bytes());
+		if reseal {
+			let sum = hash(b"", &b[..304]);
+			b[304..].copy_from_slice(&sum);
+		}
+		b
+	};
+	for word in [1u16, 2] {
+		for reseal in [false, true] {
+			assert_eq!(
+				read_terminal3(&with_word(word, reseal), &retired.f.any, pin),
+				Err(TerminalError3::Profile),
+				"word {word}, resealed {reseal}"
+			);
+		}
+	}
+	// The version precedes the profile word; the trailer follows it.
+	let mut versioned = with_word(1, true);
+	versioned[8..10].copy_from_slice(&2u16.to_le_bytes());
+	assert_eq!(
+		read_terminal3(&versioned, &retired.f.any, pin),
+		Err(TerminalError3::Version)
+	);
+	let mut stale = bytes.clone();
+	stale[200] ^= 1;
+	assert_eq!(
+		read_terminal3(&stale, &retired.f.any, pin),
+		Err(TerminalError3::Trailer)
+	);
+}
