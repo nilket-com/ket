@@ -305,6 +305,49 @@ impl MutationOutcomeStore {
 	}
 }
 
+#[cfg(test)]
+impl MutationOutcomeStore {
+	fn stored_outcome_for_test(
+		&self,
+		write_id: ClientWriteId,
+		tenant_id: TenantId,
+	) -> Option<DurableMutationOutcome> {
+		use redb::ReadableDatabase;
+		let db = self.db.test_handle();
+		let txn = db.begin_read().unwrap();
+		let outcomes = txn.open_table(OUTCOMES).unwrap();
+		outcomes
+			.get(key(write_id, tenant_id).as_slice())
+			.unwrap()
+			.map(|value| decode(value.value()).unwrap())
+	}
+
+	/// The stored deadline of an outcome, for fixtures that check the TTL the
+	/// write path recorded without waiting for it on a wall clock.
+	pub(crate) fn expires_at_ms_for_test(
+		&self,
+		write_id: ClientWriteId,
+		tenant_id: TenantId,
+	) -> Option<u64> {
+		self.stored_outcome_for_test(write_id, tenant_id)
+			.map(|outcome| outcome.expires_at_ms)
+	}
+
+	/// Move a stored outcome's deadline into the past, as elapsed time would.
+	pub(crate) async fn expire_for_test(&self, write_id: ClientWriteId, tenant_id: TenantId) {
+		let mut outcome = self
+			.stored_outcome_for_test(write_id, tenant_id)
+			.expect("an outcome to expire");
+		outcome.expires_at_ms = now_ms().saturating_sub(1);
+		self.upsert(outcome).await.unwrap();
+	}
+}
+
+#[cfg(test)]
+pub(crate) fn now_ms_for_test() -> u64 {
+	now_ms()
+}
+
 fn outcome_store_registry() -> &'static StdMutex<HashMap<PathBuf, Weak<MutationOutcomeStore>>> {
 	static REGISTRY: OnceLock<StdMutex<HashMap<PathBuf, Weak<MutationOutcomeStore>>>> =
 		OnceLock::new();
