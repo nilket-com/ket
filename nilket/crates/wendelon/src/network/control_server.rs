@@ -4692,6 +4692,9 @@ impl WendelonControlServer {
 	async fn accept_join(&self, req: &JoinClusterRequestWire) -> std::io::Result<()> {
 		if req.node_id == self.local_node.id {
 			#[cfg(feature = "test-support")]
+			self.record_join_observation(req, "self JOIN handler ingress")
+				.await;
+			#[cfg(feature = "test-support")]
 			if let Some(gate) = &self.join_promotion_gate {
 				gate.pause(join_test_support::JoinGateStage::BeforeSelfFence, req)
 					.await?;
@@ -4812,13 +4815,32 @@ impl WendelonControlServer {
 			.await
 			.filter(|leader_id| *leader_id != self.local_node.id)
 			.ok_or_else(|| not_leader_error(None))?;
-		let conn = self
-			.factory
-			.get_connection(NodeId {
-				id: leader_id,
-				_reserved: 0,
-			})
-			.await?;
+		let target = NodeId {
+			id: leader_id,
+			_reserved: 0,
+		};
+		let visible_has_leader = self.epoch_rx.borrow().peers.contains_key(&target);
+		let conn = if visible_has_leader {
+			// Preserve normal epoch capabilities and its errors; a failed dial or
+			// authentication must never select the membership fallback.
+			self.factory.get_connection(target).await?
+		} else {
+			// A promoted voter can become leader before its epoch edge exists.
+			// Read applied membership only, never an address supplied by this JOIN.
+			let (membership, _) = self.state_machine.join_completion_snapshot().await;
+			let current_leader = self.leader_hint().await;
+			let now_visible = self.epoch_rx.borrow().peers.contains_key(&target);
+			match join_forwarding_address(
+				self.local_node.id,
+				leader_id,
+				current_leader,
+				now_visible,
+				&membership,
+			)? {
+				None => self.factory.get_connection(target).await?,
+				Some(address) => self.factory.get_connection_to(target, &address).await?,
+			}
+		};
 		let mut stream = conn.open_bi().await?;
 		let meta = wire::encode(req)?;
 		let header = FrameHeader {
@@ -5475,6 +5497,40 @@ fn deterministic_migration_id(to_epoch: u64, range_start: u64, range_end: u64) -
 fn membership_eq(left: &MembershipEpoch, right: &MembershipEpoch) -> bool {
 	epoch_config_from_membership(left) == epoch_config_from_membership(right)
 }
+
+/// JOIN-only routing fallback. None retains the ordinary visible-epoch route.
+/// A routing snapshot grants no JOIN acceptance; the authenticated destination
+/// still runs all leader, authorization and completion checks.
+fn join_forwarding_address(
+	local_id: u32,
+	leader_id: u32,
+	current_leader: Option<u32>,
+	visible_has_leader: bool,
+	membership: &openraft::StoredMembership<u32, BasicNode>,
+) -> std::io::Result<Option<String>> {
+	let unavailable = || not_leader_error(current_leader);
+	if leader_id == 0 || leader_id == local_id || current_leader != Some(leader_id) {
+		return Err(unavailable());
+	}
+	if visible_has_leader {
+		return Ok(None);
+	}
+	let configs = membership.membership().get_joint_config();
+	if membership.log_id().is_none() || configs.len() != 1 || !configs[0].contains(&leader_id) {
+		return Err(unavailable());
+	}
+	let node = membership
+		.membership()
+		.get_node(&leader_id)
+		.ok_or_else(unavailable)?;
+	if node.addr.trim().is_empty() {
+		return Err(unavailable());
+	}
+	Ok(Some(node.addr.clone()))
+}
+
+#[cfg(test)]
+mod join_forwarding_tests;
 
 /// Current completed-state idempotence, not recognition of a historical actor
 /// key or operation receipt. The caller supplies a fresh quorum/applied fence.

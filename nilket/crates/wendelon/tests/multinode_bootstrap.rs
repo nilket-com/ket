@@ -950,18 +950,17 @@ async fn observe_join_handoff(
 		);
 	}
 
-	if stage == wendelon::network::control_server::join_test_support::JoinGateStage::AfterPromotion
-	{
-		gate.wait_for_applied_membership(3, &snapshot.last_membership)
-			.await;
-	}
+	// Both handoff cuts need the joining voter's applied uniform membership.
+	gate.wait_for_applied_membership(3, &snapshot.last_membership)
+		.await;
 	eprintln!(
 		"PRE_PARTITION_JOIN_READINESS: {}",
 		gate.metrics_observation()
 	);
 
 	let survivor = if incumbent == 1 { &node2 } else { &node1 };
-	if stage == wendelon::network::control_server::join_test_support::JoinGateStage::AfterPromotion
+	// Completed epochs do not imply a caught-up Raft suffix. Both cuts must
+	// freeze the survivor first and cover its tail before isolating the leader.
 	{
 		// First freeze the survivor's incoming incumbent streams while the
 		// incumbent and joining voter still form a majority. Applying the
@@ -1099,10 +1098,69 @@ async fn observe_join_handoff(
 	let before_membership = before_retry.last_membership.clone();
 	let before_epochs = before_retry.epoch_history.clone();
 	let before_visible = completed_join_visible_config(&node2);
+	if stage == wendelon::network::control_server::join_test_support::JoinGateStage::AfterPromotion
+	{
+		assert_eq!(
+			before_epochs.keys().next_back(),
+			Some(&2),
+			"missing epoch edge is an explicit routing precondition"
+		);
+		assert_eq!(before_visible.epoch, 2);
+		assert!(
+			!before_visible.peers.contains_key(&3),
+			"visible resolver must lack promoted leader3"
+		);
+		assert_eq!(before_membership.membership().get_joint_config().len(), 1);
+		assert_eq!(
+			before_membership.voter_ids().collect::<BTreeSet<_>>(),
+			BTreeSet::from([1, 2, 3])
+		);
+	}
 	let before_mutations = gate.mutation_path_calls();
 	let request = gate.promoted_request();
-	let response =
-		send_join_wire_request(provider_for(3, registry.clone()), 2, addresses[1], request).await;
+	let observations_before_retry = gate.observations().len();
+	let response = send_join_wire_request(
+		provider_for(3, registry.clone()),
+		2,
+		addresses[1],
+		request.clone(),
+	)
+	.await;
+	let forwarded_self_ingress =
+		gate.observations()[observations_before_retry..]
+			.iter()
+			.any(|observation| {
+				observation.starts_with("receiver=3 request=JoinClusterRequestWire { node_id: 3,")
+					&& observation.contains("stage=self JOIN handler ingress")
+			});
+	// Direct ingress is a control, not evidence that the follower forwarded.
+	// Capture the forwarded observation first so this control cannot satisfy it.
+	let observations_before_direct = gate.observations().len();
+	let direct_incomplete_response = if stage
+		== wendelon::network::control_server::join_test_support::JoinGateStage::AfterPromotion
+	{
+		Some(
+			send_join_wire_request(provider_for(3, registry.clone()), 3, addresses[2], request)
+				.await,
+		)
+	} else {
+		None
+	};
+	let direct_self_ingress = gate.observations()[observations_before_direct..]
+		.iter()
+		.any(|observation| {
+			observation.starts_with("receiver=3 request=JoinClusterRequestWire { node_id: 3,")
+				&& observation.contains("stage=self JOIN handler ingress")
+		});
+	let no_follower_observed_incomplete_mutations = if direct_incomplete_response.is_some() {
+		let after = node2.state_machine.state_snapshot().await;
+		after.last_membership == before_membership
+			&& after.epoch_history == before_epochs
+			&& completed_join_visible_config(&node2) == before_visible
+			&& gate.mutation_path_calls() == before_mutations
+	} else {
+		true
+	};
 	eprintln!(
 		"retry response: {response:?}; observations: {:?}",
 		gate.observations()
@@ -1152,6 +1210,25 @@ async fn observe_join_handoff(
 		assert!(
 			original_succeeded,
 			"original completed JOIN/bootstrap must still succeed after release: {original_diagnostic}"
+		);
+	}
+	if let Some(direct) = direct_incomplete_response {
+		assert!(
+			direct_self_ingress,
+			"direct control must reach actual leader3 self JOIN handler"
+		);
+		assert!(
+			!direct.accepted,
+			"direct incomplete self JOIN must refuse: {direct:?}"
+		);
+		assert!(
+			no_follower_observed_incomplete_mutations,
+			"incomplete retries must not change follower2 observed membership/epochs/visibility or shared promotion-call count"
+		);
+		assert!(
+			forwarded_self_ingress,
+			"follower retry must reach actual leader3 even while epoch2 lacks3; response={response:?}; observations={:?}",
+			gate.observations()
 		);
 	}
 	response
