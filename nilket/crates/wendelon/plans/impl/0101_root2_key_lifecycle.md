@@ -846,3 +846,81 @@ None new. The facade's public surface is unchanged, so its pin is not amended.
 - `impl: adr 0101 key custody wendelon-key signing`. It touches no `plans/**` file.
 
 Gates: as 5b. Order: independent source review → ladder → log audit → FF.
+
+## Key custody slice 5d plan: containment signing (D-21)
+
+### Status
+
+Plan only. This section authorizes no source changes.
+- Specs:
+  - activation contract r9 (`/home/me/work/.agent-bridge/wendelon-root2-activation-contract-r9/CONTRACT.md`) §8.2, where P-6 and the containment override are carried unchanged from r6; Addendum B (B1-B3); Addendum A5; D-21 in §12;
+  - custody `IMPL-NOTES.md` rulings D-c (the amended pin) and D-d (`--root-key`).
+- Slices 5a-5c are on main (`3a43b9190`).
+- Out of scope:
+  - `live.rs::verify_containment`, the node-side verifier (activation slice 6);
+  - the refusal of Dev-tagged key files (activation C7 [slice 6]).
+
+### Behavior
+
+- **The form.** `R/role_command.rs` gains `RoleForm3::Containment`. Its one domain is `(Containment, [3, 0], 0) → "VISROOT2-ROLE3-CONTAINMENT-RECOVERY\0"`. `role_requirement` never yields it, so no on-log command can select it.
+- **The containment digest.** `role_command::containment_digest3(root_key, node_id, boot_nonce, on)` is BLAKE3 over `"wendelon/root2/containment-elect/v1\0" ‖ RootKey ‖ node_id u32 LE ‖ boot_nonce16 ‖ on/off u8` (1 on, 0 off), through the crate's BLAKE3 boundary (`crate::hash::blake3`). It is one function, so `live.rs` will share it.
+- **The proof.** A VISROL03 layout:
+  - bytes 12..44 are the context digest, as for every role proof;
+  - bytes 44..76 are the containment digest;
+  - slot 0 is recovery at its active epoch, and slot 1 is absent.
+- **The facade** (`operator_proof/proof.rs`) gains two functions:
+  - `prepare_containment(context, signer, root_key, node_id, boot_nonce, on) -> Unsigned`. It refuses `RoleNotNamed` for a signer that is not recovery, `StaleEpoch` for a stale epoch, and `Retired` for a retired root (A4: containment is unavailable once retired). Frozen roots are not refused: containment is incident response.
+  - `self_check_containment(context, root_key, node_id, boot_nonce, on, proof)`. It runs `verify_core(view, proof, containment_digest, [3, 0], Containment)` under the reader's view: the check `live.rs` will make, under the offline view.
+
+  The facade public-items pin is amended to exactly the new export list, and the signature-type pin is unchanged (byte arrays, primitives, the facade's types).
+- **`wendelon-key sign containment --dir D --key NAME --context F --trusted-manifest M --root-key HEX64 --node-id N --boot-nonce HEX32 --state on|off [--override-host-checks] --out NAME2`.**
+  - **Gates.** The same as 5c's `sign`: host checks, decryption, a Bound file, its context equal to the verified one, the history holding its key at its role and epoch, and the facade's active-epoch and retirement refusals.
+  - **RootKey (B2).** It is an explicit input until the identity encoding exists.
+  - **Display.** The root key, node, boot nonce and state, with the signer's role and epoch.
+  - **Code.** The first 32 hex digits of the containment digest (bytes 44..76): the "containment context digest" that `root2 status` will display (B3), which binds RootKey, node, nonce and state. It is shown in full only after the code matches, then the preimage hash is shown.
+  - **Output.** `NAME2.containment`, the 224-byte proof, create-new 0600, after `self_check_containment`. It is logged with the digest and the form and slot.
+- **Vectors.** `R/tests/compromise/containment_vectors.json`, produced by a Rust generator (`R/tests/compromise/containment_form.rs`, which rewrites the file when `WENDELON_WRITE_VECTORS=1` and otherwise compares), next to the compromise fixtures it reuses. It holds the inputs (context bytes, RootKey, node, nonce, state, recovery seed) and the outputs (containment digest, preimage, signed proof). The wendelon-key tests replay each vector through `sign containment` and get byte-identical proofs, since Ed25519 is deterministic.
+
+### Algebra
+
+- **Identity.** A containment authorization is (context digest, containment digest, recovery epoch), where the containment digest names (RootKey, node, boot nonce, state). It has no command and no log position: it is process-local on the node and dies with the boot nonce.
+- **Owner.** The recovery role signs; only `live.rs` will verify (slice 6).
+- **Keys.** One domain, one slot ([3, 0], 0). Domain separation is the key that keeps containment and on-log proofs apart.
+- **Laws.**
+  - **CL1, never on the log.** No on-log path selects `Containment`. A containment proof presented as an on-log sidecar fails on the domain; an on-log proof presented as containment fails on the domain and the digest.
+  - **CL2, bound to one boot.** A proof for one (RootKey, node, nonce, state) fails for any other.
+  - **CL3, the same signing authority as 5c.** An authenticated Bound recovery header, its context, the history and the active epoch. Location in `retired/` never decides it.
+  - **CL4, unchanged audit.** C-S6 and C-S6b outputs are byte-identical.
+- **Visibility.** The proof is bearer authority for one process lifetime. It is written 0600 and logged by digest only.
+
+### The B1 pin
+
+A new MV architecture test walks every non-test root2 source token by token, with `cfg(test)` items stripped. The identifier `Containment` may appear only:
+- in `role_command.rs`, inside `enum RoleForm3` and `fn domain`;
+- in `operator_proof/proof.rs`, inside `prepare_containment` and `self_check_containment`;
+- in a file named `live.rs`, inside `verify_containment`.
+
+Everywhere else is refused, including `role_requirement`, `verification.rs`, `governance_verification.rs` and `compromise/attribution.rs`. Probes cover each of those, plus another `proof.rs` function. The control is a `live.rs` probe whose `verify_containment` names it, which passes.
+
+### Tests (each with a negative control)
+
+| Test | Checks | Negative control |
+|---|---|---|
+| T-CV vectors | the generator reproduces `containment_vectors.json` (as JSON values); the digest is the BLAKE3 of the documented concatenation | a vector with one input byte changed gives another digest and fails `self_check_containment` |
+| T-CX cross-use (CL1) | a containment proof as an on-log RetireRoot [3,0], Freeze, and governance VISROL03 sidecar is refused by the production verifier and the reducer (not authorized); the same layout signed under the containment domain but carrying the command digest is also refused, so the domain alone separates them; an on-log recovery proof (RotateAdmin [3,0]) and a Legacy-domain signature over a containment layout both fail `self_check_containment` | the same layouts signed under their own domains are accepted |
+| T-CB binding (CL2) | a wrong boot nonce, node, RootKey and state each fail `self_check_containment` | the correct inputs pass |
+| T-CF facade refusals | a governance or administrator signer is `RoleNotNamed`; a stale recovery epoch is `StaleEpoch`; a retired root is `Retired` | the active recovery key on the same context prepares, and a frozen root prepares |
+| T-CA audit unchanged (CL4) | the C-S6 audit stdout over a history of every role-proof form (`R/tests/compromise/output_pin.rs`) equals the SHA-256 recorded at `3a43b9190`, before the form existed; the C-S6b export golden is unchanged | the same history without its RetireRoot gives another digest |
+| T-CS tool | `sign containment` with the recovery key writes a proof that passes `self_check_containment` and equals the vector's bytes; the 5c authority refusals hold (Pending, foreign context, non-recovery key, stale epoch); host checks apply (recovery role) | a wrong code, including one matching only 16 hex digits, writes nothing; a clean host with the right code writes |
+| B1 pin | the identifier sits only in the allowed sites | the probes above |
+
+### Dependencies
+
+None new. BLAKE3 goes through `crate::hash::blake3`, so the BLAKE3 confinement inventory is unchanged.
+
+### Commits and gate order
+
+- `plan: adr 0101 key custody containment signing` (this section). The arch and MV checks pass before FF.
+- `impl: adr 0101 key custody containment signing`. It touches no `plans/**` file.
+
+Gates: as 5c, at full parallelism (operator rule): every suite runs with `--test-threads` of at least the cpuset size and none at one thread. A failure that appears only in parallel is reported as a defect candidate. Order: independent source review → ladder → log audit → FF.
