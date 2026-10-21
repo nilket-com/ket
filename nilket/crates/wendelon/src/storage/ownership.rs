@@ -850,7 +850,7 @@ mod tests {
 		});
 		started_rx.await.unwrap();
 		worker.abort();
-		// On this single-thread runtime cancellation cannot be polled between
+		// On this `current_thread` runtime cancellation cannot be polled between
 		// abort and this independent open: the task still owns its future.
 		let error = DataDirectoryOwner::acquire_existing(dir.path()).unwrap_err();
 		assert!(

@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MANIFEST="${CARGO_CTRL_MANIFEST:-$ROOT_DIR/ci/controlled-tests.txt}"
-MAIN_PERCENT="${CARGO_CTRL_MAIN_PERCENT:-80}"
+CONTROLLED_CPUS="${CARGO_CTRL_CONTROLLED_CPUS:-2}"
 FILTER=""
 LOCKED=0
 DRY_RUN=0
@@ -14,8 +14,9 @@ usage() {
 Usage: scripts/cargo-ctrl [OPTIONS]
 
 Run workspace library tests in two concurrent resource lanes:
-  general     parallel libtest workers on 80% of available CPUs
-  controlled  timing-sensitive tests from the manifest, queued one at a time
+  general     parallel libtest workers on every CPU outside the controlled lane
+  controlled  timing-sensitive tests from the manifest, queued one at a time on
+              a lane sized to what one test uses (1-2 CPUs), never a large share
 
 Manifest lines are exact library test names, or integration tests written as
 `<package> --test <target> <exact test name>`. Controlled tests run with
@@ -30,7 +31,7 @@ Options:
   -h, --help        Show this help.
 
 Environment:
-  CARGO_CTRL_MAIN_PERCENT  General-lane CPU percentage (default: 80).
+  CARGO_CTRL_CONTROLLED_CPUS  Controlled-lane CPUs, 1 or 2 (default: 2).
   CARGO_CTRL_MANIFEST      Default controlled-test manifest path.
   CARGO_CTRL_NO_AFFINITY   Set to 1 to disable taskset partitioning.
 
@@ -81,8 +82,8 @@ while (($# > 0)); do
 	esac
 done
 
-[[ "$MAIN_PERCENT" =~ ^[0-9]+$ ]] && ((MAIN_PERCENT >= 1 && MAIN_PERCENT <= 99)) || {
-	echo "CARGO_CTRL_MAIN_PERCENT must be an integer from 1 through 99" >&2
+[[ "$CONTROLLED_CPUS" =~ ^[12]$ ]] || {
+	echo "CARGO_CTRL_CONTROLLED_CPUS must be 1 or 2: one test at a time never holds more" >&2
 	exit 2
 }
 [[ -f "$MANIFEST" ]] || {
@@ -157,13 +158,14 @@ if ((${#available_cpus[@]} > 0)); then
 fi
 [[ "$total_cpus" =~ ^[0-9]+$ ]] && ((total_cpus >= 1)) || total_cpus=1
 
-main_threads=$((total_cpus * MAIN_PERCENT / 100))
-((main_threads >= 1)) || main_threads=1
-if ((total_cpus > 1 && main_threads >= total_cpus)); then
-	main_threads=$((total_cpus - 1))
+# The controlled lane runs one test at a time, so it gets only the CPUs one
+# test uses (nilket/plans/ops/test_parallelism.md); the general lane gets the rest.
+controlled_cpu_count=$CONTROLLED_CPUS
+if ((controlled_cpu_count >= total_cpus)); then
+	controlled_cpu_count=$((total_cpus > 1 ? total_cpus - 1 : 1))
 fi
-controlled_cpu_count=$((total_cpus - main_threads))
-((controlled_cpu_count >= 1)) || controlled_cpu_count=1
+main_threads=$((total_cpus - controlled_cpu_count))
+((main_threads >= 1)) || main_threads=1
 
 main_prefix=()
 controlled_prefix=()
@@ -193,10 +195,10 @@ done
 controlled_command() {
 	if [[ "$1" =~ $INTEGRATION_ENTRY ]]; then
 		controlled_cmd=(env CARGO_CTRL_LANE=controlled "${cargo_base[@]}" -p "${BASH_REMATCH[1]}"
-			--test "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" -- --exact --test-threads=1 --nocapture)
+			--test "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" -- --exact --nocapture)
 	else
 		controlled_cmd=(env CARGO_CTRL_LANE=controlled "${cargo_base[@]}" --workspace --lib "$1"
-			-- --exact --test-threads=1)
+			-- --exact)
 	fi
 }
 

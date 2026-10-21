@@ -9470,7 +9470,7 @@ impl PerfBoardRunContext {
 				(None, None)
 			};
 		let (duckdb_version, duckdb_executable_sha256) = if engines.contains(&PerfEngine::DuckDb) {
-			require_single_thread_duckdb_reference(engines)?;
+			require_one_thread_duckdb_reference(engines)?;
 			let identity = runtime_identity()?.ok_or_else(|| {
 				"DuckDB perf requires toron-bench run and a staged DuckDB executable".to_string()
 			})?;
@@ -11261,15 +11261,15 @@ fn reference_thread_pin_provenance(setting: &Option<String>) -> &'static str {
 
 /// A primitive-ladder row compares Toron's one-task coordinate against a one-thread reference.
 /// Do not silently fall back to DuckDB's machine-dependent default parallelism: the recorded
-/// provenance must be the literal single-thread setting before a ladder can run its DuckDB arm.
-fn require_single_thread_duckdb_reference(engines: &[PerfEngine]) -> Result<(), String> {
+/// provenance must be the literal one-thread setting before a ladder can run its DuckDB arm.
+fn require_one_thread_duckdb_reference(engines: &[PerfEngine]) -> Result<(), String> {
 	if !engines.contains(&PerfEngine::DuckDb) {
 		return Ok(());
 	}
-	require_single_thread_duckdb_setting(duckdb_thread_setting().as_deref())
+	require_one_thread_duckdb_setting(duckdb_thread_setting().as_deref())
 }
 
-fn require_single_thread_duckdb_setting(setting: Option<&str>) -> Result<(), String> {
+fn require_one_thread_duckdb_setting(setting: Option<&str>) -> Result<(), String> {
 	match setting {
 		Some("1") => Ok(()),
 		Some(value) => Err(format!(
@@ -20250,15 +20250,15 @@ mod tests {
 	}
 
 	#[test]
-	fn primitive_ladder_requires_explicit_single_thread_duckdb() {
-		assert!(require_single_thread_duckdb_setting(Some("1")).is_ok());
+	fn primitive_ladder_requires_explicit_one_thread_duckdb() {
+		assert!(require_one_thread_duckdb_setting(Some("1")).is_ok());
 		assert!(
-			require_single_thread_duckdb_setting(None)
+			require_one_thread_duckdb_setting(None)
 				.expect_err("unset DuckDB thread count must reject")
 				.contains("TORON_TPCH_DUCKDB_THREADS=1")
 		);
 		assert!(
-			require_single_thread_duckdb_setting(Some("16"))
+			require_one_thread_duckdb_setting(Some("16"))
 				.expect_err("parallel DuckDB thread count must reject")
 				.contains("found \"16\"")
 		);
@@ -20479,7 +20479,7 @@ async fn ladder_command(args: &[String]) -> ExitCode {
 		Ok(engines) => engines,
 		Err(message) => return harness_error(&message),
 	};
-	if let Err(message) = require_single_thread_duckdb_reference(&engines) {
+	if let Err(message) = require_one_thread_duckdb_reference(&engines) {
 		return harness_error(&message);
 	}
 	let output_dir =

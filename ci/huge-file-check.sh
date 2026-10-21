@@ -46,7 +46,7 @@ fi
 cd "$ROOT_DIR"
 export BARYON_SPARSE_FIXTURE="$FIXTURE"
 timeout 120s cargo test --locked -p libaryon \
-	sparse_200_gib -- --test-threads=1
+	sparse_200_gib
 
 allocated_after="$(( $(stat -c '%b' "$FIXTURE") * 512 ))"
 echo "allocated bytes after test: $allocated_after"

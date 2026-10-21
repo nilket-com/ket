@@ -19,15 +19,24 @@ function Invoke-Step {
     }
 }
 
+. (Join-Path $PSScriptRoot 'windows-test-lanes.ps1')
+
 Push-Location (Split-Path -Parent $PSScriptRoot)
 try {
     Invoke-Step @('fmt', '--check')
     # Per-package runs include each crate's architecture test. A workspace-wide
-    # run would also build Nilket's Linux-only member crates.
-    # Serial, because some engine tests depend on uncontended timing.
-    Invoke-Step @('test', '--locked', '-p', 'libaryon', '-p', 'baryon', '-p', 'ket', '--', '--test-threads=1')
+    # run would also build Nilket's Linux-only member crates. The engine tests
+    # that need uncontended timing (ci/controlled-tests.txt) run one at a time
+    # in a 2-CPU controlled lane; everything else runs in parallel beside them.
+    Invoke-Step @('test', '--locked', '-p', 'libaryon', '-p', 'baryon', '-p', 'ket', '--no-run')
+    Invoke-LanedTests -TestArguments @('test', '--locked', '-p', 'libaryon', '-p', 'baryon', '-p', 'ket') `
+        -Packages @('libaryon', 'baryon', 'ket')
     # Polariton's default features: local Toron supervision compiles out here.
-    Invoke-Step @('test', '--locked', '-p', 'polariton', '--', '--test-threads=1')
+    # UNVERIFIED at libtest's default thread count: on Linux, ci/check.sh runs
+    # only Polariton's bin tests with --no-default-features (at the default
+    # count); this full default-feature package run has not been checked in
+    # parallel on any host.
+    Invoke-Step @('test', '--locked', '-p', 'polariton')
     Invoke-Step @('check', '--locked', '-p', 'polariton', '--no-default-features')
 } finally {
     Pop-Location

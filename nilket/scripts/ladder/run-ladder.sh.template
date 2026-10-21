@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+# Ladder driver v5: three lanes, each with its own target dir and its own
+# 8-CPU set, so lanes do not contend for cores or build locks. Inside a lane,
+# steps run one after another and every test step takes cargo-cgroup's default
+# test concurrency (RUST_TEST_THREADS=1024, CPU bounded by the lane cpuset);
+# no step passes a one-thread setting. Every step runs under timeout(1) with
+# its own budget (about 3x its expected time) and records rc 124 (timed out) or
+# 137 (killed after the 60 s grace). See nilket/plans/ops/test_parallelism.md
+# and reviews/ladder-driver-v5/DESIGN.md.
+set -uo pipefail
+COMMIT=__COMMIT__
+ROOT=$HOME/work/toron-evidence/__RUN__
+SRC=$ROOT/source
+OUT=$ROOT/run
+export PATH=$HOME/.cargo/bin:$PATH
+[ -e "$OUT" ] && { echo "run dir exists; refusing to overwrite"; exit 2; }
+mkdir -p "$OUT"
+git clone -q "$ROOT/full.bundle" "$SRC" 2>/dev/null
+git -C "$SRC" checkout -q --detach "$COMMIT"
+[ "$(git -C "$SRC" rev-parse HEAD)" = "$COMMIT" ] || { echo "wrong commit"; exit 2; }
+git -C "$SRC" status --porcelain > "$OUT/status-start.txt"
+{ rustc --version; cargo --version; uname -a; nproc; date -u +%FT%TZ; } > "$OUT/env.txt"
+# v5 needs the wrapper with the 1024 default, the shared memory slice and
+# signal-safe units; refuse a source tree whose wrapper predates them.
+grep -q 'CARGO_CGROUP_SLICE_MEMORY_PERCENT' "$SRC/nilket/scripts/cargo-cgroup" || { echo "cargo-cgroup lacks the memory slice; v5 needs it" | tee -a "$OUT/rc.txt"; exit 2; }
+# All three lanes share one cgroup slice (cargo-cgroup.slice). Three 32G lanes
+# need 96G in it: the slice is min(96G, 80% of MemTotal), so refuse a host with
+# less than 120 GiB rather than let the lanes OOM each other.
+export CARGO_CGROUP_SLICE_MEMORY_MAX=96G CARGO_CGROUP_SLICE_MEMORY_PERCENT=80
+mem_kb=$(awk '/^MemTotal:/ { print $2 }' /proc/meminfo)
+[ $((mem_kb * 1024 / 100 * 80)) -ge $((96 << 30)) ] || { echo "MemTotal ${mem_kb} kB: 80% is below the 96G three lanes need; refusing" | tee -a "$OUT/rc.txt"; exit 2; }
+# The wrapper owns the test concurrency, so record exactly which wrapper ran.
+{ sha256sum "$SRC/nilket/scripts/cargo-cgroup"; grep -E '^(test_threads|tasks_max|memory_high_cfg|memory_max_cfg|slice|slice_memory_max_cfg|slice_memory_percent|nofile)=' "$SRC/nilket/scripts/cargo-cgroup"; free -g; ulimit -Hn; } >> "$OUT/env.txt"
+# Test temp state lives in a per-run directory on /dev/shm (tmpfs, the same
+# semantics as every earlier accepted ladder), never in the host's shared /tmp,
+# whose inodes leaked tests exhausted on 2026-10-19. Preflight refuses without
+# headroom; the cleanup below removes each lane's TMPDIR.
+TMPROOT=/dev/shm/ladder-${ROOT##*/}
+{ df -h "$ROOT" /tmp /dev/shm; df -i "$ROOT" /tmp /dev/shm; } >> "$OUT/env.txt"
+shm_inodes=$(df --output=iavail /dev/shm | tail -1 | tr -d ' ')
+[ "$shm_inodes" -ge 4000000 ] || { echo "/dev/shm has $shm_inodes free inodes; refusing" | tee -a "$OUT/rc.txt"; exit 2; }
+free_inodes=$(df --output=iavail "$ROOT" | tail -1 | tr -d ' ')
+[ "$free_inodes" -ge 2000000 ] || { echo "run root has $free_inodes free inodes; refusing" | tee -a "$OUT/rc.txt"; exit 2; }
+free_kb=$(df --block-size=1K --output=avail "$ROOT" | tail -1 | tr -d ' ')
+[ "$free_kb" -ge 157286400 ] || { echo "run root has $free_kb KiB free (< 150 GiB); refusing" | tee -a "$OUT/rc.txt"; exit 2; }
+# mkdir is the atomic existence test: /dev/shm is world-writable, so never check-then-create.
+mkdir -m 0700 "$TMPROOT" || { echo "tmp root exists or cannot be created; refusing" | tee -a "$OUT/rc.txt"; exit 2; }
+# step <lane> <name> <budget> <cargo args...>; budget is a timeout(1) duration.
+# timeout sends TERM, on which cargo-cgroup stops its unit; RuntimeMaxSec is
+# the backstop if the 60 s grace ends in SIGKILL.
+step() {
+	local lane=$1 name=$2 budget=$3; shift 3
+	local secs=${budget%[smh]}
+	case $budget in *m) secs=$((secs * 60)) ;; *h) secs=$((secs * 3600)) ;; esac
+	echo "$(date -u +%FT%TZ) $lane start $name budget=$budget" >> "$OUT/timeline.txt"
+	(cd "$SRC/nilket" && CARGO_CGROUP_RUNTIME_MAX_SEC=$((secs + 90)) timeout --kill-after=60 "$budget" scripts/cargo-cgroup "$@") > "$OUT/$name.log" 2>&1
+	local rc=$?
+	echo "$name rc=$rc" >> "$OUT/rc.txt"
+	echo "$(date -u +%FT%TZ) $lane end $name rc=$rc" >> "$OUT/timeline.txt"
+}
+# Lane A: the debug Wendelon chain. The stress steps run first, while lanes B
+# and C are still building and testing, so they run under the load of the
+# other two lanes; their nextest build also compiles every Wendelon test
+# target, which wendelon-test then reuses.
+lane_a() {
+	export TMPDIR=$TMPROOT/tmp-a; mkdir -p "$TMPDIR"
+	export CARGO_TARGET_DIR=$ROOT/target-a CARGO_CGROUP_CPUS=0-7 CARGO_CGROUP_CPU_QUOTA=800% CARGO_CGROUP_JOBS=6
+	step A debug-lib-test-build 15m test --locked -p wendelon --lib --no-run --message-format=json-render-diagnostics
+	# Concurrency stress for the converted restart tests (ci/README "Test
+	# concurrency"), under the load of the other two lanes: cross-process
+	# (nextest) and in-process (repeated libtest at an explicit thread count).
+	step A stress-restart-nextest 35m nextest run --locked -p wendelon --no-fail-fast --stress-count 30 -E 'test(=advance_epoch_status_survives_restart) | test(=advance_epoch_commit_emits_raft_audit_once_across_restart) | test(=explicit_join_is_idempotent_and_recovery_rejoins_cleanly) | test(=property_pending_finalization_restart_recovers_without_losing_value) | test(/^node::tests::/) | test(/^storage::ownership::/)'
+	for i in $(seq -w 1 10); do
+		step A stress-node-inprocess-$i 5m test --locked -p wendelon --lib node::tests -- --test-threads=12
+		step A stress-markstore-inprocess-$i 5m test --locked -p wendelon --lib root2::tests::mark_store -- --test-threads=8
+		step A stress-counter-inprocess-$i 5m test --locked -p wendelon --lib -- --test-threads=8 storage::counter network::data_server::tests::counter_write_key
+	done
+	# Counter concurrency (F-CTR-8/9: framing, write-key admission, cancellation),
+	# cross-process under the same lane load.
+	step A stress-counter-nextest 10m nextest run --locked -p wendelon --no-fail-fast --stress-count 20 -E 'test(/^storage::counter::/) | test(/^network::data_server::tests::counter_write_key/)'
+	# Every Wendelon target in debug: lib (root2 and mutation_visibility included),
+	# architecture_test, mutation_visibility_architecture_test, the other
+	# integration tests and the doc-tests.
+	step A wendelon-test 45m test --locked -p wendelon --no-fail-fast
+}
+# Lane B: release mode, formatting, the key-custody crates and the client.
+lane_b() {
+	export TMPDIR=$TMPROOT/tmp-b; mkdir -p "$TMPDIR"
+	export CARGO_TARGET_DIR=$ROOT/target-b CARGO_CGROUP_CPUS=8-15 CARGO_CGROUP_CPU_QUOTA=800% CARGO_CGROUP_JOBS=6
+	step B fmt 5m fmt -p wendelon -p wendelon-client -p toron -p toron-tpch -p toron-client -p nilket -p key-guard -p wendelon-key -p tls-pki -p observability -p nilket-local --check
+	step B release-library 15m build --locked --verbose --release -p wendelon --lib --message-format=json-render-diagnostics
+	step B release-lib-test-build 50m test --locked --verbose --release -p wendelon --lib --no-run --message-format=json-render-diagnostics
+	step B release-raft-storage-pins 5m test --locked --verbose --release -p wendelon --lib consensus::raft_storage --no-fail-fast
+	step B release-pins 5m test --locked --verbose --release -p wendelon --lib mutation_visibility --no-fail-fast -- --nocapture
+	step B wendelon-client-test 15m test --locked -p wendelon-client --no-fail-fast
+	step B key-guard-test 5m test --locked -p key-guard --no-fail-fast
+	step B tls-pki-test 5m test --locked -p tls-pki --no-fail-fast
+	# wendelon-key builds wendelon with the non-FIPS feature set, so this step
+	# compiles its own wendelon; its tests/pins.rs holds the FIPS-graph check.
+	step B wendelon-key-test 15m test --locked -p wendelon-key --no-fail-fast
+	# Crates neither v4 nor earlier v5 tested. observability's tests are all
+	# feature-gated; kafka (rdkafka, cmake) and fips (aws-lc FIPS) stay out.
+	step B observability-test 10m test --locked -p observability --features http,non-fips,otlp-http,otlp-grpc --no-fail-fast
+	step B nilket-local-test 10m test --locked -p nilket-local --no-fail-fast
+}
+# Lane C: Toron and the crates that build on it.
+lane_c() {
+	export TMPDIR=$TMPROOT/tmp-c; mkdir -p "$TMPDIR"
+	export CARGO_TARGET_DIR=$ROOT/target-c CARGO_CGROUP_CPUS=16-23 CARGO_CGROUP_CPU_QUOTA=800% CARGO_CGROUP_JOBS=6
+	step C toron-test 75m test --locked -p toron --no-fail-fast
+	# The fixture-worker binary once hung in a futex wait when two of its tests
+	# ran at once (an unexplained defect candidate); stress it cross-process.
+	step C stress-distributed-process-nextest 15m nextest run --locked -p toron --test distributed_process_test --no-fail-fast --stress-count 20
+	# Builds the shared TPC-H fixture once, by one exact test, before the suite.
+	step C tpch-fixture-warmup 10m test --locked -p toron-tpch --lib adr471_probe::adr471_q14_binds_natural_with_flag_on --no-fail-fast -- --exact
+	step C tpch-test 10m test --locked -p toron-tpch --no-fail-fast
+	step C client-test 5m test --locked -p toron-client --no-fail-fast
+	step C nilket-test 15m test --locked -p nilket --no-fail-fast
+}
+lane_a & A=$!
+lane_b & B=$!
+lane_c & C=$!
+wait $A $B $C
+git -C "$SRC" status --porcelain > "$OUT/status-end.txt"
+[ "$(git -C "$SRC" rev-parse HEAD)" = "$COMMIT" ] && echo "commit unchanged" >> "$OUT/rc.txt"
+echo DONE >> "$OUT/rc.txt"
+# Temp entries the tests left behind are a hygiene signal: count them per lane.
+for l in a b c; do echo "tmp-$l leftover entries: $(find "$TMPROOT/tmp-$l" -mindepth 1 -maxdepth 1 | wc -l)"; done > "$OUT/tmp-leftovers.txt"
+# Build output and temp state are disposable; keep the run logs only, so runs never fill the disk.
+rm -rf "$ROOT/target-a" "$ROOT/target-b" "$ROOT/target-c" "$TMPROOT" "$SRC"
+echo CLEANED >> "$OUT/rc.txt"

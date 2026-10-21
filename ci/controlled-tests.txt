@@ -7,6 +7,8 @@
 # timing/projection assertions; ordinary slow tests belong in the general lane.
 # Never add a test here to hide a parallel-only failure; that is a defect
 # candidate (see "Test concurrency" in ci/README.md).
+# The lane is 2 CPUs (cargo-ctrl, ci/windows-test-lanes.ps1): one test at a
+# time never holds more. Policy: nilket/plans/ops/test_parallelism.md.
 
 engine::runtime::system::tests::split_view_resolves_the_shared_buffers_language_theme
 engine::runtime::system::tests::write_file_as_redetects_language_and_re_resolves_theme

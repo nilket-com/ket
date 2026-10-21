@@ -23,6 +23,8 @@ function Invoke-Cargo {
     }
 }
 
+. (Join-Path (Join-Path (Split-Path -Parent $PSScriptRoot) 'ci') 'windows-test-lanes.ps1')
+
 Push-Location (Split-Path -Parent $PSScriptRoot)
 try {
     $rustVersion = & rustc -vV
@@ -47,11 +49,12 @@ try {
 
     if ($Test) {
         # Debug assertions are required by Polariton's widget test renderer.
-        # Run serially because some engine tests depend on uncontended timing.
-        Invoke-Cargo -CargoArguments (@('test', '--locked', '--target', $target,
-            '-p', 'libaryon', '--lib', '--', '--test-threads=1'))
-        Invoke-Cargo -CargoArguments (@('test') + $productArguments +
-            @('--bin', $Product, '--', '--test-threads=1'))
+        # The engine tests that need uncontended timing (ci/controlled-tests.txt)
+        # run one at a time in a 2-CPU controlled lane beside the parallel rest.
+        $libArguments = @('test', '--locked', '--target', $target, '-p', 'libaryon', '--lib')
+        Invoke-Cargo -CargoArguments ($libArguments + @('--no-run'))
+        Invoke-LanedTests -TestArguments $libArguments -Packages @('libaryon') -LibOnly
+        Invoke-Cargo -CargoArguments (@('test') + $productArguments + @('--bin', $Product))
     }
 } finally {
     Pop-Location

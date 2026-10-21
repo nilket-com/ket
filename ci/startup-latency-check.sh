@@ -33,6 +33,6 @@ cargo test --release --locked -p baryon --test startup_latency_pty_test --no-run
 
 export BARYON_STARTUP_LATENCY_ENFORCE="$ENFORCE"
 timeout 300s cargo test --release --locked -p libaryon --test startup_latency_test \
-	-- --exact engine_startup_latency_stays_within_budget --test-threads=1 --nocapture
+	-- --exact engine_startup_latency_stays_within_budget --nocapture
 timeout 300s cargo test --release --locked -p baryon --test startup_latency_pty_test \
-	-- --exact terminal_startup_latency_stays_within_budget --test-threads=1 --nocapture
+	-- --exact terminal_startup_latency_stays_within_budget --nocapture

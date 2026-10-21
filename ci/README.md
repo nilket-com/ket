@@ -41,9 +41,11 @@ their target, which needs that platform's toolchain and SDK. On macOS, run
 build script above remains the quicker smoke entrypoint.
 
 `cargo-ctrl` divides the CPUs available to its process into two concurrent
-lanes. The general lane receives 80% and uses that many libtest workers. The
-remaining CPUs are reserved for the tests listed in `controlled-tests.txt`,
-which run one-at-a-time. On Linux, `taskset` gives both lanes disjoint CPU sets,
+lanes. The controlled lane receives 2 CPUs (`CARGO_CTRL_CONTROLLED_CPUS`, 1 or
+2): the tests listed in `controlled-tests.txt` run there one at a time, so the
+lane is sized to what one test uses and never holds a large share of the
+machine. The general lane receives every other CPU and uses that many libtest
+workers. On Linux, `taskset` gives both lanes disjoint CPU sets,
 including every Cargo, rust-analyzer, and test thread they spawn. On other
 platforms the same thread limits apply without CPU affinity.
 
@@ -55,7 +57,7 @@ scripts/cargo-ctrl --filter ordinary_set
 BARYON_SVP_BACKEND=blocking scripts/cargo-ctrl --locked
 ```
 
-Set `CARGO_CTRL_MAIN_PERCENT` to tune the split or
+Set `CARGO_CTRL_CONTROLLED_CPUS=1` to shrink the controlled lane or
 `CARGO_CTRL_NO_AFFINITY=1` to diagnose affinity-specific behavior.
 
 A manifest line is an exact library test name, or an integration test written
@@ -84,14 +86,20 @@ channel closed before the tenant admission reservation dropped (`e9a92b06`).
    cargo test -p <crate> --lib -- --test-threads=<N>   # in-process; repeat it, and pass N explicitly
    ```
 
-   nextest exercises cross-process contention; repeated in-process `cargo test` runs exercise shared state inside one process. A stress campaign needs both. Pass `--test-threads` explicitly, because cargo-cgroup sets RUST_TEST_THREADS=1.
+   nextest exercises cross-process contention; repeated in-process `cargo test` runs exercise shared state inside one process. A stress campaign needs both. cargo-cgroup defaults RUST_TEST_THREADS to 1024; pass `--test-threads` explicitly when a stress run needs a specific count.
 
 3. **Do not widen serialization to turn a suite green.** Add a nextest
    test-group or a `controlled-tests.txt` entry only when the test genuinely
    needs exclusive resources, and write the reason beside the entry.
-4. **A serial run is not concurrency evidence.** Gate runs with
-   `--test-threads=1` give attributable output; they say nothing about a
-   parallel-only failure.
+4. **A serial run is not concurrency evidence.** A run on one test thread
+   says nothing about a parallel-only failure. The 1024-test-thread default
+   (CPU bounded by the cpuset) and the fixes for the candidates in
+   `nilket/plans/ops/parallel_defect_candidates.md` reach main together as one
+   stack, only after every candidate is fixed and a ladder driver v5 run passes
+   on that stack. Until then main's wrapper defaults to one test thread, and v4
+   ladders, which run it, need no step timeouts. A test that must
+   run alone is declared narrowly and allowlisted, never by a global serial
+   default: see `nilket/plans/ops/test_parallelism.md`.
 
 When a test fails only in parallel, open a defect-candidate item naming the
 test and the failure, reproduce it under load, and then fix the product or the

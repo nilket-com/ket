@@ -10118,9 +10118,9 @@ async fn fresh_leader_recovers_peer_witness_before_duplicate_write_replays() {
 		.data_ring_orphan_witness_recovery_leadership_unconfirmed_total
 		.get();
 	let (response, trailing) = fx.leader.write(meta, batch).await.unwrap();
-	// This delta is meaningful only when the harness serializes tests within
-	// this binary, as cargo-cgroup does. Under nextest, concurrent tests share
-	// the process-global counter and the delta is not attributable.
+	// Diagnostic only: concurrent tests in this process share the global
+	// counter, so the delta is attributable only when nothing else in the
+	// binary runs at the same time. No assertion depends on it.
 	let unconfirmed = crate::metrics::global()
 		.data_ring_orphan_witness_recovery_leadership_unconfirmed_total
 		.get() - unconfirmed_before;
