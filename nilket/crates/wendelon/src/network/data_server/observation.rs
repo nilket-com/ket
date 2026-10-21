@@ -70,16 +70,7 @@ impl WendelonDataServer {
 			.lock()
 			.expect("local observation gate poisoned")
 			.take();
-		let delay = self
-			.delay_next_local_durable_append
-			.lock()
-			.expect("local durable append delay failpoint poisoned")
-			.take();
-		LocalAppendTestHooks {
-			failure,
-			gate,
-			delay,
-		}
+		LocalAppendTestHooks { failure, gate }
 	}
 }
 
@@ -87,7 +78,6 @@ impl WendelonDataServer {
 pub(super) struct LocalAppendTestHooks {
 	failure: Arc<StdMutex<Option<(ErrorKind, String)>>>,
 	gate: Option<(Arc<Notify>, Arc<Notify>)>,
-	delay: Option<Duration>,
 }
 
 #[cfg(test)]
@@ -96,9 +86,6 @@ impl LocalAppendTestHooks {
 		if let Some((entered, release)) = self.gate {
 			entered.notify_one();
 			release.notified().await;
-		}
-		if let Some(delay) = self.delay {
-			tokio::time::sleep(delay).await;
 		}
 		if let Some((kind, message)) = self
 			.failure
@@ -127,13 +114,5 @@ impl WendelonDataServer {
 			.fail_next_local_durable_append
 			.lock()
 			.expect("local durable append failpoint poisoned") = Some((kind, message.into()));
-	}
-
-	#[cfg(test)]
-	pub(crate) fn delay_next_local_durable_append_for_test(&self, delay: Duration) {
-		*self
-			.delay_next_local_durable_append
-			.lock()
-			.expect("local durable append delay failpoint poisoned") = Some(delay);
 	}
 }
