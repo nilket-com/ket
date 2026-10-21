@@ -3,7 +3,7 @@
 //! vectors (`provisioning_reference.py`). A Bound root retires through a terminal Retire.
 use super::*;
 use crate::storage::mutation_visibility::root2::admin::manifest::{
-	AdminManifestThree3, AnyAdminManifest2, any_manifest_digest2,
+	AdminManifestThree3, manifest_digest3,
 };
 use crate::storage::mutation_visibility::root2::codec::hash;
 use crate::storage::mutation_visibility::root2::provisioning::inventory::v2::{
@@ -37,10 +37,7 @@ fn retire_at(seq: u64, op: u8) -> Event2 {
 	t
 }
 fn three(e: &Event2) -> AdminManifestThree3 {
-	let EventBody2::Reserve {
-		manifest: AnyAdminManifest2::Three(m),
-	} = e.body.clone()
-	else {
+	let EventBody2::Reserve { manifest: m } = e.body.clone() else {
 		unreachable!()
 	};
 	m
@@ -57,15 +54,15 @@ fn manifest(generation: [u8; 16], cluster: [u8; 16], seed: [u8; 32]) -> AdminMan
 	AdminManifestThree3::new(base, m.governance(), m.recovery()).unwrap()
 }
 fn reserve(m: AdminManifestThree3, seq: u64, op: [u8; 16]) -> Event2 {
-	let any = AnyAdminManifest2::Three(m);
-	let a = any.admission().clone();
+	let any = m;
+	let a = any.base().clone();
 	Event2 {
 		seq,
 		op_id: op,
 		identity: Some(RootIdentity2 {
 			generation: a.generation,
 			cluster: a.cluster,
-			pin: any_manifest_digest2(&any.encode().unwrap()),
+			pin: manifest_digest3(&any.encode().unwrap()),
 			admin_key: a.admin_key,
 		}),
 		body: EventBody2::Reserve { manifest: any },

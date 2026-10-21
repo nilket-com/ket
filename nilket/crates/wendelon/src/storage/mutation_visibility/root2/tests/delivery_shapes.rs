@@ -19,7 +19,7 @@ use super::owner_tuple_delivery::{
 };
 use super::profile_three_fixture::{M3_OTHER, M3_PRIMARY, rooted};
 use super::*;
-use crate::storage::mutation_visibility::root2::admin::manifest::AnyAdminManifest2;
+use crate::storage::mutation_visibility::root2::admin::manifest::AdminManifestThree3;
 use crate::storage::mutation_visibility::root2::admin_install::observe_bootstrap2;
 use crate::storage::mutation_visibility::root2::provisioning::anchored::AnchoredError2;
 use crate::storage::mutation_visibility::root2::provisioning::inventory::RootState2;
@@ -395,7 +395,7 @@ fn a_replaced_file_needs_the_newly_supplied_pin() {
 		.apply(
 			&op_id2([4; 16]).unwrap(),
 			&OwnerRequest2::Reserve {
-				manifest: AnyAdminManifest2::decode(&other).unwrap(),
+				manifest: AdminManifestThree3::decode(&other).unwrap(),
 			},
 		)
 		.unwrap();

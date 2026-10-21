@@ -10,9 +10,7 @@ use super::profile_three_fixture::{
 	M3_OTHER, M3_PRIMARY, M3_SIBLING, exact_pin, expected_context, pre_root, rooted,
 };
 use super::*;
-use crate::storage::mutation_visibility::root2::admin::manifest::{
-	AnyAdminManifest2, ManifestProfile2,
-};
+use crate::storage::mutation_visibility::root2::admin::manifest::AdminManifestThree3;
 use crate::storage::mutation_visibility::root2::admin_install::*;
 use crate::storage::mutation_visibility::root2::origin::*;
 use crate::storage::mutation_visibility::root2::provisioning::anchored::AnchorDir2;
@@ -67,7 +65,7 @@ pub(super) const INVENTORY: &str = "root2.inventory";
 /// Bootstrap `length`, then exported with `export_tuple` into `out`.
 pub(super) struct Delivered {
 	pub bytes: Vec<u8>,
-	pub any: AnyAdminManifest2,
+	pub any: AdminManifestThree3,
 	pub identity: RootIdentity2,
 	pub cmd: Command2,
 	pub entry: TrustedEntry2,
@@ -79,8 +77,8 @@ pub(super) struct Delivered {
 	pub export: TupleExport2,
 }
 pub(super) fn identity_of(bytes: &[u8]) -> RootIdentity2 {
-	let any = AnyAdminManifest2::decode(bytes).unwrap();
-	let a = any.admission();
+	let any = AdminManifestThree3::decode(bytes).unwrap();
+	let a = any.base();
 	RootIdentity2 {
 		generation: a.generation,
 		cluster: a.cluster,
@@ -97,7 +95,7 @@ pub(super) fn reserved(bytes: &[u8]) -> (Scratch, OwnerDir2) {
 		.apply(
 			&op_id2([1; 16]).unwrap(),
 			&OwnerRequest2::Reserve {
-				manifest: AnyAdminManifest2::decode(bytes).unwrap(),
+				manifest: AdminManifestThree3::decode(bytes).unwrap(),
 			},
 		)
 		.unwrap();
@@ -112,7 +110,7 @@ pub(super) fn delivered_three(manifest: &[u8]) -> Delivered {
 	delivered_bytes(manifest.to_vec(), 241)
 }
 fn delivered_bytes(bytes: Vec<u8>, length: u64) -> Delivered {
-	let any = AnyAdminManifest2::decode(&bytes).unwrap();
+	let any = AdminManifestThree3::decode(&bytes).unwrap();
 	let identity = identity_of(&bytes);
 	let (_owner_dir, mut owner) = reserved(&bytes);
 	let (cmd, entry, committed, root) = rooted(&bytes, length);
@@ -192,7 +190,6 @@ fn owner_export_tuple_feeds_install() {
 	// The files are the owner's: the exact canonical manifest and nothing placed by the test.
 	assert_eq!(fs::read(d.out.at(MANIFEST)).unwrap(), d.bytes);
 	assert_eq!(d.export.manifest_pin, d.identity.pin);
-	assert_eq!(d.export.profile, ManifestProfile2::Three);
 	let tuple = read_delivered(&d).unwrap();
 	assert!(*tuple_manifest2(&tuple) == d.any);
 	assert_eq!(tuple_manifest_len2(&tuple), 241);
@@ -217,7 +214,7 @@ fn owner_export_tuple_feeds_install() {
 	);
 	// Install: identity, record, manifest binding, profile and the copied roles.
 	let admin = install_admin2(&verified, &tuple).unwrap();
-	let a = d.any.admission();
+	let a = d.any.base();
 	assert_eq!(
 		(admin_id2(&admin), admin_key2(&admin)),
 		(a.admin_id, a.admin_key)
@@ -229,13 +226,10 @@ fn owner_export_tuple_feeds_install() {
 		admin_context2(&admin).bootstrap_command,
 		record.identity.bootstrap_command
 	);
-	assert_eq!(
-		(admin_profile2(&admin), admin_manifest_len2(&admin)),
-		(ManifestProfile2::Three, 241)
-	);
-	let AnyAdminManifest2::Three(three) = &d.any;
-	assert!(admin_governance2(&admin).unwrap() == three.governance());
-	assert!(admin_recovery3(&admin).unwrap() == three.recovery());
+	assert_eq!(admin_manifest_len2(&admin), 241);
+	let three = &d.any;
+	assert!(admin_governance2(&admin) == three.governance());
+	assert!(admin_recovery3(&admin) == three.recovery());
 }
 
 /// Coherent owner tuples that pass the replica read and refuse only at C or install: a root

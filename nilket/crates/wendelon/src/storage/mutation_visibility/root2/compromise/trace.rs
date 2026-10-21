@@ -174,15 +174,15 @@ impl Trace2 {
 				self.fault = Some("first Root2 entry is not the install entry");
 				return;
 			}
-			let installed = install_admin2(post, pin).ok();
-			let Some(original) = installed.as_ref().and_then(original_roles3) else {
+			let Ok(installed) = install_admin2(post, pin) else {
 				self.fault = Some("install entry did not yield a profile-3 administrator");
 				return;
 			};
+			let original = original_roles3(&installed);
 			for (role, key) in original.into_iter().enumerate() {
 				self.history.epochs[role].push((key, at));
 			}
-			self.admin = installed;
+			self.admin = Some(installed);
 		}
 		let records = records2(
 			command,

@@ -14,7 +14,6 @@ use super::owner_core::{
 };
 use super::snapshot::encode_snapshot2;
 use crate::storage::mutation_visibility::redacted_debug;
-use crate::storage::mutation_visibility::root2::admin::manifest::ManifestProfile2;
 use crate::storage::mutation_visibility::root2::types::Digest2;
 use std::fs::{self, File, TryLockError};
 use std::io::ErrorKind;
@@ -171,7 +170,6 @@ pub(in crate::storage::mutation_visibility::root2) struct TupleExport2 {
 	pub manifest_pin: Digest2,
 	pub inventory_pin: Digest2,
 	pub export_seq: u64,
-	pub profile: ManifestProfile2,
 }
 redacted_debug!(TupleExport2, "TupleExport2");
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -450,7 +448,6 @@ impl OwnerDir2 {
 			manifest_pin: root.identity.pin,
 			inventory_pin: sha(&snapshot),
 			export_seq: state.last_seq,
-			profile: root.manifest.profile(),
 		};
 		self.publish(
 			&out_handle,

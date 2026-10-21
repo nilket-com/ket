@@ -3,7 +3,6 @@
 use super::inventory::{LogState2, MAX_ROOTS2, RootIdentity2, RootState2};
 use crate::storage::mutation_visibility::redacted_debug;
 use crate::storage::mutation_visibility::root2::admin::key::check_enrollable_admin_key2;
-use crate::storage::mutation_visibility::root2::admin::manifest::ManifestProfile2;
 use crate::storage::mutation_visibility::root2::admin::record::{
 	BOOTSTRAP_RECORD_BYTES2, BootstrapRecord2,
 };
@@ -21,8 +20,6 @@ const TRAILER: usize = 32;
 #[derive(Clone, PartialEq, Eq)]
 pub(in crate::storage::mutation_visibility::root2) struct SnapshotEntry2 {
 	pub identity: RootIdentity2,
-	/// A tag only: decode cannot authenticate a manifest it never sees.
-	pub profile: ManifestProfile2,
 	pub state: RootState2,
 	pub last_seq: u64,
 	pub record: Option<BootstrapRecord2>,
@@ -192,7 +189,6 @@ pub(in crate::storage::mutation_visibility::root2) fn encode_snapshot2(
 			.iter()
 			.map(|r| SnapshotEntry2 {
 				identity: r.identity,
-				profile: r.manifest.profile(),
 				state: r.state,
 				last_seq: r.last_seq,
 				record: r.record,
@@ -249,7 +245,6 @@ pub(in crate::storage::mutation_visibility::root2) fn decode_snapshot2(
 		if e[98..104].iter().any(|&x| x != 0) {
 			return Err(SnapshotError2::Reserved);
 		}
-		let profile = ManifestProfile2::Three;
 		let state = match e[96] {
 			1 => RootState2::Prepared,
 			2 => RootState2::Bound,
@@ -280,7 +275,6 @@ pub(in crate::storage::mutation_visibility::root2) fn decode_snapshot2(
 		};
 		entries.push(SnapshotEntry2 {
 			identity,
-			profile,
 			state,
 			last_seq,
 			record,

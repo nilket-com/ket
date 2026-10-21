@@ -2,7 +2,7 @@
 //! profile 3), against the independent `p3_` install vectors.
 use super::profile_three_fixture::{M3_PRIME, exact_pin};
 use super::*;
-use crate::storage::mutation_visibility::root2::admin::manifest::AnyAdminManifest2;
+use crate::storage::mutation_visibility::root2::admin::manifest::AdminManifestThree3;
 use crate::storage::mutation_visibility::root2::admin::record::BootstrapRecord2;
 use crate::storage::mutation_visibility::root2::admin_install::*;
 use crate::storage::mutation_visibility::root2::entry_identity::EntryPosition2;
@@ -93,8 +93,8 @@ impl Boot {
 // A coherent Part A tuple for M3_PRIME whose Bound record is `record`; Part A must accept it.
 fn tuple(record: BootstrapRecord2) -> (PinnedBoundTuple2, Vec<u8>) {
 	let (m, pin) = prime();
-	let any = AnyAdminManifest2::decode(&m).unwrap();
-	let manifest = any.admission().clone();
+	let any = AdminManifestThree3::decode(&m).unwrap();
+	let manifest = any.base().clone();
 	let snapshot = encode_snapshot2(&LogState2 {
 		roots: vec![RootEntry2 {
 			terminal: None,
@@ -169,9 +169,9 @@ fn installs_from_the_original_bootstrap_and_matches_the_vectors() {
 	);
 	assert!(
 		admin_namespace2(&a)
-			== AnyAdminManifest2::decode(&prime().0)
+			== AdminManifestThree3::decode(&prime().0)
 				.unwrap()
-				.admission()
+				.base()
 				.namespace
 	);
 	assert!(install_admin2(&state, &t).unwrap() == a);
@@ -213,7 +213,7 @@ fn later_entries_move_the_tip_but_not_the_installed_bootstrap() {
 			admin_context2(&a) == admin_context2(&before),
 			"installed context unchanged after entry {i}"
 		);
-		assert_eq!(admin_cut3(&a), Some(tip(&state)), "entry {i}");
+		assert_eq!(admin_cut3(&a), tip(&state), "entry {i}");
 		assert_eq!(admin_installed_at2(&a), l(2));
 		// Identity and the copied roles are unchanged as well.
 		assert_eq!(

@@ -32,10 +32,12 @@ fn p3_events_fold_to_the_tag_three_snapshot() {
 		snapshot::encode_snapshot2(&state).unwrap(),
 		b(&v["p3_three"])
 	);
-	let s = snapshot::decode_snapshot2(&b(&v["p3_three"])).unwrap();
 	assert_eq!(
-		s.entries[0].profile,
-		crate::storage::mutation_visibility::root2::admin::manifest::ManifestProfile2::Three
+		snapshot::decode_snapshot2(&b(&v["p3_three"]))
+			.unwrap()
+			.entries
+			.len(),
+		1
 	);
 }
 #[test]

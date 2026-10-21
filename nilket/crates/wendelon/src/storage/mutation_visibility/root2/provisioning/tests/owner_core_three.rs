@@ -4,7 +4,7 @@
 //! observation. `owner_core.rs:196` (a Reserve whose manifest fails to encode) is not ported:
 //! a profile-3 manifest cannot be constructed invalid.
 use super::*;
-use crate::storage::mutation_visibility::root2::admin::manifest::AnyAdminManifest2;
+use crate::storage::mutation_visibility::root2::admin::manifest::AdminManifestThree3;
 use crate::storage::mutation_visibility::root2::admin::record::BootstrapObservation2;
 use crate::storage::mutation_visibility::root2::codec::hash;
 use crate::storage::mutation_visibility::root2::provisioning::inventory::v2::{
@@ -34,7 +34,7 @@ fn op(n: u8) -> OpId2 {
 fn owner_vectors() -> serde_json::Value {
 	serde_json::from_str(include_str!("owner_vectors.json")).unwrap()
 }
-fn manifest_of(name: &str) -> AnyAdminManifest2 {
+fn manifest_of(name: &str) -> AdminManifestThree3 {
 	let EventBody2::Reserve { manifest } = p3_event(name).body else {
 		unreachable!()
 	};
@@ -228,7 +228,7 @@ fn state_rows_no_ops_and_refusals() {
 	);
 	// One shared component with a Retired root is enough.
 	let shared =
-		AnyAdminManifest2::decode(&p3_variant(id1.generation, [0x3c; 16], [0x3e; 32])).unwrap();
+		AdminManifestThree3::decode(&p3_variant(id1.generation, [0x3c; 16], [0x3e; 32])).unwrap();
 	assert_eq!(
 		decide2(&log, &fresh, &OwnerRequest2::Reserve { manifest: shared }),
 		refuse(OwnerError2::IdentityTaken)
@@ -314,7 +314,7 @@ fn caps_refuse_appends_but_not_retries_or_no_ops() {
 		Decision2::NoOp(RootState2::Bound)
 	);
 	assert_eq!(decide2(&bound, &op(0x44), &retire(id1)), full);
-	let m = AnyAdminManifest2::decode(&p3_variant([0x51; 16], [0x52; 16], [0x53; 32])).unwrap();
+	let m = AdminManifestThree3::decode(&p3_variant([0x51; 16], [0x52; 16], [0x53; 32])).unwrap();
 	assert_eq!(
 		decide2(&log, &op(0x42), &OwnerRequest2::Reserve { manifest: m }),
 		full
@@ -330,7 +330,7 @@ fn caps_root_cap_keeps_retries() {
 	for x in [&mut g[..4], &mut c[..4], &mut seed[..4], &mut o[..4]] {
 		x.copy_from_slice(&0u32.to_le_bytes());
 	}
-	let first = AnyAdminManifest2::decode(&p3_variant(g, c, seed)).unwrap();
+	let first = AdminManifestThree3::decode(&p3_variant(g, c, seed)).unwrap();
 	assert!(matches!(
 		decide2(
 			roots,
@@ -343,7 +343,8 @@ fn caps_root_cap_keeps_retries() {
 /// ...and a new reservation is RootCap.
 #[test]
 fn caps_root_cap_refuses_a_new_root() {
-	let extra = AnyAdminManifest2::decode(&p3_variant([0x54; 16], [0x55; 16], [0x56; 32])).unwrap();
+	let extra =
+		AdminManifestThree3::decode(&p3_variant([0x54; 16], [0x55; 16], [0x56; 32])).unwrap();
 	assert_eq!(
 		decide2(
 			p3_cap_roots(),

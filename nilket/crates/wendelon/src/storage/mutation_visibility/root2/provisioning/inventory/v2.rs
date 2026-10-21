@@ -134,7 +134,7 @@ pub(in crate::storage::mutation_visibility::root2::provisioning) fn decode_event
 	let p = &b[144..144 + n];
 	let body = match op {
 		RESERVE => EventBody2::Reserve {
-			manifest: AnyAdminManifest2::decode(p).map_err(|_| bad(CorruptReason2::Payload))?,
+			manifest: AdminManifestThree3::decode(p).map_err(|_| bad(CorruptReason2::Payload))?,
 		},
 		APPROVE => EventBody2::Approve {
 			record: BootstrapRecord2::decode(p).map_err(|_| bad(CorruptReason2::Payload))?,

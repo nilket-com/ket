@@ -56,12 +56,6 @@ fn check_fields(m: &AdminManifest2) -> AdminResult2<()> {
 // `governance_actions` u32 [185..189); the recovery role follows at [189..241).
 const GOVERNANCE_ACTIONS: u32 = 0x1FF;
 
-/// The profile identifier only; it carries no role data. Profile 3 is the only manifest form.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::storage::mutation_visibility::root2) enum ManifestProfile2 {
-	Three,
-}
-
 /// The governance role of a manifest; its action mask is fixed (`0x1FF`).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(in crate::storage::mutation_visibility::root2) struct GovernanceRole2 {
@@ -94,57 +88,11 @@ impl GovernanceRole2 {
 
 // ---- The manifest, with its exact canonical bytes ----
 
-/// The administrator manifest: profile 3, the only form (the enum collapses in d).
-#[derive(Clone, PartialEq, Eq)]
-pub(in crate::storage::mutation_visibility::root2) enum AnyAdminManifest2 {
-	Three(AdminManifestThree3),
-}
-redacted_debug!(AnyAdminManifest2, "AnyAdminManifest2");
-
-/// The exact canonical bytes of one manifest. Built only by the manifest enum's `encode`; the
-/// bytes beyond `len` are always zero, so the derived equality is exact-byte equality.
-#[derive(Clone, PartialEq, Eq)]
-pub(in crate::storage::mutation_visibility::root2) struct ManifestBytes2 {
-	storage: [u8; ADMIN_MANIFEST_P3_BYTES3],
-	len: usize,
-}
-redacted_debug!(ManifestBytes2, "ManifestBytes2");
-impl ManifestBytes2 {
-	pub(in crate::storage::mutation_visibility::root2) fn as_slice(&self) -> &[u8] {
-		&self.storage[..self.len]
-	}
-}
-
-impl AnyAdminManifest2 {
-	/// The profile-3 decoder.
-	pub(in crate::storage::mutation_visibility::root2) fn decode(
-		input: &[u8],
-	) -> AdminResult2<Self> {
-		Ok(Self::Three(AdminManifestThree3::decode(input)?))
-	}
-	/// Revalidates the manifest through its own encoder.
-	pub(in crate::storage::mutation_visibility::root2) fn encode(
-		&self,
-	) -> AdminResult2<ManifestBytes2> {
-		let Self::Three(m) = self;
-		let (storage, len) = (m.encode()?, ADMIN_MANIFEST_P3_BYTES3);
-		Ok(ManifestBytes2 { storage, len })
-	}
-	pub(in crate::storage::mutation_visibility::root2) fn profile(&self) -> ManifestProfile2 {
-		ManifestProfile2::Three
-	}
-	/// The Admission fields, descriptive only: never a whole-manifest pin or request identity.
-	pub(in crate::storage::mutation_visibility::root2) fn admission(&self) -> &AdminManifest2 {
-		let Self::Three(m) = self;
-		m.base()
-	}
-}
-
-/// Digest math over exact canonical bytes (the manifest domain); not trust.
-pub(in crate::storage::mutation_visibility::root2) fn any_manifest_digest2(
-	bytes: &ManifestBytes2,
+/// Digest math over the exact canonical manifest bytes; not trust.
+pub(in crate::storage::mutation_visibility::root2) fn manifest_digest3(
+	bytes: &[u8; ADMIN_MANIFEST_P3_BYTES3],
 ) -> Digest2 {
-	hash(DOMAIN, bytes.as_slice())
+	hash(DOMAIN, bytes)
 }
 
 pub(in crate::storage::mutation_visibility::root2) const ADMIN_MANIFEST_P3_BYTES3: usize = 241;
@@ -188,7 +136,7 @@ pub(in crate::storage::mutation_visibility::root2) struct AdminManifestThree3 {
 redacted_debug!(AdminManifestThree3, "AdminManifestThree3");
 /// Steps 1-5: the read bound, the one length (241) before any header access, magic, format,
 /// profile 3.
-fn profile_of_three(input: &[u8]) -> AdminResult2<ManifestProfile2> {
+fn profile_of_three(input: &[u8]) -> AdminResult2<()> {
 	if input.len() > ADMIN_MANIFEST_READ_BOUND2 {
 		return Err(AdminManifestError2::OverReadBound);
 	}
@@ -204,7 +152,7 @@ fn profile_of_three(input: &[u8]) -> AdminResult2<ManifestProfile2> {
 	if u16::from_le_bytes(array(input, 10)) != 3 {
 		return Err(AdminManifestError2::UnsupportedProfile);
 	}
-	Ok(ManifestProfile2::Three)
+	Ok(())
 }
 fn check_three(m: &AdminManifestThree3) -> AdminResult2<()> {
 	let b = &m.base;

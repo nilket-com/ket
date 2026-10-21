@@ -1,7 +1,7 @@
 //! T-MOVE and T-INLINE for the profile-3 fixtures: every moved or inlined input is byte-identical
 //! to what its users read before the move.
 use super::*;
-use crate::storage::mutation_visibility::root2::admin::manifest::any_manifest_digest2;
+use crate::storage::mutation_visibility::root2::admin::manifest::manifest_digest3;
 use crate::storage::mutation_visibility::root2::tests::support;
 
 fn hex(b: &[u8]) -> String {
@@ -213,8 +213,8 @@ fn tuple_digest_equals_the_inventory_pin() {
 		m3_kat_foreign(),
 	] {
 		let c = chain_of(&m, 241);
-		let any = AnyAdminManifest2::decode(&m).unwrap();
-		let shared = any_manifest_digest2(&any.encode().unwrap());
+		let any = AdminManifestThree3::decode(&m).unwrap();
+		let shared = manifest_digest3(&any.encode().unwrap());
 		assert_eq!(tuple_manifest_pin2(&c.tuple), shared);
 		assert_eq!(tuple_record2(&c.tuple).identity.pin, shared);
 		assert_eq!(

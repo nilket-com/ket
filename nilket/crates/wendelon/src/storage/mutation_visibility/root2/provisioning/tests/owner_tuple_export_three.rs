@@ -3,7 +3,7 @@
 //! roots (the independent `p3_` vectors), with the exact 241-byte manifest artifact.
 use super::*;
 use crate::storage::mutation_visibility::root2::admin::manifest::{
-	AnyAdminManifest2, ManifestProfile2, any_manifest_digest2,
+	AdminManifestThree3, manifest_digest3,
 };
 use crate::storage::mutation_visibility::root2::codec::hash;
 use crate::storage::mutation_visibility::root2::provisioning::inventory::v2::{
@@ -108,7 +108,7 @@ fn export_tuple_publishes_both_artifacts() {
 		"the exact canonical 241-byte manifest"
 	);
 	assert_eq!(manifest.len(), 241);
-	assert_eq!((t.profile, t.export_seq), (ManifestProfile2::Three, 4));
+	assert_eq!(t.export_seq, 4);
 	assert_eq!(decode_snapshot2(&snapshot).unwrap().export_seq, 4);
 	// The snapshot is byte-identical to `export` of the same state.
 	let again = Scratch::new();
@@ -122,10 +122,10 @@ fn export_tuple_publishes_both_artifacts() {
 	assert_eq!(fs::read(out.at("root2.manifest")).unwrap(), m1_bytes());
 	// The pin is the whole-manifest digest of the exact exported bytes (= the event header pin).
 	let bytes = fs::read(out.at("root2.manifest")).unwrap();
-	let any = AnyAdminManifest2::decode(&bytes).unwrap();
+	let any = AdminManifestThree3::decode(&bytes).unwrap();
 	let encoded = any.encode().unwrap();
 	assert_eq!(encoded.as_slice(), &bytes[..]);
-	assert_eq!(t.manifest_pin, any_manifest_digest2(&encoded));
+	assert_eq!(t.manifest_pin, manifest_digest3(&encoded));
 	assert_eq!(t.manifest_pin, b.pin);
 	assert_eq!(t.inventory_pin, hash(b"", &p3_snapshot_bytes("bound")));
 	assert_eq!(
@@ -145,10 +145,10 @@ fn export_tuple_pins_are_the_two_distinct_rules() {
 	let t = export(&mut o, &out, key_of(&b)).unwrap();
 	let manifest = fs::read(out.at("root2.manifest")).unwrap();
 	let snapshot = fs::read(out.at("root2.inventory")).unwrap();
-	let any = AnyAdminManifest2::decode(&manifest).unwrap();
+	let any = AdminManifestThree3::decode(&manifest).unwrap();
 	let encoded = any.encode().unwrap();
 	assert_eq!(encoded.as_slice(), &manifest[..], "the exact encoded bytes");
-	assert_eq!(t.manifest_pin, any_manifest_digest2(&encoded));
+	assert_eq!(t.manifest_pin, manifest_digest3(&encoded));
 	assert_eq!(t.manifest_pin, b.pin, "the Reserve event header's pin");
 	assert_eq!(
 		t.manifest_pin.to_vec(),

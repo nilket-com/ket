@@ -116,8 +116,8 @@ fn real_context() -> (PinnedBoundTuple2, Deployment2, Vec<E>, Vec<Fixture>) {
 	entries[2] = carried(&boot, dep, 2, None);
 	fixtures[0] = fixture(&entries[2], boot.clone(), dep);
 	let bytes = vector("p3_manifest");
-	let any = AnyAdminManifest2::decode(&bytes).unwrap();
-	let m = any.admission().clone();
+	let any = AdminManifestThree3::decode(&bytes).unwrap();
+	let m = any.base().clone();
 	let pin: Digest2 = vector("p3_manifest_pin").try_into().unwrap();
 	let mut record = BootstrapRecord2::decode(&vector("p3_record")).unwrap();
 	record.identity.bootstrap = Log2 {

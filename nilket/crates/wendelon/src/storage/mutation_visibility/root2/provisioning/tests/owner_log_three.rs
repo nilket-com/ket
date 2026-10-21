@@ -3,7 +3,7 @@
 //! profile-3 roots (the independent `p3_` vectors). A fresh marked directory already holds an empty
 //! log. The forked-child lock test is not repeated: the lock path is the same for both formats.
 use super::*;
-use crate::storage::mutation_visibility::root2::admin::manifest::AnyAdminManifest2;
+use crate::storage::mutation_visibility::root2::admin::manifest::AdminManifestThree3;
 use crate::storage::mutation_visibility::root2::admin::record::BootstrapObservation2;
 use crate::storage::mutation_visibility::root2::codec::hash;
 use crate::storage::mutation_visibility::root2::provisioning::inventory::*;
@@ -71,7 +71,7 @@ fn sha(b: &[u8]) -> [u8; 32] {
 fn op(n: u8) -> OpId2 {
 	op_id2([n; 16]).unwrap()
 }
-fn manifest_of(name: &str) -> AnyAdminManifest2 {
+fn manifest_of(name: &str) -> AdminManifestThree3 {
 	let EventBody2::Reserve { manifest } = p3_event(name).body else {
 		unreachable!()
 	};
@@ -884,7 +884,7 @@ fn repair_uses_the_reserved_slots_and_refuses_when_they_are_exhausted() {
 		o.apply(
 			&op(9),
 			&OwnerRequest2::Reserve {
-				manifest: AnyAdminManifest2::decode(&p3_variant(
+				manifest: AdminManifestThree3::decode(&p3_variant(
 					[0x5b; 16], [0x5c; 16], [0x5d; 32]
 				))
 				.unwrap()
@@ -906,7 +906,7 @@ fn repair_uses_the_reserved_slots_and_refuses_when_they_are_exhausted() {
 		o.apply(
 			&op(9),
 			&OwnerRequest2::Reserve {
-				manifest: AnyAdminManifest2::decode(&p3_variant(
+				manifest: AdminManifestThree3::decode(&p3_variant(
 					[0x5b; 16], [0x5c; 16], [0x5d; 32]
 				))
 				.unwrap()
@@ -1204,7 +1204,8 @@ fn owner_refuses_an_unreadable_event_version_before_any_write() {
 		},
 	)));
 	let _plan = seam::plan(&[], None);
-	let fresh = AnyAdminManifest2::decode(&p3_variant([0x5b; 16], [0x5c; 16], [0x5d; 32])).unwrap();
+	let fresh =
+		AdminManifestThree3::decode(&p3_variant([0x5b; 16], [0x5c; 16], [0x5d; 32])).unwrap();
 	assert_eq!(
 		o.apply(&op(0x31), &OwnerRequest2::Reserve { manifest: fresh })
 			.map(|_| ()),

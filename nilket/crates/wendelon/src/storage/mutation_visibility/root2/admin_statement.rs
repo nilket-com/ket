@@ -273,7 +273,8 @@ pub(in crate::storage::mutation_visibility::root2) fn check_admin_statement2(
 	}
 	let preimage =
 		admin_statement_preimage2(bytes.try_into().map_err(|_| StatementError2::Length)?)?;
-	if view.active(0).is_some_and(|(k, _)| k != 0) {
+	let (k, _) = view.active(0);
+	if k != 0 {
 		return Err(StatementError2::Signature);
 	}
 	VerifyingKey::from_bytes(&view.admin_key())
@@ -381,7 +382,7 @@ pub(in crate::storage::mutation_visibility::root2) fn check_epoch_statement3(
 	{
 		return Err(StatementError2::Scope);
 	}
-	let (active, key) = view.active(0).ok_or(StatementError2::Signature)?;
+	let (active, key) = view.active(0);
 	if active != k {
 		return Err(StatementError2::Signature);
 	}

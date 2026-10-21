@@ -206,10 +206,8 @@ fn verify_command2(
 			let ok = super::role_command::verify_for(&admin, bytes, d, expected, form)
 				.map_err(VerifyError2::Role)?;
 			if ok {
-				let keys =
-					super::admin_install::original_roles3(&admin).ok_or(VerifyError2::StateKind)?;
-				let (covered, fp, digest) =
-					super::admin_install::admin_cut3(&admin).ok_or(VerifyError2::StateKind)?;
+				let keys = super::admin_install::original_roles3(&admin);
+				let (covered, fp, digest) = super::admin_install::admin_cut3(&admin);
 				role_seed = Some((keys, covered, fp, digest));
 			}
 			(ok, 0)

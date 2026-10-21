@@ -1166,8 +1166,6 @@ fn admin_items(file: &syn::File) -> Option<Vec<String>> {
 						"AdminManifestError2",
 						"BootstrapRecordError2",
 						"BootstrapField2",
-						"ManifestProfile2",
-						"AnyAdminManifest2",
 						"ManifestRole3",
 						"RolePair3",
 						"ReuseField3",
@@ -1187,7 +1185,6 @@ fn admin_items(file: &syn::File) -> Option<Vec<String>> {
 						"BootstrapRecord2",
 						"BootstrapObservation2",
 						"GovernanceRole2",
-						"ManifestBytes2",
 						"RecoveryRole3",
 						"AdminManifestThree3",
 					]
@@ -1272,11 +1269,11 @@ fn admin_manifest_math_stays_private_and_has_no_provenance_producer() {
 	}
 	entrypoints.sort();
 	assert_eq!(entrypoints, ADMIN_ENTRYPOINTS);
-	// The profile-3-only census: decode x4, encode x4, new x3, base x1, governance x1.
+	// The concrete profile-3 census: decode x3, encode x3, new x3, base x1, governance x1.
 	let count = |n: &str| entrypoints.iter().filter(|e| *e == n).count();
 	assert_eq!(
 		["decode", "encode", "new", "base", "governance"].map(count),
-		[4, 4, 3, 1, 1]
+		[3, 3, 3, 1, 1]
 	);
 	// Probe: a re-added digest entrypoint is a different census.
 	let mut probe = entrypoints.clone();
@@ -1292,21 +1289,16 @@ fn admin_manifest_math_stays_private_and_has_no_provenance_producer() {
 	probe.sort();
 	assert_ne!(probe, ADMIN_ENTRYPOINTS);
 }
-// The admin entrypoints once profile 3 is the only manifest form (c2): no profile-1/2 codec,
+// The admin entrypoints after the concrete profile-3 types (d): no profile-1/2 codec,
 // digest, digest check or structural peek remains.
-const ADMIN_ENTRYPOINTS: [&str; 26] = [
+const ADMIN_ENTRYPOINTS: [&str; 21] = [
 	"actions",
 	"actions",
-	"admission",
-	"any_manifest_digest2",
-	"as_slice",
 	"base",
 	"check_enrollable_admin_key2",
 	"decode",
 	"decode",
 	"decode",
-	"decode",
-	"encode",
 	"encode",
 	"encode",
 	"encode",
@@ -1316,10 +1308,10 @@ const ADMIN_ENTRYPOINTS: [&str; 26] = [
 	"id",
 	"key",
 	"key",
+	"manifest_digest3",
 	"new",
 	"new",
 	"new",
-	"profile",
 	"recovery",
 ];
 #[test]
@@ -2228,7 +2220,6 @@ fn admin_install_is_a_pure_derivation() {
 			"admin_key2",
 			"admin_manifest_len2",
 			"admin_namespace2",
-			"admin_profile2",
 			"admin_recovery3",
 			"confirm_terminal2",
 			"install_admin2",
@@ -4775,19 +4766,16 @@ fn visadc01_is_deleted_and_the_facade_refuses_it() {
 }
 
 // The manifest names each production file may use only under its exact allowance.
-const TRACKED: [&str; 8] = [
+const TRACKED: [&str; 5] = [
 	"AdminManifestThree3",
 	"GovernanceRole2",
-	"ManifestProfile2",
-	"AnyAdminManifest2",
-	"ManifestBytes2",
-	"any_manifest_digest2",
+	"manifest_digest3",
 	"RecoveryRole3",
 	"ADMIN_MANIFEST_P3_BYTES3",
 ];
 // The tombstone list of manifest_codec_census_is_exact_and_dormant: the removed profile-1/2,
 // class-0, VISADC01 and v1-directory names, which no root2 production file may name again.
-const TOMBSTONES: [&str; 17] = [
+const TOMBSTONES: [&str; 21] = [
 	"AdminManifestTwo2",
 	"admin_manifest_two_digest2",
 	"manifest_profile2",
@@ -4805,9 +4793,13 @@ const TOMBSTONES: [&str; 17] = [
 	"DirectoryFormat2",
 	"VISREP03",
 	"VERSION_TWO",
+	"ManifestProfile2",
+	"AnyAdminManifest2",
+	"ManifestBytes2",
+	"any_manifest_digest2",
 ];
 // The manifest codec census (renamed at c2 from the profile-2 census): profile 3 is the only form.
-// Exact census of admin/manifest.rs (struct fields private, the profile and manifest enums, the
+// Exact census of admin/manifest.rs (struct fields private, no profile or manifest enums, the
 // constants) and no production name of a manifest item outside src/.../admin and the test
 // modules, except the exact per-file allowances. The tombstone names below must never return.
 // Syntax only.
@@ -4838,7 +4830,6 @@ fn manifest_codec_census_is_exact_and_dormant() {
 				let want: &[&str] = match s.ident.to_string().as_str() {
 					"GovernanceRole2" | "RecoveryRole3" => &["id", "key"],
 					"AdminManifestThree3" => &["base", "governance", "recovery"],
-					"ManifestBytes2" => &["storage", "len"],
 					"AdminManifest2" => &[
 						"generation",
 						"cluster",
@@ -4853,32 +4844,6 @@ fn manifest_codec_census_is_exact_and_dormant() {
 				assert_eq!(fields, want);
 				structs.push(s.ident.to_string());
 			}
-			syn::Item::Enum(e) if e.ident == "ManifestProfile2" => {
-				let v: Vec<_> = e.variants.iter().map(|v| v.ident.to_string()).collect();
-				assert_eq!(v, ["Three"]);
-				assert!(
-					e.variants.iter().all(|v| v.fields.is_empty()),
-					"no role data"
-				);
-			}
-			// Exactly one manifest shape, no conversion.
-			syn::Item::Enum(e) if e.ident == "AnyAdminManifest2" => {
-				let v: Vec<_> = e
-					.variants
-					.iter()
-					.map(|v| {
-						let syn::Fields::Unnamed(f) = &v.fields else {
-							panic!("tuple variants")
-						};
-						assert_eq!(f.unnamed.len(), 1);
-						(v.ident.to_string(), quote_type(&f.unnamed[0].ty))
-					})
-					.collect();
-				assert_eq!(
-					v,
-					[("Three".to_string(), "AdminManifestThree3".to_string())]
-				);
-			}
 			syn::Item::Enum(e) => panic!("unexpected enum {}", e.ident),
 			syn::Item::Const(c) => consts.push((c.ident.to_string(), root2_scoped(&c.vis))),
 			_ => {}
@@ -4892,7 +4857,6 @@ fn manifest_codec_census_is_exact_and_dormant() {
 			"AdminManifestThree3",
 			"AdminNamespace2",
 			"GovernanceRole2",
-			"ManifestBytes2",
 			"RecoveryRole3"
 		]
 	);
@@ -4909,46 +4873,43 @@ fn manifest_codec_census_is_exact_and_dormant() {
 			("RECOVERY_ACTIONS3".to_string(), false)
 		]
 	);
-	// ManifestBytes2 is built at exactly one site (the end of the manifest enum's encode):
-	// the declaration, its impl and that one literal.
-	assert_eq!(text.matches("ManifestBytes2 {").count(), 3);
-	assert_eq!(
-		text.matches("Ok(ManifestBytes2 { storage, len })").count(),
-		1
-	);
+	// The encoder returns the one fixed canonical array and digest accepts that exact array.
+	assert!(text.contains("-> AdminResult2<[u8; ADMIN_MANIFEST_P3_BYTES3]>"));
+	assert!(text.contains("bytes: &[u8; ADMIN_MANIFEST_P3_BYTES3]"));
+	assert!(text.contains("hash(DOMAIN, bytes)"));
 	// Dormant: no production file outside admin/ names a manifest item, except these exact
 	// allowances: the owner request -> event -> fold -> snapshot path, the replica tuple, install,
 	// the governed marker and C's Bootstrap length conjunct (§4.2).
 	let allowed: &[(&str, &[&str])] = &[
 		(
 			"provisioning/inventory.rs",
-			&["AnyAdminManifest2", "any_manifest_digest2"],
+			&["AdminManifestThree3", "manifest_digest3"],
 		),
-		("provisioning/inventory/v2.rs", &["AnyAdminManifest2"]),
+		("provisioning/inventory/v2.rs", &["AdminManifestThree3"]),
 		(
 			"provisioning/owner_core.rs",
 			&[
-				"AnyAdminManifest2",
-				"ManifestBytes2",
-				"any_manifest_digest2",
+				"AdminManifestThree3",
+				"manifest_digest3",
+				"ADMIN_MANIFEST_P3_BYTES3",
 			],
 		),
-		("provisioning/owner_core/v2.rs", &["any_manifest_digest2"]),
-		("provisioning/snapshot.rs", &["ManifestProfile2"]),
+		("provisioning/owner_core/v2.rs", &["manifest_digest3"]),
+		("provisioning/snapshot.rs", &[]),
 		(
 			"provisioning/terminal.rs",
-			&[
-				"AnyAdminManifest2",
-				"ManifestProfile2",
-				"any_manifest_digest2",
-			],
+			&["AdminManifestThree3", "manifest_digest3"],
 		),
-		("provisioning/owner_log.rs", &["ManifestProfile2"]),
+		("provisioning/owner_log.rs", &[]),
 		("provisioning/owner_log/ops.rs", &[]),
 		("provisioning/owner_log/directory.rs", &[]),
 		(
 			"provisioning/replica_anchor.rs",
-			&["AnyAdminManifest2", "ADMIN_MANIFEST_P3_BYTES3"],
+			&[
+				"AdminManifestThree3",
+				"manifest_digest3",
+				"ADMIN_MANIFEST_P3_BYTES3",
+			],
 		),
 		(
 			"provisioning/replica_read.rs",
@@ -4958,8 +4919,6 @@ fn manifest_codec_census_is_exact_and_dormant() {
 			"admin_install.rs",
 			&[
 				"GovernanceRole2",
-				"ManifestProfile2",
-				"AnyAdminManifest2",
 				"RecoveryRole3",
 				"ADMIN_MANIFEST_P3_BYTES3",
 			],
@@ -4970,24 +4929,15 @@ fn manifest_codec_census_is_exact_and_dormant() {
 		("role_epochs.rs", &["ADMIN_MANIFEST_P3_BYTES3"]),
 		("role_freeze.rs", &["ADMIN_MANIFEST_P3_BYTES3"]),
 		("retirement.rs", &["ADMIN_MANIFEST_P3_BYTES3"]),
-		("role_command.rs", &["ManifestProfile2"]),
-		// Key custody K7: the role view copies the descriptive governance role and profile, and
-		// its offline constructor decodes the trusted profile-3 manifest and checks its pin; the
-		// facade refuses any other manifest profile.
+		("role_command.rs", &[]),
 		(
 			"role_view.rs",
-			&[
-				"GovernanceRole2",
-				"ManifestProfile2",
-				"AnyAdminManifest2",
-				"any_manifest_digest2",
-			],
+			&["AdminManifestThree3", "GovernanceRole2", "manifest_digest3"],
 		),
-		("operator_proof.rs", &["AnyAdminManifest2"]),
-		// C-S6: the audit decodes the operator's trusted manifest (profile 3 only) and pins it.
+		("operator_proof.rs", &["AdminManifestThree3"]),
 		(
 			"compromise/binding.rs",
-			&["AnyAdminManifest2", "any_manifest_digest2"],
+			&["AdminManifestThree3", "manifest_digest3"],
 		),
 	];
 	// The one new out-of-line test file is excluded only while its declaration is cfg(test).
@@ -5033,7 +4983,7 @@ fn manifest_codec_census_is_exact_and_dormant() {
 	// Probes: a tombstone name, or a tracked name outside its allowance, in a synthetic production
 	// file is caught by the same per-name checks.
 	let probe = format!(
-		"mod {};\nfn f() -> ManifestBytes2 {{ todo!() }}",
+		"mod {};\nfn f() -> AdminManifestThree3 {{ todo!() }}",
 		TOMBSTONES[13]
 	);
 	assert!(TOMBSTONES.iter().any(|n| probe.contains(n)));
@@ -5205,7 +5155,6 @@ fn admin_binding_surface_is_exact() {
 			"admin_key",
 			"namespace",
 			"governance",
-			"profile",
 			"recovery",
 			"active",
 			"cut"
@@ -5228,14 +5177,7 @@ fn admin_binding_surface_is_exact() {
 		.unwrap();
 	assert_eq!(
 		variants,
-		[
-			"Generation",
-			"Cluster",
-			"Pin",
-			"AdminKey",
-			"InitialEpoch",
-			"Profile"
-		]
+		["Generation", "Cluster", "Pin", "AdminKey", "InitialEpoch",]
 	);
 	let governance = fs::read_to_string(root.join("governance_command.rs")).unwrap();
 	assert_eq!(governance.matches("admin_governance2(").count(), 0);
@@ -6249,10 +6191,10 @@ fn role_epoch_control_is_pre_entry_bounded_and_dormant() {
 	assert!(rotate.contains("(s.covered, s.fingerprint, s.command_digest)"));
 	let install = read("admin_install.rs");
 	assert!(
-		install.find("Some(epochs.original) != original").unwrap()
+		install.find("epochs.original != original").unwrap()
 			< install.find("Ok(InstalledAdmin2").unwrap()
 	);
-	assert!(install.contains("cut: active.map("));
+	assert!(install.contains("cut: (s.covered, s.fingerprint, s.command_digest)"));
 	let proof = read("role_command.rs");
 	assert!(proof.contains("const ROLE_PROOF_BYTES3: usize = 224;"));
 	assert_eq!(calls(&proof, "verify_strict"), 1);
@@ -6395,7 +6337,7 @@ fn role_epoch_control_is_pre_entry_bounded_and_dormant() {
 // Key custody K7 (ADR 0101): the operator proof facade and the role view. Root2's public surface
 // is exactly the earlier re-exports plus `operator_proof`, whose public signatures carry only byte
 // arrays, primitives and the facade's own result types. No non-test Root2 module names a signing
-// token. A `RoleView3` has exactly the six checker fields, is built only by `InstalledAdmin2::view`
+// token. A `RoleView3` has exactly the five checker fields, is built only by `InstalledAdmin2::view`
 // and `RoleView3::offline` (called only by the context-export reader), and never meets a command
 // token; the four checkers take it; the facade's governance `VISROL03` self-check applies the same
 // action-bit predicate as `verify_governance2`. Syntax checks over source text, probed below.
@@ -6615,7 +6557,7 @@ fn facade_violation(files: &std::collections::BTreeMap<String, String>) -> Optio
 			return Some(format!("{name}: public signature names {t}"));
 		}
 	}
-	// 5. The view: exactly the six checker fields (a test-only mask aside), private, root2-only.
+	// 5. The view: exactly the five checker fields (a test-only mask aside), private, root2-only.
 	let view = get("role_view.rs");
 	let view_file: syn::File = syn::parse2(without_test_items_deep(view.parse().unwrap())).unwrap();
 	let Some(fields) = view_file.items.iter().find_map(|i| match i {
@@ -6637,11 +6579,10 @@ fn facade_violation(files: &std::collections::BTreeMap<String, String>) -> Optio
 		.collect::<Vec<_>>();
 	let expected = [
 		("context", "AdminContext2"),
-		("profile", "ManifestProfile2"),
 		("admin_key", "[u8;32]"),
 		("namespace", "AdminNamespace2"),
-		("governance", "Option<GovernanceRole2>"),
-		("active", "Option<[(u64,Digest2);3]>"),
+		("governance", "GovernanceRole2"),
+		("active", "[(u64,Digest2);3]"),
 	]
 	.map(|(n, t)| (n.to_string(), t.to_string(), true));
 	if shape != expected
@@ -6697,7 +6638,7 @@ fn facade_violation(files: &std::collections::BTreeMap<String, String>) -> Optio
 		}
 	}
 	if fn_body(view, "view").replace(char::is_whitespace, "")
-		!= "{RoleView3{context:admin_context2(self),profile:admin_profile2(self),admin_key:admin_key2(self),namespace:admin_namespace2(self),governance:admin_governance2(self),active:admin_active3(self),#[cfg(test)]test_mask:None,}}"
+		!= "{RoleView3{context:admin_context2(self),admin_key:admin_key2(self),namespace:admin_namespace2(self),governance:admin_governance2(self),active:admin_active3(self),#[cfg(test)]test_mask:None,}}"
 	{
 		return Some("role_view.rs: view() is not the one-for-one copy".into());
 	}
@@ -6753,7 +6694,7 @@ fn facade_violation(files: &std::collections::BTreeMap<String, String>) -> Optio
 	// facade's governance VISROL03 self-check (and its prepare), nowhere else.
 	if view.matches("fn governs(").count() != 1
 		|| fn_body(view, "governs").replace(char::is_whitespace, "")
-			!= "{self.governance.is_some_and(|r|self.mask(r)&action.bit()!=0)}"
+			!= "{self.mask(self.governance)&action.bit()!=0}"
 	{
 		return Some("role_view.rs: governs is not the action-bit predicate".into());
 	}
@@ -6891,11 +6832,20 @@ fn operator_proof_facade_is_exact_and_never_signs() {
 			}),
 		),
 		(
-			"a seventh view field",
+			"optional governance on the view",
 			edit("role_view.rs", &|t| {
 				t.replace(
-					"\tactive: Option<[(u64, Digest2); 3]>,\n",
-					"\tactive: Option<[(u64, Digest2); 3]>,\n\tcut: Option<Digest2>,\n",
+					"governance: GovernanceRole2,",
+					"governance: Option<GovernanceRole2>,",
+				)
+			}),
+		),
+		(
+			"a sixth view field",
+			edit("role_view.rs", &|t| {
+				t.replace(
+					"\tactive: [(u64, Digest2); 3],\n",
+					"\tactive: [(u64, Digest2); 3],\n\tcut: Option<Digest2>,\n",
 				)
 			}),
 		),

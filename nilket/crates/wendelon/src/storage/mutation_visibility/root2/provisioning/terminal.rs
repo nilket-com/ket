@@ -2,7 +2,7 @@
 use super::inventory::RootIdentity2;
 use crate::storage::mutation_visibility::redacted_debug;
 use crate::storage::mutation_visibility::root2::{
-	admin::manifest::{AnyAdminManifest2, ManifestProfile2, any_manifest_digest2},
+	admin::manifest::{AdminManifestThree3, manifest_digest3},
 	admin::record::{BootstrapIdentity2, BootstrapObservation2},
 	codec::{hash, valid_log},
 	types::{Digest2, Log2},
@@ -193,7 +193,7 @@ pub(in crate::storage::mutation_visibility::root2) fn encode_terminal_artifact3(
 /// The inventory pin is supplied out of band; parsed bytes confer no readiness.
 pub(in crate::storage::mutation_visibility::root2) fn read_terminal3(
 	b: &[u8],
-	manifest: &AnyAdminManifest2,
+	manifest: &AdminManifestThree3,
 	inventory_pin: Digest2,
 ) -> Result<TerminalArtifact3, TerminalError3> {
 	if b.len() != TERMINAL_ARTIFACT_BYTES3 {
@@ -205,7 +205,7 @@ pub(in crate::storage::mutation_visibility::root2) fn read_terminal3(
 	if u16::from_le_bytes(array(b, 8)) != 1 {
 		return Err(TerminalError3::Version);
 	}
-	if u16::from_le_bytes(array(b, 10)) != 3 || manifest.profile() != ManifestProfile2::Three {
+	if u16::from_le_bytes(array(b, 10)) != 3 {
 		return Err(TerminalError3::Profile);
 	}
 	if hash(b"", &b[..304]) != array::<32>(b, 304) {
@@ -223,8 +223,8 @@ pub(in crate::storage::mutation_visibility::root2) fn read_terminal3(
 		export_seq: u64::from_le_bytes(array(b, 264)),
 		inventory_pin: array(b, 272),
 	};
-	let m = manifest.admission();
-	let pin = any_manifest_digest2(&manifest.encode().map_err(|_| TerminalError3::Identity)?);
+	let m = manifest.base();
+	let pin = manifest_digest3(&manifest.encode().map_err(|_| TerminalError3::Identity)?);
 	if (
 		identity.generation,
 		identity.cluster,

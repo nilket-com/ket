@@ -55,8 +55,8 @@ fn kat_statements_are_the_published_seed_signatures_over_the_kat_contexts() {
 		("p3_kat_grant", M3_KAT),
 		("p3_kat_foreign_grant", m3_kat_foreign()),
 	] {
-		let a = AnyAdminManifest2::decode(&manifest).unwrap();
-		let a = a.admission();
+		let a = AdminManifestThree3::decode(&manifest).unwrap();
+		let a = a.base();
 		let boot = Command2::Bootstrap {
 			epoch: a.initial_epoch,
 			control: exact_pin(&manifest),

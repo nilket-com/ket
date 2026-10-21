@@ -31,10 +31,7 @@ fn owner_inventory_snapshot_and_tuple_identity_stable() {
 		super::super::super::provisioning::replica_anchor::tuple_manifest_pin2(&f.f.pin),
 		original_pin
 	);
-	assert_eq!(
-		original_roles3(&f.installed()),
-		Some([key(11), key(12), key(13)])
-	);
+	assert_eq!(original_roles3(&f.installed()), [key(11), key(12), key(13)]);
 }
 #[test]
 fn carrier_wal5_v4_fixtures_and_caps_unchanged() {

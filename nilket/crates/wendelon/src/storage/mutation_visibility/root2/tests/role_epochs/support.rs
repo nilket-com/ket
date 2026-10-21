@@ -98,7 +98,7 @@ impl F {
 	}
 	pub(super) fn legacy_statement(&self) -> [u8; 337] {
 		let c = admin_context2(&self.installed());
-		let ns = self.f.any.admission().namespace;
+		let ns = self.f.any.base().namespace;
 		let k = PermissionKey2 {
 			authority: wire::authority(),
 			namespace: AdmissionNamespace2 {

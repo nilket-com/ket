@@ -3,7 +3,7 @@
 //! authority state or trust token.
 use crate::storage::mutation_visibility::redacted_debug;
 use crate::storage::mutation_visibility::root2::admin::manifest::{
-	AnyAdminManifest2, any_manifest_digest2,
+	AdminManifestThree3, manifest_digest3,
 };
 use crate::storage::mutation_visibility::root2::admin::record::{
 	BootstrapObservation2, BootstrapRecord2,
@@ -33,7 +33,7 @@ redacted_debug!(RootIdentity2, "RootIdentity2");
 #[derive(Clone, PartialEq, Eq)]
 pub(in crate::storage::mutation_visibility::root2) enum EventBody2 {
 	Reserve {
-		manifest: AnyAdminManifest2,
+		manifest: AdminManifestThree3,
 	},
 	Approve {
 		record: BootstrapRecord2,
@@ -69,7 +69,7 @@ pub(in crate::storage::mutation_visibility::root2) enum RootState2 {
 #[derive(Clone)]
 pub(in crate::storage::mutation_visibility::root2) struct RootEntry2 {
 	pub identity: RootIdentity2,
-	pub manifest: AnyAdminManifest2,
+	pub manifest: AdminManifestThree3,
 	pub state: RootState2,
 	pub last_seq: u64,
 	pub record: Option<BootstrapRecord2>,
@@ -131,13 +131,13 @@ fn zero(b: &[u8]) -> bool {
 }
 
 /// The pin binds the whole manifest (governance included); it is never the Admission digest.
-fn identity_of(m: &AnyAdminManifest2) -> RootIdentity2 {
+fn identity_of(m: &AdminManifestThree3) -> RootIdentity2 {
 	let bytes = m.encode().expect("decoded manifest re-encodes");
-	let admission = m.admission();
+	let admission = m.base();
 	RootIdentity2 {
 		generation: admission.generation,
 		cluster: admission.cluster,
-		pin: any_manifest_digest2(&bytes),
+		pin: manifest_digest3(&bytes),
 		admin_key: admission.admin_key,
 	}
 }
@@ -220,7 +220,7 @@ fn apply(
 			let r = &record.identity;
 			if (r.generation, r.cluster, r.pin)
 				!= (identity.generation, identity.cluster, identity.pin)
-				|| r.initial_epoch != root.manifest.admission().initial_epoch
+				|| r.initial_epoch != root.manifest.base().initial_epoch
 				|| record.inventory_seq != e.seq
 			{
 				return Err(bad(CorruptReason2::Binding));
@@ -238,7 +238,7 @@ fn apply(
 					identity.generation,
 					identity.cluster,
 					identity.pin,
-					root.manifest.admission().initial_epoch,
+					root.manifest.base().initial_epoch,
 				) {
 				return Err(bad(CorruptReason2::Binding));
 			}

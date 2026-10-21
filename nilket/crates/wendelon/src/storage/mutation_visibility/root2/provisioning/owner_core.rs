@@ -7,7 +7,7 @@ use super::inventory::{
 };
 use crate::storage::mutation_visibility::redacted_debug;
 use crate::storage::mutation_visibility::root2::admin::manifest::{
-	AnyAdminManifest2, ManifestBytes2, any_manifest_digest2,
+	ADMIN_MANIFEST_P3_BYTES3, AdminManifestThree3, manifest_digest3,
 };
 use crate::storage::mutation_visibility::root2::admin::record::{
 	BootstrapIdentity2, BootstrapObservation2, BootstrapRecord2,
@@ -26,7 +26,7 @@ redacted_debug!(OpId2, "OpId2");
 #[derive(Clone)]
 pub(in crate::storage::mutation_visibility::root2) enum OwnerRequest2 {
 	Reserve {
-		manifest: AnyAdminManifest2,
+		manifest: AdminManifestThree3,
 	},
 	Approve {
 		identity: RootIdentity2,
@@ -43,7 +43,7 @@ redacted_debug!(OwnerRequest2, "OwnerRequest2");
 #[derive(Clone, PartialEq, Eq)]
 pub(in crate::storage::mutation_visibility::root2) enum RequestKey2 {
 	Reserve {
-		manifest: ManifestBytes2,
+		manifest: [u8; ADMIN_MANIFEST_P3_BYTES3],
 	},
 	Approve {
 		identity: RootIdentity2,

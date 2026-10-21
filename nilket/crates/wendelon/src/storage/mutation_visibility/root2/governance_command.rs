@@ -84,7 +84,6 @@ pub(in crate::storage::mutation_visibility::root2) enum GovernanceCommandError2 
 	Version,
 	Reserved,
 	ZeroField(GovernanceField2),
-	NoGovernance,
 	Action,
 	Context,
 	Digest,
@@ -220,7 +219,7 @@ pub(in crate::storage::mutation_visibility::root2) fn check_governance_command2(
 	command_digest: Digest2,
 ) -> Result<CheckedGovernanceCommand2, GovernanceCommandError2> {
 	let (context, embedded, signature) = parse_governance_command2(bytes)?;
-	let role = RoleView3::governance_role(view).ok_or(GovernanceCommandError2::NoGovernance)?;
+	let role = RoleView3::governance_role(view);
 	if !permits(role.actions(), action) {
 		return Err(GovernanceCommandError2::Action);
 	}
@@ -234,7 +233,8 @@ pub(in crate::storage::mutation_visibility::root2) fn check_governance_command2(
 		.try_into()
 		.map_err(|_| GovernanceCommandError2::Length)?;
 	let preimage = governance_command_preimage2(fixed)?;
-	if view.active(1).is_some_and(|(k, _)| k != 0) {
+	let (k, _) = view.active(1);
+	if k != 0 {
 		return Err(GovernanceCommandError2::Signature);
 	}
 	VerifyingKey::from_bytes(&role.key())

@@ -7,7 +7,7 @@
 use super::profile_three_fixture::{M3_KAT, exact_pin, m3_kat_foreign, tuple_of};
 use super::*;
 use crate::storage::mutation_visibility::root2::admin::manifest::{
-	AdminManifest2, AnyAdminManifest2,
+	AdminManifest2, AdminManifestThree3,
 };
 use crate::storage::mutation_visibility::root2::admin::record::{
 	BootstrapIdentity2, BootstrapRecord2,
@@ -55,9 +55,9 @@ fn at(term: u64, node: u32, index: u64) -> EntryPosition2 {
 
 // ---- Governed fixtures (G1d gate, on M3_PRIME) ----
 fn prime_admission() -> AdminManifest2 {
-	AnyAdminManifest2::decode(&sv("p3_manifest"))
+	AdminManifestThree3::decode(&sv("p3_manifest"))
 		.unwrap()
-		.admission()
+		.base()
 		.clone()
 }
 fn record() -> BootstrapRecord2 {

@@ -47,12 +47,11 @@ fn independent_profile_three_bytes_pin_and_parts() {
 		let b = hex(row["bytes"].as_str().unwrap());
 		let m = AdminManifestThree3::decode(&b).unwrap();
 		assert_eq!(m.encode().unwrap().as_slice(), b);
-		let any = AnyAdminManifest2::decode(&b).unwrap();
-		assert_eq!(any.profile(), ManifestProfile2::Three);
+		let any = AdminManifestThree3::decode(&b).unwrap();
 		let canonical = any.encode().unwrap();
 		assert_eq!(canonical.as_slice(), b);
 		assert_eq!(
-			any_manifest_digest2(&canonical).as_slice(),
+			manifest_digest3(&canonical).as_slice(),
 			hex(row["pin"].as_str().unwrap())
 		);
 		assert_eq!(m.recovery().actions(), 31);
@@ -144,7 +143,7 @@ fn profile_three_encoder_writes_the_base_layout_directly() {
 		let encoded = m.encode().unwrap();
 		assert_eq!(encoded.as_slice(), b);
 		assert_eq!(
-			any_manifest_digest2(&AnyAdminManifest2::Three(m.clone()).encode().unwrap()).as_slice(),
+			manifest_digest3(&m.clone().encode().unwrap()).as_slice(),
 			hex(row["pin"].as_str().unwrap())
 		);
 	}
