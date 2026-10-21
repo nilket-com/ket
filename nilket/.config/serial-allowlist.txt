@@ -1,0 +1,17 @@
+# Serial settings allowed under nilket/plans/ops/test_parallelism.md.
+#
+# One entry per occurrence: path<TAB>exact line, trimmed<TAB>scope<TAB>reason.
+# scope is one of:
+#   lane:1 | lane:2  the setting runs in a dedicated lane of at most that many
+#                    CPUs, declared on the same line (taskset -c, CARGO_CGROUP_CPUS=,
+#                    /affinity); only noise-sensitive tests (timing, benchmark,
+#                    perf-gate) qualify. One thread never holds a large lane.
+#   test-group       a nextest test-group limit or threads-required in a
+#                    nextest.toml; it limits its group while other tests keep running.
+#   doc              a Rust comment or #[ignore] reason that documents how to run
+#                    one noise-sensitive measurement; it executes nothing.
+# nilket/crates/nilket/tests/test_parallelism_policy.rs fails on an unlisted
+# occurrence, a stale entry, a missing reason, or a lane larger than its scope.
+nilket/crates/toron/src/exec/join/build_rows/join_table_size_scaling.rs	/// --test-threads 1`.	doc	documents the ADR 619 join-table measurement, an ignored benchmark run by full name on one pinned strix core; noise-sensitive
+nilket/crates/wendelon/src/storage/mutation_visibility/root2/tests/r0_assay.rs	#[ignore = "R0 instrument: only after frozen review; fresh process, --exact --test-threads=1"]	doc	the R0 assay is an ignored timing instrument run by exact name in a fresh process; noise-sensitive
+nilket/crates/toron/src/exec/join/build_rows/join_table_size_scaling.rs	/// --test-threads 1`.	doc	documents the ADR 619 join-table measurement, an ignored benchmark run by full name on one pinned strix core; noise-sensitive

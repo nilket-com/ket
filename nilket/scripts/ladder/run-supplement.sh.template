@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# Supplement pattern for ladder driver v5: one lane (CPUs 0-7) for evidence the
+# main ladder does not produce, such as plan-commit architecture tests. Same
+# step() as run-ladder.sh.template: every step runs under timeout(1) with its
+# own budget and records rc 124 (timed out) or 137 (killed after the 60 s
+# grace); no step passes a one-thread setting (wrapper default 1024 threads).
+# Every step, including the plan-commit steps, runs the audited COMMIT's
+# wrapper, copied aside before any plan commit is checked out: a plan commit's
+# own wrapper may predate the slice, the timeouts or the defaults.
+# Fill __COMMIT__, __PLAN_COMMITS__ (space-separated) and __RUN__.
+set -uo pipefail
+COMMIT=__COMMIT__
+PLAN_COMMITS="__PLAN_COMMITS__"
+ROOT=$HOME/work/toron-evidence/__RUN__
+SRC=$ROOT/source
+OUT=$ROOT/run
+export PATH=$HOME/.cargo/bin:$PATH
+[ -e "$OUT" ] && { echo "run dir exists; refusing"; exit 2; }
+mkdir -p "$OUT"
+git clone -q "$ROOT/full.bundle" "$SRC" 2>/dev/null
+git -C "$SRC" checkout -q --detach "$COMMIT"
+[ "$(git -C "$SRC" rev-parse HEAD)" = "$COMMIT" ] || { echo "wrong commit"; exit 2; }
+git -C "$SRC" status --porcelain > "$OUT/status-start.txt"
+{ rustc --version; cargo --version; uname -a; nproc; date -u +%FT%TZ; } > "$OUT/env.txt"
+grep -q 'CARGO_CGROUP_SLICE_MEMORY_PERCENT' "$SRC/nilket/scripts/cargo-cgroup" || { echo "cargo-cgroup lacks the memory slice; v5 needs it" | tee -a "$OUT/rc.txt"; exit 2; }
+{ sha256sum "$SRC/nilket/scripts/cargo-cgroup"; grep -E '^(test_threads|tasks_max|memory_high_cfg|memory_max_cfg|slice|slice_memory_max_cfg|slice_memory_percent|nofile)=' "$SRC/nilket/scripts/cargo-cgroup"; free -g; ulimit -Hn; } >> "$OUT/env.txt"
+TMPROOT=/dev/shm/ladder-${ROOT##*/}
+{ df -h "$ROOT" /dev/shm; df -i "$ROOT" /dev/shm; } >> "$OUT/env.txt"
+shm_inodes=$(df --output=iavail /dev/shm | tail -1 | tr -d ' ')
+[ "$shm_inodes" -ge 4000000 ] || { echo "/dev/shm low on inodes; refusing" | tee -a "$OUT/rc.txt"; exit 2; }
+free_kb=$(df --block-size=1K --output=avail "$ROOT" | tail -1 | tr -d ' ')
+[ "$free_kb" -ge 157286400 ] || { echo "run root < 150 GiB free; refusing" | tee -a "$OUT/rc.txt"; exit 2; }
+mkdir -m 0700 "$TMPROOT" || { echo "tmp root exists; refusing" | tee -a "$OUT/rc.txt"; exit 2; }
+export TMPDIR=$TMPROOT/tmp; mkdir -p "$TMPDIR"
+export CARGO_TARGET_DIR=$ROOT/target CARGO_CGROUP_CPUS=0-7 CARGO_CGROUP_CPU_QUOTA=800% CARGO_CGROUP_JOBS=6
+WRAPPER=$ROOT/cargo-cgroup.commit
+cp "$SRC/nilket/scripts/cargo-cgroup" "$WRAPPER"
+sha256sum "$WRAPPER" >> "$OUT/env.txt"
+# step <lane> <name> <budget> <cargo args...>; budget is a timeout(1) duration.
+step() {
+	local lane=$1 name=$2 budget=$3; shift 3
+	local secs=${budget%[smh]}
+	case $budget in *m) secs=$((secs * 60)) ;; *h) secs=$((secs * 3600)) ;; esac
+	echo "$(date -u +%FT%TZ) $lane start $name budget=$budget" >> "$OUT/timeline.txt"
+	(cd "$SRC/nilket" && CARGO_CGROUP_RUNTIME_MAX_SEC=$((secs + 90)) timeout --kill-after=60 "$budget" "$WRAPPER" "$@") > "$OUT/$name.log" 2>&1
+	local rc=$?
+	echo "$name rc=$rc" >> "$OUT/rc.txt"
+	echo "$(date -u +%FT%TZ) $lane end $name rc=$rc" >> "$OUT/timeline.txt"
+}
+step S key-guard-test 5m test --locked -p key-guard --no-fail-fast
+step S wendelon-key-test 15m test --locked -p wendelon-key --no-fail-fast
+step S tls-pki-test 5m test --locked -p tls-pki --no-fail-fast
+step S fmt-custody 5m fmt -p key-guard -p wendelon-key -p tls-pki --check
+for pc in $PLAN_COMMITS; do
+	git -C "$SRC" checkout -q --detach "$pc"
+	echo "plan-commit $(git -C "$SRC" rev-parse HEAD)" >> "$OUT/rc.txt"
+	step S "plan-arch-$pc" 30m test --locked -p wendelon --test architecture_test --test mutation_visibility_architecture_test --no-fail-fast
+	step S "plan-toron-arch-$pc" 40m test --locked -p toron --test architecture_test --no-fail-fast
+done
+git -C "$SRC" checkout -q --detach "$COMMIT"
+[ "$(git -C "$SRC" rev-parse HEAD)" = "$COMMIT" ] && echo "commit unchanged" >> "$OUT/rc.txt"
+git -C "$SRC" status --porcelain > "$OUT/status-end.txt"
+find "$TMPROOT" -mindepth 2 -maxdepth 2 | wc -l > "$OUT/tmp-leftovers.txt"
+echo DONE >> "$OUT/rc.txt"
+rm -rf "$TMPROOT" "$SRC" "$CARGO_TARGET_DIR" "$WRAPPER" && echo CLEANED >> "$OUT/rc.txt"

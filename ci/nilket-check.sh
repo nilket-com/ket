@@ -57,7 +57,14 @@ run() {
 
 run cargo fmt --check
 run cargo check --workspace --all-targets
-# Nilket contains concurrency-sensitive saturation fixtures whose contract is
-# deterministic in isolation. Keep the product lane reproducible instead of
-# making unrelated harnesses race for one process-global test environment.
-RUST_TEST_THREADS=1 run cargo test --workspace --no-fail-fast
+# Tests run concurrently (nilket/plans/ops/test_parallelism.md). A fixture that
+# races another for process-global state is a defect candidate to isolate, not
+# a reason to run the workspace on one test thread.
+#
+# This lane calls cargo directly rather than nilket/scripts/cargo-cgroup on
+# purpose: it is the portable product gate (ADR 0164, "the lane carries its own
+# environment") and must run on hosts without a user systemd manager or
+# containerd, where cargo-cgroup refuses to start (exit 70). Local runs on slim
+# and bigfoot go through cargo-cgroup; libtest's default here is one test thread
+# per available CPU.
+run cargo test --workspace --no-fail-fast

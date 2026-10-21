@@ -1,27 +1,24 @@
 # Suite runtime policy.
 #
-# nextest runs test *binaries* concurrently. The cargo-test path never did — it
-# set RUST_TEST_THREADS=1, which only serializes *within* a binary — so switching
-# runners exposed a contention that had always been latent.
+# nextest runs tests from different binaries concurrently. The cargo-test path
+# once did not: cargo-cgroup used to give libtest one test thread (it now
+# defaults to 1024, and libtest still runs binaries one after another), so
+# switching runners exposed a contention that had always been latent.
 #
 # `distributed_process_test` spawns fixture-worker processes and coordinates over
-# loopback. Two of its tests running at once park every process in a futex wait at
-# 0% CPU, and with no outer timeout the run waits forever: a suite that took
-# minutes appears to take hours while computing nothing. Measured in isolation the
-# same tests finish in 0.28s and 0.93s.
+# loopback. It ran in a one-thread test-group because two of its tests at once
+# parked every process in a futex wait that never returned. That hang is an
+# unexplained defect candidate, not a fixed one: it did not recur in 25 nextest
+# stress iterations without the group nor in a libtest run at 1024 threads on
+# 2026-10-20, but nothing explains why. The group is gone so the suite keeps
+# testing it; ladder driver v5 stresses the binary every run, and every v5
+# step runs under a timeout so a recurrence ends instead of hanging the run.
 #
-# Serialize that one binary. Everything else stays parallel — single-threading is
-# for the cold path that needs it, not a blanket ritual.
-#
-# A test that fails only in parallel is a defect candidate, not a flake: see
-# "Test concurrency" in ci/README.md before adding any serialization here.
-
-[test-groups]
-distributed-fixtures = { max-threads = 1 }
-
-[[profile.default.overrides]]
-filter = 'binary(distributed_process_test)'
-test-group = 'distributed-fixtures'
+# Everything stays parallel; serial execution is only for noise-sensitive tests,
+# in a lane of at most 2 CPUs. A test that fails only in parallel is a defect
+# candidate, not a flake: see nilket/plans/ops/test_parallelism.md before adding
+# any serialization here. A group limited to one thread must also be listed in
+# serial-allowlist.txt.
 
 [profile.default]
 # Bound a hang instead of waiting on it. A stuck test is terminated after

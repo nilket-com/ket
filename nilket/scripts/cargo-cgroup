@@ -6,24 +6,48 @@ usage() {
 Usage: scripts/cargo-cgroup <cargo-subcommand> [cargo-args...]
 
 Runs cargo inside a constrained user cgroup scope, with CPU affinity,
-low IO priority, bounded build parallelism, and one Rust test thread by
-default. Lockup protection is the cpuset + quota + nice + ionice, not the
-job count: within a bounded cpuset, parallel jobs contend inside the cage
-rather than starving the machine. Build parallelism is therefore bounded by
-MEMORY_MAX (peak rustc link memory), not by core count.
+low IO priority, bounded build parallelism, and 1024 Rust test threads by
+default: test concurrency is maximised while the cpuset and quota bound CPU.
+Lockup protection is the cpuset + quota + nice + ionice, not the job count:
+within a bounded cpuset, parallel jobs contend inside the cage rather than
+starving the machine. Build parallelism is therefore bounded by MEMORY_MAX
+(peak rustc link memory), not by core count.
+
+Memory is bounded twice on the systemd backend. Every invocation runs in the
+shared slice CARGO_CGROUP_SLICE, whose MemoryMax bounds all concurrent
+sessions together: min(CARGO_CGROUP_SLICE_MEMORY_MAX, CARGO_CGROUP_SLICE_MEMORY_PERCENT
+of MemTotal). Each invocation's MemoryMax is min(CARGO_CGROUP_MEMORY_MAX, the
+slice max), and its MemoryHigh is at most its MemoryMax. The slice limit is
+never lowered under a running session: with no cargo-cgroup unit active a
+session sets it to its own value; while units are active it is only raised.
+
+The nerdctl backend has no shared cap: its limits are per container only.
+
+A timeout or signal that stops this wrapper stops its unit too (the unit
+otherwise outlives a killed systemd-run client); RuntimeMaxSec
+(CARGO_CGROUP_RUNTIME_MAX_SEC, default one day) is the backstop for SIGKILL.
+A unit stopped by RuntimeMaxSec is reported on stderr and exits 124, so a run
+longer than a day (a 24 h or 72 h soak) must raise CARGO_CGROUP_RUNTIME_MAX_SEC.
 
 Environment overrides:
   CARGO_CGROUP_BACKEND=auto        # auto, systemd, nerdctl, affinity
   CARGO_CGROUP_CPUS=0-11
   CARGO_CGROUP_CPU_QUOTA=1200%
   CARGO_CGROUP_CONTAINER_CPUS=12
-  CARGO_CGROUP_MEMORY_HIGH=12G
-  CARGO_CGROUP_MEMORY_MAX=16G
-  CARGO_CGROUP_TASKS_MAX=512
+  CARGO_CGROUP_MEMORY_HIGH=28G
+  CARGO_CGROUP_MEMORY_MAX=32G
+  CARGO_CGROUP_SLICE=cargo-cgroup.slice
+  CARGO_CGROUP_SLICE_MEMORY_MAX=96G
+  CARGO_CGROUP_SLICE_MEMORY_PERCENT=60
+  CARGO_CGROUP_MEMTOTAL_KB=<MemTotal from /proc/meminfo>
+  CARGO_CGROUP_TASKS_MAX=16384
+  CARGO_CGROUP_NOFILE=<min(caller hard limit, user manager DefaultLimitNOFILE)>
+  CARGO_CGROUP_RUNTIME_MAX_SEC=86400  # soak drivers must set it above their run time
+  CARGO_CGROUP_RUNTIME_DIR=/run/user/<uid>  # holds the per-user slice lock
   CARGO_CGROUP_IO_WEIGHT=10
   CARGO_CGROUP_NICE=19
   CARGO_CGROUP_JOBS=6
-  CARGO_CGROUP_RUST_TEST_THREADS=1
+  CARGO_CGROUP_RUST_TEST_THREADS=1024
   CARGO_CGROUP_RUST_MIN_STACK=67108864
   CARGO_CGROUP_IMAGE=rust:1
   CARGO_CGROUP_ALLOW_AFFINITY_ONLY=0
@@ -31,6 +55,14 @@ Environment overrides:
 Examples:
   scripts/cargo-cgroup test -p toron --test architecture_test -- adr142
   scripts/cargo-cgroup check -p wendelon --all-targets
+  CARGO_CGROUP_CPUS=0-7,16-23 scripts/cargo-cgroup test -p wendelon --lib
+
+Test parallelism: tests run concurrently by default. Only noise-sensitive
+tests (timing, benchmark, perf gate) run alone, in a dedicated lane of at most
+2 CPUs, listed in nilket/.config/serial-allowlist.txt. Tests that share a named
+resource (a port, a global, a file) take a narrow lock around it, with the
+reason in a comment beside the lock; such locks are not allowlisted. Never
+lower this default instead. See nilket/plans/ops/test_parallelism.md.
 
 Containerd backend:
   CARGO_CGROUP_BACKEND=nerdctl scripts/cargo-cgroup test -p toron
@@ -51,13 +83,82 @@ backend="${CARGO_CGROUP_BACKEND:-auto}"
 cpus="${CARGO_CGROUP_CPUS:-0-11}"
 cpu_quota="${CARGO_CGROUP_CPU_QUOTA:-1200%}"
 container_cpus="${CARGO_CGROUP_CONTAINER_CPUS:-12}"
-memory_high="${CARGO_CGROUP_MEMORY_HIGH:-12G}"
-memory_max="${CARGO_CGROUP_MEMORY_MAX:-16G}"
-tasks_max="${CARGO_CGROUP_TASKS_MAX:-512}"
+# Sized for 1024 concurrent tests (measured on slim, 2026-10-20, CPUS=0-7): the
+# Wendelon lib suite peaked at 21-23 GiB (20.6 GiB anonymous) and 3594 tasks
+# (threads count as tasks: each test may run a multi-thread tokio runtime plus
+# io_uring and redb threads) with up to 3649 open files in one process; the
+# Toron package peaked at 17.9 GiB and 1470 tasks.
+memory_high_cfg="${CARGO_CGROUP_MEMORY_HIGH:-28G}"
+memory_max_cfg="${CARGO_CGROUP_MEMORY_MAX:-32G}"
+slice="${CARGO_CGROUP_SLICE:-cargo-cgroup.slice}"
+slice_memory_max_cfg="${CARGO_CGROUP_SLICE_MEMORY_MAX:-96G}"
+slice_memory_percent="${CARGO_CGROUP_SLICE_MEMORY_PERCENT:-60}"
+memtotal_kb="${CARGO_CGROUP_MEMTOTAL_KB:-$(awk '/^MemTotal:/ { print $2 }' /proc/meminfo 2>/dev/null)}"
+tasks_max="${CARGO_CGROUP_TASKS_MAX:-16384}"
+runtime_max_sec="${CARGO_CGROUP_RUNTIME_MAX_SEC:-86400}"
+runtime_dir="${CARGO_CGROUP_RUNTIME_DIR:-/run/user/$(id -u)}"
+
+# Size with an optional K/M/G/T suffix (powers of 1024) to bytes.
+to_bytes() {
+	[[ "$1" =~ ^([0-9]+)([KMGT]?)$ ]] || return 1
+	local n=${BASH_REMATCH[1]}
+	case "${BASH_REMATCH[2]}" in
+		K) n=$((n << 10)) ;;
+		M) n=$((n << 20)) ;;
+		G) n=$((n << 30)) ;;
+		T) n=$((n << 40)) ;;
+	esac
+	printf '%s\n' "$n"
+}
+min() { (($1 < $2)) && printf '%s\n' "$1" || printf '%s\n' "$2"; }
+
+for knob in memory_high_cfg memory_max_cfg slice_memory_max_cfg; do
+	to_bytes "${!knob}" >/dev/null || {
+		echo "cargo-cgroup: ${knob%_cfg} must be a size such as 32G" >&2
+		exit 64
+	}
+done
+[[ "$slice_memory_percent" =~ ^[1-9][0-9]?$ ]] || {
+	echo "cargo-cgroup: CARGO_CGROUP_SLICE_MEMORY_PERCENT must be 1-99" >&2
+	exit 64
+}
+[[ "$memtotal_kb" =~ ^[1-9][0-9]*$ ]] || {
+	echo "cargo-cgroup: cannot read MemTotal (set CARGO_CGROUP_MEMTOTAL_KB)" >&2
+	exit 64
+}
+[[ "$runtime_max_sec" =~ ^[1-9][0-9]*$ ]] || {
+	echo "cargo-cgroup: CARGO_CGROUP_RUNTIME_MAX_SEC must be a positive integer" >&2
+	exit 64
+}
+# Host-aware: the slice never takes more than the configured share of RAM, and
+# no single invocation more than the slice.
+slice_memory_max=$(min "$(to_bytes "$slice_memory_max_cfg")" $((memtotal_kb * 1024 / 100 * slice_memory_percent)))
+memory_max=$(min "$(to_bytes "$memory_max_cfg")" "$slice_memory_max")
+memory_high=$(min "$(to_bytes "$memory_high_cfg")" "$memory_max")
+
+# Open files: a systemd user scope starts with a soft limit of 1024, which
+# 1024 concurrent tests (each with its own runtime, redb files and sockets)
+# exhaust at once. Default to the smaller of the caller's hard limit and the
+# user manager's DefaultLimitNOFILE (the most a user unit may be granted).
+nofile_limit() {
+	local hard manager
+	hard=$(ulimit -Hn)
+	[[ "$hard" != unlimited ]] || hard=1048576
+	manager=$(systemctl --user show -p DefaultLimitNOFILE --value 2>/dev/null || true)
+	if [[ "$manager" =~ ^[1-9][0-9]*$ ]]; then
+		min "$hard" "$manager"
+	else
+		printf '%s\n' "$hard"
+	fi
+}
+nofile="${CARGO_CGROUP_NOFILE:-$(nofile_limit)}"
 io_weight="${CARGO_CGROUP_IO_WEIGHT:-10}"
 nice_level="${CARGO_CGROUP_NICE:-19}"
 jobs="${CARGO_CGROUP_JOBS:-6}"
-test_threads="${CARGO_CGROUP_RUST_TEST_THREADS:-1}"
+# Maximise test concurrency: libtest runs up to this many tests of a binary at
+# once. CPU is bounded by the cpuset and quota, not by this count, so tests
+# oversubscribe threads rather than cores. See nilket/plans/ops/test_parallelism.md.
+test_threads="${CARGO_CGROUP_RUST_TEST_THREADS:-1024}"
 # Deep-recursion targets overflow the default 8 MiB test-thread stack and abort
 # the process. An aborted target prints no result line, so a receipt that sums
 # reported failures reads clean while that target's remaining tests silently
@@ -68,6 +169,15 @@ min_stack="${CARGO_CGROUP_RUST_MIN_STACK:-67108864}"
 progress="${CARGO_TERM_PROGRESS_WHEN:-never}"
 image="${CARGO_CGROUP_IMAGE:-rust:1}"
 allow_affinity_only="${CARGO_CGROUP_ALLOW_AFFINITY_ONLY:-0}"
+
+if [[ ! "$nofile" =~ ^[1-9][0-9]*$ ]]; then
+	echo "cargo-cgroup: CARGO_CGROUP_NOFILE must be a positive integer" >&2
+	exit 64
+fi
+if [[ ! "$test_threads" =~ ^[1-9][0-9]*$ ]]; then
+	echo "cargo-cgroup: CARGO_CGROUP_RUST_TEST_THREADS must be a positive integer" >&2
+	exit 64
+fi
 
 # A user systemd manager does not inherit the caller's environment. Preserve
 # the build/runtime inputs needed by Cargo and the tests, but do not pass the
@@ -114,16 +224,107 @@ nerdctl_available() {
 	command -v nerdctl >/dev/null 2>&1 && nerdctl info >/dev/null 2>&1
 }
 
+# The slice limit bounds every running session, so it is never lowered under
+# one. With no cargo-cgroup unit active it is set to this session's value; with
+# units active it is only raised. A lock makes check, set and unit start atomic
+# against other sessions starting at the same moment.
+set_slice_limit() {
+	local live active
+	live=$(systemctl --user show -p MemoryMax --value "${slice}" 2>/dev/null || true)
+	# A failed listing proves nothing about idleness: treat the slice as active.
+	active=$(systemctl --user list-units --plain --no-legend --state=active,activating,deactivating \
+		'cargo-cgroup-*.service' 2>/dev/null) || active="(listing failed)"
+	if [[ -n "$active" ]]; then
+		if [[ ! "$live" =~ ^[0-9]+$ ]]; then
+			echo "cargo-cgroup: ${slice} has MemoryMax=${live:-<unknown>} while cargo-cgroup units run;" \
+				"refusing to start unbounded (stop them, or set the slice limit by hand)" >&2
+			return 1
+		fi
+		((live < slice_memory_max)) || return 0
+	fi
+	systemctl --user set-property --runtime "${slice}" "MemoryMax=${slice_memory_max}" >/dev/null
+}
+
 run_systemd() {
-	exec systemd-run --user --same-dir --wait --collect --quiet --pipe \
+	# One lock per user, in the user runtime directory: never TMPDIR, which
+	# differs per ladder lane, so lanes would not exclude each other.
+	if [[ ! -d "$runtime_dir" ]]; then
+		echo "cargo-cgroup: user runtime directory ${runtime_dir} is absent; refusing" >&2
+		exit 70
+	fi
+	local lock="${runtime_dir}/cargo-cgroup-slice.lock"
+	local lockfd
+	exec {lockfd}>"$lock"
+	flock -x "$lockfd"
+	if ! set_slice_limit; then
+		echo "cargo-cgroup: cannot set MemoryMax on ${slice}" >&2
+		exit 70
+	fi
+	local unit="cargo-cgroup-$$-${RANDOM}${RANDOM}.service"
+	local child=""
+	# Not exec: a systemd-run client killed by timeout(1) leaves its unit
+	# running, so this wrapper stays to stop the unit on any signal. The client
+	# is stopped and reaped first, so the unit cannot be registered after the
+	# stop; the stop is then repeated. RuntimeMaxSec is the backstop if this
+	# wrapper itself is SIGKILLed.
+	stop_unit() {
+		# Between `&` and `child=$!` only jobs(1) knows the client's PID; $!
+		# could name an exited process substitution whose PID was reused.
+		local pid=${child:-$(jobs -p | tail -n 1)}
+		if [[ -n "$pid" ]]; then
+			kill -TERM "$pid" 2>/dev/null || true
+			wait "$pid" 2>/dev/null || true
+		fi
+		local attempt
+		for attempt in 1 2; do
+			systemctl --user kill --signal=SIGKILL "$unit" >/dev/null 2>&1 || true
+			systemctl --user stop "$unit" >/dev/null 2>&1 || true
+		done
+		systemctl --user reset-failed "$unit" >/dev/null 2>&1 || true
+	}
+	trap 'stop_unit; exit 143' TERM
+	trap 'stop_unit; exit 130' INT
+	trap 'stop_unit; exit 129' HUP
+	# No --collect: a failed unit stays loaded so its Result can be read below,
+	# then reset-failed collects it.
+	systemd-run --user --same-dir --wait --quiet --pipe \
+		--unit="$unit" --slice="${slice}" \
 		"${systemd_env_args[@]}" \
+		--property="RuntimeMaxSec=${runtime_max_sec}" \
 		--nice="${nice_level}" \
 		--property="CPUQuota=${cpu_quota}" \
 		--property="MemoryHigh=${memory_high}" \
 		--property="MemoryMax=${memory_max}" \
 		--property="TasksMax=${tasks_max}" \
+		--property="LimitNOFILE=${nofile}" \
 		--property="IOWeight=${io_weight}" \
-		"${wrapped_cmd[@]}"
+		"${wrapped_cmd[@]}" <&0 {lockfd}>&- &
+	child=$!
+	# Hold the lock until the unit is registered, so a session starting next
+	# sees it as active and cannot lower the slice under it.
+	local wait_step
+	for wait_step in $(seq 100); do
+		case "$(systemctl --user show -p ActiveState --value "$unit" 2>/dev/null)" in
+			active | activating | deactivating) break ;;
+		esac
+		kill -0 "$child" 2>/dev/null || break
+		sleep 0.1
+	done
+	exec {lockfd}>&-
+	local rc=0
+	wait "$child" || rc=$?
+	trap - TERM INT HUP
+	local result
+	result=$(systemctl --user show -p Result --value "$unit" 2>/dev/null || true)
+	systemctl --user reset-failed "$unit" >/dev/null 2>&1 || true
+	if [[ "$result" == timeout ]]; then
+		# systemd-run reports a RuntimeMaxSec stop only as exit 1; say so plainly.
+		echo "cargo-cgroup: ${unit} was stopped by RuntimeMaxSec=${runtime_max_sec}s" \
+			"(CARGO_CGROUP_RUNTIME_MAX_SEC); a long run such as a soak driver must set it above" \
+			"its duration" >&2
+		exit 124
+	fi
+	exit "$rc"
 }
 
 run_nerdctl() {
@@ -136,6 +337,7 @@ run_nerdctl() {
 		--memory="${memory_max}" \
 		--memory-reservation="${memory_high}" \
 		--pids-limit="${tasks_max}" \
+		--ulimit "nofile=${nofile}:${nofile}" \
 		--workdir /work \
 		--user "$(id -u):$(id -g)" \
 		--env HOME=/tmp \
@@ -165,6 +367,7 @@ EOF
 	fi
 
 	echo "cargo-cgroup: using taskset/ionice/nice without cgroup memory/task limits" >&2
+	ulimit -n "${nofile}" 2>/dev/null || ulimit -n "$(ulimit -Hn)"
 	exec nice -n "${nice_level}" "${wrapped_cmd[@]}"
 }
 

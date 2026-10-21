@@ -30,8 +30,7 @@ strace \
 	"$exe" \
 	consensus::raft_storage::recovery_tests::blocking_file_ops_metadata_sync_trace_fixture \
 	--exact \
-	--nocapture \
-	--test-threads=1
+	--nocapture
 
 rename_count="$(grep -hEc 'rename(at|at2)?\(' "$trace_dir"/trace* || true)"
 fdatasync_count="$(grep -hEc 'fdatasync\(' "$trace_dir"/trace* || true)"

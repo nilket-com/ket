@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# If this driver is launched through nilket/scripts/cargo-cgroup, set
+# CARGO_CGROUP_RUNTIME_MAX_SEC above DURATION_SECS plus setup time: the
+# wrapper's one-day RuntimeMaxSec default otherwise stops a 24 h or 72 h soak
+# partway (reported on stderr, exit 124). See nilket/plans/ops/test_parallelism.md.
+
 usage() {
   cat <<'EOF' >&2
 usage:
