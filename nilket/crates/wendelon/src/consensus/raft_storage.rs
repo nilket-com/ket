@@ -14128,13 +14128,25 @@ mod recovery_tests {
 				time_threshold: Duration::from_millis(40),
 			},
 		);
-		let timer = coordinator.clone().spawn();
-		let mut sm = WendelonStateMachine::new().with_checkpoint_observer(coordinator);
+		let mut sm = WendelonStateMachine::new().with_checkpoint_observer(coordinator.clone());
 
+		// No timer yet: under the unreachable entry threshold, applying alone must
+		// not checkpoint. With the timer already running, a slow apply would let
+		// a tick flush first and this would be measuring the scheduler.
 		append_and_apply(&mut store, &mut sm, finalize_entry(1, 111)).await;
 		assert_eq!(store.recovery_checkpoint().await, None);
 
-		tokio::time::sleep(Duration::from_millis(150)).await;
+		// Only the timer can flush now. Wait for it rather than for a fixed
+		// sleep a loaded host may not schedule within.
+		let timer = coordinator.spawn();
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+		while store.recovery_checkpoint().await.is_none() {
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"the timer never flushed the pending checkpoint"
+			);
+			tokio::time::sleep(Duration::from_millis(10)).await;
+		}
 		assert_eq!(
 			store.recovery_checkpoint().await,
 			Some(RecoveryCheckpoint {
