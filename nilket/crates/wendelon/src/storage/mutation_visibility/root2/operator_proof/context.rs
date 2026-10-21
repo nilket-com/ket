@@ -124,7 +124,7 @@ impl VerifiedContext {
 	}
 	/// The active `(epoch, key)` per role (admin, governance, recovery) after the chain.
 	pub fn active(&self) -> [(u64, [u8; 32]); 3] {
-		std::array::from_fn(|r| self.view.active(r).expect("a profile-3 view"))
+		std::array::from_fn(|r| self.view.active(r))
 	}
 	/// `(role, epoch)` of `key` anywhere in this root's history, originals included.
 	pub fn identity(&self, key: &[u8; 32]) -> Option<(u8, u64)> {
@@ -355,8 +355,7 @@ pub fn verify_context_export(
 		successors: [Vec::new(), Vec::new(), Vec::new()],
 	};
 	let mut view = RoleView3::offline(&p.context, &p.manifest, &chain).ok_or(R::Pin)?;
-	let original: [Digest2; 3] =
-		std::array::from_fn(|r| view.active(r).expect("a profile-3 view").1);
+	let original: [Digest2; 3] = std::array::from_fn(|r| view.active(r).1);
 	// 3. Replay.
 	let context = context_from_bytes(&p.context);
 	let mut last = context.installed_at.index;

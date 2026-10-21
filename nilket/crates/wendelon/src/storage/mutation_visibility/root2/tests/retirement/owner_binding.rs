@@ -70,11 +70,11 @@ impl Drop for Owned {
 }
 fn bound(f: &F) -> (Owned, RootIdentity2) {
 	let m = f.f.any.clone();
-	let a = m.admission();
+	let a = m.base();
 	let id = RootIdentity2 {
 		generation: a.generation,
 		cluster: a.cluster,
-		pin: any_manifest_digest2(&m.encode().unwrap()),
+		pin: manifest_digest3(&m.encode().unwrap()),
 		admin_key: a.admin_key,
 	};
 	let mut b = Owned::new();
@@ -554,16 +554,14 @@ fn terminal_export_refusal_order_and_reader_profile_manifest_negatives() {
 	};
 	let bytes = encode_terminal_artifact3(&a).unwrap();
 	assert_eq!(read_terminal3(&bytes, &retired.f.any, pin).unwrap(), a);
-	let mut base = retired.f.any.admission().clone();
+	let mut base = retired.f.any.base().clone();
 	base.cluster[0] ^= 1;
-	let wrong = AnyAdminManifest2::Three(
-		AdminManifestThree3::new(
-			base,
-			GovernanceRole2::new([0xd2; 16], key(12)).unwrap(),
-			RecoveryRole3::new([0xd3; 16], key(13)).unwrap(),
-		)
-		.unwrap(),
-	);
+	let wrong = AdminManifestThree3::new(
+		base,
+		GovernanceRole2::new([0xd2; 16], key(12)).unwrap(),
+		RecoveryRole3::new([0xd3; 16], key(13)).unwrap(),
+	)
+	.unwrap();
 	assert_eq!(
 		read_terminal3(&bytes, &wrong, pin),
 		Err(TerminalError3::Binding)

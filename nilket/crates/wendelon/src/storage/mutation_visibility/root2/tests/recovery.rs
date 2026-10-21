@@ -5,7 +5,7 @@
 //! persistence or serving, which stay held.
 use super::*;
 use crate::storage::mutation_visibility::root2::admin::manifest::AdminManifest2;
-use crate::storage::mutation_visibility::root2::admin::manifest::AnyAdminManifest2;
+use crate::storage::mutation_visibility::root2::admin::manifest::AdminManifestThree3;
 use crate::storage::mutation_visibility::root2::admin::record::BootstrapRecord2;
 use crate::storage::mutation_visibility::root2::admin_install::install_admin2;
 use crate::storage::mutation_visibility::root2::admission_registry::encode_permission_key2;
@@ -37,9 +37,9 @@ fn d32(field: &str) -> Digest2 {
 }
 /// `M3_PRIME`: the profile-1 G1d fixture's admission fields as a profile-3 manifest.
 fn manifest() -> AdminManifest2 {
-	AnyAdminManifest2::decode(&unhex(sv()["p3_manifest"].as_str().unwrap()))
+	AdminManifestThree3::decode(&unhex(sv()["p3_manifest"].as_str().unwrap()))
 		.unwrap()
-		.admission()
+		.base()
 		.clone()
 }
 fn gc() -> ([u8; 16], [u8; 16]) {

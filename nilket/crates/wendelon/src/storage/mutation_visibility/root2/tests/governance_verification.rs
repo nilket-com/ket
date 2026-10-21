@@ -115,7 +115,7 @@ pub(in crate::storage::mutation_visibility::root2) fn positive_chain() -> Fixtur
 		differential(&mut f, Command2::RevokeAuthority(authority()))
 			== ApplyResult2::Registered(log(11))
 	);
-	let epoch = f.any.admission().initial_epoch;
+	let epoch = f.any.base().initial_epoch;
 	assert!(
 		differential(
 			&mut f,

@@ -10,7 +10,7 @@ use super::snapshot::{SnapshotError2, decode_snapshot2};
 use crate::storage::mutation_visibility::redacted_debug;
 use crate::storage::mutation_visibility::root2::admin::errors::AdminManifestError2;
 use crate::storage::mutation_visibility::root2::admin::manifest::{
-	ADMIN_MANIFEST_P3_BYTES3, AnyAdminManifest2,
+	ADMIN_MANIFEST_P3_BYTES3, AdminManifestThree3, manifest_digest3,
 };
 use crate::storage::mutation_visibility::root2::admin::record::BootstrapRecord2;
 use crate::storage::mutation_visibility::root2::codec::hash;
@@ -30,7 +30,7 @@ pub(in crate::storage::mutation_visibility::root2) struct ReplicaInputs2<'a> {
 redacted_debug!(ReplicaInputs2<'_>, "ReplicaInputs2");
 #[derive(Clone, PartialEq, Eq)]
 pub(in crate::storage::mutation_visibility::root2) struct PinnedBoundTuple2 {
-	manifest: AnyAdminManifest2,
+	manifest: AdminManifestThree3,
 	manifest_pin: Digest2,
 	inventory_pin: Digest2,
 	export_seq: u64,
@@ -52,7 +52,6 @@ pub(in crate::storage::mutation_visibility::root2) enum TupleField2 {
 	Pin,
 	AdminKey,
 	InitialEpoch,
-	Profile,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::storage::mutation_visibility::root2) enum ReplicaAnchorError2 {
@@ -86,7 +85,7 @@ pub(in crate::storage::mutation_visibility::root2) fn validate_replica_tuple2(
 	// the exact supplied bytes.
 	let manifest_digest =
 		if let Ok(three) = <&[u8; ADMIN_MANIFEST_P3_BYTES3]>::try_from(manifest_bytes) {
-			hash(b"VISROOT2-ADMIN-MANIFEST\0", three)
+			manifest_digest3(three)
 		} else {
 			return Err(E::Length(ReplicaInput2::Manifest));
 		};
@@ -100,8 +99,8 @@ pub(in crate::storage::mutation_visibility::root2) fn validate_replica_tuple2(
 	if hash(b"", snapshot_bytes) != inventory_pin {
 		return Err(E::InventoryPinMismatch);
 	}
-	let any = AnyAdminManifest2::decode(manifest_bytes).map_err(E::ManifestCodec)?;
-	let manifest = any.admission();
+	let any = AdminManifestThree3::decode(manifest_bytes).map_err(E::ManifestCodec)?;
+	let manifest = any.base();
 	let snapshot = decode_snapshot2(snapshot_bytes).map_err(E::SnapshotCodec)?;
 	let Some(entry) = snapshot.entries.iter().find(|e| {
 		(e.identity.generation, e.identity.cluster) == (manifest.generation, manifest.cluster)
@@ -113,10 +112,6 @@ pub(in crate::storage::mutation_visibility::root2) fn validate_replica_tuple2(
 	}
 	if entry.identity.admin_key != manifest.admin_key {
 		return Err(E::EntryMismatch(TupleField2::AdminKey));
-	}
-	// The selected manifest's tag only; unseen entries are not authenticated here.
-	if entry.profile != any.profile() {
-		return Err(E::EntryMismatch(TupleField2::Profile));
 	}
 	if entry.state != RootState2::Bound {
 		return Err(E::NotBound(entry.state));
@@ -152,7 +147,7 @@ pub(in crate::storage::mutation_visibility::root2) fn validate_replica_tuple2(
 }
 pub(in crate::storage::mutation_visibility::root2) fn tuple_manifest2(
 	t: &PinnedBoundTuple2,
-) -> &AnyAdminManifest2 {
+) -> &AdminManifestThree3 {
 	&t.manifest
 }
 /// The canonical length of the validated manifest (241, the only length the tuple accepts); the

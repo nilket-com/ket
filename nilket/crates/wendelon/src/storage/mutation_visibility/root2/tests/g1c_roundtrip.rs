@@ -1,6 +1,6 @@
 use super::profile_three_fixture::{M3_OTHER, M3_PRIME, exact_pin};
 use super::*;
-use crate::storage::mutation_visibility::root2::admin::manifest::AnyAdminManifest2;
+use crate::storage::mutation_visibility::root2::admin::manifest::AdminManifestThree3;
 use crate::storage::mutation_visibility::root2::admin_install::*;
 use crate::storage::mutation_visibility::root2::entry_identity::EntryPosition2;
 use crate::storage::mutation_visibility::root2::origin::*;
@@ -134,12 +134,12 @@ impl Boot {
 }
 fn reserve_three() -> OwnerRequest2 {
 	OwnerRequest2::Reserve {
-		manifest: AnyAdminManifest2::decode(&M3_PRIME).unwrap(),
+		manifest: AdminManifestThree3::decode(&M3_PRIME).unwrap(),
 	}
 }
 fn three_identity() -> RootIdentity2 {
-	let any = AnyAdminManifest2::decode(&M3_PRIME).unwrap();
-	let a = any.admission();
+	let any = AdminManifestThree3::decode(&M3_PRIME).unwrap();
+	let a = any.base();
 	RootIdentity2 {
 		generation: a.generation,
 		cluster: a.cluster,

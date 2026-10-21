@@ -6,8 +6,7 @@
 //! authorizes anything in another root.
 use super::admin::errors::BootstrapRecordError2;
 use super::admin::manifest::{
-	ADMIN_MANIFEST_P3_BYTES3, AdminNamespace2, AnyAdminManifest2, GovernanceRole2,
-	ManifestProfile2, RecoveryRole3,
+	ADMIN_MANIFEST_P3_BYTES3, AdminNamespace2, GovernanceRole2, RecoveryRole3,
 };
 use super::admin::record::{BootstrapIdentity2, BootstrapObservation2};
 use super::origin::{MutationAuthorityState2, root_and_origin2};
@@ -23,12 +22,11 @@ pub(in crate::storage::mutation_visibility::root2) struct InstalledAdmin2 {
 	admin_id: [u8; 16],
 	admin_key: [u8; 32],
 	namespace: AdminNamespace2,
-	// Descriptive copied roles; explicit profile fixes the role set and canonical length.
-	governance: Option<GovernanceRole2>,
-	profile: ManifestProfile2,
-	recovery: Option<RecoveryRole3>,
-	active: Option<[(u64, Digest2); 3]>,
-	cut: Option<(Log2, Digest2, Digest2)>,
+	// Descriptive copied roles of the one canonical manifest form.
+	governance: GovernanceRole2,
+	recovery: RecoveryRole3,
+	active: [(u64, Digest2); 3],
+	cut: (Log2, Digest2, Digest2),
 }
 redacted_debug!(InstalledAdmin2, "InstalledAdmin2");
 /// The exact root, original Bootstrap and genesis an administrator is bound to.
@@ -129,25 +127,23 @@ pub(in crate::storage::mutation_visibility::root2) fn install_admin2(
 		}
 	}
 	let any = tuple_manifest2(tuple);
-	let manifest = any.admission();
-	let AnyAdminManifest2::Three(three) = any;
-	let governance = Some(three.governance());
-	let original = Some([
+	let manifest = any.base();
+	let three = any;
+	let governance = three.governance();
+	let original = [
 		manifest.admin_key,
 		three.governance().key(),
 		three.recovery().key(),
-	]);
+	];
 	if let Some(epochs) = &s.role_epochs {
-		if Some(epochs.original) != original {
+		if epochs.original != original {
 			return Err(InstallError2::EpochState);
 		}
 	}
-	let active = original.map(|keys| {
-		std::array::from_fn(|role| {
-			s.role_epochs
-				.as_ref()
-				.map_or((0, keys[role]), |e| e.active(role))
-		})
+	let active = std::array::from_fn(|role| {
+		s.role_epochs
+			.as_ref()
+			.map_or((0, original[role]), |e| e.active(role))
 	});
 	Ok(InstalledAdmin2 {
 		context: AdminContext2 {
@@ -161,13 +157,12 @@ pub(in crate::storage::mutation_visibility::root2) fn install_admin2(
 			manifest_pin: pin,
 		},
 		active,
-		cut: active.map(|_| (s.covered, s.fingerprint, s.command_digest)),
+		cut: (s.covered, s.fingerprint, s.command_digest),
 		admin_id: manifest.admin_id,
 		admin_key: manifest.admin_key,
 		namespace: manifest.namespace,
 		governance,
-		profile: any.profile(),
-		recovery: Some(three.recovery()),
+		recovery: three.recovery(),
 	})
 }
 pub(in crate::storage::mutation_visibility::root2) fn admin_context2(
@@ -194,21 +189,14 @@ pub(in crate::storage::mutation_visibility::root2) fn admin_installed_at2(
 /// The copied descriptive governance role of the administrator's manifest; never a verifier.
 pub(in crate::storage::mutation_visibility::root2) fn admin_governance2(
 	a: &InstalledAdmin2,
-) -> Option<GovernanceRole2> {
+) -> GovernanceRole2 {
 	a.governance
-}
-pub(in crate::storage::mutation_visibility::root2) fn admin_profile2(
-	a: &InstalledAdmin2,
-) -> ManifestProfile2 {
-	a.profile
 }
 /// The installed manifest's canonical length, which `install_admin2` bound to `control_len`.
 pub(in crate::storage::mutation_visibility::root2) fn admin_manifest_len2(
-	a: &InstalledAdmin2,
+	_: &InstalledAdmin2,
 ) -> u64 {
-	match a.profile {
-		ManifestProfile2::Three => ADMIN_MANIFEST_P3_BYTES3 as u64,
-	}
+	ADMIN_MANIFEST_P3_BYTES3 as u64
 }
 
 /// The observation a node offers its owner for approval: the original Bootstrap identity of a
@@ -245,7 +233,7 @@ pub(in crate::storage::mutation_visibility::root2) fn observe_bootstrap2(
 /// Descriptive inert copy, never a verifier or an executable recovery action.
 pub(in crate::storage::mutation_visibility::root2) fn admin_recovery3(
 	a: &InstalledAdmin2,
-) -> Option<RecoveryRole3> {
+) -> RecoveryRole3 {
 	a.recovery
 }
 
@@ -254,23 +242,23 @@ pub(in crate::storage::mutation_visibility::root2) fn active_role3(
 	a: &InstalledAdmin2,
 	role: usize,
 ) -> Option<(u64, Digest2)> {
-	a.active.and_then(|roles| roles.get(role).copied())
+	a.active.get(role).copied()
 }
 /// All three active epochs at once, exactly as installed: what a role view copies.
 pub(in crate::storage::mutation_visibility::root2) fn admin_active3(
 	a: &InstalledAdmin2,
-) -> Option<[(u64, Digest2); 3]> {
+) -> [(u64, Digest2); 3] {
 	a.active
 }
 pub(in crate::storage::mutation_visibility::root2) fn admin_cut3(
 	a: &InstalledAdmin2,
-) -> Option<(Log2, Digest2, Digest2)> {
+) -> (Log2, Digest2, Digest2) {
 	a.cut
 }
 pub(in crate::storage::mutation_visibility::root2) fn original_roles3(
 	a: &InstalledAdmin2,
-) -> Option<[Digest2; 3]> {
-	Some([a.admin_key, a.governance?.key(), a.recovery?.key()])
+) -> [Digest2; 3] {
+	[a.admin_key, a.governance.key(), a.recovery.key()]
 }
 
 pub(in crate::storage::mutation_visibility::root2) fn confirm_terminal2(
@@ -322,9 +310,9 @@ pub(in crate::storage::mutation_visibility::root2) fn confirm_terminal2(
 		}
 	}
 	let any = tuple_manifest2(tuple);
-	let AnyAdminManifest2::Three(manifest) = any;
+	let manifest = any;
 	let original = [
-		any.admission().admin_key,
+		any.base().admin_key,
 		manifest.governance().key(),
 		manifest.recovery().key(),
 	];

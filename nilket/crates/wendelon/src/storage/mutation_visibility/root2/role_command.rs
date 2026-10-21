@@ -1,5 +1,4 @@
 //! Compact, canonical role proofs. No signing, authority factory or persistent active-key cache.
-use super::admin::manifest::ManifestProfile2;
 use super::command::Command2;
 use super::role_view::RoleView3;
 use super::{admin_install::*, codec::hash, types::Digest2};
@@ -216,10 +215,7 @@ pub(super) fn verify_core(
 	form: RoleForm3,
 ) -> Result<bool, RoleProofError3> {
 	parse(bytes)?;
-	if view.profile() != ManifestProfile2::Three
-		|| bytes[12..44] != context_digest3(&view.context())
-		|| bytes[44..76] != command
-	{
+	if bytes[12..44] != context_digest3(&view.context()) || bytes[44..76] != command {
 		return Ok(false);
 	}
 	for (i, at) in [76, 150].into_iter().enumerate() {
@@ -232,9 +228,7 @@ pub(super) fn verify_core(
 		if bytes[at + 9] != 1 {
 			return Ok(false);
 		}
-		let Some((epoch, key)) = view.active(usize::from(expected[i] - 1)) else {
-			return Ok(false);
-		};
+		let (epoch, key) = view.active(usize::from(expected[i] - 1));
 		if u64::from_le_bytes(array(bytes, at + 1)) != epoch {
 			return Ok(false);
 		}

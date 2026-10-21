@@ -1,7 +1,7 @@
 //! Pure matrix and physical record boundaries; no authority or runtime claims.
 use super::*;
 use crate::storage::mutation_visibility::root2::{
-	admin::{manifest::ManifestProfile2, record::BootstrapObservation2},
+	admin::record::BootstrapObservation2,
 	provisioning::{inventory::*, owner_core::*, terminal::*},
 	types::Log2,
 };
@@ -120,7 +120,6 @@ fn terminal_event_and_snapshot_match_independent_python_vectors() {
 		snapshot::encode_snapshot2(&folded).unwrap(),
 		b(&v["snapshot"])
 	);
-	assert_eq!(folded.roots[0].manifest.profile(), ManifestProfile2::Three);
 }
 /// The profile-3 rows of the matrix with the Retired prefix reached by the committed terminal
 /// Retire (not a plain Retire): each state and observation option gets its profile-3 decision.

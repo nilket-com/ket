@@ -7,7 +7,7 @@ use super::profile_three_fixture::{
 use super::*;
 use crate::storage::mutation_visibility::MutationScope;
 use crate::storage::mutation_visibility::root2::admin::manifest::AdminManifest2;
-use crate::storage::mutation_visibility::root2::admin::manifest::AnyAdminManifest2;
+use crate::storage::mutation_visibility::root2::admin::manifest::AdminManifestThree3;
 use crate::storage::mutation_visibility::root2::admin::record::BootstrapRecord2;
 use crate::storage::mutation_visibility::root2::admin_install::*;
 use crate::storage::mutation_visibility::root2::admin_statement::*;
@@ -35,9 +35,9 @@ fn statement(name: &str) -> Vec<u8> {
 	unhex(v()[name]["bytes"].as_str().unwrap())
 }
 fn prime_admission() -> AdminManifest2 {
-	AnyAdminManifest2::decode(&hex("p3_manifest"))
+	AdminManifestThree3::decode(&hex("p3_manifest"))
 		.unwrap()
-		.admission()
+		.base()
 		.clone()
 }
 fn at(term: u64, node: u32, index: u64) -> EntryPosition2 {

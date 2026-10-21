@@ -3,7 +3,7 @@
 //! snapshots, from the independent `p3_` anchor vectors. The empty snapshot stays the kept v1 one.
 use super::*;
 use crate::storage::mutation_visibility::root2::admin::manifest::{
-	AdminManifestThree3, AnyAdminManifest2, any_manifest_digest2,
+	AdminManifestThree3, manifest_digest3,
 };
 use crate::storage::mutation_visibility::root2::admin::record::BootstrapRecord2;
 use crate::storage::mutation_visibility::root2::codec::hash;
@@ -84,7 +84,7 @@ fn the_golden_bound_tuple_matches_the_independent_vectors() {
 	let t = check(&m, &mp, &s, &sp).unwrap();
 	assert_eq!(tuple_manifest_len2(&t), 241);
 	assert_eq!(tuple_manifest2(&t).encode().unwrap().as_slice(), m);
-	let manifest = tuple_manifest2(&t).admission();
+	let manifest = tuple_manifest2(&t).base();
 	let f = &x["fields"];
 	assert_eq!(
 		manifest.generation.to_vec(),
@@ -270,12 +270,12 @@ fn only_a_coherent_bound_entry_forms_a_tuple() {
 	);
 	// The epoch is the one binding the snapshot cannot make: rebind and re-pin both the entry and
 	// its record to a manifest whose epoch differs from the approved record's.
-	let AnyAdminManifest2::Three(three) = AnyAdminManifest2::decode(&m1).unwrap();
+	let three = AdminManifestThree3::decode(&m1).unwrap();
 	let mut base = three.base().clone();
 	base.initial_epoch += 1;
 	let changed = AdminManifestThree3::new(base, three.governance(), three.recovery()).unwrap();
 	let me = changed.encode().unwrap().to_vec();
-	let pe = any_manifest_digest2(&AnyAdminManifest2::Three(changed).encode().unwrap());
+	let pe = manifest_digest3(&changed.encode().unwrap());
 	let EventBody2::Approve { mut record } = p3_event("approve").body else {
 		unreachable!()
 	};

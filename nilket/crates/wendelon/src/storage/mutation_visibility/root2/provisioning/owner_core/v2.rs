@@ -76,10 +76,10 @@ fn decide(log: &[u8], op_id: &OpId2, req: &OwnerRequest2) -> Result<Decision2, O
 	let (identity, body) = match (req, &key) {
 		(OwnerRequest2::Reserve { manifest }, RequestKey2::Reserve { manifest: bytes }) => {
 			let identity = RootIdentity2 {
-				generation: manifest.admission().generation,
-				cluster: manifest.admission().cluster,
-				pin: any_manifest_digest2(bytes),
-				admin_key: manifest.admission().admin_key,
+				generation: manifest.base().generation,
+				cluster: manifest.base().cluster,
+				pin: manifest_digest3(bytes),
+				admin_key: manifest.base().admin_key,
 			};
 			if state.roots.iter().any(|r| r.identity == identity) {
 				return Err(OwnerError2::AlreadyReserved);
@@ -117,7 +117,7 @@ fn decide(log: &[u8], op_id: &OpId2, req: &OwnerRequest2) -> Result<Decision2, O
 					ordinary()?;
 					let binds = (o.generation, o.cluster, o.pin)
 						== (identity.generation, identity.cluster, identity.pin)
-						&& o.initial_epoch == root.manifest.admission().initial_epoch;
+						&& o.initial_epoch == root.manifest.base().initial_epoch;
 					let body = if binds {
 						EventBody2::Approve {
 							record: BootstrapRecord2 {

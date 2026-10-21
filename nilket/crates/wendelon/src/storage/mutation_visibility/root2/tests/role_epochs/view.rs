@@ -138,7 +138,6 @@ fn code(r: &str) -> char {
 		"Err(Signature)" => 'S',
 		"Err(Context)" => 'C',
 		"Err(Digest)" => 'D',
-		"Err(NoGovernance)" => 'N',
 		_ => '?',
 	}
 }
@@ -182,7 +181,15 @@ fn t_view_each_altered_field_changes_a_result() {
 				..ns
 			})
 		}),
-		("governance", |v| v.with_governance(None)),
+		("governance", |v| {
+			v.with_governance(
+				crate::storage::mutation_visibility::root2::admin::manifest::GovernanceRole2::new(
+					[0x56; 16],
+					key(0x55),
+				)
+				.unwrap(),
+			)
+		}),
 	];
 	for (field, alter) in alterations {
 		let altered = coded(matrix(&|a, i| results(&alter(a.view()), i)));

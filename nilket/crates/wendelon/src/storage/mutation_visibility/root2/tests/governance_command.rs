@@ -50,7 +50,7 @@ fn fixture_matches_independent_reference() {
 	assert_eq!(fp.to_vec(), vv("p3_bootstrap_fingerprint"));
 	assert_eq!(d.to_vec(), vv("p3_bootstrap_command"));
 	assert_eq!(
-		admin_governance2(&admin()).unwrap().key().to_vec(),
+		admin_governance2(&admin()).key().to_vec(),
 		vv("p3_governance_public")
 	);
 	assert_eq!(context().manifest_pin.to_vec(), vv("p3_pin"));

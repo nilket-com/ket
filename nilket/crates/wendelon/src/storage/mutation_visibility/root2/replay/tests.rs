@@ -2,7 +2,7 @@
 use super::*;
 use crate::consensus::retention::{ControlRetention, HistoryCheck, RetentionRefusals};
 use crate::consensus::{RetentionStatus, WendelonLogStore, WendelonRequest};
-use crate::storage::mutation_visibility::root2::admin::manifest::AnyAdminManifest2;
+use crate::storage::mutation_visibility::root2::admin::manifest::AdminManifestThree3;
 use crate::storage::mutation_visibility::root2::admin::record::BootstrapRecord2;
 use crate::storage::mutation_visibility::root2::committed::fixture::Root2FixtureScope;
 use crate::storage::mutation_visibility::root2::entry_identity::EntryPosition2;
@@ -105,8 +105,8 @@ fn context_with_bootstrap_fingerprint(
 ) -> (PinnedBoundTuple2, Deployment2, Vec<E>, Vec<Fixture>) {
 	// M3_PRIME: the profile-1 G1d fixture's admission fields as a profile-3 manifest.
 	let bytes = vector("p3_manifest");
-	let any = AnyAdminManifest2::decode(&bytes).unwrap();
-	let m = any.admission().clone();
+	let any = AdminManifestThree3::decode(&bytes).unwrap();
+	let m = any.base().clone();
 	let pin: Digest2 = vector("p3_manifest_pin").try_into().unwrap();
 	let dep = Deployment2 {
 		generation: m.generation,

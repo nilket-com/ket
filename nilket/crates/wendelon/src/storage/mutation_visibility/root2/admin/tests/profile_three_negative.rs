@@ -26,7 +26,7 @@ fn decode_unchanged(b: &[u8]) -> Result<AdminManifestThree3, AdminManifestError2
 	assert_eq!(b, &before[..]);
 	// The dispatching decoder refuses the same bytes with the same error.
 	assert_eq!(
-		AnyAdminManifest2::decode(b).err(),
+		AdminManifestThree3::decode(b).err(),
 		r.as_ref().err().copied()
 	);
 	r

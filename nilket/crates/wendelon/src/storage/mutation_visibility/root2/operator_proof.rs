@@ -20,12 +20,9 @@ pub(in crate::storage::mutation_visibility::root2) use context::Chain3;
 #[cfg(test)]
 pub(in crate::storage::mutation_visibility::root2) use proof::check_under;
 
-use crate::storage::mutation_visibility::root2::admin::manifest::AnyAdminManifest2;
+use crate::storage::mutation_visibility::root2::admin::manifest::AdminManifestThree3;
 
 /// The export binds only a profile-3 manifest.
 fn is_profile_three(manifest: &[u8]) -> bool {
-	matches!(
-		AnyAdminManifest2::decode(manifest),
-		Ok(AnyAdminManifest2::Three(_))
-	)
+	matches!(AdminManifestThree3::decode(manifest), Ok(_))
 }

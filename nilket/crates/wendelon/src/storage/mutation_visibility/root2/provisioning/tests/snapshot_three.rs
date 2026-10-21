@@ -34,7 +34,6 @@ fn goldens_equal_folded_exports_and_decode_round_trips() {
 		for (e, r) in s.entries.iter().zip(&state.roots) {
 			assert!(
 				e.identity == r.identity
-					&& e.profile == r.manifest.profile()
 					&& e.state == r.state
 					&& e.last_seq == r.last_seq
 					&& e.record == r.record

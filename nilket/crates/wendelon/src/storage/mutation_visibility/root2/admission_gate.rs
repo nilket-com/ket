@@ -89,7 +89,7 @@ impl Root2 {
 		if s.control_len != admin_manifest_len2(admin)
 			|| admin_context2(admin) != expected
 			|| super::admin_install::admin_cut3(admin)
-				.is_some_and(|cut| cut != (s.covered, s.fingerprint, s.command_digest))
+				!= (s.covered, s.fingerprint, s.command_digest)
 		{
 			return Err(RootError2::TrustMismatch);
 		}

@@ -1,6 +1,6 @@
 //! Test-only real-entry setup; no production capability or token constructors.
 use crate::consensus::{Root2Carrier1, WendelonRequest, WendelonTypeConfig};
-use crate::storage::mutation_visibility::root2::admin::manifest::AnyAdminManifest2;
+use crate::storage::mutation_visibility::root2::admin::manifest::AdminManifestThree3;
 use crate::storage::mutation_visibility::root2::admin::record::BootstrapRecord2;
 use crate::storage::mutation_visibility::root2::admin_install::*;
 use crate::storage::mutation_visibility::root2::admin_statement::*;
@@ -93,7 +93,7 @@ pub(in crate::storage::mutation_visibility::root2) fn tip(s: &MutationAuthorityS
 }
 pub(in crate::storage::mutation_visibility::root2) struct Fixture {
 	pub(in crate::storage::mutation_visibility::root2) manifest: Vec<u8>,
-	pub(in crate::storage::mutation_visibility::root2) any: AnyAdminManifest2,
+	pub(in crate::storage::mutation_visibility::root2) any: AdminManifestThree3,
 	pub(in crate::storage::mutation_visibility::root2) record: BootstrapRecord2,
 	pub(in crate::storage::mutation_visibility::root2) pin: PinnedBoundTuple2,
 	pub(in crate::storage::mutation_visibility::root2) dep: Deployment2,
@@ -110,8 +110,8 @@ impl Fixture {
 		use profile_three_fixture::{
 			PRIMARY_GOVERNANCE_ID, PRIMARY_RECOVERY_ID, PRIMARY_SEEDS, build_three, key,
 		};
-		let any = AnyAdminManifest2::decode(&profile_three_fixture::M3_PRIMARY).unwrap();
-		let mut base = any.admission().clone();
+		let any = AdminManifestThree3::decode(&profile_three_fixture::M3_PRIMARY).unwrap();
+		let mut base = any.base().clone();
 		base.namespace.scope = MutationScope::Table;
 		base.namespace.table = [0x51; 16];
 		base.namespace.schema = 7;
@@ -169,8 +169,8 @@ pub(in crate::storage::mutation_visibility::root2) fn tuple_for(
 	manifest: &[u8],
 	record: BootstrapRecord2,
 ) -> PinnedBoundTuple2 {
-	let any = AnyAdminManifest2::decode(manifest).unwrap();
-	let a = any.admission();
+	let any = AdminManifestThree3::decode(manifest).unwrap();
+	let a = any.base();
 	let pin = profile_three_fixture::exact_pin(manifest);
 	let snapshot = encode_snapshot2(&LogState2 {
 		roots: vec![RootEntry2 {
@@ -274,7 +274,7 @@ pub(in crate::storage::mutation_visibility::root2) fn denied(
 	assert_eq!(bytes(&f.state), before);
 }
 pub(in crate::storage::mutation_visibility::root2) fn selector(f: &Fixture) -> ProofKeyBinding {
-	let a = f.any.admission();
+	let a = f.any.base();
 	ProofKeyBinding {
 		generation: a.generation,
 		tenant: a.namespace.tenant,
@@ -304,7 +304,7 @@ pub(in crate::storage::mutation_visibility::root2) fn signed_lease(
 	seed: u8,
 ) -> SignedLease2 {
 	let mut lease = profile_three_fixture::s1_claim().original.lease;
-	lease.epoch = f.any.admission().initial_epoch;
+	lease.epoch = f.any.base().initial_epoch;
 	lease.issuer = 7;
 	lease.signature = SigningKey::from_bytes(&[seed; 32])
 		.sign(&lease_payload2(&lease).unwrap())
@@ -321,7 +321,7 @@ pub(in crate::storage::mutation_visibility::root2) fn grant(f: &Fixture, seed: u
 	}
 }
 pub(in crate::storage::mutation_visibility::root2) fn identity(f: &Fixture) -> MutationIdentity {
-	let a = f.any.admission();
+	let a = f.any.base();
 	let n = a.namespace;
 	MutationIdentity {
 		generation: a.generation,
@@ -361,8 +361,8 @@ pub(in crate::storage::mutation_visibility::root2) fn nine(f: &Fixture) -> Vec<C
 			latest: original.reference().unwrap(),
 		},
 		Command2::Cut {
-			expected: f.any.admission().initial_epoch,
-			next: f.any.admission().initial_epoch + 1,
+			expected: f.any.base().initial_epoch,
+			next: f.any.base().initial_epoch + 1,
 			configuration: [0x61; 32],
 		},
 		Command2::Resolve {

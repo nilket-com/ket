@@ -231,8 +231,5 @@ fn root_pin_original_keys_and_role_ids_never_rotate() {
 		super::super::super::provisioning::replica_anchor::tuple_manifest_pin2(&f.f.pin),
 		pin
 	);
-	assert_eq!(
-		original_roles3(&f.installed()),
-		Some([key(11), key(12), key(13)])
-	);
+	assert_eq!(original_roles3(&f.installed()), [key(11), key(12), key(13)]);
 }

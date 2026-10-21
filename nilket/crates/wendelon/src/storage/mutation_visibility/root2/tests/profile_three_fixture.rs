@@ -16,8 +16,7 @@ use super::statement_seeds::{ADMIN_SEED, GOVERNANCE_SEED, RECOVERY_SEED};
 use super::*;
 use crate::storage::mutation_visibility::MutationScope;
 use crate::storage::mutation_visibility::root2::admin::manifest::{
-	AdminManifest2, AdminManifestThree3, AdminNamespace2, AnyAdminManifest2, GovernanceRole2,
-	RecoveryRole3,
+	AdminManifest2, AdminManifestThree3, AdminNamespace2, GovernanceRole2, RecoveryRole3,
 };
 use crate::storage::mutation_visibility::root2::admin::record::BootstrapRecord2;
 use crate::storage::mutation_visibility::root2::admin_install::*;
@@ -343,8 +342,8 @@ pub(super) fn exact_pin(bytes: &[u8]) -> Digest2 {
 /// A coherent Part A tuple for this exact profile-3 manifest whose single Bound record is `record`,
 /// over the v3 snapshot; Part A must accept it.
 pub(super) fn tuple_of(manifest: &[u8], record: BootstrapRecord2) -> PinnedBoundTuple2 {
-	let any = AnyAdminManifest2::decode(manifest).unwrap();
-	let a = any.admission();
+	let any = AdminManifestThree3::decode(manifest).unwrap();
+	let a = any.base();
 	let pin = exact_pin(manifest);
 	let snapshot = encode_snapshot2(&LogState2 {
 		roots: vec![RootEntry2 {
@@ -380,7 +379,7 @@ pub(super) fn pre_root() -> MutationAuthorityState2 {
 /// One coherent chain: a FIXTURE-rooted state, its observation, the owner-approved record, the
 /// snapshot, its pins and the validated Bound tuple, all derived from this exact command.
 pub(super) struct Chain {
-	pub any: AnyAdminManifest2,
+	pub any: AdminManifestThree3,
 	pub cmd: Command2,
 	pub entry: TrustedEntry2,
 	pub rooted: MutationAuthorityState2,
@@ -396,8 +395,8 @@ pub(super) fn rooted(
 	CommittedEntry2,
 	MutationAuthorityState2,
 ) {
-	let m = AnyAdminManifest2::decode(bytes).unwrap();
-	let a = m.admission();
+	let m = AdminManifestThree3::decode(bytes).unwrap();
+	let a = m.base();
 	let cmd = Command2::Bootstrap {
 		epoch: a.initial_epoch,
 		control: exact_pin(bytes),
@@ -412,7 +411,7 @@ pub(super) fn rooted(
 }
 pub(super) fn chain_of(bytes: &[u8], length: u64) -> Chain {
 	let bytes = bytes.to_vec();
-	let any = AnyAdminManifest2::decode(&bytes).unwrap();
+	let any = AdminManifestThree3::decode(&bytes).unwrap();
 	let pin = exact_pin(&bytes);
 	let (cmd, entry, _, rooted) = rooted(&bytes, length);
 	let observation = observe_bootstrap2(&rooted).unwrap();
@@ -420,7 +419,7 @@ pub(super) fn chain_of(bytes: &[u8], length: u64) -> Chain {
 		identity: observation.identity,
 		inventory_seq: 2,
 	};
-	let a = any.admission();
+	let a = any.base();
 	let snapshot = encode_snapshot2(&LogState2 {
 		roots: vec![RootEntry2 {
 			terminal: None,
@@ -462,9 +461,9 @@ fn authority() -> AuthorityRef2 {
 /// FIXTURE: a rooted state with authority 0x41 rev 1 enrolled at (1,1,3).
 pub(super) fn enrolled(
 	rooted: &MutationAuthorityState2,
-	any: &AnyAdminManifest2,
+	any: &AdminManifestThree3,
 ) -> MutationAuthorityState2 {
-	let a = any.admission();
+	let a = any.base();
 	let cmd = Command2::EnrollAuthority {
 		authority: authority(),
 		node: NodeRef2 {
@@ -534,15 +533,12 @@ pub(super) fn control_len(state: &MutationAuthorityState2) -> u64 {
 impl Fixture {
 	/// A fixture root bootstrapped with this exact profile-3 manifest.
 	pub(in crate::storage::mutation_visibility::root2) fn profile_three(manifest: &[u8]) -> Self {
-		assert!(matches!(
-			AnyAdminManifest2::decode(manifest),
-			Ok(AnyAdminManifest2::Three(_))
-		));
+		assert!(matches!(AdminManifestThree3::decode(manifest), Ok(_)));
 		Self::from_manifest(manifest.to_vec())
 	}
 	pub(in crate::storage::mutation_visibility::root2) fn from_manifest(manifest: Vec<u8>) -> Self {
-		let any = AnyAdminManifest2::decode(&manifest).unwrap();
-		let a = any.admission();
+		let any = AdminManifestThree3::decode(&manifest).unwrap();
+		let a = any.base();
 		let dep = Deployment2 {
 			generation: a.generation,
 			cluster: a.cluster,

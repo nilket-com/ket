@@ -8,7 +8,7 @@ use super::profile_three_fixture::{
 };
 use super::*;
 use crate::storage::mutation_visibility::root2::admin::manifest::AdminManifest2;
-use crate::storage::mutation_visibility::root2::admin::manifest::AnyAdminManifest2;
+use crate::storage::mutation_visibility::root2::admin::manifest::AdminManifestThree3;
 use crate::storage::mutation_visibility::root2::admin::record::BootstrapRecord2;
 use crate::storage::mutation_visibility::root2::admin_install::*;
 use crate::storage::mutation_visibility::root2::admission_registry::encode_permission_key2;
@@ -46,9 +46,9 @@ fn variant(v: &str) -> Command2 {
 	Command2::AdmissionPermission(bytes337(unhex(v)))
 }
 fn prime_admission() -> AdminManifest2 {
-	AnyAdminManifest2::decode(&hex("p3_manifest"))
+	AdminManifestThree3::decode(&hex("p3_manifest"))
 		.unwrap()
-		.admission()
+		.base()
 		.clone()
 }
 fn gc() -> ([u8; 16], [u8; 16]) {

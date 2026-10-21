@@ -4,9 +4,7 @@
 //! since c1, N1-N3 and N13-N15 since c2.
 use super::*;
 use crate::storage::mutation_visibility::root2::admin::errors::AdminManifestError2;
-use crate::storage::mutation_visibility::root2::admin::manifest::{
-	AdminManifestThree3, AnyAdminManifest2, ManifestProfile2,
-};
+use crate::storage::mutation_visibility::root2::admin::manifest::AdminManifestThree3;
 use crate::storage::mutation_visibility::root2::compromise::compromise_audit2;
 use crate::storage::mutation_visibility::root2::provisioning::inventory::{
 	CorruptReason2, LogError2, RootState2,
@@ -18,7 +16,7 @@ use crate::storage::mutation_visibility::root2::provisioning::owner_log::{
 	OwnerDir2, OwnerIoError2,
 };
 use crate::storage::mutation_visibility::root2::provisioning::replica_anchor::{
-	ReplicaAnchorError2, ReplicaInput2, ReplicaInputs2, tuple_manifest_len2, tuple_manifest2,
+	ReplicaAnchorError2, ReplicaInput2, ReplicaInputs2, tuple_manifest_len2,
 	validate_replica_tuple2,
 };
 use crate::storage::mutation_visibility::root2::provisioning::snapshot::{
@@ -114,12 +112,12 @@ fn removed_manifests_are_refused_against_twins() {
 	// N1 (137 bytes) and N2 (189 bytes) are refused at the length, before any header access.
 	for id in ["N1", "N2"] {
 		assert_eq!(
-			AnyAdminManifest2::decode(&one(&all, id)).err(),
+			AdminManifestThree3::decode(&one(&all, id)).err(),
 			Some(AdminManifestError2::Length),
 			"{id}"
 		);
 	}
-	assert!(AnyAdminManifest2::decode(&M3_PRIMARY).is_ok());
+	assert!(AdminManifestThree3::decode(&M3_PRIMARY).is_ok());
 	// N3 (241 bytes, profile word 2) and its profile-1 relabel are refused at the profile; the
 	// profile-3 relabel is the accepted twin.
 	let n3 = one(&all, "N3");
@@ -191,10 +189,6 @@ fn removed_tuple_and_snapshots_are_refused_against_twins() {
 	);
 	let chain = chain_of(&M3_PRIMARY, 241);
 	assert_eq!(tuple_manifest_len2(&chain.tuple), 241);
-	assert_eq!(
-		tuple_manifest2(&chain.tuple).profile(),
-		ManifestProfile2::Three
-	);
 	// N5 (version 2) and N6 (version 1 with an entry) are refused at the version.
 	for id in ["N5", "N6"] {
 		assert_eq!(
@@ -240,8 +234,7 @@ fn removed_tuple_and_snapshots_are_refused_against_twins() {
 	alone[10..14].copy_from_slice(&1u32.to_le_bytes());
 	alone.extend_from_slice(entry);
 	alone.extend_from_slice(&[0; 32]);
-	let alone = decode_snapshot2(&reseal(alone)).unwrap();
-	assert_eq!(alone.entries[0].profile, ManifestProfile2::Three);
+	assert_eq!(decode_snapshot2(&reseal(alone)).unwrap().entries.len(), 1);
 }
 
 #[test]
@@ -265,7 +258,7 @@ fn removed_owner_forms_are_refused_against_twins() {
 	o.apply(
 		&op_id2([9; 16]).unwrap(),
 		&OwnerRequest2::Reserve {
-			manifest: AnyAdminManifest2::decode(&M3_PRIMARY).unwrap(),
+			manifest: AdminManifestThree3::decode(&M3_PRIMARY).unwrap(),
 		},
 	)
 	.unwrap();

@@ -10,7 +10,7 @@
 //! binding: any mismatch refuses.
 use crate::consensus::{WendelonRequest, WendelonTypeConfig};
 use crate::storage::mutation_visibility::root2::admin::manifest::{
-	AnyAdminManifest2, any_manifest_digest2,
+	AdminManifestThree3, manifest_digest3,
 };
 use crate::storage::mutation_visibility::root2::admin::record::{
 	BootstrapIdentity2, BootstrapRecord2,
@@ -35,7 +35,7 @@ use std::collections::BTreeMap;
 /// A decoded profile-3 manifest and its pin. Its source is the operator, never the log.
 pub(super) struct TrustedManifest2 {
 	bytes: Vec<u8>,
-	any: AnyAdminManifest2,
+	any: AdminManifestThree3,
 	pin: Digest2,
 }
 /// Why the manifest is not bound to this log's root.
@@ -59,9 +59,9 @@ pub(super) enum BindingError2 {
 
 /// The trusted manifest, or why it is refused as a trust input: only an exact profile-3 manifest.
 pub(super) fn trusted_manifest2(bytes: &[u8]) -> Result<TrustedManifest2, &'static str> {
-	let any = AnyAdminManifest2::decode(bytes)
+	let any = AdminManifestThree3::decode(bytes)
 		.map_err(|_| "the trusted manifest does not decode as an administrator manifest")?;
-	let pin = any_manifest_digest2(&any.encode().map_err(|_| "manifest re-encode")?);
+	let pin = manifest_digest3(&any.encode().map_err(|_| "manifest re-encode")?);
 	Ok(TrustedManifest2 {
 		bytes: bytes.to_vec(),
 		any,
@@ -115,7 +115,7 @@ pub(super) fn bind2(
 	stop: u64,
 ) -> Result<(PinnedBoundTuple2, Deployment2), BindingError2> {
 	use BindingError2 as E;
-	let a = manifest.any.admission();
+	let a = manifest.any.base();
 	let (entry, g, c, command) = install_entry(entries, stop).ok_or(E::InstallMissing)?;
 	let Command2::Bootstrap {
 		epoch,

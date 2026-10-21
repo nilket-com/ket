@@ -141,7 +141,7 @@ fn step(
 	parents: &Parents,
 ) -> MutationAuthorityState2 {
 	let (g, cl) = {
-		let a = chain.any.admission();
+		let a = chain.any.base();
 		(a.generation, a.cluster)
 	};
 	let before = encode_authority2(prev).unwrap();
@@ -244,14 +244,10 @@ fn reserved(c: &Command2, i: u64) -> ApplyResult2 {
 fn a_profile_three_governed_reserve_requires_an_active_exact_permission() {
 	let chain = governed_three();
 	let admin = install_admin2(&chain.rooted, &chain.tuple).unwrap();
-	assert_eq!(
-		admin_profile2(&admin),
-		crate::storage::mutation_visibility::root2::admin::manifest::ManifestProfile2::Three
-	);
-	assert!(admin_governance2(&admin).is_some());
-	assert_eq!(admin_recovery3(&admin).unwrap().actions(), 31);
+	assert!(admin_governance2(&admin).actions() == 0x1FF);
+	assert_eq!(admin_recovery3(&admin).actions(), 31);
 	let (reserve, g, c) = command("reserve");
-	let a = chain.any.admission();
+	let a = chain.any.base();
 	assert_eq!(
 		(g, c),
 		(a.generation, a.cluster),
