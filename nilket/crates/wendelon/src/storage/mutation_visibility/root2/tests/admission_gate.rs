@@ -673,3 +673,36 @@ fn legacy_paths_still_refuse_tag_eleven() {
 fn hex_of(b: &[u8]) -> String {
 	b.iter().map(|x| format!("{x:02x}")).collect()
 }
+/// C3: the gate compares the root's commitment length with the installed recorded length. Only
+/// `control_len` differs in the mutated state; the whole expected context still equals the
+/// administrator's, so the refusal is the length check alone.
+#[test]
+fn gate_length_is_isolated_by_a_control_len_only_change() {
+	use super::profile_three_fixture::{
+		M3_PRIMARY, PRIMARY_SEEDS, chain_of, control_len, enrolled, expected_context, grant,
+		reduce_at,
+	};
+	// On the profile-3 chain, with the off-by-one lengths (moved here at c2).
+	for other in [240, 242] {
+		let name = other;
+		let c = chain_of(&M3_PRIMARY, 241);
+		let state = enrolled(&c.rooted, &c.any);
+		// A profile-3 administrator is installed at the tip it acts on.
+		let admin = install_admin2(&state, &c.tuple).unwrap();
+		let seed = PRIMARY_SEEDS[0];
+		let cmd = grant(&admin, seed);
+		let first = reduce_at(&state, &admin, &cmd, 4);
+		assert!(
+			matches!(first, Ok(ApplyResult2::Permission { .. })),
+			"{name}: {first:?}"
+		);
+		let mutated = with_control_len_for_test(&state, other);
+		assert_eq!(control_len(&mutated), other);
+		assert!(admin_context2(&admin) == expected_context(&mutated));
+		assert_eq!(
+			reduce_at(&mutated, &admin, &cmd, 4).err(),
+			Some(RootError2::TrustMismatch),
+			"{name}"
+		);
+	}
+}

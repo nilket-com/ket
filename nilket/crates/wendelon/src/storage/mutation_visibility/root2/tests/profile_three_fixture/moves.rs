@@ -1,9 +1,7 @@
 //! T-MOVE and T-INLINE for the profile-3 fixtures: every moved or inlined input is byte-identical
-//! to what its users read before the move. Tests marked "bridge" name a profile-1/2 form and are
-//! deleted with it in c2.
+//! to what its users read before the move.
 use super::*;
 use crate::storage::mutation_visibility::root2::admin::manifest::any_manifest_digest2;
-use crate::storage::mutation_visibility::root2::tests::profile_two_binding::manifest_bytes;
 use crate::storage::mutation_visibility::root2::tests::support;
 
 fn hex(b: &[u8]) -> String {
@@ -16,14 +14,6 @@ fn with_key(base: &AdminManifest2, seed: u8) -> AdminManifest2 {
 	let mut b = base.clone();
 	b.admin_key = key(seed);
 	b
-}
-
-/// T-MOVE (i), bridge: `BASE_B` is bytes 12..137 of manifest "b", field for field.
-#[test]
-fn base_b_is_the_admission_part_of_manifest_b() {
-	let b = manifest_bytes("b");
-	assert_eq!(BASE_B.encode().unwrap()[12..137], b[12..137]);
-	assert!(*AnyAdminManifest2::decode(&b).unwrap().admission() == BASE_B);
 }
 
 /// T-MOVE (ii): each literal manifest is its constructor build, with the recorded pin.
@@ -175,16 +165,12 @@ fn frozen_s1_bytes_are_the_pre_twin_goldens() {
 		.iter()
 		.find(|e| e["id"] == "N13" && e["part"] == "root_reserved")
 		.unwrap();
+	// The pre-twin root is refused since c2 (ControlClass), so it is read as bytes: it carries the
+	// frozen claim's exact encoding.
 	let bytes = unhex(pre_twin["hex"].as_str().unwrap());
-	let old = UnverifiedRoot2::decode(&bytes).unwrap();
-	let (g, c, l, fp) = old.fixture_fields();
-	let old = old
-		.fixture_install(g, c, l, fp, hash(&bytes))
-		.unwrap()
-		.lookup(&s1_claim().manifest.identity)
-		.unwrap()
-		.unwrap();
-	assert!(old.claim == s1_claim());
+	let frozen_claim = s1_frozen("claim_projection2");
+	assert!(bytes.windows(frozen_claim.len()).any(|w| w == frozen_claim));
+	let (g, c) = ([0x11; 16], [0x12; 16]);
 	assert!(Command2::Reserve(s1_claim()).encode(g, c).unwrap() == s1_frozen("command_reserve"));
 	// The twins.
 	let mut claim = s1_claim();
@@ -200,7 +186,7 @@ fn frozen_s1_bytes_are_the_pre_twin_goldens() {
 	else {
 		panic!("frozen command_finalize is a Finalize")
 	};
-	assert_eq!(reservation, old.reservation);
+	assert_eq!(reservation.index, 5, "the pre-twin reservation");
 	attestation.reservation.index += 1;
 	attestation.grant = claim.original.reference().unwrap();
 	attestation.claim_digest = claim.digest().unwrap();

@@ -233,9 +233,7 @@ fn owner_export_tuple_feeds_install() {
 		(admin_profile2(&admin), admin_manifest_len2(&admin)),
 		(ManifestProfile2::Three, 241)
 	);
-	let AnyAdminManifest2::Three(three) = &d.any else {
-		panic!("a profile-3 delivery")
-	};
+	let AnyAdminManifest2::Three(three) = &d.any;
 	assert!(admin_governance2(&admin).unwrap() == three.governance());
 	assert!(admin_recovery3(&admin).unwrap() == three.recovery());
 }

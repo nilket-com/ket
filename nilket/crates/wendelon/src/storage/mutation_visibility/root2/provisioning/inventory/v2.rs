@@ -11,11 +11,6 @@ pub(in crate::storage::mutation_visibility::root2::provisioning) fn encode_event
 	e: &Event2,
 ) -> Result<[u8; EVENT_BYTES2], LogError2> {
 	let bad = |r| corrupt(e.seq, r);
-	// Transitional: a profile-1/2 manifest is not a v2 Reserve payload.
-	if matches!(&e.body, EventBody2::Reserve { manifest } if !matches!(manifest, AnyAdminManifest2::Three(_)))
-	{
-		return Err(bad(CorruptReason2::Payload));
-	}
 	let mut b = [0; EVENT_BYTES2];
 	b[..8].copy_from_slice(MAGIC_V2);
 	b[8..10].copy_from_slice(&1u16.to_le_bytes());

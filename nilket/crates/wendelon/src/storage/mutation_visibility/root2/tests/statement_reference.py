@@ -143,7 +143,7 @@ def merge(name, fresh, indent):
 
 
 # ---- Inputs inlined, so a rerun is unchanged once the profile-1 keys are removed ----
-# The profile-1 G1d fixture manifest's admission fields (statement_vectors.json "manifest_prime").
+# The G1d fixture manifest's admission fields, inlined.
 PRIME_FIELDS = dict(generation=bytes([0xA1]) * 16, cluster=bytes([0xC2]) * 16, epoch=7,
                     admin_id=bytes([0x0E]) * 16, namespace=(0, 1, bytes([0x7A]) * 16, 2))
 # The gate's post-grant root over that manifest (gate_vectors.json "post_grant_root", registry 238).
@@ -182,25 +182,17 @@ PERMISSIONS_ROOT = bytes.fromhex(
 PERMISSIONS_ROOT_FIELDS = {"length": 643, "registry": 355, "permission_coordinates": [3, 4, 5]}
 
 
-def same_as_old(vectors, key, value):
-    """While an old key is still present, the inlined input must equal it."""
-    if key in vectors:
-        assert vectors[key] == value, key
-
-
 SV = json.loads((HERE / "statement_vectors.json").read_text())
 GV = json.loads((HERE / "gate_vectors.json").read_text())
 genesis = bytes.fromhex(SV["genesis"])
-old_key = bytes.fromhex(SV["key"])
+# The permission key the M3_PRIME statements carry (the G1d fixture's key), inlined.
+old_key = bytes.fromhex(
+    "414141414141414141414141414141410100000000000000a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"
+    "0000000000000000017a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a0200000000000000"
+)
 
 # ---- M3_PRIME: the profile-1 fixture's admission fields, profile 3, admin seed 0x5A ----
 F = PRIME_FIELDS
-if "manifest_prime" in SV:
-    old = bytes.fromhex(SV["manifest_prime"])
-    assert (old[12:28], old[28:44], old[52:68]) == (F["generation"], F["cluster"], F["admin_id"])
-    assert struct.unpack("<Q", old[44:52])[0] == F["epoch"]
-    assert old[104:137] == struct.pack("<QB", *F["namespace"][:2]) + F["namespace"][2] + \
-        struct.pack("<Q", F["namespace"][3])
 PRIME = manifest(
     F["generation"], F["cluster"], F["epoch"], (F["admin_id"], public(0x5A)), F["namespace"],
     (bytes([0x6C]) * 16, public(0x6B)),
@@ -263,9 +255,6 @@ assert revision_2.hex() == GV["revision_2_key"]
 grant_payload = r.g + r.c + bytes([11]) + grant
 tip_command = sha(b"VISROOT2-COMMAND\x00", grant_payload)
 tip_fp = sha(b"TEST-S1-ENTRY\x00", grant_payload)
-same_as_old(GV, "post_grant_root", {"length": len(GATE_ROOT), "hex": GATE_ROOT.hex(),
-                                      "registry": 238})
-assert GATE_ROOT[192:200] == struct.pack("<Q", 137)
 root = bytearray(GATE_ROOT[:-32])
 root[88:120], root[120:152], root[160:192] = tip_fp, tip_command, r.pin
 root[192:200] = struct.pack("<Q", 241)
@@ -306,11 +295,7 @@ merge("install_vectors.json", {
 }, 1)
 
 # ---- Root profile: the permission-section root, committed to M3_PRIME at length 241 ----
-RP = json.loads((HERE / "root_profile_vectors.json").read_text())
-same_as_old(RP, "root_with_permissions", dict(PERMISSIONS_ROOT_FIELDS, hex=PERMISSIONS_ROOT.hex(),
-                                               sha256=sha(PERMISSIONS_ROOT).hex()))
 assert PERMISSIONS_ROOT[:8] == b"VISAUT04" and PERMISSIONS_ROOT[16:32] == r.g
-assert PERMISSIONS_ROOT[192:200] == struct.pack("<Q", 137)
 root = bytearray(PERMISSIONS_ROOT[:-32])
 root[160:192] = r.pin
 root[192:200] = struct.pack("<Q", 241)
@@ -330,9 +315,6 @@ def resealed(b):
     return b[:-32] + sha(b[:-32])
 
 
-AC = json.loads((HERE / "admission_command_vectors.json").read_text())
-same_as_old(AC, "generation", r.g.hex())
-same_as_old(AC, "cluster", r.c.hex())
 commands = {}
 for name, stmt in [("grant", grant), ("revoke", revoke), ("other_signer", other)]:
     b, d = command(r.g, r.c, stmt)
@@ -347,8 +329,6 @@ refusals = {
     "long_statement": command(r.g, r.c, grant + b"\x00")[0],
     "bad_statement_magic": command(r.g, r.c, b"X" + grant[1:])[0],
 }
-if "command_refusals" in AC:
-    assert list(refusals) == list(AC["command_refusals"])
 merge("admission_command_vectors.json", {
     "p3_commands": commands,
     "p3_command_refusals": {k: v.hex() for k, v in refusals.items()},

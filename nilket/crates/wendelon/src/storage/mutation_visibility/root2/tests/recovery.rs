@@ -811,10 +811,4 @@ fn binding_before_persistence() {
 		ready(&states);
 		assert!(install_admin2(states.last().unwrap(), &tuple()).is_err());
 	}
-	// Legacy (ungoverned) Ready never implies governed eligibility.
-	let legacy = replay(&short(d32("genesis"), [9; 32], 0, false, 2));
-	ready(&legacy);
-	let legacy = legacy.last().unwrap();
-	assert_ne!(root_and_origin2(legacy).unwrap().0.state.control_len, 137);
-	assert!(install_admin2(legacy, &tuple()).is_err());
 }

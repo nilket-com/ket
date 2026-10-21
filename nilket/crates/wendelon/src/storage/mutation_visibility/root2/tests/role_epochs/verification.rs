@@ -26,26 +26,7 @@ fn legacy_governance_sidecar_epoch0_after_rotation_denied8() {
 	deny(f.apply(c, old), 8);
 	assert_eq!(f.root().state.authorities.len(), 0);
 }
-#[test]
-fn legacy_admin_primitive_never_uses_successor_key() {
-	use super::super::super::admin_command::*;
-	let mut f = F::new();
-	let ctx = admin_context2(&f.installed());
-	let unsigned = encode_admin_command2(&ctx, [7; 32], &[0; 64]).unwrap();
-	let sig = SigningKey::from_bytes(&[11; 32])
-		.sign(&admin_command_preimage2(&unsigned).unwrap())
-		.to_bytes();
-	let old = encode_admin_command2(&ctx, [7; 32], &sig).unwrap();
-	assert!(check_admin_command2(&f.installed(), &old, [7; 32]).is_ok());
-	f.rotate(0, 40);
-	assert!(check_admin_command2(&f.installed(), &old, [7; 32]).is_err());
-	let sig = SigningKey::from_bytes(&[40; 32])
-		.sign(&admin_command_preimage2(&unsigned).unwrap())
-		.to_bytes();
-	let changed = encode_admin_command2(&ctx, [7; 32], &sig).unwrap();
-	assert!(check_admin_command2(&f.installed(), &changed, [7; 32]).is_err());
-}
-/// VISADS02 port of the VISADC01 case above: the epoch-0 statement path verifies only under the
+/// The epoch-0 statement path (VISADS02, which replaced the removed VISADC01 primitive) verifies only under the
 /// original administrator key, never the successor's, once the administrator has rotated.
 #[test]
 fn legacy_admin_statement_never_uses_successor_key() {

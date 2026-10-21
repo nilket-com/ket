@@ -3,7 +3,7 @@
 //! authority state or trust token.
 use crate::storage::mutation_visibility::redacted_debug;
 use crate::storage::mutation_visibility::root2::admin::manifest::{
-	AnyAdminManifest2, ManifestProfile2, any_manifest_digest2,
+	AnyAdminManifest2, any_manifest_digest2,
 };
 use crate::storage::mutation_visibility::root2::admin::record::{
 	BootstrapObservation2, BootstrapRecord2,
@@ -246,8 +246,7 @@ fn apply(
 		}
 		EventBody2::RetireTerminal { terminal } => {
 			use super::terminal::{TerminalObservation3, encode_terminal3, observation_digest3};
-			if root.manifest.profile() != ManifestProfile2::Three
-				|| root.state != RootState2::Bound
+			if root.state != RootState2::Bound
 				|| terminal.inventory_seq != e.seq
 				|| encode_terminal3(terminal).is_err()
 			{

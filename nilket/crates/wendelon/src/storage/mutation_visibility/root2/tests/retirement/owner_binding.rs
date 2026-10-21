@@ -554,18 +554,6 @@ fn terminal_export_refusal_order_and_reader_profile_manifest_negatives() {
 	};
 	let bytes = encode_terminal_artifact3(&a).unwrap();
 	assert_eq!(read_terminal3(&bytes, &retired.f.any, pin).unwrap(), a);
-	// The manifest half of the profile check (terminal.rs:208, removed in d): a profile-1/2
-	// manifest still decodes, and the reader refuses it.
-	for name in ["a", "b"] {
-		let old =
-			AnyAdminManifest2::decode(&super::super::profile_two_binding::manifest_bytes(name))
-				.unwrap();
-		assert_eq!(
-			read_terminal3(&bytes, &old, pin),
-			Err(TerminalError3::Profile),
-			"{name}"
-		);
-	}
 	let mut base = retired.f.any.admission().clone();
 	base.cluster[0] ^= 1;
 	let wrong = AnyAdminManifest2::Three(

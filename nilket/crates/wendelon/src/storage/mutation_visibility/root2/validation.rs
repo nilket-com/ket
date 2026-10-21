@@ -1,6 +1,4 @@
-use super::admin::manifest::{
-	ADMIN_MANIFEST_BYTES2, ADMIN_MANIFEST_P2_BYTES2, ADMIN_MANIFEST_P3_BYTES3,
-};
+use super::admin::manifest::ADMIN_MANIFEST_P3_BYTES3;
 use super::admin_statement::{AdmissionNamespace2, PermissionKey2};
 use super::admission_registry::{
 	PERMISSION_CHARGE2, PERMISSION_SECTION_BYTES2, RegistryError2, encode_permission_key2,
@@ -248,21 +246,19 @@ fn permission_error(e: RegistryError2) -> RootError2 {
 		_ => RootError2::RootInvariant,
 	}
 }
-/// Admission eligibility of a Reserve at entry `at` on an admission-governed root (Bootstrap
-/// commitment length 137 or 189, an immutable marker, not proof of a valid administrator; the
-/// exact manifest binding is install's and the gate's). Returns the
+/// Admission eligibility of a Reserve at entry `at`. Every root is admission-governed: its
+/// Bootstrap commitment length is 241 (checked here as the class, an immutable marker, not proof
+/// of a valid administrator; the exact manifest binding is install's and the gate's). Returns the
 /// denial (18: no permission active before `at`; 19: revoked at or before `at`, with its coordinate)
-/// or None; ungoverned roots have no requirement. Local preconditions only: a canonical claim and an
-/// already-validated permission map and authority relations. It is one keyed lookup, and it is a
-/// part of the parent-admission invariant `validate_state` checks, not an assumption of it.
+/// or None. Local preconditions only: a canonical claim and an already-validated permission map and
+/// authority relations. It is one keyed lookup, and it is a part of the parent-admission invariant
+/// `validate_state` checks, not an assumption of it.
 pub(super) fn admission_permission(
 	s: &State2,
 	c: &ClaimProjection2,
 	at: u64,
 ) -> Result2<Option<(u16, Option<Log2>)>> {
-	if admin_class_of(s)? == AdminClass2::LegacyNonManifestZero {
-		return Ok(None);
-	}
+	admin_class_of(s)?;
 	let id = c.manifest.identity;
 	let key = PermissionKey2 {
 		authority: c.authority,
@@ -714,20 +710,11 @@ pub(super) fn validate_state(s: &State2) -> Result2<()> {
 	Ok(())
 }
 
-/// Immutable state marker only; full tag/manifest/pin eligibility is checked at install.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum AdminClass2 {
-	LegacyNonManifestZero,
-	One,
-	Two,
-	Three,
-}
-pub(super) fn admin_class_of(s: &State2) -> Result2<AdminClass2> {
-	match s.control_len {
-		0 => Ok(AdminClass2::LegacyNonManifestZero),
-		n if n == ADMIN_MANIFEST_BYTES2 as u64 => Ok(AdminClass2::One),
-		n if n == ADMIN_MANIFEST_P2_BYTES2 as u64 => Ok(AdminClass2::Two),
-		n if n == ADMIN_MANIFEST_P3_BYTES3 as u64 => Ok(AdminClass2::Three),
-		_ => Err(RootError2::ControlClass),
+/// Immutable state marker only: the commitment length is the profile-3 manifest's (241), else
+/// `ControlClass`. Full manifest/pin eligibility is checked at install.
+pub(super) fn admin_class_of(s: &State2) -> Result2<()> {
+	if s.control_len != ADMIN_MANIFEST_P3_BYTES3 as u64 {
+		return Err(RootError2::ControlClass);
 	}
+	Ok(())
 }

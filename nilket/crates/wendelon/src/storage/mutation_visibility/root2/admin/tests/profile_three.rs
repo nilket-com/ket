@@ -20,7 +20,6 @@ fn error(s: &str) -> AdminManifestError2 {
 		["Magic"] => Magic,
 		["UnsupportedFormat"] => UnsupportedFormat,
 		["UnsupportedProfile"] => UnsupportedProfile,
-		["ProfileLength"] => ProfileLength,
 		["ZeroField"] => ZeroField,
 		["Namespace"] => Namespace,
 		["Action", r] => ActionThree(role(r)),
@@ -91,31 +90,28 @@ fn profile_three_all_independent_refusals_and_precedence() {
 		assert_eq!(b, before);
 	}
 }
+/// Every single-bit change of a canonical manifest changes its pin, and never decodes to the same
+/// manifest (ported from the profile-1 vector test at c2).
 #[test]
-fn old_profile_decoders_do_not_accept_recovery_or_change_old_unknown_profile_errors() {
+fn every_single_bit_change_changes_the_pin_and_never_decodes_to_the_same_value() {
 	let v = vectors();
-	let b = hex(v["valid"][0]["bytes"].as_str().unwrap());
-	assert_eq!(
-		AdminManifest2::decode(&b).err(),
-		Some(AdminManifestError2::Length)
-	);
-	assert_eq!(
-		AdminManifestTwo2::decode(&b).err(),
-		Some(AdminManifestError2::Length)
-	);
-	let old3 = &b[..189];
-	assert_eq!(
-		AdminManifestTwo2::decode(old3).err(),
-		Some(AdminManifestError2::UnsupportedProfile)
-	);
-	assert_eq!(
-		manifest_profile2(old3),
-		Err(AdminManifestError2::UnsupportedProfile)
-	);
-	assert_eq!(
-		AnyAdminManifest2::decode(old3).err(),
-		Some(AdminManifestError2::ProfileLength)
-	);
+	let literal = hex(v["valid"][1]["bytes"].as_str().unwrap());
+	let original = AdminManifestThree3::decode(&literal).unwrap();
+	let pin = |b: &[u8]| {
+		crate::storage::mutation_visibility::root2::codec::hash(b"VISROOT2-ADMIN-MANIFEST\0", b)
+	};
+	let digest = pin(&literal);
+	for i in 0..literal.len() {
+		for bit in 0..8 {
+			let mut b = literal.clone();
+			b[i] ^= 1 << bit;
+			assert_ne!(pin(&b), digest);
+			if let Ok(m) = AdminManifestThree3::decode(&b) {
+				assert!(m != original, "byte {i} bit {bit}");
+				assert_eq!(m.encode().unwrap().as_slice(), b);
+			}
+		}
+	}
 }
 /// T-INLINE: the profile-3 encoder writes the base layout itself. The independent pins are
 /// unchanged, every valid vector round-trips, and the 64 refusal rows keep their errors (above).
@@ -151,10 +147,5 @@ fn profile_three_encoder_writes_the_base_layout_directly() {
 			any_manifest_digest2(&AnyAdminManifest2::Three(m.clone()).encode().unwrap()).as_slice(),
 			hex(row["pin"].as_str().unwrap())
 		);
-		// Bridge, deleted with the profile-1 codec in c2: the inline head equals the profile-1
-		// encoding of the same base with only the profile word changed.
-		let mut head = m.base().encode().unwrap();
-		head[10..12].copy_from_slice(&3u16.to_le_bytes());
-		assert_eq!(encoded[..137], head);
 	}
 }

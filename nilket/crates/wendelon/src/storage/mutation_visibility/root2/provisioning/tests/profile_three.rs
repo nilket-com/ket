@@ -114,7 +114,8 @@ fn owner_v2_creation_never_upgrades_or_replaces_entries() {
 }
 #[test]
 fn both_cross_framing_repair_paths_refuse_before_any_write() {
-	// A marked directory holding a VISIEV02 log refuses both repair paths, then refuses to open.
+	// A marked directory holding a removed-format (v1) log refuses both repair paths, then refuses
+	// to open.
 	let s = Scratch::new();
 	let mut o = OwnerDir2::create_v2(&s.0).unwrap();
 	let bytes = visiev02_bytes();
@@ -160,71 +161,9 @@ fn a_nonregular_v2_log_is_refused_at_open() {
 }
 mod p3_keys;
 mod terminal_binding;
-/// The c1 transitional refusals of profile-1/2 inputs (deleted in c2): the snapshot encoder refuses
-/// a One/Two entry with `ProfileTag`, the VISOEV02 encoder refuses a One/Two Reserve with
-/// `Payload`, and the owner core therefore refuses such a Reserve as `Codec` before any state.
-/// The profile-3 manifest is the accepted twin in each row.
-#[test]
-fn profile_one_and_two_inputs_are_refused_by_the_encoders() {
-	use crate::storage::mutation_visibility::root2::admin::manifest::AnyAdminManifest2;
-	let v = vectors();
-	for (i, profile_three) in [(0, false), (1, false), (2, true)] {
-		let manifest = AnyAdminManifest2::decode(&b(&v["manifests"][i])).unwrap();
-		let a = manifest.admission();
-		let identity = inventory::RootIdentity2 {
-			generation: a.generation,
-			cluster: a.cluster,
-			pin: [0x33; 32],
-			admin_key: a.admin_key,
-		};
-		let state = inventory::LogState2 {
-			roots: vec![inventory::RootEntry2 {
-				identity,
-				manifest: manifest.clone(),
-				state: inventory::RootState2::Prepared,
-				last_seq: 1,
-				record: None,
-				terminal: None,
-			}],
-			last_seq: 1,
-		};
-		let snapshot = snapshot::encode_snapshot2(&state);
-		let event = inventory::v2::encode_event2(&inventory::Event2 {
-			seq: 1,
-			op_id: [1; 16],
-			identity: Some(identity),
-			body: inventory::EventBody2::Reserve {
-				manifest: manifest.clone(),
-			},
-		});
-		let decision = owner_core::v2::decide2(
-			&[],
-			&op(1),
-			&owner_core::OwnerRequest2::Reserve { manifest },
-		);
-		if profile_three {
-			assert!(snapshot.is_ok());
-			assert!(event.is_ok());
-			assert!(matches!(decision, owner_core::Decision2::Append(_)));
-		} else {
-			assert_eq!(
-				snapshot.err(),
-				Some(snapshot::SnapshotError2::ProfileTag),
-				"{i}"
-			);
-			assert_eq!(
-				event.err(),
-				Some(inventory::LogError2::Corrupt {
-					seq: 1,
-					reason: inventory::CorruptReason2::Payload
-				}),
-				"{i}"
-			);
-			assert_eq!(
-				decision,
-				owner_core::Decision2::Refuse(owner_core::OwnerError2::Codec),
-				"{i}"
-			);
-		}
-	}
+/// T-O1: a removed-format (v1) log prefix; only its magic matters to the framing refusal.
+pub(super) fn visiev02_bytes() -> Vec<u8> {
+	let mut b = vec![0u8; 384];
+	b[..8].copy_from_slice(b"VISIEV02");
+	b
 }

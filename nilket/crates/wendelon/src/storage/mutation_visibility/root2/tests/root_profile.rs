@@ -100,9 +100,10 @@ fn profile3_goldens_round_trip_and_profile2_bytes_are_refused() {
 		let new = pre_twin(name);
 		assert_eq!(new.len(), old.len() + 8, "{name}");
 		assert_eq!(&new[..8], b"VISAUT04");
+		// The pre-twin VISAUT04 bytes are refused at the class since c2 (corpus N13).
 		assert_eq!(
-			UnverifiedRoot2::decode(&new).unwrap().encode().unwrap(),
-			new,
+			UnverifiedRoot2::decode(&new).err(),
+			Some(RootError2::ControlClass),
 			"{name}"
 		);
 		// Old bytes: refused by production, still genuine to the frozen oracle.

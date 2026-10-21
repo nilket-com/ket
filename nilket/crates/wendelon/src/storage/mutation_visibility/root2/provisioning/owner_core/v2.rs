@@ -58,13 +58,7 @@ fn decide(log: &[u8], op_id: &OpId2, req: &OwnerRequest2) -> Result<Decision2, O
 			.find(|r| r.identity == identity)
 			.ok_or(OwnerError2::Inconsistent)?;
 		if let OwnerRequest2::Retire { terminal, .. } = req {
-			if root.manifest.profile()
-				== super::super::super::admin::manifest::ManifestProfile2::Three
-			{
-				return retired_retry(root, terminal);
-			}
-			// Transitional: no profile-1/2 root folds from a v2 log.
-			return Err(OwnerError2::ProfileUnsupported);
+			return retired_retry(root, terminal);
 		}
 		return Ok(Decision2::Retry {
 			original: EventRef2 { op, seq: event.seq },
@@ -152,31 +146,24 @@ fn decide(log: &[u8], op_id: &OpId2, req: &OwnerRequest2) -> Result<Decision2, O
 		}
 		(OwnerRequest2::Retire { identity, terminal }, _) => {
 			let root = find_root(&state, identity)?;
-			if root.manifest.profile()
-				== super::super::super::admin::manifest::ManifestProfile2::Three
-			{
-				if root.state == RootState2::Retired {
-					return retired_retry(root, terminal);
-				}
-				let o = terminal;
-				if root.state != RootState2::Bound {
-					return Err(OwnerError2::NotBound);
-				}
-				let record = root.record.ok_or(OwnerError2::Inconsistent)?;
-				if let Some(field) = record.identity.first_mismatch(&o.identity) {
-					return Err(OwnerError2::RetirementField(field));
-				}
-				if o.original_admin_key != root.identity.admin_key {
-					return Err(OwnerError2::RetirementMismatch);
-				}
-				ordinary()?;
-				let terminal = super::super::terminal::terminal_record3(o, next)
-					.map_err(|_| OwnerError2::Codec)?;
-				(*identity, EventBody2::RetireTerminal { terminal })
-			} else {
-				// Transitional: no profile-1/2 root folds from a v2 log.
-				return Err(OwnerError2::ProfileUnsupported);
+			if root.state == RootState2::Retired {
+				return retired_retry(root, terminal);
 			}
+			let o = terminal;
+			if root.state != RootState2::Bound {
+				return Err(OwnerError2::NotBound);
+			}
+			let record = root.record.ok_or(OwnerError2::Inconsistent)?;
+			if let Some(field) = record.identity.first_mismatch(&o.identity) {
+				return Err(OwnerError2::RetirementField(field));
+			}
+			if o.original_admin_key != root.identity.admin_key {
+				return Err(OwnerError2::RetirementMismatch);
+			}
+			ordinary()?;
+			let terminal = super::super::terminal::terminal_record3(o, next)
+				.map_err(|_| OwnerError2::Codec)?;
+			(*identity, EventBody2::RetireTerminal { terminal })
 		}
 		_ => return Err(OwnerError2::Inconsistent),
 	};

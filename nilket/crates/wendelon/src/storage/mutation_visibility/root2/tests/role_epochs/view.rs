@@ -172,8 +172,7 @@ fn t_view_every_vector_checks_identically_through_the_view() {
 #[test]
 fn t_view_each_altered_field_changes_a_result() {
 	type Alter = fn(RoleView3) -> RoleView3;
-	let alterations: [(&str, Alter); 5] = [
-		("profile", |v| v.with_profile(ManifestProfile2::Two)),
+	let alterations: [(&str, Alter); 4] = [
 		("admin_key", |v| v.with_admin_key(key(0x55))),
 		("active[0]", |v| v.with_active0((0, key(0x55)))),
 		("namespace", |v| {

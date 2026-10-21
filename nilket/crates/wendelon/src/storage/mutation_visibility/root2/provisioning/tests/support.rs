@@ -21,12 +21,6 @@ pub(super) fn reseal_snapshot(mut b: Vec<u8>) -> Vec<u8> {
 	b[n..].copy_from_slice(&sum);
 	b
 }
-/// A removed-format (VISIEV02) log prefix: only its magic matters to the framing refusal.
-pub(super) fn visiev02_bytes() -> Vec<u8> {
-	let mut b = vec![0u8; 384];
-	b[..8].copy_from_slice(b"VISIEV02");
-	b
-}
 
 // ---- Profile 3 over VISOEV02 (the `p3_` keys) ----
 pub(super) fn p3_event_bytes(name: &str) -> Vec<u8> {

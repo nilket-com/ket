@@ -2,7 +2,7 @@
 """Independent 512-byte framing, snapshots and repair-v2 fixtures; source bytes only, no Rust.
 
 The mixed-profile `events`, `snapshots.three` and `repair` keys are removed at c1 (their `p3_`
-twins remain); the rest is unchanged."""
+twins remain), and `retire` and `snapshots` at c2; the rest is unchanged."""
 import hashlib,json,struct
 # Manifests "a" (profile 1), "b" (profile 2) and the first profile-3 manifest, inlined.
 M=[bytes.fromhex(h) for h in [
@@ -40,4 +40,4 @@ p3_prefix=b''.join(p3_events);p3_boundary=len(p3_prefix);p3_original=p3_boundary
 p3_context=sha(b'VISROOT2-REPAIR-CONTEXT-V2\0'+sha(p3_prefix)+struct.pack('<QQ',p3_boundary,p3_original)+sha(tail));p3_op=sha(b'VISROOT2-REPAIR-OP-V2\0'+p3_context)[:16]
 p3_evidence=b'VISREP04'+struct.pack('<HH',1,2)+sha(p3_prefix)+struct.pack('<QQI',p3_boundary,p3_original,len(tail))+bytes(4)+sha(tail)+p3_op+struct.pack('<Q',3)+tail;p3_evidence+=sha(p3_evidence)
 marker=b'VISOWN02'+struct.pack('<HHI',2,512,0);marker+=sha(marker)
-print(json.dumps({'marker':marker.hex(),'generator':'profile_three_reference.py','manifests':[m.hex()for m in M],'retire':event(4,7,identity(M[2]),b'').hex(),'snapshots':{'one':snapshot(M[:1],1).hex(),'two':snapshot(M[:2],2).hex(),'retired':snapshot(M,3,True).hex()},'p3_events':[e.hex()for e in p3_events],'p3_three':p3_three.hex(),'p3_repair':{'tail':tail.hex(),'name':p3_context.hex()+'.rep','context':p3_context.hex(),'bytes':p3_evidence.hex()}},indent=2))
+print(json.dumps({'marker':marker.hex(),'generator':'profile_three_reference.py','manifests':[m.hex()for m in M],'p3_events':[e.hex()for e in p3_events],'p3_three':p3_three.hex(),'p3_repair':{'tail':tail.hex(),'name':p3_context.hex()+'.rep','context':p3_context.hex(),'bytes':p3_evidence.hex()}},indent=2))

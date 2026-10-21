@@ -73,7 +73,7 @@ fn independent_wrapper_goldens_round_trip_and_constructed_states_match() {
 		("empty", 0),
 		("genesis_only", 1),
 		("pre_root", 1),
-		("root", 2),
+		("p3_root", 2),
 	] {
 		let b = bytes(name);
 		let u = UnverifiedAuthority2::decode(&b).unwrap();
@@ -356,7 +356,7 @@ fn wrapper_negatives() {
 	let reseal = |body: &[u8]| envelope(b"VISMAS02", body, 1 << 28).unwrap();
 	let body = |name: &str| bytes(name)[16..bytes(name).len() - 32].to_vec();
 	let pre = body("pre_root");
-	let root = body("root");
+	let root = body("p3_root");
 	let refuse = |b: &[u8]| UnverifiedAuthority2::decode(b).err().expect("refused");
 	// Unknown tag, trailing byte, short PreRoot.
 	assert_eq!(refuse(&reseal(&[3])), RootError2::Codec);

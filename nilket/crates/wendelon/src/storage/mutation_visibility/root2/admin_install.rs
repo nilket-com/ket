@@ -6,8 +6,8 @@
 //! authorizes anything in another root.
 use super::admin::errors::BootstrapRecordError2;
 use super::admin::manifest::{
-	ADMIN_MANIFEST_BYTES2, ADMIN_MANIFEST_P2_BYTES2, ADMIN_MANIFEST_P3_BYTES3, AdminNamespace2,
-	AnyAdminManifest2, GovernanceRole2, ManifestProfile2, RecoveryRole3,
+	ADMIN_MANIFEST_P3_BYTES3, AdminNamespace2, AnyAdminManifest2, GovernanceRole2,
+	ManifestProfile2, RecoveryRole3,
 };
 use super::admin::record::{BootstrapIdentity2, BootstrapObservation2};
 use super::origin::{MutationAuthorityState2, root_and_origin2};
@@ -95,7 +95,7 @@ pub(in crate::storage::mutation_visibility::root2) fn install_admin2(
 	if s.control_digest != pin {
 		return Err(InstallError2::Commitment(CommitmentField2::ControlDigest));
 	}
-	// Exactly the tuple manifest's canonical length; membership in {137, 189} is not enough.
+	// Exactly the tuple manifest's canonical length (241), against the root's commitment.
 	if s.control_len != tuple_manifest_len2(tuple) {
 		return Err(InstallError2::Commitment(CommitmentField2::ControlLength));
 	}
@@ -130,17 +130,13 @@ pub(in crate::storage::mutation_visibility::root2) fn install_admin2(
 	}
 	let any = tuple_manifest2(tuple);
 	let manifest = any.admission();
-	let governance = match any {
-		AnyAdminManifest2::One(_) => None,
-		AnyAdminManifest2::Two(m) => Some(m.governance()),
-		AnyAdminManifest2::Three(m) => Some(m.governance()),
-	};
-	let original = match any {
-		AnyAdminManifest2::Three(m) => {
-			Some([manifest.admin_key, m.governance().key(), m.recovery().key()])
-		}
-		_ => None,
-	};
+	let AnyAdminManifest2::Three(three) = any;
+	let governance = Some(three.governance());
+	let original = Some([
+		manifest.admin_key,
+		three.governance().key(),
+		three.recovery().key(),
+	]);
 	if let Some(epochs) = &s.role_epochs {
 		if Some(epochs.original) != original {
 			return Err(InstallError2::EpochState);
@@ -171,10 +167,7 @@ pub(in crate::storage::mutation_visibility::root2) fn install_admin2(
 		namespace: manifest.namespace,
 		governance,
 		profile: any.profile(),
-		recovery: match any {
-			AnyAdminManifest2::Three(m) => Some(m.recovery()),
-			_ => None,
-		},
+		recovery: Some(three.recovery()),
 	})
 }
 pub(in crate::storage::mutation_visibility::root2) fn admin_context2(
@@ -198,7 +191,7 @@ pub(in crate::storage::mutation_visibility::root2) fn admin_installed_at2(
 ) -> Log2 {
 	a.context.installed_at
 }
-/// The copied descriptive governance role of a profile-2 administrator; never a verifier.
+/// The copied descriptive governance role of the administrator's manifest; never a verifier.
 pub(in crate::storage::mutation_visibility::root2) fn admin_governance2(
 	a: &InstalledAdmin2,
 ) -> Option<GovernanceRole2> {
@@ -214,8 +207,6 @@ pub(in crate::storage::mutation_visibility::root2) fn admin_manifest_len2(
 	a: &InstalledAdmin2,
 ) -> u64 {
 	match a.profile {
-		ManifestProfile2::One => ADMIN_MANIFEST_BYTES2 as u64,
-		ManifestProfile2::Two => ADMIN_MANIFEST_P2_BYTES2 as u64,
 		ManifestProfile2::Three => ADMIN_MANIFEST_P3_BYTES3 as u64,
 	}
 }
@@ -231,11 +222,8 @@ pub(in crate::storage::mutation_visibility::root2) fn observe_bootstrap2(
 		return Err(ObserveError2::PrerequisiteUnavailable);
 	};
 	let s = &root.state;
-	// State-only and descriptive: either canonical length; the exact match is install's and C's.
-	if s.control_len != ADMIN_MANIFEST_BYTES2 as u64
-		&& s.control_len != ADMIN_MANIFEST_P2_BYTES2 as u64
-		&& s.control_len != ADMIN_MANIFEST_P3_BYTES3 as u64
-	{
+	// State-only and descriptive: the one canonical length; the exact match is install's and C's.
+	if s.control_len != ADMIN_MANIFEST_P3_BYTES3 as u64 {
 		return Err(ObserveError2::ControlLength);
 	}
 	let observation = BootstrapObservation2 {
@@ -300,7 +288,7 @@ pub(in crate::storage::mutation_visibility::root2) fn confirm_terminal2(
 	if s.control_digest != pin {
 		return Err(InstallError2::Commitment(CommitmentField2::ControlDigest));
 	}
-	// Exactly the tuple manifest's canonical length; membership in {137, 189} is not enough.
+	// Exactly the tuple manifest's canonical length (241), against the root's commitment.
 	if s.control_len != tuple_manifest_len2(tuple) {
 		return Err(InstallError2::Commitment(CommitmentField2::ControlLength));
 	}
@@ -334,9 +322,7 @@ pub(in crate::storage::mutation_visibility::root2) fn confirm_terminal2(
 		}
 	}
 	let any = tuple_manifest2(tuple);
-	let AnyAdminManifest2::Three(manifest) = any else {
-		return Err(InstallError2::EpochState);
-	};
+	let AnyAdminManifest2::Three(manifest) = any;
 	let original = [
 		any.admission().admin_key,
 		manifest.governance().key(),

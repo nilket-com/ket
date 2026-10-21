@@ -108,7 +108,7 @@ fn exact_snapshot_preserves_multi_fault_refusal_precedence() {
 			}
 			_ => {
 				s.command_digest = [0; 32];
-				s.control_len = 0;
+				s.control_len = 240;
 				s.cluster = [0; 16];
 			}
 		}

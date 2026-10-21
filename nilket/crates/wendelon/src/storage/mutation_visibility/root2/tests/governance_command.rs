@@ -2,9 +2,6 @@
 //! no production authority construction.
 use super::profile_three_fixture::{M3_PRIMARY, PRIMARY_SEEDS, chain_of};
 use super::*;
-use crate::storage::mutation_visibility::root2::admin_command::{
-	EnvelopeError2, admin_command_preimage2, check_admin_command2, encode_admin_command2,
-};
 use crate::storage::mutation_visibility::root2::admin_install::*;
 use crate::storage::mutation_visibility::root2::governance_command::*;
 use ed25519_dalek::Signer;
@@ -250,18 +247,17 @@ fn encode_refuses_invalid_context() {
 	);
 }
 #[test]
-fn purpose_separation_reaches_signature_and_preserves_admin_checker() {
+fn purpose_separation_reaches_signature() {
 	let body = valid();
-	let mut adc = encode_admin_command2(&context(), d1(), &[0; 64]).unwrap();
-	let preimage = admin_command_preimage2(&adc).unwrap();
-	adc[232..].copy_from_slice(
-		&ed25519_dalek::SigningKey::from_bytes(&ADMIN_SEED)
-			.sign(&preimage)
-			.to_bytes(),
+	// The administrator key over the administrator-command domain (the removed VISADC01 form's
+	// signature, now carried in a VISADG01 body) is not a governance signature.
+	assert_eq!(
+		check(
+			&signed_with(&body, ADMIN_SEED, b"VISROOT2-ADMIN-COMMAND\0"),
+			d1()
+		),
+		Err(GovernanceCommandError2::Signature)
 	);
-	assert!(check_admin_command2(&admin(), &adc, d1()).is_ok());
-	adc[..8].copy_from_slice(b"VISADG01");
-	assert_eq!(check(&adc, d1()), Err(GovernanceCommandError2::Signature));
 	assert_eq!(
 		check(&signed_with(&body, SEED, b"VISROOT2-ADMIN-COMMAND\0"), d1()),
 		Err(GovernanceCommandError2::Signature)
@@ -272,10 +268,6 @@ fn purpose_separation_reaches_signature_and_preserves_admin_checker() {
 			d1()
 		),
 		Err(GovernanceCommandError2::Signature)
-	);
-	assert_eq!(
-		check_admin_command2(&admin(), &body, d1()).err(),
-		Some(EnvelopeError2::Magic)
 	);
 }
 #[test]

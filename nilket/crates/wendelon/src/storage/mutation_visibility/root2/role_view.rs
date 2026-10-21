@@ -123,10 +123,6 @@ impl RoleView3 {
 // action-mask refusal a profile-3 manifest cannot express; never reachable through the facade.
 #[cfg(test)]
 impl RoleView3 {
-	pub(super) fn with_profile(mut self, profile: ManifestProfile2) -> Self {
-		self.profile = profile;
-		self
-	}
 	pub(super) fn with_admin_key(mut self, key: [u8; 32]) -> Self {
 		self.admin_key = key;
 		self

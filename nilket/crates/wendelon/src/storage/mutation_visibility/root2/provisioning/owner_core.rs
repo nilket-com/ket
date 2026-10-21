@@ -68,7 +68,6 @@ pub(in crate::storage::mutation_visibility::root2) struct EventRef2 {
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::storage::mutation_visibility::root2) enum OwnerError2 {
-	ProfileUnsupported,
 	RetirementMismatch,
 	RetirementField(super::super::admin::record::BootstrapField2),
 	NotBound,

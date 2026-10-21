@@ -1,7 +1,6 @@
 //! Owner directories are format 2 only (D-O1): an unmarked directory is refused as
 //! `Unformatted` and never upgraded. Every other owner-log row runs on a marked directory in
 //! `owner_log_three.rs`.
-use super::*;
 use crate::storage::mutation_visibility::root2::provisioning::owner_log::*;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -66,7 +65,7 @@ fn an_unmarked_directory_is_unformatted_and_never_written() {
 	visoev02[..8].copy_from_slice(b"VISOEV02");
 	for log in [
 		None,
-		Some(visiev02_bytes()),
+		Some(super::profile_three::visiev02_bytes()),
 		Some(Vec::new()),
 		Some(visoev02),
 	] {

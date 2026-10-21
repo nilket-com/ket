@@ -60,20 +60,12 @@ fn v5_empty_extension_is_noncanonical() {
 	);
 }
 #[test]
-fn v5_profile_one_two_extensions_refused() {
-	for len in [137u64, 189] {
-		let mut b = bytes(&vectors()["state_v5"]);
-		b[16 + 176..16 + 184].copy_from_slice(&len.to_le_bytes());
-		assert!(super::super::super::UnverifiedRoot2::decode(&reseal(b)).is_err());
-	}
-}
-#[test]
 fn v5_non_profile_three_lengths_refused() {
 	use crate::storage::mutation_visibility::root2::{UnverifiedRoot2, role_epochs};
-	// Decoded: length 0 passes the class check and reaches the role-epoch gate; 240 and 242 are
-	// refused by the class check first.
+	// Decoded: every non-241 length is refused by the class check first (0 is no class since c2);
+	// the role-epoch gate is reached directly below.
 	for (len, want) in [
-		(0u64, RootError2::RootInvariant),
+		(0u64, RootError2::ControlClass),
 		(240, RootError2::ControlClass),
 		(242, RootError2::ControlClass),
 	] {

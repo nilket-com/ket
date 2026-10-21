@@ -1,7 +1,7 @@
 //! The removed-forms corpus (`removed_forms.json`): the exact bytes of every admin form the
 //! profile-3-only slice removes, each with its recorded outcome. The plan pins the file's digest.
-//! N4-N12 (c1) are refused at their exact typed error and step, each against an accepted twin;
-//! N1-N3 and N13-N15 still behave as recorded until c2 flips them.
+//! Every entry is refused at its exact typed error and step, each against an accepted twin: N4-N12
+//! since c1, N1-N3 and N13-N15 since c2.
 use super::*;
 use crate::storage::mutation_visibility::root2::admin::errors::AdminManifestError2;
 use crate::storage::mutation_visibility::root2::admin::manifest::{
@@ -25,8 +25,10 @@ use crate::storage::mutation_visibility::root2::provisioning::snapshot::{
 	SnapshotError2, decode_snapshot2,
 };
 use crate::storage::mutation_visibility::root2::tests::profile_three_fixture::{
-	M3_PRIMARY, chain_of,
+	M3_PRIMARY, chain_of, pre_root,
 };
+use crate::storage::mutation_visibility::root2::trust::CommittedEntry2;
+use crate::storage::mutation_visibility::root2::verification::{VerifyError2, advance_verified2};
 use serde_json::Value;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -107,26 +109,34 @@ fn corpus_is_pinned_complete_and_self_consistent() {
 }
 
 #[test]
-fn removed_manifests_decode_today() {
+fn removed_manifests_are_refused_against_twins() {
 	let all = entries();
-	let n1 = one(&all, "N1");
-	assert_eq!(n1.len(), 137);
-	assert!(matches!(
-		AnyAdminManifest2::decode(&n1),
-		Ok(AnyAdminManifest2::One(_))
-	));
-	let n2 = one(&all, "N2");
-	assert_eq!(n2.len(), 189);
-	assert!(matches!(
-		AnyAdminManifest2::decode(&n2),
-		Ok(AnyAdminManifest2::Two(_))
-	));
+	// N1 (137 bytes) and N2 (189 bytes) are refused at the length, before any header access.
+	for id in ["N1", "N2"] {
+		assert_eq!(
+			AnyAdminManifest2::decode(&one(&all, id)).err(),
+			Some(AdminManifestError2::Length),
+			"{id}"
+		);
+	}
+	assert!(AnyAdminManifest2::decode(&M3_PRIMARY).is_ok());
+	// N3 (241 bytes, profile word 2) and its profile-1 relabel are refused at the profile; the
+	// profile-3 relabel is the accepted twin.
 	let n3 = one(&all, "N3");
-	assert_eq!(n3.len(), 241);
-	assert_eq!(
-		AdminManifestThree3::decode(&n3).err(),
-		Some(AdminManifestError2::ProfileLength)
-	);
+	assert_eq!(&n3[10..12], &2u16.to_le_bytes());
+	let with_word = |w: u16| {
+		let mut b = n3.clone();
+		b[10..12].copy_from_slice(&w.to_le_bytes());
+		b
+	};
+	for word in [1u16, 2] {
+		assert_eq!(
+			AdminManifestThree3::decode(&with_word(word)).err(),
+			Some(AdminManifestError2::UnsupportedProfile),
+			"{word}"
+		);
+	}
+	assert!(AdminManifestThree3::decode(&with_word(3)).is_ok());
 }
 
 // ---- c1: N4-N12 refused, each at its typed error and step, against an accepted twin ----
@@ -367,42 +377,122 @@ fn reseal_event(mut b: Vec<u8>) -> Vec<u8> {
 }
 
 #[test]
-fn removed_roots_and_bootstraps_are_accepted_today() {
+fn removed_roots_and_bootstraps_are_refused_against_twins() {
 	let all = entries();
+	// N13: a root committed to length 0 or 137 passes the checksum and is refused at the class
+	// (Derived2::build); so is the same root relabelled to the other removed length. The twins are
+	// the same-named S1 goldens and the profile-3 post-grant root.
+	let gate: Value = serde_json::from_str(include_str!("gate_vectors.json")).unwrap();
 	for e in of(&all, "N13") {
 		let b = bytes(e);
-		assert!(UnverifiedRoot2::decode(&b).is_ok(), "{}", e["part"]);
+		let part = e["part"].as_str().unwrap();
+		let length = e["control_len"].as_u64().unwrap();
+		assert_eq!(u64::from_le_bytes(b[192..200].try_into().unwrap()), length);
 		assert_eq!(
-			u64::from_le_bytes(b[192..200].try_into().unwrap()),
-			e["control_len"].as_u64().unwrap()
+			UnverifiedRoot2::decode(&b).err(),
+			Some(RootError2::ControlClass),
+			"{part}"
 		);
+		let other = if length == 0 { 189u64 } else { 0 };
+		let mut relabelled = b.clone();
+		relabelled[192..200].copy_from_slice(&other.to_le_bytes());
+		let end = relabelled.len() - 32;
+		let sum = hash(b"", &relabelled[..end]);
+		relabelled[end..].copy_from_slice(&sum);
+		assert_eq!(
+			UnverifiedRoot2::decode(&relabelled).err(),
+			Some(RootError2::ControlClass),
+			"{part} relabelled"
+		);
+		let twin = if part == "post_grant_root" {
+			unhex(gate["p3_post_grant_root"]["hex"].as_str().unwrap())
+		} else {
+			fixture(part)
+		};
+		assert_eq!(u64::from_le_bytes(twin[192..200].try_into().unwrap()), 241);
+		assert!(UnverifiedRoot2::decode(&twin).is_ok(), "{part} twin");
 	}
+	// N14: a Bootstrap of length 0, 137 or 189 is refused at the class with the test token, and
+	// against an M3_PRIMARY tuple in production; length 241 is the accepted twin.
+	let chain = chain_of(&M3_PRIMARY, 241);
+	let Command2::Bootstrap { epoch, control, .. } = chain.cmd.clone() else {
+		unreachable!()
+	};
+	let (g, c, _, _, _) = chain.entry.fields();
 	for e in of(&all, "N14") {
-		let (g, c, cmd) = Command2::decode(&bytes(e)).unwrap();
+		let (eg, ec, cmd) = Command2::decode(&bytes(e)).unwrap();
 		let length = e["length"].as_u64().unwrap();
 		assert!(matches!(cmd, Command2::Bootstrap { length: n, .. } if n == length));
-		let entry = TrustedEntry2::fixture(g, c, l(1), &cmd).unwrap();
-		let verified = VerifiedCommand2::fixture(g, c, &cmd, &[], 0).unwrap();
-		let (root, result) = Root2::reduce(None, &entry, &verified, &cmd).unwrap();
-		assert_eq!(result, ApplyResult2::Registered(l(1)));
-		assert_eq!(root.state.control_len, length);
+		let entry = TrustedEntry2::fixture(eg, ec, l(1), &cmd).unwrap();
+		let verified = VerifiedCommand2::fixture(eg, ec, &cmd, &[], 0).unwrap();
+		assert_eq!(
+			Root2::reduce(None, &entry, &verified, &cmd).err(),
+			Some(RootError2::ControlClass),
+			"{length}"
+		);
+		let wrong = Command2::Bootstrap {
+			epoch,
+			control,
+			length,
+		};
+		let (e2, committed) = bootstrap_entry(g, c, &wrong);
+		assert_eq!(
+			advance_verified2(&pre_root(), &chain.tuple, &committed, &e2, &wrong, None).err(),
+			Some(VerifyError2::Consumer(RootError2::TrustMismatch)),
+			"{length}"
+		);
 	}
-	// N15: the compromise audit refuses N1 as a trust input before reading the data directory.
+	let (e2, committed) = bootstrap_entry(g, c, &chain.cmd);
+	assert!(
+		advance_verified2(&pre_root(), &chain.tuple, &committed, &e2, &chain.cmd, None).is_ok()
+	);
+	// N15: the compromise audit refuses N1 as a trust input before reading the data directory, at
+	// the decode; the twin M3_PRIMARY passes that step (and stops at the missing directory).
 	let missing = std::env::temp_dir().join("removed-forms-no-data-dir");
 	let runtime = tokio::runtime::Builder::new_current_thread()
 		.build()
 		.unwrap();
-	let (stdout, export, diagnostic, code) = runtime.block_on(compromise_audit2(
-		&missing,
-		&one(&all, "N15"),
-		&[(1, 0)],
-		None,
-		false,
-		None,
-	));
+	let audit = |manifest: &[u8]| {
+		runtime.block_on(compromise_audit2(
+			&missing,
+			manifest,
+			&[(1, 0)],
+			None,
+			false,
+			None,
+		))
+	};
+	let (stdout, export, diagnostic, code) = audit(&one(&all, "N15"));
 	assert_eq!((stdout.as_str(), export, code), ("", None, 2));
 	assert_eq!(
 		diagnostic.as_deref(),
-		Some("trusted manifest refused: the trusted manifest is not a profile-3 manifest")
+		Some(
+			"trusted manifest refused: the trusted manifest does not decode as an administrator manifest"
+		)
 	);
+	let (_, _, diagnostic, _) = audit(&M3_PRIMARY);
+	assert!(
+		!diagnostic
+			.as_deref()
+			.unwrap_or("")
+			.starts_with("trusted manifest refused"),
+		"{diagnostic:?}"
+	);
+}
+/// The committed and trusted entries of a Bootstrap at (1, 1, 2), through the fixtures.
+fn bootstrap_entry(g: [u8; 16], c: [u8; 16], cmd: &Command2) -> (TrustedEntry2, CommittedEntry2) {
+	use crate::storage::mutation_visibility::root2::entry_identity::EntryPosition2;
+	use crate::storage::mutation_visibility::root2::origin::EntryClass2;
+	let e = TrustedEntry2::fixture(g, c, l(2), cmd).unwrap();
+	let (_, _, _, fp, d) = e.fields();
+	let committed = CommittedEntry2::fixture(
+		EntryPosition2 {
+			term: 1,
+			node: 1,
+			index: 2,
+		},
+		fp,
+		EntryClass2::Bootstrap(d),
+	);
+	(e, committed)
 }
