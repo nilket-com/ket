@@ -26,15 +26,15 @@ final defaults) and four runs of each integration binary. A third, earlier lib r
 
 | ID | Test | Rate | Symptom | Hypothesis (unverified) | Status |
 |---|---|---|---|---|---|
-| PD-01 | `storage::maintenance_policy::tests::three_deterministic_failures_quarantine_and_only_requeue_clears_it` | 2/2 | metric delta 6 or 9, expected 3 | asserts a delta on a process-global counter that concurrent tests also increment | open |
-| PD-02 | `storage::manager::tests::a_compaction_tick_is_policed_and_its_success_is_recorded` | 2/2 | metric delta 3 or 6, expected 1 | same as PD-01 | open |
-| PD-03 | `network::data_server::tests::table_write_seals_secondary_index_active_buffer_after_slab_rotation` | 2/2 | `[SlabId(0), SlabId(1)]`, expected `[SlabId(0)]` | none yet | open |
-| PD-04 | `consensus::raft_storage::recovery_tests::checkpoint_coordinator_flushes_on_timer` | 1/2 | checkpoint `None` after the timer | timer deadline under CPU contention | open |
-| PD-05 | `storage::manager::tests::append_durable_coalesces_concurrent_fdatasyncs` | 1/2 | 2 fdatasyncs, expected 1 | the 20 ms group-commit window misses the second append under contention | open |
-| PD-06 | `network::data_server::tests::no_match_full_scan_progresses_per_examined_location` | 1/2 | `ReadStatus(17)`, expected `ReadStatus(1)` | none yet | open |
-| PD-07 | `storage::mutation_visibility::root2::provisioning::tests::owner_log::a_forked_child_cannot_extend_a_dropped_owner_lock` | 1/2 | fork fails with `ENOMEM` | unverified; two competing hypotheses: (a) stack address space reserved by many test threads under heuristic overcommit; (b) a memory-cgroup charge failure at fork (the unit's MemoryMax/MemoryHigh, or the shared slice), which the kernel reports as ENOMEM | open |
-| PD-08 | `network::data_server::tests::table_write_populates_building_secondary_index_active_buffer` | 1/2 | `NotFound` on a file | none yet | open |
-| PD-09 | `network::control_server::tests::maintenance_control_is_node_local_authenticated_and_durable_across_reopen` | 1/2 | `DataDirectoryBusy` on reopen | a forking lib test's child briefly holding the inherited flock (the F-OWN-1 fork window); needs a control | open |
+| PD-01 | `storage::maintenance_policy::tests::three_deterministic_failures_quarantine_and_only_requeue_clears_it` | 2/2 | metric delta 6 or 9, expected 3 | asserts a delta on a process-global counter that concurrent tests also increment | `233760152`: implemented; exact focused receipt below; loaded/final adoption pending |
+| PD-02 | `storage::manager::tests::a_compaction_tick_is_policed_and_its_success_is_recorded` | 2/2 | metric delta 3 or 6, expected 1 | same as PD-01 | `233760152`: implemented; exact focused receipt below; loaded/final adoption pending |
+| PD-03 | `network::data_server::tests::table_write_seals_secondary_index_active_buffer_after_slab_rotation` | 2/2 | `[SlabId(0), SlabId(1)]`, expected `[SlabId(0)]` | none yet | `611dede80`: implemented; exact focused receipt below; loaded/final adoption pending |
+| PD-04 | `consensus::raft_storage::recovery_tests::checkpoint_coordinator_flushes_on_timer` | 1/2 | checkpoint `None` after the timer | timer deadline under CPU contention | `7c7686ffa`: implemented; exact focused receipt below; loaded/final adoption pending |
+| PD-05 | `storage::manager::tests::append_durable_coalesces_concurrent_fdatasyncs` | 1/2 | 2 fdatasyncs, expected 1 | the 20 ms group-commit window misses the second append under contention | `4b1866b23`: implemented; exact focused receipt below; loaded/final adoption pending |
+| PD-06 | `network::data_server::tests::no_match_full_scan_progresses_per_examined_location` | 1/2 | `ReadStatus(17)`, expected `ReadStatus(1)` | none yet | `ab32e6e91`: implemented; exact focused receipt below; loaded/final adoption pending |
+| PD-07 | `storage::mutation_visibility::root2::provisioning::tests::owner_log::a_forked_child_cannot_extend_a_dropped_owner_lock` | 1/2 | fork fails with `ENOMEM` | unverified; two competing hypotheses: (a) stack address space reserved by many test threads under heuristic overcommit; (b) a memory-cgroup charge failure at fork (the unit's MemoryMax/MemoryHigh, or the shared slice), which the kernel reports as ENOMEM | `d048ba810`: implemented; exact focused receipt below; loaded/final adoption pending |
+| PD-08 | `network::data_server::tests::table_write_populates_building_secondary_index_active_buffer` | 1/2 | `NotFound` on a file | none yet | `611dede80` + `df86421f6`: implemented; exact focused receipt below; loaded/final adoption pending |
+| PD-09 | `network::control_server::tests::maintenance_control_is_node_local_authenticated_and_durable_across_reopen` | 1/2 | `DataDirectoryBusy` on reopen | a forking lib test's child briefly holding the inherited flock (the F-OWN-1 fork window); needs a control | `0453d30e8`: implemented; exact focused receipt below; loaded/final adoption pending |
 | PD-10 | `stream_finalization` (`stream_finalization_replays_after_floor_and_stays_ordered_under_write_load`) | 4/4 before oracle repair | replayed sequence differs | write-only expected list omitted other valid Finalize entries; historical unexpected entry identities not recovered | `dd936a775`: full committed-prefix oracle plus real heartbeat controls; focused stress passed, final candidate gate pending |
 | PD-11 | `multinode_bootstrap` (binary) | 4/4 before scoped repair | join rejection, epoch wait timeout, or SIGABRT without result | completed self-JOIN retry after leader handoff reproduced separately | `e0edea2a0`: guarded completed-state replay; focused stress passed; incomplete epoch, replacement timeout and abort remain separate/open |
 | PD-12 | `chaos::chaos_smoke_catalog` | 2/4 before fix | timed out waiting for leader 1 (current leader 2) | fixture assumed founding-node leadership | `e508e8a4d`: elected-leader fixture; focused stress passed, final candidate gate pending |
@@ -271,3 +271,27 @@ unproven followup: retained idle entries are plausible, while duplicate
 admission or wrong counter values have not been established. Its audit and
 proposed deterministic control are recorded in
 `reviews/readiness-counter-replica-gate-source-audit-20261021.json`.
+
+PD-01–09 focused reconciliation (2026-10-21): all implementing commits above
+are ancestors of the signed integration stack, and all nine candidate test
+bodies plus the five inspected mechanism helpers match their fix postimages.
+The exact nine original candidates passed a firstpass at eight threads, 30
+nextest repetitions (270 executions), and 10 in-process repetitions at explicit
+1024 threads (90 executions). Frozen metadata reused the existing executable;
+no build, source edit or retry was needed. Receipts:
+`reviews/readiness-pd01-09-focused-20261021/summary.json`; implementation and
+remaining-prerequisite matrix:
+`reviews/readiness-pd01-09-reconcile-20261021.json`. No extra background suite
+load was present, so these receipts do not replace loaded closure or final v5
+acceptance. Original table hypotheses remain historical where later source
+notes above refute or narrow them.
+
+Read-stall diagnostic (2026-10-21): the exact row-limit, whole-record cancelled
+consumer and typed midstream-error tests passed 18 baseline executions and 39
+executions under a recorded background nextest run of the remaining Wendelon
+library. Source and executable hashes stayed fixed. The background was
+intentionally terminated after foreground completion; it is not a full-suite
+pass. Receipt: `reviews/readiness-read-stall-execution-r2-20261021/summary.json`.
+This lower-width process load does not recreate the old wide in-process hunt
+or establish why the historical failures disappeared. No stall budget or
+production timeout was changed.
