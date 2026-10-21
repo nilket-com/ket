@@ -165,7 +165,7 @@ fn s1_caller_or_envelope_conflict_and_unauthorized_apply_are_atomic() {
 	let r = root("root_reserved");
 	let c = finalized(&r);
 	let (g, cl) = (r.state.generation, r.state.cluster);
-	let e = TrustedEntry2::fixture(g, cl, l(6), &c).unwrap();
+	let e = TrustedEntry2::fixture(g, cl, l(7), &c).unwrap();
 	let v = VerifiedCommand2::fixture(g, cl, &c, &[], 1)
 		.unwrap()
 		.unauthorized();
@@ -173,5 +173,8 @@ fn s1_caller_or_envelope_conflict_and_unauthorized_apply_are_atomic() {
 	assert_denied(&o, 8);
 	assert_eq!(n.usage().unwrap(), r.usage().unwrap());
 	let v = VerifiedCommand2::fixture(g, cl, &command("command_cover_blank"), &[], 1).unwrap();
-	assert!(super::s1c::checked_step(&r, &e, &v, &c).is_err());
+	assert_eq!(
+		super::s1c::checked_step(&r, &e, &v, &c).err(),
+		Some(RootError2::TrustMismatch)
+	);
 }

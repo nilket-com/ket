@@ -45,6 +45,7 @@ use support::*;
 
 mod r0_assay;
 
+mod s1_family;
 mod s1c;
 mod s1c_oracle;
 

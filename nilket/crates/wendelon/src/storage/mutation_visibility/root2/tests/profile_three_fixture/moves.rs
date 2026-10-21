@@ -156,19 +156,61 @@ fn support_roots_are_unchanged_by_the_move() {
 	}
 }
 
-/// T-MOVE (vi): every frozen S1 literal equals its `goldens.json` entry today.
+/// T-MOVE (vi), re-targeted at b3, which replaces the live S1 parent-lineage goldens with their
+/// profile-3 twins. The frozen entries outside the parent lineage still equal their goldens. The
+/// three frozen parent-lineage entries are the pre-twin bytes: the claim is the one the pre-twin
+/// `root_reserved` (corpus N13) holds, and each twin is its frozen entry under the D-G1 rule (every
+/// `Log2` index >= 4 moved by one, with the grant reference and claim digest recomputed).
 #[test]
-fn frozen_s1_bytes_equal_the_goldens_today() {
-	for name in [
-		"claim_projection2",
-		"command_bootstrap",
-		"command_cover_blank",
-		"command_reserve",
-		"command_finalize",
-	] {
+fn frozen_s1_bytes_are_the_pre_twin_goldens() {
+	for name in ["command_bootstrap", "command_cover_blank"] {
 		assert_eq!(s1_frozen(name), support::fixture(name), "{name}");
 	}
-	assert!(s1_claim() == support::claim());
+	let corpus: serde_json::Value =
+		serde_json::from_str(include_str!("../removed_forms.json")).unwrap();
+	let pre_twin = corpus["entries"]
+		.as_array()
+		.unwrap()
+		.iter()
+		.find(|e| e["id"] == "N13" && e["part"] == "root_reserved")
+		.unwrap();
+	let bytes = unhex(pre_twin["hex"].as_str().unwrap());
+	let old = UnverifiedRoot2::decode(&bytes).unwrap();
+	let (g, c, l, fp) = old.fixture_fields();
+	let old = old
+		.fixture_install(g, c, l, fp, hash(&bytes))
+		.unwrap()
+		.lookup(&s1_claim().manifest.identity)
+		.unwrap()
+		.unwrap();
+	assert!(old.claim == s1_claim());
+	assert!(Command2::Reserve(s1_claim()).encode(g, c).unwrap() == s1_frozen("command_reserve"));
+	// The twins.
+	let mut claim = s1_claim();
+	claim.original.log.index += 1;
+	assert!(claim == support::claim());
+	assert!(Command2::Reserve(claim.clone()) == support::command("command_reserve"));
+	let Command2::Finalize {
+		identity,
+		reservation,
+		mut attestation,
+		..
+	} = s1_command("command_finalize")
+	else {
+		panic!("frozen command_finalize is a Finalize")
+	};
+	assert_eq!(reservation, old.reservation);
+	attestation.reservation.index += 1;
+	attestation.grant = claim.original.reference().unwrap();
+	attestation.claim_digest = claim.digest().unwrap();
+	assert!(
+		Command2::Finalize {
+			identity,
+			digest: claim.digest().unwrap(),
+			reservation: attestation.reservation,
+			attestation,
+		} == support::command("command_finalize")
+	);
 }
 
 /// T-INLINE: the tuple's manifest digest (the inline 241-byte arm) equals the shared digest of the

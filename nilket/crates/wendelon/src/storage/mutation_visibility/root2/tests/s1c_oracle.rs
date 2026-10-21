@@ -71,6 +71,37 @@ pub(super) fn legacy_profile2(
 		ROOT_BYTES2,
 	)
 }
+/// D-G2, test-only: the S1c comparison projection of a profile-3 root. The frozen oracle has no
+/// permission section, so the section and its registry charge (117 bytes per record) are stripped;
+/// `control_len` passes through as an opaque scalar. The rest is the strict `legacy_profile2`.
+/// Callers compare only steps with no `Denied(18)` or `Denied(19)`, the two permission refusals.
+pub(super) fn s1c_projection(
+	bytes: &[u8],
+) -> crate::storage::mutation_visibility::root2::Result2<Vec<u8>> {
+	use crate::storage::mutation_visibility::root2::types::{ROOT_BYTES2, RootError2};
+	let body = codec::open_versioned(bytes, b"VISAUT04", 4, ROOT_BYTES2)?;
+	let at = registry_extension_at(body)?;
+	let mut r = codec::Read2::new(&body[at..]);
+	let issuers = r.take(4)?;
+	let n = r.count(4096, 117)?;
+	for _ in 0..n {
+		if r.blob(113)?.len() != 113 {
+			return Err(RootError2::Codec);
+		}
+	}
+	let mut stripped = [&body[..at], issuers, &[0u8; 4][..], r.remaining()].concat();
+	let charge = 117 * n as u64;
+	let registry = u64::from_le_bytes(stripped[204..212].try_into().unwrap())
+		.checked_sub(charge)
+		.ok_or(RootError2::RootInvariant)?;
+	stripped[204..212].copy_from_slice(&registry.to_le_bytes());
+	legacy_profile2(&codec::envelope_versioned(
+		b"VISAUT04",
+		4,
+		&stripped,
+		ROOT_BYTES2,
+	)?)
+}
 pub(super) fn profile3(
 	bytes: &[u8],
 ) -> crate::storage::mutation_visibility::root2::Result2<Vec<u8>> {

@@ -54,9 +54,9 @@ fn key(s: &State2, a: AuthorityRef2, tenant: u64) -> PermissionKey2 {
 		},
 	}
 }
+// Adds `r` to the existing permissions, so a root's own admitting permission survives.
 fn with_record(s: &State2, r: PermissionRecord2) -> State2 {
 	let mut s = s.clone();
-	s.permissions = PermissionMap2::new();
 	s.permissions
 		.insert(encode_permission_key2(&r.key).unwrap(), r);
 	s
@@ -78,10 +78,26 @@ fn profile3_goldens_round_trip_and_profile2_bytes_are_refused() {
 	let v = vectors();
 	let refused = v["refused"].as_array().unwrap();
 	assert_eq!(refused.len(), 7);
+	// The live goldens are the profile-3 twins since b3; the bridge pairs each kept VISAUT02 vector
+	// with its pre-twin VISAUT04 bytes, preserved as corpus N13.
+	let corpus: serde_json::Value =
+		serde_json::from_str(include_str!("removed_forms.json")).unwrap();
+	let pre_twin = |name: &str| {
+		unhex(
+			corpus["entries"]
+				.as_array()
+				.unwrap()
+				.iter()
+				.find(|e| e["id"] == "N13" && e["part"] == name)
+				.unwrap()["hex"]
+				.as_str()
+				.unwrap(),
+		)
+	};
 	for item in refused {
 		let name = item["name"].as_str().unwrap();
 		let old = unhex(item["hex"].as_str().unwrap());
-		let new = fixture(name);
+		let new = pre_twin(name);
 		assert_eq!(new.len(), old.len() + 8, "{name}");
 		assert_eq!(&new[..8], b"VISAUT04");
 		assert_eq!(
@@ -208,9 +224,16 @@ fn validate_state_joins_permission_coordinates_and_references() {
 			enrolled: l(i),
 			revoked: None,
 		};
-		if a.revoked.is_none() {
-			validate_state(&with_record(&s, at(free))).unwrap();
-		}
+		// The positive twin of every refusal below: the same record at `free`, added next to the
+		// root's own permission (tenant 1; this record is tenant 9), validates.
+		let positive = || {
+			if a.revoked.is_none() {
+				let x = with_record(&s, at(free));
+				assert_eq!(x.permissions.len(), s.permissions.len() + 1, "{name}");
+				validate_state(&x).unwrap();
+			}
+		};
+		positive();
 		let mut claimed = vec![s.bootstrap.index];
 		claimed.extend(s.selectors.values().map(|x| x.enrolled.index));
 		for x in s.authorities.values() {
@@ -226,6 +249,14 @@ fn validate_state_joins_permission_coordinates_and_references() {
 			claimed.push(p.reservation.index);
 			claimed.extend(p.terminal.map(|t| t.first().index));
 		}
+		for p in s.permissions.values() {
+			claimed.push(p.enrolled.index);
+			claimed.extend(p.revoked.map(|l| l.index));
+		}
+		assert!(
+			claimed.contains(&4),
+			"{name}: the admitting permission's coordinate"
+		);
 		for i in claimed {
 			assert_eq!(
 				validate_state(&with_record(&s, at(i))).err(),
@@ -253,7 +284,10 @@ fn validate_state_joins_permission_coordinates_and_references() {
 					Some(RootError2::RootInvariant),
 					"{name}"
 				);
-				without.permissions = PermissionMap2::new();
+				positive();
+				without
+					.permissions
+					.remove(&encode_permission_key2(&at(o).key).unwrap());
 				validate_state(&without).unwrap();
 				joined += 1;
 			}
@@ -265,12 +299,14 @@ fn validate_state_joins_permission_coordinates_and_references() {
 			validate_state(&with_record(&s, other)).err(),
 			Some(RootError2::RootInvariant)
 		);
+		positive();
 		let mut unknown = at(free);
 		unknown.key.authority.revision += 7;
 		assert_eq!(
 			validate_state(&with_record(&s, unknown)).err(),
 			Some(RootError2::RootInvariant)
 		);
+		positive();
 	}
 	// The renewal golden supplies an old-interval original grant, so the join is exercised.
 	assert!(joined > 0);
@@ -439,6 +475,16 @@ fn bootstrap_and_reduce_keep_permissions_empty() {
 	assert_eq!(b.state.permissions.len(), 0);
 	assert_eq!(&b.encode().unwrap()[..8], b"VISAUT04");
 	let mut r = root("root_reserved");
+	// The twin's admitting permission is its baseline; no step adds or changes one.
+	let records = |r: &Root2| {
+		r.state
+			.permissions
+			.iter()
+			.map(|(k, v)| (*k, v.clone()))
+			.collect::<Vec<_>>()
+	};
+	let baseline = records(&r);
+	assert_eq!(baseline.len(), 1);
 	for step in 0..6u8 {
 		let cmd = match step % 3 {
 			0 => Command2::Cover {
@@ -453,6 +499,6 @@ fn bootstrap_and_reduce_keep_permissions_empty() {
 			_ => finalized(&r),
 		};
 		r = next(&r, &cmd, &[], 1).0;
-		assert_eq!(r.state.permissions.len(), 0, "step {step}");
+		assert!(records(&r) == baseline, "step {step}");
 	}
 }

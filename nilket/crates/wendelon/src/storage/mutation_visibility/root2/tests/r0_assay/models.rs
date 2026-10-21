@@ -158,6 +158,17 @@ fn parents(r: &mut Root2, n: usize, big: bool) {
 		r.state
 			.authorities
 			.insert(authority_key(revoked.authority).unwrap(), revoked.clone());
+		// Its admitting permission for the shared claim namespace, at the free coordinate 10.
+		let mut permission = r.state.permissions.values().next().unwrap().clone();
+		permission.key.authority = revoked.authority;
+		permission.enrolled = l(10);
+		r.state.permissions.insert(
+			crate::storage::mutation_visibility::root2::admission_registry::encode_permission_key2(
+				&permission.key,
+			)
+			.unwrap(),
+			permission,
+		);
 	}
 	for i in 0..n {
 		let mut c = if let Some((index, c)) = &special {

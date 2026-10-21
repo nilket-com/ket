@@ -3,7 +3,7 @@ use super::*;
 fn s1c_existing_goldens_equal_legacy_decoder_and_codec() {
 	for name in ["root_reserved", "root_renewed_no_parents"] {
 		let r = root(name);
-		let bytes = super::s1c_oracle::legacy_profile2(&r.encode().unwrap()).unwrap();
+		let bytes = super::s1c_oracle::s1c_projection(&r.encode().unwrap()).unwrap();
 		let legacy = super::s1c_oracle::state::UnverifiedRoot2::decode(&bytes).unwrap();
 		assert_eq!(legacy.encode().unwrap(), bytes);
 		assert!(
@@ -28,18 +28,26 @@ pub(super) fn checked_step(
 		crate::storage::mutation_visibility::root2::incremental::Derived2::build(&sealed.state)?;
 	let before = sealed.encode()?;
 	let expected = super::s1c_oracle::reduce(
-		&super::s1c_oracle::legacy_profile2(&before)?,
+		&super::s1c_oracle::s1c_projection(&before)?,
 		sealed.limits,
 		e,
 		v,
 		c,
 	);
 	let actual = Root2::reduce(Some(&sealed), e, v, c);
+	// D-G2 precondition: the projection drops the permission section, so a step that a permission
+	// decides is never compared.
+	if let Ok((_, ApplyResult2::Denied { reason, .. })) = &actual {
+		assert!(
+			!matches!(reason, 18 | 19),
+			"Denied({reason}) is a permission refusal; the S1c oracle cannot compare it"
+		);
+	}
 	assert_eq!(sealed.encode()?, before);
 	match (&actual, expected) {
 		(Ok((n, o)), Ok((bytes, old_o))) => {
 			assert!(o == &old_o, "outcome differs from frozen S1 oracle");
-			assert_eq!(super::s1c_oracle::legacy_profile2(&n.encode()?)?, bytes);
+			assert_eq!(super::s1c_oracle::s1c_projection(&n.encode()?)?, bytes);
 			assert_eq!(
 				o.encode(n.state.generation, n.state.cluster, n.covered())?,
 				old_o.encode(n.state.generation, n.state.cluster, n.covered())?
@@ -157,14 +165,14 @@ fn s1c_trust_gap_and_replay_match_legacy_errors() {
 		kind: 0,
 		external: [7; 32],
 	};
-	for idx in [
-		r.covered().index - 1,
-		r.covered().index,
-		r.covered().index + 2,
+	for (idx, error) in [
+		(r.covered().index - 1, RootError2::LineageGap),
+		(r.covered().index, RootError2::TrustMismatch),
+		(r.covered().index + 2, RootError2::LineageGap),
 	] {
 		let e = TrustedEntry2::fixture(r.state.generation, r.state.cluster, l(idx), &c).unwrap();
 		let v = VerifiedCommand2::fixture(r.state.generation, r.state.cluster, &c, &[], 1).unwrap();
-		assert!(checked_step(&r, &e, &v, &c).is_err());
+		assert_eq!(checked_step(&r, &e, &v, &c).err(), Some(error), "{idx}");
 	}
 	let cmd = command("command_reserve"); // use a self-consistent replay built from a completed new entry
 	let (n, _) = next(&r, &cmd, &[original()], 1);
@@ -352,7 +360,7 @@ fn s1c_path_copy_mutation_never_changes_a_retained_version() {
 }
 #[test]
 fn s1c_bootstrap_and_unauthorized_bootstrap_match_legacy() {
-	let c = command("command_bootstrap");
+	let c = command("command_bootstrap_p3");
 	let g = [4; 16];
 	let cluster = [5; 16];
 	let e = TrustedEntry2::fixture(g, cluster, l(1), &c).unwrap();
@@ -366,7 +374,7 @@ fn s1c_bootstrap_and_unauthorized_bootstrap_match_legacy() {
 		match (actual, expected) {
 			(Ok((n, o)), Ok((bytes, old_o))) => {
 				assert_eq!(
-					super::s1c_oracle::legacy_profile2(&n.encode().unwrap()).unwrap(),
+					super::s1c_oracle::s1c_projection(&n.encode().unwrap()).unwrap(),
 					bytes
 				);
 				assert!(o == old_o);
@@ -392,7 +400,7 @@ fn s1c_every_root_golden_and_corrupt_envelope_agree_with_legacy() {
 		let bytes = fixture(name);
 		if matches!(name, "root_one_issuer" | "root_numeric_issuers") {
 			assert_eq!(
-				super::s1c_oracle::legacy_profile2(&bytes),
+				super::s1c_oracle::s1c_projection(&bytes),
 				Err(RootError2::Codec)
 			);
 			assert_eq!(
@@ -410,11 +418,22 @@ fn s1c_every_root_golden_and_corrupt_envelope_agree_with_legacy() {
 			continue;
 		}
 		legacy_count += 1;
-		let legacy = super::s1c_oracle::legacy_profile2(&bytes).unwrap();
+		let legacy = super::s1c_oracle::s1c_projection(&bytes).unwrap();
 		let old = super::s1c_oracle::state::UnverifiedRoot2::decode(&legacy).unwrap();
 		let n = UnverifiedRoot2::decode(&bytes).unwrap();
 		assert_eq!(old.encode().unwrap(), legacy);
 		assert_eq!(n.encode().unwrap(), bytes);
+		// The projection strips exactly the twin's permission section (one record on the six
+		// parent-lineage roots, none on root_bootstrap_only) and the two section counts, and keeps
+		// the profile-3 control length opaque.
+		let permissions = root(name).state.permissions.len();
+		assert_eq!(
+			permissions,
+			usize::from(name != "root_bootstrap_only"),
+			"{name}"
+		);
+		assert_eq!(legacy.len(), bytes.len() - 8 - 117 * permissions, "{name}");
+		assert_eq!(legacy[192..200], 241u64.to_le_bytes(), "{name}");
 		// The same checksum mutation, applied to each profile's own bytes.
 		let flip = |b: &[u8]| {
 			let mut b = b.to_vec();

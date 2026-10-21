@@ -61,7 +61,7 @@ fn s1_independent_literal_record_root_command_result_goldens() {
 		assert_eq!(encoded, b, "{name}");
 		count += 1;
 	}
-	assert_eq!(count, 55);
+	assert_eq!(count, 58);
 }
 #[test]
 fn s1_truncation_every_byte_and_unknown_formats_are_refused() {

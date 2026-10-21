@@ -17,7 +17,10 @@ fn equality(r: &Root2) {
 		before
 	);
 }
+// Fills the permission section to `count` records alongside the twin's admitting permission
+// (tenant 1), which stays; the added records use tenants 2 and up.
 fn permissions(r: &mut Root2, count: usize) {
+	let base = r.state.permissions.len();
 	let a = r
 		.state
 		.authorities
@@ -25,12 +28,12 @@ fn permissions(r: &mut Root2, count: usize) {
 		.find(|a| a.revoked.is_none())
 		.unwrap()
 		.authority;
-	for i in 0..count {
+	for i in base..count.max(base) {
 		let key = PermissionKey2 {
 			authority: a,
 			namespace: AdmissionNamespace2 {
 				generation: r.state.generation,
-				tenant: i as u64 + 1,
+				tenant: i as u64 + 1 + base as u64,
 				scope: MutationScope::Raw,
 				table: [0; 16],
 				schema: 0,
