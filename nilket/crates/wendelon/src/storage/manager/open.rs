@@ -5,6 +5,7 @@ impl SlabManager {
 	pub(super) async fn open_shared(
 		mut config: SlabManagerConfig,
 		owner: Option<DataDirectoryOwner>,
+		maintenance_metrics: &'static crate::metrics::MetricsRegistry,
 		#[cfg(feature = "test-support")] file_ops_override: Option<Arc<dyn AsyncFileOps>>,
 	) -> std::io::Result<Self> {
 		if let Some(owner) = &owner {
@@ -327,11 +328,16 @@ impl SlabManager {
 		// history - it is the absence of a record, and no record means no maintenance.
 		let maintenance_policy = match &persistent_index {
 			Some(index) => {
-				MaintenancePolicyInner::load(Arc::clone(index), Arc::new(SystemMaintenanceClock))
-					.await
+				MaintenancePolicyInner::load(
+					Arc::clone(index),
+					Arc::new(SystemMaintenanceClock),
+					maintenance_metrics,
+				)
+				.await
 			}
 			None => MaintenancePolicyInner::disabled(
 				"no persistent index: maintenance receipts have nowhere to live",
+				maintenance_metrics,
 			),
 		};
 		let manager = Self {

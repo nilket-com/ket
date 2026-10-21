@@ -23,6 +23,7 @@
 //! never resolves or a deterministic failure whose origin was never tagged, and
 //! both want a human.
 
+use crate::metrics::MetricsRegistry;
 use crate::schema::SlabId;
 use crate::storage::index::PersistentLocalIndex;
 use crate::storage::lsm::CompactionFailure;
@@ -814,7 +815,12 @@ mod tests {
 		);
 		(
 			dir,
-			MaintenancePolicyInner::enabled(store, BTreeMap::new(), clock),
+			MaintenancePolicyInner::enabled(
+				store,
+				BTreeMap::new(),
+				clock,
+				crate::metrics::isolated_for_test(),
+			),
 		)
 	}
 
@@ -969,7 +975,12 @@ mod tests {
 				.await
 				.unwrap(),
 		);
-		let policy = MaintenancePolicyInner::enabled(store, receipts, clock);
+		let policy = MaintenancePolicyInner::enabled(
+			store,
+			receipts,
+			clock,
+			crate::metrics::isolated_for_test(),
+		);
 
 		assert!(
 			!policy.is_eligible(OP, &slabs, 10_000_000),
@@ -1033,7 +1044,12 @@ mod tests {
 				.await
 				.unwrap(),
 		);
-		let policy = MaintenancePolicyInner::load(store, Arc::new(ManualClock::at(u64::MAX))).await;
+		let policy = MaintenancePolicyInner::load(
+			store,
+			Arc::new(ManualClock::at(u64::MAX)),
+			crate::metrics::isolated_for_test(),
+		)
+		.await;
 		assert!(policy.is_enabled(), "{:?}", policy.diagnostic());
 		assert!(
 			!policy.is_eligible(OP, &quarantined, u64::MAX),
@@ -1087,7 +1103,12 @@ mod tests {
 				.await
 				.unwrap(),
 		);
-		let policy = MaintenancePolicyInner::load(store, Arc::new(ManualClock::at(1))).await;
+		let policy = MaintenancePolicyInner::load(
+			store,
+			Arc::new(ManualClock::at(1)),
+			crate::metrics::isolated_for_test(),
+		)
+		.await;
 		assert!(!policy.is_enabled());
 		let diagnostic = policy.diagnostic().unwrap();
 		assert!(
@@ -1175,7 +1196,12 @@ mod tests {
 				.await
 				.unwrap(),
 		);
-		let policy = MaintenancePolicyInner::load(store, Arc::new(ManualClock::at(1))).await;
+		let policy = MaintenancePolicyInner::load(
+			store,
+			Arc::new(ManualClock::at(1)),
+			crate::metrics::isolated_for_test(),
+		)
+		.await;
 		assert!(!policy.is_enabled());
 		let diagnostic = policy.diagnostic().unwrap();
 		assert!(diagnostic.contains("bound exceeded"), "{diagnostic}");
@@ -1208,7 +1234,12 @@ mod tests {
 				.await
 				.unwrap(),
 		);
-		let policy = MaintenancePolicyInner::load(store, Arc::new(ManualClock::at(1))).await;
+		let policy = MaintenancePolicyInner::load(
+			store,
+			Arc::new(ManualClock::at(1)),
+			crate::metrics::isolated_for_test(),
+		)
+		.await;
 		let diagnostic = policy.diagnostic().unwrap();
 		assert!(
 			diagnostic.contains("500 slabs, first [1, 2, 3, 4, ..]"),
@@ -1235,7 +1266,12 @@ mod tests {
 				.await
 				.unwrap(),
 		);
-		let policy = MaintenancePolicyInner::load(store, Arc::new(ManualClock::at(1))).await;
+		let policy = MaintenancePolicyInner::load(
+			store,
+			Arc::new(ManualClock::at(1)),
+			crate::metrics::isolated_for_test(),
+		)
+		.await;
 		let diagnostic = policy.diagnostic().unwrap();
 		assert!(
 			diagnostic.contains("10000 bytes, prefix abababab"),
@@ -1267,7 +1303,12 @@ mod tests {
 				.unwrap(),
 		);
 		assert!(!store.receipts_available());
-		let policy = MaintenancePolicyInner::load(store, Arc::new(ManualClock::at(1))).await;
+		let policy = MaintenancePolicyInner::load(
+			store,
+			Arc::new(ManualClock::at(1)),
+			crate::metrics::isolated_for_test(),
+		)
+		.await;
 		assert!(!policy.is_enabled());
 		assert!(
 			policy.diagnostic().unwrap().contains("lost"),
@@ -1293,7 +1334,12 @@ mod tests {
 				.await
 				.expect("temp index opens"),
 		);
-		let policy = MaintenancePolicyInner::load(Arc::clone(&store), clock).await;
+		let policy = MaintenancePolicyInner::load(
+			Arc::clone(&store),
+			clock,
+			crate::metrics::isolated_for_test(),
+		)
+		.await;
 		assert!(policy.is_enabled(), "{:?}", policy.diagnostic());
 		(dir, policy, store)
 	}
@@ -1311,7 +1357,12 @@ mod tests {
 				.await
 				.expect("temp index opens"),
 		);
-		let policy = MaintenancePolicyInner::load(Arc::clone(&store), clock).await;
+		let policy = MaintenancePolicyInner::load(
+			Arc::clone(&store),
+			clock,
+			crate::metrics::isolated_for_test(),
+		)
+		.await;
 		assert!(policy.is_enabled(), "{:?}", policy.diagnostic());
 		(policy, store)
 	}
@@ -1421,7 +1472,7 @@ mod tests {
 		let clock = Arc::new(ManualClock::at(1_000_000));
 		let (_dir, policy, store) = enabled_policy_with_store(clock.clone()).await;
 		let slabs = [SlabId::new(7)];
-		let metrics = crate::metrics::global();
+		let metrics = policy.metrics_for_test();
 		let before_quarantined =
 			metrics.maintenance_attempts(MaintenanceAttemptResult::Quarantined);
 		let before_reason = metrics.maintenance_deterministic_failures(ORIGIN.reason());
@@ -1603,7 +1654,12 @@ mod tests {
 				.unwrap()
 				.is_empty()
 		);
-		let reloaded = MaintenancePolicyInner::load(Arc::clone(&store), clock.clone()).await;
+		let reloaded = MaintenancePolicyInner::load(
+			Arc::clone(&store),
+			clock.clone(),
+			crate::metrics::isolated_for_test(),
+		)
+		.await;
 		assert!(reloaded.report().retryable.is_empty());
 
 		// A deterministic failure ends the consecutive run.
@@ -1662,7 +1718,12 @@ mod tests {
 				.await
 				.unwrap();
 		}
-		let policy = MaintenancePolicyInner::load(Arc::clone(&store), clock).await;
+		let policy = MaintenancePolicyInner::load(
+			Arc::clone(&store),
+			clock,
+			crate::metrics::isolated_for_test(),
+		)
+		.await;
 		assert_eq!(policy.report().receipts.len(), 3);
 		// Every origin's schedule has elapsed; the work is admissible.
 		let ok = policy
@@ -1724,7 +1785,8 @@ mod tests {
 		store
 			.fail_receipt_mutations
 			.store(false, std::sync::atomic::Ordering::SeqCst);
-		let reloaded = MaintenancePolicyInner::load(store, clock).await;
+		let reloaded =
+			MaintenancePolicyInner::load(store, clock, crate::metrics::isolated_for_test()).await;
 		assert!(reloaded.is_enabled());
 		assert!(reloaded.report().receipts.is_empty());
 	}
@@ -1766,7 +1828,8 @@ mod tests {
 		store
 			.fail_receipt_mutations
 			.store(false, std::sync::atomic::Ordering::SeqCst);
-		let reloaded = MaintenancePolicyInner::load(store, clock).await;
+		let reloaded =
+			MaintenancePolicyInner::load(store, clock, crate::metrics::isolated_for_test()).await;
 		assert!(reloaded.is_enabled());
 		assert_eq!(
 			reloaded.report().quarantined().count(),
@@ -1794,7 +1857,12 @@ mod tests {
 		fail_deterministically(&policy, &slabs).await;
 		drop(policy);
 		let store = reopen_store(store, &path).await;
-		let policy = MaintenancePolicyInner::load(Arc::clone(&store), clock.clone()).await;
+		let policy = MaintenancePolicyInner::load(
+			Arc::clone(&store),
+			clock.clone(),
+			crate::metrics::isolated_for_test(),
+		)
+		.await;
 		let deadline_1 = 1_000_000 + backoff(1).unwrap().as_millis() as u64;
 		clock.set(deadline_1 - 1);
 		assert_eq!(
@@ -1808,7 +1876,12 @@ mod tests {
 		fail_deterministically(&policy, &slabs).await;
 		drop(policy);
 		let store = reopen_store(store, &path).await;
-		let policy = MaintenancePolicyInner::load(Arc::clone(&store), clock.clone()).await;
+		let policy = MaintenancePolicyInner::load(
+			Arc::clone(&store),
+			clock.clone(),
+			crate::metrics::isolated_for_test(),
+		)
+		.await;
 		assert_eq!(receipt_for(&policy, &slabs).unwrap().attempts, 2);
 		let deadline_2 = deadline_1 + backoff(2).unwrap().as_millis() as u64;
 		clock.set(deadline_2 - 1);
@@ -1823,7 +1896,12 @@ mod tests {
 		fail_deterministically(&policy, &slabs).await;
 		drop(policy);
 		let store = reopen_store(store, &path).await;
-		let policy = MaintenancePolicyInner::load(Arc::clone(&store), clock.clone()).await;
+		let policy = MaintenancePolicyInner::load(
+			Arc::clone(&store),
+			clock.clone(),
+			crate::metrics::isolated_for_test(),
+		)
+		.await;
 		assert_eq!(policy.report().quarantined().count(), 1);
 		for at in [0, deadline_2, u64::MAX] {
 			clock.set(at);
@@ -1864,7 +1942,8 @@ mod tests {
 		store
 			.fail_receipt_mutations
 			.store(false, std::sync::atomic::Ordering::SeqCst);
-		let reloaded = MaintenancePolicyInner::load(store, clock).await;
+		let reloaded =
+			MaintenancePolicyInner::load(store, clock, crate::metrics::isolated_for_test()).await;
 		assert_eq!(
 			reloaded.report().receipts.len(),
 			1,
@@ -2190,7 +2269,7 @@ mod tests {
 	async fn a_completion_that_rewrote_nothing_records_nothing() {
 		let clock = Arc::new(ManualClock::at(1_000_000));
 		let (_dir, policy, store) = enabled_policy_with_store(clock.clone()).await;
-		let metrics = crate::metrics::global();
+		let metrics = policy.metrics_for_test();
 		let neutral = |_: &()| SuccessDisposition::Neutral;
 
 		// A deterministic receipt on one set, a retryable cooldown on another.
@@ -2217,9 +2296,9 @@ mod tests {
 				.await;
 			assert!(matches!(done, MaintenanceAttempt::Completed(())));
 		}
-		assert!(
-			metrics.maintenance_attempts(MaintenanceAttemptResult::CompletedWithoutRewrite)
-				>= before + 2,
+		assert_eq!(
+			metrics.maintenance_attempts(MaintenanceAttemptResult::CompletedWithoutRewrite),
+			before + 2,
 			"the reporting half sees a neutral completion as its own outcome"
 		);
 
@@ -2502,7 +2581,12 @@ mod tests {
 				.await
 				.unwrap();
 		}
-		let policy = MaintenancePolicyInner::load(Arc::clone(&store), clock.clone()).await;
+		let policy = MaintenancePolicyInner::load(
+			Arc::clone(&store),
+			clock.clone(),
+			crate::metrics::isolated_for_test(),
+		)
+		.await;
 		assert_eq!(policy.report().quarantined().count(), 2);
 
 		// An operation with no quarantine over the set is refused, even though
@@ -2536,7 +2620,8 @@ mod tests {
 		// remains.
 		drop(policy);
 		let store = reopen_store(store, &path).await;
-		let reloaded = MaintenancePolicyInner::load(store, clock).await;
+		let reloaded =
+			MaintenancePolicyInner::load(store, clock, crate::metrics::isolated_for_test()).await;
 		let report = reloaded.report();
 		let remaining = report.quarantined().collect::<Vec<_>>();
 		assert_eq!(remaining.len(), 1);
@@ -2597,7 +2682,12 @@ mod tests {
 			.put_maintenance_receipt(last.encode(), receipt.encode())
 			.await
 			.unwrap();
-		let policy = MaintenancePolicyInner::load(store, Arc::new(ManualClock::at(10_000))).await;
+		let policy = MaintenancePolicyInner::load(
+			store,
+			Arc::new(ManualClock::at(10_000)),
+			crate::metrics::isolated_for_test(),
+		)
+		.await;
 
 		let first = policy
 			.report_page(None, 1, MAINTENANCE_REPORT_MAX_BYTES)
@@ -2675,7 +2765,12 @@ mod tests {
 				.await
 				.unwrap();
 		}
-		let policy = MaintenancePolicyInner::load(Arc::clone(&store), clock.clone()).await;
+		let policy = MaintenancePolicyInner::load(
+			Arc::clone(&store),
+			clock.clone(),
+			crate::metrics::isolated_for_test(),
+		)
+		.await;
 		let page = policy
 			.report_page(None, 1, MAINTENANCE_REPORT_MAX_BYTES)
 			.unwrap();
@@ -2696,7 +2791,8 @@ mod tests {
 		let pre_reopen_cursor = fresh_page.next_cursor.unwrap();
 		drop(policy);
 		let store = reopen_store(store, &path).await;
-		let reopened = MaintenancePolicyInner::load(store, clock).await;
+		let reopened =
+			MaintenancePolicyInner::load(store, clock, crate::metrics::isolated_for_test()).await;
 		assert_eq!(
 			reopened.report_page(Some(&pre_reopen_cursor), 1, MAINTENANCE_REPORT_MAX_BYTES),
 			Err(MaintenanceReportPageError::StaleCursor)
@@ -2765,7 +2861,9 @@ mod tests {
 				.await
 				.unwrap();
 		}
-		let policy = MaintenancePolicyInner::load(store, clock.clone()).await;
+		let policy =
+			MaintenancePolicyInner::load(store, clock.clone(), crate::metrics::isolated_for_test())
+				.await;
 		let cursor = || {
 			policy
 				.report_page(None, 1, MAINTENANCE_REPORT_MAX_BYTES)
@@ -3059,7 +3157,12 @@ mod tests {
 			.put_maintenance_receipt(only_backing_off.encode(), backing_off.encode())
 			.await
 			.unwrap();
-		let policy = MaintenancePolicyInner::load(store, Arc::new(ManualClock::at(10_000))).await;
+		let policy = MaintenancePolicyInner::load(
+			store,
+			Arc::new(ManualClock::at(10_000)),
+			crate::metrics::isolated_for_test(),
+		)
+		.await;
 
 		let whole = policy
 			.report_page(None, 10, MAINTENANCE_REPORT_MAX_BYTES)
@@ -3678,6 +3781,10 @@ fn slabs_summary(slabs: &[SlabId]) -> String {
 pub(crate) struct MaintenancePolicyInner {
 	state: std::sync::Mutex<PolicyState>,
 	clock: Arc<dyn MaintenanceClock>,
+	/// Where attempts, deterministic failures and the two gauges are reported.
+	/// Injected like the clock: production passes the process registry, tests an
+	/// isolated one, so a test's counter delta is its own and not its neighbours'.
+	metrics: &'static MetricsRegistry,
 	report_incarnation: [u8; 16],
 	report_generation: AtomicU64,
 }
@@ -3743,11 +3850,18 @@ pub(crate) enum AdmissionRefusal {
 }
 
 impl MaintenancePolicyInner {
-	pub(crate) fn disabled(diagnostic: impl Into<String>) -> Arc<Self> {
-		Self::disabled_with(diagnostic, Arc::new(SystemMaintenanceClock))
+	pub(crate) fn disabled(
+		diagnostic: impl Into<String>,
+		metrics: &'static MetricsRegistry,
+	) -> Arc<Self> {
+		Self::disabled_with(diagnostic, Arc::new(SystemMaintenanceClock), metrics)
 	}
 
-	fn disabled_with(diagnostic: impl Into<String>, clock: Arc<dyn MaintenanceClock>) -> Arc<Self> {
+	fn disabled_with(
+		diagnostic: impl Into<String>,
+		clock: Arc<dyn MaintenanceClock>,
+		metrics: &'static MetricsRegistry,
+	) -> Arc<Self> {
 		let diagnostic = truncate_utf8(&diagnostic.into(), MAX_DIAGNOSTIC_BYTES);
 		tracing::error!(
 			diagnostic = %diagnostic,
@@ -3756,6 +3870,7 @@ impl MaintenancePolicyInner {
 		let policy = Arc::new(Self {
 			state: std::sync::Mutex::new(PolicyState::Disabled { diagnostic }),
 			clock,
+			metrics,
 			report_incarnation: *Uuid::new_v4().as_bytes(),
 			report_generation: AtomicU64::new(0),
 		});
@@ -3778,12 +3893,14 @@ impl MaintenancePolicyInner {
 	pub(crate) async fn load(
 		store: Arc<PersistentLocalIndex>,
 		clock: Arc<dyn MaintenanceClock>,
+		metrics: &'static MetricsRegistry,
 	) -> Arc<Self> {
 		if !store.receipts_available() {
 			return Self::disabled_with(
 				"maintenance receipt history was lost: the table is missing from an \
 				 initialized index",
 				clock,
+				metrics,
 			);
 		}
 		// Bounded while copying: a runaway or corrupt table fails closed here,
@@ -3794,6 +3911,7 @@ impl MaintenancePolicyInner {
 				return Self::disabled_with(
 					format!("maintenance receipts could not be read: {error}"),
 					clock,
+					metrics,
 				);
 			}
 		};
@@ -3810,6 +3928,7 @@ impl MaintenancePolicyInner {
 							bytes_summary(&key)
 						),
 						clock,
+						metrics,
 					);
 				}
 			};
@@ -3825,6 +3944,7 @@ impl MaintenancePolicyInner {
 							bytes_summary(&value)
 						),
 						clock,
+						metrics,
 					);
 				}
 			};
@@ -3841,10 +3961,11 @@ impl MaintenancePolicyInner {
 				return Self::disabled_with(
 					format!("two maintenance receipts decode to one key: {summary}"),
 					clock,
+					metrics,
 				);
 			}
 		}
-		let policy = Self::enabled(store, recovered, clock);
+		let policy = Self::enabled(store, recovered, clock, metrics);
 		policy.publish_gauges();
 		let report = policy.report();
 		for receipt in report.quarantined().take(MAX_QUARANTINE_LOG_LINES) {
@@ -3869,6 +3990,7 @@ impl MaintenancePolicyInner {
 		store: Arc<PersistentLocalIndex>,
 		deterministic: BTreeMap<MaintenanceWorkKey, DeterministicReceipt>,
 		clock: Arc<dyn MaintenanceClock>,
+		metrics: &'static MetricsRegistry,
 	) -> Arc<Self> {
 		Arc::new(Self {
 			state: std::sync::Mutex::new(PolicyState::Enabled {
@@ -3879,6 +4001,7 @@ impl MaintenancePolicyInner {
 				},
 			}),
 			clock,
+			metrics,
 			report_incarnation: *Uuid::new_v4().as_bytes(),
 			report_generation: AtomicU64::new(0),
 		})
@@ -5005,7 +5128,7 @@ impl MaintenancePolicyInner {
 		Fut: std::future::Future<Output = Result<T, E>>,
 		E: fmt::Display,
 	{
-		let metrics = crate::metrics::global();
+		let metrics = self.metrics;
 		let reservation = match self.reserve(operation, slabs) {
 			Ok(reservation) => reservation,
 			Err(refusal) => {
@@ -5480,43 +5603,35 @@ impl MaintenancePolicyInner {
 		}
 	}
 
-	fn publish_gauges_locked(&self) -> (u64, u64) {
+	fn publish_and_read_gauges(&self) -> (u64, u64) {
 		let (enabled, quarantined) = self.gauge_values();
-		let metrics = crate::metrics::global();
-		metrics.set_maintenance_policy_state(enabled, quarantined);
+		self.metrics
+			.set_maintenance_policy_state(enabled, quarantined);
 		(
-			metrics.maintenance_policy_enabled.get(),
-			metrics.maintenance_quarantined_work.get(),
+			self.metrics.maintenance_policy_enabled.get(),
+			self.metrics.maintenance_quarantined_work.get(),
 		)
 	}
 
 	/// Gauges are set from the state, never incremented alongside it, so they
 	/// cannot drift from what the accessor reports.
 	pub(crate) fn publish_gauges(&self) {
-		#[cfg(test)]
-		let _serial = maintenance_gauge_test_lock()
-			.lock()
-			.expect("maintenance gauge test lock poisoned");
-		let _ = self.publish_gauges_locked();
+		let _ = self.publish_and_read_gauges();
 	}
 
-	/// Publish this policy and read the two process-global gauges as one serialized
-	/// test operation. Every test-build publisher takes the same lock, so another
-	/// concurrently hydrated policy cannot overwrite the values between the set and
-	/// the assertions.
+	/// Publish this policy and read the two gauges back from its registry. A test
+	/// policy reports to an isolated registry, so no concurrently hydrated policy
+	/// can overwrite the values between the set and the assertions.
 	#[cfg(test)]
 	pub(crate) fn gauge_snapshot_for_test(&self) -> (u64, u64) {
-		let _serial = maintenance_gauge_test_lock()
-			.lock()
-			.expect("maintenance gauge test lock poisoned");
-		self.publish_gauges_locked()
+		self.publish_and_read_gauges()
 	}
-}
 
-#[cfg(test)]
-fn maintenance_gauge_test_lock() -> &'static std::sync::Mutex<()> {
-	static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-	LOCK.get_or_init(|| std::sync::Mutex::new(()))
+	/// The registry this policy reports to, for tests asserting counter deltas.
+	#[cfg(test)]
+	pub(crate) fn metrics_for_test(&self) -> &'static MetricsRegistry {
+		self.metrics
+	}
 }
 
 /// Bounded label for the attempt counter. One value per way an attempt can end,
