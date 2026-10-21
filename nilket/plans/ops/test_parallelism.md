@@ -187,7 +187,7 @@ equals the SHA-256 of that copy at the audited commit.
 
 Parallel-only defect candidates found when the default moved to 1024 test
 threads, tracked one by one in
-`nilket/plans/ops/parallel_defect_candidates.md` (PD-01 to PD-13). They block
+`nilket/plans/ops/parallel_defect_candidates.md`. All open entries block
 the adoption gate above; none is handled by serialization.
 
 - PD-01 to PD-09: Wendelon lib tests (process-global metric deltas, timing
@@ -196,3 +196,8 @@ the adoption gate above; none is handled by serialization.
   `multinode_bootstrap` (including a SIGABRT with no result line) and `chaos`.
 - PD-13: the `distributed_process_test` futex hang, unexplained and not
   reproduced since.
+
+- PD-14 to PD-19: additional expiry, progress, tiering, shutdown and WAL
+  evidence candidates reconciled in the register.
+- PD-20: counter write-key gate reclamation, deterministically reproduced;
+  focused repair evidence and full adoption status are tracked in the register.
