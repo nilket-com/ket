@@ -5780,13 +5780,11 @@ mod tests {
 			MaintenanceCompletionAuditWire::Recorded
 		);
 
-		// A restart test needs every manager/index owner gone. The node's graceful
-		// shutdown intentionally leaves the Raft worker lifetime independent; the
-		// established restart fixtures abort handles, drop the assembled node, and
-		// give those workers one scheduler turn to release their Arc graph.
-		node_a.handles.abort();
-		drop(node_a);
-		tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+		// A restart test needs every manager/index owner gone. Dropping the node
+		// and sleeping only hopes that its aborted and blocking workers have let
+		// go of the directory owner; on a loaded host they have not, and the
+		// reopen sees DataDirectoryBusy. The joined shutdown closes the owner.
+		node_a.shutdown().await.unwrap();
 		let reopened_a = bootstrap_maintenance_test_node(101, dir_a).await;
 		let after = report_real_node(&reopened_a, ActorRole::Operator, 5)
 			.await
