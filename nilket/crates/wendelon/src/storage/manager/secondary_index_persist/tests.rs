@@ -524,3 +524,177 @@ async fn restored_noncanonical_sidecar_paths_remain_deletable() {
 		assert_sidecar_state(&reopened, &info, false).await;
 	}
 }
+
+async fn open_owned_manager_for_sidecar_recovery(
+	dir: &Path,
+	owner: &crate::storage::ownership::DataDirectoryOwner,
+) -> Arc<SlabManager> {
+	Arc::new(
+		SlabManager::open_with_owner(
+			SlabManagerConfig {
+				dir: dir.to_path_buf(),
+				max_slab_bytes: 1024 * 1024,
+				io: spawn_io_thread(64).unwrap(),
+				l2: None,
+				rehydration: Default::default(),
+				l2_column_fetch: Default::default(),
+				row_group_writer: Default::default(),
+				l2_row_group_fetch: Default::default(),
+				encoding_writer: Default::default(),
+				l2_chunk_layout: Default::default(),
+				l2_encoding_fetch: Default::default(),
+				encoding_compute: Default::default(),
+				group_commit: Default::default(),
+				crypto: test_crypto(),
+			},
+			owner.clone(),
+		)
+		.await
+		.unwrap(),
+	)
+}
+
+#[tokio::test]
+async fn interrupted_real_sidecar_publisher_is_cleaned_on_owned_reopen() {
+	use crate::storage::ownership::DataDirectoryOwner;
+	const CHILD: &str = "WENDELON_REAL_SIDECAR_PUBLISH_CHILD_DIR";
+	let slab = SlabId::new(88);
+	if let Some(path) = std::env::var_os(CHILD) {
+		let dir = PathBuf::from(path);
+		let owner = DataDirectoryOwner::acquire_existing(&dir).unwrap();
+		let mut manager = open_owned_manager_for_sidecar_recovery(&dir, &owner).await;
+		assert!(
+			manager.persistent_index.is_some(),
+			"real publisher control requires its durable catalog"
+		);
+		let original = manager
+			.persist_secondary_index_segment(&segment_with_key(slab, 1))
+			.await
+			.unwrap();
+		let published_bytes = std::fs::read(dir.join(&original.segment_path)).unwrap();
+		let gate = Arc::new(ParkFirstSidecarTmpOpen {
+			inner: Arc::clone(&manager.file_ops),
+			armed: AtomicBool::new(true),
+			parked: Notify::new(),
+			release: Notify::new(),
+			synchronous_boundaries: false,
+			park_unlink: AtomicBool::new(false),
+			staging_started: AtomicUsize::new(0),
+			unlinks_started: AtomicUsize::new(0),
+		});
+		Arc::get_mut(&mut manager).unwrap().file_ops = gate.clone();
+		let _publisher = {
+			let manager = Arc::clone(&manager);
+			tokio::spawn(async move {
+				manager
+					.persist_secondary_index_segment(&segment_with_key(slab, 2))
+					.await
+			})
+		};
+		tokio::time::timeout(Duration::from_secs(60), gate.parked.notified())
+			.await
+			.expect("real publisher wrote staging bytes and reached pre-open gate");
+		let parent = dir
+			.join(&original.segment_path)
+			.parent()
+			.unwrap()
+			.to_path_buf();
+		let staged: Vec<_> = std::fs::read_dir(parent)
+			.unwrap()
+			.map(Result::unwrap)
+			.filter(|entry| ParkFirstSidecarTmpOpen::is_sidecar_tmp(&entry.path()))
+			.collect();
+		assert_eq!(staged.len(), 1);
+		assert_eq!(
+			std::fs::read(staged[0].path()).unwrap(),
+			segment_with_key(slab, 2).encode().unwrap()
+		);
+		assert_eq!(
+			std::fs::read(dir.join(&original.segment_path)).unwrap(),
+			published_bytes
+		);
+		assert_sidecar_state(&manager, &original, true).await;
+		println!("real publisher staged replacement before open; original catalog unchanged");
+		std::io::Write::flush(&mut std::io::stdout()).unwrap();
+		// Exit without dropping the parked publish future: its normal error
+		// cleanup cannot run, and no clean-shutdown record can hide the crash.
+		std::process::exit(0);
+	}
+
+	let dir = fresh_dir("sidecar-real-publisher-reopen");
+	let test = concat!(
+		module_path!(),
+		"::interrupted_real_sidecar_publisher_is_cleaned_on_owned_reopen"
+	)
+	.trim_start_matches("wendelon::");
+	let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+	command
+		.args([test, "--exact", "--nocapture"])
+		.env(CHILD, dir.as_os_str());
+	let output = crate::test_support::run_test_child(&mut command, Duration::from_secs(120))
+		.await
+		.unwrap();
+	assert!(
+		output.status.success(),
+		"{}\n{}",
+		String::from_utf8_lossy(&output.stdout),
+		String::from_utf8_lossy(&output.stderr)
+	);
+	assert!(
+		String::from_utf8_lossy(&output.stdout)
+			.contains("real publisher staged replacement before open; original catalog unchanged")
+	);
+	let original_segment = segment_with_key(slab, 1);
+	let identity = original_segment.identity();
+	let relative = secondary_index_segment_storage_path(
+		identity.tenant_id,
+		identity.table_object_id,
+		identity.index_object_id,
+		slab,
+	);
+	let published_path = dir.join(&relative);
+	let original_bytes = std::fs::read(&published_path).unwrap();
+	assert_eq!(original_bytes, original_segment.encode().unwrap());
+	let parent = published_path.parent().unwrap();
+	assert_eq!(
+		std::fs::read_dir(parent).unwrap().count(),
+		2,
+		"real orphan must exist before reopening"
+	);
+	for _ in 0..2 {
+		let owner = DataDirectoryOwner::acquire_existing(&dir).unwrap();
+		let manager = open_owned_manager_for_sidecar_recovery(&dir, &owner).await;
+		assert!(
+			manager.persistent_index.is_some(),
+			"reopen must validate the durable catalog, not a fallback"
+		);
+		let listed = manager.list_secondary_index_segments(
+			identity.tenant_id,
+			identity.table_object_id,
+			identity.index_object_id,
+			identity.logical_schema_fingerprint,
+		);
+		assert_eq!(
+			listed.len(),
+			1,
+			"reopen must not invent or drop a published catalog row"
+		);
+		assert_sidecar_state(&manager, &listed[0], true).await;
+		assert_eq!(
+			manager
+				.load_secondary_index_segment(&listed[0])
+				.await
+				.unwrap()
+				.unwrap(),
+			original_segment
+		);
+		assert_eq!(std::fs::read(&published_path).unwrap(), original_bytes);
+		assert_eq!(
+			std::fs::read_dir(parent).unwrap().count(),
+			1,
+			"only the staged replacement may be removed"
+		);
+		owner.close(Duration::from_secs(30)).await.unwrap();
+		drop(manager);
+	}
+}

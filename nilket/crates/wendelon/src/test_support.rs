@@ -1,4 +1,7 @@
 //! Test-only helpers shared by the unit tests.
+mod child;
+pub(crate) use child::run_test_child;
+
 mod test_dir;
 pub(crate) use test_dir::TestDir;
 

@@ -9683,6 +9683,7 @@ fn adr078_manager_source_concatenates_submodules() {
 			"observation.rs",
 			"open.rs",
 			"retention_reclaim.rs",
+			"secondary_index_cleanup.rs",
 			"secondary_index_segments.rs",
 			"stats_facts.rs",
 			"tiered_io.rs",

@@ -115,6 +115,9 @@ impl SlabManager {
 		.await?;
 		cleanup_retention_rewrite_tmp_files(file_ops.as_ref(), &config.dir).await?;
 		cleanup_lsm_compaction_tmp_files(file_ops.as_ref(), &config.dir).await?;
+		// The manager is not published and no sidecar producer exists yet.
+		secondary_index_cleanup::cleanup_secondary_index_tmp_files(&config.dir, owner.clone())
+			.await?;
 		let mut existing_ids = discover_slab_ids(file_ops.as_ref(), &config.dir).await?;
 		existing_ids.sort_unstable();
 
