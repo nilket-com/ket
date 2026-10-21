@@ -37,8 +37,37 @@ final defaults) and four runs of each integration binary. A third, earlier lib r
 | PD-09 | `network::control_server::tests::maintenance_control_is_node_local_authenticated_and_durable_across_reopen` | 1/2 | `DataDirectoryBusy` on reopen | a forking lib test's child briefly holding the inherited flock (the F-OWN-1 fork window); needs a control | open |
 | PD-10 | `stream_finalization` (`stream_finalization_replays_after_floor_and_stays_ordered_under_write_load`) | 4/4 | replayed sequence differs | none yet | open |
 | PD-11 | `multinode_bootstrap` (binary) | 4/4 | 1-4 of 5 tests fail (join rejected by seed with a leader hint; epoch wait timeout), or the binary aborts with SIGABRT and prints no result line | none yet | open |
-| PD-12 | `chaos::chaos_smoke_catalog` | 2/4 | timed out waiting for leader 1 (current leader 2) | none yet | open |
+| PD-12 | `chaos::chaos_smoke_catalog` | 2/4 before fix | timed out waiting for leader 1 (current leader 2) | fixture assumed founding-node leadership | `e508e8a4d`: elected-leader fixture; focused stress passed, final candidate gate pending |
 | PD-13 | `toron` `distributed_process_test` (binary) | 0/25 since | historically two concurrent tests parked every process in a futex wait that never returned | unexplained; the serial nextest group was removed so the binary keeps being tested, and ladder v5 stresses it | open |
+
+
+## Additional candidates PD-14–19 (reconciled 2026-10-21)
+
+These entries reconcile the implementation history with the original register.
+A fix commit alone does not close a candidate: required concurrency receipts
+and final stack acceptance remain pending. Source/evidence inventory:
+`reviews/readiness-uring-snapshot-20261021/REPORT.md`.
+
+| ID | Candidate / observed failure | Recorded context | Implementation / remaining evidence |
+|---|---|---|---|
+| PD-14 | `expired_table_outcome_keeps_warm_cache_replay_but_cold_replay_is_indeterminate`: premature EXPIRED | 1/5 full-lib runs at 1024 threads | `919f4170f`: maximum supported fixture TTL and deliberate hook-driven expiry; closure receipts pending |
+| PD-15 | `full_scan_completes_far_beyond_the_former_lifetime_cap`: QUERY_STALLED | 1/1 loaded run at 24 threads | `ad3812629`: explicit scan-test stall budget and per-location progress assertions; product stall-default decision and closure evidence remain separate |
+| PD-16 | `single_node_bootstrap_starts_background_tiering_when_l2_is_configured`: L1 file remains | 1/3 diagnostic full-lib runs at 1024 threads | `d73b8b651`: wait for actual unlink rather than earlier tier-pointer installation; closure receipts pending |
+| PD-17 | `post_dispatch_expiry_resolves_and_replays_as_one_indeterminate_operation_after_restart`: KNOWN_NOT_COMMITTED instead of INDETERMINATE | 1/3 diagnostic full-lib runs at 1024 threads | `e434342c7`: hold append after dispatch through caller expiry; closure receipts pending |
+| PD-18 | `shutdown_lease_node`: fixture shutdown timeout | Four simultaneous failures in one of nine full-lib runs at 1024 threads; five with additional disk load | `6abc3b464`: fixture hang detector above component shutdown budgets; closure receipts pending |
+| PD-19 | Restart reports foreign WAL record / duplicate index | Exact failing test and measured rate not recovered; unknown | `28f4dbaf7` independently reproduces and repairs queued bare-fd reuse; connection to this restart failure is unconfirmed. The separate enter-error P1 below does not establish causality. Retained restart evidence and closure remain required. |
+
+Existing-entry corrections from source history: PD-08 has both fixture-lifecycle
+isolation (`611dede80`) and same-path sidecar publication (`df86421f6`) fixes.
+PD-09's fork-window hypothesis was refuted by `0453d30e8` (5/5 immediate reopen
+failures without fork); joined shutdown addresses retained ownership. PD-07's
+`d048ba810` removes the fork mechanisms without identifying which kernel ENOMEM
+cause occurred. These observations do not substitute for closure receipts.
+
+Open source followups: orphan sidecar staging-file recovery, and ordering
+same-path deletion/retirement against publication. The latter's source audit
+is not yet a reproduced failure. Neither is closed by the publication UUID or
+io_uring fixes. See the snapshot report and `SIDECAR-STRIPE-ASSIGNMENT.md`.
 
 The leader-replay test
 `network::data_server::tests::fresh_leader_recovers_peer_witness_before_duplicate_write_replays`
@@ -48,3 +77,70 @@ reports, outside this register.
 Closing an entry needs its fix commit and a stress result at the same
 concurrency (nextest `--stress-count` and repeated in-process libtest runs),
 recorded here.
+
+## Additional P1: io_uring enter-error lifetime (2026-10-21)
+
+Found in the independent review of fd-retention fix `28f4dbaf7`. The enter-error
+path predates that fix: `submit_and_wait` errors called `drain_with_error`, which
+returned or freed buffers before outstanding kernel requests had completed.
+An `EINTR` while waiting is not cancellation or a CQE. This finding is separate
+from the suspected PD-19 cause; neither review establishes PD-19 causality.
+
+Implementation in `storage/io_uring.rs` and `storage/io_uring/lifetime.rs`:
+
+- Retry `EINTR`, `EAGAIN` and `EBUSY`, reaping available CQEs and retaining all
+  other requests, files, owners and permits.
+- On a terminal enter error, stop admission and attempt bounded synchronous
+  cancellation. Only a request's actual CQE authorizes releasing its resources;
+  even a successful cancel-all return is not treated as a per-request proof.
+- Without a CQE, retain the allocation, file, owner and permit until process
+  exit, including on worker unwind. Wake the waiter with an error and no
+  buffer. For unresolved writes, retained write permits prevent a false clean
+  shutdown or LOCK release. The existing shutdown budget and process watchdog
+  apply once shutdown begins; terminal ring failure does not initiate shutdown.
+  Older kernels without synchronous cancellation take this same safe path.
+
+Regression evidence: inject `EINTR` after submitting a real socket read while
+its peer has supplied no bytes. The old handler returned `-EINTR` (red); the
+fixed handler waits for the real read completion. Additional controls cover
+resource-pressure errors, real cancellation, unsupported cancellation, a
+successful cancellation return without a CQE, worker unwind, and a receiver
+waker that panics while other kernel requests remain pending. The retention
+controls use child processes so intentional quarantine does not leak resources
+into the rest of the test suite; they do not serialize concurrent tests.
+
+Status: implemented in the parallel-defects worktree; focused validation and
+stress receipts accompany the review package. This does not close the v5
+adoption gate or replace the pending full ladder and audit.
+
+Local validation (CPU bounded; no added serial settings): all 12 io_uring
+tests passed in each of 30 nextest stress iterations (360 executions), and
+io_uring + file_ops + ownership passed 10 in-process runs at 1024 test threads
+(28 per run, 280 executions). Architecture tests passed 180 + 42. Raw logs,
+the patch and source hashes are retained in
+`reviews/codex-uring-p1-fix-20261021-1/`. No ignored tests were added.
+
+Independent Astra source review approved the scoped lifetime fix with no
+must-fix correctness findings; its report is retained as `astra-review.json`
+in the package above. Three optional coverage additions now assert known-CQE
+reclamation without cancellation support, terminal EIO through the real worker
+with queued requests and subsequent admission refusal, and explicit close
+failure/no clean-shutdown record with a quarantined write permit. These tests
+strengthen coverage; they do not change the production implementation.
+
+Followup receipt: `reviews/codex-uring-p1-followup-20261021-1/review.json`
+records 15 io_uring tests across 30 nextest iterations (450 executions), and
+31 io_uring/file-operations/ownership tests across 10 in-process runs at 1024
+threads (310 executions), all passing. These are retained focused receipts;
+the full v5 ladder/audit and candidate closure remain pending.
+
+PD-12 focused receipt (2026-10-21): signed fix `e508e8a4d`, reviewed chaos
+source hash `c01703296d512c0729f550697bd9e805e437116435626e265c84615fd87869dd`.
+The complete five-test chaos binary passed 30 nextest repetitions (150
+executions) and 10 in-process repetitions at 1024 threads (50 executions).
+Receipts: `reviews/readiness-chaos-focused-stress-20261021/summary.json`.
+A new real-majority-failover control exercises nonfounder leadership; its
+initial election-only setup failure is retained in the firstpass evidence.
+This is focused concurrent evidence, not a full-suite loaded reproduction
+or a completed v5 adoption gate. The signed enter-error P1 checkpoint is
+`58eb2d68a`; neither commit establishes PD-19 causality.
