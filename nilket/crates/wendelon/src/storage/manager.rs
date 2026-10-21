@@ -710,6 +710,10 @@ pub struct SlabManager {
 	/// restart may repeat a cut before the durable completion receipt exists;
 	/// that is safe and only creates another historical slab to backfill.
 	secondary_index_declaration_cuts: DashSet<SecondaryIndexCoverageKey>,
+	/// Serializes sidecar publication per path. An active-buffer seal and a
+	/// lifecycle backfill can persist the same source slab's sidecar at once;
+	/// unserialized, their temp files and catalog rows interleave.
+	secondary_index_persist_stripes: Box<[Mutex<()>]>,
 	/// Per-slab rewrite claim shared by every reader that must retain a physical
 	/// source and every operation that can replace or retire it. Secondary-index
 	/// backfill holds a shared claim; compaction, retention, and ADR 0095 table

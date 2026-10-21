@@ -141,10 +141,23 @@ pub(super) fn secondary_index_sidecar_path(dir: &Path, relative: &str) -> std::i
 	Ok(dir.join(relative_path))
 }
 
+/// A temp name owned by one persist, so no other writer can unlink, rewrite or
+/// rename it.
 pub(super) fn secondary_index_sidecar_tmp_path(path: &Path) -> PathBuf {
 	let mut tmp = path.as_os_str().to_os_string();
-	tmp.push(".tmp");
+	tmp.push(format!(".{}.tmp", uuid::Uuid::new_v4().simple()));
 	PathBuf::from(tmp)
+}
+
+/// Lock stripes for sidecar publication: bounded memory, and two different
+/// sidecars share a stripe only by hash collision, which merely orders them.
+pub(super) const SECONDARY_INDEX_PERSIST_STRIPES: usize = 64;
+
+fn secondary_index_persist_stripe(path: &Path) -> usize {
+	use std::hash::{Hash, Hasher};
+	let mut hasher = std::collections::hash_map::DefaultHasher::new();
+	path.hash(&mut hasher);
+	(hasher.finish() % SECONDARY_INDEX_PERSIST_STRIPES as u64) as usize
 }
 
 /// ADR 0097: where the slab a backfill is about to read came from.
@@ -1010,28 +1023,41 @@ impl SlabManager {
 		let row = PersistentSecondaryIndexSegmentRow::from(info.clone());
 		let encoded = segment.encode()?;
 		let path = secondary_index_sidecar_path(&self.config.dir, &info.segment_path)?;
+		// One publication per path at a time: the file rename and the catalog row
+		// below must describe the same segment, which two interleaved writers of
+		// one source slab (an active-buffer seal and a backfill) cannot promise.
+		let _publication = self.secondary_index_persist_stripes
+			[secondary_index_persist_stripe(&path)]
+		.lock()
+		.await;
 		let tmp_path = secondary_index_sidecar_tmp_path(&path);
 		if let Some(parent) = path.parent() {
 			self.file_ops.create_dir_all(parent).await?;
 		}
-		let _ = unlink_local_file(self.file_ops.as_ref(), &tmp_path).await;
-		self.file_ops.write_all(&tmp_path, &encoded).await?;
-		let tmp = self
-			.file_ops
-			.open(
-				&tmp_path,
-				OpenFlags {
-					read: true,
-					write: true,
-					create: false,
-					create_new: false,
-					truncate: false,
-					direct: false,
-				},
-			)
-			.await?;
-		self.file_ops.fsync(&tmp).await?;
-		self.file_ops.rename(&tmp_path, &path).await?;
+		let staged = async {
+			self.file_ops.write_all(&tmp_path, &encoded).await?;
+			let tmp = self
+				.file_ops
+				.open(
+					&tmp_path,
+					OpenFlags {
+						read: true,
+						write: true,
+						create: false,
+						create_new: false,
+						truncate: false,
+						direct: false,
+					},
+				)
+				.await?;
+			self.file_ops.fsync(&tmp).await?;
+			self.file_ops.rename(&tmp_path, &path).await
+		}
+		.await;
+		if let Err(err) = staged {
+			let _ = unlink_local_file(self.file_ops.as_ref(), &tmp_path).await;
+			return Err(err);
+		}
 		fsync_parent_dir(self.file_ops.as_ref(), &path).await?;
 		if let Some(index) = &self.persistent_index {
 			if let Err(err) = index.upsert_secondary_index_segment(row.clone()).await {
