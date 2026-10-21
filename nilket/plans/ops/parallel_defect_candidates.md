@@ -64,10 +64,10 @@ failures without fork); joined shutdown addresses retained ownership. PD-07's
 `d048ba810` removes the fork mechanisms without identifying which kernel ENOMEM
 cause occurred. These observations do not substitute for closure receipts.
 
-Open source followups: orphan sidecar staging-file recovery, and ordering
-same-path deletion/retirement against publication. The latter's source audit
-is not yet a reproduced failure. Neither is closed by the publication UUID or
-io_uring fixes. See the snapshot report and `SIDECAR-STRIPE-ASSIGNMENT.md`.
+Sidecar deletion/retirement ordering and orphan staging-file recovery now have
+separate implementations and focused receipts below. Neither is closed by the
+publication UUID or io_uring fixes alone; full adoption evidence remains pending.
+See the snapshot report and `SIDECAR-STRIPE-ASSIGNMENT.md`.
 
 The leader-replay test
 `network::data_server::tests::fresh_leader_recovers_peer_witness_before_duplicate_write_replays`
@@ -165,8 +165,9 @@ architecture checks passed. Receipts:
 artifact reused by the first GREEN attempt was rejected as invalid provenance;
 package artifacts were invalidated and actual fresh GREEN execution verified.
 The repair preserves restored stored-path behavior. Logical late resurrection,
-blocking work after cancellation, read/publication consistency, and orphan-temp
-recovery remain separate unresolved questions; this is ordering evidence only.
+blocking publication work after cancellation, and read/publication consistency
+remain separate unresolved questions; this is ordering evidence only. Startup
+orphan recovery has its own scoped implementation and receipt below.
 
 PD-19 evidence recovery: the stopped bigfoot hunt has 40 historical runs at
 intended source `df86421f6`, before both io_uring fixes. One retention reopen
@@ -175,3 +176,25 @@ This is not a current-source rate or causal proof. See
 `reviews/readiness-focused-reviews-20261021/pd19-hunt/REPORT.md` for exact
 provenance limits and all 22 failing test names. Neither old failures nor its
 one passing run close the current candidates.
+
+Orphan sidecar recovery receipt (2026-10-21): signed `c5b9db554` performs
+startup-only cleanup under the directory owner, before producers start. It
+recognizes only the publisher's UUID-v4 temporary spelling at the exact sidecar
+directory depth; descriptor-relative traversal does not follow child symlinks.
+Committed catalogs/segments, legacy temporary names, unrelated files and
+malformed paths remain intact. Cleanup retains ownership and the write permit
+through cancellation, and fsyncs a changed leaf even after a later sweep error.
+This assumes an operator-trusted root and cooperative ownership; it does not
+claim protection against arbitrary hostile filesystem mutation.
+
+Independent Astra production review and Sol regression review passed. Actual
+publisher interruption, repeated reopen, ownership cancellation, symlink and
+partial-failure controls are included. Architecture passed 180/180; the exact
+11-test selection passed 30 nextest repetitions (330 executions) and 10
+in-process repetitions at explicit 1024 threads (110 executions). Receipts:
+`reviews/readiness-sidecar-orphans-stress-r4-20261021/summary.json`. The initial
+179/180 architecture failure is preserved; adding the new production module to
+the pinned module census restored the guard without weakening it. The tests'
+child-process guard bounds execution and reaps children on cancellation. These
+are focused checks, without additional background suite load; full-stack
+concurrency adoption and lifecycle/read-coherence followups remain pending.
