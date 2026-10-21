@@ -153,7 +153,7 @@ pub(super) fn secondary_index_sidecar_tmp_path(path: &Path) -> PathBuf {
 /// sidecars share a stripe only by hash collision, which merely orders them.
 pub(super) const SECONDARY_INDEX_PERSIST_STRIPES: usize = 64;
 
-fn secondary_index_persist_stripe(path: &Path) -> usize {
+pub(super) fn secondary_index_persist_stripe(path: &Path) -> usize {
 	use std::hash::{Hash, Hasher};
 	let mut hasher = std::collections::hash_map::DefaultHasher::new();
 	path.hash(&mut hasher);
@@ -1129,6 +1129,19 @@ impl SlabManager {
 		&self,
 		key: &SecondaryIndexSegmentInfo,
 	) -> std::io::Result<bool> {
+		// Derive publication's canonical path before reading the current row.
+		// Keep the stripe through durable deletion, unlink and coverage updates.
+		let relative_path = secondary_index_segment_storage_path(
+			key.tenant_id,
+			key.table_object_id,
+			key.index_object_id,
+			key.source_slab_id,
+		);
+		let path = secondary_index_sidecar_path(&self.config.dir, &relative_path)?;
+		let _publication = self.secondary_index_persist_stripes
+			[secondary_index_persist_stripe(&path)]
+		.lock()
+		.await;
 		let Some(row) = self
 			.secondary_index_segments
 			.get(&key.key())
@@ -1136,10 +1149,12 @@ impl SlabManager {
 		else {
 			return Ok(false);
 		};
+		// A restored row may retain a format-valid noncanonical relative path.
+		// Publication still locks by canonical identity; unlink the stored path.
+		let path = secondary_index_sidecar_path(&self.config.dir, &row.segment_path)?;
 		if let Some(index) = &self.persistent_index {
 			index.delete_secondary_index_segment(row.key).await?;
 		}
-		let path = secondary_index_sidecar_path(&self.config.dir, &row.segment_path)?;
 		unlink_local_file(self.file_ops.as_ref(), &path).await?;
 		self.secondary_index_segments.remove(&row.key);
 		self.remove_secondary_index_source_reference(
@@ -1274,6 +1289,19 @@ impl SlabManager {
 		&self,
 		info: &SecondaryIndexSegmentInfo,
 	) -> std::io::Result<bool> {
+		// Derive publication's canonical path before reading the current row.
+		// Keep the stripe through durable deletion, unlink and coverage updates.
+		let relative_path = secondary_index_segment_storage_path(
+			info.tenant_id,
+			info.table_object_id,
+			info.index_object_id,
+			info.source_slab_id,
+		);
+		let path = secondary_index_sidecar_path(&self.config.dir, &relative_path)?;
+		let _publication = self.secondary_index_persist_stripes
+			[secondary_index_persist_stripe(&path)]
+		.lock()
+		.await;
 		let Some(row) = self
 			.secondary_index_segments
 			.get(&info.key())
@@ -1282,10 +1310,12 @@ impl SlabManager {
 			self.forget_secondary_index_source_slab(info.coverage_key(), info.source_slab_id);
 			return Ok(false);
 		};
+		// A restored row may retain a format-valid noncanonical relative path.
+		// Publication still locks by canonical identity; unlink the stored path.
+		let path = secondary_index_sidecar_path(&self.config.dir, &row.segment_path)?;
 		if let Some(index) = &self.persistent_index {
 			index.delete_secondary_index_segment(row.key).await?;
 		}
-		let path = secondary_index_sidecar_path(&self.config.dir, &row.segment_path)?;
 		unlink_local_file(self.file_ops.as_ref(), &path).await?;
 		self.secondary_index_segments.remove(&row.key);
 		self.remove_secondary_index_source_reference(
