@@ -1,24 +1,11 @@
-//! M3 coherent fixture chains (one per profile and Bootstrap length) and the positive binding
-//! surface: Admission-only signing on a profile-2 install, the derived installed profile/length,
-//! the {137, 189} governed marker and shared-Admission-key pin binding. The isolated length
-//! refusals on these chains are in `profile_two_refusal`. The committed, trusted and
-//! verified builders are test-only FIXTURES; the checked paths they feed are the published ones.
-//! Manifests come from the independent M2 vectors; entry fingerprints and command digests are
-//! Rust-derived through those fixtures.
-use super::profile_three_fixture::{
-	Chain, chain_of, enrolled, exact_pin, genesis, grant, reduce_at,
-};
+//! The profile-1/2 manifests "a" and "b" (inlined) for the bridge users that remain until c2, and
+//! the {137, 189, 241} governed marker, which is state-only. The profile-1/2 install and chain tests
+//! went at c1: a profile-1/2 tuple can no longer be built (the snapshot encoder and the tuple refuse
+//! them), so those paths are unreachable end to end.
+use super::profile_three_fixture::{M3_PRIMARY, chain_of};
 use super::*;
-use crate::storage::mutation_visibility::root2::admin::manifest::{
-	AnyAdminManifest2, ManifestProfile2,
-};
-use crate::storage::mutation_visibility::root2::admin_command::*;
-use crate::storage::mutation_visibility::root2::admin_install::*;
-use crate::storage::mutation_visibility::root2::admin_statement::*;
 use crate::storage::mutation_visibility::root2::origin::*;
-use crate::storage::mutation_visibility::root2::provisioning::replica_anchor::*;
 use crate::storage::mutation_visibility::root2::validation::admission_permission;
-use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 
 fn unhex(s: &str) -> Vec<u8> {
 	(0..s.len())
@@ -28,137 +15,27 @@ fn unhex(s: &str) -> Vec<u8> {
 }
 /// Independent M2 manifests: "a" profile 1 (admin seed 0x21); "b" profile 2 (admin seed 0x42,
 /// governance seed 0x92).
+// Inlined from the deleted provisioning/tests/profile_two_inventory_vectors.json (c1); the
+// profile-1/2 users of these two manifests go in c2.
+const MANIFEST_A: &str = concat!(
+	"56495341444d320001000100212121212121212121212121212121212e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e",
+	"210100000000000012121212121212121212121212121212884b8857f4eaa1613c61504db34d4beaf346517a",
+	"0e31de3cddd4d9b4201d9d0b0300000005000000000000000000000000000000000000000000000000000000",
+	"0000000000",
+);
+const MANIFEST_B: &str = concat!(
+	"56495341444d320001000200424242424242424242424242424242424d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d",
+	"4201000000000000717171717171717171717171717171712152f8d19b791d24453242e15f2eab6cb7cffa7b",
+	"6a5ed30097960e069881db120300000005000000000000000000000000000000000000000000000000000000",
+	"000000000091919191919191919191919191919191c6d0c796bb4c3c923615f8dc85e6fc35149eb6b1317de5",
+	"23d3a5085584f5c109ff010000",
+);
 pub(super) fn manifest_bytes(name: &str) -> Vec<u8> {
-	let v: serde_json::Value = serde_json::from_str(include_str!(
-		"../provisioning/tests/profile_two_inventory_vectors.json"
-	))
-	.unwrap();
-	unhex(v["manifests"][name]["bytes"].as_str().unwrap())
-}
-pub(super) const ADMISSION_SEED_A: u8 = 0x21;
-pub(super) const ADMISSION_SEED_B: u8 = 0x42;
-pub(super) const GOVERNANCE_SEED_B: u8 = 0x92;
-pub(super) fn chain(name: &str, length: u64) -> Chain {
-	chain_of(&manifest_bytes(name), length)
-}
-/// The published non-length conjuncts of `bootstrap_authorized`, restated test-side.
-pub(super) fn non_length_conjuncts(c: &Chain) -> [bool; 5] {
-	let Command2::Bootstrap { epoch, control, .. } = &c.cmd else {
-		unreachable!()
-	};
-	let (g, cl, l, fp, d) = c.entry.fields();
-	let r = tuple_record2(&c.tuple).identity;
-	[
-		(r.generation, r.cluster, r.bootstrap) == (g, cl, l),
-		(r.bootstrap_fingerprint, r.bootstrap_command) == (fp, d),
-		r.initial_epoch == *epoch,
-		r.genesis_fingerprint == genesis(),
-		*control == tuple_manifest_pin2(&c.tuple),
-	]
-}
-pub(super) const PROFILES: [(&str, u64, u64); 2] = [("a", 137, 189), ("b", 189, 137)];
-
-/// r2 §5: a profile-2 administrator verifies statements and envelopes under its Admission key
-/// only; the governance key's valid signatures over the same preimages are refused.
-#[test]
-fn a_profile_two_install_verifies_under_the_admission_key_only() {
-	let c = chain("b", 189);
-	let admin = install_admin2(&c.rooted, &c.tuple).unwrap();
-	assert_eq!(admin_profile2(&admin), ManifestProfile2::Two);
-	let AnyAdminManifest2::Two(m) = &c.any else {
-		unreachable!()
-	};
-	let role = admin_governance2(&admin).unwrap();
-	assert!(role == m.governance());
-	let governance = SigningKey::from_bytes(&[GOVERNANCE_SEED_B; 32]);
-	assert_eq!(governance.verifying_key().to_bytes(), role.key());
-	assert_eq!(
-		SigningKey::from_bytes(&[ADMISSION_SEED_B; 32])
-			.verifying_key()
-			.to_bytes(),
-		admin_key2(&admin)
-	);
-	// Statements.
-	let Command2::AdmissionPermission(by_admission) = grant(&admin, ADMISSION_SEED_B) else {
-		unreachable!()
-	};
-	let Command2::AdmissionPermission(by_governance) = grant(&admin, GOVERNANCE_SEED_B) else {
-		unreachable!()
-	};
-	assert_eq!(
-		by_admission[..273],
-		by_governance[..273],
-		"same signed bytes"
-	);
-	let preimage = admin_statement_preimage2(&by_governance).unwrap();
-	let sig = ed25519_dalek::Signature::from_bytes(&by_governance[273..].try_into().unwrap());
-	VerifyingKey::from_bytes(&role.key())
-		.unwrap()
-		.verify_strict(&preimage, &sig)
-		.expect("the governance signature is valid over the same preimage");
-	assert!(check_admin_statement2(&admin.view(), &by_admission).is_ok());
-	assert_eq!(
-		check_admin_statement2(&admin.view(), &by_governance).err(),
-		Some(StatementError2::Signature)
-	);
-	// Envelopes.
-	let ctx = admin_context2(&admin);
-	let digest = [0x5A; 32];
-	let unsigned = encode_admin_command2(&ctx, digest, &[0; 64]).unwrap();
-	let preimage = admin_command_preimage2(&unsigned).unwrap();
-	let envelope = |seed: u8| {
-		let s = SigningKey::from_bytes(&[seed; 32])
-			.sign(&preimage)
-			.to_bytes();
-		encode_admin_command2(&ctx, digest, &s).unwrap()
-	};
-	assert!(check_admin_command2(&admin, &envelope(ADMISSION_SEED_B), digest).is_ok());
-	assert_eq!(
-		check_admin_command2(&admin, &envelope(GOVERNANCE_SEED_B), digest).err(),
-		Some(EnvelopeError2::Signature)
-	);
-	// The issuer gate: Admission-signed Grant applies; the governance-signed one is a consumed
-	// statement denial.
-	let state = enrolled(&c.rooted, &c.any);
-	assert!(matches!(
-		reduce_at(&state, &admin, &grant(&admin, ADMISSION_SEED_B), 4),
-		Ok(ApplyResult2::Permission { .. })
-	));
-	assert!(matches!(
-		reduce_at(&state, &admin, &grant(&admin, GOVERNANCE_SEED_B), 4),
-		Ok(ApplyResult2::Denied { reason: 8, .. })
-	));
-	// A profile-1 administrator has no governance role.
-	let p1 = chain("a", 137);
-	let admin = install_admin2(&p1.rooted, &p1.tuple).unwrap();
-	assert_eq!(
-		(admin_profile2(&admin), admin_governance2(&admin)),
-		(ManifestProfile2::One, None)
-	);
-}
-
-/// The installed profile, length and governance are one derivation, for both profiles.
-#[test]
-fn installed_profile_length_and_governance_agree() {
-	for (name, right, _) in PROFILES {
-		let c = chain(name, right);
-		let admin = install_admin2(&c.rooted, &c.tuple).unwrap();
-		let two = admin_governance2(&admin).is_some();
-		assert_eq!(admin_profile2(&admin) == ManifestProfile2::Two, two);
-		assert_eq!(admin_manifest_len2(&admin) == 189, two);
-		assert_eq!(admin_manifest_len2(&admin), tuple_manifest_len2(&c.tuple));
-		assert_eq!(admin_profile2(&admin), c.any.profile());
-		let a = c.any.admission();
-		assert_eq!(
-			(admin_id2(&admin), admin_key2(&admin)),
-			(a.admin_id, a.admin_key)
-		);
-		assert!(admin_namespace2(&admin) == a.namespace);
-		assert_eq!(
-			admin_context2(&admin).manifest_pin,
-			exact_pin(&manifest_bytes(name))
-		);
-	}
+	unhex(match name {
+		"a" => MANIFEST_A,
+		"b" => MANIFEST_B,
+		other => panic!("no inlined manifest {other}"),
+	})
 }
 
 /// r1 §5: governed iff the commitment length is 137 or 189 (an immutable state-only marker).
@@ -177,7 +54,8 @@ fn admission_governed_marker_is_either_canonical_length() {
 			},
 		)
 		.unwrap();
-	let base = chain("b", 189).rooted;
+	// The marker is state-only: any rooted state carries it (a profile-1/2 tuple no longer builds).
+	let base = chain_of(&M3_PRIMARY, 241).rooted;
 	for (length, governed) in [
 		(137, true),
 		(189, true),
@@ -203,45 +81,4 @@ fn admission_governed_marker_is_either_canonical_length() {
 			assert_eq!(got, Some((18, None)), "{length}");
 		}
 	}
-}
-
-/// M2 item 6 carried into M3: two coherent profile-2 manifests sharing the Admission fields
-/// (and key) but not the governance id or key have their own pins; a tuple never installs against
-/// the other root (pin binding, not Admission-key substitution). A different mask is no manifest.
-#[test]
-fn shared_admission_key_never_substitutes_across_roots() {
-	for other in ["b_governance_id", "b_governance_key"] {
-		let b = chain("b", 189);
-		let x = chain(other, 189);
-		assert_eq!(
-			(
-				x.any.admission().admin_key,
-				x.any.admission().generation,
-				x.any.admission().cluster
-			),
-			(
-				b.any.admission().admin_key,
-				b.any.admission().generation,
-				b.any.admission().cluster
-			)
-		);
-		assert_ne!(tuple_manifest_pin2(&x.tuple), tuple_manifest_pin2(&b.tuple));
-		assert!(install_admin2(&x.rooted, &x.tuple).is_ok());
-		assert_eq!(
-			install_admin2(&b.rooted, &x.tuple).err(),
-			Some(InstallError2::Commitment(CommitmentField2::ControlDigest)),
-			"{other}"
-		);
-		assert_eq!(
-			install_admin2(&x.rooted, &b.tuple).err(),
-			Some(InstallError2::Commitment(CommitmentField2::ControlDigest)),
-			"{other}"
-		);
-	}
-	let mut mask = manifest_bytes("b");
-	mask[185..189].copy_from_slice(&0xFFu32.to_le_bytes());
-	assert_eq!(
-		AnyAdminManifest2::decode(&mask).err(),
-		Some(crate::storage::mutation_visibility::root2::admin::errors::AdminManifestError2::UnsupportedAction)
-	);
 }

@@ -5,6 +5,7 @@
 use super::*;
 use crate::storage::mutation_visibility::root2::admin::manifest::AnyAdminManifest2;
 use crate::storage::mutation_visibility::root2::admin::record::BootstrapObservation2;
+use crate::storage::mutation_visibility::root2::codec::hash;
 use crate::storage::mutation_visibility::root2::provisioning::inventory::*;
 use crate::storage::mutation_visibility::root2::provisioning::owner_core::v2::encode_evidence2;
 use crate::storage::mutation_visibility::root2::provisioning::owner_core::*;
@@ -65,7 +66,7 @@ impl Drop for Scratch {
 	}
 }
 fn sha(b: &[u8]) -> [u8; 32] {
-	crate::storage::mutation_visibility::root2::codec::hash(b"", b)
+	hash(b"", b)
 }
 fn op(n: u8) -> OpId2 {
 	op_id2([n; 16]).unwrap()
@@ -124,7 +125,7 @@ fn retire_first() -> OwnerRequest2 {
 	};
 	OwnerRequest2::Retire {
 		identity: id_of("reserve"),
-		terminal: Some(TerminalObservation3 {
+		terminal: TerminalObservation3 {
 			identity: record.identity,
 			original_admin_key: id_of("reserve").admin_key,
 			at: Log2 {
@@ -135,7 +136,7 @@ fn retire_first() -> OwnerRequest2 {
 			fingerprint: [0x19; 32],
 			command_digest: [0x1a; 32],
 			state_digest: [0x1b; 32],
-		}),
+		},
 	}
 }
 fn torn_tail() -> Vec<u8> {
@@ -537,6 +538,8 @@ fn an_open_time_lock_sync_failure_returns_no_owner_and_no_lock() {
 		);
 	}
 	assert!(!s.at("SYNC_FAILED").exists());
+	// No lock is held and nothing but the lock file was left: initialization now succeeds.
+	drop(OwnerDir2::create_v2(&s.0).unwrap());
 	drop(s.open());
 }
 #[test]

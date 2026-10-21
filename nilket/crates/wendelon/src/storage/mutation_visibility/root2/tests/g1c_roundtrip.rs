@@ -1,6 +1,5 @@
 use super::profile_three_fixture::{M3_OTHER, M3_PRIME, exact_pin};
 use super::*;
-use crate::storage::mutation_visibility::root2::admin::manifest::AdminManifest2;
 use crate::storage::mutation_visibility::root2::admin::manifest::AnyAdminManifest2;
 use crate::storage::mutation_visibility::root2::admin_install::*;
 use crate::storage::mutation_visibility::root2::entry_identity::EntryPosition2;
@@ -21,6 +20,7 @@ use crate::storage::mutation_visibility::root2::provisioning::replica_anchor::{
 	MAX_SNAPSHOT_BYTES2, PinnedBoundTuple2, ReplicaAnchorError2, ReplicaInput2,
 };
 use crate::storage::mutation_visibility::root2::provisioning::replica_read::*;
+use crate::storage::mutation_visibility::root2::provisioning::terminal::TerminalObservation3;
 use crate::storage::mutation_visibility::root2::trust::CommittedEntry2;
 use std::ffi::CString;
 use std::fs;
@@ -58,13 +58,9 @@ fn unhex(s: &str) -> Vec<u8> {
 		.map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
 		.collect()
 }
-fn manifest(name: &str) -> (Vec<u8>, Digest2) {
-	let a: serde_json::Value =
-		serde_json::from_str(include_str!("../provisioning/tests/anchor_vectors.json")).unwrap();
-	let m = unhex(a["manifests"][name]["bytes"].as_str().unwrap());
-	let pin = unhex(a["manifests"][name]["pin"].as_str().unwrap());
-	(m, pin.try_into().unwrap())
-}
+// The profile-1 anchor manifest m1's pin (inlined at c1 from the removed `anchor_vectors.json`
+// key); only the legacy length-0 Bootstrap row still commits to it, until c2.
+const M1_PIN: &str = "9ff7fc086037177bfd8046f790a5765cb23c3cb30a69b7118ce4d793e14fefc2";
 fn canonical_genesis() -> Digest2 {
 	let v: serde_json::Value = serde_json::from_str(include_str!("install_vectors.json")).unwrap();
 	unhex(v["genesis"].as_str().unwrap()).try_into().unwrap()
@@ -83,7 +79,7 @@ struct Boot {
 impl Boot {
 	fn standard() -> Self {
 		Self {
-			control: manifest("m1").1,
+			control: unhex(M1_PIN).try_into().unwrap(),
 			length: 137,
 			index: 2,
 		}
@@ -114,37 +110,6 @@ impl Boot {
 			.unwrap()
 			.0
 	}
-}
-fn reserve_m1() -> OwnerRequest2 {
-	OwnerRequest2::Reserve {
-		manifest: AnyAdminManifest2::One(AdminManifest2::decode(&manifest("m1").0).unwrap()),
-	}
-}
-fn m1_identity() -> RootIdentity2 {
-	let (m, pin) = manifest("m1");
-	let parsed = AdminManifest2::decode(&m).unwrap();
-	RootIdentity2 {
-		generation: parsed.generation,
-		cluster: parsed.cluster,
-		pin,
-		admin_key: parsed.admin_key,
-	}
-}
-fn approve(state: &MutationAuthorityState2) -> OwnerRequest2 {
-	let id = m1_identity();
-	OwnerRequest2::Approve {
-		identity: id,
-		observation: observe_bootstrap2(state).unwrap(),
-		confirmed: id,
-	}
-}
-// Exports into `out` and places the m1 manifest beside it; returns the export's pin, checked here
-// independently against the exported bytes.
-fn export(owner: &mut OwnerDir2, out: &Path, name: &str) -> Digest2 {
-	let pin = owner.export(out, name).unwrap();
-	assert_eq!(pin, sha(&fs::read(out.join(name)).unwrap()));
-	fs::write(out.join("m1.adm"), manifest("m1").0).unwrap();
-	pin
 }
 fn read(
 	dir: &Path,
@@ -221,21 +186,6 @@ fn bound_export_three(
 	let pin = export_three(&mut owner, &out.0, "inv");
 	(owner, pin)
 }
-// An owner with m1 reserved and approved from `state`, exported to `out` as "inv".
-fn bound_export(
-	owner_dir: &Scratch,
-	out: &Scratch,
-	state: &MutationAuthorityState2,
-) -> (OwnerDir2, Digest2) {
-	let mut owner = OwnerDir2::open(&owner_dir.0).unwrap();
-	owner.apply(&op(1), &reserve_m1()).unwrap();
-	let outcome = owner.apply(&op(2), &approve(state)).unwrap();
-	assert_eq!(outcome.original.map(|e| e.op), Some(EventOp2::Approve));
-	assert_eq!(outcome.current, RootState2::Bound);
-	let pin = export(&mut owner, &out.0, "inv");
-	(owner, pin)
-}
-
 #[test]
 fn observation_round_trips_through_owner_approval_to_an_installed_admin() {
 	let (owner_dir, out) = (Scratch::new(), Scratch::new());
@@ -382,30 +332,39 @@ fn owner_conflict_paths_follow_the_accepted_owner_semantics() {
 #[test]
 fn retirement_and_pins() {
 	let (owner_dir, out) = (Scratch::new(), Scratch::new());
-	let state = Boot::standard().rooted();
-	let (mut owner, p1) = bound_export(&owner_dir, &out, &state);
-	owner
+	let state = Boot::three().rooted();
+	let (mut owner, p1) = bound_export_three(&owner_dir, &out, &state);
+	// The committed terminal Retire (plain Retire no longer exists).
+	let retired = owner
 		.apply(
 			&op(3),
 			&OwnerRequest2::Retire {
-				terminal: None,
-				identity: m1_identity(),
+				terminal: TerminalObservation3 {
+					identity: observe_bootstrap2(&state).unwrap().identity,
+					original_admin_key: three_identity().admin_key,
+					at: l(9),
+					fingerprint: [0x19; 32],
+					command_digest: [0x1a; 32],
+					state_digest: [0x1b; 32],
+				},
+				identity: three_identity(),
 			},
 		)
 		.unwrap();
-	let p2 = export(&mut owner, &out.0, "inv-2");
-	let m1_pin = manifest("m1").1;
+	assert_eq!(retired.current, RootState2::Retired);
+	let p2 = export_three(&mut owner, &out.0, "inv-2");
+	let pin = three_pin();
 	assert_eq!(
-		read(&out.0, "m1.adm", Some(&m1_pin), "inv-2", Some(&p2)).err(),
+		read(&out.0, "m3.adm", Some(&pin), "inv-2", Some(&p2)).err(),
 		Some(ReplicaReadError2::Tuple(ReplicaAnchorError2::NotBound(
 			RootState2::Retired
 		)))
 	);
 	// Retained limitation: the coherent older Bound export with its own matching pin still
 	// validates. This is not a freshness or rollback defence.
-	assert!(read(&out.0, "m1.adm", Some(&m1_pin), "inv", Some(&p1)).is_ok());
+	assert!(read(&out.0, "m3.adm", Some(&pin), "inv", Some(&p1)).is_ok());
 	assert_eq!(
-		read(&out.0, "m1.adm", Some(&m1_pin), "inv-2", Some(&p1)).err(),
+		read(&out.0, "m3.adm", Some(&pin), "inv-2", Some(&p1)).err(),
 		Some(ReplicaReadError2::Tuple(
 			ReplicaAnchorError2::InventoryPinMismatch
 		))

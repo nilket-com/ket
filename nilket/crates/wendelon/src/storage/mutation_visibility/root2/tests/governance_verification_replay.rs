@@ -288,11 +288,6 @@ fn s3_all_nine_raw_state_context_position_and_structure_first_errors() {
 #[tokio::test(flavor = "current_thread")]
 #[cfg(target_endian = "little")]
 async fn s3_raw_consumed_denials_scope_and_resigned_issuer_failures_advance_only_coverage() {
-	let f = g::Fixture::new("a");
-	for c in g::nine(&f) {
-		let side = f.envelope(&f.state, &c, 0x92);
-		assert_denied_run(&f, c, side).await;
-	}
 	let f = g::Fixture::primary();
 	let c = Command2::EnrollSelector(g::selector(&f));
 	let ctx = crate::storage::mutation_visibility::root2::admin_install::admin_context2(

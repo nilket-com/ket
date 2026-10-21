@@ -3,7 +3,7 @@ import hashlib,json,struct
 from pathlib import Path
 p=Path(__file__).parent
 v=json.loads((p.parent/'profile_three_vectors.json').read_text())
-approve=bytes.fromhex(v['events'][5])
+approve=bytes.fromhex(v['p3_events'][1])  # the profile-3 Approve (identity and observation)
 identity=approve[36:132]
 observation=bytearray(approve[144:352]);observation[:8]=b'VISAOB2\0';observation[200:208]=bytes(8)
 log=struct.pack('<QIQ',1,1,9)

@@ -1,4 +1,5 @@
-//! Immutable owner-directory format. Initialization never upgrades a legacy directory.
+//! Immutable owner-directory format. Only a marked v2 directory opens; an unmarked one is
+//! refused as `Unformatted` and never upgraded.
 use super::*;
 use std::io::{Read, Write};
 use std::os::unix::fs::MetadataExt;
@@ -42,7 +43,7 @@ fn magic(owner: &OwnerDir2) -> Owned<Option<Vec<u8>>> {
 }
 impl OwnerDir2 {
 	pub(in crate::storage::mutation_visibility::root2) fn open(path: &Path) -> Owned<Self> {
-		let mut owner = Self::locked(path)?;
+		let owner = Self::locked(path)?;
 		if present(&owner.path.join(TEMP))? {
 			return Err(OwnerIoError2::Incomplete);
 		}
@@ -64,27 +65,18 @@ impl OwnerDir2 {
 			if prefix == b"VISIEV02" {
 				return Err(OwnerIoError2::ForeignFormat);
 			}
-			owner.format = DirectoryFormat2::Two;
-		} else if magic(&owner)
-			.ok()
-			.flatten()
-			.is_some_and(|p| p == b"VISOEV02")
+			return Ok(owner);
+		}
+		// No marker: an unmarked directory (any log, or none) is not a v2 directory.
+		Err(OwnerIoError2::Unformatted)
+	}
+	// Only the known foreign framing is recognized here; unreadable/short probes defer to the
+	// existing operation's typed read path.
+	pub(super) fn check_framing(&self) -> Owned<()> {
+		if let Ok(Some(p)) = magic(self)
+			&& p == b"VISIEV02"
 		{
 			return Err(OwnerIoError2::ForeignFormat);
-		}
-		// A failed no-follow/regular header probe never selects v2. All operation paths
-		// re-read and preserve the original typed I/O error at its existing phase.
-		Ok(owner)
-	}
-	// Only known cross-framing is recognized here; unreadable/short probes defer to the
-	// existing operation's typed read path. The selected handle format never changes.
-	pub(super) fn check_framing(&self) -> Owned<()> {
-		if let Ok(Some(p)) = magic(self) {
-			if (self.format == DirectoryFormat2::One && p == b"VISOEV02")
-				|| (self.format == DirectoryFormat2::Two && p == b"VISIEV02")
-			{
-				return Err(OwnerIoError2::ForeignFormat);
-			}
 		}
 		Ok(())
 	}
@@ -134,7 +126,6 @@ impl OwnerDir2 {
 		owner.synced(IoStep2::FormatLogSync, result)?;
 		let result = run(IoStep2::FormatFinalSync, || owner.dir.sync_all());
 		owner.synced(IoStep2::FormatFinalSync, result)?;
-		owner.format = DirectoryFormat2::Two;
 		Ok(owner)
 	}
 }

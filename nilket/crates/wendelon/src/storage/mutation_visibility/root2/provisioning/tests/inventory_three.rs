@@ -5,6 +5,7 @@ use super::*;
 use crate::storage::mutation_visibility::root2::admin::manifest::{
 	AdminManifestThree3, AnyAdminManifest2, any_manifest_digest2,
 };
+use crate::storage::mutation_visibility::root2::codec::hash;
 use crate::storage::mutation_visibility::root2::provisioning::inventory::v2::{
 	EVENT_BYTES2, MAX_LOG_BYTES2, decode_event2, fold_events2,
 };
@@ -431,7 +432,7 @@ fn error_precedence_never_lets_a_tail_mask_earlier_corruption() {
 		Err(LogError2::Ambiguous {
 			boundary: boundary as u64,
 			tail_len: tail.len() as u32,
-			tail_sha256: crate::storage::mutation_visibility::root2::codec::hash(b"", tail),
+			tail_sha256: hash(b"", tail),
 		})
 	};
 	assert_eq!(fold(&cat(&[e1, e2, &bad_last])), amb(2 * E, &bad_last));

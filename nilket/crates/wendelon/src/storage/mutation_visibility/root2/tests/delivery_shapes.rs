@@ -12,29 +12,24 @@
 //! No freshness, owner authentication, transport or concurrency guarantee is claimed: a coherent
 //! older tuple stays accepted under its original pins.
 //!
-//! The deliveries are profile 3 (`M3_*`) in marked directories, except the two plain-Retire cases,
-//! which stay on the profile-2 manifest "b" until plain Retire is removed.
+//! The deliveries are profile 3 (`M3_*`) in marked directories; a Retired root is reached by the
+//! committed terminal Retire.
 use super::owner_tuple_delivery::{
-	INVENTORY, MANIFEST, Scratch, delivered, delivered_three, identity_of, read_at, read_delivered,
-	reserved,
+	INVENTORY, MANIFEST, Scratch, delivered_three, identity_of, read_at, read_delivered, reserved,
 };
 use super::profile_three_fixture::{M3_OTHER, M3_PRIMARY, rooted};
-use super::profile_two_binding::manifest_bytes;
 use super::*;
 use crate::storage::mutation_visibility::root2::admin::manifest::AnyAdminManifest2;
 use crate::storage::mutation_visibility::root2::admin_install::observe_bootstrap2;
 use crate::storage::mutation_visibility::root2::provisioning::anchored::AnchoredError2;
-use crate::storage::mutation_visibility::root2::provisioning::inventory::{
-	RootIdentity2, RootState2,
-};
+use crate::storage::mutation_visibility::root2::provisioning::inventory::RootState2;
 use crate::storage::mutation_visibility::root2::provisioning::owner_core::{
 	EventOp2, OwnerRequest2, op_id2,
 };
-use crate::storage::mutation_visibility::root2::provisioning::owner_log::{
-	OwnerDir2, OwnerIoError2,
-};
+use crate::storage::mutation_visibility::root2::provisioning::owner_log::OwnerIoError2;
 use crate::storage::mutation_visibility::root2::provisioning::replica_anchor::*;
 use crate::storage::mutation_visibility::root2::provisioning::replica_read::*;
+use crate::storage::mutation_visibility::root2::provisioning::terminal::TerminalObservation3;
 use std::fs;
 use std::os::unix::fs::symlink;
 
@@ -161,10 +156,10 @@ fn a_mixed_generation_tuple_is_not_in_inventory() {
 
 /// Prepared, Conflicted and Retired roots from legitimate owner operations: `export_tuple`
 /// refuses each, so the snapshot is the owner's `export` and the manifest is the reserved exact
-/// bytes (Retired: the root's own earlier owner export).
+/// bytes (Retired: the root's own earlier owner export, after its terminal Retire).
 #[test]
 fn a_root_that_is_not_bound_is_refused_with_its_state() {
-	let bytes = manifest_bytes("b");
+	let bytes = M3_PRIMARY.to_vec();
 	let id = identity_of(&bytes);
 	let not_bound = |dir: &Scratch, pin: &Digest2| {
 		read_at(&dir.0, MANIFEST, Some(&id.pin), INVENTORY, Some(pin)).err()
@@ -186,7 +181,7 @@ fn a_root_that_is_not_bound_is_refused_with_its_state() {
 	);
 	// Conflicted: approved from the observation of another root's committed Bootstrap.
 	let (_dir, mut owner) = reserved(&bytes);
-	let other = rooted(&manifest_bytes("a"), 137).3;
+	let other = rooted(&M3_OTHER, 241).3;
 	let conflicted = owner
 		.apply(
 			&op_id2([2; 16]).unwrap(),
@@ -215,8 +210,8 @@ fn a_root_that_is_not_bound_is_refused_with_its_state() {
 		tuple_err(E::NotBound(RootState2::Conflicted))
 	);
 	// Retired after a Bound export: the earlier owner manifest with the Retired snapshot.
-	let mut d = delivered("b", 189);
-	retire(&mut d.owner, id);
+	let mut d = delivered_three(&M3_PRIMARY);
+	retire(&mut d);
 	let retired = Scratch::new();
 	assert_eq!(
 		d.owner
@@ -235,13 +230,22 @@ fn a_root_that_is_not_bound_is_refused_with_its_state() {
 		tuple_err(E::NotBound(RootState2::Retired))
 	);
 }
-fn retire(owner: &mut OwnerDir2, identity: RootIdentity2) {
-	let retired = owner
+/// The committed terminal Retire of a delivered root, observed from its own committed Bootstrap.
+fn retire(d: &mut super::owner_tuple_delivery::Delivered) {
+	let retired = d
+		.owner
 		.apply(
 			&op_id2([3; 16]).unwrap(),
 			&OwnerRequest2::Retire {
-				terminal: None,
-				identity,
+				terminal: TerminalObservation3 {
+					identity: observe_bootstrap2(&d.root).unwrap().identity,
+					original_admin_key: d.identity.admin_key,
+					at: l(9),
+					fingerprint: [0x19; 32],
+					command_digest: [0x1a; 32],
+					state_digest: [0x1b; 32],
+				},
+				identity: d.identity,
 			},
 		)
 		.unwrap();
@@ -253,7 +257,7 @@ fn retire(owner: &mut OwnerDir2, identity: RootIdentity2) {
 
 /// Prepared and Conflicted profile-3 roots from legitimate owner operations in a marked directory:
 /// `export_tuple` refuses each, so the snapshot is the owner's `export` and the manifest is the
-/// reserved exact bytes. (The Retired case needs a terminal Retire; it moves with plain Retire.)
+/// reserved exact bytes. (The Retired case is in `a_root_that_is_not_bound_is_refused_with_its_state`.)
 #[test]
 fn a_profile_three_root_that_is_not_bound_is_refused_with_its_state() {
 	let bytes = M3_PRIMARY.to_vec();
@@ -415,9 +419,9 @@ fn a_replaced_file_needs_the_newly_supplied_pin() {
 /// under its original pins; the owner itself now refuses to export it.
 #[test]
 fn a_coherent_older_tuple_is_still_accepted() {
-	let mut d = delivered("b", 189);
+	let mut d = delivered_three(&M3_PRIMARY);
 	let before = read_delivered(&d).unwrap();
-	retire(&mut d.owner, d.identity);
+	retire(&mut d);
 	let now = Scratch::new();
 	assert_eq!(
 		d.owner

@@ -44,7 +44,7 @@ impl Owned {
 			&op(n),
 			&OwnerRequest2::Retire {
 				identity: id,
-				terminal: Some(o),
+				terminal: o,
 			},
 		)
 	}
@@ -101,12 +101,19 @@ fn terminal_observation_requires_retired_profile_three() {
 		observe_retirement3(&f.f.state),
 		Err(ObserveError2::NotRetired)
 	);
-	for profile in ["a", "b"] {
-		let f = wire::Fixture::new(profile);
-		assert_eq!(
-			observe_retirement3(&f.state),
-			Err(ObserveError2::ProfileUnsupported)
-		);
+	// admin_install.rs:365 (§4.1 invariant): a state not committed to 241 bytes is refused before
+	// the retirement check, whether or not it is retired; the 241 twins are NotRetired above and
+	// the accepted observation below.
+	let (retired, o) = observation();
+	assert_eq!(observe_retirement3(&retired.f.state).unwrap(), o);
+	for wrong in [240, 242] {
+		for state in [&f.f.state, &retired.f.state] {
+			assert_eq!(
+				observe_retirement3(&with_control_len_for_test(state, wrong)),
+				Err(ObserveError2::ProfileUnsupported),
+				"{wrong}"
+			);
+		}
 	}
 }
 #[test]
@@ -195,20 +202,6 @@ fn terminal_retry_every_observation_field_before_after_reopen() {
 					OwnerIoError2::Decision(OwnerError2::RetirementMismatch)
 				);
 			}
-			assert_eq!(
-				b.owner
-					.as_mut()
-					.unwrap()
-					.apply(
-						&op(n),
-						&OwnerRequest2::Retire {
-							identity: id,
-							terminal: None
-						}
-					)
-					.unwrap_err(),
-				OwnerIoError2::Decision(OwnerError2::RetirementMismatch)
-			);
 		}
 	}
 	assert_eq!(std::fs::read(b.path.join("inventory.log")).unwrap(), before);
@@ -243,8 +236,6 @@ fn terminal_artifact_export_and_binding() {
 	assert_eq!(std::fs::read(b.out.join("terminal")).unwrap(), bytes);
 }
 
-use crate::storage::mutation_visibility::root2::provisioning::inventory;
-mod old_v3_snapshot;
 #[test]
 fn terminal_independent_wire_and_state_goldens() {
 	use crate::storage::mutation_visibility::root2::admin::record::BootstrapIdentity2;
@@ -329,18 +320,15 @@ fn terminal_independent_wire_and_state_goldens() {
 		);
 	}
 }
+/// S4: a Retired entry is terminal-retired; one without its terminal record (the removed plain
+/// Retire) is refused on encode as on decode (corpus N7). The accepted twin is the owner's v4 export.
 #[test]
-fn terminal_snapshot_legacy_bytes_and_frozen_reader() {
+fn a_retired_entry_without_its_terminal_is_refused_on_encode() {
 	let (f, o) = observation();
 	let (mut b, id) = bound(&f);
 	b.apply(3, o, id).unwrap();
-	b.snapshot();
-	let raw = std::fs::read(b.out.join("snapshot")).unwrap();
-	assert_eq!(
-		old_v3_snapshot::decode_snapshot2(&raw).unwrap_err(),
-		old_v3_snapshot::SnapshotError2::Version
-	);
-	let mut legacy = LogState2 {
+	assert_eq!(b.snapshot().entries[0].state, RootState2::Retired);
+	let plain = LogState2 {
 		roots: vec![RootEntry2 {
 			identity: id,
 			manifest: f.f.any.clone(),
@@ -352,24 +340,9 @@ fn terminal_snapshot_legacy_bytes_and_frozen_reader() {
 		last_seq: 3,
 	};
 	assert_eq!(
-		encode_snapshot2(&legacy).unwrap(),
-		old_v3_snapshot::encode_snapshot2(&legacy).unwrap()
+		encode_snapshot2(&plain).err(),
+		Some(SnapshotError2::Binding)
 	);
-	for profile in ["a", "b"] {
-		let fixture = wire::Fixture::new(profile);
-		let m = fixture.any.admission();
-		legacy.roots[0].identity = RootIdentity2 {
-			generation: m.generation,
-			cluster: m.cluster,
-			pin: any_manifest_digest2(&fixture.any.encode().unwrap()),
-			admin_key: m.admin_key,
-		};
-		legacy.roots[0].manifest = fixture.any.clone();
-		assert_eq!(
-			encode_snapshot2(&legacy).unwrap(),
-			old_v3_snapshot::encode_snapshot2(&legacy).unwrap()
-		);
-	}
 }
 #[test]
 fn terminal_snapshot_v4_rejects_padding_profile_state_sequence() {
@@ -476,20 +449,6 @@ fn terminal_first_transition_each_bootstrap_field_refused_without_append() {
 		b.apply(3, x, id).unwrap_err(),
 		OwnerIoError2::Decision(OwnerError2::RetirementMismatch)
 	);
-	assert_eq!(
-		b.owner
-			.as_mut()
-			.unwrap()
-			.apply(
-				&op(3),
-				&OwnerRequest2::Retire {
-					identity: id,
-					terminal: None
-				}
-			)
-			.unwrap_err(),
-		OwnerIoError2::Decision(OwnerError2::CommittedRetirementRequired)
-	);
 }
 #[test]
 fn terminal_observation_state_digest_keeps_non_tip_bytes() {
@@ -595,10 +554,16 @@ fn terminal_export_refusal_order_and_reader_profile_manifest_negatives() {
 	};
 	let bytes = encode_terminal_artifact3(&a).unwrap();
 	assert_eq!(read_terminal3(&bytes, &retired.f.any, pin).unwrap(), a);
-	for profile in ["a", "b"] {
+	// The manifest half of the profile check (terminal.rs:208, removed in d): a profile-1/2
+	// manifest still decodes, and the reader refuses it.
+	for name in ["a", "b"] {
+		let old =
+			AnyAdminManifest2::decode(&super::super::profile_two_binding::manifest_bytes(name))
+				.unwrap();
 		assert_eq!(
-			read_terminal3(&bytes, &wire::Fixture::new(profile).any, pin),
-			Err(TerminalError3::Profile)
+			read_terminal3(&bytes, &old, pin),
+			Err(TerminalError3::Profile),
+			"{name}"
 		);
 	}
 	let mut base = retired.f.any.admission().clone();

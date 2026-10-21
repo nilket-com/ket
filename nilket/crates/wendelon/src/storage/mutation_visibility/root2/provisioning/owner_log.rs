@@ -6,8 +6,9 @@
 //! Supported path model: Linux, a local filesystem, one owner host, and trusted owner and export
 //! parent paths that are not replaced while an operation runs. Nothing here yields a root,
 //! authority state or trust token, and a marker's absence never proves no sync failed.
-use super::format::DirectoryFormat2;
 use super::inventory::RootState2;
+use super::inventory::v2 as events;
+use super::owner_core::v2 as decisions;
 use super::owner_core::{
 	Classification2, Decision2, EventRef2, OpId2, OwnerError2, OwnerRequest2, event_request_key2,
 };
@@ -99,6 +100,8 @@ pub(in crate::storage::mutation_visibility::root2) enum OwnerIoError2 {
 	Incomplete,
 	MarkerCorrupt,
 	ForeignFormat,
+	/// No `OWNER_FORMAT` marker: an unmarked (pre-v2) directory is never opened or upgraded.
+	Unformatted,
 	CreationNotEmpty,
 	Busy,
 	InsecureDir,
@@ -185,7 +188,6 @@ pub(in crate::storage::mutation_visibility::root2) struct OwnerDir2 {
 	id: (u64, u64),
 	lock: File,
 	poisoned: Option<IoStep2>,
-	format: DirectoryFormat2,
 }
 
 impl Drop for OwnerDir2 {
@@ -248,7 +250,6 @@ impl OwnerDir2 {
 			id,
 			lock,
 			poisoned: None,
-			format: DirectoryFormat2::One,
 		})
 	}
 
@@ -271,7 +272,7 @@ impl OwnerDir2 {
 		self.check_framing()?;
 		self.blocked()?;
 		let view = self.clean_view()?;
-		match self.format.decide(view.bytes(), op, req) {
+		match decisions::decide2(view.bytes(), op, req) {
 			Decision2::Refuse(e) => Err(OwnerIoError2::Decision(e)),
 			Decision2::Retry { original, current } => {
 				self.resync(view.log.is_some(), &[])?;
@@ -288,9 +289,7 @@ impl OwnerDir2 {
 				})
 			}
 			Decision2::Append(event) => {
-				let encoded = self
-					.format
-					.encode(&event)
+				let encoded = events::encode_event2(&event)
 					.map_err(|_| OwnerIoError2::Decision(OwnerError2::Codec))?;
 				let at = view.bytes().len() as u64;
 				let file = self.log_for_write(view.log.is_none())?;
@@ -305,7 +304,9 @@ impl OwnerDir2 {
 					after.classification,
 					Classification2::Clean { last_seq } if last_seq == event.seq
 				);
-				let state = self.format.fold(after.bytes()).ok().filter(|_| verified);
+				let state = events::fold_events2(after.bytes())
+					.ok()
+					.filter(|_| verified);
 				let current = state.and_then(|s| {
 					let id = event.identity?;
 					s.roots.iter().find(|r| r.identity == id).map(|r| r.state)
@@ -340,17 +341,18 @@ impl OwnerDir2 {
 				actual: tail_sha256,
 			});
 		}
-		let (name, bytes) = self
-			.format
-			.encode_evidence(view.bytes())
+		let (name, bytes) = decisions::encode_evidence2(view.bytes())
 			.map_err(|_| OwnerIoError2::EvidenceInvalid)?;
-		let evidence = self
-			.format
-			.decode_evidence(&name, &bytes)
+		let evidence = decisions::decode_evidence2(&name, &bytes)
 			.map_err(|_| OwnerIoError2::EvidenceInvalid)?;
 		self.ensure_repairs()?;
 		self.publish_evidence(&name, &bytes)?;
-		let context = self.format.context(&evidence);
+		let context = decisions::repair_context2(
+			&evidence.prefix_sha256,
+			evidence.boundary,
+			evidence.original_len,
+			&evidence.tail_sha256,
+		);
 		self.resume(&context)
 	}
 
@@ -386,10 +388,8 @@ impl OwnerDir2 {
 		let (out, out_handle) = self.export_dir(out_dir)?;
 		let view = self.clean_view()?;
 		self.resync(view.log.is_some(), &[])?;
-		let state = self
-			.format
-			.fold(view.bytes())
-			.map_err(|_| OwnerIoError2::RepairVerifyFailed)?;
+		let state =
+			events::fold_events2(view.bytes()).map_err(|_| OwnerIoError2::RepairVerifyFailed)?;
 		let bytes = encode_snapshot2(&state).map_err(|_| OwnerIoError2::Io {
 			step: IoStep2::ExportWrite,
 			errno: None,
@@ -423,10 +423,8 @@ impl OwnerDir2 {
 		let (out, out_handle) = self.export_dir(out_dir)?;
 		let view = self.clean_view()?;
 		self.resync(view.log.is_some(), &[])?;
-		let state = self
-			.format
-			.fold(view.bytes())
-			.map_err(|_| OwnerIoError2::RepairVerifyFailed)?;
+		let state =
+			events::fold_events2(view.bytes()).map_err(|_| OwnerIoError2::RepairVerifyFailed)?;
 		let mut matching = state
 			.roots
 			.iter()
@@ -491,10 +489,8 @@ impl OwnerDir2 {
 		let (out, out_handle) = self.export_dir(out_dir)?;
 		let view = self.clean_view()?;
 		self.resync(view.log.is_some(), &[])?;
-		let state = self
-			.format
-			.fold(view.bytes())
-			.map_err(|_| OwnerIoError2::RepairVerifyFailed)?;
+		let state =
+			events::fold_events2(view.bytes()).map_err(|_| OwnerIoError2::RepairVerifyFailed)?;
 		let root = state
 			.roots
 			.iter()
@@ -503,9 +499,10 @@ impl OwnerDir2 {
 		if root.state != RootState2::Retired || root.manifest.profile() != ManifestProfile2::Three {
 			return Err(OwnerIoError2::ExportNotTerminal(root.state));
 		}
+		// Every Retired root carries its terminal record: plain Retire no longer exists.
 		let terminal = root
 			.terminal
-			.ok_or(OwnerIoError2::ExportNotTerminal(root.state))?;
+			.ok_or(OwnerIoError2::Decision(OwnerError2::Inconsistent))?;
 		let failed = |_| OwnerIoError2::Decision(OwnerError2::Codec);
 		let manifest = root
 			.manifest
@@ -575,7 +572,7 @@ impl OwnerDir2 {
 			.iter()
 			.map(|(n, b)| (n.as_str(), b.as_slice()))
 			.collect();
-		let classification = self.format.classify(log.as_deref().unwrap_or(&[]), &refs);
+		let classification = decisions::classify2(log.as_deref().unwrap_or(&[]), &refs);
 		if !matches!(
 			classification,
 			Classification2::Clean { .. }

@@ -2,11 +2,7 @@ use super::*;
 #[test]
 fn all_old_profiles_and_no_extension_inverse_proof() {
 	let f = F::new();
-	for root in [
-		wire::Fixture::new("a").state,
-		wire::Fixture::new("b").state,
-		f.f.state,
-	] {
+	for root in [f.f.state] {
 		let r = root_and_origin2(&root).unwrap().0;
 		assert_eq!(
 			r.encode().unwrap(),

@@ -241,11 +241,6 @@ fn s3_presence_length_and_structural_refusals_are_atomic() {
 #[test]
 #[cfg(target_endian = "little")]
 fn s3_profile_context_digest_signature_and_scope_denials_are_consumed() {
-	let f = Fixture::new("a");
-	for command in nine(&f) {
-		let side = f.envelope(&f.state, &command, 0x92);
-		denied(&f, &command, &side);
-	}
 	let f = Fixture::primary();
 	let command = Command2::EnrollSelector(selector(&f));
 	let ctx = admin_context2(&install_admin2(&f.state, &f.pin).unwrap());

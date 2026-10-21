@@ -330,6 +330,38 @@ fn signatures_are_strict_and_bound_to_the_admin_key() {
 		Some(StatementError2::Signature)
 	);
 }
+/// Role-key substitution: the same statement bytes signed, validly, by `M3_PRIME`'s governance or
+/// recovery key instead of its administrator key are refused at the signature. The
+/// administrator-signed statement is the accepted twin.
+#[test]
+fn a_statement_signed_by_another_role_key_is_refused() {
+	use crate::storage::mutation_visibility::root2::tests::profile_three_fixture::{
+		PRIME_GOVERNANCE, PRIME_RECOVERY,
+	};
+	use ed25519_dalek::{Signer, SigningKey};
+	let a = admin();
+	let grant = statement("p3_grant");
+	assert!(check_admin_statement2(&a.view(), &grant).is_ok());
+	let preimage = admin_statement_preimage2(&grant.clone().try_into().unwrap()).unwrap();
+	for (role, seed) in [
+		("governance", PRIME_GOVERNANCE.1),
+		("recovery", PRIME_RECOVERY.1),
+	] {
+		let signer = SigningKey::from_bytes(&[seed; 32]);
+		let signature = signer.sign(&preimage);
+		signer
+			.verifying_key()
+			.verify_strict(&preimage, &signature)
+			.expect("a valid signature by the role key");
+		let mut by_role = grant.clone();
+		by_role[273..].copy_from_slice(&signature.to_bytes());
+		assert_eq!(
+			check_admin_statement2(&a.view(), &by_role).err(),
+			Some(StatementError2::Signature),
+			"{role}"
+		);
+	}
+}
 #[test]
 fn statements_survive_tip_advances_and_do_not_cross_roots() {
 	let grant = statement("p3_grant");

@@ -5,8 +5,10 @@ use super::{
 	RepairOutcome2,
 };
 use crate::storage::mutation_visibility::root2::codec::hash;
+use crate::storage::mutation_visibility::root2::provisioning::inventory::v2 as events;
+use crate::storage::mutation_visibility::root2::provisioning::owner_core::v2 as decisions;
 use crate::storage::mutation_visibility::root2::provisioning::owner_core::{
-	Classification2, MAX_REPAIR_ENTRIES2, evidence_name2,
+	Classification2, MAX_REPAIR_ENTRIES2,
 };
 use crate::storage::mutation_visibility::root2::types::Digest2;
 use std::fs::{self, DirBuilder, File, OpenOptions};
@@ -221,11 +223,9 @@ impl OwnerDir2 {
 			Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
 			Err(e) => return Err(io_err(IoStep2::LogOpen)(e)),
 		};
-		let bytes = bounded(f, self.format.max_log() + 1, IoStep2::LogRead)?;
-		// Validate against the already selected handle; never select a new format here.
-		if (self.format == super::DirectoryFormat2::One && bytes.starts_with(b"VISOEV02"))
-			|| (self.format == super::DirectoryFormat2::Two && bytes.starts_with(b"VISIEV02"))
-		{
+		let bytes = bounded(f, events::MAX_LOG_BYTES2 + 1, IoStep2::LogRead)?;
+		// A v1 log under a v2 marker is foreign; it is never read as v2.
+		if bytes.starts_with(b"VISIEV02") {
 			return Err(OwnerIoError2::ForeignFormat);
 		}
 		Ok(Some(bytes))
@@ -277,7 +277,7 @@ impl OwnerDir2 {
 			let bytes = if name.ends_with(".rep") {
 				bounded(
 					self.evidence_file(&name)?,
-					self.format.max_evidence() + 1,
+					decisions::MAX_EVIDENCE_BYTES2 + 1,
 					IoStep2::EvidenceRead,
 				)?
 			} else {
@@ -304,7 +304,7 @@ impl OwnerDir2 {
 			.iter()
 			.map(|(n, b)| (n.as_str(), b.as_slice()))
 			.collect();
-		let classification = self.format.classify(log.as_deref().unwrap_or(&[]), &refs);
+		let classification = decisions::classify2(log.as_deref().unwrap_or(&[]), &refs);
 		Ok(View {
 			log,
 			entries,
@@ -385,7 +385,7 @@ impl OwnerDir2 {
 			Err(e) if e.kind() == ErrorKind::AlreadyExists => {
 				let existing = bounded(
 					self.evidence_file(name)?,
-					self.format.max_evidence() + 1,
+					decisions::MAX_EVIDENCE_BYTES2 + 1,
 					IoStep2::EvidenceRead,
 				)?;
 				if existing != bytes {
@@ -410,17 +410,13 @@ impl OwnerDir2 {
 			Classification2::Pending { .. } => return Err(OwnerIoError2::RepairContextMismatch),
 			other => return Err(OwnerIoError2::Classified(other)),
 		}
-		let name = evidence_name2(context);
+		let name = decisions::evidence_name2(context);
 		let Some((_, bytes)) = view.entries.iter().find(|(n, _)| *n == name) else {
 			return Err(OwnerIoError2::RepairContextMismatch);
 		};
-		let evidence = self
-			.format
-			.decode_evidence(&name, bytes)
+		let evidence = decisions::decode_evidence2(&name, bytes)
 			.map_err(|_| OwnerIoError2::EvidenceInvalid)?;
-		let expected = self
-			.format
-			.expected(&evidence)
+		let expected = decisions::expected_repair_event2(&evidence)
 			.map_err(|_| OwnerIoError2::EvidenceInvalid)?;
 		self.resync(view.log.is_some(), std::slice::from_ref(&name))?;
 		let file = self.log_for_write(view.log.is_none())?;

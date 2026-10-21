@@ -10,9 +10,8 @@ use crate::storage::mutation_visibility::root2::admin::record::{
 use crate::storage::mutation_visibility::root2::codec::hash;
 
 const MAGIC: &[u8; 8] = b"VISINV02";
+/// Version 1 is the empty snapshot only; entries are version 3, or version 4 with a terminal.
 const VERSION: u16 = 1;
-/// Canonical iff at least one entry is tagged profile 2; version 1 carries no tag.
-const VERSION_TWO: u16 = 2;
 const VERSION_THREE: u16 = 3;
 const VERSION_FOUR: u16 = 4;
 const HEADER: usize = 22;
@@ -68,6 +67,17 @@ fn array<const N: usize>(b: &[u8], at: usize) -> [u8; N] {
 	b[at..at + N].try_into().expect("fixed snapshot offset")
 }
 
+// S4: a Retired entry is terminal-retired (plain Retire no longer exists). Checked by the public
+// encoder and, on decode, after canonicality, so a v4 without its terminal stays `NotCanonical`.
+fn terminal_binding(s: &InventorySnapshot2) -> Result<(), SnapshotError2> {
+	if s.entries
+		.iter()
+		.any(|e| e.state == RootState2::Retired && e.terminal.is_none())
+	{
+		return Err(SnapshotError2::Binding);
+	}
+	Ok(())
+}
 // Every invariant a snapshot must satisfy, checked identically for encode and decode.
 fn validate(s: &InventorySnapshot2) -> Result<(), SnapshotError2> {
 	if s.entries.len() > MAX_ROOTS2 {
@@ -134,17 +144,18 @@ fn validate(s: &InventorySnapshot2) -> Result<(), SnapshotError2> {
 }
 fn encode(s: &InventorySnapshot2) -> Result<Vec<u8>, SnapshotError2> {
 	validate(s)?;
+	// Transitional: only profile-3 entries have a tag.
+	if s.entries
+		.iter()
+		.any(|e| e.profile != ManifestProfile2::Three)
+	{
+		return Err(SnapshotError2::ProfileTag);
+	}
 	let len = HEADER + s.entries.len() * ENTRY + TRAILER;
 	let version = if s.entries.iter().any(|e| e.terminal.is_some()) {
 		VERSION_FOUR
-	} else if s
-		.entries
-		.iter()
-		.any(|e| e.profile == ManifestProfile2::Three)
-	{
+	} else if !s.entries.is_empty() {
 		VERSION_THREE
-	} else if s.entries.iter().any(|e| e.profile == ManifestProfile2::Two) {
-		VERSION_TWO
 	} else {
 		VERSION
 	};
@@ -159,13 +170,7 @@ fn encode(s: &InventorySnapshot2) -> Result<Vec<u8>, SnapshotError2> {
 		b.extend(e.identity.pin);
 		b.extend(e.identity.admin_key);
 		b.push(state_byte(e.state));
-		// Version 2 writes every tag explicitly; version 1 has none.
-		b.push(match (version != VERSION, e.profile) {
-			(false, _) => 0,
-			(true, ManifestProfile2::One) => 1,
-			(true, ManifestProfile2::Two) => 2,
-			(true, ManifestProfile2::Three) => 3,
-		});
+		b.push(3);
 		b.extend([0u8; 6]);
 		b.extend(e.last_seq.to_le_bytes());
 		if let Some(t) = &e.terminal {
@@ -190,7 +195,7 @@ pub(in crate::storage::mutation_visibility::root2) fn encode_snapshot2(
 	if state.roots.len() > MAX_ROOTS2 {
 		return Err(SnapshotError2::Count);
 	}
-	encode(&InventorySnapshot2 {
+	let s = InventorySnapshot2 {
 		export_seq: state.last_seq,
 		entries: state
 			.roots
@@ -204,7 +209,10 @@ pub(in crate::storage::mutation_visibility::root2) fn encode_snapshot2(
 				terminal: r.terminal,
 			})
 			.collect(),
-	})
+	};
+	let bytes = encode(&s)?;
+	terminal_binding(&s)?;
+	Ok(bytes)
 }
 pub(in crate::storage::mutation_visibility::root2) fn decode_snapshot2(
 	bytes: &[u8],
@@ -217,14 +225,14 @@ pub(in crate::storage::mutation_visibility::root2) fn decode_snapshot2(
 		return Err(SnapshotError2::Magic);
 	}
 	let version = u16::from_le_bytes(array(bytes, 8));
-	if version != VERSION
-		&& version != VERSION_TWO
-		&& version != VERSION_THREE
-		&& version != VERSION_FOUR
-	{
+	if version != VERSION && version != VERSION_THREE && version != VERSION_FOUR {
 		return Err(SnapshotError2::Version);
 	}
 	let count = u32::from_le_bytes(array(bytes, 10)) as usize;
+	// Version 1 is the empty snapshot only.
+	if version == VERSION && count > 0 {
+		return Err(SnapshotError2::Version);
+	}
 	if count > MAX_ROOTS2 {
 		return Err(SnapshotError2::Count);
 	}
@@ -245,23 +253,13 @@ pub(in crate::storage::mutation_visibility::root2) fn decode_snapshot2(
 			pin: array(e, 32),
 			admin_key: array(e, 64),
 		};
-		let profile = if version == VERSION {
-			if e[97..104].iter().any(|&x| x != 0) {
-				return Err(SnapshotError2::Reserved);
-			}
-			ManifestProfile2::One
-		} else {
-			let tag = match e[97] {
-				1 => ManifestProfile2::One,
-				2 => ManifestProfile2::Two,
-				3 if version >= VERSION_THREE => ManifestProfile2::Three,
-				_ => return Err(SnapshotError2::ProfileTag),
-			};
-			if e[98..104].iter().any(|&x| x != 0) {
-				return Err(SnapshotError2::Reserved);
-			}
-			tag
-		};
+		if e[97] != 3 {
+			return Err(SnapshotError2::ProfileTag);
+		}
+		if e[98..104].iter().any(|&x| x != 0) {
+			return Err(SnapshotError2::Reserved);
+		}
+		let profile = ManifestProfile2::Three;
 		let state = match e[96] {
 			1 => RootState2::Prepared,
 			2 => RootState2::Bound,
@@ -307,5 +305,6 @@ pub(in crate::storage::mutation_visibility::root2) fn decode_snapshot2(
 	if encode(&s)? != bytes {
 		return Err(SnapshotError2::NotCanonical);
 	}
+	terminal_binding(&s)?;
 	Ok(s)
 }

@@ -1,4 +1,4 @@
-//! Format-v2 owner decisions and evidence. The v1 implementation remains frozen in the parent.
+//! Format-v2 owner decisions and evidence, the only owner core.
 use super::super::inventory::v2::{
 	EVENT_BYTES2, MAX_TAIL2, decode_event2, encode_event2, fold_events2,
 };
@@ -61,11 +61,10 @@ fn decide(log: &[u8], op_id: &OpId2, req: &OwnerRequest2) -> Result<Decision2, O
 			if root.manifest.profile()
 				== super::super::super::admin::manifest::ManifestProfile2::Three
 			{
-				return retired_retry(root, terminal.as_ref());
+				return retired_retry(root, terminal);
 			}
-			if terminal.is_some() {
-				return Err(OwnerError2::ProfileUnsupported);
-			}
+			// Transitional: no profile-1/2 root folds from a v2 log.
+			return Err(OwnerError2::ProfileUnsupported);
 		}
 		return Ok(Decision2::Retry {
 			original: EventRef2 { op, seq: event.seq },
@@ -157,11 +156,9 @@ fn decide(log: &[u8], op_id: &OpId2, req: &OwnerRequest2) -> Result<Decision2, O
 				== super::super::super::admin::manifest::ManifestProfile2::Three
 			{
 				if root.state == RootState2::Retired {
-					return retired_retry(root, terminal.as_ref());
+					return retired_retry(root, terminal);
 				}
-				let o = terminal
-					.as_ref()
-					.ok_or(OwnerError2::CommittedRetirementRequired)?;
+				let o = terminal;
 				if root.state != RootState2::Bound {
 					return Err(OwnerError2::NotBound);
 				}
@@ -177,14 +174,8 @@ fn decide(log: &[u8], op_id: &OpId2, req: &OwnerRequest2) -> Result<Decision2, O
 					.map_err(|_| OwnerError2::Codec)?;
 				(*identity, EventBody2::RetireTerminal { terminal })
 			} else {
-				if terminal.is_some() {
-					return Err(OwnerError2::ProfileUnsupported);
-				}
-				if root.state == RootState2::Retired {
-					return Ok(Decision2::NoOp(RootState2::Retired));
-				}
-				ordinary()?;
-				(*identity, EventBody2::Retire)
+				// Transitional: no profile-1/2 root folds from a v2 log.
+				return Err(OwnerError2::ProfileUnsupported);
 			}
 		}
 		_ => return Err(OwnerError2::Inconsistent),
@@ -501,20 +492,40 @@ pub(in crate::storage::mutation_visibility::root2) fn classify2(
 
 fn retired_retry(
 	root: &RootEntry2,
-	observation: Option<&super::super::terminal::TerminalObservation3>,
+	o: &super::super::terminal::TerminalObservation3,
 ) -> Result<Decision2, OwnerError2> {
-	let Some(o) = observation else {
-		return Err(if root.terminal.is_some() {
-			OwnerError2::RetirementMismatch
-		} else {
-			OwnerError2::CommittedRetirementRequired
-		});
-	};
-	let terminal = root.terminal.ok_or(OwnerError2::RetirementMismatch)?;
+	// Every Retired root carries its terminal record: plain Retire no longer exists.
+	let terminal = root.terminal.ok_or(OwnerError2::Inconsistent)?;
 	let digest = super::super::terminal::observation_digest3(o)
 		.map_err(|_| OwnerError2::RetirementMismatch)?;
 	if digest != terminal.observation_digest {
 		return Err(OwnerError2::RetirementMismatch);
 	}
 	Ok(Decision2::NoOp(RootState2::Retired))
+}
+
+// The contextual collision path cannot be reached with a self-consistent derived id (that would
+// need a digest fixed point), so the shared helper is pinned directly with synthetic ids.
+#[cfg(test)]
+#[test]
+fn prefix_op_id_helper_matches_only_ids_present_in_the_prefix() {
+	let event = |seq: u64, op: u8| {
+		encode_event2(&Event2 {
+			seq,
+			op_id: [op; 16],
+			identity: None,
+			body: EventBody2::Repair {
+				tail_sha256: [0x77; 32],
+				original_len: (seq - 1) * EVENT_BYTES2 as u64 + 10,
+				boundary: (seq - 1) * EVENT_BYTES2 as u64,
+				tail_len: 10,
+			},
+		})
+		.unwrap()
+	};
+	let prefix = [event(1, 0x31), event(2, 0x32)].concat();
+	assert!(prefix_has_op_id(&prefix, &[0x31; 16]));
+	assert!(prefix_has_op_id(&prefix, &[0x32; 16]));
+	assert!(!prefix_has_op_id(&prefix, &[0x33; 16]));
+	assert!(!prefix_has_op_id(&[], &[0x31; 16]));
 }

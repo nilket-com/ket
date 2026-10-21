@@ -51,14 +51,15 @@ fn every_invariant_is_refused() {
 	assert_eq!(decode(&short), Err(Length));
 	assert_eq!(decode(&full[..40]), Err(Length));
 	assert_eq!(decode(&patched("full", 0, b"VISINV03")), Err(Magic));
-	// Versions over a tag-3 v3 snapshot: v1 has no tag byte, v2 has no tag 3, v4 needs a terminal.
+	// Versions over a tag-3 v3 snapshot: v1 is the empty snapshot only and v2 is removed (both
+	// `Version`, S1), v4 needs a terminal.
 	assert_eq!(
 		decode(&patched("bound", 8, &1u16.to_le_bytes())),
-		Err(Reserved)
+		Err(Version)
 	);
 	assert_eq!(
 		decode(&patched("bound", 8, &2u16.to_le_bytes())),
-		Err(ProfileTag)
+		Err(Version)
 	);
 	assert_eq!(
 		decode(&patched("bound", 8, &4u16.to_le_bytes())),

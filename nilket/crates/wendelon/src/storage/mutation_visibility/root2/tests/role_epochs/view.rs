@@ -113,30 +113,10 @@ fn add(
 		i.proofs.push((stale, d, roles, form));
 	}
 }
-/// An unsigned proof at epoch 0 under the profile 1/2 fixture's own context.
-fn unprofiled_proof(f: &wire::Fixture, c: &Command2, roles: [u8; 2]) -> Vec<u8> {
-	let slot = |r: u8| (r, 0, r != 0, [0; 64]);
-	role_command::encode_role_proof3(
-		role_command::context_digest(&install_admin2(&f.state, &f.pin).unwrap()),
-		c.digest(f.dep.generation, f.dep.cluster).unwrap(),
-		[slot(roles[0]), slot(roles[1])],
-	)
-	.unwrap()
-	.to_vec()
-}
-/// Profile 1 and 2 fixtures, then profile 3 through each role's rotation: every input is checked
-/// under every later administrator, so stale inputs are part of the matrix.
+/// Profile 3 through each role's rotation: every input is checked under every later
+/// administrator, so stale inputs are part of the matrix.
 fn matrix(check: &dyn Fn(&InstalledAdmin2, &Inputs) -> Vec<String>) -> Vec<Vec<String>> {
 	let mut out = Vec::new();
-	for (profile, seed) in [("a", 0x21), ("b", 0x42)] {
-		let f = wire::Fixture::new(profile);
-		let a = install_admin2(&f.state, &f.pin).unwrap();
-		let mut i = Inputs::default();
-		add(&mut i, &f, &a, [seed, 0x92, 0], &|c, r| {
-			unprofiled_proof(&f, c, r)
-		});
-		out.push(check(&a, &i));
-	}
 	let mut f = F::new();
 	let mut i = Inputs::default();
 	for rotation in [None, Some((0, 40)), Some((1, 41)), Some((2, 42))] {
@@ -168,9 +148,7 @@ fn coded(rows: Vec<Vec<String>>) -> Vec<String> {
 		.collect()
 }
 /// Recorded from this matrix through the checkers as they took `&InstalledAdmin2`, before views.
-const GOLDEN: [&str; 6] = [
-	"oSCSSSSSNNNNFFFFFFFFFFFF",
-	"oSCSSSSSooSDFFFFFFFFFFFF",
+const GOLDEN: [&str; 4] = [
 	"oSCSoSSSooSDTFFTFFTFFTFF",
 	"SSCSSSCSSSSSoSSSooSDooSDTFFTFFFFFFFFTFFTFFTFFTFF",
 	"SSCSSSCSSSCSSSSSoSSSoSSSSSSDSSSDSSSDFFFTFFFFFFFFFFFTFFFFFFFFTFFTFFTFFTFF",
