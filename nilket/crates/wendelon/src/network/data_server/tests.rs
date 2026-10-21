@@ -3682,9 +3682,16 @@ async fn stop_secondary_index_lifecycle(node: &WendelonNode) {
 	}
 }
 
+/// A hang detector, not a latency assertion. The node bounds quiescence and the
+/// storage close at `storage_shutdown_timeout` each (30 s in the dev config); the
+/// storage close fsyncs every owned redb store, and on a host saturated with
+/// flushes it was measured at up to 6.7 s, past 10 s in bursts. The outer bound
+/// therefore sits above the node's own bounds and only catches a real hang.
+const LEASE_FIXTURE_SHUTDOWN_BOUND: Duration = Duration::from_secs(120);
+
 async fn shutdown_lease_node(node: WendelonNode) {
 	node.handles.abort();
-	tokio::time::timeout(Duration::from_secs(10), async {
+	tokio::time::timeout(LEASE_FIXTURE_SHUTDOWN_BOUND, async {
 		node.raft.shutdown().await.unwrap();
 		node.shutdown().await.unwrap();
 	})
