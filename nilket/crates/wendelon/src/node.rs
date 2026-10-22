@@ -1285,6 +1285,19 @@ impl WendelonNode {
 				)
 			})?;
 		WendelonLogStore::restore_backup(&backup.control, &cfg.data_dir, owner).await?;
+		#[cfg(test)]
+		if let Some(fault) = &cfg.startup_fault {
+			fault
+				.reached(
+					"after_control_restore",
+					owner.clone(),
+					Vec::new(),
+					None,
+					None,
+				)
+				.await?;
+		}
+
 		SlabManager::restore_backup(&node_backup.storage, &cfg.data_dir, owner).await?;
 		Ok(())
 	}
@@ -1597,6 +1610,15 @@ impl WendelonNode {
 		revocation_tx: watch::Sender<Arc<RevocationSnapshot>>,
 		scope: &mut startup::StartupScope,
 	) -> std::io::Result<startup::NodeParts> {
+		#[cfg(test)]
+		if let Some(fault) = &cfg.startup_fault {
+			for listener in &startup_listeners {
+				if let BootstrapListener::TcpTls { listener, .. } = listener {
+					fault.bound_tcp.lock().unwrap().push(listener.local_addr()?);
+				}
+			}
+		}
+
 		let owner = scope.owner().clone();
 		cfg.validate()?;
 		owner.ensure_contains(&cfg.data_dir)?;
