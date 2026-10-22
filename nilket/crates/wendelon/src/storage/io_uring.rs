@@ -249,6 +249,8 @@ type ObservationCompletionGate = Arc<
 #[cfg(test)]
 struct SubmitFault {
 	errno: i32,
+	repeats: usize,
+	entered: bool,
 	submitted: std::sync::mpsc::SyncSender<()>,
 	release: std::sync::mpsc::Receiver<()>,
 }
@@ -518,6 +520,8 @@ fn io_thread_loop(
 ) {
 	let mut cookie: u64 = 1;
 	let mut in_flight = InFlightRequests::default();
+	let mut enter_retries = 0usize;
+	const MAX_ENTER_RETRIES: usize = 64;
 
 	loop {
 		// 1. Block when idle. Shutdown signalled by channel close.
@@ -538,8 +542,8 @@ fn io_thread_loop(
 			}
 		}
 
-		// 2. Drain additional ready requests.
-		loop {
+		// 2. Stop adding work while recovering from an enter error.
+		while enter_retries == 0 {
 			if ring.submission().is_full() {
 				break;
 			}
@@ -576,12 +580,12 @@ fn io_thread_loop(
 			#[cfg(test)]
 			&submit_fault,
 		) {
-			Ok(_) => {}
+			Ok(_) => enter_retries = 0,
 			// An enter error is not a CQE. Reap anything already completed
 			// below, then retry with every other request's resources intact.
-			Err(e) if retryable_enter_error(&e) => {
+			Err(e) if retryable_enter_error(&e) && enter_retries < MAX_ENTER_RETRIES => {
 				metrics().observe_io_uring_error(class, "submit", e.raw_os_error().unwrap());
-				std::thread::yield_now();
+				enter_retries += 1;
 			}
 			Err(e) => {
 				// Stop admission and prove cancellation before releasing resources.
@@ -603,6 +607,7 @@ fn io_thread_loop(
 
 		// 4. Reap CQEs.
 		let mut cq = ring.completion();
+		let cq_ready = cq.len();
 		span.record("cq_ready", cq.len() as i64);
 		while let Some(cqe) = cq.next() {
 			if let Some(mut request) = in_flight.remove(&cqe.user_data()) {
@@ -636,6 +641,18 @@ fn io_thread_loop(
 		}
 		metrics().set_io_uring_completion_queue_depth(class, in_flight.len() as u64);
 
+		drop(cq);
+		if enter_retries != 0 {
+			if cq_ready != 0 {
+				enter_retries = 0;
+			} else {
+				// EAGAIN can mean no SQE was consumed, so a wait-only enter
+				// could block forever. Back off after reaping, and exhaust a
+				// finite retry budget before safe cancellation/quarantine.
+				std::thread::sleep(std::time::Duration::from_millis(1));
+			}
+		}
+
 		// If the channel is closed and nothing remains in flight, exit.
 		if rx.is_closed() && rx.is_empty() && in_flight.is_empty() {
 			metrics().set_io_uring_completion_queue_depth(class, 0);
@@ -646,13 +663,23 @@ fn io_thread_loop(
 
 fn submit_and_wait(ring: &IoUring, #[cfg(test)] fault: &SubmitFaultSlot) -> std::io::Result<usize> {
 	#[cfg(test)]
-	if let Some(fault) = fault.lock().unwrap().take() {
-		// Submit real kernel work before injecting the enter error. The gate lets
-		// the test verify that no CQE exists yet (a socket read awaits peer data).
-		ring.submit()?;
-		fault.submitted.send(()).unwrap();
-		fault.release.recv().unwrap();
-		return Err(std::io::Error::from_raw_os_error(fault.errno));
+	{
+		let mut slot = fault.lock().unwrap();
+		if let Some(mut fault) = slot.take() {
+			if !fault.entered {
+				// Submit real pending work, then gate the first injected error.
+				ring.submit()?;
+				fault.submitted.send(()).unwrap();
+				fault.release.recv().unwrap();
+				fault.entered = true;
+			}
+			let errno = fault.errno;
+			if fault.repeats > 0 {
+				fault.repeats -= 1;
+				*slot = Some(fault);
+			}
+			return Err(std::io::Error::from_raw_os_error(errno));
+		}
 	}
 	ring.submit_and_wait(1)
 }
