@@ -86,18 +86,19 @@ channel closed before the tenant admission reservation dropped (`e9a92b06`).
    cargo test -p <crate> --lib -- --test-threads=<N>   # in-process; repeat it, and pass N explicitly
    ```
 
-   nextest exercises cross-process contention; repeated in-process `cargo test` runs exercise shared state inside one process. A stress campaign needs both. cargo-cgroup defaults RUST_TEST_THREADS to 1024; pass `--test-threads` explicitly when a stress run needs a specific count.
+   nextest exercises cross-process contention; repeated in-process `cargo test` runs exercise shared state inside one process. A stress campaign needs both. cargo-cgroup retains a one-test-thread default during the adoption hold; opt in with `CARGO_CGROUP_RUST_TEST_THREADS=1024` or pass `--test-threads` explicitly for stress.
 
 3. **Do not widen serialization to turn a suite green.** Add a nextest
    test-group or a `controlled-tests.txt` entry only when the test genuinely
    needs exclusive resources, and write the reason beside the entry.
 4. **A serial run is not concurrency evidence.** A run on one test thread
-   says nothing about a parallel-only failure. The 1024-test-thread default
-   (CPU bounded by the cpuset) and the fixes for the candidates in
-   `nilket/plans/ops/parallel_defect_candidates.md` reach main together as one
-   stack, only after every candidate is fixed and a ladder driver v5 run passes
-   on that stack. Until then main's wrapper defaults to one test thread, and v4
-   ladders, which run it, need no step timeouts. A test that must
+   says nothing about a parallel-only failure. Policy, tooling and candidate fixes may land with main's accepted wrapper
+   default of one test thread after the unchanged v4 gate. The separate
+   default flip to the cpuset CPU count (1024 remains an explicit stress
+   lane) requires every
+   entry in `nilket/plans/ops/parallel_defect_candidates.md` closed and a
+   final ladder PASS on exactly that flip candidate, using the reviewed
+   successor to v5 with a dedicated explicit 1024 stress lane. A test that must
    run alone is declared narrowly and allowlisted, never by a global serial
    default: see `nilket/plans/ops/test_parallelism.md`.
 
