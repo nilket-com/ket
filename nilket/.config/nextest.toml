@@ -1,9 +1,9 @@
 # Suite runtime policy.
 #
 # nextest runs tests from different binaries concurrently. The cargo-test path
-# once did not: cargo-cgroup used to give libtest one test thread (it now
-# defaults to 1024, and libtest still runs binaries one after another), so
-# switching runners exposed a contention that had always been latent.
+# exposes cross-process contention while libtest runs binaries one after
+# another. During the adoption hold cargo-cgroup defaults to one test thread;
+# explicit 1024 stress exposes interleavings that had always been latent.
 #
 # `distributed_process_test` spawns fixture-worker processes and coordinates over
 # loopback. It ran in a one-thread test-group because two of its tests at once

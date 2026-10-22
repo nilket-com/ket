@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Ladder driver v5: three lanes, each with its own target dir and its own
 # 8-CPU set, so lanes do not contend for cores or build locks. Inside a lane,
-# steps run one after another and every test step takes cargo-cgroup's default
-# test concurrency (RUST_TEST_THREADS=1024, CPU bounded by the lane cpuset);
+# steps run one after another. The wrapper must default to 1024 test threads
+# or the caller must explicitly choose concurrency (CPU bounded by the cpuset);
 # no step passes a one-thread setting. Every step runs under timeout(1) with
 # its own budget (about 3x its expected time) and records rc 124 (timed out) or
 # 137 (killed after the 60 s grace). See nilket/plans/ops/test_parallelism.md
@@ -20,8 +20,21 @@ git -C "$SRC" checkout -q --detach "$COMMIT"
 [ "$(git -C "$SRC" rev-parse HEAD)" = "$COMMIT" ] || { echo "wrong commit"; exit 2; }
 git -C "$SRC" status --porcelain > "$OUT/status-start.txt"
 { rustc --version; cargo --version; uname -a; nproc; date -u +%FT%TZ; } > "$OUT/env.txt"
-# v5 needs the wrapper with the 1024 default, the shared memory slice and
+# v5 needs default 1024 or explicit concurrency, the shared memory slice and
 # signal-safe units; refuse a source tree whose wrapper predates them.
+# Refuse a silent default-1 run masquerading as v5 concurrency evidence.
+require_v5_concurrency() {
+	local wrapper=$1
+	if [[ -v CARGO_CGROUP_RUST_TEST_THREADS ]]; then
+		[[ "$CARGO_CGROUP_RUST_TEST_THREADS" =~ ^[1-9][0-9]*$ ]] || {
+			echo "v5 requires a positive explicit test-thread override" >&2; return 2;
+		}
+	elif ! grep -Fxq 'test_threads="${CARGO_CGROUP_RUST_TEST_THREADS:-1024}"' "$wrapper"; then
+		echo "v5 requires default 1024 or an explicit CARGO_CGROUP_RUST_TEST_THREADS override" >&2
+		return 2
+	fi
+}
+require_v5_concurrency "$SRC/nilket/scripts/cargo-cgroup" || exit 2
 grep -q 'CARGO_CGROUP_SLICE_MEMORY_PERCENT' "$SRC/nilket/scripts/cargo-cgroup" || { echo "cargo-cgroup lacks the memory slice; v5 needs it" | tee -a "$OUT/rc.txt"; exit 2; }
 # All three lanes share one cgroup slice (cargo-cgroup.slice). Three 32G lanes
 # need 96G in it: the slice is min(96G, 80% of MemTotal), so refuse a host with

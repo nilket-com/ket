@@ -158,9 +158,8 @@ nofile="${CARGO_CGROUP_NOFILE:-$(nofile_limit)}"
 io_weight="${CARGO_CGROUP_IO_WEIGHT:-10}"
 nice_level="${CARGO_CGROUP_NICE:-19}"
 jobs="${CARGO_CGROUP_JOBS:-6}"
-# Maximise test concurrency: libtest runs up to this many tests of a binary at
-# once. CPU is bounded by the cpuset and quota, not by this count, so tests
-# oversubscribe threads rather than cores. See nilket/plans/ops/test_parallelism.md.
+# Retain the accepted default during the adoption hold. The later flip targets
+# the cpuset CPU count, retaining explicit 1024 stress. See test_parallelism.md.
 test_threads="${CARGO_CGROUP_RUST_TEST_THREADS:-1}"
 # Deep-recursion targets overflow the default 8 MiB test-thread stack and abort
 # the process. An aborted target prints no result line, so a receipt that sums

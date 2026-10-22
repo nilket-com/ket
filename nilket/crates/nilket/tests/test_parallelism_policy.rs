@@ -974,3 +974,68 @@ fn checked_in_supplement_template_uses_the_commit_wrapper() {
 		"a step uses the checked-out wrapper"
 	);
 }
+
+#[test]
+fn v5_preflight_refuses_implicit_serial_concurrency_and_validates_explicit_choice() {
+	let dir = std::env::temp_dir().join(format!(
+		"nilket-v5-preflight-{}-{}",
+		std::process::id(),
+		std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.unwrap()
+			.as_nanos()
+	));
+	std::fs::create_dir(&dir).unwrap();
+	struct Fixture(PathBuf);
+	impl Drop for Fixture {
+		fn drop(&mut self) {
+			let _ = std::fs::remove_dir_all(&self.0);
+		}
+	}
+	let _fixture = Fixture(dir.clone());
+	for template in [LADDER_TEMPLATE, SUPPLEMENT_TEMPLATE] {
+		let text = read_text(&ket_root(), template).unwrap();
+		let start = text
+			.find("require_v5_concurrency() {")
+			.expect("v5 has a concurrency preflight");
+		let end = start + text[start..].find("\n}\n").unwrap() + 3;
+		let call = "require_v5_concurrency \"$SRC/nilket/scripts/cargo-cgroup\" || exit 2";
+		assert!(
+			text.contains(call),
+			"{template}: missing fail-closed preflight invocation"
+		);
+		assert!(text.find(call).unwrap() < text.find("step() {").unwrap());
+		let body = format!("{}\nrequire_v5_concurrency \"$1\"\n", &text[start..end]);
+		for default in [1, 1024] {
+			let wrapper = dir.join(format!("wrapper-{default}"));
+			std::fs::write(
+				&wrapper,
+				format!("test_threads=\"${{CARGO_CGROUP_RUST_TEST_THREADS:-{default}}}\"\n"),
+			)
+			.unwrap();
+			for (choice, expected) in [
+				(None, if default == 1024 { 0 } else { 2 }),
+				(Some("1024"), 0),
+				(Some("8"), 0),
+				(Some(""), 2),
+				(Some("all"), 2),
+			] {
+				let mut command = Command::new("bash");
+				command
+					.args(["-c", &body, "v5-preflight"])
+					.arg(&wrapper)
+					.env_remove("CARGO_CGROUP_RUST_TEST_THREADS");
+				if let Some(choice) = choice {
+					command.env("CARGO_CGROUP_RUST_TEST_THREADS", choice);
+				}
+				let result = command.output().unwrap();
+				assert_eq!(
+					result.status.code(),
+					Some(expected),
+					"{template}: default={default} choice={choice:?}: {}",
+					String::from_utf8_lossy(&result.stderr)
+				);
+			}
+		}
+	}
+}
