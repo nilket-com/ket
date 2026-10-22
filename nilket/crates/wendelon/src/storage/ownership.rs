@@ -176,6 +176,7 @@ pub struct DataDirectoryOwner {
 }
 
 struct OwnerInner {
+	closed_signal: Arc<std::sync::atomic::AtomicBool>,
 	path: PathBuf,
 	previous_shutdown_clean: bool,
 	// Set when a run that started after an unclean shutdown finished its
@@ -299,8 +300,15 @@ impl DataDirectoryOwner {
 			released: false,
 		})
 	}
+	pub(crate) fn closed_signal(&self) -> Arc<std::sync::atomic::AtomicBool> {
+		self.inner.closed_signal.clone()
+	}
 	pub(crate) fn begin_close(&self) {
-		let mut state = self.inner.state.lock().unwrap();
+		let mut state = self
+			.inner
+			.state
+			.lock()
+			.unwrap_or_else(std::sync::PoisonError::into_inner);
 		if state.phase != OwnerPhase::Closed {
 			state.phase = OwnerPhase::Closing;
 			state.closing_pin = Some(self.inner.clone());
@@ -319,8 +327,13 @@ impl DataDirectoryOwner {
 		Error::new(
 			kind,
 			ShutdownIncomplete {
-				outstanding: outstanding
-					.unwrap_or_else(|| self.inner.state.lock().unwrap().outstanding),
+				outstanding: outstanding.unwrap_or_else(|| {
+					self.inner
+						.state
+						.lock()
+						.unwrap_or_else(std::sync::PoisonError::into_inner)
+						.outstanding
+				}),
 				cause: Error::new(kind, message),
 			},
 		)
@@ -356,13 +369,13 @@ impl DataDirectoryOwner {
 			let result = match tokio::time::timeout(bound, future.as_mut()).await {
 				Ok(result) => result,
 				Err(_) => {
-					tracing::error!(context = %worker_slot.context, stage = *progress.lock().unwrap(), "startup cleanup incomplete at bound; resources retained");
+					tracing::error!(context = %worker_slot.context, stage = *progress.lock().unwrap_or_else(std::sync::PoisonError::into_inner), "startup cleanup incomplete at bound; resources retained");
 					worker_slot
 						.status
 						.send_replace(StartupCleanupStatus::PendingIncomplete(format!(
 							"{}: startup shutdown still running at {}",
 							worker_slot.context,
-							*progress.lock().unwrap()
+							*progress.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 						)));
 					future.await
 				}
@@ -387,7 +400,7 @@ impl DataDirectoryOwner {
 		self.inner
 			.startup_cleanups
 			.lock()
-			.unwrap()
+			.unwrap_or_else(std::sync::PoisonError::into_inner)
 			.push(slot.clone());
 		let _ = start.send(());
 		slot
@@ -568,6 +581,7 @@ impl DataDirectoryOwner {
 			state.phase = OwnerPhase::Closed;
 			state.closing_pin.take();
 			state.workers.clear();
+			self.inner.closed_signal.store(true, std::sync::atomic::Ordering::Release);
 			Ok(())
 		})
 		.await;
@@ -760,6 +774,7 @@ fn acquire_lock(canonical: PathBuf) -> std::io::Result<DataDirectoryOwner> {
 		consume_clean_shutdown_record(&canonical)? || directory_is_fresh(&canonical)?;
 	Ok(DataDirectoryOwner {
 		inner: Arc::new(OwnerInner {
+			closed_signal: Arc::new(std::sync::atomic::AtomicBool::new(false)),
 			path: canonical,
 			previous_shutdown_clean,
 			recovery_complete: std::sync::atomic::AtomicBool::new(false),

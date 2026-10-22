@@ -186,6 +186,8 @@ pub struct ObservabilityConfig {
 pub struct NodeBootstrapConfig {
 	#[cfg(test)]
 	pub(crate) startup_probe: Option<startup_ownership_tests::StartupProbe>,
+	#[cfg(test)]
+	pub(crate) startup_fault: Option<startup_ownership_tests::StartupFault>,
 	/// Numeric node id — also the openraft peer id. Must be unique
 	/// across the cluster; single-node genesis picks any u32.
 	pub node_id: u32,
@@ -330,6 +332,8 @@ impl NodeBootstrapConfig {
 		Self {
 			#[cfg(test)]
 			startup_probe: None,
+			#[cfg(test)]
+			startup_fault: None,
 			node_id,
 			data_dir,
 			slab_max_bytes: 64 * 1024 * 1024,
@@ -1029,13 +1033,66 @@ impl WendelonNode {
 	pub async fn bootstrap(cfg: NodeBootstrapConfig) -> std::io::Result<Self> {
 		cfg.validate()?;
 		let owner = DataDirectoryOwner::acquire_existing(&cfg.data_dir)?;
-		Self::bootstrap_owned(cfg, owner).await
+		Self::bootstrap_scoped(
+			cfg,
+			owner,
+			startup::TransportChoice::Configured,
+			startup::RestoreChoice::None,
+		)
+		.await
+	}
+
+	async fn bootstrap_scoped(
+		cfg: NodeBootstrapConfig,
+		owner: DataDirectoryOwner,
+		transport: startup::TransportChoice,
+		restore: startup::RestoreChoice<'_>,
+	) -> std::io::Result<Self> {
+		let mut scope = startup::StartupScope::begin(owner, cfg.storage_shutdown_timeout).await?;
+		#[cfg(test)]
+		if let Some(deadline) = cfg
+			.startup_probe
+			.as_ref()
+			.and_then(|probe| probe.watchdog_deadline())
+		{
+			scope.set_test_watchdog_deadline(deadline);
+		}
+		let result = async {
+			let owner = scope.owner().clone();
+			match restore {
+				startup::RestoreChoice::None => {}
+				startup::RestoreChoice::Cluster(backup) => {
+					Self::restore_cluster_backup_artifacts(backup, &cfg, &owner).await?
+				}
+				startup::RestoreChoice::Replacement(backup, source) => {
+					Self::prepare_replacement_from_cluster_backup(backup, source, &cfg, &owner)
+						.await?
+				}
+			}
+			match transport {
+				startup::TransportChoice::Configured => {
+					Self::bootstrap_owned(cfg, &mut scope).await
+				}
+				startup::TransportChoice::Provided(provider, tier) => {
+					Self::bootstrap_with_provider_owned_at_tier(cfg, provider, tier, &mut scope)
+						.await
+				}
+			}
+		}
+		.await;
+		match result {
+			Ok(parts) => match scope.finish_success(parts) {
+				Ok(node) => Ok(node),
+				Err((scope, error)) => Err(scope.fail(error).await),
+			},
+			Err(error) => Err(scope.fail(error).await),
+		}
 	}
 
 	async fn bootstrap_owned(
 		cfg: NodeBootstrapConfig,
-		owner: DataDirectoryOwner,
-	) -> std::io::Result<Self> {
+		scope: &mut startup::StartupScope,
+	) -> std::io::Result<startup::NodeParts> {
 		let (revocation_tx, _) = watch::channel(Arc::new(RevocationSnapshot::default()));
 		if let Some(tls) = cfg.transport_tls.clone() {
 			let material = TlsMaterial::load(&tls.cert_path, &tls.key_path, &tls.node_ca_path)?;
@@ -1080,7 +1137,7 @@ impl WendelonNode {
 					.with_revocations(revocation_tx.subscribe()),
 				),
 			);
-			return Self::bootstrap_with_transport_stack(
+			return Self::construct(
 				cfg,
 				socket_transport_tiers(),
 				providers,
@@ -1098,7 +1155,7 @@ impl WendelonNode {
 					},
 				],
 				revocation_tx,
-				owner,
+				scope,
 			)
 			.await;
 		}
@@ -1108,7 +1165,7 @@ impl WendelonNode {
 				"cluster.join requires transport_tls or a caller-supplied real transport provider",
 			));
 		}
-		Self::bootstrap_with_provider_owned(cfg, Arc::new(NoDialTransportProvider), owner).await
+		Self::bootstrap_with_provider_owned(cfg, Arc::new(NoDialTransportProvider), scope).await
 	}
 
 	/// Compatibility wrapper kept for older tests that want the
@@ -1125,11 +1182,13 @@ impl WendelonNode {
 	) -> std::io::Result<Self> {
 		cfg.validate()?;
 		let owner = DataDirectoryOwner::acquire_or_create(&cfg.data_dir)?;
-		Self::restore_cluster_backup_artifacts(backup, &cfg, &owner).await?;
-		// Preserve the caller's cluster mode so the same restore helper can
-		// support both standalone recovery bootstrap and same-identity
-		// replacement into a live cluster.
-		Self::bootstrap_owned(cfg, owner).await
+		Self::bootstrap_scoped(
+			cfg,
+			owner,
+			startup::TransportChoice::Configured,
+			startup::RestoreChoice::Cluster(backup),
+		)
+		.await
 	}
 
 	pub async fn restore_from_cluster_backup_with_provider(
@@ -1139,8 +1198,13 @@ impl WendelonNode {
 	) -> std::io::Result<Self> {
 		cfg.validate()?;
 		let owner = DataDirectoryOwner::acquire_or_create(&cfg.data_dir)?;
-		Self::restore_cluster_backup_artifacts(backup, &cfg, &owner).await?;
-		Self::bootstrap_with_provider_owned(cfg, provider, owner).await
+		Self::bootstrap_scoped(
+			cfg,
+			owner,
+			startup::TransportChoice::Provided(provider, TransportTier::QuicIoUring),
+			startup::RestoreChoice::Cluster(backup),
+		)
+		.await
 	}
 
 	pub async fn restore_replacement_from_cluster_backup(
@@ -1151,8 +1215,13 @@ impl WendelonNode {
 		cfg.validate()?;
 		Self::validate_replacement_target(source_node_id, &cfg)?;
 		let owner = DataDirectoryOwner::acquire_or_create(&cfg.data_dir)?;
-		Self::prepare_replacement_from_cluster_backup(backup, source_node_id, &cfg, &owner).await?;
-		Self::bootstrap_owned(cfg, owner).await
+		Self::bootstrap_scoped(
+			cfg,
+			owner,
+			startup::TransportChoice::Configured,
+			startup::RestoreChoice::Replacement(backup, source_node_id),
+		)
+		.await
 	}
 
 	pub async fn restore_replacement_from_cluster_backup_with_provider(
@@ -1164,8 +1233,13 @@ impl WendelonNode {
 		cfg.validate()?;
 		Self::validate_replacement_target(source_node_id, &cfg)?;
 		let owner = DataDirectoryOwner::acquire_or_create(&cfg.data_dir)?;
-		Self::prepare_replacement_from_cluster_backup(backup, source_node_id, &cfg, &owner).await?;
-		Self::bootstrap_with_provider_owned(cfg, provider, owner).await
+		Self::bootstrap_scoped(
+			cfg,
+			owner,
+			startup::TransportChoice::Provided(provider, TransportTier::QuicIoUring),
+			startup::RestoreChoice::Replacement(backup, source_node_id),
+		)
+		.await
 	}
 
 	fn validate_replacement_target(
@@ -1442,19 +1516,25 @@ impl WendelonNode {
 	) -> std::io::Result<Self> {
 		cfg.validate()?;
 		let owner = DataDirectoryOwner::acquire_existing(&cfg.data_dir)?;
-		Self::bootstrap_with_provider_owned_at_tier(cfg, provider, provider_tier, owner).await
+		Self::bootstrap_scoped(
+			cfg,
+			owner,
+			startup::TransportChoice::Provided(provider, provider_tier),
+			startup::RestoreChoice::None,
+		)
+		.await
 	}
 
 	async fn bootstrap_with_provider_owned(
 		cfg: NodeBootstrapConfig,
 		provider: Arc<dyn TransportProvider>,
-		owner: DataDirectoryOwner,
-	) -> std::io::Result<Self> {
+		scope: &mut startup::StartupScope,
+	) -> std::io::Result<startup::NodeParts> {
 		Self::bootstrap_with_provider_owned_at_tier(
 			cfg,
 			provider,
 			TransportTier::QuicIoUring,
-			owner,
+			scope,
 		)
 		.await
 	}
@@ -1463,8 +1543,8 @@ impl WendelonNode {
 		cfg: NodeBootstrapConfig,
 		provider: Arc<dyn TransportProvider>,
 		provider_tier: TransportTier,
-		owner: DataDirectoryOwner,
-	) -> std::io::Result<Self> {
+		scope: &mut startup::StartupScope,
+	) -> std::io::Result<startup::NodeParts> {
 		let (revocation_tx, _) = watch::channel(Arc::new(RevocationSnapshot::default()));
 		let startup_listeners = if provider_tier == TransportTier::TcpTls {
 			let tls = cfg.transport_tls.as_ref().ok_or_else(|| {
@@ -1495,25 +1575,26 @@ impl WendelonNode {
 		};
 		let mut providers: HashMap<TransportTier, Arc<dyn TransportProvider>> = HashMap::new();
 		providers.insert(provider_tier, provider);
-		Self::bootstrap_with_transport_stack(
+		Self::construct(
 			cfg,
 			transport_tiers_for_provider(provider_tier),
 			providers,
 			startup_listeners,
 			revocation_tx,
-			owner,
+			scope,
 		)
 		.await
 	}
 
-	async fn bootstrap_with_transport_stack(
+	async fn construct(
 		cfg: NodeBootstrapConfig,
 		local_tiers: TransportTierSet,
 		providers: HashMap<TransportTier, Arc<dyn TransportProvider>>,
 		startup_listeners: Vec<BootstrapListener>,
 		revocation_tx: watch::Sender<Arc<RevocationSnapshot>>,
-		owner: DataDirectoryOwner,
-	) -> std::io::Result<Self> {
+		scope: &mut startup::StartupScope,
+	) -> std::io::Result<startup::NodeParts> {
+		let owner = scope.owner().clone();
 		cfg.validate()?;
 		owner.ensure_contains(&cfg.data_dir)?;
 		let local_node = NodeId {
@@ -1538,6 +1619,8 @@ impl WendelonNode {
 
 		// 1. Shared buffer pool (HRFT frames + postcard bodies).
 		let pool = BufPool::new(256, 1024 * 1024);
+		#[cfg(test)]
+		scope.checkpoint(&cfg, "pool").await?;
 
 		// 2. Dedicated `io_uring` workers for the two durability classes.
 		let slab_io = spawn_io_thread_named_for_class(
@@ -1560,6 +1643,8 @@ impl WendelonNode {
 			.map(|config| config.build_with_owner(owner.clone()))
 			.transpose()?;
 		let l2_for_sweeper = l2.clone();
+		#[cfg(test)]
+		scope.checkpoint(&cfg, "io_workers").await?;
 		let crypto = Arc::new(CryptoManager::new_with_cache_config_and_owner(
 			cfg.root_kek_provider
 				.build_with_owner(&cfg.data_dir, &owner)?,
@@ -1642,7 +1727,11 @@ impl WendelonNode {
 			.with_tenant_kek_observer(crypto.clone())
 			.with_checkpoint_observer(checkpoint_coordinator.clone())
 			.with_external_revocation_snapshot(revocation_tx.clone());
-		let checkpoint_emitter = checkpoint_coordinator.spawn();
+		scope
+			.handles()
+			.set_checkpoint_emitter(checkpoint_coordinator.spawn());
+		#[cfg(test)]
+		scope.checkpoint(&cfg, "set_checkpoint_emitter").await?;
 
 		// 5. Seed membership epoch from durable history if present;
 		//    otherwise fall back to the single-node genesis epoch.
@@ -1763,12 +1852,18 @@ impl WendelonNode {
 				audit_sink.clone(),
 				audit_materialization.clone(),
 			);
-		let audit_chain_root_rollup = spawn_signed_chain_root_rollup(
-			audit_sink.clone(),
-			local_node,
-			AuditRootSigner::from_seed(cfg.audit_root_signing_secret),
-			DEFAULT_CHAIN_ROOT_ROLLUP_INTERVAL,
-		);
+		scope
+			.handles()
+			.set_audit_chain_root_rollup(spawn_signed_chain_root_rollup(
+				audit_sink.clone(),
+				local_node,
+				AuditRootSigner::from_seed(cfg.audit_root_signing_secret),
+				DEFAULT_CHAIN_ROOT_ROLLUP_INTERVAL,
+			));
+		#[cfg(test)]
+		scope
+			.checkpoint(&cfg, "set_audit_chain_root_rollup")
+			.await?;
 		let (clock_drift_tx, clock_drift_rx) = watch::channel(None);
 
 		// 7. Transport factory — tests can still swap in loopback
@@ -1780,6 +1875,10 @@ impl WendelonNode {
 		));
 		let factory =
 			TransportProviderFactory::new(local_tiers, providers, resolver, epoch_rx.clone());
+		scope.adopt_factory(factory.clone());
+		#[cfg(test)]
+		scope.checkpoint(&cfg, "adopt_factory").await?;
+		owner.register_worker(factory.clone())?;
 		let dial_provider: Arc<dyn TransportProvider> = factory.clone();
 
 		// 8. Raft network factory — uses the same shared
@@ -1812,6 +1911,9 @@ impl WendelonNode {
 		)
 		.await
 		.map_err(|e| Error::new(ErrorKind::Other, format!("Raft::new: {e}")))?;
+		scope.adopt_raft(raft.clone());
+		#[cfg(test)]
+		scope.checkpoint(&cfg, "adopt_raft").await?;
 		#[cfg(feature = "test-support")]
 		if let Some(gate) = &cfg.join_promotion_gate {
 			gate.register_metrics(cfg.node_id, raft.metrics(), test_automatic_elections);
@@ -1822,7 +1924,11 @@ impl WendelonNode {
 		//     `epoch_rx` value the updater task observes before it
 		//     begins blocking on `changed()`.
 		let ring = Arc::new(RingRouter::empty());
-		let ring_updater = ring.clone().spawn_updater(epoch_rx.clone(), cfg.rf);
+		scope
+			.handles()
+			.set_ring_updater(ring.clone().spawn_updater(epoch_rx.clone(), cfg.rf));
+		#[cfg(test)]
+		scope.checkpoint(&cfg, "set_ring_updater").await?;
 
 		// 11. Drift monitor.
 		let abort: Arc<dyn AbortHandle> = Arc::new(ProcessAbort);
@@ -1830,14 +1936,18 @@ impl WendelonNode {
 			Arc::new(WatchClockDriftSubscriber::new(clock_drift_tx)),
 			Arc::new(AuditClockDriftSubscriber::new(audit_sink.clone())),
 		]));
-		let drift_monitor = spawn_drift_monitor_with_subscriber(
-			tracker.clone(),
-			clock.clone(),
-			abort.clone(),
-			drift_subscriber,
-			DRIFT_CHECK_INTERVAL,
-			cfg.drift_max_offset_ms,
-		);
+		scope
+			.handles()
+			.set_drift_monitor(spawn_drift_monitor_with_subscriber(
+				tracker.clone(),
+				clock.clone(),
+				abort.clone(),
+				drift_subscriber,
+				DRIFT_CHECK_INTERVAL,
+				cfg.drift_max_offset_ms,
+			));
+		#[cfg(test)]
+		scope.checkpoint(&cfg, "set_drift_monitor").await?;
 
 		// 12. Data Ring + Raft Internal Ring servers. Both observe
 		//     inbound HLCs into the shared tracker so the drift
@@ -1901,6 +2011,9 @@ impl WendelonNode {
 				.build(),
 		);
 		let lifecycle = ServerLifecycle::new();
+		scope.adopt_lifecycle(lifecycle.clone());
+		#[cfg(test)]
+		scope.checkpoint(&cfg, "adopt_lifecycle").await?;
 		let service: Arc<dyn HrftService> =
 			Arc::new(LifecycleService::new(router.clone(), lifecycle.clone()));
 		#[cfg(test)]
@@ -1911,20 +2024,22 @@ impl WendelonNode {
 				&service,
 				&lifecycle,
 				&raft,
-				vec![
-					("checkpoint", checkpoint_emitter.abort_handle()),
-					("audit", audit_chain_root_rollup.abort_handle()),
-					("ring", ring_updater.abort_handle()),
-					("drift", drift_monitor.abort_handle()),
-				],
+				scope.abort_handles(),
 			);
 		}
 		for provider in publish_providers {
+			scope.will_publish(
+				provider.clone(),
+				service.clone(),
+				local_node,
+				&cfg.advertise_address,
+			);
+			#[cfg(test)]
+			scope.checkpoint(&cfg, "will_publish").await?;
 			provider.publish_local(local_node, &cfg.advertise_address, service.clone())?;
 		}
-		let transport_servers = startup_listeners
-			.into_iter()
-			.map(|listener| match listener {
+		for listener in startup_listeners {
+			let server = match listener {
 				BootstrapListener::Quic {
 					endpoint,
 					cluster_domain,
@@ -1955,9 +2070,16 @@ impl WendelonNode {
 					revocation_tx.subscribe(),
 					trust_roots,
 				)),
-			})
-			.collect::<Vec<_>>();
-		let epoch_reconciler = control_server.clone().spawn_epoch_reconciler();
+			};
+			scope.adopt_transport(server);
+			#[cfg(test)]
+			scope.checkpoint(&cfg, "adopt_transport").await?;
+		}
+		scope
+			.handles()
+			.set_epoch_reconciler(control_server.clone().spawn_epoch_reconciler());
+		#[cfg(test)]
+		scope.checkpoint(&cfg, "set_epoch_reconciler").await?;
 		#[cfg(test)]
 		if let Some(probe) = &cfg.startup_probe {
 			probe.record(
@@ -1966,32 +2088,10 @@ impl WendelonNode {
 				&service,
 				&lifecycle,
 				&raft,
-				vec![
-					("checkpoint", checkpoint_emitter.abort_handle()),
-					("audit", audit_chain_root_rollup.abort_handle()),
-					("ring", ring_updater.abort_handle()),
-					("drift", drift_monitor.abort_handle()),
-					("epoch", epoch_reconciler.abort_handle()),
-				],
+				scope.abort_handles(),
 			);
 		}
 
-		let startup = startup::Guard::arm(startup::Resources {
-			owner: owner.clone(),
-			raft: raft.clone(),
-			lifecycle: lifecycle.clone(),
-			transports: transport_servers,
-			tasks: startup::Tasks {
-				ring_updater,
-				drift_monitor,
-				audit_chain_root_rollup,
-				checkpoint_emitter,
-				epoch_reconciler,
-			},
-			bound: cfg.storage_shutdown_timeout,
-			runtime: tokio::runtime::Handle::current(),
-		})
-		.await?;
 		// 14. Fresh nodes either initialize a one-node cluster or
 		//     join an existing leader through the explicit Control
 		//     Ring join path. Recovery-mode nodes rely on their
@@ -1999,6 +2099,8 @@ impl WendelonNode {
 		//     a synthetic join RPC on restart; reissuing join after
 		//     recovery can perturb follower replication ordering and
 		//     trip OpenRaft's follower-log-reversion guard.
+		#[cfg(test)]
+		scope.checkpoint(&cfg, "before_cluster").await?;
 		let cluster_result: std::io::Result<()> = async {
 			match &cfg.cluster {
 				ClusterBootstrapConfig::Bootstrap => {
@@ -2038,24 +2140,15 @@ impl WendelonNode {
 		}
 		.await;
 		if let Err(error) = cluster_result {
-			return Err(startup.fail(error).await);
+			return Err(error);
 		}
-		let startup::Resources {
-			transports: transport_servers,
-			tasks:
-				startup::Tasks {
-					ring_updater,
-					drift_monitor,
-					audit_chain_root_rollup,
-					checkpoint_emitter,
-					epoch_reconciler,
-				},
-			..
-		} = startup.finish_success();
 		#[cfg(test)]
 		if let Some(probe) = &cfg.startup_probe {
 			probe.after_handoff()?;
 		}
+
+		#[cfg(test)]
+		scope.checkpoint(&cfg, "epoch_reconcile").await?;
 
 		// ADR 0095 stamps erasure participants from replicated epoch history.
 		// Seed the genesis edge synchronously on the leader so an immediately
@@ -2086,22 +2179,28 @@ impl WendelonNode {
 				}
 			}
 		}
-		let default_tenant_seeder = if state_machine
-			.state_snapshot()
-			.await
-			.tenants
-			.contains_key(&TenantId::ZERO)
-		{
-			tokio::spawn(async {})
-		} else {
-			spawn_default_tenant_seeder(
-				raft.clone(),
-				state_machine.clone(),
-				crypto.clone(),
-				local_node,
-				cfg.rf as u32,
-			)
-		};
+		#[cfg(test)]
+		scope.checkpoint(&cfg, "tenant_seed").await?;
+		scope.handles().set_default_tenant_seeder(
+			if state_machine
+				.state_snapshot()
+				.await
+				.tenants
+				.contains_key(&TenantId::ZERO)
+			{
+				tokio::spawn(async {})
+			} else {
+				spawn_default_tenant_seeder(
+					raft.clone(),
+					state_machine.clone(),
+					crypto.clone(),
+					local_node,
+					cfg.rf as u32,
+				)
+			},
+		);
+		#[cfg(test)]
+		scope.checkpoint(&cfg, "set_default_tenant_seeder").await?;
 
 		// Prime the tenant policy cache from the freshly seeded state
 		// machine before spawning the periodic reconciler. Otherwise
@@ -2110,9 +2209,15 @@ impl WendelonNode {
 		// next `ensure_tenant_policy_fresh` call of a real refresh for
 		// a full tick interval.
 		let _ = data_server.sync_tenant_policy_cache_once().await;
-		let tenant_policy_reconciler = data_server
-			.clone()
-			.spawn_tenant_policy_reconciler(DEFAULT_TENANT_CACHE_REFRESH_INTERVAL);
+		scope.handles().set_tenant_policy_reconciler(
+			data_server
+				.clone()
+				.spawn_tenant_policy_reconciler(DEFAULT_TENANT_CACHE_REFRESH_INTERVAL),
+		);
+		#[cfg(test)]
+		scope
+			.checkpoint(&cfg, "set_tenant_policy_reconciler")
+			.await?;
 
 		// 15. Eviction watchdog. Route leader-driven epoch changes
 		//     back through the same Control Ring compound workflow
@@ -2122,15 +2227,19 @@ impl WendelonNode {
 			Arc::new(RaftLeaderStatus::new(raft.clone(), local_node));
 		let advancer: Arc<dyn MembershipAdvancer> =
 			Arc::new(ControlRingMembershipAdvancer::new(control_server.clone()));
-		let eviction_watchdog = spawn_eviction_watchdog(
-			tracker.clone(),
-			clock.clone(),
-			leader.clone(),
-			advancer,
-			epoch_rx.clone(),
-			cfg.rf,
-			EVICTION_CHECK_INTERVAL,
-		);
+		scope
+			.handles()
+			.set_eviction_watchdog(spawn_eviction_watchdog(
+				tracker.clone(),
+				clock.clone(),
+				leader.clone(),
+				advancer,
+				epoch_rx.clone(),
+				cfg.rf,
+				EVICTION_CHECK_INTERVAL,
+			));
+		#[cfg(test)]
+		scope.checkpoint(&cfg, "set_eviction_watchdog").await?;
 		let raft_committer: Arc<dyn TierCommitter> = Arc::new(RaftCommitter::new(raft.clone()));
 		let lsm_worker = LsmCompactionWorker::new(LsmConfig::default(), slab.slab_pin_table())?;
 		let lsm_driver = Arc::new(LeaderGatedLsmCompactionDriver::new(
@@ -2144,88 +2253,154 @@ impl WendelonNode {
 		if cfg.lsm_compaction_paused {
 			lsm_compaction_control.pause();
 		}
-		let lsm_compaction = lsm_service.spawn();
+		scope
+			.handles()
+			.set_lsm_compaction_control(lsm_compaction_control);
+		#[cfg(test)]
+		scope.checkpoint(&cfg, "set_lsm_compaction_control").await?;
+		scope.handles().set_lsm_compaction(lsm_service.spawn());
+		#[cfg(test)]
+		scope.checkpoint(&cfg, "set_lsm_compaction").await?;
 		let lsm_gc_worker = LsmGcWorker::new(LsmConfig::default(), slab.slab_pin_table())?;
 		let lsm_gc_driver = Arc::new(LeaderGatedLsmGcDriver::new(
 			slab.clone(),
 			leader.clone(),
 			raft_committer.clone(),
 		));
-		let lsm_gc = LsmGcService::new(lsm_gc_driver, lsm_gc_worker).spawn();
-		let secondary_index_lifecycle = spawn_secondary_index_lifecycle_driver(
-			slab.clone(),
-			state_machine.clone(),
-			control_server.clone(),
-			local_node,
-		);
+		scope
+			.handles()
+			.set_lsm_gc(LsmGcService::new(lsm_gc_driver, lsm_gc_worker).spawn());
+		#[cfg(test)]
+		scope.checkpoint(&cfg, "set_lsm_gc").await?;
+		scope
+			.handles()
+			.set_secondary_index_lifecycle(spawn_secondary_index_lifecycle_driver(
+				slab.clone(),
+				state_machine.clone(),
+				control_server.clone(),
+				local_node,
+			));
+		#[cfg(test)]
+		scope
+			.checkpoint(&cfg, "set_secondary_index_lifecycle")
+			.await?;
 
 		// 16. Lease manager (plan 018 / ADR 080). Runs in the background,
 		//     renews every configured TTL / 3 and on every ring-epoch
 		//     change, and updates the data server's local cache so
 		//     the write/read gates installed above can admit traffic.
-		let lease_manager = data_server.clone().spawn_lease_manager(
-			ring.clone(),
-			clock.clone(),
-			epoch_rx.clone(),
-			lease_timing.renew_interval(),
-			lease_timing.ttl_millis(),
+		scope
+			.handles()
+			.set_lease_manager(data_server.clone().spawn_lease_manager(
+				ring.clone(),
+				clock.clone(),
+				epoch_rx.clone(),
+				lease_timing.renew_interval(),
+				lease_timing.ttl_millis(),
+			));
+		#[cfg(test)]
+		scope.checkpoint(&cfg, "set_lease_manager").await?;
+		scope.handles().set_pending_finalization_reconciler(
+			data_server
+				.clone()
+				.spawn_pending_finalization_reconciler(PENDING_FINALIZATION_RETRY_INTERVAL),
 		);
-		let pending_finalization_reconciler = data_server
-			.clone()
-			.spawn_pending_finalization_reconciler(PENDING_FINALIZATION_RETRY_INTERVAL);
-		let drop_reclaim_sweeper = data_server
-			.clone()
-			.spawn_drop_reclaim_sweeper(DROP_RECLAIM_SWEEP_INTERVAL);
-		let cdc_finalization_release_observer = data_server
-			.clone()
-			.spawn_cdc_finalization_release_observer();
-		let cdc_locality_heartbeat = data_server.clone().spawn_cdc_locality_heartbeat_supervisor(
-			ring.clone(),
-			cfg.cdc_locality_heartbeat_interval,
+		#[cfg(test)]
+		scope
+			.checkpoint(&cfg, "set_pending_finalization_reconciler")
+			.await?;
+		scope.handles().set_drop_reclaim_sweeper(
+			data_server
+				.clone()
+				.spawn_drop_reclaim_sweeper(DROP_RECLAIM_SWEEP_INTERVAL),
 		);
-		let migration_sweeper = data_server.clone().spawn_migration_sweeper(
-			MIGRATION_SWEEP_INTERVAL,
-			MIGRATION_SWEEP_FAILURE_BACKOFF,
-			MIGRATION_SWEEP_MAX_PER_PASS,
-			cfg.mvcc_retention_paused,
+		#[cfg(test)]
+		scope.checkpoint(&cfg, "set_drop_reclaim_sweeper").await?;
+		scope.handles().set_cdc_finalization_release_observer(
+			data_server
+				.clone()
+				.spawn_cdc_finalization_release_observer(),
 		);
-		let tiering_sweeper = l2_for_sweeper.map(|object_store| {
-			SlabSweeper::new(
-				slab.clone(),
-				object_store,
-				raft_committer.clone(),
-				state_machine.clone(),
-				cfg.tiering.clone(),
-			)
-			.with_clock(clock.clone())
-			.with_audit_sink(local_node, audit_sink.clone())
-			.with_mvcc_retention_policy(cfg.mvcc_retention_policy)
-			.spawn()
-		});
-		let restore_validation = if requires_restore_validation {
-			let slab = slab.clone();
-			let recovery_owner = owner.clone();
-			Some(tokio::spawn(async move {
-				match slab.validate_tiered_references().await {
-					Ok(()) => {
-						// Only a run that finished its recovery may later leave a
-						// clean-shutdown record.
-						recovery_owner.mark_recovery_complete();
-						let _ = restore_validation_tx.send(RestoreValidationStatus::Complete);
+		#[cfg(test)]
+		scope
+			.checkpoint(&cfg, "set_cdc_finalization_release_observer")
+			.await?;
+		scope.handles().set_cdc_locality_heartbeat(
+			data_server.clone().spawn_cdc_locality_heartbeat_supervisor(
+				ring.clone(),
+				cfg.cdc_locality_heartbeat_interval,
+			),
+		);
+		#[cfg(test)]
+		scope.checkpoint(&cfg, "set_cdc_locality_heartbeat").await?;
+		scope
+			.handles()
+			.set_migration_sweeper(data_server.clone().spawn_migration_sweeper(
+				MIGRATION_SWEEP_INTERVAL,
+				MIGRATION_SWEEP_FAILURE_BACKOFF,
+				MIGRATION_SWEEP_MAX_PER_PASS,
+				cfg.mvcc_retention_paused,
+			));
+		#[cfg(test)]
+		scope.checkpoint(&cfg, "set_migration_sweeper").await?;
+		scope
+			.handles()
+			.set_tiering_sweeper(l2_for_sweeper.map(|object_store| {
+				SlabSweeper::new(
+					slab.clone(),
+					object_store,
+					raft_committer.clone(),
+					state_machine.clone(),
+					cfg.tiering.clone(),
+				)
+				.with_clock(clock.clone())
+				.with_audit_sink(local_node, audit_sink.clone())
+				.with_mvcc_retention_policy(cfg.mvcc_retention_policy)
+				.spawn()
+			}));
+		#[cfg(test)]
+		scope.checkpoint(&cfg, "set_tiering_sweeper").await?;
+		scope
+			.handles()
+			.set_restore_validation(if requires_restore_validation {
+				let slab = slab.clone();
+				let recovery_owner = owner.clone();
+				Some(tokio::spawn(async move {
+					match slab.validate_tiered_references().await {
+						Ok(()) => {
+							// Only a run that finished its recovery may later leave a
+							// clean-shutdown record.
+							recovery_owner.mark_recovery_complete();
+							let _ = restore_validation_tx.send(RestoreValidationStatus::Complete);
+						}
+						Err(err) => {
+							tracing::error!(error = %err, "restore tier validation failed");
+							let _ = restore_validation_tx.send(RestoreValidationStatus::Failed(
+								format!("RestoreValidationFailed: {err}"),
+							));
+						}
 					}
-					Err(err) => {
-						tracing::error!(error = %err, "restore tier validation failed");
-						let _ = restore_validation_tx.send(RestoreValidationStatus::Failed(
-							format!("RestoreValidationFailed: {err}"),
-						));
-					}
-				}
-			}))
-		} else {
-			None
-		};
+				}))
+			} else {
+				None
+			});
+		#[cfg(test)]
+		scope.checkpoint(&cfg, "set_restore_validation").await?;
 
-		let node = Self {
+		if data_server.degraded_reason().is_some() {
+			tracing::error!(
+				node_id = local_node.id,
+				"bootstrapped with persisted local-persistence distrust fence; shutting down raft participation"
+			);
+			if let Err(err) = raft.shutdown().await {
+				tracing::error!(
+					node_id = local_node.id,
+					error = %err,
+					"failed to shut down raft participation for persisted distrust fence"
+				);
+			}
+		}
+		let parts = startup::NodeParts {
 			_directory_owner: owner,
 			storage_shutdown_timeout: cfg.storage_shutdown_timeout,
 			recovered_after_unclean_shutdown: unclean_previous_shutdown,
@@ -2254,44 +2429,8 @@ impl WendelonNode {
 			restore_validation: restore_validation_rx,
 			retention,
 			clock_drift_events: clock_drift_rx,
-			transport_servers,
-			handles: NodeHandles {
-				ring_updater,
-				drift_monitor,
-				eviction_watchdog,
-				lease_manager,
-				pending_finalization_reconciler,
-				cdc_finalization_release_observer,
-				cdc_locality_heartbeat,
-				epoch_reconciler,
-				tenant_policy_reconciler,
-				drop_reclaim_sweeper,
-				migration_sweeper,
-				lsm_compaction,
-				lsm_compaction_control,
-				lsm_gc,
-				secondary_index_lifecycle,
-				tiering_sweeper,
-				restore_validation,
-				audit_chain_root_rollup,
-				default_tenant_seeder,
-				checkpoint_emitter,
-			},
 		};
-		if node.data_server.degraded_reason().is_some() {
-			tracing::error!(
-				node_id = node.local_node.id,
-				"bootstrapped with persisted local-persistence distrust fence; shutting down raft participation"
-			);
-			if let Err(err) = node.raft.shutdown().await {
-				tracing::error!(
-					node_id = node.local_node.id,
-					error = %err,
-					"failed to shut down raft participation for persisted distrust fence"
-				);
-			}
-		}
-		Ok(node)
+		Ok(parts)
 	}
 
 	pub fn subscribe_clock_drift(&self) -> watch::Receiver<Option<ClockDriftEvent>> {
@@ -3354,6 +3493,16 @@ pub struct NoDialTransportProvider;
 
 #[async_trait]
 impl TransportProvider for NoDialTransportProvider {
+	fn withdraw_local(
+		&self,
+		_node_id: crate::schema::NodeId,
+		_address: &str,
+		_service: &std::sync::Arc<dyn crate::network::server::HrftService>,
+	) -> std::io::Result<()> {
+		// This provider does not retain publish_local registrations.
+		Ok(())
+	}
+
 	async fn connect(
 		&self,
 		target: NodeId,

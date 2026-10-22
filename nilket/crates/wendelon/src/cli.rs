@@ -703,7 +703,7 @@ async fn start_daemon(config_path: PathBuf) -> DaemonExit {
 		Ok(n) => n,
 		Err(e) => {
 			eprintln!("bootstrap failed: {e}");
-			return DaemonExit::now(ExitCode::from(1));
+			return bootstrap_failure_exit(&e, shutdown_deadline);
 		}
 	};
 	eprintln!("wendelon: bootstrapped node {}", node.local_node.id);
@@ -811,7 +811,7 @@ async fn start_daemon(config_path: PathBuf) -> DaemonExit {
 
 /// How the daemon body ended. An armed watchdog stays armed until the runtime
 /// itself has been torn down, so blocking work left behind cannot hang the exit.
-struct DaemonExit {
+pub(crate) struct DaemonExit {
 	code: ExitCode,
 	watchdog: Option<crate::shutdown_watchdog::ShutdownWatchdog>,
 }
@@ -875,10 +875,35 @@ async fn wait_for_stop_signal() {
 	tokio::signal::ctrl_c().await.ok();
 }
 
+pub(crate) fn bootstrap_failure_exit(
+	error: &std::io::Error,
+	deadline: std::time::Duration,
+) -> DaemonExit {
+	let watchdog = crate::shutdown_watchdog::ShutdownWatchdog::arm(deadline);
+	if is_shutdown_incomplete(error) {
+		crate::shutdown_watchdog::terminate_unclean(&format!(
+			"bootstrap cleanup incomplete: {error}"
+		));
+	}
+	DaemonExit::armed(ExitCode::from(1), watchdog)
+}
 fn is_shutdown_incomplete(error: &std::io::Error) -> bool {
-	error
-		.get_ref()
-		.is_some_and(|inner| inner.is::<crate::storage::ownership::ShutdownIncomplete>())
+	let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(error);
+	while let Some(current) = cause {
+		if current.is::<crate::storage::ownership::ShutdownIncomplete>() {
+			return true;
+		}
+		if let Some(io) = current.downcast_ref::<std::io::Error>() {
+			if io
+				.get_ref()
+				.is_some_and(|inner| inner.is::<crate::storage::ownership::ShutdownIncomplete>())
+			{
+				return true;
+			}
+		}
+		cause = current.source();
+	}
+	false
 }
 
 async fn shutdown_observability(handles: ObservabilityHandles) -> std::io::Result<()> {

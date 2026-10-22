@@ -3368,7 +3368,13 @@ fn adr054_cdc_subscription_substrate_contract() {
 		"await_background_task(\n\t\t\tself.cdc_finalization_release_observer",
 		"await_background_task(self.cdc_locality_heartbeat, \"CDC locality heartbeat\")",
 	] {
-		if !node.contains(required) {
+		// Ownership setters add indentation around the same heartbeat call.
+		// Preserve the full call/argument guard while ignoring formatting.
+		if !node
+			.split_whitespace()
+			.collect::<String>()
+			.contains(&required.split_whitespace().collect::<String>())
+		{
 			violations.push(format!(
 				"src/node.rs: missing ADR 054 heartbeat supervisor token {required}"
 			));
@@ -10412,6 +10418,76 @@ fn adr0167_wendelon_tenant_command_reaches_the_tenant_admin_rpc() {
 			"tenant CLI must not use {forbidden}"
 		);
 	}
+}
+
+#[test]
+fn pd25_constructor_spawns_stay_inside_typed_ownership_handoff() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let source = fs::read_to_string(root.join("src/node.rs")).unwrap();
+	let region = source
+		.split("async fn construct(")
+		.nth(1)
+		.unwrap()
+		.split("pub fn subscribe_clock_drift")
+		.next()
+		.unwrap();
+	fn find_body(stream: TokenStream) -> Option<TokenStream> {
+		let tokens: Vec<_> = stream.into_iter().collect();
+		if let Some(function) = tokens.windows(2).position(|pair| {
+			matches!(&pair[0], TokenTree::Ident(id) if id == "fn")
+				&& matches!(&pair[1], TokenTree::Ident(id) if id == "construct")
+		}) {
+			return tokens[function + 2..].iter().find_map(|token| match token {
+				TokenTree::Group(group) if group.delimiter() == proc_macro2::Delimiter::Brace => {
+					Some(group.stream())
+				}
+				_ => None,
+			});
+		}
+		tokens.into_iter().find_map(|token| match token {
+			TokenTree::Group(group) => find_body(group.stream()),
+			_ => None,
+		})
+	}
+	let body = find_body(TokenStream::from_str(&source).unwrap()).expect("constructor body");
+	fn audit(stream: TokenStream) {
+		let tokens: Vec<_> = stream.into_iter().collect();
+		let mut i = 0;
+		while i < tokens.len() {
+			if let TokenTree::Ident(name) = &tokens[i] {
+				let name = name.to_string();
+				if name.starts_with("set_")
+					&& matches!(tokens.get(i+1), Some(TokenTree::Group(group)) if group.delimiter() == proc_macro2::Delimiter::Parenthesis)
+				{
+					// Typed setters immediately own the result even when a spawn lives in
+					// an if/match expression inside their argument.
+					i += 2;
+					continue;
+				}
+				if name == "spawn" || name.starts_with("spawn_") {
+					assert!(
+						matches!(
+							name.as_str(),
+							"spawn_io_thread_named_for_class"
+								| "spawn_quic_server" | "spawn_tcp_tls_server"
+						),
+						"unowned constructor spawn: {name}"
+					);
+				}
+			}
+			if let TokenTree::Group(group) = &tokens[i] {
+				audit(group.stream());
+			}
+			i += 1;
+		}
+	}
+	audit(body);
+	assert!(region.contains("scope.adopt_transport(server)"));
+	assert!(region.contains("scope.adopt_raft(raft.clone())"));
+	assert!(region.contains("scope.adopt_factory(factory.clone())"));
+	let startup = fs::read_to_string(root.join("src/node/startup.rs")).unwrap();
+	assert!(startup.contains("handles.validate()"));
+	assert!(startup.contains("duplicate or untransferred tasks"));
 }
 
 #[test]
