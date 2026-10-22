@@ -835,6 +835,21 @@ impl std::fmt::Debug for StartupFault {
 	}
 }
 
+/// This stage is written only AFTER awaited Raft shutdown, every task/factory
+/// join, lifecycle quiescence and transport shutdown, and BEFORE waiting for
+/// foreign callbacks. No fixture teardown or active Raft request runs here.
+async fn trusted_startup_joins_completed(observation: &Observation) -> bool {
+	let slot = observation
+		.owner
+		.latest_startup_cleanup()
+		.expect("owned startup cleanup");
+	while slot.current_stage() != "provider withdrawal join" {
+		tokio::task::yield_now().await;
+	}
+	observation.tasks.iter().all(|(_, task)| task.is_finished())
+		&& observation.raft.metrics().borrow().state == openraft::ServerState::Shutdown
+}
+
 struct BlockingWithdrawal {
 	entered_file: PathBuf,
 	panic_publish: bool,
@@ -893,22 +908,7 @@ async fn pd25_forever_withdraw_child() {
 	});
 	let outcome = tokio::spawn(WendelonNode::bootstrap_with_provider(cfg, provider)).await;
 	let observation = probe.0.lock().unwrap().take().unwrap();
-	let closed_trusted = async {
-		while observation
-			.tasks
-			.iter()
-			.any(|(_, task)| !task.is_finished())
-		{
-			tokio::task::yield_now().await;
-		}
-		assert!(observation.lifecycle.is_draining());
-		assert!(observation.owner.write_permit().is_err());
-		while observation.raft.is_initialized().await.is_ok() {
-			tokio::task::yield_now().await;
-		}
-		true
-	}
-	.await;
+	let closed_trusted = trusted_startup_joins_completed(&observation).await;
 	if closed_trusted {
 		std::fs::write(
 			path.join("trusted-cleanup-complete"),
@@ -1062,20 +1062,15 @@ async fn pd25_slow_partial_publish_withdrawal_keeps_lock_but_not_trusted_workers
 		let outcome = tokio::time::timeout(Duration::from_secs(10), &mut task).await;
 		let observation = probe.0.lock().unwrap().take().unwrap();
 		let slot = observation.owner.latest_startup_cleanup().unwrap();
-		let trusted = tokio::time::timeout(Duration::from_secs(5), async {
-			while observation
-				.tasks
-				.iter()
-				.any(|(_, task)| !task.is_finished())
-			{
-				tokio::task::yield_now().await;
-			}
-			while observation.raft.is_initialized().await.is_ok() {
-				tokio::task::yield_now().await;
-			}
-			true
-		})
+		// A live API request can remain pending during Raft shutdown even after
+		// the actual shutdown join has completed. Observe the producer certificate,
+		// not an interfering request, while foreign withdrawal is still blocked.
+		let trusted = tokio::time::timeout(
+			Duration::from_secs(5),
+			trusted_startup_joins_completed(&observation),
+		)
 		.await;
+
 		let write_closed = observation.owner.write_permit().is_err();
 		let still_registered = provider.registration.lock().unwrap().is_some();
 		let busy = DataDirectoryOwner::acquire_existing(&dir).is_err();
@@ -1099,6 +1094,14 @@ async fn pd25_slow_partial_publish_withdrawal_keeps_lock_but_not_trusted_workers
 		.unwrap();
 		slot.join_finished().await;
 		assert!(trusted.unwrap() && write_closed && still_registered && busy && close_incomplete);
+		assert!(
+			tokio::time::timeout(Duration::from_secs(5), observation.raft.is_initialized())
+				.await
+				.unwrap()
+				.is_err(),
+			"Raft must remain stopped after the owned cleanup joins"
+		);
+
 		assert!(provider.registration.lock().unwrap().is_none());
 		match outcome.unwrap() {
 			Err(error) if panic_publish => assert!(error.is_panic()),

@@ -243,10 +243,18 @@ pub enum StartupCleanupStatus {
 }
 pub(crate) struct StartupCleanupSlot {
 	context: String,
+	progress: Arc<Mutex<&'static str>>,
 	status: tokio::sync::watch::Sender<StartupCleanupStatus>,
 	handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 impl StartupCleanupSlot {
+	#[cfg(test)]
+	pub(crate) fn current_stage(&self) -> &'static str {
+		*self
+			.progress
+			.lock()
+			.unwrap_or_else(std::sync::PoisonError::into_inner)
+	}
 	pub(crate) async fn wait(&self) -> StartupCleanupStatus {
 		let mut status = self.status.subscribe();
 		let mut handle = self.handle.lock().await;
@@ -354,6 +362,7 @@ impl DataDirectoryOwner {
 		let (start, ready) = tokio::sync::oneshot::channel();
 		let slot = Arc::new(StartupCleanupSlot {
 			context,
+			progress: progress.clone(),
 			status,
 			handle: tokio::sync::Mutex::new(None),
 		});
@@ -386,7 +395,7 @@ impl DataDirectoryOwner {
 				Err(error) => {
 					let incomplete = error.get_ref().and_then(|source| source.downcast_ref::<ShutdownIncomplete>());
 					let outstanding = incomplete.map(|error| error.outstanding);
-					let mut message = format!("{}: {error}", worker_slot.context);
+					let mut message = format!("{} at {}: {error}", worker_slot.context, *worker_slot.progress.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
 					let mut cause = std::error::Error::source(&error);
 					while let Some(source) = cause { message.push_str(": "); message.push_str(&source.to_string()); cause = source.source(); }
 					StartupCleanupStatus::Failed { kind: error.kind(), message, incomplete: incomplete.is_some(), outstanding }

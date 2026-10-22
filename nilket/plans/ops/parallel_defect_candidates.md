@@ -479,3 +479,31 @@ registration (pre-existing behavior; failed-startup withdrawal is repaired by
 B0). Track a separate healthy-shutdown registration retirement change; current
 lifecycle draining refuses new calls, but stale registrations may retain
 service/storage aliases until the provider network is dropped.
+
+#### Cut C slow-withdrawal control: observer-interference (captured)
+
+R2 nextest iteration1 and in-process iteration1 both failed the panic half of
+`pd25_slow_partial_publish_withdrawal_keeps_lock_but_not_trusted_workers`:
+the active `Raft::is_initialized()` external request did not answer within the
+unchanged5s observation bound. Original receipts remain in
+`/home/me/work/reviews/cut-c-b0-r2-20261022/final/`.
+
+The pinned-observer control reproduced on diagnosticR3 observation3:
+`/home/me/work/reviews/cut-c-b0-slow-diagnostic-r3-20261022/full-003.log`.
+BEFORE cancelling that observer, all registered handles were finished,
+current cleanup stage was `provider withdrawal join`, and Raft metrics were
+`Shutdown` / `Err(Stopped)`. That stage is written after the actual awaited
+Raft shutdown, every task/factory join, lifecycle quiescence and transport
+shutdown. Cancelling ONLY the probe left that completed stage unchanged,
+with `foreign_released=false`. Trusted cleanup was already independent of
+foreign work; the active API query was an invalid shutdown-completion oracle.
+Claude confirmed the captured classification in durable chatd
+`01a1651c-1e50-7440-9c75-e0bb218d1649`.
+
+The repaired control waits on that passive producer stage, then requires the
+finished handles and Shutdown metrics before releasing the foreign job. It
+keeps the post-cleanup Raft API check after the owned cleanup joins and before
+fixture teardown. The forever-withdrawal child uses the same passive ordering
+proof. No bound increase, bootstrap retry or serialization is used. The original
+STOPs and diagnostic failures are retained; GREEN closure remains PENDING a
+complete clean nextest30 and in-process10 cycle at explicit1024 concurrency.
