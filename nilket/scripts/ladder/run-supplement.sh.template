@@ -3,7 +3,8 @@
 # main ladder does not produce, such as plan-commit architecture tests. Same
 # step() as run-ladder.sh.template: every step runs under timeout(1) with its
 # own budget and records rc 124 (timed out) or 137 (killed after the 60 s
-# grace); no step passes a one-thread setting (wrapper default 1024 threads).
+# grace); the wrapper must default to 1024 or the caller must explicitly
+# choose test concurrency. No step passes a one-thread setting.
 # Every step, including the plan-commit steps, runs the audited COMMIT's
 # wrapper, copied aside before any plan commit is checked out: a plan commit's
 # own wrapper may predate the slice, the timeouts or the defaults.
@@ -22,6 +23,19 @@ git -C "$SRC" checkout -q --detach "$COMMIT"
 [ "$(git -C "$SRC" rev-parse HEAD)" = "$COMMIT" ] || { echo "wrong commit"; exit 2; }
 git -C "$SRC" status --porcelain > "$OUT/status-start.txt"
 { rustc --version; cargo --version; uname -a; nproc; date -u +%FT%TZ; } > "$OUT/env.txt"
+# Refuse a silent default-1 run masquerading as v5 concurrency evidence.
+require_v5_concurrency() {
+	local wrapper=$1
+	if [[ -v CARGO_CGROUP_RUST_TEST_THREADS ]]; then
+		[[ "$CARGO_CGROUP_RUST_TEST_THREADS" =~ ^[1-9][0-9]*$ ]] || {
+			echo "v5 requires a positive explicit test-thread override" >&2; return 2;
+		}
+	elif ! grep -Fxq 'test_threads="${CARGO_CGROUP_RUST_TEST_THREADS:-1024}"' "$wrapper"; then
+		echo "v5 requires default 1024 or an explicit CARGO_CGROUP_RUST_TEST_THREADS override" >&2
+		return 2
+	fi
+}
+require_v5_concurrency "$SRC/nilket/scripts/cargo-cgroup" || exit 2
 grep -q 'CARGO_CGROUP_SLICE_MEMORY_PERCENT' "$SRC/nilket/scripts/cargo-cgroup" || { echo "cargo-cgroup lacks the memory slice; v5 needs it" | tee -a "$OUT/rc.txt"; exit 2; }
 { sha256sum "$SRC/nilket/scripts/cargo-cgroup"; grep -E '^(test_threads|tasks_max|memory_high_cfg|memory_max_cfg|slice|slice_memory_max_cfg|slice_memory_percent|nofile)=' "$SRC/nilket/scripts/cargo-cgroup"; free -g; ulimit -Hn; } >> "$OUT/env.txt"
 TMPROOT=/dev/shm/ladder-${ROOT##*/}
