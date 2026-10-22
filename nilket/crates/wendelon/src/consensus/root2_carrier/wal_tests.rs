@@ -17,7 +17,7 @@ fn manifest(text: &str) -> Vec<(&str, Vec<u8>)> {
 		})
 		.collect()
 }
-fn record(payload: &[u8], version: u8) -> std::io::Result<Entry<WendelonTypeConfig>> {
+pub(super) fn record(payload: &[u8], version: u8) -> std::io::Result<Entry<WendelonTypeConfig>> {
 	// Hash-matched body uses the actual production decoder, not postcard as a stand-in.
 	let fixed_size = std::mem::size_of::<RaftLogEntryFixed>();
 	let fixed = RaftLogEntryFixed {
