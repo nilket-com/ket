@@ -389,3 +389,29 @@ The samples do not freeze every nested payload shape; changed historical leaves
 must be forked before a successor decoder is activated. No format bump or
 conditional recovery command is emitted. Incomplete-epoch recovery, cluster
 command-support gating and final stacked v5 acceptance remain open.
+
+## Review candidates PD-22–25 (2026-10-22)
+
+Independent source review found these pre-existing candidates. None has a RED
+execution or confirmed measured rate yet. They are registered for investigation,
+not claimed as Cut A closures or regressions. Source reviews:
+`reviews/claude-review-sidecar-20261022/review.md` and
+`reviews/claude-review-join-startup-20261022/review.md`.
+
+| ID | Review name | Candidate and required first proof | State / next cut |
+|---|---|---|---|
+| PD-22 | S1 | Sidecar file identity omits the logical schema fingerprint present in the catalog key. Confirm or refute that an object id changes on every fingerprint change; if not, reproduce new publication followed by old-row retirement unlinking the live file. A missing file currently loads as `Ok(None)`, so this may silently lose index data. | HIGH; identity narrower than catalog identity is held for proof. RED first, highest-priority cut after A; no parallel-load reproduction yet. |
+| PD-23 | S2 | Active-buffer sealing may publish after GC retires its source slab because sealing has no source-slab lease/claim. Reproduce a publish/retire overlap and inspect the catalog row and coverage for the retired slab. | Unconfirmed; RED first after PD-22; no parallel-load reproduction yet. |
+| PD-24 | S3 | Catalog failure after sidecar rename removes the new file while an old row may still name that path. Inject the catalog failure after a same-path replacement and prove whether the old row loses its file. | Unconfirmed; RED first after PD-22; no parallel-load reproduction yet. |
+| PD-25 | J1 | Startup ownership guard currently spans only the initialization/JOIN block. Earlier producer/transport setup and later epoch reconcile, tenant seeding and LSM-worker construction failures may leave writes admitted, serving transports, detached tasks and LOCK held. Inject failures at both prefixes and observe actual closure. | Open, source-confirmed scope gap; separate Cut B contract or later cut. No parallel-load RED yet. |
+
+Every confirmed candidate needs its RED before repair. Applicable reproduced
+parallel-load defects block the separately gated default flip to the cpuset CPU count, with an explicit 1024
+stress lane; the current
+Cut A retains main's accepted default 1 and runs the v4 gate.
+
+Additional source-review notes, not yet demonstrated defects: forwarded JOIN
+has no hop limit; the counter-key `locks` map does not shrink; the test-only
+`CounterReplica` harness can remove gates with queued waiters; leader and replica
+gate-drop invariant failures use different release-build policies. Record a
+separate RED and scope before promoting any note to an implementation change.
