@@ -187,6 +187,71 @@ mod reclamation_tests {
 	// A correctness hang detector, not a scheduling delay or throughput budget.
 	const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(60);
 
+	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+	async fn multithread_cancellation_stress_preserves_exclusion_and_reclaims_gates() {
+		let gates = Arc::new(WriteKeyGates::new());
+		let active = Arc::new([
+			AtomicUsize::new(0),
+			AtomicUsize::new(0),
+			AtomicUsize::new(0),
+		]);
+		let admitted = Arc::new(AtomicUsize::new(0));
+		let cancelled = Arc::new(AtomicUsize::new(0));
+		let start = Arc::new(tokio::sync::Barrier::new(48));
+		let mut tasks = tokio::task::JoinSet::new();
+		for task in 0..48u64 {
+			let gates = gates.clone();
+			let active = active.clone();
+			let admitted = admitted.clone();
+			let cancelled = cancelled.clone();
+			let start = start.clone();
+			tasks.spawn(async move {
+				let mut random = task + 1;
+				start.wait().await;
+				for _ in 0..80 {
+					random ^= random << 13;
+					random ^= random >> 7;
+					random ^= random << 17;
+					let key = (random % 3) as usize;
+					let admission = WriteKeyGate::admit(&gates, [key as u8; 24]);
+					let deadline = Duration::from_micros(1 + random % 200);
+					if let Ok(guard) = tokio::time::timeout(deadline, admission).await {
+						assert_eq!(
+							active[key].fetch_add(1, Ordering::SeqCst),
+							0,
+							"two holders for key {key}"
+						);
+						admitted.fetch_add(1, Ordering::Relaxed);
+						for _ in 0..(1 + random % 8) {
+							tokio::task::yield_now().await;
+						}
+						assert_eq!(active[key].fetch_sub(1, Ordering::SeqCst), 1);
+						drop(guard);
+					} else {
+						cancelled.fetch_add(1, Ordering::Relaxed);
+					}
+				}
+			});
+		}
+		tokio::time::timeout(Duration::from_secs(60), async {
+			while let Some(result) = tasks.join_next().await {
+				result.unwrap();
+			}
+		})
+		.await
+		.unwrap();
+		assert!(admitted.load(Ordering::Relaxed) > 0);
+		assert!(
+			cancelled.load(Ordering::Relaxed) > 0,
+			"stress did not exercise timeout cancellation"
+		);
+		assert!(active.iter().all(|value| value.load(Ordering::SeqCst) == 0));
+		assert!(
+			gates.is_empty(),
+			"retained gate after every participant ended"
+		);
+	}
+
 	struct UnlockWake {
 		run: mpsc::SyncSender<()>,
 		finished: StdMutex<mpsc::Receiver<()>>,

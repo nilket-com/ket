@@ -996,3 +996,76 @@ mod replica_gate_cleanup {
 		assert!(f.service.op_locks.is_empty());
 	}
 }
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multithread_replica_cancellation_stress_preserves_exclusion_and_reclaims_gates() {
+	let fixture = Fixture::new("replica-gate-multithread-stress").await;
+	let gates = fixture.service.clone();
+	let active = Arc::new([
+		AtomicUsize::new(0),
+		AtomicUsize::new(0),
+		AtomicUsize::new(0),
+	]);
+	let admitted = Arc::new(AtomicUsize::new(0));
+	let cancelled = Arc::new(AtomicUsize::new(0));
+	let start = Arc::new(tokio::sync::Barrier::new(48));
+	let mut tasks = tokio::task::JoinSet::new();
+	for task in 0..48u64 {
+		let gates = gates.clone();
+		let active = active.clone();
+		let admitted = admitted.clone();
+		let cancelled = cancelled.clone();
+		let start = start.clone();
+		tasks.spawn(async move {
+			let mut random = task + 1;
+			start.wait().await;
+			for _ in 0..80 {
+				random ^= random << 13;
+				random ^= random >> 7;
+				random ^= random << 17;
+				let key = (random % 3) as usize;
+				let admission = ReplicaGate::admit(
+					&gates,
+					ReplicaOpKey2::new(node(1), tenant(7), key as u64 + 1).unwrap(),
+				);
+				let deadline = Duration::from_micros(1 + random % 200);
+				if let Ok(guard) = tokio::time::timeout(deadline, admission).await {
+					assert_eq!(
+						active[key].fetch_add(1, Ordering::SeqCst),
+						0,
+						"two holders for key {key}"
+					);
+					admitted.fetch_add(1, Ordering::Relaxed);
+					for _ in 0..(1 + random % 8) {
+						tokio::task::yield_now().await;
+					}
+					assert_eq!(active[key].fetch_sub(1, Ordering::SeqCst), 1);
+					drop(guard);
+				} else {
+					cancelled.fetch_add(1, Ordering::Relaxed);
+				}
+			}
+		});
+	}
+	tokio::time::timeout(Duration::from_secs(60), async {
+		while let Some(result) = tasks.join_next().await {
+			result.unwrap();
+		}
+	})
+	.await
+	.unwrap();
+	assert!(admitted.load(Ordering::Relaxed) > 0);
+	assert!(
+		cancelled.load(Ordering::Relaxed) > 0,
+		"stress did not exercise timeout cancellation"
+	);
+	assert!(active.iter().all(|value| value.load(Ordering::SeqCst) == 0));
+	assert!(gates.pending.is_empty());
+	assert!(
+		gates.op_locks.is_empty(),
+		"retained gate after every participant ended"
+	);
+}
