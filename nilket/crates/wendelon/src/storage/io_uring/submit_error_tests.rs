@@ -6,7 +6,8 @@ use crate::storage::finality_observation::{
 use std::io::Write;
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
-use std::time::Duration;
+use std::sync::atomic::AtomicUsize;
+use std::time::{Duration, Instant};
 
 mod callback_panic;
 
@@ -30,6 +31,7 @@ async fn read_across_enter_error(errno: i32) {
 	let (release, released) = std::sync::mpsc::sync_channel(1);
 	*handle.submit_fault.lock().unwrap() = Some(SubmitFault {
 		repeats: 0,
+		observed: None,
 		entered: false,
 		errno,
 		submitted,
@@ -432,6 +434,7 @@ async fn terminal_worker_error_closes_admission_and_drops_queued_requests() {
 	let (release, released) = std::sync::mpsc::sync_channel(1);
 	*handle.submit_fault.lock().unwrap() = Some(SubmitFault {
 		repeats: 0,
+		observed: None,
 		entered: false,
 		errno: libc::EIO,
 		submitted,
@@ -496,8 +499,9 @@ async fn persistent_retryable_enter_errors_terminate_without_completion() {
 	) {
 		return;
 	}
-	for errno in [libc::EAGAIN, libc::EBUSY, libc::EINTR] {
+	for errno in [libc::EAGAIN, libc::EBUSY] {
 		let handle = spawn_io_thread(8).unwrap();
+		let attempts = Arc::new(AtomicUsize::new(0));
 		let (reader, _writer) = UnixStream::pair().unwrap();
 		let file = Arc::new(std::fs::File::from(OwnedFd::from(reader)));
 		let (submitted, ready) = std::sync::mpsc::sync_channel(1);
@@ -505,6 +509,7 @@ async fn persistent_retryable_enter_errors_terminate_without_completion() {
 		*handle.submit_fault.lock().unwrap() = Some(SubmitFault {
 			errno,
 			repeats: usize::MAX,
+			observed: Some(attempts.clone()),
 			entered: false,
 			submitted,
 			release: released,
@@ -516,6 +521,7 @@ async fn persistent_retryable_enter_errors_terminate_without_completion() {
 		tokio::task::spawn_blocking(move || ready.recv_timeout(Duration::from_secs(10)).unwrap())
 			.await
 			.unwrap();
+		let started = Instant::now();
 		release.send(()).unwrap();
 		// No peer data is ever sent. A retry budget must stop this worker even
 		// when none of its operations can complete; this is a hang detector.
@@ -529,10 +535,132 @@ async fn persistent_retryable_enter_errors_terminate_without_completion() {
 			panic!("persistent enter error {errno} never exhausted its retry budget");
 		}
 		assert_eq!(result.unwrap().unwrap().result, -errno);
+		assert!(
+			started.elapsed() >= Duration::from_secs(2),
+			"pressure failure exhausted before the no-progress time budget"
+		);
+		assert!(
+			attempts.load(Ordering::SeqCst) <= 64,
+			"retry path spun instead of backing off"
+		);
 		tokio::time::timeout(Duration::from_secs(5), handle.close_and_join())
 			.await
 			.unwrap()
 			.unwrap();
 	}
 	println!("quarantine control passed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repeated_interrupted_waits_do_not_fail_a_pending_read() {
+	let handle = spawn_io_thread(8).unwrap();
+	let (reader, mut writer) = UnixStream::pair().unwrap();
+	let file = Arc::new(std::fs::File::from(OwnedFd::from(reader)));
+	let attempts = Arc::new(AtomicUsize::new(0));
+	let (submitted, ready) = std::sync::mpsc::sync_channel(1);
+	let (release, released) = std::sync::mpsc::sync_channel(1);
+	*handle.submit_fault.lock().unwrap() = Some(SubmitFault {
+		errno: libc::EINTR,
+		repeats: 1023,
+		observed: Some(attempts.clone()),
+		entered: false,
+		submitted,
+		release: released,
+	});
+	let mut reply = handle
+		.submit(IoOp::Read, &file, AlignedBuf::new(DIRECT_IO_ALIGN), 0)
+		.await
+		.unwrap();
+	tokio::task::spawn_blocking(move || ready.recv_timeout(Duration::from_secs(10)).unwrap())
+		.await
+		.unwrap();
+	release.send(()).unwrap();
+	tokio::time::timeout(Duration::from_secs(5), async {
+		while attempts.load(Ordering::SeqCst) < 1024 {
+			assert!(
+				matches!(
+					reply.try_recv(),
+					Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+				),
+				"EINTR killed the pending read"
+			);
+			tokio::task::yield_now().await;
+		}
+	})
+	.await
+	.unwrap();
+	assert!(matches!(
+		reply.try_recv(),
+		Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+	));
+	writer.write_all(&[0x7a; 32]).unwrap();
+	let result = tokio::time::timeout(Duration::from_secs(10), reply)
+		.await
+		.unwrap()
+		.unwrap();
+	assert_eq!(result.result, 32);
+	assert_eq!(&result.buf.unwrap().as_slice()[..32], &[0x7a; 32]);
+	handle.close_and_join().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transient_pressure_recovers_and_resumes_sqe_admission() {
+	for errno in [libc::EAGAIN, libc::EBUSY] {
+		let handle = spawn_io_thread(8).unwrap();
+		for _cycle in 0..2 {
+			let (reader, mut writer) = UnixStream::pair().unwrap();
+			let file = Arc::new(std::fs::File::from(OwnedFd::from(reader)));
+			let attempts = Arc::new(AtomicUsize::new(0));
+			let (submitted, ready) = std::sync::mpsc::sync_channel(1);
+			let (release, released) = std::sync::mpsc::sync_channel(1);
+			*handle.submit_fault.lock().unwrap() = Some(SubmitFault {
+				errno,
+				repeats: 3,
+				observed: Some(attempts.clone()),
+				entered: false,
+				submitted,
+				release: released,
+			});
+			let first = handle
+				.submit(IoOp::Read, &file, AlignedBuf::new(DIRECT_IO_ALIGN), 0)
+				.await
+				.unwrap();
+			tokio::task::spawn_blocking(move || {
+				ready.recv_timeout(Duration::from_secs(10)).unwrap()
+			})
+			.await
+			.unwrap();
+			let (next_reader, mut next_writer) = UnixStream::pair().unwrap();
+			let next_file = Arc::new(std::fs::File::from(OwnedFd::from(next_reader)));
+			let second = handle
+				.submit(IoOp::Read, &next_file, AlignedBuf::new(DIRECT_IO_ALIGN), 0)
+				.await
+				.unwrap();
+			release.send(()).unwrap();
+			tokio::time::timeout(Duration::from_secs(5), async {
+				while attempts.load(Ordering::SeqCst) < 4 {
+					tokio::task::yield_now().await;
+				}
+			})
+			.await
+			.unwrap();
+			// The second request was queued behind the first error. A real CQE
+			// must reset retry mode so its SQE is admitted on the next iteration.
+			writer.write_all(&[0x61; 32]).unwrap();
+			next_writer.write_all(&[0x62; 16]).unwrap();
+			let first = tokio::time::timeout(Duration::from_secs(10), first)
+				.await
+				.unwrap()
+				.unwrap();
+			let second = tokio::time::timeout(Duration::from_secs(10), second)
+				.await
+				.unwrap()
+				.unwrap();
+			assert_eq!(first.result, 32);
+			assert_eq!(second.result, 16);
+			assert_eq!(&first.buf.unwrap().as_slice()[..32], &[0x61; 32]);
+			assert_eq!(&second.buf.unwrap().as_slice()[..16], &[0x62; 16]);
+		}
+		handle.close_and_join().await.unwrap();
+	}
 }

@@ -65,11 +65,38 @@ impl Drop for InFlightRequests {
 	}
 }
 
-pub(super) fn retryable_enter_error(error: &io::Error) -> bool {
-	matches!(
-		error.raw_os_error(),
-		Some(libc::EINTR | libc::EAGAIN | libc::EBUSY)
-	)
+/// A pressure retry budget, independent of harmless signal interruptions.
+/// The dedicated worker sleeps exponentially rather than burning its cpuset.
+#[derive(Default)]
+pub(super) struct EnterBackoff {
+	since: Option<Instant>,
+	delay: Duration,
+}
+pub(super) const ENTER_PRESSURE_BUDGET: Duration = Duration::from_secs(2);
+impl EnterBackoff {
+	pub(super) fn is_retrying(&self) -> bool {
+		self.since.is_some()
+	}
+	pub(super) fn reset(&mut self) {
+		*self = Self::default();
+	}
+	pub(super) fn pressure_delay(&mut self, now: Instant) -> Option<Duration> {
+		let elapsed = now.saturating_duration_since(*self.since.get_or_insert(now));
+		let remaining = ENTER_PRESSURE_BUDGET.checked_sub(elapsed)?;
+		if remaining.is_zero() {
+			return None;
+		}
+		self.delay = if self.delay.is_zero() {
+			Duration::from_millis(1)
+		} else {
+			self.delay.saturating_mul(2).min(Duration::from_millis(50))
+		};
+		Some(self.delay.min(remaining))
+	}
+}
+
+pub(super) fn pressure_enter_error(error: &io::Error) -> bool {
+	matches!(error.raw_os_error(), Some(libc::EAGAIN | libc::EBUSY))
 }
 
 /// Linux 6.0+ provides synchronous cancellation. An older kernel, an
