@@ -5,7 +5,11 @@ use tokio::sync::Notify;
 use tokio::task::AbortHandle;
 
 #[derive(Clone, Default)]
-pub(crate) struct StartupProbe(Arc<StdMutex<Option<Observation>>>, Option<Arc<Notify>>);
+pub(crate) struct StartupProbe(
+	Arc<StdMutex<Option<Observation>>>,
+	Option<Arc<Notify>>,
+	bool,
+);
 impl std::fmt::Debug for StartupProbe {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		f.write_str("StartupProbe")
@@ -18,6 +22,7 @@ impl PartialEq for StartupProbe {
 }
 impl Eq for StartupProbe {}
 struct Observation {
+	raft: WendelonRaft,
 	slab: Weak<SlabManager>,
 	control: Weak<WendelonControlServer>,
 	service: Weak<dyn HrftService>,
@@ -31,6 +36,7 @@ impl StartupProbe {
 		control: &Arc<WendelonControlServer>,
 		service: &Arc<dyn HrftService>,
 		lifecycle: &ServerLifecycle,
+		raft: &WendelonRaft,
 		tasks: Vec<(&'static str, AbortHandle)>,
 	) {
 		if let Some(pause) = &self.1 {
@@ -39,12 +45,23 @@ impl StartupProbe {
 				.pause_startup_cleanup(pause.clone());
 		}
 		*self.0.lock().unwrap() = Some(Observation {
+			raft: raft.clone(),
 			slab: Arc::downgrade(slab),
 			control: Arc::downgrade(control),
 			service: Arc::downgrade(service),
 			lifecycle: lifecycle.clone(),
 			tasks,
 		});
+	}
+	pub(super) fn after_handoff(&self) -> std::io::Result<()> {
+		if self.2 {
+			Err(Error::new(
+				ErrorKind::InvalidData,
+				"PD25 injected post-handoff constructor refusal",
+			))
+		} else {
+			Ok(())
+		}
 	}
 }
 struct JoinProvider {
@@ -335,7 +352,11 @@ async fn observe_failed_startup(cancel: bool, park_cleanup: bool) {
 		"startup fixture protocol/cleanup failed: {diagnostics:?}"
 	);
 	assert!(
-		live.is_empty() && !still_serving && !write_admitted && !busy_before_cleanup,
+		live.is_empty()
+			&& !still_serving
+			&& !service_retained
+			&& !write_admitted
+			&& !busy_before_cleanup,
 		"startup left resources: live={live:?} serving={still_serving} write_admitted={write_admitted} directory_busy={busy_before_cleanup}"
 	);
 }
@@ -351,4 +372,158 @@ async fn cancelled_join_startup_releases_owned_resources() {
 #[tokio::test]
 async fn cancelled_startup_fences_before_worker_and_excludes_external_close() {
 	observe_failed_startup(true, true).await;
+}
+
+struct PrefixProvider {
+	publish_panic: bool,
+	publish_error: bool,
+}
+#[async_trait]
+impl TransportProvider for PrefixProvider {
+	async fn connect(
+		&self,
+		_target: NodeId,
+		_address: &str,
+	) -> std::io::Result<Arc<dyn crate::network::transport::TransportConnection>> {
+		Err(Error::new(
+			ErrorKind::ConnectionRefused,
+			"PD25 unexpected connect",
+		))
+	}
+	fn publish_local(
+		&self,
+		_node: NodeId,
+		_address: &str,
+		_service: Arc<dyn HrftService>,
+	) -> std::io::Result<()> {
+		assert!(!self.publish_panic, "PD25 provider publish panic");
+		if self.publish_error {
+			Err(Error::new(
+				ErrorKind::ConnectionRefused,
+				"PD25 provider publish refusal",
+			))
+		} else {
+			Ok(())
+		}
+	}
+}
+
+async fn pd25_prefix_case(publish_error: bool, publish_panic: bool, after_handoff: bool) {
+	let dir = crate::test_support::TestDir::new("pd25-startup-prefix");
+	let mut cfg = NodeBootstrapConfig::dev(7121, dir.to_path_buf(), "127.0.0.1:0".into());
+	let mut probe = StartupProbe::default();
+	probe.2 = after_handoff;
+	cfg.startup_probe = Some(probe.clone());
+	let task = tokio::spawn(WendelonNode::bootstrap_with_provider(
+		cfg,
+		Arc::new(PrefixProvider {
+			publish_panic,
+			publish_error,
+		}),
+	));
+	match tokio::time::timeout(Duration::from_secs(30), task)
+		.await
+		.unwrap()
+	{
+		Err(error) if publish_panic && error.is_panic() => {}
+		Ok(Err(error))
+			if !publish_panic
+				&& error.kind()
+					== if after_handoff {
+						ErrorKind::InvalidData
+					} else {
+						ErrorKind::ConnectionRefused
+					} => {}
+		Ok(Ok(node)) => {
+			node.shutdown().await.unwrap();
+			panic!("PD25 fault did not execute");
+		}
+		other => panic!(
+			"PD25 unexpected bootstrap result: {}",
+			match other {
+				Err(e) => e.to_string(),
+				Ok(Err(e)) => e.to_string(),
+				_ => unreachable!(),
+			}
+		),
+	}
+	let observation = probe
+		.0
+		.lock()
+		.unwrap()
+		.take()
+		.expect("prefix observation before provider callback");
+	let live = observation
+		.tasks
+		.iter()
+		.filter(|(_, handle)| !handle.is_finished())
+		.map(|(name, _)| *name)
+		.collect::<Vec<_>>();
+	let ingress_open = !observation.lifecycle.is_draining();
+	let service_retained = observation.service.upgrade().is_some();
+	let owner = observation
+		.slab
+		.upgrade()
+		.and_then(|slab| slab.directory_owner());
+	let write_admitted = owner
+		.as_ref()
+		.is_some_and(|owner| owner.write_permit().is_ok());
+	let busy = match DataDirectoryOwner::acquire_existing(&dir) {
+		Ok(owner) => {
+			owner.close(Duration::from_secs(10)).await.unwrap();
+			false
+		}
+		Err(error) => {
+			assert!(
+				error
+					.get_ref()
+					.is_some_and(|e| e.is::<crate::storage::ownership::DataDirectoryBusy>())
+			);
+			true
+		}
+	};
+	// This fixture-only Raft alias is deliberately held through observation.
+	// It enables actual teardown after an earlier failure dropped ControlServer;
+	// a correct bootstrap cleanup must close writers/LOCK even with aliases.
+	observation.lifecycle.begin_drain();
+	tokio::time::timeout(Duration::from_secs(10), observation.raft.shutdown())
+		.await
+		.unwrap()
+		.unwrap();
+	for (_, task) in &observation.tasks {
+		task.abort();
+	}
+	tokio::time::timeout(Duration::from_secs(10), async {
+		while observation
+			.tasks
+			.iter()
+			.any(|(_, handle)| !handle.is_finished())
+		{
+			tokio::task::yield_now().await;
+		}
+	})
+	.await
+	.unwrap();
+	if let Some(owner) = owner {
+		owner.close(Duration::from_secs(10)).await.unwrap();
+	}
+	drop(observation);
+	let reopened = DataDirectoryOwner::acquire_existing(&dir).unwrap();
+	reopened.close(Duration::from_secs(10)).await.unwrap();
+	assert!(
+		live.is_empty() && !ingress_open && !service_retained && !write_admitted && !busy,
+		"PD25 failed startup leaked resources: live={live:?} ingress_open={ingress_open} service_retained={service_retained} write_admitted={write_admitted} directory_busy={busy}"
+	);
+}
+#[tokio::test]
+async fn pd25_provider_publish_error_cleans_the_earlier_prefix() {
+	pd25_prefix_case(true, false, false).await;
+}
+#[tokio::test]
+async fn pd25_provider_publish_unwind_cleans_the_earlier_prefix() {
+	pd25_prefix_case(false, true, false).await;
+}
+#[tokio::test]
+async fn pd25_post_handoff_error_cleans_the_later_prefix() {
+	pd25_prefix_case(false, false, true).await;
 }
