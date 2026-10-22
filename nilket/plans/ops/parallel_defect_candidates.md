@@ -400,10 +400,10 @@ not claimed as Cut A closures or regressions. Source reviews:
 
 | ID | Review name | Candidate and required first proof | State / next cut |
 |---|---|---|---|
-| PD-22 | S1 | Sidecar file identity omits the logical schema fingerprint present in the catalog key. Confirm or refute that an object id changes on every fingerprint change; if not, reproduce new publication followed by old-row retirement unlinking the live file. A missing file currently loads as `Ok(None)`, so this may silently lose index data. | HIGH; identity narrower than catalog identity is held for proof. RED first, highest-priority cut after A; no parallel-load reproduction yet. |
+| PD-22 | S1 | Sidecar file identity omits the logical schema fingerprint present in the catalog key. Confirm or refute that an object id changes on every fingerprint change; if not, reproduce new publication followed by old-row retirement unlinking the live file. A missing file currently loads as `Ok(None)`, so this may silently lose index data. | Confirmed component/storage API RED; repaired in Cut C S1 (8024efdf2 + db3d24a62), source cleared. Focused repeated stress passed; exact combined gate and final adoption remain pending. No production interleaving rate claimed. |
 | PD-23 | S2 | Active-buffer sealing may publish after GC retires its source slab because sealing has no source-slab lease/claim. Reproduce a publish/retire overlap and inspect the catalog row and coverage for the retired slab. | Unconfirmed; RED first after PD-22; no parallel-load reproduction yet. |
 | PD-24 | S3 | Catalog failure after sidecar rename removes the new file while an old row may still name that path. Inject the catalog failure after a same-path replacement and prove whether the old row loses its file. | Unconfirmed; RED first after PD-22; no parallel-load reproduction yet. |
-| PD-25 | J1 | Startup ownership guard currently spans only the initialization/JOIN block. Earlier producer/transport setup and later epoch reconcile, tenant seeding and LSM-worker construction failures may leave writes admitted, serving transports, detached tasks and LOCK held. Inject failures at both prefixes and observe actual closure. | Open, source-confirmed scope gap; separate Cut B contract or later cut. No parallel-load RED yet. |
+| PD-25 | J1 | Startup ownership guard currently spans only the initialization/JOIN block. Earlier producer/transport setup and later epoch reconcile, tenant seeding and LSM-worker construction failures may leave writes admitted, serving transports, detached tasks and LOCK held. Inject failures at both prefixes and observe actual closure. | Confirmed producer-prefix RED (c5b105f82); repaired in Cut C B0 through 797585f64, source cleared. Corrected focused nextest30 and in-process10 at1024 passed. Exact combined gate and final adoption remain pending. |
 
 Every confirmed candidate needs its RED before repair. PD-22 through PD-25
 block the default flip until each is repaired after a RED or refuted with
@@ -420,6 +420,7 @@ separate RED and scope before promoting any note to an implementation change.
 PD-25 oracle note: `startup_ownership_tests.rs` computes `service_retained`
 without asserting it. The later startup-prefix REDs must assert actual resource
 closure, retaining a real-socket control alongside provider fixtures.
+
 
 #### Cut C PD22 review notes: normalized reference checks and post-commit cleanup
 
@@ -440,6 +441,7 @@ post-commit reclamation debt in a typed outcome if that debt can be scheduled an
 observed durably (review N2). Neither note blocks the jointly reviewed source.
 
 
+
 ### Security incident follow-up: eMudhra trust roots and starter signing keys
 
 - Advisory received by browser root programs: 2026-10-17 18:05 UTC ([Chrome primary report](https://blog.google/security/protecting-chrome-and-android-users-from-compromised-emudhra-intermediate-ca-certificates/)).
@@ -448,8 +450,7 @@ observed durably (review N2). Neither note blocks the jointly reviewed source.
 - Lockfile metadata also reconciles existing key-guard serde_json/zeroize dependency edges in the root workspace (no package version change); polariton adds explicit dev dependencies for the two root bundle regression checks.
 - Follow-up OPEN: gate deterministic `NodeBootstrapConfig::dev()` and `dev_*_signing_secret` behind test support after a complete integration-fixture caller/feature audit. This incident patch preserves the explicit in-code API; starter TOML never opts into those keys. Avoid globally forcing unrelated test-support behavior or dropping integration test names during that migration.
 
-
-#### Cut C startup matrix pre-hook failure (OPEN, classification pending)
+#### Cut C startup matrix pre-hook failure (captured fixture race; locally closed)
 
 On signed B0 source `7fd0f944a`, in-process explicit1024 run4 failed after
 three passing runs: `pd25_every_adopted_prefix_err_cancel_panic_releases_real_tls_socket_and_reboots`
@@ -472,7 +473,7 @@ listeners with `:0` and records the live TCP address before any injection;
 there is no release/rebind gap and no bootstrap retry. The original run4's
 exact early error was discarded and cannot be retrospectively recovered;
 its attribution is consistent/probable, while diagnostic run14 is captured.
-Closure remains PENDING the corrected full1024 stress cycle and review.
+Closure was held until the corrected full1024 stress cycle recorded below.
 
 Healthy shutdown of a retaining provider does not yet withdraw the published
 registration (pre-existing behavior; failed-startup withdrawal is repaired by
@@ -505,5 +506,25 @@ finished handles and Shutdown metrics before releasing the foreign job. It
 keeps the post-cleanup Raft API check after the owned cleanup joins and before
 fixture teardown. The forever-withdrawal child uses the same passive ordering
 proof. No bound increase, bootstrap retry or serialization is used. The original
-STOPs and diagnostic failures are retained; GREEN closure remains PENDING a
-complete clean nextest30 and in-process10 cycle at explicit1024 concurrency.
+STOPs and diagnostic failures are retained; local GREEN closure is recorded
+below after the complete corrected cycle, without erasing either STOP.
+
+
+#### Cut C local startup control closure (2026-10-22)
+
+Signed source `797585f64d8481e6c792c5899bf8b2cfb62bf4ae` passed the complete
+corrected focused cycle: nextest30 x18 =540 passes and in-process10 x18 =180
+passes at explicit1024, with zero failed or ignored selected cases. The cycle
+includes3600 constructor site/mode observations,120 partial-restore mode cases,
+and200 bounded hard-exit child cases; these are repetitions inside the18 tests,
+not additional top-level test names. Single-run182 architecture checks and
+formatting also passed. Receipt:
+`/home/me/work/reviews/cut-c-b0-passive-oracle-20261022/`.
+
+This closes the captured TCP/UDP fixture reservation race and captured active
+Raft observer-interference failure for B0 local acceptance. It does not claim a
+recovered exact error for the original run4 whose early outcome was discarded.
+Both original STOPs, all diagnostic variants and the pinned failing control are
+retained. The source and classification were cleared by Claude; final combined
+Cut C gate/main-plus-root-supplement acceptance remains pending. The wrapper
+default remains1, and every broader PD/adoption/activation hold remains in force.
