@@ -3,27 +3,40 @@
 Status: policy, repo-wide (every crate in the nilket workspace, the ket root
 crates, `ci/`, `scripts/`, `nilket/scripts/` and the ladder driver).
 
-**Adoption gate.** This policy and the fixes for the defect candidates in
-section 7 fast-forward to main together, as one stack. Main does not get the
-1024-thread default until every PD entry is fixed and a ladder driver v5 run
-passes on that stack. Until then, v4 ladders run main's current wrapper,
-whose default is one test thread, so they do not see 1024 and need no step
-timeouts. No gate accepts a run by matching a list of known failures.
+**Adoption gate.** Policy, tooling and defect repairs may land on main while
+cargo-cgroup retains the currently accepted default of one test thread. Cut A
+uses the accepted, unchanged v4 ladder, preflighted against the new wrapper;
+any incompatibility stops the run. Its selected test-name set must cover the
+last accepted v4 run plus added tests. Focused runs with an explicit 1024
+threads support individual repairs but do not adopt the target default.
+
+Main stays at default 1 until a separate default-flip cut. That cut may change
+the wrapper default to the cpuset CPU count only after every entry in the PD register is closed
+and a final ladder passes on exactly the flip candidate. The current v5 driver
+assumes default 1024; the flip cut must review a successor driver with a
+dedicated explicit 1024 stress lane rather than relying on the default. New sidecar
+and startup candidates belong in the register too; if reproduced under parallel
+load, they also block the flip. No gate accepts known failures. The operator
+rule below remains the target state; the temporary wrapper default is an
+explicit adoption hold, never a repair for a parallel-only defect.
 
 Operator rule, 2026-10-20: no test runs alone unless it blocks one core. This
 document is the canonical home of that rule. `ci/README.md`
 ("Test concurrency"), `nilket/.config/nextest.toml`, `ci/controlled-tests.txt`
 and `nilket/crates/wendelon/plans/ops/testing.md` point here.
 
-## 1. Default: maximum concurrency, CPU bounded by the cpuset
+## 1. Target default: cpuset CPU count, plus an explicit 1024 stress lane
 
-- `nilket/scripts/cargo-cgroup` exports `RUST_TEST_THREADS=1024` unless
-  `CARGO_CGROUP_RUST_TEST_THREADS` overrides it. libtest therefore runs up to
-  1024 tests of one binary at once.
-- Reason: maximise concurrency. The wrapper's cpuset (`CARGO_CGROUP_CPUS`) and
-  CPU quota bound CPU, so the tests oversubscribe threads, not cores. A lane on
-  eight cores still uses at most eight cores; it no longer leaves seven of them
-  idle while one test runs, and it exposes interleavings a serial run cannot.
+- During the adoption hold, `nilket/scripts/cargo-cgroup` defaults to one
+  test thread; `CARGO_CGROUP_RUST_TEST_THREADS=1024` opts in explicitly. After
+  the separate flip cut, the default is the CPU count of `CARGO_CGROUP_CPUS`
+  (for example 8 in a ladder lane or 24 on slim). The explicit
+  `CARGO_CGROUP_RUST_TEST_THREADS` override still wins.
+- A dedicated ladder stress lane explicitly uses 1024 test threads. That
+  posture exposed ring, counter, sidecar and JOIN defects and remains required.
+  It oversubscribes threads while the cpuset and CPU quota bound CPU; an
+  eight-CPU lane still consumes at most eight CPUs. The default need not
+  oversubscribe to retain this stress evidence.
 - The cgroup limits are sized for this default (see `cargo-cgroup --help`).
   Measured on slim, 2026-10-20, eight CPUs: the Wendelon lib suite peaked at
   21-23 GiB and about 3600 tasks, with up to 3649 open files in one process.
@@ -103,12 +116,17 @@ never block eight cores.
    occurrence is an error, and so is an occurrence without an entry or a lane
    larger than its scope.
 
+The sole temporary `adoption-gate` allowlist scope pins exactly the wrapper
+default expression to 1 until the separate flip cut. It permits no other
+serial setting or lane exception. Remove that entry when the flip lands.
+
 An `--exact` run of one named test needs no thread setting at all, so it
 carries none.
 
 ## 3. No blanket serial settings in gates
 
-Ladder steps, local gates and CI scripts never pass a blanket serial setting:
+Apart from the temporary wrapper default pinned by the adoption hold,
+ladder steps, local gates and CI scripts never pass a blanket serial setting:
 no one-thread `--test-threads`, `RUST_TEST_THREADS`, `NEXTEST_TEST_THREADS` or
 `test_threads`, no one-job `-j`/`--jobs`/`CARGO_BUILD_JOBS`, no nextest
 `threads-required`, and none of these through a variable whose every
@@ -161,7 +179,9 @@ sqlite, ttf).
 `nilket/crates/nilket/tests/test_parallelism_policy.rs` pins, each with a
 probe or negative control:
 
-- the cargo-cgroup defaults: 1024 test threads (the override still wins), the
+- the cargo-cgroup defaults: one test thread during the adoption hold, explicit
+  1024 opt-in (the override still wins); the flip cut will pin default ==
+  cpuset CPU count. It also pins the
   slice, its 96G and 60% defaults, 28G/32G per invocation, 16384 tasks, the
   open-file minimum and the one-day `RuntimeMaxSec`; it also runs
   `nilket/scripts/tests/test-cargo-cgroup-systemd-env.sh`, which checks the
@@ -170,7 +190,7 @@ probe or negative control:
   signal stops the unit;
 - no serial setting in the pinned scope outside the exact allowlist, and every
   allowlisted one in its declared scope (a lane of at most 1 or 2 CPUs, a
-  nextest group, or a Rust doc line);
+  nextest group, a Rust doc line, or the exact temporary adoption default);
 - the banned phrase appears nowhere in tracked files (exact zero), and no
   unreadable file is skipped silently;
 - the checked-in ladder and supplement templates carry no serial step outside
@@ -203,4 +223,4 @@ the adoption gate above; none is handled by serialization.
   focused repair evidence and full adoption status are tracked in the register.
 - PD-21: replica operation gate reclamation, deterministically reproduced;
   logical admission repair passed focused stress and load controls; final
-  stacked v5 acceptance remains pending.
+  stacked adoption acceptance remains pending.
