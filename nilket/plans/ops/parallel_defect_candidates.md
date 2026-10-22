@@ -420,3 +420,21 @@ separate RED and scope before promoting any note to an implementation change.
 PD-25 oracle note: `startup_ownership_tests.rs` computes `service_retained`
 without asserting it. The later startup-prefix REDs must assert actual resource
 closure, retaining a real-socket control alongside provider fixtures.
+
+#### Cut C PD22 review notes: normalized reference checks and post-commit cleanup
+
+The db3d24a62 repair deliberately keeps reference census fail-closed when any
+other catalog row has an invalid relative-safe path. That malformed metadata is
+outside the ordinary production writer contract; refusing the unlink exposes it
+without assuming how a future restored-path normalizer may interpret it. This
+can block delete/retire until the malformed legacy row is repaired. Follow-up:
+classify and surface malformed restored paths in the legacy census, then consider
+skipping proven non-aliasing entries with explicit diagnostics (review N1).
+
+Old-path unlink or parent-fsync failure after a successful replacement catalog
+commit is returned as an error. The new row is already durable; callers may retry
+an idempotent publish. This intentionally reports uncompleted cleanup/durability
+work rather than silently certifying it. It can leave an unreferenced legacy file
+until an operator/census repair. Follow-up: distinguish publication success from
+post-commit reclamation debt in a typed outcome if that debt can be scheduled and
+observed durably (review N2). Neither note blocks the jointly reviewed source.
