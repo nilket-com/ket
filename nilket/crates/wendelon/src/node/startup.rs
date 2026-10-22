@@ -47,6 +47,7 @@ struct PartialResources {
 impl PartialResources {
 	fn fence(&self) {
 		// No provider callbacks here: Drop must not run foreign code or panic.
+		self.owner.mark_startup_failed();
 		self.owner.begin_close();
 		if let Some(lifecycle) = &self.lifecycle {
 			lifecycle.begin_drain();
@@ -142,6 +143,7 @@ impl PartialResources {
 pub(super) struct StartupScope {
 	resources: Option<PartialResources>,
 	barrier: Option<StartupDrainBarrier>,
+	watchdog: Option<crate::shutdown_watchdog::ShutdownWatchdog>,
 }
 impl StartupScope {
 	pub(super) async fn begin(owner: DataDirectoryOwner, bound: Duration) -> std::io::Result<Self> {
@@ -160,15 +162,41 @@ impl StartupScope {
 		.await
 	}
 	async fn arm_partial(resources: PartialResources) -> std::io::Result<Self> {
+		let prepared = crate::shutdown_watchdog::ShutdownWatchdog::prepare_for_owner(
+			resources.owner.closed_signal(),
+		);
+		Self::arm_with_prepared(resources, prepared).await
+	}
+	async fn arm_with_prepared(
+		resources: PartialResources,
+		prepared: std::io::Result<crate::shutdown_watchdog::ShutdownWatchdog>,
+	) -> std::io::Result<Self> {
+		let watchdog = match prepared {
+			Ok(watchdog) => watchdog,
+			Err(error) => {
+				// Production enters here before ANY worker/listener/registration exists.
+				// Fence even this refused owner and never mark failed startup clean.
+				resources.fence();
+				let cleanup = resources
+					.cleanup(
+						None,
+						Arc::new(std::sync::Mutex::new("watchdog preparation refused")),
+					)
+					.await;
+				return Err(with_cleanup_context(error, cleanup));
+			}
+		};
 		match resources.owner.reserve_startup_drain() {
 			Ok(barrier) => Ok(Self {
 				resources: Some(resources),
 				barrier: Some(barrier),
+				watchdog: Some(watchdog),
 			}),
 			Err(original) => {
 				let mut scope = Self {
 					resources: Some(resources),
 					barrier: None,
+					watchdog: Some(watchdog),
 				};
 				let (owner, slot) = scope
 					.start_cleanup(original.to_string())
@@ -180,6 +208,7 @@ impl StartupScope {
 			}
 		}
 	}
+
 	fn resources(&self) -> &PartialResources {
 		self.resources.as_ref().expect("live startup scope")
 	}
@@ -257,11 +286,11 @@ impl StartupScope {
 		let resources = self.resources.take()?;
 		let owner = resources.owner.clone();
 		let closed = owner.closed_signal();
-		let watchdog = crate::shutdown_watchdog::ShutdownWatchdog::arm_for_owner(
-			resources.watchdog_deadline,
-			closed.clone(),
-		);
+		// Trusted fencing always happens first, including on unwind. No native
+		// thread creation, foreign callback, or fallible operation occurs in Drop.
 		resources.fence();
+		let watchdog = self.watchdog.take().expect("prepared before construction");
+		watchdog.start(resources.watchdog_deadline);
 		let bound = resources.bound;
 		let runtime = resources.runtime.clone();
 		let barrier = self.barrier.take();
@@ -311,6 +340,10 @@ impl StartupScope {
 			.expect("accepted startup barrier")
 			.release_after_handoff();
 		self.resources.take();
+		self.watchdog
+			.take()
+			.expect("prepared startup watchdog")
+			.disarm();
 		Ok(node)
 	}
 	#[cfg(test)]
@@ -1186,5 +1219,51 @@ mod tests {
 			let reopened = DataDirectoryOwner::acquire_existing(&dir).unwrap();
 			reopened.close(Duration::from_secs(5)).await.unwrap();
 		}
+	}
+	#[tokio::test]
+	async fn pd25_watchdog_preparation_refusal_fences_before_any_construction() {
+		let dir = crate::test_support::TestDir::new("pd25-watchdog-prepare-refusal");
+		let owner = DataDirectoryOwner::acquire_existing(&dir).unwrap();
+		assert!(owner.previous_shutdown_clean());
+		std::fs::write(
+			dir.join("constructor-observation"),
+			b"fresh owner now has unvalidated state",
+		)
+		.unwrap();
+		let resources = PartialResources {
+			owner: owner.clone(),
+			raft: None,
+			factory: None,
+			lifecycle: None,
+			published: Vec::new(),
+			transports: Vec::new(),
+			handles: NodeHandlesBuilder::default(),
+			bound: Duration::from_secs(5),
+			watchdog_deadline: Duration::from_secs(5),
+			runtime: tokio::runtime::Handle::current(),
+		};
+		let error = match StartupScope::arm_with_prepared(
+			resources,
+			Err(Error::new(
+				ErrorKind::WouldBlock,
+				"injected native thread creation refused",
+			)),
+		)
+		.await
+		{
+			Err(error) => error,
+			Ok(_) => panic!("watchdog preparation refusal ignored"),
+		};
+		assert_eq!(error.kind(), ErrorKind::WouldBlock);
+		assert!(owner.write_permit().is_err());
+		assert!(
+			owner
+				.closed_signal()
+				.load(std::sync::atomic::Ordering::Acquire)
+		);
+		assert!(!dir.join("CLEAN_SHUTDOWN").exists());
+		let reopened = DataDirectoryOwner::acquire_existing(&dir).unwrap();
+		assert!(!reopened.previous_shutdown_clean());
+		reopened.close(Duration::from_secs(5)).await.unwrap();
 	}
 }

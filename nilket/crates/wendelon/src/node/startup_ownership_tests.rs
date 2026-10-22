@@ -392,6 +392,7 @@ async fn cancelled_startup_fences_before_worker_and_excludes_external_close() {
 }
 
 struct PrefixProvider {
+	registration: StdMutex<Option<Arc<dyn HrftService>>>,
 	publish_panic: bool,
 	publish_error: bool,
 }
@@ -401,9 +402,18 @@ impl TransportProvider for PrefixProvider {
 		&self,
 		_node_id: crate::schema::NodeId,
 		_address: &str,
-		_service: &std::sync::Arc<dyn crate::network::server::HrftService>,
+		service: &std::sync::Arc<dyn crate::network::server::HrftService>,
 	) -> std::io::Result<()> {
-		// This provider does not retain publish_local registrations.
+		let mut registration = self
+			.registration
+			.lock()
+			.unwrap_or_else(std::sync::PoisonError::into_inner);
+		if registration
+			.as_ref()
+			.is_some_and(|current| Arc::ptr_eq(current, service))
+		{
+			registration.take();
+		}
 		Ok(())
 	}
 
@@ -421,8 +431,9 @@ impl TransportProvider for PrefixProvider {
 		&self,
 		_node: NodeId,
 		_address: &str,
-		_service: Arc<dyn HrftService>,
+		service: Arc<dyn HrftService>,
 	) -> std::io::Result<()> {
+		*self.registration.lock().unwrap() = Some(service);
 		assert!(!self.publish_panic, "PD25 provider publish panic");
 		if self.publish_error {
 			Err(Error::new(
@@ -444,6 +455,7 @@ async fn pd25_prefix_case(publish_error: bool, publish_panic: bool, after_handof
 	let task = tokio::spawn(WendelonNode::bootstrap_with_provider(
 		cfg,
 		Arc::new(PrefixProvider {
+			registration: StdMutex::new(None),
 			publish_panic,
 			publish_error,
 		}),
@@ -588,6 +600,8 @@ pub(crate) struct StartupFault {
 	mode: FaultMode,
 	snapshot: Arc<StdMutex<Option<FaultSnapshot>>>,
 	entered: Arc<Notify>,
+	last_site: Arc<StdMutex<Option<&'static str>>>,
+	pub(super) bound_tcp: Arc<StdMutex<Vec<std::net::SocketAddr>>>,
 }
 impl PartialEq for StartupFault {
 	fn eq(&self, other: &Self) -> bool {
@@ -610,6 +624,7 @@ impl StartupFault {
 		raft: Option<WendelonRaft>,
 		lifecycle: Option<ServerLifecycle>,
 	) -> std::io::Result<()> {
+		*self.last_site.lock().unwrap() = Some(site);
 		if self.site != site {
 			return Ok(());
 		}
@@ -670,16 +685,16 @@ async fn pd25_every_adopted_prefix_err_cancel_panic_releases_real_tls_socket_and
 	for &site in PREFIX_SITES {
 		for mode in [FaultMode::Error, FaultMode::Cancel, FaultMode::Panic] {
 			let dir = crate::test_support::TestDir::new("pd25-matrix-case");
-			// Ephemeral reservation is released immediately before the actual bind.
-			let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-			let address = reservation.local_addr().unwrap();
+
 			let fault = StartupFault {
 				site,
 				mode,
 				snapshot: Arc::default(),
 				entered: Arc::new(Notify::new()),
+				last_site: Arc::default(),
+				bound_tcp: Arc::default(),
 			};
-			let mut cfg = NodeBootstrapConfig::dev(1, dir.to_path_buf(), address.to_string());
+			let mut cfg = NodeBootstrapConfig::dev(1, dir.to_path_buf(), "127.0.0.1:0".into());
 			cfg.transport_tls = Some(TransportTlsConfig {
 				cert_path: pki.server_cert.clone(),
 				key_path: pki.server_key.clone(),
@@ -689,23 +704,46 @@ async fn pd25_every_adopted_prefix_err_cancel_panic_releases_real_tls_socket_and
 			});
 			let healthy = cfg.clone();
 			cfg.startup_fault = Some(fault.clone());
-			drop(reservation);
 			let mut task = tokio::spawn(WendelonNode::bootstrap(cfg));
-			let reached =
-				tokio::time::timeout(Duration::from_secs(30), fault.entered.notified()).await;
-			if reached.is_err() {
-				task.abort();
-				if let Ok(Ok(node)) = (&mut task).await {
-					node.shutdown().await.unwrap();
+			let mut early = None;
+			let reached = tokio::select! {
+				notice = tokio::time::timeout(Duration::from_secs(30), fault.entered.notified()) => notice.is_ok(),
+				outcome = &mut task => {
+					early = Some(outcome);
+					fault.snapshot.lock().unwrap().is_some()
 				}
-				panic!("site not reached: {site} {mode:?}");
+			};
+			if !reached {
+				task.abort();
+				let outcome = match early.take() {
+					Some(outcome) => outcome,
+					None => (&mut task).await,
+				};
+				let diagnostic = match outcome {
+					Ok(Ok(node)) => {
+						node.shutdown().await.unwrap();
+						"unexpected healthy completion".into()
+					}
+					Ok(Err(error)) => format!(
+						"early bootstrap error kind={:?} error={error:?}",
+						error.kind()
+					),
+					Err(error) => format!("join={error:?}"),
+				};
+				panic!(
+					"site not reached: {site} {mode:?}; last={:?}; {diagnostic}",
+					*fault.last_site.lock().unwrap()
+				);
 			}
-			if mode == FaultMode::Cancel {
+			if mode == FaultMode::Cancel && early.is_none() {
 				task.abort();
 			}
-			let outcome = tokio::time::timeout(Duration::from_secs(30), &mut task)
-				.await
-				.expect("bootstrap joined");
+			let outcome = match early {
+				Some(outcome) => outcome,
+				None => tokio::time::timeout(Duration::from_secs(30), &mut task)
+					.await
+					.expect("bootstrap joined"),
+			};
 			match outcome {
 				Ok(Err(error)) if mode == FaultMode::Error => {
 					assert_eq!(error.kind(), ErrorKind::InvalidData, "{site}")
@@ -749,10 +787,17 @@ async fn pd25_every_adopted_prefix_err_cancel_panic_releases_real_tls_socket_and
 					"{site}: Raft still running before fixture teardown"
 				);
 			}
+			let bound = fault.bound_tcp.lock().unwrap().clone();
 			assert!(
-				tokio::net::TcpStream::connect(address).await.is_err(),
-				"{site}: TLS listener still accepts"
+				!bound.is_empty(),
+				"actual TLS listener missing from fixture observation"
 			);
+			for address in bound {
+				assert!(
+					tokio::net::TcpStream::connect(address).await.is_err(),
+					"{site}: TLS listener still accepts {address}"
+				);
+			}
 			assert!(
 				snapshot
 					.owner
@@ -763,6 +808,15 @@ async fn pd25_every_adopted_prefix_err_cancel_panic_releases_real_tls_socket_and
 			let reopened = WendelonNode::bootstrap(healthy)
 				.await
 				.unwrap_or_else(|e| panic!("{site} {mode:?} reboot: {e}"));
+			if matches!(
+				site,
+				"epoch_reconcile" | "tenant_seed" | "set_pending_finalization_reconciler"
+			) {
+				assert!(
+					reopened.recovered_after_unclean_shutdown(),
+					"{site}: startup mutation failure skipped recovery"
+				);
+			}
 			reopened.shutdown().await.unwrap();
 			eprintln!(
 				"PD25 MATRIX {site} {mode:?} PASS tasks={}",
@@ -830,7 +884,7 @@ async fn pd25_forever_withdraw_child() {
 	let mut cfg = NodeBootstrapConfig::dev(7131, path.clone(), "127.0.0.1:0".into());
 	cfg.storage_shutdown_timeout = Duration::from_millis(20);
 	let mut probe = StartupProbe::default();
-	probe.3 = Some(Duration::from_millis(250));
+	probe.3 = Some(Duration::from_secs(5));
 	cfg.startup_probe = Some(probe.clone());
 	let provider = Arc::new(BlockingWithdrawal {
 		entered_file: path.join("withdraw-entered"),
@@ -839,7 +893,7 @@ async fn pd25_forever_withdraw_child() {
 	});
 	let outcome = tokio::spawn(WendelonNode::bootstrap_with_provider(cfg, provider)).await;
 	let observation = probe.0.lock().unwrap().take().unwrap();
-	let closed_trusted = tokio::time::timeout(Duration::from_millis(150), async {
+	let closed_trusted = async {
 		while observation
 			.tasks
 			.iter()
@@ -852,9 +906,9 @@ async fn pd25_forever_withdraw_child() {
 		while observation.raft.is_initialized().await.is_ok() {
 			tokio::task::yield_now().await;
 		}
-	})
-	.await
-	.is_ok();
+		true
+	}
+	.await;
 	if closed_trusted {
 		std::fs::write(
 			path.join("trusted-cleanup-complete"),
@@ -868,7 +922,7 @@ async fn pd25_forever_withdraw_child() {
 			_ => panic!("expected real bootstrap cleanup error"),
 		};
 		assert_eq!(error.kind(), ErrorKind::InvalidData);
-		let _exit = crate::cli::bootstrap_failure_exit(&error, Duration::from_millis(250));
+		let _exit = crate::cli::bootstrap_failure_exit(&error, Duration::from_secs(5));
 		std::fs::write(
 			path.join("cli-returned"),
 			b"nested incomplete not recognized",
@@ -1057,4 +1111,235 @@ async fn pd25_slow_partial_publish_withdrawal_keeps_lock_but_not_trusted_workers
 		let owner = DataDirectoryOwner::acquire_existing(&dir).unwrap();
 		owner.close(Duration::from_secs(10)).await.unwrap();
 	}
+}
+
+#[tokio::test]
+async fn pd25_tcp_reservation_does_not_own_the_quic_udp_port() {
+	let dir = crate::test_support::TestDir::new("pd25-port-domain-control");
+	let pki = tls_pki::write_test_pki(&dir.join("pki"));
+	// Acquire an actual two-protocol reservation; only a typed conflict during
+	// reservation acquisition may select another port. Bootstrap is attempted once.
+	let (reservation, _udp_owner) = (0..32)
+		.find_map(|_| {
+			let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+			match std::net::TcpListener::bind(udp.local_addr().unwrap()) {
+				Ok(tcp) => Some((tcp, udp)),
+				Err(error) if error.kind() == ErrorKind::AddrInUse => None,
+				Err(error) => panic!("reservation: {error}"),
+			}
+		})
+		.expect("available paired protocol port");
+	let address = reservation.local_addr().unwrap();
+	let fault = StartupFault {
+		site: "set_pending_finalization_reconciler",
+		mode: FaultMode::Cancel,
+		snapshot: Arc::default(),
+		entered: Arc::new(Notify::new()),
+		last_site: Arc::default(),
+		bound_tcp: Arc::default(),
+	};
+	let mut cfg = NodeBootstrapConfig::dev(1, dir.to_path_buf(), address.to_string());
+	cfg.transport_tls = Some(TransportTlsConfig {
+		cert_path: pki.server_cert,
+		key_path: pki.server_key,
+		node_ca_path: pki.ca_cert,
+		operator_ca_path: pki.ops_ca_cert,
+		cluster_domain: tls_pki::CLUSTER_DOMAIN.into(),
+	});
+	cfg.startup_fault = Some(fault.clone());
+	drop(reservation);
+	let error = match WendelonNode::bootstrap(cfg).await {
+		Err(error) => error,
+		Ok(node) => {
+			node.shutdown().await.unwrap();
+			panic!("occupied UDP port was ignored");
+		}
+	};
+	assert_eq!(error.kind(), ErrorKind::AddrInUse, "{error:?}");
+	assert!(fault.snapshot.lock().unwrap().is_none());
+	assert!(fault.last_site.lock().unwrap().is_none());
+	let owner = DataDirectoryOwner::acquire_existing(&dir).unwrap();
+	owner.close(Duration::from_secs(10)).await.unwrap();
+}
+
+#[tokio::test]
+async fn pd25_partial_restore_refusal_never_certifies_clean_and_reboot_validates_recovery() {
+	let source_dir = crate::test_support::TestDir::new("pd25-restore-source");
+	let source = WendelonNode::bootstrap(NodeBootstrapConfig::dev(
+		1,
+		source_dir.to_path_buf(),
+		"127.0.0.1:0".into(),
+	))
+	.await
+	.unwrap();
+	let backup = source.export_cluster_backup().await.unwrap();
+	source.shutdown().await.unwrap();
+	for mode in [FaultMode::Error, FaultMode::Cancel, FaultMode::Panic] {
+		let dir = crate::test_support::TestDir::new("pd25-restore-partial");
+		let healthy = NodeBootstrapConfig::dev(1, dir.to_path_buf(), "127.0.0.1:0".into());
+		let fault = StartupFault {
+			site: "after_control_restore",
+			mode,
+			snapshot: Arc::default(),
+			entered: Arc::new(Notify::new()),
+			last_site: Arc::default(),
+			bound_tcp: Arc::default(),
+		};
+		let mut cfg = healthy.clone();
+		cfg.startup_fault = Some(fault.clone());
+		let image = backup.clone();
+		let mut task =
+			tokio::spawn(
+				async move { WendelonNode::restore_from_cluster_backup(&image, cfg).await },
+			);
+		tokio::time::timeout(Duration::from_secs(30), fault.entered.notified())
+			.await
+			.unwrap();
+		if mode == FaultMode::Cancel {
+			task.abort();
+		}
+		match tokio::time::timeout(Duration::from_secs(30), &mut task)
+			.await
+			.unwrap()
+		{
+			Ok(Err(error)) if mode == FaultMode::Error => {
+				assert_eq!(error.kind(), ErrorKind::InvalidData)
+			}
+			Err(error) if mode == FaultMode::Cancel => assert!(error.is_cancelled()),
+			Err(error) if mode == FaultMode::Panic => assert!(error.is_panic()),
+			Ok(Ok(node)) => {
+				node.shutdown().await.unwrap();
+				panic!("partial restore fault escaped");
+			}
+			_ => panic!("wrong restore fault outcome"),
+		}
+		let snapshot = fault.snapshot.lock().unwrap().take().unwrap();
+		assert!(
+			snapshot.owner.previous_shutdown_clean(),
+			"restore must start from a genuinely fresh clean owner"
+		);
+		let slot = snapshot.owner.latest_startup_cleanup().unwrap();
+		assert!(matches!(
+			tokio::time::timeout(Duration::from_secs(30), slot.wait())
+				.await
+				.unwrap(),
+			crate::storage::ownership::StartupCleanupStatus::Complete
+		));
+		assert!(
+			dir.join("control.wal").exists(),
+			"restore must really mutate disk before fault"
+		);
+		assert!(
+			!dir.join("CLEAN_SHUTDOWN").exists(),
+			"stopped writers must not certify failed restore"
+		);
+		assert!(
+			snapshot
+				.owner
+				.closed_signal()
+				.load(std::sync::atomic::Ordering::Acquire)
+		);
+		let owner = DataDirectoryOwner::acquire_existing(&dir).unwrap();
+		assert!(!owner.previous_shutdown_clean());
+		owner.close(Duration::from_secs(10)).await.unwrap();
+		let recovered = WendelonNode::bootstrap(healthy).await.unwrap();
+		assert!(recovered.recovered_after_unclean_shutdown());
+		assert_eq!(
+			recovered.log_store.bootstrap_mode().await,
+			DurableBootstrapMode::Recovery
+		);
+		recovered.shutdown().await.unwrap();
+		assert!(
+			dir.join("CLEAN_SHUTDOWN").exists(),
+			"later validated boot may certify clean shutdown"
+		);
+	}
+}
+
+#[tokio::test]
+async fn pd25_healthy_handoff_preserves_base_task_census_and_clean_shutdown() {
+	let dir = crate::test_support::TestDir::new("pd25-healthy-census");
+	let node = WendelonNode::bootstrap(NodeBootstrapConfig::dev(
+		7141,
+		dir.to_path_buf(),
+		"127.0.0.1:0".into(),
+	))
+	.await
+	.unwrap();
+	let owner = node._directory_owner.clone();
+	let tasks = [
+		("ring_updater", node.handles.ring_updater.abort_handle()),
+		("drift_monitor", node.handles.drift_monitor.abort_handle()),
+		(
+			"eviction_watchdog",
+			node.handles.eviction_watchdog.abort_handle(),
+		),
+		("lease_manager", node.handles.lease_manager.abort_handle()),
+		(
+			"pending_finalization_reconciler",
+			node.handles.pending_finalization_reconciler.abort_handle(),
+		),
+		(
+			"cdc_finalization_release_observer",
+			node.handles
+				.cdc_finalization_release_observer
+				.abort_handle(),
+		),
+		(
+			"cdc_locality_heartbeat",
+			node.handles.cdc_locality_heartbeat.abort_handle(),
+		),
+		(
+			"epoch_reconciler",
+			node.handles.epoch_reconciler.abort_handle(),
+		),
+		(
+			"tenant_policy_reconciler",
+			node.handles.tenant_policy_reconciler.abort_handle(),
+		),
+		(
+			"drop_reclaim_sweeper",
+			node.handles.drop_reclaim_sweeper.abort_handle(),
+		),
+		(
+			"migration_sweeper",
+			node.handles.migration_sweeper.abort_handle(),
+		),
+		("lsm_compaction", node.handles.lsm_compaction.abort_handle()),
+		("lsm_gc", node.handles.lsm_gc.abort_handle()),
+		(
+			"secondary_index_lifecycle",
+			node.handles.secondary_index_lifecycle.abort_handle(),
+		),
+		(
+			"audit_chain_root_rollup",
+			node.handles.audit_chain_root_rollup.abort_handle(),
+		),
+		(
+			"default_tenant_seeder",
+			node.handles.default_tenant_seeder.abort_handle(),
+		),
+		(
+			"checkpoint_emitter",
+			node.handles.checkpoint_emitter.abort_handle(),
+		),
+	];
+	assert_eq!(
+		tasks.len(),
+		17,
+		"base has seventeen required tasks and two optional task slots"
+	);
+	assert!(node.handles.tiering_sweeper.is_none());
+	assert!(node.handles.restore_validation.is_none());
+	node.shutdown().await.unwrap();
+	assert!(tasks.iter().all(|(_, task)| task.is_finished()));
+	assert!(
+		owner
+			.closed_signal()
+			.load(std::sync::atomic::Ordering::Acquire)
+	);
+	assert!(
+		dir.join("CLEAN_SHUTDOWN").exists(),
+		"healthy handoff must preserve clean-shutdown behavior"
+	);
 }

@@ -177,6 +177,7 @@ pub struct DataDirectoryOwner {
 
 struct OwnerInner {
 	closed_signal: Arc<std::sync::atomic::AtomicBool>,
+	startup_failed: std::sync::atomic::AtomicBool,
 	path: PathBuf,
 	previous_shutdown_clean: bool,
 	// Set when a run that started after an unclean shutdown finished its
@@ -467,7 +468,19 @@ impl DataDirectoryOwner {
 			.store(true, std::sync::atomic::Ordering::Release);
 	}
 
+	pub(crate) fn mark_startup_failed(&self) {
+		self.inner
+			.startup_failed
+			.store(true, std::sync::atomic::Ordering::Release);
+	}
 	fn may_record_clean_shutdown(&self) -> bool {
+		if self
+			.inner
+			.startup_failed
+			.load(std::sync::atomic::Ordering::Acquire)
+		{
+			return false;
+		}
 		self.inner.previous_shutdown_clean
 			|| self
 				.inner
@@ -775,6 +788,7 @@ fn acquire_lock(canonical: PathBuf) -> std::io::Result<DataDirectoryOwner> {
 	Ok(DataDirectoryOwner {
 		inner: Arc::new(OwnerInner {
 			closed_signal: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+			startup_failed: std::sync::atomic::AtomicBool::new(false),
 			path: canonical,
 			previous_shutdown_clean,
 			recovery_complete: std::sync::atomic::AtomicBool::new(false),

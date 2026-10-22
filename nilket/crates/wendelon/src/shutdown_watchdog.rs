@@ -38,56 +38,88 @@ pub fn terminate_unclean(reason: &str) -> ! {
 
 /// An OS-thread deadline over the whole shutdown, independent of the async
 /// runtime so a wedged runtime cannot hold it off.
+struct WatchdogState {
+	finished: bool,
+	armed: Option<(std::time::Instant, std::time::Duration)>,
+}
 pub struct ShutdownWatchdog {
-	done: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+	done: std::sync::Arc<(std::sync::Mutex<WatchdogState>, std::sync::Condvar)>,
 	thread: Option<std::thread::JoinHandle<()>>,
 }
-
 impl ShutdownWatchdog {
 	pub fn arm(deadline: std::time::Duration) -> Self {
-		Self::arm_with_owner(deadline, None)
+		let watchdog = Self::prepare(None).expect("spawn shutdown watchdog");
+		watchdog.start(deadline);
+		watchdog
 	}
-	/// Startup cancellation/unwind must also be bounded. A later successful
-	/// explicit close suppresses this timer without reading a possibly wedged
-	/// mutex: only actual LOCK release sets the owner signal.
-	pub(crate) fn arm_for_owner(
-		deadline: std::time::Duration,
+	/// Prepare before any startup producer exists. Drop only starts an already
+	/// existing thread; a failed preparation is an ordinary constructor error.
+	pub(crate) fn prepare_for_owner(
 		closed: std::sync::Arc<std::sync::atomic::AtomicBool>,
-	) -> Self {
-		Self::arm_with_owner(deadline, Some(closed))
+	) -> std::io::Result<Self> {
+		Self::prepare(Some(closed))
 	}
-	fn arm_with_owner(
-		deadline: std::time::Duration,
+	fn prepare(
 		closed: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-	) -> Self {
-		let done = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+	) -> std::io::Result<Self> {
+		let done = std::sync::Arc::new((
+			std::sync::Mutex::new(WatchdogState {
+				finished: false,
+				armed: None,
+			}),
+			std::sync::Condvar::new(),
+		));
 		let state = done.clone();
 		let thread = std::thread::Builder::new()
 			.name("wendelon-shutdown-watchdog".to_string())
 			.spawn(move || {
 				let (lock, signal) = &*state;
-				let finished = lock.lock().unwrap_or_else(|poison| poison.into_inner());
-				let (finished, timeout) = signal
-					.wait_timeout_while(finished, deadline, |finished| !*finished)
-					.unwrap_or_else(|poison| poison.into_inner());
+				let mut state = lock
+					.lock()
+					.unwrap_or_else(std::sync::PoisonError::into_inner);
+				while !state.finished && state.armed.is_none() {
+					state = signal
+						.wait(state)
+						.unwrap_or_else(std::sync::PoisonError::into_inner);
+				}
+				if state.finished {
+					return;
+				}
+				let (started, deadline) = state.armed.expect("armed under native mutex");
+				let remaining = deadline.saturating_sub(started.elapsed());
+				let (state, timeout) = signal
+					.wait_timeout_while(state, remaining, |state| !state.finished)
+					.unwrap_or_else(std::sync::PoisonError::into_inner);
 				if timeout.timed_out()
-					&& !*finished && !closed
-					.as_ref()
-					.is_some_and(|closed| closed.load(std::sync::atomic::Ordering::Acquire))
+					&& !state.finished
+					&& !closed
+						.as_ref()
+						.is_some_and(|closed| closed.load(std::sync::atomic::Ordering::Acquire))
 				{
 					terminate_unclean(&format!("shutdown exceeded {deadline:?}"));
 				}
-			})
-			.expect("spawn shutdown watchdog");
-		Self {
+			})?;
+		Ok(Self {
 			done,
 			thread: Some(thread),
+		})
+	}
+	pub(crate) fn start(&self, deadline: std::time::Duration) {
+		let (lock, signal) = &*self.done;
+		let mut state = lock
+			.lock()
+			.unwrap_or_else(std::sync::PoisonError::into_inner);
+		if !state.finished && state.armed.is_none() {
+			state.armed = Some((std::time::Instant::now(), deadline));
 		}
+		signal.notify_all();
 	}
 
 	pub fn disarm(mut self) {
 		let (lock, signal) = &*self.done;
-		*lock.lock().unwrap_or_else(|poison| poison.into_inner()) = true;
+		lock.lock()
+			.unwrap_or_else(|poison| poison.into_inner())
+			.finished = true;
 		signal.notify_all();
 		if let Some(thread) = self.thread.take() {
 			let _ = thread.join();
