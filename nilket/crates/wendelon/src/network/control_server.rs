@@ -743,6 +743,12 @@ fn control_operation_permission(operation: ControlOperation) -> ActorPermission 
 }
 
 impl WendelonControlServer {
+	/// Fixture teardown only; observers retain a Weak control server until bootstrap ends.
+	#[cfg(test)]
+	pub(crate) async fn shutdown_startup_fixture_raft(&self) -> std::io::Result<()> {
+		self.raft.shutdown().await.map_err(std::io::Error::other)
+	}
+
 	pub fn new(
 		raft: WendelonRaft,
 		state_machine: crate::consensus::raft_storage::WendelonStateMachine,
