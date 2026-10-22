@@ -1903,6 +1903,22 @@ impl WendelonNode {
 		let lifecycle = ServerLifecycle::new();
 		let service: Arc<dyn HrftService> =
 			Arc::new(LifecycleService::new(router.clone(), lifecycle.clone()));
+		#[cfg(test)]
+		if let Some(probe) = &cfg.startup_probe {
+			probe.record(
+				&slab,
+				&control_server,
+				&service,
+				&lifecycle,
+				&raft,
+				vec![
+					("checkpoint", checkpoint_emitter.abort_handle()),
+					("audit", audit_chain_root_rollup.abort_handle()),
+					("ring", ring_updater.abort_handle()),
+					("drift", drift_monitor.abort_handle()),
+				],
+			);
+		}
 		for provider in publish_providers {
 			provider.publish_local(local_node, &cfg.advertise_address, service.clone())?;
 		}
@@ -1949,6 +1965,7 @@ impl WendelonNode {
 				&control_server,
 				&service,
 				&lifecycle,
+				&raft,
 				vec![
 					("checkpoint", checkpoint_emitter.abort_handle()),
 					("audit", audit_chain_root_rollup.abort_handle()),
@@ -2035,6 +2052,11 @@ impl WendelonNode {
 				},
 			..
 		} = startup.finish_success();
+		#[cfg(test)]
+		if let Some(probe) = &cfg.startup_probe {
+			probe.after_handoff()?;
+		}
+
 		// ADR 0095 stamps erasure participants from replicated epoch history.
 		// Seed the genesis edge synchronously on the leader so an immediately
 		// following DROP cannot race the background epoch reconciler.
