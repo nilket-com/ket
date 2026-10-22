@@ -810,11 +810,89 @@ fn nilket_wendelon_sql_is_rejected_by_wendelon() {
 
 #[test]
 fn nilket_wendelon_example_config_matches_existing_behavior() {
-	let output = nilket(&["wendelon", "--print-example-config"]);
+	fn key_bytes(text: &str) -> [u8; 32] {
+		assert_eq!(
+			text.len(),
+			64,
+			"signing material must encode exactly 32 bytes"
+		);
+		assert!(text.bytes().all(|byte| byte.is_ascii_hexdigit()));
+		std::array::from_fn(|index| {
+			u8::from_str_radix(&text[2 * index..2 * index + 2], 16).unwrap()
+		})
+	}
+	fn validated_non_key_output(text: &str, previous: &mut Vec<[u8; 32]>) -> String {
+		use wendelon::network::{
+			audit_root_verifying_key_bytes, dev_audit_root_signing_secret,
+			dev_lease_signing_secret, dev_transfer_signing_secret, lease_verifying_key_bytes,
+			transfer_verifying_key_bytes,
+		};
+		let config: toml::Value = text.parse().expect("rendered config must be valid TOML");
+		let node_id = u32::try_from(config["node"]["node_id"].as_integer().unwrap()).unwrap();
+		let identity = &config["identity"];
+		assert_eq!(identity["allow_dev_keys"].as_bool(), Some(false));
+		let roles: [(&str, &str, fn([u8; 32]) -> [u8; 32]); 3] = [
+			(
+				"lease_signing_secret",
+				"trusted_lease_signers",
+				lease_verifying_key_bytes,
+			),
+			(
+				"transfer_signing_secret",
+				"trusted_transfer_signers",
+				transfer_verifying_key_bytes,
+			),
+			(
+				"audit_root_signing_secret",
+				"trusted_audit_root_keys",
+				audit_root_verifying_key_bytes,
+			),
+		];
+		let known_dev = [
+			dev_lease_signing_secret(node_id),
+			dev_transfer_signing_secret(node_id),
+			dev_audit_root_signing_secret(node_id),
+		];
+		let mut normalized = text.to_owned();
+		for (secret_field, trusted_field, verifying_key) in roles {
+			let secret_hex = identity[secret_field].as_str().unwrap();
+			let secret = key_bytes(secret_hex);
+			assert_ne!(secret, [0; 32]);
+			assert!(!known_dev.contains(&secret), "rendered a public dev key");
+			assert!(
+				!previous.contains(&secret),
+				"a role or invocation reused a secret"
+			);
+			previous.push(secret);
+			let trusted = identity[trusted_field].as_table().unwrap();
+			assert_eq!(trusted.len(), 1, "starter must enroll only its own node");
+			let public_hex = trusted[&node_id.to_string()].as_str().unwrap();
+			assert_eq!(key_bytes(public_hex), verifying_key(secret));
+			// Keep exact delegation coverage for every other byte, including
+			// comments/formatting. Mask only the six independently validated values.
+			for (value, marker) in [(secret_hex, secret_field), (public_hex, trusted_field)] {
+				let quoted = format!("\"{value}\"");
+				assert_eq!(normalized.matches(&quoted).count(), 1);
+				normalized = normalized.replace(&quoted, &format!("\"<{marker}>\""));
+			}
+		}
+		normalized
+	}
 
-	assert!(output.status.success(), "{output:?}");
-	assert_eq!(stdout(&output), render_example_config());
-	assert!(stderr(&output).is_empty(), "{output:?}");
+	let mut previous = Vec::new();
+	let expected = validated_non_key_output(&render_example_config(), &mut previous);
+	// Two actual CLI invocations must each provision independent keys; a
+	// hard-coded wrapper config must not pass merely by differing from the API.
+	for _ in 0..2 {
+		let output = nilket(&["wendelon", "--print-example-config"]);
+		assert!(output.status.success(), "{output:?}");
+		assert!(stderr(&output).is_empty(), "{output:?}");
+		assert_eq!(
+			validated_non_key_output(&stdout(&output), &mut previous),
+			expected
+		);
+	}
+	assert_eq!(previous.len(), 9);
 }
 
 #[test]

@@ -569,3 +569,26 @@ at 1024 threads, 38 config tests, 183 architecture checks and formatting.
 identities. The original combined STOP remains retained; passing repetitions do
 not erase it. Final frozen combined checks and the main v4 plus actual root
 Polariton supplement remain required before publication.
+
+### Cut C E2 CLI delegation fixture refusal (2026-10-22)
+
+Main v4 candidate `83503319a2192330c1c5c19b72cf15706dd0a7a5`, run
+`cut-c-ladder-1-20261022`, stopped at `nilket-test rc=101`: the Nilket CLI
+wrapper test compared two independent starter renders byte for byte, although
+E2 intentionally provisions fresh signing keys for every render. The E2 caller
+audit had missed this wrapper assertion. The security behavior is retained.
+The corrected test validates all three role secrets, refusal of deterministic
+dev keys, own-node enrollment and derived public keys, and independence across
+the direct API plus two actual CLI invocations. It masks only those six validated
+values and still requires exact equality of every other output byte. The stale
+template header is corrected while preserving the local-only dev-insecure Root
+KEK custody warning.
+
+The sluice event observer captured the nonzero receipt at 21:18:16.134 UTC,
+submitted one durable stop intent, and recorded supervisor STOP success at
+21:18:16.778 UTC. Ownership reaping certified no live owned process. Eleven
+completed steps passed before this refusal; the failed run is NOT a gate PASS,
+and no root supplement was launched. Raw logs and remote/local hash equality:
+`/home/me/work/reviews/cut-c-main-stop-20261022-1/`. A corrected source freeze,
+local full Nilket CLI checks, review and a new named complete gate are required;
+the original run is retained and must not be retried or overwritten.

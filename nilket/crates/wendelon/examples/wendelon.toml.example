@@ -6,9 +6,9 @@
 #   wendelon --print-example-config
 #   wendelon --write-example-config ./wendelon.toml
 #
-# The generated config uses dev-derived signing material for
-# `node_id = 1`. That is suitable for local bring-up only. Replace
-# the identity section for any non-development deployment.
+# Each rendering generates fresh signing keys and refuses deterministic dev keys.
+# This starter still uses the dev-insecure Root KEK for local bring-up only.
+# Choose a serious custody provider before any non-development deployment.
 
 [node]
 node_id = {{NODE_ID}}
