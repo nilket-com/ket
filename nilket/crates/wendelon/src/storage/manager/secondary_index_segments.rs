@@ -366,7 +366,15 @@ impl SlabManager {
 
 		for row in self.secondary_index_segments.iter() {
 			if secondary_index_coverage_key_from_persistent(&row.key) == key {
-				tracker.mark_covered(row.key.source_slab_id);
+				// A registered row is not proof after a read-side integrity failure.
+				// Only successful replacement/persist may clear that downgrade.
+				let corrupt = tracker.uncovered_slabs().any(|(slab, error)| {
+					slab == row.key.source_slab_id
+						&& error.reason == SecondaryIndexBackfillErrorReason::CorruptSegment
+				});
+				if !corrupt {
+					tracker.mark_covered(row.key.source_slab_id);
+				}
 			}
 		}
 		if tracker.active_buffer().is_none() {
@@ -1098,10 +1106,17 @@ impl SlabManager {
 		&self,
 		key: &PersistentSecondaryIndexSegmentKey,
 		path: &str,
-	) -> bool {
-		self.secondary_index_segments
-			.iter()
-			.any(|entry| entry.key() != key && entry.value().segment_path == path)
+	) -> std::io::Result<bool> {
+		let physical = secondary_index_sidecar_path(&self.config.dir, path)?;
+		for entry in self.secondary_index_segments.iter() {
+			if entry.key() != key
+				&& secondary_index_sidecar_path(&self.config.dir, &entry.value().segment_path)?
+					== physical
+			{
+				return Ok(true);
+			}
+		}
+		Ok(false)
 	}
 	fn sidecar_data_error(
 		&self,
@@ -1153,7 +1168,7 @@ impl SlabManager {
 		// One publication per path at a time: the file rename and the catalog row
 		// below must describe the same segment, which two interleaved writers of
 		// one source slab (an active-buffer seal and a backfill) cannot promise.
-		let (_publication, _previous) = self.lock_secondary_index_row(row.key, false).await?;
+		let (_publication, previous) = self.lock_secondary_index_row(row.key, false).await?;
 		let tmp_path = secondary_index_sidecar_tmp_path(&path);
 		if let Some(parent) = path.parent() {
 			self.file_ops.create_dir_all(parent).await?;
@@ -1195,6 +1210,18 @@ impl SlabManager {
 				previous.key.table_object_id,
 				previous.key.source_slab_id,
 			);
+		}
+		// The same held guard includes the observed old physical stripe. Retire
+		// its bytes only after catalog replacement, and only without live aliases.
+		if let Some(previous) = previous {
+			let old_path = secondary_index_sidecar_path(&self.config.dir, &previous.segment_path)?;
+			if old_path != path
+				&& !self
+					.other_secondary_index_row_references(&previous.key, &previous.segment_path)?
+			{
+				unlink_local_file(self.file_ops.as_ref(), &old_path).await?;
+				fsync_parent_dir(self.file_ops.as_ref(), &old_path).await?;
+			}
 		}
 		self.add_secondary_index_source_reference(
 			info.tenant_id,
@@ -1264,7 +1291,7 @@ impl SlabManager {
 		if let Some(index) = &self.persistent_index {
 			index.delete_secondary_index_segment(row.key).await?;
 		}
-		if !self.other_secondary_index_row_references(&row.key, &row.segment_path) {
+		if !self.other_secondary_index_row_references(&row.key, &row.segment_path)? {
 			unlink_local_file(self.file_ops.as_ref(), &path).await?;
 		}
 		self.secondary_index_segments.remove(&row.key);
@@ -1411,7 +1438,7 @@ impl SlabManager {
 		if let Some(index) = &self.persistent_index {
 			index.delete_secondary_index_segment(row.key).await?;
 		}
-		if !self.other_secondary_index_row_references(&row.key, &row.segment_path) {
+		if !self.other_secondary_index_row_references(&row.key, &row.segment_path)? {
 			unlink_local_file(self.file_ops.as_ref(), &path).await?;
 		}
 		self.secondary_index_segments.remove(&row.key);
