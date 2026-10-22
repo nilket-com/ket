@@ -1,5 +1,37 @@
 use super::*;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SidecarDataErrorReason {
+	IdentityMismatch,
+	PayloadMismatch,
+	MissingFile,
+	MissingCoveredRow,
+	PathUnstable,
+}
+#[derive(Debug)]
+pub(super) struct SidecarDataError {
+	pub(super) reason: SidecarDataErrorReason,
+	key: PersistentSecondaryIndexSegmentKey,
+}
+impl std::fmt::Display for SidecarDataError {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(
+			f,
+			"secondary index sidecar {:?} for {:?}",
+			self.reason, self.key
+		)
+	}
+}
+impl std::error::Error for SidecarDataError {}
+enum SidecarRowGuard<'a> {
+	Read {
+		_guard: tokio::sync::RwLockReadGuard<'a, ()>,
+	},
+	Write {
+		_guard: tokio::sync::RwLockWriteGuard<'a, ()>,
+	},
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SecondaryIndexSegmentInfo {
 	pub tenant_id: TenantId,
@@ -996,17 +1028,112 @@ impl SlabManager {
 		self.mark_secondary_index_uncovered(key, source_slab_id, error);
 	}
 
+	async fn lock_secondary_index_row(
+		&self,
+		key: PersistentSecondaryIndexSegmentKey,
+		shared: bool,
+	) -> std::io::Result<(
+		Vec<SidecarRowGuard<'_>>,
+		Option<PersistentSecondaryIndexSegmentRow>,
+	)> {
+		let canonical = secondary_index_sidecar_path(
+			&self.config.dir,
+			&secondary_index_segment_storage_path(&key),
+		)?;
+		let canonical_stripe = secondary_index_persist_stripe(&canonical);
+		for _ in 0..8 {
+			let before = self
+				.secondary_index_segments
+				.get(&key)
+				.map(|entry| entry.value().clone());
+			let mut indices = vec![canonical_stripe];
+			if let Some(row) = &before {
+				indices.push(secondary_index_persist_stripe(
+					&secondary_index_sidecar_path(&self.config.dir, &row.segment_path)?,
+				));
+			}
+			indices.sort_unstable();
+			indices.dedup();
+			let mut guards = Vec::with_capacity(indices.len());
+			for index in &indices {
+				guards.push(if shared {
+					SidecarRowGuard::Read {
+						_guard: self.secondary_index_persist_stripes[*index].read().await,
+					}
+				} else {
+					SidecarRowGuard::Write {
+						_guard: self.secondary_index_persist_stripes[*index].write().await,
+					}
+				});
+			}
+			let current = self
+				.secondary_index_segments
+				.get(&key)
+				.map(|entry| entry.value().clone());
+			if let Some(row) = &current {
+				let physical = secondary_index_persist_stripe(&secondary_index_sidecar_path(
+					&self.config.dir,
+					&row.segment_path,
+				)?);
+				if !indices.contains(&physical) {
+					drop(guards);
+					continue;
+				}
+			}
+			// Canonical locking serializes replacement of this key; physical
+			// locking serializes aliases of legacy/noncanonical stored paths.
+			// Production only moves a legacy stored path to its canonical path.
+			// The cap also fails typed if a future path writer breaks that rule.
+			return Ok((guards, current));
+		}
+		Err(Error::new(
+			ErrorKind::WouldBlock,
+			SidecarDataError {
+				reason: SidecarDataErrorReason::PathUnstable,
+				key,
+			},
+		))
+	}
+	fn other_secondary_index_row_references(
+		&self,
+		key: &PersistentSecondaryIndexSegmentKey,
+		path: &str,
+	) -> bool {
+		self.secondary_index_segments
+			.iter()
+			.any(|entry| entry.key() != key && entry.value().segment_path == path)
+	}
+	fn sidecar_data_error(
+		&self,
+		key: PersistentSecondaryIndexSegmentKey,
+		reason: SidecarDataErrorReason,
+	) -> Error {
+		let error = Error::new(ErrorKind::InvalidData, SidecarDataError { reason, key });
+		self.record_sidecar_corruption(key, &error);
+		error
+	}
+	fn record_sidecar_corruption(&self, key: PersistentSecondaryIndexSegmentKey, error: &Error) {
+		metrics().observe_storage_secondary_index_corruption_failure(
+			key.tenant_id,
+			key.table_object_id,
+			key.index_object_id,
+		);
+		self.mark_secondary_index_uncovered(
+			secondary_index_coverage_key_from_persistent(&key),
+			key.source_slab_id,
+			SecondaryIndexBackfillError::new(
+				SecondaryIndexBackfillErrorReason::CorruptSegment,
+				error.to_string(),
+			),
+		);
+	}
+
 	pub async fn persist_secondary_index_segment(
 		&self,
 		segment: &SecondaryIndexSegment,
 	) -> std::io::Result<SecondaryIndexSegmentInfo> {
 		let identity = segment.identity();
-		let segment_path = secondary_index_segment_storage_path(
-			segment.header.tenant_id,
-			segment.header.table_object_id,
-			segment.header.index_object_id,
-			segment.header.source_slab_id,
-		);
+		let segment_path = secondary_index_segment_storage_path(&segment.catalog_key());
 		let info = SecondaryIndexSegmentInfo {
 			tenant_id: segment.header.tenant_id,
 			table_object_id: segment.header.table_object_id,
@@ -1026,10 +1153,7 @@ impl SlabManager {
 		// One publication per path at a time: the file rename and the catalog row
 		// below must describe the same segment, which two interleaved writers of
 		// one source slab (an active-buffer seal and a backfill) cannot promise.
-		let _publication = self.secondary_index_persist_stripes
-			[secondary_index_persist_stripe(&path)]
-		.lock()
-		.await;
+		let (_publication, _previous) = self.lock_secondary_index_row(row.key, false).await?;
 		let tmp_path = secondary_index_sidecar_tmp_path(&path);
 		if let Some(parent) = path.parent() {
 			self.file_ops.create_dir_all(parent).await?;
@@ -1089,64 +1213,49 @@ impl SlabManager {
 
 	pub async fn load_secondary_index_segment(
 		&self,
-		key: &SecondaryIndexSegmentInfo,
+		info: &SecondaryIndexSegmentInfo,
 	) -> std::io::Result<Option<SecondaryIndexSegment>> {
-		let Some(row) = self
-			.secondary_index_segments
-			.get(&key.key())
-			.map(|entry| entry.value().clone())
-		else {
-			return Ok(None);
+		let (_read, row) = self.lock_secondary_index_row(info.key(), true).await?;
+		let Some(row) = row else {
+			let covered = self
+				.secondary_index_coverage_snapshot(info.coverage_key())
+				.is_some_and(|coverage| coverage.covered_slabs.contains(&info.source_slab_id));
+			return if covered {
+				Err(self.sidecar_data_error(info.key(), SidecarDataErrorReason::MissingCoveredRow))
+			} else {
+				Ok(None)
+			};
 		};
 		let path = secondary_index_sidecar_path(&self.config.dir, &row.segment_path)?;
 		let bytes = match self.file_ops.read_all(&path).await {
 			Ok(bytes) => bytes,
-			Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
-			Err(err) => return Err(err),
-		};
-		match SecondaryIndexSegment::decode(&bytes) {
-			Ok(segment) => Ok(Some(segment)),
-			Err(err) => {
-				metrics().observe_storage_secondary_index_corruption_failure(
-					row.key.tenant_id,
-					row.key.table_object_id,
-					row.key.index_object_id,
-				);
-				self.mark_secondary_index_uncovered(
-					secondary_index_coverage_key_from_persistent(&row.key),
-					row.key.source_slab_id,
-					SecondaryIndexBackfillError::new(
-						SecondaryIndexBackfillErrorReason::CorruptSegment,
-						err.to_string(),
-					),
-				);
-				Err(err)
+			Err(error) if error.kind() == ErrorKind::NotFound => {
+				return Err(self.sidecar_data_error(row.key, SidecarDataErrorReason::MissingFile));
 			}
+			Err(error) => return Err(error),
+		};
+		let segment = match SecondaryIndexSegment::decode(&bytes) {
+			Ok(segment) => segment,
+			Err(error) => {
+				self.record_sidecar_corruption(row.key, &error);
+				return Err(error);
+			}
+		};
+		if segment.catalog_key() != row.key {
+			return Err(self.sidecar_data_error(row.key, SidecarDataErrorReason::IdentityMismatch));
 		}
+		if segment.header.payload_hash != row.payload_hash {
+			return Err(self.sidecar_data_error(row.key, SidecarDataErrorReason::PayloadMismatch));
+		}
+		Ok(Some(segment))
 	}
 
 	pub async fn delete_secondary_index_segment(
 		&self,
 		key: &SecondaryIndexSegmentInfo,
 	) -> std::io::Result<bool> {
-		// Derive publication's canonical path before reading the current row.
-		// Keep the stripe through durable deletion, unlink and coverage updates.
-		let relative_path = secondary_index_segment_storage_path(
-			key.tenant_id,
-			key.table_object_id,
-			key.index_object_id,
-			key.source_slab_id,
-		);
-		let path = secondary_index_sidecar_path(&self.config.dir, &relative_path)?;
-		let _publication = self.secondary_index_persist_stripes
-			[secondary_index_persist_stripe(&path)]
-		.lock()
-		.await;
-		let Some(row) = self
-			.secondary_index_segments
-			.get(&key.key())
-			.map(|entry| entry.value().clone())
-		else {
+		let (_publication, row) = self.lock_secondary_index_row(key.key(), false).await?;
+		let Some(row) = row else {
 			return Ok(false);
 		};
 		// A restored row may retain a format-valid noncanonical relative path.
@@ -1155,7 +1264,9 @@ impl SlabManager {
 		if let Some(index) = &self.persistent_index {
 			index.delete_secondary_index_segment(row.key).await?;
 		}
-		unlink_local_file(self.file_ops.as_ref(), &path).await?;
+		if !self.other_secondary_index_row_references(&row.key, &row.segment_path) {
+			unlink_local_file(self.file_ops.as_ref(), &path).await?;
+		}
 		self.secondary_index_segments.remove(&row.key);
 		self.remove_secondary_index_source_reference(
 			row.key.tenant_id,
@@ -1289,24 +1400,8 @@ impl SlabManager {
 		&self,
 		info: &SecondaryIndexSegmentInfo,
 	) -> std::io::Result<bool> {
-		// Derive publication's canonical path before reading the current row.
-		// Keep the stripe through durable deletion, unlink and coverage updates.
-		let relative_path = secondary_index_segment_storage_path(
-			info.tenant_id,
-			info.table_object_id,
-			info.index_object_id,
-			info.source_slab_id,
-		);
-		let path = secondary_index_sidecar_path(&self.config.dir, &relative_path)?;
-		let _publication = self.secondary_index_persist_stripes
-			[secondary_index_persist_stripe(&path)]
-		.lock()
-		.await;
-		let Some(row) = self
-			.secondary_index_segments
-			.get(&info.key())
-			.map(|entry| entry.value().clone())
-		else {
+		let (_publication, row) = self.lock_secondary_index_row(info.key(), false).await?;
+		let Some(row) = row else {
 			self.forget_secondary_index_source_slab(info.coverage_key(), info.source_slab_id);
 			return Ok(false);
 		};
@@ -1316,7 +1411,9 @@ impl SlabManager {
 		if let Some(index) = &self.persistent_index {
 			index.delete_secondary_index_segment(row.key).await?;
 		}
-		unlink_local_file(self.file_ops.as_ref(), &path).await?;
+		if !self.other_secondary_index_row_references(&row.key, &row.segment_path) {
+			unlink_local_file(self.file_ops.as_ref(), &path).await?;
+		}
 		self.secondary_index_segments.remove(&row.key);
 		self.remove_secondary_index_source_reference(
 			row.key.tenant_id,

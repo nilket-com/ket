@@ -714,7 +714,7 @@ pub struct SlabManager {
 	/// Serializes sidecar publication per path. An active-buffer seal and a
 	/// lifecycle backfill can persist the same source slab's sidecar at once;
 	/// unserialized, their temp files and catalog rows interleave.
-	secondary_index_persist_stripes: Box<[Mutex<()>]>,
+	secondary_index_persist_stripes: Box<[tokio::sync::RwLock<()>]>,
 	/// Per-slab rewrite claim shared by every reader that must retain a physical
 	/// source and every operation that can replace or retire it. Secondary-index
 	/// backfill holds a shared claim; compaction, retention, and ADR 0095 table

@@ -255,6 +255,27 @@ async fn assert_sidecar_state(
 	info: &SecondaryIndexSegmentInfo,
 	present: bool,
 ) {
+	assert_sidecar_state_inner(manager, info, present, true).await;
+}
+async fn assert_sidecar_state_while_writer_is_parked(
+	manager: &SlabManager,
+	info: &SecondaryIndexSegmentInfo,
+) {
+	// The public loader now shares the publication stripe and must wait.
+	// Cancel its real pending future before the writer is released.
+	let mut read = Box::pin(manager.load_secondary_index_segment(info));
+	poll_pending_once(read.as_mut()).await;
+	drop(read);
+	// The gate parks before temp open/rename. Preserve the original old-file,
+	// row, coverage and durable-catalog oracle using the physical preimage.
+	assert_sidecar_state_inner(manager, info, true, false).await;
+}
+async fn assert_sidecar_state_inner(
+	manager: &SlabManager,
+	info: &SecondaryIndexSegmentInfo,
+	present: bool,
+	through_api: bool,
+) {
 	let row = manager
 		.secondary_index_segments
 		.get(&PersistentSecondaryIndexSegmentKey {
@@ -282,11 +303,15 @@ async fn assert_sidecar_state(
 		present
 	);
 	if present {
-		let published = manager
-			.load_secondary_index_segment(info)
-			.await
-			.unwrap()
-			.unwrap();
+		let published = if through_api {
+			manager
+				.load_secondary_index_segment(info)
+				.await
+				.unwrap()
+				.unwrap()
+		} else {
+			SecondaryIndexSegment::decode(&std::fs::read(&path).unwrap()).unwrap()
+		};
 		assert_eq!(
 			published.header.payload_hash,
 			row.as_ref().unwrap().payload_hash
@@ -353,7 +378,7 @@ async fn delete_and_retire_wait_for_same_path_publication() {
 			tokio::pin!(deletion);
 			poll_pending_once(deletion.as_mut()).await;
 			assert_eq!(gate.unlinks_started.load(Ordering::Acquire), 0);
-			assert_sidecar_state(&manager, &original, true).await;
+			assert_sidecar_state_while_writer_is_parked(&manager, &original).await;
 			gate.release.notify_one();
 			let replacement = tokio::time::timeout(Duration::from_secs(60), publisher)
 				.await
@@ -463,7 +488,7 @@ async fn absent_row_delete_and_retire_still_wait_for_publication_stripe() {
 		// A source may have coverage state even when its durable row is absent.
 		manager.mark_secondary_index_covered(info.coverage_key(), info.source_slab_id);
 		let guard = manager.secondary_index_persist_stripes[secondary_index_persist_stripe(&path)]
-			.lock()
+			.write()
 			.await;
 		let deletion = remove_sidecar(&manager, &info, retire);
 		tokio::pin!(deletion);
@@ -613,7 +638,7 @@ async fn interrupted_real_sidecar_publisher_is_cleaned_on_owned_reopen() {
 			std::fs::read(dir.join(&original.segment_path)).unwrap(),
 			published_bytes
 		);
-		assert_sidecar_state(&manager, &original, true).await;
+		assert_sidecar_state_while_writer_is_parked(&manager, &original).await;
 		println!("real publisher staged replacement before open; original catalog unchanged");
 		std::io::Write::flush(&mut std::io::stdout()).unwrap();
 		// Exit without dropping the parked publish future: its normal error
@@ -646,12 +671,7 @@ async fn interrupted_real_sidecar_publisher_is_cleaned_on_owned_reopen() {
 	);
 	let original_segment = segment_with_key(slab, 1);
 	let identity = original_segment.identity();
-	let relative = secondary_index_segment_storage_path(
-		identity.tenant_id,
-		identity.table_object_id,
-		identity.index_object_id,
-		slab,
-	);
+	let relative = secondary_index_segment_storage_path(&original_segment.catalog_key());
 	let published_path = dir.join(&relative);
 	let original_bytes = std::fs::read(&published_path).unwrap();
 	assert_eq!(original_bytes, original_segment.encode().unwrap());
@@ -804,4 +824,275 @@ async fn pd22_retire_old_fingerprint_preserves_new_sidecar() {
 async fn pd22_different_index_ids_are_an_independent_retirement_control() {
 	pd22_old_retirement_preserves_new(false, true).await;
 	pd22_old_retirement_preserves_new(true, true).await;
+}
+
+fn pd22_reason(
+	error: &std::io::Error,
+) -> super::super::secondary_index_segments::SidecarDataErrorReason {
+	assert_eq!(error.kind(), ErrorKind::InvalidData);
+	error
+		.get_ref()
+		.unwrap()
+		.downcast_ref::<super::super::secondary_index_segments::SidecarDataError>()
+		.expect("typed sidecar error")
+		.reason
+}
+
+#[tokio::test]
+async fn pd22_loader_binds_header_and_payload_hash_to_the_row_and_downgrades_coverage() {
+	use super::super::secondary_index_segments::SidecarDataErrorReason as Reason;
+	for (fingerprint, key, reason) in [
+		(2, 1, Reason::IdentityMismatch),
+		(1, 2, Reason::PayloadMismatch),
+	] {
+		let dir = fresh_dir("pd22-loader-binding");
+		let manager = open_manager_at_dir(
+			dir.to_path_buf(),
+			spawn_io_thread(64).unwrap(),
+			test_crypto(),
+		)
+		.await;
+		let segment = pd22_segment(SlabId::new(94), 1, false);
+		let info = manager
+			.persist_secondary_index_segment(&segment)
+			.await
+			.unwrap();
+		let base = segment_with_key(SlabId::new(94), key);
+		let mut identity = base.identity();
+		identity.logical_schema_fingerprint =
+			crate::schema::LogicalSchemaFingerprint::from_bytes([fingerprint; 32]);
+		let wrong = SecondaryIndexSegment::build(
+			identity,
+			base.header.source_slab_id,
+			base.header.table_schema_generation,
+			base.header.arrow_type_tag,
+			base.entries,
+		)
+		.unwrap();
+		std::fs::write(dir.join(&info.segment_path), wrong.encode().unwrap()).unwrap();
+		assert_eq!(
+			pd22_reason(
+				&manager
+					.load_secondary_index_segment(&info)
+					.await
+					.unwrap_err()
+			),
+			reason
+		);
+		let coverage = manager
+			.secondary_index_coverage_snapshot(info.coverage_key())
+			.unwrap();
+		assert!(!coverage.covered_slabs.contains(&info.source_slab_id));
+		assert!(
+			coverage
+				.uncovered_slabs
+				.iter()
+				.any(|(slab, _)| *slab == info.source_slab_id)
+		);
+	}
+}
+
+#[tokio::test]
+async fn pd22_covered_missing_file_or_row_is_typed_and_uncovered() {
+	use super::super::secondary_index_segments::SidecarDataErrorReason as Reason;
+	for missing_row in [false, true] {
+		let dir = fresh_dir("pd22-covered-missing");
+		let manager = open_manager_at_dir(
+			dir.to_path_buf(),
+			spawn_io_thread(64).unwrap(),
+			test_crypto(),
+		)
+		.await;
+		let info = manager
+			.persist_secondary_index_segment(&pd22_segment(SlabId::new(95), 1, false))
+			.await
+			.unwrap();
+		if missing_row {
+			manager
+				.secondary_index_segments
+				.remove(&PersistentSecondaryIndexSegmentRow::from(info.clone()).key);
+		} else {
+			std::fs::remove_file(dir.join(&info.segment_path)).unwrap();
+		}
+		assert_eq!(
+			pd22_reason(
+				&manager
+					.load_secondary_index_segment(&info)
+					.await
+					.unwrap_err()
+			),
+			if missing_row {
+				Reason::MissingCoveredRow
+			} else {
+				Reason::MissingFile
+			}
+		);
+		let coverage = manager
+			.secondary_index_coverage_snapshot(info.coverage_key())
+			.unwrap();
+		assert!(!coverage.covered_slabs.contains(&info.source_slab_id));
+		assert!(
+			coverage
+				.uncovered_slabs
+				.iter()
+				.any(|(slab, _)| *slab == info.source_slab_id)
+		);
+	}
+}
+
+async fn pd22_legacy_alias_pair(
+	manager: &SlabManager,
+	dir: &Path,
+	winner: usize,
+) -> (Vec<SecondaryIndexSegmentInfo>, Vec<SecondaryIndexSegment>) {
+	let segments = vec![
+		pd22_segment(SlabId::new(96), 1, false),
+		pd22_segment(SlabId::new(96), 2, false),
+	];
+	let mut infos = Vec::new();
+	for segment in &segments {
+		infos.push(
+			manager
+				.persist_secondary_index_segment(segment)
+				.await
+				.unwrap(),
+		);
+	}
+	let mut parts = infos[0].segment_path.split('/').collect::<Vec<_>>();
+	assert_eq!(parts.len(), 6);
+	parts.remove(4);
+	let legacy = parts.join("/");
+	std::fs::write(dir.join(&legacy), segments[winner].encode().unwrap()).unwrap();
+	for info in &mut infos {
+		std::fs::remove_file(dir.join(&info.segment_path)).unwrap();
+		info.segment_path = legacy.clone();
+		let row = PersistentSecondaryIndexSegmentRow::from(info.clone());
+		manager
+			.persistent_index
+			.as_ref()
+			.unwrap()
+			.upsert_secondary_index_segment(row.clone())
+			.await
+			.unwrap();
+		manager.secondary_index_segments.insert(row.key, row);
+	}
+	assert_eq!(
+		secondary_index_persist_stripe(&dir.join(&infos[0].segment_path)),
+		secondary_index_persist_stripe(&dir.join(&infos[1].segment_path))
+	);
+	(infos, segments)
+}
+
+#[tokio::test]
+async fn pd22_legacy_alias_deletion_preserves_a_referenced_file() {
+	for winner in 0..2 {
+		for removed in 0..2 {
+			for retire in [false, true] {
+				let dir = fresh_dir("pd22-legacy-alias");
+				let manager = open_manager_at_dir(
+					dir.to_path_buf(),
+					spawn_io_thread(64).unwrap(),
+					test_crypto(),
+				)
+				.await;
+				let (infos, segments) = pd22_legacy_alias_pair(&manager, &dir, winner).await;
+				assert!(
+					remove_sidecar(&manager, &infos[removed], retire)
+						.await
+						.unwrap()
+				);
+				let remains = 1 - removed;
+				assert!(
+					dir.join(&infos[remains].segment_path).exists(),
+					"a live legacy alias lost its file"
+				);
+				if remains == winner {
+					assert_eq!(
+						manager
+							.load_secondary_index_segment(&infos[remains])
+							.await
+							.unwrap(),
+						Some(segments[winner].clone())
+					);
+				} else {
+					assert_eq!(pd22_reason(&manager.load_secondary_index_segment(&infos[remains]).await.unwrap_err()), super::super::secondary_index_segments::SidecarDataErrorReason::IdentityMismatch);
+				}
+			}
+		}
+	}
+}
+
+#[tokio::test]
+async fn pd22_legacy_physical_stripe_excludes_replacement_and_other_row_delete() {
+	let dir = fresh_dir("pd22-legacy-physical-lock");
+	let manager = open_manager_at_dir(
+		dir.to_path_buf(),
+		spawn_io_thread(64).unwrap(),
+		test_crypto(),
+	)
+	.await;
+	let (infos, segments) = pd22_legacy_alias_pair(&manager, &dir, 1).await;
+	let physical = secondary_index_persist_stripe(&dir.join(&infos[0].segment_path));
+	let held = manager.secondary_index_persist_stripes[physical]
+		.write()
+		.await;
+	let mut publish = Box::pin(manager.persist_secondary_index_segment(&segments[0]));
+	let mut delete = Box::pin(manager.delete_secondary_index_segment(&infos[1]));
+	poll_pending_once(publish.as_mut()).await;
+	poll_pending_once(delete.as_mut()).await;
+	drop(held);
+	let (published, deleted) = tokio::time::timeout(Duration::from_secs(60), async {
+		tokio::join!(publish, delete)
+	})
+	.await
+	.unwrap();
+	let published = published.unwrap();
+	assert!(deleted.unwrap());
+	assert_eq!(
+		manager
+			.load_secondary_index_segment(&published)
+			.await
+			.unwrap(),
+		Some(segments[0].clone())
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pd22_hot_sidecar_loads_share_the_read_stripe() {
+	let dir = fresh_dir("pd22-shared-loads");
+	let manager = open_manager_at_dir(
+		dir.to_path_buf(),
+		spawn_io_thread(64).unwrap(),
+		test_crypto(),
+	)
+	.await;
+	let segment = pd22_segment(SlabId::new(97), 1, false);
+	let info = manager
+		.persist_secondary_index_segment(&segment)
+		.await
+		.unwrap();
+	let shared = manager.secondary_index_persist_stripes
+		[secondary_index_persist_stripe(&dir.join(&info.segment_path))]
+	.read()
+	.await;
+	let mut tasks = tokio::task::JoinSet::new();
+	for _ in 0..16 {
+		let manager = manager.clone();
+		let info = info.clone();
+		let expected = segment.clone();
+		tasks.spawn(async move {
+			assert_eq!(
+				manager.load_secondary_index_segment(&info).await.unwrap(),
+				Some(expected)
+			);
+		});
+	}
+	tokio::time::timeout(Duration::from_secs(60), async {
+		while let Some(result) = tasks.join_next().await {
+			result.unwrap();
+		}
+	})
+	.await
+	.expect("loads must finish while another reader retains the stripe");
+	drop(shared);
 }

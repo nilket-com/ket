@@ -10413,3 +10413,26 @@ fn adr0167_wendelon_tenant_command_reaches_the_tenant_admin_rpc() {
 		);
 	}
 }
+
+#[test]
+fn pd22_sidecar_path_builder_requires_the_full_persistent_catalog_key() {
+	let text = std::fs::read_to_string(
+		std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+			.join("src/storage/secondary_index_segment.rs"),
+	)
+	.unwrap();
+	let start = text
+		.find("pub(crate) fn secondary_index_segment_storage_path(")
+		.unwrap();
+	let body = &text[start..text[start..].find("\n}\n").map(|end| start + end).unwrap()];
+	assert!(body.contains("key: &PersistentSecondaryIndexSegmentKey"));
+	for field in [
+		"tenant_id",
+		"table_object_id",
+		"index_object_id",
+		"logical_schema_fingerprint",
+		"source_slab_id",
+	] {
+		assert!(body.contains(&format!("key.{field}")), "path omits {field}");
+	}
+}

@@ -465,3 +465,44 @@ async fn changed_parent_is_synced_when_a_later_unlink_fails() {
 	);
 	owner.close(Duration::from_secs(10)).await.unwrap();
 }
+
+#[test]
+fn pd22_cleanup_accepts_exact_new_fingerprint_depth_and_preserves_other_shapes() {
+	let root = TestDir::new("pd22-cleanup-shape");
+	let base = leaf_dir(&root);
+	let fingerprint = "33".repeat(32);
+	let new_leaf = base.join(&fingerprint);
+	std::fs::create_dir_all(&new_leaf).unwrap();
+	let valid = new_leaf.join(leaf_name());
+	std::fs::write(&valid, b"owned-temp").unwrap();
+	let regular = new_leaf.join("0000000000000003.idx");
+	std::fs::write(&regular, b"published").unwrap();
+	let arbitrary = new_leaf.join("unrelated.tmp");
+	std::fs::write(&arbitrary, b"user").unwrap();
+	let wrong = base.join("44".repeat(31));
+	std::fs::create_dir_all(&wrong).unwrap();
+	let wrong_temp = wrong.join(leaf_name());
+	std::fs::write(&wrong_temp, b"wrong-depth").unwrap();
+	let extra = new_leaf.join("55".repeat(32));
+	std::fs::create_dir_all(&extra).unwrap();
+	let nested_temp = extra.join(leaf_name());
+	std::fs::write(&nested_temp, b"too-deep").unwrap();
+	let removed = walk(
+		&OpenOptions::new()
+			.read(true)
+			.custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+			.open(root.join("secondary_index"))
+			.unwrap(),
+		0,
+		&mut NoHooks,
+	)
+	.unwrap();
+	assert_eq!(removed, 1);
+	assert!(!valid.exists());
+	for path in [regular, arbitrary, wrong_temp, nested_temp] {
+		assert!(
+			path.exists(),
+			"cleanup crossed its exact namespace: {path:?}"
+		);
+	}
+}
