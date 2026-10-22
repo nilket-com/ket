@@ -1017,6 +1017,7 @@ fn v5_preflight_refuses_implicit_serial_concurrency_and_validates_explicit_choic
 				(None, if default == 1024 { 0 } else { 2 }),
 				(Some("1024"), 0),
 				(Some("8"), 0),
+				(Some("1"), 2),
 				(Some(""), 2),
 				(Some("all"), 2),
 			] {

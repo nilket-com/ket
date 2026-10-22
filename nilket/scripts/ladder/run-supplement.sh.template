@@ -27,8 +27,8 @@ git -C "$SRC" status --porcelain > "$OUT/status-start.txt"
 require_v5_concurrency() {
 	local wrapper=$1
 	if [[ -v CARGO_CGROUP_RUST_TEST_THREADS ]]; then
-		[[ "$CARGO_CGROUP_RUST_TEST_THREADS" =~ ^[1-9][0-9]*$ ]] || {
-			echo "v5 requires a positive explicit test-thread override" >&2; return 2;
+		[[ "$CARGO_CGROUP_RUST_TEST_THREADS" =~ ^[1-9][0-9]*$ && "$CARGO_CGROUP_RUST_TEST_THREADS" != 1 ]] || {
+			echo "v5 requires an explicit test-thread override of at least 2" >&2; return 2;
 		}
 	elif ! grep -Fxq 'test_threads="${CARGO_CGROUP_RUST_TEST_THREADS:-1024}"' "$wrapper"; then
 		echo "v5 requires default 1024 or an explicit CARGO_CGROUP_RUST_TEST_THREADS override" >&2
