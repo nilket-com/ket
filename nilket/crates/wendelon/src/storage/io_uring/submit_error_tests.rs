@@ -29,6 +29,8 @@ async fn read_across_enter_error(errno: i32) {
 	let (submitted, ready) = std::sync::mpsc::sync_channel(1);
 	let (release, released) = std::sync::mpsc::sync_channel(1);
 	*handle.submit_fault.lock().unwrap() = Some(SubmitFault {
+		repeats: 0,
+		entered: false,
 		errno,
 		submitted,
 		release: released,
@@ -404,6 +406,8 @@ async fn terminal_worker_error_closes_admission_and_drops_queued_requests() {
 	let (submitted, ready) = std::sync::mpsc::sync_channel(1);
 	let (release, released) = std::sync::mpsc::sync_channel(1);
 	*handle.submit_fault.lock().unwrap() = Some(SubmitFault {
+		repeats: 0,
+		entered: false,
 		errno: libc::EIO,
 		submitted,
 		release: released,
@@ -452,5 +456,58 @@ async fn terminal_worker_error_closes_admission_and_drops_queued_requests() {
 		.unwrap();
 	assert!(dropped.load(Ordering::Acquire));
 	assert!(queued_weak.upgrade().is_none());
+	println!("quarantine control passed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn persistent_retryable_enter_errors_terminate_without_completion() {
+	if !quarantine_child(
+		"retry-budget",
+		concat!(
+			module_path!(),
+			"::persistent_retryable_enter_errors_terminate_without_completion"
+		)
+		.trim_start_matches("wendelon::"),
+	) {
+		return;
+	}
+	for errno in [libc::EAGAIN, libc::EBUSY, libc::EINTR] {
+		let handle = spawn_io_thread(8).unwrap();
+		let (reader, _writer) = UnixStream::pair().unwrap();
+		let file = Arc::new(std::fs::File::from(OwnedFd::from(reader)));
+		let (submitted, ready) = std::sync::mpsc::sync_channel(1);
+		let (release, released) = std::sync::mpsc::sync_channel(1);
+		*handle.submit_fault.lock().unwrap() = Some(SubmitFault {
+			errno,
+			repeats: usize::MAX,
+			entered: false,
+			submitted,
+			release: released,
+		});
+		let reply = handle
+			.submit(IoOp::Read, &file, AlignedBuf::new(DIRECT_IO_ALIGN), 0)
+			.await
+			.unwrap();
+		tokio::task::spawn_blocking(move || ready.recv_timeout(Duration::from_secs(10)).unwrap())
+			.await
+			.unwrap();
+		release.send(()).unwrap();
+		// No peer data is ever sent. A retry budget must stop this worker even
+		// when none of its operations can complete; this is a hang detector.
+		let result = tokio::time::timeout(Duration::from_secs(5), reply).await;
+		if result.is_err() {
+			// Let the red worker exit after the assertion, without leaking a
+			// spinning thread into a subsequent test in this child process.
+			*handle.submit_fault.lock().unwrap() = None;
+			drop(_writer);
+			handle.close_and_join().await.unwrap();
+			panic!("persistent enter error {errno} never exhausted its retry budget");
+		}
+		assert_eq!(result.unwrap().unwrap().result, -errno);
+		tokio::time::timeout(Duration::from_secs(5), handle.close_and_join())
+			.await
+			.unwrap()
+			.unwrap();
+	}
 	println!("quarantine control passed");
 }
