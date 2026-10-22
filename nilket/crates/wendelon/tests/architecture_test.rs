@@ -10456,7 +10456,14 @@ fn pd25_constructor_spawns_stay_inside_typed_ownership_handoff() {
 		while i < tokens.len() {
 			if let TokenTree::Ident(name) = &tokens[i] {
 				let name = name.to_string();
-				if name.starts_with("set_")
+				let owned_receiver = i >= 5
+					&& matches!(&tokens[i-5], TokenTree::Ident(id) if id == "scope")
+					&& matches!(&tokens[i-4], TokenTree::Punct(p) if p.as_char() == '.')
+					&& matches!(&tokens[i-3], TokenTree::Ident(id) if id == "handles")
+					&& matches!(&tokens[i-2], TokenTree::Group(group) if group.delimiter() == proc_macro2::Delimiter::Parenthesis && group.stream().is_empty())
+					&& matches!(&tokens[i-1], TokenTree::Punct(p) if p.as_char() == '.');
+				if owned_receiver
+					&& name.starts_with("set_")
 					&& matches!(tokens.get(i+1), Some(TokenTree::Group(group)) if group.delimiter() == proc_macro2::Delimiter::Parenthesis)
 				{
 					// Typed setters immediately own the result even when a spawn lives in
@@ -10488,6 +10495,136 @@ fn pd25_constructor_spawns_stay_inside_typed_ownership_handoff() {
 	let startup = fs::read_to_string(root.join("src/node/startup.rs")).unwrap();
 	assert!(startup.contains("handles.validate()"));
 	assert!(startup.contains("duplicate or untransferred tasks"));
+	let cleanup = startup
+		.split("fn start_cleanup(")
+		.nth(1)
+		.unwrap()
+		.split("pub(super) async fn fail")
+		.next()
+		.unwrap();
+	assert!(!cleanup.contains("prepare_for_owner"));
+	assert!(!cleanup.contains("ShutdownWatchdog::arm"));
+	assert!(cleanup.find("resources.fence()").unwrap() < cleanup.find("watchdog.start(").unwrap());
+}
+
+#[test]
+fn pd25_provider_publication_requires_real_withdrawal_and_complete_census() {
+	fn empty_success(expr: &syn::Expr) -> bool {
+		match expr {
+			syn::Expr::Return(value) => value.expr.as_deref().is_some_and(empty_success),
+			syn::Expr::Paren(value) => empty_success(&value.expr),
+			syn::Expr::Group(value) => empty_success(&value.expr),
+			syn::Expr::Block(value) if value.block.stmts.len() == 1 => {
+				match &value.block.stmts[0] {
+					syn::Stmt::Expr(expr, _) => empty_success(expr),
+					_ => false,
+				}
+			}
+			syn::Expr::Call(call) => {
+				matches!(&*call.func, syn::Expr::Path(path) if path.path.is_ident("Ok"))
+					&& call.args.len() == 1
+					&& matches!(&call.args[0], syn::Expr::Tuple(tuple) if tuple.elems.is_empty())
+			}
+			_ => false,
+		}
+	}
+
+	fn record_provider(item: syn::ItemImpl, file: &str, rows: &mut Vec<serde_json::Value>) {
+		let is_provider = item.trait_.as_ref().is_some_and(|(_, path, _)| {
+			path.segments
+				.last()
+				.is_some_and(|segment| segment.ident == "TransportProvider")
+		});
+		if !is_provider {
+			return;
+		}
+		let implementation = match &*item.self_ty {
+			syn::Type::Path(path) => path.path.segments.last().unwrap().ident.to_string(),
+			_ => panic!("unclassified provider type in {file}"),
+		};
+		let mut publish = false;
+		let mut withdraw = None;
+		for entry in &item.items {
+			if let syn::ImplItem::Fn(method) = entry {
+				if method.sig.ident == "publish_local" {
+					publish = true;
+				}
+				if method.sig.ident == "withdraw_local" {
+					withdraw = Some(method);
+				}
+			}
+		}
+		let withdraw = withdraw.expect("every provider implements the required withdrawal");
+		let noop = match withdraw.block.stmts.as_slice() {
+			[syn::Stmt::Expr(expr, _)] => empty_success(expr),
+			_ => false,
+		};
+		rows.push(serde_json::json!({
+		 "file": file, "implementation": implementation,
+		 "overrides_publish": publish, "withdraw_noop": noop,
+		}));
+	}
+	fn scan(stream: TokenStream, file: &str, rows: &mut Vec<serde_json::Value>) {
+		let tokens: Vec<_> = stream.into_iter().collect();
+		for i in 0..tokens.len() {
+			if matches!(&tokens[i], TokenTree::Ident(id) if id == "impl") {
+				let end = (i+1..tokens.len()).find(|&end| {
+     matches!(&tokens[end], TokenTree::Group(group) if group.delimiter() == proc_macro2::Delimiter::Brace)
+    });
+				if let Some(end) = end {
+					let candidate = tokens[i..=end].iter().cloned().collect();
+					if let Ok(item) = syn::parse2::<syn::ItemImpl>(candidate) {
+						record_provider(item, file, rows);
+					}
+				}
+			}
+			if let TokenTree::Group(group) = &tokens[i] {
+				scan(group.stream(), file, rows);
+			}
+		}
+	}
+
+	let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+		.parent()
+		.unwrap()
+		.parent()
+		.unwrap();
+	let mut rows = Vec::new();
+	walk_dir(&workspace.join("crates"), &mut |path| {
+		if path.extension().is_some_and(|extension| extension == "rs")
+			&& !path
+				.components()
+				.any(|component| component.as_os_str() == "target")
+		{
+			let source = fs::read_to_string(path).unwrap();
+			scan(
+				TokenStream::from_str(&source).unwrap(),
+				&path.strip_prefix(workspace).unwrap().to_string_lossy(),
+				&mut rows,
+			);
+		}
+	});
+	rows.sort_by_key(|row| format!("{}:{}", row["file"], row["implementation"]));
+	for row in &rows {
+		assert!(
+			!(row["overrides_publish"] == true && row["withdraw_noop"] == true),
+			"publication with no-op withdrawal: {row}"
+		);
+	}
+	let expected: serde_json::Value =
+		serde_json::from_str(include_str!("fixtures/startup_provider_census.json")).unwrap();
+	let expected: Vec<_> = expected.as_array().unwrap().iter().map(|row| serde_json::json!({"file":row["file"], "implementation":row["implementation"], "overrides_publish":row["overrides_publish"], "withdraw_noop":row["withdraw_noop"]})).collect();
+	assert_eq!(
+		rows, expected,
+		"provider census changed: audit retention/withdrawal and update the checked fixture"
+	);
+	let mut negative = Vec::new();
+	scan(TokenStream::from_str("impl TransportProvider for Unwithdrawn { fn publish_local(&self) {} fn withdraw_local(&self) { Ok(()) } }").unwrap(), "negative control", &mut negative);
+	assert_eq!(negative[0]["overrides_publish"], true);
+	assert_eq!(
+		negative[0]["withdraw_noop"], true,
+		"the no-op publication bypass must be detectable"
+	);
 }
 
 #[test]
