@@ -27,6 +27,7 @@
 //!   request drain has completed.
 
 mod identity;
+mod startup;
 #[cfg(feature = "test-support")]
 mod test_support;
 pub use identity::{IdentityKeyError, IdentityKeyRole};
@@ -183,6 +184,8 @@ pub struct ObservabilityConfig {
 /// constructed programmatically in tests.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NodeBootstrapConfig {
+	#[cfg(test)]
+	pub(crate) startup_probe: Option<startup_ownership_tests::StartupProbe>,
 	/// Numeric node id — also the openraft peer id. Must be unique
 	/// across the cluster; single-node genesis picks any u32.
 	pub node_id: u32,
@@ -325,6 +328,8 @@ impl NodeBootstrapConfig {
 			audit_root_verifying_key_bytes(audit_root_signing_secret),
 		)]);
 		Self {
+			#[cfg(test)]
+			startup_probe: None,
 			node_id,
 			data_dir,
 			slab_max_bytes: 64 * 1024 * 1024,
@@ -734,8 +739,8 @@ pub struct WendelonNode {
 	pub handles: NodeHandles,
 }
 
-/// Background task handles. Dropping the node drops these, which
-/// aborts every watchdog and updater cleanly.
+/// Background task handles. Explicit shutdown aborts and joins these tasks;
+/// dropping a raw Tokio JoinHandle alone detaches its task.
 pub struct NodeHandles {
 	pub ring_updater: JoinHandle<()>,
 	pub drift_monitor: JoinHandle<()>,
@@ -1937,7 +1942,39 @@ impl WendelonNode {
 			})
 			.collect::<Vec<_>>();
 		let epoch_reconciler = control_server.clone().spawn_epoch_reconciler();
+		#[cfg(test)]
+		if let Some(probe) = &cfg.startup_probe {
+			probe.record(
+				&slab,
+				&control_server,
+				&service,
+				&lifecycle,
+				vec![
+					("checkpoint", checkpoint_emitter.abort_handle()),
+					("audit", audit_chain_root_rollup.abort_handle()),
+					("ring", ring_updater.abort_handle()),
+					("drift", drift_monitor.abort_handle()),
+					("epoch", epoch_reconciler.abort_handle()),
+				],
+			);
+		}
 
+		let startup = startup::Guard::arm(startup::Resources {
+			owner: owner.clone(),
+			raft: raft.clone(),
+			lifecycle: lifecycle.clone(),
+			transports: transport_servers,
+			tasks: startup::Tasks {
+				ring_updater,
+				drift_monitor,
+				audit_chain_root_rollup,
+				checkpoint_emitter,
+				epoch_reconciler,
+			},
+			bound: cfg.storage_shutdown_timeout,
+			runtime: tokio::runtime::Handle::current(),
+		})
+		.await?;
 		// 14. Fresh nodes either initialize a one-node cluster or
 		//     join an existing leader through the explicit Control
 		//     Ring join path. Recovery-mode nodes rely on their
@@ -1945,40 +1982,59 @@ impl WendelonNode {
 		//     a synthetic join RPC on restart; reissuing join after
 		//     recovery can perturb follower replication ordering and
 		//     trip OpenRaft's follower-log-reversion guard.
-		match &cfg.cluster {
-			ClusterBootstrapConfig::Bootstrap => {
-				if bootstrap_mode == DurableBootstrapMode::FreshBootstrap {
-					let mut members: BTreeMap<u32, BasicNode> = BTreeMap::new();
-					members.insert(
-						cfg.node_id,
-						BasicNode {
-							addr: cfg.advertise_address.clone(),
-						},
-					);
-					raft.initialize(members).await.map_err(|e| {
-						Error::new(ErrorKind::Other, format!("Raft::initialize: {e}"))
-					})?;
-					wait_for_local_leader(&raft, local_node).await?;
+		let cluster_result: std::io::Result<()> = async {
+			match &cfg.cluster {
+				ClusterBootstrapConfig::Bootstrap => {
+					if bootstrap_mode == DurableBootstrapMode::FreshBootstrap {
+						let mut members: BTreeMap<u32, BasicNode> = BTreeMap::new();
+						members.insert(
+							cfg.node_id,
+							BasicNode {
+								addr: cfg.advertise_address.clone(),
+							},
+						);
+						raft.initialize(members).await.map_err(|e| {
+							Error::new(ErrorKind::Other, format!("Raft::initialize: {e}"))
+						})?;
+						wait_for_local_leader(&raft, local_node).await?;
+					}
+				}
+				ClusterBootstrapConfig::Join { seeds } => {
+					if bootstrap_mode == DurableBootstrapMode::FreshBootstrap {
+						request_join_via_seeds(
+							local_node,
+							&cfg.advertise_address,
+							local_tiers,
+							advertised_roles(),
+							advertised_capabilities(),
+							cfg.protocol,
+							dial_provider.clone(),
+							pool.clone(),
+							seeds,
+						)
+						.await?;
+						wait_for_join_visibility(epoch_rx.clone()).await?;
+					}
 				}
 			}
-			ClusterBootstrapConfig::Join { seeds } => {
-				if bootstrap_mode == DurableBootstrapMode::FreshBootstrap {
-					request_join_via_seeds(
-						local_node,
-						&cfg.advertise_address,
-						local_tiers,
-						advertised_roles(),
-						advertised_capabilities(),
-						cfg.protocol,
-						dial_provider.clone(),
-						pool.clone(),
-						seeds,
-					)
-					.await?;
-					wait_for_join_visibility(epoch_rx.clone()).await?;
-				}
-			}
+			Ok(())
 		}
+		.await;
+		if let Err(error) = cluster_result {
+			return Err(startup.fail(error).await);
+		}
+		let startup::Resources {
+			transports: transport_servers,
+			tasks:
+				startup::Tasks {
+					ring_updater,
+					drift_monitor,
+					audit_chain_root_rollup,
+					checkpoint_emitter,
+					epoch_reconciler,
+				},
+			..
+		} = startup.finish_success();
 		// ADR 0095 stamps erasure participants from replicated epoch history.
 		// Seed the genesis edge synchronously on the leader so an immediately
 		// following DROP cannot race the background epoch reconciler.
@@ -4521,3 +4577,6 @@ mod dormant_response_tests {
 		assert_eq!(e.to_string(), "ctx: unexpected LeaseDenied response");
 	}
 }
+
+#[cfg(test)]
+mod startup_ownership_tests;

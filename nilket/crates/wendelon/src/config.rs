@@ -980,6 +980,8 @@ impl RawConfig {
 		let l2_encoding_fetch = self.storage.l2_encoding_fetch.into_runtime_config()?;
 		let encoding_compute = self.storage.encoding_compute.into_runtime_config()?;
 		let cfg = NodeBootstrapConfig {
+			#[cfg(test)]
+			startup_probe: None,
 			#[cfg(feature = "test-support")]
 			slab_file_ops: None,
 			#[cfg(feature = "test-support")]

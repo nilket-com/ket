@@ -105,6 +105,7 @@ enum OwnerPhase {
 struct OwnerState {
 	phase: OwnerPhase,
 	outstanding: usize,
+	startup_barriers: usize,
 	// Fields drop in declaration order. Workers (whose closers may still hold a
 	// redb database, which writes on drop) must go before the lock descriptor,
 	// so an owner dropped without close never releases the lock first.
@@ -183,6 +184,9 @@ struct OwnerInner {
 	state: Mutex<OwnerState>,
 	drained: Notify,
 	close_gate: tokio::sync::Mutex<()>,
+	startup_cleanups: Mutex<Vec<Arc<StartupCleanupSlot>>>,
+	#[cfg(test)]
+	startup_cleanup_pause: Mutex<Option<Arc<Notify>>>,
 }
 
 impl std::fmt::Debug for DataDirectoryOwner {
@@ -193,7 +197,255 @@ impl std::fmt::Debug for DataDirectoryOwner {
 	}
 }
 
+/// A reserved startup drain is distinct from an individual write permit.
+/// Unexpected Drop fences admission and deliberately retains the reservation.
+pub(crate) struct StartupDrainBarrier {
+	owner: DataDirectoryOwner,
+	released: bool,
+}
+impl StartupDrainBarrier {
+	fn release(mut self) {
+		let mut state = self.owner.inner.state.lock().unwrap();
+		state.startup_barriers = state
+			.startup_barriers
+			.checked_sub(1)
+			.expect("startup barrier released twice");
+		self.released = true;
+		self.owner.inner.drained.notify_waiters();
+	}
+	pub(crate) fn release_after_handoff(self) {
+		self.release();
+	}
+	pub(crate) fn complete_cleanup(self) {
+		self.release();
+	}
+}
+impl Drop for StartupDrainBarrier {
+	fn drop(&mut self) {
+		if !self.released {
+			self.owner.begin_close();
+		}
+	}
+}
+#[derive(Clone, Debug)]
+pub enum StartupCleanupStatus {
+	Running,
+	PendingIncomplete(String),
+	Complete,
+	Failed {
+		kind: ErrorKind,
+		message: String,
+		incomplete: bool,
+		outstanding: Option<usize>,
+	},
+}
+pub(crate) struct StartupCleanupSlot {
+	context: String,
+	status: tokio::sync::watch::Sender<StartupCleanupStatus>,
+	handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+impl StartupCleanupSlot {
+	pub(crate) async fn wait(&self) -> StartupCleanupStatus {
+		let mut status = self.status.subscribe();
+		let mut handle = self.handle.lock().await;
+		loop {
+			let value = status.borrow_and_update().clone();
+			if !matches!(value, StartupCleanupStatus::Running) {
+				let finished_pending = matches!(value, StartupCleanupStatus::PendingIncomplete(_))
+					&& handle.as_ref().is_some_and(|task| task.is_finished());
+				if !finished_pending {
+					return value;
+				}
+			}
+			let Some(task) = handle.as_mut() else {
+				return StartupCleanupStatus::PendingIncomplete(
+					"cleanup handle missing report".into(),
+				);
+			};
+			tokio::select! {
+				result = task => {
+					handle.take();
+					if let Err(error) = result {
+						self.status.send_replace(StartupCleanupStatus::Failed { kind: ErrorKind::Other, message: format!("startup cleanup task failed: {error}"), incomplete: true, outstanding: None });
+					}
+				},
+				changed = status.changed() => if changed.is_err() { return StartupCleanupStatus::PendingIncomplete("cleanup status closed".into()); }
+			}
+		}
+	}
+
+	pub(crate) async fn join_finished(&self) {
+		// Borrow the registered handle: cancelling an observer never drops it.
+		let mut handle = self.handle.lock().await;
+		if let Some(task) = handle.as_mut() {
+			let _ = task.await;
+		}
+		handle.take();
+	}
+}
+
 impl DataDirectoryOwner {
+	pub(crate) fn reserve_startup_drain(&self) -> std::io::Result<StartupDrainBarrier> {
+		let mut state = self.inner.state.lock().unwrap();
+		if state.phase != OwnerPhase::Active {
+			return Err(closed_error());
+		}
+		state.startup_barriers = state
+			.startup_barriers
+			.checked_add(1)
+			.expect("startup barrier count overflow");
+		Ok(StartupDrainBarrier {
+			owner: self.clone(),
+			released: false,
+		})
+	}
+	pub(crate) fn begin_close(&self) {
+		let mut state = self.inner.state.lock().unwrap();
+		if state.phase != OwnerPhase::Closed {
+			state.phase = OwnerPhase::Closing;
+			state.closing_pin = Some(self.inner.clone());
+			self.inner.drained.notify_waiters();
+		}
+	}
+	pub(crate) fn startup_incomplete(&self, message: String) -> Error {
+		self.startup_incomplete_from(ErrorKind::TimedOut, message, None)
+	}
+	pub(crate) fn startup_incomplete_from(
+		&self,
+		kind: ErrorKind,
+		message: String,
+		outstanding: Option<usize>,
+	) -> Error {
+		Error::new(
+			kind,
+			ShutdownIncomplete {
+				outstanding: outstanding
+					.unwrap_or_else(|| self.inner.state.lock().unwrap().outstanding),
+				cause: Error::new(kind, message),
+			},
+		)
+	}
+	pub(crate) fn track_startup_cleanup<F>(
+		&self,
+		future: F,
+		bound: Duration,
+		context: String,
+		progress: Arc<Mutex<&'static str>>,
+		runtime: tokio::runtime::Handle,
+	) -> Arc<StartupCleanupSlot>
+	where
+		F: std::future::Future<Output = std::io::Result<()>> + Send + 'static,
+	{
+		let (status, _) = tokio::sync::watch::channel(StartupCleanupStatus::Running);
+		let (start, ready) = tokio::sync::oneshot::channel();
+		let slot = Arc::new(StartupCleanupSlot {
+			context,
+			status,
+			handle: tokio::sync::Mutex::new(None),
+		});
+		let worker_slot = slot.clone();
+		#[cfg(test)]
+		let pause = self.inner.startup_cleanup_pause.lock().unwrap().take();
+		let handle = runtime.spawn(async move {
+			let _ = ready.await;
+			#[cfg(test)]
+			if let Some(pause) = pause {
+				pause.notified().await;
+			}
+			tokio::pin!(future);
+			let result = match tokio::time::timeout(bound, future.as_mut()).await {
+				Ok(result) => result,
+				Err(_) => {
+					tracing::error!(context = %worker_slot.context, stage = *progress.lock().unwrap(), "startup cleanup incomplete at bound; resources retained");
+					worker_slot
+						.status
+						.send_replace(StartupCleanupStatus::PendingIncomplete(format!(
+							"{}: startup shutdown still running at {}",
+							worker_slot.context,
+							*progress.lock().unwrap()
+						)));
+					future.await
+				}
+			};
+			let status = match result {
+				Ok(()) => StartupCleanupStatus::Complete,
+				Err(error) => {
+					let incomplete = error.get_ref().and_then(|source| source.downcast_ref::<ShutdownIncomplete>());
+					let outstanding = incomplete.map(|error| error.outstanding);
+					let mut message = error.to_string();
+					let mut cause = std::error::Error::source(&error);
+					while let Some(source) = cause { message.push_str(": "); message.push_str(&source.to_string()); cause = source.source(); }
+					StartupCleanupStatus::Failed { kind: error.kind(), message, incomplete: incomplete.is_some(), outstanding }
+				},
+			};
+			if let StartupCleanupStatus::Failed { message, .. } = &status {
+				tracing::error!(context = %worker_slot.context, error = %message, "startup cleanup failed");
+			}
+			worker_slot.status.send_replace(status);
+		});
+		*slot.handle.try_lock().expect("unpublished startup slot") = Some(handle);
+		self.inner
+			.startup_cleanups
+			.lock()
+			.unwrap()
+			.push(slot.clone());
+		let _ = start.send(());
+		slot
+	}
+	/// Retained startup cleanup outcomes, including cancellation with no caller.
+	/// Reports own no storage resources; incomplete cleanup still retains LOCK.
+	pub fn startup_cleanup_reports(&self) -> Vec<StartupCleanupStatus> {
+		self.inner
+			.startup_cleanups
+			.lock()
+			.unwrap()
+			.iter()
+			.map(|slot| {
+				let value = slot.status.borrow().clone();
+				if matches!(
+					value,
+					StartupCleanupStatus::Running | StartupCleanupStatus::PendingIncomplete(_)
+				) && slot
+					.handle
+					.try_lock()
+					.ok()
+					.is_some_and(|handle| handle.as_ref().is_some_and(|task| task.is_finished()))
+				{
+					{
+						let current = slot.status.borrow().clone();
+						if matches!(
+							current,
+							StartupCleanupStatus::Running
+								| StartupCleanupStatus::PendingIncomplete(_)
+						) {
+							StartupCleanupStatus::Failed {
+								kind: ErrorKind::Other,
+								message: format!(
+									"{}: cleanup task ended without terminal report; wait joins exact failure",
+									slot.context
+								),
+								incomplete: true,
+								outstanding: None,
+							}
+						} else {
+							current
+						}
+					}
+				} else {
+					value
+				}
+			})
+			.collect()
+	}
+	#[cfg(test)]
+	pub(crate) fn pause_startup_cleanup(&self, pause: Arc<Notify>) {
+		*self.inner.startup_cleanup_pause.lock().unwrap() = Some(pause);
+	}
+	#[cfg(test)]
+	pub(crate) fn latest_startup_cleanup(&self) -> Option<Arc<StartupCleanupSlot>> {
+		self.inner.startup_cleanups.lock().unwrap().last().cloned()
+	}
+
 	/// Record that this run, which started after an unclean shutdown, finished
 	/// its recovery validation, so a complete close may mark the directory clean.
 	pub fn mark_recovery_complete(&self) {
@@ -268,6 +520,7 @@ impl DataDirectoryOwner {
 	/// Timeout/failure leaves the descriptor held and admission closed. Repeating
 	/// close resumes the same joins; cancellation never treats a live join as done.
 	pub async fn close(&self, bound: Duration) -> std::io::Result<()> {
+		self.begin_close();
 		let _close = self.inner.close_gate.lock().await;
 		let result = tokio::time::timeout(bound, async {
 			{
@@ -283,7 +536,7 @@ impl DataDirectoryOwner {
 				let notified = self.inner.drained.notified();
 				tokio::pin!(notified);
 				notified.as_mut().enable();
-				if self.inner.state.lock().unwrap().outstanding == 0 {
+				if { let state = self.inner.state.lock().unwrap(); state.outstanding == 0 && state.startup_barriers == 0 } {
 					break;
 				}
 				notified.await;
@@ -298,6 +551,8 @@ impl DataDirectoryOwner {
 			if let Some(error) = first_error {
 				return Err(error);
 			}
+			let mut state = self.inner.state.lock().unwrap();
+			assert_eq!(state.startup_barriers, 0, "startup drain bypassed");
 			// Every writer has stopped. Record that before releasing the lock so
 			// the next owner can tell a complete shutdown from a crash or kill.
 			// Failure only costs the next boot a recovery pass.
@@ -309,7 +564,6 @@ impl DataDirectoryOwner {
 			} else if let Err(error) = write_clean_shutdown_record(self.path()) {
 				tracing::warn!(%error, path = %self.path().display(), "clean-shutdown record not written; next start will recover");
 			}
-			let mut state = self.inner.state.lock().unwrap();
 			state.lock.take();
 			state.phase = OwnerPhase::Closed;
 			state.closing_pin.take();
@@ -513,11 +767,15 @@ fn acquire_lock(canonical: PathBuf) -> std::io::Result<DataDirectoryOwner> {
 				phase: OwnerPhase::Active,
 				lock: Some(file),
 				outstanding: 0,
+				startup_barriers: 0,
 				workers: Vec::new(),
 				closing_pin: None,
 			}),
 			drained: Notify::new(),
 			close_gate: tokio::sync::Mutex::new(()),
+			startup_cleanups: Mutex::new(Vec::new()),
+			#[cfg(test)]
+			startup_cleanup_pause: Mutex::new(None),
 		}),
 	})
 }
@@ -935,5 +1193,146 @@ mod tests {
 
 		let after_crash = DataDirectoryOwner::acquire_existing(dir.path()).unwrap();
 		assert!(!after_crash.previous_shutdown_clean());
+	}
+}
+
+#[cfg(test)]
+mod startup_drain_tests {
+	use super::*;
+	fn directory() -> crate::test_support::TestDir {
+		crate::test_support::TestDir::new("startup-drain")
+	}
+	fn incomplete(error: &Error) -> bool {
+		error
+			.get_ref()
+			.is_some_and(|e| e.is::<ShutdownIncomplete>())
+	}
+	#[tokio::test]
+	async fn reserved_startup_drain_excludes_external_close_until_actual_completion() {
+		let dir = directory();
+		let owner = DataDirectoryOwner::acquire_existing(&dir).unwrap();
+		let token = owner.reserve_startup_drain().unwrap();
+		assert!(owner.write_permit().is_ok());
+		let error = owner.close(Duration::from_millis(20)).await.unwrap_err();
+		assert!(incomplete(&error));
+		assert!(owner.write_permit().is_err());
+		assert!(DataDirectoryOwner::acquire_existing(&dir).is_err());
+		assert!(
+			owner.reserve_startup_drain().is_err(),
+			"Closing excludes new reservations"
+		);
+		token.complete_cleanup();
+		owner.close(Duration::from_secs(5)).await.unwrap();
+		let reopened = DataDirectoryOwner::acquire_existing(&dir).unwrap();
+		reopened.close(Duration::from_secs(5)).await.unwrap();
+	}
+	#[tokio::test]
+	async fn successful_startup_handoff_preserves_admission_and_normal_close() {
+		let dir = directory();
+		let owner = DataDirectoryOwner::acquire_existing(&dir).unwrap();
+		owner
+			.reserve_startup_drain()
+			.unwrap()
+			.release_after_handoff();
+		assert!(owner.write_permit().is_ok());
+		owner.close(Duration::from_secs(5)).await.unwrap();
+		assert!(
+			owner.reserve_startup_drain().is_err(),
+			"Closed excludes late reservations"
+		);
+	}
+	#[tokio::test]
+	async fn cancelled_cleanup_observer_retains_worker_and_reserved_drain() {
+		let dir = directory();
+		let owner = DataDirectoryOwner::acquire_existing(&dir).unwrap();
+		let token = owner.reserve_startup_drain().unwrap();
+		owner.begin_close();
+		let (release, wait) = tokio::sync::oneshot::channel();
+		let cleanup_owner = owner.clone();
+		let slot = owner.track_startup_cleanup(
+			async move {
+				let _ = wait.await;
+				token.complete_cleanup();
+				cleanup_owner.close(Duration::from_secs(5)).await
+			},
+			Duration::from_millis(30),
+			"cancelled observer control".into(),
+			Arc::new(Mutex::new("parked fixture joins")),
+			tokio::runtime::Handle::current(),
+		);
+		let mut observer = Box::pin(slot.wait());
+		use std::future::Future;
+		assert!(
+			observer
+				.as_mut()
+				.poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+				.is_pending()
+		);
+		drop(observer);
+		assert!(incomplete(
+			&owner.close(Duration::from_millis(20)).await.unwrap_err()
+		));
+		assert!(matches!(
+			slot.wait().await,
+			StartupCleanupStatus::PendingIncomplete(_)
+		));
+		assert!(DataDirectoryOwner::acquire_existing(&dir).is_err());
+		release.send(()).unwrap();
+		// A prior PendingIncomplete is a report, not loss of the running worker.
+		tokio::time::timeout(Duration::from_secs(5), async {
+			loop {
+				if matches!(*slot.status.borrow(), StartupCleanupStatus::Complete) {
+					break;
+				}
+				tokio::task::yield_now().await;
+			}
+		})
+		.await
+		.unwrap();
+		assert!(matches!(slot.wait().await, StartupCleanupStatus::Complete));
+		slot.join_finished().await;
+		let reopened = DataDirectoryOwner::acquire_existing(&dir).unwrap();
+		reopened.close(Duration::from_secs(5)).await.unwrap();
+	}
+	#[test]
+	fn abandoned_startup_drain_fails_closed_in_disposable_process() {
+		const CHILD: &str = "NILKET_STARTUP_DRAIN_CHILD";
+		if std::env::var_os(CHILD).is_some() {
+			let dir = directory();
+			let owner = DataDirectoryOwner::acquire_existing(&dir).unwrap();
+			drop(owner.reserve_startup_drain().unwrap());
+			assert!(owner.write_permit().is_err());
+			assert!(DataDirectoryOwner::acquire_existing(&dir).is_err());
+			let runtime = tokio::runtime::Builder::new_current_thread()
+				.enable_all()
+				.build()
+				.unwrap();
+			assert!(incomplete(
+				&runtime
+					.block_on(owner.close(Duration::from_millis(20)))
+					.unwrap_err()
+			));
+			runtime.block_on(async {
+				let (release, wait) = tokio::sync::oneshot::channel();
+				let slot = owner.track_startup_cleanup(async move { let _ = wait.await; panic!("cleanup panic after incomplete report"); }, Duration::from_millis(20), "panic report control".into(), Arc::new(Mutex::new("parked panic control")), tokio::runtime::Handle::current());
+				assert!(matches!(slot.wait().await, StartupCleanupStatus::PendingIncomplete(_)));
+				release.send(()).unwrap();
+				tokio::time::timeout(Duration::from_secs(5), async { loop {
+					if slot.handle.try_lock().ok().is_some_and(|h| h.as_ref().is_some_and(|task| task.is_finished())) { break; }
+					tokio::task::yield_now().await;
+				}}).await.unwrap();
+				assert!(matches!(owner.startup_cleanup_reports().last(), Some(StartupCleanupStatus::Failed { incomplete: true, .. })));
+				assert!(matches!(slot.wait().await, StartupCleanupStatus::Failed { incomplete: true, ref message, .. } if message.contains("cleanup panic after incomplete report")));
+				assert!(incomplete(&owner.close(Duration::from_millis(20)).await.unwrap_err()));
+			});
+			// Intentional retained pin belongs solely to this process, never parent.
+			return;
+		}
+		let output = std::process::Command::new(std::env::current_exe().unwrap()).env(CHILD, "1").arg("storage::ownership::startup_drain_tests::abandoned_startup_drain_fails_closed_in_disposable_process").arg("--exact").arg("--nocapture").output().unwrap();
+		assert!(
+			output.status.success(),
+			"child failed: {}",
+			String::from_utf8_lossy(&output.stderr)
+		);
 	}
 }
