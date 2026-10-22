@@ -16513,3 +16513,64 @@ mod counter_visibility_tests;
 
 #[path = "secondary_index_persist/tests.rs"]
 mod secondary_index_persist_tests;
+
+#[tokio::test]
+async fn pd22_corrupt_downgrade_survives_planning_and_real_backfill_repairs_load() {
+	let (dir, manager) = fresh_manager().await;
+	let table = secondary_index_table_descriptor_for_test();
+	let descriptor = secondary_index_descriptor_for_test();
+	append_secondary_index_table_row_for_test(&manager, &table, 1, Some(1), hlc(10)).await;
+	let source = manager.force_seal_active_for_test().await;
+	let info = manager
+		.backfill_secondary_index_source_slab(tenant(), &table, &descriptor, source)
+		.await
+		.unwrap();
+	let original = manager
+		.load_secondary_index_segment(&info)
+		.await
+		.unwrap()
+		.unwrap();
+	let mut identity = original.identity();
+	identity.logical_schema_fingerprint =
+		crate::schema::LogicalSchemaFingerprint::from_bytes([0xe7; 32]);
+	let wrong = SecondaryIndexSegment::build(
+		identity,
+		source,
+		original.header.table_schema_generation,
+		original.header.arrow_type_tag,
+		original.entries.clone(),
+	)
+	.unwrap();
+	std::fs::write(dir.join(&info.segment_path), wrong.encode().unwrap()).unwrap();
+	assert_eq!(
+		manager
+			.load_secondary_index_segment(&info)
+			.await
+			.unwrap_err()
+			.kind(),
+		ErrorKind::InvalidData
+	);
+	for _ in 0..2 {
+		let plan = manager
+			.ensure_secondary_index_coverage(tenant(), &descriptor, 4096)
+			.await
+			.unwrap();
+		assert!(
+			plan.candidates
+				.iter()
+				.any(|candidate| candidate.source_slab_id() == source),
+			"planner erased corruption downgrade"
+		);
+		assert!(!plan.snapshot.covered_slabs.contains(&source));
+	}
+	let report = manager
+		.run_secondary_index_backfill_once(tenant(), &table, &descriptor, 8, 4096)
+		.await
+		.unwrap();
+	assert!(report.failures.is_empty(), "{:?}", report.failures);
+	assert!(report.historical_complete);
+	assert_eq!(
+		manager.load_secondary_index_segment(&info).await.unwrap(),
+		Some(original)
+	);
+}

@@ -1096,3 +1096,91 @@ async fn pd22_hot_sidecar_loads_share_the_read_stripe() {
 	.expect("loads must finish while another reader retains the stripe");
 	drop(shared);
 }
+
+#[tokio::test]
+async fn pd22_equivalent_noncanonical_alias_deletion_preserves_a_referenced_file() {
+	for winner in 0..2 {
+		for removed in 0..2 {
+			for retire in [false, true] {
+				let dir = fresh_dir("pd22-legacy-alias");
+				let manager = open_manager_at_dir(
+					dir.to_path_buf(),
+					spawn_io_thread(64).unwrap(),
+					test_crypto(),
+				)
+				.await;
+				let (mut infos, segments) = pd22_legacy_alias_pair(&manager, &dir, winner).await;
+				let (parent, filename) = infos[1].segment_path.rsplit_once('/').unwrap();
+				infos[1].segment_path = format!("{parent}/./{filename}");
+				let row = PersistentSecondaryIndexSegmentRow::from(infos[1].clone());
+				manager
+					.persistent_index
+					.as_ref()
+					.unwrap()
+					.upsert_secondary_index_segment(row.clone())
+					.await
+					.unwrap();
+				manager.secondary_index_segments.insert(row.key, row);
+
+				assert!(
+					remove_sidecar(&manager, &infos[removed], retire)
+						.await
+						.unwrap()
+				);
+				let remains = 1 - removed;
+				assert!(
+					dir.join(&infos[remains].segment_path).exists(),
+					"a live legacy alias lost its file"
+				);
+				if remains == winner {
+					assert_eq!(
+						manager
+							.load_secondary_index_segment(&infos[remains])
+							.await
+							.unwrap(),
+						Some(segments[winner].clone())
+					);
+				} else {
+					assert_eq!(pd22_reason(&manager.load_secondary_index_segment(&infos[remains]).await.unwrap_err()), super::super::secondary_index_segments::SidecarDataErrorReason::IdentityMismatch);
+				}
+			}
+		}
+	}
+}
+
+#[tokio::test]
+async fn pd22_republish_legacy_row_reclaims_only_its_unreferenced_old_path() {
+	let dir = fresh_dir("pd22-legacy-republish");
+	let manager = open_manager_at_dir(
+		dir.to_path_buf(),
+		spawn_io_thread(64).unwrap(),
+		test_crypto(),
+	)
+	.await;
+	let (infos, segments) = pd22_legacy_alias_pair(&manager, &dir, 0).await;
+	let legacy_path = dir.join(&infos[0].segment_path);
+	let first = manager
+		.persist_secondary_index_segment(&segments[0])
+		.await
+		.unwrap();
+	assert!(
+		legacy_path.exists(),
+		"the other live alias still references the old path"
+	);
+	let second = manager
+		.persist_secondary_index_segment(&segments[1])
+		.await
+		.unwrap();
+	assert!(
+		!legacy_path.exists(),
+		"the final republish leaked an unreferenced legacy sidecar"
+	);
+	assert_eq!(
+		manager.load_secondary_index_segment(&first).await.unwrap(),
+		Some(segments[0].clone())
+	);
+	assert_eq!(
+		manager.load_secondary_index_segment(&second).await.unwrap(),
+		Some(segments[1].clone())
+	);
+}
