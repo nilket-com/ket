@@ -266,7 +266,7 @@ impl StartupCleanupSlot {
 				result = task => {
 					handle.take();
 					if let Err(error) = result {
-						self.status.send_replace(StartupCleanupStatus::Failed { kind: ErrorKind::Other, message: format!("startup cleanup task failed: {error}"), incomplete: true, outstanding: None });
+						self.status.send_replace(StartupCleanupStatus::Failed { kind: ErrorKind::Other, message: format!("{}: startup cleanup task failed: {error}", self.context), incomplete: true, outstanding: None });
 					}
 				},
 				changed = status.changed() => if changed.is_err() { return StartupCleanupStatus::PendingIncomplete("cleanup status closed".into()); }
@@ -372,7 +372,7 @@ impl DataDirectoryOwner {
 				Err(error) => {
 					let incomplete = error.get_ref().and_then(|source| source.downcast_ref::<ShutdownIncomplete>());
 					let outstanding = incomplete.map(|error| error.outstanding);
-					let mut message = error.to_string();
+					let mut message = format!("{}: {error}", worker_slot.context);
 					let mut cause = std::error::Error::source(&error);
 					while let Some(source) = cause { message.push_str(": "); message.push_str(&source.to_string()); cause = source.source(); }
 					StartupCleanupStatus::Failed { kind: error.kind(), message, incomplete: incomplete.is_some(), outstanding }
