@@ -6,8 +6,9 @@ usage() {
 Usage: scripts/cargo-cgroup <cargo-subcommand> [cargo-args...]
 
 Runs cargo inside a constrained user cgroup scope, with CPU affinity,
-low IO priority, bounded build parallelism, and 1024 Rust test threads by
-default: test concurrency is maximised while the cpuset and quota bound CPU.
+low IO priority, bounded build parallelism, and one Rust test thread by
+default during the adoption hold. Opt in to 1024 test threads explicitly with
+CARGO_CGROUP_RUST_TEST_THREADS=1024; the cpuset and quota bound CPU.
 Lockup protection is the cpuset + quota + nice + ionice, not the job count:
 within a bounded cpuset, parallel jobs contend inside the cage rather than
 starving the machine. Build parallelism is therefore bounded by MEMORY_MAX
@@ -47,7 +48,7 @@ Environment overrides:
   CARGO_CGROUP_IO_WEIGHT=10
   CARGO_CGROUP_NICE=19
   CARGO_CGROUP_JOBS=6
-  CARGO_CGROUP_RUST_TEST_THREADS=1024
+  CARGO_CGROUP_RUST_TEST_THREADS=<count>  # default 1; explicit 1024 opt-in
   CARGO_CGROUP_RUST_MIN_STACK=67108864
   CARGO_CGROUP_IMAGE=rust:1
   CARGO_CGROUP_ALLOW_AFFINITY_ONLY=0
@@ -57,12 +58,14 @@ Examples:
   scripts/cargo-cgroup check -p wendelon --all-targets
   CARGO_CGROUP_CPUS=0-7,16-23 scripts/cargo-cgroup test -p wendelon --lib
 
-Test parallelism: tests run concurrently by default. Only noise-sensitive
+Test parallelism target: tests run concurrently after the separate default-flip
+cut passes its adoption gate. Until then the wrapper default remains 1.
+Only noise-sensitive
 tests (timing, benchmark, perf gate) run alone, in a dedicated lane of at most
 2 CPUs, listed in nilket/.config/serial-allowlist.txt. Tests that share a named
 resource (a port, a global, a file) take a narrow lock around it, with the
 reason in a comment beside the lock; such locks are not allowlisted. Never
-lower this default instead. See nilket/plans/ops/test_parallelism.md.
+lower concurrency instead of fixing a defect. See nilket/plans/ops/test_parallelism.md.
 
 Containerd backend:
   CARGO_CGROUP_BACKEND=nerdctl scripts/cargo-cgroup test -p toron
@@ -158,7 +161,7 @@ jobs="${CARGO_CGROUP_JOBS:-6}"
 # Maximise test concurrency: libtest runs up to this many tests of a binary at
 # once. CPU is bounded by the cpuset and quota, not by this count, so tests
 # oversubscribe threads rather than cores. See nilket/plans/ops/test_parallelism.md.
-test_threads="${CARGO_CGROUP_RUST_TEST_THREADS:-1024}"
+test_threads="${CARGO_CGROUP_RUST_TEST_THREADS:-1}"
 # Deep-recursion targets overflow the default 8 MiB test-thread stack and abort
 # the process. An aborted target prints no result line, so a receipt that sums
 # reported failures reads clean while that target's remaining tests silently

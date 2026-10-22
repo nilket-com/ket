@@ -1,7 +1,7 @@
 //! Repo-wide pins for `nilket/plans/ops/test_parallelism.md`.
 //!
-//! Tests run concurrently by default (cargo-cgroup exports 1024 test threads;
-//! the cpuset bounds CPU). Serial execution is narrow, reasoned and listed in
+//! The target default follows the cpuset CPU count, with an explicit 1024 stress
+//! lane. During the adoption hold the wrapper defaults to 1. Serial settings are in
 //! `nilket/.config/serial-allowlist.txt`. One phrase for an execution model is
 //! banned outright because it hides what is meant. Every pin below has a probe
 //! or negative control, so a matcher that silently matches nothing fails.
@@ -459,6 +459,8 @@ enum SerialScope {
 	/// A comment or `#[ignore]` reason in a Rust source that documents how to
 	/// run one measurement; it executes nothing.
 	Doc,
+	/// Temporary wrapper default until the separately gated adoption cut.
+	AdoptionGate,
 }
 
 #[derive(Debug)]
@@ -468,7 +470,7 @@ struct AllowEntry {
 }
 
 /// Each allowlist line: `path<TAB>exact line, trimmed<TAB>scope<TAB>reason`,
-/// where scope is `lane:1`, `lane:2`, `test-group` or `doc`.
+/// where scope is `lane:1`, `lane:2`, `test-group`, `doc` or `adoption-gate`.
 fn parse_allowlist(text: &str) -> BTreeMap<(String, String), AllowEntry> {
 	let mut entries: BTreeMap<(String, String), AllowEntry> = BTreeMap::new();
 	for (number, raw) in text.lines().enumerate() {
@@ -487,6 +489,7 @@ fn parse_allowlist(text: &str) -> BTreeMap<(String, String), AllowEntry> {
 			"lane:2" => SerialScope::Lane(2),
 			"test-group" => SerialScope::TestGroup,
 			"doc" => SerialScope::Doc,
+			"adoption-gate" => SerialScope::AdoptionGate,
 			other => panic!(
 				"{ALLOWLIST}:{at}: scope `{other}` is not lane:1, lane:2, test-group or doc; \
 				 a serial setting never holds a lane of more than 2 CPUs"
@@ -584,6 +587,18 @@ fn rust_doc_code_lines(text: &str) -> std::collections::BTreeSet<String> {
 /// says whether it sits in a doctest code block.
 fn scope_problems(file: &str, line: &str, scope: &SerialScope, doc_code: bool) -> Vec<String> {
 	match scope {
+		SerialScope::AdoptionGate => {
+			if file == CARGO_CGROUP
+				&& line == "test_threads=\"${CARGO_CGROUP_RUST_TEST_THREADS:-1}\""
+				&& !doc_code
+			{
+				Vec::new()
+			} else {
+				vec![format!(
+					"{file}: `{line}` is not the exact temporary wrapper default"
+				)]
+			}
+		}
 		SerialScope::TestGroup => {
 			if file.ends_with("nextest.toml")
 				&& (line.contains("max-threads") || line.contains("threads-required"))
@@ -689,6 +704,22 @@ fn allowlist_parser_and_lane_rule_probe() {
 }
 
 #[test]
+fn temporary_adoption_scope_permits_only_the_exact_wrapper_default() {
+	// The live-file scan rejects this as a stale allowlist entry after a flip;
+	// remove the exception in the separately reviewed default-flip cut.
+	let line = "test_threads=\"${CARGO_CGROUP_RUST_TEST_THREADS:-1}\"";
+	assert!(scope_problems(CARGO_CGROUP, line, &SerialScope::AdoptionGate, false).is_empty());
+	for (path, setting, doc) in [
+		("ci/x.sh", line, false),
+		(CARGO_CGROUP, "cargo test -- --test-threads=1", false),
+		(CARGO_CGROUP, "test_threads=1", false),
+		(CARGO_CGROUP, line, true),
+	] {
+		assert!(!scope_problems(path, setting, &SerialScope::AdoptionGate, doc).is_empty());
+	}
+}
+
+#[test]
 fn serial_settings_are_exactly_the_allowlist_and_sit_in_small_lanes() {
 	let root = ket_root();
 	let allowlist = parse_allowlist(
@@ -752,7 +783,7 @@ fn serial_settings_are_exactly_the_allowlist_and_sit_in_small_lanes() {
 fn cargo_cgroup_default_expressions_are_pinned() {
 	let script = read_text(&ket_root(), CARGO_CGROUP).expect("read cargo-cgroup");
 	for expected in [
-		"test_threads=\"${CARGO_CGROUP_RUST_TEST_THREADS:-1024}\"",
+		"test_threads=\"${CARGO_CGROUP_RUST_TEST_THREADS:-1}\"",
 		"memory_high_cfg=\"${CARGO_CGROUP_MEMORY_HIGH:-28G}\"",
 		"memory_max_cfg=\"${CARGO_CGROUP_MEMORY_MAX:-32G}\"",
 		"slice=\"${CARGO_CGROUP_SLICE:-cargo-cgroup.slice}\"",
@@ -805,7 +836,7 @@ fn cargo_cgroup_systemd_resource_test_passes() {
 		"PASS: host-aware slice and invocation memory, nofile minimum, signal stops the unit",
 		"PASS: the slice limit is never lowered under a running session",
 		"PASS: a RuntimeMaxSec stop is reported with rc 124",
-		"PASS: default test threads are 1024 and the override is validated",
+		"PASS: default test threads are 1 and the override is validated",
 		"PASS: systemd environment allowlist",
 	] {
 		assert!(stdout.contains(pass), "missing `{pass}` in: {stdout}");
@@ -843,8 +874,12 @@ fn probe_test_threads(overrides: &[(&str, &str)]) -> (Option<i32>, String) {
 }
 
 #[test]
-fn cargo_cgroup_delivers_1024_test_threads_and_honours_the_override() {
-	assert_eq!(probe_test_threads(&[]), (Some(0), "1024".to_string()));
+fn cargo_cgroup_retains_default_one_and_honours_explicit_concurrency() {
+	assert_eq!(probe_test_threads(&[]), (Some(0), "1".to_string()));
+	assert_eq!(
+		probe_test_threads(&[("CARGO_CGROUP_RUST_TEST_THREADS", "1024")]),
+		(Some(0), "1024".to_string())
+	);
 	assert_eq!(
 		probe_test_threads(&[("CARGO_CGROUP_RUST_TEST_THREADS", "7")]),
 		(Some(0), "7".to_string())
