@@ -31,7 +31,9 @@ use std::thread;
 use tokio::sync::{mpsc, oneshot};
 
 mod lifetime;
-use lifetime::{InFlightRequests, cancel_outstanding, fail_ring, retryable_enter_error};
+use lifetime::{
+	EnterBackoff, InFlightRequests, cancel_outstanding, fail_ring, pressure_enter_error,
+};
 
 /// Default SQ / CQ depth. Large enough to keep a PCIe 4/5 NVMe saturated.
 pub const DEFAULT_RING_DEPTH: u32 = 1024;
@@ -250,6 +252,7 @@ type ObservationCompletionGate = Arc<
 struct SubmitFault {
 	errno: i32,
 	repeats: usize,
+	observed: Option<Arc<std::sync::atomic::AtomicUsize>>,
 	entered: bool,
 	submitted: std::sync::mpsc::SyncSender<()>,
 	release: std::sync::mpsc::Receiver<()>,
@@ -520,8 +523,7 @@ fn io_thread_loop(
 ) {
 	let mut cookie: u64 = 1;
 	let mut in_flight = InFlightRequests::default();
-	let mut enter_retries = 0usize;
-	const MAX_ENTER_RETRIES: usize = 64;
+	let mut enter_backoff = EnterBackoff::default();
 
 	loop {
 		// 1. Block when idle. Shutdown signalled by channel close.
@@ -543,7 +545,7 @@ fn io_thread_loop(
 		}
 
 		// 2. Stop adding work while recovering from an enter error.
-		while enter_retries == 0 {
+		while !enter_backoff.is_retrying() {
 			if ring.submission().is_full() {
 				break;
 			}
@@ -574,35 +576,54 @@ fn io_thread_loop(
 		);
 		let _enter = span.enter();
 
-		// 3. Submit + wait for at least one completion.
-		match submit_and_wait(
+		// 3. Submit + wait for at least one completion. Signals are not
+		// resource pressure: retry EINTR immediately, without a delay/budget.
+		let mut retry_delay = None;
+		let terminal = match submit_and_wait(
 			&ring,
 			#[cfg(test)]
 			&submit_fault,
 		) {
-			Ok(_) => enter_retries = 0,
-			// An enter error is not a CQE. Reap anything already completed
-			// below, then retry with every other request's resources intact.
-			Err(e) if retryable_enter_error(&e) && enter_retries < MAX_ENTER_RETRIES => {
-				metrics().observe_io_uring_error(class, "submit", e.raw_os_error().unwrap());
-				enter_retries += 1;
+			Ok(_) => {
+				enter_backoff.reset();
+				None
 			}
-			Err(e) => {
-				// Stop admission and prove cancellation before releasing resources.
-				// If that proof fails, fail_ring quarantines them until process exit.
-				rx.close();
-				let errno = e.raw_os_error().unwrap_or(5);
-				metrics().observe_io_uring_error(class, "submit", errno);
-				tracing::warn!(
-					class = class.as_str(),
-					op = "submit",
-					errno,
-					"io_uring submit_and_wait failed"
-				);
-				fail_ring(ring, in_flight, class, &e, |ring| cancel_outstanding(ring));
-				metrics().set_io_uring_completion_queue_depth(class, 0);
-				return;
+			Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+				// EINTR interrupts the GETEVENTS wait, not allocation of SQEs.
+				enter_backoff.reset();
+				None
 			}
+			Err(error) if pressure_enter_error(&error) => {
+				retry_delay = enter_backoff.pressure_delay(std::time::Instant::now());
+				if retry_delay.is_some() {
+					metrics().observe_io_uring_error(
+						class,
+						"submit",
+						error.raw_os_error().unwrap(),
+					);
+					None
+				} else {
+					Some(error)
+				}
+			}
+			Err(error) => Some(error),
+		};
+		if let Some(error) = terminal {
+			// Stop admission; release resources only for CQEs cancellation proves.
+			rx.close();
+			let errno = error.raw_os_error().unwrap_or(libc::EIO);
+			metrics().observe_io_uring_error(class, "submit", errno);
+			tracing::warn!(
+				class = class.as_str(),
+				op = "submit",
+				errno,
+				"io_uring submit_and_wait failed"
+			);
+			fail_ring(ring, in_flight, class, &error, |ring| {
+				cancel_outstanding(ring)
+			});
+			metrics().set_io_uring_completion_queue_depth(class, 0);
+			return;
 		}
 
 		// 4. Reap CQEs.
@@ -642,15 +663,13 @@ fn io_thread_loop(
 		metrics().set_io_uring_completion_queue_depth(class, in_flight.len() as u64);
 
 		drop(cq);
-		if enter_retries != 0 {
-			if cq_ready != 0 {
-				enter_retries = 0;
-			} else {
-				// EAGAIN can mean no SQE was consumed, so a wait-only enter
-				// could block forever. Back off after reaping, and exhaust a
-				// finite retry budget before safe cancellation/quarantine.
-				std::thread::sleep(std::time::Duration::from_millis(1));
-			}
+		if cq_ready != 0 {
+			enter_backoff.reset();
+		} else if let Some(delay) = retry_delay {
+			// EAGAIN may leave every SQE unconsumed, so waiting only for a
+			// CQE could hang. Reap first, then back off within the elapsed
+			// pressure budget. No new SQEs enter until progress resumes.
+			std::thread::sleep(delay);
 		}
 
 		// If the channel is closed and nothing remains in flight, exit.
@@ -664,19 +683,22 @@ fn io_thread_loop(
 fn submit_and_wait(ring: &IoUring, #[cfg(test)] fault: &SubmitFaultSlot) -> std::io::Result<usize> {
 	#[cfg(test)]
 	{
-		let mut slot = fault.lock().unwrap();
-		if let Some(mut fault) = slot.take() {
-			if !fault.entered {
-				// Submit real pending work, then gate the first injected error.
+		let injected = fault.lock().unwrap().take();
+		if let Some(mut injected) = injected {
+			if !injected.entered {
+				// Submit real pending work before the first injected wait error.
 				ring.submit()?;
-				fault.submitted.send(()).unwrap();
-				fault.release.recv().unwrap();
-				fault.entered = true;
+				injected.submitted.send(()).unwrap();
+				injected.release.recv().unwrap();
+				injected.entered = true;
 			}
-			let errno = fault.errno;
-			if fault.repeats > 0 {
-				fault.repeats -= 1;
-				*slot = Some(fault);
+			let errno = injected.errno;
+			if let Some(count) = &injected.observed {
+				count.fetch_add(1, Ordering::SeqCst);
+			}
+			if injected.repeats > 0 {
+				injected.repeats -= 1;
+				*fault.lock().unwrap() = Some(injected);
 			}
 			return Err(std::io::Error::from_raw_os_error(errno));
 		}
