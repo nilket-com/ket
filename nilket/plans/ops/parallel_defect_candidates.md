@@ -554,7 +554,18 @@ control is reached. Product cleanup and watchdog behavior are unchanged.
 Evidence: `/home/me/work/reviews/cut-c-combined-diagnostic-20261022/` and
 `/home/me/work/reviews/cut-c-close-fixture-repair-20261022/`. Pairwise comparison
 B0+S1 (no E) passed its first 51-case run and ten additional 51-case in-process
-runs at 1024 threads. B0+E (no S1) first pass selected 36 cases and passed;
-its ten additional repetitions and the corrected full-cycle acceptance are
-pending. The original combined STOP remains retained; passing repetitions do
-not erase it. Final combined gate remains required.
+runs at 1024 threads. B0+E (no S1) passed its first 36-case run and ten additional
+36-case runs under the same conditions. Corrected B0 `d129ccce7` passed all 20
+focused tests, 182 architecture checks and formatting, followed by 30 process
+stress iterations (600 passes) and ten in-process iterations at 1024 threads
+(200 passes). Both deterministic branches occurred for error and panic in every
+iteration: held-worker timeout/resume and first-close success. The tolerant
+20 ms case took first-close success in all 80 stress observations; the forced
+timeout control separately proves the resume branch without relying on load.
+
+Combined `528baa33b` passed the 53-case union plus ten additional 53-case runs
+at 1024 threads, 38 config tests, 183 architecture checks and formatting.
+`stress-summary.json` records all branch tallies and exact source/executable
+identities. The original combined STOP remains retained; passing repetitions do
+not erase it. Final frozen combined checks and the main v4 plus actual root
+Polariton supplement remain required before publication.
