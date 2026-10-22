@@ -112,8 +112,10 @@ impl Guard {
 					progress,
 					runtime,
 				);
-				cleanup_result(&owner, &slot).await?;
-				Err(original)
+				Err(with_cleanup_context(
+					original,
+					cleanup_result(&owner, &slot).await,
+				))
 			}
 		}
 	}
@@ -142,10 +144,7 @@ impl Guard {
 		let Some((owner, slot)) = self.start_cleanup(original.to_string()) else {
 			return original;
 		};
-		match cleanup_result(&owner, &slot).await {
-			Ok(()) => original,
-			Err(error) => error,
-		}
+		with_cleanup_context(original, cleanup_result(&owner, &slot).await)
 	}
 	pub fn finish_success(mut self) -> Resources {
 		// No await or fallible construction between taking the real bundle and
@@ -163,6 +162,28 @@ impl Drop for Guard {
 		let _ = self.start_cleanup("bootstrap caller cancelled".into());
 	}
 }
+#[derive(Debug)]
+struct StartupFailure {
+	original: Error,
+	cleanup: Error,
+}
+impl std::fmt::Display for StartupFailure {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(f, "{}; startup cleanup: {}", self.original, self.cleanup)
+	}
+}
+impl std::error::Error for StartupFailure {
+	fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+		Some(&self.cleanup)
+	}
+}
+fn with_cleanup_context(original: Error, cleanup: std::io::Result<()>) -> Error {
+	match cleanup {
+		Ok(()) => original,
+		Err(cleanup) => Error::new(original.kind(), StartupFailure { original, cleanup }),
+	}
+}
+
 async fn cleanup_result(
 	owner: &DataDirectoryOwner,
 	slot: &StartupCleanupSlot,
@@ -208,6 +229,53 @@ mod tests {
 			}
 		}
 	}
+	#[tokio::test]
+	async fn failed_cleanup_keeps_original_startup_error_kind_and_both_causes() {
+		let dir = crate::test_support::TestDir::new("startup-error-kind");
+		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			7112,
+			dir.to_path_buf(),
+			"127.0.0.1:0".into(),
+		))
+		.await
+		.unwrap();
+		let panic_task = tokio::spawn(async {
+			panic!("startup cleanup producer panic");
+		});
+		while !panic_task.is_finished() {
+			tokio::task::yield_now().await;
+		}
+		let resources = Resources {
+			owner: node._directory_owner.clone(),
+			raft: node.raft.clone(),
+			lifecycle: node.lifecycle.clone(),
+			transports: Vec::new(),
+			tasks: Tasks {
+				ring_updater: panic_task,
+				drift_monitor: tokio::spawn(std::future::pending()),
+				audit_chain_root_rollup: tokio::spawn(std::future::pending()),
+				checkpoint_emitter: tokio::spawn(std::future::pending()),
+				epoch_reconciler: tokio::spawn(std::future::pending()),
+			},
+			bound: Duration::from_secs(5),
+			runtime: tokio::runtime::Handle::current(),
+		};
+		let guard = Guard::arm(resources).await.unwrap();
+		let error = guard
+			.fail(Error::new(ErrorKind::InvalidInput, "original JOIN refusal"))
+			.await;
+		let kind = error.kind();
+		let text = error.to_string();
+		let reports = node._directory_owner.startup_cleanup_reports();
+		node.shutdown().await.unwrap();
+		assert_eq!(kind, ErrorKind::InvalidInput, "{text}");
+		assert!(
+			text.contains("original JOIN refusal") && text.contains("ring updater task failed"),
+			"{text}"
+		);
+		assert!(reports.iter().any(|r| matches!(r, StartupCleanupStatus::Failed { message, .. } if message.contains("original JOIN refusal") && message.contains("ring updater task failed"))), "{reports:?}");
+	}
+
 	#[test]
 	fn actual_cleanup_joins_blocked_and_panicked_tasks_preserving_storage_error() {
 		const CHILD: &str = "NILKET_STARTUP_RESOURCE_CHILD";
