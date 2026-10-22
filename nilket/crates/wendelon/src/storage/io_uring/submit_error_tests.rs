@@ -134,6 +134,26 @@ fn pending_read(
 	}
 }
 
+fn sync_cancel_supported() -> bool {
+	let ring = IoUring::new(2).unwrap();
+	match ring.submitter().register_sync_cancel(
+		Some(types::Timespec::from(Duration::from_secs(1))),
+		types::CancelBuilder::any(),
+	) {
+		Ok(()) => true,
+		Err(error) if error.raw_os_error() == Some(libc::ENOENT) => true,
+		Err(error)
+			if matches!(
+				error.raw_os_error(),
+				Some(libc::EINVAL | libc::EOPNOTSUPP | libc::ENOSYS)
+			) =>
+		{
+			false
+		}
+		Err(error) => panic!("unexpected sync-cancel support probe error: {error}"),
+	}
+}
+
 #[tokio::test]
 async fn fatal_enter_cancels_before_returning_buffers_and_releasing_owner() {
 	if !quarantine_child(
@@ -146,6 +166,7 @@ async fn fatal_enter_cancels_before_returning_buffers_and_releasing_owner() {
 	) {
 		return;
 	}
+	let supports_cancel = sync_cancel_supported();
 	let dir = crate::test_support::TestDir::new("uring-fatal-cancel");
 	let owner = DataDirectoryOwner::acquire_existing(&dir).unwrap();
 	let registry = FinalityObservationRegistry::new();
@@ -173,6 +194,10 @@ async fn fatal_enter_cancels_before_returning_buffers_and_releasing_owner() {
 	let completion = reply.await.unwrap();
 	assert_eq!(completion.result, -libc::EIO);
 	assert!(!buffer_dropped.load(Ordering::Acquire));
+	assert!(
+		!supports_cancel || completion.buf.is_some(),
+		"supported sync cancellation did not return the completed read buffer"
+	);
 	if completion.buf.is_some() {
 		drop(completion);
 		assert!(buffer_dropped.load(Ordering::Acquire));
