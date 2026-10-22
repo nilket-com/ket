@@ -528,3 +528,33 @@ Both original STOPs, all diagnostic variants and the pinned failing control are
 retained. The source and classification were cleared by Claude; final combined
 Cut C gate/main-plus-root-supplement acceptance remains pending. The wrapper
 default remains1, and every broader PD/adoption/activation hold remains in force.
+
+### PD-25 combined Cut C storage-close fixture correction (2026-10-22)
+
+The exact combined candidate `40cc57bbcc540bb0dc4427b00edb90240e0607f5`
+failed the slow partial-publication fixture after foreign withdrawal was released.
+The retained diagnostic repeat 06 captured `stage=storage close`, trusted joins
+complete, no live producer handles, registration removed, and a completed cleanup
+slot reporting typed `TimedOut` / `ShutdownIncomplete` with zero outstanding
+writes. This is a captured fixture assumption: its deliberate 20 ms storage close
+expired correctly and retained LOCK, while the test wrongly waited for automatic
+retry. It is not evidence of a PD-22 stripe deadlock. Chief classification and
+fixture-only repair agreement: chatd `01a1653c-289b-7197-be83-a57a9a867f16`.
+
+The corrected fixture preserves 20 ms, joins the actual cleanup slot, accepts only
+certified completion or that exact typed storage-close timeout, and checks closed
+admission, retained LOCK, and absent CLEAN_SHUTDOWN before explicitly resuming
+close. A held actual StorageWorker deterministically forces the timeout branch;
+a separate realistic-bound control requires first-attempt certification without
+resume. Both run error and panic publication and report their chosen branch.
+The worker is inserted first through a cfg(test)-only registration helper so
+unrelated filesystem closers cannot consume the tiny budget before the causal
+control is reached. Product cleanup and watchdog behavior are unchanged.
+
+Evidence: `/home/me/work/reviews/cut-c-combined-diagnostic-20261022/` and
+`/home/me/work/reviews/cut-c-close-fixture-repair-20261022/`. Pairwise comparison
+B0+S1 (no E) passed its first 51-case run and ten additional 51-case in-process
+runs at 1024 threads. B0+E (no S1) first pass selected 36 cases and passed;
+its ten additional repetitions and the corrected full-cycle acceptance are
+pending. The original combined STOP remains retained; passing repetitions do
+not erase it. Final combined gate remains required.

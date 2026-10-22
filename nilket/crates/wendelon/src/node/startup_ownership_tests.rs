@@ -10,6 +10,7 @@ pub(crate) struct StartupProbe(
 	Option<Arc<Notify>>,
 	bool,
 	Option<Duration>,
+	Option<Arc<ControlledStartupClose>>,
 );
 impl std::fmt::Debug for StartupProbe {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -45,6 +46,11 @@ impl StartupProbe {
 			slab.directory_owner()
 				.expect("owned startup fixture")
 				.pause_startup_cleanup(pause.clone());
+		}
+		if let Some(worker) = &self.4 {
+			slab.directory_owner()
+				.unwrap()
+				.register_first_test_worker(worker.clone());
 		}
 		*self.0.lock().unwrap() = Some(Observation {
 			owner: slab.directory_owner().expect("owned probe"),
@@ -1040,13 +1046,52 @@ impl TransportProvider for SlowPartialPublish {
 		Ok(())
 	}
 }
+#[derive(Default)]
+struct ControlledStartupClose {
+	entered: std::sync::atomic::AtomicBool,
+	released: std::sync::atomic::AtomicBool,
+	changed: Notify,
+}
+#[async_trait]
+impl crate::storage::ownership::StorageWorker for ControlledStartupClose {
+	async fn close_and_join(&self) -> std::io::Result<()> {
+		self.entered
+			.store(true, std::sync::atomic::Ordering::Release);
+		loop {
+			let changed = self.changed.notified();
+			tokio::pin!(changed);
+			changed.as_mut().enable();
+			if self.released.load(std::sync::atomic::Ordering::Acquire) {
+				return Ok(());
+			}
+			changed.await;
+		}
+	}
+}
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pd25_slow_partial_publish_withdrawal_keeps_lock_but_not_trusted_workers() {
+	slow_partial_publish_close(false, false).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pd25_partial_publish_storage_timeout_retains_lock_until_explicit_resume() {
+	slow_partial_publish_close(true, false).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pd25_partial_publish_first_storage_close_certifies_without_resume() {
+	slow_partial_publish_close(false, true).await;
+}
+async fn slow_partial_publish_close(held_worker: bool, first_close_control: bool) {
 	for panic_publish in [false, true] {
 		let dir = crate::test_support::TestDir::new("pd25-slow-partial");
 		let mut cfg = NodeBootstrapConfig::dev(7133, dir.to_path_buf(), "127.0.0.1:0".into());
-		cfg.storage_shutdown_timeout = Duration::from_millis(20);
-		let probe = StartupProbe::default();
+		cfg.storage_shutdown_timeout = if first_close_control {
+			Duration::from_secs(10)
+		} else {
+			Duration::from_millis(20)
+		};
+		let mut probe = StartupProbe::default();
+		let worker = held_worker.then(|| Arc::new(ControlledStartupClose::default()));
+		probe.4 = worker.clone();
 		cfg.startup_probe = Some(probe.clone());
 		let provider = Arc::new(SlowPartialPublish {
 			registration: StdMutex::new(None),
@@ -1059,7 +1104,17 @@ async fn pd25_slow_partial_publish_withdrawal_keeps_lock_but_not_trusted_workers
 			.await
 			.unwrap();
 		// Always release the foreign callback even when a regression fails an oracle.
-		let outcome = tokio::time::timeout(Duration::from_secs(10), &mut task).await;
+		// A short observer budget never changes the storage close budget.
+		// The first-close control releases withdrawal before waiting for bootstrap.
+		let outcome = if first_close_control {
+			None
+		} else {
+			Some(
+				tokio::time::timeout(Duration::from_secs(10), &mut task)
+					.await
+					.unwrap(),
+			)
+		};
 		let observation = probe.0.lock().unwrap().take().unwrap();
 		let slot = observation.owner.latest_startup_cleanup().unwrap();
 		// A live API request can remain pending during Raft shutdown even after
@@ -1081,18 +1136,78 @@ async fn pd25_slow_partial_publish_withdrawal_keeps_lock_but_not_trusted_workers
 			.is_err();
 		*provider.release.0.lock().unwrap() = true;
 		provider.release.1.notify_all();
-		tokio::time::timeout(Duration::from_secs(10), async {
-			while !observation
+		tokio::time::timeout(Duration::from_secs(10), slot.join_finished())
+			.await
+			.unwrap();
+		assert!(provider.registration.lock().unwrap().is_none());
+		let report = slot.wait().await;
+		let resumed = match report {
+			crate::storage::ownership::StartupCleanupStatus::Complete => {
+				assert!(
+					!held_worker,
+					"held worker must deterministically prevent first close"
+				);
+				assert!(
+					observation
+						.owner
+						.closed_signal()
+						.load(std::sync::atomic::Ordering::Acquire)
+				);
+				false
+			}
+			crate::storage::ownership::StartupCleanupStatus::Failed {
+				kind: ErrorKind::TimedOut,
+				incomplete: true,
+				outstanding: Some(0),
+				..
+			} if !first_close_control && slot.current_stage() == "storage close" => {
+				assert!(observation.owner.write_permit().is_err());
+				assert!(DataDirectoryOwner::acquire_existing(&dir).is_err());
+				assert!(!dir.join("CLEAN_SHUTDOWN").exists());
+				assert!(
+					!observation
+						.owner
+						.closed_signal()
+						.load(std::sync::atomic::Ordering::Acquire)
+				);
+				if let Some(worker) = &worker {
+					assert!(worker.entered.load(std::sync::atomic::Ordering::Acquire));
+					assert!(!worker.released.load(std::sync::atomic::Ordering::Acquire));
+					worker
+						.released
+						.store(true, std::sync::atomic::Ordering::Release);
+					worker.changed.notify_waiters();
+				}
+				// close is resumable; a timed-out attempt never retries itself.
+				tokio::time::timeout(
+					Duration::from_secs(10),
+					observation.owner.close(Duration::from_secs(10)),
+				)
+				.await
+				.unwrap()
+				.unwrap();
+				true
+			}
+			other => panic!("unexpected cleanup result: {other:?}"),
+		};
+		println!(
+			"PD25_CLOSE_BRANCH held_worker={held_worker} first_close_control={first_close_control} panic_publish={panic_publish} resumed={resumed}"
+		);
+		assert!(!held_worker || resumed);
+		assert!(!first_close_control || !resumed);
+		assert!(
+			observation
 				.owner
 				.closed_signal()
 				.load(std::sync::atomic::Ordering::Acquire)
-			{
-				tokio::task::yield_now().await;
-			}
-		})
-		.await
-		.unwrap();
-		slot.join_finished().await;
+		);
+		assert!(!dir.join("CLEAN_SHUTDOWN").exists());
+		let outcome = match outcome {
+			Some(outcome) => outcome,
+			None => tokio::time::timeout(Duration::from_secs(10), &mut task)
+				.await
+				.unwrap(),
+		};
 		assert!(trusted.unwrap() && write_closed && still_registered && busy && close_incomplete);
 		assert!(
 			tokio::time::timeout(Duration::from_secs(5), observation.raft.is_initialized())
@@ -1103,7 +1218,7 @@ async fn pd25_slow_partial_publish_withdrawal_keeps_lock_but_not_trusted_workers
 		);
 
 		assert!(provider.registration.lock().unwrap().is_none());
-		match outcome.unwrap() {
+		match outcome {
 			Err(error) if panic_publish => assert!(error.is_panic()),
 			Ok(Err(error)) if !panic_publish => {
 				assert_eq!(error.kind(), ErrorKind::ConnectionRefused)
