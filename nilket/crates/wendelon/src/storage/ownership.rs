@@ -551,6 +551,15 @@ impl DataDirectoryOwner {
 		Ok(())
 	}
 
+	// Deterministic timeout controls must reach their held worker before any
+	// filesystem closer can consume the deliberately tiny observation budget.
+	#[cfg(test)]
+	pub(crate) fn register_first_test_worker(&self, worker: Arc<dyn StorageWorker>) {
+		let mut state = self.inner.state.lock().unwrap();
+		assert!(state.phase == OwnerPhase::Active);
+		state.workers.insert(0, worker);
+	}
+
 	/// Reject new writes, drain admitted operations and join registered workers.
 	/// Timeout/failure leaves the descriptor held and admission closed. Repeating
 	/// close resumes the same joins; cancellation never treats a live join as done.
