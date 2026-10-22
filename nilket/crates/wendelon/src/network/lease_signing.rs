@@ -76,6 +76,9 @@ impl LeaseAuthority {
 	}
 }
 
+/// # Security
+/// These deterministic keys are publicly derivable. Use only in tests and
+/// local development; never provision a reachable node with them.
 pub fn dev_lease_signing_secret(node_id: u32) -> [u8; 32] {
 	crate::hash::sha256::digest(format!("wendelon-dev-lease-signing-key-{node_id}").as_bytes())
 }

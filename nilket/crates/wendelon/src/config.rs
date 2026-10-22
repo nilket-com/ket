@@ -11,8 +11,7 @@ use crate::metrics::telemetry::{
 	TRACE_SAMPLING_RATE_DENOMINATOR, TraceExportConfig, TraceExportProtocol,
 };
 use crate::network::{
-	ServerAdmissionConfig, audit_root_verifying_key_bytes, dev_audit_root_signing_secret,
-	dev_lease_signing_secret, dev_transfer_signing_secret, lease_verifying_key_bytes,
+	ServerAdmissionConfig, audit_root_verifying_key_bytes, lease_verifying_key_bytes,
 	transfer_verifying_key_bytes,
 };
 use crate::node::{
@@ -25,6 +24,7 @@ use crate::storage::{
 	EncodingWriterConfig, L2ChunkLayoutConfig, L2ColumnFetchConfig, L2EncodingFetchConfig,
 	L2RowGroupFetchConfig, MvccRetentionPolicy, RowGroupSizingProfile, RowGroupWriterConfig,
 };
+use rand::TryRng;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
@@ -52,14 +52,20 @@ pub fn load_node_bootstrap_config(path: impl AsRef<Path>) -> std::io::Result<Nod
 }
 
 /// Render a concrete starter `wendelon.toml` from the checked-in
-/// template. The generated file is valid for a single-node dev
+/// template. Each rendering provisions fresh OS-random signing keys and keeps
+/// deterministic dev keys disabled. The generated file is valid for a single-node dev
 /// bootstrap and can be edited in place by operators afterward.
 pub fn render_example_config() -> String {
 	let template = std::str::from_utf8(EXAMPLE_CONFIG_TEMPLATE)
 		.expect("example config template must be valid UTF-8");
-	let lease_secret = dev_lease_signing_secret(EXAMPLE_NODE_ID);
-	let transfer_secret = dev_transfer_signing_secret(EXAMPLE_NODE_ID);
-	let audit_secret = dev_audit_root_signing_secret(EXAMPLE_NODE_ID);
+	// Fail closed on entropy failure; never fall back to public deterministic keys.
+	let mut secrets = [[0u8; 32]; 3];
+	for secret in &mut secrets {
+		rand::rngs::SysRng
+			.try_fill_bytes(secret)
+			.expect("OS randomness for example signing secrets");
+	}
+	let [lease_secret, transfer_secret, audit_secret] = secrets;
 
 	template
 		.replace("{{NODE_ID}}", &EXAMPLE_NODE_ID.to_string())
@@ -146,7 +152,14 @@ fn toml_path(path: &Path) -> String {
 /// existing file.
 pub fn write_example_config(path: impl AsRef<Path>) -> std::io::Result<()> {
 	let path = path.as_ref();
-	let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+	let mut options = OpenOptions::new();
+	options.write(true).create_new(true);
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::OpenOptionsExt;
+		options.mode(0o600);
+	}
+	let mut file = options.open(path)?;
 	file.write_all(render_example_config().as_bytes())?;
 	file.flush()?;
 	Ok(())

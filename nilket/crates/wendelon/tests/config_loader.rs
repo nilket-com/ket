@@ -1940,7 +1940,7 @@ fn rendered_example_config_loads_after_writing() {
 
 	let cfg = load_node_bootstrap_config(&config_path).unwrap();
 	assert_eq!(cfg.node_id, 1);
-	assert!(cfg.allow_dev_keys);
+	assert!(!cfg.allow_dev_keys);
 	assert_eq!(cfg.data_dir, data_dir);
 	assert_eq!(cfg.advertise_address, "127.0.0.1:7001");
 	assert!(!cfg.lsm_compaction_paused);
@@ -1960,8 +1960,52 @@ fn write_example_config_refuses_to_overwrite() {
 	let config_path = root.join("wendelon.toml");
 
 	write_example_config(&config_path).unwrap();
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::PermissionsExt;
+		assert_eq!(
+			std::fs::metadata(&config_path)
+				.unwrap()
+				.permissions()
+				.mode() & 0o077,
+			0,
+			"fresh starter signing secrets must remain owner-private"
+		);
+	}
 	let err = write_example_config(&config_path).err().unwrap();
 	assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+}
+
+// Deliberately provision the unsafe keys only inside the refusal controls.
+// Production starter rendering must no longer provide these fixtures.
+fn deterministic_example_for_dev_key_controls() -> String {
+	let mut document: toml::Value = toml::from_str(&render_example_config()).unwrap();
+	let identity = document.get_mut("identity").unwrap();
+	identity["allow_dev_keys"] = toml::Value::Boolean(true);
+	for (secret_name, trust_name, secret, verifying) in [
+		(
+			"lease_signing_secret",
+			"trusted_lease_signers",
+			dev_lease_signing_secret(1),
+			lease_verifying_key_bytes(dev_lease_signing_secret(1)),
+		),
+		(
+			"transfer_signing_secret",
+			"trusted_transfer_signers",
+			dev_transfer_signing_secret(1),
+			transfer_verifying_key_bytes(dev_transfer_signing_secret(1)),
+		),
+		(
+			"audit_root_signing_secret",
+			"trusted_audit_root_keys",
+			dev_audit_root_signing_secret(1),
+			audit_root_verifying_key_bytes(dev_audit_root_signing_secret(1)),
+		),
+	] {
+		identity[secret_name] = toml::Value::String(hex(secret));
+		identity[trust_name]["1"] = toml::Value::String(hex(verifying));
+	}
+	toml::to_string(&document).unwrap()
 }
 
 #[test]
@@ -1969,7 +2013,7 @@ fn identity_toml_dev_keys_require_explicit_authorization() {
 	use wendelon::node::{IdentityKeyError, IdentityKeyRole};
 	let root = fresh_dir("identity-dev-authorization");
 	std::fs::create_dir_all(root.join("data")).unwrap();
-	let rendered = render_example_config();
+	let rendered = deterministic_example_for_dev_key_controls();
 	for flag in ["", "allow_dev_keys = false\n"] {
 		let body = rendered.replace("allow_dev_keys = true\n", flag);
 		let path = write_config(&root, &body);
@@ -1997,7 +2041,7 @@ fn identity_toml_peer_dev_key_is_refused_with_authorization_off() {
 	let lease_secret = [41; 32];
 	let transfer_secret = [42; 32];
 	let audit_secret = [43; 32];
-	let body = render_example_config()
+	let body = deterministic_example_for_dev_key_controls()
 		.replace("allow_dev_keys = true", "allow_dev_keys = false")
 		.replace(&hex(dev_lease_signing_secret(1)), &hex(lease_secret))
 		.replace(&hex(dev_transfer_signing_secret(1)), &hex(transfer_secret))
@@ -2067,7 +2111,10 @@ fn identity_audit_toml_requires_secret_and_trust_map() {
 	let root = fresh_dir("audit-required");
 	std::fs::create_dir_all(root.join("data")).unwrap();
 	let rendered = render_example_config();
-	let secret = hex(dev_audit_root_signing_secret(1));
+	let document: toml::Value = toml::from_str(&rendered).unwrap();
+	let secret = document["identity"]["audit_root_signing_secret"]
+		.as_str()
+		.unwrap();
 	let without_secret = rendered.replace(&format!("audit_root_signing_secret = \"{secret}\""), "");
 	assert!(load_node_bootstrap_config(write_config(&root, &without_secret)).is_err());
 	let without_map = rendered.replace(
@@ -2143,4 +2190,45 @@ fn out_of_range_counter_retention_is_refused_at_startup() {
 		render_example_config()
 	);
 	load_node_bootstrap_config(write_config(&root, &body)).unwrap();
+}
+
+#[test]
+fn example_signing_keys_are_fresh_independent_and_dev_keys_stay_disabled() {
+	let scratch = fresh_dir("fresh-example-signing-keys");
+	std::fs::create_dir_all(scratch.join("data")).unwrap();
+	let mut previous = Vec::new();
+	for iteration in 0..2 {
+		let path = scratch.join(format!("example-{iteration}.toml"));
+		std::fs::write(&path, render_example_config()).unwrap();
+		let cfg = load_node_bootstrap_config(&path).unwrap();
+		assert!(!cfg.allow_dev_keys);
+		let keys = [
+			cfg.lease_signing_secret,
+			cfg.transfer_signing_secret,
+			cfg.audit_root_signing_secret,
+		];
+		for key in keys {
+			assert_ne!(key, [0; 32]);
+			assert!(
+				!previous.contains(&key),
+				"a role or render reused a signing key"
+			);
+			assert_ne!(key, dev_lease_signing_secret(cfg.node_id));
+			assert_ne!(key, dev_transfer_signing_secret(cfg.node_id));
+			assert_ne!(key, dev_audit_root_signing_secret(cfg.node_id));
+			previous.push(key);
+		}
+		assert_eq!(
+			cfg.trusted_lease_signers[&cfg.node_id],
+			lease_verifying_key_bytes(cfg.lease_signing_secret)
+		);
+		assert_eq!(
+			cfg.trusted_transfer_signers[&cfg.node_id],
+			transfer_verifying_key_bytes(cfg.transfer_signing_secret)
+		);
+		assert_eq!(
+			cfg.trusted_audit_root_keys[&cfg.node_id],
+			audit_root_verifying_key_bytes(cfg.audit_root_signing_secret)
+		);
+	}
 }

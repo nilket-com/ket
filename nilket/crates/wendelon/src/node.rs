@@ -314,6 +314,9 @@ pub const DEFAULT_MVCC_RETENTION_POLICY: MvccRetentionPolicy =
 impl NodeBootstrapConfig {
 	/// Convenience for tests and dev deploys: tempdir-style data
 	/// dir, RF=1, modest WAL/slab `io_uring` depth, loopback address.
+	/// # Security
+	/// These deterministic keys are publicly derivable. Use only in tests and
+	/// local development; never provision a reachable node with them.
 	pub fn dev(node_id: u32, data_dir: PathBuf, advertise_address: String) -> Self {
 		let lease_signing_secret = dev_lease_signing_secret(node_id);
 		let mut trusted_lease_signers = BTreeMap::new();
