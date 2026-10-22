@@ -438,3 +438,12 @@ work rather than silently certifying it. It can leave an unreferenced legacy fil
 until an operator/census repair. Follow-up: distinguish publication success from
 post-commit reclamation debt in a typed outcome if that debt can be scheduled and
 observed durably (review N2). Neither note blocks the jointly reviewed source.
+
+
+### Security incident follow-up: eMudhra trust roots and starter signing keys
+
+- Advisory received by browser root programs: 2026-10-17 18:05 UTC ([Chrome primary report](https://blog.google/security/protecting-chrome-and-android-users-from-compromised-emudhra-intermediate-ca-certificates/)).
+- Nilket exposure identified: 2026-10-22, bundled PostgreSQL TLS roots retained emSign ECC Root CA - G3. [RUSTSEC-2026-0381](https://rustsec.org/advisories/RUSTSEC-2026-0381) / [0383](https://rustsec.org/advisories/RUSTSEC-2026-0383) require roots/root-certs >=1.0.10.
+- Cut C remediation prepared: both lockfiles update the two root bundles to 1.0.10, root absence regression; operator-facing starter keys use independent OS randomness with `allow_dev_keys=false` and consistent enrollment. Publication/fast-forward time: PENDING Cut C acceptance, not yet landed. Compute time-to-remediate from advisory, exposure detection, and actual publication separately.
+- Lockfile metadata also reconciles existing key-guard serde_json/zeroize dependency edges in the root workspace (no package version change); polariton adds explicit dev dependencies for the two root bundle regression checks.
+- Follow-up OPEN: gate deterministic `NodeBootstrapConfig::dev()` and `dev_*_signing_secret` behind test support after a complete integration-fixture caller/feature audit. This incident patch preserves the explicit in-code API; starter TOML never opts into those keys. Avoid globally forcing unrelated test-support behavior or dropping integration test names during that migration.
