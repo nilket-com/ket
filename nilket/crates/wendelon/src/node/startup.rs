@@ -281,7 +281,7 @@ impl StartupScope {
 
 	fn start_cleanup(
 		&mut self,
-		context: String,
+		mut context: String,
 	) -> Option<(DataDirectoryOwner, Arc<StartupCleanupSlot>)> {
 		let resources = self.resources.take()?;
 		let owner = resources.owner.clone();
@@ -289,8 +289,13 @@ impl StartupScope {
 		// Trusted fencing always happens first, including on unwind. No native
 		// thread creation, foreign callback, or fallible operation occurs in Drop.
 		resources.fence();
-		let watchdog = self.watchdog.take().expect("prepared before construction");
-		watchdog.start(resources.watchdog_deadline);
+		let watchdog = self.watchdog.take();
+		if let Some(watchdog) = &watchdog {
+			watchdog.start(resources.watchdog_deadline);
+		} else {
+			context.push_str("; watchdog unavailable");
+			tracing::error!("startup watchdog unavailable after trusted fence");
+		}
 		let bound = resources.bound;
 		let runtime = resources.runtime.clone();
 		let barrier = self.barrier.take();
@@ -299,7 +304,9 @@ impl StartupScope {
 		let future = async move {
 			let result = resources.cleanup(barrier, work_progress).await;
 			if closed.load(std::sync::atomic::Ordering::Acquire) {
-				watchdog.disarm();
+				if let Some(watchdog) = watchdog {
+					watchdog.disarm();
+				}
 			}
 			// Otherwise its OS thread stays armed even if this future panics or
 			// returns incomplete. A later certified owner close suppresses it.

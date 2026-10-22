@@ -10504,6 +10504,7 @@ fn pd25_constructor_spawns_stay_inside_typed_ownership_handoff() {
 		.unwrap();
 	assert!(!cleanup.contains("prepare_for_owner"));
 	assert!(!cleanup.contains("ShutdownWatchdog::arm"));
+	assert!(!cleanup.contains(".expect("));
 	assert!(cleanup.find("resources.fence()").unwrap() < cleanup.find("watchdog.start(").unwrap());
 }
 
