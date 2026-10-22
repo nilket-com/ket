@@ -201,8 +201,8 @@ for ((start = 0; start + ${#command_tail[@]} <= ${#args[@]}; start++)); do
 done
 [[ "$matched" -eq 1 ]]
 
-# Default test threads: 1024 whatever the cpuset (the cpuset bounds CPU, not
-# test concurrency). An ambient RUST_TEST_THREADS must not leak through either.
+# Default test threads: 1 during the adoption hold, whatever the cpuset.
+# An ambient RUST_TEST_THREADS must not leak through either.
 default_case() {
 	local cpus=$1
 	rm -f "$tmp/cargo home/probe.txt"
@@ -215,7 +215,9 @@ default_case() {
 		${cpus:+CARGO_CGROUP_CPUS="$cpus"} \
 		SYSTEMD_ARGS_FILE="$tmp/systemd-args-default.bin" \
 		"$wrapper" --version >/dev/null
-	grep -Fx "RUST_TEST_THREADS=1024" "$tmp/cargo home/probe.txt" >/dev/null
+	local threads
+	threads=$(sed -n 's/^RUST_TEST_THREADS=//p' "$tmp/cargo home/probe.txt")
+	[[ "$threads" == 1 ]]
 }
 default_case ''
 default_case 0-7,16-23
@@ -347,5 +349,5 @@ grep -q 'was stopped by RuntimeMaxSec=86400s' "$tmp/rt.err"
 printf 'PASS: a RuntimeMaxSec stop is reported with rc 124\n'
 
 printf 'PASS: host-aware slice and invocation memory, nofile minimum, signal stops the unit\n'
-printf 'PASS: default test threads are 1024 and the override is validated\n'
+printf 'PASS: default test threads are 1 and the override is validated\n'
 printf 'PASS: systemd environment allowlist, prefix forwarding, exclusions, values, and resource argv\n'
