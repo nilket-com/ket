@@ -698,3 +698,110 @@ async fn interrupted_real_sidecar_publisher_is_cleaned_on_owned_reopen() {
 		drop(manager);
 	}
 }
+
+fn pd22_segment(source: SlabId, fingerprint: u8, alternate_index: bool) -> SecondaryIndexSegment {
+	let base = segment_with_key(source, i64::from(fingerprint));
+	let mut identity = base.identity();
+	identity.logical_schema_fingerprint =
+		crate::schema::LogicalSchemaFingerprint::from_bytes([fingerprint; 32]);
+	if alternate_index {
+		identity.index_object_id = crate::schema::IndexObjectId::new([0xf2; 16]);
+	}
+	SecondaryIndexSegment::build(
+		identity,
+		source,
+		base.header.table_schema_generation,
+		base.header.arrow_type_tag,
+		base.entries,
+	)
+	.unwrap()
+}
+
+#[tokio::test]
+async fn pd22_fingerprint_rows_load_their_own_payloads() {
+	let dir = fresh_dir("pd22-load-fingerprint");
+	let manager = open_manager_at_dir(
+		dir.to_path_buf(),
+		spawn_io_thread(64).unwrap(),
+		test_crypto(),
+	)
+	.await;
+	let old = pd22_segment(SlabId::new(91), 1, false);
+	let new = pd22_segment(SlabId::new(91), 2, false);
+	let old_info = manager.persist_secondary_index_segment(&old).await.unwrap();
+	let new_info = manager.persist_secondary_index_segment(&new).await.unwrap();
+	assert_ne!(
+		PersistentSecondaryIndexSegmentRow::from(old_info.clone()).key,
+		PersistentSecondaryIndexSegmentRow::from(new_info.clone()).key
+	);
+	assert_eq!(
+		manager
+			.load_secondary_index_segment(&new_info)
+			.await
+			.unwrap(),
+		Some(new)
+	);
+	assert_eq!(
+		manager
+			.load_secondary_index_segment(&old_info)
+			.await
+			.unwrap(),
+		Some(old),
+		"a catalog row loaded another fingerprint's payload"
+	);
+}
+
+async fn pd22_old_retirement_preserves_new(retire: bool, alternate_index: bool) {
+	let dir = fresh_dir("pd22-retire-fingerprint");
+	let manager = open_manager_at_dir(
+		dir.to_path_buf(),
+		spawn_io_thread(64).unwrap(),
+		test_crypto(),
+	)
+	.await;
+	let old_info = manager
+		.persist_secondary_index_segment(&pd22_segment(SlabId::new(92), 1, false))
+		.await
+		.unwrap();
+	let new = pd22_segment(SlabId::new(92), 2, alternate_index);
+	let new_info = manager.persist_secondary_index_segment(&new).await.unwrap();
+	assert_ne!(
+		PersistentSecondaryIndexSegmentRow::from(old_info.clone()).key,
+		PersistentSecondaryIndexSegmentRow::from(new_info.clone()).key
+	);
+	assert_eq!(
+		manager
+			.load_secondary_index_segment(&new_info)
+			.await
+			.unwrap(),
+		Some(new.clone())
+	);
+	assert!(remove_sidecar(&manager, &old_info, retire).await.unwrap());
+	assert!(
+		manager
+			.secondary_index_segments
+			.contains_key(&PersistentSecondaryIndexSegmentRow::from(new_info.clone()).key)
+	);
+	assert_eq!(
+		manager
+			.load_secondary_index_segment(&new_info)
+			.await
+			.unwrap(),
+		Some(new),
+		"retiring an old identity silently unlinked the still-cataloged live file"
+	);
+}
+
+#[tokio::test]
+async fn pd22_delete_old_fingerprint_preserves_new_sidecar() {
+	pd22_old_retirement_preserves_new(false, false).await;
+}
+#[tokio::test]
+async fn pd22_retire_old_fingerprint_preserves_new_sidecar() {
+	pd22_old_retirement_preserves_new(true, false).await;
+}
+#[tokio::test]
+async fn pd22_different_index_ids_are_an_independent_retirement_control() {
+	pd22_old_retirement_preserves_new(false, true).await;
+	pd22_old_retirement_preserves_new(true, true).await;
+}

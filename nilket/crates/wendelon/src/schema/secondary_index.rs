@@ -1075,4 +1075,100 @@ mod tests {
 				.contains(SCHEMA_UPDATE_REJECT_INDEX_COLUMN_COLLISION)
 		);
 	}
+	fn pd22_changed_table() -> TableSchemaDescriptor {
+		let original = table();
+		let schema = original.arrow_schema().unwrap();
+		let mut fields = schema
+			.fields()
+			.iter()
+			.map(|field| field.as_ref().clone())
+			.collect::<Vec<_>>();
+		fields.push(Field::new("added", DataType::Int64, true));
+		TableSchemaDescriptor::new(
+			original.table_object_id,
+			original.schema_generation + 1,
+			"analytics",
+			"events",
+			&Schema::new(fields),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
+			LocalityPolicy::default_table_spread(),
+			SchemaEvolutionPolicy::AdditiveOnly,
+		)
+		.unwrap()
+	}
+
+	#[test]
+	fn pd22_live_catalog_refuses_changed_fingerprint_with_the_same_index_id() {
+		let tenant = TenantId::new(7);
+		let mut tables = TableSchemaCatalog::default();
+		tables.upsert(tenant, table()).unwrap();
+		let old = descriptor("customer_id", 1, IndexArrowTypeTag::UInt64);
+		let mut catalog = SecondaryIndexCatalog::default();
+		catalog.create(tenant, old.clone(), &tables).unwrap();
+		let changed = pd22_changed_table();
+		tables.upsert(tenant, changed.clone()).unwrap();
+		let new = SecondaryIndexDescriptor::for_table_column(
+			old.index_object_id,
+			old.index_name.clone(),
+			&changed,
+			"customer_id",
+		)
+		.unwrap();
+		assert_ne!(
+			old.logical_schema_fingerprint,
+			new.logical_schema_fingerprint
+		);
+		let error = catalog.create(tenant, new, &tables).unwrap_err();
+		assert_eq!(error.kind(), ErrorKind::AlreadyExists);
+		assert!(
+			error
+				.to_string()
+				.contains(SCHEMA_UPDATE_REJECT_INDEX_OBJECT_ID_COLLISION)
+		);
+		assert_eq!(
+			catalog.get(tenant, old.index_object_id).unwrap().descriptor,
+			old
+		);
+	}
+
+	#[test]
+	fn pd22_catalog_can_reuse_an_index_id_after_drop_gc_for_a_new_fingerprint() {
+		let tenant = TenantId::new(7);
+		let mut tables = TableSchemaCatalog::default();
+		tables.upsert(tenant, table()).unwrap();
+		let old = descriptor("customer_id", 1, IndexArrowTypeTag::UInt64);
+		let mut catalog = SecondaryIndexCatalog::default();
+		catalog.create(tenant, old.clone(), &tables).unwrap();
+		catalog.mark_dropping(tenant, old.index_object_id).unwrap();
+		catalog
+			.mark_drop_gc_complete(
+				tenant,
+				old.index_object_id,
+				NodeId {
+					id: 1,
+					_reserved: 0,
+				},
+				&BTreeSet::from([1]),
+			)
+			.unwrap();
+		assert!(catalog.get(tenant, old.index_object_id).is_none());
+		let changed = pd22_changed_table();
+		tables.upsert(tenant, changed.clone()).unwrap();
+		let new = SecondaryIndexDescriptor::for_table_column(
+			old.index_object_id,
+			old.index_name.clone(),
+			&changed,
+			"customer_id",
+		)
+		.unwrap();
+		assert_ne!(
+			old.logical_schema_fingerprint,
+			new.logical_schema_fingerprint
+		);
+		catalog.create(tenant, new.clone(), &tables).unwrap();
+		assert_eq!(
+			catalog.get(tenant, old.index_object_id).unwrap().descriptor,
+			new
+		);
+	}
 }
