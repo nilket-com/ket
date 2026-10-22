@@ -200,11 +200,18 @@ fn regular_identity(parent: &File, name: &CStr) -> io::Result<Option<(libc::dev_
 fn walk<H: CleanupHooks>(dir: &File, depth: usize, hooks: &mut H) -> io::Result<usize> {
 	let mut names = DirectoryStream::open(dir)?;
 	let mut removed = 0;
+	let mut local_removed = 0usize;
 	let result = (|| {
 		while let Some(name) = names.next_name()? {
 			let bytes = name.as_bytes();
-			if depth < 3 {
-				let width = if depth == 0 { 16 } else { 32 };
+			if depth < 3 || (depth == 3 && lower_hex(bytes, 64)) {
+				let width = if depth == 0 {
+					16
+				} else if depth == 3 {
+					64
+				} else {
+					32
+				};
 				if !lower_hex(bytes, width) {
 					continue;
 				}
@@ -212,7 +219,7 @@ fn walk<H: CleanupHooks>(dir: &File, depth: usize, hooks: &mut H) -> io::Result<
 				if let Some(child) = open_child_dir(dir, &name, depth + 1, hooks)? {
 					removed += walk(&child, depth + 1, hooks)?;
 				}
-			} else if is_sidecar_tmp(bytes) {
+			} else if (depth == 3 || depth == 4) && is_sidecar_tmp(bytes) {
 				let name = CString::new(bytes).expect("directory entry has no embedded NUL");
 				let Some(identity) = regular_identity(dir, &name)? else {
 					continue;
@@ -233,6 +240,7 @@ fn walk<H: CleanupHooks>(dir: &File, depth: usize, hooks: &mut H) -> io::Result<
 					}
 				} else {
 					removed += 1;
+					local_removed += 1;
 				}
 			}
 		}
@@ -240,7 +248,7 @@ fn walk<H: CleanupHooks>(dir: &File, depth: usize, hooks: &mut H) -> io::Result<
 	})();
 	// Sync this leaf directory even if a later unlink/readdir fails after a
 	// partial sweep. Ancestors are untouched and need no namespace sync.
-	if depth == 3 && removed > 0 {
+	if local_removed > 0 {
 		hooks.before_fsync(dir)?;
 		dir.sync_all()?;
 	}

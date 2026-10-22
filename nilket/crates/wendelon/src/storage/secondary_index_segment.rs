@@ -7,6 +7,7 @@ use crate::schema::{
 	RecordRowIndex, SlabId, TableObjectId, TenantId,
 };
 use crate::storage::RecordLocation;
+use crate::storage::index::PersistentSecondaryIndexSegmentKey;
 use crate::storage::secondary_index::{SecondaryIndexEntry, SecondaryIndexIdentity};
 use serde::{Deserialize, Serialize};
 use std::io::{Error, ErrorKind};
@@ -157,6 +158,16 @@ impl SecondaryIndexSegment {
 		Ok(())
 	}
 
+	pub(crate) fn catalog_key(&self) -> PersistentSecondaryIndexSegmentKey {
+		PersistentSecondaryIndexSegmentKey {
+			tenant_id: self.header.tenant_id,
+			table_object_id: self.header.table_object_id,
+			index_object_id: self.header.index_object_id,
+			logical_schema_fingerprint: self.header.logical_schema_fingerprint,
+			source_slab_id: self.header.source_slab_id,
+		}
+	}
+
 	pub fn identity(&self) -> SecondaryIndexIdentity {
 		SecondaryIndexIdentity {
 			tenant_id: self.header.tenant_id,
@@ -168,23 +179,21 @@ impl SecondaryIndexSegment {
 	}
 }
 
-pub fn secondary_index_segment_storage_path(
-	tenant_id: TenantId,
-	table_object_id: TableObjectId,
-	index_object_id: IndexObjectId,
-	source_slab_id: SlabId,
+pub(crate) fn secondary_index_segment_storage_path(
+	key: &PersistentSecondaryIndexSegmentKey,
 ) -> String {
 	format!(
-		"secondary_index/{:016x}/{}/{}/{:016x}.idx",
-		tenant_id.get(),
-		hex16(table_object_id.as_bytes()),
-		hex16(index_object_id.as_bytes()),
-		source_slab_id.get()
+		"secondary_index/{:016x}/{}/{}/{}/{:016x}.idx",
+		key.tenant_id.get(),
+		hex(key.table_object_id.as_bytes()),
+		hex(key.index_object_id.as_bytes()),
+		hex(key.logical_schema_fingerprint.as_bytes()),
+		key.source_slab_id.get()
 	)
 }
 
-fn hex16(bytes: &[u8; 16]) -> String {
-	let mut out = String::with_capacity(32);
+fn hex(bytes: &[u8]) -> String {
+	let mut out = String::with_capacity(bytes.len() * 2);
 	for byte in bytes {
 		use std::fmt::Write as _;
 		write!(&mut out, "{byte:02x}").expect("writing to String cannot fail");
@@ -384,13 +393,14 @@ mod tests {
 	#[test]
 	fn storage_path_uses_stable_sidecar_namespace() {
 		assert_eq!(
-			secondary_index_segment_storage_path(
-				TenantId::new(7),
-				TableObjectId::new([0x10; 16]),
-				IndexObjectId::new([0x52; 16]),
-				SlabId::new(41),
-			),
-			"secondary_index/0000000000000007/10101010101010101010101010101010/52525252525252525252525252525252/0000000000000029.idx"
+			secondary_index_segment_storage_path(&PersistentSecondaryIndexSegmentKey {
+				tenant_id: TenantId::new(7),
+				table_object_id: TableObjectId::new([0x10; 16]),
+				index_object_id: IndexObjectId::new([0x52; 16]),
+				logical_schema_fingerprint: LogicalSchemaFingerprint::from_bytes([0x33; 32]),
+				source_slab_id: SlabId::new(41)
+			}),
+			"secondary_index/0000000000000007/10101010101010101010101010101010/52525252525252525252525252525252/3333333333333333333333333333333333333333333333333333333333333333/0000000000000029.idx"
 		);
 	}
 
