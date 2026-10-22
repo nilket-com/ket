@@ -189,6 +189,15 @@ mod reclamation_tests {
 
 	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 	async fn multithread_cancellation_stress_preserves_exclusion_and_reclaims_gates() {
+		run_multithread_gate_stress(false).await;
+	}
+
+	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+	async fn multithread_cancellation_oracle_rejects_bypass() {
+		run_multithread_gate_stress(true).await;
+	}
+
+	async fn run_multithread_gate_stress(bypass: bool) {
 		let gates = Arc::new(WriteKeyGates::new());
 		let active = Arc::new([
 			AtomicUsize::new(0),
@@ -213,19 +222,28 @@ mod reclamation_tests {
 					random ^= random >> 7;
 					random ^= random << 17;
 					let key = (random % 3) as usize;
-					let admission = WriteKeyGate::admit(&gates, [key as u8; 24]);
+					let admission = async {
+						if bypass {
+							WriteKeyGate::bypassed(&gates, [key as u8; 24])
+						} else {
+							WriteKeyGate::admit(&gates, [key as u8; 24]).await
+						}
+					};
 					let deadline = Duration::from_micros(1 + random % 200);
 					if let Ok(guard) = tokio::time::timeout(deadline, admission).await {
-						assert_eq!(
-							active[key].fetch_add(1, Ordering::SeqCst),
-							0,
-							"two holders for key {key}"
-						);
+						if active[key].fetch_add(1, Ordering::SeqCst) != 0 {
+							active[key].fetch_sub(1, Ordering::SeqCst);
+							panic!("two holders for key {key} at admission");
+						}
 						admitted.fetch_add(1, Ordering::Relaxed);
 						for _ in 0..(1 + random % 8) {
 							tokio::task::yield_now().await;
 						}
-						assert_eq!(active[key].fetch_sub(1, Ordering::SeqCst), 1);
+						assert_eq!(
+							active[key].fetch_sub(1, Ordering::SeqCst),
+							1,
+							"two holders for key {key} at release"
+						);
 						drop(guard);
 					} else {
 						cancelled.fetch_add(1, Ordering::Relaxed);
@@ -233,16 +251,37 @@ mod reclamation_tests {
 				}
 			});
 		}
+		let mut detected = false;
 		tokio::time::timeout(Duration::from_secs(60), async {
 			while let Some(result) = tasks.join_next().await {
-				result.unwrap();
+				if let Err(error) = result {
+					assert!(
+						bypass && error.is_panic(),
+						"unexpected stress task failure: {error}"
+					);
+					let payload = error.into_panic();
+					let message = payload
+						.downcast_ref::<String>()
+						.map(String::as_str)
+						.or_else(|| payload.downcast_ref::<&str>().copied())
+						.unwrap_or("");
+					assert!(
+						message.contains("two holders for key"),
+						"unexpected mutant failure: {message}"
+					);
+					detected = true;
+				}
 			}
 		})
 		.await
 		.unwrap();
+		assert_eq!(
+			detected, bypass,
+			"bypass mutant must trip the same exclusion oracle"
+		);
 		assert!(admitted.load(Ordering::Relaxed) > 0);
 		assert!(
-			cancelled.load(Ordering::Relaxed) > 0,
+			bypass || cancelled.load(Ordering::Relaxed) > 0,
 			"stress did not exercise timeout cancellation"
 		);
 		assert!(active.iter().all(|value| value.load(Ordering::SeqCst) == 0));
