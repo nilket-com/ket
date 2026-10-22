@@ -457,6 +457,36 @@ impl SimulatedTransportProvider {
 
 #[async_trait]
 impl TransportProvider for SimulatedTransportProvider {
+	fn withdraw_local(
+		&self,
+		node_id: NodeId,
+		address: &str,
+		service: &Arc<dyn HrftService>,
+	) -> std::io::Result<()> {
+		let removed = {
+			let mut services = self
+				.network
+				.services
+				.lock()
+				.unwrap_or_else(std::sync::PoisonError::into_inner);
+			let matches = services.get(&node_id).is_some_and(|entry| {
+				entry.address == address && Arc::ptr_eq(&entry.service, service)
+			});
+			if matches {
+				services.remove(&node_id);
+			}
+			matches
+		};
+		if removed {
+			self.network.record_event(
+				None,
+				Some(node_id),
+				SimulatedTransportEventKind::Unpublished,
+			);
+		}
+		Ok(())
+	}
+
 	async fn connect(
 		&self,
 		target: NodeId,
@@ -517,6 +547,43 @@ mod tests {
 
 	fn node(id: u32) -> NodeId {
 		NodeId { id, _reserved: 0 }
+	}
+
+	#[tokio::test]
+	async fn pd25_old_withdrawal_cannot_remove_a_newer_shared_provider_registration() {
+		let network = Arc::new(SimulatedTransportNetwork::default());
+		let provider = SimulatedTransportProvider::new(
+			node(1),
+			network.clone(),
+			BufPool::new(8, 16 * 1024),
+			TransportTier::QuicIoUring,
+		);
+		let first: Arc<dyn HrftService> = Arc::new(EchoService);
+		let second: Arc<dyn HrftService> = Arc::new(EchoService);
+		provider
+			.publish_local(node(2), "sim://node-2", first.clone())
+			.unwrap();
+		provider
+			.publish_local(node(2), "sim://node-2", second.clone())
+			.unwrap();
+		provider
+			.withdraw_local(node(2), "sim://node-2", &first)
+			.unwrap();
+		assert!(Arc::ptr_eq(
+			&network
+				.services
+				.lock()
+				.unwrap()
+				.get(&node(2))
+				.unwrap()
+				.service,
+			&second
+		));
+		assert!(provider.connect(node(2), "sim://node-2").await.is_ok());
+		provider
+			.withdraw_local(node(2), "sim://node-2", &second)
+			.unwrap();
+		assert!(!network.services.lock().unwrap().contains_key(&node(2)));
 	}
 
 	#[tokio::test]

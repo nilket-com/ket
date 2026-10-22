@@ -11535,6 +11535,16 @@ struct LoopbackProvider {
 
 #[async_trait]
 impl TransportProvider for LoopbackProvider {
+	fn withdraw_local(
+		&self,
+		_node_id: crate::schema::NodeId,
+		_address: &str,
+		_service: &std::sync::Arc<dyn crate::network::server::HrftService>,
+	) -> std::io::Result<()> {
+		// This provider does not retain publish_local registrations.
+		Ok(())
+	}
+
 	async fn connect(
 		&self,
 		target: NodeId,

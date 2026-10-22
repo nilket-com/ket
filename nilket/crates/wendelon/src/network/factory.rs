@@ -50,9 +50,8 @@
 //!
 //! The spawned task holds a `Weak<TransportProviderFactory>`. When
 //! the factory's last `Arc` goes away the upgrade fails and the
-//! task returns. Dropping the factory is therefore clean — no
-//! channel close, no poisoning, no orphaned task — and tests can
-//! construct and discard factories freely.
+//! task returns. The factory also owns the actual task handle: Drop aborts it,
+//! and owner-registered close_and_join proves it finished during node teardown.
 
 use crate::network::transport::{
 	CapabilityResolver, MembershipEpoch, TransportConnection, TransportProvider, TransportTier,
@@ -77,6 +76,8 @@ use tokio::sync::watch;
 /// the returned `Arc<Self>` alive for as long as any subsystem
 /// intends to call [`Self::get_connection`].
 pub struct TransportProviderFactory {
+	invalidation: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+	invalidation_abort: std::sync::OnceLock<tokio::task::AbortHandle>,
 	/// Tiers this node supports locally — the bitmask published
 	/// into our own `ring(E)` entry at boot. Combined with the
 	/// peer's advertised set to pick the negotiated tier.
@@ -164,6 +165,8 @@ impl TransportProviderFactory {
 		policy: TransportSelectionPolicy,
 	) -> Arc<Self> {
 		let factory = Arc::new(Self {
+			invalidation: tokio::sync::Mutex::new(None),
+			invalidation_abort: std::sync::OnceLock::new(),
 			local_tiers,
 			providers,
 			resolver,
@@ -173,7 +176,15 @@ impl TransportProviderFactory {
 			health: Mutex::new(HashMap::new()),
 		});
 		let weak = Arc::downgrade(&factory);
-		tokio::spawn(invalidation_loop(weak, epoch_rx));
+		let task = tokio::spawn(invalidation_loop(weak, epoch_rx));
+		factory
+			.invalidation_abort
+			.set(task.abort_handle())
+			.expect("new factory task");
+		*factory
+			.invalidation
+			.try_lock()
+			.expect("unpublished factory task") = Some(task);
 		factory
 	}
 
@@ -358,6 +369,16 @@ impl TransportProviderFactory {
 
 #[async_trait]
 impl TransportProvider for TransportProviderFactory {
+	fn withdraw_local(
+		&self,
+		_node_id: crate::schema::NodeId,
+		_address: &str,
+		_service: &std::sync::Arc<dyn crate::network::server::HrftService>,
+	) -> std::io::Result<()> {
+		// This provider does not retain publish_local registrations.
+		Ok(())
+	}
+
 	async fn connect(
 		&self,
 		target: NodeId,
@@ -498,6 +519,16 @@ mod tests {
 
 	#[async_trait]
 	impl TransportProvider for MockProvider {
+		fn withdraw_local(
+			&self,
+			_node_id: crate::schema::NodeId,
+			_address: &str,
+			_service: &std::sync::Arc<dyn crate::network::server::HrftService>,
+		) -> std::io::Result<()> {
+			// This provider does not retain publish_local registrations.
+			Ok(())
+		}
+
 		async fn connect(
 			&self,
 			target: NodeId,
@@ -818,5 +849,41 @@ mod tests {
 		};
 		factory.apply_epoch(&new_epoch);
 		assert_eq!(factory.cached_connection_count(), 0);
+	}
+}
+
+impl TransportProviderFactory {
+	pub(crate) fn begin_close(&self) {
+		if let Some(task) = self.invalidation_abort.get() {
+			task.abort();
+		}
+	}
+	#[cfg(test)]
+	pub(crate) fn invalidation_abort_handle(&self) -> Option<tokio::task::AbortHandle> {
+		self.invalidation_abort.get().cloned()
+	}
+}
+#[async_trait::async_trait]
+impl crate::storage::ownership::StorageWorker for TransportProviderFactory {
+	async fn close_and_join(&self) -> std::io::Result<()> {
+		self.begin_close();
+		let mut task = self.invalidation.lock().await;
+		let result = match task.as_mut() {
+			Some(handle) => match handle.await {
+				Ok(()) => Ok(()),
+				Err(error) if error.is_cancelled() => Ok(()),
+				Err(error) => Err(Error::other(format!(
+					"transport invalidation task failed: {error}"
+				))),
+			},
+			None => Ok(()),
+		};
+		task.take();
+		result
+	}
+}
+impl Drop for TransportProviderFactory {
+	fn drop(&mut self) {
+		self.begin_close();
 	}
 }

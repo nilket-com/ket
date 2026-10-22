@@ -982,6 +982,8 @@ impl RawConfig {
 		let cfg = NodeBootstrapConfig {
 			#[cfg(test)]
 			startup_probe: None,
+			#[cfg(test)]
+			startup_fault: None,
 			#[cfg(feature = "test-support")]
 			slab_file_ops: None,
 			#[cfg(feature = "test-support")]

@@ -45,6 +45,21 @@ pub struct ShutdownWatchdog {
 
 impl ShutdownWatchdog {
 	pub fn arm(deadline: std::time::Duration) -> Self {
+		Self::arm_with_owner(deadline, None)
+	}
+	/// Startup cancellation/unwind must also be bounded. A later successful
+	/// explicit close suppresses this timer without reading a possibly wedged
+	/// mutex: only actual LOCK release sets the owner signal.
+	pub(crate) fn arm_for_owner(
+		deadline: std::time::Duration,
+		closed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+	) -> Self {
+		Self::arm_with_owner(deadline, Some(closed))
+	}
+	fn arm_with_owner(
+		deadline: std::time::Duration,
+		closed: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+	) -> Self {
 		let done = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
 		let state = done.clone();
 		let thread = std::thread::Builder::new()
@@ -55,7 +70,11 @@ impl ShutdownWatchdog {
 				let (finished, timeout) = signal
 					.wait_timeout_while(finished, deadline, |finished| !*finished)
 					.unwrap_or_else(|poison| poison.into_inner());
-				if timeout.timed_out() && !*finished {
+				if timeout.timed_out()
+					&& !*finished && !closed
+					.as_ref()
+					.is_some_and(|closed| closed.load(std::sync::atomic::Ordering::Acquire))
+				{
 					terminate_unclean(&format!("shutdown exceeded {deadline:?}"));
 				}
 			})

@@ -229,6 +229,18 @@ pub trait TransportProvider: Send + Sync {
 		address: &str,
 	) -> std::io::Result<Arc<dyn TransportConnection>>;
 
+	/// Withdraw only this exact service registration. Success certifies that no
+	/// matching registration remains; never remove a newer service for the node.
+	/// Non-retaining providers explicitly implement a no-op. No default can
+	/// silently certify an unknown publisher. This callback may block or panic;
+	/// startup executes it as owned blocking work, outside its synchronous fence.
+	fn withdraw_local(
+		&self,
+		node_id: NodeId,
+		address: &str,
+		service: &Arc<dyn HrftService>,
+	) -> std::io::Result<()>;
+
 	/// Optional publish hook used by bootstrap code that needs to
 	/// make its freshly-built HRFT service discoverable before a
 	/// peer dials back for Raft replication or a forwarded Control

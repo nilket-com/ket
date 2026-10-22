@@ -9,6 +9,7 @@ pub(crate) struct StartupProbe(
 	Arc<StdMutex<Option<Observation>>>,
 	Option<Arc<Notify>>,
 	bool,
+	Option<Duration>,
 );
 impl std::fmt::Debug for StartupProbe {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -22,6 +23,7 @@ impl PartialEq for StartupProbe {
 }
 impl Eq for StartupProbe {}
 struct Observation {
+	owner: DataDirectoryOwner,
 	raft: WendelonRaft,
 	slab: Weak<SlabManager>,
 	control: Weak<WendelonControlServer>,
@@ -45,6 +47,7 @@ impl StartupProbe {
 				.pause_startup_cleanup(pause.clone());
 		}
 		*self.0.lock().unwrap() = Some(Observation {
+			owner: slab.directory_owner().expect("owned probe"),
 			raft: raft.clone(),
 			slab: Arc::downgrade(slab),
 			control: Arc::downgrade(control),
@@ -53,6 +56,10 @@ impl StartupProbe {
 			tasks,
 		});
 	}
+	pub(super) fn watchdog_deadline(&self) -> Option<Duration> {
+		self.3
+	}
+
 	pub(super) fn after_handoff(&self) -> std::io::Result<()> {
 		if self.2 {
 			Err(Error::new(
@@ -70,6 +77,16 @@ struct JoinProvider {
 }
 #[async_trait]
 impl TransportProvider for JoinProvider {
+	fn withdraw_local(
+		&self,
+		_node_id: crate::schema::NodeId,
+		_address: &str,
+		_service: &std::sync::Arc<dyn crate::network::server::HrftService>,
+	) -> std::io::Result<()> {
+		// This provider does not retain publish_local registrations.
+		Ok(())
+	}
+
 	async fn connect(
 		&self,
 		_target: NodeId,
@@ -380,6 +397,16 @@ struct PrefixProvider {
 }
 #[async_trait]
 impl TransportProvider for PrefixProvider {
+	fn withdraw_local(
+		&self,
+		_node_id: crate::schema::NodeId,
+		_address: &str,
+		_service: &std::sync::Arc<dyn crate::network::server::HrftService>,
+	) -> std::io::Result<()> {
+		// This provider does not retain publish_local registrations.
+		Ok(())
+	}
+
 	async fn connect(
 		&self,
 		_target: NodeId,
@@ -453,12 +480,25 @@ async fn pd25_prefix_case(publish_error: bool, publish_panic: bool, after_handof
 		.unwrap()
 		.take()
 		.expect("prefix observation before provider callback");
+	// Unwind/cancellation starts tracked cleanup in Drop. Wait for its actual
+	// certificate before the final oracle; the alias does no cleanup itself.
+	let slot = observation
+		.owner
+		.latest_startup_cleanup()
+		.expect("owned cleanup slot");
+	assert!(matches!(
+		tokio::time::timeout(Duration::from_secs(30), slot.wait())
+			.await
+			.unwrap(),
+		crate::storage::ownership::StartupCleanupStatus::Complete
+	));
 	let live = observation
 		.tasks
 		.iter()
 		.filter(|(_, handle)| !handle.is_finished())
 		.map(|(name, _)| *name)
 		.collect::<Vec<_>>();
+	let raft_stopped = observation.raft.is_initialized().await.is_err();
 	let ingress_open = !observation.lifecycle.is_draining();
 	let service_retained = observation.service.upgrade().is_some();
 	let owner = observation
@@ -511,7 +551,12 @@ async fn pd25_prefix_case(publish_error: bool, publish_panic: bool, after_handof
 	let reopened = DataDirectoryOwner::acquire_existing(&dir).unwrap();
 	reopened.close(Duration::from_secs(10)).await.unwrap();
 	assert!(
-		live.is_empty() && !ingress_open && !service_retained && !write_admitted && !busy,
+		live.is_empty()
+			&& raft_stopped
+			&& !ingress_open
+			&& !service_retained
+			&& !write_admitted
+			&& !busy,
 		"PD25 failed startup leaked resources: live={live:?} ingress_open={ingress_open} service_retained={service_retained} write_admitted={write_admitted} directory_busy={busy}"
 	);
 }
@@ -526,4 +571,490 @@ async fn pd25_provider_publish_unwind_cleans_the_earlier_prefix() {
 #[tokio::test]
 async fn pd25_post_handoff_error_cleans_the_later_prefix() {
 	pd25_prefix_case(false, false, true).await;
+}
+
+#[path = "../../tests/support/tls_pki.rs"]
+mod tls_pki;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FaultMode {
+	Error,
+	Cancel,
+	Panic,
+}
+#[derive(Clone)]
+pub(crate) struct StartupFault {
+	site: &'static str,
+	mode: FaultMode,
+	snapshot: Arc<StdMutex<Option<FaultSnapshot>>>,
+	entered: Arc<Notify>,
+}
+impl PartialEq for StartupFault {
+	fn eq(&self, other: &Self) -> bool {
+		Arc::ptr_eq(&self.snapshot, &other.snapshot)
+	}
+}
+impl Eq for StartupFault {}
+struct FaultSnapshot {
+	owner: DataDirectoryOwner,
+	tasks: Vec<(&'static str, AbortHandle)>,
+	raft: Option<WendelonRaft>,
+	lifecycle: Option<ServerLifecycle>,
+}
+impl StartupFault {
+	pub(super) async fn reached(
+		&self,
+		site: &'static str,
+		owner: DataDirectoryOwner,
+		tasks: Vec<(&'static str, AbortHandle)>,
+		raft: Option<WendelonRaft>,
+		lifecycle: Option<ServerLifecycle>,
+	) -> std::io::Result<()> {
+		if self.site != site {
+			return Ok(());
+		}
+		*self.snapshot.lock().unwrap() = Some(FaultSnapshot {
+			owner,
+			tasks,
+			raft,
+			lifecycle,
+		});
+		self.entered.notify_one();
+		match self.mode {
+			FaultMode::Error => Err(Error::new(
+				ErrorKind::InvalidData,
+				format!("PD25 fault at {site}"),
+			)),
+			FaultMode::Cancel => std::future::pending().await,
+			FaultMode::Panic => panic!("PD25 constructor panic at {site}"),
+		}
+	}
+}
+const PREFIX_SITES: &[&str] = &[
+	"pool",
+	"io_workers",
+	"set_checkpoint_emitter",
+	"set_audit_chain_root_rollup",
+	"adopt_factory",
+	"adopt_raft",
+	"set_ring_updater",
+	"set_drift_monitor",
+	"adopt_lifecycle",
+	"will_publish",
+	"adopt_transport",
+	"set_epoch_reconciler",
+	"set_default_tenant_seeder",
+	"set_tenant_policy_reconciler",
+	"set_eviction_watchdog",
+	"set_lsm_compaction_control",
+	"set_lsm_compaction",
+	"set_lsm_gc",
+	"set_secondary_index_lifecycle",
+	"set_lease_manager",
+	"set_pending_finalization_reconciler",
+	"set_drop_reclaim_sweeper",
+	"set_cdc_finalization_release_observer",
+	"set_cdc_locality_heartbeat",
+	"set_migration_sweeper",
+	"set_tiering_sweeper",
+	"set_restore_validation",
+	"before_cluster",
+	"epoch_reconcile",
+	"tenant_seed",
+];
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pd25_every_adopted_prefix_err_cancel_panic_releases_real_tls_socket_and_reboots() {
+	let pki_dir = crate::test_support::TestDir::new("pd25-matrix-pki");
+	let pki = tls_pki::write_test_pki(&pki_dir);
+	for &site in PREFIX_SITES {
+		for mode in [FaultMode::Error, FaultMode::Cancel, FaultMode::Panic] {
+			let dir = crate::test_support::TestDir::new("pd25-matrix-case");
+			// Ephemeral reservation is released immediately before the actual bind.
+			let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+			let address = reservation.local_addr().unwrap();
+			let fault = StartupFault {
+				site,
+				mode,
+				snapshot: Arc::default(),
+				entered: Arc::new(Notify::new()),
+			};
+			let mut cfg = NodeBootstrapConfig::dev(1, dir.to_path_buf(), address.to_string());
+			cfg.transport_tls = Some(TransportTlsConfig {
+				cert_path: pki.server_cert.clone(),
+				key_path: pki.server_key.clone(),
+				node_ca_path: pki.ca_cert.clone(),
+				operator_ca_path: pki.ops_ca_cert.clone(),
+				cluster_domain: tls_pki::CLUSTER_DOMAIN.into(),
+			});
+			let healthy = cfg.clone();
+			cfg.startup_fault = Some(fault.clone());
+			drop(reservation);
+			let mut task = tokio::spawn(WendelonNode::bootstrap(cfg));
+			let reached =
+				tokio::time::timeout(Duration::from_secs(30), fault.entered.notified()).await;
+			if reached.is_err() {
+				task.abort();
+				if let Ok(Ok(node)) = (&mut task).await {
+					node.shutdown().await.unwrap();
+				}
+				panic!("site not reached: {site} {mode:?}");
+			}
+			if mode == FaultMode::Cancel {
+				task.abort();
+			}
+			let outcome = tokio::time::timeout(Duration::from_secs(30), &mut task)
+				.await
+				.expect("bootstrap joined");
+			match outcome {
+				Ok(Err(error)) if mode == FaultMode::Error => {
+					assert_eq!(error.kind(), ErrorKind::InvalidData, "{site}")
+				}
+				Err(error) if mode == FaultMode::Cancel => assert!(error.is_cancelled()),
+				Err(error) if mode == FaultMode::Panic => assert!(error.is_panic()),
+				Ok(Ok(node)) => {
+					node.shutdown().await.unwrap();
+					panic!("fault escaped: {site}");
+				}
+				_ => panic!("wrong fault outcome at {site} {mode:?}"),
+			}
+			let snapshot = fault.snapshot.lock().unwrap().take().unwrap();
+			let slot = snapshot
+				.owner
+				.latest_startup_cleanup()
+				.expect("tracked cleanup");
+			assert!(matches!(
+				tokio::time::timeout(Duration::from_secs(30), slot.wait())
+					.await
+					.unwrap(),
+				crate::storage::ownership::StartupCleanupStatus::Complete
+			));
+			let live: Vec<_> = snapshot
+				.tasks
+				.iter()
+				.filter(|(_, task)| !task.is_finished())
+				.map(|(name, _)| *name)
+				.collect();
+			assert!(live.is_empty(), "{site} {mode:?}: {live:?}");
+			assert!(
+				snapshot.owner.write_permit().is_err(),
+				"{site}: writes open"
+			);
+			if let Some(lifecycle) = snapshot.lifecycle {
+				assert!(lifecycle.is_draining(), "{site}");
+			}
+			if let Some(raft) = snapshot.raft {
+				assert!(
+					raft.is_initialized().await.is_err(),
+					"{site}: Raft still running before fixture teardown"
+				);
+			}
+			assert!(
+				tokio::net::TcpStream::connect(address).await.is_err(),
+				"{site}: TLS listener still accepts"
+			);
+			assert!(
+				snapshot
+					.owner
+					.closed_signal()
+					.load(std::sync::atomic::Ordering::Acquire),
+				"{site}: owner not certified closed"
+			);
+			let reopened = WendelonNode::bootstrap(healthy)
+				.await
+				.unwrap_or_else(|e| panic!("{site} {mode:?} reboot: {e}"));
+			reopened.shutdown().await.unwrap();
+			eprintln!(
+				"PD25 MATRIX {site} {mode:?} PASS tasks={}",
+				snapshot.tasks.len()
+			);
+		}
+	}
+}
+
+impl std::fmt::Debug for StartupFault {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("StartupFault")
+			.field("site", &self.site)
+			.field("mode", &self.mode)
+			.finish()
+	}
+}
+
+struct BlockingWithdrawal {
+	entered_file: PathBuf,
+	panic_publish: bool,
+	withdraw_failure: Option<String>,
+}
+#[async_trait]
+impl TransportProvider for BlockingWithdrawal {
+	async fn connect(
+		&self,
+		_: NodeId,
+		_: &str,
+	) -> std::io::Result<Arc<dyn crate::network::transport::TransportConnection>> {
+		Err(Error::other("not used"))
+	}
+	fn publish_local(&self, _: NodeId, _: &str, _: Arc<dyn HrftService>) -> std::io::Result<()> {
+		if self.panic_publish {
+			panic!("PD25 watchdog publish unwind");
+		}
+		Err(Error::new(
+			ErrorKind::InvalidData,
+			"PD25 watchdog publish error",
+		))
+	}
+	fn withdraw_local(&self, _: NodeId, _: &str, _: &Arc<dyn HrftService>) -> std::io::Result<()> {
+		std::fs::write(&self.entered_file, b"actual withdrawal entered").unwrap();
+		match self.withdraw_failure.as_deref() {
+			Some("error") => {
+				return Err(Error::new(
+					ErrorKind::PermissionDenied,
+					"withdrawal refused",
+				));
+			}
+			Some("panic") => panic!("withdrawal callback panic"),
+			_ => {}
+		}
+		loop {
+			std::thread::park();
+		}
+	}
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pd25_forever_withdraw_child() {
+	let Some(path) = std::env::var_os("WENDELON_PD25_FOREVER_CHILD") else {
+		return;
+	};
+	let path = PathBuf::from(path);
+	let mut cfg = NodeBootstrapConfig::dev(7131, path.clone(), "127.0.0.1:0".into());
+	cfg.storage_shutdown_timeout = Duration::from_millis(20);
+	let mut probe = StartupProbe::default();
+	probe.3 = Some(Duration::from_millis(250));
+	cfg.startup_probe = Some(probe.clone());
+	let provider = Arc::new(BlockingWithdrawal {
+		entered_file: path.join("withdraw-entered"),
+		panic_publish: std::env::var_os("WENDELON_PD25_PANIC").is_some(),
+		withdraw_failure: std::env::var("WENDELON_PD25_WITHDRAW_FAILURE").ok(),
+	});
+	let outcome = tokio::spawn(WendelonNode::bootstrap_with_provider(cfg, provider)).await;
+	let observation = probe.0.lock().unwrap().take().unwrap();
+	let closed_trusted = tokio::time::timeout(Duration::from_millis(150), async {
+		while observation
+			.tasks
+			.iter()
+			.any(|(_, task)| !task.is_finished())
+		{
+			tokio::task::yield_now().await;
+		}
+		assert!(observation.lifecycle.is_draining());
+		assert!(observation.owner.write_permit().is_err());
+		while observation.raft.is_initialized().await.is_ok() {
+			tokio::task::yield_now().await;
+		}
+	})
+	.await
+	.is_ok();
+	if closed_trusted {
+		std::fs::write(
+			path.join("trusted-cleanup-complete"),
+			b"done before withdrawal finished",
+		)
+		.unwrap();
+	}
+	if std::env::var_os("WENDELON_PD25_CLI").is_some() {
+		let error = match outcome {
+			Ok(Err(error)) => error,
+			_ => panic!("expected real bootstrap cleanup error"),
+		};
+		assert_eq!(error.kind(), ErrorKind::InvalidData);
+		let _exit = crate::cli::bootstrap_failure_exit(&error, Duration::from_millis(250));
+		std::fs::write(
+			path.join("cli-returned"),
+			b"nested incomplete not recognized",
+		)
+		.unwrap();
+	}
+	// Keep the runtime and owned blocking callback alive. Only the independent
+	// scope watchdog can complete this child; parent kills/reaps on regression.
+	std::future::pending::<()>().await;
+}
+#[tokio::test]
+async fn pd25_forever_withdraw_exits_bounded_and_requires_recovery() {
+	for (panic_publish, cli, withdraw_failure) in [
+		(false, false, "block"),
+		(true, false, "block"),
+		(false, true, "block"),
+		(false, false, "error"),
+		(false, false, "panic"),
+	] {
+		let dir = crate::test_support::TestDir::new("pd25-withdraw-watchdog");
+		let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+		command
+			.args([
+				"--exact",
+				"node::startup_ownership_tests::pd25_forever_withdraw_child",
+				"--nocapture",
+			])
+			.env("WENDELON_PD25_FOREVER_CHILD", dir.as_os_str());
+		if panic_publish {
+			command.env("WENDELON_PD25_PANIC", "1");
+		}
+		if cli {
+			command.env("WENDELON_PD25_CLI", "1");
+		}
+		command.env("WENDELON_PD25_WITHDRAW_FAILURE", withdraw_failure);
+		let output = crate::test_support::run_test_child(&mut command, Duration::from_secs(15))
+			.await
+			.unwrap();
+		assert_eq!(
+			output.status.code(),
+			Some(crate::storage::ownership::UNCLEAN_SHUTDOWN_EXIT_CODE),
+			"{}",
+			String::from_utf8_lossy(&output.stderr)
+		);
+		assert!(
+			dir.join("withdraw-entered").exists(),
+			"actual callback was not exercised"
+		);
+		assert!(
+			dir.join("trusted-cleanup-complete").exists(),
+			"foreign withdrawal blocked trusted cleanup"
+		);
+		assert!(
+			!dir.join("cli-returned").exists(),
+			"nested incomplete bootstrap marker missed"
+		);
+		assert!(!dir.join("CLEAN_SHUTDOWN").exists());
+		let owner = DataDirectoryOwner::acquire_existing(&dir).unwrap();
+		assert!(
+			!owner.previous_shutdown_clean(),
+			"must recover after hard exit"
+		);
+		owner.close(Duration::from_secs(10)).await.unwrap();
+	}
+}
+
+struct SlowPartialPublish {
+	registration: StdMutex<Option<Arc<dyn HrftService>>>,
+	release: (StdMutex<bool>, std::sync::Condvar),
+	entered: Notify,
+	panic_publish: bool,
+}
+#[async_trait]
+impl TransportProvider for SlowPartialPublish {
+	async fn connect(
+		&self,
+		_: NodeId,
+		_: &str,
+	) -> std::io::Result<Arc<dyn crate::network::transport::TransportConnection>> {
+		Err(Error::other("unused"))
+	}
+	fn publish_local(
+		&self,
+		_: NodeId,
+		_: &str,
+		service: Arc<dyn HrftService>,
+	) -> std::io::Result<()> {
+		*self.registration.lock().unwrap() = Some(service);
+		assert!(
+			!self.panic_publish,
+			"panic after actual partial registration"
+		);
+		Err(Error::new(
+			ErrorKind::ConnectionRefused,
+			"error after actual partial registration",
+		))
+	}
+	fn withdraw_local(
+		&self,
+		_: NodeId,
+		_: &str,
+		service: &Arc<dyn HrftService>,
+	) -> std::io::Result<()> {
+		self.entered.notify_one();
+		let (lock, changed) = &self.release;
+		let released = lock.lock().unwrap();
+		let _released = changed.wait_while(released, |released| !*released).unwrap();
+		let mut registration = self.registration.lock().unwrap();
+		if registration
+			.as_ref()
+			.is_some_and(|current| Arc::ptr_eq(current, service))
+		{
+			registration.take();
+		}
+		Ok(())
+	}
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pd25_slow_partial_publish_withdrawal_keeps_lock_but_not_trusted_workers() {
+	for panic_publish in [false, true] {
+		let dir = crate::test_support::TestDir::new("pd25-slow-partial");
+		let mut cfg = NodeBootstrapConfig::dev(7133, dir.to_path_buf(), "127.0.0.1:0".into());
+		cfg.storage_shutdown_timeout = Duration::from_millis(20);
+		let probe = StartupProbe::default();
+		cfg.startup_probe = Some(probe.clone());
+		let provider = Arc::new(SlowPartialPublish {
+			registration: StdMutex::new(None),
+			release: (StdMutex::new(false), std::sync::Condvar::new()),
+			entered: Notify::new(),
+			panic_publish,
+		});
+		let mut task = tokio::spawn(WendelonNode::bootstrap_with_provider(cfg, provider.clone()));
+		tokio::time::timeout(Duration::from_secs(10), provider.entered.notified())
+			.await
+			.unwrap();
+		// Always release the foreign callback even when a regression fails an oracle.
+		let outcome = tokio::time::timeout(Duration::from_secs(10), &mut task).await;
+		let observation = probe.0.lock().unwrap().take().unwrap();
+		let slot = observation.owner.latest_startup_cleanup().unwrap();
+		let trusted = tokio::time::timeout(Duration::from_secs(5), async {
+			while observation
+				.tasks
+				.iter()
+				.any(|(_, task)| !task.is_finished())
+			{
+				tokio::task::yield_now().await;
+			}
+			while observation.raft.is_initialized().await.is_ok() {
+				tokio::task::yield_now().await;
+			}
+			true
+		})
+		.await;
+		let write_closed = observation.owner.write_permit().is_err();
+		let still_registered = provider.registration.lock().unwrap().is_some();
+		let busy = DataDirectoryOwner::acquire_existing(&dir).is_err();
+		let close_incomplete = observation
+			.owner
+			.close(Duration::from_millis(20))
+			.await
+			.is_err();
+		*provider.release.0.lock().unwrap() = true;
+		provider.release.1.notify_all();
+		tokio::time::timeout(Duration::from_secs(10), async {
+			while !observation
+				.owner
+				.closed_signal()
+				.load(std::sync::atomic::Ordering::Acquire)
+			{
+				tokio::task::yield_now().await;
+			}
+		})
+		.await
+		.unwrap();
+		slot.join_finished().await;
+		assert!(trusted.unwrap() && write_closed && still_registered && busy && close_incomplete);
+		assert!(provider.registration.lock().unwrap().is_none());
+		match outcome.unwrap() {
+			Err(error) if panic_publish => assert!(error.is_panic()),
+			Ok(Err(error)) if !panic_publish => {
+				assert_eq!(error.kind(), ErrorKind::ConnectionRefused)
+			}
+			_ => panic!("wrong partial publish outcome"),
+		}
+		assert!(observation.lifecycle.is_draining());
+		let owner = DataDirectoryOwner::acquire_existing(&dir).unwrap();
+		owner.close(Duration::from_secs(10)).await.unwrap();
+	}
 }

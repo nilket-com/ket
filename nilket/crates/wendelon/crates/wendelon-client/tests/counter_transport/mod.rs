@@ -212,6 +212,11 @@ struct WireProvider {
 }
 
 impl TransportProvider for WireProvider {
+	fn withdraw_local(&self, _node_id: wendelon::schema::NodeId, _address: &str, _service: &std::sync::Arc<dyn wendelon::network::server::HrftService>) -> std::io::Result<()> {
+		// This provider does not retain publish_local registrations.
+		Ok(())
+	}
+
 	fn connect<'life0, 'life1, 'async_trait>(
 		&'life0 self,
 		target: NodeId,

@@ -57,4 +57,7 @@ pub mod simulator;
 pub mod storage;
 
 #[cfg(test)]
+extern crate self as wendelon;
+
+#[cfg(test)]
 mod test_support;
