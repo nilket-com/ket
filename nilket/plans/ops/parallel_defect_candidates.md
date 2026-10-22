@@ -354,10 +354,38 @@ PD-16 focused load evidence (2026-10-21): the actual-unlink regression passed
 one firstpass, three baseline runs, 30 nextest repetitions, ten in-process runs
 at explicit 1024 threads and three loaded runs, with zero selected ignores or
 retries. Receipt: `reviews/readiness-pd16-focused-20261021/summary.json`.
-The frozen prior executable's node/tiering/unlink sources match this stack;
-three replica files differ, so this is not a full current-stack receipt. Loaded
+The frozen prior executable's node/tiering/unlink sources match integration
+`e92a84dd7`; three replica files differ. Later startup changes are outside this
+receipt, which is not a full current-stack pass. Loaded
 checks sampled only background-nextest descendants (minimum 2/7/7), with sparse
 sampling because the foreground test takes about 0.1–0.25 seconds. Background
 runs were deliberately stopped. An initial ancestry-sampler setup failure
 stopped before loaded execution; only previously unrun loaded samples followed.
 Final stacked v5 acceptance remains pending.
+
+PD-11 startup ownership prerequisite (2026-10-21): signed `b704a10f3` owns
+the five existing background task handles and transports during post-publish
+cluster initialization/JOIN through visibility. Failure or cancellation drains
+admission synchronously, retains tracked cleanup and prevents directory closure
+until actual joins finish. Successful startup transfers the same handles back.
+Typed incomplete errors retain their original kind and cause; observer timeout
+does not cancel cleanup. Earlier startup prefixes and later node construction
+remain outside this guard. Provider-only probes make no socket-closure claim.
+
+The original failed/cancelled JOIN controls each retained five live tasks,
+open write admission and a busy directory before explicit fixture teardown.
+The reviewed repair passed 23 firstpass checks, 180 architecture checks, four
+existing multi-node JOIN regressions and 506 repeated/control executions
+(330 nextest, 110 in-process at explicit 1024 threads, 33 baseline, 33 loaded).
+Recorded background load was deliberately stopped, not a full-suite pass.
+Evidence: `reviews/readiness-pd11-startup-green-20261021/summary.json`; final
+audit: `reviews/readiness-pd11-startup-final-independent-evidence-audit-20261021.json`.
+
+The WAL5 compatibility prerequisite is signed `063217be6`: a test-only frozen
+27-variant spine and 29 immutable fixture samples, checked against production
+replay and suffix refusal. All 28 selected compatibility controls and 180
+architecture checks passed. Receipt: `reviews/readiness-pd11-conditional-20261021/summary.json`.
+The samples do not freeze every nested payload shape; changed historical leaves
+must be forked before a successor decoder is activated. No format bump or
+conditional recovery command is emitted. Incomplete-epoch recovery, cluster
+command-support gating and final stacked v5 acceptance remain open.
