@@ -447,3 +447,35 @@ observed durably (review N2). Neither note blocks the jointly reviewed source.
 - Cut C remediation prepared: both lockfiles update the two root bundles to 1.0.10, root absence regression; operator-facing starter keys use independent OS randomness with `allow_dev_keys=false` and consistent enrollment. Publication/fast-forward time: PENDING Cut C acceptance, not yet landed. Compute time-to-remediate from advisory, exposure detection, and actual publication separately.
 - Lockfile metadata also reconciles existing key-guard serde_json/zeroize dependency edges in the root workspace (no package version change); polariton adds explicit dev dependencies for the two root bundle regression checks.
 - Follow-up OPEN: gate deterministic `NodeBootstrapConfig::dev()` and `dev_*_signing_secret` behind test support after a complete integration-fixture caller/feature audit. This incident patch preserves the explicit in-code API; starter TOML never opts into those keys. Avoid globally forcing unrelated test-support behavior or dropping integration test names during that migration.
+
+
+#### Cut C startup matrix pre-hook failure (OPEN, classification pending)
+
+On signed B0 source `7fd0f944a`, in-process explicit1024 run4 failed after
+three passing runs: `pd25_every_adopted_prefix_err_cancel_panic_releases_real_tls_socket_and_reboots`
+did not reach `set_pending_finalization_reconciler` / Cancel within30s.
+The other13 cases passed. Separate nextest30x14 passed. Receipt:
+`/home/me/work/reviews/cut-c-b0-green-20261022/inprocess-04.log`.
+
+The fixture discarded an early constructor outcome at this branch, so that
+receipt alone cannot classify a production refusal, stalled progress, or a
+fixture resource assumption. Diagnostic revision retains the original typed
+error/join outcome and last checkpoint, including early completion racing the
+notification. Reproduce under the same resources/concurrency; no timeout
+widening, serialization, retry-to-green, or B0 stress acceptance while open.
+
+The diagnostic reproduced on observation14 with exact `AddrInUse` (OS98),
+`last_site=None`: refusal precedes all constructor fault hooks. Controlled
+UDP occupancy reproduces the TCP-only reservation defect while startup
+correctly fences/releases the owner. The fixture now binds both actual
+listeners with `:0` and records the live TCP address before any injection;
+there is no release/rebind gap and no bootstrap retry. The original run4's
+exact early error was discarded and cannot be retrospectively recovered;
+its attribution is consistent/probable, while diagnostic run14 is captured.
+Closure remains PENDING the corrected full1024 stress cycle and review.
+
+Healthy shutdown of a retaining provider does not yet withdraw the published
+registration (pre-existing behavior; failed-startup withdrawal is repaired by
+B0). Track a separate healthy-shutdown registration retirement change; current
+lifecycle draining refuses new calls, but stale registrations may retain
+service/storage aliases until the provider network is dropped.

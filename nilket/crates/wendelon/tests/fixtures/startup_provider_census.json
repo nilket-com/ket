@@ -1,0 +1,130 @@
+[
+  {
+    "file": "crates/toron/src/binder/runtime_evidence.rs",
+    "implementation": "ConflictProvider",
+    "retains_publication": false,
+    "withdrawal": "explicit no retained publication",
+    "overrides_publish": false,
+    "withdraw_noop": true
+  },
+  {
+    "file": "crates/wendelon/crates/wendelon-client/tests/counter_transport/mod.rs",
+    "implementation": "WireProvider",
+    "retains_publication": false,
+    "withdrawal": "explicit no retained publication",
+    "overrides_publish": false,
+    "withdraw_noop": true
+  },
+  {
+    "file": "crates/wendelon/src/client/core.rs",
+    "implementation": "ScriptedDescriptorGetProvider",
+    "retains_publication": false,
+    "withdrawal": "explicit no retained publication",
+    "overrides_publish": false,
+    "withdraw_noop": true
+  },
+  {
+    "file": "crates/wendelon/src/client/core.rs",
+    "implementation": "SlowSetupCounterProvider",
+    "retains_publication": false,
+    "withdrawal": "explicit no retained publication",
+    "overrides_publish": false,
+    "withdraw_noop": true
+  },
+  {
+    "file": "crates/wendelon/src/network/data_server/tests.rs",
+    "implementation": "LoopbackProvider",
+    "retains_publication": false,
+    "withdrawal": "explicit no retained publication",
+    "overrides_publish": false,
+    "withdraw_noop": true
+  },
+  {
+    "file": "crates/wendelon/src/network/factory.rs",
+    "implementation": "MockProvider",
+    "retains_publication": false,
+    "withdrawal": "explicit no retained publication",
+    "overrides_publish": false,
+    "withdraw_noop": true
+  },
+  {
+    "file": "crates/wendelon/src/network/factory.rs",
+    "implementation": "TransportProviderFactory",
+    "retains_publication": false,
+    "withdrawal": "explicit no retained publication",
+    "overrides_publish": false,
+    "withdraw_noop": true
+  },
+  {
+    "file": "crates/wendelon/src/network/quic_transport.rs",
+    "implementation": "QuicTransportProvider",
+    "retains_publication": false,
+    "withdrawal": "explicit no retained publication",
+    "overrides_publish": false,
+    "withdraw_noop": true
+  },
+  {
+    "file": "crates/wendelon/src/network/tcp_tls_transport.rs",
+    "implementation": "TcpTlsTransportProvider",
+    "retains_publication": false,
+    "withdrawal": "explicit no retained publication",
+    "overrides_publish": false,
+    "withdraw_noop": true
+  },
+  {
+    "file": "crates/wendelon/src/node.rs",
+    "implementation": "NoDialTransportProvider",
+    "retains_publication": false,
+    "withdrawal": "explicit no retained publication",
+    "overrides_publish": false,
+    "withdraw_noop": true
+  },
+  {
+    "file": "crates/wendelon/src/node/startup_ownership_tests.rs",
+    "implementation": "BlockingWithdrawal",
+    "retains_publication": false,
+    "withdrawal": "deliberate blocking/error/panic control, never certified",
+    "overrides_publish": true,
+    "withdraw_noop": false
+  },
+  {
+    "file": "crates/wendelon/src/node/startup_ownership_tests.rs",
+    "implementation": "JoinProvider",
+    "retains_publication": false,
+    "withdrawal": "explicit no retained publication",
+    "overrides_publish": false,
+    "withdraw_noop": true
+  },
+  {
+    "file": "crates/wendelon/src/node/startup_ownership_tests.rs",
+    "implementation": "PrefixProvider",
+    "retains_publication": true,
+    "withdrawal": "conditional exact Arc fixture registration",
+    "overrides_publish": true,
+    "withdraw_noop": false
+  },
+  {
+    "file": "crates/wendelon/src/node/startup_ownership_tests.rs",
+    "implementation": "SlowPartialPublish",
+    "retains_publication": true,
+    "withdrawal": "owned blocking callback, exact Arc conditional",
+    "overrides_publish": true,
+    "withdraw_noop": false
+  },
+  {
+    "file": "crates/wendelon/src/simulator/network.rs",
+    "implementation": "SimulatedTransportProvider",
+    "retains_publication": true,
+    "withdrawal": "conditional exact Arc+address",
+    "overrides_publish": true,
+    "withdraw_noop": false
+  },
+  {
+    "file": "crates/wendelon/tests/quic_transport.rs",
+    "implementation": "RefusingProvider",
+    "retains_publication": false,
+    "withdrawal": "explicit no retained publication",
+    "overrides_publish": false,
+    "withdraw_noop": true
+  }
+]
