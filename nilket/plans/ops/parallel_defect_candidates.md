@@ -349,3 +349,15 @@ Incomplete epoch recovery, replacement timeout, historical abort, startup
 lifecycle cleanup and final stacked v5 adoption remain separate/open. State
 nonmutation checks observe the follower plus shared promotion-call count,
 not direct leader durable-state closure.
+
+PD-16 focused load evidence (2026-10-21): the actual-unlink regression passed
+one firstpass, three baseline runs, 30 nextest repetitions, ten in-process runs
+at explicit 1024 threads and three loaded runs, with zero selected ignores or
+retries. Receipt: `reviews/readiness-pd16-focused-20261021/summary.json`.
+The frozen prior executable's node/tiering/unlink sources match this stack;
+three replica files differ, so this is not a full current-stack receipt. Loaded
+checks sampled only background-nextest descendants (minimum 2/7/7), with sparse
+sampling because the foreground test takes about 0.1–0.25 seconds. Background
+runs were deliberately stopped. An initial ancestry-sampler setup failure
+stopped before loaded execution; only previously unrun loaded samples followed.
+Final stacked v5 acceptance remains pending.
