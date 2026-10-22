@@ -405,13 +405,18 @@ not claimed as Cut A closures or regressions. Source reviews:
 | PD-24 | S3 | Catalog failure after sidecar rename removes the new file while an old row may still name that path. Inject the catalog failure after a same-path replacement and prove whether the old row loses its file. | Unconfirmed; RED first after PD-22; no parallel-load reproduction yet. |
 | PD-25 | J1 | Startup ownership guard currently spans only the initialization/JOIN block. Earlier producer/transport setup and later epoch reconcile, tenant seeding and LSM-worker construction failures may leave writes admitted, serving transports, detached tasks and LOCK held. Inject failures at both prefixes and observe actual closure. | Open, source-confirmed scope gap; separate Cut B contract or later cut. No parallel-load RED yet. |
 
-Every confirmed candidate needs its RED before repair. Applicable reproduced
-parallel-load defects block the separately gated default flip to the cpuset CPU count, with an explicit 1024
-stress lane; the current
-Cut A retains main's accepted default 1 and runs the v4 gate.
+Every confirmed candidate needs its RED before repair. PD-22 through PD-25
+block the default flip until each is repaired after a RED or refuted with
+evidence; parallel-load reproduction is an additional classification, not a
+condition for blocking. The target flip uses the cpuset CPU count plus an
+explicit 1024 stress lane. Cut A retains default 1 and runs the v4 gate.
 
 Additional source-review notes, not yet demonstrated defects: forwarded JOIN
 has no hop limit; the counter-key `locks` map does not shrink; the test-only
 `CounterReplica` harness can remove gates with queued waiters; leader and replica
 gate-drop invariant failures use different release-build policies. Record a
 separate RED and scope before promoting any note to an implementation change.
+
+PD-25 oracle note: `startup_ownership_tests.rs` computes `service_retained`
+without asserting it. The later startup-prefix REDs must assert actual resource
+closure, retaining a real-socket control alongside provider fixtures.
