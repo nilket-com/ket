@@ -1074,3 +1074,138 @@ pub(crate) mod v4 {
 		})
 	}
 }
+
+/// Frozen outgoing WAL v5 spine, captured before promoted-JOIN conditional commands.
+/// The immutable v5 corpus pins every live leaf referenced by this shadow.
+/// Test-only until a separately reviewed WAL successor activates this decoder.
+#[cfg(test)]
+pub(crate) mod v5 {
+	use crate::consensus::core::{
+		AdvanceEpochRecord, CreateTenant, MigrationComplete, SeedMigration,
+		SetTableRetentionPolicy, TableDropFinalizeRequest, TableDropLogicalFinalizeRequest,
+		TableDropPrepareRequest, TableDropSettlementRequest, TableReclaimCompletionRequest,
+		TenantFinalization, TieredSlab, UpdateTenantQuota, WendelonResponse,
+	};
+	use crate::consensus::{RetireTieredSlab, WendelonRequest as CurrentRequest};
+	use crate::crypto::{InstallTenantKekVersion, RetireTenantKekVersion};
+	use crate::schema::{
+		CtasSagaMutation, LeaseDescriptor, ReleaseLeaseRequestMeta, ReplayLegacyCtasRowDispatched,
+		TenantId,
+	};
+	use crate::storage::CompactionCommit as CompactionCommitBody;
+	use serde::{Deserialize, Serialize};
+
+	#[derive(Clone, Debug, Serialize, Deserialize)]
+	pub(crate) enum WendelonRequest {
+		Finalize(TenantFinalization),
+		AcquireLease(LeaseDescriptor),
+		ReleaseLease(ReleaseLeaseRequestMeta),
+		AdvanceEpoch(AdvanceEpochRecord),
+		#[serde(with = "serde_bytes")]
+		SchemaUpdate(Vec<u8>),
+		TierSlab(TieredSlab),
+		RetireTieredSlab(RetireTieredSlab),
+		CompactionCommit(CompactionCommitBody),
+		SeedMigration(SeedMigration),
+		MigrationComplete(MigrationComplete),
+		CreateTenant(CreateTenant),
+		UpdateTenantQuota(UpdateTenantQuota),
+		SuspendTenant(TenantId),
+		ResumeTenant(TenantId),
+		DeleteTenant(TenantId),
+		InstallTenantKekVersion(InstallTenantKekVersion),
+		RetireTenantKekVersion(RetireTenantKekVersion),
+		RevokeActorKey(crate::consensus::core::RevokeActorKey),
+		SetTableRetentionPolicy(SetTableRetentionPolicy),
+		TableDropPrepare(TableDropPrepareRequest),
+		TableReclaimCompletion(TableReclaimCompletionRequest),
+		TableDropFinalize(TableDropFinalizeRequest),
+		CtasSaga(CtasSagaMutation),
+		ReplayLegacyCtasRowDispatched(ReplayLegacyCtasRowDispatched),
+		TableDropLogicalFinalize(TableDropLogicalFinalizeRequest),
+		TableDropSettlement(TableDropSettlementRequest),
+		Root2Command(crate::consensus::Root2Carrier1),
+	}
+
+	openraft::declare_raft_types!(
+		pub(crate) WendelonWalV5TypeConfig:
+			D = WendelonRequest,
+			R = WendelonResponse,
+			NodeId = u32,
+			Node = openraft::BasicNode,
+			Entry = openraft::Entry<WendelonWalV5TypeConfig>,
+			SnapshotData = crate::consensus::raft_storage::SnapshotDataFile,
+			AsyncRuntime = openraft::TokioRuntime,
+	);
+
+	impl From<WendelonRequest> for CurrentRequest {
+		fn from(request: WendelonRequest) -> Self {
+			match request {
+				WendelonRequest::Root2Command(v) => Self::Root2Command(v),
+				WendelonRequest::TableDropLogicalFinalize(v) => Self::TableDropLogicalFinalize(v),
+				WendelonRequest::TableDropSettlement(v) => Self::TableDropSettlement(v),
+				WendelonRequest::Finalize(v) => Self::Finalize(v),
+				WendelonRequest::AcquireLease(v) => Self::AcquireLease(v),
+				WendelonRequest::ReleaseLease(v) => Self::ReleaseLease(v),
+				WendelonRequest::AdvanceEpoch(v) => Self::AdvanceEpoch(v),
+				WendelonRequest::SchemaUpdate(v) => Self::SchemaUpdate(v),
+				WendelonRequest::TierSlab(v) => Self::TierSlab(v),
+				WendelonRequest::RetireTieredSlab(v) => Self::RetireTieredSlab(v),
+				WendelonRequest::CompactionCommit(v) => Self::CompactionCommit(v),
+				WendelonRequest::SeedMigration(v) => Self::SeedMigration(v),
+				WendelonRequest::MigrationComplete(v) => Self::MigrationComplete(v),
+				WendelonRequest::CreateTenant(v) => Self::CreateTenant(v),
+				WendelonRequest::UpdateTenantQuota(v) => Self::UpdateTenantQuota(v),
+				WendelonRequest::SuspendTenant(v) => Self::SuspendTenant(v),
+				WendelonRequest::ResumeTenant(v) => Self::ResumeTenant(v),
+				WendelonRequest::DeleteTenant(v) => Self::DeleteTenant(v),
+				WendelonRequest::InstallTenantKekVersion(v) => Self::InstallTenantKekVersion(v),
+				WendelonRequest::RetireTenantKekVersion(v) => Self::RetireTenantKekVersion(v),
+				WendelonRequest::RevokeActorKey(v) => Self::RevokeActorKey(v),
+				WendelonRequest::SetTableRetentionPolicy(v) => Self::SetTableRetentionPolicy(v),
+				WendelonRequest::TableDropPrepare(v) => Self::TableDropPrepare(v),
+				WendelonRequest::TableReclaimCompletion(v) => Self::TableReclaimCompletion(v),
+				WendelonRequest::TableDropFinalize(v) => Self::TableDropFinalize(v),
+				WendelonRequest::CtasSaga(v) => Self::CtasSaga(v),
+				WendelonRequest::ReplayLegacyCtasRowDispatched(v) => {
+					Self::ReplayLegacyCtasRowDispatched(v)
+				}
+			}
+		}
+	}
+
+	pub(crate) fn decode_entry(
+		payload: &[u8],
+	) -> std::io::Result<openraft::Entry<crate::consensus::WendelonTypeConfig>> {
+		let (entry, rest) =
+			postcard::take_from_bytes::<openraft::Entry<WendelonWalV5TypeConfig>>(payload)
+				.map_err(|err| {
+					std::io::Error::new(
+						std::io::ErrorKind::InvalidData,
+						format!("log entry postcard decode failed: {err}"),
+					)
+				})?;
+		if !rest.is_empty() {
+			return Err(std::io::Error::new(
+				std::io::ErrorKind::InvalidData,
+				format!(
+					"log entry decoded with {} unconsumed payload bytes",
+					rest.len()
+				),
+			));
+		}
+		let payload = match entry.payload {
+			openraft::EntryPayload::Blank => openraft::EntryPayload::Blank,
+			openraft::EntryPayload::Normal(request) => {
+				openraft::EntryPayload::Normal(request.into())
+			}
+			openraft::EntryPayload::Membership(membership) => {
+				openraft::EntryPayload::Membership(membership)
+			}
+		};
+		Ok(openraft::Entry {
+			log_id: entry.log_id,
+			payload,
+		})
+	}
+}

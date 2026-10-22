@@ -19458,6 +19458,93 @@ pub(crate) mod body_format_corpus {
 	const SNAPSHOT_V5_MANIFEST: &str =
 		include_str!("../../tests/fixtures/consensus_body/snapshot_v5.txt");
 
+	// Frozen before adding conditional promoted-JOIN commands. Never regenerate
+	// these bytes to repair drift; fork any payload leaf that subsequently moves.
+	const WAL_V5_OUTGOING_MANIFEST: &str =
+		include_str!("../../tests/fixtures/consensus_body/wal_v5_entries.txt");
+	const WAL_V5_OUTGOING_NAMES: [&str; 29] = [
+		"finalize",
+		"acquire_lease",
+		"release_lease",
+		"advance_epoch",
+		"schema_update",
+		"tier_slab",
+		"retire_tiered_slab",
+		"compaction_commit",
+		"seed_migration",
+		"migration_complete",
+		"create_tenant",
+		"update_tenant_quota",
+		"suspend_tenant",
+		"resume_tenant",
+		"delete_tenant",
+		"install_tenant_kek_version",
+		"retire_tenant_kek_version",
+		"revoke_actor_key",
+		"set_table_retention_policy",
+		"table_drop_prepare",
+		"table_reclaim_completion",
+		"table_drop_finalize",
+		"ctas_saga",
+		"replay_legacy_ctas_row_dispatched",
+		"table_drop_logical_finalize",
+		"table_drop_settlement",
+		"root2_command",
+		"membership",
+		"blank",
+	];
+
+	#[test]
+	fn pd11_frozen_outgoing_v5_spine_and_corpus_are_byte_exact() {
+		let stored = parse_manifest(WAL_V5_OUTGOING_MANIFEST);
+		let mut names = WAL_V5_OUTGOING_NAMES.map(str::to_owned).to_vec();
+		names.sort();
+		assert_eq!(stored.keys().cloned().collect::<Vec<_>>(), names);
+		let live: BTreeMap<_, _> = wal_corpus().into_iter().collect();
+		for (name, payload) in stored {
+			assert_eq!(
+				&live[name.as_str()],
+				&payload,
+				"outgoing v5 leaf drift for {name}"
+			);
+			let (frozen, rest) = postcard::take_from_bytes::<
+				Entry<crate::consensus::wal_body::v5::WendelonWalV5TypeConfig>,
+			>(&payload)
+			.unwrap();
+			assert!(rest.is_empty(), "frozen v5 decoder left bytes for {name}");
+			assert_eq!(postcard::to_stdvec(&frozen).unwrap(), payload);
+			let converted = crate::consensus::wal_body::v5::decode_entry(&payload).unwrap();
+			assert_eq!(postcard::to_stdvec(&converted).unwrap(), payload);
+		}
+	}
+
+	#[test]
+	fn pd11_outgoing_v5_production_replay_matches_frozen_spine_and_rejects_suffix() {
+		for (name, payload) in parse_manifest(WAL_V5_OUTGOING_MANIFEST) {
+			let frozen = crate::consensus::wal_body::v5::decode_entry(&payload).unwrap();
+			let production = super::root2_carrier_tests::record(&payload, 5).unwrap();
+			assert_eq!(
+				postcard::to_stdvec(&production).unwrap(),
+				postcard::to_stdvec(&frozen).unwrap(),
+				"production replay drift for {name}"
+			);
+			let mut suffix = payload;
+			suffix.push(0);
+			assert!(
+				crate::consensus::wal_body::v5::decode_entry(&suffix)
+					.unwrap_err()
+					.to_string()
+					.contains("unconsumed payload bytes")
+			);
+			assert!(
+				super::root2_carrier_tests::record(&suffix, 5)
+					.unwrap_err()
+					.to_string()
+					.contains("format mismatch")
+			);
+		}
+	}
+
 	fn wal_corpus() -> Vec<(&'static str, Vec<u8>)> {
 		let mut corpus: Vec<(&'static str, Vec<u8>)> = canonical_requests()
 			.into_iter()
