@@ -444,9 +444,39 @@ observed durably (review N2). Neither note blocks the jointly reviewed source.
 
 ### Security incident follow-up: eMudhra trust roots and starter signing keys
 
-- Advisory received by browser root programs: 2026-10-17 18:05 UTC ([Chrome primary report](https://blog.google/security/protecting-chrome-and-android-users-from-compromised-emudhra-intermediate-ca-certificates/)).
-- Nilket exposure identified: 2026-10-22, bundled PostgreSQL TLS roots retained emSign ECC Root CA - G3. [RUSTSEC-2026-0381](https://rustsec.org/advisories/RUSTSEC-2026-0381) / [0383](https://rustsec.org/advisories/RUSTSEC-2026-0383) require roots/root-certs >=1.0.10.
-- Cut C remediation prepared: both lockfiles update the two root bundles to 1.0.10, root absence regression; operator-facing starter keys use independent OS randomness with `allow_dev_keys=false` and consistent enrollment. Publication/fast-forward time: PENDING Cut C acceptance, not yet landed. Compute time-to-remediate from advisory, exposure detection, and actual publication separately.
+- Public advisory milestone: [RUSTSEC-2026-0381](https://rustsec.org/advisories/RUSTSEC-2026-0381) and [RUSTSEC-2026-0383](https://rustsec.org/advisories/RUSTSEC-2026-0383) were issued 2026-10-20 (reported 10-19, modified 10-21); the [Chrome public report](https://blog.google/security/protecting-chrome-and-android-users-from-compromised-emudhra-intermediate-ca-certificates/) is also dated 10-20. These sources provide date precision for publication. Chrome Root Program's private receipt at 2026-10-17 18:05 UTC is separate context, not the public-advisory start.
+- Project exposure was detected **by** 2026-10-22 18:19:46.509 UTC: Claude's first durable exposure request `01a164d7-2fcd-764e-bf07-8dc41b6a62eb`. The finding occurred minutes before the request; no earlier precise project detection timestamp is established. Bundled PostgreSQL TLS roots retained emSign ECC Root CA - G3. The advisories require roots/root-certs >=1.0.10 for the resolved 1.x bundles.
+- Source remediation was ready at 2026-10-22 18:54:34 UTC (`114288cdc1d18a192f37a8d4b9806a6b8c5558c8`): both lockfiles update the bundles to 1.0.10 with a root-absence regression; starter signing keys use independent OS randomness with `allow_dev_keys=false` and consistent enrollment. First source/local gate-ready clearance was 20:30:37.484 UTC (`01a1654e-fbac-7322-ab12-108bfdd1a0d8`, candidate `83503319a2192330c1c5c19b72cf15706dd0a7a5`). This was not full gate acceptance or publication.
+- Cut C **published** as `b16dc4ef349e7546e95efb6bf61e1663b976576e` (tree `20196e154ba8d14ca3a845f17482df965f30b2e3`): `origin/main` publication confirmed 2026-10-23 01:02:43.434962 UTC after a fast-forward from `892dc9d26e8207a28f5a1a2fe24100e7f5252a9b` and a push with the exact previous-ref lease. This is repository publication confirmation, not a fleet deployment timestamp. Quorum clearance: `01a16647-5deb-72dc-a682-9e1bab62cb30`; receipts: `/home/me/work/reviews/cut-c-publication-20261023/`.
+
+#### E3 remediation intervals and gate history
+
+| Interval | Measured result and precision |
+|---|---|
+| Public advisory -> durable project detection request | 2026-10-20 (date only) -> 2026-10-22 18:19:46.509 UTC: about 42–66 hours. Actual discovery preceded the request by an unmeasured few minutes; no exact detection-latency claim. |
+| Durable exposure request -> first source/local gate-ready clearance | 2h 10m 50.975s; source-fix-ready submilestone at 18:54:34 UTC. |
+| First source/local gate-ready clearance -> repository publication confirmation | 4h 32m 05.950962s, including the stopped first gate, fixture repair, fresh complete gates and joint audit. |
+
+The operator estimated 12+ hours of delay associated with hospital/surgery
+availability. This is an operator-reported estimate, not a measured interval or
+a medical inference. There was no automated project advisory check. A watch
+could have flagged the RustSec entries from their database availability on
+10-20 and its first successful scheduled check, not from Chrome's private
+10-17 receipt. The planned advisory gate/watch is a separate follow-up.
+
+The first gate's `nilket-test rc=101` at 2026-10-22 21:18:15 UTC exposed an
+E2 caller-audit miss: a CLI wrapper equality assertion assumed deterministic
+renders. The observer stopped the supervisor once; this run remains STOP,
+never PASS. The stronger fixture checks nine independent secrets across API
+and two CLI renders while retaining equality for every other byte. Candidate
+`b16dc4ef3` passed full local Nilket coverage before the approved fresh gate.
+Main2 completed 51/51 rc0, DONE+CLEANED (last command 2026-10-23 00:43:17 UTC);
+root2 completed 2/2 rc0, DONE+CLEANED (distrust test completed 01:00:54 UTC,
+exactly one named test passed, zero failed/ignored). Both supervisors finished
+inactive-success with empty owned slices. Independent joint audit receipts:
+`/home/me/work/reviews/cut-c-claude-audit-20261023/`. The first gate-ready clock
+is preserved across the failed gate and repair.
+
 - Lockfile metadata also reconciles existing key-guard serde_json/zeroize dependency edges in the root workspace (no package version change); polariton adds explicit dev dependencies for the two root bundle regression checks.
 - Follow-up OPEN: gate deterministic `NodeBootstrapConfig::dev()` and `dev_*_signing_secret` behind test support after a complete integration-fixture caller/feature audit. This incident patch preserves the explicit in-code API; starter TOML never opts into those keys. Avoid globally forcing unrelated test-support behavior or dropping integration test names during that migration.
 
