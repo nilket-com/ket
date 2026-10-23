@@ -2744,45 +2744,6 @@ impl PreparedSlabDek {
 	}
 }
 
-struct ChunkSealBuffer<'a> {
-	body: &'a mut [u8],
-	suffix: &'a mut [u8],
-	suffix_len: usize,
-}
-
-impl<'a> ChunkSealBuffer<'a> {
-	fn new(body: &'a mut [u8], suffix: &'a mut [u8]) -> Self {
-		Self {
-			body,
-			suffix,
-			suffix_len: 0,
-		}
-	}
-
-	fn suffix_len(&self) -> usize {
-		self.suffix_len
-	}
-}
-
-impl AsMut<[u8]> for ChunkSealBuffer<'_> {
-	fn as_mut(&mut self) -> &mut [u8] {
-		self.body
-	}
-}
-
-impl<'a> Extend<&'a u8> for ChunkSealBuffer<'_> {
-	fn extend<T: IntoIterator<Item = &'a u8>>(&mut self, iter: T) {
-		for byte in iter {
-			assert!(
-				self.suffix_len < self.suffix.len(),
-				"AEAD append exceeded reserved tag capacity"
-			);
-			self.suffix[self.suffix_len] = *byte;
-			self.suffix_len += 1;
-		}
-	}
-}
-
 fn encrypt_stats_block(
 	prepared: &PreparedSlabDek,
 	cipher_id: CipherId,
@@ -2812,12 +2773,11 @@ fn seal_stats_block(
 	let mut out = vec![0_u8; plaintext.len() + SLAB_AEAD_TAG_BYTES];
 	let (body, tag) = out.split_at_mut(plaintext.len());
 	body.copy_from_slice(plaintext);
-	let mut in_out = ChunkSealBuffer::new(body, tag);
 	// The stats block uses the slab DEK and a reserved nonce-domain value.
 	// Slab chunk indices cannot reach u64::MAX under the hard slab size cap.
-	prepared
+	let sealed_tag = prepared
 		.aead()
-		.seal_in_place_append_tag(
+		.seal_in_place_separate_tag(
 			Nonce::assume_unique_for_key(encode_stats_nonce()),
 			Aad::from(encode_stats_aad(
 				tenant_id,
@@ -2825,10 +2785,11 @@ fn seal_stats_block(
 				cipher_id,
 				schema_generation,
 			)),
-			&mut in_out,
+			body,
 		)
 		.map_err(|_| Error::other("ADR 039 stats block encrypt failed"))?;
-	debug_assert_eq!(in_out.suffix_len(), SLAB_AEAD_TAG_BYTES);
+	assert_eq!(sealed_tag.as_ref().len(), SLAB_AEAD_TAG_BYTES);
+	tag.copy_from_slice(sealed_tag.as_ref());
 	Ok(out)
 }
 
@@ -2907,13 +2868,12 @@ fn encrypt_chunk_range(
 		let (chunk_buf, tag_buf) =
 			out[local_cipher_start..local_cipher_end].split_at_mut(plaintext_bounds.len());
 		chunk_buf.copy_from_slice(&plaintext[plaintext_bounds.clone()]);
-		let mut in_out = ChunkSealBuffer::new(chunk_buf, tag_buf);
 		// Safety: `LessSafeKey` is sound here because slab encryption mints a
 		// fresh DEK per slab, and chunk nonces are injectively derived from the
 		// chunk index within that slab. The `(key, nonce)` pair cannot repeat.
-		prepared
+		let sealed_tag = prepared
 			.aead()
-			.seal_in_place_append_tag(
+			.seal_in_place_separate_tag(
 				Nonce::assume_unique_for_key(encode_chunk_nonce(chunk_index as u64)),
 				Aad::from(encode_chunk_aad(
 					tenant_id,
@@ -2922,10 +2882,11 @@ fn encrypt_chunk_range(
 					slab_format_version,
 					cipher_id,
 				)),
-				&mut in_out,
+				chunk_buf,
 			)
 			.map_err(|_| Error::other("slab chunk encrypt failed"))?;
-		debug_assert_eq!(in_out.suffix_len(), SLAB_AEAD_TAG_BYTES);
+		assert_eq!(sealed_tag.as_ref().len(), SLAB_AEAD_TAG_BYTES);
+		tag_buf.copy_from_slice(sealed_tag.as_ref());
 	}
 	Ok(())
 }
@@ -7531,6 +7492,134 @@ mod tests {
 				.unwrap()
 				.plaintext,
 			b"after rotation"
+		);
+	}
+
+	// Frozen from 71e096320 + aws-lc-rs 1.16.3, before the separate-tag repair.
+	// Fixed DEK=[0x35;32], tenant=7, slab=42, generation=9, chunk size=16.
+	// These are format compatibility controls; this key/nonce reuse is test-only.
+	const E1_1_SLAB_PLAINTEXT: &[u8] = b"fixed slab format control: three chunks!";
+
+	fn e1_1_prepared_key(cipher: CipherId) -> PreparedSlabDek {
+		let key = KeyMaterialBytes::copy_from_slice(&[0x35; 32], "format control").unwrap();
+		PreparedSlabDek::new(cipher, Arc::new(LockedKeyMaterial::new(key).unwrap())).unwrap()
+	}
+
+	fn e1_1_assert_stats_format(cipher: CipherId, expected: &[u8]) {
+		let prepared = e1_1_prepared_key(cipher);
+		let tenant = TenantId::new(7);
+		let slab = SlabId::new(42);
+		assert_eq!(
+			seal_stats_block(&prepared, cipher, tenant, slab, 9, E1_1_SLAB_PLAINTEXT).unwrap(),
+			expected
+		);
+		let locator = TieredStatsBlockLocator {
+			stats_format_version: SLAB_STATS_FORMAT_VERSION_ADR039,
+			stats_flags: 0,
+			stats_block_len: expected.len() as u32,
+			stats_plaintext_len: E1_1_SLAB_PLAINTEXT.len() as u32,
+			stats_column_count: 0,
+			stats_block_hash128: stats_ciphertext_hash128(expected),
+		};
+		assert_eq!(
+			decrypt_stats_block(&prepared, cipher, tenant, slab, 9, locator, expected).unwrap(),
+			E1_1_SLAB_PLAINTEXT
+		);
+	}
+
+	fn e1_1_assert_chunks_format(cipher: CipherId, expected: &[u8]) {
+		let prepared = e1_1_prepared_key(cipher);
+		let tenant = TenantId::new(7);
+		let slab = SlabId::new(42);
+		let size = ChunkSizeBytes::new(16);
+		let mut ciphertext = vec![0; E1_1_SLAB_PLAINTEXT.len() + 3 * SLAB_AEAD_TAG_BYTES];
+		encrypt_chunk_range(
+			&prepared,
+			cipher,
+			tenant,
+			slab,
+			SLAB_ENVELOPE_FORMAT_VERSION_WITH_STATS,
+			size,
+			E1_1_SLAB_PLAINTEXT,
+			0..3,
+			&mut ciphertext,
+		)
+		.unwrap();
+		assert_eq!(ciphertext, expected);
+		let mut plaintext = vec![0; E1_1_SLAB_PLAINTEXT.len()];
+		decrypt_chunk_range(
+			&prepared,
+			cipher,
+			tenant,
+			slab,
+			SLAB_ENVELOPE_FORMAT_VERSION_WITH_STATS,
+			size,
+			E1_1_SLAB_PLAINTEXT.len(),
+			expected,
+			0..3,
+			&mut plaintext,
+		)
+		.unwrap();
+		assert_eq!(plaintext, E1_1_SLAB_PLAINTEXT);
+	}
+
+	#[test]
+	fn e1_1_gcm_stats_matches_base_format() {
+		e1_1_assert_stats_format(
+			CipherId::Aes256GcmInjective,
+			&[
+				0x17, 0xd0, 0xc7, 0xa6, 0xec, 0xe7, 0x94, 0x40, 0xb1, 0xfd, 0x52, 0x69, 0x88, 0xbb,
+				0x4d, 0xdb, 0x80, 0x41, 0xf2, 0xdd, 0xb9, 0xb6, 0xc8, 0xce, 0x67, 0x59, 0xb4, 0x4d,
+				0xa1, 0x92, 0x42, 0x4a, 0x5b, 0xa8, 0x80, 0xbd, 0xe3, 0x7b, 0x9b, 0x44, 0x1e, 0xc2,
+				0xdc, 0x94, 0xf5, 0xe0, 0x1d, 0xe8, 0x7d, 0x4f, 0x12, 0xa5, 0x06, 0x6e, 0x97, 0x0e,
+			],
+		);
+	}
+
+	#[test]
+	fn e1_1_gcm_chunks_matches_base_format() {
+		e1_1_assert_chunks_format(
+			CipherId::Aes256GcmInjective,
+			&[
+				0x41, 0x0b, 0x00, 0x84, 0x83, 0xf5, 0x15, 0x2d, 0x3a, 0x02, 0x9b, 0xd2, 0x45, 0x18,
+				0x14, 0x15, 0x44, 0x5b, 0x80, 0x11, 0x47, 0x4d, 0x0e, 0x33, 0x73, 0x58, 0x59, 0x0c,
+				0xc8, 0xcc, 0xdc, 0xb8, 0x58, 0xd4, 0x34, 0xe8, 0x1d, 0x37, 0x99, 0x4f, 0xa6, 0xe9,
+				0x61, 0xbb, 0x97, 0x42, 0x9d, 0xea, 0xb3, 0x78, 0x3c, 0x71, 0xa2, 0x0b, 0xfb, 0x3b,
+				0xc3, 0xb6, 0x77, 0x7a, 0x21, 0xb8, 0x7f, 0xd5, 0x2b, 0x6e, 0xcb, 0x00, 0x71, 0xf5,
+				0x1f, 0xcb, 0xfa, 0x94, 0x79, 0xc0, 0xf0, 0x43, 0xb0, 0x77, 0x32, 0x56, 0xf7, 0xb1,
+				0x18, 0x59, 0x8a, 0x64,
+			],
+		);
+	}
+
+	#[cfg(not(feature = "fips"))]
+	#[test]
+	fn e1_1_gcm_siv_stats_matches_base_format() {
+		e1_1_assert_stats_format(
+			CipherId::Aes256GcmSiv,
+			&[
+				0x16, 0x1f, 0x81, 0xef, 0x82, 0x11, 0x37, 0x25, 0x75, 0xf7, 0x69, 0x8c, 0x94, 0x59,
+				0x87, 0x00, 0x4f, 0x36, 0xce, 0x27, 0x2d, 0x4c, 0x14, 0x2e, 0xd5, 0x2e, 0xb7, 0x8a,
+				0x08, 0x21, 0x73, 0xf1, 0x59, 0x8b, 0xf4, 0xab, 0x43, 0x52, 0x92, 0xbf, 0xa3, 0x30,
+				0x0c, 0xa9, 0xe2, 0x51, 0x51, 0x1a, 0x94, 0xed, 0xa2, 0x42, 0xa6, 0x32, 0x73, 0x84,
+			],
+		);
+	}
+
+	#[cfg(not(feature = "fips"))]
+	#[test]
+	fn e1_1_gcm_siv_chunks_matches_base_format() {
+		e1_1_assert_chunks_format(
+			CipherId::Aes256GcmSiv,
+			&[
+				0xd7, 0x38, 0x8c, 0x85, 0x1e, 0x89, 0x95, 0x54, 0xb8, 0xd7, 0x5b, 0x0e, 0x27, 0x19,
+				0xda, 0x3b, 0x2e, 0x18, 0xf7, 0xa9, 0xa0, 0xae, 0x00, 0x80, 0x49, 0xcf, 0xc1, 0x7c,
+				0x01, 0x2c, 0x33, 0x84, 0x46, 0x8c, 0x68, 0x42, 0x1f, 0x99, 0xe3, 0x00, 0xce, 0xc2,
+				0x65, 0x5b, 0xe4, 0x52, 0x69, 0x01, 0x81, 0xd3, 0xb6, 0x77, 0xe9, 0xcb, 0xbd, 0xdc,
+				0x2c, 0x68, 0x04, 0x6d, 0x7b, 0x2a, 0xd2, 0xd5, 0x95, 0x82, 0x55, 0xcb, 0xfc, 0x8d,
+				0x9e, 0xa6, 0x73, 0x2a, 0x4c, 0x02, 0xdd, 0x2a, 0xc8, 0x0c, 0x26, 0xed, 0x96, 0x9b,
+				0x30, 0x04, 0xa7, 0x80,
+			],
 		);
 	}
 }

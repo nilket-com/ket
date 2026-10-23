@@ -622,3 +622,42 @@ and no root supplement was launched. Raw logs and remote/local hash equality:
 `/home/me/work/reviews/cut-c-main-stop-20261022-1/`. A corrected source freeze,
 local full Nilket CLI checks, review and a new named complete gate are required;
 the original run is retained and must not be retried or overwritten.
+
+### CRYPTO-01: slab seal adapter exposes a body-only slice (2026-10-23)
+
+Severity: latent unsoundness on published main 71e096320; no observed
+corruption. This is a deterministic crypto compatibility defect, not a
+parallel-only candidate. Wendelon's ChunkSealBuffer exposes only the plaintext
+body through AsMut<[u8]>, while its Extend writes into a separate suffix.
+With aws-lc-rs 1.16.3, combined sealing passed that body pointer to FFI with
+plaintext-plus-tag output capacity: an out-of-bounds write relative to the Rust
+slice, correct in practice only because split_at_mut kept the reserved suffix
+adjacent in the underlying allocation. aws-lc-rs 1.18.2 checks the actual
+post-extend slice length and rejects the adapter before that write.
+
+Cut E1 e584b3b76 exposed the defect in cut-e1-ladder-1-20261023:
+raft-storage-pins rc=101, 195 passed / 1 failed / 2 ignored, at
+tenant_keysets_survive_snapshot_reopen_and_presnapshot_slabs_still_decrypt
+with "slab chunk encrypt failed". The supervisor stopped once; owned processes
+were reaped, logs and the failing executable retained, and only disposable
+source/build/tmp state removed. The root supplement never launched. This run
+remains STOP and must not be retried or overwritten.
+
+Bounded slim controls at one test thread passed on base 71e096320 and failed
+on unchanged E1: both fixed-input cipher controls and the exact recovery test.
+Both probes selected AES-256-GCM-SIV. The separate fixed-input controls cover
+AES-256-GCM as well. The recovery fixture generates random keys; the format
+controls fix the DEK, nonce, AAD and plaintext. A single-family downgrade is
+incompatible with rustls 0.23.46's aws-lc-rs ^1.18 requirement.
+
+E1.1 repairs both stats-block and multi-chunk sealing by using
+seal_in_place_separate_tag on the body, checking the tag length and copying the
+tag into its reserved suffix; the custom adapter is removed. Frozen vectors
+come from the base build, covering both ciphers, stats blocks and three chunks.
+The controls require exact ciphertext/tag identity and use the actual readers
+to decrypt the base outputs. Nonce/AAD formats and cipher selection stay fixed.
+Evidence: /home/me/work/reviews/cut-e1-crypto-repair-20261023/.
+
+State: source repair and focused validation in progress. Joint source review,
+fresh named main ladder-2, root supplement, final audit and publication remain
+required. Successful controls do not convert ladder-1 into a PASS.
