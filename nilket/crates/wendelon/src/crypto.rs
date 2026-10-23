@@ -7498,41 +7498,41 @@ mod tests {
 	// Frozen from 71e096320 + aws-lc-rs 1.16.3, before the separate-tag repair.
 	// Fixed DEK=[0x35;32], tenant=7, slab=42, generation=9, chunk size=16.
 	// These are format compatibility controls; this key/nonce reuse is test-only.
-	const E1_1_SLAB_PLAINTEXT: &[u8] = b"fixed slab format control: three chunks!";
+	const FROZEN_SLAB_PLAINTEXT: &[u8] = b"fixed slab format control: three chunks!";
 
-	fn e1_1_prepared_key(cipher: CipherId) -> PreparedSlabDek {
+	fn prepared_slab_format_key(cipher: CipherId) -> PreparedSlabDek {
 		let key = KeyMaterialBytes::copy_from_slice(&[0x35; 32], "format control").unwrap();
 		PreparedSlabDek::new(cipher, Arc::new(LockedKeyMaterial::new(key).unwrap())).unwrap()
 	}
 
-	fn e1_1_assert_stats_format(cipher: CipherId, expected: &[u8]) {
-		let prepared = e1_1_prepared_key(cipher);
+	fn assert_slab_stats_frozen_format(cipher: CipherId, expected: &[u8]) {
+		let prepared = prepared_slab_format_key(cipher);
 		let tenant = TenantId::new(7);
 		let slab = SlabId::new(42);
 		assert_eq!(
-			seal_stats_block(&prepared, cipher, tenant, slab, 9, E1_1_SLAB_PLAINTEXT).unwrap(),
+			seal_stats_block(&prepared, cipher, tenant, slab, 9, FROZEN_SLAB_PLAINTEXT).unwrap(),
 			expected
 		);
 		let locator = TieredStatsBlockLocator {
 			stats_format_version: SLAB_STATS_FORMAT_VERSION_ADR039,
 			stats_flags: 0,
 			stats_block_len: expected.len() as u32,
-			stats_plaintext_len: E1_1_SLAB_PLAINTEXT.len() as u32,
+			stats_plaintext_len: FROZEN_SLAB_PLAINTEXT.len() as u32,
 			stats_column_count: 0,
 			stats_block_hash128: stats_ciphertext_hash128(expected),
 		};
 		assert_eq!(
 			decrypt_stats_block(&prepared, cipher, tenant, slab, 9, locator, expected).unwrap(),
-			E1_1_SLAB_PLAINTEXT
+			FROZEN_SLAB_PLAINTEXT
 		);
 	}
 
-	fn e1_1_assert_chunks_format(cipher: CipherId, expected: &[u8]) {
-		let prepared = e1_1_prepared_key(cipher);
+	fn assert_slab_chunks_frozen_format(cipher: CipherId, expected: &[u8]) {
+		let prepared = prepared_slab_format_key(cipher);
 		let tenant = TenantId::new(7);
 		let slab = SlabId::new(42);
 		let size = ChunkSizeBytes::new(16);
-		let mut ciphertext = vec![0; E1_1_SLAB_PLAINTEXT.len() + 3 * SLAB_AEAD_TAG_BYTES];
+		let mut ciphertext = vec![0; FROZEN_SLAB_PLAINTEXT.len() + 3 * SLAB_AEAD_TAG_BYTES];
 		encrypt_chunk_range(
 			&prepared,
 			cipher,
@@ -7540,13 +7540,13 @@ mod tests {
 			slab,
 			SLAB_ENVELOPE_FORMAT_VERSION_WITH_STATS,
 			size,
-			E1_1_SLAB_PLAINTEXT,
+			FROZEN_SLAB_PLAINTEXT,
 			0..3,
 			&mut ciphertext,
 		)
 		.unwrap();
 		assert_eq!(ciphertext, expected);
-		let mut plaintext = vec![0; E1_1_SLAB_PLAINTEXT.len()];
+		let mut plaintext = vec![0; FROZEN_SLAB_PLAINTEXT.len()];
 		decrypt_chunk_range(
 			&prepared,
 			cipher,
@@ -7554,18 +7554,18 @@ mod tests {
 			slab,
 			SLAB_ENVELOPE_FORMAT_VERSION_WITH_STATS,
 			size,
-			E1_1_SLAB_PLAINTEXT.len(),
+			FROZEN_SLAB_PLAINTEXT.len(),
 			expected,
 			0..3,
 			&mut plaintext,
 		)
 		.unwrap();
-		assert_eq!(plaintext, E1_1_SLAB_PLAINTEXT);
+		assert_eq!(plaintext, FROZEN_SLAB_PLAINTEXT);
 	}
 
 	#[test]
-	fn e1_1_gcm_stats_matches_base_format() {
-		e1_1_assert_stats_format(
+	fn slab_stats_gcm_matches_frozen_format() {
+		assert_slab_stats_frozen_format(
 			CipherId::Aes256GcmInjective,
 			&[
 				0x17, 0xd0, 0xc7, 0xa6, 0xec, 0xe7, 0x94, 0x40, 0xb1, 0xfd, 0x52, 0x69, 0x88, 0xbb,
@@ -7577,8 +7577,8 @@ mod tests {
 	}
 
 	#[test]
-	fn e1_1_gcm_chunks_matches_base_format() {
-		e1_1_assert_chunks_format(
+	fn slab_chunks_gcm_matches_frozen_format() {
+		assert_slab_chunks_frozen_format(
 			CipherId::Aes256GcmInjective,
 			&[
 				0x41, 0x0b, 0x00, 0x84, 0x83, 0xf5, 0x15, 0x2d, 0x3a, 0x02, 0x9b, 0xd2, 0x45, 0x18,
@@ -7594,8 +7594,8 @@ mod tests {
 
 	#[cfg(not(feature = "fips"))]
 	#[test]
-	fn e1_1_gcm_siv_stats_matches_base_format() {
-		e1_1_assert_stats_format(
+	fn slab_stats_gcm_siv_matches_frozen_format() {
+		assert_slab_stats_frozen_format(
 			CipherId::Aes256GcmSiv,
 			&[
 				0x16, 0x1f, 0x81, 0xef, 0x82, 0x11, 0x37, 0x25, 0x75, 0xf7, 0x69, 0x8c, 0x94, 0x59,
@@ -7608,8 +7608,8 @@ mod tests {
 
 	#[cfg(not(feature = "fips"))]
 	#[test]
-	fn e1_1_gcm_siv_chunks_matches_base_format() {
-		e1_1_assert_chunks_format(
+	fn slab_chunks_gcm_siv_matches_frozen_format() {
+		assert_slab_chunks_frozen_format(
 			CipherId::Aes256GcmSiv,
 			&[
 				0xd7, 0x38, 0x8c, 0x85, 0x1e, 0x89, 0x95, 0x54, 0xb8, 0xd7, 0x5b, 0x0e, 0x27, 0x19,
