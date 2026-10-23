@@ -1,0 +1,7 @@
+[Unit]
+Description=Owned Rust advisory scanner slice
+
+[Slice]
+MemoryMax=640M
+TasksMax=96
+CPUQuota=50%

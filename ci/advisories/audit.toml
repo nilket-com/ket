@@ -1,0 +1,11 @@
+[advisories]
+ignore = []
+informational_warnings = ["unmaintained", "unsound", "notice"]
+[output]
+deny = []
+format = "json"
+show_tree = false
+quiet = false
+[yanked]
+enabled = false
+update_index = false

@@ -1,0 +1,816 @@
+{
+  "schema": 1,
+  "oversize": [
+    {
+      "path": "nilket/crates/toron/plans/adr/0001_toron_foundation_and_engine_contract.md",
+      "blob": "861e358fc22fd35ed4e4acf69e1f41ed4f452c73",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/toron/plans/adr/0002_toron_storage_backed_execution_contract.md",
+      "blob": "6a93477c4049ccebca2e75e9b3ab1f62ca16b494",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/toron/plans/adr/0003_toron_distributed_runtime_and_data_movement.md",
+      "blob": "07cbde33570a0948dbbf108e3b6b919a0a13feb0",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/toron/plans/adr/0004_distributed_inner_equi_join.md",
+      "blob": "8ebb851681c53132fb259c5faaee584e594fed1a",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/toron/plans/adr/0005_hash_join_build_path_efficiency.md",
+      "blob": "33c8da463aa1a5e3b860bb2033a882b8e7db3c0b",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/toron/plans/adr/0006_runtime_filter_pushdown.md",
+      "blob": "04912ee4efd8538f9b27c1b7442095216bc569d8",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/toron/plans/adr/0007_rune_sandbox_enforcement.md",
+      "blob": "cdd2d4f40495f1cfdb2e337fbc932b3043cbb212",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/toron/plans/adr/0008_outer_semi_anti_joins.md",
+      "blob": "d5737e8b049afe7027e1199339acd30a147825e1",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/toron/plans/adr/0009_correlated_exists_decorrelation.md",
+      "blob": "328d65b4d398bdf1afea656dd39471f03cf61717",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/toron/plans/adr/0010_top_level_clause_accounting_and_ordering.md",
+      "blob": "7c910c2bdafde10bcd465f5f65acf8eafd6baceb",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/toron/plans/adr/0011_aggregate_projection_accounting_and_group_by.md",
+      "blob": "9f1e288b624f0af09a561f3502570def1e1c9d4d",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/toron/plans/adr/0016_post_aggregate_filtering_with_having.md",
+      "blob": "2f3ce9d1176fe1c1332bb3db1a07b4569a377a1c",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/toron/plans/adr/0017_order_by_aggregate_call.md",
+      "blob": "bc39f815fc02c0ba4613932a429a9ef1f69d1b9d",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/toron/plans/adr/0018_scalar_aggregate_having_order_by.md",
+      "blob": "c26b78958276282c65d1c434c92e855972d798d8",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/toron/plans/adr/0019_min_max_aggregate_kernels.md",
+      "blob": "4329070f46d1ac960e4e273638fba37de3728a40",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/toron/plans/adr/0020_avg_aggregate_kernel.md",
+      "blob": "17f3e947096d984a6dc7c5dabad7968439be4ad4",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/toron/plans/adr/0021_aggregate_kernel_catalog_refactor.md",
+      "blob": "9e5a1af352362a610c20067f0c3a13b068d2b7cb",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/toron/plans/adr/0022_float_min_max_aggregate_kernels.md",
+      "blob": "4bbfe1341f4981b9a160907c2d5648e979cc24c0",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/toron/plans/adr/0023_post_aggregate_projection.md",
+      "blob": "531410e1ac76484fe0165e0729797fcd61d4892c",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/toron/plans/adr/0024_scalar_arithmetic_expression_ir.md",
+      "blob": "492b9fd449c45de789cfdd66d5971c2ec0e36eae",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/toron/plans/adr/0025_sql_cast_numeric_primitive_lattice.md",
+      "blob": "ca4a231ad6ef3856dff83dcdc7e8bc04bd4d3594",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/toron/plans/adr/0026_try_cast_numeric_primitive_lattice.md",
+      "blob": "d263afc8aeb422f67cfb90ac3c01d4f9af8528d1",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/toron/plans/adr/0027_order_by_computed_expressions.md",
+      "blob": "c8d68cda62342e9ae08babdf8b7144d39b4f03b9",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/toron/plans/adr/0028_computed_aggregate_arguments.md",
+      "blob": "e1b09471cae97f9dd16163b8b3d97df87a2bdb81",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/toron/plans/adr/0029_create_table_ddl.md",
+      "blob": "fb60cdebedca2fcb0d241f7c3e2e66c933537fc6",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/toron/plans/adr/0030_insert_into_values.md",
+      "blob": "c0c09c91eac0197b30dc647c9cb5d4b4ca20bead",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/toron/plans/adr/0031_bound_expr_program.md",
+      "blob": "d600d18317190853ddd9696e766153d1c4ef11e0",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/toron/plans/adr/0032_insert_into_select.md",
+      "blob": "9ad4482f67ae06ce4d0834d33f11a1b8fcfcf0ad",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/toron/plans/adr/0033_create_table_as_select.md",
+      "blob": "ce21208c1ef0730129102f5c4df496a7b993b822",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/toron/plans/adr/0034_drop_table.md",
+      "blob": "667e39ade9ef71579aad8f977de383cccaa67e72",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/toron/plans/adr/0035_row_identity_predicate_delete_substrate.md",
+      "blob": "5dc94928476e46c6ced7e28f7ddc23652e268630",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/toron/plans/adr/0036_sql_delete_where.md",
+      "blob": "756ec8e30630e1ff6071243384aa08ae9452df7c",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/toron/plans/adr/0037_distributed_write_context.md",
+      "blob": "039ba5f6a89c372bbf08bfcd69d6cbb0d6c40986",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/toron/plans/adr/0038_storage_admin_reclaim_substrate.md",
+      "blob": "a30a654ea0fc28f200986d63a28c78c9d905aba0",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/toron/plans/adr/0039_wendelon_drop_migration_substrate.md",
+      "blob": "822dd8e699c4d0500f896f03ba73ca8d8a4e18bb",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/toron/plans/adr/0044_authenticated_remote_toron_quic_listeners.md",
+      "blob": "854856e91e144668d9e594f6e2c2e532242373ac",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/toron/plans/adr/0045_toron_daemon_observability_listeners.md",
+      "blob": "366ac62f55b9d9fa51ac23cf121b4a3392aba6d7",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/toron/plans/adr/0046_nilket_toron_inspect_real_wiring.md",
+      "blob": "75a7832bc3a33b21cec83a166239fb1e104360a3",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/toron/plans/adr/0047_shared_tls_pki_workspace_crate.md",
+      "blob": "fdce2e6a785a08249e7e383a3f4f67070f89fbc4",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/toron/plans/adr/0048_shared_observability_http_workspace_crate.md",
+      "blob": "3aac9ab04899f7bcce4f7753ca9a82842b8afdc7",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/toron/plans/adr/0049_authenticated_tenant_routing_for_sql.md",
+      "blob": "5d6a7b7a3ca87cd75ac79cc1d59831aba36ac459",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/toron/plans/adr/0546_stable_grouped_approximate_quantiles.md",
+      "blob": "dcdfc33d9221fc0b8d7acddd75579ae7c3db2d62",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/toron/plans/adr/0548_ctas_staged_publication.md",
+      "blob": "74915d87ddb60c382506fe7246e2e38224916167",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/toron/plans/adr/0553_typed_scalar_function_registry.md",
+      "blob": "5abd6dd8f4c01f78b041dd423109a7a8656763e6",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/toron/plans/adr/0554_remainder_has_two_mechanisms.md",
+      "blob": "e77c43aa76f64c0855fdbff86edc5be5c2219e5a",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/toron/plans/adr/0587_q21_summary_insert_decomposition.md",
+      "blob": "81151ec748b6d844b64445d806efa03ec9f3613f",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/toron/plans/adr/0589_q21_summary_order_aware_build.md",
+      "blob": "7fd4d85e3a2a57e87b9a129d5da4f3634a1a3938",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/toron/plans/adr/0625_three_host_authenticated_quic_bring_up.md",
+      "blob": "0067552c05b5f2de252d3b9341fbc8d600544550",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/toron/plans/adr/0626_bounded_recovery_from_unannounced_worker_loss.md",
+      "blob": "a766b051c673ed5bb9ea8e2e233c9c243f27c061",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/toron/plans/adr/0627_mid_task_worker_loss_diagnostic.md",
+      "blob": "64a92618431dc78e69faab577f7ed2d07019767f",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/toron/plans/adr/0628_query_lease_renewal_that_tolerates_delay.md",
+      "blob": "ed3d68b3d85293f01dc37534c048bcdad0123e44",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/toron/plans/adr/0629_trust_in_acknowledged_writes_store_soak.md",
+      "blob": "85008ac557279614778780bba856b970f8bcca85",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/wendelon/plans/adr/0038_column_aware_locality_v1_zorder.md",
+      "blob": "f528dcdb433625cfbea46ab7d8369400d930833c",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/wendelon/plans/adr/0039_slab_footer_column_statistics_v1.md",
+      "blob": "dd478a9e47c0d5e08bf39ff8b7eafb6fc1e43855",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/wendelon/plans/adr/0040_aggregate_pushdown.md",
+      "blob": "5dd0872ffc8e9bc49f2e2273518e203acb01efd0",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/wendelon/plans/adr/0042_analytical_multi_row_fragments.md",
+      "blob": "d711989d8dc8e5c3f58dd52d8913302ce0723a02",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/wendelon/plans/adr/0043_arrow_ipc_body_compression.md",
+      "blob": "d39d7ef6939d41e5295e6a4c85a8391569e9dd80",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/wendelon/plans/adr/0044_l2_columnar_fetch.md",
+      "blob": "d3d7edf48f100555df7a477f8167703f565ae2b3",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/wendelon/plans/adr/0045_pk_less_append_only_tables.md",
+      "blob": "0574538faed2456d433aca421dfb376a87bbb1ba",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/wendelon/plans/adr/0046_state_digest_substrate.md",
+      "blob": "1b8ad2e979494cde58a1123ab95207f15944c5c3",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/wendelon/plans/adr/0047_row_tombstones_append_only.md",
+      "blob": "4471c6182b9afe4358f234e89dc5c41740608a69",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/wendelon/plans/adr/0048_per_table_retention_policy.md",
+      "blob": "eb6143cd7fed101271c48f1c719807e8e0060521",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/wendelon/plans/adr/0049_content_hash_row_identity.md",
+      "blob": "b324a286e3b38916ef347e019150d2775e51fece",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/wendelon/plans/adr/0050_pk_delete_supersession.md",
+      "blob": "49a0ad183287e71cc4dbafd6cfc0f733d205d5c0",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/wendelon/plans/adr/0051_descriptor_fingerprint_split.md",
+      "blob": "df666327790e507b5e44b5c57d755040e6c08bc9",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/wendelon/plans/adr/0052_secondary_indexes.md",
+      "blob": "8d6731a3af0c889e099b8858b9f7d1b0b0a01e1c",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/wendelon/plans/adr/0053_wire_arrow_ipc_body_compression.md",
+      "blob": "e19b0b80e4ce3740360299aeb367596646c056fd",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/wendelon/plans/adr/0054_cdc_subscription_substrate.md",
+      "blob": "d612389999f84c1f08bdb0f2e65b98f4c1aa1096",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/wendelon/plans/adr/0055_lsm_leveled_compaction_substrate.md",
+      "blob": "198012bae0e6549812ed0234bbebd09909a3ddfb",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/wendelon/plans/adr/0056_row_group_fetch_and_page_directory.md",
+      "blob": "f029e585c7f616038232ba3788c2cfed8b535d25",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/wendelon/plans/adr/0057_per_buffer_pages_and_encoding_cascades.md",
+      "blob": "3edaeaf083286358f19c907a3a140007bb29123c",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/wendelon/plans/adr/0058_compute_over_encoded_data.md",
+      "blob": "a94292bce78e708d4445e1e0fe3a5a7863fc7527",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/wendelon/plans/adr/0059_native_cocd_kernels.md",
+      "blob": "f844ad2d8e5782a011755e3699a345913f21bf55",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/wendelon/plans/adr/0060_sparse_projection_fetch_narrowing.md",
+      "blob": "1ab9a3e446035b1a952d1d34bf85fbd1aca0a8b7",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/wendelon/plans/adr/0061_page_aligned_authenticated_chunk_layout.md",
+      "blob": "bf99b38ede02e9d2ca62ccac76488ad100b7e7fc",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/wendelon/plans/adr/0062_row_group_sizing_profile.md",
+      "blob": "d2c563dbbdb9cabecbb47135cb3cc379ffa89e59",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/wendelon/plans/adr/0063_page_level_predicate_stats.md",
+      "blob": "7f27b2f5039f5f783388586cfc8a24054da6cd38",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/wendelon/plans/adr/0064_nullable_sparse_projection.md",
+      "blob": "b18ba71073335d6384b52b871fba81bace45a1c9",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/wendelon/plans/adr/0065_dense_predicate_zip_with_sparse_projection.md",
+      "blob": "b709e757903efe1c3e8c885b655f73eeb6b8c867",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/wendelon/plans/adr/0066_fsst_evaluator.md",
+      "blob": "ecb3276f8e8ee3b64ce2c95a056d71123a004085",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/wendelon/plans/adr/0067_row_canonical_fsst.md",
+      "blob": "aaff0ea831dc5e46f79af30cbfb6b3c038a321d3",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/wendelon/plans/adr/0068_fsst_row_safe_writer_estimator.md",
+      "blob": "67e6188bf4cf1f6a5472a89c092a5812a00f0540",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/wendelon/plans/adr/0069_encoded_validity_sparse_projection.md",
+      "blob": "8369546ddb0073da8cd69c8392b456eb81194f55",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/wendelon/plans/adr/0070_all_null_page_skip_sparse_projection.md",
+      "blob": "3a2a7a17cd9f40e68e0943e8133fc0627a6adc92",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/wendelon/plans/adr/0071_nilket_wendelon_inspect_real_wiring.md",
+      "blob": "c087826784029dda213e61a6ba18231eb913c6c3",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "nilket/crates/wendelon/plans/adr/0083_kll_quantile_substrate_correctness.md",
+      "blob": "ecb363a4cc7f66b2c1ea93cd092fef160a5b4c21",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "plans/product/adr/0015_producer_scoped_host_panel_groups.md",
+      "blob": "99a6cc9db7375e1c9ecbdd7483813971325e155c",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "plans/product/adr/0029_stable_categorical_palette_positions.md",
+      "blob": "754f96c6eea4b0b7d51fcba03dd423b29b3dbf75",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "plans/product/adr/0030_the_categorical_palette_figure_surface.md",
+      "blob": "ef9c07f0a32278815739d59acea2b7e63ad890f0",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "plans/product/adr/0055_pair_resolved_bar_orientation.md",
+      "blob": "5ad202695961c376d1a95b4db2de4102b48c6111",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "plans/product/adr/0057_rendering_oracle_licenses.md",
+      "blob": "b222ceecb6481666242c7c936415c21c921424c0",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "plans/product/adr/0059_shared_durable_session_substrate.md",
+      "blob": "288c8f49ced594661906d77bc95e0ffc0358347b",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "plans/product/adr/0060_libaryon_document_checkpoints_and_restoration.md",
+      "blob": "050ec4a4049990a7fea2148e2d41d073f3b93424",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "plans/product/adr/0061_libaryon_logical_workspace_restoration.md",
+      "blob": "bd5e1f3fcea6205e4ac1a72003d18b36e02f2b06",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "plans/product/adr/0062_polariton_rune_view_and_color_continuation.md",
+      "blob": "0b536549ecb31ed8bdd83c42511a3ae6be148b42",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "plans/product/adr/0063_saved_session_surface_and_durable_named_panels.md",
+      "blob": "eba5359783d0f26095579241ea2a618320f1a049",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "plans/product/adr/0064_the_stacked_bar_surface.md",
+      "blob": "751a93274484ad26830d10e03b37b72ba9acbf19",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "plans/product/adr/0070_the_area_surface.md",
+      "blob": "77dba4a3d11230375084184cc8259e04c87fd78f",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "plans/product/adr/0072_percent_of_total_stacking.md",
+      "blob": "9f6bc70202b793dfe3108e8fc82fc3e96fe6a3a2",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "plans/product/adr/0074_divider_reservation_and_gesture_arbitration.md",
+      "blob": "fbe7d9acf3d545c5aa22cb1df85f22b0c7cc05b9",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "plans/product/adr/0075_retiring_the_nested_dashboard.md",
+      "blob": "3f7712ecfd36a0329482eb33ef591b3d2eecdaf0",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "plans/product/adr/0076_executable_presentation_values_with_static_view_topology.md",
+      "blob": "2edaf0d36a6813cf09685e9bd94c5e0e2d93d9c2",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "plans/product/adr/0078_the_histogram_interval_substrate.md",
+      "blob": "3b06606845a389468aea24a9caca6fd4d3979524",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "plans/product/adr/0079_the_histogram_surface.md",
+      "blob": "415dfe0b5193c92274fbe64de816542697c50ebe",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "plans/product/adr/0080_the_mark_style_tier.md",
+      "blob": "ab6e89a61ff8d3cf8a77c348fde70ec84640dcef",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "plans/product/adr/0081_the_box_plot_tukey_substrate.md",
+      "blob": "6a8efd37246afbc911087a0cc383351907007a33",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "plans/product/adr/0082_the_box_plot_surface.md",
+      "blob": "4dcf47364cfde2af9a79384c3f87759ea1cd7235",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "plans/product/adr/0084_the_result_artifact.md",
+      "blob": "463090094a249393d0f5c9c09eeaccf21493af87",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "plans/product/adr/0086_extensible_authored_family_colour_lineage.md",
+      "blob": "14f098f4f71849cfff8bbd8098f41a3ae92a731c",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "plans/product/adr/0087_honest_gradient_guide_stops.md",
+      "blob": "4beee887f8820c395232966c6c0a6761b1c90f04",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "plans/product/adr/0088_the_heatmap_cell_substrate.md",
+      "blob": "010b22278bb1fb2f2e986cf456882269f235668f",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "plans/product/adr/0089_the_continuous_colour_substrate.md",
+      "blob": "c90396876b462bc18f274c48a69b9ea4687be379",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "plans/product/adr/0090_the_bubble_observation_substrate.md",
+      "blob": "0ac9e62d8bdd69b04223dac9d25dafe0d75a947f",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "plans/product/adr/0091_the_continuous_colour_authoring_surface.md",
+      "blob": "a440cfb27ee14cc94c023eb03634da0217865da5",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "plans/product/adr/0092_the_heatmap_surface.md",
+      "blob": "722577e21e6060a41d0ee5f709ac1dd7945d1728",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "plans/product/adr/0095_the_bubble_surface.md",
+      "blob": "0b1497c8ad9c7ee37950f0e776afe17dfd52a422",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "plans/product/adr/0096_the_funnel_stage_substrate.md",
+      "blob": "27f52ad4c77f72f020f61adf23687e78326e069f",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "plans/product/adr/0099_the_radial_dial_reading_substrate.md",
+      "blob": "47412d376960fe4571277b39fda0f3a704035e08",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "plans/product/adr/0102_the_pie_slice_substrate.md",
+      "blob": "378001868726f2b6e2b49b25dbb82dff8afec352",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "plans/product/adr/0113_the_typography_layout_surface.md",
+      "blob": "282dfb50798e4b31284ac01769d20bbdfaa9c463",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "plans/product/adr/0114_the_bottom_and_left_band_reservation.md",
+      "blob": "6d631932cc493809cc07f98c0c8cc69fa85a92a8",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "plans/product/adr/0115_the_x_tick_rotation_surface.md",
+      "blob": "1a8c65ae42e075ae85a293aa51a8cccab43789de",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "plans/product/adr/0127_the_selected_tick_label_requirement.md",
+      "blob": "59e053d32de97636eb2d06b021c3469d94cc0a20",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "plans/product/adr/0133_the_interaction_contract.md",
+      "blob": "87f8e6de83483ef6cb00a643cc9094311ff12489",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "plans/product/adr/0139_the_image_space_raster_reuse_policy.md",
+      "blob": "34bb072eccc71e729dc3f7824c2f9e39c47dc454",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "plans/product/adr/0143_the_viewport_prepared_hexbin_substrate.md",
+      "blob": "005a59456a93483f022611552fd27fa8d7faa716",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "plans/product/adr/0144_the_hexbin_surface.md",
+      "blob": "833b30b793c2fd0855f60168f277f582930f5ec9",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "plans/product/adr/0145_the_fill_between_substrate.md",
+      "blob": "83128bb62eb6c50427ed6aa7c7e1369783cfaad3",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "plans/product/adr/0146_the_fill_between_surface.md",
+      "blob": "d9fb7e885f2118d628136573a5d118a3c9be89c9",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "plans/product/adr/0147_the_candlestick_substrate.md",
+      "blob": "49aedb89dabf3b58fe3fc6d8fc50e9576849ef11",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "plans/product/adr/0148_the_candlestick_surface.md",
+      "blob": "3f5d4bf07dd47223d8adcdb5b4dafffbb81d963e",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "plans/product/adr/0149_the_off_thread_rasterization_substrate.md",
+      "blob": "ff0116c347c05dff4d440cee2cf6fa34b838c317",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "plans/product/adr/0150_the_viewport_gesture.md",
+      "blob": "e527a7f842b17be5507a74d34b6ad1c396ad3142",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "plans/product/adr/0151_the_selection_context.md",
+      "blob": "f80aba32c20748403edcee2d3a8ba8ce123e12c4",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    },
+    {
+      "path": "plans/product/adr/0161_the_first_run_experience.md",
+      "blob": "8f63a7440d38cdc1a1b5a297e04790458bbb6f25",
+      "reason": "Grandfathered unchanged pre-policy ADR. Any different blob requires a new reviewed exception.",
+      "reviewer": "operator policy, chatd 01a168ef-fe92-752e-966c-6996649133b4"
+    }
+  ],
+  "impl_limits": []
+}

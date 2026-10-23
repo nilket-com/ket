@@ -1,0 +1,17 @@
+[Unit]
+Description=Evaluate both main Rust lockfiles and deliver durable advisory events
+OnFailure=nilket-advisory-watch-health.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -B %h/work/ket/ci/advisories/watch.py --config %h/.config/nilket/advisory-watch.json check
+TimeoutStartSec=15min
+TimeoutStopSec=30s
+KillMode=control-group
+Slice=nilket-advisory.slice
+MemoryMax=512M
+TasksMax=64
+CPUQuota=50%
+IOWeight=10
+Nice=19
+UMask=0077

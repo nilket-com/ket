@@ -1,0 +1,8 @@
+{
+  "repo": "/home/me/work/ket",
+  "state_dir": "/home/me/.local/state/nilket-advisory-watch",
+  "tool": "/home/me/.local/lib/nilket-advisory-tools/cargo-audit-0.22.2",
+  "chatctl": "/home/me/.local/bin/chatctl",
+  "test_mode": false,
+  "retain_runs": 7
+}

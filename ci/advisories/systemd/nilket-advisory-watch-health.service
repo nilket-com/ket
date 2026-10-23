@@ -1,0 +1,14 @@
+[Unit]
+Description=Persist checker failure and its durable alert outbox
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -B %h/work/ket/ci/advisories/watch.py --config %h/.config/nilket/advisory-watch.json health
+TimeoutStartSec=2min
+TimeoutStopSec=15s
+KillMode=control-group
+Slice=nilket-advisory.slice
+MemoryMax=128M
+TasksMax=32
+CPUQuota=20%
+UMask=0077
