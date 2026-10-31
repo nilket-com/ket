@@ -3,22 +3,13 @@
 Status: policy, repo-wide (every crate in the nilket workspace, the ket root
 crates, `ci/`, `scripts/`, `nilket/scripts/` and the ladder driver).
 
-**Adoption gate.** Policy, tooling and defect repairs may land on main while
-cargo-cgroup retains the currently accepted default of one test thread. Cut A
-uses the accepted, unchanged v4 ladder, preflighted against the new wrapper;
-any incompatibility stops the run. Its selected test-name set must cover the
-last accepted v4 run plus added tests. Focused runs with an explicit 1024
-threads support individual repairs but do not adopt the target default.
-
-Main stays at default 1 until a separate default-flip cut. That cut may change
-the wrapper default to the cpuset CPU count only after every entry in the PD register is closed
-and a final ladder passes on exactly the flip candidate. The current v5 driver
-assumes default 1024; the flip cut must review a successor driver with a
-dedicated explicit 1024 stress lane rather than relying on the default. New sidecar
-and startup candidates belong in the register too; if reproduced under parallel
-load, they also block the flip. No gate accepts known failures. The operator
-rule below remains the target state; the temporary wrapper default is an
-explicit adoption hold, never a repair for a parallel-only defect.
+**Default.** cargo-cgroup runs one test thread per CPU of its cpuset (ADR
+0694, which ended ADR 0673's adoption hold by operator decision on 2026-10-30,
+before the PD register closed). Open register entries stay open: a failure
+the default exposes is registered and then fixed or measured, never
+serialised, retried to green or reverted around. Focused runs with an
+explicit 1024 threads remain the stress posture; the ladder's explicit 1024
+stress lane is a separate, still-required driver change.
 
 Operator rule, 2026-10-20: no test runs alone unless it blocks one core. This
 document is the canonical home of that rule. `ci/README.md`
@@ -27,11 +18,11 @@ and `nilket/crates/wendelon/plans/ops/testing.md` point here.
 
 ## 1. Target default: cpuset CPU count, plus an explicit 1024 stress lane
 
-- During the adoption hold, `nilket/scripts/cargo-cgroup` defaults to one
-  test thread; `CARGO_CGROUP_RUST_TEST_THREADS=1024` opts in explicitly. After
-  the separate flip cut, the default is the CPU count of `CARGO_CGROUP_CPUS`
-  (for example 8 in a ladder lane or 24 on slim). The explicit
-  `CARGO_CGROUP_RUST_TEST_THREADS` override still wins.
+- `nilket/scripts/cargo-cgroup` defaults to the CPU count of
+  `CARGO_CGROUP_CPUS`, each CPU counted once (for example 8 in a ladder lane,
+  12 for the default `0-11`); a cpuset it cannot count is refused.
+  `CARGO_CGROUP_RUST_TEST_THREADS=1024` opts in to stress explicitly, and any
+  explicit `CARGO_CGROUP_RUST_TEST_THREADS` override still wins.
 - A dedicated ladder stress lane explicitly uses 1024 test threads. That
   posture exposed ring, counter, sidecar and JOIN defects and remains required.
   It oversubscribes threads while the cpuset and CPU quota bound CPU; an
@@ -116,17 +107,13 @@ never block eight cores.
    occurrence is an error, and so is an occurrence without an entry or a lane
    larger than its scope.
 
-The sole temporary `adoption-gate` allowlist scope pins exactly the wrapper
-default expression to 1 until the separate flip cut. It permits no other
-serial setting or lane exception. Remove that entry when the flip lands.
-
 An `--exact` run of one named test needs no thread setting at all, so it
 carries none.
 
 ## 3. No blanket serial settings in gates
 
-Apart from the temporary wrapper default pinned by the adoption hold,
-ladder steps, local gates and CI scripts never pass a blanket serial setting:
+The wrapper, ladder steps, local gates and CI scripts never pass a blanket
+serial setting:
 no one-thread `--test-threads`, `RUST_TEST_THREADS`, `NEXTEST_TEST_THREADS` or
 `test_threads`, no one-job `-j`/`--jobs`/`CARGO_BUILD_JOBS`, no nextest
 `threads-required`, and none of these through a variable whose every
@@ -179,9 +166,8 @@ sqlite, ttf).
 `nilket/crates/nilket/tests/test_parallelism_policy.rs` pins, each with a
 probe or negative control:
 
-- the cargo-cgroup defaults: one test thread during the adoption hold, explicit
-  1024 opt-in (the override still wins); the flip cut will pin default ==
-  cpuset CPU count. It also pins the
+- the cargo-cgroup defaults: one test thread per cpuset CPU, a refused
+  uncountable cpuset, explicit 1024 opt-in (the override still wins). It also pins the
   slice, its 96G and 60% defaults, 28G/32G per invocation, 16384 tasks, the
   open-file minimum and the one-day `RuntimeMaxSec`; it also runs
   `nilket/scripts/tests/test-cargo-cgroup-systemd-env.sh`, which checks the
@@ -190,7 +176,8 @@ probe or negative control:
   signal stops the unit;
 - no serial setting in the pinned scope outside the exact allowlist, and every
   allowlisted one in its declared scope (a lane of at most 1 or 2 CPUs, a
-  nextest group, a Rust doc line, or the exact temporary adoption default);
+  nextest group, or a Rust doc line), and no scope that could allowlist a
+  serial wrapper default;
 - the banned phrase appears nowhere in tracked files (exact zero), and no
   unreadable file is skipped silently;
 - the checked-in ladder and supplement templates carry no serial step outside
@@ -207,8 +194,8 @@ equals the SHA-256 of that copy at the audited commit.
 
 Parallel-only defect candidates found when the default moved to 1024 test
 threads, tracked one by one in
-`nilket/plans/ops/parallel_defect_candidates.md`. All open entries block
-the adoption gate above; none is handled by serialization.
+`nilket/plans/ops/parallel_defect_candidates.md`. Each open entry blocks
+only its own closure (ADR 0694); none is handled by serialization.
 
 - PD-01 to PD-09: Wendelon lib tests (process-global metric deltas, timing
   windows, a fork ENOMEM, a `DataDirectoryBusy` on reopen).

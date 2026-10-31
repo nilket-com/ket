@@ -6,9 +6,9 @@ usage() {
 Usage: scripts/cargo-cgroup <cargo-subcommand> [cargo-args...]
 
 Runs cargo inside a constrained user cgroup scope, with CPU affinity,
-low IO priority, bounded build parallelism, and one Rust test thread by
-default during the adoption hold. Opt in to 1024 test threads explicitly with
-CARGO_CGROUP_RUST_TEST_THREADS=1024; the cpuset and quota bound CPU.
+low IO priority, bounded build parallelism, and by default one Rust test
+thread per CPU of CARGO_CGROUP_CPUS. Opt in to 1024 test threads explicitly
+with CARGO_CGROUP_RUST_TEST_THREADS=1024; the cpuset and quota bound CPU.
 Lockup protection is the cpuset + quota + nice + ionice, not the job count:
 within a bounded cpuset, parallel jobs contend inside the cage rather than
 starving the machine. Build parallelism is therefore bounded by MEMORY_MAX
@@ -48,7 +48,7 @@ Environment overrides:
   CARGO_CGROUP_IO_WEIGHT=10
   CARGO_CGROUP_NICE=19
   CARGO_CGROUP_JOBS=6
-  CARGO_CGROUP_RUST_TEST_THREADS=<count>  # default 1; explicit 1024 opt-in
+  CARGO_CGROUP_RUST_TEST_THREADS=<count>  # default: CPUs in CARGO_CGROUP_CPUS; explicit 1024 opt-in
   CARGO_CGROUP_RUST_MIN_STACK=67108864
   CARGO_CGROUP_IMAGE=rust:1
   CARGO_CGROUP_ALLOW_AFFINITY_ONLY=0
@@ -158,9 +158,33 @@ nofile="${CARGO_CGROUP_NOFILE:-$(nofile_limit)}"
 io_weight="${CARGO_CGROUP_IO_WEIGHT:-10}"
 nice_level="${CARGO_CGROUP_NICE:-19}"
 jobs="${CARGO_CGROUP_JOBS:-6}"
-# Retain the accepted default during the adoption hold. The later flip targets
-# the cpuset CPU count, retaining explicit 1024 stress. See test_parallelism.md.
-test_threads="${CARGO_CGROUP_RUST_TEST_THREADS:-1}"
+# Distinct CPUs in a cpuset list such as 0-7,16-23 or 3; fails on a malformed list.
+cpuset_size() {
+	local part cpu
+	local -A seen=()
+	local IFS=,
+	for part in $1; do
+		if [[ "$part" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+			((10#${BASH_REMATCH[1]} <= 10#${BASH_REMATCH[2]})) || return 1
+			for ((cpu = 10#${BASH_REMATCH[1]}; cpu <= 10#${BASH_REMATCH[2]}; cpu++)); do
+				seen[$cpu]=1
+			done
+		elif [[ "$part" =~ ^[0-9]+$ ]]; then
+			seen[$((10#$part))]=1
+		else
+			return 1
+		fi
+	done
+	((${#seen[@]} > 0)) || return 1
+	printf '%s\n' "${#seen[@]}"
+}
+cpuset_cpus=$(cpuset_size "$cpus") || {
+	echo "cargo-cgroup: cannot count the CPUs in CARGO_CGROUP_CPUS=$cpus" >&2
+	exit 64
+}
+# One test thread per CPU of the cpuset (ADR 0694); 1024 is the explicit stress
+# opt-in. See test_parallelism.md.
+test_threads="${CARGO_CGROUP_RUST_TEST_THREADS:-$cpuset_cpus}"
 # Deep-recursion targets overflow the default 8 MiB test-thread stack and abort
 # the process. An aborted target prints no result line, so a receipt that sums
 # reported failures reads clean while that target's remaining tests silently

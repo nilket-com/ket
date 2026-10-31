@@ -1,7 +1,7 @@
 //! Repo-wide pins for `nilket/plans/ops/test_parallelism.md`.
 //!
-//! The target default follows the cpuset CPU count, with an explicit 1024 stress
-//! lane. During the adoption hold the wrapper defaults to 1. Serial settings are in
+//! The wrapper defaults to the cpuset CPU count (ADR 0694), with an explicit 1024
+//! stress lane; no serial default may be allowlisted. Serial settings are in
 //! `nilket/.config/serial-allowlist.txt`. One phrase for an execution model is
 //! banned outright because it hides what is meant. Every pin below has a probe
 //! or negative control, so a matcher that silently matches nothing fails.
@@ -459,8 +459,6 @@ enum SerialScope {
 	/// A comment or `#[ignore]` reason in a Rust source that documents how to
 	/// run one measurement; it executes nothing.
 	Doc,
-	/// Temporary wrapper default until the separately gated adoption cut.
-	AdoptionGate,
 }
 
 #[derive(Debug)]
@@ -470,7 +468,7 @@ struct AllowEntry {
 }
 
 /// Each allowlist line: `path<TAB>exact line, trimmed<TAB>scope<TAB>reason`,
-/// where scope is `lane:1`, `lane:2`, `test-group`, `doc` or `adoption-gate`.
+/// where scope is `lane:1`, `lane:2`, `test-group` or `doc`.
 fn parse_allowlist(text: &str) -> BTreeMap<(String, String), AllowEntry> {
 	let mut entries: BTreeMap<(String, String), AllowEntry> = BTreeMap::new();
 	for (number, raw) in text.lines().enumerate() {
@@ -489,7 +487,6 @@ fn parse_allowlist(text: &str) -> BTreeMap<(String, String), AllowEntry> {
 			"lane:2" => SerialScope::Lane(2),
 			"test-group" => SerialScope::TestGroup,
 			"doc" => SerialScope::Doc,
-			"adoption-gate" => SerialScope::AdoptionGate,
 			other => panic!(
 				"{ALLOWLIST}:{at}: scope `{other}` is not lane:1, lane:2, test-group or doc; \
 				 a serial setting never holds a lane of more than 2 CPUs"
@@ -587,18 +584,6 @@ fn rust_doc_code_lines(text: &str) -> std::collections::BTreeSet<String> {
 /// says whether it sits in a doctest code block.
 fn scope_problems(file: &str, line: &str, scope: &SerialScope, doc_code: bool) -> Vec<String> {
 	match scope {
-		SerialScope::AdoptionGate => {
-			if file == CARGO_CGROUP
-				&& line == "test_threads=\"${CARGO_CGROUP_RUST_TEST_THREADS:-1}\""
-				&& !doc_code
-			{
-				Vec::new()
-			} else {
-				vec![format!(
-					"{file}: `{line}` is not the exact temporary wrapper default"
-				)]
-			}
-		}
 		SerialScope::TestGroup => {
 			if file.ends_with("nextest.toml")
 				&& (line.contains("max-threads") || line.contains("threads-required"))
@@ -704,19 +689,13 @@ fn allowlist_parser_and_lane_rule_probe() {
 }
 
 #[test]
-fn temporary_adoption_scope_permits_only_the_exact_wrapper_default() {
-	// The live-file scan rejects this as a stale allowlist entry after a flip;
-	// remove the exception in the separately reviewed default-flip cut.
+fn a_serial_wrapper_default_cannot_be_allowlisted() {
+	// ADR 0694 removed the adoption-gate scope: the wrapper's one-thread
+	// default is an unlisted serial setting like any other.
+	let entry = "nilket/scripts/cargo-cgroup\ttest_threads=\"${CARGO_CGROUP_RUST_TEST_THREADS:-1}\"\tadoption-gate\tthe wrapper keeps one test thread by default";
+	assert!(std::panic::catch_unwind(|| parse_allowlist(entry)).is_err());
 	let line = "test_threads=\"${CARGO_CGROUP_RUST_TEST_THREADS:-1}\"";
-	assert!(scope_problems(CARGO_CGROUP, line, &SerialScope::AdoptionGate, false).is_empty());
-	for (path, setting, doc) in [
-		("ci/x.sh", line, false),
-		(CARGO_CGROUP, "cargo test -- --test-threads=1", false),
-		(CARGO_CGROUP, "test_threads=1", false),
-		(CARGO_CGROUP, line, true),
-	] {
-		assert!(!scope_problems(path, setting, &SerialScope::AdoptionGate, doc).is_empty());
-	}
+	assert!(is_serial_setting(line, &one_valued_variables(line)));
 }
 
 #[test]
@@ -783,7 +762,8 @@ fn serial_settings_are_exactly_the_allowlist_and_sit_in_small_lanes() {
 fn cargo_cgroup_default_expressions_are_pinned() {
 	let script = read_text(&ket_root(), CARGO_CGROUP).expect("read cargo-cgroup");
 	for expected in [
-		"test_threads=\"${CARGO_CGROUP_RUST_TEST_THREADS:-1}\"",
+		"cpuset_cpus=$(cpuset_size \"$cpus\") || {",
+		"test_threads=\"${CARGO_CGROUP_RUST_TEST_THREADS:-$cpuset_cpus}\"",
 		"memory_high_cfg=\"${CARGO_CGROUP_MEMORY_HIGH:-28G}\"",
 		"memory_max_cfg=\"${CARGO_CGROUP_MEMORY_MAX:-32G}\"",
 		"slice=\"${CARGO_CGROUP_SLICE:-cargo-cgroup.slice}\"",
@@ -836,7 +816,7 @@ fn cargo_cgroup_systemd_resource_test_passes() {
 		"PASS: host-aware slice and invocation memory, nofile minimum, signal stops the unit",
 		"PASS: the slice limit is never lowered under a running session",
 		"PASS: a RuntimeMaxSec stop is reported with rc 124",
-		"PASS: default test threads are 1 and the override is validated",
+		"PASS: default test threads follow the cpuset, and the override and cpuset are validated",
 		"PASS: systemd environment allowlist",
 	] {
 		assert!(stdout.contains(pass), "missing `{pass}` in: {stdout}");
@@ -874,8 +854,13 @@ fn probe_test_threads(overrides: &[(&str, &str)]) -> (Option<i32>, String) {
 }
 
 #[test]
-fn cargo_cgroup_retains_default_one_and_honours_explicit_concurrency() {
+fn cargo_cgroup_defaults_to_the_cpuset_and_honours_explicit_concurrency() {
 	assert_eq!(probe_test_threads(&[]), (Some(0), "1".to_string()));
+	// taskset keeps the online CPUs of a wider mask, so this runs on small hosts.
+	assert_eq!(
+		probe_test_threads(&[("CARGO_CGROUP_CPUS", "0-3")]),
+		(Some(0), "4".to_string())
+	);
 	assert_eq!(
 		probe_test_threads(&[("CARGO_CGROUP_RUST_TEST_THREADS", "1024")]),
 		(Some(0), "1024".to_string())
@@ -884,8 +869,11 @@ fn cargo_cgroup_retains_default_one_and_honours_explicit_concurrency() {
 		probe_test_threads(&[("CARGO_CGROUP_RUST_TEST_THREADS", "7")]),
 		(Some(0), "7".to_string())
 	);
-	// Negative control: a malformed override is refused, not passed through.
+	// Negative controls: a malformed override or cpuset is refused, not passed through.
 	let (code, threads) = probe_test_threads(&[("CARGO_CGROUP_RUST_TEST_THREADS", "all")]);
+	assert_eq!(code, Some(64));
+	assert!(threads.is_empty());
+	let (code, threads) = probe_test_threads(&[("CARGO_CGROUP_CPUS", "5-2")]);
 	assert_eq!(code, Some(64));
 	assert!(threads.is_empty());
 }
@@ -976,9 +964,9 @@ fn checked_in_supplement_template_uses_the_commit_wrapper() {
 }
 
 #[test]
-fn v5_preflight_refuses_implicit_serial_concurrency_and_validates_explicit_choice() {
+fn ladder_preflight_refuses_implicit_serial_concurrency_and_validates_explicit_choice() {
 	let dir = std::env::temp_dir().join(format!(
-		"nilket-v5-preflight-{}-{}",
+		"nilket-ladder-preflight-{}-{}",
 		std::process::id(),
 		std::time::SystemTime::now()
 			.duration_since(std::time::UNIX_EPOCH)
@@ -996,17 +984,17 @@ fn v5_preflight_refuses_implicit_serial_concurrency_and_validates_explicit_choic
 	for template in [LADDER_TEMPLATE, SUPPLEMENT_TEMPLATE] {
 		let text = read_text(&ket_root(), template).unwrap();
 		let start = text
-			.find("require_v5_concurrency() {")
-			.expect("v5 has a concurrency preflight");
+			.find("require_ladder_concurrency() {")
+			.expect("the ladder has a concurrency preflight");
 		let end = start + text[start..].find("\n}\n").unwrap() + 3;
-		let call = "require_v5_concurrency \"$SRC/nilket/scripts/cargo-cgroup\" || exit 2";
+		let call = "require_ladder_concurrency \"$SRC/nilket/scripts/cargo-cgroup\" || exit 2";
 		assert!(
 			text.contains(call),
 			"{template}: missing fail-closed preflight invocation"
 		);
 		assert!(text.find(call).unwrap() < text.find("step() {").unwrap());
-		let body = format!("{}\nrequire_v5_concurrency \"$1\"\n", &text[start..end]);
-		for default in [1, 1024] {
+		let body = format!("{}\nrequire_ladder_concurrency \"$1\"\n", &text[start..end]);
+		for default in ["1", "1024", "$cpuset_cpus"] {
 			let wrapper = dir.join(format!("wrapper-{default}"));
 			std::fs::write(
 				&wrapper,
@@ -1014,7 +1002,7 @@ fn v5_preflight_refuses_implicit_serial_concurrency_and_validates_explicit_choic
 			)
 			.unwrap();
 			for (choice, expected) in [
-				(None, if default == 1024 { 0 } else { 2 }),
+				(None, if default == "$cpuset_cpus" { 0 } else { 2 }),
 				(Some("1024"), 0),
 				(Some("8"), 0),
 				(Some("1"), 2),
@@ -1023,7 +1011,7 @@ fn v5_preflight_refuses_implicit_serial_concurrency_and_validates_explicit_choic
 			] {
 				let mut command = Command::new("bash");
 				command
-					.args(["-c", &body, "v5-preflight"])
+					.args(["-c", &body, "ladder-preflight"])
 					.arg(&wrapper)
 					.env_remove("CARGO_CGROUP_RUST_TEST_THREADS");
 				if let Some(choice) = choice {

@@ -2,7 +2,7 @@
 
 Status: open register. Policy: `nilket/plans/ops/test_parallelism.md` (section
 4: a parallel-only failure is a defect candidate, never a flake, and never
-fixed by serialization; section 7: these block the adoption gate).
+fixed by serialization; section 7: each blocks only its own closure, ADR 0694).
 
 Found 2026-10-20 on slim when cargo-cgroup's default moved to 1024 test
 threads (CPUS 0-7, quota 800%, another session sharing CPUs 0-11). Every test

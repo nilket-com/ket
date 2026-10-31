@@ -201,10 +201,10 @@ for ((start = 0; start + ${#command_tail[@]} <= ${#args[@]}; start++)); do
 done
 [[ "$matched" -eq 1 ]]
 
-# Default test threads: 1 during the adoption hold, whatever the cpuset.
-# An ambient RUST_TEST_THREADS must not leak through either.
+# Default test threads: one per CPU of the cpuset (ADR 0694), counting each CPU
+# once. An ambient RUST_TEST_THREADS must not leak through.
 default_case() {
-	local cpus=$1
+	local cpus=$1 want=$2
 	rm -f "$tmp/cargo home/probe.txt"
 	env -i CARGO_CGROUP_RUNTIME_DIR="$tmp" \
 		PATH="$tmp/bin:/usr/bin:/bin" \
@@ -217,11 +217,24 @@ default_case() {
 		"$wrapper" --version >/dev/null
 	local threads
 	threads=$(sed -n 's/^RUST_TEST_THREADS=//p' "$tmp/cargo home/probe.txt")
-	[[ "$threads" == 1 ]]
+	[[ "$threads" == "$want" ]] || {
+		echo "FAIL: cpuset '${cpus}' defaulted to ${threads} test threads, want ${want}" >&2
+		exit 1
+	}
 }
-default_case ''
-default_case 0-7,16-23
-default_case 3
+default_case '' 12
+default_case 0-7,16-23 16
+default_case 3 1
+default_case 0-3,2-5 6
+# Negative control: a cpuset the wrapper cannot count is refused, not defaulted.
+for bad in x 5-2 0,,1; do
+	if env -i CARGO_CGROUP_RUNTIME_DIR="$tmp" PATH="$tmp/bin:/usr/bin:/bin" HOME="$tmp/home" CARGO_HOME="$tmp/cargo home" \
+		CARGO_CGROUP_BACKEND=systemd CARGO_CGROUP_CPUS="$bad" \
+		SYSTEMD_ARGS_FILE="$tmp/systemd-args-bad.bin" "$wrapper" --version >/dev/null 2>&1; then
+		echo "FAIL: uncountable CARGO_CGROUP_CPUS=$bad was accepted" >&2
+		exit 1
+	fi
+done
 # Negative control: a non-numeric override is refused, not passed through.
 if env -i CARGO_CGROUP_RUNTIME_DIR="$tmp" PATH="$tmp/bin:/usr/bin:/bin" HOME="$tmp/home" CARGO_HOME="$tmp/cargo home" \
 	CARGO_CGROUP_BACKEND=systemd CARGO_CGROUP_RUST_TEST_THREADS=all \
@@ -349,5 +362,5 @@ grep -q 'was stopped by RuntimeMaxSec=86400s' "$tmp/rt.err"
 printf 'PASS: a RuntimeMaxSec stop is reported with rc 124\n'
 
 printf 'PASS: host-aware slice and invocation memory, nofile minimum, signal stops the unit\n'
-printf 'PASS: default test threads are 1 and the override is validated\n'
+printf 'PASS: default test threads follow the cpuset, and the override and cpuset are validated\n'
 printf 'PASS: systemd environment allowlist, prefix forwarding, exclusions, values, and resource argv\n'
