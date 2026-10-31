@@ -7,8 +7,8 @@ Usage: scripts/cargo-cgroup <cargo-subcommand> [cargo-args...]
 
 Runs cargo inside a constrained user cgroup scope, with CPU affinity,
 low IO priority, bounded build parallelism, and by default one Rust test
-thread per CPU of CARGO_CGROUP_CPUS. Opt in to 1024 test threads explicitly
-with CARGO_CGROUP_RUST_TEST_THREADS=1024; the cpuset and quota bound CPU.
+thread per CPU of CARGO_CGROUP_CPUS. Set an explicit count with
+CARGO_CGROUP_RUST_TEST_THREADS=<n>; the cpuset and quota bound CPU.
 Lockup protection is the cpuset + quota + nice + ionice, not the job count:
 within a bounded cpuset, parallel jobs contend inside the cage rather than
 starving the machine. Build parallelism is therefore bounded by MEMORY_MAX
@@ -48,7 +48,7 @@ Environment overrides:
   CARGO_CGROUP_IO_WEIGHT=10
   CARGO_CGROUP_NICE=19
   CARGO_CGROUP_JOBS=6
-  CARGO_CGROUP_RUST_TEST_THREADS=<count>  # default: CPUs in CARGO_CGROUP_CPUS; explicit 1024 opt-in
+  CARGO_CGROUP_RUST_TEST_THREADS=<count>  # default: CPUs in CARGO_CGROUP_CPUS
   CARGO_CGROUP_RUST_MIN_STACK=67108864
   CARGO_CGROUP_IMAGE=rust:1
   CARGO_CGROUP_ALLOW_AFFINITY_ONLY=0
@@ -182,8 +182,8 @@ cpuset_cpus=$(cpuset_size "$cpus") || {
 	echo "cargo-cgroup: cannot count the CPUs in CARGO_CGROUP_CPUS=$cpus" >&2
 	exit 64
 }
-# One test thread per CPU of the cpuset (ADR 0694); 1024 is the explicit stress
-# opt-in. See test_parallelism.md.
+# One test thread per CPU of the cpuset (ADR 0694); stress sets an explicit
+# count (ADR 0695). See test_parallelism.md.
 test_threads="${CARGO_CGROUP_RUST_TEST_THREADS:-$cpuset_cpus}"
 # Deep-recursion targets overflow the default 8 MiB test-thread stack and abort
 # the process. An aborted target prints no result line, so a receipt that sums

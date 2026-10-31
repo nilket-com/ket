@@ -1,7 +1,7 @@
 //! Repo-wide pins for `nilket/plans/ops/test_parallelism.md`.
 //!
-//! The wrapper defaults to the cpuset CPU count (ADR 0694), with an explicit 1024
-//! stress lane; no serial default may be allowlisted. Serial settings are in
+//! The wrapper defaults to the cpuset CPU count (ADR 0694); stress sets an
+//! explicit count (ADR 0695); no serial default may be allowlisted. Serial settings are in
 //! `nilket/.config/serial-allowlist.txt`. One phrase for an execution model is
 //! banned outright because it hides what is meant. Every pin below has a probe
 //! or negative control, so a matcher that silently matches nothing fails.

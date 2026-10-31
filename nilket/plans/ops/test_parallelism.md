@@ -7,28 +7,30 @@ crates, `ci/`, `scripts/`, `nilket/scripts/` and the ladder driver).
 0694, which ended ADR 0673's adoption hold by operator decision on 2026-10-30,
 before the PD register closed). Open register entries stay open: a failure
 the default exposes is registered and then fixed or measured, never
-serialised, retried to green or reverted around. Focused runs with an
-explicit 1024 threads remain the stress posture; the ladder's explicit 1024
-stress lane is a separate, still-required driver change.
+serialised, retried to green or reverted around. A stress run sets an
+explicit test count chosen for what it stresses; there is no 1024-thread
+stress lane or posture (ADR 0695).
 
 Operator rule, 2026-10-20: no test runs alone unless it blocks one core. This
 document is the canonical home of that rule. `ci/README.md`
 ("Test concurrency"), `nilket/.config/nextest.toml`, `ci/controlled-tests.txt`
 and `nilket/crates/wendelon/plans/ops/testing.md` point here.
 
-## 1. Target default: cpuset CPU count, plus an explicit 1024 stress lane
+## 1. Default: cpuset CPU count; stress sets an explicit count
 
 - `nilket/scripts/cargo-cgroup` defaults to the CPU count of
   `CARGO_CGROUP_CPUS`, each CPU counted once (for example 8 in a ladder lane,
   12 for the default `0-11`); a cpuset it cannot count is refused.
-  `CARGO_CGROUP_RUST_TEST_THREADS=1024` opts in to stress explicitly, and any
-  explicit `CARGO_CGROUP_RUST_TEST_THREADS` override still wins.
-- A dedicated ladder stress lane explicitly uses 1024 test threads. That
-  posture exposed ring, counter, sidecar and JOIN defects and remains required.
-  It oversubscribes threads while the cpuset and CPU quota bound CPU; an
-  eight-CPU lane still consumes at most eight CPUs. The default need not
-  oversubscribe to retain this stress evidence.
-- The cgroup limits are sized for this default (see `cargo-cgroup --help`).
+  An explicit `CARGO_CGROUP_RUST_TEST_THREADS` override, any positive count,
+  still wins.
+- Stress sets its own explicit count, chosen for what it stresses (the
+  ladder's in-process stress steps use 12 and 8). The cpuset, CPU quota, nice
+  and ionice keep the host reachable, not the thread count: an eight-CPU lane
+  consumes at most eight CPUs whatever the count. There is no dedicated
+  1024-thread stress lane (ADR 0695); earlier 1024 runs, which exposed ring,
+  counter, sidecar and JOIN defects, stay in the register as history.
+- The cgroup limits were measured for 1024 concurrent tests and stay as
+  headroom over the default (see `cargo-cgroup --help`).
   Measured on slim, 2026-10-20, eight CPUs: the Wendelon lib suite peaked at
   21-23 GiB and about 3600 tasks, with up to 3649 open files in one process.
   - Per invocation: `MemoryHigh=28G`, `MemoryMax=32G`, `TasksMax=16384`, and
@@ -167,7 +169,7 @@ sqlite, ttf).
 probe or negative control:
 
 - the cargo-cgroup defaults: one test thread per cpuset CPU, a refused
-  uncountable cpuset, explicit 1024 opt-in (the override still wins). It also pins the
+  uncountable cpuset, any explicit positive count (the override still wins). It also pins the
   slice, its 96G and 60% defaults, 28G/32G per invocation, 16384 tasks, the
   open-file minimum and the one-day `RuntimeMaxSec`; it also runs
   `nilket/scripts/tests/test-cargo-cgroup-systemd-env.sh`, which checks the

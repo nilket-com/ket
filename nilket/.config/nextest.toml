@@ -3,7 +3,7 @@
 # nextest runs tests from different binaries concurrently. The cargo-test path
 # exposes cross-process contention while libtest runs binaries one after
 # another. cargo-cgroup defaults to one test thread per cpuset CPU (ADR 0694);
-# explicit 1024 stress exposes interleavings that had always been latent.
+# stress runs set an explicit count (ADR 0695).
 #
 # `distributed_process_test` spawns fixture-worker processes and coordinates over
 # loopback. It ran in a one-thread test-group because two of its tests at once

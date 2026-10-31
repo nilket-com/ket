@@ -86,7 +86,7 @@ channel closed before the tenant admission reservation dropped (`e9a92b06`).
    cargo test -p <crate> --lib -- --test-threads=<N>   # in-process; repeat it, and pass N explicitly
    ```
 
-   nextest exercises cross-process contention; repeated in-process `cargo test` runs exercise shared state inside one process. A stress campaign needs both. cargo-cgroup defaults to one test thread per cpuset CPU (ADR 0694); opt in with `CARGO_CGROUP_RUST_TEST_THREADS=1024` or pass `--test-threads` explicitly for stress.
+   nextest exercises cross-process contention; repeated in-process `cargo test` runs exercise shared state inside one process. A stress campaign needs both. cargo-cgroup defaults to one test thread per cpuset CPU (ADR 0694); for stress, set an explicit count with `CARGO_CGROUP_RUST_TEST_THREADS=<n>` or `--test-threads=<n>` (ADR 0695).
 
 3. **Do not widen serialization to turn a suite green.** Add a nextest
    test-group or a `controlled-tests.txt` entry only when the test genuinely
