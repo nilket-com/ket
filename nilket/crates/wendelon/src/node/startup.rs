@@ -5,6 +5,217 @@ use crate::storage::ownership::{
 };
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
+const STORAGE_INDEX_RESTORE_INTENT: &str = "STORAGE_INDEX_RESTORE_AUTHORITY";
+
+fn read_restore_intent(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+	let file = std::fs::File::open(path)?;
+	let mut limited = std::io::Read::take(file, 257);
+	let mut bytes = Vec::new();
+	std::io::Read::read_to_end(&mut limited, &mut bytes)?;
+	if bytes.len() > 256 {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"oversized index restore intent",
+		));
+	}
+	Ok(bytes)
+}
+
+#[derive(serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+struct StorageIndexRestoreIntent {
+	node_id: u32,
+	artifact_hash: [u8; 32],
+	last_applied: Option<openraft::LogId<u32>>,
+	active_slab_id: crate::schema::SlabId,
+	local_slabs_hash: [u8; 32],
+}
+
+// The inventory binds absence as well as presence: every expected local file,
+// its exact bytes, and the active slab identity are required before rebuilding.
+fn local_slabs_hash(
+	active_slab_id: crate::schema::SlabId,
+	slabs: &[(crate::schema::SlabId, u64, [u8; 32])],
+) -> [u8; 32] {
+	let mut hash = crate::hash::blake3::Context::new();
+	hash.update(b"wendelon-local-storage-restore-v1\0");
+	hash.update(&active_slab_id.get().to_le_bytes());
+	hash.update(&(slabs.len() as u64).to_le_bytes());
+	for (id, len, digest) in slabs {
+		hash.update(&id.get().to_le_bytes());
+		hash.update(&len.to_le_bytes());
+		hash.update(digest);
+	}
+	hash.finish()
+}
+
+fn restored_local_slabs_hash(
+	owner: &DataDirectoryOwner,
+	active_slab_id: crate::schema::SlabId,
+) -> std::io::Result<[u8; 32]> {
+	let _permit = owner.write_permit()?;
+	let mut slabs = Vec::new();
+	for entry in std::fs::read_dir(owner.path())? {
+		let entry = entry?;
+		let name = entry.file_name();
+		let Some(name) = name.to_str() else { continue };
+		let Some(id) = name
+			.strip_prefix("slab_")
+			.and_then(|s| s.strip_suffix(".wnd"))
+		else {
+			continue;
+		};
+		let id = u64::from_str_radix(id, 16).map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+		if name != format!("slab_{id:016x}.wnd") {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"noncanonical restored slab name",
+			));
+		}
+		let mut file = std::fs::File::open(entry.path())?;
+		let mut hash = crate::hash::blake3::Context::new();
+		let mut len = 0_u64;
+		let mut buffer = [0_u8; 64 * 1024];
+		loop {
+			let n = std::io::Read::read(&mut file, &mut buffer)?;
+			if n == 0 {
+				break;
+			}
+			len += n as u64;
+			hash.update(&buffer[..n]);
+		}
+		slabs.push((crate::schema::SlabId::new(id), len, hash.finish()));
+	}
+	slabs.sort_unstable_by_key(|slab| slab.0);
+	if !slabs.iter().any(|slab| slab.0 == active_slab_id) {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"restored active slab is missing",
+		));
+	}
+	Ok(local_slabs_hash(active_slab_id, &slabs))
+}
+
+/// Writer: validated cluster restore, before the first restored control artifact.
+/// The marker alone grants nothing: both control replay and all local slab bytes
+/// must match. Partial copies keep the marker but cannot create an index.
+/// Clearer: successful tier/reference recovery validation, before clean certification.
+/// Returns true only when resuming the identical pending restore.
+pub(super) fn record_validated_storage_restore(
+	backup: &ClusterBackupImage,
+	node_id: u32,
+	owner: &DataDirectoryOwner,
+) -> std::io::Result<bool> {
+	let _permit = owner.write_permit()?;
+	let path = owner.path().join(STORAGE_INDEX_RESTORE_INTENT);
+	let storage = &backup
+		.nodes
+		.iter()
+		.find(|node| node.node_id == node_id)
+		.ok_or_else(|| Error::new(ErrorKind::InvalidData, "restore node storage is missing"))?
+		.storage;
+	let mut slabs: Vec<_> = storage
+		.local_slabs
+		.iter()
+		.map(|slab| {
+			(
+				slab.slab_id,
+				slab.bytes.len() as u64,
+				crate::hash::content::digest(&slab.bytes),
+			)
+		})
+		.collect();
+	slabs.sort_unstable_by_key(|slab| slab.0);
+	let intent = StorageIndexRestoreIntent {
+		node_id,
+		artifact_hash: backup.control.restore_artifact_hash(),
+		last_applied: backup.control.manifest.last_applied_log_id,
+		active_slab_id: storage.manifest.active_slab_id,
+		local_slabs_hash: local_slabs_hash(storage.manifest.active_slab_id, &slabs),
+	};
+	let bytes = postcard::to_stdvec(&intent).map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+	match std::fs::OpenOptions::new()
+		.write(true)
+		.create_new(true)
+		.open(&path)
+	{
+		Ok(mut file) => {
+			std::io::Write::write_all(&mut file, &bytes)?;
+			file.sync_all()?;
+			std::fs::File::open(owner.path())?.sync_all()?;
+			Ok(false)
+		}
+		Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+			if read_restore_intent(&path)? == bytes {
+				Ok(true)
+			} else {
+				Err(Error::new(
+					ErrorKind::InvalidData,
+					"another storage restore intent is pending",
+				))
+			}
+		}
+		Err(error) => Err(error),
+	}
+}
+
+pub(super) async fn validated_index_recovery(
+	owner: &DataDirectoryOwner,
+	node_id: u32,
+	control: &WendelonStateMachine,
+) -> std::io::Result<Option<crate::storage::manager::IndexRecoveryAuthority>> {
+	let intent = {
+		let _permit = owner.write_permit()?;
+		if owner.path().join("storage_index.redb").exists() {
+			return Ok(None);
+		}
+		let path = owner.path().join(STORAGE_INDEX_RESTORE_INTENT);
+		let bytes = match read_restore_intent(&path) {
+			Ok(bytes) => bytes,
+			Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+			Err(error) => return Err(error),
+		};
+		if bytes.len() > 256 {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"oversized index restore intent",
+			));
+		}
+		postcard::from_bytes::<StorageIndexRestoreIntent>(&bytes)
+			.map_err(|e| Error::new(ErrorKind::InvalidData, e))?
+	};
+	let (hash, applied) = control.restored_control_identity(owner).await?;
+	if intent.node_id != node_id || intent.artifact_hash != hash || intent.last_applied != applied {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"index restore intent does not match validated control replay",
+		));
+	}
+	let disk_owner = owner.clone();
+	let active_slab_id = intent.active_slab_id;
+	let disk_hash =
+		tokio::task::spawn_blocking(move || restored_local_slabs_hash(&disk_owner, active_slab_id))
+			.await
+			.map_err(Error::other)??;
+	if intent.local_slabs_hash != disk_hash {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"index restore intent does not match restored local slabs",
+		));
+	}
+	Ok(Some(
+		crate::storage::manager::IndexRecoveryAuthority::verified_restore(owner.clone()),
+	))
+}
+
+pub(super) fn complete_storage_index_recovery(owner: &DataDirectoryOwner) -> std::io::Result<()> {
+	let _permit = owner.write_permit()?;
+	match std::fs::remove_file(owner.path().join(STORAGE_INDEX_RESTORE_INTENT)) {
+		Ok(()) => std::fs::File::open(owner.path())?.sync_all(),
+		Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+		Err(error) => Err(error),
+	}
+}
+
 pub(super) enum TransportChoice {
 	Configured,
 	Provided(Arc<dyn TransportProvider>, TransportTier),
@@ -141,6 +352,7 @@ impl PartialResources {
 	}
 }
 pub(super) struct StartupScope {
+	storage_init_fresh: bool,
 	resources: Option<PartialResources>,
 	barrier: Option<StartupDrainBarrier>,
 	watchdog: Option<crate::shutdown_watchdog::ShutdownWatchdog>,
@@ -188,12 +400,14 @@ impl StartupScope {
 		};
 		match resources.owner.reserve_startup_drain() {
 			Ok(barrier) => Ok(Self {
+				storage_init_fresh: false,
 				resources: Some(resources),
 				barrier: Some(barrier),
 				watchdog: Some(watchdog),
 			}),
 			Err(original) => {
 				let mut scope = Self {
+					storage_init_fresh: false,
 					resources: Some(resources),
 					barrier: None,
 					watchdog: Some(watchdog),
@@ -215,6 +429,13 @@ impl StartupScope {
 	fn resources_mut(&mut self) -> &mut PartialResources {
 		self.resources.as_mut().expect("live startup scope")
 	}
+	pub(super) fn set_storage_init_fresh(&mut self, fresh: bool) {
+		self.storage_init_fresh = fresh;
+	}
+	pub(super) fn storage_init_fresh(&self) -> bool {
+		self.storage_init_fresh
+	}
+
 	pub(super) fn owner(&self) -> &DataDirectoryOwner {
 		&self.resources().owner
 	}
@@ -1273,4 +1494,16 @@ mod tests {
 		assert!(!reopened.previous_shutdown_clean());
 		reopened.close(Duration::from_secs(5)).await.unwrap();
 	}
+}
+
+/// Pre-restore, owner-held fresh authorization. ADR 0685's DataDirCensus
+/// replaces this temporary same-boot predicate when the stacks join.
+pub(super) fn fresh_storage_initialization_allowed(dir: &std::path::Path) -> std::io::Result<bool> {
+	for entry in std::fs::read_dir(dir)? {
+		let name = entry?.file_name();
+		if name != "LOCK" && name != "CLEAN_SHUTDOWN" && name != ".CLEAN_SHUTDOWN.tmp" {
+			return Ok(false);
+		}
+	}
+	Ok(true)
 }

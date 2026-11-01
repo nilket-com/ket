@@ -2,9 +2,17 @@
 mod test_dir;
 use async_trait::async_trait;
 
-async fn open_test_manager(config: SlabManagerConfig) -> std::io::Result<SlabManager> {
+async fn open_test_manager(
+	config: SlabManagerConfig,
+) -> std::io::Result<std::sync::Arc<SlabManager>> {
 	let owner = wendelon::storage::ownership::DataDirectoryOwner::acquire_existing(&config.dir)?;
 	SlabManager::open_with_owner(config, owner).await
+}
+async fn initialize_test_manager(
+	config: SlabManagerConfig,
+) -> std::io::Result<std::sync::Arc<SlabManager>> {
+	let owner = wendelon::storage::ownership::DataDirectoryOwner::acquire_existing(&config.dir)?;
+	SlabManager::initialize_new_store_with_owner(config, owner).await
 }
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -95,7 +103,7 @@ impl TierCommitter for ManifestApplyingCommitter {
 #[tokio::test]
 async fn sealed_slabs_enter_compaction_manifest_as_l0_live() {
 	let l1_dir = fresh_dir("l1");
-	let manager = open_test_manager(SlabManagerConfig {
+	let manager = initialize_test_manager(SlabManagerConfig {
 		dir: l1_dir.to_path_buf(),
 		max_slab_bytes: 1,
 		io: spawn_io_thread(16).unwrap(),
@@ -140,10 +148,7 @@ async fn open_removes_stale_lsm_compaction_temp_files() {
 	let dir = fresh_dir("tmp-cleanup");
 	let temp = dir.join("compaction-temp-77-output-0001.wnd");
 	let unrelated = dir.join("not-compaction-temp-77-output-0001.wnd");
-	std::fs::write(&temp, b"orphan").unwrap();
-	std::fs::write(&unrelated, b"keep").unwrap();
-
-	let _manager = open_test_manager(SlabManagerConfig {
+	let config = || SlabManagerConfig {
 		dir: dir.to_path_buf(),
 		max_slab_bytes: 1,
 		io: spawn_io_thread(16).unwrap(),
@@ -158,9 +163,12 @@ async fn open_removes_stale_lsm_compaction_temp_files() {
 		encoding_compute: Default::default(),
 		group_commit: wendelon::storage::GroupCommitConfig::default(),
 		crypto: test_crypto(),
-	})
-	.await
-	.unwrap();
+	};
+	let initial = initialize_test_manager(config()).await.unwrap();
+	drop(initial);
+	std::fs::write(&temp, b"orphan").unwrap();
+	std::fs::write(&unrelated, b"keep").unwrap();
+	let _manager = open_test_manager(config()).await.unwrap();
 
 	assert!(!temp.exists());
 	assert!(unrelated.exists());
@@ -169,7 +177,7 @@ async fn open_removes_stale_lsm_compaction_temp_files() {
 #[tokio::test]
 async fn lsm_output_slab_id_reservation_advances_manager_sequence() {
 	let l1_dir = fresh_dir("reserve-outputs");
-	let manager = open_test_manager(SlabManagerConfig {
+	let manager = initialize_test_manager(SlabManagerConfig {
 		dir: l1_dir.to_path_buf(),
 		max_slab_bytes: 1,
 		io: spawn_io_thread(16).unwrap(),
@@ -208,7 +216,7 @@ async fn lsm_output_slab_id_reservation_advances_manager_sequence() {
 #[tokio::test]
 async fn lsm_version_entries_for_plan_come_from_manager_key_index() {
 	let l1_dir = fresh_dir("extract-entries");
-	let manager = open_test_manager(SlabManagerConfig {
+	let manager = initialize_test_manager(SlabManagerConfig {
 		dir: l1_dir.to_path_buf(),
 		max_slab_bytes: 1,
 		io: spawn_io_thread(16).unwrap(),
@@ -249,7 +257,7 @@ async fn lsm_version_entries_for_plan_come_from_manager_key_index() {
 		dominant_reason: DominantReason::LevelSize,
 	};
 
-	let entries = manager.lsm_version_entries_for_plan(&plan);
+	let entries = manager.lsm_version_entries_for_plan(&plan).unwrap();
 
 	assert_eq!(entries.len(), 1);
 	assert_eq!(entries[0].tenant_id, tenant());
@@ -262,7 +270,7 @@ async fn lsm_version_entries_for_plan_come_from_manager_key_index() {
 #[tokio::test]
 async fn manager_prepares_lsm_outputs_from_extracted_entries_and_reserved_ids() {
 	let l1_dir = fresh_dir("prepare-outputs");
-	let manager = open_test_manager(SlabManagerConfig {
+	let manager = initialize_test_manager(SlabManagerConfig {
 		dir: l1_dir.to_path_buf(),
 		max_slab_bytes: 1,
 		io: spawn_io_thread(16).unwrap(),
@@ -321,7 +329,7 @@ async fn manager_prepares_lsm_outputs_from_extracted_entries_and_reserved_ids() 
 #[tokio::test]
 async fn manager_reads_lsm_single_row_source_frames_for_plan() {
 	let l1_dir = fresh_dir("source-frames");
-	let manager = open_test_manager(SlabManagerConfig {
+	let manager = initialize_test_manager(SlabManagerConfig {
 		dir: l1_dir.to_path_buf(),
 		max_slab_bytes: 1,
 		io: spawn_io_thread(16).unwrap(),
@@ -376,7 +384,7 @@ async fn manager_reads_lsm_single_row_source_frames_for_plan() {
 #[tokio::test]
 async fn manager_writes_lsm_temp_output_slabs_without_installing_them() {
 	let dir = fresh_dir("temp-outputs");
-	let manager = open_test_manager(SlabManagerConfig {
+	let manager = initialize_test_manager(SlabManagerConfig {
 		dir: dir.to_path_buf(),
 		max_slab_bytes: 1,
 		io: spawn_io_thread(16).unwrap(),
@@ -450,7 +458,7 @@ async fn manager_writes_lsm_temp_output_slabs_without_installing_them() {
 		!dir.join(format!("slab_{:016x}.wnd", written[0].slab_id))
 			.exists()
 	);
-	assert_eq!(manager.lookup(tenant(), id(71)).unwrap(), first);
+	assert_eq!(manager.lookup(tenant(), id(71)).unwrap().unwrap(), first);
 
 	let temp_store = LocalSlabStore::open(
 		&written[0].temp_path,
@@ -492,7 +500,7 @@ async fn manager_writes_lsm_temp_output_slabs_without_installing_them() {
 #[tokio::test]
 async fn manager_installs_lsm_temp_outputs_into_manifest_and_lookup_index() {
 	let dir = fresh_dir("install-outputs");
-	let manager = open_test_manager(SlabManagerConfig {
+	let manager = initialize_test_manager(SlabManagerConfig {
 		dir: dir.to_path_buf(),
 		max_slab_bytes: 1,
 		io: spawn_io_thread(16).unwrap(),
@@ -568,7 +576,10 @@ async fn manager_installs_lsm_temp_outputs_into_manifest_and_lookup_index() {
 	assert_eq!(post_epoch, snapshot.manifest_epoch.saturating_add(1));
 	assert!(!temp_path.exists());
 	assert!(final_path.exists());
-	assert_eq!(manager.lookup(tenant(), id(91)).unwrap(), output_location);
+	assert_eq!(
+		manager.lookup(tenant(), id(91)).unwrap().unwrap(),
+		output_location
+	);
 	assert_eq!(
 		manager.read(output_location).await.unwrap(),
 		b"first-record"
@@ -592,7 +603,7 @@ async fn manager_installs_lsm_temp_outputs_into_manifest_and_lookup_index() {
 #[tokio::test]
 async fn manager_runs_single_lsm_compaction_job_end_to_end() {
 	let l1_dir = fresh_dir("run-once");
-	let manager = open_test_manager(SlabManagerConfig {
+	let manager = initialize_test_manager(SlabManagerConfig {
 		dir: l1_dir.to_path_buf(),
 		max_slab_bytes: 1,
 		io: spawn_io_thread(16).unwrap(),
@@ -634,9 +645,9 @@ async fn manager_runs_single_lsm_compaction_job_end_to_end() {
 	};
 	let worker = LsmCompactionWorker::new(LsmConfig::default(), manager.slab_pin_table()).unwrap();
 
-	let outcome = worker.run_one(&manager, plan).await.unwrap();
+	let outcome = worker.run_one(manager.as_ref(), plan).await.unwrap();
 	let output_slab = outcome.output_slabs[0].slab_id;
-	let output_location = manager.lookup(tenant(), id(101)).unwrap();
+	let output_location = manager.lookup(tenant(), id(101)).unwrap().unwrap();
 
 	assert_eq!(outcome.manifest_epoch_pre, snapshot.manifest_epoch);
 	assert_eq!(
@@ -664,26 +675,24 @@ async fn manager_runs_single_lsm_compaction_job_end_to_end() {
 #[tokio::test]
 async fn manager_runs_lsm_compaction_job_through_control_ring_committer() {
 	let l1_dir = fresh_dir("run-once-control-ring");
-	let manager = Arc::new(
-		open_test_manager(SlabManagerConfig {
-			dir: l1_dir.to_path_buf(),
-			max_slab_bytes: 1,
-			io: spawn_io_thread(16).unwrap(),
-			l2: None,
-			rehydration: RehydrationPolicy::default(),
-			l2_column_fetch: Default::default(),
-			row_group_writer: Default::default(),
-			l2_row_group_fetch: Default::default(),
-			encoding_writer: Default::default(),
-			l2_chunk_layout: Default::default(),
-			l2_encoding_fetch: Default::default(),
-			encoding_compute: Default::default(),
-			group_commit: GroupCommitConfig::default(),
-			crypto: test_crypto(),
-		})
-		.await
-		.unwrap(),
-	);
+	let manager = initialize_test_manager(SlabManagerConfig {
+		dir: l1_dir.to_path_buf(),
+		max_slab_bytes: 1,
+		io: spawn_io_thread(16).unwrap(),
+		l2: None,
+		rehydration: RehydrationPolicy::default(),
+		l2_column_fetch: Default::default(),
+		row_group_writer: Default::default(),
+		l2_row_group_fetch: Default::default(),
+		encoding_writer: Default::default(),
+		l2_chunk_layout: Default::default(),
+		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
+		group_commit: GroupCommitConfig::default(),
+		crypto: test_crypto(),
+	})
+	.await
+	.unwrap();
 
 	let first = manager
 		.append(tenant(), id(111), hlc(111), b"first-record")
@@ -718,7 +727,7 @@ async fn manager_runs_lsm_compaction_job_through_control_ring_committer() {
 		.await
 		.unwrap();
 	let output_slab = outcome.output_slabs[0].slab_id;
-	let output_location = manager.lookup(tenant(), id(111)).unwrap();
+	let output_location = manager.lookup(tenant(), id(111)).unwrap().unwrap();
 
 	assert_eq!(committer.applied.load(Ordering::SeqCst), 1);
 	let committed = committer.last_commit.lock().unwrap().clone().unwrap();
@@ -750,7 +759,7 @@ async fn manager_runs_lsm_compaction_job_through_control_ring_committer() {
 #[tokio::test]
 async fn manager_picker_tick_runs_l0_compaction_when_threshold_met() {
 	let l1_dir = fresh_dir("picker-tick");
-	let manager = open_test_manager(SlabManagerConfig {
+	let manager = initialize_test_manager(SlabManagerConfig {
 		dir: l1_dir.to_path_buf(),
 		max_slab_bytes: 1,
 		io: spawn_io_thread(16).unwrap(),
@@ -803,7 +812,7 @@ async fn manager_picker_tick_runs_l0_compaction_when_threshold_met() {
 		.unwrap()
 		.expect("picker tick should run a job");
 	let after = manager.compaction_manifest_snapshot();
-	let output_location = manager.lookup(tenant(), id(121)).unwrap();
+	let output_location = manager.lookup(tenant(), id(121)).unwrap().unwrap();
 
 	assert_eq!(outcome.rows_in, 4);
 	assert_eq!(outcome.rows_out, 4);
@@ -829,7 +838,7 @@ async fn manager_picker_tick_runs_l0_compaction_when_threshold_met() {
 #[tokio::test]
 async fn manager_reopens_with_persisted_lsm_manifest_filtering_retired_inputs() {
 	let dir = fresh_dir("reopen-lsm-manifest");
-	let manager = open_test_manager(SlabManagerConfig {
+	let manager = initialize_test_manager(SlabManagerConfig {
 		dir: dir.to_path_buf(),
 		max_slab_bytes: 1,
 		io: spawn_io_thread(16).unwrap(),
@@ -895,7 +904,7 @@ async fn manager_reopens_with_persisted_lsm_manifest_filtering_retired_inputs() 
 	})
 	.await
 	.unwrap();
-	let reopened_location = reopened.lookup(tenant(), id(131)).unwrap();
+	let reopened_location = reopened.lookup(tenant(), id(131)).unwrap().unwrap();
 	let reopened_manifest = reopened.compaction_manifest_snapshot();
 
 	assert_eq!(reopened_location.slab_id, output_slab);
@@ -919,7 +928,7 @@ async fn manager_reopens_with_persisted_lsm_manifest_filtering_retired_inputs() 
 #[tokio::test]
 async fn manager_install_rejects_bad_digest_before_manifest_apply() {
 	let dir = fresh_dir("run-once-digest-reject");
-	let manager = open_test_manager(SlabManagerConfig {
+	let manager = initialize_test_manager(SlabManagerConfig {
 		dir: dir.to_path_buf(),
 		max_slab_bytes: 1,
 		io: spawn_io_thread(16).unwrap(),
@@ -985,7 +994,7 @@ async fn manager_install_rejects_bad_digest_before_manifest_apply() {
 		err,
 		wendelon::storage::CompactionFailure::VisibleDigestInvariance
 	));
-	assert_eq!(manager.lookup(tenant(), id(111)).unwrap(), first);
+	assert_eq!(manager.lookup(tenant(), id(111)).unwrap().unwrap(), first);
 	assert!(
 		std::fs::read_dir(&dir)
 			.unwrap()
@@ -1006,7 +1015,7 @@ async fn manager_install_rejects_bad_digest_before_manifest_apply() {
 #[tokio::test]
 async fn manager_install_rejects_explicit_lsm_sidecar_swaps() {
 	let dir = fresh_dir("sidecar-swap-reject");
-	let manager = open_test_manager(SlabManagerConfig {
+	let manager = initialize_test_manager(SlabManagerConfig {
 		dir: dir.to_path_buf(),
 		max_slab_bytes: 1,
 		io: spawn_io_thread(16).unwrap(),
@@ -1076,7 +1085,7 @@ async fn manager_install_rejects_explicit_lsm_sidecar_swaps() {
 		err,
 		wendelon::storage::CompactionFailure::SidecarDigestMismatch
 	));
-	assert_eq!(manager.lookup(tenant(), id(141)).unwrap(), first);
+	assert_eq!(manager.lookup(tenant(), id(141)).unwrap().unwrap(), first);
 	assert!(
 		!dir.join(format!("slab_{:016x}.wnd", written[0].slab_id))
 			.exists()
@@ -1086,7 +1095,7 @@ async fn manager_install_rejects_explicit_lsm_sidecar_swaps() {
 #[tokio::test]
 async fn manager_removes_lsm_temp_output_on_missing_source_frame() {
 	let dir = fresh_dir("temp-output-missing-frame");
-	let manager = open_test_manager(SlabManagerConfig {
+	let manager = initialize_test_manager(SlabManagerConfig {
 		dir: dir.to_path_buf(),
 		max_slab_bytes: 1,
 		io: spawn_io_thread(16).unwrap(),
@@ -1150,7 +1159,7 @@ async fn manager_removes_lsm_temp_output_on_missing_source_frame() {
 #[tokio::test]
 async fn point_read_refuses_lsm_delete_pending_slab() {
 	let l1_dir = fresh_dir("read-pin");
-	let manager = open_test_manager(SlabManagerConfig {
+	let manager = initialize_test_manager(SlabManagerConfig {
 		dir: l1_dir.to_path_buf(),
 		max_slab_bytes: 1,
 		io: spawn_io_thread(16).unwrap(),
@@ -1191,7 +1200,7 @@ async fn point_read_refuses_lsm_delete_pending_slab() {
 #[tokio::test]
 async fn manager_applies_lsm_manifest_compaction_commit() {
 	let l1_dir = fresh_dir("manifest-commit");
-	let manager = open_test_manager(SlabManagerConfig {
+	let manager = initialize_test_manager(SlabManagerConfig {
 		dir: l1_dir.to_path_buf(),
 		max_slab_bytes: 1,
 		io: spawn_io_thread(16).unwrap(),
@@ -1268,7 +1277,7 @@ async fn manager_applies_lsm_manifest_compaction_commit() {
 #[tokio::test]
 async fn manager_lsm_gc_waits_for_authoritative_index_rewrite() {
 	let l1_dir = fresh_dir("manifest-gc");
-	let manager = open_test_manager(SlabManagerConfig {
+	let manager = initialize_test_manager(SlabManagerConfig {
 		dir: l1_dir.to_path_buf(),
 		max_slab_bytes: 1,
 		io: spawn_io_thread(16).unwrap(),
@@ -1356,26 +1365,24 @@ async fn manager_lsm_gc_waits_for_authoritative_index_rewrite() {
 #[tokio::test]
 async fn manager_lsm_gc_lifecycle_commits_through_control_ring() {
 	let dir = fresh_dir("gc-control-ring");
-	let manager = Arc::new(
-		open_test_manager(SlabManagerConfig {
-			dir: dir.to_path_buf(),
-			max_slab_bytes: 1,
-			io: spawn_io_thread(16).unwrap(),
-			l2: None,
-			rehydration: RehydrationPolicy::default(),
-			l2_column_fetch: Default::default(),
-			row_group_writer: Default::default(),
-			l2_row_group_fetch: Default::default(),
-			encoding_writer: Default::default(),
-			l2_chunk_layout: Default::default(),
-			l2_encoding_fetch: Default::default(),
-			encoding_compute: Default::default(),
-			group_commit: wendelon::storage::GroupCommitConfig::default(),
-			crypto: test_crypto(),
-		})
-		.await
-		.unwrap(),
-	);
+	let manager = initialize_test_manager(SlabManagerConfig {
+		dir: dir.to_path_buf(),
+		max_slab_bytes: 1,
+		io: spawn_io_thread(16).unwrap(),
+		l2: None,
+		rehydration: RehydrationPolicy::default(),
+		l2_column_fetch: Default::default(),
+		row_group_writer: Default::default(),
+		l2_row_group_fetch: Default::default(),
+		encoding_writer: Default::default(),
+		l2_chunk_layout: Default::default(),
+		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
+		group_commit: wendelon::storage::GroupCommitConfig::default(),
+		crypto: test_crypto(),
+	})
+	.await
+	.unwrap();
 
 	manager
 		.append(tenant(), id(41), hlc(41), b"first-record")

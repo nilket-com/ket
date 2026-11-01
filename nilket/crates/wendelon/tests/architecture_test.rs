@@ -743,13 +743,25 @@ fn test_adr055_lsm_compaction_substrate_guards() {
 	}
 	for required in [
 		"on_lsm_compaction_committed",
-		"apply_lsm_manifest_compaction_commit(commit)",
+		"observe_lsm_compaction_commit(commit, applied_log_index)",
 		"commit_lsm_compaction",
 		"WendelonRequest::CompactionCommit(commit)",
 	] {
 		if !storage_sweeper.contains(required) {
 			violations.push(format!(
 				"src/storage/sweeper.rs: missing ADR 055 manager observer token {required}"
+			));
+		}
+	}
+	let observer = manager_method_body(&storage_manager, "observe_lsm_compaction_commit");
+	for required in [
+		"persistent_index_gate",
+		"observer_is_superseded",
+		"apply_lsm_manifest_compaction_commit(commit)",
+	] {
+		if !observer.contains(required) {
+			violations.push(format!(
+				"LSM manager observer is missing guarded delegation {required}"
 			));
 		}
 	}
@@ -9250,8 +9262,8 @@ fn adr076_pending_witness_never_expires_on_peer_loss() {
 		"pub struct CounterReplicaService",
 		"/// The leader's own (local) participant",
 	);
-	assert!(service.contains("pending: DashMap<ReplicaOpKey2, PendingReplicaTentative>"));
-	assert!(service.contains("op_locks: DashMap<ReplicaOpKey2, ReplicaGateEntry>"));
+	assert!(service.contains("pending: Arc<DashMap<ReplicaOpKey2, PendingReplicaTentative>>"));
+	assert!(service.contains("op_locks: Arc<DashMap<ReplicaOpKey2, ReplicaGateEntry>>"));
 	assert!(service.contains("ReplicaGate::admit(self, key).await"));
 	assert!(!service.contains("Arc::strong_count") && !service.contains("reclaim_gate2"));
 	let gate = source_region(
@@ -9267,9 +9279,7 @@ fn adr076_pending_witness_never_expires_on_peer_loss() {
 		let start = service.find(marker).unwrap();
 		let next = &service[start..];
 		let zero = next.find("check_expected_key2(expected_key)?;").unwrap();
-		let gate = next
-			.find("let _gate = ReplicaGate::admit(self, key).await;")
-			.unwrap();
+		let gate = next.find("ReplicaGate::admit(self, key).await;").unwrap();
 		let lookup = next.find("self.pending.get(&key)").unwrap();
 		let compare = next.find("pending.key_identity != expected_key").unwrap();
 		assert!(zero < gate && gate < lookup && lookup < compare);
@@ -9694,16 +9704,35 @@ fn adr078_manager_source_concatenates_submodules() {
 			"compaction.rs",
 			"counter_visibility.rs",
 			"encoding_compute.rs",
+			"index_publication.rs",
 			"lsm_driver.rs",
 			"maintenance_publication.rs",
+			// Snapshot-race metadata observations and durable operation tokens.
+			"metadata_observation.rs",
 			// ADR 629 counted publication helpers preserve the existing entry points.
 			"observation.rs",
 			"open.rs",
+			// ADR 0692: test-only pause points (compiled only under cfg(test)), kept
+			// out of the bounded root.
+			"pause_hooks.rs",
+			"publication_accounting.rs",
+			// ADR 0692: per-key relocation and atomic empty-key removal.
+			"relocation.rs",
 			"retention_reclaim.rs",
 			"secondary_index_cleanup.rs",
 			"secondary_index_segments.rs",
+			// Local slab files that disagree with the committed tier state, and
+			// the ownership rule for every slab-path unlink.
+			"slab_file_quarantine.rs",
 			"stats_facts.rs",
+			// ADR 0692: tier generations, the read snapshot and the typed refusal.
+			"tier_authority.rs",
+			"tier_generation.rs",
+			// ADR 0692: tier publication plans pair rows by logical owner.
+			"tier_plan.rs",
 			"tiered_io.rs",
+			// ADR 0692: class-scoped version identity and tier verification.
+			"version_identity.rs",
 		],
 		"ADR 078 production source manifest changed; update this guard deliberately \
 		 (tests.rs is excluded — it is not production source)"
@@ -10378,9 +10407,9 @@ fn adr0093_test_support_is_non_default_and_every_hook_site_is_gated() {
 		1
 	);
 	let manager = read_workspace("crates/wendelon/src/storage/manager.rs");
-	assert!(
-		manager.contains("#[cfg(feature = \"test-support\")]\n\tpub async fn open_with_file_ops(")
-	);
+	assert!(manager.contains(
+		"#[cfg(any(test, feature = \"test-support\"))]\n\tpub async fn open_with_file_ops("
+	));
 	assert_eq!(
 		manager.matches("pub async fn open_with_file_ops(").count(),
 		1
@@ -10648,5 +10677,967 @@ fn pd22_sidecar_path_builder_requires_the_full_persistent_catalog_key() {
 		"source_slab_id",
 	] {
 		assert!(body.contains(&format!("key.{field}")), "path omits {field}");
+	}
+}
+
+/// The source text of one `impl` method, from its signature to the next
+/// method at the same indentation.
+fn manager_method_body<'a>(source: &'a str, name: &str) -> &'a str {
+	let start = source
+		.find(&format!("fn {name}("))
+		.unwrap_or_else(|| panic!("method {name} not found"));
+	let rest = &source[start..];
+	let end = [
+		"\n\tpub async fn ",
+		"\n\tpub fn ",
+		"\n\tpub(super) ",
+		"\n\tpub(crate) ",
+		"\n\tasync fn ",
+		"\n\tfn ",
+	]
+	.iter()
+	.filter_map(|marker| rest[1..].find(marker).map(|index| index + 1))
+	.min()
+	.unwrap_or(rest.len());
+	&rest[..end]
+}
+
+/// Relocating writers replace each key's versions in one index critical
+/// section. A relocation that removes every source and then inserts every
+/// output makes a live key momentarily absent to lock-free readers.
+#[test]
+fn relocating_writers_replace_versions_per_key_and_never_remove_then_insert() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	for (file, method) in [
+		(
+			"src/storage/manager/lsm_driver.rs",
+			"complete_lsm_compaction_install",
+		),
+		(
+			"src/storage/manager/compaction.rs",
+			"finish_compaction_with_replacement",
+		),
+		(
+			"src/storage/manager/tiered_io.rs",
+			"apply_tiered_row_refresh_plan_locked",
+		),
+	] {
+		let source = fs::read_to_string(manifest_dir.join(file)).unwrap();
+		let body = manager_method_body(&source, method);
+		assert!(
+			!body.contains("rollback_indexed_location("),
+			"{file}::{method} must not remove relocated versions with rollback_indexed_location"
+		);
+		assert!(
+			!body.contains("index_appended_location_with_locality("),
+			"{file}::{method} must not insert relocated versions with index_appended_location_with_locality"
+		);
+		assert!(
+			body.contains("relocate_indexed_locations("),
+			"{file}::{method} must relocate through relocate_indexed_locations"
+		);
+	}
+}
+
+// ============================================================
+//  Release by slab id: the conditions it rests on
+// ============================================================
+
+/// `(file basename, count)` of `needle` in each manager source file
+/// (`tests.rs` excluded), for the files where it occurs.
+fn manager_occurrences(manifest_dir: &Path, count: impl Fn(&str) -> usize) -> Vec<(String, usize)> {
+	manager_source_files(manifest_dir)
+		.iter()
+		.filter_map(|path| {
+			let occurrences = count(&fs::read_to_string(path).unwrap());
+			(occurrences > 0).then(|| {
+				(
+					path.file_name().unwrap().to_str().unwrap().to_string(),
+					occurrences,
+				)
+			})
+		})
+		.collect()
+}
+
+/// A released slab id is never allocated again: `next_slab_id` changes only
+/// through one helper, and that helper never moves it backward.
+#[test]
+fn the_slab_allocator_only_advances_through_one_monotone_helper() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let assignments = manager_occurrences(manifest_dir, |source| {
+		source
+			.lines()
+			.filter(|line| {
+				line.split("next_slab_id").skip(1).any(|rest| {
+					rest.trim_start().starts_with('=') && !rest.trim_start().starts_with("==")
+				})
+			})
+			.filter(|line| line.contains(".next_slab_id"))
+			.count()
+	});
+	assert_eq!(
+		assignments,
+		vec![("manager.rs".to_string(), 1)],
+		"next_slab_id is assigned only inside the monotone allocator helper"
+	);
+	let root = fs::read_to_string(manifest_dir.join("src/storage/manager.rs")).unwrap();
+	let helper = manager_method_body(&root, "advance_slab_allocator");
+	assert!(
+		helper.contains("self.next_slab_id = ") && helper.contains(".max("),
+		"the allocator helper only moves next_slab_id forward"
+	);
+}
+
+/// Every call that names a slab path, pinned per file. A released file's
+/// path is reused only by an installer that allocates a fresh id (rotation,
+/// force-seal, LSM outputs, maintenance replacements, retention reclaim, the
+/// secondary-index declaration cut) or links without replacing (rehydration).
+/// A new call site changes this census and must be reviewed against the
+/// release rule in `slab_file_quarantine.rs`.
+#[test]
+fn every_slab_path_installer_uses_a_fresh_id_or_links_without_replacing() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let slab_paths = manager_occurrences(manifest_dir, |source| {
+		source
+			.match_indices("slab_path(")
+			.filter(|(at, _)| {
+				let before = &source[..*at];
+				!before.ends_with('_')
+					&& !before.ends_with("fn ")
+					&& !before
+						.chars()
+						.last()
+						.is_some_and(|c| c.is_ascii_alphanumeric())
+			})
+			.count()
+	});
+	assert_eq!(
+		slab_paths,
+		vec![
+			// recovery-time zero-length cleanup (no manager yet), the rotation's
+			// fresh next id, sealed-file reads and the backup copy
+			("manager.rs".to_string(), 7),
+			// Fresh output paths, identity-only reads, and intent-guarded cleanup.
+			// Control output recovery and input capture add read-only identity checks.
+			("lsm_driver.rs".to_string(), 12),
+			// the staged replacement's final path (fresh reserved id)
+			("maintenance_publication.rs".to_string(), 1),
+			// open-time discovery (no manager yet)
+			("open.rs".to_string(), 4),
+			// retention reclaim's fresh active slab
+			("retention_reclaim.rs".to_string(), 1),
+			// the declaration cut (fresh id) and segment source reads
+			("secondary_index_segments.rs".to_string(), 2),
+			// Open classification, owner-identity GC unlink, and released unlink.
+			("slab_file_quarantine.rs".to_string(), 3),
+			// Bootstrap checks the existing path and allocates a fresh replacement.
+			("tier_authority.rs".to_string(), 2),
+			// rehydration, published with link_no_replace
+			("tiered_io.rs".to_string(), 1),
+		],
+		"slab-path call sites changed; review each against the id-keyed release rule"
+	);
+	let installs = manager_occurrences(manifest_dir, |source| {
+		source.matches(".rename(").count() + source.matches(".link_no_replace(").count()
+	});
+	assert_eq!(
+		installs,
+		vec![
+			// Staged output rename and no-replace link into the quarantine namespace.
+			("lsm_driver.rs".to_string(), 2),
+			("maintenance_publication.rs".to_string(), 1),
+			("secondary_index_segments.rs".to_string(), 1),
+			("tiered_io.rs".to_string(), 1),
+		],
+		"rename/link call sites changed; review each against the id-keyed release rule"
+	);
+	let tiered_io =
+		fs::read_to_string(manifest_dir.join("src/storage/manager/tiered_io.rs")).unwrap();
+	assert!(
+		tiered_io.contains("link_no_replace(&tmp_path, &path)"),
+		"rehydration never replaces a file at a slab path"
+	);
+}
+
+/// One manager per data directory: the only constructor outside test and
+/// test-support builds holds the directory owner, whose lock is exclusive
+/// (storage/ownership.rs tests).
+#[test]
+fn the_only_production_slab_manager_constructor_holds_the_directory_owner() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let root = fs::read_to_string(manifest_dir.join("src/storage/manager.rs")).unwrap();
+	let constructors = root
+		.lines()
+		.enumerate()
+		.filter(|(_, line)| line.contains("async fn open") && !line.contains("open_shared"))
+		.map(|(index, line)| {
+			let gate = root
+				.lines()
+				.take(index)
+				.last()
+				.unwrap_or("")
+				.trim()
+				.to_string();
+			(line.trim().to_string(), gate)
+		})
+		.collect::<Vec<_>>();
+	for (signature, gate) in &constructors {
+		if signature.starts_with("pub async fn open_with_owner(") {
+			continue;
+		}
+		assert!(
+			gate == "#[cfg(any(test, feature = \"test-support\"))]"
+				|| gate == "#[cfg(test)]"
+				|| gate == "#[cfg(feature = \"test-support\")]",
+			"{signature} opens a manager without the directory owner outside tests ({gate})"
+		);
+	}
+	assert!(
+		constructors
+			.iter()
+			.any(|(signature, _)| signature.starts_with("pub async fn open_with_owner(")),
+		"the production constructor exists"
+	);
+	assert!(
+		manager_method_body(&root, "open_with_owner").contains("Some(owner)"),
+		"the production constructor keeps the owner for the manager's lifetime"
+	);
+	let open = fs::read_to_string(manifest_dir.join("src/storage/manager/open.rs")).unwrap();
+	assert!(
+		open.contains("pub(super) async fn open_shared("),
+		"the shared opener is not reachable outside the manager"
+	);
+}
+
+#[test]
+fn tier_recovery_snapshots_have_only_the_reviewed_private_callers() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/storage");
+	for (name, expected) in [
+		(
+			"record_rows_for_slab_for_recovery",
+			vec![
+				("manager.rs", 2),
+				("manager/lsm_driver.rs", 1),
+				("manager/tiered_io.rs", 4),
+			],
+		),
+		(
+			"published_table_object_id_for_recovery",
+			vec![("manager.rs", 3)],
+		),
+		(
+			"version_conflict_groups_for_recovery",
+			vec![
+				("manager/version_identity.rs", 2),
+				("manager/tier_authority.rs", 1),
+			],
+		),
+		(
+			"recovery_read_target",
+			vec![
+				("manager/tier_generation.rs", 1),
+				("manager/lsm_driver.rs", 1),
+				("manager/tier_authority.rs", 1),
+			],
+		),
+		(
+			"build_tiered_row_refresh_plan_from_plaintext",
+			vec![
+				("manager/tiered_io.rs", 1),
+				("manager/tier_authority.rs", 1),
+			],
+		),
+	] {
+		let mut actual = Vec::new();
+		walk_dir(&root, &mut |path| {
+			if path.ends_with("manager/tests.rs") {
+				return;
+			}
+			if path.extension().is_none_or(|extension| extension != "rs") {
+				return;
+			}
+			let source = fs::read_to_string(path).unwrap();
+			let count = rust_identifiers_from_source(&path.display().to_string(), &source)
+				.iter()
+				.filter(|ident| *ident == name)
+				.count();
+			if count > 0 {
+				actual.push((
+					path.strip_prefix(&root)
+						.unwrap()
+						.to_string_lossy()
+						.to_string(),
+					count,
+				));
+			}
+		});
+		actual.sort();
+		let mut expected = expected
+			.into_iter()
+			.map(|(file, count)| (file.to_string(), count))
+			.collect::<Vec<_>>();
+		expected.sort();
+		assert_eq!(
+			actual, expected,
+			"private recovery caller census changed for {name}"
+		);
+	}
+	let tiered = fs::read_to_string(root.join("manager/tiered_io.rs")).unwrap();
+	let entry = manager_method_body(&tiered, "retire_tiered_slab_committed");
+	assert!(entry.contains("retire_tiered_slab_with_epoch(slab_id, last_control_log_index, None)"));
+	let retirement = manager_method_body(&tiered, "retire_tiered_slab_with_epoch");
+	assert!(retirement.contains("tier_lock.lock().await"));
+	assert!(retirement.contains("retire_tiered_slab_under_publication_lock("));
+	let retirement_locked =
+		manager_method_body(&tiered, "retire_tiered_slab_under_publication_lock");
+	assert!(retirement_locked.contains(
+		"require_private_retirement_authority(slab_id, last_control_log_index.is_some())?"
+	));
+	let reconcile = manager_method_body(&tiered, "reconcile_tier_slab_at_snapshot_epoch<F, Fut>");
+	assert!(
+		reconcile.find("tier_lock.lock().await").unwrap()
+			< reconcile.find("authoritative().await").unwrap()
+	);
+	assert!(
+		retirement.find("tier_lock.lock().await").unwrap()
+			< retirement
+				.find("retire_tiered_slab_under_publication_lock(")
+				.unwrap()
+	);
+	assert!(
+		reconcile.find("tier_lock.lock().await").unwrap()
+			< reconcile
+				.find("retire_tiered_slab_under_publication_lock(")
+				.unwrap()
+	);
+	assert_eq!(
+		retirement
+			.matches("retire_tiered_slab_under_publication_lock(")
+			.count(),
+		1
+	);
+	assert_eq!(
+		reconcile
+			.matches("retire_tiered_slab_under_publication_lock(")
+			.count(),
+		1
+	);
+	assert_eq!(
+		tiered
+			.matches("retire_tiered_slab_under_publication_lock(")
+			.count(),
+		3
+	);
+	assert!(tiered.contains("\n\tasync fn retire_tiered_slab_under_publication_lock("));
+	let snapshot_retirement = manager_method_body(&tiered, "apply_snapshot_retirement");
+	assert!(snapshot_retirement.contains("tier_lock.lock().await"));
+	assert!(snapshot_retirement.contains("persistent_index_gate"));
+	assert!(snapshot_retirement.contains("apply_snapshot_retirement("));
+	let manager = fs::read_to_string(root.join("manager.rs")).unwrap();
+	assert!(
+		manager_method_body(&manager, "record_rows_for_slab")
+			.contains("require_tier_authority_ready()?")
+	);
+	assert!(
+		manager_method_body(&manager, "published_table_object_id")
+			.contains("require_tier_authority_ready()?")
+	);
+}
+
+fn answer_tokens_never_default(tokens: TokenStream) -> bool {
+	let tokens = tokens.into_iter().collect::<Vec<_>>();
+	let answers = [
+		"lookup",
+		"lookup_as_of",
+		"scan",
+		"scan_as_of",
+		"scan_as_of_with_identity",
+		"scan_as_of_with_identity_and_locality",
+		"scan_all_versions",
+		"scan_all_versions_from",
+		"version_placement_at",
+		"routing_locality_for_existing_key",
+		"slab_hlc_bounds",
+		"slab_supersession_metadata",
+		"slab_row_tombstone_metadata",
+		"slab_has_supersession_at",
+		"slab_has_migrated_range_tombstone_at",
+		"table_drop_reference_counts",
+		"published_table_object_id",
+		"record_rows_for_slab",
+		"counter_lookup",
+		"same_hlc_locations",
+		"resolve_logical_version",
+		"resolve_secondary_index_rows",
+		"admit_pk_write_row",
+		"admit_pk_delete_row",
+		"row_visible_for_admission",
+	];
+	for (index, token) in tokens.iter().enumerate() {
+		if let TokenTree::Group(group) = token {
+			if !answer_tokens_never_default(group.stream()) {
+				return false;
+			}
+		}
+		if matches!(token, TokenTree::Ident(name) if answers.iter().any(|answer| name == *answer))
+			&& matches!(tokens.get(index + 1), Some(TokenTree::Group(group)) if group.delimiter() == proc_macro2::Delimiter::Parenthesis)
+			&& matches!(tokens.get(index + 2), Some(TokenTree::Punct(dot)) if dot.as_char() == '.')
+			&& matches!(tokens.get(index + 3), Some(TokenTree::Ident(method)) if ["ok", "unwrap_or", "unwrap_or_default", "unwrap_or_else"].iter().any(|name| method == *name))
+		{
+			return false;
+		}
+	}
+	true
+}
+
+#[test]
+fn fallible_index_answers_never_coerce_refusal_to_missing_or_empty() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	walk_dir(&root, &mut |path| {
+		if path.extension().is_some_and(|extension| extension == "rs") {
+			let source = fs::read_to_string(path).unwrap();
+			assert!(
+				answer_tokens_never_default(TokenStream::from_str(&source).unwrap()),
+				"answer refusal defaulted in {}",
+				path.display()
+			);
+		}
+	});
+}
+
+#[test]
+fn tier_authority_remote_reads_have_no_manager_or_install_authority() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/storage/manager");
+	let source = fs::read_to_string(root.join("tier_authority.rs")).unwrap();
+	let plaintext = manager_method_body(&source, "plaintext");
+	assert!(plaintext.contains("let (store, acknowledged) = {"));
+	let remote = plaintext
+		.find("store.get_bytes(")
+		.expect("owned remote read");
+	assert!(plaintext[..remote].contains("\n\t\t};"));
+	assert!(plaintext[remote..].contains("self.upgrade(epoch)"));
+	assert!(!plaintext.contains("spawn_blocking"));
+	assert!(!plaintext.contains("write_all("));
+	assert!(source.contains("OnceLock<Weak<SlabManager>>"));
+	assert!(source.contains("owner.register_worker(self.clone())?"));
+	let stage = manager_method_body(&source, "stage_bootstrap_tier_authority");
+	assert!(stage.contains(
+		"stage_tier_authority(pointer, last_control_log_index, committed_id_floor, false)"
+	));
+	let wrapper = manager_method_body(&source, "stage_tier_authority");
+	assert!(wrapper.contains("lock.lock().await"));
+	assert!(wrapper.contains("stage_tier_authority_under_publication_lock("));
+	let delegated = manager_method_body(&source, "stage_tier_authority_under_publication_lock");
+	assert!(delegated.contains("begin_staging(pointer.slab_id, snapshot)?"));
+	assert!(!wrapper.contains("unlink"));
+	assert!(!wrapper.contains("release_slab_file"));
+	assert!(!wrapper.contains("get_bytes"));
+	assert!(!stage.contains("unlink"));
+	assert!(!stage.contains("release_slab_file"));
+	assert!(!stage.contains("get_bytes"));
+	assert!(!delegated.contains("unlink"));
+	assert!(!delegated.contains("release_slab_file"));
+	assert!(!delegated.contains("get_bytes"));
+}
+
+#[test]
+fn replacement_canonical_staging_has_one_confirmed_replay_issuer() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let mut occurrences = Vec::new();
+	walk_dir(&root.join("src"), &mut |path| {
+		if path.extension().is_some_and(|ext| ext == "rs")
+			&& path.file_name().is_none_or(|name| name != "tests.rs")
+		{
+			let source = fs::read_to_string(path).unwrap();
+			let count = rust_identifiers_from_source("replay staging issuer census", &source)
+				.iter()
+				.filter(|name| *name == "stage_replacement_tier_comparison")
+				.count();
+			if count != 0 {
+				occurrences.push((path.strip_prefix(root).unwrap().to_path_buf(), count));
+			}
+		}
+	});
+	occurrences.sort();
+	assert_eq!(
+		occurrences,
+		vec![
+			(PathBuf::from("src/storage/index.rs"), 1),
+			(PathBuf::from("src/storage/manager/tier_authority.rs"), 1),
+		],
+		"one declaration and exactly one production caller"
+	);
+	let index = fs::read_to_string(root.join("src/storage/index.rs")).unwrap();
+	let strict = index
+		.split("pub(crate) async fn stage_tier_comparison(")
+		.nth(1)
+		.unwrap()
+		.split("pub(crate) async fn stage_replacement_tier_comparison(")
+		.next()
+		.unwrap();
+	assert!(strict.contains(".stage_tier_comparison_inner("));
+	assert!(strict.contains("Vec::new()"));
+	assert!(!strict.contains("replay_staged"));
+	let authority = fs::read_to_string(root.join("src/storage/manager/tier_authority.rs")).unwrap();
+	assert!(authority.contains("let replay_staged = if replay_confirmation.is_some()"));
+	assert!(authority.contains("if let Some(completion) = replacement_completion"));
+	assert!(authority.contains(".stage_replacement_tier_comparison("));
+	let node = fs::read_to_string(root.join("src/node.rs")).unwrap();
+	let recovered = node
+		.split("for tier in recovered_tiers {")
+		.nth(1)
+		.unwrap()
+		.split("let seed_epoch =")
+		.next()
+		.unwrap();
+	assert!(recovered.contains(".stage_bootstrap_tier_authority("));
+	assert!(
+		!recovered.contains("break;"),
+		"awaiting replacements still register recovered committed flights"
+	);
+}
+
+#[test]
+fn pending_retirement_staging_has_one_complete_snapshot_issuer() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let mut occurrences = Vec::new();
+	walk_dir(&root.join("src"), &mut |path| {
+		if path.extension().is_some_and(|ext| ext == "rs")
+			&& path.file_name().is_none_or(|name| name != "tests.rs")
+		{
+			let source = fs::read_to_string(path).unwrap();
+			let count = rust_identifiers_from_source("pending retirement issuer census", &source)
+				.iter()
+				.filter(|name| *name == "stage_snapshot_tier_comparison_with_pending_retirements")
+				.count();
+			if count != 0 {
+				occurrences.push((path.strip_prefix(root).unwrap().to_path_buf(), count));
+			}
+		}
+	});
+	occurrences.sort();
+	assert_eq!(
+		occurrences,
+		vec![
+			(PathBuf::from("src/storage/index.rs"), 1),
+			(PathBuf::from("src/storage/manager/tier_authority.rs"), 1),
+		],
+		"one declaration and exactly one production caller"
+	);
+	let authority = fs::read_to_string(root.join("src/storage/manager/tier_authority.rs")).unwrap();
+	let comparison = manager_method_body(&authority, "finish_tier_comparison_at_epoch");
+	assert!(comparison.contains("write_owned().await"));
+	assert!(comparison.contains("if replay_confirmation.is_none()"));
+	assert!(comparison.contains("entry.pointer == *pointer"));
+	assert!(comparison.contains("old < snapshot"));
+	assert!(comparison.contains("else if !pending_retirements.is_empty()"));
+	let index = fs::read_to_string(root.join("src/storage/index.rs")).unwrap();
+	for name in ["stage_tier_comparison", "stage_replacement_tier_comparison"] {
+		let entry = manager_method_body(&index, name);
+		assert!(entry.contains(".stage_tier_comparison_inner("));
+		assert!(!entry.contains("pending_retirement"));
+		assert!(entry.contains("None,"));
+	}
+}
+
+#[test]
+fn accepted_snapshot_pending_staging_has_one_private_issuer() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let mut occurrences = Vec::new();
+	walk_dir(&root.join("src"), &mut |path| {
+		if path.extension().is_some_and(|ext| ext == "rs")
+			&& path.file_name().is_none_or(|name| name != "tests.rs")
+		{
+			let source = fs::read_to_string(path).unwrap();
+			let count = rust_identifiers_from_source("snapshot pending staging census", &source)
+				.iter()
+				.filter(|name| *name == "stage_snapshot_pending_tiers")
+				.count();
+			if count != 0 {
+				occurrences.push((path.strip_prefix(root).unwrap().to_path_buf(), count));
+			}
+		}
+	});
+	occurrences.sort();
+	assert_eq!(
+		occurrences,
+		vec![
+			(PathBuf::from("src/storage/index.rs"), 1),
+			(PathBuf::from("src/storage/manager/tier_authority.rs"), 1)
+		],
+		"one declaration and one accepted-snapshot deferral caller"
+	);
+}
+
+/// The SM lease precedes local publication locks. Local files/redb may await;
+/// remote work and retry waiting must occur outside the lease's lexical scope.
+#[test]
+fn snapshot_lease_scopes_exclude_remote_io_and_backoff() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let authority = fs::read_to_string(root.join("src/storage/manager/tier_authority.rs")).unwrap();
+	let sweeper = fs::read_to_string(root.join("src/storage/sweeper.rs")).unwrap();
+	let verify = manager_method_body(&authority, "verify");
+	let compare = manager_method_body(&authority, "retry_snapshot_comparison");
+	let callback = manager_method_body(&sweeper, "on_tier_snapshot_installed");
+	// Census all acquisition sites, including the freshness-only Verify branch.
+	assert_eq!(authority.matches("source.read().await").count(), 4);
+	assert_eq!(sweeper.matches("source.read().await").count(), 1);
+	let mut sites = Vec::new();
+	walk_dir(&root.join("src"), &mut |path| {
+		if path.extension().is_some_and(|ext| ext == "rs")
+			&& path.file_name().is_none_or(|name| name != "tests.rs")
+		{
+			let source = fs::read_to_string(path).unwrap();
+			if source.contains("source.read().await") {
+				sites.push(path.strip_prefix(root).unwrap().to_path_buf());
+			}
+		}
+	});
+	sites.sort();
+	assert_eq!(
+		sites,
+		vec![
+			PathBuf::from("src/storage/manager/tier_authority.rs"),
+			PathBuf::from("src/storage/sweeper.rs")
+		]
+	);
+	assert!(compare.contains("let canonical = retry.source.read().await?;\n\t\tlet manager"));
+	assert!(callback.contains("let canonical = match self.snapshot_source.get()"));
+	assert!(
+		!callback
+			.split("let canonical =")
+			.next()
+			.unwrap()
+			.contains(".await")
+	);
+	assert!(verify.contains("let plaintext = self.plaintext(epoch, &pending.pointer, &mut cache).await?;\n\t\t\tlet canonical ="));
+	assert!(verify.contains("\n\t\t}\n\t\tlet groups = {"));
+	let per_pointer = verify
+		.split("let _canonical =")
+		.nth(1)
+		.unwrap()
+		.split("\n\t\t}\n\t\tlet groups = {")
+		.next()
+		.unwrap();
+	let ready = verify.rsplit("let _canonical =").next().unwrap();
+	let freshness = authority
+		.split("SnapshotReconciliationPhase::Verify { revision } => {")
+		.nth(1)
+		.unwrap()
+		.split("SnapshotReconciliationPhase::Compare => {")
+		.next()
+		.unwrap();
+	assert!(freshness.contains("let canonical = retry.source.read().await;"));
+	assert!(
+		!freshness
+			.split("let canonical =")
+			.next()
+			.unwrap()
+			.contains(".await")
+	);
+	for scope in [compare, callback, per_pointer, ready, freshness] {
+		for forbidden in [
+			"ObjectStore",
+			".plaintext(",
+			".frame(",
+			".fetch(",
+			"tokio::time",
+			"next_transient_retry",
+			".recv(",
+			".join(",
+		] {
+			assert!(
+				!scope.contains(forbidden),
+				"{forbidden} inside an SM lease scope"
+			);
+		}
+	}
+	// The actual retry/backoff arm only starts after comparison returned,
+	// dropping the comparison's guard (including every error return).
+	let worker = manager_method_body(&authority, "run");
+	assert!(
+		worker
+			.find("self.retry_snapshot_comparison(&retry).await")
+			.unwrap() < worker
+			.find("sleep(next_transient_retry(&mut delay))")
+			.unwrap()
+	);
+	// Direct local callees are a reviewed census, not permission to fetch.
+	for name in [
+		"quarantine_pending_snapshot_collision",
+		"quarantine_bootstrap_collision_locked",
+		"finish_tier_comparison_at_epoch",
+		"stage_deferred_snapshot_tiers",
+	] {
+		let body = manager_method_body(&authority, name);
+		for forbidden in [
+			"ObjectStore",
+			".plaintext(",
+			".frame(",
+			".fetch(",
+			"tokio::time",
+		] {
+			assert!(!body.contains(forbidden), "{name} introduced {forbidden}");
+		}
+	}
+}
+
+/// A canonical writer cannot wait on the local locks held by a lease reader.
+/// Observer I/O is dispatched after the SM guard's enclosing block ends.
+#[test]
+fn snapshot_lease_writers_do_not_await_local_publication_locks() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let source = fs::read_to_string(root.join("src/consensus/raft_storage.rs")).unwrap();
+	let sm = source
+		.split("impl WendelonStateMachine {")
+		.nth(1)
+		.unwrap()
+		.split("fn apply_entry_to_state(")
+		.next()
+		.unwrap();
+	// Six cfg(test) seeding helpers plus the two production writers.
+	assert_eq!(sm.matches("self.inner.write().await").count(), 8);
+	let apply = sm
+		.split("let pending_checkpoint = {\n\t\t\tlet mut guard = self.inner.write().await;")
+		.nth(1)
+		.unwrap()
+		.split("\n\t\t};")
+		.next()
+		.unwrap();
+	let install = sm
+		.rsplit("let pending_checkpoint = {\n\t\t\tlet mut guard = self.inner.write().await;")
+		.next()
+		.unwrap()
+		.split("\n\t\t};")
+		.next()
+		.unwrap();
+	for guarded in [apply, install] {
+		assert!(!guarded.contains(".await"));
+		assert!(!guarded.contains("self.slab"));
+	}
+	let builder = source
+		.split("impl RaftSnapshotBuilder<WendelonTypeConfig> for WendelonSnapshotBuilder {")
+		.nth(1)
+		.unwrap()
+		.split("#[cfg(test)]")
+		.next()
+		.unwrap();
+	assert_eq!(builder.matches("self.inner.write().await").count(), 2);
+	for guarded in builder
+		.split("let mut guard = self.inner.write().await;")
+		.skip(1)
+	{
+		let guarded = guarded
+			.split("\n\t\t};")
+			.next()
+			.unwrap()
+			.split("\n\t\t}")
+			.next()
+			.unwrap();
+		assert!(!guarded.contains(".await"));
+	}
+	let sweeper = fs::read_to_string(root.join("src/storage/sweeper.rs")).unwrap();
+	let authority = fs::read_to_string(root.join("src/storage/manager/tier_authority.rs")).unwrap();
+	// The only in-guard tier hook uses synchronous fence bookkeeping.
+	for body in [
+		manager_method_body(&sweeper, "before_slab_retired"),
+		manager_method_body(&authority, "observer_is_superseded"),
+		manager_method_body(&authority, "fence_unapplied_tier_retirement"),
+		manager_method_body(&authority, "mark_retirement"),
+	] {
+		assert!(!body.contains(".await"));
+		assert!(!body.contains("self.state.lock()"));
+		assert!(!body.contains("tier_publication_lock"));
+	}
+}
+
+#[test]
+fn control_lsm_output_rename_has_one_guarded_staging_path() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let source = fs::read_to_string(root.join("src/storage/manager/lsm_driver.rs")).unwrap();
+	let wrapper = manager_method_body(&source, "stage_lsm_compaction_outputs");
+	let local = manager_method_body(&source, "install_lsm_compaction_temp_outputs");
+	let control = manager_method_body(
+		&source,
+		"install_lsm_compaction_temp_outputs_via_control_ring_with_context",
+	);
+	assert!(
+		wrapper.find("maintenance_publication_gate").unwrap()
+			< wrapper.find("lock_lsm_slabs").unwrap()
+	);
+	assert!(
+		wrapper.find("lock_lsm_slabs").unwrap()
+			< wrapper.find("lsm_input_authority_locked").unwrap()
+	);
+	assert!(
+		wrapper.find("lsm_input_authority_locked").unwrap()
+			< wrapper
+				.find(".stage_lsm_compaction_outputs_locked(")
+				.unwrap()
+	);
+	assert!(
+		local.find("lock_lsm_slabs").unwrap()
+			< local.find(".stage_lsm_compaction_outputs_locked(").unwrap()
+	);
+	assert!(
+		control.find(".stage_lsm_compaction_outputs(").unwrap()
+			< control.find("committer.commit_lsm_compaction(").unwrap()
+	);
+	assert_eq!(
+		source
+			.matches(".stage_lsm_compaction_outputs_locked(")
+			.count(),
+		2
+	);
+	assert_eq!(source.matches(".stage_lsm_compaction_outputs(").count(), 1);
+	assert_eq!(source.matches(".install_lsm_output_files(").count(), 1);
+	assert!(
+		manager_method_body(&source, "stage_lsm_compaction_outputs_locked")
+			.contains(".install_lsm_output_files(")
+	);
+}
+
+#[test]
+fn completed_control_lsm_recovery_has_one_accepted_private_issuer() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let driver = fs::read_to_string(root.join("src/storage/manager/lsm_driver.rs")).unwrap();
+	let index = fs::read_to_string(root.join("src/storage/index.rs")).unwrap();
+	let open = fs::read_to_string(root.join("src/storage/manager/open.rs")).unwrap();
+	let control = manager_method_body(
+		&driver,
+		"install_lsm_compaction_temp_outputs_via_control_ring_with_context",
+	);
+	assert!(
+		control.find("committer.commit_lsm_compaction(").unwrap()
+			< control.find("new_after_acceptance(").unwrap()
+	);
+	assert!(control.contains("prepared_sidecars.is_none()"));
+	assert_eq!(driver.matches("new_after_acceptance(").count(), 2);
+	let capability = driver
+		.split("pub(crate) struct AcceptedControlLsmCompletion {")
+		.nth(1)
+		.unwrap()
+		.split("struct UnresolvedControlIntentMetric")
+		.next()
+		.unwrap();
+	assert!(!capability.contains("Serialize"));
+	assert!(!capability.contains("Deserialize"));
+	assert!(!capability.contains("derive(Clone"));
+	let mut issuers = Vec::new();
+	walk_dir(&root.join("src"), &mut |path| {
+		if path.extension().is_some_and(|ext| ext == "rs")
+			&& path.file_name().is_none_or(|name| name != "tests.rs")
+		{
+			let source = fs::read_to_string(path).unwrap();
+			let count = rust_identifiers_from_source("control LSM completion census", &source)
+				.iter()
+				.filter(|name| *name == "apply_with_control_lsm_completion")
+				.count();
+			if count != 0 {
+				issuers.push((path.strip_prefix(root).unwrap().to_path_buf(), count));
+			}
+		}
+	});
+	issuers.sort();
+	assert_eq!(
+		issuers,
+		vec![
+			(PathBuf::from("src/storage/index.rs"), 1),
+			(PathBuf::from("src/storage/manager/lsm_driver.rs"), 1)
+		]
+	);
+	// Untyped updates retain the original Local-only validation. The opaque
+	// accepted capability is the only route to a Control phase transition.
+	assert!(index.contains("if before.kind != LsmInstallKind::Local"));
+	assert!(manager_method_body(&index, "apply_with_publication_guard").contains("None"));
+	assert!(
+		manager_method_body(&index, "apply_with_control_lsm_completion")
+			.contains("Some(completion)")
+	);
+	let recover = driver
+		.split("pub(super) async fn reconcile_completed_control_lsm_intent(")
+		.nth(1)
+		.unwrap()
+		.split("pub(super) fn lsm_compaction_tmp_path(")
+		.next()
+		.unwrap();
+	for guard in [
+		"LsmInstallKind::Control",
+		"LsmInstallPhase::OutputsPublished",
+		"commit_digest",
+		"local_output_rows_digest",
+		"local_output_files",
+		"SlabState::Retired",
+		"secondary_index_segments",
+		"SidecarCoverage::None",
+	] {
+		assert!(recover.contains(guard), "missing {guard}");
+	}
+	assert!(recover.contains("clear_lsm_install_intent(intent.clone())"));
+	for forbidden in [
+		".apply(",
+		".put_",
+		".unlink(",
+		".write_all(",
+		"reconcile_local_lsm_intent(",
+	] {
+		assert!(
+			!recover.contains(forbidden),
+			"recovery introduced {forbidden}"
+		);
+	}
+	assert_eq!(
+		open.matches("lsm_driver::reconcile_local_lsm_intent(")
+			.count(),
+		1
+	);
+	assert_eq!(
+		open.matches("lsm_driver::reconcile_completed_control_lsm_intent(")
+			.count(),
+		1
+	);
+}
+
+#[test]
+fn lsm_stage_refusal_is_definite_only_before_rename() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let source = fs::read_to_string(root.join("src/storage/manager/lsm_driver.rs")).unwrap();
+	let locked = manager_method_body(&source, "stage_lsm_compaction_outputs_locked");
+	assert_eq!(locked.matches("LsmStageFailure::BeforeRename").count(), 1);
+	assert!(
+		locked.find("LsmStageFailure::BeforeRename").unwrap()
+			< locked.find(".install_lsm_output_files(").unwrap()
+	);
+	let wrapper = manager_method_body(&source, "stage_lsm_compaction_outputs");
+	assert!(!wrapper.contains("Uncertain"));
+	assert!(
+		wrapper.rfind("LsmStageFailure::BeforeRename").unwrap()
+			< wrapper
+				.find(".stage_lsm_compaction_outputs_locked(")
+				.unwrap()
+	);
+	// Every implicit conversion is uncertain: only the explicit pre-rename
+	// checks may report a definite refusal.
+	for conversion in [
+		"impl From<CompactionFailure> for LsmStageFailure {\n\tfn from(failure: CompactionFailure) -> Self {\n\t\tSelf::Uncertain(failure)",
+		"impl From<std::io::Error> for LsmStageFailure {\n\tfn from(error: std::io::Error) -> Self {\n\t\tSelf::Uncertain(error.into())",
+	] {
+		assert!(source.contains(conversion), "{conversion}");
+	}
+	assert_eq!(
+		source.matches("for LsmStageFailure {").count(),
+		2,
+		"no other conversion into a stage failure"
+	);
+	assert_eq!(source.matches(".clear_refused_lsm_intent(").count(), 2);
+	for caller in [
+		"install_lsm_compaction_temp_outputs",
+		"install_lsm_compaction_temp_outputs_via_control_ring_with_context",
+	] {
+		let body = manager_method_body(&source, caller);
+		let clear = body.find(".clear_refused_lsm_intent(").unwrap();
+		assert!(body[..clear].contains("LsmStageFailure::BeforeRename("));
+		assert!(body.contains("LsmStageFailure::Uncertain(failure)) => return Err(failure)"));
 	}
 }

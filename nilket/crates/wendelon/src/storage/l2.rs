@@ -71,6 +71,15 @@ pub trait ObjectStore: Send + Sync {
 	/// hash is the durability oracle.
 	async fn put(&self, key: &str, bytes: &[u8]) -> std::io::Result<String>;
 
+	/// Resolve the final object URI before upload so callers can persist
+	/// an intent before an upload may become externally visible.
+	fn planned_upload_uri(&self, _key: &str) -> std::io::Result<String> {
+		Err(Error::new(
+			ErrorKind::Unsupported,
+			"object store cannot determine upload URI",
+		))
+	}
+
 	/// Fetch metadata for the object previously uploaded to `uri`.
 	/// The returned `key` is always relative to the configured L2
 	/// root / prefix so callers can safely compare it against local
@@ -324,8 +333,41 @@ fn normalize_prefix(prefix: &str) -> String {
 	prefix.trim_matches('/').to_string()
 }
 
-fn opendal_error(context: &str, err: opendal::Error) -> Error {
+#[derive(Debug)]
+struct RemoteOperationError {
+	context: &'static str,
+	cause: opendal::Error,
+}
+impl std::fmt::Display for RemoteOperationError {
+	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(formatter, "{}: {}", self.context, self.cause)
+	}
+}
+impl std::error::Error for RemoteOperationError {
+	fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+		Some(&self.cause)
+	}
+}
+
+/// Bounded provider categories survive RetryLayer's final Persistent status.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RemoteAvailabilityFailure {
+	Unexpected,
+	RateLimited,
+}
+
+pub(crate) fn remote_availability_failure(error: &Error) -> Option<RemoteAvailabilityFailure> {
+	let remote = error.get_ref()?.downcast_ref::<RemoteOperationError>()?;
+	match remote.cause.kind() {
+		OpendalErrorKind::Unexpected => Some(RemoteAvailabilityFailure::Unexpected),
+		OpendalErrorKind::RateLimited => Some(RemoteAvailabilityFailure::RateLimited),
+		_ => None,
+	}
+}
+
+fn opendal_error(context: &'static str, err: opendal::Error) -> Error {
 	let kind = match err.kind() {
+		OpendalErrorKind::Unexpected | OpendalErrorKind::RateLimited => ErrorKind::WouldBlock,
 		OpendalErrorKind::NotFound => ErrorKind::NotFound,
 		OpendalErrorKind::PermissionDenied => ErrorKind::PermissionDenied,
 		OpendalErrorKind::AlreadyExists => ErrorKind::AlreadyExists,
@@ -335,7 +377,13 @@ fn opendal_error(context: &str, err: opendal::Error) -> Error {
 		| OpendalErrorKind::Unsupported => ErrorKind::InvalidInput,
 		_ => ErrorKind::Other,
 	};
-	Error::new(kind, format!("{context}: {err}"))
+	Error::new(
+		kind,
+		RemoteOperationError {
+			context,
+			cause: err,
+		},
+	)
 }
 
 // ============================================================
@@ -517,6 +565,11 @@ impl RemoteObjectStore {
 
 #[async_trait]
 impl ObjectStore for RemoteObjectStore {
+	fn planned_upload_uri(&self, key: &str) -> std::io::Result<String> {
+		validate_object_key(key)?;
+		Ok(self.uri_for_key(key))
+	}
+
 	async fn put(&self, key: &str, bytes: &[u8]) -> std::io::Result<String> {
 		validate_object_key(key)?;
 		self.operator
@@ -700,6 +753,28 @@ impl LocalFsObjectStore {
 
 #[async_trait]
 impl ObjectStore for LocalFsObjectStore {
+	fn planned_upload_uri(&self, key: &str) -> std::io::Result<String> {
+		validate_object_key(key)?;
+		let mut path = self.root.canonicalize()?;
+		for component in Path::new(key).components() {
+			if let Component::Normal(name) = component {
+				path.push(name);
+				match std::fs::symlink_metadata(&path) {
+					Ok(meta) if meta.file_type().is_symlink() => {
+						return Err(Error::new(
+							ErrorKind::InvalidInput,
+							"planned upload path contains a symlink",
+						));
+					}
+					Ok(_) => {}
+					Err(error) if error.kind() == ErrorKind::NotFound => {}
+					Err(error) => return Err(error),
+				}
+			}
+		}
+		Ok(format!("file://{}", path.display()))
+	}
+
 	async fn put(&self, key: &str, bytes: &[u8]) -> std::io::Result<String> {
 		validate_object_key(key)?;
 		let final_path = self.root.join(key);
@@ -993,6 +1068,11 @@ impl Default for MockObjectStore {
 
 #[async_trait]
 impl ObjectStore for MockObjectStore {
+	fn planned_upload_uri(&self, key: &str) -> std::io::Result<String> {
+		validate_object_key(key)?;
+		Ok(self.uri_for_key(key))
+	}
+
 	async fn put(&self, key: &str, bytes: &[u8]) -> std::io::Result<String> {
 		validate_object_key(key)?;
 		self.apply_latency(MockObjectStoreOp::Put).await;
@@ -1150,6 +1230,19 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn planned_upload_uri_matches_the_uploaded_object() {
+		let root = fresh_root();
+		let local = LocalFsObjectStore::new(root.to_path_buf()).unwrap();
+		let mock = MockObjectStore::default();
+		for store in [&local as &dyn ObjectStore, &mock as &dyn ObjectStore] {
+			let key = "planned/nested/object.wnd";
+			let planned = store.planned_upload_uri(key).unwrap();
+			assert_eq!(store.put(key, b"object").await.unwrap(), planned);
+			assert_eq!(store.head(&planned).await.unwrap().size_bytes, 6);
+		}
+	}
+
+	#[tokio::test]
 	async fn head_reports_key_uri_and_size() {
 		let root = fresh_root();
 		let store = LocalFsObjectStore::new(root.to_path_buf()).unwrap();
@@ -1294,5 +1387,96 @@ mod tests {
 		assert_eq!(store.get_range(&uri, 2..6).await.unwrap().as_ref(), b"cdef");
 		let err = store.get_range(&uri, 2..16).await.unwrap_err();
 		assert_eq!(err.kind(), ErrorKind::InvalidInput);
+	}
+}
+
+#[cfg(test)]
+mod remote_operation_error_controls {
+	use super::*;
+
+	#[test]
+	fn remote_availability_failures_keep_a_typed_cause_and_retryable_kind() {
+		for kind in [OpendalErrorKind::Unexpected, OpendalErrorKind::RateLimited] {
+			let error = opendal_error(
+				"remote read",
+				opendal::Error::new(kind, "same opaque message").set_persistent(),
+			);
+			assert_eq!(
+				error.kind(),
+				ErrorKind::WouldBlock,
+				"backend availability remains retryable after its retry layer stops"
+			);
+			assert!(
+				error.get_ref().unwrap().source().is_some(),
+				"the original provider error is retained as a typed cause"
+			);
+		}
+	}
+
+	#[test]
+	fn remote_authorization_and_configuration_errors_keep_their_nonretryable_kind() {
+		for (kind, expected) in [
+			(
+				OpendalErrorKind::PermissionDenied,
+				ErrorKind::PermissionDenied,
+			),
+			(OpendalErrorKind::ConfigInvalid, ErrorKind::InvalidInput),
+			(OpendalErrorKind::Unsupported, ErrorKind::InvalidInput),
+		] {
+			let error = opendal_error(
+				"remote read",
+				opendal::Error::new(kind, "same opaque message").set_persistent(),
+			);
+			assert_eq!(error.kind(), expected);
+			assert!(
+				error.get_ref().unwrap().source().is_some(),
+				"classification never requires the error message"
+			);
+		}
+	}
+}
+
+#[cfg(test)]
+mod authority_error_policy_controls {
+	use super::*;
+	use crate::storage::manager::tier_authority::transient_tier_error;
+
+	#[test]
+	fn authority_retry_policy_uses_typed_remote_causes_and_keeps_opaque_failures_sticky() {
+		for (provider, expected) in [
+			(
+				OpendalErrorKind::Unexpected,
+				RemoteAvailabilityFailure::Unexpected,
+			),
+			(
+				OpendalErrorKind::RateLimited,
+				RemoteAvailabilityFailure::RateLimited,
+			),
+		] {
+			let error = opendal_error(
+				"remote read",
+				opendal::Error::new(provider, "opaque").set_persistent(),
+			);
+			assert_eq!(remote_availability_failure(&error), Some(expected));
+			assert!(transient_tier_error(error.kind()));
+		}
+		for kind in [
+			OpendalErrorKind::PermissionDenied,
+			OpendalErrorKind::ConfigInvalid,
+			OpendalErrorKind::Unsupported,
+		] {
+			let error = opendal_error(
+				"remote read",
+				opendal::Error::new(kind, "timeout Unexpected retry"),
+			);
+			assert_eq!(remote_availability_failure(&error), None);
+			assert!(!transient_tier_error(error.kind()));
+		}
+		for kind in [ErrorKind::Other, ErrorKind::InvalidData] {
+			let error = Error::new(kind, "remote Unexpected timeout retry");
+			assert_eq!(remote_availability_failure(&error), None);
+			assert!(!transient_tier_error(error.kind()));
+		}
+		assert!(transient_tier_error(ErrorKind::NotFound));
 	}
 }

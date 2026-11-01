@@ -55,6 +55,11 @@ pub struct WendelonRaftInternalServer {
 	/// so the drift monitor and eviction watchdog pick up
 	/// Raft-layer signal in addition to the data-ring.
 	tracker: Option<Arc<NodeTracker>>,
+	replacement_replay: Option<(
+		Arc<crate::storage::manager::SlabManager>,
+		crate::consensus::raft_storage::WendelonStateMachine,
+		crate::consensus::raft_storage::WendelonLogStore,
+	)>,
 	/// The node's Control retention guard. Under full retention an inbound
 	/// snapshot is refused here, before decode and before openraft sees it.
 	retention: Arc<RetentionGuard>,
@@ -66,6 +71,7 @@ impl WendelonRaftInternalServer {
 			raft,
 			pool,
 			tracker: None,
+			replacement_replay: None,
 			retention,
 		}
 	}
@@ -73,6 +79,74 @@ impl WendelonRaftInternalServer {
 	/// Builder-style tracker attachment. See [`Self::tracker`] on
 	/// the equivalent method in `WendelonDataServer` — same story:
 	/// production bootstrap wires it, tests skip it.
+	pub(crate) fn with_replacement_replay(
+		mut self,
+		slab: Arc<crate::storage::manager::SlabManager>,
+		state: crate::consensus::raft_storage::WendelonStateMachine,
+		log: crate::consensus::raft_storage::WendelonLogStore,
+	) -> Self {
+		self.replacement_replay = Some((slab, state, log));
+		self
+	}
+
+	async fn confirm_replacement_replay(&self, confirmed: Option<u64>, leader: u32) {
+		let Some((slab, state, log)) = &self.replacement_replay else {
+			return;
+		};
+		let Some(confirmed) = confirmed else {
+			return;
+		};
+		if !slab.is_awaiting_cluster() || self.raft.current_leader().await != Some(leader) {
+			return;
+		}
+		if !log.replacement_replay_base_verified().await {
+			return;
+		}
+		let state = state.state_snapshot().await;
+		let local = self.raft.metrics().borrow().id;
+		// This accepted leader confirmation must follow the replacement's join.
+		if !state.last_membership.nodes().any(|(id, _)| *id == local) {
+			return;
+		}
+		let Some(applied) = state.last_applied_log_id.map(|id| id.index) else {
+			return;
+		};
+		if applied < confirmed {
+			return;
+		}
+		if state
+			.last_membership
+			.log_id()
+			.as_ref()
+			.is_none_or(|joined| confirmed < joined.index)
+		{
+			return;
+		}
+		let pointers = state
+			.tiered_slabs
+			.values()
+			.map(|tier| crate::storage::TieredSlabPointer {
+				slab_id: tier.slab_id,
+				l2_uri: tier.l2_uri.clone(),
+				payload_hash: tier.payload_hash,
+				is_encrypted: tier.is_encrypted,
+				tenant_id: tier.tenant_id,
+				tenant_kek_id: tier.tenant_kek_id,
+				stats_format_version: tier.stats_format_version,
+				stats_block_len: tier.stats_block_len,
+				stats_block_hash128: tier.stats_block_hash128,
+				tombstone_metadata: tier.tombstone_metadata,
+				supersession_metadata: tier.supersession_metadata,
+			})
+			.collect();
+		if let Err(error) = slab
+			.finish_replacement_log_replay(pointers, applied, confirmed)
+			.await
+		{
+			tracing::warn!(%error, applied, confirmed, "replacement replay comparison remains fenced");
+		}
+	}
+
 	pub fn with_tracker(mut self, tracker: Arc<NodeTracker>) -> Self {
 		self.tracker = Some(tracker);
 		self
@@ -115,8 +189,13 @@ impl RaftInternalServer for WendelonRaftInternalServer {
 						}
 					}
 				}
+				let confirmed = req.leader_commit.map(|id| id.index);
+				let leader = req.vote.leader_id.node_id;
 				let envelope: Result<AppendEntriesResponse<u32>, RaftError<u32>> =
 					self.raft.append_entries(req).await;
+				if matches!(&envelope, Ok(AppendEntriesResponse::Success)) {
+					self.confirm_replacement_replay(confirmed, leader).await;
+				}
 				(
 					MsgType::APPEND_ENTRIES_RESP,
 					wire::encode_into(&self.pool, &envelope)?,

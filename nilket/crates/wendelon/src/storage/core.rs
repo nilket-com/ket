@@ -55,10 +55,10 @@
 use crate::metrics::global as metrics;
 use crate::schema::table::PlacementSemantics;
 use crate::schema::{
-	CounterCommitFrame, CounterTentativeFrame, HybridTimestamp, Identity, Locality, PartitionId,
-	RecordRowIndex, STORAGE_ROW_HLC_COLUMN, STORAGE_ROW_KEY_ID_COLUMN,
-	STORAGE_ROW_ROUTING_LOCALITY_COLUMN, STORAGE_ROW_TABLE_OBJECT_ID_COLUMN,
-	STORAGE_ROW_TOMBSTONE_COLUMN, SlabId, SlabRecordHeader, TenantId,
+	HybridTimestamp, Identity, Locality, PartitionId, RecordRowIndex, STORAGE_ROW_HLC_COLUMN,
+	STORAGE_ROW_KEY_ID_COLUMN, STORAGE_ROW_ROUTING_LOCALITY_COLUMN,
+	STORAGE_ROW_TABLE_OBJECT_ID_COLUMN, STORAGE_ROW_TOMBSTONE_COLUMN, SlabId, SlabRecordHeader,
+	TenantId,
 };
 use crate::storage::io_uring::{AlignedBuf, DIRECT_IO_ALIGN};
 use crate::storage::{AsyncFileOps, FileHandle, OpenFlags};
@@ -144,6 +144,8 @@ pub(crate) struct RecoveredSlabEntry {
 	pub key_identity: Identity,
 	pub routing_locality: Locality,
 	pub routing_locality_trusted: bool,
+	/// Recovery successfully decoded this frame as Arrow.
+	pub is_arrow_frame: bool,
 	pub location: RecordLocation,
 }
 
@@ -210,7 +212,9 @@ struct GroupCommitState {
 #[async_trait]
 pub trait StorageEngine: Send + Sync {
 	/// Appends a raw HRFT frame to the current active slab.
-	/// Returns the location of the record upon successful disk ack.
+	/// Returns the location after the write completes. This does not force a
+	/// durability barrier or guarantee survival of a power loss; use the
+	/// manager’s durable append API when the caller needs that guarantee.
 	async fn append(
 		&self,
 		tenant_id: TenantId,
@@ -225,7 +229,11 @@ pub trait StorageEngine: Send + Sync {
 	/// Looks up a key's location in the in-memory index.
 	/// Returns the latest version, equivalent to
 	/// [`Self::lookup_as_of`] with the sentinel zero HLC.
-	fn lookup(&self, tenant_id: TenantId, key_identity: Identity) -> Option<RecordLocation>;
+	fn lookup(
+		&self,
+		tenant_id: TenantId,
+		key_identity: Identity,
+	) -> std::io::Result<Option<RecordLocation>>;
 
 	/// Time-travel lookup (ADR 013). Returns the newest version
 	/// whose `hlc <= as_of_hlc`. A zero-valued `as_of_hlc` is the
@@ -236,7 +244,7 @@ pub trait StorageEngine: Send + Sync {
 		tenant_id: TenantId,
 		key_identity: Identity,
 		as_of_hlc: HybridTimestamp,
-	) -> Option<RecordLocation>;
+	) -> std::io::Result<Option<RecordLocation>>;
 }
 
 /// A page-aligned byte range one slab has set aside for one framed record.
@@ -250,13 +258,27 @@ pub trait StorageEngine: Send + Sync {
 /// taken on another slab.
 #[derive(Debug)]
 pub struct AppendReservation {
+	quiescence: Option<Arc<AppendInFlight>>,
 	slab_id: SlabId,
 	offset: u64,
 	payload_size: usize,
 	padded_size: usize,
 }
 
+#[derive(Debug)]
+pub(crate) struct AppendInFlight(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for AppendInFlight {
+	fn drop(&mut self) {
+		let previous = self.0.fetch_sub(1, Ordering::AcqRel);
+		debug_assert!(previous > 0);
+	}
+}
+
 impl AppendReservation {
+	pub(crate) fn quiescence_guard(&self) -> Option<Arc<AppendInFlight>> {
+		self.quiescence.clone()
+	}
 	pub(crate) fn offset(&self) -> u64 {
 		self.offset
 	}
@@ -310,7 +332,14 @@ pub struct LocalSlabStore {
 	/// disjoint byte ranges with `fetch_add`, so concurrent appends
 	/// never collide.
 	next_offset: AtomicU64,
+	manager_appends_in_flight: Arc<std::sync::atomic::AtomicUsize>,
 
+	#[cfg(test)]
+	append_write_hold:
+		std::sync::Mutex<Option<(Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>>,
+	#[cfg(test)]
+	append_cleanup_hold:
+		std::sync::Mutex<Option<(Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>>,
 	#[cfg(test)]
 	fdatasync_calls: AtomicU64,
 }
@@ -342,6 +371,54 @@ pub(crate) struct ScannedCounterFrame {
 	pub location: RecordLocation,
 	pub record_class: u32,
 	pub payload: Vec<u8>,
+}
+
+/// A retired record format found during open. The diagnostic carries no row key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct UnsupportedRecordClass {
+	pub slab_id: SlabId,
+	pub record_class: u32,
+}
+
+impl std::fmt::Display for UnsupportedRecordClass {
+	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(
+			formatter,
+			"unsupported record class {} in slab {}",
+			self.record_class, self.slab_id
+		)
+	}
+}
+impl std::error::Error for UnsupportedRecordClass {}
+impl UnsupportedRecordClass {
+	pub(crate) fn into_io(self) -> Error {
+		Error::new(ErrorKind::Unsupported, self)
+	}
+}
+
+/// Recovery would have zeroed an offset the node acknowledged durable: the
+/// record there is damaged or torn, and its bytes are evidence. The
+/// diagnostic carries no row key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DamagedAcknowledgedRecord {
+	pub slab_id: SlabId,
+	pub offset: u64,
+}
+
+impl std::fmt::Display for DamagedAcknowledgedRecord {
+	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(
+			formatter,
+			"acknowledged record at offset {} in slab {} fails validation; recovery refused",
+			self.offset, self.slab_id
+		)
+	}
+}
+impl std::error::Error for DamagedAcknowledgedRecord {}
+impl DamagedAcknowledgedRecord {
+	pub(crate) fn into_io(self) -> Error {
+		Error::new(ErrorKind::InvalidData, self)
+	}
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -386,9 +463,10 @@ impl LocalSlabStore {
 		group_commit: GroupCommitConfig,
 		acknowledged: Option<&BTreeSet<u64>>,
 	) -> std::io::Result<Self> {
+		let path = path.as_ref();
 		let file = file_ops
 			.open(
-				path.as_ref(),
+				path,
 				OpenFlags {
 					read: true,
 					write: true,
@@ -398,6 +476,12 @@ impl LocalSlabStore {
 				},
 			)
 			.await?;
+		// Every open makes the slab's name durable before the store is returned:
+		// bytes synced into a file whose directory entry a crash then loses are
+		// lost with it, though the record was acknowledged. That the file
+		// already exists proves nothing, since an earlier open may have created
+		// it and then failed this sync.
+		crate::storage::fsync_parent_dir(file_ops.as_ref(), path).await?;
 
 		// Scan any existing records so a restart resumes writing
 		// past the last complete record and serves reads immediately.
@@ -435,6 +519,11 @@ impl LocalSlabStore {
 				state: Mutex::new(GroupCommitState::default()),
 			},
 			next_offset: AtomicU64::new(write_cursor),
+			manager_appends_in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+			#[cfg(test)]
+			append_write_hold: std::sync::Mutex::new(None),
+			#[cfg(test)]
+			append_cleanup_hold: std::sync::Mutex::new(None),
 			#[cfg(test)]
 			fdatasync_calls: AtomicU64::new(0),
 		})
@@ -474,7 +563,6 @@ impl LocalSlabStore {
 		}
 		verify_record_checksum(header, &bytes[size..end])?;
 		match header.record_class {
-			crate::schema::record_class::COUNTER_TENTATIVE => Ok(bytes[size..end].len() >= 8),
 			crate::schema::record_class::COUNTER_TENTATIVE_V2 => {
 				super::counter::decode_origin_frame(&bytes[size..end])?;
 				Ok(true)
@@ -731,6 +819,54 @@ impl LocalSlabStore {
 		}
 	}
 
+	/// Identity of the file descriptor actually owned by this slab.
+	pub(crate) fn opened_file_identity(&self) -> std::io::Result<(u64, u64)> {
+		use std::os::unix::fs::MetadataExt;
+		let metadata = self.file.try_clone()?.metadata()?;
+		Ok((metadata.dev(), metadata.ino()))
+	}
+
+	/// Read a bounded, complete sealed slab through its already-owned file
+	/// descriptor for conservative intent-key disjointness proof.
+	pub(crate) async fn read_scope_blob(&self, max_bytes: usize) -> std::io::Result<Vec<u8>> {
+		let len = usize::try_from(self.write_cursor()).map_err(Error::other)?;
+		if len > max_bytes
+			|| len % DIRECT_IO_ALIGN != 0
+			|| !self.manager_appends_quiescent()
+			|| self.file_ops.opened_file_len(&self.file).await? != len as u64
+		{
+			return Err(Error::new(
+				ErrorKind::WouldBlock,
+				"slab is too large or not quiescent for scope proof",
+			));
+		}
+		let mut bytes = Vec::with_capacity(len);
+		while bytes.len() < len {
+			let wanted = (len - bytes.len()).min(1024 * 1024);
+			let buffer = AlignedBuf::new(wanted);
+			let (read, buffer) = self
+				.file_ops
+				.read_at(&self.file, bytes.len() as u64, buffer)
+				.await?;
+			if read != wanted {
+				return Err(Error::new(
+					ErrorKind::UnexpectedEof,
+					"short slab scope read",
+				));
+			}
+			bytes.extend_from_slice(&buffer.as_slice()[..read]);
+		}
+		if usize::try_from(self.write_cursor()).ok() != Some(len)
+			|| self.file_ops.opened_file_len(&self.file).await? != len as u64
+		{
+			return Err(Error::new(
+				ErrorKind::WouldBlock,
+				"slab changed during scope proof",
+			));
+		}
+		Ok(bytes)
+	}
+
 	/// Remove one exact record location from the slab-local index.
 	///
 	/// This is a best-effort in-memory rollback used when an append
@@ -763,6 +899,28 @@ impl LocalSlabStore {
 			.entry((tenant_id, key_identity))
 			.and_modify(|versions| insert_version_sorted(versions, location))
 			.or_insert_with(|| vec![location]);
+	}
+
+	/// Add a verified location only if this exact physical record is absent.
+	pub(crate) fn ensure_index_location(
+		&self,
+		tenant_id: TenantId,
+		key_identity: Identity,
+		location: RecordLocation,
+	) -> std::io::Result<()> {
+		let mut versions = self.index.entry((tenant_id, key_identity)).or_default();
+		if let Some(existing) = versions.iter().find(|existing| **existing == location) {
+			if existing.placement != location.placement || existing.partition != location.partition
+			{
+				return Err(Error::new(
+					ErrorKind::InvalidData,
+					"local location placement mismatch",
+				));
+			}
+		} else {
+			insert_version_sorted(&mut versions, location);
+		}
+		Ok(())
 	}
 
 	/// Write a framed record of `record_class` at a freshly reserved,
@@ -823,11 +981,44 @@ impl LocalSlabStore {
 			.next_offset
 			.fetch_add(padded_size as u64, Ordering::AcqRel);
 		Ok(AppendReservation {
+			quiescence: None,
 			slab_id: self.slab_id,
 			offset,
 			payload_size,
 			padded_size,
 		})
+	}
+
+	/// Track a manager reservation before the manager lock is released.
+	pub(crate) fn track_manager_reservation(
+		&self,
+		reservation: &mut AppendReservation,
+	) -> std::io::Result<()> {
+		self.manager_appends_in_flight
+			.fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+				count.checked_add(1)
+			})
+			.map_err(|_| Error::other("too many in-flight slab appends"))?;
+		reservation.quiescence = Some(Arc::new(AppendInFlight(
+			self.manager_appends_in_flight.clone(),
+		)));
+		Ok(())
+	}
+
+	/// Retain a recovered unresolved tentative until its owner resolves it.
+	pub(crate) fn track_recovered_counter(&self) -> std::io::Result<Arc<AppendInFlight>> {
+		self.manager_appends_in_flight
+			.fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+				count.checked_add(1)
+			})
+			.map_err(|_| Error::other("too many recovered counter tentatives"))?;
+		Ok(Arc::new(AppendInFlight(
+			self.manager_appends_in_flight.clone(),
+		)))
+	}
+
+	pub(crate) fn manager_appends_quiescent(&self) -> bool {
+		self.manager_appends_in_flight.load(Ordering::Acquire) == 0
 	}
 
 	/// Write a STANDARD frame into `reservation` and index it, the reserved
@@ -873,6 +1064,7 @@ impl LocalSlabStore {
 		}
 		let header_size = std::mem::size_of::<SlabRecordHeader>();
 		let AppendReservation {
+			quiescence,
 			slab_id,
 			offset,
 			payload_size,
@@ -922,7 +1114,17 @@ impl LocalSlabStore {
 		let file_ops = self.file_ops.clone();
 		let file = self.file.clone();
 		let slab_id = self.slab_id;
+		#[cfg(test)]
+		let append_write_hold = self.append_write_hold.lock().unwrap().take();
+		#[cfg(test)]
+		let append_cleanup_hold = self.append_cleanup_hold.lock().unwrap().take();
 		let write = tokio::spawn(async move {
+			let _quiescence = quiescence;
+			#[cfg(test)]
+			if let Some((entered, release)) = append_write_hold {
+				entered.add_permits(1);
+				let _ = release.acquire().await;
+			}
 			let outcome = match file_ops.write_at(&file, offset, buf).await {
 				Ok((written, _buf)) if written >= payload_size => return Ok(()),
 				Ok((written, _buf)) => Err(Error::new(
@@ -931,6 +1133,11 @@ impl LocalSlabStore {
 				)),
 				Err(err) => Err(err),
 			};
+			#[cfg(test)]
+			if let Some((entered, release)) = append_cleanup_hold {
+				entered.add_permits(1);
+				let _ = release.acquire().await;
+			}
 			let zeros = AlignedBuf::new(padded_size);
 			match file_ops.write_at(&file, offset, zeros).await {
 				Ok((written, _)) if written >= padded_size => {}
@@ -965,6 +1172,26 @@ impl LocalSlabStore {
 			placement: PlacementSemantics::RawLocality,
 			partition: None,
 		})
+	}
+
+	#[cfg(test)]
+	pub(crate) fn hold_next_append_write_for_test(
+		&self,
+	) -> (Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>) {
+		let entered = Arc::new(tokio::sync::Semaphore::new(0));
+		let release = Arc::new(tokio::sync::Semaphore::new(0));
+		*self.append_write_hold.lock().unwrap() = Some((entered.clone(), release.clone()));
+		(entered, release)
+	}
+
+	#[cfg(all(test, feature = "test-support"))]
+	pub(crate) fn hold_next_append_cleanup_for_test(
+		&self,
+	) -> (Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>) {
+		let entered = Arc::new(tokio::sync::Semaphore::new(0));
+		let release = Arc::new(tokio::sync::Semaphore::new(0));
+		*self.append_cleanup_hold.lock().unwrap() = Some((entered.clone(), release.clone()));
+		(entered, release)
 	}
 
 	#[cfg(test)]
@@ -1015,6 +1242,41 @@ impl StorageEngine for LocalSlabStore {
 	}
 
 	async fn read(&self, location: RecordLocation) -> std::io::Result<Vec<u8>> {
+		self.read_with_header(location)
+			.await
+			.map(|(_, frame)| frame)
+	}
+
+	fn lookup(
+		&self,
+		tenant_id: TenantId,
+		key_identity: Identity,
+	) -> std::io::Result<Option<RecordLocation>> {
+		Ok(self
+			.index
+			.get(&(tenant_id, key_identity))
+			.and_then(|v| v.last().copied()))
+	}
+
+	fn lookup_as_of(
+		&self,
+		tenant_id: TenantId,
+		key_identity: Identity,
+		as_of_hlc: HybridTimestamp,
+	) -> std::io::Result<Option<RecordLocation>> {
+		Ok(self
+			.index
+			.get(&(tenant_id, key_identity))
+			.and_then(|versions| newest_version_as_of(versions.value(), as_of_hlc)))
+	}
+}
+
+impl LocalSlabStore {
+	/// The record header and frame at `location`, checksum verified.
+	pub(crate) async fn read_with_header(
+		&self,
+		location: RecordLocation,
+	) -> std::io::Result<(SlabRecordHeader, Vec<u8>)> {
 		if location.slab_id != self.slab_id {
 			return Err(Error::new(
 				ErrorKind::NotFound,
@@ -1025,59 +1287,50 @@ impl StorageEngine for LocalSlabStore {
 			));
 		}
 
-		let padded_size = page_round_up(location.length as usize);
-		let buf = AlignedBuf::new(padded_size);
-		let (bytes_read, completion_buf) = self
-			.file_ops
-			.read_at(&self.file, location.offset, buf)
-			.await?;
-
-		let header_size = std::mem::size_of::<SlabRecordHeader>();
-		if bytes_read < header_size {
-			return Err(Error::new(
-				ErrorKind::UnexpectedEof,
-				"slab read returned fewer bytes than the record header",
-			));
-		}
-		let bytes = &completion_buf.as_slice()[..bytes_read];
-		let header: &SlabRecordHeader = bytemuck::from_bytes(&bytes[..header_size]);
-
-		if header.magic != SLAB_RECORD_MAGIC {
-			return Err(Error::new(
-				ErrorKind::InvalidData,
-				"slab record magic mismatch",
-			));
-		}
-		let frame_len = header.frame_len as usize;
-		let end = header_size
-			.checked_add(frame_len)
-			.ok_or_else(|| Error::new(ErrorKind::InvalidData, "frame_len overflows usize"))?;
-		if end > bytes.len() {
-			return Err(Error::new(
-				ErrorKind::InvalidData,
-				"slab record frame_len exceeds bytes read",
-			));
-		}
-		verify_record_checksum(header, &bytes[header_size..end])?;
-
-		Ok(bytes[header_size..end].to_vec())
+		read_verified_slab_frame(self.file_ops.as_ref(), &self.file, location).await
 	}
+}
 
-	fn lookup(&self, tenant_id: TenantId, key_identity: Identity) -> Option<RecordLocation> {
-		self.index
-			.get(&(tenant_id, key_identity))
-			.and_then(|v| v.last().copied())
-	}
+/// Read a record from an already-open file without creating or modifying it.
+/// The frame checksum and physical bounds are checked exactly as for slab reads.
+pub(crate) async fn read_verified_slab_frame(
+	file_ops: &dyn AsyncFileOps,
+	file: &FileHandle,
+	location: RecordLocation,
+) -> std::io::Result<(SlabRecordHeader, Vec<u8>)> {
+	let padded_size = page_round_up(location.length as usize);
+	let buf = AlignedBuf::new(padded_size);
+	let (bytes_read, completion_buf) = file_ops.read_at(file, location.offset, buf).await?;
 
-	fn lookup_as_of(
-		&self,
-		tenant_id: TenantId,
-		key_identity: Identity,
-		as_of_hlc: HybridTimestamp,
-	) -> Option<RecordLocation> {
-		let versions = self.index.get(&(tenant_id, key_identity))?;
-		newest_version_as_of(versions.value(), as_of_hlc)
+	let header_size = std::mem::size_of::<SlabRecordHeader>();
+	if bytes_read < header_size {
+		return Err(Error::new(
+			ErrorKind::UnexpectedEof,
+			"slab read returned fewer bytes than the record header",
+		));
 	}
+	let bytes = &completion_buf.as_slice()[..bytes_read];
+	let header: &SlabRecordHeader = bytemuck::from_bytes(&bytes[..header_size]);
+
+	if header.magic != SLAB_RECORD_MAGIC {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"slab record magic mismatch",
+		));
+	}
+	let frame_len = header.frame_len as usize;
+	let end = header_size
+		.checked_add(frame_len)
+		.ok_or_else(|| Error::new(ErrorKind::InvalidData, "frame_len overflows usize"))?;
+	if end > bytes.len() {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"slab record frame_len exceeds bytes read",
+		));
+	}
+	verify_record_checksum(header, &bytes[header_size..end])?;
+
+	Ok((*header, bytes[header_size..end].to_vec()))
 }
 
 /// Insert `loc` into a per-key version chain, keeping the vec
@@ -1209,21 +1462,10 @@ fn recover_slab(
 	// orphan tentative (rolled back, or crashed before its marker) is never
 	// resurrected. This is the in-process twin of the pure `recover_counter_index`
 	// rule the storage `counter` module proves.
-	let mut counter_tentatives: Vec<(
-		TenantId,
-		Identity,
-		RecordLocation,
-		u64,
-		Option<crate::schema::NodeId>,
-	)> = Vec::new();
 	let mut recovered_counter_versions = Vec::new();
 	let mut recovered_counter_tentatives_v2 = Vec::new();
 	let mut recovered_counter_markers_v2 = Vec::new();
 	let mut recovered_non_counter_keys = Vec::new();
-	let mut committed_counter_ops: HashMap<
-		(TenantId, Identity, u64),
-		Vec<(Option<crate::schema::NodeId>, HybridTimestamp)>,
-	> = HashMap::new();
 	let mut recovered_counter_errors = Vec::new();
 	let mut has_counter_records = false;
 	let header_size = std::mem::size_of::<SlabRecordHeader>();
@@ -1249,6 +1491,20 @@ fn recover_slab(
 		// the buffer for the same-page frame read below.
 		let header: SlabRecordHeader =
 			*bytemuck::from_bytes::<SlabRecordHeader>(&probe.as_slice()[..header_size]);
+		// Refuse obsolete formats before the scan can canonicalize any bytes.
+		// No value or marker from these classes is decoded or paired.
+		if header.magic == SLAB_RECORD_MAGIC
+			&& matches!(
+				header.record_class,
+				crate::schema::record_class::COUNTER_TENTATIVE
+					| crate::schema::record_class::COUNTER_COMMIT
+			) {
+			return Err(UnsupportedRecordClass {
+				slab_id,
+				record_class: header.record_class,
+			}
+			.into_io());
+		}
 
 		// Classify the page. Anything that is not a complete record
 		// with a good checksum is an anomaly, whether it is a zero
@@ -1330,43 +1586,6 @@ fn recover_slab(
 					);
 				}
 			}
-			crate::schema::record_class::COUNTER_TENTATIVE => {
-				// op-id is the record's own offset. The value lives in the
-				// frame and is read on demand; here we only need length
-				// validation and the location to (maybe) index below.
-				if frame_bytes.len() < std::mem::size_of::<CounterTentativeFrame>() {
-					return Err(Error::new(
-						ErrorKind::InvalidData,
-						"counter tentative frame shorter than its fixed value",
-					));
-				}
-				counter_tentatives.push((
-					header.tenant_id,
-					header.key_identity,
-					base_location,
-					u64::from_le_bytes(
-						frame_bytes[..8]
-							.try_into()
-							.expect("validated counter value length"),
-					),
-					None,
-				));
-			}
-			crate::schema::record_class::COUNTER_COMMIT => {
-				if frame_bytes.len() < std::mem::size_of::<CounterCommitFrame>() {
-					return Err(Error::new(
-						ErrorKind::InvalidData,
-						"counter commit marker shorter than its fixed op-id",
-					));
-				}
-				let op_id = u64::from_le_bytes(frame_bytes[..8].try_into().map_err(|_| {
-					Error::new(ErrorKind::InvalidData, "counter commit marker op-id slice")
-				})?);
-				committed_counter_ops
-					.entry((header.tenant_id, header.key_identity, op_id))
-					.or_default()
-					.push((None, header.hlc));
-			}
 			crate::schema::record_class::COUNTER_TENTATIVE_V2
 			| crate::schema::record_class::COUNTER_COMMIT_V2 => {
 				match super::counter::decode_origin_frame(&frame_bytes) {
@@ -1413,9 +1632,18 @@ fn recover_slab(
 	// region the walk stepped over, and whatever trails the last accepted
 	// record, was never acknowledged; zero it so that a later reader of
 	// these bytes can take "non-zero page" to mean "record".
-	if acknowledged.is_some() {
+	if let Some(acknowledged) = acknowledged {
 		if valid_end < file_size {
 			skipped.push((valid_end, file_size));
+		}
+		// Only never-acknowledged bytes may be zeroed. An acknowledged offset
+		// inside a stepped-over region is a record the node promised durable:
+		// refuse before any byte changes.
+		if let Some(offset) = skipped
+			.iter()
+			.find_map(|&(start, end)| acknowledged.range(start..end).next().copied())
+		{
+			return Err(DamagedAcknowledgedRecord { slab_id, offset }.into_io());
 		}
 		let mut zeroed = false;
 		for (start, end) in skipped {
@@ -1436,8 +1664,8 @@ fn recover_slab(
 		}
 	}
 
-	// Legacy classes 1/2 retain their original per-slab offset pairing. Pair
-	// V2 frames locally first: an exact same-slab identity/offset pair is
+	// Only current origin-bound frames are paired. Obsolete classes already
+	// refused before any recovery mutation. Pair V2 frames locally first: an exact same-slab identity/offset pair is
 	// authoritative within that slab. Only unmatched frames participate in
 	// the manager's cross-slab identity join.
 	type VersionIdentity = (TenantId, Identity, u64, u32, u32, u32);
@@ -1540,48 +1768,10 @@ fn recover_slab(
 	for tentatives in tentatives_by_identity.into_values() {
 		recovered_counter_tentatives_v2.extend(tentatives);
 	}
-	// A legacy marker/value cannot satisfy a V2 frame's origin-bound identity,
-	// even when its slab offset or HLC happens to coincide. Refuse such mixed
-	// same-slab pairings instead of accidentally consuming either frame.
+	// Refuse a current marker whose origin disagrees with the tentative
+	// at its same-slab offset.
 	let mut conflicting_v2_tentatives = vec![false; recovered_counter_tentatives_v2.len()];
 	let mut conflicting_v2_markers = vec![false; recovered_counter_markers_v2.len()];
-	for (index, tentative) in recovered_counter_tentatives_v2.iter().enumerate() {
-		if committed_counter_ops
-			.get(&(
-				tentative.tenant_id,
-				tentative.key_identity,
-				tentative.location.offset,
-			))
-			.is_some_and(|markers| {
-				markers
-					.iter()
-					.any(|(_, hlc)| *hlc == tentative.location.hlc)
-			}) {
-			conflicting_v2_tentatives[index] = true;
-			recovered_counter_errors.push((
-				tentative.tenant_id,
-				tentative.key_identity,
-				super::counter::CounterVisibilityError::Conflict,
-			));
-		}
-	}
-	for (index, marker) in recovered_counter_markers_v2.iter().enumerate() {
-		if counter_tentatives
-			.iter()
-			.any(|(tenant, key, location, _, _)| {
-				*tenant == marker.tenant_id
-					&& *key == marker.key_identity
-					&& location.offset == marker.tentative_offset
-					&& location.hlc == marker.location.hlc
-			}) {
-			conflicting_v2_markers[index] = true;
-			recovered_counter_errors.push((
-				marker.tenant_id,
-				marker.key_identity,
-				super::counter::CounterVisibilityError::Conflict,
-			));
-		}
-	}
 	for (tentative_index, tentative) in recovered_counter_tentatives_v2.iter().enumerate() {
 		for (marker_index, marker) in recovered_counter_markers_v2.iter().enumerate() {
 			if tentative.tenant_id == marker.tenant_id
@@ -1611,37 +1801,6 @@ fn recover_slab(
 		.enumerate()
 		.filter_map(|(index, marker)| (!conflicting_v2_markers[index]).then_some(marker))
 		.collect();
-	for (tenant_id, key_identity, location, value, origin) in counter_tentatives {
-		if let Some(markers) =
-			committed_counter_ops.get(&(tenant_id, key_identity, location.offset))
-		{
-			if markers
-				.iter()
-				.any(|(marker_origin, _)| *marker_origin != origin)
-			{
-				recovered_counter_errors.push((
-					tenant_id,
-					key_identity,
-					super::counter::CounterVisibilityError::Conflict,
-				));
-				continue;
-			}
-			recovered_counter_versions.push((
-				tenant_id,
-				key_identity,
-				super::counter::CounterVersion {
-					value,
-					hlc: location.hlc,
-					origin,
-				},
-			));
-			index
-				.entry((tenant_id, key_identity))
-				.and_modify(|versions| insert_version_sorted(versions, location))
-				.or_insert_with(|| vec![location]);
-			recovered_localities.insert((tenant_id, key_identity), Locality::from(key_identity));
-		}
-	}
 
 	validate_recovered_row_tombstone_chains(&recovered_versions)?;
 	Ok((
@@ -1673,7 +1832,9 @@ fn next_acknowledged_offset(acknowledged: &BTreeSet<u64>, cursor: u64, len: u64)
 /// slab: the offsets the manager's index holds for it, which for a tiered
 /// slab were loaded from the durable rows. On an anomaly - a zero page, a
 /// page with bytes but no magic, an overlong or torn record - the walk
-/// resumes at the next acknowledged offset and stops if there is none. An
+/// resumes at the next acknowledged offset and stops if there is none. Every
+/// acknowledged offset must start a record the walk accepts, or the walk
+/// refuses with `DamagedAcknowledgedRecord`. An
 /// empty set is the strict walk that ends at the first anomaly. The
 /// argument is mandatory so that no caller can walk bytes without stating
 /// what it knows; there is no zero-page skip, because a zero page proves
@@ -1707,6 +1868,7 @@ fn recover_slab_entries_from_blob_inner(
 	let header_size = std::mem::size_of::<SlabRecordHeader>();
 	let mut entries = Vec::new();
 	let mut recovered_versions = HashMap::new();
+	let mut accepted = BTreeSet::new();
 	let mut cursor: usize = 0;
 
 	while cursor + DIRECT_IO_ALIGN <= blob.len() {
@@ -1752,6 +1914,7 @@ fn recover_slab_entries_from_blob_inner(
 			placement: PlacementSemantics::RawLocality,
 			partition: None,
 		};
+		accepted.insert(cursor as u64);
 		// ADR 075: the blob-tier recovery path does not (yet) apply the
 		// counter tentative/commit rule — counters are not tiered in this cut.
 		// Fail closed rather than mis-index a counter frame as a blob (which
@@ -1777,6 +1940,13 @@ fn recover_slab_entries_from_blob_inner(
 		cursor += padded;
 	}
 
+	// Every acknowledged offset must start a record the walk accepted. One the
+	// walk stepped over (damaged in place), never reached (past a truncated
+	// end, or in a page too short to hold a record) or that is misaligned is a
+	// record the node promised durable: refuse rather than hand back the rest.
+	if let Some(&offset) = acknowledged.difference(&accepted).next() {
+		return Err(DamagedAcknowledgedRecord { slab_id, offset }.into_io());
+	}
 	validate_recovered_row_tombstone_chains(&recovered_versions)?;
 	Ok(entries)
 }
@@ -1818,12 +1988,14 @@ fn recover_entries_for_record(
 	base_location: RecordLocation,
 	frame: &[u8],
 ) -> std::io::Result<Vec<RecoveredSlabEntry>> {
-	let Some(entries) = storage_multirow_index_entries_from_frame(frame)? else {
+	let (is_arrow_frame, entries) = classify_recovered_frame(frame)?;
+	let Some(entries) = entries else {
 		return Ok(vec![RecoveredSlabEntry {
 			tenant_id: header.tenant_id,
 			key_identity: header.key_identity,
 			routing_locality: Locality::from(header.key_identity),
 			routing_locality_trusted: false,
+			is_arrow_frame,
 			location: base_location,
 		}]);
 	};
@@ -1834,6 +2006,7 @@ fn recover_entries_for_record(
 			key_identity: entry.key_identity,
 			routing_locality: entry.routing_locality,
 			routing_locality_trusted: true,
+			is_arrow_frame: true,
 			location: RecordLocation {
 				hlc: entry.row_hlc,
 				record_row_index: entry.record_row_index,
@@ -1854,12 +2027,18 @@ fn recover_entries_for_record(
 pub(crate) fn storage_multirow_index_entries_from_frame(
 	frame: &[u8],
 ) -> std::io::Result<Option<Vec<MultiRowIndexEntry>>> {
+	Ok(classify_recovered_frame(frame)?.1)
+}
+
+fn classify_recovered_frame(
+	frame: &[u8],
+) -> std::io::Result<(bool, Option<Vec<MultiRowIndexEntry>>)> {
 	if !has_plausible_arrow_stream_prefix(frame) {
-		return Ok(None);
+		return Ok((false, None));
 	}
 	let batch = match decode_recovery_batch(frame) {
 		Ok(batch) => batch,
-		Err(_) => return Ok(None),
+		Err(_) => return Ok((false, None)),
 	};
 	let has_hlc = batch.column_by_name(STORAGE_ROW_HLC_COLUMN).is_some();
 	let has_identity = batch.column_by_name(STORAGE_ROW_KEY_ID_COLUMN).is_some();
@@ -1871,7 +2050,7 @@ pub(crate) fn storage_multirow_index_entries_from_frame(
 		.is_some();
 	let has_tombstone = batch.column_by_name(STORAGE_ROW_TOMBSTONE_COLUMN).is_some();
 	if !(has_hlc || has_identity || has_locality || has_table_object_id || has_tombstone) {
-		return Ok(None);
+		return Ok((true, None));
 	}
 	if !(has_hlc && has_identity && has_locality && has_tombstone) {
 		return Err(Error::new(
@@ -1958,7 +2137,7 @@ pub(crate) fn storage_multirow_index_entries_from_frame(
 				.map(|array| PartitionId::new(array.value(row))),
 		});
 	}
-	Ok(Some(entries))
+	Ok((true, Some(entries)))
 }
 
 fn validate_recovered_row_tombstone_marker_shape(
@@ -2496,10 +2675,11 @@ mod tests {
 		assert!(
 			recovered
 				.lookup(TenantId::new(7), Identity::new([9; 32]))
+				.unwrap()
 				.is_none()
 		);
 
-		let loc0 = recovered.lookup(TenantId::new(7), row0).unwrap();
+		let loc0 = recovered.lookup(TenantId::new(7), row0).unwrap().unwrap();
 		assert_eq!(loc0.hlc, hlc(10, 0));
 		assert_eq!(loc0.record_row_index, RecordRowIndex::ZERO);
 		assert_eq!(
@@ -2510,7 +2690,7 @@ mod tests {
 			Some(Locality::new(70))
 		);
 
-		let loc1 = recovered.lookup(TenantId::new(7), row1).unwrap();
+		let loc1 = recovered.lookup(TenantId::new(7), row1).unwrap().unwrap();
 		assert_eq!(loc1.hlc, hlc(20, 3));
 		assert_eq!(loc1.record_row_index, RecordRowIndex::new(1));
 		assert_eq!(
@@ -2576,24 +2756,28 @@ mod tests {
 		assert!(
 			!recovered
 				.lookup_as_of(TenantId::new(7), row, hlc(10, 0))
+				.unwrap()
 				.expect("initial data")
 				.is_tombstone
 		);
 		assert!(
 			recovered
 				.lookup_as_of(TenantId::new(7), row, hlc(20, 0))
+				.unwrap()
 				.expect("first tombstone")
 				.is_tombstone
 		);
 		assert!(
 			!recovered
 				.lookup_as_of(TenantId::new(7), row, hlc(30, 0))
+				.unwrap()
 				.expect("resurrection data")
 				.is_tombstone
 		);
 		assert!(
 			recovered
 				.lookup(TenantId::new(7), row)
+				.unwrap()
 				.expect("second tombstone")
 				.is_tombstone
 		);

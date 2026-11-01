@@ -20,7 +20,7 @@ use aws_lc_rs::key_wrap::{AES_256, AesKek, KeyWrapPadded};
 use reqwest::Url;
 use scrypt::{Params as ScryptParams, scrypt};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::OpenOptions;
 use std::hash::Hash;
 use std::io::{Error, ErrorKind};
@@ -990,6 +990,12 @@ pub struct DecryptedTieredSlab {
 	pub cipher_id: CipherId,
 	pub chunk_size_bytes: ChunkSizeBytes,
 	pub chunk_count: u32,
+	/// The distinct record start offsets the object's offset index lists,
+	/// decoded after the surface HMAC that binds the index and the chunk AEAD
+	/// verified. They describe this object's own layout: authenticated, but
+	/// written by whichever build produced the object, so they do not prove
+	/// that every acknowledged record was kept.
+	pub record_offsets: BTreeSet<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1416,7 +1422,7 @@ pub struct CryptoManager {
 	root_kek: Arc<dyn RootKekProvider>,
 	keysets: Arc<Mutex<HashMap<TenantId, TenantKeyset>>>,
 	tenant_kek_cache: Arc<Mutex<KeyCache<(TenantId, TenantKekId), LockedKeyMaterial>>>,
-	slab_dek_cache: Arc<Mutex<KeyCache<(TenantId, SlabId, CipherId), PreparedSlabDek>>>,
+	slab_dek_cache: Arc<Mutex<KeyCache<SlabDekCacheKey, PreparedSlabDek>>>,
 	audit_context: Arc<Mutex<Option<CryptoAuditContext>>>,
 }
 
@@ -1750,7 +1756,13 @@ impl CryptoManager {
 		{
 			let mut slab_cache = self.lock_slab_dek_cache()?;
 			slab_cache.insert(
-				(metadata.tenant_id, slab_id, cipher_id),
+				slab_dek_cache_key(
+					metadata.tenant_id,
+					tenant_kek_id,
+					slab_id,
+					cipher_id,
+					&encrypted_chunks.wrapped_slab_dek,
+				),
 				encrypted_chunks.cache_key,
 			);
 		}
@@ -1849,6 +1861,13 @@ impl CryptoManager {
 				return Err(error);
 			}
 		};
+		let record_offsets = match decode_adr022_record_offsets(parsed.index, plaintext.len()) {
+			Ok(offsets) => offsets,
+			Err(error) => {
+				self.emit_decrypt_rejected(expected_slab_id, Some(footer), "offset_index", &error);
+				return Err(error);
+			}
+		};
 		Ok(DecryptedTieredSlab {
 			plaintext,
 			tenant_id: parsed.tenant_id,
@@ -1857,6 +1876,7 @@ impl CryptoManager {
 			cipher_id: parsed.cipher_id,
 			chunk_size_bytes: parsed.chunk_size_bytes,
 			chunk_count: parsed.chunk_count,
+			record_offsets,
 		})
 	}
 
@@ -2284,7 +2304,13 @@ impl CryptoManager {
 	) -> std::io::Result<Arc<PreparedSlabDek>> {
 		{
 			let mut slab_cache = self.lock_slab_dek_cache()?;
-			let cache_key = (tenant_id, slab_id, cipher_id);
+			let cache_key = slab_dek_cache_key(
+				tenant_id,
+				tenant_kek_id,
+				slab_id,
+				cipher_id,
+				wrapped_slab_dek,
+			);
 			if let Some(prepared) = slab_cache.get(&cache_key) {
 				return Ok(prepared);
 			}
@@ -2296,7 +2322,16 @@ impl CryptoManager {
 			Arc::new(LockedKeyMaterial::new(unwrapped)?),
 		)?);
 		let mut slab_cache = self.lock_slab_dek_cache()?;
-		slab_cache.insert((tenant_id, slab_id, cipher_id), prepared.clone());
+		slab_cache.insert(
+			slab_dek_cache_key(
+				tenant_id,
+				tenant_kek_id,
+				slab_id,
+				cipher_id,
+				wrapped_slab_dek,
+			),
+			prepared.clone(),
+		);
 		Ok(prepared)
 	}
 
@@ -2408,7 +2443,7 @@ impl CryptoManager {
 		self.lock_tenant_kek_cache()?
 			.invalidate_where(|(entry_tenant, _)| *entry_tenant == tenant_id);
 		self.lock_slab_dek_cache()?
-			.invalidate_where(|(entry_tenant, _, _)| *entry_tenant == tenant_id);
+			.invalidate_where(|(entry_tenant, ..)| *entry_tenant == tenant_id);
 		Ok(())
 	}
 
@@ -2432,9 +2467,7 @@ impl CryptoManager {
 
 	fn lock_slab_dek_cache(
 		&self,
-	) -> std::io::Result<
-		std::sync::MutexGuard<'_, KeyCache<(TenantId, SlabId, CipherId), PreparedSlabDek>>,
-	> {
+	) -> std::io::Result<std::sync::MutexGuard<'_, KeyCache<SlabDekCacheKey, PreparedSlabDek>>> {
 		self.slab_dek_cache
 			.lock()
 			.map_err(|_| Error::other("slab DEK cache mutex poisoned"))
@@ -3223,6 +3256,25 @@ fn adr022_surface_hmac_payload(
 	payload.extend_from_slice(&index_len.to_be_bytes());
 	payload.extend_from_slice(&ADR_TIERED_SLAB_MAGIC_TAIL);
 	payload
+}
+
+/// A prepared slab DEK is cached per generation: the wrapped DEK named by the
+/// authenticated footer of the object being read, under its KEK. Two
+/// generations of one slab id never share an entry.
+type SlabDekCacheKey = (TenantId, TenantKekId, SlabId, CipherId, [u8; 32]);
+
+fn slab_dek_cache_key(
+	tenant_id: TenantId,
+	tenant_kek_id: TenantKekId,
+	slab_id: SlabId,
+	cipher_id: CipherId,
+	wrapped_slab_dek: &[u8],
+) -> SlabDekCacheKey {
+	let mut wrapped_digest = [0_u8; 32];
+	wrapped_digest.copy_from_slice(
+		aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, wrapped_slab_dek).as_ref(),
+	);
+	(tenant_id, tenant_kek_id, slab_id, cipher_id, wrapped_digest)
 }
 
 fn compute_adr022_surface_hmac(
@@ -4090,6 +4142,45 @@ fn encode_adr022_offset_index(
 		push_u32_be(&mut out, entry.flags);
 	}
 	Ok(out)
+}
+
+/// The distinct record start offsets in an ADR 022 offset index. Every entry
+/// must lie inside the plaintext; one that does not, or a length that is not a
+/// whole number of entries, refuses the index rather than being dropped.
+/// Callers decode only bytes the surface HMAC already verified.
+fn decode_adr022_record_offsets(
+	index_bytes: &[u8],
+	plaintext_len: usize,
+) -> std::io::Result<BTreeSet<u64>> {
+	if index_bytes.len() % ADR_TIERED_SLAB_INDEX_ENTRY_BYTES != 0 {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"ADR 022 offset index length is not an integral number of entries",
+		));
+	}
+	let mut offsets = BTreeSet::new();
+	for entry in index_bytes.chunks_exact(ADR_TIERED_SLAB_INDEX_ENTRY_BYTES) {
+		let byte_offset = u64::from_be_bytes(entry[16..24].try_into().expect("slice len"));
+		let byte_length = u32::from_be_bytes(entry[24..28].try_into().expect("slice len"));
+		let end = byte_offset
+			.checked_add(u64::from(byte_length))
+			.ok_or_else(|| {
+				Error::new(
+					ErrorKind::InvalidData,
+					"ADR 022 offset index entry range overflows",
+				)
+			})?;
+		if end > plaintext_len as u64 {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"ADR 022 offset index entry {byte_offset}..{end} falls outside plaintext length {plaintext_len}"
+				),
+			));
+		}
+		offsets.insert(byte_offset);
+	}
+	Ok(offsets)
 }
 
 fn crc32c(bytes: &[u8]) -> u32 {
@@ -6758,6 +6849,34 @@ mod tests {
 			err.to_string().contains("footer HMAC failed"),
 			"late CSB attachment must rebuild the slab footer and HMAC: {err}"
 		);
+	}
+
+	#[test]
+	fn record_offsets_decode_the_offset_index_and_refuse_bad_entries() {
+		let entry = |byte_offset: u64, byte_length: u32| TieredOffsetIndexEntry {
+			key_locator: IdentityPrefix::new([0x33; 16]),
+			byte_offset,
+			byte_length,
+			flags: 0,
+		};
+		// Two rows of one record share an offset; the set holds it once.
+		let entries = [entry(0, 100), entry(0, 100), entry(4096, 200)];
+		let bytes = encode_adr022_offset_index(&entries, 8192).unwrap();
+		assert_eq!(
+			decode_adr022_record_offsets(&bytes, 8192).unwrap(),
+			BTreeSet::from([0, 4096])
+		);
+		assert_eq!(
+			decode_adr022_record_offsets(&[], 8192).unwrap(),
+			BTreeSet::new()
+		);
+		// A partial entry, an entry past the plaintext, and an overflowing
+		// range each refuse the whole index; none is dropped.
+		assert!(decode_adr022_record_offsets(&bytes[..bytes.len() - 1], 8192).is_err());
+		assert!(decode_adr022_record_offsets(&bytes, 4296 - 1).is_err());
+		let mut overflow = encode_adr022_offset_index(&[entry(0, 1)], 8192).unwrap();
+		overflow[16..24].copy_from_slice(&u64::MAX.to_be_bytes());
+		assert!(decode_adr022_record_offsets(&overflow, 8192).is_err());
 	}
 
 	#[test]

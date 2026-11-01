@@ -112,7 +112,7 @@ fn lsm_secondary_index_compaction_path_has_behavioral_guards() {
 
 	for required in [
 		"prepare_lsm_secondary_index_segments_for_compaction",
-		"publish_prepared_lsm_secondary_index_segments",
+		"publish_prepared_lsm_secondary_index_segments_locked",
 		"update_lsm_sidecar_coverage_after_publish",
 	] {
 		assert!(

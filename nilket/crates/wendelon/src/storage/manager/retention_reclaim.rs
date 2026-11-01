@@ -1,4 +1,110 @@
 use super::*;
+use crate::storage::index::{RetainedObjectIntent, RetainedObjectIntentState};
+
+/// A nonleader defers L2 debt without uploading, proposing, or completing it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TableDropReclaimStatus {
+	#[default]
+	Progress,
+	DeferredNotLeader,
+}
+
+/// Outcome of one explicit table-drop reclaim pass.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TableDropReclaimReport {
+	pub status: TableDropReclaimStatus,
+	pub compacted_slabs: usize,
+	pub reclaimed_records: usize,
+	pub reclaimed_bytes: u64,
+}
+
+type DeferredDropKey = (TenantId, TableObjectId, u64);
+
+type CleanupWorkKey = (SlabId, u8, String);
+enum CleanupWork {
+	Candidate(SlabId, String),
+	Intent(SlabId, String),
+	Legacy(SlabId),
+}
+
+#[derive(Default)]
+pub(crate) struct CleanupReconcileReport {
+	examined: usize,
+	fully_scanned: bool,
+	has_pending: bool,
+	deferred_slabs: BTreeSet<SlabId>,
+	first_error: Option<Error>,
+}
+impl CleanupReconcileReport {
+	fn legacy_result(self) -> std::io::Result<(usize, bool)> {
+		match self.first_error {
+			Some(error) => Err(error),
+			// Pending work can arrive after this scan selected its entries. It
+			// prevents completion without inventing an error for unvisited work.
+			None => Ok((self.examined, self.fully_scanned && !self.has_pending)),
+		}
+	}
+}
+#[derive(Default)]
+pub(super) struct CleanupScanSchedule {
+	after: std::sync::Mutex<Option<CleanupWorkKey>>,
+	drops: dashmap::DashMap<DeferredDropKey, Arc<tokio::sync::Mutex<TableDropSliceScan>>>,
+}
+struct TableDropSliceScan {
+	after: Option<SlabId>,
+	watermark: Option<SlabId>,
+	upper: Option<SlabId>,
+	blocked: Option<SlabId>,
+	cleanup_next: bool,
+}
+impl TableDropSliceScan {
+	fn start(cursor: TableDropReclaimCursor, upper: Option<SlabId>) -> Self {
+		Self {
+			after: cursor.after_slab_id,
+			watermark: cursor.after_slab_id,
+			upper,
+			blocked: None,
+			cleanup_next: true,
+		}
+	}
+}
+
+/// Volatile set of operation debts deferred by local role. Existing replicated
+/// debt and durable reclaim progress reconstruct it on the first recovery tick.
+#[derive(Default)]
+pub(super) struct DeferredTableDropL2(
+	std::sync::Mutex<BTreeSet<DeferredDropKey>>,
+	#[cfg(test)] std::sync::Mutex<Option<&'static crate::metrics::Gauge>>,
+);
+
+impl DeferredTableDropL2 {
+	fn gauge(&self) -> &'static crate::metrics::Gauge {
+		#[cfg(test)]
+		if let Some(gauge) = *self.1.lock().unwrap() {
+			return gauge;
+		}
+		&metrics().storage_table_drop_l2_deferred_debts
+	}
+
+	fn update(&self, f: impl FnOnce(&mut BTreeSet<DeferredDropKey>)) {
+		let mut debts = self.0.lock().unwrap();
+		let before = debts.len();
+		f(&mut debts);
+		let after = debts.len();
+		let gauge = self.gauge();
+		if after > before {
+			gauge.add((after - before) as u64);
+		} else {
+			gauge.sub((before - after) as u64);
+		}
+	}
+}
+impl Drop for DeferredTableDropL2 {
+	fn drop(&mut self) {
+		let count = self.0.get_mut().unwrap().len() as u64;
+		self.gauge().sub(count);
+	}
+}
 
 /// ADR 0098 decision 2: what one policed scan of a sealed slab established.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -74,6 +180,284 @@ struct PendingTableDropL2Cleanup {
 	slab_id: SlabId,
 	old_l2_uri: String,
 	replacement_l2_uri: Option<String>,
+	state: CleanupIntentState,
+	retained_bytes: u64,
+}
+
+/// A failed response never establishes that a publication cannot still apply.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+enum CleanupIntentState {
+	Unresolved,
+}
+
+/// One manager's contribution to process gauges, restored before open returns.
+#[derive(Default)]
+pub(super) struct UnresolvedTierCleanup {
+	intents: std::sync::Mutex<CleanupIntentUnion>,
+	missing_authority: std::sync::atomic::AtomicBool,
+}
+
+#[derive(Default)]
+struct CleanupIntentUnion {
+	legacy: BTreeMap<SlabId, (String, Option<String>, u64)>,
+	snapshot: BTreeMap<(SlabId, String), RetainedObjectIntent>,
+	pending: BTreeSet<(SlabId, String)>,
+}
+
+impl CleanupIntentUnion {
+	fn totals(&self) -> (u64, u64, u64) {
+		let mut count = self.legacy.len() as u64;
+		let mut bytes: u64 = self.legacy.values().map(|(_, _, bytes)| *bytes).sum();
+		let mut unknown = 0u64;
+		for ((slab, uri), size) in &self.snapshot {
+			let duplicate = self.legacy.get(slab).is_some_and(|(old, replacement, _)| {
+				uri == old || replacement.as_ref() == Some(uri)
+			});
+			if !duplicate {
+				count = count.saturating_add(1);
+				if let Some(size) = size.bytes {
+					bytes = bytes.saturating_add(size);
+				} else {
+					unknown = unknown.saturating_add(1);
+				}
+			}
+		}
+		(count, bytes, unknown)
+	}
+}
+
+impl UnresolvedTierCleanup {
+	fn mark_missing_authority(&self) {
+		if !self
+			.missing_authority
+			.swap(true, std::sync::atomic::Ordering::AcqRel)
+		{
+			metrics().storage_cleanup_authority_missing.add(1);
+		}
+	}
+
+	#[cfg(test)]
+	pub(super) fn test_record_count(&self) -> usize {
+		self.intents.lock().unwrap().snapshot.len()
+	}
+
+	#[cfg(test)]
+	pub(super) fn test_totals(&self) -> (u64, u64) {
+		let totals = self.intents.lock().unwrap().totals();
+		(totals.0, totals.1)
+	}
+
+	#[cfg(test)]
+	pub(super) fn test_accounting(&self) -> (u64, u64, u64) {
+		self.intents.lock().unwrap().totals()
+	}
+
+	fn update(&self, f: impl FnOnce(&mut CleanupIntentUnion)) {
+		let mut intents = self.intents.lock().unwrap();
+		let before = intents.totals();
+		let records_before = intents.snapshot.len() as u64;
+		f(&mut intents);
+		let after = intents.totals();
+		let records_after = intents.snapshot.len() as u64;
+		let m = metrics();
+		if records_after >= records_before {
+			m.storage_tier_cleanup_records
+				.add(records_after - records_before);
+		} else {
+			m.storage_tier_cleanup_records
+				.sub(records_before - records_after);
+		}
+		if after.0 >= before.0 {
+			m.storage_unresolved_tier_cleanup_intents
+				.add(after.0 - before.0);
+		} else {
+			m.storage_unresolved_tier_cleanup_intents
+				.sub(before.0 - after.0);
+		}
+		if after.1 >= before.1 {
+			m.storage_unresolved_tier_cleanup_bytes
+				.add(after.1 - before.1);
+		} else {
+			m.storage_unresolved_tier_cleanup_bytes
+				.sub(before.1 - after.1);
+		}
+		if after.2 >= before.2 {
+			m.storage_unresolved_tier_cleanup_unknown_size
+				.add(after.2 - before.2);
+		} else {
+			m.storage_unresolved_tier_cleanup_unknown_size
+				.sub(before.2 - after.2);
+		}
+	}
+
+	fn insert(&self, slab_id: SlabId, uri: String, replacement: Option<String>, bytes: u64) {
+		self.update(|intents| {
+			intents.legacy.insert(slab_id, (uri, replacement, bytes));
+		});
+	}
+
+	fn begin_snapshot(&self, slab_id: SlabId, uri: &str) {
+		self.intents
+			.lock()
+			.unwrap()
+			.pending
+			.insert((slab_id, uri.to_owned()));
+	}
+
+	fn finish_snapshot(
+		&self,
+		slab_id: SlabId,
+		uri: String,
+		intent: RetainedObjectIntent,
+		committed: bool,
+	) {
+		self.update(|intents| {
+			intents
+				.snapshot
+				.entry((slab_id, uri.clone()))
+				.or_insert(intent);
+			if committed {
+				intents.pending.remove(&(slab_id, uri));
+			}
+		});
+	}
+
+	fn insert_snapshot(&self, slab_id: SlabId, uri: String, intent: RetainedObjectIntent) {
+		self.update(|intents| {
+			intents.snapshot.insert((slab_id, uri), intent);
+		});
+	}
+
+	fn publish_replacement(
+		&self,
+		slab_id: SlabId,
+		old: String,
+		replacement: &str,
+		intent: RetainedObjectIntent,
+	) {
+		self.update(|intents| {
+			let mut intent = intent;
+			intent.published_replacements.insert(replacement.to_owned());
+			if let Some(prior) = intents.snapshot.get(&(slab_id, old.clone())) {
+				intent.bytes = prior.bytes;
+				intent.replacement_bytes = prior.replacement_bytes;
+				intent.retirement_source = intent.retirement_source.or(prior.retirement_source);
+				intent
+					.published_replacements
+					.extend(prior.published_replacements.iter().cloned());
+				if prior.state == RetainedObjectIntentState::ReplacementPublished {
+					intent
+						.published_replacements
+						.extend(prior.replacement_uri.iter().cloned());
+				}
+			}
+			let key = (slab_id, replacement.to_owned());
+			if old != replacement {
+				if let Some(provisional) = intents.snapshot.get(&key).filter(|p| {
+					matches!(
+						p.state,
+						RetainedObjectIntentState::Unresolved
+							| RetainedObjectIntentState::CandidateNotSubmitted
+					) && p.replacement_uri.as_deref() == Some(replacement)
+				}) {
+					intent.replacement_bytes = intent.replacement_bytes.or(provisional.bytes);
+					intents.snapshot.remove(&key);
+				}
+			}
+			intents.snapshot.insert((slab_id, old), intent);
+		});
+	}
+
+	fn unresolved_slabs(&self) -> BTreeSet<SlabId> {
+		let slabs = {
+			let intents = self.intents.lock().unwrap();
+			intents
+				.legacy
+				.keys()
+				.copied()
+				.chain(intents.snapshot.keys().map(|(slab, _)| *slab))
+				.chain(intents.pending.iter().map(|(slab, _)| *slab))
+				.collect::<BTreeSet<_>>()
+		};
+		slabs
+			.into_iter()
+			.filter(|slab| self.contains(*slab))
+			.collect()
+	}
+
+	fn contains(&self, slab_id: SlabId) -> bool {
+		let intents = self.intents.lock().unwrap();
+		let unresolved_legacy =
+			intents
+				.legacy
+				.get(&slab_id)
+				.is_some_and(|(old, replacement, _)| {
+					!intents
+						.snapshot
+						.get(&(slab_id, old.clone()))
+						.is_some_and(|record| {
+							replacement
+								.as_deref()
+								.is_some_and(|uri| record.was_published(uri))
+						})
+				});
+		unresolved_legacy
+			|| intents.snapshot.iter().any(|((slab, _), record)| {
+				*slab == slab_id
+					&& matches!(
+						record.state,
+						RetainedObjectIntentState::Unresolved
+							| RetainedObjectIntentState::CandidateNotSubmitted
+					)
+			}) || intents.pending.iter().any(|(slab, _)| *slab == slab_id)
+	}
+
+	fn published(&self, slab_id: SlabId, uri: &str, replacement: &str) -> bool {
+		self.intents
+			.lock()
+			.unwrap()
+			.snapshot
+			.get(&(slab_id, uri.to_owned()))
+			.is_some_and(|record| record.was_published(replacement))
+	}
+}
+
+struct PendingSnapshotCleanup<'a> {
+	cleanup: &'a UnresolvedTierCleanup,
+	slab_id: SlabId,
+	uri: String,
+	intent: RetainedObjectIntent,
+	finished: bool,
+}
+
+impl Drop for PendingSnapshotCleanup<'_> {
+	fn drop(&mut self) {
+		if !self.finished {
+			self.cleanup.finish_snapshot(
+				self.slab_id,
+				self.uri.clone(),
+				self.intent.clone(),
+				false,
+			);
+		}
+	}
+}
+
+impl Drop for UnresolvedTierCleanup {
+	fn drop(&mut self) {
+		if *self.missing_authority.get_mut() {
+			metrics().storage_cleanup_authority_missing.sub(1);
+		}
+		let intents = self.intents.get_mut().unwrap();
+		let totals = intents.totals();
+		metrics()
+			.storage_tier_cleanup_records
+			.sub(intents.snapshot.len() as u64);
+		metrics().release_storage_unresolved_tier_cleanup(totals.0, totals.1);
+		metrics()
+			.storage_unresolved_tier_cleanup_unknown_size
+			.sub(totals.2);
+	}
 }
 
 pub(super) fn table_drop_l2_cleanup_path(dir: &Path, slab_id: SlabId) -> PathBuf {
@@ -132,45 +516,813 @@ pub(super) async fn cleanup_retention_rewrite_tmp_files(
 }
 
 impl SlabManager {
-	pub(super) async fn persist_table_drop_l2_cleanup(
+	pub(crate) fn retain_table_drop_scan_operations(
+		&self,
+		active: &BTreeSet<(TenantId, TableObjectId, u64)>,
+	) {
+		self.cleanup_scan_schedule
+			.drops
+			.retain(|operation, _| active.contains(operation));
+	}
+
+	pub(crate) async fn prepare_tier_candidate_proposal(
+		&self,
+		slab_id: SlabId,
+		uri: &str,
+	) -> std::io::Result<()> {
+		self.set_tier_candidate_proposal_state(slab_id, uri, false, None)
+			.await
+	}
+
+	/// Only pre-invocation code or B1N's definite refusal may call this.
+	pub(crate) async fn record_tier_candidate_not_submitted(
+		&self,
+		slab_id: SlabId,
+		uri: &str,
+		bytes: u64,
+	) -> std::io::Result<()> {
+		self.set_tier_candidate_proposal_state(slab_id, uri, true, Some(bytes))
+			.await
+	}
+
+	async fn set_tier_candidate_proposal_state(
+		&self,
+		slab_id: SlabId,
+		uri: &str,
+		not_submitted: bool,
+		bytes: Option<u64>,
+	) -> std::io::Result<()> {
+		self.require_cleanup_authority()?;
+		let _claim = self.cleanup_claim(slab_id).lock_owned().await;
+		self.unresolved_tier_cleanup.begin_snapshot(slab_id, uri);
+		let index = self
+			.persistent_index
+			.as_ref()
+			.ok_or_else(|| Error::new(ErrorKind::WouldBlock, "persistent index unavailable"))?;
+		let record = index
+			.set_tier_candidate_proposal_state(slab_id, uri.to_owned(), not_submitted, bytes)
+			.await?;
+		self.unresolved_tier_cleanup.update(|intents| {
+			intents.snapshot.insert((slab_id, uri.to_owned()), record);
+			intents.pending.remove(&(slab_id, uri.to_owned()));
+		});
+		Ok(())
+	}
+
+	pub(crate) async fn discard_unsubmitted_tier_candidate(
+		&self,
+		slab_id: SlabId,
+		uri: &str,
+		object_store: &dyn ObjectStore,
+	) -> std::io::Result<()> {
+		self.require_cleanup_authority()?;
+		let _claim = self.cleanup_claim(slab_id).lock_owned().await;
+		let expected = {
+			let intents = self.unresolved_tier_cleanup.intents.lock().unwrap();
+			if intents.pending.contains(&(slab_id, uri.to_owned()))
+				|| !intents
+					.snapshot
+					.get(&(slab_id, uri.to_owned()))
+					.is_some_and(|r| {
+						r.state == RetainedObjectIntentState::CandidateNotSubmitted
+							&& r.replacement_uri.as_deref() == Some(uri)
+							&& r.published_replacements.is_empty()
+							&& r.retirement_source.is_none()
+					}) || intents
+				.snapshot
+				.iter()
+				.any(|((slab, _), r)| *slab == slab_id && r.was_published(uri))
+			{
+				return Err(stale_location_error(slab_id, StaleLocationReason::Fenced));
+			}
+			intents
+				.snapshot
+				.iter()
+				.filter(|((slab, name), record)| {
+					*slab == slab_id
+						&& (name == uri || record.replacement_uri.as_deref() == Some(uri))
+				})
+				.map(|((_, name), record)| (name.clone(), record.clone()))
+				.collect::<BTreeMap<_, _>>()
+		};
+		if self
+			.tier_pointer(slab_id)
+			.await
+			.is_some_and(|p| p.l2_uri == uri)
+			|| self
+				.unapplied_tier_pointer(slab_id)
+				.is_some_and(|p| p.l2_uri == uri)
+		{
+			return Err(stale_location_error(slab_id, StaleLocationReason::Fenced));
+		}
+		match object_store.delete(uri).await {
+			Ok(()) => {}
+			Err(error) if error.kind() == ErrorKind::NotFound => {}
+			Err(error) => return Err(error),
+		}
+		let index = self
+			.persistent_index
+			.as_ref()
+			.ok_or_else(|| Error::new(ErrorKind::WouldBlock, "persistent index unavailable"))?;
+		let changes = index
+			.clear_unsubmitted_tier_candidate(
+				slab_id,
+				uri.to_owned(),
+				expected
+					.keys()
+					.filter(|name| name.as_str() != uri)
+					.cloned()
+					.collect(),
+			)
+			.await?;
+		#[cfg(test)]
+		self.candidate_after_clear_pause_point().await;
+		self.unresolved_tier_cleanup.update(|intents| {
+			for (name, record) in changes {
+				let key = (slab_id, name.clone());
+				if intents.snapshot.get(&key) != expected.get(&name) {
+					continue;
+				}
+				intents.pending.remove(&key);
+				match record {
+					Some(record) => {
+						intents.snapshot.insert(key, record);
+					}
+					None => {
+						intents.snapshot.remove(&key);
+					}
+				}
+			}
+		});
+		Ok(())
+	}
+
+	pub(crate) fn set_table_drop_l2_deferred(
+		&self,
+		tenant: TenantId,
+		table: TableObjectId,
+		generation: u64,
+		deferred: bool,
+	) {
+		self.deferred_table_drop_l2.update(|debts| {
+			let key = (tenant, table, generation);
+			if deferred {
+				debts.insert(key);
+			} else {
+				debts.remove(&key);
+			}
+		});
+	}
+
+	pub(crate) fn replace_table_drop_l2_deferred(
+		&self,
+		active: &BTreeSet<(TenantId, TableObjectId, u64)>,
+	) {
+		self.deferred_table_drop_l2
+			.update(|debts| *debts = active.clone());
+	}
+
+	#[cfg(test)]
+	pub(crate) fn bind_table_drop_l2_gauge_for_test(&self, gauge: &'static crate::metrics::Gauge) {
+		assert!(self.deferred_table_drop_l2.0.lock().unwrap().is_empty());
+		*self.deferred_table_drop_l2.1.lock().unwrap() = Some(gauge);
+	}
+
+	#[cfg(test)]
+	pub(crate) fn table_drop_l2_deferred_count(&self) -> usize {
+		self.deferred_table_drop_l2.0.lock().unwrap().len()
+	}
+
+	#[cfg(test)]
+	pub(crate) fn retained_cleanup_test_accounting(&self) -> (u64, u64, u64) {
+		self.unresolved_tier_cleanup.test_accounting()
+	}
+
+	#[cfg(test)]
+	pub(crate) fn retained_cleanup_test_crypto(&self) -> Arc<CryptoManager> {
+		self.config.crypto.clone()
+	}
+
+	pub(super) fn cleanup_claim(&self, slab_id: SlabId) -> Arc<tokio::sync::Mutex<()>> {
+		self.cleanup_claims
+			.entry(slab_id)
+			.or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+			.clone()
+	}
+
+	pub(super) fn note_tier_republished(&self, slab_id: SlabId, uri: &str, index: u64) {
+		self.unresolved_tier_cleanup.update(|intents| {
+			if let Some(record) = intents.snapshot.get_mut(&(slab_id, uri.to_owned())) {
+				if record
+					.retirement_source
+					.is_some_and(|source| index > source.index())
+				{
+					record.retirement_source = None;
+					if record.state == RetainedObjectIntentState::RetirementPublished {
+						record.state = RetainedObjectIntentState::ReplacementPublished;
+					}
+				}
+			}
+		});
+	}
+
+	pub(super) fn snapshot_retained_size_hint(&self, slab_id: SlabId, uri: &str) -> Option<u64> {
+		let intents = self.unresolved_tier_cleanup.intents.lock().unwrap();
+		intents
+			.snapshot
+			.get(&(slab_id, uri.to_owned()))
+			.and_then(|record| record.bytes)
+			.or_else(|| {
+				intents
+					.snapshot
+					.iter()
+					.filter(|((slab, prior_uri), record)| {
+						*slab == slab_id
+							&& prior_uri != uri && record.replacement_uri.as_deref() == Some(uri)
+					})
+					.find_map(|(_, record)| record.replacement_bytes)
+			})
+	}
+
+	pub(super) fn snapshot_retirement_evidence(
+		&self,
+		slab_id: SlabId,
+		uri: &str,
+	) -> Vec<(String, RetainedObjectIntent)> {
+		let intents = self.unresolved_tier_cleanup.intents.lock().unwrap();
+		let mut evidence = intents
+			.snapshot
+			.iter()
+			.filter(|((slab, prior), record)| {
+				*slab == slab_id && prior != uri && record.replacement_uri.as_deref() == Some(uri)
+			})
+			.map(|((_, prior), record)| (prior.clone(), record.clone()))
+			.collect::<Vec<_>>();
+		if let Some((prior, replacement, bytes)) = intents.legacy.get(&slab_id) {
+			if replacement.as_deref() == Some(uri) && !evidence.iter().any(|(key, _)| key == prior)
+			{
+				evidence.push((
+					prior.clone(),
+					RetainedObjectIntent {
+						bytes: Some(*bytes),
+						replacement_uri: replacement.clone(),
+						replacement_bytes: None,
+						published_replacements: Default::default(),
+						retirement_source: None,
+						state: RetainedObjectIntentState::ReplacementPublished,
+					},
+				));
+			}
+		}
+		evidence
+	}
+
+	pub(super) fn note_snapshot_retirement_applied(
+		&self,
+		slab_id: SlabId,
+		uri: String,
+		intent: RetainedObjectIntent,
+		evidence: Vec<(String, RetainedObjectIntent)>,
+	) {
+		self.unresolved_tier_cleanup.update(|intents| {
+			for (prior, record) in evidence {
+				intents.snapshot.insert((slab_id, prior), record);
+			}
+			intents.snapshot.insert((slab_id, uri), intent);
+		});
+	}
+
+	pub(crate) fn require_cleanup_authority(&self) -> std::io::Result<()> {
+		if self
+			.persistent_index
+			.as_ref()
+			.is_some_and(|index| index.cleanup_authority_available())
+		{
+			Ok(())
+		} else {
+			Err(Error::new(
+				ErrorKind::WouldBlock,
+				"cleanup authority unavailable until restart",
+			))
+		}
+	}
+
+	pub(super) async fn load_unresolved_tier_cleanup(&self) -> std::io::Result<()> {
+		for entry in self.file_ops.read_dir(&self.config.dir).await? {
+			if !entry.is_file {
+				continue;
+			}
+			let Some(slab_id) = entry
+				.file_name
+				.to_str()
+				.and_then(parse_table_drop_l2_cleanup_filename)
+			else {
+				continue;
+			};
+			let marker = self.read_table_drop_cleanup_intent(slab_id).await?;
+			self.unresolved_tier_cleanup.insert(
+				slab_id,
+				marker.old_l2_uri,
+				marker.replacement_l2_uri,
+				marker.retained_bytes,
+			);
+		}
+		if let Some(index) = &self.persistent_index {
+			if !index.cleanup_authority_available() {
+				self.unresolved_tier_cleanup.mark_missing_authority();
+				return Ok(());
+			}
+			for (slab_id, uri, intent) in index.load_snapshot_cleanup_intents().await? {
+				self.unresolved_tier_cleanup
+					.insert_snapshot(slab_id, uri, intent);
+			}
+		}
+		Ok(())
+	}
+
+	#[cfg(test)]
+	pub(crate) async fn persist_snapshot_cleanup_intent(
+		&self,
+		slab_id: SlabId,
+		uri: &str,
+		bytes: u64,
+	) -> std::io::Result<()> {
+		self.persist_retained_intent(slab_id, uri, bytes, None)
+			.await
+	}
+
+	/// An ambiguous upload is unresolved until that exact URI is observed live.
+	pub(crate) async fn persist_ambiguous_upload_intent(
+		&self,
+		slab_id: SlabId,
+		uri: &str,
+		bytes: u64,
+	) -> std::io::Result<()> {
+		self.persist_retained_intent(slab_id, uri, bytes, Some(uri.to_owned()))
+			.await
+	}
+
+	async fn persist_retained_intent(
+		&self,
+		slab_id: SlabId,
+		uri: &str,
+		bytes: u64,
+		replacement_uri: Option<String>,
+	) -> std::io::Result<()> {
+		self.require_cleanup_authority()?;
+		let _claim = self.cleanup_claim(slab_id).lock_owned().await;
+		let (existing, pending) = {
+			let intents = self.unresolved_tier_cleanup.intents.lock().unwrap();
+			let key = (slab_id, uri.to_owned());
+			(
+				intents.snapshot.get(&key).cloned(),
+				intents.pending.contains(&key),
+			)
+		};
+		if let Some(existing) = &existing {
+			if replacement_uri.is_some() && existing.replacement_uri != replacement_uri {
+				return Err(Error::new(
+					ErrorKind::InvalidData,
+					"conflicting retained-object intent",
+				));
+			}
+			if !pending {
+				return Ok(());
+			}
+		}
+		// A failed or cancelled write leaves conservative memory and a pending
+		// fence. Retry the exact durable intent before reporting success.
+		let intent = existing.unwrap_or(RetainedObjectIntent {
+			bytes: Some(bytes),
+			replacement_uri,
+			replacement_bytes: None,
+			published_replacements: Default::default(),
+			retirement_source: None,
+			state: RetainedObjectIntentState::Unresolved,
+		});
+		self.unresolved_tier_cleanup.begin_snapshot(slab_id, uri);
+		let mut pending = PendingSnapshotCleanup {
+			cleanup: &self.unresolved_tier_cleanup,
+			slab_id,
+			uri: uri.to_owned(),
+			intent: intent.clone(),
+			finished: false,
+		};
+		let result = match &self.persistent_index {
+			Some(index) => {
+				index
+					.put_snapshot_cleanup_intent(slab_id, uri.to_owned(), intent.clone())
+					.await
+			}
+			None => Err(Error::new(
+				ErrorKind::WouldBlock,
+				"persistent index unavailable for cleanup intent",
+			)),
+		};
+		self.unresolved_tier_cleanup.finish_snapshot(
+			slab_id,
+			uri.to_owned(),
+			intent,
+			result.is_ok(),
+		);
+		pending.finished = true;
+		result
+	}
+
+	async fn read_table_drop_cleanup_intent(
+		&self,
+		slab_id: SlabId,
+	) -> std::io::Result<PendingTableDropL2Cleanup> {
+		let path = table_drop_l2_cleanup_path(&self.config.dir, slab_id);
+		let bytes = self.file_ops.read_all(&path).await?;
+		let marker: PendingTableDropL2Cleanup = postcard::from_bytes(&bytes).map_err(|error| {
+			Error::new(
+				ErrorKind::InvalidData,
+				format!("invalid tier cleanup intent: {error}"),
+			)
+		})?;
+		if marker.format_version != 2 || marker.slab_id != slab_id {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"tier cleanup intent identity or format mismatch",
+			));
+		}
+		Ok(marker)
+	}
+
+	#[cfg(test)]
+	pub(crate) async fn persist_table_drop_l2_cleanup(
 		&self,
 		slab_id: SlabId,
 		old_l2_uri: &str,
 		replacement_l2_uri: Option<&str>,
 	) -> std::io::Result<()> {
-		let marker = PendingTableDropL2Cleanup {
-			format_version: 1,
-			slab_id,
-			old_l2_uri: old_l2_uri.to_string(),
-			replacement_l2_uri: replacement_l2_uri.map(str::to_string),
+		let store = self
+			.config
+			.l2
+			.as_ref()
+			.ok_or_else(|| Error::new(ErrorKind::NotFound, "cleanup intent requires L2"))?;
+		let replacement = match replacement_l2_uri {
+			Some(uri) => Some((uri, store.head(uri).await?.size_bytes)),
+			None => None,
 		};
-		let bytes = postcard::to_stdvec(&marker).map_err(|error| {
-			Error::new(
-				ErrorKind::InvalidData,
-				format!("encode table-drop L2 cleanup marker: {error}"),
-			)
-		})?;
-		let path = table_drop_l2_cleanup_path(&self.config.dir, slab_id);
-		write_file(
-			self.file_ops.as_ref(),
-			&path,
-			OpenFlags {
-				write: true,
-				create: true,
-				truncate: true,
-				..OpenFlags::default()
-			},
-			&bytes,
-		)
-		.await?;
-		self.file_ops.fsync_dir(&self.config.dir).await
+		let old_bytes = store.head(old_l2_uri).await?.size_bytes;
+		self.stage_table_drop_l2_cleanup(slab_id, old_l2_uri, Some(old_bytes), replacement)
+			.await
 	}
 
-	pub(super) async fn reconcile_table_drop_l2_cleanup_markers(
+	/// Durably stage both objects before the replacement upload begins.
+	pub(crate) async fn stage_table_drop_l2_cleanup(
+		&self,
+		slab_id: SlabId,
+		old_l2_uri: &str,
+		old_bytes: Option<u64>,
+		replacement: Option<(&str, u64)>,
+	) -> std::io::Result<()> {
+		self.require_cleanup_authority()?;
+		if self.unresolved_tier_cleanup.contains(slab_id) {
+			return Err(stale_location_error(slab_id, StaleLocationReason::Fenced));
+		}
+		let replacement_l2_uri = replacement.map(|(uri, _)| uri);
+		let mut provisional =
+			replacement
+				.filter(|(uri, _)| *uri != old_l2_uri)
+				.map(|(uri, bytes)| {
+					(
+						uri.to_owned(),
+						RetainedObjectIntent {
+							bytes: Some(bytes),
+							replacement_uri: Some(uri.to_owned()),
+							replacement_bytes: None,
+							published_replacements: Default::default(),
+							retirement_source: None,
+							state: RetainedObjectIntentState::CandidateNotSubmitted,
+						},
+					)
+				});
+		let mut intent = RetainedObjectIntent {
+			bytes: old_bytes,
+			replacement_uri: replacement_l2_uri.map(str::to_owned),
+			replacement_bytes: replacement.map(|(_, bytes)| bytes),
+			published_replacements: Default::default(),
+			retirement_source: None,
+			state: RetainedObjectIntentState::Unresolved,
+		};
+		let _claim = self.cleanup_claim(slab_id).lock_owned().await;
+		if self.unresolved_tier_cleanup.contains(slab_id) {
+			return Err(stale_location_error(slab_id, StaleLocationReason::Fenced));
+		}
+		if let Some(prior) = self
+			.unresolved_tier_cleanup
+			.intents
+			.lock()
+			.unwrap()
+			.snapshot
+			.get(&(slab_id, old_l2_uri.to_owned()))
+			.cloned()
+		{
+			if matches!(
+				prior.state,
+				RetainedObjectIntentState::ReplacementPublished
+					| RetainedObjectIntentState::RetirementPublished
+			) {
+				intent.bytes = prior.bytes;
+				intent.retirement_source = prior.retirement_source;
+				intent.published_replacements = prior.published_replacements;
+				intent.published_replacements.extend(prior.replacement_uri);
+			}
+		}
+		if let Some((uri, requested)) = &provisional {
+			let prior = self
+				.unresolved_tier_cleanup
+				.intents
+				.lock()
+				.unwrap()
+				.snapshot
+				.get(&(slab_id, uri.clone()))
+				.cloned();
+			if let Some(prior) = prior {
+				if !matches!(
+					prior.state,
+					RetainedObjectIntentState::ReplacementPublished
+						| RetainedObjectIntentState::RetirementPublished
+				) || prior
+					.bytes
+					.zip(requested.bytes)
+					.is_some_and(|(a, b)| a != b)
+				{
+					return Err(Error::new(
+						ErrorKind::InvalidData,
+						"conflicting replacement history",
+					));
+				}
+				// This URI is already counted by its historical record. Preserve it.
+				provisional = None;
+			}
+		}
+		let index = self.persistent_index.as_ref().ok_or_else(|| {
+			Error::new(
+				ErrorKind::WouldBlock,
+				"persistent index unavailable for cleanup intent",
+			)
+		})?;
+		self.unresolved_tier_cleanup
+			.begin_snapshot(slab_id, old_l2_uri);
+		if let Some((uri, _)) = &provisional {
+			self.unresolved_tier_cleanup.begin_snapshot(slab_id, uri);
+		}
+		index
+			.put_cleanup_intent_pair(
+				slab_id,
+				old_l2_uri.to_owned(),
+				intent.clone(),
+				provisional.clone(),
+			)
+			.await?;
+		self.unresolved_tier_cleanup.update(|intents| {
+			intents
+				.snapshot
+				.insert((slab_id, old_l2_uri.to_owned()), intent);
+			intents.pending.remove(&(slab_id, old_l2_uri.to_owned()));
+			if let Some((uri, item)) = provisional {
+				intents.pending.remove(&(slab_id, uri.clone()));
+				intents.snapshot.insert((slab_id, uri), item);
+			}
+		});
+		Ok(())
+	}
+
+	pub(crate) async fn record_cleanup_replacement_published(
+		&self,
+		slab_id: SlabId,
+		old_uri: &str,
+		replacement: &str,
+	) -> std::io::Result<()> {
+		let _claim = self.cleanup_claim(slab_id).lock_owned().await;
+		if self
+			.unresolved_tier_cleanup
+			.published(slab_id, old_uri, replacement)
+		{
+			return Ok(());
+		}
+		if self.unapplied_tier_pointer(slab_id).is_some()
+			|| self
+				.tier_pointer(slab_id)
+				.await
+				.as_ref()
+				.map(|p| p.l2_uri.as_str())
+				!= Some(replacement)
+		{
+			return Err(stale_location_error(slab_id, StaleLocationReason::Fenced));
+		}
+		let intent = self
+			.unresolved_tier_cleanup
+			.intents
+			.lock()
+			.unwrap()
+			.snapshot
+			.get(&(slab_id, old_uri.to_owned()))
+			.cloned()
+			.ok_or_else(|| Error::new(ErrorKind::NotFound, "cleanup intent missing"))?;
+		if intent.replacement_uri.as_deref() != Some(replacement) {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"cleanup replacement mismatch",
+			));
+		}
+		let index = self.persistent_index.as_ref().ok_or_else(|| {
+			Error::new(
+				ErrorKind::WouldBlock,
+				"persistent index unavailable for cleanup intent",
+			)
+		})?;
+		index
+			.mark_cleanup_replacement_published(
+				slab_id,
+				old_uri.to_owned(),
+				replacement.to_owned(),
+				intent.bytes,
+			)
+			.await?;
+		self.unresolved_tier_cleanup.publish_replacement(
+			slab_id,
+			old_uri.to_owned(),
+			replacement,
+			RetainedObjectIntent {
+				state: RetainedObjectIntentState::ReplacementPublished,
+				..intent
+			},
+		);
+		Ok(())
+	}
+
+	/// Preserve the local generation a snapshot is about to supersede. Sizes
+	/// come only from records already held here; unknown stays unknown.
+	pub(crate) async fn record_retained_pointer_transition(
+		&self,
+		old: &TieredSlabPointer,
+		replacement: Option<&TieredSlabPointer>,
+		locally_published: bool,
+	) -> std::io::Result<()> {
+		if self
+			.persistent_index
+			.as_ref()
+			.is_some_and(|index| !index.cleanup_authority_available())
+		{
+			// The committed pointer transaction records this accounting gap.
+			return Ok(());
+		}
+		if replacement.is_some_and(|pointer| old.l2_uri == pointer.l2_uri) {
+			return Ok(());
+		}
+		let slab_id = old.slab_id;
+		let _claim = self.cleanup_claim(slab_id).lock_owned().await;
+		let (known_bytes, evidence, existing_retained) = {
+			let intents = self.unresolved_tier_cleanup.intents.lock().unwrap();
+			let provisional = intents
+				.snapshot
+				.get(&(slab_id, old.l2_uri.clone()))
+				.filter(|p| {
+					matches!(
+						p.state,
+						RetainedObjectIntentState::Unresolved
+							| RetainedObjectIntentState::CandidateNotSubmitted
+					) && p.replacement_uri.as_deref() == Some(old.l2_uri.as_str())
+				});
+			let existing_retained = intents
+				.snapshot
+				.get(&(slab_id, old.l2_uri.clone()))
+				.filter(|p| {
+					!(matches!(
+						p.state,
+						RetainedObjectIntentState::Unresolved
+							| RetainedObjectIntentState::CandidateNotSubmitted
+					) && p.replacement_uri.as_deref() == Some(old.l2_uri.as_str()))
+				})
+				.cloned();
+			let mut predecessors = intents
+				.snapshot
+				.iter()
+				.filter(|((slab, uri), record)| {
+					*slab == slab_id
+						&& uri != &old.l2_uri
+						&& record.replacement_uri.as_deref() == Some(old.l2_uri.as_str())
+				})
+				.map(|((_, uri), record)| (uri.clone(), record.clone()))
+				.collect::<Vec<_>>();
+			let known = provisional
+				.and_then(|p| p.bytes)
+				.or_else(|| predecessors.iter().find_map(|(_, p)| p.replacement_bytes));
+			if locally_published {
+				if let Some((uri, next, bytes)) = intents.legacy.get(&slab_id) {
+					if next.as_deref() == Some(old.l2_uri.as_str())
+						&& !predecessors.iter().any(|(key, _)| key == uri)
+					{
+						predecessors.push((
+							uri.clone(),
+							RetainedObjectIntent {
+								bytes: Some(*bytes),
+								replacement_uri: next.clone(),
+								replacement_bytes: None,
+								published_replacements: Default::default(),
+								retirement_source: None,
+								state: RetainedObjectIntentState::ReplacementPublished,
+							},
+						));
+					}
+				}
+			} else {
+				predecessors.clear();
+			}
+			let evidence = predecessors;
+			(known, evidence, existing_retained)
+		};
+		let retained = match existing_retained {
+			Some(mut prior)
+				if prior.state == RetainedObjectIntentState::ReplacementPublished
+					&& replacement.is_some_and(|pointer| !prior.was_published(&pointer.l2_uri)) =>
+			{
+				prior
+					.published_replacements
+					.extend(prior.replacement_uri.take());
+				prior.replacement_uri = replacement.map(|pointer| pointer.l2_uri.clone());
+				prior.replacement_bytes = None;
+				prior.state = RetainedObjectIntentState::Unresolved;
+				prior
+			}
+			Some(prior) => prior,
+			None => RetainedObjectIntent {
+				bytes: known_bytes,
+				replacement_uri: replacement.map(|pointer| pointer.l2_uri.clone()),
+				replacement_bytes: None,
+				published_replacements: Default::default(),
+				retirement_source: None,
+				state: RetainedObjectIntentState::Unresolved,
+			},
+		};
+		let index = self.persistent_index.as_ref().ok_or_else(|| {
+			Error::new(
+				ErrorKind::WouldBlock,
+				"persistent index unavailable for snapshot retained object",
+			)
+		})?;
+		self.unresolved_tier_cleanup
+			.begin_snapshot(slab_id, &old.l2_uri);
+		index
+			.stage_snapshot_retained_object(
+				slab_id,
+				old.l2_uri.clone(),
+				retained.clone(),
+				evidence.clone(),
+			)
+			.await?;
+		self.unresolved_tier_cleanup.update(|intents| {
+			for (uri, mut prior) in evidence {
+				prior.published_replacements.insert(old.l2_uri.clone());
+				prior.state = RetainedObjectIntentState::ReplacementPublished;
+				intents.snapshot.insert((slab_id, uri), prior);
+			}
+			intents.pending.remove(&(slab_id, old.l2_uri.clone()));
+			intents
+				.snapshot
+				.insert((slab_id, old.l2_uri.clone()), retained);
+		});
+		Ok(())
+	}
+
+	pub(crate) fn refuse_unresolved_cleanup(&self, slab_id: SlabId) -> std::io::Result<()> {
+		if self.unresolved_tier_cleanup.contains(slab_id) {
+			return Err(stale_location_error(slab_id, StaleLocationReason::Fenced));
+		}
+		Ok(())
+	}
+
+	pub(crate) async fn reconcile_table_drop_l2_cleanup_markers(
 		&self,
 		object_store: &dyn ObjectStore,
 		examined_budget: usize,
 	) -> std::io::Result<(usize, bool)> {
+		self.reconcile_table_drop_l2_cleanup_impl(object_store, examined_budget, false)
+			.await?
+			.legacy_result()
+	}
+	pub(crate) async fn reconcile_unresolved_table_drop_cleanup(
+		&self,
+		object_store: &dyn ObjectStore,
+		examined_budget: usize,
+	) -> std::io::Result<CleanupReconcileReport> {
+		self.reconcile_table_drop_l2_cleanup_impl(object_store, examined_budget, true)
+			.await
+	}
+	async fn reconcile_table_drop_l2_cleanup_impl(
+		&self,
+		object_store: &dyn ObjectStore,
+		examined_budget: usize,
+		unresolved_only: bool,
+	) -> std::io::Result<CleanupReconcileReport> {
+		self.require_cleanup_authority()?;
+		// Directory discovery is global authority: a failure here still stops
+		// initiative. Errors while processing one known slab are deferred below.
 		let mut markers = self
 			.file_ops
 			.read_dir(&self.config.dir)
@@ -188,45 +1340,273 @@ impl SlabManager {
 					.flatten()
 			})
 			.collect::<Vec<_>>();
-		markers.sort_unstable();
-		let total = markers.len();
-		let mut examined = 0usize;
-		for slab_id in markers.into_iter().take(examined_budget) {
-			examined += 1;
-			let path = table_drop_l2_cleanup_path(&self.config.dir, slab_id);
-			let bytes = self.file_ops.read_all(&path).await?;
-			let marker: PendingTableDropL2Cleanup =
-				postcard::from_bytes(&bytes).map_err(|error| {
-					Error::new(
-						ErrorKind::InvalidData,
-						format!(
-							"table-drop L2 cleanup marker for slab {slab_id} is corrupt: {error}"
-						),
-					)
-				})?;
-			if marker.format_version != 1 || marker.slab_id != slab_id {
-				return Err(Error::new(
-					ErrorKind::InvalidData,
-					format!(
-						"table-drop L2 cleanup marker for slab {slab_id} has unsupported identity or format"
-					),
+		let live_uris = self
+			.list_tiered_slabs()
+			.await
+			.into_iter()
+			.map(|p| (p.slab_id, p.l2_uri))
+			.collect::<BTreeMap<_, _>>();
+		let mut work = Vec::new();
+		{
+			let intents = self.unresolved_tier_cleanup.intents.lock().unwrap();
+			let candidates = intents
+				.snapshot
+				.iter()
+				.filter(|(key, record)| {
+					record.state == RetainedObjectIntentState::CandidateNotSubmitted
+						&& live_uris.get(&key.0) != Some(&key.1)
+						&& !intents.pending.contains(*key)
+				})
+				.map(|(key, _)| key.clone())
+				.collect::<BTreeSet<_>>();
+			for (slab, uri) in &candidates {
+				work.push((
+					(*slab, 0, uri.clone()),
+					CleanupWork::Candidate(*slab, uri.clone()),
 				));
 			}
-			let current_uri = self
-				.tier_pointer(slab_id)
-				.await
-				.map(|pointer| pointer.l2_uri);
-			if current_uri.as_deref() != Some(marker.old_l2_uri.as_str()) {
-				Self::delete_l2_object_if_present(object_store, &marker.old_l2_uri).await?;
-			} else if let Some(replacement_uri) = marker.replacement_l2_uri.as_deref() {
-				Self::delete_l2_object_if_present(object_store, replacement_uri).await?;
+			for ((slab, uri), record) in &intents.snapshot {
+				let provisional = record.replacement_uri.as_deref() == Some(uri.as_str());
+				let owned = intents
+					.legacy
+					.get(slab)
+					.is_some_and(|(_, replacement, _)| replacement.as_ref() == Some(uri))
+					|| intents
+						.snapshot
+						.iter()
+						.any(|((other_slab, other_uri), other)| {
+							other_slab == slab
+								&& other_uri != uri && other.replacement_uri.as_ref() == Some(uri)
+						});
+				let candidate_owned = candidates.contains(&(*slab, uri.clone()))
+					|| record.replacement_uri.as_ref().is_some_and(|replacement| {
+						candidates.contains(&(*slab, replacement.clone()))
+					});
+				if matches!(
+					record.state,
+					RetainedObjectIntentState::Unresolved
+						| RetainedObjectIntentState::CandidateNotSubmitted
+				) && !candidate_owned
+					&& (!provisional || !owned)
+					&& !intents
+						.legacy
+						.get(slab)
+						.is_some_and(|(old, replacement, _)| {
+							old == uri && record.replacement_uri == *replacement
+						}) {
+					work.push((
+						(*slab, 1, uri.clone()),
+						CleanupWork::Intent(*slab, uri.clone()),
+					));
+				}
 			}
-			// If the old pointer is still authoritative, the replacement commit did
-			// not become visible and the next bounded pass will retry it. Otherwise
-			// the old object is gone before this durable intent is removed.
-			unlink_local_file(self.file_ops.as_ref(), &path).await?;
+			if unresolved_only {
+				markers.retain(|slab| {
+					!intents
+						.legacy
+						.get(slab)
+						.is_some_and(|(old, replacement, _)| {
+							intents
+								.snapshot
+								.get(&(*slab, old.clone()))
+								.is_some_and(|record| {
+									replacement
+										.as_deref()
+										.is_some_and(|uri| record.was_published(uri))
+								})
+						})
+				});
+			}
 		}
-		Ok((examined, examined == total))
+		for slab in markers {
+			work.push(((slab, 2, String::new()), CleanupWork::Legacy(slab)));
+		}
+		work.sort_by(|a, b| a.0.cmp(&b.0));
+		if let Some(after) = self.cleanup_scan_schedule.after.lock().unwrap().as_ref() {
+			let split = work.partition_point(|(key, _)| key <= after);
+			work.rotate_left(split);
+		}
+		let total = work.len();
+		let mut report = CleanupReconcileReport {
+			fully_scanned: total <= examined_budget,
+			..Default::default()
+		};
+		for (key, item) in work.into_iter().take(examined_budget) {
+			report.examined += 1;
+			let slab = key.0;
+			let outcome = self.reconcile_cleanup_work(item, object_store).await;
+			*self.cleanup_scan_schedule.after.lock().unwrap() = Some(key);
+			if let Err(error) = outcome {
+				tracing::warn!(slab_id=slab.get(),error=%error,"cleanup deferred for this slab; continuing the scan");
+				report.deferred_slabs.insert(slab);
+				if report.first_error.is_none() {
+					report.first_error = Some(error);
+				}
+			}
+		}
+		let pending = self.unresolved_tier_cleanup.unresolved_slabs();
+		report.has_pending = !pending.is_empty();
+		report.deferred_slabs.extend(pending);
+		Ok(report)
+	}
+	async fn reconcile_cleanup_work(
+		&self,
+		work: CleanupWork,
+		object_store: &dyn ObjectStore,
+	) -> std::io::Result<()> {
+		match work {
+			CleanupWork::Candidate(slab, uri) => {
+				#[cfg(test)]
+				self.candidate_reconcile_before_rewrite_pause_point().await;
+				let _rewrite = self.acquire_slab_rewrite_exclusive_claim(slab).await;
+				let still_unsubmitted = self
+					.unresolved_tier_cleanup
+					.intents
+					.lock()
+					.unwrap()
+					.snapshot
+					.get(&(slab, uri.clone()))
+					.is_some_and(|record| {
+						record.state == RetainedObjectIntentState::CandidateNotSubmitted
+					});
+				if !still_unsubmitted
+					|| self
+						.tier_pointer(slab)
+						.await
+						.is_some_and(|p| p.l2_uri == uri)
+				{
+					return Ok(());
+				}
+				self.discard_unsubmitted_tier_candidate(slab, &uri, object_store)
+					.await
+			}
+			CleanupWork::Intent(slab_id, uri) => {
+				let _claim = self.cleanup_claim(slab_id).lock_owned().await;
+				let Some(intent) = self
+					.unresolved_tier_cleanup
+					.intents
+					.lock()
+					.unwrap()
+					.snapshot
+					.get(&(slab_id, uri.clone()))
+					.cloned()
+				else {
+					return Ok(());
+				};
+				if !matches!(
+					intent.state,
+					RetainedObjectIntentState::Unresolved
+						| RetainedObjectIntentState::CandidateNotSubmitted
+				) {
+					return Ok(());
+				}
+				let Some(replacement) = intent.replacement_uri.as_deref() else {
+					return Err(stale_location_error(slab_id, StaleLocationReason::Fenced));
+				};
+				if self
+					.unresolved_tier_cleanup
+					.published(slab_id, &uri, replacement)
+				{
+					return Ok(());
+				}
+				if self.unapplied_tier_pointer(slab_id).is_some()
+					|| self
+						.tier_pointer(slab_id)
+						.await
+						.as_ref()
+						.map(|p| p.l2_uri.as_str())
+						!= Some(replacement)
+				{
+					return Err(stale_location_error(slab_id, StaleLocationReason::Fenced));
+				}
+				let index = self.persistent_index.as_ref().ok_or_else(|| {
+					Error::new(
+						ErrorKind::WouldBlock,
+						"persistent index unavailable for cleanup intent",
+					)
+				})?;
+				if uri == replacement {
+					index
+						.remove_standalone_live_provisional(slab_id, uri.clone())
+						.await?;
+					self.unresolved_tier_cleanup.update(|intents| {
+						intents.snapshot.remove(&(slab_id, uri));
+					});
+					return Ok(());
+				}
+				index
+					.mark_cleanup_replacement_published(
+						slab_id,
+						uri.clone(),
+						replacement.to_owned(),
+						intent.bytes,
+					)
+					.await?;
+				self.unresolved_tier_cleanup.publish_replacement(
+					slab_id,
+					uri,
+					replacement,
+					RetainedObjectIntent {
+						state: RetainedObjectIntentState::ReplacementPublished,
+						..intent.clone()
+					},
+				);
+				Ok(())
+			}
+			CleanupWork::Legacy(slab_id) => {
+				let _claim = self.cleanup_claim(slab_id).lock_owned().await;
+				#[cfg(test)]
+				self.cleanup_reconcile_claim_pause_point().await;
+				let marker = self.read_table_drop_cleanup_intent(slab_id).await?;
+				let Some(replacement) = marker.replacement_l2_uri.as_deref() else {
+					return Err(stale_location_error(slab_id, StaleLocationReason::Fenced));
+				};
+				if self
+					.unresolved_tier_cleanup
+					.published(slab_id, &marker.old_l2_uri, replacement)
+				{
+					return Ok(());
+				}
+				if self.unapplied_tier_pointer(slab_id).is_some()
+					|| self
+						.tier_pointer(slab_id)
+						.await
+						.as_ref()
+						.map(|p| p.l2_uri.as_str())
+						!= Some(replacement)
+				{
+					return Err(stale_location_error(slab_id, StaleLocationReason::Fenced));
+				}
+				let index = self.persistent_index.as_ref().ok_or_else(|| {
+					Error::new(
+						ErrorKind::WouldBlock,
+						"persistent index unavailable for cleanup intent",
+					)
+				})?;
+				index
+					.mark_cleanup_replacement_published(
+						slab_id,
+						marker.old_l2_uri.clone(),
+						replacement.to_owned(),
+						Some(marker.retained_bytes),
+					)
+					.await?;
+				self.unresolved_tier_cleanup.publish_replacement(
+					slab_id,
+					marker.old_l2_uri,
+					replacement,
+					RetainedObjectIntent {
+						bytes: Some(marker.retained_bytes),
+						replacement_uri: Some(replacement.to_owned()),
+						replacement_bytes: None,
+						published_replacements: Default::default(),
+						retirement_source: None,
+						state: RetainedObjectIntentState::ReplacementPublished,
+					},
+				);
+				Ok(())
+			}
+		}
 	}
 
 	pub async fn reclaim_table_drop_storage_slice(
@@ -238,6 +1618,7 @@ impl SlabManager {
 		cursor: TableDropReclaimCursor,
 		examined_budget: usize,
 	) -> std::io::Result<TableDropReclaimSliceReport> {
+		self.require_tier_authority_ready()?;
 		descriptor.validate()?;
 		if descriptor.table_object_id == TableObjectId::DEFAULT_KV || examined_budget == 0 {
 			return Ok(TableDropReclaimSliceReport {
@@ -312,6 +1693,30 @@ impl SlabManager {
 		cursor: TableDropReclaimCursor,
 		examined_budget: usize,
 	) -> std::io::Result<TableDropReclaimSliceReport> {
+		// The coordinator can ask a follower participant to reclaim its local
+		// debt. Its L2 phase remains pending until this node may propose.
+		if !committer.should_propose() {
+			self.set_table_drop_l2_deferred(
+				tenant_id,
+				descriptor.table_object_id,
+				descriptor.schema_generation,
+				true,
+			);
+			return Ok(TableDropReclaimSliceReport {
+				status: TableDropReclaimStatus::DeferredNotLeader,
+				cursor_next: cursor,
+				..TableDropReclaimSliceReport::default()
+			});
+		}
+		self.set_table_drop_l2_deferred(
+			tenant_id,
+			descriptor.table_object_id,
+			descriptor.schema_generation,
+			false,
+		);
+
+		self.require_cleanup_authority()?;
+		self.require_tier_authority_ready()?;
 		descriptor.validate()?;
 		if descriptor.table_object_id == TableObjectId::DEFAULT_KV || examined_budget == 0 {
 			return Ok(TableDropReclaimSliceReport {
@@ -342,40 +1747,120 @@ impl SlabManager {
 				"table drop tiered reclaim requires an L2 object store",
 			)
 		})?;
-		let (cleanup_examined, cleanup_done) = self
-			.reconcile_table_drop_l2_cleanup_markers(object_store.as_ref(), examined_budget)
+		let operation = (
+			tenant_id,
+			descriptor.table_object_id,
+			descriptor.schema_generation,
+		);
+		let state = self
+			.cleanup_scan_schedule
+			.drops
+			.entry(operation)
+			.or_insert_with(|| {
+				Arc::new(tokio::sync::Mutex::new(TableDropSliceScan::start(
+					cursor,
+					upper_bound,
+				)))
+			})
+			.clone();
+		let mut scan = state.lock_owned().await;
+		let still_blocked = scan.blocked.is_some_and(|slab| {
+			self.unresolved_tier_cleanup.contains(slab)
+				|| self.refuse_proposal_over_unapplied_pointer(slab).is_err()
+		});
+		if scan.watermark != cursor.after_slab_id
+			|| scan.upper != upper_bound
+			|| (scan.blocked.is_some() && !still_blocked && scan.cleanup_next)
+		{
+			*scan = TableDropSliceScan::start(cursor, upper_bound);
+		}
+		let cleanup_budget = if scan.cleanup_next {
+			if examined_budget == 1 {
+				1
+			} else {
+				examined_budget / 2 + examined_budget % 2
+			}
+		} else {
+			0
+		};
+		let cleanup = self
+			.reconcile_unresolved_table_drop_cleanup(object_store.as_ref(), cleanup_budget)
 			.await?;
-		report.examined = cleanup_examined;
-		if !cleanup_done || cleanup_examined == examined_budget {
-			return Ok(report);
+		report.examined = cleanup.examined;
+		let cleanup_done =
+			cleanup.fully_scanned && !cleanup.has_pending && cleanup.first_error.is_none();
+		let cleanup_deferred = cleanup.deferred_slabs.clone();
+		if cleanup.examined > 0 || cleanup.has_pending {
+			scan.cleanup_next = !scan.cleanup_next;
+		} else {
+			scan.cleanup_next = true;
 		}
-		if pointers.is_empty() {
-			report.done = true;
-			return Ok(report);
+		for slab in cleanup.deferred_slabs {
+			if cursor.after_slab_id.is_none_or(|after| slab > after)
+				&& upper_bound.is_none_or(|upper| slab <= upper)
+			{
+				scan.blocked = Some(scan.blocked.map_or(slab, |old| old.min(slab)));
+			}
 		}
-		let pointer_budget = examined_budget - cleanup_examined;
+		let pointer_ids = pointers.iter().map(|p| p.slab_id).collect::<Vec<_>>();
+		let after = scan.after;
 		let candidates = pointers.into_iter().filter(|pointer| {
-			cursor
-				.after_slab_id
-				.is_none_or(|after| pointer.slab_id > after)
+			after.is_none_or(|after| pointer.slab_id > after)
 				&& upper_bound.is_none_or(|upper| pointer.slab_id <= upper)
 		});
-		for pointer in candidates.take(pointer_budget) {
+		let mut pointer_end = true;
+
+		for pointer in candidates {
+			if report.examined == examined_budget {
+				pointer_end = false;
+				break;
+			}
+			scan.after = Some(pointer.slab_id);
+			if scan.blocked == Some(pointer.slab_id)
+				|| cleanup_deferred.contains(&pointer.slab_id)
+				|| self.unresolved_tier_cleanup.contains(pointer.slab_id)
+				|| self
+					.refuse_proposal_over_unapplied_pointer(pointer.slab_id)
+					.is_err()
+			{
+				scan.blocked = Some(
+					scan.blocked
+						.map_or(pointer.slab_id, |old| old.min(pointer.slab_id)),
+				);
+				continue;
+			}
 			let _slab_rewrite_claim = self
 				.acquire_slab_rewrite_exclusive_claim(pointer.slab_id)
 				.await;
 			report.examined += 1;
 			report.cursor_next.after_slab_id = Some(pointer.slab_id);
+			if cleanup_deferred.contains(&pointer.slab_id)
+				|| self
+					.refuse_proposal_over_unapplied_pointer(pointer.slab_id)
+					.is_err() || self.unresolved_tier_cleanup.contains(pointer.slab_id)
+			{
+				scan.blocked = Some(
+					scan.blocked
+						.map_or(pointer.slab_id, |old| old.min(pointer.slab_id)),
+				);
+				continue;
+			}
+			let previous_blocked = scan.blocked;
+			// A failed attempt must not publish a cursor receipt past this slab.
+			scan.blocked =
+				Some(previous_blocked.map_or(pointer.slab_id, |old| old.min(pointer.slab_id)));
 			let Some(prepared) = self
 				.prepare_tiered_table_drop_rewrite(&pointer, tenant_id, descriptor, table_schemas)
 				.await?
 			else {
+				scan.blocked = previous_blocked;
 				continue;
 			};
 			match prepared {
 				PreparedTieredTableDropRewrite::Rewrite {
 					slab_id,
 					old_l2_uri,
+					old_bytes,
 					encrypted_bytes,
 					payload_hash,
 					tombstone_metadata,
@@ -384,12 +1869,42 @@ impl SlabManager {
 					reclaimed_bytes,
 				} => {
 					let key = self.table_drop_rewritten_key(slab_id);
+					let planned_uri = object_store.planned_upload_uri(&key)?;
+					self.stage_table_drop_l2_cleanup(
+						slab_id,
+						&old_l2_uri,
+						Some(old_bytes),
+						Some((&planned_uri, encrypted_bytes.len() as u64)),
+					)
+					.await?;
 					let new_uri = object_store.put(&key, &encrypted_bytes).await?;
+					if new_uri != planned_uri {
+						self.persist_ambiguous_upload_intent(
+							slab_id,
+							&new_uri,
+							encrypted_bytes.len() as u64,
+						)
+						.await?;
+						return Err(Error::new(
+							ErrorKind::InvalidData,
+							"object store returned a different upload URI",
+						));
+					}
+					#[cfg(test)]
+					self.table_drop_after_upload_pause_point().await;
 					let fetched = object_store.get(&new_uri).await?;
 					let fetched_hash = crate::hash::content::digest(&fetched);
 					if fetched_hash != payload_hash {
-						let _ = Self::delete_l2_object_if_present(object_store.as_ref(), &new_uri)
-							.await;
+						if let Err(cleanup_error) = self
+							.discard_unsubmitted_tier_candidate(
+								slab_id,
+								&new_uri,
+								object_store.as_ref(),
+							)
+							.await
+						{
+							tracing::warn!(error=%cleanup_error,"unsubmitted table-drop candidate awaits cleanup");
+						}
 						return Err(Error::new(
 							ErrorKind::InvalidData,
 							format!(
@@ -426,20 +1941,46 @@ impl SlabManager {
 						tombstone_metadata,
 						supersession_metadata,
 					};
-					self.persist_table_drop_l2_cleanup(slab_id, &old_l2_uri, Some(&new_uri))
+					self.prepare_tier_candidate_proposal(slab_id, &new_uri)
 						.await?;
-					let cleanup_marker = table_drop_l2_cleanup_path(&self.config.dir, slab_id);
 					if let Err(error) = committer.commit_tier_slab(tier).await {
+						if crate::storage::sweeper::tier_proposal_not_submitted(&error) {
+							self.record_tier_candidate_not_submitted(
+								slab_id,
+								&new_uri,
+								encrypted_bytes.len() as u64,
+							)
+							.await?;
+							return Err(error);
+						}
+
+						if self
+							.tier_pointer(slab_id)
+							.await
+							.as_ref()
+							.map(|pointer| pointer.l2_uri.as_str())
+							!= Some(new_uri.as_str())
+						{
+							self.persist_ambiguous_upload_intent(
+								slab_id,
+								&new_uri,
+								encrypted_bytes.len() as u64,
+							)
+							.await?;
+						}
 						// Commit errors are ambiguous: the Raft apply may still have won.
 						// Keep both objects and the durable marker; the next slice resolves
 						// which URI is authoritative before deleting either old data.
 						return Err(error);
 					}
+					// The old object may still serve this node if it failed to publish
+					// the committed pointer: it is kept, and the refusal is typed.
+					self.refuse_proposal_over_unapplied_pointer(slab_id)?;
 					if old_l2_uri != new_uri {
-						Self::delete_l2_object_if_present(object_store.as_ref(), &old_l2_uri)
-							.await?;
+						Self::retain_superseded_l2_object(slab_id, &old_l2_uri, "tier rewrite")?;
 					}
-					unlink_local_file(self.file_ops.as_ref(), &cleanup_marker).await?;
+					self.record_cleanup_replacement_published(slab_id, &old_l2_uri, &new_uri)
+						.await?;
 					self.clear_retired_tiered_cleanup(slab_id);
 					report.rewritten += 1;
 					report.reclaimed_records =
@@ -449,19 +1990,18 @@ impl SlabManager {
 				PreparedTieredTableDropRewrite::Retire {
 					slab_id,
 					old_l2_uri,
+					old_bytes,
 					reclaimed_records,
 					reclaimed_bytes,
 				} => {
-					self.persist_table_drop_l2_cleanup(slab_id, &old_l2_uri, None)
+					self.stage_table_drop_l2_cleanup(slab_id, &old_l2_uri, Some(old_bytes), None)
 						.await?;
-					let cleanup_marker = table_drop_l2_cleanup_path(&self.config.dir, slab_id);
 					if let Err(error) = committer.retire_tiered_slab(slab_id).await {
 						// As above, a transport error does not prove the retirement failed.
 						// Reconciliation compares the durable pointer with the marker.
 						return Err(error);
 					}
-					Self::delete_l2_object_if_present(object_store.as_ref(), &old_l2_uri).await?;
-					unlink_local_file(self.file_ops.as_ref(), &cleanup_marker).await?;
+					Self::retain_superseded_l2_object(slab_id, &old_l2_uri, "tier retirement")?;
 					self.clear_retired_tiered_cleanup(slab_id);
 					report.rewritten += 1;
 					report.reclaimed_records =
@@ -469,14 +2009,27 @@ impl SlabManager {
 					report.reclaimed_bytes = report.reclaimed_bytes.saturating_add(reclaimed_bytes);
 				}
 			}
+			scan.blocked = previous_blocked;
 		}
-		report.done = match upper_bound {
-			None => true,
-			Some(upper) => report
-				.cursor_next
-				.after_slab_id
-				.is_some_and(|after| after >= upper),
-		};
+		if let Some(blocked) = scan.blocked {
+			report.cursor_next.after_slab_id = pointer_ids
+				.iter()
+				.copied()
+				.filter(|id| *id < blocked && cursor.after_slab_id.is_none_or(|after| *id > after))
+				.max()
+				.or(cursor.after_slab_id);
+		} else {
+			report.cursor_next.after_slab_id = scan.after;
+		}
+		report.done = pointer_end && cleanup_done && scan.blocked.is_none();
+		scan.watermark = report.cursor_next.after_slab_id;
+		if pointer_end {
+			scan.after = report.cursor_next.after_slab_id;
+		}
+		if report.done {
+			self.cleanup_scan_schedule.drops.remove(&operation);
+		}
+
 		Ok(report)
 	}
 
@@ -487,6 +2040,7 @@ impl SlabManager {
 		secondary_indexes: &SecondaryIndexCatalog,
 		max_slabs: usize,
 	) -> std::io::Result<TombstoneCompactionReport> {
+		self.require_tier_authority_ready()?;
 		if tombstones.is_empty() {
 			return Ok(TombstoneCompactionReport::default());
 		}
@@ -572,6 +2126,7 @@ impl SlabManager {
 		secondary_indexes: &SecondaryIndexCatalog,
 		max_slabs: usize,
 	) -> std::io::Result<RetentionPruningReport> {
+		self.require_tier_authority_ready()?;
 		if max_slabs == 0 {
 			return Ok(RetentionPruningReport::default());
 		}
@@ -642,6 +2197,7 @@ impl SlabManager {
 		now_ms: u64,
 		max_slabs: usize,
 	) -> std::io::Result<RetentionPruningReport> {
+		self.require_tier_authority_ready()?;
 		if max_slabs == 0 {
 			return Ok(RetentionPruningReport::default());
 		}
@@ -741,6 +2297,7 @@ impl SlabManager {
 		secondary_indexes: &SecondaryIndexCatalog,
 		max_slabs: usize,
 	) -> std::io::Result<TableDropReclaimReport> {
+		self.require_tier_authority_ready()?;
 		descriptor.validate()?;
 		if descriptor.table_object_id == TableObjectId::DEFAULT_KV || max_slabs == 0 {
 			return Ok(TableDropReclaimReport::default());
@@ -795,6 +2352,29 @@ impl SlabManager {
 		committer: &dyn TierCommitter,
 		max_slabs: usize,
 	) -> std::io::Result<TableDropReclaimReport> {
+		// The coordinator can ask a follower participant to reclaim its local
+		// debt. Its L2 phase remains pending until this node may propose.
+		if !committer.should_propose() {
+			self.set_table_drop_l2_deferred(
+				tenant_id,
+				descriptor.table_object_id,
+				descriptor.schema_generation,
+				true,
+			);
+			return Ok(TableDropReclaimReport {
+				status: TableDropReclaimStatus::DeferredNotLeader,
+				..TableDropReclaimReport::default()
+			});
+		}
+		self.set_table_drop_l2_deferred(
+			tenant_id,
+			descriptor.table_object_id,
+			descriptor.schema_generation,
+			false,
+		);
+
+		self.require_cleanup_authority()?;
+		self.require_tier_authority_ready()?;
 		descriptor.validate()?;
 		if descriptor.table_object_id == TableObjectId::DEFAULT_KV || max_slabs == 0 {
 			return Ok(TableDropReclaimReport::default());
@@ -815,6 +2395,19 @@ impl SlabManager {
 			if report.compacted_slabs >= max_slabs {
 				break;
 			}
+			let _slab_rewrite_claim = self
+				.acquire_slab_rewrite_exclusive_claim(pointer.slab_id)
+				.await;
+			if self
+				.refuse_proposal_over_unapplied_pointer(pointer.slab_id)
+				.is_err() || self.unresolved_tier_cleanup.contains(pointer.slab_id)
+			{
+				tracing::warn!(
+					slab_id = pointer.slab_id.get(),
+					"table-drop slab deferred while cleanup remains unresolved"
+				);
+				continue;
+			}
 			let Some(prepared) = self
 				.prepare_tiered_table_drop_rewrite(&pointer, tenant_id, descriptor, table_schemas)
 				.await?
@@ -825,6 +2418,7 @@ impl SlabManager {
 				PreparedTieredTableDropRewrite::Rewrite {
 					slab_id,
 					old_l2_uri,
+					old_bytes,
 					encrypted_bytes,
 					payload_hash,
 					tombstone_metadata,
@@ -833,12 +2427,42 @@ impl SlabManager {
 					reclaimed_bytes,
 				} => {
 					let key = self.table_drop_rewritten_key(slab_id);
+					let planned_uri = object_store.planned_upload_uri(&key)?;
+					self.stage_table_drop_l2_cleanup(
+						slab_id,
+						&old_l2_uri,
+						Some(old_bytes),
+						Some((&planned_uri, encrypted_bytes.len() as u64)),
+					)
+					.await?;
 					let new_uri = object_store.put(&key, &encrypted_bytes).await?;
+					if new_uri != planned_uri {
+						self.persist_ambiguous_upload_intent(
+							slab_id,
+							&new_uri,
+							encrypted_bytes.len() as u64,
+						)
+						.await?;
+						return Err(Error::new(
+							ErrorKind::InvalidData,
+							"object store returned a different upload URI",
+						));
+					}
+					#[cfg(test)]
+					self.table_drop_after_upload_pause_point().await;
 					let fetched = object_store.get(&new_uri).await?;
 					let fetched_hash = crate::hash::content::digest(&fetched);
 					if fetched_hash != payload_hash {
-						let _ = Self::delete_l2_object_if_present(object_store.as_ref(), &new_uri)
-							.await;
+						if let Err(cleanup_error) = self
+							.discard_unsubmitted_tier_candidate(
+								slab_id,
+								&new_uri,
+								object_store.as_ref(),
+							)
+							.await
+						{
+							tracing::warn!(error=%cleanup_error,"unsubmitted table-drop candidate awaits cleanup");
+						}
 						return Err(Error::new(
 							ErrorKind::InvalidData,
 							format!(
@@ -875,35 +2499,46 @@ impl SlabManager {
 						tombstone_metadata,
 						supersession_metadata,
 					};
+					// A lost response is not proof of a failed proposal. The durable
+					// unresolved intent keeps both objects, even across restart.
+					self.prepare_tier_candidate_proposal(slab_id, &new_uri)
+						.await?;
 					if let Err(error) = committer.commit_tier_slab(tier).await {
-						if !self
+						if crate::storage::sweeper::tier_proposal_not_submitted(&error) {
+							self.record_tier_candidate_not_submitted(
+								slab_id,
+								&new_uri,
+								encrypted_bytes.len() as u64,
+							)
+							.await?;
+							return Err(error);
+						}
+
+						if self
 							.tier_pointer(slab_id)
 							.await
-							.is_some_and(|pointer| pointer.l2_uri == new_uri)
+							.as_ref()
+							.map(|pointer| pointer.l2_uri.as_str())
+							!= Some(new_uri.as_str())
 						{
-							let _ =
-								Self::delete_l2_object_if_present(object_store.as_ref(), &new_uri)
-									.await;
+							self.persist_ambiguous_upload_intent(
+								slab_id,
+								&new_uri,
+								encrypted_bytes.len() as u64,
+							)
+							.await?;
 						}
 						return Err(error);
 					}
+					// The old object may still serve this node if it failed to publish
+					// the committed pointer: it is kept, and the refusal is typed.
+					self.refuse_proposal_over_unapplied_pointer(slab_id)?;
 					if old_l2_uri != new_uri {
-						if let Err(error) =
-							Self::delete_l2_object_if_present(object_store.as_ref(), &old_l2_uri)
-								.await
-						{
-							tracing::warn!(
-								slab_id = slab_id.get(),
-								l2_uri = %old_l2_uri,
-								error = %error,
-								"table drop tiered rewrite committed but old object cleanup failed"
-							);
-						} else {
-							self.clear_retired_tiered_cleanup(slab_id);
-						}
-					} else {
-						self.clear_retired_tiered_cleanup(slab_id);
+						Self::retain_superseded_l2_object(slab_id, &old_l2_uri, "tier rewrite")?;
 					}
+					self.record_cleanup_replacement_published(slab_id, &old_l2_uri, &new_uri)
+						.await?;
+					self.clear_retired_tiered_cleanup(slab_id);
 					report.compacted_slabs += 1;
 					report.reclaimed_records =
 						report.reclaimed_records.saturating_add(reclaimed_records);
@@ -912,22 +2547,15 @@ impl SlabManager {
 				PreparedTieredTableDropRewrite::Retire {
 					slab_id,
 					old_l2_uri,
+					old_bytes,
 					reclaimed_records,
 					reclaimed_bytes,
 				} => {
+					self.stage_table_drop_l2_cleanup(slab_id, &old_l2_uri, Some(old_bytes), None)
+						.await?;
 					committer.retire_tiered_slab(slab_id).await?;
-					if let Err(error) =
-						Self::delete_l2_object_if_present(object_store.as_ref(), &old_l2_uri).await
-					{
-						tracing::warn!(
-							slab_id = slab_id.get(),
-							l2_uri = %old_l2_uri,
-							error = %error,
-							"table drop tiered retirement committed but old object cleanup failed"
-						);
-					} else {
-						self.clear_retired_tiered_cleanup(slab_id);
-					}
+					Self::retain_superseded_l2_object(slab_id, &old_l2_uri, "tier retirement")?;
+					self.clear_retired_tiered_cleanup(slab_id);
 					report.compacted_slabs += 1;
 					report.reclaimed_records =
 						report.reclaimed_records.saturating_add(reclaimed_records);
@@ -936,6 +2564,15 @@ impl SlabManager {
 			}
 		}
 		Ok(report)
+	}
+
+	/// A proposer never plans from a generation the cluster has moved past, and
+	/// never deletes the object a node that failed to publish still serves.
+	fn refuse_proposal_over_unapplied_pointer(&self, slab_id: SlabId) -> std::io::Result<()> {
+		match self.unapplied_tier_pointer(slab_id) {
+			Some(_) => Err(stale_location_error(slab_id, StaleLocationReason::Fenced)),
+			None => Ok(()),
+		}
 	}
 
 	pub(super) fn table_drop_rewritten_key(&self, slab_id: SlabId) -> String {
@@ -969,7 +2606,7 @@ impl SlabManager {
 		);
 		state.active = next;
 		state.sealed.insert(sealed_id, sealed);
-		state.next_slab_id = next_id.saturating_add(1);
+		state.advance_slab_allocator(next_id.saturating_add(1));
 		self.record_l0_compaction_run(sealed_id, sealed_size);
 		Ok(Some(sealed_id))
 	}
@@ -1522,5 +3159,71 @@ impl SlabManager {
 			.intersection(&reclaimed_data_by_key)
 			.count();
 		stats
+	}
+}
+
+#[cfg(test)]
+mod cleanup_union_controls {
+	use super::*;
+
+	#[test]
+	fn unknown_sizes_are_counted_and_legacy_duplicates_are_not_double_counted() {
+		let slab = SlabId::new(12);
+		let mut union = CleanupIntentUnion::default();
+		union.snapshot.insert(
+			(slab, "old".into()),
+			RetainedObjectIntent {
+				bytes: None,
+				replacement_uri: None,
+				replacement_bytes: None,
+				published_replacements: Default::default(),
+				retirement_source: None,
+				state: RetainedObjectIntentState::Unresolved,
+			},
+		);
+		union.snapshot.insert(
+			(slab, "other".into()),
+			RetainedObjectIntent {
+				bytes: Some(7),
+				replacement_uri: None,
+				replacement_bytes: None,
+				published_replacements: Default::default(),
+				retirement_source: None,
+				state: RetainedObjectIntentState::Unresolved,
+			},
+		);
+		assert_eq!(union.totals(), (2, 7, 1));
+		union.legacy.insert(slab, ("old".into(), None, 100));
+		assert_eq!(union.totals(), (2, 107, 0));
+	}
+
+	#[test]
+	fn legacy_old_uri_dedup_keeps_legacy_combined_bytes() {
+		let slab = SlabId::new(11);
+		let mut union = CleanupIntentUnion::default();
+		union.legacy.insert(slab, ("old".into(), None, 100));
+		union.snapshot.insert(
+			(slab, "old".into()),
+			RetainedObjectIntent {
+				bytes: Some(200),
+				replacement_uri: None,
+				replacement_bytes: None,
+				published_replacements: Default::default(),
+				retirement_source: None,
+				state: RetainedObjectIntentState::Unresolved,
+			},
+		);
+		union.snapshot.insert(
+			(slab, "other".into()),
+			RetainedObjectIntent {
+				bytes: Some(7),
+				replacement_uri: None,
+				replacement_bytes: None,
+				published_replacements: Default::default(),
+				retirement_source: None,
+				state: RetainedObjectIntentState::Unresolved,
+			},
+		);
+		assert_eq!(union.totals(), (2, 107, 0));
 	}
 }

@@ -182,7 +182,7 @@ async fn ctr4_orphan_live_value_never_becomes_base() {
 		}))
 	);
 	assert_eq!(leader.read(&key).await, Ok(Some(3)));
-	let raw = f.slab.counter_lookup(tenant(7), id).unwrap();
+	let raw = f.slab.counter_lookup(tenant(7), id).unwrap().unwrap();
 	assert_eq!(
 		f.slab.counter_read_value(raw).await.unwrap(),
 		99,
@@ -293,7 +293,7 @@ async fn ctr4_local_reopen_rebuilds_marked_and_pending_witness_winner() {
 	assert_eq!(leader.pending_witnesses(), 1);
 	assert_eq!(
 		f.slab
-			.counter_read_value(f.slab.counter_lookup(tenant(7), id).unwrap())
+			.counter_read_value(f.slab.counter_lookup(tenant(7), id).unwrap().unwrap())
 			.await
 			.unwrap(),
 		10,
@@ -475,7 +475,7 @@ fn ctr4_origin_record_bytes_and_independent_goldens() {
 	}
 }
 #[tokio::test]
-async fn ctr4_mixed_legacy_origin_records_pair_and_reopen() {
+async fn old_counter_frames_mixed_with_current_frames_refuse_reopen() {
 	let dir = TestDir::new("ctr4-mixed");
 	let path = dir.join("mixed.slab");
 	let s = local(&path).await;
@@ -553,38 +553,73 @@ async fn ctr4_mixed_legacy_origin_records_pair_and_reopen() {
 	.unwrap();
 	s.fsync().await.unwrap();
 	drop(s);
+	let before = std::fs::read(&path).unwrap();
+	let result = LocalSlabStore::open(
+		&path,
+		crate::schema::SlabId::ZERO,
+		Arc::new(BlockingFileOps),
+		GroupCommitConfig::default(),
+	)
+	.await;
+	match result {
+		Ok(_) => panic!("a slab containing obsolete counter frames reopened"),
+		Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::Unsupported),
+	}
+	assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+#[tokio::test]
+async fn current_counter_frames_keep_origin_validation_and_orphan_marker_refusal() {
+	let dir = TestDir::new("current-counter-origin-validation");
+	let path = dir.join("current.slab");
 	let s = local(&path).await;
-	assert_eq!(s.recovered_counter_versions.len(), 2);
-	assert!(s.recovered_counter_versions.contains(&(
-		tenant(7),
-		old,
-		CounterVersion {
-			value: 11,
-			hlc: hlc(1),
-			origin: None
-		}
-	)));
-	assert!(s.recovered_counter_versions.contains(&(
-		tenant(7),
-		new,
-		CounterVersion {
-			value: 22,
-			hlc: hlc(2),
-			origin: Some(node(2))
-		}
-	)));
-	assert_eq!(s.recovered_counter_errors.len(), 3);
-	assert!(
-		s.recovered_counter_errors
-			.iter()
-			.all(|(_, _, e)| *e == CounterVisibilityError::Conflict)
+	let key = identity(b"current");
+	let good = s
+		.counter_tentative(tenant(7), key, hlc(2), 22, node(2))
+		.await
+		.unwrap();
+	s.counter_commit_marker(tenant(7), key, hlc(2), good.offset, node(2))
+		.await
+		.unwrap();
+	let bad_key = identity(b"wrong-origin");
+	let bad = s
+		.counter_tentative(tenant(7), bad_key, hlc(3), 33, node(1))
+		.await
+		.unwrap();
+	s.counter_commit_marker(tenant(7), bad_key, hlc(3), bad.offset, node(2))
+		.await
+		.unwrap();
+	let orphan = CounterKey(b"standalone-orphan-marker".to_vec());
+	s.counter_commit_marker(tenant(7), counter_identity(&orphan), hlc(4), 0, node(3))
+		.await
+		.unwrap();
+	s.fsync().await.unwrap();
+	drop(s);
+	let s = local(&path).await;
+	assert_eq!(
+		s.recovered_counter_versions,
+		vec![(
+			tenant(7),
+			key,
+			CounterVersion {
+				value: 22,
+				hlc: hlc(2),
+				origin: Some(node(2))
+			}
+		)]
 	);
-	let standalone = SlabCounterStore::new(s.clone(), tenant(7), node(3));
+	assert_eq!(s.recovered_counter_errors.len(), 1);
+	assert_eq!(
+		s.recovered_counter_errors[0].2,
+		CounterVisibilityError::Conflict
+	);
+	let standalone = SlabCounterStore::new(s, tenant(7), node(3));
 	assert!(
-		standalone.read_committed(&standalone_orphan).await.is_err(),
-		"a standalone slab has no cross-slab join to resolve an orphan marker"
+		standalone.read_committed(&orphan).await.is_err(),
+		"an orphan marker cannot become a committed value"
 	);
 }
+
 #[test]
 fn ctr4_origin_witness_legacy_decode_and_versioned_roundtrip() {
 	let dir = TestDir::new("ctr4-witness-codecs");

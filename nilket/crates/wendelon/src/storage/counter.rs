@@ -355,7 +355,7 @@ pub trait CounterSlab {
 		&self,
 		_tenant_id: TenantId,
 		_key_identity: Identity,
-		_hlc: HybridTimestamp,
+		_location: RecordLocation,
 		_origin: NodeId,
 	) {
 	}
@@ -366,10 +366,13 @@ pub trait CounterSlab {
 		tenant_id: TenantId,
 		key_identity: Identity,
 		location: RecordLocation,
-	);
+	) -> impl std::future::Future<Output = std::io::Result<()>> + Send;
 	/// Latest indexed version for the counter key.
-	fn counter_lookup(&self, tenant_id: TenantId, key_identity: Identity)
-	-> Option<RecordLocation>;
+	fn counter_lookup(
+		&self,
+		tenant_id: TenantId,
+		key_identity: Identity,
+	) -> std::io::Result<Option<RecordLocation>>;
 	/// A standalone slab has no manager-wide join to resolve leftover markers.
 	/// Manager-backed stores resolve these during recovery and use the default.
 	fn counter_recovery_error(
@@ -483,19 +486,20 @@ impl CounterSlab for LocalSlabStore {
 		self.wait_durable_commit().await?;
 		Ok(())
 	}
-	fn counter_unindex(
+	async fn counter_unindex(
 		&self,
 		tenant_id: TenantId,
 		key_identity: Identity,
 		location: RecordLocation,
-	) {
+	) -> std::io::Result<()> {
 		self.rollback_index_entry(tenant_id, key_identity, location);
+		Ok(())
 	}
 	fn counter_lookup(
 		&self,
 		tenant_id: TenantId,
 		key_identity: Identity,
-	) -> Option<RecordLocation> {
+	) -> std::io::Result<Option<RecordLocation>> {
 		self.lookup(tenant_id, key_identity)
 	}
 	fn counter_recovery_error(
@@ -547,30 +551,31 @@ impl CounterSlab for crate::storage::manager::SlabManager {
 		&self,
 		tenant_id: TenantId,
 		key_identity: Identity,
-		hlc: HybridTimestamp,
+		location: RecordLocation,
 		origin: NodeId,
 	) {
 		crate::storage::manager::SlabManager::counter_commit_published(
 			self,
 			tenant_id,
 			key_identity,
-			hlc,
+			location,
 			origin,
 		);
 	}
-	fn counter_unindex(
+	async fn counter_unindex(
 		&self,
 		tenant_id: TenantId,
 		key_identity: Identity,
 		location: RecordLocation,
-	) {
-		self.counter_unindex_tentative(tenant_id, key_identity, location);
+	) -> std::io::Result<()> {
+		self.counter_unindex_tentative(tenant_id, key_identity, location)
+			.await
 	}
 	fn counter_lookup(
 		&self,
 		tenant_id: TenantId,
 		key_identity: Identity,
-	) -> Option<RecordLocation> {
+	) -> std::io::Result<Option<RecordLocation>> {
 		self.lookup(tenant_id, key_identity)
 	}
 	async fn counter_read_value(&self, location: RecordLocation) -> std::io::Result<u64> {
@@ -609,7 +614,7 @@ impl<S: CounterSlab> SlabCounterStore<S> {
 		if let Some(error) = self.slab.counter_recovery_error(self.tenant_id, identity) {
 			return Err(error);
 		}
-		let Some(location) = self.slab.counter_lookup(self.tenant_id, identity) else {
+		let Some(location) = self.slab.counter_lookup(self.tenant_id, identity)? else {
 			return Ok(None);
 		};
 		Ok(Some(self.slab.counter_read_value(location).await?))
@@ -666,21 +671,18 @@ impl<S: CounterSlab> SlabCounterStore<S> {
 				self.origin,
 			)
 			.await?;
-		self.slab.counter_commit_published(
-			self.tenant_id,
-			t.key_identity,
-			t.location.hlc,
-			self.origin,
-		);
+		self.slab
+			.counter_commit_published(self.tenant_id, t.key_identity, t.location, self.origin);
 		Ok(())
 	}
 
 	/// Roll back a tentative: remove the live index entry only. No durable abort
 	/// marker is written — the durable tentative frame is left an orphan that
 	/// `recover_slab` skips (it has no commit marker).
-	pub fn rollback_tentative(&self, t: SlabTentative) {
+	pub async fn rollback_tentative(&self, t: SlabTentative) -> std::io::Result<()> {
 		self.slab
-			.counter_unindex(self.tenant_id, t.key_identity, t.location);
+			.counter_unindex(self.tenant_id, t.key_identity, t.location)
+			.await
 	}
 
 	#[cfg(test)]
@@ -773,6 +775,8 @@ impl<S: CounterSlab> CounterReplica<S> {
 	/// committed or rolled back). Retryable: on marker-write failure the pending
 	/// entry is KEPT so the leader's reconciler can re-drive the commit.
 	pub async fn commit(&self, op_id: u64) -> std::io::Result<()> {
+		let gate = self.op_locks.entry(op_id).or_default().clone();
+		let _guard = gate.lock().await;
 		let tentative = match self.pending.get(&op_id) {
 			Some(entry) => *entry.value(),
 			None => return Ok(()),
@@ -786,11 +790,15 @@ impl<S: CounterSlab> CounterReplica<S> {
 	/// `COUNTER_ROLLBACK_REQ`: remove the tentative's live index state. No
 	/// durable abort marker — the orphan tentative frame is skipped by recovery.
 	/// No-op if `op_id` is unknown.
-	pub fn rollback(&self, op_id: u64) {
-		if let Some((_, tentative)) = self.pending.remove(&op_id) {
-			self.store.rollback_tentative(tentative);
+	pub async fn rollback(&self, op_id: u64) -> std::io::Result<()> {
+		let gate = self.op_locks.entry(op_id).or_default().clone();
+		let _guard = gate.lock().await;
+		if let Some(tentative) = self.pending.get(&op_id).map(|entry| *entry.value()) {
+			self.store.rollback_tentative(tentative).await?;
+			self.pending.remove(&op_id);
 		}
 		self.op_locks.remove(&op_id);
+		Ok(())
 	}
 
 	/// Point read of the committed counter on this replica.
@@ -893,13 +901,13 @@ struct ReplicaGateEntry {
 	participants: usize,
 }
 
-pub(crate) struct ReplicaGate<'a> {
-	service: &'a CounterReplicaService,
+pub(crate) struct ReplicaGate {
+	service: CounterReplicaService,
 	key: ReplicaOpKey2,
 	identity: std::sync::Weak<Mutex<()>>,
 	guard: Option<tokio::sync::OwnedMutexGuard<()>>,
 }
-impl<'a> ReplicaGate<'a> {
+impl ReplicaGate {
 	/// Count actual reserved operations without retaining a shard across a yield.
 	#[cfg(test)]
 	pub(crate) fn participant_count(&self) -> usize {
@@ -915,7 +923,7 @@ impl<'a> ReplicaGate<'a> {
 		entry.participants
 	}
 
-	async fn admit(service: &'a CounterReplicaService, key: ReplicaOpKey2) -> Self {
+	async fn admit(service: &CounterReplicaService, key: ReplicaOpKey2) -> Self {
 		let mutex = {
 			let mut entry = service
 				.op_locks
@@ -932,7 +940,7 @@ impl<'a> ReplicaGate<'a> {
 		};
 		// The ticket exists before awaiting: cancellation retires its reservation.
 		let mut ticket = Self {
-			service,
+			service: service.clone(),
 			key,
 			identity: Arc::downgrade(&mutex),
 			guard: None,
@@ -941,7 +949,7 @@ impl<'a> ReplicaGate<'a> {
 		ticket
 	}
 }
-impl Drop for ReplicaGate<'_> {
+impl Drop for ReplicaGate {
 	fn drop(&mut self) {
 		// Keep this admission counted while unlock can synchronously finish a waiter.
 		// Neither map may be borrowed across this reentrant callback.
@@ -969,19 +977,24 @@ impl Drop for ReplicaGate<'_> {
 }
 
 /// The server-side counter replica over a [`SlabManager`].
+#[derive(Clone)]
 pub struct CounterReplicaService {
 	slab: Arc<crate::storage::manager::SlabManager>,
 	marked: Arc<EligibleCells<(TenantId, Identity)>>,
-	pending: DashMap<ReplicaOpKey2, PendingReplicaTentative>,
-	op_locks: DashMap<ReplicaOpKey2, ReplicaGateEntry>,
+	runtime: tokio::runtime::Handle,
+	pending: Arc<DashMap<ReplicaOpKey2, PendingReplicaTentative>>,
+	op_locks: Arc<DashMap<ReplicaOpKey2, ReplicaGateEntry>>,
+	rollback_in_progress: Arc<DashMap<ReplicaOpKey2, ()>>,
 }
 impl CounterReplicaService {
 	pub fn new(slab: Arc<crate::storage::manager::SlabManager>) -> Self {
 		Self {
 			marked: slab.counter_eligible_cells(),
+			runtime: tokio::runtime::Handle::current(),
 			slab,
-			pending: DashMap::new(),
-			op_locks: DashMap::new(),
+			pending: Arc::new(DashMap::new()),
+			op_locks: Arc::new(DashMap::new()),
+			rollback_in_progress: Arc::new(DashMap::new()),
 		}
 	}
 	/// Append one tentative; matching retries are idempotent only while pending exists.
@@ -1005,6 +1018,12 @@ impl CounterReplicaService {
 			return Err(CounterReplicaRejection::TentativeConflict.into_error());
 		}
 		let _gate = ReplicaGate::admit(self, key).await;
+		if self.rollback_in_progress.contains_key(&key) {
+			return Err(std::io::Error::new(
+				std::io::ErrorKind::WouldBlock,
+				"counter rollback requires retry",
+			));
+		}
 		if let Some(pending) = self.pending.get(&key).map(|entry| *entry.value()) {
 			return if (pending.key_identity, pending.value, pending.location.hlc)
 				== (key_identity, value, commit_hlc)
@@ -1058,6 +1077,12 @@ impl CounterReplicaService {
 		let key = ReplicaOpKey2::new(origin, tenant_id, op_id)?;
 		check_expected_key2(expected_key)?;
 		let _gate = ReplicaGate::admit(self, key).await;
+		if self.rollback_in_progress.contains_key(&key) {
+			return Err(std::io::Error::new(
+				std::io::ErrorKind::WouldBlock,
+				"counter rollback requires retry",
+			));
+		}
 		let Some(pending) = self.pending.get(&key).map(|entry| *entry.value()) else {
 			let commit_hlc = HybridTimestamp {
 				physical_ms: op_id,
@@ -1101,7 +1126,7 @@ impl CounterReplicaService {
 		self.slab.counter_commit_published(
 			pending.tenant_id,
 			pending.key_identity,
-			pending.location.hlc,
+			pending.location,
 			origin,
 		);
 		self.pending.remove(&key);
@@ -1117,20 +1142,35 @@ impl CounterReplicaService {
 	) -> std::io::Result<()> {
 		let key = ReplicaOpKey2::new(origin, tenant_id, op_id)?;
 		check_expected_key2(expected_key)?;
-		let _gate = ReplicaGate::admit(self, key).await;
+		let gate = ReplicaGate::admit(self, key).await;
 		let Some(pending) = self.pending.get(&key).map(|entry| *entry.value()) else {
+			self.rollback_in_progress.remove(&key);
 			return Ok(());
 		};
 		if pending.tenant_id != tenant_id || pending.key_identity != expected_key {
 			return Err(CounterReplicaRejection::TentativeConflict.into_error());
 		}
-		self.pending.remove(&key);
-		self.slab.counter_unindex_tentative(
-			pending.tenant_id,
-			pending.key_identity,
-			pending.location,
-		);
-		Ok(())
+		self.rollback_in_progress.insert(key, ());
+		let service = self.clone();
+		self.runtime
+			.spawn(async move {
+				let _gate = gate;
+				service
+					.slab
+					.counter_unindex_tentative(
+						pending.tenant_id,
+						pending.key_identity,
+						pending.location,
+					)
+					.await?;
+				service.pending.remove(&key);
+				service.rollback_in_progress.remove(&key);
+				Ok(())
+			})
+			.await
+			.map_err(|error| {
+				std::io::Error::other(format!("counter rollback job failed: {error}"))
+			})?
 	}
 	/// Only marker-eligible values; raw tentative lookup remains a distinct storage API.
 	pub async fn read_committed(
@@ -1166,9 +1206,22 @@ impl CounterReplicaService {
 		origin: NodeId,
 		tenant: TenantId,
 		op: u64,
-	) -> ReplicaGate<'_> {
+	) -> ReplicaGate {
 		let key = ReplicaOpKey2::new(origin, tenant, op).expect("fixture scope");
 		ReplicaGate::admit(self, key).await
+	}
+	#[cfg(test)]
+	pub(crate) fn ctr4_operation_state(
+		&self,
+		origin: NodeId,
+		tenant: TenantId,
+		op: u64,
+	) -> (usize, bool) {
+		let key = ReplicaOpKey2::new(origin, tenant, op).unwrap();
+		self.op_locks
+			.get(&key)
+			.map(|entry| (entry.participants, entry.mutex.try_lock().is_err()))
+			.unwrap_or((0, false))
 	}
 	#[cfg(test)]
 	pub(crate) fn pending_count(&self) -> usize {
@@ -3460,11 +3513,11 @@ mod slab_store_tests {
 				let local = SlabCounterStore::new(store.clone(), tenant, origin);
 				assert!(local.tentative_append(&key, 42, h(902)).await.is_err());
 			}
-			assert_eq!(store.counter_lookup(tenant, identity), None);
+			assert_eq!(store.counter_lookup(tenant, identity).unwrap(), None);
 			drop(store);
 			ops.crash().unwrap();
 			let reopened = open_store_with_ops(&path, ops).await;
-			assert_eq!(reopened.counter_lookup(tenant, identity), None);
+			assert_eq!(reopened.counter_lookup(tenant, identity).unwrap(), None);
 			assert!(reopened.recovered_counter_tentatives_v2.is_empty());
 		}
 	}
@@ -3548,7 +3601,7 @@ mod slab_store_tests {
 				"tentative is visible in the live index"
 			);
 			// ...then rolled back: live index state removed only, committed 3 intact.
-			counter.rollback_tentative(t2);
+			counter.rollback_tentative(t2).await.unwrap();
 			assert_eq!(
 				counter.read_committed(&k).await.unwrap(),
 				Some(3),
@@ -3603,7 +3656,7 @@ mod slab_store_tests {
 			// rolling the tentative back (no marker was written, so recovery skips
 			// the orphan). (A post-quorum caller would instead leave it for the
 			// reconciler — see the leader's drive_commits.)
-			counter.rollback_tentative(t2);
+			counter.rollback_tentative(t2).await.unwrap();
 			assert_eq!(
 				counter.read_committed(&k).await.unwrap(),
 				Some(3),
@@ -3681,6 +3734,7 @@ mod slab_store_tests {
 		let store = open_store(&path).await;
 		let recovered = store
 			.lookup(tenant(), blob_id)
+			.unwrap()
 			.expect("blob must be re-indexed");
 		assert_eq!(store.read(recovered).await.unwrap(), blob_bytes);
 		let counter = SlabCounterStore::new(
@@ -3803,20 +3857,21 @@ mod replica_tests {
 				.counter_commit_marker(tenant_id, key_identity, hlc, tentative_op_id, origin)
 				.await
 		}
-		fn counter_unindex(
+		async fn counter_unindex(
 			&self,
 			tenant_id: TenantId,
 			key_identity: Identity,
 			location: RecordLocation,
-		) {
+		) -> std::io::Result<()> {
 			self.inner
 				.counter_unindex(tenant_id, key_identity, location)
+				.await
 		}
 		fn counter_lookup(
 			&self,
 			tenant_id: TenantId,
 			key_identity: Identity,
-		) -> Option<RecordLocation> {
+		) -> std::io::Result<Option<RecordLocation>> {
 			self.inner.counter_lookup(tenant_id, key_identity)
 		}
 		async fn counter_read_value(&self, location: RecordLocation) -> std::io::Result<u64> {
@@ -3907,7 +3962,7 @@ mod replica_tests {
 		let r = replica(store);
 		r.replicate_tentative(1, &k, 5, h(5)).await.unwrap();
 		assert_eq!(r.read_committed(&k).await.unwrap(), Some(5));
-		r.rollback(1);
+		r.rollback(1).await.unwrap();
 		assert_eq!(
 			r.read_committed(&k).await.unwrap(),
 			None,
@@ -3930,7 +3985,7 @@ mod replica_tests {
 			r.commit(1).await.unwrap(); // committed -> 3
 			r.replicate_tentative(2, &k, 99, h(99)).await.unwrap();
 			assert_eq!(r.read_committed(&k).await.unwrap(), Some(99));
-			r.rollback(2);
+			r.rollback(2).await.unwrap();
 			assert_eq!(r.read_committed(&k).await.unwrap(), Some(3));
 			store.fsync().await.unwrap();
 		}
@@ -4224,7 +4279,7 @@ mod leader_tests {
 			if self.leader_crashed() {
 				return;
 			}
-			self.replica.rollback(op_id);
+			let _ = self.replica.rollback(op_id).await;
 		}
 		fn eligibility_status(&self, _identity: Identity) -> Result<(), CounterVisibilityError> {
 			Ok(())
@@ -4235,7 +4290,7 @@ mod leader_tests {
 		) -> Result<Option<CounterVersion>, ParticipantError> {
 			// Historical local-slab harness: raw substrate visibility remains unchanged.
 			let slab = &self.replica.store.slab;
-			let Some(location) = slab.counter_lookup(TenantId::new(7), identity) else {
+			let Some(location) = slab.counter_lookup(TenantId::new(7), identity).unwrap() else {
 				return Ok(None);
 			};
 			let value = slab
@@ -5196,6 +5251,7 @@ mod leader_tests {
 			assert_eq!(leader.pending_witnesses(), 0, "clean restart: no pending");
 			hlc_before = store
 				.counter_lookup(TenantId::new(7), identity)
+				.unwrap()
 				.expect("committed version is indexed")
 				.hlc;
 			store.fsync().await.unwrap();
@@ -5219,6 +5275,7 @@ mod leader_tests {
 		);
 		let hlc_after = store2
 			.counter_lookup(TenantId::new(7), identity)
+			.unwrap()
 			.expect("the fresh add's version is indexed")
 			.hlc;
 		assert!(

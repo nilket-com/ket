@@ -6,7 +6,7 @@ use crate::storage::file_ops::{DirectoryEntry, FileHandle};
 use crate::storage::io_uring::AlignedBuf;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize};
 use std::task::Poll;
 use tokio::sync::Notify;
 
@@ -21,7 +21,9 @@ struct ParkFirstSidecarTmpOpen {
 	// independently of filesystem executor scheduling.
 	synchronous_boundaries: bool,
 	park_unlink: AtomicBool,
+	deny_final_unlink: AtomicBool,
 	staging_started: AtomicUsize,
+	tmp_fd: AtomicI32,
 	unlinks_started: AtomicUsize,
 }
 
@@ -36,12 +38,27 @@ impl ParkFirstSidecarTmpOpen {
 
 #[async_trait::async_trait]
 impl AsyncFileOps for ParkFirstSidecarTmpOpen {
+	fn bind_directory_owner(
+		self: Arc<Self>,
+		owner: DataDirectoryOwner,
+	) -> std::io::Result<Arc<dyn AsyncFileOps>> {
+		// Validate the underlying implementation supports the same owner; the
+		// fixture installs an already owner-bound delegate before opening.
+		self.inner.clone().bind_directory_owner(owner)?;
+		Ok(self)
+	}
+
+	fn write_permit(&self) -> std::io::Result<Option<crate::storage::ownership::WritePermit>> {
+		self.inner.write_permit()
+	}
+
 	async fn open(&self, path: &Path, flags: OpenFlags) -> std::io::Result<FileHandle> {
-		if Self::is_sidecar_tmp(path) && self.armed.swap(false, Ordering::AcqRel) {
-			self.parked.notify_one();
-			self.release.notified().await;
+		let handle = self.inner.open(path, flags).await?;
+		if Self::is_sidecar_tmp(path) {
+			self.staging_started.fetch_add(1, Ordering::AcqRel);
+			self.tmp_fd.store(handle.raw_fd(), Ordering::Release);
 		}
-		self.inner.open(path, flags).await
+		Ok(handle)
 	}
 	async fn read_plain_at(
 		&self,
@@ -76,7 +93,14 @@ impl AsyncFileOps for ParkFirstSidecarTmpOpen {
 		self.inner.write_at(handle, offset, buf).await
 	}
 	async fn fsync(&self, handle: &FileHandle) -> std::io::Result<()> {
-		self.inner.fsync(handle).await
+		self.inner.fsync(handle).await?;
+		if self.tmp_fd.load(Ordering::Acquire) == handle.raw_fd()
+			&& self.armed.swap(false, Ordering::AcqRel)
+		{
+			self.parked.notify_one();
+			self.release.notified().await;
+		}
+		Ok(())
 	}
 	async fn fdatasync(&self, handle: &FileHandle) -> std::io::Result<()> {
 		self.inner.fdatasync(handle).await
@@ -86,7 +110,6 @@ impl AsyncFileOps for ParkFirstSidecarTmpOpen {
 	}
 	async fn write_all(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 		if Self::is_sidecar_tmp(path) {
-			self.staging_started.fetch_add(1, Ordering::AcqRel);
 			if self.synchronous_boundaries {
 				return std::fs::write(path, bytes);
 			}
@@ -118,6 +141,17 @@ impl AsyncFileOps for ParkFirstSidecarTmpOpen {
 		self.inner.link_no_replace(from, to).await
 	}
 	async fn unlink(&self, path: &Path) -> std::io::Result<()> {
+		if !Self::is_sidecar_tmp(path)
+			&& path
+				.components()
+				.any(|part| part.as_os_str() == "secondary_index")
+			&& self.deny_final_unlink.swap(false, Ordering::AcqRel)
+		{
+			return Err(Error::new(
+				ErrorKind::PermissionDenied,
+				"injected final unlink refusal",
+			));
+		}
 		if self.synchronous_boundaries {
 			self.unlinks_started.fetch_add(1, Ordering::AcqRel);
 			if self.park_unlink.swap(false, Ordering::AcqRel) {
@@ -153,21 +187,20 @@ fn segment_with_key(source_slab_id: SlabId, key: i64) -> SecondaryIndexSegment {
 #[tokio::test]
 async fn concurrent_persists_of_one_sidecar_neither_fail_nor_clobber() {
 	let dir = fresh_dir("secondary-index-concurrent-persist");
-	let io = spawn_io_thread(64).unwrap();
-	let mut manager = open_manager_at_dir(dir.to_path_buf(), io, test_crypto()).await;
 	let gate = Arc::new(ParkFirstSidecarTmpOpen {
-		inner: Arc::clone(&manager.file_ops),
-		armed: AtomicBool::new(true),
+		inner: Arc::new(BlockingFileOps),
+		armed: AtomicBool::new(false),
 		parked: Notify::new(),
 		release: Notify::new(),
 		synchronous_boundaries: false,
 		park_unlink: AtomicBool::new(false),
+		deny_final_unlink: AtomicBool::new(false),
 		staging_started: AtomicUsize::new(0),
+		tmp_fd: AtomicI32::new(-1),
 		unlinks_started: AtomicUsize::new(0),
 	});
-	Arc::get_mut(&mut manager)
-		.expect("the fresh manager is not shared")
-		.file_ops = gate.clone();
+	let manager = open_fresh_sidecar_manager_with_ops(&dir, gate.clone()).await;
+	gate.armed.store(true, Ordering::Release);
 
 	let slab = SlabId::new(77);
 	let first = {
@@ -202,7 +235,7 @@ async fn concurrent_persists_of_one_sidecar_neither_fail_nor_clobber() {
 	let second = second.await.unwrap();
 	let first = first.expect("the first persist must not fail");
 	let second = second.expect("the second persist must not fail");
-	assert_eq!(first.segment_path, second.segment_path);
+	assert_ne!(first.segment_path, second.segment_path);
 
 	let listed = manager.list_secondary_index_segments(
 		first.tenant_id,
@@ -331,148 +364,133 @@ async fn assert_sidecar_state_inner(
 	}
 }
 
-/// Single-poll controls use immediate filesystem boundaries and no optional redb
-/// catalog, so unrelated executor scheduling cannot masquerade as the stripe.
-/// Repeat with real redb enabled to check durable and in-memory end states too.
+/// A real redb catalog and a parked filesystem boundary show that publication
+/// and deletion serialize for both retirement and ordinary deletion.
 #[tokio::test]
 async fn delete_and_retire_wait_for_same_path_publication() {
 	for retire in [false, true] {
-		for durable in [false, true] {
-			let dir = fresh_dir("sidecar-publish-before-delete");
-			let mut manager = open_manager_at_dir(
-				dir.to_path_buf(),
-				spawn_io_thread(64).unwrap(),
-				test_crypto(),
-			)
-			.await;
-			if !durable {
-				Arc::get_mut(&mut manager).unwrap().persistent_index = None;
-			}
-			let original = manager
-				.persist_secondary_index_segment(&segment_with_key(SlabId::new(81), 1))
-				.await
-				.unwrap();
-			let gate = Arc::new(ParkFirstSidecarTmpOpen {
-				inner: Arc::clone(&manager.file_ops),
-				armed: AtomicBool::new(true),
-				parked: Notify::new(),
-				release: Notify::new(),
-				synchronous_boundaries: true,
-				park_unlink: AtomicBool::new(false),
-				staging_started: AtomicUsize::new(0),
-				unlinks_started: AtomicUsize::new(0),
-			});
-			Arc::get_mut(&mut manager).unwrap().file_ops = gate.clone();
-			let publisher = {
-				let manager = Arc::clone(&manager);
-				tokio::spawn(async move {
-					manager
-						.persist_secondary_index_segment(&segment_with_key(SlabId::new(81), 2))
-						.await
-				})
-			};
-			tokio::time::timeout(Duration::from_secs(60), gate.parked.notified())
-				.await
-				.unwrap();
-			let deletion = remove_sidecar(&manager, &original, retire);
-			tokio::pin!(deletion);
-			poll_pending_once(deletion.as_mut()).await;
-			assert_eq!(gate.unlinks_started.load(Ordering::Acquire), 0);
-			assert_sidecar_state_while_writer_is_parked(&manager, &original).await;
-			gate.release.notify_one();
-			let replacement = tokio::time::timeout(Duration::from_secs(60), publisher)
-				.await
-				.unwrap()
-				.unwrap()
-				.unwrap();
-			assert!(
-				tokio::time::timeout(Duration::from_secs(60), deletion)
+		let dir = fresh_dir("sidecar-publish-before-delete");
+		let gate = Arc::new(ParkFirstSidecarTmpOpen {
+			inner: Arc::new(BlockingFileOps),
+			armed: AtomicBool::new(false),
+			parked: Notify::new(),
+			release: Notify::new(),
+			synchronous_boundaries: true,
+			park_unlink: AtomicBool::new(false),
+			deny_final_unlink: AtomicBool::new(false),
+			staging_started: AtomicUsize::new(0),
+			tmp_fd: AtomicI32::new(-1),
+			unlinks_started: AtomicUsize::new(0),
+		});
+		let manager = open_fresh_sidecar_manager_with_ops(&dir, gate.clone()).await;
+		let original = manager
+			.persist_secondary_index_segment(&segment_with_key(SlabId::new(81), 1))
+			.await
+			.unwrap();
+		gate.unlinks_started.store(0, Ordering::Release);
+		gate.armed.store(true, Ordering::Release);
+		let publisher = {
+			let manager = Arc::clone(&manager);
+			tokio::spawn(async move {
+				manager
+					.persist_secondary_index_segment(&segment_with_key(SlabId::new(81), 2))
 					.await
-					.unwrap()
-					.unwrap()
-			);
-			assert_sidecar_state(&manager, &replacement, false).await;
-		}
+			})
+		};
+		tokio::time::timeout(Duration::from_secs(60), gate.parked.notified())
+			.await
+			.unwrap();
+		let deletion = remove_sidecar(&manager, &original, retire);
+		tokio::pin!(deletion);
+		poll_pending_once(deletion.as_mut()).await;
+		assert_eq!(gate.unlinks_started.load(Ordering::Acquire), 0);
+		assert_sidecar_state_while_writer_is_parked(&manager, &original).await;
+		gate.release.notify_one();
+		let replacement = tokio::time::timeout(Duration::from_secs(60), publisher)
+			.await
+			.unwrap()
+			.unwrap()
+			.unwrap();
+		assert!(
+			tokio::time::timeout(Duration::from_secs(60), deletion)
+				.await
+				.unwrap()
+				.unwrap()
+		);
+		assert_sidecar_state(&manager, &replacement, false).await;
 	}
 }
 
 #[tokio::test]
 async fn publication_waits_for_same_path_delete_and_retire() {
 	for retire in [false, true] {
-		for durable in [false, true] {
-			let dir = fresh_dir("sidecar-delete-before-publish");
-			let mut manager = open_manager_at_dir(
-				dir.to_path_buf(),
-				spawn_io_thread(64).unwrap(),
-				test_crypto(),
-			)
-			.await;
-			if !durable {
-				Arc::get_mut(&mut manager).unwrap().persistent_index = None;
-			}
-			let original = manager
-				.persist_secondary_index_segment(&segment_with_key(SlabId::new(82), 1))
-				.await
-				.unwrap();
-			let gate = Arc::new(ParkFirstSidecarTmpOpen {
-				inner: Arc::clone(&manager.file_ops),
-				armed: AtomicBool::new(false),
-				parked: Notify::new(),
-				release: Notify::new(),
-				synchronous_boundaries: true,
-				park_unlink: AtomicBool::new(true),
-				staging_started: AtomicUsize::new(0),
-				unlinks_started: AtomicUsize::new(0),
-			});
-			Arc::get_mut(&mut manager).unwrap().file_ops = gate.clone();
-			let deletion = {
-				let manager = Arc::clone(&manager);
-				let original = original.clone();
-				tokio::spawn(async move { remove_sidecar(&manager, &original, retire).await })
-			};
-			tokio::time::timeout(Duration::from_secs(60), gate.parked.notified())
-				.await
-				.unwrap();
-			if let Some(index) = &manager.persistent_index {
-				assert!(
-					index
-						.load_snapshot()
-						.await
-						.unwrap()
-						.secondary_index_segments
-						.is_empty()
-				);
-			}
-			let replacement_segment = segment_with_key(SlabId::new(82), 2);
-			let publication = manager.persist_secondary_index_segment(&replacement_segment);
-			tokio::pin!(publication);
-			poll_pending_once(publication.as_mut()).await;
-			assert_eq!(
-				gate.staging_started.load(Ordering::Acquire),
-				0,
-				"publication must not stage during deletion"
-			);
-			gate.release.notify_one();
+		let dir = fresh_dir("sidecar-delete-before-publish");
+		let gate = Arc::new(ParkFirstSidecarTmpOpen {
+			inner: Arc::new(BlockingFileOps),
+			armed: AtomicBool::new(false),
+			parked: Notify::new(),
+			release: Notify::new(),
+			synchronous_boundaries: true,
+			park_unlink: AtomicBool::new(false),
+			deny_final_unlink: AtomicBool::new(false),
+			staging_started: AtomicUsize::new(0),
+			tmp_fd: AtomicI32::new(-1),
+			unlinks_started: AtomicUsize::new(0),
+		});
+		let manager = open_fresh_sidecar_manager_with_ops(&dir, gate.clone()).await;
+		let original = manager
+			.persist_secondary_index_segment(&segment_with_key(SlabId::new(82), 1))
+			.await
+			.unwrap();
+		gate.staging_started.store(0, Ordering::Release);
+		gate.park_unlink.store(true, Ordering::Release);
+		let deletion = {
+			let manager = Arc::clone(&manager);
+			let original = original.clone();
+			tokio::spawn(async move { remove_sidecar(&manager, &original, retire).await })
+		};
+		tokio::time::timeout(Duration::from_secs(60), gate.parked.notified())
+			.await
+			.unwrap();
+		if let Some(index) = &manager.persistent_index {
 			assert!(
-				tokio::time::timeout(Duration::from_secs(60), deletion)
+				index
+					.load_snapshot()
 					.await
 					.unwrap()
-					.unwrap()
-					.unwrap()
+					.secondary_index_segments
+					.is_empty()
 			);
-			let replacement = tokio::time::timeout(Duration::from_secs(60), publication)
+		}
+		let replacement_segment = segment_with_key(SlabId::new(82), 2);
+		let publication = manager.persist_secondary_index_segment(&replacement_segment);
+		tokio::pin!(publication);
+		poll_pending_once(publication.as_mut()).await;
+		assert_eq!(
+			gate.staging_started.load(Ordering::Acquire),
+			0,
+			"publication must not stage during deletion"
+		);
+		gate.release.notify_one();
+		assert!(
+			tokio::time::timeout(Duration::from_secs(60), deletion)
 				.await
 				.unwrap()
-				.unwrap();
-			assert_sidecar_state(&manager, &replacement, true).await;
-		}
+				.unwrap()
+				.unwrap()
+		);
+		let replacement = tokio::time::timeout(Duration::from_secs(60), publication)
+			.await
+			.unwrap()
+			.unwrap();
+		assert_sidecar_state(&manager, &replacement, true).await;
 	}
 }
 
 #[tokio::test]
 async fn absent_row_delete_and_retire_still_wait_for_publication_stripe() {
 	let dir = fresh_dir("sidecar-no-row-stripe");
-	let manager = open_manager_at_dir(
+	let manager = initialize_manager_at_dir(
 		dir.to_path_buf(),
 		spawn_io_thread(64).unwrap(),
 		test_crypto(),
@@ -483,7 +501,8 @@ async fn absent_row_delete_and_retire_still_wait_for_publication_stripe() {
 		.await
 		.unwrap();
 	assert!(manager.delete_secondary_index_segment(&info).await.unwrap());
-	let path = dir.join(&info.segment_path);
+	let key = PersistentSecondaryIndexSegmentRow::from(info.clone()).key;
+	let path = dir.join(secondary_index_segment_storage_path(&key));
 	for retire in [false, true] {
 		// A source may have coverage state even when its durable row is absent.
 		manager.mark_secondary_index_covered(info.coverage_key(), info.source_slab_id);
@@ -517,7 +536,7 @@ async fn absent_row_delete_and_retire_still_wait_for_publication_stripe() {
 async fn restored_noncanonical_sidecar_paths_remain_deletable() {
 	for retire in [false, true] {
 		let dir = fresh_dir("sidecar-restored-path");
-		let manager = open_manager_at_dir(
+		let manager = initialize_manager_at_dir(
 			dir.to_path_buf(),
 			spawn_io_thread(64).unwrap(),
 			test_crypto(),
@@ -553,30 +572,37 @@ async fn restored_noncanonical_sidecar_paths_remain_deletable() {
 async fn open_owned_manager_for_sidecar_recovery(
 	dir: &Path,
 	owner: &crate::storage::ownership::DataDirectoryOwner,
+	initialize: bool,
+	file_ops: Option<Arc<dyn AsyncFileOps>>,
 ) -> Arc<SlabManager> {
-	Arc::new(
-		SlabManager::open_with_owner(
-			SlabManagerConfig {
-				dir: dir.to_path_buf(),
-				max_slab_bytes: 1024 * 1024,
-				io: spawn_io_thread(64).unwrap(),
-				l2: None,
-				rehydration: Default::default(),
-				l2_column_fetch: Default::default(),
-				row_group_writer: Default::default(),
-				l2_row_group_fetch: Default::default(),
-				encoding_writer: Default::default(),
-				l2_chunk_layout: Default::default(),
-				l2_encoding_fetch: Default::default(),
-				encoding_compute: Default::default(),
-				group_commit: Default::default(),
-				crypto: test_crypto(),
-			},
-			owner.clone(),
-		)
-		.await
-		.unwrap(),
-	)
+	let config = SlabManagerConfig {
+		dir: dir.to_path_buf(),
+		max_slab_bytes: 1024 * 1024,
+		io: spawn_io_thread(64).unwrap(),
+		l2: None,
+		rehydration: Default::default(),
+		l2_column_fetch: Default::default(),
+		row_group_writer: Default::default(),
+		l2_row_group_fetch: Default::default(),
+		encoding_writer: Default::default(),
+		l2_chunk_layout: Default::default(),
+		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
+		group_commit: Default::default(),
+		crypto: test_crypto(),
+	};
+	match (initialize, file_ops) {
+		(true, Some(ops)) => {
+			SlabManager::initialize_new_store_with_file_ops_and_owner(config, ops, owner.clone())
+				.await
+		}
+		(false, Some(ops)) => {
+			SlabManager::open_with_file_ops_and_owner(config, ops, owner.clone()).await
+		}
+		(true, None) => SlabManager::initialize_new_store_with_owner(config, owner.clone()).await,
+		(false, None) => SlabManager::open_with_owner(config, owner.clone()).await,
+	}
+	.unwrap()
 }
 
 #[tokio::test]
@@ -587,7 +613,20 @@ async fn interrupted_real_sidecar_publisher_is_cleaned_on_owned_reopen() {
 	if let Some(path) = std::env::var_os(CHILD) {
 		let dir = PathBuf::from(path);
 		let owner = DataDirectoryOwner::acquire_existing(&dir).unwrap();
-		let mut manager = open_owned_manager_for_sidecar_recovery(&dir, &owner).await;
+		let gate = Arc::new(ParkFirstSidecarTmpOpen {
+			inner: Arc::new(BlockingFileOps::with_owner(owner.clone())),
+			armed: AtomicBool::new(false),
+			parked: Notify::new(),
+			release: Notify::new(),
+			synchronous_boundaries: false,
+			park_unlink: AtomicBool::new(false),
+			deny_final_unlink: AtomicBool::new(false),
+			staging_started: AtomicUsize::new(0),
+			tmp_fd: AtomicI32::new(-1),
+			unlinks_started: AtomicUsize::new(0),
+		});
+		let manager =
+			open_owned_manager_for_sidecar_recovery(&dir, &owner, true, Some(gate.clone())).await;
 		assert!(
 			manager.persistent_index.is_some(),
 			"real publisher control requires its durable catalog"
@@ -597,17 +636,7 @@ async fn interrupted_real_sidecar_publisher_is_cleaned_on_owned_reopen() {
 			.await
 			.unwrap();
 		let published_bytes = std::fs::read(dir.join(&original.segment_path)).unwrap();
-		let gate = Arc::new(ParkFirstSidecarTmpOpen {
-			inner: Arc::clone(&manager.file_ops),
-			armed: AtomicBool::new(true),
-			parked: Notify::new(),
-			release: Notify::new(),
-			synchronous_boundaries: false,
-			park_unlink: AtomicBool::new(false),
-			staging_started: AtomicUsize::new(0),
-			unlinks_started: AtomicUsize::new(0),
-		});
-		Arc::get_mut(&mut manager).unwrap().file_ops = gate.clone();
+		gate.armed.store(true, Ordering::Release);
 		let _publisher = {
 			let manager = Arc::clone(&manager);
 			tokio::spawn(async move {
@@ -671,8 +700,16 @@ async fn interrupted_real_sidecar_publisher_is_cleaned_on_owned_reopen() {
 	);
 	let original_segment = segment_with_key(slab, 1);
 	let identity = original_segment.identity();
-	let relative = secondary_index_segment_storage_path(&original_segment.catalog_key());
-	let published_path = dir.join(&relative);
+	let canonical = dir.join(secondary_index_segment_storage_path(
+		&original_segment.catalog_key(),
+	));
+	let parent = canonical.parent().unwrap();
+	let published_path = std::fs::read_dir(parent)
+		.unwrap()
+		.map(Result::unwrap)
+		.map(|entry| entry.path())
+		.find(|path| !ParkFirstSidecarTmpOpen::is_sidecar_tmp(path))
+		.expect("published final survives the interrupted replacement");
 	let original_bytes = std::fs::read(&published_path).unwrap();
 	assert_eq!(original_bytes, original_segment.encode().unwrap());
 	let parent = published_path.parent().unwrap();
@@ -683,7 +720,7 @@ async fn interrupted_real_sidecar_publisher_is_cleaned_on_owned_reopen() {
 	);
 	for _ in 0..2 {
 		let owner = DataDirectoryOwner::acquire_existing(&dir).unwrap();
-		let manager = open_owned_manager_for_sidecar_recovery(&dir, &owner).await;
+		let manager = open_owned_manager_for_sidecar_recovery(&dir, &owner, false, None).await;
 		assert!(
 			manager.persistent_index.is_some(),
 			"reopen must validate the durable catalog, not a fallback"
@@ -740,7 +777,7 @@ fn pd22_segment(source: SlabId, fingerprint: u8, alternate_index: bool) -> Secon
 #[tokio::test]
 async fn pd22_fingerprint_rows_load_their_own_payloads() {
 	let dir = fresh_dir("pd22-load-fingerprint");
-	let manager = open_manager_at_dir(
+	let manager = initialize_manager_at_dir(
 		dir.to_path_buf(),
 		spawn_io_thread(64).unwrap(),
 		test_crypto(),
@@ -773,7 +810,7 @@ async fn pd22_fingerprint_rows_load_their_own_payloads() {
 
 async fn pd22_old_retirement_preserves_new(retire: bool, alternate_index: bool) {
 	let dir = fresh_dir("pd22-retire-fingerprint");
-	let manager = open_manager_at_dir(
+	let manager = initialize_manager_at_dir(
 		dir.to_path_buf(),
 		spawn_io_thread(64).unwrap(),
 		test_crypto(),
@@ -846,7 +883,7 @@ async fn pd22_loader_binds_header_and_payload_hash_to_the_row_and_downgrades_cov
 		(1, 2, Reason::PayloadMismatch),
 	] {
 		let dir = fresh_dir("pd22-loader-binding");
-		let manager = open_manager_at_dir(
+		let manager = initialize_manager_at_dir(
 			dir.to_path_buf(),
 			spawn_io_thread(64).unwrap(),
 			test_crypto(),
@@ -897,7 +934,7 @@ async fn pd22_covered_missing_file_or_row_is_typed_and_uncovered() {
 	use super::super::secondary_index_segments::SidecarDataErrorReason as Reason;
 	for missing_row in [false, true] {
 		let dir = fresh_dir("pd22-covered-missing");
-		let manager = open_manager_at_dir(
+		let manager = initialize_manager_at_dir(
 			dir.to_path_buf(),
 			spawn_io_thread(64).unwrap(),
 			test_crypto(),
@@ -989,7 +1026,7 @@ async fn pd22_legacy_alias_deletion_preserves_a_referenced_file() {
 		for removed in 0..2 {
 			for retire in [false, true] {
 				let dir = fresh_dir("pd22-legacy-alias");
-				let manager = open_manager_at_dir(
+				let manager = initialize_manager_at_dir(
 					dir.to_path_buf(),
 					spawn_io_thread(64).unwrap(),
 					test_crypto(),
@@ -1025,7 +1062,7 @@ async fn pd22_legacy_alias_deletion_preserves_a_referenced_file() {
 #[tokio::test]
 async fn pd22_legacy_physical_stripe_excludes_replacement_and_other_row_delete() {
 	let dir = fresh_dir("pd22-legacy-physical-lock");
-	let manager = open_manager_at_dir(
+	let manager = initialize_manager_at_dir(
 		dir.to_path_buf(),
 		spawn_io_thread(64).unwrap(),
 		test_crypto(),
@@ -1060,7 +1097,7 @@ async fn pd22_legacy_physical_stripe_excludes_replacement_and_other_row_delete()
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pd22_hot_sidecar_loads_share_the_read_stripe() {
 	let dir = fresh_dir("pd22-shared-loads");
-	let manager = open_manager_at_dir(
+	let manager = initialize_manager_at_dir(
 		dir.to_path_buf(),
 		spawn_io_thread(64).unwrap(),
 		test_crypto(),
@@ -1103,7 +1140,7 @@ async fn pd22_equivalent_noncanonical_alias_deletion_preserves_a_referenced_file
 		for removed in 0..2 {
 			for retire in [false, true] {
 				let dir = fresh_dir("pd22-legacy-alias");
-				let manager = open_manager_at_dir(
+				let manager = initialize_manager_at_dir(
 					dir.to_path_buf(),
 					spawn_io_thread(64).unwrap(),
 					test_crypto(),
@@ -1151,7 +1188,7 @@ async fn pd22_equivalent_noncanonical_alias_deletion_preserves_a_referenced_file
 #[tokio::test]
 async fn pd22_republish_legacy_row_reclaims_only_its_unreferenced_old_path() {
 	let dir = fresh_dir("pd22-legacy-republish");
-	let manager = open_manager_at_dir(
+	let manager = initialize_manager_at_dir(
 		dir.to_path_buf(),
 		spawn_io_thread(64).unwrap(),
 		test_crypto(),
@@ -1159,6 +1196,8 @@ async fn pd22_republish_legacy_row_reclaims_only_its_unreferenced_old_path() {
 	.await;
 	let (infos, segments) = pd22_legacy_alias_pair(&manager, &dir, 0).await;
 	let legacy_path = dir.join(&infos[0].segment_path);
+	let legacy_bytes = std::fs::read(&legacy_path).unwrap();
+	let retained_before = metrics().storage_retained_secondary_sidecar_files.get();
 	let first = manager
 		.persist_secondary_index_segment(&segments[0])
 		.await
@@ -1171,9 +1210,10 @@ async fn pd22_republish_legacy_row_reclaims_only_its_unreferenced_old_path() {
 		.persist_secondary_index_segment(&segments[1])
 		.await
 		.unwrap();
-	assert!(
-		!legacy_path.exists(),
-		"the final republish leaked an unreferenced legacy sidecar"
+	assert_eq!(std::fs::read(&legacy_path).unwrap(), legacy_bytes);
+	assert_eq!(
+		metrics().storage_retained_secondary_sidecar_files.get(),
+		retained_before + 1
 	);
 	assert_eq!(
 		manager.load_secondary_index_segment(&first).await.unwrap(),
@@ -1183,4 +1223,127 @@ async fn pd22_republish_legacy_row_reclaims_only_its_unreferenced_old_path() {
 		manager.load_secondary_index_segment(&second).await.unwrap(),
 		Some(segments[1].clone())
 	);
+}
+
+async fn open_fresh_sidecar_manager_with_ops(
+	dir: &Path,
+	file_ops: Arc<dyn AsyncFileOps>,
+) -> Arc<SlabManager> {
+	let io = spawn_io_thread(64).unwrap();
+	let crypto = test_crypto();
+	SlabManager::initialize_new_store_with_file_ops(
+		SlabManagerConfig {
+			dir: dir.to_path_buf(),
+			max_slab_bytes: 1024 * 1024,
+			io,
+			l2: None,
+			rehydration: RehydrationPolicy::default(),
+			l2_column_fetch: Default::default(),
+			row_group_writer: Default::default(),
+			l2_row_group_fetch: Default::default(),
+			encoding_writer: Default::default(),
+			l2_chunk_layout: Default::default(),
+			l2_encoding_fetch: Default::default(),
+			encoding_compute: Default::default(),
+			group_commit: GroupCommitConfig::default(),
+			crypto,
+		},
+		file_ops,
+	)
+	.await
+	.unwrap()
+}
+
+#[tokio::test]
+async fn publication_refuses_when_persistent_index_is_unavailable() {
+	let dir = fresh_dir("sidecar-index-unavailable");
+	let manager = open_manager_at_dir(
+		dir.to_path_buf(),
+		spawn_io_thread(64).unwrap(),
+		test_crypto(),
+	)
+	.await;
+	assert!(
+		manager.persistent_index.is_none(),
+		"premise: missing redb was not initialized"
+	);
+	let error = manager
+		.persist_secondary_index_segment(&segment_with_key(SlabId::new(86), 1))
+		.await
+		.unwrap_err();
+	assert_eq!(error.kind(), ErrorKind::WouldBlock);
+	assert!(manager.secondary_index_segments.is_empty());
+	assert!(
+		!dir.join("secondary_index").exists(),
+		"refused publication must not stage a file"
+	);
+}
+
+#[tokio::test]
+async fn failed_sidecar_cleanup_counts_and_exports_retained_new_final() {
+	let dir = fresh_dir("sidecar-failed-cleanup-gauge");
+	let gate = Arc::new(ParkFirstSidecarTmpOpen {
+		inner: Arc::new(BlockingFileOps),
+		armed: AtomicBool::new(false),
+		parked: Notify::new(),
+		release: Notify::new(),
+		synchronous_boundaries: false,
+		park_unlink: AtomicBool::new(false),
+		deny_final_unlink: AtomicBool::new(false),
+		staging_started: AtomicUsize::new(0),
+		tmp_fd: AtomicI32::new(-1),
+		unlinks_started: AtomicUsize::new(0),
+	});
+	let manager = open_fresh_sidecar_manager_with_ops(&dir, gate.clone()).await;
+	let segment = segment_with_key(SlabId::new(96), 1);
+	let original = manager
+		.persist_secondary_index_segment(&segment)
+		.await
+		.unwrap();
+	let original_path = dir.join(&original.segment_path);
+	let original_bytes = std::fs::read(&original_path).unwrap();
+	let before_files = metrics().storage_retained_secondary_sidecar_files.get();
+	let before_bytes = metrics().storage_retained_secondary_sidecar_bytes.get();
+	gate.deny_final_unlink.store(true, Ordering::Release);
+	manager
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.fail_next_delta
+		.store(true, Ordering::Release);
+	assert!(
+		manager
+			.persist_secondary_index_segment(&segment)
+			.await
+			.is_err()
+	);
+	assert!(manager.has_orphaned_index_publications());
+	assert_eq!(std::fs::read(&original_path).unwrap(), original_bytes);
+	let parent = original_path.parent().unwrap();
+	let retained = std::fs::read_dir(parent)
+		.unwrap()
+		.map(Result::unwrap)
+		.map(|entry| entry.path())
+		.find(|path| path != &original_path && !ParkFirstSidecarTmpOpen::is_sidecar_tmp(path))
+		.expect("new final remains after the injected unlink failure");
+	let bytes = std::fs::metadata(&retained).unwrap().len();
+	assert_eq!(
+		metrics().storage_retained_secondary_sidecar_files.get(),
+		before_files + 1
+	);
+	assert_eq!(
+		metrics().storage_retained_secondary_sidecar_bytes.get(),
+		before_bytes + bytes
+	);
+	let rendered = metrics().render_prometheus();
+	assert!(rendered.lines().any(|line| line
+		== format!(
+			"wendelon_storage_retained_secondary_sidecar_files {}",
+			before_files + 1
+		)));
+	assert!(rendered.lines().any(|line| line
+		== format!(
+			"wendelon_storage_retained_secondary_sidecar_bytes {}",
+			before_bytes + bytes
+		)));
 }

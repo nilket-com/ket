@@ -133,6 +133,7 @@ async fn ctr4_v2_maintenance_preserves_pair_and_legacy_refuses_before_rewrite() 
 				assert!(outcome.compaction.is_some());
 				let moved = manager
 					.lookup(tenant(), key)
+					.unwrap()
 					.expect("V2 tentative remains indexed");
 				let replacement = manager
 					.state
@@ -213,6 +214,12 @@ async fn ctr4_v2_maintenance_preserves_pair_and_legacy_refuses_before_rewrite() 
 					.encrypt_tiered_object_blob(sealed, &bytes)
 					.unwrap_err(),
 			);
+			if legacy {
+				let path = slab_path(manager.data_dir(), sealed);
+				manager.fsync_all_local_slabs().await.unwrap();
+				drop(manager);
+				assert_obsolete_slab_refuses_open(&path, sealed).await;
+			}
 		}
 	}
 }

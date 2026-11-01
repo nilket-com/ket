@@ -330,7 +330,7 @@ impl SlabManager {
 			);
 			state.active = next;
 			state.sealed.insert(sealed_id, sealed);
-			state.next_slab_id = next_id.saturating_add(1);
+			state.advance_slab_allocator(next_id.saturating_add(1));
 			self.record_l0_compaction_run(sealed_id, sealed_size);
 			sealed_id
 		};
@@ -1147,8 +1147,29 @@ impl SlabManager {
 		&self,
 		segment: &SecondaryIndexSegment,
 	) -> std::io::Result<SecondaryIndexSegmentInfo> {
+		let slab_id = segment.header.source_slab_id;
+		let tier_lock = self.tier_publication_lock(slab_id);
+		let _tier_guard = tier_lock.lock().await;
+		self.persist_secondary_index_segment_locked(segment).await
+	}
+
+	async fn persist_secondary_index_segment_locked(
+		&self,
+		segment: &SecondaryIndexSegment,
+	) -> std::io::Result<SecondaryIndexSegmentInfo> {
+		self.bump_slab_publication_revision(segment.header.source_slab_id)?;
+		let index = self
+			.persistent_index
+			.as_ref()
+			.ok_or_else(|| Error::new(ErrorKind::WouldBlock, "persistent index unavailable"))?;
 		let identity = segment.identity();
-		let segment_path = secondary_index_segment_storage_path(&segment.catalog_key());
+		// Every attempt owns a distinct final name. A failed replacement must
+		// never overwrite or unlink the previously published sidecar.
+		let segment_path = format!(
+			"{}.{}",
+			secondary_index_segment_storage_path(&segment.catalog_key()),
+			uuid::Uuid::new_v4().simple()
+		);
 		let info = SecondaryIndexSegmentInfo {
 			tenant_id: segment.header.tenant_id,
 			table_object_id: segment.header.table_object_id,
@@ -1169,12 +1190,17 @@ impl SlabManager {
 		// below must describe the same segment, which two interleaved writers of
 		// one source slab (an active-buffer seal and a backfill) cannot promise.
 		let (_publication, previous) = self.lock_secondary_index_row(row.key, false).await?;
+		let previous_size = if let Some(previous) = &previous {
+			let old_path = secondary_index_sidecar_path(&self.config.dir, &previous.segment_path)?;
+			self.file_ops.file_len(&old_path).await?
+		} else {
+			None
+		};
 		let tmp_path = secondary_index_sidecar_tmp_path(&path);
 		if let Some(parent) = path.parent() {
 			self.file_ops.create_dir_all(parent).await?;
 		}
 		let staged = async {
-			self.file_ops.write_all(&tmp_path, &encoded).await?;
 			let tmp = self
 				.file_ops
 				.open(
@@ -1182,15 +1208,29 @@ impl SlabManager {
 					OpenFlags {
 						read: true,
 						write: true,
-						create: false,
-						create_new: false,
+						create: true,
+						create_new: true,
 						truncate: false,
 						direct: false,
 					},
 				)
 				.await?;
+			let mut offset = 0usize;
+			while offset < encoded.len() {
+				let written = self
+					.file_ops
+					.write_plain_at(&tmp, offset as u64, encoded[offset..].to_vec())
+					.await?;
+				if written == 0 {
+					return Err(Error::new(ErrorKind::WriteZero, "short sidecar write"));
+				}
+				offset += written;
+			}
 			self.file_ops.fsync(&tmp).await?;
-			self.file_ops.rename(&tmp_path, &path).await
+			// Hard-link creation cannot replace an existing final name.
+			self.file_ops.link_no_replace(&tmp_path, &path).await?;
+			fsync_parent_dir(self.file_ops.as_ref(), &path).await?;
+			unlink_local_file(self.file_ops.as_ref(), &tmp_path).await
 		}
 		.await;
 		if let Err(err) = staged {
@@ -1198,12 +1238,57 @@ impl SlabManager {
 			return Err(err);
 		}
 		fsync_parent_dir(self.file_ops.as_ref(), &path).await?;
-		if let Some(index) = &self.persistent_index {
-			if let Err(err) = index.upsert_secondary_index_segment(row.clone()).await {
-				let _ = unlink_local_file(self.file_ops.as_ref(), &path).await;
-				return Err(err);
+		let publication = self
+			.begin_index_publication(vec![info.source_slab_id])
+			.await?;
+		if let Err(err) = index
+			.apply_with_publication_guard(
+				PersistentIndexUpdate {
+					put_secondary_index_segments: vec![row.clone()],
+					..Default::default()
+				},
+				Some(publication.gate.clone()),
+			)
+			.await
+		{
+			// An error is not proof of no commit. Only remove this new file if
+			// redb still equals the observed previous row and no row names it.
+			if let Ok(snapshot) = index.load_snapshot().await {
+				let durable_previous = snapshot
+					.secondary_index_segments
+					.iter()
+					.find(|candidate| candidate.key == row.key)
+					.cloned();
+				let new_is_unreferenced = snapshot
+					.secondary_index_segments
+					.iter()
+					.all(|candidate| candidate.segment_path != info.segment_path);
+				if durable_previous == previous
+					&& new_is_unreferenced
+					&& unlink_local_file(self.file_ops.as_ref(), &path)
+						.await
+						.is_ok()
+				{
+					// This error cleanup need not fsync the parent. After a crash the
+					// unreferenced final can reappear; startup retains and counts it.
+					publication.complete();
+					return Err(err);
+				}
 			}
+			// The outcome is unresolved, so keep both the new bytes and the
+			// orphan mark. Account for the possibly retained final immediately;
+			// startup reclassifies it from the durable snapshot after reopen.
+			self.retained_secondary_sidecars
+				.record(PathBuf::from(&info.segment_path), encoded.len() as u64);
+			return Err(err);
 		}
+		// Count the new segment's source reference before the previous one is
+		// released, so the slab is never momentarily unreferenced.
+		self.add_secondary_index_source_reference(
+			info.tenant_id,
+			info.table_object_id,
+			info.source_slab_id,
+		);
 		if let Some(previous) = self.secondary_index_segments.insert(row.key, row) {
 			self.remove_secondary_index_source_reference(
 				previous.key.tenant_id,
@@ -1211,24 +1296,18 @@ impl SlabManager {
 				previous.key.source_slab_id,
 			);
 		}
-		// The same held guard includes the observed old physical stripe. Retire
-		// its bytes only after catalog replacement, and only without live aliases.
-		if let Some(previous) = previous {
-			let old_path = secondary_index_sidecar_path(&self.config.dir, &previous.segment_path)?;
-			if old_path != path
+		// Superseded bytes are retained until owned inventory/GC is available.
+		if let (Some(previous), Some(bytes)) = (previous, previous_size) {
+			if previous.segment_path != info.segment_path
 				&& !self
 					.other_secondary_index_row_references(&previous.key, &previous.segment_path)?
 			{
-				unlink_local_file(self.file_ops.as_ref(), &old_path).await?;
-				fsync_parent_dir(self.file_ops.as_ref(), &old_path).await?;
+				self.retained_secondary_sidecars
+					.record(PathBuf::from(previous.segment_path), bytes);
 			}
 		}
-		self.add_secondary_index_source_reference(
-			info.tenant_id,
-			info.table_object_id,
-			info.source_slab_id,
-		);
 		self.mark_secondary_index_covered(info.coverage_key(), info.source_slab_id);
+		publication.complete();
 		metrics().observe_storage_secondary_index_segment_built(
 			info.tenant_id,
 			info.table_object_id,
@@ -1281,6 +1360,9 @@ impl SlabManager {
 		&self,
 		key: &SecondaryIndexSegmentInfo,
 	) -> std::io::Result<bool> {
+		let tier_lock = self.tier_publication_lock(key.source_slab_id);
+		let _tier_guard = tier_lock.lock().await;
+		self.bump_slab_publication_revision(key.source_slab_id)?;
 		let (_publication, row) = self.lock_secondary_index_row(key.key(), false).await?;
 		let Some(row) = row else {
 			return Ok(false);
@@ -1288,9 +1370,22 @@ impl SlabManager {
 		// A restored row may retain a format-valid noncanonical relative path.
 		// Publication still locks by canonical identity; unlink the stored path.
 		let path = secondary_index_sidecar_path(&self.config.dir, &row.segment_path)?;
-		if let Some(index) = &self.persistent_index {
-			index.delete_secondary_index_segment(row.key).await?;
-		}
+		let index = self
+			.persistent_index
+			.as_ref()
+			.ok_or_else(|| Error::new(ErrorKind::WouldBlock, "persistent index unavailable"))?;
+		let publication = self
+			.begin_index_publication(vec![row.key.source_slab_id])
+			.await?;
+		index
+			.apply_with_publication_guard(
+				PersistentIndexUpdate {
+					delete_secondary_index_segments: vec![row.key],
+					..Default::default()
+				},
+				Some(publication.gate.clone()),
+			)
+			.await?;
 		if !self.other_secondary_index_row_references(&row.key, &row.segment_path)? {
 			unlink_local_file(self.file_ops.as_ref(), &path).await?;
 		}
@@ -1309,6 +1404,7 @@ impl SlabManager {
 		{
 			tracker.forget_slab(row.key.source_slab_id);
 		}
+		publication.complete();
 		Ok(true)
 	}
 
@@ -1427,6 +1523,17 @@ impl SlabManager {
 		&self,
 		info: &SecondaryIndexSegmentInfo,
 	) -> std::io::Result<bool> {
+		let tier_lock = self.tier_publication_lock(info.source_slab_id);
+		let _tier_guard = tier_lock.lock().await;
+		self.retire_secondary_index_segment_for_replaced_slab_locked(info)
+			.await
+	}
+
+	pub(super) async fn retire_secondary_index_segment_for_replaced_slab_locked(
+		&self,
+		info: &SecondaryIndexSegmentInfo,
+	) -> std::io::Result<bool> {
+		self.bump_slab_publication_revision(info.source_slab_id)?;
 		let (_publication, row) = self.lock_secondary_index_row(info.key(), false).await?;
 		let Some(row) = row else {
 			self.forget_secondary_index_source_slab(info.coverage_key(), info.source_slab_id);
@@ -1435,9 +1542,22 @@ impl SlabManager {
 		// A restored row may retain a format-valid noncanonical relative path.
 		// Publication still locks by canonical identity; unlink the stored path.
 		let path = secondary_index_sidecar_path(&self.config.dir, &row.segment_path)?;
-		if let Some(index) = &self.persistent_index {
-			index.delete_secondary_index_segment(row.key).await?;
-		}
+		let index = self
+			.persistent_index
+			.as_ref()
+			.ok_or_else(|| Error::new(ErrorKind::WouldBlock, "persistent index unavailable"))?;
+		let publication = self
+			.begin_index_publication(vec![row.key.source_slab_id])
+			.await?;
+		index
+			.apply_with_publication_guard(
+				PersistentIndexUpdate {
+					delete_secondary_index_segments: vec![row.key],
+					..Default::default()
+				},
+				Some(publication.gate.clone()),
+			)
+			.await?;
 		if !self.other_secondary_index_row_references(&row.key, &row.segment_path)? {
 			unlink_local_file(self.file_ops.as_ref(), &path).await?;
 		}
@@ -1448,6 +1568,7 @@ impl SlabManager {
 			row.key.source_slab_id,
 		);
 		self.forget_secondary_index_source_slab(info.coverage_key(), info.source_slab_id);
+		publication.complete();
 		Ok(true)
 	}
 
@@ -1462,14 +1583,11 @@ impl SlabManager {
 			source_slab_id,
 			&self.acknowledged_offsets_in_slab(source_slab_id),
 		)? {
-			let frame = match extract_record_from_blob(plaintext, recovered.location) {
-				Ok(frame) => frame,
-				Err(_) => continue,
-			};
-			let storage_batch = match decode_record_batch(&frame) {
-				Ok(batch) => batch,
-				Err(_) => continue,
-			};
+			if !recovered.is_arrow_frame {
+				continue;
+			}
+			let frame = extract_record_from_blob(plaintext, recovered.location)?;
+			let storage_batch = decode_record_batch(&frame)?;
 			if let Some(table_object_id) =
 				storage_row_table_object_id_at(&storage_batch, recovered.location.record_row_index)?
 			{
@@ -1712,6 +1830,7 @@ impl SlabManager {
 		plan: &CompactionPlan,
 		written: &[LsmWrittenOutputRun],
 		context: Option<SecondaryIndexCompactionContext<'_>>,
+		temp_outputs: bool,
 	) -> Result<Option<LsmPreparedSecondaryIndexSegments>, CompactionFailure> {
 		let Some(context) = context else {
 			return Ok(None);
@@ -1739,7 +1858,11 @@ impl SlabManager {
 
 		let mut output_segments = Vec::new();
 		for run in written {
-			let path = slab_path(&self.config.dir, run.slab_id);
+			let path = if temp_outputs {
+				run.temp_path.clone()
+			} else {
+				slab_path(&self.config.dir, run.slab_id)
+			};
 			let plaintext = self.file_ops.read_all(&path).await?;
 			for (tenant_id, table, descriptor) in self
 				.secondary_index_compaction_descriptors_for_plaintext(
@@ -1804,9 +1927,18 @@ impl SlabManager {
 		Ok(())
 	}
 
-	pub(super) async fn publish_prepared_lsm_secondary_index_segments(
+	pub(super) async fn publish_prepared_lsm_secondary_index_segments_locked(
 		&self,
 		prepared: Option<LsmPreparedSecondaryIndexSegments>,
+	) -> usize {
+		self.publish_prepared_lsm_secondary_index_segments_inner(prepared, true)
+			.await
+	}
+
+	async fn publish_prepared_lsm_secondary_index_segments_inner(
+		&self,
+		prepared: Option<LsmPreparedSecondaryIndexSegments>,
+		locks_held: bool,
 	) -> usize {
 		let Some(prepared) = prepared else {
 			return 0;
@@ -1814,10 +1946,14 @@ impl SlabManager {
 		let mut coverage_by_slab: BTreeMap<SlabId, (usize, usize)> = BTreeMap::new();
 
 		for old_info in prepared.old_sidecars {
-			if let Err(err) = self
-				.retire_secondary_index_segment_for_replaced_slab(&old_info)
-				.await
-			{
+			let retired = if locks_held {
+				self.retire_secondary_index_segment_for_replaced_slab_locked(&old_info)
+					.await
+			} else {
+				self.retire_secondary_index_segment_for_replaced_slab(&old_info)
+					.await
+			};
+			if let Err(err) = retired {
 				tracing::warn!(
 					old_slab_id = old_info.source_slab_id.get(),
 					index_object_id = ?old_info.index_object_id,
@@ -1836,10 +1972,14 @@ impl SlabManager {
 				.entry(prepared_segment.output_slab_id)
 				.or_default();
 			coverage.0 = coverage.0.saturating_add(1);
-			if let Err(err) = self
-				.persist_secondary_index_segment(&prepared_segment.segment)
-				.await
-			{
+			let persisted = if locks_held {
+				self.persist_secondary_index_segment_locked(&prepared_segment.segment)
+					.await
+			} else {
+				self.persist_secondary_index_segment(&prepared_segment.segment)
+					.await
+			};
+			if let Err(err) = persisted {
 				self.mark_secondary_index_uncovered(
 					prepared_segment.key,
 					prepared_segment.output_slab_id,
@@ -1862,15 +2002,19 @@ impl SlabManager {
 			coverage.1 = coverage.1.saturating_add(1);
 			rebuilt = rebuilt.saturating_add(1);
 		}
-		self.update_lsm_sidecar_coverage_after_publish(coverage_by_slab)
-			.await;
+		if let Err(error) = self
+			.update_lsm_sidecar_coverage_after_publish(coverage_by_slab)
+			.await
+		{
+			tracing::warn!(%error, "LSM sidecar coverage publication remains unresolved");
+		}
 		rebuilt
 	}
 
 	pub(super) async fn update_lsm_sidecar_coverage_after_publish(
 		&self,
 		coverage_by_slab: BTreeMap<SlabId, (usize, usize)>,
-	) {
+	) -> std::io::Result<()> {
 		let updates = coverage_by_slab
 			.into_iter()
 			.filter_map(|(slab_id, (attempted, succeeded))| {
@@ -1886,36 +2030,64 @@ impl SlabManager {
 			})
 			.collect::<Vec<_>>();
 		if updates.is_empty() {
-			return;
+			return Ok(());
 		}
 
-		let lsm_runs = {
+		// Prepare without exposing new coverage before its durable update.
+		let changes = {
+			let manifest = recover_rwlock_read(&self.compaction_manifest, "compaction_manifest");
+			updates
+				.into_iter()
+				.filter_map(|(slab_id, coverage)| {
+					let old = manifest.get_run(slab_id)?.clone();
+					if !old.state.is_live() || old.sidecar_coverage == coverage {
+						return None;
+					}
+					let mut new = old.clone();
+					new.sidecar_coverage = coverage;
+					Some((old, new))
+				})
+				.collect::<Vec<_>>()
+		};
+		if changes.is_empty() {
+			return Ok(());
+		}
+		let slabs = changes.iter().map(|(_, new)| new.slab_id).collect();
+		let publication = self.begin_index_publication(slabs).await?;
+		let index = self
+			.persistent_index
+			.as_ref()
+			.ok_or_else(|| Error::new(ErrorKind::WouldBlock, "persistent index unavailable"))?;
+		index
+			.apply_with_publication_guard(
+				PersistentIndexUpdate {
+					put_lsm_runs: changes.iter().map(|(_, new)| new.clone()).collect(),
+					..Default::default()
+				},
+				Some(publication.gate.clone()),
+			)
+			.await?;
+		{
 			let mut manifest =
 				recover_rwlock_write(&self.compaction_manifest, "compaction_manifest");
-			for (slab_id, coverage) in updates {
-				let Some(run) = manifest.get_run(slab_id).cloned() else {
-					continue;
-				};
-				if !run.state.is_live() || run.sidecar_coverage == coverage {
-					continue;
-				}
-				let mut updated = run;
-				updated.sidecar_coverage = coverage;
-				manifest.insert_live_run(updated);
+			if changes
+				.iter()
+				.any(|(old, _)| manifest.get_run(old.slab_id) != Some(old))
+			{
+				return Err(Error::new(
+					ErrorKind::WouldBlock,
+					"LSM coverage changed during publication",
+				));
+			}
+			for (_, new) in changes {
+				manifest.insert_live_run(new);
 			}
 			let snapshot = manifest.snapshot();
 			drop(manifest);
 			refresh_lsm_level_metrics(&snapshot);
-			snapshot.runs().to_vec()
-		};
-		self.mirror_persistent_update(
-			PersistentIndexUpdate {
-				put_lsm_runs: lsm_runs,
-				..Default::default()
-			},
-			"lsm-sidecar-coverage-update",
-		)
-		.await;
+		}
+		publication.complete();
+		Ok(())
 	}
 
 	#[allow(dead_code)]
@@ -1926,11 +2098,11 @@ impl SlabManager {
 		context: Option<SecondaryIndexCompactionContext<'_>>,
 	) -> usize {
 		match self
-			.prepare_lsm_secondary_index_segments_for_compaction(plan, written, context)
+			.prepare_lsm_secondary_index_segments_for_compaction(plan, written, context, false)
 			.await
 		{
 			Ok(prepared) => {
-				self.publish_prepared_lsm_secondary_index_segments(prepared)
+				self.publish_prepared_lsm_secondary_index_segments_inner(prepared, false)
 					.await
 			}
 			Err(err) => {
@@ -2120,6 +2292,7 @@ impl SlabManager {
 		source_slab_id: SlabId,
 		plaintext: &[u8],
 	) -> std::io::Result<SecondaryIndexSegment> {
+		self.require_tier_authority_ready()?;
 		let identity = SecondaryIndexIdentity::from_descriptor(tenant_id, descriptor);
 		let mut index_entries = Vec::new();
 		for recovered in recover_slab_entries_from_blob_skipping_counters(
@@ -2127,14 +2300,14 @@ impl SlabManager {
 			source_slab_id,
 			&self.acknowledged_offsets_in_slab(source_slab_id),
 		)? {
-			if recovered.tenant_id != tenant_id || recovered.location.is_tombstone {
+			if recovered.tenant_id != tenant_id
+				|| recovered.location.is_tombstone
+				|| !recovered.is_arrow_frame
+			{
 				continue;
 			}
 			let frame = extract_record_from_blob(plaintext, recovered.location)?;
-			let storage_batch = match decode_record_batch(&frame) {
-				Ok(batch) => batch,
-				Err(_) => continue,
-			};
+			let storage_batch = decode_record_batch(&frame)?;
 			let stored_table_object_id = storage_row_table_object_id_at(
 				&storage_batch,
 				recovered.location.record_row_index,
@@ -2185,6 +2358,7 @@ impl SlabManager {
 		&self,
 		source_slab_id: SlabId,
 	) -> std::io::Result<Vec<u8>> {
+		self.require_tier_authority_ready()?;
 		let tier_pointer = {
 			let state = self.state.lock().await;
 			if state.active.slab_id() == source_slab_id {

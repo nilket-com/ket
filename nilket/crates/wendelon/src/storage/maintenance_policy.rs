@@ -809,7 +809,7 @@ mod tests {
 	) -> (crate::test_support::TestDir, Arc<MaintenancePolicyInner>) {
 		let (dir, path) = temp_index_path("enabled");
 		let store = Arc::new(
-			crate::storage::index::PersistentLocalIndex::open(path)
+			crate::storage::index::PersistentLocalIndex::initialize_new(path, None)
 				.await
 				.expect("temp index opens"),
 		);
@@ -971,7 +971,7 @@ mod tests {
 
 		let (_dir, path) = temp_index_path("agg");
 		let store = Arc::new(
-			crate::storage::index::PersistentLocalIndex::open(path)
+			crate::storage::index::PersistentLocalIndex::initialize_new(path, None)
 				.await
 				.unwrap(),
 		);
@@ -1030,9 +1030,10 @@ mod tests {
 			DeterministicReceipt::after_failure(Some(&b), 3_000, "c").unwrap()
 		};
 		{
-			let store = crate::storage::index::PersistentLocalIndex::open(path.clone())
-				.await
-				.unwrap();
+			let store =
+				crate::storage::index::PersistentLocalIndex::initialize_new(path.clone(), None)
+					.await
+					.unwrap();
 			store
 				.put_maintenance_receipt(key.encode(), spent.encode())
 				.await
@@ -1085,9 +1086,10 @@ mod tests {
 		.unwrap();
 		assert!(good_key.encode() < bad_key.encode());
 		{
-			let store = crate::storage::index::PersistentLocalIndex::open(path.clone())
-				.await
-				.unwrap();
+			let store =
+				crate::storage::index::PersistentLocalIndex::initialize_new(path.clone(), None)
+					.await
+					.unwrap();
 			store
 				.put_maintenance_receipt(good_key.encode(), good.encode())
 				.await
@@ -1179,9 +1181,10 @@ mod tests {
 		)
 		.unwrap();
 		{
-			let store = crate::storage::index::PersistentLocalIndex::open(path.clone())
-				.await
-				.unwrap();
+			let store =
+				crate::storage::index::PersistentLocalIndex::initialize_new(path.clone(), None)
+					.await
+					.unwrap();
 			// Raw put bypasses the schema: one byte over the exact v1 maximum.
 			store
 				.put_maintenance_receipt(
@@ -1221,9 +1224,10 @@ mod tests {
 		)
 		.unwrap();
 		{
-			let store = crate::storage::index::PersistentLocalIndex::open(path.clone())
-				.await
-				.unwrap();
+			let store =
+				crate::storage::index::PersistentLocalIndex::initialize_new(path.clone(), None)
+					.await
+					.unwrap();
 			store
 				.put_maintenance_receipt(wide.encode(), vec![0xFF])
 				.await
@@ -1253,9 +1257,10 @@ mod tests {
 		let raw_key = vec![0xAB; 10_000];
 		assert!(raw_key.len() <= MAX_RECEIPT_KEY_BYTES);
 		{
-			let store = crate::storage::index::PersistentLocalIndex::open(path.clone())
-				.await
-				.unwrap();
+			let store =
+				crate::storage::index::PersistentLocalIndex::initialize_new(path.clone(), None)
+					.await
+					.unwrap();
 			store
 				.put_maintenance_receipt(raw_key, vec![0xFF])
 				.await
@@ -1291,9 +1296,10 @@ mod tests {
 	async fn lost_receipt_history_disables_recovery() {
 		let (_dir, path) = temp_index_path("lost");
 		{
-			let store = crate::storage::index::PersistentLocalIndex::open(path.clone())
-				.await
-				.unwrap();
+			let store =
+				crate::storage::index::PersistentLocalIndex::initialize_new(path.clone(), None)
+					.await
+					.unwrap();
 			assert!(store.receipts_available());
 		}
 		crate::storage::index::delete_maintenance_receipt_table_for_test(&path);
@@ -1330,7 +1336,7 @@ mod tests {
 	) {
 		let (dir, path) = temp_index_path("exec");
 		let store = Arc::new(
-			crate::storage::index::PersistentLocalIndex::open(path)
+			crate::storage::index::PersistentLocalIndex::initialize_new(path, None)
 				.await
 				.expect("temp index opens"),
 		);
@@ -1353,7 +1359,7 @@ mod tests {
 		Arc<crate::storage::index::PersistentLocalIndex>,
 	) {
 		let store = Arc::new(
-			crate::storage::index::PersistentLocalIndex::open(path.to_path_buf())
+			crate::storage::index::PersistentLocalIndex::initialize_new(path.to_path_buf(), None)
 				.await
 				.expect("temp index opens"),
 		);

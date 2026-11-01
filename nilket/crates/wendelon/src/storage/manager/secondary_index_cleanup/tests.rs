@@ -338,6 +338,15 @@ async fn interrupted_staging_is_removed_by_actual_owned_manager_reopen() {
 		std::process::exit(0);
 	}
 	let dir = TestDir::new("sidecar-sweep-reopen");
+	// Reopen cleanup is permitted only with durable index authority.
+	drop(
+		crate::storage::index::PersistentLocalIndex::initialize_new(
+			crate::storage::index::persistent_index_path(&dir),
+			None,
+		)
+		.await
+		.unwrap(),
+	);
 	let published = leaf_dir(&dir).join("0000000000000003.idx");
 	std::fs::create_dir_all(published.parent().unwrap()).unwrap();
 	std::fs::write(&published, b"published-preserved").unwrap();
@@ -505,4 +514,62 @@ fn pd22_cleanup_accepts_exact_new_fingerprint_depth_and_preserves_other_shapes()
 			"cleanup crossed its exact namespace: {path:?}"
 		);
 	}
+}
+
+#[tokio::test]
+async fn unique_sidecar_finals_survive_cleanup_and_inventory_counts_unreferenced_bytes() {
+	let dir = TestDir::new("unique-sidecar-inventory");
+	let leaf =
+		leaf_dir(&dir).join("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+	std::fs::create_dir_all(&leaf).unwrap();
+	let current = leaf.join(format!(
+		"0000000000000003.idx.{}",
+		uuid::Uuid::new_v4().simple()
+	));
+	let previous = leaf.join(format!(
+		"0000000000000003.idx.{}",
+		uuid::Uuid::new_v4().simple()
+	));
+	let orphan = leaf.join(format!(
+		"0000000000000003.idx.{}",
+		uuid::Uuid::new_v4().simple()
+	));
+	let tmp = leaf.join(format!(
+		"{}.{}.tmp",
+		current.file_name().unwrap().to_str().unwrap(),
+		uuid::Uuid::new_v4().simple()
+	));
+	for (path, bytes) in [
+		(&current, b"current".as_slice()),
+		(&previous, b"old".as_slice()),
+		(&orphan, b"orphan".as_slice()),
+		(&tmp, b"temporary".as_slice()),
+	] {
+		std::fs::write(path, bytes).unwrap();
+	}
+	let owner = DataDirectoryOwner::acquire_existing(&dir).unwrap();
+	assert_eq!(
+		run_owned_cleanup(dir.to_path_buf(), Some(owner.clone()), NoHooks)
+			.await
+			.unwrap(),
+		1
+	);
+	assert!(!tmp.exists());
+	let referenced = [current.strip_prefix(&*dir).unwrap().to_path_buf()]
+		.into_iter()
+		.collect();
+	let mut files = scan_retained_secondary_files(&dir, Some(owner.clone()), referenced)
+		.await
+		.unwrap();
+	files.sort();
+	let mut expected = vec![
+		(previous.strip_prefix(&*dir).unwrap().to_path_buf(), 3),
+		(orphan.strip_prefix(&*dir).unwrap().to_path_buf(), 6),
+	];
+	expected.sort();
+	assert_eq!(files, expected);
+	for path in [&current, &previous, &orphan] {
+		assert!(path.exists());
+	}
+	owner.close(Duration::from_secs(10)).await.unwrap();
 }

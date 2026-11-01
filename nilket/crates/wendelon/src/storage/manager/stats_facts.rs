@@ -941,6 +941,7 @@ impl SlabManager {
 		tenant_id: TenantId,
 		descriptor: &TableSchemaDescriptor,
 	) -> std::io::Result<Option<TableOptimizerFacts>> {
+		self.require_tier_authority_ready()?;
 		let ndv_candidates = ndv_column_candidates(descriptor)?;
 		let range_candidates = range_column_candidates(descriptor)?;
 		let heavy_hitter_candidates = heavy_hitter_column_candidates(descriptor)?;
@@ -1034,7 +1035,9 @@ impl SlabManager {
 		slab_id: SlabId,
 		tenant_id: TenantId,
 		table_schemas: &TableSchemaCatalog,
+		acknowledged: &BTreeSet<u64>,
 	) -> std::io::Result<Option<TieredColumnStatsBlock>> {
+		self.require_tier_authority_ready()?;
 		let descriptors = table_schemas
 			.descriptors_for_tenant(tenant_id)
 			.into_iter()
@@ -1043,11 +1046,7 @@ impl SlabManager {
 		if descriptors.is_empty() {
 			return Ok(None);
 		}
-		let entries = recover_slab_entries_from_blob(
-			blob,
-			slab_id,
-			&self.acknowledged_offsets_in_slab(slab_id),
-		)?;
+		let entries = recover_slab_entries_from_blob(blob, slab_id, acknowledged)?;
 		let mut candidates: Option<Vec<TableSchemaDescriptor>> = None;
 		let mut saw_unmatched_row = false;
 		let mut row_batches = Vec::with_capacity(entries.len());

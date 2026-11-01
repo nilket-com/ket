@@ -20,18 +20,18 @@ pub(crate) fn row_visible_for_admission(
 	admission_hlc: HybridTimestamp,
 	effective_retention: &EffectiveRetention,
 	row_index: &SlabManager,
-) -> bool {
-	match descriptor.row_identity_policy {
+) -> std::io::Result<bool> {
+	Ok(match descriptor.row_identity_policy {
 		RowIdentityPolicy::PrimaryKey(_) => row_index
-			.lookup_as_of(tenant_id, key_identity, admission_hlc)
+			.lookup_as_of(tenant_id, key_identity, admission_hlc)?
 			.is_some_and(|location| !location.is_tombstone),
 		RowIdentityPolicy::AppendOnly | RowIdentityPolicy::AppendOnlyContentHash => row_index
-			.lookup(tenant_id, key_identity)
+			.lookup(tenant_id, key_identity)?
 			.is_some_and(|location| {
 				!location.is_tombstone
 					&& row_visible_under_retention(location.hlc, effective_retention)
 			}),
-	}
+	})
 }
 
 pub(crate) fn pk_delete_outcome_for_latest(
@@ -68,17 +68,17 @@ pub(crate) fn admit_pk_write_row(
 	key_identity: Identity,
 	admission_hlc: HybridTimestamp,
 	row_index: &SlabManager,
-) -> PkAdmissionOutcome {
-	match descriptor.row_identity_policy {
+) -> std::io::Result<PkAdmissionOutcome> {
+	Ok(match descriptor.row_identity_policy {
 		RowIdentityPolicy::PrimaryKey(_) => pk_write_outcome_for_latest(row_index.lookup_as_of(
 			tenant_id,
 			key_identity,
 			admission_hlc,
-		)),
+		)?),
 		RowIdentityPolicy::AppendOnly | RowIdentityPolicy::AppendOnlyContentHash => {
 			unreachable!("PK write admission only accepts primary-key row identity policy")
 		}
-	}
+	})
 }
 
 pub(crate) fn admit_pk_delete_row(
@@ -88,7 +88,7 @@ pub(crate) fn admit_pk_delete_row(
 	delete_hlc: HybridTimestamp,
 	effective_retention: &EffectiveRetention,
 	row_index: &SlabManager,
-) -> PkAdmissionOutcome {
+) -> std::io::Result<PkAdmissionOutcome> {
 	if row_visible_for_admission(
 		descriptor,
 		tenant_id,
@@ -96,9 +96,13 @@ pub(crate) fn admit_pk_delete_row(
 		delete_hlc,
 		effective_retention,
 		row_index,
-	) {
-		return PkAdmissionOutcome::DeletedSupersedingVisible;
+	)? {
+		return Ok(PkAdmissionOutcome::DeletedSupersedingVisible);
 	}
 
-	pk_delete_outcome_for_latest(row_index.lookup_as_of(tenant_id, key_identity, delete_hlc))
+	Ok(pk_delete_outcome_for_latest(row_index.lookup_as_of(
+		tenant_id,
+		key_identity,
+		delete_hlc,
+	)?))
 }

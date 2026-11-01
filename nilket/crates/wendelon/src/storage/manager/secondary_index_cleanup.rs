@@ -66,6 +66,10 @@ fn lower_hex(bytes: &[u8], width: usize) -> bool {
 			.all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
 }
 
+fn is_uuid_v4(uuid: &[u8]) -> bool {
+	lower_hex(uuid, 32) && uuid[12] == b'4' && matches!(uuid[16], b'8' | b'9' | b'a' | b'b')
+}
+
 fn is_sidecar_tmp(name: &[u8]) -> bool {
 	let Some(stem) = name.strip_suffix(b".tmp") else {
 		return false;
@@ -74,15 +78,120 @@ fn is_sidecar_tmp(name: &[u8]) -> bool {
 		return false;
 	};
 	let (slab, rest) = stem.split_at(dot);
-	let uuid = &rest[1..];
-	// The first dot follows the slab; the exact remaining spelling is idx.UUID.
-	let Some(uuid) = uuid.strip_prefix(b"idx.") else {
+	let Some(rest) = rest[1..].strip_prefix(b"idx.") else {
 		return false;
 	};
-	lower_hex(slab, 16)
-		&& lower_hex(uuid, 32)
-		&& uuid[12] == b'4'
-		&& matches!(uuid[16], b'8' | b'9' | b'a' | b'b')
+	if !lower_hex(slab, 16) {
+		return false;
+	}
+	let pieces = rest.split(|byte| *byte == b'.').collect::<Vec<_>>();
+	match pieces.as_slice() {
+		[staging] => is_uuid_v4(staging),
+		[final_id, staging] => is_uuid_v4(final_id) && is_uuid_v4(staging),
+		_ => false,
+	}
+}
+
+/// Recognize both the legacy final spelling and unique-attempt final names.
+fn is_sidecar_final(name: &[u8]) -> bool {
+	let Some(dot) = name.iter().position(|byte| *byte == b'.') else {
+		return false;
+	};
+	if !lower_hex(&name[..dot], 16) {
+		return false;
+	}
+	let rest = &name[dot + 1..];
+	if rest == b"idx" {
+		return true;
+	}
+	rest.strip_prefix(b"idx.").is_some_and(is_uuid_v4)
+}
+
+/// Inventory only recognized, unreferenced finals without following child
+/// symlinks. Files are retained; this path does not perform garbage collection.
+pub(super) async fn scan_retained_secondary_files(
+	dir: &Path,
+	owner: Option<DataDirectoryOwner>,
+	referenced: std::collections::HashSet<PathBuf>,
+) -> io::Result<Vec<(PathBuf, u64)>> {
+	let root_path = dir.to_path_buf();
+	spawn_blocking_io_owned(owner, move || {
+		let root = OpenOptions::new()
+			.read(true)
+			.custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+			.open(root_path)?;
+		let Some(sidecars) = open_child_dir(&root, c"secondary_index", 0, &mut NoHooks)? else {
+			return Ok(Vec::new());
+		};
+		let mut files = Vec::new();
+		scan_finals(
+			&sidecars,
+			0,
+			&PathBuf::from("secondary_index"),
+			&referenced,
+			&mut files,
+		)?;
+		Ok(files)
+	})
+	.await
+}
+
+fn scan_finals(
+	dir: &File,
+	depth: usize,
+	prefix: &Path,
+	referenced: &std::collections::HashSet<PathBuf>,
+	files: &mut Vec<(PathBuf, u64)>,
+) -> io::Result<()> {
+	let mut names = DirectoryStream::open(dir)?;
+	while let Some(name) = names.next_name()? {
+		let bytes = name.as_bytes();
+		if depth < 3 || (depth == 3 && lower_hex(bytes, 64)) {
+			let width = if depth == 0 {
+				16
+			} else if depth == 3 {
+				64
+			} else {
+				32
+			};
+			if !lower_hex(bytes, width) {
+				continue;
+			}
+			let cname = CString::new(bytes).expect("directory entry has no embedded NUL");
+			if let Some(child) = open_child_dir(dir, &cname, depth + 1, &mut NoHooks)? {
+				scan_finals(&child, depth + 1, &prefix.join(&name), referenced, files)?;
+			}
+		} else if (depth == 3 || depth == 4) && is_sidecar_final(bytes) {
+			let relative = prefix.join(&name);
+			if referenced.contains(&relative) {
+				continue;
+			}
+			let cname = CString::new(bytes).expect("directory entry has no embedded NUL");
+			let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+			// SAFETY: dir owns its fd and cname is a valid single component.
+			if unsafe {
+				libc::fstatat(
+					dir.as_raw_fd(),
+					cname.as_ptr(),
+					stat.as_mut_ptr(),
+					libc::AT_SYMLINK_NOFOLLOW,
+				)
+			} < 0
+			{
+				let error = io::Error::last_os_error();
+				if error.kind() == ErrorKind::NotFound {
+					continue;
+				}
+				return Err(error);
+			}
+			// SAFETY: fstatat succeeded and initialized stat.
+			let stat = unsafe { stat.assume_init() };
+			if stat.st_mode & libc::S_IFMT == libc::S_IFREG && stat.st_size >= 0 {
+				files.push((relative, stat.st_size as u64));
+			}
+		}
+	}
+	Ok(())
 }
 
 fn ignored_child_error(error: &io::Error) -> bool {

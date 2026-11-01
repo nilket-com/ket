@@ -1025,6 +1025,10 @@ impl CountingBenchObjectStore {
 
 #[async_trait]
 impl ObjectStore for CountingBenchObjectStore {
+	fn planned_upload_uri(&self, key: &str) -> std::io::Result<String> {
+		self.inner.planned_upload_uri(key)
+	}
+
 	async fn put(&self, key: &str, bytes: &[u8]) -> std::io::Result<String> {
 		self.inner.put(key, bytes).await
 	}

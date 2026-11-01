@@ -114,6 +114,14 @@ pub trait AsyncFileOps: Send + Sync {
 
 	async fn file_len(&self, path: &Path) -> std::io::Result<Option<u64>>;
 
+	/// Length of the owned descriptor, without resolving its path or blocking the runtime.
+	async fn opened_file_len(&self, handle: &FileHandle) -> std::io::Result<u64> {
+		let handle = handle.clone();
+		tokio::task::spawn_blocking(move || handle.file.metadata().map(|metadata| metadata.len()))
+			.await
+			.map_err(Error::other)?
+	}
+
 	async fn set_len(&self, handle: &FileHandle, len: u64) -> std::io::Result<()>;
 
 	async fn create_dir_all(&self, path: &Path) -> std::io::Result<()>;
@@ -698,6 +706,39 @@ pub async fn write_file(
 	file_ops.fsync(&handle).await
 }
 
+/// Resume only an identical pending restore. Existing bytes must be an exact
+/// prefix of the expected artifact, so retrying a partial write cannot replace
+/// unrelated or advanced live state. Rewriting the prefix is crash-resumable.
+pub(crate) async fn write_restore_file(
+	file_ops: &dyn AsyncFileOps,
+	path: &Path,
+	bytes: &[u8],
+	resume: bool,
+) -> std::io::Result<()> {
+	let exists = file_ops.file_len(path).await?.is_some();
+	if resume && exists && !bytes.starts_with(&file_ops.read_all(path).await?) {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!(
+				"pending restore artifact differs from backup: {}",
+				path.display()
+			),
+		));
+	}
+	write_file(
+		file_ops,
+		path,
+		OpenFlags {
+			write: true,
+			create_new: !resume || !exists,
+			..Default::default()
+		},
+		bytes,
+	)
+	.await?;
+	fsync_parent_dir(file_ops, path).await
+}
+
 pub async fn fsync_parent_dir(file_ops: &dyn AsyncFileOps, path: &Path) -> std::io::Result<()> {
 	let parent = path.parent().ok_or_else(|| {
 		Error::new(
@@ -990,6 +1031,16 @@ impl FaultyFileOps {
 
 	pub fn inject(&self, fault: InjectedFault) {
 		self.state.lock().unwrap().faults.push_back(fault);
+	}
+
+	/// Record a file whose durability is managed outside these file ops as
+	/// durable now, name and bytes: redb fsyncs its own commits.
+	pub fn mark_durable_for_test(&self, path: &Path) -> std::io::Result<()> {
+		let bytes = std::fs::read(path)?;
+		let mut state = self.state.lock().unwrap();
+		state.durable_paths.insert(path.to_path_buf());
+		state.durable_contents.insert(path.to_path_buf(), bytes);
+		Ok(())
 	}
 
 	pub fn crash(&self) -> std::io::Result<()> {

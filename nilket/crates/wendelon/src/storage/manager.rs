@@ -60,9 +60,9 @@ use crate::schema::{
 	ColumnNdvFact, ColumnRangeDistributionFact, ColumnRangeFact, CompactionJobId,
 	CompactionLevelIndex, EncodingPageByteOffset, HllPrecision, HybridTimestamp,
 	INDEX_REJECT_LOGICAL_FINGERPRINT_MISMATCH, Identity, IdentityPrefix, IndexObjectId,
-	IpcBufferIndex, IpcColumnOrdinal, Locality, LogicalSchemaFingerprint, ManifestEpoch, NdvFact,
-	NodeId, RecordBodyByteLen, RecordBodyByteOffset, RecordRowIndex, RowCount, RowGroupIndex,
-	SecondaryIndexCatalog, SecondaryIndexDescriptor, SecondaryIndexState,
+	IpcBufferIndex, IpcColumnOrdinal, Locality, LogicalSchemaFingerprint, ManifestEpoch,
+	MigrationCursor, NdvFact, NodeId, RecordBodyByteLen, RecordBodyByteOffset, RecordRowIndex,
+	RowCount, RowGroupIndex, SecondaryIndexCatalog, SecondaryIndexDescriptor, SecondaryIndexState,
 	SelectivityFractionMicros, SimdPageValueCount, SlabId, SlabRecordHeader, SupersessionMetadata,
 	TableLifecycleCatalog, TableOptimizerFacts, TableReferenceIntegrityFailureMeta, TenantId,
 	TenantKekId, TombstoneMetadata, WriterNodeId, range_fact_tag_supported,
@@ -77,8 +77,8 @@ use crate::storage::columnar::{
 	survival_mask_projected_record_batch,
 };
 use crate::storage::core::{
-	AppendReservation, GroupCommitConfig, LocalSlabStore, MultiRowIndexEntry, RecordLocation,
-	RecoveredSlabEntry, StorageEngine, insert_version_sorted, newest_version_as_of,
+	AppendInFlight, AppendReservation, GroupCommitConfig, LocalSlabStore, MultiRowIndexEntry,
+	RecordLocation, RecoveredSlabEntry, StorageEngine, insert_version_sorted, newest_version_as_of,
 	recover_slab_entries_from_blob, recover_slab_entries_from_blob_skipping_counters,
 	remove_version_exact, storage_multirow_index_entries_from_frame, validate_row_tombstone_chain,
 };
@@ -171,7 +171,7 @@ use crate::storage::{
 	OpenFlags, SlabPinGuard, SlabPinTable, SlabState, TierCommitter, VersionEntry,
 	VersionLifecycle, VisibleDomainRow, apply_elision, cluster_retention_floor,
 	compaction_visible_domain_summary, effective_table_retention, required_output_run_count,
-	storage_row_table_object_id_at, survivor_records, write_file,
+	storage_row_table_object_id_at, survivor_records,
 };
 use crate::storage::{core, counter};
 use arrow::array::{Array, BooleanArray};
@@ -195,19 +195,41 @@ use tokio::time::Instant;
 use zeroize::Zeroizing;
 
 mod counter_visibility;
+mod publication_accounting;
+use publication_accounting::{CounterPendingGuards, RetainedSecondarySidecars};
 mod encoding_compute;
+mod metadata_observation;
 mod observation;
 mod open;
+pub(crate) use open::IndexRecoveryAuthority;
 mod retention_reclaim;
 mod stats_facts;
 use retention_reclaim::{
 	cleanup_retention_rewrite_tmp_files, retention_rewrite_tmp_path, table_drop_rewrite_tmp_path,
 };
+mod relocation;
+pub(crate) mod tier_authority;
+mod tier_generation;
+mod tier_plan;
+mod version_identity;
+use tier_generation::{ReadTarget, TierLayout};
+pub use tier_generation::{
+	StaleLocation, StaleLocationReason, stale_location, stale_location_error,
+};
+use version_identity::IncomingVersion;
+mod slab_file_quarantine;
 mod tiered_io;
+use relocation::{KeyRelocation, RelocationInsertion, RelocationPair, decrement_reference_count};
+pub use slab_file_quarantine::{
+	DisagreeingSlabFileReason, QuarantinedSlabFile, QuarantinedSlabFilesReport,
+};
+#[cfg(test)]
+mod pause_hooks;
 use tiered_io::{
-	RehydratedSlabState, SlabBacking, build_tiered_object_metadata, decode_tiered_blob,
-	descriptor_matches_tiered_row, extract_record_from_blob, fetch_tiered_ciphertext_runs,
-	validate_tiered_blob, validate_tiered_record_header_tenant,
+	RehydratedSlabState, SlabBacking, TierObjectEvidence, TieredPlaintext,
+	build_tiered_object_metadata, decode_tiered_blob, descriptor_matches_tiered_row,
+	extract_record_from_blob, fetch_tiered_ciphertext_runs, validate_tiered_blob,
+	validate_tiered_record_header_tenant,
 };
 mod compaction;
 use compaction::{
@@ -218,7 +240,10 @@ mod maintenance_publication;
 use maintenance_publication::{
 	maintenance_staged_slab_path, reconcile_staged_maintenance_publications,
 };
+mod index_publication;
+use index_publication::{IndexPublication, IndexPublicationState, SingleAppendEvidence};
 mod lsm_driver;
+pub(crate) use lsm_driver::AcceptedControlLsmCompletion;
 use lsm_driver::{
 	cleanup_lsm_compaction_tmp_files, lsm_run_summary_from_index, refresh_lsm_level_metrics,
 	remove_non_live_lsm_rows_from_index,
@@ -243,6 +268,7 @@ const STORAGE_BACKUP_FORMAT_VERSION: u16 = 1;
 
 type TenantKey = (TenantId, Identity);
 type PendingCounterFrame = (TenantId, Identity, u64, u32, u32, u32, SlabId, u64);
+
 type TenantLocalityMembers = BTreeMap<TenantId, BTreeSet<(Locality, Identity)>>;
 
 const DEFAULT_L2_TAIL_READ_WINDOW_BYTES: u64 = 64 * 1024;
@@ -436,6 +462,15 @@ pub struct TieredSlabPointer {
 }
 
 impl TieredSlabPointer {
+	/// Immutable object generation for retirement. Advisory visibility
+	/// summaries can change without reintroducing a retired object.
+	pub(crate) fn same_object_generation(&self, other: &Self) -> bool {
+		let mut normalized = other.clone();
+		normalized.tombstone_metadata = self.tombstone_metadata;
+		normalized.supersession_metadata = self.supersession_metadata;
+		self == &normalized
+	}
+
 	pub fn record_tombstone_hlc(&mut self, tombstone_hlc: HybridTimestamp) {
 		self.tombstone_metadata = crate::storage::aggregate::merge_earliest_tombstone(
 			self.tombstone_metadata,
@@ -495,13 +530,7 @@ pub struct RetentionPruningReport {
 	pub reclaimed_bytes: u64,
 }
 
-/// Outcome of one explicit table-drop reclaim pass.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct TableDropReclaimReport {
-	pub compacted_slabs: usize,
-	pub reclaimed_records: usize,
-	pub reclaimed_bytes: u64,
-}
+pub use retention_reclaim::{TableDropReclaimReport, TableDropReclaimStatus};
 
 /// Stable scan position for one ADR 0095 bounded reclaim phase. The upper
 /// bound is captured on the first slice: after mutation drain closes, newer
@@ -515,6 +544,7 @@ pub struct TableDropReclaimCursor {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TableDropReclaimSliceReport {
+	pub status: TableDropReclaimStatus,
 	pub cursor_next: TableDropReclaimCursor,
 	pub examined: usize,
 	pub rewritten: usize,
@@ -562,6 +592,7 @@ pub(crate) enum PreparedTieredRetentionRewrite {
 	Rewrite {
 		slab_id: SlabId,
 		old_l2_uri: String,
+		old_bytes: u64,
 		encrypted_bytes: Vec<u8>,
 		payload_hash: [u8; 32],
 		tombstone_metadata: TombstoneMetadata,
@@ -573,6 +604,7 @@ pub(crate) enum PreparedTieredRetentionRewrite {
 	Retire {
 		slab_id: SlabId,
 		old_l2_uri: String,
+		old_bytes: u64,
 		pruned_versions: usize,
 		retention_stats: RetentionCompactionStats,
 		reclaimed_bytes: u64,
@@ -586,6 +618,7 @@ pub(crate) enum PreparedTieredTableDropRewrite {
 	Rewrite {
 		slab_id: SlabId,
 		old_l2_uri: String,
+		old_bytes: u64,
 		encrypted_bytes: Vec<u8>,
 		payload_hash: [u8; 32],
 		tombstone_metadata: TombstoneMetadata,
@@ -596,6 +629,7 @@ pub(crate) enum PreparedTieredTableDropRewrite {
 	Retire {
 		slab_id: SlabId,
 		old_l2_uri: String,
+		old_bytes: u64,
 		reclaimed_records: usize,
 		reclaimed_bytes: u64,
 	},
@@ -620,6 +654,8 @@ pub struct SlabManager {
 	/// This is volatile in-flight state; after restart unmarked tentatives are
 	/// ordinary recovery orphans and can be copied safely.
 	counter_pending_frames: DashSet<PendingCounterFrame>,
+	counter_pending_guards: CounterPendingGuards,
+	slab_publication_revisions: DashMap<SlabId, u64>,
 	/// L0 sources whose class-preserving counter work made the current LSM plan
 	/// ineligible. Excluding just these inputs lets ordinary L0 work proceed.
 	counter_deferred_l0_slabs: DashSet<SlabId>,
@@ -667,6 +703,18 @@ pub struct SlabManager {
 	/// state machine, and their redb transactions also stamp the
 	/// highest applied control-log index we have mirrored so far.
 	persistent_index: Option<Arc<PersistentLocalIndex>>,
+	pending_metadata_tokens: DashMap<SlabId, crate::storage::index::PendingMetadataTokens>,
+	completed_metadata_retries: DashMap<(SlabId, u64), crate::storage::index::MetadataKind>,
+	persistent_index_gate: Arc<tokio::sync::RwLock<()>>,
+	index_authority_unavailable: AtomicBool,
+	lsm_install_unresolved: DashMap<CompactionJobId, lsm_driver::UnresolvedLsmScope>,
+	// Lock order: all required tier locks, then this scope gate, then state.
+	// Never acquire a tier lock while holding either scope guard.
+	lsm_intent_scope_gate: Arc<tokio::sync::RwLock<()>>,
+	pending_index_publications: Arc<DashMap<(SlabId, u64), IndexPublicationState>>,
+	single_append_publication_evidence: Arc<DashMap<(SlabId, u64), SingleAppendEvidence>>,
+	index_publication_revision: std::sync::atomic::AtomicU64,
+	orphaned_index_publications: Arc<std::sync::atomic::AtomicUsize>,
 	/// ADR 0097 decision 4: the one admission truth every maintenance tick, the
 	/// reservation guard and the operator accessor consult. Hydrated once at open
 	/// from the persistent index and never replaced.
@@ -715,6 +763,7 @@ pub struct SlabManager {
 	/// lifecycle backfill can persist the same source slab's sidecar at once;
 	/// unserialized, their temp files and catalog rows interleave.
 	secondary_index_persist_stripes: Box<[tokio::sync::RwLock<()>]>,
+	retained_secondary_sidecars: Arc<RetainedSecondarySidecars>,
 	/// Per-slab rewrite claim shared by every reader that must retain a physical
 	/// source and every operation that can replace or retire it. Secondary-index
 	/// backfill holds a shared claim; compaction, retention, and ADR 0095 table
@@ -725,6 +774,67 @@ pub struct SlabManager {
 	/// locator identity. This avoids repeated L2 range reads and
 	/// AEAD decrypts for WFRM query bursts over the same cold slab.
 	tiered_stats_cache: DashMap<TieredStatsCacheKey, ParsedColumnStatsBlock>,
+	/// Per-slab tier publication locks (tier publication and retirement only).
+	tier_publication_locks: DashMap<SlabId, Arc<tokio::sync::Mutex<()>>>,
+	/// Serializes legacy cleanup with new unresolved records for a slab.
+	cleanup_claims: DashMap<SlabId, Arc<tokio::sync::Mutex<()>>>,
+	/// Every copy of a version whose identity is claimed by different payloads;
+	/// rebuilt at each open. Reads of these refuse.
+	conflicted_locations: DashSet<RecordLocation>,
+	/// Tiered slabs not yet verified against their objects since open.
+	unverified_tier_slabs: DashSet<SlabId>,
+	tier_authority: Arc<tier_authority::TierAuthority>,
+	installed_snapshot_index: std::sync::RwLock<Option<u64>>,
+	snapshot_epoch: Arc<std::sync::atomic::AtomicU64>,
+	snapshot_epoch_gate: Arc<std::sync::RwLock<()>>,
+	awaiting_cluster: AtomicBool,
+	/// Tiered slabs retired in this process; a later publication for one is stale.
+	retired_tier_slabs: DashSet<SlabId>,
+	/// Committed tier pointers this node failed to publish, with the typed
+	/// refusal when the failure was one (replayed without retrying the plan).
+	// The optional third field is evidence of an actual Some-index TierSlab
+	// callback. Metadata/comparison refusals never invent replay provenance.
+	unapplied_tier_pointers:
+		DashMap<SlabId, (TieredSlabPointer, Option<StaleLocationReason>, Option<u64>)>,
+	#[cfg(test)]
+	counter_rollback_fail_once: std::sync::atomic::AtomicBool,
+	#[cfg(test)]
+	lsm_control_install_hold: lsm_driver::ControlLsmInstallHold,
+	#[cfg(test)]
+	lsm_after_rename_hold:
+		std::sync::Mutex<Option<(Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>>,
+	#[cfg(test)]
+	lsm_fail_before_rename: std::sync::atomic::AtomicBool,
+	#[cfg(test)]
+	lsm_after_output_publish_hold:
+		std::sync::Mutex<Option<(Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>>,
+	#[cfg(test)]
+	lsm_after_install_hold:
+		std::sync::Mutex<Option<(Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>>,
+	#[cfg(test)]
+	lsm_after_intent_clear_hold:
+		std::sync::Mutex<Option<(Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>>,
+	#[cfg(test)]
+	lsm_capture_hold:
+		std::sync::Mutex<Option<(Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>>,
+	#[cfg(test)]
+	counter_rollback_hold:
+		std::sync::Mutex<Option<(Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>>,
+	#[cfg(test)]
+	continuity_test_holds: pause_hooks::TestHolds,
+	/// Durable cleanup intents that cannot be resolved from a stale local pointer.
+	unresolved_tier_cleanup: retention_reclaim::UnresolvedTierCleanup,
+	deferred_table_drop_l2: retention_reclaim::DeferredTableDropL2,
+	cleanup_scan_schedule: retention_reclaim::CleanupScanSchedule,
+	/// Local slab files open found disagreeing with the committed tier state;
+	/// fixed at open, never served or unlinked.
+	quarantined_slab_files: slab_file_quarantine::SlabFileQuarantine,
+	/// Slab ids whose local file an operation of this process removed from
+	/// `state` and has not yet unlinked: the only slab files it may unlink.
+	released_slab_files: DashSet<SlabId>,
+	/// Test-only pause points (manager/pause_hooks.rs).
+	#[cfg(test)]
+	test_pauses: pause_hooks::TestPauses,
 }
 
 /// Which durable reference was found to point at a missing backing slab.
@@ -820,6 +930,22 @@ struct ManagerState {
 	/// hot-read path against duplicate local installs.
 	rehydrating: HashSet<SlabId>,
 	next_slab_id: SlabId,
+	/// Each tiered slab's published generation history; absent means
+	/// generation 0 with no history.
+	tier_layouts: DashMap<SlabId, Arc<TierLayout>>,
+}
+
+impl ManagerState {
+	/// The only writer of `next_slab_id` after open. A released slab id is
+	/// below it and is never allocated again, so the id-keyed release in
+	/// `slab_file_quarantine.rs` can never unlink a newer file.
+	fn advance_slab_allocator(&mut self, next: SlabId) {
+		debug_assert!(
+			next >= self.next_slab_id,
+			"the slab allocator only advances"
+		);
+		self.next_slab_id = self.next_slab_id.max(next);
+	}
 }
 
 impl SlabManager {
@@ -829,57 +955,26 @@ impl SlabManager {
 		key_identity: Identity,
 		hlc: HybridTimestamp,
 		frame: &[u8],
-	) -> std::io::Result<(Arc<LocalSlabStore>, RecordLocation)> {
+	) -> std::io::Result<(
+		Arc<LocalSlabStore>,
+		RecordLocation,
+		Option<Arc<AppendInFlight>>,
+	)> {
 		let (slab, reservation) = self.target_for_append(frame.len(), None).await?;
+		let guard = reservation.quiescence_guard();
 		let location = slab
 			.append_reserved(reservation, tenant_id, key_identity, hlc, frame)
 			.await?;
-		Ok((slab, location))
+		Ok((slab, location, guard))
 	}
 
-	fn index_appended_location(
-		&self,
-		tenant_id: TenantId,
-		key_identity: Identity,
-		location: RecordLocation,
-	) {
-		self.index_appended_location_with_locality(
-			tenant_id,
-			key_identity,
-			Locality::from(key_identity),
-			location,
-		);
-	}
-
-	fn index_appended_location_with_locality(
-		&self,
-		tenant_id: TenantId,
-		key_identity: Identity,
-		routing_locality: Locality,
-		location: RecordLocation,
-	) {
-		self.key_index
-			.entry((tenant_id, key_identity))
-			.and_modify(|versions| insert_version_sorted(versions, location))
-			.or_insert_with(|| vec![location]);
-		self.insert_locality_membership_with_locality(tenant_id, key_identity, routing_locality);
-	}
-
-	fn latest_location_before(
-		&self,
-		tenant_id: TenantId,
-		key_identity: Identity,
-		hlc: HybridTimestamp,
-	) -> Option<RecordLocation> {
-		self.key_index
-			.get(&(tenant_id, key_identity))
-			.and_then(|versions| {
-				versions
-					.iter()
-					.filter(|location| location.hlc < hlc)
-					.max_by_key(|location| location.hlc)
-					.copied()
-			})
+	/// Caller must own the matching tier publication lock.
+	fn bump_slab_publication_revision(&self, slab_id: SlabId) -> std::io::Result<()> {
+		let mut revision = self.slab_publication_revisions.entry(slab_id).or_insert(0);
+		*revision = revision
+			.checked_add(1)
+			.ok_or_else(|| Error::other("slab publication revision exhausted"))?;
+		Ok(())
 	}
 
 	fn rollback_indexed_location(
@@ -889,8 +984,7 @@ impl SlabManager {
 		location: RecordLocation,
 	) {
 		let key = (tenant_id, key_identity);
-		let (removed, should_remove_key) = if let Some(mut versions) = self.key_index.get_mut(&key)
-		{
+		let (removed, now_empty) = if let Some(mut versions) = self.key_index.get_mut(&key) {
 			let removed = remove_version_exact(&mut versions, location);
 			(removed, removed && versions.is_empty())
 		} else {
@@ -899,9 +993,10 @@ impl SlabManager {
 		if removed {
 			self.remove_published_table_reference(location);
 		}
-		if should_remove_key {
-			self.key_index.remove(&key);
-			self.remove_locality_membership(tenant_id, key_identity);
+		if now_empty {
+			#[cfg(test)]
+			self.empty_key_removal_pause_point();
+			self.remove_key_if_empty(tenant_id, key_identity);
 		}
 	}
 
@@ -924,7 +1019,7 @@ impl SlabManager {
 
 	/// Append a tentative counter value to the active slab, durably commit that
 	/// exact slab write, then index it live. The record class is fixed
-	/// `COUNTER_TENTATIVE`; recovery indexes it only if a matching commit marker
+	/// `COUNTER_TENTATIVE_V2`; recovery indexes it only if a matching commit marker
 	/// is found, so an un-committed tentative does not survive restart.
 	pub async fn counter_append_tentative(
 		&self,
@@ -934,18 +1029,21 @@ impl SlabManager {
 		value: u64,
 		origin: NodeId,
 	) -> std::io::Result<RecordLocation> {
+		self.require_tier_authority_ready()?;
 		let frame = super::counter::encode_origin_frame(value, origin)?;
+		let checked_same_hlc = self
+			.refuse_conflicting_version(
+				tenant_id,
+				key_identity,
+				hlc,
+				IncomingVersion::Counter { value, origin },
+			)
+			.await?;
 		let (slab, reservation) = self
 			.target_for_append(frame.len(), Some((tenant_id, key_identity, hlc, origin)))
 			.await?;
-		let pending = Self::pending_counter_frame(
-			tenant_id,
-			key_identity,
-			hlc,
-			origin,
-			slab.slab_id(),
-			reservation.offset(),
-		);
+		let _append_guard = reservation.quiescence_guard();
+
 		let location = match slab
 			.write_reserved(
 				reservation,
@@ -959,7 +1057,7 @@ impl SlabManager {
 		{
 			Ok(location) => location,
 			Err(error) => {
-				self.counter_pending_frames.remove(&pending);
+				// The write may have left a frame or detached work. Keep its hold.
 				return Err(error);
 			}
 		};
@@ -967,16 +1065,25 @@ impl SlabManager {
 		// tentative slab. A failed barrier leaves no live index entry or pending
 		// replica state; the written frame remains an uncommitted recovery orphan.
 		if let Err(error) = slab.wait_durable_commit().await {
-			self.counter_pending_frames.remove(&pending);
+			// A durable frame may remain; abandonment is not proven.
 			return Err(error);
 		}
-		self.index_appended_location(tenant_id, key_identity, location);
+		if let Err(error) = self.index_checked_version(
+			tenant_id,
+			key_identity,
+			Locality::from(key_identity),
+			location,
+			checked_same_hlc,
+		) {
+			// A durable frame may remain; abandonment is not proven.
+			return Err(error);
+		}
 		Ok(location)
 	}
 
 	/// Append a durable commit marker for `tentative_op_id` (the tentative's slab
 	/// offset) to the active slab and flush. The record class is fixed
-	/// `COUNTER_COMMIT`; the marker is NOT a version, so it is not indexed. The
+	/// `COUNTER_COMMIT_V2`; the marker is NOT a version, so it is not indexed. The
 	/// tentative and its marker must be co-located in one slab — true within a
 	/// single add (no rotation between the two writes); cross-slab pairing under
 	/// rotation is a follow-on for the compaction path.
@@ -988,8 +1095,10 @@ impl SlabManager {
 		tentative_op_id: u64,
 		origin: NodeId,
 	) -> std::io::Result<()> {
+		self.require_tier_authority_ready()?;
 		let marker = super::counter::encode_origin_frame(tentative_op_id, origin)?;
 		let (slab, reservation) = self.target_for_append(marker.len(), None).await?;
+		let _append_guard = reservation.quiescence_guard();
 		slab.write_reserved(
 			reservation,
 			tenant_id,
@@ -1006,19 +1115,44 @@ impl SlabManager {
 	/// Remove a tentative counter version from the live `key_index` (rollback).
 	/// No durable abort marker — recovery skips the orphan (it has no commit
 	/// marker). Counter-shaped wrapper over the in-memory version removal.
-	pub fn counter_unindex_tentative(
+	pub async fn counter_unindex_tentative(
 		&self,
 		tenant_id: TenantId,
 		key_identity: Identity,
 		location: RecordLocation,
-	) {
+	) -> std::io::Result<()> {
+		let tier_lock = self.tier_publication_lock(location.slab_id);
+		let _guard = tier_lock.lock().await;
+		self.rollback_indexed_location(tenant_id, key_identity, location);
+		#[cfg(test)]
+		if self
+			.counter_rollback_fail_once
+			.swap(false, Ordering::AcqRel)
+		{
+			return Err(std::io::Error::other("injected counter rollback failure"));
+		}
+		self.bump_slab_publication_revision(location.slab_id)?;
+		#[cfg(test)]
+		{
+			let hold = self.counter_rollback_hold.lock().unwrap().clone();
+			if let Some((entered, release)) = hold {
+				entered.add_permits(1);
+				let _ = release.acquire().await;
+			}
+		}
 		self.counter_pending_frames.retain(|pending| {
 			!(pending.0 == tenant_id
 				&& pending.1 == key_identity
 				&& pending.6 == location.slab_id
 				&& pending.7 == location.offset)
 		});
-		self.rollback_indexed_location(tenant_id, key_identity, location);
+		self.counter_pending_guards.retain(|pending, _| {
+			!(pending.0 == tenant_id
+				&& pending.1 == key_identity
+				&& pending.6 == location.slab_id
+				&& pending.7 == location.offset)
+		});
+		Ok(())
 	}
 
 	/// Mark a V2 tentative no longer pending only after the corresponding marker
@@ -1027,17 +1161,19 @@ impl SlabManager {
 		&self,
 		tenant_id: TenantId,
 		key_identity: Identity,
-		hlc: HybridTimestamp,
+		location: RecordLocation,
 		origin: NodeId,
 	) {
-		self.counter_pending_frames.retain(|pending| {
-			!(pending.0 == tenant_id
-				&& pending.1 == key_identity
-				&& pending.2 == hlc.physical_ms
-				&& pending.3 == hlc.logical
-				&& pending.4 == hlc.node_id
-				&& pending.5 == origin.id)
-		});
+		let pending = Self::pending_counter_frame(
+			tenant_id,
+			key_identity,
+			location.hlc,
+			origin,
+			location.slab_id,
+			location.offset,
+		);
+		self.counter_pending_frames.remove(&pending);
+		self.counter_pending_guards.remove(&pending);
 	}
 
 	pub(crate) fn counter_frame_is_pending(&self, frame: &core::ScannedCounterFrame) -> bool {
@@ -1075,20 +1211,12 @@ impl SlabManager {
 		&self,
 		tenant_id: TenantId,
 		key_identity: Identity,
-	) -> Option<Locality> {
-		self.key_localities
+	) -> std::io::Result<Option<Locality>> {
+		self.require_tier_authority_ready()?;
+		Ok(self
+			.key_localities
 			.get(&(tenant_id, key_identity))
-			.map(|entry| *entry.value())
-	}
-
-	fn routing_locality_for_identity_any_tenant(&self, key_identity: Identity) -> Locality {
-		// Migration cursors carry identity + HLC, while the scan
-		// order is locality + identity + HLC. Resolve the current
-		// routing locality for table-spread rows before resuming.
-		self.key_localities
-			.iter()
-			.find_map(|entry| (entry.key().1 == key_identity).then_some(*entry.value()))
-			.unwrap_or_else(|| Locality::from(key_identity))
+			.map(|entry| *entry.value()))
 	}
 
 	fn recovered_entry_routing_locality(&self, entry: &RecoveredSlabEntry) -> Locality {
@@ -1109,7 +1237,7 @@ impl SlabManager {
 			tenant_id,
 			key_identity,
 			routing_locality: self.routing_locality_for_key(tenant_id, key_identity),
-			table_object_id: self.published_table_object_id(location),
+			table_object_id: self.published_table_object_id_for_recovery(location),
 			// ADR 0090: rebuilt rows keep the location's own placement.
 			placement: location.placement,
 			partition: location.partition,
@@ -1123,10 +1251,12 @@ impl SlabManager {
 		key_identity: Identity,
 		routing_locality: Locality,
 	) {
+		// `key_localities` changes only under the locality write lock, so a
+		// concurrent empty-key removal cannot interleave with this publication.
+		let mut locality_index = recover_rwlock_write(&self.locality_index, "locality_index");
 		let previous = self
 			.key_localities
 			.insert((tenant_id, key_identity), routing_locality);
-		let mut locality_index = recover_rwlock_write(&self.locality_index, "locality_index");
 		if let Some(previous_locality) = previous {
 			if previous_locality != routing_locality {
 				if let Some(members) = locality_index.get_mut(&tenant_id) {
@@ -1138,21 +1268,6 @@ impl SlabManager {
 			.entry(tenant_id)
 			.or_default()
 			.insert((routing_locality, key_identity));
-	}
-
-	fn remove_locality_membership(&self, tenant_id: TenantId, key_identity: Identity) {
-		let mut locality_index = recover_rwlock_write(&self.locality_index, "locality_index");
-		let routing_locality = self.routing_locality_for_key(tenant_id, key_identity);
-		let should_remove_tenant = if let Some(members) = locality_index.get_mut(&tenant_id) {
-			members.remove(&(routing_locality, key_identity));
-			members.is_empty()
-		} else {
-			false
-		};
-		if should_remove_tenant {
-			locality_index.remove(&tenant_id);
-		}
-		self.key_localities.remove(&(tenant_id, key_identity));
 	}
 
 	/// Append a record whose routing locality is not the identity
@@ -1167,9 +1282,29 @@ impl SlabManager {
 		hlc: HybridTimestamp,
 		frame: &[u8],
 	) -> std::io::Result<RecordLocation> {
+		self.require_tier_authority_ready()?;
 		self.observe_publication(tenant_id, async {
+			let metadata_epoch = self.capture_snapshot_epoch();
 			let superseded = self.latest_location_before(tenant_id, key_identity, hlc);
-			let (slab, location) = self
+			let checked_same_hlc = self
+				.refuse_conflicting_version(
+					tenant_id,
+					key_identity,
+					hlc,
+					IncomingVersion::Record(frame),
+				)
+				.await?;
+			let metadata_token = match superseded {
+				Some(previous) => {
+					self.begin_pending_metadata_operation(
+						previous.slab_id,
+						crate::storage::index::MetadataKind::Supersession,
+					)
+					.await?
+				}
+				None => None,
+			};
+			let (slab, location, _append_guard) = self
 				.append_on_target(tenant_id, key_identity, hlc, frame)
 				.await?;
 			if let Err(err) = slab.wait_durable_commit().await {
@@ -1177,24 +1312,54 @@ impl SlabManager {
 				self.rollback_indexed_location(tenant_id, key_identity, location);
 				return Err(err);
 			}
+			let row = PersistentRecordRow {
+				tenant_id,
+				key_identity,
+				routing_locality,
+				table_object_id: None,
+				placement: location.placement,
+				partition: location.partition,
+				location,
+			};
+			let publication = self.begin_single_append_publication(row, frame).await?;
 			if let Err(err) = self
-				.persist_record_row_strict(tenant_id, key_identity, routing_locality, location)
+				.persist_record_row_strict(
+					tenant_id,
+					key_identity,
+					routing_locality,
+					location,
+					&publication,
+				)
 				.await
 			{
 				slab.rollback_index_entry(tenant_id, key_identity, location);
 				self.rollback_indexed_location(tenant_id, key_identity, location);
 				return Err(err);
 			}
-			self.index_appended_location_with_locality(
+			if let Err(err) = self.index_checked_version(
 				tenant_id,
 				key_identity,
 				routing_locality,
 				location,
-			);
+				checked_same_hlc,
+			) {
+				slab.rollback_index_entry(tenant_id, key_identity, location);
+				return Err(err);
+			}
+			publication.complete();
+			#[cfg(test)]
+			self.append_metadata_observed_pause_point().await;
 			if let Some(previous) = superseded {
+				// A durable row must not be reported failed if metadata publication fails.
 				let _ = self
-					.record_supersession_for_slab(previous.slab_id, hlc, None)
-					.await?;
+					.record_supersession_for_slab_at_epoch(
+						previous.slab_id,
+						hlc,
+						None,
+						metadata_epoch,
+						metadata_token,
+					)
+					.await;
 			}
 			Ok(location)
 		})
@@ -1207,7 +1372,9 @@ impl SlabManager {
 		frame: &[u8],
 		entries: &[MultiRowIndexEntry],
 	) -> std::io::Result<RecordLocation> {
+		self.require_tier_authority_ready()?;
 		self.observe_publication(tenant_id, async {
+			let metadata_epoch = self.capture_snapshot_epoch();
 			let Some(primary) = entries.first().copied() else {
 				return Err(Error::new(
 					ErrorKind::InvalidInput,
@@ -1229,6 +1396,21 @@ impl SlabManager {
 				.map(|entry| entry.row_hlc)
 				.max()
 				.unwrap_or(primary.row_hlc);
+			let mut checked_same_hlc = Vec::with_capacity(entries.len());
+			for entry in entries {
+				checked_same_hlc.push(
+					self.refuse_conflicting_version(
+						tenant_id,
+						entry.key_identity,
+						entry.row_hlc,
+						IncomingVersion::Row {
+							batch: &batch,
+							row: entry.record_row_index.get() as usize,
+						},
+					)
+					.await?,
+				);
+			}
 			let mut superseded = Vec::new();
 			let mut tombstoned = Vec::new();
 			for entry in entries {
@@ -1242,7 +1424,45 @@ impl SlabManager {
 					}
 				}
 			}
-			let (slab, base_location) = self
+			let mut supersession_by_slab = BTreeMap::new();
+			for (slab, event) in superseded {
+				supersession_by_slab
+					.entry(slab)
+					.and_modify(|existing: &mut HybridTimestamp| *existing = (*existing).min(event))
+					.or_insert(event);
+			}
+			let mut tombstone_by_slab = BTreeMap::new();
+			for (slab, event) in tombstoned {
+				tombstone_by_slab
+					.entry(slab)
+					.and_modify(|existing: &mut HybridTimestamp| *existing = (*existing).min(event))
+					.or_insert(event);
+			}
+			let mut supersession_tokens = HashMap::new();
+			for slab in supersession_by_slab.keys() {
+				if let Some(token) = self
+					.begin_pending_metadata_operation(
+						*slab,
+						crate::storage::index::MetadataKind::Supersession,
+					)
+					.await?
+				{
+					supersession_tokens.insert(*slab, token);
+				}
+			}
+			let mut tombstone_tokens = HashMap::new();
+			for slab in tombstone_by_slab.keys() {
+				if let Some(token) = self
+					.begin_pending_metadata_operation(
+						*slab,
+						crate::storage::index::MetadataKind::Tombstone,
+					)
+					.await?
+				{
+					tombstone_tokens.insert(*slab, token);
+				}
+			}
+			let (slab, base_location, _append_guard) = self
 				.append_on_target(tenant_id, primary.key_identity, record_hlc, frame)
 				.await?;
 			if let Err(err) = slab.wait_durable_commit().await {
@@ -1283,7 +1503,13 @@ impl SlabManager {
 					})
 				})
 				.collect::<std::io::Result<Vec<_>>>()?;
-			if let Err(err) = self.persist_record_rows_strict(rows.clone()).await {
+			let publication = self
+				.begin_index_publication(vec![base_location.slab_id])
+				.await?;
+			if let Err(err) = self
+				.persist_record_rows_strict(rows.clone(), &publication)
+				.await
+			{
 				slab.rollback_index_entry(tenant_id, primary.key_identity, base_location);
 				for row in &rows {
 					self.rollback_indexed_location(row.tenant_id, row.key_identity, row.location);
@@ -1292,27 +1518,51 @@ impl SlabManager {
 			}
 
 			slab.rollback_index_entry(tenant_id, primary.key_identity, base_location);
-			for row in &rows {
+			for (row, checked_same_hlc) in rows.iter().zip(checked_same_hlc) {
+				// The reference is counted before the location is indexed, so an
+				// indexed attributed row is always counted.
+				if let Some(table_object_id) = row.table_object_id {
+					#[cfg(test)]
+					self.append_reference_publication_pause_point();
+					self.add_published_table_reference(tenant_id, table_object_id, row.location);
+				}
 				slab.index_location(row.tenant_id, row.key_identity, row.location);
-				self.index_appended_location_with_locality(
+				if let Err(err) = self.index_checked_version(
 					row.tenant_id,
 					row.key_identity,
 					row.routing_locality,
 					row.location,
-				);
-				if let Some(table_object_id) = row.table_object_id {
-					self.add_published_table_reference(tenant_id, table_object_id, row.location);
+					checked_same_hlc,
+				) {
+					slab.rollback_index_entry(row.tenant_id, row.key_identity, row.location);
+					self.remove_published_table_reference(row.location);
+					return Err(err);
 				}
 			}
-			for (slab_id, supersession_hlc) in superseded {
+			publication.complete();
+			#[cfg(test)]
+			self.append_metadata_observed_pause_point().await;
+			for (slab_id, supersession_hlc) in supersession_by_slab {
 				let _ = self
-					.record_supersession_for_slab(slab_id, supersession_hlc, None)
-					.await?;
+					.record_supersession_for_slab_at_epoch(
+						slab_id,
+						supersession_hlc,
+						None,
+						metadata_epoch,
+						supersession_tokens.remove(&slab_id),
+					)
+					.await;
 			}
-			for (slab_id, tombstone_hlc) in tombstoned {
+			for (slab_id, tombstone_hlc) in tombstone_by_slab {
 				let _ = self
-					.record_row_tombstone_for_slab(slab_id, tombstone_hlc, None)
-					.await?;
+					.record_row_tombstone_for_slab_at_epoch(
+						slab_id,
+						tombstone_hlc,
+						None,
+						metadata_epoch,
+						tombstone_tokens.remove(&slab_id),
+					)
+					.await;
 			}
 			Ok(base_location)
 		})
@@ -1374,12 +1624,13 @@ impl SlabManager {
 	/// by slab id — so a rewrite that landed in a newer slab
 	/// shadows the stale copy in an older one.
 	#[cfg(any(test, feature = "test-support"))]
-	pub async fn open(config: SlabManagerConfig) -> std::io::Result<Self> {
+	pub async fn open(config: SlabManagerConfig) -> std::io::Result<Arc<Self>> {
 		Self::open_shared(
 			config,
 			None,
 			crate::metrics::global(),
-			#[cfg(feature = "test-support")]
+			false,
+			#[cfg(any(test, feature = "test-support"))]
 			None,
 		)
 		.await
@@ -1392,12 +1643,13 @@ impl SlabManager {
 	pub(crate) async fn open_with_maintenance_metrics(
 		config: SlabManagerConfig,
 		maintenance_metrics: &'static crate::metrics::MetricsRegistry,
-	) -> std::io::Result<Self> {
+	) -> std::io::Result<Arc<Self>> {
 		Self::open_shared(
 			config,
 			None,
 			maintenance_metrics,
-			#[cfg(feature = "test-support")]
+			false,
+			#[cfg(any(test, feature = "test-support"))]
 			None,
 		)
 		.await
@@ -1408,39 +1660,48 @@ impl SlabManager {
 	pub async fn open_with_owner(
 		config: SlabManagerConfig,
 		owner: DataDirectoryOwner,
-	) -> std::io::Result<Self> {
+	) -> std::io::Result<Arc<Self>> {
 		Self::open_shared(
 			config,
 			Some(owner),
 			crate::metrics::global(),
-			#[cfg(feature = "test-support")]
+			false,
+			#[cfg(any(test, feature = "test-support"))]
 			None,
 		)
 		.await
 	}
 
-	#[cfg(feature = "test-support")]
+	#[cfg(any(test, feature = "test-support"))]
 	pub(crate) async fn open_with_file_ops_and_owner(
 		config: SlabManagerConfig,
 		file_ops: Arc<dyn AsyncFileOps>,
 		owner: DataDirectoryOwner,
-	) -> std::io::Result<Self> {
+	) -> std::io::Result<Arc<Self>> {
 		Self::open_shared(
 			config,
 			Some(owner),
 			crate::metrics::global(),
+			false,
 			Some(file_ops),
 		)
 		.await
 	}
 
 	/// Open with caller-supplied file operations for deterministic acceptance fixtures.
-	#[cfg(feature = "test-support")]
+	#[cfg(any(test, feature = "test-support"))]
 	pub async fn open_with_file_ops(
 		config: SlabManagerConfig,
 		file_ops: Arc<dyn AsyncFileOps>,
-	) -> std::io::Result<Self> {
-		Self::open_shared(config, None, crate::metrics::global(), Some(file_ops)).await
+	) -> std::io::Result<Arc<Self>> {
+		Self::open_shared(
+			config,
+			None,
+			crate::metrics::global(),
+			false,
+			Some(file_ops),
+		)
+		.await
 	}
 
 	/// Test / diagnostic accessor: current active slab id.
@@ -1464,6 +1725,13 @@ impl SlabManager {
 	pub(crate) fn published_table_object_id(
 		&self,
 		location: RecordLocation,
+	) -> std::io::Result<Option<TableObjectId>> {
+		self.require_tier_authority_ready()?;
+		Ok(self.published_table_object_id_for_recovery(location))
+	}
+	fn published_table_object_id_for_recovery(
+		&self,
+		location: RecordLocation,
 	) -> Option<TableObjectId> {
 		self.table_by_location
 			.get(&location)
@@ -1477,7 +1745,8 @@ impl SlabManager {
 		&self,
 		tenant_id: TenantId,
 		table_object_id: TableObjectId,
-	) -> TableDropReferenceCounts {
+	) -> std::io::Result<TableDropReferenceCounts> {
+		self.require_tier_authority_ready()?;
 		let in_memory_rows = self
 			.table_by_location
 			.iter()
@@ -1500,68 +1769,77 @@ impl SlabManager {
 			.iter()
 			.filter(|entry| entry.value().contains_key(&(tenant_id, table_object_id)))
 			.count();
-		TableDropReferenceCounts {
+		Ok(TableDropReferenceCounts {
 			in_memory_rows,
 			persistent_rows,
 			indexed_slabs,
 			secondary_indexed_slabs,
-		}
+		})
 	}
 
+	/// Attribute `location` to a typed table and count it on its slab.
+	///
+	/// The attribution and its count change together under the location's
+	/// `table_by_location` entry guard; the count changes under one
+	/// `table_references_by_slab` entry guard, so a reassignment replaces the
+	/// old table's contribution with the new one atomically and a counts reader
+	/// always sees the location attributed to one of them.
 	fn add_published_table_reference(
 		&self,
 		tenant_id: TenantId,
 		table_object_id: TableObjectId,
 		location: RecordLocation,
 	) {
-		if let Some(previous) = self
-			.table_by_location
-			.insert(location, (tenant_id, table_object_id))
-		{
-			if previous == (tenant_id, table_object_id) {
-				return;
-			}
-			self.remove_published_table_reference_count(previous.0, previous.1, location.slab_id);
-		}
-		*self
-			.table_references_by_slab
-			.entry(location.slab_id)
-			.or_default()
-			.entry((tenant_id, table_object_id))
-			.or_default() += 1;
-	}
-
-	fn remove_published_table_reference_count(
-		&self,
-		tenant_id: TenantId,
-		table_object_id: TableObjectId,
-		slab_id: SlabId,
-	) {
-		let remove_slab =
-			if let Some(mut references) = self.table_references_by_slab.get_mut(&slab_id) {
-				let key = (tenant_id, table_object_id);
-				if let Some(count) = references.get_mut(&key) {
-					*count = count.saturating_sub(1);
-					if *count == 0 {
-						references.remove(&key);
-					}
+		let target = (tenant_id, table_object_id);
+		match self.table_by_location.entry(location) {
+			dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
+				let previous = *occupied.get();
+				if previous == target {
+					return;
 				}
-				references.is_empty()
-			} else {
-				false
-			};
-		if remove_slab {
-			self.table_references_by_slab.remove(&slab_id);
+				{
+					let mut references = self
+						.table_references_by_slab
+						.entry(location.slab_id)
+						.or_default();
+					decrement_reference_count(&mut references, previous);
+					#[cfg(test)]
+					self.reference_reassignment_pause_point();
+					*references.entry(target).or_default() += 1;
+				}
+				occupied.insert(target);
+			}
+			dashmap::mapref::entry::Entry::Vacant(vacant) => {
+				*self
+					.table_references_by_slab
+					.entry(location.slab_id)
+					.or_default()
+					.entry(target)
+					.or_default() += 1;
+				vacant.insert(target);
+			}
 		}
 	}
 
+	/// Remove `location`'s attribution and its count. The emptiness check and
+	/// the slab entry's removal happen under one entry guard, so a concurrent
+	/// add for another location on the slab is never erased.
 	fn remove_published_table_reference(&self, location: RecordLocation) {
-		if let Some((_, (tenant_id, table_object_id))) = self.table_by_location.remove(&location) {
-			self.remove_published_table_reference_count(
-				tenant_id,
-				table_object_id,
-				location.slab_id,
-			);
+		if let dashmap::mapref::entry::Entry::Occupied(occupied) =
+			self.table_by_location.entry(location)
+		{
+			let attribution = *occupied.get();
+			if let dashmap::mapref::entry::Entry::Occupied(mut references) =
+				self.table_references_by_slab.entry(location.slab_id)
+			{
+				decrement_reference_count(references.get_mut(), attribution);
+				if references.get().is_empty() {
+					#[cfg(test)]
+					self.empty_reference_slab_removal_pause_point();
+					references.remove();
+				}
+			}
+			occupied.remove();
 		}
 	}
 
@@ -1585,24 +1863,16 @@ impl SlabManager {
 		table_object_id: TableObjectId,
 		source_slab_id: SlabId,
 	) {
-		let remove_slab = if let Some(mut references) = self
+		if let dashmap::mapref::entry::Entry::Occupied(mut references) = self
 			.secondary_index_table_references_by_slab
-			.get_mut(&source_slab_id)
+			.entry(source_slab_id)
 		{
-			let key = (tenant_id, table_object_id);
-			if let Some(count) = references.get_mut(&key) {
-				*count = count.saturating_sub(1);
-				if *count == 0 {
-					references.remove(&key);
-				}
+			decrement_reference_count(references.get_mut(), (tenant_id, table_object_id));
+			if references.get().is_empty() {
+				#[cfg(test)]
+				self.empty_secondary_reference_slab_removal_pause_point();
+				references.remove();
 			}
-			references.is_empty()
-		} else {
-			false
-		};
-		if remove_slab {
-			self.secondary_index_table_references_by_slab
-				.remove(&source_slab_id);
 		}
 	}
 
@@ -1894,6 +2164,9 @@ impl SlabManager {
 		let state = self.state.lock().await;
 		let mut out = Vec::with_capacity(state.sealed.len());
 		for entry in state.sealed.iter() {
+			if !entry.value().manager_appends_quiescent() {
+				continue;
+			}
 			out.push(SealedSlabInfo {
 				slab_id: *entry.key(),
 				size_bytes: entry.value().write_cursor(),
@@ -1954,17 +2227,46 @@ impl SlabManager {
 	/// active, or already tiered — all three are bugs on the
 	/// caller side.
 	pub async fn read_sealed_raw(&self, slab_id: SlabId) -> std::io::Result<Vec<u8>> {
+		self.require_tier_authority_ready()?;
 		{
 			let state = self.state.lock().await;
-			if !state.sealed.contains_key(&slab_id) {
+			let Some(slab) = state.sealed.get(&slab_id) else {
 				return Err(Error::new(
 					ErrorKind::NotFound,
 					format!("slab {slab_id} is not in the sealed set"),
+				));
+			};
+			if !slab.manager_appends_quiescent() {
+				return Err(Error::new(
+					ErrorKind::WouldBlock,
+					"sealed slab has in-flight appends",
 				));
 			}
 		}
 		let path = slab_path(&self.config.dir, slab_id);
 		self.file_ops.read_all(&path).await
+	}
+
+	/// Recheck local tier eligibility under the slab publication lock.
+	pub(crate) async fn confirm_tier_candidate_quiescent(
+		&self,
+		slab_id: SlabId,
+	) -> std::io::Result<()> {
+		let lock = self.tier_publication_lock(slab_id);
+		let _guard = lock.lock().await;
+		let state = self.state.lock().await;
+		if state.tiered.contains_key(&slab_id)
+			|| !state
+				.sealed
+				.get(&slab_id)
+				.is_some_and(|slab| slab.manager_appends_quiescent())
+		{
+			return Err(Error::new(
+				ErrorKind::WouldBlock,
+				"slab is not a quiescent sealed tier candidate",
+			));
+		}
+		Ok(())
 	}
 
 	pub async fn table_lookup_by_index(
@@ -1973,6 +2275,7 @@ impl SlabManager {
 		descriptor: &SecondaryIndexDescriptor,
 		state: SecondaryIndexState,
 	) -> std::io::Result<SecondaryIndexLookupReport> {
+		self.require_tier_read_scope(&[])?;
 		if state != SecondaryIndexState::Ready
 			|| descriptor.table_object_id != request.table_object_id
 			|| descriptor.index_object_id != request.index_object_id
@@ -2044,6 +2347,7 @@ impl SlabManager {
 			) {
 				continue;
 			}
+			self.require_tier_read_scope(&[info.source_slab_id])?;
 			report.stats.scanned_segments += 1;
 			let segment_identity = segment.identity();
 			for entry in segment
@@ -2055,7 +2359,7 @@ impl SlabManager {
 				let frame = self.read(entry.record_location).await?;
 				let fetched_batch = decode_record_batch(&frame)?;
 				let visible_as_of_location =
-					self.lookup_as_of(request.tenant_id, entry.row_key_id, request.as_of_hlc);
+					self.lookup_as_of(request.tenant_id, entry.row_key_id, request.as_of_hlc)?;
 				match revalidate_secondary_index_candidate(
 					descriptor,
 					segment_identity,
@@ -2186,12 +2490,15 @@ impl SlabManager {
 		blob: &[u8],
 	) -> std::io::Result<Vec<u8>> {
 		validate_tiered_blob(pointer, blob)?;
-		decode_tiered_blob(
+		// Callers decode the published generation (rewrap keeps its layout).
+		let acknowledged = self.acknowledged_offsets_in_slab(pointer.slab_id);
+		Ok(decode_tiered_blob(
 			self.config.crypto.as_ref(),
 			pointer,
 			blob,
-			&self.acknowledged_offsets_in_slab(pointer.slab_id),
-		)
+			TierObjectEvidence::Indexed(&acknowledged),
+		)?
+		.bytes)
 	}
 
 	#[allow(dead_code)]
@@ -2200,6 +2507,7 @@ impl SlabManager {
 		pointer: &TieredSlabPointer,
 		descriptor: &TableSchemaDescriptor,
 	) -> std::io::Result<Option<ParsedColumnStatsBlock>> {
+		self.require_tier_read_scope(&[pointer.slab_id])?;
 		metrics().pbc_slab_stats_consulted_total.inc();
 		let Some(cache_key) = tiered_stats_cache_key(pointer, descriptor) else {
 			metrics().pbc_slab_stats_missing_total.inc();
@@ -2300,7 +2608,7 @@ impl SlabManager {
 			(state.active.slab_id(), sealed)
 		};
 		if self
-			.record_rows_for_slab(active_slab_id)
+			.record_rows_for_slab(active_slab_id)?
 			.iter()
 			.any(|row| row.tenant_id == tenant_id)
 		{
@@ -2308,7 +2616,7 @@ impl SlabManager {
 		}
 		for slab_id in sealed_slab_ids {
 			let tenant_rows = self
-				.record_rows_for_slab(slab_id)
+				.record_rows_for_slab(slab_id)?
 				.into_iter()
 				.filter(|row| row.tenant_id == tenant_id)
 				.collect::<Vec<_>>();
@@ -2347,6 +2655,7 @@ impl SlabManager {
 	/// L2 remains authoritative for those slabs; the manifest
 	/// records them as omitted assumptions instead.
 	pub async fn export_backup(&self) -> std::io::Result<StorageBackupImage> {
+		self.require_tier_authority_ready()?;
 		self.fsync_all_local_slabs().await?;
 
 		let (active_slab_id, next_slab_id, sealed_slab_ids, tiered_slabs, omitted) = {
@@ -2406,7 +2715,8 @@ impl SlabManager {
 		})
 	}
 
-	/// Restore a backup image into an empty slab directory.
+	/// Restore a backup image into an empty slab directory, or finish an
+	/// identical pending restore after the caller validates its durable intent.
 	///
 	/// The caller is responsible for opening a new [`SlabManager`]
 	/// against the target after the files have been materialized.
@@ -2414,6 +2724,7 @@ impl SlabManager {
 		backup: &StorageBackupImage,
 		dir: impl AsRef<Path>,
 		owner: &DataDirectoryOwner,
+		resume: bool,
 	) -> std::io::Result<()> {
 		let dir = dir.as_ref();
 		owner.ensure_path(dir)?;
@@ -2424,7 +2735,18 @@ impl SlabManager {
 			));
 		}
 		let file_ops: Arc<dyn AsyncFileOps> = Arc::new(BlockingFileOps::with_owner(owner.clone()));
-		if !discover_slab_ids(file_ops.as_ref(), dir).await?.is_empty() {
+		let existing = discover_slab_ids(file_ops.as_ref(), dir).await?;
+		if resume
+			&& existing
+				.iter()
+				.any(|id| !backup.local_slabs.iter().any(|slab| slab.slab_id == *id))
+		{
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"pending restore contains an unexpected local slab",
+			));
+		}
+		if !resume && !existing.is_empty() {
 			return Err(Error::new(
 				ErrorKind::AlreadyExists,
 				format!("storage restore target is not empty: {}", dir.display()),
@@ -2440,18 +2762,13 @@ impl SlabManager {
 				));
 			}
 			let path = slab_path(dir, slab.slab_id);
-			write_file(
+			crate::storage::file_ops::write_restore_file(
 				file_ops.as_ref(),
 				&path,
-				OpenFlags {
-					write: true,
-					create_new: true,
-					..Default::default()
-				},
 				&slab.bytes,
+				resume,
 			)
 			.await?;
-			fsync_parent_dir(file_ops.as_ref(), &path).await?;
 		}
 		if !seen.contains(&backup.manifest.active_slab_id) {
 			return Err(Error::new(
@@ -2494,7 +2811,7 @@ impl SlabManager {
 		tenant_id: TenantId,
 		start_locality: impl Into<Locality>,
 		end_locality: impl Into<Locality>,
-	) -> Vec<(u64, RecordLocation)> {
+	) -> std::io::Result<Vec<(u64, RecordLocation)>> {
 		self.scan_as_of(
 			tenant_id,
 			start_locality,
@@ -2517,16 +2834,17 @@ impl SlabManager {
 		start_locality: impl Into<Locality>,
 		end_locality: impl Into<Locality>,
 		as_of_hlc: HybridTimestamp,
-	) -> Vec<(u64, RecordLocation)> {
-		self.scan_as_of_with_identity_and_locality(
-			tenant_id,
-			start_locality,
-			end_locality,
-			as_of_hlc,
-		)
-		.into_iter()
-		.map(|(_key_identity, locality, loc)| (locality.get(), loc))
-		.collect()
+	) -> std::io::Result<Vec<(u64, RecordLocation)>> {
+		Ok(self
+			.scan_as_of_with_identity_and_locality(
+				tenant_id,
+				start_locality,
+				end_locality,
+				as_of_hlc,
+			)?
+			.into_iter()
+			.map(|(_key_identity, locality, loc)| (locality.get(), loc))
+			.collect())
 	}
 
 	/// Variant of [`Self::scan_as_of`] that preserves the full
@@ -2540,16 +2858,17 @@ impl SlabManager {
 		start_locality: impl Into<Locality>,
 		end_locality: impl Into<Locality>,
 		as_of_hlc: HybridTimestamp,
-	) -> Vec<(Identity, RecordLocation)> {
-		self.scan_as_of_with_identity_and_locality(
-			tenant_id,
-			start_locality,
-			end_locality,
-			as_of_hlc,
-		)
-		.into_iter()
-		.map(|(key_identity, _locality, location)| (key_identity, location))
-		.collect()
+	) -> std::io::Result<Vec<(Identity, RecordLocation)>> {
+		Ok(self
+			.scan_as_of_with_identity_and_locality(
+				tenant_id,
+				start_locality,
+				end_locality,
+				as_of_hlc,
+			)?
+			.into_iter()
+			.map(|(key_identity, _locality, location)| (key_identity, location))
+			.collect())
 	}
 
 	/// Scan variant that also returns the routing locality used for
@@ -2561,11 +2880,12 @@ impl SlabManager {
 		start_locality: impl Into<Locality>,
 		end_locality: impl Into<Locality>,
 		as_of_hlc: HybridTimestamp,
-	) -> Vec<(Identity, Locality, RecordLocation)> {
+	) -> std::io::Result<Vec<(Identity, Locality, RecordLocation)>> {
+		self.require_tier_read_scope(&[])?;
 		let start_locality = start_locality.into();
 		let end_locality = end_locality.into();
 		if start_locality > end_locality {
-			return Vec::new();
+			return Ok(Vec::new());
 		}
 		let candidates =
 			self.locality_candidates_for_tenant(tenant_id, start_locality, end_locality);
@@ -2575,6 +2895,7 @@ impl SlabManager {
 				continue;
 			};
 			if let Some(location) = newest_version_as_of(versions.value(), as_of_hlc) {
+				self.require_tier_read_scope(&[location.slab_id])?;
 				if location.is_tombstone {
 					continue;
 				}
@@ -2586,7 +2907,7 @@ impl SlabManager {
 				out.push((key_identity, locality, location));
 			}
 		}
-		out
+		Ok(out)
 	}
 
 	/// Every retained version whose identity projects into the
@@ -2596,7 +2917,7 @@ impl SlabManager {
 	///
 	/// Unlike [`Self::scan`] / [`Self::scan_as_of`], this does not
 	/// collapse per-key history — every version ≥ floor is
-	/// returned. Output is sorted by `(locality, identity, hlc)` so
+	/// returned. Output is sorted in [`MigrationCursor`] order so
 	/// the migration RPC can paginate with a stable cursor and the
 	/// destination can append in the same order it observed on the
 	/// source.
@@ -2605,49 +2926,29 @@ impl SlabManager {
 		start_locality: impl Into<Locality>,
 		end_locality: impl Into<Locality>,
 		migration_hlc_floor: HybridTimestamp,
-	) -> Vec<(TenantId, Identity, Locality, RecordLocation)> {
-		self.scan_all_versions_from(
-			start_locality,
-			end_locality,
-			migration_hlc_floor,
-			Identity::ZERO,
-			bytemuck::Zeroable::zeroed(),
-		)
+	) -> std::io::Result<Vec<(TenantId, Identity, Locality, RecordLocation)>> {
+		self.scan_all_versions_from(start_locality, end_locality, migration_hlc_floor, None)
 	}
 
 	/// Version-aware paging variant of [`Self::scan_all_versions`].
 	///
-	/// Lets `handle_migrate` resume mid-key when a fat key has more
-	/// retained versions than fit in a single page:
-	///
-	/// * When `(cursor_identity, cursor_hlc)` is `(zero, zero)` the
-	///   scan
-	///   behaves identically to `scan_all_versions`.
-	/// * Otherwise we resume strictly after the last emitted
-	///   `(locality, identity, hlc)` tuple.
-	///
-	/// Output is still sorted `(locality ASC, identity ASC, hlc ASC)`
-	/// so the migration RPC can paginate deterministically.
+	/// Resumes strictly after `cursor`, the last version a prior page
+	/// emitted, mid-key for a fat key. The order, the resume comparison
+	/// and the wire cursor are all [`MigrationCursor`]: locality, tenant,
+	/// key, HLC, with each row's own routing locality.
 	pub fn scan_all_versions_from(
 		&self,
 		start_locality: impl Into<Locality>,
 		end_locality: impl Into<Locality>,
 		migration_hlc_floor: HybridTimestamp,
-		cursor_identity: Identity,
-		cursor_hlc: HybridTimestamp,
-	) -> Vec<(TenantId, Identity, Locality, RecordLocation)> {
+		cursor: Option<MigrationCursor>,
+	) -> std::io::Result<Vec<(TenantId, Identity, Locality, RecordLocation)>> {
+		self.require_tier_read_scope(&[])?;
 		let start_locality = start_locality.into();
 		let end_locality = end_locality.into();
 		if start_locality > end_locality {
-			return Vec::new();
+			return Ok(Vec::new());
 		}
-		let cursor_active =
-			cursor_identity != Identity::ZERO || cursor_hlc != bytemuck::Zeroable::zeroed();
-		let cursor_locality = if cursor_active {
-			self.routing_locality_for_identity_any_tenant(cursor_identity)
-		} else {
-			start_locality
-		};
 		let mut out: Vec<(TenantId, Identity, Locality, RecordLocation)> = Vec::new();
 		for (tenant_id, locality, key_identity) in
 			self.locality_candidates_for_all_tenants(start_locality, end_locality)
@@ -2659,21 +2960,28 @@ impl SlabManager {
 				if loc.hlc < migration_hlc_floor {
 					continue;
 				}
-				if cursor_active
-					&& (locality, key_identity, loc.hlc)
-						<= (cursor_locality, cursor_identity, cursor_hlc)
-				{
+				self.require_tier_read_scope(&[loc.slab_id])?;
+				let position = MigrationCursor {
+					locality,
+					tenant_id,
+					key_identity,
+					hlc: loc.hlc,
+				};
+				if cursor.is_some_and(|cursor| position <= cursor) {
 					continue;
 				}
 				out.push((tenant_id, key_identity, locality, *loc));
 			}
 		}
-		out.sort_by(
-			|(tenant_a, ida, locality_a, la), (tenant_b, idb, locality_b, lb)| {
-				(*locality_a, *tenant_a, *ida, la.hlc).cmp(&(*locality_b, *tenant_b, *idb, lb.hlc))
+		out.sort_by_key(
+			|&(tenant_id, key_identity, locality, location)| MigrationCursor {
+				locality,
+				tenant_id,
+				key_identity,
+				hlc: location.hlc,
 			},
 		);
-		out
+		Ok(out)
 	}
 
 	fn migrated_tombstone_affects_slab(
@@ -2726,17 +3034,23 @@ impl SlabManager {
 		slab_id: SlabId,
 		as_of_hlc: HybridTimestamp,
 		tombstones: &[MigratedRangeTombstone],
-	) -> bool {
-		tombstones.iter().any(|tombstone| {
+	) -> std::io::Result<bool> {
+		self.require_tier_read_scope(&[slab_id])?;
+		Ok(tombstones.iter().any(|tombstone| {
 			tombstone.completed_at_hlc <= as_of_hlc
 				&& self.migrated_tombstone_affects_slab(slab_id, tombstone)
-		})
+		}))
 	}
 
-	pub fn slab_has_supersession_at(&self, slab_id: SlabId, as_of_hlc: HybridTimestamp) -> bool {
+	pub fn slab_has_supersession_at(
+		&self,
+		slab_id: SlabId,
+		as_of_hlc: HybridTimestamp,
+	) -> std::io::Result<bool> {
+		self.require_tier_read_scope(&[slab_id])?;
 		let unbounded_as_of =
 			as_of_hlc.physical_ms == 0 && as_of_hlc.logical == 0 && as_of_hlc.node_id == 0;
-		self.key_index.iter().any(|entry| {
+		Ok(self.key_index.iter().any(|entry| {
 			let versions = entry.value();
 			versions.iter().enumerate().any(|(index, location)| {
 				location.slab_id == slab_id
@@ -2746,13 +3060,14 @@ impl SlabManager {
 							&& (unbounded_as_of || newer.hlc <= as_of_hlc)
 					})
 			})
-		})
+		}))
 	}
 
 	pub fn slab_hlc_bounds(
 		&self,
 		slab_id: SlabId,
-	) -> Option<(HybridTimestamp, HybridTimestamp, u64)> {
+	) -> std::io::Result<Option<(HybridTimestamp, HybridTimestamp, u64)>> {
+		self.require_tier_read_scope(&[slab_id])?;
 		let mut bounds: Option<(HybridTimestamp, HybridTimestamp, u64)> = None;
 		for entry in self.key_index.iter() {
 			for location in entry.value().iter() {
@@ -2769,10 +3084,14 @@ impl SlabManager {
 				});
 			}
 		}
-		bounds
+		Ok(bounds)
 	}
 
-	pub fn slab_supersession_metadata(&self, slab_id: SlabId) -> SupersessionMetadata {
+	pub fn slab_supersession_metadata(
+		&self,
+		slab_id: SlabId,
+	) -> std::io::Result<SupersessionMetadata> {
+		self.require_tier_read_scope(&[slab_id])?;
 		let mut earliest: Option<HybridTimestamp> = None;
 		for entry in self.key_index.iter() {
 			let versions = entry.value();
@@ -2793,10 +3112,14 @@ impl SlabManager {
 				}
 			}
 		}
-		earliest.map_or(SupersessionMetadata::None, SupersessionMetadata::Earliest)
+		Ok(earliest.map_or(SupersessionMetadata::None, SupersessionMetadata::Earliest))
 	}
 
-	pub fn slab_row_tombstone_metadata(&self, slab_id: SlabId) -> TombstoneMetadata {
+	pub fn slab_row_tombstone_metadata(
+		&self,
+		slab_id: SlabId,
+	) -> std::io::Result<TombstoneMetadata> {
+		self.require_tier_read_scope(&[slab_id])?;
 		let mut earliest: Option<HybridTimestamp> = None;
 		for entry in self.key_index.iter() {
 			for location in entry.value().iter() {
@@ -2809,7 +3132,7 @@ impl SlabManager {
 				}
 			}
 		}
-		earliest.map_or(TombstoneMetadata::None, TombstoneMetadata::Earliest)
+		Ok(earliest.map_or(TombstoneMetadata::None, TombstoneMetadata::Earliest))
 	}
 
 	pub async fn record_supersession_for_slab(
@@ -2818,24 +3141,10 @@ impl SlabManager {
 		supersession_hlc: HybridTimestamp,
 		last_control_log_index: Option<u64>,
 	) -> std::io::Result<bool> {
-		let mut changed = None;
-		{
-			let state = self.state.lock().await;
-			if let Some(mut pointer) = state.tiered.get_mut(&slab_id) {
-				let before = pointer.supersession_metadata;
-				pointer.record_supersession_hlc(supersession_hlc);
-				if pointer.supersession_metadata != before {
-					changed = Some((*pointer).clone());
-				}
-			}
-		}
-		let Some(pointer) = changed else {
-			return Ok(false);
-		};
-		self.persist_tiered_pointer_strict(pointer.clone(), last_control_log_index)
-			.await?;
-		self.clear_tiered_stats_cache_for_slab(pointer.slab_id);
-		Ok(true)
+		self.update_tier_pointer_metadata(slab_id, last_control_log_index, None, |pointer| {
+			pointer.record_supersession_hlc(supersession_hlc)
+		})
+		.await
 	}
 
 	pub async fn record_row_tombstone_for_slab(
@@ -2844,24 +3153,33 @@ impl SlabManager {
 		tombstone_hlc: HybridTimestamp,
 		last_control_log_index: Option<u64>,
 	) -> std::io::Result<bool> {
-		let mut changed = None;
-		{
-			let state = self.state.lock().await;
-			if let Some(mut pointer) = state.tiered.get_mut(&slab_id) {
-				let before = pointer.tombstone_metadata;
-				pointer.record_tombstone_hlc(tombstone_hlc);
-				if pointer.tombstone_metadata != before {
-					changed = Some((*pointer).clone());
-				}
-			}
+		self.update_tier_pointer_metadata(slab_id, last_control_log_index, None, |pointer| {
+			pointer.record_tombstone_hlc(tombstone_hlc)
+		})
+		.await
+	}
+
+	/// Serialize control-observed LSM manifest changes with snapshot installation.
+	pub(crate) async fn observe_lsm_compaction_commit(
+		&self,
+		commit: &crate::storage::CompactionCommit,
+		index: u64,
+	) -> std::io::Result<()> {
+		let _gate = self.persistent_index_gate.clone().read_owned().await;
+		if self.observer_is_superseded(Some(index)) {
+			return Ok(());
 		}
-		let Some(pointer) = changed else {
-			return Ok(false);
-		};
-		self.persist_tiered_pointer_strict(pointer.clone(), last_control_log_index)
-			.await?;
-		self.clear_tiered_stats_cache_for_slab(pointer.slab_id);
-		Ok(true)
+		if self.snapshot_install_in_flight() {
+			self.index_authority_unavailable
+				.store(true, Ordering::Release);
+			return Err(Error::new(
+				ErrorKind::WouldBlock,
+				"snapshot installation fences LSM observer",
+			));
+		}
+		self.apply_lsm_manifest_compaction_commit(commit)
+			.map(|_| ())
+			.map_err(|err| Error::other(err.to_string()))
 	}
 
 	pub async fn record_migrated_range_tombstone(
@@ -2869,185 +3187,8 @@ impl SlabManager {
 		tombstone: &MigratedRangeTombstone,
 		last_control_log_index: Option<u64>,
 	) -> std::io::Result<usize> {
-		let affected_slab_ids = self.migrated_tombstone_affected_tiered_slabs(tombstone);
-		if affected_slab_ids.is_empty() {
-			return Ok(0);
-		}
-
-		let mut changed = Vec::new();
-		{
-			let state = self.state.lock().await;
-			for slab_id in affected_slab_ids {
-				let Some(mut pointer) = state.tiered.get_mut(&slab_id) else {
-					continue;
-				};
-				let before = pointer.tombstone_metadata;
-				pointer.record_tombstone_hlc(tombstone.completed_at_hlc);
-				if pointer.tombstone_metadata != before {
-					changed.push((*pointer).clone());
-				}
-			}
-		}
-
-		for pointer in &changed {
-			self.persist_tiered_pointer_strict(pointer.clone(), last_control_log_index)
-				.await?;
-			self.clear_tiered_stats_cache_for_slab(pointer.slab_id);
-		}
-
-		Ok(changed.len())
-	}
-
-	/// Idempotent migration ingest (Plan 019).
-	///
-	/// Distinct from [`StorageEngine::append`] so the correctness
-	/// boundary for lazy migration lives at a dedicated API rather
-	/// than piggybacking on the hot write path:
-	///
-	/// * **Fast path** — if a version with the same
-	///   `(key_identity, hlc)`
-	///   already exists locally, read its frame, blake3 it, and
-	///   compare to `payload_hash`. A match is a no-op and returns
-	///   [`MigrationIngestOutcome::Duplicate`]. A mismatch is a
-	///   fatal invariant violation: two nodes claim different bytes
-	///   for the same MVCC slot, which would make MVCC history
-	///   non-deterministic if silently accepted.
-	/// * **Slow path** — otherwise append the frame through the
-	///   same slab machinery the hot write path uses and return
-	///   [`MigrationIngestOutcome::Inserted`].
-	///
-	/// The `migration_id` argument is currently only used for
-	/// diagnostic framing in the mismatch error — retained so the
-	/// signature stays stable once the migration registry and
-	/// sweeper surfaces wire it through.
-	pub async fn append_migration(
-		&self,
-		migration_id: u64,
-		tenant_id: TenantId,
-		key_identity: Identity,
-		hlc: HybridTimestamp,
-		payload_hash: [u8; 32],
-		frame: &[u8],
-	) -> std::io::Result<MigrationIngestOutcome> {
-		self.append_migration_with_locality(
-			migration_id,
-			tenant_id,
-			key_identity,
-			Locality::from(key_identity),
-			hlc,
-			payload_hash,
-			frame,
-		)
-		.await
-	}
-
-	/// Idempotent migration ingest for records whose routing
-	/// locality is not the identity projection. Table-spread rows
-	/// use this path so range migration preserves their table arc
-	/// placement across replica-set movement.
-	pub async fn append_migration_with_locality(
-		&self,
-		migration_id: u64,
-		tenant_id: TenantId,
-		key_identity: Identity,
-		routing_locality: Locality,
-		hlc: HybridTimestamp,
-		payload_hash: [u8; 32],
-		frame: &[u8],
-	) -> std::io::Result<MigrationIngestOutcome> {
-		self.counter_unsupported.insert((tenant_id, key_identity));
-		self.counter_eligible.refuse(
-			&(tenant_id, key_identity),
-			super::counter::CounterVisibilityError::Unsupported,
-		);
-		// Fast-path collision check before touching disk: walk the
-		// key's existing version chain under a short-lived read
-		// guard and look for an exact HLC match. DashMap's read
-		// guard is cheap and the chain is O(versions-per-key),
-		// which is bounded by retention.
-		let existing = self
-			.key_index
-			.get(&(tenant_id, key_identity))
-			.and_then(|chain| chain.iter().find(|loc| loc.hlc == hlc).copied());
-
-		if let Some(location) = existing {
-			// Slow path: read the on-disk frame and hash it. If
-			// the incoming payload really is a byte-identical copy
-			// of what we already stored, the migration pull was
-			// a duplicate and can be dropped.
-			let stored = self.read(location).await?;
-			let stored_hash = crate::hash::content::digest(&stored);
-			if stored_hash == payload_hash {
-				self.insert_locality_membership_with_locality(
-					tenant_id,
-					key_identity,
-					routing_locality,
-				);
-				self.persist_record_row_strict(tenant_id, key_identity, routing_locality, location)
-					.await?;
-				return Ok(MigrationIngestOutcome::Duplicate(location));
-			}
-			// Different bytes claim the same MVCC slot. Refuse
-			// loudly — accepting either side would make historical
-			// reads depend on which replica answered the pull.
-			return Err(Error::new(
-				ErrorKind::InvalidData,
-				format!(
-					"append_migration payload_hash mismatch: migration_id={migration_id} \
-                     key_identity={key_identity} hlc={hlc:?} stored_hash={stored_hash:?} \
-                     incoming_hash={payload_hash:?}"
-				),
-			));
-		}
-
-		if let Some(entries) = storage_multirow_index_entries_from_frame(frame)? {
-			let Some(requested_entry) = entries
-				.iter()
-				.find(|entry| entry.key_identity == key_identity && entry.row_hlc == hlc)
-				.copied()
-			else {
-				return Err(Error::new(
-					ErrorKind::InvalidData,
-					"multi-row migration frame does not contain the requested row identity/HLC",
-				));
-			};
-			if requested_entry.routing_locality != routing_locality {
-				return Err(Error::new(
-					ErrorKind::InvalidData,
-					"multi-row migration frame routing locality mismatch",
-				));
-			}
-			let base_location = self
-				.append_durable_multirow_with_locality(tenant_id, frame, &entries)
-				.await?;
-			return Ok(MigrationIngestOutcome::Inserted(RecordLocation {
-				hlc: requested_entry.row_hlc,
-				record_row_index: requested_entry.record_row_index,
-				is_tombstone: requested_entry.is_tombstone,
-				..base_location
-			}));
-		}
-
-		// No prior version at this exact HLC — append to the same
-		// slab machinery as hot writes, but publish the caller's
-		// routing locality instead of deriving it from identity.
-		let (slab, location) = self
-			.append_on_target(tenant_id, key_identity, hlc, frame)
-			.await?;
-		if let Err(err) = self
-			.persist_record_row_strict(tenant_id, key_identity, routing_locality, location)
+		self.record_migrated_range_tombstone_impl(tombstone, last_control_log_index)
 			.await
-		{
-			slab.rollback_index_entry(tenant_id, key_identity, location);
-			return Err(err);
-		}
-		self.index_appended_location_with_locality(
-			tenant_id,
-			key_identity,
-			routing_locality,
-			location,
-		);
-		Ok(MigrationIngestOutcome::Inserted(location))
 	}
 
 	/// Admit a frame of `frame_len` bytes to the active slab and reserve its
@@ -3088,18 +3229,25 @@ impl SlabManager {
 		let fits =
 			cursor == 0 || cursor.saturating_add(padded as u64) <= self.config.max_slab_bytes;
 		if cursor < self.config.max_slab_bytes && fits {
-			let reservation = state.active.reserve_append(frame_len)?;
+			let mut reservation = state.active.reserve_append(frame_len)?;
+			state.active.track_manager_reservation(&mut reservation)?;
 			let slab = state.active.clone();
 			if let Some((tenant_id, key_identity, hlc, origin)) = pending_counter {
-				self.counter_pending_frames
-					.insert(Self::pending_counter_frame(
-						tenant_id,
-						key_identity,
-						hlc,
-						origin,
-						slab.slab_id(),
-						reservation.offset(),
-					));
+				let pending = Self::pending_counter_frame(
+					tenant_id,
+					key_identity,
+					hlc,
+					origin,
+					slab.slab_id(),
+					reservation.offset(),
+				);
+				self.counter_pending_frames.insert(pending);
+				self.counter_pending_guards.insert(
+					pending,
+					reservation
+						.quiescence_guard()
+						.expect("tracked manager reservation"),
+				);
 			}
 			return Ok((slab, reservation));
 		}
@@ -3123,20 +3271,27 @@ impl SlabManager {
 		let sealed_id = sealed_slab.slab_id();
 		let sealed_size = sealed_slab.write_cursor();
 		state.sealed.insert(sealed_id, sealed_slab);
-		state.next_slab_id = next_id.saturating_add(1);
+		state.advance_slab_allocator(next_id.saturating_add(1));
 		self.record_l0_compaction_run(sealed_id, sealed_size);
 
-		let reservation = next_slab.reserve_append(frame_len)?;
+		let mut reservation = next_slab.reserve_append(frame_len)?;
+		next_slab.track_manager_reservation(&mut reservation)?;
 		if let Some((tenant_id, key_identity, hlc, origin)) = pending_counter {
-			self.counter_pending_frames
-				.insert(Self::pending_counter_frame(
-					tenant_id,
-					key_identity,
-					hlc,
-					origin,
-					next_slab.slab_id(),
-					reservation.offset(),
-				));
+			let pending = Self::pending_counter_frame(
+				tenant_id,
+				key_identity,
+				hlc,
+				origin,
+				next_slab.slab_id(),
+				reservation.offset(),
+			);
+			self.counter_pending_frames.insert(pending);
+			self.counter_pending_guards.insert(
+				pending,
+				reservation
+					.quiescence_guard()
+					.expect("tracked manager reservation"),
+			);
 		}
 		Ok((next_slab, reservation))
 	}
@@ -3177,15 +3332,28 @@ impl SlabManager {
 		location
 	}
 
-	async fn delete_l2_object_if_present(
-		object_store: &dyn ObjectStore,
+	/// An L2 object that a committed pointer named, or that a commit with an
+	/// ambiguous result may name, is kept rather than deleted. A snapshot
+	/// installed later may still name it, and openraft installs snapshots on
+	/// the apply worker, so a delete cannot be fenced against installs
+	/// without stalling apply. Deletion returns with owner-scoped retirement
+	/// authority. Infallible; it returns `Result` so call sites keep their
+	/// cleanup sequencing unchanged.
+	pub(crate) fn retain_superseded_l2_object(
+		slab_id: SlabId,
 		uri: &str,
+		reason: &'static str,
 	) -> std::io::Result<()> {
-		match object_store.delete(uri).await {
-			Ok(()) => Ok(()),
-			Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
-			Err(error) => Err(error),
-		}
+		crate::metrics::global()
+			.storage_l2_superseded_objects_retained_total
+			.inc();
+		tracing::info!(
+			slab_id = slab_id.get(),
+			l2_uri = %uri,
+			reason,
+			"retained superseded L2 object"
+		);
+		Ok(())
 	}
 }
 
@@ -3198,16 +3366,40 @@ impl StorageEngine for SlabManager {
 		hlc: HybridTimestamp,
 		frame: &[u8],
 	) -> std::io::Result<RecordLocation> {
-		let (_slab, location) = self
+		self.require_tier_authority_ready()?;
+		let checked_same_hlc = self
+			.refuse_conflicting_version(
+				tenant_id,
+				key_identity,
+				hlc,
+				IncomingVersion::Record(frame),
+			)
+			.await?;
+		let (slab, location, _append_guard) = self
 			.append_on_target(tenant_id, key_identity, hlc, frame)
 			.await?;
-		// The per-slab `append` already pushed the new version onto
-		// its local chain; mirror it into the manager's
-		// authoritative multi-version index so `lookup` /
-		// `lookup_as_of` stay O(1) without cross-slab scanning.
-		self.index_appended_location(tenant_id, key_identity, location);
-		self.persist_record_row(tenant_id, key_identity, location)
-			.await;
+		let publication = self.begin_index_publication(vec![location.slab_id]).await?;
+		// Commit the persistent row before readers can observe this version.
+		// A failed/uncertain transaction keeps its publication fence and never
+		// publishes the new manager location.
+		if let Err(error) = self
+			.persist_record_row(tenant_id, key_identity, location, &publication)
+			.await
+		{
+			slab.rollback_index_entry(tenant_id, key_identity, location);
+			return Err(error);
+		}
+		if let Err(error) = self.index_checked_version(
+			tenant_id,
+			key_identity,
+			Locality::from(key_identity),
+			location,
+			checked_same_hlc,
+		) {
+			slab.rollback_index_entry(tenant_id, key_identity, location);
+			return Err(error);
+		}
+		publication.complete();
 		Ok(location)
 	}
 
@@ -3216,10 +3408,21 @@ impl StorageEngine for SlabManager {
 			.await
 	}
 
-	fn lookup(&self, tenant_id: TenantId, key_identity: Identity) -> Option<RecordLocation> {
-		self.key_index
+	fn lookup(
+		&self,
+		tenant_id: TenantId,
+		key_identity: Identity,
+	) -> std::io::Result<Option<RecordLocation>> {
+		let location = self
+			.key_index
 			.get(&(tenant_id, key_identity))
-			.and_then(|v| v.last().copied())
+			.and_then(|v| v.last().copied());
+		let scope = location
+			.iter()
+			.map(|location| location.slab_id)
+			.collect::<Vec<_>>();
+		self.require_tier_read_scope(&scope)?;
+		Ok(location)
 	}
 
 	fn lookup_as_of(
@@ -3227,9 +3430,17 @@ impl StorageEngine for SlabManager {
 		tenant_id: TenantId,
 		key_identity: Identity,
 		as_of_hlc: HybridTimestamp,
-	) -> Option<RecordLocation> {
-		let versions = self.key_index.get(&(tenant_id, key_identity))?;
-		newest_version_as_of(versions.value(), as_of_hlc)
+	) -> std::io::Result<Option<RecordLocation>> {
+		let location = self
+			.key_index
+			.get(&(tenant_id, key_identity))
+			.and_then(|versions| newest_version_as_of(versions.value(), as_of_hlc));
+		let scope = location
+			.iter()
+			.map(|location| location.slab_id)
+			.collect::<Vec<_>>();
+		self.require_tier_read_scope(&scope)?;
+		Ok(location)
 	}
 }
 
@@ -3270,9 +3481,13 @@ impl SlabManager {
 		if !self.config.l2_column_fetch.enabled && !self.config.l2_row_group_fetch.enabled {
 			return Ok(None);
 		}
-		let location = self.relocate_read_location(location);
-		let _pin = self.pin_lsm_read_location(location)?;
-		match self.resolve_backing(location.slab_id).await {
+		let ReadTarget {
+			backing,
+			location,
+			_pin,
+			..
+		} = self.resolve_read_target(location, false).await?;
+		match backing {
 			SlabBacking::Local(_) => Ok(None),
 			SlabBacking::L2(pointer) => {
 				let l2 = self.config.l2.as_ref().cloned().ok_or_else(|| {
@@ -3334,9 +3549,13 @@ impl SlabManager {
 			);
 			return Ok(None);
 		}
-		let location = self.relocate_read_location(location);
-		let _pin = self.pin_lsm_read_location(location)?;
-		match self.resolve_backing(location.slab_id).await {
+		let ReadTarget {
+			backing,
+			location,
+			_pin,
+			..
+		} = self.resolve_read_target(location, false).await?;
+		match backing {
 			SlabBacking::Local(_) => Ok(None),
 			SlabBacking::L2(pointer) => {
 				let l2 = self.config.l2.as_ref().cloned().ok_or_else(|| {
@@ -3377,10 +3596,7 @@ impl SlabManager {
 		{
 			return Ok(None);
 		}
-		let relocated = locations
-			.iter()
-			.map(|location| self.relocate_read_location(*location))
-			.collect::<Vec<_>>();
+		let (backing, relocated, _pins) = self.resolve_read_targets(locations).await?;
 		let first = relocated[0];
 		for location in &relocated {
 			if indexed_record_fetch_key(*location) != indexed_record_fetch_key(first) {
@@ -3390,8 +3606,7 @@ impl SlabManager {
 				));
 			}
 		}
-		let _pin = self.pin_lsm_read_location(first)?;
-		match self.resolve_backing(first.slab_id).await {
+		match backing {
 			SlabBacking::Local(_) => Ok(None),
 			SlabBacking::L2(pointer) => {
 				let l2 = self.config.l2.as_ref().cloned().ok_or_else(|| {
@@ -3476,282 +3691,12 @@ impl SlabManager {
 		out
 	}
 
-	fn persistent_record_rows_snapshot(&self) -> Vec<PersistentRecordRow> {
-		let mut rows = Vec::new();
-		for entry in self.key_index.iter() {
-			let (tenant_id, key_identity) = *entry.key();
-			for location in entry.value().iter() {
-				rows.push(self.persistent_record_row(tenant_id, key_identity, *location));
-			}
-		}
-		rows.sort_by_key(|row| {
-			(
-				row.location.slab_id,
-				row.tenant_id,
-				row.key_identity,
-				row.location.hlc,
-				row.location.offset,
-				row.location.record_row_index,
-			)
-		});
-		rows
+	fn record_rows_for_slab(&self, slab_id: SlabId) -> std::io::Result<Vec<PersistentRecordRow>> {
+		self.require_tier_authority_ready()?;
+		Ok(self.record_rows_for_slab_for_recovery(slab_id))
 	}
 
-	fn has_rows_for_slab(&self, slab_id: SlabId) -> bool {
-		self.key_index.iter().any(|entry| {
-			entry
-				.value()
-				.iter()
-				.any(|location| location.slab_id == slab_id)
-		})
-	}
-
-	async fn tiered_pointers_snapshot(&self) -> Vec<TieredSlabPointer> {
-		let state = self.state.lock().await;
-		let mut tiered = state
-			.tiered
-			.iter()
-			.map(|entry| entry.value().clone())
-			.collect::<Vec<_>>();
-		tiered.sort_by_key(|pointer| pointer.slab_id);
-		tiered
-	}
-
-	async fn rebuild_persistent_index(&self) {
-		let Some(index) = &self.persistent_index else {
-			return;
-		};
-		let rows = self.persistent_record_rows_snapshot();
-		let tiered = self.tiered_pointers_snapshot().await;
-		if let Err(err) = index.rebuild(rows, tiered, None).await {
-			tracing::warn!(
-				error = %err,
-				dir = %self.config.dir.display(),
-				"failed to rebuild redb storage index snapshot"
-			);
-		}
-	}
-
-	async fn mirror_persistent_update(
-		&self,
-		update: PersistentIndexUpdate,
-		operation: &'static str,
-	) {
-		let Some(index) = &self.persistent_index else {
-			return;
-		};
-		if let Err(err) = index.apply(update.clone()).await {
-			tracing::warn!(
-				error = %err,
-				dir = %self.config.dir.display(),
-				operation,
-				"redb delta update failed; rebuilding from authoritative storage state"
-			);
-			let rows = self.persistent_record_rows_snapshot();
-			let tiered = self.tiered_pointers_snapshot().await;
-			if let Err(rebuild_err) = index
-				.rebuild(rows, tiered, update.last_control_log_index)
-				.await
-			{
-				tracing::warn!(
-					error = %rebuild_err,
-					dir = %self.config.dir.display(),
-					operation,
-					"failed to rebuild redb storage index snapshot"
-				);
-			}
-		}
-	}
-
-	/// A local slab may be unlinked only after the durable index agrees that
-	/// no published record or secondary-index source still names it. Runtime
-	/// `key_index` alone is insufficient: it can already have advanced past a
-	/// source while a failed mirror leaves recovery pointing at that source.
-	///
-	/// A mismatch preserves the slab, quarantines further retirement work for
-	/// it, and leaves repair to an explicit future operator decision.
-	async fn can_retire_local_slab(&self, slab_id: SlabId) -> std::io::Result<bool> {
-		let Some(index) = &self.persistent_index else {
-			return Ok(true);
-		};
-		let snapshot = index.load_snapshot().await?;
-		let record_references = snapshot
-			.record_rows
-			.iter()
-			.chain(snapshot.tiered_records.iter())
-			.filter(|row| row.location.slab_id == slab_id)
-			.count();
-		let secondary_references = snapshot
-			.secondary_index_segments
-			.iter()
-			.filter(|row| row.key.source_slab_id == slab_id)
-			.count();
-		if record_references == 0 && secondary_references == 0 {
-			return Ok(true);
-		}
-
-		self.quarantined_compaction_slabs.insert(slab_id);
-		tracing::error!(
-			slab_id = slab_id.get(),
-			record_references,
-			secondary_references,
-			"refusing to retire slab with durable published references"
-		);
-		Ok(false)
-	}
-
-	async fn persist_record_row(
-		&self,
-		tenant_id: TenantId,
-		key_identity: Identity,
-		location: RecordLocation,
-	) {
-		let Some(index) = &self.persistent_index else {
-			return;
-		};
-		let row = self.persistent_record_row(tenant_id, key_identity, location);
-		if let Err(err) = index.upsert_record(row).await {
-			tracing::warn!(
-				error = %err,
-				slab_id = location.slab_id.get(),
-				offset = location.offset,
-				tenant_id = tenant_id.get(),
-				"failed to persist slab record into redb"
-			);
-		}
-	}
-
-	async fn persist_record_row_strict(
-		&self,
-		tenant_id: TenantId,
-		key_identity: Identity,
-		routing_locality: Locality,
-		location: RecordLocation,
-	) -> std::io::Result<()> {
-		let Some(index) = &self.persistent_index else {
-			return Ok(());
-		};
-		let row = PersistentRecordRow {
-			tenant_id,
-			key_identity,
-			routing_locality,
-			table_object_id: None,
-			// ADR 0090: persist the location's own placement, never a default.
-			placement: location.placement,
-			partition: location.partition,
-			location,
-		};
-		if let Err(err) = index.upsert_record(row).await {
-			tracing::warn!(
-				error = %err,
-				slab_id = location.slab_id.get(),
-				offset = location.offset,
-				tenant_id = tenant_id.get(),
-				"redb upsert failed on durable append; rebuilding snapshot before retry"
-			);
-			let mut rows = self.persistent_record_rows_snapshot();
-			rows.push(row);
-			rows.sort_by_key(|row| {
-				(
-					row.location.slab_id,
-					row.tenant_id,
-					row.key_identity,
-					row.location.hlc,
-					row.location.offset,
-					row.location.record_row_index,
-				)
-			});
-			let tiered = self.tiered_pointers_snapshot().await;
-			index.rebuild(rows, tiered, None).await?;
-		}
-		Ok(())
-	}
-
-	async fn persist_record_rows_strict(
-		&self,
-		rows: Vec<PersistentRecordRow>,
-	) -> std::io::Result<()> {
-		let Some(index) = &self.persistent_index else {
-			return Ok(());
-		};
-		if let Err(err) = index
-			.apply(PersistentIndexUpdate {
-				put_records: rows.clone(),
-				..Default::default()
-			})
-			.await
-		{
-			tracing::warn!(
-				error = %err,
-				"redb batch upsert failed on durable multi-row append; rebuilding snapshot before retry"
-			);
-			let mut snapshot_rows = self.persistent_record_rows_snapshot();
-			snapshot_rows.extend(rows);
-			snapshot_rows.sort_by_key(|row| {
-				(
-					row.location.slab_id,
-					row.tenant_id,
-					row.key_identity,
-					row.location.hlc,
-					row.location.offset,
-					row.location.record_row_index,
-				)
-			});
-			let tiered = self.tiered_pointers_snapshot().await;
-			index.rebuild(snapshot_rows, tiered, None).await?;
-		}
-		Ok(())
-	}
-
-	async fn persist_tiered_pointer_strict(
-		&self,
-		pointer: TieredSlabPointer,
-		last_control_log_index: Option<u64>,
-	) -> std::io::Result<()> {
-		let Some(index) = &self.persistent_index else {
-			return Ok(());
-		};
-		if let Err(err) = index
-			.upsert_tiered_slab(pointer.clone(), last_control_log_index)
-			.await
-		{
-			tracing::warn!(
-				error = %err,
-				slab_id = pointer.slab_id.get(),
-				"redb tier-pointer upsert failed; rebuilding snapshot before retry"
-			);
-			let rows = self.persistent_record_rows_snapshot();
-			let mut tiered = self.tiered_pointers_snapshot().await;
-			if let Some(existing) = tiered
-				.iter_mut()
-				.find(|entry| entry.slab_id == pointer.slab_id)
-			{
-				*existing = pointer.clone();
-			} else {
-				tiered.push(pointer.clone());
-				tiered.sort_by_key(|entry| entry.slab_id);
-			}
-			index.rebuild(rows, tiered, last_control_log_index).await?;
-		}
-		Ok(())
-	}
-
-	async fn delete_tiered_slab_strict(
-		&self,
-		slab_id: SlabId,
-		last_control_log_index: Option<u64>,
-	) -> std::io::Result<()> {
-		let Some(index) = &self.persistent_index else {
-			return Ok(());
-		};
-		let mut rows = self.persistent_record_rows_snapshot();
-		rows.retain(|row| row.location.slab_id != slab_id);
-		let mut tiered = self.tiered_pointers_snapshot().await;
-		tiered.retain(|entry| entry.slab_id != slab_id);
-		index.rebuild(rows, tiered, last_control_log_index).await
-	}
-
-	fn record_rows_for_slab(&self, slab_id: SlabId) -> Vec<PersistentRecordRow> {
+	fn record_rows_for_slab_for_recovery(&self, slab_id: SlabId) -> Vec<PersistentRecordRow> {
 		let mut rows = Vec::new();
 		for entry in self.key_index.iter() {
 			let (tenant_id, key_identity) = *entry.key();
@@ -3781,6 +3726,7 @@ impl SlabManager {
 		table_schemas: &TableSchemaCatalog,
 		now_ms: u64,
 	) -> std::io::Result<Option<PreparedTieredRetentionRewrite>> {
+		self.require_tier_authority_ready()?;
 		let old_blob = self
 			.config
 			.l2
@@ -3797,12 +3743,17 @@ impl SlabManager {
 			.get(&pointer.l2_uri)
 			.await?;
 		validate_tiered_blob(pointer, &old_blob)?;
-		let plaintext = Zeroizing::new(decode_tiered_blob(
-			self.config.crypto.as_ref(),
-			pointer,
-			&old_blob,
-			&self.acknowledged_offsets_in_slab(pointer.slab_id),
-		)?);
+		// The rewrite source is the published generation: the index's offsets
+		// are the independent evidence for every acknowledged record in it.
+		let plaintext = Zeroizing::new(
+			decode_tiered_blob(
+				self.config.crypto.as_ref(),
+				pointer,
+				&old_blob,
+				TierObjectEvidence::Indexed(&self.acknowledged_offsets_in_slab(pointer.slab_id)),
+			)?
+			.bytes,
+		);
 		let mut records = recover_slab_entries_from_blob(
 			&plaintext,
 			pointer.slab_id,
@@ -3827,6 +3778,7 @@ impl SlabManager {
 			table_schemas,
 			now_ms,
 		)?;
+		self.keep_conflicting_versions(&mut records);
 		records.sort_by_key(|record| record.old_location.offset);
 		let physical_groups = physical_compaction_groups(&records);
 		let pruned_versions = records.iter().filter(|record| record.reclaim).count();
@@ -3844,6 +3796,7 @@ impl SlabManager {
 			return Ok(Some(PreparedTieredRetentionRewrite::Retire {
 				slab_id: pointer.slab_id,
 				old_l2_uri: pointer.l2_uri.clone(),
+				old_bytes: old_blob.len() as u64,
 				pruned_versions,
 				retention_stats,
 				reclaimed_bytes: old_blob.len() as u64,
@@ -3853,6 +3806,9 @@ impl SlabManager {
 		let tmp_path = retention_rewrite_tmp_path(&self.config.dir, pointer.slab_id);
 		let _ = unlink_local_file(self.file_ops.as_ref(), &tmp_path).await;
 		let mut multirow_recompact_count = 0_u64;
+		// The replacement's own record offsets: the index still describes the
+		// old layout, so every walk of the new bytes takes these instead.
+		let mut replacement_offsets = BTreeSet::new();
 		let rewrite_result: std::io::Result<Zeroizing<Vec<u8>>> = async {
 			let rewritten = Arc::new(
 				LocalSlabStore::open(
@@ -3883,7 +3839,7 @@ impl SlabManager {
 				if compacted.was_multirow {
 					multirow_recompact_count = multirow_recompact_count.saturating_add(1);
 				}
-				rewritten
+				let location = rewritten
 					.append(
 						compacted.tenant_id,
 						compacted.key_identity,
@@ -3891,6 +3847,7 @@ impl SlabManager {
 						&compacted.frame,
 					)
 					.await?;
+				replacement_offsets.insert(location.offset);
 			}
 			rewritten.fsync().await?;
 			Ok(Zeroizing::new(self.file_ops.read_all(&tmp_path).await?))
@@ -3898,28 +3855,37 @@ impl SlabManager {
 		.await;
 		let _ = unlink_local_file(self.file_ops.as_ref(), &tmp_path).await;
 		let rewritten_plaintext = rewrite_result?;
+		self.preflight_tier_publication(
+			pointer.slab_id,
+			&plaintext,
+			&rewritten_plaintext,
+			&replacement_offsets,
+		)
+		.await?;
 		if multirow_recompact_count > 0 {
 			metrics().observe_storage_multirow_recompact(multirow_recompact_count);
 		}
-		let encrypted = self.encrypt_tiered_object_blob_with_table_stats(
+		let encrypted = self.encrypt_tiered_blob_with_evidence(
 			pointer.slab_id,
 			rewritten_plaintext.as_ref(),
-			table_schemas,
+			&replacement_offsets,
+			Some(table_schemas),
 		)?;
 		let row_tombstone_metadata = row_tombstone_metadata_from_blob(
 			rewritten_plaintext.as_ref(),
 			pointer.slab_id,
-			&BTreeSet::new(),
+			&replacement_offsets,
 		)?;
 		Ok(Some(PreparedTieredRetentionRewrite::Rewrite {
 			slab_id: pointer.slab_id,
 			old_l2_uri: pointer.l2_uri.clone(),
+			old_bytes: old_blob.len() as u64,
 			payload_hash: crate::hash::content::digest(&encrypted.bytes),
 			tombstone_metadata: merge_row_tombstone_metadata(
 				pointer.tombstone_metadata,
 				row_tombstone_metadata,
 			),
-			supersession_metadata: self.slab_supersession_metadata(pointer.slab_id),
+			supersession_metadata: self.slab_supersession_metadata(pointer.slab_id)?,
 			reclaimed_bytes: (old_blob.len() as u64).saturating_sub(encrypted.bytes.len() as u64),
 			pruned_versions,
 			retention_stats,
@@ -3934,6 +3900,7 @@ impl SlabManager {
 		descriptor: &TableSchemaDescriptor,
 		table_schemas: &TableSchemaCatalog,
 	) -> std::io::Result<Option<PreparedTieredTableDropRewrite>> {
+		self.require_tier_authority_ready()?;
 		let old_blob = self
 			.config
 			.l2
@@ -3950,12 +3917,17 @@ impl SlabManager {
 			.get(&pointer.l2_uri)
 			.await?;
 		validate_tiered_blob(pointer, &old_blob)?;
-		let plaintext = Zeroizing::new(decode_tiered_blob(
-			self.config.crypto.as_ref(),
-			pointer,
-			&old_blob,
-			&self.acknowledged_offsets_in_slab(pointer.slab_id),
-		)?);
+		// The rewrite source is the published generation: the index's offsets
+		// are the independent evidence for every acknowledged record in it.
+		let plaintext = Zeroizing::new(
+			decode_tiered_blob(
+				self.config.crypto.as_ref(),
+				pointer,
+				&old_blob,
+				TierObjectEvidence::Indexed(&self.acknowledged_offsets_in_slab(pointer.slab_id)),
+			)?
+			.bytes,
+		);
 		let mut records = recover_slab_entries_from_blob(
 			&plaintext,
 			pointer.slab_id,
@@ -3989,6 +3961,7 @@ impl SlabManager {
 			return Ok(Some(PreparedTieredTableDropRewrite::Retire {
 				slab_id: pointer.slab_id,
 				old_l2_uri: pointer.l2_uri.clone(),
+				old_bytes: old_blob.len() as u64,
 				reclaimed_records,
 				reclaimed_bytes: old_blob.len() as u64,
 			}));
@@ -3997,6 +3970,9 @@ impl SlabManager {
 		let tmp_path = table_drop_rewrite_tmp_path(&self.config.dir, pointer.slab_id);
 		let _ = unlink_local_file(self.file_ops.as_ref(), &tmp_path).await;
 		let mut multirow_recompact_count = 0_u64;
+		// The replacement's own record offsets: the index still describes the
+		// old layout, so every walk of the new bytes takes these instead.
+		let mut replacement_offsets = BTreeSet::new();
 		let rewrite_result: std::io::Result<Zeroizing<Vec<u8>>> = async {
 			let rewritten = Arc::new(
 				LocalSlabStore::open(
@@ -4027,7 +4003,7 @@ impl SlabManager {
 				if compacted.was_multirow {
 					multirow_recompact_count = multirow_recompact_count.saturating_add(1);
 				}
-				rewritten
+				let location = rewritten
 					.append(
 						compacted.tenant_id,
 						compacted.key_identity,
@@ -4035,6 +4011,7 @@ impl SlabManager {
 						&compacted.frame,
 					)
 					.await?;
+				replacement_offsets.insert(location.offset);
 			}
 			rewritten.fsync().await?;
 			Ok(Zeroizing::new(self.file_ops.read_all(&tmp_path).await?))
@@ -4042,28 +4019,37 @@ impl SlabManager {
 		.await;
 		let _ = unlink_local_file(self.file_ops.as_ref(), &tmp_path).await;
 		let rewritten_plaintext = rewrite_result?;
+		self.preflight_tier_publication(
+			pointer.slab_id,
+			&plaintext,
+			&rewritten_plaintext,
+			&replacement_offsets,
+		)
+		.await?;
 		if multirow_recompact_count > 0 {
 			metrics().observe_storage_multirow_recompact(multirow_recompact_count);
 		}
-		let encrypted = self.encrypt_tiered_object_blob_with_table_stats(
+		let encrypted = self.encrypt_tiered_blob_with_evidence(
 			pointer.slab_id,
 			rewritten_plaintext.as_ref(),
-			table_schemas,
+			&replacement_offsets,
+			Some(table_schemas),
 		)?;
 		let row_tombstone_metadata = row_tombstone_metadata_from_blob(
 			rewritten_plaintext.as_ref(),
 			pointer.slab_id,
-			&BTreeSet::new(),
+			&replacement_offsets,
 		)?;
 		Ok(Some(PreparedTieredTableDropRewrite::Rewrite {
 			slab_id: pointer.slab_id,
 			old_l2_uri: pointer.l2_uri.clone(),
+			old_bytes: old_blob.len() as u64,
 			payload_hash: crate::hash::content::digest(&encrypted.bytes),
 			tombstone_metadata: merge_row_tombstone_metadata(
 				pointer.tombstone_metadata,
 				row_tombstone_metadata,
 			),
-			supersession_metadata: self.slab_supersession_metadata(pointer.slab_id),
+			supersession_metadata: self.slab_supersession_metadata(pointer.slab_id)?,
 			reclaimed_bytes: (old_blob.len() as u64).saturating_sub(encrypted.bytes.len() as u64),
 			reclaimed_records,
 			encrypted_bytes: encrypted.bytes,
@@ -4073,7 +4059,7 @@ impl SlabManager {
 	async fn reserve_slab_id(&self) -> SlabId {
 		let mut state = self.state.lock().await;
 		let next_id = state.next_slab_id;
-		state.next_slab_id = state.next_slab_id.saturating_add(1);
+		state.advance_slab_allocator(next_id.saturating_add(1));
 		next_id
 	}
 }
@@ -4359,11 +4345,8 @@ pub struct EmptySlabRepairReport {
 /// one slab too few costs a reference.
 async fn referenced_slab_ids(dir: &Path) -> std::io::Result<HashSet<SlabId>> {
 	let index_path = persistent_index_path(dir);
-	// `PersistentLocalIndex::open` goes through `Database::create`, which would
-	// happily conjure an empty index here. That would report every candidate as
-	// unreferenced and delete them all — not because nothing referenced them,
-	// but because nothing could be asked. An absent index is a refusal, and it
-	// must be caught before the open that would paper over it.
+	// An absent index cannot distinguish an unreferenced slab from unavailable
+	// authority. Refuse explicitly; open itself also never creates the index.
 	if !index_path.exists() {
 		return Err(Error::new(
 			ErrorKind::NotFound,
@@ -4488,47 +4471,99 @@ fn build_locality_index(key_localities: &DashMap<TenantKey, Locality>) -> Tenant
 	locality_index
 }
 
+pub(crate) const AWAITING_CLUSTER_MARKER: &str = "TIER_AUTHORITY_AWAITING_CLUSTER";
+
 #[cfg(test)]
 mod tests;
 
-/// ADR 0090 route-gate hook: install an arbitrary version so route tests can
-/// construct placement states the write path cannot produce yet. The location
-/// may point at nothing — route selection must decide before any slab byte is
-/// touched, which is exactly what the tests prove.
 #[cfg(test)]
 impl SlabManager {
-	pub(crate) fn install_version_for_route_test(
-		&self,
-		tenant_id: TenantId,
-		key_identity: Identity,
-		location: RecordLocation,
-	) {
-		self.key_index
-			.entry((tenant_id, key_identity))
-			.or_default()
-			.push(location);
+	pub(crate) fn fail_next_retirement_transaction_for_test(&self) {
+		self.persistent_index
+			.as_ref()
+			.unwrap()
+			.fail_next_retirement
+			.store(true, std::sync::atomic::Ordering::Release);
 	}
 }
 
-/// ADR 0090: placement resolution helpers that live outside the storage-engine
-/// trait surface.
-impl SlabManager {
-	/// ADR 0090: the placement authority for one row version. Durable carriers
-	/// that predate placement — the V1 secondary-index segment format — decode
-	/// their locations as raw-locality, so a reader holding such a location
-	/// must resolve the version's true placement from the key chain rather
-	/// than trusting the segment's reconstruction.
-	pub(crate) fn version_placement_at(
-		&self,
-		tenant_id: TenantId,
-		key_identity: Identity,
-		hlc: HybridTimestamp,
-	) -> Option<(PlacementSemantics, Option<crate::schema::PartitionId>)> {
-		let versions = self.key_index.get(&(tenant_id, key_identity))?;
-		versions
-			.value()
+/// Test support: read-only views of durable LSM state for acceptance tests.
+#[cfg(feature = "test-support")]
+pub mod durable_lsm_view {
+	use super::SlabId;
+
+	/// What protects one compaction source while its unlink is pending, read
+	/// from the manager's own durable index without changing it.
+	#[derive(Clone, Debug, PartialEq, Eq)]
+	pub struct SourceProtection {
+		/// The source's durable run state, if a run is recorded.
+		pub run_state: Option<String>,
+		/// Unresolved install intents that are a Control/Prepared pure GC
+		/// removal of exactly this source, with exactly this source as input,
+		/// whose commit digest matches the commit.
+		pub exact_removal_intents: usize,
+		/// Every other unresolved install intent naming this source.
+		pub other_intents_naming_source: usize,
+		/// Durable record rows (local and tiered) located in this source.
+		pub durable_rows_in_source: usize,
+	}
+
+	pub async fn source_protection(
+		manager: &super::SlabManager,
+		source: SlabId,
+	) -> std::io::Result<SourceProtection> {
+		use crate::storage::index::{LsmInstallKind, LsmInstallPhase};
+		let index = manager
+			.persistent_index
+			.as_ref()
+			.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no durable index"))?;
+		let snapshot = index.load_snapshot().await?;
+		let run_state = snapshot
+			.lsm_runs
 			.iter()
-			.find(|location| location.hlc == hlc)
-			.map(|location| (location.placement, location.partition))
+			.find(|run| run.slab_id == source)
+			.map(|run| format!("{:?}", run.state));
+		let mut exact_removal_intents = 0;
+		let mut other_intents_naming_source = 0;
+		for intent in &snapshot.lsm_install_intents {
+			let commit = &intent.commit;
+			let names = commit.slabs_to_remove.contains(&source)
+				|| commit.slabs_to_retire.contains(&source)
+				|| commit.slabs_to_mark_delete_pending.contains(&source)
+				|| intent.inputs.iter().any(|input| input.slab_id == source);
+			if !names {
+				continue;
+			}
+			let digest_matches = serde_json::to_vec(commit)
+				.map(|bytes| *blake3::hash(&bytes).as_bytes() == intent.commit_digest)
+				.unwrap_or(false);
+			let exact = intent.kind == LsmInstallKind::Control
+				&& intent.phase == LsmInstallPhase::Prepared
+				&& commit.slabs_to_remove == [source]
+				&& commit.slabs_to_add.is_empty()
+				&& commit.slabs_to_retire.is_empty()
+				&& commit.slabs_to_mark_delete_pending.is_empty()
+				&& commit.sidecar_swaps.is_empty()
+				&& intent.inputs.len() == 1
+				&& intent.inputs[0].slab_id == source
+				&& digest_matches;
+			if exact {
+				exact_removal_intents += 1;
+			} else {
+				other_intents_naming_source += 1;
+			}
+		}
+		let durable_rows_in_source = snapshot
+			.record_rows
+			.iter()
+			.chain(&snapshot.tiered_records)
+			.filter(|row| row.location.slab_id == source)
+			.count();
+		Ok(SourceProtection {
+			run_state,
+			exact_removal_intents,
+			other_intents_naming_source,
+			durable_rows_in_source,
+		})
 	}
 }

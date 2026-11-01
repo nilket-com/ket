@@ -223,7 +223,7 @@ async fn maintenance_publication_fail_stop_blocks_reads_until_restart() {
 		.append_durable(tenant(), key, hlc(1), b"must-not-serve-half-published")
 		.await
 		.unwrap();
-	let location = manager.lookup(tenant(), key).unwrap();
+	let location = manager.lookup(tenant(), key).unwrap().unwrap();
 	let publication_gate = manager
 		.maintenance_publication_gate
 		.clone()
@@ -1708,6 +1708,10 @@ impl CountingObjectStore {
 
 #[async_trait::async_trait]
 impl ObjectStore for CountingObjectStore {
+	fn planned_upload_uri(&self, key: &str) -> std::io::Result<String> {
+		self.inner.planned_upload_uri(key)
+	}
+
 	async fn put(&self, key: &str, bytes: &[u8]) -> std::io::Result<String> {
 		self.inner.put(key, bytes).await
 	}
@@ -1899,7 +1903,7 @@ async fn durable_multirow_table_attribution_survives_manager_reopen() {
 	let dir = fresh_dir("adr0539-table-attribution");
 	let crypto = test_crypto();
 	let io = spawn_io_thread(64).unwrap();
-	let manager = open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	let manager = initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
 	let table_object_id = TableObjectId::new([0x53; 16]);
 	let key_identity = id(5_039);
 	let row_hlc = hlc(5_039);
@@ -1916,9 +1920,10 @@ async fn durable_multirow_table_attribution_survives_manager_reopen() {
 		.unwrap();
 	let location = manager
 		.lookup(tenant(), key_identity)
+		.unwrap()
 		.expect("published typed row");
 	assert_eq!(
-		manager.published_table_object_id(location),
+		manager.published_table_object_id(location).unwrap(),
 		Some(table_object_id)
 	);
 	assert_eq!(
@@ -1932,7 +1937,7 @@ async fn durable_multirow_table_attribution_survives_manager_reopen() {
 	drop(manager);
 	let reopened = open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
 	assert_eq!(
-		reopened.published_table_object_id(location),
+		reopened.published_table_object_id(location).unwrap(),
 		Some(table_object_id)
 	);
 	assert_eq!(
@@ -1961,7 +1966,7 @@ async fn missing_published_reference_fences_the_referencing_typed_table_before_w
 		.append_durable_multirow_with_locality(tenant(), &frame, &entries)
 		.await
 		.unwrap();
-	let location = manager.lookup(tenant(), key_identity).unwrap();
+	let location = manager.lookup(tenant(), key_identity).unwrap().unwrap();
 	let slab_id = manager.force_seal_active_for_test().await;
 	assert_eq!(location.slab_id, slab_id);
 	let unrelated_table_object_id = TableObjectId::new([0x56; 16]);
@@ -1983,7 +1988,10 @@ async fn missing_published_reference_fences_the_referencing_typed_table_before_w
 		.append_durable_multirow_with_locality(tenant(), &unrelated_frame, &unrelated_entries)
 		.await
 		.unwrap();
-	let unrelated_location = manager.lookup(tenant(), unrelated_key_identity).unwrap();
+	let unrelated_location = manager
+		.lookup(tenant(), unrelated_key_identity)
+		.unwrap()
+		.unwrap();
 	assert_ne!(unrelated_location.slab_id, slab_id);
 	manager.state.lock().await.sealed.remove(&slab_id);
 
@@ -2023,7 +2031,7 @@ async fn recovery_fences_durable_reference_to_missing_slab() {
 	let dir = fresh_dir("adr0539-recovery-fence");
 	let crypto = test_crypto();
 	let io = spawn_io_thread(64).unwrap();
-	let manager = open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	let manager = initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
 	let table_object_id = TableObjectId::new([0x55; 16]);
 	let key_identity = id(5_041);
 	let row_hlc = hlc(5_041);
@@ -2038,7 +2046,7 @@ async fn recovery_fences_durable_reference_to_missing_slab() {
 		.append_durable_multirow_with_locality(tenant(), &frame, &entries)
 		.await
 		.unwrap();
-	let location = manager.lookup(tenant(), key_identity).unwrap();
+	let location = manager.lookup(tenant(), key_identity).unwrap().unwrap();
 	let slab_id = manager.force_seal_active_for_test().await;
 	assert_eq!(location.slab_id, slab_id);
 	drop(manager);
@@ -2078,7 +2086,7 @@ async fn durable_index_reference_blocks_local_slab_retirement() {
 		.append_durable_multirow_with_locality(tenant(), &frame, &entries)
 		.await
 		.unwrap();
-	let location = manager.lookup(tenant(), key_identity).unwrap();
+	let location = manager.lookup(tenant(), key_identity).unwrap().unwrap();
 	let slab_id = manager.force_seal_active_for_test().await;
 	assert_eq!(location.slab_id, slab_id);
 
@@ -2331,26 +2339,24 @@ async fn fresh_manager_with_l2(
 	let l2_root = fresh_dir(&format!("{tag}-l2"));
 	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
 	let io = spawn_io_thread(64).unwrap();
-	let manager = Arc::new(
-		SlabManager::open(SlabManagerConfig {
-			dir: l1_dir.to_path_buf(),
-			max_slab_bytes: 1 << 20,
-			io,
-			l2: Some(l2.clone()),
-			rehydration: RehydrationPolicy::default(),
-			l2_column_fetch: Default::default(),
-			row_group_writer: Default::default(),
-			l2_row_group_fetch: Default::default(),
-			encoding_writer: Default::default(),
-			l2_chunk_layout: Default::default(),
-			l2_encoding_fetch: Default::default(),
-			encoding_compute: Default::default(),
-			group_commit: GroupCommitConfig::default(),
-			crypto: test_crypto(),
-		})
-		.await
-		.unwrap(),
-	);
+	let manager = SlabManager::initialize_new_store(SlabManagerConfig {
+		dir: l1_dir.to_path_buf(),
+		max_slab_bytes: 1 << 20,
+		io,
+		l2: Some(l2.clone()),
+		rehydration: RehydrationPolicy::default(),
+		l2_column_fetch: Default::default(),
+		row_group_writer: Default::default(),
+		l2_row_group_fetch: Default::default(),
+		encoding_writer: Default::default(),
+		l2_chunk_layout: Default::default(),
+		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
+		group_commit: GroupCommitConfig::default(),
+		crypto: test_crypto(),
+	})
+	.await
+	.unwrap();
 	([l1_dir, l2_root], manager, l2)
 }
 
@@ -2744,57 +2750,78 @@ async fn fresh_manager_with_group_commit(
 ) -> (crate::test_support::TestDir, Arc<SlabManager>) {
 	let dir = fresh_dir("mv");
 	let io = spawn_io_thread(64).unwrap();
-	let manager = Arc::new(
-		SlabManager::open(SlabManagerConfig {
-			dir: dir.to_path_buf(),
-			// Large enough that no rotation fires during tests;
-			// we want every version in the same active slab so
-			// the test targets the multi-version index
-			// semantics rather than cross-slab drain behaviour.
-			max_slab_bytes: 1024 * 1024,
-			io,
-			l2: None,
-			rehydration: RehydrationPolicy::default(),
-			l2_column_fetch: Default::default(),
-			row_group_writer: Default::default(),
-			l2_row_group_fetch: Default::default(),
-			encoding_writer: Default::default(),
-			l2_chunk_layout: Default::default(),
-			l2_encoding_fetch: Default::default(),
-			encoding_compute: Default::default(),
-			group_commit,
-			crypto: test_crypto(),
-		})
-		.await
-		.unwrap(),
-	);
+	let manager = SlabManager::initialize_new_store(SlabManagerConfig {
+		dir: dir.to_path_buf(),
+		// Large enough that no rotation fires during tests;
+		// we want every version in the same active slab so
+		// the test targets the multi-version index
+		// semantics rather than cross-slab drain behaviour.
+		max_slab_bytes: 1024 * 1024,
+		io,
+		l2: None,
+		rehydration: RehydrationPolicy::default(),
+		l2_column_fetch: Default::default(),
+		row_group_writer: Default::default(),
+		l2_row_group_fetch: Default::default(),
+		encoding_writer: Default::default(),
+		l2_chunk_layout: Default::default(),
+		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
+		group_commit,
+		crypto: test_crypto(),
+	})
+	.await
+	.unwrap();
 	(dir, manager)
 }
+async fn initialize_manager_at_dir(
+	dir: std::path::PathBuf,
+	io: crate::storage::io_uring::IoRingHandle,
+	crypto: Arc<CryptoManager>,
+) -> Arc<SlabManager> {
+	SlabManager::initialize_new_store(SlabManagerConfig {
+		dir,
+		max_slab_bytes: 1024 * 1024,
+		io,
+		l2: None,
+		rehydration: RehydrationPolicy::default(),
+		l2_column_fetch: Default::default(),
+		row_group_writer: Default::default(),
+		l2_row_group_fetch: Default::default(),
+		encoding_writer: Default::default(),
+		l2_chunk_layout: Default::default(),
+		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
+		group_commit: GroupCommitConfig::default(),
+		crypto,
+	})
+	.await
+	.unwrap()
+}
+
 async fn open_manager_at_dir(
 	dir: std::path::PathBuf,
 	io: crate::storage::io_uring::IoRingHandle,
 	crypto: Arc<CryptoManager>,
 ) -> Arc<SlabManager> {
-	Arc::new(
-		SlabManager::open(SlabManagerConfig {
-			dir,
-			max_slab_bytes: 1024 * 1024,
-			io,
-			l2: None,
-			rehydration: RehydrationPolicy::default(),
-			l2_column_fetch: Default::default(),
-			row_group_writer: Default::default(),
-			l2_row_group_fetch: Default::default(),
-			encoding_writer: Default::default(),
-			l2_chunk_layout: Default::default(),
-			l2_encoding_fetch: Default::default(),
-			encoding_compute: Default::default(),
-			group_commit: GroupCommitConfig::default(),
-			crypto,
-		})
-		.await
-		.unwrap(),
-	)
+	SlabManager::open(SlabManagerConfig {
+		dir,
+		max_slab_bytes: 1024 * 1024,
+		io,
+		l2: None,
+		rehydration: RehydrationPolicy::default(),
+		l2_column_fetch: Default::default(),
+		row_group_writer: Default::default(),
+		l2_row_group_fetch: Default::default(),
+		encoding_writer: Default::default(),
+		l2_chunk_layout: Default::default(),
+		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
+		group_commit: GroupCommitConfig::default(),
+		crypto,
+	})
+	.await
+	.unwrap()
 }
 
 // ============================================================
@@ -2816,7 +2843,7 @@ async fn counter_tentative_without_marker_does_not_survive_restart() {
 	let crypto = test_crypto();
 	let k = ckey(b"verdict");
 	{
-		let mgr = open_manager_at_dir(
+		let mgr = initialize_manager_at_dir(
 			dir.to_path_buf(),
 			spawn_io_thread(64).unwrap(),
 			crypto.clone(),
@@ -2864,7 +2891,7 @@ async fn counter_commit_marker_survives_restart_into_manager_index() {
 	let crypto = test_crypto();
 	let k = ckey(b"verdict");
 	{
-		let mgr = open_manager_at_dir(
+		let mgr = initialize_manager_at_dir(
 			dir.to_path_buf(),
 			spawn_io_thread(64).unwrap(),
 			crypto.clone(),
@@ -2885,7 +2912,9 @@ async fn counter_commit_marker_survives_restart_into_manager_index() {
 	let mgr = open_manager_at_dir(dir.to_path_buf(), spawn_io_thread(64).unwrap(), crypto).await;
 	// Direct proof: the committed counter is in the manager's key_index.
 	assert!(
-		mgr.lookup(tenant(), counter_identity(&k)).is_some(),
+		mgr.lookup(tenant(), counter_identity(&k))
+			.unwrap()
+			.is_some(),
 		"committed counter landed in the manager's authoritative index after open"
 	);
 	let store = SlabCounterStore::new(
@@ -3113,10 +3142,24 @@ async fn ctr6_same_identity_with_different_tentative_values_refuses_key() {
 		.counter_append_tentative(tenant(), key, hlc, 86, origin)
 		.await
 		.unwrap();
-	manager
-		.counter_append_tentative(tenant(), key, hlc, 87, origin)
+	// The producer refuses a second value at this identity, so the conflicting
+	// tentative is written below the manager, as a store from before the check
+	// holds it.
+	let frame = super::super::counter::encode_origin_frame(87, origin).unwrap();
+	let active = manager.state.lock().await.active.clone();
+	let reservation = active.reserve_append(frame.len()).unwrap();
+	active
+		.write_reserved(
+			reservation,
+			tenant(),
+			key,
+			hlc,
+			crate::schema::record_class::COUNTER_TENTATIVE_V2,
+			&frame,
+		)
 		.await
 		.unwrap();
+	active.wait_durable_commit().await.unwrap();
 	for _ in 0..2 {
 		manager
 			.counter_append_commit_marker(tenant(), key, hlc, first.offset, origin)
@@ -3134,6 +3177,65 @@ async fn ctr6_same_identity_with_different_tentative_values_refuses_key() {
 	assert_eq!(
 		reopened.counter_eligible_cells().read(&(tenant(), key)),
 		Err(crate::storage::counter::CounterVisibilityError::Conflict)
+	);
+}
+
+#[tokio::test]
+async fn a_second_tentative_value_at_one_counter_identity_is_refused_at_append() {
+	let (_dir, manager) = fresh_manager().await;
+	let key = id(6_190);
+	let origin = NodeId {
+		id: 48,
+		_reserved: 0,
+	};
+	let hlc = HybridTimestamp {
+		physical_ms: 85,
+		logical: 0,
+		node_id: 0,
+	};
+	let first = manager
+		.counter_append_tentative(tenant(), key, hlc, 86, origin)
+		.await
+		.unwrap();
+	manager
+		.counter_append_commit_marker(tenant(), key, hlc, first.offset, origin)
+		.await
+		.unwrap();
+	manager.counter_commit_published(tenant(), key, first, origin);
+	let error = manager
+		.counter_append_tentative(tenant(), key, hlc, 87, origin)
+		.await
+		.expect_err("a second value at one (tenant, key, hlc, origin) was accepted");
+	assert_eq!(
+		stale_location(&error),
+		Some(StaleLocation {
+			slab_id: first.slab_id,
+			reason: StaleLocationReason::ConflictingVersion,
+		}),
+		"{error}"
+	);
+	assert_eq!(
+		counter_versions(&manager, key).await,
+		vec![(85, 86, 48)],
+		"the first value stays the one exact version"
+	);
+	// Another origin at the same HLC is another version, not a conflict.
+	let other = NodeId {
+		id: 49,
+		_reserved: 0,
+	};
+	let second = manager
+		.counter_append_tentative(tenant(), key, hlc, 87, other)
+		.await
+		.unwrap();
+	manager
+		.counter_append_commit_marker(tenant(), key, hlc, second.offset, other)
+		.await
+		.unwrap();
+	manager.counter_commit_published(tenant(), key, second, other);
+	assert_eq!(
+		counter_versions(&manager, key).await,
+		vec![(85, 86, 48), (85, 87, 49)]
 	);
 }
 
@@ -3565,10 +3667,11 @@ async fn fctr5a_counter_only_rewrite_preserves_pair_and_remaps_same_slab_marker(
 		service.read_committed(tenant(), key).await.unwrap(),
 		Some(42)
 	);
-	assert!(manager.lookup(tenant(), ordinary_key).is_none());
+	assert!(manager.lookup(tenant(), ordinary_key).unwrap().is_none());
 
 	let moved = manager
 		.lookup(tenant(), key)
+		.unwrap()
 		.expect("counter tentative remains indexed");
 	assert_ne!(moved.slab_id, source_id);
 	let replacement = manager
@@ -3681,7 +3784,7 @@ async fn fctr5a_cross_slab_marker_is_copied_verbatim_by_identity() {
 		.await
 		.unwrap()
 		.expect("marker-only slab must be retained via identity-bound committed state");
-	let tentative = manager.lookup(tenant(), key).unwrap();
+	let tentative = manager.lookup(tenant(), key).unwrap().unwrap();
 	assert_eq!(tentative.slab_id, tentative_slab);
 	let replacement = {
 		let state = manager.state.lock().await;
@@ -3799,6 +3902,11 @@ async fn fctr5a_legacy_and_orphan_marker_rewrites_refuse_without_mutation() {
 			2,
 			"only source and fresh active slab may exist after refusal"
 		);
+		if legacy {
+			manager.fsync_all_local_slabs().await.unwrap();
+			drop(manager);
+			assert_obsolete_slab_refuses_open(&path, source_id).await;
+		}
 	}
 }
 
@@ -3822,7 +3930,7 @@ async fn fctr5a_same_slab_offset_conflict_refuses_before_publication() {
 		.replicate_tentative(origin, 75, tenant(), key, 75, commit_hlc)
 		.await
 		.unwrap();
-	let tentative = manager.lookup(tenant(), key).unwrap();
+	let tentative = manager.lookup(tenant(), key).unwrap().unwrap();
 	service.commit(origin, 75, tenant(), key).await.unwrap();
 	manager
 		.counter_append_commit_marker(tenant(), key, commit_hlc, tentative.offset + 4096, origin)
@@ -3945,7 +4053,8 @@ async fn fctr5a_pending_tentative_defers_without_mutation() {
 		test_crypto(),
 	)
 	.await;
-	assert_eq!(reopened.counter_pending_frame_count(), 0);
+	assert_eq!(reopened.counter_pending_frame_count(), 1);
+	let recovered_manifest = reopened.compaction_manifest_snapshot();
 	let outcome = reopened
 		.compact_one_sealed_slab(
 			source_id,
@@ -3956,8 +4065,14 @@ async fn fctr5a_pending_tentative_defers_without_mutation() {
 			},
 		)
 		.await
-		.expect("restart discards volatile pending state, leaving the orphan compactable");
-	assert!(outcome.compaction.is_some());
+		.expect("recovered unmatched tentative remains held");
+	assert_eq!(outcome.scan, SealedSlabScan::Deferred);
+	assert!(outcome.compaction.is_none());
+	assert_eq!(std::fs::read(&path).unwrap(), source_before);
+	assert_eq!(
+		reopened.compaction_manifest_snapshot().run(source_id),
+		recovered_manifest.run(source_id)
+	);
 }
 
 #[tokio::test]
@@ -3980,7 +4095,7 @@ async fn fctr5a_duplicate_marker_rewrite_remains_idempotent() {
 		.replicate_tentative(origin, 77, tenant(), key, 77, commit_hlc)
 		.await
 		.unwrap();
-	let tentative = manager.lookup(tenant(), key).unwrap();
+	let tentative = manager.lookup(tenant(), key).unwrap().unwrap();
 	service.commit(origin, 77, tenant(), key).await.unwrap();
 	manager
 		.counter_append_commit_marker(tenant(), key, commit_hlc, tentative.offset, origin)
@@ -4245,26 +4360,24 @@ async fn fctr5a_lsm_compacts_tiered_ordinary_l0_with_local_runs() {
 	let l2_dir = fresh_dir("fctr5a-lsm-l2-l2");
 	let io = spawn_io_thread(64).unwrap();
 	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_dir).unwrap());
-	let manager = Arc::new(
-		SlabManager::open(SlabManagerConfig {
-			dir: l1_dir.to_path_buf(),
-			max_slab_bytes: 1,
-			io: io.clone(),
-			l2: Some(l2.clone()),
-			rehydration: RehydrationPolicy::default(),
-			l2_column_fetch: Default::default(),
-			row_group_writer: Default::default(),
-			l2_row_group_fetch: Default::default(),
-			encoding_writer: Default::default(),
-			l2_chunk_layout: Default::default(),
-			l2_encoding_fetch: Default::default(),
-			encoding_compute: Default::default(),
-			group_commit: GroupCommitConfig::default(),
-			crypto: test_crypto(),
-		})
-		.await
-		.unwrap(),
-	);
+	let manager = SlabManager::initialize_new_store(SlabManagerConfig {
+		dir: l1_dir.to_path_buf(),
+		max_slab_bytes: 1,
+		io: io.clone(),
+		l2: Some(l2.clone()),
+		rehydration: RehydrationPolicy::default(),
+		l2_column_fetch: Default::default(),
+		row_group_writer: Default::default(),
+		l2_row_group_fetch: Default::default(),
+		encoding_writer: Default::default(),
+		l2_chunk_layout: Default::default(),
+		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
+		group_commit: GroupCommitConfig::default(),
+		crypto: test_crypto(),
+	})
+	.await
+	.unwrap();
 	manager
 		.append_durable(tenant(), id(0x5a50), hlc(10), b"tiered ordinary row")
 		.await
@@ -4331,7 +4444,7 @@ async fn fctr5a_lsm_compacts_tiered_ordinary_l0_with_local_runs() {
 #[tokio::test]
 async fn counter_manager_rollback_removes_live_tentative_only() {
 	let dir = fresh_dir("adr075-counter-rollback");
-	let mgr = open_manager_at_dir(
+	let mgr = initialize_manager_at_dir(
 		dir.to_path_buf(),
 		spawn_io_thread(64).unwrap(),
 		test_crypto(),
@@ -4348,7 +4461,7 @@ async fn counter_manager_rollback_removes_live_tentative_only() {
 	let k = ckey(b"verdict");
 	let t = store.tentative_append(&k, 5, hlc(1)).await.unwrap();
 	assert_eq!(store.read_committed(&k).await.unwrap(), Some(5));
-	store.rollback_tentative(t);
+	store.rollback_tentative(t).await.unwrap();
 	assert_eq!(
 		store.read_committed(&k).await.unwrap(),
 		None,
@@ -4364,7 +4477,7 @@ async fn counter_manager_marker_failure_rolls_back_and_recovery_skips_orphan() {
 	let crypto = test_crypto();
 	let k = ckey(b"verdict");
 	{
-		let mgr = open_manager_at_dir(
+		let mgr = initialize_manager_at_dir(
 			dir.to_path_buf(),
 			spawn_io_thread(64).unwrap(),
 			crypto.clone(),
@@ -4384,7 +4497,7 @@ async fn counter_manager_marker_failure_rolls_back_and_recovery_skips_orphan() {
 		assert_eq!(store.read_committed(&k).await.unwrap(), Some(50));
 		store.arm_commit_marker_failure();
 		assert!(store.commit_tentative(t2).await.is_err());
-		store.rollback_tentative(t2); // terminal caller aborts
+		store.rollback_tentative(t2).await.unwrap(); // terminal caller aborts
 		assert_eq!(store.read_committed(&k).await.unwrap(), Some(3));
 		mgr.fsync_all_local_slabs().await.unwrap();
 	}
@@ -4414,7 +4527,7 @@ async fn counter_and_blob_coexist_blob_recovery_unchanged() {
 	let blob_value = b"ordinary-blob-value".to_vec();
 	let k = ckey(b"verdict");
 	{
-		let mgr = open_manager_at_dir(
+		let mgr = initialize_manager_at_dir(
 			dir.to_path_buf(),
 			spawn_io_thread(64).unwrap(),
 			crypto.clone(),
@@ -4439,6 +4552,7 @@ async fn counter_and_blob_coexist_blob_recovery_unchanged() {
 	// Ordinary blob recovers and reads back byte-identical.
 	let loc = mgr
 		.lookup(tenant(), blob_id)
+		.unwrap()
 		.expect("blob must be re-indexed");
 	assert_eq!(mgr.read(loc).await.unwrap(), blob_value);
 	// The counter recovers independently.
@@ -4466,7 +4580,7 @@ async fn counter_replica_service_replicate_live_then_restart_skips_without_marke
 	let crypto = test_crypto();
 	let id = counter_identity(&ckey(b"verdict"));
 	{
-		let mgr = open_manager_at_dir(
+		let mgr = initialize_manager_at_dir(
 			dir.to_path_buf(),
 			spawn_io_thread(64).unwrap(),
 			crypto.clone(),
@@ -4496,7 +4610,7 @@ async fn counter_replica_service_replicate_live_then_restart_skips_without_marke
 			"unmarked tentative is not committed"
 		);
 		assert_eq!(
-			mgr.counter_read_value(mgr.counter_lookup(tenant(), id).unwrap())
+			mgr.counter_read_value(mgr.counter_lookup(tenant(), id).unwrap().unwrap())
 				.await
 				.unwrap(),
 			5
@@ -4518,7 +4632,7 @@ async fn counter_replica_service_replicate_live_then_restart_skips_without_marke
 async fn counter_replica_service_rollback_removes_matching_op_idempotent() {
 	use crate::storage::counter::CounterSlab;
 	let dir = fresh_dir("adr075-replica-svc-rollback");
-	let mgr = open_manager_at_dir(
+	let mgr = initialize_manager_at_dir(
 		dir.to_path_buf(),
 		spawn_io_thread(64).unwrap(),
 		test_crypto(),
@@ -4576,7 +4690,7 @@ async fn counter_replica_service_rollback_removes_matching_op_idempotent() {
 	// op 2's tentative (value 9, higher HLC) remains the live latest.
 	assert_eq!(svc.read_committed(tenant(), id).await.unwrap(), None);
 	assert_eq!(
-		mgr.counter_read_value(mgr.counter_lookup(tenant(), id).unwrap())
+		mgr.counter_read_value(mgr.counter_lookup(tenant(), id).unwrap().unwrap())
 			.await
 			.unwrap(),
 		9
@@ -4604,7 +4718,7 @@ async fn counter_replica_service_commit_makes_value_survive_restart() {
 	let crypto = test_crypto();
 	let id = counter_identity(&ckey(b"verdict"));
 	{
-		let mgr = open_manager_at_dir(
+		let mgr = initialize_manager_at_dir(
 			dir.to_path_buf(),
 			spawn_io_thread(64).unwrap(),
 			crypto.clone(),
@@ -4674,7 +4788,7 @@ fn wkey(n: u64) -> CounterWriteKey {
 async fn leader_over_real_replica_service_commits_value_visible_through_service() {
 	let dir = fresh_dir("adr075-leader-real-svc");
 	let wdir = fresh_dir("adr075-leader-real-svc-witness");
-	let mgr = open_manager_at_dir(
+	let mgr = initialize_manager_at_dir(
 		dir.to_path_buf(),
 		spawn_io_thread(64).unwrap(),
 		test_crypto(),
@@ -4912,7 +5026,7 @@ async fn secondary_index_segment_catalog_persists_loads_and_deletes() {
 	let dir = fresh_dir("secondary-index-sidecar");
 	let io = spawn_io_thread(64).unwrap();
 	let crypto = test_crypto();
-	let manager = open_manager_at_dir(dir.to_path_buf(), io, crypto.clone()).await;
+	let manager = initialize_manager_at_dir(dir.to_path_buf(), io, crypto.clone()).await;
 	let segment = secondary_index_segment_for_test(SlabId::new(41));
 	let info = manager
 		.persist_secondary_index_segment(&segment)
@@ -4997,7 +5111,7 @@ async fn secondary_index_segment_catalog_persists_loads_and_deletes() {
 async fn recovery_fences_missing_secondary_index_source_slab() {
 	let dir = fresh_dir("adr0539-secondary-source-recovery");
 	let crypto = test_crypto();
-	let manager = open_manager_at_dir(
+	let manager = initialize_manager_at_dir(
 		dir.to_path_buf(),
 		spawn_io_thread(64).unwrap(),
 		crypto.clone(),
@@ -5030,7 +5144,7 @@ async fn secondary_index_corrupt_sidecar_marks_uncovered_and_fails_closed() {
 	let dir = fresh_dir("secondary-index-corrupt-sidecar");
 	let io = spawn_io_thread(64).unwrap();
 	let crypto = test_crypto();
-	let manager = open_manager_at_dir(dir.to_path_buf(), io, crypto).await;
+	let manager = initialize_manager_at_dir(dir.to_path_buf(), io, crypto).await;
 	let segment = secondary_index_segment_for_test(SlabId::new(41));
 	let info = manager
 		.persist_secondary_index_segment(&segment)
@@ -5063,7 +5177,7 @@ async fn secondary_index_drop_gc_deletes_sidecars_and_clears_local_coverage() {
 	let dir = fresh_dir("secondary-index-drop-gc");
 	let io = spawn_io_thread(64).unwrap();
 	let crypto = test_crypto();
-	let manager = open_manager_at_dir(dir.to_path_buf(), io, crypto).await;
+	let manager = initialize_manager_at_dir(dir.to_path_buf(), io, crypto).await;
 	let descriptor = secondary_index_descriptor_for_test();
 	let first = manager
 		.persist_secondary_index_segment(&secondary_index_segment_for_test(SlabId::new(41)))
@@ -5555,7 +5669,7 @@ async fn adr0097_lsm_owns_its_inputs_through_publication_and_retention_replans()
 	let dir = fresh_dir("adr0097-ownership-latch");
 	let crypto = test_crypto();
 	let io = spawn_io_thread(64).unwrap();
-	let manager = open_manager_at_dir(dir.to_path_buf(), io, crypto).await;
+	let manager = initialize_manager_at_dir(dir.to_path_buf(), io, crypto).await;
 	let table = adr0097_colocated_table_descriptor_for_test();
 
 	append_attributed_multirow_frame_for_test(&manager, &table, &[1, 2], hlc(1_000)).await;
@@ -6315,16 +6429,21 @@ async fn lsm_compaction_elides_non_visible_primary_key_versions_with_catalog_con
 	assert!(
 		manager
 			.lookup_as_of(tenant(), row_identity, hlc(15))
+			.unwrap()
 			.is_none()
 	);
 	assert_eq!(
 		manager
 			.lookup_as_of(tenant(), row_identity, hlc(25))
 			.unwrap()
+			.unwrap()
 			.hlc,
 		hlc(20)
 	);
-	assert_eq!(manager.lookup(tenant(), row_identity).unwrap().hlc, hlc(30));
+	assert_eq!(
+		manager.lookup(tenant(), row_identity).unwrap().unwrap().hlc,
+		hlc(30)
+	);
 }
 
 #[tokio::test]
@@ -6452,7 +6571,7 @@ async fn lookup_returns_latest_version_after_multiple_appends() {
 	mgr.append(tenant(), key, hlc(20), b"v2").await.unwrap();
 	mgr.append(tenant(), key, hlc(30), b"v3").await.unwrap();
 
-	let latest = mgr.lookup(tenant(), key).expect("key present");
+	let latest = mgr.lookup(tenant(), key).unwrap().expect("key present");
 	assert_eq!(latest.hlc.physical_ms, 30);
 }
 
@@ -6826,26 +6945,24 @@ async fn stats_advisory_drift_fails_closed_to_unavailable() {
 	let l2_root = fresh_dir("stats-drift-l2");
 	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
 	let io = spawn_io_thread(64).unwrap();
-	let mgr = Arc::new(
-		SlabManager::open(SlabManagerConfig {
-			dir: l1_dir.to_path_buf(),
-			max_slab_bytes: 1 << 20,
-			io,
-			l2: Some(l2.clone()),
-			rehydration: RehydrationPolicy::default(),
-			l2_column_fetch: Default::default(),
-			row_group_writer: Default::default(),
-			l2_row_group_fetch: Default::default(),
-			encoding_writer: Default::default(),
-			l2_chunk_layout: Default::default(),
-			l2_encoding_fetch: Default::default(),
-			encoding_compute: Default::default(),
-			group_commit: GroupCommitConfig::default(),
-			crypto: test_crypto(),
-		})
-		.await
-		.unwrap(),
-	);
+	let mgr = SlabManager::initialize_new_store(SlabManagerConfig {
+		dir: l1_dir.to_path_buf(),
+		max_slab_bytes: 1 << 20,
+		io,
+		l2: Some(l2.clone()),
+		rehydration: RehydrationPolicy::default(),
+		l2_column_fetch: Default::default(),
+		row_group_writer: Default::default(),
+		l2_row_group_fetch: Default::default(),
+		encoding_writer: Default::default(),
+		l2_chunk_layout: Default::default(),
+		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
+		group_commit: GroupCommitConfig::default(),
+		crypto: test_crypto(),
+	})
+	.await
+	.unwrap();
 	let schema = Schema::new(vec![
 		Field::new("id", DataType::Int64, false),
 		Field::new("region", DataType::LargeUtf8, true),
@@ -7053,26 +7170,24 @@ async fn tiered_retention_rewrite_recomputes_stats_from_survivors() {
 	let l2_root = fresh_dir("retention-stats-l2");
 	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
 	let io = spawn_io_thread(64).unwrap();
-	let mgr = Arc::new(
-		SlabManager::open(SlabManagerConfig {
-			dir: l1_dir.to_path_buf(),
-			max_slab_bytes: 1 << 20,
-			io,
-			l2: Some(l2.clone()),
-			rehydration: RehydrationPolicy::default(),
-			l2_column_fetch: Default::default(),
-			row_group_writer: Default::default(),
-			l2_row_group_fetch: Default::default(),
-			encoding_writer: Default::default(),
-			l2_chunk_layout: Default::default(),
-			l2_encoding_fetch: Default::default(),
-			encoding_compute: Default::default(),
-			group_commit: GroupCommitConfig::default(),
-			crypto: test_crypto(),
-		})
-		.await
-		.unwrap(),
-	);
+	let mgr = SlabManager::initialize_new_store(SlabManagerConfig {
+		dir: l1_dir.to_path_buf(),
+		max_slab_bytes: 1 << 20,
+		io,
+		l2: Some(l2.clone()),
+		rehydration: RehydrationPolicy::default(),
+		l2_column_fetch: Default::default(),
+		row_group_writer: Default::default(),
+		l2_row_group_fetch: Default::default(),
+		encoding_writer: Default::default(),
+		l2_chunk_layout: Default::default(),
+		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
+		group_commit: GroupCommitConfig::default(),
+		crypto: test_crypto(),
+	})
+	.await
+	.unwrap();
 	let schema = Schema::new(vec![
 		Field::new("id", DataType::Int64, false),
 		Field::new("region", DataType::LargeUtf8, true),
@@ -7221,26 +7336,24 @@ async fn tiered_retention_rewrite_filters_partial_multirow_storage_records() {
 	let l2_root = fresh_dir("retention-multirow-l2");
 	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
 	let io = spawn_io_thread(64).unwrap();
-	let mgr = Arc::new(
-		SlabManager::open(SlabManagerConfig {
-			dir: l1_dir.to_path_buf(),
-			max_slab_bytes: 1 << 20,
-			io,
-			l2: Some(l2.clone()),
-			rehydration: RehydrationPolicy::default(),
-			l2_column_fetch: Default::default(),
-			row_group_writer: Default::default(),
-			l2_row_group_fetch: Default::default(),
-			encoding_writer: Default::default(),
-			l2_chunk_layout: Default::default(),
-			l2_encoding_fetch: Default::default(),
-			encoding_compute: Default::default(),
-			group_commit: GroupCommitConfig::default(),
-			crypto: test_crypto(),
-		})
-		.await
-		.unwrap(),
-	);
+	let mgr = SlabManager::initialize_new_store(SlabManagerConfig {
+		dir: l1_dir.to_path_buf(),
+		max_slab_bytes: 1 << 20,
+		io,
+		l2: Some(l2.clone()),
+		rehydration: RehydrationPolicy::default(),
+		l2_column_fetch: Default::default(),
+		row_group_writer: Default::default(),
+		l2_row_group_fetch: Default::default(),
+		encoding_writer: Default::default(),
+		l2_chunk_layout: Default::default(),
+		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
+		group_commit: GroupCommitConfig::default(),
+		crypto: test_crypto(),
+	})
+	.await
+	.unwrap();
 
 	let key_a = id(0xA1);
 	let key_b = id(0xB2);
@@ -7320,9 +7433,10 @@ async fn tiered_retention_rewrite_filters_partial_multirow_storage_records() {
 		mgr.config.crypto.as_ref(),
 		&rewritten_pointer,
 		&encrypted_bytes,
-		&BTreeSet::new(),
+		TierObjectEvidence::Replacement,
 	)
-	.unwrap();
+	.unwrap()
+	.bytes;
 	let recovered =
 		recover_slab_entries_from_blob(&rewritten_plaintext, slab_id, &BTreeSet::new()).unwrap();
 	assert!(
@@ -7401,12 +7515,20 @@ async fn l1_retention_pruning_filters_partial_multirow_storage_records_once() {
 	assert_eq!(report.compacted_slabs, 1);
 	assert_eq!(report.pruned_versions, 1);
 	assert!(
-		mgr.lookup_as_of(tenant(), key_a, hlc(10)).is_none(),
+		mgr.lookup_as_of(tenant(), key_a, hlc(10))
+			.unwrap()
+			.is_none(),
 		"pruned old row should leave the historical slot absent"
 	);
 
-	let loc_b_new = mgr.lookup(tenant(), key_b).expect("key_b survivor");
-	let loc_c_new = mgr.lookup(tenant(), key_c).expect("key_c survivor");
+	let loc_b_new = mgr
+		.lookup(tenant(), key_b)
+		.unwrap()
+		.expect("key_b survivor");
+	let loc_c_new = mgr
+		.lookup(tenant(), key_c)
+		.unwrap()
+		.expect("key_c survivor");
 	assert_ne!(loc_b_new.slab_id, old_slab_id);
 	assert_eq!(loc_b_new.slab_id, loc_c_new.slab_id);
 	assert_eq!(loc_b_new.offset, loc_c_new.offset);
@@ -7421,7 +7543,7 @@ async fn l1_retention_pruning_filters_partial_multirow_storage_records_once() {
 	assert_eq!(rewritten_entries[0].key_identity, key_b);
 	assert_eq!(rewritten_entries[1].key_identity, key_c);
 	assert_eq!(
-		mgr.read(mgr.lookup(tenant(), key_a).expect("new key_a"))
+		mgr.read(mgr.lookup(tenant(), key_a).unwrap().expect("new key_a"))
 			.await
 			.unwrap(),
 		b"new-a"
@@ -7478,9 +7600,9 @@ async fn table_drop_reclaim_removes_target_table_rows() {
 
 	assert_eq!(report.compacted_slabs, 1);
 	assert_eq!(report.reclaimed_records, 2);
-	assert!(mgr.lookup(tenant(), target_key_a).is_none());
-	assert!(mgr.lookup(tenant(), target_key_b).is_none());
-	assert!(mgr.lookup(tenant(), other_key).is_some());
+	assert!(mgr.lookup(tenant(), target_key_a).unwrap().is_none());
+	assert!(mgr.lookup(tenant(), target_key_b).unwrap().is_none());
+	assert!(mgr.lookup(tenant(), other_key).unwrap().is_some());
 }
 
 #[tokio::test]
@@ -7560,9 +7682,9 @@ async fn adr0095_table_drop_slice_bounds_examined_work_and_resumes_after_cursor(
 		rewritten_total, 1,
 		"only the target-bearing slab was rewritten"
 	);
-	assert!(mgr.lookup(tenant(), target_key).is_none());
+	assert!(mgr.lookup(tenant(), target_key).unwrap().is_none());
 	for key in nonmatching_keys {
-		assert!(mgr.lookup(tenant(), key).is_some());
+		assert!(mgr.lookup(tenant(), key).unwrap().is_some());
 	}
 }
 
@@ -7572,26 +7694,24 @@ async fn table_drop_reclaim_rewrites_tiered_target_rows() {
 	let l2_root = fresh_dir("drop-reclaim-l2");
 	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
 	let io = spawn_io_thread(64).unwrap();
-	let mgr = Arc::new(
-		SlabManager::open(SlabManagerConfig {
-			dir: l1_dir.to_path_buf(),
-			max_slab_bytes: 1 << 20,
-			io,
-			l2: Some(l2.clone()),
-			rehydration: RehydrationPolicy::default(),
-			l2_column_fetch: Default::default(),
-			row_group_writer: Default::default(),
-			l2_row_group_fetch: Default::default(),
-			encoding_writer: Default::default(),
-			l2_chunk_layout: Default::default(),
-			l2_encoding_fetch: Default::default(),
-			encoding_compute: Default::default(),
-			group_commit: GroupCommitConfig::default(),
-			crypto: test_crypto(),
-		})
-		.await
-		.unwrap(),
-	);
+	let mgr = SlabManager::initialize_new_store(SlabManagerConfig {
+		dir: l1_dir.to_path_buf(),
+		max_slab_bytes: 1 << 20,
+		io,
+		l2: Some(l2.clone()),
+		rehydration: RehydrationPolicy::default(),
+		l2_column_fetch: Default::default(),
+		row_group_writer: Default::default(),
+		l2_row_group_fetch: Default::default(),
+		encoding_writer: Default::default(),
+		l2_chunk_layout: Default::default(),
+		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
+		group_commit: GroupCommitConfig::default(),
+		crypto: test_crypto(),
+	})
+	.await
+	.unwrap();
 	let target = append_only_retention_descriptor(TableObjectId::new([0x41; 16]));
 	let other =
 		append_only_retention_descriptor_named(TableObjectId::new([0x42; 16]), "tier_other");
@@ -7661,12 +7781,15 @@ async fn table_drop_reclaim_rewrites_tiered_target_rows() {
 
 	assert_eq!(report.compacted_slabs, 1);
 	assert_eq!(report.reclaimed_records, 2);
-	assert!(mgr.lookup(tenant(), target_key_a).is_none());
-	assert!(mgr.lookup(tenant(), target_key_b).is_none());
-	assert!(mgr.lookup(tenant(), other_key).is_some());
+	assert!(mgr.lookup(tenant(), target_key_a).unwrap().is_none());
+	assert!(mgr.lookup(tenant(), target_key_b).unwrap().is_none());
+	assert!(mgr.lookup(tenant(), other_key).unwrap().is_some());
 	let rewritten = mgr.tier_pointer(slab_id).await.expect("rewritten pointer");
 	assert_ne!(rewritten.l2_uri, old_uri);
-	assert!(l2.get(&old_uri).await.is_err());
+	assert!(
+		l2.get(&old_uri).await.is_ok(),
+		"the superseded object is retained until owner-scoped retirement authority"
+	);
 }
 
 #[tokio::test]
@@ -7705,8 +7828,11 @@ async fn l1_table_retention_prunes_append_only_rows_when_cluster_retention_disab
 
 	assert_eq!(report.compacted_slabs, 1);
 	assert_eq!(report.pruned_versions, 1);
-	assert!(mgr.lookup(tenant(), old_key).is_none());
-	let live_location = mgr.lookup(tenant(), live_key).expect("live row survives");
+	assert!(mgr.lookup(tenant(), old_key).unwrap().is_none());
+	let live_location = mgr
+		.lookup(tenant(), live_key)
+		.unwrap()
+		.expect("live row survives");
 	assert_ne!(live_location.slab_id, old_slab_id);
 	let live_frame = mgr.read(live_location).await.unwrap();
 	let live_entries = storage_multirow_index_entries_from_frame(&live_frame)
@@ -7762,14 +7888,16 @@ async fn l1_table_retention_reports_lag_for_retained_rows_below_floor() {
 	assert_eq!(report.compacted_slabs, 1);
 	assert_eq!(report.pruned_versions, 1);
 	assert_eq!(report.max_lag_seconds, 70);
-	assert!(mgr.lookup(tenant(), pruned_key).is_none());
+	assert!(mgr.lookup(tenant(), pruned_key).unwrap().is_none());
 	assert!(
 		!mgr.lookup_as_of(tenant(), retained_key, hlc(30_000))
+			.unwrap()
 			.expect("retained data row below floor")
 			.is_tombstone
 	);
 	assert!(
 		mgr.lookup_as_of(tenant(), retained_key, hlc(50_000))
+			.unwrap()
 			.expect("retained tombstone above floor")
 			.is_tombstone
 	);
@@ -7819,11 +7947,13 @@ async fn l1_table_retention_reports_lag_without_rewrite_for_pair_waiting_on_tomb
 	assert_eq!(report.max_lag_seconds, 70);
 	assert!(
 		!mgr.lookup_as_of(tenant(), retained_key, hlc(30_000))
+			.unwrap()
 			.expect("retained data row below floor")
 			.is_tombstone
 	);
 	assert!(
 		mgr.lookup_as_of(tenant(), retained_key, hlc(50_000))
+			.unwrap()
 			.expect("retained tombstone above floor")
 			.is_tombstone
 	);
@@ -7834,7 +7964,7 @@ async fn l1_table_retention_keeps_pk_boundary_tombstone_under_cluster_floor() {
 	let dir = fresh_dir("pk-boundary-tombstone-reopen");
 	let io = spawn_io_thread(64).unwrap();
 	let crypto = test_crypto();
-	let mgr = open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	let mgr = initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
 	let descriptor = pk_retention_descriptor(TableObjectId::new([0x50; 16]));
 	let mut schemas = TableSchemaCatalog::default();
 	schemas.upsert(tenant(), descriptor.clone()).unwrap();
@@ -7873,14 +8003,20 @@ async fn l1_table_retention_keeps_pk_boundary_tombstone_under_cluster_floor() {
 	assert_eq!(report.compacted_slabs, 1);
 	assert_eq!(report.pruned_versions, 1);
 	assert_eq!(report.pair_drops, 0);
-	assert!(mgr.lookup_as_of(tenant(), key, hlc(10_000)).is_none());
+	assert!(
+		mgr.lookup_as_of(tenant(), key, hlc(10_000))
+			.unwrap()
+			.is_none()
+	);
 	assert!(
 		mgr.lookup_as_of(tenant(), key, hlc(20_000))
+			.unwrap()
 			.expect("pk boundary tombstone survives")
 			.is_tombstone
 	);
 	assert!(
 		mgr.lookup(tenant(), key)
+			.unwrap()
 			.expect("latest pk boundary tombstone survives")
 			.is_tombstone
 	);
@@ -7889,18 +8025,23 @@ async fn l1_table_retention_keeps_pk_boundary_tombstone_under_cluster_floor() {
 
 	let reopened = open_manager_at_dir(dir.to_path_buf(), io, crypto).await;
 	assert!(
-		reopened.lookup_as_of(tenant(), key, hlc(10_000)).is_none(),
+		reopened
+			.lookup_as_of(tenant(), key, hlc(10_000))
+			.unwrap()
+			.is_none(),
 		"pruned data row should stay absent after reopen"
 	);
 	assert!(
 		reopened
 			.lookup_as_of(tenant(), key, hlc(20_000))
+			.unwrap()
 			.expect("compacted pk boundary tombstone survives reopen")
 			.is_tombstone
 	);
 	assert!(
 		reopened
 			.lookup(tenant(), key)
+			.unwrap()
 			.expect("latest compacted pk tombstone survives reopen")
 			.is_tombstone
 	);
@@ -7937,8 +8078,8 @@ async fn l1_retention_pruning_pair_gc_drops_data_and_row_tombstone() {
 
 	assert_eq!(report.compacted_slabs, 1);
 	assert_eq!(report.pruned_versions, 2);
-	assert!(mgr.lookup(tenant(), key).is_none());
-	assert!(mgr.lookup_as_of(tenant(), key, hlc(10)).is_none());
+	assert!(mgr.lookup(tenant(), key).unwrap().is_none());
+	assert!(mgr.lookup_as_of(tenant(), key, hlc(10)).unwrap().is_none());
 }
 
 #[tokio::test]
@@ -7974,11 +8115,13 @@ async fn l1_retention_pruning_keeps_pair_until_floor_passes_tombstone() {
 	assert_eq!(report.pruned_versions, 0);
 	assert!(
 		!mgr.lookup_as_of(tenant(), key, hlc(10))
+			.unwrap()
 			.expect("data before delete")
 			.is_tombstone
 	);
 	assert!(
 		mgr.lookup_as_of(tenant(), key, hlc(20))
+			.unwrap()
 			.expect("tombstone at delete")
 			.is_tombstone
 	);
@@ -7990,26 +8133,24 @@ async fn tiered_retention_rewrite_pair_gc_drops_data_and_row_tombstone() {
 	let l2_root = fresh_dir("retention-tombstone-pair-l2");
 	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
 	let io = spawn_io_thread(64).unwrap();
-	let mgr = Arc::new(
-		SlabManager::open(SlabManagerConfig {
-			dir: l1_dir.to_path_buf(),
-			max_slab_bytes: 1 << 20,
-			io,
-			l2: Some(l2.clone()),
-			rehydration: RehydrationPolicy::default(),
-			l2_column_fetch: Default::default(),
-			row_group_writer: Default::default(),
-			l2_row_group_fetch: Default::default(),
-			encoding_writer: Default::default(),
-			l2_chunk_layout: Default::default(),
-			l2_encoding_fetch: Default::default(),
-			encoding_compute: Default::default(),
-			group_commit: GroupCommitConfig::default(),
-			crypto: test_crypto(),
-		})
-		.await
-		.unwrap(),
-	);
+	let mgr = SlabManager::initialize_new_store(SlabManagerConfig {
+		dir: l1_dir.to_path_buf(),
+		max_slab_bytes: 1 << 20,
+		io,
+		l2: Some(l2.clone()),
+		rehydration: RehydrationPolicy::default(),
+		l2_column_fetch: Default::default(),
+		row_group_writer: Default::default(),
+		l2_row_group_fetch: Default::default(),
+		encoding_writer: Default::default(),
+		l2_chunk_layout: Default::default(),
+		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
+		group_commit: GroupCommitConfig::default(),
+		crypto: test_crypto(),
+	})
+	.await
+	.unwrap();
 
 	let key_a = id(0x4703);
 	let key_b = id(0x4704);
@@ -8096,9 +8237,10 @@ async fn tiered_retention_rewrite_pair_gc_drops_data_and_row_tombstone() {
 		mgr.config.crypto.as_ref(),
 		&rewritten_pointer,
 		&encrypted_bytes,
-		&BTreeSet::new(),
+		TierObjectEvidence::Replacement,
 	)
-	.unwrap();
+	.unwrap()
+	.bytes;
 	let recovered =
 		recover_slab_entries_from_blob(&rewritten_plaintext, slab_id, &BTreeSet::new()).unwrap();
 	assert_eq!(recovered.len(), 1);
@@ -8112,26 +8254,24 @@ async fn tiered_table_retention_keeps_pk_boundary_tombstone_under_cluster_floor(
 	let l2_root = fresh_dir("retention-pk-boundary-l2");
 	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
 	let io = spawn_io_thread(64).unwrap();
-	let mgr = Arc::new(
-		SlabManager::open(SlabManagerConfig {
-			dir: l1_dir.to_path_buf(),
-			max_slab_bytes: 1 << 20,
-			io,
-			l2: Some(l2.clone()),
-			rehydration: RehydrationPolicy::default(),
-			l2_column_fetch: Default::default(),
-			row_group_writer: Default::default(),
-			l2_row_group_fetch: Default::default(),
-			encoding_writer: Default::default(),
-			l2_chunk_layout: Default::default(),
-			l2_encoding_fetch: Default::default(),
-			encoding_compute: Default::default(),
-			group_commit: GroupCommitConfig::default(),
-			crypto: test_crypto(),
-		})
-		.await
-		.unwrap(),
-	);
+	let mgr = SlabManager::initialize_new_store(SlabManagerConfig {
+		dir: l1_dir.to_path_buf(),
+		max_slab_bytes: 1 << 20,
+		io,
+		l2: Some(l2.clone()),
+		rehydration: RehydrationPolicy::default(),
+		l2_column_fetch: Default::default(),
+		row_group_writer: Default::default(),
+		l2_row_group_fetch: Default::default(),
+		encoding_writer: Default::default(),
+		l2_chunk_layout: Default::default(),
+		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
+		group_commit: GroupCommitConfig::default(),
+		crypto: test_crypto(),
+	})
+	.await
+	.unwrap();
 	let descriptor = pk_retention_descriptor(TableObjectId::new([0x58; 16]));
 	let mut schemas = TableSchemaCatalog::default();
 	schemas.upsert(tenant(), descriptor.clone()).unwrap();
@@ -8240,9 +8380,10 @@ async fn tiered_table_retention_keeps_pk_boundary_tombstone_under_cluster_floor(
 		mgr.config.crypto.as_ref(),
 		&rewritten_pointer,
 		&encrypted_bytes,
-		&BTreeSet::new(),
+		TierObjectEvidence::Replacement,
 	)
-	.unwrap();
+	.unwrap()
+	.bytes;
 	let recovered =
 		recover_slab_entries_from_blob(&rewritten_plaintext, slab_id, &BTreeSet::new()).unwrap();
 	assert_eq!(recovered.len(), 1);
@@ -8257,26 +8398,24 @@ async fn tiered_table_retention_rewrite_prunes_append_only_rows_when_cluster_ret
 	let l2_root = fresh_dir("retention-table-l2");
 	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
 	let io = spawn_io_thread(64).unwrap();
-	let mgr = Arc::new(
-		SlabManager::open(SlabManagerConfig {
-			dir: l1_dir.to_path_buf(),
-			max_slab_bytes: 1 << 20,
-			io,
-			l2: Some(l2.clone()),
-			rehydration: RehydrationPolicy::default(),
-			l2_column_fetch: Default::default(),
-			row_group_writer: Default::default(),
-			l2_row_group_fetch: Default::default(),
-			encoding_writer: Default::default(),
-			l2_chunk_layout: Default::default(),
-			l2_encoding_fetch: Default::default(),
-			encoding_compute: Default::default(),
-			group_commit: GroupCommitConfig::default(),
-			crypto: test_crypto(),
-		})
-		.await
-		.unwrap(),
-	);
+	let mgr = SlabManager::initialize_new_store(SlabManagerConfig {
+		dir: l1_dir.to_path_buf(),
+		max_slab_bytes: 1 << 20,
+		io,
+		l2: Some(l2.clone()),
+		rehydration: RehydrationPolicy::default(),
+		l2_column_fetch: Default::default(),
+		row_group_writer: Default::default(),
+		l2_row_group_fetch: Default::default(),
+		encoding_writer: Default::default(),
+		l2_chunk_layout: Default::default(),
+		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
+		group_commit: GroupCommitConfig::default(),
+		crypto: test_crypto(),
+	})
+	.await
+	.unwrap();
 	let descriptor = append_only_retention_descriptor(TableObjectId::new([0x49; 16]));
 	let (schemas, lifecycle) = fixed_table_retention_catalog(&descriptor, 60_000);
 	let old_key = id(0x4901);
@@ -8376,9 +8515,10 @@ async fn tiered_table_retention_rewrite_prunes_append_only_rows_when_cluster_ret
 		mgr.config.crypto.as_ref(),
 		&rewritten_pointer,
 		&encrypted_bytes,
-		&BTreeSet::new(),
+		TierObjectEvidence::Replacement,
 	)
-	.unwrap();
+	.unwrap()
+	.bytes;
 	let recovered =
 		recover_slab_entries_from_blob(&rewritten_plaintext, slab_id, &BTreeSet::new()).unwrap();
 	assert_eq!(recovered.len(), 1);
@@ -8391,26 +8531,24 @@ async fn tiered_table_retention_reports_lag_without_rewrite_for_pair_waiting_on_
 	let l2_root = fresh_dir("retention-table-lag-l2");
 	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
 	let io = spawn_io_thread(64).unwrap();
-	let mgr = Arc::new(
-		SlabManager::open(SlabManagerConfig {
-			dir: l1_dir.to_path_buf(),
-			max_slab_bytes: 1 << 20,
-			io,
-			l2: Some(l2.clone()),
-			rehydration: RehydrationPolicy::default(),
-			l2_column_fetch: Default::default(),
-			row_group_writer: Default::default(),
-			l2_row_group_fetch: Default::default(),
-			encoding_writer: Default::default(),
-			l2_chunk_layout: Default::default(),
-			l2_encoding_fetch: Default::default(),
-			encoding_compute: Default::default(),
-			group_commit: GroupCommitConfig::default(),
-			crypto: test_crypto(),
-		})
-		.await
-		.unwrap(),
-	);
+	let mgr = SlabManager::initialize_new_store(SlabManagerConfig {
+		dir: l1_dir.to_path_buf(),
+		max_slab_bytes: 1 << 20,
+		io,
+		l2: Some(l2.clone()),
+		rehydration: RehydrationPolicy::default(),
+		l2_column_fetch: Default::default(),
+		row_group_writer: Default::default(),
+		l2_row_group_fetch: Default::default(),
+		encoding_writer: Default::default(),
+		l2_chunk_layout: Default::default(),
+		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
+		group_commit: GroupCommitConfig::default(),
+		crypto: test_crypto(),
+	})
+	.await
+	.unwrap();
 	let descriptor = append_only_retention_descriptor(TableObjectId::new([0x4C; 16]));
 	let (schemas, lifecycle) = fixed_table_retention_catalog(&descriptor, 60_000);
 	let retained_key = id(0x4C01);
@@ -8529,6 +8667,7 @@ async fn sealed_layout_recluster_single_to_multi_preserves_reads() {
 	for (row, expected) in [1, 2, 3, 4].into_iter().enumerate() {
 		let location = mgr
 			.lookup_as_of(tenant(), admission.key_identities[row], hlc(100))
+			.unwrap()
 			.expect("reclustered row");
 		assert_ne!(location.slab_id, old_slab_id);
 		offsets.insert(location.offset);
@@ -8612,6 +8751,7 @@ async fn sealed_layout_recluster_multi_to_single_preserves_reads() {
 	for (row, expected) in [1, 2, 3, 4].into_iter().enumerate() {
 		let location = mgr
 			.lookup_as_of(tenant(), admission.key_identities[row], hlc(100))
+			.unwrap()
 			.expect("reclustered row");
 		assert_ne!(location.slab_id, old_slab_id);
 		assert_eq!(location.record_row_index, RecordRowIndex::ZERO);
@@ -8707,6 +8847,7 @@ async fn assert_sealed_layout_recluster_updates_multirow_codec(
 	for (row, expected) in [1, 2, 3, 4].into_iter().enumerate() {
 		let location = mgr
 			.lookup_as_of(tenant(), admission.key_identities[row], hlc(100))
+			.unwrap()
 			.expect("reclustered row");
 		assert_ne!(location.slab_id, old_slab_id);
 		let frame = mgr.read(location).await.unwrap();
@@ -8806,6 +8947,7 @@ async fn active_slab_reads_mixed_record_body_compression() {
 	for (key_identity, location, expected_value, expected_policy) in inserted {
 		let found = mgr
 			.lookup_as_of(tenant(), key_identity, hlc(100))
+			.unwrap()
 			.expect("mixed-codec row");
 		assert_eq!(found, location);
 		let frame = mgr.read(found).await.unwrap();
@@ -8828,7 +8970,7 @@ async fn recovery_reopens_pk_delete_and_resurrection_chain() {
 	let key = id(0x5701);
 	let locality = Locality::new(57);
 
-	let manager = open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	let manager = initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
 	let data_frame = encode_test_append_only_storage_frame(
 		descriptor.table_object_id,
 		&[(key, locality, hlc(10), 100, false)],
@@ -8851,24 +8993,29 @@ async fn recovery_reopens_pk_delete_and_resurrection_chain() {
 
 	let reopened = open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
 	assert_eq!(
-		reopened.routing_locality_for_existing_key(tenant(), key),
+		reopened
+			.routing_locality_for_existing_key(tenant(), key)
+			.unwrap(),
 		Some(locality)
 	);
 	assert!(
 		!reopened
 			.lookup_as_of(tenant(), key, hlc(10))
+			.unwrap()
 			.expect("pre-delete data survives reopen")
 			.is_tombstone
 	);
 	assert!(
 		reopened
 			.lookup_as_of(tenant(), key, hlc(20))
+			.unwrap()
 			.expect("delete tombstone survives reopen")
 			.is_tombstone
 	);
 	assert!(
 		reopened
 			.lookup(tenant(), key)
+			.unwrap()
 			.expect("latest delete tombstone survives reopen")
 			.is_tombstone
 	);
@@ -8891,11 +9038,13 @@ async fn recovery_reopens_pk_delete_and_resurrection_chain() {
 	assert!(
 		reopened
 			.lookup_as_of(tenant(), key, hlc(20))
+			.unwrap()
 			.expect("historical delete tombstone survives resurrection reopen")
 			.is_tombstone
 	);
 	let latest = reopened
 		.lookup_as_of(tenant(), key, hlc(30))
+		.unwrap()
 		.expect("resurrected data survives reopen");
 	assert!(!latest.is_tombstone);
 	let frame = reopened.read(latest).await.unwrap();
@@ -8917,7 +9066,7 @@ async fn recovery_fails_closed_on_cross_slab_consecutive_pk_tombstones() {
 	let key = id(0x5901);
 	let locality = Locality::new(59);
 
-	let manager = open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	let manager = initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
 	let data_frame = encode_test_append_only_storage_frame(
 		descriptor.table_object_id,
 		&[(key, locality, hlc(10), 100, false)],
@@ -8981,26 +9130,24 @@ async fn recovery_fails_closed_on_cross_slab_consecutive_pk_tombstones() {
 #[tokio::test]
 async fn recovery_reopens_mixed_record_body_compression_slab() {
 	let dir = fresh_dir("mixed-compression-recovery");
-	let mgr = Arc::new(
-		SlabManager::open(SlabManagerConfig {
-			dir: dir.to_path_buf(),
-			max_slab_bytes: 1024 * 1024,
-			io: spawn_io_thread(64).unwrap(),
-			l2: None,
-			rehydration: RehydrationPolicy::default(),
-			l2_column_fetch: Default::default(),
-			row_group_writer: Default::default(),
-			l2_row_group_fetch: Default::default(),
-			encoding_writer: Default::default(),
-			l2_chunk_layout: Default::default(),
-			l2_encoding_fetch: Default::default(),
-			encoding_compute: Default::default(),
-			group_commit: GroupCommitConfig::default(),
-			crypto: test_crypto(),
-		})
-		.await
-		.unwrap(),
-	);
+	let mgr = SlabManager::initialize_new_store(SlabManagerConfig {
+		dir: dir.to_path_buf(),
+		max_slab_bytes: 1024 * 1024,
+		io: spawn_io_thread(64).unwrap(),
+		l2: None,
+		rehydration: RehydrationPolicy::default(),
+		l2_column_fetch: Default::default(),
+		row_group_writer: Default::default(),
+		l2_row_group_fetch: Default::default(),
+		encoding_writer: Default::default(),
+		l2_chunk_layout: Default::default(),
+		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
+		group_commit: GroupCommitConfig::default(),
+		crypto: test_crypto(),
+	})
+	.await
+	.unwrap();
 	let uncompressed_descriptor = layout_recluster_descriptor_with_codec(
 		0x68,
 		1,
@@ -9074,6 +9221,7 @@ async fn recovery_reopens_mixed_record_body_compression_slab() {
 	for (key_identity, location, expected_value, expected_policy) in inserted {
 		let found = reopened
 			.lookup_as_of(tenant(), key_identity, hlc(100))
+			.unwrap()
 			.expect("recovered mixed-codec row");
 		assert_eq!(found, location);
 		let frame = reopened.read(found).await.unwrap();
@@ -9091,26 +9239,24 @@ async fn l2_reads_mixed_record_body_compression_slab() {
 	let l1_dir = fresh_dir("mixed-compression-l2-l1");
 	let l2_dir = fresh_dir("mixed-compression-l2-objects");
 	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_dir).unwrap());
-	let mgr = Arc::new(
-		SlabManager::open(SlabManagerConfig {
-			dir: l1_dir.to_path_buf(),
-			max_slab_bytes: 1024 * 1024,
-			io: spawn_io_thread(64).unwrap(),
-			l2: Some(l2.clone()),
-			rehydration: RehydrationPolicy::default(),
-			l2_column_fetch: Default::default(),
-			row_group_writer: Default::default(),
-			l2_row_group_fetch: Default::default(),
-			encoding_writer: Default::default(),
-			l2_chunk_layout: Default::default(),
-			l2_encoding_fetch: Default::default(),
-			encoding_compute: Default::default(),
-			group_commit: GroupCommitConfig::default(),
-			crypto: test_crypto(),
-		})
-		.await
-		.unwrap(),
-	);
+	let mgr = SlabManager::initialize_new_store(SlabManagerConfig {
+		dir: l1_dir.to_path_buf(),
+		max_slab_bytes: 1024 * 1024,
+		io: spawn_io_thread(64).unwrap(),
+		l2: Some(l2.clone()),
+		rehydration: RehydrationPolicy::default(),
+		l2_column_fetch: Default::default(),
+		row_group_writer: Default::default(),
+		l2_row_group_fetch: Default::default(),
+		encoding_writer: Default::default(),
+		l2_chunk_layout: Default::default(),
+		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
+		group_commit: GroupCommitConfig::default(),
+		crypto: test_crypto(),
+	})
+	.await
+	.unwrap();
 	let uncompressed_descriptor = layout_recluster_descriptor_with_codec(
 		0x69,
 		1,
@@ -9209,6 +9355,7 @@ async fn l2_reads_mixed_record_body_compression_slab() {
 	{
 		let found = mgr
 			.lookup_as_of(tenant(), key_identity, hlc(100))
+			.unwrap()
 			.expect("tiered mixed-codec row");
 		assert_eq!(found, location);
 		let frame = mgr.read(found).await.unwrap();
@@ -9342,26 +9489,24 @@ async fn compression_resident_gauge_counts_tiered_uncompressed_frames() {
 	let l1_dir = fresh_dir("compression-gauge-tiered-l1");
 	let l2_dir = fresh_dir("compression-gauge-tiered-l2");
 	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_dir).unwrap());
-	let mgr = Arc::new(
-		SlabManager::open(SlabManagerConfig {
-			dir: l1_dir.to_path_buf(),
-			max_slab_bytes: 1024 * 1024,
-			io: spawn_io_thread(64).unwrap(),
-			l2: Some(l2.clone()),
-			rehydration: RehydrationPolicy::default(),
-			l2_column_fetch: Default::default(),
-			row_group_writer: Default::default(),
-			l2_row_group_fetch: Default::default(),
-			encoding_writer: Default::default(),
-			l2_chunk_layout: Default::default(),
-			l2_encoding_fetch: Default::default(),
-			encoding_compute: Default::default(),
-			group_commit: GroupCommitConfig::default(),
-			crypto: test_crypto(),
-		})
-		.await
-		.unwrap(),
-	);
+	let mgr = SlabManager::initialize_new_store(SlabManagerConfig {
+		dir: l1_dir.to_path_buf(),
+		max_slab_bytes: 1024 * 1024,
+		io: spawn_io_thread(64).unwrap(),
+		l2: Some(l2.clone()),
+		rehydration: RehydrationPolicy::default(),
+		l2_column_fetch: Default::default(),
+		row_group_writer: Default::default(),
+		l2_row_group_fetch: Default::default(),
+		encoding_writer: Default::default(),
+		l2_chunk_layout: Default::default(),
+		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
+		group_commit: GroupCommitConfig::default(),
+		crypto: test_crypto(),
+	})
+	.await
+	.unwrap();
 	let layout = MultiRowLayoutDescriptor::new(4, 4, 1024 * 1024).unwrap();
 	let source_descriptor = layout_recluster_descriptor_with_codec(
 		0x6a,
@@ -9474,33 +9619,31 @@ async fn projected_l2_read_materializes_sparse_multirow_record() {
 	let l1_dir = fresh_dir("projected-l2-l1");
 	let l2_dir = fresh_dir("projected-l2-l2");
 	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_dir).unwrap());
-	let mgr = Arc::new(
-		SlabManager::open(SlabManagerConfig {
-			dir: l1_dir.to_path_buf(),
-			max_slab_bytes: 1024 * 1024 * 16,
-			io: spawn_io_thread(64).unwrap(),
-			l2: Some(l2.clone()),
-			rehydration: RehydrationPolicy {
-				promote_after_l2_reads: 0,
-				..RehydrationPolicy::default()
-			},
-			l2_column_fetch: L2ColumnFetchConfig {
-				enabled: true,
-				min_record_bytes: RecordBodyByteLen::new(1),
-				..L2ColumnFetchConfig::default()
-			},
-			row_group_writer: Default::default(),
-			l2_row_group_fetch: Default::default(),
-			encoding_writer: Default::default(),
-			l2_chunk_layout: Default::default(),
-			l2_encoding_fetch: Default::default(),
-			encoding_compute: Default::default(),
-			group_commit: GroupCommitConfig::default(),
-			crypto: test_crypto(),
-		})
-		.await
-		.unwrap(),
-	);
+	let mgr = SlabManager::initialize_new_store(SlabManagerConfig {
+		dir: l1_dir.to_path_buf(),
+		max_slab_bytes: 1024 * 1024 * 16,
+		io: spawn_io_thread(64).unwrap(),
+		l2: Some(l2.clone()),
+		rehydration: RehydrationPolicy {
+			promote_after_l2_reads: 0,
+			..RehydrationPolicy::default()
+		},
+		l2_column_fetch: L2ColumnFetchConfig {
+			enabled: true,
+			min_record_bytes: RecordBodyByteLen::new(1),
+			..L2ColumnFetchConfig::default()
+		},
+		row_group_writer: Default::default(),
+		l2_row_group_fetch: Default::default(),
+		encoding_writer: Default::default(),
+		l2_chunk_layout: Default::default(),
+		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
+		group_commit: GroupCommitConfig::default(),
+		crypto: test_crypto(),
+	})
+	.await
+	.unwrap();
 	let mut fields = vec![Field::new("id", DataType::Int64, false)];
 	for column in 1..16 {
 		fields.push(Field::new(format!("c{column}"), DataType::Int64, false));
@@ -9605,6 +9748,7 @@ async fn projected_l2_read_materializes_sparse_multirow_record() {
 	mgr.apply_tier_slab(pointer.clone()).await.unwrap();
 	let location = mgr
 		.lookup(tenant(), admission.key_identities[0])
+		.unwrap()
 		.expect("tiered row location");
 	let requirement = ColumnFetchRequirement {
 		output_columns: crate::storage::columnar::ColumnOrdinalSet::from_columns([15]),
@@ -9640,38 +9784,36 @@ async fn row_group_l2_point_read_materializes_projected_group() {
 	let l1_dir = fresh_dir("row-group-l2-l1");
 	let l2_dir = fresh_dir("row-group-l2-l2");
 	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_dir).unwrap());
-	let mgr = Arc::new(
-		SlabManager::open(SlabManagerConfig {
-			dir: l1_dir.to_path_buf(),
-			max_slab_bytes: 1024 * 1024 * 16,
-			io: spawn_io_thread(64).unwrap(),
-			l2: Some(l2.clone()),
-			rehydration: RehydrationPolicy {
-				promote_after_l2_reads: 0,
-				..RehydrationPolicy::default()
-			},
-			l2_column_fetch: L2ColumnFetchConfig {
-				enabled: true,
-				min_record_bytes: RecordBodyByteLen::new(1),
-				..L2ColumnFetchConfig::default()
-			},
-			row_group_writer: Default::default(),
-			l2_row_group_fetch: crate::storage::row_group::L2RowGroupFetchConfig {
-				enabled: true,
-				max_selected_row_group_fraction_micros:
-					crate::storage::row_group::L2_ROW_GROUP_FETCH_FRACTION_DENOMINATOR - 1,
-				..Default::default()
-			},
-			encoding_writer: Default::default(),
-			l2_chunk_layout: Default::default(),
-			l2_encoding_fetch: Default::default(),
-			encoding_compute: Default::default(),
-			group_commit: GroupCommitConfig::default(),
-			crypto: test_crypto(),
-		})
-		.await
-		.unwrap(),
-	);
+	let mgr = SlabManager::initialize_new_store(SlabManagerConfig {
+		dir: l1_dir.to_path_buf(),
+		max_slab_bytes: 1024 * 1024 * 16,
+		io: spawn_io_thread(64).unwrap(),
+		l2: Some(l2.clone()),
+		rehydration: RehydrationPolicy {
+			promote_after_l2_reads: 0,
+			..RehydrationPolicy::default()
+		},
+		l2_column_fetch: L2ColumnFetchConfig {
+			enabled: true,
+			min_record_bytes: RecordBodyByteLen::new(1),
+			..L2ColumnFetchConfig::default()
+		},
+		row_group_writer: Default::default(),
+		l2_row_group_fetch: crate::storage::row_group::L2RowGroupFetchConfig {
+			enabled: true,
+			max_selected_row_group_fraction_micros:
+				crate::storage::row_group::L2_ROW_GROUP_FETCH_FRACTION_DENOMINATOR - 1,
+			..Default::default()
+		},
+		encoding_writer: Default::default(),
+		l2_chunk_layout: Default::default(),
+		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
+		group_commit: GroupCommitConfig::default(),
+		crypto: test_crypto(),
+	})
+	.await
+	.unwrap();
 	let schema = Schema::new(vec![
 		Field::new("id", DataType::Int64, false),
 		Field::new("payload", DataType::Int64, false),
@@ -9787,6 +9929,7 @@ async fn row_group_l2_point_read_materializes_projected_group() {
 		.expect("target storage row");
 	let location = mgr
 		.lookup(tenant(), target.key_identity)
+		.unwrap()
 		.expect("tiered row location");
 	let requirement = ColumnFetchRequirement {
 		output_columns: crate::storage::columnar::ColumnOrdinalSet::from_columns([1]),
@@ -9957,6 +10100,7 @@ async fn row_group_l2_point_read_materializes_projected_group() {
 			.find(|row| row.record_row_index == record_row_index)
 			.expect("indexed source row");
 		mgr.lookup(tenant(), row.key_identity)
+			.unwrap()
 			.expect("indexed row location")
 	})
 	.collect::<Vec<_>>();
@@ -10533,43 +10677,41 @@ async fn fsst_phase_b_l2_read_filters_a1_and_declines_a2_overlap() {
 	encoding_compute
 		.enabled_predicate_evaluators
 		.insert(crate::storage::encoding::compute::EncodingComputeEvaluatorKind::FsstWholeBuffer);
-	let mgr = Arc::new(
-		SlabManager::open(SlabManagerConfig {
-			dir: l1_dir.to_path_buf(),
-			max_slab_bytes: 1024 * 1024 * 16,
-			io: spawn_io_thread(64).unwrap(),
-			l2: Some(l2.clone()),
-			rehydration: RehydrationPolicy {
-				promote_after_l2_reads: 0,
-				..RehydrationPolicy::default()
-			},
-			l2_column_fetch: L2ColumnFetchConfig {
-				enabled: true,
-				min_record_bytes: RecordBodyByteLen::new(1),
-				..L2ColumnFetchConfig::default()
-			},
-			row_group_writer: Default::default(),
-			l2_row_group_fetch: crate::storage::row_group::L2RowGroupFetchConfig {
-				enabled: true,
-				max_selected_row_group_fraction_micros:
-					crate::storage::row_group::L2_ROW_GROUP_FETCH_FRACTION_DENOMINATOR - 1,
-				max_selected_byte_fraction_micros:
-					crate::storage::row_group::L2_ROW_GROUP_FETCH_FRACTION_DENOMINATOR - 1,
-				..Default::default()
-			},
-			encoding_writer: Default::default(),
-			l2_chunk_layout: Default::default(),
-			l2_encoding_fetch: crate::storage::encoding::L2EncodingFetchConfig {
-				enabled: true,
-				..Default::default()
-			},
-			encoding_compute,
-			group_commit: GroupCommitConfig::default(),
-			crypto: test_crypto(),
-		})
-		.await
-		.unwrap(),
-	);
+	let mgr = SlabManager::initialize_new_store(SlabManagerConfig {
+		dir: l1_dir.to_path_buf(),
+		max_slab_bytes: 1024 * 1024 * 16,
+		io: spawn_io_thread(64).unwrap(),
+		l2: Some(l2.clone()),
+		rehydration: RehydrationPolicy {
+			promote_after_l2_reads: 0,
+			..RehydrationPolicy::default()
+		},
+		l2_column_fetch: L2ColumnFetchConfig {
+			enabled: true,
+			min_record_bytes: RecordBodyByteLen::new(1),
+			..L2ColumnFetchConfig::default()
+		},
+		row_group_writer: Default::default(),
+		l2_row_group_fetch: crate::storage::row_group::L2RowGroupFetchConfig {
+			enabled: true,
+			max_selected_row_group_fraction_micros:
+				crate::storage::row_group::L2_ROW_GROUP_FETCH_FRACTION_DENOMINATOR - 1,
+			max_selected_byte_fraction_micros:
+				crate::storage::row_group::L2_ROW_GROUP_FETCH_FRACTION_DENOMINATOR - 1,
+			..Default::default()
+		},
+		encoding_writer: Default::default(),
+		l2_chunk_layout: Default::default(),
+		l2_encoding_fetch: crate::storage::encoding::L2EncodingFetchConfig {
+			enabled: true,
+			..Default::default()
+		},
+		encoding_compute,
+		group_commit: GroupCommitConfig::default(),
+		crypto: test_crypto(),
+	})
+	.await
+	.unwrap();
 
 	let row_count = 4_096_usize;
 	let schema = Schema::new(vec![
@@ -10733,6 +10875,7 @@ async fn fsst_phase_b_l2_read_filters_a1_and_declines_a2_overlap() {
 		.expect("target storage row");
 	let location = mgr
 		.lookup(tenant(), target.key_identity)
+		.unwrap()
 		.expect("tiered FSST row location");
 	let selected_rows = [RecordRowIndex::new(target_row as u32)];
 	let mut bytecode = Vec::new();
@@ -11065,47 +11208,46 @@ async fn sparse_projection_fetch_materializes_exact_cocd_clustered_pages() {
 		LocalFsObjectStore::new(&*l2_dir).unwrap(),
 	)));
 	let l2: Arc<dyn ObjectStore> = l2_counter.clone();
-	let mgr = Arc::new(
-		SlabManager::open(SlabManagerConfig {
-			dir: l1_dir.to_path_buf(),
-			max_slab_bytes: 1024 * 1024 * 16,
-			io: spawn_io_thread(64).unwrap(),
-			l2: Some(l2.clone()),
-			rehydration: RehydrationPolicy {
-				promote_after_l2_reads: 0,
-				..RehydrationPolicy::default()
-			},
-			l2_column_fetch: L2ColumnFetchConfig {
-				enabled: true,
-				min_record_bytes: RecordBodyByteLen::new(1),
-				..L2ColumnFetchConfig::default()
-			},
-			row_group_writer: Default::default(),
-			l2_row_group_fetch: crate::storage::row_group::L2RowGroupFetchConfig {
-				enabled: true,
-				max_selected_row_group_fraction_micros:
-					crate::storage::row_group::L2_ROW_GROUP_FETCH_FRACTION_DENOMINATOR - 1,
-				max_selected_byte_fraction_micros:
-					crate::storage::row_group::L2_ROW_GROUP_FETCH_FRACTION_DENOMINATOR - 1,
-				..Default::default()
-			},
-			encoding_writer: Default::default(),
-			l2_chunk_layout: Default::default(),
-			l2_encoding_fetch: crate::storage::encoding::L2EncodingFetchConfig {
-				enabled: true,
-				..Default::default()
-			},
-			encoding_compute: crate::storage::encoding::compute::EncodingComputeConfig {
-				min_selectivity_for_encoded_eval_micros:
-					crate::schema::SelectivityFractionMicros::new(1_000_000),
-				..Default::default()
-			},
-			group_commit: GroupCommitConfig::default(),
-			crypto: test_crypto(),
-		})
-		.await
-		.unwrap(),
-	);
+	let mgr = SlabManager::initialize_new_store(SlabManagerConfig {
+		dir: l1_dir.to_path_buf(),
+		max_slab_bytes: 1024 * 1024 * 16,
+		io: spawn_io_thread(64).unwrap(),
+		l2: Some(l2.clone()),
+		rehydration: RehydrationPolicy {
+			promote_after_l2_reads: 0,
+			..RehydrationPolicy::default()
+		},
+		l2_column_fetch: L2ColumnFetchConfig {
+			enabled: true,
+			min_record_bytes: RecordBodyByteLen::new(1),
+			..L2ColumnFetchConfig::default()
+		},
+		row_group_writer: Default::default(),
+		l2_row_group_fetch: crate::storage::row_group::L2RowGroupFetchConfig {
+			enabled: true,
+			max_selected_row_group_fraction_micros:
+				crate::storage::row_group::L2_ROW_GROUP_FETCH_FRACTION_DENOMINATOR - 1,
+			max_selected_byte_fraction_micros:
+				crate::storage::row_group::L2_ROW_GROUP_FETCH_FRACTION_DENOMINATOR - 1,
+			..Default::default()
+		},
+		encoding_writer: Default::default(),
+		l2_chunk_layout: Default::default(),
+		l2_encoding_fetch: crate::storage::encoding::L2EncodingFetchConfig {
+			enabled: true,
+			..Default::default()
+		},
+		encoding_compute: crate::storage::encoding::compute::EncodingComputeConfig {
+			min_selectivity_for_encoded_eval_micros: crate::schema::SelectivityFractionMicros::new(
+				1_000_000,
+			),
+			..Default::default()
+		},
+		group_commit: GroupCommitConfig::default(),
+		crypto: test_crypto(),
+	})
+	.await
+	.unwrap();
 	let schema = Schema::new(vec![
 		Field::new("id", DataType::Int64, false),
 		Field::new("selector", DataType::Int64, false),
@@ -11231,6 +11373,7 @@ async fn sparse_projection_fetch_materializes_exact_cocd_clustered_pages() {
 		.expect("target storage row");
 	let location = mgr
 		.lookup(tenant(), target.key_identity)
+		.unwrap()
 		.expect("tiered row location");
 	// Sparse projection fetch consumes the exact COCD mask but
 	// does not page-slice dense predicate columns.
@@ -11458,46 +11601,44 @@ async fn sparse_projection_fetch_materializes_exact_cocd_clustered_pages() {
 		LocalFsObjectStore::new(&*scalar_l2_dir).unwrap(),
 	)));
 	let scalar_l2: Arc<dyn ObjectStore> = scalar_l2_counter.clone();
-	let scalar_mgr = Arc::new(
-		SlabManager::open(SlabManagerConfig {
-			dir: scalar_l1_dir.to_path_buf(),
-			max_slab_bytes: 1024 * 1024 * 16,
-			io: spawn_io_thread(64).unwrap(),
-			l2: Some(scalar_l2.clone()),
-			rehydration: RehydrationPolicy {
-				promote_after_l2_reads: 0,
-				..RehydrationPolicy::default()
-			},
-			l2_column_fetch: L2ColumnFetchConfig {
-				enabled: true,
-				min_record_bytes: RecordBodyByteLen::new(1),
-				..L2ColumnFetchConfig::default()
-			},
-			row_group_writer: Default::default(),
-			l2_row_group_fetch: crate::storage::row_group::L2RowGroupFetchConfig {
-				enabled: true,
-				max_selected_row_group_fraction_micros:
-					crate::storage::row_group::L2_ROW_GROUP_FETCH_FRACTION_DENOMINATOR - 1,
-				max_selected_byte_fraction_micros:
-					crate::storage::row_group::L2_ROW_GROUP_FETCH_FRACTION_DENOMINATOR - 1,
-				..Default::default()
-			},
-			encoding_writer: Default::default(),
-			l2_chunk_layout: Default::default(),
-			l2_encoding_fetch: crate::storage::encoding::L2EncodingFetchConfig {
-				enabled: true,
-				..Default::default()
-			},
-			encoding_compute: crate::storage::encoding::compute::EncodingComputeConfig {
-				enabled: false,
-				..Default::default()
-			},
-			group_commit: GroupCommitConfig::default(),
-			crypto: test_crypto(),
-		})
-		.await
-		.unwrap(),
-	);
+	let scalar_mgr = SlabManager::initialize_new_store(SlabManagerConfig {
+		dir: scalar_l1_dir.to_path_buf(),
+		max_slab_bytes: 1024 * 1024 * 16,
+		io: spawn_io_thread(64).unwrap(),
+		l2: Some(scalar_l2.clone()),
+		rehydration: RehydrationPolicy {
+			promote_after_l2_reads: 0,
+			..RehydrationPolicy::default()
+		},
+		l2_column_fetch: L2ColumnFetchConfig {
+			enabled: true,
+			min_record_bytes: RecordBodyByteLen::new(1),
+			..L2ColumnFetchConfig::default()
+		},
+		row_group_writer: Default::default(),
+		l2_row_group_fetch: crate::storage::row_group::L2RowGroupFetchConfig {
+			enabled: true,
+			max_selected_row_group_fraction_micros:
+				crate::storage::row_group::L2_ROW_GROUP_FETCH_FRACTION_DENOMINATOR - 1,
+			max_selected_byte_fraction_micros:
+				crate::storage::row_group::L2_ROW_GROUP_FETCH_FRACTION_DENOMINATOR - 1,
+			..Default::default()
+		},
+		encoding_writer: Default::default(),
+		l2_chunk_layout: Default::default(),
+		l2_encoding_fetch: crate::storage::encoding::L2EncodingFetchConfig {
+			enabled: true,
+			..Default::default()
+		},
+		encoding_compute: crate::storage::encoding::compute::EncodingComputeConfig {
+			enabled: false,
+			..Default::default()
+		},
+		group_commit: GroupCommitConfig::default(),
+		crypto: test_crypto(),
+	})
+	.await
+	.unwrap();
 	scalar_mgr
 		.append_durable_multirow_with_locality(tenant(), &encoded.frame, &encoded_entries)
 		.await
@@ -11545,6 +11686,7 @@ async fn sparse_projection_fetch_materializes_exact_cocd_clustered_pages() {
 		.expect("scalar target storage row");
 	let scalar_location = scalar_mgr
 		.lookup(tenant(), scalar_target.key_identity)
+		.unwrap()
 		.expect("scalar tiered row location");
 	let no_overlap_requirement = ColumnFetchRequirement {
 		predicate_columns: crate::storage::columnar::ColumnOrdinalSet::from_columns([1]),
@@ -11682,26 +11824,24 @@ async fn adr061_enabled_chunk_layout_writes_16k_encrypted_slab() {
 		enabled: true,
 		..Default::default()
 	};
-	let mgr = Arc::new(
-		SlabManager::open(SlabManagerConfig {
-			dir: dir.to_path_buf(),
-			max_slab_bytes: 1024 * 1024 * 16,
-			io: spawn_io_thread(64).unwrap(),
-			l2: None,
-			rehydration: RehydrationPolicy::default(),
-			l2_column_fetch: L2ColumnFetchConfig::default(),
-			row_group_writer: Default::default(),
-			l2_row_group_fetch: Default::default(),
-			encoding_writer: Default::default(),
-			l2_chunk_layout: chunk_layout_config.clone(),
-			l2_encoding_fetch: Default::default(),
-			encoding_compute: Default::default(),
-			group_commit: GroupCommitConfig::default(),
-			crypto: test_crypto(),
-		})
-		.await
-		.unwrap(),
-	);
+	let mgr = SlabManager::initialize_new_store(SlabManagerConfig {
+		dir: dir.to_path_buf(),
+		max_slab_bytes: 1024 * 1024 * 16,
+		io: spawn_io_thread(64).unwrap(),
+		l2: None,
+		rehydration: RehydrationPolicy::default(),
+		l2_column_fetch: L2ColumnFetchConfig::default(),
+		row_group_writer: Default::default(),
+		l2_row_group_fetch: Default::default(),
+		encoding_writer: Default::default(),
+		l2_chunk_layout: chunk_layout_config.clone(),
+		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
+		group_commit: GroupCommitConfig::default(),
+		crypto: test_crypto(),
+	})
+	.await
+	.unwrap();
 	let schema = Schema::new(vec![
 		Field::new("id", DataType::Int64, false),
 		Field::new("payload", DataType::UInt8, false),
@@ -11847,41 +11987,39 @@ async fn encoding_secondary_index_fetches_only_selected_simd_pages() {
 	let l1_dir = fresh_dir("encoding-index-l1");
 	let l2_dir = fresh_dir("encoding-index-l2");
 	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_dir).unwrap());
-	let mgr = Arc::new(
-		SlabManager::open(SlabManagerConfig {
-			dir: l1_dir.to_path_buf(),
-			max_slab_bytes: 1024 * 1024 * 16,
-			io: spawn_io_thread(64).unwrap(),
-			l2: Some(l2.clone()),
-			rehydration: RehydrationPolicy {
-				promote_after_l2_reads: 0,
-				..RehydrationPolicy::default()
-			},
-			l2_column_fetch: L2ColumnFetchConfig {
-				enabled: true,
-				min_record_bytes: RecordBodyByteLen::new(1),
-				..L2ColumnFetchConfig::default()
-			},
-			row_group_writer: Default::default(),
-			l2_row_group_fetch: crate::storage::row_group::L2RowGroupFetchConfig {
-				enabled: true,
-				max_selected_row_group_fraction_micros:
-					crate::storage::row_group::L2_ROW_GROUP_FETCH_FRACTION_DENOMINATOR - 1,
-				..Default::default()
-			},
-			encoding_writer: Default::default(),
-			l2_chunk_layout: Default::default(),
-			l2_encoding_fetch: crate::storage::encoding::L2EncodingFetchConfig {
-				enabled: true,
-				..Default::default()
-			},
-			encoding_compute: Default::default(),
-			group_commit: GroupCommitConfig::default(),
-			crypto: test_crypto(),
-		})
-		.await
-		.unwrap(),
-	);
+	let mgr = SlabManager::initialize_new_store(SlabManagerConfig {
+		dir: l1_dir.to_path_buf(),
+		max_slab_bytes: 1024 * 1024 * 16,
+		io: spawn_io_thread(64).unwrap(),
+		l2: Some(l2.clone()),
+		rehydration: RehydrationPolicy {
+			promote_after_l2_reads: 0,
+			..RehydrationPolicy::default()
+		},
+		l2_column_fetch: L2ColumnFetchConfig {
+			enabled: true,
+			min_record_bytes: RecordBodyByteLen::new(1),
+			..L2ColumnFetchConfig::default()
+		},
+		row_group_writer: Default::default(),
+		l2_row_group_fetch: crate::storage::row_group::L2RowGroupFetchConfig {
+			enabled: true,
+			max_selected_row_group_fraction_micros:
+				crate::storage::row_group::L2_ROW_GROUP_FETCH_FRACTION_DENOMINATOR - 1,
+			..Default::default()
+		},
+		encoding_writer: Default::default(),
+		l2_chunk_layout: Default::default(),
+		l2_encoding_fetch: crate::storage::encoding::L2EncodingFetchConfig {
+			enabled: true,
+			..Default::default()
+		},
+		encoding_compute: Default::default(),
+		group_commit: GroupCommitConfig::default(),
+		crypto: test_crypto(),
+	})
+	.await
+	.unwrap();
 	let schema = Schema::new(vec![
 		Field::new("id", DataType::Int64, false),
 		Field::new("payload", DataType::UInt8, false),
@@ -12015,6 +12153,7 @@ async fn encoding_secondary_index_fetches_only_selected_simd_pages() {
 			.find(|row| row.record_row_index == record_row_index)
 			.expect("indexed source row");
 		mgr.lookup(tenant(), row.key_identity)
+			.unwrap()
 			.expect("indexed row location")
 	})
 	.collect::<Vec<_>>();
@@ -12341,9 +12480,10 @@ async fn decode_tiered_blob_rejects_footer_tenant_mismatch_with_payload_tenant()
 		mgr.config.crypto.as_ref(),
 		&pointer,
 		&encrypted.bytes,
-		&BTreeSet::new(),
+		TierObjectEvidence::Indexed(&BTreeSet::new()),
 	)
-	.unwrap_err();
+	.err()
+	.expect("decoding refuses");
 	assert_eq!(err.kind(), ErrorKind::InvalidData);
 	assert!(
 		err.to_string().contains("footer tenant"),
@@ -12362,12 +12502,14 @@ async fn lookup_as_of_returns_historical_version() {
 	assert_eq!(
 		mgr.lookup_as_of(tenant(), key, hlc(15))
 			.unwrap()
+			.unwrap()
 			.hlc
 			.physical_ms,
 		10
 	);
 	assert_eq!(
 		mgr.lookup_as_of(tenant(), key, hlc(20))
+			.unwrap()
 			.unwrap()
 			.hlc
 			.physical_ms,
@@ -12376,12 +12518,13 @@ async fn lookup_as_of_returns_historical_version() {
 	assert_eq!(
 		mgr.lookup_as_of(tenant(), key, hlc(25))
 			.unwrap()
+			.unwrap()
 			.hlc
 			.physical_ms,
 		20
 	);
 	// Bound before the first write -> nothing visible yet.
-	assert!(mgr.lookup_as_of(tenant(), key, hlc(5)).is_none());
+	assert!(mgr.lookup_as_of(tenant(), key, hlc(5)).unwrap().is_none());
 }
 
 #[tokio::test]
@@ -12397,7 +12540,9 @@ async fn scan_all_versions_returns_every_retained_version_above_floor() {
 		.await
 		.unwrap();
 
-	let hits = mgr.scan_all_versions(Locality::ZERO, Locality::MAX, hlc(10));
+	let hits = mgr
+		.scan_all_versions(Locality::ZERO, Locality::MAX, hlc(10))
+		.unwrap();
 	// Floor at 10 drops (1, hlc=5); the remaining three survive.
 	assert_eq!(hits.len(), 3);
 	// Sorted first by locality/identity, then by hlc ascending.
@@ -12417,6 +12562,7 @@ async fn scan_all_versions_returns_every_retained_version_above_floor() {
 	// Inverted window → empty rather than panic.
 	assert!(
 		mgr.scan_all_versions(Locality::new(10), Locality::new(5), hlc(0))
+			.unwrap()
 			.is_empty()
 	);
 }
@@ -12443,7 +12589,7 @@ async fn append_migration_is_idempotent_on_identical_payload() {
 
 	// Only one version at this (key, hlc) should exist.
 	let locality = Locality::from(key);
-	let versions = mgr.scan_all_versions(locality, locality, hlc(0));
+	let versions = mgr.scan_all_versions(locality, locality, hlc(0)).unwrap();
 	assert_eq!(versions.len(), 1);
 }
 
@@ -12461,7 +12607,9 @@ async fn append_migration_with_locality_preserves_custom_range_membership() {
 		.append_durable_with_locality(tenant(), key, routing_locality, ts, b"table-row")
 		.await
 		.unwrap();
-	let source_versions = source.scan_all_versions(routing_locality, routing_locality, hlc(0));
+	let source_versions = source
+		.scan_all_versions(routing_locality, routing_locality, hlc(0))
+		.unwrap();
 	assert_eq!(source_versions.len(), 1);
 	let (tenant_id, migrated_key, migrated_locality, source_loc) = source_versions[0];
 	assert_eq!(migrated_key, key);
@@ -12482,13 +12630,16 @@ async fn append_migration_with_locality_preserves_custom_range_membership() {
 		.await
 		.unwrap();
 
-	let custom_hits = destination.scan_all_versions(routing_locality, routing_locality, hlc(0));
+	let custom_hits = destination
+		.scan_all_versions(routing_locality, routing_locality, hlc(0))
+		.unwrap();
 	assert_eq!(custom_hits.len(), 1);
 	assert_eq!(custom_hits[0].1, key);
 	assert_eq!(custom_hits[0].2, routing_locality);
 	assert!(
 		destination
 			.scan_all_versions(identity_locality, identity_locality, hlc(0))
+			.unwrap()
 			.is_empty()
 	);
 }
@@ -12530,7 +12681,9 @@ async fn scan_as_of_filters_versions_per_key() {
 
 	// AS OF 25 — should see key=1 at 10 (20 hasn't landed),
 	// key=2 at 20.
-	let at_25 = mgr.scan_as_of(tenant(), Locality::ZERO, Locality::MAX, hlc(25));
+	let at_25 = mgr
+		.scan_as_of(tenant(), Locality::ZERO, Locality::MAX, hlc(25))
+		.unwrap();
 	assert_eq!(at_25.len(), 2);
 	assert_eq!(at_25[0].0, Locality::from(key_a).get());
 	assert_eq!(at_25[0].1.hlc.physical_ms, 10);
@@ -12540,11 +12693,12 @@ async fn scan_as_of_filters_versions_per_key() {
 	// AS OF 5 — nothing visible yet.
 	assert!(
 		mgr.scan_as_of(tenant(), Locality::ZERO, Locality::MAX, hlc(5))
+			.unwrap()
 			.is_empty()
 	);
 
 	// Zero sentinel -> latest versions.
-	let latest = mgr.scan(tenant(), Locality::ZERO, Locality::MAX);
+	let latest = mgr.scan(tenant(), Locality::ZERO, Locality::MAX).unwrap();
 	assert_eq!(latest[0].1.hlc.physical_ms, 30);
 	assert_eq!(latest[1].1.hlc.physical_ms, 40);
 }
@@ -12563,12 +12717,16 @@ async fn scan_as_of_scopes_locality_membership_per_tenant() {
 		.await
 		.unwrap();
 
-	let primary = mgr.scan_as_of(tenant(), locality, locality, hlc(30));
+	let primary = mgr
+		.scan_as_of(tenant(), locality, locality, hlc(30))
+		.unwrap();
 	assert_eq!(primary.len(), 1);
 	assert_eq!(primary[0].0, locality.get());
 	assert_eq!(primary[0].1.hlc.physical_ms, 10);
 
-	let secondary = mgr.scan_as_of(other_tenant, locality, locality, hlc(30));
+	let secondary = mgr
+		.scan_as_of(other_tenant, locality, locality, hlc(30))
+		.unwrap();
 	assert_eq!(secondary.len(), 1);
 	assert_eq!(secondary[0].0, locality.get());
 	assert_eq!(secondary[0].1.hlc.physical_ms, 20);
@@ -12577,26 +12735,24 @@ async fn scan_as_of_scopes_locality_membership_per_tenant() {
 #[tokio::test]
 async fn custom_routing_locality_survives_reopen() {
 	let dir = fresh_dir("custom-locality-reopen");
-	let manager = Arc::new(
-		SlabManager::open(SlabManagerConfig {
-			dir: dir.to_path_buf(),
-			max_slab_bytes: 1024 * 1024,
-			io: spawn_io_thread(64).unwrap(),
-			l2: None,
-			rehydration: RehydrationPolicy::default(),
-			l2_column_fetch: Default::default(),
-			row_group_writer: Default::default(),
-			l2_row_group_fetch: Default::default(),
-			encoding_writer: Default::default(),
-			l2_chunk_layout: Default::default(),
-			l2_encoding_fetch: Default::default(),
-			encoding_compute: Default::default(),
-			group_commit: GroupCommitConfig::default(),
-			crypto: test_crypto(),
-		})
-		.await
-		.unwrap(),
-	);
+	let manager = SlabManager::initialize_new_store(SlabManagerConfig {
+		dir: dir.to_path_buf(),
+		max_slab_bytes: 1024 * 1024,
+		io: spawn_io_thread(64).unwrap(),
+		l2: None,
+		rehydration: RehydrationPolicy::default(),
+		l2_column_fetch: Default::default(),
+		row_group_writer: Default::default(),
+		l2_row_group_fetch: Default::default(),
+		encoding_writer: Default::default(),
+		l2_chunk_layout: Default::default(),
+		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
+		group_commit: GroupCommitConfig::default(),
+		crypto: test_crypto(),
+	})
+	.await
+	.unwrap();
 	let key = id(0xCAFE);
 	let routing_locality = Locality::new(42);
 	assert_ne!(routing_locality, Locality::from(key));
@@ -12612,6 +12768,7 @@ async fn custom_routing_locality_survives_reopen() {
 				routing_locality,
 				hlc(20),
 			)
+			.unwrap()
 			.len(),
 		1
 	);
@@ -12635,12 +12792,14 @@ async fn custom_routing_locality_survives_reopen() {
 	})
 	.await
 	.unwrap();
-	let custom_hits = reopened.scan_as_of_with_identity_and_locality(
-		tenant(),
-		routing_locality,
-		routing_locality,
-		hlc(20),
-	);
+	let custom_hits = reopened
+		.scan_as_of_with_identity_and_locality(
+			tenant(),
+			routing_locality,
+			routing_locality,
+			hlc(20),
+		)
+		.unwrap();
 	assert_eq!(custom_hits.len(), 1);
 	assert_eq!(custom_hits[0].0, key);
 	assert_eq!(custom_hits[0].1, routing_locality);
@@ -12652,6 +12811,7 @@ async fn custom_routing_locality_survives_reopen() {
 				Locality::from(key),
 				hlc(20),
 			)
+			.unwrap()
 			.is_empty()
 	);
 }
@@ -12714,7 +12874,7 @@ async fn reopen_restores_tiered_rows_from_redb() {
 	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_dir).unwrap());
 	let crypto = test_crypto();
 
-	let manager = SlabManager::open(SlabManagerConfig {
+	let manager = SlabManager::initialize_new_store(SlabManagerConfig {
 		dir: l1_dir.to_path_buf(),
 		max_slab_bytes: 1,
 		io: io.clone(),
@@ -12806,10 +12966,12 @@ async fn reopen_restores_tiered_rows_from_redb() {
 	})
 	.await
 	.unwrap();
+	reopened.wait_tier_authority_ready().await.unwrap();
 	assert!(reopened.is_tiered(sealed_id).await);
 
 	let location = reopened
 		.lookup(tenant(), tiered_key)
+		.unwrap()
 		.expect("tiered key should survive reopen");
 	assert_eq!(location.slab_id, sealed_id);
 	assert_eq!(reopened.read(location).await.unwrap(), tiered_bytes);
@@ -12838,6 +13000,52 @@ async fn cleanup_retention_rewrite_tmp_files_removes_stale_plaintext() {
 	);
 }
 
+async fn assert_new_cleanup_intent(mgr: &SlabManager, slab: SlabId, uri: &str, published: bool) {
+	use crate::storage::index::RetainedObjectIntentState;
+	assert_cleanup_intent_state(
+		mgr,
+		slab,
+		uri,
+		if published {
+			RetainedObjectIntentState::ReplacementPublished
+		} else {
+			RetainedObjectIntentState::Unresolved
+		},
+	)
+	.await;
+}
+
+async fn assert_cleanup_intent_state(
+	mgr: &SlabManager,
+	slab: SlabId,
+	uri: &str,
+	expected: crate::storage::index::RetainedObjectIntentState,
+) {
+	let records = mgr
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot_cleanup_intents()
+		.await
+		.unwrap();
+	let record = records
+		.iter()
+		.find(|(id, key, _)| *id == slab && key == uri)
+		.expect("durable cleanup intent");
+	assert_eq!(record.2.state, expected);
+}
+
+async fn assert_no_cleanup_intent(mgr: &SlabManager, slab: SlabId, uri: &str) {
+	let records = mgr
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot_cleanup_intents()
+		.await
+		.unwrap();
+	assert!(!records.iter().any(|(id, key, _)| *id == slab && key == uri));
+}
+
 #[tokio::test]
 async fn adr0095_tiered_cleanup_intent_is_durable_and_budgeted_before_receipt() {
 	let (_manager_dirs, manager, l2) = fresh_manager_with_l2("adr0095-l2-cleanup-intent").await;
@@ -12849,10 +13057,8 @@ async fn adr0095_tiered_cleanup_intent_is_durable_and_budgeted_before_receipt() 
 		.await
 		.unwrap();
 	let marker = super::retention_reclaim::table_drop_l2_cleanup_path(&manager.config.dir, slab_id);
-	assert!(
-		marker.exists(),
-		"cleanup intent is durable before pointer mutation"
-	);
+	assert!(!marker.exists());
+	assert_new_cleanup_intent(&manager, slab_id, &old_uri, false).await;
 
 	let (examined, done) = manager
 		.reconcile_table_drop_l2_cleanup_markers(l2.as_ref(), 0)
@@ -12863,51 +13069,46 @@ async fn adr0095_tiered_cleanup_intent_is_durable_and_budgeted_before_receipt() 
 		!done,
 		"a zero budget cannot erase or attest pending cleanup"
 	);
-	assert!(marker.exists());
+	assert_new_cleanup_intent(&manager, slab_id, &old_uri, false).await;
 
-	let (examined, done) = manager
+	let error = manager
 		.reconcile_table_drop_l2_cleanup_markers(l2.as_ref(), 1)
 		.await
-		.unwrap();
-	assert_eq!(examined, 1);
-	assert!(done);
-	assert!(
-		!marker.exists(),
-		"the marker clears only after old-object deletion"
+		.expect_err("a cleanup intent alone is not proof of a committed retirement");
+	assert_eq!(
+		stale_location(&error),
+		Some(StaleLocation {
+			slab_id,
+			reason: StaleLocationReason::Fenced,
+		})
 	);
-	assert!(
-		l2.list("adr0095/old-target-bearing-slab")
-			.await
-			.unwrap()
-			.is_empty(),
-		"no target-bearing L2 object survives the cleanup receipt"
-	);
+	assert_new_cleanup_intent(&manager, slab_id, &old_uri, false).await;
+	assert_eq!(l2.get(&old_uri).await.unwrap(), b"old-target-bytes");
+	assert_unresolved_drop_is_reported(b"old-target-bytes".len() as u64);
 }
 
 #[tokio::test]
 async fn reopen_after_tombstone_compaction_preserves_survivor_lookup() {
 	let dir = fresh_dir("compaction-redb");
 	let io = spawn_io_thread(64).unwrap();
-	let manager = Arc::new(
-		SlabManager::open(SlabManagerConfig {
-			dir: dir.to_path_buf(),
-			max_slab_bytes: 1024 * 1024,
-			io: io.clone(),
-			l2: None,
-			rehydration: RehydrationPolicy::default(),
-			l2_column_fetch: Default::default(),
-			row_group_writer: Default::default(),
-			l2_row_group_fetch: Default::default(),
-			encoding_writer: Default::default(),
-			l2_chunk_layout: Default::default(),
-			l2_encoding_fetch: Default::default(),
-			encoding_compute: Default::default(),
-			group_commit: GroupCommitConfig::default(),
-			crypto: test_crypto(),
-		})
-		.await
-		.unwrap(),
-	);
+	let manager = SlabManager::initialize_new_store(SlabManagerConfig {
+		dir: dir.to_path_buf(),
+		max_slab_bytes: 1024 * 1024,
+		io: io.clone(),
+		l2: None,
+		rehydration: RehydrationPolicy::default(),
+		l2_column_fetch: Default::default(),
+		row_group_writer: Default::default(),
+		l2_row_group_fetch: Default::default(),
+		encoding_writer: Default::default(),
+		l2_chunk_layout: Default::default(),
+		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
+		group_commit: GroupCommitConfig::default(),
+		crypto: test_crypto(),
+	})
+	.await
+	.unwrap();
 
 	let removed_key = id(0x1010);
 	let survivor_key = id(0x2020);
@@ -12926,6 +13127,7 @@ async fn reopen_after_tombstone_compaction_preserves_survivor_lookup() {
 		.unwrap();
 	let survivor_before = manager
 		.lookup(tenant(), survivor_key)
+		.unwrap()
 		.expect("survivor location before maintenance");
 
 	let target = Locality::from(removed_key).get();
@@ -12951,12 +13153,13 @@ async fn reopen_after_tombstone_compaction_preserves_survivor_lookup() {
 		.unwrap();
 	assert_eq!(report.compacted_slabs, 1);
 	assert!(
-		manager.lookup(tenant(), removed_key).is_none(),
+		manager.lookup(tenant(), removed_key).unwrap().is_none(),
 		"reclaimed key should disappear from the in-memory index"
 	);
 
 	let survivor = manager
 		.lookup(tenant(), survivor_key)
+		.unwrap()
 		.expect("survivor should remain indexed");
 	assert_ne!(
 		survivor.slab_id, sealed_id,
@@ -13001,11 +13204,12 @@ async fn reopen_after_tombstone_compaction_preserves_survivor_lookup() {
 	.await
 	.unwrap();
 	assert!(
-		reopened.lookup(tenant(), removed_key).is_none(),
+		reopened.lookup(tenant(), removed_key).unwrap().is_none(),
 		"reclaimed key should stay absent after reopen"
 	);
 	let survivor = reopened
 		.lookup(tenant(), survivor_key)
+		.unwrap()
 		.expect("survivor should still be indexed after reopen");
 	assert_eq!(reopened.read(survivor).await.unwrap(), b"keep-me");
 }
@@ -13014,26 +13218,24 @@ async fn reopen_after_tombstone_compaction_preserves_survivor_lookup() {
 async fn lsm_compaction_does_not_retain_empty_active_slabs() {
 	let dir = fresh_dir("lsm-empty-active");
 	let io = spawn_io_thread(16).unwrap();
-	let manager = Arc::new(
-		SlabManager::open(SlabManagerConfig {
-			dir: dir.to_path_buf(),
-			max_slab_bytes: 1,
-			io: io.clone(),
-			l2: None,
-			rehydration: RehydrationPolicy::default(),
-			l2_column_fetch: Default::default(),
-			row_group_writer: Default::default(),
-			l2_row_group_fetch: Default::default(),
-			encoding_writer: Default::default(),
-			l2_chunk_layout: Default::default(),
-			l2_encoding_fetch: Default::default(),
-			encoding_compute: Default::default(),
-			group_commit: GroupCommitConfig::default(),
-			crypto: test_crypto(),
-		})
-		.await
-		.unwrap(),
-	);
+	let manager = SlabManager::initialize_new_store(SlabManagerConfig {
+		dir: dir.to_path_buf(),
+		max_slab_bytes: 1,
+		io: io.clone(),
+		l2: None,
+		rehydration: RehydrationPolicy::default(),
+		l2_column_fetch: Default::default(),
+		row_group_writer: Default::default(),
+		l2_row_group_fetch: Default::default(),
+		encoding_writer: Default::default(),
+		l2_chunk_layout: Default::default(),
+		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
+		group_commit: GroupCommitConfig::default(),
+		crypto: test_crypto(),
+	})
+	.await
+	.unwrap();
 
 	let worker = LsmCompactionWorker::new(LsmConfig::default(), manager.slab_pin_table()).unwrap();
 	let slab_lengths = || {
@@ -13113,7 +13315,7 @@ async fn lsm_compaction_does_not_retain_empty_active_slabs() {
 	.await
 	.unwrap();
 	assert!(
-		reopened.lookup(tenant(), id(0x7000)).is_some(),
+		reopened.lookup(tenant(), id(0x7000)).unwrap().is_some(),
 		"restart must retain rows after empty-slab retirement"
 	);
 }
@@ -13122,26 +13324,24 @@ async fn lsm_compaction_does_not_retain_empty_active_slabs() {
 async fn recovery_skips_zero_length_sealed_slabs_but_preserves_records_and_active_tail() {
 	let dir = fresh_dir("recovery-empty-sealed");
 	let io = spawn_io_thread(16).unwrap();
-	let manager = Arc::new(
-		SlabManager::open(SlabManagerConfig {
-			dir: dir.to_path_buf(),
-			max_slab_bytes: 1,
-			io: io.clone(),
-			l2: None,
-			rehydration: RehydrationPolicy::default(),
-			l2_column_fetch: Default::default(),
-			row_group_writer: Default::default(),
-			l2_row_group_fetch: Default::default(),
-			encoding_writer: Default::default(),
-			l2_chunk_layout: Default::default(),
-			l2_encoding_fetch: Default::default(),
-			encoding_compute: Default::default(),
-			group_commit: GroupCommitConfig::default(),
-			crypto: test_crypto(),
-		})
-		.await
-		.unwrap(),
-	);
+	let manager = SlabManager::initialize_new_store(SlabManagerConfig {
+		dir: dir.to_path_buf(),
+		max_slab_bytes: 1,
+		io: io.clone(),
+		l2: None,
+		rehydration: RehydrationPolicy::default(),
+		l2_column_fetch: Default::default(),
+		row_group_writer: Default::default(),
+		l2_row_group_fetch: Default::default(),
+		encoding_writer: Default::default(),
+		l2_chunk_layout: Default::default(),
+		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
+		group_commit: GroupCommitConfig::default(),
+		crypto: test_crypto(),
+	})
+	.await
+	.unwrap();
 	let key = id(0x7A00);
 	manager
 		.append(tenant(), key, hlc(1), b"record-survives")
@@ -13179,6 +13379,7 @@ async fn recovery_skips_zero_length_sealed_slabs_but_preserves_records_and_activ
 	assert_eq!(reopened.sealed_count().await, 1);
 	let location = reopened
 		.lookup(tenant(), key)
+		.unwrap()
 		.expect("non-empty sealed slab must remain discoverable");
 	assert_eq!(reopened.read(location).await.unwrap(), b"record-survives");
 }
@@ -13317,8 +13518,8 @@ async fn lsm_compaction_copies_whole_multirow_frame_into_output_run() {
 	assert_eq!(outcome.rows_out, 2);
 	assert_eq!(outcome.output_slabs.len(), 1);
 	let output_slab_id = outcome.output_slabs[0].slab_id;
-	let first = manager.lookup(tenant(), first_key).unwrap();
-	let second = manager.lookup(tenant(), second_key).unwrap();
+	let first = manager.lookup(tenant(), first_key).unwrap().unwrap();
+	let second = manager.lookup(tenant(), second_key).unwrap().unwrap();
 	assert_eq!(first.slab_id, output_slab_id);
 	assert_eq!(second.slab_id, output_slab_id);
 	assert_ne!(output_slab_id, source_slab_id);
@@ -13373,16 +13574,24 @@ async fn migrated_range_tombstone_marks_tiered_slab_visibility_incomplete() {
 		completed_at_hlc: hlc(50),
 		migration_hlc_floor: hlc(0),
 	};
-	assert!(!manager.slab_has_migrated_range_tombstone_at(
-		sealed_id,
-		hlc(49),
-		std::slice::from_ref(&tombstone)
-	));
-	assert!(manager.slab_has_migrated_range_tombstone_at(
-		sealed_id,
-		hlc(50),
-		std::slice::from_ref(&tombstone)
-	));
+	assert!(
+		!manager
+			.slab_has_migrated_range_tombstone_at(
+				sealed_id,
+				hlc(49),
+				std::slice::from_ref(&tombstone)
+			)
+			.unwrap()
+	);
+	assert!(
+		manager
+			.slab_has_migrated_range_tombstone_at(
+				sealed_id,
+				hlc(50),
+				std::slice::from_ref(&tombstone)
+			)
+			.unwrap()
+	);
 
 	let changed = manager
 		.record_migrated_range_tombstone(&tombstone, Some(99))
@@ -13532,7 +13741,7 @@ async fn tiered_pk_tombstone_slab_records_row_tombstone_and_resurrection_metadat
 		.unwrap();
 	let sealed_id = force_seal_active(&manager).await;
 	assert_eq!(
-		manager.slab_row_tombstone_metadata(sealed_id),
+		manager.slab_row_tombstone_metadata(sealed_id).unwrap(),
 		TombstoneMetadata::Earliest(hlc(20))
 	);
 	manager
@@ -13546,7 +13755,7 @@ async fn tiered_pk_tombstone_slab_records_row_tombstone_and_resurrection_metadat
 			stats_format_version: None,
 			stats_block_len: None,
 			stats_block_hash128: None,
-			tombstone_metadata: manager.slab_row_tombstone_metadata(sealed_id),
+			tombstone_metadata: manager.slab_row_tombstone_metadata(sealed_id).unwrap(),
 			supersession_metadata: SupersessionMetadata::None,
 		})
 		.await
@@ -13615,17 +13824,24 @@ async fn retention_pruning_keeps_latest_version_before_floor() {
 
 	let as_of_25 = manager
 		.lookup_as_of(tenant(), key, hlc(25))
+		.unwrap()
 		.expect("anchor version retained");
 	assert_ne!(as_of_25.slab_id, sealed_id);
 	assert_eq!(as_of_25.hlc.physical_ms, 20);
 	assert_eq!(manager.read(as_of_25).await.unwrap(), b"v20");
 
-	let latest = manager.lookup(tenant(), key).expect("latest retained");
+	let latest = manager
+		.lookup(tenant(), key)
+		.unwrap()
+		.expect("latest retained");
 	assert_eq!(latest.hlc.physical_ms, 30);
 	assert_eq!(manager.read(latest).await.unwrap(), b"v30");
 
 	assert!(
-		manager.lookup_as_of(tenant(), key, hlc(15)).is_none(),
+		manager
+			.lookup_as_of(tenant(), key, hlc(15))
+			.unwrap()
+			.is_none(),
 		"versions older than the retained window should be pruned"
 	);
 }
@@ -13656,11 +13872,17 @@ async fn retention_pruning_keeps_latest_when_all_versions_precede_floor() {
 	assert_eq!(report.compacted_slabs, 1);
 	assert_eq!(report.pruned_versions, 1);
 
-	let latest = manager.lookup(tenant(), key).expect("latest retained");
+	let latest = manager
+		.lookup(tenant(), key)
+		.unwrap()
+		.expect("latest retained");
 	assert_eq!(latest.hlc.physical_ms, 20);
 	assert_eq!(manager.read(latest).await.unwrap(), b"v20");
 	assert!(
-		manager.lookup_as_of(tenant(), key, hlc(15)).is_none(),
+		manager
+			.lookup_as_of(tenant(), key, hlc(15))
+			.unwrap()
+			.is_none(),
 		"earlier history should be removed once the full chain is outside retention"
 	);
 }
@@ -13723,12 +13945,15 @@ impl SlabManager {
 			.get(&pointer.l2_uri)
 			.await?;
 		validate_tiered_blob(pointer, &old_blob)?;
-		let plaintext = Zeroizing::new(decode_tiered_blob(
-			self.config.crypto.as_ref(),
-			pointer,
-			&old_blob,
-			&self.acknowledged_offsets_in_slab(pointer.slab_id),
-		)?);
+		let plaintext = Zeroizing::new(
+			decode_tiered_blob(
+				self.config.crypto.as_ref(),
+				pointer,
+				&old_blob,
+				TierObjectEvidence::Indexed(&self.acknowledged_offsets_in_slab(pointer.slab_id)),
+			)?
+			.bytes,
+		);
 		let mut records =
 			recover_slab_entries_from_blob(&plaintext, pointer.slab_id, &BTreeSet::new())?
 				.into_iter()
@@ -13748,6 +13973,7 @@ impl SlabManager {
 				})
 				.collect::<Vec<_>>();
 		Self::mark_retention_prunable_row_tombstone_pairs(&mut records, retention_floor);
+		self.keep_conflicting_versions(&mut records);
 		records.sort_by_key(|record| record.old_location.offset);
 		let physical_groups = physical_compaction_groups(&records);
 		let pruned_versions = records.iter().filter(|record| record.reclaim).count();
@@ -13760,6 +13986,7 @@ impl SlabManager {
 			return Ok(Some(PreparedTieredRetentionRewrite::Retire {
 				slab_id: pointer.slab_id,
 				old_l2_uri: pointer.l2_uri.clone(),
+				old_bytes: old_blob.len() as u64,
 				pruned_versions,
 				retention_stats,
 				reclaimed_bytes: old_blob.len() as u64,
@@ -13769,6 +13996,8 @@ impl SlabManager {
 		let tmp_path = retention_rewrite_tmp_path(&self.config.dir, pointer.slab_id);
 		let _ = unlink_local_file(self.file_ops.as_ref(), &tmp_path).await;
 		let mut multirow_recompact_count = 0_u64;
+		// The replacement's own record offsets, as the production rewrites keep.
+		let mut replacement_offsets = BTreeSet::new();
 		let rewrite_result: std::io::Result<Zeroizing<Vec<u8>>> = async {
 			let rewritten = Arc::new(
 				LocalSlabStore::open(
@@ -13799,7 +14028,7 @@ impl SlabManager {
 				if compacted.was_multirow {
 					multirow_recompact_count = multirow_recompact_count.saturating_add(1);
 				}
-				rewritten
+				let location = rewritten
 					.append(
 						compacted.tenant_id,
 						compacted.key_identity,
@@ -13807,6 +14036,7 @@ impl SlabManager {
 						&compacted.frame,
 					)
 					.await?;
+				replacement_offsets.insert(location.offset);
 			}
 			rewritten.fsync().await?;
 			Ok(Zeroizing::new(self.file_ops.read_all(&tmp_path).await?))
@@ -13817,25 +14047,27 @@ impl SlabManager {
 		if multirow_recompact_count > 0 {
 			metrics().observe_storage_multirow_recompact(multirow_recompact_count);
 		}
-		let encrypted = self.encrypt_tiered_object_blob_with_table_stats(
+		let encrypted = self.encrypt_tiered_blob_with_evidence(
 			pointer.slab_id,
 			rewritten_plaintext.as_ref(),
-			table_schemas,
+			&replacement_offsets,
+			Some(table_schemas),
 		)?;
 		let row_tombstone_metadata = row_tombstone_metadata_from_blob(
 			rewritten_plaintext.as_ref(),
 			pointer.slab_id,
-			&BTreeSet::new(),
+			&replacement_offsets,
 		)?;
 		Ok(Some(PreparedTieredRetentionRewrite::Rewrite {
 			slab_id: pointer.slab_id,
 			old_l2_uri: pointer.l2_uri.clone(),
+			old_bytes: old_blob.len() as u64,
 			payload_hash: crate::hash::content::digest(&encrypted.bytes),
 			tombstone_metadata: merge_row_tombstone_metadata(
 				pointer.tombstone_metadata,
 				row_tombstone_metadata,
 			),
-			supersession_metadata: self.slab_supersession_metadata(pointer.slab_id),
+			supersession_metadata: self.slab_supersession_metadata(pointer.slab_id).unwrap(),
 			reclaimed_bytes: (old_blob.len() as u64).saturating_sub(encrypted.bytes.len() as u64),
 			pruned_versions,
 			retention_stats,
@@ -13854,7 +14086,7 @@ async fn prune_compaction_must_not_orphan_secondary_index_sources() {
 	let dir = fresh_dir("adr0539-prune-orphans-secondary-source");
 	let crypto = test_crypto();
 	let io = spawn_io_thread(64).unwrap();
-	let manager = open_manager_at_dir(dir.to_path_buf(), io, crypto).await;
+	let manager = initialize_manager_at_dir(dir.to_path_buf(), io, crypto).await;
 	let table = secondary_index_table_descriptor_for_test();
 	let descriptor = secondary_index_descriptor_for_test();
 
@@ -13941,7 +14173,7 @@ async fn recluster_refuses_retirement_without_reconciliation_proof() {
 	let dir = fresh_dir("adr0539-recluster-refuses");
 	let crypto = test_crypto();
 	let io = spawn_io_thread(64).unwrap();
-	let manager = open_manager_at_dir(dir.to_path_buf(), io, crypto).await;
+	let manager = initialize_manager_at_dir(dir.to_path_buf(), io, crypto).await;
 	let single_descriptor = layout_recluster_descriptor(0x64, 1, RecordLayoutPolicy::SingleRow);
 	let multi_descriptor = layout_recluster_descriptor(
 		0x64,
@@ -14070,7 +14302,7 @@ async fn secondary_index_lookup_still_refuses_after_reopen() {
 	let dir = fresh_dir("adr0539-lookup-gate-survives-reopen");
 	let crypto = test_crypto();
 	let io = spawn_io_thread(64).unwrap();
-	let manager = open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	let manager = initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
 	let table = secondary_index_table_descriptor_for_test();
 	let descriptor = secondary_index_descriptor_for_test();
 	append_secondary_index_table_row_for_test(&manager, &table, 1, Some(10), hlc(10)).await;
@@ -14175,27 +14407,33 @@ async fn backfill_candidacy_survives_failures_until_the_budget_spends() {
 	);
 }
 
-async fn repair_fixture_manager(dir: &std::path::Path, io: IoRingHandle) -> Arc<SlabManager> {
-	Arc::new(
-		SlabManager::open(SlabManagerConfig {
-			dir: dir.to_path_buf(),
-			max_slab_bytes: 1,
-			io,
-			l2: None,
-			rehydration: RehydrationPolicy::default(),
-			l2_column_fetch: Default::default(),
-			row_group_writer: Default::default(),
-			l2_row_group_fetch: Default::default(),
-			encoding_writer: Default::default(),
-			l2_chunk_layout: Default::default(),
-			l2_encoding_fetch: Default::default(),
-			encoding_compute: Default::default(),
-			group_commit: GroupCommitConfig::default(),
-			crypto: test_crypto(),
-		})
-		.await
-		.unwrap(),
-	)
+async fn repair_fixture_manager(
+	dir: &std::path::Path,
+	io: IoRingHandle,
+	initialize: bool,
+) -> Arc<SlabManager> {
+	let config = SlabManagerConfig {
+		dir: dir.to_path_buf(),
+		max_slab_bytes: 1,
+		io,
+		l2: None,
+		rehydration: RehydrationPolicy::default(),
+		l2_column_fetch: Default::default(),
+		row_group_writer: Default::default(),
+		l2_row_group_fetch: Default::default(),
+		encoding_writer: Default::default(),
+		l2_chunk_layout: Default::default(),
+		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
+		group_commit: GroupCommitConfig::default(),
+		crypto: test_crypto(),
+	};
+	if initialize {
+		SlabManager::initialize_new_store(config).await
+	} else {
+		SlabManager::open(config).await
+	}
+	.unwrap()
 }
 
 fn slab_files_on_disk(dir: &std::path::Path) -> Vec<(SlabId, u64)> {
@@ -14215,7 +14453,7 @@ fn slab_files_on_disk(dir: &std::path::Path) -> Vec<(SlabId, u64)> {
 async fn adr0084_repair_preserves_a_zero_length_active_slab() {
 	let dir = fresh_dir("repair-active");
 	let io = spawn_io_thread(16).unwrap();
-	let manager = repair_fixture_manager(&dir, io.clone()).await;
+	let manager = repair_fixture_manager(&dir, io.clone(), true).await;
 	for n in 0..4 {
 		manager
 			.append(tenant(), id(0x9000 + n), hlc(n + 1), b"row")
@@ -14246,9 +14484,9 @@ async fn adr0084_repair_preserves_a_zero_length_active_slab() {
 		"split_last promotes the highest id to active, so an empty highest slab must survive"
 	);
 
-	let reopened = repair_fixture_manager(&dir, io).await;
+	let reopened = repair_fixture_manager(&dir, io, false).await;
 	assert!(
-		reopened.lookup(tenant(), id(0x9000)).is_some(),
+		reopened.lookup(tenant(), id(0x9000)).unwrap().is_some(),
 		"a repaired profile still opens and keeps its rows"
 	);
 }
@@ -14257,7 +14495,7 @@ async fn adr0084_repair_preserves_a_zero_length_active_slab() {
 async fn adr0084_repair_refuses_an_empty_slab_the_index_still_references() {
 	let dir = fresh_dir("repair-referenced");
 	let io = spawn_io_thread(16).unwrap();
-	let manager = repair_fixture_manager(&dir, io.clone()).await;
+	let manager = repair_fixture_manager(&dir, io.clone(), true).await;
 	for n in 0..4 {
 		manager
 			.append(tenant(), id(0xa000 + n), hlc(n + 1), b"row")
@@ -14295,7 +14533,7 @@ async fn adr0084_repair_refuses_an_empty_slab_the_index_still_references() {
 async fn adr0084_repair_removes_unreferenced_empties_and_is_idempotent() {
 	let dir = fresh_dir("repair-idempotent");
 	let io = spawn_io_thread(16).unwrap();
-	let manager = repair_fixture_manager(&dir, io.clone()).await;
+	let manager = repair_fixture_manager(&dir, io.clone(), true).await;
 	manager
 		.append(tenant(), id(0xb000), hlc(1), b"row")
 		.await
@@ -14328,7 +14566,7 @@ async fn adr0084_repair_removes_unreferenced_empties_and_is_idempotent() {
 async fn adr0084_repair_refuses_without_a_durable_index() {
 	let dir = fresh_dir("repair-no-index");
 	let io = spawn_io_thread(16).unwrap();
-	let manager = repair_fixture_manager(&dir, io.clone()).await;
+	let manager = repair_fixture_manager(&dir, io.clone(), true).await;
 	manager
 		.append(tenant(), id(0xc000), hlc(1), b"row")
 		.await
@@ -14370,26 +14608,24 @@ async fn adr0084_repair_refuses_without_a_durable_index() {
 #[tokio::test]
 async fn adr0089_locality_intervals_yield_exactly_the_rows_inside_them() {
 	let dir = fresh_dir("adr0089-range-discoverability");
-	let manager = Arc::new(
-		SlabManager::open(SlabManagerConfig {
-			dir: dir.to_path_buf(),
-			max_slab_bytes: 1024 * 1024,
-			io: spawn_io_thread(64).unwrap(),
-			l2: None,
-			rehydration: RehydrationPolicy::default(),
-			l2_column_fetch: Default::default(),
-			row_group_writer: Default::default(),
-			l2_row_group_fetch: Default::default(),
-			encoding_writer: Default::default(),
-			l2_chunk_layout: Default::default(),
-			l2_encoding_fetch: Default::default(),
-			encoding_compute: Default::default(),
-			group_commit: GroupCommitConfig::default(),
-			crypto: test_crypto(),
-		})
-		.await
-		.unwrap(),
-	);
+	let manager = SlabManager::initialize_new_store(SlabManagerConfig {
+		dir: dir.to_path_buf(),
+		max_slab_bytes: 1024 * 1024,
+		io: spawn_io_thread(64).unwrap(),
+		l2: None,
+		rehydration: RehydrationPolicy::default(),
+		l2_column_fetch: Default::default(),
+		row_group_writer: Default::default(),
+		l2_row_group_fetch: Default::default(),
+		encoding_writer: Default::default(),
+		l2_chunk_layout: Default::default(),
+		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
+		group_commit: GroupCommitConfig::default(),
+		crypto: test_crypto(),
+	})
+	.await
+	.unwrap();
 
 	// A contiguous span of localities, the shape a packed record covers: one
 	// prefix, consecutive per-row suffixes.
@@ -14409,12 +14645,14 @@ async fn adr0089_locality_intervals_yield_exactly_the_rows_inside_them() {
 	}
 
 	let scan = |start: u64, end: u64| {
-		let hits = manager.scan_as_of_with_identity_and_locality(
-			tenant(),
-			Locality::new(start),
-			Locality::new(end),
-			hlc(20),
-		);
+		let hits = manager
+			.scan_as_of_with_identity_and_locality(
+				tenant(),
+				Locality::new(start),
+				Locality::new(end),
+				hlc(20),
+			)
+			.unwrap();
 		let mut localities: Vec<u64> = hits
 			.iter()
 			.map(|(_identity, locality, _location)| locality.get())
@@ -14559,7 +14797,7 @@ async fn adr0097_partial_survivor_frame_is_rewritten_before_installation() {
 	let dir = fresh_dir("adr0097-partial-survivor-rewrite");
 	let crypto = test_crypto();
 	let io = spawn_io_thread(64).unwrap();
-	let manager = open_manager_at_dir(dir.to_path_buf(), io, crypto).await;
+	let manager = initialize_manager_at_dir(dir.to_path_buf(), io, crypto).await;
 	let table = adr0097_colocated_table_descriptor_for_test();
 
 	// Slab A: one physical frame holding k1, k2, k3.
@@ -14643,11 +14881,14 @@ async fn adr0097_partial_survivor_frame_is_rewritten_before_installation() {
 	// The source is still readable: nothing is destroyed before installation.
 	for identity in [k1, k2, k3] {
 		assert!(
-			manager.lookup(tenant(), identity).is_some(),
+			manager.lookup(tenant(), identity).unwrap().is_some(),
 			"source rows stay addressable until installation commits"
 		);
 	}
-	let k1_location = manager.lookup(tenant(), k1).expect("k1 is indexed");
+	let k1_location = manager
+		.lookup(tenant(), k1)
+		.unwrap()
+		.expect("k1 is indexed");
 	assert_eq!(
 		k1_location.slab_id, slab_a,
 		"the index still points at the untouched source slab"
@@ -14727,7 +14968,8 @@ async fn adr0097_partial_survivor_frame_is_rewritten_before_installation() {
 	// Digest invariance: the visible domain the outputs publish must equal the
 	// visible domain the plan's survivors describe.
 	let digest_summary = manager
-		.lsm_single_row_bridge_digest_summary(&prepared, &written, &source_frames)
+		.lsm_single_row_bridge_digest_summary(&plan, &prepared, &written, &source_frames)
+		.await
 		.expect("the written outputs reproduce the planned visible domain");
 	assert_eq!(
 		digest_summary.visible_pre, digest_summary.visible_post,
@@ -14748,7 +14990,7 @@ async fn adr0097_rewritten_partial_survivor_frame_survives_install_and_reopen() 
 	let dir = fresh_dir("adr0097-partial-survivor-install");
 	let crypto = test_crypto();
 	let io = spawn_io_thread(64).unwrap();
-	let manager = open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	let manager = initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
 	let table = adr0097_colocated_table_descriptor_for_test();
 
 	let identities =
@@ -14801,6 +15043,7 @@ async fn adr0097_rewritten_partial_survivor_frame_survives_install_and_reopen() 
 	let before_rewrite = {
 		let location = manager
 			.lookup(tenant(), k1)
+			.unwrap()
 			.expect("k1 indexed pre-install");
 		let frame = manager
 			.read_with_reference_origin(location, PublishedReferenceOrigin::Compaction)
@@ -14817,7 +15060,8 @@ async fn adr0097_rewritten_partial_survivor_frame_survives_install_and_reopen() 
 	);
 
 	let digest_summary = manager
-		.lsm_single_row_bridge_digest_summary(&prepared, &written, &source_frames)
+		.lsm_single_row_bridge_digest_summary(&plan, &prepared, &written, &source_frames)
+		.await
 		.unwrap();
 	let commit = worker.build_written_compaction_commit(&plan, &written, digest_summary);
 	let installed_slabs = written.iter().map(|run| run.slab_id).collect::<Vec<_>>();
@@ -14833,6 +15077,7 @@ async fn adr0097_rewritten_partial_survivor_frame_survives_install_and_reopen() 
 	for identity in [k1, k3] {
 		let location = reopened
 			.lookup(tenant(), identity)
+			.unwrap()
 			.unwrap_or_else(|| panic!("row still resolves after reopen"));
 		assert!(
 			installed_slabs.contains(&location.slab_id),
@@ -14840,7 +15085,10 @@ async fn adr0097_rewritten_partial_survivor_frame_survives_install_and_reopen() 
 			location.slab_id
 		);
 	}
-	let k2_location = reopened.lookup(tenant(), k2).expect("k2 still resolves");
+	let k2_location = reopened
+		.lookup(tenant(), k2)
+		.unwrap()
+		.expect("k2 still resolves");
 	assert_eq!(
 		k2_location.hlc,
 		hlc(2_000),
@@ -14853,8 +15101,8 @@ async fn adr0097_rewritten_partial_survivor_frame_survives_install_and_reopen() 
 
 	// The rewritten frame recovered from disk holds exactly k1 and k3, densely
 	// numbered, with every per-row field intact.
-	let k1_location = reopened.lookup(tenant(), k1).unwrap();
-	let k3_location = reopened.lookup(tenant(), k3).unwrap();
+	let k1_location = reopened.lookup(tenant(), k1).unwrap().unwrap();
+	let k3_location = reopened.lookup(tenant(), k3).unwrap().unwrap();
 	assert_eq!(
 		(k1_location.slab_id, k1_location.offset),
 		(k3_location.slab_id, k3_location.offset),
@@ -15012,26 +15260,24 @@ async fn adr0090_compaction_preserves_partitioned_placement() {
 
 	let dir = fresh_dir("adr0090-compaction-placement");
 	let io = spawn_io_thread(64).unwrap();
-	let manager = Arc::new(
-		SlabManager::open(SlabManagerConfig {
-			dir: dir.to_path_buf(),
-			max_slab_bytes: 1024 * 1024,
-			io: io.clone(),
-			l2: None,
-			rehydration: RehydrationPolicy::default(),
-			l2_column_fetch: Default::default(),
-			row_group_writer: Default::default(),
-			l2_row_group_fetch: Default::default(),
-			encoding_writer: Default::default(),
-			l2_chunk_layout: Default::default(),
-			l2_encoding_fetch: Default::default(),
-			encoding_compute: Default::default(),
-			group_commit: GroupCommitConfig::default(),
-			crypto: test_crypto(),
-		})
-		.await
-		.unwrap(),
-	);
+	let manager = SlabManager::initialize_new_store(SlabManagerConfig {
+		dir: dir.to_path_buf(),
+		max_slab_bytes: 1024 * 1024,
+		io: io.clone(),
+		l2: None,
+		rehydration: RehydrationPolicy::default(),
+		l2_column_fetch: Default::default(),
+		row_group_writer: Default::default(),
+		l2_row_group_fetch: Default::default(),
+		encoding_writer: Default::default(),
+		l2_chunk_layout: Default::default(),
+		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
+		group_commit: GroupCommitConfig::default(),
+		crypto: test_crypto(),
+	})
+	.await
+	.unwrap();
 
 	// A partitioned multirow record plus an unrelated tombstoned row, sealed
 	// together so reclaim compacts the shared slab.
@@ -15066,7 +15312,7 @@ async fn adr0090_compaction_preserves_partitioned_placement() {
 		.append_durable_multirow_with_locality(tenant(), &encoded.frame, &entries)
 		.await
 		.unwrap();
-	let before = manager.lookup(tenant(), partitioned_key).unwrap();
+	let before = manager.lookup(tenant(), partitioned_key).unwrap().unwrap();
 	assert_eq!(before.placement, PlacementSemantics::Partitioned);
 	assert_eq!(before.partition, Some(partition));
 
@@ -15104,7 +15350,7 @@ async fn adr0090_compaction_preserves_partitioned_placement() {
 
 	// The partitioned row survived compaction at a NEW location, and its
 	// placement survived with it.
-	let after = manager.lookup(tenant(), partitioned_key).unwrap();
+	let after = manager.lookup(tenant(), partitioned_key).unwrap().unwrap();
 	assert_ne!(
 		(after.slab_id, after.offset),
 		(before.slab_id, before.offset),
@@ -15144,7 +15390,10 @@ async fn repro_drop_reclaim_keeps_pinned_slab_backing_readable() {
 		.await
 		.unwrap();
 
-	let location = mgr.lookup(tenant(), key).expect("target row location");
+	let location = mgr
+		.lookup(tenant(), key)
+		.unwrap()
+		.expect("target row location");
 	let pinned_slab = location.slab_id;
 	let sanity_read = mgr.read(location).await;
 	assert!(sanity_read.is_ok(), "pre-reclaim read must succeed");
@@ -15168,7 +15417,7 @@ async fn repro_drop_reclaim_keeps_pinned_slab_backing_readable() {
 	// unreachable from any table surface meanwhile.)
 	assert_eq!(report.compacted_slabs, 0, "pinned slab must be deferred");
 	assert_eq!(report.reclaimed_records, 0);
-	assert!(mgr.lookup(tenant(), key).is_some());
+	assert!(mgr.lookup(tenant(), key).unwrap().is_some());
 
 	// The discriminating assertion: while the compaction pin is held, the
 	// slab backing must remain readable at the pre-reclaim location.
@@ -15230,7 +15479,10 @@ async fn retention_prune_defers_pinned_slab_backing_until_release() {
 	mgr.append_durable_multirow_with_locality(tenant(), &frame, &entries)
 		.await
 		.unwrap();
-	let location = mgr.lookup(tenant(), old_key).expect("row location");
+	let location = mgr
+		.lookup(tenant(), old_key)
+		.unwrap()
+		.expect("row location");
 	let pinned_slab = force_seal_active(&mgr).await;
 	assert_eq!(pinned_slab, location.slab_id);
 
@@ -15269,7 +15521,7 @@ async fn retention_prune_defers_pinned_slab_backing_until_release() {
 		resumed.compacted_slabs, 1,
 		"retirement resumes after pin release"
 	);
-	assert!(mgr.lookup(tenant(), old_key).is_none());
+	assert!(mgr.lookup(tenant(), old_key).unwrap().is_none());
 }
 
 #[tokio::test]
@@ -15293,7 +15545,7 @@ async fn missing_compaction_source_read_records_compaction_origin() {
 	mgr.append_durable_multirow_with_locality(tenant(), &frame, &entries)
 		.await
 		.unwrap();
-	let location = mgr.lookup(tenant(), key).expect("row location");
+	let location = mgr.lookup(tenant(), key).unwrap().expect("row location");
 	let sealed_slab = force_seal_active(&mgr).await;
 	assert_eq!(sealed_slab, location.slab_id);
 	// Simulate the incident-class inconsistency: the backing vanishes while
@@ -15354,8 +15606,14 @@ async fn maintenance_rewrite_publishes_under_reader_pin_and_sweep_defers_disposa
 		.await
 		.unwrap();
 
-	let target_old = mgr.lookup(tenant(), target_key).expect("target location");
-	let other_old = mgr.lookup(tenant(), other_key).expect("survivor location");
+	let target_old = mgr
+		.lookup(tenant(), target_key)
+		.unwrap()
+		.expect("target location");
+	let other_old = mgr
+		.lookup(tenant(), other_key)
+		.unwrap()
+		.expect("survivor location");
 	let old_slab = other_old.slab_id;
 	assert_eq!(old_slab, target_old.slab_id, "co-resident fixture");
 
@@ -15379,7 +15637,10 @@ async fn maintenance_rewrite_publishes_under_reader_pin_and_sweep_defers_disposa
 	// index entry, its stale pre-D3 location via relocation forwarding, and
 	// the dropped row's old location at the byte level — the retained old
 	// backing.
-	let other_new = mgr.lookup(tenant(), other_key).expect("survivor relocated");
+	let other_new = mgr
+		.lookup(tenant(), other_key)
+		.unwrap()
+		.expect("survivor relocated");
 	assert_ne!(other_new.slab_id, old_slab);
 	assert_eq!(mgr.read(other_new).await.unwrap().len() > 0, true);
 	assert!(mgr.read(other_old).await.is_ok(), "stale location forwards");
@@ -15444,7 +15705,7 @@ async fn maintenance_publication_refuses_relocation_survivor_mismatch() {
 	mgr.append_durable_multirow_with_locality(tenant(), &frame, &entries)
 		.await
 		.unwrap();
-	let location = mgr.lookup(tenant(), key).expect("row location");
+	let location = mgr.lookup(tenant(), key).unwrap().expect("row location");
 	let old_slab = force_seal_active(&mgr).await;
 	assert_eq!(old_slab, location.slab_id);
 	// The test seal helper does not register an L0 run; use the same bridge
@@ -15571,31 +15832,32 @@ async fn maintenance_manifest_reapply_is_a_no_op() {
 async fn open_policed_manager(
 	dir: std::path::PathBuf,
 	io: crate::storage::io_uring::IoRingHandle,
+	initialize: bool,
 ) -> Arc<SlabManager> {
-	Arc::new(
-		SlabManager::open_with_maintenance_metrics(
-			SlabManagerConfig {
-				dir,
-				// Every append rotates, so five appends are five L0 runs.
-				max_slab_bytes: 1,
-				io,
-				l2: None,
-				rehydration: RehydrationPolicy::default(),
-				l2_column_fetch: Default::default(),
-				row_group_writer: Default::default(),
-				l2_row_group_fetch: Default::default(),
-				encoding_writer: Default::default(),
-				l2_chunk_layout: Default::default(),
-				l2_encoding_fetch: Default::default(),
-				encoding_compute: Default::default(),
-				group_commit: GroupCommitConfig::default(),
-				crypto: test_crypto(),
-			},
-			crate::metrics::isolated_for_test(),
-		)
-		.await
-		.unwrap(),
-	)
+	let config = SlabManagerConfig {
+		dir,
+		// Every append rotates, so five appends are five L0 runs.
+		max_slab_bytes: 1,
+		io,
+		l2: None,
+		rehydration: RehydrationPolicy::default(),
+		l2_column_fetch: Default::default(),
+		row_group_writer: Default::default(),
+		l2_row_group_fetch: Default::default(),
+		encoding_writer: Default::default(),
+		l2_chunk_layout: Default::default(),
+		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
+		group_commit: GroupCommitConfig::default(),
+		crypto: test_crypto(),
+	};
+	let metrics = crate::metrics::isolated_for_test();
+	if initialize {
+		SlabManager::initialize_new_store_with_maintenance_metrics(config, metrics).await
+	} else {
+		SlabManager::open_with_maintenance_metrics(config, metrics).await
+	}
+	.unwrap()
 }
 
 async fn l0_pressure(manager: &SlabManager) {
@@ -15612,7 +15874,7 @@ async fn l0_pressure(manager: &SlabManager) {
 async fn a_compaction_tick_is_policed_and_its_success_is_recorded() {
 	let dir = fresh_dir("adr0097-policed-tick");
 	let io = spawn_io_thread(16).unwrap();
-	let manager = open_policed_manager(dir.to_path_buf(), io).await;
+	let manager = open_policed_manager(dir.to_path_buf(), io, true).await;
 	let policy = manager.maintenance_policy();
 	assert!(policy.is_enabled(), "{:?}", policy.diagnostic());
 	l0_pressure(&manager).await;
@@ -15650,7 +15912,7 @@ async fn a_quarantined_plan_is_skipped_by_the_tick_until_requeued() {
 
 	// Learn which plan the picker chooses for this pressure.
 	let touched = {
-		let manager = open_policed_manager(dir.to_path_buf(), io.clone()).await;
+		let manager = open_policed_manager(dir.to_path_buf(), io.clone(), true).await;
 		l0_pressure(&manager).await;
 		let worker = LsmCompactionWorker::new(worker_config, manager.slab_pin_table()).unwrap();
 		manager
@@ -15683,7 +15945,7 @@ async fn a_quarantined_plan_is_skipped_by_the_tick_until_requeued() {
 			.unwrap();
 	}
 
-	let manager = open_policed_manager(dir.to_path_buf(), io).await;
+	let manager = open_policed_manager(dir.to_path_buf(), io, false).await;
 	let policy = manager.maintenance_policy();
 	assert!(policy.is_enabled(), "{:?}", policy.diagnostic());
 	assert_eq!(policy.report().quarantined().count(), 1);
@@ -15744,7 +16006,7 @@ async fn a_manager_with_unreadable_receipt_history_serves_but_admits_no_maintena
 	let dir = fresh_dir("adr0097-unreadable-history");
 	let io = spawn_io_thread(16).unwrap();
 	{
-		let manager = open_policed_manager(dir.to_path_buf(), io.clone()).await;
+		let manager = open_policed_manager(dir.to_path_buf(), io.clone(), true).await;
 		manager
 			.append(tenant(), id(0x9800), hlc(1), b"served")
 			.await
@@ -15762,7 +16024,7 @@ async fn a_manager_with_unreadable_receipt_history_serves_but_admits_no_maintena
 			.unwrap();
 	}
 
-	let manager = open_policed_manager(dir.to_path_buf(), io).await;
+	let manager = open_policed_manager(dir.to_path_buf(), io, false).await;
 	let policy = manager.maintenance_policy();
 	assert!(!policy.is_enabled());
 	assert!(
@@ -15775,6 +16037,7 @@ async fn a_manager_with_unreadable_receipt_history_serves_but_admits_no_maintena
 	// Serving is intact.
 	let location = manager
 		.lookup(tenant(), id(0x9800))
+		.unwrap()
 		.expect("the row is still indexed");
 	assert_eq!(manager.read(location).await.unwrap(), b"served");
 
@@ -15803,27 +16066,31 @@ async fn a_manager_with_unreadable_receipt_history_serves_but_admits_no_maintena
 async fn tombstone_reclaim_is_policed() {
 	let dir = fresh_dir("adr0097-policed-tombstone-reclaim");
 	let io = spawn_io_thread(64).unwrap();
-	let open = |dir: std::path::PathBuf, io: crate::storage::io_uring::IoRingHandle| async move {
-		Arc::new(
-			SlabManager::open(SlabManagerConfig {
-				dir: dir.to_path_buf(),
-				max_slab_bytes: 1024 * 1024,
-				io,
-				l2: None,
-				rehydration: RehydrationPolicy::default(),
-				l2_column_fetch: Default::default(),
-				row_group_writer: Default::default(),
-				l2_row_group_fetch: Default::default(),
-				encoding_writer: Default::default(),
-				l2_chunk_layout: Default::default(),
-				l2_encoding_fetch: Default::default(),
-				encoding_compute: Default::default(),
-				group_commit: GroupCommitConfig::default(),
-				crypto: test_crypto(),
-			})
-			.await
-			.unwrap(),
-		)
+	let open = |dir: std::path::PathBuf,
+	            io: crate::storage::io_uring::IoRingHandle,
+	            fresh: bool| async move {
+		let config = SlabManagerConfig {
+			dir: dir.to_path_buf(),
+			max_slab_bytes: 1024 * 1024,
+			io,
+			l2: None,
+			rehydration: RehydrationPolicy::default(),
+			l2_column_fetch: Default::default(),
+			row_group_writer: Default::default(),
+			l2_row_group_fetch: Default::default(),
+			encoding_writer: Default::default(),
+			l2_chunk_layout: Default::default(),
+			l2_encoding_fetch: Default::default(),
+			encoding_compute: Default::default(),
+			group_commit: GroupCommitConfig::default(),
+			crypto: test_crypto(),
+		};
+		if fresh {
+			SlabManager::initialize_new_store(config).await
+		} else {
+			SlabManager::open(config).await
+		}
+		.unwrap()
 	};
 	let removed_key = id(0x1010);
 	let survivor_key = id(0x2020);
@@ -15841,7 +16108,7 @@ async fn tombstone_reclaim_is_policed() {
 	};
 	let target = Locality::from(removed_key).get();
 
-	let manager = open(dir.to_path_buf(), io.clone()).await;
+	let manager = open(dir.to_path_buf(), io.clone(), true).await;
 	manager
 		.append_durable(tenant(), removed_key, hlc(10), b"drop-me")
 		.await
@@ -15864,23 +16131,23 @@ async fn tombstone_reclaim_is_policed() {
 		"a disabled policy admits no reclaim"
 	);
 	assert!(
-		manager.lookup(tenant(), removed_key).is_some(),
+		manager.lookup(tenant(), removed_key).unwrap().is_some(),
 		"the tombstoned row was not reclaimed around the policy"
 	);
 	drop(manager);
 
 	// Control arm: the same store, reopened, reclaims once the policy admits.
-	let reopened = open(dir.to_path_buf(), io).await;
+	let reopened = open(dir.to_path_buf(), io, false).await;
 	assert!(reopened.maintenance_policy().is_enabled());
 	let report = reopened
 		.reclaim_tombstoned_ranges(&[tombstone(target)], &schemas, &indexes, 1)
 		.await
 		.unwrap();
 	assert_eq!(report.compacted_slabs, 1);
-	assert!(reopened.lookup(tenant(), removed_key).is_none());
+	assert!(reopened.lookup(tenant(), removed_key).unwrap().is_none());
 	assert_eq!(
 		reopened
-			.read(reopened.lookup(tenant(), survivor_key).unwrap())
+			.read(reopened.lookup(tenant(), survivor_key).unwrap().unwrap())
 			.await
 			.unwrap(),
 		b"keep-me"
@@ -16136,7 +16403,7 @@ async fn durable_append_after_an_unwritten_reservation_survives_reopen() {
 	let dir = fresh_dir("adr0099-interior-hole");
 	let crypto = test_crypto();
 	let io = spawn_io_thread(64).unwrap();
-	let manager = open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	let manager = initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
 
 	// A: admitted and reserved, never written. Three pages wide so the hole
 	// is more than one probe page.
@@ -16163,6 +16430,7 @@ async fn durable_append_after_an_unwritten_reservation_survives_reopen() {
 	let reopened = open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
 	let recovered = reopened
 		.lookup(tenant(), key_b)
+		.unwrap()
 		.expect("a durably acknowledged record is recoverable past an interior hole");
 	assert_eq!(recovered, location_b);
 	assert_eq!(reopened.read(recovered).await.unwrap(), bytes_b);
@@ -16189,7 +16457,7 @@ async fn blob_recovery_resumes_only_at_acknowledged_offsets() {
 	let dir = fresh_dir("adr0099-blob-hole");
 	let crypto = test_crypto();
 	let io = spawn_io_thread(64).unwrap();
-	let manager = open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	let manager = initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
 	let page = crate::storage::io_uring::DIRECT_IO_ALIGN;
 
 	let before = manager
@@ -16238,13 +16506,14 @@ async fn blob_recovery_resumes_only_at_acknowledged_offsets() {
 /// record whose lost first page is zero and whose persisted payload page
 /// holds a byte-exact copy of another record. Fed straight to the sealed-bytes
 /// walk with the slab's real evidence, nothing is promoted: the copy's offset
-/// was never acknowledged. Without evidence the walk stops at the zero page.
+/// was never acknowledged, and the damaged outer record's acknowledged offset
+/// refuses the walk. Without evidence the walk stops at the zero page.
 #[tokio::test]
 async fn blob_recovery_does_not_promote_a_payload_page_after_a_lost_header_page() {
 	let dir = fresh_dir("adr0099-blob-embedded");
 	let crypto = test_crypto();
 	let io = spawn_io_thread(64).unwrap();
-	let manager = open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	let manager = initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
 	let page = crate::storage::io_uring::DIRECT_IO_ALIGN;
 	let inner = manager
 		.append_durable(tenant(), id(0x99F0), hlc(130), b"embedded-record")
@@ -16272,13 +16541,26 @@ async fn blob_recovery_does_not_promote_a_payload_page_after_a_lost_header_page(
 		.filter_map(|offset| offset.checked_sub(outer.offset))
 		.collect::<BTreeSet<_>>();
 	assert_eq!(shifted, BTreeSet::from([0]));
-	for acknowledged in [&shifted, &BTreeSet::new()] {
-		let recovered = recover_slab_entries_from_blob(&torn, outer.slab_id, acknowledged).unwrap();
-		assert!(
-			recovered.is_empty(),
-			"payload was promoted to a record: {recovered:?}"
-		);
-	}
+	// With the evidence the outer record's acknowledged offset is damaged, so
+	// the walk refuses naming it; nothing is promoted.
+	let error = recover_slab_entries_from_blob(&torn, outer.slab_id, &shifted)
+		.expect_err("a damaged acknowledged record refuses the walk");
+	assert_eq!(
+		error
+			.get_ref()
+			.and_then(
+				|inner| inner.downcast_ref::<crate::storage::core::DamagedAcknowledgedRecord>()
+			)
+			.map(|record| (record.slab_id, record.offset)),
+		Some((outer.slab_id, 0)),
+		"the refusal must name the damaged acknowledged record: {error}"
+	);
+	// Without evidence the walk stops at the zero page and promotes nothing.
+	let recovered = recover_slab_entries_from_blob(&torn, outer.slab_id, &BTreeSet::new()).unwrap();
+	assert!(
+		recovered.is_empty(),
+		"payload was promoted to a record: {recovered:?}"
+	);
 }
 
 /// ADR 0099 decision 2: zero pages at the end of the file are a trailing
@@ -16289,7 +16571,7 @@ async fn recovery_resumes_at_the_last_record_over_a_trailing_hole() {
 	let dir = fresh_dir("adr0099-trailing-hole");
 	let crypto = test_crypto();
 	let io = spawn_io_thread(64).unwrap();
-	let manager = open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	let manager = initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
 	let page = crate::storage::io_uring::DIRECT_IO_ALIGN as u64;
 
 	let last = manager
@@ -16308,7 +16590,7 @@ async fn recovery_resumes_at_the_last_record_over_a_trailing_hole() {
 	drop(file);
 
 	let reopened = open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
-	assert_eq!(reopened.lookup(tenant(), id(0x9920)), Some(last));
+	assert_eq!(reopened.lookup(tenant(), id(0x9920)).unwrap(), Some(last));
 	let next = reopened
 		.append_durable(tenant(), id(0x9921), hlc(121), b"next-record")
 		.await
@@ -16324,16 +16606,16 @@ async fn recovery_resumes_at_the_last_record_over_a_trailing_hole() {
 
 /// ADR 0099 decision 1, the case a zero-page skip alone gets wrong: a record
 /// whose payload carries a byte-exact copy of another record at its second
-/// page, whose first page did not persist. The copy validates by checksum,
-/// but its offset was never acknowledged, so recovery does not promote it;
-/// the torn record's region is zeroed and the original stays the only
-/// version of its key.
+/// page, whose first page did not persist. The crash came before its row
+/// committed, so neither it nor the copy was acknowledged. The copy validates
+/// by checksum, but recovery does not promote it; the torn record's region is
+/// zeroed and the original stays the only version of its key.
 #[tokio::test]
 async fn recovery_does_not_promote_a_payload_page_after_a_lost_header_page() {
 	let dir = fresh_dir("adr0099-embedded-record");
 	let crypto = test_crypto();
 	let io = spawn_io_thread(64).unwrap();
-	let manager = open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	let manager = initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
 	let page = crate::storage::io_uring::DIRECT_IO_ALIGN;
 
 	let inner_key = id(0x99F0);
@@ -16352,6 +16634,7 @@ async fn recovery_does_not_promote_a_payload_page_after_a_lost_header_page() {
 		.unwrap();
 	assert_eq!(outer.offset, page as u64);
 	drop(manager);
+	forget_durable_row(&dir, outer_key, outer).await;
 
 	// The outer record's first page is lost; its payload page persisted.
 	let path = slab_path(&dir, outer.slab_id);
@@ -16360,10 +16643,12 @@ async fn recovery_does_not_promote_a_payload_page_after_a_lost_header_page() {
 	drop(file);
 
 	let reopened = open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
-	assert_eq!(reopened.lookup(tenant(), inner_key), Some(inner));
-	assert_eq!(reopened.lookup(tenant(), outer_key), None);
+	assert_eq!(reopened.lookup(tenant(), inner_key).unwrap(), Some(inner));
+	assert_eq!(reopened.lookup(tenant(), outer_key).unwrap(), None);
 	assert_eq!(
-		reopened.lookup_as_of(tenant(), inner_key, hlc(130)),
+		reopened
+			.lookup_as_of(tenant(), inner_key, hlc(130))
+			.unwrap(),
 		Some(inner),
 		"the embedded copy was not promoted to a second version of the key"
 	);
@@ -16375,14 +16660,15 @@ async fn recovery_does_not_promote_a_payload_page_after_a_lost_header_page() {
 }
 
 /// ADR 0099 decision 1: a torn region with bytes in it, ahead of a record
-/// the node acknowledged, no longer ends the walk. The acknowledged record is
+/// the node acknowledged, no longer ends the walk. The torn record's row never
+/// committed, so it was never acknowledged. The acknowledged record is
 /// recovered, the torn region is zeroed, and appends resume past the record.
 #[tokio::test]
 async fn recovery_resumes_past_a_torn_region_at_the_next_acknowledged_record() {
 	let dir = fresh_dir("adr0099-torn-then-acked");
 	let crypto = test_crypto();
 	let io = spawn_io_thread(64).unwrap();
-	let manager = open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	let manager = initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
 	let page = crate::storage::io_uring::DIRECT_IO_ALIGN;
 
 	let torn_key = id(0x99A0);
@@ -16396,6 +16682,7 @@ async fn recovery_resumes_past_a_torn_region_at_the_next_acknowledged_record() {
 		.await
 		.unwrap();
 	drop(manager);
+	forget_durable_row(&dir, torn_key, torn).await;
 
 	// Corrupt the first record's magic without zeroing the page.
 	let path = slab_path(&dir, torn.slab_id);
@@ -16404,8 +16691,8 @@ async fn recovery_resumes_past_a_torn_region_at_the_next_acknowledged_record() {
 	drop(file);
 
 	let reopened = open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
-	assert_eq!(reopened.lookup(tenant(), torn_key), None);
-	assert_eq!(reopened.lookup(tenant(), acked_key), Some(acked));
+	assert_eq!(reopened.lookup(tenant(), torn_key).unwrap(), None);
+	assert_eq!(reopened.lookup(tenant(), acked_key).unwrap(), Some(acked));
 	assert_eq!(
 		reopened.read(acked).await.unwrap(),
 		b"acknowledged-after-torn".to_vec()
@@ -16424,15 +16711,12 @@ async fn recovery_resumes_past_a_torn_region_at_the_next_acknowledged_record() {
 	assert!(next.offset > acked.offset);
 }
 
-/// ADR 0099 decision 1 without an oracle: when the durable index cannot be
-/// opened, recovery has no evidence of boundaries and stops at the first
-/// anomaly, as it did before this record. This is the pre-record exposure,
-/// not a safe mode: the append is still acknowledged, and the warning at
-/// open that the index failed is the operator's signal.
+/// ADR 0099 without a boundary oracle still stops at the first anomaly.
+/// S4 fences manager admission when redb is unavailable, so create the
+/// forensic fixture through the local store and inspect recovery privately.
 #[tokio::test]
 async fn recovery_without_the_durable_index_stops_at_the_first_anomaly() {
 	let dir = fresh_dir("adr0099-no-oracle");
-	// Occupy the index path with a directory so redb cannot open it.
 	std::fs::create_dir_all(persistent_index_path(&dir)).unwrap();
 	let crypto = test_crypto();
 	let io = spawn_io_thread(64).unwrap();
@@ -16442,16 +16726,29 @@ async fn recovery_without_the_durable_index_stops_at_the_first_anomaly() {
 	let (slab, reservation) = manager.target_for_append(16, None).await.unwrap();
 	drop(reservation);
 	let key = id(0x99B0);
-	let after = manager
-		.append_durable(tenant(), key, hlc(150), b"after-the-hole")
+	let after = slab
+		.append(tenant(), key, hlc(150), b"after-the-hole")
 		.await
 		.unwrap();
+	slab.wait_durable_commit().await.unwrap();
 	assert_eq!(after.slab_id, slab.slab_id());
+	assert!(
+		manager
+			.append_durable(tenant(), id(0x99B1), hlc(151), b"refused")
+			.await
+			.is_err()
+	);
+	drop(slab);
 	drop(manager);
 
 	let reopened = open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	assert!(
+		reopened.lookup(tenant(), key).is_err(),
+		"public answers remain fenced"
+	);
+	let active = reopened.state.lock().await.active.clone();
 	assert_eq!(
-		reopened.lookup(tenant(), key),
+		active.lookup(tenant(), key).unwrap(),
 		None,
 		"without boundary evidence the walk stops at the hole"
 	);
@@ -16491,17 +16788,18 @@ async fn encrypted_slab_with_a_leading_hole_round_trips_with_evidence() {
 		mgr.config.crypto.as_ref(),
 		&pointer,
 		&encrypted.bytes,
-		&evidence,
+		TierObjectEvidence::Indexed(&evidence),
 	)
 	.expect("a freshly encrypted slab with an acknowledged record after a hole decodes");
-	assert_eq!(decoded, plaintext);
+	assert_eq!(decoded.bytes, plaintext);
 	let err = decode_tiered_blob(
 		mgr.config.crypto.as_ref(),
 		&pointer,
 		&encrypted.bytes,
-		&BTreeSet::new(),
+		TierObjectEvidence::Indexed(&BTreeSet::new()),
 	)
-	.unwrap_err();
+	.err()
+	.expect("decoding refuses");
 	assert!(
 		err.to_string().contains("committed records"),
 		"without evidence the leading hole ends the tenant walk: {err}"
@@ -16572,5 +16870,25775 @@ async fn pd22_corrupt_downgrade_survives_planning_and_real_backfill_repairs_load
 	assert_eq!(
 		manager.load_secondary_index_segment(&info).await.unwrap(),
 		Some(original)
+	);
+}
+
+// ------------------------------------------------------------------
+// Index continuity during relocation. An install relocates rows in the
+// in-memory indexes while lock-free readers (table scans, point reads,
+// the migration source scan, placement resolution) run. These controls
+// pause an install inside its index relocation and check, against exact
+// identity/value/version sets, that every reader sees each live key
+// exactly once.
+// ------------------------------------------------------------------
+
+/// What the lock-free readers returned while an install was paused.
+struct RelocationObservation {
+	scan: Vec<(Identity, Locality, RecordLocation)>,
+	lookups: HashMap<Identity, (Option<RecordLocation>, Option<RecordLocation>)>,
+	versions: Vec<(TenantId, Identity, Locality, RecordLocation)>,
+}
+
+fn observe_relocation_readers(mgr: &SlabManager, keys: &[Identity]) -> RelocationObservation {
+	RelocationObservation {
+		scan: mgr
+			.scan_as_of_with_identity_and_locality(
+				tenant(),
+				Locality::ZERO,
+				Locality::MAX,
+				zero_hlc(),
+			)
+			.unwrap(),
+		lookups: keys
+			.iter()
+			.map(|key| {
+				(
+					*key,
+					(
+						mgr.lookup(tenant(), *key).unwrap(),
+						mgr.lookup_as_of(tenant(), *key, hlc(1_000_000)).unwrap(),
+					),
+				)
+			})
+			.collect(),
+		versions: mgr
+			.scan_all_versions(Locality::ZERO, Locality::MAX, zero_hlc())
+			.unwrap(),
+	}
+}
+
+/// Per key: the HLCs of every indexed version, in chain order.
+fn version_hlcs_by_key(mgr: &SlabManager) -> HashMap<Identity, Vec<HybridTimestamp>> {
+	let mut out: HashMap<Identity, Vec<HybridTimestamp>> = HashMap::new();
+	for (_tenant, key, _locality, location) in mgr
+		.scan_all_versions(Locality::ZERO, Locality::MAX, zero_hlc())
+		.unwrap()
+	{
+		out.entry(key).or_default().push(location.hlc);
+	}
+	out
+}
+
+/// The newest value of every live key, read through a fresh lookup.
+async fn newest_values(mgr: &SlabManager, keys: &[Identity]) -> BTreeMap<Identity, Vec<u8>> {
+	let mut out = BTreeMap::new();
+	for key in keys {
+		let location = mgr
+			.lookup(tenant(), *key)
+			.unwrap()
+			.expect("live key indexed");
+		out.insert(*key, mgr.read(location).await.unwrap());
+	}
+	out
+}
+
+async fn values_at(
+	mgr: &SlabManager,
+	locations: impl IntoIterator<Item = (Identity, RecordLocation)>,
+) -> BTreeMap<Identity, Vec<u8>> {
+	let mut out = BTreeMap::new();
+	for (key, location) in locations {
+		let previous = out.insert(key, mgr.read(location).await.unwrap());
+		assert!(previous.is_none(), "key {key} returned more than once");
+	}
+	out
+}
+
+/// Run `install` while observing the readers at its index-relocation pause.
+async fn observe_paused_install<T>(
+	mgr: &SlabManager,
+	keys: &[Identity],
+	install: impl std::future::Future<Output = T>,
+) -> (T, RelocationObservation) {
+	let pause = mgr.pause_index_relocation_once();
+	let observe = async {
+		tokio::time::timeout(
+			std::time::Duration::from_secs(600),
+			pause.reached.notified(),
+		)
+		.await
+		.expect("premise: the install reached its index relocation");
+		let observed = observe_relocation_readers(mgr, keys);
+		pause.resume.notify_one();
+		observed
+	};
+	tokio::join!(install, observe)
+}
+
+/// Five sealed L0 slabs of single-row KV records, plus one key with a version
+/// in two different slabs. Returns every live key.
+async fn seed_lsm_relocation_fixture(mgr: &Arc<SlabManager>) -> Vec<Identity> {
+	let mut keys = Vec::new();
+	let multi_version_key = id(0xC0FF);
+	keys.push(multi_version_key);
+	for slab in 0..5_u64 {
+		for row in 0..3_u64 {
+			let key = id(0xC000 + slab * 16 + row);
+			keys.push(key);
+			mgr.append(
+				tenant(),
+				key,
+				hlc(100 + slab * 10 + row),
+				format!("lsm-row-{slab}-{row}").as_bytes(),
+			)
+			.await
+			.unwrap();
+		}
+		if slab == 0 || slab == 2 {
+			mgr.append(
+				tenant(),
+				multi_version_key,
+				hlc(105 + slab * 10),
+				format!("lsm-multi-version-{slab}").as_bytes(),
+			)
+			.await
+			.unwrap();
+		}
+		mgr.force_seal_active_for_test().await;
+	}
+	keys
+}
+
+/// One sealed slab holding a doomed KV row and several survivors; a
+/// migrated-range tombstone over the doomed row makes maintenance rewrite the
+/// slab with survivors. Returns (live keys, doomed key, tombstone).
+async fn seed_maintenance_relocation_fixture(
+	mgr: &Arc<SlabManager>,
+) -> (Vec<Identity>, Identity, MigratedRangeTombstone) {
+	let doomed = id(0xD000);
+	mgr.append(tenant(), doomed, hlc(10), b"doomed")
+		.await
+		.unwrap();
+	let mut keys = Vec::new();
+	for row in 1..=6_u64 {
+		let key = id(0xD000 + row);
+		keys.push(key);
+		mgr.append(
+			tenant(),
+			key,
+			hlc(10 + row),
+			format!("survivor-{row}").as_bytes(),
+		)
+		.await
+		.unwrap();
+	}
+	// A second version of one survivor in the same slab.
+	mgr.append(tenant(), keys[0], hlc(30), b"survivor-1-newer")
+		.await
+		.unwrap();
+	force_seal_active(mgr).await;
+	mgr.append(tenant(), id(0xDFFF), hlc(40), b"active-row")
+		.await
+		.unwrap();
+	keys.push(id(0xDFFF));
+	let target = Locality::from(doomed).get();
+	let tombstone = MigratedRangeTombstone {
+		migration_id: 1,
+		range_start: target,
+		range_end: target,
+		to_epoch: 2,
+		completed_by: NodeId {
+			id: 7,
+			_reserved: 0,
+		},
+		completed_at_hlc: hlc(1),
+		migration_hlc_floor: hlc(0),
+	};
+	(keys, doomed, tombstone)
+}
+
+async fn run_paused_lsm_install(
+	mgr: &Arc<SlabManager>,
+	keys: &[Identity],
+) -> RelocationObservation {
+	let worker = LsmCompactionWorker::new(LsmConfig::default(), mgr.slab_pin_table()).unwrap();
+	let (outcome, observed) =
+		observe_paused_install(mgr, keys, mgr.run_lsm_compaction_tick(&worker, hlc(20_000))).await;
+	let outcome = outcome
+		.unwrap()
+		.expect("premise: five L0 runs produce a compaction");
+	assert!(outcome.rows_out > 0, "premise: the install relocated rows");
+	observed
+}
+
+async fn run_paused_maintenance_install(
+	mgr: &Arc<SlabManager>,
+	keys: &[Identity],
+	tombstone: MigratedRangeTombstone,
+) -> RelocationObservation {
+	let (schemas, indexes) = empty_compaction_catalogs();
+	let tombstones = [tombstone];
+	let (report, observed) = observe_paused_install(
+		mgr,
+		keys,
+		mgr.reclaim_tombstoned_ranges(&tombstones, &schemas, &indexes, 1),
+	)
+	.await;
+	assert_eq!(
+		report.unwrap().compacted_slabs,
+		1,
+		"premise: the shared slab was rewritten with survivors"
+	);
+	observed
+}
+
+/// Every live key appears exactly once in the paused scan, with its newest
+/// value; `allowed_extra` keys may appear or not (their install drops them).
+async fn assert_scan_complete(
+	mgr: &SlabManager,
+	observed: &RelocationObservation,
+	expected: &BTreeMap<Identity, Vec<u8>>,
+	allowed_extra: &[Identity],
+) {
+	let scanned = observed
+		.scan
+		.iter()
+		.filter(|(key, _, _)| !allowed_extra.contains(key))
+		.map(|(key, _, location)| (*key, *location))
+		.collect::<Vec<_>>();
+	let values = values_at(mgr, scanned).await;
+	assert_eq!(
+		values.keys().copied().collect::<Vec<_>>(),
+		expected.keys().copied().collect::<Vec<_>>(),
+		"a table scan during index relocation must return every live row exactly once"
+	);
+	assert_eq!(
+		&values, expected,
+		"a table scan during index relocation must return each row's newest value"
+	);
+}
+
+#[tokio::test]
+async fn lsm_install_keeps_every_row_visible_to_table_scans() {
+	let (_dir, mgr) = fresh_manager().await;
+	let keys = seed_lsm_relocation_fixture(&mgr).await;
+	let expected = newest_values(&mgr, &keys).await;
+	let observed = run_paused_lsm_install(&mgr, &keys).await;
+	assert_eq!(
+		newest_values(&mgr, &keys).await,
+		expected,
+		"premise: the completed install preserves every row"
+	);
+	assert_scan_complete(&mgr, &observed, &expected, &[]).await;
+}
+
+#[tokio::test]
+async fn maintenance_rewrite_keeps_every_row_visible_to_table_scans() {
+	let (_dir, mgr) = fresh_manager().await;
+	let (keys, doomed, tombstone) = seed_maintenance_relocation_fixture(&mgr).await;
+	let expected = newest_values(&mgr, &keys).await;
+	let observed = run_paused_maintenance_install(&mgr, &keys, tombstone).await;
+	assert_eq!(
+		newest_values(&mgr, &keys).await,
+		expected,
+		"premise: the completed rewrite preserves every survivor"
+	);
+	assert!(
+		mgr.lookup(tenant(), doomed).unwrap().is_none(),
+		"premise: the tombstoned row was reclaimed"
+	);
+	assert_scan_complete(&mgr, &observed, &expected, &[doomed]).await;
+}
+
+async fn assert_point_reads_complete(
+	mgr: &SlabManager,
+	observed: &RelocationObservation,
+	expected: &BTreeMap<Identity, Vec<u8>>,
+) {
+	for (key, value) in expected {
+		let (latest, as_of) = observed.lookups[key];
+		let latest = latest.unwrap_or_else(|| {
+			panic!("lookup returned NOT FOUND for live key {key} during index relocation")
+		});
+		let as_of = as_of.unwrap_or_else(|| {
+			panic!("lookup_as_of returned NOT FOUND for live key {key} during index relocation")
+		});
+		assert_eq!(
+			&mgr.read(latest).await.unwrap(),
+			value,
+			"lookup value of {key}"
+		);
+		assert_eq!(
+			&mgr.read(as_of).await.unwrap(),
+			value,
+			"lookup_as_of value of {key}"
+		);
+	}
+}
+
+#[tokio::test]
+async fn point_reads_find_live_keys_during_lsm_install() {
+	let (_dir, mgr) = fresh_manager().await;
+	let keys = seed_lsm_relocation_fixture(&mgr).await;
+	let expected = newest_values(&mgr, &keys).await;
+	let observed = run_paused_lsm_install(&mgr, &keys).await;
+	assert_point_reads_complete(&mgr, &observed, &expected).await;
+}
+
+#[tokio::test]
+async fn point_reads_find_live_keys_during_maintenance_rewrite() {
+	let (_dir, mgr) = fresh_manager().await;
+	let (keys, _doomed, tombstone) = seed_maintenance_relocation_fixture(&mgr).await;
+	let expected = newest_values(&mgr, &keys).await;
+	let observed = run_paused_maintenance_install(&mgr, &keys, tombstone).await;
+	assert_point_reads_complete(&mgr, &observed, &expected).await;
+}
+
+/// Per key, the paused migration scan returns either the key's whole chain
+/// before the install or its whole chain after it: no version is missing and
+/// none is returned twice.
+fn assert_migration_scan_exact(
+	observed: &RelocationObservation,
+	before: &HashMap<Identity, Vec<HybridTimestamp>>,
+	after: &HashMap<Identity, Vec<HybridTimestamp>>,
+) {
+	let mut paused: HashMap<Identity, Vec<HybridTimestamp>> = HashMap::new();
+	for (tenant_id, key, _locality, location) in &observed.versions {
+		assert_eq!(*tenant_id, tenant());
+		paused.entry(*key).or_default().push(location.hlc);
+	}
+	let mut every_key = before
+		.keys()
+		.chain(after.keys())
+		.copied()
+		.collect::<Vec<_>>();
+	every_key.sort();
+	every_key.dedup();
+	for key in every_key {
+		let paused_hlcs = paused.remove(&key).unwrap_or_default();
+		let before_hlcs = before.get(&key).cloned().unwrap_or_default();
+		let after_hlcs = after.get(&key).cloned().unwrap_or_default();
+		assert!(
+			paused_hlcs == before_hlcs || paused_hlcs == after_hlcs,
+			"the migration scan must return each version of {key} exactly once during index \
+			 relocation: paused {paused_hlcs:?}, before {before_hlcs:?}, after {after_hlcs:?}"
+		);
+	}
+	assert!(paused.is_empty(), "migration scan invented keys {paused:?}");
+}
+
+#[tokio::test]
+async fn migration_scan_returns_each_version_once_during_lsm_install() {
+	let (_dir, mgr) = fresh_manager().await;
+	let keys = seed_lsm_relocation_fixture(&mgr).await;
+	let before = version_hlcs_by_key(&mgr);
+	let observed = run_paused_lsm_install(&mgr, &keys).await;
+	assert_migration_scan_exact(&observed, &before, &version_hlcs_by_key(&mgr));
+}
+
+#[tokio::test]
+async fn migration_scan_returns_each_version_once_during_maintenance_rewrite() {
+	let (_dir, mgr) = fresh_manager().await;
+	let (keys, _doomed, tombstone) = seed_maintenance_relocation_fixture(&mgr).await;
+	let before = version_hlcs_by_key(&mgr);
+	let observed = run_paused_maintenance_install(&mgr, &keys, tombstone).await;
+	assert_migration_scan_exact(&observed, &before, &version_hlcs_by_key(&mgr));
+}
+
+#[tokio::test]
+async fn last_version_removal_keeps_a_concurrent_append() {
+	let (_dir, mgr) = fresh_manager().await;
+	let key = id(0xE001);
+	let first = mgr
+		.append_durable(tenant(), key, hlc(10), b"first")
+		.await
+		.unwrap();
+	let pause = mgr.pause_before_empty_key_removal_once();
+	let remover = {
+		let mgr = mgr.clone();
+		std::thread::spawn(move || mgr.rollback_indexed_location(tenant(), key, first))
+	};
+	// The remover emptied the chain and is about to remove the key.
+	pause.reached.wait();
+	let appended = mgr
+		.append_durable(tenant(), key, hlc(20), b"second")
+		.await
+		.unwrap();
+	pause.resume.wait();
+	remover.join().unwrap();
+
+	assert_eq!(
+		mgr.lookup(tenant(), key).unwrap(),
+		Some(appended),
+		"removing the last old version must not erase a concurrently appended version"
+	);
+	assert_eq!(mgr.read(appended).await.unwrap(), b"second");
+	assert!(
+		mgr.scan_as_of_with_identity_and_locality(
+			tenant(),
+			Locality::ZERO,
+			Locality::MAX,
+			zero_hlc()
+		)
+		.unwrap()
+		.iter()
+		.any(|(scanned, _, location)| *scanned == key && *location == appended),
+		"the appended version must keep its locality membership"
+	);
+	assert_eq!(
+		mgr.routing_locality_for_existing_key(tenant(), key)
+			.unwrap(),
+		Some(Locality::from(key)),
+		"the appended version must keep its routing locality"
+	);
+}
+
+#[tokio::test]
+async fn index_relocation_preserves_partitioned_placement() {
+	use crate::schema::table::PlacementSemantics;
+
+	let (_dir, mgr) = fresh_manager().await;
+	let doomed = id(0xF010);
+	mgr.append_durable(tenant(), doomed, hlc(10), b"drop-me")
+		.await
+		.unwrap();
+	let partitioned_key = id(0xF020);
+	let partition = crate::schema::PartitionId::new(0x00AB_0000_0000_0000);
+	let batch = RecordBatch::try_new(
+		Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+		vec![Arc::new(arrow::array::Int64Array::from(vec![7_i64]))],
+	)
+	.unwrap();
+	let source = vec![crate::storage::multirow::MultiRowSourceRow {
+		source_row_index: 0,
+		key_identity: partitioned_key,
+		routing_locality: Locality::new(partition.get() | 0x1234),
+		row_hlc: hlc(20),
+		is_tombstone: false,
+		partition: Some(partition),
+		table_object_id: None,
+	}];
+	let encoded =
+		crate::storage::multirow::encode_multirow_from_survivors(&batch, &source).unwrap();
+	let entries = crate::storage::multirow::storage_index_entries_from_batch(
+		&crate::storage::multirow::decode_batch(&encoded.frame).unwrap(),
+	)
+	.unwrap();
+	mgr.append_durable_multirow_with_locality(tenant(), &encoded.frame, &entries)
+		.await
+		.unwrap();
+	let before = mgr.lookup(tenant(), partitioned_key).unwrap().unwrap();
+	assert_eq!(before.placement, PlacementSemantics::Partitioned);
+	force_seal_active(&mgr).await;
+	mgr.append_durable(tenant(), id(0xF030), hlc(30), b"active-row")
+		.await
+		.unwrap();
+
+	let target = Locality::from(doomed).get();
+	let tombstone = MigratedRangeTombstone {
+		migration_id: 1,
+		range_start: target,
+		range_end: target,
+		to_epoch: 2,
+		completed_by: NodeId {
+			id: 7,
+			_reserved: 0,
+		},
+		completed_at_hlc: hlc(1),
+		migration_hlc_floor: hlc(0),
+	};
+	let pause = mgr.pause_index_relocation_once();
+	let (schemas, indexes) = empty_compaction_catalogs();
+	let tombstones = [tombstone];
+	let observe = async {
+		tokio::time::timeout(
+			std::time::Duration::from_secs(600),
+			pause.reached.notified(),
+		)
+		.await
+		.expect("premise: the rewrite reached its index relocation");
+		let observed = (
+			mgr.lookup(tenant(), partitioned_key).unwrap(),
+			mgr.version_placement_at(tenant(), partitioned_key, hlc(20))
+				.unwrap(),
+		);
+		pause.resume.notify_one();
+		observed
+	};
+	let (report, (paused_lookup, paused_placement)) = tokio::join!(
+		mgr.reclaim_tombstoned_ranges(&tombstones, &schemas, &indexes, 1),
+		observe
+	);
+	assert_eq!(report.unwrap().compacted_slabs, 1, "premise: rewrite ran");
+	let after = mgr.lookup(tenant(), partitioned_key).unwrap().unwrap();
+	assert_ne!(
+		(after.slab_id, after.offset),
+		(before.slab_id, before.offset),
+		"premise: the rewrite relocated the row"
+	);
+	assert_eq!(
+		(after.placement, after.partition),
+		(PlacementSemantics::Partitioned, Some(partition))
+	);
+	let paused_lookup = paused_lookup
+		.expect("the partitioned row must stay visible to point reads during index relocation");
+	assert_eq!(
+		(paused_lookup.placement, paused_lookup.partition),
+		(PlacementSemantics::Partitioned, Some(partition)),
+		"relocation must not downgrade placement, even transiently"
+	);
+	assert_eq!(
+		paused_placement,
+		Some((PlacementSemantics::Partitioned, Some(partition))),
+		"the key chain must remain the placement authority during index relocation"
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn last_version_removal_keeps_an_append_made_after_the_key_removal() {
+	let (_dir, mgr) = fresh_manager().await;
+	let key = id(0xE101);
+	let first = mgr
+		.append_durable(tenant(), key, hlc(10), b"first")
+		.await
+		.unwrap();
+	let pause = mgr.pause_after_empty_key_removal_once();
+	let remover = {
+		let mgr = mgr.clone();
+		std::thread::spawn(move || mgr.rollback_indexed_location(tenant(), key, first))
+	};
+	// The remover has removed the empty key and not yet removed its locality.
+	pause.reached.wait();
+	let mut append = tokio::spawn({
+		let mgr = mgr.clone();
+		async move { mgr.append_durable(tenant(), key, hlc(20), b"second").await }
+	});
+	let appended = match tokio::time::timeout(std::time::Duration::from_secs(3), &mut append).await
+	{
+		// The append completed inside the window.
+		Ok(joined) => {
+			pause.resume.wait();
+			joined.unwrap().unwrap()
+		}
+		// The append is waiting for the remover's locality critical section; it
+		// must already have created its chain, i.e. it inserted after the
+		// removal and while the remover still holds the locality lock.
+		Err(_) => {
+			let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+			while !mgr.key_index.contains_key(&(tenant(), key)) {
+				assert!(
+					std::time::Instant::now() < deadline,
+					"premise: the append inserted its chain while the remover was paused"
+				);
+				std::thread::yield_now();
+			}
+			pause.resume.wait();
+			append.await.unwrap().unwrap()
+		}
+	};
+	remover.join().unwrap();
+
+	assert_eq!(
+		mgr.lookup(tenant(), key).unwrap(),
+		Some(appended),
+		"the appended version must stay indexed"
+	);
+	assert!(
+		mgr.scan_as_of_with_identity_and_locality(
+			tenant(),
+			Locality::ZERO,
+			Locality::MAX,
+			zero_hlc()
+		)
+		.unwrap()
+		.iter()
+		.any(|(scanned, _, location)| *scanned == key && *location == appended),
+		"removing the old key's locality must not remove the appended version's membership"
+	);
+	assert_eq!(
+		mgr.routing_locality_for_existing_key(tenant(), key)
+			.unwrap(),
+		Some(Locality::from(key)),
+		"removing the old key's locality must not remove the appended version's routing locality"
+	);
+}
+
+#[tokio::test]
+async fn table_spread_routing_locality_survives_index_relocation() {
+	let (_dir, mgr) = fresh_manager().await;
+	let doomed = id(0xA000);
+	mgr.append_durable(tenant(), doomed, hlc(10), b"doomed")
+		.await
+		.unwrap();
+	let rows = [
+		(
+			id(0xA001),
+			Locality::new(0x5150_0000_0000_0001),
+			hlc(20),
+			1_u64,
+		),
+		(
+			id(0xA002),
+			Locality::new(0x5150_0000_0000_0002),
+			hlc(21),
+			2_u64,
+		),
+		(
+			id(0xA003),
+			Locality::new(0x0000_0000_0000_0003),
+			hlc(22),
+			3_u64,
+		),
+	];
+	for (key, locality, _, _) in &rows {
+		assert_ne!(
+			*locality,
+			Locality::from(*key),
+			"premise: routing locality differs from the identity projection"
+		);
+	}
+	let frame = encode_test_multirow_storage_frame(&rows);
+	let entries = storage_multirow_index_entries_from_frame(&frame)
+		.unwrap()
+		.expect("multi-row entries");
+	mgr.append_durable_multirow_with_locality(tenant(), &frame, &entries)
+		.await
+		.unwrap();
+	force_seal_active(&mgr).await;
+	let before = rows
+		.iter()
+		.map(|(key, _, _, _)| (*key, mgr.lookup(tenant(), *key).unwrap().expect("indexed")))
+		.collect::<BTreeMap<_, _>>();
+
+	let target = Locality::from(doomed).get();
+	let tombstone = MigratedRangeTombstone {
+		migration_id: 1,
+		range_start: target,
+		range_end: target,
+		to_epoch: 2,
+		completed_by: NodeId {
+			id: 7,
+			_reserved: 0,
+		},
+		completed_at_hlc: hlc(1),
+		migration_hlc_floor: hlc(0),
+	};
+	let pause = mgr.pause_index_relocation_once();
+	let (schemas, indexes) = empty_compaction_catalogs();
+	let tombstones = [tombstone];
+	let observe = async {
+		tokio::time::timeout(
+			std::time::Duration::from_secs(600),
+			pause.reached.notified(),
+		)
+		.await
+		.expect("premise: the rewrite reached its index relocation");
+		let observed = rows
+			.iter()
+			.map(|(key, locality, _, _)| {
+				(
+					*key,
+					(
+						mgr.scan_as_of_with_identity_and_locality(
+							tenant(),
+							*locality,
+							*locality,
+							zero_hlc(),
+						)
+						.unwrap(),
+						mgr.routing_locality_for_existing_key(tenant(), *key)
+							.unwrap(),
+					),
+				)
+			})
+			.collect::<BTreeMap<_, _>>();
+		pause.resume.notify_one();
+		observed
+	};
+	let (report, observed) = tokio::join!(
+		mgr.reclaim_tombstoned_ranges(&tombstones, &schemas, &indexes, 1),
+		observe
+	);
+	assert_eq!(report.unwrap().compacted_slabs, 1, "premise: rewrite ran");
+	for (key, locality, _, _) in &rows {
+		let after = mgr
+			.lookup(tenant(), *key)
+			.unwrap()
+			.expect("survivor indexed");
+		assert_ne!(
+			(after.slab_id, after.offset),
+			(before[key].slab_id, before[key].offset),
+			"premise: the rewrite relocated {key}"
+		);
+		assert_eq!(
+			mgr.routing_locality_for_existing_key(tenant(), *key)
+				.unwrap(),
+			Some(*locality),
+			"premise: the routing locality of {key} survives the completed rewrite"
+		);
+	}
+	for (key, locality, _, _) in &rows {
+		let (window, routing) = &observed[key];
+		assert_eq!(
+			window
+				.iter()
+				.filter(
+					|(scanned, scanned_locality, _)| scanned == key && scanned_locality == locality
+				)
+				.count(),
+			1,
+			"a scan of {key}'s own locality window must find it exactly once during relocation"
+		);
+		assert_eq!(
+			*routing,
+			Some(*locality),
+			"the routing locality of {key} must survive relocation, even transiently"
+		);
+	}
+}
+
+/// The value column (column 0) of the row a location names, read from its frame.
+async fn row_value_at(mgr: &SlabManager, location: RecordLocation) -> i128 {
+	let bytes = mgr.read(location).await.unwrap();
+	let batch = decode_record_batch(&bytes).unwrap();
+	let row = location.record_row_index.get() as usize;
+	let column = batch.column(0);
+	if let Some(values) = column.as_any().downcast_ref::<UInt64Array>() {
+		i128::from(values.value(row))
+	} else if let Some(values) = column.as_any().downcast_ref::<Int64Array>() {
+		i128::from(values.value(row))
+	} else {
+		panic!("unexpected value column type {:?}", column.data_type());
+	}
+}
+
+struct TierRefreshFixture {
+	_dirs: [crate::test_support::TestDir; 2],
+	mgr: Arc<SlabManager>,
+	slab_id: SlabId,
+	rewritten: TieredSlabPointer,
+	/// Live keys with their routing locality.
+	live: BTreeMap<Identity, Locality>,
+	/// The key whose every version the rewrite prunes.
+	pruned: Identity,
+	/// Newest row value per live key, read before the rewrite was prepared
+	/// (preparing a rewrite currently makes the published tiered slab
+	/// unreadable until the new pointer is applied; registered separately).
+	expected_values: BTreeMap<Identity, i128>,
+	/// Version HLCs per key before the refresh.
+	before: HashMap<Identity, Vec<HybridTimestamp>>,
+	/// Newest location of each live key, captured before the publication.
+	before_newest: BTreeMap<Identity, RecordLocation>,
+	/// Locations of pruned versions, captured before the publication.
+	pruned_locations: Vec<(Identity, RecordLocation)>,
+}
+
+/// One tiered slab: a leading frame of survivors, a key with a pruned older
+/// version, a key whose value and tombstone are both pruned, and a
+/// partitioned key with two surviving versions. Every routing locality differs
+/// from the identity projection. Returns the manager after tiering, with the
+/// retention-rewritten pointer uploaded but not applied.
+async fn seed_tier_refresh_fixture(tag: &str) -> TierRefreshFixture {
+	let (dirs, mgr, l2) = fresh_manager_with_l2(tag).await;
+	let key_b = id(0xB701);
+	let key_c = id(0xB702);
+	let key_a = id(0xB703);
+	let key_e = id(0xB704);
+	let key_d = id(0xB705);
+	let loc_b = Locality::new(0x7100_0000_0000_0001);
+	let loc_c = Locality::new(0x7100_0000_0000_0002);
+	let loc_a = Locality::new(0x7100_0000_0000_0003);
+	let loc_e = Locality::new(0x7100_0000_0000_0004);
+	let pruned_table = TableObjectId::new([0xB7; 16]);
+	let partition = crate::schema::PartitionId::new(0x00CD_0000_0000_0000);
+	let loc_d = Locality::new(partition.get() | 0x0005);
+	let frames = [
+		encode_test_multirow_storage_frame(&[
+			(key_b, loc_b, hlc(60), 200),
+			(key_c, loc_c, hlc(61), 300),
+		]),
+		encode_test_multirow_storage_frame(&[(key_a, loc_a, hlc(10), 100)]),
+		encode_test_multirow_storage_frame(&[(key_a, loc_a, hlc(40), 101)]),
+		encode_test_append_only_storage_frame(pruned_table, &[(key_e, loc_e, hlc(12), 500, false)]),
+	];
+	for frame in &frames {
+		let entries = storage_multirow_index_entries_from_frame(frame)
+			.unwrap()
+			.expect("multi-row entries");
+		mgr.append_durable_multirow_with_locality(tenant(), frame, &entries)
+			.await
+			.unwrap();
+	}
+	let (tombstone_frame, tombstone_entries) =
+		encode_test_row_tombstone_marker_frame(pruned_table, key_e, loc_e, hlc(22));
+	mgr.append_durable_multirow_with_locality(tenant(), &tombstone_frame, &tombstone_entries)
+		.await
+		.unwrap();
+	for (row_hlc, value) in [(hlc(70), 7_i64), (hlc(80), 8_i64)] {
+		let batch = RecordBatch::try_new(
+			Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+			vec![Arc::new(arrow::array::Int64Array::from(vec![value]))],
+		)
+		.unwrap();
+		let source = vec![crate::storage::multirow::MultiRowSourceRow {
+			source_row_index: 0,
+			key_identity: key_d,
+			routing_locality: loc_d,
+			row_hlc,
+			is_tombstone: false,
+			partition: Some(partition),
+			table_object_id: None,
+		}];
+		let encoded =
+			crate::storage::multirow::encode_multirow_from_survivors(&batch, &source).unwrap();
+		let entries = crate::storage::multirow::storage_index_entries_from_batch(
+			&crate::storage::multirow::decode_batch(&encoded.frame).unwrap(),
+		)
+		.unwrap();
+		mgr.append_durable_multirow_with_locality(tenant(), &encoded.frame, &entries)
+			.await
+			.unwrap();
+	}
+	let slab_id = force_seal_active(&mgr).await;
+	let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
+	let old_encrypted = mgr.encrypt_tiered_object_blob(slab_id, &raw).unwrap();
+	let old_uri = l2
+		.put(
+			&format!("tier/slab_{slab_id:016x}.wnd"),
+			&old_encrypted.bytes,
+		)
+		.await
+		.unwrap();
+	let old_footer = mgr
+		.encrypted_tiered_footer_summary(&old_encrypted.bytes)
+		.unwrap()
+		.expect("premise: the tiered blob has an encrypted footer");
+	let old_pointer = TieredSlabPointer {
+		slab_id,
+		l2_uri: old_uri,
+		payload_hash: crate::hash::content::digest(&old_encrypted.bytes),
+		is_encrypted: true,
+		tenant_id: Some(old_footer.tenant_id),
+		tenant_kek_id: Some(old_footer.tenant_kek_id),
+		stats_format_version: old_footer
+			.stats_locator
+			.map(|locator| locator.stats_format_version),
+		stats_block_len: old_footer
+			.stats_locator
+			.map(|locator| locator.stats_block_len),
+		stats_block_hash128: old_footer
+			.stats_locator
+			.map(|locator| locator.stats_block_hash128),
+		tombstone_metadata: TombstoneMetadata::None,
+		supersession_metadata: SupersessionMetadata::None,
+	};
+	mgr.apply_tier_slab(old_pointer.clone()).await.unwrap();
+	let live = BTreeMap::from([
+		(key_a, loc_a),
+		(key_b, loc_b),
+		(key_c, loc_c),
+		(key_d, loc_d),
+	]);
+	let expected_values = newest_row_values(&mgr, live.keys().copied()).await;
+	let before = version_hlcs_by_key(&mgr);
+	let before_newest = live
+		.keys()
+		.map(|key| {
+			(
+				*key,
+				mgr.lookup(tenant(), *key)
+					.unwrap()
+					.expect("live key indexed"),
+			)
+		})
+		.collect::<BTreeMap<_, _>>();
+	let pruned_locations = vec![
+		(
+			key_a,
+			mgr.lookup_as_of(tenant(), key_a, hlc(15))
+				.unwrap()
+				.expect("premise: a@10 is indexed"),
+		),
+		(
+			key_e,
+			mgr.lookup_as_of(tenant(), key_e, hlc(15))
+				.unwrap()
+				.expect("premise: e@12 is indexed"),
+		),
+	];
+	let prepared = mgr
+		.prepare_tiered_retention_rewrite(&old_pointer, hlc(50), &TableSchemaCatalog::default())
+		.await
+		.unwrap()
+		.expect("premise: a retention rewrite");
+	let PreparedTieredRetentionRewrite::Rewrite {
+		encrypted_bytes,
+		payload_hash,
+		tombstone_metadata,
+		supersession_metadata,
+		..
+	} = prepared
+	else {
+		panic!("premise: a rewrite with survivors, not a retirement");
+	};
+	let footer = mgr
+		.encrypted_tiered_footer_summary(&encrypted_bytes)
+		.unwrap()
+		.expect("premise: the rewrite produced an encrypted footer");
+	let rewritten_uri = l2
+		.put(
+			&format!("tier/slab_{slab_id:016x}-rewritten.wnd"),
+			&encrypted_bytes,
+		)
+		.await
+		.unwrap();
+	let rewritten = TieredSlabPointer {
+		slab_id,
+		l2_uri: rewritten_uri,
+		payload_hash,
+		is_encrypted: true,
+		tenant_id: Some(footer.tenant_id),
+		tenant_kek_id: Some(footer.tenant_kek_id),
+		stats_format_version: footer
+			.stats_locator
+			.map(|locator| locator.stats_format_version),
+		stats_block_len: footer.stats_locator.map(|locator| locator.stats_block_len),
+		stats_block_hash128: footer
+			.stats_locator
+			.map(|locator| locator.stats_block_hash128),
+		tombstone_metadata,
+		supersession_metadata,
+	};
+	TierRefreshFixture {
+		_dirs: dirs,
+		mgr,
+		slab_id,
+		rewritten,
+		live,
+		pruned: key_e,
+		expected_values,
+		before,
+		before_newest,
+		pruned_locations,
+	}
+}
+
+async fn newest_row_values(
+	mgr: &SlabManager,
+	keys: impl IntoIterator<Item = Identity>,
+) -> BTreeMap<Identity, i128> {
+	let mut out = BTreeMap::new();
+	for key in keys {
+		let location = mgr
+			.lookup(tenant(), key)
+			.unwrap()
+			.expect("live key indexed");
+		out.insert(key, row_value_at(mgr, location).await);
+	}
+	out
+}
+
+/// Every live key appears exactly once in the paused scan, with its newest
+/// row value and its own routing locality; point reads find it; the
+/// migration scan returns each version once.
+async fn assert_tier_refresh_observation(
+	fixture: &TierRefreshFixture,
+	observed: &RelocationObservation,
+	expected_values: &BTreeMap<Identity, i128>,
+	before: &HashMap<Identity, Vec<HybridTimestamp>>,
+) {
+	let mgr = &fixture.mgr;
+	let mut scanned = BTreeMap::new();
+	for (key, locality, location) in &observed.scan {
+		if *key == fixture.pruned {
+			continue;
+		}
+		assert_eq!(
+			Some(locality),
+			fixture.live.get(key),
+			"scan reported a wrong routing locality for {key}"
+		);
+		let previous = scanned.insert(*key, row_value_at(mgr, *location).await);
+		assert!(previous.is_none(), "scan returned {key} twice");
+	}
+	assert_eq!(
+		&scanned, expected_values,
+		"a scan during tier row refresh must return every live row once with its newest value"
+	);
+	for (key, value) in expected_values {
+		let (latest, as_of) = observed.lookups[key];
+		let latest = latest.unwrap_or_else(|| {
+			panic!("lookup NOT FOUND for live key {key} during tier row refresh")
+		});
+		let as_of = as_of.unwrap_or_else(|| {
+			panic!("lookup_as_of NOT FOUND for live key {key} during tier row refresh")
+		});
+		assert_eq!(row_value_at(mgr, latest).await, *value);
+		assert_eq!(row_value_at(mgr, as_of).await, *value);
+	}
+	assert_migration_scan_exact(observed, before, &version_hlcs_by_key(mgr));
+}
+
+#[tokio::test]
+async fn tier_row_refresh_keeps_every_row_visible_with_versions_and_locality() {
+	use crate::schema::table::PlacementSemantics;
+
+	let fixture = seed_tier_refresh_fixture("tier-refresh-continuity").await;
+	let mgr = &fixture.mgr;
+	let keys = fixture
+		.live
+		.keys()
+		.copied()
+		.chain([fixture.pruned])
+		.collect::<Vec<_>>();
+	let expected_values = fixture.expected_values.clone();
+	let before = fixture.before.clone();
+	let (applied, observed) = observe_paused_install(
+		mgr,
+		&keys,
+		mgr.apply_tier_slab_committed(fixture.rewritten.clone(), None),
+	)
+	.await;
+	applied.unwrap();
+
+	let after = version_hlcs_by_key(mgr);
+	assert!(
+		!after.contains_key(&fixture.pruned),
+		"premise: the rewrite pruned every version of the pruned key"
+	);
+	let key_d = id(0xB705);
+	assert_eq!(
+		after[&key_d],
+		vec![hlc(70), hlc(80)],
+		"premise: the partitioned key keeps both versions"
+	);
+	assert_eq!(
+		newest_row_values(mgr, fixture.live.keys().copied()).await,
+		expected_values,
+		"premise: the completed refresh preserves every live row"
+	);
+	let latest_d = mgr.lookup(tenant(), key_d).unwrap().unwrap();
+	assert_eq!(latest_d.placement, PlacementSemantics::Partitioned);
+	assert_tier_refresh_observation(&fixture, &observed, &expected_values, &before).await;
+}
+
+#[tokio::test]
+async fn stale_tier_row_refresh_does_not_resurrect_a_retired_slab() {
+	let fixture = seed_tier_refresh_fixture("tier-refresh-stale").await;
+	let mgr = &fixture.mgr;
+	let plan = mgr
+		.build_tiered_row_refresh_plan_from_l2(&fixture.rewritten)
+		.await
+		.unwrap();
+	assert!(
+		!plan.new_rows.is_empty(),
+		"premise: the refresh plan would publish rows"
+	);
+	assert!(
+		mgr.retire_tiered_slab_committed(fixture.slab_id, None)
+			.await
+			.unwrap(),
+		"premise: the slab was retired"
+	);
+	assert!(
+		!mgr.has_rows_for_slab(fixture.slab_id),
+		"premise: retirement removed every row"
+	);
+	mgr.apply_tiered_row_refresh_plan(plan).await;
+
+	assert!(
+		!mgr.has_rows_for_slab(fixture.slab_id),
+		"a refresh planned before the retirement must not re-index the retired slab's rows"
+	);
+	for key in fixture.live.keys().chain([&fixture.pruned]) {
+		assert_eq!(
+			mgr.lookup(tenant(), *key).unwrap(),
+			None,
+			"{key} lived only in the retired slab and must stay absent"
+		);
+		assert_eq!(
+			mgr.routing_locality_for_existing_key(tenant(), *key)
+				.unwrap(),
+			None,
+			"a stale refresh must not republish {key}'s locality"
+		);
+	}
+	assert!(
+		mgr.table_references_by_slab.get(&fixture.slab_id).is_none(),
+		"a stale refresh must not publish table references for the retired slab"
+	);
+}
+
+/// The indexed state the relocation owns, for an exact before/after comparison.
+fn index_state_snapshot(
+	mgr: &SlabManager,
+) -> (
+	BTreeMap<Identity, Vec<RecordLocation>>,
+	BTreeMap<Identity, Locality>,
+	usize,
+) {
+	let chains = mgr
+		.key_index
+		.iter()
+		.map(|entry| (entry.key().1, entry.value().clone()))
+		.collect();
+	let localities = mgr
+		.key_localities
+		.iter()
+		.map(|entry| (entry.key().1, *entry.value()))
+		.collect();
+	(chains, localities, mgr.table_by_location.len())
+}
+
+#[tokio::test]
+async fn repeated_tier_row_refresh_is_idempotent_and_keeps_rows_visible() {
+	let fixture = seed_tier_refresh_fixture("tier-refresh-repeat").await;
+	let mgr = &fixture.mgr;
+	let keys = fixture
+		.live
+		.keys()
+		.copied()
+		.chain([fixture.pruned])
+		.collect::<Vec<_>>();
+	let plan = mgr
+		.build_tiered_row_refresh_plan_from_l2(&fixture.rewritten)
+		.await
+		.unwrap();
+	let repeat = TieredRowRefreshPlan {
+		pointer: plan.pointer.clone(),
+		old_rows: plan.old_rows.clone(),
+		new_rows: plan.new_rows.clone(),
+		relocated_reads: plan.relocated_reads.clone(),
+	};
+	drop(plan);
+	// The authorized refresh: installs the rewritten pointer and applies the
+	// same plan once.
+	mgr.apply_tier_slab_committed(fixture.rewritten.clone(), None)
+		.await
+		.unwrap();
+	let once = index_state_snapshot(mgr);
+	assert_eq!(
+		newest_row_values(mgr, fixture.live.keys().copied()).await,
+		fixture.expected_values,
+		"premise: the first refresh preserves every live row"
+	);
+	let expected_values = fixture.expected_values.clone();
+	let before = version_hlcs_by_key(mgr);
+
+	let ((), observed) =
+		observe_paused_install(mgr, &keys, mgr.apply_tiered_row_refresh_plan(repeat)).await;
+	assert_eq!(
+		index_state_snapshot(mgr),
+		once,
+		"re-applying the same refresh must leave chains, localities and references unchanged"
+	);
+	assert_tier_refresh_observation(&fixture, &observed, &expected_values, &before).await;
+}
+
+// ------------------------------------------------------------------
+// Tier read coherence. A read resolves a location, then selects the
+// slab's backing. A tier publication changes both the slab's layout
+// (redirects) and its backing (pointer). Whatever the interleaving, a
+// read must return the requested row or a typed refusal, never another
+// row's bytes.
+// ------------------------------------------------------------------
+
+/// The (identity, value) of row `row` in a storage frame.
+fn frame_row_identity_and_value(bytes: &[u8], row: RecordRowIndex) -> (Identity, i128) {
+	let batch = decode_record_batch(bytes).expect("a decodable frame");
+	let row = row.get() as usize;
+	let identities = batch
+		.column_by_name(STORAGE_ROW_KEY_ID_COLUMN)
+		.expect("frame has a key identity column")
+		.as_any()
+		.downcast_ref::<arrow::array::FixedSizeBinaryArray>()
+		.expect("key identity column is fixed-size binary");
+	let identity = Identity::new(identities.value(row).try_into().expect("32-byte identity"));
+	let column = batch.column(0);
+	let value = if let Some(values) = column.as_any().downcast_ref::<UInt64Array>() {
+		i128::from(values.value(row))
+	} else if let Some(values) = column.as_any().downcast_ref::<Int64Array>() {
+		i128::from(values.value(row))
+	} else {
+		panic!("unexpected value column type {:?}", column.data_type());
+	};
+	(identity, value)
+}
+
+/// The typed refusal a read of a location that its slab's current
+/// generation no longer serves must return.
+fn is_superseded_tier_refusal(error: &std::io::Error) -> bool {
+	stale_location(error).is_some()
+}
+
+/// A read of `location` must return the frame whose row at the caller's row
+/// index is `(key, value)`, or the typed refusal. `value == None` means the
+/// version no longer exists and only the refusal is acceptable.
+fn assert_tier_read_is_its_row_or_refused(
+	result: std::io::Result<Vec<u8>>,
+	location: RecordLocation,
+	key: Identity,
+	value: Option<i128>,
+	what: &str,
+) {
+	match (result, value) {
+		(Ok(bytes), Some(value)) => {
+			let decoded = std::panic::catch_unwind(|| {
+				frame_row_identity_and_value(&bytes, location.record_row_index)
+			});
+			let Ok(decoded) = decoded else {
+				panic!("{what}: the read returned bytes that are not {key}'s row frame");
+			};
+			assert_eq!(
+				decoded,
+				(key, value),
+				"{what}: the read returned another row's bytes"
+			);
+		}
+		(Ok(_), None) => panic!("{what}: a pruned version must be refused, not served"),
+		(Err(error), _) => assert!(
+			is_superseded_tier_refusal(&error),
+			"{what}: expected the row or the typed superseded-location refusal, got {error}"
+		),
+	}
+}
+
+#[tokio::test]
+async fn tier_read_between_redirect_and_pointer_swap_returns_its_row_or_refuses() {
+	let fixture = seed_tier_refresh_fixture("tier-read-redirect-window").await;
+	let mgr = &fixture.mgr;
+	let pause = mgr.pause_tier_publication_before_pointer_once();
+	let readers = async {
+		tokio::time::timeout(
+			std::time::Duration::from_secs(600),
+			pause.reached.notified(),
+		)
+		.await
+		.expect("premise: the publication reached its pointer swap");
+		let mut results = Vec::new();
+		for (key, location) in &fixture.before_newest {
+			results.push((*key, *location, mgr.read(*location).await));
+		}
+		pause.resume.notify_one();
+		results
+	};
+	let (applied, results) = tokio::join!(
+		mgr.apply_tier_slab_committed(fixture.rewritten.clone(), None),
+		readers
+	);
+	applied.unwrap();
+	for (key, location, result) in results {
+		assert_tier_read_is_its_row_or_refused(
+			result,
+			location,
+			key,
+			Some(fixture.expected_values[&key]),
+			"read between the redirect and the pointer swap",
+		);
+	}
+}
+
+#[tokio::test]
+async fn tier_read_resolved_before_publication_returns_its_row_or_refuses() {
+	let fixture = seed_tier_refresh_fixture("tier-read-resolved-early").await;
+	let mgr = &fixture.mgr;
+	let key = id(0xB703);
+	let location = fixture.before_newest[&key];
+	let pause = mgr.pause_read_before_backing_selection_once();
+	let publish = async {
+		tokio::time::timeout(
+			std::time::Duration::from_secs(600),
+			pause.reached.notified(),
+		)
+		.await
+		.expect("premise: the read resolved its location and paused");
+		mgr.apply_tier_slab_committed(fixture.rewritten.clone(), None)
+			.await
+			.unwrap();
+		pause.resume.notify_one();
+	};
+	let (result, ()) = tokio::join!(mgr.read(location), publish);
+	assert_tier_read_is_its_row_or_refused(
+		result,
+		location,
+		key,
+		Some(fixture.expected_values[&key]),
+		"read that resolved its location before the publication",
+	);
+}
+
+#[tokio::test]
+async fn pruned_tier_location_captured_before_publication_is_refused() {
+	let fixture = seed_tier_refresh_fixture("tier-read-pruned").await;
+	let mgr = &fixture.mgr;
+	mgr.apply_tier_slab_committed(fixture.rewritten.clone(), None)
+		.await
+		.unwrap();
+	for (key, location) in &fixture.before_newest {
+		assert_tier_read_is_its_row_or_refused(
+			mgr.read(*location).await,
+			*location,
+			*key,
+			Some(fixture.expected_values[key]),
+			"surviving location captured before the publication",
+		);
+	}
+	for (key, location) in &fixture.pruned_locations {
+		assert_tier_read_is_its_row_or_refused(
+			mgr.read(*location).await,
+			*location,
+			*key,
+			None,
+			"pruned location captured before the publication",
+		);
+	}
+}
+
+// ------------------------------------------------------------------
+// Preparing a tier rewrite must leave the published generation readable.
+// ------------------------------------------------------------------
+
+struct PreparedRewriteFixture {
+	dirs: [crate::test_support::TestDir; 2],
+	mgr: Arc<SlabManager>,
+	l2: Arc<dyn ObjectStore>,
+	pointer: TieredSlabPointer,
+	/// The newest location of each live key and its bytes before preparation.
+	expected: BTreeMap<Identity, (RecordLocation, Vec<u8>)>,
+}
+
+async fn tier_kv_slab(
+	mgr: &Arc<SlabManager>,
+	l2: &Arc<dyn ObjectStore>,
+	object: &str,
+) -> TieredSlabPointer {
+	let slab_id = force_seal_active(mgr).await;
+	let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
+	let encrypted = mgr.encrypt_tiered_object_blob(slab_id, &raw).unwrap();
+	let uri = l2.put(object, &encrypted.bytes).await.unwrap();
+	let pointer = tiered_pointer_from_blob(mgr, slab_id, uri, &encrypted.bytes);
+	mgr.apply_tier_slab(pointer.clone()).await.unwrap();
+	pointer
+}
+
+fn tiered_pointer_from_blob(
+	mgr: &SlabManager,
+	slab_id: SlabId,
+	uri: String,
+	bytes: &[u8],
+) -> TieredSlabPointer {
+	let footer = mgr
+		.encrypted_tiered_footer_summary(bytes)
+		.unwrap()
+		.expect("an encrypted tier footer");
+	TieredSlabPointer {
+		slab_id,
+		l2_uri: uri,
+		payload_hash: crate::hash::content::digest(bytes),
+		is_encrypted: true,
+		tenant_id: Some(footer.tenant_id),
+		tenant_kek_id: Some(footer.tenant_kek_id),
+		stats_format_version: footer
+			.stats_locator
+			.map(|locator| locator.stats_format_version),
+		stats_block_len: footer.stats_locator.map(|locator| locator.stats_block_len),
+		stats_block_hash128: footer
+			.stats_locator
+			.map(|locator| locator.stats_block_hash128),
+		tombstone_metadata: TombstoneMetadata::None,
+		supersession_metadata: SupersessionMetadata::None,
+	}
+}
+
+/// A tiered slab of KV rows where key x has a version below the retention
+/// floor that a rewrite prunes.
+async fn seed_prepared_rewrite_fixture(tag: &str) -> PreparedRewriteFixture {
+	let (dirs, mgr, l2) = fresh_manager_with_l2(tag).await;
+	let key_x = id(0x6501);
+	let key_y = id(0x6502);
+	mgr.append(tenant(), key_x, hlc(10), b"x-10").await.unwrap();
+	mgr.append(tenant(), key_x, hlc(20), b"x-20").await.unwrap();
+	mgr.append(tenant(), key_y, hlc(30), b"y-30").await.unwrap();
+	let pointer = tier_kv_slab(&mgr, &l2, &format!("tier/{tag}.wnd")).await;
+	let mut expected = BTreeMap::new();
+	for key in [key_x, key_y] {
+		let location = mgr.lookup(tenant(), key).unwrap().unwrap();
+		expected.insert(key, (location, mgr.read(location).await.unwrap()));
+	}
+	PreparedRewriteFixture {
+		dirs,
+		mgr,
+		l2,
+		pointer,
+		expected,
+	}
+}
+
+async fn prepare_production_retention_rewrite(
+	mgr: &SlabManager,
+	pointer: &TieredSlabPointer,
+) -> (Vec<u8>, TombstoneMetadata, SupersessionMetadata) {
+	let prepared = mgr
+		.prepare_tiered_table_retention_rewrite(
+			pointer,
+			crate::storage::retention::MvccRetentionPolicy::fixed_window(
+				std::time::Duration::from_secs(15),
+			),
+			&TableLifecycleCatalog::default(),
+			&TableSchemaCatalog::default(),
+			15_025,
+		)
+		.await
+		.unwrap()
+		.expect("premise: a retention rewrite");
+	let PreparedTieredRetentionRewrite::Rewrite {
+		encrypted_bytes,
+		tombstone_metadata,
+		supersession_metadata,
+		..
+	} = prepared
+	else {
+		panic!("premise: a rewrite with survivors");
+	};
+	(encrypted_bytes, tombstone_metadata, supersession_metadata)
+}
+
+async fn assert_published_generation_reads(
+	mgr: &SlabManager,
+	expected: &BTreeMap<Identity, (RecordLocation, Vec<u8>)>,
+	what: &str,
+) {
+	for (key, (location, bytes)) in expected {
+		match mgr.read(*location).await {
+			Ok(read) => assert_eq!(&read, bytes, "{what}: {key} returned other bytes"),
+			Err(error) => {
+				panic!("{what}: the published generation of {key} is unreadable: {error}")
+			}
+		}
+	}
+}
+
+#[tokio::test]
+async fn tier_reads_stay_valid_while_a_retention_rewrite_is_only_prepared() {
+	let fixture = seed_prepared_rewrite_fixture("prepared-rewrite-reads").await;
+	let _prepared = prepare_production_retention_rewrite(&fixture.mgr, &fixture.pointer).await;
+	assert_published_generation_reads(
+		&fixture.mgr,
+		&fixture.expected,
+		"after preparing a retention rewrite",
+	)
+	.await;
+}
+
+#[tokio::test]
+async fn tier_reads_stay_valid_after_a_refused_rewrite_is_cleaned_up() {
+	let fixture = seed_prepared_rewrite_fixture("prepared-rewrite-refused").await;
+	let (bytes, _, _) = prepare_production_retention_rewrite(&fixture.mgr, &fixture.pointer).await;
+	let staged = fixture
+		.l2
+		.put("tier/prepared-rewrite-refused-staged.wnd", &bytes)
+		.await
+		.unwrap();
+	// The commit is refused: the staged object is cleaned up and the pointer
+	// never changes.
+	fixture.l2.delete(&staged).await.unwrap();
+	assert_published_generation_reads(
+		&fixture.mgr,
+		&fixture.expected,
+		"after a refused rewrite and its cleanup",
+	)
+	.await;
+}
+
+#[tokio::test]
+async fn tier_reads_stay_valid_after_restart_before_publication() {
+	let fixture = seed_prepared_rewrite_fixture("prepared-rewrite-restart").await;
+	let _prepared = prepare_production_retention_rewrite(&fixture.mgr, &fixture.pointer).await;
+	fixture.mgr.fsync_all_local_slabs().await.unwrap();
+	// The same key material across the restart, as a real node keeps its
+	// keystore; a new process starts with empty key caches.
+	let crypto = fixture.mgr.config.crypto.clone();
+	let keysets = crypto.tenant_keysets_snapshot().unwrap();
+	crypto
+		.replace_keysets_from_authoritative_snapshot(&keysets)
+		.unwrap();
+	let PreparedRewriteFixture {
+		dirs,
+		mgr,
+		l2,
+		expected,
+		..
+	} = fixture;
+	drop(mgr);
+	let reopened = SlabManager::open(SlabManagerConfig {
+		dir: dirs[0].to_path_buf(),
+		max_slab_bytes: 1 << 20,
+		io: spawn_io_thread(64).unwrap(),
+		l2: Some(l2.clone()),
+		rehydration: RehydrationPolicy::default(),
+		l2_column_fetch: Default::default(),
+		row_group_writer: Default::default(),
+		l2_row_group_fetch: Default::default(),
+		encoding_writer: Default::default(),
+		l2_chunk_layout: Default::default(),
+		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
+		group_commit: GroupCommitConfig::default(),
+		crypto,
+	})
+	.await
+	.unwrap();
+	assert_published_generation_reads(
+		&reopened,
+		&expected,
+		"after a restart before the rewrite was published",
+	)
+	.await;
+}
+
+#[tokio::test]
+async fn tier_reads_follow_a_published_retention_rewrite() {
+	let fixture = seed_prepared_rewrite_fixture("prepared-rewrite-published").await;
+	let mgr = &fixture.mgr;
+	let (bytes, tombstone_metadata, supersession_metadata) =
+		prepare_production_retention_rewrite(mgr, &fixture.pointer).await;
+	let uri = fixture
+		.l2
+		.put("tier/prepared-rewrite-published-new.wnd", &bytes)
+		.await
+		.unwrap();
+	let published = TieredSlabPointer {
+		tombstone_metadata,
+		supersession_metadata,
+		..tiered_pointer_from_blob(mgr, fixture.pointer.slab_id, uri, &bytes)
+	};
+	mgr.apply_tier_slab_committed(published, None)
+		.await
+		.unwrap();
+	for (key, (_, bytes)) in &fixture.expected {
+		let location = mgr
+			.lookup(tenant(), *key)
+			.unwrap()
+			.expect("survivor indexed");
+		assert_eq!(
+			&mgr.read(location).await.unwrap(),
+			bytes,
+			"the published generation serves {key}'s newest row"
+		);
+	}
+	assert!(
+		mgr.lookup_as_of(tenant(), id(0x6501), hlc(15))
+			.unwrap()
+			.is_none(),
+		"premise: the rewrite pruned x@10"
+	);
+}
+
+#[tokio::test]
+async fn tier_reads_stay_valid_while_a_table_drop_rewrite_is_only_prepared() {
+	let (_dirs, mgr, l2) = fresh_manager_with_l2("prepared-drop-rewrite").await;
+	let dropped = append_only_retention_descriptor(TableObjectId::new([0x65; 16]));
+	let mut schemas = TableSchemaCatalog::default();
+	schemas.upsert(tenant(), dropped.clone()).unwrap();
+	let frame = encode_test_append_only_storage_frame(
+		dropped.table_object_id,
+		&[(id(0x6511), Locality::new(10), hlc(10), 1, false)],
+	);
+	let entries = storage_multirow_index_entries_from_frame(&frame)
+		.unwrap()
+		.expect("entries");
+	mgr.append_durable_multirow_with_locality(tenant(), &frame, &entries)
+		.await
+		.unwrap();
+	let survivor = id(0x6512);
+	mgr.append(tenant(), survivor, hlc(11), b"survivor")
+		.await
+		.unwrap();
+	let pointer = tier_kv_slab(&mgr, &l2, "tier/prepared-drop-rewrite.wnd").await;
+	let location = mgr.lookup(tenant(), survivor).unwrap().unwrap();
+	let expected = mgr.read(location).await.unwrap();
+	let prepared = mgr
+		.prepare_tiered_table_drop_rewrite(&pointer, tenant(), &dropped, &schemas)
+		.await
+		.unwrap()
+		.expect("premise: a table-drop rewrite");
+	assert!(
+		matches!(prepared, PreparedTieredTableDropRewrite::Rewrite { .. }),
+		"premise: a rewrite with survivors"
+	);
+	match mgr.read(location).await {
+		Ok(read) => assert_eq!(read, expected),
+		Err(error) => panic!(
+			"preparing a table-drop rewrite made the published generation unreadable: {error}"
+		),
+	}
+}
+
+// ------------------------------------------------------------------
+// Published table references: per-slab counts must never lose a live
+// reference.
+// ------------------------------------------------------------------
+
+fn reference_location(slab: u64, offset: u64) -> RecordLocation {
+	RecordLocation {
+		slab_id: SlabId::new(slab),
+		offset,
+		length: 16,
+		hlc: hlc(offset),
+		record_row_index: RecordRowIndex::ZERO,
+		is_tombstone: false,
+		placement: crate::schema::table::PlacementSemantics::RawLocality,
+		partition: None,
+	}
+}
+
+/// The per-slab counts recomputed from `table_by_location`.
+fn recomputed_reference_counts(
+	mgr: &SlabManager,
+) -> BTreeMap<SlabId, BTreeMap<(TenantId, TableObjectId), usize>> {
+	let mut out: BTreeMap<SlabId, BTreeMap<(TenantId, TableObjectId), usize>> = BTreeMap::new();
+	for entry in mgr.table_by_location.iter() {
+		*out.entry(entry.key().slab_id)
+			.or_default()
+			.entry(*entry.value())
+			.or_default() += 1;
+	}
+	out
+}
+
+fn published_reference_counts(
+	mgr: &SlabManager,
+) -> BTreeMap<SlabId, BTreeMap<(TenantId, TableObjectId), usize>> {
+	mgr.table_references_by_slab
+		.iter()
+		.map(|entry| (*entry.key(), entry.value().clone()))
+		.collect()
+}
+
+/// Run `contender` on another thread while `paused` is held inside the
+/// empty-slab removal; the contender may complete or block, and either way
+/// the final counts must equal the recomputation.
+fn race_against_empty_reference_slab_removal(
+	mgr: &Arc<SlabManager>,
+	paused: impl FnOnce(&SlabManager) + Send + 'static,
+	contender: impl FnOnce(&SlabManager) + Send + 'static,
+) {
+	let pause = mgr.pause_before_empty_reference_slab_removal_once();
+	let first = {
+		let mgr = mgr.clone();
+		std::thread::spawn(move || paused(&mgr))
+	};
+	// Wait for the paused operation to reach the removal window. An operation
+	// that never empties the slab entry (a reassignment, once it is a single
+	// critical section) has no window: it completes, and the contender then
+	// races it from outside.
+	let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+	{
+		let reached = pause.reached.clone();
+		std::thread::spawn(move || {
+			reached.wait();
+			let _ = reached_tx.send(());
+		});
+	}
+	let in_window = reached_rx
+		.recv_timeout(std::time::Duration::from_secs(30))
+		.is_ok();
+	let (done_tx, done_rx) = std::sync::mpsc::channel();
+	let second = {
+		let mgr = mgr.clone();
+		std::thread::spawn(move || {
+			contender(&mgr);
+			let _ = done_tx.send(());
+		})
+	};
+	if in_window {
+		// The contender either completes inside the window or blocks behind
+		// the paused removal's critical section; release the removal either way.
+		let _ = done_rx.recv_timeout(std::time::Duration::from_secs(3));
+		pause.resume.wait();
+	}
+	first.join().unwrap();
+	second.join().unwrap();
+}
+
+#[test]
+fn published_reference_last_count_removal_keeps_a_concurrent_add() {
+	let runtime = tokio::runtime::Runtime::new().unwrap();
+	let (_dir, mgr) = runtime.block_on(fresh_manager());
+	let table_a = TableObjectId::new([0x6A; 16]);
+	let table_b = TableObjectId::new([0x6B; 16]);
+	let first = reference_location(9_001, 4_096);
+	let second = reference_location(9_001, 8_192);
+	mgr.add_published_table_reference(tenant(), table_a, first);
+	race_against_empty_reference_slab_removal(
+		&mgr,
+		move |mgr| mgr.remove_published_table_reference(first),
+		move |mgr| mgr.add_published_table_reference(tenant(), table_b, second),
+	);
+	assert_eq!(
+		mgr.tables_referencing_slab_by_kind(
+			SlabId::new(9_001),
+			PublishedReferenceKind::RecordLocation
+		),
+		BTreeSet::from([(tenant(), table_b)]),
+		"removing the last count of one table must not erase a concurrently added reference"
+	);
+	assert_eq!(
+		published_reference_counts(&mgr),
+		recomputed_reference_counts(&mgr),
+		"per-slab counts must equal the published references"
+	);
+}
+
+#[test]
+fn published_reference_reassignment_keeps_a_concurrent_add() {
+	let runtime = tokio::runtime::Runtime::new().unwrap();
+	let (_dir, mgr) = runtime.block_on(fresh_manager());
+	let table_a = TableObjectId::new([0x6C; 16]);
+	let table_b = TableObjectId::new([0x6D; 16]);
+	let table_c = TableObjectId::new([0x6E; 16]);
+	let first = reference_location(9_002, 4_096);
+	let second = reference_location(9_002, 8_192);
+	mgr.add_published_table_reference(tenant(), table_a, first);
+	race_against_empty_reference_slab_removal(
+		&mgr,
+		move |mgr| mgr.add_published_table_reference(tenant(), table_b, first),
+		move |mgr| mgr.add_published_table_reference(tenant(), table_c, second),
+	);
+	assert_eq!(
+		mgr.tables_referencing_slab_by_kind(
+			SlabId::new(9_002),
+			PublishedReferenceKind::RecordLocation
+		),
+		BTreeSet::from([(tenant(), table_b), (tenant(), table_c)]),
+		"a reassignment must not erase a concurrently added reference"
+	);
+	assert_eq!(
+		published_reference_counts(&mgr),
+		recomputed_reference_counts(&mgr)
+	);
+}
+
+#[test]
+fn published_reference_add_and_remove_retries_are_idempotent() {
+	let runtime = tokio::runtime::Runtime::new().unwrap();
+	let (_dir, mgr) = runtime.block_on(fresh_manager());
+	let table = TableObjectId::new([0x6F; 16]);
+	let first = reference_location(9_003, 4_096);
+	let second = reference_location(9_003, 8_192);
+	let slab = BTreeMap::from([(SlabId::new(9_003), BTreeMap::from([((tenant(), table), 1)]))]);
+	mgr.add_published_table_reference(tenant(), table, first);
+	mgr.add_published_table_reference(tenant(), table, first);
+	assert_eq!(
+		published_reference_counts(&mgr),
+		slab,
+		"a repeated add counts once"
+	);
+	mgr.add_published_table_reference(tenant(), table, second);
+	mgr.remove_published_table_reference(first);
+	mgr.remove_published_table_reference(first);
+	assert_eq!(
+		published_reference_counts(&mgr),
+		slab,
+		"a repeated remove counts once"
+	);
+	mgr.remove_published_table_reference(second);
+	assert!(
+		published_reference_counts(&mgr).is_empty(),
+		"the last removal clears the slab"
+	);
+	mgr.add_published_table_reference(tenant(), table, first);
+	assert_eq!(published_reference_counts(&mgr), slab);
+	assert_eq!(
+		published_reference_counts(&mgr),
+		recomputed_reference_counts(&mgr)
+	);
+}
+
+#[tokio::test]
+async fn encrypting_a_slab_again_leaves_its_published_generation_decryptable() {
+	let (_dirs, mgr, _l2) = fresh_manager_with_l2("re-encrypt-generation").await;
+	mgr.append(tenant(), id(0x6521), hlc(10), b"row")
+		.await
+		.unwrap();
+	let slab_id = force_seal_active(&mgr).await;
+	let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
+	let published = mgr.encrypt_tiered_object_blob(slab_id, &raw).unwrap();
+	let published_pointer =
+		tiered_pointer_from_blob(&mgr, slab_id, "published".to_string(), &published.bytes);
+	let decode = |pointer: &TieredSlabPointer, bytes: &[u8]| {
+		decode_tiered_blob(
+			mgr.config.crypto.as_ref(),
+			pointer,
+			bytes,
+			TierObjectEvidence::Indexed(&BTreeSet::new()),
+		)
+		.map(|decoded| decoded.bytes)
+	};
+	assert!(
+		decode(&published_pointer, &published.bytes).is_ok(),
+		"premise: the published generation decrypts"
+	);
+	// A second generation of the same slab id is only staged, never published.
+	let staged = mgr.encrypt_tiered_object_blob(slab_id, &raw).unwrap();
+	let staged_pointer =
+		tiered_pointer_from_blob(&mgr, slab_id, "staged".to_string(), &staged.bytes);
+	assert!(
+		decode(&staged_pointer, &staged.bytes).is_ok(),
+		"premise: the staged generation decrypts"
+	);
+	assert!(
+		decode(&published_pointer, &published.bytes).is_ok(),
+		"staging a new generation must not make the published generation undecryptable"
+	);
+	assert!(
+		decode(&staged_pointer, &staged.bytes).is_ok(),
+		"decrypting the published generation must not make the staged generation undecryptable"
+	);
+}
+
+// ------------------------------------------------------------------
+// Persisted carriers of physical locations (secondary-index segments)
+// and pre-publication scan holders across tier rewrites, restart and
+// row-index movement.
+// ------------------------------------------------------------------
+
+struct RowMovementFixture {
+	dirs: [crate::test_support::TestDir; 2],
+	mgr: Arc<SlabManager>,
+	l2: Arc<dyn ObjectStore>,
+	pointer: TieredSlabPointer,
+	/// (key, hlc, value) of every live newest version, with its location
+	/// before any rewrite.
+	live: Vec<(Identity, HybridTimestamp, i128, RecordLocation)>,
+}
+
+/// One tiered slab. Frame F1 holds [p@10, q@11, s@12]; p has a newer version
+/// p@20, so a rewrite at floor 25 prunes p@10 and q, s move to row indexes 0, 1
+/// of a smaller frame. r has r@30 and r@40, so a rewrite at floor 45 prunes
+/// r@30 and moves r@40.
+async fn seed_row_movement_fixture(tag: &str) -> RowMovementFixture {
+	let (dirs, mgr, l2) = fresh_manager_with_l2(tag).await;
+	let loc = Locality::new(0x7700_0000_0000_0001);
+	let (p, q, s, r) = (id(0x7701), id(0x7702), id(0x7703), id(0x7704));
+	for rows in [
+		vec![
+			(p, loc, hlc(10), 1),
+			(q, loc, hlc(11), 2),
+			(s, loc, hlc(12), 6),
+		],
+		vec![(p, loc, hlc(20), 3)],
+		vec![(r, loc, hlc(30), 4)],
+		vec![(r, loc, hlc(40), 5)],
+	] {
+		let frame = encode_test_multirow_storage_frame(&rows);
+		let entries = storage_multirow_index_entries_from_frame(&frame)
+			.unwrap()
+			.expect("entries");
+		mgr.append_durable_multirow_with_locality(tenant(), &frame, &entries)
+			.await
+			.unwrap();
+	}
+	let pointer = tier_kv_slab(&mgr, &l2, &format!("tier/{tag}.wnd")).await;
+	let mut live = Vec::new();
+	for (key, row_hlc, value) in [
+		(q, hlc(11), 2),
+		(s, hlc(12), 6),
+		(p, hlc(20), 3),
+		(r, hlc(40), 5),
+	] {
+		let location = mgr
+			.lookup(tenant(), key)
+			.unwrap()
+			.expect("live key indexed");
+		assert_eq!(location.hlc, row_hlc, "premise: newest version");
+		live.push((key, row_hlc, value, location));
+	}
+	assert_eq!(
+		live[0].3.record_row_index,
+		RecordRowIndex::new(1),
+		"premise: q is row 1 of F1"
+	);
+	RowMovementFixture {
+		dirs,
+		mgr,
+		l2,
+		pointer,
+		live,
+	}
+}
+
+/// Publish a retention rewrite of `pointer` at `floor`; return the new pointer.
+async fn publish_tier_retention_rewrite(
+	mgr: &SlabManager,
+	l2: &Arc<dyn ObjectStore>,
+	pointer: &TieredSlabPointer,
+	floor: HybridTimestamp,
+	object: &str,
+) -> TieredSlabPointer {
+	let prepared = mgr
+		.prepare_tiered_retention_rewrite(pointer, floor, &TableSchemaCatalog::default())
+		.await
+		.unwrap()
+		.expect("premise: a retention rewrite");
+	let PreparedTieredRetentionRewrite::Rewrite {
+		encrypted_bytes,
+		tombstone_metadata,
+		supersession_metadata,
+		..
+	} = prepared
+	else {
+		panic!("premise: a rewrite with survivors");
+	};
+	let uri = l2.put(object, &encrypted_bytes).await.unwrap();
+	let published = TieredSlabPointer {
+		tombstone_metadata,
+		supersession_metadata,
+		..tiered_pointer_from_blob(mgr, pointer.slab_id, uri, &encrypted_bytes)
+	};
+	mgr.apply_tier_slab_committed(published.clone(), None)
+		.await
+		.unwrap();
+	published
+}
+
+/// Restart the manager over the same directories, object store and keystore
+/// (with empty key caches, as a new process has).
+async fn restart_tier_manager(
+	mgr: Arc<SlabManager>,
+	dirs: &[crate::test_support::TestDir; 2],
+	l2: &Arc<dyn ObjectStore>,
+) -> Arc<SlabManager> {
+	let manager = try_restart_tier_manager(mgr, dirs, l2).await.unwrap();
+	manager.wait_tier_authority_ready().await.unwrap();
+	manager
+}
+
+async fn try_restart_tier_manager(
+	mgr: Arc<SlabManager>,
+	dirs: &[crate::test_support::TestDir; 2],
+	l2: &Arc<dyn ObjectStore>,
+) -> std::io::Result<Arc<SlabManager>> {
+	mgr.fsync_all_local_slabs().await.unwrap();
+	let crypto = mgr.config.crypto.clone();
+	drop(mgr);
+	let keysets = crypto.tenant_keysets_snapshot().unwrap();
+	crypto
+		.replace_keysets_from_authoritative_snapshot(&keysets)
+		.unwrap();
+	SlabManager::open(SlabManagerConfig {
+		dir: dirs[0].to_path_buf(),
+		max_slab_bytes: 1 << 20,
+		io: spawn_io_thread(64).unwrap(),
+		l2: Some(l2.clone()),
+		rehydration: RehydrationPolicy::default(),
+		l2_column_fetch: Default::default(),
+		row_group_writer: Default::default(),
+		l2_row_group_fetch: Default::default(),
+		encoding_writer: Default::default(),
+		l2_chunk_layout: Default::default(),
+		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
+		group_commit: GroupCommitConfig::default(),
+		crypto,
+	})
+	.await
+}
+
+/// A secondary-index segment over the fixture's live rows, as a backfill of
+/// the tiered source slab would persist it.
+fn segment_over_rows(
+	slab_id: SlabId,
+	rows: &[(Identity, HybridTimestamp, i128, RecordLocation)],
+) -> SecondaryIndexSegment {
+	let descriptor = secondary_index_descriptor_for_test();
+	SecondaryIndexSegment::build(
+		SecondaryIndexIdentity {
+			tenant_id: tenant(),
+			table_object_id: descriptor.table_object_id,
+			index_object_id: descriptor.index_object_id,
+			logical_schema_fingerprint: descriptor.logical_schema_fingerprint,
+			column_ordinal: 1,
+		},
+		slab_id,
+		descriptor.table_schema_generation,
+		IndexArrowTypeTag::Int64,
+		rows.iter()
+			.map(|(key, row_hlc, value, location)| SecondaryIndexEntry {
+				encoded_key: ((*value as u64) ^ 0x8000_0000_0000_0000)
+					.to_be_bytes()
+					.to_vec(),
+				row_key_id: *key,
+				row_hlc: *row_hlc,
+				record_location: *location,
+			})
+			.collect(),
+	)
+	.unwrap()
+}
+
+/// The secondary-index query read of one segment entry, as data_server
+/// `read_secondary_index_query_location` does it: the entry resolves to its
+/// version's current location, and the read verifies the frame holds that
+/// version's tenant and key.
+async fn read_secondary_index_entry_for_test(
+	mgr: &SlabManager,
+	entry: &SecondaryIndexEntry,
+) -> std::io::Result<(Identity, i128)> {
+	let location = mgr.resolve_logical_version(
+		tenant(),
+		entry.row_key_id,
+		entry.row_hlc,
+		entry.record_location,
+	)?;
+	let bytes = mgr
+		.read_version(tenant(), entry.row_key_id, location)
+		.await?;
+	std::panic::catch_unwind(|| frame_row_identity_and_value(&bytes, location.record_row_index))
+		.map_err(|_| {
+			Error::new(
+				ErrorKind::InvalidData,
+				"saved row index is not a row of the frame",
+			)
+		})
+}
+
+async fn assert_segment_entries_resolve_their_versions(
+	mgr: &SlabManager,
+	info: &SecondaryIndexSegmentInfo,
+	expected: &[(Identity, HybridTimestamp, i128, RecordLocation)],
+	step: &str,
+) {
+	let segment = mgr
+		.load_secondary_index_segment(info)
+		.await
+		.unwrap()
+		.expect("premise: the segment is persisted");
+	for entry in &segment.entries {
+		let (key, row_hlc, value, _) = expected
+			.iter()
+			.find(|(key, ..)| *key == entry.row_key_id)
+			.expect("premise: entry for a fixture row");
+		assert_eq!(entry.row_hlc, *row_hlc);
+		match read_secondary_index_entry_for_test(mgr, entry).await {
+			Ok(read) => assert_eq!(
+				read,
+				(*key, *value),
+				"{step}: the segment entry for {key}@{row_hlc:?} returned another row"
+			),
+			Err(error) => panic!(
+				"{step}: the segment entry for {key}@{row_hlc:?} names a live version but failed: {error}"
+			),
+		}
+	}
+}
+
+#[tokio::test]
+async fn secondary_index_entries_resolve_their_version_across_tier_rewrites_and_restart() {
+	let fixture = seed_row_movement_fixture("segment-across-rewrites").await;
+	let RowMovementFixture {
+		dirs,
+		mgr,
+		l2,
+		pointer,
+		live,
+	} = fixture;
+	let info = mgr
+		.persist_secondary_index_segment(&segment_over_rows(pointer.slab_id, &live))
+		.await
+		.unwrap();
+	assert_segment_entries_resolve_their_versions(&mgr, &info, &live, "before any rewrite").await;
+
+	let first = publish_tier_retention_rewrite(
+		&mgr,
+		&l2,
+		&pointer,
+		hlc(25),
+		"tier/segment-across-rewrites-1.wnd",
+	)
+	.await;
+	assert!(
+		mgr.lookup_as_of(tenant(), id(0x7701), hlc(15))
+			.unwrap()
+			.is_none(),
+		"premise: the first rewrite pruned p@10"
+	);
+	assert_eq!(
+		mgr.lookup(tenant(), id(0x7702))
+			.unwrap()
+			.unwrap()
+			.record_row_index,
+		RecordRowIndex::ZERO,
+		"premise: q moved from row 1 to row 0"
+	);
+	assert_segment_entries_resolve_their_versions(&mgr, &info, &live, "after the first rewrite")
+		.await;
+
+	let mgr = restart_tier_manager(mgr, &dirs, &l2).await;
+	assert_segment_entries_resolve_their_versions(&mgr, &info, &live, "after a restart").await;
+
+	publish_tier_retention_rewrite(
+		&mgr,
+		&l2,
+		&first,
+		hlc(45),
+		"tier/segment-across-rewrites-2.wnd",
+	)
+	.await;
+	assert!(
+		mgr.lookup_as_of(tenant(), id(0x7704), hlc(35))
+			.unwrap()
+			.is_none(),
+		"premise: the second rewrite pruned r@30"
+	);
+	assert_segment_entries_resolve_their_versions(&mgr, &info, &live, "after the second rewrite")
+		.await;
+}
+
+#[tokio::test]
+async fn secondary_index_entries_without_row_movement_resolve_after_restart() {
+	let fixture = seed_row_movement_fixture("segment-restart-only").await;
+	let RowMovementFixture {
+		dirs,
+		mgr,
+		l2,
+		pointer,
+		live,
+	} = fixture;
+	// p@20 and r@40 keep row index 0; only their offsets move.
+	let unmoved = live
+		.iter()
+		.copied()
+		.filter(|(key, ..)| *key == id(0x7701) || *key == id(0x7704))
+		.collect::<Vec<_>>();
+	let info = mgr
+		.persist_secondary_index_segment(&segment_over_rows(pointer.slab_id, &unmoved))
+		.await
+		.unwrap();
+	publish_tier_retention_rewrite(
+		&mgr,
+		&l2,
+		&pointer,
+		hlc(25),
+		"tier/segment-restart-only-1.wnd",
+	)
+	.await;
+	let mgr = restart_tier_manager(mgr, &dirs, &l2).await;
+	assert_segment_entries_resolve_their_versions(
+		&mgr,
+		&info,
+		&unmoved,
+		"after a rewrite and a restart",
+	)
+	.await;
+}
+
+#[tokio::test]
+async fn scan_holding_pre_publication_locations_returns_exact_rows_or_an_error() {
+	let fixture = seed_row_movement_fixture("scan-holder-across-rewrite").await;
+	let mgr = &fixture.mgr;
+	// A table scan takes its candidate locations, then reads them.
+	let held = mgr
+		.scan_as_of_with_identity_and_locality(tenant(), Locality::ZERO, Locality::MAX, zero_hlc())
+		.unwrap();
+	assert_eq!(
+		held.len(),
+		fixture.live.len(),
+		"premise: one row per live key"
+	);
+	publish_tier_retention_rewrite(
+		mgr,
+		&fixture.l2,
+		&fixture.pointer,
+		hlc(25),
+		"tier/scan-holder-across-rewrite-1.wnd",
+	)
+	.await;
+	let mut rows = BTreeMap::new();
+	let mut errors = Vec::new();
+	for (key, _locality, location) in &held {
+		match mgr.read(*location).await {
+			Ok(bytes) => {
+				match std::panic::catch_unwind(|| {
+					frame_row_identity_and_value(&bytes, location.record_row_index)
+				}) {
+					Ok((read_key, value)) => {
+						assert_eq!(
+							read_key, *key,
+							"a scan holding a pre-publication location read another row"
+						);
+						rows.insert(*key, value);
+					}
+					Err(_) => errors.push(*key),
+				}
+			}
+			Err(_) => errors.push(*key),
+		}
+	}
+	if errors.is_empty() {
+		let expected = fixture
+			.live
+			.iter()
+			.map(|(key, _, value, _)| (*key, *value))
+			.collect::<BTreeMap<_, _>>();
+		assert_eq!(rows, expected, "the scan must return the exact result set");
+	}
+}
+
+// ------------------------------------------------------------------
+// Reference attribution is never empty for an indexed attributed row.
+// ------------------------------------------------------------------
+
+#[test]
+fn published_reference_reassignment_is_never_unattributed() {
+	let runtime = tokio::runtime::Runtime::new().unwrap();
+	let (_dir, mgr) = runtime.block_on(fresh_manager());
+	let table_old = TableObjectId::new([0x71; 16]);
+	let table_new = TableObjectId::new([0x72; 16]);
+	let slab = SlabId::new(9_101);
+	let location = reference_location(9_101, 4_096);
+	mgr.add_published_table_reference(tenant(), table_old, location);
+	let pause = mgr.pause_inside_reference_reassignment_once();
+	let reassign = {
+		let mgr = mgr.clone();
+		std::thread::spawn(move || mgr.add_published_table_reference(tenant(), table_new, location))
+	};
+	pause.reached.wait();
+	// A counts reader inside the reassignment.
+	let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+	let reader = {
+		let mgr = mgr.clone();
+		std::thread::spawn(move || {
+			let _ = seen_tx.send(
+				mgr.tables_referencing_slab_by_kind(slab, PublishedReferenceKind::RecordLocation),
+			);
+		})
+	};
+	let seen = seen_rx.recv_timeout(std::time::Duration::from_secs(3));
+	pause.resume.wait();
+	reassign.join().unwrap();
+	reader.join().unwrap();
+	let seen = match seen {
+		Ok(seen) => seen,
+		// The reader waited for the reassignment's critical section.
+		Err(_) => mgr.tables_referencing_slab_by_kind(slab, PublishedReferenceKind::RecordLocation),
+	};
+	assert!(
+		seen.contains(&(tenant(), table_old)) || seen.contains(&(tenant(), table_new)),
+		"a counts reader inside a reassignment saw the indexed row attributed to no table: {seen:?}"
+	);
+	assert_eq!(
+		published_reference_counts(&mgr),
+		recomputed_reference_counts(&mgr)
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn multirow_append_counts_its_table_reference_before_indexing() {
+	let (_dir, mgr) = fresh_manager().await;
+	let table = TableObjectId::new([0x73; 16]);
+	let key = id(0x7301);
+	let frame = encode_test_append_only_storage_frame(
+		table,
+		&[(key, Locality::new(0x7300), hlc(10), 1, false)],
+	);
+	let entries = storage_multirow_index_entries_from_frame(&frame)
+		.unwrap()
+		.expect("entries");
+	let pause = mgr.pause_before_append_reference_publication_once();
+	let append = tokio::spawn({
+		let mgr = mgr.clone();
+		async move {
+			mgr.append_durable_multirow_with_locality(tenant(), &frame, &entries)
+				.await
+		}
+	});
+	let reached = pause.reached.clone();
+	let paused = tokio::time::timeout(
+		std::time::Duration::from_secs(30),
+		tokio::task::spawn_blocking(move || reached.wait()),
+	)
+	.await;
+	let observed = match paused {
+		Ok(_) => {
+			let indexed = mgr.lookup(tenant(), key).unwrap();
+			let attributed = indexed.map(|location| {
+				mgr.tables_referencing_slab_by_kind(
+					location.slab_id,
+					PublishedReferenceKind::RecordLocation,
+				)
+			});
+			let resume = pause.resume.clone();
+			tokio::task::spawn_blocking(move || resume.wait())
+				.await
+				.unwrap();
+			Some((indexed, attributed))
+		}
+		// The fix counts before indexing and has no window to pause in.
+		Err(_) => None,
+	};
+	append.await.unwrap().unwrap();
+	if let Some((Some(_), Some(attributed))) = observed {
+		assert!(
+			attributed.contains(&(tenant(), table)),
+			"an indexed typed row was visible before its table reference was counted"
+		);
+	}
+	assert!(
+		mgr.tables_referencing_slab_by_kind(
+			mgr.lookup(tenant(), key).unwrap().unwrap().slab_id,
+			PublishedReferenceKind::RecordLocation
+		)
+		.contains(&(tenant(), table))
+	);
+}
+
+#[test]
+fn secondary_index_source_last_reference_removal_keeps_a_concurrent_add() {
+	let runtime = tokio::runtime::Runtime::new().unwrap();
+	let (_dir, mgr) = runtime.block_on(fresh_manager());
+	let table_a = TableObjectId::new([0x74; 16]);
+	let table_b = TableObjectId::new([0x75; 16]);
+	let slab = SlabId::new(9_201);
+	mgr.add_secondary_index_source_reference(tenant(), table_a, slab);
+	let pause = mgr.pause_before_empty_secondary_reference_slab_removal_once();
+	let remover = {
+		let mgr = mgr.clone();
+		std::thread::spawn(move || {
+			mgr.remove_secondary_index_source_reference(tenant(), table_a, slab)
+		})
+	};
+	pause.reached.wait();
+	let (done_tx, done_rx) = std::sync::mpsc::channel();
+	let adder = {
+		let mgr = mgr.clone();
+		std::thread::spawn(move || {
+			mgr.add_secondary_index_source_reference(tenant(), table_b, slab);
+			let _ = done_tx.send(());
+		})
+	};
+	let _ = done_rx.recv_timeout(std::time::Duration::from_secs(3));
+	pause.resume.wait();
+	remover.join().unwrap();
+	adder.join().unwrap();
+	assert_eq!(
+		mgr.tables_referencing_slab_by_kind(slab, PublishedReferenceKind::SecondaryIndexSourceSlab),
+		BTreeSet::from([(tenant(), table_b)]),
+		"removing the last secondary-index source reference must not erase a concurrent add"
+	);
+}
+
+// ------------------------------------------------------------------
+// Logical version identity: (tenant, key, hlc) names one immutable
+// version. A second, different payload at an existing version is
+// refused; pre-existing conflicting duplicates are refused on read; a
+// byte-identical copy is the same version. A saved physical location is
+// never proof of which version is meant.
+// ------------------------------------------------------------------
+
+/// The typed refusal for a version whose identity is contradicted by a
+/// different payload.
+fn is_conflicting_version_refusal(error: &std::io::Error) -> bool {
+	stale_location(error)
+		.is_some_and(|stale| stale.reason == StaleLocationReason::ConflictingVersion)
+}
+
+/// Append below the manager, as data written before the producer check
+/// existed would be: the slab holds the frame, and the manager learns of it
+/// at the next open.
+async fn append_below_manager(
+	mgr: &SlabManager,
+	key: Identity,
+	row_hlc: HybridTimestamp,
+	value: u64,
+) {
+	let active = mgr.state.lock().await.active.clone();
+	let frame = encode_test_multirow_storage_frame(&[(key, Locality::new(0x7900), row_hlc, value)]);
+	active.append(tenant(), key, row_hlc, &frame).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_second_payload_at_an_existing_version_is_refused() {
+	let (_dir, mgr) = fresh_manager().await;
+	let key = id(0x7901);
+	let first = mgr
+		.append_durable(tenant(), key, hlc(10), b"first payload")
+		.await
+		.unwrap();
+	match mgr
+		.append_durable(tenant(), key, hlc(10), b"other payload")
+		.await
+	{
+		Ok(_) => panic!("a different payload at an existing (tenant, key, hlc) was accepted"),
+		Err(error) => assert!(
+			is_conflicting_version_refusal(&error),
+			"expected the typed conflicting-version refusal, got {error}"
+		),
+	}
+	assert_eq!(mgr.lookup(tenant(), key).unwrap(), Some(first));
+	assert_eq!(mgr.read(first).await.unwrap(), b"first payload");
+	// A byte-identical copy is the same version and is accepted.
+	mgr.append_durable(tenant(), key, hlc(10), b"first payload")
+		.await
+		.expect("a byte-identical copy of the version is not a conflict");
+	assert_eq!(
+		mgr.read(mgr.lookup(tenant(), key).unwrap().unwrap())
+			.await
+			.unwrap(),
+		b"first payload"
+	);
+}
+
+#[tokio::test]
+async fn conflicting_duplicates_from_before_the_check_are_refused_after_restart() {
+	let (dirs, mgr, l2) = fresh_manager_with_l2("conflicting-duplicates").await;
+	let key = id(0x7902);
+	append_below_manager(&mgr, key, hlc(10), 100).await;
+	append_below_manager(&mgr, key, hlc(10), 200).await;
+	force_seal_active(&mgr).await;
+	let mgr = restart_tier_manager(mgr, &dirs, &l2).await;
+	let copies = mgr
+		.scan_all_versions(Locality::ZERO, Locality::MAX, zero_hlc())
+		.unwrap()
+		.into_iter()
+		.filter(|(_, scanned, _, _)| *scanned == key)
+		.map(|(_, _, _, location)| location)
+		.collect::<Vec<_>>();
+	assert_eq!(copies.len(), 2, "premise: both payloads were recovered");
+	for location in copies
+		.iter()
+		.copied()
+		.chain(mgr.lookup(tenant(), key).unwrap())
+	{
+		match mgr.read(location).await {
+			Ok(bytes) => panic!(
+				"a version with two different payloads was served: {:?}",
+				std::panic::catch_unwind(|| frame_row_identity_and_value(
+					&bytes,
+					location.record_row_index
+				))
+				.ok()
+			),
+			Err(error) => assert!(
+				is_conflicting_version_refusal(&error),
+				"expected the typed conflicting-version refusal, got {error}"
+			),
+		}
+	}
+}
+
+/// A tiered slab holding two copies of (key, hlc 10) plus another key. With
+/// `conflicting`, the second copy has a different value.
+async fn seed_duplicate_version_tier(
+	tag: &str,
+	conflicting: bool,
+) -> (
+	[crate::test_support::TestDir; 2],
+	Arc<SlabManager>,
+	Arc<dyn ObjectStore>,
+	TieredSlabPointer,
+	Identity,
+	Vec<RecordLocation>,
+) {
+	let (dirs, mgr, l2) = fresh_manager_with_l2(tag).await;
+	let key = id(0x7910);
+	append_below_manager(&mgr, key, hlc(10), 100).await;
+	append_below_manager(&mgr, key, hlc(10), if conflicting { 200 } else { 100 }).await;
+	append_below_manager(&mgr, id(0x7911), hlc(30), 300).await;
+	force_seal_active(&mgr).await;
+	let mgr = restart_tier_manager(mgr, &dirs, &l2).await;
+	let copies = mgr
+		.scan_all_versions(Locality::ZERO, Locality::MAX, zero_hlc())
+		.unwrap()
+		.into_iter()
+		.filter(|(_, scanned, _, _)| *scanned == key)
+		.map(|(_, _, _, location)| location)
+		.collect::<Vec<_>>();
+	assert_eq!(copies.len(), 2, "premise: two copies of (key, hlc 10)");
+	let slab_id = copies[0].slab_id;
+	let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
+	let encrypted = mgr.encrypt_tiered_object_blob(slab_id, &raw).unwrap();
+	let uri = l2
+		.put(&format!("tier/{tag}.wnd"), &encrypted.bytes)
+		.await
+		.unwrap();
+	let pointer = tiered_pointer_from_blob(&mgr, slab_id, uri, &encrypted.bytes);
+	mgr.apply_tier_slab(pointer.clone()).await.unwrap();
+	(dirs, mgr, l2, pointer, key, copies)
+}
+
+/// A segment entry must return exactly `value` for its version, or a typed
+/// refusal; never another value.
+async fn assert_segment_entry_is_exact_or_refused(
+	mgr: &SlabManager,
+	info: &SecondaryIndexSegmentInfo,
+	value: i128,
+	step: &str,
+) {
+	let segment = mgr
+		.load_secondary_index_segment(info)
+		.await
+		.unwrap()
+		.expect("premise: the segment is persisted");
+	for entry in &segment.entries {
+		match read_secondary_index_entry_for_test(mgr, entry).await {
+			Ok((key, read)) => {
+				assert_eq!(key, entry.row_key_id, "{step}: another key's row");
+				assert_eq!(
+					read, value,
+					"{step}: the entry returned another version's value"
+				);
+			}
+			Err(error) => assert!(
+				is_conflicting_version_refusal(&error) || is_superseded_tier_refusal(&error),
+				"{step}: expected the exact version or a typed refusal, got {error}"
+			),
+		}
+	}
+}
+
+#[tokio::test]
+async fn a_segment_for_a_pruned_conflicting_duplicate_never_returns_the_other_value() {
+	let (dirs, mgr, l2, pointer, key, copies) =
+		seed_duplicate_version_tier("pruned-conflicting-duplicate", true).await;
+	// The segment indexed the first copy (value 100).
+	let info = mgr
+		.persist_secondary_index_segment(&segment_over_rows(
+			pointer.slab_id,
+			&[(key, hlc(10), 100, copies[0])],
+		))
+		.await
+		.unwrap();
+	assert_segment_entry_is_exact_or_refused(&mgr, &info, 100, "before the rewrite").await;
+	// Retention at floor 20 prunes the older same-HLC copy.
+	let rewritten = mgr
+		.prepare_tiered_retention_rewrite(&pointer, hlc(20), &TableSchemaCatalog::default())
+		.await
+		.unwrap();
+	if let Some(PreparedTieredRetentionRewrite::Rewrite {
+		encrypted_bytes,
+		tombstone_metadata,
+		supersession_metadata,
+		..
+	}) = rewritten
+	{
+		let uri = l2
+			.put("tier/pruned-conflicting-duplicate-1.wnd", &encrypted_bytes)
+			.await
+			.unwrap();
+		let published = TieredSlabPointer {
+			tombstone_metadata,
+			supersession_metadata,
+			..tiered_pointer_from_blob(&mgr, pointer.slab_id, uri, &encrypted_bytes)
+		};
+		mgr.apply_tier_slab_committed(published, None)
+			.await
+			.unwrap();
+	}
+	assert_segment_entry_is_exact_or_refused(&mgr, &info, 100, "after the rewrite").await;
+	let mgr = restart_tier_manager(mgr, &dirs, &l2).await;
+	assert_segment_entry_is_exact_or_refused(&mgr, &info, 100, "after a restart").await;
+}
+
+#[tokio::test]
+async fn byte_identical_copies_resolve_as_one_version_across_a_rewrite_and_restart() {
+	let (dirs, mgr, l2, pointer, key, copies) =
+		seed_duplicate_version_tier("identical-copies", false).await;
+	let info = mgr
+		.persist_secondary_index_segment(&segment_over_rows(
+			pointer.slab_id,
+			&[(key, hlc(10), 100, copies[0])],
+		))
+		.await
+		.unwrap();
+	publish_tier_retention_rewrite(&mgr, &l2, &pointer, hlc(20), "tier/identical-copies-1.wnd")
+		.await;
+	let mgr = restart_tier_manager(mgr, &dirs, &l2).await;
+	let segment = mgr
+		.load_secondary_index_segment(&info)
+		.await
+		.unwrap()
+		.expect("premise: the segment is persisted");
+	for entry in &segment.entries {
+		let read = read_secondary_index_entry_for_test(&mgr, entry)
+			.await
+			.unwrap_or_else(|error| {
+				panic!("a byte-identical copy must resolve as its version: {error}")
+			});
+		assert_eq!(read, (key, 100), "the version resolves to its one value");
+	}
+}
+
+#[tokio::test]
+async fn a_crash_between_tier_pointer_and_rows_never_serves_another_row() {
+	// Generation 1 of slab S: single-row frames a@10, b@20, c@30 at offsets
+	// 0, 4096, 8192. Generation 2 drops b and holds a@10, c@30 at 0, 4096,
+	// with the same frame shape, so b's generation-1 location (4096, len) is
+	// a valid frame of generation 2 that belongs to c. (Retention rewrites
+	// re-encode frames and change their length; a length-preserving
+	// publication is built directly here.)
+	let (dirs, mgr, l2) = fresh_manager_with_l2("pointer-row-crash").await;
+	let loc = Locality::new(0x7a00_0000_0000_0001);
+	let (a, b, c) = (id(0x7a01), id(0x7a02), id(0x7a03));
+	let append = |key: Identity, row_hlc: HybridTimestamp, value: u64| {
+		let mgr = mgr.clone();
+		async move {
+			let frame = encode_test_multirow_storage_frame(&[(key, loc, row_hlc, value)]);
+			let entries = storage_multirow_index_entries_from_frame(&frame)
+				.unwrap()
+				.expect("entries");
+			mgr.append_durable_multirow_with_locality(tenant(), &frame, &entries)
+				.await
+				.unwrap()
+		}
+	};
+	append(a, hlc(10), 1).await;
+	append(b, hlc(20), 2).await;
+	append(c, hlc(30), 3).await;
+	let pointer = tier_kv_slab(&mgr, &l2, "tier/pointer-row-crash.wnd").await;
+	let before_b = mgr.lookup(tenant(), b).unwrap().unwrap();
+	// Generation 2's plaintext, laid out in a scratch slab.
+	append(a, hlc(10), 1).await;
+	append(c, hlc(30), 3).await;
+	let scratch = force_seal_active(&mgr).await;
+	let raw = mgr.read_sealed_raw(scratch).await.unwrap();
+	// The scratch slab's offsets describe these bytes; the target slab's index
+	// still describes generation 1.
+	let encrypted = mgr
+		.encrypt_tiered_blob_with_evidence(
+			pointer.slab_id,
+			&raw,
+			&mgr.acknowledged_offsets_in_slab(scratch),
+			None,
+		)
+		.unwrap();
+	let uri = l2
+		.put("tier/pointer-row-crash-2.wnd", &encrypted.bytes)
+		.await
+		.unwrap();
+	let published = tiered_pointer_from_blob(&mgr, pointer.slab_id, uri, &encrypted.bytes);
+	let rewritten =
+		recover_slab_entries_from_blob(&raw, pointer.slab_id, &BTreeSet::new()).unwrap();
+	assert!(
+		rewritten.iter().any(|entry| entry.key_identity == c
+			&& (entry.location.offset, entry.location.length)
+				== (before_b.offset, before_b.length)),
+		"premise: b's old location is exactly generation 2's frame for c"
+	);
+	// An injected inconsistent (or legacy) state, not a crash boundary of the
+	// current publication paths, which persist a pointer and its row delta in
+	// one transaction: generation 2's pointer with generation 1's rows. Nothing
+	// durable says which generation the rows describe, so their offsets cannot
+	// tell a prior layout from an acknowledged record a historical writer
+	// omitted. The slab stays fenced pending a separately specified repair.
+	let rows_before = mgr.record_rows_for_slab_for_recovery(pointer.slab_id);
+	mgr.persist_tiered_pointer_strict(published, None)
+		.await
+		.unwrap();
+	let mgr = try_restart_tier_manager(mgr, &dirs, &l2).await.unwrap();
+	let fenced = Some(StaleLocation {
+		slab_id: pointer.slab_id,
+		reason: StaleLocationReason::Fenced,
+	});
+	// Authority never becomes ready over the ambiguous slab: the typed fence.
+	let error = tokio::time::timeout(Duration::from_secs(30), mgr.wait_tier_authority_ready())
+		.await
+		.expect("verification settles")
+		.expect_err("the ambiguous slab never verifies");
+	assert_eq!(stale_location(&error), fenced, "{error}");
+	// b's saved location is exactly generation 2's frame for c: read directly,
+	// it must never serve c's bytes.
+	match mgr.read(before_b).await {
+		Ok(bytes) => {
+			let decoded = std::panic::catch_unwind(|| {
+				frame_row_identity_and_value(&bytes, before_b.record_row_index)
+			});
+			if let Ok((served, value)) = decoded {
+				assert_eq!(
+					served, b,
+					"b's stale location served another row ({served}, value {value})"
+				);
+			}
+		}
+		Err(error) => assert!(stale_location(&error).is_some(), "{error}"),
+	}
+	for key in [a, b, c] {
+		let error = mgr
+			.lookup(tenant(), key)
+			.expect_err("the ambiguous slab answers no lookup");
+		assert_eq!(stale_location(&error), fenced, "{key}: {error}");
+	}
+	assert_eq!(
+		mgr.record_rows_for_slab_for_recovery(pointer.slab_id),
+		rows_before,
+		"the refused walk neither refreshes nor deletes a row"
+	);
+}
+
+// ------------------------------------------------------------------
+// Version identity is scoped by record class. Counter tentatives are
+// identified by (tenant, key, hlc, origin): the counter leader derives
+// the HLC from the op id with node id 0, so two origins legitimately share
+// (tenant, key, hlc) with different values. A conflict exists only within
+// one full counter identity.
+// ------------------------------------------------------------------
+
+fn counter_origin(id: u32) -> NodeId {
+	NodeId { id, _reserved: 0 }
+}
+
+/// The counter leader's HLC for an op id (counter.rs `commit_hlc_for`).
+fn counter_op_hlc(op_id: u64) -> HybridTimestamp {
+	HybridTimestamp {
+		physical_ms: op_id,
+		logical: 0,
+		node_id: 0,
+	}
+}
+
+async fn committed_counter_frame(
+	mgr: &SlabManager,
+	key: Identity,
+	op_id: u64,
+	value: u64,
+	origin: NodeId,
+) -> RecordLocation {
+	let location = mgr
+		.counter_append_tentative(tenant(), key, counter_op_hlc(op_id), value, origin)
+		.await
+		.unwrap();
+	mgr.counter_append_commit_marker(
+		tenant(),
+		key,
+		counter_op_hlc(op_id),
+		location.offset,
+		origin,
+	)
+	.await
+	.unwrap();
+	mgr.counter_commit_published(tenant(), key, location, origin);
+	location
+}
+
+/// Values of every indexed counter tentative of `key`, with their origins
+/// decoded from the frames.
+async fn counter_versions(mgr: &SlabManager, key: Identity) -> Vec<(u64, u64, u32)> {
+	let mut out = Vec::new();
+	for (_, scanned, _, location) in mgr
+		.scan_all_versions(Locality::ZERO, Locality::MAX, zero_hlc())
+		.unwrap()
+	{
+		if scanned != key {
+			continue;
+		}
+		let frame = mgr.read(location).await.unwrap();
+		let (value, origin) = super::super::counter::decode_origin_frame(&frame).unwrap();
+		out.push((location.hlc.physical_ms, value, origin.id));
+	}
+	out.sort();
+	out
+}
+
+#[tokio::test]
+async fn counter_tentatives_from_two_origins_at_one_hlc_are_not_conflicts() {
+	let (dirs, mgr, l2) = fresh_manager_with_l2("counter-two-origins").await;
+	let key = id(0x7c01);
+	committed_counter_frame(&mgr, key, 7, 5, counter_origin(1)).await;
+	// A second origin at the same op id, so the same (tenant, key, hlc).
+	committed_counter_frame(&mgr, key, 7, 9, counter_origin(2)).await;
+	assert_eq!(
+		counter_versions(&mgr, key).await,
+		vec![(7, 5, 1), (7, 9, 2)],
+		"both origins' tentatives are distinct counter versions"
+	);
+	force_seal_active(&mgr).await;
+	let mgr = restart_tier_manager(mgr, &dirs, &l2).await;
+	for location in mgr
+		.scan_all_versions(Locality::ZERO, Locality::MAX, zero_hlc())
+		.unwrap()
+		.into_iter()
+		.filter(|(_, scanned, _, _)| *scanned == key)
+		.map(|(_, _, _, location)| location)
+	{
+		if let Err(error) = mgr.read(location).await {
+			panic!(
+				"two origins sharing a counter HLC are not a conflict, but the read failed: {error}"
+			);
+		}
+	}
+	assert_eq!(
+		counter_versions(&mgr, key).await,
+		vec![(7, 5, 1), (7, 9, 2)]
+	);
+}
+
+#[tokio::test]
+async fn unequal_counter_values_under_one_full_identity_conflict() {
+	let (_dir, mgr) = fresh_manager().await;
+	let key = id(0x7c02);
+	committed_counter_frame(&mgr, key, 8, 5, counter_origin(1)).await;
+	match mgr
+		.counter_append_tentative(tenant(), key, counter_op_hlc(8), 6, counter_origin(1))
+		.await
+	{
+		Ok(_) => panic!(
+			"a different value under the same (tenant, key, hlc, origin) counter identity was accepted"
+		),
+		Err(error) => assert!(
+			is_conflicting_version_refusal(&error),
+			"expected the typed conflicting-version refusal, got {error}"
+		),
+	}
+	assert_eq!(counter_versions(&mgr, key).await, vec![(8, 5, 1)]);
+}
+
+#[tokio::test]
+async fn counter_markers_match_their_tentatives_across_a_rewrite_and_restart() {
+	let (dirs, mgr, l2) = fresh_manager_with_l2("counter-markers-rewrite").await;
+	let doomed = id(0x7c10);
+	mgr.append_durable(tenant(), doomed, hlc(1), b"doomed")
+		.await
+		.unwrap();
+	let key = id(0x7c11);
+	committed_counter_frame(&mgr, key, 9, 5, counter_origin(1)).await;
+	committed_counter_frame(&mgr, key, 9, 9, counter_origin(2)).await;
+	force_seal_active(&mgr).await;
+	let before = counter_versions(&mgr, key).await;
+	assert_eq!(before, vec![(9, 5, 1), (9, 9, 2)], "premise");
+	let target = Locality::from(doomed).get();
+	let tombstone = MigratedRangeTombstone {
+		migration_id: 1,
+		range_start: target,
+		range_end: target,
+		to_epoch: 2,
+		completed_by: NodeId {
+			id: 7,
+			_reserved: 0,
+		},
+		completed_at_hlc: hlc(1),
+		migration_hlc_floor: hlc(0),
+	};
+	let (schemas, indexes) = empty_compaction_catalogs();
+	mgr.reclaim_tombstoned_ranges(&[tombstone], &schemas, &indexes, 1)
+		.await
+		.unwrap();
+	assert_eq!(
+		counter_versions(&mgr, key).await,
+		before,
+		"a rewrite keeps each origin's committed tentative"
+	);
+	let mgr = restart_tier_manager(mgr, &dirs, &l2).await;
+	assert_eq!(
+		counter_versions(&mgr, key).await,
+		before,
+		"after a restart, each marker still matches its own origin's tentative"
+	);
+}
+
+// ------------------------------------------------------------------
+// A tier pointer can apply on a node that did not propose it (no local
+// reservation, possibly old in-process holders). The node's local serving must
+// serve the exact version or a typed refusal.
+// ------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_tier_apply_without_a_local_proposal_never_serves_another_row_to_old_holders() {
+	let fixture = seed_row_movement_fixture("tokenless-apply").await;
+	let mgr = &fixture.mgr;
+	// Old in-process holders: every live key's location before the apply.
+	let held = fixture.live.clone();
+	// The entry was proposed and committed elsewhere; this node only applies it.
+	publish_tier_retention_rewrite(
+		mgr,
+		&fixture.l2,
+		&fixture.pointer,
+		hlc(25),
+		"tier/tokenless-apply-1.wnd",
+	)
+	.await;
+	for (key, _row_hlc, value, location) in held {
+		assert_tier_read_is_its_row_or_refused(
+			mgr.read(location).await,
+			location,
+			key,
+			Some(value),
+			"an old holder after a token-less apply",
+		);
+	}
+}
+
+#[tokio::test]
+async fn a_different_pointer_after_a_missed_observation_never_serves_another_row() {
+	let fixture = seed_row_movement_fixture("missed-observation").await;
+	let mgr = &fixture.mgr;
+	let held = fixture.live.clone();
+	// Generation g+1 (floor 25) was applied by other nodes; this node missed it
+	// and applies g+2 (floor 45, a different pointer) directly over g.
+	let _missed = mgr
+		.prepare_tiered_retention_rewrite(&fixture.pointer, hlc(25), &TableSchemaCatalog::default())
+		.await
+		.unwrap()
+		.expect("premise: generation g+1 exists");
+	// Preparing g+1 poisons the slab DEK cache (DC-65); clear the caches so this
+	// control exercises the apply, not DC-65.
+	let crypto = mgr.config.crypto.clone();
+	let keysets = crypto.tenant_keysets_snapshot().unwrap();
+	crypto
+		.replace_keysets_from_authoritative_snapshot(&keysets)
+		.unwrap();
+	publish_tier_retention_rewrite(
+		mgr,
+		&fixture.l2,
+		&fixture.pointer,
+		hlc(45),
+		"tier/missed-observation-2.wnd",
+	)
+	.await;
+	for (key, row_hlc, value, location) in held {
+		let survives = !(key == id(0x7704) && row_hlc == hlc(30));
+		assert_tier_read_is_its_row_or_refused(
+			mgr.read(location).await,
+			location,
+			key,
+			survives.then_some(value),
+			"an old holder after a different pointer applied over a missed one",
+		);
+	}
+}
+
+// ------------------------------------------------------------------
+// Open-time slab files and the committed storage state. A file whose id the
+// committed state names otherwise (tiered, retired) is not data: open never
+// indexes it, retention never counts it, and a read never serves it.
+// ------------------------------------------------------------------
+
+/// A tiered slab of KV rows (k@10, k@20, j@30) whose local cache copy was
+/// promoted by repeated L2 reads (the rehydration path writes it at the slab's
+/// own path in the data directory).
+async fn seed_tiered_slab_with_local_copy(
+	tag: &str,
+) -> (
+	[crate::test_support::TestDir; 2],
+	Arc<SlabManager>,
+	Arc<dyn ObjectStore>,
+	TieredSlabPointer,
+	HashMap<Identity, Vec<HybridTimestamp>>,
+) {
+	let (dirs, mgr, l2) = fresh_manager_with_l2(tag).await;
+	let (k, j) = (id(0x7e01), id(0x7e02));
+	mgr.append(tenant(), k, hlc(10), b"k-10").await.unwrap();
+	mgr.append(tenant(), k, hlc(20), b"k-20").await.unwrap();
+	mgr.append(tenant(), j, hlc(30), b"j-30").await.unwrap();
+	let pointer = tier_kv_slab(&mgr, &l2, &format!("tier/{tag}.wnd")).await;
+	let before = version_hlcs_by_key(&mgr);
+	for _ in 0..4 {
+		let location = mgr.lookup(tenant(), j).unwrap().unwrap();
+		mgr.read(location).await.unwrap();
+	}
+	assert!(
+		slab_path(&mgr.config.dir, pointer.slab_id).exists(),
+		"premise: repeated L2 reads left a local copy at the tiered slab's own path"
+	);
+	(dirs, mgr, l2, pointer, before)
+}
+
+#[tokio::test]
+async fn a_local_copy_of_a_tiered_slab_is_never_indexed_after_restart() {
+	let (dirs, mgr, l2, pointer, before) =
+		seed_tiered_slab_with_local_copy("orphan-copy-indexed").await;
+	let mgr = restart_tier_manager(mgr, &dirs, &l2).await;
+	assert!(
+		!mgr.state.lock().await.sealed.contains_key(&pointer.slab_id),
+		"a tiered slab id must not also be registered as a sealed slab"
+	);
+	assert_eq!(
+		version_hlcs_by_key(&mgr),
+		before,
+		"a file for a tiered slab id must add no indexed version"
+	);
+}
+
+#[tokio::test]
+async fn retention_never_reclaims_because_of_a_local_copy_of_a_tiered_slab() {
+	let (dirs, mgr, l2, pointer, _before) =
+		seed_tiered_slab_with_local_copy("orphan-copy-retention").await;
+	let mgr = restart_tier_manager(mgr, &dirs, &l2).await;
+	let prepared = mgr
+		.prepare_tiered_retention_rewrite(&pointer, hlc(25), &TableSchemaCatalog::default())
+		.await
+		.unwrap();
+	match prepared {
+		Some(PreparedTieredRetentionRewrite::Rewrite {
+			pruned_versions, ..
+		}) => assert_eq!(pruned_versions, 1, "only k@10 is older than the floor"),
+		Some(PreparedTieredRetentionRewrite::Retire { .. }) => {
+			panic!("retention retired the whole slab because a file duplicated its rows")
+		}
+		other => panic!(
+			"expected one pruned version, got {:?}",
+			other.map(|_| "a different outcome")
+		),
+	}
+}
+
+#[tokio::test]
+async fn a_read_never_serves_a_local_copy_of_an_older_generation() {
+	let (dirs, mgr, l2, pointer, _before) =
+		seed_tiered_slab_with_local_copy("orphan-copy-older-generation").await;
+	let (k, j) = (id(0x7e01), id(0x7e02));
+	// Generation 1 (floor 25 prunes k@10) is committed with its rows, and the
+	// process stops before the publication removes the generation-0 copy.
+	let prepared = mgr
+		.prepare_tiered_table_retention_rewrite(
+			&pointer,
+			crate::storage::retention::MvccRetentionPolicy::fixed_window(
+				std::time::Duration::from_secs(15),
+			),
+			&TableLifecycleCatalog::default(),
+			&TableSchemaCatalog::default(),
+			15_025,
+		)
+		.await
+		.unwrap()
+		.expect("premise: a retention rewrite");
+	let PreparedTieredRetentionRewrite::Rewrite {
+		encrypted_bytes, ..
+	} = prepared
+	else {
+		panic!("premise: a rewrite with survivors");
+	};
+	let uri = l2
+		.put("tier/orphan-copy-older-generation-1.wnd", &encrypted_bytes)
+		.await
+		.unwrap();
+	let next = tiered_pointer_from_blob(&mgr, pointer.slab_id, uri, &encrypted_bytes);
+	let plan = mgr
+		.build_tiered_row_refresh_plan_from_l2(&next)
+		.await
+		.unwrap();
+	mgr.persistent_index
+		.as_ref()
+		.expect("persistent index")
+		.apply(PersistentIndexUpdate {
+			put_tiered_slabs: vec![next],
+			delete_records: plan.old_rows.clone(),
+			put_records: plan.new_rows.clone(),
+			..Default::default()
+		})
+		.await
+		.unwrap();
+	let mgr = restart_tier_manager(mgr, &dirs, &l2).await;
+	for (key, expected) in [(k, b"k-20".as_slice()), (j, b"j-30".as_slice())] {
+		let location = mgr
+			.lookup(tenant(), key)
+			.unwrap()
+			.expect("live key indexed");
+		match mgr.read(location).await {
+			Ok(bytes) => assert_eq!(
+				bytes, expected,
+				"a read served bytes other than the committed generation's row"
+			),
+			Err(error) => assert!(
+				is_superseded_tier_refusal(&error),
+				"expected the row or a typed refusal, got {error}"
+			),
+		}
+	}
+	assert!(
+		mgr.lookup_as_of(tenant(), k, hlc(15)).unwrap().is_none(),
+		"k@10, pruned by the committed generation, must not reappear from the older copy"
+	);
+}
+
+#[tokio::test]
+async fn a_leftover_file_of_a_retired_tiered_slab_is_never_indexed() {
+	let (dirs, mgr, l2, pointer, _before) =
+		seed_tiered_slab_with_local_copy("orphan-copy-retired").await;
+	// Production cut: the checked transaction committed, before memory
+	// removal or the local unlink. The durable retirement evidence must be
+	// sufficient to keep the leftover file from becoming authoritative.
+	let before = std::fs::read(slab_path(&mgr.config.dir, pointer.slab_id)).unwrap();
+	mgr.delete_tiered_slab_strict(pointer.slab_id, Some(701))
+		.await
+		.unwrap()
+		.unwrap()
+		.complete();
+	let snapshot = mgr
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot()
+		.await
+		.unwrap();
+	assert!(snapshot.tiered_slabs.is_empty());
+	assert!(
+		snapshot
+			.record_rows
+			.iter()
+			.all(|row| row.location.slab_id != pointer.slab_id)
+	);
+	let records = mgr
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot_cleanup_intents()
+		.await
+		.unwrap();
+	assert!(
+		records
+			.iter()
+			.any(|(slab, uri, intent)| *slab == pointer.slab_id
+				&& uri == &pointer.l2_uri
+				&& intent.state
+					== crate::storage::index::RetainedObjectIntentState::RetirementPublished)
+	);
+	let mgr = restart_tier_manager(mgr, &dirs, &l2).await;
+	assert!(
+		mgr.lookup(tenant(), id(0x7e02)).unwrap().is_none(),
+		"a retired tiered slab's rows must not be resurrected from a leftover file"
+	);
+	assert!(
+		crate::metrics::STORAGE_DISAGREEING_SLAB_FILE_REASONS
+			.contains(&DisagreeingSlabFileReason::RetiredTier.label())
+	);
+	assert!(
+		mgr.quarantined_slab_files()
+			.files
+			.iter()
+			.any(|file| file.slab_id == pointer.slab_id
+				&& file.reason == DisagreeingSlabFileReason::RetiredTier)
+	);
+	assert_file_unchanged(&mgr, pointer.slab_id, &before, "retired-file recovery");
+	assert!(l2.get(&pointer.l2_uri).await.is_ok());
+}
+
+#[tokio::test]
+async fn a_local_slab_unknown_to_the_persistent_index_is_still_recovered() {
+	// Guard: a sealed local slab whose rows never reached redb (a crash before
+	// the mirror) is recovered from its own bytes, as today.
+	let (dirs, mgr, l2) = fresh_manager_with_l2("unknown-local-slab").await;
+	let key = id(0x7e10);
+	append_below_manager(&mgr, key, hlc(10), 7).await;
+	force_seal_active(&mgr).await;
+	let mgr = restart_tier_manager(mgr, &dirs, &l2).await;
+	assert!(
+		mgr.lookup(tenant(), key).unwrap().is_some(),
+		"a local slab's bytes stay authoritative for rows redb never saw"
+	);
+}
+
+#[tokio::test]
+async fn a_crash_between_the_first_tier_commit_and_the_local_unlink_indexes_each_version_once() {
+	// The first tiering's pointer is committed, and the process stops before
+	// the sealed file is unlinked: the same slab id is on disk and in redb.
+	let (dirs, mgr, l2) = fresh_manager_with_l2("first-tier-unlink-crash").await;
+	let (k, j) = (id(0x7e21), id(0x7e22));
+	mgr.append(tenant(), k, hlc(10), b"k-10").await.unwrap();
+	mgr.append(tenant(), k, hlc(20), b"k-20").await.unwrap();
+	mgr.append(tenant(), j, hlc(30), b"j-30").await.unwrap();
+	let slab_id = force_seal_active(&mgr).await;
+	let before = version_hlcs_by_key(&mgr);
+	let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
+	let encrypted = mgr.encrypt_tiered_object_blob(slab_id, &raw).unwrap();
+	let uri = l2
+		.put("tier/first-tier-unlink-crash.wnd", &encrypted.bytes)
+		.await
+		.unwrap();
+	let pointer = tiered_pointer_from_blob(&mgr, slab_id, uri, &encrypted.bytes);
+	mgr.persist_tiered_pointer_strict(pointer, None)
+		.await
+		.unwrap();
+	let mgr = restart_tier_manager(mgr, &dirs, &l2).await;
+	assert_eq!(
+		version_hlcs_by_key(&mgr),
+		before,
+		"each version is indexed exactly once after the crash"
+	);
+	for (key, expected) in [(k, b"k-20".as_slice()), (j, b"j-30".as_slice())] {
+		let location = mgr.lookup(tenant(), key).unwrap().unwrap();
+		assert_eq!(mgr.read(location).await.unwrap(), expected);
+	}
+}
+
+#[tokio::test]
+async fn a_local_file_with_rows_its_tiered_object_lacks_is_preserved() {
+	// An intact L2 generation plus a local file for the same id that holds an
+	// extra acknowledged row: the file is evidence and is never auto-deleted,
+	// whatever open decides to serve.
+	let (dirs, mgr, l2) = fresh_manager_with_l2("extra-local-evidence").await;
+	let (k, extra) = (id(0x7e31), id(0x7e32));
+	mgr.append(tenant(), k, hlc(10), b"k-10").await.unwrap();
+	let slab_id = force_seal_active(&mgr).await;
+	let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
+	let encrypted = mgr.encrypt_tiered_object_blob(slab_id, &raw).unwrap();
+	let uri = l2
+		.put("tier/extra-local-evidence.wnd", &encrypted.bytes)
+		.await
+		.unwrap();
+	let pointer = tiered_pointer_from_blob(&mgr, slab_id, uri, &encrypted.bytes);
+	// The local file gains a row the uploaded object does not have.
+	{
+		let sealed = mgr.state.lock().await.sealed.get(&slab_id).unwrap().clone();
+		let frame =
+			encode_test_multirow_storage_frame(&[(extra, Locality::new(0x7e00), hlc(11), 9)]);
+		sealed
+			.append(tenant(), extra, hlc(11), &frame)
+			.await
+			.unwrap();
+		sealed.fsync().await.unwrap();
+	}
+	mgr.persist_tiered_pointer_strict(pointer, None)
+		.await
+		.unwrap();
+	let mgr = restart_tier_manager(mgr, &dirs, &l2).await;
+	if let Some(location) = mgr.lookup(tenant(), k).unwrap() {
+		let _ = mgr.read(location).await;
+	}
+	assert!(
+		slab_path(&mgr.config.dir, slab_id).exists(),
+		"a local file holding rows its tiered object lacks must never be deleted"
+	);
+}
+
+// ------------------------------------------------------------------
+// A file that disagrees with the tier state is evidence: runtime paths never
+// overwrite or unlink it, and no failure path falls back to serving it.
+// ------------------------------------------------------------------
+
+/// Restart over the same directories, running `before_open` on the data
+/// directory between the old manager's drop and the new open.
+async fn restart_tier_manager_with(
+	mgr: Arc<SlabManager>,
+	dirs: &[crate::test_support::TestDir; 2],
+	l2: &Arc<dyn ObjectStore>,
+	before_open: impl FnOnce(&std::path::Path),
+) -> std::io::Result<Arc<SlabManager>> {
+	mgr.fsync_all_local_slabs().await.unwrap();
+	let crypto = mgr.config.crypto.clone();
+	drop(mgr);
+	let keysets = crypto.tenant_keysets_snapshot().unwrap();
+	crypto
+		.replace_keysets_from_authoritative_snapshot(&keysets)
+		.unwrap();
+	before_open(&dirs[0]);
+	let manager = SlabManager::open(SlabManagerConfig {
+		dir: dirs[0].to_path_buf(),
+		max_slab_bytes: 1 << 20,
+		io: spawn_io_thread(64).unwrap(),
+		l2: Some(l2.clone()),
+		rehydration: RehydrationPolicy::default(),
+		l2_column_fetch: Default::default(),
+		row_group_writer: Default::default(),
+		l2_row_group_fetch: Default::default(),
+		encoding_writer: Default::default(),
+		l2_chunk_layout: Default::default(),
+		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
+		group_commit: GroupCommitConfig::default(),
+		crypto,
+	})
+	.await?;
+	manager.wait_tier_authority_ready().await?;
+	Ok(manager)
+}
+
+/// A tiered slab whose local copy is on disk when the node restarts: the copy
+/// disagrees with the tier state. Returns the copy's bytes.
+async fn seed_disagreeing_slab_file(
+	tag: &str,
+) -> (
+	[crate::test_support::TestDir; 2],
+	Arc<SlabManager>,
+	Arc<dyn ObjectStore>,
+	TieredSlabPointer,
+	HashMap<Identity, Vec<HybridTimestamp>>,
+	Vec<u8>,
+) {
+	let (dirs, mgr, l2, pointer, before) = seed_tiered_slab_with_local_copy(tag).await;
+	let path = slab_path(&mgr.config.dir, pointer.slab_id);
+	let mgr = restart_tier_manager(mgr, &dirs, &l2).await;
+	let bytes = std::fs::read(&path).unwrap();
+	(dirs, mgr, l2, pointer, before, bytes)
+}
+
+fn assert_file_unchanged(mgr: &SlabManager, slab_id: SlabId, bytes: &[u8], path_name: &str) {
+	match std::fs::read(slab_path(&mgr.config.dir, slab_id)) {
+		Ok(now) => assert!(
+			now == bytes,
+			"{path_name} overwrote the disagreeing slab file"
+		),
+		Err(error) => panic!("{path_name} removed the disagreeing slab file: {error}"),
+	}
+}
+
+#[tokio::test]
+async fn a_disagreeing_slab_file_survives_rehydration_and_versions_stay_exact() {
+	let (_dirs, mgr, _l2, pointer, before, bytes) =
+		seed_disagreeing_slab_file("disagreeing-rehydration").await;
+	for _ in 0..4 {
+		let location = mgr.lookup(tenant(), id(0x7e02)).unwrap().unwrap();
+		let _ = mgr.read(location).await;
+	}
+	assert_file_unchanged(&mgr, pointer.slab_id, &bytes, "rehydration");
+	assert_eq!(version_hlcs_by_key(&mgr), before, "versions stay exact");
+}
+
+#[tokio::test]
+async fn a_disagreeing_slab_file_survives_a_tier_publication() {
+	let (_dirs, mgr, l2, pointer, _before, bytes) =
+		seed_disagreeing_slab_file("disagreeing-publication").await;
+	publish_tier_retention_rewrite(
+		&mgr,
+		&l2,
+		&pointer,
+		hlc(25),
+		"tier/disagreeing-publication-1.wnd",
+	)
+	.await;
+	assert_file_unchanged(&mgr, pointer.slab_id, &bytes, "a tier publication");
+}
+
+#[tokio::test]
+async fn a_disagreeing_slab_file_survives_tier_retirement() {
+	let (_dirs, mgr, _l2, pointer, _before, bytes) =
+		seed_disagreeing_slab_file("disagreeing-retirement").await;
+	mgr.retire_tiered_slab_committed(pointer.slab_id, None)
+		.await
+		.unwrap();
+	assert_file_unchanged(&mgr, pointer.slab_id, &bytes, "tier retirement");
+}
+
+#[tokio::test]
+async fn a_disagreeing_slab_file_survives_cache_eviction() {
+	let (_dirs, mgr, _l2, pointer, before, bytes) =
+		seed_disagreeing_slab_file("disagreeing-eviction").await;
+	let _ = mgr.drop_rehydrated_slab(pointer.slab_id).await;
+	assert_file_unchanged(&mgr, pointer.slab_id, &bytes, "cache eviction");
+	assert_eq!(version_hlcs_by_key(&mgr), before, "versions stay exact");
+}
+
+#[tokio::test]
+async fn reads_refuse_typed_when_l2_is_unavailable_and_a_disagreeing_file_exists() {
+	let (_dirs, mgr, l2, pointer, _before, _bytes) =
+		seed_disagreeing_slab_file("disagreeing-l2-unavailable").await;
+	l2.delete(&pointer.l2_uri).await.unwrap();
+	let location = mgr.lookup(tenant(), id(0x7e02)).unwrap().unwrap();
+	for _ in 0..2 {
+		match mgr.read(location).await {
+			Ok(_) => panic!("with L2 unavailable, a read fell back to the disagreeing local file"),
+			// The refusal a tiered read without a local copy returns when its
+			// object is unavailable.
+			Err(error) => assert_eq!(
+				error.kind(),
+				ErrorKind::NotFound,
+				"expected the L2-unavailable refusal, got {error}"
+			),
+		}
+	}
+}
+
+#[tokio::test]
+async fn redb_unavailable_with_a_leftover_tiered_copy_never_serves_it_as_sealed() {
+	// Generation 1 (pruning k@10) is committed in redb, the generation-0 copy is
+	// still on disk, and redb then cannot be opened.
+	let (dirs, mgr, l2, pointer, _before) =
+		seed_tiered_slab_with_local_copy("redb-unavailable-leftover").await;
+	let (k, j) = (id(0x7e01), id(0x7e02));
+	let prepared = mgr
+		.prepare_tiered_table_retention_rewrite(
+			&pointer,
+			crate::storage::retention::MvccRetentionPolicy::fixed_window(
+				std::time::Duration::from_secs(15),
+			),
+			&TableLifecycleCatalog::default(),
+			&TableSchemaCatalog::default(),
+			15_025,
+		)
+		.await
+		.unwrap()
+		.expect("premise: a retention rewrite");
+	let PreparedTieredRetentionRewrite::Rewrite {
+		encrypted_bytes, ..
+	} = prepared
+	else {
+		panic!("premise: a rewrite with survivors");
+	};
+	let uri = l2
+		.put("tier/redb-unavailable-leftover-1.wnd", &encrypted_bytes)
+		.await
+		.unwrap();
+	let next = tiered_pointer_from_blob(&mgr, pointer.slab_id, uri, &encrypted_bytes);
+	// Committed with its rows; the process stops before the generation-0 copy
+	// is unlinked.
+	let plan = mgr
+		.build_tiered_row_refresh_plan_from_l2(&next)
+		.await
+		.unwrap();
+	mgr.persistent_index
+		.as_ref()
+		.expect("persistent index")
+		.apply(PersistentIndexUpdate {
+			put_tiered_slabs: vec![next],
+			delete_records: plan.old_rows.clone(),
+			put_records: plan.new_rows.clone(),
+			..Default::default()
+		})
+		.await
+		.unwrap();
+	let reopened = restart_tier_manager_with(mgr, &dirs, &l2, |dir| {
+		std::fs::write(dir.join("storage_index.redb"), b"not a redb file").unwrap();
+	})
+	.await;
+	let Ok(mgr) = reopened else {
+		// Open refused: the node fences rather than guessing the slab's state.
+		return;
+	};
+	assert!(
+		mgr.lookup_as_of(tenant(), k, hlc(15)).unwrap().is_none(),
+		"k@10, pruned by the committed generation, was served from a leftover copy"
+	);
+	for (key, expected) in [(k, b"k-20".as_slice()), (j, b"j-30".as_slice())] {
+		if let Some(location) = mgr.lookup(tenant(), key).unwrap() {
+			match mgr.read(location).await {
+				Ok(bytes) => assert_eq!(bytes, expected),
+				Err(error) => assert!(is_superseded_tier_refusal(&error), "{error}"),
+			}
+		}
+	}
+}
+
+#[tokio::test]
+async fn a_tiered_slab_id_that_is_the_highest_file_never_becomes_the_active_slab() {
+	let (dirs, mgr, l2, pointer, before) =
+		seed_tiered_slab_with_local_copy("tiered-highest-id").await;
+	let tiered_id = pointer.slab_id;
+	let mgr = restart_tier_manager_with(mgr, &dirs, &l2, |dir| {
+		// Every file above the tiered id (the empty active slab) is gone.
+		for entry in std::fs::read_dir(dir).unwrap().filter_map(Result::ok) {
+			let name = entry.file_name().to_string_lossy().to_string();
+			if let Some(hex) = name
+				.strip_prefix("slab_")
+				.and_then(|n| n.strip_suffix(".wnd"))
+			{
+				if u64::from_str_radix(hex, 16).unwrap() > tiered_id.get() {
+					std::fs::remove_file(entry.path()).unwrap();
+				}
+			}
+		}
+	})
+	.await
+	.unwrap();
+	let fresh = mgr
+		.append(tenant(), id(0x7e40), hlc(50), b"after-restart")
+		.await
+		.unwrap();
+	assert_ne!(
+		fresh.slab_id, tiered_id,
+		"a new write landed in a tiered slab's id"
+	);
+	let mut after = version_hlcs_by_key(&mgr);
+	after.remove(&id(0x7e40));
+	assert_eq!(after, before, "versions stay exact");
+}
+
+#[tokio::test]
+async fn a_foreign_file_at_a_tiered_slab_path_is_never_indexed() {
+	let (dirs, mgr, l2, pointer, before) = seed_tiered_slab_with_local_copy("foreign-file").await;
+	// A copy of another slab's bytes ends up at the tiered slab's path. The
+	// original stays: its rows are acknowledged and recovery must find them.
+	let foreign_key = id(0x7e50);
+	let foreign = mgr
+		.append(tenant(), foreign_key, hlc(60), b"foreign")
+		.await
+		.unwrap();
+	let foreign_slab = force_seal_active(&mgr).await;
+	let foreign_bytes = mgr.read_sealed_raw(foreign_slab).await.unwrap();
+	let target = slab_path(&mgr.config.dir, pointer.slab_id);
+	let mgr = restart_tier_manager_with(mgr, &dirs, &l2, move |_dir| {
+		std::fs::write(&target, &foreign_bytes).unwrap();
+	})
+	.await
+	.unwrap();
+	assert_eq!(
+		mgr.lookup(tenant(), foreign_key).unwrap(),
+		Some(foreign),
+		"a foreign file at a tiered slab's path was indexed"
+	);
+	let mut after = version_hlcs_by_key(&mgr);
+	after.remove(&foreign_key);
+	assert_eq!(after, before, "the tiered slab's versions stay exact");
+}
+
+#[tokio::test]
+async fn delete_pending_lsm_sources_are_not_indexed_after_restart() {
+	let (dirs, mgr, l2) = fresh_manager_with_l2("lsm-delete-pending-restart").await;
+	let keys = seed_lsm_relocation_fixture(&mgr).await;
+	let worker = LsmCompactionWorker::new(LsmConfig::default(), mgr.slab_pin_table()).unwrap();
+	mgr.run_lsm_compaction_tick(&worker, hlc(20_000))
+		.await
+		.unwrap()
+		.expect("premise: a compaction");
+	let after_compaction = version_hlcs_by_key(&mgr);
+	let values = newest_values(&mgr, &keys).await;
+	let mgr = restart_tier_manager(mgr, &dirs, &l2).await;
+	assert_eq!(
+		version_hlcs_by_key(&mgr),
+		after_compaction,
+		"retired LSM sources left on disk add no versions"
+	);
+	assert_eq!(newest_values(&mgr, &keys).await, values);
+}
+
+#[tokio::test]
+async fn counter_state_in_a_tiered_slab_survives_a_restart() {
+	let (dirs, mgr, l2) = fresh_manager_with_l2("counter-tiered-restart").await;
+	let key = id(0x7e60);
+	committed_counter_frame(&mgr, key, 11, 5, counter_origin(1)).await;
+	committed_counter_frame(&mgr, key, 11, 9, counter_origin(2)).await;
+	let before = counter_versions(&mgr, key).await;
+	assert_eq!(before, vec![(11, 5, 1), (11, 9, 2)], "premise");
+	// Tiering a counter-bearing slab is refused, so its counter state never
+	// moves to L2; if tiering ever accepts it, the state must survive anyway.
+	let slab_id = force_seal_active(&mgr).await;
+	let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
+	match mgr.encrypt_tiered_object_blob(slab_id, &raw) {
+		Err(error) => assert_eq!(
+			error.kind(),
+			ErrorKind::InvalidData,
+			"tiering a counter-bearing slab is refused: {error}"
+		),
+		Ok(encrypted) => {
+			let uri = l2
+				.put("tier/counter-tiered-restart.wnd", &encrypted.bytes)
+				.await
+				.unwrap();
+			let pointer = tiered_pointer_from_blob(&mgr, slab_id, uri, &encrypted.bytes);
+			mgr.apply_tier_slab(pointer).await.unwrap();
+		}
+	}
+	let mgr = restart_tier_manager(mgr, &dirs, &l2).await;
+	let after = mgr
+		.scan_all_versions(Locality::ZERO, Locality::MAX, zero_hlc())
+		.unwrap()
+		.into_iter()
+		.filter(|(_, scanned, _, _)| *scanned == key)
+		.count();
+	assert_eq!(
+		after,
+		before.len(),
+		"counter versions in a tiered slab must survive a restart"
+	);
+}
+
+// ------------------------------------------------------------------
+// An interrupted runtime operation and its retry never remove or replace a
+// file that disagrees with the tier state, and a failed tier read never falls
+// back to it.
+// ------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_disagreeing_slab_file_survives_an_interrupted_tier_publication_and_its_retry() {
+	let (dirs, mgr, l2, pointer, _before, bytes) =
+		seed_disagreeing_slab_file("disagreeing-publication-retry").await;
+	let (k, j) = (id(0x7e01), id(0x7e02));
+	let prepared = mgr
+		.prepare_tiered_retention_rewrite(&pointer, hlc(25), &TableSchemaCatalog::default())
+		.await
+		.unwrap()
+		.expect("premise: a retention rewrite");
+	let PreparedTieredRetentionRewrite::Rewrite {
+		encrypted_bytes,
+		tombstone_metadata,
+		supersession_metadata,
+		..
+	} = prepared
+	else {
+		panic!("premise: a rewrite with survivors");
+	};
+	let uri = l2
+		.put("tier/disagreeing-publication-retry-1.wnd", &encrypted_bytes)
+		.await
+		.unwrap();
+	let next = TieredSlabPointer {
+		tombstone_metadata,
+		supersession_metadata,
+		..tiered_pointer_from_blob(&mgr, pointer.slab_id, uri, &encrypted_bytes)
+	};
+	// The first attempt commits generation 1 durably and is interrupted before
+	// it installs the pointer.
+	let pause = mgr.pause_tier_publication_before_pointer_once();
+	let first = tokio::spawn({
+		let mgr = mgr.clone();
+		let next = next.clone();
+		async move { mgr.apply_tier_slab_committed(next, None).await }
+	});
+	pause.reached.notified().await;
+	first.abort();
+	let _ = first.await;
+	assert_file_unchanged(
+		&mgr,
+		pointer.slab_id,
+		&bytes,
+		"an interrupted tier publication",
+	);
+	let refused = mgr.apply_tier_slab_committed(next, None).await.unwrap_err();
+	assert!(stale_location(&refused).is_some(), "{refused}");
+	let blocked = mgr.lookup(tenant(), k).unwrap_err();
+	assert_eq!(blocked.kind(), ErrorKind::WouldBlock);
+	assert!(
+		blocked
+			.to_string()
+			.contains("TierAuthorityPublicationPending")
+	);
+	let mgr = restart_tier_manager(mgr, &dirs, &l2).await;
+	mgr.wait_tier_authority_ready().await.unwrap();
+	assert_file_unchanged(&mgr, pointer.slab_id, &bytes, "reopened tier publication");
+	let expected: HashMap<Identity, Vec<HybridTimestamp>> =
+		[(k, vec![hlc(20)]), (j, vec![hlc(30)])]
+			.into_iter()
+			.collect();
+	assert_eq!(
+		version_hlcs_by_key(&mgr),
+		expected,
+		"generation 1's versions, each exactly once"
+	);
+	let values: BTreeMap<Identity, Vec<u8>> = [(k, b"k-20".to_vec()), (j, b"j-30".to_vec())]
+		.into_iter()
+		.collect();
+	assert_eq!(newest_values(&mgr, &[k, j]).await, values);
+}
+
+#[tokio::test]
+async fn a_disagreeing_slab_file_survives_tier_retirement_its_retry_and_deferred_cleanup() {
+	let (_dirs, mgr, _l2, pointer, _before, bytes) =
+		seed_disagreeing_slab_file("disagreeing-retirement-retry").await;
+	let (k, j) = (id(0x7e01), id(0x7e02));
+	let held = mgr.lookup(tenant(), j).unwrap().unwrap();
+	assert!(
+		mgr.retire_tiered_slab_committed(pointer.slab_id, None)
+			.await
+			.unwrap(),
+		"premise: the retirement removes the slab"
+	);
+	assert!(
+		!mgr.retire_tiered_slab_committed(pointer.slab_id, None)
+			.await
+			.unwrap(),
+		"a retried retirement changes nothing"
+	);
+	// The object delete was interrupted, so the cleanup stays pending and a
+	// sweeper pass retries the local part, more than once.
+	let pending = mgr
+		.list_retired_tiered_cleanup_candidates()
+		.await
+		.into_iter()
+		.map(|candidate| candidate.slab_id)
+		.collect::<Vec<_>>();
+	assert_eq!(
+		pending,
+		vec![pointer.slab_id],
+		"premise: the retirement's cleanup is pending"
+	);
+	for _ in 0..2 {
+		mgr.retry_retired_tiered_local_cleanup(pointer.slab_id)
+			.await
+			.unwrap();
+	}
+	assert_file_unchanged(
+		&mgr,
+		pointer.slab_id,
+		&bytes,
+		"a retired slab's deferred cleanup",
+	);
+	assert!(
+		mgr.lookup(tenant(), k).unwrap().is_none() && mgr.lookup(tenant(), j).unwrap().is_none(),
+		"the retired slab's rows are gone"
+	);
+	let error = mgr
+		.read(held)
+		.await
+		.expect_err("a location of the retired slab never serves");
+	assert_eq!(error.kind(), ErrorKind::NotFound, "{error}");
+}
+
+#[tokio::test]
+async fn an_interrupted_copy_eviction_finishes_on_retry_and_never_touches_a_disagreeing_file() {
+	let (_dirs, mgr, l2, pointer, before, bytes) =
+		seed_disagreeing_slab_file("disagreeing-eviction-retry").await;
+	let (k, j, b) = (id(0x7e01), id(0x7e02), id(0x7e70));
+	// A second tiered slab, whose copy this process installs.
+	mgr.append(tenant(), b, hlc(70), b"b-70").await.unwrap();
+	let other = tier_kv_slab(&mgr, &l2, "tier/disagreeing-eviction-retry-b.wnd").await;
+	for _ in 0..4 {
+		let location = mgr.lookup(tenant(), b).unwrap().unwrap();
+		assert_eq!(mgr.read(location).await.unwrap(), b"b-70");
+	}
+	let copy = slab_path(&mgr.config.dir, other.slab_id);
+	assert!(
+		mgr.is_rehydrated(other.slab_id).await && copy.exists(),
+		"premise: repeated L2 reads installed a copy"
+	);
+	// The eviction is interrupted after the copy left `state` and before its
+	// file is unlinked; the retry finishes exactly that copy.
+	let pause = mgr.pause_rehydrated_copy_eviction_before_unlink_once();
+	let first = tokio::spawn({
+		let mgr = mgr.clone();
+		let slab_id = other.slab_id;
+		async move { mgr.drop_rehydrated_slab(slab_id).await }
+	});
+	pause.reached.notified().await;
+	first.abort();
+	let _ = first.await;
+	assert!(
+		copy.exists(),
+		"premise: the interrupted eviction left its copy"
+	);
+	mgr.drop_rehydrated_slab(other.slab_id).await.unwrap();
+	assert!(
+		!copy.exists(),
+		"a retried eviction finishes removing the copy it released"
+	);
+	for _ in 0..2 {
+		assert!(
+			!mgr.drop_rehydrated_slab(pointer.slab_id).await.unwrap(),
+			"a disagreeing file is not a copy to evict"
+		);
+	}
+	assert_file_unchanged(
+		&mgr,
+		pointer.slab_id,
+		&bytes,
+		"cache eviction and its retry",
+	);
+	let mut expected = before;
+	expected.insert(b, vec![hlc(70)]);
+	assert_eq!(version_hlcs_by_key(&mgr), expected, "versions stay exact");
+	let values: BTreeMap<Identity, Vec<u8>> = [
+		(k, b"k-20".to_vec()),
+		(j, b"j-30".to_vec()),
+		(b, b"b-70".to_vec()),
+	]
+	.into_iter()
+	.collect();
+	assert_eq!(newest_values(&mgr, &[k, j, b]).await, values);
+}
+
+#[tokio::test]
+async fn a_disagreeing_slab_file_survives_an_interrupted_read_and_retried_rehydration() {
+	let (_dirs, mgr, _l2, pointer, before, bytes) =
+		seed_disagreeing_slab_file("disagreeing-rehydration-retry").await;
+	let (k, j) = (id(0x7e01), id(0x7e02));
+	let held = mgr.lookup(tenant(), j).unwrap().unwrap();
+	// A read is interrupted after resolving its location, then reads continue
+	// well past the promotion threshold.
+	let pause = mgr.pause_read_before_backing_selection_once();
+	let first = tokio::spawn({
+		let mgr = mgr.clone();
+		async move { mgr.read(held).await }
+	});
+	pause.reached.notified().await;
+	first.abort();
+	let _ = first.await;
+	for _ in 0..7 {
+		assert_eq!(mgr.read(held).await.unwrap(), b"j-30");
+	}
+	assert!(
+		!mgr.is_rehydrated(pointer.slab_id).await,
+		"a slab whose path holds a disagreeing file is never rehydrated over it"
+	);
+	assert_file_unchanged(&mgr, pointer.slab_id, &bytes, "rehydration and its retries");
+	assert_eq!(version_hlcs_by_key(&mgr), before, "versions stay exact");
+	let values: BTreeMap<Identity, Vec<u8>> = [(k, b"k-20".to_vec()), (j, b"j-30".to_vec())]
+		.into_iter()
+		.collect();
+	assert_eq!(newest_values(&mgr, &[k, j]).await, values);
+}
+
+#[tokio::test]
+async fn reads_refuse_typed_when_the_tiered_object_fails_verification_and_a_disagreeing_file_exists()
+ {
+	let (_dirs, mgr, l2, pointer, _before, bytes) =
+		seed_disagreeing_slab_file("disagreeing-l2-corrupt").await;
+	// The object the committed pointer names no longer matches its hash.
+	l2.put(
+		"tier/disagreeing-l2-corrupt.wnd",
+		b"not the committed object",
+	)
+	.await
+	.unwrap();
+	let location = mgr.lookup(tenant(), id(0x7e02)).unwrap().unwrap();
+	for _ in 0..2 {
+		match mgr.read(location).await {
+			Ok(_) => panic!("with L2 failing verification, a read fell back to the local file"),
+			Err(error) => assert_eq!(
+				error.kind(),
+				ErrorKind::InvalidData,
+				"expected the verification refusal, got {error}"
+			),
+		}
+	}
+	assert_file_unchanged(&mgr, pointer.slab_id, &bytes, "a failed verification");
+}
+
+#[tokio::test]
+async fn a_quarantined_slab_file_is_reported_exactly_and_never_authorizes_cleanup() {
+	let (_dirs, mgr, _l2, pointer, _before, bytes) =
+		seed_disagreeing_slab_file("quarantine-report").await;
+	assert!(
+		crate::metrics::STORAGE_DISAGREEING_SLAB_FILE_REASONS
+			.contains(&DisagreeingSlabFileReason::TierPointer.label()),
+		"the reason is in the exporter's bounded label set"
+	);
+	let file = QuarantinedSlabFile {
+		slab_id: pointer.slab_id,
+		bytes: bytes.len() as u64,
+		reason: DisagreeingSlabFileReason::TierPointer,
+	};
+	assert_eq!(
+		mgr.quarantined_slab_files(),
+		QuarantinedSlabFilesReport {
+			files: vec![file],
+			rehydrations_skipped: 0,
+		}
+	);
+	// Every promotion the slab's L2 reads reach is one skipped rehydration.
+	let promote_after = RehydrationPolicy::default().promote_after_l2_reads as usize;
+	let held = mgr.lookup(tenant(), id(0x7e02)).unwrap().unwrap();
+	for _ in 0..2 * promote_after {
+		assert_eq!(mgr.read(held).await.unwrap(), b"j-30");
+	}
+	assert_eq!(
+		mgr.quarantined_slab_files(),
+		QuarantinedSlabFilesReport {
+			files: vec![file],
+			rehydrations_skipped: 2,
+		}
+	);
+	// Reporting never authorizes cleanup: no cleanup path removes the file.
+	mgr.retry_retired_tiered_local_cleanup(pointer.slab_id)
+		.await
+		.unwrap();
+	assert!(!mgr.drop_rehydrated_slab(pointer.slab_id).await.unwrap());
+	assert_file_unchanged(
+		&mgr,
+		pointer.slab_id,
+		&bytes,
+		"reporting and cleanup retries",
+	);
+	// The process gauges hold at least this manager's file while it lives
+	// (other managers in this process may add their own).
+	let rendered = crate::metrics::global().render_prometheus();
+	let gauge = |name: &str| {
+		rendered
+			.lines()
+			.find_map(|line| line.strip_prefix(&format!("{name} ")))
+			.and_then(|value| value.parse::<u64>().ok())
+			.unwrap_or_else(|| panic!("{name} is not exported"))
+	};
+	assert!(gauge("wendelon_storage_quarantined_slab_files") >= 1);
+	assert!(gauge("wendelon_storage_quarantined_slab_file_bytes") >= bytes.len() as u64);
+}
+
+// ------------------------------------------------------------------
+// Physical location is not logical identity across a tier publication.
+// Keys a and b written in one batch share an HLC, and their rows have equal
+// sizes. A retention rewrite that prunes a@10 moves b@10 into a@10's old
+// physical slot: the same slab, offset, length, HLC and row index. A
+// `RecordLocation` carries no key, so a holder of a@10's location could not
+// be told apart from a holder of b@10's new one.
+// ------------------------------------------------------------------
+
+struct PrunedSlotReuseFixture {
+	dirs: [crate::test_support::TestDir; 2],
+	mgr: Arc<SlabManager>,
+	l2: Arc<dyn ObjectStore>,
+	pointer: TieredSlabPointer,
+	/// The rewrite a proposer without this node's history would publish.
+	rewritten: TieredSlabPointer,
+	held_a: RecordLocation,
+	held_b: RecordLocation,
+}
+
+const SLOT_REUSE_A: u64 = 0x9A01;
+const SLOT_REUSE_B: u64 = 0x9A02;
+
+/// a@10 and b@10 share an HLC and a row size; a@20 makes a@10 prunable at a
+/// floor of 25, while b@10 is b's only version and survives.
+async fn seed_pruned_slot_reuse_fixture(tag: &str) -> PrunedSlotReuseFixture {
+	let (dirs, mgr, l2) = fresh_manager_with_l2(tag).await;
+	let (a, b) = (id(SLOT_REUSE_A), id(SLOT_REUSE_B));
+	mgr.append(tenant(), a, hlc(10), b"a-10").await.unwrap();
+	mgr.append(tenant(), b, hlc(10), b"b-10").await.unwrap();
+	mgr.append(tenant(), a, hlc(20), b"a-20").await.unwrap();
+	let pointer = tier_kv_slab(&mgr, &l2, &format!("tier/{tag}.wnd")).await;
+	let held_a = mgr.lookup_as_of(tenant(), a, hlc(15)).unwrap().unwrap();
+	let held_b = mgr.lookup(tenant(), b).unwrap().unwrap();
+	assert_eq!(
+		(held_a.hlc, held_a.length, held_a.record_row_index),
+		(held_b.hlc, held_b.length, held_b.record_row_index),
+		"premise: a@10 and b@10 share an HLC, a row size and a row index"
+	);
+	let prepared = mgr
+		.prepare_tiered_retention_rewrite(&pointer, hlc(25), &TableSchemaCatalog::default())
+		.await
+		.unwrap()
+		.expect("premise: a@10 is prunable");
+	let PreparedTieredRetentionRewrite::Rewrite {
+		encrypted_bytes,
+		tombstone_metadata,
+		supersession_metadata,
+		..
+	} = prepared
+	else {
+		panic!("premise: a rewrite with survivors");
+	};
+	let uri = l2
+		.put(&format!("tier/{tag}-rewritten.wnd"), &encrypted_bytes)
+		.await
+		.unwrap();
+	let rewritten = TieredSlabPointer {
+		tombstone_metadata,
+		supersession_metadata,
+		..tiered_pointer_from_blob(&mgr, pointer.slab_id, uri, &encrypted_bytes)
+	};
+	let new_rows = mgr.load_tiered_rows_from_l2(&rewritten).await.unwrap();
+	let b_new = new_rows
+		.iter()
+		.find(|row| row.key_identity == b)
+		.expect("premise: b@10 survives the rewrite")
+		.location;
+	assert_eq!(
+		b_new, held_a,
+		"premise: the rewrite moves b@10 into a@10's old physical location"
+	);
+	PrunedSlotReuseFixture {
+		dirs,
+		mgr,
+		l2,
+		pointer,
+		rewritten,
+		held_a,
+		held_b,
+	}
+}
+
+/// a@10 is read exactly or refused typed; it is never served as b's row.
+async fn assert_pruned_version_never_reads_another_key(
+	mgr: &SlabManager,
+	location: RecordLocation,
+	what: &str,
+) {
+	match mgr.read(location).await {
+		Ok(bytes) => assert_eq!(bytes, b"a-10", "{what}: a@10 was served as another row"),
+		Err(error) => assert!(
+			stale_location(&error).is_some(),
+			"{what}: an untyped failure: {error}"
+		),
+	}
+}
+
+/// Every read of the fixture's versions: direct lookups, the locations held
+/// from before the publication, and the logical (secondary-index) resolution.
+async fn assert_slot_reuse_reads_exact(
+	mgr: &SlabManager,
+	held_a: RecordLocation,
+	held_b: RecordLocation,
+	step: &str,
+) {
+	let (a, b) = (id(SLOT_REUSE_A), id(SLOT_REUSE_B));
+	if let Some(location) = mgr.lookup_as_of(tenant(), a, hlc(15)).unwrap() {
+		assert_pruned_version_never_reads_another_key(mgr, location, &format!("{step}: a@10"))
+			.await;
+	}
+	assert_pruned_version_never_reads_another_key(mgr, held_a, &format!("{step}: held a@10")).await;
+	match mgr.resolve_logical_version(tenant(), a, hlc(10), held_a) {
+		Ok(location) => {
+			assert_pruned_version_never_reads_another_key(
+				mgr,
+				location,
+				&format!("{step}: a@10 resolved logically"),
+			)
+			.await
+		}
+		Err(error) => assert!(
+			stale_location(&error).is_some(),
+			"{step}: logical a@10: an untyped failure: {error}"
+		),
+	}
+	let latest_a = mgr.lookup(tenant(), a).unwrap().expect("a keeps a@20");
+	assert_eq!(latest_a.hlc, hlc(20));
+	assert_eq!(mgr.read(latest_a).await.unwrap(), b"a-20", "{step}: a@20");
+	let latest_b = mgr.lookup(tenant(), b).unwrap().expect("b keeps b@10");
+	assert_eq!(mgr.read(latest_b).await.unwrap(), b"b-10", "{step}: b@10");
+	assert_eq!(
+		mgr.read(held_b).await.unwrap(),
+		b"b-10",
+		"{step}: held b@10"
+	);
+	let logical_b = mgr
+		.resolve_logical_version(tenant(), b, hlc(10), held_b)
+		.unwrap();
+	assert_eq!(
+		mgr.read(logical_b).await.unwrap(),
+		b"b-10",
+		"{step}: b@10 resolved logically"
+	);
+	for location in mgr
+		.key_index
+		.get(&(tenant(), a))
+		.map(|chain| chain.value().clone())
+		.unwrap_or_default()
+	{
+		assert_ne!(
+			mgr.read(location).await.ok().as_deref(),
+			Some(&b"b-10"[..]),
+			"{step}: a's index names a location that reads b's row"
+		);
+	}
+}
+
+#[tokio::test]
+async fn a_publication_that_moves_another_key_into_a_pruned_location_is_refused() {
+	let fixture = seed_pruned_slot_reuse_fixture("slot-reuse-publication").await;
+	let PrunedSlotReuseFixture {
+		dirs,
+		mgr,
+		l2,
+		pointer,
+		rewritten,
+		held_a,
+		held_b,
+	} = fixture;
+	assert_slot_reuse_reads_exact(&mgr, held_a, held_b, "before the publication").await;
+
+	// An observer applies the committed pointer: a@10's old location would
+	// name b@10, so the two meanings cannot be told apart and the publication
+	// is refused whole, before the pointer or any row changes.
+	let refused = mgr
+		.apply_tier_slab_committed(rewritten.clone(), None)
+		.await
+		.expect_err("a publication that reuses a pruned version's location for another key");
+	assert_eq!(
+		stale_location(&refused),
+		Some(StaleLocation {
+			slab_id: pointer.slab_id,
+			reason: StaleLocationReason::LayoutCollision,
+		}),
+		"{refused}"
+	);
+	assert_eq!(
+		mgr.tier_pointer(pointer.slab_id).await,
+		Some(pointer.clone()),
+		"a refused publication leaves the published generation"
+	);
+	for error in [
+		mgr.lookup(tenant(), id(SLOT_REUSE_A)).unwrap_err(),
+		mgr.read(held_a).await.unwrap_err(),
+		mgr.read(held_b).await.unwrap_err(),
+	] {
+		assert_eq!(
+			stale_location(&error).map(|reason| reason.reason),
+			Some(StaleLocationReason::Fenced)
+		);
+	}
+
+	let mgr = restart_tier_manager(mgr, &dirs, &l2).await;
+	assert_eq!(
+		mgr.tier_pointer(pointer.slab_id).await,
+		Some(pointer.clone()),
+		"the refused pointer was never persisted"
+	);
+	assert_slot_reuse_reads_exact(&mgr, held_a, held_b, "after a restart").await;
+	let refused = mgr
+		.apply_tier_slab_committed(rewritten, None)
+		.await
+		.expect_err("the publication stays refused after a restart");
+	assert_eq!(
+		stale_location(&refused).map(|refusal| refusal.reason),
+		Some(StaleLocationReason::LayoutCollision),
+		"{refused}"
+	);
+	for error in [
+		mgr.lookup(tenant(), id(SLOT_REUSE_A)).unwrap_err(),
+		mgr.read(held_a).await.unwrap_err(),
+		mgr.read(held_b).await.unwrap_err(),
+	] {
+		assert_eq!(
+			stale_location(&error).map(|reason| reason.reason),
+			Some(StaleLocationReason::Fenced)
+		);
+	}
+}
+
+#[tokio::test]
+async fn tier_row_refresh_removes_a_pruned_version_whose_location_another_key_takes() {
+	let fixture = seed_pruned_slot_reuse_fixture("slot-reuse-refresh").await;
+	let mgr = &fixture.mgr;
+	let (a, b) = (id(SLOT_REUSE_A), id(SLOT_REUSE_B));
+	let slab_id = fixture.pointer.slab_id;
+	// The index-level classification, apart from the publication's history:
+	// the rewritten generation is the published one, and its row refresh runs.
+	mgr.state
+		.lock()
+		.await
+		.tiered
+		.insert(slab_id, fixture.rewritten.clone());
+	// The replaced generation, as production passes it to the refresh.
+	let plan = mgr
+		.build_tiered_row_refresh_plan(&fixture.rewritten, Some(&fixture.pointer))
+		.await
+		.unwrap();
+	mgr.apply_tiered_row_refresh_plan(plan).await;
+
+	let chain = |key: Identity| {
+		mgr.key_index
+			.get(&(tenant(), key))
+			.map(|chain| chain.value().clone())
+			.unwrap_or_default()
+	};
+	let a_chain = chain(a);
+	assert_eq!(
+		a_chain
+			.iter()
+			.map(|location| location.hlc)
+			.collect::<Vec<_>>(),
+		vec![hlc(20)],
+		"the pruned a@10 is removed even though b@10 now stands at its old location: {a_chain:?}"
+	);
+	assert_eq!(
+		chain(b),
+		vec![fixture.held_a],
+		"b@10 is indexed once, at its new location"
+	);
+	assert_eq!(mgr.read(a_chain[0]).await.unwrap(), b"a-20");
+	assert_eq!(
+		mgr.read(mgr.lookup(tenant(), b).unwrap().unwrap())
+			.await
+			.unwrap(),
+		b"b-10"
+	);
+	assert!(
+		mgr.lookup_as_of(tenant(), a, hlc(15)).unwrap().is_none(),
+		"a@10 is gone from a's history"
+	);
+}
+
+// ------------------------------------------------------------------
+// A tiered read verifies the decoded frame names the requested version: the
+// decoded HLC and row for every caller, and the decoded tenant and key for a
+// caller that names its version. A frame that cannot be decoded is an error.
+// ------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_tiered_read_refuses_a_single_row_frame_that_names_another_version() {
+	let fixture = seed_pruned_slot_reuse_fixture("frame-identity-single-row").await;
+	let mgr = &fixture.mgr;
+	assert_eq!(mgr.read(fixture.held_b).await.unwrap(), b"b-10");
+	for (location, what) in [
+		(
+			RecordLocation {
+				hlc: hlc(99),
+				..fixture.held_b
+			},
+			"an HLC the frame does not carry",
+		),
+		(
+			RecordLocation {
+				record_row_index: RecordRowIndex::new(1),
+				..fixture.held_b
+			},
+			"a row the single-row frame does not have",
+		),
+	] {
+		match mgr.read(location).await {
+			Ok(bytes) => panic!("{what}: the frame was served as that version: {bytes:?}"),
+			Err(error) => assert_eq!(
+				stale_location(&error),
+				Some(StaleLocation {
+					slab_id: fixture.pointer.slab_id,
+					reason: StaleLocationReason::Superseded,
+				}),
+				"{what}: {error}"
+			),
+		}
+	}
+}
+
+#[tokio::test]
+async fn a_secondary_index_read_refuses_a_frame_row_of_another_key() {
+	let (_dirs, mgr, l2) = fresh_manager_with_l2("frame-identity-secondary").await;
+	let loc = Locality::new(0x9B00_0000_0000_0001);
+	let (x, y) = (id(0x9B01), id(0x9B02));
+	let frame = encode_test_multirow_storage_frame(&[(x, loc, hlc(50), 7), (y, loc, hlc(50), 8)]);
+	let entries = storage_multirow_index_entries_from_frame(&frame)
+		.unwrap()
+		.expect("entries");
+	mgr.append_durable_multirow_with_locality(tenant(), &frame, &entries)
+		.await
+		.unwrap();
+	let x_location = mgr.lookup(tenant(), x).unwrap().unwrap();
+	let y_location = mgr.lookup(tenant(), y).unwrap().unwrap();
+	assert_eq!(
+		(x_location.offset, x_location.hlc),
+		(y_location.offset, y_location.hlc),
+		"premise: x@50 and y@50 are rows of one frame at one HLC"
+	);
+	let entry = SecondaryIndexEntry {
+		encoded_key: 7_u64.to_be_bytes().to_vec(),
+		row_key_id: x,
+		row_hlc: hlc(50),
+		record_location: x_location,
+	};
+	assert_eq!(
+		read_secondary_index_entry_for_test(&mgr, &entry)
+			.await
+			.unwrap(),
+		(x, 7),
+		"premise: the entry reads x's row"
+	);
+	// A defect that names y's row as x's version (the shape of a reused
+	// location): x's chain holds y's location at x's HLC.
+	let assert_refused = |read: std::io::Result<(Identity, i128)>, what: &str| match read {
+		Ok(read) => panic!("{what}: x's secondary-index entry returned another row {read:?}"),
+		Err(error) => assert_eq!(
+			stale_location(&error).map(|refusal| refusal.reason),
+			Some(StaleLocationReason::Superseded),
+			"{what}: {error}"
+		),
+	};
+	mgr.key_index.get_mut(&(tenant(), x)).unwrap().value_mut()[0] = y_location;
+	assert_refused(
+		read_secondary_index_entry_for_test(&mgr, &entry).await,
+		"a local slab",
+	);
+	let pointer = tier_kv_slab(&mgr, &l2, "tier/frame-identity-secondary.wnd").await;
+	assert_eq!(
+		mgr.lookup(tenant(), x).unwrap().unwrap().slab_id,
+		pointer.slab_id,
+		"premise: x's chain names the tiered slab"
+	);
+	mgr.key_index.get_mut(&(tenant(), x)).unwrap().value_mut()[0] =
+		mgr.lookup(tenant(), y).unwrap().unwrap();
+	assert_refused(
+		read_secondary_index_entry_for_test(&mgr, &entry).await,
+		"a tiered slab",
+	);
+}
+
+#[tokio::test]
+async fn a_tiered_frame_that_cannot_be_decoded_is_an_error() {
+	let (_dirs, mgr, l2) = fresh_manager_with_l2("frame-identity-undecodable").await;
+	let key = id(0x9C01);
+	// A frame that claims storage synthetic columns but carries only the HLC:
+	// its row identities cannot be decoded.
+	let schema = Arc::new(Schema::new(vec![
+		Field::new("value", DataType::UInt64, false),
+		Field::new(STORAGE_ROW_HLC_COLUMN, DataType::FixedSizeBinary(16), false),
+	]));
+	let mut row_hlc = FixedSizeBinaryBuilder::with_capacity(1, 16);
+	row_hlc
+		.append_value(test_hlc_storage_bytes(hlc(60)))
+		.unwrap();
+	let batch = RecordBatch::try_new(
+		schema,
+		vec![
+			Arc::new(UInt64Array::from(vec![9_u64])) as Arc<dyn Array>,
+			Arc::new(row_hlc.finish()) as Arc<dyn Array>,
+		],
+	)
+	.unwrap();
+	let frame = encode_test_batch(&batch);
+	assert!(
+		storage_multirow_index_entries_from_frame(&frame).is_err(),
+		"premise: the frame's row identities cannot be decoded"
+	);
+	// Written below the manager, whose append refuses it.
+	let active = mgr.state.lock().await.active.clone();
+	let location = active
+		.write_framed(
+			tenant(),
+			key,
+			hlc(60),
+			crate::schema::record_class::STANDARD,
+			&frame,
+		)
+		.await
+		.unwrap();
+	active.fsync().await.unwrap();
+	let slab_id = force_seal_active(&mgr).await;
+	// A plaintext object: encryption would refuse the frame too.
+	let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
+	let pointer = TieredSlabPointer {
+		slab_id,
+		l2_uri: l2
+			.put("tier/frame-identity-undecodable.wnd", &raw)
+			.await
+			.unwrap(),
+		payload_hash: crate::hash::content::digest(&raw),
+		is_encrypted: false,
+		tenant_id: Some(tenant()),
+		tenant_kek_id: None,
+		stats_format_version: None,
+		stats_block_len: None,
+		stats_block_hash128: None,
+		tombstone_metadata: TombstoneMetadata::None,
+		supersession_metadata: SupersessionMetadata::None,
+	};
+	{
+		// Installed below the publication, which would refuse to index it.
+		let state = mgr.state.lock().await;
+		state.sealed.remove(&slab_id);
+		state.tiered.insert(slab_id, pointer);
+	}
+	match mgr.read(location).await {
+		Ok(bytes) => panic!("an undecodable tiered frame was served: {bytes:?}"),
+		Err(error) => assert_eq!(error.kind(), ErrorKind::InvalidData, "{error}"),
+	}
+}
+
+/// The local observer cannot fetch the just-committed object during apply.
+/// Restore the exact object afterwards, modelling a transient L2 outage;
+/// the consensus commit succeeds independently of this observer's failure.
+struct UnpublishedDropCommitter {
+	manager: Arc<SlabManager>,
+	committed: tokio::sync::Mutex<Option<TieredSlabPointer>>,
+}
+
+#[async_trait]
+impl TierCommitter for UnpublishedDropCommitter {
+	async fn commit_tier_slab(&self, tier: TieredSlab) -> std::io::Result<()> {
+		let pointer = TieredSlabPointer {
+			slab_id: tier.slab_id,
+			l2_uri: tier.l2_uri,
+			payload_hash: tier.payload_hash,
+			is_encrypted: tier.is_encrypted,
+			tenant_id: tier.tenant_id,
+			tenant_kek_id: tier.tenant_kek_id,
+			stats_format_version: tier.stats_format_version,
+			stats_block_len: tier.stats_block_len,
+			stats_block_hash128: tier.stats_block_hash128,
+			tombstone_metadata: tier.tombstone_metadata,
+			supersession_metadata: tier.supersession_metadata,
+		};
+		*self.committed.lock().await = Some(pointer.clone());
+		let path = PathBuf::from(pointer.l2_uri.strip_prefix("file://").unwrap());
+		let hidden = path.with_extension("unavailable");
+		std::fs::rename(&path, &hidden).unwrap();
+		let apply = self.manager.apply_tier_slab(pointer).await;
+		std::fs::rename(&hidden, &path).unwrap();
+		assert_eq!(apply.unwrap_err().kind(), ErrorKind::NotFound);
+		Ok(())
+	}
+
+	async fn retire_tiered_slab(&self, _slab_id: SlabId) -> std::io::Result<()> {
+		panic!("the fixture must rewrite, not retire")
+	}
+}
+
+async fn unpublished_drop_fixture() -> (
+	[crate::test_support::TestDir; 2],
+	Arc<SlabManager>,
+	Arc<dyn ObjectStore>,
+	TableSchemaDescriptor,
+	TableSchemaCatalog,
+	TieredSlabPointer,
+) {
+	let l1_dir = fresh_dir("unpublished-drop-l1");
+	let l2_root = fresh_dir("unpublished-drop-l2");
+	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
+	let io = spawn_io_thread(64).unwrap();
+	let mgr = SlabManager::initialize_new_store(SlabManagerConfig {
+		dir: l1_dir.to_path_buf(),
+		max_slab_bytes: 1 << 20,
+		io,
+		l2: Some(l2.clone()),
+		rehydration: RehydrationPolicy::default(),
+		l2_column_fetch: Default::default(),
+		row_group_writer: Default::default(),
+		l2_row_group_fetch: Default::default(),
+		encoding_writer: Default::default(),
+		l2_chunk_layout: Default::default(),
+		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
+		group_commit: GroupCommitConfig::default(),
+		crypto: test_crypto(),
+	})
+	.await
+	.unwrap();
+	let target = append_only_retention_descriptor(TableObjectId::new([0x41; 16]));
+	let other =
+		append_only_retention_descriptor_named(TableObjectId::new([0x42; 16]), "tier_other");
+	let mut schemas = TableSchemaCatalog::default();
+	schemas.upsert(tenant(), target.clone()).unwrap();
+	schemas.upsert(tenant(), other.clone()).unwrap();
+
+	let target_key_a = id(0x411);
+	let target_key_b = id(0x412);
+	let other_key = id(0x421);
+	let target_frame = encode_test_append_only_storage_frame(
+		target.table_object_id,
+		&[
+			(target_key_a, Locality::new(30), hlc(30), 100, false),
+			(target_key_b, Locality::new(31), hlc(31), 200, false),
+		],
+	);
+	let target_entries = storage_multirow_index_entries_from_frame(&target_frame)
+		.unwrap()
+		.expect("target table entries");
+	mgr.append_durable_multirow_with_locality(tenant(), &target_frame, &target_entries)
+		.await
+		.unwrap();
+	let other_frame = encode_test_append_only_storage_frame(
+		other.table_object_id,
+		&[(other_key, Locality::new(40), hlc(40), 300, false)],
+	);
+	let other_entries = storage_multirow_index_entries_from_frame(&other_frame)
+		.unwrap()
+		.expect("other table entries");
+	mgr.append_durable_multirow_with_locality(tenant(), &other_frame, &other_entries)
+		.await
+		.unwrap();
+
+	let slab_id = force_seal_active(&mgr).await;
+	let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
+	let old_encrypted = mgr.encrypt_tiered_object_blob(slab_id, &raw).unwrap();
+	let old_uri = l2
+		.put(
+			&format!("tier/drop_reclaim_{slab_id:016x}.wnd"),
+			&old_encrypted.bytes,
+		)
+		.await
+		.unwrap();
+	let old_pointer = TieredSlabPointer {
+		slab_id,
+		l2_uri: old_uri.clone(),
+		payload_hash: crate::hash::content::digest(&old_encrypted.bytes),
+		is_encrypted: true,
+		tenant_id: Some(tenant()),
+		tenant_kek_id: Some(old_encrypted.tenant_kek_id),
+		stats_format_version: None,
+		stats_block_len: None,
+		stats_block_hash128: None,
+		tombstone_metadata: TombstoneMetadata::None,
+		supersession_metadata: SupersessionMetadata::None,
+	};
+	mgr.apply_tier_slab(old_pointer.clone()).await.unwrap();
+
+	([l1_dir, l2_root], mgr, l2, target, schemas, old_pointer)
+}
+
+async fn run_unpublished_drop(
+	mgr: &Arc<SlabManager>,
+	target: &TableSchemaDescriptor,
+	schemas: &TableSchemaCatalog,
+	sliced: bool,
+) -> (std::io::Result<()>, TieredSlabPointer) {
+	let committer = UnpublishedDropCommitter {
+		manager: mgr.clone(),
+		committed: tokio::sync::Mutex::new(None),
+	};
+	let result = if sliced {
+		mgr.reclaim_table_drop_tiered_storage_slice(
+			tenant(),
+			target,
+			schemas,
+			&committer,
+			TableDropReclaimCursor::default(),
+			1,
+		)
+		.await
+		.map(|_| ())
+	} else {
+		mgr.reclaim_table_drop_tiered_storage(tenant(), target, schemas, &committer, 1)
+			.await
+			.map(|_| ())
+	};
+	let committed = committer
+		.committed
+		.lock()
+		.await
+		.clone()
+		.expect("replacement committed");
+	(result, committed)
+}
+
+#[tokio::test]
+async fn table_drop_refuses_after_its_committed_pointer_cannot_publish() {
+	let (_dirs, mgr, _l2, target, schemas, old) = unpublished_drop_fixture().await;
+	let (result, committed) = run_unpublished_drop(&mgr, &target, &schemas, false).await;
+	assert_ne!(old.l2_uri, committed.l2_uri);
+	let error =
+		result.expect_err("successful consensus commit is not successful local publication");
+	assert_eq!(
+		stale_location(&error),
+		Some(StaleLocation {
+			slab_id: old.slab_id,
+			reason: StaleLocationReason::Fenced,
+		})
+	);
+	assert_eq!(mgr.tier_pointer(old.slab_id).await, Some(old));
+}
+
+#[tokio::test]
+async fn sliced_table_drop_refuses_after_its_committed_pointer_cannot_publish() {
+	let (_dirs, mgr, _l2, target, schemas, old) = unpublished_drop_fixture().await;
+	let (result, committed) = run_unpublished_drop(&mgr, &target, &schemas, true).await;
+	assert_ne!(old.l2_uri, committed.l2_uri);
+	let error = result.expect_err("a slice cannot receipt an unpublished committed replacement");
+	assert_eq!(
+		stale_location(&error),
+		Some(StaleLocation {
+			slab_id: old.slab_id,
+			reason: StaleLocationReason::Fenced,
+		})
+	);
+	assert_eq!(mgr.tier_pointer(old.slab_id).await, Some(old));
+}
+
+#[tokio::test]
+async fn table_drop_keeps_the_old_object_byte_exact_after_a_failed_publication() {
+	let (_dirs, mgr, l2, target, schemas, old) = unpublished_drop_fixture().await;
+	let before = l2.get(&old.l2_uri).await.unwrap();
+	let (_result, committed) = run_unpublished_drop(&mgr, &target, &schemas, false).await;
+	assert_eq!(
+		l2.get(&old.l2_uri)
+			.await
+			.expect("the old generation still serves this node"),
+		before
+	);
+	let replacement = l2
+		.get(&committed.l2_uri)
+		.await
+		.expect("the committed replacement stays available");
+	assert_eq!(
+		crate::hash::content::digest(&replacement),
+		committed.payload_hash
+	);
+}
+
+#[tokio::test]
+async fn table_drop_cleanup_refuses_to_delete_either_object_with_an_unpublished_commit() {
+	let (_dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let old_bytes = l2.get(&old.l2_uri).await.unwrap();
+	let new_uri = l2
+		.put("tier/unpublished-cleanup-replacement.wnd", &old_bytes)
+		.await
+		.unwrap();
+	let committer = UnpublishedDropCommitter {
+		manager: mgr.clone(),
+		committed: tokio::sync::Mutex::new(None),
+	};
+	mgr.persist_table_drop_l2_cleanup(old.slab_id, &old.l2_uri, Some(&new_uri))
+		.await
+		.unwrap();
+	committer
+		.commit_tier_slab(TieredSlab {
+			slab_id: old.slab_id,
+			l2_uri: new_uri,
+			payload_hash: old.payload_hash,
+			is_encrypted: old.is_encrypted,
+			tenant_id: old.tenant_id,
+			tenant_kek_id: old.tenant_kek_id,
+			stats_format_version: old.stats_format_version,
+			stats_block_len: old.stats_block_len,
+			stats_block_hash128: old.stats_block_hash128,
+			tombstone_metadata: old.tombstone_metadata,
+			supersession_metadata: old.supersession_metadata,
+		})
+		.await
+		.unwrap();
+	let committed = committer.committed.lock().await.clone().unwrap();
+	assert_eq!(mgr.tier_pointer(old.slab_id).await, Some(old.clone()));
+	let new_bytes = l2.get(&committed.l2_uri).await.unwrap();
+	let marker = table_drop_l2_cleanup_path(&mgr.config.dir, old.slab_id);
+	assert!(!marker.exists());
+	assert_new_cleanup_intent(&mgr, old.slab_id, &old.l2_uri, false).await;
+	let result = mgr
+		.reconcile_table_drop_l2_cleanup_markers(l2.as_ref(), 1)
+		.await;
+	// Assert the deletion property independently of the refusal so a base
+	// failure records which committed object's bytes were actually lost.
+	assert_eq!(
+		l2.get(&committed.l2_uri)
+			.await
+			.expect("cleanup cannot delete the committed replacement"),
+		new_bytes
+	);
+	assert_eq!(
+		l2.get(&old.l2_uri)
+			.await
+			.expect("cleanup cannot delete the still-published generation"),
+		old_bytes
+	);
+	let error = result.expect_err("cleanup must wait for local publication");
+	assert_eq!(
+		stale_location(&error),
+		Some(StaleLocation {
+			slab_id: old.slab_id,
+			reason: StaleLocationReason::Fenced,
+		})
+	);
+	assert_new_cleanup_intent(&mgr, old.slab_id, &old.l2_uri, false).await;
+}
+
+/// A commit response can be lost independently of whether the observer has
+/// run. Capture the submitted pointer, optionally apply it, then lose the
+/// response. No caller may infer that the proposal failed from this error.
+struct AmbiguousDropCommitter {
+	manager: Arc<SlabManager>,
+	apply_before_error: bool,
+	proposed: tokio::sync::Mutex<Option<TieredSlabPointer>>,
+}
+
+#[async_trait]
+impl TierCommitter for AmbiguousDropCommitter {
+	async fn commit_tier_slab(&self, tier: TieredSlab) -> std::io::Result<()> {
+		let pointer = TieredSlabPointer {
+			slab_id: tier.slab_id,
+			l2_uri: tier.l2_uri,
+			payload_hash: tier.payload_hash,
+			is_encrypted: tier.is_encrypted,
+			tenant_id: tier.tenant_id,
+			tenant_kek_id: tier.tenant_kek_id,
+			stats_format_version: tier.stats_format_version,
+			stats_block_len: tier.stats_block_len,
+			stats_block_hash128: tier.stats_block_hash128,
+			tombstone_metadata: tier.tombstone_metadata,
+			supersession_metadata: tier.supersession_metadata,
+		};
+		*self.proposed.lock().await = Some(pointer.clone());
+		if self.apply_before_error {
+			self.manager.apply_tier_slab(pointer).await.unwrap();
+		}
+		Err(Error::new(
+			ErrorKind::ConnectionReset,
+			"the commit response was lost",
+		))
+	}
+	async fn retire_tiered_slab(&self, _slab_id: SlabId) -> std::io::Result<()> {
+		panic!("the fixture must rewrite")
+	}
+}
+
+async fn propose_ambiguous_drop(
+	mgr: &Arc<SlabManager>,
+	target: &TableSchemaDescriptor,
+	schemas: &TableSchemaCatalog,
+	sliced: bool,
+	apply_before_error: bool,
+) -> TieredSlabPointer {
+	let committer = AmbiguousDropCommitter {
+		manager: mgr.clone(),
+		apply_before_error,
+		proposed: tokio::sync::Mutex::new(None),
+	};
+	let result = if sliced {
+		mgr.reclaim_table_drop_tiered_storage_slice(
+			tenant(),
+			target,
+			schemas,
+			&committer,
+			TableDropReclaimCursor::default(),
+			1,
+		)
+		.await
+		.map(|_| ())
+	} else {
+		mgr.reclaim_table_drop_tiered_storage(tenant(), target, schemas, &committer, 1)
+			.await
+			.map(|_| ())
+	};
+	assert_eq!(result.unwrap_err().kind(), ErrorKind::ConnectionReset);
+	let proposed = committer.proposed.lock().await.clone().unwrap();
+	proposed
+}
+
+fn assert_unresolved_drop_is_reported(bytes: u64) {
+	let rendered = crate::metrics::global().render_prometheus();
+	let gauge = |name: &str| {
+		rendered
+			.lines()
+			.find_map(|line| line.strip_prefix(&format!("{name} ")))
+			.and_then(|value| value.parse::<u64>().ok())
+			.unwrap_or_else(|| panic!("{name} is not exported"))
+	};
+	assert!(gauge("wendelon_storage_unresolved_tier_cleanup_intents") >= 1);
+	assert!(gauge("wendelon_storage_unresolved_tier_cleanup_bytes") >= bytes);
+}
+
+#[derive(serde::Serialize)]
+enum TestLegacyCleanupState {
+	Unresolved,
+}
+#[derive(serde::Serialize)]
+struct TestLegacyCleanupMarker {
+	format_version: u8,
+	slab_id: SlabId,
+	old_l2_uri: String,
+	replacement_l2_uri: Option<String>,
+	state: TestLegacyCleanupState,
+	retained_bytes: u64,
+}
+
+#[tokio::test]
+async fn legacy_replacement_uri_deduplicates_without_adding_bytes() {
+	let (_dirs, mgr, _l2, target, schemas, old) = unpublished_drop_fixture().await;
+	let proposed = propose_ambiguous_drop(&mgr, &target, &schemas, false, false).await;
+	let marker = TestLegacyCleanupMarker {
+		format_version: 2,
+		slab_id: old.slab_id,
+		old_l2_uri: old.l2_uri.clone(),
+		replacement_l2_uri: Some(proposed.l2_uri.clone()),
+		state: TestLegacyCleanupState::Unresolved,
+		retained_bytes: 100,
+	};
+	std::fs::write(
+		table_drop_l2_cleanup_path(&mgr.config.dir, old.slab_id),
+		postcard::to_stdvec(&marker).unwrap(),
+	)
+	.unwrap();
+	mgr.load_unresolved_tier_cleanup().await.unwrap();
+	let before = mgr.unresolved_tier_cleanup.test_totals();
+	assert_eq!(before.0, 1);
+	mgr.persist_snapshot_cleanup_intent(old.slab_id, &proposed.l2_uri, 12345)
+		.await
+		.unwrap();
+	assert_eq!(
+		mgr.unresolved_tier_cleanup.test_totals(),
+		before,
+		"a new record matching a legacy replacement URI adds no intent or bytes"
+	);
+}
+
+async fn assert_ambiguous_drop_waits_for_observer(sliced: bool, reopen: bool) {
+	let (dirs, mgr, l2, target, schemas, old) = unpublished_drop_fixture().await;
+	let old_bytes = l2.get(&old.l2_uri).await.unwrap();
+	let proposed = propose_ambiguous_drop(&mgr, &target, &schemas, sliced, false).await;
+	let new_bytes = l2
+		.get(&proposed.l2_uri)
+		.await
+		.expect("an error response cannot delete a proposed generation");
+	let mgr = if reopen {
+		restart_tier_manager(mgr, &dirs, &l2).await
+	} else {
+		mgr
+	};
+	let marker = table_drop_l2_cleanup_path(&mgr.config.dir, old.slab_id);
+	assert!(!marker.exists());
+	assert_new_cleanup_intent(&mgr, old.slab_id, &old.l2_uri, false).await;
+	let result = mgr
+		.reconcile_table_drop_l2_cleanup_markers(l2.as_ref(), 1)
+		.await;
+	assert_eq!(
+		l2.get(&proposed.l2_uri)
+			.await
+			.expect("a delayed commit may still apply"),
+		new_bytes
+	);
+	assert_eq!(l2.get(&old.l2_uri).await.unwrap(), old_bytes);
+	assert_eq!(
+		stale_location(&result.unwrap_err()),
+		Some(StaleLocation {
+			slab_id: old.slab_id,
+			reason: StaleLocationReason::Fenced,
+		})
+	);
+	assert!(!marker.exists());
+	assert_new_cleanup_intent(&mgr, old.slab_id, &old.l2_uri, false).await;
+	assert_new_cleanup_intent(&mgr, old.slab_id, &proposed.l2_uri, false).await;
+	assert_unresolved_drop_is_reported((old_bytes.len() + new_bytes.len()) as u64);
+	// The observer now applies the replacement that really committed.
+	mgr.apply_tier_slab(proposed.clone()).await.unwrap();
+	let (examined, done) = mgr
+		.reconcile_table_drop_l2_cleanup_markers(l2.as_ref(), 1)
+		.await
+		.unwrap();
+	assert_eq!((examined, done), (1, true));
+	assert!(!marker.exists());
+	assert_new_cleanup_intent(&mgr, old.slab_id, &old.l2_uri, true).await;
+	assert_no_cleanup_intent(&mgr, old.slab_id, &proposed.l2_uri).await;
+	assert!(
+		l2.get(&old.l2_uri).await.is_ok(),
+		"the superseded object is retained until owner-scoped retirement authority"
+	);
+	assert_eq!(l2.get(&proposed.l2_uri).await.unwrap(), new_bytes);
+}
+
+#[tokio::test]
+async fn table_drop_retains_both_objects_until_a_delayed_observer_applies() {
+	assert_ambiguous_drop_waits_for_observer(false, false).await;
+}
+
+#[tokio::test]
+async fn sliced_table_drop_retains_both_objects_until_a_delayed_observer_applies() {
+	assert_ambiguous_drop_waits_for_observer(true, false).await;
+}
+
+#[tokio::test]
+async fn table_drop_unresolved_intent_survives_reopen_before_a_delayed_apply() {
+	assert_ambiguous_drop_waits_for_observer(false, true).await;
+}
+
+#[tokio::test]
+async fn sliced_table_drop_unresolved_intent_survives_reopen_before_a_delayed_apply() {
+	assert_ambiguous_drop_waits_for_observer(true, true).await;
+}
+
+#[tokio::test]
+async fn table_drop_lost_response_keeps_the_replacement_and_reconciles_after_apply() {
+	let (_dirs, mgr, l2, target, schemas, old) = unpublished_drop_fixture().await;
+	let proposed = propose_ambiguous_drop(&mgr, &target, &schemas, false, true).await;
+	let new_bytes = l2.get(&proposed.l2_uri).await.unwrap();
+	assert_eq!(mgr.tier_pointer(old.slab_id).await, Some(proposed.clone()));
+	let marker = table_drop_l2_cleanup_path(&mgr.config.dir, old.slab_id);
+	assert!(!marker.exists());
+	assert_new_cleanup_intent(&mgr, old.slab_id, &old.l2_uri, false).await;
+	assert!(l2.get(&old.l2_uri).await.is_ok());
+	assert_eq!(
+		mgr.reconcile_table_drop_l2_cleanup_markers(l2.as_ref(), 1)
+			.await
+			.unwrap(),
+		(1, true)
+	);
+	assert!(!marker.exists());
+	assert_new_cleanup_intent(&mgr, old.slab_id, &old.l2_uri, true).await;
+	assert_eq!(l2.get(&proposed.l2_uri).await.unwrap(), new_bytes);
+	assert!(
+		l2.get(&old.l2_uri).await.is_ok(),
+		"the superseded object is retained until owner-scoped retirement authority"
+	);
+}
+
+#[tokio::test]
+async fn a_truly_failed_table_drop_proposal_stays_unresolved_and_reported() {
+	let (dirs, mgr, l2, target, schemas, old) = unpublished_drop_fixture().await;
+	let old_bytes = l2.get(&old.l2_uri).await.unwrap();
+	let proposed = propose_ambiguous_drop(&mgr, &target, &schemas, false, false).await;
+	let new_bytes = l2.get(&proposed.l2_uri).await.unwrap();
+	let mgr = restart_tier_manager(mgr, &dirs, &l2).await;
+	for _ in 0..2 {
+		let error = mgr
+			.reconcile_table_drop_l2_cleanup_markers(l2.as_ref(), 1)
+			.await
+			.unwrap_err();
+		assert_eq!(
+			stale_location(&error).unwrap().reason,
+			StaleLocationReason::Fenced
+		);
+	}
+	assert_eq!(l2.get(&old.l2_uri).await.unwrap(), old_bytes);
+	assert_eq!(l2.get(&proposed.l2_uri).await.unwrap(), new_bytes);
+	assert!(!table_drop_l2_cleanup_path(&mgr.config.dir, old.slab_id).exists());
+	assert_new_cleanup_intent(&mgr, old.slab_id, &old.l2_uri, false).await;
+	assert_new_cleanup_intent(&mgr, old.slab_id, &proposed.l2_uri, false).await;
+	assert_unresolved_drop_is_reported((old_bytes.len() + new_bytes.len()) as u64);
+}
+
+#[tokio::test]
+async fn table_drop_intent_before_proposal_survives_reopen_without_deleting_either_object() {
+	let (dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let old_bytes = l2.get(&old.l2_uri).await.unwrap();
+	let new_uri = l2
+		.put("tier/unsubmitted-drop-replacement.wnd", &old_bytes)
+		.await
+		.unwrap();
+	mgr.persist_table_drop_l2_cleanup(old.slab_id, &old.l2_uri, Some(&new_uri))
+		.await
+		.unwrap();
+	// The crash is after the durable proposal boundary, but before the RPC.
+	// Reopen cannot distinguish that cut from an invocation with a lost reply.
+	mgr.prepare_tier_candidate_proposal(old.slab_id, &new_uri)
+		.await
+		.unwrap();
+
+	let mgr = restart_tier_manager(mgr, &dirs, &l2).await;
+	let result = mgr
+		.reconcile_table_drop_l2_cleanup_markers(l2.as_ref(), 1)
+		.await;
+	assert_eq!(
+		l2.get(&new_uri)
+			.await
+			.expect("an unresolved upload is retained"),
+		old_bytes
+	);
+	assert_eq!(l2.get(&old.l2_uri).await.unwrap(), old_bytes);
+	assert_eq!(
+		stale_location(&result.unwrap_err()).unwrap().reason,
+		StaleLocationReason::Fenced
+	);
+	assert!(!table_drop_l2_cleanup_path(&mgr.config.dir, old.slab_id).exists());
+	assert_new_cleanup_intent(&mgr, old.slab_id, &old.l2_uri, false).await;
+	assert_unresolved_drop_is_reported(old_bytes.len() as u64);
+}
+
+async fn assert_drop_reconciles_after_applied_restart(old_deleted: bool) {
+	let (dirs, mgr, l2, target, schemas, old) = unpublished_drop_fixture().await;
+	let proposed = propose_ambiguous_drop(&mgr, &target, &schemas, false, true).await;
+	let new_bytes = l2.get(&proposed.l2_uri).await.unwrap();
+	let marker = table_drop_l2_cleanup_path(&mgr.config.dir, old.slab_id);
+	assert!(!marker.exists());
+	assert_new_cleanup_intent(&mgr, old.slab_id, &old.l2_uri, false).await;
+	if old_deleted {
+		l2.delete(&old.l2_uri).await.unwrap();
+	}
+	let mgr = restart_tier_manager(mgr, &dirs, &l2).await;
+	assert_eq!(mgr.tier_pointer(old.slab_id).await, Some(proposed.clone()));
+	assert_eq!(
+		mgr.reconcile_table_drop_l2_cleanup_markers(l2.as_ref(), 1)
+			.await
+			.unwrap(),
+		(1, true)
+	);
+	assert!(!marker.exists());
+	assert_new_cleanup_intent(&mgr, old.slab_id, &old.l2_uri, true).await;
+	assert_eq!(l2.get(&proposed.l2_uri).await.unwrap(), new_bytes);
+	assert_eq!(
+		l2.get(&old.l2_uri).await.is_ok(),
+		!old_deleted,
+		"the superseded object is retained until owner-scoped retirement authority"
+	);
+	assert_eq!(
+		mgr.reconcile_table_drop_l2_cleanup_markers(l2.as_ref(), 1)
+			.await
+			.unwrap(),
+		(0, true)
+	);
+}
+
+#[tokio::test]
+async fn table_drop_cleanup_reopens_after_apply_before_old_object_deletion() {
+	assert_drop_reconciles_after_applied_restart(false).await;
+}
+
+#[tokio::test]
+async fn table_drop_cleanup_reopens_after_old_object_deletion_before_intent_removal() {
+	assert_drop_reconciles_after_applied_restart(true).await;
+}
+
+#[tokio::test]
+async fn table_drop_open_refuses_an_old_cleanup_intent_without_migrating_it() {
+	#[derive(serde::Serialize)]
+	struct OldCleanupIntent {
+		format_version: u8,
+		slab_id: SlabId,
+		old_l2_uri: String,
+		replacement_l2_uri: Option<String>,
+	}
+	let (dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let old_bytes = l2.get(&old.l2_uri).await.unwrap();
+	let marker = table_drop_l2_cleanup_path(&mgr.config.dir, old.slab_id);
+	let bytes = postcard::to_stdvec(&OldCleanupIntent {
+		format_version: 1,
+		slab_id: old.slab_id,
+		old_l2_uri: old.l2_uri.clone(),
+		replacement_l2_uri: None,
+	})
+	.unwrap();
+	std::fs::write(&marker, &bytes).unwrap();
+	std::fs::File::open(&marker).unwrap().sync_all().unwrap();
+	std::fs::File::open(&mgr.config.dir)
+		.unwrap()
+		.sync_all()
+		.unwrap();
+	match try_restart_tier_manager(mgr, &dirs, &l2).await {
+		Ok(_) => panic!("an old cleanup intent must not be decoded or migrated"),
+		Err(error) => assert_eq!(error.kind(), ErrorKind::InvalidData),
+	}
+	assert_eq!(std::fs::read(marker).unwrap(), bytes);
+	assert_eq!(l2.get(&old.l2_uri).await.unwrap(), old_bytes);
+}
+
+/// Ordinary bytes that happen to be a valid counter payload keep the
+/// ordinary header's identity, including after recovery.
+#[tokio::test]
+async fn ordinary_counter_shaped_payloads_keep_their_header_class_after_restart() {
+	let (dirs, mgr, l2) = fresh_manager_with_l2("ordinary-counter-shaped-payloads").await;
+	let key = id(0x7f31);
+	let first = super::super::counter::encode_origin_frame(100, counter_origin(1)).unwrap();
+	let second = super::super::counter::encode_origin_frame(200, counter_origin(2)).unwrap();
+	assert_ne!(first, second);
+	let active = mgr.state.lock().await.active.clone();
+	let mut copies = Vec::new();
+	for payload in [&first, &second] {
+		let location = active
+			.append(tenant(), key, hlc(10), payload)
+			.await
+			.unwrap();
+		let (header, bytes) = active.read_with_header(location).await.unwrap();
+		assert_eq!(header.record_class, crate::schema::record_class::STANDARD);
+		assert_eq!(bytes.as_slice(), payload.as_slice());
+		copies.push(location);
+	}
+	drop(active);
+	force_seal_active(&mgr).await;
+	let mgr = restart_tier_manager(mgr, &dirs, &l2).await;
+	assert_eq!(
+		mgr.same_hlc_locations(tenant(), key, hlc(10))
+			.unwrap()
+			.len(),
+		2
+	);
+	for location in copies {
+		let error = mgr
+			.read(location)
+			.await
+			.expect_err("ordinary copies with different bytes have one conflicting identity");
+		assert!(is_conflicting_version_refusal(&error), "{error}");
+	}
+}
+
+#[tokio::test]
+async fn identical_ordinary_counter_shaped_payloads_remain_readable_after_restart() {
+	let (dirs, mgr, l2) = fresh_manager_with_l2("identical-counter-shaped-payloads").await;
+	let key = id(0x7f32);
+	let payload = super::super::counter::encode_origin_frame(100, counter_origin(1)).unwrap();
+	let active = mgr.state.lock().await.active.clone();
+	let mut copies = Vec::new();
+	for _ in 0..2 {
+		copies.push(
+			active
+				.append(tenant(), key, hlc(10), &payload)
+				.await
+				.unwrap(),
+		);
+	}
+	drop(active);
+	force_seal_active(&mgr).await;
+	let mgr = restart_tier_manager(mgr, &dirs, &l2).await;
+	assert_eq!(
+		mgr.same_hlc_locations(tenant(), key, hlc(10))
+			.unwrap()
+			.len(),
+		2
+	);
+	for location in copies {
+		assert_eq!(
+			mgr.read(location).await.unwrap().as_slice(),
+			payload.as_slice()
+		);
+	}
+}
+
+async fn assert_old_counter_frame_refuses_open(class: u32, mixture: u8) {
+	let (dirs, mgr, l2) = fresh_manager_with_l2("unsupported-counter-class").await;
+	let key = id(0x7f41);
+	let slab = mgr.state.lock().await.active.clone();
+	slab.write_framed(
+		tenant(),
+		key,
+		counter_op_hlc(10),
+		class,
+		&7u64.to_le_bytes(),
+	)
+	.await
+	.unwrap();
+	if mixture == 1 {
+		slab.append(tenant(), key, counter_op_hlc(10), b"ordinary")
+			.await
+			.unwrap();
+	} else if mixture == 2 {
+		committed_counter_frame(&mgr, key, 10, 7, counter_origin(1)).await;
+	}
+	let slab_id = slab.slab_id();
+	let path = slab_path(&mgr.config.dir, slab_id);
+	drop(slab);
+	mgr.fsync_all_local_slabs().await.unwrap();
+	let before = std::fs::read(&path).unwrap();
+	match try_restart_tier_manager(mgr, &dirs, &l2).await {
+		Ok(_) => panic!("an obsolete counter class was accepted at open"),
+		Err(error) => {
+			assert_eq!(error.kind(), ErrorKind::Unsupported);
+			assert_eq!(
+				error.get_ref().and_then(
+					|inner| inner.downcast_ref::<super::super::core::UnsupportedRecordClass>()
+				),
+				Some(&super::super::core::UnsupportedRecordClass {
+					slab_id,
+					record_class: class
+				})
+			);
+		}
+	}
+	assert_eq!(std::fs::read(path).unwrap(), before);
+}
+
+macro_rules! old_counter_open_control {
+	($name:ident, $class:ident, $mixture:expr) => {
+		#[tokio::test]
+		async fn $name() {
+			assert_old_counter_frame_refuses_open(crate::schema::record_class::$class, $mixture)
+				.await;
+		}
+	};
+}
+old_counter_open_control!(old_counter_tentative_refuses_open, COUNTER_TENTATIVE, 0);
+old_counter_open_control!(old_counter_marker_refuses_open, COUNTER_COMMIT, 0);
+old_counter_open_control!(
+	old_counter_tentative_mixed_with_standard_refuses_open,
+	COUNTER_TENTATIVE,
+	1
+);
+old_counter_open_control!(
+	old_counter_marker_mixed_with_standard_refuses_open,
+	COUNTER_COMMIT,
+	1
+);
+old_counter_open_control!(
+	old_counter_tentative_mixed_with_current_counter_refuses_open,
+	COUNTER_TENTATIVE,
+	2
+);
+old_counter_open_control!(
+	old_counter_marker_mixed_with_current_counter_refuses_open,
+	COUNTER_COMMIT,
+	2
+);
+
+#[tokio::test]
+async fn different_record_classes_at_one_version_conflict_through_relocation() {
+	let (dirs, mgr, l2) = fresh_manager_with_l2("mixed-current-record-classes").await;
+	let key = id(0x7f42);
+	let origin = counter_origin(1);
+	let frame = super::super::counter::encode_origin_frame(7, origin).unwrap();
+	let active = mgr.state.lock().await.active.clone();
+	active
+		.append(tenant(), key, counter_op_hlc(10), &frame)
+		.await
+		.unwrap();
+	drop(active);
+	committed_counter_frame(&mgr, key, 10, 7, origin).await;
+	let mgr = restart_tier_manager(mgr, &dirs, &l2).await;
+	let copies = mgr
+		.same_hlc_locations(tenant(), key, counter_op_hlc(10))
+		.unwrap();
+	assert_eq!(copies.len(), 2);
+	let mut classes = BTreeSet::new();
+	let mut frames = Vec::new();
+	for location in &copies {
+		let SlabBacking::Local(slab) = mgr.resolve_backing(location.slab_id).await else {
+			panic!("the fixture must stay local");
+		};
+		let (header, bytes) = slab.read_with_header(*location).await.unwrap();
+		classes.insert(header.record_class);
+		assert_eq!(bytes.as_slice(), frame.as_slice());
+		frames.push((header, bytes));
+		let error = mgr
+			.read(*location)
+			.await
+			.expect_err("different classes cannot be two versions");
+		assert!(is_conflicting_version_refusal(&error), "{error}");
+	}
+	assert_eq!(
+		classes,
+		BTreeSet::from([
+			crate::schema::record_class::STANDARD,
+			crate::schema::record_class::COUNTER_TENTATIVE_V2,
+		])
+	);
+	let active = mgr.state.lock().await.active.clone();
+	let mut relocation = KeyRelocation::new(Locality::from(key), true);
+	for (old, (header, bytes)) in copies.iter().zip(frames) {
+		let new = active
+			.write_framed(
+				tenant(),
+				key,
+				counter_op_hlc(10),
+				header.record_class,
+				&bytes,
+			)
+			.await
+			.unwrap();
+		relocation.pairs.push(RelocationPair {
+			old: *old,
+			new,
+			table_object_id: None,
+		});
+	}
+	assert!(
+		mgr.relocate_indexed_locations(tenant(), key, &relocation)
+			.is_empty()
+	);
+	for pair in relocation.pairs {
+		for location in [pair.old, pair.new] {
+			let error = mgr
+				.read(location)
+				.await
+				.expect_err("relocation must preserve the conflict mark");
+			assert!(is_conflicting_version_refusal(&error), "{error}");
+		}
+	}
+}
+
+async fn assert_obsolete_slab_refuses_open(path: &Path, slab_id: SlabId) {
+	let before = std::fs::read(path).unwrap();
+	let result = LocalSlabStore::open(
+		path,
+		slab_id,
+		Arc::new(BlockingFileOps),
+		GroupCommitConfig::default(),
+	)
+	.await;
+	match result {
+		Ok(_) => panic!("an obsolete counter slab reopened"),
+		Err(error) => assert_eq!(error.kind(), ErrorKind::Unsupported),
+	}
+	assert_eq!(std::fs::read(path).unwrap(), before);
+}
+
+async fn reopen_duplicate_fixture(
+	dirs: &[crate::test_support::TestDir; 2],
+	l2: &Arc<dyn ObjectStore>,
+	crypto: Arc<CryptoManager>,
+) -> std::io::Result<Arc<SlabManager>> {
+	let keysets = crypto.tenant_keysets_snapshot().unwrap();
+	crypto
+		.replace_keysets_from_authoritative_snapshot(&keysets)
+		.unwrap();
+	SlabManager::open(SlabManagerConfig {
+		dir: dirs[0].to_path_buf(),
+		max_slab_bytes: 1 << 20,
+		io: spawn_io_thread(64).unwrap(),
+		l2: Some(l2.clone()),
+		rehydration: RehydrationPolicy::default(),
+		l2_column_fetch: Default::default(),
+		row_group_writer: Default::default(),
+		l2_row_group_fetch: Default::default(),
+		encoding_writer: Default::default(),
+		l2_chunk_layout: Default::default(),
+		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
+		group_commit: GroupCommitConfig::default(),
+		crypto,
+	})
+	.await
+}
+
+fn assert_unresolved_duplicate_refusal(error: &std::io::Error) {
+	let refusal = stale_location(error)
+		.unwrap_or_else(|| panic!("an unresolved duplicate needs a typed refusal: {error}"));
+	assert!(
+		matches!(
+			refusal.reason,
+			StaleLocationReason::AmbiguousVersion | StaleLocationReason::Fenced
+		),
+		"{error}"
+	);
+}
+
+async fn unreadable_duplicate_never_leaves_a_servable_copy(corrupt: bool) {
+	let (dirs, mgr, l2) = fresh_manager_with_l2("unreadable-version-copy").await;
+	let key = id(0x7f51);
+	append_below_manager(&mgr, key, hlc(10), 100).await;
+	let object_key = "tier/unreadable-version-copy.wnd";
+	let pointer = tier_kv_slab(&mgr, &l2, object_key).await;
+	let object_bytes = l2.get(&pointer.l2_uri).await.unwrap();
+	let active = mgr.state.lock().await.active.clone();
+	let local_frame = encode_test_multirow_storage_frame(&[(
+		key,
+		Locality::new(0x7900),
+		hlc(10),
+		if corrupt { 200 } else { 100 },
+	)]);
+	let readable = active
+		.append(tenant(), key, hlc(10), &local_frame)
+		.await
+		.unwrap();
+	drop(active);
+	mgr.fsync_all_local_slabs().await.unwrap();
+	let path = slab_path(&mgr.config.dir, readable.slab_id);
+	let local_bytes = std::fs::read(&path).unwrap();
+	let crypto = mgr.config.crypto.clone();
+	let damaged = if corrupt {
+		let mut bytes = object_bytes.clone();
+		bytes[0] ^= 0x80;
+		assert_eq!(l2.put(object_key, &bytes).await.unwrap(), pointer.l2_uri);
+		Some(bytes)
+	} else {
+		l2.delete(&pointer.l2_uri).await.unwrap();
+		None
+	};
+	match try_restart_tier_manager(mgr, &dirs, &l2).await {
+		Err(error) => assert_unresolved_duplicate_refusal(&error),
+		Ok(reopened) => {
+			let error = reopened
+				.read_version(tenant(), key, readable)
+				.await
+				.expect_err(
+					"one readable copy is not proof while its duplicate cannot be validated",
+				);
+			assert_unresolved_duplicate_refusal(&error);
+		}
+	}
+	assert_eq!(
+		std::fs::read(path).unwrap(),
+		local_bytes,
+		"failed validation cannot prune local bytes"
+	);
+	if let Some(bytes) = damaged {
+		assert_eq!(
+			l2.get(&pointer.l2_uri).await.unwrap(),
+			bytes,
+			"failed validation preserves corrupt evidence"
+		);
+	} else {
+		assert_eq!(
+			l2.get(&pointer.l2_uri).await.unwrap_err().kind(),
+			ErrorKind::NotFound
+		);
+	}
+	assert_eq!(
+		l2.put(object_key, &object_bytes).await.unwrap(),
+		pointer.l2_uri
+	);
+	let reopened = reopen_duplicate_fixture(&dirs, &l2, crypto).await.unwrap();
+	reopened.wait_tier_authority_ready().await.unwrap();
+	let copies = reopened.same_hlc_locations(tenant(), key, hlc(10)).unwrap();
+	assert_eq!(
+		copies.len(),
+		2,
+		"both physical copies survive the failed validation"
+	);
+	for location in copies {
+		let result = reopened.read_version(tenant(), key, location).await;
+		if corrupt {
+			assert!(is_conflicting_version_refusal(&result.unwrap_err()));
+		} else {
+			let bytes = result.unwrap();
+			assert_eq!(
+				frame_row_identity_and_value(&bytes, location.record_row_index),
+				(key, 100)
+			);
+		}
+	}
+}
+
+#[tokio::test]
+async fn a_missing_duplicate_never_leaves_its_readable_copy_servable() {
+	unreadable_duplicate_never_leaves_a_servable_copy(false).await;
+}
+
+#[tokio::test]
+async fn a_corrupt_duplicate_never_leaves_its_readable_copy_servable() {
+	unreadable_duplicate_never_leaves_a_servable_copy(true).await;
+}
+
+// Refusal assertions preserve the fallible answer payload.
+trait AuthorityAnswer<T> {
+	fn authority_result(self) -> std::io::Result<T>;
+}
+
+impl<T> AuthorityAnswer<T> for std::io::Result<T> {
+	fn authority_result(self) -> std::io::Result<T> {
+		self
+	}
+}
+fn assert_authority_pending<T: std::fmt::Debug>(answer: impl AuthorityAnswer<T>) {
+	let error = answer
+		.authority_result()
+		.expect_err("unverified authority cannot answer from its row mirror");
+	assert_unresolved_duplicate_refusal(&error);
+}
+
+struct PausedAuthorityStore {
+	inner: Arc<dyn ObjectStore>,
+	paused: AtomicBool,
+	fetches: std::sync::atomic::AtomicUsize,
+	entered: tokio::sync::Notify,
+	released: tokio::sync::Semaphore,
+}
+impl PausedAuthorityStore {
+	fn release(&self) {
+		self.paused.store(false, Ordering::SeqCst);
+		self.released.add_permits(100);
+	}
+}
+#[async_trait::async_trait]
+impl ObjectStore for PausedAuthorityStore {
+	fn planned_upload_uri(&self, key: &str) -> std::io::Result<String> {
+		self.inner.planned_upload_uri(key)
+	}
+
+	async fn put(&self, key: &str, bytes: &[u8]) -> std::io::Result<String> {
+		self.inner.put(key, bytes).await
+	}
+	async fn head(&self, uri: &str) -> std::io::Result<crate::storage::l2::ObjectMetadata> {
+		self.inner.head(uri).await
+	}
+	async fn get_range(&self, uri: &str, range: std::ops::Range<u64>) -> std::io::Result<Bytes> {
+		self.inner.get_range(uri, range).await
+	}
+	async fn get_bytes(&self, uri: &str) -> std::io::Result<Bytes> {
+		self.fetches.fetch_add(1, Ordering::SeqCst);
+		let bytes = self.inner.get_bytes(uri).await?;
+		if self.paused.load(Ordering::SeqCst) {
+			self.entered.notify_one();
+			self.released.acquire().await.unwrap().forget();
+		}
+		Ok(bytes)
+	}
+	async fn list(&self, prefix: &str) -> std::io::Result<Vec<crate::storage::l2::ObjectMetadata>> {
+		self.inner.list(prefix).await
+	}
+	async fn delete(&self, uri: &str) -> std::io::Result<()> {
+		self.inner.delete(uri).await
+	}
+}
+struct PendingAuthorityFixture {
+	dirs: [crate::test_support::TestDir; 2],
+	manager: Arc<SlabManager>,
+	store: Arc<PausedAuthorityStore>,
+	pointer: TieredSlabPointer,
+	present: RecordLocation,
+	omitted: RecordLocation,
+}
+impl Drop for PendingAuthorityFixture {
+	fn drop(&mut self) {
+		self.store.release();
+	}
+}
+async fn pending_authority_fixture() -> PendingAuthorityFixture {
+	pending_authority_fixture_with_corruption(None).await
+}
+
+async fn pending_authority_fixture_with_corruption(
+	corruption: Option<bool>,
+) -> PendingAuthorityFixture {
+	pending_authority_fixture_with_fault(corruption, false).await
+}
+
+async fn pending_authority_fixture_with_fault(
+	corruption: Option<bool>,
+	missing: bool,
+) -> PendingAuthorityFixture {
+	let (dirs, mgr, l2) = fresh_manager_with_l2("pending-tier-authority").await;
+	let present = mgr
+		.append(tenant(), id(0x7f61), hlc(10), b"present")
+		.await
+		.unwrap();
+	let omitted = mgr
+		.append(tenant(), id(0x7f62), hlc(20), b"omitted")
+		.await
+		.unwrap();
+	let mut pointer = tier_kv_slab(&mgr, &l2, "tier/pending-authority.wnd").await;
+	let rows = mgr
+		.record_rows_for_slab(pointer.slab_id)
+		.unwrap()
+		.into_iter()
+		.filter(|row| row.key_identity == id(0x7f62))
+		.collect::<Vec<_>>();
+	assert_eq!(rows.len(), 1);
+	mgr.persistent_index
+		.as_ref()
+		.unwrap()
+		.apply(PersistentIndexUpdate {
+			delete_records: rows,
+			..Default::default()
+		})
+		.await
+		.unwrap();
+
+	if let Some(update_hash) = corruption {
+		let mut damaged = l2.get(&pointer.l2_uri).await.unwrap();
+		let plan = mgr
+			.config
+			.crypto
+			.plan_tiered_range_read(
+				pointer.slab_id,
+				damaged.len() as u64,
+				&damaged,
+				None,
+				(present.offset as usize)..(present.offset as usize + present.length as usize),
+			)
+			.unwrap();
+		let cipher_offset = plan.ciphertext_range_in_object().start as usize;
+		damaged[cipher_offset] ^= 0x80;
+		assert!(
+			mgr.config
+				.crypto
+				.encrypted_footer_summary(&damaged)
+				.unwrap()
+				.is_some(),
+			"damage preserves the encrypted envelope"
+		);
+		assert_eq!(
+			l2.put("tier/pending-authority.wnd", &damaged)
+				.await
+				.unwrap(),
+			pointer.l2_uri
+		);
+		if update_hash {
+			pointer.payload_hash = crate::hash::content::digest(&damaged);
+			let error = mgr
+				.decode_tiered_object_blob(&pointer, &damaged)
+				.expect_err("matching hash does not authenticate damaged ciphertext");
+			assert_eq!(error.kind(), ErrorKind::InvalidData);
+			mgr.persistent_index
+				.as_ref()
+				.unwrap()
+				.apply(PersistentIndexUpdate {
+					put_tiered_slabs: vec![pointer.clone()],
+					..Default::default()
+				})
+				.await
+				.unwrap();
+		}
+	}
+	if missing {
+		let bytes = l2.get(&pointer.l2_uri).await.unwrap();
+		l2.put("tier/pending-authority-backup.wnd", &bytes)
+			.await
+			.unwrap();
+		l2.delete(&pointer.l2_uri).await.unwrap();
+	}
+	mgr.fsync_all_local_slabs().await.unwrap();
+	let crypto = mgr.config.crypto.clone();
+	drop(mgr);
+	let store = Arc::new(PausedAuthorityStore {
+		inner: l2,
+		paused: AtomicBool::new(true),
+		fetches: Default::default(),
+		entered: Default::default(),
+		released: tokio::sync::Semaphore::new(0),
+	});
+	let l2: Arc<dyn ObjectStore> = store.clone();
+	let manager = tokio::time::timeout(
+		Duration::from_secs(5),
+		reopen_duplicate_fixture(&dirs, &l2, crypto),
+	)
+	.await
+	.expect("open cannot await the remote authority")
+	.unwrap();
+	PendingAuthorityFixture {
+		dirs,
+		manager,
+		store,
+		pointer,
+		present,
+		omitted,
+	}
+}
+
+#[tokio::test]
+async fn unverified_authority_refuses_existing_and_absent_index_answers() {
+	let f = pending_authority_fixture().await;
+	assert_authority_pending(f.manager.same_hlc_locations(tenant(), id(0x7f62), hlc(20)));
+	assert_authority_pending(f.manager.lookup(tenant(), id(0x7f61)));
+	assert_authority_pending(f.manager.lookup(tenant(), id(0x7f62)));
+	assert_authority_pending(f.manager.lookup(tenant(), id(0x7fff)));
+	assert_authority_pending(
+		f.manager
+			.lookup(TenantId::new(tenant().get() + 1), id(0x7fff)),
+	);
+	assert_authority_pending(f.manager.lookup_as_of(tenant(), id(0x7f62), hlc(30)));
+	assert_authority_pending(f.manager.scan(tenant(), Locality::ZERO, Locality::MAX));
+	assert_authority_pending(f.manager.scan_as_of_with_identity(
+		tenant(),
+		Locality::ZERO,
+		Locality::MAX,
+		hlc(30),
+	));
+	assert_authority_pending(
+		f.manager
+			.scan_all_versions(Locality::ZERO, Locality::MAX, hlc(0)),
+	);
+	assert_authority_pending(
+		f.manager
+			.version_placement_at(tenant(), id(0x7f62), hlc(20)),
+	);
+	assert_authority_pending(
+		f.manager
+			.routing_locality_for_existing_key(tenant(), id(0x7f62)),
+	);
+	f.store.release();
+	assert_eq!(f.manager.read(f.present).await.unwrap(), b"present");
+	let repaired = f
+		.manager
+		.lookup(tenant(), id(0x7f62))
+		.authority_result()
+		.unwrap()
+		.expect("object restores the omitted row");
+	assert_eq!(f.manager.read(repaired).await.unwrap(), b"omitted");
+	assert!(
+		f.manager
+			.lookup(tenant(), id(0x7fff))
+			.authority_result()
+			.unwrap()
+			.is_none()
+	);
+}
+
+#[tokio::test]
+async fn unverified_authority_starts_eagerly_and_readers_share_one_flight() {
+	let f = pending_authority_fixture().await;
+	tokio::time::timeout(Duration::from_secs(2), f.store.entered.notified())
+		.await
+		.expect("open starts verification without a read");
+	let authority = f.manager.tier_authority.clone();
+	let waits_before = authority
+		.verification_waits_for_test
+		.load(Ordering::Acquire);
+	let mut readers = Vec::new();
+	for _ in 0..12 {
+		let manager = f.manager.clone();
+		let location = f.present;
+		readers.push(tokio::spawn(async move { manager.read(location).await }));
+	}
+	for _ in 0..12 {
+		assert_authority_pending(f.manager.lookup(tenant(), id(0x7fff)));
+	}
+	// Handshake: every reader has called start() and parked in the
+	// verification wait before the flight count is judged. Nothing notifies
+	// the wait while the eager fetch is paused, so each reader parks once.
+	tokio::time::timeout(Duration::from_secs(5), async {
+		while authority
+			.verification_waits_for_test
+			.load(Ordering::Acquire)
+			< waits_before + 12
+		{
+			tokio::task::yield_now().await;
+		}
+	})
+	.await
+	.expect("every reader parks in the verification wait");
+	let flights = authority
+		.verification_flights_for_test
+		.lock()
+		.unwrap()
+		.clone();
+	// A lost single-flight check leaves extra flights detached; abort and
+	// drain them before judging, so a failure strands no task.
+	for extra in flights.iter().skip(1) {
+		extra.abort();
+	}
+	tokio::time::timeout(Duration::from_secs(5), async {
+		while !flights.iter().skip(1).all(|flight| flight.is_finished()) {
+			tokio::task::yield_now().await;
+		}
+	})
+	.await
+	.expect("extra verification flights abort");
+	assert_eq!(
+		flights.len(),
+		1,
+		"start() from the parked readers spawns no flight beside the eager one"
+	);
+	assert_eq!(
+		f.store.fetches.load(Ordering::SeqCst),
+		1,
+		"all readers share the eager flight"
+	);
+	f.store.release();
+	for reader in readers {
+		assert_eq!(
+			tokio::time::timeout(Duration::from_secs(5), reader)
+				.await
+				.unwrap()
+				.unwrap()
+				.unwrap(),
+			b"present"
+		);
+	}
+	assert_eq!(f.manager.read(f.omitted).await.unwrap(), b"omitted");
+}
+
+#[tokio::test]
+async fn unverified_duplicate_opens_refuses_and_recovers_on_the_same_manager() {
+	let (dirs, mgr, l2) = fresh_manager_with_l2("pending-duplicate-authority").await;
+	let key = id(0x7f63);
+	append_below_manager(&mgr, key, hlc(10), 100).await;
+	let object_key = "tier/pending-duplicate.wnd";
+	let pointer = tier_kv_slab(&mgr, &l2, object_key).await;
+	let bytes = l2.get(&pointer.l2_uri).await.unwrap();
+	let active = mgr.state.lock().await.active.clone();
+	let frame = encode_test_multirow_storage_frame(&[(key, Locality::new(0x7900), hlc(10), 100)]);
+	let saved = active.append(tenant(), key, hlc(10), &frame).await.unwrap();
+	drop(active);
+	l2.delete(&pointer.l2_uri).await.unwrap();
+	let mgr = try_restart_tier_manager(mgr, &dirs, &l2)
+		.await
+		.expect("an unavailable duplicate gates readiness, not open");
+	assert_authority_pending(mgr.lookup(tenant(), key));
+	let error = mgr
+		.read_version(tenant(), key, saved)
+		.await
+		.expect_err("unvalidated duplicate remains unresolved");
+	assert_unresolved_duplicate_refusal(&error);
+	assert_eq!(l2.put(object_key, &bytes).await.unwrap(), pointer.l2_uri);
+	let frame = tokio::time::timeout(
+		Duration::from_secs(5),
+		mgr.read_version(tenant(), key, saved),
+	)
+	.await
+	.expect("restored authority retries without a recursive flight")
+	.unwrap();
+	assert_eq!(
+		frame_row_identity_and_value(&frame, saved.record_row_index),
+		(key, 100)
+	);
+	assert_eq!(
+		mgr.same_hlc_locations(tenant(), key, hlc(10))
+			.unwrap()
+			.len(),
+		2
+	);
+	assert!(
+		mgr.lookup(tenant(), id(0x7fff))
+			.authority_result()
+			.unwrap()
+			.is_none()
+	);
+}
+
+#[tokio::test]
+async fn unverified_authority_refuses_a_maintenance_tick_without_state_changes() {
+	let f = pending_authority_fixture().await;
+	let manifest = f.manager.compaction_manifest_snapshot();
+	let before = f.manager.state.lock().await.active.write_cursor();
+	let gc = LsmGcWorker::new(
+		crate::storage::lsm::LsmConfig::default(),
+		f.manager.slab_pin_table(),
+	)
+	.unwrap();
+	let error = f
+		.manager
+		.sweep_lsm_delete_pending_once(&gc)
+		.await
+		.expect_err("a maintenance tick cannot use incomplete tier rows as emptiness proof");
+	assert_unresolved_duplicate_refusal(&error);
+	assert_eq!(f.manager.compaction_manifest_snapshot(), manifest);
+	assert_eq!(f.manager.state.lock().await.active.write_cursor(), before);
+	assert_authority_pending(f.manager.slab_hlc_bounds(f.pointer.slab_id));
+	f.store.release();
+	assert_eq!(f.manager.read(f.present).await.unwrap(), b"present");
+	assert_eq!(f.manager.read(f.omitted).await.unwrap(), b"omitted");
+	assert!(f.dirs[0].join("storage_index.redb").exists());
+}
+
+#[tokio::test]
+async fn unverified_authority_refuses_a_write_before_reserving_a_frame() {
+	let f = pending_authority_fixture().await;
+	let before = f.manager.state.lock().await.active.write_cursor();
+	let key = id(0x7f64);
+	let error = f
+		.manager
+		.append(tenant(), key, hlc(40), b"must-not-append")
+		.await
+		.expect_err("a write cannot decide an identity is absent under an unverified tier");
+	assert_unresolved_duplicate_refusal(&error);
+	assert_eq!(
+		f.manager.state.lock().await.active.write_cursor(),
+		before,
+		"a refused write reserves no frame"
+	);
+	f.store.release();
+	assert_eq!(f.manager.read(f.present).await.unwrap(), b"present");
+	assert!(
+		f.manager
+			.lookup(tenant(), key)
+			.authority_result()
+			.unwrap()
+			.is_none()
+	);
+	assert!(
+		f.manager
+			.same_hlc_locations(tenant(), key, hlc(40))
+			.unwrap()
+			.is_empty()
+	);
+}
+
+#[tokio::test]
+async fn unverified_authority_refuses_pk_write_and_delete_admission() {
+	let f = pending_authority_fixture().await;
+	let descriptor = pk_retention_descriptor(TableObjectId::new([0x65; 16]));
+	let retention = crate::storage::retention::EffectiveRetention {
+		policy: TableRetentionPolicy::Disabled,
+		floor: None,
+	};
+	let before = f.manager.state.lock().await.active.write_cursor();
+	for key in [id(0x7f61), id(0x7f62), id(0x7fff)] {
+		assert_authority_pending(crate::storage::pk_delete::row_visible_for_admission(
+			&descriptor,
+			tenant(),
+			key,
+			hlc(40),
+			&retention,
+			&f.manager,
+		));
+		assert_authority_pending(crate::storage::pk_delete::admit_pk_write_row(
+			&descriptor,
+			tenant(),
+			key,
+			hlc(40),
+			&f.manager,
+		));
+		assert_authority_pending(crate::storage::pk_delete::admit_pk_delete_row(
+			&descriptor,
+			tenant(),
+			key,
+			hlc(40),
+			&retention,
+			&f.manager,
+		));
+	}
+	assert_eq!(f.manager.state.lock().await.active.write_cursor(), before);
+	f.store.release();
+	assert_eq!(f.manager.read(f.present).await.unwrap(), b"present");
+	assert_eq!(f.manager.read(f.omitted).await.unwrap(), b"omitted");
+	assert!(
+		f.manager
+			.lookup(tenant(), id(0x7fff))
+			.authority_result()
+			.unwrap()
+			.is_none()
+	);
+}
+
+#[tokio::test]
+async fn unverified_authority_close_joins_the_flight_and_reopen_has_a_new_owner() {
+	let mut f = pending_authority_fixture().await;
+	tokio::time::timeout(Duration::from_secs(2), f.store.entered.notified())
+		.await
+		.expect("the old manager has an in-flight fetch before drop");
+	let (_dummy_dir, dummy) = fresh_manager().await;
+	let old = std::mem::replace(&mut f.manager, dummy);
+	let crypto = old.config.crypto.clone();
+	let weak = Arc::downgrade(&old);
+	drop(old);
+	assert!(
+		weak.upgrade().is_none(),
+		"an eager remote flight must not own the manager"
+	);
+	let owner = DataDirectoryOwner::acquire_existing(&*f.dirs[0]).unwrap();
+	let manager = SlabManager::open_with_owner(
+		SlabManagerConfig {
+			dir: f.dirs[0].to_path_buf(),
+			max_slab_bytes: 1 << 20,
+			io: spawn_io_thread(64).unwrap(),
+			l2: Some(f.store.clone()),
+			rehydration: RehydrationPolicy::default(),
+			l2_column_fetch: Default::default(),
+			row_group_writer: Default::default(),
+			l2_row_group_fetch: Default::default(),
+			encoding_writer: Default::default(),
+			l2_chunk_layout: Default::default(),
+			l2_encoding_fetch: Default::default(),
+			encoding_compute: Default::default(),
+			group_commit: GroupCommitConfig::default(),
+			crypto: crypto.clone(),
+		},
+		owner.clone(),
+	)
+	.await
+	.unwrap();
+	tokio::time::timeout(Duration::from_secs(2), f.store.entered.notified())
+		.await
+		.expect("verification is active before close");
+	tokio::time::timeout(Duration::from_secs(3), owner.close(Duration::from_secs(2)))
+		.await
+		.expect("close is bounded")
+		.unwrap();
+	drop(manager);
+	drop(owner);
+	let next_owner = DataDirectoryOwner::acquire_existing(&*f.dirs[0])
+		.expect("successful close releases the lease before reporting success");
+	// The canceled flight cannot publish row repairs for the new owner.
+	let index = PersistentLocalIndex::open_with_owner(
+		f.dirs[0].join("storage_index.redb"),
+		Some(next_owner.clone()),
+	)
+	.await
+	.unwrap();
+	let snapshot = index.load_snapshot().await.unwrap();
+	assert!(
+		!snapshot
+			.record_rows
+			.iter()
+			.any(|row| row.key_identity == id(0x7f62)),
+		"a canceled verification installed no rows"
+	);
+	drop(index);
+	next_owner.close(Duration::from_secs(2)).await.unwrap();
+	drop(next_owner);
+	f.store.release();
+	let l2: Arc<dyn ObjectStore> = f.store.clone();
+	let reopened = reopen_duplicate_fixture(&f.dirs, &l2, crypto)
+		.await
+		.unwrap();
+	assert_eq!(
+		tokio::time::timeout(Duration::from_secs(5), reopened.read(f.present))
+			.await
+			.unwrap()
+			.unwrap(),
+		b"present"
+	);
+	let repaired = reopened
+		.lookup(tenant(), id(0x7f62))
+		.authority_result()
+		.unwrap()
+		.unwrap();
+	assert_eq!(reopened.read(repaired).await.unwrap(), b"omitted");
+}
+
+#[tokio::test]
+async fn unverified_authority_installs_only_the_latest_committed_pointer() {
+	let f = pending_authority_fixture().await;
+	tokio::time::timeout(Duration::from_secs(2), f.store.entered.notified())
+		.await
+		.expect("old authority fetch is paused");
+	let blob = f.store.inner.get(&f.pointer.l2_uri).await.unwrap();
+	let raw = f
+		.manager
+		.decode_tiered_object_blob(&f.pointer, &blob)
+		.unwrap();
+	let (_, padded) = LocalSlabStore::padded_record_size(f.present.length as usize).unwrap();
+	let first_frame_end = f.present.offset as usize + padded;
+	assert!(first_frame_end < raw.len());
+	let plaintext = &raw[..first_frame_end];
+	let metadata = build_tiered_object_metadata(
+		plaintext,
+		f.pointer.slab_id,
+		&f.manager.config.l2_chunk_layout,
+		&f.manager.acknowledged_offsets_in_slab(f.pointer.slab_id),
+	)
+	.unwrap();
+	let encrypted = f
+		.manager
+		.config
+		.crypto
+		.encrypt_tiered_slab_object(f.pointer.slab_id, &metadata, plaintext)
+		.unwrap();
+	let uri = f
+		.store
+		.inner
+		.put("tier/newer-pending-authority.wnd", &encrypted.bytes)
+		.await
+		.unwrap();
+	let latest = tiered_pointer_from_blob(&f.manager, f.pointer.slab_id, uri, &encrypted.bytes);
+	let before = f
+		.manager
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot()
+		.await
+		.unwrap();
+	tokio::time::timeout(
+		Duration::from_secs(2),
+		f.manager
+			.apply_tier_slab_committed(latest.clone(), Some(91)),
+	)
+	.await
+	.expect("an already-pending slab stages a newer commit without fetching")
+	.unwrap();
+	assert_authority_pending(f.manager.lookup(tenant(), id(0x7f62)));
+	// Let only the OLD response return. Its stale rows must not install while
+	// the newer object's fetch remains paused.
+	f.store.released.add_permits(1);
+	tokio::time::timeout(Duration::from_secs(2), f.store.entered.notified())
+		.await
+		.expect("the flight advances to the latest object");
+	let waiting = f
+		.manager
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot()
+		.await
+		.unwrap();
+	assert_eq!(
+		waiting.record_rows, before.record_rows,
+		"the old flight installed no row repairs"
+	);
+	assert_eq!(
+		waiting.last_control_log_index, before.last_control_log_index,
+		"pending is not published"
+	);
+	f.store.release();
+	assert_eq!(
+		tokio::time::timeout(Duration::from_secs(5), f.manager.read(f.present))
+			.await
+			.unwrap()
+			.unwrap(),
+		b"present"
+	);
+	assert!(
+		f.manager
+			.lookup(tenant(), id(0x7f62))
+			.authority_result()
+			.unwrap()
+			.is_none(),
+		"the newer generation pruned this row"
+	);
+	assert_eq!(
+		f.manager.tier_pointer(f.pointer.slab_id).await,
+		Some(latest)
+	);
+	let done = f
+		.manager
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot()
+		.await
+		.unwrap();
+	assert_eq!(done.last_control_log_index, Some(91));
+}
+
+async fn assert_unverified_integrity_failure_does_not_retry(update_hash: bool) {
+	let f = pending_authority_fixture_with_corruption(Some(update_hash)).await;
+	f.store.release();
+	let first = f
+		.manager
+		.read(f.present)
+		.await
+		.expect_err("corrupt authority never serves from its mirror");
+	assert_unresolved_duplicate_refusal(&first);
+	let calls = f.store.fetches.load(Ordering::SeqCst);
+	assert!(calls > 0);
+	let second = f
+		.manager
+		.read(f.present)
+		.await
+		.expect_err("integrity failure stays fenced");
+	assert_unresolved_duplicate_refusal(&second);
+	assert_eq!(
+		f.store.fetches.load(Ordering::SeqCst),
+		calls,
+		"integrity failure is sticky rather than retried as an outage"
+	);
+	let snapshot = f
+		.manager
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot()
+		.await
+		.unwrap();
+	assert!(
+		!snapshot
+			.record_rows
+			.iter()
+			.any(|row| row.key_identity == id(0x7f62)),
+		"failed validation does not publish row repair"
+	);
+}
+
+#[tokio::test]
+async fn unverified_authority_hash_failure_is_sticky_and_preserves_the_mirror() {
+	assert_unverified_integrity_failure_does_not_retry(false).await;
+}
+
+#[tokio::test]
+async fn unverified_authority_decode_failure_is_sticky_and_preserves_the_mirror() {
+	assert_unverified_integrity_failure_does_not_retry(true).await;
+}
+
+#[tokio::test]
+async fn unverified_authority_retry_keeps_known_conflicts_without_a_permanent_fence() {
+	let (dirs, mgr, l2) = fresh_manager_with_l2("pending-authority-known-conflict").await;
+	let key = id(0x7f65);
+	let active = mgr.state.lock().await.active.clone();
+	let mut conflicts = Vec::new();
+	for value in [100, 200] {
+		let frame =
+			encode_test_multirow_storage_frame(&[(key, Locality::new(0x7900), hlc(10), value)]);
+		conflicts.push(active.append(tenant(), key, hlc(10), &frame).await.unwrap());
+	}
+	drop(active);
+	force_seal_active(&mgr).await;
+	let remote_key = id(0x7f66);
+	append_below_manager(&mgr, remote_key, hlc(20), 300).await;
+	let object_key = "tier/pending-after-known-conflict.wnd";
+	let pointer = tier_kv_slab(&mgr, &l2, object_key).await;
+	let bytes = l2.get(&pointer.l2_uri).await.unwrap();
+	let active = mgr.state.lock().await.active.clone();
+	let frame =
+		encode_test_multirow_storage_frame(&[(remote_key, Locality::new(0x7900), hlc(20), 300)]);
+	let saved = active
+		.append(tenant(), remote_key, hlc(20), &frame)
+		.await
+		.unwrap();
+	drop(active);
+	l2.delete(&pointer.l2_uri).await.unwrap();
+	let mgr = try_restart_tier_manager(mgr, &dirs, &l2)
+		.await
+		.expect("unavailable authority is a readiness gate");
+	let error = mgr
+		.read_version(tenant(), remote_key, saved)
+		.await
+		.unwrap_err();
+	assert_unresolved_duplicate_refusal(&error);
+	l2.put(object_key, &bytes).await.unwrap();
+	let result = tokio::time::timeout(
+		Duration::from_secs(5),
+		mgr.read_version(tenant(), remote_key, saved),
+	)
+	.await
+	.expect("a known conflict cannot block the retry's private validation")
+	.unwrap();
+	assert_eq!(
+		frame_row_identity_and_value(&result, saved.record_row_index),
+		(remote_key, 300)
+	);
+	for location in conflicts {
+		let error = mgr.read_version(tenant(), key, location).await.unwrap_err();
+		assert!(is_conflicting_version_refusal(&error));
+	}
+	assert!(
+		mgr.lookup(tenant(), id(0x7fff))
+			.authority_result()
+			.unwrap()
+			.is_none()
+	);
+}
+
+struct DetachedAuthorityReadStore {
+	inner: Arc<dyn ObjectStore>,
+	receiver: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+	started: Arc<tokio::sync::Notify>,
+	finished: Arc<tokio::sync::Notify>,
+}
+#[async_trait::async_trait]
+impl ObjectStore for DetachedAuthorityReadStore {
+	fn planned_upload_uri(&self, key: &str) -> std::io::Result<String> {
+		self.inner.planned_upload_uri(key)
+	}
+
+	async fn put(&self, key: &str, bytes: &[u8]) -> std::io::Result<String> {
+		self.inner.put(key, bytes).await
+	}
+	async fn head(&self, uri: &str) -> std::io::Result<crate::storage::l2::ObjectMetadata> {
+		self.inner.head(uri).await
+	}
+	async fn get_range(&self, uri: &str, range: std::ops::Range<u64>) -> std::io::Result<Bytes> {
+		self.inner.get_range(uri, range).await
+	}
+	async fn get_bytes(&self, uri: &str) -> std::io::Result<Bytes> {
+		let bytes = self.inner.get_bytes(uri).await?;
+		let receiver = self.receiver.lock().unwrap().take();
+		if let Some(receiver) = receiver {
+			let finished = self.finished.clone();
+			let started = self.started.clone();
+			// Like non-owned BlockingFileOps reads, this closure carries bytes
+			// and a completion signal, never a manager, owner or install handle.
+			tokio::task::spawn_blocking(move || {
+				started.notify_one();
+				let _ = receiver.recv();
+				finished.notify_one();
+				bytes
+			})
+			.await
+			.map_err(Error::other)
+		} else {
+			Ok(bytes)
+		}
+	}
+	async fn list(&self, prefix: &str) -> std::io::Result<Vec<crate::storage::l2::ObjectMetadata>> {
+		self.inner.list(prefix).await
+	}
+	async fn delete(&self, uri: &str) -> std::io::Result<()> {
+		self.inner.delete(uri).await
+	}
+}
+
+async fn open_owned_authority_fixture(
+	dir: &Path,
+	l2: Arc<dyn ObjectStore>,
+	crypto: Arc<CryptoManager>,
+	owner: DataDirectoryOwner,
+) -> Arc<SlabManager> {
+	SlabManager::open_with_owner(
+		SlabManagerConfig {
+			dir: dir.to_path_buf(),
+			max_slab_bytes: 1 << 20,
+			io: spawn_io_thread(64).unwrap(),
+			l2: Some(l2),
+			rehydration: RehydrationPolicy::default(),
+			l2_column_fetch: Default::default(),
+			row_group_writer: Default::default(),
+			l2_row_group_fetch: Default::default(),
+			encoding_writer: Default::default(),
+			l2_chunk_layout: Default::default(),
+			l2_encoding_fetch: Default::default(),
+			encoding_compute: Default::default(),
+			group_commit: GroupCommitConfig::default(),
+			crypto,
+		},
+		owner,
+	)
+	.await
+	.unwrap()
+}
+
+#[tokio::test]
+async fn unverified_authority_close_does_not_give_a_late_detached_read_install_authority() {
+	let mut f = pending_authority_fixture().await;
+	let (_dummy_dir, dummy) = fresh_manager().await;
+	let old = std::mem::replace(&mut f.manager, dummy);
+	let crypto = old.config.crypto.clone();
+	drop(old);
+	let (release, receiver) = std::sync::mpsc::channel();
+	let detached = Arc::new(DetachedAuthorityReadStore {
+		inner: f.store.inner.clone(),
+		receiver: std::sync::Mutex::new(Some(receiver)),
+		started: Default::default(),
+		finished: Default::default(),
+	});
+	let owner = DataDirectoryOwner::acquire_existing(&*f.dirs[0]).unwrap();
+	let manager =
+		open_owned_authority_fixture(&f.dirs[0], detached.clone(), crypto.clone(), owner.clone())
+			.await;
+	tokio::time::timeout(Duration::from_secs(2), detached.started.notified())
+		.await
+		.expect("the non-owned blocking read has started");
+	let weak = Arc::downgrade(&manager);
+	tokio::time::timeout(Duration::from_secs(3), owner.close(Duration::from_secs(2)))
+		.await
+		.expect("detached pure reads cannot zombify close")
+		.unwrap();
+	drop(manager);
+	drop(owner);
+	assert!(
+		weak.upgrade().is_none(),
+		"no late response can upgrade the old manager"
+	);
+	let next_owner = DataDirectoryOwner::acquire_existing(&*f.dirs[0])
+		.expect("close releases the lease even while the pure read is blocked");
+	let reopened = open_owned_authority_fixture(
+		&f.dirs[0],
+		f.store.inner.clone(),
+		crypto,
+		next_owner.clone(),
+	)
+	.await;
+	assert_eq!(
+		tokio::time::timeout(Duration::from_secs(5), reopened.read(f.present))
+			.await
+			.unwrap()
+			.unwrap(),
+		b"present"
+	);
+	let before = reopened
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot()
+		.await
+		.unwrap();
+	release.send(()).unwrap();
+	tokio::time::timeout(Duration::from_secs(2), detached.finished.notified())
+		.await
+		.expect("the old detached read completes after reopen");
+	assert_eq!(
+		reopened
+			.persistent_index
+			.as_ref()
+			.unwrap()
+			.load_snapshot()
+			.await
+			.unwrap(),
+		before,
+		"the old response installs nothing in the reopened directory"
+	);
+	let location = reopened
+		.lookup(tenant(), id(0x7f62))
+		.authority_result()
+		.unwrap()
+		.unwrap();
+	assert_eq!(reopened.read(location).await.unwrap(), b"omitted");
+	next_owner.close(Duration::from_secs(2)).await.unwrap();
+}
+
+#[tokio::test]
+async fn unverified_authority_outage_backs_off_repeated_admission_probes() {
+	let f = pending_authority_fixture_with_fault(None, true).await;
+	f.store.release();
+	let error = f.manager.read(f.present).await.unwrap_err();
+	assert_unresolved_duplicate_refusal(&error);
+	let calls = f.store.fetches.load(Ordering::SeqCst);
+	assert!(calls > 0);
+	tokio::time::pause();
+	for _ in 0..32 {
+		assert_authority_pending(f.manager.lookup(tenant(), id(0x7fff)));
+		tokio::task::yield_now().await;
+	}
+	assert_eq!(
+		f.store.fetches.load(Ordering::SeqCst),
+		calls,
+		"admission probes cannot hot-loop retries during backoff"
+	);
+	tokio::time::resume();
+	let backup = f.dirs[1].join("tier/pending-authority-backup.wnd");
+	let bytes = std::fs::read(backup).unwrap();
+	f.store
+		.inner
+		.put("tier/pending-authority.wnd", &bytes)
+		.await
+		.unwrap();
+	assert_eq!(
+		tokio::time::timeout(Duration::from_secs(5), f.manager.read(f.present))
+			.await
+			.unwrap()
+			.unwrap(),
+		b"present"
+	);
+	assert!(
+		f.manager
+			.lookup(tenant(), id(0x7fff))
+			.authority_result()
+			.unwrap()
+			.is_none()
+	);
+}
+
+#[tokio::test]
+async fn unverified_authority_refuses_an_omitted_row_in_its_mirror() {
+	let f = pending_authority_fixture().await;
+	assert_authority_pending(f.manager.lookup(tenant(), id(0x7f62)));
+	f.store.release();
+	assert_eq!(f.manager.read(f.present).await.unwrap(), b"present");
+	let restored = f
+		.manager
+		.lookup(tenant(), id(0x7f62))
+		.authority_result()
+		.unwrap()
+		.unwrap();
+	assert_eq!(f.manager.read(restored).await.unwrap(), b"omitted");
+}
+
+#[tokio::test]
+async fn unverified_authority_refuses_an_incomplete_range_scan() {
+	let f = pending_authority_fixture().await;
+	assert_authority_pending(f.manager.scan(tenant(), Locality::ZERO, Locality::MAX));
+	assert_authority_pending(f.manager.scan_all_versions_from(
+		Locality::ZERO,
+		Locality::MAX,
+		hlc(0),
+		None,
+	));
+	f.store.release();
+	assert_eq!(f.manager.read(f.present).await.unwrap(), b"present");
+	assert_eq!(
+		f.manager
+			.scan(tenant(), Locality::ZERO, Locality::MAX)
+			.authority_result()
+			.unwrap()
+			.len(),
+		2
+	);
+	assert_eq!(
+		f.manager
+			.scan_all_versions(Locality::ZERO, Locality::MAX, hlc(0))
+			.authority_result()
+			.unwrap()
+			.len(),
+		2
+	);
+}
+
+struct BootstrapCollisionFixture {
+	_dirs: [crate::test_support::TestDir; 2],
+	manager: Arc<SlabManager>,
+	store: Arc<PausedAuthorityStore>,
+	pointer: TieredSlabPointer,
+	keep: RecordLocation,
+	file: PathBuf,
+	bytes: Vec<u8>,
+	allocator_floor: SlabId,
+}
+impl Drop for BootstrapCollisionFixture {
+	fn drop(&mut self) {
+		self.store.release();
+	}
+}
+
+async fn bootstrap_collision_fixture(active: bool, extra: bool) -> BootstrapCollisionFixture {
+	let (dirs, mgr, l2) = fresh_manager_with_l2("bootstrap-authority-collision").await;
+	let keep = mgr
+		.append(tenant(), id(0x7f71), hlc(10), b"keep")
+		.await
+		.unwrap();
+	mgr.append(tenant(), id(0x7f72), hlc(20), b"evidence")
+		.await
+		.unwrap();
+	let slab_id = force_seal_active(&mgr).await;
+	let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
+	let (_, padded) = LocalSlabStore::padded_record_size(
+		keep.length as usize - std::mem::size_of::<SlabRecordHeader>(),
+	)
+	.unwrap();
+	let first_end = keep.offset as usize + padded;
+	let plaintext = if extra { &raw[..first_end] } else { &raw };
+	// With `extra` the object's own layout holds only `keep`: the second local
+	// row is evidence the object lacks, so state the object's record offsets.
+	let evidence = if extra {
+		BTreeSet::from([keep.offset])
+	} else {
+		mgr.acknowledged_offsets_in_slab(slab_id)
+	};
+	let encrypted = mgr
+		.encrypt_tiered_blob_with_evidence(slab_id, plaintext, &evidence, None)
+		.unwrap();
+	let uri = l2
+		.put("tier/bootstrap-collision.wnd", &encrypted.bytes)
+		.await
+		.unwrap();
+	let pointer = tiered_pointer_from_blob(&mgr, slab_id, uri, &encrypted.bytes);
+	// A committed pointer known externally (the bootstrap call supplies it).
+	// Preserve redb, but simulate loss of this pointer and its mirrored rows.
+	mgr.apply_tier_slab_committed(pointer.clone(), Some(101))
+		.await
+		.unwrap();
+	let rows = mgr.record_rows_for_slab_for_recovery(slab_id);
+	mgr.persistent_index
+		.as_ref()
+		.unwrap()
+		.apply(PersistentIndexUpdate {
+			delete_tiered_slab_ids: vec![slab_id],
+			delete_records: rows,
+			..Default::default()
+		})
+		.await
+		.unwrap();
+	mgr.fsync_all_local_slabs().await.unwrap();
+	let active_id = mgr.active_slab_id().await;
+	let allocator_floor = mgr.state.lock().await.next_slab_id;
+	let crypto = mgr.config.crypto.clone();
+	drop(mgr);
+	let file = slab_path(&dirs[0], slab_id);
+	std::fs::write(&file, &raw).unwrap();
+	if active {
+		let active_file = slab_path(&dirs[0], active_id);
+		assert_eq!(
+			std::fs::metadata(&active_file).unwrap().len(),
+			0,
+			"only the fixture's empty active file is removed"
+		);
+		std::fs::remove_file(active_file).unwrap();
+	}
+	let bytes = std::fs::read(&file).unwrap();
+	let store = Arc::new(PausedAuthorityStore {
+		inner: l2,
+		paused: AtomicBool::new(true),
+		fetches: Default::default(),
+		entered: Default::default(),
+		released: tokio::sync::Semaphore::new(0),
+	});
+	let l2: Arc<dyn ObjectStore> = store.clone();
+	let manager = reopen_duplicate_fixture(&dirs, &l2, crypto).await.unwrap();
+	BootstrapCollisionFixture {
+		_dirs: dirs,
+		manager,
+		store,
+		pointer,
+		keep,
+		file,
+		bytes,
+		allocator_floor,
+	}
+}
+
+/// The production bootstrap entry before the split from runtime reconciliation.
+/// The product change adapts this helper exactly as it adapts node bootstrap.
+async fn bootstrap_collision_staging(f: &BootstrapCollisionFixture) -> std::io::Result<()> {
+	tokio::time::timeout(
+		Duration::from_secs(2),
+		f.manager
+			.stage_bootstrap_tier_authority(f.pointer.clone(), Some(101), f.pointer.slab_id),
+	)
+	.await
+	.expect("bootstrap stages authority without awaiting L2")
+}
+async fn reconcile_bootstrap_collision(f: &BootstrapCollisionFixture) {
+	bootstrap_collision_staging(f).await.unwrap();
+}
+
+#[tokio::test]
+async fn bootstrap_tier_authority_quarantines_a_sealed_collision_without_unlinking_it() {
+	let f = bootstrap_collision_fixture(false, false).await;
+	reconcile_bootstrap_collision(&f).await;
+	assert_eq!(
+		std::fs::read(&f.file)
+			.expect("a discovered local file becomes evidence, not a released file"),
+		f.bytes
+	);
+	assert!(
+		!f.manager
+			.state
+			.lock()
+			.await
+			.sealed
+			.contains_key(&f.pointer.slab_id)
+	);
+	assert_authority_pending(f.manager.lookup(tenant(), id(0x7f71)));
+	f.store.release();
+	assert_eq!(f.manager.read(f.keep).await.unwrap(), b"keep");
+	assert!(
+		f.manager
+			.quarantined_slab_files()
+			.files
+			.iter()
+			.any(|file| file.slab_id == f.pointer.slab_id)
+	);
+	assert_eq!(std::fs::read(&f.file).unwrap(), f.bytes);
+}
+
+#[tokio::test]
+async fn bootstrap_tier_authority_rotates_an_active_collision_before_new_writes() {
+	let f = bootstrap_collision_fixture(true, false).await;
+	reconcile_bootstrap_collision(&f).await;
+	let active = f.manager.active_slab_id().await;
+	assert!(
+		active > f.pointer.slab_id,
+		"the committed tier id cannot remain the active append target"
+	);
+	assert!(f.manager.state.lock().await.next_slab_id >= f.allocator_floor);
+	assert_authority_pending(f.manager.lookup(tenant(), id(0x7f71)));
+	let error = f
+		.manager
+		.append(tenant(), id(0x7f73), hlc(30), b"not-ready")
+		.await
+		.unwrap_err();
+	assert_unresolved_duplicate_refusal(&error);
+	f.store.release();
+	assert_eq!(f.manager.read(f.keep).await.unwrap(), b"keep");
+	let added = f
+		.manager
+		.append(tenant(), id(0x7f73), hlc(30), b"fresh")
+		.await
+		.unwrap();
+	assert_eq!(added.slab_id, active);
+	assert!(added.slab_id > f.pointer.slab_id);
+	assert_eq!(std::fs::read(&f.file).unwrap(), f.bytes);
+}
+
+#[tokio::test]
+async fn bootstrap_tier_authority_keeps_extra_local_rows_only_as_evidence() {
+	let f = bootstrap_collision_fixture(false, true).await;
+	reconcile_bootstrap_collision(&f).await;
+	f.store.release();
+	assert_eq!(f.manager.read(f.keep).await.unwrap(), b"keep");
+	assert!(
+		f.manager
+			.lookup(tenant(), id(0x7f72))
+			.authority_result()
+			.unwrap()
+			.is_none(),
+		"an extra local row is never a live version of the committed tier"
+	);
+	assert_eq!(
+		std::fs::read(&f.file).expect("the extra row stays in evidence"),
+		f.bytes
+	);
+	assert!(
+		!f.manager
+			.state
+			.lock()
+			.await
+			.sealed
+			.contains_key(&f.pointer.slab_id)
+	);
+}
+
+#[tokio::test]
+async fn bootstrap_tier_authority_staging_refuses_after_readiness_was_exposed() {
+	let f = bootstrap_collision_fixture(false, false).await;
+	assert!(
+		f.manager
+			.lookup(tenant(), id(0x7f71))
+			.authority_result()
+			.unwrap()
+			.is_some()
+	);
+	let error = bootstrap_collision_staging(&f)
+		.await
+		.expect_err("bootstrap staging is forbidden after a caller observed readiness");
+	assert_unresolved_duplicate_refusal(&error);
+}
+
+async fn metadata_observer_survives_a_late_authority_install(supersession: bool) {
+	let f = pending_authority_fixture().await;
+	let reader_manager = f.manager.clone();
+	let present = f.present;
+	let reader = tokio::spawn(async move { reader_manager.read(present).await });
+	tokio::time::timeout(Duration::from_secs(5), f.store.entered.notified())
+		.await
+		.expect("the authority read is held before its bytes return");
+	let changed = tokio::time::timeout(Duration::from_secs(2), async {
+		if supersession {
+			f.manager
+				.record_supersession_for_slab(f.pointer.slab_id, hlc(70), Some(707))
+				.await
+		} else {
+			f.manager
+				.record_row_tombstone_for_slab(f.pointer.slab_id, hlc(70), Some(707))
+				.await
+		}
+	})
+	.await
+	.expect("metadata observers cannot wait for unavailable L2")
+	.unwrap();
+	assert!(changed);
+	let durable = f
+		.manager
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot()
+		.await
+		.unwrap();
+	assert_eq!(durable.last_control_log_index, Some(707));
+	let pointer = durable
+		.tiered_slabs
+		.iter()
+		.find(|pointer| pointer.slab_id == f.pointer.slab_id)
+		.unwrap();
+	if supersession {
+		assert_eq!(
+			pointer.supersession_metadata,
+			SupersessionMetadata::Earliest(hlc(70))
+		);
+	} else {
+		assert_eq!(
+			pointer.tombstone_metadata,
+			TombstoneMetadata::Earliest(hlc(70))
+		);
+	}
+	f.store.release();
+	let _ = tokio::time::timeout(Duration::from_secs(5), reader)
+		.await
+		.unwrap()
+		.unwrap();
+	f.manager.read(f.omitted).await.unwrap();
+	let durable = f
+		.manager
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot()
+		.await
+		.unwrap();
+	assert_eq!(durable.last_control_log_index, Some(707));
+	let pointer = durable
+		.tiered_slabs
+		.iter()
+		.find(|pointer| pointer.slab_id == f.pointer.slab_id)
+		.unwrap();
+	if supersession {
+		assert_eq!(
+			pointer.supersession_metadata,
+			SupersessionMetadata::Earliest(hlc(70)),
+			"a late verification overwrote committed metadata"
+		);
+	} else {
+		assert_eq!(
+			pointer.tombstone_metadata,
+			TombstoneMetadata::Earliest(hlc(70)),
+			"a late verification overwrote committed metadata"
+		);
+	}
+}
+
+#[tokio::test]
+async fn pending_authority_preserves_observed_supersession_across_install() {
+	metadata_observer_survives_a_late_authority_install(true).await;
+}
+
+#[tokio::test]
+async fn pending_authority_preserves_observed_tombstone_across_install() {
+	metadata_observer_survives_a_late_authority_install(false).await;
+}
+
+#[tokio::test]
+async fn pending_authority_migration_marks_a_range_omitted_from_its_mirror() {
+	let f = pending_authority_fixture().await;
+	let key = id(0x7f62);
+	let locality = Locality::from(key).get();
+	let tombstone = MigratedRangeTombstone {
+		migration_id: 709,
+		range_start: locality,
+		range_end: locality,
+		to_epoch: 2,
+		completed_by: NodeId {
+			id: 7,
+			_reserved: 0,
+		},
+		completed_at_hlc: hlc(80),
+		migration_hlc_floor: hlc(0),
+	};
+	let changed = f
+		.manager
+		.record_migrated_range_tombstone(&tombstone, Some(708))
+		.await
+		.unwrap();
+	assert_eq!(
+		changed, 1,
+		"the incomplete mirror cannot prove the migrated range absent"
+	);
+	let durable = f
+		.manager
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot()
+		.await
+		.unwrap();
+	assert_eq!(durable.last_control_log_index, Some(708));
+	assert_eq!(
+		durable.tiered_slabs[0].tombstone_metadata,
+		TombstoneMetadata::Earliest(hlc(80))
+	);
+	f.store.release();
+	f.manager.read(f.omitted).await.unwrap();
+	assert!(
+		f.manager
+			.slab_has_migrated_range_tombstone_at(
+				f.pointer.slab_id,
+				hlc(80),
+				std::slice::from_ref(&tombstone)
+			)
+			.authority_result()
+			.unwrap()
+	);
+	assert!(!crate::storage::slab_visibility_complete(
+		hlc(20),
+		f.manager
+			.tier_pointer(f.pointer.slab_id)
+			.await
+			.unwrap()
+			.tombstone_metadata,
+		SupersessionMetadata::None,
+		hlc(80)
+	));
+}
+
+#[tokio::test]
+async fn observed_pending_metadata_survives_restart_before_authority_install() {
+	let mut f = pending_authority_fixture().await;
+	let reader_manager = f.manager.clone();
+	let present = f.present;
+	let reader = tokio::spawn(async move { reader_manager.read(present).await });
+	tokio::time::timeout(Duration::from_secs(5), f.store.entered.notified())
+		.await
+		.unwrap();
+	f.manager
+		.record_row_tombstone_for_slab(f.pointer.slab_id, hlc(90), Some(709))
+		.await
+		.unwrap();
+	reader.abort();
+	assert!(reader.await.unwrap_err().is_cancelled());
+	let crypto = f.manager.config.crypto.clone();
+	let (_placeholder_dir, placeholder) = fresh_manager().await;
+	let original = std::mem::replace(&mut f.manager, placeholder);
+	drop(original);
+	// No old fetch has returned: the restarted manager must learn the update
+	// from the durable pointer, before any verifier has installed the rows.
+	let store: Arc<dyn ObjectStore> = f.store.clone();
+	let reopened = reopen_duplicate_fixture(&f.dirs, &store, crypto)
+		.await
+		.unwrap();
+	let durable = reopened
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot()
+		.await
+		.unwrap();
+	assert_eq!(durable.last_control_log_index, Some(709));
+	assert_eq!(
+		durable.tiered_slabs[0].tombstone_metadata,
+		TombstoneMetadata::Earliest(hlc(90))
+	);
+	f.store.release();
+	reopened.read(f.omitted).await.unwrap();
+	assert_eq!(
+		reopened
+			.tier_pointer(f.pointer.slab_id)
+			.await
+			.unwrap()
+			.tombstone_metadata,
+		TombstoneMetadata::Earliest(hlc(90))
+	);
+}
+
+/// Peak RSS is process-wide, so the measured fixture runs in an exact-test
+/// child. Other suite tests remain concurrent in their original lanes.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn tier_authority_opaque_payloads_keep_recovery_allocation_bounded() {
+	const CHILD_ENV: &str = "WENDELON_TIER_AUTHORITY_ALLOCATION_CHILD";
+	const EXACT: &str =
+		"storage::manager::tests::tier_authority_opaque_payloads_keep_recovery_allocation_bounded";
+	if std::env::var_os(CHILD_ENV).is_none() {
+		let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+			.arg("--exact")
+			.arg(EXACT)
+			.arg("--nocapture")
+			.env(CHILD_ENV, "1")
+			.kill_on_drop(true)
+			.output()
+			.await
+			.unwrap();
+		assert!(
+			output.status.success(),
+			"isolated allocation control failed: stdout={} stderr={}",
+			String::from_utf8_lossy(&output.stdout),
+			String::from_utf8_lossy(&output.stderr)
+		);
+		assert!(
+			String::from_utf8_lossy(&output.stdout).contains("running 1 test"),
+			"the child must execute the exact allocation control"
+		);
+		return;
+	}
+
+	fn peak_rss_kib() -> u64 {
+		let status = std::fs::read_to_string("/proc/self/status").unwrap();
+		status
+			.lines()
+			.find_map(|line| line.strip_prefix("VmHWM:"))
+			.and_then(|value| value.split_whitespace().next())
+			.and_then(|value| value.parse().ok())
+			.expect("Linux must report peak resident memory")
+	}
+
+	let f = pending_authority_fixture().await;
+	let before = peak_rss_kib();
+	f.store.release();
+	let started = std::time::Instant::now();
+	let read = tokio::time::timeout(Duration::from_secs(5), f.manager.read(f.present)).await;
+	let growth = peak_rss_kib().saturating_sub(before);
+	assert!(
+		growth < 64 * 1024,
+		"opaque present/omitted frames caused {growth} KiB of peak RSS growth"
+	);
+	assert_eq!(read.expect("readiness deadline").unwrap(), b"present");
+	assert!(
+		started.elapsed() < Duration::from_secs(5),
+		"recovery exceeded the same five-second readiness deadline"
+	);
+	assert_eq!(
+		tokio::time::timeout(Duration::from_secs(5), f.manager.read(f.omitted))
+			.await
+			.expect("omitted row readiness deadline")
+			.unwrap(),
+		b"omitted"
+	);
+	let final_growth = peak_rss_kib().saturating_sub(before);
+	assert!(final_growth < 64 * 1024, "peak RSS grew {final_growth} KiB");
+}
+
+#[tokio::test]
+async fn retired_tier_during_verification_does_not_keep_authority_pending() {
+	let f = pending_authority_fixture().await;
+	tokio::time::timeout(Duration::from_secs(5), f.store.entered.notified())
+		.await
+		.expect("verification has fetched the soon-retired object");
+	// Model the observer's committed retirement while its previous fetch is
+	// paused. Keep the staged pointer to exercise stale snapshot cleanup.
+	let slab_id = f.pointer.slab_id;
+	f.manager.tier_authority.pending.insert(
+		slab_id,
+		tier_authority::PendingTierAuthority {
+			pointer: f.pointer.clone(),
+			last_control_log_index: None,
+		},
+	);
+	f.manager.state.lock().await.tiered.remove(&slab_id);
+	f.manager.retired_tier_slabs.insert(slab_id);
+	f.store.release();
+	tokio::time::timeout(Duration::from_secs(5), async {
+		loop {
+			if f.manager.wait_tier_authority_ready().await.is_ok() {
+				break;
+			}
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+	})
+	.await
+	.expect("a retired pointer cannot keep readiness pending");
+	assert!(f.manager.tier_authority_is_ready());
+}
+
+#[tokio::test]
+async fn bootstrap_rotation_skips_all_committed_pointer_ids() {
+	let f = bootstrap_collision_fixture(true, false).await;
+	let later_id = f.pointer.slab_id.saturating_add(4);
+	let mut later = f.pointer.clone();
+	later.slab_id = later_id;
+	f.manager
+		.stage_bootstrap_tier_authority(f.pointer.clone(), Some(101), later_id)
+		.await
+		.unwrap();
+	let replacement = f.manager.active_slab_id().await;
+	assert!(
+		replacement > later_id,
+		"rotation must skip every committed pointer ID"
+	);
+	f.manager
+		.stage_bootstrap_tier_authority(later, Some(101), later_id)
+		.await
+		.unwrap();
+	assert_eq!(f.manager.active_slab_id().await, replacement);
+	assert!(!slab_path(&f._dirs[0], later_id).exists());
+}
+
+#[tokio::test]
+async fn committed_retirement_during_verification_fences_reads_until_ready() {
+	use crate::consensus::{RetireTieredSlab, TieredSlab, WendelonRequest, WendelonStateMachine};
+	use crate::storage::sweeper::ManagerTierObserver;
+	use openraft::storage::RaftStateMachine;
+	use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
+
+	let f = pending_authority_fixture().await;
+	tokio::time::timeout(Duration::from_secs(5), f.store.entered.notified())
+		.await
+		.expect("verification is paused on the old committed object");
+	let p = &f.pointer;
+	let old_bytes = f.store.inner.get(&p.l2_uri).await.unwrap();
+	let mut sm = WendelonStateMachine::new()
+		.with_tier_observer(Arc::new(ManagerTierObserver::new(f.manager.clone())));
+	sm.seed_tiered_slab_for_test(TieredSlab {
+		slab_id: p.slab_id,
+		l2_uri: p.l2_uri.clone(),
+		payload_hash: p.payload_hash,
+		is_encrypted: p.is_encrypted,
+		tenant_id: p.tenant_id,
+		tenant_kek_id: p.tenant_kek_id,
+		stats_format_version: p.stats_format_version,
+		stats_block_len: p.stats_block_len,
+		stats_block_hash128: p.stats_block_hash128,
+		tombstone_metadata: p.tombstone_metadata,
+		supersession_metadata: p.supersession_metadata,
+	})
+	.await;
+	let entry = Entry {
+		log_id: LogId::new(CommittedLeaderId::new(3, 1), 701),
+		payload: EntryPayload::Normal(WendelonRequest::RetireTieredSlab(RetireTieredSlab {
+			slab_id: p.slab_id,
+		})),
+	};
+	RaftStateMachine::apply(&mut sm, [entry]).await.unwrap();
+	assert!(
+		!sm.state_snapshot()
+			.await
+			.tiered_slabs
+			.contains_key(&p.slab_id)
+	);
+	assert!(f.manager.tier_pointer(p.slab_id).await.is_none());
+	assert_authority_pending(f.manager.lookup(tenant(), id(0x7f61)));
+	assert_authority_pending(f.manager.lookup(tenant(), id(0x7f62)));
+	f.store.release();
+	let result = tokio::time::timeout(
+		Duration::from_secs(5),
+		f.manager.wait_tier_authority_ready(),
+	)
+	.await
+	.expect("retirement must have a prompt explicit outcome");
+	result.expect("applied retirement must reach Ready after late verification is discarded");
+	assert!(f.manager.lookup(tenant(), id(0x7f61)).unwrap().is_none());
+	assert!(f.manager.lookup(tenant(), id(0x7f62)).unwrap().is_none());
+	assert_eq!(f.store.inner.get(&p.l2_uri).await.unwrap(), old_bytes);
+	let records = f
+		.manager
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot_cleanup_intents()
+		.await
+		.unwrap();
+	let old = records
+		.iter()
+		.find(|(slab, uri, _)| *slab == p.slab_id && uri == &p.l2_uri)
+		.unwrap();
+	assert_eq!(
+		old.2.retirement_source,
+		Some(crate::storage::index::RetirementSource::Log(701))
+	);
+}
+
+/// Forwards every real observer call; only the async local retirement waits
+/// for the test after it has been entered.
+struct PausedRetirementObserver {
+	inner: crate::storage::sweeper::ManagerTierObserver,
+	entered: Arc<tokio::sync::Semaphore>,
+	release: Arc<tokio::sync::Semaphore>,
+}
+
+#[async_trait::async_trait]
+impl crate::consensus::TierObserver for PausedRetirementObserver {
+	fn bind_tier_snapshot_source(&self, source: crate::consensus::TierSnapshotSource) {
+		self.inner.bind_tier_snapshot_source(source);
+	}
+
+	fn before_slab_retired(&self, slab_id: SlabId, applied_log_index: u64) {
+		self.inner.before_slab_retired(slab_id, applied_log_index);
+	}
+
+	fn before_tier_snapshot_install(&self) -> std::io::Result<u64> {
+		self.inner.before_tier_snapshot_install()
+	}
+
+	async fn on_tier_snapshot_installed(
+		&self,
+		tiers: &[crate::consensus::TieredSlab],
+		index: Option<u64>,
+		snapshot_epoch: u64,
+	) -> std::io::Result<()> {
+		self.inner
+			.on_tier_snapshot_installed(tiers, index, snapshot_epoch)
+			.await
+	}
+
+	async fn on_slab_tiered(
+		&self,
+		tier: &crate::consensus::TieredSlab,
+		applied_log_index: u64,
+	) -> std::io::Result<()> {
+		self.inner.on_slab_tiered(tier, applied_log_index).await
+	}
+
+	async fn on_slab_retired(
+		&self,
+		slab_id: SlabId,
+		applied_log_index: u64,
+	) -> std::io::Result<()> {
+		self.entered.add_permits(1);
+		self.release.acquire().await.unwrap().forget();
+		self.inner.on_slab_retired(slab_id, applied_log_index).await
+	}
+
+	async fn on_migrated_range_tombstone(
+		&self,
+		tombstone: &crate::consensus::MigratedRangeTombstone,
+		applied_log_index: u64,
+	) -> std::io::Result<()> {
+		self.inner
+			.on_migrated_range_tombstone(tombstone, applied_log_index)
+			.await
+	}
+
+	async fn on_lsm_compaction_committed(
+		&self,
+		commit: &crate::storage::CompactionCommit,
+		applied_log_index: u64,
+	) -> std::io::Result<()> {
+		self.inner
+			.on_lsm_compaction_committed(commit, applied_log_index)
+			.await
+	}
+}
+
+/// The window the synchronous retirement hook protects: authority is ready,
+/// the SM has applied RetireTieredSlab, local retirement has not completed.
+#[tokio::test]
+async fn committed_retirement_fences_ready_reads_before_local_retirement() {
+	use crate::consensus::{RetireTieredSlab, TieredSlab, WendelonRequest, WendelonStateMachine};
+	use openraft::storage::RaftStateMachine;
+	use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
+
+	let (_dirs, mgr, l2) = fresh_manager_with_l2("committed-retire-ready-window").await;
+	let key = id(0x7e61);
+	mgr.append_durable(tenant(), key, hlc(10), b"retiring")
+		.await
+		.unwrap();
+	let p = tier_kv_slab(&mgr, &l2, "tier/committed-retire-ready-window.wnd").await;
+	// Premise: ready authority and a readable tiered row, with no pending
+	// verification, deferred pointer, or held index writer.
+	assert_eq!(mgr.tier_authority_readiness_reason(), None);
+	assert!(mgr.tier_authority.pending.is_empty());
+	assert!(mgr.unapplied_tier_pointers.is_empty());
+	assert_eq!(mgr.tier_pointer(p.slab_id).await, Some(p.clone()));
+	let location = mgr
+		.lookup(tenant(), key)
+		.unwrap()
+		.expect("the tiered row is served");
+	assert_eq!(location.slab_id, p.slab_id);
+	assert_eq!(mgr.read(location).await.unwrap(), b"retiring");
+
+	let entered = Arc::new(tokio::sync::Semaphore::new(0));
+	let release = Arc::new(tokio::sync::Semaphore::new(0));
+	let sm = WendelonStateMachine::new().with_tier_observer(Arc::new(PausedRetirementObserver {
+		inner: crate::storage::sweeper::ManagerTierObserver::new(mgr.clone()),
+		entered: entered.clone(),
+		release: release.clone(),
+	}));
+	sm.seed_tiered_slab_for_test(TieredSlab {
+		slab_id: p.slab_id,
+		l2_uri: p.l2_uri.clone(),
+		payload_hash: p.payload_hash,
+		is_encrypted: p.is_encrypted,
+		tenant_id: p.tenant_id,
+		tenant_kek_id: p.tenant_kek_id,
+		stats_format_version: p.stats_format_version,
+		stats_block_len: p.stats_block_len,
+		stats_block_hash128: p.stats_block_hash128,
+		tombstone_metadata: p.tombstone_metadata,
+		supersession_metadata: p.supersession_metadata,
+	})
+	.await;
+	let mut apply = {
+		let mut sm = sm.clone();
+		tokio::spawn(async move {
+			RaftStateMachine::apply(
+				&mut sm,
+				[Entry {
+					log_id: LogId::new(CommittedLeaderId::new(3, 1), 711),
+					payload: EntryPayload::Normal(WendelonRequest::RetireTieredSlab(
+						RetireTieredSlab { slab_id: p.slab_id },
+					)),
+				}],
+			)
+			.await
+			.map_err(|error| error.to_string())
+		})
+	};
+	// Handshake on callback entry. If the apply ends first, keep its result.
+	let (paused, finished) = tokio::select! {
+		biased;
+		result = &mut apply => (false, Some(result)),
+		permit = tokio::time::timeout(Duration::from_secs(30), entered.acquire()) => {
+			permit.unwrap().unwrap().forget();
+			(true, None)
+		}
+	};
+	// Observations inside the window; asserted only after the join below.
+	let sm_names_tier = tokio::time::timeout(Duration::from_secs(5), sm.state_snapshot())
+		.await
+		.expect("the shared SM state is readable during the callback")
+		.tiered_slabs
+		.contains_key(&p.slab_id);
+	let local_pointer = mgr.tier_pointer(p.slab_id).await;
+	let locally_retired = mgr.retired_tier_slabs.contains(&p.slab_id);
+	let verification_pending = !mgr.tier_authority.pending.is_empty();
+	let deferred_pointers = !mgr.unapplied_tier_pointers.is_empty();
+	let window_lookup = mgr.lookup(tenant(), key);
+	let window_read = tokio::time::timeout(Duration::from_secs(5), mgr.read(location))
+		.await
+		.expect("a read in the window has a prompt outcome");
+	// Always release and join the paused apply before judging.
+	release.add_permits(1);
+	let applied = match finished {
+		Some(result) => result.unwrap(),
+		None => tokio::time::timeout(Duration::from_secs(30), apply)
+			.await
+			.expect("the released apply completes")
+			.unwrap(),
+	};
+	applied.expect("the RetireTieredSlab apply succeeds");
+	assert!(paused, "local retirement callback was entered");
+	assert!(!sm_names_tier, "the SM applied the retirement first");
+	assert_eq!(
+		local_pointer,
+		Some(p.clone()),
+		"the manager still holds the old pointer in the window"
+	);
+	assert!(!locally_retired, "local retirement has not completed");
+	assert!(
+		!verification_pending,
+		"no pending verification explains a refusal"
+	);
+	assert!(!deferred_pointers, "no deferred pointer explains a refusal");
+	let lookup_error = window_lookup
+		.expect_err("a committed retirement must fence a ready lookup before local retirement");
+	assert_eq!(
+		stale_location(&lookup_error).map(|stale| stale.reason),
+		Some(StaleLocationReason::Fenced),
+		"{lookup_error}"
+	);
+	let read_error = window_read
+		.expect_err("a committed retirement must fence a ready read before local retirement");
+	assert_eq!(
+		stale_location(&read_error).map(|stale| stale.reason),
+		Some(StaleLocationReason::Fenced),
+		"{read_error}"
+	);
+	// The normal local retirement then completes.
+	tokio::time::timeout(Duration::from_secs(10), mgr.wait_tier_authority_ready())
+		.await
+		.expect("retirement reaches a prompt outcome")
+		.expect("authority is ready after local retirement");
+	assert!(mgr.tier_pointer(p.slab_id).await.is_none());
+	assert!(mgr.retired_tier_slabs.contains(&p.slab_id));
+	assert_eq!(mgr.tier_authority_readiness_reason(), None);
+	assert!(
+		mgr.lookup(tenant(), key).unwrap().is_none(),
+		"the retired row is absent"
+	);
+}
+
+/// A reservation whose caller has not completed keeps its rotated slab out of
+/// tier selection, even if another append has already made it sealed.
+#[tokio::test]
+async fn pending_reservation_blocks_sealed_slab_tier_selection() {
+	let (_dir, mgr) = fresh_manager().await;
+	let frame = vec![0x3c; 600 * 1024];
+	let (first_slab, first) = mgr.target_for_append(frame.len(), None).await.unwrap();
+	let second = mgr
+		.append_durable(tenant(), id(0x9a31), hlc(31), &frame)
+		.await
+		.unwrap();
+	assert_ne!(first_slab.slab_id(), second.slab_id);
+	assert!(
+		mgr.list_sealed_slabs()
+			.await
+			.iter()
+			.all(|info| info.slab_id != first_slab.slab_id()),
+		"an unpublished reservation must not be tier eligible"
+	);
+	drop(first);
+	assert!(
+		mgr.list_sealed_slabs()
+			.await
+			.iter()
+			.any(|info| info.slab_id == first_slab.slab_id()),
+		"an abandoned, never-submitted reservation must release eligibility"
+	);
+	assert_eq!(mgr.read(second).await.unwrap(), frame);
+}
+
+/// A durable append has written its frame but has not published its manager
+/// index while its group commit is held. Rotation must not make it eligible.
+#[tokio::test]
+async fn unpublished_durable_append_blocks_sealed_slab_tier_selection() {
+	let (_dir, mgr) = fresh_manager().await;
+	let first_slab = Arc::clone(&mgr.state.lock().await.active);
+	let hold = first_slab.hold_group_commit_batches_for_test().await;
+	let payload = vec![0x5a; 600 * 1024];
+	let first = {
+		let mgr = mgr.clone();
+		let payload = payload.clone();
+		tokio::spawn(async move {
+			mgr.append_durable(tenant(), id(0x9a41), hlc(41), &payload)
+				.await
+		})
+	};
+	let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+	while first_slab.pending_durable_waiters_for_test().await == 0 {
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"append did not reach durability wait"
+		);
+		tokio::time::sleep(Duration::from_millis(1)).await;
+	}
+	let other = mgr
+		.append_durable(tenant(), id(0x9a42), hlc(42), &payload)
+		.await
+		.unwrap();
+	assert_ne!(first_slab.slab_id(), other.slab_id);
+	let selected_while_pending = mgr.list_sealed_slabs().await;
+	hold.close();
+	let location = first.await.unwrap().unwrap();
+	assert!(
+		selected_while_pending
+			.iter()
+			.all(|info| info.slab_id != first_slab.slab_id()),
+		"the unpublished append made its slab tier eligible"
+	);
+	assert!(
+		mgr.list_sealed_slabs()
+			.await
+			.iter()
+			.any(|info| info.slab_id == first_slab.slab_id())
+	);
+	assert_eq!(mgr.lookup(tenant(), id(0x9a41)).unwrap(), Some(location));
+	assert_eq!(mgr.read(location).await.unwrap(), payload);
+}
+
+/// The write task outlives an aborted caller, so its reservation must remain
+/// in flight until the actual write (including any cleanup) has completed.
+#[tokio::test]
+async fn cancelled_caller_keeps_detached_append_slab_out_of_tier_selection() {
+	let (_dir, mgr) = fresh_manager().await;
+	let first_slab = Arc::clone(&mgr.state.lock().await.active);
+	let (entered, release) = first_slab.hold_next_append_write_for_test();
+	let payload = vec![0x63; 600 * 1024];
+	let writer = {
+		let mgr = mgr.clone();
+		let payload = payload.clone();
+		tokio::spawn(async move {
+			mgr.append_durable(tenant(), id(0x9a51), hlc(51), &payload)
+				.await
+		})
+	};
+	tokio::time::timeout(Duration::from_secs(60), entered.acquire())
+		.await
+		.unwrap()
+		.unwrap()
+		.forget();
+	writer.abort();
+	assert!(writer.await.unwrap_err().is_cancelled());
+	let other = mgr
+		.append_durable(tenant(), id(0x9a52), hlc(52), &payload)
+		.await
+		.unwrap();
+	assert_ne!(first_slab.slab_id(), other.slab_id);
+	let selected_while_writing = mgr.list_sealed_slabs().await;
+	release.close();
+	let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+	while !mgr
+		.list_sealed_slabs()
+		.await
+		.iter()
+		.any(|info| info.slab_id == first_slab.slab_id())
+	{
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"completed detached write never released eligibility"
+		);
+		tokio::time::sleep(Duration::from_millis(1)).await;
+	}
+	assert!(
+		selected_while_writing
+			.iter()
+			.all(|info| info.slab_id != first_slab.slab_id()),
+		"detached append was still writing when its slab became tier eligible"
+	);
+	assert_eq!(mgr.read(other).await.unwrap(), payload);
+}
+
+/// Local maintenance cannot publish a row deletion while tier publication for
+/// the same source slab owns the publication lock.
+#[tokio::test]
+async fn local_compaction_finisher_waits_for_source_tier_publication_lock() {
+	let (_dir, mgr) = fresh_manager().await;
+	let key = id(0x9a61);
+	let bytes = b"compaction-source";
+	let location = mgr
+		.append_durable(tenant(), key, hlc(61), bytes)
+		.await
+		.unwrap();
+	let slab_id = force_seal_active(&mgr).await;
+	assert_eq!(slab_id, location.slab_id);
+	mgr.ensure_live_lsm_run_for_maintenance(slab_id, 1024);
+	let record = CompactionRecord {
+		tenant_id: tenant(),
+		key_identity: key,
+		routing_locality: Locality::from(key),
+		old_location: location,
+		reclaim: true,
+		retention_ambiguous: false,
+		retention_lag_seconds: 0,
+	};
+	let lock = mgr.tier_publication_lock(slab_id);
+	let guard = lock.lock().await;
+	let mut finisher = {
+		let mgr = mgr.clone();
+		tokio::spawn(async move {
+			mgr.finish_compaction_without_replacement(slab_id, &[record])
+				.await
+		})
+	};
+	let completed_while_locked =
+		tokio::time::timeout(Duration::from_millis(200), &mut finisher).await;
+	let still_readable = mgr.read(location).await.ok();
+	drop(guard);
+	if completed_while_locked.is_err() {
+		finisher.await.unwrap().unwrap();
+	}
+	assert!(
+		completed_while_locked.is_err(),
+		"compaction published while tier lock was held"
+	);
+	assert_eq!(still_readable.as_deref(), Some(bytes.as_slice()));
+	assert!(mgr.lookup(tenant(), key).unwrap().is_none());
+}
+
+/// A torn write keeps the reservation live until the detached zero cleanup
+/// finishes, even when the original append caller is cancelled.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn cancelled_torn_append_blocks_tiering_until_zero_cleanup_finishes() {
+	let dir = fresh_dir("cancelled-torn-append");
+	let io = spawn_io_thread(64).unwrap();
+	let faults = Arc::new(FaultyFileOps::new(&*dir).unwrap());
+	let mgr = SlabManager::initialize_new_store_with_file_ops(
+		SlabManagerConfig {
+			dir: dir.to_path_buf(),
+			max_slab_bytes: 1024 * 1024,
+			io,
+			l2: None,
+			rehydration: RehydrationPolicy::default(),
+			l2_column_fetch: Default::default(),
+			row_group_writer: Default::default(),
+			l2_row_group_fetch: Default::default(),
+			encoding_writer: Default::default(),
+			l2_chunk_layout: Default::default(),
+			l2_encoding_fetch: Default::default(),
+			encoding_compute: Default::default(),
+			group_commit: GroupCommitConfig::default(),
+			crypto: test_crypto(),
+		},
+		faults.clone(),
+	)
+	.await
+	.unwrap();
+	let slab = Arc::clone(&mgr.state.lock().await.active);
+	let (entered, release) = slab.hold_next_append_cleanup_for_test();
+	faults.inject(InjectedFault::on(
+		FaultOp::WriteAt,
+		FaultAction::PartialWriteError {
+			written_bytes: 128,
+			persist_partial: true,
+			kind: ErrorKind::WriteZero,
+			message: "injected torn append".into(),
+		},
+	));
+	let payload = vec![0x70; 600 * 1024];
+	let writer = {
+		let mgr = mgr.clone();
+		let payload = payload.clone();
+		tokio::spawn(async move {
+			mgr.append_durable(tenant(), id(0x9a81), hlc(81), &payload)
+				.await
+		})
+	};
+	tokio::time::timeout(Duration::from_secs(60), entered.acquire())
+		.await
+		.unwrap()
+		.unwrap()
+		.forget();
+	writer.abort();
+	assert!(writer.await.unwrap_err().is_cancelled());
+	let other = mgr
+		.append_durable(tenant(), id(0x9a82), hlc(82), &payload)
+		.await
+		.unwrap();
+	assert_ne!(slab.slab_id(), other.slab_id);
+	let while_cleaning = mgr.list_sealed_slabs().await;
+	release.close();
+	let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+	while !mgr
+		.list_sealed_slabs()
+		.await
+		.iter()
+		.any(|info| info.slab_id == slab.slab_id())
+	{
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"cleanup never released eligibility"
+		);
+		tokio::time::sleep(Duration::from_millis(1)).await;
+	}
+	assert!(
+		while_cleaning
+			.iter()
+			.all(|info| info.slab_id != slab.slab_id()),
+		"cleanup was still in flight when tiering selected the slab"
+	);
+	assert_eq!(mgr.read(other).await.unwrap(), payload);
+}
+
+/// Independent committed retirements must not replace one another with stale
+/// whole-index snapshots. Hold both just before their durable publication.
+#[tokio::test]
+async fn independent_tier_retirements_both_survive_reopen() {
+	let (dirs, mgr, l2) = fresh_manager_with_l2("independent-retirements").await;
+	let first_key = id(0x9a71);
+	let second_key = id(0x9a72);
+	mgr.append_durable(tenant(), first_key, hlc(71), b"first")
+		.await
+		.unwrap();
+	let first = tier_kv_slab(&mgr, &l2, "independent-retirements/first").await;
+	mgr.append_durable(tenant(), second_key, hlc(72), b"second")
+		.await
+		.unwrap();
+	let second = tier_kv_slab(&mgr, &l2, "independent-retirements/second").await;
+	assert_ne!(first.slab_id, second.slab_id);
+	let entered = Arc::new(tokio::sync::Semaphore::new(0));
+	let release = Arc::new(tokio::sync::Semaphore::new(0));
+	*mgr.continuity_test_holds
+		.retirement_snapshot_hold
+		.lock()
+		.unwrap() = Some((entered.clone(), release.clone()));
+	let mut a = {
+		let mgr = mgr.clone();
+		tokio::spawn(async move { mgr.retire_tiered_slab(first.slab_id).await })
+	};
+	let mut b = {
+		let mgr = mgr.clone();
+		tokio::spawn(async move { mgr.retire_tiered_slab(second.slab_id).await })
+	};
+	let arrivals = tokio::select! {
+		result = tokio::time::timeout(Duration::from_secs(60), entered.acquire_many(2)) => result,
+		result = &mut a => { release.close(); let other = b.await; panic!("first retirement exited before rendezvous: {result:?}; second={other:?}"); },
+		result = &mut b => { release.close(); let other = a.await; panic!("second retirement exited before rendezvous: {result:?}; first={other:?}"); },
+	};
+	arrivals
+		.expect("both retirements reached the unchanged deadline")
+		.unwrap()
+		.forget();
+	release.close();
+	assert!(a.await.unwrap().unwrap());
+	assert!(b.await.unwrap().unwrap());
+	let before_reopen = mgr
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot()
+		.await
+		.unwrap();
+	assert!(
+		before_reopen
+			.tiered_slabs
+			.iter()
+			.all(|p| p.slab_id != first.slab_id && p.slab_id != second.slab_id),
+		"both retirement pointers must be durable before reopen"
+	);
+	assert!(
+		before_reopen
+			.record_rows
+			.iter()
+			.all(|row| row.location.slab_id != first.slab_id
+				&& row.location.slab_id != second.slab_id),
+		"both retirement row removals must be durable before reopen"
+	);
+	let reopened = try_restart_tier_manager(mgr, &dirs, &l2).await.unwrap();
+	assert!(reopened.lookup(tenant(), first_key).unwrap().is_none());
+	assert!(reopened.lookup(tenant(), second_key).unwrap().is_none());
+	let persisted = reopened
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot()
+		.await
+		.unwrap();
+	assert!(
+		persisted
+			.tiered_slabs
+			.iter()
+			.all(|p| p.slab_id != first.slab_id && p.slab_id != second.slab_id)
+	);
+	assert!(
+		persisted
+			.record_rows
+			.iter()
+			.all(|row| row.location.slab_id != first.slab_id
+				&& row.location.slab_id != second.slab_id)
+	);
+}
+
+/// A fallback rebuilt from a prior snapshot cannot resurrect a retirement
+/// that committed while the rebuild was waiting to publish.
+#[tokio::test]
+async fn retirement_racing_failed_delta_rebuild_is_never_resurrected() {
+	let (_dirs, mgr, l2) = fresh_manager_with_l2("retirement-versus-rebuild").await;
+	let key = id(0x9a91);
+	mgr.append_durable(tenant(), key, hlc(91), b"value")
+		.await
+		.unwrap();
+	let pointer = tier_kv_slab(&mgr, &l2, "retirement-versus-rebuild/object").await;
+	let entered = Arc::new(tokio::sync::Semaphore::new(0));
+	let release = Arc::new(tokio::sync::Semaphore::new(0));
+	*mgr.continuity_test_holds
+		.rebuild_snapshot_hold
+		.lock()
+		.unwrap() = Some((entered.clone(), release.clone()));
+	mgr.persistent_index
+		.as_ref()
+		.unwrap()
+		.fail_next_delta
+		.store(true, std::sync::atomic::Ordering::Release);
+	let rebuild = {
+		let mgr = mgr.clone();
+		tokio::spawn(async move {
+			mgr.mirror_persistent_update(PersistentIndexUpdate::default(), "test-forced-rebuild")
+				.await;
+		})
+	};
+	tokio::time::timeout(Duration::from_secs(60), entered.acquire())
+		.await
+		.unwrap()
+		.unwrap()
+		.forget();
+	let mut retirement = {
+		let mgr = mgr.clone();
+		tokio::spawn(async move { mgr.retire_tiered_slab(pointer.slab_id).await })
+	};
+	let early = tokio::time::timeout(Duration::from_millis(200), &mut retirement).await;
+	release.close();
+	rebuild.await.unwrap();
+	match early {
+		Ok(result) => assert!(result.unwrap().unwrap()),
+		Err(_) => assert!(retirement.await.unwrap().unwrap()),
+	}
+	let snapshot = mgr
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot()
+		.await
+		.unwrap();
+	assert!(
+		snapshot
+			.tiered_slabs
+			.iter()
+			.all(|p| p.slab_id != pointer.slab_id),
+		"rebuild resurrected the retired pointer"
+	);
+	assert!(
+		snapshot
+			.record_rows
+			.iter()
+			.all(|row| row.location.slab_id != pointer.slab_id),
+		"rebuild resurrected retired rows"
+	);
+}
+
+/// A committed tier refresh waits for an in-progress exclusive rebuild.
+#[tokio::test]
+async fn tier_apply_waits_for_rebuild_and_publishes() {
+	let (_dirs, manager, l2) = fresh_manager_with_l2("tier-apply-rebuild").await;
+	manager
+		.append_durable(tenant(), id(0x9a92), hlc(92), b"value")
+		.await
+		.unwrap();
+	let slab = manager.force_seal_active_for_test().await;
+	let raw = manager.read_sealed_raw(slab).await.unwrap();
+	let encrypted = manager.encrypt_tiered_object_blob(slab, &raw).unwrap();
+	let first_uri = l2
+		.put("tier-apply-rebuild/first", &encrypted.bytes)
+		.await
+		.unwrap();
+	let second_uri = l2
+		.put("tier-apply-rebuild/second", &encrypted.bytes)
+		.await
+		.unwrap();
+	let first = tiered_pointer_from_blob(&manager, slab, first_uri, &encrypted.bytes);
+	let second = tiered_pointer_from_blob(&manager, slab, second_uri, &encrypted.bytes);
+	manager.apply_tier_slab(first).await.unwrap();
+	let entered = Arc::new(tokio::sync::Semaphore::new(0));
+	let release = Arc::new(tokio::sync::Semaphore::new(0));
+	*manager
+		.continuity_test_holds
+		.rebuild_snapshot_hold
+		.lock()
+		.unwrap() = Some((entered.clone(), release.clone()));
+	manager
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.fail_next_delta
+		.store(true, Ordering::Release);
+	let rebuild = {
+		let manager = manager.clone();
+		tokio::spawn(async move {
+			manager
+				.mirror_persistent_update(PersistentIndexUpdate::default(), "tier-apply-rebuild")
+				.await;
+		})
+	};
+	tokio::time::timeout(Duration::from_secs(60), entered.acquire())
+		.await
+		.unwrap()
+		.unwrap()
+		.forget();
+	let mut apply = {
+		let manager = manager.clone();
+		let pointer = second.clone();
+		tokio::spawn(async move { manager.apply_tier_slab(pointer).await })
+	};
+	assert!(
+		tokio::time::timeout(Duration::from_millis(200), &mut apply)
+			.await
+			.is_err(),
+		"apply must wait while rebuild owns the index gate"
+	);
+	assert!(!manager.unapplied_tier_pointers.contains_key(&slab));
+	release.add_permits(1);
+	rebuild.await.unwrap();
+	apply.await.unwrap().unwrap();
+	assert!(!manager.unapplied_tier_pointers.contains_key(&slab));
+	assert_eq!(
+		manager
+			.state
+			.lock()
+			.await
+			.tiered
+			.get(&slab)
+			.unwrap()
+			.value(),
+		&second
+	);
+	assert!(manager.tier_authority_readiness_reason().is_none());
+}
+
+/// Replacement publication also acquires the source tier lock before it
+/// judges or publishes its staged relocation.
+#[tokio::test]
+async fn replacement_compaction_finisher_waits_for_source_tier_lock() {
+	let (_dir, mgr) = fresh_manager().await;
+	let key = id(0x9aa1);
+	let location = mgr
+		.append_durable(tenant(), key, hlc(101), b"replacement-source")
+		.await
+		.unwrap();
+	let slab_id = force_seal_active(&mgr).await;
+	assert_eq!(slab_id, location.slab_id);
+	mgr.ensure_live_lsm_run_for_maintenance(slab_id, 1024);
+	let record = CompactionRecord {
+		tenant_id: tenant(),
+		key_identity: key,
+		routing_locality: Locality::from(key),
+		old_location: location,
+		reclaim: false,
+		retention_ambiguous: false,
+		retention_lag_seconds: 0,
+	};
+	let replacement_id = mgr.reserve_slab_id().await;
+	let staged = maintenance_staged_slab_path(&mgr.config.dir, slab_id, replacement_id);
+	let replacement = Arc::new(
+		LocalSlabStore::open(
+			&staged,
+			replacement_id,
+			mgr.file_ops.clone(),
+			mgr.config.group_commit.clone(),
+		)
+		.await
+		.unwrap(),
+	);
+	let lock = mgr.tier_publication_lock(slab_id);
+	let guard = lock.lock().await;
+	let mut task = {
+		let mgr = mgr.clone();
+		let staged = staged.clone();
+		tokio::spawn(async move {
+			mgr.finish_compaction_with_replacement(
+				slab_id,
+				replacement_id,
+				replacement,
+				&[record],
+				&[],
+				&[],
+				&staged,
+			)
+			.await
+		})
+	};
+	let early = tokio::time::timeout(Duration::from_millis(200), &mut task).await;
+	let value_while_locked = mgr.read(location).await.ok();
+	drop(guard);
+	let did_wait = early.is_err();
+	let result = match early {
+		Ok(value) => value.unwrap(),
+		Err(_) => task.await.unwrap(),
+	};
+	assert!(matches!(result, Err(ref err) if err.kind() == ErrorKind::InvalidData));
+	assert_eq!(
+		value_while_locked.as_deref(),
+		Some(b"replacement-source".as_slice())
+	);
+	assert!(
+		did_wait,
+		"replacement finisher bypassed the source tier lock"
+	);
+	let _ = unlink_local_file(mgr.file_ops.as_ref(), &staged).await;
+}
+
+/// A retirement must refuse if its observed durable pointer has changed by
+/// the time the redb transaction executes, preserving the newer generation.
+#[tokio::test]
+async fn tier_retirement_rechecks_expected_pointer_inside_transaction() {
+	let (_dirs, mgr, l2) = fresh_manager_with_l2("retirement-expected-pointer").await;
+	let key = id(0x9ab1);
+	mgr.append_durable(tenant(), key, hlc(111), b"value")
+		.await
+		.unwrap();
+	let pointer = tier_kv_slab(&mgr, &l2, "retirement-expected-pointer/object").await;
+	let entered = Arc::new(tokio::sync::Semaphore::new(0));
+	let release = Arc::new(tokio::sync::Semaphore::new(0));
+	*mgr.continuity_test_holds
+		.retirement_snapshot_hold
+		.lock()
+		.unwrap() = Some((entered.clone(), release.clone()));
+	let task = {
+		let mgr = mgr.clone();
+		tokio::spawn(async move { mgr.delete_tiered_slab_strict(pointer.slab_id, None).await })
+	};
+	tokio::time::timeout(Duration::from_secs(60), entered.acquire())
+		.await
+		.unwrap()
+		.unwrap()
+		.forget();
+	let mut newer = pointer.clone();
+	newer.l2_uri.push_str("-newer");
+	mgr.persistent_index
+		.as_ref()
+		.unwrap()
+		.upsert_tiered_slab(newer.clone(), None)
+		.await
+		.unwrap();
+	release.close();
+	let result = task.await.unwrap();
+	let snapshot = mgr
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot()
+		.await
+		.unwrap();
+	assert!(result.is_err(), "retirement accepted a stale pointer");
+	assert!(
+		snapshot.tiered_slabs.contains(&newer),
+		"retirement erased a newer pointer"
+	);
+	assert!(
+		snapshot
+			.record_rows
+			.iter()
+			.any(|row| row.location.slab_id == pointer.slab_id),
+		"retirement erased rows for a newer pointer"
+	);
+}
+
+/// S4-only ablation control: redb can commit after its caller is cancelled.
+/// A rebuild must not replace that committed deletion with older memory.
+#[tokio::test]
+async fn cancelled_retirement_after_commit_fences_rebuild_and_public_reads() {
+	let (_dirs, mgr, l2) = fresh_manager_with_l2("cancelled-redb-retirement").await;
+	let key = id(0x9ac1);
+	mgr.append_durable(tenant(), key, hlc(121), b"value")
+		.await
+		.unwrap();
+	let pointer = tier_kv_slab(&mgr, &l2, "cancelled-redb-retirement/object").await;
+	let entered = Arc::new(std::sync::Barrier::new(2));
+	let release = Arc::new(std::sync::Barrier::new(2));
+	*mgr.persistent_index
+		.as_ref()
+		.unwrap()
+		.retirement_commit_hold
+		.lock()
+		.unwrap() = Some((entered.clone(), release.clone()));
+	let retirement = {
+		let mgr = mgr.clone();
+		tokio::spawn(async move { mgr.retire_tiered_slab(pointer.slab_id).await })
+	};
+	tokio::time::timeout(
+		Duration::from_secs(60),
+		tokio::task::spawn_blocking(move || entered.wait()),
+	)
+	.await
+	.unwrap()
+	.unwrap();
+	retirement.abort();
+	assert!(retirement.await.unwrap_err().is_cancelled());
+	let answer = mgr.lookup(tenant(), key);
+	let mut rebuild = {
+		let mgr = mgr.clone();
+		tokio::spawn(async move { mgr.rebuild_persistent_index().await })
+	};
+	let early = tokio::time::timeout(Duration::from_millis(200), &mut rebuild).await;
+	tokio::task::spawn_blocking(move || release.wait())
+		.await
+		.unwrap();
+	let result = match early {
+		Ok(joined) => joined.unwrap(),
+		Err(_) => rebuild.await.unwrap(),
+	};
+	assert!(
+		result.is_err(),
+		"a rebuild must refuse unresolved publication"
+	);
+	assert!(
+		answer.is_err(),
+		"an unresolved committed retirement must fence answers"
+	);
+	let snapshot = mgr
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot()
+		.await
+		.unwrap();
+	assert!(
+		snapshot
+			.tiered_slabs
+			.iter()
+			.all(|p| p.slab_id != pointer.slab_id),
+		"rebuild replaced committed retirement with old memory"
+	);
+	assert!(
+		snapshot
+			.record_rows
+			.iter()
+			.all(|row| row.location.slab_id != pointer.slab_id),
+		"rebuild restored retired rows"
+	);
+}
+
+/// No staged output may be deleted or data admitted while redb is unreadable:
+/// an unresolved LSM intent cannot be ruled out without its authority.
+#[tokio::test]
+async fn unreadable_index_preserves_staged_lsm_output_and_fences_admission() {
+	let dir = fresh_dir("unreadable-index-keeps-lsm");
+	std::fs::create_dir_all(persistent_index_path(&dir)).unwrap();
+	let staged = dir.join("compaction-temp-0000000000000001-slab_0000000000000001.wnd");
+	let bytes = b"staged-output-evidence";
+	std::fs::write(&staged, bytes).unwrap();
+	let mgr = open_manager_at_dir(
+		dir.to_path_buf(),
+		spawn_io_thread(64).unwrap(),
+		test_crypto(),
+	)
+	.await;
+	let preserved = std::fs::read(&staged);
+	let admission = mgr
+		.append_durable(tenant(), id(0x9ad1), hlc(131), b"not-admitted")
+		.await;
+	assert!(
+		matches!(preserved, Ok(ref data) if data == bytes),
+		"open deleted or changed the staged output"
+	);
+	let error = admission.expect_err("unreadable intent authority must fence admission");
+	assert_eq!(error.kind(), ErrorKind::WouldBlock);
+}
+
+/// A published tentative still owns its source slab until its final outcome.
+#[tokio::test]
+async fn unresolved_counter_tentative_keeps_rotated_slab_out_of_tiering() {
+	let (_dir, mgr) = fresh_manager().await;
+	let key = id(0x9ae1);
+	let origin = NodeId {
+		id: 1,
+		_reserved: 0,
+	};
+	let location = mgr
+		.counter_append_tentative(tenant(), key, hlc(141), 7, origin)
+		.await
+		.unwrap();
+	let slab_id = force_seal_active(&mgr).await;
+	assert_eq!(slab_id, location.slab_id);
+	let before_rollback = mgr.list_sealed_slabs().await;
+	mgr.counter_unindex_tentative(tenant(), key, location)
+		.await
+		.unwrap();
+	let after_rollback = mgr.list_sealed_slabs().await;
+	assert!(
+		before_rollback.iter().all(|info| info.slab_id != slab_id),
+		"unresolved counter was eligible for tiering"
+	);
+	assert!(
+		after_rollback.iter().any(|info| info.slab_id == slab_id),
+		"resolved counter did not release its slab"
+	);
+	assert!(mgr.lookup(tenant(), key).unwrap().is_none());
+}
+
+/// Recovery cannot infer that an unmatched tentative was durably abandoned.
+#[tokio::test]
+async fn recovered_unmatched_counter_tentative_keeps_slab_out_of_tiering() {
+	let dir = fresh_dir("counter-unresolved-reopen");
+	let io = spawn_io_thread(64).unwrap();
+	let crypto = test_crypto();
+	let mgr = initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	let key = id(0x9af1);
+	let origin = NodeId {
+		id: 1,
+		_reserved: 0,
+	};
+	let location = mgr
+		.counter_append_tentative(tenant(), key, hlc(151), 9, origin)
+		.await
+		.unwrap();
+	assert_eq!(force_seal_active(&mgr).await, location.slab_id);
+	mgr.fsync_all_local_slabs().await.unwrap();
+	drop(mgr);
+	let reopened = open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	let candidates = reopened.list_sealed_slabs().await;
+	assert!(
+		candidates
+			.iter()
+			.all(|info| info.slab_id != location.slab_id),
+		"recovery selected a slab with an unresolved counter tentative"
+	);
+	assert!(
+		reopened.lookup(tenant(), key).unwrap().is_none(),
+		"the unpaired tentative must not become a committed answer"
+	);
+}
+
+/// S4-only: completing one physical tentative cannot release a second copy.
+#[tokio::test]
+async fn counter_commit_releases_only_its_exact_tentative_reservation() {
+	let (_dir, mgr) = fresh_manager().await;
+	let key = id(0x9b01);
+	let origin = NodeId {
+		id: 1,
+		_reserved: 0,
+	};
+	let first = mgr
+		.counter_append_tentative(tenant(), key, hlc(161), 3, origin)
+		.await
+		.unwrap();
+	let second = mgr
+		.counter_append_tentative(tenant(), key, hlc(161), 3, origin)
+		.await
+		.unwrap();
+	assert_ne!(first.offset, second.offset);
+	mgr.counter_append_commit_marker(tenant(), key, hlc(161), first.offset, origin)
+		.await
+		.unwrap();
+	mgr.counter_commit_published(tenant(), key, first, origin);
+	let slab_id = force_seal_active(&mgr).await;
+	assert_eq!(slab_id, first.slab_id);
+	let while_second_pending = mgr.list_sealed_slabs().await;
+	mgr.counter_unindex_tentative(tenant(), key, second)
+		.await
+		.unwrap();
+	assert!(
+		while_second_pending
+			.iter()
+			.all(|info| info.slab_id != slab_id),
+		"a second tentative was still unresolved"
+	);
+	assert!(
+		mgr.list_sealed_slabs()
+			.await
+			.iter()
+			.any(|info| info.slab_id == slab_id)
+	);
+	assert_eq!(mgr.lookup(tenant(), key).unwrap(), Some(first));
+}
+
+/// A committed copy cannot resolve another physical copy during recovery.
+#[tokio::test]
+async fn recovered_unmatched_copy_remains_guarded_when_same_identity_committed() {
+	let dir = fresh_dir("counter-unmatched-copy-reopen");
+	let io = spawn_io_thread(64).unwrap();
+	let crypto = test_crypto();
+	let mgr = initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	let key = id(0x9b11);
+	let origin = NodeId {
+		id: 1,
+		_reserved: 0,
+	};
+	let first = mgr
+		.counter_append_tentative(tenant(), key, hlc(171), 3, origin)
+		.await
+		.unwrap();
+	let second = mgr
+		.counter_append_tentative(tenant(), key, hlc(171), 3, origin)
+		.await
+		.unwrap();
+	assert_ne!(first.offset, second.offset);
+	mgr.counter_append_commit_marker(tenant(), key, hlc(171), first.offset, origin)
+		.await
+		.unwrap();
+	mgr.counter_commit_published(tenant(), key, first, origin);
+	assert_eq!(force_seal_active(&mgr).await, second.slab_id);
+	mgr.fsync_all_local_slabs().await.unwrap();
+	drop(mgr);
+	let reopened = open_manager_at_dir(dir.to_path_buf(), io, crypto).await;
+	assert!(
+		reopened
+			.list_sealed_slabs()
+			.await
+			.iter()
+			.all(|info| info.slab_id != second.slab_id),
+		"a different committed copy cannot resolve this physical tentative"
+	);
+}
+
+#[tokio::test]
+async fn cancelled_replica_rollback_retains_gate_during_locked_row_mutation() {
+	let (_dir, mgr) = fresh_manager().await;
+	let service = Arc::new(CounterReplicaService::new(mgr.clone()));
+	let origin = NodeId {
+		id: 1,
+		_reserved: 0,
+	};
+	let key = counter_identity(&ckey(b"owned-rollback"));
+	let timestamp = HybridTimestamp {
+		physical_ms: 19,
+		logical: 0,
+		node_id: 0,
+	};
+	service
+		.replicate_tentative(origin, 19, tenant(), key, 7, timestamp)
+		.await
+		.unwrap();
+	let location = mgr.lookup(tenant(), key).unwrap().unwrap();
+	assert_eq!(force_seal_active(&mgr).await, location.slab_id);
+	let entered = Arc::new(tokio::sync::Semaphore::new(0));
+	let release = Arc::new(tokio::sync::Semaphore::new(0));
+	*mgr.counter_rollback_hold.lock().unwrap() = Some((entered.clone(), release.clone()));
+	let running_service = service.clone();
+	let rollback =
+		tokio::spawn(async move { running_service.rollback(origin, 19, tenant(), key).await });
+	tokio::time::timeout(std::time::Duration::from_secs(5), entered.acquire())
+		.await
+		.unwrap()
+		.unwrap()
+		.forget();
+	assert!(mgr.lookup(tenant(), key).unwrap().is_none());
+	rollback.abort();
+	let running_service = service.clone();
+	let commit =
+		tokio::spawn(async move { running_service.commit(origin, 19, tenant(), key).await });
+	tokio::time::timeout(std::time::Duration::from_secs(5), async {
+		while service.ctr4_operation_state(origin, tenant(), 19).0 < 2 {
+			tokio::task::yield_now().await;
+		}
+	})
+	.await
+	.unwrap();
+	assert!(
+		mgr.list_sealed_slabs()
+			.await
+			.iter()
+			.all(|slab| slab.slab_id != location.slab_id)
+	);
+	release.add_permits(1);
+	assert!(commit.await.unwrap().is_err());
+	assert!(mgr.lookup(tenant(), key).unwrap().is_none());
+	assert!(
+		mgr.list_sealed_slabs()
+			.await
+			.iter()
+			.any(|slab| slab.slab_id == location.slab_id)
+	);
+}
+
+#[tokio::test]
+async fn failed_replica_rollback_fences_commit_and_retains_guard_until_retry() {
+	let (_dir, mgr) = fresh_manager().await;
+	let service = CounterReplicaService::new(mgr.clone());
+	let origin = NodeId {
+		id: 1,
+		_reserved: 0,
+	};
+	let key = counter_identity(&ckey(b"rollback-error"));
+	let timestamp = HybridTimestamp {
+		physical_ms: 29,
+		logical: 0,
+		node_id: 0,
+	};
+	service
+		.replicate_tentative(origin, 29, tenant(), key, 7, timestamp)
+		.await
+		.unwrap();
+	let location = mgr.lookup(tenant(), key).unwrap().unwrap();
+	assert_eq!(force_seal_active(&mgr).await, location.slab_id);
+	mgr.counter_rollback_fail_once
+		.store(true, Ordering::Release);
+	assert!(service.rollback(origin, 29, tenant(), key).await.is_err());
+	assert_eq!(
+		service
+			.commit(origin, 29, tenant(), key)
+			.await
+			.unwrap_err()
+			.kind(),
+		ErrorKind::WouldBlock
+	);
+	assert!(
+		mgr.list_sealed_slabs()
+			.await
+			.iter()
+			.all(|slab| slab.slab_id != location.slab_id)
+	);
+	service.rollback(origin, 29, tenant(), key).await.unwrap();
+	assert!(
+		mgr.list_sealed_slabs()
+			.await
+			.iter()
+			.any(|slab| slab.slab_id == location.slab_id)
+	);
+	assert!(service.commit(origin, 29, tenant(), key).await.is_err());
+}
+
+#[tokio::test]
+async fn counter_guard_slab_count_deduplicates_copies_and_tracks_release() {
+	let (_dir, mgr) = fresh_manager().await;
+	let origin = NodeId {
+		id: 1,
+		_reserved: 0,
+	};
+	let first = mgr
+		.counter_append_tentative(tenant(), id(0x9b21), hlc(181), 3, origin)
+		.await
+		.unwrap();
+	let second = mgr
+		.counter_append_tentative(tenant(), id(0x9b22), hlc(182), 4, origin)
+		.await
+		.unwrap();
+	assert_eq!(first.slab_id, second.slab_id);
+	let count = || {
+		let guards = mgr.counter_pending_guards.state.lock().unwrap();
+		guards.per_slab.len() as u64
+	};
+	assert_eq!(count(), 1);
+	assert_eq!(force_seal_active(&mgr).await, first.slab_id);
+	let third = mgr
+		.counter_append_tentative(tenant(), id(0x9b23), hlc(183), 5, origin)
+		.await
+		.unwrap();
+	assert_ne!(first.slab_id, third.slab_id);
+	assert_eq!(count(), 2);
+	mgr.counter_unindex_tentative(tenant(), id(0x9b21), first)
+		.await
+		.unwrap();
+	assert_eq!(count(), 2);
+	mgr.counter_unindex_tentative(tenant(), id(0x9b22), second)
+		.await
+		.unwrap();
+	assert_eq!(count(), 1);
+	mgr.counter_unindex_tentative(tenant(), id(0x9b23), third)
+		.await
+		.unwrap();
+	assert_eq!(count(), 0);
+}
+
+#[tokio::test]
+async fn own_unresolved_index_publication_refuses_private_retirement() {
+	let (_dirs, mgr, l2) = fresh_manager_with_l2("retire-own-index-dirty").await;
+	let key = id(0x9b31);
+	mgr.append_durable(tenant(), key, hlc(191), b"value")
+		.await
+		.unwrap();
+	let pointer = tier_kv_slab(&mgr, &l2, "retire-own-index-dirty/object").await;
+	mgr.pending_index_publications
+		.insert((pointer.slab_id, u64::MAX), IndexPublicationState::InFlight);
+	let outcome = mgr.retire_tiered_slab(pointer.slab_id).await;
+	mgr.pending_index_publications
+		.remove(&(pointer.slab_id, u64::MAX));
+	assert!(
+		outcome.is_err(),
+		"a slab's unresolved index update must fence its retirement"
+	);
+	assert_eq!(
+		mgr.read(mgr.lookup(tenant(), key).unwrap().unwrap())
+			.await
+			.unwrap(),
+		b"value"
+	);
+}
+
+#[tokio::test]
+async fn unresolved_lsm_intent_fences_open_and_preserves_staged_output() {
+	let dir = fresh_dir("lsm-unresolved-open");
+	let index = crate::storage::index::PersistentLocalIndex::initialize_new(
+		persistent_index_path(&dir),
+		None,
+	)
+	.await
+	.unwrap();
+	let commit = CompactionCommit::gc_remove(
+		CompactionJobId::new(718),
+		ManifestEpoch::new(1),
+		vec![SlabId::new(2)],
+	);
+	let intent = crate::storage::index::LsmInstallIntent {
+		kind: crate::storage::index::LsmInstallKind::Control,
+		phase: crate::storage::index::LsmInstallPhase::Prepared,
+		local_input_rows_digest: [0; 32],
+		local_output_rows_digest: [0; 32],
+		local_input_runs: Vec::new(),
+		local_input_files: Vec::new(),
+		local_output_files: Vec::new(),
+		commit_digest: *blake3::hash(&serde_json::to_vec(&commit).unwrap()).as_bytes(),
+		commit,
+		inputs: vec![crate::storage::index::LsmInputAuthority {
+			slab_id: SlabId::new(2),
+			revision: 3,
+			tiered: None,
+		}],
+	};
+	index.put_lsm_install_intent(intent).await.unwrap();
+	drop(index);
+	let staged = dir.join("compaction-temp-0000000000000001-slab_0000000000000001.wnd");
+	let bytes = b"unresolved-lsm-output";
+	std::fs::write(&staged, bytes).unwrap();
+	let mgr = open_manager_at_dir(
+		dir.to_path_buf(),
+		spawn_io_thread(64).unwrap(),
+		test_crypto(),
+	)
+	.await;
+	assert_eq!(std::fs::read(&staged).unwrap(), bytes);
+	assert_eq!(
+		mgr.tier_authority_readiness_reason().as_deref(),
+		Some("TierAuthorityLsmUnresolved")
+	);
+	let error = mgr
+		.append_durable(tenant(), id(0x9b41), hlc(201), b"refused")
+		.await
+		.unwrap_err();
+	assert_eq!(error.kind(), ErrorKind::WouldBlock);
+}
+
+#[tokio::test]
+async fn lsm_prepare_refuses_pointer_aba_during_source_read() {
+	let (_dirs, mgr, l2) = fresh_manager_with_l2("lsm-input-aba").await;
+	let key = id(0x9b51);
+	mgr.append_durable(tenant(), key, hlc(211), b"value")
+		.await
+		.unwrap();
+	let pointer = tier_kv_slab(&mgr, &l2, "lsm-input-aba/object").await;
+	let plan = CompactionPlan {
+		job_id: CompactionJobId::new(719),
+		source_level: CompactionLevelIndex::L0,
+		target_level: CompactionLevelIndex::L1,
+		manifest_epoch_pre: mgr.compaction_manifest_snapshot().manifest_epoch,
+		input_slabs: vec![pointer.slab_id],
+		overlapping_slabs: Vec::new(),
+		retention_floor_snapshot: hlc(212),
+		compaction_start_hlc: hlc(213),
+		dominant_reason: crate::storage::DominantReason::Operator,
+	};
+	let worker = LsmCompactionWorker::new(LsmConfig::default(), mgr.slab_pin_table()).unwrap();
+	let entered = Arc::new(tokio::sync::Semaphore::new(0));
+	let release = Arc::new(tokio::sync::Semaphore::new(0));
+	*mgr.lsm_capture_hold.lock().unwrap() = Some((entered.clone(), release.clone()));
+	let task = {
+		let mgr = mgr.clone();
+		tokio::spawn(async move { mgr.prepare_lsm_compaction_outputs(&worker, &plan).await })
+	};
+	tokio::time::timeout(Duration::from_secs(60), entered.acquire())
+		.await
+		.unwrap()
+		.unwrap()
+		.forget();
+	mgr.update_tier_pointer_metadata(pointer.slab_id, None, None, |p| {
+		p.l2_uri.push_str("-temporary")
+	})
+	.await
+	.unwrap();
+	let original_uri = pointer.l2_uri.clone();
+	mgr.update_tier_pointer_metadata(pointer.slab_id, None, None, |p| p.l2_uri = original_uri)
+		.await
+		.unwrap();
+	release.add_permits(1);
+	assert!(
+		matches!(task.await.unwrap(), Err(CompactionFailure::ManifestRace)),
+		"revision must detect pointer ABA"
+	);
+}
+
+#[tokio::test]
+async fn lsm_intent_fences_public_reads_but_not_private_retirement() {
+	let (_dirs, mgr, l2) = fresh_manager_with_l2("private-retire-lsm-intent").await;
+	let key = id(0x9b61);
+	mgr.append_durable(tenant(), key, hlc(221), b"value")
+		.await
+		.unwrap();
+	let pointer = tier_kv_slab(&mgr, &l2, "private-retire-lsm-intent/object").await;
+	let job = CompactionJobId::new(720);
+	mgr.lsm_install_unresolved.insert(
+		job,
+		lsm_driver::UnresolvedLsmScope {
+			control_legacy: None,
+			control_metric: None,
+			slabs: HashSet::new(),
+			keys_unknown: true,
+			in_flight: false,
+			owner_token: Arc::new(()),
+		},
+	);
+	assert!(mgr.lookup(tenant(), key).is_err());
+	let retired = mgr.retire_tiered_slab(pointer.slab_id).await;
+	assert!(
+		retired.unwrap(),
+		"the committed retirement must not be swallowed"
+	);
+	assert!(mgr.lookup(tenant(), key).is_err());
+	mgr.lsm_install_unresolved.remove(&job);
+	assert!(mgr.lookup(tenant(), key).unwrap().is_none());
+}
+
+/// A crash after output rename but before proposing the commit must keep the
+/// durable intent and the discoverable output, and must fence reopen.
+#[tokio::test]
+async fn lsm_crash_after_output_rename_before_proposal_keeps_intent_and_output() {
+	let (dir, mgr) = fresh_manager().await;
+	seed_lsm_relocation_fixture(&mgr).await;
+	let worker = LsmCompactionWorker::new(LsmConfig::default(), mgr.slab_pin_table()).unwrap();
+	let plan = mgr
+		.pick_lsm_compaction_plan(&worker, hlc(20_000))
+		.expect("fixture LSM plan");
+	let entered = Arc::new(tokio::sync::Semaphore::new(0));
+	let release = Arc::new(tokio::sync::Semaphore::new(0));
+	*mgr.lsm_after_rename_hold.lock().unwrap() = Some((entered.clone(), release));
+	let task = {
+		let manager = mgr.clone();
+		tokio::spawn(async move {
+			let committer = DirectLsmCommitter {
+				manager: manager.clone(),
+			};
+			manager
+				.run_lsm_compaction_once_via_control_ring(&worker, plan, &committer)
+				.await
+		})
+	};
+	tokio::time::timeout(Duration::from_secs(60), entered.acquire())
+		.await
+		.unwrap()
+		.unwrap()
+		.forget();
+	let snapshot = mgr
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot()
+		.await
+		.unwrap();
+	assert_eq!(snapshot.lsm_install_intents.len(), 1);
+	let outputs: Vec<_> = snapshot.lsm_install_intents[0]
+		.commit
+		.slabs_to_add
+		.iter()
+		.map(|run| slab_path(&dir, run.slab_id))
+		.collect();
+	assert!(!outputs.is_empty());
+	assert!(outputs.iter().all(|path| path.exists()));
+	task.abort();
+	assert!(task.await.unwrap_err().is_cancelled());
+	drop(mgr);
+	let reopened = open_manager_at_dir(
+		dir.to_path_buf(),
+		spawn_io_thread(64).unwrap(),
+		test_crypto(),
+	)
+	.await;
+	assert_eq!(
+		reopened.tier_authority_readiness_reason().as_deref(),
+		Some("TierAuthorityLsmUnresolved")
+	);
+	assert!(outputs.iter().all(|path| path.exists()));
+}
+
+struct DefiniteRejectLsmCommitter;
+#[async_trait]
+impl TierCommitter for DefiniteRejectLsmCommitter {
+	async fn commit_tier_slab(&self, _: crate::consensus::TieredSlab) -> std::io::Result<()> {
+		Err(Error::new(ErrorKind::Unsupported, "unused"))
+	}
+	async fn retire_tiered_slab(&self, _: SlabId) -> std::io::Result<()> {
+		Err(Error::new(ErrorKind::Unsupported, "unused"))
+	}
+	async fn commit_lsm_compaction(&self, _: CompactionCommit) -> std::io::Result<()> {
+		Err(Error::new(
+			ErrorKind::InvalidData,
+			crate::storage::sweeper::LsmCommitRejected("test rejection".into()),
+		))
+	}
+}
+struct AmbiguousLsmCommitter;
+#[async_trait]
+impl TierCommitter for AmbiguousLsmCommitter {
+	async fn commit_tier_slab(&self, _: crate::consensus::TieredSlab) -> std::io::Result<()> {
+		Err(Error::new(ErrorKind::Unsupported, "unused"))
+	}
+	async fn retire_tiered_slab(&self, _: SlabId) -> std::io::Result<()> {
+		Err(Error::new(ErrorKind::Unsupported, "unused"))
+	}
+	async fn commit_lsm_compaction(&self, _: CompactionCommit) -> std::io::Result<()> {
+		Err(Error::other("ambiguous transport failure"))
+	}
+}
+
+#[tokio::test]
+async fn lsm_definite_refusal_clears_intent_after_removing_outputs() {
+	let (_dir, mgr) = fresh_manager().await;
+	let keys = seed_lsm_relocation_fixture(&mgr).await;
+	let worker = LsmCompactionWorker::new(LsmConfig::default(), mgr.slab_pin_table()).unwrap();
+	let plan = mgr
+		.pick_lsm_compaction_plan(&worker, hlc(20_000))
+		.expect("fixture LSM plan");
+	assert!(
+		mgr.run_lsm_compaction_once_via_control_ring(&worker, plan, &DefiniteRejectLsmCommitter)
+			.await
+			.is_err()
+	);
+	let snapshot = mgr
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot()
+		.await
+		.unwrap();
+	assert!(snapshot.lsm_install_intents.is_empty());
+	assert!(mgr.tier_authority_readiness_reason().is_none());
+	for key in keys {
+		assert!(mgr.lookup(tenant(), key).unwrap().is_some());
+	}
+}
+
+#[tokio::test]
+async fn lsm_ambiguous_submission_keeps_intent_and_fences_reopen() {
+	let (dir, mgr) = fresh_manager().await;
+	seed_lsm_relocation_fixture(&mgr).await;
+	let worker = LsmCompactionWorker::new(LsmConfig::default(), mgr.slab_pin_table()).unwrap();
+	let plan = mgr
+		.pick_lsm_compaction_plan(&worker, hlc(20_000))
+		.expect("fixture LSM plan");
+	assert!(
+		mgr.run_lsm_compaction_once_via_control_ring(&worker, plan, &AmbiguousLsmCommitter)
+			.await
+			.is_err()
+	);
+	assert!(mgr.has_orphaned_lsm_intents());
+	assert_eq!(
+		mgr.lookup(tenant(), id(0xC000)).unwrap_err().kind(),
+		ErrorKind::WouldBlock
+	);
+	let snapshot = mgr
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot()
+		.await
+		.unwrap();
+	assert_eq!(snapshot.lsm_install_intents.len(), 1);
+	let outputs: Vec<_> = snapshot.lsm_install_intents[0]
+		.commit
+		.slabs_to_add
+		.iter()
+		.map(|run| slab_path(&dir, run.slab_id))
+		.collect();
+	assert!(!outputs.is_empty() && outputs.iter().all(|path| path.exists()));
+	drop(mgr);
+	let reopened = open_manager_at_dir(
+		dir.to_path_buf(),
+		spawn_io_thread(64).unwrap(),
+		test_crypto(),
+	)
+	.await;
+	assert_eq!(
+		reopened.tier_authority_readiness_reason().as_deref(),
+		Some("TierAuthorityLsmUnresolved")
+	);
+	assert!(outputs.iter().all(|path| path.exists()));
+}
+
+#[tokio::test]
+async fn clean_control_lsm_install_clears_its_intent() {
+	let (_dir, mgr) = fresh_manager().await;
+	let keys = seed_lsm_relocation_fixture(&mgr).await;
+	let worker = LsmCompactionWorker::new(LsmConfig::default(), mgr.slab_pin_table()).unwrap();
+	let plan = mgr
+		.pick_lsm_compaction_plan(&worker, hlc(20_000))
+		.expect("fixture LSM plan");
+	let committer = DirectLsmCommitter {
+		manager: mgr.clone(),
+	};
+	let job_id = plan.job_id;
+	let mut before = Vec::new();
+	for key in &keys {
+		let location = mgr.lookup(tenant(), *key).unwrap().unwrap();
+		before.push((location, mgr.read(location).await.unwrap()));
+	}
+	mgr.run_lsm_compaction_once_via_control_ring(&worker, plan, &committer)
+		.await
+		.unwrap();
+	assert!(
+		mgr.persistent_index
+			.as_ref()
+			.unwrap()
+			.load_snapshot()
+			.await
+			.unwrap()
+			.lsm_install_intents
+			.is_empty(),
+		"the accepted install clears its durable intent"
+	);
+	assert!(
+		!mgr.lsm_install_unresolved.contains_key(&job_id) && mgr.lsm_install_unresolved.is_empty(),
+		"the accepted install clears its process-local registration"
+	);
+	assert!(mgr.tier_authority_readiness_reason().is_none());
+	let mut relocated = 0;
+	for (key, (old, bytes)) in keys.iter().zip(before) {
+		let location = mgr.lookup(tenant(), *key).unwrap().unwrap();
+		relocated += usize::from(location != old);
+		assert_eq!(mgr.read(location).await.unwrap(), bytes, "{key:?}");
+	}
+	assert!(relocated > 0, "the install relocated rows it then serves");
+}
+
+#[tokio::test]
+async fn lsm_retired_input_during_control_wait_keeps_intent_and_never_resurrects() {
+	let (dirs, mgr, l2) = fresh_manager_with_l2("lsm-retire-during-commit").await;
+	let key = id(0x9b71);
+	mgr.append_durable(tenant(), key, hlc(231), &[0, 0, 0, 0, 65])
+		.await
+		.unwrap();
+	let pointer = tier_kv_slab(&mgr, &l2, "lsm-retire-during-commit/object").await;
+	// The direct test seal bypasses normal L0 registration; restore it before planning.
+	mgr.ensure_live_lsm_run_for_maintenance(pointer.slab_id, 4096);
+	assert!(
+		mgr.compaction_manifest_snapshot()
+			.run(pointer.slab_id)
+			.is_some(),
+		"fixture must contain a live LSM run before the race"
+	);
+	let plan = CompactionPlan {
+		job_id: CompactionJobId::new(721),
+		source_level: CompactionLevelIndex::L0,
+		target_level: CompactionLevelIndex::L1,
+		manifest_epoch_pre: mgr.compaction_manifest_snapshot().manifest_epoch,
+		input_slabs: vec![pointer.slab_id],
+		overlapping_slabs: Vec::new(),
+		retention_floor_snapshot: hlc(232),
+		compaction_start_hlc: hlc(233),
+		dominant_reason: crate::storage::DominantReason::Operator,
+	};
+	let worker = LsmCompactionWorker::new(LsmConfig::default(), mgr.slab_pin_table()).unwrap();
+	let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+	let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+	let committer = Arc::new(PausingLsmCommitter {
+		manager: mgr.clone(),
+		reached_publication: tokio::sync::Mutex::new(Some(reached_tx)),
+		release_publication: tokio::sync::Mutex::new(Some(release_rx)),
+	});
+	let mut task = {
+		let mgr = mgr.clone();
+		let committer = committer.clone();
+		tokio::spawn(async move {
+			mgr.run_lsm_compaction_once_via_control_ring(&worker, plan, committer.as_ref())
+				.await
+		})
+	};
+	tokio::select! {
+		result = &mut task => panic!("LSM install exited before the control commit pause: {result:?}"),
+		reached = tokio::time::timeout(Duration::from_secs(60), reached_rx) => reached.unwrap().unwrap(),
+	}
+	let snapshot = mgr
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot()
+		.await
+		.unwrap();
+	assert_eq!(snapshot.lsm_install_intents.len(), 1);
+	let outputs: Vec<_> = snapshot.lsm_install_intents[0]
+		.commit
+		.slabs_to_add
+		.iter()
+		.map(|run| slab_path(&dirs[0], run.slab_id))
+		.collect();
+	assert!(!outputs.is_empty() && outputs.iter().all(|path| path.exists()));
+	assert!(mgr.retire_tiered_slab(pointer.slab_id).await.unwrap());
+	release_tx.send(()).unwrap();
+	assert!(matches!(
+		task.await.unwrap(),
+		Err(CompactionFailure::ManifestRace)
+	));
+	assert!(mgr.lookup(tenant(), key).is_err());
+	let snapshot = mgr
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot()
+		.await
+		.unwrap();
+	assert_eq!(snapshot.lsm_install_intents.len(), 1);
+	assert!(
+		snapshot
+			.tiered_slabs
+			.iter()
+			.all(|p| p.slab_id != pointer.slab_id)
+	);
+	assert!(
+		snapshot
+			.record_rows
+			.iter()
+			.all(|row| row.location.slab_id != pointer.slab_id)
+	);
+	assert!(outputs.iter().all(|path| path.exists()));
+	drop(committer);
+	let reopened = try_restart_tier_manager(mgr, &dirs, &l2).await.unwrap();
+	assert_eq!(
+		reopened.tier_authority_readiness_reason().as_deref(),
+		Some("TierAuthorityLsmUnresolved")
+	);
+	assert!(reopened.lookup(tenant(), key).is_err());
+	assert!(outputs.iter().all(|path| path.exists()));
+}
+
+#[tokio::test]
+async fn in_flight_index_publication_keeps_reads_available() {
+	let (_dirs, mgr, l2) = fresh_manager_with_l2("index-inflight-readable").await;
+	let key = id(0x9b81);
+	let value = [0, 0, 0, 0, 65];
+	mgr.append_durable(tenant(), key, hlc(241), &value)
+		.await
+		.unwrap();
+	let pointer = tier_kv_slab(&mgr, &l2, "index-inflight-readable/object").await;
+	let entered = Arc::new(tokio::sync::Semaphore::new(0));
+	let release = Arc::new(tokio::sync::Semaphore::new(0));
+	*mgr.continuity_test_holds
+		.retirement_snapshot_hold
+		.lock()
+		.unwrap() = Some((entered.clone(), release.clone()));
+	let task = {
+		let mgr = mgr.clone();
+		tokio::spawn(async move { mgr.retire_tiered_slab(pointer.slab_id).await })
+	};
+	tokio::time::timeout(Duration::from_secs(60), entered.acquire())
+		.await
+		.unwrap()
+		.unwrap()
+		.forget();
+	let location = mgr
+		.lookup(tenant(), key)
+		.unwrap()
+		.expect("live publication is not a read fence");
+	assert_eq!(mgr.read(location).await.unwrap(), value);
+	assert!(mgr.tier_authority_readiness_reason().is_none());
+	release.add_permits(1);
+	assert!(task.await.unwrap().unwrap());
+	assert!(mgr.lookup(tenant(), key).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn missing_index_stays_fenced_after_restoration_until_manager_reopen() {
+	let dir = fresh_dir("missing-index-restart-required");
+	let io = spawn_io_thread(64).unwrap();
+	let crypto = test_crypto();
+	let original = initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	let key = id(0x9b91);
+	original
+		.append_durable(tenant(), key, hlc(251), b"preserved")
+		.await
+		.unwrap();
+	original.fsync_all_local_slabs().await.unwrap();
+	drop(original);
+	let index_path = persistent_index_path(&dir);
+	let index_bytes = std::fs::read(&index_path).unwrap();
+	std::fs::remove_file(&index_path).unwrap();
+	let fenced = open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	assert!(
+		!index_path.exists(),
+		"opening an existing store must not create a replacement index"
+	);
+	assert_eq!(
+		fenced.tier_authority_readiness_reason().as_deref(),
+		Some("TierAuthorityIndexUnavailable(RestartRequired)")
+	);
+	assert!(fenced.lookup(tenant(), key).is_err());
+	std::fs::write(&index_path, index_bytes).unwrap();
+	assert_eq!(
+		fenced.tier_authority_readiness_reason().as_deref(),
+		Some("TierAuthorityIndexUnavailable(RestartRequired)")
+	);
+	assert!(fenced.lookup(tenant(), key).is_err());
+	drop(fenced);
+	let reopened = open_manager_at_dir(dir.to_path_buf(), io, crypto).await;
+	assert!(reopened.tier_authority_readiness_reason().is_none());
+	assert_eq!(
+		reopened
+			.read(reopened.lookup(tenant(), key).unwrap().unwrap())
+			.await
+			.unwrap(),
+		b"preserved"
+	);
+}
+
+#[tokio::test]
+async fn cancelled_durable_append_after_index_commit_fences_rebuild_and_reads() {
+	let (_dir, mgr) = fresh_manager_with_group_commit(GroupCommitConfig::default()).await;
+	let key = id(0x9ac2);
+	let entered = Arc::new(std::sync::Barrier::new(2));
+	let release = Arc::new(std::sync::Barrier::new(2));
+	*mgr.persistent_index
+		.as_ref()
+		.unwrap()
+		.guarded_delta_commit_hold
+		.lock()
+		.unwrap() = Some((entered.clone(), release.clone()));
+	let append = {
+		let mgr = mgr.clone();
+		tokio::spawn(async move { mgr.append_durable(tenant(), key, hlc(122), b"value").await })
+	};
+	tokio::time::timeout(
+		Duration::from_secs(60),
+		tokio::task::spawn_blocking(move || entered.wait()),
+	)
+	.await
+	.unwrap()
+	.unwrap();
+	append.abort();
+	assert!(append.await.unwrap_err().is_cancelled());
+	let answer = mgr.lookup(tenant(), key);
+	let mut rebuild = {
+		let mgr = mgr.clone();
+		tokio::spawn(async move { mgr.rebuild_persistent_index().await })
+	};
+	let early = tokio::time::timeout(Duration::from_millis(200), &mut rebuild).await;
+	tokio::task::spawn_blocking(move || release.wait())
+		.await
+		.unwrap();
+	let result = match early {
+		Ok(joined) => joined.unwrap(),
+		Err(_) => rebuild.await.unwrap(),
+	};
+	assert!(
+		result.is_err(),
+		"rebuild must refuse an orphaned append publication"
+	);
+	assert!(
+		answer.is_err(),
+		"orphaned append publication must fence reads"
+	);
+	let snapshot = mgr
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot()
+		.await
+		.unwrap();
+	assert!(
+		snapshot
+			.record_rows
+			.iter()
+			.any(|row| row.key_identity == key),
+		"the committed append row must survive the refused rebuild"
+	);
+}
+
+#[tokio::test]
+async fn cancelled_tier_metadata_after_index_commit_fences_rebuild_and_reads() {
+	let (dirs, mgr, l2) = fresh_manager_with_l2("cancelled-tier-metadata").await;
+	let key = id(0x9ac3);
+	mgr.append_durable(tenant(), key, hlc(123), b"value")
+		.await
+		.unwrap();
+	let mut expected = tier_kv_slab(&mgr, &l2, "cancelled-tier-metadata/object").await;
+	let slab_id = expected.slab_id;
+	expected.record_supersession_hlc(hlc(200));
+	let entered = Arc::new(std::sync::Barrier::new(2));
+	let release = Arc::new(std::sync::Barrier::new(2));
+	*mgr.persistent_index
+		.as_ref()
+		.unwrap()
+		.guarded_delta_commit_hold
+		.lock()
+		.unwrap() = Some((entered.clone(), release.clone()));
+	let update = {
+		let mgr = mgr.clone();
+		tokio::spawn(async move {
+			mgr.record_supersession_for_slab(slab_id, hlc(200), None)
+				.await
+		})
+	};
+	tokio::time::timeout(
+		Duration::from_secs(60),
+		tokio::task::spawn_blocking(move || entered.wait()),
+	)
+	.await
+	.unwrap()
+	.unwrap();
+	update.abort();
+	assert!(update.await.unwrap_err().is_cancelled());
+	let answer = mgr.lookup(tenant(), key);
+	let mut rebuild = {
+		let mgr = mgr.clone();
+		tokio::spawn(async move { mgr.rebuild_persistent_index().await })
+	};
+	let early = tokio::time::timeout(Duration::from_millis(200), &mut rebuild).await;
+	tokio::task::spawn_blocking(move || release.wait())
+		.await
+		.unwrap();
+	let result = match early {
+		Ok(joined) => joined.unwrap(),
+		Err(_) => rebuild.await.unwrap(),
+	};
+	assert!(
+		result.is_err(),
+		"rebuild must refuse orphaned metadata publication"
+	);
+	assert!(
+		answer.is_err(),
+		"orphaned metadata publication must fence reads"
+	);
+	let snapshot = mgr
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot()
+		.await
+		.unwrap();
+	assert!(
+		snapshot.tiered_slabs.contains(&expected),
+		"committed metadata must survive the refused rebuild"
+	);
+	let io = mgr.config.io.clone();
+	let crypto = mgr.config.crypto.clone();
+	drop(mgr);
+	let reopened = SlabManager::open(SlabManagerConfig {
+		dir: dirs[0].to_path_buf(),
+		max_slab_bytes: 1 << 20,
+		io,
+		l2: Some(l2),
+		rehydration: RehydrationPolicy::default(),
+		l2_column_fetch: Default::default(),
+		row_group_writer: Default::default(),
+		l2_row_group_fetch: Default::default(),
+		encoding_writer: Default::default(),
+		l2_chunk_layout: Default::default(),
+		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
+		group_commit: GroupCommitConfig::default(),
+		crypto,
+	})
+	.await
+	.unwrap();
+	reopened.wait_tier_authority_ready().await.unwrap();
+	let recovered = reopened
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot()
+		.await
+		.unwrap();
+	assert!(recovered.tiered_slabs.contains(&expected));
+	let location = reopened.lookup(tenant(), key).unwrap().unwrap();
+	assert_eq!(reopened.read(location).await.unwrap(), b"value");
+}
+
+#[tokio::test]
+async fn local_lsm_cancel_after_rename_quarantines_outputs_and_recovers_inputs() {
+	let dir = fresh_dir("dc121-local-intent-recovery");
+	let crypto = test_crypto();
+	let io = spawn_io_thread(64).unwrap();
+	let manager = initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	let keys = [id(0xd121), id(0xd122)];
+	manager
+		.append_durable(tenant(), keys[0], hlc(1), b"one")
+		.await
+		.unwrap();
+	let first = manager.force_seal_active_for_test().await;
+	manager
+		.append_durable(tenant(), keys[1], hlc(2), b"two")
+		.await
+		.unwrap();
+	let second = manager.force_seal_active_for_test().await;
+	let snapshot = manager.compaction_manifest_snapshot();
+	let plan = CompactionPlan {
+		job_id: CompactionJobId::new(0xd121),
+		source_level: CompactionLevelIndex::L0,
+		target_level: CompactionLevelIndex::L1,
+		manifest_epoch_pre: snapshot.manifest_epoch,
+		input_slabs: vec![first, second],
+		overlapping_slabs: Vec::new(),
+		retention_floor_snapshot: hlc(100),
+		compaction_start_hlc: hlc(101),
+		dominant_reason: crate::storage::DominantReason::Operator,
+	};
+	let worker = LsmCompactionWorker::new(
+		crate::storage::LsmConfig::default(),
+		manager.slab_pin_table(),
+	)
+	.unwrap();
+	let prepared = manager
+		.prepare_lsm_compaction_outputs(&worker, &plan)
+		.await
+		.unwrap();
+	let frames = manager
+		.read_lsm_single_row_source_frames(&plan)
+		.await
+		.unwrap();
+	let written = manager
+		.write_lsm_compaction_temp_outputs(&plan, &prepared, &frames)
+		.await
+		.unwrap();
+	assert!(!written.is_empty());
+	let outputs = written.iter().map(|run| run.slab_id).collect::<Vec<_>>();
+	let digest = manager
+		.lsm_single_row_bridge_digest_summary(&plan, &prepared, &written, &frames)
+		.await
+		.unwrap();
+	let commit = worker.build_written_compaction_commit(&plan, &written, digest);
+	let entered = Arc::new(tokio::sync::Semaphore::new(0));
+	let release = Arc::new(tokio::sync::Semaphore::new(0));
+	*manager.lsm_after_rename_hold.lock().unwrap() = Some((entered.clone(), release));
+	let mut install = {
+		let manager = manager.clone();
+		tokio::spawn(async move {
+			manager
+				.install_lsm_compaction_temp_outputs(&plan, &prepared, &written, &commit)
+				.await
+		})
+	};
+	tokio::select! {
+		result = &mut install => panic!("LSM install exited before pause: {result:?}"),
+		permit = tokio::time::timeout(Duration::from_secs(60), entered.acquire()) => permit.unwrap().unwrap().forget(),
+	}
+	for output in &outputs {
+		assert!(slab_path(&dir, *output).exists());
+	}
+	let expected_bytes = outputs
+		.iter()
+		.map(|id| (*id, std::fs::read(slab_path(&dir, *id)).unwrap()))
+		.collect::<Vec<_>>();
+	install.abort();
+	assert!(install.await.unwrap_err().is_cancelled());
+	drop(manager);
+	let reopened = open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	let versions = reopened
+		.scan_all_versions(Locality::ZERO, Locality::MAX, hlc(0))
+		.unwrap();
+	for key in keys {
+		assert_eq!(
+			versions
+				.iter()
+				.filter(|(_, identity, _, _)| *identity == key)
+				.count(),
+			1
+		);
+	}
+	let discovered = discover_slab_ids(reopened.file_ops.as_ref(), &dir)
+		.await
+		.unwrap();
+	for (output, bytes) in &expected_bytes {
+		assert!(!slab_path(&dir, *output).exists());
+		let name = format!(
+			"lsm-quarantine-{:016x}-slab_{:016x}.wnd",
+			CompactionJobId::new(0xd121),
+			output
+		);
+		assert!(parse_slab_filename(&name).is_none());
+		assert!(!lsm_driver::is_lsm_compaction_tmp_filename(&name));
+		assert!(!discovered.contains(output));
+		assert_eq!(std::fs::read(dir.join(name)).unwrap(), *bytes);
+	}
+
+	assert!(
+		reopened
+			.persistent_index
+			.as_ref()
+			.unwrap()
+			.load_snapshot()
+			.await
+			.unwrap()
+			.lsm_install_intents
+			.is_empty()
+	);
+	drop(reopened);
+	let reopened_again = open_manager_at_dir(dir.to_path_buf(), io, crypto).await;
+	for (output, bytes) in &expected_bytes {
+		let name = format!(
+			"lsm-quarantine-{:016x}-slab_{:016x}.wnd",
+			CompactionJobId::new(0xd121),
+			output
+		);
+		assert_eq!(
+			std::fs::read(dir.join(name)).unwrap(),
+			*bytes,
+			"reopen cleanup must preserve quarantined bytes"
+		);
+	}
+	let versions = reopened_again
+		.scan_all_versions(Locality::ZERO, Locality::MAX, hlc(0))
+		.unwrap();
+	for key in keys {
+		assert_eq!(
+			versions
+				.iter()
+				.filter(|(_, identity, _, _)| *identity == key)
+				.count(),
+			1
+		);
+	}
+}
+
+#[tokio::test]
+async fn local_lsm_cancel_after_publication_recovers_committed_outputs() {
+	let dir = fresh_dir("dc121-local-published-recovery");
+	let crypto = test_crypto();
+	let io = spawn_io_thread(64).unwrap();
+	let manager = initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	let keys = [id(0xd121), id(0xd122)];
+	manager
+		.append_durable(tenant(), keys[0], hlc(1), b"one")
+		.await
+		.unwrap();
+	let first = manager.force_seal_active_for_test().await;
+	manager
+		.append_durable(tenant(), keys[1], hlc(2), b"two")
+		.await
+		.unwrap();
+	let second = manager.force_seal_active_for_test().await;
+	let snapshot = manager.compaction_manifest_snapshot();
+	let plan = CompactionPlan {
+		job_id: CompactionJobId::new(0xd121),
+		source_level: CompactionLevelIndex::L0,
+		target_level: CompactionLevelIndex::L1,
+		manifest_epoch_pre: snapshot.manifest_epoch,
+		input_slabs: vec![first, second],
+		overlapping_slabs: Vec::new(),
+		retention_floor_snapshot: hlc(100),
+		compaction_start_hlc: hlc(101),
+		dominant_reason: crate::storage::DominantReason::Operator,
+	};
+	let worker = LsmCompactionWorker::new(
+		crate::storage::LsmConfig::default(),
+		manager.slab_pin_table(),
+	)
+	.unwrap();
+	let prepared = manager
+		.prepare_lsm_compaction_outputs(&worker, &plan)
+		.await
+		.unwrap();
+	let frames = manager
+		.read_lsm_single_row_source_frames(&plan)
+		.await
+		.unwrap();
+	let written = manager
+		.write_lsm_compaction_temp_outputs(&plan, &prepared, &frames)
+		.await
+		.unwrap();
+	assert!(!written.is_empty());
+	let outputs = written.iter().map(|run| run.slab_id).collect::<Vec<_>>();
+	let digest = manager
+		.lsm_single_row_bridge_digest_summary(&plan, &prepared, &written, &frames)
+		.await
+		.unwrap();
+	let commit = worker.build_written_compaction_commit(&plan, &written, digest);
+	let entered = Arc::new(tokio::sync::Semaphore::new(0));
+	let release = Arc::new(tokio::sync::Semaphore::new(0));
+	*manager.lsm_after_install_hold.lock().unwrap() = Some((entered.clone(), release));
+	let mut install = {
+		let manager = manager.clone();
+		tokio::spawn(async move {
+			manager
+				.install_lsm_compaction_temp_outputs(&plan, &prepared, &written, &commit)
+				.await
+		})
+	};
+	tokio::select! {
+		result = &mut install => panic!("LSM install exited before pause: {result:?}"),
+		permit = tokio::time::timeout(Duration::from_secs(60), entered.acquire()) => permit.unwrap().unwrap().forget(),
+	}
+	for output in &outputs {
+		assert!(slab_path(&dir, *output).exists());
+	}
+	install.abort();
+	assert!(install.await.unwrap_err().is_cancelled());
+	drop(manager);
+	let reopened = open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	let versions = reopened
+		.scan_all_versions(Locality::ZERO, Locality::MAX, hlc(0))
+		.unwrap();
+	for key in keys {
+		assert_eq!(
+			versions
+				.iter()
+				.filter(|(_, identity, _, _)| *identity == key)
+				.count(),
+			1
+		);
+	}
+	for output in &outputs {
+		assert!(slab_path(&dir, *output).exists());
+		assert!(
+			!dir.join(format!(
+				"lsm-quarantine-{:016x}-slab_{:016x}.wnd",
+				CompactionJobId::new(0xd121),
+				output
+			))
+			.exists()
+		);
+	}
+	assert!(
+		reopened
+			.persistent_index
+			.as_ref()
+			.unwrap()
+			.load_snapshot()
+			.await
+			.unwrap()
+			.lsm_install_intents
+			.is_empty()
+	);
+	drop(reopened);
+	let reopened_again = open_manager_at_dir(dir.to_path_buf(), io, crypto).await;
+	let versions = reopened_again
+		.scan_all_versions(Locality::ZERO, Locality::MAX, hlc(0))
+		.unwrap();
+	for key in keys {
+		assert_eq!(
+			versions
+				.iter()
+				.filter(|(_, identity, _, _)| *identity == key)
+				.count(),
+			1
+		);
+	}
+}
+
+#[tokio::test]
+async fn local_lsm_cancel_after_output_publication_finishes_input_retirement() {
+	let dir = fresh_dir("dc121-local-intermediate-recovery");
+	let crypto = test_crypto();
+	let io = spawn_io_thread(64).unwrap();
+	let manager = initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	let keys = [id(0xd121), id(0xd122)];
+	manager
+		.append_durable(tenant(), keys[0], hlc(1), b"one")
+		.await
+		.unwrap();
+	let first = manager.force_seal_active_for_test().await;
+	manager
+		.append_durable(tenant(), keys[1], hlc(2), b"two")
+		.await
+		.unwrap();
+	let second = manager.force_seal_active_for_test().await;
+	let snapshot = manager.compaction_manifest_snapshot();
+	let plan = CompactionPlan {
+		job_id: CompactionJobId::new(0xd121),
+		source_level: CompactionLevelIndex::L0,
+		target_level: CompactionLevelIndex::L1,
+		manifest_epoch_pre: snapshot.manifest_epoch,
+		input_slabs: vec![first, second],
+		overlapping_slabs: Vec::new(),
+		retention_floor_snapshot: hlc(100),
+		compaction_start_hlc: hlc(101),
+		dominant_reason: crate::storage::DominantReason::Operator,
+	};
+	let worker = LsmCompactionWorker::new(
+		crate::storage::LsmConfig::default(),
+		manager.slab_pin_table(),
+	)
+	.unwrap();
+	let prepared = manager
+		.prepare_lsm_compaction_outputs(&worker, &plan)
+		.await
+		.unwrap();
+	let frames = manager
+		.read_lsm_single_row_source_frames(&plan)
+		.await
+		.unwrap();
+	let written = manager
+		.write_lsm_compaction_temp_outputs(&plan, &prepared, &frames)
+		.await
+		.unwrap();
+	assert!(!written.is_empty());
+	let outputs = written.iter().map(|run| run.slab_id).collect::<Vec<_>>();
+	let digest = manager
+		.lsm_single_row_bridge_digest_summary(&plan, &prepared, &written, &frames)
+		.await
+		.unwrap();
+	let commit = worker.build_written_compaction_commit(&plan, &written, digest);
+	let entered = Arc::new(tokio::sync::Semaphore::new(0));
+	let release = Arc::new(tokio::sync::Semaphore::new(0));
+	*manager.lsm_after_output_publish_hold.lock().unwrap() = Some((entered.clone(), release));
+	let mut install = {
+		let manager = manager.clone();
+		tokio::spawn(async move {
+			manager
+				.install_lsm_compaction_temp_outputs(&plan, &prepared, &written, &commit)
+				.await
+		})
+	};
+	tokio::select! {
+		result = &mut install => panic!("LSM install exited before pause: {result:?}"),
+		permit = tokio::time::timeout(Duration::from_secs(60), entered.acquire()) => permit.unwrap().unwrap().forget(),
+	}
+	for output in &outputs {
+		assert!(slab_path(&dir, *output).exists());
+	}
+	install.abort();
+	assert!(install.await.unwrap_err().is_cancelled());
+	drop(manager);
+	let reopened = open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	let versions = reopened
+		.scan_all_versions(Locality::ZERO, Locality::MAX, hlc(0))
+		.unwrap();
+	for key in keys {
+		assert_eq!(
+			versions
+				.iter()
+				.filter(|(_, identity, _, _)| *identity == key)
+				.count(),
+			1
+		);
+	}
+	for output in &outputs {
+		assert!(slab_path(&dir, *output).exists());
+		assert!(
+			!dir.join(format!(
+				"lsm-quarantine-{:016x}-slab_{:016x}.wnd",
+				CompactionJobId::new(0xd121),
+				output
+			))
+			.exists()
+		);
+	}
+	assert!(
+		reopened
+			.persistent_index
+			.as_ref()
+			.unwrap()
+			.load_snapshot()
+			.await
+			.unwrap()
+			.lsm_install_intents
+			.is_empty()
+	);
+	drop(reopened);
+	let reopened_again = open_manager_at_dir(dir.to_path_buf(), io, crypto).await;
+	let versions = reopened_again
+		.scan_all_versions(Locality::ZERO, Locality::MAX, hlc(0))
+		.unwrap();
+	for key in keys {
+		assert_eq!(
+			versions
+				.iter()
+				.filter(|(_, identity, _, _)| *identity == key)
+				.count(),
+			1
+		);
+	}
+	for input in [first, second] {
+		assert!(
+			slab_path(&dir, input).exists(),
+			"recovery must preserve input files until owned GC"
+		);
+		assert!(
+			versions
+				.iter()
+				.all(|(_, _, _, location)| location.slab_id != input),
+			"retired input must not be re-indexed"
+		);
+	}
+	let gc = LsmGcWorker::new(
+		crate::storage::LsmConfig::default(),
+		reopened_again.slab_pin_table(),
+	)
+	.unwrap();
+	let deleted = reopened_again
+		.sweep_lsm_delete_pending_once(&gc)
+		.await
+		.unwrap();
+	for input in [first, second] {
+		assert!(
+			deleted.contains(&input),
+			"normal owned GC should retire the input"
+		);
+		assert!(!slab_path(&dir, input).exists());
+	}
+}
+
+#[tokio::test]
+async fn local_lsm_changed_input_keeps_intent_and_output_fenced() {
+	let dir = fresh_dir("dc121-local-mismatch");
+	let crypto = test_crypto();
+	let io = spawn_io_thread(64).unwrap();
+	let manager = initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	let keys = [id(0xd121), id(0xd122)];
+	manager
+		.append_durable(tenant(), keys[0], hlc(1), b"one")
+		.await
+		.unwrap();
+	let first = manager.force_seal_active_for_test().await;
+	manager
+		.append_durable(tenant(), keys[1], hlc(2), b"two")
+		.await
+		.unwrap();
+	let second = manager.force_seal_active_for_test().await;
+	let snapshot = manager.compaction_manifest_snapshot();
+	let plan = CompactionPlan {
+		job_id: CompactionJobId::new(0xd121),
+		source_level: CompactionLevelIndex::L0,
+		target_level: CompactionLevelIndex::L1,
+		manifest_epoch_pre: snapshot.manifest_epoch,
+		input_slabs: vec![first, second],
+		overlapping_slabs: Vec::new(),
+		retention_floor_snapshot: hlc(100),
+		compaction_start_hlc: hlc(101),
+		dominant_reason: crate::storage::DominantReason::Operator,
+	};
+	let worker = LsmCompactionWorker::new(
+		crate::storage::LsmConfig::default(),
+		manager.slab_pin_table(),
+	)
+	.unwrap();
+	let prepared = manager
+		.prepare_lsm_compaction_outputs(&worker, &plan)
+		.await
+		.unwrap();
+	let frames = manager
+		.read_lsm_single_row_source_frames(&plan)
+		.await
+		.unwrap();
+	let written = manager
+		.write_lsm_compaction_temp_outputs(&plan, &prepared, &frames)
+		.await
+		.unwrap();
+	assert!(!written.is_empty());
+	let outputs = written.iter().map(|run| run.slab_id).collect::<Vec<_>>();
+	let digest = manager
+		.lsm_single_row_bridge_digest_summary(&plan, &prepared, &written, &frames)
+		.await
+		.unwrap();
+	let commit = worker.build_written_compaction_commit(&plan, &written, digest);
+	let entered = Arc::new(tokio::sync::Semaphore::new(0));
+	let release = Arc::new(tokio::sync::Semaphore::new(0));
+	*manager.lsm_after_rename_hold.lock().unwrap() = Some((entered.clone(), release));
+	let mut install = {
+		let manager = manager.clone();
+		tokio::spawn(async move {
+			manager
+				.install_lsm_compaction_temp_outputs(&plan, &prepared, &written, &commit)
+				.await
+		})
+	};
+	tokio::select! {
+		result = &mut install => panic!("LSM install exited before pause: {result:?}"),
+		permit = tokio::time::timeout(Duration::from_secs(60), entered.acquire()) => permit.unwrap().unwrap().forget(),
+	}
+	for output in &outputs {
+		assert!(slab_path(&dir, *output).exists());
+	}
+	install.abort();
+	assert!(install.await.unwrap_err().is_cancelled());
+	drop(manager);
+	let input = slab_path(&dir, first);
+	let file = std::fs::OpenOptions::new()
+		.write(true)
+		.open(&input)
+		.unwrap();
+	file.set_len(file.metadata().unwrap().len() + 4096).unwrap();
+	file.sync_all().unwrap();
+	drop(file);
+	let reopened = open_manager_at_dir(dir.to_path_buf(), io, crypto).await;
+	assert!(
+		reopened.lookup(tenant(), keys[0]).is_err(),
+		"changed input must keep public reads fenced"
+	);
+	let snapshot = reopened
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot()
+		.await
+		.unwrap();
+	assert_eq!(snapshot.lsm_install_intents.len(), 1);
+	for output in outputs {
+		assert!(
+			slab_path(&dir, output).exists(),
+			"mismatched evidence must retain outputs"
+		);
+	}
+}
+
+#[tokio::test]
+async fn local_lsm_failed_before_rename_keeps_temp_for_recovery() {
+	let dir = fresh_dir("dc121-local-temp-failure");
+	let crypto = test_crypto();
+	let io = spawn_io_thread(64).unwrap();
+	let manager = initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	let keys = [id(0xd121), id(0xd122)];
+	manager
+		.append_durable(tenant(), keys[0], hlc(1), b"one")
+		.await
+		.unwrap();
+	let first = manager.force_seal_active_for_test().await;
+	manager
+		.append_durable(tenant(), keys[1], hlc(2), b"two")
+		.await
+		.unwrap();
+	let second = manager.force_seal_active_for_test().await;
+	let snapshot = manager.compaction_manifest_snapshot();
+	let plan = CompactionPlan {
+		job_id: CompactionJobId::new(0xd121),
+		source_level: CompactionLevelIndex::L0,
+		target_level: CompactionLevelIndex::L1,
+		manifest_epoch_pre: snapshot.manifest_epoch,
+		input_slabs: vec![first, second],
+		overlapping_slabs: Vec::new(),
+		retention_floor_snapshot: hlc(100),
+		compaction_start_hlc: hlc(101),
+		dominant_reason: crate::storage::DominantReason::Operator,
+	};
+	let worker = LsmCompactionWorker::new(
+		crate::storage::LsmConfig::default(),
+		manager.slab_pin_table(),
+	)
+	.unwrap();
+	manager
+		.lsm_fail_before_rename
+		.store(true, Ordering::Release);
+	assert!(
+		manager
+			.run_lsm_compaction_once(&worker, plan)
+			.await
+			.is_err()
+	);
+	let snapshot = manager
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot()
+		.await
+		.unwrap();
+	assert_eq!(snapshot.lsm_install_intents.len(), 1);
+	let outputs = snapshot.lsm_install_intents[0]
+		.local_output_files
+		.iter()
+		.map(|file| file.slab_id)
+		.collect::<Vec<_>>();
+	assert!(!outputs.is_empty());
+	for output in &outputs {
+		assert!(
+			lsm_driver::lsm_compaction_tmp_path(&dir, CompactionJobId::new(0xd121), *output)
+				.exists(),
+			"unresolved intent must retain its temp output"
+		);
+	}
+	drop(manager);
+	let reopened = open_manager_at_dir(dir.to_path_buf(), io, crypto).await;
+	assert!(
+		reopened
+			.persistent_index
+			.as_ref()
+			.unwrap()
+			.load_snapshot()
+			.await
+			.unwrap()
+			.lsm_install_intents
+			.is_empty()
+	);
+	let versions = reopened
+		.scan_all_versions(Locality::ZERO, Locality::MAX, hlc(0))
+		.unwrap();
+	for key in keys {
+		assert_eq!(
+			versions
+				.iter()
+				.filter(|(_, identity, _, _)| *identity == key)
+				.count(),
+			1
+		);
+	}
+	for output in outputs {
+		assert!(
+			dir.join(format!(
+				"lsm-quarantine-{:016x}-slab_{:016x}.wnd",
+				CompactionJobId::new(0xd121),
+				output
+			))
+			.exists()
+		);
+	}
+}
+
+#[tokio::test]
+async fn cancelled_append_after_index_commit_fences_rebuild_and_reads() {
+	let (_dir, mgr) = fresh_manager_with_group_commit(GroupCommitConfig::default()).await;
+	let key = id(0x9ac2);
+	let entered = Arc::new(std::sync::Barrier::new(2));
+	let release = Arc::new(std::sync::Barrier::new(2));
+	*mgr.persistent_index
+		.as_ref()
+		.unwrap()
+		.guarded_delta_commit_hold
+		.lock()
+		.unwrap() = Some((entered.clone(), release.clone()));
+	let append = {
+		let mgr = mgr.clone();
+		tokio::spawn(async move { mgr.append(tenant(), key, hlc(122), b"value").await })
+	};
+	tokio::time::timeout(
+		Duration::from_secs(60),
+		tokio::task::spawn_blocking(move || entered.wait()),
+	)
+	.await
+	.unwrap()
+	.unwrap();
+	append.abort();
+	assert!(append.await.unwrap_err().is_cancelled());
+	let answer = mgr.lookup(tenant(), key);
+	let mut rebuild = {
+		let mgr = mgr.clone();
+		tokio::spawn(async move { mgr.rebuild_persistent_index().await })
+	};
+	let early = tokio::time::timeout(Duration::from_millis(200), &mut rebuild).await;
+	tokio::task::spawn_blocking(move || release.wait())
+		.await
+		.unwrap();
+	let result = match early {
+		Ok(joined) => joined.unwrap(),
+		Err(_) => rebuild.await.unwrap(),
+	};
+	assert!(
+		result.is_err(),
+		"rebuild must refuse an orphaned append publication"
+	);
+	assert!(
+		answer.is_err(),
+		"orphaned append publication must fence reads"
+	);
+	let snapshot = mgr
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot()
+		.await
+		.unwrap();
+	assert!(
+		snapshot
+			.record_rows
+			.iter()
+			.any(|row| row.key_identity == key),
+		"the committed append row must survive the refused rebuild"
+	);
+}
+
+#[tokio::test]
+async fn tier_generation_epoch_change_after_index_commit_mirrors_without_orphan() {
+	let (_dirs, mgr, l2) = fresh_manager_with_l2("fenced-tier-generation").await;
+	let key = id(0x9ac4);
+	mgr.append_durable(tenant(), key, hlc(124), b"value")
+		.await
+		.unwrap();
+	let pointer = tier_kv_slab(&mgr, &l2, "fenced-tier-generation/object").await;
+	let plan = mgr
+		.build_tiered_row_refresh_plan(&pointer, Some(&pointer))
+		.await
+		.unwrap();
+	let entered = Arc::new(std::sync::Barrier::new(2));
+	let release = Arc::new(std::sync::Barrier::new(2));
+	*mgr.persistent_index
+		.as_ref()
+		.unwrap()
+		.guarded_delta_commit_hold
+		.lock()
+		.unwrap() = Some((entered.clone(), release.clone()));
+	let epoch = mgr.tier_authority.reconcile_epoch();
+	let publication = {
+		let mgr = mgr.clone();
+		let pointer = pointer.clone();
+		let plan = plan.clone();
+		tokio::spawn(async move {
+			let tier_lock = mgr.tier_publication_lock(pointer.slab_id);
+			let _guard = tier_lock.lock().await;
+			mgr.publish_tier_generation(&pointer, &plan, None, epoch)
+				.await
+		})
+	};
+	tokio::time::timeout(
+		Duration::from_secs(60),
+		tokio::task::spawn_blocking(move || entered.wait()),
+	)
+	.await
+	.unwrap()
+	.unwrap();
+	mgr.tier_authority.advance_reconcile_epoch_for_test();
+	tokio::task::spawn_blocking(move || release.wait())
+		.await
+		.unwrap();
+	let error = publication.await.unwrap().unwrap_err();
+	assert!(stale_location(&error).is_some());
+	assert!(
+		!mgr.has_orphaned_index_publications(),
+		"a completed mirror must not acquire an orphan marker merely because its epoch changed"
+	);
+	assert_eq!(
+		mgr.tier_pointer(pointer.slab_id).await,
+		Some(pointer.clone())
+	);
+	let location = mgr.lookup(tenant(), key).unwrap().unwrap();
+	assert_eq!(mgr.read(location).await.unwrap(), b"value");
+	mgr.rebuild_persistent_index().await.unwrap();
+	let snapshot = mgr
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot()
+		.await
+		.unwrap();
+	assert!(snapshot.tiered_slabs.contains(&pointer));
+	assert!(
+		snapshot
+			.record_rows
+			.iter()
+			.any(|row| row.key_identity == key)
+	);
+}
+
+#[tokio::test]
+async fn local_lsm_quarantine_resumes_after_link_before_fsync() {
+	let dir = fresh_dir("dc121-link_before_fsync");
+	let crypto = test_crypto();
+	let io = spawn_io_thread(64).unwrap();
+	let manager = initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	let keys = [id(0xd121), id(0xd122)];
+	manager
+		.append_durable(tenant(), keys[0], hlc(1), b"one")
+		.await
+		.unwrap();
+	let first = manager.force_seal_active_for_test().await;
+	manager
+		.append_durable(tenant(), keys[1], hlc(2), b"two")
+		.await
+		.unwrap();
+	let second = manager.force_seal_active_for_test().await;
+	let snapshot = manager.compaction_manifest_snapshot();
+	let plan = CompactionPlan {
+		job_id: CompactionJobId::new(0xd121),
+		source_level: CompactionLevelIndex::L0,
+		target_level: CompactionLevelIndex::L1,
+		manifest_epoch_pre: snapshot.manifest_epoch,
+		input_slabs: vec![first, second],
+		overlapping_slabs: Vec::new(),
+		retention_floor_snapshot: hlc(100),
+		compaction_start_hlc: hlc(101),
+		dominant_reason: crate::storage::DominantReason::Operator,
+	};
+	let worker = LsmCompactionWorker::new(
+		crate::storage::LsmConfig::default(),
+		manager.slab_pin_table(),
+	)
+	.unwrap();
+	let prepared = manager
+		.prepare_lsm_compaction_outputs(&worker, &plan)
+		.await
+		.unwrap();
+	let frames = manager
+		.read_lsm_single_row_source_frames(&plan)
+		.await
+		.unwrap();
+	let written = manager
+		.write_lsm_compaction_temp_outputs(&plan, &prepared, &frames)
+		.await
+		.unwrap();
+	assert!(!written.is_empty());
+	let outputs = written.iter().map(|run| run.slab_id).collect::<Vec<_>>();
+	let digest = manager
+		.lsm_single_row_bridge_digest_summary(&plan, &prepared, &written, &frames)
+		.await
+		.unwrap();
+	let commit = worker.build_written_compaction_commit(&plan, &written, digest);
+	let entered = Arc::new(tokio::sync::Semaphore::new(0));
+	let release = Arc::new(tokio::sync::Semaphore::new(0));
+	*manager.lsm_after_rename_hold.lock().unwrap() = Some((entered.clone(), release));
+	let mut install = {
+		let manager = manager.clone();
+		tokio::spawn(async move {
+			manager
+				.install_lsm_compaction_temp_outputs(&plan, &prepared, &written, &commit)
+				.await
+		})
+	};
+	tokio::select! {
+		result = &mut install => panic!("LSM install exited before pause: {result:?}"),
+		permit = tokio::time::timeout(Duration::from_secs(60), entered.acquire()) => permit.unwrap().unwrap().forget(),
+	}
+	for output in &outputs {
+		assert!(slab_path(&dir, *output).exists());
+	}
+	let expected_bytes = outputs
+		.iter()
+		.map(|id| (*id, std::fs::read(slab_path(&dir, *id)).unwrap()))
+		.collect::<Vec<_>>();
+	install.abort();
+	assert!(install.await.unwrap_err().is_cancelled());
+	for output in &outputs {
+		let source = slab_path(&dir, *output);
+		let quarantine = dir.join(format!(
+			"lsm-quarantine-{:016x}-slab_{:016x}.wnd",
+			CompactionJobId::new(0xd121),
+			output
+		));
+		std::fs::hard_link(&source, &quarantine).unwrap();
+	}
+	drop(manager);
+	let reopened = open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	let versions = reopened
+		.scan_all_versions(Locality::ZERO, Locality::MAX, hlc(0))
+		.unwrap();
+	for key in keys {
+		assert_eq!(
+			versions
+				.iter()
+				.filter(|(_, identity, _, _)| *identity == key)
+				.count(),
+			1
+		);
+	}
+	let discovered = discover_slab_ids(reopened.file_ops.as_ref(), &dir)
+		.await
+		.unwrap();
+	for (output, bytes) in &expected_bytes {
+		assert!(!slab_path(&dir, *output).exists());
+		let name = format!(
+			"lsm-quarantine-{:016x}-slab_{:016x}.wnd",
+			CompactionJobId::new(0xd121),
+			output
+		);
+		assert!(parse_slab_filename(&name).is_none());
+		assert!(!lsm_driver::is_lsm_compaction_tmp_filename(&name));
+		assert!(!discovered.contains(output));
+		assert_eq!(std::fs::read(dir.join(name)).unwrap(), *bytes);
+	}
+
+	assert!(
+		reopened
+			.persistent_index
+			.as_ref()
+			.unwrap()
+			.load_snapshot()
+			.await
+			.unwrap()
+			.lsm_install_intents
+			.is_empty()
+	);
+	drop(reopened);
+	let reopened_again = open_manager_at_dir(dir.to_path_buf(), io, crypto).await;
+	for (output, bytes) in &expected_bytes {
+		let name = format!(
+			"lsm-quarantine-{:016x}-slab_{:016x}.wnd",
+			CompactionJobId::new(0xd121),
+			output
+		);
+		assert_eq!(
+			std::fs::read(dir.join(name)).unwrap(),
+			*bytes,
+			"reopen cleanup must preserve quarantined bytes"
+		);
+	}
+	let versions = reopened_again
+		.scan_all_versions(Locality::ZERO, Locality::MAX, hlc(0))
+		.unwrap();
+	for key in keys {
+		assert_eq!(
+			versions
+				.iter()
+				.filter(|(_, identity, _, _)| *identity == key)
+				.count(),
+			1
+		);
+	}
+}
+
+#[tokio::test]
+async fn local_lsm_quarantine_resumes_after_link_after_fsync() {
+	let dir = fresh_dir("dc121-link_after_fsync");
+	let crypto = test_crypto();
+	let io = spawn_io_thread(64).unwrap();
+	let manager = initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	let keys = [id(0xd121), id(0xd122)];
+	manager
+		.append_durable(tenant(), keys[0], hlc(1), b"one")
+		.await
+		.unwrap();
+	let first = manager.force_seal_active_for_test().await;
+	manager
+		.append_durable(tenant(), keys[1], hlc(2), b"two")
+		.await
+		.unwrap();
+	let second = manager.force_seal_active_for_test().await;
+	let snapshot = manager.compaction_manifest_snapshot();
+	let plan = CompactionPlan {
+		job_id: CompactionJobId::new(0xd121),
+		source_level: CompactionLevelIndex::L0,
+		target_level: CompactionLevelIndex::L1,
+		manifest_epoch_pre: snapshot.manifest_epoch,
+		input_slabs: vec![first, second],
+		overlapping_slabs: Vec::new(),
+		retention_floor_snapshot: hlc(100),
+		compaction_start_hlc: hlc(101),
+		dominant_reason: crate::storage::DominantReason::Operator,
+	};
+	let worker = LsmCompactionWorker::new(
+		crate::storage::LsmConfig::default(),
+		manager.slab_pin_table(),
+	)
+	.unwrap();
+	let prepared = manager
+		.prepare_lsm_compaction_outputs(&worker, &plan)
+		.await
+		.unwrap();
+	let frames = manager
+		.read_lsm_single_row_source_frames(&plan)
+		.await
+		.unwrap();
+	let written = manager
+		.write_lsm_compaction_temp_outputs(&plan, &prepared, &frames)
+		.await
+		.unwrap();
+	assert!(!written.is_empty());
+	let outputs = written.iter().map(|run| run.slab_id).collect::<Vec<_>>();
+	let digest = manager
+		.lsm_single_row_bridge_digest_summary(&plan, &prepared, &written, &frames)
+		.await
+		.unwrap();
+	let commit = worker.build_written_compaction_commit(&plan, &written, digest);
+	let entered = Arc::new(tokio::sync::Semaphore::new(0));
+	let release = Arc::new(tokio::sync::Semaphore::new(0));
+	*manager.lsm_after_rename_hold.lock().unwrap() = Some((entered.clone(), release));
+	let mut install = {
+		let manager = manager.clone();
+		tokio::spawn(async move {
+			manager
+				.install_lsm_compaction_temp_outputs(&plan, &prepared, &written, &commit)
+				.await
+		})
+	};
+	tokio::select! {
+		result = &mut install => panic!("LSM install exited before pause: {result:?}"),
+		permit = tokio::time::timeout(Duration::from_secs(60), entered.acquire()) => permit.unwrap().unwrap().forget(),
+	}
+	for output in &outputs {
+		assert!(slab_path(&dir, *output).exists());
+	}
+	let expected_bytes = outputs
+		.iter()
+		.map(|id| (*id, std::fs::read(slab_path(&dir, *id)).unwrap()))
+		.collect::<Vec<_>>();
+	install.abort();
+	assert!(install.await.unwrap_err().is_cancelled());
+	for output in &outputs {
+		let source = slab_path(&dir, *output);
+		let quarantine = dir.join(format!(
+			"lsm-quarantine-{:016x}-slab_{:016x}.wnd",
+			CompactionJobId::new(0xd121),
+			output
+		));
+		std::fs::hard_link(&source, &quarantine).unwrap();
+		std::fs::File::open(&*dir).unwrap().sync_all().unwrap();
+	}
+	drop(manager);
+	let reopened = open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	let versions = reopened
+		.scan_all_versions(Locality::ZERO, Locality::MAX, hlc(0))
+		.unwrap();
+	for key in keys {
+		assert_eq!(
+			versions
+				.iter()
+				.filter(|(_, identity, _, _)| *identity == key)
+				.count(),
+			1
+		);
+	}
+	let discovered = discover_slab_ids(reopened.file_ops.as_ref(), &dir)
+		.await
+		.unwrap();
+	for (output, bytes) in &expected_bytes {
+		assert!(!slab_path(&dir, *output).exists());
+		let name = format!(
+			"lsm-quarantine-{:016x}-slab_{:016x}.wnd",
+			CompactionJobId::new(0xd121),
+			output
+		);
+		assert!(parse_slab_filename(&name).is_none());
+		assert!(!lsm_driver::is_lsm_compaction_tmp_filename(&name));
+		assert!(!discovered.contains(output));
+		assert_eq!(std::fs::read(dir.join(name)).unwrap(), *bytes);
+	}
+
+	assert!(
+		reopened
+			.persistent_index
+			.as_ref()
+			.unwrap()
+			.load_snapshot()
+			.await
+			.unwrap()
+			.lsm_install_intents
+			.is_empty()
+	);
+	drop(reopened);
+	let reopened_again = open_manager_at_dir(dir.to_path_buf(), io, crypto).await;
+	for (output, bytes) in &expected_bytes {
+		let name = format!(
+			"lsm-quarantine-{:016x}-slab_{:016x}.wnd",
+			CompactionJobId::new(0xd121),
+			output
+		);
+		assert_eq!(
+			std::fs::read(dir.join(name)).unwrap(),
+			*bytes,
+			"reopen cleanup must preserve quarantined bytes"
+		);
+	}
+	let versions = reopened_again
+		.scan_all_versions(Locality::ZERO, Locality::MAX, hlc(0))
+		.unwrap();
+	for key in keys {
+		assert_eq!(
+			versions
+				.iter()
+				.filter(|(_, identity, _, _)| *identity == key)
+				.count(),
+			1
+		);
+	}
+}
+
+#[tokio::test]
+async fn local_lsm_quarantine_resumes_after_unlink_before_fsync() {
+	let dir = fresh_dir("dc121-unlink_before_fsync");
+	let crypto = test_crypto();
+	let io = spawn_io_thread(64).unwrap();
+	let manager = initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	let keys = [id(0xd121), id(0xd122)];
+	manager
+		.append_durable(tenant(), keys[0], hlc(1), b"one")
+		.await
+		.unwrap();
+	let first = manager.force_seal_active_for_test().await;
+	manager
+		.append_durable(tenant(), keys[1], hlc(2), b"two")
+		.await
+		.unwrap();
+	let second = manager.force_seal_active_for_test().await;
+	let snapshot = manager.compaction_manifest_snapshot();
+	let plan = CompactionPlan {
+		job_id: CompactionJobId::new(0xd121),
+		source_level: CompactionLevelIndex::L0,
+		target_level: CompactionLevelIndex::L1,
+		manifest_epoch_pre: snapshot.manifest_epoch,
+		input_slabs: vec![first, second],
+		overlapping_slabs: Vec::new(),
+		retention_floor_snapshot: hlc(100),
+		compaction_start_hlc: hlc(101),
+		dominant_reason: crate::storage::DominantReason::Operator,
+	};
+	let worker = LsmCompactionWorker::new(
+		crate::storage::LsmConfig::default(),
+		manager.slab_pin_table(),
+	)
+	.unwrap();
+	let prepared = manager
+		.prepare_lsm_compaction_outputs(&worker, &plan)
+		.await
+		.unwrap();
+	let frames = manager
+		.read_lsm_single_row_source_frames(&plan)
+		.await
+		.unwrap();
+	let written = manager
+		.write_lsm_compaction_temp_outputs(&plan, &prepared, &frames)
+		.await
+		.unwrap();
+	assert!(!written.is_empty());
+	let outputs = written.iter().map(|run| run.slab_id).collect::<Vec<_>>();
+	let digest = manager
+		.lsm_single_row_bridge_digest_summary(&plan, &prepared, &written, &frames)
+		.await
+		.unwrap();
+	let commit = worker.build_written_compaction_commit(&plan, &written, digest);
+	let entered = Arc::new(tokio::sync::Semaphore::new(0));
+	let release = Arc::new(tokio::sync::Semaphore::new(0));
+	*manager.lsm_after_rename_hold.lock().unwrap() = Some((entered.clone(), release));
+	let mut install = {
+		let manager = manager.clone();
+		tokio::spawn(async move {
+			manager
+				.install_lsm_compaction_temp_outputs(&plan, &prepared, &written, &commit)
+				.await
+		})
+	};
+	tokio::select! {
+		result = &mut install => panic!("LSM install exited before pause: {result:?}"),
+		permit = tokio::time::timeout(Duration::from_secs(60), entered.acquire()) => permit.unwrap().unwrap().forget(),
+	}
+	for output in &outputs {
+		assert!(slab_path(&dir, *output).exists());
+	}
+	let expected_bytes = outputs
+		.iter()
+		.map(|id| (*id, std::fs::read(slab_path(&dir, *id)).unwrap()))
+		.collect::<Vec<_>>();
+	install.abort();
+	assert!(install.await.unwrap_err().is_cancelled());
+	for output in &outputs {
+		let source = slab_path(&dir, *output);
+		let quarantine = dir.join(format!(
+			"lsm-quarantine-{:016x}-slab_{:016x}.wnd",
+			CompactionJobId::new(0xd121),
+			output
+		));
+		std::fs::hard_link(&source, &quarantine).unwrap();
+		std::fs::File::open(&*dir).unwrap().sync_all().unwrap();
+		std::fs::remove_file(source).unwrap();
+	}
+	drop(manager);
+	let reopened = open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	let versions = reopened
+		.scan_all_versions(Locality::ZERO, Locality::MAX, hlc(0))
+		.unwrap();
+	for key in keys {
+		assert_eq!(
+			versions
+				.iter()
+				.filter(|(_, identity, _, _)| *identity == key)
+				.count(),
+			1
+		);
+	}
+	let discovered = discover_slab_ids(reopened.file_ops.as_ref(), &dir)
+		.await
+		.unwrap();
+	for (output, bytes) in &expected_bytes {
+		assert!(!slab_path(&dir, *output).exists());
+		let name = format!(
+			"lsm-quarantine-{:016x}-slab_{:016x}.wnd",
+			CompactionJobId::new(0xd121),
+			output
+		);
+		assert!(parse_slab_filename(&name).is_none());
+		assert!(!lsm_driver::is_lsm_compaction_tmp_filename(&name));
+		assert!(!discovered.contains(output));
+		assert_eq!(std::fs::read(dir.join(name)).unwrap(), *bytes);
+	}
+
+	assert!(
+		reopened
+			.persistent_index
+			.as_ref()
+			.unwrap()
+			.load_snapshot()
+			.await
+			.unwrap()
+			.lsm_install_intents
+			.is_empty()
+	);
+	drop(reopened);
+	let reopened_again = open_manager_at_dir(dir.to_path_buf(), io, crypto).await;
+	for (output, bytes) in &expected_bytes {
+		let name = format!(
+			"lsm-quarantine-{:016x}-slab_{:016x}.wnd",
+			CompactionJobId::new(0xd121),
+			output
+		);
+		assert_eq!(
+			std::fs::read(dir.join(name)).unwrap(),
+			*bytes,
+			"reopen cleanup must preserve quarantined bytes"
+		);
+	}
+	let versions = reopened_again
+		.scan_all_versions(Locality::ZERO, Locality::MAX, hlc(0))
+		.unwrap();
+	for key in keys {
+		assert_eq!(
+			versions
+				.iter()
+				.filter(|(_, identity, _, _)| *identity == key)
+				.count(),
+			1
+		);
+	}
+}
+
+#[tokio::test]
+async fn local_lsm_quarantine_resumes_after_unlink_after_fsync() {
+	let dir = fresh_dir("dc121-unlink_after_fsync");
+	let crypto = test_crypto();
+	let io = spawn_io_thread(64).unwrap();
+	let manager = initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	let keys = [id(0xd121), id(0xd122)];
+	manager
+		.append_durable(tenant(), keys[0], hlc(1), b"one")
+		.await
+		.unwrap();
+	let first = manager.force_seal_active_for_test().await;
+	manager
+		.append_durable(tenant(), keys[1], hlc(2), b"two")
+		.await
+		.unwrap();
+	let second = manager.force_seal_active_for_test().await;
+	let snapshot = manager.compaction_manifest_snapshot();
+	let plan = CompactionPlan {
+		job_id: CompactionJobId::new(0xd121),
+		source_level: CompactionLevelIndex::L0,
+		target_level: CompactionLevelIndex::L1,
+		manifest_epoch_pre: snapshot.manifest_epoch,
+		input_slabs: vec![first, second],
+		overlapping_slabs: Vec::new(),
+		retention_floor_snapshot: hlc(100),
+		compaction_start_hlc: hlc(101),
+		dominant_reason: crate::storage::DominantReason::Operator,
+	};
+	let worker = LsmCompactionWorker::new(
+		crate::storage::LsmConfig::default(),
+		manager.slab_pin_table(),
+	)
+	.unwrap();
+	let prepared = manager
+		.prepare_lsm_compaction_outputs(&worker, &plan)
+		.await
+		.unwrap();
+	let frames = manager
+		.read_lsm_single_row_source_frames(&plan)
+		.await
+		.unwrap();
+	let written = manager
+		.write_lsm_compaction_temp_outputs(&plan, &prepared, &frames)
+		.await
+		.unwrap();
+	assert!(!written.is_empty());
+	let outputs = written.iter().map(|run| run.slab_id).collect::<Vec<_>>();
+	let digest = manager
+		.lsm_single_row_bridge_digest_summary(&plan, &prepared, &written, &frames)
+		.await
+		.unwrap();
+	let commit = worker.build_written_compaction_commit(&plan, &written, digest);
+	let entered = Arc::new(tokio::sync::Semaphore::new(0));
+	let release = Arc::new(tokio::sync::Semaphore::new(0));
+	*manager.lsm_after_rename_hold.lock().unwrap() = Some((entered.clone(), release));
+	let mut install = {
+		let manager = manager.clone();
+		tokio::spawn(async move {
+			manager
+				.install_lsm_compaction_temp_outputs(&plan, &prepared, &written, &commit)
+				.await
+		})
+	};
+	tokio::select! {
+		result = &mut install => panic!("LSM install exited before pause: {result:?}"),
+		permit = tokio::time::timeout(Duration::from_secs(60), entered.acquire()) => permit.unwrap().unwrap().forget(),
+	}
+	for output in &outputs {
+		assert!(slab_path(&dir, *output).exists());
+	}
+	let expected_bytes = outputs
+		.iter()
+		.map(|id| (*id, std::fs::read(slab_path(&dir, *id)).unwrap()))
+		.collect::<Vec<_>>();
+	install.abort();
+	assert!(install.await.unwrap_err().is_cancelled());
+	for output in &outputs {
+		let source = slab_path(&dir, *output);
+		let quarantine = dir.join(format!(
+			"lsm-quarantine-{:016x}-slab_{:016x}.wnd",
+			CompactionJobId::new(0xd121),
+			output
+		));
+		std::fs::hard_link(&source, &quarantine).unwrap();
+		std::fs::File::open(&*dir).unwrap().sync_all().unwrap();
+		std::fs::remove_file(source).unwrap();
+		std::fs::File::open(&*dir).unwrap().sync_all().unwrap();
+	}
+	drop(manager);
+	let reopened = open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	let versions = reopened
+		.scan_all_versions(Locality::ZERO, Locality::MAX, hlc(0))
+		.unwrap();
+	for key in keys {
+		assert_eq!(
+			versions
+				.iter()
+				.filter(|(_, identity, _, _)| *identity == key)
+				.count(),
+			1
+		);
+	}
+	let discovered = discover_slab_ids(reopened.file_ops.as_ref(), &dir)
+		.await
+		.unwrap();
+	for (output, bytes) in &expected_bytes {
+		assert!(!slab_path(&dir, *output).exists());
+		let name = format!(
+			"lsm-quarantine-{:016x}-slab_{:016x}.wnd",
+			CompactionJobId::new(0xd121),
+			output
+		);
+		assert!(parse_slab_filename(&name).is_none());
+		assert!(!lsm_driver::is_lsm_compaction_tmp_filename(&name));
+		assert!(!discovered.contains(output));
+		assert_eq!(std::fs::read(dir.join(name)).unwrap(), *bytes);
+	}
+
+	assert!(
+		reopened
+			.persistent_index
+			.as_ref()
+			.unwrap()
+			.load_snapshot()
+			.await
+			.unwrap()
+			.lsm_install_intents
+			.is_empty()
+	);
+	drop(reopened);
+	let reopened_again = open_manager_at_dir(dir.to_path_buf(), io, crypto).await;
+	for (output, bytes) in &expected_bytes {
+		let name = format!(
+			"lsm-quarantine-{:016x}-slab_{:016x}.wnd",
+			CompactionJobId::new(0xd121),
+			output
+		);
+		assert_eq!(
+			std::fs::read(dir.join(name)).unwrap(),
+			*bytes,
+			"reopen cleanup must preserve quarantined bytes"
+		);
+	}
+	let versions = reopened_again
+		.scan_all_versions(Locality::ZERO, Locality::MAX, hlc(0))
+		.unwrap();
+	for key in keys {
+		assert_eq!(
+			versions
+				.iter()
+				.filter(|(_, identity, _, _)| *identity == key)
+				.count(),
+			1
+		);
+	}
+}
+
+#[tokio::test]
+async fn local_lsm_sidecar_evidence_keeps_intent_and_outputs_fenced() {
+	let dir = fresh_dir("dc122-local-sidecar-evidence");
+	let crypto = test_crypto();
+	let io = spawn_io_thread(64).unwrap();
+	let manager = initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	let keys = [id(0xd121), id(0xd122)];
+	manager
+		.append_durable(tenant(), keys[0], hlc(1), b"one")
+		.await
+		.unwrap();
+	let first = manager.force_seal_active_for_test().await;
+	manager
+		.append_durable(tenant(), keys[1], hlc(2), b"two")
+		.await
+		.unwrap();
+	let second = manager.force_seal_active_for_test().await;
+	let snapshot = manager.compaction_manifest_snapshot();
+	let plan = CompactionPlan {
+		job_id: CompactionJobId::new(0xd121),
+		source_level: CompactionLevelIndex::L0,
+		target_level: CompactionLevelIndex::L1,
+		manifest_epoch_pre: snapshot.manifest_epoch,
+		input_slabs: vec![first, second],
+		overlapping_slabs: Vec::new(),
+		retention_floor_snapshot: hlc(100),
+		compaction_start_hlc: hlc(101),
+		dominant_reason: crate::storage::DominantReason::Operator,
+	};
+	let worker = LsmCompactionWorker::new(
+		crate::storage::LsmConfig::default(),
+		manager.slab_pin_table(),
+	)
+	.unwrap();
+	let prepared = manager
+		.prepare_lsm_compaction_outputs(&worker, &plan)
+		.await
+		.unwrap();
+	let frames = manager
+		.read_lsm_single_row_source_frames(&plan)
+		.await
+		.unwrap();
+	let written = manager
+		.write_lsm_compaction_temp_outputs(&plan, &prepared, &frames)
+		.await
+		.unwrap();
+	assert!(!written.is_empty());
+	let outputs = written.iter().map(|run| run.slab_id).collect::<Vec<_>>();
+	let digest = manager
+		.lsm_single_row_bridge_digest_summary(&plan, &prepared, &written, &frames)
+		.await
+		.unwrap();
+	let commit = worker.build_written_compaction_commit(&plan, &written, digest);
+	let entered = Arc::new(tokio::sync::Semaphore::new(0));
+	let release = Arc::new(tokio::sync::Semaphore::new(0));
+	*manager.lsm_after_rename_hold.lock().unwrap() = Some((entered.clone(), release));
+	let mut install = {
+		let manager = manager.clone();
+		tokio::spawn(async move {
+			manager
+				.install_lsm_compaction_temp_outputs(&plan, &prepared, &written, &commit)
+				.await
+		})
+	};
+	tokio::select! {
+		result = &mut install => panic!("LSM install exited before pause: {result:?}"),
+		permit = tokio::time::timeout(Duration::from_secs(60), entered.acquire()) => permit.unwrap().unwrap().forget(),
+	}
+	for output in &outputs {
+		assert!(slab_path(&dir, *output).exists());
+	}
+	let expected_bytes = outputs
+		.iter()
+		.map(|id| (*id, std::fs::read(slab_path(&dir, *id)).unwrap()))
+		.collect::<Vec<_>>();
+	install.abort();
+	assert!(install.await.unwrap_err().is_cancelled());
+	// Fixture the durable sidecar evidence directly, representing a row
+	// that appeared before restart without granting publication authority.
+	let segment = secondary_index_segment_for_test(first);
+	let identity = segment.identity();
+	let relative = secondary_index_segment_storage_path(&segment.catalog_key());
+	let info = SecondaryIndexSegmentInfo {
+		tenant_id: segment.header.tenant_id,
+		table_object_id: segment.header.table_object_id,
+		index_object_id: segment.header.index_object_id,
+		logical_schema_fingerprint: identity.logical_schema_fingerprint,
+		source_slab_id: first,
+		segment_path: relative.clone(),
+		l2_uri: None,
+		payload_hash: segment.header.payload_hash,
+		state_digest: *segment.header.state_digest.as_bytes(),
+		format_version: segment.header.format_version,
+		entry_count: segment.header.entry_count,
+	};
+	let path = dir.join(&relative);
+	std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+	let bytes = segment.encode().unwrap();
+	std::fs::write(&path, &bytes).unwrap();
+	std::fs::File::open(&path).unwrap().sync_all().unwrap();
+	manager
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.upsert_secondary_index_segment(PersistentSecondaryIndexSegmentRow::from(info))
+		.await
+		.unwrap();
+	drop(manager);
+	let reopened = open_manager_at_dir(dir.to_path_buf(), io, crypto).await;
+	assert_eq!(
+		reopened.tier_authority_readiness_reason().as_deref(),
+		Some("TierAuthorityLsmUnresolved")
+	);
+	assert!(reopened.lookup(tenant(), keys[0]).is_err());
+	assert_eq!(
+		reopened
+			.persistent_index
+			.as_ref()
+			.unwrap()
+			.load_snapshot()
+			.await
+			.unwrap()
+			.lsm_install_intents
+			.len(),
+		1
+	);
+	assert_eq!(std::fs::read(&path).unwrap(), bytes);
+	for (output, bytes) in expected_bytes {
+		assert_eq!(std::fs::read(slab_path(&dir, output)).unwrap(), bytes);
+	}
+}
+
+#[tokio::test]
+async fn local_lsm_preflight_refusal_precedes_durable_intent_and_orphan_mark() {
+	let dir = fresh_dir("local-lsm-preflight-before-intent");
+	let crypto = test_crypto();
+	let io = spawn_io_thread(64).unwrap();
+	let manager = initialize_manager_at_dir(dir.to_path_buf(), io, crypto).await;
+	let keys = [id(0xd131), id(0xd132)];
+	manager
+		.append_durable(tenant(), keys[0], hlc(1), b"one")
+		.await
+		.unwrap();
+	let first = manager.force_seal_active_for_test().await;
+	manager
+		.append_durable(tenant(), keys[1], hlc(2), b"two")
+		.await
+		.unwrap();
+	let second = manager.force_seal_active_for_test().await;
+	let snapshot = manager.compaction_manifest_snapshot();
+	let plan = CompactionPlan {
+		job_id: CompactionJobId::new(0xd131),
+		source_level: CompactionLevelIndex::L0,
+		target_level: CompactionLevelIndex::L1,
+		manifest_epoch_pre: snapshot.manifest_epoch,
+		input_slabs: vec![first, second],
+		overlapping_slabs: Vec::new(),
+		retention_floor_snapshot: hlc(100),
+		compaction_start_hlc: hlc(101),
+		dominant_reason: crate::storage::DominantReason::Operator,
+	};
+	let worker = LsmCompactionWorker::new(
+		crate::storage::LsmConfig::default(),
+		manager.slab_pin_table(),
+	)
+	.unwrap();
+	let prepared = manager
+		.prepare_lsm_compaction_outputs(&worker, &plan)
+		.await
+		.unwrap();
+	let frames = manager
+		.read_lsm_single_row_source_frames(&plan)
+		.await
+		.unwrap();
+	let written = manager
+		.write_lsm_compaction_temp_outputs(&plan, &prepared, &frames)
+		.await
+		.unwrap();
+	assert!(!written.is_empty());
+	let digest = manager
+		.lsm_single_row_bridge_digest_summary(&plan, &prepared, &written, &frames)
+		.await
+		.unwrap();
+	let commit = worker.build_written_compaction_commit(&plan, &written, digest);
+	// Make the install deterministically preflight-refusable: a sidecar-covered
+	// input without catalog context. The manifest epoch is unchanged.
+	{
+		let mut manifest =
+			recover_rwlock_write(&manager.compaction_manifest, "compaction_manifest");
+		let mut run = manifest
+			.get_run(first)
+			.expect("sealed input is in the LSM manifest")
+			.clone();
+		run.sidecar_coverage = crate::storage::SidecarCoverage::Complete;
+		manifest.insert_live_run(run);
+	}
+	assert_eq!(
+		manager.compaction_manifest_snapshot().manifest_epoch,
+		commit.manifest_epoch_pre
+	);
+	// The injected failure fires only after the durable intent is written.
+	manager
+		.lsm_fail_before_rename
+		.store(true, Ordering::Release);
+	let result = manager
+		.install_lsm_compaction_temp_outputs(&plan, &prepared, &written, &commit)
+		.await;
+	let snapshot = manager
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot()
+		.await
+		.unwrap();
+	assert!(
+		snapshot.lsm_install_intents.is_empty(),
+		"preflight refusal must precede the durable intent: {:?}",
+		snapshot.lsm_install_intents
+	);
+	assert!(
+		!manager.has_orphaned_index_publications(),
+		"preflight refusal must precede the orphan mark"
+	);
+	assert!(manager.lsm_install_unresolved.is_empty());
+	assert_eq!(manager.tier_authority_readiness_reason(), None);
+	assert!(
+		manager.lsm_fail_before_rename.load(Ordering::Acquire),
+		"the post-intent failure point is never reached"
+	);
+	assert!(
+		matches!(result, Err(CompactionFailure::SidecarDigestMismatch)),
+		"{result:?}"
+	);
+	for (key, value) in keys.iter().zip([&b"one"[..], b"two"]) {
+		let location = manager
+			.lookup(tenant(), *key)
+			.unwrap()
+			.expect("refused install leaves inputs authoritative");
+		assert_eq!(manager.read(location).await.unwrap(), value);
+	}
+}
+
+#[tokio::test]
+async fn local_lsm_recovery_preserves_unrelated_run_change() {
+	let dir = fresh_dir("dc121-unrelated-run");
+	let crypto = test_crypto();
+	let io = spawn_io_thread(64).unwrap();
+	let manager = initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	let keys = [id(0xd121), id(0xd122)];
+	manager
+		.append_durable(tenant(), keys[0], hlc(1), b"one")
+		.await
+		.unwrap();
+	let first = manager.force_seal_active_for_test().await;
+	manager
+		.append_durable(tenant(), keys[1], hlc(2), b"two")
+		.await
+		.unwrap();
+	let second = manager.force_seal_active_for_test().await;
+	let other_key = id(0xd123);
+	manager
+		.append_durable(tenant(), other_key, hlc(3), b"other")
+		.await
+		.unwrap();
+	let other_slab = manager.force_seal_active_for_test().await;
+	let snapshot = manager.compaction_manifest_snapshot();
+	let plan = CompactionPlan {
+		job_id: CompactionJobId::new(0xd121),
+		source_level: CompactionLevelIndex::L0,
+		target_level: CompactionLevelIndex::L1,
+		manifest_epoch_pre: snapshot.manifest_epoch,
+		input_slabs: vec![first, second],
+		overlapping_slabs: Vec::new(),
+		retention_floor_snapshot: hlc(100),
+		compaction_start_hlc: hlc(101),
+		dominant_reason: crate::storage::DominantReason::Operator,
+	};
+	let worker = LsmCompactionWorker::new(
+		crate::storage::LsmConfig::default(),
+		manager.slab_pin_table(),
+	)
+	.unwrap();
+	let prepared = manager
+		.prepare_lsm_compaction_outputs(&worker, &plan)
+		.await
+		.unwrap();
+	let frames = manager
+		.read_lsm_single_row_source_frames(&plan)
+		.await
+		.unwrap();
+	let written = manager
+		.write_lsm_compaction_temp_outputs(&plan, &prepared, &frames)
+		.await
+		.unwrap();
+	assert!(!written.is_empty());
+	let outputs = written.iter().map(|run| run.slab_id).collect::<Vec<_>>();
+	let digest = manager
+		.lsm_single_row_bridge_digest_summary(&plan, &prepared, &written, &frames)
+		.await
+		.unwrap();
+	let commit = worker.build_written_compaction_commit(&plan, &written, digest);
+	let entered = Arc::new(tokio::sync::Semaphore::new(0));
+	let release = Arc::new(tokio::sync::Semaphore::new(0));
+	*manager.lsm_after_output_publish_hold.lock().unwrap() = Some((entered.clone(), release));
+	let mut install = {
+		let manager = manager.clone();
+		tokio::spawn(async move {
+			manager
+				.install_lsm_compaction_temp_outputs(&plan, &prepared, &written, &commit)
+				.await
+		})
+	};
+	tokio::select! {
+		result = &mut install => panic!("LSM install exited before pause: {result:?}"),
+		permit = tokio::time::timeout(Duration::from_secs(60), entered.acquire()) => permit.unwrap().unwrap().forget(),
+	}
+	for output in &outputs {
+		assert!(slab_path(&dir, *output).exists());
+	}
+	install.abort();
+	assert!(install.await.unwrap_err().is_cancelled());
+	let mut unrelated = manager
+		.compaction_manifest_snapshot()
+		.run(other_slab)
+		.unwrap()
+		.clone();
+	unrelated.retention_debt_score = unrelated.retention_debt_score.saturating_add(1);
+	manager
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.apply(PersistentIndexUpdate {
+			put_lsm_runs: vec![unrelated.clone()],
+			..Default::default()
+		})
+		.await
+		.unwrap();
+	drop(manager);
+	let reopened = open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	assert_eq!(
+		reopened.compaction_manifest_snapshot().run(other_slab),
+		Some(&unrelated)
+	);
+	assert!(reopened.lookup(tenant(), other_key).unwrap().is_some());
+	let versions = reopened
+		.scan_all_versions(Locality::ZERO, Locality::MAX, hlc(0))
+		.unwrap();
+	for key in keys {
+		assert_eq!(
+			versions
+				.iter()
+				.filter(|(_, identity, _, _)| *identity == key)
+				.count(),
+			1
+		);
+	}
+	for output in &outputs {
+		assert!(slab_path(&dir, *output).exists());
+		assert!(
+			!dir.join(format!(
+				"lsm-quarantine-{:016x}-slab_{:016x}.wnd",
+				CompactionJobId::new(0xd121),
+				output
+			))
+			.exists()
+		);
+	}
+	assert!(
+		reopened
+			.persistent_index
+			.as_ref()
+			.unwrap()
+			.load_snapshot()
+			.await
+			.unwrap()
+			.lsm_install_intents
+			.is_empty()
+	);
+	drop(reopened);
+	let reopened_again = open_manager_at_dir(dir.to_path_buf(), io, crypto).await;
+	let versions = reopened_again
+		.scan_all_versions(Locality::ZERO, Locality::MAX, hlc(0))
+		.unwrap();
+	for key in keys {
+		assert_eq!(
+			versions
+				.iter()
+				.filter(|(_, identity, _, _)| *identity == key)
+				.count(),
+			1
+		);
+	}
+}
+
+/// A deliberately constructed, sealed zero-row L0 run exercises the phase
+/// protocol without claiming that the retention digest accepts dropped rows.
+async fn empty_output_local_lsm_recovers_at_phase(outputs_published: bool) {
+	use crate::storage::index::LsmInstallPhase;
+	let dir = fresh_dir("dc121-empty-output");
+	let crypto = test_crypto();
+	let io = spawn_io_thread(64).unwrap();
+	let manager = initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	let input = manager.force_seal_active_for_test().await;
+	{
+		let mut manifest =
+			recover_rwlock_write(&manager.compaction_manifest, "compaction_manifest");
+		let epoch = manifest.manifest_epoch();
+		manifest.insert_live_run(LsmRunSummary::new(
+			input,
+			CompactionLevelIndex::L0,
+			hlc(0),
+			hlc(0),
+			ByteCount::new(0),
+			RowCount::new(0),
+			epoch,
+		));
+	}
+	let snapshot = manager.compaction_manifest_snapshot();
+	let plan = CompactionPlan {
+		job_id: CompactionJobId::new(0xd125),
+		source_level: CompactionLevelIndex::L0,
+		target_level: CompactionLevelIndex::L1,
+		manifest_epoch_pre: snapshot.manifest_epoch,
+		input_slabs: vec![input],
+		overlapping_slabs: Vec::new(),
+		retention_floor_snapshot: hlc(100),
+		compaction_start_hlc: hlc(101),
+		dominant_reason: crate::storage::DominantReason::Operator,
+	};
+	let worker = LsmCompactionWorker::new(
+		crate::storage::LsmConfig::default(),
+		manager.slab_pin_table(),
+	)
+	.unwrap();
+	let prepared = manager
+		.prepare_lsm_compaction_outputs(&worker, &plan)
+		.await
+		.unwrap();
+	let frames = manager
+		.read_lsm_single_row_source_frames(&plan)
+		.await
+		.unwrap();
+	let written = manager
+		.write_lsm_compaction_temp_outputs(&plan, &prepared, &frames)
+		.await
+		.unwrap();
+	assert!(prepared.decisions.is_empty());
+	assert!(
+		written.is_empty(),
+		"the zero-row fixture must produce no output files"
+	);
+	let digest = manager
+		.lsm_single_row_bridge_digest_summary(&plan, &prepared, &written, &frames)
+		.await
+		.unwrap();
+	let commit = worker.build_written_compaction_commit(&plan, &written, digest);
+	let entered = Arc::new(tokio::sync::Semaphore::new(0));
+	let release = Arc::new(tokio::sync::Semaphore::new(0));
+	if outputs_published {
+		*manager.lsm_after_output_publish_hold.lock().unwrap() = Some((entered.clone(), release));
+	} else {
+		*manager.lsm_after_rename_hold.lock().unwrap() = Some((entered.clone(), release));
+	}
+	let mut install = {
+		let manager = manager.clone();
+		tokio::spawn(async move {
+			manager
+				.install_lsm_compaction_temp_outputs(&plan, &prepared, &written, &commit)
+				.await
+		})
+	};
+	tokio::select! {
+		result = &mut install => panic!("LSM install exited before pause: {result:?}"),
+		permit = tokio::time::timeout(Duration::from_secs(60), entered.acquire()) => permit.unwrap().unwrap().forget(),
+	}
+	let snapshot = manager
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot()
+		.await
+		.unwrap();
+	let phase = if outputs_published {
+		LsmInstallPhase::OutputsPublished
+	} else {
+		LsmInstallPhase::Prepared
+	};
+	assert_eq!(snapshot.lsm_install_intents[0].phase, phase);
+	install.abort();
+	assert!(install.await.unwrap_err().is_cancelled());
+	drop(manager);
+	let reopened = open_manager_at_dir(dir.to_path_buf(), io, crypto).await;
+	let snapshot = reopened
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot()
+		.await
+		.unwrap();
+	assert!(snapshot.lsm_install_intents.is_empty());
+	let run = snapshot
+		.lsm_runs
+		.iter()
+		.find(|run| run.slab_id == input)
+		.expect("input run remains represented");
+	assert_eq!(run.state.is_live(), !outputs_published);
+}
+
+#[tokio::test]
+async fn local_lsm_empty_output_prepared_phase_preserves_input() {
+	empty_output_local_lsm_recovers_at_phase(false).await;
+}
+
+#[tokio::test]
+async fn local_lsm_empty_output_published_phase_finishes_retirement() {
+	empty_output_local_lsm_recovers_at_phase(true).await;
+}
+
+#[tokio::test]
+async fn append_only_retention_elision_preserves_the_visible_domain_digest() {
+	let dir = fresh_dir("dc123-retention-digest");
+	let manager = initialize_manager_at_dir(
+		dir.to_path_buf(),
+		spawn_io_thread(64).unwrap(),
+		test_crypto(),
+	)
+	.await;
+	let table_id = TableObjectId::new([0xd1; 16]);
+	let descriptor = append_only_retention_descriptor(table_id);
+	let key = id(0xd125);
+	let frame = encode_test_append_only_storage_frame(
+		table_id,
+		&[(key, Locality::new(25), hlc(1), 7, false)],
+	);
+	let entries = storage_multirow_index_entries_from_frame(&frame)
+		.unwrap()
+		.unwrap();
+	manager
+		.append_durable_multirow_with_locality(tenant(), &frame, &entries)
+		.await
+		.unwrap();
+	let input = manager.force_seal_active_for_test().await;
+	let snapshot = manager.compaction_manifest_snapshot();
+	let plan = CompactionPlan {
+		job_id: CompactionJobId::new(0xd125),
+		source_level: CompactionLevelIndex::L0,
+		target_level: CompactionLevelIndex::L1,
+		manifest_epoch_pre: snapshot.manifest_epoch,
+		input_slabs: vec![input],
+		overlapping_slabs: Vec::new(),
+		retention_floor_snapshot: hlc(100),
+		compaction_start_hlc: hlc(101),
+		dominant_reason: crate::storage::DominantReason::Operator,
+	};
+	let worker = LsmCompactionWorker::new(
+		crate::storage::LsmConfig::default(),
+		manager.slab_pin_table(),
+	)
+	.unwrap();
+	let mut catalog = TableSchemaCatalog::default();
+	catalog.upsert(tenant(), descriptor).unwrap();
+	let prepared = manager
+		.prepare_lsm_compaction_outputs_with_table_schemas(&worker, &plan, &catalog)
+		.await
+		.unwrap();
+	let frames = manager
+		.read_lsm_single_row_source_frames(&plan)
+		.await
+		.unwrap();
+	let written = manager
+		.write_lsm_compaction_temp_outputs_with_table_schemas(
+			&plan,
+			&prepared,
+			&frames,
+			Some(&catalog),
+		)
+		.await
+		.unwrap();
+	assert!(
+		written.is_empty(),
+		"the below-floor append-only row must be elided"
+	);
+	manager
+		.lsm_single_row_bridge_digest_summary(&plan, &prepared, &written, &frames)
+		.await
+		.expect("below-floor retention elision must preserve the visible-domain proof");
+}
+
+#[tokio::test]
+async fn incorrectly_elided_above_floor_row_is_refused_by_visible_domain_digest() {
+	let dir = fresh_dir("dc123-visible-drop");
+	let manager = initialize_manager_at_dir(
+		dir.to_path_buf(),
+		spawn_io_thread(64).unwrap(),
+		test_crypto(),
+	)
+	.await;
+	let table_id = TableObjectId::new([0xd1; 16]);
+	let descriptor = append_only_retention_descriptor(table_id);
+	let key = id(0xd125);
+	let frame = encode_test_append_only_storage_frame(
+		table_id,
+		&[(key, Locality::new(25), hlc(101), 7, false)],
+	);
+	let entries = storage_multirow_index_entries_from_frame(&frame)
+		.unwrap()
+		.unwrap();
+	manager
+		.append_durable_multirow_with_locality(tenant(), &frame, &entries)
+		.await
+		.unwrap();
+	let input = manager.force_seal_active_for_test().await;
+	let snapshot = manager.compaction_manifest_snapshot();
+	let plan = CompactionPlan {
+		job_id: CompactionJobId::new(0xd125),
+		source_level: CompactionLevelIndex::L0,
+		target_level: CompactionLevelIndex::L1,
+		manifest_epoch_pre: snapshot.manifest_epoch,
+		input_slabs: vec![input],
+		overlapping_slabs: Vec::new(),
+		retention_floor_snapshot: hlc(100),
+		compaction_start_hlc: hlc(101),
+		dominant_reason: crate::storage::DominantReason::Operator,
+	};
+	let worker = LsmCompactionWorker::new(
+		crate::storage::LsmConfig::default(),
+		manager.slab_pin_table(),
+	)
+	.unwrap();
+	let mut catalog = TableSchemaCatalog::default();
+	catalog.upsert(tenant(), descriptor).unwrap();
+	let mut prepared = manager
+		.prepare_lsm_compaction_outputs_with_table_schemas(&worker, &plan, &catalog)
+		.await
+		.unwrap();
+	let frames = manager
+		.read_lsm_single_row_source_frames(&plan)
+		.await
+		.unwrap();
+	let record = match prepared.decisions.as_slice() {
+		[crate::storage::SurvivorOrDrop::Survivor(record)] => record.clone(),
+		other => panic!("above-floor fixture must plan exactly one survivor: {other:?}"),
+	};
+	prepared.decisions = vec![crate::storage::SurvivorOrDrop::Drop {
+		record,
+		reason: crate::storage::DropReason::Retention,
+	}];
+	prepared.output_runs.clear();
+	assert!(
+		manager
+			.lsm_single_row_bridge_digest_summary(&plan, &prepared, &[], &frames)
+			.await
+			.is_err(),
+		"a wrongly dropped above-floor row must be refused"
+	);
+}
+
+async fn retention_empty_output_local_lsm_recovers_at_phase(outputs_published: bool) {
+	use crate::storage::index::LsmInstallPhase;
+	let dir = fresh_dir("dc123-retention-empty-phase");
+	let crypto = test_crypto();
+	let io = spawn_io_thread(64).unwrap();
+	let manager = initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	let table_id = TableObjectId::new([0xd1; 16]);
+	let descriptor = append_only_retention_descriptor(table_id);
+	let key = id(0xd125);
+	let frame = encode_test_append_only_storage_frame(
+		table_id,
+		&[(key, Locality::new(25), hlc(1), 7, false)],
+	);
+	let entries = storage_multirow_index_entries_from_frame(&frame)
+		.unwrap()
+		.unwrap();
+	manager
+		.append_durable_multirow_with_locality(tenant(), &frame, &entries)
+		.await
+		.unwrap();
+	let input = manager.force_seal_active_for_test().await;
+	let snapshot = manager.compaction_manifest_snapshot();
+	let plan = CompactionPlan {
+		job_id: CompactionJobId::new(0xd125),
+		source_level: CompactionLevelIndex::L0,
+		target_level: CompactionLevelIndex::L1,
+		manifest_epoch_pre: snapshot.manifest_epoch,
+		input_slabs: vec![input],
+		overlapping_slabs: Vec::new(),
+		retention_floor_snapshot: hlc(100),
+		compaction_start_hlc: hlc(101),
+		dominant_reason: crate::storage::DominantReason::Operator,
+	};
+	let worker = LsmCompactionWorker::new(
+		crate::storage::LsmConfig::default(),
+		manager.slab_pin_table(),
+	)
+	.unwrap();
+	let mut catalog = TableSchemaCatalog::default();
+	catalog.upsert(tenant(), descriptor).unwrap();
+	let prepared = manager
+		.prepare_lsm_compaction_outputs_with_table_schemas(&worker, &plan, &catalog)
+		.await
+		.unwrap();
+	let frames = manager
+		.read_lsm_single_row_source_frames(&plan)
+		.await
+		.unwrap();
+	let written = manager
+		.write_lsm_compaction_temp_outputs_with_table_schemas(
+			&plan,
+			&prepared,
+			&frames,
+			Some(&catalog),
+		)
+		.await
+		.unwrap();
+	assert!(matches!(
+		prepared.decisions.as_slice(),
+		[crate::storage::SurvivorOrDrop::Drop { .. }]
+	));
+	assert!(
+		written.is_empty(),
+		"retention must elide the below-floor row"
+	);
+	let digest = manager
+		.lsm_single_row_bridge_digest_summary(&plan, &prepared, &written, &frames)
+		.await
+		.unwrap();
+	let commit = worker.build_written_compaction_commit(&plan, &written, digest);
+	let entered = Arc::new(tokio::sync::Semaphore::new(0));
+	let release = Arc::new(tokio::sync::Semaphore::new(0));
+	if outputs_published {
+		*manager.lsm_after_output_publish_hold.lock().unwrap() = Some((entered.clone(), release));
+	} else {
+		*manager.lsm_after_rename_hold.lock().unwrap() = Some((entered.clone(), release));
+	}
+	let mut install = {
+		let manager = manager.clone();
+		tokio::spawn(async move {
+			manager
+				.install_lsm_compaction_temp_outputs(&plan, &prepared, &written, &commit)
+				.await
+		})
+	};
+	tokio::select! {
+		result = &mut install => panic!("LSM install exited before pause: {result:?}"),
+		permit = tokio::time::timeout(Duration::from_secs(60), entered.acquire()) => permit.unwrap().unwrap().forget(),
+	}
+	let snapshot = manager
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot()
+		.await
+		.unwrap();
+	let phase = if outputs_published {
+		LsmInstallPhase::OutputsPublished
+	} else {
+		LsmInstallPhase::Prepared
+	};
+	assert_eq!(snapshot.lsm_install_intents[0].phase, phase);
+	install.abort();
+	assert!(install.await.unwrap_err().is_cancelled());
+	drop(manager);
+	let reopened = open_manager_at_dir(dir.to_path_buf(), io, crypto).await;
+	assert_eq!(
+		reopened.lookup(tenant(), key).unwrap().is_some(),
+		!outputs_published
+	);
+	let snapshot = reopened
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot()
+		.await
+		.unwrap();
+	assert!(snapshot.lsm_install_intents.is_empty());
+	let run = snapshot
+		.lsm_runs
+		.iter()
+		.find(|run| run.slab_id == input)
+		.expect("input run remains represented");
+	assert_eq!(run.state.is_live(), !outputs_published);
+}
+
+#[tokio::test]
+async fn local_lsm_retention_empty_prepared_phase_preserves_input() {
+	retention_empty_output_local_lsm_recovers_at_phase(false).await;
+}
+
+#[tokio::test]
+async fn local_lsm_retention_empty_published_phase_finishes_retirement() {
+	retention_empty_output_local_lsm_recovers_at_phase(true).await;
+}
+
+#[tokio::test]
+async fn secondary_index_discovery_does_not_decode_opaque_records() {
+	let (_dir, manager) = fresh_manager().await;
+	let location = manager
+		.append(tenant(), id(0xea01), hlc(1), b"x")
+		.await
+		.unwrap();
+	force_seal_active(&manager).await;
+	let plaintext = manager.read_sealed_raw(location.slab_id).await.unwrap();
+	let decode_guard = crate::storage::multirow::DecodeCountGuard::start();
+	let tables = manager
+		.secondary_index_table_ids_from_plaintext(location.slab_id, &plaintext)
+		.unwrap();
+	let probes = decode_guard.finish();
+	assert!(tables.is_empty());
+	assert_eq!(probes, 0, "opaque records must not be decoded as Arrow");
+}
+
+#[tokio::test]
+async fn secondary_index_discovery_and_builder_preserve_mixed_typed_rows() {
+	let (_dir, manager) = fresh_manager().await;
+	let first = secondary_index_table_descriptor_for_test();
+	let schema = Schema::new(vec![
+		Field::new("id", DataType::Int64, false),
+		Field::new("age", DataType::Int64, true),
+	]);
+	let second = TableSchemaDescriptor::new_with_layout(
+		TableObjectId::new([0x53; 16]),
+		1,
+		"analytics",
+		"other_events",
+		&schema,
+		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
+		LocalityPolicy::default_table_spread(),
+		RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::new(4, 8, 1024 * 1024).unwrap()),
+		SchemaEvolutionPolicy::AdditiveOnly,
+	)
+	.unwrap();
+	manager
+		.append(tenant(), id(0xea02), hlc(1), b"x")
+		.await
+		.unwrap();
+	let first_key =
+		append_secondary_index_table_row_for_test(&manager, &first, 11, Some(7), hlc(2)).await;
+	append_secondary_index_table_row_for_test(&manager, &second, 12, Some(8), hlc(3)).await;
+	let location = manager.lookup(tenant(), first_key).unwrap().unwrap();
+	force_seal_active(&manager).await;
+	let plaintext = manager.read_sealed_raw(location.slab_id).await.unwrap();
+	let decode_guard = crate::storage::multirow::DecodeCountGuard::start();
+	let tables = manager
+		.secondary_index_table_ids_from_plaintext(location.slab_id, &plaintext)
+		.unwrap();
+	let probes = decode_guard.finish();
+	assert_eq!(
+		tables,
+		BTreeSet::from([
+			(tenant(), first.table_object_id),
+			(tenant(), second.table_object_id)
+		])
+	);
+	assert_eq!(probes, 2, "both typed rows and no opaque value are decoded");
+	let descriptor = secondary_index_descriptor_for_test();
+	let decode_guard = crate::storage::multirow::DecodeCountGuard::start();
+	let segment = manager
+		.build_secondary_index_segment_from_plaintext(
+			tenant(),
+			&first,
+			&descriptor,
+			location.slab_id,
+			&plaintext,
+		)
+		.unwrap();
+	let probes = decode_guard.finish();
+	assert_eq!(probes, 2, "builder decodes only the two typed rows");
+	assert_eq!(segment.entries.len(), 1);
+	assert_eq!(segment.entries[0].row_key_id, first_key);
+}
+
+#[tokio::test]
+async fn secondary_index_builder_does_not_decode_opaque_records() {
+	let (_dir, manager) = fresh_manager().await;
+	let location = manager
+		.append(tenant(), id(0xea03), hlc(1), b"x")
+		.await
+		.unwrap();
+	force_seal_active(&manager).await;
+	let plaintext = manager.read_sealed_raw(location.slab_id).await.unwrap();
+	let table = secondary_index_table_descriptor_for_test();
+	let descriptor = secondary_index_descriptor_for_test();
+	let decode_guard = crate::storage::multirow::DecodeCountGuard::start();
+	let segment = manager
+		.build_secondary_index_segment_from_plaintext(
+			tenant(),
+			&table,
+			&descriptor,
+			location.slab_id,
+			&plaintext,
+		)
+		.unwrap();
+	let probes = decode_guard.finish();
+	assert_eq!(probes, 0);
+	assert!(segment.entries.is_empty());
+}
+
+#[tokio::test]
+async fn secondary_index_discovery_refuses_trusted_row_decode_error() {
+	let (_dir, manager) = fresh_manager().await;
+	let table = secondary_index_table_descriptor_for_test();
+	let key =
+		append_secondary_index_table_row_for_test(&manager, &table, 11, Some(7), hlc(2)).await;
+	let location = manager.lookup(tenant(), key).unwrap().unwrap();
+	force_seal_active(&manager).await;
+	let plaintext = manager.read_sealed_raw(location.slab_id).await.unwrap();
+	let guard = crate::storage::multirow::DecodeCountGuard::start();
+	guard.fail_next();
+	let error = manager
+		.secondary_index_table_ids_from_plaintext(location.slab_id, &plaintext)
+		.unwrap_err();
+	assert_eq!(error.kind(), ErrorKind::InvalidData);
+	assert_eq!(guard.finish(), 1);
+	assert_eq!(
+		manager.read_sealed_raw(location.slab_id).await.unwrap(),
+		plaintext
+	);
+}
+
+#[tokio::test]
+async fn maintenance_reclaim_retains_bytes_on_trusted_row_decode_error() {
+	let (_dir, manager) = fresh_manager().await;
+	let doomed = id(0xea04);
+	let doomed_location = manager
+		.append(tenant(), doomed, hlc(1), b"x")
+		.await
+		.unwrap();
+	let table = secondary_index_table_descriptor_for_test();
+	let live_key =
+		append_secondary_index_table_row_for_test(&manager, &table, 21, Some(9), hlc(2)).await;
+	force_seal_active(&manager).await;
+	let before = manager
+		.read_sealed_raw(doomed_location.slab_id)
+		.await
+		.unwrap();
+	let target = Locality::from(doomed).get();
+	let tombstone = MigratedRangeTombstone {
+		migration_id: 1,
+		range_start: target,
+		range_end: target,
+		to_epoch: 2,
+		completed_by: NodeId {
+			id: 7,
+			_reserved: 0,
+		},
+		completed_at_hlc: hlc(1),
+		migration_hlc_floor: hlc(0),
+	};
+	let (schemas, indexes) = empty_compaction_catalogs();
+	let guard = crate::storage::multirow::DecodeCountGuard::start();
+	guard.fail_next();
+	let error = manager
+		.reclaim_tombstoned_ranges(&[tombstone], &schemas, &indexes, 1)
+		.await
+		.unwrap_err();
+	assert_eq!(error.kind(), ErrorKind::InvalidData);
+	assert_eq!(guard.finish(), 1);
+	assert_eq!(
+		manager
+			.read_sealed_raw(doomed_location.slab_id)
+			.await
+			.unwrap(),
+		before
+	);
+	assert!(manager.lookup(tenant(), doomed).unwrap().is_some());
+	assert!(manager.lookup(tenant(), live_key).unwrap().is_some());
+}
+
+#[tokio::test]
+async fn maintenance_relocation_cancellation_fences_unfinished_index_publication() {
+	let (dir, manager) = fresh_manager().await;
+	let (keys, doomed, tombstone) = seed_maintenance_relocation_fixture(&manager).await;
+	manager.fsync_all_local_slabs().await.unwrap();
+	let expected = newest_values(&manager, &keys).await;
+	let pause = manager.pause_index_relocation_once();
+	let task = {
+		let manager = manager.clone();
+		tokio::spawn(async move {
+			let (schemas, indexes) = empty_compaction_catalogs();
+			manager
+				.reclaim_tombstoned_ranges(&[tombstone], &schemas, &indexes, 1)
+				.await
+		})
+	};
+	tokio::time::timeout(std::time::Duration::from_secs(60), pause.reached.notified())
+		.await
+		.expect("premise: maintenance reached the in-memory relocation after durable publication");
+	task.abort();
+	assert!(task.await.unwrap_err().is_cancelled());
+	assert!(manager.has_orphaned_index_publications());
+	assert!(
+		manager
+			.require_tier_authority_ready()
+			.unwrap_err()
+			.to_string()
+			.contains("RestartRequired")
+	);
+	assert!(manager.rebuild_persistent_index().await.is_err());
+	let io = manager.config.io.clone();
+	let crypto = manager.config.crypto.clone();
+	drop(manager);
+	let reopened = open_manager_at_dir(dir.to_path_buf(), io, crypto).await;
+	assert!(reopened.tier_authority_readiness_reason().is_none());
+	assert_eq!(newest_values(&reopened, &keys).await, expected);
+	assert!(reopened.lookup(tenant(), doomed).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn orphaned_durable_append_reconciles_exact_row_without_erasing_nondurable_row() {
+	let (_dir, manager) = fresh_manager().await;
+	let other_key = id(0xda01);
+	let other = manager
+		.append(tenant(), other_key, hlc(1), b"live-nondurable")
+		.await
+		.unwrap();
+	let slab_id = other.slab_id;
+	let tier_lock = manager.tier_publication_lock(slab_id);
+	let tier_guard = tier_lock.lock().await;
+	let entered = Arc::new(std::sync::Barrier::new(2));
+	let release = Arc::new(std::sync::Barrier::new(2));
+	*manager
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.guarded_delta_commit_hold
+		.lock()
+		.unwrap() = Some((entered.clone(), release.clone()));
+	let key = id(0xda02);
+	let task = {
+		let manager = manager.clone();
+		tokio::spawn(async move {
+			manager
+				.append_durable(tenant(), key, hlc(2), b"verified")
+				.await
+		})
+	};
+	tokio::time::timeout(
+		Duration::from_secs(60),
+		tokio::task::spawn_blocking(move || entered.wait()),
+	)
+	.await
+	.unwrap()
+	.unwrap();
+	task.abort();
+	assert!(task.await.unwrap_err().is_cancelled());
+	assert!(manager.has_orphaned_index_publications());
+	assert!(manager.lookup(tenant(), other_key).is_err());
+	tokio::task::spawn_blocking(move || release.wait())
+		.await
+		.unwrap();
+	drop(tier_guard);
+	let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+	while manager.has_orphaned_index_publications() {
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"matching committed append did not reconcile"
+		);
+		tokio::time::sleep(Duration::from_millis(5)).await;
+	}
+	assert_eq!(manager.lookup(tenant(), other_key).unwrap(), Some(other));
+	assert_eq!(manager.read(other).await.unwrap(), b"live-nondurable");
+	let location = manager
+		.lookup(tenant(), key)
+		.unwrap()
+		.expect("committed row indexed");
+	assert_eq!(manager.read(location).await.unwrap(), b"verified");
+}
+
+#[tokio::test]
+async fn orphaned_durable_append_with_mismatched_redb_evidence_stays_fenced() {
+	let (_dir, manager) = fresh_manager().await;
+	let slab_id = manager.state.lock().await.active.slab_id();
+	let tier_lock = manager.tier_publication_lock(slab_id);
+	let tier_guard = tier_lock.lock().await;
+	let entered = Arc::new(std::sync::Barrier::new(2));
+	let release = Arc::new(std::sync::Barrier::new(2));
+	*manager
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.guarded_delta_commit_hold
+		.lock()
+		.unwrap() = Some((entered.clone(), release.clone()));
+	let key = id(0xda03);
+	let task = {
+		let manager = manager.clone();
+		tokio::spawn(async move {
+			manager
+				.append_durable(tenant(), key, hlc(3), b"verified")
+				.await
+		})
+	};
+	tokio::time::timeout(
+		Duration::from_secs(60),
+		tokio::task::spawn_blocking(move || entered.wait()),
+	)
+	.await
+	.unwrap()
+	.unwrap();
+	task.abort();
+	assert!(task.await.unwrap_err().is_cancelled());
+	let evidence = *manager
+		.single_append_publication_evidence
+		.iter()
+		.next()
+		.unwrap()
+		.value();
+	tokio::task::spawn_blocking(move || release.wait())
+		.await
+		.unwrap();
+	let index = manager.persistent_index.as_ref().unwrap();
+	*index.guarded_delta_commit_hold.lock().unwrap() = None;
+	let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+	while index
+		.record_row_at_key(evidence.row)
+		.await
+		.unwrap()
+		.is_none()
+	{
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"detached transaction did not commit"
+		);
+		tokio::time::sleep(Duration::from_millis(5)).await;
+	}
+	let mut wrong = evidence.row;
+	wrong.routing_locality = Locality::new(wrong.routing_locality.get() ^ 1);
+	index
+		.apply(PersistentIndexUpdate {
+			put_records: vec![wrong],
+			..Default::default()
+		})
+		.await
+		.unwrap();
+	drop(tier_guard);
+	assert_eq!(
+		manager
+			.reconcile_single_append_publications()
+			.await
+			.unwrap(),
+		0
+	);
+	assert!(manager.has_orphaned_index_publications());
+	assert!(manager.lookup(tenant(), key).is_err());
+}
+
+#[tokio::test]
+async fn orphaned_append_with_incompatible_manager_chain_keeps_private_index_unchanged() {
+	let (_dir, manager) = fresh_manager().await;
+	let slab_id = manager.state.lock().await.active.slab_id();
+	let tier_lock = manager.tier_publication_lock(slab_id);
+	let tier_guard = tier_lock.lock().await;
+	let entered = Arc::new(std::sync::Barrier::new(2));
+	let release = Arc::new(std::sync::Barrier::new(2));
+	*manager
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.guarded_delta_commit_hold
+		.lock()
+		.unwrap() = Some((entered.clone(), release.clone()));
+	let key = id(0xda05);
+	let task = {
+		let manager = manager.clone();
+		tokio::spawn(async move {
+			manager
+				.append_durable(tenant(), key, hlc(3), b"verified")
+				.await
+		})
+	};
+	tokio::time::timeout(
+		Duration::from_secs(60),
+		tokio::task::spawn_blocking(move || entered.wait()),
+	)
+	.await
+	.unwrap()
+	.unwrap();
+	task.abort();
+	assert!(task.await.unwrap_err().is_cancelled());
+	let evidence = *manager
+		.single_append_publication_evidence
+		.iter()
+		.next()
+		.unwrap()
+		.value();
+	tokio::task::spawn_blocking(move || release.wait())
+		.await
+		.unwrap();
+	let index = manager.persistent_index.as_ref().unwrap();
+	*index.guarded_delta_commit_hold.lock().unwrap() = None;
+	let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+	while index
+		.record_row_at_key(evidence.row)
+		.await
+		.unwrap()
+		.is_none()
+	{
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"detached transaction did not commit"
+		);
+		tokio::time::sleep(Duration::from_millis(5)).await;
+	}
+	let slab = manager.state.lock().await.active.clone();
+	assert_eq!(
+		slab.lookup(tenant(), key).unwrap(),
+		Some(evidence.row.location)
+	);
+	slab.rollback_index_entry(tenant(), key, evidence.row.location);
+	assert_eq!(slab.lookup(tenant(), key).unwrap(), None);
+	let mut conflicting = evidence.row.location;
+	conflicting.offset += 4096;
+	manager.key_index.insert((tenant(), key), vec![conflicting]);
+	drop(tier_guard);
+	assert_eq!(
+		manager
+			.reconcile_single_append_publications()
+			.await
+			.unwrap(),
+		0
+	);
+	assert!(manager.has_orphaned_index_publications());
+	assert!(manager.lookup(tenant(), key).is_err());
+	assert_eq!(
+		slab.lookup(tenant(), key).unwrap(),
+		None,
+		"refusing incompatible manager state must not repair the private slab index"
+	);
+}
+
+#[tokio::test]
+async fn orphaned_append_retries_after_inflight_append_on_same_slab() {
+	let (_dir, manager) = fresh_manager().await;
+	let entered = Arc::new(std::sync::Barrier::new(2));
+	let release = Arc::new(std::sync::Barrier::new(2));
+	*manager
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.guarded_delta_commit_hold
+		.lock()
+		.unwrap() = Some((entered.clone(), release.clone()));
+	let first_key = id(0xda04);
+	let second_key = id(0xda05);
+	let first = {
+		let manager = manager.clone();
+		tokio::spawn(async move {
+			manager
+				.append_durable(tenant(), first_key, hlc(4), b"first")
+				.await
+		})
+	};
+	let first_entered = entered.clone();
+	tokio::time::timeout(
+		Duration::from_secs(60),
+		tokio::task::spawn_blocking(move || first_entered.wait()),
+	)
+	.await
+	.unwrap()
+	.unwrap();
+	let second = {
+		let manager = manager.clone();
+		tokio::spawn(async move {
+			manager
+				.append_durable(tenant(), second_key, hlc(5), b"second")
+				.await
+		})
+	};
+	let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+	while manager.pending_index_publications.len() < 2 {
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"second append did not register an in-flight mark"
+		);
+		tokio::time::sleep(Duration::from_millis(5)).await;
+	}
+	first.abort();
+	assert!(first.await.unwrap_err().is_cancelled());
+	let first_release = release.clone();
+	tokio::task::spawn_blocking(move || first_release.wait())
+		.await
+		.unwrap();
+	let second_entered = entered.clone();
+	tokio::time::timeout(
+		Duration::from_secs(60),
+		tokio::task::spawn_blocking(move || second_entered.wait()),
+	)
+	.await
+	.unwrap()
+	.unwrap();
+	// Hold the second owner beyond the first attempt's bounded retry window.
+	tokio::time::sleep(Duration::from_secs(2)).await;
+	assert!(manager.has_orphaned_index_publications());
+	assert!(manager.lookup(tenant(), first_key).is_err());
+	tokio::task::spawn_blocking(move || release.wait())
+		.await
+		.unwrap();
+	second.await.unwrap().unwrap();
+	*manager
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.guarded_delta_commit_hold
+		.lock()
+		.unwrap() = None;
+	let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+	while manager.has_orphaned_index_publications() {
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"orphan did not reconcile after the other append completed"
+		);
+		tokio::time::sleep(Duration::from_millis(5)).await;
+	}
+	let first_location = manager.lookup(tenant(), first_key).unwrap().unwrap();
+	let second_location = manager.lookup(tenant(), second_key).unwrap().unwrap();
+	assert_eq!(first_location.slab_id, second_location.slab_id);
+	assert_eq!(manager.read(first_location).await.unwrap(), b"first");
+	assert_eq!(manager.read(second_location).await.unwrap(), b"second");
+}
+
+#[tokio::test]
+async fn single_append_reconciler_is_single_flight_and_close_joins_before_reopen() {
+	let dir = fresh_dir("append-reconciler-close");
+	let owner = DataDirectoryOwner::acquire_existing(&dir).unwrap();
+	let crypto = test_crypto();
+	let config = |io| SlabManagerConfig {
+		dir: dir.to_path_buf(),
+		max_slab_bytes: 1 << 20,
+		io,
+		l2: None,
+		rehydration: RehydrationPolicy::default(),
+		l2_column_fetch: Default::default(),
+		row_group_writer: Default::default(),
+		l2_row_group_fetch: Default::default(),
+		encoding_writer: Default::default(),
+		l2_chunk_layout: Default::default(),
+		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
+		group_commit: GroupCommitConfig::default(),
+		crypto: crypto.clone(),
+	};
+	let manager = SlabManager::initialize_new_store_with_owner(
+		config(spawn_io_thread(64).unwrap()),
+		owner.clone(),
+	)
+	.await
+	.unwrap();
+	let entered_reconcile = Arc::new(tokio::sync::Semaphore::new(0));
+	let release_reconcile = Arc::new(tokio::sync::Semaphore::new(0));
+	*manager
+		.tier_authority
+		.reconcile_before_mutation_hold
+		.lock()
+		.unwrap() = Some((entered_reconcile.clone(), release_reconcile.clone()));
+	let slab_id = manager.state.lock().await.active.slab_id();
+	let tier_lock = manager.tier_publication_lock(slab_id);
+	let tier_guard = tier_lock.lock().await;
+	let entered_commit = Arc::new(std::sync::Barrier::new(2));
+	let release_commit = Arc::new(std::sync::Barrier::new(2));
+	*manager
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.guarded_delta_commit_hold
+		.lock()
+		.unwrap() = Some((entered_commit.clone(), release_commit.clone()));
+	let key = id(0xda06);
+	let task = {
+		let manager = manager.clone();
+		tokio::spawn(async move {
+			manager
+				.append_durable(tenant(), key, hlc(6), b"closed")
+				.await
+		})
+	};
+	tokio::time::timeout(
+		Duration::from_secs(60),
+		tokio::task::spawn_blocking(move || entered_commit.wait()),
+	)
+	.await
+	.unwrap()
+	.unwrap();
+	task.abort();
+	assert!(task.await.unwrap_err().is_cancelled());
+	tokio::task::spawn_blocking(move || release_commit.wait())
+		.await
+		.unwrap();
+	drop(tier_guard);
+	tokio::time::timeout(Duration::from_secs(60), entered_reconcile.acquire())
+		.await
+		.unwrap()
+		.unwrap()
+		.forget();
+	for _ in 0..64 {
+		manager.tier_authority.schedule_index_reconciliation();
+	}
+	assert_eq!(
+		manager
+			.tier_authority
+			.reconcile_task_starts
+			.load(Ordering::Acquire),
+		1
+	);
+	assert!(!manager.key_index.contains_key(&(tenant(), key)));
+	tokio::time::timeout(Duration::from_secs(3), owner.close(Duration::from_secs(2)))
+		.await
+		.expect("worker close must be bounded")
+		.unwrap();
+	release_reconcile.add_permits(1);
+	manager.tier_authority.schedule_index_reconciliation();
+	tokio::time::sleep(Duration::from_millis(50)).await;
+	assert_eq!(
+		manager
+			.tier_authority
+			.reconcile_task_starts
+			.load(Ordering::Acquire),
+		1
+	);
+	assert!(
+		!manager.key_index.contains_key(&(tenant(), key)),
+		"closed worker must not publish a key"
+	);
+	assert!(manager.has_orphaned_index_publications());
+	drop(manager);
+	drop(owner);
+	let next_owner =
+		DataDirectoryOwner::acquire_existing(&dir).expect("close released the directory lease");
+	let reopened =
+		SlabManager::open_with_owner(config(spawn_io_thread(64).unwrap()), next_owner.clone())
+			.await
+			.unwrap();
+	assert_eq!(
+		reopened
+			.read(reopened.lookup(tenant(), key).unwrap().unwrap())
+			.await
+			.unwrap(),
+		b"closed"
+	);
+	next_owner.close(Duration::from_secs(2)).await.unwrap();
+}
+
+#[tokio::test]
+async fn single_append_reconciler_holds_no_manager_while_parked() {
+	let dir = fresh_dir("append-reconciler-weak");
+	let owner = DataDirectoryOwner::acquire_existing(&dir).unwrap();
+	let manager = SlabManager::initialize_new_store_with_owner(
+		SlabManagerConfig {
+			dir: dir.to_path_buf(),
+			max_slab_bytes: 1 << 20,
+			io: spawn_io_thread(64).unwrap(),
+			l2: None,
+			rehydration: RehydrationPolicy::default(),
+			l2_column_fetch: Default::default(),
+			row_group_writer: Default::default(),
+			l2_row_group_fetch: Default::default(),
+			encoding_writer: Default::default(),
+			l2_chunk_layout: Default::default(),
+			l2_encoding_fetch: Default::default(),
+			encoding_compute: Default::default(),
+			group_commit: GroupCommitConfig::default(),
+			crypto: test_crypto(),
+		},
+		owner.clone(),
+	)
+	.await
+	.unwrap();
+	let authority = manager.tier_authority.clone();
+	let entered_reconcile = Arc::new(tokio::sync::Semaphore::new(0));
+	let release_reconcile = Arc::new(tokio::sync::Semaphore::new(0));
+	*authority.reconcile_before_mutation_hold.lock().unwrap() =
+		Some((entered_reconcile.clone(), release_reconcile.clone()));
+	let slab_id = manager.state.lock().await.active.slab_id();
+	let tier_lock = manager.tier_publication_lock(slab_id);
+	let tier_guard = tier_lock.lock().await;
+	let entered_commit = Arc::new(std::sync::Barrier::new(2));
+	let release_commit = Arc::new(std::sync::Barrier::new(2));
+	*manager
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.guarded_delta_commit_hold
+		.lock()
+		.unwrap() = Some((entered_commit.clone(), release_commit.clone()));
+	let key = id(0xda07);
+	let task = {
+		let manager = manager.clone();
+		tokio::spawn(async move { manager.append_durable(tenant(), key, hlc(7), b"weak").await })
+	};
+	tokio::time::timeout(
+		Duration::from_secs(60),
+		tokio::task::spawn_blocking(move || entered_commit.wait()),
+	)
+	.await
+	.unwrap()
+	.unwrap();
+	task.abort();
+	assert!(task.await.unwrap_err().is_cancelled());
+	tokio::task::spawn_blocking(move || release_commit.wait())
+		.await
+		.unwrap();
+	drop(tier_guard);
+	drop(tier_lock);
+	// The flight is parked before its mutation, after the pass dropped every
+	// temporary upgrade (index_publication.rs drops it before the hold).
+	tokio::time::timeout(Duration::from_secs(60), entered_reconcile.acquire())
+		.await
+		.unwrap()
+		.unwrap()
+		.forget();
+	assert_eq!(authority.reconcile_task_starts.load(Ordering::Acquire), 1);
+	let weak = Arc::downgrade(&manager);
+	let strong_while_parked = Arc::strong_count(&manager);
+	// Drop the only external owner without close.
+	drop(manager);
+	let released = tokio::time::timeout(Duration::from_secs(5), async {
+		while weak.strong_count() != 0 {
+			tokio::task::yield_now().await;
+		}
+	})
+	.await
+	.is_ok();
+	let closed_by_drop = authority.closed_for_test();
+	// Separate cleanup authority: the directory owner stops and joins the
+	// reconcile flight whether or not it kept the manager alive.
+	tokio::time::timeout(Duration::from_secs(3), owner.close(Duration::from_secs(2)))
+		.await
+		.expect("worker close must be bounded")
+		.unwrap();
+	assert_eq!(weak.strong_count(), 0, "cleanup released every owner");
+	drop(owner);
+	drop(DataDirectoryOwner::acquire_existing(&dir).expect("cleanup released the directory lease"));
+	assert_eq!(
+		strong_while_parked, 1,
+		"a parked reconcile flight holds no strong manager"
+	);
+	assert!(
+		released,
+		"dropping the last external owner releases the manager"
+	);
+	assert!(closed_by_drop, "manager drop stops the tier authority");
+}
+
+#[tokio::test]
+async fn single_append_reconciler_retries_after_epoch_changes() {
+	let dir = fresh_dir("append-reconciler-epoch");
+	let owner = DataDirectoryOwner::acquire_existing(&dir).unwrap();
+	let crypto = test_crypto();
+	let config = |io| SlabManagerConfig {
+		dir: dir.to_path_buf(),
+		max_slab_bytes: 1 << 20,
+		io,
+		l2: None,
+		rehydration: RehydrationPolicy::default(),
+		l2_column_fetch: Default::default(),
+		row_group_writer: Default::default(),
+		l2_row_group_fetch: Default::default(),
+		encoding_writer: Default::default(),
+		l2_chunk_layout: Default::default(),
+		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
+		group_commit: GroupCommitConfig::default(),
+		crypto: crypto.clone(),
+	};
+	let manager = SlabManager::initialize_new_store_with_owner(
+		config(spawn_io_thread(64).unwrap()),
+		owner.clone(),
+	)
+	.await
+	.unwrap();
+	let entered_reconcile = Arc::new(tokio::sync::Semaphore::new(0));
+	let release_reconcile = Arc::new(tokio::sync::Semaphore::new(0));
+	*manager
+		.tier_authority
+		.reconcile_before_mutation_hold
+		.lock()
+		.unwrap() = Some((entered_reconcile.clone(), release_reconcile.clone()));
+	let slab_id = manager.state.lock().await.active.slab_id();
+	let tier_lock = manager.tier_publication_lock(slab_id);
+	let tier_guard = tier_lock.lock().await;
+	let entered_commit = Arc::new(std::sync::Barrier::new(2));
+	let release_commit = Arc::new(std::sync::Barrier::new(2));
+	*manager
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.guarded_delta_commit_hold
+		.lock()
+		.unwrap() = Some((entered_commit.clone(), release_commit.clone()));
+	let key = id(0xda07);
+	let task = {
+		let manager = manager.clone();
+		tokio::spawn(async move {
+			manager
+				.append_durable(tenant(), key, hlc(6), b"closed")
+				.await
+		})
+	};
+	tokio::time::timeout(
+		Duration::from_secs(60),
+		tokio::task::spawn_blocking(move || entered_commit.wait()),
+	)
+	.await
+	.unwrap()
+	.unwrap();
+	task.abort();
+	assert!(task.await.unwrap_err().is_cancelled());
+	tokio::task::spawn_blocking(move || release_commit.wait())
+		.await
+		.unwrap();
+	drop(tier_guard);
+	tokio::time::timeout(Duration::from_secs(60), entered_reconcile.acquire())
+		.await
+		.unwrap()
+		.unwrap()
+		.forget();
+	manager.tier_authority.advance_reconcile_epoch_for_test();
+	release_reconcile.add_permits(1);
+	tokio::time::timeout(Duration::from_secs(60), entered_reconcile.acquire())
+		.await
+		.unwrap()
+		.unwrap()
+		.forget();
+	release_reconcile.add_permits(1);
+	let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+	while manager.has_orphaned_index_publications() {
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"new epoch must retry the orphan"
+		);
+		tokio::time::sleep(Duration::from_millis(5)).await;
+	}
+	assert_eq!(
+		manager
+			.tier_authority
+			.reconcile_task_starts
+			.load(Ordering::Acquire),
+		1
+	);
+	assert_eq!(
+		manager
+			.read(manager.lookup(tenant(), key).unwrap().unwrap())
+			.await
+			.unwrap(),
+		b"closed"
+	);
+	owner.close(Duration::from_secs(2)).await.unwrap();
+}
+
+#[tokio::test]
+async fn successful_lsm_install_never_orphans_its_intent_at_clear() {
+	let (_dir, manager) = fresh_manager().await;
+	let keys = seed_lsm_relocation_fixture(&manager).await;
+	let before_entered = Arc::new(tokio::sync::Semaphore::new(0));
+	let before_release = Arc::new(tokio::sync::Semaphore::new(0));
+	let after_entered = Arc::new(tokio::sync::Semaphore::new(0));
+	let after_release = Arc::new(tokio::sync::Semaphore::new(0));
+	*manager.lsm_after_install_hold.lock().unwrap() =
+		Some((before_entered.clone(), before_release.clone()));
+	*manager.lsm_after_intent_clear_hold.lock().unwrap() =
+		Some((after_entered.clone(), after_release.clone()));
+	let install = {
+		let manager = manager.clone();
+		tokio::spawn(async move {
+			let worker =
+				LsmCompactionWorker::new(LsmConfig::default(), manager.slab_pin_table()).unwrap();
+			manager.run_lsm_compaction_tick(&worker, hlc(20_000)).await
+		})
+	};
+	tokio::time::timeout(Duration::from_secs(120), before_entered.acquire())
+		.await
+		.unwrap()
+		.unwrap()
+		.forget();
+	assert!(!manager.lsm_install_unresolved.is_empty());
+	assert!(!manager.has_orphaned_lsm_intents());
+	assert!(manager.lookup(tenant(), keys[0]).unwrap().is_some());
+	before_release.add_permits(1);
+	tokio::time::timeout(Duration::from_secs(120), after_entered.acquire())
+		.await
+		.unwrap()
+		.unwrap()
+		.forget();
+	assert!(manager.lsm_install_unresolved.is_empty());
+	assert!(!manager.has_orphaned_lsm_intents());
+	assert!(manager.lookup(tenant(), keys[0]).unwrap().is_some());
+	after_release.add_permits(1);
+	assert!(install.await.unwrap().unwrap().is_some());
+	assert!(!manager.has_orphaned_lsm_intents());
+}
+
+#[tokio::test]
+async fn stale_lsm_intent_owner_cannot_orphan_same_job_replacement() {
+	let (_dir, manager) = fresh_manager().await;
+	seed_lsm_relocation_fixture(&manager).await;
+	let before_entered = Arc::new(tokio::sync::Semaphore::new(0));
+	let before_release = Arc::new(tokio::sync::Semaphore::new(0));
+	let after_entered = Arc::new(tokio::sync::Semaphore::new(0));
+	let after_release = Arc::new(tokio::sync::Semaphore::new(0));
+	*manager.lsm_after_install_hold.lock().unwrap() =
+		Some((before_entered.clone(), before_release.clone()));
+	*manager.lsm_after_intent_clear_hold.lock().unwrap() =
+		Some((after_entered.clone(), after_release));
+	let install = {
+		let manager = manager.clone();
+		tokio::spawn(async move {
+			let worker =
+				LsmCompactionWorker::new(LsmConfig::default(), manager.slab_pin_table()).unwrap();
+			manager.run_lsm_compaction_tick(&worker, hlc(20_000)).await
+		})
+	};
+	tokio::time::timeout(Duration::from_secs(120), before_entered.acquire())
+		.await
+		.unwrap()
+		.unwrap()
+		.forget();
+	let intent = manager
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot()
+		.await
+		.unwrap()
+		.lsm_install_intents
+		.into_iter()
+		.next()
+		.unwrap();
+	before_release.add_permits(1);
+	tokio::time::timeout(Duration::from_secs(120), after_entered.acquire())
+		.await
+		.unwrap()
+		.unwrap()
+		.forget();
+	let replacement = manager
+		.register_lsm_install_intent(&intent)
+		.await
+		.expect("same job may register after prior clear");
+	install.abort();
+	assert!(install.await.unwrap_err().is_cancelled());
+	assert!(
+		!manager.has_orphaned_lsm_intents(),
+		"old owner must not orphan its replacement"
+	);
+	drop(replacement);
+	assert!(
+		manager.has_orphaned_lsm_intents(),
+		"the current owner still orphans on drop"
+	);
+	manager
+		.clear_registered_lsm_intent(intent.commit.job_id)
+		.await;
+}
+
+#[tokio::test]
+async fn local_lsm_renamed_outputs_before_publication_never_duplicate_recovered_versions() {
+	let dir = fresh_dir("dc121-rename-before-publish");
+	let crypto = test_crypto();
+	let io = spawn_io_thread(64).unwrap();
+	let manager = initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	let keys = [id(0xd121), id(0xd122)];
+	manager
+		.append_durable(tenant(), keys[0], hlc(1), b"one")
+		.await
+		.unwrap();
+	let first = manager.force_seal_active_for_test().await;
+	manager
+		.append_durable(tenant(), keys[1], hlc(2), b"two")
+		.await
+		.unwrap();
+	let second = manager.force_seal_active_for_test().await;
+	let snapshot = manager.compaction_manifest_snapshot();
+	let plan = CompactionPlan {
+		job_id: CompactionJobId::new(0xd121),
+		source_level: CompactionLevelIndex::L0,
+		target_level: CompactionLevelIndex::L1,
+		manifest_epoch_pre: snapshot.manifest_epoch,
+		input_slabs: vec![first, second],
+		overlapping_slabs: Vec::new(),
+		retention_floor_snapshot: hlc(100),
+		compaction_start_hlc: hlc(101),
+		dominant_reason: crate::storage::DominantReason::Operator,
+	};
+	let worker = LsmCompactionWorker::new(
+		crate::storage::LsmConfig::default(),
+		manager.slab_pin_table(),
+	)
+	.unwrap();
+	let prepared = manager
+		.prepare_lsm_compaction_outputs(&worker, &plan)
+		.await
+		.unwrap();
+	let frames = manager
+		.read_lsm_single_row_source_frames(&plan)
+		.await
+		.unwrap();
+	let written = manager
+		.write_lsm_compaction_temp_outputs(&plan, &prepared, &frames)
+		.await
+		.unwrap();
+	assert!(!written.is_empty());
+	let digest = manager
+		.lsm_single_row_bridge_digest_summary(&plan, &prepared, &written, &frames)
+		.await
+		.unwrap();
+	let commit = worker.build_written_compaction_commit(&plan, &written, digest);
+	let outputs = written.iter().map(|run| run.slab_id).collect::<Vec<_>>();
+	let entered = Arc::new(tokio::sync::Semaphore::new(0));
+	let release = Arc::new(tokio::sync::Semaphore::new(0));
+	*manager.lsm_after_rename_hold.lock().unwrap() = Some((entered.clone(), release));
+	let mut install = {
+		let manager = manager.clone();
+		tokio::spawn(async move {
+			manager
+				.install_lsm_compaction_temp_outputs(&plan, &prepared, &written, &commit)
+				.await
+		})
+	};
+	tokio::select! {
+		result = &mut install => panic!("LSM install exited before pause: {result:?}"),
+		permit = tokio::time::timeout(Duration::from_secs(60), entered.acquire()) => permit.unwrap().unwrap().forget(),
+	}
+	assert!(
+		outputs
+			.iter()
+			.all(|slab_id| slab_path(&dir, *slab_id).exists())
+	);
+	for key in keys {
+		assert!(manager.lookup(tenant(), key).unwrap().is_some());
+	}
+	install.abort();
+	assert!(install.await.unwrap_err().is_cancelled());
+	assert!(manager.has_orphaned_lsm_intents());
+	assert_eq!(
+		manager.lookup(tenant(), keys[0]).unwrap_err().kind(),
+		ErrorKind::WouldBlock
+	);
+	drop(manager);
+	let reopened = open_manager_at_dir(dir.to_path_buf(), io, crypto).await;
+	let versions = reopened
+		.scan_all_versions(Locality::ZERO, Locality::MAX, hlc(0))
+		.unwrap();
+	for key in keys {
+		let copies = versions
+			.iter()
+			.filter(|(_, identity, _, _)| *identity == key)
+			.count();
+		assert_eq!(
+			copies, 1,
+			"unpublished renamed output must not add another version copy"
+		);
+	}
+}
+
+async fn dc123_append_only_tombstone_pair(
+	tombstone_hlc: HybridTimestamp,
+	expected_survivors: usize,
+) {
+	let dir = fresh_dir("dc123-tombstone-pair");
+	let manager = initialize_manager_at_dir(
+		dir.to_path_buf(),
+		spawn_io_thread(64).unwrap(),
+		test_crypto(),
+	)
+	.await;
+	let table_id = TableObjectId::new([0xd2; 16]);
+	let descriptor = append_only_retention_descriptor(table_id);
+	let key = id(0xd126);
+	let frame = encode_test_append_only_storage_frame(
+		table_id,
+		&[(key, Locality::new(26), hlc(1), 7, false)],
+	);
+	let entries = storage_multirow_index_entries_from_frame(&frame)
+		.unwrap()
+		.unwrap();
+	manager
+		.append_durable_multirow_with_locality(tenant(), &frame, &entries)
+		.await
+		.unwrap();
+	let (tombstone, entries) =
+		encode_test_row_tombstone_marker_frame(table_id, key, Locality::new(26), tombstone_hlc);
+	manager
+		.append_durable_multirow_with_locality(tenant(), &tombstone, &entries)
+		.await
+		.unwrap();
+	let input = manager.force_seal_active_for_test().await;
+	let snapshot = manager.compaction_manifest_snapshot();
+	let plan = CompactionPlan {
+		job_id: CompactionJobId::new(0xd126),
+		source_level: CompactionLevelIndex::L0,
+		target_level: CompactionLevelIndex::L1,
+		manifest_epoch_pre: snapshot.manifest_epoch,
+		input_slabs: vec![input],
+		overlapping_slabs: Vec::new(),
+		retention_floor_snapshot: hlc(100),
+		compaction_start_hlc: hlc(102),
+		dominant_reason: crate::storage::DominantReason::Operator,
+	};
+	let worker = LsmCompactionWorker::new(
+		crate::storage::LsmConfig::default(),
+		manager.slab_pin_table(),
+	)
+	.unwrap();
+	let mut catalog = TableSchemaCatalog::default();
+	catalog.upsert(tenant(), descriptor).unwrap();
+	let prepared = manager
+		.prepare_lsm_compaction_outputs_with_table_schemas(&worker, &plan, &catalog)
+		.await
+		.unwrap();
+	assert_eq!(
+		crate::storage::survivor_records(&prepared.decisions).len(),
+		expected_survivors,
+		"planner decisions: {:?}",
+		prepared.decisions
+	);
+	let frames = manager
+		.read_lsm_single_row_source_frames(&plan)
+		.await
+		.unwrap();
+	let written = manager
+		.write_lsm_compaction_temp_outputs_with_table_schemas(
+			&plan,
+			&prepared,
+			&frames,
+			Some(&catalog),
+		)
+		.await
+		.unwrap();
+	manager
+		.lsm_single_row_bridge_digest_summary(&plan, &prepared, &written, &frames)
+		.await
+		.expect("the retained visibility domain must match");
+}
+
+#[tokio::test]
+async fn dc123_below_floor_tombstone_pair_elides_together() {
+	dc123_append_only_tombstone_pair(hlc(2), 0).await;
+}
+
+#[tokio::test]
+async fn dc123_above_floor_tombstone_keeps_covered_version() {
+	dc123_append_only_tombstone_pair(hlc(101), 2).await;
+}
+
+#[tokio::test]
+async fn dc123_pk_boundary_is_preserved_when_key_spans_the_plan() {
+	let dir = fresh_dir("dc123-pk-plan-boundary");
+	let manager = initialize_manager_at_dir(
+		dir.to_path_buf(),
+		spawn_io_thread(64).unwrap(),
+		test_crypto(),
+	)
+	.await;
+	let table = adr0097_colocated_table_descriptor_for_test();
+	let key = append_attributed_multirow_frame_for_test(&manager, &table, &[1], hlc(10)).await[0];
+	append_attributed_multirow_frame_for_test(&manager, &table, &[1], hlc(20)).await;
+	let input = manager.force_seal_active_for_test().await;
+	append_attributed_multirow_frame_for_test(&manager, &table, &[1], hlc(30)).await;
+	let snapshot = manager.compaction_manifest_snapshot();
+	let plan = CompactionPlan {
+		job_id: CompactionJobId::new(0xd127),
+		source_level: CompactionLevelIndex::L0,
+		target_level: CompactionLevelIndex::L1,
+		manifest_epoch_pre: snapshot.manifest_epoch,
+		input_slabs: vec![input],
+		overlapping_slabs: Vec::new(),
+		retention_floor_snapshot: hlc(25),
+		compaction_start_hlc: hlc(31),
+		dominant_reason: crate::storage::DominantReason::Operator,
+	};
+	let worker = LsmCompactionWorker::new(
+		crate::storage::LsmConfig::default(),
+		manager.slab_pin_table(),
+	)
+	.unwrap();
+	let mut catalog = TableSchemaCatalog::default();
+	catalog.upsert(tenant(), table).unwrap();
+	let prepared = manager
+		.prepare_lsm_compaction_outputs_with_table_schemas(&worker, &plan, &catalog)
+		.await
+		.unwrap();
+	let survivors = crate::storage::survivor_records(&prepared.decisions);
+	assert_eq!(
+		prepared.decisions.len(),
+		2,
+		"the outside-plan version must not enter planner input"
+	);
+	assert_eq!(survivors.len(), 1);
+	assert_eq!(survivors[0].row_key_id, key);
+	assert_eq!(
+		survivors[0].row_hlc,
+		hlc(20),
+		"the latest below-floor PK boundary must survive"
+	);
+	let frames = manager
+		.read_lsm_single_row_source_frames(&plan)
+		.await
+		.unwrap();
+	let written = manager
+		.write_lsm_compaction_temp_outputs_with_table_schemas(
+			&plan,
+			&prepared,
+			&frames,
+			Some(&catalog),
+		)
+		.await
+		.unwrap();
+	manager
+		.lsm_single_row_bridge_digest_summary(&plan, &prepared, &written, &frames)
+		.await
+		.expect("the retained PK boundary must have equal digests");
+}
+
+#[tokio::test]
+async fn dc123_wrongly_dropped_pk_boundary_with_newer_version_is_refused() {
+	let dir = fresh_dir("dc123-dropped-pk-boundary");
+	let manager = initialize_manager_at_dir(
+		dir.to_path_buf(),
+		spawn_io_thread(64).unwrap(),
+		test_crypto(),
+	)
+	.await;
+	let table = adr0097_colocated_table_descriptor_for_test();
+	append_attributed_multirow_frame_for_test(&manager, &table, &[1], hlc(20)).await;
+	append_attributed_multirow_frame_for_test(&manager, &table, &[1], hlc(30)).await;
+	let input = manager.force_seal_active_for_test().await;
+	let snapshot = manager.compaction_manifest_snapshot();
+	let plan = CompactionPlan {
+		job_id: CompactionJobId::new(0xd128),
+		source_level: CompactionLevelIndex::L0,
+		target_level: CompactionLevelIndex::L1,
+		manifest_epoch_pre: snapshot.manifest_epoch,
+		input_slabs: vec![input],
+		overlapping_slabs: Vec::new(),
+		retention_floor_snapshot: hlc(25),
+		compaction_start_hlc: hlc(31),
+		dominant_reason: crate::storage::DominantReason::Operator,
+	};
+	let worker = LsmCompactionWorker::new(
+		crate::storage::LsmConfig::default(),
+		manager.slab_pin_table(),
+	)
+	.unwrap();
+	let mut catalog = TableSchemaCatalog::default();
+	catalog.upsert(tenant(), table).unwrap();
+	let mut prepared = manager
+		.prepare_lsm_compaction_outputs_with_table_schemas(&worker, &plan, &catalog)
+		.await
+		.unwrap();
+	assert_eq!(
+		crate::storage::survivor_records(&prepared.decisions).len(),
+		2,
+		"both PK versions are observable after the floor"
+	);
+	for decision in &mut prepared.decisions {
+		if let crate::storage::SurvivorOrDrop::Survivor(record) = decision {
+			if record.row_hlc == hlc(20) {
+				*decision = crate::storage::SurvivorOrDrop::Drop {
+					record: record.clone(),
+					reason: crate::storage::DropReason::PkPrefix,
+				};
+			}
+		}
+	}
+	for run in &mut prepared.output_runs {
+		run.rows.retain(|record| record.row_hlc != hlc(20));
+	}
+	let frames = manager
+		.read_lsm_single_row_source_frames(&plan)
+		.await
+		.unwrap();
+	let written = manager
+		.write_lsm_compaction_temp_outputs_with_table_schemas(
+			&plan,
+			&prepared,
+			&frames,
+			Some(&catalog),
+		)
+		.await
+		.unwrap();
+	assert!(
+		manager
+			.lsm_single_row_bridge_digest_summary(&plan, &prepared, &written, &frames)
+			.await
+			.is_err(),
+		"a missing below-floor PK boundary must be refused even with a newer version"
+	);
+}
+
+async fn dc123_written_output_integrity_control(change_value: bool) {
+	let dir = fresh_dir("dc123-output-integrity");
+	let manager = initialize_manager_at_dir(
+		dir.to_path_buf(),
+		spawn_io_thread(64).unwrap(),
+		test_crypto(),
+	)
+	.await;
+	let table_id = TableObjectId::new([0xd3; 16]);
+	let descriptor = append_only_retention_descriptor(table_id);
+	let key = id(0xd129);
+	let original = encode_test_append_only_storage_frame(
+		table_id,
+		&[(key, Locality::new(29), hlc(101), 7, false)],
+	);
+	let entries = storage_multirow_index_entries_from_frame(&original)
+		.unwrap()
+		.unwrap();
+	manager
+		.append_durable_multirow_with_locality(tenant(), &original, &entries)
+		.await
+		.unwrap();
+	let input = manager.force_seal_active_for_test().await;
+	let snapshot = manager.compaction_manifest_snapshot();
+	let plan = CompactionPlan {
+		job_id: CompactionJobId::new(0xd129),
+		source_level: CompactionLevelIndex::L0,
+		target_level: CompactionLevelIndex::L1,
+		manifest_epoch_pre: snapshot.manifest_epoch,
+		input_slabs: vec![input],
+		overlapping_slabs: Vec::new(),
+		retention_floor_snapshot: hlc(100),
+		compaction_start_hlc: hlc(102),
+		dominant_reason: crate::storage::DominantReason::Operator,
+	};
+	let worker = LsmCompactionWorker::new(
+		crate::storage::LsmConfig::default(),
+		manager.slab_pin_table(),
+	)
+	.unwrap();
+	let mut catalog = TableSchemaCatalog::default();
+	catalog.upsert(tenant(), descriptor).unwrap();
+	let prepared = manager
+		.prepare_lsm_compaction_outputs_with_table_schemas(&worker, &plan, &catalog)
+		.await
+		.unwrap();
+	let frames = manager
+		.read_lsm_single_row_source_frames(&plan)
+		.await
+		.unwrap();
+	assert_eq!(frames.len(), 1);
+	let mut written_frames = frames.clone();
+	if change_value {
+		written_frames[0].frame = Arc::new(encode_test_append_only_storage_frame(
+			table_id,
+			&[(key, Locality::new(29), hlc(101), 8, false)],
+		));
+	}
+	let mut written = manager
+		.write_lsm_compaction_temp_outputs_with_table_schemas(
+			&plan,
+			&prepared,
+			&written_frames,
+			Some(&catalog),
+		)
+		.await
+		.unwrap();
+	assert_eq!(written.len(), 1);
+	assert_eq!(written[0].locations.len(), 1);
+	if !change_value {
+		written[0].locations[0].is_tombstone = true;
+	}
+	assert!(
+		manager
+			.lsm_single_row_bridge_digest_summary(&plan, &prepared, &written, &frames)
+			.await
+			.is_err(),
+		"a changed value or tombstone flag in the output must be refused"
+	);
+}
+
+#[tokio::test]
+async fn dc123_changed_value_at_same_hlc_is_refused() {
+	dc123_written_output_integrity_control(true).await;
+}
+
+#[tokio::test]
+async fn dc123_output_tombstone_flag_flip_is_refused() {
+	dc123_written_output_integrity_control(false).await;
+}
+
+#[tokio::test]
+async fn dc125_lsm_output_preserves_partitioned_row_location() {
+	let dir = fresh_dir("dc125-lsm-location-partition");
+	let manager = initialize_manager_at_dir(
+		dir.to_path_buf(),
+		spawn_io_thread(64).unwrap(),
+		test_crypto(),
+	)
+	.await;
+	let table = adr0097_colocated_table_descriptor_for_test();
+	let key = append_attributed_multirow_frame_for_test(&manager, &table, &[1], hlc(10)).await[0];
+	append_attributed_multirow_frame_for_test(&manager, &table, &[1], hlc(20)).await;
+	let input = manager.force_seal_active_for_test().await;
+	append_attributed_multirow_frame_for_test(&manager, &table, &[1], hlc(30)).await;
+	let snapshot = manager.compaction_manifest_snapshot();
+	let plan = CompactionPlan {
+		job_id: CompactionJobId::new(0xd127),
+		source_level: CompactionLevelIndex::L0,
+		target_level: CompactionLevelIndex::L1,
+		manifest_epoch_pre: snapshot.manifest_epoch,
+		input_slabs: vec![input],
+		overlapping_slabs: Vec::new(),
+		retention_floor_snapshot: hlc(25),
+		compaction_start_hlc: hlc(31),
+		dominant_reason: crate::storage::DominantReason::Operator,
+	};
+	let worker = LsmCompactionWorker::new(
+		crate::storage::LsmConfig::default(),
+		manager.slab_pin_table(),
+	)
+	.unwrap();
+	let mut catalog = TableSchemaCatalog::default();
+	catalog.upsert(tenant(), table).unwrap();
+	let prepared = manager
+		.prepare_lsm_compaction_outputs_with_table_schemas(&worker, &plan, &catalog)
+		.await
+		.unwrap();
+	let survivors = crate::storage::survivor_records(&prepared.decisions);
+	assert_eq!(
+		prepared.decisions.len(),
+		2,
+		"the outside-plan version must not enter planner input"
+	);
+	assert_eq!(survivors.len(), 1);
+	assert_eq!(survivors[0].row_key_id, key);
+	assert_eq!(
+		survivors[0].row_hlc,
+		hlc(20),
+		"the latest below-floor PK boundary must survive"
+	);
+	let frames = manager
+		.read_lsm_single_row_source_frames(&plan)
+		.await
+		.unwrap();
+	let written = manager
+		.write_lsm_compaction_temp_outputs_with_table_schemas(
+			&plan,
+			&prepared,
+			&frames,
+			Some(&catalog),
+		)
+		.await
+		.unwrap();
+	assert_eq!(
+		survivors[0].location.placement,
+		PlacementSemantics::Partitioned
+	);
+	assert!(survivors[0].location.partition.is_some());
+	assert_eq!(
+		written[0].locations[0].placement, survivors[0].location.placement,
+		"compaction must preserve row placement"
+	);
+	assert_eq!(
+		written[0].locations[0].partition, survivors[0].location.partition,
+		"compaction must preserve row partition"
+	);
+}
+
+#[tokio::test]
+async fn dc125_partial_multirow_output_preserves_partitioned_locations() {
+	let dir = fresh_dir("dc125-partial-multirow");
+	let crypto = test_crypto();
+	let io = spawn_io_thread(64).unwrap();
+	let manager = initialize_manager_at_dir(dir.to_path_buf(), io, crypto).await;
+	let table = adr0097_colocated_table_descriptor_for_test();
+
+	// Slab A: one physical frame holding k1, k2, k3.
+	let identities =
+		append_attributed_multirow_frame_for_test(&manager, &table, &[1, 2, 3], hlc(1_000)).await;
+	let k2 = identities[1];
+	let slab_a = manager.force_seal_active_for_test().await;
+
+	// Slab B: a newer k2. Sealed, so the plan can see it.
+	let newer = append_attributed_multirow_frame_for_test(&manager, &table, &[2], hlc(2_000)).await;
+	assert_eq!(newer[0], k2, "the newer row must supersede the same key");
+	let slab_b = manager.force_seal_active_for_test().await;
+	assert_ne!(
+		slab_a, slab_b,
+		"the fixture needs two distinct sealed slabs"
+	);
+
+	let mut catalog_tables = TableSchemaCatalog::default();
+	catalog_tables.upsert(tenant(), table.clone()).unwrap();
+
+	let snapshot = manager.compaction_manifest_snapshot();
+	let plan = CompactionPlan {
+		job_id: CompactionJobId::new(0x0097_0001),
+		source_level: CompactionLevelIndex::L0,
+		target_level: CompactionLevelIndex::L1,
+		manifest_epoch_pre: snapshot.manifest_epoch,
+		input_slabs: vec![slab_a, slab_b],
+		overlapping_slabs: Vec::new(),
+		// Above every row HLC: only versions below the floor are superseded.
+		retention_floor_snapshot: hlc(9_000),
+		compaction_start_hlc: hlc(9_001),
+		dominant_reason: crate::storage::DominantReason::Operator,
+	};
+
+	// The plan must actually drop exactly one row, or the rest proves nothing.
+	let entries = manager
+		.lsm_version_entries_for_plan_with_table_schemas(&plan, &catalog_tables)
+		.await
+		.unwrap();
+	assert_eq!(entries.len(), 4, "three frame rows plus the newer k2");
+	let decisions = crate::storage::lsm::apply_elision(entries, plan.retention_floor_snapshot);
+	let survivors = crate::storage::lsm::survivor_records(&decisions);
+	assert_eq!(
+		survivors.len(),
+		3,
+		"the older k2 is superseded; k1, k3 and the newer k2 survive"
+	);
+	let survivors_in_frame = survivors
+		.iter()
+		.filter(|record| record.location.slab_id == slab_a)
+		.count();
+	assert_eq!(
+		survivors_in_frame, 2,
+		"the fixture must reproduce the shape it guards: a three-row frame with \
+		 two survivors"
+	);
+
+	let worker = LsmCompactionWorker::new(
+		crate::storage::LsmConfig::default(),
+		manager.slab_pin_table(),
+	)
+	.unwrap();
+	let prepared = manager
+		.prepare_lsm_compaction_outputs_with_table_schemas(&worker, &plan, &catalog_tables)
+		.await
+		.unwrap();
+	let source_frames = manager
+		.read_lsm_single_row_source_frames(&plan)
+		.await
+		.unwrap();
+	let written = manager
+		.write_lsm_compaction_temp_outputs_with_table_schemas(
+			&plan,
+			&prepared,
+			&source_frames,
+			Some(&catalog_tables),
+		)
+		.await
+		.unwrap();
+
+	let mut count = 0;
+	for (planned, output) in prepared.output_runs.iter().zip(&written) {
+		for (row, location) in planned.rows.iter().zip(&output.locations) {
+			assert_eq!(row.location.placement, PlacementSemantics::Partitioned);
+			assert!(row.location.partition.is_some());
+			assert_eq!(
+				(location.placement, location.partition),
+				(row.location.placement, row.location.partition),
+				"rewritten row must retain its placement"
+			);
+			count += 1;
+		}
+	}
+	assert_eq!(count, 3);
+}
+
+#[tokio::test]
+async fn dc125_opaque_output_preserves_supplied_location_metadata() {
+	let dir = fresh_dir("dc125-opaque-placement");
+	let crypto = test_crypto();
+	let io = spawn_io_thread(64).unwrap();
+	let manager = initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	let keys = [id(0xd121), id(0xd122)];
+	manager
+		.append_durable(tenant(), keys[0], hlc(1), b"one")
+		.await
+		.unwrap();
+	let first = manager.force_seal_active_for_test().await;
+	manager
+		.append_durable(tenant(), keys[1], hlc(2), b"two")
+		.await
+		.unwrap();
+	let second = manager.force_seal_active_for_test().await;
+	let snapshot = manager.compaction_manifest_snapshot();
+	let plan = CompactionPlan {
+		job_id: CompactionJobId::new(0xd121),
+		source_level: CompactionLevelIndex::L0,
+		target_level: CompactionLevelIndex::L1,
+		manifest_epoch_pre: snapshot.manifest_epoch,
+		input_slabs: vec![first, second],
+		overlapping_slabs: Vec::new(),
+		retention_floor_snapshot: hlc(100),
+		compaction_start_hlc: hlc(101),
+		dominant_reason: crate::storage::DominantReason::Operator,
+	};
+	let worker = LsmCompactionWorker::new(
+		crate::storage::LsmConfig::default(),
+		manager.slab_pin_table(),
+	)
+	.unwrap();
+	let mut prepared = manager
+		.prepare_lsm_compaction_outputs(&worker, &plan)
+		.await
+		.unwrap();
+	let mut frames = manager
+		.read_lsm_single_row_source_frames(&plan)
+		.await
+		.unwrap();
+	// Constructed writer input: opaque frames have no row-level partition metadata.
+	let partition = crate::schema::PartitionId::new(0x00AB_0000_0000_0000);
+	for run in &mut prepared.output_runs {
+		for row in &mut run.rows {
+			row.location.placement = PlacementSemantics::Partitioned;
+			row.location.partition = Some(partition);
+		}
+	}
+	for frame in &mut frames {
+		frame.entry.location.placement = PlacementSemantics::Partitioned;
+		frame.entry.location.partition = Some(partition);
+	}
+	let written = manager
+		.write_lsm_compaction_temp_outputs(&plan, &prepared, &frames)
+		.await
+		.unwrap();
+	assert!(!written.is_empty());
+	for output in &written {
+		for location in &output.locations {
+			assert_eq!(location.placement, PlacementSemantics::Partitioned);
+			assert_eq!(location.partition, Some(partition));
+		}
+	}
+}
+
+#[tokio::test]
+async fn dc124_visible_covered_value_loss_is_refused_by_bridge() {
+	let dir = fresh_dir("dc124-bridge-covered-value");
+	let manager = initialize_manager_at_dir(
+		dir.to_path_buf(),
+		spawn_io_thread(64).unwrap(),
+		test_crypto(),
+	)
+	.await;
+	let table_id = TableObjectId::new([0xd2; 16]);
+	let descriptor = append_only_retention_descriptor(table_id);
+	let key = id(0xd126);
+	let frame = encode_test_append_only_storage_frame(
+		table_id,
+		&[(key, Locality::new(26), hlc(1), 7, false)],
+	);
+	let entries = storage_multirow_index_entries_from_frame(&frame)
+		.unwrap()
+		.unwrap();
+	manager
+		.append_durable_multirow_with_locality(tenant(), &frame, &entries)
+		.await
+		.unwrap();
+	let (tombstone, entries) =
+		encode_test_row_tombstone_marker_frame(table_id, key, Locality::new(26), hlc(101));
+	manager
+		.append_durable_multirow_with_locality(tenant(), &tombstone, &entries)
+		.await
+		.unwrap();
+	let input = manager.force_seal_active_for_test().await;
+	let snapshot = manager.compaction_manifest_snapshot();
+	let plan = CompactionPlan {
+		job_id: CompactionJobId::new(0xd126),
+		source_level: CompactionLevelIndex::L0,
+		target_level: CompactionLevelIndex::L1,
+		manifest_epoch_pre: snapshot.manifest_epoch,
+		input_slabs: vec![input],
+		overlapping_slabs: Vec::new(),
+		retention_floor_snapshot: hlc(100),
+		compaction_start_hlc: hlc(102),
+		dominant_reason: crate::storage::DominantReason::Operator,
+	};
+	let worker = LsmCompactionWorker::new(
+		crate::storage::LsmConfig::default(),
+		manager.slab_pin_table(),
+	)
+	.unwrap();
+	let mut catalog = TableSchemaCatalog::default();
+	catalog.upsert(tenant(), descriptor).unwrap();
+	let mut prepared = manager
+		.prepare_lsm_compaction_outputs_with_table_schemas(&worker, &plan, &catalog)
+		.await
+		.unwrap();
+	// The old planner already drops the value; if repaired, forge that same
+	// incorrect decision so this remains a bridge regression control.
+	for decision in &mut prepared.decisions {
+		if let crate::storage::SurvivorOrDrop::Survivor(record) = decision {
+			if record.row_hlc == hlc(1) {
+				*decision = crate::storage::SurvivorOrDrop::Drop {
+					record: record.clone(),
+					reason: crate::storage::DropReason::Retention,
+				};
+			}
+		}
+	}
+	for run in &mut prepared.output_runs {
+		run.rows.retain(|row| row.row_hlc != hlc(1));
+	}
+	prepared.output_runs.retain(|run| !run.rows.is_empty());
+	assert_eq!(
+		crate::storage::survivor_records(&prepared.decisions).len(),
+		1
+	);
+
+	let frames = manager
+		.read_lsm_single_row_source_frames(&plan)
+		.await
+		.unwrap();
+	let written = manager
+		.write_lsm_compaction_temp_outputs_with_table_schemas(
+			&plan,
+			&prepared,
+			&frames,
+			Some(&catalog),
+		)
+		.await
+		.unwrap();
+	assert!(
+		matches!(
+			manager
+				.lsm_single_row_bridge_digest_summary(&plan, &prepared, &written, &frames)
+				.await,
+			Err(CompactionFailure::VisibleDigestInvariance)
+		),
+		"a missing value visible between floor and tombstone must be refused"
+	);
+}
+
+#[tokio::test]
+async fn dc123_omitted_input_decision_is_refused() {
+	let dir = fresh_dir("dc123-omitted-input-decision");
+	let manager = initialize_manager_at_dir(
+		dir.to_path_buf(),
+		spawn_io_thread(64).unwrap(),
+		test_crypto(),
+	)
+	.await;
+	let table = adr0097_colocated_table_descriptor_for_test();
+	append_attributed_multirow_frame_for_test(&manager, &table, &[1], hlc(20)).await;
+	append_attributed_multirow_frame_for_test(&manager, &table, &[1], hlc(30)).await;
+	let input = manager.force_seal_active_for_test().await;
+	let snapshot = manager.compaction_manifest_snapshot();
+	let plan = CompactionPlan {
+		job_id: CompactionJobId::new(0xd128),
+		source_level: CompactionLevelIndex::L0,
+		target_level: CompactionLevelIndex::L1,
+		manifest_epoch_pre: snapshot.manifest_epoch,
+		input_slabs: vec![input],
+		overlapping_slabs: Vec::new(),
+		retention_floor_snapshot: hlc(25),
+		compaction_start_hlc: hlc(31),
+		dominant_reason: crate::storage::DominantReason::Operator,
+	};
+	let worker = LsmCompactionWorker::new(
+		crate::storage::LsmConfig::default(),
+		manager.slab_pin_table(),
+	)
+	.unwrap();
+	let mut catalog = TableSchemaCatalog::default();
+	catalog.upsert(tenant(), table).unwrap();
+	let mut prepared = manager
+		.prepare_lsm_compaction_outputs_with_table_schemas(&worker, &plan, &catalog)
+		.await
+		.unwrap();
+	assert_eq!(
+		crate::storage::survivor_records(&prepared.decisions).len(),
+		2,
+		"both PK versions are observable after the floor"
+	);
+	prepared.decisions.retain(|decision| match decision {
+		crate::storage::SurvivorOrDrop::Survivor(row)
+		| crate::storage::SurvivorOrDrop::Drop { record: row, .. } => row.row_hlc != hlc(20),
+	});
+	for run in &mut prepared.output_runs {
+		run.rows.retain(|record| record.row_hlc != hlc(20));
+	}
+	let frames = manager
+		.read_lsm_single_row_source_frames(&plan)
+		.await
+		.unwrap();
+	let written = manager
+		.write_lsm_compaction_temp_outputs_with_table_schemas(
+			&plan,
+			&prepared,
+			&frames,
+			Some(&catalog),
+		)
+		.await
+		.unwrap();
+	assert!(
+		manager
+			.lsm_single_row_bridge_digest_summary(&plan, &prepared, &written, &frames)
+			.await
+			.is_err(),
+		"omitting an input decision must be refused"
+	);
+}
+
+#[tokio::test]
+async fn dc123_ambiguous_value_with_typed_tombstone_cannot_resurrect() {
+	let dir = fresh_dir("dc123-ambiguous-value-typed-tombstone");
+	let manager = initialize_manager_at_dir(
+		dir.to_path_buf(),
+		spawn_io_thread(64).unwrap(),
+		test_crypto(),
+	)
+	.await;
+	let table_id = TableObjectId::new([0xd2; 16]);
+	let descriptor = append_only_retention_descriptor(table_id);
+	let key = id(0xd126);
+	let frame = encode_test_append_only_storage_frame(
+		table_id,
+		&[(key, Locality::new(26), hlc(1), 7, false)],
+	);
+	let entries = storage_multirow_index_entries_from_frame(&frame)
+		.unwrap()
+		.unwrap();
+	manager
+		.append_durable_multirow_with_locality(tenant(), &frame, &entries)
+		.await
+		.unwrap();
+	let (tombstone, entries) =
+		encode_test_row_tombstone_marker_frame(table_id, key, Locality::new(26), hlc(2));
+	manager
+		.append_durable_multirow_with_locality(tenant(), &tombstone, &entries)
+		.await
+		.unwrap();
+	let input = manager.force_seal_active_for_test().await;
+	let snapshot = manager.compaction_manifest_snapshot();
+	let plan = CompactionPlan {
+		job_id: CompactionJobId::new(0xd126),
+		source_level: CompactionLevelIndex::L0,
+		target_level: CompactionLevelIndex::L1,
+		manifest_epoch_pre: snapshot.manifest_epoch,
+		input_slabs: vec![input],
+		overlapping_slabs: Vec::new(),
+		retention_floor_snapshot: hlc(100),
+		compaction_start_hlc: hlc(102),
+		dominant_reason: crate::storage::DominantReason::Operator,
+	};
+	let worker = LsmCompactionWorker::new(
+		crate::storage::LsmConfig::default(),
+		manager.slab_pin_table(),
+	)
+	.unwrap();
+	let mut catalog = TableSchemaCatalog::default();
+	catalog.upsert(tenant(), descriptor).unwrap();
+	// Allocate an output template without allowing the planner to elide the
+	// pair; the proof below still evaluates the injected plan at floor 100.
+	let mut allocation_plan = plan.clone();
+	allocation_plan.retention_floor_snapshot = hlc(0);
+	let mut prepared = manager
+		.prepare_lsm_compaction_outputs_with_table_schemas(&worker, &allocation_plan, &catalog)
+		.await
+		.unwrap();
+	let records = prepared
+		.decisions
+		.iter()
+		.map(|decision| match decision {
+			crate::storage::SurvivorOrDrop::Survivor(row)
+			| crate::storage::SurvivorOrDrop::Drop { record: row, .. } => row.clone(),
+		})
+		.collect::<Vec<_>>();
+	let mut value = records
+		.iter()
+		.find(|row| !row.location.is_tombstone)
+		.unwrap()
+		.clone();
+	value.lifecycle = VersionLifecycle::AmbiguousTable;
+	let mut tombstone = records
+		.iter()
+		.find(|row| row.location.is_tombstone)
+		.unwrap()
+		.clone();
+	tombstone.lifecycle = VersionLifecycle::AppendOnly;
+	prepared.decisions = vec![
+		crate::storage::SurvivorOrDrop::Survivor(value.clone()),
+		crate::storage::SurvivorOrDrop::Drop {
+			record: tombstone,
+			reason: crate::storage::DropReason::TombstonePair,
+		},
+	];
+	assert_eq!(prepared.output_runs.len(), 1);
+	prepared.output_runs[0].rows = vec![value];
+	let frames = manager
+		.read_lsm_single_row_source_frames(&plan)
+		.await
+		.unwrap();
+	let written = manager
+		.write_lsm_compaction_temp_outputs_with_table_schemas(
+			&plan,
+			&prepared,
+			&frames,
+			Some(&catalog),
+		)
+		.await
+		.unwrap();
+	assert!(
+		matches!(
+			manager
+				.lsm_single_row_bridge_digest_summary(&plan, &prepared, &written, &frames)
+				.await,
+			Err(CompactionFailure::VisibleDigestInvariance)
+		),
+		"dropping a typed tombstone must not resurrect an ambiguous older value"
+	);
+}
+
+#[tokio::test]
+async fn dc123_preserved_ambiguous_value_and_tombstone_are_accepted() {
+	let dir = fresh_dir("dc123-ambiguous-group-preserved");
+	let manager = initialize_manager_at_dir(
+		dir.to_path_buf(),
+		spawn_io_thread(64).unwrap(),
+		test_crypto(),
+	)
+	.await;
+	let table_id = TableObjectId::new([0xd2; 16]);
+	let descriptor = append_only_retention_descriptor(table_id);
+	let key = id(0xd126);
+	let frame = encode_test_append_only_storage_frame(
+		table_id,
+		&[(key, Locality::new(26), hlc(1), 7, false)],
+	);
+	let entries = storage_multirow_index_entries_from_frame(&frame)
+		.unwrap()
+		.unwrap();
+	manager
+		.append_durable_multirow_with_locality(tenant(), &frame, &entries)
+		.await
+		.unwrap();
+	let (tombstone, entries) =
+		encode_test_row_tombstone_marker_frame(table_id, key, Locality::new(26), hlc(2));
+	manager
+		.append_durable_multirow_with_locality(tenant(), &tombstone, &entries)
+		.await
+		.unwrap();
+	let input = manager.force_seal_active_for_test().await;
+	let snapshot = manager.compaction_manifest_snapshot();
+	let plan = CompactionPlan {
+		job_id: CompactionJobId::new(0xd126),
+		source_level: CompactionLevelIndex::L0,
+		target_level: CompactionLevelIndex::L1,
+		manifest_epoch_pre: snapshot.manifest_epoch,
+		input_slabs: vec![input],
+		overlapping_slabs: Vec::new(),
+		retention_floor_snapshot: hlc(100),
+		compaction_start_hlc: hlc(102),
+		dominant_reason: crate::storage::DominantReason::Operator,
+	};
+	let worker = LsmCompactionWorker::new(
+		crate::storage::LsmConfig::default(),
+		manager.slab_pin_table(),
+	)
+	.unwrap();
+	let mut catalog = TableSchemaCatalog::default();
+	catalog.upsert(tenant(), descriptor).unwrap();
+	// Allocate an output template without allowing the planner to elide the
+	// pair; the proof below still evaluates the injected plan at floor 100.
+	let mut allocation_plan = plan.clone();
+	allocation_plan.retention_floor_snapshot = hlc(0);
+	let mut prepared = manager
+		.prepare_lsm_compaction_outputs_with_table_schemas(&worker, &allocation_plan, &catalog)
+		.await
+		.unwrap();
+	let records = prepared
+		.decisions
+		.iter()
+		.map(|decision| match decision {
+			crate::storage::SurvivorOrDrop::Survivor(row)
+			| crate::storage::SurvivorOrDrop::Drop { record: row, .. } => row.clone(),
+		})
+		.collect::<Vec<_>>();
+	let mut value = records
+		.iter()
+		.find(|row| !row.location.is_tombstone)
+		.unwrap()
+		.clone();
+	value.lifecycle = VersionLifecycle::AmbiguousTable;
+	let mut tombstone = records
+		.iter()
+		.find(|row| row.location.is_tombstone)
+		.unwrap()
+		.clone();
+	tombstone.lifecycle = VersionLifecycle::AppendOnly;
+	prepared.decisions = vec![
+		crate::storage::SurvivorOrDrop::Survivor(value.clone()),
+		crate::storage::SurvivorOrDrop::Survivor(tombstone.clone()),
+	];
+	assert_eq!(prepared.output_runs.len(), 1);
+	prepared.output_runs[0].rows = vec![value, tombstone];
+	let frames = manager
+		.read_lsm_single_row_source_frames(&plan)
+		.await
+		.unwrap();
+	let written = manager
+		.write_lsm_compaction_temp_outputs_with_table_schemas(
+			&plan,
+			&prepared,
+			&frames,
+			Some(&catalog),
+		)
+		.await
+		.unwrap();
+	assert!(
+		manager
+			.lsm_single_row_bridge_digest_summary(&plan, &prepared, &written, &frames)
+			.await
+			.is_ok(),
+		"a fully preserved ambiguous group must be accepted"
+	);
+}
+
+#[tokio::test]
+async fn dc123_mixed_exact_lifecycles_cannot_drop_visible_value() {
+	let dir = fresh_dir("dc123-mixed-exact-drop");
+	let manager = initialize_manager_at_dir(
+		dir.to_path_buf(),
+		spawn_io_thread(64).unwrap(),
+		test_crypto(),
+	)
+	.await;
+	let table_id = TableObjectId::new([0xd2; 16]);
+	let descriptor = append_only_retention_descriptor(table_id);
+	let key = id(0xd126);
+	let frame = encode_test_append_only_storage_frame(
+		table_id,
+		&[(key, Locality::new(26), hlc(1), 7, false)],
+	);
+	let entries = storage_multirow_index_entries_from_frame(&frame)
+		.unwrap()
+		.unwrap();
+	manager
+		.append_durable_multirow_with_locality(tenant(), &frame, &entries)
+		.await
+		.unwrap();
+	let (tombstone, entries) =
+		encode_test_row_tombstone_marker_frame(table_id, key, Locality::new(26), hlc(101));
+	manager
+		.append_durable_multirow_with_locality(tenant(), &tombstone, &entries)
+		.await
+		.unwrap();
+	let input = manager.force_seal_active_for_test().await;
+	let snapshot = manager.compaction_manifest_snapshot();
+	let plan = CompactionPlan {
+		job_id: CompactionJobId::new(0xd126),
+		source_level: CompactionLevelIndex::L0,
+		target_level: CompactionLevelIndex::L1,
+		manifest_epoch_pre: snapshot.manifest_epoch,
+		input_slabs: vec![input],
+		overlapping_slabs: Vec::new(),
+		retention_floor_snapshot: hlc(100),
+		compaction_start_hlc: hlc(102),
+		dominant_reason: crate::storage::DominantReason::Operator,
+	};
+	let worker = LsmCompactionWorker::new(
+		crate::storage::LsmConfig::default(),
+		manager.slab_pin_table(),
+	)
+	.unwrap();
+	let mut catalog = TableSchemaCatalog::default();
+	catalog.upsert(tenant(), descriptor).unwrap();
+	let mut prepared = manager
+		.prepare_lsm_compaction_outputs_with_table_schemas(&worker, &plan, &catalog)
+		.await
+		.unwrap();
+	let records = prepared
+		.decisions
+		.iter()
+		.map(|decision| match decision {
+			crate::storage::SurvivorOrDrop::Survivor(row)
+			| crate::storage::SurvivorOrDrop::Drop { record: row, .. } => row.clone(),
+		})
+		.collect::<Vec<_>>();
+	let mut value = records
+		.iter()
+		.find(|row| !row.location.is_tombstone)
+		.unwrap()
+		.clone();
+	value.lifecycle = VersionLifecycle::AppendOnly;
+	let mut tombstone = records
+		.iter()
+		.find(|row| row.location.is_tombstone)
+		.unwrap()
+		.clone();
+	tombstone.lifecycle = VersionLifecycle::PrimaryKey;
+	prepared.decisions = vec![
+		crate::storage::SurvivorOrDrop::Drop {
+			record: value,
+			reason: crate::storage::DropReason::Retention,
+		},
+		crate::storage::SurvivorOrDrop::Survivor(tombstone.clone()),
+	];
+	assert_eq!(prepared.output_runs.len(), 1);
+	prepared.output_runs[0].rows = vec![tombstone];
+	let frames = manager
+		.read_lsm_single_row_source_frames(&plan)
+		.await
+		.unwrap();
+	let written = manager
+		.write_lsm_compaction_temp_outputs_with_table_schemas(
+			&plan,
+			&prepared,
+			&frames,
+			Some(&catalog),
+		)
+		.await
+		.unwrap();
+	assert!(
+		matches!(
+			manager
+				.lsm_single_row_bridge_digest_summary(&plan, &prepared, &written, &frames)
+				.await,
+			Err(CompactionFailure::VisibleDigestInvariance)
+		),
+		"mixed exact lifecycle classes must not erase a visible value"
+	);
+}
+
+#[tokio::test]
+async fn dc123_preserved_mixed_exact_lifecycles_are_accepted() {
+	let dir = fresh_dir("dc123-mixed-exact-preserved");
+	let manager = initialize_manager_at_dir(
+		dir.to_path_buf(),
+		spawn_io_thread(64).unwrap(),
+		test_crypto(),
+	)
+	.await;
+	let table_id = TableObjectId::new([0xd2; 16]);
+	let descriptor = append_only_retention_descriptor(table_id);
+	let key = id(0xd126);
+	let frame = encode_test_append_only_storage_frame(
+		table_id,
+		&[(key, Locality::new(26), hlc(1), 7, false)],
+	);
+	let entries = storage_multirow_index_entries_from_frame(&frame)
+		.unwrap()
+		.unwrap();
+	manager
+		.append_durable_multirow_with_locality(tenant(), &frame, &entries)
+		.await
+		.unwrap();
+	let (tombstone, entries) =
+		encode_test_row_tombstone_marker_frame(table_id, key, Locality::new(26), hlc(101));
+	manager
+		.append_durable_multirow_with_locality(tenant(), &tombstone, &entries)
+		.await
+		.unwrap();
+	let input = manager.force_seal_active_for_test().await;
+	let snapshot = manager.compaction_manifest_snapshot();
+	let plan = CompactionPlan {
+		job_id: CompactionJobId::new(0xd126),
+		source_level: CompactionLevelIndex::L0,
+		target_level: CompactionLevelIndex::L1,
+		manifest_epoch_pre: snapshot.manifest_epoch,
+		input_slabs: vec![input],
+		overlapping_slabs: Vec::new(),
+		retention_floor_snapshot: hlc(100),
+		compaction_start_hlc: hlc(102),
+		dominant_reason: crate::storage::DominantReason::Operator,
+	};
+	let worker = LsmCompactionWorker::new(
+		crate::storage::LsmConfig::default(),
+		manager.slab_pin_table(),
+	)
+	.unwrap();
+	let mut catalog = TableSchemaCatalog::default();
+	catalog.upsert(tenant(), descriptor).unwrap();
+	let mut prepared = manager
+		.prepare_lsm_compaction_outputs_with_table_schemas(&worker, &plan, &catalog)
+		.await
+		.unwrap();
+	let records = prepared
+		.decisions
+		.iter()
+		.map(|decision| match decision {
+			crate::storage::SurvivorOrDrop::Survivor(row)
+			| crate::storage::SurvivorOrDrop::Drop { record: row, .. } => row.clone(),
+		})
+		.collect::<Vec<_>>();
+	let mut value = records
+		.iter()
+		.find(|row| !row.location.is_tombstone)
+		.unwrap()
+		.clone();
+	value.lifecycle = VersionLifecycle::AppendOnly;
+	let mut tombstone = records
+		.iter()
+		.find(|row| row.location.is_tombstone)
+		.unwrap()
+		.clone();
+	tombstone.lifecycle = VersionLifecycle::PrimaryKey;
+	prepared.decisions = vec![
+		crate::storage::SurvivorOrDrop::Survivor(value.clone()),
+		crate::storage::SurvivorOrDrop::Survivor(tombstone.clone()),
+	];
+	assert_eq!(prepared.output_runs.len(), 1);
+	prepared.output_runs[0].rows = vec![value, tombstone];
+	let frames = manager
+		.read_lsm_single_row_source_frames(&plan)
+		.await
+		.unwrap();
+	let written = manager
+		.write_lsm_compaction_temp_outputs_with_table_schemas(
+			&plan,
+			&prepared,
+			&frames,
+			Some(&catalog),
+		)
+		.await
+		.unwrap();
+	assert!(
+		manager
+			.lsm_single_row_bridge_digest_summary(&plan, &prepared, &written, &frames)
+			.await
+			.is_ok(),
+		"a fully preserved mixed-class group must be accepted"
+	);
+}
+
+#[tokio::test]
+async fn dc124_tombstone_lifecycle_requires_matching_source_identity_and_table() {
+	let dir = fresh_dir("dc124-marker-provenance");
+	let manager = initialize_manager_at_dir(
+		dir.to_path_buf(),
+		spawn_io_thread(64).unwrap(),
+		test_crypto(),
+	)
+	.await;
+	let table_id = TableObjectId::new([0xd2; 16]);
+	let descriptor = append_only_retention_descriptor(table_id);
+	let key = id(0xd126);
+	let frame = encode_test_append_only_storage_frame(
+		table_id,
+		&[(key, Locality::new(26), hlc(1), 7, false)],
+	);
+	let entries = storage_multirow_index_entries_from_frame(&frame)
+		.unwrap()
+		.unwrap();
+	manager
+		.append_durable_multirow_with_locality(tenant(), &frame, &entries)
+		.await
+		.unwrap();
+	let (tombstone, entries) =
+		encode_test_row_tombstone_marker_frame(table_id, key, Locality::new(26), hlc(101));
+	manager
+		.append_durable_multirow_with_locality(tenant(), &tombstone, &entries)
+		.await
+		.unwrap();
+	let input = manager.force_seal_active_for_test().await;
+	let snapshot = manager.compaction_manifest_snapshot();
+	let plan = CompactionPlan {
+		job_id: CompactionJobId::new(0xd126),
+		source_level: CompactionLevelIndex::L0,
+		target_level: CompactionLevelIndex::L1,
+		manifest_epoch_pre: snapshot.manifest_epoch,
+		input_slabs: vec![input],
+		overlapping_slabs: Vec::new(),
+		retention_floor_snapshot: hlc(100),
+		compaction_start_hlc: hlc(102),
+		dominant_reason: crate::storage::DominantReason::Operator,
+	};
+	let mut catalog = TableSchemaCatalog::default();
+	catalog.upsert(tenant(), descriptor).unwrap();
+	let entries = manager.lsm_version_entries_for_plan(&plan).unwrap();
+	let marker = entries
+		.iter()
+		.find(|entry| entry.location.is_tombstone)
+		.unwrap();
+	let mut wrong_table = marker.clone();
+	wrong_table.table_object_id = Some(TableObjectId::new([0xee; 16]));
+	let mut wrong_key = marker.clone();
+	wrong_key.row_key_id = id(0xdeaf);
+	let mut wrong_hlc = marker.clone();
+	wrong_hlc.row_hlc = hlc(102);
+	let mut wrong_flag = marker.clone();
+	wrong_flag.location.is_tombstone = false;
+	for entry in [&wrong_table, &wrong_key, &wrong_hlc, &wrong_flag] {
+		let result = manager
+			.lsm_version_lifecycle_for_entry(entry, &catalog)
+			.await;
+		assert!(
+			matches!(result, Ok(VersionLifecycle::AmbiguousTable) | Err(_)),
+			"invalid tombstone provenance must not receive an exact lifecycle: {result:?}"
+		);
+	}
+}
+
+#[tokio::test]
+async fn dc126_failed_same_key_sidecar_upsert_preserves_published_file() {
+	let (dir, manager) = fresh_manager().await;
+	let key = id(0xd126);
+	let location = manager
+		.append_durable(tenant(), key, hlc(1), b"published-source")
+		.await
+		.unwrap();
+	let slab_id = manager.force_seal_active_for_test().await;
+	assert_eq!(location.slab_id, slab_id);
+	let segment = segment_over_rows(slab_id, &[(key, hlc(1), 7, location)]);
+	let info = manager
+		.persist_secondary_index_segment(&segment)
+		.await
+		.unwrap();
+	let path = dir.join(&info.segment_path);
+	let before = std::fs::read(&path).unwrap();
+	manager
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.fail_next_delta
+		.store(true, std::sync::atomic::Ordering::Release);
+	let error = manager.persist_secondary_index_segment(&segment).await;
+	assert!(
+		error.is_err(),
+		"premise: the replacement row transaction failed"
+	);
+	assert_eq!(
+		std::fs::read(&path).expect("published sidecar must survive failed replacement"),
+		before
+	);
+	assert_eq!(
+		manager.load_secondary_index_segment(&info).await.unwrap(),
+		Some(segment)
+	);
+}
+
+#[tokio::test]
+async fn dc126_replacement_retains_old_sidecar_and_counts_its_bytes() {
+	let (dir, manager) = fresh_manager().await;
+	let key = id(0xd127);
+	let location = manager
+		.append_durable(tenant(), key, hlc(1), b"source")
+		.await
+		.unwrap();
+	let slab_id = manager.force_seal_active_for_test().await;
+	let segment = segment_over_rows(slab_id, &[(key, hlc(1), 7, location)]);
+	let files_before = metrics().storage_retained_secondary_sidecar_files.get();
+	let bytes_before = metrics().storage_retained_secondary_sidecar_bytes.get();
+	let old = manager
+		.persist_secondary_index_segment(&segment)
+		.await
+		.unwrap();
+	let old_path = dir.join(&old.segment_path);
+	let old_len = std::fs::metadata(&old_path).unwrap().len();
+	let current = manager
+		.persist_secondary_index_segment(&segment)
+		.await
+		.unwrap();
+	assert_ne!(old.segment_path, current.segment_path);
+	assert!(old_path.exists());
+	assert_eq!(
+		manager
+			.load_secondary_index_segment(&current)
+			.await
+			.unwrap(),
+		Some(segment)
+	);
+	assert_eq!(
+		metrics().storage_retained_secondary_sidecar_files.get(),
+		files_before + 1
+	);
+	assert_eq!(
+		metrics().storage_retained_secondary_sidecar_bytes.get(),
+		bytes_before + old_len
+	);
+}
+
+struct GcPauseAfterRemoveCommit {
+	manager: Arc<SlabManager>,
+	entered: Arc<tokio::sync::Semaphore>,
+	release: Arc<tokio::sync::Semaphore>,
+}
+
+#[async_trait]
+impl TierCommitter for GcPauseAfterRemoveCommit {
+	async fn commit_tier_slab(&self, _: crate::consensus::TieredSlab) -> std::io::Result<()> {
+		Err(Error::new(ErrorKind::Unsupported, "unused"))
+	}
+	async fn retire_tiered_slab(&self, _: SlabId) -> std::io::Result<()> {
+		Err(Error::new(ErrorKind::Unsupported, "unused"))
+	}
+	async fn commit_lsm_compaction(&self, commit: CompactionCommit) -> std::io::Result<()> {
+		self.manager
+			.apply_lsm_manifest_compaction_commit(&commit)
+			.map_err(Error::other)?;
+		if !commit.slabs_to_remove.is_empty() {
+			self.entered.add_permits(1);
+			let _ = self.release.acquire().await;
+		}
+		Ok(())
+	}
+}
+
+#[tokio::test]
+async fn gc_control_revision_mismatch_keeps_file_and_fences_reopen() {
+	let (dir, manager) = fresh_manager().await;
+	seed_lsm_relocation_fixture(&manager).await;
+	let worker = LsmCompactionWorker::new(LsmConfig::default(), manager.slab_pin_table()).unwrap();
+	let plan = manager
+		.pick_lsm_compaction_plan(&worker, hlc(20_000))
+		.expect("LSM fixture plan");
+	let target = plan.touched_slabs()[0];
+	let direct = DirectLsmCommitter {
+		manager: manager.clone(),
+	};
+	manager
+		.run_lsm_compaction_once_via_control_ring(&worker, plan, &direct)
+		.await
+		.unwrap();
+	drop(direct);
+	let snapshot = manager.compaction_manifest_snapshot();
+	let commit = CompactionCommit::gc_mark_delete_pending(
+		CompactionJobId::new(0xdd01),
+		snapshot.manifest_epoch,
+		vec![target],
+	);
+	manager
+		.apply_lsm_manifest_compaction_commit(&commit)
+		.unwrap();
+	let marked = manager
+		.compaction_manifest_snapshot()
+		.run(target)
+		.unwrap()
+		.clone();
+	manager
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.apply(PersistentIndexUpdate {
+			put_lsm_runs: vec![marked],
+			..Default::default()
+		})
+		.await
+		.unwrap();
+	let path = slab_path(&dir, target);
+	assert!(path.exists());
+	let entered = Arc::new(tokio::sync::Semaphore::new(0));
+	let release = Arc::new(tokio::sync::Semaphore::new(0));
+	let committer = Arc::new(GcPauseAfterRemoveCommit {
+		manager: manager.clone(),
+		entered: entered.clone(),
+		release: release.clone(),
+	});
+	let gc = LsmGcWorker::new(LsmConfig::default(), manager.slab_pin_table()).unwrap();
+	let task = {
+		let manager = manager.clone();
+		let committer = committer.clone();
+		tokio::spawn(async move {
+			manager
+				.sweep_lsm_delete_pending_once_via_control_ring(&gc, committer.as_ref())
+				.await
+		})
+	};
+	tokio::time::timeout(Duration::from_secs(60), entered.acquire())
+		.await
+		.unwrap()
+		.unwrap()
+		.forget();
+	assert!(
+		path.exists(),
+		"control commit cannot release the backing before local recheck"
+	);
+	let tier_lock = manager.tier_publication_lock(target);
+	let guard = tier_lock.lock().await;
+	manager.bump_slab_publication_revision(target).unwrap();
+	drop(guard);
+	release.add_permits(1);
+	assert_eq!(
+		task.await.unwrap().unwrap_err().kind(),
+		ErrorKind::WouldBlock
+	);
+	assert!(path.exists(), "revision mismatch must keep the owned file");
+	let durable = manager
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot()
+		.await
+		.unwrap();
+	assert_eq!(durable.lsm_install_intents.len(), 1);
+	assert_eq!(
+		manager.tier_authority_readiness_reason().as_deref(),
+		Some("TierAuthorityLsmUnresolved")
+	);
+	drop(committer);
+	drop(manager);
+	let reopened = open_manager_at_dir(
+		dir.to_path_buf(),
+		spawn_io_thread(64).unwrap(),
+		test_crypto(),
+	)
+	.await;
+	assert_eq!(
+		reopened.tier_authority_readiness_reason().as_deref(),
+		Some("TierAuthorityLsmUnresolved")
+	);
+	assert!(path.exists());
+}
+
+async fn seed_small_retired_gc_slab(manager: &Arc<SlabManager>) -> (SlabId, Identity) {
+	let key = id(0xdd10);
+	let old = manager
+		.append_durable(tenant(), key, hlc(10), b"gc-survivor")
+		.await
+		.unwrap();
+	assert_eq!(manager.force_seal_active_for_test().await, old.slab_id);
+	let before = manager.compaction_manifest_snapshot();
+	let plan = CompactionPlan {
+		job_id: CompactionJobId::new(0xdd10),
+		source_level: CompactionLevelIndex::L0,
+		target_level: CompactionLevelIndex::L1,
+		manifest_epoch_pre: before.manifest_epoch,
+		input_slabs: vec![old.slab_id],
+		overlapping_slabs: Vec::new(),
+		retention_floor_snapshot: hlc(0),
+		compaction_start_hlc: hlc(20),
+		dominant_reason: crate::storage::DominantReason::Operator,
+	};
+	let worker = LsmCompactionWorker::new(LsmConfig::default(), manager.slab_pin_table()).unwrap();
+	manager
+		.run_lsm_compaction_once(&worker, plan)
+		.await
+		.unwrap();
+	assert!(
+		manager
+			.record_rows_for_slab(old.slab_id)
+			.unwrap()
+			.is_empty()
+	);
+	(old.slab_id, key)
+}
+
+#[tokio::test]
+async fn gc_keeps_superseded_sidecar_while_removing_its_current_row() {
+	let (dir, manager) = fresh_manager().await;
+	let (slab_id, key) = seed_small_retired_gc_slab(&manager).await;
+	let segment = secondary_index_segment_for_test(slab_id);
+	let old = manager
+		.persist_secondary_index_segment(&segment)
+		.await
+		.unwrap();
+	let current = manager
+		.persist_secondary_index_segment(&segment)
+		.await
+		.unwrap();
+	assert_ne!(old.segment_path, current.segment_path);
+	let old_path = dir.join(&old.segment_path);
+	let current_path = dir.join(&current.segment_path);
+	let old_bytes = std::fs::read(&old_path).unwrap();
+	let gc = LsmGcWorker::new(LsmConfig::default(), manager.slab_pin_table()).unwrap();
+	assert!(
+		manager
+			.sweep_lsm_delete_pending_once(&gc)
+			.await
+			.unwrap()
+			.contains(&slab_id)
+	);
+	assert_eq!(std::fs::read(&old_path).unwrap(), old_bytes);
+	assert!(!current_path.exists());
+	assert!(
+		manager
+			.list_secondary_index_segments_for_source_slab(slab_id)
+			.is_empty()
+	);
+	assert_eq!(
+		manager
+			.read(manager.lookup(tenant(), key).unwrap().unwrap())
+			.await
+			.unwrap(),
+		b"gc-survivor"
+	);
+}
+
+#[tokio::test]
+async fn gc_refuses_if_slab_path_no_longer_names_its_owned_handle() {
+	let (dir, manager) = fresh_manager().await;
+	let (slab_id, key) = seed_small_retired_gc_slab(&manager).await;
+	let path = slab_path(&dir, slab_id);
+	let original = path.with_extension("saved");
+	std::fs::rename(&path, &original).unwrap();
+	std::fs::write(&path, b"unrelated replacement").unwrap();
+	let gc = LsmGcWorker::new(LsmConfig::default(), manager.slab_pin_table()).unwrap();
+	assert_eq!(
+		manager
+			.sweep_lsm_delete_pending_once(&gc)
+			.await
+			.unwrap_err()
+			.kind(),
+		ErrorKind::InvalidData
+	);
+	assert_eq!(std::fs::read(&path).unwrap(), b"unrelated replacement");
+	assert!(original.exists());
+	assert!(
+		manager.lookup(tenant(), key).is_err(),
+		"uncertain GC stays fenced"
+	);
+}
+
+fn gc_owned_test_config(dir: &Path) -> SlabManagerConfig {
+	SlabManagerConfig {
+		dir: dir.to_path_buf(),
+		max_slab_bytes: 1 << 20,
+		io: spawn_io_thread(64).unwrap(),
+		l2: None,
+		rehydration: RehydrationPolicy::default(),
+		l2_column_fetch: Default::default(),
+		row_group_writer: Default::default(),
+		l2_row_group_fetch: Default::default(),
+		encoding_writer: Default::default(),
+		l2_chunk_layout: Default::default(),
+		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
+		group_commit: GroupCommitConfig::default(),
+		crypto: test_crypto(),
+	}
+}
+
+#[tokio::test]
+async fn gc_crash_steps_preserve_or_complete_deletion_on_reopen() {
+	const CHILD_DIR: &str = "WENDELON_GC_CRASH_STEP_DIR";
+	const CHILD_STEP: &str = "WENDELON_GC_CRASH_STEP_KIND";
+	if let (Some(path), Ok(step)) = (std::env::var_os(CHILD_DIR), std::env::var(CHILD_STEP)) {
+		let dir = PathBuf::from(path);
+		let owner = DataDirectoryOwner::acquire_existing(&dir).unwrap();
+		let manager =
+			SlabManager::initialize_new_store_with_owner(gc_owned_test_config(&dir), owner)
+				.await
+				.unwrap();
+		let (slab_id, _) = seed_small_retired_gc_slab(&manager).await;
+		std::fs::write(dir.join("gc-target"), slab_id.get().to_string()).unwrap();
+		let entered = Arc::new(tokio::sync::Semaphore::new(0));
+		let release = Arc::new(tokio::sync::Semaphore::new(0));
+		let hold = Some((entered.clone(), release));
+		let selected = match step.rsplit('-').next().unwrap() {
+			"preunlink" => &manager.continuity_test_holds.gc_before_unlink_hold,
+			"unlink" => &manager.continuity_test_holds.gc_after_unlink_hold,
+			"fsync" => &manager.continuity_test_holds.gc_after_fsync_hold,
+			"clear" => &manager.continuity_test_holds.gc_before_clear_hold,
+			"cleared" => &manager.continuity_test_holds.gc_after_clear_hold,
+			_ => panic!("unknown GC crash boundary"),
+		};
+		*selected.lock().unwrap() = hold;
+
+		let gc = LsmGcWorker::new(LsmConfig::default(), manager.slab_pin_table()).unwrap();
+		let control = step.starts_with("control");
+		let job = {
+			let manager = manager.clone();
+			tokio::spawn(async move {
+				if control {
+					let committer = DirectLsmCommitter {
+						manager: manager.clone(),
+					};
+					manager
+						.sweep_lsm_delete_pending_once_via_control_ring(&gc, &committer)
+						.await
+				} else {
+					manager.sweep_lsm_delete_pending_once(&gc).await
+				}
+			})
+		};
+		tokio::time::timeout(Duration::from_secs(120), entered.acquire())
+			.await
+			.unwrap()
+			.unwrap()
+			.forget();
+		assert!(!job.is_finished());
+		println!("gc crash boundary reached: {step}");
+		std::io::Write::flush(&mut std::io::stdout()).unwrap();
+		std::process::exit(0);
+	}
+	let test = concat!(
+		module_path!(),
+		"::gc_crash_steps_preserve_or_complete_deletion_on_reopen"
+	)
+	.trim_start_matches("wendelon::");
+	for kind in ["local", "control"] {
+		for boundary in ["preunlink", "unlink", "fsync", "clear", "cleared"] {
+			let dir = fresh_dir("gc-crash-boundary");
+			let step = format!("{kind}-{boundary}");
+			let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+			command
+				.args([test, "--exact", "--nocapture"])
+				.env(CHILD_DIR, dir.as_os_str())
+				.env(CHILD_STEP, &step);
+			let output =
+				crate::test_support::run_test_child(&mut command, Duration::from_secs(180))
+					.await
+					.unwrap();
+			assert!(
+				output.status.success(),
+				"{step}: {} {}",
+				String::from_utf8_lossy(&output.stdout),
+				String::from_utf8_lossy(&output.stderr)
+			);
+			assert!(
+				String::from_utf8_lossy(&output.stdout)
+					.contains(&format!("gc crash boundary reached: {step}"))
+			);
+			let slab_id = SlabId::new(
+				std::fs::read_to_string(dir.join("gc-target"))
+					.unwrap()
+					.parse()
+					.unwrap(),
+			);
+			assert_eq!(
+				slab_path(&dir, slab_id).exists(),
+				boundary == "preunlink",
+				"{step}: backing state must match the completed unlink boundary"
+			);
+			let owner = DataDirectoryOwner::acquire_existing(&dir)
+				.expect("crashed owner released its lease");
+			let manager = SlabManager::open_with_owner(gc_owned_test_config(&dir), owner.clone())
+				.await
+				.unwrap();
+			let snapshot = manager
+				.persistent_index
+				.as_ref()
+				.unwrap()
+				.load_snapshot()
+				.await
+				.unwrap();
+			assert!(
+				snapshot
+					.record_rows
+					.iter()
+					.all(|row| row.location.slab_id != slab_id)
+			);
+			if kind == "control" && boundary != "cleared" {
+				assert!(
+					!snapshot.lsm_install_intents.is_empty(),
+					"{step}: unfinished control intent survives"
+				);
+				assert_eq!(
+					manager.tier_authority_readiness_reason().as_deref(),
+					Some("TierAuthorityLsmUnresolved")
+				);
+			} else {
+				if kind == "control" {
+					assert!(
+						snapshot.lsm_install_intents.is_empty(),
+						"{step}: completed intent must be cleared"
+					);
+				}
+				assert!(
+					snapshot
+						.lsm_runs
+						.iter()
+						.find(|run| run.slab_id == slab_id)
+						.is_none_or(|run| matches!(run.state, SlabState::DeletePending))
+				);
+				let key = id(0xdd10);
+				let current = manager.lookup(tenant(), key).unwrap().unwrap();
+				assert_ne!(current.slab_id, slab_id);
+				assert_eq!(manager.read(current).await.unwrap(), b"gc-survivor");
+			}
+			owner.close(Duration::from_secs(2)).await.unwrap();
+		}
+	}
+}
+
+async fn mark_gc_target_for_control_test(manager: &Arc<SlabManager>, slab_id: SlabId) {
+	let snapshot = manager.compaction_manifest_snapshot();
+	let commit = CompactionCommit::gc_mark_delete_pending(
+		CompactionJobId::new(0xdd21),
+		snapshot.manifest_epoch,
+		vec![slab_id],
+	);
+	manager
+		.apply_lsm_manifest_compaction_commit(&commit)
+		.unwrap();
+	let marked = manager
+		.compaction_manifest_snapshot()
+		.run(slab_id)
+		.unwrap()
+		.clone();
+	manager
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.apply(PersistentIndexUpdate {
+			put_lsm_runs: vec![marked],
+			..Default::default()
+		})
+		.await
+		.unwrap();
+}
+
+#[tokio::test]
+async fn gc_control_concurrent_tier_apply_refuses_stale_local_removal() {
+	let (dirs, manager, l2) = fresh_manager_with_l2("gc-tier-apply").await;
+	let (slab_id, key) = seed_small_retired_gc_slab(&manager).await;
+	let raw = manager.read_sealed_raw(slab_id).await.unwrap();
+	let encrypted = manager.encrypt_tiered_object_blob(slab_id, &raw).unwrap();
+	let uri = l2
+		.put("gc-tier-apply/object", &encrypted.bytes)
+		.await
+		.unwrap();
+	let pointer = tiered_pointer_from_blob(&manager, slab_id, uri, &encrypted.bytes);
+	let source_path = slab_path(&dirs[0], slab_id);
+	mark_gc_target_for_control_test(&manager, slab_id).await;
+	let entered = Arc::new(tokio::sync::Semaphore::new(0));
+	let release = Arc::new(tokio::sync::Semaphore::new(0));
+	let committer = Arc::new(GcPauseAfterRemoveCommit {
+		manager: manager.clone(),
+		entered: entered.clone(),
+		release: release.clone(),
+	});
+	let gc = LsmGcWorker::new(LsmConfig::default(), manager.slab_pin_table()).unwrap();
+	let task = {
+		let manager = manager.clone();
+		let committer = committer.clone();
+		tokio::spawn(async move {
+			manager
+				.sweep_lsm_delete_pending_once_via_control_ring(&gc, committer.as_ref())
+				.await
+		})
+	};
+	tokio::time::timeout(Duration::from_secs(60), entered.acquire())
+		.await
+		.unwrap()
+		.unwrap()
+		.forget();
+	assert!(source_path.exists());
+	let apply = manager.apply_tier_slab(pointer).await;
+	if let Err(error) = &apply {
+		assert!(
+			manager.unapplied_tier_pointers.contains_key(&slab_id),
+			"a refused committed tier observer must record its pointer: {error}"
+		);
+		println!("concurrent tier observer refused and recorded its unapplied pointer: {error}");
+	} else {
+		assert!(
+			manager.is_tiered(slab_id).await,
+			"successful tier apply must publish its pointer"
+		);
+		println!("concurrent tier observer published its pointer");
+	}
+	release.add_permits(1);
+	assert_eq!(
+		task.await.unwrap().unwrap_err().kind(),
+		ErrorKind::WouldBlock
+	);
+	assert!(
+		manager.has_orphaned_index_publications() || !manager.lsm_install_unresolved.is_empty()
+	);
+	let rows = manager.record_rows_for_slab_for_recovery(slab_id);
+	assert!(
+		rows.is_empty(),
+		"tier apply must not resurrect relocated rows: {apply:?}"
+	);
+	assert!(
+		manager
+			.key_index
+			.get(&(tenant(), key))
+			.unwrap()
+			.iter()
+			.all(|location| location.slab_id != slab_id)
+	);
+	assert!(
+		manager
+			.persistent_index
+			.as_ref()
+			.unwrap()
+			.load_snapshot()
+			.await
+			.unwrap()
+			.lsm_install_intents
+			.len() >= 1
+	);
+	drop(committer);
+	let reopened = try_restart_tier_manager(manager, &dirs, &l2).await.unwrap();
+	assert_eq!(
+		reopened.tier_authority_readiness_reason().as_deref(),
+		Some("TierAuthorityLsmUnresolved")
+	);
+}
+
+#[tokio::test]
+async fn gc_control_concurrent_tier_retirement_refuses_stale_local_removal() {
+	let (dirs, manager, l2) = fresh_manager_with_l2("gc-tier-retire").await;
+	let key = id(0xdd31);
+	manager
+		.append_durable(tenant(), key, hlc(10), b"tiered-gc-survivor")
+		.await
+		.unwrap();
+	let slab_id = manager.force_seal_active_for_test().await;
+	let raw = manager.read_sealed_raw(slab_id).await.unwrap();
+	let encrypted = manager.encrypt_tiered_object_blob(slab_id, &raw).unwrap();
+	let uri = l2
+		.put("gc-tier-retire/object", &encrypted.bytes)
+		.await
+		.unwrap();
+	let pointer = tiered_pointer_from_blob(&manager, slab_id, uri, &encrypted.bytes);
+	manager.apply_tier_slab(pointer).await.unwrap();
+	let snapshot = manager.compaction_manifest_snapshot();
+	let plan = CompactionPlan {
+		job_id: CompactionJobId::new(0xdd31),
+		source_level: CompactionLevelIndex::L0,
+		target_level: CompactionLevelIndex::L1,
+		manifest_epoch_pre: snapshot.manifest_epoch,
+		input_slabs: vec![slab_id],
+		overlapping_slabs: Vec::new(),
+		retention_floor_snapshot: hlc(0),
+		compaction_start_hlc: hlc(20),
+		dominant_reason: crate::storage::DominantReason::Operator,
+	};
+	let worker = LsmCompactionWorker::new(LsmConfig::default(), manager.slab_pin_table()).unwrap();
+	manager
+		.run_lsm_compaction_once(&worker, plan)
+		.await
+		.unwrap();
+	mark_gc_target_for_control_test(&manager, slab_id).await;
+	let entered = Arc::new(tokio::sync::Semaphore::new(0));
+	let release = Arc::new(tokio::sync::Semaphore::new(0));
+	let committer = Arc::new(GcPauseAfterRemoveCommit {
+		manager: manager.clone(),
+		entered: entered.clone(),
+		release: release.clone(),
+	});
+	let gc = LsmGcWorker::new(LsmConfig::default(), manager.slab_pin_table()).unwrap();
+	let task = {
+		let manager = manager.clone();
+		let committer = committer.clone();
+		tokio::spawn(async move {
+			manager
+				.sweep_lsm_delete_pending_once_via_control_ring(&gc, committer.as_ref())
+				.await
+		})
+	};
+	tokio::time::timeout(Duration::from_secs(60), entered.acquire())
+		.await
+		.unwrap()
+		.unwrap()
+		.forget();
+	assert!(manager.retire_tiered_slab(slab_id).await.unwrap());
+	release.add_permits(1);
+	assert_eq!(
+		task.await.unwrap().unwrap_err().kind(),
+		ErrorKind::WouldBlock
+	);
+	assert!(manager.retired_tier_slabs.contains(&slab_id));
+	assert!(
+		manager
+			.record_rows_for_slab_for_recovery(slab_id)
+			.is_empty()
+	);
+	assert!(
+		manager
+			.key_index
+			.get(&(tenant(), key))
+			.unwrap()
+			.iter()
+			.all(|location| location.slab_id != slab_id)
+	);
+	drop(committer);
+	let reopened = try_restart_tier_manager(manager, &dirs, &l2).await.unwrap();
+	assert_eq!(
+		reopened.tier_authority_readiness_reason().as_deref(),
+		Some("TierAuthorityLsmUnresolved")
+	);
+}
+
+#[tokio::test]
+async fn gc_keeps_retired_slab_with_unmatched_counter_across_reopen() {
+	let dir = fresh_dir("gc-pending-counter");
+	let io = spawn_io_thread(64).unwrap();
+	let crypto = test_crypto();
+	let manager = initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	let origin = NodeId {
+		id: 9,
+		_reserved: 0,
+	};
+	let location = manager
+		.counter_append_tentative(tenant(), id(0xdd41), hlc(41), 3, origin)
+		.await
+		.unwrap();
+	assert_eq!(manager.force_seal_active_for_test().await, location.slab_id);
+	manager.fsync_all_local_slabs().await.unwrap();
+	// Construct the otherwise-ineligible retired state directly to exercise GC's
+	// independent guard; this does not claim production compaction creates it.
+	let retired = {
+		let mut manifest =
+			recover_rwlock_write(&manager.compaction_manifest, "compaction_manifest");
+		manifest.retire_run(location.slab_id, Vec::new()).unwrap()
+	};
+	manager
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.apply(PersistentIndexUpdate {
+			put_lsm_runs: vec![retired],
+			..Default::default()
+		})
+		.await
+		.unwrap();
+	let gc = LsmGcWorker::new(LsmConfig::default(), manager.slab_pin_table()).unwrap();
+	assert!(
+		!manager
+			.sweep_lsm_delete_pending_once(&gc)
+			.await
+			.unwrap()
+			.contains(&location.slab_id)
+	);
+	assert!(slab_path(&dir, location.slab_id).exists());
+	drop(manager);
+	let reopened = open_manager_at_dir(dir.to_path_buf(), io, crypto).await;
+	assert!(reopened.counter_slab_has_pending_frames(location.slab_id));
+	let gc = LsmGcWorker::new(LsmConfig::default(), reopened.slab_pin_table()).unwrap();
+	assert!(
+		!reopened
+			.sweep_lsm_delete_pending_once(&gc)
+			.await
+			.unwrap()
+			.contains(&location.slab_id)
+	);
+	assert!(slab_path(&dir, location.slab_id).exists());
+}
+
+#[tokio::test]
+async fn unrelated_tier_refresh_during_gc_proceeds_and_readiness_recovers() {
+	let (dirs, manager, l2) = fresh_manager_with_l2("gc-unrelated-tier").await;
+	let (gc_slab, gc_key) = seed_small_retired_gc_slab(&manager).await;
+	let tier_key = id(0xdd51);
+	manager
+		.append_durable(tenant(), tier_key, hlc(51), b"unrelated-tier")
+		.await
+		.unwrap();
+	let tier_slab = manager.force_seal_active_for_test().await;
+	assert_ne!(gc_slab, tier_slab);
+	let raw = manager.read_sealed_raw(tier_slab).await.unwrap();
+	let encrypted = manager.encrypt_tiered_object_blob(tier_slab, &raw).unwrap();
+	let first_uri = l2
+		.put("gc-unrelated-tier/first", &encrypted.bytes)
+		.await
+		.unwrap();
+	let second_uri = l2
+		.put("gc-unrelated-tier/second", &encrypted.bytes)
+		.await
+		.unwrap();
+	let first = tiered_pointer_from_blob(&manager, tier_slab, first_uri, &encrypted.bytes);
+	let second = tiered_pointer_from_blob(&manager, tier_slab, second_uri, &encrypted.bytes);
+	manager.apply_tier_slab(first).await.unwrap();
+	mark_gc_target_for_control_test(&manager, gc_slab).await;
+	let entered = Arc::new(tokio::sync::Semaphore::new(0));
+	let release = Arc::new(tokio::sync::Semaphore::new(0));
+	let committer = Arc::new(GcPauseAfterRemoveCommit {
+		manager: manager.clone(),
+		entered: entered.clone(),
+		release: release.clone(),
+	});
+	let gc = LsmGcWorker::new(LsmConfig::default(), manager.slab_pin_table()).unwrap();
+	let task = {
+		let manager = manager.clone();
+		let committer = committer.clone();
+		tokio::spawn(async move {
+			manager
+				.sweep_lsm_delete_pending_once_via_control_ring(&gc, committer.as_ref())
+				.await
+		})
+	};
+	tokio::time::timeout(Duration::from_secs(60), entered.acquire())
+		.await
+		.unwrap()
+		.unwrap()
+		.forget();
+	assert!(
+		manager.tier_authority_readiness_reason().is_none(),
+		"a live GC intent must not fence public readiness"
+	);
+	manager.apply_tier_slab(second.clone()).await.unwrap();
+	assert_eq!(
+		manager
+			.state
+			.lock()
+			.await
+			.tiered
+			.get(&tier_slab)
+			.unwrap()
+			.value(),
+		&second
+	);
+	assert!(!manager.unapplied_tier_pointers.contains_key(&tier_slab));
+	release.add_permits(1);
+	assert!(task.await.unwrap().unwrap().contains(&gc_slab));
+	assert!(
+		manager.tier_authority_readiness_reason().is_none(),
+		"unrelated tier refresh must not strand readiness"
+	);
+	assert_eq!(
+		manager
+			.read(manager.lookup(tenant(), tier_key).unwrap().unwrap())
+			.await
+			.unwrap(),
+		b"unrelated-tier"
+	);
+	assert_eq!(
+		manager
+			.read(manager.lookup(tenant(), gc_key).unwrap().unwrap())
+			.await
+			.unwrap(),
+		b"gc-survivor"
+	);
+	assert!(!slab_path(&dirs[0], gc_slab).exists());
+}
+
+#[tokio::test]
+async fn unresolved_lsm_outputs_stay_unindexed_and_shared_key_tier_apply_refuses_after_reopen() {
+	let (dirs, manager, l2) = fresh_manager_with_l2("lsm-unresolved-output-shared-key").await;
+	let key = id(0xdd61);
+	let input = manager
+		.append_durable(tenant(), key, hlc(10), b"old")
+		.await
+		.unwrap();
+	assert_eq!(manager.force_seal_active_for_test().await, input.slab_id);
+	manager
+		.append_durable(tenant(), key, hlc(20), b"new")
+		.await
+		.unwrap();
+	let tier_slab = manager.force_seal_active_for_test().await;
+	assert_ne!(tier_slab, input.slab_id);
+	let raw = manager.read_sealed_raw(tier_slab).await.unwrap();
+	let encrypted = manager.encrypt_tiered_object_blob(tier_slab, &raw).unwrap();
+	let first_uri = l2
+		.put("lsm-unresolved-output-shared-key/first", &encrypted.bytes)
+		.await
+		.unwrap();
+	let next_uri = l2
+		.put("lsm-unresolved-output-shared-key/next", &encrypted.bytes)
+		.await
+		.unwrap();
+	let first = tiered_pointer_from_blob(&manager, tier_slab, first_uri, &encrypted.bytes);
+	let next = tiered_pointer_from_blob(&manager, tier_slab, next_uri, &encrypted.bytes);
+	manager.apply_tier_slab(first).await.unwrap();
+	let snapshot = manager.compaction_manifest_snapshot();
+	let plan = CompactionPlan {
+		job_id: CompactionJobId::new(0xdd61),
+		source_level: CompactionLevelIndex::L0,
+		target_level: CompactionLevelIndex::L1,
+		manifest_epoch_pre: snapshot.manifest_epoch,
+		input_slabs: vec![input.slab_id],
+		overlapping_slabs: Vec::new(),
+		retention_floor_snapshot: hlc(0),
+		compaction_start_hlc: hlc(30),
+		dominant_reason: crate::storage::DominantReason::Operator,
+	};
+	let worker = LsmCompactionWorker::new(LsmConfig::default(), manager.slab_pin_table()).unwrap();
+	assert!(
+		manager
+			.run_lsm_compaction_once_via_control_ring(&worker, plan, &AmbiguousLsmCommitter)
+			.await
+			.is_err()
+	);
+	let durable = manager
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot()
+		.await
+		.unwrap();
+	assert_eq!(durable.lsm_install_intents.len(), 1);
+	let outputs = durable.lsm_install_intents[0]
+		.commit
+		.slabs_to_add
+		.iter()
+		.map(|run| run.slab_id)
+		.collect::<Vec<_>>();
+	assert!(!outputs.is_empty());
+	assert!(
+		outputs
+			.iter()
+			.all(|slab| slab_path(&dirs[0], *slab).exists())
+	);
+	let reopened = try_restart_tier_manager(manager, &dirs, &l2).await.unwrap();
+	assert_eq!(
+		reopened.tier_authority_readiness_reason().as_deref(),
+		Some("TierAuthorityLsmUnresolved")
+	);
+	let versions = reopened
+		.key_index
+		.get(&(tenant(), key))
+		.expect("input key remains indexed");
+	assert!(
+		versions
+			.iter()
+			.any(|location| location.slab_id == input.slab_id),
+		"unresolved input remains authoritative"
+	);
+	assert!(
+		versions
+			.iter()
+			.all(|location| !outputs.contains(&location.slab_id)),
+		"unresolved outputs must not enter key chains"
+	);
+	drop(versions);
+	assert!(
+		outputs
+			.iter()
+			.all(|slab| slab_path(&dirs[0], *slab).exists()),
+		"output evidence must remain on disk"
+	);
+	assert!(reopened.apply_tier_slab(next).await.is_err());
+	assert!(reopened.unapplied_tier_pointers.contains_key(&tier_slab));
+}
+
+#[tokio::test]
+async fn shared_key_tier_refresh_during_gc_refuses_and_records_pointer() {
+	let (dirs, manager, l2) = fresh_manager_with_l2("gc-shared-key-tier").await;
+	let (gc_slab, gc_key) = seed_small_retired_gc_slab(&manager).await;
+	let tier_key = gc_key;
+	manager
+		.append_durable(tenant(), tier_key, hlc(51), b"unrelated-tier")
+		.await
+		.unwrap();
+	let tier_slab = manager.force_seal_active_for_test().await;
+	assert_ne!(gc_slab, tier_slab);
+	let raw = manager.read_sealed_raw(tier_slab).await.unwrap();
+	let encrypted = manager.encrypt_tiered_object_blob(tier_slab, &raw).unwrap();
+	let first_uri = l2
+		.put("gc-shared-key-tier/first", &encrypted.bytes)
+		.await
+		.unwrap();
+	let second_uri = l2
+		.put("gc-shared-key-tier/second", &encrypted.bytes)
+		.await
+		.unwrap();
+	let first = tiered_pointer_from_blob(&manager, tier_slab, first_uri, &encrypted.bytes);
+	let second = tiered_pointer_from_blob(&manager, tier_slab, second_uri, &encrypted.bytes);
+	manager.apply_tier_slab(first).await.unwrap();
+	mark_gc_target_for_control_test(&manager, gc_slab).await;
+	let entered = Arc::new(tokio::sync::Semaphore::new(0));
+	let release = Arc::new(tokio::sync::Semaphore::new(0));
+	let committer = Arc::new(GcPauseAfterRemoveCommit {
+		manager: manager.clone(),
+		entered: entered.clone(),
+		release: release.clone(),
+	});
+	let gc = LsmGcWorker::new(LsmConfig::default(), manager.slab_pin_table()).unwrap();
+	let task = {
+		let manager = manager.clone();
+		let committer = committer.clone();
+		tokio::spawn(async move {
+			manager
+				.sweep_lsm_delete_pending_once_via_control_ring(&gc, committer.as_ref())
+				.await
+		})
+	};
+	tokio::time::timeout(Duration::from_secs(60), entered.acquire())
+		.await
+		.unwrap()
+		.unwrap()
+		.forget();
+	assert!(
+		manager.tier_authority_readiness_reason().is_none(),
+		"a live GC intent must not fence public readiness"
+	);
+	assert!(
+		manager.apply_tier_slab(second.clone()).await.is_err(),
+		"Y shares a key with the named GC input and cannot prove disjointness"
+	);
+	assert!(manager.unapplied_tier_pointers.contains_key(&tier_slab));
+	assert_ne!(
+		manager
+			.state
+			.lock()
+			.await
+			.tiered
+			.get(&tier_slab)
+			.unwrap()
+			.value(),
+		&second
+	);
+
+	release.add_permits(1);
+	assert!(task.await.unwrap().unwrap().contains(&gc_slab));
+	assert!(
+		manager.tier_authority_readiness_reason().is_some(),
+		"unapplied shared-key pointer keeps readiness fenced"
+	);
+	assert!(manager.key_index.get(&(tenant(), tier_key)).is_some());
+
+	assert!(!slab_path(&dirs[0], gc_slab).exists());
+}
+
+#[tokio::test]
+async fn physical_key_missing_from_private_index_still_blocks_tier_refresh() {
+	let (dirs, manager, l2) = fresh_manager_with_l2("gc-unindexed-physical-key").await;
+	let (gc_slab, gc_key) = seed_small_retired_gc_slab(&manager).await;
+	let source = manager
+		.state
+		.lock()
+		.await
+		.sealed
+		.get(&gc_slab)
+		.unwrap()
+		.value()
+		.clone();
+	let old = source
+		.lookup(tenant(), gc_key)
+		.unwrap()
+		.expect("fixture physical key");
+	source.rollback_index_entry(tenant(), gc_key, old);
+	assert!(
+		source.lookup(tenant(), gc_key).unwrap().is_none(),
+		"premise: private index omits the retained physical frame"
+	);
+	let tier_key = gc_key;
+	manager
+		.append_durable(tenant(), tier_key, hlc(51), b"unrelated-tier")
+		.await
+		.unwrap();
+	let tier_slab = manager.force_seal_active_for_test().await;
+	assert_ne!(gc_slab, tier_slab);
+	let raw = manager.read_sealed_raw(tier_slab).await.unwrap();
+	let encrypted = manager.encrypt_tiered_object_blob(tier_slab, &raw).unwrap();
+	let first_uri = l2
+		.put("gc-unindexed-physical-key/first", &encrypted.bytes)
+		.await
+		.unwrap();
+	let second_uri = l2
+		.put("gc-unindexed-physical-key/second", &encrypted.bytes)
+		.await
+		.unwrap();
+	let first = tiered_pointer_from_blob(&manager, tier_slab, first_uri, &encrypted.bytes);
+	let second = tiered_pointer_from_blob(&manager, tier_slab, second_uri, &encrypted.bytes);
+	manager.apply_tier_slab(first).await.unwrap();
+	mark_gc_target_for_control_test(&manager, gc_slab).await;
+	let entered = Arc::new(tokio::sync::Semaphore::new(0));
+	let release = Arc::new(tokio::sync::Semaphore::new(0));
+	let committer = Arc::new(GcPauseAfterRemoveCommit {
+		manager: manager.clone(),
+		entered: entered.clone(),
+		release: release.clone(),
+	});
+	let gc = LsmGcWorker::new(LsmConfig::default(), manager.slab_pin_table()).unwrap();
+	let task = {
+		let manager = manager.clone();
+		let committer = committer.clone();
+		tokio::spawn(async move {
+			manager
+				.sweep_lsm_delete_pending_once_via_control_ring(&gc, committer.as_ref())
+				.await
+		})
+	};
+	tokio::time::timeout(Duration::from_secs(60), entered.acquire())
+		.await
+		.unwrap()
+		.unwrap()
+		.forget();
+	assert!(
+		manager.tier_authority_readiness_reason().is_none(),
+		"a live GC intent must not fence public readiness"
+	);
+	assert!(
+		manager.apply_tier_slab(second.clone()).await.is_err(),
+		"Y shares a key with the named GC input and cannot prove disjointness"
+	);
+	assert!(manager.unapplied_tier_pointers.contains_key(&tier_slab));
+	assert_ne!(
+		manager
+			.state
+			.lock()
+			.await
+			.tiered
+			.get(&tier_slab)
+			.unwrap()
+			.value(),
+		&second
+	);
+
+	release.add_permits(1);
+	assert!(task.await.unwrap().unwrap().contains(&gc_slab));
+	assert!(
+		manager.tier_authority_readiness_reason().is_some(),
+		"unapplied shared-key pointer keeps readiness fenced"
+	);
+	assert!(manager.key_index.get(&(tenant(), tier_key)).is_some());
+
+	assert!(!slab_path(&dirs[0], gc_slab).exists());
+}
+
+async fn install_snapshot_with_tier_set_for_test(include_local_tier: bool) {
+	use crate::consensus::{TieredSlab, WendelonStateMachine};
+	use crate::storage::sweeper::ManagerTierObserver;
+	use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
+	use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
+
+	let (_dirs, manager, l2) = fresh_manager_with_l2("dc112-snapshot-tier-set").await;
+	let key = id(0xdc112);
+	manager
+		.append_durable(tenant(), key, hlc(511), b"old-tier")
+		.await
+		.unwrap();
+	let pointer = tier_kv_slab(&manager, &l2, "dc112-snapshot-tier-set/object").await;
+	let old_location = manager.lookup(tenant(), key).unwrap().unwrap();
+	let mut source = WendelonStateMachine::new();
+	if include_local_tier {
+		source
+			.seed_tiered_slab_for_test(TieredSlab {
+				slab_id: pointer.slab_id,
+				l2_uri: pointer.l2_uri.clone(),
+				payload_hash: pointer.payload_hash,
+				is_encrypted: pointer.is_encrypted,
+				tenant_id: pointer.tenant_id,
+				tenant_kek_id: pointer.tenant_kek_id,
+				stats_format_version: pointer.stats_format_version,
+				stats_block_len: pointer.stats_block_len,
+				stats_block_hash128: pointer.stats_block_hash128,
+				tombstone_metadata: pointer.tombstone_metadata,
+				supersession_metadata: pointer.supersession_metadata,
+			})
+			.await;
+	}
+	RaftStateMachine::apply(
+		&mut source,
+		[Entry {
+			log_id: LogId::new(CommittedLeaderId::new(3, 1), 701),
+			payload: EntryPayload::Blank,
+		}],
+	)
+	.await
+	.unwrap();
+	let mut builder = RaftStateMachine::get_snapshot_builder(&mut source).await;
+	let built = builder.build_snapshot().await.unwrap();
+	let mut target = WendelonStateMachine::new()
+		.with_tier_observer(Arc::new(ManagerTierObserver::new(manager.clone())));
+	RaftStateMachine::install_snapshot(&mut target, &built.meta, built.snapshot)
+		.await
+		.unwrap();
+	if include_local_tier {
+		assert!(
+			manager.tier_authority_readiness_reason().is_none(),
+			"unchanged committed set must remain available"
+		);
+		let location = manager
+			.lookup(tenant(), key)
+			.unwrap()
+			.expect("committed tier stays readable");
+		assert_eq!(manager.read(location).await.unwrap(), b"old-tier");
+	} else {
+		manager
+			.assert_retirement_completed_for_test(tenant(), key, old_location, &pointer.l2_uri)
+			.await;
+	}
+}
+
+#[tokio::test]
+async fn snapshot_install_missing_tier_id_fences_old_pointer() {
+	install_snapshot_with_tier_set_for_test(false).await;
+}
+
+#[tokio::test]
+async fn snapshot_install_matching_tier_id_keeps_authority_available() {
+	install_snapshot_with_tier_set_for_test(true).await;
+}
+
+#[tokio::test]
+async fn snapshot_install_fences_and_drains_tier_publication_before_comparison() {
+	use crate::consensus::WendelonStateMachine;
+	use crate::storage::sweeper::ManagerTierObserver;
+	use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
+	use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
+
+	let (_dirs, manager, l2) = fresh_manager_with_l2("dc112-snapshot-writer").await;
+	let key = id(0xdc113);
+	manager
+		.append_durable(tenant(), key, hlc(512), b"old-tier")
+		.await
+		.unwrap();
+	let slab_id = force_seal_active(&manager).await;
+	let raw = manager.read_sealed_raw(slab_id).await.unwrap();
+	let encrypted = manager.encrypt_tiered_object_blob(slab_id, &raw).unwrap();
+	let uri = l2
+		.put("dc112-snapshot-writer/object", &encrypted.bytes)
+		.await
+		.unwrap();
+	let pointer = tiered_pointer_from_blob(&manager, slab_id, uri, &encrypted.bytes);
+	let old_location = manager.lookup(tenant(), key).unwrap().unwrap();
+	let old_uri = pointer.l2_uri.clone();
+	let pause = manager.pause_tier_publication_before_pointer_once();
+	let publishing = {
+		let manager = manager.clone();
+		tokio::spawn(async move { manager.apply_tier_slab(pointer).await })
+	};
+	tokio::time::timeout(Duration::from_secs(60), pause.reached.notified())
+		.await
+		.expect("tier publication must reach the held cut");
+	let mut source = WendelonStateMachine::new();
+	RaftStateMachine::apply(
+		&mut source,
+		[Entry {
+			log_id: LogId::new(CommittedLeaderId::new(3, 1), 702),
+			payload: EntryPayload::Blank,
+		}],
+	)
+	.await
+	.unwrap();
+	let mut builder = RaftStateMachine::get_snapshot_builder(&mut source).await;
+	let built = builder.build_snapshot().await.unwrap();
+	let mut target = WendelonStateMachine::new()
+		.with_tier_observer(Arc::new(ManagerTierObserver::new(manager.clone())));
+	let mut installing = tokio::spawn(async move {
+		RaftStateMachine::install_snapshot(&mut target, &built.meta, built.snapshot).await
+	});
+	let early = tokio::time::timeout(Duration::from_millis(300), &mut installing).await;
+	let fenced_while_waiting = manager.tier_authority_readiness_reason().is_some();
+	pause.resume.notify_one();
+	publishing.await.unwrap().unwrap();
+	let installed = match early {
+		Ok(result) => result.unwrap(),
+		Err(_) => installing.await.unwrap(),
+	};
+	installed.unwrap();
+	assert!(
+		fenced_while_waiting,
+		"snapshot installation must fence admission while an earlier writer is in flight"
+	);
+	manager
+		.assert_retirement_completed_for_test(tenant(), key, old_location, &old_uri)
+		.await;
+}
+
+#[tokio::test]
+async fn snapshot_index_discards_old_tier_observer_but_accepts_newer_one() {
+	use crate::consensus::{TieredSlab, WendelonStateMachine};
+	use crate::storage::sweeper::ManagerTierObserver;
+	use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
+	use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
+
+	let (_dirs, manager, l2) = fresh_manager_with_l2("dc112-snapshot-index").await;
+	let key = id(0xdc114);
+	manager
+		.append_durable(tenant(), key, hlc(513), b"indexed-tier")
+		.await
+		.unwrap();
+	let original = tier_kv_slab(&manager, &l2, "dc112-snapshot-index/original").await;
+	let bytes = l2.get(&original.l2_uri).await.unwrap();
+	let newer_uri = l2
+		.put("dc112-snapshot-index/alternate", &bytes)
+		.await
+		.unwrap();
+	let mut replacement = original.clone();
+	replacement.l2_uri = newer_uri;
+	let mut source = WendelonStateMachine::new();
+	source
+		.seed_tiered_slab_for_test(TieredSlab {
+			slab_id: original.slab_id,
+			l2_uri: original.l2_uri.clone(),
+			payload_hash: original.payload_hash,
+			is_encrypted: original.is_encrypted,
+			tenant_id: original.tenant_id,
+			tenant_kek_id: original.tenant_kek_id,
+			stats_format_version: original.stats_format_version,
+			stats_block_len: original.stats_block_len,
+			stats_block_hash128: original.stats_block_hash128,
+			tombstone_metadata: original.tombstone_metadata,
+			supersession_metadata: original.supersession_metadata,
+		})
+		.await;
+	RaftStateMachine::apply(
+		&mut source,
+		[Entry {
+			log_id: LogId::new(CommittedLeaderId::new(3, 1), 702),
+			payload: EntryPayload::Blank,
+		}],
+	)
+	.await
+	.unwrap();
+	let mut builder = RaftStateMachine::get_snapshot_builder(&mut source).await;
+	let built = builder.build_snapshot().await.unwrap();
+	let mut target = WendelonStateMachine::new()
+		.with_tier_observer(Arc::new(ManagerTierObserver::new(manager.clone())));
+	RaftStateMachine::install_snapshot(&mut target, &built.meta, built.snapshot)
+		.await
+		.unwrap();
+	manager
+		.apply_tier_slab_committed(replacement.clone(), Some(701))
+		.await
+		.unwrap();
+	assert_eq!(
+		manager.tiered_pointers_snapshot().await,
+		vec![original],
+		"an observer covered by the installed snapshot must publish nothing"
+	);
+	manager
+		.apply_tier_slab_committed(replacement.clone(), Some(703))
+		.await
+		.unwrap();
+	assert_eq!(
+		manager.tiered_pointers_snapshot().await,
+		vec![replacement],
+		"a newer observer must still publish"
+	);
+	let location = manager.lookup(tenant(), key).unwrap().unwrap();
+	assert_eq!(manager.read(location).await.unwrap(), b"indexed-tier");
+}
+
+#[tokio::test]
+async fn awaiting_cluster_marker_fences_reopens_until_complete_snapshot_comparison() {
+	use crate::consensus::WendelonStateMachine;
+	use crate::storage::sweeper::ManagerTierObserver;
+	use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
+	use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
+
+	let dir = fresh_dir("dc112-awaiting-cluster-reopen");
+	let io = spawn_io_thread(64).unwrap();
+	let crypto = test_crypto();
+	let original = initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	let key = id(0xdc115);
+	original
+		.append_durable(tenant(), key, hlc(514), b"kept")
+		.await
+		.unwrap();
+	original.fsync_all_local_slabs().await.unwrap();
+	drop(original);
+	let marker = dir.join("TIER_AUTHORITY_AWAITING_CLUSTER");
+	std::fs::write(&marker, b"awaiting-cluster-v1\n").unwrap();
+	for _ in 0..2 {
+		let reopened = open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+		assert_eq!(
+			reopened.tier_authority_readiness_reason().as_deref(),
+			Some("TierAuthorityAwaitingCluster"),
+			"local or partially replayed state cannot clear the replacement fence"
+		);
+		assert!(reopened.lookup(tenant(), key).is_err());
+		assert!(marker.is_file());
+		drop(reopened);
+	}
+	let manager = open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	let mut source = WendelonStateMachine::new();
+	RaftStateMachine::apply(
+		&mut source,
+		[Entry {
+			log_id: LogId::new(CommittedLeaderId::new(3, 1), 703),
+			payload: EntryPayload::Blank,
+		}],
+	)
+	.await
+	.unwrap();
+	let mut builder = RaftStateMachine::get_snapshot_builder(&mut source).await;
+	let built = builder.build_snapshot().await.unwrap();
+	let mut target = WendelonStateMachine::new()
+		.with_tier_observer(Arc::new(ManagerTierObserver::new(manager.clone())));
+	RaftStateMachine::install_snapshot(&mut target, &built.meta, built.snapshot)
+		.await
+		.unwrap();
+	assert!(
+		!marker.exists(),
+		"a complete installed and compared snapshot clears the durable marker"
+	);
+	assert!(manager.tier_authority_readiness_reason().is_none());
+	drop(target);
+	drop(manager);
+	let reopened = open_manager_at_dir(dir.to_path_buf(), io, crypto).await;
+	assert!(
+		reopened.tier_authority_readiness_reason().is_none(),
+		"clear must survive reopen"
+	);
+	assert_eq!(
+		reopened
+			.read(reopened.lookup(tenant(), key).unwrap().unwrap())
+			.await
+			.unwrap(),
+		b"kept"
+	);
+}
+
+async fn snapshot_new_tier_is_verified_for_test(awaiting_cluster: bool) {
+	use crate::consensus::{TieredSlab, WendelonStateMachine};
+	use crate::storage::sweeper::ManagerTierObserver;
+	use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
+	use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
+
+	let src_dir = fresh_dir("dc112-snapshot-new-tier-source");
+	let dst_dir = fresh_dir("dc112-snapshot-new-tier-target");
+	let l2_dir = fresh_dir("dc112-snapshot-new-tier-l2");
+	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_dir).unwrap());
+	let io = spawn_io_thread(64).unwrap();
+	let crypto = test_crypto();
+	let config = |dir: std::path::PathBuf| SlabManagerConfig {
+		dir,
+		max_slab_bytes: 1 << 20,
+		io: io.clone(),
+		l2: Some(l2.clone()),
+		rehydration: RehydrationPolicy::default(),
+		l2_column_fetch: Default::default(),
+		row_group_writer: Default::default(),
+		l2_row_group_fetch: Default::default(),
+		encoding_writer: Default::default(),
+		l2_chunk_layout: Default::default(),
+		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
+		group_commit: GroupCommitConfig::default(),
+		crypto: crypto.clone(),
+	};
+	let source_manager = SlabManager::initialize_new_store(config(src_dir.to_path_buf()))
+		.await
+		.unwrap();
+	let key = id(0xdc116);
+	source_manager
+		.append_durable(tenant(), key, hlc(515), b"new-tier")
+		.await
+		.unwrap();
+	let pointer = tier_kv_slab(&source_manager, &l2, "dc112-snapshot-new-tier/object").await;
+	let marker = dst_dir.join("TIER_AUTHORITY_AWAITING_CLUSTER");
+	if awaiting_cluster {
+		std::fs::write(&marker, b"awaiting-cluster-v1\n").unwrap();
+	}
+	let target_manager = SlabManager::initialize_new_store(config(dst_dir.to_path_buf()))
+		.await
+		.unwrap();
+	if awaiting_cluster {
+		assert_eq!(
+			target_manager.tier_authority_readiness_reason().as_deref(),
+			Some("TierAuthorityAwaitingCluster")
+		);
+	}
+	let mut source = WendelonStateMachine::new();
+	source
+		.seed_tiered_slab_for_test(TieredSlab {
+			slab_id: pointer.slab_id,
+			l2_uri: pointer.l2_uri.clone(),
+			payload_hash: pointer.payload_hash,
+			is_encrypted: pointer.is_encrypted,
+			tenant_id: pointer.tenant_id,
+			tenant_kek_id: pointer.tenant_kek_id,
+			stats_format_version: pointer.stats_format_version,
+			stats_block_len: pointer.stats_block_len,
+			stats_block_hash128: pointer.stats_block_hash128,
+			tombstone_metadata: pointer.tombstone_metadata,
+			supersession_metadata: pointer.supersession_metadata,
+		})
+		.await;
+	RaftStateMachine::apply(
+		&mut source,
+		[Entry {
+			log_id: LogId::new(CommittedLeaderId::new(3, 1), 704),
+			payload: EntryPayload::Blank,
+		}],
+	)
+	.await
+	.unwrap();
+	let mut builder = RaftStateMachine::get_snapshot_builder(&mut source).await;
+	let built = builder.build_snapshot().await.unwrap();
+	let mut target = WendelonStateMachine::new()
+		.with_tier_observer(Arc::new(ManagerTierObserver::new(target_manager.clone())));
+	RaftStateMachine::install_snapshot(&mut target, &built.meta, built.snapshot)
+		.await
+		.unwrap();
+	if awaiting_cluster {
+		assert!(
+			!marker.exists(),
+			"a fully compared snapshot clears the replacement marker"
+		);
+	}
+	tokio::time::timeout(
+		Duration::from_secs(60),
+		target_manager.wait_tier_authority_ready(),
+	)
+	.await
+	.expect("new tier verification must finish")
+	.expect("a new committed pointer must be verified, not permanently unapplied");
+	let location = target_manager
+		.lookup(tenant(), key)
+		.unwrap()
+		.expect("new committed tier becomes readable");
+	assert_eq!(target_manager.read(location).await.unwrap(), b"new-tier");
+}
+
+#[tokio::test]
+async fn snapshot_new_tier_is_verified_on_lagging_node() {
+	snapshot_new_tier_is_verified_for_test(false).await;
+}
+
+#[tokio::test]
+async fn snapshot_new_tier_is_verified_after_replacement_fence_clears() {
+	snapshot_new_tier_is_verified_for_test(true).await;
+}
+
+#[tokio::test]
+async fn snapshot_newer_pending_tier_is_verified_before_readiness() {
+	use crate::consensus::{TieredSlab, WendelonStateMachine};
+	use crate::storage::sweeper::ManagerTierObserver;
+	use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
+	use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
+
+	let f = pending_authority_fixture().await;
+	tokio::time::timeout(Duration::from_secs(5), f.store.entered.notified())
+		.await
+		.expect("prior authority verification must be in flight");
+	let old_bytes = f.store.inner.get(&f.pointer.l2_uri).await.unwrap();
+	let mut replacement = f.pointer.clone();
+	replacement.record_tombstone_hlc(hlc(600));
+	let mut source = WendelonStateMachine::new();
+	source
+		.seed_tiered_slab_for_test(TieredSlab {
+			slab_id: replacement.slab_id,
+			l2_uri: replacement.l2_uri.clone(),
+			payload_hash: replacement.payload_hash,
+			is_encrypted: replacement.is_encrypted,
+			tenant_id: replacement.tenant_id,
+			tenant_kek_id: replacement.tenant_kek_id,
+			stats_format_version: replacement.stats_format_version,
+			stats_block_len: replacement.stats_block_len,
+			stats_block_hash128: replacement.stats_block_hash128,
+			tombstone_metadata: replacement.tombstone_metadata,
+			supersession_metadata: replacement.supersession_metadata,
+		})
+		.await;
+	RaftStateMachine::apply(
+		&mut source,
+		[Entry {
+			log_id: LogId::new(CommittedLeaderId::new(3, 1), 705),
+			payload: EntryPayload::Blank,
+		}],
+	)
+	.await
+	.unwrap();
+	let mut builder = RaftStateMachine::get_snapshot_builder(&mut source).await;
+	let built = builder.build_snapshot().await.unwrap();
+	let mut target = WendelonStateMachine::new()
+		.with_tier_observer(Arc::new(ManagerTierObserver::new(f.manager.clone())));
+	RaftStateMachine::install_snapshot(&mut target, &built.meta, built.snapshot)
+		.await
+		.unwrap();
+	assert!(
+		f.manager.lookup(tenant(), id(0x7f61)).is_err(),
+		"a registered newer snapshot must stay unreadable before verification"
+	);
+	assert_eq!(
+		f.manager
+			.tier_authority
+			.pending
+			.get(&replacement.slab_id)
+			.unwrap()
+			.pointer,
+		replacement
+	);
+	f.store.release();
+	tokio::time::timeout(
+		Duration::from_secs(30),
+		f.manager.wait_tier_authority_ready(),
+	)
+	.await
+	.unwrap()
+	.expect("newer canonical authority must verify and reach Ready");
+	assert!(
+		f.manager
+			.unapplied_tier_pointer(replacement.slab_id)
+			.is_none()
+	);
+	assert_eq!(
+		f.manager.tier_pointer(replacement.slab_id).await,
+		Some(replacement)
+	);
+	for (key, bytes) in [
+		(id(0x7f61), b"present".as_slice()),
+		(id(0x7f62), b"omitted".as_slice()),
+	] {
+		let location = f.manager.lookup(tenant(), key).unwrap().unwrap();
+		assert_eq!(f.manager.read(location).await.unwrap(), bytes);
+	}
+	assert_eq!(
+		f.store.inner.get(&f.pointer.l2_uri).await.unwrap(),
+		old_bytes
+	);
+}
+
+#[tokio::test]
+async fn snapshot_index_rejects_observer_paused_before_publication_gate() {
+	use crate::consensus::{TieredSlab, WendelonStateMachine};
+	use crate::storage::sweeper::ManagerTierObserver;
+	use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
+	use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
+
+	let (_dirs, manager, l2) = fresh_manager_with_l2("dc112-snapshot-index").await;
+	let key = id(0xdc114);
+	manager
+		.append_durable(tenant(), key, hlc(513), b"indexed-tier")
+		.await
+		.unwrap();
+	let original = tier_kv_slab(&manager, &l2, "dc112-snapshot-index/original").await;
+	let bytes = l2.get(&original.l2_uri).await.unwrap();
+	let newer_uri = l2
+		.put("dc112-snapshot-index/alternate", &bytes)
+		.await
+		.unwrap();
+	let mut replacement = original.clone();
+	replacement.l2_uri = newer_uri;
+	let pause = manager.pause_tier_observer_before_gate_once();
+	let old_observer = {
+		let manager = manager.clone();
+		let replacement = replacement.clone();
+		tokio::spawn(async move {
+			manager
+				.apply_tier_slab_committed(replacement, Some(701))
+				.await
+		})
+	};
+	tokio::time::timeout(Duration::from_secs(60), pause.reached.notified())
+		.await
+		.expect("old observer must pause before the publication gate");
+	let mut source = WendelonStateMachine::new();
+	source
+		.seed_tiered_slab_for_test(TieredSlab {
+			slab_id: original.slab_id,
+			l2_uri: original.l2_uri.clone(),
+			payload_hash: original.payload_hash,
+			is_encrypted: original.is_encrypted,
+			tenant_id: original.tenant_id,
+			tenant_kek_id: original.tenant_kek_id,
+			stats_format_version: original.stats_format_version,
+			stats_block_len: original.stats_block_len,
+			stats_block_hash128: original.stats_block_hash128,
+			tombstone_metadata: original.tombstone_metadata,
+			supersession_metadata: original.supersession_metadata,
+		})
+		.await;
+	RaftStateMachine::apply(
+		&mut source,
+		[Entry {
+			log_id: LogId::new(CommittedLeaderId::new(3, 1), 702),
+			payload: EntryPayload::Blank,
+		}],
+	)
+	.await
+	.unwrap();
+	let mut builder = RaftStateMachine::get_snapshot_builder(&mut source).await;
+	let built = builder.build_snapshot().await.unwrap();
+	let mut target = WendelonStateMachine::new()
+		.with_tier_observer(Arc::new(ManagerTierObserver::new(manager.clone())));
+	RaftStateMachine::install_snapshot(&mut target, &built.meta, built.snapshot)
+		.await
+		.unwrap();
+	pause.resume.notify_one();
+	old_observer.await.unwrap().unwrap();
+	assert_eq!(
+		manager.tiered_pointers_snapshot().await,
+		vec![original],
+		"an observer covered by the installed snapshot must publish nothing"
+	);
+	manager
+		.apply_tier_slab_committed(replacement.clone(), Some(703))
+		.await
+		.unwrap();
+	assert_eq!(
+		manager.tiered_pointers_snapshot().await,
+		vec![replacement],
+		"a newer observer must still publish"
+	);
+	let location = manager.lookup(tenant(), key).unwrap().unwrap();
+	assert_eq!(manager.read(location).await.unwrap(), b"indexed-tier");
+}
+
+#[tokio::test]
+async fn older_retirement_callback_cannot_clear_newer_retirement_marker() {
+	use crate::consensus::TierObserver;
+	use crate::storage::sweeper::ManagerTierObserver;
+
+	let (_dirs, manager, l2) = fresh_manager_with_l2("dc112-retirement-marker-order").await;
+	let key = id(0xdc117);
+	manager
+		.append_durable(tenant(), key, hlc(516), b"retired")
+		.await
+		.unwrap();
+	let pointer = tier_kv_slab(&manager, &l2, "dc112-retirement-marker-order/object").await;
+	let old_location = manager.lookup(tenant(), key).unwrap().unwrap();
+	let observer = Arc::new(ManagerTierObserver::new(manager.clone()));
+	observer.before_slab_retired(pointer.slab_id, 701);
+	let entered = Arc::new(tokio::sync::Semaphore::new(0));
+	let release = Arc::new(tokio::sync::Semaphore::new(0));
+	*manager
+		.continuity_test_holds
+		.retirement_snapshot_hold
+		.lock()
+		.unwrap() = Some((entered.clone(), release.clone()));
+	let callback = {
+		let observer = observer.clone();
+		let slab_id = pointer.slab_id;
+		tokio::spawn(async move { observer.on_slab_retired(slab_id, 701).await })
+	};
+	tokio::time::timeout(Duration::from_secs(60), entered.acquire())
+		.await
+		.unwrap()
+		.unwrap()
+		.forget();
+	observer.before_slab_retired(pointer.slab_id, 702);
+	release.add_permits(1);
+	callback.await.unwrap().unwrap();
+	assert_eq!(
+		manager.tier_authority_readiness_reason().as_deref(),
+		Some("TierAuthorityFenced"),
+		"an older callback must not clear a newer retirement marker"
+	);
+	assert_eq!(
+		manager
+			.tier_authority
+			.retirement_marker_for_test(pointer.slab_id),
+		Some(Some(702))
+	);
+	assert!(manager.lookup(tenant(), key).unwrap().is_none());
+	assert!(
+		manager.read(old_location).await.is_err(),
+		"an old location must not serve a retired row"
+	);
+	assert!(
+		manager
+			.scan(tenant(), Locality::new(0), Locality::new(u64::MAX))
+			.unwrap()
+			.iter()
+			.all(|(_, location)| location.slab_id != pointer.slab_id),
+		"no row from the retired slab may be served"
+	);
+}
+
+#[tokio::test]
+async fn replacement_crash_after_snapshot_comparison_before_marker_clear_stays_fenced() {
+	use crate::consensus::WendelonStateMachine;
+	use crate::storage::sweeper::ManagerTierObserver;
+	use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
+	use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
+
+	let dir = fresh_dir("dc112-marker-clear-crash");
+	let io = spawn_io_thread(64).unwrap();
+	let crypto = test_crypto();
+	let marker = dir.join("TIER_AUTHORITY_AWAITING_CLUSTER");
+	std::fs::write(&marker, b"awaiting-cluster-v1\n").unwrap();
+	let manager = initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	let mut partial = WendelonStateMachine::new()
+		.with_tier_observer(Arc::new(ManagerTierObserver::new(manager.clone())));
+	RaftStateMachine::apply(
+		&mut partial,
+		[Entry {
+			log_id: LogId::new(CommittedLeaderId::new(3, 1), 5),
+			payload: EntryPayload::Blank,
+		}],
+	)
+	.await
+	.unwrap();
+	assert_eq!(
+		manager.tier_authority_readiness_reason().as_deref(),
+		Some("TierAuthorityAwaitingCluster"),
+		"partial replay without leader proof must stay fenced"
+	);
+	assert!(marker.is_file());
+	drop(partial);
+	let pause = manager.pause_snapshot_before_marker_clear_once();
+	let mut source = WendelonStateMachine::new();
+	RaftStateMachine::apply(
+		&mut source,
+		[Entry {
+			log_id: LogId::new(CommittedLeaderId::new(3, 1), 706),
+			payload: EntryPayload::Blank,
+		}],
+	)
+	.await
+	.unwrap();
+	let mut builder = RaftStateMachine::get_snapshot_builder(&mut source).await;
+	let built = builder.build_snapshot().await.unwrap();
+	let mut target = WendelonStateMachine::new()
+		.with_tier_observer(Arc::new(ManagerTierObserver::new(manager.clone())));
+	let mut install = tokio::spawn(async move {
+		RaftStateMachine::install_snapshot(&mut target, &built.meta, built.snapshot).await
+	});
+	let reached = tokio::select! {
+		result = tokio::time::timeout(Duration::from_secs(60), pause.reached.notified()) => result.is_ok(),
+		_ = &mut install => false,
+	};
+	if !reached {
+		panic!("snapshot comparison must reach the marker-clear cut");
+	}
+	assert!(marker.is_file(), "marker remains durable before clear");
+	install.abort();
+	assert!(install.await.unwrap_err().is_cancelled());
+	drop(manager);
+	let reopened = open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	assert_eq!(
+		reopened.tier_authority_readiness_reason().as_deref(),
+		Some("TierAuthorityAwaitingCluster")
+	);
+	assert!(
+		marker.is_file(),
+		"interrupted clear must keep the marker across reopen"
+	);
+	let mut source = WendelonStateMachine::new();
+	RaftStateMachine::apply(
+		&mut source,
+		[Entry {
+			log_id: LogId::new(CommittedLeaderId::new(3, 1), 707),
+			payload: EntryPayload::Blank,
+		}],
+	)
+	.await
+	.unwrap();
+	let mut builder = RaftStateMachine::get_snapshot_builder(&mut source).await;
+	let built = builder.build_snapshot().await.unwrap();
+	let mut target = WendelonStateMachine::new()
+		.with_tier_observer(Arc::new(ManagerTierObserver::new(reopened.clone())));
+	RaftStateMachine::install_snapshot(&mut target, &built.meta, built.snapshot)
+		.await
+		.unwrap();
+	assert!(
+		!marker.exists(),
+		"a later complete snapshot clears the marker"
+	);
+	assert!(reopened.tier_authority_readiness_reason().is_none());
+}
+
+#[tokio::test]
+async fn snapshot_epoch_fences_unindexed_tier_publication_paused_before_gate() {
+	use crate::consensus::{TieredSlab, WendelonStateMachine};
+	use crate::storage::sweeper::ManagerTierObserver;
+	use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
+	use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
+
+	let (_dirs, manager, l2) = fresh_manager_with_l2("dc112-snapshot-index").await;
+	let key = id(0xdc114);
+	manager
+		.append_durable(tenant(), key, hlc(513), b"indexed-tier")
+		.await
+		.unwrap();
+	let original = tier_kv_slab(&manager, &l2, "dc112-snapshot-index/original").await;
+	let bytes = l2.get(&original.l2_uri).await.unwrap();
+	let newer_uri = l2
+		.put("dc112-snapshot-index/alternate", &bytes)
+		.await
+		.unwrap();
+	let mut replacement = original.clone();
+	replacement.l2_uri = newer_uri;
+	let pause = manager.pause_tier_observer_before_gate_once();
+	let old_observer = {
+		let manager = manager.clone();
+		let replacement = replacement.clone();
+		tokio::spawn(async move { manager.apply_tier_slab_committed(replacement, None).await })
+	};
+	tokio::time::timeout(Duration::from_secs(60), pause.reached.notified())
+		.await
+		.expect("old observer must pause before the publication gate");
+	let mut source = WendelonStateMachine::new();
+	source
+		.seed_tiered_slab_for_test(TieredSlab {
+			slab_id: original.slab_id,
+			l2_uri: original.l2_uri.clone(),
+			payload_hash: original.payload_hash,
+			is_encrypted: original.is_encrypted,
+			tenant_id: original.tenant_id,
+			tenant_kek_id: original.tenant_kek_id,
+			stats_format_version: original.stats_format_version,
+			stats_block_len: original.stats_block_len,
+			stats_block_hash128: original.stats_block_hash128,
+			tombstone_metadata: original.tombstone_metadata,
+			supersession_metadata: original.supersession_metadata,
+		})
+		.await;
+	RaftStateMachine::apply(
+		&mut source,
+		[Entry {
+			log_id: LogId::new(CommittedLeaderId::new(3, 1), 702),
+			payload: EntryPayload::Blank,
+		}],
+	)
+	.await
+	.unwrap();
+	let mut builder = RaftStateMachine::get_snapshot_builder(&mut source).await;
+	let built = builder.build_snapshot().await.unwrap();
+	let mut target = WendelonStateMachine::new()
+		.with_tier_observer(Arc::new(ManagerTierObserver::new(manager.clone())));
+	RaftStateMachine::install_snapshot(&mut target, &built.meta, built.snapshot)
+		.await
+		.unwrap();
+	pause.resume.notify_one();
+	assert!(
+		old_observer.await.unwrap().is_err(),
+		"an unindexed publication captured before the snapshot must refuse"
+	);
+	assert_eq!(
+		manager.tiered_pointers_snapshot().await,
+		vec![original.clone()],
+		"the old generation must not overwrite the snapshot"
+	);
+	tokio::time::timeout(Duration::from_secs(30), manager.wait_tier_authority_ready())
+		.await
+		.unwrap()
+		.expect(
+			"the rejected stale local publication must not poison canonical snapshot authority",
+		);
+	let location = manager.lookup(tenant(), key).unwrap().unwrap();
+	assert_eq!(manager.read(location).await.unwrap(), b"indexed-tier");
+	assert!(manager.unapplied_tier_pointer(original.slab_id).is_none());
+	assert_eq!(l2.get(&original.l2_uri).await.unwrap(), bytes);
+	assert_eq!(l2.get(&replacement.l2_uri).await.unwrap(), bytes);
+}
+
+impl SlabManager {
+	pub(crate) async fn remove_tier_pointer_and_mirror_rows_for_test(
+		&self,
+		slab_id: SlabId,
+	) -> std::io::Result<()> {
+		let rows = self.record_rows_for_slab_for_recovery(slab_id);
+		self.persistent_index
+			.as_ref()
+			.expect("test requires redb")
+			.apply(PersistentIndexUpdate {
+				delete_tiered_slab_ids: vec![slab_id],
+				delete_records: rows,
+				..Default::default()
+			})
+			.await
+	}
+}
+
+#[tokio::test]
+async fn legacy_published_marker_survives_later_retier_and_reopen() {
+	use crate::storage::index::RetainedObjectIntentState;
+	let (dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let old_bytes = l2.get(&old.l2_uri).await.unwrap();
+	let a = l2
+		.put("tier/legacy-published-a.wnd", &old_bytes)
+		.await
+		.unwrap();
+	let b = l2
+		.put("tier/legacy-published-b.wnd", &old_bytes)
+		.await
+		.unwrap();
+	let marker = table_drop_l2_cleanup_path(&mgr.config.dir, old.slab_id);
+	let bytes = postcard::to_stdvec(&TestLegacyCleanupMarker {
+		format_version: 2,
+		slab_id: old.slab_id,
+		old_l2_uri: old.l2_uri.clone(),
+		replacement_l2_uri: Some(a.clone()),
+		state: TestLegacyCleanupState::Unresolved,
+		retained_bytes: (old_bytes.len() * 2) as u64,
+	})
+	.unwrap();
+	std::fs::write(&marker, &bytes).unwrap();
+	mgr.load_unresolved_tier_cleanup().await.unwrap();
+	let mut pointer_a = old.clone();
+	pointer_a.l2_uri = a.clone();
+	mgr.apply_tier_slab(pointer_a.clone()).await.unwrap();
+	assert_eq!(
+		mgr.reconcile_table_drop_l2_cleanup_markers(l2.as_ref(), 1)
+			.await
+			.unwrap(),
+		(1, true)
+	);
+	let before = mgr.unresolved_tier_cleanup.test_totals();
+	assert_eq!(
+		mgr.reconcile_table_drop_l2_cleanup_markers(l2.as_ref(), 1)
+			.await
+			.unwrap(),
+		(1, true)
+	);
+	assert_eq!(mgr.unresolved_tier_cleanup.test_totals(), before);
+	mgr.persist_table_drop_l2_cleanup(old.slab_id, &a, Some(&b))
+		.await
+		.unwrap();
+	let mut pointer_b = pointer_a;
+	pointer_b.l2_uri = b.clone();
+	mgr.apply_tier_slab(pointer_b.clone()).await.unwrap();
+	assert_eq!(
+		mgr.reconcile_table_drop_l2_cleanup_markers(l2.as_ref(), 1)
+			.await
+			.unwrap(),
+		(1, false)
+	);
+	assert_eq!(
+		mgr.reconcile_table_drop_l2_cleanup_markers(l2.as_ref(), 1)
+			.await
+			.unwrap(),
+		(1, true)
+	);
+	let records = mgr
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot_cleanup_intents()
+		.await
+		.unwrap();
+	let old_record = records
+		.iter()
+		.find(|(slab, uri, _)| *slab == old.slab_id && uri == &old.l2_uri)
+		.unwrap();
+	let a_record = records
+		.iter()
+		.find(|(slab, uri, _)| *slab == old.slab_id && uri == &a)
+		.unwrap();
+	assert_eq!(old_record.2.replacement_uri.as_deref(), Some(a.as_str()));
+	assert_eq!(
+		old_record.2.state,
+		RetainedObjectIntentState::ReplacementPublished
+	);
+	assert_eq!(a_record.2.replacement_uri.as_deref(), Some(b.as_str()));
+	assert_eq!(
+		a_record.2.state,
+		RetainedObjectIntentState::ReplacementPublished
+	);
+	assert_eq!(mgr.unresolved_tier_cleanup.test_record_count(), 2);
+	let totals = mgr.unresolved_tier_cleanup.test_totals();
+	let mgr = restart_tier_manager(mgr, &dirs, &l2).await;
+	assert_eq!(mgr.tier_pointer(old.slab_id).await, Some(pointer_b));
+	let location = mgr.lookup(tenant(), id(0x421)).unwrap().unwrap();
+	assert!(!mgr.read(location).await.unwrap().is_empty());
+	assert_eq!(
+		mgr.reconcile_table_drop_l2_cleanup_markers(l2.as_ref(), 1)
+			.await
+			.unwrap(),
+		(1, true)
+	);
+	assert_eq!(mgr.unresolved_tier_cleanup.test_totals(), totals);
+	assert_eq!(mgr.unresolved_tier_cleanup.test_record_count(), 2);
+	assert_eq!(std::fs::read(&marker).unwrap(), bytes);
+	assert_eq!(l2.get(&old.l2_uri).await.unwrap(), old_bytes);
+	assert_eq!(l2.get(&a).await.unwrap(), old_bytes);
+}
+
+#[tokio::test]
+async fn legacy_unobserved_replacement_still_fences_after_retier() {
+	let (_dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let object = l2.get(&old.l2_uri).await.unwrap();
+	let a = l2
+		.put("tier/legacy-unobserved-a.wnd", &object)
+		.await
+		.unwrap();
+	let b = l2
+		.put("tier/legacy-unobserved-b.wnd", &object)
+		.await
+		.unwrap();
+	let marker = table_drop_l2_cleanup_path(&mgr.config.dir, old.slab_id);
+	let bytes = postcard::to_stdvec(&TestLegacyCleanupMarker {
+		format_version: 2,
+		slab_id: old.slab_id,
+		old_l2_uri: old.l2_uri.clone(),
+		replacement_l2_uri: Some(a),
+		state: TestLegacyCleanupState::Unresolved,
+		retained_bytes: (object.len() * 2) as u64,
+	})
+	.unwrap();
+	std::fs::write(&marker, &bytes).unwrap();
+	mgr.load_unresolved_tier_cleanup().await.unwrap();
+	let mut pointer_b = old.clone();
+	pointer_b.l2_uri = b;
+	mgr.apply_tier_slab(pointer_b).await.unwrap();
+	let error = mgr
+		.reconcile_table_drop_l2_cleanup_markers(l2.as_ref(), 1)
+		.await
+		.unwrap_err();
+	assert_eq!(
+		stale_location(&error).unwrap().reason,
+		StaleLocationReason::Fenced
+	);
+	assert_eq!(std::fs::read(marker).unwrap(), bytes);
+}
+
+#[tokio::test]
+async fn legacy_published_record_restores_accounting_after_interrupted_update() {
+	let (dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let object = l2.get(&old.l2_uri).await.unwrap();
+	let a = l2
+		.put("tier/legacy-gauge-cut-a.wnd", &object)
+		.await
+		.unwrap();
+	let marker = table_drop_l2_cleanup_path(&mgr.config.dir, old.slab_id);
+	let retained_bytes = (object.len() * 2) as u64;
+	let bytes = postcard::to_stdvec(&TestLegacyCleanupMarker {
+		format_version: 2,
+		slab_id: old.slab_id,
+		old_l2_uri: old.l2_uri.clone(),
+		replacement_l2_uri: Some(a.clone()),
+		state: TestLegacyCleanupState::Unresolved,
+		retained_bytes,
+	})
+	.unwrap();
+	std::fs::write(&marker, &bytes).unwrap();
+	mgr.load_unresolved_tier_cleanup().await.unwrap();
+	let mut pointer = old.clone();
+	pointer.l2_uri = a.clone();
+	mgr.apply_tier_slab(pointer).await.unwrap();
+	mgr.persistent_index
+		.as_ref()
+		.unwrap()
+		.mark_cleanup_replacement_published(
+			old.slab_id,
+			old.l2_uri.clone(),
+			a,
+			Some(retained_bytes),
+		)
+		.await
+		.unwrap();
+	// The durable transaction has completed; deliberately omit the in-memory update.
+	let mgr = restart_tier_manager(mgr, &dirs, &l2).await;
+	assert_eq!(
+		mgr.unresolved_tier_cleanup.test_totals(),
+		(1, retained_bytes)
+	);
+	assert_eq!(
+		mgr.reconcile_table_drop_l2_cleanup_markers(l2.as_ref(), 1)
+			.await
+			.unwrap(),
+		(1, true)
+	);
+	assert_eq!(
+		mgr.unresolved_tier_cleanup.test_totals(),
+		(1, retained_bytes)
+	);
+	assert_eq!(std::fs::read(marker).unwrap(), bytes);
+}
+
+#[tokio::test]
+async fn retained_per_uri_record_is_idempotent_and_reconstructed_on_reopen() {
+	let (dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let size = l2.head(&old.l2_uri).await.unwrap().size_bytes;
+	mgr.persist_snapshot_cleanup_intent(old.slab_id, &old.l2_uri, size)
+		.await
+		.unwrap();
+	mgr.persist_snapshot_cleanup_intent(old.slab_id, &old.l2_uri, size)
+		.await
+		.unwrap();
+	assert_eq!(mgr.unresolved_tier_cleanup.test_totals(), (1, size));
+	let mgr = restart_tier_manager(mgr, &dirs, &l2).await;
+	assert_eq!(mgr.unresolved_tier_cleanup.test_totals(), (1, size));
+	assert_new_cleanup_intent(&mgr, old.slab_id, &old.l2_uri, false).await;
+}
+
+#[tokio::test]
+async fn provisional_replacement_survives_reopen_before_proposal() {
+	let (dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let object = l2.get(&old.l2_uri).await.unwrap();
+	let a = l2
+		.put("tier/provisional-before-proposal.wnd", &object)
+		.await
+		.unwrap();
+	mgr.persist_table_drop_l2_cleanup(old.slab_id, &old.l2_uri, Some(&a))
+		.await
+		.unwrap();
+	let expected = (2, (object.len() * 2) as u64);
+	assert_eq!(mgr.unresolved_tier_cleanup.test_totals(), expected);
+	let mgr = restart_tier_manager(mgr, &dirs, &l2).await;
+	assert_eq!(mgr.unresolved_tier_cleanup.test_totals(), expected);
+	// No proposal boundary was crossed: the durable candidate is definitely unused.
+	assert_cleanup_intent_state(
+		&mgr,
+		old.slab_id,
+		&a,
+		crate::storage::index::RetainedObjectIntentState::CandidateNotSubmitted,
+	)
+	.await;
+
+	assert_eq!(mgr.tier_pointer(old.slab_id).await, Some(old.clone()));
+	assert_eq!(l2.get(&old.l2_uri).await.unwrap(), object);
+	assert_eq!(l2.get(&a).await.unwrap(), object);
+	assert_new_cleanup_intent(&mgr, old.slab_id, &old.l2_uri, false).await;
+}
+
+#[tokio::test]
+async fn publication_atomically_replaces_provisional_with_old_record() {
+	let (dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let object = l2.get(&old.l2_uri).await.unwrap();
+	let a = l2
+		.put("tier/provisional-atomic.wnd", &object)
+		.await
+		.unwrap();
+	mgr.persist_table_drop_l2_cleanup(old.slab_id, &old.l2_uri, Some(&a))
+		.await
+		.unwrap();
+	let index = mgr.persistent_index.as_ref().unwrap();
+	index
+		.fail_cleanup_after_provisional_remove
+		.store(true, std::sync::atomic::Ordering::Release);
+	assert!(
+		index
+			.mark_cleanup_replacement_published(
+				old.slab_id,
+				old.l2_uri.clone(),
+				a.clone(),
+				Some(object.len() as u64)
+			)
+			.await
+			.is_err()
+	);
+	assert_new_cleanup_intent(&mgr, old.slab_id, &old.l2_uri, false).await;
+	// No proposal boundary was crossed: the durable candidate is definitely unused.
+	assert_cleanup_intent_state(
+		&mgr,
+		old.slab_id,
+		&a,
+		crate::storage::index::RetainedObjectIntentState::CandidateNotSubmitted,
+	)
+	.await;
+
+	assert_eq!(mgr.tier_pointer(old.slab_id).await, Some(old.clone()));
+	assert_eq!(l2.get(&old.l2_uri).await.unwrap(), object);
+	assert_eq!(l2.get(&a).await.unwrap(), object);
+	assert_new_cleanup_intent(&mgr, old.slab_id, &old.l2_uri, false).await;
+	assert_eq!(
+		mgr.unresolved_tier_cleanup.test_totals(),
+		(2, (object.len() * 2) as u64)
+	);
+	mgr.persistent_index
+		.as_ref()
+		.unwrap()
+		.mark_cleanup_replacement_published(
+			old.slab_id,
+			old.l2_uri.clone(),
+			a.clone(),
+			Some(object.len() as u64),
+		)
+		.await
+		.unwrap();
+	// Inspect durable state before updating the process-local gauge.
+	assert_new_cleanup_intent(&mgr, old.slab_id, &old.l2_uri, true).await;
+	assert_no_cleanup_intent(&mgr, old.slab_id, &a).await;
+	let mgr = restart_tier_manager(mgr, &dirs, &l2).await;
+	assert_eq!(
+		mgr.unresolved_tier_cleanup.test_totals(),
+		(1, object.len() as u64)
+	);
+	assert_new_cleanup_intent(&mgr, old.slab_id, &old.l2_uri, true).await;
+	assert_no_cleanup_intent(&mgr, old.slab_id, &a).await;
+
+	assert_eq!(mgr.tier_pointer(old.slab_id).await, Some(old.clone()));
+	assert_eq!(l2.get(&old.l2_uri).await.unwrap(), object);
+	assert_eq!(l2.get(&a).await.unwrap(), object);
+}
+
+#[tokio::test]
+async fn ambiguous_replacement_resolves_after_reopen_when_published() {
+	let (dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let object = l2.get(&old.l2_uri).await.unwrap();
+	let a = l2
+		.put("tier/provisional-delayed.wnd", &object)
+		.await
+		.unwrap();
+	mgr.persist_table_drop_l2_cleanup(old.slab_id, &old.l2_uri, Some(&a))
+		.await
+		.unwrap();
+	let mgr = restart_tier_manager(mgr, &dirs, &l2).await;
+	assert_eq!(
+		mgr.unresolved_tier_cleanup.test_totals(),
+		(2, (object.len() * 2) as u64)
+	);
+	let mut pointer = old.clone();
+	pointer.l2_uri = a.clone();
+	mgr.apply_tier_slab(pointer).await.unwrap();
+	assert_eq!(
+		mgr.reconcile_table_drop_l2_cleanup_markers(l2.as_ref(), 1)
+			.await
+			.unwrap(),
+		(1, true)
+	);
+	assert_new_cleanup_intent(&mgr, old.slab_id, &old.l2_uri, true).await;
+	assert_no_cleanup_intent(&mgr, old.slab_id, &a).await;
+	assert_eq!(
+		mgr.unresolved_tier_cleanup.test_totals(),
+		(1, object.len() as u64)
+	);
+}
+
+#[tokio::test]
+async fn published_legacy_marker_does_not_starve_a_one_item_reclaim_slice() {
+	let (_dirs, mgr, l2, target, schemas, old) = unpublished_drop_fixture().await;
+	let object = l2.get(&old.l2_uri).await.unwrap();
+	let a = l2.put("tier/legacy-slice-a.wnd", &object).await.unwrap();
+	let marker = table_drop_l2_cleanup_path(&mgr.config.dir, old.slab_id);
+	let bytes = postcard::to_stdvec(&TestLegacyCleanupMarker {
+		format_version: 2,
+		slab_id: old.slab_id,
+		old_l2_uri: old.l2_uri.clone(),
+		replacement_l2_uri: Some(a.clone()),
+		state: TestLegacyCleanupState::Unresolved,
+		retained_bytes: (object.len() * 2) as u64,
+	})
+	.unwrap();
+	std::fs::write(&marker, &bytes).unwrap();
+	mgr.load_unresolved_tier_cleanup().await.unwrap();
+	let mut pointer = old.clone();
+	pointer.l2_uri = a;
+	mgr.apply_tier_slab(pointer).await.unwrap();
+	assert_eq!(
+		mgr.reconcile_table_drop_l2_cleanup_markers(l2.as_ref(), 1)
+			.await
+			.unwrap(),
+		(1, true)
+	);
+	let _proposed = propose_ambiguous_drop(&mgr, &target, &schemas, true, false).await;
+	assert_eq!(std::fs::read(marker).unwrap(), bytes);
+}
+
+#[tokio::test]
+async fn provisional_record_survives_cancellation_after_actual_upload_before_proposal() {
+	let (dirs, mgr, l2, target, schemas, old) = unpublished_drop_fixture().await;
+	let pause = mgr.pause_table_drop_after_upload_once();
+	let task = {
+		let manager = mgr.clone();
+		tokio::spawn(async move {
+			let committer = AmbiguousDropCommitter {
+				manager: manager.clone(),
+				apply_before_error: false,
+				proposed: tokio::sync::Mutex::new(None),
+			};
+			manager
+				.reclaim_table_drop_tiered_storage(tenant(), &target, &schemas, &committer, 1)
+				.await
+		})
+	};
+	tokio::time::timeout(Duration::from_secs(30), pause.reached.notified())
+		.await
+		.unwrap();
+	let entries = mgr
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot_cleanup_intents()
+		.await
+		.unwrap();
+	let replacement = entries
+		.iter()
+		.find(|(slab, uri, _)| *slab == old.slab_id && uri != &old.l2_uri)
+		.unwrap()
+		.1
+		.clone();
+	assert!(
+		l2.get(&replacement).await.is_ok(),
+		"the pause follows the actual upload"
+	);
+	let totals = mgr.unresolved_tier_cleanup.test_totals();
+	assert_eq!(totals.0, 2);
+	let retained_bytes = l2.head(&old.l2_uri).await.unwrap().size_bytes
+		+ l2.head(&replacement).await.unwrap().size_bytes;
+	assert_eq!(totals.1, retained_bytes);
+
+	task.abort();
+	assert!(task.await.unwrap_err().is_cancelled());
+	let mgr = restart_tier_manager(mgr, &dirs, &l2).await;
+	assert_eq!(mgr.unresolved_tier_cleanup.test_totals(), totals);
+	// No proposal boundary was crossed: the durable candidate is definitely unused.
+	assert_cleanup_intent_state(
+		&mgr,
+		old.slab_id,
+		&replacement,
+		crate::storage::index::RetainedObjectIntentState::CandidateNotSubmitted,
+	)
+	.await;
+
+	assert_eq!(mgr.tier_pointer(old.slab_id).await, Some(old.clone()));
+	assert!(l2.get(&old.l2_uri).await.is_ok());
+	assert!(l2.get(&replacement).await.is_ok());
+	assert_new_cleanup_intent(&mgr, old.slab_id, &old.l2_uri, false).await;
+}
+
+#[tokio::test]
+async fn snapshot_supersession_preserves_unknown_size_across_reopen() {
+	use crate::consensus::WendelonStateMachine;
+	use crate::storage::sweeper::ManagerTierObserver;
+	use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
+	use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
+
+	let (dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let object = l2.get(&old.l2_uri).await.unwrap();
+	let historical = l2
+		.put("tier/unknown-size-history.wnd", &object)
+		.await
+		.unwrap();
+	mgr.persist_snapshot_cleanup_intent(old.slab_id, &historical, object.len() as u64)
+		.await
+		.unwrap();
+	let new_uri = l2
+		.put("tier/unknown-size-snapshot.wnd", &object)
+		.await
+		.unwrap();
+	let mut replacement = old.clone();
+	replacement.l2_uri = new_uri;
+	let mut source = WendelonStateMachine::new();
+	source
+		.seed_tiered_slab_for_test(TieredSlab {
+			slab_id: replacement.slab_id,
+			l2_uri: replacement.l2_uri.clone(),
+			payload_hash: replacement.payload_hash,
+			is_encrypted: replacement.is_encrypted,
+			tenant_id: replacement.tenant_id,
+			tenant_kek_id: replacement.tenant_kek_id,
+			stats_format_version: replacement.stats_format_version,
+			stats_block_len: replacement.stats_block_len,
+			stats_block_hash128: replacement.stats_block_hash128,
+			tombstone_metadata: replacement.tombstone_metadata,
+			supersession_metadata: replacement.supersession_metadata,
+		})
+		.await;
+	RaftStateMachine::apply(
+		&mut source,
+		[Entry {
+			log_id: LogId::new(CommittedLeaderId::new(3, 1), 804),
+			payload: EntryPayload::Blank,
+		}],
+	)
+	.await
+	.unwrap();
+	let mut builder = RaftStateMachine::get_snapshot_builder(&mut source).await;
+	let built = builder.build_snapshot().await.unwrap();
+	let mut target = WendelonStateMachine::new()
+		.with_tier_observer(Arc::new(ManagerTierObserver::new(mgr.clone())));
+	RaftStateMachine::install_snapshot(&mut target, &built.meta, built.snapshot)
+		.await
+		.unwrap();
+	tokio::time::timeout(Duration::from_secs(5), mgr.wait_tier_authority_ready())
+		.await
+		.unwrap()
+		.unwrap();
+	assert_eq!(mgr.tier_pointer(old.slab_id).await, Some(replacement));
+	let expected = (2, object.len() as u64, 1);
+	assert_eq!(mgr.unresolved_tier_cleanup.test_accounting(), expected);
+	mgr.fsync_all_local_slabs().await.unwrap();
+	let crypto = mgr.config.crypto.clone();
+	drop(target);
+	let weak = Arc::downgrade(&mgr);
+	drop(mgr);
+	tokio::time::timeout(Duration::from_secs(5), async {
+		while weak.upgrade().is_some() {
+			tokio::task::yield_now().await;
+		}
+	})
+	.await
+	.unwrap();
+	let reopened = SlabManager::open(SlabManagerConfig {
+		dir: dirs[0].to_path_buf(),
+		max_slab_bytes: 1 << 20,
+		io: spawn_io_thread(64).unwrap(),
+		l2: Some(l2),
+		rehydration: Default::default(),
+		l2_column_fetch: Default::default(),
+		row_group_writer: Default::default(),
+		l2_row_group_fetch: Default::default(),
+		encoding_writer: Default::default(),
+		l2_chunk_layout: Default::default(),
+		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
+		group_commit: Default::default(),
+		crypto,
+	})
+	.await
+	.unwrap();
+	assert_eq!(reopened.unresolved_tier_cleanup.test_accounting(), expected);
+}
+
+#[tokio::test]
+async fn snapshot_removal_records_unknown_retained_size() {
+	use crate::consensus::WendelonStateMachine;
+	use crate::storage::sweeper::ManagerTierObserver;
+	use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
+	use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
+	let (_dirs, mgr, _l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let mut source = WendelonStateMachine::new();
+	RaftStateMachine::apply(
+		&mut source,
+		[Entry {
+			log_id: LogId::new(CommittedLeaderId::new(3, 1), 805),
+			payload: EntryPayload::Blank,
+		}],
+	)
+	.await
+	.unwrap();
+	let mut builder = RaftStateMachine::get_snapshot_builder(&mut source).await;
+	let built = builder.build_snapshot().await.unwrap();
+	let mut target = WendelonStateMachine::new()
+		.with_tier_observer(Arc::new(ManagerTierObserver::new(mgr.clone())));
+	RaftStateMachine::install_snapshot(&mut target, &built.meta, built.snapshot)
+		.await
+		.unwrap();
+	assert_eq!(mgr.unresolved_tier_cleanup.test_accounting(), (1, 0, 1));
+	let records = mgr
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot_cleanup_intents()
+		.await
+		.unwrap();
+	let record = records
+		.iter()
+		.find(|(slab, uri, _)| *slab == old.slab_id && uri == &old.l2_uri)
+		.unwrap();
+	assert_eq!(
+		record.2.state,
+		crate::storage::index::RetainedObjectIntentState::RetirementPublished
+	);
+	assert_eq!(
+		record.2.retirement_source,
+		Some(crate::storage::index::RetirementSource::Snapshot(805))
+	);
+}
+
+#[tokio::test]
+async fn snapshot_displacing_unverified_pointer_does_not_invent_publication_evidence() {
+	use crate::consensus::WendelonStateMachine;
+	use crate::storage::sweeper::ManagerTierObserver;
+	use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
+	use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
+	let (_dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let object = l2.get(&old.l2_uri).await.unwrap();
+	let pending_uri = l2
+		.put("tier/pending-snapshot-displaced.wnd", &object)
+		.await
+		.unwrap();
+	mgr.persist_table_drop_l2_cleanup(old.slab_id, &old.l2_uri, Some(&pending_uri))
+		.await
+		.unwrap();
+	let mut pending = old.clone();
+	pending.l2_uri = pending_uri.clone();
+	mgr.tier_authority.pending.insert(
+		old.slab_id,
+		tier_authority::PendingTierAuthority {
+			pointer: pending,
+			last_control_log_index: None,
+		},
+	);
+	let mut source = WendelonStateMachine::new();
+	source
+		.seed_tiered_slab_for_test(TieredSlab {
+			slab_id: old.slab_id,
+			l2_uri: old.l2_uri.clone(),
+			payload_hash: old.payload_hash,
+			is_encrypted: old.is_encrypted,
+			tenant_id: old.tenant_id,
+			tenant_kek_id: old.tenant_kek_id,
+			stats_format_version: old.stats_format_version,
+			stats_block_len: old.stats_block_len,
+			stats_block_hash128: old.stats_block_hash128,
+			tombstone_metadata: old.tombstone_metadata,
+			supersession_metadata: old.supersession_metadata,
+		})
+		.await;
+	RaftStateMachine::apply(
+		&mut source,
+		[Entry {
+			log_id: LogId::new(CommittedLeaderId::new(3, 1), 806),
+			payload: EntryPayload::Blank,
+		}],
+	)
+	.await
+	.unwrap();
+	let mut builder = RaftStateMachine::get_snapshot_builder(&mut source).await;
+	let built = builder.build_snapshot().await.unwrap();
+	let mut target = WendelonStateMachine::new()
+		.with_tier_observer(Arc::new(ManagerTierObserver::new(mgr.clone())));
+	RaftStateMachine::install_snapshot(&mut target, &built.meta, built.snapshot)
+		.await
+		.unwrap();
+	assert_new_cleanup_intent(&mgr, old.slab_id, &old.l2_uri, false).await;
+	assert_new_cleanup_intent(&mgr, old.slab_id, &pending_uri, false).await;
+	assert_eq!(
+		mgr.unresolved_tier_cleanup.test_accounting(),
+		(2, (object.len() * 2) as u64, 0)
+	);
+}
+
+#[tokio::test]
+async fn standalone_provisional_is_removed_only_after_its_pointer_is_live() {
+	let (dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let bytes = l2.get(&old.l2_uri).await.unwrap();
+	let a = l2
+		.put("tier/standalone-provisional-a.wnd", &bytes)
+		.await
+		.unwrap();
+	mgr.persist_ambiguous_upload_intent(old.slab_id, &a, bytes.len() as u64)
+		.await
+		.unwrap();
+	assert!(
+		mgr.reconcile_table_drop_l2_cleanup_markers(l2.as_ref(), 1)
+			.await
+			.is_err()
+	);
+	assert_new_cleanup_intent(&mgr, old.slab_id, &a, false).await;
+	let mut pointer = old.clone();
+	pointer.l2_uri = a.clone();
+	mgr.apply_tier_slab(pointer).await.unwrap();
+	assert_eq!(
+		mgr.reconcile_table_drop_l2_cleanup_markers(l2.as_ref(), 1)
+			.await
+			.unwrap(),
+		(1, true)
+	);
+	assert_no_cleanup_intent(&mgr, old.slab_id, &a).await;
+	assert_eq!(mgr.unresolved_tier_cleanup.test_accounting(), (0, 0, 0));
+	let mgr = restart_tier_manager(mgr, &dirs, &l2).await;
+	assert_no_cleanup_intent(&mgr, old.slab_id, &a).await;
+	let b = l2
+		.put("tier/standalone-provisional-b.wnd", &bytes)
+		.await
+		.unwrap();
+	mgr.persist_table_drop_l2_cleanup(old.slab_id, &a, Some(&b))
+		.await
+		.unwrap();
+}
+
+#[tokio::test]
+async fn legacy_publication_preserves_locally_known_provisional_size() {
+	let (_dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let bytes = l2.get(&old.l2_uri).await.unwrap();
+	let a = l2
+		.put("tier/legacy-known-provisional.wnd", &bytes)
+		.await
+		.unwrap();
+	let marker = table_drop_l2_cleanup_path(&mgr.config.dir, old.slab_id);
+	let marker_bytes = postcard::to_stdvec(&TestLegacyCleanupMarker {
+		format_version: 2,
+		slab_id: old.slab_id,
+		old_l2_uri: old.l2_uri.clone(),
+		replacement_l2_uri: Some(a.clone()),
+		state: TestLegacyCleanupState::Unresolved,
+		retained_bytes: (bytes.len() * 2) as u64,
+	})
+	.unwrap();
+	std::fs::write(&marker, &marker_bytes).unwrap();
+	mgr.load_unresolved_tier_cleanup().await.unwrap();
+	mgr.persist_ambiguous_upload_intent(old.slab_id, &a, bytes.len() as u64)
+		.await
+		.unwrap();
+	let mut pointer = old.clone();
+	pointer.l2_uri = a.clone();
+	mgr.apply_tier_slab(pointer).await.unwrap();
+	assert_eq!(
+		mgr.reconcile_table_drop_l2_cleanup_markers(l2.as_ref(), 1)
+			.await
+			.unwrap(),
+		(1, true)
+	);
+	let records = mgr
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot_cleanup_intents()
+		.await
+		.unwrap();
+	let record = records
+		.iter()
+		.find(|(slab, uri, _)| *slab == old.slab_id && uri == &old.l2_uri)
+		.unwrap();
+	assert_eq!(record.2.replacement_bytes, Some(bytes.len() as u64));
+	assert_no_cleanup_intent(&mgr, old.slab_id, &a).await;
+	assert_eq!(std::fs::read(marker).unwrap(), marker_bytes);
+}
+
+#[tokio::test]
+async fn snapshot_transition_records_all_matching_publication_evidence() {
+	use crate::storage::index::{RetainedObjectIntent, RetainedObjectIntentState};
+	let (_dirs, mgr, l2, _target, _schemas, current) = unpublished_drop_fixture().await;
+	let bytes = l2.get(&current.l2_uri).await.unwrap();
+	let b = l2
+		.put("tier/multiple-predecessors-next.wnd", &bytes)
+		.await
+		.unwrap();
+	let index = mgr.persistent_index.as_ref().unwrap();
+	for predecessor in ["retained-predecessor-1", "retained-predecessor-2"] {
+		index
+			.put_snapshot_cleanup_intent(
+				current.slab_id,
+				predecessor.to_owned(),
+				RetainedObjectIntent {
+					bytes: Some(5),
+					replacement_uri: Some(current.l2_uri.clone()),
+					replacement_bytes: Some(bytes.len() as u64),
+					published_replacements: Default::default(),
+					retirement_source: None,
+					state: RetainedObjectIntentState::Unresolved,
+				},
+			)
+			.await
+			.unwrap();
+	}
+	mgr.load_unresolved_tier_cleanup().await.unwrap();
+	let mut replacement = current.clone();
+	replacement.l2_uri = b;
+	mgr.record_retained_pointer_transition(&current, Some(&replacement), true)
+		.await
+		.unwrap();
+	assert_new_cleanup_intent(&mgr, current.slab_id, "retained-predecessor-1", true).await;
+	assert_new_cleanup_intent(&mgr, current.slab_id, "retained-predecessor-2", true).await;
+	assert_new_cleanup_intent(&mgr, current.slab_id, &current.l2_uri, false).await;
+	assert_eq!(
+		mgr.unresolved_tier_cleanup.test_accounting(),
+		(3, 10 + bytes.len() as u64, 0)
+	);
+}
+
+#[tokio::test]
+async fn failed_retained_intent_retry_cannot_claim_unwritten_record() {
+	let (_dirs, mgr, _l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let uri = "tier/ambiguous-retry-test.wnd";
+	let index = mgr.persistent_index.as_ref().unwrap();
+	index
+		.fail_next_cleanup_insert
+		.store(true, std::sync::atomic::Ordering::Release);
+	assert!(
+		mgr.persist_ambiguous_upload_intent(old.slab_id, uri, 123)
+			.await
+			.is_err()
+	);
+	let retry = mgr
+		.persist_ambiguous_upload_intent(old.slab_id, uri, 123)
+		.await;
+	if retry.is_ok() {
+		let entries = index.load_snapshot_cleanup_intents().await.unwrap();
+		assert!(
+			entries
+				.iter()
+				.any(|(slab, key, _)| *slab == old.slab_id && key == uri),
+			"successful retry must have a durable cleanup record"
+		);
+	}
+}
+
+#[tokio::test]
+async fn missing_cleanup_table_reopen_fences_manager() {
+	let (dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let location = mgr.lookup(tenant(), id(0x421)).unwrap().unwrap();
+	let expected = mgr.read(location).await.unwrap();
+	let object = l2.get(&old.l2_uri).await.unwrap();
+	let replacement = l2
+		.put("tier/missing-authority-committed.wnd", &object)
+		.await
+		.unwrap();
+	let marker = table_drop_l2_cleanup_path(&mgr.config.dir, old.slab_id);
+	let marker_bytes = postcard::to_stdvec(&TestLegacyCleanupMarker {
+		format_version: 2,
+		slab_id: old.slab_id,
+		old_l2_uri: old.l2_uri.clone(),
+		replacement_l2_uri: Some(replacement.clone()),
+		state: TestLegacyCleanupState::Unresolved,
+		retained_bytes: (object.len() * 2) as u64,
+	})
+	.unwrap();
+	std::fs::write(&marker, &marker_bytes).unwrap();
+	mgr.persistent_index
+		.as_ref()
+		.unwrap()
+		.remove_cleanup_table_for_test()
+		.await
+		.unwrap();
+	let reopened = try_restart_tier_manager(mgr, &dirs, &l2).await.unwrap();
+	reopened.wait_tier_authority_ready().await.unwrap();
+	assert_eq!(
+		reopened.tier_authority_readiness_reason().as_deref(),
+		Some("TierCleanupAuthorityMissing(RestartRequired)")
+	);
+	assert!(metrics().storage_cleanup_authority_missing.get() >= 1);
+	assert!(
+		metrics()
+			.render_prometheus()
+			.contains("wendelon_storage_cleanup_authority_missing")
+	);
+	assert!(
+		reopened
+			.persistent_index
+			.as_ref()
+			.unwrap()
+			.load_snapshot_cleanup_intents()
+			.await
+			.is_err()
+	);
+	assert!(
+		reopened
+			.persist_ambiguous_upload_intent(old.slab_id, "tier/forbidden-provisional", 1)
+			.await
+			.is_err()
+	);
+	assert_eq!(
+		reopened
+			.read(reopened.lookup(tenant(), id(0x421)).unwrap().unwrap())
+			.await
+			.unwrap(),
+		expected
+	);
+	assert!(
+		reopened
+			.reconcile_table_drop_l2_cleanup_markers(l2.as_ref(), 10)
+			.await
+			.is_err()
+	);
+	assert!(
+		reopened
+			.stage_table_drop_l2_cleanup(old.slab_id, &old.l2_uri, Some(1), None)
+			.await
+			.is_err()
+	);
+	assert!(reopened.retire_tiered_slab(old.slab_id).await.is_err());
+	{
+		use crate::storage::sweeper::{SlabSweeper, SweeperConfig};
+		let committer = Arc::new(AmbiguousDropCommitter {
+			manager: reopened.clone(),
+			apply_before_error: false,
+			proposed: tokio::sync::Mutex::new(None),
+		});
+		let sweeper = SlabSweeper::new(
+			reopened.clone(),
+			l2.clone(),
+			committer.clone(),
+			crate::consensus::WendelonStateMachine::new(),
+			SweeperConfig::default(),
+		);
+		assert!(sweeper.sweep_once().await.is_err());
+		assert!(committer.proposed.lock().await.is_none());
+	}
+	let mut new_pointer = old.clone();
+	new_pointer.l2_uri = replacement;
+	assert!(reopened.apply_tier_slab(new_pointer.clone()).await.is_err());
+	let index = reopened.persistent_index.as_ref().unwrap();
+	index
+		.fail_cleanup_gap_before_commit
+		.store(true, std::sync::atomic::Ordering::Release);
+	assert!(
+		index
+			.apply(PersistentIndexUpdate {
+				put_tiered_slabs: vec![new_pointer.clone()],
+				..Default::default()
+			})
+			.await
+			.is_err()
+	);
+	assert_eq!(index.cleanup_authority_gap_count().await.unwrap(), 0);
+	assert!(
+		index
+			.load_snapshot()
+			.await
+			.unwrap()
+			.tiered_slabs
+			.iter()
+			.any(|pointer| pointer == &old)
+	);
+	let before = metrics()
+		.storage_cleanup_unrecorded_supersessions_total
+		.get();
+	reopened
+		.apply_tier_slab_committed(new_pointer.clone(), Some(813))
+		.await
+		.unwrap();
+	assert_eq!(
+		reopened.tier_pointer(old.slab_id).await,
+		Some(new_pointer.clone())
+	);
+	reopened
+		.apply_tier_slab_committed(new_pointer, Some(813))
+		.await
+		.unwrap();
+	assert_eq!(
+		reopened
+			.read(reopened.lookup(tenant(), id(0x421)).unwrap().unwrap())
+			.await
+			.unwrap(),
+		expected
+	);
+	assert_eq!(
+		metrics()
+			.storage_cleanup_unrecorded_supersessions_total
+			.get(),
+		before + 1
+	);
+	let index = reopened.persistent_index.as_ref().unwrap();
+	assert_eq!(index.cleanup_authority_gap_count().await.unwrap(), 1);
+	index.restore_cleanup_table_for_test().await.unwrap();
+	assert!(
+		reopened.require_cleanup_authority().is_err(),
+		"fence is sticky until restart"
+	);
+	assert_eq!(
+		reopened.tier_authority_readiness_reason().as_deref(),
+		Some("TierCleanupAuthorityMissing(RestartRequired)")
+	);
+	assert!(metrics().storage_cleanup_authority_missing.get() >= 1);
+	assert!(
+		reopened
+			.reconcile_table_drop_l2_cleanup_markers(l2.as_ref(), 10)
+			.await
+			.is_err()
+	);
+	assert_eq!(std::fs::read(&marker).unwrap(), marker_bytes);
+	let reopened = restart_tier_manager(reopened, &dirs, &l2).await;
+	assert!(reopened.require_cleanup_authority().is_ok());
+	assert_eq!(
+		reopened
+			.persistent_index
+			.as_ref()
+			.unwrap()
+			.cleanup_authority_gap_count()
+			.await
+			.unwrap(),
+		1
+	);
+	assert!(metrics().storage_cleanup_unrecorded_supersessions.get() >= 1);
+	assert!(
+		metrics()
+			.render_prometheus()
+			.contains("wendelon_storage_cleanup_unrecorded_supersessions")
+	);
+	assert_eq!(std::fs::read(marker).unwrap(), marker_bytes);
+}
+
+#[tokio::test]
+async fn snapshot_republishes_old_uri_then_retier_to_new_uri() {
+	let (dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let bytes = l2.get(&old.l2_uri).await.unwrap();
+	let a = l2.put("tier/reuse-a.wnd", &bytes).await.unwrap();
+	let b = l2.put("tier/reuse-b.wnd", &bytes).await.unwrap();
+	let c = l2.put("tier/reuse-c.wnd", &bytes).await.unwrap();
+	mgr.persist_table_drop_l2_cleanup(old.slab_id, &old.l2_uri, Some(&a))
+		.await
+		.unwrap();
+	let mut pointer_a = old.clone();
+	pointer_a.l2_uri = a.clone();
+	mgr.apply_tier_slab(pointer_a).await.unwrap();
+	mgr.reconcile_table_drop_l2_cleanup_markers(l2.as_ref(), 10)
+		.await
+		.unwrap();
+	mgr.begin_tier_snapshot_install().unwrap();
+	mgr.finish_tier_snapshot_install(vec![old.clone()], Some(807))
+		.await
+		.unwrap();
+	mgr.wait_tier_authority_ready().await.unwrap();
+	assert_eq!(
+		mgr.tier_pointer(old.slab_id).await.unwrap().l2_uri,
+		old.l2_uri
+	);
+	mgr.reconcile_table_drop_l2_cleanup_markers(l2.as_ref(), 10)
+		.await
+		.unwrap();
+	mgr.persist_table_drop_l2_cleanup(old.slab_id, &old.l2_uri, Some(&b))
+		.await
+		.expect(
+			"later re-tier from a republished old URI must not conflict with its historical record",
+		);
+	let mut pointer_b = old.clone();
+	pointer_b.l2_uri = b.clone();
+	mgr.apply_tier_slab(pointer_b).await.unwrap();
+	mgr.reconcile_table_drop_l2_cleanup_markers(l2.as_ref(), 10)
+		.await
+		.unwrap();
+	mgr.begin_tier_snapshot_install().unwrap();
+	mgr.finish_tier_snapshot_install(vec![old.clone()], Some(808))
+		.await
+		.unwrap();
+	mgr.wait_tier_authority_ready().await.unwrap();
+	mgr.reconcile_table_drop_l2_cleanup_markers(l2.as_ref(), 10)
+		.await
+		.unwrap();
+	mgr.persist_table_drop_l2_cleanup(old.slab_id, &old.l2_uri, Some(&c))
+		.await
+		.unwrap();
+	let mut pointer_c = old.clone();
+	pointer_c.l2_uri = c.clone();
+	mgr.apply_tier_slab(pointer_c).await.unwrap();
+	mgr.reconcile_table_drop_l2_cleanup_markers(l2.as_ref(), 10)
+		.await
+		.unwrap();
+	let records = mgr
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot_cleanup_intents()
+		.await
+		.unwrap();
+	let old_records: Vec<_> = records
+		.iter()
+		.filter(|(slab, uri, _)| *slab == old.slab_id && uri == &old.l2_uri)
+		.collect();
+	assert_eq!(old_records.len(), 1);
+	for uri in [&a, &b, &c] {
+		assert!(old_records[0].2.published_replacements.contains(uri));
+	}
+	let totals = mgr.unresolved_tier_cleanup.test_accounting();
+	assert_eq!(totals, (3, (bytes.len() * 3) as u64, 0));
+	let mgr = restart_tier_manager(mgr, &dirs, &l2).await;
+	assert_eq!(mgr.unresolved_tier_cleanup.test_accounting(), totals);
+	let records = mgr
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot_cleanup_intents()
+		.await
+		.unwrap();
+	let record = records
+		.iter()
+		.find(|(slab, uri, _)| *slab == old.slab_id && uri == &old.l2_uri)
+		.unwrap();
+	for uri in [&a, &b, &c] {
+		assert!(record.2.published_replacements.contains(uri));
+	}
+}
+
+#[tokio::test]
+async fn legacy_evidence_survives_republished_old_uri_and_new_replacement() {
+	let (dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let bytes = l2.get(&old.l2_uri).await.unwrap();
+	let a = l2.put("tier/legacy-reuse-a.wnd", &bytes).await.unwrap();
+	let b = l2.put("tier/legacy-reuse-b.wnd", &bytes).await.unwrap();
+	let marker = table_drop_l2_cleanup_path(&mgr.config.dir, old.slab_id);
+	let marker_bytes = postcard::to_stdvec(&TestLegacyCleanupMarker {
+		format_version: 2,
+		slab_id: old.slab_id,
+		old_l2_uri: old.l2_uri.clone(),
+		replacement_l2_uri: Some(a.clone()),
+		state: TestLegacyCleanupState::Unresolved,
+		retained_bytes: (bytes.len() * 2) as u64,
+	})
+	.unwrap();
+	std::fs::write(&marker, &marker_bytes).unwrap();
+	mgr.load_unresolved_tier_cleanup().await.unwrap();
+	let mut pointer_a = old.clone();
+	pointer_a.l2_uri = a.clone();
+	mgr.apply_tier_slab(pointer_a).await.unwrap();
+	mgr.reconcile_table_drop_l2_cleanup_markers(l2.as_ref(), 10)
+		.await
+		.unwrap();
+	mgr.begin_tier_snapshot_install().unwrap();
+	mgr.finish_tier_snapshot_install(vec![old.clone()], Some(809))
+		.await
+		.unwrap();
+	mgr.wait_tier_authority_ready().await.unwrap();
+	mgr.reconcile_table_drop_l2_cleanup_markers(l2.as_ref(), 10)
+		.await
+		.unwrap();
+	mgr.persist_table_drop_l2_cleanup(old.slab_id, &old.l2_uri, Some(&b))
+		.await
+		.unwrap();
+	let mut pointer_b = old.clone();
+	pointer_b.l2_uri = b.clone();
+	mgr.apply_tier_slab(pointer_b).await.unwrap();
+	mgr.reconcile_table_drop_l2_cleanup_markers(l2.as_ref(), 10)
+		.await
+		.unwrap();
+	let totals = mgr.unresolved_tier_cleanup.test_accounting();
+	assert_eq!(totals, (1, (bytes.len() * 2) as u64, 0));
+	let mgr = restart_tier_manager(mgr, &dirs, &l2).await;
+	assert_eq!(mgr.unresolved_tier_cleanup.test_accounting(), totals);
+	assert_eq!(std::fs::read(marker).unwrap(), marker_bytes);
+	assert!(mgr.refuse_unresolved_cleanup(old.slab_id).is_ok());
+	let records = mgr
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot_cleanup_intents()
+		.await
+		.unwrap();
+	let old_record = records
+		.iter()
+		.find(|(slab, uri, _)| *slab == old.slab_id && uri == &old.l2_uri)
+		.unwrap();
+	assert!(old_record.2.published_replacements.contains(&a));
+	assert!(old_record.2.published_replacements.contains(&b));
+}
+
+#[tokio::test]
+async fn cleanup_record_refuses_two_unresolved_replacements() {
+	use crate::storage::index::{RetainedObjectIntent, RetainedObjectIntentState};
+	let (_dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let bytes = l2.get(&old.l2_uri).await.unwrap();
+	let a = l2.put("tier/conflict-a.wnd", &bytes).await.unwrap();
+	mgr.persist_table_drop_l2_cleanup(old.slab_id, &old.l2_uri, Some(&a))
+		.await
+		.unwrap();
+	let intent = RetainedObjectIntent {
+		bytes: Some(bytes.len() as u64),
+		replacement_uri: Some("tier/conflict-b.wnd".into()),
+		replacement_bytes: None,
+		published_replacements: Default::default(),
+		retirement_source: None,
+		state: RetainedObjectIntentState::Unresolved,
+	};
+	let err = mgr
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.put_cleanup_intent_pair(old.slab_id, old.l2_uri, intent, None)
+		.await
+		.unwrap_err();
+	assert_eq!(err.kind(), ErrorKind::InvalidData);
+}
+
+#[tokio::test]
+async fn snapshot_new_replacement_preserves_prior_publication_evidence() {
+	let (_dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let bytes = l2.get(&old.l2_uri).await.unwrap();
+	let a = l2.put("tier/snapshot-reuse-a.wnd", &bytes).await.unwrap();
+	let b = l2.put("tier/snapshot-reuse-b.wnd", &bytes).await.unwrap();
+	mgr.persist_table_drop_l2_cleanup(old.slab_id, &old.l2_uri, Some(&a))
+		.await
+		.unwrap();
+	let mut ptr_a = old.clone();
+	ptr_a.l2_uri = a.clone();
+	mgr.apply_tier_slab(ptr_a).await.unwrap();
+	mgr.reconcile_table_drop_l2_cleanup_markers(l2.as_ref(), 10)
+		.await
+		.unwrap();
+	mgr.begin_tier_snapshot_install().unwrap();
+	mgr.finish_tier_snapshot_install(vec![old.clone()], Some(810))
+		.await
+		.unwrap();
+	mgr.wait_tier_authority_ready().await.unwrap();
+	mgr.reconcile_table_drop_l2_cleanup_markers(l2.as_ref(), 10)
+		.await
+		.unwrap();
+	let mut ptr_b = old.clone();
+	ptr_b.l2_uri = b.clone();
+	mgr.begin_tier_snapshot_install().unwrap();
+	mgr.finish_tier_snapshot_install(vec![ptr_b], Some(811))
+		.await
+		.unwrap();
+	mgr.wait_tier_authority_ready().await.unwrap();
+	mgr.reconcile_table_drop_l2_cleanup_markers(l2.as_ref(), 10)
+		.await
+		.unwrap();
+	let records = mgr
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot_cleanup_intents()
+		.await
+		.unwrap();
+	let record = records
+		.iter()
+		.find(|(slab, uri, _)| *slab == old.slab_id && uri == &old.l2_uri)
+		.unwrap();
+	assert!(record.2.published_replacements.contains(&a));
+	assert!(record.2.published_replacements.contains(&b));
+}
+
+#[tokio::test]
+async fn retier_can_target_uri_with_existing_retained_history() {
+	let (_dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let bytes = l2.get(&old.l2_uri).await.unwrap();
+	let x = l2.put("tier/history-x.wnd", &bytes).await.unwrap();
+	let a = l2.put("tier/history-a.wnd", &bytes).await.unwrap();
+	mgr.persist_table_drop_l2_cleanup(old.slab_id, &old.l2_uri, Some(&x))
+		.await
+		.unwrap();
+	let mut pointer_x = old.clone();
+	pointer_x.l2_uri = x.clone();
+	mgr.apply_tier_slab(pointer_x).await.unwrap();
+	mgr.reconcile_table_drop_l2_cleanup_markers(l2.as_ref(), 10)
+		.await
+		.unwrap();
+	mgr.persist_table_drop_l2_cleanup(old.slab_id, &x, Some(&a))
+		.await
+		.unwrap();
+	let mut pointer_a = old.clone();
+	pointer_a.l2_uri = a.clone();
+	mgr.apply_tier_slab(pointer_a.clone()).await.unwrap();
+	mgr.reconcile_table_drop_l2_cleanup_markers(l2.as_ref(), 10)
+		.await
+		.unwrap();
+	mgr.begin_tier_snapshot_install().unwrap();
+	mgr.finish_tier_snapshot_install(vec![old.clone()], Some(812))
+		.await
+		.unwrap();
+	mgr.wait_tier_authority_ready().await.unwrap();
+	mgr.reconcile_table_drop_l2_cleanup_markers(l2.as_ref(), 10)
+		.await
+		.unwrap();
+	mgr.persist_table_drop_l2_cleanup(old.slab_id, &old.l2_uri, Some(&a))
+		.await
+		.expect("a previously retained replacement must not conflict with its own history");
+	mgr.apply_tier_slab(pointer_a).await.unwrap();
+	mgr.reconcile_table_drop_l2_cleanup_markers(l2.as_ref(), 10)
+		.await
+		.unwrap();
+	assert!(mgr.refuse_unresolved_cleanup(old.slab_id).is_ok());
+}
+
+#[tokio::test]
+async fn committed_tier_retirement_records_gap_when_cleanup_authority_is_missing() {
+	let (dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	mgr.persistent_index
+		.as_ref()
+		.unwrap()
+		.remove_cleanup_table_for_test()
+		.await
+		.unwrap();
+	let mgr = try_restart_tier_manager(mgr, &dirs, &l2).await.unwrap();
+	mgr.wait_tier_authority_ready().await.unwrap();
+	assert!(mgr.retire_tiered_slab(old.slab_id).await.is_err());
+	let before = metrics()
+		.storage_cleanup_unrecorded_supersessions_total
+		.get();
+	assert!(
+		mgr.retire_tiered_slab_committed(old.slab_id, Some(814))
+			.await
+			.unwrap()
+	);
+	assert!(mgr.tier_pointer(old.slab_id).await.is_none());
+	assert_eq!(
+		mgr.persistent_index
+			.as_ref()
+			.unwrap()
+			.cleanup_authority_gap_count()
+			.await
+			.unwrap(),
+		1
+	);
+	assert_eq!(
+		metrics()
+			.storage_cleanup_unrecorded_supersessions_total
+			.get(),
+		before + 1
+	);
+	mgr.persistent_index
+		.as_ref()
+		.unwrap()
+		.restore_cleanup_table_for_test()
+		.await
+		.unwrap();
+	let mgr = restart_tier_manager(mgr, &dirs, &l2).await;
+	assert_eq!(
+		mgr.persistent_index
+			.as_ref()
+			.unwrap()
+			.cleanup_authority_gap_count()
+			.await
+			.unwrap(),
+		1
+	);
+}
+
+#[tokio::test]
+async fn committed_snapshot_replacement_records_missing_cleanup_gap() {
+	let (dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let loc = mgr.lookup(tenant(), id(0x421)).unwrap().unwrap();
+	let expected = mgr.read(loc).await.unwrap();
+	let bytes = l2.get(&old.l2_uri).await.unwrap();
+	let uri = l2
+		.put("tier/missing-cleanup-snapshot.wnd", &bytes)
+		.await
+		.unwrap();
+	mgr.persistent_index
+		.as_ref()
+		.unwrap()
+		.remove_cleanup_table_for_test()
+		.await
+		.unwrap();
+	let mgr = try_restart_tier_manager(mgr, &dirs, &l2).await.unwrap();
+	mgr.wait_tier_authority_ready().await.unwrap();
+	let mut next = old.clone();
+	next.l2_uri = uri;
+	mgr.begin_tier_snapshot_install().unwrap();
+	mgr.finish_tier_snapshot_install(vec![next.clone()], Some(815))
+		.await
+		.unwrap();
+	mgr.wait_tier_authority_ready().await.unwrap();
+	assert_eq!(mgr.tier_pointer(old.slab_id).await, Some(next));
+	assert_eq!(
+		mgr.read(mgr.lookup(tenant(), id(0x421)).unwrap().unwrap())
+			.await
+			.unwrap(),
+		expected
+	);
+	assert_eq!(
+		mgr.persistent_index
+			.as_ref()
+			.unwrap()
+			.cleanup_authority_gap_count()
+			.await
+			.unwrap(),
+		1
+	);
+	assert!(mgr.require_cleanup_authority().is_err());
+}
+
+#[tokio::test]
+async fn missing_cleanup_history_remains_visible_after_table_restored_without_a_gap() {
+	let (dirs, mgr, l2, _target, _schemas, _old) = unpublished_drop_fixture().await;
+	mgr.persistent_index
+		.as_ref()
+		.unwrap()
+		.remove_cleanup_table_for_test()
+		.await
+		.unwrap();
+	let mgr = try_restart_tier_manager(mgr, &dirs, &l2).await.unwrap();
+	mgr.wait_tier_authority_ready().await.unwrap();
+	assert!(mgr.require_cleanup_authority().is_err());
+	assert_eq!(
+		mgr.persistent_index
+			.as_ref()
+			.unwrap()
+			.cleanup_authority_gap_count()
+			.await
+			.unwrap(),
+		0
+	);
+	assert!(metrics().storage_cleanup_history_incomplete.get() >= 1);
+	mgr.persistent_index
+		.as_ref()
+		.unwrap()
+		.restore_cleanup_table_for_test()
+		.await
+		.unwrap();
+	let mgr = restart_tier_manager(mgr, &dirs, &l2).await;
+	assert!(mgr.require_cleanup_authority().is_ok());
+	assert_eq!(
+		mgr.persistent_index
+			.as_ref()
+			.unwrap()
+			.cleanup_authority_gap_count()
+			.await
+			.unwrap(),
+		0
+	);
+	assert!(metrics().storage_cleanup_history_incomplete.get() >= 1);
+	assert!(
+		metrics()
+			.render_prometheus()
+			.contains("wendelon_storage_cleanup_history_incomplete")
+	);
+}
+#[tokio::test]
+async fn committed_snapshot_retirement_does_not_block_unrelated_reads_when_cleanup_missing() {
+	let (dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let key = id(0xdc122);
+	mgr.append_durable(tenant(), key, hlc(900), b"unrelated")
+		.await
+		.unwrap();
+	mgr.persistent_index
+		.as_ref()
+		.unwrap()
+		.remove_cleanup_table_for_test()
+		.await
+		.unwrap();
+	let mgr = try_restart_tier_manager(mgr, &dirs, &l2).await.unwrap();
+	mgr.wait_tier_authority_ready().await.unwrap();
+	mgr.begin_tier_snapshot_install().unwrap();
+	mgr.finish_tier_snapshot_install(vec![], Some(816))
+		.await
+		.unwrap();
+	mgr.wait_tier_authority_ready()
+		.await
+		.expect("committed retirement must not strand the node behind a local sweep fence");
+	let location = mgr.lookup(tenant(), key).unwrap().unwrap();
+	assert_eq!(mgr.read(location).await.unwrap(), b"unrelated");
+	assert!(mgr.tier_pointer(old.slab_id).await.is_none());
+	assert_eq!(
+		mgr.persistent_index
+			.as_ref()
+			.unwrap()
+			.cleanup_authority_gap_count()
+			.await
+			.unwrap(),
+		1
+	);
+}
+
+#[tokio::test]
+async fn cancelled_snapshot_after_retirement_mark_reopens_fenced() {
+	let (dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let pause = mgr.pause_snapshot_after_retirement_mark_once();
+	mgr.begin_tier_snapshot_install().unwrap();
+	let task = {
+		let mgr = mgr.clone();
+		tokio::spawn(async move { mgr.finish_tier_snapshot_install(vec![], Some(817)).await })
+	};
+	tokio::time::timeout(Duration::from_secs(60), pause.reached.notified())
+		.await
+		.unwrap();
+	let marks = mgr
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot_retirement_marks()
+		.await
+		.unwrap();
+	assert_eq!(marks.len(), 1);
+	assert_eq!(marks[0].pointer, old);
+	assert_eq!(marks[0].snapshot_index, Some(817));
+	task.abort();
+	assert!(task.await.unwrap_err().is_cancelled());
+	let reopened = try_restart_tier_manager(mgr, &dirs, &l2).await.unwrap();
+	let marks = reopened
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot_retirement_marks()
+		.await
+		.unwrap();
+	assert_eq!(marks.len(), 1);
+	assert_eq!(marks[0].pointer, old);
+	assert!(
+		reopened.require_tier_authority_ready().is_err(),
+		"pending durable retirement must not expose stale tier state"
+	);
+	reopened
+		.fence_local_tiers_absent_from_committed(&std::collections::HashSet::new(), Some(817))
+		.await
+		.unwrap();
+	reopened.wait_tier_authority_ready().await.unwrap();
+	assert!(reopened.tier_pointer(old.slab_id).await.is_none());
+	assert!(
+		reopened
+			.persistent_index
+			.as_ref()
+			.unwrap()
+			.load_snapshot_retirement_marks()
+			.await
+			.unwrap()
+			.is_empty()
+	);
+	assert_eq!(
+		reopened.unresolved_tier_cleanup.test_accounting(),
+		(1, 0, 1)
+	);
+}
+
+#[tokio::test]
+async fn snapshot_retirement_fence_only_blocks_affected_slab_reads() {
+	let (_dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let unrelated_key = id(0xdc123);
+	mgr.append_durable(tenant(), unrelated_key, hlc(901), b"unrelated")
+		.await
+		.unwrap();
+	let pause = mgr.pause_snapshot_before_retirement_apply_once();
+	let epoch = mgr.begin_tier_snapshot_install().unwrap();
+	let task = {
+		let mgr = mgr.clone();
+		tokio::spawn(async move {
+			mgr.finish_tier_snapshot_install_at_epoch(vec![], Some(818), epoch)
+				.await
+		})
+	};
+	tokio::time::timeout(Duration::from_secs(60), pause.reached.notified())
+		.await
+		.unwrap();
+	let unrelated = mgr.lookup(tenant(), unrelated_key);
+	let old_lookup = mgr.lookup(tenant(), id(0x421));
+	let locality = Locality::from(unrelated_key);
+	let unrelated_scan = mgr.scan(tenant(), locality, locality);
+	let affected_scan = mgr.scan(tenant(), Locality::new(40), Locality::new(40));
+	let read_result = match unrelated.as_ref() {
+		Ok(Some(location)) => mgr.read(*location).await,
+		_ => Err(Error::other("unrelated lookup refused")),
+	};
+	pause.resume.notify_one();
+	let task_result = task.await.unwrap();
+	assert!(
+		unrelated.is_ok() && read_result.as_ref().is_ok_and(|v| v == b"unrelated"),
+		"unrelated lookup/read refused: {unrelated:?}, {read_result:?}"
+	);
+	assert!(
+		unrelated_scan.is_ok_and(|rows| rows.len() == 1),
+		"unrelated range scan must proceed"
+	);
+	assert!(
+		affected_scan.is_err(),
+		"range including retiring slab must refuse"
+	);
+	assert!(old_lookup.is_err(), "retiring slab must remain fenced");
+	task_result.unwrap();
+	assert!(mgr.tier_pointer(old.slab_id).await.is_none());
+	assert!(l2.get(&old.l2_uri).await.is_ok());
+}
+
+#[tokio::test]
+async fn newer_snapshot_takes_over_or_cancels_pending_retirement() {
+	for keep_old in [false, true] {
+		let (_dirs, mgr, _l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+		let pause = mgr.pause_snapshot_before_retirement_apply_once();
+		let first_epoch = mgr.begin_tier_snapshot_install().unwrap();
+		let first = {
+			let mgr = mgr.clone();
+			tokio::spawn(async move {
+				mgr.finish_tier_snapshot_install_at_epoch(vec![], Some(820), first_epoch)
+					.await
+			})
+		};
+		tokio::time::timeout(Duration::from_secs(60), pause.reached.notified())
+			.await
+			.unwrap();
+		let newer_epoch = mgr.begin_tier_snapshot_install().unwrap();
+		let pointers = if keep_old { vec![old.clone()] } else { vec![] };
+		mgr.finish_tier_snapshot_install_at_epoch(pointers, Some(821), newer_epoch)
+			.await
+			.unwrap();
+		pause.resume.notify_one();
+		first.await.unwrap().unwrap();
+		assert_eq!(mgr.tier_pointer(old.slab_id).await.is_some(), keep_old);
+		assert!(
+			mgr.persistent_index
+				.as_ref()
+				.unwrap()
+				.load_snapshot_retirement_marks()
+				.await
+				.unwrap()
+				.is_empty()
+		);
+		mgr.wait_tier_authority_ready().await.unwrap();
+	}
+}
+
+#[tokio::test]
+async fn newer_committed_pointer_cancels_obsolete_snapshot_retirement() {
+	let (_dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let bytes = l2.get(&old.l2_uri).await.unwrap();
+	let uri = l2
+		.put("tier/after-pending-snapshot.wnd", &bytes)
+		.await
+		.unwrap();
+	let pause = mgr.pause_snapshot_before_retirement_apply_once();
+	let epoch = mgr.begin_tier_snapshot_install().unwrap();
+	let first = {
+		let mgr = mgr.clone();
+		tokio::spawn(async move {
+			mgr.finish_tier_snapshot_install_at_epoch(vec![], Some(822), epoch)
+				.await
+		})
+	};
+	tokio::time::timeout(Duration::from_secs(60), pause.reached.notified())
+		.await
+		.unwrap();
+	let mut replacement = old.clone();
+	replacement.l2_uri = uri;
+	mgr.apply_tier_slab_committed(replacement.clone(), Some(823))
+		.await
+		.unwrap();
+	pause.resume.notify_one();
+	first.await.unwrap().unwrap();
+	assert_eq!(mgr.tier_pointer(old.slab_id).await, Some(replacement));
+	assert!(
+		mgr.persistent_index
+			.as_ref()
+			.unwrap()
+			.load_snapshot_retirement_marks()
+			.await
+			.unwrap()
+			.is_empty()
+	);
+	mgr.wait_tier_authority_ready().await.unwrap();
+}
+
+#[tokio::test]
+async fn snapshot_retirement_waits_for_tier_lock_without_blocking_other_reads() {
+	let (_dirs, mgr, _l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let key = id(0xdc124);
+	mgr.append_durable(tenant(), key, hlc(902), b"unrelated-lock")
+		.await
+		.unwrap();
+	let pause = mgr.pause_snapshot_before_retirement_apply_once();
+	let epoch = mgr.begin_tier_snapshot_install().unwrap();
+	let mut task = {
+		let mgr = mgr.clone();
+		tokio::spawn(async move {
+			mgr.finish_tier_snapshot_install_at_epoch(vec![], Some(824), epoch)
+				.await
+		})
+	};
+	tokio::time::timeout(Duration::from_secs(60), pause.reached.notified())
+		.await
+		.unwrap();
+	let tier_lock = mgr.tier_publication_lock(old.slab_id);
+	let guard = tier_lock.lock().await;
+	pause.resume.notify_one();
+	assert!(
+		tokio::time::timeout(Duration::from_millis(100), &mut task)
+			.await
+			.is_err()
+	);
+	let location = mgr.lookup(tenant(), key).unwrap().unwrap();
+	assert_eq!(mgr.read(location).await.unwrap(), b"unrelated-lock");
+	drop(guard);
+	tokio::time::timeout(Duration::from_secs(5), task)
+		.await
+		.unwrap()
+		.unwrap()
+		.unwrap();
+}
+
+#[tokio::test]
+async fn snapshot_retirement_gap_and_pointer_removal_roll_back_together() {
+	let (dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	mgr.persistent_index
+		.as_ref()
+		.unwrap()
+		.remove_cleanup_table_for_test()
+		.await
+		.unwrap();
+	let mgr = try_restart_tier_manager(mgr, &dirs, &l2).await.unwrap();
+	mgr.wait_tier_authority_ready().await.unwrap();
+	mgr.persistent_index
+		.as_ref()
+		.unwrap()
+		.fail_cleanup_gap_before_commit
+		.store(true, std::sync::atomic::Ordering::Release);
+	let epoch = mgr.begin_tier_snapshot_install().unwrap();
+	assert!(
+		mgr.finish_tier_snapshot_install_at_epoch(vec![], Some(825), epoch)
+			.await
+			.is_err()
+	);
+	let index = mgr.persistent_index.as_ref().unwrap();
+	assert_eq!(index.cleanup_authority_gap_count().await.unwrap(), 0);
+	assert_eq!(mgr.tier_pointer(old.slab_id).await, Some(old.clone()));
+	assert_eq!(
+		index.load_snapshot_retirement_marks().await.unwrap().len(),
+		1
+	);
+	assert!(
+		index
+			.load_snapshot()
+			.await
+			.unwrap()
+			.tiered_slabs
+			.iter()
+			.any(|p| p == &old)
+	);
+	let newer = mgr.begin_tier_snapshot_install().unwrap();
+	mgr.finish_tier_snapshot_install_at_epoch(vec![], Some(826), newer)
+		.await
+		.unwrap();
+	assert!(mgr.tier_pointer(old.slab_id).await.is_none());
+	assert_eq!(index.cleanup_authority_gap_count().await.unwrap(), 1);
+	assert!(
+		index
+			.load_snapshot_retirement_marks()
+			.await
+			.unwrap()
+			.is_empty()
+	);
+}
+
+#[tokio::test]
+async fn secondary_index_lookup_scopes_pending_snapshot_retirement() {
+	let (_dir, mgr) = fresh_manager().await;
+	let table = secondary_index_table_descriptor_for_test();
+	let descriptor = secondary_index_descriptor_for_test();
+	append_secondary_index_table_row_for_test(&mgr, &table, 1, Some(10), hlc(10)).await;
+	let retired_slab = force_seal_active(&mgr).await;
+	let unaffected =
+		append_secondary_index_table_row_for_test(&mgr, &table, 2, Some(20), hlc(20)).await;
+	force_seal_active(&mgr).await;
+	mgr.run_secondary_index_backfill_once(tenant(), &table, &descriptor, 8, 4096)
+		.await
+		.unwrap();
+	mgr.tier_authority
+		.mark_snapshot_retirement(retired_slab, 99, Some(828));
+	let request = |value| {
+		TableLookupByIndexRequest::from_descriptor(
+			tenant(),
+			&descriptor,
+			IndexQuery::PointEqual {
+				encoded_key: secondary_index_encoded_i64_for_test(value),
+			},
+			hlc(99),
+		)
+	};
+	let report = mgr
+		.table_lookup_by_index(&request(20), &descriptor, SecondaryIndexState::Ready)
+		.await
+		.unwrap();
+	assert_eq!(report.rows.len(), 1);
+	assert_eq!(report.rows[0].row_key_id, unaffected);
+	assert!(
+		mgr.table_lookup_by_index(&request(10), &descriptor, SecondaryIndexState::Ready)
+			.await
+			.is_err()
+	);
+	mgr.tier_authority
+		.clear_snapshot_retirement(retired_slab, 99);
+}
+
+#[tokio::test]
+async fn snapshot_retirement_uses_locally_known_replacement_size() {
+	let (_dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let bytes = l2.get(&old.l2_uri).await.unwrap();
+	let uri = l2
+		.put("tier/retirement-known-size.wnd", &bytes)
+		.await
+		.unwrap();
+	mgr.persist_table_drop_l2_cleanup(old.slab_id, &old.l2_uri, Some(&uri))
+		.await
+		.unwrap();
+	let mut live = old.clone();
+	live.l2_uri = uri;
+	mgr.apply_tier_slab(live).await.unwrap();
+	mgr.reconcile_table_drop_l2_cleanup_markers(l2.as_ref(), 10)
+		.await
+		.unwrap();
+	let epoch = mgr.begin_tier_snapshot_install().unwrap();
+	mgr.finish_tier_snapshot_install_at_epoch(vec![], Some(829), epoch)
+		.await
+		.unwrap();
+	assert_eq!(
+		mgr.unresolved_tier_cleanup.test_accounting(),
+		(2, (bytes.len() * 2) as u64, 0)
+	);
+}
+
+#[tokio::test]
+async fn snapshot_retirement_resolves_unobserved_legacy_replacement_and_is_nonfencing() {
+	let (dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let bytes = l2.get(&old.l2_uri).await.unwrap();
+	let a = l2
+		.put("tier/retire-unobserved-legacy-a.wnd", &bytes)
+		.await
+		.unwrap();
+	let marker = table_drop_l2_cleanup_path(&mgr.config.dir, old.slab_id);
+	let marker_bytes = postcard::to_stdvec(&TestLegacyCleanupMarker {
+		format_version: 2,
+		slab_id: old.slab_id,
+		old_l2_uri: old.l2_uri.clone(),
+		replacement_l2_uri: Some(a.clone()),
+		state: TestLegacyCleanupState::Unresolved,
+		retained_bytes: (bytes.len() * 2) as u64,
+	})
+	.unwrap();
+	std::fs::write(&marker, &marker_bytes).unwrap();
+	mgr.load_unresolved_tier_cleanup().await.unwrap();
+	let mut pointer_a = old.clone();
+	pointer_a.l2_uri = a.clone();
+	mgr.apply_tier_slab(pointer_a).await.unwrap();
+	let epoch = mgr.begin_tier_snapshot_install().unwrap();
+	mgr.finish_tier_snapshot_install_at_epoch(vec![], Some(830), epoch)
+		.await
+		.unwrap();
+	let index = mgr.persistent_index.as_ref().unwrap();
+	let records = index.load_snapshot_cleanup_intents().await.unwrap();
+	let predecessor = records
+		.iter()
+		.find(|(slab, uri, _)| *slab == old.slab_id && uri == &old.l2_uri)
+		.expect("legacy publication evidence must be durable");
+	assert!(predecessor.2.was_published(&a));
+	let totals = mgr.unresolved_tier_cleanup.test_accounting();
+	assert_eq!(totals, (1, (bytes.len() * 2) as u64, 0));
+	for _ in 0..2 {
+		assert!(
+			mgr.reconcile_table_drop_l2_cleanup_markers(l2.as_ref(), 10)
+				.await
+				.is_ok()
+		);
+	}
+	assert_eq!(mgr.unresolved_tier_cleanup.test_accounting(), totals);
+	assert_eq!(std::fs::read(&marker).unwrap(), marker_bytes);
+	let mgr = restart_tier_manager(mgr, &dirs, &l2).await;
+	assert_eq!(mgr.unresolved_tier_cleanup.test_accounting(), totals);
+	assert!(
+		mgr.reconcile_table_drop_l2_cleanup_markers(l2.as_ref(), 10)
+			.await
+			.is_ok()
+	);
+	assert_eq!(std::fs::read(marker).unwrap(), marker_bytes);
+}
+
+#[tokio::test]
+async fn committed_log_retirement_records_source_and_remains_nonfencing() {
+	use crate::storage::index::{RetainedObjectIntentState, RetirementSource};
+	let (dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	assert!(
+		mgr.retire_tiered_slab_committed(old.slab_id, Some(831))
+			.await
+			.unwrap()
+	);
+	let index = mgr.persistent_index.as_ref().unwrap();
+	let records = index.load_snapshot_cleanup_intents().await.unwrap();
+	let retained = records
+		.iter()
+		.find(|(slab, uri, _)| *slab == old.slab_id && uri == &old.l2_uri)
+		.expect("retirement record must be durable");
+	assert_eq!(
+		retained.2.state,
+		RetainedObjectIntentState::RetirementPublished
+	);
+	assert_eq!(
+		retained.2.retirement_source,
+		Some(RetirementSource::Log(831))
+	);
+	let totals = mgr.unresolved_tier_cleanup.test_accounting();
+	for _ in 0..2 {
+		assert!(
+			mgr.reconcile_table_drop_l2_cleanup_markers(l2.as_ref(), 10)
+				.await
+				.is_ok()
+		);
+	}
+	let mgr = restart_tier_manager(mgr, &dirs, &l2).await;
+	assert_eq!(mgr.unresolved_tier_cleanup.test_accounting(), totals);
+	let records = mgr
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot_cleanup_intents()
+		.await
+		.unwrap();
+	let retained = records
+		.iter()
+		.find(|(slab, uri, _)| *slab == old.slab_id && uri == &old.l2_uri)
+		.unwrap();
+	assert_eq!(
+		retained.2.retirement_source,
+		Some(RetirementSource::Log(831))
+	);
+}
+
+#[tokio::test]
+async fn republished_retired_uri_clears_retirement_proof_before_retier() {
+	use crate::storage::index::{RetainedObjectIntentState, RetirementSource};
+	let (dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let object = l2.get(&old.l2_uri).await.unwrap();
+	let epoch = mgr.begin_tier_snapshot_install().unwrap();
+	mgr.finish_tier_snapshot_install_at_epoch(vec![], Some(832), epoch)
+		.await
+		.unwrap();
+	let mgr = restart_tier_manager(mgr, &dirs, &l2).await;
+	let records = mgr
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot_cleanup_intents()
+		.await
+		.unwrap();
+	let record = records
+		.iter()
+		.find(|(slab, uri, _)| *slab == old.slab_id && uri == &old.l2_uri)
+		.unwrap();
+	assert_eq!(
+		record.2.state,
+		RetainedObjectIntentState::RetirementPublished
+	);
+	assert_eq!(
+		record.2.retirement_source,
+		Some(RetirementSource::Snapshot(832))
+	);
+	mgr.apply_tier_slab_committed(old.clone(), Some(833))
+		.await
+		.unwrap();
+	let records = mgr
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot_cleanup_intents()
+		.await
+		.unwrap();
+	let record = records
+		.iter()
+		.find(|(slab, uri, _)| *slab == old.slab_id && uri == &old.l2_uri)
+		.unwrap();
+	assert_ne!(
+		record.2.state,
+		RetainedObjectIntentState::RetirementPublished
+	);
+	assert_eq!(record.2.retirement_source, None);
+	let b = l2
+		.put("tier/retired-uri-retier-b.wnd", &object)
+		.await
+		.unwrap();
+	mgr.persist_table_drop_l2_cleanup(old.slab_id, &old.l2_uri, Some(&b))
+		.await
+		.unwrap();
+	let mut next = old.clone();
+	next.l2_uri = b.clone();
+	mgr.apply_tier_slab_committed(next, Some(834))
+		.await
+		.unwrap();
+	mgr.reconcile_table_drop_l2_cleanup_markers(l2.as_ref(), 10)
+		.await
+		.unwrap();
+	let records = mgr
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot_cleanup_intents()
+		.await
+		.unwrap();
+	let record = records
+		.iter()
+		.find(|(slab, uri, _)| *slab == old.slab_id && uri == &old.l2_uri)
+		.unwrap();
+	assert!(record.2.was_published(&b));
+	assert_eq!(record.2.retirement_source, None);
+	assert_eq!(
+		records
+			.iter()
+			.filter(|(slab, uri, _)| *slab == old.slab_id && uri == &old.l2_uri)
+			.count(),
+		1
+	);
+}
+
+#[tokio::test]
+async fn snapshot_retirement_preserves_unresolved_replacement_until_publication() {
+	use crate::storage::index::{RetainedObjectIntentState, RetirementSource};
+	let (dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let bytes = l2.get(&old.l2_uri).await.unwrap();
+	let replacement = l2
+		.put("tier/retirement-pending-replacement.wnd", &bytes)
+		.await
+		.unwrap();
+	mgr.persist_table_drop_l2_cleanup(old.slab_id, &old.l2_uri, Some(&replacement))
+		.await
+		.unwrap();
+	let epoch = mgr.begin_tier_snapshot_install().unwrap();
+	mgr.finish_tier_snapshot_install_at_epoch(vec![], Some(835), epoch)
+		.await
+		.unwrap();
+	let index = mgr.persistent_index.as_ref().unwrap();
+	let records = index.load_snapshot_cleanup_intents().await.unwrap();
+	let record = records
+		.iter()
+		.find(|(slab, uri, _)| *slab == old.slab_id && uri == &old.l2_uri)
+		.unwrap();
+	assert_eq!(record.2.state, RetainedObjectIntentState::Unresolved);
+	assert_eq!(
+		record.2.retirement_source,
+		Some(RetirementSource::Snapshot(835))
+	);
+	assert!(
+		records
+			.iter()
+			.any(|(slab, uri, _)| *slab == old.slab_id && uri == &replacement)
+	);
+	let mgr = restart_tier_manager(mgr, &dirs, &l2).await;
+	let mut live = old.clone();
+	live.l2_uri = replacement.clone();
+	mgr.apply_tier_slab_committed(live, Some(836))
+		.await
+		.unwrap();
+	mgr.reconcile_table_drop_l2_cleanup_markers(l2.as_ref(), 10)
+		.await
+		.unwrap();
+	let records = mgr
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot_cleanup_intents()
+		.await
+		.unwrap();
+	let record = records
+		.iter()
+		.find(|(slab, uri, _)| *slab == old.slab_id && uri == &old.l2_uri)
+		.unwrap();
+	assert!(record.2.was_published(&replacement));
+	assert_eq!(
+		record.2.retirement_source,
+		Some(RetirementSource::Snapshot(835))
+	);
+	assert!(
+		!records
+			.iter()
+			.any(|(slab, uri, _)| *slab == old.slab_id && uri == &replacement)
+	);
+	assert!(
+		mgr.reconcile_table_drop_l2_cleanup_markers(l2.as_ref(), 10)
+			.await
+			.is_ok()
+	);
+}
+
+#[tokio::test]
+async fn snapshot_after_append_observation_refuses_stale_supersession_metadata() {
+	use crate::consensus::{TieredSlab, WendelonStateMachine};
+	use crate::storage::sweeper::ManagerTierObserver;
+	use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
+	use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
+
+	let (_dirs, manager, l2) = fresh_manager_with_l2("dc112-append-metadata-epoch").await;
+	let key = id(0xdc115);
+	manager
+		.append_durable(tenant(), key, hlc(513), b"old")
+		.await
+		.unwrap();
+	let original = tier_kv_slab(&manager, &l2, "dc112-append-metadata-epoch/original").await;
+	let pause = manager.pause_append_metadata_observed_once();
+	let append = {
+		let manager = manager.clone();
+		tokio::spawn(async move {
+			manager
+				.append_durable(tenant(), key, hlc(514), b"new")
+				.await
+		})
+	};
+	tokio::time::timeout(Duration::from_secs(60), pause.reached.notified())
+		.await
+		.expect("append pauses after its old-location observation and row publication");
+	let mut source = WendelonStateMachine::new();
+	source
+		.seed_tiered_slab_for_test(TieredSlab {
+			slab_id: original.slab_id,
+			l2_uri: original.l2_uri.clone(),
+			payload_hash: original.payload_hash,
+			is_encrypted: original.is_encrypted,
+			tenant_id: original.tenant_id,
+			tenant_kek_id: original.tenant_kek_id,
+			stats_format_version: original.stats_format_version,
+			stats_block_len: original.stats_block_len,
+			stats_block_hash128: original.stats_block_hash128,
+			tombstone_metadata: original.tombstone_metadata,
+			supersession_metadata: original.supersession_metadata,
+		})
+		.await;
+	RaftStateMachine::apply(
+		&mut source,
+		[Entry {
+			log_id: LogId::new(CommittedLeaderId::new(3, 1), 802),
+			payload: EntryPayload::Blank,
+		}],
+	)
+	.await
+	.unwrap();
+	let mut builder = RaftStateMachine::get_snapshot_builder(&mut source).await;
+	let built = builder.build_snapshot().await.unwrap();
+	let mut target = WendelonStateMachine::new()
+		.with_tier_observer(Arc::new(ManagerTierObserver::new(manager.clone())));
+	RaftStateMachine::install_snapshot(&mut target, &built.meta, built.snapshot)
+		.await
+		.unwrap();
+
+	pause.resume.notify_one();
+	let result = append.await.unwrap();
+	let mut expected = original;
+	expected.supersession_metadata = SupersessionMetadata::Untracked;
+	assert_eq!(manager.tiered_pointers_snapshot().await, vec![expected]);
+	let location = result.expect("durable append reports success");
+	manager.wait_tier_authority_ready().await.unwrap();
+	assert_eq!(manager.read(location).await.unwrap(), b"new");
+}
+
+#[tokio::test]
+async fn snapshot_after_migrated_range_observation_refuses_stale_metadata() {
+	use crate::consensus::{TieredSlab, WendelonStateMachine};
+	use crate::storage::sweeper::ManagerTierObserver;
+	use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
+	use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
+
+	let (_dirs, manager, l2) = fresh_manager_with_l2("dc112-migrated-metadata-epoch").await;
+	let key = id(0xdc116);
+	manager
+		.append_durable(tenant(), key, hlc(513), b"old")
+		.await
+		.unwrap();
+	let original = tier_kv_slab(&manager, &l2, "dc112-migrated-metadata-epoch/original").await;
+	let locality = Locality::from(key).get();
+	let tombstone = MigratedRangeTombstone {
+		migration_id: 803,
+		range_start: locality,
+		range_end: locality,
+		to_epoch: 2,
+		completed_by: NodeId {
+			id: 7,
+			_reserved: 0,
+		},
+		completed_at_hlc: hlc(514),
+		migration_hlc_floor: hlc(0),
+	};
+	let pause = manager.pause_append_metadata_observed_once();
+	let update = {
+		let manager = manager.clone();
+		tokio::spawn(async move {
+			manager
+				.record_migrated_range_tombstone(&tombstone, Some(804))
+				.await
+		})
+	};
+	tokio::time::timeout(Duration::from_secs(60), pause.reached.notified())
+		.await
+		.expect("migration pauses after its epoch check");
+	let mut source = WendelonStateMachine::new();
+	source
+		.seed_tiered_slab_for_test(TieredSlab {
+			slab_id: original.slab_id,
+			l2_uri: original.l2_uri.clone(),
+			payload_hash: original.payload_hash,
+			is_encrypted: original.is_encrypted,
+			tenant_id: original.tenant_id,
+			tenant_kek_id: original.tenant_kek_id,
+			stats_format_version: original.stats_format_version,
+			stats_block_len: original.stats_block_len,
+			stats_block_hash128: original.stats_block_hash128,
+			tombstone_metadata: original.tombstone_metadata,
+			supersession_metadata: original.supersession_metadata,
+		})
+		.await;
+	RaftStateMachine::apply(
+		&mut source,
+		[Entry {
+			log_id: LogId::new(CommittedLeaderId::new(3, 1), 803),
+			payload: EntryPayload::Blank,
+		}],
+	)
+	.await
+	.unwrap();
+	let mut builder = RaftStateMachine::get_snapshot_builder(&mut source).await;
+	let built = builder.build_snapshot().await.unwrap();
+	let mut target = WendelonStateMachine::new()
+		.with_tier_observer(Arc::new(ManagerTierObserver::new(manager.clone())));
+	RaftStateMachine::install_snapshot(&mut target, &built.meta, built.snapshot)
+		.await
+		.unwrap();
+
+	pause.resume.notify_one();
+	let result = update.await.unwrap();
+	let mut expected = original;
+	expected.tombstone_metadata = TombstoneMetadata::Untracked;
+	assert_eq!(manager.tiered_pointers_snapshot().await, vec![expected]);
+	assert!(
+		result.is_ok(),
+		"newer indexed observation degrades metadata"
+	);
+}
+
+#[tokio::test]
+async fn snapshot_after_multirow_observation_refuses_stale_metadata() {
+	use crate::consensus::{TieredSlab, WendelonStateMachine};
+	use crate::storage::sweeper::ManagerTierObserver;
+	use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
+	use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
+
+	let (_dirs, manager, l2) = fresh_manager_with_l2("dc112-multirow-metadata-epoch").await;
+	let keys = [id(0xdc117), id(0xdc118)];
+	for key in keys {
+		manager
+			.append_durable(tenant(), key, hlc(513), b"old")
+			.await
+			.unwrap();
+	}
+	let original = tier_kv_slab(&manager, &l2, "dc112-multirow-metadata-epoch/original").await;
+	let frame = encode_test_append_only_storage_frame(
+		TableObjectId::new([0x44; 16]),
+		&[
+			(keys[0], Locality::from(keys[0]), hlc(514), 1, false),
+			(keys[1], Locality::from(keys[1]), hlc(514), 2, false),
+		],
+	);
+	let entries = storage_multirow_index_entries_from_frame(&frame)
+		.unwrap()
+		.unwrap();
+	let pause = manager.pause_append_metadata_observed_once();
+	let append = {
+		let manager = manager.clone();
+		tokio::spawn(async move {
+			manager
+				.append_durable_multirow_with_locality(tenant(), &frame, &entries)
+				.await
+		})
+	};
+	tokio::time::timeout(Duration::from_secs(60), pause.reached.notified())
+		.await
+		.expect("multirow append pauses after its old-location observations and row publication");
+	let mut source = WendelonStateMachine::new();
+	source
+		.seed_tiered_slab_for_test(TieredSlab {
+			slab_id: original.slab_id,
+			l2_uri: original.l2_uri.clone(),
+			payload_hash: original.payload_hash,
+			is_encrypted: original.is_encrypted,
+			tenant_id: original.tenant_id,
+			tenant_kek_id: original.tenant_kek_id,
+			stats_format_version: original.stats_format_version,
+			stats_block_len: original.stats_block_len,
+			stats_block_hash128: original.stats_block_hash128,
+			tombstone_metadata: original.tombstone_metadata,
+			supersession_metadata: original.supersession_metadata,
+		})
+		.await;
+	RaftStateMachine::apply(
+		&mut source,
+		[Entry {
+			log_id: LogId::new(CommittedLeaderId::new(3, 1), 804),
+			payload: EntryPayload::Blank,
+		}],
+	)
+	.await
+	.unwrap();
+	let mut builder = RaftStateMachine::get_snapshot_builder(&mut source).await;
+	let built = builder.build_snapshot().await.unwrap();
+	let mut target = WendelonStateMachine::new()
+		.with_tier_observer(Arc::new(ManagerTierObserver::new(manager.clone())));
+	RaftStateMachine::install_snapshot(&mut target, &built.meta, built.snapshot)
+		.await
+		.unwrap();
+
+	pause.resume.notify_one();
+	let result = append.await.unwrap();
+	let mut expected = original;
+	expected.supersession_metadata = SupersessionMetadata::Untracked;
+	assert_eq!(manager.tiered_pointers_snapshot().await, vec![expected]);
+	assert!(result.is_ok(), "durable append reports success");
+}
+
+#[tokio::test]
+async fn snapshot_after_multirow_tombstone_observation_refuses_stale_metadata() {
+	use crate::consensus::{TieredSlab, WendelonStateMachine};
+	use crate::storage::sweeper::ManagerTierObserver;
+	use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
+	use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
+
+	let (_dirs, manager, l2) = fresh_manager_with_l2("dc112-multirow-tombstone-epoch").await;
+	let keys = [id(0xdc117), id(0xdc118)];
+	for key in keys {
+		manager
+			.append_durable(tenant(), key, hlc(513), b"old")
+			.await
+			.unwrap();
+	}
+	let original = tier_kv_slab(&manager, &l2, "dc112-multirow-tombstone-epoch/original").await;
+	let (frame, entries) = encode_test_row_tombstone_marker_frame(
+		TableObjectId::new([0x44; 16]),
+		keys[0],
+		Locality::from(keys[0]),
+		hlc(514),
+	);
+	let pause = manager.pause_append_metadata_observed_once();
+	let append = {
+		let manager = manager.clone();
+		tokio::spawn(async move {
+			manager
+				.append_durable_multirow_with_locality(tenant(), &frame, &entries)
+				.await
+		})
+	};
+	tokio::time::timeout(Duration::from_secs(60), pause.reached.notified())
+		.await
+		.expect("multirow append pauses after its old-location observations and row publication");
+	let mut source = WendelonStateMachine::new();
+	source
+		.seed_tiered_slab_for_test(TieredSlab {
+			slab_id: original.slab_id,
+			l2_uri: original.l2_uri.clone(),
+			payload_hash: original.payload_hash,
+			is_encrypted: original.is_encrypted,
+			tenant_id: original.tenant_id,
+			tenant_kek_id: original.tenant_kek_id,
+			stats_format_version: original.stats_format_version,
+			stats_block_len: original.stats_block_len,
+			stats_block_hash128: original.stats_block_hash128,
+			tombstone_metadata: original.tombstone_metadata,
+			supersession_metadata: original.supersession_metadata,
+		})
+		.await;
+	RaftStateMachine::apply(
+		&mut source,
+		[Entry {
+			log_id: LogId::new(CommittedLeaderId::new(3, 1), 805),
+			payload: EntryPayload::Blank,
+		}],
+	)
+	.await
+	.unwrap();
+	let mut builder = RaftStateMachine::get_snapshot_builder(&mut source).await;
+	let built = builder.build_snapshot().await.unwrap();
+	let mut target = WendelonStateMachine::new()
+		.with_tier_observer(Arc::new(ManagerTierObserver::new(manager.clone())));
+	RaftStateMachine::install_snapshot(&mut target, &built.meta, built.snapshot)
+		.await
+		.unwrap();
+
+	pause.resume.notify_one();
+	let result = append.await.unwrap();
+	let mut expected = original;
+	expected.tombstone_metadata = TombstoneMetadata::Untracked;
+	assert_eq!(manager.tiered_pointers_snapshot().await, vec![expected]);
+	assert!(result.is_ok(), "durable append reports success");
+}
+
+#[tokio::test]
+async fn durable_append_cancelled_before_metadata_is_safe_after_reopen() {
+	let (dirs, manager, l2) = fresh_manager_with_l2("dc112-append-metadata-crash").await;
+	let key = id(0xdc119);
+	manager
+		.append_durable(tenant(), key, hlc(513), b"old")
+		.await
+		.unwrap();
+	let original = tier_kv_slab(&manager, &l2, "dc112-append-metadata-crash/original").await;
+	let pause = manager.pause_append_metadata_observed_once();
+	let append = {
+		let manager = manager.clone();
+		tokio::spawn(async move {
+			manager
+				.append_durable(tenant(), key, hlc(514), b"new")
+				.await
+		})
+	};
+	tokio::time::timeout(Duration::from_secs(60), pause.reached.notified())
+		.await
+		.expect("append pauses after publication and before metadata update");
+	append.abort();
+	assert!(append.await.unwrap_err().is_cancelled());
+	let reopened = try_restart_tier_manager(manager, &dirs, &l2).await.unwrap();
+	reopened.wait_tier_authority_ready().await.unwrap();
+	let latest = reopened
+		.lookup(tenant(), key)
+		.unwrap()
+		.expect("published row recovered");
+	assert_eq!(reopened.read(latest).await.unwrap(), b"new");
+	let pointer = reopened.tier_pointer(original.slab_id).await.unwrap();
+	assert!(
+		!crate::storage::slab_visibility_complete(
+			hlc(513),
+			pointer.tombstone_metadata,
+			pointer.supersession_metadata,
+			hlc(514)
+		),
+		"a shortcut must not treat the superseded old row as visible"
+	);
+}
+
+#[tokio::test]
+async fn overlapping_appends_cannot_erase_another_pending_metadata_update() {
+	let (dirs, mgr, l2) = fresh_manager_with_l2("dc112-overlapping-metadata").await;
+	let key_a = id(0xdc120);
+	let key_b = id(0xdc121);
+	mgr.append_durable(tenant(), key_a, hlc(100), b"old-a")
+		.await
+		.unwrap();
+	mgr.append_durable(tenant(), key_b, hlc(101), b"old-b")
+		.await
+		.unwrap();
+	let original = tier_kv_slab(&mgr, &l2, "dc112-overlapping-metadata/old").await;
+	let pause = mgr.pause_append_metadata_observed_once();
+	let first = {
+		let mgr = mgr.clone();
+		tokio::spawn(async move {
+			mgr.append_durable(tenant(), key_a, hlc(102), b"new-a")
+				.await
+		})
+	};
+	tokio::time::timeout(Duration::from_secs(60), pause.reached.notified())
+		.await
+		.unwrap();
+	mgr.append_durable(tenant(), key_b, hlc(103), b"new-b")
+		.await
+		.unwrap();
+	first.abort();
+	assert!(first.await.unwrap_err().is_cancelled());
+	let mgr = try_restart_tier_manager(mgr, &dirs, &l2).await.unwrap();
+	mgr.wait_tier_authority_ready().await.unwrap();
+	let latest = mgr.lookup(tenant(), key_a).unwrap().unwrap();
+	assert_eq!(mgr.read(latest).await.unwrap(), b"new-a");
+	let pointer = mgr.tier_pointer(original.slab_id).await.unwrap();
+	assert!(
+		!crate::storage::slab_visibility_complete(
+			hlc(101),
+			pointer.tombstone_metadata,
+			pointer.supersession_metadata,
+			hlc(102)
+		),
+		"another append completing must not erase pending visibility work"
+	);
+}
+
+#[tokio::test]
+async fn metadata_pending_tokens_degrade_pointer_before_manager_reopen() {
+	use crate::storage::index::MetadataKind;
+	let (dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let index = mgr.persistent_index.as_ref().unwrap();
+	let token = index
+		.begin_metadata_token(old.slab_id, MetadataKind::Supersession)
+		.await
+		.unwrap();
+	let mgr = restart_tier_manager(mgr, &dirs, &l2).await;
+	let pointer = mgr.tier_pointer(old.slab_id).await.unwrap();
+	assert!(pointer.supersession_metadata.is_untracked());
+	let index = mgr.persistent_index.as_ref().unwrap();
+	assert!(
+		index
+			.load_pending_metadata_tokens()
+			.await
+			.unwrap()
+			.is_empty()
+	);
+	assert!(
+		index
+			.begin_metadata_token(old.slab_id, MetadataKind::Supersession)
+			.await
+			.unwrap() > token
+	);
+}
+
+#[tokio::test]
+async fn snapshot_applies_pending_tokens_to_unchanged_pointer() {
+	let (_dirs, mgr, l2) = fresh_manager_with_l2("snapshot-pending-tokens").await;
+	let key = id(0xdc139);
+	mgr.append_durable(tenant(), key, hlc(100), b"old")
+		.await
+		.unwrap();
+	let pointer = tier_kv_slab(&mgr, &l2, "tier/snapshot-pending-token.wnd").await;
+	let pause = mgr.pause_append_metadata_observed_once();
+	let append = {
+		let mgr = mgr.clone();
+		tokio::spawn(async move { mgr.append_durable(tenant(), key, hlc(200), b"new").await })
+	};
+	tokio::time::timeout(Duration::from_secs(60), pause.reached.notified())
+		.await
+		.unwrap();
+	let epoch = mgr.begin_tier_snapshot_install().unwrap();
+	mgr.finish_tier_snapshot_install_at_epoch(vec![pointer.clone()], Some(900), epoch)
+		.await
+		.unwrap();
+	let current = mgr.tier_pointer(pointer.slab_id).await.unwrap();
+	assert!(
+		current.supersession_metadata.is_untracked(),
+		"snapshot must degrade an unchanged pointer with an in-flight token"
+	);
+	let pending = mgr
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_pending_metadata_tokens()
+		.await
+		.unwrap();
+	assert_eq!(
+		pending.len(),
+		1,
+		"snapshot keeps the in-flight operation token"
+	);
+	assert_eq!(
+		mgr.read(mgr.lookup(tenant(), key).unwrap().unwrap())
+			.await
+			.unwrap(),
+		b"new"
+	);
+	pause.resume.notify_one();
+	append.await.unwrap().unwrap();
+	assert!(
+		mgr.persistent_index
+			.as_ref()
+			.unwrap()
+			.load_pending_metadata_tokens()
+			.await
+			.unwrap()
+			.is_empty()
+	);
+}
+
+#[tokio::test]
+async fn hundred_appends_share_one_pending_slab_record_through_snapshot() {
+	let (_dirs, mgr, l2) = fresh_manager_with_l2("metadata-hundred-appends").await;
+	let keys: Vec<_> = (0..100).map(|n| id(0xdc200 + n)).collect();
+	for key in &keys {
+		mgr.append_durable(tenant(), *key, hlc(100), b"old")
+			.await
+			.unwrap();
+	}
+	let index = mgr.persistent_index.as_ref().unwrap();
+	let writes_before_tiering = index.metadata_token_floor_for_test().await.unwrap();
+	assert_eq!(
+		writes_before_tiering, 0,
+		"plain appends perform no token writes"
+	);
+	let pointer = tier_kv_slab(&mgr, &l2, "tier/hundred-pending.wnd").await;
+	let pause = mgr.pause_metadata_tokens(100);
+	let mut tasks = Vec::new();
+	for key in &keys {
+		let mgr = mgr.clone();
+		let key = *key;
+		tasks.push(tokio::spawn(async move {
+			mgr.append_durable(tenant(), key, hlc(200), b"new").await
+		}));
+	}
+	tokio::time::timeout(Duration::from_secs(60), pause.reached.wait())
+		.await
+		.unwrap();
+	let index = mgr.persistent_index.as_ref().unwrap();
+	let rows = index.load_pending_metadata_tokens().await.unwrap();
+	assert_eq!(rows.len(), 1);
+	assert_eq!(rows[0].0, pointer.slab_id);
+	assert_eq!(rows[0].1.supersession.len(), 100);
+	assert_eq!(
+		index.metadata_token_floor_for_test().await.unwrap() - writes_before_tiering,
+		100,
+		"one additional token transaction per affected append"
+	);
+	let epoch = mgr.begin_tier_snapshot_install().unwrap();
+	mgr.finish_tier_snapshot_install_at_epoch(vec![pointer.clone()], Some(901), epoch)
+		.await
+		.unwrap();
+	assert!(
+		mgr.tier_pointer(pointer.slab_id)
+			.await
+			.unwrap()
+			.supersession_metadata
+			.is_untracked()
+	);
+	assert_eq!(
+		index.load_pending_metadata_tokens().await.unwrap()[0]
+			.1
+			.supersession
+			.len(),
+		100
+	);
+	pause.resume.wait().await;
+	for task in tasks {
+		task.await.unwrap().unwrap();
+	}
+	assert!(
+		index
+			.load_pending_metadata_tokens()
+			.await
+			.unwrap()
+			.is_empty()
+	);
+	for key in keys {
+		let location = mgr.lookup(tenant(), key).unwrap().unwrap();
+		assert_eq!(mgr.read(location).await.unwrap(), b"new");
+	}
+}
+
+#[tokio::test]
+async fn cancelled_append_before_publication_leaves_harmless_pending_token() {
+	let (dirs, mgr, l2) = fresh_manager_with_l2("metadata-cancel-before-row").await;
+	let key = id(0xdc300);
+	mgr.append_durable(tenant(), key, hlc(100), b"old")
+		.await
+		.unwrap();
+	let pointer = tier_kv_slab(&mgr, &l2, "tier/cancel-token.wnd").await;
+	let pause = mgr.pause_metadata_tokens(1);
+	let append = {
+		let mgr = mgr.clone();
+		tokio::spawn(async move { mgr.append_durable(tenant(), key, hlc(200), b"new").await })
+	};
+	pause.reached.wait().await;
+	append.abort();
+	assert!(append.await.unwrap_err().is_cancelled());
+	let reopened = restart_tier_manager(mgr, &dirs, &l2).await;
+	assert!(
+		reopened
+			.tier_pointer(pointer.slab_id)
+			.await
+			.unwrap()
+			.supersession_metadata
+			.is_untracked()
+	);
+	let location = reopened.lookup(tenant(), key).unwrap().unwrap();
+	assert_eq!(reopened.read(location).await.unwrap(), b"old");
+	assert!(
+		reopened
+			.persistent_index
+			.as_ref()
+			.unwrap()
+			.load_pending_metadata_tokens()
+			.await
+			.unwrap()
+			.is_empty()
+	);
+}
+
+#[tokio::test]
+async fn metadata_token_committed_before_mirror_survives_cancel_and_reopen() {
+	let (dirs, mgr, l2) = fresh_manager_with_l2("metadata-token-mirror-crash").await;
+	let key = id(0xdc301);
+	mgr.append_durable(tenant(), key, hlc(100), b"old")
+		.await
+		.unwrap();
+	let pointer = tier_kv_slab(&mgr, &l2, "tier/token-before-mirror.wnd").await;
+	let pause = mgr.pause_metadata_token_committed_once();
+	let append = {
+		let mgr = mgr.clone();
+		tokio::spawn(async move { mgr.append_durable(tenant(), key, hlc(200), b"new").await })
+	};
+	pause.reached.notified().await;
+	assert!(!mgr.pending_metadata_requires_exact(pointer.slab_id));
+	assert_eq!(
+		mgr.persistent_index
+			.as_ref()
+			.unwrap()
+			.load_pending_metadata_tokens()
+			.await
+			.unwrap()
+			.len(),
+		1
+	);
+	append.abort();
+	assert!(append.await.unwrap_err().is_cancelled());
+	let mgr = restart_tier_manager(mgr, &dirs, &l2).await;
+	assert!(
+		mgr.tier_pointer(pointer.slab_id)
+			.await
+			.unwrap()
+			.supersession_metadata
+			.is_untracked()
+	);
+	assert_eq!(
+		mgr.read(mgr.lookup(tenant(), key).unwrap().unwrap())
+			.await
+			.unwrap(),
+		b"old"
+	);
+	assert!(
+		mgr.persistent_index
+			.as_ref()
+			.unwrap()
+			.load_pending_metadata_tokens()
+			.await
+			.unwrap()
+			.is_empty()
+	);
+}
+
+#[tokio::test]
+async fn metadata_pointer_commit_before_mirror_removal_survives_reopen() {
+	let (dirs, mgr, l2) = fresh_manager_with_l2("metadata-pointer-mirror-crash").await;
+	let key = id(0xdc302);
+	mgr.append_durable(tenant(), key, hlc(100), b"old")
+		.await
+		.unwrap();
+	let pointer = tier_kv_slab(&mgr, &l2, "tier/pointer-before-mirror.wnd").await;
+	let pause = mgr.pause_metadata_pointer_committed_once();
+	let append = {
+		let mgr = mgr.clone();
+		tokio::spawn(async move { mgr.append_durable(tenant(), key, hlc(200), b"new").await })
+	};
+	pause.reached.notified().await;
+	assert!(mgr.pending_metadata_requires_exact(pointer.slab_id));
+	assert!(
+		mgr.persistent_index
+			.as_ref()
+			.unwrap()
+			.load_pending_metadata_tokens()
+			.await
+			.unwrap()
+			.is_empty()
+	);
+	append.abort();
+	assert!(append.await.unwrap_err().is_cancelled());
+	let mgr = restart_tier_manager(mgr, &dirs, &l2).await;
+	assert_eq!(
+		mgr.read(mgr.lookup(tenant(), key).unwrap().unwrap())
+			.await
+			.unwrap(),
+		b"new"
+	);
+	assert!(!mgr.pending_metadata_requires_exact(pointer.slab_id));
+	let pointer = mgr.tier_pointer(pointer.slab_id).await.unwrap();
+	assert!(!crate::storage::slab_visibility_complete(
+		hlc(100),
+		pointer.tombstone_metadata,
+		pointer.supersession_metadata,
+		hlc(200)
+	));
+}
+
+#[tokio::test]
+async fn durable_append_finishes_while_snapshot_fence_is_raised() {
+	let (dirs, mgr, l2) = fresh_manager_with_l2("metadata-fenced-append").await;
+	let key = id(0xdc303);
+	mgr.append_durable(tenant(), key, hlc(100), b"old")
+		.await
+		.unwrap();
+	let pointer = tier_kv_slab(&mgr, &l2, "tier/fenced-append.wnd").await;
+	let pause = mgr.pause_append_metadata_observed_once();
+	let append = {
+		let mgr = mgr.clone();
+		tokio::spawn(async move { mgr.append_durable(tenant(), key, hlc(200), b"new").await })
+	};
+	pause.reached.notified().await;
+	let epoch = mgr.begin_tier_snapshot_install().unwrap();
+	pause.resume.notify_one();
+	let location = tokio::time::timeout(Duration::from_secs(5), append)
+		.await
+		.expect("durable append must not wait for snapshot")
+		.unwrap()
+		.unwrap();
+	assert_eq!(
+		mgr.persistent_index
+			.as_ref()
+			.unwrap()
+			.load_pending_metadata_tokens()
+			.await
+			.unwrap()
+			.len(),
+		1
+	);
+	mgr.finish_tier_snapshot_install_at_epoch(vec![pointer.clone()], Some(902), epoch)
+		.await
+		.unwrap();
+	assert!(
+		mgr.tier_pointer(pointer.slab_id)
+			.await
+			.unwrap()
+			.supersession_metadata
+			.is_untracked()
+	);
+	assert_eq!(mgr.read(location).await.unwrap(), b"new");
+	tokio::time::timeout(Duration::from_secs(5), async {
+		loop {
+			if mgr
+				.persistent_index
+				.as_ref()
+				.unwrap()
+				.load_pending_metadata_tokens()
+				.await
+				.unwrap()
+				.is_empty()
+			{
+				break;
+			}
+			tokio::task::yield_now().await;
+		}
+	})
+	.await
+	.expect("completed operation token should clear without a restart");
+	let mgr = restart_tier_manager(mgr, &dirs, &l2).await;
+	assert!(
+		mgr.tier_pointer(pointer.slab_id)
+			.await
+			.unwrap()
+			.supersession_metadata
+			.is_untracked()
+	);
+	assert_eq!(
+		mgr.read(mgr.lookup(tenant(), key).unwrap().unwrap())
+			.await
+			.unwrap(),
+		b"new"
+	);
+	assert!(
+		mgr.persistent_index
+			.as_ref()
+			.unwrap()
+			.load_pending_metadata_tokens()
+			.await
+			.unwrap()
+			.is_empty()
+	);
+}
+
+#[tokio::test]
+async fn metadata_token_written_between_snapshot_stage_and_pointer_publication_is_honored() {
+	let (_dirs, mgr, l2) =
+		fresh_manager_with_l2("metadata-between-snapshot-stage-and-publish").await;
+	let key = id(0xdc304);
+	mgr.append_durable(tenant(), key, hlc(100), b"old")
+		.await
+		.unwrap();
+	let original = tier_kv_slab(&mgr, &l2, "tier/between-stage-old.wnd").await;
+	let bytes = l2.get(&original.l2_uri).await.unwrap();
+	let mut replacement = original.clone();
+	replacement.l2_uri = l2.put("tier/between-stage-new.wnd", &bytes).await.unwrap();
+	let before_token = mgr.pause_metadata_token_before_allocation_once();
+	let token_committed = mgr.pause_metadata_tokens(1);
+	let append = {
+		let mgr = mgr.clone();
+		tokio::spawn(async move { mgr.append_durable(tenant(), key, hlc(200), b"new").await })
+	};
+	before_token.reached.notified().await;
+	let stage = mgr.pause_snapshot_after_retirement_mark_once();
+	let epoch = mgr.begin_tier_snapshot_install().unwrap();
+	let snapshot = {
+		let mgr = mgr.clone();
+		let replacement = replacement.clone();
+		tokio::spawn(async move {
+			mgr.finish_tier_snapshot_install_at_epoch(vec![replacement], Some(903), epoch)
+				.await
+		})
+	};
+	stage.reached.notified().await;
+	before_token.resume.notify_one();
+	tokio::time::timeout(Duration::from_secs(60), token_committed.reached.wait())
+		.await
+		.unwrap();
+	assert_eq!(
+		mgr.persistent_index
+			.as_ref()
+			.unwrap()
+			.load_pending_metadata_tokens()
+			.await
+			.unwrap()
+			.len(),
+		1
+	);
+	stage.resume.notify_one();
+	snapshot.await.unwrap().unwrap();
+	mgr.wait_tier_authority_ready().await.unwrap();
+	let pointer = mgr.tier_pointer(original.slab_id).await.unwrap();
+	assert_eq!(pointer.l2_uri, replacement.l2_uri);
+	assert!(
+		pointer.supersession_metadata.is_untracked(),
+		"token committed after staging must affect publication or remain pending"
+	);
+	assert_eq!(
+		mgr.read(mgr.lookup(tenant(), key).unwrap().unwrap())
+			.await
+			.unwrap(),
+		b"old"
+	);
+	token_committed.resume.wait().await;
+	append.await.unwrap().unwrap();
+	assert_eq!(
+		mgr.read(mgr.lookup(tenant(), key).unwrap().unwrap())
+			.await
+			.unwrap(),
+		b"new"
+	);
+}
+
+#[tokio::test]
+async fn completed_append_clears_own_token_with_tracked_metadata() {
+	let (_dirs, mgr, l2) = fresh_manager_with_l2("metadata-normal-token").await;
+	let key = id(0xdc305);
+	mgr.append_durable(tenant(), key, hlc(100), b"old")
+		.await
+		.unwrap();
+	let pointer = tier_kv_slab(&mgr, &l2, "tier/normal-token.wnd").await;
+	let location = mgr
+		.append_durable(tenant(), key, hlc(200), b"new")
+		.await
+		.unwrap();
+	let current = mgr.tier_pointer(pointer.slab_id).await.unwrap();
+	assert_eq!(
+		current.supersession_metadata,
+		SupersessionMetadata::Earliest(hlc(200))
+	);
+	assert!(
+		mgr.persistent_index
+			.as_ref()
+			.unwrap()
+			.load_pending_metadata_tokens()
+			.await
+			.unwrap()
+			.is_empty()
+	);
+	assert_eq!(mgr.read(location).await.unwrap(), b"new");
+}
+
+#[tokio::test]
+async fn cancelled_snapshot_with_completed_append_recovers_pending_degrade() {
+	let (dirs, mgr, l2) = fresh_manager_with_l2("metadata-cancel-snapshot").await;
+	let key = id(0xdc306);
+	mgr.append_durable(tenant(), key, hlc(100), b"old")
+		.await
+		.unwrap();
+	let pointer = tier_kv_slab(&mgr, &l2, "tier/cancel-snapshot.wnd").await;
+	let append_pause = mgr.pause_append_metadata_observed_once();
+	let append = {
+		let mgr = mgr.clone();
+		tokio::spawn(async move { mgr.append_durable(tenant(), key, hlc(200), b"new").await })
+	};
+	append_pause.reached.notified().await;
+	let snapshot_pause = mgr.pause_snapshot_after_retirement_mark_once();
+	let epoch = mgr.begin_tier_snapshot_install().unwrap();
+	let snapshot = {
+		let mgr = mgr.clone();
+		let pointer = pointer.clone();
+		tokio::spawn(async move {
+			mgr.finish_tier_snapshot_install_at_epoch(vec![pointer], Some(904), epoch)
+				.await
+		})
+	};
+	snapshot_pause.reached.notified().await;
+	append_pause.resume.notify_one();
+	tokio::time::timeout(Duration::from_secs(5), append)
+		.await
+		.unwrap()
+		.unwrap()
+		.unwrap();
+	snapshot.abort();
+	assert!(snapshot.await.unwrap_err().is_cancelled());
+	let mgr = restart_tier_manager(mgr, &dirs, &l2).await;
+	let pointer = mgr.tier_pointer(pointer.slab_id).await.unwrap();
+	assert!(pointer.supersession_metadata.is_untracked());
+	assert_eq!(
+		mgr.read(mgr.lookup(tenant(), key).unwrap().unwrap())
+			.await
+			.unwrap(),
+		b"new"
+	);
+	assert!(
+		mgr.persistent_index
+			.as_ref()
+			.unwrap()
+			.load_pending_metadata_tokens()
+			.await
+			.unwrap()
+			.is_empty()
+	);
+}
+
+#[tokio::test]
+async fn retain_only_reconciliation_serializes_same_slab_intent_insertion() {
+	let (_dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let object = l2.get(&old.l2_uri).await.unwrap();
+	let replacement = l2
+		.put("tier/claim-order-published.wnd", &object)
+		.await
+		.unwrap();
+	let marker = table_drop_l2_cleanup_path(&mgr.config.dir, old.slab_id);
+	let marker_bytes = postcard::to_stdvec(&TestLegacyCleanupMarker {
+		format_version: 2,
+		slab_id: old.slab_id,
+		old_l2_uri: old.l2_uri.clone(),
+		replacement_l2_uri: Some(replacement.clone()),
+		state: TestLegacyCleanupState::Unresolved,
+		retained_bytes: (object.len() * 2) as u64,
+	})
+	.unwrap();
+	std::fs::write(&marker, &marker_bytes).unwrap();
+	mgr.load_unresolved_tier_cleanup().await.unwrap();
+	let mut live = old.clone();
+	live.l2_uri = replacement.clone();
+	mgr.apply_tier_slab(live).await.unwrap();
+	let pause = mgr.pause_cleanup_reconcile_claim_once();
+	let reconcile = {
+		let mgr = mgr.clone();
+		let l2 = l2.clone();
+		tokio::spawn(async move {
+			mgr.reconcile_table_drop_l2_cleanup_markers(l2.as_ref(), 10)
+				.await
+		})
+	};
+	tokio::time::timeout(Duration::from_secs(30), pause.reached.notified())
+		.await
+		.unwrap();
+	let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+	let mut insertion = {
+		let mgr = mgr.clone();
+		tokio::spawn(async move {
+			let _ = started_tx.send(());
+			mgr.persist_snapshot_cleanup_intent(old.slab_id, "tier/claim-order-new.wnd", 7)
+				.await
+		})
+	};
+	started_rx.await.unwrap();
+	assert!(
+		tokio::time::timeout(Duration::from_millis(100), &mut insertion)
+			.await
+			.is_err(),
+		"same-slab insertion must wait for the reconciliation claim"
+	);
+	tokio::time::timeout(
+		Duration::from_secs(5),
+		mgr.persist_snapshot_cleanup_intent(SlabId::new(0xdc400), "tier/other-slab.wnd", 9),
+	)
+	.await
+	.unwrap()
+	.unwrap();
+	pause.resume.notify_one();
+	reconcile.await.unwrap().unwrap();
+	insertion.await.unwrap().unwrap();
+	assert_eq!(std::fs::read(&marker).unwrap(), marker_bytes);
+	let records = mgr
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot_cleanup_intents()
+		.await
+		.unwrap();
+	assert!(
+		records
+			.iter()
+			.any(|(slab, uri, intent)| *slab == old.slab_id
+				&& uri == &old.l2_uri
+				&& intent.was_published(&replacement))
+	);
+	assert!(
+		records
+			.iter()
+			.any(|(slab, uri, _)| *slab == old.slab_id && uri == "tier/claim-order-new.wnd")
+	);
+}
+
+#[tokio::test]
+async fn replacement_log_catchup_below_confirmed_index_keeps_marker() {
+	let dir = fresh_dir("replacement-log-below");
+	let marker = dir.join("TIER_AUTHORITY_AWAITING_CLUSTER");
+	std::fs::write(&marker, b"awaiting-cluster-v1\n").unwrap();
+	let io = spawn_io_thread(64).unwrap();
+	let manager = initialize_manager_at_dir(dir.to_path_buf(), io, test_crypto()).await;
+	assert!(
+		manager
+			.finish_replacement_log_replay(Vec::new(), 9, 10)
+			.await
+			.is_err()
+	);
+	assert!(marker.exists());
+	assert!(manager.is_awaiting_cluster());
+	assert!(manager.require_tier_authority_ready().is_err());
+	manager
+		.finish_replacement_log_replay(Vec::new(), 10, 10)
+		.await
+		.unwrap();
+	assert!(!marker.exists());
+	assert!(!manager.is_awaiting_cluster());
+}
+
+#[tokio::test]
+async fn replacement_log_catchup_discrepancy_keeps_marker_and_pointer() {
+	let (_dirs, manager, l2) = fresh_manager_with_l2("replacement-log-discrepancy").await;
+	manager
+		.append_durable(tenant(), id(0xdc150), hlc(513), b"retained-tier")
+		.await
+		.unwrap();
+	let pointer = tier_kv_slab(&manager, &l2, "replacement-log-discrepancy/original").await;
+	manager.wait_tier_authority_ready().await.unwrap();
+	let marker = manager.config.dir.join("TIER_AUTHORITY_AWAITING_CLUSTER");
+	std::fs::write(&marker, b"awaiting-cluster-v1\n").unwrap();
+	manager.awaiting_cluster.store(true, Ordering::Release);
+	// The confirmed leader state omits a locally published tier.
+	assert!(
+		manager
+			.finish_replacement_log_replay(Vec::new(), 10, 10)
+			.await
+			.is_err()
+	);
+	assert!(marker.exists());
+	assert!(manager.is_awaiting_cluster());
+	assert_eq!(manager.tier_pointer(pointer.slab_id).await, Some(pointer));
+	assert!(manager.require_tier_authority_ready().is_err());
+}
+
+#[tokio::test]
+async fn replacement_log_catchup_crash_after_comparison_rechecks_on_reopen() {
+	let dir = fresh_dir("replacement-log-clear-crash");
+	let marker = dir.join("TIER_AUTHORITY_AWAITING_CLUSTER");
+	std::fs::write(&marker, b"awaiting-cluster-v1\n").unwrap();
+	let io = spawn_io_thread(64).unwrap();
+	let crypto = test_crypto();
+	let manager = initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	let pause = manager.pause_snapshot_before_marker_clear_once();
+	let task_manager = manager.clone();
+	let mut install = tokio::spawn(async move {
+		task_manager
+			.finish_replacement_log_replay(Vec::new(), 10, 10)
+			.await
+	});
+	tokio::select! {
+		reached = tokio::time::timeout(Duration::from_secs(60), pause.reached.notified()) => reached.unwrap(),
+		result = &mut install => panic!("comparison did not reach clear cut: {result:?}"),
+	}
+	assert!(marker.exists());
+	install.abort();
+	assert!(install.await.unwrap_err().is_cancelled());
+	drop(manager);
+	let reopened = open_manager_at_dir(dir.to_path_buf(), io, crypto).await;
+	assert!(marker.exists());
+	assert!(reopened.is_awaiting_cluster());
+	assert!(
+		reopened
+			.finish_replacement_log_replay(Vec::new(), 9, 10)
+			.await
+			.is_err()
+	);
+	assert!(
+		marker.exists(),
+		"a durable prior receipt cannot replace fresh proof"
+	);
+	reopened
+		.finish_replacement_log_replay(Vec::new(), 10, 10)
+		.await
+		.unwrap();
+	assert!(!marker.exists());
+	assert!(!reopened.is_awaiting_cluster());
+}
+
+#[tokio::test]
+async fn replacement_log_catchup_rejects_proof_before_installed_snapshot() {
+	let dir = fresh_dir("replacement-log-stale-proof");
+	let marker = dir.join("TIER_AUTHORITY_AWAITING_CLUSTER");
+	std::fs::write(&marker, b"awaiting-cluster-v1\n").unwrap();
+	let io = spawn_io_thread(64).unwrap();
+	let manager = initialize_manager_at_dir(dir.to_path_buf(), io, test_crypto()).await;
+	manager.seed_installed_snapshot_index(11);
+	assert!(
+		manager
+			.finish_replacement_log_replay(Vec::new(), 10, 10)
+			.await
+			.is_err()
+	);
+	assert!(marker.exists());
+	assert!(manager.is_awaiting_cluster());
+	manager
+		.finish_replacement_log_replay(Vec::new(), 11, 11)
+		.await
+		.unwrap();
+	assert!(!marker.exists());
+}
+
+#[tokio::test]
+async fn storage_index_lock_contention_waits_then_reaches_ready_without_restart() {
+	let dir = fresh_dir("dc145-held-old-index");
+	let io = spawn_io_thread(64).unwrap();
+	let crypto = test_crypto();
+	let old = initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	let key = id(0xdc145);
+	old.append_durable(tenant(), key, hlc(514), b"kept-across-reopen")
+		.await
+		.unwrap();
+	old.fsync_all_local_slabs().await.unwrap();
+	let held = old
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.hold_database_for_test();
+	drop(old);
+	let mut reopen = Box::pin(open_manager_at_dir(dir.to_path_buf(), io, crypto));
+	assert!(
+		tokio::time::timeout(Duration::from_millis(100), reopen.as_mut())
+			.await
+			.is_err(),
+		"an old database handle must leave the asynchronous open Pending"
+	);
+	// The caller, rather than the retry future, owns and releases this handle.
+	drop(held);
+	let reopened = tokio::time::timeout(Duration::from_secs(10), reopen)
+		.await
+		.expect("open must retry without self-deadlocking once the old handle drops");
+	tokio::time::timeout(
+		Duration::from_secs(10),
+		reopened.wait_tier_authority_ready(),
+	)
+	.await
+	.unwrap()
+	.unwrap();
+	assert!(reopened.tier_authority_readiness_reason().is_none());
+	let location = reopened
+		.lookup(tenant(), key)
+		.unwrap()
+		.expect("durable row survives");
+	assert_eq!(
+		reopened.read(location).await.unwrap(),
+		b"kept-across-reopen"
+	);
+}
+
+#[tokio::test]
+async fn retirement_timeout_fence_survives_reopen_and_validated_comparison_resolves_it() {
+	let (dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let unrelated_key = id(0xdc145);
+	mgr.append_durable(tenant(), unrelated_key, hlc(902), b"unrelated")
+		.await
+		.unwrap();
+	let gate = mgr.hold_index_write_gate_for_test().await;
+	let error = tokio::time::timeout(Duration::from_secs(35), mgr.retire_tiered_slab(old.slab_id))
+		.await
+		.unwrap()
+		.unwrap_err();
+	assert_eq!(
+		stale_location(&error),
+		Some(StaleLocation {
+			slab_id: old.slab_id,
+			reason: StaleLocationReason::Fenced
+		})
+	);
+	assert!(mgr.lookup(tenant(), id(0x421)).is_err());
+	let unrelated = mgr.lookup(tenant(), unrelated_key).unwrap().unwrap();
+	assert_eq!(mgr.read(unrelated).await.unwrap(), b"unrelated");
+	let marks = mgr
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot_retirement_marks()
+		.await
+		.unwrap();
+	assert_eq!(marks.len(), 1);
+	assert_eq!(marks[0].pointer, old);
+	assert_eq!(marks[0].snapshot_index, None);
+	drop(gate);
+	let mgr = try_restart_tier_manager(mgr, &dirs, &l2).await.unwrap();
+	assert!(
+		mgr.lookup(tenant(), id(0x421)).is_err(),
+		"reopen restores the scoped fence"
+	);
+	assert_eq!(
+		mgr.persistent_index
+			.as_ref()
+			.unwrap()
+			.load_snapshot_retirement_marks()
+			.await
+			.unwrap(),
+		marks
+	);
+	// Reopen requires a complete validated control set before the private
+	// authority verifier can finish; a raw local callback is not that proof.
+	mgr.fence_local_tiers_absent_from_committed(&std::collections::HashSet::new(), Some(819))
+		.await
+		.unwrap();
+	tokio::time::timeout(Duration::from_secs(10), mgr.wait_tier_authority_ready())
+		.await
+		.unwrap()
+		.unwrap();
+	assert!(
+		mgr.persistent_index
+			.as_ref()
+			.unwrap()
+			.load_snapshot_retirement_marks()
+			.await
+			.unwrap()
+			.is_empty()
+	);
+	assert!(mgr.tier_pointer(old.slab_id).await.is_none());
+	assert!(mgr.lookup(tenant(), id(0x421)).unwrap().is_none());
+	assert!(mgr.tier_authority_readiness_reason().is_none());
+	assert!(
+		l2.get(&old.l2_uri).await.is_ok(),
+		"retirement retains the object"
+	);
+}
+
+#[tokio::test]
+async fn tier_apply_bounds_its_index_gate_wait_and_defers_the_pointer() {
+	let (_dirs, mgr, l2) = fresh_manager_with_l2("tier-apply-gate-timeout").await;
+	let key = id(0x7e51);
+	mgr.append_durable(tenant(), key, hlc(10), b"bounded")
+		.await
+		.unwrap();
+	let slab_id = force_seal_active(&mgr).await;
+	let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
+	let encrypted = mgr.encrypt_tiered_object_blob(slab_id, &raw).unwrap();
+	let uri = l2
+		.put("tier/apply-gate-timeout.wnd", &encrypted.bytes)
+		.await
+		.unwrap();
+	let pointer = tiered_pointer_from_blob(&mgr, slab_id, uri, &encrypted.bytes);
+	let gate = mgr.hold_index_write_gate_for_test().await;
+	let started = std::time::Instant::now();
+	let error = tokio::time::timeout(
+		Duration::from_secs(35),
+		mgr.apply_tier_slab(pointer.clone()),
+	)
+	.await
+	.expect("tier apply must return within its 30 s index gate bound")
+	.unwrap_err();
+	assert!(
+		started.elapsed() >= Duration::from_secs(29),
+		"the refusal came from the gate bound: {:?}",
+		started.elapsed()
+	);
+	assert_eq!(
+		stale_location(&error),
+		Some(StaleLocation {
+			slab_id,
+			reason: StaleLocationReason::Fenced
+		})
+	);
+	assert!(
+		mgr.tier_pointer(slab_id).await.is_none(),
+		"a timed-out apply publishes no pointer"
+	);
+	{
+		let deferred = mgr
+			.unapplied_tier_pointers
+			.get(&slab_id)
+			.expect("the timed-out pointer is recorded as deferred");
+		assert_eq!(
+			*deferred.value(),
+			(pointer.clone(), Some(StaleLocationReason::Fenced), None)
+		);
+	}
+	assert!(
+		mgr.lookup(tenant(), key).is_err(),
+		"a deferred pointer fences admission"
+	);
+	drop(gate);
+	let durable = mgr
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot()
+		.await
+		.unwrap();
+	assert!(
+		!durable
+			.tiered_slabs
+			.iter()
+			.any(|stored| stored.slab_id == slab_id),
+		"a timed-out apply writes no durable pointer row"
+	);
+	tokio::time::timeout(
+		Duration::from_secs(35),
+		mgr.apply_tier_slab(pointer.clone()),
+	)
+	.await
+	.expect("the retry with a free gate is bounded")
+	.unwrap();
+	assert_eq!(mgr.tier_pointer(slab_id).await, Some(pointer.clone()));
+	assert!(!mgr.unapplied_tier_pointers.contains_key(&slab_id));
+	assert!(mgr.tier_authority_readiness_reason().is_none());
+	assert!(
+		mgr.persistent_index
+			.as_ref()
+			.unwrap()
+			.load_snapshot()
+			.await
+			.unwrap()
+			.tiered_slabs
+			.contains(&pointer)
+	);
+	let location = mgr
+		.lookup(tenant(), key)
+		.unwrap()
+		.expect("the retried apply serves the row");
+	assert_eq!(location.slab_id, slab_id);
+	assert_eq!(mgr.read(location).await.unwrap(), b"bounded");
+}
+
+#[tokio::test]
+async fn committed_republication_resolves_unindexed_timeout_fence() {
+	let (_dirs, mgr, _l2, _target, _schemas, pointer) = unpublished_drop_fixture().await;
+	let epoch = mgr.capture_snapshot_epoch();
+	mgr.persistent_index
+		.as_ref()
+		.unwrap()
+		.stage_deferred_retirement(
+			crate::storage::index::SnapshotRetirementMark {
+				epoch,
+				snapshot_index: None,
+				pointer: pointer.clone(),
+			},
+			mgr.snapshot_epoch.clone(),
+			mgr.snapshot_epoch_gate.clone(),
+		)
+		.await
+		.unwrap()
+		.unwrap();
+	mgr.tier_authority
+		.mark_snapshot_retirement(pointer.slab_id, epoch, None);
+	assert!(mgr.lookup(tenant(), id(0x421)).is_err());
+	mgr.apply_tier_slab_committed(pointer, Some(820))
+		.await
+		.unwrap();
+	assert!(
+		mgr.persistent_index
+			.as_ref()
+			.unwrap()
+			.load_snapshot_retirement_marks()
+			.await
+			.unwrap()
+			.is_empty()
+	);
+	assert!(mgr.tier_authority_readiness_reason().is_none());
+	assert!(mgr.lookup(tenant(), id(0x421)).unwrap().is_some());
+}
+
+async fn a6_undecodable_stored_counter_identity_control(counter_class: bool) {
+	let (_dir, mgr) = fresh_manager().await;
+	let key = id(0xa600);
+	let timestamp = counter_op_hlc(10);
+	let malformed = b"not an origin counter frame";
+	assert!(super::super::counter::decode_origin_frame(malformed).is_err());
+	let location = if counter_class {
+		let active = mgr.state.lock().await.active.clone();
+		let location = active
+			.write_framed(
+				tenant(),
+				key,
+				timestamp,
+				crate::schema::record_class::COUNTER_TENTATIVE_V2,
+				malformed,
+			)
+			.await
+			.unwrap();
+		active.wait_durable_commit().await.unwrap();
+		mgr.index_checked_version(tenant(), key, Locality::from(key), location, 0)
+			.unwrap();
+		location
+	} else {
+		mgr.append_durable(tenant(), key, timestamp, malformed)
+			.await
+			.unwrap()
+	};
+	let active = mgr.state.lock().await.active.clone();
+	let (header, bytes) = active.read_with_header(location).await.unwrap();
+	assert_eq!(
+		bytes, malformed,
+		"the stored frame is checksum-valid and readable"
+	);
+	assert_eq!(
+		header.record_class,
+		if counter_class {
+			crate::schema::record_class::COUNTER_TENTATIVE_V2
+		} else {
+			crate::schema::record_class::STANDARD
+		}
+	);
+	assert_eq!(mgr.read(location).await.unwrap(), malformed);
+	let before_cursor = active.write_cursor();
+	let before = mgr.same_hlc_locations(tenant(), key, timestamp).unwrap();
+	assert_eq!(before, vec![location]);
+	let result = mgr
+		.counter_append_tentative(tenant(), key, timestamp, 7, counter_origin(1))
+		.await;
+	let error = result.expect_err(
+		"A6 a counter producer must refuse an undecodable stored copy, never treat it as equal",
+	);
+	assert!(is_conflicting_version_refusal(&error), "{error}");
+	assert_eq!(
+		active.write_cursor(),
+		before_cursor,
+		"refusal must precede a new tentative write"
+	);
+	assert_eq!(
+		mgr.same_hlc_locations(tenant(), key, timestamp).unwrap(),
+		before
+	);
+	assert_eq!(
+		active.read_with_header(location).await.unwrap().1,
+		malformed
+	);
+}
+
+#[tokio::test]
+async fn a6_counter_producer_refuses_an_undecodable_counter_copy() {
+	a6_undecodable_stored_counter_identity_control(true).await;
+}
+
+#[tokio::test]
+async fn a6_counter_producer_refuses_an_ordinary_non_counter_copy() {
+	a6_undecodable_stored_counter_identity_control(false).await;
+}
+
+async fn a7_version_field_set_control(incoming_subset: bool) {
+	let (_dir, mgr) = fresh_manager().await;
+	let key = id(0xa700);
+	let base_frame =
+		encode_test_multirow_storage_frame(&[(key, Locality::new(0xa700), hlc(10), 100)]);
+	let base = decode_record_batch(&base_frame).unwrap();
+	let mut fields = base.schema().fields().iter().cloned().collect::<Vec<_>>();
+	fields.push(Arc::new(Field::new(
+		"extra_version_value",
+		DataType::Int64,
+		false,
+	)));
+	let mut columns = base.columns().to_vec();
+	columns.push(Arc::new(Int64Array::from(vec![7])));
+	let extended = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
+	let (stored, incoming) = if incoming_subset {
+		(&extended, &base)
+	} else {
+		(&base, &extended)
+	};
+	let stored_frame = encode_test_batch(stored);
+	let incoming_frame = encode_test_batch(incoming);
+	let stored_entries = storage_multirow_index_entries_from_frame(&stored_frame)
+		.unwrap()
+		.unwrap();
+	let incoming_entries = storage_multirow_index_entries_from_frame(&incoming_frame)
+		.unwrap()
+		.unwrap();
+	assert_eq!(
+		stored_entries[0].key_identity,
+		incoming_entries[0].key_identity
+	);
+	assert_eq!(stored_entries[0].row_hlc, incoming_entries[0].row_hlc);
+	let first = mgr
+		.append_durable_multirow_with_locality(tenant(), &stored_frame, &stored_entries)
+		.await
+		.unwrap();
+	let active = mgr.state.lock().await.active.clone();
+	let before_cursor = active.write_cursor();
+	let result = mgr
+		.append_durable_multirow_with_locality(tenant(), &incoming_frame, &incoming_entries)
+		.await;
+	let error = result.expect_err(
+		"A7 a different field set at the same row version must be refused in either direction",
+	);
+	assert!(is_conflicting_version_refusal(&error), "{error}");
+	assert_eq!(
+		active.write_cursor(),
+		before_cursor,
+		"refusal precedes the second physical frame"
+	);
+	assert_eq!(
+		mgr.same_hlc_locations(tenant(), key, hlc(10)).unwrap(),
+		vec![first]
+	);
+	assert_eq!(mgr.read(first).await.unwrap(), stored_frame);
+}
+
+#[tokio::test]
+async fn a7_version_identity_refuses_an_incoming_subset_of_stored_fields() {
+	a7_version_field_set_control(true).await;
+}
+
+#[tokio::test]
+async fn a7_version_identity_refuses_an_incoming_superset_of_stored_fields() {
+	a7_version_field_set_control(false).await;
+}
+
+#[tokio::test]
+async fn a7_version_identity_accepts_the_same_fields_in_a_different_order() {
+	let (_dir, mgr) = fresh_manager().await;
+	let key = id(0xa701);
+	let frame = encode_test_multirow_storage_frame(&[(key, Locality::new(0xa701), hlc(10), 100)]);
+	let batch = decode_record_batch(&frame).unwrap();
+	let reordered = RecordBatch::try_new(
+		Arc::new(Schema::new(
+			batch
+				.schema()
+				.fields()
+				.iter()
+				.rev()
+				.cloned()
+				.collect::<Vec<_>>(),
+		)),
+		batch.columns().iter().rev().cloned().collect(),
+	)
+	.unwrap();
+	for frame in [frame, encode_test_batch(&reordered)] {
+		let entries = storage_multirow_index_entries_from_frame(&frame)
+			.unwrap()
+			.unwrap();
+		let location = mgr
+			.append_durable_multirow_with_locality(tenant(), &frame, &entries)
+			.await
+			.unwrap();
+		let bytes = mgr.read(location).await.unwrap();
+		let read = decode_record_batch(&bytes).unwrap();
+		let row = location.record_row_index.get() as usize;
+		assert_eq!(
+			read.column_by_name("value")
+				.unwrap()
+				.as_any()
+				.downcast_ref::<UInt64Array>()
+				.unwrap()
+				.value(row),
+			100
+		);
+		let identities = read
+			.column_by_name(STORAGE_ROW_KEY_ID_COLUMN)
+			.unwrap()
+			.as_any()
+			.downcast_ref::<arrow::array::FixedSizeBinaryArray>()
+			.unwrap();
+		assert_eq!(identities.value(row), key.as_bytes());
+	}
+	assert_eq!(
+		mgr.same_hlc_locations(tenant(), key, hlc(10))
+			.unwrap()
+			.len(),
+		2
+	);
+}
+#[tokio::test]
+async fn a7_live_multirow_retry_and_reopen_replay_accept_full_storage_fields() {
+	let (dirs, mgr, l2) = fresh_manager_with_l2("a7-live-retry-replay").await;
+	let table = secondary_index_table_descriptor_for_test();
+	let timestamp = hlc(10);
+	let user_batch = secondary_index_user_batch_for_test(7, Some(10));
+	let pack = || {
+		let meta = layout_recluster_meta(&table, user_batch.num_rows());
+		let packed =
+			pack_record_batch_by_bucket(&meta, &table, &user_batch, WriterNodeId::ZERO, timestamp)
+				.unwrap();
+		assert_eq!(packed.len(), 1);
+		packed[0].frame_bytes.clone()
+	};
+	let first_frame = pack();
+	let first_entries = storage_multirow_index_entries_from_frame(&first_frame)
+		.unwrap()
+		.unwrap();
+	let key = first_entries[0].key_identity;
+	let first = mgr
+		.append_durable_multirow_with_locality(tenant(), &first_frame, &first_entries)
+		.await
+		.unwrap();
+	let retry_frame = pack();
+	let incoming = decode_record_batch(&retry_frame).unwrap();
+	let incoming_names = incoming
+		.schema()
+		.fields()
+		.iter()
+		.map(|f| f.name().clone())
+		.collect::<BTreeSet<_>>();
+	assert!(incoming_names.contains(STORAGE_ROW_KEY_ID_COLUMN));
+	assert!(incoming_names.contains(STORAGE_ROW_HLC_COLUMN));
+	assert!(
+		incoming.num_columns() > user_batch.num_columns(),
+		"live packing includes storage columns"
+	);
+	let stored = decode_record_batch(&mgr.read(first).await.unwrap()).unwrap();
+	assert_eq!(
+		stored
+			.schema()
+			.fields()
+			.iter()
+			.map(|f| f.name().clone())
+			.collect::<BTreeSet<_>>(),
+		incoming_names,
+		"stored and incoming producer batches have the same full field set"
+	);
+	let retry_entries = storage_multirow_index_entries_from_frame(&retry_frame)
+		.unwrap()
+		.unwrap();
+	mgr.append_durable_multirow_with_locality(tenant(), &retry_frame, &retry_entries)
+		.await
+		.expect("a real same-content client retry must be accepted");
+	assert_eq!(
+		mgr.same_hlc_locations(tenant(), key, timestamp)
+			.unwrap()
+			.len(),
+		2
+	);
+	force_seal_active(&mgr).await;
+	let mgr = restart_tier_manager(mgr, &dirs, &l2).await;
+	let recovered = mgr.lookup(tenant(), key).unwrap().unwrap();
+	let stored = decode_record_batch(&mgr.read(recovered).await.unwrap()).unwrap();
+	let replay_frame = pack();
+	let replay = decode_record_batch(&replay_frame).unwrap();
+	assert_eq!(
+		stored
+			.schema()
+			.fields()
+			.iter()
+			.map(|f| f.name().clone())
+			.collect::<BTreeSet<_>>(),
+		replay
+			.schema()
+			.fields()
+			.iter()
+			.map(|f| f.name().clone())
+			.collect::<BTreeSet<_>>(),
+		"reopen does not strip or add storage columns to the version frame"
+	);
+	let replay_entries = storage_multirow_index_entries_from_frame(&replay_frame)
+		.unwrap()
+		.unwrap();
+	let latest = mgr
+		.append_durable_multirow_with_locality(tenant(), &replay_frame, &replay_entries)
+		.await
+		.expect("the same-content replay after reopen must be accepted");
+	assert_eq!(
+		mgr.same_hlc_locations(tenant(), key, timestamp)
+			.unwrap()
+			.len(),
+		3
+	);
+	let bytes = mgr.read_version(tenant(), key, latest).await.unwrap();
+	let batch = decode_record_batch(&bytes).unwrap();
+	assert_eq!(
+		batch
+			.column_by_name("age")
+			.unwrap()
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.unwrap()
+			.value(latest.record_row_index.get() as usize),
+		10
+	);
+}
+struct A9MaintenanceFixture {
+	dir: crate::test_support::TestDir,
+	manager: Arc<SlabManager>,
+	key: Identity,
+	old_slab: SlabId,
+	new_slab: SlabId,
+	replacement: Arc<LocalSlabStore>,
+	records: Vec<CompactionRecord>,
+	relocations: Vec<RelocatedRecord>,
+	staged: std::path::PathBuf,
+}
+
+async fn a9_maintenance_fixture(keep_source: bool) -> A9MaintenanceFixture {
+	let (dir, manager) = fresh_manager().await;
+	let key = id(0xa900);
+	let first = manager
+		.append_durable(tenant(), key, hlc(10), b"survivor")
+		.await
+		.unwrap();
+	let second = manager
+		.append_durable(tenant(), key, hlc(10), b"survivor")
+		.await
+		.unwrap();
+	let other_key = id(0xa901);
+	let other = manager
+		.append_durable(tenant(), other_key, hlc(20), b"other")
+		.await
+		.unwrap();
+	let old_slab = force_seal_active(&manager).await;
+	manager.ensure_live_lsm_run_for_maintenance(old_slab, 8192);
+	let new_slab = manager.reserve_slab_id().await;
+	let staged = maintenance_staged_slab_path(&manager.config.dir, old_slab, new_slab);
+	let replacement = Arc::new(
+		LocalSlabStore::open(
+			&staged,
+			new_slab,
+			manager.file_ops.clone(),
+			manager.config.group_commit.clone(),
+		)
+		.await
+		.unwrap(),
+	);
+	let new = replacement
+		.append(tenant(), key, hlc(10), b"survivor")
+		.await
+		.unwrap();
+	let new_other = replacement
+		.append(tenant(), other_key, hlc(20), b"other")
+		.await
+		.unwrap();
+	replacement.wait_durable_commit().await.unwrap();
+	let records = [first, second, other]
+		.into_iter()
+		.map(|old_location| CompactionRecord {
+			tenant_id: tenant(),
+			key_identity: if old_location == other {
+				other_key
+			} else {
+				key
+			},
+			routing_locality: Locality::from(if old_location == other {
+				other_key
+			} else {
+				key
+			}),
+			old_location,
+			reclaim: false,
+			retention_ambiguous: false,
+			retention_lag_seconds: 0,
+		})
+		.collect();
+	let relocations = [first, second, other]
+		.into_iter()
+		.map(|old_location| RelocatedRecord {
+			tenant_id: tenant(),
+			key_identity: if old_location == other {
+				other_key
+			} else {
+				key
+			},
+			routing_locality: Locality::from(if old_location == other {
+				other_key
+			} else {
+				key
+			}),
+			old_location,
+			new_location: if old_location == other {
+				new_other
+			} else {
+				new
+			},
+		})
+		.collect();
+	// Model a stale physical-copy candidate; the logical version still has an
+	// acknowledged surviving copy in the shared-output case. This is not an
+	// assertion that a volatile-only removal revokes durable data authority.
+	manager.rollback_indexed_location(tenant(), key, second);
+	if !keep_source {
+		manager.rollback_indexed_location(tenant(), key, first);
+	}
+	A9MaintenanceFixture {
+		dir,
+		manager,
+		key,
+		old_slab,
+		new_slab,
+		replacement,
+		records,
+		relocations,
+		staged,
+	}
+}
+
+#[tokio::test]
+async fn a9_shared_output_keeps_the_live_survivor_in_the_durable_index() {
+	let f = a9_maintenance_fixture(true).await;
+	let result = f
+		.manager
+		.finish_compaction_with_replacement(
+			f.old_slab,
+			f.new_slab,
+			f.replacement.clone(),
+			&f.records,
+			&f.relocations,
+			&[],
+			&f.staged,
+		)
+		.await
+		.unwrap();
+	assert!(result, "one present source authorizes the shared output");
+	let live = f.manager.lookup(tenant(), f.key).unwrap().unwrap();
+	assert_eq!(live, f.relocations[0].new_location);
+	assert_eq!(f.manager.read(live).await.unwrap(), b"survivor");
+	let snapshot = f
+		.manager
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot()
+		.await
+		.unwrap();
+	assert!(
+		snapshot
+			.record_rows
+			.iter()
+			.any(|row| row.key_identity == f.key && row.location == live),
+		"A9 a shared output still live must not be deleted as a refused output"
+	);
+	let io = f.manager.config.io.clone();
+	let crypto = f.manager.config.crypto.clone();
+	drop(f.replacement);
+	drop(f.manager);
+	let reopened = open_manager_at_dir(f.dir.to_path_buf(), io, crypto).await;
+	let recovered = reopened
+		.lookup(tenant(), f.key)
+		.unwrap()
+		.expect("an acknowledged survivor must survive reopen");
+	assert_eq!(reopened.read(recovered).await.unwrap(), b"survivor");
+}
+
+#[tokio::test]
+async fn a9_missing_sources_refuse_before_d2_or_fail_stop_on_refused_delta_error() {
+	let f = a9_maintenance_fixture(false).await;
+	let pause = f.manager.pause_index_relocation_once();
+	let manager = f.manager.clone();
+	let old = f.old_slab;
+	let new = f.new_slab;
+	let replacement = f.replacement.clone();
+	let records = f.records.clone();
+	let relocations = f.relocations.clone();
+	let staged = f.staged.clone();
+	let mut install = tokio::spawn(async move {
+		manager
+			.finish_compaction_with_replacement(
+				old,
+				new,
+				replacement,
+				&records,
+				&relocations,
+				&[],
+				&staged,
+			)
+			.await
+	});
+	tokio::select! {
+		outcome = &mut install => {
+			assert!(!outcome.unwrap().unwrap(), "stale candidates must refuse before durable output publication");
+			assert!(!f.manager.persistent_index.as_ref().unwrap().load_snapshot().await.unwrap().record_rows.iter().any(|row| row.location.slab_id == f.new_slab));
+			return;
+		},
+		reached = tokio::time::timeout(Duration::from_secs(60), pause.reached.notified()) => reached.unwrap(),
+	}
+	assert!(
+		f.manager
+			.persistent_index
+			.as_ref()
+			.unwrap()
+			.load_snapshot()
+			.await
+			.unwrap()
+			.record_rows
+			.iter()
+			.any(|row| row.location.slab_id == f.new_slab)
+	);
+	f.manager
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.fail_next_delta
+		.store(true, Ordering::Release);
+	pause.resume.notify_one();
+	let error = install
+		.await
+		.unwrap()
+		.expect_err("the second persistent delta is forced to fail");
+	assert!(
+		error.to_string().contains("injected delta failure"),
+		"{error}"
+	);
+	assert!(
+		f.manager
+			.maintenance_publication_restart_required
+			.load(Ordering::Acquire),
+		"A9 durable D2 followed by refused-output delta failure must retain the maintenance fail-stop gate"
+	);
+}
+
+#[tokio::test]
+async fn a9_shared_output_pair_with_one_present_source_is_not_refused() {
+	let f = a9_maintenance_fixture(true).await;
+	let mut relocation = KeyRelocation::new(Locality::from(f.key), true);
+	for row in f.relocations.iter().filter(|row| row.key_identity == f.key) {
+		relocation.pairs.push(RelocationPair {
+			old: row.old_location,
+			new: row.new_location,
+			table_object_id: None,
+		});
+	}
+	let refused = f
+		.manager
+		.relocate_indexed_locations(tenant(), f.key, &relocation);
+	assert!(
+		refused.is_empty(),
+		"A9 a shared output produced by another applied pair is not refused: {refused:?}"
+	);
+	assert_eq!(
+		f.manager
+			.key_index
+			.get(&(tenant(), f.key))
+			.unwrap()
+			.as_slice(),
+		&[f.relocations[0].new_location]
+	);
+}
+#[tokio::test]
+async fn a9_missing_sources_cannot_reappear_from_the_second_persist_crash_window() {
+	let f = a9_maintenance_fixture(false).await;
+	let pause = f.manager.pause_index_relocation_once();
+	let manager = f.manager.clone();
+	let old = f.old_slab;
+	let new = f.new_slab;
+	let replacement = f.replacement.clone();
+	let records = f.records.clone();
+	let relocations = f.relocations.clone();
+	let staged = f.staged.clone();
+	let mut install = tokio::spawn(async move {
+		manager
+			.finish_compaction_with_replacement(
+				old,
+				new,
+				replacement,
+				&records,
+				&relocations,
+				&[],
+				&staged,
+			)
+			.await
+	});
+	tokio::select! {
+		outcome = &mut install => {
+			assert!(!outcome.unwrap().unwrap(), "stale candidates must refuse before D2");
+			assert!(!f.manager.persistent_index.as_ref().unwrap().load_snapshot().await.unwrap().record_rows.iter().any(|row| row.location.slab_id == f.new_slab));
+			return;
+		},
+		reached = tokio::time::timeout(Duration::from_secs(60), pause.reached.notified()) => reached.unwrap(),
+	}
+	let durable = f
+		.manager
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot()
+		.await
+		.unwrap();
+	assert!(
+		durable
+			.record_rows
+			.iter()
+			.any(|row| row.location.slab_id == f.new_slab)
+	);
+	assert!(
+		f.manager
+			.key_index
+			.get(&(tenant(), f.key))
+			.is_none_or(|chain| chain.is_empty()),
+		"the actual relocation has refused the output"
+	);
+	install.abort();
+	let _ = install.await;
+	let io = f.manager.config.io.clone();
+	let crypto = f.manager.config.crypto.clone();
+	drop(f.replacement);
+	drop(f.manager);
+	let reopened = open_manager_at_dir(f.dir.to_path_buf(), io, crypto).await;
+	if let Ok(Some(location)) = reopened.lookup(tenant(), f.key) {
+		assert!(
+			reopened.read(location).await.is_err(),
+			"A9 output refused by live relocation reappears after crash before the second persist"
+		);
+	}
+}
+
+#[tokio::test]
+async fn a9_unexpected_refusal_after_d2_retains_the_maintenance_gate() {
+	let f = a9_maintenance_fixture(true).await;
+	let pause = f.manager.pause_index_relocation_once();
+	let manager = f.manager.clone();
+	let old = f.old_slab;
+	let new = f.new_slab;
+	let replacement = f.replacement.clone();
+	let records = f.records.clone();
+	let relocations = f.relocations.clone();
+	let staged = f.staged.clone();
+	let install = tokio::spawn(async move {
+		manager
+			.finish_compaction_with_replacement(
+				old,
+				new,
+				replacement,
+				&records,
+				&relocations,
+				&[],
+				&staged,
+			)
+			.await
+	});
+	tokio::time::timeout(Duration::from_secs(60), pause.reached.notified())
+		.await
+		.unwrap();
+	// Deliberately violate the production source-lock invariant after D2 to
+	// cover the fail-stop backstop, independently of the stale-plan preflight.
+	let other = f
+		.relocations
+		.iter()
+		.find(|row| row.key_identity != f.key)
+		.unwrap();
+	f.manager
+		.rollback_indexed_location(tenant(), other.key_identity, other.old_location);
+	f.manager
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.fail_next_delta
+		.store(true, Ordering::Release);
+	pause.resume.notify_one();
+	let error = install
+		.await
+		.unwrap()
+		.expect_err("post-D2 refusal cannot report a completed rewrite");
+	assert!(
+		error.to_string().contains("injected delta failure")
+			|| error.kind() == ErrorKind::WouldBlock,
+		"{error}"
+	);
+	assert!(
+		f.manager
+			.maintenance_publication_restart_required
+			.load(Ordering::Acquire),
+		"A9 unexpected post-D2 refusal must retain the maintenance gate"
+	);
+	assert!(f.manager.maintenance_publication_gate.try_write().is_err());
+}
+
+#[tokio::test]
+async fn a9_durable_survivors_stay_readable_after_a_d2_crash() {
+	let f = a9_maintenance_fixture(true).await;
+	let pause = f.manager.pause_index_relocation_once();
+	let manager = f.manager.clone();
+	let old = f.old_slab;
+	let new = f.new_slab;
+	let replacement = f.replacement.clone();
+	let records = f.records.clone();
+	let relocations = f.relocations.clone();
+	let staged = f.staged.clone();
+	let install = tokio::spawn(async move {
+		manager
+			.finish_compaction_with_replacement(
+				old,
+				new,
+				replacement,
+				&records,
+				&relocations,
+				&[],
+				&staged,
+			)
+			.await
+	});
+	tokio::time::timeout(Duration::from_secs(60), pause.reached.notified())
+		.await
+		.unwrap();
+	let durable = f
+		.manager
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot()
+		.await
+		.unwrap();
+	assert!(
+		durable
+			.record_rows
+			.iter()
+			.any(|row| row.key_identity == f.key && row.location.slab_id == f.new_slab)
+	);
+	install.abort();
+	let _ = install.await;
+	let io = f.manager.config.io.clone();
+	let crypto = f.manager.config.crypto.clone();
+	drop(f.replacement);
+	drop(f.manager);
+	let reopened = open_manager_at_dir(f.dir.to_path_buf(), io, crypto).await;
+	for (key, value) in [
+		(f.key, b"survivor".as_slice()),
+		(id(0xa901), b"other".as_slice()),
+	] {
+		let recovered = reopened
+			.lookup(tenant(), key)
+			.unwrap()
+			.expect("durable acknowledged survivor");
+		assert_eq!(reopened.read(recovered).await.unwrap(), value);
+	}
+}
+async fn a10_append_visibility_before_index_commit(fail: bool) {
+	let (_dir, manager) = fresh_manager().await;
+	let key = id(0xa100);
+	let original = manager
+		.append_durable(tenant(), key, hlc(1), b"old")
+		.await
+		.unwrap();
+	let entered = Arc::new(std::sync::Barrier::new(2));
+	let release = Arc::new(std::sync::Barrier::new(2));
+	*manager
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.guarded_delta_before_commit_hold
+		.lock()
+		.unwrap() = Some((entered.clone(), release.clone(), fail));
+	let append = {
+		let manager = manager.clone();
+		tokio::spawn(async move { manager.append(tenant(), key, hlc(2), b"new").await })
+	};
+	tokio::time::timeout(
+		Duration::from_secs(60),
+		tokio::task::spawn_blocking(move || entered.wait()),
+	)
+	.await
+	.unwrap()
+	.unwrap();
+	let durable = manager
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot()
+		.await
+		.unwrap();
+	assert!(
+		!durable
+			.record_rows
+			.iter()
+			.any(|row| row.key_identity == key && row.location.hlc == hlc(2)),
+		"pre-commit cut has no new durable index row"
+	);
+	let latest = manager.lookup(tenant(), key);
+	let as_of = manager.lookup_as_of(tenant(), key, hlc(2));
+	let observed = match latest {
+		Ok(Some(location)) => Some(manager.read(location).await.unwrap()),
+		_ => None,
+	};
+	tokio::task::spawn_blocking(move || release.wait())
+		.await
+		.unwrap();
+	let outcome = append.await.unwrap();
+	if fail {
+		assert!(
+			outcome
+				.unwrap_err()
+				.to_string()
+				.contains("injected delta failure before commit")
+		);
+	} else {
+		let location = outcome.unwrap();
+		assert_eq!(manager.read(location).await.unwrap(), b"new");
+	}
+	assert!(
+		observed.is_none_or(|bytes| bytes == b"old"),
+		"A10 pending append served bytes before the redb transaction committed"
+	);
+	assert!(
+		as_of.is_err() || as_of.unwrap() == Some(original),
+		"A10 historical lookup exposed the uncommitted new version"
+	);
+	if fail {
+		assert!(
+			!manager
+				.key_index
+				.get(&(tenant(), key))
+				.unwrap()
+				.iter()
+				.any(|location| location.hlc == hlc(2)),
+			"a failed append must not remain in the live version chain"
+		);
+	}
+}
+
+#[tokio::test]
+async fn a10_append_that_later_fails_is_not_visible_before_index_commit() {
+	a10_append_visibility_before_index_commit(true).await;
+}
+
+#[tokio::test]
+async fn a10_successful_append_becomes_visible_only_after_index_commit() {
+	a10_append_visibility_before_index_commit(false).await;
+}
+async fn a11_replacement_comparison_requires_the_expected_set(keep_one: bool) {
+	let (_dirs, manager, l2) = fresh_manager_with_l2("a11-replacement-set").await;
+	manager
+		.append_durable(tenant(), id(0xa110), hlc(1), b"first")
+		.await
+		.unwrap();
+	let first = tier_kv_slab(&manager, &l2, "a11/first").await;
+	manager
+		.append_durable(tenant(), id(0xa111), hlc(2), b"second")
+		.await
+		.unwrap();
+	let second = tier_kv_slab(&manager, &l2, "a11/second").await;
+	let index = manager.persistent_index.as_ref().unwrap();
+	let delete_tiered_slab_ids = if keep_one {
+		vec![second.slab_id]
+	} else {
+		vec![first.slab_id, second.slab_id]
+	};
+	index
+		.apply(PersistentIndexUpdate {
+			delete_tiered_slab_ids,
+			..Default::default()
+		})
+		.await
+		.unwrap();
+	let before = index.load_snapshot().await.unwrap();
+	let floor = index.snapshot_retirement_epoch_floor().await.unwrap();
+	let epoch = floor + 7;
+	let error = index
+		.stage_tier_comparison(
+			Some((800, vec![first.clone(), second.clone()])),
+			vec![],
+			[first.slab_id, second.slab_id].into_iter().collect(),
+			epoch,
+			Arc::new(std::sync::atomic::AtomicU64::new(epoch)),
+			Arc::new(std::sync::RwLock::new(())),
+		)
+		.await
+		.expect_err(
+			"A11 replacement certification must refuse an expected pointer missing from redb",
+		);
+	assert_eq!(error.kind(), ErrorKind::WouldBlock);
+	assert_eq!(
+		index.snapshot_retirement_epoch_floor().await.unwrap(),
+		floor,
+		"refusal cannot advance the comparison receipt"
+	);
+	assert_eq!(
+		index.load_snapshot().await.unwrap().tiered_slabs,
+		before.tiered_slabs
+	);
+}
+#[tokio::test]
+async fn a11_replacement_refuses_a_missing_member_of_a_nonempty_expected_set() {
+	a11_replacement_comparison_requires_the_expected_set(true).await;
+}
+#[tokio::test]
+async fn a11_replacement_refuses_an_empty_actual_set_with_expected_pointers() {
+	a11_replacement_comparison_requires_the_expected_set(false).await;
+}
+
+#[tokio::test]
+async fn a11_replacement_accepts_the_complete_expected_pointer_set() {
+	let (_dirs, manager, l2) = fresh_manager_with_l2("a11-complete-set").await;
+	manager
+		.append_durable(tenant(), id(0xa112), hlc(1), b"present")
+		.await
+		.unwrap();
+	let pointer = tier_kv_slab(&manager, &l2, "a11/present").await;
+	let index = manager.persistent_index.as_ref().unwrap();
+	let epoch = index.snapshot_retirement_epoch_floor().await.unwrap() + 7;
+	index
+		.stage_tier_comparison(
+			Some((800, vec![pointer.clone()])),
+			vec![],
+			[pointer.slab_id].into_iter().collect(),
+			epoch,
+			Arc::new(std::sync::atomic::AtomicU64::new(epoch)),
+			Arc::new(std::sync::RwLock::new(())),
+		)
+		.await
+		.expect("the same complete pointer set must certify");
+	assert_eq!(
+		index.snapshot_retirement_epoch_floor().await.unwrap(),
+		epoch
+	);
+}
+#[tokio::test]
+async fn a12_retirement_without_log_index_records_a_durable_cleanup_gap() {
+	let (dirs, manager, l2) = fresh_manager_with_l2("a12-retirement-gap").await;
+	manager
+		.append_durable(tenant(), id(0xa120), hlc(1), b"retired")
+		.await
+		.unwrap();
+	let pointer = tier_kv_slab(&manager, &l2, "a12/retired").await;
+	let index = manager.persistent_index.as_ref().unwrap();
+	let before = index.cleanup_authority_gap_count().await.unwrap();
+	assert_eq!(before, 0);
+	let gate = Arc::new(manager.persistent_index_gate.clone().read_owned().await);
+	let (record, _) = index
+		.retire_tiered_slab_checked(
+			pointer.slab_id,
+			Some(pointer.clone()),
+			None,
+			vec![],
+			None,
+			0,
+			gate,
+		)
+		.await
+		.unwrap();
+	let snapshot = index.load_snapshot().await.unwrap();
+	assert!(
+		!snapshot
+			.tiered_slabs
+			.iter()
+			.any(|row| row.slab_id == pointer.slab_id)
+	);
+	assert!(
+		!snapshot
+			.record_rows
+			.iter()
+			.any(|row| row.location.slab_id == pointer.slab_id)
+	);
+	assert!(
+		record.is_none(),
+		"without a source index no log retirement authority may be invented"
+	);
+	assert_eq!(
+		index.cleanup_authority_gap_count().await.unwrap(),
+		before + 1,
+		"A12 an unrecorded retirement must not leave the durable gap counter at zero"
+	);
+	let gate = Arc::new(manager.persistent_index_gate.clone().read_owned().await);
+	index
+		.retire_tiered_slab_checked(pointer.slab_id, None, None, vec![], None, 0, gate)
+		.await
+		.unwrap();
+	assert_eq!(
+		index.cleanup_authority_gap_count().await.unwrap(),
+		before + 1,
+		"an absent retry cannot count the retired object twice"
+	);
+	let _ = dirs;
+}
+
+struct B1tRoleCommitter {
+	manager: Arc<SlabManager>,
+	leader: std::sync::atomic::AtomicBool,
+	calls: std::sync::atomic::AtomicUsize,
+}
+#[async_trait]
+impl TierCommitter for B1tRoleCommitter {
+	fn should_propose(&self) -> bool {
+		self.leader.load(std::sync::atomic::Ordering::Acquire)
+	}
+	async fn commit_tier_slab(&self, tier: TieredSlab) -> std::io::Result<()> {
+		self.calls.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+		if !self.should_propose() {
+			return Err(Error::new(
+				ErrorKind::WouldBlock,
+				"B1t local participant is not leader",
+			));
+		}
+		DirectTierCommitter {
+			manager: self.manager.clone(),
+		}
+		.commit_tier_slab(tier)
+		.await
+	}
+	async fn retire_tiered_slab(&self, slab: SlabId) -> std::io::Result<()> {
+		self.calls.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+		if !self.should_propose() {
+			return Err(Error::new(
+				ErrorKind::WouldBlock,
+				"B1t local participant is not leader",
+			));
+		}
+		DirectTierCommitter {
+			manager: self.manager.clone(),
+		}
+		.retire_tiered_slab(slab)
+		.await
+	}
+}
+#[tokio::test]
+async fn b1t_follower_slice_defers_without_upload_and_can_resume() {
+	let (_dirs, mgr, l2, target, schemas, old) = unpublished_drop_fixture().await;
+	let before = l2.list("").await.unwrap();
+	let accounting = mgr.retained_cleanup_test_accounting();
+	let committer = B1tRoleCommitter {
+		manager: mgr.clone(),
+		leader: Default::default(),
+		calls: Default::default(),
+	};
+	let cursor = TableDropReclaimCursor::default();
+	let first = mgr
+		.reclaim_table_drop_tiered_storage_slice(tenant(), &target, &schemas, &committer, cursor, 1)
+		.await;
+	let mut after = l2.list("").await.unwrap();
+	let mut before = before;
+	before.sort_by(|a, b| a.uri.cmp(&b.uri));
+	after.sort_by(|a, b| a.uri.cmp(&b.uri));
+	assert_eq!(
+		after, before,
+		"B1t follower participant must not upload a replacement"
+	);
+	assert_eq!(
+		mgr.retained_cleanup_test_accounting(),
+		accounting,
+		"no new retained record on deferral"
+	);
+	assert_eq!(
+		committer.calls.load(std::sync::atomic::Ordering::Acquire),
+		0,
+		"no follower proposal"
+	);
+	let first = first.expect("follower deferral is a typed successful report");
+	assert!(!first.done, "deferred debt is never complete");
+	assert_eq!(first.cursor_next, cursor, "deferred slab cursor stays put");
+	assert_eq!(mgr.tier_pointer(old.slab_id).await, Some(old.clone()));
+	committer
+		.leader
+		.store(true, std::sync::atomic::Ordering::Release);
+	let next = mgr
+		.reclaim_table_drop_tiered_storage_slice(
+			tenant(),
+			&target,
+			&schemas,
+			&committer,
+			first.cursor_next,
+			1,
+		)
+		.await
+		.unwrap();
+	assert!(
+		next.done,
+		"the same pending slab completes once this participant may propose"
+	);
+	assert_eq!(next.rewritten, 1);
+	assert_ne!(
+		mgr.tier_pointer(old.slab_id).await.unwrap().l2_uri,
+		old.l2_uri
+	);
+}
+#[tokio::test]
+async fn b1t_follower_unsliced_reclaim_does_not_upload() {
+	let (_dirs, mgr, l2, target, schemas, _old) = unpublished_drop_fixture().await;
+	let before = l2.list("").await.unwrap().len();
+	let committer = B1tRoleCommitter {
+		manager: mgr.clone(),
+		leader: Default::default(),
+		calls: Default::default(),
+	};
+	let outcome = mgr
+		.reclaim_table_drop_tiered_storage(tenant(), &target, &schemas, &committer, 1)
+		.await;
+	assert_eq!(
+		l2.list("").await.unwrap().len(),
+		before,
+		"B1t public unsliced reclaim must not upload on a follower"
+	);
+	assert_eq!(
+		committer.calls.load(std::sync::atomic::Ordering::Acquire),
+		0
+	);
+	assert!(outcome.is_ok(), "nonleader deferral must be reported");
+}
+
+#[tokio::test]
+async fn b1t_deferred_debt_is_reconstructed_after_reopen() {
+	let (_dirs, mgr, l2, target, schemas, old) = unpublished_drop_fixture().await;
+	let registry = crate::metrics::isolated_for_test();
+	mgr.bind_table_drop_l2_gauge_for_test(&registry.storage_table_drop_l2_deferred_debts);
+	let committer = B1tRoleCommitter {
+		manager: mgr.clone(),
+		leader: Default::default(),
+		calls: Default::default(),
+	};
+	let cursor = TableDropReclaimCursor::default();
+	let result = mgr
+		.reclaim_table_drop_tiered_storage_slice(tenant(), &target, &schemas, &committer, cursor, 1)
+		.await
+		.unwrap();
+	assert_eq!(result.status, TableDropReclaimStatus::DeferredNotLeader);
+	assert_eq!(mgr.table_drop_l2_deferred_count(), 1);
+	assert_eq!(registry.storage_table_drop_l2_deferred_debts.get(), 1);
+	// Repeating one debt must not count attempts as separate obligations.
+	mgr.reclaim_table_drop_tiered_storage_slice(tenant(), &target, &schemas, &committer, cursor, 1)
+		.await
+		.unwrap();
+	assert_eq!(mgr.table_drop_l2_deferred_count(), 1);
+	drop(committer);
+	let reopened = try_restart_tier_manager(mgr, &_dirs, &l2).await.unwrap();
+	assert_eq!(
+		registry.storage_table_drop_l2_deferred_debts.get(),
+		0,
+		"old manager removes only its contribution"
+	);
+	reopened.bind_table_drop_l2_gauge_for_test(&registry.storage_table_drop_l2_deferred_debts);
+	reopened.wait_tier_authority_ready().await.unwrap();
+	assert_eq!(reopened.tier_pointer(old.slab_id).await, Some(old));
+	let committer = B1tRoleCommitter {
+		manager: reopened.clone(),
+		leader: Default::default(),
+		calls: Default::default(),
+	};
+	let result = reopened
+		.reclaim_table_drop_tiered_storage_slice(tenant(), &target, &schemas, &committer, cursor, 1)
+		.await
+		.unwrap();
+	assert_eq!(result.status, TableDropReclaimStatus::DeferredNotLeader);
+	assert_eq!(
+		reopened.table_drop_l2_deferred_count(),
+		1,
+		"first recovered pass reconstructs the same debt"
+	);
+	assert_eq!(registry.storage_table_drop_l2_deferred_debts.get(), 1);
+	assert!(registry.render_prometheus().contains(
+		"wendelon_storage_table_drop_l2_deferred_debts 1
+"
+	));
+	committer
+		.leader
+		.store(true, std::sync::atomic::Ordering::Release);
+	let done = reopened
+		.reclaim_table_drop_tiered_storage_slice(tenant(), &target, &schemas, &committer, cursor, 1)
+		.await
+		.unwrap();
+	assert!(done.done);
+	assert_eq!(done.status, TableDropReclaimStatus::Progress);
+	assert_eq!(reopened.table_drop_l2_deferred_count(), 0);
+	assert_eq!(registry.storage_table_drop_l2_deferred_debts.get(), 0);
+}
+
+mod b1t_network {
+	use super::*;
+	use crate::consensus::{WendelonRaft, WendelonTypeConfig};
+	use openraft::BasicNode;
+	use openraft::error::{InstallSnapshotError, RPCError, RaftError, RemoteError};
+	use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
+	use openraft::raft::{
+		AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest,
+		InstallSnapshotResponse, VoteRequest, VoteResponse,
+	};
+	#[derive(Clone, Default)]
+	pub(super) struct Network(pub(super) Arc<std::sync::Mutex<BTreeMap<u32, WendelonRaft>>>);
+	pub(super) struct Peer {
+		target: u32,
+		nodes: Network,
+	}
+	impl Peer {
+		fn raft(&self) -> WendelonRaft {
+			self.nodes.0.lock().unwrap()[&self.target].clone()
+		}
+	}
+	impl RaftNetworkFactory<WendelonTypeConfig> for Network {
+		type Network = Peer;
+		async fn new_client(&mut self, target: u32, _node: &BasicNode) -> Peer {
+			Peer {
+				target,
+				nodes: self.clone(),
+			}
+		}
+	}
+	impl RaftNetwork<WendelonTypeConfig> for Peer {
+		async fn append_entries(
+			&mut self,
+			rpc: AppendEntriesRequest<WendelonTypeConfig>,
+			_option: RPCOption,
+		) -> Result<AppendEntriesResponse<u32>, RPCError<u32, BasicNode, RaftError<u32>>> {
+			self.raft()
+				.append_entries(rpc)
+				.await
+				.map_err(|e| RPCError::RemoteError(RemoteError::new(self.target, e)))
+		}
+		async fn install_snapshot(
+			&mut self,
+			rpc: InstallSnapshotRequest<WendelonTypeConfig>,
+			_option: RPCOption,
+		) -> Result<
+			InstallSnapshotResponse<u32>,
+			RPCError<u32, BasicNode, RaftError<u32, InstallSnapshotError>>,
+		> {
+			self.raft()
+				.install_snapshot(rpc)
+				.await
+				.map_err(|e| RPCError::RemoteError(RemoteError::new(self.target, e)))
+		}
+		async fn vote(
+			&mut self,
+			rpc: VoteRequest<u32>,
+			_option: RPCOption,
+		) -> Result<VoteResponse<u32>, RPCError<u32, BasicNode, RaftError<u32>>> {
+			self.raft()
+				.vote(rpc)
+				.await
+				.map_err(|e| RPCError::RemoteError(RemoteError::new(self.target, e)))
+		}
+	}
+}
+#[tokio::test]
+async fn b1t_real_follower_debt_completes_after_leadership_change() {
+	use crate::consensus::{WendelonLogStore, WendelonRaft};
+	let (_dirs, mgr, l2, target, schemas, old) = unpublished_drop_fixture().await;
+	let network = b1t_network::Network::default();
+	let config = Arc::new(
+		crate::consensus::retention::ControlRetention::default()
+			.openraft_config("wendelon")
+			.validate()
+			.unwrap(),
+	);
+	let mut stores = Vec::new();
+	let mut dirs = Vec::new();
+	let mut nodes = Vec::new();
+	for node_id in 1_u32..=3 {
+		let dir = fresh_dir("b1t-real-raft-wal");
+		let log = WendelonLogStore::open_for_retention_test(&dir, 64 * 4096, None)
+			.await
+			.unwrap();
+		let mut sm = log.recovered_state_machine().await.unwrap();
+		if node_id == 2 {
+			sm = sm.with_tier_observer(Arc::new(crate::storage::ManagerTierObserver::new(
+				mgr.clone(),
+			)));
+		}
+		let raft = WendelonRaft::new(node_id, config.clone(), network.clone(), log.clone(), sm)
+			.await
+			.unwrap();
+		network.0.lock().unwrap().insert(node_id, raft.clone());
+		stores.push(log);
+		dirs.push(dir);
+		nodes.push(raft);
+	}
+	let members = (1_u32..=3)
+		.map(|id| {
+			(
+				id,
+				openraft::BasicNode {
+					addr: "127.0.0.1:0".into(),
+				},
+			)
+		})
+		.collect::<BTreeMap<_, _>>();
+	nodes[0].initialize(members).await.unwrap();
+	for node in &nodes {
+		node.wait(Some(Duration::from_secs(60)))
+			.current_leader(1, "initial control leader")
+			.await
+			.unwrap();
+	}
+	let committed = nodes[0]
+		.client_write(crate::consensus::WendelonRequest::TierSlab(TieredSlab {
+			slab_id: old.slab_id,
+			l2_uri: old.l2_uri.clone(),
+			payload_hash: old.payload_hash,
+			is_encrypted: old.is_encrypted,
+			tenant_id: old.tenant_id,
+			tenant_kek_id: old.tenant_kek_id,
+			stats_format_version: old.stats_format_version,
+			stats_block_len: old.stats_block_len,
+			stats_block_hash128: old.stats_block_hash128,
+			tombstone_metadata: old.tombstone_metadata,
+			supersession_metadata: old.supersession_metadata,
+		}))
+		.await
+		.unwrap();
+	for node in &nodes {
+		node.wait(Some(Duration::from_secs(60)))
+			.applied_index_at_least(
+				Some(committed.log_id.index),
+				"all voters caught up before election",
+			)
+			.await
+			.unwrap();
+	}
+
+	let committer = crate::storage::RaftCommitter::new(nodes[1].clone());
+	assert!(
+		!committer.should_propose(),
+		"participant2 is a real follower"
+	);
+	let before = l2.list("").await.unwrap().len();
+	let cursor = TableDropReclaimCursor::default();
+	let first = mgr
+		.reclaim_table_drop_tiered_storage_slice(tenant(), &target, &schemas, &committer, cursor, 1)
+		.await
+		.unwrap();
+	assert_eq!(first.status, TableDropReclaimStatus::DeferredNotLeader);
+	assert!(!first.done);
+	assert_eq!(first.cursor_next, cursor);
+	assert_eq!(l2.list("").await.unwrap().len(), before);
+	assert_eq!(mgr.table_drop_l2_deferred_count(), 1);
+	// A trigger starts an election; a healthy former leader can win a later
+	// term under load. Request another real election only after participant2
+	// observes that loss. Keep the original leadership/debt assertions and
+	// Raft defaults; bound the entire campaign to sixty seconds.
+	let [
+		mut first_metrics,
+		mut participant_metrics,
+		mut third_metrics,
+	] = [nodes[0].metrics(), nodes[1].metrics(), nodes[2].metrics()];
+	let campaign = async {
+		let mut requested_at_term = participant_metrics.borrow().current_term;
+		nodes[1].trigger().elect().await.unwrap();
+		loop {
+			let observed = [
+				first_metrics.borrow().clone(),
+				participant_metrics.borrow().clone(),
+				third_metrics.borrow().clone(),
+			];
+			if observed
+				.iter()
+				.all(|metrics| metrics.current_leader == Some(2))
+			{
+				break;
+			}
+			let participant = &observed[1];
+			if participant.current_term > requested_at_term
+				&& participant.current_leader.is_some_and(|leader| leader != 2)
+			{
+				requested_at_term = participant.current_term;
+				nodes[1].trigger().elect().await.unwrap();
+			}
+			tokio::select! {
+				changed = first_metrics.changed() => changed.unwrap(),
+				changed = participant_metrics.changed() => changed.unwrap(),
+				changed = third_metrics.changed() => changed.unwrap(),
+			}
+		}
+	};
+	tokio::time::timeout(Duration::from_secs(60), campaign)
+		.await
+		.expect("participant2 must win a real election before the campaign deadline");
+	assert!(committer.should_propose());
+	let next = mgr
+		.reclaim_table_drop_tiered_storage_slice(tenant(), &target, &schemas, &committer, cursor, 1)
+		.await
+		.unwrap();
+	let pointer = mgr.tier_pointer(old.slab_id).await.unwrap();
+	let deferred = mgr.table_drop_l2_deferred_count();
+	for node in &nodes {
+		node.shutdown().await.unwrap();
+	}
+	network.0.lock().unwrap().clear();
+	assert!(next.done);
+	assert_eq!(next.rewritten, 1);
+	assert_ne!(pointer.l2_uri, old.l2_uri);
+	assert_eq!(deferred, 0);
+}
+#[tokio::test]
+async fn b2_snapshot_retirement_proof_survives_aborting_an_unsubmitted_candidate() {
+	use crate::storage::index::{RetainedObjectIntentState, RetirementSource};
+	let (_dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let bytes = l2.get(&old.l2_uri).await.unwrap();
+	let candidate = l2.put("b2/retirement-unused.wnd", &bytes).await.unwrap();
+	mgr.persist_table_drop_l2_cleanup(old.slab_id, &old.l2_uri, Some(&candidate))
+		.await
+		.unwrap();
+	let epoch = mgr.begin_tier_snapshot_install().unwrap();
+	mgr.finish_tier_snapshot_install_at_epoch(vec![], Some(912), epoch)
+		.await
+		.unwrap();
+	mgr.reconcile_table_drop_l2_cleanup_markers(&*l2, usize::MAX)
+		.await
+		.unwrap();
+	let records = mgr
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot_cleanup_intents()
+		.await
+		.unwrap();
+	let saved = records
+		.iter()
+		.find(|(slab, uri, _)| *slab == old.slab_id && uri == &old.l2_uri)
+		.expect("retired old-object provenance is retained");
+	assert_eq!(
+		saved.2.retirement_source,
+		Some(RetirementSource::Snapshot(912))
+	);
+	assert_eq!(
+		saved.2.state,
+		RetainedObjectIntentState::RetirementPublished,
+		"B2 aborting an unused candidate must restore existing retirement classification"
+	);
+	assert!(l2.get(&candidate).await.is_err());
+	assert_eq!(l2.get(&old.l2_uri).await.unwrap(), bytes);
+	assert!(!saved.2.was_published(&candidate));
+}
+
+async fn b3_fixture() -> (
+	[crate::test_support::TestDir; 2],
+	Arc<SlabManager>,
+	Arc<dyn ObjectStore>,
+	TableSchemaDescriptor,
+	TableSchemaCatalog,
+	TieredSlabPointer,
+) {
+	let (dirs, mgr, l2, target, schemas, old) = unpublished_drop_fixture().await;
+	let _proposed = propose_ambiguous_drop(&mgr, &target, &schemas, false, false).await;
+	assert!(
+		mgr.refuse_unresolved_cleanup(old.slab_id).is_err(),
+		"first slab is genuinely blocked by an ambiguous proposal"
+	);
+	(dirs, mgr, l2, target, schemas, old)
+}
+async fn b3_add_drop_slab(
+	mgr: &Arc<SlabManager>,
+	l2: &Arc<dyn ObjectStore>,
+	target: &TableSchemaDescriptor,
+	n: u64,
+) -> (Identity, Identity) {
+	let doomed = id(0xb300 + n * 2);
+	let survivor = id(0xb301 + n * 2);
+	let other =
+		append_only_retention_descriptor_named(TableObjectId::new([0x42; 16]), "tier_other");
+	let target_frame = encode_test_append_only_storage_frame(
+		target.table_object_id,
+		&[(doomed, Locality::new(n), hlc(100 + n), 100, false)],
+	);
+	let entries = storage_multirow_index_entries_from_frame(&target_frame)
+		.unwrap()
+		.unwrap();
+	mgr.append_durable_multirow_with_locality(tenant(), &target_frame, &entries)
+		.await
+		.unwrap();
+	let other_frame = encode_test_append_only_storage_frame(
+		other.table_object_id,
+		&[(survivor, Locality::new(n), hlc(200 + n), 200, false)],
+	);
+	let entries = storage_multirow_index_entries_from_frame(&other_frame)
+		.unwrap()
+		.unwrap();
+	mgr.append_durable_multirow_with_locality(tenant(), &other_frame, &entries)
+		.await
+		.unwrap();
+	tier_kv_slab(mgr, l2, &format!("b3/drop-{n}.wnd")).await;
+	(doomed, survivor)
+}
+#[tokio::test]
+async fn b3_one_blocked_intent_does_not_stop_other_cleanup_publication() {
+	let (_dirs, mgr, l2, _target, _schemas, bad) = b3_fixture().await;
+	mgr.append_durable(tenant(), id(0xb333), hlc(300), b"healthy")
+		.await
+		.unwrap();
+	let healthy = tier_kv_slab(&mgr, &l2, "b3/healthy-old.wnd").await;
+	let bytes = l2.get(&healthy.l2_uri).await.unwrap();
+	let new_uri = l2.put("b3/healthy-new.wnd", &bytes).await.unwrap();
+	mgr.persist_table_drop_l2_cleanup(healthy.slab_id, &healthy.l2_uri, Some(&new_uri))
+		.await
+		.unwrap();
+	let mut next = healthy.clone();
+	next.l2_uri = new_uri.clone();
+	mgr.apply_tier_slab(next).await.unwrap();
+	assert_new_cleanup_intent(&mgr, healthy.slab_id, &healthy.l2_uri, false).await;
+	let _report = mgr
+		.reconcile_table_drop_l2_cleanup_markers(&*l2, usize::MAX)
+		.await;
+	assert_new_cleanup_intent(&mgr, healthy.slab_id, &healthy.l2_uri, true).await;
+	assert_no_cleanup_intent(&mgr, healthy.slab_id, &new_uri).await;
+	assert!(mgr.refuse_unresolved_cleanup(bad.slab_id).is_err());
+	assert_eq!(l2.get(&healthy.l2_uri).await.unwrap(), bytes);
+	let loc = mgr.lookup(tenant(), id(0xb333)).unwrap().unwrap();
+	assert_eq!(mgr.read(loc).await.unwrap(), b"healthy");
+}
+async fn b3_drop_after_blocked(sliced: bool, budget: usize, count: u64) {
+	let (_dirs, mgr, l2, target, schemas, bad) = b3_fixture().await;
+	let mut rows = Vec::new();
+	for n in 1..=count {
+		rows.push(b3_add_drop_slab(&mgr, &l2, &target, n).await);
+	}
+	let committer = DirectTierCommitter {
+		manager: mgr.clone(),
+	};
+	let mut cursor = TableDropReclaimCursor::default();
+	for _ in 0..(count + 2) {
+		if sliced {
+			if let Ok(report) = mgr
+				.reclaim_table_drop_tiered_storage_slice(
+					tenant(),
+					&target,
+					&schemas,
+					&committer,
+					cursor,
+					budget,
+				)
+				.await
+			{
+				assert!(!report.done, "the blocked slab's debt remains open");
+				assert!(
+					report.examined <= budget,
+					"cleanup and pointer work share the bounded budget"
+				);
+				assert!(
+					report
+						.cursor_next
+						.after_slab_id
+						.is_none_or(|after| after < bad.slab_id),
+					"durable cursor never receipts past the blocked slab"
+				);
+
+				cursor = report.cursor_next;
+			}
+		} else {
+			let _ = mgr
+				.reclaim_table_drop_tiered_storage(tenant(), &target, &schemas, &committer, budget)
+				.await;
+		}
+	}
+	for (doomed, survivor) in rows {
+		assert!(
+			mgr.lookup(tenant(), doomed).unwrap().is_none(),
+			"B3 unrelated table-drop slab must make progress despite the earlier blocked intent"
+		);
+		let loc = mgr.lookup(tenant(), survivor).unwrap().unwrap();
+		assert!(!mgr.read(loc).await.unwrap().is_empty());
+	}
+	assert!(mgr.refuse_unresolved_cleanup(bad.slab_id).is_err());
+	assert!(
+		mgr.lookup(tenant(), id(0x411)).unwrap().is_some(),
+		"blocked original rows stay intact"
+	);
+}
+#[tokio::test]
+async fn b3_sliced_drop_progresses_past_an_unresolved_slab() {
+	b3_drop_after_blocked(true, 64, 1).await;
+}
+#[tokio::test]
+async fn b3_unsliced_drop_progresses_past_an_unresolved_slab() {
+	b3_drop_after_blocked(false, 64, 1).await;
+}
+#[tokio::test]
+async fn b3_budget_one_eventually_reaches_each_healthy_slab() {
+	b3_drop_after_blocked(true, 1, 2).await;
+}
+
+#[tokio::test]
+async fn b3_budget_one_cleanup_scan_rotates_to_the_ready_slab() {
+	let (_dirs, mgr, l2, _target, _schemas, bad) = b3_fixture().await;
+	mgr.append_durable(tenant(), id(0xb333), hlc(300), b"healthy")
+		.await
+		.unwrap();
+	let healthy = tier_kv_slab(&mgr, &l2, "b3/healthy-old.wnd").await;
+	let bytes = l2.get(&healthy.l2_uri).await.unwrap();
+	let new_uri = l2.put("b3/healthy-new.wnd", &bytes).await.unwrap();
+	mgr.persist_table_drop_l2_cleanup(healthy.slab_id, &healthy.l2_uri, Some(&new_uri))
+		.await
+		.unwrap();
+	let mut next = healthy.clone();
+	next.l2_uri = new_uri.clone();
+	mgr.apply_tier_slab(next).await.unwrap();
+	assert_new_cleanup_intent(&mgr, healthy.slab_id, &healthy.l2_uri, false).await;
+	for _ in 0..2 {
+		let _report = mgr.reconcile_table_drop_l2_cleanup_markers(&*l2, 1).await;
+	}
+	assert_new_cleanup_intent(&mgr, healthy.slab_id, &healthy.l2_uri, true).await;
+	assert_no_cleanup_intent(&mgr, healthy.slab_id, &new_uri).await;
+	assert!(mgr.refuse_unresolved_cleanup(bad.slab_id).is_err());
+	assert_eq!(l2.get(&healthy.l2_uri).await.unwrap(), bytes);
+	let loc = mgr.lookup(tenant(), id(0xb333)).unwrap().unwrap();
+	assert_eq!(mgr.read(loc).await.unwrap(), b"healthy");
+}
+
+#[tokio::test]
+async fn b4_committed_retirement_can_finish_before_its_tier_read_verification() {
+	use crate::consensus::TierObserver;
+	let fixture = pending_authority_fixture().await;
+	tokio::time::timeout(Duration::from_secs(60), fixture.store.entered.notified())
+		.await
+		.unwrap();
+	assert!(
+		!fixture.manager.tier_authority_is_ready(),
+		"remote verification is genuinely pending"
+	);
+	let observer = crate::storage::ManagerTierObserver::new(fixture.manager.clone());
+	observer.before_slab_retired(fixture.pointer.slab_id, 1001);
+	let result = tokio::time::timeout(
+		Duration::from_secs(30),
+		observer.on_slab_retired(fixture.pointer.slab_id, 1001),
+	)
+	.await;
+	let retired = fixture
+		.manager
+		.tier_pointer(fixture.pointer.slab_id)
+		.await
+		.is_none();
+	fixture.store.release();
+	assert!(
+		result.is_ok(),
+		"B4 committed retirement must finish while verification stays paused"
+	);
+	let result = result.unwrap();
+	assert!(
+		result.is_ok(),
+		"B4 committed retirement must not wait on read verification blocked by its own log fence: {result:?}"
+	);
+	assert!(retired, "committed retirement removes its own pointer");
+	tokio::time::timeout(
+		Duration::from_secs(60),
+		fixture.manager.wait_tier_authority_ready(),
+	)
+	.await
+	.unwrap()
+	.unwrap();
+	assert!(
+		fixture
+			.manager
+			.lookup(tenant(), id(0x7f61))
+			.unwrap()
+			.is_none()
+	);
+	assert!(
+		fixture
+			.manager
+			.lookup(tenant(), id(0x7f62))
+			.unwrap()
+			.is_none(),
+		"late verification cannot revive the omitted retired row"
+	);
+	let records = fixture
+		.manager
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot_cleanup_intents()
+		.await
+		.unwrap();
+	let old = records
+		.iter()
+		.find(|(slab, uri, _)| *slab == fixture.pointer.slab_id && uri == &fixture.pointer.l2_uri)
+		.unwrap();
+	assert_eq!(
+		old.2.retirement_source,
+		Some(crate::storage::index::RetirementSource::Log(1001))
+	);
+	assert!(
+		fixture
+			.store
+			.inner
+			.get(&fixture.pointer.l2_uri)
+			.await
+			.is_ok(),
+		"old object is still retained"
+	);
+}
+#[tokio::test]
+async fn b4_autonomous_retirement_still_requires_verified_private_authority() {
+	let fixture = pending_authority_fixture().await;
+	tokio::time::timeout(Duration::from_secs(60), fixture.store.entered.notified())
+		.await
+		.unwrap();
+	let result = fixture
+		.manager
+		.retire_tiered_slab(fixture.pointer.slab_id)
+		.await;
+	let pointer = fixture.manager.tier_pointer(fixture.pointer.slab_id).await;
+	fixture.store.release();
+	assert!(
+		result.is_err(),
+		"no committed authority: local initiative remains refused"
+	);
+	assert_eq!(pointer, Some(fixture.pointer.clone()));
+	tokio::time::timeout(
+		Duration::from_secs(60),
+		fixture.manager.wait_tier_authority_ready(),
+	)
+	.await
+	.unwrap()
+	.unwrap();
+	assert_eq!(
+		fixture.manager.read(fixture.present).await.unwrap(),
+		b"present"
+	);
+	let repaired = fixture
+		.manager
+		.lookup(tenant(), id(0x7f62))
+		.unwrap()
+		.unwrap();
+	assert_eq!(fixture.manager.read(repaired).await.unwrap(), b"omitted");
+}
+
+async fn b5_advance_snapshot(mgr: &SlabManager, pointer: &TieredSlabPointer) -> u64 {
+	let prior = mgr.capture_snapshot_epoch();
+	let epoch = mgr.begin_tier_snapshot_install().unwrap();
+	mgr.finish_tier_snapshot_install_at_epoch(vec![pointer.clone()], Some(900), epoch)
+		.await
+		.unwrap();
+	tokio::time::timeout(Duration::from_secs(30), mgr.wait_tier_authority_ready())
+		.await
+		.unwrap()
+		.unwrap();
+	assert_ne!(mgr.capture_snapshot_epoch(), prior);
+	prior
+}
+#[tokio::test]
+async fn b5_stale_local_retirement_does_not_fence_a_newer_snapshot() {
+	let (_dirs, mgr, l2, _target, _schemas, pointer) = unpublished_drop_fixture().await;
+	let key = id(0x421);
+	let location = mgr.lookup(tenant(), key).unwrap().unwrap();
+	let expected = mgr.read(location).await.unwrap();
+	let object = l2.get(&pointer.l2_uri).await.unwrap();
+	let prior = b5_advance_snapshot(&mgr, &pointer).await;
+	assert!(
+		mgr.retire_tiered_slab_at_snapshot_epoch(pointer.slab_id, prior)
+			.await
+			.is_err()
+	);
+	assert_eq!(
+		mgr.tier_pointer(pointer.slab_id).await,
+		Some(pointer.clone())
+	);
+	let location = mgr
+		.lookup(tenant(), key)
+		.expect("B5: a stale local retirement must not fence the canonical newer snapshot")
+		.unwrap();
+	assert_eq!(mgr.read(location).await.unwrap(), expected);
+	assert!(mgr.tier_authority_readiness_reason().is_none());
+	assert_eq!(l2.get(&pointer.l2_uri).await.unwrap(), object);
+}
+#[tokio::test]
+async fn b5_stale_local_retirement_does_not_overwrite_a_committed_log_fence() {
+	use crate::consensus::TierObserver;
+	let (_dirs, mgr, l2, _target, _schemas, pointer) = unpublished_drop_fixture().await;
+	let object = l2.get(&pointer.l2_uri).await.unwrap();
+	let prior = b5_advance_snapshot(&mgr, &pointer).await;
+	let observer = crate::storage::ManagerTierObserver::new(mgr.clone());
+	observer.before_slab_retired(pointer.slab_id, 901);
+	assert!(mgr.lookup(tenant(), id(0x421)).is_err());
+	assert!(
+		mgr.retire_tiered_slab_at_snapshot_epoch(pointer.slab_id, prior)
+			.await
+			.is_err()
+	);
+	observer
+		.on_slab_retired(pointer.slab_id, 901)
+		.await
+		.unwrap();
+	assert!(mgr.tier_pointer(pointer.slab_id).await.is_none());
+	let result = tokio::time::timeout(Duration::from_secs(5), mgr.wait_tier_authority_ready())
+		.await
+		.unwrap();
+	assert!(
+		result.is_ok(),
+		"B5: a stale None-indexed retirement must not replace the log fence and prevent its matching clear: {result:?}"
+	);
+	for key in [id(0x411), id(0x412), id(0x421)] {
+		assert!(mgr.lookup(tenant(), key).unwrap().is_none());
+	}
+	let records = mgr
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot_cleanup_intents()
+		.await
+		.unwrap();
+	let old = records
+		.iter()
+		.find(|(slab, uri, _)| *slab == pointer.slab_id && uri == &pointer.l2_uri)
+		.unwrap();
+	assert_eq!(
+		old.2.retirement_source,
+		Some(crate::storage::index::RetirementSource::Log(901))
+	);
+	assert_eq!(l2.get(&pointer.l2_uri).await.unwrap(), object);
+}
+
+async fn b6_advance_snapshot(mgr: &SlabManager, pointer: &TieredSlabPointer) -> u64 {
+	let prior = mgr.capture_snapshot_epoch();
+	let epoch = mgr.begin_tier_snapshot_install().unwrap();
+	mgr.finish_tier_snapshot_install_at_epoch(vec![pointer.clone()], Some(900), epoch)
+		.await
+		.unwrap();
+	tokio::time::timeout(Duration::from_secs(30), mgr.wait_tier_authority_ready())
+		.await
+		.unwrap()
+		.unwrap();
+	prior
+}
+#[tokio::test]
+async fn b6_stale_local_pointer_completion_does_not_poison_newer_authority() {
+	let (_dirs, mgr, l2, _target, _schemas, pointer) = unpublished_drop_fixture().await;
+	let key = id(0x421);
+	let expected = mgr
+		.read(mgr.lookup(tenant(), key).unwrap().unwrap())
+		.await
+		.unwrap();
+	let prior = b6_advance_snapshot(&mgr, &pointer).await;
+	assert!(
+		mgr.apply_tier_slab_at_snapshot_epoch(pointer.clone(), prior)
+			.await
+			.is_err()
+	);
+	let location = mgr
+		.lookup(tenant(), key)
+		.expect("B6: obsolete local pointer completion cannot become permanent unapplied authority")
+		.unwrap();
+	assert_eq!(mgr.read(location).await.unwrap(), expected);
+	assert_eq!(
+		mgr.tier_pointer(pointer.slab_id).await,
+		Some(pointer.clone())
+	);
+	assert!(mgr.unapplied_tier_pointer(pointer.slab_id).is_none());
+	assert!(l2.get(&pointer.l2_uri).await.is_ok());
+}
+#[tokio::test]
+async fn b6_stale_untokened_metadata_completion_does_not_poison_newer_authority() {
+	let (_dirs, mgr, _l2, _target, _schemas, pointer) = unpublished_drop_fixture().await;
+	let key = id(0x421);
+	let expected = mgr
+		.read(mgr.lookup(tenant(), key).unwrap().unwrap())
+		.await
+		.unwrap();
+	let prior = b6_advance_snapshot(&mgr, &pointer).await;
+	assert!(
+		mgr.record_supersession_for_slab_at_epoch(pointer.slab_id, hlc(1000), None, prior, None)
+			.await
+			.is_err()
+	);
+	let location = mgr
+		.lookup(tenant(), key)
+		.expect("B6: stale untokened local metadata cannot install permanent unapplied authority")
+		.unwrap();
+	assert_eq!(mgr.read(location).await.unwrap(), expected);
+	assert!(mgr.unapplied_tier_pointer(pointer.slab_id).is_none());
+	assert_eq!(mgr.tier_pointer(pointer.slab_id).await, Some(pointer));
+}
+
+async fn b6_copy_generation(
+	store: &Arc<dyn ObjectStore>,
+	old: &TieredSlabPointer,
+	key: &str,
+) -> TieredSlabPointer {
+	let bytes = store.get(&old.l2_uri).await.unwrap();
+	let mut next = old.clone();
+	next.l2_uri = store.put(key, &bytes).await.unwrap();
+	next
+}
+#[tokio::test]
+async fn b6_transient_snapshot_refusal_is_retried_after_canonical_comparison() {
+	let (_dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let expected = mgr
+		.read(mgr.lookup(tenant(), id(0x421)).unwrap().unwrap())
+		.await
+		.unwrap();
+	let next = b6_copy_generation(&l2, &old, "b6/transient-next.wnd").await;
+	let epoch = mgr.begin_tier_snapshot_install().unwrap();
+	let _registration = mgr.apply_tier_slab_committed(next.clone(), Some(901)).await;
+	assert_eq!(
+		mgr.tier_pointer(old.slab_id).await,
+		Some(old.clone()),
+		"registration must not publish before the canonical comparison"
+	);
+	assert!(mgr.lookup(tenant(), id(0x421)).is_err());
+	mgr.finish_tier_snapshot_install_at_epoch(vec![next.clone()], Some(902), epoch)
+		.await
+		.unwrap();
+	mgr.apply_tier_slab_committed(next.clone(), Some(903))
+		.await
+		.expect("B6: a transient Fenced result must be reevaluated after canonical comparison");
+	tokio::time::timeout(Duration::from_secs(30), mgr.wait_tier_authority_ready())
+		.await
+		.unwrap()
+		.unwrap();
+	assert_eq!(mgr.tier_pointer(next.slab_id).await, Some(next.clone()));
+	assert!(mgr.unapplied_tier_pointer(next.slab_id).is_none());
+	assert_eq!(
+		mgr.read(mgr.lookup(tenant(), id(0x421)).unwrap().unwrap())
+			.await
+			.unwrap(),
+		expected
+	);
+	assert!(l2.get(&old.l2_uri).await.is_ok());
+}
+#[tokio::test]
+async fn b6_newer_snapshot_replaces_an_older_pending_generation() {
+	let fixture = pending_authority_fixture().await;
+	tokio::time::timeout(Duration::from_secs(30), fixture.store.entered.notified())
+		.await
+		.unwrap();
+	fixture
+		.manager
+		.stage_bootstrap_tier_authority(fixture.pointer.clone(), Some(901), fixture.pointer.slab_id)
+		.await
+		.unwrap();
+	let job = CompactionJobId::new(0xb6b1);
+	fixture.manager.lsm_install_unresolved.insert(
+		job,
+		lsm_driver::UnresolvedLsmScope {
+			control_legacy: None,
+			control_metric: None,
+			slabs: HashSet::from([fixture.pointer.slab_id]),
+			keys_unknown: false,
+			in_flight: true,
+			owner_token: Arc::new(()),
+		},
+	);
+	assert!(
+		fixture
+			.manager
+			.apply_tier_slab_committed(fixture.pointer.clone(), Some(901))
+			.await
+			.is_err()
+	);
+	fixture.manager.clear_registered_lsm_intent(job).await;
+	assert_eq!(
+		fixture
+			.manager
+			.unapplied_tier_pointer(fixture.pointer.slab_id),
+		Some(fixture.pointer.clone())
+	);
+
+	let next = b6_copy_generation(
+		&fixture.store.inner,
+		&fixture.pointer,
+		"b6/pending-next.wnd",
+	)
+	.await;
+	let epoch = fixture.manager.begin_tier_snapshot_install().unwrap();
+	fixture
+		.manager
+		.finish_tier_snapshot_install_at_epoch(vec![next.clone()], Some(902), epoch)
+		.await
+		.unwrap();
+	fixture.store.release();
+	let ready = tokio::time::timeout(
+		Duration::from_secs(30),
+		fixture.manager.wait_tier_authority_ready(),
+	)
+	.await
+	.unwrap();
+	assert!(
+		ready.is_ok(),
+		"B6: canonical newer snapshot must supersede older pending authority: {ready:?}"
+	);
+	assert_eq!(
+		fixture.manager.tier_pointer(next.slab_id).await,
+		Some(next.clone())
+	);
+	assert!(
+		fixture
+			.manager
+			.unapplied_tier_pointer(next.slab_id)
+			.is_none()
+	);
+	for (key, bytes) in [
+		(id(0x7f61), b"present".as_slice()),
+		(id(0x7f62), b"omitted".as_slice()),
+	] {
+		let loc = fixture.manager.lookup(tenant(), key).unwrap().unwrap();
+		assert_eq!(fixture.manager.read(loc).await.unwrap(), bytes);
+	}
+	assert!(
+		fixture
+			.store
+			.inner
+			.get(&fixture.pointer.l2_uri)
+			.await
+			.is_ok()
+	);
+}
+#[tokio::test]
+async fn b6b_local_fallback_cannot_count_a_pending_flight_as_published() {
+	let fixture = pending_authority_fixture().await;
+	tokio::time::timeout(Duration::from_secs(30), fixture.store.entered.notified())
+		.await
+		.unwrap();
+	fixture
+		.manager
+		.stage_bootstrap_tier_authority(fixture.pointer.clone(), Some(901), fixture.pointer.slab_id)
+		.await
+		.unwrap();
+	let local = fixture
+		.manager
+		.apply_tier_slab(fixture.pointer.clone())
+		.await;
+	assert!(
+		local.is_err(),
+		"B6B: a local fallback must not count registration as completed physical publication"
+	);
+	fixture
+		.manager
+		.apply_tier_slab_committed(fixture.pointer.clone(), Some(902))
+		.await
+		.unwrap();
+	assert!(fixture.manager.lookup(tenant(), id(0x7f62)).is_err());
+	fixture.store.release();
+	tokio::time::timeout(
+		Duration::from_secs(30),
+		fixture.manager.wait_tier_authority_ready(),
+	)
+	.await
+	.unwrap()
+	.unwrap();
+	fixture
+		.manager
+		.apply_tier_slab(fixture.pointer.clone())
+		.await
+		.unwrap();
+	let location = fixture
+		.manager
+		.lookup(tenant(), id(0x7f62))
+		.unwrap()
+		.unwrap();
+	assert_eq!(fixture.manager.read(location).await.unwrap(), b"omitted");
+}
+#[tokio::test]
+async fn b6b_equal_index_different_pending_pointer_is_sticky_integrity_error() {
+	let mut fixture = pending_authority_fixture().await;
+	tokio::time::timeout(Duration::from_secs(30), fixture.store.entered.notified())
+		.await
+		.unwrap();
+	fixture
+		.manager
+		.stage_bootstrap_tier_authority(fixture.pointer.clone(), Some(901), fixture.pointer.slab_id)
+		.await
+		.unwrap();
+	let next = b6_copy_generation(
+		&fixture.store.inner,
+		&fixture.pointer,
+		"b6b/conflicting-index.wnd",
+	)
+	.await;
+	fixture
+		.manager
+		.apply_tier_slab_committed(next.clone(), Some(900))
+		.await
+		.unwrap();
+	assert_eq!(
+		fixture
+			.manager
+			.tier_authority
+			.pending
+			.get(&next.slab_id)
+			.unwrap()
+			.pointer,
+		fixture.pointer
+	);
+	assert!(fixture.manager.apply_tier_slab(next.clone()).await.is_err());
+	let error = fixture
+		.manager
+		.apply_tier_slab_committed(next.clone(), Some(901))
+		.await
+		.expect_err("B6B: one committed index cannot name two pending pointers");
+	assert_eq!(error.kind(), ErrorKind::InvalidData);
+	assert!(
+		error
+			.get_ref()
+			.is_some_and(|cause| cause.is::<tier_authority::TierAuthorityIndexConflict>())
+	);
+	assert!(
+		error.get_ref().is_some(),
+		"integrity refusal must carry a typed cause"
+	);
+	assert_eq!(
+		fixture
+			.manager
+			.tier_authority
+			.pending
+			.get(&next.slab_id)
+			.unwrap()
+			.pointer,
+		fixture.pointer
+	);
+	fixture.store.release();
+	assert!(
+		fixture
+			.manager
+			.apply_tier_slab_committed(fixture.pointer.clone(), Some(902))
+			.await
+			.is_err(),
+		"integrity failure is sticky"
+	);
+	let error = tokio::time::timeout(
+		Duration::from_secs(5),
+		fixture.manager.wait_tier_authority_ready(),
+	)
+	.await
+	.unwrap()
+	.unwrap_err();
+	assert_eq!(error.kind(), ErrorKind::InvalidData);
+	assert!(
+		error
+			.get_ref()
+			.is_some_and(|cause| cause.is::<tier_authority::TierAuthorityIndexConflict>())
+	);
+	assert!(
+		fixture.manager.begin_tier_snapshot_install().is_err(),
+		"a later proof must not silently clear integrity failure"
+	);
+	let crypto = fixture.manager.config.crypto.clone();
+	let (_placeholder_dir, placeholder) = fresh_manager().await;
+	let original = std::mem::replace(&mut fixture.manager, placeholder);
+	original.fsync_all_local_slabs().await.unwrap();
+	let weak = Arc::downgrade(&original);
+	drop(original);
+	tokio::time::timeout(Duration::from_secs(30), async {
+		while weak.upgrade().is_some() {
+			tokio::task::yield_now().await
+		}
+	})
+	.await
+	.unwrap();
+	let reopened = reopen_duplicate_fixture(&fixture.dirs, &fixture.store.inner, crypto)
+		.await
+		.unwrap();
+	tokio::time::timeout(
+		Duration::from_secs(30),
+		reopened.wait_tier_authority_ready(),
+	)
+	.await
+	.unwrap()
+	.unwrap();
+	let loc = reopened.lookup(tenant(), id(0x7f61)).unwrap().unwrap();
+	assert_eq!(reopened.read(loc).await.unwrap(), b"present");
+}
+#[tokio::test]
+async fn b6b_recovery_publication_waits_for_live_lsm_scope_then_retries() {
+	let fixture = pending_authority_fixture().await;
+	tokio::time::timeout(Duration::from_secs(30), fixture.store.entered.notified())
+		.await
+		.unwrap();
+	let job = CompactionJobId::new(0xb6b);
+	fixture.manager.lsm_install_unresolved.insert(
+		job,
+		lsm_driver::UnresolvedLsmScope {
+			control_legacy: None,
+			control_metric: None,
+			slabs: HashSet::from([fixture.pointer.slab_id]),
+			keys_unknown: false,
+			in_flight: true,
+			owner_token: Arc::new(()),
+		},
+	);
+	fixture.store.release();
+	tokio::time::timeout(Duration::from_secs(30), async {
+		loop {
+			if fixture.manager.tier_authority_is_ready()
+				|| fixture
+					.manager
+					.tier_authority_readiness_reason()
+					.is_some_and(|r| r.contains("Retry"))
+			{
+				break;
+			}
+			tokio::time::sleep(Duration::from_millis(10)).await;
+		}
+	})
+	.await
+	.unwrap();
+	assert!(
+		!fixture.manager.tier_authority_is_ready(),
+		"B6B: recovery publication must not bypass a live LSM scope"
+	);
+	assert!(
+		fixture
+			.manager
+			.tier_authority_readiness_reason()
+			.unwrap()
+			.contains("WouldBlock"),
+		"a live scope blocker must be retryable"
+	);
+	fixture.manager.clear_registered_lsm_intent(job).await;
+	tokio::time::timeout(Duration::from_secs(30), async {
+		loop {
+			if fixture.manager.wait_tier_authority_ready().await.is_ok() {
+				break;
+			}
+			tokio::time::sleep(Duration::from_millis(10)).await;
+		}
+	})
+	.await
+	.unwrap();
+	let loc = fixture
+		.manager
+		.lookup(tenant(), id(0x7f62))
+		.unwrap()
+		.unwrap();
+	assert_eq!(fixture.manager.read(loc).await.unwrap(), b"omitted");
+}
+
+#[tokio::test]
+async fn b6b_equal_index_snapshot_conflict_is_sticky_integrity_error() {
+	let fixture = pending_authority_fixture().await;
+	tokio::time::timeout(Duration::from_secs(30), fixture.store.entered.notified())
+		.await
+		.unwrap();
+	fixture
+		.manager
+		.stage_bootstrap_tier_authority(fixture.pointer.clone(), Some(901), fixture.pointer.slab_id)
+		.await
+		.unwrap();
+	let next = b6_copy_generation(
+		&fixture.store.inner,
+		&fixture.pointer,
+		"b6b/equal-snapshot.wnd",
+	)
+	.await;
+	let epoch = fixture.manager.begin_tier_snapshot_install().unwrap();
+	let error = fixture
+		.manager
+		.finish_tier_snapshot_install_at_epoch(vec![next], Some(901), epoch)
+		.await
+		.expect_err("B6B: a snapshot at the same index cannot replace a different pending pointer");
+	assert_eq!(error.kind(), ErrorKind::InvalidData);
+	fixture.store.release();
+	assert_eq!(
+		fixture.manager.tier_pointer(fixture.pointer.slab_id).await,
+		Some(fixture.pointer.clone())
+	);
+	let error = fixture.manager.lookup(tenant(), id(0x7f61)).unwrap_err();
+	assert_eq!(error.kind(), ErrorKind::InvalidData);
+	assert!(fixture.manager.begin_tier_snapshot_install().is_err());
+}
+#[tokio::test]
+async fn b6b_equal_index_staged_callback_conflict_is_sticky_integrity_error() {
+	let fixture = pending_authority_fixture().await;
+	tokio::time::timeout(Duration::from_secs(30), fixture.store.entered.notified())
+		.await
+		.unwrap();
+	fixture
+		.manager
+		.stage_bootstrap_tier_authority(fixture.pointer.clone(), Some(901), fixture.pointer.slab_id)
+		.await
+		.unwrap();
+	let next = b6_copy_generation(
+		&fixture.store.inner,
+		&fixture.pointer,
+		"b6b/equal-staged.wnd",
+	)
+	.await;
+	let active = fixture.manager.active_slab_id().await;
+	let _epoch = fixture.manager.begin_tier_snapshot_install().unwrap();
+	let error = fixture
+		.manager
+		.apply_tier_slab_committed(next, Some(901))
+		.await
+		.unwrap_err();
+	assert_eq!(
+		error.kind(),
+		ErrorKind::InvalidData,
+		"B6B: same-index staging must latch integrity, not a transient Fenced refusal"
+	);
+	fixture.store.release();
+	assert_eq!(fixture.manager.active_slab_id().await, active);
+	assert_eq!(
+		fixture
+			.manager
+			.tier_authority
+			.pending
+			.get(&fixture.pointer.slab_id)
+			.unwrap()
+			.pointer,
+		fixture.pointer
+	);
+	assert!(
+		fixture
+			.manager
+			.apply_tier_slab_committed(fixture.pointer.clone(), Some(902))
+			.await
+			.is_err()
+	);
+	assert_eq!(
+		fixture
+			.manager
+			.lookup(tenant(), id(0x7f61))
+			.unwrap_err()
+			.kind(),
+		ErrorKind::InvalidData
+	);
+}
+
+#[tokio::test]
+async fn b6b_retired_slab_cannot_register_snapshot_flight() {
+	let (_dirs, manager, _l2, _target, _schemas, pointer) = unpublished_drop_fixture().await;
+	manager
+		.retire_tiered_slab_committed(pointer.slab_id, Some(901))
+		.await
+		.unwrap();
+	assert!(manager.tier_pointer(pointer.slab_id).await.is_none());
+	let _epoch = manager.begin_tier_snapshot_install().unwrap();
+	assert!(
+		manager
+			.apply_tier_slab_committed(pointer.clone(), Some(902))
+			.await
+			.is_err(),
+		"a retired slab must not acquire a new pending flight"
+	);
+	assert!(
+		!manager
+			.tier_authority
+			.pending
+			.contains_key(&pointer.slab_id)
+	);
+	assert!(manager.tier_pointer(pointer.slab_id).await.is_none());
+}
+
+fn b6_control_tier(p: &TieredSlabPointer) -> crate::consensus::TieredSlab {
+	crate::consensus::TieredSlab {
+		slab_id: p.slab_id,
+		l2_uri: p.l2_uri.clone(),
+		payload_hash: p.payload_hash,
+		is_encrypted: p.is_encrypted,
+		tenant_id: p.tenant_id,
+		tenant_kek_id: p.tenant_kek_id,
+		stats_format_version: p.stats_format_version,
+		stats_block_len: p.stats_block_len,
+		stats_block_hash128: p.stats_block_hash128,
+		tombstone_metadata: p.tombstone_metadata,
+		supersession_metadata: p.supersession_metadata,
+	}
+}
+#[tokio::test]
+async fn b6_replacement_tier_log_entry_finishes_complete_replay_authority() {
+	use crate::consensus::{WendelonRequest, WendelonStateMachine};
+	use openraft::storage::RaftStateMachine;
+	use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
+	let (_dirs, source, l2) = fresh_manager_with_l2("b6-replacement-source").await;
+	let key = id(0xb601);
+	source
+		.append_durable(tenant(), key, hlc(70), b"replacement-tier")
+		.await
+		.unwrap();
+	let pointer = tier_kv_slab(&source, &l2, "b6/replacement-object.wnd").await;
+	let dst = fresh_dir("b6-replacement-target");
+	let marker = dst.join("TIER_AUTHORITY_AWAITING_CLUSTER");
+	std::fs::write(&marker, b"awaiting-cluster-v1\n").unwrap();
+	let target = SlabManager::initialize_new_store(SlabManagerConfig {
+		dir: dst.to_path_buf(),
+		max_slab_bytes: 1 << 20,
+		io: spawn_io_thread(64).unwrap(),
+		l2: Some(l2.clone()),
+		rehydration: RehydrationPolicy::default(),
+		l2_column_fetch: Default::default(),
+		row_group_writer: Default::default(),
+		l2_row_group_fetch: Default::default(),
+		encoding_writer: Default::default(),
+		l2_chunk_layout: Default::default(),
+		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
+		group_commit: GroupCommitConfig::default(),
+		crypto: source.config.crypto.clone(),
+	})
+	.await
+	.unwrap();
+	assert!(target.is_awaiting_cluster());
+	assert!(target.lookup(tenant(), key).is_err());
+	let mut sm = WendelonStateMachine::new().with_tier_observer(Arc::new(
+		crate::storage::ManagerTierObserver::new(target.clone()),
+	));
+	RaftStateMachine::apply(
+		&mut sm,
+		[Entry {
+			log_id: LogId::new(CommittedLeaderId::new(3, 1), 901),
+			payload: EntryPayload::Normal(WendelonRequest::TierSlab(b6_control_tier(&pointer))),
+		}],
+	)
+	.await
+	.unwrap();
+	assert!(
+		sm.state_snapshot()
+			.await
+			.tiered_slabs
+			.contains_key(&pointer.slab_id)
+	);
+	assert!(
+		target.lookup(tenant(), key).is_err(),
+		"a single entry does not authorize replacement reads"
+	);
+	target
+		.finish_replacement_log_replay(vec![pointer.clone()], 901, 901)
+		.await
+		.expect(
+			"B6: complete confirmed replay containing a TierSlab must not reject its own deferred log entry",
+		);
+	tokio::time::timeout(Duration::from_secs(30), target.wait_tier_authority_ready())
+		.await
+		.unwrap()
+		.unwrap();
+	assert!(!marker.exists());
+	assert!(!target.is_awaiting_cluster());
+	assert!(target.unapplied_tier_pointer(pointer.slab_id).is_none());
+	assert_eq!(
+		target
+			.read(target.lookup(tenant(), key).unwrap().unwrap())
+			.await
+			.unwrap(),
+		b"replacement-tier"
+	);
+}
+#[tokio::test]
+async fn b6c_complete_replay_resumes_matching_lsm_deferral() {
+	use crate::consensus::{WendelonRequest, WendelonStateMachine};
+	use openraft::storage::RaftStateMachine;
+	use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
+	let (_dirs, source, l2) = fresh_manager_with_l2("b6-replacement-source").await;
+	let key = id(0xb601);
+	source
+		.append_durable(tenant(), key, hlc(70), b"replacement-tier")
+		.await
+		.unwrap();
+	let pointer = tier_kv_slab(&source, &l2, "b6/replacement-object.wnd").await;
+	let dst = fresh_dir("b6-replacement-target");
+	let marker = dst.join("TIER_AUTHORITY_AWAITING_CLUSTER");
+	std::fs::write(&marker, b"awaiting-cluster-v1\n").unwrap();
+	let target = SlabManager::initialize_new_store(SlabManagerConfig {
+		dir: dst.to_path_buf(),
+		max_slab_bytes: 1 << 20,
+		io: spawn_io_thread(64).unwrap(),
+		l2: Some(l2.clone()),
+		rehydration: RehydrationPolicy::default(),
+		l2_column_fetch: Default::default(),
+		row_group_writer: Default::default(),
+		l2_row_group_fetch: Default::default(),
+		encoding_writer: Default::default(),
+		l2_chunk_layout: Default::default(),
+		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
+		group_commit: GroupCommitConfig::default(),
+		crypto: source.config.crypto.clone(),
+	})
+	.await
+	.unwrap();
+	assert!(target.is_awaiting_cluster());
+	assert!(target.lookup(tenant(), key).is_err());
+	let job = CompactionJobId::new(0xb6c);
+	target.lsm_install_unresolved.insert(
+		job,
+		lsm_driver::UnresolvedLsmScope {
+			control_legacy: None,
+			control_metric: None,
+			slabs: HashSet::from([pointer.slab_id]),
+			keys_unknown: false,
+			in_flight: true,
+			owner_token: Arc::new(()),
+		},
+	);
+	let mut sm = WendelonStateMachine::new().with_tier_observer(Arc::new(
+		crate::storage::ManagerTierObserver::new(target.clone()),
+	));
+	RaftStateMachine::apply(
+		&mut sm,
+		[Entry {
+			log_id: LogId::new(CommittedLeaderId::new(3, 1), 901),
+			payload: EntryPayload::Normal(WendelonRequest::TierSlab(b6_control_tier(&pointer))),
+		}],
+	)
+	.await
+	.unwrap();
+	assert!(
+		sm.state_snapshot()
+			.await
+			.tiered_slabs
+			.contains_key(&pointer.slab_id)
+	);
+	assert!(
+		target.lookup(tenant(), key).is_err(),
+		"a single entry does not authorize replacement reads"
+	);
+	assert_eq!(
+		target.unapplied_tier_pointer(pointer.slab_id),
+		Some(pointer.clone())
+	);
+	target.clear_registered_lsm_intent(job).await;
+	assert!(
+		target
+			.finish_replacement_log_replay(vec![pointer.clone()], 901, 902)
+			.await
+			.is_err()
+	);
+	assert!(marker.exists());
+	assert!(target.is_awaiting_cluster());
+	assert!(target.lookup(tenant(), key).is_err());
+	target
+		.finish_replacement_log_replay(vec![pointer.clone()], 901, 901)
+		.await
+		.expect(
+			"B6: complete confirmed replay containing a TierSlab must not reject its own deferred log entry",
+		);
+	tokio::time::timeout(Duration::from_secs(30), target.wait_tier_authority_ready())
+		.await
+		.unwrap()
+		.unwrap();
+	assert!(!marker.exists());
+	assert!(!target.is_awaiting_cluster());
+	assert!(target.unapplied_tier_pointer(pointer.slab_id).is_none());
+	assert_eq!(
+		target
+			.read(target.lookup(tenant(), key).unwrap().unwrap())
+			.await
+			.unwrap(),
+		b"replacement-tier"
+	);
+}
+#[tokio::test]
+async fn b6c_complete_replay_preserves_structural_refusal() {
+	use crate::consensus::{WendelonRequest, WendelonStateMachine};
+	use openraft::storage::RaftStateMachine;
+	use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
+	let (_dirs, source, l2) = fresh_manager_with_l2("b6-replacement-source").await;
+	let key = id(0xb601);
+	source
+		.append_durable(tenant(), key, hlc(70), b"replacement-tier")
+		.await
+		.unwrap();
+	let pointer = tier_kv_slab(&source, &l2, "b6/replacement-object.wnd").await;
+	let dst = fresh_dir("b6-replacement-target");
+	let marker = dst.join("TIER_AUTHORITY_AWAITING_CLUSTER");
+	std::fs::write(&marker, b"awaiting-cluster-v1\n").unwrap();
+	let target = SlabManager::initialize_new_store(SlabManagerConfig {
+		dir: dst.to_path_buf(),
+		max_slab_bytes: 1 << 20,
+		io: spawn_io_thread(64).unwrap(),
+		l2: Some(l2.clone()),
+		rehydration: RehydrationPolicy::default(),
+		l2_column_fetch: Default::default(),
+		row_group_writer: Default::default(),
+		l2_row_group_fetch: Default::default(),
+		encoding_writer: Default::default(),
+		l2_chunk_layout: Default::default(),
+		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
+		group_commit: GroupCommitConfig::default(),
+		crypto: source.config.crypto.clone(),
+	})
+	.await
+	.unwrap();
+	assert!(target.is_awaiting_cluster());
+	assert!(target.lookup(tenant(), key).is_err());
+	let job = CompactionJobId::new(0xb6c);
+	target.lsm_install_unresolved.insert(
+		job,
+		lsm_driver::UnresolvedLsmScope {
+			control_legacy: None,
+			control_metric: None,
+			slabs: HashSet::from([pointer.slab_id]),
+			keys_unknown: false,
+			in_flight: true,
+			owner_token: Arc::new(()),
+		},
+	);
+	let mut sm = WendelonStateMachine::new().with_tier_observer(Arc::new(
+		crate::storage::ManagerTierObserver::new(target.clone()),
+	));
+	RaftStateMachine::apply(
+		&mut sm,
+		[Entry {
+			log_id: LogId::new(CommittedLeaderId::new(3, 1), 901),
+			payload: EntryPayload::Normal(WendelonRequest::TierSlab(b6_control_tier(&pointer))),
+		}],
+	)
+	.await
+	.unwrap();
+	assert!(
+		sm.state_snapshot()
+			.await
+			.tiered_slabs
+			.contains_key(&pointer.slab_id)
+	);
+	assert!(
+		target.lookup(tenant(), key).is_err(),
+		"a single entry does not authorize replacement reads"
+	);
+	assert_eq!(
+		target.unapplied_tier_pointer(pointer.slab_id),
+		Some(pointer.clone())
+	);
+	target.clear_registered_lsm_intent(job).await;
+	assert!(
+		target
+			.finish_replacement_log_replay(vec![pointer.clone()], 901, 902)
+			.await
+			.is_err()
+	);
+	assert!(marker.exists());
+	assert!(target.is_awaiting_cluster());
+	assert!(target.lookup(tenant(), key).is_err());
+	target.unapplied_tier_pointers.insert(
+		pointer.slab_id,
+		(
+			pointer.clone(),
+			Some(StaleLocationReason::LayoutCollision),
+			None,
+		),
+	);
+	assert!(
+		target
+			.finish_replacement_log_replay(vec![pointer.clone()], 901, 901)
+			.await
+			.is_err()
+	);
+	assert!(marker.exists());
+	assert!(target.is_awaiting_cluster());
+	assert!(target.lookup(tenant(), key).is_err());
+	assert_eq!(
+		target
+			.unapplied_tier_pointers
+			.get(&pointer.slab_id)
+			.unwrap()
+			.value()
+			.1,
+		Some(StaleLocationReason::LayoutCollision)
+	);
+}
+
+#[tokio::test]
+async fn b6c_nonempty_replay_crash_before_marker_clear_rechecks_on_reopen() {
+	use crate::consensus::{WendelonRequest, WendelonStateMachine};
+	use openraft::storage::RaftStateMachine;
+	use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
+	let (_dirs, source, l2) = fresh_manager_with_l2("b6-replacement-source").await;
+	let key = id(0xb601);
+	source
+		.append_durable(tenant(), key, hlc(70), b"replacement-tier")
+		.await
+		.unwrap();
+	let pointer = tier_kv_slab(&source, &l2, "b6/replacement-object.wnd").await;
+	let dst = fresh_dir("b6-replacement-target");
+	let marker = dst.join("TIER_AUTHORITY_AWAITING_CLUSTER");
+	std::fs::write(&marker, b"awaiting-cluster-v1\n").unwrap();
+	let target = SlabManager::initialize_new_store(SlabManagerConfig {
+		dir: dst.to_path_buf(),
+		max_slab_bytes: 1 << 20,
+		io: spawn_io_thread(64).unwrap(),
+		l2: Some(l2.clone()),
+		rehydration: RehydrationPolicy::default(),
+		l2_column_fetch: Default::default(),
+		row_group_writer: Default::default(),
+		l2_row_group_fetch: Default::default(),
+		encoding_writer: Default::default(),
+		l2_chunk_layout: Default::default(),
+		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
+		group_commit: GroupCommitConfig::default(),
+		crypto: source.config.crypto.clone(),
+	})
+	.await
+	.unwrap();
+	assert!(target.is_awaiting_cluster());
+	assert!(target.lookup(tenant(), key).is_err());
+	let mut sm = WendelonStateMachine::new().with_tier_observer(Arc::new(
+		crate::storage::ManagerTierObserver::new(target.clone()),
+	));
+	RaftStateMachine::apply(
+		&mut sm,
+		[Entry {
+			log_id: LogId::new(CommittedLeaderId::new(3, 1), 901),
+			payload: EntryPayload::Normal(WendelonRequest::TierSlab(b6_control_tier(&pointer))),
+		}],
+	)
+	.await
+	.unwrap();
+	assert!(
+		sm.state_snapshot()
+			.await
+			.tiered_slabs
+			.contains_key(&pointer.slab_id)
+	);
+	assert!(
+		target.lookup(tenant(), key).is_err(),
+		"a single entry does not authorize replacement reads"
+	);
+	let crypto = source.config.crypto.clone();
+	let io = target.config.io.clone();
+	let pause = target.pause_snapshot_before_marker_clear_once();
+	let task_target = target.clone();
+	let task_pointer = pointer.clone();
+	let mut comparison = tokio::spawn(async move {
+		task_target
+			.finish_replacement_log_replay(vec![task_pointer], 901, 901)
+			.await
+	});
+	tokio::select! {
+		reached = tokio::time::timeout(Duration::from_secs(30), pause.reached.notified()) => reached.unwrap(),
+		result = &mut comparison => panic!("B6C: nonempty comparison never reached marker-clear cut: {result:?}"),
+	}
+	assert!(marker.exists());
+	assert!(target.lookup(tenant(), key).is_err());
+	assert_eq!(
+		target
+			.persistent_index
+			.as_ref()
+			.unwrap()
+			.load_snapshot()
+			.await
+			.unwrap()
+			.tiered_slabs,
+		vec![pointer.clone()]
+	);
+	comparison.abort();
+	assert!(comparison.await.unwrap_err().is_cancelled());
+	drop(sm);
+	drop(target);
+	let reopened = SlabManager::open(SlabManagerConfig {
+		dir: dst.to_path_buf(),
+		max_slab_bytes: 1 << 20,
+		io,
+		l2: Some(l2.clone()),
+		rehydration: RehydrationPolicy::default(),
+		l2_column_fetch: Default::default(),
+		row_group_writer: Default::default(),
+		l2_row_group_fetch: Default::default(),
+		encoding_writer: Default::default(),
+		l2_chunk_layout: Default::default(),
+		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
+		group_commit: GroupCommitConfig::default(),
+		crypto,
+	})
+	.await
+	.unwrap();
+	assert!(reopened.is_awaiting_cluster());
+	assert!(reopened.lookup(tenant(), key).is_err());
+	assert!(
+		reopened
+			.finish_replacement_log_replay(vec![pointer.clone()], 901, 902)
+			.await
+			.is_err()
+	);
+	assert!(marker.exists());
+	reopened
+		.finish_replacement_log_replay(vec![pointer.clone()], 901, 901)
+		.await
+		.unwrap();
+	tokio::time::timeout(
+		Duration::from_secs(30),
+		reopened.wait_tier_authority_ready(),
+	)
+	.await
+	.unwrap()
+	.unwrap();
+	assert!(!marker.exists());
+	assert_eq!(
+		reopened
+			.read(reopened.lookup(tenant(), key).unwrap().unwrap())
+			.await
+			.unwrap(),
+		b"replacement-tier"
+	);
+}
+#[tokio::test]
+async fn b6c_absent_canonical_without_registered_flight_still_refuses() {
+	let (_dirs, source, l2) = fresh_manager_with_l2("b6-replacement-source").await;
+	let key = id(0xb601);
+	source
+		.append_durable(tenant(), key, hlc(70), b"replacement-tier")
+		.await
+		.unwrap();
+	let pointer = tier_kv_slab(&source, &l2, "b6/replacement-object.wnd").await;
+	let dst = fresh_dir("b6-replacement-target");
+	let marker = dst.join("TIER_AUTHORITY_AWAITING_CLUSTER");
+	std::fs::write(&marker, b"awaiting-cluster-v1\n").unwrap();
+	let target = SlabManager::initialize_new_store(SlabManagerConfig {
+		dir: dst.to_path_buf(),
+		max_slab_bytes: 1 << 20,
+		io: spawn_io_thread(64).unwrap(),
+		l2: Some(l2.clone()),
+		rehydration: RehydrationPolicy::default(),
+		l2_column_fetch: Default::default(),
+		row_group_writer: Default::default(),
+		l2_row_group_fetch: Default::default(),
+		encoding_writer: Default::default(),
+		l2_chunk_layout: Default::default(),
+		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
+		group_commit: GroupCommitConfig::default(),
+		crypto: source.config.crypto.clone(),
+	})
+	.await
+	.unwrap();
+	assert!(target.is_awaiting_cluster());
+	assert!(target.lookup(tenant(), key).is_err());
+	assert!(target.tier_authority.pending.is_empty());
+	assert!(target.unapplied_tier_pointer(pointer.slab_id).is_none());
+	assert!(
+		target
+			.finish_replacement_log_replay(vec![pointer.clone()], 901, 901)
+			.await
+			.is_err()
+	);
+	assert!(marker.exists());
+	assert!(target.lookup(tenant(), key).is_err());
+	assert!(
+		target
+			.persistent_index
+			.as_ref()
+			.unwrap()
+			.load_snapshot()
+			.await
+			.unwrap()
+			.tiered_slabs
+			.is_empty()
+	);
+}
+#[tokio::test]
+async fn b6c_durable_old_pointer_mismatch_still_refuses() {
+	let (_dirs, manager, l2) = fresh_manager_with_l2("b6c-old-mismatch").await;
+	manager
+		.append_durable(tenant(), id(0xb6c2), hlc(2), b"old")
+		.await
+		.unwrap();
+	let old = tier_kv_slab(&manager, &l2, "b6c/old").await;
+	manager.wait_tier_authority_ready().await.unwrap();
+	let next = b6_copy_generation(&l2, &old, "b6c/new").await;
+	let marker = manager.config.dir.join("TIER_AUTHORITY_AWAITING_CLUSTER");
+	std::fs::write(&marker, b"awaiting-cluster-v1\n").unwrap();
+	manager.awaiting_cluster.store(true, Ordering::Release);
+	assert!(
+		manager
+			.finish_replacement_log_replay(vec![next], 901, 901)
+			.await
+			.is_err()
+	);
+	assert!(marker.exists());
+	assert_eq!(
+		manager
+			.persistent_index
+			.as_ref()
+			.unwrap()
+			.load_snapshot()
+			.await
+			.unwrap()
+			.tiered_slabs,
+		vec![old.clone()]
+	);
+	assert_eq!(manager.tier_pointer(old.slab_id).await, Some(old));
+}
+
+#[tokio::test]
+async fn b6c_recovered_prefix_registers_before_complete_confirmation() {
+	let (_dirs, source, l2) = fresh_manager_with_l2("b6-replacement-source").await;
+	let key = id(0xb601);
+	source
+		.append_durable(tenant(), key, hlc(70), b"replacement-tier")
+		.await
+		.unwrap();
+	let pointer = tier_kv_slab(&source, &l2, "b6/replacement-object.wnd").await;
+	let dst = fresh_dir("b6-replacement-target");
+	let marker = dst.join("TIER_AUTHORITY_AWAITING_CLUSTER");
+	std::fs::write(&marker, b"awaiting-cluster-v1\n").unwrap();
+	let target = SlabManager::initialize_new_store(SlabManagerConfig {
+		dir: dst.to_path_buf(),
+		max_slab_bytes: 1 << 20,
+		io: spawn_io_thread(64).unwrap(),
+		l2: Some(l2.clone()),
+		rehydration: RehydrationPolicy::default(),
+		l2_column_fetch: Default::default(),
+		row_group_writer: Default::default(),
+		l2_row_group_fetch: Default::default(),
+		encoding_writer: Default::default(),
+		l2_chunk_layout: Default::default(),
+		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
+		group_commit: GroupCommitConfig::default(),
+		crypto: source.config.crypto.clone(),
+	})
+	.await
+	.unwrap();
+	assert!(target.is_awaiting_cluster());
+	assert!(target.lookup(tenant(), key).is_err());
+	target
+		.stage_bootstrap_tier_authority(pointer.clone(), Some(901), pointer.slab_id)
+		.await
+		.unwrap();
+	assert!(marker.exists());
+	assert!(target.lookup(tenant(), key).is_err());
+	assert!(
+		target
+			.finish_replacement_log_replay(vec![pointer.clone()], 901, 902)
+			.await
+			.is_err()
+	);
+	assert!(marker.exists());
+	target
+		.finish_replacement_log_replay(vec![pointer.clone()], 901, 901)
+		.await
+		.expect(
+			"B6: complete confirmed replay containing a TierSlab must not reject its own deferred log entry",
+		);
+	tokio::time::timeout(Duration::from_secs(30), target.wait_tier_authority_ready())
+		.await
+		.unwrap()
+		.unwrap();
+	assert!(!marker.exists());
+	assert!(!target.is_awaiting_cluster());
+	assert!(target.unapplied_tier_pointer(pointer.slab_id).is_none());
+	assert_eq!(
+		target
+			.read(target.lookup(tenant(), key).unwrap().unwrap())
+			.await
+			.unwrap(),
+		b"replacement-tier"
+	);
+}
+
+async fn b7_assert_retirement_receipt(mgr: &SlabManager, old: &TieredSlabPointer) {
+	let records = mgr
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot_cleanup_intents()
+		.await
+		.unwrap();
+	let saved = records
+		.iter()
+		.find(|(slab, uri, _)| *slab == old.slab_id && uri == &old.l2_uri)
+		.unwrap();
+	assert_eq!(
+		saved.2.state,
+		crate::storage::index::RetainedObjectIntentState::RetirementPublished
+	);
+	assert_eq!(
+		saved.2.retirement_source,
+		Some(crate::storage::index::RetirementSource::Snapshot(950))
+	);
+}
+async fn b7_metadata_update_during_retirement(tombstone: bool) {
+	let (_dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let retained_bytes = l2.get(&old.l2_uri).await.unwrap();
+	let pause = mgr.pause_snapshot_before_retirement_apply_once();
+	let epoch = mgr.begin_tier_snapshot_install().unwrap();
+	let task = {
+		let mgr = mgr.clone();
+		tokio::spawn(async move {
+			mgr.finish_tier_snapshot_install_at_epoch(vec![], Some(950), epoch)
+				.await
+		})
+	};
+	tokio::time::timeout(Duration::from_secs(30), pause.reached.notified())
+		.await
+		.unwrap();
+	let changed = if tombstone {
+		mgr.record_row_tombstone_for_slab(old.slab_id, hlc(999), None)
+			.await
+	} else {
+		mgr.record_supersession_for_slab(old.slab_id, hlc(999), None)
+			.await
+	}
+	.unwrap();
+	assert!(changed);
+	let current = mgr.tier_pointer(old.slab_id).await.unwrap();
+	assert_ne!(current, old);
+	assert_eq!(current.l2_uri, old.l2_uri);
+	assert_eq!(current.payload_hash, old.payload_hash);
+	pause.resume.notify_one();
+	task.await.unwrap().unwrap();
+	assert!(
+		mgr.tier_pointer(old.slab_id).await.is_none(),
+		"B7: a metadata-only change must not abandon generation-authorized retirement"
+	);
+	assert!(
+		mgr.persistent_index
+			.as_ref()
+			.unwrap()
+			.load_snapshot_retirement_marks()
+			.await
+			.unwrap()
+			.is_empty()
+	);
+	tokio::time::timeout(Duration::from_secs(30), mgr.wait_tier_authority_ready())
+		.await
+		.unwrap()
+		.unwrap();
+	assert!(mgr.lookup(tenant(), id(0x421)).unwrap().is_none());
+	b7_assert_retirement_receipt(&mgr, &old).await;
+	assert_eq!(l2.get(&old.l2_uri).await.unwrap(), retained_bytes);
+}
+#[tokio::test]
+async fn b7_supersession_only_change_does_not_abandon_retirement() {
+	b7_metadata_update_during_retirement(false).await;
+}
+#[tokio::test]
+async fn b7_tombstone_only_change_does_not_abandon_retirement() {
+	b7_metadata_update_during_retirement(true).await;
+}
+#[tokio::test]
+async fn b7_pending_metadata_only_change_is_retired_without_resurrection() {
+	let fixture = pending_authority_fixture().await;
+	tokio::time::timeout(Duration::from_secs(30), fixture.store.entered.notified())
+		.await
+		.unwrap();
+	let old = fixture.pointer.clone();
+	let retained_bytes = fixture.store.inner.get(&old.l2_uri).await.unwrap();
+	let mgr = fixture.manager.clone();
+	let pause = mgr.pause_snapshot_before_retirement_apply_once();
+	let epoch = mgr.begin_tier_snapshot_install().unwrap();
+	let task = {
+		let mgr = mgr.clone();
+		tokio::spawn(async move {
+			mgr.finish_tier_snapshot_install_at_epoch(vec![], Some(950), epoch)
+				.await
+		})
+	};
+	tokio::time::timeout(Duration::from_secs(30), pause.reached.notified())
+		.await
+		.unwrap();
+	assert!(
+		mgr.record_supersession_for_slab(old.slab_id, hlc(999), Some(951))
+			.await
+			.unwrap()
+	);
+	assert_eq!(mgr.tier_pointer(old.slab_id).await, Some(old.clone()));
+	assert_ne!(
+		mgr.tier_authority
+			.pending
+			.get(&old.slab_id)
+			.unwrap()
+			.pointer,
+		old
+	);
+	pause.resume.notify_one();
+	task.await.unwrap().unwrap();
+	assert!(
+		mgr.tier_pointer(old.slab_id).await.is_none(),
+		"B7: pending metadata-only change cannot preserve the retired generation"
+	);
+	assert!(!mgr.tier_authority.pending.contains_key(&old.slab_id));
+	fixture.store.release();
+	tokio::time::timeout(Duration::from_secs(30), mgr.wait_tier_authority_ready())
+		.await
+		.unwrap()
+		.unwrap();
+	assert!(mgr.tier_pointer(old.slab_id).await.is_none());
+	assert!(mgr.lookup(tenant(), id(0x7f62)).unwrap().is_none());
+	b7_assert_retirement_receipt(&mgr, &old).await;
+	assert_eq!(
+		fixture.store.inner.get(&old.l2_uri).await.unwrap(),
+		retained_bytes
+	);
+}
+async fn b7_index_retirement_after_pointer_change(changed_generation: bool) {
+	let (_dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let retained_bytes = l2.get(&old.l2_uri).await.unwrap();
+	let index = mgr.persistent_index.as_ref().unwrap();
+	let epoch = mgr.capture_snapshot_epoch();
+	let mark = crate::storage::index::SnapshotRetirementMark {
+		epoch,
+		snapshot_index: Some(950),
+		pointer: old.clone(),
+	};
+	{
+		let _gate = mgr.persistent_index_gate.clone().write_owned().await;
+		index
+			.stage_snapshot_retirement_marks(
+				vec![mark.clone()],
+				HashSet::new(),
+				epoch,
+				mgr.snapshot_epoch.clone(),
+				mgr.snapshot_epoch_gate.clone(),
+			)
+			.await
+			.unwrap();
+	}
+	if changed_generation {
+		let mut distinct = old.clone();
+		distinct.payload_hash[0] ^= 1;
+		index
+			.apply(PersistentIndexUpdate {
+				put_tiered_slabs: vec![distinct],
+				..Default::default()
+			})
+			.await
+			.unwrap();
+	} else {
+		assert!(
+			mgr.record_supersession_for_slab(old.slab_id, hlc(999), None)
+				.await
+				.unwrap()
+		);
+	}
+	let before = index.load_snapshot().await.unwrap();
+	let publication = Arc::new(mgr.persistent_index_gate.clone().read_owned().await);
+	let result = index
+		.apply_snapshot_retirement(
+			mark.clone(),
+			Some(retained_bytes.len() as u64),
+			vec![],
+			mgr.snapshot_epoch.clone(),
+			mgr.snapshot_epoch_gate.clone(),
+			publication,
+		)
+		.await
+		.unwrap();
+	let after = index.load_snapshot().await.unwrap();
+	if changed_generation {
+		assert!(
+			result.is_none(),
+			"a different payload generation at the same URI must remain"
+		);
+		assert_eq!(after.tiered_slabs, before.tiered_slabs);
+		assert_eq!(
+			index.load_snapshot_retirement_marks().await.unwrap(),
+			vec![mark]
+		);
+	} else {
+		assert!(
+			result.is_some(),
+			"B7: redb retirement must compare object generation, not advisory metadata"
+		);
+		assert!(after.tiered_slabs.is_empty());
+		b7_assert_retirement_receipt(&mgr, &old).await;
+		assert!(
+			index
+				.load_snapshot_retirement_marks()
+				.await
+				.unwrap()
+				.is_empty()
+		);
+	}
+	assert_eq!(l2.get(&old.l2_uri).await.unwrap(), retained_bytes);
+}
+#[tokio::test]
+async fn b7_redb_metadata_only_change_keeps_retirement_authority() {
+	b7_index_retirement_after_pointer_change(false).await;
+}
+#[tokio::test]
+async fn b7_redb_different_payload_generation_preserves_pointer() {
+	b7_index_retirement_after_pointer_change(true).await;
+}
+
+#[tokio::test]
+async fn b8_snapshot_retires_pending_only_committed_generation_without_resurrection() {
+	let f = bootstrap_collision_fixture(false, false).await;
+	bootstrap_collision_staging(&f).await.unwrap();
+	tokio::time::timeout(Duration::from_secs(30), f.store.entered.notified())
+		.await
+		.unwrap();
+	let slab = f.pointer.slab_id;
+	assert!(
+		f.manager.tier_pointer(slab).await.is_none(),
+		"fixture must be pending-only"
+	);
+	assert_eq!(
+		f.manager.tier_authority.pending.get(&slab).unwrap().pointer,
+		f.pointer
+	);
+	let old_bytes = f.store.inner.get(&f.pointer.l2_uri).await.unwrap();
+	let epoch = f.manager.begin_tier_snapshot_install().unwrap();
+	f.manager
+		.finish_tier_snapshot_install_at_epoch(vec![], Some(900), epoch)
+		.await
+		.unwrap();
+	assert!(
+		!f.manager.tier_authority.pending.contains_key(&slab),
+		"B8: a canonical snapshot must retire its omitted pending-only committed generation"
+	);
+	assert!(
+		f.manager
+			.persistent_index
+			.as_ref()
+			.unwrap()
+			.load_snapshot_retirement_marks()
+			.await
+			.unwrap()
+			.is_empty()
+	);
+	f.store.release();
+	tokio::time::timeout(
+		Duration::from_secs(30),
+		f.manager.wait_tier_authority_ready(),
+	)
+	.await
+	.unwrap()
+	.unwrap();
+	assert!(f.manager.tier_pointer(slab).await.is_none());
+	assert!(f.manager.lookup(tenant(), id(0x7f71)).unwrap().is_none());
+	assert!(f.manager.lookup(tenant(), id(0x7f72)).unwrap().is_none());
+	assert_eq!(
+		std::fs::read(&f.file).unwrap(),
+		f.bytes,
+		"quarantined L1 evidence must remain"
+	);
+	assert_eq!(
+		f.store.inner.get(&f.pointer.l2_uri).await.unwrap(),
+		old_bytes
+	);
+	let records = f
+		.manager
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot_cleanup_intents()
+		.await
+		.unwrap();
+	let record = records
+		.iter()
+		.find(|(id, uri, _)| *id == slab && uri == &f.pointer.l2_uri)
+		.unwrap();
+	assert_eq!(
+		record.2.state,
+		crate::storage::index::RetainedObjectIntentState::RetirementPublished
+	);
+	assert_eq!(
+		record.2.retirement_source,
+		Some(crate::storage::index::RetirementSource::Snapshot(900))
+	);
+}
+
+async fn b8_refuses_unordered_pending_retirement(old: Option<u64>, snapshot: u64) {
+	let f = bootstrap_collision_fixture(false, false).await;
+	f.manager
+		.stage_bootstrap_tier_authority(f.pointer.clone(), old, f.pointer.slab_id)
+		.await
+		.unwrap();
+	tokio::time::timeout(Duration::from_secs(30), f.store.entered.notified())
+		.await
+		.unwrap();
+	let epoch = f.manager.begin_tier_snapshot_install().unwrap();
+	let result = f
+		.manager
+		.finish_tier_snapshot_install_at_epoch(vec![], Some(snapshot), epoch)
+		.await;
+	assert!(
+		result.is_err(),
+		"B8: pending-only retirement requires old < snapshot, old={old:?}, snapshot={snapshot}"
+	);
+	assert!(
+		f.manager
+			.tier_authority
+			.pending
+			.contains_key(&f.pointer.slab_id)
+	);
+	assert!(
+		f.manager
+			.persistent_index
+			.as_ref()
+			.unwrap()
+			.load_snapshot_retirement_marks()
+			.await
+			.unwrap()
+			.is_empty()
+	);
+	assert_eq!(std::fs::read(&f.file).unwrap(), f.bytes);
+}
+#[tokio::test]
+async fn b8_pending_retirement_without_known_index_is_refused() {
+	b8_refuses_unordered_pending_retirement(None, 900).await;
+}
+#[tokio::test]
+async fn b8_pending_retirement_at_equal_index_is_refused() {
+	b8_refuses_unordered_pending_retirement(Some(900), 900).await;
+}
+#[tokio::test]
+async fn b8_pending_retirement_of_newer_flight_is_refused() {
+	b8_refuses_unordered_pending_retirement(Some(901), 900).await;
+}
+#[tokio::test]
+async fn b8_pending_retirement_does_not_overwrite_another_durable_generation() {
+	let f = bootstrap_collision_fixture(false, false).await;
+	bootstrap_collision_staging(&f).await.unwrap();
+	tokio::time::timeout(Duration::from_secs(30), f.store.entered.notified())
+		.await
+		.unwrap();
+	let mut other = f.pointer.clone();
+	other.payload_hash[0] ^= 1;
+	f.manager
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.apply(PersistentIndexUpdate {
+			put_tiered_slabs: vec![other.clone()],
+			..Default::default()
+		})
+		.await
+		.unwrap();
+	let epoch = f.manager.begin_tier_snapshot_install().unwrap();
+	assert!(
+		f.manager
+			.finish_tier_snapshot_install_at_epoch(vec![], Some(900), epoch)
+			.await
+			.is_err(),
+		"B8: pending retirement must refuse a different durable generation"
+	);
+	assert_eq!(
+		f.manager
+			.persistent_index
+			.as_ref()
+			.unwrap()
+			.load_snapshot()
+			.await
+			.unwrap()
+			.tiered_slabs,
+		vec![other]
+	);
+}
+fn b8_pending_config(
+	dir: PathBuf,
+	crypto: Arc<CryptoManager>,
+	l2: Arc<dyn ObjectStore>,
+) -> SlabManagerConfig {
+	SlabManagerConfig {
+		dir,
+		max_slab_bytes: 1 << 20,
+		io: spawn_io_thread(64).unwrap(),
+		l2: Some(l2),
+		rehydration: RehydrationPolicy::default(),
+		l2_column_fetch: Default::default(),
+		row_group_writer: Default::default(),
+		l2_row_group_fetch: Default::default(),
+		encoding_writer: Default::default(),
+		l2_chunk_layout: Default::default(),
+		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
+		group_commit: GroupCommitConfig::default(),
+		crypto,
+	}
+}
+async fn b8_fresh_pending_target(
+	missing_cleanup: bool,
+) -> (
+	[crate::test_support::TestDir; 2],
+	crate::test_support::TestDir,
+	Arc<SlabManager>,
+	Arc<PausedAuthorityStore>,
+	TieredSlabPointer,
+) {
+	let (dirs, source, l2) = fresh_manager_with_l2("b8-source").await;
+	source
+		.append_durable(tenant(), id(0xb801), hlc(1), b"pending-retirement")
+		.await
+		.unwrap();
+	let pointer = tier_kv_slab(&source, &l2, "b8/pending-object").await;
+	let crypto = source.config.crypto.clone();
+	let store = Arc::new(PausedAuthorityStore {
+		inner: l2,
+		paused: AtomicBool::new(true),
+		fetches: Default::default(),
+		entered: Default::default(),
+		released: tokio::sync::Semaphore::new(0),
+	});
+	let target_dir = fresh_dir("b8-target");
+	let mut target = SlabManager::initialize_new_store(b8_pending_config(
+		target_dir.to_path_buf(),
+		crypto.clone(),
+		store.clone(),
+	))
+	.await
+	.unwrap();
+	if missing_cleanup {
+		target
+			.persistent_index
+			.as_ref()
+			.unwrap()
+			.remove_cleanup_table_for_test()
+			.await
+			.unwrap();
+		drop(target);
+		target = SlabManager::open(b8_pending_config(
+			target_dir.to_path_buf(),
+			crypto,
+			store.clone(),
+		))
+		.await
+		.unwrap();
+		assert!(target.require_cleanup_authority().is_err());
+	}
+	target
+		.stage_bootstrap_tier_authority(pointer.clone(), Some(101), pointer.slab_id)
+		.await
+		.unwrap();
+	tokio::time::timeout(Duration::from_secs(30), store.entered.notified())
+		.await
+		.unwrap();
+	assert!(target.tier_pointer(pointer.slab_id).await.is_none());
+	(dirs, target_dir, target, store, pointer)
+}
+#[tokio::test]
+async fn b8_pending_retirement_stage_crash_reopens_fenced_and_finishes() {
+	let (_dirs, target_dir, target, store, pointer) = b8_fresh_pending_target(false).await;
+	let crypto = target.config.crypto.clone();
+	let old_bytes = store.inner.get(&pointer.l2_uri).await.unwrap();
+	let pause = target.pause_snapshot_before_retirement_apply_once();
+	let epoch = target.begin_tier_snapshot_install().unwrap();
+	let mut comparison = {
+		let target = target.clone();
+		tokio::spawn(async move {
+			target
+				.finish_tier_snapshot_install_at_epoch(vec![], Some(900), epoch)
+				.await
+		})
+	};
+	tokio::select! {
+		reached = tokio::time::timeout(Duration::from_secs(30), pause.reached.notified()) => reached.unwrap(),
+		result = &mut comparison => panic!("B8 did not reach retirement cut: {result:?}"),
+	}
+	let index = target.persistent_index.as_ref().unwrap();
+	assert_eq!(
+		index.load_snapshot_retirement_marks().await.unwrap().len(),
+		1,
+		"B8: pending retirement mark must be durable before apply"
+	);
+	assert_eq!(
+		index.load_snapshot().await.unwrap().tiered_slabs,
+		vec![pointer.clone()]
+	);
+	let evidence_file = slab_path(&target_dir, pointer.slab_id);
+	let evidence_bytes = std::fs::read(&evidence_file).unwrap();
+	comparison.abort();
+	assert!(comparison.await.unwrap_err().is_cancelled());
+	let weak = Arc::downgrade(&target);
+	store.release();
+	drop(target);
+	tokio::time::timeout(Duration::from_secs(30), async {
+		while weak.upgrade().is_some() {
+			tokio::time::sleep(Duration::from_millis(10)).await;
+		}
+	})
+	.await
+	.unwrap();
+	let reopened = SlabManager::open(b8_pending_config(
+		target_dir.to_path_buf(),
+		crypto,
+		store.clone(),
+	))
+	.await
+	.unwrap();
+	assert!(reopened.lookup(tenant(), id(0xb801)).is_err());
+	reopened
+		.fence_local_tiers_absent_from_committed(&HashSet::new(), Some(900))
+		.await
+		.unwrap();
+	tokio::time::timeout(
+		Duration::from_secs(30),
+		reopened.wait_tier_authority_ready(),
+	)
+	.await
+	.unwrap()
+	.unwrap();
+	assert!(reopened.lookup(tenant(), id(0xb801)).unwrap().is_none());
+	assert!(
+		reopened
+			.persistent_index
+			.as_ref()
+			.unwrap()
+			.load_snapshot_retirement_marks()
+			.await
+			.unwrap()
+			.is_empty()
+	);
+	let records = reopened
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot_cleanup_intents()
+		.await
+		.unwrap();
+	let saved = records
+		.iter()
+		.find(|(id, uri, _)| *id == pointer.slab_id && uri == &pointer.l2_uri)
+		.unwrap();
+	assert_eq!(
+		saved.2.retirement_source,
+		Some(crate::storage::index::RetirementSource::Snapshot(900))
+	);
+	assert_eq!(
+		std::fs::read(&evidence_file).unwrap(),
+		evidence_bytes,
+		"reopen retains quarantined L1 evidence"
+	);
+	assert_eq!(store.inner.get(&pointer.l2_uri).await.unwrap(), old_bytes);
+}
+#[tokio::test]
+async fn b8_pending_retirement_without_cleanup_authority_counts_gap() {
+	let (_dirs, _target_dir, target, store, pointer) = b8_fresh_pending_target(true).await;
+	let index = target.persistent_index.as_ref().unwrap();
+	let before = index.cleanup_authority_gap_count().await.unwrap();
+	let old_bytes = store.inner.get(&pointer.l2_uri).await.unwrap();
+	let epoch = target.begin_tier_snapshot_install().unwrap();
+	target
+		.finish_tier_snapshot_install_at_epoch(vec![], Some(900), epoch)
+		.await
+		.unwrap();
+	assert!(
+		!target.tier_authority.pending.contains_key(&pointer.slab_id),
+		"B8: missing cleanup authority must not strand committed pending retirement"
+	);
+	assert_eq!(
+		index.cleanup_authority_gap_count().await.unwrap(),
+		before + 1
+	);
+	store.release();
+	tokio::time::timeout(Duration::from_secs(30), target.wait_tier_authority_ready())
+		.await
+		.unwrap()
+		.unwrap();
+	assert!(target.lookup(tenant(), id(0xb801)).unwrap().is_none());
+	assert!(target.require_cleanup_authority().is_err());
+	assert_eq!(store.inner.get(&pointer.l2_uri).await.unwrap(), old_bytes);
+}
+
+#[tokio::test]
+async fn b8_unjustified_pending_retirement_input_rolls_back() {
+	let f = bootstrap_collision_fixture(false, false).await;
+	assert!(f.manager.tier_authority.pending.is_empty());
+	let _gate = f.manager.persistent_index_gate.clone().write_owned().await;
+	let index = f.manager.persistent_index.as_ref().unwrap();
+	let before = index.load_snapshot().await.unwrap();
+	let floor = index.snapshot_retirement_epoch_floor().await.unwrap();
+	let epoch = f.manager.capture_snapshot_epoch();
+	let error = index
+		.stage_snapshot_tier_comparison_with_pending_retirements(
+			900,
+			vec![(f.pointer.clone(), 101)],
+			vec![],
+			HashSet::new(),
+			epoch,
+			f.manager.snapshot_epoch.clone(),
+			f.manager.snapshot_epoch_gate.clone(),
+		)
+		.await
+		.expect_err("an input without its captured retirement mark cannot stage a row");
+	assert_eq!(error.kind(), ErrorKind::InvalidInput);
+	assert_eq!(
+		index.load_snapshot().await.unwrap().tiered_slabs,
+		before.tiered_slabs
+	);
+	assert!(
+		index
+			.load_snapshot_retirement_marks()
+			.await
+			.unwrap()
+			.is_empty()
+	);
+	assert_eq!(
+		index.snapshot_retirement_epoch_floor().await.unwrap(),
+		floor
+	);
+	assert_eq!(std::fs::read(&f.file).unwrap(), f.bytes);
+}
+
+#[tokio::test]
+async fn b9_metadata_precommit_refusal_does_not_orphan_publication() {
+	let f = pending_authority_fixture().await;
+	tokio::time::timeout(Duration::from_secs(30), f.store.entered.notified())
+		.await
+		.unwrap();
+	let before = f
+		.manager
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot()
+		.await
+		.unwrap();
+	let pending_before = f
+		.manager
+		.tier_authority
+		.pending
+		.get(&f.pointer.slab_id)
+		.unwrap()
+		.clone();
+	assert!(
+		f.manager
+			.record_supersession_for_slab(f.pointer.slab_id, hlc(999), None)
+			.await
+			.is_err()
+	);
+	assert!(
+		!f.manager.has_orphaned_index_publications(),
+		"B9: a definite refusal before the metadata write cannot create an orphan publication"
+	);
+	assert_eq!(
+		*f.manager
+			.tier_authority
+			.pending
+			.get(&f.pointer.slab_id)
+			.unwrap(),
+		pending_before
+	);
+	assert_eq!(
+		f.manager
+			.persistent_index
+			.as_ref()
+			.unwrap()
+			.load_snapshot()
+			.await
+			.unwrap()
+			.tiered_slabs,
+		before.tiered_slabs
+	);
+	f.store.release();
+	tokio::time::timeout(
+		Duration::from_secs(30),
+		f.manager.wait_tier_authority_ready(),
+	)
+	.await
+	.unwrap()
+	.unwrap();
+	let location = f.manager.lookup(tenant(), id(0x7f62)).unwrap().unwrap();
+	assert_eq!(f.manager.read(location).await.unwrap(), b"omitted");
+}
+#[tokio::test]
+async fn b9_metadata_revision_refusal_does_not_orphan_publication() {
+	let (_dirs, mgr, l2) = fresh_manager_with_l2("b9-revision").await;
+	let key = id(0xb902);
+	mgr.append_durable(tenant(), key, hlc(1), b"revision-refusal")
+		.await
+		.unwrap();
+	let pointer = tier_kv_slab(&mgr, &l2, "b9/revision").await;
+	mgr.slab_publication_revisions
+		.insert(pointer.slab_id, u64::MAX);
+	let error = mgr
+		.record_supersession_for_slab(pointer.slab_id, hlc(999), None)
+		.await
+		.unwrap_err();
+	assert!(
+		error
+			.to_string()
+			.contains("slab publication revision exhausted")
+	);
+	assert!(
+		!mgr.has_orphaned_index_publications(),
+		"B9: revision refusal before the metadata write cannot orphan the publication"
+	);
+	assert_eq!(
+		mgr.tier_pointer(pointer.slab_id).await,
+		Some(pointer.clone())
+	);
+	assert_eq!(
+		mgr.persistent_index
+			.as_ref()
+			.unwrap()
+			.load_snapshot()
+			.await
+			.unwrap()
+			.tiered_slabs,
+		vec![pointer]
+	);
+	assert_eq!(
+		mgr.read(mgr.lookup(tenant(), key).unwrap().unwrap())
+			.await
+			.unwrap(),
+		b"revision-refusal"
+	);
+}
+async fn b9_wait_for_publication_exit(mgr: &SlabManager, slab: SlabId) {
+	tokio::time::timeout(Duration::from_secs(30), async {
+		while mgr.pending_index_publications.iter().any(|entry| {
+			entry.key().0 == slab
+				&& *entry.value() == super::index_publication::IndexPublicationState::InFlight
+		}) {
+			tokio::time::sleep(Duration::from_millis(10)).await;
+		}
+	})
+	.await
+	.unwrap();
+}
+#[tokio::test]
+async fn b9_epoch_change_after_tier_commit_mirrors_committed_generation_before_error() {
+	let f = seed_tier_refresh_fixture("b9-committed-mirror").await;
+	let mgr = &f.mgr;
+	let pointer = f.rewritten.clone();
+	let old = mgr.tier_pointer(f.slab_id).await.unwrap();
+	assert_ne!(old, pointer);
+	assert!(
+		mgr.state.lock().await.rehydrated.contains_key(&f.slab_id),
+		"fixture starts with the real old-generation L1 cache"
+	);
+	let plan = mgr
+		.build_tiered_row_refresh_plan(&pointer, Some(&old))
+		.await
+		.unwrap();
+	assert_ne!(plan.old_rows, plan.new_rows);
+	let entered = Arc::new(std::sync::Barrier::new(2));
+	let release = Arc::new(std::sync::Barrier::new(2));
+	*mgr.persistent_index
+		.as_ref()
+		.unwrap()
+		.guarded_delta_commit_hold
+		.lock()
+		.unwrap() = Some((entered.clone(), release.clone()));
+	let initial_epoch = mgr.begin_tier_snapshot_install().unwrap();
+	mgr.finish_tier_snapshot_install_at_epoch(vec![pointer.clone()], Some(900), initial_epoch)
+		.await
+		.unwrap();
+	assert!(
+		!mgr.state.lock().await.rehydrated.contains_key(&f.slab_id),
+		"registered snapshot staging quarantines the old local backing"
+	);
+	tokio::time::timeout(
+		Duration::from_secs(30),
+		tokio::task::spawn_blocking(move || entered.wait()),
+	)
+	.await
+	.unwrap()
+	.unwrap();
+	let snapshot_epoch = mgr.begin_tier_snapshot_install().unwrap();
+	*mgr.persistent_index
+		.as_ref()
+		.unwrap()
+		.guarded_delta_commit_hold
+		.lock()
+		.unwrap() = None;
+	tokio::task::spawn_blocking(move || release.wait())
+		.await
+		.unwrap();
+	b9_wait_for_publication_exit(mgr, f.slab_id).await;
+	assert_eq!(
+		mgr.tier_pointer(f.slab_id).await,
+		Some(pointer.clone()),
+		"B9: committed generation must be mirrored before an obsolete epoch is reported"
+	);
+	let actual = mgr.record_rows_for_slab_for_recovery(f.slab_id);
+	assert_eq!(actual.len(), plan.new_rows.len());
+	assert!(plan.new_rows.iter().all(|row| actual.contains(row)));
+	assert!(!mgr.has_orphaned_index_publications());
+	assert!(
+		mgr.lookup(tenant(), f.pruned).is_err(),
+		"snapshot admission still closes reads"
+	);
+	let durable = mgr
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot()
+		.await
+		.unwrap();
+	assert!(durable.tiered_slabs.contains(&pointer));
+	let durable_rows = durable
+		.record_rows
+		.iter()
+		.filter(|row| row.location.slab_id == f.slab_id)
+		.collect::<Vec<_>>();
+	assert_eq!(durable_rows.len(), plan.new_rows.len());
+	assert!(plan.new_rows.iter().all(|row| durable_rows.contains(&row)));
+	mgr.finish_tier_snapshot_install_at_epoch(vec![pointer.clone()], Some(901), snapshot_epoch)
+		.await
+		.unwrap();
+	tokio::time::timeout(Duration::from_secs(30), mgr.wait_tier_authority_ready())
+		.await
+		.unwrap()
+		.unwrap();
+	assert!(mgr.lookup(tenant(), f.pruned).unwrap().is_none());
+	assert_eq!(
+		newest_row_values(mgr, f.live.keys().copied()).await,
+		f.expected_values
+	);
+}
+#[tokio::test]
+async fn b9_obsolete_committed_republication_mirrors_retained_accounting() {
+	use crate::storage::index::{
+		RetainedObjectIntent, RetainedObjectIntentState, RetirementSource,
+	};
+	let f = bootstrap_collision_fixture(false, false).await;
+	let history_destination = "b9/old-history-destination";
+	let record = RetainedObjectIntent {
+		bytes: Some(f.store.inner.get(&f.pointer.l2_uri).await.unwrap().len() as u64),
+		replacement_uri: Some(history_destination.to_owned()),
+		replacement_bytes: None,
+		published_replacements: Default::default(),
+		retirement_source: Some(RetirementSource::Snapshot(800)),
+		state: RetainedObjectIntentState::RetirementPublished,
+	};
+	f.manager
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.put_snapshot_cleanup_intent(f.pointer.slab_id, f.pointer.l2_uri.clone(), record)
+		.await
+		.unwrap();
+	f.manager.load_unresolved_tier_cleanup().await.unwrap();
+	f.manager
+		.stage_bootstrap_tier_authority(f.pointer.clone(), Some(900), f.pointer.slab_id)
+		.await
+		.unwrap();
+	tokio::time::timeout(Duration::from_secs(30), f.store.entered.notified())
+		.await
+		.unwrap();
+	let entered = Arc::new(std::sync::Barrier::new(2));
+	let release = Arc::new(std::sync::Barrier::new(2));
+	*f.manager
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.guarded_delta_commit_hold
+		.lock()
+		.unwrap() = Some((entered.clone(), release.clone()));
+	f.store.release();
+	tokio::time::timeout(
+		Duration::from_secs(30),
+		tokio::task::spawn_blocking(move || entered.wait()),
+	)
+	.await
+	.unwrap()
+	.unwrap();
+	let epoch = f.manager.begin_tier_snapshot_install().unwrap();
+	*f.manager
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.guarded_delta_commit_hold
+		.lock()
+		.unwrap() = None;
+	tokio::task::spawn_blocking(move || release.wait())
+		.await
+		.unwrap();
+	b9_wait_for_publication_exit(&f.manager, f.pointer.slab_id).await;
+	let durable = f
+		.manager
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot_cleanup_intents()
+		.await
+		.unwrap();
+	let durable = durable
+		.iter()
+		.find(|(id, uri, _)| *id == f.pointer.slab_id && uri == &f.pointer.l2_uri)
+		.unwrap();
+	assert_eq!(
+		durable.2.retirement_source, None,
+		"committed900 revives the retired800 object"
+	);
+	let cached = f
+		.manager
+		.snapshot_retirement_evidence(f.pointer.slab_id, history_destination);
+	let cached = cached
+		.iter()
+		.find(|(uri, _)| uri == &f.pointer.l2_uri)
+		.unwrap();
+	assert_eq!(
+		cached.1.retirement_source, durable.2.retirement_source,
+		"B9: successful republication must mirror its committed retained-object accounting before reporting an obsolete epoch"
+	);
+	assert_eq!(cached.1.state, durable.2.state);
+	assert!(!f.manager.has_orphaned_index_publications());
+	f.manager
+		.finish_tier_snapshot_install_at_epoch(vec![f.pointer.clone()], Some(901), epoch)
+		.await
+		.unwrap();
+	tokio::time::timeout(
+		Duration::from_secs(30),
+		f.manager.wait_tier_authority_ready(),
+	)
+	.await
+	.unwrap()
+	.unwrap();
+	assert_eq!(
+		f.manager
+			.read(f.manager.lookup(tenant(), id(0x7f71)).unwrap().unwrap())
+			.await
+			.unwrap(),
+		b"keep"
+	);
+}
+
+#[tokio::test]
+async fn b9_cancelled_tier_commit_keeps_genuine_orphan_fence() {
+	let (_dirs, mgr, l2) = fresh_manager_with_l2("b9-cancelled").await;
+	let key = id(0xb904);
+	mgr.append_durable(tenant(), key, hlc(1), b"cancelled")
+		.await
+		.unwrap();
+	let pointer = tier_kv_slab(&mgr, &l2, "b9/cancelled").await;
+	let plan = mgr
+		.build_tiered_row_refresh_plan(&pointer, Some(&pointer))
+		.await
+		.unwrap();
+	let entered = Arc::new(std::sync::Barrier::new(2));
+	let release = Arc::new(std::sync::Barrier::new(2));
+	*mgr.persistent_index
+		.as_ref()
+		.unwrap()
+		.guarded_delta_commit_hold
+		.lock()
+		.unwrap() = Some((entered.clone(), release.clone()));
+	let epoch = mgr.tier_authority.reconcile_epoch();
+	let publication = {
+		let mgr = mgr.clone();
+		let pointer = pointer.clone();
+		tokio::spawn(async move {
+			let lock = mgr.tier_publication_lock(pointer.slab_id);
+			let _guard = lock.lock().await;
+			mgr.publish_tier_generation(&pointer, &plan, None, epoch)
+				.await
+		})
+	};
+	tokio::time::timeout(
+		Duration::from_secs(30),
+		tokio::task::spawn_blocking(move || entered.wait()),
+	)
+	.await
+	.unwrap()
+	.unwrap();
+	publication.abort();
+	assert!(publication.await.unwrap_err().is_cancelled());
+	let orphaned = mgr.has_orphaned_index_publications();
+	let answer = mgr.lookup(tenant(), key);
+	*mgr.persistent_index
+		.as_ref()
+		.unwrap()
+		.guarded_delta_commit_hold
+		.lock()
+		.unwrap() = None;
+	tokio::task::spawn_blocking(move || release.wait())
+		.await
+		.unwrap();
+	assert!(
+		orphaned,
+		"cancellation after commit still needs its genuine recovery fence"
+	);
+	assert!(answer.is_err());
+	assert!(mgr.rebuild_persistent_index().await.is_err());
+	assert!(
+		mgr.persistent_index
+			.as_ref()
+			.unwrap()
+			.load_snapshot()
+			.await
+			.unwrap()
+			.tiered_slabs
+			.contains(&pointer)
+	);
+}
+/// A manager append owns a real in-flight file write, rather than a synthetic
+/// observer error. Snapshot installation must accept its validated canonical
+/// state without making this temporary reconciliation refusal fatal to Raft.
+#[tokio::test]
+async fn b10_snapshot_install_defers_live_append_collision_without_fatal_storage_error() {
+	use crate::consensus::{TieredSlab, WendelonStateMachine};
+	use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
+	use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
+	let (_source_dirs, source, l2) = fresh_manager_with_l2("b10-source").await;
+	let key = id(0xb100);
+	source
+		.append_durable(tenant(), key, hlc(70), b"canonical-tier")
+		.await
+		.unwrap();
+	let pointer = tier_kv_slab(&source, &l2, "b10/canonical.wnd").await;
+	let dst = fresh_dir("b10-receiver");
+	let manager = SlabManager::initialize_new_store(SlabManagerConfig {
+		dir: dst.to_path_buf(),
+		max_slab_bytes: 1 << 20,
+		io: spawn_io_thread(64).unwrap(),
+		l2: Some(l2.clone()),
+		rehydration: RehydrationPolicy::default(),
+		l2_column_fetch: Default::default(),
+		row_group_writer: Default::default(),
+		l2_row_group_fetch: Default::default(),
+		encoding_writer: Default::default(),
+		l2_chunk_layout: Default::default(),
+		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
+		group_commit: GroupCommitConfig::default(),
+		crypto: source.config.crypto.clone(),
+	})
+	.await
+	.unwrap();
+	let active = Arc::clone(&manager.state.lock().await.active);
+	assert_eq!(active.slab_id(), pointer.slab_id);
+	let (entered, release) = active.hold_next_append_write_for_test();
+	let writer = {
+		let manager = manager.clone();
+		tokio::spawn(async move {
+			manager
+				.append_durable(tenant(), id(0xb101), hlc(71), b"in-flight-local")
+				.await
+		})
+	};
+	tokio::time::timeout(Duration::from_secs(60), entered.acquire())
+		.await
+		.unwrap()
+		.unwrap()
+		.forget();
+	let mut canonical = WendelonStateMachine::new();
+	canonical
+		.seed_tiered_slab_for_test(TieredSlab {
+			slab_id: pointer.slab_id,
+			l2_uri: pointer.l2_uri.clone(),
+			payload_hash: pointer.payload_hash,
+			is_encrypted: pointer.is_encrypted,
+			tenant_id: pointer.tenant_id,
+			tenant_kek_id: pointer.tenant_kek_id,
+			stats_format_version: pointer.stats_format_version,
+			stats_block_len: pointer.stats_block_len,
+			stats_block_hash128: pointer.stats_block_hash128,
+			tombstone_metadata: pointer.tombstone_metadata,
+			supersession_metadata: pointer.supersession_metadata,
+		})
+		.await;
+	RaftStateMachine::apply(
+		&mut canonical,
+		[Entry {
+			log_id: LogId::new(CommittedLeaderId::new(3, 1), 900),
+			payload: EntryPayload::Blank,
+		}],
+	)
+	.await
+	.unwrap();
+	let mut builder = RaftStateMachine::get_snapshot_builder(&mut canonical).await;
+	let built = builder.build_snapshot().await.unwrap();
+	let mut target = WendelonStateMachine::new().with_tier_observer(Arc::new(
+		crate::storage::ManagerTierObserver::new(manager.clone()),
+	));
+	let mut installing = tokio::spawn(async move {
+		let result =
+			RaftStateMachine::install_snapshot(&mut target, &built.meta, built.snapshot).await;
+		(target, result)
+	});
+	let early = tokio::time::timeout(Duration::from_secs(5), &mut installing).await;
+	let fenced_while_writing = manager.lookup(tenant(), key).is_err();
+	// Always release the actual detached write before any failing assertion.
+	release.close();
+	let append_result = tokio::time::timeout(Duration::from_secs(60), writer)
+		.await
+		.unwrap()
+		.unwrap();
+	let (mut target, installed) = match early {
+		Ok(joined) => joined.unwrap(),
+		Err(_) => installing.await.unwrap(),
+	};
+	assert!(
+		fenced_while_writing,
+		"the temporary collision must keep data reads closed"
+	);
+	installed.expect(
+		"B10: temporary live-append collision must not become a fatal snapshot storage error",
+	);
+	assert!(
+		append_result.is_ok(),
+		"the earlier durable append must drain: {append_result:?}"
+	);
+	assert_eq!(
+		target
+			.state_snapshot()
+			.await
+			.last_applied_log_id
+			.unwrap()
+			.index,
+		900
+	);
+	assert!(
+		RaftStateMachine::get_current_snapshot(&mut target)
+			.await
+			.unwrap()
+			.is_some(),
+		"canonical snapshot publication remains healthy"
+	);
+	tokio::time::timeout(Duration::from_secs(60), async {
+		loop {
+			if manager.require_tier_authority_ready().is_ok() {
+				break;
+			}
+			tokio::time::sleep(Duration::from_millis(10)).await;
+		}
+	})
+	.await
+	.expect("registered reconciliation must retry without reopen");
+	assert_eq!(manager.tier_pointer(pointer.slab_id).await, Some(pointer));
+	assert_eq!(
+		manager
+			.read(manager.lookup(tenant(), key).unwrap().unwrap())
+			.await
+			.unwrap(),
+		b"canonical-tier"
+	);
+}
+struct B10AppendFixture {
+	_source_dirs: [crate::test_support::TestDir; 2],
+	_dst: crate::test_support::TestDir,
+	manager: Arc<SlabManager>,
+	owner: DataDirectoryOwner,
+	l2: Arc<dyn ObjectStore>,
+	pointer: TieredSlabPointer,
+	target: crate::consensus::WendelonStateMachine,
+	release: Arc<tokio::sync::Semaphore>,
+	writer: Option<tokio::task::JoinHandle<std::io::Result<RecordLocation>>>,
+}
+async fn b10_append_fixture() -> B10AppendFixture {
+	use crate::consensus::{TieredSlab, WendelonStateMachine};
+	use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
+	use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
+	let (_source_dirs, source, l2) = fresh_manager_with_l2("b10-source").await;
+	let key = id(0xb100);
+	source
+		.append_durable(tenant(), key, hlc(70), b"canonical-tier")
+		.await
+		.unwrap();
+	let pointer = tier_kv_slab(&source, &l2, "b10/canonical.wnd").await;
+	let dst = fresh_dir("b10-receiver");
+	let owner = DataDirectoryOwner::acquire_existing(&dst).unwrap();
+	let manager = SlabManager::initialize_new_store_with_owner(
+		SlabManagerConfig {
+			dir: dst.to_path_buf(),
+			max_slab_bytes: 1 << 20,
+			io: spawn_io_thread(64).unwrap(),
+			l2: Some(l2.clone()),
+			rehydration: RehydrationPolicy::default(),
+			l2_column_fetch: Default::default(),
+			row_group_writer: Default::default(),
+			l2_row_group_fetch: Default::default(),
+			encoding_writer: Default::default(),
+			l2_chunk_layout: Default::default(),
+			l2_encoding_fetch: Default::default(),
+			encoding_compute: Default::default(),
+			group_commit: GroupCommitConfig::default(),
+			crypto: source.config.crypto.clone(),
+		},
+		owner.clone(),
+	)
+	.await
+	.unwrap();
+	let active = Arc::clone(&manager.state.lock().await.active);
+	assert_eq!(active.slab_id(), pointer.slab_id);
+	let (entered, release) = active.hold_next_append_write_for_test();
+	let writer = {
+		let manager = manager.clone();
+		tokio::spawn(async move {
+			manager
+				.append_durable(tenant(), id(0xb101), hlc(71), b"in-flight-local")
+				.await
+		})
+	};
+	tokio::time::timeout(Duration::from_secs(60), entered.acquire())
+		.await
+		.unwrap()
+		.unwrap()
+		.forget();
+	let mut canonical = WendelonStateMachine::new();
+	let locality = Locality::from(key).get();
+	RaftStateMachine::apply(
+		&mut canonical,
+		[Entry {
+			log_id: LogId::new(CommittedLeaderId::new(3, 1), 899),
+			payload: EntryPayload::Normal(crate::consensus::WendelonRequest::SeedMigration(
+				crate::consensus::SeedMigration {
+					entry: crate::consensus::MigrationLedgerEntry {
+						migration_id: 0xb10901,
+						range_start: locality,
+						range_end: locality,
+						from_epoch: 1,
+						to_epoch: 2,
+						logical_owner: NodeId {
+							id: 7,
+							_reserved: 0,
+						},
+						upstream_migration_id: None,
+						source_replicas: vec![NodeId {
+							id: 1,
+							_reserved: 0,
+						}],
+						migration_hlc_floor: hlc(0),
+						state: crate::consensus::MigrationState::Pending,
+						completed_by: None,
+						completed_at_hlc: None,
+					},
+				},
+			)),
+		}],
+	)
+	.await
+	.unwrap();
+
+	canonical
+		.seed_tiered_slab_for_test(TieredSlab {
+			slab_id: pointer.slab_id,
+			l2_uri: pointer.l2_uri.clone(),
+			payload_hash: pointer.payload_hash,
+			is_encrypted: pointer.is_encrypted,
+			tenant_id: pointer.tenant_id,
+			tenant_kek_id: pointer.tenant_kek_id,
+			stats_format_version: pointer.stats_format_version,
+			stats_block_len: pointer.stats_block_len,
+			stats_block_hash128: pointer.stats_block_hash128,
+			tombstone_metadata: pointer.tombstone_metadata,
+			supersession_metadata: pointer.supersession_metadata,
+		})
+		.await;
+	RaftStateMachine::apply(
+		&mut canonical,
+		[Entry {
+			log_id: LogId::new(CommittedLeaderId::new(3, 1), 900),
+			payload: EntryPayload::Blank,
+		}],
+	)
+	.await
+	.unwrap();
+	let mut builder = RaftStateMachine::get_snapshot_builder(&mut canonical).await;
+	let built = builder.build_snapshot().await.unwrap();
+	let mut target = WendelonStateMachine::new().with_tier_observer(Arc::new(
+		crate::storage::ManagerTierObserver::new(manager.clone()),
+	));
+
+	let installed =
+		RaftStateMachine::install_snapshot(&mut target, &built.meta, built.snapshot).await;
+	if installed.is_err() {
+		release.close();
+		let _ = writer.await;
+		panic!("initial temporary collision must be accepted: {installed:?}");
+	}
+	assert!(manager.require_tier_authority_ready().is_err());
+	assert!(manager.tier_authority.snapshot_retry_pending_for_test());
+	assert!(metrics().storage_tier_snapshot_reconciliation_pending.get() > 0);
+	B10AppendFixture {
+		_source_dirs,
+		_dst: dst,
+		manager,
+		owner,
+		l2,
+		pointer,
+		target,
+		release,
+		writer: Some(writer),
+	}
+}
+async fn b10_drain_append(f: &mut B10AppendFixture) {
+	f.release.close();
+	let _ = tokio::time::timeout(Duration::from_secs(60), f.writer.take().unwrap())
+		.await
+		.unwrap()
+		.unwrap();
+}
+async fn b10_ready(f: &B10AppendFixture) {
+	tokio::time::timeout(Duration::from_secs(60), async {
+		loop {
+			if f.manager.require_tier_authority_ready().is_ok() {
+				break;
+			}
+			tokio::time::sleep(Duration::from_millis(10)).await;
+		}
+	})
+	.await
+	.expect("fresh comparison and verification complete without reopen");
+	assert!(!f.manager.tier_authority.snapshot_retry_pending_for_test());
+}
+async fn b10_apply(f: &mut B10AppendFixture, request: crate::consensus::WendelonRequest) {
+	use openraft::storage::RaftStateMachine;
+	use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
+	RaftStateMachine::apply(
+		&mut f.target,
+		[Entry {
+			log_id: LogId::new(CommittedLeaderId::new(3, 1), 901),
+			payload: EntryPayload::Normal(request),
+		}],
+	)
+	.await
+	.unwrap();
+	assert_eq!(
+		f.target
+			.state_snapshot()
+			.await
+			.last_applied_log_id
+			.unwrap()
+			.index,
+		901
+	);
+}
+fn b10_tier(p: &TieredSlabPointer) -> crate::consensus::TieredSlab {
+	crate::consensus::TieredSlab {
+		slab_id: p.slab_id,
+		l2_uri: p.l2_uri.clone(),
+		payload_hash: p.payload_hash,
+		is_encrypted: p.is_encrypted,
+		tenant_id: p.tenant_id,
+		tenant_kek_id: p.tenant_kek_id,
+		stats_format_version: p.stats_format_version,
+		stats_block_len: p.stats_block_len,
+		stats_block_hash128: p.stats_block_hash128,
+		tombstone_metadata: p.tombstone_metadata,
+		supersession_metadata: p.supersession_metadata,
+	}
+}
+
+#[tokio::test]
+async fn b10_retry_uses_later_tier_slab_entry() {
+	let mut f = b10_append_fixture().await;
+	let mut next = f.pointer.clone();
+	next.l2_uri =
+		f.l2.put("b10/entry901.wnd", &f.l2.get(&next.l2_uri).await.unwrap())
+			.await
+			.unwrap();
+	b10_apply(
+		&mut f,
+		crate::consensus::WendelonRequest::TierSlab(b10_tier(&next)),
+	)
+	.await;
+	assert!(f.manager.lookup(tenant(), id(0xb100)).is_err());
+	b10_drain_append(&mut f).await;
+	b10_ready(&f).await;
+	assert_eq!(
+		f.manager.tier_pointer(next.slab_id).await,
+		Some(next.clone())
+	);
+	assert_eq!(
+		f.manager
+			.read(f.manager.lookup(tenant(), id(0xb100)).unwrap().unwrap())
+			.await
+			.unwrap(),
+		b"canonical-tier"
+	);
+	assert_eq!(
+		f.manager
+			.persistent_index
+			.as_ref()
+			.unwrap()
+			.load_snapshot()
+			.await
+			.unwrap()
+			.tiered_slabs,
+		vec![next]
+	);
+}
+
+#[tokio::test]
+async fn b10_retry_uses_later_retirement_entry() {
+	let mut f = b10_append_fixture().await;
+	let slab_id = f.pointer.slab_id;
+	b10_apply(
+		&mut f,
+		crate::consensus::WendelonRequest::RetireTieredSlab(crate::consensus::RetireTieredSlab {
+			slab_id,
+		}),
+	)
+	.await;
+	b10_drain_append(&mut f).await;
+	let before_l1 = std::fs::read(slab_path(&f._dst, slab_id)).unwrap();
+	let before_l2 = f.l2.get(&f.pointer.l2_uri).await.unwrap();
+	b10_ready(&f).await;
+	assert!(f.manager.tier_pointer(slab_id).await.is_none());
+	assert!(f.manager.lookup(tenant(), id(0xb100)).unwrap().is_none());
+	assert!(
+		f.manager
+			.persistent_index
+			.as_ref()
+			.unwrap()
+			.load_snapshot()
+			.await
+			.unwrap()
+			.tiered_slabs
+			.is_empty()
+	);
+	assert!(!f.l2.get(&f.pointer.l2_uri).await.unwrap().is_empty());
+	assert_eq!(
+		std::fs::read(slab_path(&f._dst, slab_id)).unwrap(),
+		before_l1
+	);
+	assert_eq!(f.l2.get(&f.pointer.l2_uri).await.unwrap(), before_l2);
+	assert!(
+		f.manager
+			.quarantined_slab_files()
+			.files
+			.iter()
+			.any(|file| file.slab_id == slab_id)
+	);
+	assert!(f.manager.lookup(tenant(), id(0xb101)).unwrap().is_none());
+	let new = f
+		.manager
+		.append_durable(tenant(), id(0xb102), hlc(72), b"new-id")
+		.await
+		.unwrap();
+	assert!(new.slab_id > slab_id);
+	assert_eq!(f.manager.read(new).await.unwrap(), b"new-id");
+}
+
+#[tokio::test]
+async fn b10_retry_uses_later_metadata_entry() {
+	let mut f = b10_append_fixture().await;
+	let locality = Locality::from(id(0xb100)).get();
+	let tombstone = crate::consensus::MigrationComplete {
+		migration_id: 0xb10901,
+		range_start: locality,
+		range_end: locality,
+		to_epoch: 2,
+		completed_by: NodeId {
+			id: 7,
+			_reserved: 0,
+		},
+		completed_at_hlc: hlc(80),
+		migration_hlc_floor: hlc(0),
+	};
+	b10_apply(
+		&mut f,
+		crate::consensus::WendelonRequest::MigrationComplete(tombstone),
+	)
+	.await;
+	assert_eq!(f.target.state_snapshot().await.tombstones.len(), 1);
+	b10_drain_append(&mut f).await;
+	b10_ready(&f).await;
+	let actual = f.manager.tier_pointer(f.pointer.slab_id).await.unwrap();
+	assert_eq!(actual.tombstone_metadata, TombstoneMetadata::Untracked);
+	assert_eq!(actual.l2_uri, f.pointer.l2_uri);
+}
+
+#[tokio::test]
+async fn b10_newer_snapshot_supersedes_only_the_old_retry_fence() {
+	use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
+	use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
+	let mut f = b10_append_fixture().await;
+	let old_epoch = f.manager.capture_snapshot_epoch();
+	let mut canonical = crate::consensus::WendelonStateMachine::new();
+	let mut next = f.pointer.clone();
+	next.l2_uri =
+		f.l2.put(
+			"b10/snapshot901.wnd",
+			&f.l2.get(&next.l2_uri).await.unwrap(),
+		)
+		.await
+		.unwrap();
+	canonical.seed_tiered_slab_for_test(b10_tier(&next)).await;
+	RaftStateMachine::apply(
+		&mut canonical,
+		[Entry {
+			log_id: LogId::new(CommittedLeaderId::new(3, 1), 901),
+			payload: EntryPayload::Blank,
+		}],
+	)
+	.await
+	.unwrap();
+	let mut builder = RaftStateMachine::get_snapshot_builder(&mut canonical).await;
+	let built = builder.build_snapshot().await.unwrap();
+	RaftStateMachine::install_snapshot(&mut f.target, &built.meta, built.snapshot)
+		.await
+		.unwrap();
+	let epoch = f.manager.capture_snapshot_epoch();
+	assert!(epoch > old_epoch);
+	assert_eq!(f.manager.tier_authority.snapshot_fence_count_for_test(), 1);
+	// A late old completion cannot release the newer epoch's fence.
+	f.manager
+		.tier_authority
+		.release_snapshot_fence_for_test(old_epoch);
+	assert_eq!(f.manager.tier_authority.snapshot_fence_count_for_test(), 1);
+	assert!(f.manager.lookup(tenant(), id(0xb100)).is_err());
+	b10_drain_append(&mut f).await;
+	b10_ready(&f).await;
+	assert_eq!(f.manager.tier_pointer(next.slab_id).await, Some(next));
+	assert_eq!(f.manager.tier_authority.snapshot_fence_count_for_test(), 0);
+	assert!(
+		RaftStateMachine::get_current_snapshot(&mut f.target)
+			.await
+			.unwrap()
+			.is_some()
+	);
+}
+
+#[tokio::test]
+async fn b10_integrity_failure_during_retry_never_exposes_ready() {
+	let mut f = b10_append_fixture().await;
+	f.manager
+		.tier_authority
+		.conflict_for_test(f.pointer.slab_id, 900);
+	b10_drain_append(&mut f).await;
+	assert!(f.manager.wait_tier_authority_ready().await.is_err());
+	assert!(f.manager.lookup(tenant(), id(0xb100)).is_err());
+	assert!(f.manager.tier_pointer(f.pointer.slab_id).await.is_none());
+	assert_eq!(
+		f.manager.tier_authority.integrity_error().unwrap().kind(),
+		std::io::ErrorKind::InvalidData
+	);
+}
+
+#[tokio::test]
+async fn b10_owner_close_stops_queued_snapshot_retry_without_late_publication() {
+	let mut f = b10_append_fixture().await;
+	let owner = f.owner.clone();
+	let closing = tokio::spawn(async move { owner.close(Duration::from_secs(10)).await });
+	tokio::time::timeout(Duration::from_secs(60), async {
+		while !f.manager.tier_authority.closed_for_test() {
+			tokio::task::yield_now().await;
+		}
+	})
+	.await
+	.unwrap();
+	b10_drain_append(&mut f).await;
+	tokio::time::timeout(Duration::from_secs(60), closing)
+		.await
+		.unwrap()
+		.unwrap()
+		.unwrap();
+	assert!(!f.manager.tier_authority.snapshot_retry_pending_for_test());
+	assert!(f.manager.tier_pointer(f.pointer.slab_id).await.is_none());
+	assert!(f.manager.require_tier_authority_ready().is_err());
+	tokio::time::sleep(Duration::from_millis(300)).await;
+	assert!(f.manager.tier_pointer(f.pointer.slab_id).await.is_none());
+	assert!(f.manager.tier_authority.joined_for_test().await);
+}
+
+/// A deliberately unidentified observer refusal pins the conservative storage
+/// adapter contract; unlike the positive control this is synthetic by design.
+struct B10UnknownObserver(Arc<SlabManager>);
+#[async_trait::async_trait]
+impl crate::consensus::TierObserver for B10UnknownObserver {
+	fn before_tier_snapshot_install(&self) -> std::io::Result<u64> {
+		self.0.begin_tier_snapshot_install()
+	}
+	async fn on_tier_snapshot_installed(
+		&self,
+		_tiers: &[crate::consensus::TieredSlab],
+		_index: Option<u64>,
+		_epoch: u64,
+	) -> std::io::Result<()> {
+		Err(std::io::Error::other(
+			"B10 unidentified reconciliation failure",
+		))
+	}
+	async fn on_slab_tiered(
+		&self,
+		_tier: &crate::consensus::TieredSlab,
+		_index: u64,
+	) -> std::io::Result<()> {
+		Ok(())
+	}
+}
+#[tokio::test]
+async fn b10_unidentified_snapshot_reconciliation_error_is_still_fatal() {
+	use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
+	use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
+	let (_dir, manager) = fresh_manager().await;
+	let mut canonical = crate::consensus::WendelonStateMachine::new();
+	RaftStateMachine::apply(
+		&mut canonical,
+		[Entry {
+			log_id: LogId::new(CommittedLeaderId::new(3, 1), 900),
+			payload: EntryPayload::Blank,
+		}],
+	)
+	.await
+	.unwrap();
+	let mut builder = RaftStateMachine::get_snapshot_builder(&mut canonical).await;
+	let built = builder.build_snapshot().await.unwrap();
+	let mut target = crate::consensus::WendelonStateMachine::new()
+		.with_tier_observer(Arc::new(B10UnknownObserver(manager.clone())));
+	let error = RaftStateMachine::install_snapshot(&mut target, &built.meta, built.snapshot)
+		.await
+		.unwrap_err();
+	assert!(
+		error
+			.to_string()
+			.contains("B10 unidentified reconciliation failure")
+	);
+	assert!(
+		RaftStateMachine::get_current_snapshot(&mut target)
+			.await
+			.is_err()
+	);
+	assert!(manager.require_tier_authority_ready().is_err());
+}
+#[tokio::test]
+async fn b10_publication_lease_excludes_a_later_canonical_writer() {
+	use openraft::storage::RaftStateMachine;
+	use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
+	let mut f = b10_append_fixture().await;
+	let lock = f.manager.tier_publication_lock(f.pointer.slab_id);
+	let guard = lock.lock().await;
+	b10_drain_append(&mut f).await;
+	let mut next = f.pointer.clone();
+	next.l2_uri =
+		f.l2.put(
+			"b10/publication901.wnd",
+			&f.l2.get(&next.l2_uri).await.unwrap(),
+		)
+		.await
+		.unwrap();
+	let entered = Arc::new(std::sync::Barrier::new(2));
+	let release = Arc::new(std::sync::Barrier::new(2));
+	*f.manager
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.guarded_delta_commit_hold
+		.lock()
+		.unwrap() = Some((entered.clone(), release.clone()));
+	drop(guard);
+	tokio::time::timeout(
+		Duration::from_secs(60),
+		tokio::task::spawn_blocking(move || entered.wait()),
+	)
+	.await
+	.unwrap()
+	.unwrap();
+	let mut later = f.target.clone();
+	let tier = b10_tier(&next);
+	let applying = tokio::spawn(async move {
+		RaftStateMachine::apply(
+			&mut later,
+			[Entry {
+				log_id: LogId::new(CommittedLeaderId::new(3, 1), 901),
+				payload: EntryPayload::Normal(crate::consensus::WendelonRequest::TierSlab(tier)),
+			}],
+		)
+		.await
+	});
+	let queued = tokio::time::timeout(Duration::from_secs(5), async {
+		loop {
+			if f.target.try_tiered_slab(next.slab_id).is_err() {
+				break;
+			}
+			tokio::task::yield_now().await;
+		}
+	})
+	.await;
+	let fenced = f.manager.require_tier_authority_ready().is_err();
+	// Release the actual redb barrier before any assertion can panic.
+	// This seam clones its hold rather than consuming it. The next901
+	// publication must not enter the same two-party barrier a second time.
+	*f.manager
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.guarded_delta_commit_hold
+		.lock()
+		.unwrap() = None;
+	tokio::task::spawn_blocking(move || release.wait())
+		.await
+		.unwrap();
+	applying.await.unwrap().unwrap();
+	assert!(
+		queued.is_ok(),
+		"canonical writer queues behind the verified publication lease"
+	);
+	assert!(fenced);
+	b10_ready(&f).await;
+	assert_eq!(
+		f.target
+			.state_snapshot()
+			.await
+			.last_applied_log_id
+			.unwrap()
+			.index,
+		901
+	);
+	assert_eq!(f.manager.tier_pointer(next.slab_id).await, Some(next));
+	assert_eq!(
+		f.manager
+			.read(f.manager.lookup(tenant(), id(0xb100)).unwrap().unwrap())
+			.await
+			.unwrap(),
+		b"canonical-tier"
+	);
+}
+
+#[tokio::test]
+async fn b10_quarantine_before_exact_retirement_clear_survives_reopen() {
+	use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
+	let mut f = b10_append_fixture().await;
+	let slab_id = f.pointer.slab_id;
+	b10_apply(
+		&mut f,
+		crate::consensus::WendelonRequest::RetireTieredSlab(crate::consensus::RetireTieredSlab {
+			slab_id,
+		}),
+	)
+	.await;
+	// Preserve a real canonical snapshot at901, as a subsequent compacted
+	// bootstrap sees it: the retired id is absent, not a replayed tier pointer.
+	let mut builder = RaftStateMachine::get_snapshot_builder(&mut f.target).await;
+	let built = builder.build_snapshot().await.unwrap();
+	assert_eq!(built.meta.last_log_id.unwrap().index, 901);
+	let entered = Arc::new(tokio::sync::Semaphore::new(0));
+	let release = Arc::new(tokio::sync::Semaphore::new(0));
+	*f.manager
+		.tier_authority
+		.snapshot_retirement_quarantine_hold
+		.lock()
+		.unwrap() = Some((entered.clone(), release));
+	let old_blob = f.l2.get(&f.pointer.l2_uri).await.unwrap();
+	b10_drain_append(&mut f).await;
+	tokio::time::timeout(Duration::from_secs(60), entered.acquire())
+		.await
+		.unwrap()
+		.unwrap()
+		.forget();
+	let old_file = std::fs::read(slab_path(&f._dst, slab_id)).unwrap();
+	assert!(
+		f.manager
+			.quarantined_slab_files()
+			.files
+			.iter()
+			.any(|file| file.slab_id == slab_id)
+	);
+	assert!(
+		f.manager
+			.tier_authority
+			.retirement_pending_for_test(slab_id, Some(901))
+	);
+	let saved = f
+		.manager
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot()
+		.await
+		.unwrap();
+	assert!(saved.tiered_slabs.iter().all(|p| p.slab_id != slab_id));
+	// Stop at the controlled crash cut: quarantine finished, Some901 clear
+	// has not executed. Cancelling/joining the owned worker prevents late work.
+	f.owner.close(Duration::from_secs(10)).await.unwrap();
+	let config = SlabManagerConfig {
+		dir: f._dst.to_path_buf(),
+		max_slab_bytes: 1 << 20,
+		io: spawn_io_thread(64).unwrap(),
+		l2: Some(f.l2.clone()),
+		rehydration: RehydrationPolicy::default(),
+		l2_column_fetch: Default::default(),
+		row_group_writer: Default::default(),
+		l2_row_group_fetch: Default::default(),
+		encoding_writer: Default::default(),
+		l2_chunk_layout: Default::default(),
+		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
+		group_commit: GroupCommitConfig::default(),
+		crypto: f.manager.config.crypto.clone(),
+	};
+	let B10AppendFixture {
+		_source_dirs,
+		_dst: dst,
+		l2,
+		pointer,
+		manager,
+		owner,
+		target,
+		..
+	} = f;
+	drop(target);
+	drop(manager);
+	drop(owner);
+	let reopened = SlabManager::open(config).await.unwrap();
+	let mut target = crate::consensus::WendelonStateMachine::new().with_tier_observer(Arc::new(
+		crate::storage::ManagerTierObserver::new(reopened.clone()),
+	));
+	RaftStateMachine::install_snapshot(&mut target, &built.meta, built.snapshot)
+		.await
+		.unwrap();
+	tokio::time::timeout(
+		Duration::from_secs(60),
+		reopened.wait_tier_authority_ready(),
+	)
+	.await
+	.unwrap()
+	.unwrap();
+	assert_eq!(
+		std::fs::read(slab_path(&dst, slab_id)).unwrap(),
+		old_file,
+		"quarantine evidence must survive reopen byte-for-byte"
+	);
+	assert!(reopened.lookup(tenant(), id(0xb100)).unwrap().is_none());
+	assert!(
+		reopened.lookup(tenant(), id(0xb101)).unwrap().is_none(),
+		"the colliding local row cannot become authoritative after reopen"
+	);
+	assert!(
+		reopened
+			.quarantined_slab_files()
+			.files
+			.iter()
+			.any(|file| file.slab_id == slab_id)
+	);
+	let next = reopened
+		.append_durable(tenant(), id(0xb103), hlc(73), b"post-reopen")
+		.await
+		.unwrap();
+	assert!(next.slab_id > slab_id);
+	assert_eq!(reopened.read(next).await.unwrap(), b"post-reopen");
+	assert_eq!(l2.get(&pointer.l2_uri).await.unwrap(), old_blob);
+}
+
+#[tokio::test]
+async fn b10_snapshot_staging_rejects_absent_noncanonical_pointer() {
+	let (_dirs, manager, l2) = fresh_manager_with_l2("b10-staging-not-canonical").await;
+	manager
+		.append_durable(tenant(), id(0xb111), hlc(10), b"canonical")
+		.await
+		.unwrap();
+	let pointer = tier_kv_slab(&manager, &l2, "b10/staging-canonical.wnd").await;
+	let mut wrong = pointer.clone();
+	wrong.slab_id = SlabId::new(99);
+	let index = manager.persistent_index.as_ref().unwrap();
+	let before = index.load_snapshot().await.unwrap();
+	let epoch = manager.capture_snapshot_epoch();
+	let gate = Arc::new(manager.persistent_index_gate.clone().write_owned().await);
+	let error = index
+		.stage_snapshot_pending_tiers(
+			vec![wrong],
+			vec![pointer],
+			epoch,
+			manager.snapshot_epoch.clone(),
+			manager.snapshot_epoch_gate.clone(),
+			gate,
+		)
+		.await
+		.unwrap_err();
+	assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+	let after = index.load_snapshot().await.unwrap();
+	assert_eq!(after.tiered_slabs, before.tiered_slabs);
+	assert_eq!(after.record_rows, before.record_rows);
+}
+
+#[tokio::test]
+async fn b10_snapshot_staging_rejects_different_existing_row_atomically() {
+	let (_dirs, manager, l2) = fresh_manager_with_l2("b10-staging-existing").await;
+	manager
+		.append_durable(tenant(), id(0xb112), hlc(10), b"canonical")
+		.await
+		.unwrap();
+	let pointer = tier_kv_slab(&manager, &l2, "b10/staging-existing-canonical.wnd").await;
+	let index = manager.persistent_index.as_ref().unwrap();
+	let mut actual = pointer.clone();
+	actual.l2_uri.push_str("-different");
+	index
+		.apply(PersistentIndexUpdate {
+			put_tiered_slabs: vec![actual],
+			..Default::default()
+		})
+		.await
+		.unwrap();
+	let mut absent = pointer.clone();
+	absent.slab_id = SlabId::new(100);
+	let before = index.load_snapshot().await.unwrap();
+	let epoch = manager.capture_snapshot_epoch();
+	let gate = Arc::new(manager.persistent_index_gate.clone().write_owned().await);
+	let error = index
+		.stage_snapshot_pending_tiers(
+			vec![absent.clone(), pointer.clone()],
+			vec![absent, pointer],
+			epoch,
+			manager.snapshot_epoch.clone(),
+			manager.snapshot_epoch_gate.clone(),
+			gate,
+		)
+		.await
+		.unwrap_err();
+	assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+	let after = index.load_snapshot().await.unwrap();
+	assert_eq!(
+		after.tiered_slabs, before.tiered_slabs,
+		"earlier absent insertion rolled back"
+	);
+	assert_eq!(after.record_rows, before.record_rows);
+}
+
+#[tokio::test]
+async fn b10_crash_after_retirement_before_append_drains_uses_durable_staging() {
+	use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
+	let mut f = b10_append_fixture().await;
+	let slab_id = f.pointer.slab_id;
+	let saved = f
+		.manager
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot()
+		.await
+		.unwrap();
+	assert!(
+		saved.tiered_slabs.contains(&f.pointer),
+		"before OpenRaft acceptance, the unverified canonical pointer is durable"
+	);
+	b10_apply(
+		&mut f,
+		crate::consensus::WendelonRequest::RetireTieredSlab(crate::consensus::RetireTieredSlab {
+			slab_id,
+		}),
+	)
+	.await;
+	let mut builder = RaftStateMachine::get_snapshot_builder(&mut f.target).await;
+	let built = builder.build_snapshot().await.unwrap();
+	let old_l2 = f.l2.get(&f.pointer.l2_uri).await.unwrap();
+	let owner = f.owner.clone();
+	let closing = tokio::spawn(async move { owner.close(Duration::from_secs(10)).await });
+	tokio::time::timeout(Duration::from_secs(60), async {
+		while !f.manager.tier_authority.closed_for_test() {
+			tokio::task::yield_now().await;
+		}
+	})
+	.await
+	.unwrap();
+	// Retry is stopped before the held file write is released; any admitted
+	// old write may drain, but no snapshot staging/retirement runs after cut.
+	b10_drain_append(&mut f).await;
+	closing.await.unwrap().unwrap();
+	let old_l1 = std::fs::read(slab_path(&f._dst, slab_id)).unwrap();
+	let config = SlabManagerConfig {
+		dir: f._dst.to_path_buf(),
+		max_slab_bytes: 1 << 20,
+		io: spawn_io_thread(64).unwrap(),
+		l2: Some(f.l2.clone()),
+		rehydration: RehydrationPolicy::default(),
+		l2_column_fetch: Default::default(),
+		row_group_writer: Default::default(),
+		l2_row_group_fetch: Default::default(),
+		encoding_writer: Default::default(),
+		l2_chunk_layout: Default::default(),
+		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
+		group_commit: GroupCommitConfig::default(),
+		crypto: f.manager.config.crypto.clone(),
+	};
+	let B10AppendFixture {
+		_source_dirs,
+		_dst: dst,
+		l2,
+		pointer,
+		manager,
+		owner,
+		target,
+		..
+	} = f;
+	drop(target);
+	drop(manager);
+	drop(owner);
+	let reopened = SlabManager::open(config).await.unwrap();
+	assert!(
+		reopened
+			.quarantined_slab_files()
+			.files
+			.iter()
+			.any(|file| file.slab_id == slab_id)
+	);
+	let mut target = crate::consensus::WendelonStateMachine::new().with_tier_observer(Arc::new(
+		crate::storage::ManagerTierObserver::new(reopened.clone()),
+	));
+	RaftStateMachine::install_snapshot(&mut target, &built.meta, built.snapshot)
+		.await
+		.unwrap();
+	tokio::time::timeout(
+		Duration::from_secs(60),
+		reopened.wait_tier_authority_ready(),
+	)
+	.await
+	.unwrap()
+	.unwrap();
+	assert!(reopened.lookup(tenant(), id(0xb100)).unwrap().is_none());
+	assert!(reopened.lookup(tenant(), id(0xb101)).unwrap().is_none());
+	assert_eq!(std::fs::read(slab_path(&dst, slab_id)).unwrap(), old_l1);
+	assert_eq!(l2.get(&pointer.l2_uri).await.unwrap(), old_l2);
+	let next = reopened
+		.append_durable(tenant(), id(0xb114), hlc(74), b"after-early-cut")
+		.await
+		.unwrap();
+	assert!(next.slab_id > slab_id);
+	assert_eq!(reopened.read(next).await.unwrap(), b"after-early-cut");
+}
+
+async fn b11_staging_lock_control(maintenance: bool) {
+	let (_dir, manager) = fresh_manager().await;
+	seed_lsm_relocation_fixture(&manager).await;
+	let worker = LsmCompactionWorker::new(LsmConfig::default(), manager.slab_pin_table()).unwrap();
+	let plan = manager
+		.pick_lsm_compaction_plan(&worker, hlc(20_000))
+		.expect("fixture plan");
+	let prepared = manager
+		.prepare_lsm_compaction_outputs(&worker, &plan)
+		.await
+		.unwrap();
+	let frames = manager
+		.read_lsm_single_row_source_frames(&plan)
+		.await
+		.unwrap();
+	let written = manager
+		.write_lsm_compaction_temp_outputs(&plan, &prepared, &frames)
+		.await
+		.unwrap();
+	assert!(!written.is_empty());
+	let digest = manager
+		.lsm_single_row_bridge_digest_summary(&plan, &prepared, &written, &frames)
+		.await
+		.unwrap();
+	let commit = worker.build_written_compaction_commit(&plan, &written, digest);
+	let output_paths = written
+		.iter()
+		.map(|run| slab_path(&manager.config.dir, run.slab_id))
+		.collect::<Vec<_>>();
+	let maintenance_guard = if maintenance {
+		Some(
+			manager
+				.maintenance_publication_gate
+				.clone()
+				.write_owned()
+				.await,
+		)
+	} else {
+		None
+	};
+	let tier_guard = if maintenance {
+		None
+	} else {
+		Some(
+			manager
+				.tier_publication_lock(plan.touched_slabs()[0])
+				.lock_owned()
+				.await,
+		)
+	};
+	let mut task = {
+		let manager = manager.clone();
+		tokio::spawn(async move {
+			manager
+				.stage_lsm_compaction_outputs(&plan, &prepared, &written, &commit, false, true)
+				.await
+		})
+	};
+	let result = tokio::time::timeout(Duration::from_secs(2), &mut task).await;
+	let waited = result.is_err();
+	let output_installed_while_locked = output_paths.iter().any(|path| path.exists());
+	drop(maintenance_guard);
+	drop(tier_guard);
+	if waited {
+		task.await.unwrap().unwrap();
+	} else {
+		result.unwrap().unwrap().unwrap();
+	}
+	assert!(
+		waited && !output_installed_while_locked,
+		"LSM staging must wait for the {} gate before output rename; waited={waited}, output_installed_while_locked={output_installed_while_locked}",
+		if maintenance {
+			"maintenance"
+		} else {
+			"input tier publication"
+		}
+	);
+}
+
+#[tokio::test]
+async fn b11_output_staging_waits_for_maintenance_publication_gate() {
+	b11_staging_lock_control(true).await;
+}
+
+#[tokio::test]
+async fn b11_output_staging_waits_for_input_tier_publication_lock() {
+	b11_staging_lock_control(false).await;
+}
+
+#[tokio::test]
+async fn b11_completed_control_install_recovers_after_crash_before_intent_clear() {
+	let (dir, manager) = fresh_manager().await;
+	let keys = seed_lsm_relocation_fixture(&manager).await;
+	let worker = LsmCompactionWorker::new(LsmConfig::default(), manager.slab_pin_table()).unwrap();
+	let plan = manager
+		.pick_lsm_compaction_plan(&worker, hlc(20_000))
+		.expect("fixture plan");
+	let progress = Arc::new(tokio::sync::Semaphore::new(0));
+	*manager.lsm_control_install_hold.lock().unwrap() = Some((
+		lsm_driver::ControlLsmInstallCut::ObserveAll,
+		progress.clone(),
+		Arc::new(tokio::sync::Semaphore::new(0)),
+	));
+	let entered = Arc::new(tokio::sync::Semaphore::new(0));
+	let release = Arc::new(tokio::sync::Semaphore::new(0));
+	*manager.lsm_after_install_hold.lock().unwrap() = Some((entered.clone(), release));
+	let mut task = {
+		let manager = manager.clone();
+		tokio::spawn(async move {
+			let committer = DirectLsmCommitter {
+				manager: manager.clone(),
+			};
+			manager
+				.run_lsm_compaction_once_via_control_ring(&worker, plan, &committer)
+				.await
+		})
+	};
+	tokio::select! {
+		result = entered.acquire() => { result.unwrap().forget(); },
+		result = &mut task => panic!("control install exited before the post-publication crash cut: {result:?}"),
+		_ = tokio::time::sleep(Duration::from_secs(60)) => { task.abort(); let _ = task.await; panic!("control install did not reach crash cut; observed_phase_count={}", progress.available_permits()); }
+	}
+	let saved = manager
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot()
+		.await
+		.unwrap();
+	assert_eq!(saved.lsm_install_intents.len(), 1);
+	let intent = &saved.lsm_install_intents[0];
+	assert_eq!(intent.kind, crate::storage::index::LsmInstallKind::Control);
+	assert!(!intent.commit.slabs_to_add.is_empty());
+	assert!(intent.commit.slabs_to_add.iter().all(|run| {
+		saved
+			.lsm_runs
+			.iter()
+			.any(|saved| saved.slab_id == run.slab_id && saved.state.is_live())
+	}));
+	assert!(saved.record_rows.iter().any(|row| {
+		intent
+			.commit
+			.slabs_to_add
+			.iter()
+			.any(|run| run.slab_id == row.location.slab_id)
+	}));
+	let output_paths = intent
+		.commit
+		.slabs_to_add
+		.iter()
+		.map(|run| slab_path(&dir, run.slab_id))
+		.collect::<Vec<_>>();
+	assert!(output_paths.iter().all(|path| path.exists()));
+	task.abort();
+	assert!(task.await.unwrap_err().is_cancelled());
+	drop(manager);
+	let reopened = open_manager_at_dir(
+		dir.to_path_buf(),
+		spawn_io_thread(64).unwrap(),
+		test_crypto(),
+	)
+	.await;
+	assert!(
+		reopened.tier_authority_readiness_reason().is_none(),
+		"a fully published control install must recover after the crash before intent clear; reason={:?}",
+		reopened.tier_authority_readiness_reason()
+	);
+	assert!(
+		reopened
+			.persistent_index
+			.as_ref()
+			.unwrap()
+			.load_snapshot()
+			.await
+			.unwrap()
+			.lsm_install_intents
+			.is_empty()
+	);
+	assert!(output_paths.iter().all(|path| path.exists()));
+	for key in keys {
+		assert!(reopened.lookup(tenant(), key).unwrap().is_some());
+	}
+}
+
+async fn b11b_paused_control_install(
+	cut: lsm_driver::ControlLsmInstallCut,
+) -> (
+	crate::test_support::TestDir,
+	Arc<SlabManager>,
+	tokio::task::JoinHandle<Result<crate::storage::CompactionOutcome, CompactionFailure>>,
+	[Identity; 2],
+) {
+	let (dir, manager) = fresh_manager().await;
+	let keys = [id(0xb11b01), id(0xb11b02)];
+	manager
+		.append_durable(tenant(), keys[0], hlc(1), b"b11b-first")
+		.await
+		.unwrap();
+	let first = manager.force_seal_active_for_test().await;
+	manager
+		.append_durable(tenant(), keys[1], hlc(2), b"b11b-second")
+		.await
+		.unwrap();
+	let second = manager.force_seal_active_for_test().await;
+	let snapshot = manager.compaction_manifest_snapshot();
+	let plan = CompactionPlan {
+		job_id: CompactionJobId::new(0xb11b),
+		source_level: CompactionLevelIndex::L0,
+		target_level: CompactionLevelIndex::L1,
+		manifest_epoch_pre: snapshot.manifest_epoch,
+		input_slabs: vec![first, second],
+		overlapping_slabs: Vec::new(),
+		retention_floor_snapshot: hlc(100),
+		compaction_start_hlc: hlc(101),
+		dominant_reason: crate::storage::DominantReason::Operator,
+	};
+	let entered = Arc::new(tokio::sync::Semaphore::new(0));
+	let release = Arc::new(tokio::sync::Semaphore::new(0));
+	*manager.lsm_control_install_hold.lock().unwrap() = Some((cut, entered.clone(), release));
+	let mut task = {
+		let manager = manager.clone();
+		tokio::spawn(async move {
+			let worker =
+				LsmCompactionWorker::new(LsmConfig::default(), manager.slab_pin_table()).unwrap();
+			let committer = DirectLsmCommitter {
+				manager: manager.clone(),
+			};
+			manager
+				.run_lsm_compaction_once_via_control_ring(&worker, plan, &committer)
+				.await
+		})
+	};
+	tokio::select! {
+		result = entered.acquire() => { result.unwrap().forget(); },
+		result = &mut task => panic!("control install returned before {cut:?}: {result:?}"),
+		_ = tokio::time::sleep(Duration::from_secs(60)) => { task.abort(); let _ = task.await; panic!("control install did not reach {cut:?}"); }
+	}
+	(dir, manager, task, keys)
+}
+
+async fn b11b_check_crash_cut(cut: lsm_driver::ControlLsmInstallCut, resolved: bool) {
+	use lsm_driver::ControlLsmInstallCut;
+	let (dir, manager, task, keys) = b11b_paused_control_install(cut).await;
+	let saved = manager
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot()
+		.await
+		.unwrap();
+	assert_eq!(saved.lsm_install_intents.len(), 1);
+	let intent = saved.lsm_install_intents[0].clone();
+	assert_eq!(
+		intent.phase,
+		if resolved {
+			crate::storage::index::LsmInstallPhase::OutputsPublished
+		} else {
+			crate::storage::index::LsmInstallPhase::Prepared
+		}
+	);
+	assert!(!intent.local_input_runs.is_empty());
+	assert_ne!(intent.local_input_rows_digest, [0; 32]);
+	assert_eq!(
+		intent.local_output_files.len(),
+		intent.commit.slabs_to_add.len()
+	);
+	for output in &intent.local_output_files {
+		assert_eq!(
+			slab_path(&dir, output.slab_id).exists(),
+			cut != ControlLsmInstallCut::BeforeRename
+		);
+	}
+	let retained = intent
+		.local_input_files
+		.iter()
+		.chain(&intent.local_output_files)
+		.filter_map(|file| {
+			let path = slab_path(&dir, file.slab_id);
+			path.exists().then(|| {
+				let bytes = std::fs::read(&path).unwrap();
+				(path, bytes)
+			})
+		})
+		.collect::<Vec<_>>();
+	task.abort();
+	assert!(task.await.unwrap_err().is_cancelled());
+	assert_eq!(manager.control_lsm_intent_metrics_for_test(), (1, 0));
+	drop(manager);
+	let reopened = open_manager_at_dir(
+		dir.to_path_buf(),
+		spawn_io_thread(64).unwrap(),
+		test_crypto(),
+	)
+	.await;
+	let after = reopened
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot()
+		.await
+		.unwrap();
+	if resolved {
+		assert!(reopened.tier_authority_readiness_reason().is_none());
+		assert!(after.lsm_install_intents.is_empty());
+		for (key, bytes) in keys
+			.into_iter()
+			.zip([b"b11b-first".as_slice(), b"b11b-second".as_slice()])
+		{
+			let location = reopened.lookup(tenant(), key).unwrap().unwrap();
+			assert!(
+				intent
+					.commit
+					.slabs_to_add
+					.iter()
+					.any(|run| run.slab_id == location.slab_id)
+			);
+			assert_eq!(reopened.read(location).await.unwrap(), bytes);
+		}
+		assert_eq!(reopened.control_lsm_intent_metrics_for_test(), (0, 0));
+	} else {
+		assert_eq!(
+			reopened.tier_authority_readiness_reason().as_deref(),
+			Some("TierAuthorityLsmUnresolved")
+		);
+		assert_eq!(after.lsm_install_intents, vec![intent]);
+		for key in keys {
+			assert_eq!(
+				reopened.lookup(tenant(), key).unwrap_err().kind(),
+				ErrorKind::WouldBlock
+			);
+		}
+		assert_eq!(reopened.control_lsm_intent_metrics_for_test(), (1, 0));
+	}
+	for (path, bytes) in retained {
+		assert_eq!(std::fs::read(path).unwrap(), bytes);
+	}
+}
+
+#[tokio::test]
+async fn b11b_crash_before_rename_stays_fenced() {
+	b11b_check_crash_cut(lsm_driver::ControlLsmInstallCut::BeforeRename, false).await;
+}
+#[tokio::test]
+async fn b11b_crash_after_rename_before_acceptance_stays_fenced() {
+	b11b_check_crash_cut(lsm_driver::ControlLsmInstallCut::AfterRename, false).await;
+}
+#[tokio::test]
+async fn b11b_crash_after_acceptance_before_publication_stays_fenced() {
+	b11b_check_crash_cut(lsm_driver::ControlLsmInstallCut::AfterAcceptance, false).await;
+}
+#[tokio::test]
+async fn b11b_crash_after_publication_recovers_exact_rows() {
+	b11b_check_crash_cut(lsm_driver::ControlLsmInstallCut::AfterPublication, true).await;
+}
+
+// API-only negative guards supplement the actual install/crash/reopen controls.
+async fn b11b_bad_proof_refuses(kind: u8) {
+	let (dir, manager, task, _) =
+		b11b_paused_control_install(lsm_driver::ControlLsmInstallCut::AfterPublication).await;
+	task.abort();
+	assert!(task.await.unwrap_err().is_cancelled());
+	let index = manager.persistent_index.as_ref().unwrap();
+	let saved = index.load_snapshot().await.unwrap();
+	let mut bad = saved.lsm_install_intents[0].clone();
+	match kind {
+		0 => {
+			bad.commit_digest[0] ^= 1;
+		}
+		1 => {
+			bad.local_output_files[0].digest[0] ^= 1;
+		}
+		2 => {
+			bad.commit.slabs_to_add[0].sidecar_coverage = crate::storage::SidecarCoverage::Complete;
+			bad.commit_digest = *blake3::hash(&serde_json::to_vec(&bad.commit).unwrap()).as_bytes();
+		}
+		3 => {
+			bad.commit = CompactionCommit::gc_mark_delete_pending(
+				bad.commit.job_id,
+				bad.commit.manifest_epoch_pre,
+				vec![bad.inputs[0].slab_id],
+			);
+			bad.commit_digest = *blake3::hash(&serde_json::to_vec(&bad.commit).unwrap()).as_bytes();
+		}
+		_ => unreachable!(),
+	}
+	assert!(
+		!lsm_driver::reconcile_completed_control_lsm_intent(
+			manager.file_ops.as_ref(),
+			&dir,
+			index,
+			&saved,
+			&bad
+		)
+		.await
+		.unwrap()
+	);
+	assert_eq!(
+		index.load_snapshot().await.unwrap().lsm_install_intents,
+		saved.lsm_install_intents
+	);
+}
+#[tokio::test]
+async fn b11b_mismatched_commit_digest_refuses_resolution() {
+	b11b_bad_proof_refuses(0).await;
+}
+#[tokio::test]
+async fn b11b_mismatched_output_identity_refuses_resolution() {
+	b11b_bad_proof_refuses(1).await;
+}
+#[tokio::test]
+async fn b11b_sidecar_completion_remains_deferred() {
+	b11b_bad_proof_refuses(2).await;
+}
+#[tokio::test]
+async fn b11b_gc_completion_remains_deferred() {
+	b11b_bad_proof_refuses(3).await;
+}
+
+#[tokio::test]
+async fn b11b_legacy_intent_reopens_fenced_and_exports_both_gauges() {
+	let (dir, manager, task, keys) =
+		b11b_paused_control_install(lsm_driver::ControlLsmInstallCut::AfterPublication).await;
+	task.abort();
+	assert!(task.await.unwrap_err().is_cancelled());
+	let index = manager.persistent_index.as_ref().unwrap();
+	let saved = index.load_snapshot().await.unwrap();
+	let original = saved.lsm_install_intents[0].clone();
+	let mut legacy = original.clone();
+	legacy.local_input_rows_digest = [0; 32];
+	legacy.local_output_rows_digest = [0; 32];
+	legacy.local_input_runs.clear();
+	legacy.local_input_files.clear();
+	legacy.local_output_files.clear();
+	// Explicit legacy-row fixture: the old schema permits these empty fields.
+	// The live orphan scope still fences the manager during fixture replacement.
+	index.clear_lsm_install_intent(original).await.unwrap();
+	index.put_lsm_install_intent(legacy.clone()).await.unwrap();
+	drop(manager);
+	let reopened = open_manager_at_dir(
+		dir.to_path_buf(),
+		spawn_io_thread(64).unwrap(),
+		test_crypto(),
+	)
+	.await;
+	assert_eq!(
+		reopened.tier_authority_readiness_reason().as_deref(),
+		Some("TierAuthorityLsmUnresolved")
+	);
+	assert_eq!(
+		reopened
+			.persistent_index
+			.as_ref()
+			.unwrap()
+			.load_snapshot()
+			.await
+			.unwrap()
+			.lsm_install_intents,
+		vec![legacy]
+	);
+	for key in keys {
+		assert_eq!(
+			reopened.lookup(tenant(), key).unwrap_err().kind(),
+			ErrorKind::WouldBlock
+		);
+	}
+	assert_eq!(reopened.control_lsm_intent_metrics_for_test(), (1, 1));
+	// The gauges are process-wide; other tests may hold intents concurrently,
+	// so the export is checked for presence while this manager holds one.
+	let rendered = metrics().render_prometheus();
+	for name in [
+		"wendelon_storage_lsm_control_intents_unresolved",
+		"wendelon_storage_lsm_control_intents_legacy_unresolved",
+	] {
+		let value = rendered
+			.lines()
+			.find_map(|line| line.strip_prefix(name)?.strip_prefix(' '))
+			.unwrap_or_else(|| panic!("{name} not exported"));
+		assert!(value.parse::<i64>().unwrap() >= 1, "{name} {value}");
+	}
+}
+
+#[tokio::test]
+async fn b11b_changed_output_file_reopens_fenced_without_serving_rows() {
+	let (dir, manager, task, keys) =
+		b11b_paused_control_install(lsm_driver::ControlLsmInstallCut::AfterPublication).await;
+	task.abort();
+	assert!(task.await.unwrap_err().is_cancelled());
+	let saved = manager
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot()
+		.await
+		.unwrap();
+	let intent = saved.lsm_install_intents[0].clone();
+	let path = slab_path(&dir, intent.local_output_files[0].slab_id);
+	drop(manager);
+	// An actual changed backing file, as distinct from the API proof-negative
+	// control above. Recovery must retain its intent and refuse every row.
+	std::fs::write(&path, b"changed after completed publication").unwrap();
+	let reopened = open_manager_at_dir(
+		dir.to_path_buf(),
+		spawn_io_thread(64).unwrap(),
+		test_crypto(),
+	)
+	.await;
+	assert_eq!(
+		reopened.tier_authority_readiness_reason().as_deref(),
+		Some("TierAuthorityLsmUnresolved")
+	);
+	assert_eq!(
+		reopened
+			.persistent_index
+			.as_ref()
+			.unwrap()
+			.load_snapshot()
+			.await
+			.unwrap()
+			.lsm_install_intents,
+		vec![intent]
+	);
+	for key in keys {
+		assert_eq!(
+			reopened.lookup(tenant(), key).unwrap_err().kind(),
+			ErrorKind::WouldBlock
+		);
+	}
+	assert_eq!(
+		std::fs::read(path).unwrap(),
+		b"changed after completed publication"
+	);
+}
+
+/// The input-run materialization transaction only makes the durable run
+/// summaries match runs that are already live in memory. Once it commits, a
+/// later error in the same install must not leave an orphaned publication
+/// fence that holds the whole manager not-ready until reopen.
+#[tokio::test]
+async fn local_lsm_error_after_input_run_materialization_leaves_no_orphan_fence() {
+	let dir = fresh_dir("local-lsm-materialized-runs-no-orphan");
+	let crypto = test_crypto();
+	let io = spawn_io_thread(64).unwrap();
+	let manager = initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	let keys = [id(0xb12a), id(0xb12b)];
+	manager
+		.append_durable(tenant(), keys[0], hlc(1), b"one")
+		.await
+		.unwrap();
+	let first = manager.force_seal_active_for_test().await;
+	manager
+		.append_durable(tenant(), keys[1], hlc(2), b"two")
+		.await
+		.unwrap();
+	let second = manager.force_seal_active_for_test().await;
+	let index = manager.persistent_index.as_ref().unwrap();
+	let before = index.load_snapshot().await.unwrap();
+	assert!(
+		[first, second]
+			.iter()
+			.any(|slab| !before.lsm_runs.iter().any(|run| run.slab_id == *slab)),
+		"precondition: at least one input run summary is not yet durable"
+	);
+	let snapshot = manager.compaction_manifest_snapshot();
+	let plan = CompactionPlan {
+		job_id: CompactionJobId::new(0xb12a),
+		source_level: CompactionLevelIndex::L0,
+		target_level: CompactionLevelIndex::L1,
+		manifest_epoch_pre: snapshot.manifest_epoch,
+		input_slabs: vec![first, second],
+		overlapping_slabs: Vec::new(),
+		retention_floor_snapshot: hlc(100),
+		compaction_start_hlc: hlc(101),
+		dominant_reason: crate::storage::DominantReason::Operator,
+	};
+	let worker = LsmCompactionWorker::new(
+		crate::storage::LsmConfig::default(),
+		manager.slab_pin_table(),
+	)
+	.unwrap();
+	let prepared = manager
+		.prepare_lsm_compaction_outputs(&worker, &plan)
+		.await
+		.unwrap();
+	let frames = manager
+		.read_lsm_single_row_source_frames(&plan)
+		.await
+		.unwrap();
+	let written = manager
+		.write_lsm_compaction_temp_outputs(&plan, &prepared, &frames)
+		.await
+		.unwrap();
+	assert!(!written.is_empty());
+	let digest = manager
+		.lsm_single_row_bridge_digest_summary(&plan, &prepared, &written, &frames)
+		.await
+		.unwrap();
+	let commit = worker.build_written_compaction_commit(&plan, &written, digest);
+	// An I/O error while hashing the output evidence, after materialization.
+	std::fs::remove_file(&written[0].temp_path).unwrap();
+	let error = manager
+		.install_lsm_compaction_temp_outputs(&plan, &prepared, &written, &commit)
+		.await
+		.unwrap_err();
+	let after = index.load_snapshot().await.unwrap();
+	assert!(
+		[first, second]
+			.iter()
+			.all(|slab| after.lsm_runs.iter().any(|run| run.slab_id == *slab)),
+		"the materialization transaction committed before the error: {error:?}"
+	);
+	assert!(after.lsm_install_intents.is_empty());
+	assert!(
+		!manager.has_orphaned_index_publications(),
+		"a committed materialization must not be orphaned by a later error: {error:?}"
+	);
+	assert!(manager.lsm_install_unresolved.is_empty());
+	assert!(
+		manager.tier_authority_readiness_reason().is_none(),
+		"reason={:?}",
+		manager.tier_authority_readiness_reason()
+	);
+	for (key, bytes) in keys.into_iter().zip([b"one".as_slice(), b"two".as_slice()]) {
+		let location = manager.lookup(tenant(), key).unwrap().unwrap();
+		assert_eq!(manager.read(location).await.unwrap(), bytes);
+	}
+}
+
+/// Between the control evidence capture and the guarded rename, the intent is
+/// durable but nothing is renamed or proposed. A refusal there is definite: the
+/// exact intent must be cleared, not left Prepared and fenced across restart.
+#[tokio::test]
+async fn control_lsm_preflight_refusal_precedes_durable_intent_and_hold() {
+	let dir = fresh_dir("control-lsm-preflight-before-intent");
+	let io = spawn_io_thread(64).unwrap();
+	let manager = initialize_manager_at_dir(dir.to_path_buf(), io, test_crypto()).await;
+	let keys = [id(0xb13b01), id(0xb13b02)];
+	manager
+		.append_durable(tenant(), keys[0], hlc(1), b"control-one")
+		.await
+		.unwrap();
+	let first = manager.force_seal_active_for_test().await;
+	manager
+		.append_durable(tenant(), keys[1], hlc(2), b"control-two")
+		.await
+		.unwrap();
+	let second = manager.force_seal_active_for_test().await;
+	let snapshot = manager.compaction_manifest_snapshot();
+	let plan = CompactionPlan {
+		job_id: CompactionJobId::new(0xb13b),
+		source_level: CompactionLevelIndex::L0,
+		target_level: CompactionLevelIndex::L1,
+		manifest_epoch_pre: snapshot.manifest_epoch,
+		input_slabs: vec![first, second],
+		overlapping_slabs: Vec::new(),
+		retention_floor_snapshot: hlc(100),
+		compaction_start_hlc: hlc(101),
+		dominant_reason: crate::storage::DominantReason::Operator,
+	};
+	let worker = LsmCompactionWorker::new(LsmConfig::default(), manager.slab_pin_table()).unwrap();
+	let prepared = manager
+		.prepare_lsm_compaction_outputs(&worker, &plan)
+		.await
+		.unwrap();
+	let frames = manager
+		.read_lsm_single_row_source_frames(&plan)
+		.await
+		.unwrap();
+	let written = manager
+		.write_lsm_compaction_temp_outputs(&plan, &prepared, &frames)
+		.await
+		.unwrap();
+	assert!(!written.is_empty());
+	let digest = manager
+		.lsm_single_row_bridge_digest_summary(&plan, &prepared, &written, &frames)
+		.await
+		.unwrap();
+	let commit = worker.build_written_compaction_commit(&plan, &written, digest);
+	// Preflight-refusable: a sidecar-covered input without catalog context.
+	// The manifest epoch is unchanged.
+	{
+		let mut manifest =
+			recover_rwlock_write(&manager.compaction_manifest, "compaction_manifest");
+		let mut run = manifest
+			.get_run(first)
+			.expect("sealed input is in the LSM manifest")
+			.clone();
+		run.sidecar_coverage = crate::storage::SidecarCoverage::Complete;
+		manifest.insert_live_run(run);
+	}
+	assert_eq!(
+		manager.compaction_manifest_snapshot().manifest_epoch,
+		commit.manifest_epoch_pre
+	);
+	// The hold is reached only after the durable control intent is written.
+	let entered = Arc::new(tokio::sync::Semaphore::new(0));
+	let release = Arc::new(tokio::sync::Semaphore::new(0));
+	*manager.lsm_control_install_hold.lock().unwrap() = Some((
+		lsm_driver::ControlLsmInstallCut::BeforeRename,
+		entered.clone(),
+		release.clone(),
+	));
+	let mut install = {
+		let manager = manager.clone();
+		tokio::spawn(async move {
+			let committer = DirectLsmCommitter {
+				manager: manager.clone(),
+			};
+			manager
+				.install_lsm_compaction_temp_outputs_via_control_ring(
+					&plan, &prepared, &written, &commit, &committer,
+				)
+				.await
+		})
+	};
+	let index = manager.persistent_index.as_ref().unwrap();
+	// If the hold is reached, record the durable state there, then release
+	// and join the install before any assertion, so nothing is stranded.
+	let (at_hold, finished) = tokio::select! {
+		biased;
+		result = &mut install => (None, Some(result)),
+		permit = tokio::time::timeout(Duration::from_secs(60), entered.acquire()) => {
+			permit.unwrap().unwrap().forget();
+			let saved = index.load_snapshot().await.unwrap();
+			(
+				Some((saved.lsm_install_intents, manager.has_orphaned_index_publications())),
+				None,
+			)
+		}
+	};
+	release.add_permits(1);
+	let result = match finished {
+		Some(result) => result.unwrap(),
+		None => tokio::time::timeout(Duration::from_secs(60), install)
+			.await
+			.expect("the install is joined")
+			.unwrap(),
+	};
+	*manager.lsm_control_install_hold.lock().unwrap() = None;
+	assert!(
+		at_hold.is_none(),
+		"preflight refusal must precede the durable control intent and its hold: {at_hold:?}"
+	);
+	assert_eq!(entered.available_permits(), 0);
+	let saved = index.load_snapshot().await.unwrap();
+	assert!(saved.lsm_install_intents.is_empty());
+	assert!(!manager.has_orphaned_index_publications());
+	assert!(manager.lsm_install_unresolved.is_empty());
+	assert_eq!(manager.tier_authority_readiness_reason(), None);
+	assert!(
+		matches!(result, Err(CompactionFailure::SidecarDigestMismatch)),
+		"{result:?}"
+	);
+	for (key, value) in keys.iter().zip([&b"control-one"[..], b"control-two"]) {
+		let location = manager
+			.lookup(tenant(), *key)
+			.unwrap()
+			.expect("refused install leaves inputs authoritative");
+		assert_eq!(manager.read(location).await.unwrap(), value);
+	}
+}
+
+#[tokio::test]
+async fn control_lsm_refusal_before_rename_clears_its_durable_intent() {
+	let (dirs, manager, l2) = fresh_manager_with_l2("control-lsm-refusal-before-rename").await;
+	let keys = [id(0xb12b01), id(0xb12b02)];
+	manager
+		.append_durable(tenant(), keys[0], hlc(1), b"refused-first")
+		.await
+		.unwrap();
+	let first = manager.force_seal_active_for_test().await;
+	manager
+		.append_durable(tenant(), keys[1], hlc(2), b"refused-second")
+		.await
+		.unwrap();
+	let second = manager.force_seal_active_for_test().await;
+	let snapshot = manager.compaction_manifest_snapshot();
+	let plan = CompactionPlan {
+		job_id: CompactionJobId::new(0xb12b),
+		source_level: CompactionLevelIndex::L0,
+		target_level: CompactionLevelIndex::L1,
+		manifest_epoch_pre: snapshot.manifest_epoch,
+		input_slabs: vec![first, second],
+		overlapping_slabs: Vec::new(),
+		retention_floor_snapshot: hlc(100),
+		compaction_start_hlc: hlc(101),
+		dominant_reason: crate::storage::DominantReason::Operator,
+	};
+	let entered = Arc::new(tokio::sync::Semaphore::new(0));
+	let release = Arc::new(tokio::sync::Semaphore::new(0));
+	*manager.lsm_control_install_hold.lock().unwrap() = Some((
+		lsm_driver::ControlLsmInstallCut::BeforeRename,
+		entered.clone(),
+		release.clone(),
+	));
+	let task = {
+		let manager = manager.clone();
+		tokio::spawn(async move {
+			let worker =
+				LsmCompactionWorker::new(LsmConfig::default(), manager.slab_pin_table()).unwrap();
+			let committer = DirectLsmCommitter {
+				manager: manager.clone(),
+			};
+			manager
+				.run_lsm_compaction_once_via_control_ring(&worker, plan, &committer)
+				.await
+		})
+	};
+	tokio::time::timeout(Duration::from_secs(60), entered.acquire())
+		.await
+		.unwrap()
+		.unwrap()
+		.forget();
+	let index = manager.persistent_index.as_ref().unwrap();
+	let saved = index.load_snapshot().await.unwrap();
+	assert_eq!(saved.lsm_install_intents.len(), 1);
+	assert_eq!(
+		saved.lsm_install_intents[0].kind,
+		crate::storage::index::LsmInstallKind::Control
+	);
+	// A committed tier apply for one input lands in the unguarded window.
+	let raw = manager.read_sealed_raw(first).await.unwrap();
+	let encrypted = manager.encrypt_tiered_object_blob(first, &raw).unwrap();
+	let uri = l2
+		.put("control-lsm-refusal-before-rename/object", &encrypted.bytes)
+		.await
+		.unwrap();
+	let pointer = tiered_pointer_from_blob(&manager, first, uri, &encrypted.bytes);
+	// The in-flight intent fences the tier apply; the refused observer records
+	// its pointer, which changes the input authority the stage rechecks.
+	let apply = manager.apply_tier_slab(pointer).await.unwrap_err();
+	assert!(
+		stale_location(&apply).is_some_and(|stale| stale.reason == StaleLocationReason::Fenced),
+		"{apply}"
+	);
+	assert!(manager.unapplied_tier_pointers.contains_key(&first));
+	release.add_permits(1);
+	let result = tokio::time::timeout(Duration::from_secs(60), task)
+		.await
+		.unwrap()
+		.unwrap();
+	assert!(
+		matches!(result, Err(CompactionFailure::ManifestRace)),
+		"the guarded stage must refuse a changed input authority: {result:?}"
+	);
+	let outputs_renamed = index
+		.load_snapshot()
+		.await
+		.unwrap()
+		.lsm_install_intents
+		.first()
+		.map(|intent| {
+			intent
+				.commit
+				.slabs_to_add
+				.iter()
+				.any(|run| slab_path(&dirs[0], run.slab_id).exists())
+		});
+	let after = index.load_snapshot().await.unwrap();
+	assert!(
+		after.lsm_install_intents.is_empty(),
+		"a definite refusal before rename must clear its exact durable intent; renamed={outputs_renamed:?}"
+	);
+	assert!(manager.lsm_install_unresolved.is_empty());
+	assert!(!manager.has_orphaned_index_publications());
+	// What remains in-process is only the recorded tier pointer, which this
+	// direct apply carries without a control log index to resume from.
+	assert_eq!(
+		manager.tier_authority_readiness_reason().as_deref(),
+		Some("TierAuthorityFenced")
+	);
+	assert_eq!(
+		manager
+			.unapplied_tier_pointers
+			.iter()
+			.map(|entry| *entry.key())
+			.collect::<Vec<_>>(),
+		vec![first]
+	);
+	drop(manager);
+	let reopened = open_manager_at_dir(
+		dirs[0].to_path_buf(),
+		spawn_io_thread(64).unwrap(),
+		test_crypto(),
+	)
+	.await;
+	assert!(
+		reopened.tier_authority_readiness_reason().is_none(),
+		"a refused install must not fence across restart: reason={:?}",
+		reopened.tier_authority_readiness_reason()
+	);
+	for (key, bytes) in keys
+		.into_iter()
+		.zip([b"refused-first".as_slice(), b"refused-second".as_slice()])
+	{
+		let location = reopened.lookup(tenant(), key).unwrap().unwrap();
+		assert_eq!(reopened.read(location).await.unwrap(), bytes);
+	}
+}
+
+/// A pending metadata token degrades the durable pointer when a rebuild
+/// rewrites it, while the in-memory mirror keeps its advisory metadata.
+/// Retirement compares the object generation, so it still applies.
+#[tokio::test]
+async fn retirement_applies_across_pending_metadata_degradation() {
+	use crate::storage::index::MetadataKind;
+	let (_dirs, mgr, l2) = fresh_manager_with_l2("pending-metadata-degrade-retire").await;
+	let key = id(0xb14001);
+	mgr.append_durable(tenant(), key, hlc(100), b"old")
+		.await
+		.unwrap();
+	let pointer = tier_kv_slab(&mgr, &l2, "pending-metadata-degrade/object").await;
+	assert!(
+		!pointer.supersession_metadata.is_untracked(),
+		"premise: the tiered pointer starts with tracked supersession metadata"
+	);
+	let index = mgr.persistent_index.as_ref().unwrap();
+	index
+		.begin_metadata_token(pointer.slab_id, MetadataKind::Supersession)
+		.await
+		.unwrap();
+	index
+		.fail_next_delta
+		.store(true, std::sync::atomic::Ordering::Release);
+	mgr.mirror_persistent_update(PersistentIndexUpdate::default(), "test-forced-rebuild")
+		.await;
+	let durable = index
+		.load_snapshot()
+		.await
+		.unwrap()
+		.tiered_slabs
+		.into_iter()
+		.find(|stored| stored.slab_id == pointer.slab_id)
+		.unwrap();
+	assert!(
+		durable.supersession_metadata.is_untracked(),
+		"premise: the rebuild degraded the durable pointer"
+	);
+	let memory = mgr.tier_pointer(pointer.slab_id).await.unwrap();
+	assert!(
+		memory != durable && memory.same_object_generation(&durable),
+		"premise: memory and durable differ only in advisory metadata"
+	);
+	let retired = mgr.retire_tiered_slab(pointer.slab_id).await;
+	assert!(
+		matches!(retired, Ok(true)),
+		"retirement must apply to the degraded pointer: {retired:?}"
+	);
+	assert!(!mgr.is_tiered(pointer.slab_id).await);
+}
+
+/// Model a crash between a record's write and its row commit: the record's
+/// offset was never acknowledged.
+async fn forget_durable_row(dir: &std::path::Path, key: Identity, location: RecordLocation) {
+	PersistentLocalIndex::open(persistent_index_path(dir))
+		.await
+		.unwrap()
+		.forget_record_rows_for_test(|row| row.key_identity == key && row.location == location)
+		.await
+		.unwrap();
+}
+
+/// Read the durable rows directly, for a recovery that refused to open.
+async fn durable_row_present(dir: &std::path::Path, key: Identity) -> bool {
+	PersistentLocalIndex::open(persistent_index_path(dir))
+		.await
+		.unwrap()
+		.load_snapshot()
+		.await
+		.unwrap()
+		.record_rows
+		.iter()
+		.any(|row| row.key_identity == key)
+}
+
+/// Open without unwrapping, so a recovery refusal is observable.
+async fn try_open_manager_at_dir(dir: std::path::PathBuf) -> std::io::Result<Arc<SlabManager>> {
+	SlabManager::open(SlabManagerConfig {
+		dir,
+		max_slab_bytes: 1024 * 1024,
+		io: spawn_io_thread(64).unwrap(),
+		l2: None,
+		rehydration: RehydrationPolicy::default(),
+		l2_column_fetch: Default::default(),
+		row_group_writer: Default::default(),
+		l2_row_group_fetch: Default::default(),
+		encoding_writer: Default::default(),
+		l2_chunk_layout: Default::default(),
+		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
+		group_commit: GroupCommitConfig::default(),
+		crypto: test_crypto(),
+	})
+	.await
+}
+
+/// A record the node acknowledged durable is evidence. A checksum failure at
+/// its offset must fence recovery; it must never zero the record or drop its
+/// durable row.
+#[tokio::test]
+async fn corrupt_acknowledged_record_fences_recovery_instead_of_erasing_it() {
+	let dir = fresh_dir("corrupt-acknowledged-record");
+	let mgr = initialize_manager_at_dir(
+		dir.to_path_buf(),
+		spawn_io_thread(64).unwrap(),
+		test_crypto(),
+	)
+	.await;
+	let keys = [id(0xc0a1), id(0xc0a2)];
+	let first = mgr
+		.append_durable(tenant(), keys[0], hlc(1), b"acknowledged-first")
+		.await
+		.unwrap();
+	mgr.append_durable(tenant(), keys[1], hlc(2), b"acknowledged-second")
+		.await
+		.unwrap();
+	let slab = mgr.force_seal_active_for_test().await;
+	assert_eq!(first.slab_id, slab);
+	drop(mgr);
+	let path = slab_path(&dir, slab);
+	let mut bytes = std::fs::read(&path).unwrap();
+	let at = first.offset as usize + first.length as usize - 1;
+	bytes[at] ^= 0xff;
+	std::fs::write(&path, &bytes).unwrap();
+	let reopened = try_open_manager_at_dir(dir.to_path_buf()).await;
+	let reopened = match reopened {
+		Err(error) => {
+			assert_eq!(
+				error
+					.get_ref()
+					.and_then(|inner| inner
+						.downcast_ref::<crate::storage::core::DamagedAcknowledgedRecord>())
+					.map(|damaged| (damaged.slab_id, damaged.offset)),
+				Some((slab, first.offset)),
+				"the refusal must name the damaged acknowledged record: {error}"
+			);
+			assert_eq!(
+				std::fs::read(&path).unwrap(),
+				bytes,
+				"a refused recovery must not touch the slab"
+			);
+			assert!(
+				durable_row_present(&dir, keys[0]).await,
+				"a refused recovery must keep the durable row"
+			);
+			return;
+		}
+		Ok(manager) => manager,
+	};
+	let row_kept = reopened
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot()
+		.await
+		.unwrap()
+		.record_rows
+		.iter()
+		.any(|row| row.key_identity == keys[0]);
+	let bytes_kept = std::fs::read(&path).unwrap()[at] == bytes[at];
+	let lookup = reopened.lookup(tenant(), keys[0]);
+	let readiness = reopened.tier_authority_readiness_reason();
+	println!(
+		"PROBE corrupt row_kept={row_kept} bytes_kept={bytes_kept} lookup={lookup:?} readiness={readiness:?}"
+	);
+	assert!(
+		row_kept,
+		"the durable row of an acknowledged record must survive recovery"
+	);
+	assert!(bytes_kept, "recovery must not zero an acknowledged record");
+	assert!(
+		lookup.is_err() || readiness.is_some(),
+		"a corrupt acknowledged record must fence, not vanish"
+	);
+}
+
+/// A missing slab file that held untyped acknowledged rows is a published
+/// reference failure like a typed one: recovery must fence and keep the rows.
+#[tokio::test]
+async fn missing_slab_file_with_untyped_rows_fences_recovery() {
+	let dir = fresh_dir("missing-slab-untyped-rows");
+	let mgr = initialize_manager_at_dir(
+		dir.to_path_buf(),
+		spawn_io_thread(64).unwrap(),
+		test_crypto(),
+	)
+	.await;
+	let key = id(0xc0b1);
+	let location = mgr
+		.append_durable(tenant(), key, hlc(1), b"untyped-acknowledged")
+		.await
+		.unwrap();
+	let slab = mgr.force_seal_active_for_test().await;
+	assert_eq!(location.slab_id, slab);
+	mgr.append_durable(tenant(), id(0xc0b2), hlc(2), b"later")
+		.await
+		.unwrap();
+	drop(mgr);
+	std::fs::remove_file(slab_path(&dir, slab)).unwrap();
+	let reopened = try_open_manager_at_dir(dir.to_path_buf()).await;
+	let reopened = match reopened {
+		Err(error) => {
+			assert_eq!(
+				error
+					.get_ref()
+					.and_then(
+						|inner| inner.downcast_ref::<super::open::UnaccountedDurableVersions>()
+					)
+					.map(|unaccounted| unaccounted.slabs.iter().copied().collect::<Vec<_>>()),
+				Some(vec![slab]),
+				"the refusal must name the missing slab: {error}"
+			);
+			assert!(
+				durable_row_present(&dir, key).await,
+				"a refused recovery must keep the durable row"
+			);
+			return;
+		}
+		Ok(manager) => manager,
+	};
+	let row_kept = reopened
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot()
+		.await
+		.unwrap()
+		.record_rows
+		.iter()
+		.any(|row| row.key_identity == key);
+	let lookup = reopened.lookup(tenant(), key);
+	let readiness = reopened.tier_authority_readiness_reason();
+	println!("PROBE missing row_kept={row_kept} lookup={lookup:?} readiness={readiness:?}");
+	assert!(
+		row_kept,
+		"recovery must not erase the durable rows of a missing slab"
+	);
+	assert!(
+		lookup.is_err() || readiness.is_some(),
+		"a missing acknowledged slab must fence, not vanish"
+	);
+}
+
+/// Migration checks for a same-HLC copy and then appends. An ordinary durable
+/// write of different bytes to that slot in between must not leave two values
+/// in one MVCC slot, served by whichever was indexed last: the migration is
+/// refused as a typed conflict, and no value is served before or after restart.
+#[tokio::test]
+async fn migration_racing_a_same_hlc_write_refuses_instead_of_indexing_both() {
+	let dir = fresh_dir("migration-same-hlc-race");
+	let mgr = initialize_manager_at_dir(
+		dir.to_path_buf(),
+		spawn_io_thread(64).unwrap(),
+		test_crypto(),
+	)
+	.await;
+	let key = id(0xd1);
+	let slot = hlc(5);
+	let pause = mgr.pause_migration_after_same_hlc_check_once();
+	let migration = {
+		let mgr = mgr.clone();
+		tokio::spawn(async move {
+			let frame = b"migrated-x".to_vec();
+			let payload_hash = crate::hash::content::digest(&frame);
+			mgr.append_migration(1, tenant(), key, slot, payload_hash, &frame)
+				.await
+		})
+	};
+	pause.reached.notified().await;
+	let ordinary = mgr.append_durable(tenant(), key, slot, b"ordinary-y").await;
+	pause.resume.notify_one();
+	let migration = migration.await.unwrap();
+	println!(
+		"PROBE wd ordinary_ok={} migration_ok={}",
+		ordinary.is_ok(),
+		migration.is_ok()
+	);
+	assert!(
+		ordinary.is_ok(),
+		"premise: the ordinary write lands while migration is paused"
+	);
+	let refused = migration.expect_err("two different values were accepted for one MVCC slot");
+	assert!(
+		is_conflicting_version_refusal(&refused),
+		"a typed conflict: {refused}"
+	);
+	// The refused row persisted first, so its publication stays orphaned and
+	// fences the manager until restart, as for any producer that lost this race.
+	assert!(mgr.has_orphaned_index_publications());
+	assert!(
+		mgr.lookup(tenant(), key).is_err(),
+		"a fenced manager serves no value"
+	);
+	drop(mgr);
+	let reopened = open_manager_at_dir(
+		dir.to_path_buf(),
+		spawn_io_thread(64).unwrap(),
+		test_crypto(),
+	)
+	.await;
+	let served = match reopened.lookup(tenant(), key) {
+		Err(error) => Err(error),
+		Ok(Some(location)) => reopened.read(location).await,
+		Ok(None) => panic!("the acknowledged ordinary write vanished"),
+	};
+	let error = served.expect_err("after restart the conflicted slot must not serve a value");
+	assert!(
+		is_conflicting_version_refusal(&error),
+		"a typed conflict: {error}"
+	);
+}
+
+/// Page one version at a time through `scan_all_versions_from` with the cursor
+/// the data server builds from the last emitted row.
+fn migration_pages_one_at_a_time(
+	mgr: &SlabManager,
+	locality: Locality,
+) -> Vec<(TenantId, Identity, RecordLocation)> {
+	let floor: HybridTimestamp = bytemuck::Zeroable::zeroed();
+	let total = mgr
+		.scan_all_versions_from(locality, locality, floor, None)
+		.unwrap()
+		.len();
+	let mut visited = Vec::new();
+	let mut cursor = None;
+	loop {
+		let page = mgr
+			.scan_all_versions_from(locality, locality, floor, cursor)
+			.unwrap();
+		let Some(&(tenant_id, key_identity, row_locality, location)) = page.first() else {
+			break;
+		};
+		visited.push((tenant_id, key_identity, location));
+		cursor = Some(MigrationCursor {
+			locality: row_locality,
+			tenant_id,
+			key_identity,
+			hlc: location.hlc,
+		});
+		assert!(visited.len() <= total, "paging must terminate");
+	}
+	visited
+}
+
+fn migration_scan_all(
+	mgr: &SlabManager,
+	locality: Locality,
+) -> Vec<(TenantId, Identity, RecordLocation)> {
+	let floor: HybridTimestamp = bytemuck::Zeroable::zeroed();
+	mgr.scan_all_versions_from(locality, locality, floor, None)
+		.unwrap()
+		.into_iter()
+		.map(|(tenant_id, key_identity, _, location)| (tenant_id, key_identity, location))
+		.collect()
+}
+
+/// Migration pages are ordered by locality, tenant, key and HLC, but the
+/// cursor names only key and HLC. A lower tenant's larger key must not make
+/// the next page skip a higher tenant's smaller key at the same locality.
+#[tokio::test]
+async fn migration_paging_visits_a_later_tenant_with_a_smaller_key() {
+	let (_dir, mgr) = fresh_manager().await;
+	let locality = Locality::new(0x5a5a);
+	let (low_tenant, high_tenant) = (TenantId::new(7), TenantId::new(17));
+	assert!(low_tenant < high_tenant, "premise");
+	let (small_key, large_key) = if id(0xc1) < id(0xc2) {
+		(id(0xc1), id(0xc2))
+	} else {
+		(id(0xc2), id(0xc1))
+	};
+	mgr.append_durable_with_locality(low_tenant, large_key, locality, hlc(1), b"low-tenant")
+		.await
+		.unwrap();
+	mgr.append_durable_with_locality(high_tenant, small_key, locality, hlc(2), b"high-tenant")
+		.await
+		.unwrap();
+	let expected = migration_scan_all(&mgr, locality);
+	assert_eq!(expected.len(), 2, "premise: both versions are in range");
+	let visited = migration_pages_one_at_a_time(&mgr, locality);
+	println!(
+		"PROBE wc-smaller-key visited={} expected={}",
+		visited.len(),
+		expected.len()
+	);
+	assert_eq!(visited, expected, "paging skipped a tenant's version");
+}
+
+/// Two tenants may hold the same key identity at the same HLC. A cursor
+/// without the tenant cannot tell them apart and must not skip the second.
+#[tokio::test]
+async fn migration_paging_visits_both_tenants_of_an_equal_version() {
+	let (_dir, mgr) = fresh_manager().await;
+	let locality = Locality::new(0x5a5b);
+	let key = id(0xc3);
+	for (tenant_id, value) in [
+		(TenantId::new(7), b"tenant-7"),
+		(TenantId::new(17), b"tenant-x"),
+	] {
+		mgr.append_durable_with_locality(tenant_id, key, locality, hlc(3), value)
+			.await
+			.unwrap();
+	}
+	let expected = migration_scan_all(&mgr, locality);
+	assert_eq!(expected.len(), 2, "premise: both versions are in range");
+	let visited = migration_pages_one_at_a_time(&mgr, locality);
+	println!(
+		"PROBE wc-equal-version visited={} expected={}",
+		visited.len(),
+		expected.len()
+	);
+	assert_eq!(visited, expected, "paging skipped a tenant's version");
+}
+
+/// One identity can route to different localities in different tenants. The
+/// resume must use the emitted row's own locality, never one looked up for
+/// the identity across tenants.
+#[tokio::test]
+async fn migration_paging_keeps_each_tenants_locality_for_a_shared_identity() {
+	let (_dir, mgr) = fresh_manager().await;
+	let (low, high) = (Locality::new(0x5a60), Locality::new(0x5a70));
+	let key = id(0xc4);
+	mgr.append_durable_with_locality(TenantId::new(17), key, low, hlc(4), b"tenant-17-low")
+		.await
+		.unwrap();
+	mgr.append_durable_with_locality(TenantId::new(7), key, high, hlc(4), b"tenant-7-high")
+		.await
+		.unwrap();
+	let floor: HybridTimestamp = bytemuck::Zeroable::zeroed();
+	let expected = mgr.scan_all_versions_from(low, high, floor, None).unwrap();
+	assert_eq!(expected.len(), 2, "premise: both versions are in range");
+	let mut visited = Vec::new();
+	let mut cursor = None;
+	loop {
+		let page = mgr
+			.scan_all_versions_from(low, high, floor, cursor)
+			.unwrap();
+		let Some(&row) = page.first() else {
+			break;
+		};
+		let (tenant_id, key_identity, locality, location) = row;
+		visited.push(row);
+		cursor = Some(MigrationCursor {
+			locality,
+			tenant_id,
+			key_identity,
+			hlc: location.hlc,
+		});
+		assert!(visited.len() <= expected.len(), "paging must terminate");
+	}
+	assert_eq!(visited, expected, "paging skipped a tenant's version");
+}
+
+/// A manager over a filesystem model that keeps only fsynced names and synced
+/// bytes, with slabs small enough that a few 4 KiB appends rotate.
+async fn open_rotating_manager_over_faults(
+	dir: &crate::test_support::TestDir,
+) -> (Arc<FaultyFileOps>, Arc<SlabManager>) {
+	let mgr = initialize_manager_at_dir(
+		dir.to_path_buf(),
+		spawn_io_thread(64).unwrap(),
+		test_crypto(),
+	)
+	.await;
+	drop(mgr);
+	// Everything initialization left behind is durable from here on.
+	let faults = Arc::new(FaultyFileOps::new(dir.to_path_buf()).unwrap());
+	let mgr = SlabManager::open_with_file_ops(
+		SlabManagerConfig {
+			dir: dir.to_path_buf(),
+			max_slab_bytes: 16 * 1024,
+			io: spawn_io_thread(64).unwrap(),
+			l2: None,
+			rehydration: RehydrationPolicy::default(),
+			l2_column_fetch: Default::default(),
+			row_group_writer: Default::default(),
+			l2_row_group_fetch: Default::default(),
+			encoding_writer: Default::default(),
+			l2_chunk_layout: Default::default(),
+			l2_encoding_fetch: Default::default(),
+			encoding_compute: Default::default(),
+			group_commit: GroupCommitConfig::default(),
+			crypto: test_crypto(),
+		},
+		faults.clone(),
+	)
+	.await
+	.unwrap();
+	(faults, mgr)
+}
+
+/// Rotation creates the next slab file and makes it active. A record then
+/// acknowledged in it must survive power loss, so the new file's directory
+/// entry has to be durable before an acknowledgement depends on it. The
+/// filesystem model keeps only fsynced names and synced bytes; redb's own
+/// committed file is marked durable, because redb fsyncs its commits itself.
+#[tokio::test]
+async fn records_acknowledged_in_a_rotated_slab_survive_power_loss() {
+	let dir = fresh_dir("rotated-slab-power-loss");
+	let (faults, mgr) = open_rotating_manager_over_faults(&dir).await;
+	let value = vec![0x5a_u8; 4096];
+	let first = mgr
+		.append_durable(tenant(), id(0xe000), hlc(1), &value)
+		.await
+		.unwrap();
+	// Append until the production rotation path has moved the active slab.
+	let mut rotated = None;
+	for n in 1..64_u64 {
+		let key = id(0xe000 + n);
+		let location = mgr
+			.append_durable(tenant(), key, hlc(n + 1), &value)
+			.await
+			.unwrap();
+		if location.slab_id != first.slab_id {
+			rotated = Some((key, location));
+			break;
+		}
+	}
+	let (rotated_key, rotated) = rotated.expect("premise: appends rotate to a new slab");
+	faults
+		.mark_durable_for_test(&persistent_index_path(&dir))
+		.unwrap();
+	drop(mgr);
+	faults.crash().unwrap();
+	let slab_file_survived = slab_path(&dir, rotated.slab_id).exists();
+	let reopened = try_open_manager_at_dir(dir.to_path_buf()).await;
+	println!(
+		"PROBE we slab_file_survived={slab_file_survived} open={:?}",
+		reopened
+			.as_ref()
+			.map(|_| ())
+			.map_err(|error| error.to_string())
+	);
+	let reopened = reopened.expect("an acknowledged record's slab must survive power loss");
+	assert_eq!(
+		reopened.lookup(tenant(), rotated_key).unwrap(),
+		Some(rotated)
+	);
+	assert_eq!(reopened.read(rotated).await.unwrap(), value);
+}
+
+/// A rotation whose directory sync fails leaves the new slab file behind. The
+/// retried append finds the file already there; it must still make that name
+/// durable before acknowledging into it, or power loss takes the acknowledged
+/// record with the file.
+#[tokio::test]
+async fn a_rotation_retried_after_a_failed_directory_sync_survives_power_loss() {
+	let dir = fresh_dir("rotated-slab-retry-power-loss");
+	let (faults, mgr) = open_rotating_manager_over_faults(&dir).await;
+	let value = vec![0x5a_u8; 4096];
+	let first = mgr
+		.append_durable(tenant(), id(0xe100), hlc(1), &value)
+		.await
+		.unwrap();
+	let slab_dir = slab_path(&dir, first.slab_id)
+		.parent()
+		.unwrap()
+		.to_path_buf();
+	let names = || -> std::collections::BTreeSet<std::ffi::OsString> {
+		std::fs::read_dir(&slab_dir)
+			.unwrap()
+			.map(|entry| entry.unwrap().file_name())
+			.collect()
+	};
+	let before = names();
+	faults.inject(
+		InjectedFault::on(
+			FaultOp::FsyncDir,
+			FaultAction::Error {
+				kind: ErrorKind::Other,
+				message: "injected slab directory sync failure".into(),
+			},
+		)
+		.for_path(&slab_dir),
+	);
+	let mut failed = None;
+	for n in 1..64_u64 {
+		let key = id(0xe100 + n);
+		match mgr.append_durable(tenant(), key, hlc(n + 1), &value).await {
+			Ok(location) => assert_eq!(
+				location.slab_id, first.slab_id,
+				"premise: the injected sync fails the rotation"
+			),
+			Err(error) => {
+				failed = Some((key, n, error));
+				break;
+			}
+		}
+	}
+	let (key, n, error) = failed.expect("premise: appends reach a rotation");
+	let created: Vec<_> = names().difference(&before).cloned().collect();
+	assert_eq!(
+		created.len(),
+		1,
+		"premise: the failed rotation left its new slab file behind ({error})"
+	);
+	let retried = mgr
+		.append_durable(tenant(), key, hlc(n + 1), &value)
+		.await
+		.expect("the retry makes the existing slab's name durable");
+	assert_ne!(retried.slab_id, first.slab_id, "premise: the retry rotated");
+	faults
+		.mark_durable_for_test(&persistent_index_path(&dir))
+		.unwrap();
+	drop(mgr);
+	faults.crash().unwrap();
+	let slab_file_survived = slab_path(&dir, retried.slab_id).exists();
+	let reopened = try_open_manager_at_dir(dir.to_path_buf()).await;
+	println!(
+		"PROBE we-retry created={created:?} slab_file_survived={slab_file_survived} open={:?}",
+		reopened
+			.as_ref()
+			.map(|_| ())
+			.map_err(|error| error.to_string())
+	);
+	let reopened = reopened.expect("an acknowledged record's slab must survive power loss");
+	assert_eq!(reopened.lookup(tenant(), key).unwrap(), Some(retried));
+	assert_eq!(reopened.read(retried).await.unwrap(), value);
+}
+
+/// A tiered object holds the local bytes as they were uploaded, and its hash
+/// vouches only for the upload. An object an older build uploaded with an
+/// acknowledged record already damaged must make a later rewrite refuse, not
+/// walk past the record and replace the slab without it. (Tiering now refuses
+/// such bytes before upload; this covers objects that already exist.)
+#[tokio::test]
+async fn a_tiered_rewrite_refuses_a_damaged_acknowledged_record() {
+	tiered_rewrite_refuses_a_historical_damaged_object(HistoricalObject::EncryptedSkippingWriter)
+		.await;
+}
+
+#[tokio::test]
+async fn a_tiered_rewrite_refuses_a_damaged_acknowledged_record_in_a_plaintext_object() {
+	tiered_rewrite_refuses_a_historical_damaged_object(HistoricalObject::Plaintext).await;
+}
+
+/// How an older build stored the damaged slab.
+enum HistoricalObject {
+	/// Encrypted with an offset index built by the old skipping walk, so the
+	/// index omits the damaged record and every hash, HMAC and AEAD check
+	/// passes: the authenticated layout is incomplete, not invalid.
+	EncryptedSkippingWriter,
+	/// The legacy plaintext form, which carries no layout at all.
+	Plaintext,
+}
+
+async fn tiered_rewrite_refuses_a_historical_damaged_object(form: HistoricalObject) {
+	let l1_dir = fresh_dir("tiered-damaged-ack-l1");
+	let l2_root = fresh_dir("tiered-damaged-ack-l2");
+	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
+	let mgr = SlabManager::initialize_new_store(SlabManagerConfig {
+		dir: l1_dir.to_path_buf(),
+		max_slab_bytes: 1 << 20,
+		io: spawn_io_thread(64).unwrap(),
+		l2: Some(l2.clone()),
+		rehydration: RehydrationPolicy::default(),
+		l2_column_fetch: Default::default(),
+		row_group_writer: Default::default(),
+		l2_row_group_fetch: Default::default(),
+		encoding_writer: Default::default(),
+		l2_chunk_layout: Default::default(),
+		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
+		group_commit: GroupCommitConfig::default(),
+		crypto: test_crypto(),
+	})
+	.await
+	.unwrap();
+	let target = append_only_retention_descriptor(TableObjectId::new([0x51; 16]));
+	let other =
+		append_only_retention_descriptor_named(TableObjectId::new([0x52; 16]), "tier_survivor");
+	let mut schemas = TableSchemaCatalog::default();
+	schemas.upsert(tenant(), target.clone()).unwrap();
+	schemas.upsert(tenant(), other.clone()).unwrap();
+	let target_key = id(0x511);
+	let damaged_key = id(0x521);
+	let intact_key = id(0x522);
+	for (descriptor, key, at, value) in [
+		(&target, target_key, 50, 100),
+		(&other, damaged_key, 51, 200),
+		(&other, intact_key, 52, 300),
+	] {
+		let frame = encode_test_append_only_storage_frame(
+			descriptor.table_object_id,
+			&[(key, Locality::new(at), hlc(at), value, false)],
+		);
+		let entries = storage_multirow_index_entries_from_frame(&frame)
+			.unwrap()
+			.expect("table entries");
+		mgr.append_durable_multirow_with_locality(tenant(), &frame, &entries)
+			.await
+			.unwrap();
+	}
+	let damaged = mgr
+		.lookup(tenant(), damaged_key)
+		.unwrap()
+		.expect("acknowledged");
+	let slab_id = force_seal_active(&mgr).await;
+	assert_eq!(
+		damaged.slab_id, slab_id,
+		"premise: one slab holds all three"
+	);
+	// A historical object uploaded from local bytes that already held the
+	// damaged acknowledged record, and installed as an older build left it.
+	let mut raw = mgr.read_sealed_raw(slab_id).await.unwrap();
+	raw[damaged.offset as usize + damaged.length as usize - 1] ^= 0xff;
+	let (object, is_encrypted, tenant_kek_id) = match form {
+		HistoricalObject::EncryptedSkippingWriter => {
+			let mut skipped = mgr.acknowledged_offsets_in_slab(slab_id);
+			skipped.remove(&damaged.offset);
+			let encrypted = mgr
+				.encrypt_tiered_blob_with_evidence(slab_id, &raw, &skipped, None)
+				.unwrap();
+			(encrypted.bytes, true, Some(encrypted.tenant_kek_id))
+		}
+		HistoricalObject::Plaintext => (raw.clone(), false, None),
+	};
+	let uri = l2
+		.put(&format!("tier/damaged_ack_{slab_id:016x}.wnd"), &object)
+		.await
+		.unwrap();
+	{
+		let state = mgr.state.lock().await;
+		state.sealed.remove(&slab_id);
+		state.tiered.insert(
+			slab_id,
+			TieredSlabPointer {
+				slab_id,
+				l2_uri: uri.clone(),
+				payload_hash: crate::hash::content::digest(&object),
+				is_encrypted,
+				tenant_id: Some(tenant()),
+				tenant_kek_id,
+				stats_format_version: None,
+				stats_block_len: None,
+				stats_block_hash128: None,
+				tombstone_metadata: TombstoneMetadata::None,
+				supersession_metadata: SupersessionMetadata::None,
+			},
+		);
+	}
+
+	// A pointer to the same object that differs only in advisory tombstone
+	// metadata is still the indexed generation: the independent index check
+	// applies and refuses, never the object's incomplete layout.
+	if matches!(form, HistoricalObject::EncryptedSkippingWriter) {
+		let mut advisory = mgr.tier_pointer(slab_id).await.expect("installed");
+		advisory.record_tombstone_hlc(hlc(900));
+		let error = mgr
+			.build_tiered_row_refresh_plan_from_l2(&advisory)
+			.await
+			.err()
+			.expect("advisory-only change keeps the index check");
+		assert_eq!(
+			error
+				.get_ref()
+				.and_then(
+					|inner| inner.downcast_ref::<crate::storage::core::DamagedAcknowledgedRecord>()
+				)
+				.map(|record| record.offset),
+			Some(damaged.offset),
+			"{error}"
+		);
+	}
+	let committer = DirectTierCommitter {
+		manager: mgr.clone(),
+	};
+	let result = mgr
+		.reclaim_table_drop_tiered_storage(tenant(), &target, &schemas, &committer, usize::MAX)
+		.await;
+	let pointer_after = mgr.tier_pointer(slab_id).await.map(|p| p.l2_uri);
+	println!(
+		"PROBE wa2 reclaim={:?} pointer_moved={} damaged_lookup={:?} intact_lookup={:?}",
+		result
+			.as_ref()
+			.map(|report| (report.compacted_slabs, report.reclaimed_records)),
+		pointer_after.as_ref() != Some(&uri),
+		mgr.lookup(tenant(), damaged_key)
+			.unwrap()
+			.map(|l| (l.slab_id, l.offset)),
+		mgr.lookup(tenant(), intact_key)
+			.unwrap()
+			.map(|l| (l.slab_id, l.offset)),
+	);
+	let error = result.expect_err("a rewrite must refuse a damaged acknowledged record");
+	assert_eq!(
+		error
+			.get_ref()
+			.and_then(
+				|inner| inner.downcast_ref::<crate::storage::core::DamagedAcknowledgedRecord>()
+			)
+			.map(|record| (record.slab_id, record.offset)),
+		Some((slab_id, damaged.offset)),
+		"the refusal must name the damaged acknowledged record: {error}"
+	);
+	assert_eq!(
+		pointer_after,
+		Some(uri),
+		"a refused rewrite keeps the old object"
+	);
+	assert_eq!(
+		mgr.lookup(tenant(), damaged_key).unwrap(),
+		Some(damaged),
+		"a refused rewrite keeps the acknowledged row"
+	);
+}
+
+/// The blob walk must account for every acknowledged offset, including one it
+/// never reaches: bytes that end at, or partway into the first page of, an
+/// acknowledged record are a damaged slab, not a shorter one.
+#[tokio::test]
+async fn blob_recovery_refuses_an_acknowledged_record_past_the_bytes() {
+	let dir = fresh_dir("blob-ack-past-end");
+	let crypto = test_crypto();
+	let io = spawn_io_thread(64).unwrap();
+	let manager = initialize_manager_at_dir(dir.to_path_buf(), io, crypto).await;
+	let page = crate::storage::io_uring::DIRECT_IO_ALIGN;
+	let first = manager
+		.append_durable(tenant(), id(0x9920), hlc(120), b"first")
+		.await
+		.unwrap();
+	let last = manager
+		.append_durable(tenant(), id(0x9921), hlc(121), b"last")
+		.await
+		.unwrap();
+	assert_eq!(last.slab_id, first.slab_id, "premise: one slab");
+	drop(manager);
+	let bytes = std::fs::read(slab_path(&dir, first.slab_id)).unwrap();
+	let evidence = BTreeSet::from([first.offset, last.offset]);
+	let outcomes = [
+		("ends at the record", last.offset as usize),
+		(
+			"ends inside its first page",
+			last.offset as usize + page - 1,
+		),
+	]
+	.map(|(name, len)| {
+		let result = recover_slab_entries_from_blob(&bytes[..len], first.slab_id, &evidence);
+		let refused = result.as_ref().err().and_then(|error| {
+			error
+				.get_ref()
+				.and_then(|inner| {
+					inner.downcast_ref::<crate::storage::core::DamagedAcknowledgedRecord>()
+				})
+				.map(|record| (record.slab_id, record.offset))
+		});
+		println!(
+			"PROBE wa2-past-end {name}: {:?}",
+			result
+				.as_ref()
+				.map(|entries| entries.len())
+				.map_err(|error| error.to_string())
+		);
+		(name, refused)
+	});
+	// Both outcomes are collected before asserting, so each case reports.
+	for (name, refused) in outcomes {
+		assert_eq!(
+			refused,
+			Some((first.slab_id, last.offset)),
+			"{name}: the walk must refuse, naming the unreached record"
+		);
+	}
+	// Control: the whole slab, and the strict walk without evidence, still pass.
+	assert_eq!(
+		recover_slab_entries_from_blob(&bytes, first.slab_id, &evidence)
+			.unwrap()
+			.len(),
+		2
+	);
+	assert!(
+		recover_slab_entries_from_blob(
+			&bytes[..last.offset as usize],
+			first.slab_id,
+			&BTreeSet::new()
+		)
+		.is_ok()
+	);
+}
+
+/// A real retention rewrite moves its survivors to new offsets under the same
+/// slab id. Staged as committed authority while the old generation is still
+/// published, the replacement is verified with its own authenticated layout,
+/// not the index's offsets for the old one, and serves exactly its survivors.
+#[tokio::test]
+async fn the_recovery_verifier_walks_a_moved_replacement_with_its_own_layout() {
+	let fixture = seed_prepared_rewrite_fixture("verifier-moved-replacement").await;
+	let mgr = &fixture.mgr;
+	let (bytes, tombstone_metadata, supersession_metadata) =
+		prepare_production_retention_rewrite(mgr, &fixture.pointer).await;
+	let uri = fixture
+		.l2
+		.put("tier/verifier-moved-replacement-new.wnd", &bytes)
+		.await
+		.unwrap();
+	let replacement = TieredSlabPointer {
+		tombstone_metadata,
+		supersession_metadata,
+		..tiered_pointer_from_blob(mgr, fixture.pointer.slab_id, uri, &bytes)
+	};
+	let old_offsets = mgr.acknowledged_offsets_in_slab(fixture.pointer.slab_id);
+	assert_eq!(
+		mgr.tier_pointer(fixture.pointer.slab_id).await.as_ref(),
+		Some(&fixture.pointer),
+		"premise: the old generation is published"
+	);
+	// The replacement arrives as committed state in a snapshot, so the
+	// recovery verifier, not live publication, brings it in.
+	{
+		use crate::consensus::{TieredSlab, WendelonStateMachine};
+		use crate::storage::sweeper::ManagerTierObserver;
+		use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
+		use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
+		let mut source = WendelonStateMachine::new();
+		source
+			.seed_tiered_slab_for_test(TieredSlab {
+				slab_id: replacement.slab_id,
+				l2_uri: replacement.l2_uri.clone(),
+				payload_hash: replacement.payload_hash,
+				is_encrypted: replacement.is_encrypted,
+				tenant_id: replacement.tenant_id,
+				tenant_kek_id: replacement.tenant_kek_id,
+				stats_format_version: replacement.stats_format_version,
+				stats_block_len: replacement.stats_block_len,
+				stats_block_hash128: replacement.stats_block_hash128,
+				tombstone_metadata: replacement.tombstone_metadata,
+				supersession_metadata: replacement.supersession_metadata,
+			})
+			.await;
+		RaftStateMachine::apply(
+			&mut source,
+			[Entry {
+				log_id: LogId::new(CommittedLeaderId::new(3, 1), 706),
+				payload: EntryPayload::Blank,
+			}],
+		)
+		.await
+		.unwrap();
+		let mut builder = RaftStateMachine::get_snapshot_builder(&mut source).await;
+		let built = builder.build_snapshot().await.unwrap();
+		let mut target = WendelonStateMachine::new()
+			.with_tier_observer(Arc::new(ManagerTierObserver::new(fixture.mgr.clone())));
+		RaftStateMachine::install_snapshot(&mut target, &built.meta, built.snapshot)
+			.await
+			.unwrap();
+	}
+	tokio::time::timeout(Duration::from_secs(60), mgr.wait_tier_authority_ready())
+		.await
+		.expect("verification finishes")
+		.expect("a moved replacement verifies with its own layout");
+	assert_eq!(
+		mgr.tier_pointer(fixture.pointer.slab_id).await.as_ref(),
+		Some(&replacement),
+		"the verified replacement is published"
+	);
+	assert_ne!(
+		mgr.acknowledged_offsets_in_slab(fixture.pointer.slab_id),
+		old_offsets,
+		"premise: the survivors moved"
+	);
+	for (key, (_, bytes)) in &fixture.expected {
+		let location = mgr
+			.lookup(tenant(), *key)
+			.unwrap()
+			.expect("survivor indexed");
+		assert_eq!(&mgr.read(location).await.unwrap(), bytes, "{key} survives");
+	}
+	assert!(
+		mgr.lookup_as_of(tenant(), id(0x6501), hlc(15))
+			.unwrap()
+			.is_none(),
+		"premise: the rewrite pruned x@10"
+	);
+}
+
+/// A replacement whose offset index was altered fails the surface HMAC that
+/// binds it: the refresh refuses before any row moves.
+#[tokio::test]
+async fn a_replacement_with_an_altered_offset_index_refuses_without_moving_rows() {
+	let fixture = seed_prepared_rewrite_fixture("altered-offset-index").await;
+	let mgr = &fixture.mgr;
+	let (mut bytes, tombstone_metadata, supersession_metadata) =
+		prepare_production_retention_rewrite(mgr, &fixture.pointer).await;
+	// The index stores each row's 16-byte key locator before its offset; the
+	// plaintext around it is encrypted, so the locator appears only there.
+	let locator = IdentityPrefix::from(id(0x6502));
+	let at = bytes
+		.windows(16)
+		.position(|window| window == locator.as_bytes())
+		.expect("premise: the offset index lists y");
+	bytes[at + 16 + 7] ^= 0x01;
+	let uri = fixture
+		.l2
+		.put("tier/altered-offset-index.wnd", &bytes)
+		.await
+		.unwrap();
+	let altered = TieredSlabPointer {
+		tombstone_metadata,
+		supersession_metadata,
+		..tiered_pointer_from_blob(mgr, fixture.pointer.slab_id, uri, &bytes)
+	};
+	let before = mgr.record_rows_for_slab_for_recovery(fixture.pointer.slab_id);
+	assert!(
+		mgr.build_tiered_row_refresh_plan_from_l2(&altered)
+			.await
+			.is_err(),
+		"an altered offset index refuses the replacement"
+	);
+	assert!(
+		mgr.apply_tier_slab_committed(altered, None).await.is_err(),
+		"publication of the altered replacement refuses"
+	);
+	// A refused publication fences public reads of the slab (fail closed);
+	// the recovery view shows that no row moved and the pointer stayed.
+	assert_eq!(
+		mgr.record_rows_for_slab_for_recovery(fixture.pointer.slab_id),
+		before,
+		"no row moved"
+	);
+	assert_eq!(
+		mgr.tier_pointer(fixture.pointer.slab_id).await.as_ref(),
+		Some(&fixture.pointer),
+		"the old generation stays published"
+	);
+}
+
+/// The same verified bytes at another location are the published layout: a
+/// byte-identical copy refreshes with the index's evidence. A plaintext object
+/// with a different layout has no authenticated layout and still refuses.
+#[tokio::test]
+async fn an_identical_payload_at_another_location_keeps_index_evidence() {
+	let (_dirs, mgr, l2) = fresh_manager_with_l2("identical-payload-alias").await;
+	let a = mgr
+		.append(tenant(), id(0x6601), hlc(10), b"a")
+		.await
+		.unwrap();
+	mgr.append(tenant(), id(0x6602), hlc(20), b"b")
+		.await
+		.unwrap();
+	let slab_id = force_seal_active(&mgr).await;
+	let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
+	let plaintext_pointer = |uri: String, bytes: &[u8]| TieredSlabPointer {
+		slab_id,
+		l2_uri: uri,
+		payload_hash: crate::hash::content::digest(bytes),
+		is_encrypted: false,
+		tenant_id: None,
+		tenant_kek_id: None,
+		stats_format_version: None,
+		stats_block_len: None,
+		stats_block_hash128: None,
+		tombstone_metadata: TombstoneMetadata::None,
+		supersession_metadata: SupersessionMetadata::None,
+	};
+	let published = plaintext_pointer(l2.put("alias/published.wnd", &raw).await.unwrap(), &raw);
+	mgr.apply_tier_slab(published.clone()).await.unwrap();
+	let rows = mgr.record_rows_for_slab_for_recovery(slab_id);
+
+	let alias = plaintext_pointer(l2.put("alias/copy.wnd", &raw).await.unwrap(), &raw);
+	assert!(
+		!published.same_object_generation(&alias),
+		"premise: a different location"
+	);
+	let plan = mgr
+		.build_tiered_row_refresh_plan(&alias, Some(&published))
+		.await
+		.expect("identical verified bytes keep the published layout's evidence");
+	assert_eq!(
+		plan.new_rows, rows,
+		"the copy publishes exactly the same rows"
+	);
+
+	// Negative control: different plaintext (the first record only).
+	let first_end = a.offset as usize + crate::storage::io_uring::DIRECT_IO_ALIGN;
+	let other = raw[..first_end].to_vec();
+	let different = plaintext_pointer(l2.put("alias/different.wnd", &other).await.unwrap(), &other);
+	let error = mgr
+		.build_tiered_row_refresh_plan(&different, Some(&published))
+		.await
+		.err()
+		.expect("a different plaintext layout has no authenticated layout");
+	assert!(
+		error.to_string().contains("is plaintext"),
+		"refused for want of a layout: {error}"
+	);
+}
+
+/// Staged plaintext over a published encrypted generation is accepted only
+/// when its bytes equal that generation's authenticated plaintext in full. A
+/// plaintext that is a valid prefix of it (its first record alone) differs and
+/// is refused: the published generation stays.
+#[tokio::test]
+async fn staged_plaintext_that_only_shares_a_prefix_with_the_published_object_refuses() {
+	use crate::consensus::{TieredSlab, WendelonStateMachine};
+	use crate::storage::sweeper::ManagerTierObserver;
+	use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
+	use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
+
+	let (_dirs, mgr, l2) = fresh_manager_with_l2("staged-plaintext-prefix").await;
+	let first = mgr
+		.append(tenant(), id(0x6701), hlc(10), b"one")
+		.await
+		.unwrap();
+	mgr.append(tenant(), id(0x6702), hlc(20), b"two")
+		.await
+		.unwrap();
+	let slab_id = force_seal_active(&mgr).await;
+	let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
+	let encrypted = mgr.encrypt_tiered_object_blob(slab_id, &raw).unwrap();
+	let uri = l2
+		.put("staged-prefix/published.wnd", &encrypted.bytes)
+		.await
+		.unwrap();
+	let published = tiered_pointer_from_blob(&mgr, slab_id, uri, &encrypted.bytes);
+	mgr.apply_tier_slab(published.clone()).await.unwrap();
+
+	let prefix = raw[..first.offset as usize + crate::storage::io_uring::DIRECT_IO_ALIGN].to_vec();
+	let staged = TieredSlabPointer {
+		slab_id,
+		l2_uri: l2
+			.put("staged-prefix/plaintext.wnd", &prefix)
+			.await
+			.unwrap(),
+		payload_hash: crate::hash::content::digest(&prefix),
+		is_encrypted: false,
+		tenant_id: None,
+		tenant_kek_id: None,
+		stats_format_version: None,
+		stats_block_len: None,
+		stats_block_hash128: None,
+		tombstone_metadata: TombstoneMetadata::None,
+		supersession_metadata: SupersessionMetadata::None,
+	};
+	let mut source = WendelonStateMachine::new();
+	source
+		.seed_tiered_slab_for_test(TieredSlab {
+			slab_id: staged.slab_id,
+			l2_uri: staged.l2_uri.clone(),
+			payload_hash: staged.payload_hash,
+			is_encrypted: staged.is_encrypted,
+			tenant_id: staged.tenant_id,
+			tenant_kek_id: staged.tenant_kek_id,
+			stats_format_version: staged.stats_format_version,
+			stats_block_len: staged.stats_block_len,
+			stats_block_hash128: staged.stats_block_hash128,
+			tombstone_metadata: staged.tombstone_metadata,
+			supersession_metadata: staged.supersession_metadata,
+		})
+		.await;
+	RaftStateMachine::apply(
+		&mut source,
+		[Entry {
+			log_id: LogId::new(CommittedLeaderId::new(3, 1), 707),
+			payload: EntryPayload::Blank,
+		}],
+	)
+	.await
+	.unwrap();
+	let mut builder = RaftStateMachine::get_snapshot_builder(&mut source).await;
+	let built = builder.build_snapshot().await.unwrap();
+	let mut target = WendelonStateMachine::new()
+		.with_tier_observer(Arc::new(ManagerTierObserver::new(mgr.clone())));
+	let _ = RaftStateMachine::install_snapshot(&mut target, &built.meta, built.snapshot).await;
+	let ready = tokio::time::timeout(Duration::from_secs(5), mgr.wait_tier_authority_ready()).await;
+	assert!(
+		!matches!(ready, Ok(Ok(()))),
+		"a plaintext sharing only a prefix with the published object is not adopted"
+	);
+	assert_eq!(
+		mgr.tier_pointer(slab_id).await.as_ref(),
+		Some(&published),
+		"the published generation stays"
 	);
 }

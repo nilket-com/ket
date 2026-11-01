@@ -98,15 +98,15 @@ use crate::schema::{
 	CounterRollbackRequestMeta, FRAME_FLAG_STREAM_END, FinalizationMarker, FrameHeader,
 	HybridTimestamp, Identity, LeaseDescriptor, LeaseStatus, Locality, LocalityPolicy,
 	LocalityRange, MigrateRequestKind, MigrateRequestMeta, MigrateResponseMeta, MigrateStatus,
-	MsgType, MultiRowLayoutDescriptor, MutationCommitKnowledge, MutationOperationKind,
-	MutationOutcomePinAction, MutationOutcomePinRequestMeta, MutationOutcomePinResponseMeta,
-	MutationOutcomePinStatus, MutationOutcomeRequestMeta, MutationOutcomeResponseMeta,
-	MutationResolutionStatus, MutationStopReason, NodeId, PbcRejectCode,
-	PendingWitnessPullRequestMeta, PendingWitnessPullResponseMeta, PendingWitnessPullStatus,
-	QueryRequestMeta, QueryResponseMeta, ReadRequestMeta, ReadResponseMeta, ReadStatus,
-	RecordBodyCompressionPolicy, RecordLayoutPolicy, RecordRowIndex, ReplicaAckLevel,
-	ReplicaWriteMeta, ReplicaWriteRespMeta, ReplicaWriteStatus, RowCount, RowIdentityPolicy,
-	RuntimeFilterDescriptor, RuntimeFilterDropReason, STORAGE_ROW_KEY_ID_COLUMN,
+	MigrationCursor, MsgType, MultiRowLayoutDescriptor, MutationCommitKnowledge,
+	MutationOperationKind, MutationOutcomePinAction, MutationOutcomePinRequestMeta,
+	MutationOutcomePinResponseMeta, MutationOutcomePinStatus, MutationOutcomeRequestMeta,
+	MutationOutcomeResponseMeta, MutationResolutionStatus, MutationStopReason, NodeId,
+	PbcRejectCode, PendingWitnessPullRequestMeta, PendingWitnessPullResponseMeta,
+	PendingWitnessPullStatus, QueryRequestMeta, QueryResponseMeta, ReadRequestMeta,
+	ReadResponseMeta, ReadStatus, RecordBodyCompressionPolicy, RecordLayoutPolicy, RecordRowIndex,
+	ReplicaAckLevel, ReplicaWriteMeta, ReplicaWriteRespMeta, ReplicaWriteStatus, RowCount,
+	RowIdentityPolicy, RuntimeFilterDescriptor, RuntimeFilterDropReason, STORAGE_ROW_KEY_ID_COLUMN,
 	SecondaryIndexCatalog, SecondaryIndexDescriptor, SecondaryIndexState, SlabId,
 	StreamFinalizationRequestMeta, TABLE_QUERY_TRACE_FLAG_KNOWN_MASK,
 	TABLE_QUERY_TRACE_FLAG_PRESENT, TABLE_QUERY_TRACE_FLAG_SAMPLED, TABLE_WRITE_MAX_ROWS,
@@ -220,7 +220,7 @@ use query_encode::encode_query_stream_batches_with_deadline;
 mod write_clocks;
 use write_clocks::{WriteClocks, acquire_mutation_work_permit, bound_orphan_witness_pull};
 mod mutation_protocol;
-use mutation_protocol::mutation_expiry_response;
+use mutation_protocol::{TableAdmissionError, mutation_expiry_response};
 mod streaming;
 use counter::{CounterParticipantFactory, CounterReplicaNetworkTransport};
 use descriptor_migration::MigrationRegistry;
@@ -635,6 +635,7 @@ pub(crate) struct DropReclaimSliceRequest {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct DropReclaimSliceResponse {
+	pub status: crate::storage::manager::TableDropReclaimStatus,
 	pub examined: usize,
 	pub done: bool,
 	pub corruption_reset: bool,
@@ -682,6 +683,7 @@ struct DropReclaimSliceResponseMeta {
 impl DropReclaimSliceResponseMeta {
 	const OK: u8 = 0;
 	const REJECTED: u8 = 1;
+	const DEFERRED_NOT_LEADER: u8 = 2;
 }
 
 /// Data Ring front door. Owns the local slab, a client to the Raft
@@ -1325,6 +1327,7 @@ impl WendelonDataServer {
 		// physical slice is idempotent. Only this validated epoch is persisted.
 		progress.owner_epoch = request.ownership_epoch;
 		let mut examined = 0usize;
+		let mut status = crate::storage::manager::TableDropReclaimStatus::Progress;
 		match progress.phase {
 			DropReclaimPhase::LocalL1 => {
 				let report = self
@@ -1358,6 +1361,7 @@ impl WendelonDataServer {
 						request.examined_budget,
 					)
 					.await?;
+				status = report.status;
 				examined = report.examined;
 				progress.cursor = report.cursor_next;
 				if report.done {
@@ -1369,7 +1373,7 @@ impl WendelonDataServer {
 				let references = self.slab.table_drop_reference_counts(
 					request.operation_id.tenant_id,
 					request.operation_id.table_object_id,
-				);
+				)?;
 				if !references.is_empty() {
 					// A rewrite that acquired the same per-slab claim before reclaim may
 					// publish its replacement above this cycle's frozen upper bound. The
@@ -1416,6 +1420,7 @@ impl WendelonDataServer {
 			);
 		}
 		Ok(DropReclaimSliceResponse {
+			status,
 			examined,
 			done: progress.phase == DropReclaimPhase::Complete,
 			corruption_reset,
@@ -1466,7 +1471,10 @@ impl WendelonDataServer {
 			));
 		}
 		let response: DropReclaimSliceResponseMeta = *bytemuck::from_bytes(&frame.meta);
-		if response.status != DropReclaimSliceResponseMeta::OK {
+		if !matches!(
+			response.status,
+			DropReclaimSliceResponseMeta::OK | DropReclaimSliceResponseMeta::DEFERRED_NOT_LEADER
+		) {
 			let message = frame
 				.trailing
 				.as_deref()
@@ -1474,63 +1482,24 @@ impl WendelonDataServer {
 				.unwrap_or("remote drop reclaim slice was rejected");
 			return Err(Error::other(message.to_string()));
 		}
+		if response.status == DropReclaimSliceResponseMeta::DEFERRED_NOT_LEADER
+			&& response.done != 0
+		{
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"deferred table-drop response cannot be complete",
+			));
+		}
 		Ok(DropReclaimSliceResponse {
+			status: if response.status == DropReclaimSliceResponseMeta::DEFERRED_NOT_LEADER {
+				crate::storage::manager::TableDropReclaimStatus::DeferredNotLeader
+			} else {
+				crate::storage::manager::TableDropReclaimStatus::Progress
+			},
 			examined: response.examined as usize,
 			done: response.done != 0,
 			corruption_reset: response.corruption_reset != 0,
 		})
-	}
-
-	fn drop_reclaim_slice_response_frame(
-		&self,
-		stream_id: u32,
-		result: std::io::Result<DropReclaimSliceResponse>,
-	) -> HrftFrame {
-		let (meta, trailing_bytes) = match result {
-			Ok(response) => (
-				DropReclaimSliceResponseMeta {
-					examined: u32::try_from(response.examined).unwrap_or(u32::MAX),
-					status: DropReclaimSliceResponseMeta::OK,
-					done: u8::from(response.done),
-					corruption_reset: u8::from(response.corruption_reset),
-					_pad: 0,
-				},
-				None,
-			),
-			Err(error) => (
-				DropReclaimSliceResponseMeta {
-					examined: 0,
-					status: DropReclaimSliceResponseMeta::REJECTED,
-					done: 0,
-					corruption_reset: 0,
-					_pad: 0,
-				},
-				Some(error.to_string().into_bytes()),
-			),
-		};
-		let mut body = self.pool.acquire();
-		body.as_mut_vec()
-			.extend_from_slice(bytemuck::bytes_of(&meta));
-		let trailing = trailing_bytes.map(|bytes| {
-			let mut pooled = self.pool.acquire();
-			pooled.as_mut_vec().extend_from_slice(&bytes);
-			pooled
-		});
-		HrftFrame {
-			header: FrameHeader {
-				magic: HRFT_MAGIC,
-				version: 1,
-				msg_type: MsgType::DROP_RECLAIM_SLICE_RESP.0,
-				flags: 0,
-				stream_id,
-				meta_len: body.len() as u32,
-				arrow_len: 0,
-				trailing_len: trailing.as_ref().map_or(0, |bytes| bytes.len() as u32),
-			},
-			meta: body,
-			arrow_payload: None,
-			trailing,
-		}
 	}
 
 	async fn content_hash_admission_guard(
@@ -2422,14 +2391,6 @@ impl WendelonDataServer {
 			.store(actor_max, Ordering::Relaxed);
 	}
 
-	pub fn degraded_reason(&self) -> Option<String> {
-		recover_rwlock_read(
-			&self.local_persistence_distrust_reason,
-			"local_persistence_distrust_reason",
-		)
-		.clone()
-	}
-
 	async fn persist_local_persistence_distrust_marker(
 		&self,
 		detail: String,
@@ -3295,6 +3256,7 @@ impl WendelonDataServer {
 	}
 
 	pub(crate) async fn reconcile_drop_reclaim_once(&self) -> std::io::Result<bool> {
+		self.refresh_table_drop_l2_deferral_gauge().await?;
 		if self.raft.current_leader().await != Some(self.local_node.id) {
 			return Ok(false);
 		}
@@ -3334,7 +3296,8 @@ impl WendelonDataServer {
 				self.request_remote_drop_reclaim_slice(participant, request)
 					.await?
 			};
-			all_done &= response.done;
+			all_done &= response.done
+				&& response.status == crate::storage::manager::TableDropReclaimStatus::Progress;
 		}
 		if !all_done {
 			return Ok(true);
@@ -5012,6 +4975,10 @@ impl WendelonDataServer {
 		target_tenant: Option<TenantId>,
 		op: DataOperation,
 	) -> std::io::Result<Result<DataRequestAdmission, BackpressureScope>> {
+		match op {
+			DataOperation::Read | DataOperation::Query => self.slab.require_tier_read_scope(&[])?,
+			_ => self.slab.require_tier_authority_ready()?,
+		}
 		let claimed_tenant = actor.claimed_tenant_id()?;
 		let tenant_reservation = match op {
 			DataOperation::Write
@@ -5142,7 +5109,7 @@ impl WendelonDataServer {
 					Locality::new(meta.range_start),
 					Locality::new(meta.range_start),
 					entry.migration_hlc_floor,
-				)
+				)?
 				.into_iter()
 				.filter(|(tenant_id, key_identity, _, _)| {
 					*tenant_id == meta.tenant_id && *key_identity == meta.key_identity
@@ -5152,9 +5119,8 @@ impl WendelonDataServer {
 				Locality::new(meta.range_start),
 				Locality::new(meta.range_end),
 				entry.migration_hlc_floor,
-				meta.cursor_identity,
-				meta.cursor_hlc,
-			),
+				meta.cursor()?,
+			)?,
 			_ => {
 				return Ok((
 					migrate_error_meta(meta, MigrateStatus::INTERNAL_ERROR, ZERO_NODE),
@@ -5172,11 +5138,10 @@ impl WendelonDataServer {
 			));
 		}
 
-		// Paging caps. Records are sorted `(locality, identity, hlc ASC)`,
-		// so truncating at the caps yields a deterministic boundary.
-		// `(next_cursor_identity, next_cursor_hlc)` names the last
-		// emitted MVCC slot so the follow-up resumes strictly after
-		// it — including mid-key for fat keys.
+		// Paging caps. Records are sorted in `MigrationCursor` order, so
+		// truncating at the caps yields a deterministic boundary. The next
+		// cursor is the last emitted row's full cursor, so the follow-up
+		// resumes strictly after it — including mid-key for fat keys.
 		let max_records = if meta.max_records == 0 {
 			usize::MAX
 		} else {
@@ -5191,8 +5156,7 @@ impl WendelonDataServer {
 		let total_locations = locations.len();
 		let mut rows: Vec<(TenantId, Identity, Locality, RecordLocation, Vec<u8>)> = Vec::new();
 		let mut packed_bytes: usize = 0;
-		let mut last_key = (TenantId::ZERO, Identity::ZERO);
-		let mut last_hlc: HybridTimestamp = bytemuck::Zeroable::zeroed();
+		let mut last: Option<MigrationCursor> = None;
 		let mut truncated = false;
 		for (tenant_id, key_identity, routing_locality, loc) in locations.drain(..) {
 			if rows.len() >= max_records {
@@ -5205,17 +5169,17 @@ impl WendelonDataServer {
 				break;
 			}
 			packed_bytes = packed_bytes.saturating_add(frame.len());
-			last_key = (tenant_id, key_identity);
-			last_hlc = loc.hlc;
+			last = Some(MigrationCursor {
+				locality: routing_locality,
+				tenant_id,
+				key_identity,
+				hlc: loc.hlc,
+			});
 			rows.push((tenant_id, key_identity, routing_locality, loc, frame));
 		}
 		let emitted_all = rows.len() == total_locations;
 		let has_more = meta.kind == MigrateRequestKind::RANGE_PAGE && truncated && !emitted_all;
-		let (next_cursor_identity, next_cursor_hlc) = if has_more {
-			(last_key.1, last_hlc)
-		} else {
-			(Identity::ZERO, bytemuck::Zeroable::zeroed())
-		};
+		let next_cursor = if has_more { last } else { None };
 
 		let arrow_bytes = encode_migration_records(&rows)?;
 		let versions_returned = rows.len() as u64;
@@ -5224,15 +5188,13 @@ impl WendelonDataServer {
 		let resp = MigrateResponseMeta {
 			status: MigrateStatus::OK,
 			has_more: if has_more { 1 } else { 0 },
-			_pad0: [0; 6],
 			migration_id: meta.migration_id,
 			source_hint: ZERO_NODE,
-			next_cursor_identity,
-			next_cursor_hlc,
 			versions_returned,
 			bytes_returned,
-			_pad1: [0; 4],
-		};
+			..bytemuck::Zeroable::zeroed()
+		}
+		.with_next_cursor(next_cursor);
 		Ok((resp, Some(arrow_bytes)))
 	}
 
@@ -5303,7 +5265,7 @@ impl WendelonDataServer {
 			// Another task may have filled this key while we waited
 			// on the gate. If so, skip the RPC entirely — the fast
 			// path is the only ack the caller needed.
-			if let Some(location) = self.slab.lookup_as_of(tenant_id, key_identity, as_of_hlc) {
+			if let Some(location) = self.slab.lookup_as_of(tenant_id, key_identity, as_of_hlc)? {
 				let bytes = self.slab.read(location).await?;
 				return Ok(PointReadOutcome::Hit(location, bytes));
 			}
@@ -5335,13 +5297,12 @@ impl WendelonDataServer {
 				range_end: key_locality,
 				key_identity,
 				migration_hlc_floor: entry.migration_hlc_floor,
-				cursor_identity: Identity::ZERO,
-				cursor_hlc: bytemuck::Zeroable::zeroed(),
 				max_records: 0,
 				max_bytes: 0,
 				kind: MigrateRequestKind::POINT_LOOKUP,
-				_pad: [0; 7],
-			};
+				..bytemuck::Zeroable::zeroed()
+			}
+			.with_cursor(None);
 
 			let mut any_inconclusive = false;
 			for source in &entry.source_replicas {
@@ -5370,7 +5331,7 @@ impl WendelonDataServer {
 								.await?;
 						}
 						if let Some(location) =
-							self.slab.lookup_as_of(tenant_id, key_identity, as_of_hlc)
+							self.slab.lookup_as_of(tenant_id, key_identity, as_of_hlc)?
 						{
 							let bytes = self.slab.read(location).await?;
 							return Ok(PointReadOutcome::Hit(location, bytes));
@@ -5483,8 +5444,7 @@ impl WendelonDataServer {
 				continue;
 			}
 			touched_any_source = true;
-			let mut cursor_identity = Identity::ZERO;
-			let mut cursor_hlc: HybridTimestamp = bytemuck::Zeroable::zeroed();
+			let mut cursor: Option<MigrationCursor> = None;
 			loop {
 				let req = MigrateRequestMeta {
 					migration_id: entry.migration_id,
@@ -5495,13 +5455,12 @@ impl WendelonDataServer {
 					range_end,
 					key_identity: Identity::ZERO,
 					migration_hlc_floor: entry.migration_hlc_floor,
-					cursor_identity,
-					cursor_hlc,
 					max_records: page_max_records,
 					max_bytes: page_max_bytes,
 					kind: MigrateRequestKind::RANGE_PAGE,
-					_pad: [0; 7],
-				};
+					..bytemuck::Zeroable::zeroed()
+				}
+				.with_cursor(cursor);
 				let (resp, records) = match self.migrate_request(*source, &req).await {
 					Ok(ok) => ok,
 					Err(err) => {
@@ -5551,8 +5510,21 @@ impl WendelonDataServer {
 				if resp.has_more == 0 {
 					break;
 				}
-				cursor_identity = resp.next_cursor_identity;
-				cursor_hlc = resp.next_cursor_hlc;
+				// A page that promises more must say where to resume.
+				match resp.next_cursor() {
+					Ok(Some(next)) => cursor = Some(next),
+					Ok(None) | Err(_) => {
+						saw_source_failure = true;
+						tracing::warn!(
+							migration_id = entry.migration_id,
+							range_start,
+							range_end,
+							source = source.id,
+							"migration pull source promised more pages without a valid cursor; trying next candidate"
+						);
+						break;
+					}
+				}
 			}
 		}
 		if !touched_any_source && !entry.source_replicas.is_empty() {
@@ -6245,7 +6217,7 @@ impl WendelonDataServer {
 				range.start,
 				range.end,
 				request.as_of_hlc,
-			);
+			)?;
 			for (_identity, _locality, location) in scanned {
 				candidate_slab_ids.insert(location.slab_id);
 			}
@@ -6253,7 +6225,7 @@ impl WendelonDataServer {
 		let mut slab_ids = candidate_slab_ids.into_iter().collect::<Vec<_>>();
 		slab_ids.sort_by_key(|slab_id| slab_id.get());
 		for slab_id in slab_ids {
-			let Some((min_hlc, max_hlc, rows)) = self.slab.slab_hlc_bounds(slab_id) else {
+			let Some((min_hlc, max_hlc, rows)) = self.slab.slab_hlc_bounds(slab_id)? else {
 				return Ok(None);
 			};
 			let bounds = AggregateCsbSlabBounds::from_parts(min_hlc, max_hlc, rows);
@@ -6274,7 +6246,7 @@ impl WendelonDataServer {
 					AggregateCsbRetentionDecision::RowFilter => return Ok(None),
 				}
 			}
-			let Some(pointer) = self.slab.tier_pointer(slab_id).await else {
+			let Some(pointer) = self.slab.tier_pointer_for_aggregate(slab_id).await else {
 				return Ok(None);
 			};
 			if pointer.tombstone_metadata.is_untracked() {
@@ -6289,12 +6261,12 @@ impl WendelonDataServer {
 				slab_id,
 				request.as_of_hlc,
 				&committed_tombstones,
-			) {
+			)? {
 				return Ok(None);
 			}
 			if self
 				.slab
-				.slab_has_supersession_at(slab_id, request.as_of_hlc)
+				.slab_has_supersession_at(slab_id, request.as_of_hlc)?
 			{
 				return Ok(None);
 			}
@@ -7876,7 +7848,7 @@ impl WendelonDataServer {
 		for range in ranges {
 			for (row_tenant_id, key_identity, locality, location) in
 				self.slab
-					.scan_all_versions(range.start, range.end, scan_hlc_floor)
+					.scan_all_versions(range.start, range.end, scan_hlc_floor)?
 			{
 				if row_tenant_id != tenant_id {
 					continue;
@@ -7973,7 +7945,7 @@ impl WendelonDataServer {
 		for range in ranges {
 			for (row_tenant_id, key_identity, locality, location) in
 				self.slab
-					.scan_all_versions(range.start, range.end, bytemuck::Zeroable::zeroed())
+					.scan_all_versions(range.start, range.end, bytemuck::Zeroable::zeroed())?
 			{
 				if row_tenant_id != tenant_id {
 					continue;
@@ -9460,9 +9432,11 @@ impl WendelonDataServer {
 					self.slab.l2_chunk_layout_config(),
 				)
 				.map(Some)
+				.map_err(TableAdmissionError::Validation)
 			} {
 				Ok(bifurcated) => bifurcated,
-				Err(err) => {
+				Err(TableAdmissionError::Authority(error)) => return Err(error),
+				Err(TableAdmissionError::Validation(err)) => {
 					return Ok((
 						self.table_write_error_response(
 							&meta,
@@ -9574,7 +9548,7 @@ impl WendelonDataServer {
 		descriptor: &TableSchemaDescriptor,
 		writer_node_id: WriterNodeId,
 		row_hlc: HybridTimestamp,
-	) -> Result<PrimaryKeyBifurcation, TableWriteValidationError> {
+	) -> Result<PrimaryKeyBifurcation, TableAdmissionError> {
 		let admission =
 			validate_table_write_request_batch(meta, batch, descriptor, writer_node_id, row_hlc)?;
 		let mut upsert_no_digest_add_rows = 0_u64;
@@ -9587,7 +9561,7 @@ impl WendelonDataServer {
 				key_identity,
 				row_hlc,
 				&self.slab,
-			);
+			)?;
 			metrics().observe_storage_pk_admission_visibility_lookup(
 				meta.tenant_id,
 				meta.table_object_id,
@@ -9636,7 +9610,7 @@ impl WendelonDataServer {
 		descriptor: &TableSchemaDescriptor,
 		effective_retention: &EffectiveRetention,
 		row_hlc: HybridTimestamp,
-	) -> Result<ContentHashBifurcation, TableWriteValidationError> {
+	) -> Result<ContentHashBifurcation, TableAdmissionError> {
 		let admission = validate_table_write_request_batch(
 			meta,
 			batch,
@@ -9655,7 +9629,7 @@ impl WendelonDataServer {
 				row_hlc,
 				effective_retention,
 				&self.slab,
-			);
+			)?;
 			if currently_visible || !keys_stored_in_batch.insert(key_identity) {
 				absorbed = absorbed.saturating_add(1);
 				continue;
@@ -9916,7 +9890,7 @@ impl WendelonDataServer {
 						delete_hlc,
 						&effective_retention,
 						&self.slab,
-					);
+					)?;
 					metrics().observe_storage_pk_admission_visibility_lookup(
 						meta.tenant_id,
 						meta.table_object_id,
@@ -9926,7 +9900,7 @@ impl WendelonDataServer {
 				} else {
 					let latest = self
 						.slab
-						.lookup_as_of(meta.tenant_id, row_key_id, delete_hlc);
+						.lookup_as_of(meta.tenant_id, row_key_id, delete_hlc)?;
 					crate::storage::pk_delete::pk_delete_outcome_for_latest(latest)
 				};
 				match outcome {
@@ -9938,7 +9912,7 @@ impl WendelonDataServer {
 					PkAdmissionOutcome::DeletedSupersedingVisible => {
 						let Some(routing_locality) = self
 							.slab
-							.routing_locality_for_existing_key(meta.tenant_id, row_key_id)
+							.routing_locality_for_existing_key(meta.tenant_id, row_key_id)?
 						else {
 							tracing::warn!(
 								tenant_id = meta.tenant_id.get(),
@@ -10266,7 +10240,7 @@ impl DataRing for WendelonDataServer {
 		let placement_key =
 			match self
 				.slab
-				.lookup_as_of(meta.tenant_id, key_identity, meta.as_of_hlc)
+				.lookup_as_of(meta.tenant_id, key_identity, meta.as_of_hlc)?
 			{
 				Some(routed) => PlacementKey::from_parts(
 					routed.placement,
@@ -10336,7 +10310,7 @@ impl DataRing for WendelonDataServer {
 		let (location, bytes) =
 			match self
 				.slab
-				.lookup_as_of(meta.tenant_id, key_identity, meta.as_of_hlc)
+				.lookup_as_of(meta.tenant_id, key_identity, meta.as_of_hlc)?
 			{
 				Some(loc) => {
 					if loc.is_tombstone {
@@ -12621,7 +12595,7 @@ async fn plan_table_query_execution_by_secondary_index(
 			range.start,
 			range.end,
 			meta.as_of_hlc,
-		);
+		)?;
 		for (key_identity, locality, location) in scanned {
 			// Examining a location is progress whatever its disposition — pruned,
 			// filtered, duplicate and mismatched locations are work done, and a
@@ -12819,6 +12793,10 @@ async fn read_secondary_index_query_locations(
 	program: &pbc::Program,
 	projected_execution: &QueryProjectedExecution,
 ) -> std::io::Result<Vec<(SecondaryIndexLookupRow, ProjectedQueryLocationRead)>> {
+	// A segment's saved location is never trusted: each row resolves to its
+	// version's current location by (tenant, key, hlc), or refuses typed.
+	let resolved = slab.resolve_secondary_index_rows(tenant_id, rows)?;
+	let rows = resolved.as_slice();
 	let Some(requirement) = projected_execution.requirement() else {
 		return read_secondary_index_query_locations_one_by_one(
 			slab,
@@ -13145,7 +13123,9 @@ async fn read_secondary_index_query_location(
 	{
 		return Ok(Some(result));
 	}
-	let bytes = slab.read(row.record_location).await?;
+	let bytes = slab
+		.read_version(tenant_id, row.row_key_id, row.record_location)
+		.await?;
 	let storage_batch = decode_batch(&bytes)?;
 	// ADR 0090: the frame is independent placement evidence, and placement is
 	// never resolved from the index alone. The V1 segment format carries no
@@ -13154,7 +13134,7 @@ async fn read_secondary_index_query_location(
 	// and the segment's reconstruction is only the fallback when the chain no
 	// longer holds it.
 	let (index_placement, index_partition) = slab
-		.version_placement_at(tenant_id, row.row_key_id, row.record_location.hlc)
+		.version_placement_at(tenant_id, row.row_key_id, row.record_location.hlc)?
 		.unwrap_or((row.record_location.placement, row.record_location.partition));
 	resolve_record_placement(
 		index_placement,
@@ -13365,7 +13345,7 @@ async fn plan_query_execution_for_ranges_with_program_maybe_cancelled(
 			range.start,
 			range.end,
 			meta.as_of_hlc,
-		);
+		)?;
 		phase_trace.record(ScanPhase::IndexEntries, phase_started);
 		for (key_identity, locality, location) in scanned {
 			// Examining a location is progress whatever its disposition — pruned,
@@ -14204,16 +14184,11 @@ fn migrate_error_meta(
 ) -> MigrateResponseMeta {
 	MigrateResponseMeta {
 		status,
-		has_more: 0,
-		_pad0: [0; 6],
 		migration_id: req.migration_id,
 		source_hint,
-		next_cursor_identity: Identity::ZERO,
-		next_cursor_hlc: bytemuck::Zeroable::zeroed(),
-		versions_returned: 0,
-		bytes_returned: 0,
-		_pad1: [0; 4],
+		..bytemuck::Zeroable::zeroed()
 	}
+	.with_next_cursor(None)
 }
 
 /// Pack `(key_identity, routing_locality, RecordLocation,

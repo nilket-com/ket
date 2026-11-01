@@ -1348,6 +1348,10 @@ async fn pd25_partial_restore_refusal_never_certifies_clean_and_reboot_validates
 			"restore must really mutate disk before fault"
 		);
 		assert!(
+			dir.join("STORAGE_INDEX_RESTORE_AUTHORITY").exists(),
+			"validated restore authority survives the partial restore"
+		);
+		assert!(
 			!dir.join("CLEAN_SHUTDOWN").exists(),
 			"stopped writers must not certify failed restore"
 		);
@@ -1359,6 +1363,11 @@ async fn pd25_partial_restore_refusal_never_certifies_clean_and_reboot_validates
 		);
 		let owner = DataDirectoryOwner::acquire_existing(&dir).unwrap();
 		assert!(!owner.previous_shutdown_clean());
+		// Complete the missing data stage explicitly before a validated reboot.
+		// A control-only restore cannot certify absent local slab data.
+		SlabManager::restore_backup(&backup.nodes[0].storage, &dir, &owner, false)
+			.await
+			.unwrap();
 		owner.close(Duration::from_secs(10)).await.unwrap();
 		let recovered = WendelonNode::bootstrap(healthy).await.unwrap();
 		assert!(recovered.recovered_after_unclean_shutdown());
@@ -1371,6 +1380,144 @@ async fn pd25_partial_restore_refusal_never_certifies_clean_and_reboot_validates
 			dir.join("CLEAN_SHUTDOWN").exists(),
 			"later validated boot may certify clean shutdown"
 		);
+		assert!(
+			!dir.join("STORAGE_INDEX_RESTORE_AUTHORITY").exists(),
+			"successful recovery consumes the restore intent"
+		);
+	}
+}
+
+#[tokio::test]
+async fn a1_partial_populated_restore_plain_reboot_refuses_missing_slabs() {
+	use crate::storage::StorageEngine;
+	let source_dir = crate::test_support::TestDir::new("a1-populated-restore-source");
+	let source = WendelonNode::bootstrap(NodeBootstrapConfig::dev(
+		1,
+		source_dir.to_path_buf(),
+		"127.0.0.1:0".into(),
+	))
+	.await
+	.unwrap();
+	let tenant = crate::schema::TenantId::ZERO;
+	let key = crate::schema::Identity::new([0xA1; 32]);
+	let payload = b"a1 acknowledged populated source";
+	let location = source
+		.slab
+		.append_durable(
+			tenant,
+			key,
+			crate::schema::HybridTimestamp {
+				physical_ms: 101,
+				logical: 0,
+				node_id: 1,
+			},
+			payload,
+		)
+		.await
+		.unwrap();
+	assert_eq!(source.slab.lookup(tenant, key).unwrap(), Some(location));
+	assert_eq!(source.slab.read(location).await.unwrap(), payload);
+	let backup = source.export_cluster_backup().await.unwrap();
+	source.shutdown().await.unwrap();
+	for mode in [FaultMode::Cancel] {
+		let dir = crate::test_support::TestDir::new("a1-populated-restore-partial");
+		let healthy = NodeBootstrapConfig::dev(1, dir.to_path_buf(), "127.0.0.1:0".into());
+		let fault = StartupFault {
+			site: "after_control_restore",
+			mode,
+			snapshot: Arc::default(),
+			entered: Arc::new(Notify::new()),
+			last_site: Arc::default(),
+			bound_tcp: Arc::default(),
+		};
+		let mut cfg = healthy.clone();
+		cfg.startup_fault = Some(fault.clone());
+		let image = backup.clone();
+		let mut task =
+			tokio::spawn(
+				async move { WendelonNode::restore_from_cluster_backup(&image, cfg).await },
+			);
+		tokio::time::timeout(Duration::from_secs(30), fault.entered.notified())
+			.await
+			.unwrap();
+		if mode == FaultMode::Cancel {
+			task.abort();
+		}
+		match tokio::time::timeout(Duration::from_secs(30), &mut task)
+			.await
+			.unwrap()
+		{
+			Ok(Err(error)) if mode == FaultMode::Error => {
+				assert_eq!(error.kind(), ErrorKind::InvalidData)
+			}
+			Err(error) if mode == FaultMode::Cancel => assert!(error.is_cancelled()),
+			Err(error) if mode == FaultMode::Panic => assert!(error.is_panic()),
+			Ok(Ok(node)) => {
+				node.shutdown().await.unwrap();
+				panic!("partial restore fault escaped");
+			}
+			_ => panic!("wrong restore fault outcome"),
+		}
+		let snapshot = fault.snapshot.lock().unwrap().take().unwrap();
+		assert!(
+			snapshot.owner.previous_shutdown_clean(),
+			"restore must start from a genuinely fresh clean owner"
+		);
+		let slot = snapshot.owner.latest_startup_cleanup().unwrap();
+		assert!(matches!(
+			tokio::time::timeout(Duration::from_secs(30), slot.wait())
+				.await
+				.unwrap(),
+			crate::storage::ownership::StartupCleanupStatus::Complete
+		));
+		assert!(
+			dir.join("control.wal").exists(),
+			"restore must really mutate disk before fault"
+		);
+		assert!(
+			dir.join("STORAGE_INDEX_RESTORE_AUTHORITY").exists(),
+			"validated restore authority survives the partial restore"
+		);
+		assert!(
+			!dir.join("CLEAN_SHUTDOWN").exists(),
+			"stopped writers must not certify failed restore"
+		);
+		assert!(
+			snapshot
+				.owner
+				.closed_signal()
+				.load(std::sync::atomic::Ordering::Acquire)
+		);
+		let owner = DataDirectoryOwner::acquire_existing(&dir).unwrap();
+		assert!(!owner.previous_shutdown_clean());
+		owner.close(Duration::from_secs(10)).await.unwrap();
+		match WendelonNode::bootstrap(healthy).await {
+			Err(error) => {
+				assert_eq!(error.kind(), ErrorKind::InvalidData, "{error}");
+				assert!(
+					error
+						.to_string()
+						.contains("restored active slab is missing"),
+					"{error}"
+				);
+				assert!(
+					!dir.join("storage_index.redb").exists(),
+					"partial restore must never create an empty index"
+				);
+				assert!(
+					!dir.join("CLEAN_SHUTDOWN").exists(),
+					"partial restore must remain uncertified"
+				);
+			}
+			Ok(recovered) => {
+				let lookup = recovered.slab.lookup(tenant, key);
+				recovered.shutdown().await.unwrap();
+				assert!(
+					lookup.is_err(),
+					"A1 partial populated restore must refuse missing slab data, never certify absence: {lookup:?}"
+				);
+			}
+		}
 	}
 }
 
@@ -1460,4 +1607,457 @@ async fn pd25_healthy_handoff_preserves_base_task_census_and_clean_shutdown() {
 		dir.join("CLEAN_SHUTDOWN").exists(),
 		"healthy handoff must preserve clean-shutdown behavior"
 	);
+}
+
+#[tokio::test]
+async fn malformed_storage_restore_intent_does_not_authorize_a_missing_index() {
+	let dir = crate::test_support::TestDir::new("dc146-malformed-recovery-authority");
+	let cfg = NodeBootstrapConfig::dev(7192, dir.to_path_buf(), "127.0.0.1:0".into());
+	let node = WendelonNode::bootstrap(cfg.clone()).await.unwrap();
+	node.shutdown().await.unwrap();
+	std::fs::remove_file(dir.join("storage_index.redb")).unwrap();
+	std::fs::write(
+		dir.join("STORAGE_INDEX_RESTORE_AUTHORITY"),
+		b"not-a-validated-restore",
+	)
+	.unwrap();
+	let error = match WendelonNode::bootstrap(cfg).await {
+		Ok(node) => {
+			node.shutdown().await.unwrap();
+			panic!("malformed authority accepted");
+		}
+		Err(error) => error,
+	};
+	assert_eq!(error.kind(), ErrorKind::InvalidData);
+	assert!(!dir.join("storage_index.redb").exists());
+	assert!(dir.join("STORAGE_INDEX_RESTORE_AUTHORITY").exists());
+}
+
+#[tokio::test]
+async fn restore_authority_uses_consumed_bytes_not_map_iteration_order() {
+	let source_dir = crate::test_support::TestDir::new("restore-order-source");
+	let source = WendelonNode::bootstrap(NodeBootstrapConfig::dev(
+		1,
+		source_dir.to_path_buf(),
+		"127.0.0.1:0".into(),
+	))
+	.await
+	.unwrap();
+	let nodes = source.export_cluster_backup().await.unwrap().nodes;
+	source.shutdown().await.unwrap();
+	let (state, images) =
+		crate::consensus::ControlRingBackupImage::equivalent_restore_inputs_for_test();
+	for control in images {
+		for tamper in [false, true] {
+			let backup =
+				ClusterBackupImage::assemble(control.clone(), &state, nodes.clone()).unwrap();
+			backup.validate_integrity().unwrap();
+			let dir = crate::test_support::TestDir::new("restore-order-target");
+			let cfg = NodeBootstrapConfig::dev(1, dir.to_path_buf(), "127.0.0.1:0".into());
+			let owner = DataDirectoryOwner::acquire_or_create(&dir).unwrap();
+			WendelonNode::restore_cluster_backup_artifacts(&backup, &cfg, &owner)
+				.await
+				.unwrap();
+			let (wal, vote, snapshot) = control_artifact_paths(&dir);
+			if tamper {
+				let mut bytes = std::fs::read(&snapshot).unwrap();
+				// Padding is ignored by semantic replay and is outside the body's
+				// checksum. Only binding the exact artifact bytes catches this.
+				bytes[std::mem::offset_of!(crate::schema::SnapshotHeader, _pad)] ^= 1;
+				std::fs::write(&snapshot, bytes).unwrap();
+			}
+			let store = WendelonLogStore::open_with_file_ops_and_owner(
+				wal,
+				vote,
+				snapshot,
+				Arc::new(crate::storage::BlockingFileOps::with_owner(owner.clone())),
+				owner.clone(),
+			)
+			.await
+			.unwrap();
+			let recovered = store.recovered_state_machine().await.unwrap();
+			assert_eq!(
+				recovered.state_snapshot().await.e_safe_watermarks,
+				state.e_safe_watermarks
+			);
+			let authority = startup::validated_index_recovery(&owner, 1, &recovered).await;
+			if tamper {
+				let error = authority
+					.err()
+					.expect("tampered header padding must refuse authority");
+				assert_eq!(error.kind(), ErrorKind::InvalidData);
+				assert!(
+					error
+						.to_string()
+						.contains("index restore intent does not match validated control replay")
+				);
+			} else {
+				assert!(
+					authority.unwrap().is_some(),
+					"both map encodings grant authority after exact replay"
+				);
+			}
+			assert!(
+				!dir.join("storage_index.redb").exists(),
+				"checking proof alone never creates the index"
+			);
+		}
+	}
+}
+
+#[tokio::test]
+async fn a1_restore_authority_requires_the_exact_complete_local_slab_set() {
+	let source_dir = crate::test_support::TestDir::new("a1-inventory-source");
+	let mut cfg = NodeBootstrapConfig::dev(1, source_dir.to_path_buf(), "127.0.0.1:0".into());
+	cfg.slab_max_bytes = 1;
+	let source = WendelonNode::bootstrap(cfg).await.unwrap();
+	for n in [1, 2] {
+		source
+			.slab
+			.append_durable(
+				crate::schema::TenantId::ZERO,
+				crate::schema::Identity::new([n; 32]),
+				crate::schema::HybridTimestamp {
+					physical_ms: n as u64,
+					logical: 0,
+					node_id: 1,
+				},
+				b"a1 local slab inventory",
+			)
+			.await
+			.unwrap();
+	}
+	let local_storage = source.slab.export_backup().await.unwrap();
+	source.shutdown().await.unwrap();
+	// This control exercises only the local-inventory proof. Keep its control
+	// input immutable; live export-cut consistency has a separate A13 control.
+	let (state, controls) =
+		crate::consensus::ControlRingBackupImage::equivalent_restore_inputs_for_test();
+	let backup = ClusterBackupImage::assemble(
+		controls.into_iter().next().unwrap(),
+		&state,
+		vec![ClusterNodeBackupImage {
+			node_id: 1,
+			storage: local_storage,
+		}],
+	)
+	.unwrap();
+	let storage = &backup.nodes[0].storage;
+	assert_eq!(
+		storage.local_slabs.len(),
+		2,
+		"exercise active and sealed files"
+	);
+	let active = storage.manifest.active_slab_id;
+	let sealed = storage.manifest.sealed_slab_ids[0];
+	for cut in [
+		"complete",
+		"missing-active",
+		"missing-sealed",
+		"truncate",
+		"corrupt",
+		"extra",
+	] {
+		let dir = crate::test_support::TestDir::new("a1-inventory-target");
+		let cfg = NodeBootstrapConfig::dev(1, dir.to_path_buf(), "127.0.0.1:0".into());
+		let owner = DataDirectoryOwner::acquire_or_create(&dir).unwrap();
+		WendelonNode::restore_cluster_backup_artifacts(&backup, &cfg, &owner)
+			.await
+			.unwrap();
+		let slab_path = |id: crate::schema::SlabId| dir.join(format!("slab_{id:016x}.wnd"));
+		match cut {
+			"missing-active" => std::fs::remove_file(slab_path(active)).unwrap(),
+			"missing-sealed" => std::fs::remove_file(slab_path(sealed)).unwrap(),
+			"truncate" => {
+				std::fs::OpenOptions::new()
+					.write(true)
+					.open(slab_path(sealed))
+					.unwrap()
+					.set_len(0)
+					.unwrap();
+			}
+			"corrupt" => {
+				let mut bytes = std::fs::read(slab_path(sealed)).unwrap();
+				bytes[0] ^= 1;
+				std::fs::write(slab_path(sealed), bytes).unwrap();
+			}
+			"extra" => {
+				std::fs::write(slab_path(crate::schema::SlabId::MAX), b"unexpected slab").unwrap()
+			}
+			"complete" => {}
+			_ => unreachable!(),
+		}
+		let (wal, vote, snapshot) = control_artifact_paths(&dir);
+		let store = WendelonLogStore::open_with_file_ops_and_owner(
+			wal,
+			vote,
+			snapshot,
+			Arc::new(crate::storage::BlockingFileOps::with_owner(owner.clone())),
+			owner.clone(),
+		)
+		.await
+		.unwrap();
+		let recovered = store.recovered_state_machine().await.unwrap();
+		let consumed = recovered.restored_control_identity(&owner).await.unwrap();
+		assert_eq!(
+			consumed,
+			(
+				backup.control.restore_artifact_hash(),
+				backup.control.manifest.last_applied_log_id
+			),
+			"A1 inventory fixture must have exact control replay before exercising local slabs; cut={cut}"
+		);
+		let result = startup::validated_index_recovery(&owner, 1, &recovered).await;
+		if cut == "complete" {
+			assert!(
+				result.unwrap().is_some(),
+				"complete exact inventory grants authority"
+			);
+		} else {
+			let error = result
+				.err()
+				.expect("incomplete or changed slabs must refuse authority");
+			assert_eq!(error.kind(), ErrorKind::InvalidData, "{cut}: {error}");
+		}
+		assert!(
+			!dir.join("storage_index.redb").exists(),
+			"proof validation never creates an index"
+		);
+	}
+}
+
+#[tokio::test]
+async fn a1_partial_populated_restore_resumes_through_production_entry_point() {
+	use crate::storage::StorageEngine;
+	let source_dir = crate::test_support::TestDir::new("a1-populated-restore-source");
+	let source = WendelonNode::bootstrap(NodeBootstrapConfig::dev(
+		1,
+		source_dir.to_path_buf(),
+		"127.0.0.1:0".into(),
+	))
+	.await
+	.unwrap();
+	let tenant = crate::schema::TenantId::ZERO;
+	let key = crate::schema::Identity::new([0xA1; 32]);
+	let payload = b"a1 acknowledged populated source";
+	let location = source
+		.slab
+		.append_durable(
+			tenant,
+			key,
+			crate::schema::HybridTimestamp {
+				physical_ms: 101,
+				logical: 0,
+				node_id: 1,
+			},
+			payload,
+		)
+		.await
+		.unwrap();
+	assert_eq!(source.slab.lookup(tenant, key).unwrap(), Some(location));
+	assert_eq!(source.slab.read(location).await.unwrap(), payload);
+	let backup = source.export_cluster_backup().await.unwrap();
+	source.shutdown().await.unwrap();
+	for cut in [
+		"control-only",
+		"partial-slab",
+		"complete-slab",
+		"partial-wal",
+		"conflicting-slab",
+		"unexpected-slab",
+	] {
+		let mode = FaultMode::Cancel;
+		let dir = crate::test_support::TestDir::new("a1-populated-restore-partial");
+		let healthy = NodeBootstrapConfig::dev(1, dir.to_path_buf(), "127.0.0.1:0".into());
+		let fault = StartupFault {
+			site: "after_control_restore",
+			mode,
+			snapshot: Arc::default(),
+			entered: Arc::new(Notify::new()),
+			last_site: Arc::default(),
+			bound_tcp: Arc::default(),
+		};
+		let mut cfg = healthy.clone();
+		cfg.startup_fault = Some(fault.clone());
+		let image = backup.clone();
+		let mut task =
+			tokio::spawn(
+				async move { WendelonNode::restore_from_cluster_backup(&image, cfg).await },
+			);
+		tokio::time::timeout(Duration::from_secs(30), fault.entered.notified())
+			.await
+			.unwrap();
+		if mode == FaultMode::Cancel {
+			task.abort();
+		}
+		match tokio::time::timeout(Duration::from_secs(30), &mut task)
+			.await
+			.unwrap()
+		{
+			Ok(Err(error)) if mode == FaultMode::Error => {
+				assert_eq!(error.kind(), ErrorKind::InvalidData)
+			}
+			Err(error) if mode == FaultMode::Cancel => assert!(error.is_cancelled()),
+			Err(error) if mode == FaultMode::Panic => assert!(error.is_panic()),
+			Ok(Ok(node)) => {
+				node.shutdown().await.unwrap();
+				panic!("partial restore fault escaped");
+			}
+			_ => panic!("wrong restore fault outcome"),
+		}
+		let snapshot = fault.snapshot.lock().unwrap().take().unwrap();
+		assert!(
+			snapshot.owner.previous_shutdown_clean(),
+			"restore must start from a genuinely fresh clean owner"
+		);
+		let slot = snapshot.owner.latest_startup_cleanup().unwrap();
+		assert!(matches!(
+			tokio::time::timeout(Duration::from_secs(30), slot.wait())
+				.await
+				.unwrap(),
+			crate::storage::ownership::StartupCleanupStatus::Complete
+		));
+		assert!(
+			dir.join("control.wal").exists(),
+			"restore must really mutate disk before fault"
+		);
+		assert!(
+			dir.join("STORAGE_INDEX_RESTORE_AUTHORITY").exists(),
+			"validated restore authority survives the partial restore"
+		);
+		assert!(
+			!dir.join("CLEAN_SHUTDOWN").exists(),
+			"stopped writers must not certify failed restore"
+		);
+		assert!(
+			snapshot
+				.owner
+				.closed_signal()
+				.load(std::sync::atomic::Ordering::Acquire)
+		);
+		let owner = DataDirectoryOwner::acquire_existing(&dir).unwrap();
+		assert!(!owner.previous_shutdown_clean());
+		owner.close(Duration::from_secs(10)).await.unwrap();
+		let expected = &backup.nodes[0].storage.local_slabs[0];
+		let copied_path = dir.join(format!("slab_{:016x}.wnd", expected.slab_id));
+		match cut {
+			"partial-slab" => {
+				std::fs::write(&copied_path, &expected.bytes[..expected.bytes.len() / 2]).unwrap()
+			}
+			"complete-slab" => std::fs::write(&copied_path, &expected.bytes).unwrap(),
+			"partial-wal" => {
+				std::fs::OpenOptions::new()
+					.write(true)
+					.open(dir.join("control.wal"))
+					.unwrap()
+					.set_len((backup.control.wal.len() / 2) as u64)
+					.unwrap();
+			}
+			"conflicting-slab" => {
+				let mut bytes = expected.bytes.clone();
+				bytes[0] ^= 1;
+				std::fs::write(&copied_path, bytes).unwrap();
+			}
+			"unexpected-slab" => {
+				std::fs::write(dir.join("slab_ffffffffffffffff.wnd"), b"unrelated slab").unwrap()
+			}
+			"control-only" => {}
+			_ => unreachable!(),
+		}
+		if matches!(cut, "conflicting-slab" | "unexpected-slab") {
+			let error = WendelonNode::restore_from_cluster_backup(&backup, healthy)
+				.await
+				.err()
+				.expect("resume cannot overwrite conflicting or unrelated data");
+			assert_eq!(error.kind(), ErrorKind::InvalidData, "{cut}: {error}");
+			assert!(!dir.join("storage_index.redb").exists());
+			assert!(!dir.join("CLEAN_SHUTDOWN").exists());
+			assert!(dir.join("STORAGE_INDEX_RESTORE_AUTHORITY").exists());
+			continue;
+		}
+		let resumed = WendelonNode::restore_from_cluster_backup(&backup, healthy)
+			.await
+			.unwrap_or_else(|error| {
+				panic!("A1 production restore must resume the interrupted copy: {error}")
+			});
+		let location = resumed
+			.slab
+			.lookup(tenant, key)
+			.unwrap()
+			.expect("resumed restore retains acknowledged source key");
+		assert_eq!(resumed.slab.read(location).await.unwrap(), payload);
+		resumed.shutdown().await.unwrap();
+		assert!(
+			dir.join("CLEAN_SHUTDOWN").exists(),
+			"complete validated resume can certify clean shutdown"
+		);
+		assert!(
+			!dir.join("STORAGE_INDEX_RESTORE_AUTHORITY").exists(),
+			"complete validated resume consumes its intent"
+		);
+	}
+}
+
+#[tokio::test]
+async fn a13_live_backup_pause_after_wal_read_keeps_a_restorable_control_cut() {
+	let source_dir = crate::test_support::TestDir::new("a13-live-backup-source");
+	let source = Arc::new(
+		WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			1,
+			source_dir.to_path_buf(),
+			"127.0.0.1:0".into(),
+		))
+		.await
+		.unwrap(),
+	);
+	tokio::time::timeout(Duration::from_secs(10), async {
+		while source.raft.current_leader().await != Some(1) {
+			tokio::time::sleep(Duration::from_millis(10)).await;
+		}
+	})
+	.await
+	.unwrap();
+	let before = source
+		.state_machine
+		.state_snapshot()
+		.await
+		.last_applied_log_id
+		.unwrap();
+	let (entered, release) = source.log_store.pause_backup_after_wal_read_for_test();
+	let exporting = source.clone();
+	let task = tokio::spawn(async move { exporting.export_cluster_backup().await });
+	tokio::time::timeout(Duration::from_secs(10), entered.acquire())
+		.await
+		.unwrap()
+		.unwrap()
+		.forget();
+	// This real Raft request is durably appended and applied while export holds
+	// the older WAL bytes. Its response may reject the empty schema payload;
+	// the applied log index must still advance through the normal Raft path.
+	let applied = source
+		.raft
+		.client_write(crate::consensus::WendelonRequest::SchemaUpdate(Vec::new()))
+		.await
+		.unwrap();
+	assert!(applied.log_id.index > before.index);
+	release.add_permits(1);
+	let backup = task.await.unwrap().unwrap();
+	backup.validate_integrity().unwrap();
+	Arc::try_unwrap(source)
+		.ok()
+		.unwrap()
+		.shutdown()
+		.await
+		.unwrap();
+	let target = crate::test_support::TestDir::new("a13-live-backup-target");
+	let restored = WendelonNode::restore_from_cluster_backup(
+		&backup,
+		NodeBootstrapConfig::dev(1, target.to_path_buf(), "127.0.0.1:0".into()),
+	)
+	.await
+	.unwrap_or_else(|error| {
+		panic!("A13 exported live backup must restore its own declared control cut: {error}")
+	});
+	restored.shutdown().await.unwrap();
+	assert!(target.join("CLEAN_SHUTDOWN").exists());
 }

@@ -117,6 +117,7 @@ async fn wait_for_key_count(
 	loop {
 		let mut keys: Vec<u64> = slab
 			.scan_as_of(tenant(), range_start, range_end, as_of)
+			.unwrap()
 			.into_iter()
 			.map(|(key, _)| key)
 			.collect();

@@ -25,6 +25,7 @@ pub struct LsmCompactionWorker {
 pub struct LsmPreparedOutputs {
 	pub decisions: Vec<SurvivorOrDrop>,
 	pub output_runs: Vec<PlannedOutputRun>,
+	pub(crate) input_authority: Option<Vec<crate::storage::index::LsmInputAuthority>>,
 }
 
 #[async_trait]
@@ -208,6 +209,7 @@ impl LsmCompactionWorker {
 		Ok(LsmPreparedOutputs {
 			decisions,
 			output_runs,
+			input_authority: None,
 		})
 	}
 

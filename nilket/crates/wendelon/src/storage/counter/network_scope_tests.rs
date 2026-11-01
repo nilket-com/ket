@@ -248,7 +248,12 @@ async fn b1d_dispatch_context_then_phase_then_zero_missing_mismatch_order() {
 			expected
 		);
 		assert_eq!(node.slab.local_l1_bytes().await, before);
-		assert!(node.slab.counter_lookup(tenant(7), meta_key()).is_some());
+		assert!(
+			node.slab
+				.counter_lookup(tenant(7), meta_key())
+				.unwrap()
+				.is_some()
+		);
 	}
 	let rollback = CounterRollbackRequestMeta {
 		key_identity: key,
@@ -268,7 +273,7 @@ async fn b1d_dispatch_context_then_phase_then_zero_missing_mismatch_order() {
 		.status,
 		CounterReplicaStatus::OK
 	);
-	assert!(node.slab.counter_lookup(tenant(7), key).is_none());
+	assert!(node.slab.counter_lookup(tenant(7), key).unwrap().is_none());
 	shutdown(node).await;
 }
 fn meta_key() -> Identity {
@@ -299,14 +304,14 @@ async fn b1d_dispatch_uses_authenticated_origin_not_epoch_or_target_for_scope() 
 	}
 	assert_eq!(
 		node.slab
-			.counter_read_value(node.slab.counter_lookup(tenant(7), a).unwrap())
+			.counter_read_value(node.slab.counter_lookup(tenant(7), a).unwrap().unwrap())
 			.await
 			.unwrap(),
 		11
 	);
 	assert_eq!(
 		node.slab
-			.counter_read_value(node.slab.counter_lookup(tenant(7), b).unwrap())
+			.counter_read_value(node.slab.counter_lookup(tenant(7), b).unwrap().unwrap())
 			.await
 			.unwrap(),
 		22
@@ -331,8 +336,8 @@ async fn b1d_dispatch_uses_authenticated_origin_not_epoch_or_target_for_scope() 
 		CounterReplicaStatus::INTERNAL_ERROR
 	);
 	assert_eq!(node.slab.local_l1_bytes().await, before);
-	assert!(node.slab.counter_lookup(tenant(7), a).is_some());
-	assert!(node.slab.counter_lookup(tenant(7), b).is_some());
+	assert!(node.slab.counter_lookup(tenant(7), a).unwrap().is_some());
+	assert!(node.slab.counter_lookup(tenant(7), b).unwrap().is_some());
 	let mut commit = one;
 	commit.phase = CounterReplicaPhase::COMMIT;
 	commit.epoch = 0;
@@ -366,7 +371,7 @@ async fn b1d_dispatch_uses_authenticated_origin_not_epoch_or_target_for_scope() 
 		.status,
 		CounterReplicaStatus::OK
 	);
-	assert!(node.slab.counter_lookup(tenant(7), a).is_some());
-	assert!(node.slab.counter_lookup(tenant(7), b).is_none());
+	assert!(node.slab.counter_lookup(tenant(7), a).unwrap().is_some());
+	assert!(node.slab.counter_lookup(tenant(7), b).unwrap().is_none());
 	shutdown(node).await;
 }

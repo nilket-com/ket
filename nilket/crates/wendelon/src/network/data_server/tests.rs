@@ -1829,26 +1829,24 @@ async fn make_manager() -> (crate::test_support::TestDir, Arc<SlabManager>) {
 	let io = spawn_io_thread(64).unwrap();
 	(
 		scratch,
-		Arc::new(
-			SlabManager::open(SlabManagerConfig {
-				dir,
-				max_slab_bytes: 1 << 30,
-				io,
-				l2: None,
-				rehydration: crate::storage::manager::RehydrationPolicy::default(),
-				l2_column_fetch: Default::default(),
-				row_group_writer: Default::default(),
-				l2_row_group_fetch: Default::default(),
-				encoding_writer: Default::default(),
-				l2_chunk_layout: Default::default(),
-				l2_encoding_fetch: Default::default(),
-				encoding_compute: Default::default(),
-				group_commit: crate::storage::GroupCommitConfig::default(),
-				crypto: test_crypto(),
-			})
-			.await
-			.unwrap(),
-		),
+		SlabManager::initialize_new_store(SlabManagerConfig {
+			dir,
+			max_slab_bytes: 1 << 30,
+			io,
+			l2: None,
+			rehydration: crate::storage::manager::RehydrationPolicy::default(),
+			l2_column_fetch: Default::default(),
+			row_group_writer: Default::default(),
+			l2_row_group_fetch: Default::default(),
+			encoding_writer: Default::default(),
+			l2_chunk_layout: Default::default(),
+			l2_encoding_fetch: Default::default(),
+			encoding_compute: Default::default(),
+			group_commit: crate::storage::GroupCommitConfig::default(),
+			crypto: test_crypto(),
+		})
+		.await
+		.unwrap(),
 	)
 }
 
@@ -1863,26 +1861,24 @@ async fn make_manager_with_l2(
 	rehydration.tail_read_window_bytes = 256 + 16;
 	(
 		scratch,
-		Arc::new(
-			SlabManager::open(SlabManagerConfig {
-				dir,
-				max_slab_bytes: 1 << 30,
-				io,
-				l2: Some(l2),
-				rehydration,
-				l2_column_fetch: Default::default(),
-				row_group_writer: Default::default(),
-				l2_row_group_fetch: Default::default(),
-				encoding_writer: Default::default(),
-				l2_chunk_layout: Default::default(),
-				l2_encoding_fetch: Default::default(),
-				encoding_compute: Default::default(),
-				group_commit: crate::storage::GroupCommitConfig::default(),
-				crypto: test_crypto(),
-			})
-			.await
-			.unwrap(),
-		),
+		SlabManager::initialize_new_store(SlabManagerConfig {
+			dir,
+			max_slab_bytes: 1 << 30,
+			io,
+			l2: Some(l2),
+			rehydration,
+			l2_column_fetch: Default::default(),
+			row_group_writer: Default::default(),
+			l2_row_group_fetch: Default::default(),
+			encoding_writer: Default::default(),
+			l2_chunk_layout: Default::default(),
+			l2_encoding_fetch: Default::default(),
+			encoding_compute: Default::default(),
+			group_commit: crate::storage::GroupCommitConfig::default(),
+			crypto: test_crypto(),
+		})
+		.await
+		.unwrap(),
 	)
 }
 
@@ -1897,30 +1893,28 @@ async fn make_manager_with_l2_projected_fetch(
 	rehydration.tail_read_window_bytes = 256 + 16;
 	(
 		scratch,
-		Arc::new(
-			SlabManager::open(SlabManagerConfig {
-				dir,
-				max_slab_bytes: 1 << 30,
-				io,
-				l2: Some(l2),
-				rehydration,
-				l2_column_fetch: crate::storage::columnar::L2ColumnFetchConfig {
-					enabled: true,
-					min_record_bytes: crate::schema::RecordBodyByteLen::try_new(1).unwrap(),
-					..Default::default()
-				},
-				row_group_writer: Default::default(),
-				l2_row_group_fetch: Default::default(),
-				encoding_writer: Default::default(),
-				l2_chunk_layout: Default::default(),
-				l2_encoding_fetch: Default::default(),
-				encoding_compute: Default::default(),
-				group_commit: crate::storage::GroupCommitConfig::default(),
-				crypto: test_crypto(),
-			})
-			.await
-			.unwrap(),
-		),
+		SlabManager::initialize_new_store(SlabManagerConfig {
+			dir,
+			max_slab_bytes: 1 << 30,
+			io,
+			l2: Some(l2),
+			rehydration,
+			l2_column_fetch: crate::storage::columnar::L2ColumnFetchConfig {
+				enabled: true,
+				min_record_bytes: crate::schema::RecordBodyByteLen::try_new(1).unwrap(),
+				..Default::default()
+			},
+			row_group_writer: Default::default(),
+			l2_row_group_fetch: Default::default(),
+			encoding_writer: Default::default(),
+			l2_chunk_layout: Default::default(),
+			l2_encoding_fetch: Default::default(),
+			encoding_compute: Default::default(),
+			group_commit: crate::storage::GroupCommitConfig::default(),
+			crypto: test_crypto(),
+		})
+		.await
+		.unwrap(),
 	)
 }
 
@@ -1935,53 +1929,51 @@ async fn make_manager_with_l2_encoded_compute(
 	rehydration.tail_read_window_bytes = 256 + 16;
 	(
 		scratch,
-		Arc::new(
-			SlabManager::open(SlabManagerConfig {
-				dir,
-				max_slab_bytes: 1 << 30,
-				io,
-				l2: Some(l2),
-				rehydration,
-				l2_column_fetch: crate::storage::columnar::L2ColumnFetchConfig {
-					enabled: true,
-					min_record_bytes: crate::schema::RecordBodyByteLen::try_new(1).unwrap(),
-					..Default::default()
-				},
-				row_group_writer:
-					crate::storage::row_group::RowGroupWriterConfig::point_read_with_overrides(
-						crate::schema::RowGroupRowCount::new(4),
-						crate::schema::RowGroupRowCount::new(8),
-						RowCount::new(1),
-						crate::schema::RecordBodyByteLen::new(1),
-					)
-					.with_enabled(true),
-				l2_row_group_fetch: crate::storage::row_group::L2RowGroupFetchConfig {
-					enabled: true,
-					max_selected_row_group_fraction_micros:
-						crate::storage::row_group::L2_ROW_GROUP_FETCH_FRACTION_DENOMINATOR - 1,
-					..Default::default()
-				},
-				encoding_writer: EncodingWriterConfig {
-					enabled: true,
-					target_simd_page_values: crate::schema::SimdPageValueCount::new(4),
-					min_buffer_bytes_for_encoding: crate::schema::RecordBodyByteLen::new(1),
-					..Default::default()
-				},
-				l2_chunk_layout: Default::default(),
-				l2_encoding_fetch: crate::storage::encoding::L2EncodingFetchConfig {
-					enabled: true,
-					..Default::default()
-				},
-				encoding_compute: crate::storage::encoding::EncodingComputeConfig {
-					enabled: true,
-					..Default::default()
-				},
-				group_commit: crate::storage::GroupCommitConfig::default(),
-				crypto: test_crypto(),
-			})
-			.await
-			.unwrap(),
-		),
+		SlabManager::initialize_new_store(SlabManagerConfig {
+			dir,
+			max_slab_bytes: 1 << 30,
+			io,
+			l2: Some(l2),
+			rehydration,
+			l2_column_fetch: crate::storage::columnar::L2ColumnFetchConfig {
+				enabled: true,
+				min_record_bytes: crate::schema::RecordBodyByteLen::try_new(1).unwrap(),
+				..Default::default()
+			},
+			row_group_writer:
+				crate::storage::row_group::RowGroupWriterConfig::point_read_with_overrides(
+					crate::schema::RowGroupRowCount::new(4),
+					crate::schema::RowGroupRowCount::new(8),
+					RowCount::new(1),
+					crate::schema::RecordBodyByteLen::new(1),
+				)
+				.with_enabled(true),
+			l2_row_group_fetch: crate::storage::row_group::L2RowGroupFetchConfig {
+				enabled: true,
+				max_selected_row_group_fraction_micros:
+					crate::storage::row_group::L2_ROW_GROUP_FETCH_FRACTION_DENOMINATOR - 1,
+				..Default::default()
+			},
+			encoding_writer: EncodingWriterConfig {
+				enabled: true,
+				target_simd_page_values: crate::schema::SimdPageValueCount::new(4),
+				min_buffer_bytes_for_encoding: crate::schema::RecordBodyByteLen::new(1),
+				..Default::default()
+			},
+			l2_chunk_layout: Default::default(),
+			l2_encoding_fetch: crate::storage::encoding::L2EncodingFetchConfig {
+				enabled: true,
+				..Default::default()
+			},
+			encoding_compute: crate::storage::encoding::EncodingComputeConfig {
+				enabled: true,
+				..Default::default()
+			},
+			group_commit: crate::storage::GroupCommitConfig::default(),
+			crypto: test_crypto(),
+		})
+		.await
+		.unwrap(),
 	)
 }
 
@@ -2073,6 +2065,7 @@ async fn append_append_only_tombstones_for_query(
 			key_identity: *row_key_id,
 			routing_locality: mgr
 				.routing_locality_for_existing_key(tenant(), *row_key_id)
+				.unwrap()
 				.expect("append-only test row must have cached routing locality"),
 			row_hlc: delete_hlc,
 			is_tombstone: true,
@@ -2327,18 +2320,18 @@ async fn scan_collects_entries_in_inclusive_range() {
 	seed_record(&mgr, 50, hlc(2, 0, 1), b"k50", b"v50").await;
 	seed_record(&mgr, 99, hlc(3, 0, 1), b"k99", b"v99").await;
 
-	let hits = mgr.scan(tenant(), 10, 50);
+	let hits = mgr.scan(tenant(), 10, 50).unwrap();
 	let keys: Vec<u64> = hits.iter().map(|(k, _)| *k).collect();
 	assert_eq!(keys, vec![10, 50]);
 
-	let full = mgr.scan(tenant(), 0, u64::MAX);
+	let full = mgr.scan(tenant(), 0, u64::MAX).unwrap();
 	assert_eq!(full.len(), 3);
 
-	let miss = mgr.scan(tenant(), 60, 90);
+	let miss = mgr.scan(tenant(), 60, 90).unwrap();
 	assert!(miss.is_empty());
 
 	// Inverted range → empty, never panics.
-	let inverted = mgr.scan(tenant(), 100, 5);
+	let inverted = mgr.scan(tenant(), 100, 5).unwrap();
 	assert!(inverted.is_empty());
 }
 
@@ -4852,7 +4845,10 @@ async fn aggregate_plan_uses_encoded_l2_partials_when_supported() {
 		}],
 		retention_floor: None,
 	};
-	let first_location = mgr.lookup(tenant(), admission.key_identities[0]).unwrap();
+	let first_location = mgr
+		.lookup(tenant(), admission.key_identities[0])
+		.unwrap()
+		.unwrap();
 	let direct_encoded = mgr
 		.read_encoded_aggregate_record(first_location, &descriptor, &request, &prepared.program)
 		.await
@@ -5436,6 +5432,7 @@ async fn table_write_single_row_commits_typed_arrow_payload() {
 	let location = node
 		.slab
 		.lookup(tenant(), key_identity)
+		.unwrap()
 		.expect("table row should be indexed by PK-derived identity");
 	let stored = decode_batch(&node.slab.read(location).await.unwrap()).unwrap();
 	assert_eq!(stored.schema().as_ref(), &typed_table_schema());
@@ -5783,6 +5780,7 @@ async fn adr0539_two_ordinary_sampler_sized_ingest_cycles_remain_readable() {
 			let location = node
 				.slab
 				.lookup(tenant(), key_identity)
+				.unwrap()
 				.expect("acknowledged row must remain indexed");
 			let stored = decode_batch(&node.slab.read(location).await.unwrap()).unwrap();
 			assert!(stored.num_rows() > 0);
@@ -5858,6 +5856,7 @@ async fn content_hash_table_write_absorbs_visible_duplicate_content() {
 	let first_location = node
 		.slab
 		.lookup(tenant(), key_identity)
+		.unwrap()
 		.expect("content-hash row should be indexed by content-derived identity");
 	assert!(!first_location.is_tombstone);
 
@@ -5877,7 +5876,7 @@ async fn content_hash_table_write_absorbs_visible_duplicate_content() {
 	assert_eq!(duplicate_resp.write.log_index, 0);
 	assert!(duplicate_trailing.is_none());
 	assert_eq!(
-		node.slab.lookup(tenant(), key_identity),
+		node.slab.lookup(tenant(), key_identity).unwrap(),
 		Some(first_location),
 		"absorbed duplicate must not replace the visible row location"
 	);
@@ -5940,6 +5939,7 @@ async fn content_hash_table_write_filters_duplicate_rows_within_batch() {
 	let location = node
 		.slab
 		.lookup(tenant(), key_identity)
+		.unwrap()
 		.expect("content-hash row should be indexed after filtering in-batch duplicate");
 	assert!(!location.is_tombstone);
 	let stored = decode_batch(&node.slab.read(location).await.unwrap()).unwrap();
@@ -6051,6 +6051,7 @@ async fn content_hash_table_reingest_after_logical_retention_floor_stores_new_ro
 	let first_location = server
 		.slab
 		.lookup(tenant(), key_identity)
+		.unwrap()
 		.expect("first content-hash row should be indexed");
 	assert!(!first_location.is_tombstone);
 
@@ -6066,11 +6067,12 @@ async fn content_hash_table_reingest_after_logical_retention_floor_stores_new_ro
 			first_location.hlc,
 			&effective_retention,
 			&server.slab,
-		),
+		)
+		.unwrap(),
 		"old row must be logically hidden before compaction removes the index entry"
 	);
 	assert_eq!(
-		server.slab.lookup(tenant(), key_identity),
+		server.slab.lookup(tenant(), key_identity).unwrap(),
 		Some(first_location),
 		"regression setup requires the expired row to remain physically indexed"
 	);
@@ -6089,6 +6091,7 @@ async fn content_hash_table_reingest_after_logical_retention_floor_stores_new_ro
 	let reingest_location = server
 		.slab
 		.lookup(tenant(), key_identity)
+		.unwrap()
 		.expect("reingested content-hash row should be indexed");
 	assert_ne!(
 		reingest_location, first_location,
@@ -6106,7 +6109,7 @@ async fn content_hash_table_reingest_after_logical_retention_floor_stores_new_ro
 		"freshly visible reingested content should absorb subsequent duplicates"
 	);
 	assert_eq!(
-		server.slab.lookup(tenant(), key_identity),
+		server.slab.lookup(tenant(), key_identity).unwrap(),
 		Some(reingest_location)
 	);
 
@@ -6158,6 +6161,7 @@ async fn column_projection_write_preserves_slab_record_header_layout() {
 	let location = node
 		.slab
 		.lookup(tenant(), key_identity)
+		.unwrap()
 		.expect("table row should be indexed by PK-derived identity");
 	let slab_path = dir.join(format!("slab_{:016x}.wnd", location.slab_id.get()));
 	let mut file = std::fs::File::open(slab_path).unwrap();
@@ -6278,7 +6282,7 @@ async fn pk_table_delete_supersedes_single_row_and_allows_resurrection() {
 	.unwrap();
 	let target = first_admission.key_identities[0];
 	let missing = Identity::new([0x52; 32]);
-	let first_location = node.slab.lookup(tenant(), target).unwrap();
+	let first_location = node.slab.lookup(tenant(), target).unwrap().unwrap();
 	assert!(!first_location.is_tombstone);
 
 	let mut delete_meta: TableDeleteRowsRequestMeta = bytemuck::Zeroable::zeroed();
@@ -6307,7 +6311,7 @@ async fn pk_table_delete_supersedes_single_row_and_allows_resurrection() {
 	assert_eq!(delete_resp.not_found_count, 1);
 	assert!(trailing.is_none());
 
-	let tombstone_location = node.slab.lookup(tenant(), target).unwrap();
+	let tombstone_location = node.slab.lookup(tenant(), target).unwrap().unwrap();
 	assert!(tombstone_location.is_tombstone);
 	assert_eq!(tombstone_location.hlc, delete_resp.write.commit_hlc);
 	let tombstone_frame = node.slab.read(tombstone_location).await.unwrap();
@@ -6335,6 +6339,7 @@ async fn pk_table_delete_supersedes_single_row_and_allows_resurrection() {
 			.slab
 			.lookup_as_of(tenant(), target, first_resp.write.commit_hlc)
 			.unwrap()
+			.unwrap()
 			.is_tombstone
 	);
 
@@ -6359,12 +6364,13 @@ async fn pk_table_delete_supersedes_single_row_and_allows_resurrection() {
 		.await
 		.unwrap();
 	assert_eq!(resurrection_resp.write.status, WriteStatus::OK);
-	let latest_location = node.slab.lookup(tenant(), target).unwrap();
+	let latest_location = node.slab.lookup(tenant(), target).unwrap().unwrap();
 	assert!(!latest_location.is_tombstone);
 	assert!(latest_location.hlc > tombstone_location.hlc);
 	assert!(
 		node.slab
-			.slab_has_supersession_at(tombstone_location.slab_id, latest_location.hlc),
+			.slab_has_supersession_at(tombstone_location.slab_id, latest_location.hlc)
+			.unwrap(),
 		"resurrection must mark the tombstone slab as superseded for CSB safety"
 	);
 	let latest_frame = node.slab.read(latest_location).await.unwrap();
@@ -6460,19 +6466,25 @@ async fn pk_delete_read_surfaces_track_tombstone_and_resurrection() {
 	let pre_delete = node
 		.slab
 		.lookup_as_of(tenant(), deleted_key, initial_resp.write.commit_hlc)
+		.unwrap()
 		.expect("deleted key should have a data version before delete");
 	assert!(!pre_delete.is_tombstone);
 	let at_delete = node
 		.slab
 		.lookup_as_of(tenant(), deleted_key, delete_resp.write.commit_hlc)
+		.unwrap()
 		.expect("deleted key should have a tombstone at delete HLC");
 	assert!(at_delete.is_tombstone);
-	let scan_at_delete =
-		node.slab
-			.scan_as_of_with_identity(tenant(), 0, u64::MAX, delete_resp.write.commit_hlc);
+	let scan_at_delete = node
+		.slab
+		.scan_as_of_with_identity(tenant(), 0, u64::MAX, delete_resp.write.commit_hlc)
+		.unwrap();
 	assert!(scan_at_delete.iter().any(|(key, _)| *key == keep_key));
 	assert!(!scan_at_delete.iter().any(|(key, _)| *key == deleted_key));
-	let versions = node.slab.scan_all_versions(0, u64::MAX, hlc(0, 0, 0));
+	let versions = node
+		.slab
+		.scan_all_versions(0, u64::MAX, hlc(0, 0, 0))
+		.unwrap();
 	assert!(
 		versions
 			.iter()
@@ -6522,6 +6534,7 @@ async fn pk_delete_read_surfaces_track_tombstone_and_resurrection() {
 	let latest = node
 		.slab
 		.lookup_as_of(tenant(), deleted_key, resurrection_resp.write.commit_hlc)
+		.unwrap()
 		.expect("resurrected key should have a data version");
 	assert!(!latest.is_tombstone);
 
@@ -7120,7 +7133,7 @@ async fn table_delete_emits_tombstone_and_replays_counts() {
 	.unwrap();
 	let target = admission.key_identities[1];
 	let missing = Identity::new([0xEE; 32]);
-	let original_location = node.slab.lookup(tenant(), target).unwrap();
+	let original_location = node.slab.lookup(tenant(), target).unwrap().unwrap();
 	assert!(!original_location.is_tombstone);
 
 	let mut delete_meta: TableDeleteRowsRequestMeta = bytemuck::Zeroable::zeroed();
@@ -7153,9 +7166,10 @@ async fn table_delete_emits_tombstone_and_replays_counts() {
 	let pre_delete = node
 		.slab
 		.lookup_as_of(tenant(), target, write_resp.write.commit_hlc)
+		.unwrap()
 		.unwrap();
 	assert!(!pre_delete.is_tombstone);
-	let tombstone_location = node.slab.lookup(tenant(), target).unwrap();
+	let tombstone_location = node.slab.lookup(tenant(), target).unwrap().unwrap();
 	assert!(tombstone_location.is_tombstone);
 	assert_eq!(tombstone_location.hlc, delete_resp.write.commit_hlc);
 	let tombstone_frame = node.slab.read(tombstone_location).await.unwrap();
@@ -7251,11 +7265,12 @@ async fn table_delete_fails_closed_when_target_locality_is_missing() {
 	)
 	.unwrap();
 	let target = admission.key_identities[0];
-	let original_location = node.slab.lookup(tenant(), target).unwrap();
+	let original_location = node.slab.lookup(tenant(), target).unwrap().unwrap();
 	assert!(!original_location.is_tombstone);
 	assert!(
 		node.slab
 			.routing_locality_for_existing_key(tenant(), target)
+			.unwrap()
 			.is_some()
 	);
 
@@ -7263,6 +7278,7 @@ async fn table_delete_fails_closed_when_target_locality_is_missing() {
 	assert!(
 		node.slab
 			.routing_locality_for_existing_key(tenant(), target)
+			.unwrap()
 			.is_none()
 	);
 
@@ -7296,7 +7312,7 @@ async fn table_delete_fails_closed_when_target_locality_is_missing() {
 	assert_eq!(delete_resp.not_found_count, 0);
 	assert!(trailing.is_none());
 
-	let latest = node.slab.lookup(tenant(), target).unwrap();
+	let latest = node.slab.lookup(tenant(), target).unwrap().unwrap();
 	assert!(!latest.is_tombstone);
 	assert_eq!(latest.hlc, original_location.hlc);
 
@@ -7392,6 +7408,7 @@ async fn table_write_multi_row_commits_one_parent_finalization() {
 		let location = node
 			.slab
 			.lookup(tenant(), key_identity)
+			.unwrap()
 			.expect("table row should be indexed by PK-derived identity");
 		let stored = decode_batch(&node.slab.read(location).await.unwrap()).unwrap();
 		assert_eq!(stored.schema().as_ref(), &typed_table_schema());
@@ -8051,7 +8068,8 @@ async fn adr0095_rf1_sweeper_reclaims_attests_and_settles_the_exact_debt() {
 	);
 	let post_cursor_references = node
 		.slab
-		.table_drop_reference_counts(tenant(), descriptor.table_object_id);
+		.table_drop_reference_counts(tenant(), descriptor.table_object_id)
+		.unwrap();
 	assert!(
 		!post_cursor_references.is_empty(),
 		"the race fixture must publish a target-bearing replacement: {post_cursor_references:?}"
@@ -8122,10 +8140,11 @@ async fn adr0095_rf1_sweeper_reclaims_attests_and_settles_the_exact_debt() {
 	assert!(
 		node.slab
 			.table_drop_reference_counts(tenant(), descriptor.table_object_id)
+			.unwrap()
 			.is_empty()
 	);
 	for key in keys {
-		assert!(node.slab.lookup(tenant(), key).is_none());
+		assert!(node.slab.lookup(tenant(), key).unwrap().is_none());
 	}
 	let phase_events = phase_events.lock().expect("captured phase event mutex");
 	let transitions = phase_events
@@ -8214,6 +8233,7 @@ async fn table_query_dispatch_materializes_multirow_records_before_pbc() {
 	let stored_location = node
 		.slab
 		.lookup(tenant(), stored_key)
+		.unwrap()
 		.expect("compressed multi-row frame should be indexed");
 	let stored_frame = node.slab.read(stored_location).await.unwrap();
 	assert_eq!(
@@ -8394,6 +8414,7 @@ async fn aggregate_dispatch_folds_filtered_table_rows() {
 	let stored_location = node
 		.slab
 		.lookup(tenant(), stored_key)
+		.unwrap()
 		.expect("compressed multi-row frame should be indexed");
 	let stored_frame = node.slab.read(stored_location).await.unwrap();
 	assert_eq!(
@@ -9712,6 +9733,7 @@ async fn table_write_fans_out_child_groups_to_distinct_replica_sets() {
 		leader_node
 			.slab
 			.lookup(tenant(), expected.children[0].key_identity)
+			.unwrap()
 			.is_some(),
 		"leader should store the first child group where it is a replica"
 	);
@@ -9719,6 +9741,7 @@ async fn table_write_fans_out_child_groups_to_distinct_replica_sets() {
 		durable_a_node
 			.slab
 			.lookup(tenant(), expected.children[0].key_identity)
+			.unwrap()
 			.is_some(),
 		"durable_a should receive the first child group"
 	);
@@ -9726,6 +9749,7 @@ async fn table_write_fans_out_child_groups_to_distinct_replica_sets() {
 		durable_b_node
 			.slab
 			.lookup(tenant(), expected.children[1].key_identity)
+			.unwrap()
 			.is_some(),
 		"durable_b should receive the remote-only child group"
 	);
@@ -9733,6 +9757,7 @@ async fn table_write_fans_out_child_groups_to_distinct_replica_sets() {
 		leader_node
 			.slab
 			.lookup(tenant(), expected.children[1].key_identity)
+			.unwrap()
 			.is_none(),
 		"leader must not locally append a child for a replica set it is not in"
 	);
@@ -10075,7 +10100,10 @@ async fn pending_finalization_replays_after_restart_when_control_branch_failed()
 		1
 	);
 	assert!(
-		node.slab.lookup(tenant(), meta.key_identity).is_some(),
+		node.slab
+			.lookup(tenant(), meta.key_identity)
+			.unwrap()
+			.is_some(),
 		"data branch must stay durable locally across the control-branch failure"
 	);
 
@@ -10400,7 +10428,10 @@ async fn write_commits_and_fences_when_pending_intent_persistence_fails() {
 		0
 	);
 	assert!(
-		node.slab.lookup(tenant(), meta.key_identity).is_some(),
+		node.slab
+			.lookup(tenant(), meta.key_identity)
+			.unwrap()
+			.is_some(),
 		"data branch must remain durable even though finalization intent persistence failed"
 	);
 	assert_eq!(
@@ -10471,7 +10502,10 @@ async fn write_fences_when_pending_intent_persistence_and_immediate_finalization
 		0
 	);
 	assert!(
-		node.slab.lookup(tenant(), meta.key_identity).is_some(),
+		node.slab
+			.lookup(tenant(), meta.key_identity)
+			.unwrap()
+			.is_some(),
 		"data branch must remain durable even though finalization cannot be recovered on this node"
 	);
 
@@ -10634,15 +10668,13 @@ async fn migrate_range_page_streams_every_version_of_fat_key() {
 	}
 
 	// Emulate the paging driver exactly the way `handle_migrate`
-	// does: scan, truncate at `max_records`, emit
-	// `(next_cursor_hash, next_cursor_hlc)` as the last row's
-	// `(key, hlc)`, loop until `has_more == 0`.
+	// does: scan, truncate at `max_records`, emit the last row's
+	// full cursor, loop until `has_more == 0`.
 	let mut collected: Vec<HybridTimestamp> = Vec::new();
-	let mut cursor_identity = Identity::ZERO;
-	let mut cursor_hlc: HybridTimestamp = hlc(0, 0, 0);
+	let mut cursor: Option<MigrationCursor> = None;
 	let max_records: usize = 10;
 	for _ in 0..15 {
-		let locations = mgr.scan_all_versions_from(key, key, floor, cursor_identity, cursor_hlc);
+		let locations = mgr.scan_all_versions_from(key, key, floor, cursor).unwrap();
 		if locations.is_empty() {
 			break;
 		}
@@ -10655,9 +10687,13 @@ async fn migrate_range_page_streams_every_version_of_fat_key() {
 		if !truncated {
 			break;
 		}
-		let (_last_tenant_id, last_h, _last_routing_locality, last_loc) = locations[take - 1];
-		cursor_identity = last_h;
-		cursor_hlc = last_loc.hlc;
+		let (last_tenant_id, last_h, last_routing_locality, last_loc) = locations[take - 1];
+		cursor = Some(MigrationCursor {
+			locality: last_routing_locality,
+			tenant_id: last_tenant_id,
+			key_identity: last_h,
+			hlc: last_loc.hlc,
+		});
 	}
 
 	assert_eq!(collected.len(), 100, "every version must cross the wire");
@@ -10696,13 +10732,13 @@ async fn migrate_point_read_falls_through_missing_source_to_populated_one() {
 	// an empty scan on `source_empty` is what becomes
 	// `KEY_NOT_FOUND` on the wire, telling the caller to try the
 	// next candidate.
-	let miss = source_empty.scan_all_versions(key, key, floor);
+	let miss = source_empty.scan_all_versions(key, key, floor).unwrap();
 	assert!(miss.is_empty(), "empty source must not surface a row");
 
 	// Next candidate in the ledger's `source_replicas` list
 	// actually has the record. The destination ingests it via
 	// the same `append_migration` path the real loop uses.
-	let hits = source_full.scan_all_versions(key, key, floor);
+	let hits = source_full.scan_all_versions(key, key, floor).unwrap();
 	assert_eq!(hits.len(), 1);
 	let (tenant_id, h, routing_locality, loc) = hits[0];
 	assert_eq!(tenant_id, tenant());
@@ -10721,7 +10757,7 @@ async fn migrate_point_read_falls_through_missing_source_to_populated_one() {
 		.await
 		.unwrap();
 
-	let found = destination.lookup_as_of(tenant(), id(key), v);
+	let found = destination.lookup_as_of(tenant(), id(key), v).unwrap();
 	assert!(
 		found.is_some(),
 		"destination must resolve the key after falling through to a populated source"
@@ -10755,7 +10791,7 @@ async fn query_merge_over_partially_migrated_range_sees_every_row() {
 	// destination, mimicking `pull_migration_range` without the
 	// network. Every record goes through `append_migration`, the
 	// idempotent ingest boundary — so a rerun would be a no-op.
-	let pulled = source.scan_all_versions_from(0, 99, floor, Identity::ZERO, floor);
+	let pulled = source.scan_all_versions_from(0, 99, floor, None).unwrap();
 	for (tenant_id, h, routing_locality, loc) in pulled {
 		let frame = source.read(loc).await.unwrap();
 		let payload_hash = payload_digest(&frame);
@@ -10774,7 +10810,7 @@ async fn query_merge_over_partially_migrated_range_sees_every_row() {
 	}
 
 	// A window scan on the destination now sees the union.
-	let merged = destination.scan_as_of(tenant(), 0, 99, v);
+	let merged = destination.scan_as_of(tenant(), 0, 99, v).unwrap();
 	let mut keys: Vec<u64> = merged.iter().map(|(k, _)| *k).collect();
 	keys.sort();
 	keys.dedup();
@@ -10818,7 +10854,7 @@ async fn drain_all_sources_unions_disjoint_halves() {
 	// Simulate pull_migration_range's drain-all behavior: walk
 	// *every* candidate in source_replicas, not just the first.
 	for src in [&source_a, &source_b] {
-		let rows = src.scan_all_versions_from(0, 99, floor, Identity::ZERO, floor);
+		let rows = src.scan_all_versions_from(0, 99, floor, None).unwrap();
 		for (tenant_id, h, routing_locality, loc) in rows {
 			let frame = src.read(loc).await.unwrap();
 			let payload_hash = payload_digest(&frame);
@@ -10837,7 +10873,7 @@ async fn drain_all_sources_unions_disjoint_halves() {
 		}
 	}
 
-	let merged = destination.scan_as_of(tenant(), 0, 99, v);
+	let merged = destination.scan_as_of(tenant(), 0, 99, v).unwrap();
 	let mut keys: Vec<u64> = merged.iter().map(|(k, _)| *k).collect();
 	keys.sort();
 	keys.dedup();
@@ -10931,7 +10967,10 @@ async fn lookup_as_of_miss_after_newer_only_ingest_proves_fallthrough_needed() {
 	// Client wants a version ≤ older.physical_ms; newer-only
 	// ingest cannot satisfy the read.
 	assert!(
-		destination.lookup_as_of(tenant(), id(key), older).is_none(),
+		destination
+			.lookup_as_of(tenant(), id(key), older)
+			.unwrap()
+			.is_none(),
 		"newer-only ingest must not be treated as authoritative for older as_of"
 	);
 
@@ -10947,7 +10986,10 @@ async fn lookup_as_of_miss_after_newer_only_ingest_proves_fallthrough_needed() {
 		.await
 		.unwrap();
 	assert!(
-		destination.lookup_as_of(tenant(), id(key), older).is_some(),
+		destination
+			.lookup_as_of(tenant(), id(key), older)
+			.unwrap()
+			.is_some(),
 		"after ingesting from a second source, the as_of read resolves"
 	);
 }
@@ -11617,7 +11659,8 @@ impl ReplicaRouter for FixedReplicaRouter {
 }
 
 struct CrashyReplicaState {
-	manager: Arc<SlabManager>,
+	manager: Option<Arc<SlabManager>>,
+	owner: Option<crate::storage::ownership::DataDirectoryOwner>,
 	volatile_cutoffs: StdHashMap<SlabId, u64>,
 }
 
@@ -11628,7 +11671,6 @@ struct CrashyReplicaState {
 /// between append and flush.
 struct CrashyReplicaService {
 	dir: std::path::PathBuf,
-	io: crate::storage::io_uring::IoRingHandle,
 	max_slab_bytes: u64,
 	pool: Arc<BufPool>,
 	state: TokioMutex<CrashyReplicaState>,
@@ -11636,10 +11678,14 @@ struct CrashyReplicaService {
 
 impl CrashyReplicaService {
 	async fn open(dir: std::path::PathBuf, pool: Arc<BufPool>) -> Arc<Self> {
-		let io = spawn_io_thread(64).unwrap();
+		std::fs::create_dir_all(&dir).unwrap();
+		let owner = crate::storage::ownership::DataDirectoryOwner::acquire_existing(&dir).unwrap();
+		let io = spawn_io_thread(64)
+			.unwrap()
+			.with_data_directory_owner(owner.clone());
 		let max_slab_bytes = 1 << 30;
-		let manager = Arc::new(
-			SlabManager::open(SlabManagerConfig {
+		let manager = SlabManager::initialize_new_store_with_owner(
+			SlabManagerConfig {
 				dir: dir.clone(),
 				max_slab_bytes,
 				io: io.clone(),
@@ -11654,56 +11700,101 @@ impl CrashyReplicaService {
 				encoding_compute: Default::default(),
 				group_commit: crate::storage::GroupCommitConfig::default(),
 				crypto: test_crypto(),
-			})
-			.await
-			.unwrap(),
-		);
+			},
+			owner.clone(),
+		)
+		.await
+		.unwrap();
 		Arc::new(Self {
 			dir,
-			io,
 			max_slab_bytes,
 			pool,
 			state: TokioMutex::new(CrashyReplicaState {
-				manager,
+				manager: Some(manager),
+				owner: Some(owner),
 				volatile_cutoffs: StdHashMap::new(),
 			}),
 		})
 	}
 
 	async fn manager(&self) -> Arc<SlabManager> {
-		self.state.lock().await.manager.clone()
+		self.state
+			.lock()
+			.await
+			.manager
+			.as_ref()
+			.expect("replica manager is open")
+			.clone()
 	}
 
 	async fn crash_and_recover(&self) {
 		let mut state = self.state.lock().await;
-		for (slab_id, cutoff) in state.volatile_cutoffs.drain() {
+		// A process crash releases every old database handle before recovery.
+		// The state mutex prevents requests from observing the empty slot.
+		let previous = state.manager.take().expect("replica manager before crash");
+		let old_owner = state.owner.take().expect("replica owner before crash");
+		old_owner
+			.close(std::time::Duration::from_secs(10))
+			.await
+			.unwrap();
+		drop(previous);
+		let owner =
+			crate::storage::ownership::DataDirectoryOwner::acquire_existing(&self.dir).unwrap();
+		let cutoffs: Vec<(SlabId, u64)> = state.volatile_cutoffs.drain().collect();
+		for &(slab_id, cutoff) in &cutoffs {
 			let path = self.dir.join(format!("slab_{slab_id:016x}.wnd"));
 			if !path.exists() {
 				continue;
 			}
+			let _permit = owner.write_permit().unwrap();
 			let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
 			file.set_len(cutoff).unwrap();
 		}
-		state.manager = Arc::new(
-			SlabManager::open(SlabManagerConfig {
-				dir: self.dir.clone(),
-				max_slab_bytes: self.max_slab_bytes,
-				io: self.io.clone(),
-				l2: None,
-				rehydration: crate::storage::manager::RehydrationPolicy::default(),
-				l2_column_fetch: Default::default(),
-				row_group_writer: Default::default(),
-				l2_row_group_fetch: Default::default(),
-				encoding_writer: Default::default(),
-				l2_chunk_layout: Default::default(),
-				l2_encoding_fetch: Default::default(),
-				encoding_compute: Default::default(),
-				group_commit: crate::storage::GroupCommitConfig::default(),
-				crypto: test_crypto(),
+		// A synthetic append-only ack: the crash takes the write's row with its
+		// bytes, as for a write whose row never committed. This models what an
+		// APPEND_ONLY ack promises, not the real non-durable append, which
+		// commits its row before its bytes are synced and is not validated here.
+		if !cutoffs.is_empty() {
+			crate::storage::index::PersistentLocalIndex::open(
+				crate::storage::index::persistent_index_path(&self.dir),
+			)
+			.await
+			.unwrap()
+			.forget_record_rows_for_test(|row| {
+				cutoffs.iter().any(|&(slab_id, cutoff)| {
+					row.location.slab_id == slab_id && row.location.offset >= cutoff
+				})
 			})
+			.await
+			.unwrap();
+		}
+		let io = spawn_io_thread(64)
+			.unwrap()
+			.with_data_directory_owner(owner.clone());
+		state.manager = Some(
+			SlabManager::open_with_owner(
+				SlabManagerConfig {
+					dir: self.dir.clone(),
+					max_slab_bytes: self.max_slab_bytes,
+					io,
+					l2: None,
+					rehydration: crate::storage::manager::RehydrationPolicy::default(),
+					l2_column_fetch: Default::default(),
+					row_group_writer: Default::default(),
+					l2_row_group_fetch: Default::default(),
+					encoding_writer: Default::default(),
+					l2_chunk_layout: Default::default(),
+					l2_encoding_fetch: Default::default(),
+					encoding_compute: Default::default(),
+					group_commit: crate::storage::GroupCommitConfig::default(),
+					crypto: test_crypto(),
+				},
+				owner.clone(),
+			)
 			.await
 			.unwrap(),
 		);
+		state.owner = Some(owner);
 	}
 }
 
@@ -12020,12 +12111,15 @@ async fn write_counts_only_durable_quorum_acks_across_replica_crash_boundary() {
 	let durable_survivors = [
 		fx.leader_slab
 			.lookup(tenant(), durable_key_identity)
+			.unwrap()
 			.is_some(),
 		fx.durable_slab
 			.lookup(tenant(), durable_key_identity)
+			.unwrap()
 			.is_some(),
 		crashy_after_ok
 			.lookup(tenant(), durable_key_identity)
+			.unwrap()
 			.is_some(),
 	]
 	.into_iter()
@@ -12038,6 +12132,7 @@ async fn write_counts_only_durable_quorum_acks_across_replica_crash_boundary() {
 	assert!(
 		!crashy_after_ok
 			.lookup(tenant(), durable_key_identity)
+			.unwrap()
 			.is_some(),
 		"append-only replica must lose its copy across the simulated crash"
 	);
@@ -12068,12 +12163,15 @@ async fn write_counts_only_durable_quorum_acks_across_replica_crash_boundary() {
 	let append_only_survivors = [
 		fx.leader_slab
 			.lookup(tenant(), append_only_key_identity)
+			.unwrap()
 			.is_some(),
 		fx.durable_slab
 			.lookup(tenant(), append_only_key_identity)
+			.unwrap()
 			.is_some(),
 		crashy_after_fail
 			.lookup(tenant(), append_only_key_identity)
+			.unwrap()
 			.is_some(),
 	]
 	.into_iter()
@@ -12391,7 +12489,7 @@ async fn pull_migration_range_unions_disjoint_halves_over_hrft() {
 		.await
 		.expect("drain-all must succeed when both sources are reachable");
 
-	let merged = fx.dest.slab.scan_as_of(tenant(), 0, 99, v);
+	let merged = fx.dest.slab.scan_as_of(tenant(), 0, 99, v).unwrap();
 	let mut keys: Vec<u64> = merged.iter().map(|(k, _)| *k).collect();
 	keys.sort();
 	keys.dedup();
@@ -12427,7 +12525,7 @@ async fn pull_migration_range_idempotent_across_overlapping_sources() {
 		.await
 		.expect("drain-all with overlap must succeed");
 
-	let merged = fx.dest.slab.scan_as_of(tenant(), 0, 99, v);
+	let merged = fx.dest.slab.scan_as_of(tenant(), 0, 99, v).unwrap();
 	let mut keys: Vec<u64> = merged.iter().map(|(k, _)| *k).collect();
 	keys.sort();
 	keys.dedup();
@@ -12439,7 +12537,7 @@ async fn pull_migration_range_idempotent_across_overlapping_sources() {
 
 	// Every key should resolve to exactly one retained version.
 	for &k in &keys {
-		let versions = fx.dest.slab.scan_all_versions(k, k, hlc(0, 0, 0));
+		let versions = fx.dest.slab.scan_all_versions(k, k, hlc(0, 0, 0)).unwrap();
 		assert_eq!(
 			versions.len(),
 			1,
@@ -12482,7 +12580,7 @@ async fn pull_migration_range_pages_through_single_source() {
 		.await
 		.expect("paged drain must succeed");
 
-	let merged = fx.dest.slab.scan_as_of(tenant(), 0, 24, v);
+	let merged = fx.dest.slab.scan_as_of(tenant(), 0, 24, v).unwrap();
 	let mut keys: Vec<u64> = merged.iter().map(|(k, _)| *k).collect();
 	keys.sort();
 	keys.dedup();
@@ -12601,7 +12699,7 @@ async fn pull_migration_range_skips_local_node_in_source_list() {
 		.await
 		.expect("self must be skipped; pull succeeds via source_a");
 
-	let merged = fx.dest.slab.scan_as_of(tenant(), 0, 4, v);
+	let merged = fx.dest.slab.scan_as_of(tenant(), 0, 4, v).unwrap();
 	let mut keys: Vec<u64> = merged.iter().map(|(k, _)| *k).collect();
 	keys.sort();
 	assert_eq!(keys, vec![0, 1, 2, 3, 4]);
@@ -16206,6 +16304,7 @@ pub(super) mod adr0090_route_selection {
 		// the local node holds the row, stamped partitioned, under the V5 chain.
 		let held = mgr
 			.lookup_as_of(tenant(), key_identity, hlc(0, 0, 0))
+			.unwrap()
 			.expect("the partition owner holds the written row");
 		assert_eq!(
 			held.partition,
@@ -16299,12 +16398,18 @@ mod adr0090_mixed_scan {
 
 		// Premise: both placements are genuinely present in the same table.
 		for key in &partitioned_keys {
-			let held = mgr.lookup_as_of(tenant(), *key, hlc(0, 0, 0)).unwrap();
+			let held = mgr
+				.lookup_as_of(tenant(), *key, hlc(0, 0, 0))
+				.unwrap()
+				.unwrap();
 			assert_eq!(held.placement, PlacementSemantics::Partitioned);
 			assert!(held.partition.is_some());
 		}
 		for key in &legacy_keys {
-			let held = mgr.lookup_as_of(tenant(), *key, hlc(0, 0, 0)).unwrap();
+			let held = mgr
+				.lookup_as_of(tenant(), *key, hlc(0, 0, 0))
+				.unwrap()
+				.unwrap();
 			assert_eq!(held.placement, PlacementSemantics::RawLocality);
 			assert_eq!(held.partition, None);
 		}
@@ -16613,7 +16718,10 @@ mod adr0090_membership_transition {
 		// The placement key of every row, read from durable state.
 		let mut keys = Vec::new();
 		for key in partitioned_keys.iter().chain(legacy_keys.iter()) {
-			let held = mgr.lookup_as_of(tenant(), *key, hlc(0, 0, 0)).unwrap();
+			let held = mgr
+				.lookup_as_of(tenant(), *key, hlc(0, 0, 0))
+				.unwrap()
+				.unwrap();
 			keys.push(
 				PlacementKey::from_parts(
 					held.placement,
@@ -16890,11 +16998,15 @@ mod adr0091_typed_stream_errors {
 				Locality::MAX,
 				hlc(0, 0, 0),
 			)
+			.unwrap()
 			.last()
 			.map(|(key_identity, _, _)| *key_identity)
 			.expect("fixture has rows");
 		let _ = &keys;
-		let held = mgr.lookup_as_of(tenant(), poisoned, hlc(0, 0, 0)).unwrap();
+		let held = mgr
+			.lookup_as_of(tenant(), poisoned, hlc(0, 0, 0))
+			.unwrap()
+			.unwrap();
 		assert_eq!(
 			held.placement,
 			PlacementSemantics::Partitioned,
@@ -17153,6 +17265,7 @@ async fn secondary_index_read_serves_partitioned_rows() {
 	let held = node
 		.slab
 		.lookup_as_of(tenant(), admission.key_identities[0], hlc(0, 0, 0))
+		.unwrap()
 		.expect("written row resolves");
 	assert_eq!(
 		held.placement,
@@ -17220,7 +17333,10 @@ async fn adr0090_segment_decoded_locations_resolve_placement_from_the_chain() {
 	let descriptor = append_only_table_descriptor();
 	let keys = append_append_only_rows_for_query(&mgr, &descriptor, vec![7], hlc(10, 0, 1)).await;
 	let key = keys[0];
-	let held = mgr.lookup_as_of(tenant(), key, hlc(0, 0, 0)).unwrap();
+	let held = mgr
+		.lookup_as_of(tenant(), key, hlc(0, 0, 0))
+		.unwrap()
+		.unwrap();
 	assert_eq!(
 		held.placement,
 		PlacementSemantics::Partitioned,
@@ -17671,6 +17787,7 @@ async fn expired_table_outcome_keeps_warm_cache_replay_but_cold_replay_is_indete
 	let location = reopened
 		.slab
 		.lookup(tenant(), key)
+		.unwrap()
 		.expect("previous committed row remains indexed");
 	let stored = decode_batch(&reopened.slab.read(location).await.unwrap()).unwrap();
 	assert_eq!(
@@ -17913,3 +18030,186 @@ mod counter_visibility_tests;
 
 #[path = "counter_write_key/tests.rs"]
 mod counter_write_key_tests;
+
+#[tokio::test]
+async fn data_admission_allows_unrelated_reads_during_snapshot_retirement() {
+	let l2 = Arc::new(MockObjectStore::default());
+	let (_mgr_dir, mgr) = make_manager_with_l2_projected_fetch(l2.clone()).await;
+	let descriptor = append_only_table_descriptor();
+	let old_keys =
+		append_append_only_rows_for_query(&mgr, &descriptor, vec![1], hlc(10, 0, 1)).await;
+	let old_slab =
+		tier_active_slab_with_stats_for_query(&mgr, l2, &descriptor, "tier/scope-old.wnd").await;
+	let keys = append_append_only_rows_for_query(&mgr, &descriptor, vec![2], hlc(11, 0, 1)).await;
+	let (_node_dir, node, server) = aggregate_csb_test_server(
+		mgr.clone(),
+		&descriptor,
+		129,
+		"snapshot-read-scope",
+		Arc::new(crate::consensus::SystemClock),
+		MvccRetentionPolicy::Disabled,
+	)
+	.await;
+	let pause = mgr.pause_snapshot_before_retirement_apply_once();
+	let epoch = mgr.begin_tier_snapshot_install().unwrap();
+	let task = {
+		let mgr = mgr.clone();
+		tokio::spawn(async move {
+			mgr.finish_tier_snapshot_install_at_epoch(vec![], Some(827), epoch)
+				.await
+		})
+	};
+	tokio::time::timeout(Duration::from_secs(60), pause.reached.notified())
+		.await
+		.unwrap();
+	let operator = actor(ActorRole::Operator, None);
+	let read = server.try_admit_data_request(&operator, Some(tenant()), DataOperation::Read);
+	let query = server.try_admit_data_request(&operator, Some(tenant()), DataOperation::Query);
+	let write = server.try_admit_data_request(&operator, Some(tenant()), DataOperation::Write);
+	let new_loc = mgr.lookup(tenant(), keys[0]);
+	let old_loc = mgr.lookup(tenant(), old_keys[0]);
+	pause.resume.notify_one();
+	task.await.unwrap().unwrap();
+	assert!(read.is_ok_and(|result| result.is_ok()));
+	assert!(query.is_ok_and(|result| result.is_ok()));
+	assert!(write.is_err());
+	assert!(new_loc.is_ok_and(|location| location.is_some()));
+	assert!(old_loc.is_err());
+	assert!(mgr.tier_pointer(old_slab).await.is_none());
+	drop(server);
+	shutdown_lease_node(node).await;
+}
+
+#[tokio::test]
+async fn aggregate_with_untracked_tier_summary_uses_exact_row_path() {
+	for mode in 0..3 {
+		let l2 = Arc::new(MockObjectStore::default());
+		let (_mgr_dir, mgr, descriptor) = tier_identity_typed_table_batch_with_stats(
+			l2,
+			vec![1, 2],
+			match mode {
+				0 => "agg-untracked-tombstone.wnd",
+				1 => "agg-untracked-supersession.wnd",
+				_ => "agg-pending-metadata.wnd",
+			},
+		)
+		.await;
+		let mut pointer = mgr.list_tiered_slabs().await.into_iter().next().unwrap();
+		match mode {
+			0 => {
+				pointer.tombstone_metadata = TombstoneMetadata::Untracked;
+				mgr.apply_tier_slab(pointer).await.unwrap();
+			}
+			1 => {
+				pointer.supersession_metadata = SupersessionMetadata::Untracked;
+				mgr.apply_tier_slab(pointer).await.unwrap();
+			}
+			_ => {
+				mgr.stage_pending_metadata_for_test(
+					pointer.slab_id,
+					crate::storage::index::MetadataKind::Supersession,
+				)
+				.await
+				.unwrap()
+				.unwrap();
+			}
+		}
+		let (_node_dir, node, server) = aggregate_csb_test_server(
+			mgr,
+			&descriptor,
+			58 + mode,
+			match mode {
+				0 => "agg-untracked-tombstone-node",
+				1 => "agg-untracked-supersession-node",
+				_ => "agg-pending-metadata-node",
+			},
+			Arc::new(FixedClock { now_ms: 1_000 }),
+			MvccRetentionPolicy::FixedWindow(Duration::from_millis(1_000)),
+		)
+		.await;
+		let request = aggregate_count_request(&descriptor, 599, hlc(99, 0, 1));
+		let response = server.execute_aggregate_local(&request).await.unwrap();
+		assert_eq!(response.status, AggregateStatus::Success);
+		assert_eq!(response.diagnostics.slabs_answered_from_csb, 0);
+		assert_eq!(count_star_partial_value(&response), 2);
+		shutdown_lease_node(node).await;
+	}
+}
+
+/// The migration pull pages by a cursor of key and HLC, without the tenant.
+/// Two tenants at one locality, a page cap of one, and a lower tenant whose key
+/// sorts after the higher tenant's: the pull must still deliver both versions
+/// before it reports success.
+#[tokio::test]
+async fn pull_migration_range_delivers_every_tenant_at_a_shared_locality() {
+	let fx = build_drain_all_fixture("tenant-cursor").await;
+	fx.dest.set_page_caps_for_test(1, 64 * 1024);
+	let locality = Locality::new(5);
+	let (low_tenant, high_tenant) = (TenantId::new(7), TenantId::new(17));
+	let (small_key, large_key) = if id(0xc1) < id(0xc2) {
+		(id(0xc1), id(0xc2))
+	} else {
+		(id(0xc2), id(0xc1))
+	};
+	let v = hlc(9, 0, 1);
+	for (tenant_id, key_identity) in [(low_tenant, large_key), (high_tenant, small_key)] {
+		let bytes = encode_batch(&kv_batch(b"tenant-cursor", b"v")).unwrap();
+		fx.source_a_slab
+			.append_durable_with_locality(tenant_id, key_identity, locality, v, &bytes)
+			.await
+			.unwrap();
+	}
+	let entry = fx.ledger_entry(1010, 0, 10);
+	fx.seed_migration(entry.clone()).await;
+
+	let pulled = fx.dest.pull_migration_range(&entry, 0, 10).await;
+	let delivered = [(low_tenant, large_key), (high_tenant, small_key)]
+		.map(|(tenant_id, key)| fx.dest.slab.lookup(tenant_id, key).unwrap().is_some());
+	println!(
+		"PROBE wc-driver pulled_ok={} delivered={delivered:?}",
+		pulled.is_ok()
+	);
+	assert!(
+		pulled.is_err() || delivered.iter().all(|present| *present),
+		"the pull reported success without delivering every tenant's version"
+	);
+	for node in fx._nodes {
+		shutdown_lease_node(node).await;
+	}
+}
+
+/// The cursor's presence is its own tag: an all-zero cursor is a real
+/// position, distinct from no cursor, and an unknown tag is refused.
+#[test]
+fn migration_cursor_wire_roundtrip_keeps_absent_apart_from_zero() {
+	let zero = MigrationCursor {
+		locality: Locality::new(0),
+		tenant_id: TenantId::ZERO,
+		key_identity: Identity::ZERO,
+		hlc: bytemuck::Zeroable::zeroed(),
+	};
+	let full = MigrationCursor {
+		locality: Locality::new(9),
+		tenant_id: TenantId::new(17),
+		key_identity: id(0xc5),
+		hlc: hlc(4, 2, 1),
+	};
+	let request: MigrateRequestMeta = bytemuck::Zeroable::zeroed();
+	let response: MigrateResponseMeta = bytemuck::Zeroable::zeroed();
+	for cursor in [None, Some(zero), Some(full)] {
+		assert_eq!(request.with_cursor(cursor).cursor().unwrap(), cursor);
+		assert_eq!(
+			response.with_next_cursor(cursor).next_cursor().unwrap(),
+			cursor
+		);
+	}
+	let mut unknown = request.with_cursor(Some(full));
+	unknown.cursor_present = 2;
+	assert_eq!(unknown.cursor().unwrap_err().kind(), ErrorKind::InvalidData);
+	let mut stray = response.with_next_cursor(None);
+	stray.next_cursor_tenant = TenantId::new(1);
+	assert_eq!(
+		stray.next_cursor().unwrap_err().kind(),
+		ErrorKind::InvalidData
+	);
+}

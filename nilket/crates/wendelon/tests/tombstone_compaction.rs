@@ -288,10 +288,12 @@ async fn background_reclaim_rewrites_mixed_slab_and_preserves_live_versions() {
 		let moved_missing = source
 			.slab
 			.lookup_as_of(tenant(), key_identity(moved_key), moved_ts)
+			.unwrap()
 			.is_none();
 		let kept_present = source
 			.slab
 			.lookup_as_of(tenant(), key_identity(kept_key), keep_ts)
+			.unwrap()
 			.is_some();
 		if after_bytes < before_bytes && moved_missing && kept_present {
 			break;
@@ -306,6 +308,7 @@ async fn background_reclaim_rewrites_mixed_slab_and_preserves_live_versions() {
 	let kept_loc = source
 		.slab
 		.lookup_as_of(tenant(), key_identity(kept_key), keep_ts)
+		.unwrap()
 		.expect("kept key retained");
 	let kept_bytes = source.slab.read(kept_loc).await.unwrap();
 	assert_eq!(decode_single_value(&kept_bytes), b"kept-value");
@@ -395,6 +398,7 @@ async fn historical_reads_succeed_from_new_owner_after_source_reclaim() {
 		if source
 			.slab
 			.lookup_as_of(tenant(), key_identity(migrated_key), newer)
+			.unwrap()
 			.is_none()
 		{
 			break;
@@ -495,6 +499,7 @@ async fn mvcc_retention_pruning_is_audit_logged_and_preserves_retained_window_re
 		if node
 			.slab
 			.lookup_as_of(tenant(), key_identity(key), oldest)
+			.unwrap()
 			.is_none()
 			&& audit.contains("\"event_type\":\"mvcc.snapshot_pruned\"")
 		{
@@ -591,6 +596,7 @@ async fn paused_mvcc_retention_prunes_nothing_and_leaves_reads_unchanged() {
 	assert!(
 		node.slab
 			.lookup_as_of(tenant(), key_identity(key), oldest)
+			.unwrap()
 			.is_some(),
 		"a paused node reclaims nothing: the oldest version is still resident"
 	);
@@ -712,6 +718,7 @@ async fn mvcc_retention_fully_pruned_tiered_slab_retires_end_to_end() {
 			&& node
 				.slab
 				.lookup_as_of(tenant(), key_identity(key), oldest)
+				.unwrap()
 				.is_none()
 			&& node.slab.read(oldest_loc).await.is_err()
 			&& audit.contains("\"event_type\":\"mvcc.snapshot_pruned\"")
@@ -727,6 +734,7 @@ async fn mvcc_retention_fully_pruned_tiered_slab_retires_end_to_end() {
 			snapshot.tiered_slabs.contains_key(&retired_slab_id),
 			node.slab
 				.lookup_as_of(tenant(), key_identity(key), oldest)
+				.unwrap()
 				.is_none(),
 			node.slab.read(oldest_loc).await.is_err(),
 			audit.contains("rewrite_action=retire"),

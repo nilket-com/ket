@@ -12,27 +12,29 @@ use crate::test_support::TestDir;
 
 const TENANT: u64 = 7;
 
-async fn manager(dir: &TestDir, crypto: Arc<CryptoManager>) -> Arc<SlabManager> {
-	Arc::new(
-		SlabManager::open(SlabManagerConfig {
-			dir: dir.to_path_buf(),
-			max_slab_bytes: 1024 * 1024,
-			io: spawn_io_thread(64).unwrap(),
-			l2: None,
-			rehydration: Default::default(),
-			l2_column_fetch: Default::default(),
-			row_group_writer: Default::default(),
-			l2_row_group_fetch: Default::default(),
-			encoding_writer: Default::default(),
-			l2_chunk_layout: Default::default(),
-			l2_encoding_fetch: Default::default(),
-			encoding_compute: Default::default(),
-			group_commit: Default::default(),
-			crypto,
-		})
-		.await
-		.unwrap(),
-	)
+async fn manager(dir: &TestDir, crypto: Arc<CryptoManager>, initialize: bool) -> Arc<SlabManager> {
+	let config = SlabManagerConfig {
+		dir: dir.to_path_buf(),
+		max_slab_bytes: 1024 * 1024,
+		io: spawn_io_thread(64).unwrap(),
+		l2: None,
+		rehydration: Default::default(),
+		l2_column_fetch: Default::default(),
+		row_group_writer: Default::default(),
+		l2_row_group_fetch: Default::default(),
+		encoding_writer: Default::default(),
+		l2_chunk_layout: Default::default(),
+		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
+		group_commit: Default::default(),
+		crypto,
+	};
+	if initialize {
+		SlabManager::initialize_new_store(config).await
+	} else {
+		SlabManager::open(config).await
+	}
+	.unwrap()
 }
 
 /// One leader whose only participant is its marker-eligible local arm.
@@ -53,7 +55,7 @@ impl EligibleRig {
 		crypto
 			.install_local_only_for_tests(TenantId::new(TENANT))
 			.unwrap();
-		let slab = manager(&dir, crypto.clone()).await;
+		let slab = manager(&dir, crypto.clone(), true).await;
 		let service = Arc::new(CounterReplicaService::new(slab.clone()));
 		Self {
 			model: PersistenceModel::new(),
@@ -95,7 +97,7 @@ impl EligibleRig {
 		drop(service);
 		drop(slab);
 		model.crash();
-		let slab = manager(&dir, crypto.clone()).await;
+		let slab = manager(&dir, crypto.clone(), false).await;
 		let service = Arc::new(CounterReplicaService::new(slab.clone()));
 		let rig = Self {
 			model,

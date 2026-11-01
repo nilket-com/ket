@@ -2,7 +2,7 @@
 
 use crate::integration::compute::DropOperationId;
 use crate::storage::manager::TableDropReclaimCursor;
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{Error, ErrorKind};
@@ -129,6 +129,36 @@ impl DropReclaimProgressStore {
 		});
 		registry.insert(path, Arc::downgrade(&store));
 		Ok(store)
+	}
+
+	/// Read-only metric reconstruction; never resets or advances durable work.
+	pub(crate) async fn tiered_debts_for_metrics(
+		&self,
+		identities: Vec<(DropOperationId, u64)>,
+	) -> std::io::Result<Vec<DropOperationId>> {
+		self.db
+			.run(move |db| {
+				let tx = db.begin_read().map_err(redb_to_io)?;
+				let table = tx.open_table(PROGRESS).map_err(redb_to_io)?;
+				let mut result = Vec::new();
+				for (operation, index) in identities {
+					let key = operation_key(operation);
+					let Some(raw) = table.get(key.as_slice()).map_err(redb_to_io)? else {
+						continue;
+					};
+					let Ok(progress) = postcard::from_bytes::<DropReclaimProgress>(raw.value())
+					else {
+						continue;
+					};
+					if progress.validate_identity(operation, index).is_ok()
+						&& progress.phase == DropReclaimPhase::TieredL2
+					{
+						result.push(operation);
+					}
+				}
+				Ok(result)
+			})
+			.await
 	}
 
 	pub(crate) async fn load_or_start(
@@ -345,5 +375,48 @@ mod tests {
 			Some(crate::schema::SlabId::new(19))
 		);
 		assert_eq!(loaded.examined_total, 19);
+	}
+	#[tokio::test]
+	async fn b1t_metric_reconstruction_uses_reopened_progress_without_advancing_it() {
+		let (_dir, path) = progress_path("b1t-progress-metric-reopen");
+		let store = DropReclaimProgressStore::open(path.clone()).unwrap();
+		let mut progress = DropReclaimProgress::start(operation(), 11, 7);
+		progress.phase = DropReclaimPhase::TieredL2;
+		store.store_current_epoch(progress, 7).await.unwrap();
+		drop(store);
+		let reopened = DropReclaimProgressStore::open(path).unwrap();
+		assert_eq!(
+			reopened
+				.tiered_debts_for_metrics(vec![(operation(), 11)])
+				.await
+				.unwrap(),
+			vec![operation()]
+		);
+		assert!(
+			reopened
+				.tiered_debts_for_metrics(vec![(operation(), 12)])
+				.await
+				.unwrap()
+				.is_empty(),
+			"mismatched replicated debt cannot contribute"
+		);
+		assert_eq!(
+			reopened
+				.load_or_start(operation(), 11, 7)
+				.await
+				.unwrap()
+				.progress(),
+			progress,
+			"metric read never changes cursor or provenance"
+		);
+		progress.phase = DropReclaimPhase::Complete;
+		reopened.store_current_epoch(progress, 7).await.unwrap();
+		assert!(
+			reopened
+				.tiered_debts_for_metrics(vec![(operation(), 11)])
+				.await
+				.unwrap()
+				.is_empty()
+		);
 	}
 }

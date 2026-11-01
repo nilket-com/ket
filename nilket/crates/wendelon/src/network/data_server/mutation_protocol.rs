@@ -2,6 +2,22 @@
 
 use super::*;
 
+#[derive(Debug)]
+pub(super) enum TableAdmissionError {
+	Validation(TableWriteValidationError),
+	Authority(std::io::Error),
+}
+impl From<TableWriteValidationError> for TableAdmissionError {
+	fn from(error: TableWriteValidationError) -> Self {
+		Self::Validation(error)
+	}
+}
+impl From<std::io::Error> for TableAdmissionError {
+	fn from(error: std::io::Error) -> Self {
+		Self::Authority(error)
+	}
+}
+
 impl WendelonDataServer {
 	pub(super) async fn handle_mutation_outcome_pin_request(
 		&self,
@@ -630,4 +646,65 @@ pub(super) fn mutation_expiry_response(
 		},
 	)
 	.with_mutation_outcome(knowledge, expiry.reason)
+}
+
+impl WendelonDataServer {
+	pub(super) fn drop_reclaim_slice_response_frame(
+		&self,
+		stream_id: u32,
+		result: std::io::Result<DropReclaimSliceResponse>,
+	) -> HrftFrame {
+		let (meta, trailing_bytes) = match result {
+			Ok(response) => (
+				DropReclaimSliceResponseMeta {
+					examined: u32::try_from(response.examined).unwrap_or(u32::MAX),
+					status: match response.status {
+						crate::storage::manager::TableDropReclaimStatus::Progress => {
+							DropReclaimSliceResponseMeta::OK
+						}
+						crate::storage::manager::TableDropReclaimStatus::DeferredNotLeader => {
+							DropReclaimSliceResponseMeta::DEFERRED_NOT_LEADER
+						}
+					},
+					done: u8::from(response.done),
+					corruption_reset: u8::from(response.corruption_reset),
+					_pad: 0,
+				},
+				None,
+			),
+			Err(error) => (
+				DropReclaimSliceResponseMeta {
+					examined: 0,
+					status: DropReclaimSliceResponseMeta::REJECTED,
+					done: 0,
+					corruption_reset: 0,
+					_pad: 0,
+				},
+				Some(error.to_string().into_bytes()),
+			),
+		};
+		let mut body = self.pool.acquire();
+		body.as_mut_vec()
+			.extend_from_slice(bytemuck::bytes_of(&meta));
+		let trailing = trailing_bytes.map(|bytes| {
+			let mut pooled = self.pool.acquire();
+			pooled.as_mut_vec().extend_from_slice(&bytes);
+			pooled
+		});
+		HrftFrame {
+			header: FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: MsgType::DROP_RECLAIM_SLICE_RESP.0,
+				flags: 0,
+				stream_id,
+				meta_len: body.len() as u32,
+				arrow_len: 0,
+				trailing_len: trailing.as_ref().map_or(0, |bytes| bytes.len() as u32),
+			},
+			meta: body,
+			arrow_payload: None,
+			trailing,
+		}
+	}
 }

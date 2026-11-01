@@ -1290,7 +1290,48 @@ pub fn encode_batch_with_policy(
 	encode_record_batch(batch, policy)
 }
 
+#[cfg(test)]
+thread_local! {
+	pub(crate) static SCOPED_DECODE_COUNT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+	static SCOPED_FAIL_NEXT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) struct DecodeCountGuard(std::marker::PhantomData<std::rc::Rc<()>>);
+
+#[cfg(test)]
+impl DecodeCountGuard {
+	pub(crate) fn start() -> Self {
+		SCOPED_DECODE_COUNT.with(|count| assert_eq!(count.replace(Some(0)), None));
+		Self(std::marker::PhantomData)
+	}
+	pub(crate) fn fail_next(&self) {
+		SCOPED_FAIL_NEXT.with(|fail| fail.set(true));
+	}
+
+	pub(crate) fn finish(self) -> usize {
+		SCOPED_DECODE_COUNT.with(|count| count.replace(None).expect("active decode counter"))
+	}
+}
+
+#[cfg(test)]
+impl Drop for DecodeCountGuard {
+	fn drop(&mut self) {
+		SCOPED_DECODE_COUNT.with(|count| count.set(None));
+		SCOPED_FAIL_NEXT.with(|fail| fail.set(false));
+	}
+}
+
 pub fn decode_batch(bytes: &[u8]) -> std::io::Result<RecordBatch> {
+	#[cfg(test)]
+	SCOPED_DECODE_COUNT.with(|count| count.set(count.get().map(|n| n + 1)));
+	#[cfg(test)]
+	if SCOPED_FAIL_NEXT.with(|fail| fail.replace(false)) {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"injected trusted-row decode failure",
+		));
+	}
 	let materialized;
 	let bytes =
 		if crate::storage::encoding::materialize::ipc_stream_contains_encoding_directory(bytes) {

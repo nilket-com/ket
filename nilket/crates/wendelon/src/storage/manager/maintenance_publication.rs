@@ -26,6 +26,7 @@ impl SlabManager {
 	pub(super) async fn persist_maintenance_publication(
 		&self,
 		update: PersistentIndexUpdate,
+		publication: &IndexPublication,
 	) -> std::io::Result<()> {
 		let index = self.persistent_index.as_ref().ok_or_else(|| {
 			Error::new(
@@ -33,7 +34,9 @@ impl SlabManager {
 				"maintenance publication requires the local persistent index",
 			)
 		})?;
-		index.apply(update).await
+		index
+			.apply_with_publication_guard(update, Some(publication.gate.clone()))
+			.await
 	}
 
 	pub(super) fn maintenance_manifest_preview(

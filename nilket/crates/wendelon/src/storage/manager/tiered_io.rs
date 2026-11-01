@@ -1,8 +1,13 @@
+use super::tier_plan::tier_row_owner;
 use super::*;
+use crate::storage::io_uring::DIRECT_IO_ALIGN;
 use std::collections::BTreeSet;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct TieredRowRefreshPlan {
+	/// The pointer whose object the plan was built from; the plan applies only
+	/// while that pointer is the slab's published generation.
+	pub(super) pointer: Option<TieredSlabPointer>,
 	pub(super) old_rows: Vec<PersistentRecordRow>,
 	pub(super) new_rows: Vec<PersistentRecordRow>,
 	pub(super) relocated_reads: Vec<(RecordLocation, RecordLocation)>,
@@ -43,14 +48,66 @@ pub(super) fn validate_tiered_blob(
 	Ok(())
 }
 
-/// `acknowledged` is the slab's boundary evidence (ADR 0099); the tenant check
-/// walks the decrypted bytes and must be able to resume past a leading hole.
+/// Which generation a tier object's bytes are, and so which record offsets
+/// describe them. SlabId alone does not say: a replacement keeps the slab id
+/// and moves its records.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum TierObjectEvidence<'a> {
+	/// The object is the generation the manager's index describes: the
+	/// published generation, the source of a rewrite, or a first upload of the
+	/// indexed local slab. The index's offsets are independent evidence that
+	/// every acknowledged record is present; the object's own offset index,
+	/// written by whichever build produced it, never replaces them.
+	Indexed(&'a BTreeSet<u64>),
+	/// An object whose layout the index does not describe: a replacement not
+	/// yet published, or committed authority staged over unrelated local
+	/// evidence (bootstrap or snapshot recovery), not necessarily a rewrite.
+	/// Its own authenticated offset index is the evidence; a plaintext object
+	/// has none and is refused.
+	Replacement,
+}
+
+/// The evidence for decoding `pointer`'s object, given the slab's published
+/// generation. The index describes the object when it is the published object
+/// (advisory tombstone or supersession metadata aside), or when its payload
+/// hash equals the published object's, so its verified bytes are identical
+/// even at another location. With nothing published, a live publication is a
+/// first upload of the indexed local slab, while staged committed authority
+/// (bootstrap or snapshot recovery) is described by its own layout.
+pub(super) fn tier_object_evidence<'a>(
+	published: Option<&TieredSlabPointer>,
+	pointer: &TieredSlabPointer,
+	acknowledged: &'a BTreeSet<u64>,
+	staged_authority: bool,
+) -> TierObjectEvidence<'a> {
+	match published {
+		Some(published)
+			if published.same_object_generation(pointer)
+				|| (published.slab_id == pointer.slab_id
+					&& published.payload_hash == pointer.payload_hash) =>
+		{
+			TierObjectEvidence::Indexed(acknowledged)
+		}
+		None if !staged_authority => TierObjectEvidence::Indexed(acknowledged),
+		_ => TierObjectEvidence::Replacement,
+	}
+}
+
+/// A tier object's plaintext with the record offsets that describe exactly
+/// these bytes; every walk of the bytes uses these offsets.
+pub(crate) struct TieredPlaintext {
+	pub(crate) bytes: Vec<u8>,
+	pub(crate) record_offsets: BTreeSet<u64>,
+}
+
+/// The tenant check walks the decrypted bytes with the generation's record
+/// offsets (ADR 0099), so it can resume past a leading hole.
 pub(super) fn decode_tiered_blob(
 	crypto: &CryptoManager,
 	pointer: &TieredSlabPointer,
 	blob: &[u8],
-	acknowledged: &BTreeSet<u64>,
-) -> std::io::Result<Vec<u8>> {
+	evidence: TierObjectEvidence<'_>,
+) -> std::io::Result<TieredPlaintext> {
 	match crypto.encrypted_footer_summary(blob)? {
 		Some(FooterSummary {
 			slab_id, tenant_id, ..
@@ -64,10 +121,17 @@ pub(super) fn decode_tiered_blob(
 					),
 				));
 			}
-			let DecryptedTieredSlab { plaintext, .. } =
-				crypto.decrypt_tiered_slab(pointer.slab_id, blob)?;
+			let DecryptedTieredSlab {
+				plaintext,
+				record_offsets: object_offsets,
+				..
+			} = crypto.decrypt_tiered_slab(pointer.slab_id, blob)?;
+			let record_offsets = match evidence {
+				TierObjectEvidence::Indexed(acknowledged) => acknowledged.clone(),
+				TierObjectEvidence::Replacement => object_offsets,
+			};
 			let payload_tenant_id =
-				single_tenant_id_from_plain_slab(&plaintext, pointer.slab_id, acknowledged)?;
+				single_tenant_id_from_plain_slab(&plaintext, pointer.slab_id, &record_offsets)?;
 			if payload_tenant_id != tenant_id {
 				return Err(Error::new(
 					ErrorKind::InvalidData,
@@ -79,9 +143,24 @@ pub(super) fn decode_tiered_blob(
 					),
 				));
 			}
-			Ok(plaintext)
+			Ok(TieredPlaintext {
+				bytes: plaintext,
+				record_offsets,
+			})
 		}
-		None => Ok(blob.to_vec()),
+		None => match evidence {
+			TierObjectEvidence::Indexed(acknowledged) => Ok(TieredPlaintext {
+				bytes: blob.to_vec(),
+				record_offsets: acknowledged.clone(),
+			}),
+			TierObjectEvidence::Replacement => Err(Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"replacement tier object for slab {} is plaintext: it carries no authenticated record layout",
+					pointer.slab_id
+				),
+			)),
+		},
 	}
 }
 
@@ -116,6 +195,14 @@ pub(super) fn extract_record_from_blob(
 	blob: &[u8],
 	location: RecordLocation,
 ) -> std::io::Result<Vec<u8>> {
+	extract_record_and_header_from_blob(blob, location).map(|(_, frame)| frame)
+}
+
+/// The record header and frame at `location` in a plaintext slab blob.
+pub(super) fn extract_record_and_header_from_blob(
+	blob: &[u8],
+	location: RecordLocation,
+) -> std::io::Result<(SlabRecordHeader, Vec<u8>)> {
 	let offset = location.offset as usize;
 	let length = location.length as usize;
 	let header_size = std::mem::size_of::<crate::schema::SlabRecordHeader>();
@@ -139,7 +226,7 @@ pub(super) fn extract_record_from_blob(
 			"L2 record extends past downloaded blob",
 		));
 	}
-	Ok(blob[offset + header_size..end].to_vec())
+	Ok((header, blob[offset + header_size..end].to_vec()))
 }
 
 pub(super) async fn fetch_tiered_ciphertext_runs(
@@ -376,40 +463,60 @@ impl SlabManager {
 	/// Encode a sealed slab into the ADR 022 L2 object layout.
 	/// The current write path still assumes every sealed slab is
 	/// single-tenant, so the footer and per-chunk AAD stay slab-scoped.
+	/// `plaintext_blob` must be the indexed sealed slab itself: the index's
+	/// offsets for the slab are its record evidence.
 	pub fn encrypt_tiered_object_blob(
 		&self,
 		slab_id: SlabId,
 		plaintext_blob: &[u8],
 	) -> std::io::Result<EncryptedTieredSlab> {
-		let metadata = build_tiered_object_metadata(
-			plaintext_blob,
-			slab_id,
-			&self.config.l2_chunk_layout,
-			&self.acknowledged_offsets_in_slab(slab_id),
-		)?;
-		self.config
-			.crypto
-			.encrypt_tiered_slab_object(slab_id, &metadata, plaintext_blob)
+		let acknowledged = self.acknowledged_offsets_in_slab(slab_id);
+		self.encrypt_tiered_blob_with_evidence(slab_id, plaintext_blob, &acknowledged, None)
 	}
 
+	/// As `encrypt_tiered_object_blob`, with column stats.
 	pub fn encrypt_tiered_object_blob_with_table_stats(
 		&self,
 		slab_id: SlabId,
 		plaintext_blob: &[u8],
 		table_schemas: &TableSchemaCatalog,
 	) -> std::io::Result<EncryptedTieredSlab> {
+		let acknowledged = self.acknowledged_offsets_in_slab(slab_id);
+		self.encrypt_tiered_blob_with_evidence(
+			slab_id,
+			plaintext_blob,
+			&acknowledged,
+			Some(table_schemas),
+		)
+	}
+
+	/// Every walk of `plaintext_blob` (offset index, chunk layout, column
+	/// stats) uses `acknowledged`, the record offsets in exactly these bytes.
+	/// A replacement written for the same slab id passes the offsets of its
+	/// own appends: the index still describes the old layout.
+	pub(crate) fn encrypt_tiered_blob_with_evidence(
+		&self,
+		slab_id: SlabId,
+		plaintext_blob: &[u8],
+		acknowledged: &BTreeSet<u64>,
+		table_schemas: Option<&TableSchemaCatalog>,
+	) -> std::io::Result<EncryptedTieredSlab> {
+		self.require_tier_authority_ready()?;
 		let mut metadata = build_tiered_object_metadata(
 			plaintext_blob,
 			slab_id,
 			&self.config.l2_chunk_layout,
-			&self.acknowledged_offsets_in_slab(slab_id),
+			acknowledged,
 		)?;
-		metadata.column_stats_block = self.build_tiered_column_stats_block(
-			plaintext_blob,
-			slab_id,
-			metadata.tenant_id,
-			table_schemas,
-		)?;
+		if let Some(table_schemas) = table_schemas {
+			metadata.column_stats_block = self.build_tiered_column_stats_block(
+				plaintext_blob,
+				slab_id,
+				metadata.tenant_id,
+				table_schemas,
+				acknowledged,
+			)?;
+		}
 		self.config
 			.crypto
 			.encrypt_tiered_slab_object(slab_id, &metadata, plaintext_blob)
@@ -444,10 +551,253 @@ impl SlabManager {
 		pointer: TieredSlabPointer,
 		last_control_log_index: Option<u64>,
 	) -> std::io::Result<()> {
+		self.apply_tier_slab_with_epoch(pointer, last_control_log_index, None)
+			.await
+	}
+
+	/// Re-read control authority after acquiring the same slab lock as log
+	/// observers. The discovery snapshot only selects work; it cannot authorize
+	/// a pointer replacement or retirement. The callback drops its SM read guard
+	/// before any filesystem work. Return whether local state changed and the
+	/// retired pointer whose existing cleanup path must be completed.
+	pub(crate) async fn reconcile_tier_slab_at_snapshot_epoch<F, Fut>(
+		&self,
+		slab_id: SlabId,
+		observed_epoch: u64,
+		authoritative: F,
+	) -> std::io::Result<(bool, Option<TieredSlabPointer>)>
+	where
+		F: FnOnce() -> Fut,
+		Fut: std::future::Future<Output = std::io::Result<Option<TieredSlabPointer>>>,
+	{
+		let tier_lock = self.tier_publication_lock(slab_id);
+		let _tier_guard = tier_lock.lock().await;
+		let pointer = authoritative().await?;
+		let local = self.tier_pointer(slab_id).await;
+		let matching_deferral = pointer.as_ref().is_some_and(|pointer| {
+			self.unapplied_tier_pointers
+				.get(&slab_id)
+				.is_some_and(|entry| {
+					entry.value().0 == *pointer
+						&& entry.value().1 == Some(StaleLocationReason::Fenced)
+				})
+		});
+		if pointer == local && !matching_deferral {
+			return Ok((false, None));
+		}
+		match pointer {
+			Some(pointer) => {
+				if let Some(old) = local.as_ref().filter(|old| old.l2_uri != pointer.l2_uri) {
+					self.record_retained_pointer_transition(old, Some(&pointer), true)
+						.await?;
+				}
+				self.apply_tier_slab_under_publication_lock(pointer, None, observed_epoch)
+					.await?;
+				Ok((true, None))
+			}
+			None => {
+				let Some(old) = local else {
+					return Ok((false, None));
+				};
+				self.record_retained_pointer_transition(&old, None, true)
+					.await?;
+				let changed = self
+					.retire_tiered_slab_under_publication_lock(slab_id, None, observed_epoch)
+					.await?;
+				Ok((changed, changed.then_some(old)))
+			}
+		}
+	}
+
+	pub(crate) async fn apply_tier_slab_at_snapshot_epoch(
+		&self,
+		pointer: TieredSlabPointer,
+		epoch: u64,
+	) -> std::io::Result<()> {
+		self.apply_tier_slab_with_epoch(pointer, None, Some(epoch))
+			.await
+	}
+
+	async fn apply_tier_slab_with_epoch(
+		&self,
+		pointer: TieredSlabPointer,
+		last_control_log_index: Option<u64>,
+		observed_epoch: Option<u64>,
+	) -> std::io::Result<()> {
+		if last_control_log_index.is_none() {
+			self.require_cleanup_authority()?;
+		}
 		// This path is intentionally idempotent for the same pointer. The
 		// sweeper may fall back to calling it after Raft apply has already
 		// fired the tier observer, so a second application of an identical
 		// pointer must not rebuild row state or mutate relocated reads again.
+		let control_epoch = observed_epoch.unwrap_or_else(|| self.capture_snapshot_epoch());
+		let tier_lock = self.tier_publication_lock(pointer.slab_id);
+		let _tier_guard = tier_lock.lock().await;
+		self.apply_tier_slab_under_publication_lock(pointer, last_control_log_index, control_epoch)
+			.await
+	}
+
+	/// Caller owns this slab's tier publication lock, including authority comparison.
+	async fn apply_tier_slab_under_publication_lock(
+		&self,
+		pointer: TieredSlabPointer,
+		last_control_log_index: Option<u64>,
+		control_epoch: u64,
+	) -> std::io::Result<()> {
+		if last_control_log_index.is_none() {
+			self.require_cleanup_authority()?;
+		}
+		if let Some(error) = self.tier_authority.integrity_error() {
+			return Err(error);
+		}
+		let _cleanup_guard = self.cleanup_claim(pointer.slab_id).lock_owned().await;
+		#[cfg(test)]
+		self.tier_observer_before_gate_pause_point().await;
+		let gate = match tokio::time::timeout(
+			Duration::from_secs(30),
+			self.persistent_index_gate.clone().read_owned(),
+		)
+		.await
+		{
+			Ok(gate) => Arc::new(gate),
+			Err(_) => {
+				self.unapplied_tier_pointers.insert(
+					pointer.slab_id,
+					(
+						pointer.clone(),
+						Some(StaleLocationReason::Fenced),
+						last_control_log_index,
+					),
+				);
+				return Err(stale_location_error(
+					pointer.slab_id,
+					StaleLocationReason::Fenced,
+				));
+			}
+		};
+		if self.observer_is_superseded(last_control_log_index) {
+			return Ok(());
+		}
+		if last_control_log_index.is_none() && !self.snapshot_epoch_is_current(control_epoch) {
+			// A newer comparison owns this generation. Refusing this obsolete
+			// local completion must not install committed-pointer authority.
+			return Err(stale_location_error(
+				pointer.slab_id,
+				StaleLocationReason::Fenced,
+			));
+		}
+		if self.snapshot_install_in_flight() {
+			let own_dirty = self
+				.pending_index_publications
+				.iter()
+				.any(|entry| entry.key().0 == pointer.slab_id);
+			if last_control_log_index.is_some()
+				&& !self.retired_tier_slabs.contains(&pointer.slab_id)
+				&& !self.index_authority_unavailable.load(Ordering::Acquire)
+				&& !own_dirty
+				&& !self.lsm_intent_names_slab(pointer.slab_id)
+				&& !self.lsm_intent_keys_unknown()
+				&& !(self.tier_authority.pending.contains_key(&pointer.slab_id)
+					&& !self.lsm_install_unresolved.is_empty())
+			{
+				let floor = pointer.slab_id;
+				return self
+					.stage_tier_authority_under_publication_lock(
+						pointer,
+						last_control_log_index,
+						floor,
+						true,
+					)
+					.await;
+			}
+			self.unapplied_tier_pointers.insert(
+				pointer.slab_id,
+				(
+					pointer.clone(),
+					Some(StaleLocationReason::Fenced),
+					last_control_log_index,
+				),
+			);
+			return Err(stale_location_error(
+				pointer.slab_id,
+				StaleLocationReason::Fenced,
+			));
+		}
+		if self.retired_tier_slabs.contains(&pointer.slab_id) {
+			tracing::warn!(
+				slab_id = pointer.slab_id.get(),
+				"tier publication for a slab retired in this process is stale; ignored"
+			);
+			return Ok(());
+		}
+		self.bump_slab_publication_revision(pointer.slab_id)?;
+		if self.lsm_intent_names_slab(pointer.slab_id)
+			|| self.lsm_intent_keys_unknown()
+			|| (self.tier_authority.pending.contains_key(&pointer.slab_id)
+				&& !self.lsm_install_unresolved.is_empty())
+		{
+			let error = stale_location_error(pointer.slab_id, StaleLocationReason::Fenced);
+			self.unapplied_tier_pointers.insert(
+				pointer.slab_id,
+				(
+					pointer,
+					Some(StaleLocationReason::Fenced),
+					last_control_log_index,
+				),
+			);
+			return Err(error);
+		}
+		if self.is_awaiting_cluster() && last_control_log_index.is_some() {
+			let own_dirty = self
+				.pending_index_publications
+				.iter()
+				.any(|entry| entry.key().0 == pointer.slab_id);
+			let incompatible_refusal = self
+				.unapplied_tier_pointers
+				.get(&pointer.slab_id)
+				.is_some_and(|entry| {
+					entry.value().0 != pointer
+						|| entry.value().1 != Some(StaleLocationReason::Fenced)
+				});
+			if self.index_authority_unavailable.load(Ordering::Acquire)
+				|| own_dirty || incompatible_refusal
+			{
+				return Err(stale_location_error(
+					pointer.slab_id,
+					StaleLocationReason::Fenced,
+				));
+			}
+			// Replay registers committed authority while the replacement marker
+			// still closes all data answers. Only the complete confirmed prefix
+			// may clear that marker; registration performs no physical publication.
+			let floor = pointer.slab_id;
+			return self
+				.stage_tier_authority_under_publication_lock(
+					pointer,
+					last_control_log_index,
+					floor,
+					false,
+				)
+				.await;
+		}
+		if self.tier_authority.pending.contains_key(&pointer.slab_id) {
+			if last_control_log_index.is_none() {
+				// Local sweep/reconcile callers report completed publication, not
+				// registration. A matching committed flight may still resume.
+				self.resume_matching_tier_deferral(&pointer);
+				return Err(Error::new(
+					ErrorKind::WouldBlock,
+					"tier verification is pending",
+				));
+			}
+			let result =
+				self.update_pending_tier_authority(pointer.clone(), last_control_log_index);
+			if result.is_ok() {
+				self.resume_matching_tier_deferral(&pointer);
+			}
+			return result;
+		}
 		let old_pointer = {
 			let state = self.state.lock().await;
 			state
@@ -455,10 +805,184 @@ impl SlabManager {
 				.get(&pointer.slab_id)
 				.map(|entry| entry.value().clone())
 		};
+		// Structural refusals remain typed and cached. A Fenced dependency
+		// can finish, so a retry must recheck all normal publication guards.
+		if let Some(entry) = self.unapplied_tier_pointers.get(&pointer.slab_id)
+			&& entry.value().0 == pointer
+			&& let Some(reason) = entry.value().1
+			&& reason != StaleLocationReason::Fenced
+		{
+			return Err(stale_location_error(pointer.slab_id, reason));
+		}
+		let already_published = old_pointer.as_ref() == Some(&pointer);
+		let result = match self.require_private_tier_apply_authority(pointer.slab_id) {
+			Ok(()) => {
+				self.publish_committed_tier_pointer(
+					&pointer,
+					old_pointer,
+					last_control_log_index,
+					gate,
+				)
+				.await
+			}
+			Err(error) => Err(error),
+		};
+		match &result {
+			Ok(()) => {
+				if let Some(index) = last_control_log_index {
+					self.tier_authority
+						.cancel_snapshot_retirement_before_control(pointer.slab_id, index);
+					if self.require_cleanup_authority().is_ok() {
+						self.note_tier_republished(pointer.slab_id, &pointer.l2_uri, index);
+					}
+				}
+				self.unapplied_tier_pointers.remove(&pointer.slab_id);
+			}
+			Err(_) if already_published => {}
+			Err(error) => {
+				let reason = stale_location(error).map(|refusal| refusal.reason);
+				self.unapplied_tier_pointers.insert(
+					pointer.slab_id,
+					(pointer.clone(), reason, last_control_log_index),
+				);
+			}
+		}
+		result
+	}
+
+	/// The committed pointer this node has not published, if any. A proposer
+	/// never plans from a generation the cluster has moved past.
+	pub(crate) fn unapplied_tier_pointer(&self, slab_id: SlabId) -> Option<TieredSlabPointer> {
+		self.unapplied_tier_pointers
+			.get(&slab_id)
+			.map(|entry| entry.value().0.clone())
+	}
+
+	/// Caller holds the LSM scope read gate through this check and publication.
+	pub(super) async fn check_tier_publication_lsm_scope(
+		&self,
+		slab_id: SlabId,
+		touched: &[PersistentRecordRow],
+	) -> std::io::Result<()> {
+		if self.lsm_intent_names_slab(slab_id)
+			|| self.lsm_intent_keys_unknown()
+			|| (self.tier_authority.pending.contains_key(&slab_id)
+				&& !self.lsm_install_unresolved.is_empty())
+		{
+			return Err(stale_location_error(slab_id, StaleLocationReason::Fenced));
+		}
+		// Named GC inputs may contain physical keys no longer in the aggregate
+		// index. Tier-only, missing, or counter-bearing sources cannot cheaply
+		// establish complete key disjointness and are refused conservatively.
+		let mut named_slabs = HashSet::new();
+		for intent in &self.lsm_install_unresolved {
+			if intent.value().slabs.is_empty() || intent.value().keys_unknown {
+				return Err(stale_location_error(slab_id, StaleLocationReason::Fenced));
+			}
+			named_slabs.extend(intent.value().slabs.iter().copied());
+		}
+		let sources = if named_slabs.is_empty() {
+			Vec::new()
+		} else {
+			let state = self.state.lock().await;
+			let mut sources = Vec::with_capacity(named_slabs.len());
+			for slab_id in named_slabs {
+				if state.tiered.contains_key(&slab_id) {
+					return Err(stale_location_error(slab_id, StaleLocationReason::Fenced));
+				}
+				let Some(slab) = state
+					.sealed
+					.get(&slab_id)
+					.map(|entry| entry.value().clone())
+				else {
+					return Err(stale_location_error(slab_id, StaleLocationReason::Fenced));
+				};
+				if slab.refuse_counter_maintenance().is_err() || !slab.manager_appends_quiescent() {
+					return Err(stale_location_error(slab_id, StaleLocationReason::Fenced));
+				}
+				sources.push(slab);
+			}
+			sources
+		};
+		// A private in-memory index may omit a rolled-back physical frame.
+		// Prove the complete physical key set from bounded owned-file reads;
+		// incomplete/corrupt/large evidence is refused, never treated as empty.
+		const MAX_SCOPE_BYTES: usize = 8 * 1024 * 1024;
+		const MAX_SCOPE_SLABS: usize = 32;
+		if sources.len() > MAX_SCOPE_SLABS {
+			return Err(stale_location_error(slab_id, StaleLocationReason::Fenced));
+		}
+		let mut remaining = MAX_SCOPE_BYTES;
+		let mut named_keys = HashSet::new();
+		for slab in sources {
+			let blob = slab
+				.read_scope_blob(remaining)
+				.await
+				.map_err(|_| stale_location_error(slab_id, StaleLocationReason::Fenced))?;
+			remaining -= blob.len();
+			let entries =
+				recover_slab_entries_from_blob(&blob, slab.slab_id(), &BTreeSet::new())
+					.map_err(|_| stale_location_error(slab_id, StaleLocationReason::Fenced))?;
+			let mut frames = entries
+				.iter()
+				.map(|entry| (entry.location.offset, entry.location.length))
+				.collect::<Vec<_>>();
+			frames.sort_unstable();
+			frames.dedup();
+			let mut cursor = 0usize;
+			for (offset, length) in frames {
+				if usize::try_from(offset).ok() != Some(cursor) {
+					return Err(stale_location_error(slab_id, StaleLocationReason::Fenced));
+				}
+				let Some(padded) = (length as usize)
+					.checked_add(DIRECT_IO_ALIGN - 1)
+					.map(|value| value & !(DIRECT_IO_ALIGN - 1))
+				else {
+					return Err(stale_location_error(slab_id, StaleLocationReason::Fenced));
+				};
+				let Some(next) = cursor.checked_add(padded) else {
+					return Err(stale_location_error(slab_id, StaleLocationReason::Fenced));
+				};
+				cursor = next;
+			}
+			if cursor != blob.len() {
+				return Err(stale_location_error(slab_id, StaleLocationReason::Fenced));
+			}
+			named_keys.extend(
+				entries
+					.into_iter()
+					.map(|entry| (entry.tenant_id, entry.key_identity)),
+			);
+		}
+		for row in touched {
+			let key = (row.tenant_id, row.key_identity);
+			if named_keys.contains(&key)
+				|| self.key_index.get(&key).is_some_and(|locations| {
+					locations
+						.iter()
+						.any(|location| self.lsm_intent_names_slab(location.slab_id))
+				}) {
+				return Err(stale_location_error(slab_id, StaleLocationReason::Fenced));
+			}
+		}
+		Ok(())
+	}
+
+	async fn publish_committed_tier_pointer(
+		&self,
+		pointer: &TieredSlabPointer,
+		old_pointer: Option<TieredSlabPointer>,
+		last_control_log_index: Option<u64>,
+		gate: Arc<tokio::sync::OwnedRwLockReadGuard<()>>,
+	) -> std::io::Result<()> {
+		let pointer = pointer.clone();
 		let refresh_plan = if old_pointer.as_ref().is_some_and(|old| old != &pointer)
 			|| !self.has_rows_for_slab(pointer.slab_id)
 		{
-			Some(self.build_tiered_row_refresh_plan_from_l2(&pointer).await?)
+			Some(
+				self.build_tiered_row_refresh_plan(&pointer, old_pointer.as_ref())
+					.await?,
+			)
 		} else {
 			None
 		};
@@ -469,11 +993,65 @@ impl SlabManager {
 				"identical tier pointer replay must remain a no-op; the sweeper may reapply after the observer already committed local state"
 			);
 		}
-		self.persist_tiered_pointer_strict(pointer.clone(), last_control_log_index)
+		// The next generation's history is built before anything is published;
+		// a layout that would make an old location name another version is
+		// refused before the pointer or any row changes.
+		let next_layout = match &refresh_plan {
+			Some(plan) => {
+				let current = {
+					let state = self.state.lock().await;
+					state
+						.tier_layouts
+						.get(&pointer.slab_id)
+						.map(|layout| layout.value().clone())
+				};
+				let current = current.unwrap_or_default();
+				Some(Arc::new(current.next(pointer.slab_id, plan)?))
+			}
+			None => None,
+		};
+		// Hold the scope guard from the final key check through publication, so
+		// a new LSM intent cannot appear between the check and key-chain edits.
+		let _scope = self.lsm_intent_scope_gate.read().await;
+		self.require_private_tier_apply_authority(pointer.slab_id)?;
+		let touched = match &refresh_plan {
+			Some(plan) => plan
+				.old_rows
+				.iter()
+				.chain(&plan.new_rows)
+				.cloned()
+				.collect::<Vec<_>>(),
+			None => self.record_rows_for_slab_for_recovery(pointer.slab_id),
+		};
+		self.check_tier_publication_lsm_scope(pointer.slab_id, &touched)
 			.await?;
-		if let Some(plan) = &refresh_plan {
-			for (old_location, new_location) in &plan.relocated_reads {
-				self.relocated_reads.insert(*old_location, *new_location);
+		// The pointer and its row delta become durable in one transaction, so a
+		// crash can never leave the new pointer with the previous rows.
+		let publication = self.begin_index_publication_with_gate(vec![pointer.slab_id], gate)?;
+		match (&refresh_plan, &self.persistent_index) {
+			(Some(plan), Some(index)) => {
+				index
+					.apply_with_publication_guard(
+						PersistentIndexUpdate {
+							put_tiered_slabs: vec![pointer.clone()],
+							tier_republication_index: last_control_log_index,
+							delete_records: plan.old_rows.clone(),
+							put_records: plan.new_rows.clone(),
+							last_control_log_index,
+							..Default::default()
+						},
+						Some(publication.gate.clone()),
+					)
+					.await?;
+			}
+			_ => {
+				self.persist_tiered_pointer_guarded(
+					pointer.clone(),
+					last_control_log_index,
+					last_control_log_index,
+					&publication,
+				)
+				.await?;
 			}
 		}
 		if old_pointer
@@ -483,24 +1061,35 @@ impl SlabManager {
 		{
 			self.clear_tiered_stats_cache_for_slab(pointer.slab_id);
 		}
+		#[cfg(test)]
+		self.tier_publication_pause_point().await;
 		{
+			// The pointer and its generation history are published together.
 			let mut state = self.state.lock().await;
-			let _old = state.sealed.remove(&pointer.slab_id);
-			let _old = state.rehydrated.remove(&pointer.slab_id);
+			let released_sealed = state.sealed.remove(&pointer.slab_id).is_some();
+			let released_copy = state.rehydrated.remove(&pointer.slab_id).is_some();
+			if released_sealed || released_copy {
+				self.release_slab_file(pointer.slab_id);
+			}
 			state.tiered.insert(pointer.slab_id, pointer.clone());
+			if let Some(layout) = next_layout {
+				state.tier_layouts.insert(pointer.slab_id, layout);
+			}
 			state.hot_read_counts.remove(&pointer.slab_id);
 			state.rehydrating.remove(&pointer.slab_id);
 		}
 		self.retired_tiered_cleanup.remove(&pointer.slab_id);
 		if let Some(plan) = refresh_plan {
-			self.apply_tiered_row_refresh_plan(plan).await;
+			self.apply_tiered_row_refresh_plan_locked(plan, false).await;
 		}
 
-		// Unlink the L1 file. Open fds held by in-flight reads
-		// continue to work; new reads find the entry in `tiered`
-		// and go to L2.
-		let path = slab_path(&self.config.dir, pointer.slab_id);
-		unlink_local_file(self.file_ops.as_ref(), &path).await?;
+		publication.complete();
+
+		// Unlink the L1 file this process released (the sealed slab or its
+		// own copy), never a file it does not own. Open fds held by in-flight
+		// reads continue to work; new reads find the entry in `tiered` and go
+		// to L2.
+		self.unlink_released_slab_file(pointer.slab_id).await?;
 		Ok(())
 	}
 
@@ -513,7 +1102,126 @@ impl SlabManager {
 		slab_id: SlabId,
 		last_control_log_index: Option<u64>,
 	) -> std::io::Result<bool> {
-		let rows = self.record_rows_for_slab(slab_id);
+		self.retire_tiered_slab_with_epoch(slab_id, last_control_log_index, None)
+			.await
+	}
+
+	pub(crate) async fn retire_tiered_slab_at_snapshot_epoch(
+		&self,
+		slab_id: SlabId,
+		epoch: u64,
+	) -> std::io::Result<bool> {
+		self.retire_tiered_slab_with_epoch(slab_id, None, Some(epoch))
+			.await
+	}
+
+	/// Snapshot and indexed retirement take the same private row snapshot.
+	fn record_rows_for_tier_retirement(&self, slab_id: SlabId) -> Vec<PersistentRecordRow> {
+		self.record_rows_for_slab_for_recovery(slab_id)
+	}
+
+	async fn retire_tiered_slab_with_epoch(
+		&self,
+		slab_id: SlabId,
+		last_control_log_index: Option<u64>,
+		observed_epoch: Option<u64>,
+	) -> std::io::Result<bool> {
+		if last_control_log_index.is_none() {
+			self.require_cleanup_authority()?;
+		}
+		let control_epoch = observed_epoch.unwrap_or_else(|| self.capture_snapshot_epoch());
+		let tier_lock = self.tier_publication_lock(slab_id);
+		let _tier_guard = tier_lock.lock().await;
+		self.retire_tiered_slab_under_publication_lock(
+			slab_id,
+			last_control_log_index,
+			control_epoch,
+		)
+		.await
+	}
+
+	/// Caller owns this slab's tier publication lock, including authority comparison.
+	async fn retire_tiered_slab_under_publication_lock(
+		&self,
+		slab_id: SlabId,
+		last_control_log_index: Option<u64>,
+		control_epoch: u64,
+	) -> std::io::Result<bool> {
+		if last_control_log_index.is_none() {
+			self.require_cleanup_authority()?;
+		}
+		let _cleanup_guard = self.cleanup_claim(slab_id).lock_owned().await;
+		let gate = match tokio::time::timeout(
+			Duration::from_secs(30),
+			self.persistent_index_gate.clone().read_owned(),
+		)
+		.await
+		{
+			Ok(gate) => Arc::new(gate),
+			Err(_) => {
+				// The read gate cannot be acquired, so pointer removal is not yet
+				// safe. Persist only this slab's intent, without inventing a complete
+				// snapshot set. Reopen restores the same scoped read fence.
+				if !self.observer_is_superseded(last_control_log_index)
+					&& self.snapshot_epoch_is_current(control_epoch)
+				{
+					let pointer = self
+						.state
+						.lock()
+						.await
+						.tiered
+						.get(&slab_id)
+						.map(|entry| entry.value().clone());
+					if let Some(pointer) = pointer {
+						let mark = crate::storage::index::SnapshotRetirementMark {
+							epoch: control_epoch,
+							snapshot_index: last_control_log_index,
+							pointer,
+						};
+						self.tier_authority.mark_snapshot_retirement(
+							slab_id,
+							control_epoch,
+							last_control_log_index,
+						);
+						if let Some(index) = &self.persistent_index {
+							match index
+								.stage_deferred_retirement(
+									mark,
+									self.snapshot_epoch.clone(),
+									self.snapshot_epoch_gate.clone(),
+								)
+								.await
+							{
+								Ok(Some(mark)) => self.tier_authority.mark_snapshot_retirement(
+									slab_id,
+									mark.epoch,
+									mark.snapshot_index,
+								),
+								Ok(None) => self
+									.tier_authority
+									.clear_snapshot_retirement(slab_id, control_epoch), // A newer comparison owns this pointer.
+								Err(error) => {
+									return Err(error);
+								}
+							}
+						} else {
+							self.fence_unapplied_tier_retirement(slab_id, last_control_log_index);
+						}
+					}
+				}
+				return Err(stale_location_error(slab_id, StaleLocationReason::Fenced));
+			}
+		};
+		if self.observer_is_superseded(last_control_log_index) {
+			return Ok(false);
+		}
+		if last_control_log_index.is_none() && !self.snapshot_epoch_is_current(control_epoch) {
+			// The newer snapshot owns this decision. An obsolete local completion
+			// must not create or overwrite its retirement fence.
+			return Err(stale_location_error(slab_id, StaleLocationReason::Fenced));
+		}
+		self.require_private_retirement_authority(slab_id, last_control_log_index.is_some())?;
+		let rows = self.record_rows_for_tier_retirement(slab_id);
 		let retired_pointer = {
 			let state = self.state.lock().await;
 			state
@@ -528,19 +1236,27 @@ impl SlabManager {
 		if !should_remove {
 			return Ok(false);
 		}
+		self.bump_slab_publication_revision(slab_id)?;
 		if let Some(pointer) = retired_pointer.clone() {
 			self.retired_tiered_cleanup.insert(slab_id, pointer);
 		}
-		self.delete_tiered_slab_strict(slab_id, last_control_log_index)
+		let publication = self
+			.delete_tiered_slab_strict_with_gate(slab_id, last_control_log_index, gate)
 			.await?;
 		{
 			let mut state = self.state.lock().await;
-			let _old = state.sealed.remove(&slab_id);
-			let _old = state.rehydrated.remove(&slab_id);
+			let released_sealed = state.sealed.remove(&slab_id).is_some();
+			let released_copy = state.rehydrated.remove(&slab_id).is_some();
+			if released_sealed || released_copy {
+				self.release_slab_file(slab_id);
+			}
 			let _old = state.tiered.remove(&slab_id);
+			let _old = state.tier_layouts.remove(&slab_id);
 			state.hot_read_counts.remove(&slab_id);
 			state.rehydrating.remove(&slab_id);
 		}
+		self.retired_tier_slabs.insert(slab_id);
+		self.unapplied_tier_pointers.remove(&slab_id);
 		for row in &rows {
 			self.rollback_indexed_location(row.tenant_id, row.key_identity, row.location);
 		}
@@ -548,8 +1264,113 @@ impl SlabManager {
 			old_location.slab_id != slab_id && new_location.slab_id != slab_id
 		});
 		self.clear_tiered_stats_cache_for_slab(slab_id);
-		let path = slab_path(&self.config.dir, slab_id);
-		unlink_local_file(self.file_ops.as_ref(), &path).await?;
+		if let Some(publication) = publication {
+			publication.complete();
+		}
+		self.unlink_released_slab_file(slab_id).await?;
+		Ok(true)
+	}
+
+	/// Apply a snapshot-authorized retirement, or leave it for a newer snapshot.
+	pub(super) async fn apply_snapshot_retirement(
+		&self,
+		mark: crate::storage::index::SnapshotRetirementMark,
+	) -> std::io::Result<bool> {
+		let slab_id = mark.pointer.slab_id;
+		let tier_lock = self.tier_publication_lock(slab_id);
+		let _tier_guard = tier_lock.lock().await;
+		let _cleanup_guard = self.cleanup_claim(slab_id).lock_owned().await;
+		let gate = Arc::new(self.persistent_index_gate.clone().read_owned().await);
+		let local = self
+			.state
+			.lock()
+			.await
+			.tiered
+			.get(&slab_id)
+			.map(|entry| entry.value().clone());
+		let matching_pending = self
+			.tier_authority
+			.pending
+			.get(&slab_id)
+			.is_some_and(|entry| entry.pointer.same_object_generation(&mark.pointer));
+		match local.as_ref() {
+			Some(pointer) if !pointer.same_object_generation(&mark.pointer) => return Ok(false),
+			None if !matching_pending => return Ok(false),
+			_ => {}
+		}
+		if self
+			.tier_authority
+			.pending
+			.get(&slab_id)
+			.is_some_and(|pending| {
+				!pending
+					.value()
+					.pointer
+					.same_object_generation(&mark.pointer)
+			}) {
+			return Ok(false);
+		}
+		let rows = self.record_rows_for_tier_retirement(slab_id);
+		let index = self.persistent_index.as_ref().ok_or_else(|| {
+			Error::new(
+				ErrorKind::WouldBlock,
+				"persistent index unavailable for snapshot retirement",
+			)
+		})?;
+		let known_bytes = self.snapshot_retained_size_hint(slab_id, &mark.pointer.l2_uri);
+		let evidence = self.snapshot_retirement_evidence(slab_id, &mark.pointer.l2_uri);
+		let Some((retained, evidence)) = index
+			.apply_snapshot_retirement(
+				mark.clone(),
+				known_bytes,
+				evidence,
+				self.snapshot_epoch.clone(),
+				self.snapshot_epoch_gate.clone(),
+				gate.clone(),
+			)
+			.await?
+		else {
+			return Ok(false);
+		};
+		{
+			let mut state = self.state.lock().await;
+			let released_sealed = state.sealed.remove(&slab_id).is_some();
+			let released_copy = state.rehydrated.remove(&slab_id).is_some();
+			if released_sealed || released_copy {
+				self.release_slab_file(slab_id);
+			}
+			state.tiered.remove(&slab_id);
+			state.tier_layouts.remove(&slab_id);
+			state.hot_read_counts.remove(&slab_id);
+			state.rehydrating.remove(&slab_id);
+		}
+		self.retired_tier_slabs.insert(slab_id);
+		self.unapplied_tier_pointers.remove(&slab_id);
+		self.unverified_tier_slabs.remove(&slab_id);
+		self.tier_authority
+			.pending
+			.remove_if(&slab_id, |_, pending| {
+				pending.pointer.same_object_generation(&mark.pointer)
+			});
+		for row in &rows {
+			self.rollback_indexed_location(row.tenant_id, row.key_identity, row.location);
+		}
+		self.relocated_reads
+			.retain(|old, new| old.slab_id != slab_id && new.slab_id != slab_id);
+		self.clear_tiered_stats_cache_for_slab(slab_id);
+		if let Some(intent) = retained {
+			self.note_snapshot_retirement_applied(
+				slab_id,
+				mark.pointer.l2_uri.clone(),
+				intent,
+				evidence,
+			);
+		}
+		self.tier_authority
+			.clear_snapshot_retirement(slab_id, mark.epoch);
+		self.retired_tiered_cleanup
+			.insert(slab_id, mark.pointer.clone());
+		self.unlink_released_slab_file(slab_id).await?;
 		Ok(true)
 	}
 
@@ -580,6 +1401,20 @@ impl SlabManager {
 	}
 
 	/// Lookup the L2 pointer for a tiered slab.
+	/// A surviving metadata operation requires exact reads until resolved.
+	pub(crate) fn pending_metadata_requires_exact(&self, slab_id: SlabId) -> bool {
+		self.pending_metadata_tokens.contains_key(&slab_id)
+	}
+
+	/// A pending metadata operation requires the aggregate's exact row path.
+	pub(crate) async fn tier_pointer_for_aggregate(
+		&self,
+		slab_id: SlabId,
+	) -> Option<TieredSlabPointer> {
+		let pointer = self.tier_pointer(slab_id).await?;
+		(!self.pending_metadata_requires_exact(slab_id)).then_some(pointer)
+	}
+
 	pub async fn tier_pointer(&self, slab_id: SlabId) -> Option<TieredSlabPointer> {
 		self.state
 			.lock()
@@ -624,11 +1459,8 @@ impl SlabManager {
 			)
 		})?;
 		for pointer in &pointers {
-			let metadata = l2.head(&pointer.l2_uri).await.map_err(|err| {
-				Error::other(format!(
-					"restore validation failed for tiered slab {} at {}: {err}",
-					pointer.slab_id, pointer.l2_uri
-				))
+			let metadata = l2.head(&pointer.l2_uri).await.inspect_err(|error| {
+				tracing::warn!(slab_id = pointer.slab_id.get(), l2_uri = %pointer.l2_uri, %error, "restore tier reference is unavailable");
 			})?;
 			if metadata.size_bytes == 0 {
 				return Err(Error::new(
@@ -655,10 +1487,12 @@ impl SlabManager {
 		pointers
 	}
 
-	/// Retry only the local-file cleanup for a retired tiered slab.
+	/// Retry only the local-file cleanup for a retired tiered slab: an unlink
+	/// the retirement released and did not finish. The candidate alone never
+	/// authorizes removing whatever file is at the slab's path.
 	pub async fn retry_retired_tiered_local_cleanup(&self, slab_id: SlabId) -> std::io::Result<()> {
-		let path = slab_path(&self.config.dir, slab_id);
-		unlink_local_file(self.file_ops.as_ref(), &path).await
+		self.require_cleanup_authority()?;
+		self.unlink_released_slab_file(slab_id).await
 	}
 
 	/// Mark one retired tiered slab cleanup candidate complete.
@@ -668,27 +1502,46 @@ impl SlabManager {
 
 	/// Best-effort reclaim of one rehydrated local cache copy. The
 	/// authoritative L2 pointer remains intact; only the temporary
-	/// L1 file is removed.
+	/// L1 file is removed. An earlier eviction that released its copy but did
+	/// not finish the unlink is finished here; only a copy this process
+	/// installed is ever removed.
 	pub async fn drop_rehydrated_slab(&self, slab_id: SlabId) -> std::io::Result<bool> {
 		let removed = {
 			let state = self.state.lock().await;
 			if state.rehydrating.contains(&slab_id) {
 				return Ok(false);
 			}
-			state.rehydrated.remove(&slab_id).map(|(_, state)| state)
+			let removed = state.rehydrated.remove(&slab_id).is_some();
+			if removed {
+				self.release_slab_file(slab_id);
+			}
+			removed
 		};
-		let Some(_state) = removed else {
-			return Ok(false);
-		};
-		let path = slab_path(&self.config.dir, slab_id);
-		unlink_local_file(self.file_ops.as_ref(), &path).await?;
-		Ok(true)
+		#[cfg(test)]
+		self.rehydrated_copy_eviction_pause_point().await;
+		self.unlink_released_slab_file(slab_id).await?;
+		Ok(removed)
 	}
 
+	/// The plaintext of `pointer`'s object, which must be the generation the
+	/// index describes (see `TierObjectEvidence::Indexed`).
 	pub(super) async fn tiered_plaintext_from_l2(
 		&self,
 		pointer: &TieredSlabPointer,
 	) -> std::io::Result<Vec<u8>> {
+		let acknowledged = self.acknowledged_offsets_in_slab(pointer.slab_id);
+		Ok(self
+			.tiered_object_from_l2(pointer, TierObjectEvidence::Indexed(&acknowledged))
+			.await?
+			.bytes)
+	}
+
+	/// `pointer`'s object decoded as the stated generation.
+	pub(super) async fn tiered_object_from_l2(
+		&self,
+		pointer: &TieredSlabPointer,
+		evidence: TierObjectEvidence<'_>,
+	) -> std::io::Result<TieredPlaintext> {
 		let l2 = self.config.l2.clone().ok_or_else(|| {
 			Error::new(
 				ErrorKind::NotFound,
@@ -700,121 +1553,275 @@ impl SlabManager {
 		})?;
 		let blob = l2.get(&pointer.l2_uri).await?;
 		validate_tiered_blob(pointer, &blob)?;
-		decode_tiered_blob(
-			self.config.crypto.as_ref(),
-			pointer,
-			&blob,
-			&self.acknowledged_offsets_in_slab(pointer.slab_id),
-		)
+		decode_tiered_blob(self.config.crypto.as_ref(), pointer, &blob, evidence)
 	}
 
+	#[cfg(test)]
 	pub(super) async fn load_tiered_rows_from_l2(
 		&self,
 		pointer: &TieredSlabPointer,
 	) -> std::io::Result<Vec<PersistentRecordRow>> {
-		let plaintext = self.tiered_plaintext_from_l2(pointer).await?;
-		recover_slab_entries_from_blob(
-			&plaintext,
+		// As publication decides.
+		let acknowledged = self.acknowledged_offsets_in_slab(pointer.slab_id);
+		let published = self.tier_pointer(pointer.slab_id).await;
+		let evidence = tier_object_evidence(published.as_ref(), pointer, &acknowledged, false);
+		let plaintext = self.tiered_object_from_l2(pointer, evidence).await?;
+		self.tiered_rows_from_plaintext_with_evidence(
+			&plaintext.bytes,
 			pointer.slab_id,
-			&self.acknowledged_offsets_in_slab(pointer.slab_id),
-		)?
-		.into_iter()
-		.map(|entry| {
-			let frame = extract_record_from_blob(&plaintext, entry.location)?;
-			let table_object_id = decode_record_batch(&frame)
-				.ok()
-				.map(|batch| {
-					storage_row_table_object_id_at(&batch, entry.location.record_row_index)
-				})
-				.transpose()?
-				.flatten();
-			Ok(PersistentRecordRow {
-				tenant_id: entry.tenant_id,
-				key_identity: entry.key_identity,
-				routing_locality: self.recovered_entry_routing_locality(&entry),
-				table_object_id,
-				// ADR 0090: recovery read the row's placement from the frame;
-				// re-tiering must not downgrade it.
-				placement: entry.location.placement,
-				partition: entry.location.partition,
-				location: entry.location,
-			})
-		})
-		.collect()
+			&plaintext.record_offsets,
+		)
 	}
 
-	pub(super) async fn build_tiered_row_refresh_plan_from_l2(
+	/// The rows in `plaintext`, walked with `acknowledged`, the record offsets
+	/// in exactly these bytes.
+	pub(super) fn tiered_rows_from_plaintext_with_evidence(
+		&self,
+		plaintext: &[u8],
+		slab_id: SlabId,
+		acknowledged: &BTreeSet<u64>,
+	) -> std::io::Result<Vec<PersistentRecordRow>> {
+		recover_slab_entries_from_blob(plaintext, slab_id, acknowledged)?
+			.into_iter()
+			.map(|entry| {
+				let frame = extract_record_from_blob(plaintext, entry.location)?;
+				// Core recovery already classified synthetic rows. Opaque blob bytes
+				// must never be probed as an Arrow length-prefixed stream.
+				let table_object_id = if entry.routing_locality_trusted {
+					let batch = decode_record_batch(&frame)?;
+					storage_row_table_object_id_at(&batch, entry.location.record_row_index)?
+				} else {
+					None
+				};
+				Ok(PersistentRecordRow {
+					tenant_id: entry.tenant_id,
+					key_identity: entry.key_identity,
+					routing_locality: self.recovered_entry_routing_locality(&entry),
+					table_object_id,
+					// ADR 0090: recovery read the row's placement from the frame;
+					// re-tiering must not downgrade it.
+					placement: entry.location.placement,
+					partition: entry.location.partition,
+					location: entry.location,
+				})
+			})
+			.collect()
+	}
+
+	/// The verifier already fetched and authenticated this object without
+	/// retaining the manager over remote IO. Its private row snapshot is not
+	/// an answer or a maintenance emptiness proof.
+	pub(super) fn build_tiered_row_refresh_plan_from_plaintext(
 		&self,
 		pointer: &TieredSlabPointer,
+		plaintext: &TieredPlaintext,
 	) -> std::io::Result<TieredRowRefreshPlan> {
-		let new_rows = self.load_tiered_rows_from_l2(pointer).await?;
-		let old_rows = self.record_rows_for_slab(pointer.slab_id);
-		let mut old_by_slot = HashMap::with_capacity(old_rows.len());
-		for row in &old_rows {
-			old_by_slot
-				.entry((row.tenant_id, row.key_identity, row.location.hlc))
-				.or_insert_with(Vec::new)
-				.push(row.location);
-		}
-		let mut new_by_slot = HashMap::with_capacity(new_rows.len());
-		for row in &new_rows {
-			new_by_slot
-				.entry((row.tenant_id, row.key_identity, row.location.hlc))
-				.or_insert_with(Vec::new)
-				.push(row.location);
-		}
-		let mut relocated_reads = Vec::new();
-		for (slot, old_locations) in old_by_slot {
-			let Some(new_locations) = new_by_slot.remove(&slot) else {
-				continue;
-			};
-			// Retention rewrites preserve surviving rows in append/offset order but
-			// may prune a prefix of older duplicates that share the same HLC. Align
-			// from the tail so the newest duplicate survives the relocation map.
-			let mut slot_relocations = old_locations
-				.into_iter()
-				.rev()
-				.zip(new_locations.into_iter().rev())
-				.filter_map(|(old_location, new_location)| {
-					(old_location != new_location).then_some((old_location, new_location))
-				})
-				.collect::<Vec<_>>();
-			slot_relocations.reverse();
-			relocated_reads.extend(slot_relocations);
-		}
-		relocated_reads
-			.sort_by_key(|(old_location, _)| (old_location.slab_id, old_location.offset));
+		let new_rows = self.tiered_rows_from_plaintext_with_evidence(
+			&plaintext.bytes,
+			pointer.slab_id,
+			&plaintext.record_offsets,
+		)?;
+		let old_rows = self.record_rows_for_slab_for_recovery(pointer.slab_id);
+		let relocated_reads = self.pair_tier_rows(
+			pointer.slab_id,
+			&old_rows,
+			&new_rows,
+			None,
+			&plaintext.bytes,
+		)?;
 		Ok(TieredRowRefreshPlan {
+			pointer: Some(pointer.clone()),
 			old_rows,
 			new_rows,
 			relocated_reads,
 		})
 	}
 
+	/// The plan that moves the slab's indexed rows to `pointer`'s object, with
+	/// the manager's published generation as the one it replaces.
+	#[cfg(test)]
+	pub(super) async fn build_tiered_row_refresh_plan_from_l2(
+		&self,
+		pointer: &TieredSlabPointer,
+	) -> std::io::Result<TieredRowRefreshPlan> {
+		let published = self.tier_pointer(pointer.slab_id).await;
+		self.build_tiered_row_refresh_plan(pointer, published.as_ref())
+			.await
+	}
+
+	/// The plan that moves the slab's indexed rows to `pointer`'s object. Rows
+	/// pair by logical owner (`tier_plan`); a conflicting owner whose copies
+	/// move pairs by payload, read from the published generation `published`.
+	pub(super) async fn build_tiered_row_refresh_plan(
+		&self,
+		pointer: &TieredSlabPointer,
+		published: Option<&TieredSlabPointer>,
+	) -> std::io::Result<TieredRowRefreshPlan> {
+		// A pointer to a different object than the published generation is a
+		// replacement: the index still describes the published one. Otherwise
+		// the object is the generation the index describes (a first upload of
+		// the indexed local slab, or the same object with only advisory
+		// tombstone or supersession metadata changed).
+		let acknowledged = self.acknowledged_offsets_in_slab(pointer.slab_id);
+		let evidence = tier_object_evidence(published, pointer, &acknowledged, false);
+		let TieredPlaintext {
+			bytes: new_plaintext,
+			record_offsets: new_offsets,
+		} = self.tiered_object_from_l2(pointer, evidence).await?;
+		let new_rows = self.tiered_rows_from_plaintext_with_evidence(
+			&new_plaintext,
+			pointer.slab_id,
+			&new_offsets,
+		)?;
+		// The committed observer holds this slab's tier lock and has checked
+		// its private authority; unrelated intents fence public reads only.
+		let old_rows = self.record_rows_for_slab_for_recovery(pointer.slab_id);
+		let old_plaintext = match published {
+			Some(published) if self.tier_pairing_needs_old_payloads(&old_rows, &new_rows) => {
+				Some(self.tiered_plaintext_from_l2(published).await?)
+			}
+			_ => None,
+		};
+		let relocated_reads = self.pair_tier_rows(
+			pointer.slab_id,
+			&old_rows,
+			&new_rows,
+			old_plaintext.as_deref(),
+			&new_plaintext,
+		)?;
+		Ok(TieredRowRefreshPlan {
+			pointer: Some(pointer.clone()),
+			old_rows,
+			new_rows,
+			relocated_reads,
+		})
+	}
+
+	/// Apply a refresh plan outside a publication: only while the plan's
+	/// pointer is still the slab's published generation and the slab was not
+	/// retired. A stale plan is refused whole, never resurrected. Production
+	/// plans are built and applied inside `apply_tier_slab_committed` under the
+	/// tier publication lock, so only controls apply a plan this way.
+	#[cfg(test)]
 	pub(super) async fn apply_tiered_row_refresh_plan(&self, plan: TieredRowRefreshPlan) {
+		let Some(pointer) = plan.pointer.clone() else {
+			return;
+		};
+		let tier_lock = self.tier_publication_lock(pointer.slab_id);
+		let _tier_guard = tier_lock.lock().await;
+		let current = {
+			let state = self.state.lock().await;
+			state
+				.tiered
+				.get(&pointer.slab_id)
+				.is_some_and(|published| published.value() == &pointer)
+		};
+		if !current || self.retired_tier_slabs.contains(&pointer.slab_id) {
+			tracing::warn!(
+				slab_id = pointer.slab_id.get(),
+				"stale tier row refresh plan refused"
+			);
+			return;
+		}
+		self.apply_tiered_row_refresh_plan_locked(plan, true).await;
+	}
+
+	/// Apply a refresh plan whose pointer the caller has published under the
+	/// slab's tier publication lock.
+	pub(super) async fn apply_tiered_row_refresh_plan_locked(
+		&self,
+		plan: TieredRowRefreshPlan,
+		mirror: bool,
+	) {
 		if plan.old_rows == plan.new_rows {
 			return;
 		}
+		// Rows are matched by their logical owner: a location names one row
+		// in each generation, and the same location in the other generation
+		// is the same version only when its row has the same owner.
+		let old_by_location = plan
+			.old_rows
+			.iter()
+			.map(|row| (row.location, row))
+			.collect::<HashMap<_, _>>();
+		let new_by_location = plan
+			.new_rows
+			.iter()
+			.map(|row| (row.location, row))
+			.collect::<HashMap<_, _>>();
+		let same_owner = |old: &PersistentRecordRow, new: &PersistentRecordRow| {
+			tier_row_owner(old) == tier_row_owner(new)
+		};
+		let mut by_key: BTreeMap<TenantKey, KeyRelocation> = BTreeMap::new();
+		let mut paired_old = HashSet::new();
+		let mut paired_new = HashSet::new();
+		for (old, new) in &plan.relocated_reads {
+			let (Some(old_row), Some(new_row)) =
+				(old_by_location.get(old), new_by_location.get(new))
+			else {
+				continue;
+			};
+			if !same_owner(old_row, new_row) {
+				continue;
+			}
+			paired_old.insert(*old);
+			paired_new.insert(*new);
+			by_key
+				.entry((old_row.tenant_id, old_row.key_identity))
+				.or_insert_with(|| KeyRelocation::new(new_row.routing_locality, false))
+				.pairs
+				.push(RelocationPair {
+					old: *old,
+					new: *new,
+					table_object_id: new_row.table_object_id,
+				});
+		}
+		let kept = |row: &PersistentRecordRow,
+		            other: &HashMap<RecordLocation, &PersistentRecordRow>| {
+			other
+				.get(&row.location)
+				.is_some_and(|other| same_owner(row, other))
+		};
 		for row in &plan.old_rows {
-			self.rollback_indexed_location(row.tenant_id, row.key_identity, row.location);
+			if !paired_old.contains(&row.location) && !kept(row, &new_by_location) {
+				by_key
+					.entry((row.tenant_id, row.key_identity))
+					.or_insert_with(|| KeyRelocation::new(row.routing_locality, false))
+					.removals
+					.push(row.location);
+			}
 		}
 		for row in &plan.new_rows {
-			self.key_index
-				.entry((row.tenant_id, row.key_identity))
-				.and_modify(|versions| {
-					if !versions.contains(&row.location) {
-						insert_version_sorted(versions, row.location);
-					}
-				})
-				.or_insert_with(|| vec![row.location]);
+			if !paired_new.contains(&row.location) && !kept(row, &old_by_location) {
+				by_key
+					.entry((row.tenant_id, row.key_identity))
+					.or_insert_with(|| KeyRelocation::new(row.routing_locality, false))
+					.insertions
+					.push(RelocationInsertion {
+						location: row.location,
+						table_object_id: row.table_object_id,
+					});
+			}
+		}
+		let mut relocated_any = false;
+		for ((tenant_id, key_identity), relocation) in &by_key {
+			self.relocate_indexed_locations(*tenant_id, *key_identity, relocation);
+			if !relocated_any {
+				relocated_any = true;
+				#[cfg(test)]
+				self.index_relocation_pause_point().await;
+			}
+		}
+		// The refreshed object is the authority for each row's routing locality.
+		for row in &plan.new_rows {
 			self.insert_locality_membership_with_locality(
 				row.tenant_id,
 				row.key_identity,
 				row.routing_locality,
 			);
-			if let Some(table_object_id) = row.table_object_id {
-				self.add_published_table_reference(row.tenant_id, table_object_id, row.location);
-			}
+		}
+		if !mirror {
+			return;
 		}
 		self.mirror_persistent_update(
 			PersistentIndexUpdate {
@@ -834,7 +1841,7 @@ impl SlabManager {
 		&self,
 		pointer: &TieredSlabPointer,
 		location: RecordLocation,
-	) -> std::io::Result<Vec<u8>> {
+	) -> std::io::Result<(SlabRecordHeader, Vec<u8>)> {
 		let l2 = self.config.l2.as_ref().ok_or_else(|| {
 			Error::new(
 				ErrorKind::NotFound,
@@ -845,16 +1852,16 @@ impl SlabManager {
 			)
 		})?;
 		let mut plaintext_for_rehydration = None;
-		let frame = if pointer.is_encrypted {
-			self.read_encrypted_record_from_l2(l2.as_ref(), pointer, location)
+		let (header, frame) = if pointer.is_encrypted {
+			self.read_encrypted_record_and_header_from_l2(l2.as_ref(), pointer, location)
 				.await?
 		} else {
 			let plaintext = self
 				.fetch_full_tiered_plaintext(l2.as_ref(), pointer)
 				.await?;
-			let frame = extract_record_from_blob(&plaintext, location)?;
+			let record = extract_record_and_header_from_blob(&plaintext, location)?;
 			plaintext_for_rehydration = Some(plaintext);
-			frame
+			record
 		};
 		if self.note_l2_read(pointer.slab_id).await {
 			let rehydrate_result = async {
@@ -880,7 +1887,7 @@ impl SlabManager {
 		if let Ok(policy) = record_batch_compression_policy_from_ipc(&frame) {
 			metrics().observe_storage_compression_l2_record_body_fetch(policy, frame.len() as u64);
 		}
-		Ok(frame)
+		Ok((header, frame))
 	}
 
 	pub(super) async fn fetch_full_tiered_plaintext(
@@ -890,12 +1897,15 @@ impl SlabManager {
 	) -> std::io::Result<Vec<u8>> {
 		let blob = l2.get_bytes(&pointer.l2_uri).await?;
 		validate_tiered_blob(pointer, blob.as_ref())?;
-		decode_tiered_blob(
+		// Reads serve the published generation, which the index describes.
+		let acknowledged = self.acknowledged_offsets_in_slab(pointer.slab_id);
+		Ok(decode_tiered_blob(
 			self.config.crypto.as_ref(),
 			pointer,
 			blob.as_ref(),
-			&self.acknowledged_offsets_in_slab(pointer.slab_id),
-		)
+			TierObjectEvidence::Indexed(&acknowledged),
+		)?
+		.bytes)
 	}
 
 	pub(super) async fn read_encrypted_record_from_l2(
@@ -904,6 +1914,17 @@ impl SlabManager {
 		pointer: &TieredSlabPointer,
 		location: RecordLocation,
 	) -> std::io::Result<Vec<u8>> {
+		self.read_encrypted_record_and_header_from_l2(l2, pointer, location)
+			.await
+			.map(|(_, frame)| frame)
+	}
+
+	pub(super) async fn read_encrypted_record_and_header_from_l2(
+		&self,
+		l2: &dyn ObjectStore,
+		pointer: &TieredSlabPointer,
+		location: RecordLocation,
+	) -> std::io::Result<(SlabRecordHeader, Vec<u8>)> {
 		let metadata = l2.head(&pointer.l2_uri).await?;
 		let tail_start = metadata
 			.size_bytes
@@ -957,7 +1978,7 @@ impl SlabManager {
 			.await?;
 		let record_bytes = plan.decrypt(ciphertext.as_ref())?;
 		validate_tiered_record_header_tenant(&record_bytes, footer.tenant_id, pointer.slab_id)?;
-		extract_record_from_blob(
+		extract_record_and_header_from_blob(
 			&record_bytes,
 			RecordLocation {
 				offset: 0,
@@ -980,6 +2001,13 @@ impl SlabManager {
 		if *hits < promote_after {
 			return false;
 		}
+		// The slab's path holds a quarantined file: a copy would have to
+		// replace evidence, so the slab keeps serving from verified L2.
+		if self.quarantined_slab_files.contains(slab_id) {
+			state.hot_read_counts.remove(&slab_id);
+			self.quarantined_slab_files.note_rehydration_skipped();
+			return false;
+		}
 		state.rehydrating.insert(slab_id);
 		true
 	}
@@ -994,7 +2022,20 @@ impl SlabManager {
 			.await;
 		let mut state = self.state.lock().await;
 		state.rehydrating.remove(&pointer.slab_id);
+		// A copy is installed only for the generation it was made from.
+		let still_published = state
+			.tiered
+			.get(&pointer.slab_id)
+			.is_some_and(|published| published.value() == &pointer);
 		match result {
+			Ok(_) if !still_published => {
+				// The copy this call installed belongs to a superseded
+				// generation: it is never tracked, and its file is removed
+				// rather than left at the slab's path.
+				self.release_slab_file(pointer.slab_id);
+				drop(state);
+				self.unlink_released_slab_file(pointer.slab_id).await
+			}
 			Ok(installed) => {
 				state.hot_read_counts.remove(&pointer.slab_id);
 				state.rehydrated.insert(pointer.slab_id, installed);
@@ -1021,6 +2062,12 @@ impl SlabManager {
 		slab_id: SlabId,
 		blob: &[u8],
 	) -> std::io::Result<RehydratedSlabState> {
+		if self.quarantined_slab_files.contains(slab_id) {
+			return Err(Error::new(
+				ErrorKind::AlreadyExists,
+				format!("slab {slab_id}'s path holds a quarantined file; it is never replaced"),
+			));
+		}
 		let path = slab_path(&self.config.dir, slab_id);
 		let tmp_path = rehydrate_tmp_path(&self.config.dir, slab_id);
 		let _ = unlink_local_file(self.file_ops.as_ref(), &tmp_path).await;
@@ -1040,7 +2087,11 @@ impl SlabManager {
 			)
 			.await?;
 		self.file_ops.fsync(&tmp).await?;
-		self.file_ops.rename(&tmp_path, &path).await?;
+		// The copy is published only where no file exists: whatever is already
+		// at the slab's path is not this copy's to replace.
+		let linked = self.file_ops.link_no_replace(&tmp_path, &path).await;
+		let _ = unlink_local_file(self.file_ops.as_ref(), &tmp_path).await;
+		linked?;
 		fsync_parent_dir(self.file_ops.as_ref(), &path).await?;
 		let slab = Arc::new(
 			LocalSlabStore::open(

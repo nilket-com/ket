@@ -2,9 +2,11 @@
 mod test_dir;
 use async_trait::async_trait;
 
-async fn open_test_manager(config: SlabManagerConfig) -> std::io::Result<SlabManager> {
+async fn initialize_test_manager(
+	config: SlabManagerConfig,
+) -> std::io::Result<std::sync::Arc<SlabManager>> {
 	let owner = wendelon::storage::ownership::DataDirectoryOwner::acquire_existing(&config.dir)?;
-	SlabManager::open_with_owner(config, owner).await
+	SlabManager::initialize_new_store_with_owner(config, owner).await
 }
 use openraft::storage::RaftStateMachine;
 use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
@@ -84,6 +86,10 @@ impl CountingObjectStore {
 
 #[async_trait]
 impl ObjectStore for CountingObjectStore {
+	fn planned_upload_uri(&self, key: &str) -> std::io::Result<String> {
+		self.inner.planned_upload_uri(key)
+	}
+
 	async fn put(&self, key: &str, bytes: &[u8]) -> std::io::Result<String> {
 		self.inner.put(key, bytes).await
 	}
@@ -187,26 +193,24 @@ async fn build_tiered_manager(
 		Arc::new(LocalFsObjectStore::new(l2_dir.to_path_buf()).unwrap());
 	let l2 = Arc::new(CountingObjectStore::new(l2_inner));
 	let l2_store: Arc<dyn ObjectStore> = l2.clone();
-	let manager = Arc::new(
-		open_test_manager(SlabManagerConfig {
-			dir: l1_dir.to_path_buf(),
-			max_slab_bytes: 1,
-			io,
-			l2: Some(l2_store.clone()),
-			rehydration,
-			l2_column_fetch: Default::default(),
-			row_group_writer: Default::default(),
-			l2_row_group_fetch: Default::default(),
-			encoding_writer: Default::default(),
-			l2_chunk_layout: Default::default(),
-			l2_encoding_fetch: Default::default(),
-			encoding_compute: Default::default(),
-			group_commit: wendelon::storage::GroupCommitConfig::default(),
-			crypto: test_crypto(),
-		})
-		.await
-		.unwrap(),
-	);
+	let manager = initialize_test_manager(SlabManagerConfig {
+		dir: l1_dir.to_path_buf(),
+		max_slab_bytes: 1,
+		io,
+		l2: Some(l2_store.clone()),
+		rehydration,
+		l2_column_fetch: Default::default(),
+		row_group_writer: Default::default(),
+		l2_row_group_fetch: Default::default(),
+		encoding_writer: Default::default(),
+		l2_chunk_layout: Default::default(),
+		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
+		group_commit: wendelon::storage::GroupCommitConfig::default(),
+		crypto: test_crypto(),
+	})
+	.await
+	.unwrap();
 
 	manager
 		.append(tenant(), id(1), hlc(), b"hello-1")
@@ -221,7 +225,10 @@ async fn build_tiered_manager(
 		.await
 		.unwrap();
 
-	let location = manager.lookup(tenant(), id(1)).expect("key present");
+	let location = manager
+		.lookup(tenant(), id(1))
+		.unwrap()
+		.expect("key present");
 	let original = manager.read(location).await.expect("pre-tier read ok");
 
 	let observer: Arc<dyn TierObserver> = Arc::new(ManagerTierObserver::new(manager.clone()));

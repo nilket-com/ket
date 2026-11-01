@@ -40,6 +40,10 @@ const TIERED_SLABS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("ti
 const SECONDARY_INDEX_SEGMENTS_TABLE: TableDefinition<&[u8], &[u8]> =
 	TableDefinition::new("secondary_index_segments_v1");
 const LSM_RUNS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("lsm_runs_v1");
+const LSM_INSTALL_INTENTS_TABLE: TableDefinition<u64, &[u8]> =
+	TableDefinition::new("lsm_install_intents_v1");
+const META_LSM_INSTALL_INTENTS_INITIALIZED: &str = "lsm_install_intents_initialized_v1";
+
 /// ADR 0097 decision 4: durable evidence of deterministic maintenance failures.
 ///
 /// Every deterministic ATTEMPT is recorded, not only the final quarantine: the
@@ -51,6 +55,251 @@ const LSM_RUNS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("lsm_ru
 const MAINTENANCE_RECEIPTS_TABLE: TableDefinition<&[u8], &[u8]> =
 	TableDefinition::new("maintenance_failure_receipts_v1");
 const META_TABLE: TableDefinition<&str, u64> = TableDefinition::new("storage_index_meta_v1");
+const SNAPSHOT_CLEANUP_INTENTS_TABLE: TableDefinition<&[u8], &[u8]> =
+	TableDefinition::new("snapshot_cleanup_intents_v1");
+const META_SNAPSHOT_CLEANUP_INITIALIZED: &str = "snapshot_cleanup_intents_initialized";
+const META_CLEANUP_AUTHORITY_GAPS: &str = "cleanup_authority_gaps_v1";
+const META_CLEANUP_HISTORY_INCOMPLETE: &str = "cleanup_history_incomplete_v1";
+const SNAPSHOT_RETIREMENTS_TABLE: TableDefinition<u64, &[u8]> =
+	TableDefinition::new("snapshot_retirements_v1");
+const META_SNAPSHOT_RETIREMENTS_INITIALIZED: &str = "snapshot_retirements_initialized_v1";
+const SNAPSHOT_RETIREMENT_STATE_TABLE: TableDefinition<&str, &[u8]> =
+	TableDefinition::new("snapshot_retirement_state_v1");
+const META_SNAPSHOT_RETIREMENT_EPOCH_FLOOR: &str = "snapshot_retirement_epoch_floor_v1";
+const METADATA_PENDING_TABLE: TableDefinition<u64, &[u8]> =
+	TableDefinition::new("metadata_pending_tokens_v1");
+const META_METADATA_PENDING_INITIALIZED: &str = "metadata_pending_initialized_v1";
+const META_METADATA_TOKEN_FLOOR: &str = "metadata_token_floor_v1";
+
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PendingMetadataTokens {
+	pub supersession: std::collections::BTreeSet<u64>,
+	pub tombstone: std::collections::BTreeSet<u64>,
+	pub degrade_applied: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum MetadataKind {
+	Supersession,
+	Tombstone,
+}
+
+impl PendingMetadataTokens {
+	pub(crate) fn degrade(&self, pointer: &mut TieredSlabPointer) {
+		if !self.supersession.is_empty() {
+			pointer.supersession_metadata = SupersessionMetadata::Untracked;
+		}
+		if !self.tombstone.is_empty() {
+			pointer.tombstone_metadata = TombstoneMetadata::Untracked;
+		}
+	}
+	fn is_empty(&self) -> bool {
+		self.supersession.is_empty() && self.tombstone.is_empty()
+	}
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct SnapshotRetirementMark {
+	pub epoch: u64,
+	pub snapshot_index: Option<u64>,
+	pub pointer: TieredSlabPointer,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct SnapshotRetirementState {
+	epoch: u64,
+	committed: Vec<SlabId>,
+}
+
+/// Apply surviving tokens to exactly the pointer published by this transaction.
+fn apply_pending_metadata_to_pointer(
+	tx: &redb::WriteTransaction,
+	pointer: &mut TieredSlabPointer,
+	completed: Option<(SlabId, MetadataKind, u64)>,
+) -> std::io::Result<()> {
+	let mut table = tx.open_table(METADATA_PENDING_TABLE).map_err(redb_to_io)?;
+	let slab = pointer.slab_id.get();
+	let pending = table
+		.get(&slab)
+		.map_err(redb_to_io)?
+		.map(|value| {
+			postcard::from_bytes::<PendingMetadataTokens>(value.value())
+				.map_err(|e| Error::new(ErrorKind::InvalidData, e))
+		})
+		.transpose()?;
+	if let Some(mut pending) = pending {
+		if let Some((id, kind, token)) = completed.filter(|(id, _, _)| *id == pointer.slab_id) {
+			let removed = match kind {
+				MetadataKind::Supersession => pending.supersession.remove(&token),
+				MetadataKind::Tombstone => pending.tombstone.remove(&token),
+			};
+			if !removed {
+				return Err(Error::new(
+					ErrorKind::InvalidData,
+					format!("metadata token {token} missing for slab {}", id.get()),
+				));
+			}
+		}
+		if pending.is_empty() {
+			table.remove(&slab).map_err(redb_to_io)?;
+		} else {
+			pending.degrade(pointer);
+			pending.degrade_applied = true;
+			let value =
+				postcard::to_stdvec(&pending).map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+			table.insert(&slab, value.as_slice()).map_err(redb_to_io)?;
+		}
+	} else if completed.is_some_and(|(id, _, _)| id == pointer.slab_id) {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"completed metadata token row is missing",
+		));
+	}
+	Ok(())
+}
+
+fn note_metadata_degradation(
+	before: &TieredSlabPointer,
+	after: &TieredSlabPointer,
+	counts: &mut (u64, u64),
+) {
+	if before.supersession_metadata.is_tracked() && after.supersession_metadata.is_untracked() {
+		counts.0 += 1;
+	}
+	if before.tombstone_metadata.is_tracked() && after.tombstone_metadata.is_untracked() {
+		counts.1 += 1;
+	}
+}
+fn publish_metadata_degradation_counts(counts: (u64, u64)) {
+	crate::metrics::global()
+		.storage_supersession_metadata_degraded_total
+		.add(counts.0);
+	crate::metrics::global()
+		.storage_tombstone_metadata_degraded_total
+		.add(counts.1);
+}
+
+/// Durable retained-object accounting and publication evidence.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct RetainedObjectIntent {
+	pub bytes: Option<u64>,
+	pub replacement_uri: Option<String>,
+	pub replacement_bytes: Option<u64>,
+	pub published_replacements: std::collections::BTreeSet<String>,
+	pub retirement_source: Option<RetirementSource>,
+	pub state: RetainedObjectIntentState,
+}
+
+impl RetainedObjectIntent {
+	pub(crate) fn was_published(&self, replacement: &str) -> bool {
+		self.published_replacements.contains(replacement)
+			|| (self.state == RetainedObjectIntentState::ReplacementPublished
+				&& self.replacement_uri.as_deref() == Some(replacement))
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum RetirementSource {
+	Snapshot(u64),
+	Log(u64),
+}
+
+impl RetirementSource {
+	pub(crate) fn index(self) -> u64 {
+		match self {
+			Self::Snapshot(index) | Self::Log(index) => index,
+		}
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum RetainedObjectIntentState {
+	Unresolved,
+	ReplacementPublished,
+	RetirementPublished,
+	/// Fresh candidate; no committer call is permitted until this proof is cleared durably.
+	CandidateNotSubmitted,
+}
+
+/// Record publication of predecessors and the retired object in one transaction.
+fn persist_retirement_records(
+	tx: &redb::WriteTransaction,
+	pointer: &TieredSlabPointer,
+	known_bytes: Option<u64>,
+	evidence: Vec<(String, RetainedObjectIntent)>,
+	source: RetirementSource,
+) -> std::io::Result<(RetainedObjectIntent, Vec<(String, RetainedObjectIntent)>)> {
+	let mut table = tx
+		.open_table(SNAPSHOT_CLEANUP_INTENTS_TABLE)
+		.map_err(redb_to_io)?;
+	let mut applied_evidence = Vec::new();
+	for (prior_uri, proposed) in evidence {
+		let mut prior_key = pointer.slab_id.get().to_be_bytes().to_vec();
+		prior_key.extend_from_slice(prior_uri.as_bytes());
+		let existing = table
+			.get(prior_key.as_slice())
+			.map_err(redb_to_io)?
+			.map(|value| {
+				postcard::from_bytes::<RetainedObjectIntent>(value.value())
+					.map_err(|e| Error::new(ErrorKind::InvalidData, e))
+			})
+			.transpose()?;
+		let mut prior = existing.unwrap_or(proposed);
+		if !prior.was_published(&pointer.l2_uri) {
+			if prior.state != RetainedObjectIntentState::Unresolved
+				|| prior.replacement_uri.as_deref() != Some(pointer.l2_uri.as_str())
+			{
+				return Err(Error::new(
+					ErrorKind::InvalidData,
+					"retirement predecessor mismatch",
+				));
+			}
+			prior.state = RetainedObjectIntentState::ReplacementPublished;
+		}
+		prior.published_replacements.insert(pointer.l2_uri.clone());
+		let encoded =
+			postcard::to_stdvec(&prior).map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+		table
+			.insert(prior_key.as_slice(), encoded.as_slice())
+			.map_err(redb_to_io)?;
+		applied_evidence.push((prior_uri, prior));
+	}
+	let mut key = pointer.slab_id.get().to_be_bytes().to_vec();
+	key.extend_from_slice(pointer.l2_uri.as_bytes());
+	let existing = table
+		.get(key.as_slice())
+		.map_err(redb_to_io)?
+		.map(|value| {
+			postcard::from_bytes::<RetainedObjectIntent>(value.value())
+				.map_err(|e| Error::new(ErrorKind::InvalidData, e))
+		})
+		.transpose()?;
+	let mut retained = existing.unwrap_or(RetainedObjectIntent {
+		bytes: known_bytes,
+		replacement_uri: None,
+		replacement_bytes: None,
+		published_replacements: Default::default(),
+		retirement_source: None,
+		state: RetainedObjectIntentState::Unresolved,
+	});
+	let pending_other = retained.state == RetainedObjectIntentState::Unresolved
+		&& retained
+			.replacement_uri
+			.as_deref()
+			.is_some_and(|uri| uri != pointer.l2_uri);
+	if !pending_other {
+		retained.replacement_uri = None;
+		retained.replacement_bytes = None;
+		retained.state = RetainedObjectIntentState::RetirementPublished;
+	}
+	retained.retirement_source = Some(source);
+	let encoded =
+		postcard::to_stdvec(&retained).map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+	table
+		.insert(key.as_slice(), encoded.as_slice())
+		.map_err(redb_to_io)?;
+	Ok((retained, applied_evidence))
+}
 
 /// Limits applied while copying the receipt table out of redb. Supplied by the
 /// policy layer, which owns the receipt schema and so knows the true maxima.
@@ -180,6 +429,48 @@ pub(crate) struct PersistentSecondaryIndexSegmentRow {
 	pub entry_count: u64,
 }
 
+/// Identifies which authority can resolve an interrupted LSM install.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum LsmInstallKind {
+	Local,
+	Control,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum LsmInstallPhase {
+	Prepared,
+	OutputsPublished,
+}
+
+/// Durable evidence that an LSM install may have renamed output files.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct LsmInstallIntent {
+	pub kind: LsmInstallKind,
+	pub phase: LsmInstallPhase,
+	pub commit: crate::storage::lsm::CompactionCommit,
+	pub commit_digest: [u8; 32],
+	pub inputs: Vec<LsmInputAuthority>,
+	pub local_input_rows_digest: [u8; 32],
+	pub local_output_rows_digest: [u8; 32],
+	pub local_input_runs: Vec<LsmRunSummary>,
+	pub local_input_files: Vec<LsmFileIdentity>,
+	pub local_output_files: Vec<LsmFileIdentity>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct LsmFileIdentity {
+	pub slab_id: SlabId,
+	pub len: u64,
+	pub digest: [u8; 32],
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct LsmInputAuthority {
+	pub slab_id: SlabId,
+	pub revision: u64,
+	pub tiered: Option<TieredSlabPointer>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct PersistentIndexSnapshot {
 	/// Every durable record reference, including local L1 records.  Recovery
@@ -188,18 +479,26 @@ pub(crate) struct PersistentIndexSnapshot {
 	/// is missing.
 	pub record_rows: Vec<PersistentRecordRow>,
 	pub tiered_slabs: Vec<TieredSlabPointer>,
+	/// Explicit durable retirements without a currently published tier pointer.
+	pub retired_tiered_slabs: HashSet<SlabId>,
 	pub tiered_records: Vec<PersistentRecordRow>,
 	pub record_localities: Vec<(TenantId, Identity, Locality)>,
 	pub secondary_index_segments: Vec<PersistentSecondaryIndexSegmentRow>,
 	pub lsm_runs: Vec<LsmRunSummary>,
+	pub lsm_install_intents: Vec<LsmInstallIntent>,
 	pub last_control_log_index: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct PersistentIndexUpdate {
+	pub lsm_intent_transition: Option<(LsmInstallIntent, LsmInstallIntent)>,
 	pub put_records: Vec<PersistentRecordRow>,
 	pub delete_records: Vec<PersistentRecordRow>,
 	pub put_tiered_slabs: Vec<TieredSlabPointer>,
+	/// A metadata operation clears only its own token in the pointer transaction.
+	pub completed_metadata_token: Option<(SlabId, MetadataKind, u64)>,
+	/// Only an actual committed tier publication can supersede a snapshot retirement.
+	pub tier_republication_index: Option<u64>,
 	pub delete_tiered_slab_ids: Vec<SlabId>,
 	pub put_secondary_index_segments: Vec<PersistentSecondaryIndexSegmentRow>,
 	pub delete_secondary_index_segments: Vec<PersistentSecondaryIndexSegmentKey>,
@@ -214,13 +513,255 @@ pub(crate) struct PersistentLocalIndex {
 	/// ADR 0097: false when this store previously held receipts and the table is
 	/// now gone - lost history, not empty history.
 	receipts_available: bool,
+	/// False for the lifetime of this handle if initialized cleanup history is missing.
+	cleanup_available: bool,
+	persisted_cleanup_gaps: std::sync::Arc<CleanupGapContribution>,
 	/// Test seam: make the next receipt mutations fail, so the policy's
 	/// fail-closed paths can be exercised against a real store.
 	#[cfg(test)]
 	pub(crate) fail_receipt_mutations: std::sync::atomic::AtomicBool,
+	#[cfg(test)]
+	pub(crate) fail_next_delta: std::sync::atomic::AtomicBool,
+	#[cfg(test)]
+	pub(crate) fail_next_cleanup_insert: std::sync::atomic::AtomicBool,
+	#[cfg(test)]
+	pub(crate) fail_cleanup_gap_before_commit: std::sync::atomic::AtomicBool,
+	#[cfg(test)]
+	pub(crate) fail_next_retirement: std::sync::atomic::AtomicBool,
+	#[cfg(test)]
+	pub(crate) fail_cleanup_after_provisional_remove: std::sync::atomic::AtomicBool,
+	#[cfg(test)]
+	pub(crate) guarded_delta_before_commit_hold: std::sync::Mutex<
+		Option<(
+			std::sync::Arc<std::sync::Barrier>,
+			std::sync::Arc<std::sync::Barrier>,
+			bool,
+		)>,
+	>,
+	#[cfg(test)]
+	pub(crate) guarded_delta_commit_hold: std::sync::Mutex<
+		Option<(
+			std::sync::Arc<std::sync::Barrier>,
+			std::sync::Arc<std::sync::Barrier>,
+		)>,
+	>,
+	#[cfg(test)]
+	pub(crate) retirement_commit_hold: std::sync::Mutex<
+		Option<(
+			std::sync::Arc<std::sync::Barrier>,
+			std::sync::Arc<std::sync::Barrier>,
+		)>,
+	>,
+}
+
+struct CleanupGapContribution {
+	count: std::sync::atomic::AtomicU64,
+	history_incomplete: bool,
+}
+
+impl Drop for CleanupGapContribution {
+	fn drop(&mut self) {
+		crate::metrics::global()
+			.storage_cleanup_unrecorded_supersessions
+			.sub(self.count.load(std::sync::atomic::Ordering::Relaxed));
+		if self.history_incomplete {
+			crate::metrics::global()
+				.storage_cleanup_history_incomplete
+				.sub(1);
+		}
+	}
 }
 
 impl PersistentLocalIndex {
+	/// Allocate and durably record an operation before it can publish a row.
+	pub(crate) async fn begin_metadata_token(
+		&self,
+		slab: SlabId,
+		kind: MetadataKind,
+	) -> std::io::Result<u64> {
+		let _guard = self.write_lock.lock().await;
+		self.db
+			.run(move |db| {
+				let tx = db.begin_write().map_err(redb_to_io)?;
+				let token;
+				{
+					let mut meta = tx.open_table(META_TABLE).map_err(redb_to_io)?;
+					let floor = meta
+						.get(META_METADATA_TOKEN_FLOOR)
+						.map_err(redb_to_io)?
+						.map(|v| v.value())
+						.unwrap_or(0);
+					token = floor
+						.checked_add(1)
+						.ok_or_else(|| Error::other("metadata token counter exhausted"))?;
+					meta.insert(META_METADATA_TOKEN_FLOOR, &token)
+						.map_err(redb_to_io)?;
+				}
+				{
+					let mut table = tx.open_table(METADATA_PENDING_TABLE).map_err(redb_to_io)?;
+					let mut pending = table
+						.get(&slab.get())
+						.map_err(redb_to_io)?
+						.map(|v| {
+							postcard::from_bytes::<PendingMetadataTokens>(v.value())
+								.map_err(|e| Error::new(ErrorKind::InvalidData, e))
+						})
+						.transpose()?
+						.unwrap_or_default();
+					match kind {
+						MetadataKind::Supersession => {
+							pending.supersession.insert(token);
+						}
+						MetadataKind::Tombstone => {
+							pending.tombstone.insert(token);
+						}
+					}
+					pending.degrade_applied = false;
+					let value = postcard::to_stdvec(&pending)
+						.map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+					table
+						.insert(&slab.get(), value.as_slice())
+						.map_err(redb_to_io)?;
+				}
+				tx.commit().map_err(redb_to_io)?;
+				Ok(token)
+			})
+			.await
+	}
+
+	#[cfg(test)]
+	pub(crate) async fn metadata_token_floor_for_test(&self) -> std::io::Result<u64> {
+		self.db
+			.run(|db| {
+				let tx = db.begin_read().map_err(redb_to_io)?;
+				let table = tx.open_table(META_TABLE).map_err(redb_to_io)?;
+				let value = table
+					.get(META_METADATA_TOKEN_FLOOR)
+					.map_err(redb_to_io)?
+					.map(|v| v.value())
+					.unwrap_or(0);
+				Ok(value)
+			})
+			.await
+	}
+
+	pub(crate) async fn load_pending_metadata_tokens(
+		&self,
+	) -> std::io::Result<Vec<(SlabId, PendingMetadataTokens)>> {
+		self.db
+			.run(move |db| {
+				let tx = db.begin_read().map_err(redb_to_io)?;
+				let table = tx.open_table(METADATA_PENDING_TABLE).map_err(redb_to_io)?;
+				let mut rows = Vec::new();
+				for row in table.iter().map_err(redb_to_io)? {
+					let (key, value) = row.map_err(redb_to_io)?;
+					let pending = postcard::from_bytes::<PendingMetadataTokens>(value.value())
+						.map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+					rows.push((SlabId::new(key.value()), pending));
+				}
+				Ok(rows)
+			})
+			.await
+	}
+
+	/// On open, no prior writer is active. Degrade the current pointer and clear
+	/// its surviving operation tokens atomically before exposing the index.
+	pub(crate) async fn recover_metadata_tokens(&self) -> std::io::Result<usize> {
+		let _guard = self.write_lock.lock().await;
+		self.db
+			.run(move |db| {
+				let tx = db.begin_write().map_err(redb_to_io)?;
+				let count;
+				let mut degradation_counts = (0, 0);
+				{
+					let mut pending = tx.open_table(METADATA_PENDING_TABLE).map_err(redb_to_io)?;
+					let rows = pending
+						.iter()
+						.map_err(redb_to_io)?
+						.map(|row| {
+							let (key, value) = row.map_err(redb_to_io)?;
+							Ok((
+								key.value(),
+								postcard::from_bytes::<PendingMetadataTokens>(value.value())
+									.map_err(|e| Error::new(ErrorKind::InvalidData, e))?,
+							))
+						})
+						.collect::<std::io::Result<Vec<_>>>()?;
+					count = rows.len();
+					let mut pointers = tx.open_table(TIERED_SLABS_TABLE).map_err(redb_to_io)?;
+					for (slab, tokens) in rows {
+						let pointer = pointers
+							.get(&slab)
+							.map_err(redb_to_io)?
+							.map(|value| decode_tiered_pointer(SlabId::new(slab), value.value()))
+							.transpose()?;
+						if let Some(mut pointer) = pointer {
+							let before = pointer.clone();
+							tokens.degrade(&mut pointer);
+							note_metadata_degradation(&before, &pointer, &mut degradation_counts);
+							let value = encode_tiered_pointer(&pointer);
+							pointers
+								.insert(&slab, value.as_slice())
+								.map_err(redb_to_io)?;
+							pending.remove(&slab).map_err(redb_to_io)?;
+						}
+					}
+				}
+				tx.commit().map_err(redb_to_io)?;
+				publish_metadata_degradation_counts(degradation_counts);
+				Ok(count)
+			})
+			.await
+	}
+
+	pub(crate) fn cleanup_authority_available(&self) -> bool {
+		self.cleanup_available
+	}
+
+	fn require_cleanup_authority(&self) -> std::io::Result<()> {
+		if self.cleanup_available {
+			Ok(())
+		} else {
+			Err(Error::new(
+				ErrorKind::WouldBlock,
+				"cleanup authority unavailable until restart",
+			))
+		}
+	}
+
+	#[cfg(test)]
+	pub(crate) async fn cleanup_authority_gap_count(&self) -> std::io::Result<u64> {
+		self.db
+			.run(move |db| {
+				let tx = db.begin_read().map_err(redb_to_io)?;
+				let meta = tx.open_table(META_TABLE).map_err(redb_to_io)?;
+				let count = meta
+					.get(META_CLEANUP_AUTHORITY_GAPS)
+					.map_err(redb_to_io)?
+					.map(|v| v.value())
+					.unwrap_or(0);
+				Ok(count)
+			})
+			.await
+	}
+
+	/// Drop the rows a test's simulated crash never made durable.
+	#[cfg(test)]
+	pub(crate) async fn forget_record_rows_for_test(
+		&self,
+		forget: impl Fn(&PersistentRecordRow) -> bool,
+	) -> std::io::Result<()> {
+		let snapshot = self.load_snapshot().await?;
+		let rows = snapshot
+			.record_rows
+			.into_iter()
+			.chain(snapshot.tiered_records)
+			.filter(|row| !forget(row))
+			.collect();
+		self.rebuild(rows, snapshot.tiered_slabs, snapshot.last_control_log_index)
+			.await
+	}
+
 	pub(crate) async fn open(path: impl Into<PathBuf>) -> std::io::Result<Self> {
 		Self::open_with_owner(path, None).await
 	}
@@ -230,6 +771,47 @@ impl PersistentLocalIndex {
 		owner: Option<DataDirectoryOwner>,
 	) -> std::io::Result<Self> {
 		let path = path.into();
+		let mut delay = std::time::Duration::from_millis(200);
+		loop {
+			match Self::open_index(path.clone(), owner.clone(), false).await {
+				Err(error)
+					if error
+						.get_ref()
+						.and_then(|cause| cause.downcast_ref::<redb::DatabaseError>())
+						.is_some_and(|cause| {
+							matches!(cause, redb::DatabaseError::DatabaseAlreadyOpen)
+						}) =>
+				{
+					// No database or directory write permit crosses this backoff.
+					tracing::warn!(path = %path.display(), readiness = "Pending", "storage index is held by a previous handle; retrying open");
+					crate::storage::manager::tier_authority::observe_tier_authority_retry(&error);
+					let delay =
+						crate::storage::manager::tier_authority::next_transient_retry(&mut delay);
+					tokio::time::sleep(delay).await;
+				}
+				result => return result,
+			}
+		}
+	}
+
+	#[cfg(test)]
+	pub(crate) fn hold_database_for_test(&self) -> std::sync::Arc<Database> {
+		self.db.test_handle()
+	}
+
+	pub(crate) async fn initialize_new(
+		path: impl Into<PathBuf>,
+		owner: Option<DataDirectoryOwner>,
+	) -> std::io::Result<Self> {
+		Self::open_index(path, owner, true).await
+	}
+
+	async fn open_index(
+		path: impl Into<PathBuf>,
+		owner: Option<DataDirectoryOwner>,
+		initialize_new: bool,
+	) -> std::io::Result<Self> {
+		let path = path.into();
 		if let Some(owner) = &owner {
 			owner.ensure_contains(&path)?;
 		}
@@ -237,8 +819,24 @@ impl PersistentLocalIndex {
 		// initialization or a refused bind drops the raw database inside this
 		// closure, while the permit still holds the owner open.
 		let bind_owner = owner.clone();
-		let (db, receipts_available) = spawn_blocking_owned_io(owner, move || {
-			let db = Database::create(path).map_err(redb_to_io)?;
+		let opened = spawn_blocking_owned_io(owner, move || {
+			let db = if initialize_new {
+				// O_EXCL makes an explicit fresh initialization incapable of opening
+				// or replacing an unexpected existing authority file.
+				let file = std::fs::OpenOptions::new()
+					.read(true)
+					.write(true)
+					.create_new(true)
+					.open(&path)?;
+				Database::builder().create_file(file).map_err(redb_to_io)?
+			} else {
+				Database::open(&path).map_err(|error| match error {
+					redb::DatabaseError::DatabaseAlreadyOpen => {
+						Error::new(ErrorKind::WouldBlock, error)
+					}
+					other => redb_to_io(other),
+				})?
+			};
 			let write_txn = db.begin_write().map_err(redb_to_io)?;
 			{
 				let _table = write_txn.open_table(RECORDS_TABLE).map_err(redb_to_io)?;
@@ -259,11 +857,115 @@ impl PersistentLocalIndex {
 			{
 				let _table = write_txn.open_table(META_TABLE).map_err(redb_to_io)?;
 			}
+			// Keep the rest of the index usable when cleanup history alone is missing.
+			let cleanup_ok = {
+				let mut meta = write_txn.open_table(META_TABLE).map_err(redb_to_io)?;
+				let initialized = meta
+					.get(META_SNAPSHOT_CLEANUP_INITIALIZED)
+					.map_err(redb_to_io)?
+					.is_some();
+				let present = write_txn
+					.list_tables()
+					.map_err(redb_to_io)?
+					.any(|table| table.name() == SNAPSHOT_CLEANUP_INTENTS_TABLE.name());
+				if initialized && !present {
+					meta.insert(META_CLEANUP_HISTORY_INCOMPLETE, &1u64)
+						.map_err(redb_to_io)?;
+				}
+				if !initialized {
+					let _table = write_txn
+						.open_table(SNAPSHOT_CLEANUP_INTENTS_TABLE)
+						.map_err(redb_to_io)?;
+					meta.insert(META_SNAPSHOT_CLEANUP_INITIALIZED, &1u64)
+						.map_err(redb_to_io)?;
+				}
+				!initialized || present
+			};
+			{
+				let mut meta = write_txn.open_table(META_TABLE).map_err(redb_to_io)?;
+				let initialized = meta
+					.get(META_SNAPSHOT_RETIREMENTS_INITIALIZED)
+					.map_err(redb_to_io)?
+					.is_some();
+				let tables = write_txn
+					.list_tables()
+					.map_err(redb_to_io)?
+					.map(|table| table.name().to_owned())
+					.collect::<HashSet<_>>();
+				let present = tables.contains(SNAPSHOT_RETIREMENTS_TABLE.name())
+					&& tables.contains(SNAPSHOT_RETIREMENT_STATE_TABLE.name());
+				if initialized && !present {
+					return Err(Error::new(
+						ErrorKind::InvalidData,
+						"snapshot retirement authority is missing",
+					));
+				}
+				if !initialized {
+					let _table = write_txn
+						.open_table(SNAPSHOT_RETIREMENTS_TABLE)
+						.map_err(redb_to_io)?;
+					let _state = write_txn
+						.open_table(SNAPSHOT_RETIREMENT_STATE_TABLE)
+						.map_err(redb_to_io)?;
+					meta.insert(META_SNAPSHOT_RETIREMENTS_INITIALIZED, &1u64)
+						.map_err(redb_to_io)?;
+				}
+			}
+			{
+				let mut meta = write_txn.open_table(META_TABLE).map_err(redb_to_io)?;
+				let initialized = meta
+					.get(META_METADATA_PENDING_INITIALIZED)
+					.map_err(redb_to_io)?
+					.is_some();
+				let present = write_txn
+					.list_tables()
+					.map_err(redb_to_io)?
+					.any(|table| table.name() == METADATA_PENDING_TABLE.name());
+				if initialized && !present {
+					return Err(Error::new(
+						ErrorKind::InvalidData,
+						"pending metadata authority is missing",
+					));
+				}
+				if !initialized {
+					let _table = write_txn
+						.open_table(METADATA_PENDING_TABLE)
+						.map_err(redb_to_io)?;
+					meta.insert(META_METADATA_PENDING_INITIALIZED, &1u64)
+						.map_err(redb_to_io)?;
+				}
+			}
+			// Create only on first upgrade. A missing previously initialized table
+			// is lost authority, not evidence that no submission is outstanding.
+			{
+				let mut meta = write_txn.open_table(META_TABLE).map_err(redb_to_io)?;
+				let initialized = meta
+					.get(META_LSM_INSTALL_INTENTS_INITIALIZED)
+					.map_err(redb_to_io)?
+					.is_some();
+				let present = write_txn
+					.list_tables()
+					.map_err(redb_to_io)?
+					.any(|table| table.name() == LSM_INSTALL_INTENTS_TABLE.name());
+				if initialized && !present {
+					return Err(std::io::Error::new(
+						std::io::ErrorKind::InvalidData,
+						"LSM install intent authority is missing",
+					));
+				}
+				if !initialized {
+					let _table = write_txn
+						.open_table(LSM_INSTALL_INTENTS_TABLE)
+						.map_err(redb_to_io)?;
+					meta.insert(META_LSM_INSTALL_INTENTS_INITIALIZED, &1u64)
+						.map_err(redb_to_io)?;
+				}
+			}
 			// ADR 0097: create the receipt table ONLY on a store that has never had
 			// one, and record that fact durably in the same transaction. On a store
 			// whose marker is set, a missing table means history was lost, and the
 			// caller is told so rather than handed an empty one.
-			let receipts_available = {
+			let receipts_ok = {
 				let mut meta = write_txn.open_table(META_TABLE).map_err(redb_to_io)?;
 				let initialized = meta
 					.get(META_MAINTENANCE_RECEIPTS_INITIALIZED)
@@ -320,20 +1022,73 @@ impl PersistentLocalIndex {
 					let _ = v1.remove(&key).map_err(redb_to_io)?;
 				}
 			}
+			let initial_gaps = {
+				let meta = write_txn.open_table(META_TABLE).map_err(redb_to_io)?;
+				let value = meta
+					.get(META_CLEANUP_AUTHORITY_GAPS)
+					.map_err(redb_to_io)?
+					.map(|v| v.value())
+					.unwrap_or(0);
+				value
+			};
+			let history_incomplete = {
+				let meta = write_txn.open_table(META_TABLE).map_err(redb_to_io)?;
+				let missing = meta
+					.get(META_CLEANUP_HISTORY_INCOMPLETE)
+					.map_err(redb_to_io)?
+					.is_some();
+				missing
+			};
 			write_txn.commit().map_err(redb_to_io)?;
 			let db = crate::storage::owned_redb::OwnedRedb::new(db, "storage index");
 			if let Some(owner) = bind_owner {
 				db.bind_owner(owner)?;
 			}
-			Ok((db, receipts_available))
+			Ok((
+				db,
+				receipts_ok,
+				cleanup_ok,
+				initial_gaps,
+				history_incomplete,
+			))
 		})
 		.await?;
+		let (db, receipts_ok, cleanup_ok, initial_gaps, history_incomplete) = opened;
+		if history_incomplete {
+			crate::metrics::global()
+				.storage_cleanup_history_incomplete
+				.add(1);
+		}
+		crate::metrics::global()
+			.storage_cleanup_unrecorded_supersessions
+			.add(initial_gaps);
 		Ok(Self {
 			db,
 			write_lock: Mutex::new(()),
-			receipts_available,
+			receipts_available: receipts_ok,
+			cleanup_available: cleanup_ok,
+			persisted_cleanup_gaps: std::sync::Arc::new(CleanupGapContribution {
+				count: std::sync::atomic::AtomicU64::new(initial_gaps),
+				history_incomplete,
+			}),
 			#[cfg(test)]
 			fail_receipt_mutations: Default::default(),
+			#[cfg(test)]
+			fail_next_delta: Default::default(),
+			#[cfg(test)]
+			fail_next_cleanup_insert: Default::default(),
+			#[cfg(test)]
+			fail_cleanup_gap_before_commit: Default::default(),
+			#[cfg(test)]
+			fail_next_retirement: Default::default(),
+			#[cfg(test)]
+			fail_cleanup_after_provisional_remove: Default::default(),
+			#[cfg(test)]
+			guarded_delta_before_commit_hold: Default::default(),
+			#[cfg(test)]
+			guarded_delta_commit_hold: Default::default(),
+			#[cfg(test)]
+			retirement_commit_hold: std::sync::Mutex::new(None),
 		})
 	}
 
@@ -347,7 +1102,26 @@ impl PersistentLocalIndex {
 		self.receipts_available
 	}
 
+	/// Read the exact durable record key for a publication pre/post comparison.
+	pub(crate) async fn record_row_at_key(
+		&self,
+		row: PersistentRecordRow,
+	) -> std::io::Result<Option<PersistentRecordRow>> {
+		self.db
+			.run(move |db| {
+				let txn = db.begin_read().map_err(redb_to_io)?;
+				let table = txn.open_table(RECORDS_TABLE).map_err(redb_to_io)?;
+				let key = encode_record_key(row);
+				let value = table.get(key.as_slice()).map_err(redb_to_io)?;
+				value
+					.map(|value| decode_record_row(&key, value.value()))
+					.transpose()
+			})
+			.await
+	}
+
 	pub(crate) async fn load_snapshot(&self) -> std::io::Result<PersistentIndexSnapshot> {
+		let cleanup_available = self.cleanup_available;
 		self.db
 			.run(move |db| {
 				let read_txn = db.begin_read().map_err(redb_to_io)?;
@@ -365,6 +1139,31 @@ impl PersistentLocalIndex {
 				}
 
 				let records_table = read_txn.open_table(RECORDS_TABLE).map_err(redb_to_io)?;
+				let mut retired_tiered_slabs = HashSet::new();
+				if cleanup_available {
+					let cleanup = read_txn
+						.open_table(SNAPSHOT_CLEANUP_INTENTS_TABLE)
+						.map_err(redb_to_io)?;
+					for row in cleanup.iter().map_err(redb_to_io)? {
+						let (key, value) = row.map_err(redb_to_io)?;
+						if key.value().len() <= 8 {
+							return Err(Error::new(
+								ErrorKind::InvalidData,
+								"invalid retirement record key",
+							));
+						}
+						let slab =
+							SlabId::new(u64::from_be_bytes(key.value()[..8].try_into().unwrap()));
+						let intent: RetainedObjectIntent = postcard::from_bytes(value.value())
+							.map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+						if intent.state == RetainedObjectIntentState::RetirementPublished
+							&& intent.retirement_source.is_some()
+							&& !tiered_ids.contains(&slab)
+						{
+							retired_tiered_slabs.insert(slab);
+						}
+					}
+				}
 				let mut record_rows = Vec::new();
 				let mut tiered_records = Vec::new();
 				let mut locality_by_key: HashMap<
@@ -416,6 +1215,32 @@ impl PersistentLocalIndex {
 						value.value(),
 					)?);
 				}
+				let intent_table = read_txn
+					.open_table(LSM_INSTALL_INTENTS_TABLE)
+					.map_err(redb_to_io)?;
+				let mut lsm_install_intents = Vec::new();
+				for entry in intent_table.iter().map_err(redb_to_io)? {
+					let (key, value) = entry.map_err(redb_to_io)?;
+					let intent: LsmInstallIntent =
+						serde_json::from_slice(value.value()).map_err(|error| {
+							std::io::Error::new(std::io::ErrorKind::InvalidData, error)
+						})?;
+					if intent.commit.job_id.get() != key.value() {
+						return Err(std::io::Error::new(
+							std::io::ErrorKind::InvalidData,
+							"LSM intent job key mismatch",
+						));
+					}
+					let bytes =
+						serde_json::to_vec(&intent.commit).map_err(std::io::Error::other)?;
+					if *blake3::hash(&bytes).as_bytes() != intent.commit_digest {
+						return Err(std::io::Error::new(
+							std::io::ErrorKind::InvalidData,
+							"LSM intent commit digest mismatch",
+						));
+					}
+					lsm_install_intents.push(intent);
+				}
 				let meta_table = read_txn.open_table(META_TABLE).map_err(redb_to_io)?;
 				let last_control_log_index = meta_table
 					.get(META_LAST_CONTROL_LOG_INDEX)
@@ -425,12 +1250,82 @@ impl PersistentLocalIndex {
 				Ok(PersistentIndexSnapshot {
 					record_rows,
 					tiered_slabs,
+					retired_tiered_slabs,
 					tiered_records,
 					record_localities,
 					secondary_index_segments,
 					lsm_runs,
+					lsm_install_intents,
 					last_control_log_index,
 				})
+			})
+			.await
+	}
+
+	pub(crate) async fn put_lsm_install_intent(
+		&self,
+		intent: LsmInstallIntent,
+	) -> std::io::Result<()> {
+		let commit_bytes = serde_json::to_vec(&intent.commit).map_err(std::io::Error::other)?;
+		if *blake3::hash(&commit_bytes).as_bytes() != intent.commit_digest {
+			return Err(std::io::Error::new(
+				std::io::ErrorKind::InvalidInput,
+				"LSM intent digest mismatch",
+			));
+		}
+		let job = intent.commit.job_id.get();
+		let bytes = serde_json::to_vec(&intent).map_err(std::io::Error::other)?;
+		let _write = self.write_lock.lock().await;
+		self.db
+			.run(move |db| {
+				let tx = db.begin_write().map_err(redb_to_io)?;
+				{
+					let mut table = tx
+						.open_table(LSM_INSTALL_INTENTS_TABLE)
+						.map_err(redb_to_io)?;
+					if let Some(existing) = table.get(&job).map_err(redb_to_io)? {
+						if existing.value() != bytes.as_slice() {
+							return Err(std::io::Error::new(
+								std::io::ErrorKind::AlreadyExists,
+								"different LSM intent for job",
+							));
+						}
+					} else {
+						table.insert(&job, bytes.as_slice()).map_err(redb_to_io)?;
+					}
+				}
+				tx.commit().map_err(redb_to_io)
+			})
+			.await
+	}
+
+	pub(crate) async fn clear_lsm_install_intent(
+		&self,
+		intent: LsmInstallIntent,
+	) -> std::io::Result<()> {
+		let job = intent.commit.job_id.get();
+		let bytes = serde_json::to_vec(&intent).map_err(std::io::Error::other)?;
+		let _write = self.write_lock.lock().await;
+		self.db
+			.run(move |db| {
+				let tx = db.begin_write().map_err(redb_to_io)?;
+				{
+					let mut table = tx
+						.open_table(LSM_INSTALL_INTENTS_TABLE)
+						.map_err(redb_to_io)?;
+					let matches = table
+						.get(&job)
+						.map_err(redb_to_io)?
+						.is_some_and(|existing| existing.value() == bytes.as_slice());
+					if !matches {
+						return Err(std::io::Error::new(
+							std::io::ErrorKind::InvalidData,
+							"LSM intent changed or disappeared",
+						));
+					}
+					table.remove(&job).map_err(redb_to_io)?;
+				}
+				tx.commit().map_err(redb_to_io)
 			})
 			.await
 	}
@@ -496,6 +1391,19 @@ impl PersistentLocalIndex {
 		self.db
 			.run(move |db| {
 				let write_txn = db.begin_write().map_err(redb_to_io)?;
+				let previous_pointers = {
+					let table = write_txn
+						.open_table(TIERED_SLABS_TABLE)
+						.map_err(redb_to_io)?;
+					let mut old = HashMap::new();
+					for row in table.iter().map_err(redb_to_io)? {
+						let (key, value) = row.map_err(redb_to_io)?;
+						let slab = SlabId::new(key.value());
+						old.insert(slab, decode_tiered_pointer(slab, value.value())?);
+					}
+					old
+				};
+				let mut degradation_counts = (0, 0);
 				let _ = write_txn.delete_table(RECORDS_TABLE);
 				let _ = write_txn.delete_table(TIERED_SLABS_TABLE);
 				let _ = write_txn.delete_table(SECONDARY_INDEX_SEGMENTS_TABLE);
@@ -514,7 +1422,11 @@ impl PersistentLocalIndex {
 					let mut table = write_txn
 						.open_table(TIERED_SLABS_TABLE)
 						.map_err(redb_to_io)?;
-					for pointer in tiered_slabs {
+					for mut pointer in tiered_slabs {
+						apply_pending_metadata_to_pointer(&write_txn, &mut pointer, None)?;
+						if let Some(previous) = previous_pointers.get(&pointer.slab_id) {
+							note_metadata_degradation(previous, &pointer, &mut degradation_counts);
+						}
 						let value = encode_tiered_pointer(&pointer);
 						table
 							.insert(&pointer.slab_id.get(), value.as_slice())
@@ -547,16 +1459,137 @@ impl PersistentLocalIndex {
 					meta.insert(META_LAST_CONTROL_LOG_INDEX, &index)
 						.map_err(redb_to_io)?;
 				}
-				write_txn.commit().map_err(redb_to_io)
+				write_txn.commit().map_err(redb_to_io)?;
+				publish_metadata_degradation_counts(degradation_counts);
+				Ok(())
 			})
 			.await
 	}
 
 	pub(crate) async fn apply(&self, update: PersistentIndexUpdate) -> std::io::Result<()> {
+		self.apply_with_publication_guard(update, None).await
+	}
+
+	/// The blocking redb closure may outlive its awaiting caller. The optional
+	/// gate is owned by the actual transaction until it finishes.
+	pub(crate) async fn apply_with_publication_guard(
+		&self,
+		update: PersistentIndexUpdate,
+		publication: Option<std::sync::Arc<tokio::sync::OwnedRwLockReadGuard<()>>>,
+	) -> std::io::Result<()> {
+		self.apply_with_publication_guard_inner(update, publication, None)
+			.await
+	}
+
+	pub(crate) async fn apply_with_control_lsm_completion(
+		&self,
+		update: PersistentIndexUpdate,
+		publication: Option<std::sync::Arc<tokio::sync::OwnedRwLockReadGuard<()>>>,
+		completion: crate::storage::manager::AcceptedControlLsmCompletion,
+	) -> std::io::Result<()> {
+		self.apply_with_publication_guard_inner(update, publication, Some(completion))
+			.await
+	}
+
+	async fn apply_with_publication_guard_inner(
+		&self,
+		mut update: PersistentIndexUpdate,
+		publication: Option<std::sync::Arc<tokio::sync::OwnedRwLockReadGuard<()>>>,
+		completion: Option<crate::storage::manager::AcceptedControlLsmCompletion>,
+	) -> std::io::Result<()> {
+		if let Some((before, after)) = &update.lsm_intent_transition {
+			let mut expected = before.clone();
+			expected.phase = LsmInstallPhase::OutputsPublished;
+			if before.kind != LsmInstallKind::Local
+				|| before.phase != LsmInstallPhase::Prepared
+				|| expected != *after
+			{
+				return Err(Error::new(
+					ErrorKind::InvalidInput,
+					"invalid LSM intent phase transition",
+				));
+			}
+		}
+		if let Some(completion) = completion {
+			if update.lsm_intent_transition.is_some() {
+				return Err(Error::new(
+					ErrorKind::InvalidInput,
+					"two LSM phase transitions in one update",
+				));
+			}
+			let (before, after) = completion.into_transition();
+			let inputs = before
+				.inputs
+				.iter()
+				.map(|input| input.slab_id)
+				.collect::<HashSet<_>>();
+			let outputs = before
+				.commit
+				.slabs_to_add
+				.iter()
+				.map(|run| run.slab_id)
+				.collect::<HashSet<_>>();
+			let mut expected = before.clone();
+			expected.phase = LsmInstallPhase::OutputsPublished;
+			if before.kind != LsmInstallKind::Control
+				|| before.phase != LsmInstallPhase::Prepared
+				|| expected != after
+				|| before.local_input_runs.is_empty()
+				|| before.local_input_rows_digest == [0; 32]
+				|| before.local_output_rows_digest == [0; 32]
+				|| !before.commit.slabs_to_mark_delete_pending.is_empty()
+				|| !before.commit.slabs_to_remove.is_empty()
+				|| !before.commit.sidecar_swaps.is_empty()
+				|| before
+					.local_input_runs
+					.iter()
+					.chain(&before.commit.slabs_to_add)
+					.any(|run| run.sidecar_coverage != crate::storage::SidecarCoverage::None)
+				|| update
+					.put_records
+					.iter()
+					.any(|row| !outputs.contains(&row.location.slab_id))
+				|| update
+					.delete_records
+					.iter()
+					.any(|row| !inputs.contains(&row.location.slab_id))
+				|| lsm_rows_digest(update.put_records.iter().copied())
+					!= before.local_output_rows_digest
+				|| lsm_rows_digest(update.delete_records.iter().copied())
+					!= before.local_input_rows_digest
+			{
+				return Err(Error::new(
+					ErrorKind::InvalidInput,
+					"invalid completed control LSM publication",
+				));
+			}
+			update.lsm_intent_transition = Some((before, after));
+		}
+
+		#[cfg(test)]
+		if self
+			.fail_next_delta
+			.swap(false, std::sync::atomic::Ordering::AcqRel)
+		{
+			return Err(Error::other("injected delta failure"));
+		}
 		let _guard = self.write_lock.lock().await;
+		let cleanup_missing = !self.cleanup_available;
+		let persisted_cleanup_gaps = self.persisted_cleanup_gaps.clone();
+		#[cfg(test)]
+		let fail_cleanup_gap = self
+			.fail_cleanup_gap_before_commit
+			.swap(false, std::sync::atomic::Ordering::AcqRel);
+		#[cfg(test)]
+		let commit_hold = self.guarded_delta_commit_hold.lock().unwrap().clone();
+		#[cfg(test)]
+		let before_commit_hold = self.guarded_delta_before_commit_hold.lock().unwrap().take();
 		self.db
 			.run(move |db| {
+				let _publication = publication;
 				let write_txn = db.begin_write().map_err(redb_to_io)?;
+				let mut degradation_counts = (0, 0);
+				let mut missing_cleanup_supersessions = Vec::new();
 				{
 					let mut table = write_txn.open_table(RECORDS_TABLE).map_err(redb_to_io)?;
 					for row in update.delete_records {
@@ -578,7 +1611,36 @@ impl PersistentLocalIndex {
 					for slab_id in update.delete_tiered_slab_ids {
 						let _ = table.remove(&slab_id.get()).map_err(redb_to_io)?;
 					}
-					for pointer in update.put_tiered_slabs {
+					for mut pointer in update.put_tiered_slabs {
+						let previous = table.get(&pointer.slab_id.get()).map_err(redb_to_io)?.map(|v| decode_tiered_pointer(pointer.slab_id, v.value())).transpose()?;
+						apply_pending_metadata_to_pointer(&write_txn, &mut pointer, update.completed_metadata_token)?;
+						if let Some(previous) = &previous { note_metadata_degradation(previous, &pointer, &mut degradation_counts); }
+						if let Some(control_index) = update.tier_republication_index {
+							let mut marks = write_txn.open_table(SNAPSHOT_RETIREMENTS_TABLE).map_err(redb_to_io)?;
+							let mark = marks.get(&pointer.slab_id.get()).map_err(redb_to_io)?
+								.map(|value| postcard::from_bytes::<SnapshotRetirementMark>(value.value()).map_err(|e| Error::new(ErrorKind::InvalidData, e))).transpose()?;
+							if mark.is_some_and(|mark| mark.snapshot_index.is_none_or(|snapshot| control_index > snapshot)) {
+								marks.remove(&pointer.slab_id.get()).map_err(redb_to_io)?;
+							}
+						}
+						if let Some(control_index) = update.tier_republication_index.filter(|_| !cleanup_missing) {
+							let mut cleanup = write_txn.open_table(SNAPSHOT_CLEANUP_INTENTS_TABLE).map_err(redb_to_io)?;
+							let mut key = pointer.slab_id.get().to_be_bytes().to_vec(); key.extend_from_slice(pointer.l2_uri.as_bytes());
+							let prior = cleanup.get(key.as_slice()).map_err(redb_to_io)?.map(|v| postcard::from_bytes::<RetainedObjectIntent>(v.value()).map_err(|e| Error::new(ErrorKind::InvalidData, e))).transpose()?;
+							if let Some(mut prior) = prior.filter(|p| p.retirement_source.is_some_and(|source| control_index > source.index())) {
+								prior.retirement_source = None;
+								if prior.state == RetainedObjectIntentState::RetirementPublished { prior.state = RetainedObjectIntentState::ReplacementPublished; }
+								let encoded = postcard::to_stdvec(&prior).map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+								cleanup.insert(key.as_slice(), encoded.as_slice()).map_err(redb_to_io)?;
+							}
+						}
+						if cleanup_missing {
+							let old = table.get(&pointer.slab_id.get()).map_err(redb_to_io)?
+								.map(|value| decode_tiered_pointer(pointer.slab_id, value.value())).transpose()?;
+							if let Some(old) = old.filter(|old| old.l2_uri != pointer.l2_uri) {
+								missing_cleanup_supersessions.push((pointer.slab_id, old.l2_uri));
+							}
+						}
 						let value = encode_tiered_pointer(&pointer);
 						table
 							.insert(&pointer.slab_id.get(), value.as_slice())
@@ -613,6 +1675,25 @@ impl PersistentLocalIndex {
 							.map_err(redb_to_io)?;
 					}
 				}
+				if let Some((before, after)) = update.lsm_intent_transition {
+					let key = before.commit.job_id.get();
+					let old = serde_json::to_vec(&before).map_err(Error::other)?;
+					let next = serde_json::to_vec(&after).map_err(Error::other)?;
+					let mut table = write_txn
+						.open_table(LSM_INSTALL_INTENTS_TABLE)
+						.map_err(redb_to_io)?;
+					let matches = table
+						.get(&key)
+						.map_err(redb_to_io)?
+						.is_some_and(|value| value.value() == old.as_slice());
+					if !matches {
+						return Err(Error::new(
+							ErrorKind::InvalidData,
+							"LSM intent changed before output publication",
+						));
+					}
+					table.insert(&key, next.as_slice()).map_err(redb_to_io)?;
+				}
 				if let Some(index) = update.last_control_log_index {
 					let mut meta = write_txn.open_table(META_TABLE).map_err(redb_to_io)?;
 					let current = meta
@@ -625,7 +1706,1401 @@ impl PersistentLocalIndex {
 							.map_err(redb_to_io)?;
 					}
 				}
-				write_txn.commit().map_err(redb_to_io)
+				if !missing_cleanup_supersessions.is_empty() {
+					let mut meta = write_txn.open_table(META_TABLE).map_err(redb_to_io)?;
+					let count = meta.get(META_CLEANUP_AUTHORITY_GAPS).map_err(redb_to_io)?.map(|v| v.value()).unwrap_or(0);
+					let next = count.checked_add(missing_cleanup_supersessions.len() as u64).ok_or_else(|| Error::other("cleanup gap counter overflow"))?;
+					meta.insert(META_CLEANUP_AUTHORITY_GAPS, &next).map_err(redb_to_io)?;
+				}
+				#[cfg(test)]
+				if fail_cleanup_gap && !missing_cleanup_supersessions.is_empty() {
+					return Err(Error::other("injected cleanup gap transaction failure"));
+				}
+				#[cfg(test)]
+				if let Some((entered, release, fail)) = before_commit_hold {
+					entered.wait();
+					release.wait();
+					if fail { return Err(Error::other("injected delta failure before commit")); }
+				}
+				write_txn.commit().map_err(redb_to_io)?;
+				publish_metadata_degradation_counts(degradation_counts);
+				let gap_count = missing_cleanup_supersessions.len() as u64;
+				persisted_cleanup_gaps.count.fetch_add(gap_count, std::sync::atomic::Ordering::Relaxed);
+				crate::metrics::global().storage_cleanup_unrecorded_supersessions.add(gap_count);
+				for (slab_id, old_uri) in missing_cleanup_supersessions {
+					tracing::warn!(slab_id = slab_id.get(), old_uri = %old_uri, "committed supersession missing cleanup accounting");
+					crate::metrics::global().storage_cleanup_unrecorded_supersessions_total.inc();
+				}
+				#[cfg(test)]
+				if let Some((entered, release)) = commit_hold {
+					entered.wait();
+					release.wait();
+				}
+				Ok(())
+			})
+			.await
+	}
+
+	/// Remove one slab and its pointer in one checked transaction.
+	pub(crate) async fn retire_tiered_slab_checked(
+		&self,
+		slab_id: SlabId,
+		expected: Option<TieredSlabPointer>,
+		known_bytes: Option<u64>,
+		evidence: Vec<(String, RetainedObjectIntent)>,
+		last_control_log_index: Option<u64>,
+		retirement_epoch: u64,
+		gate: std::sync::Arc<tokio::sync::OwnedRwLockReadGuard<()>>,
+	) -> std::io::Result<(
+		Option<(RetainedObjectIntent, Vec<(String, RetainedObjectIntent)>)>,
+		Option<SnapshotRetirementMark>,
+	)> {
+		#[cfg(test)]
+		if self
+			.fail_next_retirement
+			.swap(false, std::sync::atomic::Ordering::AcqRel)
+		{
+			return Err(Error::other("injected retirement transaction failure"));
+		}
+		#[cfg(test)]
+		let retirement_commit_hold = self.retirement_commit_hold.lock().unwrap().take();
+		let _guard = self.write_lock.lock().await;
+		let cleanup_missing = !self.cleanup_available;
+		let persisted_cleanup_gaps = self.persisted_cleanup_gaps.clone();
+		self.db
+			.run(move |db| {
+				let _gate = gate;
+				let txn = db.begin_write().map_err(redb_to_io)?;
+				{
+					let mut tiers = txn.open_table(TIERED_SLABS_TABLE).map_err(redb_to_io)?;
+					let actual = tiers
+						.get(&slab_id.get())
+						.map_err(redb_to_io)?
+						.map(|value| decode_tiered_pointer(slab_id, value.value()))
+						.transpose()?;
+					// Advisory metadata may differ from the caller's mirror while a
+					// metadata token is pending; only the object generation matters.
+					let same_generation = match (&actual, &expected) {
+						(Some(actual), Some(expected)) => actual.same_object_generation(expected),
+						(None, None) => true,
+						_ => false,
+					};
+					if !same_generation {
+						return Err(Error::new(
+							ErrorKind::WouldBlock,
+							"tier pointer changed before retirement",
+						));
+					}
+					tiers.remove(&slab_id.get()).map_err(redb_to_io)?;
+				}
+				{
+					let mut records = txn.open_table(RECORDS_TABLE).map_err(redb_to_io)?;
+					let mut keys = Vec::new();
+					for entry in records.iter().map_err(redb_to_io)? {
+						let (key, value) = entry.map_err(redb_to_io)?;
+						if decode_record_row(key.value(), value.value())?
+							.location
+							.slab_id == slab_id
+						{
+							keys.push(key.value().to_vec());
+						}
+					}
+					for key in keys {
+						records.remove(key.as_slice()).map_err(redb_to_io)?;
+					}
+				}
+				if let Some(index) = last_control_log_index {
+					let mut meta = txn.open_table(META_TABLE).map_err(redb_to_io)?;
+					let current = meta
+						.get(META_LAST_CONTROL_LOG_INDEX)
+						.map_err(redb_to_io)?
+						.map(|value| value.value())
+						.unwrap_or(0);
+					if index >= current {
+						meta.insert(META_LAST_CONTROL_LOG_INDEX, &index)
+							.map_err(redb_to_io)?;
+					}
+				}
+				// A retry resolves only the intent covered by its authority. An
+				// older callback must leave a newer snapshot/log retirement intact.
+				let resolved_mark = {
+					let mut marks = txn.open_table(SNAPSHOT_RETIREMENTS_TABLE).map_err(redb_to_io)?;
+					let mark = marks.get(&slab_id.get()).map_err(redb_to_io)?
+						.map(|v| postcard::from_bytes::<SnapshotRetirementMark>(v.value())
+							.map_err(|e| Error::new(ErrorKind::InvalidData, e))).transpose()?;
+					let resolved = mark.filter(|mark| {
+						expected
+							.as_ref()
+							.is_some_and(|pointer| pointer.same_object_generation(&mark.pointer))
+							&& mark.epoch <= retirement_epoch
+							&& match (last_control_log_index, mark.snapshot_index) {
+								(Some(applied), Some(required)) => applied >= required,
+								(_, None) => true,
+								(None, Some(_)) => false,
+							}
+					});
+					if resolved.is_some() { marks.remove(&slab_id.get()).map_err(redb_to_io)?; }
+					resolved
+				};
+				let retirement_record = if !cleanup_missing {
+					match (expected.as_ref(), last_control_log_index) {
+						(Some(pointer), Some(index)) => Some(persist_retirement_records(&txn, pointer, known_bytes, evidence, RetirementSource::Log(index))?),
+						_ => None,
+					}
+				} else { None };
+				// A missing source index is also missing cleanup accounting, even
+				// when the receipt tables themselves are available.
+				let accounting_missing = expected.is_some() && retirement_record.is_none();
+				if accounting_missing {
+					let mut meta = txn.open_table(META_TABLE).map_err(redb_to_io)?;
+					let current = meta.get(META_CLEANUP_AUTHORITY_GAPS).map_err(redb_to_io)?.map(|v| v.value()).unwrap_or(0);
+					let next = current.checked_add(1).ok_or_else(|| Error::other("cleanup gap counter overflow"))?;
+					meta.insert(META_CLEANUP_AUTHORITY_GAPS, &next).map_err(redb_to_io)?;
+				}
+				let result = txn.commit().map_err(redb_to_io);
+				if result.is_ok() && accounting_missing {
+					if let Some(old) = expected {
+						persisted_cleanup_gaps.count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+						crate::metrics::global().storage_cleanup_unrecorded_supersessions.add(1);
+						tracing::warn!(slab_id = slab_id.get(), old_uri = %old.l2_uri, "committed retirement missing cleanup accounting");
+						crate::metrics::global().storage_cleanup_unrecorded_supersessions_total.inc();
+					}
+				}
+				#[cfg(test)]
+				if let Some((entered, release)) = retirement_commit_hold {
+					entered.wait();
+					release.wait();
+				}
+				result?;
+				Ok((retirement_record, resolved_mark))
+			})
+			.await
+	}
+
+	#[cfg(test)]
+	pub(crate) async fn remove_cleanup_table_for_test(&self) -> std::io::Result<()> {
+		let _guard = self.write_lock.lock().await;
+		self.db
+			.run(move |db| {
+				let tx = db.begin_write().map_err(redb_to_io)?;
+				tx.delete_table(SNAPSHOT_CLEANUP_INTENTS_TABLE)
+					.map_err(redb_to_io)?;
+				tx.commit().map_err(redb_to_io)
+			})
+			.await
+	}
+
+	#[cfg(test)]
+	pub(crate) async fn restore_cleanup_table_for_test(&self) -> std::io::Result<()> {
+		let _guard = self.write_lock.lock().await;
+		self.db
+			.run(move |db| {
+				let tx = db.begin_write().map_err(redb_to_io)?;
+				{
+					let _table = tx
+						.open_table(SNAPSHOT_CLEANUP_INTENTS_TABLE)
+						.map_err(redb_to_io)?;
+				}
+				tx.commit().map_err(redb_to_io)
+			})
+			.await
+	}
+
+	pub(crate) async fn snapshot_retirement_epoch_floor(&self) -> std::io::Result<u64> {
+		self.db
+			.run(move |db| {
+				let tx = db.begin_read().map_err(redb_to_io)?;
+				let meta = tx.open_table(META_TABLE).map_err(redb_to_io)?;
+				let value = meta
+					.get(META_SNAPSHOT_RETIREMENT_EPOCH_FLOOR)
+					.map_err(redb_to_io)?
+					.map(|v| v.value())
+					.unwrap_or(0);
+				Ok(value)
+			})
+			.await
+	}
+
+	/// Snapshot write-gate caller records the complete new retirement set before releasing the gate.
+	pub(crate) async fn stage_snapshot_retirement_marks(
+		&self,
+		marks: Vec<SnapshotRetirementMark>,
+		committed: std::collections::HashSet<SlabId>,
+		snapshot_epoch: u64,
+		current_epoch: std::sync::Arc<std::sync::atomic::AtomicU64>,
+		epoch_gate: std::sync::Arc<std::sync::RwLock<()>>,
+	) -> std::io::Result<Vec<TieredSlabPointer>> {
+		self.stage_tier_comparison(
+			None,
+			marks,
+			committed,
+			snapshot_epoch,
+			current_epoch,
+			epoch_gate,
+		)
+		.await
+	}
+
+	/// The receipt and committed-set comparison are committed in the same redb transaction.
+	pub(crate) async fn stage_tier_comparison(
+		&self,
+		replacement_applied: Option<(u64, Vec<TieredSlabPointer>)>,
+		marks: Vec<SnapshotRetirementMark>,
+		committed: std::collections::HashSet<SlabId>,
+		snapshot_epoch: u64,
+		current_epoch: std::sync::Arc<std::sync::atomic::AtomicU64>,
+		epoch_gate: std::sync::Arc<std::sync::RwLock<()>>,
+	) -> std::io::Result<Vec<TieredSlabPointer>> {
+		self.stage_tier_comparison_inner(
+			replacement_applied,
+			Vec::new(),
+			None,
+			marks,
+			committed,
+			snapshot_epoch,
+			current_epoch,
+			epoch_gate,
+		)
+		.await
+	}
+
+	/// Accepted-snapshot deferral is the sole issuer. The caller retains the
+	/// fresh canonical read lease and index write gate until pending registration.
+	/// Only exact absent canonical pointers are staged; records are untouched.
+	pub(crate) async fn stage_snapshot_pending_tiers(
+		&self,
+		staged: Vec<TieredSlabPointer>,
+		canonical: Vec<TieredSlabPointer>,
+		snapshot_epoch: u64,
+		current_epoch: std::sync::Arc<std::sync::atomic::AtomicU64>,
+		epoch_gate: std::sync::Arc<std::sync::RwLock<()>>,
+		gate: std::sync::Arc<tokio::sync::OwnedRwLockWriteGuard<()>>,
+	) -> std::io::Result<()> {
+		let mut ids = std::collections::HashSet::new();
+		if canonical.iter().any(|pointer| !ids.insert(pointer.slab_id)) {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				"duplicate canonical snapshot tier",
+			));
+		}
+		ids.clear();
+		if staged
+			.iter()
+			.any(|pointer| !ids.insert(pointer.slab_id) || !canonical.contains(pointer))
+		{
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				"snapshot staging pointer differs from canonical set",
+			));
+		}
+		let _write = self.write_lock.lock().await;
+		self.db
+			.run(move |db| {
+				let _gate = gate;
+				let _epoch = epoch_gate.read().unwrap_or_else(|e| e.into_inner());
+				if current_epoch.load(std::sync::atomic::Ordering::Acquire) != snapshot_epoch {
+					return Err(Error::new(
+						ErrorKind::Interrupted,
+						"snapshot staging epoch superseded",
+					));
+				}
+				let tx = db.begin_write().map_err(redb_to_io)?;
+				{
+					let mut tiers = tx.open_table(TIERED_SLABS_TABLE).map_err(redb_to_io)?;
+					for pointer in staged {
+						let actual = tiers
+							.get(&pointer.slab_id.get())
+							.map_err(redb_to_io)?
+							.map(|value| decode_tiered_pointer(pointer.slab_id, value.value()))
+							.transpose()?;
+						match actual {
+							Some(actual) if actual != pointer => {
+								return Err(Error::new(
+									ErrorKind::InvalidData,
+									"snapshot staging found a different durable pointer",
+								));
+							}
+							Some(_) => {}
+							None => {
+								let value = encode_tiered_pointer(&pointer);
+								tiers
+									.insert(&pointer.slab_id.get(), value.as_slice())
+									.map_err(redb_to_io)?;
+							}
+						}
+					}
+				}
+				tx.commit().map_err(redb_to_io)
+			})
+			.await
+	}
+
+	/// The sole issuer is the manager's complete confirmed replacement replay.
+	/// Explicit exact callback evidence may stage new absent canonical rows.
+	pub(crate) async fn stage_replacement_tier_comparison(
+		&self,
+		replacement_applied: (u64, Vec<TieredSlabPointer>),
+		replay_staged: Vec<TieredSlabPointer>,
+		marks: Vec<SnapshotRetirementMark>,
+		committed: std::collections::HashSet<SlabId>,
+		snapshot_epoch: u64,
+		current_epoch: std::sync::Arc<std::sync::atomic::AtomicU64>,
+		epoch_gate: std::sync::Arc<std::sync::RwLock<()>>,
+	) -> std::io::Result<Vec<TieredSlabPointer>> {
+		self.stage_tier_comparison_inner(
+			Some(replacement_applied),
+			replay_staged,
+			None,
+			marks,
+			committed,
+			snapshot_epoch,
+			current_epoch,
+			epoch_gate,
+		)
+		.await
+	}
+
+	/// Sole issuer: complete snapshot comparison with exact older pending flights.
+	pub(crate) async fn stage_snapshot_tier_comparison_with_pending_retirements(
+		&self,
+		snapshot_index: u64,
+		pending_retirements: Vec<(TieredSlabPointer, u64)>,
+		marks: Vec<SnapshotRetirementMark>,
+		committed: std::collections::HashSet<SlabId>,
+		snapshot_epoch: u64,
+		current_epoch: std::sync::Arc<std::sync::atomic::AtomicU64>,
+		epoch_gate: std::sync::Arc<std::sync::RwLock<()>>,
+	) -> std::io::Result<Vec<TieredSlabPointer>> {
+		self.stage_tier_comparison_inner(
+			None,
+			Vec::new(),
+			Some((snapshot_index, pending_retirements)),
+			marks,
+			committed,
+			snapshot_epoch,
+			current_epoch,
+			epoch_gate,
+		)
+		.await
+	}
+
+	async fn stage_tier_comparison_inner(
+		&self,
+		replacement_applied: Option<(u64, Vec<TieredSlabPointer>)>,
+		replay_staged: Vec<TieredSlabPointer>,
+		pending_retirement_staged: Option<(u64, Vec<(TieredSlabPointer, u64)>)>,
+		marks: Vec<SnapshotRetirementMark>,
+		committed: std::collections::HashSet<SlabId>,
+		snapshot_epoch: u64,
+		current_epoch: std::sync::Arc<std::sync::atomic::AtomicU64>,
+		epoch_gate: std::sync::Arc<std::sync::RwLock<()>>,
+	) -> std::io::Result<Vec<TieredSlabPointer>> {
+		let _guard = self.write_lock.lock().await;
+		self.db
+			.run(move |db| {
+				let _epoch_guard = epoch_gate.read().unwrap_or_else(|e| e.into_inner());
+				if current_epoch.load(std::sync::atomic::Ordering::Acquire) != snapshot_epoch {
+					return Err(Error::new(
+						ErrorKind::Interrupted,
+						"snapshot retirement epoch superseded",
+					));
+				}
+				let tx = db.begin_write().map_err(redb_to_io)?;
+				if let Some((snapshot, pending)) = pending_retirement_staged {
+					if replacement_applied.is_some() {
+						return Err(Error::new(
+							ErrorKind::InvalidInput,
+							"pending retirement requires complete snapshot proof",
+						));
+					}
+					let mut tiers = tx.open_table(TIERED_SLABS_TABLE).map_err(redb_to_io)?;
+					for (pointer, old) in pending {
+						if old >= snapshot
+							|| committed.contains(&pointer.slab_id)
+							|| !marks.iter().any(|mark| {
+								mark.pointer == pointer
+									&& mark.snapshot_index == Some(snapshot)
+									&& mark.epoch == snapshot_epoch
+							}) {
+							return Err(Error::new(
+								ErrorKind::InvalidInput,
+								"unjustified pending retirement input",
+							));
+						}
+						let actual = tiers
+							.get(&pointer.slab_id.get())
+							.map_err(redb_to_io)?
+							.map(|value| decode_tiered_pointer(pointer.slab_id, value.value()))
+							.transpose()?;
+						if let Some(actual) = actual {
+							if !actual.same_object_generation(&pointer) {
+								return Err(Error::new(
+									ErrorKind::WouldBlock,
+									"pending retirement durable generation changed",
+								));
+							}
+						} else {
+							let value = encode_tiered_pointer(&pointer);
+							tiers
+								.insert(&pointer.slab_id.get(), value.as_slice())
+								.map_err(redb_to_io)?;
+						}
+					}
+				}
+				if !replay_staged.is_empty() {
+					let expected = replacement_applied.as_ref().ok_or_else(|| {
+						Error::new(
+							ErrorKind::InvalidInput,
+							"replay staging requires replacement proof",
+						)
+					})?;
+					let mut tiers = tx.open_table(TIERED_SLABS_TABLE).map_err(redb_to_io)?;
+					for pointer in replay_staged {
+						if !expected.1.contains(&pointer) {
+							return Err(Error::new(
+								ErrorKind::InvalidInput,
+								"replay staging pointer differs from canonical set",
+							));
+						}
+						let absent = tiers
+							.get(&pointer.slab_id.get())
+							.map_err(redb_to_io)?
+							.is_none();
+						if absent {
+							let value = encode_tiered_pointer(&pointer);
+							tiers
+								.insert(&pointer.slab_id.get(), value.as_slice())
+								.map_err(redb_to_io)?;
+						}
+					}
+				}
+				if let Some((_, expected)) = &replacement_applied {
+					let tiers = tx.open_table(TIERED_SLABS_TABLE).map_err(redb_to_io)?;
+					for pointer in expected {
+						if tiers
+							.get(&pointer.slab_id.get())
+							.map_err(redb_to_io)?
+							.is_none()
+						{
+							return Err(Error::new(
+								ErrorKind::WouldBlock,
+								"replacement comparison is missing an expected committed pointer",
+							));
+						}
+					}
+					for row in tiers.iter().map_err(redb_to_io)? {
+						let (id, value) = row.map_err(redb_to_io)?;
+						let slab = SlabId::new(id.value());
+						let mut actual = decode_tiered_pointer(slab, value.value())?;
+						let Some(pointer) = expected.iter().find(|p| p.slab_id == slab) else {
+							return Err(Error::new(
+								ErrorKind::WouldBlock,
+								"replacement comparison found an absent committed slab",
+							));
+						};
+						actual.tombstone_metadata = pointer.tombstone_metadata;
+						actual.supersession_metadata = pointer.supersession_metadata;
+						if &actual != pointer {
+							return Err(Error::new(
+								ErrorKind::WouldBlock,
+								"replacement comparison found a changed committed pointer",
+							));
+						}
+					}
+				}
+				let mut committed_ids = committed.iter().copied().collect::<Vec<_>>();
+				committed_ids.sort();
+				{
+					let mut meta = tx.open_table(META_TABLE).map_err(redb_to_io)?;
+					let floor = meta
+						.get(META_SNAPSHOT_RETIREMENT_EPOCH_FLOOR)
+						.map_err(redb_to_io)?
+						.map(|v| v.value())
+						.unwrap_or(0);
+					if snapshot_epoch < floor {
+						return Err(Error::new(
+							ErrorKind::Interrupted,
+							"snapshot retirement epoch is stale",
+						));
+					}
+					meta.insert(META_SNAPSHOT_RETIREMENT_EPOCH_FLOOR, &snapshot_epoch)
+						.map_err(redb_to_io)?;
+					if let Some((applied, _)) = &replacement_applied {
+						meta.insert("replacement_compared_applied_v1", applied)
+							.map_err(redb_to_io)?;
+					}
+				}
+				{
+					let mut state = tx
+						.open_table(SNAPSHOT_RETIREMENT_STATE_TABLE)
+						.map_err(redb_to_io)?;
+					let encoded = postcard::to_stdvec(&SnapshotRetirementState {
+						epoch: snapshot_epoch,
+						committed: committed_ids,
+					})
+					.map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+					state
+						.insert("current", encoded.as_slice())
+						.map_err(redb_to_io)?;
+				}
+				let mut degraded_pointers = Vec::new();
+				let mut degradation_counts = (0, 0);
+				{
+					let mut tiers = tx.open_table(TIERED_SLABS_TABLE).map_err(redb_to_io)?;
+					let mut table = tx
+						.open_table(SNAPSHOT_RETIREMENTS_TABLE)
+						.map_err(redb_to_io)?;
+					for slab in &committed {
+						table.remove(&slab.get()).map_err(redb_to_io)?;
+						let old = tiers
+							.get(&slab.get())
+							.map_err(redb_to_io)?
+							.map(|v| decode_tiered_pointer(*slab, v.value()))
+							.transpose()?;
+						if let Some(mut pointer) = old {
+							let before = pointer.clone();
+							apply_pending_metadata_to_pointer(&tx, &mut pointer, None)?;
+							if pointer != before {
+								note_metadata_degradation(
+									&before,
+									&pointer,
+									&mut degradation_counts,
+								);
+								let value = encode_tiered_pointer(&pointer);
+								tiers
+									.insert(&slab.get(), value.as_slice())
+									.map_err(redb_to_io)?;
+								degraded_pointers.push(pointer);
+							}
+						}
+					}
+					for mark in marks {
+						let id = mark.pointer.slab_id;
+						let actual = tiers
+							.get(&id.get())
+							.map_err(redb_to_io)?
+							.map(|v| decode_tiered_pointer(id, v.value()))
+							.transpose()?;
+						if actual.as_ref() != Some(&mark.pointer) {
+							return Err(Error::new(
+								ErrorKind::WouldBlock,
+								"snapshot retirement pointer changed",
+							));
+						}
+						let value = postcard::to_stdvec(&mark)
+							.map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+						table
+							.insert(&id.get(), value.as_slice())
+							.map_err(redb_to_io)?;
+					}
+				}
+				tx.commit().map_err(redb_to_io)?;
+				publish_metadata_degradation_counts(degradation_counts);
+				Ok(degraded_pointers)
+			})
+			.await
+	}
+
+	/// Persist a gate-timeout intent without claiming a complete snapshot set.
+	/// Its only clearers are a checked retirement or a newer verified comparison.
+	pub(crate) async fn stage_deferred_retirement(
+		&self,
+		mark: SnapshotRetirementMark,
+		current_epoch: std::sync::Arc<std::sync::atomic::AtomicU64>,
+		epoch_gate: std::sync::Arc<std::sync::RwLock<()>>,
+	) -> std::io::Result<Option<SnapshotRetirementMark>> {
+		let _guard = self.write_lock.lock().await;
+		self.db
+			.run(move |db| {
+				let tx = db.begin_write().map_err(redb_to_io)?;
+				let _epoch_guard = epoch_gate.read().unwrap_or_else(|e| e.into_inner());
+				if current_epoch.load(std::sync::atomic::Ordering::Acquire) != mark.epoch {
+					return Ok(None);
+				}
+				let tiers = tx.open_table(TIERED_SLABS_TABLE).map_err(redb_to_io)?;
+				let actual = tiers
+					.get(&mark.pointer.slab_id.get())
+					.map_err(redb_to_io)?
+					.map(|v| decode_tiered_pointer(mark.pointer.slab_id, v.value()))
+					.transpose()?;
+				if actual.as_ref() != Some(&mark.pointer) {
+					return Ok(None);
+				}
+				drop(tiers);
+				{
+					let mut meta = tx.open_table(META_TABLE).map_err(redb_to_io)?;
+					let floor = meta
+						.get(META_SNAPSHOT_RETIREMENT_EPOCH_FLOOR)
+						.map_err(redb_to_io)?
+						.map(|value| value.value())
+						.unwrap_or(0);
+					meta.insert(META_SNAPSHOT_RETIREMENT_EPOCH_FLOOR, &floor.max(mark.epoch))
+						.map_err(redb_to_io)?;
+				}
+				let saved = {
+					let mut marks = tx
+						.open_table(SNAPSHOT_RETIREMENTS_TABLE)
+						.map_err(redb_to_io)?;
+					let previous = marks
+						.get(&mark.pointer.slab_id.get())
+						.map_err(redb_to_io)?
+						.map(|v| {
+							postcard::from_bytes::<SnapshotRetirementMark>(v.value())
+								.map_err(|e| Error::new(ErrorKind::InvalidData, e))
+						})
+						.transpose()?;
+					if let Some(previous) = previous.filter(|previous| {
+						previous.epoch > mark.epoch
+							|| (previous.epoch == mark.epoch
+								&& previous.snapshot_index >= mark.snapshot_index)
+					}) {
+						previous
+					} else {
+						let encoded = postcard::to_stdvec(&mark)
+							.map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+						marks
+							.insert(&mark.pointer.slab_id.get(), encoded.as_slice())
+							.map_err(redb_to_io)?;
+						mark
+					}
+				};
+				tx.commit().map_err(redb_to_io)?;
+				Ok(Some(saved))
+			})
+			.await
+	}
+
+	pub(crate) async fn load_snapshot_retirement_marks(
+		&self,
+	) -> std::io::Result<Vec<SnapshotRetirementMark>> {
+		self.db
+			.run(move |db| {
+				let tx = db.begin_read().map_err(redb_to_io)?;
+				let table = tx
+					.open_table(SNAPSHOT_RETIREMENTS_TABLE)
+					.map_err(redb_to_io)?;
+				let mut marks = Vec::new();
+				for row in table.iter().map_err(redb_to_io)? {
+					let (key, value) = row.map_err(redb_to_io)?;
+					let mark: SnapshotRetirementMark = postcard::from_bytes(value.value())
+						.map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+					if mark.pointer.slab_id.get() != key.value() {
+						return Err(Error::new(
+							ErrorKind::InvalidData,
+							"snapshot retirement key mismatch",
+						));
+					}
+					marks.push(mark);
+				}
+				Ok(marks)
+			})
+			.await
+	}
+
+	/// Apply an already-published snapshot retirement under its tier lock and index gate.
+	/// None means the captured authority is obsolete and no persistent effect occurred.
+	pub(crate) async fn apply_snapshot_retirement(
+		&self,
+		mark: SnapshotRetirementMark,
+		known_bytes: Option<u64>,
+		evidence: Vec<(String, RetainedObjectIntent)>,
+		current_epoch: std::sync::Arc<std::sync::atomic::AtomicU64>,
+		epoch_gate: std::sync::Arc<std::sync::RwLock<()>>,
+		publication_gate: std::sync::Arc<tokio::sync::OwnedRwLockReadGuard<()>>,
+	) -> std::io::Result<
+		Option<(
+			Option<RetainedObjectIntent>,
+			Vec<(String, RetainedObjectIntent)>,
+		)>,
+	> {
+		let _guard = self.write_lock.lock().await;
+		let cleanup_available = self.cleanup_available;
+		let gap_contribution = self.persisted_cleanup_gaps.clone();
+		#[cfg(test)]
+		let fail_cleanup_gap = self
+			.fail_cleanup_gap_before_commit
+			.swap(false, std::sync::atomic::Ordering::AcqRel);
+		self.db.run(move |db| {
+			let _publication_gate = publication_gate;
+			let _epoch_guard = epoch_gate.read().unwrap_or_else(|e| e.into_inner());
+			if current_epoch.load(std::sync::atomic::Ordering::Acquire) != mark.epoch { return Ok(None); }
+			let tx = db.begin_write().map_err(redb_to_io)?;
+			{
+				let state = tx.open_table(SNAPSHOT_RETIREMENT_STATE_TABLE).map_err(redb_to_io)?;
+				let saved = state.get("current").map_err(redb_to_io)?.map(|value| postcard::from_bytes::<SnapshotRetirementState>(value.value()).map_err(|e| Error::new(ErrorKind::InvalidData, e))).transpose()?;
+				if !saved.is_some_and(|saved| saved.epoch == mark.epoch && !saved.committed.contains(&mark.pointer.slab_id)) { return Ok(None); }
+			}
+			{
+				let mut marks = tx.open_table(SNAPSHOT_RETIREMENTS_TABLE).map_err(redb_to_io)?;
+				let saved = marks.get(&mark.pointer.slab_id.get()).map_err(redb_to_io)?.map(|value| postcard::from_bytes::<SnapshotRetirementMark>(value.value()).map_err(|e| Error::new(ErrorKind::InvalidData, e))).transpose()?;
+				if saved.as_ref() != Some(&mark) { return Ok(None); }
+				let mut tiers = tx.open_table(TIERED_SLABS_TABLE).map_err(redb_to_io)?;
+				let actual = tiers.get(&mark.pointer.slab_id.get()).map_err(redb_to_io)?.map(|v| decode_tiered_pointer(mark.pointer.slab_id, v.value())).transpose()?;
+				if actual.as_ref().is_none_or(|pointer| !pointer.same_object_generation(&mark.pointer)) { return Ok(None); }
+				tiers.remove(&mark.pointer.slab_id.get()).map_err(redb_to_io)?;
+				marks.remove(&mark.pointer.slab_id.get()).map_err(redb_to_io)?;
+			}
+			{
+				let mut records = tx.open_table(RECORDS_TABLE).map_err(redb_to_io)?;
+				let mut keys = Vec::new();
+				for row in records.iter().map_err(redb_to_io)? {
+					let (key, value) = row.map_err(redb_to_io)?;
+					if decode_record_row(key.value(), value.value())?.location.slab_id == mark.pointer.slab_id { keys.push(key.value().to_vec()); }
+				}
+				for key in keys { records.remove(key.as_slice()).map_err(redb_to_io)?; }
+			}
+			let (retained, applied_evidence) = if cleanup_available {
+				let retirement_index = mark.snapshot_index.ok_or_else(|| Error::new(ErrorKind::WouldBlock, "snapshot retirement lacks an authority index"))?;
+				let (record, evidence) = persist_retirement_records(&tx, &mark.pointer, known_bytes, evidence, RetirementSource::Snapshot(retirement_index))?;
+				(Some(record), evidence)
+			} else {
+				let mut meta = tx.open_table(META_TABLE).map_err(redb_to_io)?;
+				let current = meta.get(META_CLEANUP_AUTHORITY_GAPS).map_err(redb_to_io)?.map(|v| v.value()).unwrap_or(0);
+				let next = current.checked_add(1).ok_or_else(|| Error::other("cleanup gap counter overflow"))?;
+				meta.insert(META_CLEANUP_AUTHORITY_GAPS, &next).map_err(redb_to_io)?;
+				(None, Vec::new())
+			};
+			#[cfg(test)]
+			if fail_cleanup_gap && !cleanup_available { return Err(Error::other("injected snapshot retirement gap failure")); }
+			tx.commit().map_err(redb_to_io)?;
+			if !cleanup_available {
+				gap_contribution.count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+				crate::metrics::global().storage_cleanup_unrecorded_supersessions.add(1);
+				crate::metrics::global().storage_cleanup_unrecorded_supersessions_total.inc();
+				tracing::warn!(slab_id = mark.pointer.slab_id.get(), old_uri = %mark.pointer.l2_uri, "committed snapshot retirement missing cleanup accounting");
+			}
+			Ok(Some((retained, applied_evidence)))
+		}).await
+	}
+
+	/// Persist one unresolved snapshot-raced cleanup, idempotently by slab and URI.
+	pub(crate) async fn put_snapshot_cleanup_intent(
+		&self,
+		slab_id: SlabId,
+		uri: String,
+		intent: RetainedObjectIntent,
+	) -> std::io::Result<()> {
+		self.require_cleanup_authority()?;
+		#[cfg(test)]
+		if self
+			.fail_next_cleanup_insert
+			.swap(false, std::sync::atomic::Ordering::AcqRel)
+		{
+			return Err(Error::other("injected cleanup insert failure"));
+		}
+		let encoded =
+			postcard::to_stdvec(&intent).map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+		let mut key = slab_id.get().to_be_bytes().to_vec();
+		key.extend_from_slice(uri.as_bytes());
+		let _write = self.write_lock.lock().await;
+		self.db
+			.run(move |db| {
+				let tx = db.begin_write().map_err(redb_to_io)?;
+				{
+					let mut table = tx
+						.open_table(SNAPSHOT_CLEANUP_INTENTS_TABLE)
+						.map_err(redb_to_io)?;
+					let existing = table
+						.get(key.as_slice())
+						.map_err(redb_to_io)?
+						.map(|value| value.value().to_vec());
+					match existing {
+						Some(value) if value != encoded => {
+							let previous: RetainedObjectIntent = postcard::from_bytes(&value)
+								.map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+							// A published ambiguous upload can later be superseded.
+							// Transition its existing row without adding a second count.
+							if previous.state != RetainedObjectIntentState::ReplacementPublished
+								|| previous.replacement_uri.as_deref() != Some(uri.as_str())
+								|| previous.bytes != intent.bytes
+								|| intent.state != RetainedObjectIntentState::Unresolved
+								|| intent.replacement_uri.is_none()
+							{
+								return Err(Error::new(
+									ErrorKind::InvalidData,
+									"conflicting cleanup intent",
+								));
+							}
+							let mut next = intent.clone();
+							next.published_replacements
+								.extend(previous.published_replacements);
+							next.published_replacements.extend(previous.replacement_uri);
+							let merged = postcard::to_stdvec(&next)
+								.map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+							table
+								.insert(key.as_slice(), merged.as_slice())
+								.map_err(redb_to_io)?;
+						}
+						Some(_) => {}
+						None => {
+							table
+								.insert(key.as_slice(), encoded.as_slice())
+								.map_err(redb_to_io)?;
+						}
+					}
+				}
+				tx.commit().map_err(redb_to_io)
+			})
+			.await
+	}
+
+	/// Stage the old object and its provisional replacement together.
+	pub(crate) async fn put_cleanup_intent_pair(
+		&self,
+		slab_id: SlabId,
+		old_uri: String,
+		old: RetainedObjectIntent,
+		provisional: Option<(String, RetainedObjectIntent)>,
+	) -> std::io::Result<()> {
+		self.require_cleanup_authority()?;
+		let mut entries = vec![(old_uri, old)];
+		if let Some(provisional) = provisional {
+			entries.push(provisional);
+		}
+		let entries = entries
+			.into_iter()
+			.map(|(uri, intent)| {
+				let mut key = slab_id.get().to_be_bytes().to_vec();
+				key.extend_from_slice(uri.as_bytes());
+				let value = postcard::to_stdvec(&intent)
+					.map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+				Ok((key, value))
+			})
+			.collect::<std::io::Result<Vec<_>>>()?;
+		let _write = self.write_lock.lock().await;
+		self.db
+			.run(move |db| {
+				let tx = db.begin_write().map_err(redb_to_io)?;
+				{
+					let mut table = tx
+						.open_table(SNAPSHOT_CLEANUP_INTENTS_TABLE)
+						.map_err(redb_to_io)?;
+					for (key, value) in entries {
+						let prior = table
+							.get(key.as_slice())
+							.map_err(redb_to_io)?
+							.map(|v| v.value().to_vec());
+						match prior {
+							Some(prior) if prior != value => {
+								let prior: RetainedObjectIntent = postcard::from_bytes(&prior)
+									.map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+								let next: RetainedObjectIntent = postcard::from_bytes(&value)
+									.map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+								if !matches!(
+									prior.state,
+									RetainedObjectIntentState::ReplacementPublished
+										| RetainedObjectIntentState::RetirementPublished
+								) || next.state != RetainedObjectIntentState::Unresolved
+									|| prior.bytes != next.bytes
+									|| !prior
+										.published_replacements
+										.is_subset(&next.published_replacements)
+									|| prior
+										.replacement_uri
+										.as_ref()
+										.is_some_and(|u| !next.published_replacements.contains(u))
+									|| next
+										.replacement_uri
+										.as_ref()
+										.is_none_or(|u| next.published_replacements.contains(u))
+								{
+									return Err(Error::new(
+										ErrorKind::InvalidData,
+										"conflicting cleanup intent",
+									));
+								}
+								table
+									.insert(key.as_slice(), value.as_slice())
+									.map_err(redb_to_io)?;
+							}
+							Some(_) => {}
+							None => {
+								table
+									.insert(key.as_slice(), value.as_slice())
+									.map_err(redb_to_io)?;
+							}
+						}
+					}
+				}
+				tx.commit().map_err(redb_to_io)
+			})
+			.await
+	}
+
+	/// Record publication and its accounting in one durable transaction.
+	pub(crate) async fn mark_cleanup_replacement_published(
+		&self,
+		slab_id: SlabId,
+		uri: String,
+		replacement: String,
+		bytes: Option<u64>,
+	) -> std::io::Result<()> {
+		self.require_cleanup_authority()?;
+		let mut key = slab_id.get().to_be_bytes().to_vec();
+		key.extend_from_slice(uri.as_bytes());
+		#[cfg(test)]
+		let fail_after_remove = self
+			.fail_cleanup_after_provisional_remove
+			.swap(false, std::sync::atomic::Ordering::AcqRel);
+		let _write = self.write_lock.lock().await;
+		self.db
+			.run(move |db| {
+				let tx = db.begin_write().map_err(redb_to_io)?;
+				{
+					let mut table = tx
+						.open_table(SNAPSHOT_CLEANUP_INTENTS_TABLE)
+						.map_err(redb_to_io)?;
+					let previous = table
+						.get(key.as_slice())
+						.map_err(redb_to_io)?
+						.map(|value| {
+							postcard::from_bytes::<RetainedObjectIntent>(value.value())
+								.map_err(|e| Error::new(ErrorKind::InvalidData, e))
+						})
+						.transpose()?;
+					if let Some(ref old) = previous {
+						if old.replacement_uri.as_ref() != Some(&replacement) {
+							return Err(Error::new(
+								ErrorKind::InvalidData,
+								"cleanup replacement mismatch",
+							));
+						}
+					}
+					let mut replacement_bytes =
+						previous.as_ref().and_then(|old| old.replacement_bytes);
+					if uri != replacement {
+						let mut provisional_key = slab_id.get().to_be_bytes().to_vec();
+						provisional_key.extend_from_slice(replacement.as_bytes());
+						let provisional = table
+							.get(provisional_key.as_slice())
+							.map_err(redb_to_io)?
+							.map(|value| {
+								postcard::from_bytes::<RetainedObjectIntent>(value.value())
+									.map_err(|e| Error::new(ErrorKind::InvalidData, e))
+							})
+							.transpose()?;
+						if let Some(provisional) = provisional.filter(|p| {
+							matches!(
+								p.state,
+								RetainedObjectIntentState::Unresolved
+									| RetainedObjectIntentState::CandidateNotSubmitted
+							) && p.replacement_uri.as_deref() == Some(replacement.as_str())
+						}) {
+							replacement_bytes = replacement_bytes.or(provisional.bytes);
+							table
+								.remove(provisional_key.as_slice())
+								.map_err(redb_to_io)?;
+						}
+					}
+					#[cfg(test)]
+					if fail_after_remove {
+						return Err(Error::other("injected cleanup transaction failure"));
+					}
+					let mut published_replacements = previous
+						.as_ref()
+						.map(|old| old.published_replacements.clone())
+						.unwrap_or_default();
+					published_replacements.insert(replacement.clone());
+					let retirement_source = previous.as_ref().and_then(|old| old.retirement_source);
+					let intent = RetainedObjectIntent {
+						bytes: previous.map_or(bytes, |old| old.bytes),
+						replacement_uri: Some(replacement),
+						replacement_bytes,
+						published_replacements,
+						retirement_source,
+						state: RetainedObjectIntentState::ReplacementPublished,
+					};
+					let value = postcard::to_stdvec(&intent)
+						.map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+					table
+						.insert(key.as_slice(), value.as_slice())
+						.map_err(redb_to_io)?;
+				}
+				tx.commit().map_err(redb_to_io)
+			})
+			.await
+	}
+
+	/// Stage a snapshot-superseded live object without remote I/O.
+	/// If its prior publication has an unresolved predecessor, record that
+	/// evidence in the same transaction as the new retained record.
+	pub(crate) async fn stage_snapshot_retained_object(
+		&self,
+		slab_id: SlabId,
+		uri: String,
+		retained: RetainedObjectIntent,
+		evidence: Vec<(String, RetainedObjectIntent)>,
+	) -> std::io::Result<()> {
+		self.require_cleanup_authority()?;
+		let mut key = slab_id.get().to_be_bytes().to_vec();
+		key.extend_from_slice(uri.as_bytes());
+		let _write = self.write_lock.lock().await;
+		self.db
+			.run(move |db| {
+				let tx = db.begin_write().map_err(redb_to_io)?;
+				{
+					let mut table = tx
+						.open_table(SNAPSHOT_CLEANUP_INTENTS_TABLE)
+						.map_err(redb_to_io)?;
+					let existing = table
+						.get(key.as_slice())
+						.map_err(redb_to_io)?
+						.map(|v| {
+							postcard::from_bytes::<RetainedObjectIntent>(v.value())
+								.map_err(|e| Error::new(ErrorKind::InvalidData, e))
+						})
+						.transpose()?;
+					let mut write_retained = true;
+					if let Some(prior) = existing {
+						let provisional = matches!(
+							prior.state,
+							RetainedObjectIntentState::Unresolved
+								| RetainedObjectIntentState::CandidateNotSubmitted
+						) && prior.replacement_uri.as_deref()
+							== Some(uri.as_str());
+						if prior == retained {
+							write_retained = false;
+						} else if !provisional {
+							let valid_next = prior.state
+								== RetainedObjectIntentState::ReplacementPublished
+								&& retained.state == RetainedObjectIntentState::Unresolved
+								&& prior.bytes == retained.bytes
+								&& prior
+									.published_replacements
+									.is_subset(&retained.published_replacements)
+								&& prior.replacement_uri.as_ref().is_none_or(|uri| {
+									retained.published_replacements.contains(uri)
+								});
+							if !valid_next {
+								return Err(Error::new(
+									ErrorKind::InvalidData,
+									"conflicting snapshot retained record",
+								));
+							}
+						}
+					}
+					for (predecessor, proposed) in evidence {
+						let mut predecessor_key = slab_id.get().to_be_bytes().to_vec();
+						predecessor_key.extend_from_slice(predecessor.as_bytes());
+						let prior = table
+							.get(predecessor_key.as_slice())
+							.map_err(redb_to_io)?
+							.map(|v| {
+								postcard::from_bytes::<RetainedObjectIntent>(v.value())
+									.map_err(|e| Error::new(ErrorKind::InvalidData, e))
+							})
+							.transpose()?;
+						if prior
+							.as_ref()
+							.is_some_and(|p| p.replacement_uri.as_deref() != Some(uri.as_str()))
+						{
+							return Err(Error::new(
+								ErrorKind::InvalidData,
+								"snapshot predecessor replacement mismatch",
+							));
+						}
+						if !prior.as_ref().is_some_and(|p| {
+							p.state == RetainedObjectIntentState::ReplacementPublished
+						}) {
+							let mut published = prior.unwrap_or(proposed);
+							published.published_replacements.insert(uri.clone());
+							published.state = RetainedObjectIntentState::ReplacementPublished;
+							let value = postcard::to_stdvec(&published)
+								.map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+							table
+								.insert(predecessor_key.as_slice(), value.as_slice())
+								.map_err(redb_to_io)?;
+						}
+					}
+					if write_retained {
+						let value = postcard::to_stdvec(&retained)
+							.map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+						table
+							.insert(key.as_slice(), value.as_slice())
+							.map_err(redb_to_io)?;
+					}
+				}
+				tx.commit().map_err(redb_to_io)
+			})
+			.await
+	}
+
+	/// The caller either has not invoked the committer yet, or carries B1N's
+	/// pre-client_write refusal proof. A returned Raft error is insufficient.
+	pub(crate) async fn set_tier_candidate_proposal_state(
+		&self,
+		slab_id: SlabId,
+		uri: String,
+		not_submitted: bool,
+		bytes: Option<u64>,
+	) -> std::io::Result<RetainedObjectIntent> {
+		self.require_cleanup_authority()?;
+		let mut key = slab_id.get().to_be_bytes().to_vec();
+		key.extend_from_slice(uri.as_bytes());
+		let _write = self.write_lock.lock().await;
+		self.db
+			.run(move |db| {
+				let tx = db.begin_write().map_err(redb_to_io)?;
+				let next = {
+					let mut table = tx
+						.open_table(SNAPSHOT_CLEANUP_INTENTS_TABLE)
+						.map_err(redb_to_io)?;
+					let prior = table
+						.get(key.as_slice())
+						.map_err(redb_to_io)?
+						.map(|v| {
+							postcard::from_bytes::<RetainedObjectIntent>(v.value())
+								.map_err(|e| Error::new(ErrorKind::InvalidData, e))
+						})
+						.transpose()?;
+					let mut next = match prior {
+						Some(prior)
+							if matches!(
+								prior.state,
+								RetainedObjectIntentState::Unresolved
+									| RetainedObjectIntentState::CandidateNotSubmitted
+							) && (not_submitted
+								|| prior.state
+									== RetainedObjectIntentState::CandidateNotSubmitted)
+								&& prior.replacement_uri.as_deref() == Some(uri.as_str())
+								&& prior.published_replacements.is_empty()
+								&& prior.retirement_source.is_none() =>
+						{
+							prior
+						}
+						None if not_submitted => RetainedObjectIntent {
+							bytes,
+							replacement_uri: Some(uri.clone()),
+							replacement_bytes: None,
+							published_replacements: Default::default(),
+							retirement_source: None,
+							state: RetainedObjectIntentState::CandidateNotSubmitted,
+						},
+						_ => {
+							return Err(Error::new(
+								ErrorKind::WouldBlock,
+								"tier candidate is not a fresh provisional",
+							));
+						}
+					};
+					next.state = if not_submitted {
+						RetainedObjectIntentState::CandidateNotSubmitted
+					} else {
+						RetainedObjectIntentState::Unresolved
+					};
+					let encoded = postcard::to_stdvec(&next)
+						.map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+					table
+						.insert(key.as_slice(), encoded.as_slice())
+						.map_err(redb_to_io)?;
+					next
+				};
+				tx.commit().map_err(redb_to_io)?;
+				Ok(next)
+			})
+			.await
+	}
+
+	/// Finish or idempotently observe our atomic rollback after deleting only
+	/// the never-submitted fresh candidate. Refresh the caller's stale parents
+	/// after cancellation without overwriting newer publication history.
+	pub(crate) async fn clear_unsubmitted_tier_candidate(
+		&self,
+		slab_id: SlabId,
+		uri: String,
+		expected_parents: Vec<String>,
+	) -> std::io::Result<Vec<(String, Option<RetainedObjectIntent>)>> {
+		self.require_cleanup_authority()?;
+		let prefix = slab_id.get().to_be_bytes();
+		let _write = self.write_lock.lock().await;
+		self.db
+			.run(move |db| {
+				let tx = db.begin_write().map_err(redb_to_io)?;
+				let changes = {
+					let mut table = tx
+						.open_table(SNAPSHOT_CLEANUP_INTENTS_TABLE)
+						.map_err(redb_to_io)?;
+					let mut records =
+						std::collections::BTreeMap::<String, RetainedObjectIntent>::new();
+					for row in table.iter().map_err(redb_to_io)? {
+						let (key, value) = row.map_err(redb_to_io)?;
+						if key.value().starts_with(&prefix) {
+							let name = std::str::from_utf8(&key.value()[8..])
+								.map_err(|e| Error::new(ErrorKind::InvalidData, e))?
+								.to_owned();
+							let record = postcard::from_bytes(value.value())
+								.map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+							records.insert(name, record);
+						}
+					}
+					let valid = match records.get(&uri) {
+						Some(r) => {
+							r.state == RetainedObjectIntentState::CandidateNotSubmitted
+								&& r.replacement_uri.as_deref() == Some(uri.as_str())
+								&& r.published_replacements.is_empty()
+								&& r.retirement_source.is_none()
+						}
+						// The only other clearer consumes publication evidence and
+						// leaves its parent edge. No candidate and no such edge is
+						// the completed atomic rollback, not an absence-only proof.
+						None => !records
+							.values()
+							.any(|r| r.replacement_uri.as_deref() == Some(uri.as_str())),
+					};
+					if !valid || records.values().any(|r| r.was_published(&uri)) {
+						return Err(Error::new(
+							ErrorKind::WouldBlock,
+							"candidate submission/publication proof changed",
+						));
+					}
+					let mut affected = expected_parents
+						.into_iter()
+						.collect::<std::collections::BTreeSet<_>>();
+					affected.insert(uri.clone());
+					records.remove(&uri);
+					let parents = records
+						.iter()
+						.filter(|(_, r)| {
+							r.state == RetainedObjectIntentState::Unresolved
+								&& r.replacement_uri.as_deref() == Some(uri.as_str())
+						})
+						.map(|(name, _)| name.clone())
+						.collect::<Vec<_>>();
+					for name in parents {
+						affected.insert(name.clone());
+						let record = records.get_mut(&name).unwrap();
+						if record.published_replacements.is_empty()
+							&& record.retirement_source.is_none()
+						{
+							records.remove(&name);
+						} else {
+							record.replacement_uri = None;
+							record.replacement_bytes = None;
+							record.state = if record.retirement_source.is_some() {
+								RetainedObjectIntentState::RetirementPublished
+							} else {
+								RetainedObjectIntentState::ReplacementPublished
+							};
+						}
+					}
+					let mut changes = Vec::new();
+					for name in affected {
+						let mut key = prefix.to_vec();
+						key.extend_from_slice(name.as_bytes());
+						let record = records.get(&name).cloned();
+						match &record {
+							Some(record) => {
+								let bytes = postcard::to_stdvec(record)
+									.map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+								table
+									.insert(key.as_slice(), bytes.as_slice())
+									.map_err(redb_to_io)?;
+							}
+							None => {
+								table.remove(key.as_slice()).map_err(redb_to_io)?;
+							}
+						}
+						changes.push((name, record));
+					}
+					changes
+				};
+				tx.commit().map_err(redb_to_io)?;
+				Ok(changes)
+			})
+			.await
+	}
+
+	/// Remove a first-tier provisional object once it is known live. A
+	/// replacement owned by an old-object intent must resolve with that row.
+	pub(crate) async fn remove_standalone_live_provisional(
+		&self,
+		slab_id: SlabId,
+		uri: String,
+	) -> std::io::Result<()> {
+		self.require_cleanup_authority()?;
+		let mut key = slab_id.get().to_be_bytes().to_vec();
+		key.extend_from_slice(uri.as_bytes());
+		let prefix = slab_id.get().to_be_bytes();
+		let _write = self.write_lock.lock().await;
+		self.db
+			.run(move |db| {
+				let tx = db.begin_write().map_err(redb_to_io)?;
+				{
+					let mut table = tx
+						.open_table(SNAPSHOT_CLEANUP_INTENTS_TABLE)
+						.map_err(redb_to_io)?;
+					for row in table.iter().map_err(redb_to_io)? {
+						let (other_key, value) = row.map_err(redb_to_io)?;
+						if other_key.value().starts_with(&prefix)
+							&& other_key.value() != key.as_slice()
+						{
+							let record: RetainedObjectIntent = postcard::from_bytes(value.value())
+								.map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+							if record.replacement_uri.as_deref() == Some(uri.as_str()) {
+								return Err(Error::new(
+									ErrorKind::WouldBlock,
+									"provisional belongs to an old-object intent",
+								));
+							}
+						}
+					}
+					let prior = table
+						.get(key.as_slice())
+						.map_err(redb_to_io)?
+						.map(|v| {
+							postcard::from_bytes::<RetainedObjectIntent>(v.value())
+								.map_err(|e| Error::new(ErrorKind::InvalidData, e))
+						})
+						.transpose()?;
+					if let Some(prior) = prior {
+						if !matches!(
+							prior.state,
+							RetainedObjectIntentState::Unresolved
+								| RetainedObjectIntentState::CandidateNotSubmitted
+						) || prior.replacement_uri.as_deref() != Some(uri.as_str())
+						{
+							return Err(Error::new(
+								ErrorKind::InvalidData,
+								"not a standalone provisional record",
+							));
+						}
+						table.remove(key.as_slice()).map_err(redb_to_io)?;
+					}
+				}
+				tx.commit().map_err(redb_to_io)
+			})
+			.await
+	}
+
+	pub(crate) async fn load_snapshot_cleanup_intents(
+		&self,
+	) -> std::io::Result<Vec<(SlabId, String, RetainedObjectIntent)>> {
+		self.require_cleanup_authority()?;
+		self.db
+			.run(move |db| {
+				let tx = db.begin_read().map_err(redb_to_io)?;
+				let table = tx
+					.open_table(SNAPSHOT_CLEANUP_INTENTS_TABLE)
+					.map_err(redb_to_io)?;
+				let mut records = Vec::new();
+				for row in table.iter().map_err(redb_to_io)? {
+					let (key, bytes) = row.map_err(redb_to_io)?;
+					let key = key.value();
+					if key.len() <= 8 {
+						return Err(std::io::Error::new(
+							std::io::ErrorKind::InvalidData,
+							"invalid snapshot cleanup key",
+						));
+					}
+					let slab_id = SlabId::new(u64::from_be_bytes(key[..8].try_into().unwrap()));
+					let uri = std::str::from_utf8(&key[8..])
+						.map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
+						.to_owned();
+					let intent = postcard::from_bytes(bytes.value())
+						.map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+					records.push((slab_id, uri, intent));
+				}
+				Ok(records)
 			})
 			.await
 	}
@@ -766,6 +3241,7 @@ impl PersistentLocalIndex {
 			.await
 	}
 
+	#[cfg(test)]
 	pub(crate) async fn upsert_record(&self, row: PersistentRecordRow) -> std::io::Result<()> {
 		self.apply(PersistentIndexUpdate {
 			put_records: vec![row],
@@ -774,6 +3250,7 @@ impl PersistentLocalIndex {
 		.await
 	}
 
+	#[cfg(test)]
 	pub(crate) async fn upsert_tiered_slab(
 		&self,
 		pointer: TieredSlabPointer,
@@ -787,6 +3264,7 @@ impl PersistentLocalIndex {
 		.await
 	}
 
+	#[cfg(test)]
 	pub(crate) async fn upsert_secondary_index_segment(
 		&self,
 		row: PersistentSecondaryIndexSegmentRow,
@@ -798,6 +3276,7 @@ impl PersistentLocalIndex {
 		.await
 	}
 
+	#[cfg(test)]
 	pub(crate) async fn delete_secondary_index_segment(
 		&self,
 		key: PersistentSecondaryIndexSegmentKey,
@@ -850,6 +3329,34 @@ where
 
 fn redb_to_io(err: impl std::fmt::Display) -> std::io::Error {
 	Error::other(format!("redb error: {err}"))
+}
+
+/// Stable digest of durable row keys and values for an LSM input set.
+pub(crate) fn lsm_rows_digest(rows: impl IntoIterator<Item = PersistentRecordRow>) -> [u8; 32] {
+	let mut rows = rows
+		.into_iter()
+		.map(|row| (encode_record_key(row), encode_record_value(row)))
+		.collect::<Vec<_>>();
+	rows.sort_unstable();
+	let mut digest = blake3::Hasher::new();
+	for (key, value) in rows {
+		digest.update(&key);
+		digest.update(&value);
+	}
+	*digest.finalize().as_bytes()
+}
+
+pub(crate) fn lsm_input_rows_digest(
+	snapshot: &PersistentIndexSnapshot,
+	inputs: &std::collections::HashSet<SlabId>,
+) -> [u8; 32] {
+	lsm_rows_digest(
+		snapshot
+			.record_rows
+			.iter()
+			.filter(|row| inputs.contains(&row.location.slab_id))
+			.copied(),
+	)
 }
 
 fn encode_record_key(row: PersistentRecordRow) -> [u8; RECORD_KEY_LEN] {
@@ -1660,6 +4167,186 @@ fn read_array_32(bytes: &[u8], cursor: &mut usize) -> std::io::Result<[u8; 32]> 
 mod tests {
 	use super::*;
 
+	#[tokio::test]
+	async fn metadata_tokens_are_grouped_and_counter_survives_reopen() {
+		let (_dir, path) = temp_path("metadata-tokens");
+		let index = PersistentLocalIndex::initialize_new(path.clone(), None)
+			.await
+			.unwrap();
+		let pointer = TieredSlabPointer {
+			slab_id: SlabId::new(3),
+			l2_uri: "tier/token".into(),
+			payload_hash: [7; 32],
+			is_encrypted: false,
+			tenant_id: None,
+			tenant_kek_id: None,
+			stats_format_version: None,
+			stats_block_len: None,
+			stats_block_hash128: None,
+			tombstone_metadata: TombstoneMetadata::None,
+			supersession_metadata: SupersessionMetadata::None,
+		};
+		index
+			.apply(PersistentIndexUpdate {
+				put_tiered_slabs: vec![pointer.clone()],
+				..Default::default()
+			})
+			.await
+			.unwrap();
+		let before_supersession = crate::metrics::global()
+			.storage_supersession_metadata_degraded_total
+			.get();
+		let before_tombstone = crate::metrics::global()
+			.storage_tombstone_metadata_degraded_total
+			.get();
+		let mut last = 0;
+		for _ in 0..100 {
+			last = index
+				.begin_metadata_token(pointer.slab_id, MetadataKind::Supersession)
+				.await
+				.unwrap();
+		}
+		let tombstone = index
+			.begin_metadata_token(pointer.slab_id, MetadataKind::Tombstone)
+			.await
+			.unwrap();
+		assert!(tombstone > last);
+		let count = index
+			.db
+			.run(|db| {
+				let tx = db.begin_read().map_err(redb_to_io)?;
+				let table = tx.open_table(METADATA_PENDING_TABLE).map_err(redb_to_io)?;
+				Ok(table.iter().map_err(redb_to_io)?.count())
+			})
+			.await
+			.unwrap();
+		assert_eq!(count, 1);
+		drop(index);
+		let index = PersistentLocalIndex::open(path).await.unwrap();
+		assert_eq!(index.recover_metadata_tokens().await.unwrap(), 1);
+		assert_eq!(
+			crate::metrics::global()
+				.storage_supersession_metadata_degraded_total
+				.get(),
+			before_supersession + 1
+		);
+		assert_eq!(
+			crate::metrics::global()
+				.storage_tombstone_metadata_degraded_total
+				.get(),
+			before_tombstone + 1
+		);
+		let recovered = index
+			.load_snapshot()
+			.await
+			.unwrap()
+			.tiered_slabs
+			.into_iter()
+			.find(|p| p.slab_id == pointer.slab_id)
+			.unwrap();
+		assert!(recovered.supersession_metadata.is_untracked());
+		assert!(recovered.tombstone_metadata.is_untracked());
+		assert!(
+			index
+				.begin_metadata_token(pointer.slab_id, MetadataKind::Supersession)
+				.await
+				.unwrap() > tombstone
+		);
+	}
+
+	#[tokio::test]
+	async fn metadata_pointer_publication_clears_only_its_own_token() {
+		let (_dir, path) = temp_path("metadata-token-publication");
+		let index = PersistentLocalIndex::initialize_new(path, None)
+			.await
+			.unwrap();
+		let pointer = TieredSlabPointer {
+			slab_id: SlabId::new(4),
+			l2_uri: "tier/token".into(),
+			payload_hash: [7; 32],
+			is_encrypted: false,
+			tenant_id: None,
+			tenant_kek_id: None,
+			stats_format_version: None,
+			stats_block_len: None,
+			stats_block_hash128: None,
+			tombstone_metadata: TombstoneMetadata::None,
+			supersession_metadata: SupersessionMetadata::None,
+		};
+		let first = index
+			.begin_metadata_token(pointer.slab_id, MetadataKind::Supersession)
+			.await
+			.unwrap();
+		let second = index
+			.begin_metadata_token(pointer.slab_id, MetadataKind::Supersession)
+			.await
+			.unwrap();
+		index
+			.apply(PersistentIndexUpdate {
+				put_tiered_slabs: vec![pointer.clone()],
+				..Default::default()
+			})
+			.await
+			.unwrap();
+		assert!(
+			index.load_snapshot().await.unwrap().tiered_slabs[0]
+				.supersession_metadata
+				.is_untracked(),
+			"a publishing transaction must not re-track while tokens exist"
+		);
+		assert_eq!(
+			index.load_pending_metadata_tokens().await.unwrap()[0]
+				.1
+				.supersession
+				.len(),
+			2
+		);
+		index
+			.apply(PersistentIndexUpdate {
+				put_tiered_slabs: vec![pointer.clone()],
+				completed_metadata_token: Some((
+					pointer.slab_id,
+					MetadataKind::Supersession,
+					first,
+				)),
+				..Default::default()
+			})
+			.await
+			.unwrap();
+		let saved = index.load_snapshot().await.unwrap().tiered_slabs.remove(0);
+		assert!(saved.supersession_metadata.is_untracked());
+		let rows = index.load_pending_metadata_tokens().await.unwrap();
+		assert_eq!(rows.len(), 1);
+		assert_eq!(
+			rows[0].1.supersession.iter().copied().collect::<Vec<_>>(),
+			vec![second]
+		);
+		index
+			.apply(PersistentIndexUpdate {
+				put_tiered_slabs: vec![saved],
+				completed_metadata_token: Some((
+					pointer.slab_id,
+					MetadataKind::Supersession,
+					second,
+				)),
+				..Default::default()
+			})
+			.await
+			.unwrap();
+		assert!(
+			index
+				.load_pending_metadata_tokens()
+				.await
+				.unwrap()
+				.is_empty()
+		);
+		assert!(
+			index.load_snapshot().await.unwrap().tiered_slabs[0]
+				.supersession_metadata
+				.is_untracked()
+		);
+	}
+
 	fn generous_bounds() -> ReceiptLoadBounds {
 		ReceiptLoadBounds {
 			max_rows: 1 << 16,
@@ -1932,7 +4619,9 @@ mod tests {
 	#[tokio::test]
 	async fn secondary_index_segments_persist_across_snapshot_and_delete() {
 		let (_dir, path) = temp_path("secondary-index-segment");
-		let index = PersistentLocalIndex::open(path).await.unwrap();
+		let index = PersistentLocalIndex::initialize_new(path, None)
+			.await
+			.unwrap();
 		let row = secondary_index_segment_row();
 		index
 			.upsert_secondary_index_segment(row.clone())
@@ -1947,9 +4636,137 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn lsm_install_intent_survives_reopen_and_requires_exact_clear() {
+		let (_dir, path) = temp_path("lsm-install-intent");
+		let index = PersistentLocalIndex::initialize_new(path.clone(), None)
+			.await
+			.unwrap();
+		let commit = crate::storage::lsm::CompactionCommit::gc_remove(
+			crate::schema::CompactionJobId::new(5),
+			ManifestEpoch::new(3),
+			vec![SlabId::new(51)],
+		);
+		let commit_digest = *blake3::hash(&serde_json::to_vec(&commit).unwrap()).as_bytes();
+		let intent = LsmInstallIntent {
+			kind: LsmInstallKind::Control,
+			phase: LsmInstallPhase::Prepared,
+			local_input_rows_digest: [0; 32],
+			local_output_rows_digest: [0; 32],
+			local_input_runs: Vec::new(),
+			local_input_files: Vec::new(),
+			local_output_files: Vec::new(),
+			commit,
+			commit_digest,
+			inputs: vec![LsmInputAuthority {
+				slab_id: SlabId::new(51),
+				revision: 7,
+				tiered: None,
+			}],
+		};
+		index.put_lsm_install_intent(intent.clone()).await.unwrap();
+		index.put_lsm_install_intent(intent.clone()).await.unwrap();
+		index.rebuild(Vec::new(), Vec::new(), None).await.unwrap();
+		drop(index);
+		let index = PersistentLocalIndex::open(path).await.unwrap();
+		assert_eq!(
+			index.load_snapshot().await.unwrap().lsm_install_intents,
+			vec![intent.clone()]
+		);
+		let mut stale = intent.clone();
+		stale.inputs[0].revision += 1;
+		assert!(index.clear_lsm_install_intent(stale).await.is_err());
+		assert_eq!(
+			index.load_snapshot().await.unwrap().lsm_install_intents,
+			vec![intent.clone()]
+		);
+		index.clear_lsm_install_intent(intent).await.unwrap();
+		assert!(
+			index
+				.load_snapshot()
+				.await
+				.unwrap()
+				.lsm_install_intents
+				.is_empty()
+		);
+	}
+
+	#[tokio::test]
+	async fn lost_lsm_install_intent_table_is_not_treated_as_empty() {
+		let (_dir, path) = temp_path("lsm-install-intent-lost");
+		let index = PersistentLocalIndex::initialize_new(path.clone(), None)
+			.await
+			.unwrap();
+		drop(index);
+		{
+			let db = Database::create(&path).unwrap();
+			let tx = db.begin_write().unwrap();
+			tx.delete_table(LSM_INSTALL_INTENTS_TABLE).unwrap();
+			tx.commit().unwrap();
+		}
+		assert!(PersistentLocalIndex::open(path).await.is_err());
+	}
+
+	#[tokio::test]
+	async fn cancelled_guarded_delta_keeps_gate_until_blocking_commit_finishes() {
+		let (_dir, path) = temp_path("guarded-redb-delta");
+		let index = std::sync::Arc::new(
+			PersistentLocalIndex::initialize_new(path, None)
+				.await
+				.unwrap(),
+		);
+		let gate = std::sync::Arc::new(tokio::sync::RwLock::new(()));
+		let read = std::sync::Arc::new(gate.clone().read_owned().await);
+		let entered = std::sync::Arc::new(std::sync::Barrier::new(2));
+		let release = std::sync::Arc::new(std::sync::Barrier::new(2));
+		*index.guarded_delta_commit_hold.lock().unwrap() = Some((entered.clone(), release.clone()));
+		let expected = row();
+		let task = {
+			let index = index.clone();
+			let expected = expected.clone();
+			tokio::spawn(async move {
+				index
+					.apply_with_publication_guard(
+						PersistentIndexUpdate {
+							put_records: vec![expected],
+							..Default::default()
+						},
+						Some(read),
+					)
+					.await
+			})
+		};
+		tokio::task::spawn_blocking(move || entered.wait())
+			.await
+			.unwrap();
+		task.abort();
+		assert!(task.await.unwrap_err().is_cancelled());
+		let writer = gate.clone();
+		let mut exclusive = tokio::spawn(async move { writer.write_owned().await });
+		assert!(
+			tokio::time::timeout(std::time::Duration::from_millis(200), &mut exclusive)
+				.await
+				.is_err()
+		);
+		tokio::task::spawn_blocking(move || release.wait())
+			.await
+			.unwrap();
+		drop(exclusive.await.unwrap());
+		assert!(
+			index
+				.load_snapshot()
+				.await
+				.unwrap()
+				.record_rows
+				.contains(&expected)
+		);
+	}
+
+	#[tokio::test]
 	async fn lsm_runs_persist_across_snapshot_and_delete() {
 		let (_dir, path) = temp_path("lsm-runs");
-		let index = PersistentLocalIndex::open(path).await.unwrap();
+		let index = PersistentLocalIndex::initialize_new(path, None)
+			.await
+			.unwrap();
 		let run = lsm_run();
 		index
 			.apply(PersistentIndexUpdate {
@@ -1975,7 +4792,9 @@ mod tests {
 	#[tokio::test]
 	async fn rebuild_preserves_existing_secondary_index_segments() {
 		let (_dir, path) = temp_path("secondary-index-preserve");
-		let index = PersistentLocalIndex::open(path).await.unwrap();
+		let index = PersistentLocalIndex::initialize_new(path, None)
+			.await
+			.unwrap();
 		let segment = secondary_index_segment_row();
 		index
 			.rebuild_with_secondary_index_segments(
@@ -1998,7 +4817,9 @@ mod tests {
 	#[tokio::test]
 	async fn snapshot_only_surfaces_tiered_records() {
 		let (_dir, path) = temp_path("snapshot");
-		let index = PersistentLocalIndex::open(path).await.unwrap();
+		let index = PersistentLocalIndex::initialize_new(path, None)
+			.await
+			.unwrap();
 		let tiered_pointer = TieredSlabPointer {
 			slab_id: SlabId::new(41),
 			l2_uri: "file:///tmp/tiered".into(),
@@ -2047,7 +4868,9 @@ mod tests {
 	#[tokio::test]
 	async fn tiered_update_stamps_monotonic_control_log_index() {
 		let (_dir, path) = temp_path("watermark");
-		let index = PersistentLocalIndex::open(path).await.unwrap();
+		let index = PersistentLocalIndex::initialize_new(path, None)
+			.await
+			.unwrap();
 		let pointer = TieredSlabPointer {
 			slab_id: SlabId::new(9),
 			l2_uri: "file:///tmp/tiered-watermark".into(),
@@ -2095,7 +4918,9 @@ mod tests {
 	#[tokio::test]
 	async fn a_rebuild_leaves_maintenance_receipts_untouched() {
 		let (_dir, path) = temp_path("adr0097-receipt-rebuild");
-		let index = PersistentLocalIndex::open(path).await.unwrap();
+		let index = PersistentLocalIndex::initialize_new(path, None)
+			.await
+			.unwrap();
 		index
 			.put_maintenance_receipt(vec![0, 11, 0, 0, 0, 0, 0, 0, 0, 5], vec![1, 2, 3])
 			.await
@@ -2126,7 +4951,9 @@ mod tests {
 	#[tokio::test]
 	async fn receipt_load_refuses_rows_over_its_bounds() {
 		let (_dir, path) = temp_path("adr0097-receipt-bounds");
-		let index = PersistentLocalIndex::open(path).await.unwrap();
+		let index = PersistentLocalIndex::initialize_new(path, None)
+			.await
+			.unwrap();
 		for slab in 1..=3u8 {
 			index
 				.put_maintenance_receipt(vec![0, 11, 0, 0, 0, 0, 0, 0, 0, slab], vec![1; 8])
@@ -2196,7 +5023,9 @@ mod tests {
 		let (_dir, path) = temp_path("adr0097-receipt-marker");
 
 		// A store with ordinary index history AND a receipt.
-		let index = PersistentLocalIndex::open(path.clone()).await.unwrap();
+		let index = PersistentLocalIndex::initialize_new(path.clone(), None)
+			.await
+			.unwrap();
 		assert!(
 			index.receipts_available(),
 			"a fresh store initializes its receipt table"
@@ -2240,7 +5069,9 @@ mod tests {
 	#[tokio::test]
 	async fn a_fresh_store_initializes_receipts_and_reopens_available() {
 		let (_dir, path) = temp_path("adr0097-receipt-fresh");
-		let index = PersistentLocalIndex::open(path.clone()).await.unwrap();
+		let index = PersistentLocalIndex::initialize_new(path.clone(), None)
+			.await
+			.unwrap();
 		assert!(index.receipts_available());
 		assert!(
 			index
@@ -2265,6 +5096,63 @@ mod tests {
 		);
 
 		let _ = std::fs::remove_file(&path);
+	}
+	#[tokio::test]
+	async fn lsm_output_and_intent_phase_commit_atomically_and_clear_exactly() {
+		let (_dir, path) = temp_path("lsm-phase-atomic");
+		let index = PersistentLocalIndex::initialize_new(path, None)
+			.await
+			.unwrap();
+		let commit = crate::storage::lsm::CompactionCommit::gc_remove(
+			crate::schema::CompactionJobId::new(55),
+			ManifestEpoch::new(3),
+			vec![SlabId::new(51)],
+		);
+		let intent = LsmInstallIntent {
+			kind: LsmInstallKind::Local,
+			phase: LsmInstallPhase::Prepared,
+			commit_digest: *blake3::hash(&serde_json::to_vec(&commit).unwrap()).as_bytes(),
+			commit,
+			inputs: Vec::new(),
+			local_input_rows_digest: [0; 32],
+			local_output_rows_digest: [0; 32],
+			local_input_runs: Vec::new(),
+			local_input_files: Vec::new(),
+			local_output_files: Vec::new(),
+		};
+		index.put_lsm_install_intent(intent.clone()).await.unwrap();
+		let mut published = intent.clone();
+		published.phase = LsmInstallPhase::OutputsPublished;
+		let mut wrong = intent.clone();
+		wrong.local_input_rows_digest[0] = 1;
+		let mut wrong_published = wrong.clone();
+		wrong_published.phase = LsmInstallPhase::OutputsPublished;
+		assert!(
+			index
+				.apply(PersistentIndexUpdate {
+					lsm_intent_transition: Some((wrong, wrong_published)),
+					put_records: vec![row()],
+					..Default::default()
+				})
+				.await
+				.is_err()
+		);
+		let snapshot = index.load_snapshot().await.unwrap();
+		assert!(snapshot.record_rows.is_empty());
+		assert_eq!(snapshot.lsm_install_intents, vec![intent.clone()]);
+		index
+			.apply(PersistentIndexUpdate {
+				lsm_intent_transition: Some((intent.clone(), published.clone())),
+				put_records: vec![row()],
+				..Default::default()
+			})
+			.await
+			.unwrap();
+		let snapshot = index.load_snapshot().await.unwrap();
+		assert_eq!(snapshot.record_rows, vec![row()]);
+		assert_eq!(snapshot.lsm_install_intents, vec![published.clone()]);
+		assert!(index.clear_lsm_install_intent(intent).await.is_err());
+		index.clear_lsm_install_intent(published).await.unwrap();
 	}
 }
 
@@ -2389,5 +5277,156 @@ mod adr0090_record_value_versions {
 				"length {len} is not a known version and must be refused"
 			);
 		}
+	}
+	#[tokio::test]
+	async fn snapshot_retirement_marks_survive_reopen_and_conflicts_roll_back() {
+		let dir = crate::test_support::TestDir::new("snapshot-retirement-marks");
+		let path = dir.join("index.redb");
+		let index = PersistentLocalIndex::initialize_new(path.clone(), None)
+			.await
+			.unwrap();
+		let pointer = TieredSlabPointer {
+			slab_id: SlabId::new(3),
+			l2_uri: "tier/old".into(),
+			payload_hash: [7; 32],
+			is_encrypted: false,
+			tenant_id: None,
+			tenant_kek_id: None,
+			stats_format_version: None,
+			stats_block_len: None,
+			stats_block_hash128: None,
+			tombstone_metadata: TombstoneMetadata::None,
+			supersession_metadata: SupersessionMetadata::None,
+		};
+		index
+			.apply(PersistentIndexUpdate {
+				put_tiered_slabs: vec![pointer.clone()],
+				..Default::default()
+			})
+			.await
+			.unwrap();
+		let epoch = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(7));
+		let gate = std::sync::Arc::new(std::sync::RwLock::new(()));
+		let mark = SnapshotRetirementMark {
+			epoch: 7,
+			snapshot_index: Some(50),
+			pointer: pointer.clone(),
+		};
+		index
+			.stage_snapshot_retirement_marks(
+				vec![mark.clone()],
+				HashSet::new(),
+				7,
+				epoch.clone(),
+				gate.clone(),
+			)
+			.await
+			.unwrap();
+		drop(index);
+		let index = PersistentLocalIndex::open(path).await.unwrap();
+		assert_eq!(
+			index.load_snapshot_retirement_marks().await.unwrap(),
+			vec![mark.clone()]
+		);
+		let mut stale = mark.clone();
+		stale.pointer.l2_uri = "tier/not-current".into();
+		assert!(
+			index
+				.stage_snapshot_retirement_marks(
+					vec![stale],
+					HashSet::new(),
+					7,
+					epoch.clone(),
+					gate.clone()
+				)
+				.await
+				.is_err()
+		);
+		assert_eq!(
+			index.load_snapshot_retirement_marks().await.unwrap(),
+			vec![mark.clone()]
+		);
+		assert_eq!(index.snapshot_retirement_epoch_floor().await.unwrap(), 7);
+		epoch.store(8, std::sync::atomic::Ordering::Release);
+		let error = index
+			.stage_snapshot_retirement_marks(
+				vec![mark.clone()],
+				HashSet::new(),
+				7,
+				epoch.clone(),
+				gate.clone(),
+			)
+			.await
+			.unwrap_err();
+		assert_eq!(error.kind(), ErrorKind::Interrupted);
+		assert_eq!(
+			index.load_snapshot_retirement_marks().await.unwrap(),
+			vec![mark]
+		);
+		index
+			.stage_snapshot_retirement_marks(
+				vec![],
+				HashSet::from([pointer.slab_id]),
+				8,
+				epoch.clone(),
+				gate.clone(),
+			)
+			.await
+			.unwrap();
+		assert!(
+			index
+				.load_snapshot_retirement_marks()
+				.await
+				.unwrap()
+				.is_empty()
+		);
+		assert_eq!(index.snapshot_retirement_epoch_floor().await.unwrap(), 8);
+	}
+	#[tokio::test]
+	async fn b2_aborted_candidate_keeps_all_prior_publication_history() {
+		let _dir = crate::test_support::TestDir::new("b2-history");
+		let path = _dir.join("index.redb");
+		let index = PersistentLocalIndex::initialize_new(path, None)
+			.await
+			.unwrap();
+		let slab = SlabId::new(7);
+		let old = RetainedObjectIntent {
+			bytes: Some(100),
+			replacement_uri: Some("new".into()),
+			replacement_bytes: Some(200),
+			published_replacements: std::collections::BTreeSet::from(["prior".into()]),
+			retirement_source: Some(RetirementSource::Log(11)),
+			state: RetainedObjectIntentState::Unresolved,
+		};
+		let candidate = RetainedObjectIntent {
+			bytes: Some(200),
+			replacement_uri: Some("new".into()),
+			replacement_bytes: None,
+			published_replacements: Default::default(),
+			retirement_source: None,
+			state: RetainedObjectIntentState::CandidateNotSubmitted,
+		};
+		index
+			.put_cleanup_intent_pair(slab, "old".into(), old, Some(("new".into(), candidate)))
+			.await
+			.unwrap();
+		index
+			.clear_unsubmitted_tier_candidate(slab, "new".into(), vec!["old".into()])
+			.await
+			.unwrap();
+		let records = index.load_snapshot_cleanup_intents().await.unwrap();
+		assert_eq!(records.len(), 1);
+		let (saved_slab, uri, saved) = &records[0];
+		assert_eq!(*saved_slab, slab);
+		assert_eq!(uri, "old");
+		assert!(saved.was_published("prior"));
+		assert!(
+			!saved.was_published("new"),
+			"aborted replacement is not publication evidence"
+		);
+		assert_eq!(saved.retirement_source, Some(RetirementSource::Log(11)));
+		assert_eq!(saved.bytes, Some(100));
+		assert_eq!(saved.replacement_uri, None);
+		assert_eq!(saved.replacement_bytes, None);
 	}
 }

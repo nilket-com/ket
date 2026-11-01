@@ -1,4 +1,4 @@
-use super::units::{Identity, TenantId};
+use super::units::{Identity, Locality, TenantId};
 use arrow::datatypes::{DataType, Field, Schema};
 use bytemuck::{Pod, Zeroable};
 use serde::{Deserialize, Serialize};
@@ -729,7 +729,7 @@ impl MsgType {
 	pub const COUNTER_ADD_REQ: Self = Self(0x4C);
 	pub const COUNTER_ADD_RESP: Self = Self(0x4D);
 	// ADR 075 cut-5b: the public counter point-read. A counter value is stored as a
-	// framed `CounterTentativeFrame` (record class COUNTER_TENTATIVE), NOT an Arrow
+	// origin-bearing counter frame (record class COUNTER_TENTATIVE_V2), not an Arrow
 	// value batch, so the blob READ_REQ path (which decodes the body as an Arrow
 	// batch) cannot read it — counters need their own point-read op over the
 	// counter-aware reader. Free slots after the current max (0x4D).
@@ -1795,7 +1795,7 @@ pub struct QueryResponseMeta {
 }
 
 // ============================================================
-//  MIGRATE REQUEST METADATA — 160 bytes, fixed
+//  MIGRATE REQUEST METADATA — 176 bytes, fixed
 //
 //  Lazy-migration pull frame (ADR 006 + Plan 019). The new owner
 //  asks a prior physical holder for retained versions in its
@@ -1833,26 +1833,25 @@ pub struct MigrateRequestMeta {
 	/// fall outside the ADR 013 retention window and are skipped.
 	/// Must match the floor stored on the server's ledger entry.
 	pub migration_hlc_floor: HybridTimestamp, // 16
-	/// Pagination cursor — the exact record identity the prior page
-	/// stopped within. Zero together with `cursor_hlc` means "start
-	/// at the range floor"; non-zero means the source was in the
-	/// middle of emitting versions for this identity when
-	/// `max_records` / `max_bytes` tripped.
+	/// The prior page's last emitted version: a [`MigrationCursor`]
+	/// spread over `cursor_identity`, `cursor_hlc`, `cursor_tenant` and
+	/// `cursor_locality`, tagged by `cursor_present`. The source resumes
+	/// strictly after it, mid-key for a fat key. Read and write it only
+	/// through [`Self::cursor`] and [`Self::with_cursor`].
 	pub cursor_identity: Identity, // 32
-	/// HLC of the last version emitted for `cursor_identity` on the
-	/// prior page. Combined with `cursor_identity`, it lets the
-	/// source resume strictly after the last emitted MVCC slot so a
-	/// fat key with more versions than fit in one page is still
-	/// streamed exhaustively.
 	pub cursor_hlc: HybridTimestamp, // 16
+	pub cursor_tenant: TenantId, //  8
+	pub cursor_locality: Locality, //  8
 	/// Server-enforced caps on the response size.
 	pub max_records: u32, //  4
 	pub max_bytes: u32,    //  4
 	/// 0 = PointLookup, 1 = RangePage. Point lookups return every
 	/// retained version of exactly one key; range pages walk the
-	/// inclusive window keyed by `(cursor_identity, cursor_hlc)`.
+	/// inclusive window, resuming after the cursor.
 	pub kind: MigrateRequestKind, //  1
-	pub _pad: [u8; 7],     //  7
+	/// [`MIGRATION_CURSOR_ABSENT`] or [`MIGRATION_CURSOR_PRESENT`].
+	pub cursor_present: u8, //  1
+	pub _pad: [u8; 6],     //  6
 }
 
 /// Request kind discriminant rides inside [`MigrateRequestMeta`].
@@ -1873,30 +1872,33 @@ impl MigrateRequestKind {
 }
 
 // ============================================================
-//  MIGRATE RESPONSE METADATA — 64 bytes, fixed
+//  MIGRATE RESPONSE METADATA — 104 bytes, fixed
 // ============================================================
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
 #[repr(C)]
 pub struct MigrateResponseMeta {
 	pub status: MigrateStatus, //  1
-	/// 1 when the server has more pages beyond
-	/// `(next_cursor_identity, next_cursor_hlc)`; 0 when this response
-	/// exhausted the source for the pinned floor.
+	/// 1 when the server has more pages beyond the next cursor; 0 when
+	/// this response exhausted the source for the pinned floor.
 	pub has_more: u8, //  1
-	pub _pad0: [u8; 6],        //  6
+	/// [`MIGRATION_CURSOR_ABSENT`] or [`MIGRATION_CURSOR_PRESENT`].
+	pub next_cursor_present: u8, //  1
+	pub _pad0: [u8; 5],        //  5
 	/// Echo of the request's `migration_id` so the caller can
 	/// correlate responses from fan-out pulls.
 	pub migration_id: u64, //  8
 	/// Populated on `REDIRECT` — the node the caller should retry
 	/// against. Zero for every other status.
 	pub source_hint: NodeId, //  8
-	/// Identity at which pagination should resume. Zero together
-	/// with `next_cursor_hlc` when `has_more == 0`.
+	/// This page's last emitted version, the cursor the follow-up
+	/// request echoes: a [`MigrationCursor`] spread over the four
+	/// `next_cursor_*` fields and tagged by `next_cursor_present`. Read
+	/// and write it only through [`Self::next_cursor`] and
+	/// [`Self::with_next_cursor`].
 	pub next_cursor_identity: Identity, // 32
-	/// HLC of the last version emitted on this page for
-	/// `next_cursor_identity`. The follow-up request must skip
-	/// versions at or below this HLC so fat keys stream cleanly.
 	pub next_cursor_hlc: HybridTimestamp, // 16
+	pub next_cursor_tenant: TenantId, //  8
+	pub next_cursor_locality: Locality, //  8
 	/// Number of retained versions packed into the response Arrow
 	/// batch. Lets the caller pre-size its ingest loop.
 	pub versions_returned: u64, //  8
@@ -1905,6 +1907,115 @@ pub struct MigrateResponseMeta {
 	/// with the other response PODs in this module.
 	pub bytes_returned: u32, //  4
 	pub _pad1: [u8; 4],        //  4
+}
+
+/// Where a migration range page resumes: the last version a page emitted,
+/// in exactly the order pages are produced. One type orders the scan,
+/// filters its resume and crosses the wire, so the three cannot disagree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct MigrationCursor {
+	pub locality: Locality,
+	pub tenant_id: TenantId,
+	pub key_identity: Identity,
+	pub hlc: HybridTimestamp,
+}
+
+/// Wire tag: no cursor; the page starts at the range floor.
+pub const MIGRATION_CURSOR_ABSENT: u8 = 0;
+/// Wire tag: the cursor fields hold a [`MigrationCursor`], which may be all
+/// zero.
+pub const MIGRATION_CURSOR_PRESENT: u8 = 1;
+
+type MigrationCursorFields = (u8, Locality, TenantId, Identity, HybridTimestamp);
+
+fn encode_migration_cursor(cursor: Option<MigrationCursor>) -> MigrationCursorFields {
+	match cursor {
+		Some(cursor) => (
+			MIGRATION_CURSOR_PRESENT,
+			cursor.locality,
+			cursor.tenant_id,
+			cursor.key_identity,
+			cursor.hlc,
+		),
+		None => (
+			MIGRATION_CURSOR_ABSENT,
+			Locality::new(0),
+			TenantId::ZERO,
+			Identity::ZERO,
+			Zeroable::zeroed(),
+		),
+	}
+}
+
+fn decode_migration_cursor(
+	fields: MigrationCursorFields,
+) -> Result<Option<MigrationCursor>, Error> {
+	let (tag, locality, tenant_id, key_identity, hlc) = fields;
+	match tag {
+		MIGRATION_CURSOR_PRESENT => Ok(Some(MigrationCursor {
+			locality,
+			tenant_id,
+			key_identity,
+			hlc,
+		})),
+		MIGRATION_CURSOR_ABSENT if fields == encode_migration_cursor(None) => Ok(None),
+		MIGRATION_CURSOR_ABSENT => Err(Error::new(
+			ErrorKind::InvalidData,
+			"an absent migration cursor carries cursor fields",
+		)),
+		other => Err(Error::new(
+			ErrorKind::InvalidData,
+			format!("unknown migration cursor tag {other}"),
+		)),
+	}
+}
+
+impl MigrateRequestMeta {
+	/// The cursor this request resumes after, if any.
+	pub fn cursor(&self) -> Result<Option<MigrationCursor>, Error> {
+		decode_migration_cursor((
+			self.cursor_present,
+			self.cursor_locality,
+			self.cursor_tenant,
+			self.cursor_identity,
+			self.cursor_hlc,
+		))
+	}
+
+	pub fn with_cursor(mut self, cursor: Option<MigrationCursor>) -> Self {
+		(
+			self.cursor_present,
+			self.cursor_locality,
+			self.cursor_tenant,
+			self.cursor_identity,
+			self.cursor_hlc,
+		) = encode_migration_cursor(cursor);
+		self
+	}
+}
+
+impl MigrateResponseMeta {
+	/// The cursor the follow-up request resumes after, if any.
+	pub fn next_cursor(&self) -> Result<Option<MigrationCursor>, Error> {
+		decode_migration_cursor((
+			self.next_cursor_present,
+			self.next_cursor_locality,
+			self.next_cursor_tenant,
+			self.next_cursor_identity,
+			self.next_cursor_hlc,
+		))
+	}
+
+	pub fn with_next_cursor(mut self, cursor: Option<MigrationCursor>) -> Self {
+		(
+			self.next_cursor_present,
+			self.next_cursor_locality,
+			self.next_cursor_tenant,
+			self.next_cursor_identity,
+			self.next_cursor_hlc,
+		) = encode_migration_cursor(cursor);
+		self
+	}
 }
 
 /// Wire status byte for [`MigrateResponseMeta`].
@@ -1970,32 +2081,28 @@ pub struct SlabRecordHeader {
 pub mod record_class {
 	/// Ordinary blob / Arrow record — recovered exactly as before ADR 075.
 	pub const STANDARD: u32 = 0;
-	/// A counter tentative-value frame ([`super::CounterTentativeFrame`]). Its
-	/// op-id is its durable record offset; recovery indexes it only if a
-	/// matching commit marker exists.
+	/// Retired tentative tag. Finding it at open refuses the obsolete format;
+	/// its value is never decoded or indexed.
 	pub const COUNTER_TENTATIVE: u32 = 1;
-	/// A counter commit-marker frame ([`super::CounterCommitFrame`]) naming the
-	/// tentative op-id (offset) that is now committed.
+	/// Retired commit-marker tag, rejected at open without decoding.
 	pub const COUNTER_COMMIT: u32 = 2;
-	/// Origin-bearing counter frames; legacy classes remain read-only.
+	/// Current origin-bearing counter frames; obsolete classes above refuse open.
 	pub const COUNTER_TENTATIVE_V2: u32 = 3;
 	pub const COUNTER_COMMIT_V2: u32 = 4;
 }
 
-/// ADR 075 counter tentative-value frame: the durable little-endian `u64`
-/// counter value. The op-id is the record's durable offset (unique, never
-/// reused — the write cursor resumes past it on restart), so the frame itself
-/// carries only the value; the paired [`CounterCommitFrame`] references that
-/// offset. A point read of a committed counter reads exactly these 8 bytes.
+/// Little-endian value prefix of a current counter tentative. The complete
+/// origin-bearing frame appends the origin to this prefix; obsolete class-1
+/// records containing only the value are not accepted at open.
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 #[repr(C)]
 pub struct CounterTentativeFrame {
 	pub value: u64,
 }
 
-/// ADR 075 counter commit-marker frame: references the tentative record's
-/// op-id (its durable offset). Recovery indexes a tentative value only if a
-/// commit marker for its offset exists; orphan tentatives are skipped.
+/// Little-endian tentative-offset prefix of a current counter marker. The
+/// complete frame also carries its origin. This prefix alone is not a valid
+/// class-2 record in the current store format.
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 #[repr(C)]
 pub struct CounterCommitFrame {
@@ -2294,8 +2401,8 @@ const _: () = assert!(std::mem::size_of::<ReadRequestMeta>() == 96);
 const _: () = assert!(std::mem::size_of::<ReadResponseMeta>() == 56);
 const _: () = assert!(std::mem::size_of::<QueryRequestMeta>() == 80);
 const _: () = assert!(std::mem::size_of::<QueryResponseMeta>() == 56);
-const _: () = assert!(std::mem::size_of::<MigrateRequestMeta>() == 160);
-const _: () = assert!(std::mem::size_of::<MigrateResponseMeta>() == 88);
+const _: () = assert!(std::mem::size_of::<MigrateRequestMeta>() == 176);
+const _: () = assert!(std::mem::size_of::<MigrateResponseMeta>() == 104);
 const _: () = assert!(std::mem::size_of::<MigrateRequestKind>() == 1);
 const _: () = assert!(std::mem::size_of::<MigrateStatus>() == 1);
 const _: () = assert!(std::mem::size_of::<SlabRecordHeader>() == 72);

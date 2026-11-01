@@ -1,13 +1,185 @@
 //! Slab manager initialization, carved without changing recovery order.
 use super::*;
 
+/// Explicit capability, minted only after a restore intent and control replay agree.
+pub(crate) struct IndexRecoveryAuthority {
+	owner: DataDirectoryOwner,
+}
+impl IndexRecoveryAuthority {
+	pub(crate) fn verified_restore(owner: DataDirectoryOwner) -> Self {
+		Self { owner }
+	}
+	fn check(&self, owner: &DataDirectoryOwner, dir: &std::path::Path) -> std::io::Result<()> {
+		if !self.owner.same_owner(owner) {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				"index recovery authority belongs to another owner",
+			));
+		}
+		owner.ensure_path(dir)
+	}
+}
+
+/// Durable rows recovery could not find in the recovered index. Opening would
+/// serve those keys without them and the rebuild would erase their rows, so
+/// the open refuses. The diagnostic carries no row key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct UnaccountedDurableVersions {
+	pub versions: usize,
+	pub slabs: BTreeSet<SlabId>,
+}
+
+impl std::fmt::Display for UnaccountedDurableVersions {
+	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(
+			formatter,
+			"{} durable record versions in slabs {:?} were not recovered; recovery refused",
+			self.versions, self.slabs
+		)
+	}
+}
+impl std::error::Error for UnaccountedDurableVersions {}
+
+/// Each durable version with the table it is attributed to, if any.
+type DurableVersions = HashMap<(TenantId, Identity, RecordLocation), Option<TableObjectId>>;
+
+/// A typed row the recovered index lacks is accounted for only by its table's
+/// published-reference fence: that fence refuses every read of the table and
+/// keeps the durable index from being rebuilt. Untyped rows have no such
+/// fence, so for them the open itself refuses.
+fn refuse_unaccounted_durable_versions(
+	manager: &SlabManager,
+	mut durable_versions: DurableVersions,
+) -> std::io::Result<()> {
+	for entry in manager.key_index.iter() {
+		let (tenant_id, key_identity) = *entry.key();
+		for location in entry.value() {
+			durable_versions.remove(&(tenant_id, key_identity, *location));
+		}
+	}
+	durable_versions.retain(|&(tenant_id, _, _), table_object_id| {
+		table_object_id.is_none_or(|table_object_id| {
+			manager
+				.table_integrity_failure(tenant_id, table_object_id)
+				.is_none()
+		})
+	});
+	if durable_versions.is_empty() {
+		return Ok(());
+	}
+	let slabs = durable_versions
+		.keys()
+		.map(|(_, _, location)| location.slab_id)
+		.collect();
+	Err(Error::new(
+		ErrorKind::InvalidData,
+		UnaccountedDurableVersions {
+			versions: durable_versions.len(),
+			slabs,
+		},
+	))
+}
+
 impl SlabManager {
+	pub(crate) async fn initialize_recovered_store_with_owner(
+		config: SlabManagerConfig,
+		owner: DataDirectoryOwner,
+		authority: &IndexRecoveryAuthority,
+	) -> std::io::Result<Arc<Self>> {
+		authority.check(&owner, &config.dir)?;
+		Self::initialize_new_store_with_owner(config, owner).await
+	}
+
+	#[cfg(feature = "test-support")]
+	pub(crate) async fn initialize_recovered_store_with_file_ops_and_owner(
+		config: SlabManagerConfig,
+		file_ops: Arc<dyn AsyncFileOps>,
+		owner: DataDirectoryOwner,
+		authority: &IndexRecoveryAuthority,
+	) -> std::io::Result<Arc<Self>> {
+		authority.check(&owner, &config.dir)?;
+		Self::initialize_new_store_with_file_ops_and_owner(config, file_ops, owner).await
+	}
+
+	/// Explicitly initialize a new store; the caller must establish Fresh.
+	#[cfg(any(test, feature = "test-support"))]
+	pub async fn initialize_new_store(config: SlabManagerConfig) -> std::io::Result<Arc<Self>> {
+		Self::open_shared(
+			config,
+			None,
+			crate::metrics::global(),
+			true,
+			#[cfg(any(test, feature = "test-support"))]
+			None,
+		)
+		.await
+	}
+
+	/// Initialize a new owner-bound store after the node establishes Fresh.
+	pub async fn initialize_new_store_with_owner(
+		config: SlabManagerConfig,
+		owner: DataDirectoryOwner,
+	) -> std::io::Result<Arc<Self>> {
+		Self::open_shared(
+			config,
+			Some(owner),
+			crate::metrics::global(),
+			true,
+			#[cfg(any(test, feature = "test-support"))]
+			None,
+		)
+		.await
+	}
+
+	#[cfg(any(test, feature = "test-support"))]
+	pub(crate) async fn initialize_new_store_with_file_ops_and_owner(
+		config: SlabManagerConfig,
+		file_ops: Arc<dyn AsyncFileOps>,
+		owner: DataDirectoryOwner,
+	) -> std::io::Result<Arc<Self>> {
+		Self::open_shared(
+			config,
+			Some(owner),
+			crate::metrics::global(),
+			true,
+			Some(file_ops),
+		)
+		.await
+	}
+
+	#[cfg(any(test, feature = "test-support"))]
+	pub async fn initialize_new_store_with_file_ops(
+		config: SlabManagerConfig,
+		file_ops: Arc<dyn AsyncFileOps>,
+	) -> std::io::Result<Arc<Self>> {
+		Self::open_shared(config, None, crate::metrics::global(), true, Some(file_ops)).await
+	}
+
+	#[cfg(test)]
+	pub(crate) async fn initialize_new_store_with_maintenance_metrics(
+		config: SlabManagerConfig,
+		metrics: &'static crate::metrics::MetricsRegistry,
+	) -> std::io::Result<Arc<Self>> {
+		Self::open_shared(
+			config,
+			None,
+			metrics,
+			true,
+			#[cfg(any(test, feature = "test-support"))]
+			None,
+		)
+		.await
+	}
+
 	pub(super) async fn open_shared(
 		mut config: SlabManagerConfig,
 		owner: Option<DataDirectoryOwner>,
 		maintenance_metrics: &'static crate::metrics::MetricsRegistry,
-		#[cfg(feature = "test-support")] file_ops_override: Option<Arc<dyn AsyncFileOps>>,
-	) -> std::io::Result<Self> {
+		initialize_index: bool,
+		#[cfg(any(test, feature = "test-support"))] file_ops_override: Option<
+			Arc<dyn AsyncFileOps>,
+		>,
+	) -> std::io::Result<Arc<Self>> {
 		if let Some(owner) = &owner {
 			owner.ensure_contains(&config.dir)?;
 			config.io = config
@@ -33,13 +205,13 @@ impl SlabManager {
 			));
 		}
 
-		#[cfg(not(feature = "test-support"))]
+		#[cfg(not(any(test, feature = "test-support")))]
 		let file_ops: Arc<dyn AsyncFileOps> = Arc::new(IoUringFileOps::with_isolated_blocking(
 			config.io.clone(),
 			"wendelon-fs-meta-slab",
 			BlockingIoClass::SlabMetadata,
 		)?);
-		#[cfg(feature = "test-support")]
+		#[cfg(any(test, feature = "test-support"))]
 		let file_ops: Arc<dyn AsyncFileOps> = match file_ops_override {
 			Some(file_ops) => match &owner {
 				Some(owner) => file_ops.bind_directory_owner(owner.clone())?,
@@ -55,13 +227,19 @@ impl SlabManager {
 		// slab discovery. Reconcile them before every discovery/allocator step so
 		// a committed S1 publication reaches its final path and an S0 file cannot
 		// reserve an id by accident on a rebuilt manager.
-		let persistent_index = match PersistentLocalIndex::open_with_owner(
-			persistent_index_path(&config.dir),
-			owner.clone(),
-		)
-		.await
-		{
+		let awaiting_cluster = file_ops
+			.file_len(&config.dir.join(AWAITING_CLUSTER_MARKER))
+			.await?
+			.is_some();
+		let index_path = persistent_index_path(&config.dir);
+		let index_result = if initialize_index {
+			PersistentLocalIndex::initialize_new(index_path, owner.clone()).await
+		} else {
+			PersistentLocalIndex::open_with_owner(index_path, owner.clone()).await
+		};
+		let persistent_index = match index_result {
 			Ok(index) => Some(Arc::new(index)),
+			Err(err) if initialize_index => return Err(err),
 			Err(err) => {
 				tracing::warn!(
 					error = %err,
@@ -71,55 +249,251 @@ impl SlabManager {
 				None
 			}
 		};
-		// ADR 0099: the durable rows double as slab recovery's boundary
-		// oracle. A row exists only for a record that was fdatasynced and
-		// then acknowledged, so its offset is a place the walk may resume
-		// after an anomaly. Without redb there is no oracle and recovery
-		// stops at the first anomaly.
-		let mut acknowledged_by_slab: Option<BTreeMap<SlabId, BTreeSet<u64>>> = None;
-		let staged_runs = match &persistent_index {
+		let pending_metadata_tokens = DashMap::new();
+		if let Some(index) = &persistent_index {
+			index.recover_metadata_tokens().await?;
+			for (slab, tokens) in index.load_pending_metadata_tokens().await? {
+				pending_metadata_tokens.insert(slab, tokens);
+			}
+		}
+		// One redb snapshot serves every open-time decision, so the tier
+		// authority that classifies slab files is the one the index loads.
+		let mut snapshot = match &persistent_index {
 			Some(index) => match index.load_snapshot().await {
-				Ok(snapshot) => {
-					let mut by_slab: BTreeMap<SlabId, BTreeSet<u64>> = BTreeMap::new();
-					for row in &snapshot.record_rows {
-						by_slab
-							.entry(row.location.slab_id)
-							.or_default()
-							.insert(row.location.offset);
-					}
-					acknowledged_by_slab = Some(by_slab);
-					Some(snapshot.lsm_runs)
-				}
+				Ok(snapshot) => Some(snapshot),
 				Err(err) => {
 					tracing::warn!(
 						error = %err,
 						dir = %config.dir.display(),
-						"failed to load redb before staged maintenance reconciliation; treating staged files as uninstalled"
+						"failed to load redb at open; staged files are treated as uninstalled and the local slab scan remains authoritative"
 					);
 					None
 				}
 			},
 			None => None,
 		};
+		// Local intent recovery runs before filename discovery. It removes an
+		// intent only after proving its input/output files and preserving any
+		// unpublished output under a non-discoverable quarantine name.
+		if !awaiting_cluster && let (Some(index), Some(initial)) = (&persistent_index, &snapshot) {
+			let intents = initial.lsm_install_intents.clone();
+			let mut changed = false;
+			let touched = intents
+				.iter()
+				.map(|intent| {
+					intent
+						.inputs
+						.iter()
+						.map(|input| input.slab_id)
+						.chain(intent.commit.slabs_to_add.iter().map(|run| run.slab_id))
+						.collect::<HashSet<_>>()
+				})
+				.collect::<Vec<_>>();
+			for (position, intent) in intents.iter().enumerate() {
+				if touched.iter().enumerate().any(|(other, slabs)| {
+					other != position && !slabs.is_disjoint(&touched[position])
+				}) {
+					continue;
+				}
+				let result = match intent.kind {
+					crate::storage::index::LsmInstallKind::Local => {
+						lsm_driver::reconcile_local_lsm_intent(
+							file_ops.as_ref(),
+							&config.dir,
+							index,
+							initial,
+							intent,
+						)
+						.await
+					}
+					crate::storage::index::LsmInstallKind::Control => {
+						lsm_driver::reconcile_completed_control_lsm_intent(
+							file_ops.as_ref(),
+							&config.dir,
+							index,
+							initial,
+							intent,
+						)
+						.await
+					}
+				};
+				match result {
+					Ok(resolved) => changed |= resolved,
+					Err(error) => {
+						tracing::warn!(error = %error, job_id = ?intent.commit.job_id, "LSM intent remains fenced during recovery")
+					}
+				}
+			}
+			if changed {
+				snapshot = match index.load_snapshot().await {
+					Ok(reloaded) => Some(reloaded),
+					Err(error) => {
+						tracing::warn!(error = %error, "failed to reload index after LSM intent recovery");
+						None
+					}
+				};
+			}
+		}
+		let retained_secondary_sidecars = Arc::new(RetainedSecondarySidecars::default());
+		if let Some(snapshot) = &snapshot {
+			let referenced = snapshot
+				.secondary_index_segments
+				.iter()
+				.map(|row| PathBuf::from(&row.segment_path))
+				.collect();
+			for (path, bytes) in secondary_index_cleanup::scan_retained_secondary_files(
+				&config.dir,
+				owner.clone(),
+				referenced,
+			)
+			.await?
+			{
+				retained_secondary_sidecars.record(path, bytes);
+			}
+		}
+		let index_authority_unavailable = snapshot.is_none();
+		let lsm_install_intents = DashMap::new();
+		if let Some(snapshot) = &snapshot {
+			for intent in &snapshot.lsm_install_intents {
+				lsm_install_intents.insert(
+					intent.commit.job_id,
+					lsm_driver::lsm_intent_scope(intent, true),
+				);
+			}
+		}
+		let lsm_install_unresolved = !lsm_install_intents.is_empty();
+		// ADR 0099: the durable rows double as slab recovery's boundary
+		// oracle. A row exists only for a record that was fdatasynced and
+		// then acknowledged, so its offset is a place the walk may resume
+		// after an anomaly. Without redb there is no oracle and recovery
+		// stops at the first anomaly.
+		let acknowledged_by_slab: Option<BTreeMap<SlabId, BTreeSet<u64>>> =
+			snapshot.as_ref().map(|snapshot| {
+				let mut by_slab: BTreeMap<SlabId, BTreeSet<u64>> = BTreeMap::new();
+				for row in &snapshot.record_rows {
+					by_slab
+						.entry(row.location.slab_id)
+						.or_default()
+						.insert(row.location.offset);
+				}
+				by_slab
+			});
 		let acknowledged_for = |id: SlabId| -> Option<BTreeSet<u64>> {
 			acknowledged_by_slab
 				.as_ref()
 				.map(|by_slab| by_slab.get(&id).cloned().unwrap_or_default())
 		};
-		reconcile_staged_maintenance_publications(
-			file_ops.as_ref(),
-			&config.dir,
-			staged_runs.as_deref(),
-			None,
-		)
-		.await?;
-		cleanup_retention_rewrite_tmp_files(file_ops.as_ref(), &config.dir).await?;
-		cleanup_lsm_compaction_tmp_files(file_ops.as_ref(), &config.dir).await?;
-		// The manager is not published and no sidecar producer exists yet.
-		secondary_index_cleanup::cleanup_secondary_index_tmp_files(&config.dir, owner.clone())
+		if !index_authority_unavailable && !lsm_install_unresolved && !awaiting_cluster {
+			reconcile_staged_maintenance_publications(
+				file_ops.as_ref(),
+				&config.dir,
+				snapshot
+					.as_ref()
+					.map(|snapshot| snapshot.lsm_runs.as_slice()),
+				None,
+			)
 			.await?;
-		let mut existing_ids = discover_slab_ids(file_ops.as_ref(), &config.dir).await?;
-		existing_ids.sort_unstable();
+			cleanup_retention_rewrite_tmp_files(file_ops.as_ref(), &config.dir).await?;
+			cleanup_lsm_compaction_tmp_files(file_ops.as_ref(), &config.dir).await?;
+			// The manager is not published and no sidecar producer exists yet.
+			secondary_index_cleanup::cleanup_secondary_index_tmp_files(&config.dir, owner.clone())
+				.await?;
+		}
+		let mut discovered_ids = discover_slab_ids(file_ops.as_ref(), &config.dir).await?;
+		discovered_ids.sort_unstable();
+		// Unresolved output files are evidence, not authoritative rows. Keep
+		// their names below the allocator floor, but never open or index them.
+		let unresolved_outputs = snapshot
+			.as_ref()
+			.map(|snapshot| {
+				snapshot
+					.lsm_install_intents
+					.iter()
+					.flat_map(|intent| {
+						intent
+							.commit
+							.slabs_to_add
+							.iter()
+							.map(|run| run.slab_id)
+							.chain(intent.local_output_files.iter().map(|file| file.slab_id))
+							.chain(
+								intent
+									.commit
+									.sidecar_swaps
+									.iter()
+									.map(|swap| swap.output_slab_id),
+							)
+					})
+					.collect::<BTreeSet<_>>()
+			})
+			.unwrap_or_default();
+		// A discovered id with a committed tier pointer is quarantined before
+		// any file is opened: it serves only through its tier generation. Every
+		// slab id redb names, and every discovered id, stays below the
+		// allocator floor, so no new slab reuses one.
+		let tier_pointer_ids = snapshot
+			.as_ref()
+			.map(|snapshot| {
+				snapshot
+					.tiered_slabs
+					.iter()
+					.map(|pointer| pointer.slab_id)
+					.collect::<BTreeSet<_>>()
+			})
+			.unwrap_or_default();
+		// A leftover file after a checked retirement is evidence, even though
+		// its pointer is gone. Bare absence still recovers unknown local slabs.
+		let retired_tier_ids = snapshot
+			.as_ref()
+			.map(|snapshot| {
+				snapshot
+					.retired_tiered_slabs
+					.iter()
+					.copied()
+					.collect::<BTreeSet<_>>()
+			})
+			.unwrap_or_default();
+		let allocator_floor = snapshot
+			.as_ref()
+			.map(|snapshot| {
+				snapshot
+					.record_rows
+					.iter()
+					.chain(snapshot.tiered_records.iter())
+					.map(|row| row.location.slab_id)
+					.chain(snapshot.lsm_runs.iter().map(|run| run.slab_id))
+					.chain(
+						snapshot
+							.secondary_index_segments
+							.iter()
+							.map(|row| row.key.source_slab_id),
+					)
+					.max()
+			})
+			.into_iter()
+			.flatten()
+			.chain(tier_pointer_ids.iter().copied())
+			.chain(retired_tier_ids.iter().copied())
+			.chain(unresolved_outputs.iter().copied())
+			.chain(discovered_ids.iter().copied())
+			.max()
+			.map(|id| id.saturating_add(1))
+			.unwrap_or(SlabId::ZERO);
+		let highest_discovered_is_quarantined = discovered_ids.last().is_some_and(|id| {
+			tier_pointer_ids.contains(id)
+				|| retired_tier_ids.contains(id)
+				|| unresolved_outputs.contains(id)
+		});
+		discovered_ids.retain(|id| !unresolved_outputs.contains(id));
+		let (existing_ids, quarantined_slab_files) =
+			slab_file_quarantine::classify_discovered_slab_files(
+				file_ops.as_ref(),
+				&config.dir,
+				discovered_ids,
+				&tier_pointer_ids,
+				&retired_tier_ids,
+			)
+			.await?;
 
 		let key_index: DashMap<TenantKey, Vec<RecordLocation>> = DashMap::new();
 		let table_by_location: DashMap<RecordLocation, (TenantId, TableObjectId)> = DashMap::new();
@@ -142,8 +516,64 @@ impl SlabManager {
 		> = DashMap::new();
 
 		let mut recovered_key_localities: Vec<(TenantId, Identity, Locality)> = Vec::new();
-		let (active, next_slab_id) = if existing_ids.is_empty() {
-			let id = SlabId::ZERO;
+		// Split: everything except the max becomes sealed, the max becomes
+		// active. When there is no local file, or the highest file is
+		// quarantined, every local file is sealed and the active slab is a fresh
+		// id at the floor. Zero-length sealed files are not opened: they cannot
+		// contain records, and retaining them would recreate the descriptor
+		// exhaustion that this recovery path bounds.
+		let (active_id, sealed_ids) = match existing_ids.split_last() {
+			Some((&active_id, sealed_ids)) if !highest_discovered_is_quarantined => {
+				(Some(active_id), sealed_ids)
+			}
+			_ => (None, existing_ids.as_slice()),
+		};
+		let active_len = match active_id {
+			Some(active_id) => {
+				let active_path = slab_path(&config.dir, active_id);
+				file_ops.file_len(&active_path).await?.ok_or_else(|| {
+					Error::new(
+						ErrorKind::NotFound,
+						format!(
+							"active slab disappeared during recovery: {}",
+							active_path.display()
+						),
+					)
+				})?
+			}
+			None => 0,
+		};
+		let mut non_empty_sealed_ids = Vec::with_capacity(sealed_ids.len());
+		for &id in sealed_ids {
+			let path = slab_path(&config.dir, id);
+			match file_ops.file_len(&path).await? {
+				Some(0) => continue,
+				Some(_) => non_empty_sealed_ids.push(id),
+				None => {
+					return Err(Error::new(
+						ErrorKind::NotFound,
+						format!("slab disappeared during recovery: {}", path.display()),
+					));
+				}
+			}
+		}
+		let non_empty_count = non_empty_sealed_ids.len() + usize::from(active_len > 0);
+		let open_count = non_empty_sealed_ids.len() + 1;
+		if open_count > MAX_RECOVERY_OPEN_SLABS {
+			return Err(Error::new(
+				ErrorKind::Other,
+				format!(
+					"bounded slab recovery refused: total slab files={}, non-empty slab files={}, slabs to open={}, bound={}; preserve the active slab and use the documented recovery path",
+					existing_ids.len(),
+					non_empty_count,
+					open_count,
+					MAX_RECOVERY_OPEN_SLABS,
+				),
+			));
+		}
+		// Drain into key_index in ascending id order so later writes
+		// shadow earlier ones.
+		for &id in &non_empty_sealed_ids {
 			let slab = Arc::new(
 				LocalSlabStore::open_with_acknowledged(
 					slab_path(&config.dir, id),
@@ -155,141 +585,123 @@ impl SlabManager {
 				.await?,
 			);
 			drain_slab_index(&slab, &key_index, &mut recovered_key_localities);
-			(slab, id.saturating_add(1))
-		} else {
-			// Split: everything except the max becomes sealed, the
-			// max becomes active. Zero-length sealed files are not opened:
-			// they cannot contain records, and retaining them would recreate
-			// the descriptor exhaustion that this recovery path bounds.
-			let (&active_id, sealed_ids) = existing_ids.split_last().expect("non-empty");
-			let active_path = slab_path(&config.dir, active_id);
-			let active_len = file_ops.file_len(&active_path).await?.ok_or_else(|| {
-				Error::new(
-					ErrorKind::NotFound,
-					format!(
-						"active slab disappeared during recovery: {}",
-						active_path.display()
-					),
-				)
-			})?;
-			let mut non_empty_sealed_ids = Vec::with_capacity(sealed_ids.len());
-			for &id in sealed_ids {
-				let path = slab_path(&config.dir, id);
-				match file_ops.file_len(&path).await? {
-					Some(0) => continue,
-					Some(_) => non_empty_sealed_ids.push(id),
-					None => {
-						return Err(Error::new(
-							ErrorKind::NotFound,
-							format!("slab disappeared during recovery: {}", path.display()),
-						));
-					}
-				}
-			}
-			let non_empty_count = non_empty_sealed_ids.len() + usize::from(active_len > 0);
-			let open_count = non_empty_sealed_ids.len() + 1;
-			if open_count > MAX_RECOVERY_OPEN_SLABS {
-				return Err(Error::new(
-					ErrorKind::Other,
-					format!(
-						"bounded slab recovery refused: total slab files={}, non-empty slab files={}, slabs to open={}, bound={}; preserve the active slab and use the documented recovery path",
-						existing_ids.len(),
-						non_empty_count,
-						open_count,
-						MAX_RECOVERY_OPEN_SLABS,
-					),
-				));
-			}
-			// Drain into key_index in ascending id order so later writes
-			// shadow earlier ones.
-			for &id in &non_empty_sealed_ids {
-				let slab = Arc::new(
-					LocalSlabStore::open_with_acknowledged(
-						slab_path(&config.dir, id),
-						id,
-						file_ops.clone(),
-						config.group_commit.clone(),
-						acknowledged_for(id).as_ref(),
-					)
-					.await?,
-				);
-				drain_slab_index(&slab, &key_index, &mut recovered_key_localities);
-				sealed.insert(id, slab);
-			}
-			let active = Arc::new(
-				LocalSlabStore::open_with_acknowledged(
-					active_path,
-					active_id,
-					file_ops.clone(),
-					config.group_commit.clone(),
-					acknowledged_for(active_id).as_ref(),
-				)
-				.await?,
-			);
-			drain_slab_index(&active, &key_index, &mut recovered_key_localities);
-			(active, active_id.saturating_add(1))
-		};
+			sealed.insert(id, slab);
+		}
+		let active_id = active_id.unwrap_or(allocator_floor);
+		let active = Arc::new(
+			LocalSlabStore::open_with_acknowledged(
+				slab_path(&config.dir, active_id),
+				active_id,
+				file_ops.clone(),
+				config.group_commit.clone(),
+				acknowledged_for(active_id).as_ref(),
+			)
+			.await?,
+		);
+		drain_slab_index(&active, &key_index, &mut recovered_key_localities);
+		let next_slab_id = active_id.saturating_add(1).max(allocator_floor);
 
+		// Every durable row names a version the node acknowledged. Recovery
+		// replaces the durable index from memory, so each one must still be
+		// held there; unresolved install outputs are evidence, not rows.
+		let durable_versions: Option<DurableVersions> = snapshot.as_ref().map(|snapshot| {
+			snapshot
+				.record_rows
+				.iter()
+				.chain(snapshot.tiered_records.iter())
+				.filter(|row| !unresolved_outputs.contains(&row.location.slab_id))
+				.map(|row| {
+					(
+						(row.tenant_id, row.key_identity, row.location),
+						row.table_object_id,
+					)
+				})
+				.collect()
+		});
 		let counter_unsupported = DashSet::new();
 		let mut persistent_key_localities: Vec<(TenantId, Identity, Locality)> = Vec::new();
 		let mut recovered_lsm_runs: Vec<LsmRunSummary> = Vec::new();
-		if let Some(index) = &persistent_index {
-			match index.load_snapshot().await {
-				Ok(snapshot) => {
-					for row in snapshot.record_rows {
-						if let Some(table_object_id) = row.table_object_id {
-							table_by_location
-								.insert(row.location, (row.tenant_id, table_object_id));
-							*table_references_by_slab
-								.entry(row.location.slab_id)
-								.or_default()
-								.entry((row.tenant_id, table_object_id))
-								.or_default() += 1;
-						}
-					}
-					for pointer in snapshot.tiered_slabs {
-						tiered.insert(pointer.slab_id, pointer);
-					}
-					for row in snapshot.tiered_records {
-						counter_unsupported.insert((row.tenant_id, row.key_identity));
-						key_index
-							.entry((row.tenant_id, row.key_identity))
-							.and_modify(|versions| insert_version_sorted(versions, row.location))
-							.or_insert_with(|| vec![row.location]);
-						persistent_key_localities.push((
-							row.tenant_id,
-							row.key_identity,
-							row.routing_locality,
-						));
-					}
-					for row in snapshot.secondary_index_segments {
-						*secondary_index_table_references_by_slab
-							.entry(row.key.source_slab_id)
-							.or_default()
-							.entry((row.key.tenant_id, row.key.table_object_id))
-							.or_default() += 1;
-						let coverage_key = secondary_index_coverage_key_from_persistent(&row.key);
-						secondary_index_coverage
-							.entry(coverage_key)
-							.or_insert_with(|| SecondaryIndexCoverageTracker::new(coverage_key))
-							.mark_covered(row.key.source_slab_id);
-						secondary_index_segments.insert(row.key, row);
-					}
-					persistent_key_localities.extend(snapshot.record_localities);
-					recovered_lsm_runs = snapshot.lsm_runs;
+		let recovered_control_index = snapshot
+			.as_ref()
+			.and_then(|snapshot| snapshot.last_control_log_index);
+		if let Some(snapshot) = snapshot {
+			for row in snapshot.record_rows {
+				if unresolved_outputs.contains(&row.location.slab_id) {
+					continue;
 				}
-				Err(err) => {
-					tracing::warn!(
-						error = %err,
-						dir = %config.dir.display(),
-						"failed to load tiered rows from redb; local slab scan remains authoritative"
-					);
+				if let Some(table_object_id) = row.table_object_id {
+					table_by_location.insert(row.location, (row.tenant_id, table_object_id));
+					*table_references_by_slab
+						.entry(row.location.slab_id)
+						.or_default()
+						.entry((row.tenant_id, table_object_id))
+						.or_default() += 1;
 				}
 			}
+			for pointer in snapshot.tiered_slabs {
+				if !unresolved_outputs.contains(&pointer.slab_id) {
+					tiered.insert(pointer.slab_id, pointer);
+				}
+			}
+			for row in snapshot.tiered_records {
+				if unresolved_outputs.contains(&row.location.slab_id) {
+					continue;
+				}
+				counter_unsupported.insert((row.tenant_id, row.key_identity));
+				key_index
+					.entry((row.tenant_id, row.key_identity))
+					.and_modify(|versions| insert_version_sorted(versions, row.location))
+					.or_insert_with(|| vec![row.location]);
+				persistent_key_localities.push((
+					row.tenant_id,
+					row.key_identity,
+					row.routing_locality,
+				));
+			}
+			for row in snapshot.secondary_index_segments {
+				*secondary_index_table_references_by_slab
+					.entry(row.key.source_slab_id)
+					.or_default()
+					.entry((row.key.tenant_id, row.key.table_object_id))
+					.or_default() += 1;
+				let coverage_key = secondary_index_coverage_key_from_persistent(&row.key);
+				secondary_index_coverage
+					.entry(coverage_key)
+					.or_insert_with(|| SecondaryIndexCoverageTracker::new(coverage_key))
+					.mark_covered(row.key.source_slab_id);
+				secondary_index_segments.insert(row.key, row);
+			}
+			persistent_key_localities.extend(snapshot.record_localities);
+			recovered_lsm_runs = snapshot.lsm_runs;
 		}
 		let counter_eligible =
 			Self::recover_counter_eligible(&active, &sealed, &counter_unsupported, &key_index);
-		remove_non_live_lsm_rows_from_index(&key_index, &recovered_lsm_runs);
+		// An unpaired recovered tentative may still be named by an external
+		// witness. Keep its slab ineligible until reconciliation resolves it.
+		let counter_pending_frames = DashSet::new();
+		let counter_pending_guards = CounterPendingGuards::default();
+		let mut recovered_counter_slabs = vec![active.clone()];
+		recovered_counter_slabs.extend(sealed.iter().map(|entry| entry.value().clone()));
+		for slab in recovered_counter_slabs {
+			for candidate in &slab.recovered_counter_tentatives_v2 {
+				// Local recovery has already consumed physically paired copies.
+				// Never infer resolution of this remaining copy from another
+				// copy sharing the logical counter identity.
+				let pending = Self::pending_counter_frame(
+					candidate.tenant_id,
+					candidate.key_identity,
+					candidate.location.hlc,
+					candidate.origin,
+					candidate.location.slab_id,
+					candidate.location.offset,
+				);
+				counter_pending_frames.insert(pending);
+				counter_pending_guards.insert(pending, slab.track_recovered_counter()?);
+			}
+		}
+		if !index_authority_unavailable && !lsm_install_unresolved {
+			remove_non_live_lsm_rows_from_index(&key_index, &recovered_lsm_runs);
+		}
 		let key_localities = build_key_localities(&key_index);
 		for (tenant_id, key_identity, locality) in recovered_key_localities {
 			if key_index.contains_key(&(tenant_id, key_identity)) {
@@ -343,7 +755,15 @@ impl SlabManager {
 				maintenance_metrics,
 			),
 		};
-		let manager = Self {
+		let snapshot_epoch_initial = match &persistent_index {
+			Some(index) => index
+				.snapshot_retirement_epoch_floor()
+				.await?
+				.checked_add(1)
+				.ok_or_else(|| Error::other("snapshot epoch exhausted"))?,
+			None => 1,
+		};
+		let manager = Arc::new(Self {
 			_directory_owner: owner,
 			finality_observation:
 				crate::storage::finality_observation::FinalityObservationRegistry::new(),
@@ -357,12 +777,15 @@ impl SlabManager {
 				hot_read_counts: HashMap::new(),
 				rehydrating: HashSet::new(),
 				next_slab_id,
+				tier_layouts: DashMap::new(),
 			}),
 			compaction_manifest: RwLock::new(compaction_manifest),
 			slab_pins: Arc::new(SlabPinTable::default()),
 			counter_eligible,
 			counter_unsupported,
-			counter_pending_frames: DashSet::new(),
+			counter_pending_frames,
+			counter_pending_guards,
+			slab_publication_revisions: DashMap::new(),
 			counter_deferred_l0_slabs: DashSet::new(),
 			key_index,
 			locality_index: RwLock::new(locality_index),
@@ -374,6 +797,16 @@ impl SlabManager {
 			quarantined_compaction_slabs: DashSet::new(),
 			relocated_reads: DashMap::new(),
 			persistent_index,
+			pending_metadata_tokens,
+			completed_metadata_retries: DashMap::new(),
+			persistent_index_gate: Arc::new(tokio::sync::RwLock::new(())),
+			index_authority_unavailable: AtomicBool::new(index_authority_unavailable),
+			lsm_install_unresolved: lsm_install_intents,
+			lsm_intent_scope_gate: Arc::new(tokio::sync::RwLock::new(())),
+			pending_index_publications: Arc::new(DashMap::new()),
+			single_append_publication_evidence: Arc::new(DashMap::new()),
+			index_publication_revision: std::sync::atomic::AtomicU64::new(1),
+			orphaned_index_publications: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
 			maintenance_policy,
 			retired_tiered_cleanup: DashMap::new(),
 			secondary_index_segments,
@@ -383,19 +816,98 @@ impl SlabManager {
 			maintenance_publication_restart_required: AtomicBool::new(false),
 			maintenance_publication_fail_stop: std::sync::Mutex::new(None),
 			secondary_index_declaration_cuts: DashSet::new(),
+			retained_secondary_sidecars,
 			secondary_index_persist_stripes: (0..crate::storage::manager::secondary_index_segments::SECONDARY_INDEX_PERSIST_STRIPES)
 				.map(|_| tokio::sync::RwLock::new(()))
 				.collect(),
 			slab_rewrite_claims: DashMap::new(),
 			tiered_stats_cache: DashMap::new(),
-		};
+			tier_publication_locks: DashMap::new(),
+			cleanup_claims: DashMap::new(),
+			conflicted_locations: DashSet::new(),
+			unverified_tier_slabs: DashSet::new(),
+			tier_authority: tier_authority::TierAuthority::new(),
+			installed_snapshot_index: std::sync::RwLock::new(None),
+			snapshot_epoch: Arc::new(std::sync::atomic::AtomicU64::new(snapshot_epoch_initial)),
+			snapshot_epoch_gate: Arc::new(std::sync::RwLock::new(())),
+			awaiting_cluster: AtomicBool::new(awaiting_cluster),
+			retired_tier_slabs: DashSet::new(),
+			unapplied_tier_pointers: DashMap::new(),
+			#[cfg(test)]
+			counter_rollback_fail_once: std::sync::atomic::AtomicBool::new(false),
+			#[cfg(test)]
+			lsm_control_install_hold: std::sync::Mutex::new(None),
+			#[cfg(test)]
+			lsm_after_rename_hold: std::sync::Mutex::new(None),
+			#[cfg(test)]
+			lsm_fail_before_rename: std::sync::atomic::AtomicBool::new(false),
+			#[cfg(test)]
+			lsm_after_output_publish_hold: std::sync::Mutex::new(None),
+			#[cfg(test)]
+			lsm_after_install_hold: std::sync::Mutex::new(None),
+			#[cfg(test)]
+			lsm_after_intent_clear_hold: std::sync::Mutex::new(None),
+			#[cfg(test)]
+			lsm_capture_hold: std::sync::Mutex::new(None),
+			#[cfg(test)]
+			counter_rollback_hold: std::sync::Mutex::new(None),
+			#[cfg(test)]
+			continuity_test_holds: Default::default(),
+			unresolved_tier_cleanup: Default::default(),
+			deferred_table_drop_l2: Default::default(),
+			cleanup_scan_schedule: Default::default(),
+			quarantined_slab_files,
+			released_slab_files: DashSet::new(),
+			#[cfg(test)]
+			test_pauses: Default::default(),
+		});
+		{
+			// Every tiered slab is verified against its object before its first
+			// serve in this process.
+			let state = manager.state.lock().await;
+			for entry in state.tiered.iter() {
+				manager.unverified_tier_slabs.insert(*entry.key());
+				manager.tier_authority.pending.insert(
+					*entry.key(),
+					tier_authority::PendingTierAuthority {
+						pointer: entry.value().clone(),
+						last_control_log_index: recovered_control_index,
+					},
+				);
+			}
+		}
 		manager
 			.detect_missing_published_references_on_recovery()
 			.await;
+		manager.load_unresolved_tier_cleanup().await?;
+		if let Some(index) = &manager.persistent_index {
+			for mark in index.load_snapshot_retirement_marks().await? {
+				manager.tier_authority.mark_snapshot_retirement(
+					mark.pointer.slab_id,
+					mark.epoch,
+					mark.snapshot_index,
+				);
+			}
+		}
+		if let Some(durable_versions) = durable_versions {
+			refuse_unaccounted_durable_versions(&manager, durable_versions)?;
+		}
+		manager.tier_authority.initialize(&manager)?;
+		if manager.tier_authority.pending.is_empty() {
+			manager.recover_version_conflicts().await?;
+			manager.tier_authority.local_ready();
+		} else {
+			manager.tier_authority.start();
+		}
 		let snapshot = manager.compaction_manifest_snapshot();
 		refresh_lsm_level_metrics(&snapshot);
-		if manager.integrity_failures.is_empty() {
-			manager.rebuild_persistent_index().await;
+		if !awaiting_cluster
+			&& !index_authority_unavailable
+			&& manager.integrity_failures.is_empty()
+			&& manager.tier_authority.pending.is_empty()
+			&& !lsm_install_unresolved
+		{
+			manager.rebuild_persistent_index().await?;
 		} else {
 			tracing::error!(
 				fenced_table_count = manager.integrity_failures.len(),

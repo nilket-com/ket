@@ -695,6 +695,7 @@ impl SlabManager {
 		secondary_indexes: &SecondaryIndexCatalog,
 		max_slabs: usize,
 	) -> std::io::Result<LayoutReclusterReport> {
+		self.require_tier_authority_ready()?;
 		descriptor.validate()?;
 		if max_slabs == 0 {
 			return Ok(LayoutReclusterReport::default());
@@ -749,6 +750,7 @@ impl SlabManager {
 		tombstones: &[MigratedRangeTombstone],
 		secondary_index_context: SecondaryIndexCompactionContext<'_>,
 	) -> std::io::Result<TombstoneSlabScanOutcome> {
+		self.require_tier_authority_ready()?;
 		// ADR 0097: own the slab BEFORE scanning it, then refetch it. Scanning
 		// unowned let this job plan from bytes another maintenance job had already
 		// replaced; and the handle it was called with predates the wait for
@@ -817,6 +819,7 @@ impl SlabManager {
 		descriptor: &TableSchemaDescriptor,
 		secondary_index_context: SecondaryIndexCompactionContext<'_>,
 	) -> std::io::Result<Option<LayoutReclusterOutcome>> {
+		self.require_tier_authority_ready()?;
 		if self.is_compaction_slab_quarantined(slab_id) {
 			return Ok(None);
 		}
@@ -1244,6 +1247,7 @@ impl SlabManager {
 		secondary_index_context: SecondaryIndexCompactionContext<'_>,
 		claims: &MaintenanceClaims,
 	) -> std::io::Result<Option<CompactionOutcome>> {
+		self.require_tier_authority_ready()?;
 		let counter_plan = self.plan_counter_rewrite(&slab).await?;
 		self.compact_sealed_slab_records_planned(
 			slab_id,
@@ -1279,7 +1283,8 @@ impl SlabManager {
 		if counter_plan.pending {
 			return Ok(None);
 		}
-		let records = Self::ordinary_compaction_records(records, counter_plan);
+		let mut records = Self::ordinary_compaction_records(records, counter_plan);
+		self.keep_conflicting_versions(&mut records);
 		if records.is_empty() && counter_plan.frames.is_empty()
 			|| records.iter().all(|record| !record.reclaim) && counter_plan.frames.is_empty()
 		{
@@ -1469,12 +1474,20 @@ impl SlabManager {
 			.clone()
 			.write_owned()
 			.await;
+		let tier_lock = self.tier_publication_lock(slab_id);
+		let _tier_guard = tier_lock.lock().await;
 		{
 			let state = self.state.lock().await;
-			if !state.sealed.contains_key(&slab_id) || state.tiered.contains_key(&slab_id) {
+			if !state
+				.sealed
+				.get(&slab_id)
+				.is_some_and(|slab| slab.manager_appends_quiescent())
+				|| state.tiered.contains_key(&slab_id)
+			{
 				return Ok(());
 			}
 		}
+		self.bump_slab_publication_revision(slab_id)?;
 		let deleted_rows = records
 			.iter()
 			.map(|record| {
@@ -1486,18 +1499,24 @@ impl SlabManager {
 			})
 			.collect::<Vec<_>>();
 		let lsm_runs = self.maintenance_manifest_preview(slab_id, None)?;
+		let index_publication = self.begin_index_publication(vec![slab_id]).await?;
 		// D2′: records and the old run's Retired disposition become durable in
 		// one transaction before the in-memory index or backing changes.
-		self.persist_maintenance_publication(PersistentIndexUpdate {
-			delete_records: deleted_rows,
-			put_lsm_runs: lsm_runs,
-			..Default::default()
-		})
+		self.persist_maintenance_publication(
+			PersistentIndexUpdate {
+				delete_records: deleted_rows,
+				put_lsm_runs: lsm_runs,
+				..Default::default()
+			},
+			&index_publication,
+		)
 		.await?;
 		self.apply_maintenance_manifest_publication(slab_id, None)?;
 		{
 			let state = self.state.lock().await;
-			state.sealed.remove(&slab_id);
+			if state.sealed.remove(&slab_id).is_some() {
+				self.release_slab_file(slab_id);
+			}
 		}
 		for record in records {
 			self.rollback_indexed_location(
@@ -1506,12 +1525,12 @@ impl SlabManager {
 				record.old_location,
 			);
 		}
+		index_publication.complete();
 		// No negative reference scan here: this path runs only after
 		// `reconcile_secondary_index_segments_after_compaction` returned proof. The
 		// scan-based `can_retire_local_slab` guard remains on the sweep paths, where
 		// no reconciliation proof exists.
-		let old_path = slab_path(&self.config.dir, slab_id);
-		unlink_local_file(self.file_ops.as_ref(), &old_path).await?;
+		self.unlink_released_slab_file(slab_id).await?;
 		Ok(())
 	}
 
@@ -1530,12 +1549,20 @@ impl SlabManager {
 			.clone()
 			.write_owned()
 			.await;
+		let tier_lock = self.tier_publication_lock(old_slab_id);
+		let _tier_guard = tier_lock.lock().await;
 		{
 			let state = self.state.lock().await;
-			if !state.sealed.contains_key(&old_slab_id) || state.tiered.contains_key(&old_slab_id) {
+			if !state
+				.sealed
+				.get(&old_slab_id)
+				.is_some_and(|slab| slab.manager_appends_quiescent())
+				|| state.tiered.contains_key(&old_slab_id)
+			{
 				return Ok(false);
 			}
 		}
+		self.bump_slab_publication_revision(old_slab_id)?;
 		let survivor_count = records.iter().filter(|record| !record.reclaim).count();
 		if relocations.len() != survivor_count
 			|| relocations.iter().any(|relocation| {
@@ -1557,13 +1584,15 @@ impl SlabManager {
 				"counter maintenance relocation escaped its source/replacement slab pair",
 			));
 		}
-		let relocation_tables = relocations
-			.iter()
-			.filter_map(|relocation| {
-				self.published_table_object_id(relocation.old_location)
-					.map(|table_object_id| (relocation.old_location, table_object_id))
-			})
-			.collect::<HashMap<_, _>>();
+		let mut relocation_tables = HashMap::new();
+		for relocation in relocations {
+			if let Some(table_object_id) =
+				self.published_table_object_id(relocation.old_location)?
+			{
+				relocation_tables.insert(relocation.old_location, table_object_id);
+			}
+		}
+
 		let mut removed_rows = records
 			.iter()
 			.map(|record| {
@@ -1658,15 +1687,83 @@ impl SlabManager {
 		let lsm_runs =
 			self.maintenance_manifest_preview(old_slab_id, Some(replacement_run.clone()))?;
 
+		let mut by_key: BTreeMap<TenantKey, KeyRelocation> = BTreeMap::new();
+		let mut relocated_sources = HashSet::new();
+		for relocation in relocations {
+			relocated_sources.insert(relocation.old_location);
+			by_key
+				.entry((relocation.tenant_id, relocation.key_identity))
+				.or_insert_with(|| KeyRelocation::new(relocation.routing_locality, true))
+				.pairs
+				.push(RelocationPair {
+					old: relocation.old_location,
+					new: relocation.new_location,
+					table_object_id: relocation_tables.get(&relocation.old_location).copied(),
+				});
+		}
+		for relocation in counter_relocations
+			.iter()
+			.filter(|relocation| relocation.indexed)
+		{
+			relocated_sources.insert(relocation.old_location);
+			by_key
+				.entry((relocation.tenant_id, relocation.key_identity))
+				.or_insert_with(|| KeyRelocation::new(relocation.routing_locality, true))
+				.pairs
+				.push(RelocationPair {
+					old: relocation.old_location,
+					new: relocation.new_location,
+					table_object_id: None,
+				});
+		}
+		for record in records {
+			if !relocated_sources.contains(&record.old_location) {
+				by_key
+					.entry((record.tenant_id, record.key_identity))
+					.or_insert_with(|| KeyRelocation::new(record.routing_locality, true))
+					.removals
+					.push(record.old_location);
+			}
+		}
+		// The maintenance and source-tier guards exclude production removals
+		// through D3. Refuse a stale survivor set before D2: a published output
+		// must have at least one live source, including coalesced physical copies.
+		for (key, relocation) in &by_key {
+			let versions = self.key_index.get(key);
+			let available = relocation
+				.pairs
+				.iter()
+				.filter(|pair| {
+					versions
+						.as_ref()
+						.is_some_and(|chain| chain.contains(&pair.old))
+				})
+				.map(|pair| pair.new)
+				.collect::<HashSet<_>>();
+			if relocation
+				.pairs
+				.iter()
+				.any(|pair| !available.contains(&pair.new))
+			{
+				return Ok(false);
+			}
+		}
+
+		let index_publication = self
+			.begin_index_publication(vec![old_slab_id, new_slab_id])
+			.await?;
 		// D2: make the record relocation and manifest disposition durable before
 		// a final-path file exists or any live lookup starts using the replacement.
 		let published_lsm_runs = lsm_runs.clone();
-		self.persist_maintenance_publication(PersistentIndexUpdate {
-			delete_records: removed_rows,
-			put_records: inserted_rows,
-			put_lsm_runs: lsm_runs,
-			..Default::default()
-		})
+		self.persist_maintenance_publication(
+			PersistentIndexUpdate {
+				delete_records: removed_rows,
+				put_records: inserted_rows,
+				put_lsm_runs: lsm_runs,
+				..Default::default()
+			},
+			&index_publication,
+		)
 		.await?;
 
 		// D1′: live installation invokes the same S1 reconciler startup uses.
@@ -1702,57 +1799,36 @@ impl SlabManager {
 		// excludes a plan derived from the pre-publication Live run. Keep the old
 		// backing sealed for stale readers; Phase D owns its eventual disposal.
 		self.apply_maintenance_manifest_publication(old_slab_id, Some(replacement_run))?;
+		// One relocation per key: every survivor (and indexed counter frame) is
+		// replaced by its new location, and reclaimed records are removed, in a
+		// single key critical section. A stale holder of an old location follows
+		// the published redirect, or reads the retained old backing.
 		let state = self.state.lock().await;
 		state.sealed.insert(new_slab_id, replacement);
-		for record in records {
-			self.rollback_indexed_location(
-				record.tenant_id,
-				record.key_identity,
-				record.old_location,
-			);
-		}
-		for relocation in counter_relocations
-			.iter()
-			.filter(|relocation| relocation.indexed)
-		{
-			self.rollback_indexed_location(
-				relocation.tenant_id,
-				relocation.key_identity,
-				relocation.old_location,
-			);
-		}
-		for relocation in relocations {
-			self.index_appended_location_with_locality(
-				relocation.tenant_id,
-				relocation.key_identity,
-				relocation.routing_locality,
-				relocation.new_location,
-			);
-			self.relocated_reads
-				.insert(relocation.old_location, relocation.new_location);
-			if let Some(table_object_id) = relocation_tables.get(&relocation.old_location).copied()
-			{
-				self.add_published_table_reference(
-					relocation.tenant_id,
-					table_object_id,
-					relocation.new_location,
-				);
+		let mut refused_rows = Vec::new();
+		let mut relocated_any = false;
+		for ((tenant_id, key_identity), relocation) in &by_key {
+			for (_, new) in self.relocate_indexed_locations(*tenant_id, *key_identity, relocation) {
+				refused_rows.push(self.persistent_record_row(*tenant_id, *key_identity, new));
+			}
+			if !relocated_any {
+				relocated_any = true;
+				#[cfg(test)]
+				self.index_relocation_pause_point().await;
 			}
 		}
-		for relocation in counter_relocations
-			.iter()
-			.filter(|relocation| relocation.indexed)
-		{
-			self.index_appended_location_with_locality(
-				relocation.tenant_id,
-				relocation.key_identity,
-				relocation.routing_locality,
-				relocation.new_location,
-			);
-			self.relocated_reads
-				.insert(relocation.old_location, relocation.new_location);
-		}
 		drop(state);
+		if !refused_rows.is_empty() {
+			// D2 is already durable. A violated source-stability invariant must
+			// retain the gate; deleting outputs in a second transaction would
+			// create a crash window and could delete a still-live shared output.
+			self.enter_maintenance_publication_fail_stop(publication_gate);
+			return Err(Error::new(
+				ErrorKind::WouldBlock,
+				"maintenance relocation refused after durable publication; restart required",
+			));
+		}
+		index_publication.complete();
 		Ok(true)
 	}
 }

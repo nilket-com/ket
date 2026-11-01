@@ -25,27 +25,29 @@ fn hlc(n: u64) -> HybridTimestamp {
 fn identity(key: &[u8]) -> Identity {
 	counter_identity(&CounterKey(key.to_vec()))
 }
-async fn manager(dir: &TestDir, crypto: Arc<CryptoManager>) -> Arc<SlabManager> {
-	Arc::new(
-		SlabManager::open(SlabManagerConfig {
-			dir: dir.to_path_buf(),
-			max_slab_bytes: 1024 * 1024,
-			io: spawn_io_thread(64).unwrap(),
-			l2: None,
-			rehydration: Default::default(),
-			l2_column_fetch: Default::default(),
-			row_group_writer: Default::default(),
-			l2_row_group_fetch: Default::default(),
-			encoding_writer: Default::default(),
-			l2_chunk_layout: Default::default(),
-			l2_encoding_fetch: Default::default(),
-			encoding_compute: Default::default(),
-			group_commit: Default::default(),
-			crypto,
-		})
-		.await
-		.unwrap(),
-	)
+async fn manager(dir: &TestDir, crypto: Arc<CryptoManager>, initialize: bool) -> Arc<SlabManager> {
+	let config = SlabManagerConfig {
+		dir: dir.to_path_buf(),
+		max_slab_bytes: 1024 * 1024,
+		io: spawn_io_thread(64).unwrap(),
+		l2: None,
+		rehydration: Default::default(),
+		l2_column_fetch: Default::default(),
+		row_group_writer: Default::default(),
+		l2_row_group_fetch: Default::default(),
+		encoding_writer: Default::default(),
+		l2_chunk_layout: Default::default(),
+		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
+		group_commit: Default::default(),
+		crypto,
+	};
+	if initialize {
+		SlabManager::initialize_new_store(config).await
+	} else {
+		SlabManager::open(config).await
+	}
+	.unwrap()
 }
 struct Fixture {
 	dir: TestDir,
@@ -60,7 +62,7 @@ impl Fixture {
 		for t in [7, 8] {
 			crypto.install_local_only_for_tests(tenant(t)).unwrap();
 		}
-		let slab = manager(&dir, crypto.clone()).await;
+		let slab = manager(&dir, crypto.clone(), true).await;
 		let service = Arc::new(CounterReplicaService::new(slab.clone()));
 		Self {
 			dir,
@@ -79,7 +81,7 @@ impl Fixture {
 		} = self;
 		drop(service);
 		drop(slab);
-		let slab = manager(&dir, crypto.clone()).await;
+		let slab = manager(&dir, crypto.clone(), false).await;
 		let service = Arc::new(CounterReplicaService::new(slab.clone()));
 		Self {
 			dir,
@@ -117,7 +119,11 @@ impl ScopeAdapter for Fixture {
 	}
 	async fn read(&self, s: Scope, key: &[u8]) -> Option<u64> {
 		// Raw pending-identity evidence, deliberately separate from committed visibility.
-		match self.slab.counter_lookup(tenant(s.tenant), identity(key)) {
+		match self
+			.slab
+			.counter_lookup(tenant(s.tenant), identity(key))
+			.unwrap()
+		{
 			Some(location) => Some(self.slab.counter_read_value(location).await.unwrap()),
 			None => None,
 		}
@@ -202,7 +208,7 @@ async fn b1d_pending_live_identical_retry_and_key_value_hlc_conflicts_are_atomic
 		.await
 		.unwrap();
 	let before = f.slab.local_l1_bytes().await;
-	let location = f.slab.counter_lookup(tenant(7), key).unwrap();
+	let location = f.slab.counter_lookup(tenant(7), key).unwrap().unwrap();
 	s.replicate_tentative(node(1), 1, tenant(7), key, 11, hlc(1))
 		.await
 		.unwrap();
@@ -219,12 +225,15 @@ async fn b1d_pending_live_identical_retry_and_key_value_hlc_conflicts_are_atomic
 				.unwrap_err(),
 		);
 		assert_eq!(f.slab.local_l1_bytes().await, before);
-		assert_eq!(f.slab.counter_lookup(tenant(7), key), Some(location));
+		assert_eq!(
+			f.slab.counter_lookup(tenant(7), key).unwrap(),
+			Some(location)
+		);
 		assert_eq!(s.pending_count(), 1);
 		assert_eq!(s.read_committed(tenant(7), key).await.unwrap(), None);
 		assert_eq!(
 			f.slab
-				.counter_read_value(f.slab.counter_lookup(tenant(7), key).unwrap())
+				.counter_read_value(f.slab.counter_lookup(tenant(7), key).unwrap().unwrap())
 				.await
 				.unwrap(),
 			11
@@ -261,7 +270,7 @@ async fn b1d_commit_rollback_zero_before_missing_then_mismatch_preserve_tentativ
 		.await
 		.unwrap();
 	let before = f.slab.local_l1_bytes().await;
-	let location = f.slab.counter_lookup(tenant(7), key).unwrap();
+	let location = f.slab.counter_lookup(tenant(7), key).unwrap().unwrap();
 	for rollback in [false, true] {
 		let e = if rollback {
 			s.rollback(node(1), 1, tenant(7), empty).await.unwrap_err()
@@ -276,7 +285,10 @@ async fn b1d_commit_rollback_zero_before_missing_then_mismatch_preserve_tentativ
 		};
 		conflict(e);
 		assert_eq!(f.slab.local_l1_bytes().await, before);
-		assert_eq!(f.slab.counter_lookup(tenant(7), key), Some(location));
+		assert_eq!(
+			f.slab.counter_lookup(tenant(7), key).unwrap(),
+			Some(location)
+		);
 		assert_eq!(s.pending_count(), 1);
 	}
 	s.commit(node(1), 1, tenant(7), key).await.unwrap();
@@ -297,7 +309,10 @@ async fn b1d_postcommit_redrive_reappends_absolute_value_at_original_hlc() {
 		.unwrap();
 	assert!(f.slab.local_l1_bytes().await > before);
 	assert_eq!(s.pending_count(), 1);
-	assert_eq!(f.slab.counter_lookup(tenant(7), key).unwrap().hlc, hlc(1));
+	assert_eq!(
+		f.slab.counter_lookup(tenant(7), key).unwrap().unwrap().hlc,
+		hlc(1)
+	);
 	assert_eq!(s.read_committed(tenant(7), key).await.unwrap(), Some(11));
 	s.commit(node(1), 1, tenant(7), key).await.unwrap();
 	let f = f.reopened().await;
@@ -332,7 +347,9 @@ async fn b1d_gate_waiter_and_new_caller_retain_same_arc_and_serialize() {
 	// Preserve the original pending-to-absent transition under the held owner.
 	let (_, removed) = f.service.pending.remove(&key).unwrap();
 	f.slab
-		.counter_unindex_tentative(removed.tenant_id, removed.key_identity, removed.location);
+		.counter_unindex_tentative(removed.tenant_id, removed.key_identity, removed.location)
+		.await
+		.unwrap();
 	assert!(!f.service.pending.contains_key(&key));
 	assert!(f.service.op_locks.contains_key(&key));
 	assert_eq!(f.service.op_locks.get(&key).unwrap().participants, 2);
@@ -561,7 +578,13 @@ async fn b1d_real_local_remote_enum_and_witness_redrive_carry_counter_key() {
 	assert_eq!(
 		local
 			.slab
-			.counter_read_value(local.slab.counter_lookup(tenant(7), original).unwrap())
+			.counter_read_value(
+				local
+					.slab
+					.counter_lookup(tenant(7), original)
+					.unwrap()
+					.unwrap()
+			)
 			.await
 			.unwrap(),
 		99
@@ -624,7 +647,13 @@ async fn b1d_real_local_remote_enum_and_witness_redrive_carry_counter_key() {
 	assert_eq!(
 		remote
 			.slab
-			.counter_read_value(remote.slab.counter_lookup(tenant(7), original).unwrap())
+			.counter_read_value(
+				remote
+					.slab
+					.counter_lookup(tenant(7), original)
+					.unwrap()
+					.unwrap()
+			)
 			.await
 			.unwrap(),
 		44
@@ -744,7 +773,7 @@ async fn b1d_queued_tentative_and_commit_serialize_while_other_scope_completes()
 		.await
 		.unwrap();
 	f.service.commit(node(1), 1, tenant(8), b).await.unwrap();
-	assert!(f.slab.counter_lookup(tenant(7), a).is_none());
+	assert!(f.slab.counter_lookup(tenant(7), a).unwrap().is_none());
 	assert_eq!(
 		f.service.read_committed(tenant(8), b).await.unwrap(),
 		Some(22)

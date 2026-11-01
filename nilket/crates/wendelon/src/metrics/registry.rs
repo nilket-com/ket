@@ -10,6 +10,34 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
+/// Fixed, node-wide categories for authority verification retries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TierAuthorityRetryClass {
+	ObjectNotFound,
+	RemoteUnexpected,
+	RateLimited,
+	Timeout,
+	IoUnavailable,
+}
+impl TierAuthorityRetryClass {
+	const LABELS: &'static [&'static str] = &[
+		"object_not_found",
+		"remote_unexpected",
+		"rate_limited",
+		"timeout",
+		"io_unavailable",
+	];
+	fn label(self) -> &'static str {
+		match self {
+			Self::ObjectNotFound => "object_not_found",
+			Self::RemoteUnexpected => "remote_unexpected",
+			Self::RateLimited => "rate_limited",
+			Self::Timeout => "timeout",
+			Self::IoUnavailable => "io_unavailable",
+		}
+	}
+}
+
 const MICROS_PER_SECOND: u64 = 1_000_000;
 
 const GROUP_COMMIT_WINDOW_BUCKETS_MICROS: &[u64] =
@@ -105,6 +133,18 @@ impl Gauge {
 
 	pub fn get(&self) -> u64 {
 		self.0.load(Ordering::Relaxed)
+	}
+
+	pub fn add(&self, value: u64) {
+		self.0.fetch_add(value, Ordering::Relaxed);
+	}
+
+	pub fn sub(&self, value: u64) {
+		let _ = self
+			.0
+			.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+				Some(current.saturating_sub(value))
+			});
 	}
 }
 
@@ -1666,6 +1706,40 @@ fn level_label(level: CompactionLevelIndex) -> &'static str {
 	}
 }
 
+/// Reasons a local slab file at open disagrees with the committed state.
+pub const STORAGE_DISAGREEING_SLAB_FILE_REASONS: [&str; 2] = ["tier_pointer", "retired_tier"];
+/// Reasons a hot tiered slab was not rehydrated.
+pub const STORAGE_REHYDRATION_SKIP_REASONS: [&str; 1] = ["quarantined_file"];
+
+/// One counter per reason of a bounded, static label set; an unknown reason is
+/// not counted.
+struct BoundedReasonCounters<const N: usize> {
+	reasons: [&'static str; N],
+	counters: [Counter; N],
+}
+
+impl<const N: usize> BoundedReasonCounters<N> {
+	fn new(reasons: [&'static str; N]) -> Self {
+		Self {
+			reasons,
+			counters: std::array::from_fn(|_| Counter::default()),
+		}
+	}
+
+	fn inc(&self, reason: &str) {
+		if let Some(index) = self.reasons.iter().position(|known| *known == reason) {
+			self.counters[index].inc();
+		}
+	}
+
+	fn render(&self, out: &mut String, name: &str, help: &str) {
+		render_counter_family_header(out, name, help);
+		for (reason, counter) in self.reasons.iter().zip(&self.counters) {
+			render_counter_with_labels(out, name, &[("reason", reason)], counter.get());
+		}
+	}
+}
+
 #[derive(Default)]
 struct L2ColumnFetchFallbackCounters {
 	disabled: Counter,
@@ -2601,6 +2675,8 @@ pub struct MetricsRegistry {
 	pub data_ring_backpressure_active_actor_requests: Gauge,
 	/// ADR 0096: authoritative replicated physical-erasure obligations.
 	drop_reclaim_debts: Gauge,
+	/// Distinct local table-drop L2 obligations awaiting leadership.
+	pub storage_table_drop_l2_deferred_debts: Gauge,
 	/// Control WAL segments wholly below the logical purge boundary, kept on disk until a
 	/// durable snapshot covers them.
 	control_wal_deferred_segments: Gauge,
@@ -2675,6 +2751,11 @@ pub struct MetricsRegistry {
 	storage_l2_column_fetch_plan_micros: Histogram,
 	storage_l2_column_fetch_selected_chunk_runs: Histogram,
 	storage_l2_column_fetch_fallback: L2ColumnFetchFallbackCounters,
+	storage_tier_authority_retries: StaticLabelCounters,
+	pub storage_tier_snapshot_reconciliation_pending: Gauge,
+	pub storage_lsm_control_intents_unresolved: Gauge,
+	pub storage_lsm_control_intents_legacy_unresolved: Gauge,
+	pub storage_counter_unresolved_slabs: Gauge,
 	storage_l2_row_group_fetch_requests: StaticLabelCounters,
 	storage_l2_row_group_fetch_fallback: StaticLabelCounters,
 	storage_l2_row_group_fetch_row_groups: StaticLabelCounters,
@@ -2722,6 +2803,35 @@ pub struct MetricsRegistry {
 	pub storage_multirow_rows_materialized_total: Counter,
 	pub storage_multirow_point_read_amplification_bytes: Counter,
 	pub storage_multirow_recompact_total: Counter,
+	/// Index relocation pairs refused because neither location was indexed.
+	pub storage_index_relocation_refused_total: Counter,
+	/// Appends refused because the version identity holds a different payload.
+	pub storage_version_conflict_refused_total: Counter,
+	/// Copies of conflicting versions found at open.
+	pub storage_version_conflict_recovered_total: Counter,
+	/// Tiered slabs whose rows were repaired against their object before first serve.
+	pub storage_tier_rows_repaired_total: Counter,
+	/// Local slab files open classified as disagreeing with the committed state.
+	storage_open_disagreeing_slab_files_total:
+		BoundedReasonCounters<{ STORAGE_DISAGREEING_SLAB_FILE_REASONS.len() }>,
+	/// Local slab files held as evidence by live managers, and their bytes.
+	pub storage_quarantined_slab_files: Gauge,
+	pub storage_quarantined_slab_file_bytes: Gauge,
+	pub storage_retained_secondary_sidecar_files: Gauge,
+	pub storage_retained_secondary_sidecar_bytes: Gauge,
+	/// Unresolved durable cleanup intents and the bytes they keep in L2.
+	pub storage_unresolved_tier_cleanup_intents: Gauge,
+	pub storage_unresolved_tier_cleanup_bytes: Gauge,
+	pub storage_unresolved_tier_cleanup_unknown_size: Gauge,
+	/// In-memory cleanup records scanned by reconciliation (before deduplication).
+	pub storage_tier_cleanup_records: Gauge,
+	pub storage_cleanup_authority_missing: Gauge,
+	pub storage_cleanup_history_incomplete: Gauge,
+	pub storage_cleanup_unrecorded_supersessions_total: Counter,
+	pub storage_cleanup_unrecorded_supersessions: Gauge,
+	/// Hot tiered slabs not rehydrated, by reason.
+	storage_rehydration_skipped_total:
+		BoundedReasonCounters<{ STORAGE_REHYDRATION_SKIP_REASONS.len() }>,
 	pub storage_multirow_uncompacted_row_records_total: Counter,
 	storage_multirow_rows_per_record: Histogram,
 	storage_multirow_decode_micros: Histogram,
@@ -2748,6 +2858,9 @@ pub struct MetricsRegistry {
 	pub storage_table_retention_l1_bytes_reclaimed_total: Counter,
 	storage_table_retention_l2_rows_pruned: TableRetentionRowKindCounters,
 	pub storage_table_retention_l2_bytes_reclaimed_total: Counter,
+	pub storage_l2_superseded_objects_retained_total: Counter,
+	pub storage_supersession_metadata_degraded_total: Counter,
+	pub storage_tombstone_metadata_degraded_total: Counter,
 	pub storage_table_retention_pair_drops_total: Counter,
 	pub storage_table_retention_ambiguous_rows_retained_total: Counter,
 	pub storage_table_retention_lag_seconds: Gauge,
@@ -2885,6 +2998,7 @@ impl Default for MetricsRegistry {
 			control_optimizer_facts_get_invalid_request_total: Counter::default(),
 			data_ring_write_outcomes: WriteOutcomeCounters::default(),
 			drop_reclaim_debts: Gauge::default(),
+			storage_table_drop_l2_deferred_debts: Gauge::default(),
 			control_wal_deferred_segments: Gauge::default(),
 			control_wal_deferred_bytes: Gauge::default(),
 			control_wal_store_poisoned: Gauge::default(),
@@ -2978,6 +3092,11 @@ impl Default for MetricsRegistry {
 				L2_COLUMN_FETCH_CHUNK_RUN_BUCKETS,
 			),
 			storage_l2_column_fetch_fallback: L2ColumnFetchFallbackCounters::default(),
+			storage_tier_authority_retries: StaticLabelCounters::default(),
+			storage_tier_snapshot_reconciliation_pending: Gauge::default(),
+			storage_lsm_control_intents_unresolved: Gauge::default(),
+			storage_lsm_control_intents_legacy_unresolved: Gauge::default(),
+			storage_counter_unresolved_slabs: Gauge::default(),
 			storage_l2_row_group_fetch_requests: StaticLabelCounters::default(),
 			storage_l2_row_group_fetch_fallback: StaticLabelCounters::default(),
 			storage_l2_row_group_fetch_row_groups: StaticLabelCounters::default(),
@@ -3039,6 +3158,28 @@ impl Default for MetricsRegistry {
 			storage_multirow_rows_materialized_total: Counter::default(),
 			storage_multirow_point_read_amplification_bytes: Counter::default(),
 			storage_multirow_recompact_total: Counter::default(),
+			storage_index_relocation_refused_total: Counter::default(),
+			storage_version_conflict_refused_total: Counter::default(),
+			storage_version_conflict_recovered_total: Counter::default(),
+			storage_tier_rows_repaired_total: Counter::default(),
+			storage_open_disagreeing_slab_files_total: BoundedReasonCounters::new(
+				STORAGE_DISAGREEING_SLAB_FILE_REASONS,
+			),
+			storage_quarantined_slab_files: Gauge::default(),
+			storage_quarantined_slab_file_bytes: Gauge::default(),
+			storage_retained_secondary_sidecar_files: Gauge::default(),
+			storage_retained_secondary_sidecar_bytes: Gauge::default(),
+			storage_unresolved_tier_cleanup_intents: Gauge::default(),
+			storage_unresolved_tier_cleanup_bytes: Gauge::default(),
+			storage_unresolved_tier_cleanup_unknown_size: Gauge::default(),
+			storage_tier_cleanup_records: Gauge::default(),
+			storage_cleanup_authority_missing: Gauge::default(),
+			storage_cleanup_history_incomplete: Gauge::default(),
+			storage_cleanup_unrecorded_supersessions_total: Counter::default(),
+			storage_cleanup_unrecorded_supersessions: Gauge::default(),
+			storage_rehydration_skipped_total: BoundedReasonCounters::new(
+				STORAGE_REHYDRATION_SKIP_REASONS,
+			),
 			storage_multirow_uncompacted_row_records_total: Counter::default(),
 			storage_multirow_rows_per_record: Histogram::new(MULTIROW_ROWS_PER_RECORD_BUCKETS),
 			storage_multirow_decode_micros: Histogram::new(PBC_EXEC_BUCKETS_MICROS),
@@ -3065,6 +3206,9 @@ impl Default for MetricsRegistry {
 			storage_table_retention_l1_bytes_reclaimed_total: Counter::default(),
 			storage_table_retention_l2_rows_pruned: TableRetentionRowKindCounters::default(),
 			storage_table_retention_l2_bytes_reclaimed_total: Counter::default(),
+			storage_l2_superseded_objects_retained_total: Counter::default(),
+			storage_supersession_metadata_degraded_total: Counter::default(),
+			storage_tombstone_metadata_degraded_total: Counter::default(),
 			storage_table_retention_pair_drops_total: Counter::default(),
 			storage_table_retention_ambiguous_rows_retained_total: Counter::default(),
 			storage_table_retention_lag_seconds: Gauge::default(),
@@ -3542,6 +3686,54 @@ impl MetricsRegistry {
 
 	pub fn observe_storage_multirow_recompact(&self, records: u64) {
 		self.storage_multirow_recompact_total.add(records);
+	}
+
+	pub fn observe_storage_index_relocation_refused(&self, pairs: u64) {
+		self.storage_index_relocation_refused_total.add(pairs);
+	}
+
+	pub fn observe_storage_version_conflict_refused(&self) {
+		self.storage_version_conflict_refused_total.inc();
+	}
+
+	pub fn observe_storage_version_conflict_recovered(&self, copies: u64) {
+		self.storage_version_conflict_recovered_total.add(copies);
+	}
+
+	pub fn observe_storage_tier_authority_retry(&self, class: TierAuthorityRetryClass) {
+		self.storage_tier_authority_retries.inc(class.label());
+	}
+
+	pub fn observe_storage_tier_rows_repaired_at_first_serve(&self) {
+		self.storage_tier_rows_repaired_total.inc();
+	}
+
+	/// Open classified one local slab file as disagreeing, holding `bytes` as
+	/// evidence until its manager drops.
+	pub fn observe_storage_disagreeing_slab_file(&self, reason: &str, bytes: u64) {
+		self.storage_open_disagreeing_slab_files_total.inc(reason);
+		self.storage_quarantined_slab_files.add(1);
+		self.storage_quarantined_slab_file_bytes.add(bytes);
+	}
+
+	/// A manager holding quarantined files dropped.
+	pub fn release_storage_quarantined_slab_files(&self, files: u64, bytes: u64) {
+		self.storage_quarantined_slab_files.sub(files);
+		self.storage_quarantined_slab_file_bytes.sub(bytes);
+	}
+
+	pub fn observe_storage_unresolved_tier_cleanup(&self, bytes: u64) {
+		self.storage_unresolved_tier_cleanup_intents.add(1);
+		self.storage_unresolved_tier_cleanup_bytes.add(bytes);
+	}
+
+	pub fn release_storage_unresolved_tier_cleanup(&self, intents: u64, bytes: u64) {
+		self.storage_unresolved_tier_cleanup_intents.sub(intents);
+		self.storage_unresolved_tier_cleanup_bytes.sub(bytes);
+	}
+
+	pub fn observe_storage_rehydration_skipped(&self, reason: &str) {
+		self.storage_rehydration_skipped_total.inc(reason);
 	}
 
 	/// ADR 045 — observe an admitted append-only batch on the
@@ -4458,6 +4650,24 @@ impl MetricsRegistry {
 		);
 		render_counter(
 			&mut out,
+			"wendelon_storage_l2_superseded_objects_retained_total",
+			"Superseded or possibly committed L2 objects kept instead of deleted since process start.",
+			self.storage_l2_superseded_objects_retained_total.get(),
+		);
+		render_counter(
+			&mut out,
+			"wendelon_storage_supersession_metadata_degraded_total",
+			"Tier pointer supersession summaries reset to untracked after stale observations.",
+			self.storage_supersession_metadata_degraded_total.get(),
+		);
+		render_counter(
+			&mut out,
+			"wendelon_storage_tombstone_metadata_degraded_total",
+			"Tier pointer tombstone summaries reset to untracked after stale observations.",
+			self.storage_tombstone_metadata_degraded_total.get(),
+		);
+		render_counter(
+			&mut out,
 			"wendelon_raft_entries_applied_total",
 			"Control Ring entries applied by the live state machine process.",
 			self.raft_entries_applied_total.get(),
@@ -4539,6 +4749,12 @@ impl MetricsRegistry {
 			"wendelon_eviction_advancer_failures_total",
 			"Eviction proposals that failed to advance the Control Ring membership.",
 			self.eviction_advancer_failures_total.get(),
+		);
+		render_gauge(
+			&mut out,
+			"wendelon_storage_table_drop_l2_deferred_debts",
+			"Local table-drop L2 obligations deferred until this participant is leader.",
+			self.storage_table_drop_l2_deferred_debts.get(),
 		);
 		render_gauge(
 			&mut out,
@@ -5171,6 +5387,48 @@ impl MetricsRegistry {
 			&l2_column_fetch_fallback_total,
 			"ADR 044 L2 column fetch strategy fallbacks by planner reason.",
 		);
+		render_gauge(
+			&mut out,
+			"wendelon_storage_retained_secondary_sidecar_files",
+			"Unreferenced secondary sidecar files retained pending owned GC across local managers.",
+			self.storage_retained_secondary_sidecar_files.get(),
+		);
+		render_gauge(
+			&mut out,
+			"wendelon_storage_retained_secondary_sidecar_bytes",
+			"Bytes in unreferenced secondary sidecar files retained pending owned GC across local managers.",
+			self.storage_retained_secondary_sidecar_bytes.get(),
+		);
+		render_gauge(
+			&mut out,
+			"wendelon_storage_counter_unresolved_slabs",
+			"Slabs held by unresolved counter tentative frames across local managers.",
+			self.storage_counter_unresolved_slabs.get(),
+		);
+		render_gauge(
+			&mut out,
+			"wendelon_storage_tier_snapshot_reconciliation_pending",
+			"Accepted canonical snapshots awaiting local reconciliation and physical verification across managers.",
+			self.storage_tier_snapshot_reconciliation_pending.get(),
+		);
+		render_gauge(
+			&mut out,
+			"wendelon_storage_lsm_control_intents_unresolved",
+			"Unresolved orphaned or recovered control LSM intents across local managers; includes deferred GC and sidecar recovery.",
+			self.storage_lsm_control_intents_unresolved.get(),
+		);
+		render_gauge(
+			&mut out,
+			"wendelon_storage_lsm_control_intents_legacy_unresolved",
+			"Unresolved control LSM intents without complete local evidence; operator recovery is required.",
+			self.storage_lsm_control_intents_legacy_unresolved.get(),
+		);
+		self.storage_tier_authority_retries.render(
+			&mut out, "wendelon_storage_tier_authority_retries_total",
+			"Availability retries while committed tier authority remains unverified; sustained retries keep the node Pending.",
+			"class", TierAuthorityRetryClass::LABELS,
+		);
+
 		let row_group_requests = namespaced_metric("storage_l2_row_group_fetch_requests_total");
 		self.storage_l2_row_group_fetch_requests.render(
 			&mut out,
@@ -5447,6 +5705,100 @@ impl MetricsRegistry {
 			"wendelon_storage_multirow_recompact_total",
 			"Background multi-row recompaction operations completed.",
 			self.storage_multirow_recompact_total.get(),
+		);
+		render_counter(
+			&mut out,
+			"wendelon_storage_index_relocation_refused_total",
+			"Index relocation pairs refused because neither the source nor the output was indexed.",
+			self.storage_index_relocation_refused_total.get(),
+		);
+		render_counter(
+			&mut out,
+			"wendelon_storage_version_conflict_refused_total",
+			"Appends refused because their version identity already holds a different payload.",
+			self.storage_version_conflict_refused_total.get(),
+		);
+		render_counter(
+			&mut out,
+			"wendelon_storage_version_conflict_recovered_total",
+			"Copies of conflicting versions recorded at open; reads of them refuse.",
+			self.storage_version_conflict_recovered_total.get(),
+		);
+		render_counter(
+			&mut out,
+			"wendelon_storage_tier_rows_repaired_total",
+			"Tiered slabs whose indexed rows were repaired against their object before first serve.",
+			self.storage_tier_rows_repaired_total.get(),
+		);
+		self.storage_open_disagreeing_slab_files_total.render(
+			&mut out,
+			"wendelon_storage_open_disagreeing_slab_files_total",
+			"Local slab files open classified as disagreeing with the committed state; each is kept as evidence and never served.",
+		);
+		render_gauge(
+			&mut out,
+			"wendelon_storage_quarantined_slab_files",
+			"Local slab files currently held as evidence because they disagree with the committed state.",
+			self.storage_quarantined_slab_files.get(),
+		);
+		render_gauge(
+			&mut out,
+			"wendelon_storage_quarantined_slab_file_bytes",
+			"Bytes of the local slab files currently held as evidence.",
+			self.storage_quarantined_slab_file_bytes.get(),
+		);
+		render_gauge(
+			&mut out,
+			"wendelon_storage_unresolved_tier_cleanup_intents",
+			"Durable tier cleanup intents awaiting confirmed publication or ordered abandonment.",
+			self.storage_unresolved_tier_cleanup_intents.get(),
+		);
+		render_gauge(
+			&mut out,
+			"wendelon_storage_unresolved_tier_cleanup_bytes",
+			"L2 object bytes retained by unresolved tier cleanup intents.",
+			self.storage_unresolved_tier_cleanup_bytes.get(),
+		);
+		render_gauge(
+			&mut out,
+			"wendelon_storage_unresolved_tier_cleanup_unknown_size",
+			"Retained tier cleanup objects whose byte size is unknown.",
+			self.storage_unresolved_tier_cleanup_unknown_size.get(),
+		);
+		render_gauge(
+			&mut out,
+			"wendelon_storage_tier_cleanup_records",
+			"In-memory tier cleanup records scanned by reconciliation before deduplication.",
+			self.storage_tier_cleanup_records.get(),
+		);
+		render_gauge(
+			&mut out,
+			"wendelon_storage_cleanup_authority_missing",
+			"Open storage managers fenced because durable cleanup authority is missing.",
+			self.storage_cleanup_authority_missing.get(),
+		);
+		render_counter(
+			&mut out,
+			"wendelon_storage_cleanup_unrecorded_supersessions_total",
+			"Committed tier supersessions without durable cleanup authority.",
+			self.storage_cleanup_unrecorded_supersessions_total.get(),
+		);
+		render_gauge(
+			&mut out,
+			"wendelon_storage_cleanup_unrecorded_supersessions",
+			"Durable count of supersessions missing cleanup records for open managers.",
+			self.storage_cleanup_unrecorded_supersessions.get(),
+		);
+		render_gauge(
+			&mut out,
+			"wendelon_storage_cleanup_history_incomplete",
+			"Open storage managers whose cleanup authority was previously missing; object-store reconciliation is required.",
+			self.storage_cleanup_history_incomplete.get(),
+		);
+		self.storage_rehydration_skipped_total.render(
+			&mut out,
+			"wendelon_storage_rehydration_skipped_total",
+			"Hot tiered slabs not rehydrated, by reason; the slab keeps serving from L2.",
 		);
 		render_counter(
 			&mut out,
@@ -6411,12 +6763,82 @@ mod tests {
 	use super::{
 		Histogram, IoUringClass, MetricsRegistry, MigrationProxyReadOutcome,
 		NetworkCompressionPath, PbcRuntime, PendingFinalizationReplayPath,
+		STORAGE_DISAGREEING_SLAB_FILE_REASONS, STORAGE_REHYDRATION_SKIP_REASONS,
 		TableRetentionMetricPolicy, render_histogram, table_object_id_label,
 	};
 	use crate::schema::{IndexObjectId, TableObjectId, TenantId, WriteStatus};
 	use std::time::Duration;
 
 	const TEST_BUCKETS_MICROS: &[u64] = &[500, 1_000, 2_500];
+
+	#[test]
+	fn retained_secondary_sidecar_gauges_are_exported() {
+		let registry = MetricsRegistry::default();
+		registry.storage_retained_secondary_sidecar_files.add(2);
+		registry.storage_retained_secondary_sidecar_bytes.add(17);
+		let rendered = registry.render_prometheus();
+		assert!(
+			rendered
+				.lines()
+				.any(|line| line == "wendelon_storage_retained_secondary_sidecar_files 2")
+		);
+		assert!(
+			rendered
+				.lines()
+				.any(|line| line == "wendelon_storage_retained_secondary_sidecar_bytes 17")
+		);
+	}
+
+	#[test]
+	fn unresolved_counter_slab_gauge_is_exported() {
+		let registry = MetricsRegistry::default();
+		registry.storage_counter_unresolved_slabs.add(2);
+		let rendered = registry.render_prometheus();
+		assert!(
+			rendered
+				.lines()
+				.any(|line| line == "wendelon_storage_counter_unresolved_slabs 2")
+		);
+		registry.storage_counter_unresolved_slabs.sub(1);
+		assert!(
+			registry
+				.render_prometheus()
+				.lines()
+				.any(|line| line == "wendelon_storage_counter_unresolved_slabs 1")
+		);
+	}
+
+	#[test]
+	fn tier_authority_availability_retries_export_only_fixed_classes() {
+		use super::TierAuthorityRetryClass as Class;
+		let registry = MetricsRegistry::default();
+		for class in [
+			Class::ObjectNotFound,
+			Class::RemoteUnexpected,
+			Class::RateLimited,
+			Class::Timeout,
+			Class::IoUnavailable,
+		] {
+			registry.observe_storage_tier_authority_retry(class);
+			registry.observe_storage_tier_authority_retry(class);
+		}
+		let rendered = registry.render_prometheus();
+		let rows = rendered
+			.lines()
+			.filter(|line| line.starts_with("wendelon_storage_tier_authority_retries_total{"))
+			.collect::<Vec<_>>();
+		assert_eq!(rows.len(), 5);
+		for label in Class::LABELS {
+			assert!(
+				rows.contains(
+					&format!(
+						"wendelon_storage_tier_authority_retries_total{{class=\"{label}\"}} 2"
+					)
+					.as_str()
+				)
+			);
+		}
+	}
 
 	#[test]
 	fn control_wal_deferral_and_poison_gauges_render_their_values() {
@@ -6602,6 +7024,149 @@ mod tests {
 			"network_compression_decode_error_total{codec=\"lz4_frame\",",
 			"reason="
 		)));
+	}
+
+	#[test]
+	fn registry_renders_metadata_degradation_counters() {
+		let registry = MetricsRegistry::default();
+		registry.storage_supersession_metadata_degraded_total.inc();
+		registry.storage_tombstone_metadata_degraded_total.inc();
+		registry.storage_tombstone_metadata_degraded_total.inc();
+		let rendered = registry.render_prometheus();
+		for (name, count) in [
+			("storage_supersession_metadata_degraded_total", 1),
+			("storage_tombstone_metadata_degraded_total", 2),
+		] {
+			let metric = namespaced_test_metric(name);
+			assert!(
+				rendered
+					.lines()
+					.any(|line| line == format!("# TYPE {metric} counter"))
+			);
+			assert!(
+				rendered
+					.lines()
+					.any(|line| line == format!("{metric} {count}"))
+			);
+		}
+	}
+
+	#[test]
+	fn registry_renders_unknown_retained_object_size_gauge() {
+		let registry = MetricsRegistry::default();
+		registry.storage_unresolved_tier_cleanup_unknown_size.add(2);
+		let rendered = registry.render_prometheus();
+		let metric = namespaced_test_metric("storage_unresolved_tier_cleanup_unknown_size");
+		assert!(
+			rendered
+				.lines()
+				.any(|line| line == format!("# TYPE {metric} gauge"))
+		);
+		assert!(rendered.lines().any(|line| line == format!("{metric} 2")));
+	}
+
+	#[test]
+	fn registry_renders_unresolved_tier_cleanup_metrics() {
+		let registry = MetricsRegistry::default();
+		registry.observe_storage_unresolved_tier_cleanup(100);
+		registry.observe_storage_unresolved_tier_cleanup(20);
+		registry.release_storage_unresolved_tier_cleanup(1, 20);
+		let rendered = registry.render_prometheus();
+		let count = namespaced_test_metric("storage_unresolved_tier_cleanup_intents");
+		let bytes = namespaced_test_metric("storage_unresolved_tier_cleanup_bytes");
+		for line in [
+			format!("# TYPE {count} gauge"),
+			format!("{count} 1"),
+			format!("# TYPE {bytes} gauge"),
+			format!("{bytes} 100"),
+		] {
+			assert!(
+				rendered.lines().any(|rendered| rendered == line),
+				"missing exporter line: {line}"
+			);
+		}
+		registry.release_storage_unresolved_tier_cleanup(1, 100);
+		assert_eq!(registry.storage_unresolved_tier_cleanup_intents.get(), 0);
+		assert_eq!(registry.storage_unresolved_tier_cleanup_bytes.get(), 0);
+	}
+
+	#[test]
+	fn registry_renders_tier_cleanup_record_count() {
+		let registry = MetricsRegistry::default();
+		registry.storage_tier_cleanup_records.add(3);
+		let rendered = registry.render_prometheus();
+		let name = namespaced_test_metric("storage_tier_cleanup_records");
+		assert!(rendered.lines().any(|line| line == format!("{name} 3")));
+	}
+
+	#[test]
+	fn registry_renders_retired_tier_quarantine_reason() {
+		let registry = MetricsRegistry::default();
+		registry.observe_storage_disagreeing_slab_file("retired_tier", 7);
+		let name = namespaced_test_metric("storage_open_disagreeing_slab_files_total");
+		assert!(
+			registry
+				.render_prometheus()
+				.lines()
+				.any(|line| line == format!("{name}{{reason=\"retired_tier\"}} 1"))
+		);
+	}
+
+	#[test]
+	fn registry_renders_quarantined_slab_file_metrics() {
+		let registry = MetricsRegistry::default();
+		registry.observe_storage_disagreeing_slab_file("tier_pointer", 100);
+		registry.observe_storage_disagreeing_slab_file("tier_pointer", 20);
+		registry.release_storage_quarantined_slab_files(1, 20);
+		for _ in 0..3 {
+			registry.observe_storage_rehydration_skipped("quarantined_file");
+		}
+		let rendered = registry.render_prometheus();
+		let disagreeing = namespaced_test_metric("storage_open_disagreeing_slab_files_total");
+		let files = namespaced_test_metric("storage_quarantined_slab_files");
+		let bytes = namespaced_test_metric("storage_quarantined_slab_file_bytes");
+		let skipped = namespaced_test_metric("storage_rehydration_skipped_total");
+		for line in [
+			format!("# TYPE {disagreeing} counter"),
+			format!("{disagreeing}{{reason=\"tier_pointer\"}} 2"),
+			format!("# TYPE {files} gauge"),
+			format!("{files} 1"),
+			format!("# TYPE {bytes} gauge"),
+			format!("{bytes} 100"),
+			format!("# TYPE {skipped} counter"),
+			format!("{skipped}{{reason=\"quarantined_file\"}} 3"),
+		] {
+			assert!(
+				rendered.lines().any(|rendered| rendered == line),
+				"missing exporter line: {line}"
+			);
+		}
+		// Each family carries exactly its bounded reason set and no tenant, key
+		// or slab label.
+		for (family, series) in [
+			(&disagreeing, STORAGE_DISAGREEING_SLAB_FILE_REASONS.len()),
+			(&files, 1),
+			(&bytes, 1),
+			(&skipped, STORAGE_REHYDRATION_SKIP_REASONS.len()),
+		] {
+			let samples = rendered
+				.lines()
+				.filter(|line| {
+					line.strip_prefix(family.as_str())
+						.is_some_and(|rest| rest.starts_with(' ') || rest.starts_with('{'))
+				})
+				.collect::<Vec<_>>();
+			assert_eq!(samples.len(), series, "{family}: {samples:?}");
+			for sample in samples {
+				let labels = &sample[family.len()..];
+				assert!(
+					!labels.contains("tenant")
+						&& !labels.contains("key")
+						&& !labels.contains("slab"),
+					"{sample}"
+				);
+			}
+		}
 	}
 
 	#[test]

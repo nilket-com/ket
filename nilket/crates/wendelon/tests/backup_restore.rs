@@ -343,7 +343,11 @@ async fn whole_node_loss_restore_bootstraps_in_recovery_mode_and_serves_recovere
 		vec![restored.local_node.id]
 	);
 
-	let restored_location = restored.slab.lookup(tenant(), id(key_locality)).unwrap();
+	let restored_location = restored
+		.slab
+		.lookup(tenant(), id(key_locality))
+		.unwrap()
+		.unwrap();
 	assert_eq!(
 		restored.slab.read(restored_location).await.unwrap(),
 		first_frame
@@ -351,6 +355,7 @@ async fn whole_node_loss_restore_bootstraps_in_recovery_mode_and_serves_recovere
 	let restored_second = restored
 		.slab
 		.lookup(tenant(), id(key_locality + 1))
+		.unwrap()
 		.unwrap();
 	assert_eq!(
 		restored.slab.read(restored_second).await.unwrap(),

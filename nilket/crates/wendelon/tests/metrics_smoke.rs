@@ -1,9 +1,11 @@
 #[path = "support/control_ring.rs"]
 mod support;
 
-async fn open_test_manager(config: SlabManagerConfig) -> std::io::Result<SlabManager> {
+async fn initialize_test_manager(
+	config: SlabManagerConfig,
+) -> std::io::Result<std::sync::Arc<SlabManager>> {
 	let owner = wendelon::storage::ownership::DataDirectoryOwner::acquire_existing(&config.dir)?;
-	SlabManager::open_with_owner(config, owner).await
+	SlabManager::initialize_new_store_with_owner(config, owner).await
 }
 
 use arrow::array::{LargeBinaryArray, LargeBinaryBuilder};
@@ -178,26 +180,24 @@ async fn build_manager_with_sealed_slabs(
 ) {
 	let dir = fresh_dir("l1");
 	let io = spawn_io_thread(64).unwrap();
-	let manager = Arc::new(
-		open_test_manager(SlabManagerConfig {
-			dir: dir.to_path_buf(),
-			max_slab_bytes: 1,
-			io,
-			l2: Some(l2),
-			rehydration: wendelon::storage::manager::RehydrationPolicy::default(),
-			l2_column_fetch: Default::default(),
-			row_group_writer: Default::default(),
-			l2_row_group_fetch: Default::default(),
-			encoding_writer: Default::default(),
-			l2_chunk_layout: Default::default(),
-			l2_encoding_fetch: Default::default(),
-			encoding_compute: Default::default(),
-			group_commit: wendelon::storage::GroupCommitConfig::default(),
-			crypto: test_crypto(),
-		})
-		.await
-		.unwrap(),
-	);
+	let manager = initialize_test_manager(SlabManagerConfig {
+		dir: dir.to_path_buf(),
+		max_slab_bytes: 1,
+		io,
+		l2: Some(l2),
+		rehydration: wendelon::storage::manager::RehydrationPolicy::default(),
+		l2_column_fetch: Default::default(),
+		row_group_writer: Default::default(),
+		l2_row_group_fetch: Default::default(),
+		encoding_writer: Default::default(),
+		l2_chunk_layout: Default::default(),
+		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
+		group_commit: wendelon::storage::GroupCommitConfig::default(),
+		crypto: test_crypto(),
+	})
+	.await
+	.unwrap();
 	manager
 		.append(tenant(), id(1), hlc(1, 1), b"hello-1")
 		.await
@@ -315,6 +315,11 @@ async fn scrape_endpoint_exposes_data_ring_and_storage_metrics() {
 	assert!(body.contains("wendelon_network_compression_decode_error_total"));
 	assert!(body.contains("wendelon_cdc_locality_heartbeats_committed_total"));
 	assert!(body.contains("wendelon_raft_entries_applied_total"));
+	assert!(
+		body.contains(
+			"wendelon_storage_tier_authority_retries_total{class=\"remote_unexpected\"} 0"
+		)
+	);
 	assert!(body.contains("wendelon_storage_content_hash_admissions_total"));
 	assert!(body.contains("wendelon_storage_content_hash_duplicate_absorptions_total"));
 	assert!(body.contains("wendelon_storage_csb_merge_logical_fingerprint_mismatch_total"));

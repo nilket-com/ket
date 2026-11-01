@@ -109,7 +109,7 @@ async fn ctr4_public_read_hides_tentative_before_failed_add_rollback() {
 	));
 	let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
 	loop {
-		if fx.leader_node.slab.lookup(tenant(), key).is_some() {
+		if fx.leader_node.slab.lookup(tenant(), key).unwrap().is_some() {
 			break;
 		}
 		assert!(
@@ -118,7 +118,7 @@ async fn ctr4_public_read_hides_tentative_before_failed_add_rollback() {
 		);
 		tokio::task::yield_now().await;
 	}
-	let location = fx.leader_node.slab.lookup(tenant(), key).unwrap();
+	let location = fx.leader_node.slab.lookup(tenant(), key).unwrap().unwrap();
 	assert_eq!(
 		fx.leader_node
 			.slab
@@ -162,7 +162,7 @@ async fn ctr4_public_read_hides_tentative_before_failed_add_rollback() {
 		.await
 		.unwrap();
 	let after = read(fx.leader.as_ref(), &fx.leader_node.pool, origin, key).await;
-	let local_raw = fx.leader_node.slab.lookup(tenant(), key);
+	let local_raw = fx.leader_node.slab.lookup(tenant(), key).unwrap();
 	shutdown_lease_node(fx.leader_node).await;
 	shutdown_lease_node(fx.follower_node).await;
 	assert_eq!(add.status, WriteStatus::INTERNAL_ERROR);

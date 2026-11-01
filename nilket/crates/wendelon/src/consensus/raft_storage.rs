@@ -92,7 +92,7 @@ use crate::storage::mutation_drain::MutationDrainRegistry;
 use crate::storage::ownership::DataDirectoryOwner;
 use crate::storage::{
 	AsyncFileOps, BlockingFileOps, CompactionCommit, FileHandle, IoUringFileOps, OpenFlags,
-	fsync_parent_dir, is_cdc_locality_heartbeat_finalization, write_file,
+	fsync_parent_dir, is_cdc_locality_heartbeat_finalization,
 };
 use bytemuck::{Pod, Zeroable};
 #[cfg(test)]
@@ -197,6 +197,33 @@ pub struct ControlRingBackupImage {
 	pub snapshot: Vec<u8>,
 }
 
+impl ControlRingBackupImage {
+	/// Identity of the exact input bytes, independent of decoded map order.
+	pub(crate) fn restore_artifact_hash(&self) -> [u8; 32] {
+		restore_artifact_hash(
+			control_artifact_digest_32(&self.wal),
+			self.wal.len() as u64,
+			control_artifact_digest_32(&self.snapshot),
+			self.snapshot.len() as u64,
+		)
+	}
+}
+
+fn restore_artifact_hash(
+	wal: [u8; 32],
+	wal_len: u64,
+	snapshot: [u8; 32],
+	snapshot_len: u64,
+) -> [u8; 32] {
+	let mut hash = control_artifact_hash::Context::new();
+	hash.update(b"wendelon-control-restore-v1\0");
+	hash.update(&wal_len.to_le_bytes());
+	hash.update(&wal);
+	hash.update(&snapshot_len.to_le_bytes());
+	hash.update(&snapshot);
+	hash.finish()
+}
+
 #[derive(Clone, Debug)]
 struct ControlArtifactPaths {
 	/// Base path used as the legacy monolithic WAL file location
@@ -255,6 +282,8 @@ struct LoadedSnapshot {
 	held: HeldSnapshot,
 	last_included: Option<LogId<u32>>,
 	state: SmState,
+	artifact_hash: [u8; 32],
+	artifact_bytes: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -327,6 +356,8 @@ struct PendingWalWrite {
 
 #[derive(Default)]
 struct WALReplay {
+	artifact_hasher: Option<control_artifact_hash::Context>,
+	artifact_bytes: u64,
 	entries: BTreeMap<u64, Entry<WendelonTypeConfig>>,
 	entry_positions: BTreeMap<u64, WalRecordPointer>,
 	last_log_id: Option<LogId<u32>>,
@@ -492,9 +523,24 @@ pub struct WendelonLogStore {
 	/// deletion of purged log.
 	publication: Arc<SnapshotPublication>,
 	_directory_owner: Option<DataDirectoryOwner>,
+	/// Captured from the bytes parsed at open, before any recovery mutation.
+	recovered_artifact_hash: Option<([u8; 32], Option<LogId<u32>>)>,
+	#[cfg(test)]
+	backup_after_wal_read_hold:
+		Arc<std::sync::Mutex<Option<(Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>>>,
 }
 
 impl WendelonLogStore {
+	#[cfg(test)]
+	pub(crate) fn pause_backup_after_wal_read_for_test(
+		&self,
+	) -> (Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>) {
+		let entered = Arc::new(tokio::sync::Semaphore::new(0));
+		let release = Arc::new(tokio::sync::Semaphore::new(0));
+		*self.backup_after_wal_read_hold.lock().unwrap() = Some((entered.clone(), release.clone()));
+		(entered, release)
+	}
+
 	/// In-memory store with no WAL backing. Intended for
 	/// openraft unit tests and intentionally ephemeral harnesses.
 	/// Live node bootstrap must use [`Self::open`] instead.
@@ -524,6 +570,9 @@ impl WendelonLogStore {
 			retention: None,
 			publication: Arc::new(SnapshotPublication::new(PublishedSnapshot::NoArtifact)),
 			_directory_owner: None,
+			#[cfg(test)]
+			backup_after_wal_read_hold: Default::default(),
+			recovered_artifact_hash: None,
 		}
 	}
 
@@ -746,6 +795,25 @@ impl WendelonLogStore {
 			replay.legacy_start,
 			&replay.entries,
 		)?;
+		// Both digests come from the buffers actually consumed by the parsers,
+		// including WAL padding. Never re-encode SmState to certify this input.
+		let wal_hash = replay
+			.artifact_hasher
+			.take()
+			.expect("replay input hasher")
+			.finish();
+		let (snapshot_hash, snapshot_bytes) = snapshot
+			.as_ref()
+			.map(|snapshot| (snapshot.artifact_hash, snapshot.artifact_bytes))
+			.unwrap_or((control_artifact_digest_32(&[]), 0));
+		let recovered_artifact_hash = restore_artifact_hash(
+			wal_hash,
+			replay.artifact_bytes,
+			snapshot_hash,
+			snapshot_bytes,
+		);
+		let input_applied =
+			recovery_committed.or_else(|| snapshot.as_ref().and_then(|s| s.last_included));
 		// The first effect of open, after every read-only refusal above.
 		complete_checkpoint_holder_at_open(
 			file_ops.as_ref(),
@@ -808,7 +876,12 @@ impl WendelonLogStore {
 			wal_gate: Arc::new(Mutex::new(())),
 			retention,
 			publication: Arc::new(SnapshotPublication::new(published)),
+			recovered_artifact_hash: owner
+				.as_ref()
+				.map(|_| (recovered_artifact_hash, input_applied)),
 			_directory_owner: owner,
+			#[cfg(test)]
+			backup_after_wal_read_hold: Default::default(),
 		};
 		metrics().set_control_wal_store_poisoned(false);
 		// Log the validated durable snapshot covers, kept by a purge that ran before it was
@@ -1154,6 +1227,55 @@ impl WendelonLogStore {
 		Ok(())
 	}
 
+	/// A replay proof needs a verified snapshot prefix or an uninterrupted log from 1.
+	/// Unlike legacy recovery, it never accepts an unexplained retained prefix.
+	/// It applies the rule reopen applies: a validated durable snapshot, recovered
+	/// or published since, explains the prefix it covers. A failed publication
+	/// refuses until reopen validates what is on disk.
+	pub(crate) async fn replacement_replay_base_verified(&self) -> bool {
+		let Ok(published) = self.publication.covered_log_id().await else {
+			return false;
+		};
+		let guard = self.inner.read().await;
+		let recovered = guard
+			.recovered_snapshot
+			.as_ref()
+			.and_then(|s| s.last_included);
+		let boundary = match (recovered, published) {
+			(Some(recovered), Some(published)) if published.index > recovered.index => {
+				Some(published)
+			}
+			(None, published) => published,
+			(recovered, _) => recovered,
+		};
+		// A logical purge does not wait for snapshot coverage: every purged entry
+		// must lie under the verified boundary, or the purge hides a gap.
+		if guard
+			.last_purged
+			.is_some_and(|purged| boundary.is_none_or(|boundary| purged.index > boundary.index))
+		{
+			return false;
+		}
+		// Unlike open, the runtime log may still retain entries a published
+		// snapshot covers; it must only leave no gap above the boundary.
+		let Some(&first) = guard.entries.keys().next() else {
+			return true;
+		};
+		let starts_covered = match boundary {
+			Some(boundary) => boundary
+				.index
+				.checked_add(1)
+				.is_some_and(|next| first <= next),
+			None => first <= 1,
+		};
+		starts_covered
+			&& guard
+				.entries
+				.keys()
+				.zip(guard.entries.keys().skip(1))
+				.all(|(previous, index)| previous.checked_add(1) == Some(*index))
+	}
+
 	pub async fn recovered_state_machine(&self) -> std::io::Result<WendelonStateMachine> {
 		let (snapshot, entries, checkpoint, snapshot_runtime) = {
 			let guard = self.inner.read().await;
@@ -1173,8 +1295,21 @@ impl WendelonLogStore {
 				snapshot_runtime,
 			)
 		};
-		let state_machine =
+		let mut state_machine =
 			WendelonStateMachine::from_recovery(snapshot, entries, checkpoint, snapshot_runtime)?;
+		if let (Some((hash, input_applied)), Some(owner)) =
+			(self.recovered_artifact_hash, &self._directory_owner)
+		{
+			let _permit = owner.write_permit()?;
+			let applied = state_machine.inner.read().await.state.last_applied_log_id;
+			if applied == input_applied {
+				state_machine.restore_replay = Some(ControlRestoreReplay {
+					owner: owner.clone(),
+					hash,
+					applied,
+				});
+			}
+		}
 		Ok(match &self.retention {
 			Some(guard) => state_machine.with_retention_guard(guard.clone()),
 			None => state_machine,
@@ -1183,73 +1318,99 @@ impl WendelonLogStore {
 
 	pub async fn export_backup(
 		&self,
-		state_machine: &WendelonStateMachine,
+		_state_machine: &WendelonStateMachine,
 	) -> std::io::Result<ControlRingBackupImage> {
-		let (artifact_paths, file_ops, wal_segments) = {
-			let guard = self.inner.read().await;
-			(
-				guard.artifact_paths.clone(),
-				guard.file_ops.clone(),
-				guard.wal_segments.clone(),
-			)
-		};
-		let artifact_paths = artifact_paths.ok_or_else(|| {
-			Error::new(
-				ErrorKind::Unsupported,
-				"cannot export a backup from the in-memory Control Ring store",
-			)
-		})?;
-		let file_ops = file_ops.ok_or_else(|| {
-			Error::new(
-				ErrorKind::Unsupported,
-				"cannot export a backup without file I/O backing",
-			)
-		})?;
-		let wal =
-			read_wal_backup_bytes(file_ops.as_ref(), &wal_segments, &artifact_paths.wal).await?;
-		let vote = read_optional_artifact(file_ops.as_ref(), &artifact_paths.vote).await?;
-		// `current` is read under the publication lock; a failed publication refuses.
-		let snapshot = {
+		self.export_backup_with_state()
+			.await
+			.map(|(image, _)| image)
+	}
+
+	/// Metadata and the node's consistent-cut record come from the copied bytes,
+	/// never a later live SM observation. No restore authority is issued here.
+	pub(crate) async fn export_backup_with_state(
+		&self,
+	) -> std::io::Result<(ControlRingBackupImage, SmState)> {
+		let (wal, vote, snapshot) = {
+			let _wal = self.wal_gate.lock().await;
+			let (paths, file_ops, segments) = {
+				let guard = self.inner.read().await;
+				if let Some(poison) = guard.poisoned {
+					return Err(poisoned_error(poison));
+				}
+				(
+					guard.artifact_paths.clone(),
+					guard.file_ops.clone(),
+					guard.wal_segments.clone(),
+				)
+			};
+			let paths = paths.ok_or_else(|| {
+				Error::new(
+					ErrorKind::Unsupported,
+					"cannot export a backup from the in-memory Control Ring store",
+				)
+			})?;
+			let file_ops = file_ops.ok_or_else(|| {
+				Error::new(
+					ErrorKind::Unsupported,
+					"cannot export a backup without file I/O backing",
+				)
+			})?;
+			// The publication lock is a leaf under the WAL gate; no SM lock is
+			// acquired here, and both locks are released before pure replay.
 			let publication = self.publication.state.lock().await;
 			SnapshotPublication::healthy(&publication)?;
-			read_optional_artifact(file_ops.as_ref(), &artifact_paths.snapshot).await?
+			let wal = read_wal_backup_bytes(file_ops.as_ref(), &segments, &paths.wal).await?;
+			let vote = read_optional_artifact(file_ops.as_ref(), &paths.vote).await?;
+			let snapshot = read_optional_artifact(file_ops.as_ref(), &paths.snapshot).await?;
+			(wal, vote, snapshot)
 		};
+		#[cfg(test)]
+		{
+			let hold = self.backup_after_wal_read_hold.lock().unwrap().take();
+			if let Some((entered, release)) = hold {
+				entered.add_permits(1);
+				release.acquire().await.unwrap().forget();
+			}
+		}
 		if wal.is_empty() && snapshot.is_empty() {
 			return Err(Error::new(
 				ErrorKind::InvalidData,
 				"backup requires at least one Control Ring recovery artifact",
 			));
 		}
-
-		let state = state_machine.state_snapshot().await;
+		let state = replay_exported_control_state(&wal, &snapshot)?;
 		let encoded_state = encode_snapshot(&state)
 			.map_err(|err| Error::other(format!("encode backup state snapshot: {err}")))?;
 		let mut voter_ids: Vec<u32> = state.last_membership.voter_ids().collect();
 		voter_ids.sort_unstable();
 
-		Ok(ControlRingBackupImage {
-			manifest: ControlRingBackupManifest {
-				format_version: CONTROL_RING_BACKUP_FORMAT_VERSION,
-				last_applied_log_id: state.last_applied_log_id,
-				voter_ids,
-				lease_count: state.leases.len() as u64,
-				tiered_slab_count: state.tiered_slabs.len() as u64,
-				migration_count: state.migrations.len() as u64,
-				wal_bytes: wal.len() as u64,
-				vote_bytes: vote.len() as u64,
-				snapshot_bytes: snapshot.len() as u64,
-				state_hash: control_artifact_digest_32(&encoded_state),
+		Ok((
+			ControlRingBackupImage {
+				manifest: ControlRingBackupManifest {
+					format_version: CONTROL_RING_BACKUP_FORMAT_VERSION,
+					last_applied_log_id: state.last_applied_log_id,
+					voter_ids,
+					lease_count: state.leases.len() as u64,
+					tiered_slab_count: state.tiered_slabs.len() as u64,
+					migration_count: state.migrations.len() as u64,
+					wal_bytes: wal.len() as u64,
+					vote_bytes: vote.len() as u64,
+					snapshot_bytes: snapshot.len() as u64,
+					state_hash: control_artifact_digest_32(&encoded_state),
+				},
+				wal,
+				vote,
+				snapshot,
 			},
-			wal,
-			vote,
-			snapshot,
-		})
+			state,
+		))
 	}
 
 	pub(crate) async fn restore_backup(
 		backup: &ControlRingBackupImage,
 		target_dir: impl AsRef<Path>,
 		owner: &DataDirectoryOwner,
+		resume: bool,
 	) -> std::io::Result<()> {
 		let target_dir = target_dir.as_ref();
 		owner.ensure_path(target_dir)?;
@@ -1271,47 +1432,43 @@ impl WendelonLogStore {
 
 		let (wal_path, vote_path, snapshot_path) = control_artifact_paths(target_dir);
 		let file_ops: Arc<dyn AsyncFileOps> = Arc::new(BlockingFileOps::with_owner(owner.clone()));
-		ensure_wal_artifacts_absent(file_ops.as_ref(), &wal_path).await?;
-		ensure_artifact_absent(&vote_path)?;
-		ensure_artifact_absent(&snapshot_path)?;
-
-		write_file(
+		if resume {
+			if !discover_named_wal_segments(file_ops.as_ref(), &wal_path)
+				.await?
+				.is_empty() || backup.snapshot.is_empty() && snapshot_path.exists()
+			{
+				return Err(Error::new(
+					ErrorKind::InvalidData,
+					"pending restore has unexpected control artifacts",
+				));
+			}
+		} else {
+			ensure_wal_artifacts_absent(file_ops.as_ref(), &wal_path).await?;
+			ensure_artifact_absent(&vote_path)?;
+			ensure_artifact_absent(&snapshot_path)?;
+		}
+		crate::storage::file_ops::write_restore_file(
 			file_ops.as_ref(),
 			&wal_path,
-			OpenFlags {
-				write: true,
-				create_new: true,
-				..Default::default()
-			},
 			&backup.wal,
+			resume,
 		)
 		.await?;
-		fsync_parent_dir(file_ops.as_ref(), &wal_path).await?;
-		write_file(
+		crate::storage::file_ops::write_restore_file(
 			file_ops.as_ref(),
 			&vote_path,
-			OpenFlags {
-				write: true,
-				create_new: true,
-				..Default::default()
-			},
 			&backup.vote,
+			resume,
 		)
 		.await?;
-		fsync_parent_dir(file_ops.as_ref(), &vote_path).await?;
 		if !backup.snapshot.is_empty() {
-			write_file(
+			crate::storage::file_ops::write_restore_file(
 				file_ops.as_ref(),
 				&snapshot_path,
-				OpenFlags {
-					write: true,
-					create_new: true,
-					..Default::default()
-				},
 				&backup.snapshot,
+				resume,
 			)
 			.await?;
-			fsync_parent_dir(file_ops.as_ref(), &snapshot_path).await?;
 		}
 		Ok(())
 	}
@@ -2718,6 +2875,38 @@ fn prune_expired_revoked_actor_keys(state: &mut SmState, prune_before_ms: u64) {
 		.retain(|_, revoked_at_ms| *revoked_at_ms == 0 || *revoked_at_ms >= prune_before_ms);
 }
 
+/// A weak view of the canonical state, bound when the observer is installed.
+/// Reading it never keeps a state machine or data-directory owner alive between
+/// attempts. The lease excludes canonical writes during comparison/publication.
+#[derive(Clone)]
+pub struct TierSnapshotSource(std::sync::Weak<RwLock<SmInner>>);
+
+pub(crate) struct TierSnapshotLease(tokio::sync::OwnedRwLockReadGuard<SmInner>);
+
+impl TierSnapshotSource {
+	pub(crate) async fn read(&self) -> std::io::Result<TierSnapshotLease> {
+		let inner = self
+			.0
+			.upgrade()
+			.ok_or_else(|| Error::new(ErrorKind::BrokenPipe, "canonical tier source closed"))?;
+		Ok(TierSnapshotLease(inner.read_owned().await))
+	}
+}
+impl TierSnapshotLease {
+	pub(crate) fn revision(&self) -> u64 {
+		self.0.tier_revision
+	}
+	pub(crate) fn tiers(&self) -> Vec<TieredSlab> {
+		self.0.state.tiered_slabs.values().cloned().collect()
+	}
+	pub(crate) fn has_migrated_ranges(&self) -> bool {
+		!self.0.state.tombstones.is_empty()
+	}
+	pub(crate) fn index(&self) -> Option<u64> {
+		self.0.state.last_applied_log_id.map(|id| id.index)
+	}
+}
+
 /// Out-of-band observer for [`TieredSlab`] apply events.
 ///
 /// Wendelon's `SlabManager` implements this so every node — not
@@ -2726,6 +2915,28 @@ fn prune_expired_revoked_actor_keys(state: &mut SmState, prune_before_ms: u64) {
 /// machine's apply loop and must therefore be non-blocking.
 #[async_trait::async_trait]
 pub trait TierObserver: Send + Sync {
+	/// Bound once at SM construction, before the observer is used.
+	fn bind_tier_snapshot_source(&self, _source: TierSnapshotSource) {}
+
+	/// Fence new admissions before committed retirement changes control state.
+	/// This hook is synchronous and must not wait on filesystem or network IO.
+	fn before_slab_retired(&self, _slab_id: SlabId, _applied_log_index: u64) {}
+
+	/// Called synchronously before publishing an incoming control snapshot.
+	fn before_tier_snapshot_install(&self) -> std::io::Result<u64> {
+		Ok(0)
+	}
+
+	/// Reconcile the complete committed tier set while admission stays fenced.
+	async fn on_tier_snapshot_installed(
+		&self,
+		_tiers: &[TieredSlab],
+		_index: Option<u64>,
+		_snapshot_epoch: u64,
+	) -> std::io::Result<()> {
+		Ok(())
+	}
+
 	async fn on_slab_tiered(
 		&self,
 		tier: &TieredSlab,
@@ -2835,6 +3046,9 @@ struct SnapshotRuntime {
 	publication: Arc<SnapshotPublication>,
 	/// Completes physical log deletion a newly published snapshot now covers.
 	deferred_purge: Option<Arc<dyn DeferredPurge>>,
+	#[cfg(test)]
+	install_after_publication_hold:
+		Arc<std::sync::Mutex<Option<(Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>>>,
 }
 
 impl SnapshotRuntime {
@@ -2849,6 +3063,8 @@ impl SnapshotRuntime {
 			paths,
 			publication,
 			deferred_purge,
+			#[cfg(test)]
+			install_after_publication_hold: Arc::new(std::sync::Mutex::new(None)),
 		}
 	}
 
@@ -2883,8 +3099,12 @@ enum PublishedSnapshot {
 impl PublishedSnapshot {
 	/// The log index a durable artifact covers: the only authority to delete log below it.
 	fn covered_index(self) -> Option<u64> {
+		self.covered_log_id().map(|id| id.index)
+	}
+
+	fn covered_log_id(self) -> Option<LogId<u32>> {
 		match self {
-			Self::Artifact(Some(id)) => Some(id.index),
+			Self::Artifact(Some(id)) => Some(id),
 			_ => None,
 		}
 	}
@@ -2974,6 +3194,10 @@ impl SnapshotPublication {
 	/// empty state, is healthy with no coverage.
 	async fn covered_index(&self) -> std::io::Result<Option<u64>> {
 		Self::healthy(&*self.state.lock().await).map(PublishedSnapshot::covered_index)
+	}
+
+	async fn covered_log_id(&self) -> std::io::Result<Option<LogId<u32>>> {
+		Self::healthy(&*self.state.lock().await).map(PublishedSnapshot::covered_log_id)
 	}
 }
 
@@ -3273,6 +3497,9 @@ impl<W: Write> Write for HashingWriter<W> {
 #[derive(Default)]
 struct SmInner {
 	state: SmState,
+	/// Process-local freshness for tier/retirement/metadata changes only.
+	/// Read and advanced under the canonical state lock; never serialized.
+	tier_revision: u64,
 	snapshot: Option<HeldSnapshot>,
 	/// Monotonic id handed out in built snapshots so every meta
 	/// has a unique `snapshot_id` even when the state hasn't
@@ -3280,12 +3507,69 @@ struct SmInner {
 	snapshot_seq: u64,
 }
 
+fn recover_sm_inner(
+	snapshot: Option<LoadedSnapshot>,
+	entries: Vec<Entry<WendelonTypeConfig>>,
+	checkpoint: Option<RecoveryCheckpoint>,
+) -> std::io::Result<SmInner> {
+	let mut inner = SmInner::default();
+	let snapshot_boundary = if let Some(snapshot) = snapshot.clone() {
+		inner.state = snapshot.state;
+		inner.state.last_applied_log_id = snapshot.held.meta.last_log_id;
+		inner.state.last_membership = snapshot.held.meta.last_membership.clone();
+		inner.snapshot = Some(snapshot.held.clone());
+		inner.snapshot_seq = 1;
+		snapshot.held.meta.last_log_id.map(|id| id.index)
+	} else {
+		None
+	};
+
+	let apply_upto = if let Some(cp) = checkpoint {
+		if let Some(boundary) = snapshot_boundary {
+			if cp.commit_index < boundary {
+				return Err(Error::new(
+					ErrorKind::InvalidData,
+					format!(
+						"recovery checkpoint commit_index {} is behind snapshot boundary {}",
+						cp.commit_index, boundary
+					),
+				));
+			}
+		}
+		cp.commit_index
+	} else {
+		snapshot_boundary.unwrap_or(0)
+	};
+
+	for entry in entries {
+		if entry.log_id.index > apply_upto {
+			break;
+		}
+		apply_entry_to_state(&mut inner.state, &entry);
+		inner.state.last_applied_log_id = Some(match inner.state.last_applied_log_id {
+			Some(prev) if prev > entry.log_id => prev,
+			_ => entry.log_id,
+		});
+	}
+
+	Ok(inner)
+}
+
 /// Wendelon's Raft state machine. Lease / epoch / E_safe state
 /// lives behind an `Arc<RwLock<_>>` so the snapshot builder can
 /// take a read lock for a consistent view without blocking apply
 /// traffic longer than the postcard encode takes.
 #[derive(Clone)]
+struct ControlRestoreReplay {
+	owner: DataDirectoryOwner,
+	hash: [u8; 32],
+	applied: Option<LogId<u32>>,
+}
+
+#[derive(Clone)]
 pub struct WendelonStateMachine {
+	/// Bootstrap-only receipt minted after owner-bound input parsing and replay.
+	restore_replay: Option<ControlRestoreReplay>,
 	inner: Arc<RwLock<SmInner>>,
 	/// ADR 0095 node-local admission/drain authority. Raft apply closes an
 	/// object here when DROP prepare commits; data paths increment through the
@@ -3320,6 +3604,24 @@ pub struct WendelonStateMachine {
 }
 
 impl WendelonStateMachine {
+	#[cfg(test)]
+	pub(crate) async fn seed_complete_snapshot_state_for_test(&self, state: SmState) {
+		self.inner.write().await.state = state;
+	}
+
+	#[cfg(test)]
+	pub(crate) fn pause_snapshot_after_publication_for_test(
+		&self,
+		entered: Arc<tokio::sync::Semaphore>,
+		release: Arc<tokio::sync::Semaphore>,
+	) {
+		*self
+			.snapshot_runtime
+			.install_after_publication_hold
+			.lock()
+			.unwrap() = Some((entered, release));
+	}
+
 	pub fn new() -> Self {
 		let observability_metrics = metrics();
 		observability_metrics.set_drop_reclaim_debts(0);
@@ -3343,6 +3645,7 @@ impl WendelonStateMachine {
 			observability_metrics,
 			finalization_events,
 			retention: None,
+			restore_replay: None,
 		}
 	}
 
@@ -3363,45 +3666,7 @@ impl WendelonStateMachine {
 		observability_metrics: &'static MetricsRegistry,
 	) -> std::io::Result<Self> {
 		let (finalization_events, _) = broadcast::channel(FINALIZATION_BROADCAST_CAPACITY);
-		let mut inner = SmInner::default();
-		let snapshot_boundary = if let Some(snapshot) = snapshot.clone() {
-			inner.state = snapshot.state;
-			inner.state.last_applied_log_id = snapshot.held.meta.last_log_id;
-			inner.state.last_membership = snapshot.held.meta.last_membership.clone();
-			inner.snapshot = Some(snapshot.held.clone());
-			inner.snapshot_seq = 1;
-			snapshot.held.meta.last_log_id.map(|id| id.index)
-		} else {
-			None
-		};
-
-		let apply_upto = if let Some(cp) = checkpoint {
-			if let Some(boundary) = snapshot_boundary {
-				if cp.commit_index < boundary {
-					return Err(Error::new(
-						ErrorKind::InvalidData,
-						format!(
-							"recovery checkpoint commit_index {} is behind snapshot boundary {}",
-							cp.commit_index, boundary
-						),
-					));
-				}
-			}
-			cp.commit_index
-		} else {
-			snapshot_boundary.unwrap_or(0)
-		};
-
-		for entry in entries {
-			if entry.log_id.index > apply_upto {
-				break;
-			}
-			apply_entry_to_state(&mut inner.state, &entry);
-			inner.state.last_applied_log_id = Some(match inner.state.last_applied_log_id {
-				Some(prev) if prev > entry.log_id => prev,
-				_ => entry.log_id,
-			});
-		}
+		let inner = recover_sm_inner(snapshot, entries, checkpoint)?;
 
 		let admission_snapshot = watch::channel(admission_snapshot_from_state(&inner.state)).0;
 		let revocation_snapshot = watch::channel(revocation_snapshot_from_state(&inner.state)).0;
@@ -3442,6 +3707,7 @@ impl WendelonStateMachine {
 			observability_metrics,
 			finalization_events,
 			retention: None,
+			restore_replay: None,
 		})
 	}
 
@@ -3450,6 +3716,7 @@ impl WendelonStateMachine {
 	/// Replacing an observer mid-run is not supported — callers
 	/// should reconstruct the SM instead.
 	pub fn with_tier_observer(mut self, observer: Arc<dyn TierObserver>) -> Self {
+		observer.bind_tier_snapshot_source(TierSnapshotSource(Arc::downgrade(&self.inner)));
 		self.tier_observer = Some(observer);
 		self
 	}
@@ -3589,6 +3856,58 @@ impl WendelonStateMachine {
 	/// Test / caller inspection hook — return a cloned snapshot
 	/// of the applied state without driving a full snapshot
 	/// build round-trip.
+	/// Identity of the exact snapshot/WAL buffers consumed by owner-bound replay.
+	/// This receipt is used only during bootstrap, before live writers start.
+	pub(crate) async fn restored_control_identity(
+		&self,
+		owner: &DataDirectoryOwner,
+	) -> std::io::Result<([u8; 32], Option<LogId<u32>>)> {
+		let _permit = owner.write_permit()?;
+		let proof = self.restore_replay.as_ref().ok_or_else(|| {
+			Error::new(
+				ErrorKind::InvalidData,
+				"control replay lacks an owner-bound artifact receipt",
+			)
+		})?;
+		if !proof.owner.same_owner(owner) {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"control replay belongs to another owner",
+			));
+		}
+		let applied = self.inner.read().await.state.last_applied_log_id;
+		if applied != proof.applied {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"control replay advanced beyond its restore receipt",
+			));
+		}
+		Ok((proof.hash, applied))
+	}
+
+	/// One authoritative tier pointer, copied under the SM lock. Callers may
+	/// hold a slab publication lock; no observer is awaited under this guard.
+	/// A caller holding a slab publication lock cannot await this lock: a
+	/// snapshot retry may hold the canonical read lease while draining that
+	/// publication lock. Refusal leaves its reconciliation work for next pass.
+	pub(crate) fn try_tiered_slab(&self, slab_id: SlabId) -> std::io::Result<Option<TieredSlab>> {
+		let guard = self
+			.inner
+			.try_read()
+			.map_err(|_| Error::new(ErrorKind::WouldBlock, "canonical tier state busy"))?;
+		Ok(guard.state.tiered_slabs.get(&slab_id).cloned())
+	}
+
+	pub(crate) async fn tiered_slab(&self, slab_id: SlabId) -> Option<TieredSlab> {
+		self.inner
+			.read()
+			.await
+			.state
+			.tiered_slabs
+			.get(&slab_id)
+			.cloned()
+	}
+
 	pub async fn state_snapshot(&self) -> SmState {
 		self.inner.read().await.state.clone()
 	}
@@ -3695,6 +4014,18 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 		let pending_checkpoint = {
 			let mut guard = self.inner.write().await;
 			for entry in entries {
+				if guard.tier_revision == u64::MAX {
+					return Err(StorageIOError::write_state_machine(AnyError::error(
+						"canonical tier revision exhausted",
+					))
+					.into());
+				}
+				if let EntryPayload::Normal(WendelonRequest::RetireTieredSlab(retire)) =
+					&entry.payload && guard.state.tiered_slabs.contains_key(&retire.slab_id)
+					&& let Some(observer) = self.tier_observer.as_ref()
+				{
+					observer.before_slab_retired(retire.slab_id, entry.log_id.index);
+				}
 				let drop_prepare_operation = match &entry.payload {
 					EntryPayload::Normal(WendelonRequest::TableDropPrepare(request)) => {
 						Some(request.operation_id())
@@ -3747,6 +4078,11 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 					_ => entry.log_id,
 				});
 				if let Some(t) = tier {
+					guard.tier_revision = guard.tier_revision.checked_add(1).ok_or_else(|| {
+						StorageIOError::write_state_machine(AnyError::error(
+							"canonical tier revision exhausted",
+						))
+					})?;
 					pending_tier_events.push((t, entry.log_id.index));
 				}
 				if let Some(rotation) = tenant_kek_rotation {
@@ -4028,6 +4364,11 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 				)));
 			}
 		}
+		let snapshot_epoch = if let Some(observer) = self.tier_observer.as_ref() {
+			Some(observer.before_tier_snapshot_install().map_err(write_err)?)
+		} else {
+			None
+		};
 		self.snapshot_runtime
 			.file_ops
 			.rename(&receive_path, &self.snapshot_runtime.paths.current)
@@ -4044,6 +4385,22 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 				step: "install directory sync",
 			};
 			return Err(write_err(err));
+		}
+		let snapshot_tiers = state.tiered_slabs.values().cloned().collect::<Vec<_>>();
+		#[cfg(test)]
+		{
+			let hold = self
+				.snapshot_runtime
+				.install_after_publication_hold
+				.lock()
+				.unwrap()
+				.take();
+			if let Some((entered, release)) = hold {
+				entered.add_permits(1);
+				if let Ok(permit) = release.acquire().await {
+					permit.forget();
+				}
+			}
 		}
 		let pending_checkpoint = {
 			let mut guard = self.inner.write().await;
@@ -4084,6 +4441,14 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 				};
 				return Err(err);
 			}
+			let Some(next_revision) = guard.tier_revision.checked_add(1) else {
+				*publication = PublicationState::Failed {
+					durable: PublishedSnapshot::Artifact(meta.last_log_id),
+					step: "install tier revision",
+				};
+				return Err(write_err(Error::other("canonical tier revision exhausted")));
+			};
+			guard.tier_revision = next_revision;
 			guard.state = state;
 			guard.snapshot = Some(HeldSnapshot {
 				meta: meta.clone(),
@@ -4096,6 +4461,22 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 				.set_drop_reclaim_debts(guard.state.table_drop_reclaim_debts.len());
 			checkpoint_observation_from_state(&guard.state, true)
 		};
+		if let Some(observer) = self.tier_observer.as_ref() {
+			if let Err(err) = observer
+				.on_tier_snapshot_installed(
+					&snapshot_tiers,
+					meta.last_log_id.map(|id| id.index),
+					snapshot_epoch.expect("observer epoch"),
+				)
+				.await
+			{
+				*publication = PublicationState::Failed {
+					durable: PublishedSnapshot::Artifact(meta.last_log_id),
+					step: "tier snapshot reconciliation",
+				};
+				return Err(write_err(err));
+			}
+		}
 		*publication = PublicationState::Healthy(PublishedSnapshot::Artifact(meta.last_log_id));
 		drop(publication);
 		let pending_checkpoint = pending_checkpoint;
@@ -7656,17 +8037,18 @@ async fn load_snapshot_artifact(
 	if !artifact_exists(file_ops, snapshot_path).await? {
 		return Ok(None);
 	}
-	let (header, state) = decode_snapshot_file(file_ops, snapshot_path)
-		.await
-		.map_err(|err| {
-			Error::new(
-				ErrorKind::InvalidData,
-				format!(
-					"snapshot artifact {} decode failed: {err}",
-					snapshot_path.display()
-				),
-			)
-		})?;
+	let (header, state, artifact_hash, artifact_bytes) =
+		decode_snapshot_file_with_identity(file_ops, snapshot_path)
+			.await
+			.map_err(|err| {
+				Error::new(
+					ErrorKind::InvalidData,
+					format!(
+						"snapshot artifact {} decode failed: {err}",
+						snapshot_path.display()
+					),
+				)
+			})?;
 	validate_snapshot_header_log_coordinates(&header, state.last_applied_log_id).map_err(
 		|err| {
 			Error::new(
@@ -7691,6 +8073,8 @@ async fn load_snapshot_artifact(
 			path: snapshot_path.to_path_buf(),
 		},
 		state,
+		artifact_hash,
+		artifact_bytes,
 	}))
 }
 
@@ -7723,12 +8107,65 @@ async fn read_optional_artifact(
 	}
 }
 
+/// Decode the same immutable input pair that restore will consume. This is a
+/// pure replay: no owner receipt, live observers, I/O or process metrics.
+fn replay_exported_control_state(wal: &[u8], snapshot_bytes: &[u8]) -> std::io::Result<SmState> {
+	let snapshot = if snapshot_bytes.is_empty() {
+		None
+	} else {
+		let (header, state, artifact_hash, artifact_bytes) =
+			decode_snapshot_reader_with_identity(snapshot_bytes)
+				.map_err(|error| Error::new(ErrorKind::InvalidData, error))?;
+		validate_snapshot_header_log_coordinates(&header, state.last_applied_log_id)
+			.map_err(|error| Error::new(ErrorKind::InvalidData, error))?;
+		let last_included = state.last_applied_log_id;
+		Some(LoadedSnapshot {
+			last_included,
+			held: HeldSnapshot {
+				meta: SnapshotMeta {
+					last_log_id: last_included,
+					last_membership: state.last_membership.clone(),
+					snapshot_id: "exported-control-cut".into(),
+				},
+				path: PathBuf::from("exported.snapshot"),
+			},
+			state,
+			artifact_hash,
+			artifact_bytes,
+		})
+	};
+	let segment = DiscoveredWalSegment {
+		path: PathBuf::from("exported.wal"),
+		start_index: 0,
+		legacy: true,
+	};
+	let mut replay = WALReplay {
+		last_purged: snapshot.as_ref().and_then(|s| s.last_included),
+		..Default::default()
+	};
+	replay_wal_segment_bytes(wal, &segment, snapshot.as_ref(), false, &mut replay)?;
+	check_retained_log_contiguous(
+		&segment.path,
+		snapshot.as_ref().and_then(|s| s.last_included),
+		true,
+		&replay.entries,
+	)?;
+	resolve_recovered_committed(snapshot.as_ref(), &replay.entries, replay.checkpoint)?;
+	Ok(recover_sm_inner(
+		snapshot,
+		replay.entries.into_values().collect(),
+		replay.checkpoint,
+	)?
+	.state)
+}
+
 async fn replay_wal(
 	file_ops: &dyn AsyncFileOps,
 	wal_path: &Path,
 	snapshot: Option<&LoadedSnapshot>,
 ) -> std::io::Result<WALReplay> {
 	let mut replay = WALReplay {
+		artifact_hasher: Some(control_artifact_hash::Context::new()),
 		last_purged: snapshot.and_then(|s| s.last_included),
 		..WALReplay::default()
 	};
@@ -8098,6 +8535,24 @@ async fn replay_wal_segment(
 		Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
 		Err(err) => return Err(err),
 	};
+	replay_wal_segment_bytes(&bytes, segment, snapshot, allow_torn_tail, replay)
+}
+
+fn replay_wal_segment_bytes(
+	bytes: &[u8],
+	segment: &DiscoveredWalSegment,
+	snapshot: Option<&LoadedSnapshot>,
+	allow_torn_tail: bool,
+	replay: &mut WALReplay,
+) -> std::io::Result<Option<WalSegmentMeta>> {
+	if let Some(hash) = &mut replay.artifact_hasher {
+		hash.update(&bytes);
+		replay.artifact_bytes = replay
+			.artifact_bytes
+			.checked_add(bytes.len() as u64)
+			.ok_or_else(|| Error::new(ErrorKind::InvalidData, "WAL input byte count overflow"))?;
+	}
+
 	if bytes.is_empty() {
 		if segment.legacy {
 			return Ok(None);
@@ -8754,6 +9209,14 @@ async fn decode_snapshot_file(
 	file_ops: &dyn AsyncFileOps,
 	path: &Path,
 ) -> std::io::Result<(SnapshotHeader, SmState)> {
+	let (header, state, _, _) = decode_snapshot_file_with_identity(file_ops, path).await?;
+	Ok((header, state))
+}
+
+async fn decode_snapshot_file_with_identity(
+	file_ops: &dyn AsyncFileOps,
+	path: &Path,
+) -> std::io::Result<(SnapshotHeader, SmState, [u8; 32], u64)> {
 	let handle = file_ops
 		.open(
 			path,
@@ -8765,12 +9228,20 @@ async fn decode_snapshot_file(
 		.await?;
 	spawn_blocking_snapshot_io(move || {
 		let file = handle.try_clone()?;
-		decode_snapshot_reader(file).map_err(|err| Error::new(ErrorKind::InvalidData, err))
+		decode_snapshot_reader_with_identity(file)
+			.map_err(|err| Error::new(ErrorKind::InvalidData, err))
 	})
 	.await
 }
 
-fn decode_snapshot_reader<R: Read>(mut reader: R) -> Result<(SnapshotHeader, SmState), String> {
+#[cfg(test)]
+fn decode_snapshot_reader<R: Read>(reader: R) -> Result<(SnapshotHeader, SmState), String> {
+	decode_snapshot_reader_with_identity(reader).map(|(header, state, _, _)| (header, state))
+}
+
+fn decode_snapshot_reader_with_identity<R: Read>(
+	mut reader: R,
+) -> Result<(SnapshotHeader, SmState, [u8; 32], u64), String> {
 	let mut header_bytes = [0u8; std::mem::size_of::<SnapshotHeader>()];
 	reader
 		.read_exact(&mut header_bytes)
@@ -8869,7 +9340,15 @@ fn decode_snapshot_reader<R: Read>(mut reader: R) -> Result<(SnapshotHeader, SmS
 			}
 		})?,
 	};
-	Ok((header, state))
+	let mut artifact = control_artifact_hash::Context::new();
+	artifact.update(&header_bytes);
+	artifact.update(&body);
+	Ok((
+		header,
+		state,
+		artifact.finish(),
+		(header_bytes.len() + body.len()) as u64,
+	))
 }
 
 fn decode_snapshot_state_bytes(body: &[u8]) -> Result<SmState, String> {
@@ -14079,6 +14558,138 @@ mod recovery_tests {
 			.map(|entry| entry.log_id.index)
 			.collect::<Vec<_>>();
 		assert_eq!(indexes, vec![3]);
+	}
+
+	/// A purge covered by a published snapshot keeps a replay proof that held
+	/// before it. Without this, a replacement awaiting its proof stays fenced
+	/// after its first runtime snapshot until a restart.
+	#[tokio::test]
+	async fn replay_proof_survives_a_purge_of_a_verified_log() {
+		let dir = tempdir("replay-proof-purge");
+		let (_, _, snapshot_path) = artifact_paths(&dir);
+		let mut store = open_store_with_segment_bytes(&dir, DIRECT_IO_ALIGN as u64).await;
+		store
+			.blocking_append(vec![
+				lease_entry(1, 0, 9, 1),
+				lease_entry(2, 10, 19, 2),
+				lease_entry(3, 20, 29, 3),
+			])
+			.await
+			.unwrap();
+		assert!(
+			store.replacement_replay_base_verified().await,
+			"premise: an uninterrupted log from 1 is verified"
+		);
+		let mut snapshot_state = SmState::default();
+		snapshot_state.last_applied_log_id = Some(log_id(1, 2));
+		write_snapshot_file(&snapshot_path, &snapshot_state);
+		store.note_published_snapshot_for_test(log_id(1, 2)).await;
+		store.purge(log_id(1, 2)).await.unwrap();
+		assert!(
+			store.replacement_replay_base_verified().await,
+			"a purge of a verified log keeps its replay proof"
+		);
+		store
+			.blocking_append(vec![lease_entry(4, 30, 39, 4)])
+			.await
+			.unwrap();
+		assert!(store.replacement_replay_base_verified().await);
+	}
+
+	/// Runtime and reopen apply one rule: a retained prefix is explained only by
+	/// a validated durable snapshot that covers it.
+	#[tokio::test]
+	async fn replay_proof_runtime_matches_reopen_for_a_covered_prefix() {
+		let dir = tempdir("replay-proof-covered-prefix");
+		let (_, _, snapshot_path) = artifact_paths(&dir);
+		let mut store = open_store_with_segment_bytes(&dir, DIRECT_IO_ALIGN as u64).await;
+		store
+			.blocking_append(vec![lease_entry(5, 0, 9, 5), lease_entry(6, 10, 19, 6)])
+			.await
+			.unwrap();
+		assert!(
+			!store.replacement_replay_base_verified().await,
+			"a prefix starting at 5 with no snapshot is unexplained"
+		);
+		let mut snapshot_state = SmState::default();
+		snapshot_state.last_applied_log_id = Some(log_id(1, 5));
+		write_snapshot_file(&snapshot_path, &snapshot_state);
+		store.note_published_snapshot_for_test(log_id(1, 5)).await;
+		store.purge(log_id(1, 5)).await.unwrap();
+		let runtime = store.replacement_replay_base_verified().await;
+		let reopened = open_store_with_segment_bytes(&dir, DIRECT_IO_ALIGN as u64).await;
+		let after_reopen = reopened.replacement_replay_base_verified().await;
+		assert!(
+			after_reopen,
+			"reopen treats the covering snapshot as the base"
+		);
+		assert_eq!(
+			runtime, after_reopen,
+			"a restart must not change the answer"
+		);
+	}
+
+	/// Before a purge, the published snapshot covers entries the log still
+	/// retains; that overlap is healthy and keeps the proof.
+	#[tokio::test]
+	async fn replay_proof_accepts_entries_a_published_snapshot_still_overlaps() {
+		let dir = tempdir("replay-proof-overlap");
+		let (_, _, snapshot_path) = artifact_paths(&dir);
+		let mut store = open_store_with_segment_bytes(&dir, DIRECT_IO_ALIGN as u64).await;
+		store
+			.blocking_append(vec![
+				lease_entry(1, 0, 9, 1),
+				lease_entry(2, 10, 19, 2),
+				lease_entry(3, 20, 29, 3),
+				lease_entry(4, 30, 39, 4),
+			])
+			.await
+			.unwrap();
+		let mut snapshot_state = SmState::default();
+		snapshot_state.last_applied_log_id = Some(log_id(1, 2));
+		write_snapshot_file(&snapshot_path, &snapshot_state);
+		store.note_published_snapshot_for_test(log_id(1, 2)).await;
+		assert!(store.replacement_replay_base_verified().await);
+	}
+
+	/// Retained entries that start above the boundary leave an unexplained gap.
+	#[tokio::test]
+	async fn replay_proof_refuses_a_gap_above_the_published_boundary() {
+		let dir = tempdir("replay-proof-gap");
+		let (_, _, snapshot_path) = artifact_paths(&dir);
+		let mut store = open_store_with_segment_bytes(&dir, DIRECT_IO_ALIGN as u64).await;
+		store
+			.blocking_append(vec![lease_entry(5, 0, 9, 5), lease_entry(6, 10, 19, 6)])
+			.await
+			.unwrap();
+		let mut snapshot_state = SmState::default();
+		snapshot_state.last_applied_log_id = Some(log_id(1, 2));
+		write_snapshot_file(&snapshot_path, &snapshot_state);
+		store.note_published_snapshot_for_test(log_id(1, 2)).await;
+		assert!(!store.replacement_replay_base_verified().await);
+		// A logical purge past the boundary empties the log; the gap stays unexplained.
+		store.purge(log_id(1, 6)).await.unwrap();
+		assert!(!store.replacement_replay_base_verified().await);
+	}
+
+	/// A failed publication refuses until reopen validates what is on disk.
+	#[tokio::test]
+	async fn replay_proof_refuses_while_publication_has_failed() {
+		let dir = tempdir("replay-proof-failed-publication");
+		let mut store = open_store_with_segment_bytes(&dir, DIRECT_IO_ALIGN as u64).await;
+		store
+			.blocking_append(vec![lease_entry(1, 0, 9, 1), lease_entry(2, 10, 19, 2)])
+			.await
+			.unwrap();
+		assert!(
+			store.replacement_replay_base_verified().await,
+			"premise: an uninterrupted log from 1 is verified"
+		);
+		*store.publication.state.lock().await = PublicationState::Failed {
+			durable: PublishedSnapshot::Artifact(None),
+			step: "test failure",
+		};
+		assert!(!store.replacement_replay_base_verified().await);
 	}
 
 	#[tokio::test]
@@ -20199,4 +20810,75 @@ fn assert_carrier_v4_fixture_round_trip(payload: &[u8]) {
 	>(payload)
 	.unwrap();
 	assert_eq!(postcard::to_stdvec(&frozen).unwrap(), payload);
+}
+
+#[cfg(test)]
+impl ControlRingBackupImage {
+	/// Force two map entry orders in the encoded body, without relying on
+	/// RandomState seeds or insertion order to happen to produce a collision.
+	pub(crate) fn equivalent_restore_inputs_for_test() -> (SmState, [Self; 2]) {
+		let mut state = SmState::default();
+		state.last_applied_log_id = Some(LogId::new(openraft::CommittedLeaderId::new(3, 1), 42));
+		let first = (
+			0x8899_u64,
+			HybridTimestamp {
+				physical_ms: 11,
+				logical: 0,
+				node_id: 1,
+			},
+		);
+		let second = (
+			0xaabb_u64,
+			HybridTimestamp {
+				physical_ms: 22,
+				logical: 0,
+				node_id: 1,
+			},
+		);
+		state.e_safe_watermarks.extend([first, second]);
+		let body = postcard::to_allocvec(&state).unwrap();
+		let map = postcard::to_allocvec(&state.e_safe_watermarks).unwrap();
+		let offsets = body
+			.windows(map.len())
+			.enumerate()
+			.filter_map(|(offset, bytes)| (bytes == map).then_some(offset))
+			.collect::<Vec<_>>();
+		assert_eq!(offsets.len(), 1, "unique map byte range in fixture");
+		let images = [[first, second], [second, first]].map(|entries| {
+			let mut ordered_map = postcard::to_allocvec(&2usize).unwrap();
+			for entry in entries {
+				ordered_map.extend(postcard::to_allocvec(&entry).unwrap());
+			}
+			assert_eq!(ordered_map.len(), map.len());
+			let mut reordered = body.clone();
+			reordered[offsets[0]..offsets[0] + map.len()].copy_from_slice(&ordered_map);
+			let decoded: SmState = postcard::from_bytes(&reordered).unwrap();
+			assert_eq!(decoded.e_safe_watermarks, state.e_safe_watermarks);
+			let header = SnapshotHeader {
+				state_sha256: control_artifact_digest_32(&reordered),
+				..snapshot_header_template(&state)
+			};
+			let mut snapshot = bytemuck::bytes_of(&header).to_vec();
+			snapshot.extend(reordered);
+			Self {
+				manifest: ControlRingBackupManifest {
+					format_version: CONTROL_RING_BACKUP_FORMAT_VERSION,
+					last_applied_log_id: state.last_applied_log_id,
+					voter_ids: Vec::new(),
+					lease_count: 0,
+					tiered_slab_count: 0,
+					migration_count: 0,
+					wal_bytes: 0,
+					vote_bytes: 0,
+					snapshot_bytes: snapshot.len() as u64,
+					state_hash: control_artifact_digest_32(&snapshot),
+				},
+				wal: Vec::new(),
+				vote: Vec::new(),
+				snapshot,
+			}
+		});
+		assert_ne!(images[0].snapshot, images[1].snapshot);
+		(state, images)
+	}
 }

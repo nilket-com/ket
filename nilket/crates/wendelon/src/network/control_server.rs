@@ -5727,7 +5727,7 @@ mod tests {
 		let path_dir = crate::test_support::TestDir::new("wendelon-adr0582-control");
 		let path = path_dir.join("store.redb");
 		let store = Arc::new(
-			crate::storage::index::PersistentLocalIndex::open(path)
+			crate::storage::index::PersistentLocalIndex::initialize_new(path, None)
 				.await
 				.unwrap(),
 		);
@@ -5763,9 +5763,13 @@ mod tests {
 		detail: &str,
 	) {
 		std::fs::create_dir_all(dir).unwrap();
-		let store = PersistentLocalIndex::open(persistent_index_path(dir))
-			.await
-			.unwrap();
+		let path = persistent_index_path(dir);
+		let store = if path.exists() {
+			PersistentLocalIndex::open(path).await
+		} else {
+			PersistentLocalIndex::initialize_new(path, None).await
+		}
+		.unwrap();
 		let first = DeterministicReceipt::after_failure(None, 1_000, detail).unwrap();
 		let second = DeterministicReceipt::after_failure(Some(&first), 2_000, detail).unwrap();
 		let receipt = DeterministicReceipt::after_failure(Some(&second), 3_000, detail).unwrap();
@@ -6067,7 +6071,11 @@ mod tests {
 	async fn maintenance_report_stops_before_the_encoded_frame_budget() {
 		let path_dir = crate::test_support::TestDir::new("wendelon-adr0582-page-budget");
 		let path = path_dir.join("store.redb");
-		let store = Arc::new(PersistentLocalIndex::open(path).await.unwrap());
+		let store = Arc::new(
+			PersistentLocalIndex::initialize_new(path, None)
+				.await
+				.unwrap(),
+		);
 		let receipt = DeterministicReceipt::after_failure(
 			Some(
 				&DeterministicReceipt::after_failure(
@@ -6844,6 +6852,102 @@ mod tests {
 				"segment seeds survive alongside partition seeds"
 			);
 		}
+	}
+	#[tokio::test]
+	async fn existing_node_missing_index_refuses_maintenance_and_reads() {
+		use crate::storage::core::StorageEngine;
+		let root = crate::test_support::TestDir::new("dc112-missing-index-maintenance");
+		let dir = root.join("node");
+		let slabs = [SlabId::new(11), SlabId::new(12)];
+		seed_quarantined_receipt(
+			&dir,
+			MaintenanceOperation::LsmCompaction,
+			&slabs,
+			DeterministicOrigin::LsmInconsistentSourceFrames,
+			"missing-index-control",
+		)
+		.await;
+		let node = bootstrap_maintenance_test_node(7191, dir.clone()).await;
+		let original = report_real_node(&node, ActorRole::Operator, 1)
+			.await
+			.unwrap();
+		let fingerprint = original
+			.items
+			.iter()
+			.find_map(|item| match item {
+				MaintenanceReportItemWire::QuarantinedWork {
+					quarantine_fingerprint,
+					..
+				} => Some(quarantine_fingerprint.clone()),
+				_ => None,
+			})
+			.expect("fixture must have a real quarantine");
+		node.shutdown().await.unwrap();
+		std::fs::remove_file(persistent_index_path(&dir)).unwrap();
+		let node = bootstrap_maintenance_test_node(7191, dir.clone()).await;
+		let before = report_real_node(&node, ActorRole::Operator, 2).await;
+		let request = MaintenanceRequeueRequestWire {
+			version: MAINTENANCE_CONTROL_WIRE_VERSION,
+			target_node_id: node.local_node.id,
+			operation_code: MaintenanceOperation::LsmCompaction.code(),
+			slabs: vec![11, 12],
+			expected_fingerprint: fingerprint,
+		};
+		let reply = node
+			.router
+			.handle_frame(
+				RequestContext {
+					remote: Some(node.local_node),
+					actor: actor(ActorRole::Operator),
+				},
+				maintenance_control_frame(&node, 3, MsgType::MAINTENANCE_REQUEUE_REQ, &request),
+			)
+			.await;
+		let requeue = reply.map(|frame| {
+			let frame = frame.expect("maintenance reply");
+			wire::decode::<MaintenanceRequeueResponseWire>(&frame.meta).unwrap()
+		});
+		let after = report_real_node(&node, ActorRole::Operator, 4).await;
+		let tenant = crate::schema::TenantId::new(1);
+		let read = node.slab.lookup(
+			tenant,
+			crate::schema::Identity::blake3_tenant(tenant, b"missing-index-read"),
+		);
+		eprintln!(
+			"MISSING_INDEX_CONTROL before={before:?} requeue={requeue:?} after={after:?} read={read:?}"
+		);
+		let report_refused = |report: &std::io::Result<MaintenanceReportResponseWire>| match report
+		{
+			Err(error) => error.kind() == std::io::ErrorKind::WouldBlock,
+			Ok(report) => {
+				matches!(
+					report.outcome,
+					MaintenanceReportOutcomeWire::Unavailable { .. }
+						| MaintenanceReportOutcomeWire::PolicyDisabled { .. }
+				) && report.items.is_empty()
+			}
+		};
+		let requeue_refused = match &requeue {
+			Err(error) => error.kind() == std::io::ErrorKind::WouldBlock,
+			Ok(reply) => matches!(
+				reply.outcome,
+				MaintenanceRequeueOutcomeWire::PolicyDisabled { .. }
+					| MaintenanceRequeueOutcomeWire::StoreFailure { .. }
+			),
+		};
+		assert!(report_refused(&before), "report must refuse missing index");
+		assert!(requeue_refused, "requeue must refuse missing index");
+		assert!(report_refused(&after), "report must still refuse");
+		assert!(read.is_err(), "missing index must not answer a read");
+		assert!(
+			!persistent_index_path(&dir).exists(),
+			"maintenance must not recreate index"
+		);
+		if let (Ok(before), Ok(after)) = (&before, &after) {
+			assert_eq!(before.generation, after.generation);
+			assert_eq!(before.items, after.items);
+		}
+		node.shutdown().await.unwrap();
 	}
 }
 

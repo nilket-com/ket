@@ -621,11 +621,29 @@ async fn acc8_rotation_compaction_retirement_under_count() {
 			"manifest_epoch_change",
 			format!("{:?}->{:?}", before.manifest_epoch, snapshot.manifest_epoch),
 		);
+		// ADR 0692: the live manifest already reflects the committed control
+		// removal of the source. Its crash protection at this pre-unlink
+		// barrier is durable: the file, its DeletePending run, the exact
+		// Control/Prepared removal intent naming it, and no row inside it.
 		assert!(
-			snapshot
-				.delete_pending_runs()
-				.any(|run| run.slab_id == first),
-			"selected source DeletePending at barrier"
+			first_path.exists(),
+			"selected source file present at barrier"
+		);
+		let protection = wendelon::storage::manager::durable_lsm_view::source_protection(
+			&fixture.node.slab,
+			first,
+		)
+		.await
+		.expect("read durable source protection");
+		assert_eq!(
+			protection,
+			wendelon::storage::manager::durable_lsm_view::SourceProtection {
+				run_state: Some("DeletePending".to_string()),
+				exact_removal_intents: 1,
+				other_intents_naming_source: 0,
+				durable_rows_in_source: 0,
+			},
+			"selected source durably protected at barrier"
 		);
 		record_phase("DeletePending", format!("{first:?}"));
 		ops.release_unlink();
