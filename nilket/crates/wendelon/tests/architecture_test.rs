@@ -10723,7 +10723,7 @@ fn relocating_writers_replace_versions_per_key_and_never_remove_then_insert() {
 		),
 		(
 			"src/storage/manager/tiered_io.rs",
-			"apply_tiered_row_refresh_plan_locked",
+			"apply_prepared_tiered_row_refresh",
 		),
 	] {
 		let source = fs::read_to_string(manifest_dir.join(file)).unwrap();

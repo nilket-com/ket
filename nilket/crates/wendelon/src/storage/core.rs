@@ -1907,6 +1907,11 @@ pub(crate) fn recover_slab_entries_from_blob_bounded(
 		acknowledged,
 		false,
 		|header, base_location, frame| {
+			// Refuse before decoding a record whose declared rows would not
+			// fit; the decoded count is checked again below.
+			if declared_logical_rows(frame).max(1) > bound.entries - entries.len() {
+				return Err(Error::other(EntryBoundExceeded));
+			}
 			let recovered = recover_entries_for_record(header, base_location, frame)?;
 			if recovered.len() > bound.entries - entries.len() {
 				return Err(Error::other(EntryBoundExceeded));

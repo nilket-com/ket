@@ -9,8 +9,9 @@
 //! one generation with the backing of another.
 use super::tier_budget::{
 	BoundExceeded, BudgetReservation, BudgetedMap, BudgetedSet, LINEAGE_HISTORY_CAP,
-	TierBudgetKind, TierHistoryShortfall, TierMemoryBudget, bounded_insert, bounded_set_insert,
-	checked_sum, hash_table_bytes_bound, tier_history_refusal, try_bounded_map, try_bounded_set,
+	TierBudgetKind, TierHistoryShortfall, TierMemoryBudget, TokenBacking, bounded_insert,
+	bounded_set_insert, checked_sum, hash_table_bytes_bound, tier_history_refusal, try_bounded_map,
+	try_bounded_set,
 };
 use super::tier_plan::{TierRowOwner, tier_row_owner};
 use super::tiered_io::TieredRowRefreshPlan;
@@ -139,19 +140,18 @@ impl TierLayout {
 		plan: &TieredRowRefreshPlan,
 		budget: &Arc<TierMemoryBudget>,
 	) -> std::io::Result<TierLayout> {
-		self.next_with(slab_id, plan, budget, &mut None)
+		self.next_with(slab_id, plan, budget, None)
 	}
 
-	/// `next`, paying for the new layout first from `funding` (a proposer's
-	/// token lent by the observer). Whatever is not published goes back into
-	/// `funding`, at its lent size, so a failed or fenced build leaves the
-	/// token as it found it.
+	/// `next`, with the layout's reservation backed by a proposer token
+	/// (`try_reserve_backed`): the token stays charged and in its slot, so a
+	/// build or publication that fails leaves it exactly as it was.
 	pub(super) fn next_with(
 		&self,
 		slab_id: SlabId,
 		plan: &TieredRowRefreshPlan,
 		budget: &Arc<TierMemoryBudget>,
-		funding: &mut Option<BudgetReservation>,
+		backing: Option<&Arc<TokenBacking>>,
 	) -> std::io::Result<TierLayout> {
 		let collision = || stale_location_error(slab_id, StaleLocationReason::LayoutCollision);
 		let refusal = |shortfall| tier_history_refusal(slab_id, shortfall);
@@ -227,26 +227,13 @@ impl TierLayout {
 			hash_table_bytes_bound::<RecordLocation>(superseded_bound),
 		])
 		.ok_or_else(overflow)?;
-		let lent_bytes = funding.as_ref().map(BudgetReservation::bytes);
-		let mut charge = match funding.take() {
-			Some(lent) if lent.bytes() >= layout_bytes => lent.into_kind(TierBudgetKind::Layout),
-			Some(lent) => {
-				match budget.try_reserve(TierBudgetKind::Layout, layout_bytes - lent.bytes()) {
-					Some(delta) => {
-						let mut charge = lent.into_kind(TierBudgetKind::Layout);
-						charge.absorb(delta);
-						charge
-					}
-					None => {
-						*funding = Some(lent);
-						return Err(refusal(TierHistoryShortfall::History));
-					}
-				}
+		let mut charge = match backing {
+			Some(backing) => {
+				budget.try_reserve_backed(TierBudgetKind::Layout, layout_bytes, backing)
 			}
-			None => budget
-				.try_reserve(TierBudgetKind::Layout, layout_bytes)
-				.ok_or_else(|| refusal(TierHistoryShortfall::History))?,
-		};
+			None => budget.try_reserve(TierBudgetKind::Layout, layout_bytes),
+		}
+		.ok_or_else(|| refusal(TierHistoryShortfall::History))?;
 		let built = self.fill_next(
 			slab_id,
 			&pairs,
@@ -256,17 +243,7 @@ impl TierLayout {
 			redirect_bound,
 			superseded_bound,
 		);
-		let (redirects, superseded) = match built {
-			Ok(maps) => maps,
-			Err(error) => {
-				if let Some(lent_bytes) = lent_bytes {
-					// The surplus over the token goes back to the budget.
-					let _ = charge.shrink_to(lent_bytes);
-					*funding = Some(charge.into_kind(TierBudgetKind::Token));
-				}
-				return Err(error);
-			}
-		};
+		let (redirects, superseded) = built?;
 		let measured = u64::try_from(redirects.allocation_size() + superseded.allocation_size())
 			.map_err(|_| overflow())?;
 		charge.shrink_to(measured).map_err(|overrun| {

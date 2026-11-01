@@ -1255,7 +1255,10 @@ impl TierAuthority {
 				return Err(obsolete_verification());
 			}
 			let plan = manager
-				.build_tiered_row_refresh_plan_from_plaintext(&pending.pointer, &plaintext)?;
+				.build_tiered_row_refresh_plan_from_plaintext(&pending.pointer, &plaintext)
+				.map_err(|error| {
+					manager.observed_publication_error(pending.pointer.slab_id, error)
+				})?;
 			if plan.old_rows != plan.new_rows {
 				metrics().observe_storage_tier_rows_repaired_at_first_serve();
 			}

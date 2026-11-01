@@ -320,7 +320,12 @@ impl TierCommitter for RaftCommitter {
 		// Dropping the proposal on this refusal releases its reservation.
 		self.require_submission_role()?;
 		let tier = proposal.tier().clone();
-		let submission = proposal.begin_submission();
+		let submission = proposal.begin_submission().map_err(|refusal| {
+			std::io::Error::new(
+				refusal.kind(),
+				TierCommitNotSubmitted(format!("tier history no longer reserved: {refusal}")),
+			)
+		})?;
 		match self
 			.raft
 			.client_write(WendelonRequest::TierSlab(tier))
@@ -2327,6 +2332,9 @@ mod tests {
 			proposal: crate::storage::TierProposal,
 		) -> std::io::Result<()> {
 			let tier = proposal.tier().clone();
+			// Modelled like RaftCommitter: submitted before the commit, applied
+			// only on success; a failure leaves the outcome unknown.
+			let submission = proposal.begin_submission()?;
 			if let Some(kind) = *self.persistent_err.lock().await {
 				return Err(std::io::Error::new(kind, "simulated commit failure"));
 			}
@@ -2343,6 +2351,7 @@ mod tests {
 				sm.seed_tiered_slab_for_test(tier.clone()).await;
 			}
 			self.observer.on_slab_tiered(&tier, 0).await?;
+			submission.applied();
 			Ok(())
 		}
 

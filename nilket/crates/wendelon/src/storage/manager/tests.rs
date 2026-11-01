@@ -2707,7 +2707,9 @@ impl TierCommitter for DirectTierCommitter {
 		proposal: crate::storage::TierProposal,
 	) -> std::io::Result<()> {
 		let tier = proposal.tier().clone();
-		self.manager
+		let submission = proposal.begin_submission()?;
+		let applied = self
+			.manager
 			.apply_tier_slab(TieredSlabPointer {
 				slab_id: tier.slab_id,
 				l2_uri: tier.l2_uri,
@@ -2721,7 +2723,11 @@ impl TierCommitter for DirectTierCommitter {
 				tombstone_metadata: tier.tombstone_metadata,
 				supersession_metadata: tier.supersession_metadata,
 			})
-			.await
+			.await;
+		if applied.is_ok() {
+			submission.applied();
+		}
+		applied
 	}
 
 	async fn retire_tiered_slab(&self, slab_id: SlabId) -> std::io::Result<()> {
@@ -43028,4 +43034,378 @@ async fn staged_plaintext_that_only_shares_a_prefix_with_the_published_object_re
 		Some(&published),
 		"the published generation stays"
 	);
+}
+
+// ------------------------------------------------------------------
+// ADR 0696 fast follow, slice 1 corrections (Codex 01a1983d).
+// ------------------------------------------------------------------
+
+/// The plan scratch charge travels with the row copies into the index
+/// worker: cancelling the publishing caller while its blocking worker still
+/// holds the copies keeps them charged until that worker drops the update.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tier_publication_scratch_stays_charged_while_its_index_worker_holds_the_row_copies() {
+	use super::tier_budget::TierBudgetKind;
+	let (_dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let bytes = l2.get(&old.l2_uri).await.unwrap();
+	let replacement = TieredSlabPointer {
+		l2_uri: l2.put("tier/s7-worker-scratch.wnd", &bytes).await.unwrap(),
+		..old.clone()
+	};
+	let (entered_tx, entered) = std::sync::mpsc::sync_channel(1);
+	let (release, release_rx) = std::sync::mpsc::sync_channel(1);
+	*mgr.persistent_index
+		.as_ref()
+		.unwrap()
+		.guarded_delta_before_rows_hold
+		.lock()
+		.unwrap() = Some((entered_tx, release_rx));
+	let before = mgr.tier_budget.used_by(TierBudgetKind::Scratch);
+	let task = {
+		let mgr = mgr.clone();
+		let replacement = replacement.clone();
+		tokio::spawn(async move { mgr.apply_tier_slab_committed(replacement, Some(900)).await })
+	};
+	tokio::task::spawn_blocking(move || entered.recv_timeout(Duration::from_secs(60)))
+		.await
+		.unwrap()
+		.expect("the publication reaches its index worker");
+	let held = mgr.tier_budget.used_by(TierBudgetKind::Scratch);
+	assert!(
+		held > before,
+		"the publication's scratch is charged: {held} > {before}"
+	);
+	task.abort();
+	let _ = task.await;
+	assert_eq!(
+		mgr.tier_budget.used_by(TierBudgetKind::Scratch),
+		held,
+		"the cancelled caller's plan is gone, but the worker still owns the copies"
+	);
+	release.send(()).unwrap();
+	tokio::time::timeout(Duration::from_secs(30), async {
+		while mgr.tier_budget.used_by(TierBudgetKind::Scratch) > before {
+			tokio::time::sleep(Duration::from_millis(10)).await;
+		}
+	})
+	.await
+	.expect("the charge is released once the worker drops the update");
+}
+
+/// The reference for `prepare_tiered_row_refresh`: the per-key relocations
+/// `apply_tiered_row_refresh_plan_locked` built before slice 1.
+fn reference_tier_refresh_relocations(plan: &TieredRowRefreshPlan) -> String {
+	let old_by_location = plan
+		.old_rows
+		.iter()
+		.map(|row| (row.location, row))
+		.collect::<HashMap<_, _>>();
+	let new_by_location = plan
+		.new_rows
+		.iter()
+		.map(|row| (row.location, row))
+		.collect::<HashMap<_, _>>();
+	let owner = |row: &PersistentRecordRow| super::tier_plan::tier_row_owner(row);
+	let mut by_key: BTreeMap<(TenantId, Identity), KeyRelocation> = BTreeMap::new();
+	let mut paired_old = HashSet::new();
+	let mut paired_new = HashSet::new();
+	for (old, new) in &plan.relocated_reads {
+		let (Some(old_row), Some(new_row)) = (old_by_location.get(old), new_by_location.get(new))
+		else {
+			continue;
+		};
+		if owner(old_row) != owner(new_row) {
+			continue;
+		}
+		paired_old.insert(*old);
+		paired_new.insert(*new);
+		by_key
+			.entry((old_row.tenant_id, old_row.key_identity))
+			.or_insert_with(|| KeyRelocation::new(new_row.routing_locality, false))
+			.pairs
+			.push(RelocationPair {
+				old: *old,
+				new: *new,
+				table_object_id: new_row.table_object_id,
+			});
+	}
+	let kept = |row: &PersistentRecordRow,
+	            other: &HashMap<RecordLocation, &PersistentRecordRow>| {
+		other
+			.get(&row.location)
+			.is_some_and(|other| owner(row) == owner(other))
+	};
+	for row in &plan.old_rows {
+		if !paired_old.contains(&row.location) && !kept(row, &new_by_location) {
+			by_key
+				.entry((row.tenant_id, row.key_identity))
+				.or_insert_with(|| KeyRelocation::new(row.routing_locality, false))
+				.removals
+				.push(row.location);
+		}
+	}
+	for row in &plan.new_rows {
+		if !paired_new.contains(&row.location) && !kept(row, &old_by_location) {
+			by_key
+				.entry((row.tenant_id, row.key_identity))
+				.or_insert_with(|| KeyRelocation::new(row.routing_locality, false))
+				.insertions
+				.push(RelocationInsertion {
+					location: row.location,
+					table_object_id: row.table_object_id,
+				});
+		}
+	}
+	format!("{:?}", by_key.into_iter().collect::<Vec<_>>())
+}
+
+/// Differential: the bounded, pre-publication `prepare_tiered_row_refresh`
+/// builds exactly the relocations the old post-publication code built, over
+/// generated plans with many distinct keys, large duplicate-owner runs,
+/// location collisions between generations and unmatched pairs.
+#[tokio::test]
+async fn prepared_tier_refresh_relocations_equal_the_pre_slice_construction() {
+	let (_dir, mgr) = fresh_manager().await;
+	let mut state = 0x5eed_0696_u64;
+	let mut next = move || {
+		state ^= state << 13;
+		state ^= state >> 7;
+		state ^= state << 17;
+		state
+	};
+	let row = |key: u8, hlc_ms: u64, offset: u64, locality: u64| PersistentRecordRow {
+		tenant_id: tenant(),
+		key_identity: Identity::new([key; 32]),
+		routing_locality: Locality::new(locality),
+		table_object_id: None,
+		placement: PlacementSemantics::RawLocality,
+		partition: None,
+		location: RecordLocation {
+			slab_id: SlabId::new(3),
+			offset,
+			length: 64,
+			hlc: hlc(hlc_ms),
+			record_row_index: RecordRowIndex::ZERO,
+			is_tombstone: false,
+			placement: PlacementSemantics::RawLocality,
+			partition: None,
+		},
+	};
+	for case in 0..2_000 {
+		let keys = if case % 10 == 0 {
+			1
+		} else {
+			(next() % 40) as u8 + 1
+		};
+		let rows = |next: &mut dyn FnMut() -> u64, count: usize| {
+			(0..count)
+				.map(|_| {
+					row(
+						(next() % u64::from(keys)) as u8,
+						10 + next() % 4,
+						(next() % 64) * 4096,
+						next() % 3,
+					)
+				})
+				.collect::<Vec<_>>()
+		};
+		let old_count = (next() % 60) as usize;
+		let old_rows = rows(&mut next, old_count);
+		let new_count = (next() % 60) as usize;
+		let new_rows = rows(&mut next, new_count);
+		let relocated_reads = (0..(next() % 40) as usize)
+			.filter_map(|_| {
+				let old = old_rows.get((next() % 64) as usize)?.location;
+				let new = new_rows.get((next() % 64) as usize)?.location;
+				Some((old, new))
+			})
+			.collect::<Vec<_>>();
+		let plan = TieredRowRefreshPlan {
+			pointer: None,
+			old_rows,
+			new_rows,
+			relocated_reads,
+			scratch: Default::default(),
+		};
+		let expected = reference_tier_refresh_relocations(&plan);
+		let prepared = mgr.prepare_tiered_row_refresh(&plan).unwrap();
+		let actual = format!("{:?}", prepared.relocations_for_test());
+		assert_eq!(actual, expected, "case {case}");
+	}
+	// Two large shapes: many distinct keys, each moved once; and one key whose
+	// thousands of versions all move, half of them pruned.
+	let wide = |index: usize, offset: u64| {
+		let mut identity = [0u8; 32];
+		identity[..8].copy_from_slice(&(index as u64).to_be_bytes());
+		PersistentRecordRow {
+			key_identity: Identity::new(identity),
+			..row(0, 10, offset, 0)
+		}
+	};
+	let distinct = 8_192;
+	let old_rows = (0..distinct)
+		.map(|index| wide(index, index as u64 * 4096))
+		.collect::<Vec<_>>();
+	let new_rows = (0..distinct)
+		.map(|index| wide(index, (distinct + index) as u64 * 4096))
+		.collect::<Vec<_>>();
+	let relocated_reads = old_rows
+		.iter()
+		.zip(&new_rows)
+		.map(|(old, new)| (old.location, new.location))
+		.collect();
+	let run = 8_192_u64;
+	let one_key_old = (0..run)
+		.map(|index| row(7, 10 + index, index * 4096, 0))
+		.collect::<Vec<_>>();
+	let one_key_new = (0..run / 2)
+		.map(|index| row(7, 10 + index, (run + index) * 4096, 0))
+		.collect::<Vec<_>>();
+	let one_key_reads = one_key_old
+		.iter()
+		.zip(&one_key_new)
+		.map(|(old, new)| (old.location, new.location))
+		.collect();
+	for (shape, plan) in [
+		(
+			"many distinct keys",
+			TieredRowRefreshPlan {
+				pointer: None,
+				old_rows,
+				new_rows,
+				relocated_reads,
+				scratch: Default::default(),
+			},
+		),
+		(
+			"one large run",
+			TieredRowRefreshPlan {
+				pointer: None,
+				old_rows: one_key_old,
+				new_rows: one_key_new,
+				relocated_reads: one_key_reads,
+				scratch: Default::default(),
+			},
+		),
+	] {
+		let expected = reference_tier_refresh_relocations(&plan);
+		let prepared = mgr.prepare_tiered_row_refresh(&plan).unwrap();
+		assert_eq!(
+			format!("{:?}", prepared.relocations_for_test()),
+			expected,
+			"{shape}"
+		);
+	}
+}
+
+/// A budget too small for a publication's plan scratch fences the committed
+/// apply typed (`Fenced`, cached for retry), allocates nothing it did not
+/// reserve, and is counted as a `no_scratch` fence.
+#[tokio::test]
+async fn a_publication_short_of_plan_scratch_fences_typed_and_is_counted() {
+	use super::tier_budget::TierBudgetKind;
+	let (_dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let bytes = l2.get(&old.l2_uri).await.unwrap();
+	let replacement = TieredSlabPointer {
+		l2_uri: l2.put("tier/s7-no-scratch.wnd", &bytes).await.unwrap(),
+		..old.clone()
+	};
+	let floor = mgr.tier_budget.used();
+	mgr.tier_budget.set_limit_for_test(floor);
+	let fenced_before = fenced_counter("no_scratch");
+	let result = mgr
+		.apply_tier_slab_committed(replacement.clone(), Some(901))
+		.await;
+	let error = result.expect_err("no scratch, no publication");
+	assert_eq!(
+		stale_location(&error).map(|stale| stale.reason),
+		Some(StaleLocationReason::Fenced),
+		"{error}"
+	);
+	assert_eq!(
+		mgr.unapplied_tier_pointers
+			.get(&old.slab_id)
+			.map(|entry| entry.value().clone()),
+		Some((replacement, Some(StaleLocationReason::Fenced), Some(901))),
+		"the deferral is typed for retry"
+	);
+	assert_eq!(mgr.tier_budget.used(), floor, "nothing left charged");
+	assert_eq!(mgr.tier_budget.used_by(TierBudgetKind::Scratch), 0);
+	assert!(
+		fenced_counter("no_scratch") > fenced_before,
+		"the fence is counted"
+	);
+	assert_eq!(mgr.tier_pointer(old.slab_id).await, Some(old));
+}
+
+/// A publication whose plan scratch fits but whose new layout does not
+/// fences typed at the layout reservation, counted as `no_budget`, leaves
+/// nothing charged, and publishes on retry once the budget covers exactly
+/// the peak an unlimited run of the same publication reached. The fixture's
+/// rewrite prunes a key, so its layout is not empty.
+#[tokio::test]
+async fn a_publication_short_of_its_layout_fences_typed_and_publishes_at_its_exact_peak() {
+	use super::tier_budget::TierBudgetKind;
+	let measured = seed_tier_refresh_fixture("s7-layout-measure").await;
+	let measured_floor = measured.mgr.tier_budget.used();
+	measured.mgr.tier_budget.reset_peak_for_test();
+	measured
+		.mgr
+		.apply_tier_slab_committed(measured.rewritten.clone(), None)
+		.await
+		.expect("an unlimited publication succeeds");
+	assert!(
+		measured.mgr.tier_budget.used_by(TierBudgetKind::Layout) > 0,
+		"premise: the published layout carries history"
+	);
+	let need = measured.mgr.tier_budget.peak() - measured_floor;
+
+	let fixture = seed_tier_refresh_fixture("s7-layout-short").await;
+	let mgr = &fixture.mgr;
+	let old = mgr.tier_pointer(fixture.slab_id).await;
+	let floor = mgr.tier_budget.used();
+	mgr.tier_budget.set_limit_for_test(floor + need - 1);
+	let no_budget = fenced_counter("no_budget");
+	mgr.tier_budget.reset_peak_for_test();
+	let error = mgr
+		.apply_tier_slab_committed(fixture.rewritten.clone(), None)
+		.await
+		.expect_err("one byte short of the peak, no publication");
+	assert_eq!(
+		stale_location(&error).map(|stale| stale.reason),
+		Some(StaleLocationReason::Fenced),
+		"{error}"
+	);
+	// Reservations are all-or-nothing, so a peak above the floor means the
+	// plan scratch was granted and a later reservation was refused.
+	assert!(
+		mgr.tier_budget.peak() > floor,
+		"the plan scratch fit; the refusal came later"
+	);
+	assert!(
+		fenced_counter("no_budget") > no_budget,
+		"the layout reservation is the one refused"
+	);
+	assert_eq!(mgr.tier_budget.used(), floor, "nothing left charged");
+	assert_eq!(mgr.tier_pointer(fixture.slab_id).await, old);
+
+	mgr.tier_budget.set_limit_for_test(floor + need);
+	mgr.apply_tier_slab_committed(fixture.rewritten.clone(), None)
+		.await
+		.expect("the exact peak is enough");
+	assert_eq!(
+		mgr.tier_pointer(fixture.slab_id).await,
+		Some(fixture.rewritten.clone())
+	);
+}
+
+/// The rendered value of `wendelon_tier_publication_fenced_total{reason}`.
+fn fenced_counter(reason: &str) -> u64 {
+	let rendered = crate::metrics::global().render_prometheus();
+	let prefix = format!("wendelon_tier_publication_fenced_total{{reason=\"{reason}\"}} ");
+	rendered
+		.lines()
+		.find_map(|line| line.strip_prefix(&prefix))
+		.map(|value| value.parse().unwrap())
+		.unwrap_or(0)
 }

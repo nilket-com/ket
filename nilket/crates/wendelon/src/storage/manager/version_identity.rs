@@ -387,12 +387,24 @@ impl SlabManager {
 				self.tier_publication_base(&state, pointer.slab_id),
 			)
 		};
-		let next = Arc::new(self.build_observed_tier_layout(
+		// Verification republishes committed authority; it resolves no
+		// proposal, so it never uses a proposer token.
+		let (next, _) = self.build_observed_tier_layout(
 			&current.unwrap_or_default(),
 			pointer,
 			&base,
 			plan,
-		)?);
+			false,
+		)?;
+		let next = Arc::new(next);
+		// Every covered allocation of the row refresh happens before the durable
+		// boundary; after it the refresh only applies.
+		let prepared = self
+			.prepare_tiered_row_refresh(plan)
+			.map_err(|error| self.observed_publication_error(pointer.slab_id, error))?;
+		let (delete_records, put_records) = plan
+			.try_copy_rows(pointer.slab_id)
+			.map_err(|error| self.observed_publication_error(pointer.slab_id, error))?;
 		self.bump_slab_publication_revision(pointer.slab_id)?;
 		let publication = self.begin_index_publication(vec![pointer.slab_id]).await?;
 		if !self.tier_authority.current(authority_epoch) {
@@ -411,8 +423,9 @@ impl SlabManager {
 				PersistentIndexUpdate {
 					put_tiered_slabs: vec![pointer.clone()],
 					tier_republication_index: last_control_log_index,
-					delete_records: plan.old_rows.clone(),
-					put_records: plan.new_rows.clone(),
+					delete_records,
+					put_records,
+					retained_charge: plan.scratch.retain(),
 					last_control_log_index,
 					..Default::default()
 				},
@@ -426,7 +439,7 @@ impl SlabManager {
 		}
 		// The durable transaction succeeded. Mirror it under the publication
 		// gate even if newer authority invalidated this verification flight.
-		self.apply_tiered_row_refresh_plan_locked(plan.clone(), false)
+		self.apply_prepared_tiered_row_refresh(plan, prepared, false)
 			.await;
 		// These mirrors are bounded by the committed index; they cannot
 		// clear authority from a newer snapshot while this flight finishes.
