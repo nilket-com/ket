@@ -149,6 +149,20 @@ impl TierLayout {
 		plan: &TieredRowRefreshPlan,
 		budget: &Arc<TierMemoryBudget>,
 	) -> std::io::Result<TierLayout> {
+		self.next_with(slab_id, plan, budget, &mut None)
+	}
+
+	/// `next`, paying for the new layout first from `funding` (a proposer's
+	/// token lent by the observer). Whatever is not published goes back into
+	/// `funding`, at its lent size, so a failed or fenced build leaves the
+	/// token as it found it.
+	pub(super) fn next_with(
+		&self,
+		slab_id: SlabId,
+		plan: &TieredRowRefreshPlan,
+		budget: &Arc<TierMemoryBudget>,
+		funding: &mut Option<BudgetReservation>,
+	) -> std::io::Result<TierLayout> {
 		let collision = || stale_location_error(slab_id, StaleLocationReason::LayoutCollision);
 		let refusal = |shortfall| tier_history_refusal(slab_id, shortfall);
 		let stale = |_: BoundExceeded| refusal(TierHistoryShortfall::StalePlan);
@@ -223,9 +237,73 @@ impl TierLayout {
 			hash_table_bytes_bound::<RecordLocation>(superseded_bound),
 		])
 		.ok_or_else(overflow)?;
-		let mut charge = budget
-			.try_reserve(TierBudgetKind::Layout, layout_bytes)
-			.ok_or_else(|| refusal(TierHistoryShortfall::History))?;
+		let lent_bytes = funding.as_ref().map(BudgetReservation::bytes);
+		let mut charge = match funding.take() {
+			Some(lent) if lent.bytes() >= layout_bytes => lent.into_kind(TierBudgetKind::Layout),
+			Some(lent) => match budget.try_reserve(TierBudgetKind::Layout, layout_bytes - lent.bytes()) {
+				Some(delta) => {
+					let mut charge = lent.into_kind(TierBudgetKind::Layout);
+					charge.absorb(delta);
+					charge
+				}
+				None => {
+					*funding = Some(lent);
+					return Err(refusal(TierHistoryShortfall::History));
+				}
+			},
+			None => budget
+				.try_reserve(TierBudgetKind::Layout, layout_bytes)
+				.ok_or_else(|| refusal(TierHistoryShortfall::History))?,
+		};
+		let built = self.fill_next(slab_id, &pairs, &pruned, &old_owner, &new_owner, redirect_bound, superseded_bound);
+		let (redirects, superseded) = match built {
+			Ok(maps) => maps,
+			Err(error) => {
+				if let Some(lent_bytes) = lent_bytes {
+					// The surplus over the token goes back to the budget.
+					let _ = charge.shrink_to(lent_bytes);
+					*funding = Some(charge.into_kind(TierBudgetKind::Token));
+				}
+				return Err(error);
+			}
+		};
+		let measured = u64::try_from(redirects.allocation_size() + superseded.allocation_size())
+			.map_err(|_| overflow())?;
+		charge.shrink_to(measured).map_err(|overrun| {
+			Error::other(format!(
+				"tier layout for slab {slab_id} measured {} bytes over its {} byte reservation",
+				overrun.actual, overrun.reserved
+			))
+		})?;
+		Ok(TierLayout {
+			generation: self.generation.saturating_add(1),
+			redirects,
+			superseded,
+			charge: Some(charge),
+		})
+	}
+
+	/// Fill the next generation's maps within their bounds and check them
+	/// against every new row (the rules `next` documents).
+	#[allow(clippy::too_many_arguments)]
+	fn fill_next(
+		&self,
+		slab_id: SlabId,
+		pairs: &BudgetedMap<RecordLocation, RecordLocation>,
+		pruned: &BudgetedSet<RecordLocation>,
+		old_owner: &BudgetedMap<RecordLocation, TierRowOwner>,
+		new_owner: &BudgetedMap<RecordLocation, TierRowOwner>,
+		redirect_bound: usize,
+		superseded_bound: usize,
+	) -> std::io::Result<(
+		BudgetedMap<RecordLocation, RecordLocation>,
+		BudgetedSet<RecordLocation>,
+	)> {
+		let collision = || stale_location_error(slab_id, StaleLocationReason::LayoutCollision);
+		let refusal = |shortfall| tier_history_refusal(slab_id, shortfall);
+		let kept = |location: &RecordLocation, owner: &TierRowOwner| {
+			new_owner.get(location) == Some(owner)
+		};
 		let capped = |_: BoundExceeded| refusal(TierHistoryShortfall::LineageCap);
 		let unallocated = |_| refusal(TierHistoryShortfall::History);
 		let mut redirects = try_bounded_map(redirect_bound).map_err(unallocated)?;
@@ -243,16 +321,16 @@ impl TierLayout {
 				bounded_set_insert(&mut superseded, superseded_bound, *from).map_err(capped)?;
 			}
 		}
-		for (old, new) in &pairs {
+		for (old, new) in pairs.iter() {
 			bounded_insert(&mut redirects, redirect_bound, *old, *new).map_err(capped)?;
 		}
-		for location in &pruned {
+		for location in pruned.iter() {
 			bounded_set_insert(&mut superseded, superseded_bound, *location).map_err(capped)?;
 		}
 		if redirects.len() + superseded.len() > LINEAGE_HISTORY_CAP {
 			return Err(refusal(TierHistoryShortfall::LineageCap));
 		}
-		for (location, owner) in &new_owner {
+		for (location, owner) in new_owner.iter() {
 			if superseded.contains(location) {
 				return Err(collision());
 			}
@@ -271,20 +349,7 @@ impl TierLayout {
 				return Err(collision());
 			}
 		}
-		let measured = u64::try_from(redirects.allocation_size() + superseded.allocation_size())
-			.map_err(|_| overflow())?;
-		charge.shrink_to(measured).map_err(|overrun| {
-			Error::other(format!(
-				"tier layout for slab {slab_id} measured {} bytes over its {} byte reservation",
-				overrun.actual, overrun.reserved
-			))
-		})?;
-		Ok(TierLayout {
-			generation: self.generation.saturating_add(1),
-			redirects,
-			superseded,
-			charge: Some(charge),
-		})
+		Ok((redirects, superseded))
 	}
 }
 

@@ -79,6 +79,7 @@ use crate::schema::{SupersessionMetadata, TombstoneMetadata};
 use crate::storage::MvccRetentionPolicy;
 use crate::storage::l2::ObjectStore;
 use crate::storage::manager::{
+	TierProposal,
 	PreparedTieredRetentionRewrite, RetentionCompactionStats, SealedSlabInfo, SlabManager,
 	StaleLocationReason, TieredSlabPointer, stale_location_error,
 };
@@ -198,7 +199,10 @@ pub trait TierCommitter: Send + Sync {
 	/// unlinked via the SM apply observer". An error means the
 	/// sweeper should skip this slab and try again on the next
 	/// scan — the L1 file stays put.
-	async fn commit_tier_slab(&self, tier: TieredSlab) -> std::io::Result<()>;
+	///
+	/// The proposal carries the history its publication reserved (ADR 0692
+	/// §7); a committer resolves it through [`TierProposal::begin_submission`].
+	async fn commit_tier_slab(&self, proposal: TierProposal) -> std::io::Result<()>;
 
 	/// Submit a RetireTieredSlab entry. Returns `Ok(())` only after
 	/// the local state machine has applied the retirement.
@@ -247,6 +251,27 @@ pub(crate) fn tier_proposal_not_submitted(error: &std::io::Error) -> bool {
 		.is_some()
 }
 
+/// Reserve `tier`'s history and propose it. A refused reservation proposes
+/// nothing, so it is reported as a definite not-submitted outcome and the
+/// caller's existing cleanup of an unsubmitted upload applies unchanged.
+pub(crate) async fn propose_tier_slab(
+	slab: &SlabManager,
+	committer: &dyn TierCommitter,
+	tier: TieredSlab,
+) -> std::io::Result<()> {
+	match slab.reserve_tier_history(tier).await {
+		Ok(proposal) => committer.commit_tier_slab(proposal).await,
+		Err(refusal) => {
+			crate::metrics::global()
+				.observe_tier_rewrite_refusal(crate::metrics::TierRewriteRefusalReason::NodeHistoryBudget);
+			Err(std::io::Error::new(
+			refusal.kind(),
+			TierCommitNotSubmitted(format!("tier history not reserved: {refusal}")),
+		))
+		}
+	}
+}
+
 /// Production [`TierCommitter`] backed by an openraft [`WendelonRaft`].
 ///
 /// `client_write` is resolved on the leader and blocks until the
@@ -291,14 +316,20 @@ impl TierCommitter for RaftCommitter {
 		self.raft.metrics().borrow().state == openraft::ServerState::Leader
 	}
 
-	async fn commit_tier_slab(&self, tier: TieredSlab) -> std::io::Result<()> {
+	async fn commit_tier_slab(&self, proposal: TierProposal) -> std::io::Result<()> {
+		// Dropping the proposal on this refusal releases its reservation.
 		self.require_submission_role()?;
+		let tier = proposal.tier().clone();
+		let submission = proposal.begin_submission();
 		match self
 			.raft
 			.client_write(WendelonRequest::TierSlab(tier))
 			.await
 		{
-			Ok(_) => Ok(()),
+			Ok(_) => {
+				submission.applied();
+				Ok(())
+			}
 			Err(openraft::error::RaftError::APIError(
 				openraft::error::ClientWriteError::ForwardToLeader(error),
 			)) => Err(std::io::Error::new(
@@ -633,7 +664,7 @@ impl SlabSweeper {
 			}
 			return Err(error);
 		}
-		if let Err(error) = self.raft.commit_tier_slab(tier).await {
+		if let Err(error) = propose_tier_slab(&self.slab, self.raft.as_ref(), tier).await {
 			let not_applied = error
 				.get_ref()
 				.and_then(|inner| inner.downcast_ref::<TierCommitNotSubmitted>())
@@ -850,7 +881,7 @@ impl SlabSweeper {
 		self.slab
 			.prepare_tier_candidate_proposal(pointer.slab_id, &new_uri)
 			.await?;
-		if let Err(error) = self.raft.commit_tier_slab(tier).await {
+		if let Err(error) = propose_tier_slab(&self.slab, self.raft.as_ref(), tier).await {
 			self.cleanup_uploaded_object_after_failed_commit(
 				pointer.slab_id,
 				&new_uri,
@@ -997,7 +1028,7 @@ impl SlabSweeper {
 				tombstone_metadata: pointer.tombstone_metadata,
 				supersession_metadata: pointer.supersession_metadata,
 			};
-			if let Err(error) = self.raft.commit_tier_slab(tier).await {
+			if let Err(error) = propose_tier_slab(&self.slab, self.raft.as_ref(), tier).await {
 				return Err(error);
 			}
 			let observed_epoch = self.slab.capture_snapshot_epoch();
@@ -1090,7 +1121,7 @@ impl SlabSweeper {
 		self.slab
 			.prepare_tier_candidate_proposal(pointer.slab_id, &new_uri)
 			.await?;
-		if let Err(error) = self.raft.commit_tier_slab(tier).await {
+		if let Err(error) = propose_tier_slab(&self.slab, self.raft.as_ref(), tier).await {
 			self.cleanup_uploaded_object_after_failed_commit(
 				pointer.slab_id,
 				&new_uri,
@@ -1333,7 +1364,7 @@ impl SlabSweeper {
 				self.slab
 					.prepare_tier_candidate_proposal(slab_id, &new_uri)
 					.await?;
-				if let Err(error) = self.raft.commit_tier_slab(tier).await {
+				if let Err(error) = propose_tier_slab(&self.slab, self.raft.as_ref(), tier).await {
 					self.cleanup_uploaded_object_after_failed_commit(
 						slab_id,
 						&new_uri,
@@ -1854,7 +1885,7 @@ impl SlabSweeper {
 			tombstone_metadata: pointer.tombstone_metadata,
 			supersession_metadata,
 		};
-		self.raft.commit_tier_slab(tier).await?;
+		propose_tier_slab(&self.slab, self.raft.as_ref(), tier).await?;
 		let observed_epoch = self.slab.capture_snapshot_epoch();
 		if let Some(pointer) = self.sm_tier_pointer(pointer.slab_id).await {
 			self.slab
@@ -2291,7 +2322,8 @@ mod tests {
 
 	#[async_trait]
 	impl TierCommitter for DirectApplyCommitter {
-		async fn commit_tier_slab(&self, tier: TieredSlab) -> std::io::Result<()> {
+		async fn commit_tier_slab(&self, proposal: crate::storage::TierProposal) -> std::io::Result<()> {
+			let tier = proposal.tier().clone();
 			if let Some(kind) = *self.persistent_err.lock().await {
 				return Err(std::io::Error::new(kind, "simulated commit failure"));
 			}
@@ -3225,7 +3257,8 @@ mod tests {
 
 	#[async_trait]
 	impl TierCommitter for A4PausedLogCommitter {
-		async fn commit_tier_slab(&self, tier: TieredSlab) -> std::io::Result<()> {
+		async fn commit_tier_slab(&self, proposal: crate::storage::TierProposal) -> std::io::Result<()> {
+			let tier = proposal.tier().clone();
 			self.entered.add_permits(1);
 			self.release.acquire().await.unwrap().forget();
 			a4_apply_control_request(
@@ -6099,7 +6132,8 @@ mod tests {
 		};
 		let error = tokio::time::timeout(
 			Duration::from_secs(60),
-			RaftCommitter::new(raft.clone()).commit_tier_slab(tier),
+			RaftCommitter::new(raft.clone())
+				.commit_tier_slab(crate::storage::TierProposal::unreserved_for_test(tier)),
 		)
 		.await
 		.unwrap()
@@ -6154,8 +6188,8 @@ mod tests {
 	struct B1UnhintedRaftCommitter(RaftCommitter);
 	#[async_trait]
 	impl TierCommitter for B1UnhintedRaftCommitter {
-		async fn commit_tier_slab(&self, tier: TieredSlab) -> std::io::Result<()> {
-			self.0.commit_tier_slab(tier).await
+		async fn commit_tier_slab(&self, proposal: crate::storage::TierProposal) -> std::io::Result<()> {
+			self.0.commit_tier_slab(proposal).await
 		}
 		async fn retire_tiered_slab(&self, slab: SlabId) -> std::io::Result<()> {
 			self.0.retire_tiered_slab(slab).await

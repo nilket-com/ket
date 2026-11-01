@@ -12,7 +12,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex as AsyncMutex;
 use wendelon::consensus::{
-	RetireTieredSlab, TierObserver, TieredSlab, WendelonRequest, WendelonStateMachine,
+	RetireTieredSlab, TierObserver, WendelonRequest, WendelonStateMachine,
 	WendelonTypeConfig,
 };
 use wendelon::crypto::{CryptoManager, test_support};
@@ -81,7 +81,8 @@ impl AppliedStateMachineCommitter {
 
 #[async_trait]
 impl TierCommitter for AppliedStateMachineCommitter {
-	async fn commit_tier_slab(&self, tier: TieredSlab) -> std::io::Result<()> {
+	async fn commit_tier_slab(&self, proposal: wendelon::storage::TierProposal) -> std::io::Result<()> {
+		let tier = proposal.tier().clone();
 		let index = self.next_index.fetch_add(1, Ordering::Relaxed);
 		let entry = Entry::<WendelonTypeConfig> {
 			log_id: LogId::new(CommittedLeaderId::new(1, 0), index),

@@ -211,6 +211,8 @@ mod relocation;
 pub(crate) mod tier_authority;
 mod tier_budget;
 mod tier_generation;
+mod tier_tokens;
+pub use tier_tokens::{TierProposal, TierSubmission};
 mod tier_plan;
 mod version_identity;
 use tier_generation::{ReadTarget, TierLayout};
@@ -793,6 +795,8 @@ pub struct SlabManager {
 	retired_tier_slabs: DashSet<SlabId>,
 	/// The ADR 0692 §7 node budget for tier history and redirect memory.
 	tier_budget: Arc<tier_budget::TierMemoryBudget>,
+	/// Proposer history reservations awaiting their outcome (§7 tokens).
+	tier_tokens: Arc<tier_tokens::TierTokenRegistry>,
 	/// Committed tier pointers this node failed to publish, with the typed
 	/// refusal when the failure was one (replayed without retrying the plan).
 	// The optional third field is evidence of an actual Some-index TierSlab

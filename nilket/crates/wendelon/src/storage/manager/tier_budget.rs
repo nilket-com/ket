@@ -46,6 +46,28 @@ impl TierBudgetKind {
 	const fn slot(self) -> usize {
 		self as usize
 	}
+
+	/// The process-wide gauge this kind reports to, as per-manager deltas.
+	fn gauge(self) -> Option<&'static crate::metrics::Gauge> {
+		let metrics = crate::metrics::global();
+		match self {
+			Self::Layout => Some(&metrics.tier_history_bytes),
+			Self::Redirect | Self::RedirectStore => Some(&metrics.relocation_redirect_bytes),
+			_ => None,
+		}
+	}
+
+	fn charge(self, bytes: u64) {
+		if let Some(gauge) = self.gauge() {
+			gauge.add(bytes);
+		}
+	}
+
+	fn discharge(self, bytes: u64) {
+		if let Some(gauge) = self.gauge() {
+			gauge.sub(bytes);
+		}
+	}
 }
 
 /// One manager's §7 memory budget.
@@ -112,6 +134,7 @@ impl TierMemoryBudget {
 	) -> Option<BudgetReservation> {
 		self.take(bytes)?;
 		self.by_kind[kind.slot()].fetch_add(bytes, Ordering::AcqRel);
+		kind.charge(bytes);
 		Some(BudgetReservation {
 			budget: self.clone(),
 			kind,
@@ -141,6 +164,7 @@ impl TierMemoryBudget {
 			return;
 		}
 		self.by_kind[kind.slot()].fetch_sub(bytes, Ordering::AcqRel);
+		kind.discharge(bytes);
 		self.used.fetch_sub(bytes, Ordering::AcqRel);
 		self.release_epoch.fetch_add(1, Ordering::AcqRel);
 		self.released.notify_waiters();
@@ -191,7 +215,9 @@ impl BudgetReservation {
 		if kind != self.kind {
 			let slots = &self.budget.by_kind;
 			slots[self.kind.slot()].fetch_sub(self.bytes, Ordering::AcqRel);
+			self.kind.discharge(self.bytes);
 			slots[kind.slot()].fetch_add(self.bytes, Ordering::AcqRel);
+			kind.charge(self.bytes);
 			self.kind = kind;
 		}
 		self

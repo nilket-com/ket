@@ -161,7 +161,8 @@ struct DirectApplyCommitter {
 
 #[async_trait]
 impl TierCommitter for DirectApplyCommitter {
-	async fn commit_tier_slab(&self, tier: wendelon::consensus::TieredSlab) -> std::io::Result<()> {
+	async fn commit_tier_slab(&self, proposal: wendelon::storage::TierProposal) -> std::io::Result<()> {
+		let tier = proposal.tier().clone();
 		self.observer.on_slab_tiered(&tier, 0).await
 	}
 

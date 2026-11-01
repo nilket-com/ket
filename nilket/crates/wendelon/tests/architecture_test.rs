@@ -9727,9 +9727,13 @@ fn adr078_manager_source_concatenates_submodules() {
 			"stats_facts.rs",
 			// ADR 0692: tier generations, the read snapshot and the typed refusal.
 			"tier_authority.rs",
+			// ADR 0696 (0692 §7): the node budget for tier history and redirects.
+			"tier_budget.rs",
 			"tier_generation.rs",
 			// ADR 0692: tier publication plans pair rows by logical owner.
 			"tier_plan.rs",
+			// ADR 0696 (0692 §7): proposer history tokens.
+			"tier_tokens.rs",
 			"tiered_io.rs",
 			// ADR 0692: class-scoped version identity and tier verification.
 			"version_identity.rs",
@@ -10919,8 +10923,14 @@ fn tier_recovery_snapshots_have_only_the_reviewed_private_callers() {
 			vec![
 				("manager.rs", 2),
 				("manager/lsm_driver.rs", 1),
-				("manager/tiered_io.rs", 4),
+				("manager/tiered_io.rs", 2),
 			],
+		),
+		(
+			// ADR 0696 (0692 §7): the bounded snapshot behind every tier
+			// publication plan; its callers are the plan builders.
+			"record_rows_for_slab_for_recovery_within",
+			vec![("manager/tiered_io.rs", 4)],
 		),
 		(
 			"published_table_object_id_for_recovery",
@@ -11640,4 +11650,62 @@ fn lsm_stage_refusal_is_definite_only_before_rename() {
 		assert!(body[..clear].contains("LsmStageFailure::BeforeRename("));
 		assert!(body.contains("LsmStageFailure::Uncertain(failure)) => return Err(failure)"));
 	}
+}
+
+/// ADR 0692 §7 (ADR 0696 fast follow): every proposer of a tier pointer
+/// change holds a history token. Production code reaches
+/// `TierCommitter::commit_tier_slab` only through `propose_tier_slab`, which
+/// reserves the token first; the committer's argument is the
+/// `TierProposal` that binds the pointer to it, so no other path can
+/// propose a pointer without one.
+#[test]
+fn every_tier_proposer_holds_a_history_token() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let production = |path: &str| -> String {
+		let source = fs::read_to_string(manifest_dir.join(path)).unwrap();
+		match source.split_once("#[cfg(test)]\nmod tests {") {
+			Some((production, _)) => production.to_owned(),
+			None => source,
+		}
+	};
+	let sweeper = production("src/storage/sweeper.rs");
+	let reclaim = production("src/storage/manager/retention_reclaim.rs");
+	let helper = sweeper
+		.split_once("pub(crate) async fn propose_tier_slab(")
+		.and_then(|(_, tail)| tail.split_once("\n}\n"))
+		.map(|(body, _)| body.to_owned())
+		.expect("propose_tier_slab exists");
+	assert!(
+		helper.contains("reserve_tier_history(tier)")
+			&& helper.contains("committer.commit_tier_slab(proposal)"),
+		"the helper reserves the token, then proposes with it"
+	);
+	assert!(
+		sweeper.contains(
+			"async fn commit_tier_slab(&self, proposal: TierProposal) -> std::io::Result<()>;"
+		),
+		"the committer receives the bound proposal, never a bare entry"
+	);
+	for (name, source) in [("sweeper.rs", &sweeper), ("retention_reclaim.rs", &reclaim)] {
+		let direct = source
+			.match_indices(".commit_tier_slab(")
+			.filter(|(at, _)| !source[..*at].ends_with("committer"))
+			.count();
+		assert_eq!(
+			direct, 0,
+			"{name}: production proposals go through propose_tier_slab"
+		);
+	}
+	assert!(sweeper.matches("propose_tier_slab(&self.slab,").count() >= 6);
+	assert_eq!(reclaim.matches("propose_tier_slab(self, committer, tier)").count(), 2);
+	let manager = manager_source(manifest_dir);
+	assert_eq!(
+		manager.matches("fn reserve_tier_history(").count(),
+		1,
+		"one constructor of a reserved proposal"
+	);
+	assert!(
+		!manager.contains("TierProposal {\n\t\t\ttier,\n\t\t\ttoken: None"),
+		"production never builds an unreserved proposal"
+	);
 }

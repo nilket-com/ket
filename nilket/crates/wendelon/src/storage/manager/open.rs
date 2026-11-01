@@ -763,6 +763,9 @@ impl SlabManager {
 				.ok_or_else(|| Error::other("snapshot epoch exhausted"))?,
 			None => 1,
 		};
+		let tier_budget =
+			super::tier_budget::TierMemoryBudget::new(super::tier_budget::DEFAULT_TIER_BUDGET_BYTES);
+		let tier_tokens = super::tier_tokens::TierTokenRegistry::new(&tier_budget)?;
 		let manager = Arc::new(Self {
 			_directory_owner: owner,
 			finality_observation:
@@ -832,9 +835,8 @@ impl SlabManager {
 			snapshot_epoch_gate: Arc::new(std::sync::RwLock::new(())),
 			awaiting_cluster: AtomicBool::new(awaiting_cluster),
 			retired_tier_slabs: DashSet::new(),
-			tier_budget: super::tier_budget::TierMemoryBudget::new(
-				super::tier_budget::DEFAULT_TIER_BUDGET_BYTES,
-			),
+			tier_budget: tier_budget.clone(),
+			tier_tokens,
 			unapplied_tier_pointers: DashMap::new(),
 			#[cfg(test)]
 			counter_rollback_fail_once: std::sync::atomic::AtomicBool::new(false),

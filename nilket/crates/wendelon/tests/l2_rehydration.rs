@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
 use wendelon::consensus::{
-	RetireTieredSlab, TierObserver, TieredSlab, WendelonRequest, WendelonStateMachine,
+	RetireTieredSlab, TierObserver, WendelonRequest, WendelonStateMachine,
 	WendelonTypeConfig,
 };
 use wendelon::crypto::{CryptoManager, test_support};
@@ -140,7 +140,8 @@ impl DirectApplyCommitter {
 
 #[async_trait]
 impl TierCommitter for DirectApplyCommitter {
-	async fn commit_tier_slab(&self, tier: TieredSlab) -> std::io::Result<()> {
+	async fn commit_tier_slab(&self, proposal: wendelon::storage::TierProposal) -> std::io::Result<()> {
+		let tier = proposal.tier().clone();
 		let index = self.next_index.fetch_add(1, Ordering::Relaxed);
 		let entry = Entry::<WendelonTypeConfig> {
 			log_id: LogId::new(CommittedLeaderId::new(1, 0), index),

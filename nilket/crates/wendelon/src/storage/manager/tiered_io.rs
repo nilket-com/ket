@@ -731,6 +731,9 @@ impl SlabManager {
 				slab_id = pointer.slab_id.get(),
 				"tier publication for a slab retired in this process is stale; ignored"
 			);
+			crate::metrics::global().observe_tier_rewrite_refusal(
+				crate::metrics::TierRewriteRefusalReason::SlabRetired,
+			);
 			return Ok(());
 		}
 		self.bump_slab_publication_revision(pointer.slab_id)?;
@@ -1000,15 +1003,22 @@ impl SlabManager {
 		// refused before the pointer or any row changes.
 		let next_layout = match &refresh_plan {
 			Some(plan) => {
-				let current = {
+				let (current, base) = {
 					let state = self.state.lock().await;
-					state
-						.tier_layouts
-						.get(&pointer.slab_id)
-						.map(|layout| layout.value().clone())
+					(
+						state
+							.tier_layouts
+							.get(&pointer.slab_id)
+							.map(|layout| layout.value().clone()),
+						self.tier_publication_base(&state, pointer.slab_id),
+					)
 				};
-				let current = current.unwrap_or_default();
-				Some(Arc::new(current.next(pointer.slab_id, plan, &self.tier_budget)?))
+				Some(Arc::new(self.build_observed_tier_layout(
+					&current.unwrap_or_default(),
+					&pointer,
+					&base,
+					plan,
+				)?))
 			}
 			None => None,
 		};
@@ -1636,7 +1646,7 @@ impl SlabManager {
 			&plaintext.record_offsets,
 			&scratch,
 		)?;
-		let old_rows = self.record_rows_for_slab_within(pointer.slab_id, &scratch)?;
+		let old_rows = self.record_rows_for_slab_for_recovery_within(pointer.slab_id, &scratch)?;
 		let relocated_reads = self.pair_tier_rows(
 			pointer.slab_id,
 			&old_rows,
@@ -1730,12 +1740,12 @@ impl SlabManager {
 		scratch: &TierPlanScratch,
 	) -> std::io::Result<Vec<PersistentRecordRow>> {
 		self.require_tier_authority_ready()?;
-		self.record_rows_for_slab_within(slab_id, scratch)
+		self.record_rows_for_slab_for_recovery_within(slab_id, scratch)
 	}
 
 	/// The slab's indexed rows, as `record_rows_for_slab_for_recovery` lists
 	/// them, within `scratch`'s bound.
-	pub(super) fn record_rows_for_slab_within(
+	pub(super) fn record_rows_for_slab_for_recovery_within(
 		&self,
 		slab_id: SlabId,
 		scratch: &TierPlanScratch,
@@ -1809,7 +1819,7 @@ impl SlabManager {
 			self.tiered_rows_within(&new_plaintext, pointer.slab_id, &new_offsets, &scratch)?;
 		// The committed observer holds this slab's tier lock and has checked
 		// its private authority; unrelated intents fence public reads only.
-		let old_rows = self.record_rows_for_slab_within(pointer.slab_id, &scratch)?;
+		let old_rows = self.record_rows_for_slab_for_recovery_within(pointer.slab_id, &scratch)?;
 		let old_plaintext = match published {
 			Some(published) if self.tier_pairing_needs_old_payloads(&old_rows, &new_rows)? => {
 				Some(self.tiered_plaintext_from_l2(published).await?)

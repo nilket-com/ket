@@ -313,5 +313,6 @@ impl SlabManager {
 			.unwrap_or_default()
 			.next(slab_id, &plan, &self.tier_budget)
 			.map(|_| ())
+			.inspect_err(super::tier_tokens::observe_tier_rewrite_refusal)
 	}
 }

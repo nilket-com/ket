@@ -377,16 +377,22 @@ impl SlabManager {
 				},
 			));
 		}
-		let current = {
+		let (current, base) = {
 			let state = self.state.lock().await;
-			state
-				.tier_layouts
-				.get(&pointer.slab_id)
-				.map(|layout| layout.value().clone())
+			(
+				state
+					.tier_layouts
+					.get(&pointer.slab_id)
+					.map(|layout| layout.value().clone()),
+				self.tier_publication_base(&state, pointer.slab_id),
+			)
 		};
-		let next = Arc::new(current
-			.unwrap_or_default()
-			.next(pointer.slab_id, plan, &self.tier_budget)?);
+		let next = Arc::new(self.build_observed_tier_layout(
+			&current.unwrap_or_default(),
+			pointer,
+			&base,
+			plan,
+		)?);
 		self.bump_slab_publication_revision(pointer.slab_id)?;
 		let publication = self.begin_index_publication(vec![pointer.slab_id]).await?;
 		if !self.tier_authority.current(authority_epoch) {

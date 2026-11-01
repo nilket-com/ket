@@ -38,6 +38,52 @@ impl TierAuthorityRetryClass {
 	}
 }
 
+/// Why a tier rewrite was refused (ADR 0692 §7 reporting).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TierRewriteRefusalReason {
+	LayoutCollision,
+	LineageHistoryCap,
+	NodeHistoryBudget,
+	StalePlan,
+	SlabRetired,
+}
+impl TierRewriteRefusalReason {
+	const LABELS: &'static [&'static str] = &[
+		"layout_collision",
+		"lineage_history_cap",
+		"node_history_budget",
+		"stale_plan",
+		"slab_retired",
+	];
+	fn label(self) -> &'static str {
+		match self {
+			Self::LayoutCollision => "layout_collision",
+			Self::LineageHistoryCap => "lineage_history_cap",
+			Self::NodeHistoryBudget => "node_history_budget",
+			Self::StalePlan => "stale_plan",
+			Self::SlabRetired => "slab_retired",
+		}
+	}
+}
+
+/// Why a committed tier publication was fenced (ADR 0692 §7 reporting).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TierPublicationFenceReason {
+	NoBudget,
+	NoScratch,
+	L2Unavailable,
+}
+impl TierPublicationFenceReason {
+	const LABELS: &'static [&'static str] = &["no_budget", "no_scratch", "l2_unavailable"];
+	fn label(self) -> &'static str {
+		match self {
+			Self::NoBudget => "no_budget",
+			Self::NoScratch => "no_scratch",
+			Self::L2Unavailable => "l2_unavailable",
+		}
+	}
+}
+
 const MICROS_PER_SECOND: u64 = 1_000_000;
 
 const GROUP_COMMIT_WINDOW_BUCKETS_MICROS: &[u64] =
@@ -2752,6 +2798,11 @@ pub struct MetricsRegistry {
 	storage_l2_column_fetch_selected_chunk_runs: Histogram,
 	storage_l2_column_fetch_fallback: L2ColumnFetchFallbackCounters,
 	storage_tier_authority_retries: StaticLabelCounters,
+	tier_rewrite_refusals: StaticLabelCounters,
+	tier_publication_fenced: StaticLabelCounters,
+	pub relocation_redirects_skipped: Counter,
+	pub tier_history_bytes: Gauge,
+	pub relocation_redirect_bytes: Gauge,
 	pub storage_tier_snapshot_reconciliation_pending: Gauge,
 	pub storage_lsm_control_intents_unresolved: Gauge,
 	pub storage_lsm_control_intents_legacy_unresolved: Gauge,
@@ -3093,6 +3144,11 @@ impl Default for MetricsRegistry {
 			),
 			storage_l2_column_fetch_fallback: L2ColumnFetchFallbackCounters::default(),
 			storage_tier_authority_retries: StaticLabelCounters::default(),
+			tier_rewrite_refusals: StaticLabelCounters::default(),
+			tier_publication_fenced: StaticLabelCounters::default(),
+			relocation_redirects_skipped: Counter::default(),
+			tier_history_bytes: Gauge::default(),
+			relocation_redirect_bytes: Gauge::default(),
 			storage_tier_snapshot_reconciliation_pending: Gauge::default(),
 			storage_lsm_control_intents_unresolved: Gauge::default(),
 			storage_lsm_control_intents_legacy_unresolved: Gauge::default(),
@@ -3698,6 +3754,14 @@ impl MetricsRegistry {
 
 	pub fn observe_storage_version_conflict_recovered(&self, copies: u64) {
 		self.storage_version_conflict_recovered_total.add(copies);
+	}
+
+	pub fn observe_tier_rewrite_refusal(&self, reason: TierRewriteRefusalReason) {
+		self.tier_rewrite_refusals.inc(reason.label());
+	}
+
+	pub fn observe_tier_publication_fenced(&self, reason: TierPublicationFenceReason) {
+		self.tier_publication_fenced.inc(reason.label());
 	}
 
 	pub fn observe_storage_tier_authority_retry(&self, class: TierAuthorityRetryClass) {
@@ -5423,6 +5487,38 @@ impl MetricsRegistry {
 			"Unresolved control LSM intents without complete local evidence; operator recovery is required.",
 			self.storage_lsm_control_intents_legacy_unresolved.get(),
 		);
+		self.tier_rewrite_refusals.render(
+			&mut out,
+			"wendelon_tier_rewrite_refusals_total",
+			"Tier rewrites refused before publication, by reason (ADR 0692 §7).",
+			"reason",
+			TierRewriteRefusalReason::LABELS,
+		);
+		self.tier_publication_fenced.render(
+			&mut out,
+			"wendelon_tier_publication_fenced_total",
+			"Committed tier publications fenced on this node, by reason (ADR 0692 §7).",
+			"reason",
+			TierPublicationFenceReason::LABELS,
+		);
+		render_counter(
+			&mut out,
+			"wendelon_relocation_redirects_skipped_total",
+			"Optional cross-slab redirect maps skipped for want of budget (ADR 0692 §7).",
+			self.relocation_redirects_skipped.get(),
+		);
+		render_gauge(
+			&mut out,
+			"wendelon_tier_history_bytes",
+			"Bytes charged to tier history layouts across this process's managers.",
+			self.tier_history_bytes.get(),
+		);
+		render_gauge(
+			&mut out,
+			"wendelon_relocation_redirect_bytes",
+			"Bytes charged to cross-slab redirect maps across this process's managers.",
+			self.relocation_redirect_bytes.get(),
+		);
 		self.storage_tier_authority_retries.render(
 			&mut out, "wendelon_storage_tier_authority_retries_total",
 			"Availability retries while committed tier authority remains unverified; sustained retries keep the node Pending.",
@@ -6805,6 +6901,48 @@ mod tests {
 				.render_prometheus()
 				.lines()
 				.any(|line| line == "wendelon_storage_counter_unresolved_slabs 1")
+		);
+	}
+
+	#[test]
+	fn tier_history_metrics_export_fixed_reasons_and_their_values() {
+		use super::{TierPublicationFenceReason as Fence, TierRewriteRefusalReason as Refusal};
+		let registry = MetricsRegistry::default();
+		for reason in [
+			Refusal::LayoutCollision,
+			Refusal::LineageHistoryCap,
+			Refusal::NodeHistoryBudget,
+			Refusal::StalePlan,
+			Refusal::SlabRetired,
+		] {
+			registry.observe_tier_rewrite_refusal(reason);
+		}
+		registry.observe_tier_rewrite_refusal(Refusal::LayoutCollision);
+		for reason in [Fence::NoBudget, Fence::NoScratch, Fence::L2Unavailable] {
+			registry.observe_tier_publication_fenced(reason);
+		}
+		registry.relocation_redirects_skipped.add(3);
+		registry.tier_history_bytes.add(4096);
+		registry.relocation_redirect_bytes.add(512);
+		let rendered = registry.render_prometheus();
+		let has = |line: &str| rendered.lines().any(|row| row == line);
+		assert!(has("wendelon_tier_rewrite_refusals_total{reason=\"layout_collision\"} 2"));
+		for label in &Refusal::LABELS[1..] {
+			assert!(has(&format!("wendelon_tier_rewrite_refusals_total{{reason=\"{label}\"}} 1")));
+		}
+		for label in Fence::LABELS {
+			assert!(has(&format!("wendelon_tier_publication_fenced_total{{reason=\"{label}\"}} 1")));
+		}
+		assert!(has("wendelon_relocation_redirects_skipped_total 3"));
+		assert!(has("wendelon_tier_history_bytes 4096"));
+		assert!(has("wendelon_relocation_redirect_bytes 512"));
+		assert_eq!(
+			rendered
+				.lines()
+				.filter(|row| row.starts_with("wendelon_tier_rewrite_refusals_total{"))
+				.count(),
+			5,
+			"no per-slab labels"
 		);
 	}
 

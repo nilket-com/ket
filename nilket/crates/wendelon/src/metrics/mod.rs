@@ -10,5 +10,6 @@ pub use registry::{
 	LsmCompactionResult, LsmDigestInvariantKind, MetricsRegistry, MigrationProxyReadOutcome,
 	NetworkCompressionPath, PbcRuntime, PendingFinalizationReplayPath,
 	STORAGE_DISAGREEING_SLAB_FILE_REASONS, STORAGE_REHYDRATION_SKIP_REASONS,
-	TableRetentionMetricPolicy, TierAuthorityRetryClass, global,
+	TableRetentionMetricPolicy, TierAuthorityRetryClass, TierPublicationFenceReason,
+	TierRewriteRefusalReason, global,
 };

@@ -72,10 +72,7 @@ struct ManifestApplyingCommitter {
 
 #[async_trait]
 impl TierCommitter for ManifestApplyingCommitter {
-	async fn commit_tier_slab(
-		&self,
-		_tier: wendelon::consensus::TieredSlab,
-	) -> std::io::Result<()> {
+	async fn commit_tier_slab(&self, _proposal: wendelon::storage::TierProposal) -> std::io::Result<()> {
 		Err(std::io::Error::new(
 			std::io::ErrorKind::Unsupported,
 			"tier commits are not used by this test committer",
