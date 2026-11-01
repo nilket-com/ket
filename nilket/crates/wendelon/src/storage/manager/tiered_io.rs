@@ -11,6 +11,8 @@ pub(super) struct TieredRowRefreshPlan {
 	pub(super) old_rows: Vec<PersistentRecordRow>,
 	pub(super) new_rows: Vec<PersistentRecordRow>,
 	pub(super) relocated_reads: Vec<(RecordLocation, RecordLocation)>,
+	/// The node budget charge for building and applying this plan.
+	pub(super) scratch: super::tier_budget::PlanScratch,
 }
 
 #[derive(Clone)]
@@ -1006,7 +1008,7 @@ impl SlabManager {
 						.map(|layout| layout.value().clone())
 				};
 				let current = current.unwrap_or_default();
-				Some(Arc::new(current.next(pointer.slab_id, plan)?))
+				Some(Arc::new(current.next(pointer.slab_id, plan, &self.tier_budget)?))
 			}
 			None => None,
 		};
@@ -1583,29 +1585,36 @@ impl SlabManager {
 	) -> std::io::Result<Vec<PersistentRecordRow>> {
 		recover_slab_entries_from_blob(plaintext, slab_id, acknowledged)?
 			.into_iter()
-			.map(|entry| {
-				let frame = extract_record_from_blob(plaintext, entry.location)?;
-				// Core recovery already classified synthetic rows. Opaque blob bytes
-				// must never be probed as an Arrow length-prefixed stream.
-				let table_object_id = if entry.routing_locality_trusted {
-					let batch = decode_record_batch(&frame)?;
-					storage_row_table_object_id_at(&batch, entry.location.record_row_index)?
-				} else {
-					None
-				};
-				Ok(PersistentRecordRow {
-					tenant_id: entry.tenant_id,
-					key_identity: entry.key_identity,
-					routing_locality: self.recovered_entry_routing_locality(&entry),
-					table_object_id,
-					// ADR 0090: recovery read the row's placement from the frame;
-					// re-tiering must not downgrade it.
-					placement: entry.location.placement,
-					partition: entry.location.partition,
-					location: entry.location,
-				})
-			})
+			.map(|entry| self.persistent_row_from_recovered_entry(plaintext, entry))
 			.collect()
+	}
+
+	/// The index row for one recovered entry of `plaintext`.
+	fn persistent_row_from_recovered_entry(
+		&self,
+		plaintext: &[u8],
+		entry: crate::storage::core::RecoveredSlabEntry,
+	) -> std::io::Result<PersistentRecordRow> {
+		let frame = extract_record_from_blob(plaintext, entry.location)?;
+		// Core recovery already classified synthetic rows. Opaque blob bytes
+		// must never be probed as an Arrow length-prefixed stream.
+		let table_object_id = if entry.routing_locality_trusted {
+			let batch = decode_record_batch(&frame)?;
+			storage_row_table_object_id_at(&batch, entry.location.record_row_index)?
+		} else {
+			None
+		};
+		Ok(PersistentRecordRow {
+			tenant_id: entry.tenant_id,
+			key_identity: entry.key_identity,
+			routing_locality: self.recovered_entry_routing_locality(&entry),
+			table_object_id,
+			// ADR 0090: recovery read the row's placement from the frame;
+			// re-tiering must not downgrade it.
+			placement: entry.location.placement,
+			partition: entry.location.partition,
+			location: entry.location,
+		})
 	}
 
 	/// The verifier already fetched and authenticated this object without
@@ -1616,12 +1625,18 @@ impl SlabManager {
 		pointer: &TieredSlabPointer,
 		plaintext: &TieredPlaintext,
 	) -> std::io::Result<TieredRowRefreshPlan> {
-		let new_rows = self.tiered_rows_from_plaintext_with_evidence(
+		let scratch = self.reserve_tier_plan_scratch(
+			pointer.slab_id,
+			&plaintext.bytes,
+			&plaintext.record_offsets,
+		)?;
+		let new_rows = self.tiered_rows_within(
 			&plaintext.bytes,
 			pointer.slab_id,
 			&plaintext.record_offsets,
+			&scratch,
 		)?;
-		let old_rows = self.record_rows_for_slab_for_recovery(pointer.slab_id);
+		let old_rows = self.record_rows_for_slab_within(pointer.slab_id, &scratch)?;
 		let relocated_reads = self.pair_tier_rows(
 			pointer.slab_id,
 			&old_rows,
@@ -1634,7 +1649,127 @@ impl SlabManager {
 			old_rows,
 			new_rows,
 			relocated_reads,
+			scratch: scratch.charge,
 		})
+	}
+
+	/// Reserve, before any of it is allocated, the memory a publication plan
+	/// over `plaintext` needs (ADR 0692 §7): the bounded recovery walk, the
+	/// new and old row vectors with the copies made of them for the index
+	/// transaction and the apply, and the pairing scratch. The counts come
+	/// from the count-only walk and a count over the index.
+	pub(super) fn reserve_tier_plan_scratch(
+		&self,
+		slab_id: SlabId,
+		plaintext: &[u8],
+		acknowledged: &BTreeSet<u64>,
+	) -> std::io::Result<TierPlanScratch> {
+		use super::tier_budget::{
+			PlanScratch, TierBudgetKind, TierHistoryShortfall, checked_sum, tier_history_refusal,
+			vec_bytes,
+		};
+		let new_bound = crate::storage::core::count_slab_entries_in_blob(
+			plaintext,
+			slab_id,
+			acknowledged,
+		)?;
+		let old_bound = self.count_record_rows_for_slab(slab_id);
+		let short = || tier_history_refusal(slab_id, TierHistoryShortfall::Scratch);
+		// Rows: the plan's vectors, the index transaction's copies of them, and
+		// the apply's copy of the plan; pairs: the plan's and the apply's.
+		let rows = |count| vec_bytes::<PersistentRecordRow>(count)?.checked_mul(3);
+		let pairs = vec_bytes::<(RecordLocation, RecordLocation)>(old_bound)
+			.and_then(|bytes| bytes.checked_mul(2));
+		let bytes = checked_sum(&[
+			crate::storage::core::bounded_recovery_bytes(new_bound),
+			rows(new_bound.entries),
+			rows(old_bound),
+			pairs,
+			super::tier_plan::tier_pairing_scratch_bytes(old_bound, new_bound.entries),
+		])
+		.ok_or_else(short)?;
+		let charge = self
+			.tier_budget
+			.try_reserve(TierBudgetKind::Scratch, bytes)
+			.ok_or_else(short)?;
+		Ok(TierPlanScratch {
+			new_bound,
+			old_bound,
+			charge: PlanScratch::new(charge),
+		})
+	}
+
+	/// `tiered_rows_from_plaintext_with_evidence` within `scratch`'s bound.
+	pub(super) fn tiered_rows_within(
+		&self,
+		plaintext: &[u8],
+		slab_id: SlabId,
+		acknowledged: &BTreeSet<u64>,
+		scratch: &TierPlanScratch,
+	) -> std::io::Result<Vec<PersistentRecordRow>> {
+		let entries = crate::storage::core::recover_slab_entries_from_blob_bounded(
+			plaintext,
+			slab_id,
+			acknowledged,
+			scratch.new_bound,
+		)
+		.map_err(|error| stale_plan_if_over_bound(slab_id, error))?;
+		let mut rows = Vec::new();
+		rows.try_reserve_exact(entries.len())
+			.map_err(|_| Error::new(ErrorKind::OutOfMemory, "tier plan rows"))?;
+		for entry in entries {
+			rows.push(self.persistent_row_from_recovered_entry(plaintext, entry)?);
+		}
+		Ok(rows)
+	}
+
+	/// `record_rows_for_slab` (readiness checked) within `scratch`'s bound.
+	pub(super) fn record_rows_for_slab_within_checked(
+		&self,
+		slab_id: SlabId,
+		scratch: &TierPlanScratch,
+	) -> std::io::Result<Vec<PersistentRecordRow>> {
+		self.require_tier_authority_ready()?;
+		self.record_rows_for_slab_within(slab_id, scratch)
+	}
+
+	/// The slab's indexed rows, as `record_rows_for_slab_for_recovery` lists
+	/// them, within `scratch`'s bound.
+	pub(super) fn record_rows_for_slab_within(
+		&self,
+		slab_id: SlabId,
+		scratch: &TierPlanScratch,
+	) -> std::io::Result<Vec<PersistentRecordRow>> {
+		let mut rows = Vec::new();
+		rows.try_reserve_exact(scratch.old_bound)
+			.map_err(|_| Error::new(ErrorKind::OutOfMemory, "tier plan rows"))?;
+		for entry in self.key_index.iter() {
+			let (tenant_id, key_identity) = *entry.key();
+			for location in entry.value().iter() {
+				if location.slab_id == slab_id {
+					if rows.len() == scratch.old_bound {
+						return Err(super::tier_budget::tier_history_refusal(
+							slab_id,
+							super::tier_budget::TierHistoryShortfall::StalePlan,
+						));
+					}
+					rows.push(self.persistent_record_row(tenant_id, key_identity, *location));
+				}
+			}
+		}
+		// Rows equal in this key are one location of one key, so they are equal
+		// rows and the unstable sort, which needs no buffer, is exact.
+		rows.sort_unstable_by_key(|row| {
+			(
+				row.location.slab_id,
+				row.tenant_id,
+				row.key_identity,
+				row.location.hlc,
+				row.location.offset,
+				row.location.record_row_index,
+			)
+		});
+		Ok(rows)
 	}
 
 	/// The plan that moves the slab's indexed rows to `pointer`'s object, with
@@ -1668,16 +1803,15 @@ impl SlabManager {
 			bytes: new_plaintext,
 			record_offsets: new_offsets,
 		} = self.tiered_object_from_l2(pointer, evidence).await?;
-		let new_rows = self.tiered_rows_from_plaintext_with_evidence(
-			&new_plaintext,
-			pointer.slab_id,
-			&new_offsets,
-		)?;
+		let scratch =
+			self.reserve_tier_plan_scratch(pointer.slab_id, &new_plaintext, &new_offsets)?;
+		let new_rows =
+			self.tiered_rows_within(&new_plaintext, pointer.slab_id, &new_offsets, &scratch)?;
 		// The committed observer holds this slab's tier lock and has checked
 		// its private authority; unrelated intents fence public reads only.
-		let old_rows = self.record_rows_for_slab_for_recovery(pointer.slab_id);
+		let old_rows = self.record_rows_for_slab_within(pointer.slab_id, &scratch)?;
 		let old_plaintext = match published {
-			Some(published) if self.tier_pairing_needs_old_payloads(&old_rows, &new_rows) => {
+			Some(published) if self.tier_pairing_needs_old_payloads(&old_rows, &new_rows)? => {
 				Some(self.tiered_plaintext_from_l2(published).await?)
 			}
 			_ => None,
@@ -1694,6 +1828,7 @@ impl SlabManager {
 			old_rows,
 			new_rows,
 			relocated_reads,
+			scratch: scratch.charge,
 		})
 	}
 
@@ -2142,5 +2277,28 @@ impl SlabManager {
 			}
 		}
 		by_slab
+	}
+}
+
+/// A publication plan's counted bounds and its reserved scratch charge.
+pub(super) struct TierPlanScratch {
+	pub(super) new_bound: crate::storage::core::SlabEntryBound,
+	pub(super) old_bound: usize,
+	pub(super) charge: super::tier_budget::PlanScratch,
+}
+
+/// A bounded walk that outgrew its count means the plan's inputs changed or
+/// the count was wrong: refuse the plan as stale rather than grow.
+fn stale_plan_if_over_bound(slab_id: SlabId, error: Error) -> Error {
+	let over = error
+		.get_ref()
+		.is_some_and(|inner| inner.is::<crate::storage::core::EntryBoundExceeded>());
+	if over {
+		super::tier_budget::tier_history_refusal(
+			slab_id,
+			super::tier_budget::TierHistoryShortfall::StalePlan,
+		)
+	} else {
+		error
 	}
 }

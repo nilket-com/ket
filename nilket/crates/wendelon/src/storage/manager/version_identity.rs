@@ -384,7 +384,9 @@ impl SlabManager {
 				.get(&pointer.slab_id)
 				.map(|layout| layout.value().clone())
 		};
-		let next = Arc::new(current.unwrap_or_default().next(pointer.slab_id, plan)?);
+		let next = Arc::new(current
+			.unwrap_or_default()
+			.next(pointer.slab_id, plan, &self.tier_budget)?);
 		self.bump_slab_publication_revision(pointer.slab_id)?;
 		let publication = self.begin_index_publication(vec![pointer.slab_id]).await?;
 		if !self.tier_authority.current(authority_epoch) {

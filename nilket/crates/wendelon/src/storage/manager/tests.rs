@@ -35598,6 +35598,339 @@ async fn committed_republication_resolves_unindexed_timeout_fence() {
 	assert!(mgr.lookup(tenant(), id(0x421)).unwrap().is_some());
 }
 
+/// A committed republication fenced by the index-gate bound and recovered by
+/// the sweeper's retry supersedes an older snapshot retirement, as the
+/// observer's own apply at that control index does.
+#[tokio::test]
+async fn sweeper_recovery_of_a_fenced_republication_supersedes_an_older_snapshot_retirement() {
+	let (_dirs, mgr, _l2, _target, _schemas, pointer) = unpublished_drop_fixture().await;
+	let slab_id = pointer.slab_id;
+	let epoch = mgr.capture_snapshot_epoch();
+	mgr.persistent_index
+		.as_ref()
+		.unwrap()
+		.stage_deferred_retirement(
+			crate::storage::index::SnapshotRetirementMark {
+				epoch,
+				snapshot_index: None,
+				pointer: pointer.clone(),
+			},
+			mgr.snapshot_epoch.clone(),
+			mgr.snapshot_epoch_gate.clone(),
+		)
+		.await
+		.unwrap()
+		.unwrap();
+	mgr.tier_authority
+		.mark_snapshot_retirement(slab_id, epoch, None);
+	let gate = mgr.hold_index_write_gate_for_test().await;
+	let fenced = mgr
+		.apply_tier_slab_committed(pointer.clone(), Some(820))
+		.await;
+	drop(gate);
+	assert!(fenced.is_err(), "premise: the gate bound fences the apply");
+	assert_eq!(
+		mgr.unapplied_tier_pointers
+			.get(&slab_id)
+			.map(|entry| entry.value().clone()),
+		Some((pointer.clone(), Some(StaleLocationReason::Fenced), Some(820))),
+		"premise: the deferral carries the apply's control index"
+	);
+
+	let observed = mgr.capture_snapshot_epoch();
+	let authoritative = pointer.clone();
+	mgr.reconcile_tier_slab_at_snapshot_epoch(slab_id, observed, || async move {
+		Ok(Some(authoritative))
+	})
+	.await
+	.unwrap();
+	assert!(
+		mgr.unapplied_tier_pointers.get(&slab_id).is_none(),
+		"premise: the sweeper retry recovered the fence"
+	);
+	assert!(
+		mgr.persistent_index
+			.as_ref()
+			.unwrap()
+			.load_snapshot_retirement_marks()
+			.await
+			.unwrap()
+			.is_empty(),
+		"the republication at 820 supersedes the older durable retirement mark"
+	);
+	assert!(mgr.tier_authority_readiness_reason().is_none());
+	assert!(mgr.lookup(tenant(), id(0x421)).unwrap().is_some());
+}
+
+/// The fenced form of `newer_committed_pointer_cancels_obsolete_snapshot_retirement`:
+/// a committed replacement at control index 823, applied while an older
+/// snapshot retirement (822) is still pending, is fenced by the index-gate
+/// bound and then recovered only by the sweeper's retry. The recovery must
+/// supersede the older retirement exactly as the unfenced apply does.
+#[tokio::test]
+async fn sweeper_recovery_of_a_fenced_replacement_cancels_an_obsolete_snapshot_retirement() {
+	let (_dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let bytes = l2.get(&old.l2_uri).await.unwrap();
+	let uri = l2
+		.put("tier/after-pending-snapshot.wnd", &bytes)
+		.await
+		.unwrap();
+	let pause = mgr.pause_snapshot_before_retirement_apply_once();
+	let epoch = mgr.begin_tier_snapshot_install().unwrap();
+	let first = {
+		let mgr = mgr.clone();
+		tokio::spawn(async move {
+			mgr.finish_tier_snapshot_install_at_epoch(vec![], Some(822), epoch)
+				.await
+		})
+	};
+	tokio::time::timeout(Duration::from_secs(60), pause.reached.notified())
+		.await
+		.unwrap();
+	let mut replacement = old.clone();
+	replacement.l2_uri = uri;
+	let gate = mgr.hold_index_write_gate_for_test().await;
+	let fenced = mgr
+		.apply_tier_slab_committed(replacement.clone(), Some(823))
+		.await;
+	drop(gate);
+	let deferral = mgr
+		.unapplied_tier_pointers
+		.get(&old.slab_id)
+		.map(|entry| entry.value().clone());
+	eprintln!("fenced apply: {fenced:?}; deferral: {deferral:?}");
+	assert!(fenced.is_err(), "premise: the gate bound fences the apply");
+	assert_eq!(
+		deferral,
+		Some((
+			replacement.clone(),
+			Some(StaleLocationReason::Fenced),
+			Some(823)
+		)),
+		"premise: the deferral carries the apply's control index"
+	);
+	pause.resume.notify_one();
+	let snapshot = first.await.unwrap();
+	eprintln!("snapshot install: {snapshot:?}");
+
+	let observed = mgr.capture_snapshot_epoch();
+	let authoritative = replacement.clone();
+	let retry = mgr
+		.reconcile_tier_slab_at_snapshot_epoch(old.slab_id, observed, || async move {
+			Ok(Some(authoritative))
+		})
+		.await;
+	let marks = mgr
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot_retirement_marks()
+		.await
+		.unwrap();
+	eprintln!(
+		"sweeper retry: {retry:?}; pointer: {:?}; deferral: {:?}; marks: {marks:?}",
+		mgr.tier_pointer(old.slab_id).await,
+		mgr.unapplied_tier_pointers
+			.get(&old.slab_id)
+			.map(|entry| entry.value().clone())
+	);
+	assert_eq!(mgr.tier_pointer(old.slab_id).await, Some(replacement));
+	assert!(
+		marks.is_empty(),
+		"the replacement at 823 cancels the obsolete retirement at 822"
+	);
+	tokio::time::timeout(Duration::from_secs(60), mgr.wait_tier_authority_ready())
+		.await
+		.expect("authority becomes ready")
+		.unwrap();
+}
+
+/// The real-state-machine route for the fenced-replacement RED: a snapshot at
+/// 822 that no longer names slab X is installed while an append is in flight,
+/// so its tier reconciliation is deferred to the authority worker; entry 823
+/// then commits a replacement pointer for X through the real observer while
+/// the index gate is held, so that apply is fenced. Observations are recorded
+/// before any assertion so a typed refusal can be told from a silent omission.
+#[tokio::test]
+async fn real_sm_fenced_replacement_after_a_deferred_snapshot_retirement_is_served_or_refused() {
+	use crate::consensus::WendelonStateMachine;
+	use crate::storage::sweeper::ManagerTierObserver;
+	use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
+	use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
+
+	let (_dirs, manager, l2) = fresh_manager_with_l2("s7-real-sm-fenced-replacement").await;
+	let key = id(0x5e823);
+	manager
+		.append_durable(tenant(), key, hlc(511), b"tiered-row")
+		.await
+		.unwrap();
+	let old = tier_kv_slab(&manager, &l2, "s7-real-sm/p0").await;
+	let slab_id = old.slab_id;
+	let bytes = l2.get(&old.l2_uri).await.unwrap();
+	let replacement = TieredSlabPointer {
+		l2_uri: l2.put("s7-real-sm/p1", &bytes).await.unwrap(),
+		..old.clone()
+	};
+	assert_eq!(
+		manager.read(manager.lookup(tenant(), key).unwrap().unwrap()).await.unwrap(),
+		b"tiered-row",
+		"premise: the tiered row is served at P0"
+	);
+
+	// The snapshot at 822 no longer names X.
+	let mut source = WendelonStateMachine::new();
+	RaftStateMachine::apply(
+		&mut source,
+		[Entry {
+			log_id: LogId::new(CommittedLeaderId::new(3, 1), 822),
+			payload: EntryPayload::Blank,
+		}],
+	)
+	.await
+	.unwrap();
+	let built = RaftStateMachine::get_snapshot_builder(&mut source)
+		.await
+		.build_snapshot()
+		.await
+		.unwrap();
+	let mut target = WendelonStateMachine::new()
+		.with_tier_observer(Arc::new(ManagerTierObserver::new(manager.clone())));
+	target.seed_tiered_slab_for_test(b10_tier(&old)).await;
+
+	// An in-flight append makes the snapshot's reconciliation defer.
+	let active = Arc::clone(&manager.state.lock().await.active);
+	assert_ne!(active.slab_id(), slab_id);
+	let (entered, release) = active.hold_next_append_write_for_test();
+	let writer = {
+		let manager = manager.clone();
+		tokio::spawn(async move {
+			manager
+				.append_durable(tenant(), id(0x5e824), hlc(600), b"in-flight")
+				.await
+		})
+	};
+	tokio::time::timeout(Duration::from_secs(60), entered.acquire())
+		.await
+		.unwrap()
+		.unwrap()
+		.forget();
+	let installed =
+		RaftStateMachine::install_snapshot(&mut target, &built.meta, built.snapshot).await;
+	let deferred = manager.tier_authority.snapshot_retry_pending_for_test();
+	eprintln!("install_snapshot: {installed:?}; reconciliation deferred: {deferred}");
+
+	// Entry 823 commits the replacement; the observer's apply is fenced.
+	let gate = manager.hold_index_write_gate_for_test().await;
+	let applied = RaftStateMachine::apply(
+		&mut target,
+		[Entry {
+			log_id: LogId::new(CommittedLeaderId::new(3, 1), 823),
+			payload: EntryPayload::Normal(crate::consensus::WendelonRequest::TierSlab(
+				b10_tier(&replacement),
+			)),
+		}],
+	)
+	.await
+	.map(|_| ());
+	drop(gate);
+	let deferral = manager
+		.unapplied_tier_pointers
+		.get(&slab_id)
+		.map(|entry| entry.value().clone());
+	eprintln!("apply 823: {applied:?}; deferral: {deferral:?}");
+	release.close();
+	let wrote = tokio::time::timeout(Duration::from_secs(60), writer).await;
+	eprintln!("in-flight append: {wrote:?}");
+
+	// Let the authority worker run its deferred reconciliation.
+	let ready = tokio::time::timeout(Duration::from_secs(60), async {
+		loop {
+			if manager.require_tier_authority_ready().is_ok() {
+				break;
+			}
+			tokio::time::sleep(Duration::from_millis(10)).await;
+		}
+	})
+	.await
+	.is_ok();
+	let canonical = || {
+		let target = target.clone();
+		async move {
+			Ok(target
+				.state_snapshot()
+				.await
+				.tiered_slabs
+				.get(&slab_id)
+				.map(|tier| TieredSlabPointer {
+					slab_id: tier.slab_id,
+					l2_uri: tier.l2_uri.clone(),
+					payload_hash: tier.payload_hash,
+					is_encrypted: tier.is_encrypted,
+					tenant_id: tier.tenant_id,
+					tenant_kek_id: tier.tenant_kek_id,
+					stats_format_version: tier.stats_format_version,
+					stats_block_len: tier.stats_block_len,
+					stats_block_hash128: tier.stats_block_hash128,
+					tombstone_metadata: tier.tombstone_metadata,
+					supersession_metadata: tier.supersession_metadata,
+				}))
+		}
+	};
+	let committed = canonical().await.unwrap();
+	let observe = |stage: &'static str| {
+		let manager = manager.clone();
+		async move {
+			let lookup = manager.lookup(tenant(), key);
+			let read = match &lookup {
+				Ok(Some(location)) => Some(
+					tokio::time::timeout(Duration::from_secs(10), manager.read(*location))
+						.await
+						.map(|read| read.map(|bytes| String::from_utf8_lossy(&bytes).into_owned())),
+				),
+				_ => None,
+			};
+			let durable = manager
+				.persistent_index
+				.as_ref()
+				.unwrap()
+				.load_snapshot_retirement_marks()
+				.await
+				.map(|marks| marks.len());
+			eprintln!(
+				"{stage}: pointer={:?} deferral={:?} retired={} readiness={:?} lookup={lookup:?} read={read:?} marks={durable:?}",
+				manager.tier_pointer(slab_id).await.map(|p| p.l2_uri),
+				manager
+					.unapplied_tier_pointers
+					.get(&slab_id)
+					.map(|entry| (entry.value().1, entry.value().2)),
+				manager.retired_tier_slabs.contains(&slab_id),
+				manager.tier_authority_readiness_reason(),
+			);
+			(lookup.is_ok_and(|found| found.is_none()), read)
+		}
+	};
+	eprintln!("canonical pointer after 823: {:?}; worker ready: {ready}", committed.as_ref().map(|p| &p.l2_uri));
+	let (missing_after_worker, _) = observe("after worker").await;
+
+	let observed_epoch = manager.capture_snapshot_epoch();
+	let retry = manager
+		.reconcile_tier_slab_at_snapshot_epoch(slab_id, observed_epoch, canonical)
+		.await;
+	eprintln!("sweeper retry: {retry:?}");
+	let (missing_after_retry, read_after_retry) = observe("after sweeper retry").await;
+
+	assert_eq!(committed, Some(replacement.clone()), "premise: canonical state names 823's replacement");
+	assert!(
+		!missing_after_worker && !missing_after_retry,
+		"a committed row is never answered as absent"
+	);
+	assert_eq!(manager.tier_pointer(slab_id).await, Some(replacement), "the newer committed pointer is published");
+	assert!(
+		matches!(read_after_retry, Some(Ok(Ok(ref value))) if value == "tiered-row"),
+		"the row is served after recovery: {read_after_retry:?}"
+	);
+}
+
 async fn a6_undecodable_stored_counter_identity_control(counter_class: bool) {
 	let (_dir, mgr) = fresh_manager().await;
 	let key = id(0xa600);

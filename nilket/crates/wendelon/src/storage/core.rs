@@ -1865,10 +1865,169 @@ fn recover_slab_entries_from_blob_inner(
 	acknowledged: &BTreeSet<u64>,
 	skip_counter_frames: bool,
 ) -> std::io::Result<Vec<RecoveredSlabEntry>> {
-	let header_size = std::mem::size_of::<SlabRecordHeader>();
 	let mut entries = Vec::new();
 	let mut recovered_versions = HashMap::new();
-	let mut accepted = BTreeSet::new();
+	walk_slab_records(
+		blob,
+		slab_id,
+		acknowledged,
+		skip_counter_frames,
+		|header, base_location, frame| {
+			for entry in recover_entries_for_record(header, base_location, frame)? {
+				observe_recovered_row_version(&mut recovered_versions, &entry);
+				entries.push(entry);
+			}
+			Ok(())
+		},
+	)?;
+	validate_recovered_row_tombstone_chains(&recovered_versions)?;
+	Ok(entries)
+}
+
+/// `recover_slab_entries_from_blob` within `bound` (from
+/// `count_slab_entries_in_blob`): every container is allocated at the bound
+/// first and the walk refuses with `EntryBoundExceeded` before it would grow
+/// past it. The tombstone-chain check sorts a bounded copy of each entry's
+/// version instead of building per-key chains; it accepts and refuses
+/// exactly what the per-key chains do.
+pub(crate) fn recover_slab_entries_from_blob_bounded(
+	blob: &[u8],
+	slab_id: SlabId,
+	acknowledged: &BTreeSet<u64>,
+	bound: SlabEntryBound,
+) -> std::io::Result<Vec<RecoveredSlabEntry>> {
+	let unallocated = |_| Error::new(ErrorKind::OutOfMemory, "bounded blob recovery");
+	let mut entries = Vec::new();
+	entries.try_reserve_exact(bound.entries).map_err(unallocated)?;
+	walk_slab_records(blob, slab_id, acknowledged, false, |header, base_location, frame| {
+		let recovered = recover_entries_for_record(header, base_location, frame)?;
+		if recovered.len() > bound.entries - entries.len() {
+			return Err(Error::other(EntryBoundExceeded));
+		}
+		entries.extend(recovered);
+		Ok(())
+	})?;
+	// (tenant, key, hlc, walk order, tombstone): sorted, each key's versions
+	// fall in the order `insert_version_sorted` gives them (by HLC, then in
+	// walk order for equal HLCs).
+	let mut versions = Vec::new();
+	versions.try_reserve_exact(entries.len()).map_err(unallocated)?;
+	versions.extend(entries.iter().enumerate().map(|(order, entry)| {
+		(
+			entry.tenant_id,
+			entry.key_identity,
+			entry.location.hlc,
+			order,
+			entry.location.is_tombstone,
+		)
+	}));
+	versions.sort_unstable_by_key(|(tenant, key, hlc, order, _)| (*tenant, *key, *hlc, *order));
+	if versions.windows(2).any(|pair| {
+		let (left, right) = (&pair[0], &pair[1]);
+		(left.0, left.1) == (right.0, right.1) && left.4 && right.4
+	}) {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"duplicate row tombstone recovered for the same tenant/key",
+		));
+	}
+	Ok(entries)
+}
+
+/// Bytes `recover_slab_entries_from_blob_bounded` allocates for `bound`,
+/// besides one record's transient decode.
+pub(crate) fn bounded_recovery_bytes(bound: SlabEntryBound) -> Option<u64> {
+	let entry = u64::try_from(std::mem::size_of::<RecoveredSlabEntry>()).ok()?;
+	let version = u64::try_from(std::mem::size_of::<(
+		TenantId,
+		Identity,
+		HybridTimestamp,
+		usize,
+		bool,
+	)>())
+	.ok()?;
+	let entries = u64::try_from(bound.entries).ok()?;
+	let one_record = u64::try_from(bound.max_record_entries).ok()?;
+	entry
+		.checked_mul(entries)?
+		.checked_add(version.checked_mul(entries)?)?
+		.checked_add(entry.checked_mul(one_record)?)
+}
+
+/// A walk produced more entries than its counted bound.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct EntryBoundExceeded;
+
+impl std::fmt::Display for EntryBoundExceeded {
+	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		formatter.write_str("recovered entries exceed their counted bound")
+	}
+}
+
+impl std::error::Error for EntryBoundExceeded {}
+
+/// An upper bound on the entries `recover_slab_entries_from_blob` returns
+/// for the same bytes, computed without decoding a frame or collecting an
+/// entry: the same record walk, counting each accepted record's logical rows
+/// from its Arrow IPC record-batch headers (one for an opaque frame), and the
+/// most any one record contributes.
+///
+/// A bound, not a count: a record whose IPC headers cannot be read counts
+/// one, and a caller that fills past the bound must refuse rather than grow.
+pub(crate) fn count_slab_entries_in_blob(
+	blob: &[u8],
+	slab_id: SlabId,
+	acknowledged: &BTreeSet<u64>,
+) -> std::io::Result<SlabEntryBound> {
+	let mut bound = SlabEntryBound::default();
+	walk_slab_records(blob, slab_id, acknowledged, false, |_, _, frame| {
+		let rows = declared_logical_rows(frame).max(1);
+		bound.entries = bound
+			.entries
+			.checked_add(rows)
+			.ok_or_else(|| Error::new(ErrorKind::InvalidData, "recovered row count overflow"))?;
+		bound.max_record_entries = bound.max_record_entries.max(rows);
+		Ok(())
+	})?;
+	Ok(bound)
+}
+
+/// `count_slab_entries_in_blob`'s result.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SlabEntryBound {
+	/// At most this many entries in the whole walk.
+	pub(crate) entries: usize,
+	/// At most this many entries from any one record.
+	pub(crate) max_record_entries: usize,
+}
+
+/// The logical rows an Arrow IPC stream frame declares across its
+/// record-batch messages, read from the flatbuffer headers alone; 0 for a
+/// frame that is not a readable IPC stream. Spans are checked as
+/// `validate_ipc_stream_envelope` checks them, and nothing is allocated.
+fn declared_logical_rows(frame: &[u8]) -> usize {
+	if !has_plausible_arrow_stream_prefix(frame) {
+		return 0;
+	}
+	super::ipc::declared_record_batch_rows(frame).unwrap_or(0)
+}
+
+/// The one record walk behind blob recovery: framing, checksums, the
+/// acknowledged-offset resynchronisation and the refusal of an acknowledged
+/// record the walk did not accept. `on_record` sees each accepted standard
+/// record in physical order; counter records are skipped or refused.
+fn walk_slab_records(
+	blob: &[u8],
+	slab_id: SlabId,
+	acknowledged: &BTreeSet<u64>,
+	skip_counter_frames: bool,
+	mut on_record: impl FnMut(&SlabRecordHeader, RecordLocation, &[u8]) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+	let header_size = std::mem::size_of::<SlabRecordHeader>();
+	// Acknowledged offsets are matched against accepted records as the walk
+	// advances in offset order, so no set of accepted offsets is collected.
+	let mut pending_acknowledged = acknowledged.iter().copied().peekable();
+	let mut first_unaccepted = None;
 	let mut cursor: usize = 0;
 
 	while cursor + DIRECT_IO_ALIGN <= blob.len() {
@@ -1914,7 +2073,15 @@ fn recover_slab_entries_from_blob_inner(
 			placement: PlacementSemantics::RawLocality,
 			partition: None,
 		};
-		accepted.insert(cursor as u64);
+		while let Some(&offset) = pending_acknowledged.peek() {
+			if offset > cursor as u64 {
+				break;
+			}
+			if offset < cursor as u64 && first_unaccepted.is_none() {
+				first_unaccepted = Some(offset);
+			}
+			pending_acknowledged.next();
+		}
 		// ADR 075: the blob-tier recovery path does not (yet) apply the
 		// counter tentative/commit rule — counters are not tiered in this cut.
 		// Fail closed rather than mis-index a counter frame as a blob (which
@@ -1933,10 +2100,7 @@ fn recover_slab_entries_from_blob_inner(
 				"counter record encountered on the blob-tier recovery path (unsupported in this cut)",
 			));
 		}
-		for entry in recover_entries_for_record(&header, base_location, frame)? {
-			observe_recovered_row_version(&mut recovered_versions, &entry);
-			entries.push(entry);
-		}
+		on_record(&header, base_location, frame)?;
 		cursor += padded;
 	}
 
@@ -1944,11 +2108,10 @@ fn recover_slab_entries_from_blob_inner(
 	// walk stepped over (damaged in place), never reached (past a truncated
 	// end, or in a page too short to hold a record) or that is misaligned is a
 	// record the node promised durable: refuse rather than hand back the rest.
-	if let Some(&offset) = acknowledged.difference(&accepted).next() {
+	if let Some(offset) = first_unaccepted.or_else(|| pending_acknowledged.next()) {
 		return Err(DamagedAcknowledgedRecord { slab_id, offset }.into_io());
 	}
-	validate_recovered_row_tombstone_chains(&recovered_versions)?;
-	Ok(entries)
+	Ok(())
 }
 
 fn observe_recovered_row_version(

@@ -209,6 +209,7 @@ use retention_reclaim::{
 };
 mod relocation;
 pub(crate) mod tier_authority;
+mod tier_budget;
 mod tier_generation;
 mod tier_plan;
 mod version_identity;
@@ -790,6 +791,8 @@ pub struct SlabManager {
 	awaiting_cluster: AtomicBool,
 	/// Tiered slabs retired in this process; a later publication for one is stale.
 	retired_tier_slabs: DashSet<SlabId>,
+	/// The ADR 0692 §7 node budget for tier history and redirect memory.
+	tier_budget: Arc<tier_budget::TierMemoryBudget>,
 	/// Committed tier pointers this node failed to publish, with the typed
 	/// refusal when the failure was one (replayed without retrying the plan).
 	// The optional third field is evidence of an actual Some-index TierSlab
@@ -3694,6 +3697,20 @@ impl SlabManager {
 	fn record_rows_for_slab(&self, slab_id: SlabId) -> std::io::Result<Vec<PersistentRecordRow>> {
 		self.require_tier_authority_ready()?;
 		Ok(self.record_rows_for_slab_for_recovery(slab_id))
+	}
+
+	/// How many index rows name `slab_id`, counted without collecting them.
+	fn count_record_rows_for_slab(&self, slab_id: SlabId) -> usize {
+		self.key_index
+			.iter()
+			.map(|entry| {
+				entry
+					.value()
+					.iter()
+					.filter(|location| location.slab_id == slab_id)
+					.count()
+			})
+			.sum()
 	}
 
 	fn record_rows_for_slab_for_recovery(&self, slab_id: SlabId) -> Vec<PersistentRecordRow> {

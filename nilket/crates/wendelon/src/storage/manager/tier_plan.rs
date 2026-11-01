@@ -10,6 +10,7 @@
 //! Copies of one owner pair newest-first, and a surplus copy maps to a
 //! surviving one, because byte-identical copies are one version. Copies of a
 //! conflicting owner pair by payload, so each copy keeps its own bytes.
+use super::tier_budget::{TierHistoryShortfall, tier_history_refusal};
 use super::tiered_io::TieredRowRefreshPlan;
 use super::version_identity::same_row;
 use super::*;
@@ -21,19 +22,73 @@ pub(super) fn tier_row_owner(row: &PersistentRecordRow) -> TierRowOwner {
 	(row.tenant_id, row.key_identity, row.location.hlc)
 }
 
-/// Each owner's locations in one generation, in physical order.
-fn locations_by_owner(rows: &[PersistentRecordRow]) -> BTreeMap<TierRowOwner, Vec<RecordLocation>> {
-	let mut by_owner: BTreeMap<TierRowOwner, Vec<RecordLocation>> = BTreeMap::new();
-	for row in rows {
-		by_owner
-			.entry(tier_row_owner(row))
-			.or_default()
-			.push(row.location);
-	}
-	for locations in by_owner.values_mut() {
-		locations.sort_by_key(|location| (location.offset, location.record_row_index));
-	}
+/// One generation's rows as `(owner, location)`, sorted by owner and then in
+/// physical order, so each owner's locations form one run. Built into a
+/// vector sized for `rows` (the caller reserved it, ADR 0692 §7) and sorted
+/// without a temporary buffer; equal elements are identical, so the unstable
+/// sort is exact.
+fn locations_by_owner(
+	rows: &[PersistentRecordRow],
+) -> std::io::Result<Vec<(TierRowOwner, RecordLocation)>> {
+	let mut by_owner = Vec::new();
 	by_owner
+		.try_reserve_exact(rows.len())
+		.map_err(|_| Error::new(ErrorKind::OutOfMemory, "tier pairing scratch"))?;
+	by_owner.extend(rows.iter().map(|row| (tier_row_owner(row), row.location)));
+	by_owner.sort_unstable_by_key(|(owner, location)| {
+		(*owner, location.offset, location.record_row_index)
+	});
+	Ok(by_owner)
+}
+
+/// The runs of `by_owner`, one per owner, in owner order.
+fn owner_runs(
+	by_owner: &[(TierRowOwner, RecordLocation)],
+) -> impl Iterator<Item = (TierRowOwner, &[(TierRowOwner, RecordLocation)])> {
+	by_owner
+		.chunk_by(|left, right| left.0 == right.0)
+		.map(|run| (run[0].0, run))
+}
+
+/// The run of `owner` in `by_owner`, if any.
+fn owner_run(
+	by_owner: &[(TierRowOwner, RecordLocation)],
+	owner: TierRowOwner,
+) -> Option<&[(TierRowOwner, RecordLocation)]> {
+	let start = by_owner.partition_point(|(other, _)| *other < owner);
+	let len = by_owner[start..].partition_point(|(other, _)| *other == owner);
+	(len > 0).then(|| &by_owner[start..start + len])
+}
+
+/// The locations of one owner's run.
+fn run_locations(run: &[(TierRowOwner, RecordLocation)]) -> impl Iterator<Item = RecordLocation> + '_ {
+	run.iter().map(|(_, location)| *location)
+}
+
+fn same_run_locations(
+	left: &[(TierRowOwner, RecordLocation)],
+	right: &[(TierRowOwner, RecordLocation)],
+) -> bool {
+	left.len() == right.len() && run_locations(left).eq(run_locations(right))
+}
+
+/// The bytes `pair_tier_rows` and `tier_pairing_needs_old_payloads` allocate
+/// for `old` and `new` rows at most, besides per-frame payload decodes.
+pub(super) fn tier_pairing_scratch_bytes(old: usize, new: usize) -> Option<u64> {
+	use super::tier_budget::{checked_sum, vec_bytes};
+	checked_sum(&[
+		vec_bytes::<(TierRowOwner, RecordLocation)>(old),
+		vec_bytes::<(TierRowOwner, RecordLocation)>(new),
+		// One owner's run copied out per side, and the pairs.
+		vec_bytes::<RecordLocation>(old),
+		vec_bytes::<RecordLocation>(new),
+		vec_bytes::<(RecordLocation, RecordLocation)>(old),
+		// pair_conflicting_copies: payload ids and use marks per new copy,
+		// matched payloads per old copy.
+		vec_bytes::<usize>(new),
+		vec_bytes::<bool>(new),
+		vec_bytes::<usize>(old),
+	])
 }
 
 /// Whether the row at `left` in `left_plaintext` and the row at `right` in
@@ -151,14 +206,13 @@ impl SlabManager {
 		&self,
 		old_rows: &[PersistentRecordRow],
 		new_rows: &[PersistentRecordRow],
-	) -> bool {
-		let new_by_owner = locations_by_owner(new_rows);
-		locations_by_owner(old_rows).iter().any(|(owner, old)| {
-			new_by_owner.get(owner).is_some_and(|new| new != old)
-				&& old
-					.iter()
-					.any(|location| self.conflicted_locations.contains(location))
-		})
+	) -> std::io::Result<bool> {
+		let old_by_owner = locations_by_owner(old_rows)?;
+		let new_by_owner = locations_by_owner(new_rows)?;
+		Ok(owner_runs(&old_by_owner).any(|(owner, old)| {
+			owner_run(&new_by_owner, owner).is_some_and(|new| !same_run_locations(new, old))
+				&& run_locations(old).any(|location| self.conflicted_locations.contains(&location))
+		}))
 	}
 
 	/// Pair each old row that survives with the new row that serves its
@@ -171,15 +225,29 @@ impl SlabManager {
 		old_plaintext: Option<&[u8]>,
 		new_plaintext: &[u8],
 	) -> std::io::Result<Vec<(RecordLocation, RecordLocation)>> {
-		let new_by_owner = locations_by_owner(new_rows);
+		let old_by_owner = locations_by_owner(old_rows)?;
+		let new_by_owner = locations_by_owner(new_rows)?;
 		let mut pairs = Vec::new();
-		for (owner, old) in locations_by_owner(old_rows) {
-			let Some(new) = new_by_owner.get(&owner) else {
+		pairs
+			.try_reserve_exact(old_rows.len())
+			.map_err(|_| Error::new(ErrorKind::OutOfMemory, "tier pairing scratch"))?;
+		let mut push = |pair| {
+			if pairs.len() == old_rows.len() {
+				// Every old row pairs at most once; more is a broken plan.
+				return Err(tier_history_refusal(slab_id, TierHistoryShortfall::StalePlan));
+			}
+			pairs.push(pair);
+			Ok(())
+		};
+		for (owner, old_run) in owner_runs(&old_by_owner) {
+			let Some(new_run) = owner_run(&new_by_owner, owner) else {
 				continue;
 			};
-			if &old == new {
+			if same_run_locations(old_run, new_run) {
 				continue;
 			}
+			let old = run_locations(old_run).collect::<Vec<_>>();
+			let new = run_locations(new_run).collect::<Vec<_>>();
 			if old
 				.iter()
 				.any(|location| self.conflicted_locations.contains(location))
@@ -190,19 +258,18 @@ impl SlabManager {
 						StaleLocationReason::AmbiguousVersion,
 					));
 				};
-				pairs.extend(pair_conflicting_copies(
-					slab_id,
-					&old,
-					new,
-					old_plaintext,
-					new_plaintext,
-				)?);
+				for pair in pair_conflicting_copies(slab_id, &old, &new, old_plaintext, new_plaintext)? {
+					push(pair)?;
+				}
 			} else {
-				pairs.extend(pair_copies_of_one_version(&old, new));
+				for pair in pair_copies_of_one_version(&old, &new) {
+					push(pair)?;
+				}
 			}
 		}
 		pairs.retain(|(old, new)| old != new);
-		pairs.sort_by_key(|(old, _)| (old.slab_id, old.offset, old.record_row_index));
+		// Old locations are distinct, so the unstable sort is exact and needs no buffer.
+		pairs.sort_unstable_by_key(|(old, _)| (old.slab_id, old.offset, old.record_row_index));
 		Ok(pairs)
 	}
 
@@ -218,12 +285,9 @@ impl SlabManager {
 		new_plaintext: &[u8],
 		new_acknowledged: &BTreeSet<u64>,
 	) -> std::io::Result<()> {
-		let new_rows = self.tiered_rows_from_plaintext_with_evidence(
-			new_plaintext,
-			slab_id,
-			new_acknowledged,
-		)?;
-		let old_rows = self.record_rows_for_slab(slab_id)?;
+		let scratch = self.reserve_tier_plan_scratch(slab_id, new_plaintext, new_acknowledged)?;
+		let new_rows = self.tiered_rows_within(new_plaintext, slab_id, new_acknowledged, &scratch)?;
+		let old_rows = self.record_rows_for_slab_within_checked(slab_id, &scratch)?;
 		let relocated_reads = self.pair_tier_rows(
 			slab_id,
 			&old_rows,
@@ -236,6 +300,7 @@ impl SlabManager {
 			old_rows,
 			new_rows,
 			relocated_reads,
+			scratch: scratch.charge,
 		};
 		let current = {
 			let state = self.state.lock().await;
@@ -244,6 +309,9 @@ impl SlabManager {
 				.get(&slab_id)
 				.map(|layout| layout.value().clone())
 		};
-		current.unwrap_or_default().next(slab_id, &plan).map(|_| ())
+		current
+			.unwrap_or_default()
+			.next(slab_id, &plan, &self.tier_budget)
+			.map(|_| ())
 	}
 }

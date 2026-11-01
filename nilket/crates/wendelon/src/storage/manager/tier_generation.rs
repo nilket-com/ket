@@ -8,6 +8,11 @@
 //! selects its backing in one `state` snapshot, so it never pairs a location of
 //! one generation with the backing of another.
 use super::tier_plan::{TierRowOwner, tier_row_owner};
+use super::tier_budget::{
+	BoundExceeded, BudgetReservation, BudgetedMap, BudgetedSet, LINEAGE_HISTORY_CAP, TierBudgetKind,
+	TierHistoryShortfall, TierMemoryBudget, bounded_insert, bounded_set_insert, checked_sum,
+	hash_table_bytes_bound, tier_history_refusal, try_bounded_map, try_bounded_set,
+};
 use super::tiered_io::TieredRowRefreshPlan;
 use super::*;
 
@@ -79,11 +84,14 @@ pub fn stale_location(error: &Error) -> Option<StaleLocation> {
 /// The history of one tiered slab's published generations, complete for the
 /// process lifetime: every location ever served for the slab is current,
 /// redirected to the same version, or superseded.
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 pub(super) struct TierLayout {
 	pub(super) generation: u64,
-	pub(super) redirects: HashMap<RecordLocation, RecordLocation>,
-	pub(super) superseded: HashSet<RecordLocation>,
+	pub(super) redirects: BudgetedMap<RecordLocation, RecordLocation>,
+	pub(super) superseded: BudgetedSet<RecordLocation>,
+	/// The node budget charge for this generation's maps, released when the
+	/// last holder of the generation drops it. Generation 0 has none.
+	charge: Option<BudgetReservation>,
 }
 
 impl TierLayout {
@@ -105,6 +113,16 @@ impl TierLayout {
 		Ok(location)
 	}
 
+	/// Redirect plus superseded entries: the size the per-lineage cap bounds.
+	pub(super) fn entries(&self) -> usize {
+		self.redirects.len() + self.superseded.len()
+	}
+
+	/// The budget charge this generation holds.
+	pub(super) fn charged_bytes(&self) -> u64 {
+		self.charge.as_ref().map_or(0, BudgetReservation::bytes)
+	}
+
 	/// The next generation's history after `plan` moves the slab's rows.
 	///
 	/// Rows are matched by their logical owner (`tier_plan`), never by
@@ -119,30 +137,55 @@ impl TierLayout {
 	/// at a superseded location, or at a location whose version before the
 	/// publication had another owner, or when a pair or a redirect would join
 	/// two owners.
+	///
+	/// Memory (ADR 0692 §7): the build scratch and the new layout are reserved
+	/// against `budget` at checked upper bounds before anything is allocated,
+	/// every container is built into its reserved capacity and never grows,
+	/// and the layout's charge is reconciled down to its measured allocation.
+	/// A shortfall refuses typed (`TierHistoryRefusal`) without building.
 	pub(super) fn next(
 		&self,
 		slab_id: SlabId,
 		plan: &TieredRowRefreshPlan,
+		budget: &Arc<TierMemoryBudget>,
 	) -> std::io::Result<TierLayout> {
 		let collision = || stale_location_error(slab_id, StaleLocationReason::LayoutCollision);
-		let old_owner = plan
-			.old_rows
-			.iter()
-			.map(|row| (row.location, tier_row_owner(row)))
-			.collect::<HashMap<_, _>>();
-		let new_owner = plan
-			.new_rows
-			.iter()
-			.map(|row| (row.location, tier_row_owner(row)))
-			.collect::<HashMap<_, _>>();
-		let mut pairs = HashMap::with_capacity(plan.relocated_reads.len());
+		let refusal = |shortfall| tier_history_refusal(slab_id, shortfall);
+		let stale = |_: BoundExceeded| refusal(TierHistoryShortfall::StalePlan);
+		let overflow = || refusal(TierHistoryShortfall::History);
+		let old_bound = plan.old_rows.len();
+		let new_bound = plan.new_rows.len();
+		let pair_bound = plan.relocated_reads.len();
+		let scratch_bytes = checked_sum(&[
+			hash_table_bytes_bound::<(RecordLocation, TierRowOwner)>(old_bound),
+			hash_table_bytes_bound::<(RecordLocation, TierRowOwner)>(new_bound),
+			hash_table_bytes_bound::<(RecordLocation, RecordLocation)>(pair_bound),
+			hash_table_bytes_bound::<RecordLocation>(old_bound),
+		])
+		.ok_or_else(|| refusal(TierHistoryShortfall::Scratch))?;
+		let _scratch = budget
+			.try_reserve(TierBudgetKind::Scratch, scratch_bytes)
+			.ok_or_else(|| refusal(TierHistoryShortfall::Scratch))?;
+		let unallocated = |_| refusal(TierHistoryShortfall::Scratch);
+
+		let mut old_owner = try_bounded_map(old_bound).map_err(unallocated)?;
+		for row in &plan.old_rows {
+			bounded_insert(&mut old_owner, old_bound, row.location, tier_row_owner(row))
+				.map_err(stale)?;
+		}
+		let mut new_owner = try_bounded_map(new_bound).map_err(unallocated)?;
+		for row in &plan.new_rows {
+			bounded_insert(&mut new_owner, new_bound, row.location, tier_row_owner(row))
+				.map_err(stale)?;
+		}
+		let mut pairs = try_bounded_map(pair_bound).map_err(unallocated)?;
 		for (old, new) in &plan.relocated_reads {
 			if old == new {
 				continue;
 			}
 			match (old_owner.get(old), new_owner.get(new)) {
 				(Some(from), Some(to)) if from == to => {
-					pairs.insert(*old, *new);
+					bounded_insert(&mut pairs, pair_bound, *old, *new).map_err(stale)?;
 				}
 				_ => return Err(collision()),
 			}
@@ -150,25 +193,65 @@ impl TierLayout {
 		let kept = |location: &RecordLocation, owner: &TierRowOwner| {
 			new_owner.get(location) == Some(owner)
 		};
-		let pruned = old_owner
-			.iter()
-			.filter(|(location, owner)| !pairs.contains_key(*location) && !kept(*location, *owner))
-			.map(|(location, _)| *location)
-			.collect::<HashSet<_>>();
-		let mut redirects = HashMap::with_capacity(self.redirects.len() + pairs.len());
-		let mut superseded = self.superseded.clone();
-		for (from, to) in &self.redirects {
-			if let Some(next) = pairs.get(to) {
-				redirects.insert(*from, *next);
-			} else if old_owner.get(to).is_some_and(|owner| kept(to, owner)) {
-				redirects.insert(*from, *to);
-			} else {
-				// The version it served is pruned, or no longer indexed.
-				superseded.insert(*from);
+		let mut pruned = try_bounded_set(old_bound).map_err(unallocated)?;
+		for (location, owner) in &old_owner {
+			if !pairs.contains_key(location) && !kept(location, owner) {
+				bounded_set_insert(&mut pruned, old_bound, *location).map_err(stale)?;
 			}
 		}
-		redirects.extend(pairs.iter().map(|(old, new)| (*old, *new)));
-		superseded.extend(pruned);
+		// Size the new maps from the scratch, without allocating: each earlier
+		// redirect either survives or becomes superseded.
+		let surviving = self
+			.redirects
+			.values()
+			.filter(|to| {
+				pairs.contains_key(*to) || old_owner.get(*to).is_some_and(|owner| kept(to, owner))
+			})
+			.count();
+		let redirect_bound = surviving.checked_add(pairs.len()).ok_or_else(overflow)?;
+		let superseded_bound = self
+			.superseded
+			.len()
+			.checked_add(self.redirects.len() - surviving)
+			.and_then(|bound| bound.checked_add(pruned.len()))
+			.ok_or_else(overflow)?;
+		// Over the cap the clamped fill refuses, and so does the total below.
+		let redirect_bound = redirect_bound.min(LINEAGE_HISTORY_CAP);
+		let superseded_bound = superseded_bound.min(LINEAGE_HISTORY_CAP);
+		let layout_bytes = checked_sum(&[
+			hash_table_bytes_bound::<(RecordLocation, RecordLocation)>(redirect_bound),
+			hash_table_bytes_bound::<RecordLocation>(superseded_bound),
+		])
+		.ok_or_else(overflow)?;
+		let mut charge = budget
+			.try_reserve(TierBudgetKind::Layout, layout_bytes)
+			.ok_or_else(|| refusal(TierHistoryShortfall::History))?;
+		let capped = |_: BoundExceeded| refusal(TierHistoryShortfall::LineageCap);
+		let unallocated = |_| refusal(TierHistoryShortfall::History);
+		let mut redirects = try_bounded_map(redirect_bound).map_err(unallocated)?;
+		let mut superseded = try_bounded_set(superseded_bound).map_err(unallocated)?;
+		for location in &self.superseded {
+			bounded_set_insert(&mut superseded, superseded_bound, *location).map_err(capped)?;
+		}
+		for (from, to) in &self.redirects {
+			if let Some(next) = pairs.get(to) {
+				bounded_insert(&mut redirects, redirect_bound, *from, *next).map_err(capped)?;
+			} else if old_owner.get(to).is_some_and(|owner| kept(to, owner)) {
+				bounded_insert(&mut redirects, redirect_bound, *from, *to).map_err(capped)?;
+			} else {
+				// The version it served is pruned, or no longer indexed.
+				bounded_set_insert(&mut superseded, superseded_bound, *from).map_err(capped)?;
+			}
+		}
+		for (old, new) in &pairs {
+			bounded_insert(&mut redirects, redirect_bound, *old, *new).map_err(capped)?;
+		}
+		for location in &pruned {
+			bounded_set_insert(&mut superseded, superseded_bound, *location).map_err(capped)?;
+		}
+		if redirects.len() + superseded.len() > LINEAGE_HISTORY_CAP {
+			return Err(refusal(TierHistoryShortfall::LineageCap));
+		}
 		for (location, owner) in &new_owner {
 			if superseded.contains(location) {
 				return Err(collision());
@@ -188,10 +271,19 @@ impl TierLayout {
 				return Err(collision());
 			}
 		}
+		let measured = u64::try_from(redirects.allocation_size() + superseded.allocation_size())
+			.map_err(|_| overflow())?;
+		charge.shrink_to(measured).map_err(|overrun| {
+			Error::other(format!(
+				"tier layout for slab {slab_id} measured {} bytes over its {} byte reservation",
+				overrun.actual, overrun.reserved
+			))
+		})?;
 		Ok(TierLayout {
 			generation: self.generation.saturating_add(1),
 			redirects,
 			superseded,
+			charge: Some(charge),
 		})
 	}
 }

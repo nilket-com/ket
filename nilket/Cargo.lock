@@ -6164,6 +6164,7 @@ dependencies = [
  "ed25519-dalek",
  "flatbuffers",
  "h2",
+ "hashbrown 0.16.1",
  "http",
  "io-uring",
  "key-guard",

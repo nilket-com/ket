@@ -24,6 +24,8 @@ bytes = "1.6"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 curve25519-dalek = { version = "4.1.3", default-features = false, features = ["alloc", "precomputed-tables"] }
 dashmap = "6.1.0"
+# ADR 0696 (0692 §7): budgeted tier maps are measured by `allocation_size`.
+hashbrown = { version = "=0.16.1", default-features = false }
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 # ADR 057 rewrites Arrow IPC RecordBatch flatbuffer messages after
 # compacting/materializing body buffers; Arrow's public Schema APIs do not
