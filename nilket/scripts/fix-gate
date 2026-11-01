@@ -1,0 +1,264 @@
+#!/usr/bin/env bash
+# Per-fix gate: the checks a fix runs before review, in order, so that none of
+# them depends on someone remembering it.
+#
+#   1. cargo fmt --check on the real workspace (never autoformats). A failure
+#      stops the gate before any test runs.
+#   2. A targeted selection must match tests of its own: it is listed alone
+#      before the architecture tests are added to it.
+#   3. nextest through scripts/cargo-cgroup, which owns the CPU, memory, IO and
+#      thread policy; this script sets none of it. A probe run through the same
+#      wrapper records the policy the child actually received.
+#
+# Every run writes one log at an absolute path, records what was tested (HEAD,
+# the identity of the tracked diff and of each untracked file, the selection,
+# the effective cgroup policy), keeps the real exit status, and seals the log
+# with a sha256 beside it, also on failure or signal. The hash is an integrity
+# checksum, not a pass certificate. The gate is nonzero when any of that fails:
+# a log it cannot write or seal, or a source tree that changed during the run.
+# Ignored files are not part of the source identity.
+#
+# Usage:
+#   scripts/fix-gate <absolute-log> --filter '<nextest expression>' [--test-support]
+#   scripts/fix-gate <absolute-log> --full [--test-support]
+#
+# --test-support builds wendelon and toron with their test-support features,
+# which no default lane enables, and adds toron to the run.
+#
+# Exit status: the failing step's own status; 64 usage (including a log inside
+# the repository); 65 a selection that
+# matched no tests; 66 the source changed during the run; 74 the log could not
+# be written or sealed.
+#
+# CARGO_TARGET_DIR must be set to an absolute path; TMPDIR becomes
+# $CARGO_TARGET_DIR/tmp (created, or its symlink target created). The
+# FIX_GATE_CARGO and FIX_GATE_CARGO_CGROUP overrides exist for the self-test.
+set -uo pipefail
+
+usage() {
+	sed -n '2,35p' "$0" >&2
+	exit 64
+}
+
+nilket=$(cd "$(dirname "$0")/.." && pwd)
+cargo=${FIX_GATE_CARGO:-cargo}
+cargo_cgroup=${FIX_GATE_CARGO_CGROUP:-$nilket/scripts/cargo-cgroup}
+
+(($# >= 2)) || usage
+log=$1
+shift
+case $log in
+/*) ;;
+*)
+	echo "fix-gate: the log path must be absolute: $log" >&2
+	exit 64
+	;;
+esac
+mode=
+filter=
+packages=(-p wendelon)
+features=()
+while (($#)); do
+	case $1 in
+	--filter)
+		(($# >= 2)) || usage
+		mode=filter
+		filter=$2
+		shift 2
+		;;
+	--full)
+		mode=full
+		shift
+		;;
+	--test-support)
+		packages=(-p wendelon -p toron)
+		features=(--features wendelon/test-support,toron/test-support)
+		shift
+		;;
+	*) usage ;;
+	esac
+done
+[[ -n $mode ]] || usage
+target=${CARGO_TARGET_DIR:-}
+case $target in
+/*) ;;
+*)
+	echo "fix-gate: CARGO_TARGET_DIR must be set to an absolute path" >&2
+	exit 64
+	;;
+esac
+
+selection=()
+if [[ $mode == filter ]]; then
+	selection=(-E "($filter) | binary(architecture_test)")
+fi
+
+tmp=$target/tmp
+if [[ -L $tmp ]]; then
+	mkdir -p "$(readlink -f "$tmp")"
+else
+	mkdir -p "$tmp"
+fi
+
+repo=$(git -C "$nilket" rev-parse --show-toplevel) || exit 74
+case $log in
+"$repo"/*)
+	echo "fix-gate: the log must live outside the repository: $log" >&2
+	exit 64
+	;;
+esac
+cd "$nilket" || exit 74
+
+# HEAD, the tracked diff, and every untracked, unignored file by content.
+source_identity() {
+	{
+		git -C "$repo" rev-parse HEAD &&
+			git -C "$repo" diff --no-color --binary HEAD &&
+			git -C "$repo" ls-files --others --exclude-standard -z |
+			(cd "$repo" && xargs -0r sha256sum --)
+	} | sha256sum | cut -d' ' -f1
+}
+
+note() {
+	printf '%s\n' "$*" >>"$log" || log_failed=1
+}
+
+log_failed=0
+sealed=0
+finish() {
+	local rc=$1
+	trap - INT TERM HUP
+	((sealed)) && exit "$rc"
+	sealed=1
+	note "# rc=$rc $(date -Is)"
+	if ! sha256sum "$log" >"$log.sha256"; then
+		echo "fix-gate: could not seal $log" >&2
+		log_failed=1
+	fi
+	if ((log_failed)) && ((rc == 0)); then
+		echo "fix-gate: the log is incomplete; failing the gate" >&2
+		rc=74
+	fi
+	exit "$rc"
+}
+
+# Children run in the background so that a signal reaches this script while it
+# waits; the handler stops the child and seals the log.
+child=
+on_signal() {
+	local rc=$1
+	[[ -n $child ]] && kill -TERM "$child" 2>/dev/null && wait "$child"
+	note "## stopped by signal"
+	finish "$rc"
+}
+trap 'on_signal 129' HUP
+trap 'on_signal 130' INT
+trap 'on_signal 143' TERM
+
+# Callers redirect the call itself, which the background job inherits.
+run() {
+	"$@" &
+	child=$!
+	wait "$child"
+	local rc=$?
+	child=
+	return "$rc"
+}
+
+mkdir -p "$(dirname "$log")" || exit 74
+if ! : >"$log"; then
+	echo "fix-gate: cannot write $log" >&2
+	exit 74
+fi
+identity=$(source_identity) || {
+	note "## the source identity could not be computed"
+	finish 74
+}
+
+probe_dir=$(mktemp -d "$tmp/fix-gate-probe.XXXXXX") || finish 74
+trap 'rm -rf "$probe_dir"' EXIT
+cat >"$probe_dir/cargo-fixgate-probe" <<'PROBE'
+#!/usr/bin/env bash
+# Runs as the child of scripts/cargo-cgroup and reports what it received.
+cg=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup | head -1)
+echo "#   cgroup=${cg#/sys/fs/cgroup}"
+echo "#   affinity=$(taskset -pc $$ 2>/dev/null | sed 's/.*: //')"
+echo "#   nice=$(ps -o ni= -p $$ | tr -d ' ') ionice=$(ionice -p $$ 2>/dev/null)"
+echo "#   nofile=$(ulimit -n)"
+for f in memory.high memory.max cpu.max pids.max io.weight; do
+	[[ -r $cg/$f ]] && echo "#   $f=$(cat "$cg/$f")"
+done
+[[ -r $cg/../memory.max ]] && echo "#   slice memory.max=$(cat "$cg/../memory.max")"
+env | grep -E '^(RUST_MIN_STACK|RUST_TEST_THREADS|CARGO_BUILD_JOBS|NEXTEST_[A-Z_]+)=' | sort | sed 's/^/#   /'
+PROBE
+chmod +x "$probe_dir/cargo-fixgate-probe"
+
+{
+	echo "# fix-gate $(date -Is) host=$(hostname)"
+	echo "# head=$(git -C "$repo" rev-parse HEAD)"
+	echo "# tracked-diff-sha256=$(git -C "$repo" diff --no-color --binary HEAD | sha256sum | cut -d' ' -f1)"
+	echo "# untracked (sha256, path):"
+	git -C "$repo" ls-files --others --exclude-standard -z |
+		(cd "$repo" && xargs -0r sha256sum --) | sed 's/^/#   /'
+	echo "# source-identity=$identity"
+	echo "# mode=$mode packages=${packages[*]} features=${features[*]:-default}"
+	[[ $mode == filter ]] && echo "# selection=${selection[1]}"
+	echo "# target=$target tmpdir=$tmp"
+	echo "# cargo-cgroup sha256=$(sha256sum <"$cargo_cgroup" | cut -d' ' -f1)"
+	env | grep '^CARGO_CGROUP_' | sort | sed 's/^/# override /'
+	echo "# effective policy (probe through cargo-cgroup):"
+} >>"$log" || {
+	echo "fix-gate: cannot write $log" >&2
+	exit 74
+}
+PATH="$probe_dir:$PATH" run "$cargo_cgroup" fixgate-probe >>"$log" 2>&1
+rc=$?
+if ((rc != 0)); then
+	note "## the policy probe failed; tests not run"
+	finish "$rc"
+fi
+uptime >>"$log" || log_failed=1
+
+note "## cargo fmt --check"
+run "$cargo" fmt --check >>"$log" 2>&1
+rc=$?
+if ((rc != 0)); then
+	note "## cargo fmt --check exited $rc; tests not run"
+	finish "$rc"
+fi
+
+if [[ $mode == filter ]]; then
+	note "## the caller's selection alone"
+	listing=$(mktemp "$tmp/fix-gate-list.XXXXXX") || finish 74
+	CARGO_TARGET_DIR="$target" TMPDIR="$tmp" \
+		run "$cargo_cgroup" nextest list "${packages[@]}" "${features[@]}" \
+		-E "$filter" --message-format oneline >"$listing" 2>>"$log"
+	rc=$?
+	matched=$(grep -c . "$listing")
+	rm -f "$listing"
+	note "# caller-selection-matches=$matched"
+	if ((rc != 0)); then
+		note "## listing the selection exited $rc; tests not run"
+		finish "$rc"
+	fi
+	if ((matched == 0)); then
+		note "## the caller's selection matched no tests"
+		finish 65
+	fi
+fi
+
+note "## nextest"
+CARGO_TARGET_DIR="$target" TMPDIR="$tmp" \
+	run "$cargo_cgroup" nextest run "${packages[@]}" "${features[@]}" "${selection[@]}" --no-fail-fast >>"$log" 2>&1
+rc=$?
+uptime >>"$log" || log_failed=1
+if ((rc == 0)) && grep -Eq 'Summary .* 0 tests run' "$log"; then
+	note "## the selection ran no tests"
+	rc=65
+fi
+after=$(source_identity) || after=unknown
+if [[ $after != "$identity" ]]; then
+	note "## the source changed during the run: source-identity=$after"
+	((rc == 0)) && rc=66
+fi
+finish "$rc"

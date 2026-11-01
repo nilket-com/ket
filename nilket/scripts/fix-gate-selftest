@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+# Self-test for scripts/fix-gate with stub cargo commands, in a disposable git
+# repository holding a copy of the gate, so the real tree is never read or
+# changed. Each case is one rule from the gate's header.
+set -uo pipefail
+here=$(cd "$(dirname "$0")" && pwd)
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+repo=$work/repo
+mkdir -p "$repo/nilket/scripts"
+cp "$here/fix-gate" "$repo/nilket/scripts/fix-gate"
+git -C "$repo" init -q
+git -C "$repo" -c user.name=t -c user.email=t@t add -A
+git -C "$repo" -c user.name=t -c user.email=t@t -c commit.gpgsign=false commit -qm fixture
+gate=$repo/nilket/scripts/fix-gate
+export CARGO_TARGET_DIR=$work/target
+logs=$work/logs
+failures=0
+
+expect() {
+	local name=$1 want=$2 got=$3
+	if [[ $want != "$got" ]]; then
+		echo "FAIL $name: want $want, got $got"
+		failures=$((failures + 1))
+	else
+		echo "ok   $name"
+	fi
+}
+
+sealed() {
+	(cd "$logs" && sha256sum -c --quiet "$1.sha256" >/dev/null 2>&1)
+	echo $?
+}
+
+# A cargo-cgroup stub: the policy probe, `nextest list` printing STUB_LIST, and
+# `nextest run` running the given body.
+cgroup_stub() {
+	local path=$work/$1
+	cat >"$path" <<EOF
+#!/usr/bin/env bash
+case "\$1 \${2-}" in
+"fixgate-probe "*) echo "#   stub policy"; exit 0 ;;
+"nextest list") printf '%b' "\${STUB_LIST-wendelon::t a\\\\n}"; exit 0 ;;
+esac
+$2
+EOF
+	chmod +x "$path"
+	echo "$path"
+}
+
+cargo_stub() {
+	local path=$work/$1
+	printf '#!/usr/bin/env bash\n%s\n' "$2" >"$path"
+	chmod +x "$path"
+	echo "$path"
+}
+
+fmt_ok=$(cargo_stub cargo-ok 'exit 0')
+fmt_bad=$(cargo_stub cargo-bad 'echo "Diff in x.rs"; exit 1')
+ran=$(cgroup_stub cgroup-ran 'touch "$CARGO_TARGET_DIR/ran"; echo "     Summary [ 1.0s] 3 tests run: 3 passed"; exit 0')
+fails=$(cgroup_stub cgroup-fail 'echo "     Summary [ 1.0s] 3 tests run: 2 passed, 1 failed"; exit 100')
+empty=$(cgroup_stub cgroup-empty 'echo "     Summary [ 0.1s] 0 tests run: 0 passed, 9 skipped"; exit 0')
+edits=$(cgroup_stub cgroup-edits "echo changed >>'$repo/nilket/scripts/fix-gate'; echo '     Summary [ 1.0s] 3 tests run: 3 passed'; exit 0")
+slow=$(cgroup_stub cgroup-slow 'echo started; sleep 30; exit 0')
+
+gate() {
+	local cargo=$1 cgroup=$2
+	shift 2
+	FIX_GATE_CARGO=$cargo FIX_GATE_CARGO_CGROUP=$cgroup "$gate" "$@" >/dev/null 2>&1
+}
+
+gate "$fmt_bad" "$ran" "$logs/fmt.log" --filter 'test(/x/)'
+expect "fmt failure is nonzero" 1 $?
+expect "fmt failure runs no tests" absent "$([[ -e $CARGO_TARGET_DIR/ran ]] && echo present || echo absent)"
+expect "fmt failure still seals the log" 0 "$(sealed fmt.log)"
+
+gate "$fmt_ok" "$fails" "$logs/fail.log" --full
+expect "test failure keeps its status" 100 $?
+expect "test failure is recorded" 1 "$(grep -c '^# rc=100 ' "$logs/fail.log")"
+expect "test failure still seals the log" 0 "$(sealed fail.log)"
+
+gate "$fmt_ok" "$empty" "$logs/empty.log" --filter 'test(/nothing/)'
+expect "an empty run fails" 65 $?
+
+STUB_LIST= gate "$fmt_ok" "$ran" "$logs/unmatched.log" --filter 'test(/misspelled/)'
+expect "a selection matching nothing fails although architecture tests exist" 65 $?
+expect "a selection matching nothing runs no tests" 0 "$(grep -c '^## nextest' "$logs/unmatched.log")"
+
+gate "$fmt_ok" "$ran" relative.log --full
+expect "a relative log path is refused" 64 $?
+
+gate "$fmt_ok" "$ran" "$repo/inside.log" --full
+expect "a log inside the repository is refused" 64 $?
+
+mkdir -p "$logs/sealdir.log.sha256"
+gate "$fmt_ok" "$ran" "$logs/sealdir.log" --full
+expect "a seal that cannot be written fails a passing gate" 74 $?
+
+mkdir -p "$logs/isdir.log"
+gate "$fmt_ok" "$ran" "$logs/isdir.log" --full
+expect "a log that cannot be written fails" 74 $?
+
+echo draft >"$repo/untracked.rs"
+gate "$fmt_ok" "$ran" "$logs/ok.log" --filter 'test(/x/)'
+expect "a passing gate is zero" 0 $?
+expect "a targeted selection adds the architecture tests" 1 "$(grep -c 'binary(architecture_test)' "$logs/ok.log")"
+expect "an untracked file is identified by content" 1 "$(grep -c "$(sha256sum <"$repo/untracked.rs" | cut -d' ' -f1)  untracked.rs" "$logs/ok.log")"
+expect "the effective policy is recorded" 1 "$(grep -c '^#   stub policy' "$logs/ok.log")"
+rm "$repo/untracked.rs"
+
+gate "$fmt_ok" "$edits" "$logs/edited.log" --full
+expect "a source change during the run fails" 66 $?
+git -C "$repo" checkout -q -- nilket/scripts/fix-gate
+
+FIX_GATE_CARGO=$fmt_ok FIX_GATE_CARGO_CGROUP=$slow "$gate" "$logs/signal.log" --full >/dev/null 2>&1 &
+pid=$!
+for _ in $(seq 100); do
+	grep -q '^started' "$logs/signal.log" 2>/dev/null && break
+	sleep 0.1
+done
+kill -TERM "$pid"
+wait "$pid"
+expect "a signalled gate keeps a signal status" 143 $?
+expect "a signalled gate still seals the log" 0 "$(sealed signal.log)"
+
+((failures == 0)) && echo "fix-gate selftest: all passed" || echo "fix-gate selftest: $failures failed"
+((failures == 0))
