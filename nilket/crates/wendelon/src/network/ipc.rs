@@ -29,6 +29,10 @@ pub fn wire_encode_batch(batch: &RecordBatch) -> std::io::Result<Vec<u8>> {
 
 pub fn wire_decode_batch(bytes: &[u8]) -> std::io::Result<RecordBatch> {
 	let policy = classify_wire_compression_policy(bytes);
+	crate::storage::ipc::validate_ipc_stream_envelope(bytes).map_err(|error| {
+		observe_wire_decode_error_for_policy(policy);
+		error
+	})?;
 	let mut reader = StreamReader::try_new(Cursor::new(bytes), None).map_err(|err| {
 		observe_wire_decode_error_for_policy(policy);
 		Error::new(ErrorKind::InvalidData, format!("arrow stream open: {err}"))

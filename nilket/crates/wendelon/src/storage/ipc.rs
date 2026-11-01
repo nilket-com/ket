@@ -113,6 +113,51 @@ pub fn encode_record_batches_bytes(
 	Ok(buf)
 }
 
+/// Validate borrowed IPC message spans before Arrow's reader allocates buffers
+/// from a declared metadata length. EOF and an explicit end marker retain the
+/// stream reader's existing semantics; bytes after the first end marker are not
+/// interpreted as another stream.
+pub(crate) fn validate_ipc_stream_envelope(bytes: &[u8]) -> std::io::Result<()> {
+	let invalid = |message: &'static str| Error::new(ErrorKind::InvalidData, message);
+	let mut offset = 0_usize;
+	while offset < bytes.len() {
+		let Some((start, metadata_len)) = read_message_prefix(bytes, &mut offset)
+			.map_err(|error| Error::new(ErrorKind::InvalidData, error))?
+		else {
+			return Ok(());
+		};
+		let end = start
+			.checked_add(metadata_len)
+			.ok_or_else(|| invalid("arrow metadata length overflow"))?;
+		if end > bytes.len() {
+			return Err(invalid("arrow metadata extends past stream"));
+		}
+		let message = root_as_message(&bytes[start..end]).map_err(|error| {
+			Error::new(
+				ErrorKind::InvalidData,
+				format!("arrow message flatbuffer parse: {error}"),
+			)
+		})?;
+		let body_len = usize::try_from(message.bodyLength())
+			.map_err(|_| invalid("negative arrow message body length"))?;
+		let body_end = end
+			.checked_add(body_len)
+			.ok_or_else(|| invalid("arrow body length overflow"))?;
+		// Bound before alignment arithmetic: an untrusted body length must not
+		// overflow the padding helper or cause a reader allocation.
+		if body_end > bytes.len() {
+			return Err(invalid("arrow message body extends past stream"));
+		}
+		offset = body_end
+			.checked_add(pad_to_alignment(8, body_len))
+			.ok_or_else(|| invalid("arrow body padding overflow"))?;
+		if offset > bytes.len() {
+			return Err(invalid("arrow message padding extends past stream"));
+		}
+	}
+	Ok(())
+}
+
 pub fn record_batch_compression_policy_from_ipc(
 	bytes: &[u8],
 ) -> std::io::Result<RecordBodyCompressionPolicy> {

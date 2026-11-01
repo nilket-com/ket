@@ -2039,12 +2039,15 @@ fn decode_recovery_batch(frame: &[u8]) -> std::io::Result<arrow::record_batch::R
 	let materialized;
 	let frame =
 		if crate::storage::encoding::materialize::ipc_stream_contains_encoding_directory(frame) {
+			// Bound the encoded input's own envelope before materialization reads it.
+			crate::storage::ipc::validate_ipc_stream_envelope(frame)?;
 			materialized =
 				crate::storage::encoding::materialize::materialize_encoding_ipc_stream(frame)?;
 			materialized.as_slice()
 		} else {
 			frame
 		};
+	crate::storage::ipc::validate_ipc_stream_envelope(frame)?;
 	let mut reader = StreamReader::try_new(Cursor::new(frame), None)
 		.map_err(|err| Error::new(ErrorKind::InvalidData, format!("arrow stream open: {err}")))?;
 	let mut batches = Vec::new();

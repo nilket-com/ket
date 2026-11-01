@@ -14298,6 +14298,10 @@ fn encode_migration_records(
 /// stream over [`migration_record_schema`]; any column mismatch or
 /// missing value surfaces as `InvalidData`.
 fn decode_migration_records(bytes: &[u8]) -> std::io::Result<Vec<MigrationRecord>> {
+	crate::storage::ipc::validate_ipc_stream_envelope(bytes).map_err(|error| {
+		crate::network::ipc::observe_wire_decode_error_for_bytes(bytes);
+		error
+	})?;
 	let mut reader = StreamReader::try_new(Cursor::new(bytes), None).map_err(|e| {
 		crate::network::ipc::observe_wire_decode_error_for_bytes(bytes);
 		Error::new(ErrorKind::InvalidData, format!("migrate stream open: {e}"))

@@ -2379,6 +2379,7 @@ pub(super) fn encoding_directories_from_slab_blob(
 		if !ipc_stream_contains_encoding_directory(&frame) {
 			continue;
 		}
+		crate::storage::ipc::validate_ipc_stream_envelope(&frame)?;
 		let reader = StreamReader::try_new(Cursor::new(frame), None).map_err(|err| {
 			Error::new(
 				ErrorKind::InvalidData,

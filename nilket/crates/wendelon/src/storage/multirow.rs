@@ -1294,6 +1294,8 @@ pub fn decode_batch(bytes: &[u8]) -> std::io::Result<RecordBatch> {
 	let materialized;
 	let bytes =
 		if crate::storage::encoding::materialize::ipc_stream_contains_encoding_directory(bytes) {
+			// Bound the encoded input's own envelope before materialization reads it.
+			crate::storage::ipc::validate_ipc_stream_envelope(bytes)?;
 			materialized =
 				crate::storage::encoding::materialize::materialize_encoding_ipc_stream(bytes)?;
 			materialized.as_slice()
@@ -1301,6 +1303,12 @@ pub fn decode_batch(bytes: &[u8]) -> std::io::Result<RecordBatch> {
 			bytes
 		};
 	let policy = record_batch_compression_policy_from_ipc(bytes).ok();
+	crate::storage::ipc::validate_ipc_stream_envelope(bytes).map_err(|error| {
+		if let Some(policy) = policy {
+			crate::metrics::global().observe_storage_compression_decode_error(policy);
+		}
+		error
+	})?;
 	let started = Instant::now();
 	let mut reader = StreamReader::try_new(Cursor::new(bytes), None)
 		.map_err(|err| Error::new(ErrorKind::InvalidData, format!("arrow stream open: {err}")))?;

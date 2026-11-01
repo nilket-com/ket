@@ -2169,6 +2169,7 @@ pub fn encode_arrow_schema_ipc(schema: &Schema) -> std::io::Result<Vec<u8>> {
 }
 
 pub fn decode_arrow_schema_ipc(bytes: &[u8]) -> std::io::Result<Schema> {
+	crate::storage::ipc::validate_ipc_stream_envelope(bytes)?;
 	let reader = StreamReader::try_new(Cursor::new(bytes), None).map_err(|err| {
 		Error::new(
 			ErrorKind::InvalidData,
