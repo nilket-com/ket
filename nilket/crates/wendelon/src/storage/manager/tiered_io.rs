@@ -1586,7 +1586,8 @@ impl SlabManager {
 	}
 
 	/// The rows in `plaintext`, walked with `acknowledged`, the record offsets
-	/// in exactly these bytes.
+	/// in exactly these bytes. Unbounded: production plans use `tiered_rows_within`.
+	#[cfg(test)]
 	pub(super) fn tiered_rows_from_plaintext_with_evidence(
 		&self,
 		plaintext: &[u8],
@@ -1678,11 +1679,8 @@ impl SlabManager {
 			PlanScratch, TierBudgetKind, TierHistoryShortfall, checked_sum, tier_history_refusal,
 			vec_bytes,
 		};
-		let new_bound = crate::storage::core::count_slab_entries_in_blob(
-			plaintext,
-			slab_id,
-			acknowledged,
-		)?;
+		let new_bound =
+			crate::storage::core::count_slab_entries_in_blob(plaintext, slab_id, acknowledged)?;
 		let old_bound = self.count_record_rows_for_slab(slab_id);
 		let short = || tier_history_refusal(slab_id, TierHistoryShortfall::Scratch);
 		// Rows: the plan's vectors, the index transaction's copies of them, and

@@ -1943,7 +1943,9 @@ impl SlabManager {
 					};
 					self.prepare_tier_candidate_proposal(slab_id, &new_uri)
 						.await?;
-					if let Err(error) = crate::storage::sweeper::propose_tier_slab(self, committer, tier).await {
+					if let Err(error) =
+						crate::storage::sweeper::propose_tier_slab(self, committer, tier).await
+					{
 						if crate::storage::sweeper::tier_proposal_not_submitted(&error) {
 							self.record_tier_candidate_not_submitted(
 								slab_id,
@@ -2503,7 +2505,9 @@ impl SlabManager {
 					// unresolved intent keeps both objects, even across restart.
 					self.prepare_tier_candidate_proposal(slab_id, &new_uri)
 						.await?;
-					if let Err(error) = crate::storage::sweeper::propose_tier_slab(self, committer, tier).await {
+					if let Err(error) =
+						crate::storage::sweeper::propose_tier_slab(self, committer, tier).await
+					{
 						if crate::storage::sweeper::tier_proposal_not_submitted(&error) {
 							self.record_tier_candidate_not_submitted(
 								slab_id,

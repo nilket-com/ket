@@ -2671,7 +2671,10 @@ struct DirectLsmCommitter {
 
 #[async_trait]
 impl TierCommitter for DirectLsmCommitter {
-	async fn commit_tier_slab(&self, _proposal: crate::storage::TierProposal) -> std::io::Result<()> {
+	async fn commit_tier_slab(
+		&self,
+		_proposal: crate::storage::TierProposal,
+	) -> std::io::Result<()> {
 		Err(Error::new(
 			ErrorKind::Unsupported,
 			"tier commits are not used by this test committer",
@@ -2699,7 +2702,10 @@ struct DirectTierCommitter {
 
 #[async_trait]
 impl TierCommitter for DirectTierCommitter {
-	async fn commit_tier_slab(&self, proposal: crate::storage::TierProposal) -> std::io::Result<()> {
+	async fn commit_tier_slab(
+		&self,
+		proposal: crate::storage::TierProposal,
+	) -> std::io::Result<()> {
 		let tier = proposal.tier().clone();
 		self.manager
 			.apply_tier_slab(TieredSlabPointer {
@@ -2727,7 +2733,10 @@ struct FailingLsmCommitter;
 
 #[async_trait]
 impl TierCommitter for FailingLsmCommitter {
-	async fn commit_tier_slab(&self, _proposal: crate::storage::TierProposal) -> std::io::Result<()> {
+	async fn commit_tier_slab(
+		&self,
+		_proposal: crate::storage::TierProposal,
+	) -> std::io::Result<()> {
 		Err(Error::new(
 			ErrorKind::Unsupported,
 			"tier commits are not used by this test committer",
@@ -5629,7 +5638,10 @@ struct PausingLsmCommitter {
 
 #[async_trait]
 impl TierCommitter for PausingLsmCommitter {
-	async fn commit_tier_slab(&self, _proposal: crate::storage::TierProposal) -> std::io::Result<()> {
+	async fn commit_tier_slab(
+		&self,
+		_proposal: crate::storage::TierProposal,
+	) -> std::io::Result<()> {
 		Err(Error::new(ErrorKind::Unsupported, "unused"))
 	}
 
@@ -21208,7 +21220,10 @@ struct UnpublishedDropCommitter {
 
 #[async_trait]
 impl TierCommitter for UnpublishedDropCommitter {
-	async fn commit_tier_slab(&self, proposal: crate::storage::TierProposal) -> std::io::Result<()> {
+	async fn commit_tier_slab(
+		&self,
+		proposal: crate::storage::TierProposal,
+	) -> std::io::Result<()> {
 		let tier = proposal.tier().clone();
 		let pointer = TieredSlabPointer {
 			slab_id: tier.slab_id,
@@ -21435,19 +21450,21 @@ async fn table_drop_cleanup_refuses_to_delete_either_object_with_an_unpublished_
 		.await
 		.unwrap();
 	committer
-		.commit_tier_slab(crate::storage::TierProposal::unreserved_for_test(TieredSlab {
-			slab_id: old.slab_id,
-			l2_uri: new_uri,
-			payload_hash: old.payload_hash,
-			is_encrypted: old.is_encrypted,
-			tenant_id: old.tenant_id,
-			tenant_kek_id: old.tenant_kek_id,
-			stats_format_version: old.stats_format_version,
-			stats_block_len: old.stats_block_len,
-			stats_block_hash128: old.stats_block_hash128,
-			tombstone_metadata: old.tombstone_metadata,
-			supersession_metadata: old.supersession_metadata,
-		}))
+		.commit_tier_slab(crate::storage::TierProposal::unreserved_for_test(
+			TieredSlab {
+				slab_id: old.slab_id,
+				l2_uri: new_uri,
+				payload_hash: old.payload_hash,
+				is_encrypted: old.is_encrypted,
+				tenant_id: old.tenant_id,
+				tenant_kek_id: old.tenant_kek_id,
+				stats_format_version: old.stats_format_version,
+				stats_block_len: old.stats_block_len,
+				stats_block_hash128: old.stats_block_hash128,
+				tombstone_metadata: old.tombstone_metadata,
+				supersession_metadata: old.supersession_metadata,
+			},
+		))
 		.await
 		.unwrap();
 	let committed = committer.committed.lock().await.clone().unwrap();
@@ -21495,7 +21512,10 @@ struct AmbiguousDropCommitter {
 
 #[async_trait]
 impl TierCommitter for AmbiguousDropCommitter {
-	async fn commit_tier_slab(&self, proposal: crate::storage::TierProposal) -> std::io::Result<()> {
+	async fn commit_tier_slab(
+		&self,
+		proposal: crate::storage::TierProposal,
+	) -> std::io::Result<()> {
 		let tier = proposal.tier().clone();
 		let pointer = TieredSlabPointer {
 			slab_id: tier.slab_id,
@@ -25314,7 +25334,10 @@ async fn lsm_crash_after_output_rename_before_proposal_keeps_intent_and_output()
 struct DefiniteRejectLsmCommitter;
 #[async_trait]
 impl TierCommitter for DefiniteRejectLsmCommitter {
-	async fn commit_tier_slab(&self, _proposal: crate::storage::TierProposal) -> std::io::Result<()> {
+	async fn commit_tier_slab(
+		&self,
+		_proposal: crate::storage::TierProposal,
+	) -> std::io::Result<()> {
 		Err(Error::new(ErrorKind::Unsupported, "unused"))
 	}
 	async fn retire_tiered_slab(&self, _: SlabId) -> std::io::Result<()> {
@@ -25330,7 +25353,10 @@ impl TierCommitter for DefiniteRejectLsmCommitter {
 struct AmbiguousLsmCommitter;
 #[async_trait]
 impl TierCommitter for AmbiguousLsmCommitter {
-	async fn commit_tier_slab(&self, _proposal: crate::storage::TierProposal) -> std::io::Result<()> {
+	async fn commit_tier_slab(
+		&self,
+		_proposal: crate::storage::TierProposal,
+	) -> std::io::Result<()> {
 		Err(Error::new(ErrorKind::Unsupported, "unused"))
 	}
 	async fn retire_tiered_slab(&self, _: SlabId) -> std::io::Result<()> {
@@ -30359,7 +30385,10 @@ struct GcPauseAfterRemoveCommit {
 
 #[async_trait]
 impl TierCommitter for GcPauseAfterRemoveCommit {
-	async fn commit_tier_slab(&self, _proposal: crate::storage::TierProposal) -> std::io::Result<()> {
+	async fn commit_tier_slab(
+		&self,
+		_proposal: crate::storage::TierProposal,
+	) -> std::io::Result<()> {
 		Err(Error::new(ErrorKind::Unsupported, "unused"))
 	}
 	async fn retire_tiered_slab(&self, _: SlabId) -> std::io::Result<()> {
@@ -35637,7 +35666,11 @@ async fn sweeper_recovery_of_a_fenced_republication_supersedes_an_older_snapshot
 		mgr.unapplied_tier_pointers
 			.get(&slab_id)
 			.map(|entry| entry.value().clone()),
-		Some((pointer.clone(), Some(StaleLocationReason::Fenced), Some(820))),
+		Some((
+			pointer.clone(),
+			Some(StaleLocationReason::Fenced),
+			Some(820)
+		)),
 		"premise: the deferral carries the apply's control index"
 	);
 
@@ -35776,7 +35809,10 @@ async fn real_sm_fenced_replacement_after_a_deferred_snapshot_retirement_is_serv
 		..old.clone()
 	};
 	assert_eq!(
-		manager.read(manager.lookup(tenant(), key).unwrap().unwrap()).await.unwrap(),
+		manager
+			.read(manager.lookup(tenant(), key).unwrap().unwrap())
+			.await
+			.unwrap(),
 		b"tiered-row",
 		"premise: the tiered row is served at P0"
 	);
@@ -35829,9 +35865,9 @@ async fn real_sm_fenced_replacement_after_a_deferred_snapshot_retirement_is_serv
 		&mut target,
 		[Entry {
 			log_id: LogId::new(CommittedLeaderId::new(3, 1), 823),
-			payload: EntryPayload::Normal(crate::consensus::WendelonRequest::TierSlab(
-				b10_tier(&replacement),
-			)),
+			payload: EntryPayload::Normal(crate::consensus::WendelonRequest::TierSlab(b10_tier(
+				&replacement,
+			))),
 		}],
 	)
 	.await
@@ -35913,7 +35949,10 @@ async fn real_sm_fenced_replacement_after_a_deferred_snapshot_retirement_is_serv
 			(lookup.is_ok_and(|found| found.is_none()), read)
 		}
 	};
-	eprintln!("canonical pointer after 823: {:?}; worker ready: {ready}", committed.as_ref().map(|p| &p.l2_uri));
+	eprintln!(
+		"canonical pointer after 823: {:?}; worker ready: {ready}",
+		committed.as_ref().map(|p| &p.l2_uri)
+	);
 	let (missing_after_worker, _) = observe("after worker").await;
 
 	let observed_epoch = manager.capture_snapshot_epoch();
@@ -35923,12 +35962,20 @@ async fn real_sm_fenced_replacement_after_a_deferred_snapshot_retirement_is_serv
 	eprintln!("sweeper retry: {retry:?}");
 	let (missing_after_retry, read_after_retry) = observe("after sweeper retry").await;
 
-	assert_eq!(committed, Some(replacement.clone()), "premise: canonical state names 823's replacement");
+	assert_eq!(
+		committed,
+		Some(replacement.clone()),
+		"premise: canonical state names 823's replacement"
+	);
 	assert!(
 		!missing_after_worker && !missing_after_retry,
 		"a committed row is never answered as absent"
 	);
-	assert_eq!(manager.tier_pointer(slab_id).await, Some(replacement), "the newer committed pointer is published");
+	assert_eq!(
+		manager.tier_pointer(slab_id).await,
+		Some(replacement),
+		"the newer committed pointer is published"
+	);
 	assert!(
 		matches!(read_after_retry, Some(Ok(Ok(ref value))) if value == "tiered-row"),
 		"the row is served after recovery: {read_after_retry:?}"
@@ -36931,8 +36978,11 @@ impl TierCommitter for B1tRoleCommitter {
 	fn should_propose(&self) -> bool {
 		self.leader.load(std::sync::atomic::Ordering::Acquire)
 	}
-	async fn commit_tier_slab(&self, proposal: crate::storage::TierProposal) -> std::io::Result<()> {
-				self.calls.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+	async fn commit_tier_slab(
+		&self,
+		proposal: crate::storage::TierProposal,
+	) -> std::io::Result<()> {
+		self.calls.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
 		if !self.should_propose() {
 			return Err(Error::new(
 				ErrorKind::WouldBlock,

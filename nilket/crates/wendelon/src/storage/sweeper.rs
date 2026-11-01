@@ -79,9 +79,8 @@ use crate::schema::{SupersessionMetadata, TombstoneMetadata};
 use crate::storage::MvccRetentionPolicy;
 use crate::storage::l2::ObjectStore;
 use crate::storage::manager::{
-	TierProposal,
 	PreparedTieredRetentionRewrite, RetentionCompactionStats, SealedSlabInfo, SlabManager,
-	StaleLocationReason, TieredSlabPointer, stale_location_error,
+	StaleLocationReason, TierProposal, TieredSlabPointer, stale_location_error,
 };
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -262,12 +261,13 @@ pub(crate) async fn propose_tier_slab(
 	match slab.reserve_tier_history(tier).await {
 		Ok(proposal) => committer.commit_tier_slab(proposal).await,
 		Err(refusal) => {
-			crate::metrics::global()
-				.observe_tier_rewrite_refusal(crate::metrics::TierRewriteRefusalReason::NodeHistoryBudget);
+			crate::metrics::global().observe_tier_rewrite_refusal(
+				crate::metrics::TierRewriteRefusalReason::NodeHistoryBudget,
+			);
 			Err(std::io::Error::new(
-			refusal.kind(),
-			TierCommitNotSubmitted(format!("tier history not reserved: {refusal}")),
-		))
+				refusal.kind(),
+				TierCommitNotSubmitted(format!("tier history not reserved: {refusal}")),
+			))
 		}
 	}
 }
@@ -2322,7 +2322,10 @@ mod tests {
 
 	#[async_trait]
 	impl TierCommitter for DirectApplyCommitter {
-		async fn commit_tier_slab(&self, proposal: crate::storage::TierProposal) -> std::io::Result<()> {
+		async fn commit_tier_slab(
+			&self,
+			proposal: crate::storage::TierProposal,
+		) -> std::io::Result<()> {
 			let tier = proposal.tier().clone();
 			if let Some(kind) = *self.persistent_err.lock().await {
 				return Err(std::io::Error::new(kind, "simulated commit failure"));
@@ -3257,7 +3260,10 @@ mod tests {
 
 	#[async_trait]
 	impl TierCommitter for A4PausedLogCommitter {
-		async fn commit_tier_slab(&self, proposal: crate::storage::TierProposal) -> std::io::Result<()> {
+		async fn commit_tier_slab(
+			&self,
+			proposal: crate::storage::TierProposal,
+		) -> std::io::Result<()> {
 			let tier = proposal.tier().clone();
 			self.entered.add_permits(1);
 			self.release.acquire().await.unwrap().forget();
@@ -6188,7 +6194,10 @@ mod tests {
 	struct B1UnhintedRaftCommitter(RaftCommitter);
 	#[async_trait]
 	impl TierCommitter for B1UnhintedRaftCommitter {
-		async fn commit_tier_slab(&self, proposal: crate::storage::TierProposal) -> std::io::Result<()> {
+		async fn commit_tier_slab(
+			&self,
+			proposal: crate::storage::TierProposal,
+		) -> std::io::Result<()> {
 			self.0.commit_tier_slab(proposal).await
 		}
 		async fn retire_tiered_slab(&self, slab: SlabId) -> std::io::Result<()> {

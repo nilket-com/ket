@@ -6926,12 +6926,18 @@ mod tests {
 		registry.relocation_redirect_bytes.add(512);
 		let rendered = registry.render_prometheus();
 		let has = |line: &str| rendered.lines().any(|row| row == line);
-		assert!(has("wendelon_tier_rewrite_refusals_total{reason=\"layout_collision\"} 2"));
+		assert!(has(
+			"wendelon_tier_rewrite_refusals_total{reason=\"layout_collision\"} 2"
+		));
 		for label in &Refusal::LABELS[1..] {
-			assert!(has(&format!("wendelon_tier_rewrite_refusals_total{{reason=\"{label}\"}} 1")));
+			assert!(has(&format!(
+				"wendelon_tier_rewrite_refusals_total{{reason=\"{label}\"}} 1"
+			)));
 		}
 		for label in Fence::LABELS {
-			assert!(has(&format!("wendelon_tier_publication_fenced_total{{reason=\"{label}\"}} 1")));
+			assert!(has(&format!(
+				"wendelon_tier_publication_fenced_total{{reason=\"{label}\"}} 1"
+			)));
 		}
 		assert!(has("wendelon_relocation_redirects_skipped_total 3"));
 		assert!(has("wendelon_tier_history_bytes 4096"));

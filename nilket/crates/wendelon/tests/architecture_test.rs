@@ -11697,7 +11697,12 @@ fn every_tier_proposer_holds_a_history_token() {
 		);
 	}
 	assert!(sweeper.matches("propose_tier_slab(&self.slab,").count() >= 6);
-	assert_eq!(reclaim.matches("propose_tier_slab(self, committer, tier)").count(), 2);
+	assert_eq!(
+		reclaim
+			.matches("propose_tier_slab(self, committer, tier)")
+			.count(),
+		2
+	);
 	let manager = manager_source(manifest_dir);
 	assert_eq!(
 		manager.matches("fn reserve_tier_history(").count(),

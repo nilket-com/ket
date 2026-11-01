@@ -61,7 +61,9 @@ fn owner_run(
 }
 
 /// The locations of one owner's run.
-fn run_locations(run: &[(TierRowOwner, RecordLocation)]) -> impl Iterator<Item = RecordLocation> + '_ {
+fn run_locations(
+	run: &[(TierRowOwner, RecordLocation)],
+) -> impl Iterator<Item = RecordLocation> + '_ {
 	run.iter().map(|(_, location)| *location)
 }
 
@@ -234,7 +236,10 @@ impl SlabManager {
 		let mut push = |pair| {
 			if pairs.len() == old_rows.len() {
 				// Every old row pairs at most once; more is a broken plan.
-				return Err(tier_history_refusal(slab_id, TierHistoryShortfall::StalePlan));
+				return Err(tier_history_refusal(
+					slab_id,
+					TierHistoryShortfall::StalePlan,
+				));
 			}
 			pairs.push(pair);
 			Ok(())
@@ -258,7 +263,9 @@ impl SlabManager {
 						StaleLocationReason::AmbiguousVersion,
 					));
 				};
-				for pair in pair_conflicting_copies(slab_id, &old, &new, old_plaintext, new_plaintext)? {
+				for pair in
+					pair_conflicting_copies(slab_id, &old, &new, old_plaintext, new_plaintext)?
+				{
 					push(pair)?;
 				}
 			} else {
@@ -286,7 +293,8 @@ impl SlabManager {
 		new_acknowledged: &BTreeSet<u64>,
 	) -> std::io::Result<()> {
 		let scratch = self.reserve_tier_plan_scratch(slab_id, new_plaintext, new_acknowledged)?;
-		let new_rows = self.tiered_rows_within(new_plaintext, slab_id, new_acknowledged, &scratch)?;
+		let new_rows =
+			self.tiered_rows_within(new_plaintext, slab_id, new_acknowledged, &scratch)?;
 		let old_rows = self.record_rows_for_slab_within_checked(slab_id, &scratch)?;
 		let relocated_reads = self.pair_tier_rows(
 			slab_id,

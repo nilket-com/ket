@@ -7,12 +7,12 @@
 //! in the current generation, or superseded. A read resolves its location and
 //! selects its backing in one `state` snapshot, so it never pairs a location of
 //! one generation with the backing of another.
-use super::tier_plan::{TierRowOwner, tier_row_owner};
 use super::tier_budget::{
-	BoundExceeded, BudgetReservation, BudgetedMap, BudgetedSet, LINEAGE_HISTORY_CAP, TierBudgetKind,
-	TierHistoryShortfall, TierMemoryBudget, bounded_insert, bounded_set_insert, checked_sum,
-	hash_table_bytes_bound, tier_history_refusal, try_bounded_map, try_bounded_set,
+	BoundExceeded, BudgetReservation, BudgetedMap, BudgetedSet, LINEAGE_HISTORY_CAP,
+	TierBudgetKind, TierHistoryShortfall, TierMemoryBudget, bounded_insert, bounded_set_insert,
+	checked_sum, hash_table_bytes_bound, tier_history_refusal, try_bounded_map, try_bounded_set,
 };
+use super::tier_plan::{TierRowOwner, tier_row_owner};
 use super::tiered_io::TieredRowRefreshPlan;
 use super::*;
 
@@ -91,7 +91,7 @@ pub(super) struct TierLayout {
 	pub(super) superseded: BudgetedSet<RecordLocation>,
 	/// The node budget charge for this generation's maps, released when the
 	/// last holder of the generation drops it. Generation 0 has none.
-	charge: Option<BudgetReservation>,
+	_charge: Option<BudgetReservation>,
 }
 
 impl TierLayout {
@@ -114,13 +114,15 @@ impl TierLayout {
 	}
 
 	/// Redirect plus superseded entries: the size the per-lineage cap bounds.
+	#[cfg(test)]
 	pub(super) fn entries(&self) -> usize {
 		self.redirects.len() + self.superseded.len()
 	}
 
 	/// The budget charge this generation holds.
+	#[cfg(test)]
 	pub(super) fn charged_bytes(&self) -> u64 {
-		self.charge.as_ref().map_or(0, BudgetReservation::bytes)
+		self._charge.as_ref().map_or(0, BudgetReservation::bytes)
 	}
 
 	/// The next generation's history after `plan` moves the slab's rows.
@@ -240,22 +242,32 @@ impl TierLayout {
 		let lent_bytes = funding.as_ref().map(BudgetReservation::bytes);
 		let mut charge = match funding.take() {
 			Some(lent) if lent.bytes() >= layout_bytes => lent.into_kind(TierBudgetKind::Layout),
-			Some(lent) => match budget.try_reserve(TierBudgetKind::Layout, layout_bytes - lent.bytes()) {
-				Some(delta) => {
-					let mut charge = lent.into_kind(TierBudgetKind::Layout);
-					charge.absorb(delta);
-					charge
+			Some(lent) => {
+				match budget.try_reserve(TierBudgetKind::Layout, layout_bytes - lent.bytes()) {
+					Some(delta) => {
+						let mut charge = lent.into_kind(TierBudgetKind::Layout);
+						charge.absorb(delta);
+						charge
+					}
+					None => {
+						*funding = Some(lent);
+						return Err(refusal(TierHistoryShortfall::History));
+					}
 				}
-				None => {
-					*funding = Some(lent);
-					return Err(refusal(TierHistoryShortfall::History));
-				}
-			},
+			}
 			None => budget
 				.try_reserve(TierBudgetKind::Layout, layout_bytes)
 				.ok_or_else(|| refusal(TierHistoryShortfall::History))?,
 		};
-		let built = self.fill_next(slab_id, &pairs, &pruned, &old_owner, &new_owner, redirect_bound, superseded_bound);
+		let built = self.fill_next(
+			slab_id,
+			&pairs,
+			&pruned,
+			&old_owner,
+			&new_owner,
+			redirect_bound,
+			superseded_bound,
+		);
 		let (redirects, superseded) = match built {
 			Ok(maps) => maps,
 			Err(error) => {
@@ -279,7 +291,7 @@ impl TierLayout {
 			generation: self.generation.saturating_add(1),
 			redirects,
 			superseded,
-			charge: Some(charge),
+			_charge: Some(charge),
 		})
 	}
 

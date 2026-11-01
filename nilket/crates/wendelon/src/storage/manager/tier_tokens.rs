@@ -16,8 +16,8 @@
 use std::sync::{Arc, Mutex, Weak};
 
 use super::tier_budget::{
-	BudgetReservation, LINEAGE_HISTORY_CAP, TierBudgetKind, TierHistoryShortfall,
-	TierMemoryBudget, checked_sum, hash_table_bytes_bound, tier_history_refusal, vec_bytes,
+	BudgetReservation, LINEAGE_HISTORY_CAP, TierBudgetKind, TierHistoryShortfall, TierMemoryBudget,
+	checked_sum, hash_table_bytes_bound, tier_history_refusal, vec_bytes,
 };
 use super::*;
 use crate::consensus::TieredSlab;
@@ -89,16 +89,22 @@ impl TierTokenRegistry {
 	}
 
 	fn lock(&self) -> std::sync::MutexGuard<'_, Vec<Option<Slot>>> {
-		self.slots.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+		self.slots
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner())
 	}
 
 	/// Occupied slots and the bytes they hold.
+	#[cfg(test)]
 	pub(super) fn held(&self) -> (usize, u64) {
 		self.lock()
 			.iter()
 			.flatten()
 			.fold((0, 0), |(count, bytes), slot| {
-				(count + 1, bytes + slot.charge.as_ref().map_or(0, BudgetReservation::bytes))
+				(
+					count + 1,
+					bytes + slot.charge.as_ref().map_or(0, BudgetReservation::bytes),
+				)
 			})
 	}
 
@@ -160,7 +166,10 @@ impl TierTokenRegistry {
 	/// The loan's charge now pays for a published layout: the slot is done.
 	pub(super) fn consume(&self, index: usize, attempt: u64) {
 		let mut slots = self.lock();
-		if slots[index].as_ref().is_some_and(|slot| slot.attempt == attempt) {
+		if slots[index]
+			.as_ref()
+			.is_some_and(|slot| slot.attempt == attempt)
+		{
 			slots[index] = None;
 		}
 	}
@@ -183,7 +192,10 @@ impl TierTokenRegistry {
 		let mut slots = self.lock();
 		let slot = &mut slots[token.index];
 		// A slot reused by a newer attempt is not this token's.
-		if slot.as_ref().is_some_and(|slot| slot.attempt == token.attempt) {
+		if slot
+			.as_ref()
+			.is_some_and(|slot| slot.attempt == token.attempt)
+		{
 			change(slot);
 		}
 	}
@@ -565,12 +577,20 @@ mod tests {
 		let loan = registry
 			.lend_matching(&pointer("a"), &TierBase::Untiered)
 			.unwrap();
-		assert_eq!(loan.charge.bytes(), 100, "the lowest attempt funds the install");
+		assert_eq!(
+			loan.charge.bytes(),
+			100,
+			"the lowest attempt funds the install"
+		);
 		registry.consume(loan.index, loan.attempt);
 		let layout = loan.charge.into_kind(TierBudgetKind::Layout);
 		first.applied();
 		assert_eq!(registry.held(), (1, 60), "the identical attempt stays");
-		assert_eq!(budget.used_by(TierBudgetKind::Layout), 100, "no refund of the consumed charge");
+		assert_eq!(
+			budget.used_by(TierBudgetKind::Layout),
+			100,
+			"no refund of the consumed charge"
+		);
 		drop(layout);
 		second.applied();
 		assert_eq!(budget.used_by(TierBudgetKind::Token), 0);
@@ -636,7 +656,11 @@ mod tests {
 		drop(loan.charge);
 		let newer = proposal(&registry, "b", 70).begin_submission();
 		old.applied();
-		assert_eq!(registry.held(), (1, 70), "the reused slot keeps the newer attempt");
+		assert_eq!(
+			registry.held(),
+			(1, 70),
+			"the reused slot keeps the newer attempt"
+		);
 		newer.not_submitted();
 		assert_eq!(tokens(&budget), 0);
 	}
@@ -664,17 +688,18 @@ mod tests {
 /// Count a refused tier rewrite under its §7 reason, if it is one.
 pub(super) fn observe_tier_rewrite_refusal(error: &Error) {
 	use crate::metrics::TierRewriteRefusalReason as Reason;
-	let reason = match super::tier_budget::tier_history_refusal_of(error).map(|refusal| refusal.shortfall) {
-		Some(TierHistoryShortfall::History | TierHistoryShortfall::Scratch) => {
-			Some(Reason::NodeHistoryBudget)
-		}
-		Some(TierHistoryShortfall::LineageCap) => Some(Reason::LineageHistoryCap),
-		Some(TierHistoryShortfall::StalePlan) => Some(Reason::StalePlan),
-		None => match stale_location(error).map(|stale| stale.reason) {
-			Some(StaleLocationReason::LayoutCollision) => Some(Reason::LayoutCollision),
-			_ => None,
-		},
-	};
+	let reason =
+		match super::tier_budget::tier_history_refusal_of(error).map(|refusal| refusal.shortfall) {
+			Some(TierHistoryShortfall::History | TierHistoryShortfall::Scratch) => {
+				Some(Reason::NodeHistoryBudget)
+			}
+			Some(TierHistoryShortfall::LineageCap) => Some(Reason::LineageHistoryCap),
+			Some(TierHistoryShortfall::StalePlan) => Some(Reason::StalePlan),
+			None => match stale_location(error).map(|stale| stale.reason) {
+				Some(StaleLocationReason::LayoutCollision) => Some(Reason::LayoutCollision),
+				_ => None,
+			},
+		};
 	if let Some(reason) = reason {
 		crate::metrics::global().observe_tier_rewrite_refusal(reason);
 	}

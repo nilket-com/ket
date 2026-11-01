@@ -95,35 +95,30 @@ impl TierMemoryBudget {
 		})
 	}
 
+	#[cfg(test)]
 	pub(super) fn limit(&self) -> u64 {
 		self.limit
 	}
 
+	#[cfg(test)]
 	pub(super) fn used(&self) -> u64 {
 		self.used.load(Ordering::Acquire)
 	}
 
+	#[cfg(test)]
 	pub(super) fn used_by(&self, kind: TierBudgetKind) -> u64 {
 		self.by_kind[kind.slot()].load(Ordering::Acquire)
 	}
 
 	/// The most ever outstanding at once since the last `reset_peak`.
+	#[cfg(test)]
 	pub(super) fn peak(&self) -> u64 {
 		self.peak.load(Ordering::Acquire)
 	}
 
-	pub(super) fn reset_peak(&self) {
-		self.peak.store(self.used(), Ordering::Release);
-	}
-
+	#[cfg(test)]
 	pub(super) fn release_epoch(&self) -> u64 {
 		self.release_epoch.load(Ordering::Acquire)
-	}
-
-	/// Resolves after the next refund. Enable it before checking whether to
-	/// wait, so a refund between the check and the wait is not lost.
-	pub(super) fn released(&self) -> tokio::sync::futures::Notified<'_> {
-		self.released.notified()
 	}
 
 	/// Reserve exactly `bytes`, or nothing.
@@ -185,15 +180,6 @@ impl BudgetReservation {
 		self.bytes
 	}
 
-	pub(super) fn kind(&self) -> TierBudgetKind {
-		self.kind
-	}
-
-	/// Whether this reservation is charged to `budget`.
-	pub(super) fn is_from(&self, budget: &Arc<TierMemoryBudget>) -> bool {
-		Arc::ptr_eq(&self.budget, budget)
-	}
-
 	/// Refund everything above `actual`. Refuses, changing nothing, when
 	/// `actual` exceeds the reservation: memory already allocated past a
 	/// reservation is never accepted after the fact.
@@ -245,7 +231,13 @@ impl Drop for BudgetReservation {
 /// The scratch charge a publication plan carries until its last copy drops.
 /// Plans compare equal regardless of it.
 #[derive(Clone, Debug, Default)]
-pub(super) struct PlanScratch(Option<Arc<BudgetReservation>>);
+pub(super) struct PlanScratch(
+	#[allow(
+		dead_code,
+		reason = "held for its Drop: the charge is released with the plan"
+	)]
+	Option<Arc<BudgetReservation>>,
+);
 
 impl PlanScratch {
 	pub(super) fn new(charge: BudgetReservation) -> Self {
@@ -380,40 +372,6 @@ pub(super) fn checked_sum(terms: &[Option<u64>]) -> Option<u64> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct BoundExceeded;
 
-/// A `Vec` that holds at most the capacity reserved for it and never grows.
-#[derive(Debug)]
-pub(super) struct BoundedVec<T> {
-	items: Vec<T>,
-	bound: usize,
-}
-
-impl<T> BoundedVec<T> {
-	/// Allocate room for exactly `bound` elements, or fail without
-	/// allocating.
-	pub(super) fn try_with_bound(bound: usize) -> Result<Self, std::collections::TryReserveError> {
-		let mut items = Vec::new();
-		items.try_reserve_exact(bound)?;
-		Ok(Self { items, bound })
-	}
-
-	/// Append, refusing before the push could reallocate.
-	pub(super) fn push(&mut self, item: T) -> Result<(), BoundExceeded> {
-		if self.items.len() >= self.bound {
-			return Err(BoundExceeded);
-		}
-		self.items.push(item);
-		Ok(())
-	}
-
-	pub(super) fn len(&self) -> usize {
-		self.items.len()
-	}
-
-	pub(super) fn into_vec(self) -> Vec<T> {
-		self.items
-	}
-}
-
 pub(super) type BudgetedMap<K, V> = hashbrown::HashMap<K, V, std::hash::RandomState>;
 pub(super) type BudgetedSet<K> = hashbrown::HashSet<K, std::hash::RandomState>;
 
@@ -508,7 +466,11 @@ mod tests {
 		assert_eq!(budget.used_by(TierBudgetKind::Token), 0);
 		assert_eq!(budget.used(), 500);
 		assert_eq!(sum(&budget), budget.used());
-		assert_eq!(budget.peak(), 500, "token 300 + scratch 200 was the high-water mark");
+		assert_eq!(
+			budget.peak(),
+			500,
+			"token 300 + scratch 200 was the high-water mark"
+		);
 		drop(scratch);
 		drop(layout);
 		assert_eq!(budget.used(), 0);
@@ -540,7 +502,11 @@ mod tests {
 		let budget = TierMemoryBudget::new(10);
 		let before = budget.release_epoch();
 		drop(budget.try_reserve(TierBudgetKind::Token, 0).unwrap());
-		assert_eq!(budget.release_epoch(), before, "a zero refund is no release");
+		assert_eq!(
+			budget.release_epoch(),
+			before,
+			"a zero refund is no release"
+		);
 		drop(budget.try_reserve(TierBudgetKind::Token, 4).unwrap());
 		assert_eq!(budget.release_epoch(), before + 1);
 	}
@@ -573,7 +539,9 @@ mod tests {
 
 	#[test]
 	fn the_table_bound_covers_every_budgeted_map_shape() {
-		use super::super::{HybridTimestamp, PlacementSemantics, RecordLocation, RecordRowIndex, SlabId};
+		use super::super::{
+			HybridTimestamp, PlacementSemantics, RecordLocation, RecordRowIndex, SlabId,
+		};
 		let location = |index: usize| RecordLocation {
 			slab_id: SlabId::new(1),
 			offset: index as u64,
@@ -597,14 +565,13 @@ mod tests {
 
 	#[test]
 	fn bounded_containers_refuse_before_growing() {
-		let mut items = BoundedVec::<u64>::try_with_bound(2).unwrap();
-		items.push(1).unwrap();
-		items.push(2).unwrap();
-		assert_eq!(items.push(3), Err(BoundExceeded));
-		assert_eq!(items.len(), 2);
 		let mut map = try_bounded_map::<u64, u64>(1).unwrap();
 		bounded_insert(&mut map, 1, 7, 1).unwrap();
-		assert_eq!(bounded_insert(&mut map, 1, 7, 2), Ok(Some(1)), "an existing key never grows");
+		assert_eq!(
+			bounded_insert(&mut map, 1, 7, 2),
+			Ok(Some(1)),
+			"an existing key never grows"
+		);
 		assert_eq!(bounded_insert(&mut map, 1, 8, 1), Err(BoundExceeded));
 		let mut set = try_bounded_set::<u64>(1).unwrap();
 		assert_eq!(bounded_set_insert(&mut set, 1, 3), Ok(true));
