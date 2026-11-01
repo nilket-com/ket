@@ -113,18 +113,6 @@ impl TierLayout {
 		Ok(location)
 	}
 
-	/// Redirect plus superseded entries: the size the per-lineage cap bounds.
-	#[cfg(test)]
-	pub(super) fn entries(&self) -> usize {
-		self.redirects.len() + self.superseded.len()
-	}
-
-	/// The budget charge this generation holds.
-	#[cfg(test)]
-	pub(super) fn charged_bytes(&self) -> u64 {
-		self._charge.as_ref().map_or(0, BudgetReservation::bytes)
-	}
-
 	/// The next generation's history after `plan` moves the slab's rows.
 	///
 	/// Rows are matched by their logical owner (`tier_plan`), never by
