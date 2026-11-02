@@ -43563,6 +43563,15 @@ async fn relocation_within_scratch_edits_chains_exactly_as_before() {
 		let mut scratch =
 			RelocationScratch::try_for_counts(relocation.pairs.len(), relocation.removals.len())
 				.unwrap();
+		assert!(
+			scratch.allocation_for_test() as u64
+				<= RelocationScratch::bytes_bound(
+					relocation.pairs.len(),
+					relocation.removals.len()
+				)
+				.unwrap(),
+			"case {case}: the prepared buffers fit their charged bound"
+		);
 		let refused = mgr
 			.relocate_indexed_locations(tenant(), key, &relocation, &mut scratch)
 			.to_vec();
@@ -43599,6 +43608,10 @@ async fn relocating_one_row_of_a_long_chain_stays_within_its_prepared_scratch() 
 	});
 	let mut scratch = RelocationScratch::try_for_counts(1, 0).unwrap();
 	let capacities = scratch.capacities_for_test();
+	assert!(
+		scratch.allocation_for_test() as u64 <= RelocationScratch::bytes_bound(1, 0).unwrap(),
+		"the prepared buffers fit their charged bound"
+	);
 	let chain_bytes = super::tier_budget::vec_bytes::<RecordLocation>(chain.len()).unwrap();
 	assert!(
 		RelocationScratch::bytes_bound(1, 0).unwrap() * 1000 < chain_bytes,

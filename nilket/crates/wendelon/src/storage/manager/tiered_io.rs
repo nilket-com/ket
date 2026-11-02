@@ -2124,7 +2124,7 @@ impl SlabManager {
 					)
 				});
 		let scratch = super::relocation::RelocationScratch::try_for_counts(pairs, removals)
-			.map_err(unallocated_vec)?;
+			.ok_or_else(|| tier_history_refusal(slab_id, TierHistoryShortfall::Scratch))?;
 		Ok(PreparedTierRefresh {
 			relocations,
 			scratch,

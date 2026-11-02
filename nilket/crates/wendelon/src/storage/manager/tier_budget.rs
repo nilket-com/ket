@@ -767,6 +767,8 @@ mod tests {
 		});
 		assert_map_bound::<RecordLocation, ()>(|index| (location(index), ()));
 		assert_map_bound::<u64, u32>(|index| (index as u64, index as u32));
+		// RelocationScratch's sets.
+		assert_map_bound::<usize, ()>(|index| (index, ()));
 	}
 
 	#[test]

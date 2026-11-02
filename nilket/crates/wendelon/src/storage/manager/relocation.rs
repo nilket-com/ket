@@ -41,6 +41,8 @@ pub(super) struct KeyRelocation {
 	pub(super) publish_redirects: bool,
 }
 
+use super::tier_budget::{BudgetedSet, try_bounded_set};
+
 /// The working buffers of a key's relocation: sized before it runs from the
 /// largest pair and removal counts it serves, never from the key's version
 /// chain, and never grown by it. A tier publication builds one fallibly before
@@ -48,9 +50,9 @@ pub(super) struct KeyRelocation {
 #[derive(Debug, Default)]
 pub(super) struct RelocationScratch {
 	/// Chain positions a pair already matched.
-	matched: HashSet<usize>,
+	matched: BudgetedSet<usize>,
 	applied: Vec<(usize, RelocationPair)>,
-	produced: HashSet<RecordLocation>,
+	produced: BudgetedSet<RecordLocation>,
 	refused: Vec<(RecordLocation, RecordLocation)>,
 	removed: Vec<RecordLocation>,
 	moved: Vec<usize>,
@@ -59,29 +61,32 @@ pub(super) struct RelocationScratch {
 impl RelocationScratch {
 	/// Buffers for relocations of at most `pairs` pairs and `removals`
 	/// removals each.
-	pub(super) fn try_for_counts(
-		pairs: usize,
-		removals: usize,
-	) -> Result<Self, std::collections::TryReserveError> {
-		let mut scratch = Self::default();
-		scratch.matched.try_reserve(pairs)?;
-		scratch.applied.try_reserve_exact(pairs)?;
-		scratch.produced.try_reserve(pairs)?;
-		scratch.refused.try_reserve_exact(pairs)?;
-		scratch
-			.removed
-			.try_reserve_exact(pairs.saturating_add(removals))?;
-		scratch.moved.try_reserve_exact(pairs)?;
-		Ok(scratch)
+	/// `None` when an allocation is refused.
+	pub(super) fn try_for_counts(pairs: usize, removals: usize) -> Option<Self> {
+		fn vec<T>(capacity: usize) -> Option<Vec<T>> {
+			let mut vec = Vec::new();
+			vec.try_reserve_exact(capacity).ok().map(|()| vec)
+		}
+		Some(Self {
+			matched: try_bounded_set(pairs).ok()?,
+			applied: vec(pairs)?,
+			produced: try_bounded_set(pairs).ok()?,
+			refused: vec(pairs)?,
+			removed: vec(pairs.checked_add(removals)?)?,
+			moved: vec(pairs)?,
+		})
 	}
 
 	/// Buffers for `relocation` alone (callers outside §7 coverage).
 	pub(super) fn for_relocation(relocation: &KeyRelocation) -> Self {
 		let (pairs, removals) = (relocation.pairs.len(), relocation.removals.len());
+		fn set<T>(capacity: usize) -> BudgetedSet<T> {
+			BudgetedSet::with_capacity_and_hasher(capacity, Default::default())
+		}
 		Self {
-			matched: HashSet::with_capacity(pairs),
+			matched: set(pairs),
 			applied: Vec::with_capacity(pairs),
-			produced: HashSet::with_capacity(pairs),
+			produced: set(pairs),
 			refused: Vec::with_capacity(pairs),
 			removed: Vec::with_capacity(pairs.saturating_add(removals)),
 			moved: Vec::with_capacity(pairs),
@@ -99,6 +104,20 @@ impl RelocationScratch {
 			vec_bytes::<RecordLocation>(pairs.checked_add(removals)?),
 			vec_bytes::<usize>(pairs),
 		])
+	}
+
+	/// The bytes these buffers have allocated.
+	#[cfg(test)]
+	pub(super) fn allocation_for_test(&self) -> usize {
+		fn vec<T>(vec: &Vec<T>) -> usize {
+			vec.capacity() * std::mem::size_of::<T>()
+		}
+		self.matched.allocation_size()
+			+ vec(&self.applied)
+			+ self.produced.allocation_size()
+			+ vec(&self.refused)
+			+ vec(&self.removed)
+			+ vec(&self.moved)
 	}
 
 	#[cfg(test)]
