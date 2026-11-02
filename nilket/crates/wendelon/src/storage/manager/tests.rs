@@ -45743,16 +45743,20 @@ async fn single_voter(
 	(raft, log, network)
 }
 
-/// Multinode: restart while fenced. A node fences committed P1 on the index
-/// gate. With the gate still held, its authority worker is closed and
-/// joined (no replay can run) and its voter shut down; the volatile
-/// deferral is lost with the manager. After reopening on the same store and
-/// log, the premises are asserted: local P0, committed P1, no deferral,
-/// readiness closed. The authoritative reconcile pass (the sweeper's) then
-/// converges the node to P1 from recovered committed state: published,
-/// nothing deferred, readiness open, the row served.
+/// Multinode: restart while fenced, through the node's own startup order. A
+/// node fences committed P1 on the index gate. With the gate still held, its
+/// authority worker is closed and joined (no replay can run) and its voter
+/// shut down; the volatile deferral is lost with the manager. On restart the
+/// control follows `node.rs` bootstrap exactly: reopen the manager, recover
+/// the state machine from the log (premises asserted: committed P1, local
+/// P0, no deferral), seed the installed snapshot index, fence local tiers
+/// absent from committed state and stage every recovered committed tier, all
+/// before the voter starts. From then on readiness is never open while the
+/// node still names P0, and verification alone (no sweeper pass) converges it
+/// to P1: published, nothing deferred, readiness open, the row served.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_node_restarted_while_fenced_converges_to_its_committed_pointer() {
+	use crate::consensus::{WendelonLogStore, WendelonRaft};
 	use crate::storage::ownership::StorageWorker;
 	let l1_dir = fresh_dir("s7-restart-fenced-l1");
 	let l2_dir = fresh_dir("s7-restart-fenced-l2");
@@ -45805,44 +45809,88 @@ async fn a_node_restarted_while_fenced_converges_to_its_committed_pointer() {
 	drop((raft, log));
 	drop(mgr);
 
+	// Restart, in node.rs bootstrap order.
 	let reopened = SlabManager::open(reopen_test_config(&l1_dir, io, l2, crypto))
 		.await
 		.unwrap();
-	let (_raft, _log, _network) = single_voter(&wal_dir, &reopened, false).await;
+	let log = WendelonLogStore::open_for_retention_test(&wal_dir, 64 * 4096, None)
+		.await
+		.unwrap();
+	let state_machine = log.recovered_state_machine().await.unwrap();
+	let recovered = state_machine.state_snapshot().await;
+	let recovered_index = recovered.last_applied_log_id.map(|id| id.index);
+	let committed_x = recovered
+		.tiered_slabs
+		.get(&old.slab_id)
+		.map(tiered_slab_pointer_for_test);
+	assert_eq!(
+		committed_x,
+		Some(p1.clone()),
+		"premise: committed state names P1"
+	);
 	assert_eq!(
 		reopened.tier_pointer(old.slab_id).await,
 		Some(old.clone()),
 		"premise after the reopen: local P0"
 	);
-	assert_eq!(
-		reopened.try_canonical_tier_pointer(old.slab_id),
-		Some(Some(p1.clone())),
-		"premise after the reopen: committed state names P1"
-	);
 	assert!(
 		reopened.unapplied_tier_pointers.get(&old.slab_id).is_none(),
 		"premise after the reopen: no volatile deferral survived"
 	);
-	assert!(
-		reopened.tier_authority_readiness_reason().is_some(),
-		"premise after the reopen: readiness closed"
-	);
-	assert_eq!(
-		sweep_with_committed(&reopened, old.slab_id, Some(p1.clone()))
+	if let Some(index) = recovered_index {
+		reopened.seed_installed_snapshot_index(index);
+	}
+	let committed_ids = recovered.tiered_slabs.keys().copied().collect();
+	reopened
+		.fence_local_tiers_absent_from_committed(&committed_ids, recovered_index)
+		.await
+		.unwrap();
+	let mut tiers = recovered.tiered_slabs.values().cloned().collect::<Vec<_>>();
+	tiers.sort_by_key(|tier| tier.slab_id);
+	let floor = tiers.last().map_or(SlabId::ZERO, |tier| tier.slab_id);
+	for tier in &tiers {
+		reopened
+			.stage_bootstrap_tier_authority(
+				tiered_slab_pointer_for_test(tier),
+				recovered_index,
+				floor,
+			)
 			.await
+			.unwrap();
+	}
+	let network = b1t_network::Network::default();
+	let config = Arc::new(
+		crate::consensus::retention::ControlRetention::default()
+			.openraft_config("wendelon")
+			.validate()
 			.unwrap(),
-		(true, None),
-		"the authoritative reconcile pass publishes P1"
 	);
-	assert_eq!(reopened.tier_pointer(old.slab_id).await, Some(p1));
+	let state_machine = state_machine.with_tier_observer(Arc::new(
+		crate::storage::ManagerTierObserver::new(reopened.clone()),
+	));
+	let raft = WendelonRaft::new(1, config, network.clone(), log.clone(), state_machine)
+		.await
+		.unwrap();
+	network.0.lock().unwrap().insert(1, raft.clone());
+
+	// Never ready while still naming P0; verification alone converges.
+	let converged = eventually(60, async || {
+		let ready = reopened.tier_authority_readiness_reason().is_none();
+		let pointer = reopened.tier_pointer(old.slab_id).await;
+		assert!(
+			!ready || pointer.as_ref() == Some(&p1),
+			"readiness open while the node names {pointer:?}"
+		);
+		ready && pointer.as_ref() == Some(&p1)
+	})
+	.await;
+	assert!(converged, "verification converges the restarted node to P1");
 	assert!(reopened.unapplied_tier_pointers.get(&old.slab_id).is_none());
-	tokio::time::timeout(
-		Duration::from_secs(60),
-		reopened.wait_tier_authority_ready(),
-	)
-	.await
-	.expect("readiness opens")
-	.unwrap();
 	let location = reopened.lookup(tenant(), key).unwrap().unwrap();
 	assert_eq!(reopened.read(location).await.unwrap(), b"restart-row");
+	raft.shutdown().await.unwrap();
+}
+
+fn tiered_slab_pointer_for_test(tier: &crate::consensus::TieredSlab) -> TieredSlabPointer {
+	super::tier_tokens::tiered_slab_pointer(tier)
 }
