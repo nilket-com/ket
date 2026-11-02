@@ -52,7 +52,7 @@ struct Slot {
 	base: TierBase,
 	state: SlotState,
 	/// Retired before `charge` refunds (fields drop after `Drop::drop`).
-	backing: Arc<super::tier_budget::TokenBacking>,
+	backing: super::tier_budget::TokenBacking,
 	#[cfg_attr(
 		not(test),
 		allow(dead_code, reason = "held for its Drop: the token's reservation")
@@ -62,7 +62,7 @@ struct Slot {
 
 impl Drop for Slot {
 	fn drop(&mut self) {
-		self.backing.retire();
+		self.charge.retire_backing(self.backing);
 	}
 }
 
@@ -78,7 +78,10 @@ pub(super) struct TierTokenRegistry {
 
 impl TierTokenRegistry {
 	pub(super) fn new(budget: &Arc<TierMemoryBudget>) -> std::io::Result<Arc<Self>> {
+		// The slot table and the budget's backing table for it.
 		let bytes = vec_bytes::<Option<Slot>>(TOKEN_SLOTS)
+			.zip(TierMemoryBudget::backing_table_bytes(TOKEN_SLOTS))
+			.and_then(|(slots, backings)| slots.checked_add(backings))
 			.ok_or_else(|| Error::new(ErrorKind::OutOfMemory, "tier token registry size"))?;
 		let table = budget
 			.try_reserve(TierBudgetKind::Registry, bytes)
@@ -88,6 +91,7 @@ impl TierTokenRegistry {
 			.try_reserve_exact(TOKEN_SLOTS)
 			.map_err(|_| Error::new(ErrorKind::OutOfMemory, "tier token registry"))?;
 		slots.resize_with(TOKEN_SLOTS, || None);
+		budget.install_backings(TOKEN_SLOTS)?;
 		Ok(Arc::new(Self {
 			slots: Mutex::new(slots),
 			next_attempt: std::sync::atomic::AtomicU64::new(1),
@@ -118,6 +122,7 @@ impl TierTokenRegistry {
 		pointer: TieredSlabPointer,
 		base: TierBase,
 		charge: BudgetReservation,
+		credit: u64,
 	) -> Option<TokenRef> {
 		// Attempt ids never wrap: an exhausted counter admits nothing.
 		let attempt = self
@@ -135,7 +140,9 @@ impl TierTokenRegistry {
 			pointer,
 			base,
 			state: SlotState::Held,
-			backing: super::tier_budget::TokenBacking::new(&self.budget, charge.bytes()),
+			backing: self
+				.budget
+				.open_backing(index, attempt, credit.min(charge.bytes())),
 			charge,
 		});
 		Some(TokenRef {
@@ -166,7 +173,7 @@ impl TierTokenRegistry {
 							&& slot.pointer == *pointer
 							&& slot.base == *base
 					})
-					.map(|slot| (slot.attempt, index, slot.backing.clone()))
+					.map(|slot| (slot.attempt, index, slot.backing))
 			})
 			.min_by_key(|(attempt, index, _)| (*attempt, *index))?;
 		Some(TokenUse {
@@ -210,14 +217,7 @@ impl TierTokenRegistry {
 pub(super) struct TokenUse {
 	index: usize,
 	attempt: u64,
-	pub(super) backing: Arc<super::tier_budget::TokenBacking>,
-}
-
-#[cfg(test)]
-impl TokenUse {
-	fn backing_bytes(&self) -> u64 {
-		self.backing.bytes()
-	}
+	pub(super) backing: super::tier_budget::TokenBacking,
 }
 
 /// A token's address in its registry, valid only while the slot still holds
@@ -340,57 +340,61 @@ impl SlabManager {
 	pub async fn reserve_tier_history(&self, tier: TieredSlab) -> std::io::Result<TierProposal> {
 		let slab_id = tier.slab_id;
 		let refuse = || tier_history_refusal(slab_id, TierHistoryShortfall::History);
-		let (base, redirects, superseded) = self.tier_history_base(slab_id).await;
 		let rows = self.count_record_rows_for_slab(slab_id);
-		let redirect_bound = redirects
-			.checked_add(rows)
-			.ok_or_else(refuse)?
-			.min(LINEAGE_HISTORY_CAP);
-		let superseded_bound = superseded
-			.checked_add(redirects)
-			.and_then(|bound| bound.checked_add(rows))
-			.ok_or_else(refuse)?
-			.min(LINEAGE_HISTORY_CAP);
-		// The slot also keeps the proposed pointer and its base, whose URIs
-		// are the only variable allocations it holds.
-		let base_uri = match &base {
-			TierBase::Published { pointer, .. } => pointer.l2_uri.len(),
-			TierBase::Untiered => 0,
-		};
-		let bytes = checked_sum(&[
-			hash_table_bytes_bound::<(RecordLocation, RecordLocation)>(redirect_bound),
-			hash_table_bytes_bound::<RecordLocation>(superseded_bound),
-			u64::try_from(tier.l2_uri.len()).ok(),
-			u64::try_from(base_uri).ok(),
-		])
-		.ok_or_else(refuse)?;
-		let charge = self
-			.tier_tokens
-			.budget()
-			.try_reserve(TierBudgetKind::Token, bytes)
+		// Read the history sizes, reserve, and only then copy the base, in one
+		// `state` snapshot: nothing the token holds is allocated unreserved.
+		let (base, charge, credit) = {
+			let state = self.state.lock().await;
+			let (redirects, superseded) = state
+				.tier_layouts
+				.get(&slab_id)
+				.map(|layout| (layout.redirects.len(), layout.superseded.len()))
+				.unwrap_or((0, 0));
+			let redirect_bound = redirects
+				.checked_add(rows)
+				.ok_or_else(refuse)?
+				.min(LINEAGE_HISTORY_CAP);
+			let superseded_bound = superseded
+				.checked_add(redirects)
+				.and_then(|bound| bound.checked_add(rows))
+				.ok_or_else(refuse)?
+				.min(LINEAGE_HISTORY_CAP);
+			// History credit: not yet allocated, so a build it backs may
+			// overlap it.
+			let credit = checked_sum(&[
+				hash_table_bytes_bound::<(RecordLocation, RecordLocation)>(redirect_bound),
+				hash_table_bytes_bound::<RecordLocation>(superseded_bound),
+			])
 			.ok_or_else(refuse)?;
+			// Resident metadata: the slot's copies of the proposed pointer and
+			// its base, whose URIs are the only variable allocations it holds.
+			// They coexist with any build, so they are never lent.
+			let base_uri = state
+				.tiered
+				.get(&slab_id)
+				.map_or(0, |pointer| pointer.l2_uri.len());
+			let bytes = checked_sum(&[
+				Some(credit),
+				u64::try_from(tier.l2_uri.len()).ok(),
+				u64::try_from(base_uri).ok(),
+			])
+			.ok_or_else(refuse)?;
+			let charge = self
+				.tier_tokens
+				.budget()
+				.try_reserve(TierBudgetKind::Token, bytes)
+				.ok_or_else(refuse)?;
+			(self.tier_publication_base(&state, slab_id), charge, credit)
+		};
 		let pointer = tiered_slab_pointer(&tier);
 		let token = self
 			.tier_tokens
-			.admit(pointer, base, charge)
+			.admit(pointer, base, charge, credit)
 			.ok_or_else(refuse)?;
 		Ok(TierProposal {
 			tier,
 			token: Some(token),
 		})
-	}
-
-	/// The slab's published base and its history sizes, read in one `state`
-	/// snapshot.
-	async fn tier_history_base(&self, slab_id: SlabId) -> (TierBase, usize, usize) {
-		let state = self.state.lock().await;
-		let base = self.tier_publication_base(&state, slab_id);
-		let (redirects, superseded) = state
-			.tier_layouts
-			.get(&slab_id)
-			.map(|layout| (layout.redirects.len(), layout.superseded.len()))
-			.unwrap_or((0, 0));
-		(base, redirects, superseded)
 	}
 
 	/// The observer's build of `pointer`'s next layout over `current`. For an
@@ -414,7 +418,7 @@ impl SlabManager {
 			pointer.slab_id,
 			plan,
 			&self.tier_budget,
-			token.as_ref().map(|token| &token.backing),
+			token.as_ref().map(|token| token.backing),
 		)?;
 		Ok((layout, token))
 	}
@@ -552,7 +556,7 @@ mod tests {
 			.try_reserve(TierBudgetKind::Token, bytes)
 			.unwrap();
 		let token = registry
-			.admit(pointer(uri), TierBase::Untiered, charge)
+			.admit(pointer(uri), TierBase::Untiered, charge, bytes)
 			.unwrap();
 		TierProposal {
 			tier: TieredSlab {
@@ -628,7 +632,11 @@ mod tests {
 		let token = registry
 			.back_matching(&pointer("a"), &TierBase::Untiered)
 			.unwrap();
-		assert_eq!(token.backing_bytes(), 60, "the held attempt is never used");
+		assert_eq!(
+			budget.credit_for_test(token.backing),
+			60,
+			"the held attempt is never used"
+		);
 		registry.consume(token);
 		assert_eq!(registry.held(), (1, 100));
 		submitted.applied();
@@ -683,11 +691,11 @@ mod tests {
 			.back_matching(&pointer("a"), &TierBase::Untiered)
 			.unwrap();
 		let layout = budget
-			.try_reserve_backed(TierBudgetKind::Layout, room, &token.backing)
+			.try_reserve_backed(TierBudgetKind::Layout, room, token.backing)
 			.expect("the token backs the layout it reserved for");
 		assert!(
 			budget
-				.try_reserve_backed(TierBudgetKind::Layout, 1, &token.backing)
+				.try_reserve_backed(TierBudgetKind::Layout, 1, token.backing)
 				.is_none(),
 			"backing covers at most the token"
 		);
@@ -714,44 +722,41 @@ mod tests {
 			.back_matching(&pointer("a"), &TierBase::Untiered)
 			.unwrap();
 		let half = budget
-			.try_reserve_backed(TierBudgetKind::Layout, room / 2, &first.backing)
+			.try_reserve_backed(TierBudgetKind::Layout, room / 2, first.backing)
 			.expect("half the token backs the first build");
 		let rest = room - room / 2;
 		assert!(
 			budget
-				.try_reserve_backed(TierBudgetKind::Layout, rest + 1, &second.backing)
+				.try_reserve_backed(TierBudgetKind::Layout, rest + 1, second.backing)
 				.is_none(),
 			"the second build may overlap only what the first left unclaimed"
 		);
 		let other = budget
-			.try_reserve_backed(TierBudgetKind::Layout, rest, &second.backing)
+			.try_reserve_backed(TierBudgetKind::Layout, rest, second.backing)
 			.expect("the rest of the token backs the second build");
-		assert_eq!(first.backing.claimed(), room);
-		assert!(
-			Arc::ptr_eq(&first.backing, &second.backing),
-			"one backing per token"
-		);
+		assert_eq!(budget.claimed_for_test(first.backing), room);
+		assert!(first.backing == second.backing, "one backing per token");
 		assert_eq!(budget.peak(), budget.limit(), "the overlap is counted once");
 
 		drop(other);
 		assert_eq!(
-			first.backing.claimed(),
+			budget.claimed_for_test(first.backing),
 			room / 2,
 			"a dropped build returns its claim"
 		);
 		let mut retry = budget
-			.try_reserve_backed(TierBudgetKind::Layout, rest, &second.backing)
+			.try_reserve_backed(TierBudgetKind::Layout, rest, second.backing)
 			.expect("a retry is backed again");
 		retry.shrink_to(1).unwrap();
 		assert_eq!(
-			first.backing.claimed(),
+			budget.claimed_for_test(first.backing),
 			room / 2 + 1,
 			"a shrink returns the surplus overlap"
 		);
 
 		registry.consume(first);
 		assert_eq!(
-			second.backing.claimed(),
+			budget.claimed_for_test(second.backing),
 			0,
 			"a released token backs nothing"
 		);
@@ -764,6 +769,120 @@ mod tests {
 		drop((half, retry, second));
 		assert_eq!(budget.used(), table);
 		assert_eq!(budget.peak(), budget.used() + room / 2 + 1);
+	}
+
+	/// The history Codex gave against b47e5797. An ordinary admission of 50
+	/// bytes under a 100-byte limit pauses twice before it commits: at the
+	/// first pause a 100-byte layout backed by a 100-byte token is reserved,
+	/// at the second the token is consumed (its overlap retired, its charge
+	/// refunded), leaving the layout live. Committing against what it read
+	/// before those changes would hold 150 bytes. Every admission is one
+	/// critical section, so both changes wait for it instead.
+	#[test]
+	fn an_admission_never_commits_against_state_changed_since_it_read_it() {
+		use std::sync::mpsc::{channel, sync_channel};
+		use std::time::Duration;
+		let (budget, registry) = registry(1 << 20);
+		let table = budget.used_by(TierBudgetKind::Registry);
+		budget.set_limit_for_test(table + 100);
+		let _submitted = proposal(&registry, "a", 100).begin_submission().unwrap();
+		let token = registry
+			.back_matching(&pointer("a"), &TierBase::Untiered)
+			.unwrap();
+		let backing = token.backing;
+
+		let (entered_tx, entered) = sync_channel(1);
+		let (release, release_rx) = sync_channel(1);
+		budget.hold_next_admission_for_test(entered_tx, release_rx, 2);
+		let admission = {
+			let budget = budget.clone();
+			std::thread::spawn(move || budget.try_reserve(TierBudgetKind::Scratch, 50))
+		};
+		let wait = Duration::from_secs(30);
+		entered.recv_timeout(wait).expect("first pause");
+		let (layout_done, layout_done_rx) = channel();
+		let layout = {
+			let budget = budget.clone();
+			std::thread::spawn(move || {
+				let layout = budget.try_reserve_backed(TierBudgetKind::Layout, 100, backing);
+				let _ = layout_done.send(());
+				layout
+			})
+		};
+		let layout_ran_in_pause = layout_done_rx
+			.recv_timeout(Duration::from_millis(500))
+			.is_ok();
+		release.send(()).unwrap();
+		entered.recv_timeout(wait).expect("second pause");
+		let (consumed, consumed_rx) = channel();
+		let consume = {
+			let registry = registry.clone();
+			std::thread::spawn(move || {
+				registry.consume(token);
+				let _ = consumed.send(());
+			})
+		};
+		let consume_ran_in_pause = consumed_rx.recv_timeout(Duration::from_millis(500)).is_ok();
+		release.send(()).unwrap();
+		let admitted = admission.join().unwrap();
+		let layout = layout.join().unwrap();
+		consume.join().unwrap();
+		assert!(
+			!(admitted.is_some() && layout.is_some()),
+			"a live 100-byte layout and a 50-byte admission never coexist under a 100-byte limit"
+		);
+		assert!(
+			budget.peak() <= budget.limit(),
+			"nothing ever held over the limit"
+		);
+		assert!(
+			!layout_ran_in_pause && !consume_ran_in_pause,
+			"no reservation or release lands between an admission's read and its commit"
+		);
+		assert!(
+			layout.is_some(),
+			"the layout is admitted after the refused admission"
+		);
+		drop((admitted, layout));
+		assert_eq!(budget.used(), table);
+	}
+
+	/// Only a token's history credit is lent; the metadata its slot keeps
+	/// (the proposed and base URIs) stays held beside any build it backs.
+	#[test]
+	fn a_live_tokens_metadata_is_never_lent_to_a_build() {
+		let (budget, registry) = registry(1 << 20);
+		let table = budget.used_by(TierBudgetKind::Registry);
+		let uri = "u".repeat(4096);
+		let credit = 1_000;
+		let charge = budget
+			.try_reserve(TierBudgetKind::Token, credit + uri.len() as u64)
+			.unwrap();
+		budget.set_limit_for_test(table + credit + uri.len() as u64);
+		let token = registry
+			.admit(pointer(&uri), TierBase::Untiered, charge, credit)
+			.unwrap();
+		registry.with_slot(&token, |slot| {
+			slot.as_mut().unwrap().state = SlotState::Submitted;
+		});
+		let backing = registry
+			.back_matching(&pointer(&uri), &TierBase::Untiered)
+			.unwrap();
+		assert_eq!(budget.credit_for_test(backing.backing), credit);
+		assert!(
+			budget
+				.try_reserve_backed(TierBudgetKind::Layout, credit + 1, backing.backing)
+				.is_none(),
+			"the token is live, so its URI bytes are held, not lendable"
+		);
+		let layout = budget
+			.try_reserve_backed(TierBudgetKind::Layout, credit, backing.backing)
+			.expect("the history credit backs the build");
+		assert_eq!(budget.peak(), budget.limit());
+		drop(layout);
+		registry.consume(backing);
+		drop(token);
+		assert_eq!(budget.used(), table);
 	}
 
 	#[test]
@@ -824,7 +943,7 @@ mod tests {
 			.unwrap();
 		assert!(
 			registry
-				.admit(pointer("a"), TierBase::Untiered, charge)
+				.admit(pointer("a"), TierBase::Untiered, charge, 0)
 				.is_none(),
 			"zero-byte tokens still need a slot"
 		);

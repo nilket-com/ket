@@ -222,7 +222,10 @@ pub use tier_generation::{
 use version_identity::IncomingVersion;
 mod slab_file_quarantine;
 mod tiered_io;
-use relocation::{KeyRelocation, RelocationInsertion, RelocationPair, decrement_reference_count};
+use relocation::{
+	KeyRelocation, RelocationInsertion, RelocationPair, RelocationScratch,
+	decrement_reference_count,
+};
 pub use slab_file_quarantine::{
 	DisagreeingSlabFileReason, QuarantinedSlabFile, QuarantinedSlabFilesReport,
 };

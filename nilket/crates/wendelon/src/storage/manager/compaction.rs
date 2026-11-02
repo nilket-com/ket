@@ -1808,8 +1808,11 @@ impl SlabManager {
 		let mut refused_rows = Vec::new();
 		let mut relocated_any = false;
 		for ((tenant_id, key_identity), relocation) in &by_key {
-			for (_, new) in self.relocate_indexed_locations(*tenant_id, *key_identity, relocation) {
-				refused_rows.push(self.persistent_record_row(*tenant_id, *key_identity, new));
+			let mut scratch = RelocationScratch::for_relocation(relocation);
+			for (_, new) in
+				self.relocate_indexed_locations(*tenant_id, *key_identity, relocation, &mut scratch)
+			{
+				refused_rows.push(self.persistent_record_row(*tenant_id, *key_identity, *new));
 			}
 			if !relocated_any {
 				relocated_any = true;

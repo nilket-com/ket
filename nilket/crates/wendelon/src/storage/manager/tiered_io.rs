@@ -1982,20 +1982,18 @@ impl SlabManager {
 		if plan.old_rows == plan.new_rows {
 			return Ok(PreparedTierRefresh::default());
 		}
+		use super::tier_budget::{TierHistoryShortfall, tier_history_refusal};
+		let slab_id = plan
+			.pointer
+			.as_ref()
+			.map_or(SlabId::ZERO, |pointer| pointer.slab_id);
 		let unallocated = |_: hashbrown::TryReserveError| {
-			Error::new(ErrorKind::OutOfMemory, "tier refresh relocations")
+			tier_history_refusal(slab_id, TierHistoryShortfall::Scratch)
 		};
 		let unallocated_vec = |_: std::collections::TryReserveError| {
-			Error::new(ErrorKind::OutOfMemory, "tier refresh relocations")
+			tier_history_refusal(slab_id, TierHistoryShortfall::Scratch)
 		};
-		let stale = |_| {
-			super::tier_budget::tier_history_refusal(
-				plan.pointer
-					.as_ref()
-					.map_or(SlabId::ZERO, |pointer| pointer.slab_id),
-				super::tier_budget::TierHistoryShortfall::StalePlan,
-			)
-		};
+		let stale = |_| tier_history_refusal(slab_id, TierHistoryShortfall::StalePlan);
 		let index_by_location = |rows: &[PersistentRecordRow]| {
 			let mut map = try_bounded_map(rows.len()).map_err(unallocated)?;
 			for (index, row) in rows.iter().enumerate() {
@@ -2116,7 +2114,21 @@ impl SlabManager {
 			}
 			relocations.push((run[0].0, relocation));
 		}
-		Ok(PreparedTierRefresh { relocations })
+		let (pairs, removals) =
+			relocations
+				.iter()
+				.fold((0, 0), |(pairs, removals), (_, relocation)| {
+					(
+						pairs.max(relocation.pairs.len()),
+						removals.max(relocation.removals.len()),
+					)
+				});
+		let scratch = super::relocation::RelocationScratch::try_for_counts(pairs, removals)
+			.map_err(unallocated_vec)?;
+		Ok(PreparedTierRefresh {
+			relocations,
+			scratch,
+		})
 	}
 
 	/// Apply relocations prepared by `prepare_tiered_row_refresh` for `plan`.
@@ -2129,10 +2141,14 @@ impl SlabManager {
 		if plan.old_rows == plan.new_rows {
 			return;
 		}
-		let by_key = prepared.relocations;
+		let PreparedTierRefresh {
+			relocations: by_key,
+			mut scratch,
+		} = prepared;
 		let mut relocated_any = false;
 		for ((tenant_id, key_identity), relocation) in &by_key {
-			self.relocate_indexed_locations(*tenant_id, *key_identity, relocation);
+			// `scratch` was sized for the largest of these relocations.
+			self.relocate_indexed_locations(*tenant_id, *key_identity, relocation, &mut scratch);
 			if !relocated_any {
 				relocated_any = true;
 				#[cfg(test)]
@@ -2500,6 +2516,8 @@ fn stale_plan_if_over_bound(slab_id: SlabId, error: Error) -> Error {
 #[derive(Debug, Default)]
 pub(super) struct PreparedTierRefresh {
 	relocations: Vec<(TenantKey, KeyRelocation)>,
+	/// The relocation buffers, sized for the largest per-key relocation.
+	scratch: super::relocation::RelocationScratch,
 }
 
 #[cfg(test)]
@@ -2552,5 +2570,8 @@ pub(super) fn tier_refresh_prepare_bytes(old: usize, new: usize) -> Option<u64> 
 		vec_bytes::<RelocationPair>(old),
 		vec_bytes::<RecordLocation>(old),
 		vec_bytes::<RelocationInsertion>(new),
+		// The apply's relocation buffers: no key has more pairs or removals
+		// than the plan has old rows, whatever its version chain holds.
+		super::relocation::RelocationScratch::bytes_bound(old, old),
 	])
 }

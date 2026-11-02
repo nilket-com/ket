@@ -151,7 +151,7 @@ impl TierLayout {
 		slab_id: SlabId,
 		plan: &TieredRowRefreshPlan,
 		budget: &Arc<TierMemoryBudget>,
-		backing: Option<&Arc<TokenBacking>>,
+		backing: Option<TokenBacking>,
 	) -> std::io::Result<TierLayout> {
 		let collision = || stale_location_error(slab_id, StaleLocationReason::LayoutCollision);
 		let refusal = |shortfall| tier_history_refusal(slab_id, shortfall);

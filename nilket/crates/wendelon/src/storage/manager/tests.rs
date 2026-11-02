@@ -22085,8 +22085,13 @@ async fn different_record_classes_at_one_version_conflict_through_relocation() {
 		});
 	}
 	assert!(
-		mgr.relocate_indexed_locations(tenant(), key, &relocation)
-			.is_empty()
+		mgr.relocate_indexed_locations(
+			tenant(),
+			key,
+			&relocation,
+			&mut RelocationScratch::for_relocation(&relocation),
+		)
+		.is_empty()
 	);
 	for pair in relocation.pairs {
 		for location in [pair.old, pair.new] {
@@ -36532,9 +36537,10 @@ async fn a9_shared_output_pair_with_one_present_source_is_not_refused() {
 			table_object_id: None,
 		});
 	}
+	let mut scratch = RelocationScratch::for_relocation(&relocation);
 	let refused = f
 		.manager
-		.relocate_indexed_locations(tenant(), f.key, &relocation);
+		.relocate_indexed_locations(tenant(), f.key, &relocation, &mut scratch);
 	assert!(
 		refused.is_empty(),
 		"A9 a shared output produced by another applied pair is not refused: {refused:?}"
@@ -43408,4 +43414,205 @@ fn fenced_counter(reason: &str) -> u64 {
 		.find_map(|line| line.strip_prefix(&prefix))
 		.map(|value| value.parse().unwrap())
 		.unwrap_or(0)
+}
+
+/// The chain edit `relocate_indexed_locations` made before its buffers moved
+/// into `RelocationScratch`, verbatim but for the index side effects (table
+/// references, redirects, conflict marks), which the edit does not read.
+fn reference_relocate_chain(
+	versions: &mut Vec<RecordLocation>,
+	relocation: &KeyRelocation,
+) -> Vec<(RecordLocation, RecordLocation)> {
+	let mut refused = Vec::new();
+	let mut matched = vec![false; versions.len()];
+	let mut applied = Vec::with_capacity(relocation.pairs.len());
+	for pair in &relocation.pairs {
+		if pair.old == pair.new {
+			continue;
+		}
+		let position = versions
+			.iter()
+			.enumerate()
+			.position(|(index, stored)| !matched[index] && *stored == pair.old);
+		match position {
+			Some(position) => {
+				matched[position] = true;
+				applied.push((position, *pair));
+			}
+			None if versions.contains(&pair.new) => {}
+			None => refused.push((pair.old, pair.new)),
+		}
+	}
+	let produced = applied
+		.iter()
+		.map(|(_, pair)| pair.new)
+		.collect::<HashSet<_>>();
+	refused.retain(|(_, new)| !produced.contains(new));
+	let mut moved = Vec::new();
+	for (position, pair) in &applied {
+		if pair.old.hlc == pair.new.hlc {
+			versions[*position] = pair.new;
+		} else {
+			moved.push(*position);
+		}
+	}
+	moved.sort_unstable();
+	for position in moved.iter().rev() {
+		versions.remove(*position);
+	}
+	for (_, pair) in &applied {
+		if pair.old.hlc != pair.new.hlc {
+			crate::storage::core::insert_version_sorted(versions, pair.new);
+		}
+	}
+	for (_, pair) in &applied {
+		let mut seen = false;
+		versions.retain(|stored| {
+			if *stored != pair.new {
+				return true;
+			}
+			let first = !seen;
+			seen = true;
+			first
+		});
+	}
+	for location in &relocation.removals {
+		crate::storage::core::remove_version_exact(versions, *location);
+	}
+	for insertion in &relocation.insertions {
+		if !versions.contains(&insertion.location) {
+			crate::storage::core::insert_version_sorted(versions, insertion.location);
+		}
+	}
+	refused
+}
+
+fn relocation_test_location(slab: u64, offset: u64, hlc_ms: u64) -> RecordLocation {
+	RecordLocation {
+		slab_id: SlabId::new(slab),
+		offset,
+		length: 64,
+		hlc: hlc(hlc_ms),
+		record_row_index: RecordRowIndex::ZERO,
+		is_tombstone: false,
+		placement: PlacementSemantics::RawLocality,
+		partition: None,
+	}
+}
+
+/// With its buffers in a caller's `RelocationScratch`, a relocation decides
+/// and edits every chain exactly as before: duplicates, shifting copies,
+/// absent sources, equal and moved HLCs, removals and insertions.
+#[tokio::test]
+async fn relocation_within_scratch_edits_chains_exactly_as_before() {
+	let (_dir, mgr) = fresh_manager().await;
+	let mut state = 0x0696_5c4a_u64;
+	let mut next = move || {
+		state ^= state << 13;
+		state ^= state >> 7;
+		state ^= state << 17;
+		state
+	};
+	for case in 0..20_000u64 {
+		let location = |next: &mut dyn FnMut() -> u64| {
+			relocation_test_location(1 + next() % 3, (next() % 6) * 4096, 10 + next() % 4)
+		};
+		let mut chain = (0..next() % 10)
+			.map(|_| location(&mut next))
+			.collect::<Vec<_>>();
+		chain.sort_by_key(|location| location.hlc);
+		let mut relocation = KeyRelocation::new(Locality::new(0), false);
+		for _ in 0..next() % 6 {
+			let old = if !chain.is_empty() && next() % 4 != 0 {
+				chain[(next() as usize) % chain.len()]
+			} else {
+				location(&mut next)
+			};
+			let new = match next() % 4 {
+				0 => old,
+				1 if !chain.is_empty() => chain[(next() as usize) % chain.len()],
+				2 => RecordLocation {
+					hlc: old.hlc,
+					..location(&mut next)
+				},
+				_ => location(&mut next),
+			};
+			relocation.pairs.push(RelocationPair {
+				old,
+				new,
+				table_object_id: None,
+			});
+		}
+		for _ in 0..next() % 3 {
+			relocation.removals.push(location(&mut next));
+		}
+		for _ in 0..next() % 3 {
+			relocation.insertions.push(RelocationInsertion {
+				location: location(&mut next),
+				table_object_id: None,
+			});
+		}
+		let mut identity = [0u8; 32];
+		identity[..8].copy_from_slice(&case.to_be_bytes());
+		let key = Identity::new(identity);
+		let mut expected = chain.clone();
+		let expected_refused = reference_relocate_chain(&mut expected, &relocation);
+		if !chain.is_empty() {
+			mgr.key_index.insert((tenant(), key), chain.clone());
+		}
+		let mut scratch =
+			RelocationScratch::try_for_counts(relocation.pairs.len(), relocation.removals.len())
+				.unwrap();
+		let refused = mgr
+			.relocate_indexed_locations(tenant(), key, &relocation, &mut scratch)
+			.to_vec();
+		let actual = mgr
+			.key_index
+			.get(&(tenant(), key))
+			.map(|chain| chain.clone())
+			.unwrap_or_default();
+		assert_eq!(actual, expected, "case {case}: chain");
+		assert_eq!(refused, expected_refused, "case {case}: refused");
+		mgr.key_index.remove(&(tenant(), key));
+	}
+}
+
+/// A refreshed slab relocating one row of a key whose version chain is large
+/// (its other versions on other slabs) needs relocation buffers sized by that
+/// one pair, not by the chain: the scratch prepared for it is never grown.
+#[tokio::test]
+async fn relocating_one_row_of_a_long_chain_stays_within_its_prepared_scratch() {
+	let (_dir, mgr) = fresh_manager().await;
+	let key = Identity::new([0x96; 32]);
+	let mut chain = (0..200_000u64)
+		.map(|index| relocation_test_location(100 + index % 7, index * 64, 10 + index))
+		.collect::<Vec<_>>();
+	let old = relocation_test_location(3, 0, 10 + 100_000);
+	chain[100_000] = old;
+	mgr.key_index.insert((tenant(), key), chain.clone());
+	let new = relocation_test_location(4, 4096, 10 + 100_000);
+	let mut relocation = KeyRelocation::new(Locality::new(0), false);
+	relocation.pairs.push(RelocationPair {
+		old,
+		new,
+		table_object_id: None,
+	});
+	let mut scratch = RelocationScratch::try_for_counts(1, 0).unwrap();
+	let capacities = scratch.capacities_for_test();
+	let chain_bytes = super::tier_budget::vec_bytes::<RecordLocation>(chain.len()).unwrap();
+	assert!(
+		RelocationScratch::bytes_bound(1, 0).unwrap() * 1000 < chain_bytes,
+		"one pair's buffers do not scale with the chain"
+	);
+	assert!(
+		mgr.relocate_indexed_locations(tenant(), key, &relocation, &mut scratch)
+			.is_empty()
+	);
+	assert_eq!(
+		scratch.capacities_for_test(),
+		capacities,
+		"no buffer grew past its prepared capacity"
+	);
+	chain[100_000] = new;
+	assert_eq!(*mgr.key_index.get(&(tenant(), key)).unwrap(), chain);
 }
