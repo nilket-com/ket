@@ -45088,7 +45088,7 @@ async fn an_l2_outage_fences_the_committed_publication_until_l2_recovers() {
 }
 
 fn live_lineages(mgr: &SlabManager) -> u64 {
-	mgr.tier_budget.lineages().snapshot().0.iter().sum()
+	mgr.tier_budget.census().snapshot().iter().sum()
 }
 
 /// The §7 measurement instrument counts each live published layout once: a
@@ -45288,5 +45288,116 @@ async fn concurrent_near_budget_publications_fence_typed_and_all_publish_on_retr
 	assert!(
 		layout_bytes.windows(2).all(|pair| pair[1] <= pair[0]),
 		"churn does not grow live layout bytes: {layout_bytes:?}"
+	);
+}
+
+/// The census counts exactly one sample per slab's published generation:
+/// a build paused before its state install is not a sample; a publication
+/// cancelled there leaves none; a replacement keeps one sample while an
+/// old generation's `Arc` is still held; a retirement removes it.
+#[tokio::test]
+async fn the_lineage_census_counts_only_each_slabs_published_generation() {
+	let fixture = seed_tier_refresh_fixture("s7-census").await;
+	let mgr = &fixture.mgr;
+	let base = live_lineages(mgr);
+
+	// Paused after the build and the durable step, before the state install.
+	let pause = mgr.pause_tier_publication_before_pointer_once();
+	let publication = {
+		let (mgr, pointer) = (mgr.clone(), fixture.rewritten.clone());
+		tokio::spawn(async move { mgr.apply_tier_slab_committed(pointer, None).await })
+	};
+	tokio::time::timeout(Duration::from_secs(60), pause.reached.notified())
+		.await
+		.unwrap();
+	assert_eq!(
+		live_lineages(mgr),
+		base,
+		"a prepared layout is not a sample"
+	);
+	// Cancelled there.
+	publication.abort();
+	let _ = publication.await;
+	assert_eq!(
+		live_lineages(mgr),
+		base,
+		"a cancelled publication leaves none"
+	);
+	// The cancellation came after its durable step, which leaves this
+	// manager fenced by the existing orphan protection: continue on a fresh
+	// one.
+	let fixture = seed_tier_refresh_fixture("s7-census-published").await;
+	let mgr = &fixture.mgr;
+	let base = live_lineages(mgr);
+
+	mgr.apply_tier_slab_committed(fixture.rewritten.clone(), None)
+		.await
+		.unwrap();
+	assert_eq!(
+		live_lineages(mgr),
+		base + 1,
+		"the published generation is one sample"
+	);
+	let held = mgr
+		.state
+		.lock()
+		.await
+		.tier_layouts
+		.get(&fixture.slab_id)
+		.map(|entry| entry.value().clone())
+		.expect("published layout");
+	let l2 = mgr.config.l2.clone().expect("the fixture has L2");
+	let bytes = l2.get(&fixture.rewritten.l2_uri).await.unwrap();
+	let next = TieredSlabPointer {
+		l2_uri: l2.put("s7-census/next", &bytes).await.unwrap(),
+		..fixture.rewritten.clone()
+	};
+	mgr.apply_tier_slab_committed(next.clone(), None)
+		.await
+		.unwrap();
+	assert_eq!(
+		live_lineages(mgr),
+		base + 1,
+		"a replacement keeps one sample, old generation held or not"
+	);
+	drop(held);
+	assert_eq!(live_lineages(mgr), base + 1);
+
+	{
+		let state = mgr.state.lock().await;
+		state.remove_tier_layout(&mgr.tier_budget, fixture.slab_id);
+	}
+	assert_eq!(
+		live_lineages(mgr),
+		base,
+		"a removed generation leaves the census"
+	);
+}
+
+/// A block reset starts the block at the current headroom: a refund before
+/// the first admission does not erase the block's minimum.
+#[test]
+fn a_block_reset_keeps_its_starting_headroom_through_a_refund() {
+	use super::tier_budget::{TierBudgetKind, TierMemoryBudget};
+	let budget = TierMemoryBudget::new(100);
+	let held = budget.try_reserve(TierBudgetKind::Scratch, 90).unwrap();
+	budget.reset_measurement_block();
+	drop(held);
+	let mut out = String::new();
+	crate::metrics::TierMeasurementSource::render_tier_measurement(&*budget, &mut out);
+	assert!(
+		out.contains("wendelon_test_tier_budget_block_min_headroom_bytes 10\n"),
+		"{out}"
+	);
+	assert!(
+		out.contains("wendelon_test_tier_budget_block_peak_bytes 90\n"),
+		"{out}"
+	);
+	drop(budget.try_reserve(TierBudgetKind::Scratch, 20).unwrap());
+	let mut out = String::new();
+	crate::metrics::TierMeasurementSource::render_tier_measurement(&*budget, &mut out);
+	assert!(
+		out.contains("wendelon_test_tier_budget_block_min_headroom_bytes 10\n"),
+		"a later, larger headroom does not raise the minimum: {out}"
 	);
 }

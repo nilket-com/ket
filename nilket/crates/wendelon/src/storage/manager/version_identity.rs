@@ -435,7 +435,7 @@ impl SlabManager {
 		{
 			let state = self.state.lock().await;
 			state.install_tiered(&self.tier_budget, pointer.slab_id, pointer.clone());
-			state.tier_layouts.insert(pointer.slab_id, next);
+			state.install_tier_layout(&self.tier_budget, pointer.slab_id, next);
 		}
 		// The durable transaction succeeded. Mirror it under the publication
 		// gate even if newer authority invalidated this verification flight.

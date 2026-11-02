@@ -1,20 +1,19 @@
 //! The §7 measurement instrument (ADR 0696 fast follow, plan r3 F).
 //! Test-support only: it is never built into production.
 //!
-//! - **Lineage histogram.** Each live published tier layout is one sample:
-//!   its redirects plus superseded entries. Layouts are counted at
-//!   construction and uncounted on drop, so a read at block end describes
-//!   the live published lineages, unweighted (an untiered slab, with no
-//!   layout and no history, is not a sample: leaving it out can only raise
-//!   p99). Fixed memory: a zero bin, 63 log-spaced bins (`bin_upper_edge`,
-//!   2^18 = 262,144 = cap/4 an exact edge at k = 54, 2^21 at k = 63), and an
-//!   overflow bin. p99 is certified by an exact count of lineages above
-//!   262,144, never by a bin, so a bin straddling that bound can never pass;
-//!   the bins are for reporting.
+//! - **Lineage census.** One sample per tiered slab whose layout is
+//!   published: its redirects plus superseded entries, maintained at exactly
+//!   the transitions that change the published generation, so prepared,
+//!   failed, cancelled and superseded generations are never samples. A
+//!   tiered slab still at generation 0 has no history and no layout; it is
+//!   not a sample (omitting zeros can only raise p99, never dilute a fail).
+//!   Fixed memory: a zero bin, 63 log-spaced bins (`bin_upper_edge`;
+//!   2^18 = 262,144 = cap/4 is the exact edge of bin 54, 2^21 of bin 63), and
+//!   an overflow bin, all under one mutex. p99 passes iff at most 1% of the
+//!   population is strictly above 262,144, counted from the bins above bin
+//!   54, so the bound is exact.
 //! - **Block headroom.** The budget's peak of truly held bytes and its
 //!   minimum headroom since the last block reset (`TierMemoryBudget`).
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Bins: [0] zero, [1..=63] log-spaced, [64] overflow.
 pub(super) const LINEAGE_BINS: usize = 65;
@@ -45,79 +44,91 @@ fn bin_of(entries: u64) -> usize {
 		.unwrap_or(LINEAGE_BINS - 1)
 }
 
-/// The live lineages, by history size.
+/// The current lineages, by history size: one sample per tiered slab with a
+/// published layout, maintained only where the published generation of a
+/// slab changes (`ManagerState::install_tier_layout` and
+/// `remove_tier_layout`). One mutex covers every bin, and a replacement
+/// (the old size out, the new size in) is one critical section, so a
+/// snapshot is always one coherent population. The count above cap/4 is
+/// derived from the bins, never kept apart from them.
 #[derive(Debug)]
-pub(super) struct LineageHistogram {
-	bins: [AtomicU64; LINEAGE_BINS],
-	over_quarter_cap: AtomicU64,
+pub(super) struct LineageCensus {
+	bins: std::sync::Mutex<[u64; LINEAGE_BINS]>,
+	/// Test seam: hold the next replacement inside its critical section,
+	/// between taking out the old size and putting in the new one.
+	#[cfg(test)]
+	hold: std::sync::Mutex<
+		Option<(
+			std::sync::mpsc::SyncSender<()>,
+			std::sync::mpsc::Receiver<()>,
+		)>,
+	>,
 }
 
-impl Default for LineageHistogram {
+impl Default for LineageCensus {
 	fn default() -> Self {
 		Self {
-			bins: std::array::from_fn(|_| AtomicU64::new(0)),
-			over_quarter_cap: AtomicU64::new(0),
+			bins: std::sync::Mutex::new([0; LINEAGE_BINS]),
+			#[cfg(test)]
+			hold: std::sync::Mutex::default(),
 		}
 	}
 }
 
-impl LineageHistogram {
-	fn add(&self, entries: u64) {
-		self.bins[bin_of(entries)].fetch_add(1, Ordering::AcqRel);
-		if entries > QUARTER_CAP {
-			self.over_quarter_cap.fetch_add(1, Ordering::AcqRel);
+impl LineageCensus {
+	fn lock(&self) -> std::sync::MutexGuard<'_, [u64; LINEAGE_BINS]> {
+		self.bins
+			.lock()
+			.unwrap_or_else(std::sync::PoisonError::into_inner)
+	}
+
+	/// A slab's published lineage changed from `old` to `new` entries
+	/// (`None`: no published layout).
+	pub(super) fn replace(&self, old: Option<u64>, new: Option<u64>) {
+		#[cfg(test)]
+		let hold = self.hold.lock().unwrap().take();
+		let mut bins = self.lock();
+		if let Some(old) = old {
+			bins[bin_of(old)] -= 1;
+		}
+		#[cfg(test)]
+		if let Some((entered, release)) = hold
+			&& entered.send(()).is_ok()
+		{
+			let _ = release.recv_timeout(std::time::Duration::from_secs(30));
+		}
+		if let Some(new) = new {
+			bins[bin_of(new)] += 1;
 		}
 	}
 
-	fn remove(&self, entries: u64) {
-		self.bins[bin_of(entries)].fetch_sub(1, Ordering::AcqRel);
-		if entries > QUARTER_CAP {
-			self.over_quarter_cap.fetch_sub(1, Ordering::AcqRel);
-		}
+	/// One coherent population.
+	pub(super) fn snapshot(&self) -> [u64; LINEAGE_BINS] {
+		*self.lock()
 	}
 
-	/// The per-bin counts and the exact count above `QUARTER_CAP`.
-	pub(super) fn snapshot(&self) -> ([u64; LINEAGE_BINS], u64) {
-		let mut bins = [0; LINEAGE_BINS];
-		for (bin, count) in bins.iter_mut().zip(&self.bins) {
-			*bin = count.load(Ordering::Acquire);
-		}
-		(bins, self.over_quarter_cap.load(Ordering::Acquire))
-	}
-
-	/// Whether p99 over the live lineages is at most `QUARTER_CAP`: at most
-	/// 1% of them are strictly above it, by the exact count. The harness
-	/// applies the same rule to the exported count.
 	#[cfg(test)]
-	pub(super) fn p99_within_quarter_cap(&self) -> bool {
-		let (bins, over) = self.snapshot();
-		let total: u64 = bins.iter().sum();
-		// More than 1% strictly above the bound fails, whatever the bins say.
-		over * 100 <= total
+	pub(super) fn hold_next_replacement_for_test(
+		&self,
+		entered: std::sync::mpsc::SyncSender<()>,
+		release: std::sync::mpsc::Receiver<()>,
+	) {
+		*self.hold.lock().unwrap() = Some((entered, release));
 	}
 }
 
-/// One live layout's sample, uncounted when the layout drops.
-#[derive(Debug)]
-pub(super) struct LineageSample {
-	histogram: Arc<LineageHistogram>,
-	entries: u64,
+/// The lineages strictly above `QUARTER_CAP`: every bin above the one whose
+/// upper edge is `QUARTER_CAP`.
+pub(super) fn over_quarter_cap(bins: &[u64; LINEAGE_BINS]) -> u64 {
+	bins[bin_of(QUARTER_CAP) + 1..].iter().sum()
 }
 
-impl LineageSample {
-	pub(super) fn new(histogram: &Arc<LineageHistogram>, entries: u64) -> Self {
-		histogram.add(entries);
-		Self {
-			histogram: histogram.clone(),
-			entries,
-		}
-	}
-}
-
-impl Drop for LineageSample {
-	fn drop(&mut self) {
-		self.histogram.remove(self.entries);
-	}
+/// Whether p99 over a population is at most `QUARTER_CAP`: at most 1% of
+/// it is strictly above. The harness applies the same rule to the export.
+#[cfg(test)]
+pub(super) fn p99_within_quarter_cap(bins: &[u64; LINEAGE_BINS]) -> bool {
+	let total: u64 = bins.iter().sum();
+	over_quarter_cap(bins) * 100 <= total
 }
 
 /// The Prometheus text for one manager's instrument (test-support builds
@@ -125,13 +136,13 @@ impl Drop for LineageSample {
 /// above cap/4, and the block's budget peak and minimum headroom.
 pub(super) fn render(
 	out: &mut String,
-	histogram: &LineageHistogram,
+	bins: &[u64; LINEAGE_BINS],
 	peak: u64,
 	min_headroom: u64,
 	limit: u64,
 ) {
 	use std::fmt::Write;
-	let (bins, over) = histogram.snapshot();
+	let over = over_quarter_cap(bins);
 	let _ = writeln!(out, "# TYPE wendelon_test_tier_lineage_entries histogram");
 	let mut cumulative = 0;
 	for (k, count) in bins.iter().enumerate() {
@@ -201,14 +212,14 @@ mod tests {
 	}
 
 	#[test]
-	fn samples_land_in_their_bins_and_leave_on_drop() {
-		let histogram = Arc::new(LineageHistogram::default());
-		let samples = [0, 1, 2, QUARTER_CAP, QUARTER_CAP + 1, 1 << 22]
-			.map(|entries| LineageSample::new(&histogram, entries));
-		let (bins, over) = histogram.snapshot();
+	fn replacements_move_one_sample_and_the_over_count_is_exact() {
+		let census = LineageCensus::default();
+		for entries in [0, 1, 2, QUARTER_CAP, QUARTER_CAP + 1, 1 << 22] {
+			census.replace(None, Some(entries));
+		}
+		let bins = census.snapshot();
 		assert_eq!(bins[0], 1, "zero bin");
 		assert_eq!(bins[bin_of(1)], 2, "1 and 2 share the first bin (edge 2)");
-		assert_eq!(bins[bin_of(QUARTER_CAP)], 1);
 		assert_eq!(
 			bin_of(QUARTER_CAP),
 			54,
@@ -216,24 +227,76 @@ mod tests {
 		);
 		assert_eq!(bin_of(QUARTER_CAP + 1), 55, "one above lands above it");
 		assert_eq!(bins[LINEAGE_BINS - 1], 1, "overflow");
-		assert_eq!(over, 2, "exact count above cap/4");
+		assert_eq!(over_quarter_cap(&bins), 2, "exactly the two above cap/4");
+		assert!(!p99_within_quarter_cap(&bins), "2 of 6 above the bound");
+		census.replace(Some(QUARTER_CAP + 1), Some(3));
+		census.replace(Some(1 << 22), None);
+		let bins = census.snapshot();
+		assert_eq!(bins.iter().sum::<u64>(), 5);
+		assert_eq!(over_quarter_cap(&bins), 0);
+		assert!(p99_within_quarter_cap(&bins));
+	}
+
+	/// A scrape never sees a replacement half done. 101 lineages, 2 above
+	/// the bound, fail; one of the over-bound lineages grows, still over,
+	/// so the population after also fails. Half done (old size out, new
+	/// size not yet in), it would read 100 lineages with 1 over, which
+	/// passes. The scrape, made during the held replacement, waits for it
+	/// and sees the complete population.
+	#[test]
+	fn a_scrape_never_sees_a_replacement_half_done() {
+		use std::sync::mpsc::{channel, sync_channel};
+		use std::time::Duration;
+		let census = std::sync::Arc::new(LineageCensus::default());
+		for _ in 0..99 {
+			census.replace(None, Some(10));
+		}
+		census.replace(None, Some(QUARTER_CAP + 1));
+		census.replace(None, Some(QUARTER_CAP + 2));
 		assert!(
-			!histogram.p99_within_quarter_cap(),
-			"2 of 6 above the bound"
+			!p99_within_quarter_cap(&census.snapshot()),
+			"premise: before fails"
 		);
-		drop(samples);
-		let (bins, over) = histogram.snapshot();
-		assert_eq!(bins.iter().sum::<u64>(), 0);
-		assert_eq!(over, 0);
-		assert!(histogram.p99_within_quarter_cap());
+		let (entered_tx, entered) = sync_channel(1);
+		let (release, release_rx) = sync_channel(1);
+		census.hold_next_replacement_for_test(entered_tx, release_rx);
+		let replacing = {
+			let census = census.clone();
+			std::thread::spawn(move || {
+				census.replace(Some(QUARTER_CAP + 2), Some(QUARTER_CAP + 50));
+			})
+		};
+		entered.recv_timeout(Duration::from_secs(30)).unwrap();
+		let (scraped_tx, scraped) = channel();
+		let scraper = {
+			let census = census.clone();
+			std::thread::spawn(move || {
+				let _ = scraped_tx.send(census.snapshot());
+			})
+		};
+		let during = scraped.recv_timeout(Duration::from_millis(300));
+		release.send(()).unwrap();
+		replacing.join().unwrap();
+		scraper.join().unwrap();
+		let seen = during
+			.or_else(|_| scraped.recv_timeout(Duration::from_secs(30)))
+			.unwrap();
+		assert_eq!(seen.iter().sum::<u64>(), 101, "never the half-done 100");
+		assert_eq!(over_quarter_cap(&seen), 2);
+		assert!(
+			!p99_within_quarter_cap(&seen),
+			"the scrape never certifies a pass"
+		);
 	}
 
 	#[test]
 	fn the_render_is_cumulative_and_ends_at_the_count() {
-		let histogram = Arc::new(LineageHistogram::default());
-		let _samples = [0, 3, 3, 1 << 20].map(|entries| LineageSample::new(&histogram, entries));
+		let census = LineageCensus::default();
+		for entries in [0, 3, 3, 1 << 20] {
+			census.replace(None, Some(entries));
+		}
 		let mut out = String::new();
-		render(&mut out, &histogram, 10, 20, 30);
+		render(&mut out, &census.snapshot(), 10, 20, 30);
 		assert!(out.contains("wendelon_test_tier_lineage_entries_bucket{le=\"0\"} 1\n"));
 		assert!(out.contains("wendelon_test_tier_lineage_entries_bucket{le=\"+Inf\"} 4\n"));
 		assert!(out.contains("wendelon_test_tier_lineage_entries_count 4\n"));

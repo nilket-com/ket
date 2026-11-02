@@ -207,6 +207,7 @@ mod stats_facts;
 use retention_reclaim::{
 	cleanup_retention_rewrite_tmp_files, retention_rewrite_tmp_path, table_drop_rewrite_tmp_path,
 };
+mod backing_install;
 mod disposal_evidence;
 mod redirect_store;
 mod relocation;
@@ -964,41 +965,6 @@ struct ManagerState {
 }
 
 impl ManagerState {
-	/// Install `slab_id`'s sealed backing. Every insertion into `sealed`
-	/// goes through here, so a disposed slab's evidence never outlives a
-	/// backing installed for it again.
-	fn install_sealed(
-		&self,
-		budget: &Arc<tier_budget::TierMemoryBudget>,
-		slab_id: SlabId,
-		slab: Arc<LocalSlabStore>,
-	) {
-		self.disposal_evidence.forget(budget, slab_id);
-		self.sealed.insert(slab_id, slab);
-	}
-
-	/// Install `slab_id`'s tier pointer (see `install_sealed`).
-	fn install_tiered(
-		&self,
-		budget: &Arc<tier_budget::TierMemoryBudget>,
-		slab_id: SlabId,
-		pointer: TieredSlabPointer,
-	) {
-		self.disposal_evidence.forget(budget, slab_id);
-		self.tiered.insert(slab_id, pointer);
-	}
-
-	/// Install `slab_id`'s rehydrated copy (see `install_sealed`).
-	fn install_rehydrated(
-		&self,
-		budget: &Arc<tier_budget::TierMemoryBudget>,
-		slab_id: SlabId,
-		copy: RehydratedSlabState,
-	) {
-		self.disposal_evidence.forget(budget, slab_id);
-		self.rehydrated.insert(slab_id, copy);
-	}
-
 	/// The only writer of `next_slab_id` after open. A released slab id is
 	/// below it and is never allocated again, so the id-keyed release in
 	/// `slab_file_quarantine.rs` can never unlink a newer file.

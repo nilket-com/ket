@@ -1198,7 +1198,7 @@ impl SlabManager {
 			}
 			state.install_tiered(&self.tier_budget, pointer.slab_id, pointer.clone());
 			if let Some(layout) = next_layout {
-				state.tier_layouts.insert(pointer.slab_id, layout);
+				state.install_tier_layout(&self.tier_budget, pointer.slab_id, layout);
 			}
 			state.hot_read_counts.remove(&pointer.slab_id);
 			state.rehydrating.remove(&pointer.slab_id);
@@ -1382,7 +1382,7 @@ impl SlabManager {
 				self.release_slab_file(slab_id);
 			}
 			let _old = state.tiered.remove(&slab_id);
-			let _old = state.tier_layouts.remove(&slab_id);
+			let _old = state.remove_tier_layout(&self.tier_budget, slab_id);
 			state.hot_read_counts.remove(&slab_id);
 			state.rehydrating.remove(&slab_id);
 		}
@@ -1487,7 +1487,7 @@ impl SlabManager {
 				self.release_slab_file(slab_id);
 			}
 			state.tiered.remove(&slab_id);
-			state.tier_layouts.remove(&slab_id);
+			state.remove_tier_layout(&self.tier_budget, slab_id);
 			state.hot_read_counts.remove(&slab_id);
 			state.rehydrating.remove(&slab_id);
 		}

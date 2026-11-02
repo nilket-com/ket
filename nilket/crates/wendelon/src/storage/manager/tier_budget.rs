@@ -113,9 +113,9 @@ pub(super) struct TierMemoryBudget {
 	/// section, after it read the state and before it commits.
 	#[cfg(test)]
 	admission_hold: Mutex<Option<AdmissionHold>>,
-	/// The §7 measurement instrument's live lineages (`tier_measure`).
+	/// The §7 measurement instrument's lineage census (`tier_measure`).
 	#[cfg(any(test, feature = "test-support"))]
-	lineages: Arc<super::tier_measure::LineageHistogram>,
+	census: super::tier_measure::LineageCensus,
 }
 
 #[cfg(test)]
@@ -186,23 +186,27 @@ impl TierMemoryBudget {
 			#[cfg(test)]
 			admission_hold: Mutex::default(),
 			#[cfg(any(test, feature = "test-support"))]
-			lineages: Arc::default(),
+			census: Default::default(),
 		})
 	}
 
-	/// The live lineages of the §7 measurement instrument.
+	/// The lineage census of the §7 measurement instrument.
 	#[cfg(any(test, feature = "test-support"))]
-	pub(super) fn lineages(&self) -> &Arc<super::tier_measure::LineageHistogram> {
-		&self.lineages
+	pub(super) fn census(&self) -> &super::tier_measure::LineageCensus {
+		&self.census
 	}
 
 	/// Start a measurement block: the peak and the minimum headroom restart
 	/// from what is truly held now.
 	#[cfg(any(test, feature = "test-support"))]
 	pub(super) fn reset_measurement_block(&self) {
+		let limit = self.limit();
 		let mut state = self.lock();
-		state.peak = state.used - state.backed;
-		state.min_headroom = None;
+		let held = state.used - state.backed;
+		state.peak = held;
+		// The block starts at its current headroom: a refund before the first
+		// admission must not erase it.
+		state.min_headroom = Some(limit.saturating_sub(held));
 	}
 
 	/// Test seam: hold the next admission (see `admission_hold`).
@@ -937,6 +941,6 @@ impl crate::metrics::TierMeasurementSource for TierMemoryBudget {
 				state.min_headroom.unwrap_or(limit.saturating_sub(held)),
 			)
 		};
-		super::tier_measure::render(out, &self.lineages, peak, min_headroom, limit);
+		super::tier_measure::render(out, &self.census.snapshot(), peak, min_headroom, limit);
 	}
 }

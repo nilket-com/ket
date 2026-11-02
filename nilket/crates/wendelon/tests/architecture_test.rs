@@ -9701,6 +9701,8 @@ fn adr078_manager_source_concatenates_submodules() {
 		basenames,
 		vec![
 			"manager.rs",
+			// ADR 0696: every backing and tier-generation install into the state.
+			"backing_install.rs",
 			"compaction.rs",
 			"counter_visibility.rs",
 			// ADR 0696 (0692 §7): disposal evidence for typed Superseded after disposal.
@@ -11735,10 +11737,12 @@ fn every_backing_install_forgets_disposal_evidence() {
 		let found = manager_occurrences(manifest_dir, |source| source.matches(&needle).count());
 		assert_eq!(
 			found,
-			vec![("manager.rs".to_string(), 1)],
+			vec![("backing_install.rs".to_string(), 1)],
 			"`{needle}` only inside ManagerState::install_{map}"
 		);
-		let source = fs::read_to_string(manifest_dir.join("src/storage/manager.rs")).unwrap();
+		let source =
+			fs::read_to_string(manifest_dir.join("src/storage/manager/backing_install.rs"))
+				.unwrap();
 		let helper = format!("fn install_{map}(");
 		let start = source.find(&helper).expect("the install helper exists");
 		let body = &source[start..start + source[start..].find("\n\t}").unwrap()];
@@ -11748,6 +11752,43 @@ fn every_backing_install_forgets_disposal_evidence() {
 		assert!(
 			forget < body.find(&needle).unwrap(),
 			"install_{map} forgets the evidence before it installs"
+		);
+	}
+}
+
+/// ADR 0696 (0692 §8, plan r3 F): the lineage census counts one sample per
+/// slab's published generation, so every write of `tier_layouts` goes
+/// through `ManagerState::{install_tier_layout, remove_tier_layout}`, the
+/// only places that update it.
+#[test]
+fn every_published_layout_transition_updates_the_lineage_census() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	for (write, helper) in [
+		(".tier_layouts.insert(", "fn install_tier_layout("),
+		(".tier_layouts.remove(", "fn remove_tier_layout("),
+	] {
+		let found = manager_occurrences(manifest_dir, |source| source.matches(write).count());
+		assert_eq!(
+			found,
+			vec![("backing_install.rs".to_string(), 1)],
+			"`{write}` only inside ManagerState::{helper}"
+		);
+		let source =
+			fs::read_to_string(manifest_dir.join("src/storage/manager/backing_install.rs"))
+				.unwrap();
+		let start = source.find(helper).expect("the helper exists");
+		let body = &source[start..start + source[start..].find("\n\t}").unwrap()];
+		assert!(body.contains(write), "{helper} performs the write");
+		assert!(
+			body.contains("census().replace("),
+			"{helper} updates the census"
+		);
+	}
+	for forbidden in [".tier_layouts.clear(", ".tier_layouts.retain("] {
+		assert!(
+			manager_occurrences(manifest_dir, |source| source.matches(forbidden).count())
+				.is_empty(),
+			"no `{forbidden}` bypasses the census"
 		);
 	}
 }
