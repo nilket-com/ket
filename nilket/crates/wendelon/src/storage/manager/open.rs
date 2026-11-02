@@ -765,6 +765,10 @@ impl SlabManager {
 		};
 		let tier_budget =
 			super::tier_budget::TierMemoryBudget::new(config.tier_history_budget_bytes);
+		#[cfg(feature = "test-support")]
+		crate::metrics::global().set_tier_measurement_source(std::sync::Arc::downgrade(
+			&(tier_budget.clone() as std::sync::Arc<dyn crate::metrics::TierMeasurementSource>),
+		));
 		let tier_tokens = super::tier_tokens::TierTokenRegistry::new(&tier_budget)?;
 		let manager = Arc::new(Self {
 			_directory_owner: owner,

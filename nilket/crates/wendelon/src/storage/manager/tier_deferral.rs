@@ -20,6 +20,8 @@ pub(super) enum FenceCause {
 	NoBudget,
 	/// The node budget could not hold the publication's scratch.
 	NoScratch,
+	/// The tier object could not be fetched from L2.
+	L2Unavailable,
 	/// A control snapshot install was in flight.
 	SnapshotInstall,
 	/// An LSM intent named the slab, or its keys were unknown.
@@ -35,7 +37,10 @@ impl FenceCause {
 	/// A cause that clears without any newer committed state, so replaying
 	/// the callback can publish.
 	pub(super) const fn replayable(self) -> bool {
-		matches!(self, Self::IndexGate | Self::NoBudget | Self::NoScratch)
+		matches!(
+			self,
+			Self::IndexGate | Self::NoBudget | Self::NoScratch | Self::L2Unavailable
+		)
 	}
 
 	/// A cause a budget release can clear.
@@ -68,6 +73,34 @@ impl std::fmt::Display for CausedFence {
 }
 
 impl std::error::Error for CausedFence {}
+
+/// An L2 fetch that failed (`tiered_object_from_l2`), keeping its kind: a
+/// committed publication that hits it fences and is replayed later, while
+/// every other reader sees the fetch error it always saw.
+#[derive(Debug)]
+pub(super) struct L2Unavailable(Error);
+
+impl std::fmt::Display for L2Unavailable {
+	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(formatter, "L2 unavailable: {}", self.0)
+	}
+}
+
+impl std::error::Error for L2Unavailable {
+	fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+		Some(&self.0)
+	}
+}
+
+pub(super) fn l2_unavailable(error: Error) -> Error {
+	Error::new(error.kind(), L2Unavailable(error))
+}
+
+pub(super) fn is_l2_unavailable(error: &Error) -> bool {
+	error
+		.get_ref()
+		.is_some_and(|inner| inner.is::<L2Unavailable>())
+}
 
 /// A `Fenced` refusal of `slab_id` with its cause.
 pub(super) fn fenced_error(kind: ErrorKind, slab_id: SlabId, cause: FenceCause) -> Error {

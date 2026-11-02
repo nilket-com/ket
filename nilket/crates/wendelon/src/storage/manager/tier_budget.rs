@@ -113,6 +113,9 @@ pub(super) struct TierMemoryBudget {
 	/// section, after it read the state and before it commits.
 	#[cfg(test)]
 	admission_hold: Mutex<Option<AdmissionHold>>,
+	/// The §7 measurement instrument's live lineages (`tier_measure`).
+	#[cfg(any(test, feature = "test-support"))]
+	lineages: Arc<super::tier_measure::LineageHistogram>,
 }
 
 #[cfg(test)]
@@ -133,6 +136,10 @@ struct BudgetState {
 	backed: u64,
 	/// One entry per token registry slot (`install_backings`).
 	backings: Vec<BackingEntry>,
+	/// The least headroom (limit less what is truly held) any admission
+	/// left since the last block reset; `None` before the first.
+	#[cfg(any(test, feature = "test-support"))]
+	min_headroom: Option<u64>,
 }
 
 /// A registry slot's lendable history credit. `attempt` 0 is empty.
@@ -178,7 +185,24 @@ impl TierMemoryBudget {
 			released: tokio::sync::Notify::new(),
 			#[cfg(test)]
 			admission_hold: Mutex::default(),
+			#[cfg(any(test, feature = "test-support"))]
+			lineages: Arc::default(),
 		})
+	}
+
+	/// The live lineages of the §7 measurement instrument.
+	#[cfg(any(test, feature = "test-support"))]
+	pub(super) fn lineages(&self) -> &Arc<super::tier_measure::LineageHistogram> {
+		&self.lineages
+	}
+
+	/// Start a measurement block: the peak and the minimum headroom restart
+	/// from what is truly held now.
+	#[cfg(any(test, feature = "test-support"))]
+	pub(super) fn reset_measurement_block(&self) {
+		let mut state = self.lock();
+		state.peak = state.used - state.backed;
+		state.min_headroom = None;
 	}
 
 	/// Test seam: hold the next admission (see `admission_hold`).
@@ -367,6 +391,11 @@ impl TierMemoryBudget {
 		state.backed += overlap;
 		state.by_kind[kind.slot()] += bytes;
 		state.peak = state.peak.max(held);
+		#[cfg(any(test, feature = "test-support"))]
+		{
+			let headroom = limit - held;
+			state.min_headroom = Some(state.min_headroom.map_or(headroom, |min| min.min(headroom)));
+		}
 		drop(state);
 		kind.charge(bytes);
 		Some(BudgetReservation {
@@ -893,5 +922,21 @@ mod tests {
 		assert_eq!(checked_sum(&[Some(u64::MAX), Some(1)]), None);
 		assert_eq!(checked_sum(&[Some(1), None]), None);
 		assert_eq!(checked_sum(&[Some(1), Some(2)]), Some(3));
+	}
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl crate::metrics::TierMeasurementSource for TierMemoryBudget {
+	fn render_tier_measurement(&self, out: &mut String) {
+		let limit = self.limit();
+		let (peak, min_headroom) = {
+			let state = self.lock();
+			let held = state.used - state.backed;
+			(
+				state.peak,
+				state.min_headroom.unwrap_or(limit.saturating_sub(held)),
+			)
+		};
+		super::tier_measure::render(out, &self.lineages, peak, min_headroom, limit);
 	}
 }

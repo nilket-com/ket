@@ -338,6 +338,7 @@ impl SlabManager {
 	/// superseded entries and redirects plus one per row, each within the
 	/// per-lineage cap. Refuses typed when the budget or the registry is full.
 	pub async fn reserve_tier_history(&self, tier: TieredSlab) -> std::io::Result<TierProposal> {
+		crate::metrics::global().tier_history_reservations.inc();
 		let slab_id = tier.slab_id;
 		let refuse = || tier_history_refusal(slab_id, TierHistoryShortfall::History);
 		let rows = self.count_record_rows_for_slab(slab_id);
@@ -446,21 +447,21 @@ impl SlabManager {
 	/// counted as a fence; any other refusal is counted as a refused rewrite
 	/// and returned as it is.
 	pub(super) fn observed_publication_error(&self, slab_id: SlabId, error: Error) -> Error {
+		use super::tier_deferral::FenceCause;
 		use crate::metrics::TierPublicationFenceReason as Fence;
 		let fence = match super::tier_budget::tier_history_refusal_of(&error)
 			.map(|refusal| refusal.shortfall)
 		{
-			Some(TierHistoryShortfall::History) => Some(Fence::NoBudget),
-			Some(TierHistoryShortfall::Scratch) => Some(Fence::NoScratch),
+			Some(TierHistoryShortfall::History) => Some((Fence::NoBudget, FenceCause::NoBudget)),
+			Some(TierHistoryShortfall::Scratch) => Some((Fence::NoScratch, FenceCause::NoScratch)),
+			_ if super::tier_deferral::is_l2_unavailable(&error) => {
+				Some((Fence::L2Unavailable, FenceCause::L2Unavailable))
+			}
 			_ => None,
 		};
 		match fence {
-			Some(reason) => {
+			Some((reason, cause)) => {
 				crate::metrics::global().observe_tier_publication_fenced(reason);
-				let cause = match reason {
-					Fence::NoScratch => super::tier_deferral::FenceCause::NoScratch,
-					_ => super::tier_deferral::FenceCause::NoBudget,
-				};
 				super::tier_deferral::fenced_error(ErrorKind::WouldBlock, slab_id, cause)
 			}
 			None => {

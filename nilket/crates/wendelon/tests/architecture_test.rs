@@ -9736,6 +9736,8 @@ fn adr078_manager_source_concatenates_submodules() {
 			// ADR 0696 (0692 §7): typed tier deferrals and their replay.
 			"tier_deferral.rs",
 			"tier_generation.rs",
+			// ADR 0696 (0692 §8): the test-support measurement instrument.
+			"tier_measure.rs",
 			// ADR 0692: tier publication plans pair rows by logical owner.
 			"tier_plan.rs",
 			// ADR 0696 (0692 §7): proposer history tokens.

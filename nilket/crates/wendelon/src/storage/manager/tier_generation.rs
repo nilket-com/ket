@@ -96,6 +96,9 @@ pub(super) struct TierLayout {
 	/// The node budget charge for this generation's maps, released when the
 	/// last holder of the generation drops it. Generation 0 has none.
 	_charge: Option<BudgetReservation>,
+	/// This generation's sample in the §7 measurement instrument.
+	#[cfg(any(test, feature = "test-support"))]
+	_lineage: Option<super::tier_measure::LineageSample>,
 }
 
 impl TierLayout {
@@ -255,11 +258,18 @@ impl TierLayout {
 				overrun.actual, overrun.reserved
 			))
 		})?;
+		#[cfg(any(test, feature = "test-support"))]
+		let lineage = super::tier_measure::LineageSample::new(
+			budget.lineages(),
+			(redirects.len() + superseded.len()) as u64,
+		);
 		Ok(TierLayout {
 			generation: self.generation.saturating_add(1),
 			redirects,
 			superseded,
 			_charge: Some(charge),
+			#[cfg(any(test, feature = "test-support"))]
+			_lineage: Some(lineage),
 		})
 	}
 

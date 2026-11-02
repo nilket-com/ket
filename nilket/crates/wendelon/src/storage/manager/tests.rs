@@ -2335,9 +2335,21 @@ async fn fresh_manager_with_l2(
 	Arc<SlabManager>,
 	Arc<dyn ObjectStore>,
 ) {
+	fresh_manager_with_wrapped_l2(tag, |l2| l2).await
+}
+
+/// `fresh_manager_with_l2`, with the manager's L2 store wrapped by `wrap`.
+async fn fresh_manager_with_wrapped_l2(
+	tag: &str,
+	wrap: impl FnOnce(Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore>,
+) -> (
+	[crate::test_support::TestDir; 2],
+	Arc<SlabManager>,
+	Arc<dyn ObjectStore>,
+) {
 	let l1_dir = fresh_dir(&format!("{tag}-l1"));
 	let l2_root = fresh_dir(&format!("{tag}-l2"));
-	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
+	let l2: Arc<dyn ObjectStore> = wrap(Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap()));
 	let io = spawn_io_thread(64).unwrap();
 	let manager = SlabManager::initialize_new_store(SlabManagerConfig {
 		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
@@ -21301,7 +21313,18 @@ impl TierCommitter for UnpublishedDropCommitter {
 		std::fs::rename(&path, &hidden).unwrap();
 		let apply = self.manager.apply_tier_slab(pointer).await;
 		std::fs::rename(&hidden, &path).unwrap();
-		assert_eq!(apply.unwrap_err().kind(), ErrorKind::NotFound);
+		// An unavailable L2 object fences the publication typed, for retry
+		// (ADR 0696 fast follow item 3); it once failed untyped `NotFound`.
+		let error = apply.unwrap_err();
+		assert_eq!(
+			stale_location(&error).map(|stale| stale.reason),
+			Some(StaleLocationReason::Fenced),
+			"{error}"
+		);
+		assert_eq!(
+			super::tier_deferral::fence_cause(&error),
+			Some(super::tier_deferral::FenceCause::L2Unavailable)
+		);
 		Ok(())
 	}
 
@@ -44043,9 +44066,24 @@ async fn worker_replay_fixture(
 	TieredSlabPointer,
 	Identity,
 ) {
+	worker_replay_fixture_over(tag, |l2| l2).await
+}
+
+/// `worker_replay_fixture`, with the manager's L2 store wrapped by `wrap`.
+async fn worker_replay_fixture_over(
+	tag: &str,
+	wrap: impl FnOnce(Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore>,
+) -> (
+	impl Sized,
+	Arc<SlabManager>,
+	Arc<dyn ObjectStore>,
+	crate::consensus::WendelonStateMachine,
+	TieredSlabPointer,
+	Identity,
+) {
 	use crate::consensus::WendelonStateMachine;
 	use crate::storage::sweeper::ManagerTierObserver;
-	let (dirs, manager, l2) = fresh_manager_with_l2(tag).await;
+	let (dirs, manager, l2) = fresh_manager_with_wrapped_l2(tag, wrap).await;
 	let key = id(0x5e900);
 	manager
 		.append_durable(tenant(), key, hlc(900), b"replayed-row")
@@ -44937,4 +44975,318 @@ async fn a_gc_abort_while_delete_pending_enters_no_disposal_evidence() {
 	);
 	let read = manager.read(old).await;
 	assert!(!is_superseded(&read), "{read:?}");
+}
+
+/// An L2 store whose fetches fail while `down` is set.
+struct OutageObjectStore {
+	inner: Arc<dyn ObjectStore>,
+	down: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl OutageObjectStore {
+	fn check(&self) -> std::io::Result<()> {
+		if self.down.load(std::sync::atomic::Ordering::Acquire) {
+			return Err(Error::new(ErrorKind::ConnectionRefused, "L2 outage (test)"));
+		}
+		Ok(())
+	}
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for OutageObjectStore {
+	fn planned_upload_uri(&self, key: &str) -> std::io::Result<String> {
+		self.inner.planned_upload_uri(key)
+	}
+
+	async fn put(&self, key: &str, bytes: &[u8]) -> std::io::Result<String> {
+		self.inner.put(key, bytes).await
+	}
+
+	async fn head(&self, uri: &str) -> std::io::Result<crate::storage::l2::ObjectMetadata> {
+		self.check()?;
+		self.inner.head(uri).await
+	}
+
+	async fn get_range(&self, uri: &str, range: std::ops::Range<u64>) -> std::io::Result<Bytes> {
+		self.check()?;
+		self.inner.get_range(uri, range).await
+	}
+
+	async fn get_bytes(&self, uri: &str) -> std::io::Result<Bytes> {
+		self.check()?;
+		self.inner.get_bytes(uri).await
+	}
+
+	async fn list(&self, prefix: &str) -> std::io::Result<Vec<crate::storage::l2::ObjectMetadata>> {
+		self.inner.list(prefix).await
+	}
+
+	async fn delete(&self, uri: &str) -> std::io::Result<()> {
+		self.inner.delete(uri).await
+	}
+}
+
+/// A committed publication that cannot fetch its object from L2 fences typed
+/// (`Fenced(L2Unavailable)`, counted as `l2_unavailable`) and stays unpublished
+/// while L2 is down; once L2 recovers, the authority worker replays the
+/// callback on its own (its backoff is the resume, as no release event exists
+/// for L2), with no sweeper and no manual wake.
+#[tokio::test]
+async fn an_l2_outage_fences_the_committed_publication_until_l2_recovers() {
+	use super::tier_deferral::{FenceCause, TierDeferral};
+	let down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+	let wrap = {
+		let down = down.clone();
+		move |inner: Arc<dyn ObjectStore>| -> Arc<dyn ObjectStore> {
+			Arc::new(OutageObjectStore { inner, down })
+		}
+	};
+	let (_keep, manager, l2, mut target, old, _key) =
+		worker_replay_fixture_over("s7-l2-outage", wrap).await;
+	let bytes = l2.get(&old.l2_uri).await.unwrap();
+	let replacement = TieredSlabPointer {
+		l2_uri: l2.put("s7-l2-outage/p1", &bytes).await.unwrap(),
+		..old.clone()
+	};
+	manager.wait_tier_authority_ready().await.unwrap();
+	let fenced = fenced_counter("l2_unavailable");
+	down.store(true, std::sync::atomic::Ordering::Release);
+	commit_tier_entry(&mut target, &replacement, 920).await;
+	assert_eq!(
+		manager
+			.unapplied_tier_pointers
+			.get(&old.slab_id)
+			.map(|entry| entry.value().clone()),
+		Some(TierDeferral::fenced(
+			replacement.clone(),
+			FenceCause::L2Unavailable,
+			Some(920)
+		)),
+		"the outage fences the committed publication typed"
+	);
+	assert!(
+		fenced_counter("l2_unavailable") > fenced,
+		"the fence is counted"
+	);
+	assert!(
+		eventually(60, async || replay_failures(&manager) >= 2).await,
+		"the worker keeps retrying while L2 is down: {}",
+		replay_diagnostics(&manager, old.slab_id)
+	);
+	assert_eq!(manager.tier_pointer(old.slab_id).await, Some(old.clone()));
+	down.store(false, std::sync::atomic::Ordering::Release);
+	assert!(
+		eventually(60, async || manager
+			.tier_pointer(old.slab_id)
+			.await
+			.as_ref() == Some(&replacement))
+		.await,
+		"after L2 recovers the worker publishes the replayed callback: {}",
+		replay_diagnostics(&manager, old.slab_id)
+	);
+	assert!(manager.unapplied_tier_pointers.get(&old.slab_id).is_none());
+}
+
+fn live_lineages(mgr: &SlabManager) -> u64 {
+	mgr.tier_budget.lineages().snapshot().0.iter().sum()
+}
+
+/// The §7 measurement instrument counts each live published layout once: a
+/// publication carrying history adds one lineage, a republication of the
+/// same slab replaces it, and a block reset restarts the block's peak and
+/// headroom, which render with the histogram.
+#[tokio::test]
+async fn the_lineage_instrument_counts_each_live_published_layout_once() {
+	let fixture = seed_tier_refresh_fixture("s7-instrument").await;
+	let mgr = &fixture.mgr;
+	let before = live_lineages(mgr);
+	mgr.apply_tier_slab_committed(fixture.rewritten.clone(), None)
+		.await
+		.unwrap();
+	assert_eq!(
+		live_lineages(mgr),
+		before + 1,
+		"one live lineage for the slab"
+	);
+	mgr.reset_tier_measurement_block();
+	let mut out = String::new();
+	crate::metrics::TierMeasurementSource::render_tier_measurement(&*mgr.tier_budget, &mut out);
+	assert!(
+		out.contains("wendelon_test_tier_lineage_entries_count "),
+		"{out}"
+	);
+	assert!(out.contains("wendelon_test_tier_budget_block_min_headroom_bytes "));
+	assert!(out.contains(&format!(
+		"wendelon_test_tier_budget_limit_bytes {}",
+		mgr.tier_budget.limit()
+	)));
+}
+
+/// Near-budget concurrency, abort and retry accounting, churn and peak
+/// live bytes (ADR 0696 fast follow controls). Eight tiered slabs are
+/// rewritten concurrently under a limit that holds about two publications:
+/// every apply publishes or fences typed on the budget, sweeper passes
+/// replay the fences until all publish, the peak never exceeds the limit,
+/// no scratch or token bytes remain, and the charged total is the registry
+/// plus the live layouts. Three churn rounds then keep exactly eight live
+/// lineages and stable layout bytes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_near_budget_publications_fence_typed_and_all_publish_on_retry() {
+	use super::tier_budget::TierBudgetKind;
+	use super::tier_deferral::DeferralOutcome;
+	let (_dirs, mgr, l2) = fresh_manager_with_l2("s7-near-budget").await;
+	let mut olds = Vec::new();
+	for slab in 0..8u64 {
+		for row in 0..4u64 {
+			mgr.append_durable(
+				tenant(),
+				id(0x7b00 + slab * 16 + row),
+				hlc(100 + slab * 16 + row),
+				format!("near-budget-{slab}-{row}").as_bytes(),
+			)
+			.await
+			.unwrap();
+		}
+		olds.push(tier_kv_slab(&mgr, &l2, &format!("s7-near-budget/s{slab}-0")).await);
+	}
+	let replacement = |old: &TieredSlabPointer, round: u64| {
+		let (l2, old) = (l2.clone(), old.clone());
+		async move {
+			let bytes = l2.get(&old.l2_uri).await.unwrap();
+			TieredSlabPointer {
+				l2_uri: l2
+					.put(
+						&format!("s7-near-budget/s{}-{round}", old.slab_id.get()),
+						&bytes,
+					)
+					.await
+					.unwrap(),
+				..old
+			}
+		}
+	};
+	// One publication's need, measured on the first slab alone.
+	let floor = mgr.tier_budget.used();
+	mgr.tier_budget.reset_peak_for_test();
+	let first = replacement(&olds[0], 1).await;
+	mgr.apply_tier_slab_committed(first.clone(), Some(2000))
+		.await
+		.unwrap();
+	let need = mgr.tier_budget.peak() - floor;
+	let mut current = vec![first];
+	for old in &olds[1..] {
+		current.push(old.clone());
+	}
+
+	// Round 1 for the other seven, concurrently, under about two needs.
+	let base = mgr.tier_budget.used();
+	let limit = base + 2 * need + need / 2;
+	mgr.tier_budget.set_limit_for_test(limit);
+	mgr.tier_budget.reset_peak_for_test();
+	let mut wanted = Vec::new();
+	for old in &olds[1..] {
+		wanted.push(replacement(old, 1).await);
+	}
+	let applies = wanted
+		.iter()
+		.enumerate()
+		.map(|(i, pointer)| {
+			let (mgr, pointer) = (mgr.clone(), pointer.clone());
+			tokio::spawn(async move {
+				mgr.apply_tier_slab_committed(pointer, Some(2001 + i as u64))
+					.await
+			})
+		})
+		.collect::<Vec<_>>();
+	let mut fenced = 0;
+	for (apply, pointer) in applies.into_iter().zip(&wanted) {
+		if let Err(error) = apply.await.unwrap() {
+			fenced += 1;
+			let outcome = mgr
+				.unapplied_tier_pointers
+				.get(&pointer.slab_id)
+				.map(|entry| entry.value().outcome);
+			assert!(
+				matches!(outcome, Some(DeferralOutcome::Fenced(cause)) if cause.waits_for_budget()),
+				"a near-budget apply fences typed on the budget: {error}, {outcome:?}"
+			);
+		}
+	}
+	eprintln!(
+		"near budget: need {need}, limit headroom {}, fenced {fenced} of 7",
+		limit - base
+	);
+	assert!(
+		fenced > 0,
+		"premise: the limit fences some of the concurrent publications"
+	);
+	for _ in 0..20 {
+		let pending = wanted
+			.iter()
+			.filter(|pointer| mgr.unapplied_tier_pointers.contains_key(&pointer.slab_id))
+			.cloned()
+			.collect::<Vec<_>>();
+		if pending.is_empty() {
+			break;
+		}
+		for pointer in pending {
+			let _ = sweep_with_committed(&mgr, pointer.slab_id, Some(pointer.clone())).await;
+		}
+	}
+	for pointer in &wanted {
+		assert_eq!(
+			mgr.tier_pointer(pointer.slab_id).await.as_ref(),
+			Some(pointer),
+			"every fenced publication is published on retry"
+		);
+	}
+	assert!(
+		mgr.tier_budget.peak() <= limit,
+		"the peak never exceeds the limit: {} > {limit}",
+		mgr.tier_budget.peak()
+	);
+	assert_eq!(
+		mgr.tier_budget.used_by(TierBudgetKind::Scratch),
+		0,
+		"no scratch left"
+	);
+	assert_eq!(
+		mgr.tier_budget.used_by(TierBudgetKind::Token),
+		0,
+		"no token left"
+	);
+	let accounted = mgr.tier_budget.used_by(TierBudgetKind::Registry)
+		+ mgr.tier_budget.used_by(TierBudgetKind::Layout);
+	assert_eq!(
+		mgr.tier_budget.used(),
+		accounted,
+		"registry plus live layouts"
+	);
+	for (pointer, slot) in wanted.into_iter().zip(&mut current[1..]) {
+		*slot = pointer;
+	}
+
+	// Churn: three more rounds, sequential, at the default budget.
+	mgr.tier_budget
+		.set_limit_for_test(super::tier_budget::DEFAULT_TIER_BUDGET_BYTES);
+	let mut layout_bytes = Vec::new();
+	for round in 2..5u64 {
+		for (i, pointer) in current.iter_mut().enumerate() {
+			let next = replacement(pointer, round).await;
+			mgr.apply_tier_slab_committed(next.clone(), Some(3000 + round * 10 + i as u64))
+				.await
+				.unwrap();
+			*pointer = next;
+		}
+		assert_eq!(
+			live_lineages(&mgr),
+			8,
+			"round {round}: one live lineage per slab"
+		);
+		layout_bytes.push(mgr.tier_budget.used_by(TierBudgetKind::Layout));
+	}
+	assert!(
+		layout_bytes.windows(2).all(|pair| pair[1] <= pair[0]),
+		"churn does not grow live layout bytes: {layout_bytes:?}"
+	);
 }

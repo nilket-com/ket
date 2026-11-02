@@ -214,6 +214,8 @@ pub(crate) mod tier_authority;
 mod tier_budget;
 mod tier_deferral;
 mod tier_generation;
+#[cfg(any(test, feature = "test-support"))]
+mod tier_measure;
 mod tier_tokens;
 pub use tier_tokens::{TierProposal, TierSubmission};
 mod tier_plan;

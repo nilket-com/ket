@@ -910,6 +910,7 @@ impl SlabManager {
 		let already_published = old_pointer.as_ref() == Some(&pointer);
 		let result = match self.require_private_tier_apply_authority(pointer.slab_id) {
 			Ok(()) => {
+				crate::metrics::global().tier_observer_publications.inc();
 				self.publish_committed_tier_pointer(
 					&pointer,
 					old_pointer,
@@ -1697,7 +1698,10 @@ impl SlabManager {
 				),
 			)
 		})?;
-		let blob = l2.get(&pointer.l2_uri).await?;
+		let blob = l2
+			.get(&pointer.l2_uri)
+			.await
+			.map_err(super::tier_deferral::l2_unavailable)?;
 		validate_tiered_blob(pointer, &blob)?;
 		decode_tiered_blob(self.config.crypto.as_ref(), pointer, &blob, evidence)
 	}

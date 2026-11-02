@@ -139,6 +139,24 @@ const COMPRESSION_RATIO_MILLI_BUCKETS: &[u64] = &[250, 500, 750, 1000, 1250, 150
 const PK_ADMISSION_VISIBILITY_BUCKETS_MICROS: &[u64] =
 	&[1, 2, 5, 10, 25, 50, 100, 250, 500, 1_000, 2_500, 5_000];
 
+/// A source of the §7 measurement instrument (test-support builds only):
+/// the manager's budget renders its block headroom and lineage histogram.
+#[cfg(any(test, feature = "test-support"))]
+pub trait TierMeasurementSource: Send + Sync {
+	fn render_tier_measurement(&self, out: &mut String);
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl MetricsRegistry {
+	/// Render `source`'s instrument with every scrape from now on.
+	pub fn set_tier_measurement_source(&self, source: std::sync::Weak<dyn TierMeasurementSource>) {
+		*self
+			.tier_measurement
+			.lock()
+			.unwrap_or_else(std::sync::PoisonError::into_inner) = Some(source);
+	}
+}
+
 pub fn global() -> &'static MetricsRegistry {
 	static METRICS: OnceLock<MetricsRegistry> = OnceLock::new();
 	METRICS.get_or_init(MetricsRegistry::default)
@@ -2801,6 +2819,15 @@ pub struct MetricsRegistry {
 	tier_rewrite_refusals: StaticLabelCounters,
 	tier_publication_fenced: StaticLabelCounters,
 	pub relocation_redirects_skipped: Counter,
+	/// Proposer rewrite attempts that reached `reserve_tier_history` (the
+	/// §8 population P, ADR 0696).
+	pub tier_history_reservations: Counter,
+	/// Observer tier publication attempts, from committed callbacks and
+	/// their replays (the §8 population O, ADR 0696).
+	pub tier_observer_publications: Counter,
+	/// This process's §7 measurement instrument (test-support builds only).
+	#[cfg(any(test, feature = "test-support"))]
+	tier_measurement: std::sync::Mutex<Option<std::sync::Weak<dyn TierMeasurementSource>>>,
 	pub tier_history_bytes: Gauge,
 	pub relocation_redirect_bytes: Gauge,
 	pub storage_tier_snapshot_reconciliation_pending: Gauge,
@@ -3147,6 +3174,10 @@ impl Default for MetricsRegistry {
 			tier_rewrite_refusals: StaticLabelCounters::default(),
 			tier_publication_fenced: StaticLabelCounters::default(),
 			relocation_redirects_skipped: Counter::default(),
+			tier_history_reservations: Counter::default(),
+			tier_observer_publications: Counter::default(),
+			#[cfg(any(test, feature = "test-support"))]
+			tier_measurement: std::sync::Mutex::new(None),
 			tier_history_bytes: Gauge::default(),
 			relocation_redirect_bytes: Gauge::default(),
 			storage_tier_snapshot_reconciliation_pending: Gauge::default(),
@@ -5507,6 +5538,28 @@ impl MetricsRegistry {
 			"Optional cross-slab redirect maps skipped for want of budget (ADR 0692 §7).",
 			self.relocation_redirects_skipped.get(),
 		);
+		render_counter(
+			&mut out,
+			"wendelon_tier_history_reservations_total",
+			"Proposer tier rewrite attempts that reached their history reservation (ADR 0692 §8).",
+			self.tier_history_reservations.get(),
+		);
+		render_counter(
+			&mut out,
+			"wendelon_tier_observer_publications_total",
+			"Observer tier publication attempts, committed callbacks and replays (ADR 0692 §8).",
+			self.tier_observer_publications.get(),
+		);
+		#[cfg(any(test, feature = "test-support"))]
+		if let Some(source) = self
+			.tier_measurement
+			.lock()
+			.unwrap_or_else(std::sync::PoisonError::into_inner)
+			.as_ref()
+			.and_then(std::sync::Weak::upgrade)
+		{
+			source.render_tier_measurement(&mut out);
+		}
 		render_gauge(
 			&mut out,
 			"wendelon_tier_history_bytes",
