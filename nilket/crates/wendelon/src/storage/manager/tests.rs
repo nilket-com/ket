@@ -45504,13 +45504,13 @@ impl ControlCluster {
 	}
 }
 
-/// Multinode: a follower's observer funds its own apply. The proposer's
-/// token lives on another node and is resolved there; follower node 2, its
-/// budget exhausted, fences the committed pointer typed on the budget, and
-/// its own worker publishes it once a release makes room, with no sweeper
-/// and no manual wake.
+/// Multinode: a follower funds its own apply. The leader commits the pointer;
+/// follower node 2, with its budget exhausted, fences it typed on the budget
+/// with the entry's provenance, and its own worker publishes it once a
+/// release makes room, with no sweeper and no manual wake. (No proposer token
+/// exists in this history: see the released-token control.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_followers_apply_without_the_proposers_token_fences_and_publishes_on_release() {
+async fn a_followers_apply_funds_itself_fences_on_its_budget_and_publishes_on_release() {
 	use super::tier_budget::TierBudgetKind;
 	use super::tier_deferral::DeferralOutcome;
 	let (_dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
@@ -45551,11 +45551,71 @@ async fn a_followers_apply_without_the_proposers_token_fences_and_publishes_on_r
 	);
 }
 
-/// Multinode: across a leader change, a newer committed pointer wins over
-/// an older fenced one. Follower node 2 fences P1 on the index gate; the
-/// leader moves to node 3, which commits P2; node 2 publishes P2, never P1.
+/// Multinode: a delayed apply after its proposer's token was released. The
+/// manager is on leader node 1 and reserves a real proposer token for P1;
+/// `RaftCommitter` submits it while node 1's observer is fenced on the index
+/// gate. The entry commits, `client_write` returns, and the committer's
+/// `applied()` releases the token: the registry holds nothing, and P1 is
+/// still unpublished. Only then is the gate released, and the delayed apply
+/// (the worker's replay of that callback) publishes P1 with its own funding.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn across_a_leader_change_a_newer_committed_pointer_wins_over_an_older_fence() {
+async fn a_delayed_apply_after_its_proposers_token_was_released_funds_itself() {
+	use crate::storage::TierCommitter;
+	let (_dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let cluster = control_cluster(1, &mgr).await;
+	cluster.commit_tier(1, &old).await;
+	let bytes = l2.get(&old.l2_uri).await.unwrap();
+	let p1 = TieredSlabPointer {
+		l2_uri: l2.put("tier/s7-released-token.wnd", &bytes).await.unwrap(),
+		..old.clone()
+	};
+	let proposal = mgr.reserve_tier_history(b10_tier(&p1)).await.unwrap();
+	let (slots, bytes_held) = mgr.tier_tokens.held();
+	assert_eq!(slots, 1, "premise: a real proposer token is reserved");
+	assert!(bytes_held > 0);
+	let gate = mgr.hold_index_write_gate_for_test().await;
+	crate::storage::RaftCommitter::new(cluster.nodes[0].clone())
+		.commit_tier_slab(proposal)
+		.await
+		.unwrap();
+	assert_eq!(
+		mgr.tier_tokens.held(),
+		(0, 0),
+		"the committed proposal's token is released"
+	);
+	assert!(
+		mgr.unapplied_tier_pointers
+			.get(&old.slab_id)
+			.is_some_and(|entry| entry.value().fences(&p1)),
+		"premise: the apply is still deferred"
+	);
+	assert_eq!(
+		mgr.tier_pointer(old.slab_id).await,
+		Some(old.clone()),
+		"premise: nothing published before the release"
+	);
+	drop(gate);
+	assert!(
+		eventually(60, async || mgr.tier_pointer(old.slab_id).await.as_ref()
+			== Some(&p1))
+		.await,
+		"the delayed apply publishes with its own funding: {}",
+		replay_diagnostics(&mgr, old.slab_id)
+	);
+	assert_eq!(mgr.tier_tokens.held(), (0, 0));
+}
+
+/// Multinode: across a leader change, an older replay never publishes over
+/// newer committed authority. Node 2 fences P1 on the index gate; its
+/// worker's replay is held just before re-running the callback (its
+/// canonical check passed for P1, its tier lock held). The leader moves to
+/// node 3, which commits P2: node 2's committed state names P2 (read without
+/// waiting), while node 2's own P2 callback waits behind the held replay.
+/// Released, the replay refuses at its canonical recheck, and P2's callback
+/// publishes: the layout generation advances exactly once, so P1 was never
+/// installed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn across_a_leader_change_an_older_replay_never_publishes_over_newer_authority() {
 	let (_dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
 	let cluster = control_cluster(2, &mgr).await;
 	cluster.commit_tier(1, &old).await;
@@ -45568,7 +45628,19 @@ async fn across_a_leader_change_a_newer_committed_pointer_wins_over_an_older_fen
 		l2_uri: l2.put("tier/s7-leader-p2.wnd", &bytes).await.unwrap(),
 		..old.clone()
 	};
-	*mgr.replay_probe.backoff.lock().unwrap() = Some(Duration::from_secs(3600));
+	let generation = || async {
+		mgr.state
+			.lock()
+			.await
+			.tier_layouts
+			.get(&old.slab_id)
+			.map_or(0, |layout| layout.generation)
+	};
+	let before = generation().await;
+	let entered = Arc::new(tokio::sync::Semaphore::new(0));
+	let release = Arc::new(tokio::sync::Semaphore::new(0));
+	*mgr.replay_probe.before_replay_apply.lock().unwrap() =
+		Some((entered.clone(), release.clone()));
 	let gate = mgr.hold_index_write_gate_for_test().await;
 	let p1_index = cluster.commit_tier(1, &p1).await;
 	assert!(
@@ -45579,9 +45651,32 @@ async fn across_a_leader_change_a_newer_committed_pointer_wins_over_an_older_fen
 			),
 		"premise: node 2 fenced P1"
 	);
-	cluster.elect(3).await;
 	drop(gate);
-	let p2_index = cluster.commit_tier(3, &p2).await;
+	tokio::time::timeout(Duration::from_secs(60), entered.acquire())
+		.await
+		.expect("node 2's replay of P1 passed its canonical check and holds")
+		.unwrap()
+		.forget();
+	cluster.elect(3).await;
+	let commit = {
+		let node = cluster.nodes[2].clone();
+		let p2 = p2.clone();
+		tokio::spawn(async move {
+			node.client_write(crate::consensus::WendelonRequest::TierSlab(b10_tier(&p2)))
+				.await
+				.map(|response| response.log_id.index)
+		})
+	};
+	assert!(
+		eventually(60, async || mgr
+			.try_canonical_tier_pointer(old.slab_id)
+			.is_some_and(|committed| committed.as_ref() == Some(&p2)))
+		.await,
+		"node 2's committed state names P2 while its replay of P1 holds"
+	);
+	assert_eq!(mgr.tier_pointer(old.slab_id).await, Some(old.clone()));
+	release.add_permits(1);
+	let p2_index = commit.await.unwrap().unwrap();
 	assert!(p2_index > p1_index);
 	assert!(
 		eventually(60, async || mgr.tier_pointer(old.slab_id).await.as_ref()
@@ -45590,11 +45685,10 @@ async fn across_a_leader_change_a_newer_committed_pointer_wins_over_an_older_fen
 		"node 2 publishes the newer pointer: {}",
 		replay_diagnostics(&mgr, old.slab_id)
 	);
-	tokio::time::sleep(Duration::from_millis(500)).await;
 	assert_eq!(
-		mgr.tier_pointer(old.slab_id).await,
-		Some(p2),
-		"the older fence is never published after the newer pointer"
+		generation().await,
+		before + 1,
+		"one publication: the older replay never installed P1"
 	);
 	assert!(mgr.unapplied_tier_pointers.get(&old.slab_id).is_none());
 }
@@ -45649,14 +45743,17 @@ async fn single_voter(
 	(raft, log, network)
 }
 
-/// Multinode: restart while fenced. A node fences committed P1 on the
-/// index gate, then stops (its deferral is volatile and lost). After it
-/// reopens on the same store and log, its committed state already includes
-/// P1, and the authoritative reconcile pass (the sweeper's) converges the
-/// manager to P1 from that committed state: published, nothing deferred,
-/// rows served.
+/// Multinode: restart while fenced. A node fences committed P1 on the index
+/// gate. With the gate still held, its authority worker is closed and
+/// joined (no replay can run) and its voter shut down; the volatile
+/// deferral is lost with the manager. After reopening on the same store and
+/// log, the premises are asserted: local P0, committed P1, no deferral,
+/// readiness closed. The authoritative reconcile pass (the sweeper's) then
+/// converges the node to P1 from recovered committed state: published,
+/// nothing deferred, readiness open, the row served.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_node_restarted_while_fenced_converges_to_its_committed_pointer() {
+	use crate::storage::ownership::StorageWorker;
 	let l1_dir = fresh_dir("s7-restart-fenced-l1");
 	let l2_dir = fresh_dir("s7-restart-fenced-l2");
 	let wal_dir = fresh_dir("s7-restart-fenced-wal");
@@ -45682,18 +45779,12 @@ async fn a_node_restarted_while_fenced_converges_to_its_committed_pointer() {
 		..old.clone()
 	};
 	let (raft, log, _network) = single_voter(&wal_dir, &mgr, true).await;
-	for pointer in [&old] {
-		raft.client_write(crate::consensus::WendelonRequest::TierSlab(b10_tier(
-			pointer,
-		)))
+	raft.client_write(crate::consensus::WendelonRequest::TierSlab(b10_tier(&old)))
 		.await
 		.unwrap();
-	}
 	assert_eq!(mgr.tier_pointer(old.slab_id).await, Some(old.clone()));
-	*mgr.replay_probe.backoff.lock().unwrap() = Some(Duration::from_secs(3600));
 	let gate = mgr.hold_index_write_gate_for_test().await;
-	let committed = raft
-		.client_write(crate::consensus::WendelonRequest::TierSlab(b10_tier(&p1)))
+	raft.client_write(crate::consensus::WendelonRequest::TierSlab(b10_tier(&p1)))
 		.await
 		.unwrap();
 	assert!(
@@ -45702,47 +45793,48 @@ async fn a_node_restarted_while_fenced_converges_to_its_committed_pointer() {
 			.is_some_and(|entry| entry.value().fences(&p1)),
 		"premise: the node fenced P1"
 	);
-	drop(gate);
+	assert_eq!(
+		mgr.tier_pointer(old.slab_id).await,
+		Some(old.clone()),
+		"premise before the stop: local P0"
+	);
+	// Stop with the dependency still fenced: no replay can publish P1.
+	mgr.tier_authority.close_and_join().await.unwrap();
 	raft.shutdown().await.unwrap();
+	drop(gate);
 	drop((raft, log));
-	mgr.tier_authority.stop();
 	drop(mgr);
 
 	let reopened = SlabManager::open(reopen_test_config(&l1_dir, io, l2, crypto))
 		.await
 		.unwrap();
-	let (raft, _log, _network) = single_voter(&wal_dir, &reopened, false).await;
-	raft.wait(Some(Duration::from_secs(60)))
-		.applied_index_at_least(Some(committed.log_id.index), "recovered through P1")
-		.await
-		.unwrap();
-	let committed_pointer = reopened
-		.try_canonical_tier_pointer(old.slab_id)
-		.expect("the observer bound the committed source")
-		.expect("committed state names the slab");
+	let (_raft, _log, _network) = single_voter(&wal_dir, &reopened, false).await;
 	assert_eq!(
-		committed_pointer, p1,
-		"premise: committed state includes P1"
+		reopened.tier_pointer(old.slab_id).await,
+		Some(old.clone()),
+		"premise after the reopen: local P0"
 	);
-	eprintln!(
-		"after restart: local {:?}, deferral {:?}, readiness {:?}",
-		reopened.tier_pointer(old.slab_id).await.map(|p| p.l2_uri),
-		reopened
-			.unapplied_tier_pointers
-			.get(&old.slab_id)
-			.map(|entry| entry.value().clone()),
-		reopened.tier_authority_readiness_reason()
+	assert_eq!(
+		reopened.try_canonical_tier_pointer(old.slab_id),
+		Some(Some(p1.clone())),
+		"premise after the reopen: committed state names P1"
 	);
-	let swept = sweep_with_committed(&reopened, old.slab_id, Some(p1.clone())).await;
-	eprintln!("reconcile pass: {swept:?}");
 	assert!(
-		eventually(60, async || reopened
-			.tier_pointer(old.slab_id)
-			.await
-			.as_ref() == Some(&p1))
-		.await,
-		"the restarted node converges to its committed pointer"
+		reopened.unapplied_tier_pointers.get(&old.slab_id).is_none(),
+		"premise after the reopen: no volatile deferral survived"
 	);
+	assert!(
+		reopened.tier_authority_readiness_reason().is_some(),
+		"premise after the reopen: readiness closed"
+	);
+	assert_eq!(
+		sweep_with_committed(&reopened, old.slab_id, Some(p1.clone()))
+			.await
+			.unwrap(),
+		(true, None),
+		"the authoritative reconcile pass publishes P1"
+	);
+	assert_eq!(reopened.tier_pointer(old.slab_id).await, Some(p1));
 	assert!(reopened.unapplied_tier_pointers.get(&old.slab_id).is_none());
 	tokio::time::timeout(
 		Duration::from_secs(60),

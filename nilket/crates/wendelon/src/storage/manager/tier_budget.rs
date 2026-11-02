@@ -704,6 +704,22 @@ pub(super) fn bounded_set_insert<K: Eq + std::hash::Hash>(
 	Ok(set.insert(key))
 }
 
+#[cfg(any(test, feature = "test-support"))]
+impl crate::metrics::TierMeasurementSource for TierMemoryBudget {
+	fn render_tier_measurement(&self, out: &mut String) {
+		let limit = self.limit();
+		let (peak, min_headroom) = {
+			let state = self.lock();
+			let held = state.used - state.backed;
+			(
+				state.peak,
+				state.min_headroom.unwrap_or(limit.saturating_sub(held)),
+			)
+		};
+		super::tier_measure::render(out, &self.census.snapshot(), peak, min_headroom, limit);
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -926,21 +942,5 @@ mod tests {
 		assert_eq!(checked_sum(&[Some(u64::MAX), Some(1)]), None);
 		assert_eq!(checked_sum(&[Some(1), None]), None);
 		assert_eq!(checked_sum(&[Some(1), Some(2)]), Some(3));
-	}
-}
-
-#[cfg(any(test, feature = "test-support"))]
-impl crate::metrics::TierMeasurementSource for TierMemoryBudget {
-	fn render_tier_measurement(&self, out: &mut String) {
-		let limit = self.limit();
-		let (peak, min_headroom) = {
-			let state = self.lock();
-			let held = state.used - state.backed;
-			(
-				state.peak,
-				state.min_headroom.unwrap_or(limit.saturating_sub(held)),
-			)
-		};
-		super::tier_measure::render(out, &self.census.snapshot(), peak, min_headroom, limit);
 	}
 }

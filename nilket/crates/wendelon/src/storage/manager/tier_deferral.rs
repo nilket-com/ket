@@ -309,6 +309,16 @@ impl SlabManager {
 		if self.retired_tier_slabs.contains(&slab_id) {
 			return TierReplay::KeptFenced;
 		}
+		#[cfg(test)]
+		{
+			let hold = self.replay_probe.before_replay_apply.lock().unwrap().take();
+			if let Some((entered, release)) = hold {
+				entered.add_permits(1);
+				if let Ok(permit) = release.acquire().await {
+					permit.forget();
+				}
+			}
+		}
 		let result = self
 			.apply_tier_slab_under_publication_lock_as(deferral.pointer, Some(index), epoch, true)
 			.await;
@@ -359,6 +369,10 @@ pub(super) struct ReplayProbe {
 	/// held before the attempt and freed during it (as a consumed token is).
 	pub(super) free_during_attempt:
 		std::sync::Mutex<Option<(SlabId, super::tier_budget::BudgetReservation)>>,
+	/// Hold the next replay after its canonical check passed, under its tier
+	/// publication lock, just before it re-runs the callback.
+	pub(super) before_replay_apply:
+		std::sync::Mutex<Option<(Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>>,
 	/// Hold the worker after an attempt's outcome, before its schedule.
 	pub(super) after_outcome:
 		std::sync::Mutex<Option<(Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>>,

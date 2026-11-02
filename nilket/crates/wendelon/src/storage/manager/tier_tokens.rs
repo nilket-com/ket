@@ -660,7 +660,8 @@ mod tests {
 			(2, 160),
 			"backing keeps the token charged in its slot"
 		);
-		drop(token);
+		// A build that never installs just lets its use go (a plain handle).
+		let _ = token;
 		assert_eq!(
 			registry.held(),
 			(2, 160),
