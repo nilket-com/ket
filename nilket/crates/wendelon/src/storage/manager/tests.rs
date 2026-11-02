@@ -2340,6 +2340,7 @@ async fn fresh_manager_with_l2(
 	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
 	let io = spawn_io_thread(64).unwrap();
 	let manager = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: l1_dir.to_path_buf(),
 		max_slab_bytes: 1 << 20,
 		io,
@@ -2767,6 +2768,7 @@ async fn fresh_manager_with_group_commit(
 	let dir = fresh_dir("mv");
 	let io = spawn_io_thread(64).unwrap();
 	let manager = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dir.to_path_buf(),
 		// Large enough that no rotation fires during tests;
 		// we want every version in the same active slab so
@@ -2796,6 +2798,7 @@ async fn initialize_manager_at_dir(
 	crypto: Arc<CryptoManager>,
 ) -> Arc<SlabManager> {
 	SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir,
 		max_slab_bytes: 1024 * 1024,
 		io,
@@ -2821,6 +2824,7 @@ async fn open_manager_at_dir(
 	crypto: Arc<CryptoManager>,
 ) -> Arc<SlabManager> {
 	SlabManager::open(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir,
 		max_slab_bytes: 1024 * 1024,
 		io,
@@ -4377,6 +4381,7 @@ async fn fctr5a_lsm_compacts_tiered_ordinary_l0_with_local_runs() {
 	let io = spawn_io_thread(64).unwrap();
 	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_dir).unwrap());
 	let manager = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: l1_dir.to_path_buf(),
 		max_slab_bytes: 1,
 		io: io.clone(),
@@ -6965,6 +6970,7 @@ async fn stats_advisory_drift_fails_closed_to_unavailable() {
 	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
 	let io = spawn_io_thread(64).unwrap();
 	let mgr = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: l1_dir.to_path_buf(),
 		max_slab_bytes: 1 << 20,
 		io,
@@ -7190,6 +7196,7 @@ async fn tiered_retention_rewrite_recomputes_stats_from_survivors() {
 	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
 	let io = spawn_io_thread(64).unwrap();
 	let mgr = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: l1_dir.to_path_buf(),
 		max_slab_bytes: 1 << 20,
 		io,
@@ -7356,6 +7363,7 @@ async fn tiered_retention_rewrite_filters_partial_multirow_storage_records() {
 	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
 	let io = spawn_io_thread(64).unwrap();
 	let mgr = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: l1_dir.to_path_buf(),
 		max_slab_bytes: 1 << 20,
 		io,
@@ -7714,6 +7722,7 @@ async fn table_drop_reclaim_rewrites_tiered_target_rows() {
 	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
 	let io = spawn_io_thread(64).unwrap();
 	let mgr = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: l1_dir.to_path_buf(),
 		max_slab_bytes: 1 << 20,
 		io,
@@ -8153,6 +8162,7 @@ async fn tiered_retention_rewrite_pair_gc_drops_data_and_row_tombstone() {
 	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
 	let io = spawn_io_thread(64).unwrap();
 	let mgr = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: l1_dir.to_path_buf(),
 		max_slab_bytes: 1 << 20,
 		io,
@@ -8274,6 +8284,7 @@ async fn tiered_table_retention_keeps_pk_boundary_tombstone_under_cluster_floor(
 	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
 	let io = spawn_io_thread(64).unwrap();
 	let mgr = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: l1_dir.to_path_buf(),
 		max_slab_bytes: 1 << 20,
 		io,
@@ -8418,6 +8429,7 @@ async fn tiered_table_retention_rewrite_prunes_append_only_rows_when_cluster_ret
 	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
 	let io = spawn_io_thread(64).unwrap();
 	let mgr = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: l1_dir.to_path_buf(),
 		max_slab_bytes: 1 << 20,
 		io,
@@ -8551,6 +8563,7 @@ async fn tiered_table_retention_reports_lag_without_rewrite_for_pair_waiting_on_
 	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
 	let io = spawn_io_thread(64).unwrap();
 	let mgr = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: l1_dir.to_path_buf(),
 		max_slab_bytes: 1 << 20,
 		io,
@@ -9122,6 +9135,7 @@ async fn recovery_fails_closed_on_cross_slab_consecutive_pk_tombstones() {
 	drop(manager);
 
 	let reopened = SlabManager::open(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dir.to_path_buf(),
 		max_slab_bytes: 1024 * 1024,
 		io,
@@ -9150,6 +9164,7 @@ async fn recovery_fails_closed_on_cross_slab_consecutive_pk_tombstones() {
 async fn recovery_reopens_mixed_record_body_compression_slab() {
 	let dir = fresh_dir("mixed-compression-recovery");
 	let mgr = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dir.to_path_buf(),
 		max_slab_bytes: 1024 * 1024,
 		io: spawn_io_thread(64).unwrap(),
@@ -9220,6 +9235,7 @@ async fn recovery_reopens_mixed_record_body_compression_slab() {
 	drop(mgr);
 
 	let reopened = SlabManager::open(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dir.to_path_buf(),
 		max_slab_bytes: 1024 * 1024,
 		io: spawn_io_thread(64).unwrap(),
@@ -9259,6 +9275,7 @@ async fn l2_reads_mixed_record_body_compression_slab() {
 	let l2_dir = fresh_dir("mixed-compression-l2-objects");
 	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_dir).unwrap());
 	let mgr = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: l1_dir.to_path_buf(),
 		max_slab_bytes: 1024 * 1024,
 		io: spawn_io_thread(64).unwrap(),
@@ -9509,6 +9526,7 @@ async fn compression_resident_gauge_counts_tiered_uncompressed_frames() {
 	let l2_dir = fresh_dir("compression-gauge-tiered-l2");
 	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_dir).unwrap());
 	let mgr = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: l1_dir.to_path_buf(),
 		max_slab_bytes: 1024 * 1024,
 		io: spawn_io_thread(64).unwrap(),
@@ -9639,6 +9657,7 @@ async fn projected_l2_read_materializes_sparse_multirow_record() {
 	let l2_dir = fresh_dir("projected-l2-l2");
 	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_dir).unwrap());
 	let mgr = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: l1_dir.to_path_buf(),
 		max_slab_bytes: 1024 * 1024 * 16,
 		io: spawn_io_thread(64).unwrap(),
@@ -9804,6 +9823,7 @@ async fn row_group_l2_point_read_materializes_projected_group() {
 	let l2_dir = fresh_dir("row-group-l2-l2");
 	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_dir).unwrap());
 	let mgr = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: l1_dir.to_path_buf(),
 		max_slab_bytes: 1024 * 1024 * 16,
 		io: spawn_io_thread(64).unwrap(),
@@ -10697,6 +10717,7 @@ async fn fsst_phase_b_l2_read_filters_a1_and_declines_a2_overlap() {
 		.enabled_predicate_evaluators
 		.insert(crate::storage::encoding::compute::EncodingComputeEvaluatorKind::FsstWholeBuffer);
 	let mgr = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: l1_dir.to_path_buf(),
 		max_slab_bytes: 1024 * 1024 * 16,
 		io: spawn_io_thread(64).unwrap(),
@@ -11228,6 +11249,7 @@ async fn sparse_projection_fetch_materializes_exact_cocd_clustered_pages() {
 	)));
 	let l2: Arc<dyn ObjectStore> = l2_counter.clone();
 	let mgr = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: l1_dir.to_path_buf(),
 		max_slab_bytes: 1024 * 1024 * 16,
 		io: spawn_io_thread(64).unwrap(),
@@ -11621,6 +11643,7 @@ async fn sparse_projection_fetch_materializes_exact_cocd_clustered_pages() {
 	)));
 	let scalar_l2: Arc<dyn ObjectStore> = scalar_l2_counter.clone();
 	let scalar_mgr = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: scalar_l1_dir.to_path_buf(),
 		max_slab_bytes: 1024 * 1024 * 16,
 		io: spawn_io_thread(64).unwrap(),
@@ -11844,6 +11867,7 @@ async fn adr061_enabled_chunk_layout_writes_16k_encrypted_slab() {
 		..Default::default()
 	};
 	let mgr = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dir.to_path_buf(),
 		max_slab_bytes: 1024 * 1024 * 16,
 		io: spawn_io_thread(64).unwrap(),
@@ -12007,6 +12031,7 @@ async fn encoding_secondary_index_fetches_only_selected_simd_pages() {
 	let l2_dir = fresh_dir("encoding-index-l2");
 	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_dir).unwrap());
 	let mgr = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: l1_dir.to_path_buf(),
 		max_slab_bytes: 1024 * 1024 * 16,
 		io: spawn_io_thread(64).unwrap(),
@@ -12755,6 +12780,7 @@ async fn scan_as_of_scopes_locality_membership_per_tenant() {
 async fn custom_routing_locality_survives_reopen() {
 	let dir = fresh_dir("custom-locality-reopen");
 	let manager = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dir.to_path_buf(),
 		max_slab_bytes: 1024 * 1024,
 		io: spawn_io_thread(64).unwrap(),
@@ -12794,6 +12820,7 @@ async fn custom_routing_locality_survives_reopen() {
 	drop(manager);
 
 	let reopened = SlabManager::open(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dir.to_path_buf(),
 		max_slab_bytes: 1024 * 1024,
 		io: spawn_io_thread(64).unwrap(),
@@ -12894,6 +12921,7 @@ async fn reopen_restores_tiered_rows_from_redb() {
 	let crypto = test_crypto();
 
 	let manager = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: l1_dir.to_path_buf(),
 		max_slab_bytes: 1,
 		io: io.clone(),
@@ -12968,6 +12996,7 @@ async fn reopen_restores_tiered_rows_from_redb() {
 	drop(manager);
 
 	let reopened = SlabManager::open(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: l1_dir.to_path_buf(),
 		max_slab_bytes: 1,
 		io,
@@ -13111,6 +13140,7 @@ async fn reopen_after_tombstone_compaction_preserves_survivor_lookup() {
 	let dir = fresh_dir("compaction-redb");
 	let io = spawn_io_thread(64).unwrap();
 	let manager = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dir.to_path_buf(),
 		max_slab_bytes: 1024 * 1024,
 		io: io.clone(),
@@ -13205,6 +13235,7 @@ async fn reopen_after_tombstone_compaction_preserves_survivor_lookup() {
 	drop(manager);
 
 	let reopened = SlabManager::open(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dir.to_path_buf(),
 		max_slab_bytes: 1024 * 1024,
 		io,
@@ -13238,6 +13269,7 @@ async fn lsm_compaction_does_not_retain_empty_active_slabs() {
 	let dir = fresh_dir("lsm-empty-active");
 	let io = spawn_io_thread(16).unwrap();
 	let manager = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dir.to_path_buf(),
 		max_slab_bytes: 1,
 		io: io.clone(),
@@ -13316,6 +13348,7 @@ async fn lsm_compaction_does_not_retain_empty_active_slabs() {
 
 	drop(manager);
 	let reopened = SlabManager::open(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dir.to_path_buf(),
 		max_slab_bytes: 1,
 		io,
@@ -13344,6 +13377,7 @@ async fn recovery_skips_zero_length_sealed_slabs_but_preserves_records_and_activ
 	let dir = fresh_dir("recovery-empty-sealed");
 	let io = spawn_io_thread(16).unwrap();
 	let manager = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dir.to_path_buf(),
 		max_slab_bytes: 1,
 		io: io.clone(),
@@ -13376,6 +13410,7 @@ async fn recovery_skips_zero_length_sealed_slabs_but_preserves_records_and_activ
 	}
 
 	let reopened = SlabManager::open(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dir.to_path_buf(),
 		max_slab_bytes: 1,
 		io,
@@ -13414,6 +13449,7 @@ async fn recovery_refuses_before_opening_more_than_the_slab_bound() {
 	}
 
 	let error = match SlabManager::open(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dir.to_path_buf(),
 		max_slab_bytes: 1,
 		io,
@@ -14432,6 +14468,7 @@ async fn repair_fixture_manager(
 	initialize: bool,
 ) -> Arc<SlabManager> {
 	let config = SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dir.to_path_buf(),
 		max_slab_bytes: 1,
 		io,
@@ -14628,6 +14665,7 @@ async fn adr0084_repair_refuses_without_a_durable_index() {
 async fn adr0089_locality_intervals_yield_exactly_the_rows_inside_them() {
 	let dir = fresh_dir("adr0089-range-discoverability");
 	let manager = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dir.to_path_buf(),
 		max_slab_bytes: 1024 * 1024,
 		io: spawn_io_thread(64).unwrap(),
@@ -15280,6 +15318,7 @@ async fn adr0090_compaction_preserves_partitioned_placement() {
 	let dir = fresh_dir("adr0090-compaction-placement");
 	let io = spawn_io_thread(64).unwrap();
 	let manager = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dir.to_path_buf(),
 		max_slab_bytes: 1024 * 1024,
 		io: io.clone(),
@@ -15854,6 +15893,7 @@ async fn open_policed_manager(
 	initialize: bool,
 ) -> Arc<SlabManager> {
 	let config = SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir,
 		// Every append rotates, so five appends are five L0 runs.
 		max_slab_bytes: 1,
@@ -16089,6 +16129,7 @@ async fn tombstone_reclaim_is_policed() {
 	            io: crate::storage::io_uring::IoRingHandle,
 	            fresh: bool| async move {
 		let config = SlabManagerConfig {
+			tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 			dir: dir.to_path_buf(),
 			max_slab_bytes: 1024 * 1024,
 			io,
@@ -18391,6 +18432,7 @@ async fn tier_reads_stay_valid_after_restart_before_publication() {
 	} = fixture;
 	drop(mgr);
 	let reopened = SlabManager::open(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dirs[0].to_path_buf(),
 		max_slab_bytes: 1 << 20,
 		io: spawn_io_thread(64).unwrap(),
@@ -18847,6 +18889,7 @@ async fn try_restart_tier_manager(
 		.replace_keysets_from_authoritative_snapshot(&keysets)
 		.unwrap();
 	SlabManager::open(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dirs[0].to_path_buf(),
 		max_slab_bytes: 1 << 20,
 		io: spawn_io_thread(64).unwrap(),
@@ -20142,6 +20185,7 @@ async fn restart_tier_manager_with(
 		.unwrap();
 	before_open(&dirs[0]);
 	let manager = SlabManager::open(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dirs[0].to_path_buf(),
 		max_slab_bytes: 1 << 20,
 		io: spawn_io_thread(64).unwrap(),
@@ -21272,6 +21316,7 @@ async fn unpublished_drop_fixture() -> (
 	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
 	let io = spawn_io_thread(64).unwrap();
 	let mgr = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: l1_dir.to_path_buf(),
 		max_slab_bytes: 1 << 20,
 		io,
@@ -22130,6 +22175,7 @@ async fn reopen_duplicate_fixture(
 		.replace_keysets_from_authoritative_snapshot(&keysets)
 		.unwrap();
 	SlabManager::open(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dirs[0].to_path_buf(),
 		max_slab_bytes: 1 << 20,
 		io: spawn_io_thread(64).unwrap(),
@@ -22747,6 +22793,7 @@ async fn unverified_authority_close_joins_the_flight_and_reopen_has_a_new_owner(
 	let owner = DataDirectoryOwner::acquire_existing(&*f.dirs[0]).unwrap();
 	let manager = SlabManager::open_with_owner(
 		SlabManagerConfig {
+			tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 			dir: f.dirs[0].to_path_buf(),
 			max_slab_bytes: 1 << 20,
 			io: spawn_io_thread(64).unwrap(),
@@ -23085,6 +23132,7 @@ async fn open_owned_authority_fixture(
 ) -> Arc<SlabManager> {
 	SlabManager::open_with_owner(
 		SlabManagerConfig {
+			tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 			dir: dir.to_path_buf(),
 			max_slab_bytes: 1 << 20,
 			io: spawn_io_thread(64).unwrap(),
@@ -24290,6 +24338,7 @@ async fn cancelled_torn_append_blocks_tiering_until_zero_cleanup_finishes() {
 	let faults = Arc::new(FaultyFileOps::new(&*dir).unwrap());
 	let mgr = SlabManager::initialize_new_store_with_file_ops(
 		SlabManagerConfig {
+			tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 			dir: dir.to_path_buf(),
 			max_slab_bytes: 1024 * 1024,
 			io,
@@ -25808,6 +25857,7 @@ async fn cancelled_tier_metadata_after_index_commit_fences_rebuild_and_reads() {
 	let crypto = mgr.config.crypto.clone();
 	drop(mgr);
 	let reopened = SlabManager::open(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dirs[0].to_path_buf(),
 		max_slab_bytes: 1 << 20,
 		io,
@@ -28552,6 +28602,7 @@ async fn single_append_reconciler_is_single_flight_and_close_joins_before_reopen
 	let owner = DataDirectoryOwner::acquire_existing(&dir).unwrap();
 	let crypto = test_crypto();
 	let config = |io| SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dir.to_path_buf(),
 		max_slab_bytes: 1 << 20,
 		io,
@@ -28673,6 +28724,7 @@ async fn single_append_reconciler_holds_no_manager_while_parked() {
 	let owner = DataDirectoryOwner::acquire_existing(&dir).unwrap();
 	let manager = SlabManager::initialize_new_store_with_owner(
 		SlabManagerConfig {
+			tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 			dir: dir.to_path_buf(),
 			max_slab_bytes: 1 << 20,
 			io: spawn_io_thread(64).unwrap(),
@@ -28774,6 +28826,7 @@ async fn single_append_reconciler_retries_after_epoch_changes() {
 	let owner = DataDirectoryOwner::acquire_existing(&dir).unwrap();
 	let crypto = test_crypto();
 	let config = |io| SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dir.to_path_buf(),
 		max_slab_bytes: 1 << 20,
 		io,
@@ -30624,6 +30677,7 @@ async fn gc_refuses_if_slab_path_no_longer_names_its_owned_handle() {
 
 fn gc_owned_test_config(dir: &Path) -> SlabManagerConfig {
 	SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dir.to_path_buf(),
 		max_slab_bytes: 1 << 20,
 		io: spawn_io_thread(64).unwrap(),
@@ -31703,6 +31757,7 @@ async fn snapshot_new_tier_is_verified_for_test(awaiting_cluster: bool) {
 	let io = spawn_io_thread(64).unwrap();
 	let crypto = test_crypto();
 	let config = |dir: std::path::PathBuf| SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir,
 		max_slab_bytes: 1 << 20,
 		io: io.clone(),
@@ -32746,6 +32801,7 @@ async fn snapshot_supersession_preserves_unknown_size_across_reopen() {
 	.await
 	.unwrap();
 	let reopened = SlabManager::open(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dirs[0].to_path_buf(),
 		max_slab_bytes: 1 << 20,
 		io: spawn_io_thread(64).unwrap(),
@@ -38402,6 +38458,7 @@ async fn b6_replacement_tier_log_entry_finishes_complete_replay_authority() {
 	let marker = dst.join("TIER_AUTHORITY_AWAITING_CLUSTER");
 	std::fs::write(&marker, b"awaiting-cluster-v1\n").unwrap();
 	let target = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dst.to_path_buf(),
 		max_slab_bytes: 1 << 20,
 		io: spawn_io_thread(64).unwrap(),
@@ -38480,6 +38537,7 @@ async fn b6c_complete_replay_resumes_matching_lsm_deferral() {
 	let marker = dst.join("TIER_AUTHORITY_AWAITING_CLUSTER");
 	std::fs::write(&marker, b"awaiting-cluster-v1\n").unwrap();
 	let target = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dst.to_path_buf(),
 		max_slab_bytes: 1 << 20,
 		io: spawn_io_thread(64).unwrap(),
@@ -38584,6 +38642,7 @@ async fn b6c_complete_replay_preserves_structural_refusal() {
 	let marker = dst.join("TIER_AUTHORITY_AWAITING_CLUSTER");
 	std::fs::write(&marker, b"awaiting-cluster-v1\n").unwrap();
 	let target = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dst.to_path_buf(),
 		max_slab_bytes: 1 << 20,
 		io: spawn_io_thread(64).unwrap(),
@@ -38698,6 +38757,7 @@ async fn b6c_nonempty_replay_crash_before_marker_clear_rechecks_on_reopen() {
 	let marker = dst.join("TIER_AUTHORITY_AWAITING_CLUSTER");
 	std::fs::write(&marker, b"awaiting-cluster-v1\n").unwrap();
 	let target = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dst.to_path_buf(),
 		max_slab_bytes: 1 << 20,
 		io: spawn_io_thread(64).unwrap(),
@@ -38771,6 +38831,7 @@ async fn b6c_nonempty_replay_crash_before_marker_clear_rechecks_on_reopen() {
 	drop(sm);
 	drop(target);
 	let reopened = SlabManager::open(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dst.to_path_buf(),
 		max_slab_bytes: 1 << 20,
 		io,
@@ -38830,6 +38891,7 @@ async fn b6c_absent_canonical_without_registered_flight_still_refuses() {
 	let marker = dst.join("TIER_AUTHORITY_AWAITING_CLUSTER");
 	std::fs::write(&marker, b"awaiting-cluster-v1\n").unwrap();
 	let target = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dst.to_path_buf(),
 		max_slab_bytes: 1 << 20,
 		io: spawn_io_thread(64).unwrap(),
@@ -38918,6 +38980,7 @@ async fn b6c_recovered_prefix_registers_before_complete_confirmation() {
 	let marker = dst.join("TIER_AUTHORITY_AWAITING_CLUSTER");
 	std::fs::write(&marker, b"awaiting-cluster-v1\n").unwrap();
 	let target = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dst.to_path_buf(),
 		max_slab_bytes: 1 << 20,
 		io: spawn_io_thread(64).unwrap(),
@@ -39368,6 +39431,7 @@ fn b8_pending_config(
 	l2: Arc<dyn ObjectStore>,
 ) -> SlabManagerConfig {
 	SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir,
 		max_slab_bytes: 1 << 20,
 		io: spawn_io_thread(64).unwrap(),
@@ -40008,6 +40072,7 @@ async fn b10_snapshot_install_defers_live_append_collision_without_fatal_storage
 	let pointer = tier_kv_slab(&source, &l2, "b10/canonical.wnd").await;
 	let dst = fresh_dir("b10-receiver");
 	let manager = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dst.to_path_buf(),
 		max_slab_bytes: 1 << 20,
 		io: spawn_io_thread(64).unwrap(),
@@ -40160,6 +40225,7 @@ async fn b10_append_fixture() -> B10AppendFixture {
 	let owner = DataDirectoryOwner::acquire_existing(&dst).unwrap();
 	let manager = SlabManager::initialize_new_store_with_owner(
 		SlabManagerConfig {
+			tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 			dir: dst.to_path_buf(),
 			max_slab_bytes: 1 << 20,
 			io: spawn_io_thread(64).unwrap(),
@@ -40764,6 +40830,7 @@ async fn b10_quarantine_before_exact_retirement_clear_survives_reopen() {
 	// has not executed. Cancelling/joining the owned worker prevents late work.
 	f.owner.close(Duration::from_secs(10)).await.unwrap();
 	let config = SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: f._dst.to_path_buf(),
 		max_slab_bytes: 1 << 20,
 		io: spawn_io_thread(64).unwrap(),
@@ -40948,6 +41015,7 @@ async fn b10_crash_after_retirement_before_append_drains_uses_durable_staging() 
 	closing.await.unwrap().unwrap();
 	let old_l1 = std::fs::read(slab_path(&f._dst, slab_id)).unwrap();
 	let config = SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: f._dst.to_path_buf(),
 		max_slab_bytes: 1 << 20,
 		io: spawn_io_thread(64).unwrap(),
@@ -41986,6 +42054,7 @@ async fn durable_row_present(dir: &std::path::Path, key: Identity) -> bool {
 /// Open without unwrapping, so a recovery refusal is observable.
 async fn try_open_manager_at_dir(dir: std::path::PathBuf) -> std::io::Result<Arc<SlabManager>> {
 	SlabManager::open(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir,
 		max_slab_bytes: 1024 * 1024,
 		io: spawn_io_thread(64).unwrap(),
@@ -42376,6 +42445,7 @@ async fn open_rotating_manager_over_faults(
 	let faults = Arc::new(FaultyFileOps::new(dir.to_path_buf()).unwrap());
 	let mgr = SlabManager::open_with_file_ops(
 		SlabManagerConfig {
+			tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 			dir: dir.to_path_buf(),
 			max_slab_bytes: 16 * 1024,
 			io: spawn_io_thread(64).unwrap(),
@@ -42558,6 +42628,7 @@ async fn tiered_rewrite_refuses_a_historical_damaged_object(form: HistoricalObje
 	let l2_root = fresh_dir("tiered-damaged-ack-l2");
 	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
 	let mgr = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: l1_dir.to_path_buf(),
 		max_slab_bytes: 1 << 20,
 		io: spawn_io_thread(64).unwrap(),
@@ -44000,20 +44071,60 @@ async fn commit_tier_entry(
 	.unwrap();
 }
 
-/// The authority worker replays a fenced committed callback itself, instead
-/// of parking on it: no sweeper pass is needed. A structural, provenance-free
-/// deferral on another slab neither strands it nor is touched, and keeps
-/// public readiness closed.
+/// Poll `cond` every 10 ms for up to `seconds`, without touching readiness
+/// (a readiness query would start the authority worker itself).
+async fn eventually(seconds: u64, mut cond: impl AsyncFnMut() -> bool) -> bool {
+	tokio::time::timeout(Duration::from_secs(seconds), async {
+		while !cond().await {
+			tokio::time::sleep(Duration::from_millis(10)).await;
+		}
+	})
+	.await
+	.is_ok()
+}
+
+/// The worker's replay state, for a control that timed out.
+fn replay_diagnostics(manager: &SlabManager, slab_id: SlabId) -> String {
+	format!(
+		"status={} attempts={} failures={} deferral={:?} task_running={:?}",
+		manager.tier_authority.status_for_test(),
+		manager
+			.replay_probe
+			.attempts
+			.load(std::sync::atomic::Ordering::Acquire),
+		replay_failures(manager),
+		manager
+			.unapplied_tier_pointers
+			.get(&slab_id)
+			.map(|entry| (entry.value().outcome, entry.value().provenance)),
+		manager.tier_authority.task_running_for_test(),
+	)
+}
+
+fn replay_failures(manager: &SlabManager) -> u64 {
+	manager
+		.replay_probe
+		.failures
+		.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Recording a replayable deferral schedules the authority worker: with the
+/// worker parked (ready, then blocked on a structural deferral it cannot
+/// clear) and no wake from the test, no sweeper and no readiness query, a
+/// committed callback fenced on the index gate is replayed by the worker and
+/// published once the gate is free. A structural, provenance-free deferral on
+/// another slab neither strands it nor is touched, and keeps readiness closed.
 #[tokio::test]
-async fn the_authority_worker_replays_a_fenced_callback_beside_a_structural_deferral() {
+async fn recording_a_replayable_fence_wakes_the_parked_authority_worker() {
 	use super::tier_deferral::{DeferralOutcome, FenceCause, TierDeferral};
-	let (_keep, manager, l2, mut target, old, key) =
-		worker_replay_fixture("s7-worker-replay").await;
+	let (_keep, manager, l2, mut target, old, _key) = worker_replay_fixture("s7-worker-wake").await;
 	let bytes = l2.get(&old.l2_uri).await.unwrap();
 	let replacement = TieredSlabPointer {
-		l2_uri: l2.put("s7-worker-replay/p1", &bytes).await.unwrap(),
+		l2_uri: l2.put("s7-worker-wake/p1", &bytes).await.unwrap(),
 		..old.clone()
 	};
+	*manager.replay_probe.backoff.lock().unwrap() = Some(Duration::from_secs(3600));
+	manager.wait_tier_authority_ready().await.unwrap();
 	let other = SlabId::new(old.slab_id.get() + 1000);
 	let structural = TierDeferral {
 		pointer: TieredSlabPointer {
@@ -44023,13 +44134,13 @@ async fn the_authority_worker_replays_a_fenced_callback_beside_a_structural_defe
 		outcome: DeferralOutcome::Refused(StaleLocationReason::LayoutCollision),
 		provenance: None,
 	};
+	// Inserted directly: no wake. The worker stays parked.
 	manager
 		.unapplied_tier_pointers
 		.insert(other, structural.clone());
 
 	let gate = manager.hold_index_write_gate_for_test().await;
 	commit_tier_entry(&mut target, &replacement, 900).await;
-	drop(gate);
 	assert_eq!(
 		manager
 			.unapplied_tier_pointers
@@ -44042,15 +44153,16 @@ async fn the_authority_worker_replays_a_fenced_callback_beside_a_structural_defe
 		)),
 		"premise: the observer's apply was fenced"
 	);
-	manager.tier_authority.start();
-	manager.tier_authority.notify_changed();
-	tokio::time::timeout(Duration::from_secs(60), async {
-		while manager.tier_pointer(old.slab_id).await.as_ref() != Some(&replacement) {
-			tokio::time::sleep(Duration::from_millis(10)).await;
-		}
-	})
-	.await
-	.expect("the worker publishes the replayed callback");
+	drop(gate);
+	assert!(
+		eventually(60, async || manager
+			.tier_pointer(old.slab_id)
+			.await
+			.as_ref() == Some(&replacement))
+		.await,
+		"the worker, woken only by the recorded fence, publishes the replayed callback: {}",
+		replay_diagnostics(&manager, old.slab_id)
+	);
 	assert!(manager.unapplied_tier_pointers.get(&old.slab_id).is_none());
 	assert_eq!(
 		manager
@@ -44064,31 +44176,88 @@ async fn the_authority_worker_replays_a_fenced_callback_beside_a_structural_defe
 		manager.tier_authority_readiness_reason().is_some(),
 		"the structural deferral keeps readiness closed"
 	);
-	let location = manager.lookup(tenant(), key);
-	eprintln!("lookup while readiness is closed: {location:?}");
 }
 
-/// A budget-fenced replay waits for a release instead of its backoff: one
-/// reservation's refund wakes the worker, which then publishes.
+/// A replay whose cause changes to the budget waits for budget releases from
+/// then on: an index-gate fence is replayed, re-fences on plan scratch, and
+/// once that failed attempt is recorded a release publishes it, long before
+/// its scheduled retry.
 #[tokio::test]
-async fn a_budget_release_wakes_the_replay_of_a_budget_fenced_callback() {
+async fn a_replay_that_re_fences_on_the_budget_is_woken_by_a_release() {
 	use super::tier_budget::TierBudgetKind;
-	use super::tier_deferral::DeferralOutcome;
+	use super::tier_deferral::{DeferralOutcome, FenceCause};
 	let (_keep, manager, l2, mut target, old, _key) =
-		worker_replay_fixture("s7-worker-budget").await;
+		worker_replay_fixture("s7-worker-refence").await;
 	let bytes = l2.get(&old.l2_uri).await.unwrap();
 	let replacement = TieredSlabPointer {
-		l2_uri: l2.put("s7-worker-budget/p1", &bytes).await.unwrap(),
+		l2_uri: l2.put("s7-worker-refence/p1", &bytes).await.unwrap(),
 		..old.clone()
 	};
-	// Every scheduled retry is an hour away, so only a release can wake it.
 	*manager.replay_probe.backoff.lock().unwrap() = Some(Duration::from_secs(3600));
+	manager.wait_tier_authority_ready().await.unwrap();
+	let gate = manager.hold_index_write_gate_for_test().await;
+	commit_tier_entry(&mut target, &replacement, 901).await;
+	// The woken worker's replay now waits on the gate. Exhaust the budget
+	// before freeing it, so the replay re-fences on plan scratch.
 	let room = manager.tier_budget.limit() - manager.tier_budget.used();
 	let hog = manager
 		.tier_budget
 		.try_reserve(TierBudgetKind::Scratch, room)
 		.unwrap();
-	commit_tier_entry(&mut target, &replacement, 901).await;
+	drop(gate);
+	assert!(
+		eventually(60, async || replay_failures(&manager) >= 1).await,
+		"the replay attempt failed and was scheduled: {}",
+		replay_diagnostics(&manager, old.slab_id)
+	);
+	assert_eq!(
+		manager
+			.unapplied_tier_pointers
+			.get(&old.slab_id)
+			.map(|entry| entry.value().outcome),
+		Some(DeferralOutcome::Fenced(FenceCause::NoScratch)),
+		"premise: the replay re-fenced on the budget"
+	);
+	assert_eq!(manager.tier_pointer(old.slab_id).await, Some(old.clone()));
+	drop(hog);
+	assert!(
+		eventually(30, async || manager
+			.tier_pointer(old.slab_id)
+			.await
+			.as_ref() == Some(&replacement))
+		.await,
+		"the release wakes the replay, well before its hour-long backoff: {}",
+		replay_diagnostics(&manager, old.slab_id)
+	);
+}
+
+/// A release after a budget-fenced attempt is recorded but before the worker
+/// registers its wait is not lost: the worker is held between its round and
+/// its wait, the reservation is released there, and the replay publishes.
+#[tokio::test]
+async fn a_release_before_the_worker_waits_still_wakes_the_replay() {
+	use super::tier_budget::TierBudgetKind;
+	use super::tier_deferral::DeferralOutcome;
+	let (_keep, manager, l2, mut target, old, _key) =
+		worker_replay_fixture("s7-worker-watermark").await;
+	let bytes = l2.get(&old.l2_uri).await.unwrap();
+	let replacement = TieredSlabPointer {
+		l2_uri: l2.put("s7-worker-watermark/p1", &bytes).await.unwrap(),
+		..old.clone()
+	};
+	*manager.replay_probe.backoff.lock().unwrap() = Some(Duration::from_secs(3600));
+	manager.wait_tier_authority_ready().await.unwrap();
+	let room = manager.tier_budget.limit() - manager.tier_budget.used();
+	let hog = manager
+		.tier_budget
+		.try_reserve(TierBudgetKind::Scratch, room)
+		.unwrap();
+	// Held after a blocked round that attempted nothing (the failed attempt's
+	// own re-record wakes one such round), just before it registers waiters.
+	let entered = Arc::new(tokio::sync::Semaphore::new(0));
+	let release = Arc::new(tokio::sync::Semaphore::new(0));
+	*manager.replay_probe.before_wait.lock().unwrap() = Some((entered.clone(), release.clone()));
+	commit_tier_entry(&mut target, &replacement, 902).await;
 	let outcome = manager
 		.unapplied_tier_pointers
 		.get(&old.slab_id)
@@ -44097,31 +44266,33 @@ async fn a_budget_release_wakes_the_replay_of_a_budget_fenced_callback() {
 		matches!(outcome, Some(DeferralOutcome::Fenced(cause)) if cause.waits_for_budget()),
 		"premise: the apply is fenced on the budget: {outcome:?}"
 	);
-	manager.tier_authority.start();
-	manager.tier_authority.notify_changed();
-	tokio::time::timeout(Duration::from_secs(60), async {
-		while manager
-			.replay_probe
-			.attempts
-			.load(std::sync::atomic::Ordering::Acquire)
-			== 0
-		{
-			tokio::time::sleep(Duration::from_millis(10)).await;
-		}
-	})
-	.await
-	.expect("the worker tried the replay and scheduled it an hour out");
+	tokio::time::timeout(Duration::from_secs(60), entered.acquire())
+		.await
+		.unwrap_or_else(|_| {
+			panic!(
+				"the worker, woken by the recorded fence, finished its round: {}",
+				replay_diagnostics(&manager, old.slab_id)
+			)
+		})
+		.unwrap()
+		.forget();
+	assert_eq!(
+		replay_failures(&manager),
+		1,
+		"premise: its replay failed and was scheduled an hour out"
+	);
 	assert_eq!(manager.tier_pointer(old.slab_id).await, Some(old.clone()));
-
 	drop(hog);
-	tokio::time::timeout(Duration::from_secs(30), async {
-		while manager.tier_pointer(old.slab_id).await.as_ref() != Some(&replacement) {
-			tokio::time::sleep(Duration::from_millis(10)).await;
-		}
-	})
-	.await
-	.expect("the release wakes the replay, well before its backoff");
-	assert!(manager.unapplied_tier_pointers.get(&old.slab_id).is_none());
+	release.add_permits(1);
+	assert!(
+		eventually(30, async || manager
+			.tier_pointer(old.slab_id)
+			.await
+			.as_ref() == Some(&replacement))
+		.await,
+		"the release before the wait is seen, well before the hour-long backoff: {}",
+		replay_diagnostics(&manager, old.slab_id)
+	);
 }
 
 fn reopen_test_config(
@@ -44131,6 +44302,7 @@ fn reopen_test_config(
 	crypto: Arc<CryptoManager>,
 ) -> SlabManagerConfig {
 	SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dir.to_path_buf(),
 		max_slab_bytes: 1 << 20,
 		io,

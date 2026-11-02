@@ -104,6 +104,7 @@ impl TierCommitter for ManifestApplyingCommitter {
 async fn sealed_slabs_enter_compaction_manifest_as_l0_live() {
 	let l1_dir = fresh_dir("l1");
 	let manager = initialize_test_manager(SlabManagerConfig {
+		tier_history_budget_bytes: wendelon::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: l1_dir.to_path_buf(),
 		max_slab_bytes: 1,
 		io: spawn_io_thread(16).unwrap(),
@@ -149,6 +150,7 @@ async fn open_removes_stale_lsm_compaction_temp_files() {
 	let temp = dir.join("compaction-temp-77-output-0001.wnd");
 	let unrelated = dir.join("not-compaction-temp-77-output-0001.wnd");
 	let config = || SlabManagerConfig {
+		tier_history_budget_bytes: wendelon::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dir.to_path_buf(),
 		max_slab_bytes: 1,
 		io: spawn_io_thread(16).unwrap(),
@@ -178,6 +180,7 @@ async fn open_removes_stale_lsm_compaction_temp_files() {
 async fn lsm_output_slab_id_reservation_advances_manager_sequence() {
 	let l1_dir = fresh_dir("reserve-outputs");
 	let manager = initialize_test_manager(SlabManagerConfig {
+		tier_history_budget_bytes: wendelon::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: l1_dir.to_path_buf(),
 		max_slab_bytes: 1,
 		io: spawn_io_thread(16).unwrap(),
@@ -217,6 +220,7 @@ async fn lsm_output_slab_id_reservation_advances_manager_sequence() {
 async fn lsm_version_entries_for_plan_come_from_manager_key_index() {
 	let l1_dir = fresh_dir("extract-entries");
 	let manager = initialize_test_manager(SlabManagerConfig {
+		tier_history_budget_bytes: wendelon::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: l1_dir.to_path_buf(),
 		max_slab_bytes: 1,
 		io: spawn_io_thread(16).unwrap(),
@@ -271,6 +275,7 @@ async fn lsm_version_entries_for_plan_come_from_manager_key_index() {
 async fn manager_prepares_lsm_outputs_from_extracted_entries_and_reserved_ids() {
 	let l1_dir = fresh_dir("prepare-outputs");
 	let manager = initialize_test_manager(SlabManagerConfig {
+		tier_history_budget_bytes: wendelon::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: l1_dir.to_path_buf(),
 		max_slab_bytes: 1,
 		io: spawn_io_thread(16).unwrap(),
@@ -330,6 +335,7 @@ async fn manager_prepares_lsm_outputs_from_extracted_entries_and_reserved_ids() 
 async fn manager_reads_lsm_single_row_source_frames_for_plan() {
 	let l1_dir = fresh_dir("source-frames");
 	let manager = initialize_test_manager(SlabManagerConfig {
+		tier_history_budget_bytes: wendelon::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: l1_dir.to_path_buf(),
 		max_slab_bytes: 1,
 		io: spawn_io_thread(16).unwrap(),
@@ -385,6 +391,7 @@ async fn manager_reads_lsm_single_row_source_frames_for_plan() {
 async fn manager_writes_lsm_temp_output_slabs_without_installing_them() {
 	let dir = fresh_dir("temp-outputs");
 	let manager = initialize_test_manager(SlabManagerConfig {
+		tier_history_budget_bytes: wendelon::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dir.to_path_buf(),
 		max_slab_bytes: 1,
 		io: spawn_io_thread(16).unwrap(),
@@ -477,6 +484,7 @@ async fn manager_writes_lsm_temp_output_slabs_without_installing_them() {
 	let temp_path = written[0].temp_path.clone();
 	drop(manager);
 	let _reopened = open_test_manager(SlabManagerConfig {
+		tier_history_budget_bytes: wendelon::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dir.to_path_buf(),
 		max_slab_bytes: 1,
 		io: spawn_io_thread(16).unwrap(),
@@ -501,6 +509,7 @@ async fn manager_writes_lsm_temp_output_slabs_without_installing_them() {
 async fn manager_installs_lsm_temp_outputs_into_manifest_and_lookup_index() {
 	let dir = fresh_dir("install-outputs");
 	let manager = initialize_test_manager(SlabManagerConfig {
+		tier_history_budget_bytes: wendelon::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dir.to_path_buf(),
 		max_slab_bytes: 1,
 		io: spawn_io_thread(16).unwrap(),
@@ -604,6 +613,7 @@ async fn manager_installs_lsm_temp_outputs_into_manifest_and_lookup_index() {
 async fn manager_runs_single_lsm_compaction_job_end_to_end() {
 	let l1_dir = fresh_dir("run-once");
 	let manager = initialize_test_manager(SlabManagerConfig {
+		tier_history_budget_bytes: wendelon::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: l1_dir.to_path_buf(),
 		max_slab_bytes: 1,
 		io: spawn_io_thread(16).unwrap(),
@@ -676,6 +686,7 @@ async fn manager_runs_single_lsm_compaction_job_end_to_end() {
 async fn manager_runs_lsm_compaction_job_through_control_ring_committer() {
 	let l1_dir = fresh_dir("run-once-control-ring");
 	let manager = initialize_test_manager(SlabManagerConfig {
+		tier_history_budget_bytes: wendelon::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: l1_dir.to_path_buf(),
 		max_slab_bytes: 1,
 		io: spawn_io_thread(16).unwrap(),
@@ -760,6 +771,7 @@ async fn manager_runs_lsm_compaction_job_through_control_ring_committer() {
 async fn manager_picker_tick_runs_l0_compaction_when_threshold_met() {
 	let l1_dir = fresh_dir("picker-tick");
 	let manager = initialize_test_manager(SlabManagerConfig {
+		tier_history_budget_bytes: wendelon::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: l1_dir.to_path_buf(),
 		max_slab_bytes: 1,
 		io: spawn_io_thread(16).unwrap(),
@@ -839,6 +851,7 @@ async fn manager_picker_tick_runs_l0_compaction_when_threshold_met() {
 async fn manager_reopens_with_persisted_lsm_manifest_filtering_retired_inputs() {
 	let dir = fresh_dir("reopen-lsm-manifest");
 	let manager = initialize_test_manager(SlabManagerConfig {
+		tier_history_budget_bytes: wendelon::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dir.to_path_buf(),
 		max_slab_bytes: 1,
 		io: spawn_io_thread(16).unwrap(),
@@ -887,6 +900,7 @@ async fn manager_reopens_with_persisted_lsm_manifest_filtering_retired_inputs() 
 	drop(manager);
 
 	let reopened = open_test_manager(SlabManagerConfig {
+		tier_history_budget_bytes: wendelon::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dir.to_path_buf(),
 		max_slab_bytes: 1,
 		io: spawn_io_thread(16).unwrap(),
@@ -929,6 +943,7 @@ async fn manager_reopens_with_persisted_lsm_manifest_filtering_retired_inputs() 
 async fn manager_install_rejects_bad_digest_before_manifest_apply() {
 	let dir = fresh_dir("run-once-digest-reject");
 	let manager = initialize_test_manager(SlabManagerConfig {
+		tier_history_budget_bytes: wendelon::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dir.to_path_buf(),
 		max_slab_bytes: 1,
 		io: spawn_io_thread(16).unwrap(),
@@ -1016,6 +1031,7 @@ async fn manager_install_rejects_bad_digest_before_manifest_apply() {
 async fn manager_install_rejects_explicit_lsm_sidecar_swaps() {
 	let dir = fresh_dir("sidecar-swap-reject");
 	let manager = initialize_test_manager(SlabManagerConfig {
+		tier_history_budget_bytes: wendelon::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dir.to_path_buf(),
 		max_slab_bytes: 1,
 		io: spawn_io_thread(16).unwrap(),
@@ -1096,6 +1112,7 @@ async fn manager_install_rejects_explicit_lsm_sidecar_swaps() {
 async fn manager_removes_lsm_temp_output_on_missing_source_frame() {
 	let dir = fresh_dir("temp-output-missing-frame");
 	let manager = initialize_test_manager(SlabManagerConfig {
+		tier_history_budget_bytes: wendelon::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dir.to_path_buf(),
 		max_slab_bytes: 1,
 		io: spawn_io_thread(16).unwrap(),
@@ -1160,6 +1177,7 @@ async fn manager_removes_lsm_temp_output_on_missing_source_frame() {
 async fn point_read_refuses_lsm_delete_pending_slab() {
 	let l1_dir = fresh_dir("read-pin");
 	let manager = initialize_test_manager(SlabManagerConfig {
+		tier_history_budget_bytes: wendelon::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: l1_dir.to_path_buf(),
 		max_slab_bytes: 1,
 		io: spawn_io_thread(16).unwrap(),
@@ -1201,6 +1219,7 @@ async fn point_read_refuses_lsm_delete_pending_slab() {
 async fn manager_applies_lsm_manifest_compaction_commit() {
 	let l1_dir = fresh_dir("manifest-commit");
 	let manager = initialize_test_manager(SlabManagerConfig {
+		tier_history_budget_bytes: wendelon::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: l1_dir.to_path_buf(),
 		max_slab_bytes: 1,
 		io: spawn_io_thread(16).unwrap(),
@@ -1278,6 +1297,7 @@ async fn manager_applies_lsm_manifest_compaction_commit() {
 async fn manager_lsm_gc_waits_for_authoritative_index_rewrite() {
 	let l1_dir = fresh_dir("manifest-gc");
 	let manager = initialize_test_manager(SlabManagerConfig {
+		tier_history_budget_bytes: wendelon::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: l1_dir.to_path_buf(),
 		max_slab_bytes: 1,
 		io: spawn_io_thread(16).unwrap(),
@@ -1366,6 +1386,7 @@ async fn manager_lsm_gc_waits_for_authoritative_index_rewrite() {
 async fn manager_lsm_gc_lifecycle_commits_through_control_ring() {
 	let dir = fresh_dir("gc-control-ring");
 	let manager = initialize_test_manager(SlabManagerConfig {
+		tier_history_budget_bytes: wendelon::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dir.to_path_buf(),
 		max_slab_bytes: 1,
 		io: spawn_io_thread(16).unwrap(),

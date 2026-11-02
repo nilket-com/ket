@@ -197,6 +197,7 @@ async fn build_tiered_manager(
 	let l2 = Arc::new(CountingObjectStore::new(l2_inner));
 	let l2_store: Arc<dyn ObjectStore> = l2.clone();
 	let manager = initialize_test_manager(SlabManagerConfig {
+		tier_history_budget_bytes: wendelon::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: l1_dir.to_path_buf(),
 		max_slab_bytes: 1,
 		io,

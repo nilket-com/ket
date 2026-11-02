@@ -13,8 +13,21 @@ use std::sync::{Arc, Mutex};
 
 use super::SlabId;
 
-/// The §7 default: 256 MiB per manager.
-pub(super) const DEFAULT_TIER_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
+tokio::task_local! {
+	/// Set while a tier deferral replay attempt runs (`within_replay_attempt`).
+	static REPLAY_ATTEMPT: ();
+}
+
+/// Run one replay attempt. Its refunds are not releases: a failed attempt
+/// gives back only what it reserved, so it never makes room that was not
+/// there before it, and counting it would let replays wake each other.
+pub(super) async fn within_replay_attempt<F: std::future::Future>(attempt: F) -> F::Output {
+	REPLAY_ATTEMPT.scope((), attempt).await
+}
+
+/// The §7 default per manager.
+#[cfg(test)]
+pub(super) const DEFAULT_TIER_BUDGET_BYTES: u64 = super::DEFAULT_TIER_HISTORY_BUDGET_BYTES;
 
 /// The most redirect plus superseded entries one slab's history may hold,
 /// inclusive (§7 per-lineage cap).
@@ -79,7 +92,8 @@ impl TierBudgetKind {
 pub(super) struct TierMemoryBudget {
 	limit: AtomicU64,
 	state: Mutex<BudgetState>,
-	/// Advances on every refund, so a waiter fenced on budget can tell that
+	/// Advances on every refund outside a replay attempt
+	/// (`within_replay_attempt`), so a waiter fenced on budget can tell that
 	/// memory was released since it last failed.
 	release_epoch: AtomicU64,
 	released: tokio::sync::Notify,
@@ -210,12 +224,12 @@ impl TierMemoryBudget {
 		state.peak = state.held();
 	}
 
-	/// Advances on every refund (see `release_epoch`).
+	/// The count of releases (see the field).
 	pub(super) fn release_epoch(&self) -> u64 {
 		self.release_epoch.load(Ordering::Acquire)
 	}
 
-	/// Notified on every refund.
+	/// Notified on every release (see `release_epoch`).
 	pub(super) fn released(&self) -> &tokio::sync::Notify {
 		&self.released
 	}
@@ -367,8 +381,10 @@ impl TierMemoryBudget {
 			return;
 		}
 		kind.discharge(bytes);
-		self.release_epoch.fetch_add(1, Ordering::AcqRel);
-		self.released.notify_waiters();
+		if REPLAY_ATTEMPT.try_with(|()| ()).is_err() {
+			self.release_epoch.fetch_add(1, Ordering::AcqRel);
+			self.released.notify_waiters();
+		}
 	}
 }
 
@@ -706,6 +722,38 @@ mod tests {
 		});
 		assert_eq!(budget.used(), 0);
 		assert!(budget.peak() <= budget.limit());
+	}
+
+	/// A failed replay attempt's own refunds are not releases, so they never
+	/// wake a replay (its own or another's); a refund outside any attempt is.
+	#[tokio::test]
+	async fn refunds_inside_a_replay_attempt_are_not_releases() {
+		let budget = TierMemoryBudget::new(1_000);
+		let before = budget.release_epoch();
+		let notified = budget.released().notified();
+		tokio::pin!(notified);
+		notified.as_mut().enable();
+		within_replay_attempt(async {
+			drop(budget.try_reserve(TierBudgetKind::Scratch, 100).unwrap());
+		})
+		.await;
+		assert_eq!(
+			budget.release_epoch(),
+			before,
+			"an attempt's refund is no release"
+		);
+		assert!(
+			tokio::time::timeout(std::time::Duration::from_millis(50), notified.as_mut())
+				.await
+				.is_err(),
+			"and wakes no waiter"
+		);
+		let outside = budget.try_reserve(TierBudgetKind::Scratch, 100).unwrap();
+		drop(outside);
+		assert_eq!(budget.release_epoch(), before + 1);
+		tokio::time::timeout(std::time::Duration::from_secs(5), notified)
+			.await
+			.expect("a release outside any attempt wakes the waiter");
 	}
 
 	#[test]

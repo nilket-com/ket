@@ -349,7 +349,14 @@ pub struct SlabManagerConfig {
 	pub group_commit: GroupCommitConfig,
 	/// ADR 022 slab-object encryption service used for L2 object bytes.
 	pub crypto: Arc<CryptoManager>,
+	/// ADR 0692 §7: the node budget, in bytes, for tier history, publication
+	/// scratch, proposer tokens and relocation redirects. A manager whose
+	/// budget cannot hold its own fixed token registry refuses to open.
+	pub tier_history_budget_bytes: u64,
 }
+
+/// The §7 default node budget for tier history: 256 MiB.
+pub const DEFAULT_TIER_HISTORY_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Policy that governs L2 -> L1 slab rehydration.
 #[derive(Clone, Debug, PartialEq, Eq)]

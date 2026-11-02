@@ -2550,6 +2550,7 @@ mod tests {
 		let dir = fresh_dir("l1");
 		let io = spawn_io_thread(64).unwrap();
 		let manager = SlabManager::initialize_new_store(SlabManagerConfig {
+			tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 			dir: dir.to_path_buf(),
 			// Tiny cap so two appends produce two sealed slabs.
 			max_slab_bytes: 1,
@@ -2639,6 +2640,7 @@ mod tests {
 		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
 		let io = spawn_io_thread(64).unwrap();
 		let manager = SlabManager::initialize_new_store(SlabManagerConfig {
+			tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 			dir: l1_dir.to_path_buf(),
 			max_slab_bytes: 1 << 20,
 			io,
@@ -3753,6 +3755,7 @@ mod tests {
 		.await
 		.expect("manager owners must release before reopen");
 		let reopened = SlabManager::open(SlabManagerConfig {
+			tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 			dir: l1_dir.to_path_buf(),
 			max_slab_bytes: 1,
 			io: spawn_io_thread(64).unwrap(),
@@ -3998,6 +4001,7 @@ mod tests {
 		let io = spawn_io_thread(64).unwrap();
 		let crypto = test_crypto();
 		let manager = SlabManager::initialize_new_store(SlabManagerConfig {
+			tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 			dir: l1_dir.to_path_buf(),
 			max_slab_bytes: 1 << 20,
 			io,
@@ -4098,6 +4102,7 @@ mod tests {
 		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
 		let io = spawn_io_thread(64).unwrap();
 		let manager = SlabManager::initialize_new_store(SlabManagerConfig {
+			tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 			dir: l1_dir.to_path_buf(),
 			max_slab_bytes: 1 << 20,
 			io,
@@ -4203,6 +4208,7 @@ mod tests {
 		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
 		let io = spawn_io_thread(64).unwrap();
 		let manager = SlabManager::initialize_new_store(SlabManagerConfig {
+			tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 			dir: l1_dir.to_path_buf(),
 			max_slab_bytes: 1 << 20,
 			io,
@@ -4352,6 +4358,7 @@ mod tests {
 		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
 		let io = spawn_io_thread(64).unwrap();
 		let manager = SlabManager::initialize_new_store(SlabManagerConfig {
+			tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 			dir: l1_dir.to_path_buf(),
 			max_slab_bytes: 1 << 20,
 			io,
@@ -4504,6 +4511,7 @@ mod tests {
 		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
 		let io = spawn_io_thread(64).unwrap();
 		let manager = SlabManager::initialize_new_store(SlabManagerConfig {
+			tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 			dir: l1_dir.to_path_buf(),
 			max_slab_bytes: 1 << 20,
 			io,
@@ -4651,6 +4659,7 @@ mod tests {
 		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
 		let io = spawn_io_thread(64).unwrap();
 		let manager = SlabManager::initialize_new_store(SlabManagerConfig {
+			tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 			dir: l1_dir.to_path_buf(),
 			max_slab_bytes: 1 << 20,
 			io,
@@ -4782,6 +4791,7 @@ mod tests {
 		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
 		let io = spawn_io_thread(64).unwrap();
 		let manager = SlabManager::initialize_new_store(SlabManagerConfig {
+			tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 			dir: l1_dir.to_path_buf(),
 			max_slab_bytes: 1 << 20,
 			io,
@@ -4979,6 +4989,7 @@ mod tests {
 			slab.fsync().await.unwrap();
 		}
 		let manager = SlabManager::initialize_new_store(SlabManagerConfig {
+			tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 			dir: l1_dir.to_path_buf(),
 			max_slab_bytes: 1 << 20,
 			io: spawn_io_thread(64).unwrap(),
@@ -5135,6 +5146,7 @@ mod tests {
 		let l2_root = fresh_dir(&format!("{tag}-l2"));
 		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
 		let manager = SlabManager::initialize_new_store(SlabManagerConfig {
+			tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 			dir: l1_dir.to_path_buf(),
 			max_slab_bytes: 1 << 20,
 			io: spawn_io_thread(64).unwrap(),
@@ -5368,6 +5380,7 @@ mod tests {
 			slab.fsync().await.unwrap();
 		}
 		let manager = SlabManager::initialize_new_store(SlabManagerConfig {
+			tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 			dir: l1_dir.to_path_buf(),
 			max_slab_bytes: 1 << 20,
 			io: spawn_io_thread(64).unwrap(),
@@ -5517,6 +5530,7 @@ mod tests {
 		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
 		let io = spawn_io_thread(64).unwrap();
 		let manager = SlabManager::initialize_new_store(SlabManagerConfig {
+			tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 			dir: l1_dir.to_path_buf(),
 			max_slab_bytes: 1 << 20,
 			io,
@@ -5684,6 +5698,7 @@ mod tests {
 		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
 		let io = spawn_io_thread(64).unwrap();
 		let manager = SlabManager::initialize_new_store(SlabManagerConfig {
+			tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 			dir: l1_dir.to_path_buf(),
 			max_slab_bytes: 1 << 20,
 			io,
@@ -5800,6 +5815,7 @@ mod tests {
 		let l2_root = fresh_dir("first-tier-retry-l2");
 		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
 		let manager = SlabManager::initialize_new_store(SlabManagerConfig {
+			tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 			dir: l1_dir.to_path_buf(),
 			max_slab_bytes: 1 << 20,
 			io: spawn_io_thread(64).unwrap(),
@@ -5880,6 +5896,7 @@ mod tests {
 		let l2_root = fresh_dir("sweeper-counter-slab-l2");
 		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
 		let manager = SlabManager::initialize_new_store(SlabManagerConfig {
+			tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 			dir: l1_dir.to_path_buf(),
 			max_slab_bytes: 1 << 20,
 			io: spawn_io_thread(64).unwrap(),
@@ -6588,6 +6605,7 @@ mod tests {
 			.replace_keysets_from_authoritative_snapshot(&keysets)
 			.unwrap();
 		let reopened = SlabManager::open(SlabManagerConfig {
+			tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 			dir: dirs[0].to_path_buf(),
 			max_slab_bytes: 1,
 			io: spawn_io_thread(64).unwrap(),

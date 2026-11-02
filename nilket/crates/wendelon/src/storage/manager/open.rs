@@ -763,9 +763,8 @@ impl SlabManager {
 				.ok_or_else(|| Error::other("snapshot epoch exhausted"))?,
 			None => 1,
 		};
-		let tier_budget = super::tier_budget::TierMemoryBudget::new(
-			super::tier_budget::DEFAULT_TIER_BUDGET_BYTES,
-		);
+		let tier_budget =
+			super::tier_budget::TierMemoryBudget::new(config.tier_history_budget_bytes);
 		let tier_tokens = super::tier_tokens::TierTokenRegistry::new(&tier_budget)?;
 		let manager = Arc::new(Self {
 			_directory_owner: owner,

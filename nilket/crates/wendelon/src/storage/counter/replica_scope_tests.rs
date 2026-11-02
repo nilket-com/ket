@@ -27,6 +27,7 @@ fn identity(key: &[u8]) -> Identity {
 }
 async fn manager(dir: &TestDir, crypto: Arc<CryptoManager>, initialize: bool) -> Arc<SlabManager> {
 	let config = SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dir.to_path_buf(),
 		max_slab_bytes: 1024 * 1024,
 		io: spawn_io_thread(64).unwrap(),

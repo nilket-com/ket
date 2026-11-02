@@ -287,6 +287,19 @@ impl TierAuthority {
 		self.integrity_error().expect("latched conflict")
 	}
 
+	#[cfg(test)]
+	pub(super) fn task_running_for_test(&self) -> Option<bool> {
+		self.task
+			.try_lock()
+			.ok()
+			.map(|task| task.as_ref().is_some_and(|task| !task.is_finished()))
+	}
+
+	#[cfg(test)]
+	pub(super) fn status_for_test(&self) -> String {
+		format!("{:?}", self.status())
+	}
+
 	fn status(&self) -> AuthorityStatus {
 		self.status
 			.lock()
@@ -1031,9 +1044,22 @@ impl TierAuthority {
 					// parking on them (ADR 0696 r3 E).
 					let replay = if blocked && !awaiting {
 						let round = manager.replay_tier_deferrals(&mut replay_schedule).await;
-						let budget = manager.tier_budget.clone();
-						let seen = budget.release_epoch();
-						Some((round, budget, seen))
+						#[cfg(test)]
+						let hold = manager
+							.replay_probe
+							.before_wait
+							.lock()
+							.unwrap()
+							.clone()
+							.filter(|_| round.attempted == 0 && !round.progressed);
+						#[cfg(test)]
+						if let Some((entered, release)) = hold {
+							entered.add_permits(1);
+							if let Ok(permit) = release.acquire().await {
+								permit.forget();
+							}
+						}
+						Some((round, manager.tier_budget.clone()))
 					} else {
 						None
 					};
@@ -1043,13 +1069,17 @@ impl TierAuthority {
 			};
 			if manager_blocked {
 				match replay {
-					Some((round, _, _)) if round.progressed => continue,
-					Some((round, budget, seen)) => {
+					Some((round, _)) if round.progressed => continue,
+					Some((round, budget)) => {
 						let released = budget.released().notified();
 						tokio::pin!(released);
 						released.as_mut().enable();
-						// A release between the round and the wait is not missed.
-						if round.waits_for_budget && budget.release_epoch() != seen {
+						// A release after a budget-fenced attempt ended, including one
+						// before this waiter was registered, is never missed.
+						if round
+							.budget_watermark
+							.is_some_and(|mark| budget.release_epoch() > mark)
+						{
 							continue;
 						}
 						let wake = round.next.unwrap_or_else(|| {
@@ -1058,7 +1088,7 @@ impl TierAuthority {
 						tokio::select! {
 							_ = &mut changed => {}
 							_ = tokio::time::sleep_until(wake), if round.next.is_some() => {}
-							_ = &mut released, if round.waits_for_budget => {}
+							_ = &mut released, if round.budget_watermark.is_some() => {}
 						}
 					}
 					None => changed.await,

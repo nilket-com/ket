@@ -576,6 +576,7 @@ async fn open_owned_manager_for_sidecar_recovery(
 	file_ops: Option<Arc<dyn AsyncFileOps>>,
 ) -> Arc<SlabManager> {
 	let config = SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dir.to_path_buf(),
 		max_slab_bytes: 1024 * 1024,
 		io: spawn_io_thread(64).unwrap(),
@@ -1233,6 +1234,7 @@ async fn open_fresh_sidecar_manager_with_ops(
 	let crypto = test_crypto();
 	SlabManager::initialize_new_store_with_file_ops(
 		SlabManagerConfig {
+			tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 			dir: dir.to_path_buf(),
 			max_slab_bytes: 1024 * 1024,
 			io,

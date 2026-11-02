@@ -749,7 +749,7 @@ impl SlabManager {
 		{
 			Ok(gate) => Arc::new(gate),
 			Err(_) => {
-				self.unapplied_tier_pointers.insert(
+				self.record_tier_deferral(
 					pointer.slab_id,
 					TierDeferral::fenced(
 						pointer.clone(),
@@ -808,7 +808,7 @@ impl SlabManager {
 					)
 					.await;
 			}
-			self.unapplied_tier_pointers.insert(
+			self.record_tier_deferral(
 				pointer.slab_id,
 				TierDeferral::fenced(
 					pointer.clone(),
@@ -839,7 +839,7 @@ impl SlabManager {
 				&& !self.lsm_install_unresolved.is_empty())
 		{
 			let error = fenced_error(ErrorKind::Other, pointer.slab_id, FenceCause::LsmScope);
-			self.unapplied_tier_pointers.insert(
+			self.record_tier_deferral(
 				pointer.slab_id,
 				TierDeferral::fenced(pointer, FenceCause::LsmScope, last_control_log_index),
 			);
@@ -933,7 +933,7 @@ impl SlabManager {
 			}
 			Err(_) if already_published => {}
 			Err(error) => {
-				self.unapplied_tier_pointers.insert(
+				self.record_tier_deferral(
 					pointer.slab_id,
 					TierDeferral {
 						pointer: pointer.clone(),

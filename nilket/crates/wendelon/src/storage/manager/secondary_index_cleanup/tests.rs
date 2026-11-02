@@ -376,6 +376,7 @@ async fn interrupted_staging_is_removed_by_actual_owned_manager_reopen() {
 			.unwrap();
 		let manager = super::super::SlabManager::open_with_owner(
 			super::super::SlabManagerConfig {
+				tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 				dir: dir.to_path_buf(),
 				max_slab_bytes: 1024 * 1024,
 				io: crate::storage::io_uring::spawn_io_thread(64).unwrap(),

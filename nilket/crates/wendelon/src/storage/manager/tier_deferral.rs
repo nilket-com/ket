@@ -190,6 +190,18 @@ impl TierReplay {
 }
 
 impl SlabManager {
+	/// Record `deferral` for `slab_id`. A replayable one schedules the
+	/// authority worker once it is visible, so a committed fence never waits
+	/// on an unrelated authority change or a sweeper pass to be replayed.
+	pub(super) fn record_tier_deferral(&self, slab_id: SlabId, deferral: TierDeferral) {
+		let replayable = deferral.replayable_index().is_some();
+		self.unapplied_tier_pointers.insert(slab_id, deferral);
+		if replayable {
+			self.tier_authority.start();
+			self.tier_authority.notify_changed();
+		}
+	}
+
 	pub(crate) fn bind_canonical_tier_source(&self, source: crate::consensus::TierSnapshotSource) {
 		let _ = self.canonical_tier_source.set(source);
 	}
@@ -278,9 +290,12 @@ impl SlabManager {
 #[derive(Clone, Copy, Debug)]
 pub(super) struct ReplaySchedule {
 	not_before: tokio::time::Instant,
-	/// The budget's release epoch after the last failed attempt, so that the
-	/// attempt's own refunds never count as a release that could unblock it.
+	/// The budget's release epoch when the last attempt ended. Replay
+	/// attempts never advance it (`within_replay_attempt`), so a later epoch
+	/// is a genuine release.
 	release_epoch: u64,
+	/// The deferral left by the last attempt is fenced on the budget.
+	budget: bool,
 	attempts: u32,
 }
 
@@ -288,24 +303,40 @@ pub(super) struct ReplaySchedule {
 #[derive(Debug, Default)]
 pub(super) struct ReplayRound {
 	pub(super) progressed: bool,
+	/// Replays attempted in this round.
+	pub(super) attempted: u32,
 	/// The earliest scheduled retry of a deferral still waiting.
 	pub(super) next: Option<tokio::time::Instant>,
-	/// A waiting deferral's cause is the budget, so a release may clear it.
-	pub(super) waits_for_budget: bool,
+	/// The lowest release epoch a budget-fenced deferral last observed: any
+	/// later release may clear it, so the worker waits for releases past it.
+	pub(super) budget_watermark: Option<u64>,
 }
 
-/// Test seams for the worker's replay: attempts made, and a backoff override.
+/// Test seams for the worker's replay.
 #[cfg(test)]
 #[derive(Debug, Default)]
 pub(super) struct ReplayProbe {
+	/// Attempts started.
 	pub(super) attempts: std::sync::atomic::AtomicU64,
+	/// Failed attempts whose schedule is recorded.
+	pub(super) failures: std::sync::atomic::AtomicU64,
 	pub(super) backoff: std::sync::Mutex<Option<std::time::Duration>>,
+	/// Hold the worker after a round that attempted nothing, just before it
+	/// registers its waiters: the last point a release can be missed.
+	pub(super) before_wait:
+		std::sync::Mutex<Option<(Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>>,
 }
 
 fn replay_backoff(attempts: u32) -> std::time::Duration {
 	std::time::Duration::from_millis(200)
 		.saturating_mul(1 << attempts.min(8))
 		.min(std::time::Duration::from_secs(30))
+}
+
+fn fenced_on_budget(deferral: Option<&TierDeferral>) -> bool {
+	deferral.is_some_and(
+		|deferral| matches!(deferral.outcome, DeferralOutcome::Fenced(cause) if cause.waits_for_budget()),
+	)
 }
 
 impl SlabManager {
@@ -322,29 +353,18 @@ impl SlabManager {
 			.unapplied_tier_pointers
 			.iter()
 			.filter(|entry| entry.value().replayable_index().is_some())
-			.map(|entry| {
-				let budget = matches!(
-					entry.value().outcome,
-					DeferralOutcome::Fenced(cause) if cause.waits_for_budget()
-				);
-				(*entry.key(), budget)
-			})
+			.map(|entry| *entry.key())
 			.collect::<Vec<_>>();
-		schedule.retain(|id, _| candidates.iter().any(|(candidate, _)| candidate == id));
+		schedule.retain(|id, _| candidates.contains(id));
 		if self.canonical_tier_source.get().is_none() {
 			return round;
 		}
-		for (slab_id, budget) in candidates {
+		for slab_id in candidates {
 			let now = tokio::time::Instant::now();
 			if let Some(entry) = schedule.get(&slab_id) {
-				let released = budget && self.tier_budget.release_epoch() > entry.release_epoch;
+				let released =
+					entry.budget && self.tier_budget.release_epoch() > entry.release_epoch;
 				if now < entry.not_before && !released {
-					round.next = Some(
-						round
-							.next
-							.map_or(entry.not_before, |next| next.min(entry.not_before)),
-					);
-					round.waits_for_budget |= budget;
 					continue;
 				}
 			}
@@ -355,21 +375,26 @@ impl SlabManager {
 				.get(&slab_id)
 				.map(|entry| entry.value().clone());
 			let epoch = self.capture_snapshot_epoch();
+			round.attempted += 1;
 			#[cfg(test)]
 			self.replay_probe
 				.attempts
 				.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-			let outcome = match self.try_canonical_tier_pointer(slab_id) {
-				Some(committed) => {
-					self.replay_tier_deferral_under_publication_lock(
-						slab_id,
-						committed.as_ref(),
-						epoch,
-					)
-					.await
+			let outcome = super::tier_budget::within_replay_attempt(async {
+				match self.try_canonical_tier_pointer(slab_id) {
+					Some(committed) => {
+						self.replay_tier_deferral_under_publication_lock(
+							slab_id,
+							committed.as_ref(),
+							epoch,
+						)
+						.await
+					}
+					None => TierReplay::Unchanged,
 				}
-				None => TierReplay::Unchanged,
-			};
+			})
+			.await;
+			let release_epoch = self.tier_budget.release_epoch();
 			// Progress is the exact deferral gone or replaced, never a reported
 			// success alone: an `Ok` that leaves it in place is retried on the
 			// backoff, so the worker cannot spin.
@@ -389,17 +414,34 @@ impl SlabManager {
 			let backoff = replay_backoff(attempts);
 			#[cfg(test)]
 			let backoff = self.replay_probe.backoff.lock().unwrap().unwrap_or(backoff);
-			let next = tokio::time::Instant::now() + backoff;
 			schedule.insert(
 				slab_id,
 				ReplaySchedule {
-					not_before: next,
-					release_epoch: self.tier_budget.release_epoch(),
+					not_before: tokio::time::Instant::now() + backoff,
+					release_epoch,
+					// What the deferral is fenced on now, after this attempt.
+					budget: fenced_on_budget(current.as_ref()),
 					attempts,
 				},
 			);
-			round.next = Some(round.next.map_or(next, |current| current.min(next)));
-			round.waits_for_budget |= budget;
+			#[cfg(test)]
+			self.replay_probe
+				.failures
+				.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+		}
+		for entry in schedule.values() {
+			round.next = Some(
+				round
+					.next
+					.map_or(entry.not_before, |next| next.min(entry.not_before)),
+			);
+			if entry.budget {
+				round.budget_watermark = Some(
+					round
+						.budget_watermark
+						.map_or(entry.release_epoch, |mark| mark.min(entry.release_epoch)),
+				);
+			}
 		}
 		round
 	}

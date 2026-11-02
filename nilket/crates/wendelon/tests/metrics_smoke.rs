@@ -185,6 +185,7 @@ async fn build_manager_with_sealed_slabs(
 	let dir = fresh_dir("l1");
 	let io = spawn_io_thread(64).unwrap();
 	let manager = initialize_test_manager(SlabManagerConfig {
+		tier_history_budget_bytes: wendelon::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dir.to_path_buf(),
 		max_slab_bytes: 1,
 		io,

@@ -199,6 +199,8 @@ pub struct NodeBootstrapConfig {
 	pub slab_max_bytes: u64,
 	/// ADR 016 coalescing window for data-path durable writes.
 	pub group_commit: GroupCommitConfig,
+	/// ADR 0692 §7 node budget for tier history, in bytes.
+	pub tier_history_budget_bytes: u64,
 	/// Replication factor published into the ring. Single-node
 	/// deployments run at RF=1; production minimum is 3.
 	pub rf: usize,
@@ -341,6 +343,7 @@ impl NodeBootstrapConfig {
 			data_dir,
 			slab_max_bytes: 64 * 1024 * 1024,
 			group_commit: GroupCommitConfig::default(),
+			tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 			rf: 1,
 			wal_io_depth: 64,
 			slab_io_depth: 64,
@@ -1717,6 +1720,7 @@ impl WendelonNode {
 		#[cfg(not(feature = "test-support"))]
 		let slab: Arc<SlabManager> = {
 			let config = SlabManagerConfig {
+				tier_history_budget_bytes: cfg.tier_history_budget_bytes,
 				dir: cfg.data_dir.clone(),
 				max_slab_bytes: cfg.slab_max_bytes,
 				io: slab_io.clone(),
@@ -1748,6 +1752,7 @@ impl WendelonNode {
 		#[cfg(feature = "test-support")]
 		let slab: Arc<SlabManager> = {
 			let config = SlabManagerConfig {
+				tier_history_budget_bytes: cfg.tier_history_budget_bytes,
 				dir: cfg.data_dir.clone(),
 				max_slab_bytes: cfg.slab_max_bytes,
 				io: slab_io.clone(),
