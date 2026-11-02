@@ -2609,7 +2609,7 @@ impl SlabManager {
 			.await?,
 		);
 		state.active = next;
-		state.sealed.insert(sealed_id, sealed);
+		state.install_sealed(&self.tier_budget, sealed_id, sealed);
 		state.advance_slab_allocator(next_id.saturating_add(1));
 		self.record_l0_compaction_run(sealed_id, sealed_size);
 		Ok(Some(sealed_id))

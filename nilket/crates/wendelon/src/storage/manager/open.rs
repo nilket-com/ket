@@ -781,6 +781,7 @@ impl SlabManager {
 				rehydrating: HashSet::new(),
 				next_slab_id,
 				tier_layouts: DashMap::new(),
+				disposal_evidence: Default::default(),
 			}),
 			compaction_manifest: RwLock::new(compaction_manifest),
 			slab_pins: Arc::new(SlabPinTable::default()),

@@ -1520,6 +1520,7 @@ impl SlabManager {
 		}
 		// The old slab is disposed: its redirects go with it.
 		self.redirects.remove_touching(&self.tier_budget, slab_id);
+		self.record_disposal_evidence(slab_id).await;
 		for record in records {
 			self.rollback_indexed_location(
 				record.tenant_id,
@@ -1832,7 +1833,7 @@ impl SlabManager {
 		// single key critical section. A stale holder of an old location follows
 		// the published redirect, or reads the retained old backing.
 		let state = self.state.lock().await;
-		state.sealed.insert(new_slab_id, replacement);
+		state.install_sealed(&self.tier_budget, new_slab_id, replacement);
 		// Installed before the key edits, so each applied pair's published bit
 		// is visible to readers of the store from then on.
 		if let Some(install) = redirect_install

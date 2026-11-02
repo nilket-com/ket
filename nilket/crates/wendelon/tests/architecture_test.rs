@@ -9703,6 +9703,8 @@ fn adr078_manager_source_concatenates_submodules() {
 			"manager.rs",
 			"compaction.rs",
 			"counter_visibility.rs",
+			// ADR 0696 (0692 §7): disposal evidence for typed Superseded after disposal.
+			"disposal_evidence.rs",
 			"encoding_compute.rs",
 			"index_publication.rs",
 			"lsm_driver.rs",
@@ -9716,9 +9718,9 @@ fn adr078_manager_source_concatenates_submodules() {
 			// out of the bounded root.
 			"pause_hooks.rs",
 			"publication_accounting.rs",
-			// ADR 0692: per-key relocation and atomic empty-key removal.
 			// ADR 0696 (0692 §7): charged cross-slab redirects of maintenance rewrites.
 			"redirect_store.rs",
+			// ADR 0692: per-key relocation and atomic empty-key removal.
 			"relocation.rs",
 			"retention_reclaim.rs",
 			"secondary_index_cleanup.rs",
@@ -11717,4 +11719,33 @@ fn every_tier_proposer_holds_a_history_token() {
 		!manager.contains("TierProposal {\n\t\t\ttier,\n\t\t\ttoken: None"),
 		"production never builds an unreserved proposal"
 	);
+}
+
+/// ADR 0696 (0692 §7, plan r3 D): every backing installed into the manager
+/// state goes through `ManagerState::install_{sealed,tiered,rehydrated}`,
+/// which forget the slab's disposal evidence first, so evidence never
+/// outlives a backing installed for that slab again.
+#[test]
+fn every_backing_install_forgets_disposal_evidence() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	for map in ["sealed", "tiered", "rehydrated"] {
+		let needle = format!(".{map}.insert(");
+		let found = manager_occurrences(manifest_dir, |source| source.matches(&needle).count());
+		assert_eq!(
+			found,
+			vec![("manager.rs".to_string(), 1)],
+			"`{needle}` only inside ManagerState::install_{map}"
+		);
+		let source = fs::read_to_string(manifest_dir.join("src/storage/manager.rs")).unwrap();
+		let helper = format!("fn install_{map}(");
+		let start = source.find(&helper).expect("the install helper exists");
+		let body = &source[start..start + source[start..].find("\n\t}").unwrap()];
+		let forget = body
+			.find("disposal_evidence.forget(")
+			.expect("it forgets evidence");
+		assert!(
+			forget < body.find(&needle).unwrap(),
+			"install_{map} forgets the evidence before it installs"
+		);
+	}
 }

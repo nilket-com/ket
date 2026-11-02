@@ -1796,6 +1796,7 @@ impl SlabManager {
 		}
 		let epoch = self.begin_tier_snapshot_install()?;
 		let gate = self.persistent_index_gate.clone().write_owned().await;
+		self.clear_disposal_evidence().await;
 		let local = self.tiered_pointers_snapshot().await;
 		let marks = local
 			.into_iter()
@@ -1963,6 +1964,8 @@ impl SlabManager {
 		if self.capture_snapshot_epoch() != snapshot_epoch {
 			return Err(obsolete_verification());
 		}
+		// A snapshot comparison is a bulk authority event.
+		self.clear_disposal_evidence().await;
 		if replay_confirmation.is_some()
 			&& index
 				.zip(
@@ -2377,6 +2380,8 @@ impl SlabManager {
 		if let Some(error) = self.tier_authority.integrity_error() {
 			return Err(error);
 		}
+		// Authority staging (bootstrap, replay, snapshot) is a bulk event.
+		self.clear_disposal_evidence().await;
 		let known = self
 			.tier_authority
 			.pending

@@ -1195,7 +1195,7 @@ impl SlabManager {
 			if released_sealed || released_copy {
 				self.release_slab_file(pointer.slab_id);
 			}
-			state.tiered.insert(pointer.slab_id, pointer.clone());
+			state.install_tiered(&self.tier_budget, pointer.slab_id, pointer.clone());
 			if let Some(layout) = next_layout {
 				state.tier_layouts.insert(pointer.slab_id, layout);
 			}
@@ -1391,6 +1391,7 @@ impl SlabManager {
 			self.rollback_indexed_location(row.tenant_id, row.key_identity, row.location);
 		}
 		self.redirects.remove_touching(&self.tier_budget, slab_id);
+		self.record_disposal_evidence(slab_id).await;
 		self.clear_tiered_stats_cache_for_slab(slab_id);
 		if let Some(publication) = publication {
 			publication.complete();
@@ -1501,6 +1502,7 @@ impl SlabManager {
 			self.rollback_indexed_location(row.tenant_id, row.key_identity, row.location);
 		}
 		self.redirects.remove_touching(&self.tier_budget, slab_id);
+		self.record_disposal_evidence(slab_id).await;
 		self.clear_tiered_stats_cache_for_slab(slab_id);
 		if let Some(intent) = retained {
 			self.note_snapshot_retirement_applied(
@@ -2445,7 +2447,7 @@ impl SlabManager {
 			}
 			Ok(installed) => {
 				state.hot_read_counts.remove(&pointer.slab_id);
-				state.rehydrated.insert(pointer.slab_id, installed);
+				state.install_rehydrated(&self.tier_budget, pointer.slab_id, installed);
 				Ok(())
 			}
 			Err(err) => {

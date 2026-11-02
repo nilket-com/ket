@@ -20622,7 +20622,14 @@ async fn a_disagreeing_slab_file_survives_tier_retirement_its_retry_and_deferred
 		.read(held)
 		.await
 		.expect_err("a location of the retired slab never serves");
-	assert_eq!(error.kind(), ErrorKind::NotFound, "{error}");
+	// Tier retirement is an authorized disposal (ADR 0696, plan r3 D): the
+	// stale holder gets the typed refusal, where it once got an untyped
+	// `NotFound`.
+	assert_eq!(
+		stale_location(&error).map(|stale| stale.reason),
+		Some(StaleLocationReason::Superseded),
+		"{error}"
+	);
 }
 
 #[tokio::test]
@@ -44714,4 +44721,220 @@ async fn a_rewrite_without_room_for_its_redirects_skips_them_and_counts_it() {
 			"the retained old slab still serves {key:?}"
 		);
 	}
+}
+
+/// `seed_small_retired_gc_slab`, also returning the stale holder's location:
+/// the row's original location in the now Retired input slab.
+async fn seed_small_retired_gc_slab_at(
+	manager: &Arc<SlabManager>,
+) -> (SlabId, Identity, RecordLocation) {
+	let key = id(0xdd20);
+	let old = manager
+		.append_durable(tenant(), key, hlc(10), b"gc-survivor")
+		.await
+		.unwrap();
+	assert_eq!(manager.force_seal_active_for_test().await, old.slab_id);
+	let before = manager.compaction_manifest_snapshot();
+	let plan = CompactionPlan {
+		job_id: CompactionJobId::new(0xdd20),
+		source_level: CompactionLevelIndex::L0,
+		target_level: CompactionLevelIndex::L1,
+		manifest_epoch_pre: before.manifest_epoch,
+		input_slabs: vec![old.slab_id],
+		overlapping_slabs: Vec::new(),
+		retention_floor_snapshot: hlc(0),
+		compaction_start_hlc: hlc(20),
+		dominant_reason: crate::storage::DominantReason::Operator,
+	};
+	let worker = LsmCompactionWorker::new(LsmConfig::default(), manager.slab_pin_table()).unwrap();
+	manager
+		.run_lsm_compaction_once(&worker, plan)
+		.await
+		.unwrap();
+	(old.slab_id, key, old)
+}
+
+fn is_superseded(result: &std::io::Result<Vec<u8>>) -> bool {
+	result
+		.as_ref()
+		.err()
+		.and_then(stale_location)
+		.map(|stale| stale.reason)
+		== Some(StaleLocationReason::Superseded)
+}
+
+async fn sweep_gc(manager: &Arc<SlabManager>, slab_id: SlabId) {
+	let gc = LsmGcWorker::new(LsmConfig::default(), manager.slab_pin_table()).unwrap();
+	assert!(
+		manager
+			.sweep_lsm_delete_pending_once(&gc)
+			.await
+			.unwrap()
+			.contains(&slab_id),
+		"premise: GC disposed of the Retired input"
+	);
+}
+
+/// A stale holder of a location in a slab LSM GC disposed of gets typed
+/// `Superseded`, read in the same snapshot as the missing backing; before
+/// GC, while the input is only Retired, it is served from the retained slab.
+#[tokio::test]
+async fn a_stale_holder_after_lsm_gc_gets_superseded_and_before_it_is_served() {
+	let (_dir, manager) = fresh_manager().await;
+	let (slab_id, key, old) = seed_small_retired_gc_slab_at(&manager).await;
+	assert_eq!(
+		manager.read(old).await.unwrap(),
+		b"gc-survivor",
+		"Retired, not yet disposed: the old backing serves"
+	);
+	sweep_gc(&manager, slab_id).await;
+	let read = manager.read(old).await;
+	assert!(is_superseded(&read), "{read:?}");
+	assert_eq!(
+		manager
+			.read(manager.lookup(tenant(), key).unwrap().unwrap())
+			.await
+			.unwrap(),
+		b"gc-survivor",
+		"the current location still serves"
+	);
+}
+
+/// Maintenance without replacement (every row of the slab reclaimed) is an
+/// authorized disposal too: a stale holder of a reclaimed row's location
+/// gets `Superseded`.
+#[tokio::test]
+async fn a_stale_holder_after_maintenance_without_replacement_gets_superseded() {
+	let (_dir, mgr) = fresh_manager().await;
+	let doomed = id(0xD100);
+	let old = mgr
+		.append(tenant(), doomed, hlc(10), b"doomed")
+		.await
+		.unwrap();
+	force_seal_active(&mgr).await;
+	mgr.append(tenant(), id(0xD1FF), hlc(40), b"active-row")
+		.await
+		.unwrap();
+	let target = Locality::from(doomed).get();
+	let tombstone = MigratedRangeTombstone {
+		migration_id: 1,
+		range_start: target,
+		range_end: target,
+		to_epoch: 2,
+		completed_by: NodeId {
+			id: 7,
+			_reserved: 0,
+		},
+		completed_at_hlc: hlc(1),
+		migration_hlc_floor: hlc(0),
+	};
+	let (schemas, indexes) = empty_compaction_catalogs();
+	let report = mgr
+		.reclaim_tombstoned_ranges(&[tombstone], &schemas, &indexes, 1)
+		.await
+		.unwrap();
+	eprintln!("reclaim report: {report:?}");
+	assert!(
+		mgr.state.lock().await.sealed.get(&old.slab_id).is_none(),
+		"premise: the slab was disposed without replacement"
+	);
+	let read = mgr.read(old).await;
+	assert!(is_superseded(&read), "{read:?}");
+}
+
+/// Installing a backing for a disposed slab again forgets its evidence: if
+/// that backing later goes missing for any other reason, the answer is the
+/// existing missing-slab failure, never `Superseded`.
+#[tokio::test]
+async fn reinstalling_a_disposed_slab_forgets_its_disposal_evidence() {
+	let (_dir, manager) = fresh_manager().await;
+	let (slab_id, _key, old) = seed_small_retired_gc_slab_at(&manager).await;
+	sweep_gc(&manager, slab_id).await;
+	assert!(is_superseded(&manager.read(old).await), "premise");
+	{
+		let state = manager.state.lock().await;
+		let active = state.active.clone();
+		state.install_sealed(&manager.tier_budget, slab_id, active);
+		assert!(!state.disposal_evidence.contains(slab_id));
+		state.sealed.remove(&slab_id);
+	}
+	let read = manager.read(old).await;
+	assert!(!is_superseded(&read), "{read:?}");
+	assert!(read.is_err());
+}
+
+/// A bulk authority event (here a snapshot comparison) clears all disposal
+/// evidence: a stale holder then gets the existing failure, not `Superseded`.
+#[tokio::test]
+async fn a_snapshot_comparison_after_disposal_clears_its_evidence() {
+	let (_dir, manager) = fresh_manager().await;
+	let (slab_id, _key, old) = seed_small_retired_gc_slab_at(&manager).await;
+	sweep_gc(&manager, slab_id).await;
+	assert!(is_superseded(&manager.read(old).await), "premise");
+	let epoch = manager.begin_tier_snapshot_install().unwrap();
+	let installed = manager
+		.finish_tier_snapshot_install_at_epoch(vec![], Some(1), epoch)
+		.await;
+	eprintln!("snapshot install: {installed:?}");
+	assert!(
+		!manager
+			.state
+			.lock()
+			.await
+			.disposal_evidence
+			.contains(slab_id)
+	);
+	let read = manager.read(old).await;
+	assert!(!is_superseded(&read), "{read:?}");
+}
+
+/// A disposal whose evidence the budget cannot hold records none: a stale
+/// holder gets the existing failure, never a `Superseded` without evidence.
+#[tokio::test]
+async fn a_disposal_without_room_for_its_evidence_degrades_to_the_existing_failure() {
+	let (_dir, manager) = fresh_manager().await;
+	let (slab_id, _key, old) = seed_small_retired_gc_slab_at(&manager).await;
+	manager
+		.tier_budget
+		.set_limit_for_test(manager.tier_budget.used());
+	sweep_gc(&manager, slab_id).await;
+	assert_eq!(
+		manager.state.lock().await.disposal_evidence.len_for_test(),
+		0
+	);
+	let read = manager.read(old).await;
+	assert!(!is_superseded(&read), "{read:?}");
+	assert!(read.is_err());
+}
+
+/// A GC sweep that aborts while the run is delete-pending (here because the
+/// slab path no longer names its owned handle) disposed of nothing, so it
+/// enters no evidence: a stale holder never gets `Superseded`.
+#[tokio::test]
+async fn a_gc_abort_while_delete_pending_enters_no_disposal_evidence() {
+	let (dir, manager) = fresh_manager().await;
+	let (slab_id, _key, old) = seed_small_retired_gc_slab_at(&manager).await;
+	let path = slab_path(&dir, slab_id);
+	std::fs::rename(&path, path.with_extension("saved")).unwrap();
+	std::fs::write(&path, b"unrelated replacement").unwrap();
+	let gc = LsmGcWorker::new(LsmConfig::default(), manager.slab_pin_table()).unwrap();
+	assert_eq!(
+		manager
+			.sweep_lsm_delete_pending_once(&gc)
+			.await
+			.unwrap_err()
+			.kind(),
+		ErrorKind::InvalidData,
+		"premise: the sweep aborts"
+	);
+	assert!(
+		!manager
+			.state
+			.lock()
+			.await
+			.disposal_evidence
+			.contains(slab_id)
+	);
+	let read = manager.read(old).await;
+	assert!(!is_superseded(&read), "{read:?}");
 }

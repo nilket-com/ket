@@ -434,7 +434,7 @@ impl SlabManager {
 			.await?;
 		{
 			let state = self.state.lock().await;
-			state.tiered.insert(pointer.slab_id, pointer.clone());
+			state.install_tiered(&self.tier_budget, pointer.slab_id, pointer.clone());
 			state.tier_layouts.insert(pointer.slab_id, next);
 		}
 		// The durable transaction succeeded. Mirror it under the publication

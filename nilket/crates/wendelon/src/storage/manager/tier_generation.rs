@@ -370,6 +370,15 @@ fn select_in_snapshot(
 	if let Some(copy) = state.rehydrated.get(&location.slab_id) {
 		return Ok((SlabBacking::Local(copy.slab.clone()), location));
 	}
+	// Missing in this snapshot. Only evidence of an authorized disposal,
+	// read in the same snapshot, makes it a typed `Superseded`; otherwise the
+	// reader's existing missing-slab handling applies.
+	if state.disposal_evidence.contains(location.slab_id) {
+		return Err(stale_location_error(
+			location.slab_id,
+			StaleLocationReason::Superseded,
+		));
+	}
 	Ok((SlabBacking::Missing, location))
 }
 
