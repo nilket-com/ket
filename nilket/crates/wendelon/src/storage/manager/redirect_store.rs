@@ -215,18 +215,29 @@ impl RedirectStores {
 	}
 
 	/// Install a reserved map in place of any earlier one for its source.
+	/// Maps revoked earlier (a removal that could not build its copy) are
+	/// left out, so this successful write removes them as any other does.
 	/// Returns false, installing nothing, when the copy cannot be built in
 	/// the reserved room; the rewrite then publishes no redirects.
 	pub(super) fn install(&self, install: RedirectInstall) -> bool {
 		let RedirectInstall { map, mut room } = install;
 		let _writer = self.write_lock();
 		let current = self.load();
-		let len = current.maps.len() + usize::from(!current.maps.contains_key(&map.source));
+		// The existing live maps of other sources, and the new one: at most
+		// the reserved count (the store's length then, plus one).
+		let kept = |source: &SlabId, existing: &Arc<SourceRedirects>| {
+			*source != map.source && !existing.revoked.load(Ordering::Acquire)
+		};
+		let len = current
+			.maps
+			.iter()
+			.filter(|(source, existing)| kept(source, existing))
+			.count() + 1;
 		let Ok(mut maps) = try_bounded_map(len) else {
 			return false;
 		};
 		for (source, existing) in &current.maps {
-			if *source != map.source {
+			if kept(source, existing) {
 				maps.insert(*source, existing.clone());
 			}
 		}
@@ -404,6 +415,42 @@ mod tests {
 			"removed by the next successful write"
 		);
 		assert!(stores.source_map_for_test(SlabId::new(1)).is_none());
+	}
+
+	/// A successful install is a successful outer write: a map revoked by a
+	/// removal that found no room is left out of its copy, while the other
+	/// maps keep serving, and the revoked map's charge is refunded once the
+	/// last reader of an older generation drops it.
+	#[test]
+	fn an_unrelated_install_removes_a_map_revoked_under_exhaustion() {
+		let budget = TierMemoryBudget::new(1 << 20);
+		let stores = RedirectStores::default();
+		installed(&stores, &budget, 1, 2);
+		installed(&stores, &budget, 3, 4);
+		let redirect_before = budget.used_by(TierBudgetKind::Redirect);
+		let old_reader = stores.source_map_for_test(SlabId::new(1)).unwrap();
+		budget.set_limit_for_test(budget.used());
+		stores.remove_touching(&budget, SlabId::new(2));
+		assert_eq!(stores.len_for_test(), 2, "premise: removal found no room");
+		budget.set_limit_for_test(1 << 20);
+		installed(&stores, &budget, 5, 6);
+		assert!(
+			stores.source_map_for_test(SlabId::new(1)).is_none(),
+			"the revoked map is not carried into the new generation"
+		);
+		assert_eq!(stores.len_for_test(), 2);
+		assert_eq!(stores.resolve(&location(3, 0)), Some(location(4, 0)));
+		assert_eq!(stores.resolve(&location(5, 0)), Some(location(6, 0)));
+		assert_eq!(stores.resolve(&location(1, 0)), None);
+		let with_reader = budget.used_by(TierBudgetKind::Redirect);
+		drop(old_reader);
+		let single = with_reader - budget.used_by(TierBudgetKind::Redirect);
+		assert!(single > 0, "the last reader's drop refunds the revoked map");
+		assert_eq!(
+			budget.used_by(TierBudgetKind::Redirect),
+			redirect_before,
+			"two live maps' worth remains"
+		);
 	}
 
 	/// Writers serialize on the writer mutex and each copies the current
