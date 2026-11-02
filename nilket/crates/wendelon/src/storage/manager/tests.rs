@@ -45401,3 +45401,356 @@ fn a_block_reset_keeps_its_starting_headroom_through_a_refund() {
 		"a later, larger headroom does not raise the minimum: {out}"
 	);
 }
+/// A three-voter in-process control cluster (the b1t harness) whose node
+/// `observer` applies through `manager`'s tier observer.
+struct ControlCluster {
+	nodes: Vec<crate::consensus::WendelonRaft>,
+	_network: b1t_network::Network,
+	_logs: Vec<crate::consensus::WendelonLogStore>,
+	_dirs: Vec<crate::test_support::TestDir>,
+}
+
+async fn control_cluster(observer: u32, manager: &Arc<SlabManager>) -> ControlCluster {
+	use crate::consensus::{WendelonLogStore, WendelonRaft};
+	let network = b1t_network::Network::default();
+	let config = Arc::new(
+		crate::consensus::retention::ControlRetention::default()
+			.openraft_config("wendelon")
+			.validate()
+			.unwrap(),
+	);
+	let (mut logs, mut dirs, mut nodes) = (Vec::new(), Vec::new(), Vec::new());
+	for node_id in 1_u32..=3 {
+		let dir = fresh_dir("s7-control-cluster-wal");
+		let log = WendelonLogStore::open_for_retention_test(&dir, 64 * 4096, None)
+			.await
+			.unwrap();
+		let mut sm = log.recovered_state_machine().await.unwrap();
+		if node_id == observer {
+			sm = sm.with_tier_observer(Arc::new(crate::storage::ManagerTierObserver::new(
+				manager.clone(),
+			)));
+		}
+		let raft = WendelonRaft::new(node_id, config.clone(), network.clone(), log.clone(), sm)
+			.await
+			.unwrap();
+		network.0.lock().unwrap().insert(node_id, raft.clone());
+		logs.push(log);
+		dirs.push(dir);
+		nodes.push(raft);
+	}
+	let members = (1_u32..=3)
+		.map(|id| {
+			(
+				id,
+				openraft::BasicNode {
+					addr: "127.0.0.1:0".into(),
+				},
+			)
+		})
+		.collect::<BTreeMap<_, _>>();
+	nodes[0].initialize(members).await.unwrap();
+	for node in &nodes {
+		node.wait(Some(Duration::from_secs(60)))
+			.current_leader(1, "initial control leader")
+			.await
+			.unwrap();
+	}
+	ControlCluster {
+		nodes,
+		_network: network,
+		_logs: logs,
+		_dirs: dirs,
+	}
+}
+
+impl ControlCluster {
+	/// Commit `pointer` through the current leader `leader` (1-based) and
+	/// wait until every voter applied it.
+	async fn commit_tier(&self, leader: u32, pointer: &TieredSlabPointer) -> u64 {
+		let committed = self.nodes[leader as usize - 1]
+			.client_write(crate::consensus::WendelonRequest::TierSlab(b10_tier(
+				pointer,
+			)))
+			.await
+			.unwrap();
+		for node in &self.nodes {
+			node.wait(Some(Duration::from_secs(60)))
+				.applied_index_at_least(Some(committed.log_id.index), "every voter applied")
+				.await
+				.unwrap();
+		}
+		committed.log_id.index
+	}
+
+	/// Make `node` (1-based) the leader through a real election.
+	async fn elect(&self, node: u32) {
+		let target = &self.nodes[node as usize - 1];
+		tokio::time::timeout(Duration::from_secs(60), async {
+			loop {
+				if self
+					.nodes
+					.iter()
+					.all(|raft| raft.metrics().borrow().current_leader == Some(node))
+				{
+					break;
+				}
+				let _ = target.trigger().elect().await;
+				tokio::time::sleep(Duration::from_millis(200)).await;
+			}
+		})
+		.await
+		.expect("the node wins a real election");
+	}
+}
+
+/// Multinode: a follower's observer funds its own apply. The proposer's
+/// token lives on another node and is resolved there; follower node 2, its
+/// budget exhausted, fences the committed pointer typed on the budget, and
+/// its own worker publishes it once a release makes room, with no sweeper
+/// and no manual wake.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_followers_apply_without_the_proposers_token_fences_and_publishes_on_release() {
+	use super::tier_budget::TierBudgetKind;
+	use super::tier_deferral::DeferralOutcome;
+	let (_dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let cluster = control_cluster(2, &mgr).await;
+	cluster.commit_tier(1, &old).await;
+	assert_eq!(mgr.tier_pointer(old.slab_id).await, Some(old.clone()));
+	let bytes = l2.get(&old.l2_uri).await.unwrap();
+	let replacement = TieredSlabPointer {
+		l2_uri: l2.put("tier/s7-follower.wnd", &bytes).await.unwrap(),
+		..old.clone()
+	};
+	*mgr.replay_probe.backoff.lock().unwrap() = Some(Duration::from_secs(3600));
+	let room = mgr.tier_budget.limit() - mgr.tier_budget.used();
+	let hog = mgr
+		.tier_budget
+		.try_reserve(TierBudgetKind::Scratch, room)
+		.unwrap();
+	let index = cluster.commit_tier(1, &replacement).await;
+	let deferral = mgr
+		.unapplied_tier_pointers
+		.get(&old.slab_id)
+		.map(|entry| entry.value().clone());
+	assert!(
+		deferral
+			.as_ref()
+			.is_some_and(|deferral| deferral.pointer == replacement
+				&& deferral.provenance == Some(index)
+				&& matches!(deferral.outcome, DeferralOutcome::Fenced(cause) if cause.waits_for_budget())),
+		"the follower fences typed on its own budget: {deferral:?}"
+	);
+	drop(hog);
+	assert!(
+		eventually(60, async || mgr.tier_pointer(old.slab_id).await.as_ref()
+			== Some(&replacement))
+		.await,
+		"the follower's worker publishes after the release: {}",
+		replay_diagnostics(&mgr, old.slab_id)
+	);
+}
+
+/// Multinode: across a leader change, a newer committed pointer wins over
+/// an older fenced one. Follower node 2 fences P1 on the index gate; the
+/// leader moves to node 3, which commits P2; node 2 publishes P2, never P1.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn across_a_leader_change_a_newer_committed_pointer_wins_over_an_older_fence() {
+	let (_dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let cluster = control_cluster(2, &mgr).await;
+	cluster.commit_tier(1, &old).await;
+	let bytes = l2.get(&old.l2_uri).await.unwrap();
+	let p1 = TieredSlabPointer {
+		l2_uri: l2.put("tier/s7-leader-p1.wnd", &bytes).await.unwrap(),
+		..old.clone()
+	};
+	let p2 = TieredSlabPointer {
+		l2_uri: l2.put("tier/s7-leader-p2.wnd", &bytes).await.unwrap(),
+		..old.clone()
+	};
+	*mgr.replay_probe.backoff.lock().unwrap() = Some(Duration::from_secs(3600));
+	let gate = mgr.hold_index_write_gate_for_test().await;
+	let p1_index = cluster.commit_tier(1, &p1).await;
+	assert!(
+		mgr.unapplied_tier_pointers
+			.get(&old.slab_id)
+			.is_some_and(
+				|entry| entry.value().fences(&p1) && entry.value().provenance == Some(p1_index)
+			),
+		"premise: node 2 fenced P1"
+	);
+	cluster.elect(3).await;
+	drop(gate);
+	let p2_index = cluster.commit_tier(3, &p2).await;
+	assert!(p2_index > p1_index);
+	assert!(
+		eventually(60, async || mgr.tier_pointer(old.slab_id).await.as_ref()
+			== Some(&p2))
+		.await,
+		"node 2 publishes the newer pointer: {}",
+		replay_diagnostics(&mgr, old.slab_id)
+	);
+	tokio::time::sleep(Duration::from_millis(500)).await;
+	assert_eq!(
+		mgr.tier_pointer(old.slab_id).await,
+		Some(p2),
+		"the older fence is never published after the newer pointer"
+	);
+	assert!(mgr.unapplied_tier_pointers.get(&old.slab_id).is_none());
+}
+
+/// One control voter over a persistent log in `dir`, applying through
+/// `manager`'s tier observer; `initialize` only on first start.
+async fn single_voter(
+	dir: &std::path::Path,
+	manager: &Arc<SlabManager>,
+	initialize: bool,
+) -> (
+	crate::consensus::WendelonRaft,
+	crate::consensus::WendelonLogStore,
+	b1t_network::Network,
+) {
+	use crate::consensus::{WendelonLogStore, WendelonRaft};
+	let network = b1t_network::Network::default();
+	let config = Arc::new(
+		crate::consensus::retention::ControlRetention::default()
+			.openraft_config("wendelon")
+			.validate()
+			.unwrap(),
+	);
+	let log = WendelonLogStore::open_for_retention_test(dir, 64 * 4096, None)
+		.await
+		.unwrap();
+	let sm = log
+		.recovered_state_machine()
+		.await
+		.unwrap()
+		.with_tier_observer(Arc::new(crate::storage::ManagerTierObserver::new(
+			manager.clone(),
+		)));
+	let raft = WendelonRaft::new(1, config, network.clone(), log.clone(), sm)
+		.await
+		.unwrap();
+	network.0.lock().unwrap().insert(1, raft.clone());
+	if initialize {
+		raft.initialize(BTreeMap::from([(
+			1,
+			openraft::BasicNode {
+				addr: "127.0.0.1:0".into(),
+			},
+		)]))
+		.await
+		.unwrap();
+	}
+	raft.wait(Some(Duration::from_secs(60)))
+		.current_leader(1, "the single voter leads")
+		.await
+		.unwrap();
+	(raft, log, network)
+}
+
+/// Multinode: restart while fenced. A node fences committed P1 on the
+/// index gate, then stops (its deferral is volatile and lost). After it
+/// reopens on the same store and log, its committed state already includes
+/// P1, and the authoritative reconcile pass (the sweeper's) converges the
+/// manager to P1 from that committed state: published, nothing deferred,
+/// rows served.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_node_restarted_while_fenced_converges_to_its_committed_pointer() {
+	let l1_dir = fresh_dir("s7-restart-fenced-l1");
+	let l2_dir = fresh_dir("s7-restart-fenced-l2");
+	let wal_dir = fresh_dir("s7-restart-fenced-wal");
+	let io = spawn_io_thread(64).unwrap();
+	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_dir).unwrap());
+	let crypto = test_crypto();
+	let mgr = SlabManager::initialize_new_store(reopen_test_config(
+		&l1_dir,
+		io.clone(),
+		l2.clone(),
+		crypto.clone(),
+	))
+	.await
+	.unwrap();
+	let key = id(0x5e930);
+	mgr.append_durable(tenant(), key, hlc(930), b"restart-row")
+		.await
+		.unwrap();
+	let old = tier_kv_slab(&mgr, &l2, "s7-restart-fenced/p0").await;
+	let bytes = l2.get(&old.l2_uri).await.unwrap();
+	let p1 = TieredSlabPointer {
+		l2_uri: l2.put("s7-restart-fenced/p1", &bytes).await.unwrap(),
+		..old.clone()
+	};
+	let (raft, log, _network) = single_voter(&wal_dir, &mgr, true).await;
+	for pointer in [&old] {
+		raft.client_write(crate::consensus::WendelonRequest::TierSlab(b10_tier(
+			pointer,
+		)))
+		.await
+		.unwrap();
+	}
+	assert_eq!(mgr.tier_pointer(old.slab_id).await, Some(old.clone()));
+	*mgr.replay_probe.backoff.lock().unwrap() = Some(Duration::from_secs(3600));
+	let gate = mgr.hold_index_write_gate_for_test().await;
+	let committed = raft
+		.client_write(crate::consensus::WendelonRequest::TierSlab(b10_tier(&p1)))
+		.await
+		.unwrap();
+	assert!(
+		mgr.unapplied_tier_pointers
+			.get(&old.slab_id)
+			.is_some_and(|entry| entry.value().fences(&p1)),
+		"premise: the node fenced P1"
+	);
+	drop(gate);
+	raft.shutdown().await.unwrap();
+	drop((raft, log));
+	mgr.tier_authority.stop();
+	drop(mgr);
+
+	let reopened = SlabManager::open(reopen_test_config(&l1_dir, io, l2, crypto))
+		.await
+		.unwrap();
+	let (raft, _log, _network) = single_voter(&wal_dir, &reopened, false).await;
+	raft.wait(Some(Duration::from_secs(60)))
+		.applied_index_at_least(Some(committed.log_id.index), "recovered through P1")
+		.await
+		.unwrap();
+	let committed_pointer = reopened
+		.try_canonical_tier_pointer(old.slab_id)
+		.expect("the observer bound the committed source")
+		.expect("committed state names the slab");
+	assert_eq!(
+		committed_pointer, p1,
+		"premise: committed state includes P1"
+	);
+	eprintln!(
+		"after restart: local {:?}, deferral {:?}, readiness {:?}",
+		reopened.tier_pointer(old.slab_id).await.map(|p| p.l2_uri),
+		reopened
+			.unapplied_tier_pointers
+			.get(&old.slab_id)
+			.map(|entry| entry.value().clone()),
+		reopened.tier_authority_readiness_reason()
+	);
+	let swept = sweep_with_committed(&reopened, old.slab_id, Some(p1.clone())).await;
+	eprintln!("reconcile pass: {swept:?}");
+	assert!(
+		eventually(60, async || reopened
+			.tier_pointer(old.slab_id)
+			.await
+			.as_ref() == Some(&p1))
+		.await,
+		"the restarted node converges to its committed pointer"
+	);
+	assert!(reopened.unapplied_tier_pointers.get(&old.slab_id).is_none());
+	tokio::time::timeout(
+		Duration::from_secs(60),
+		reopened.wait_tier_authority_ready(),
+	)
+	.await
+	.expect("readiness opens")
+	.unwrap();
+	let location = reopened.lookup(tenant(), key).unwrap().unwrap();
+	assert_eq!(reopened.read(location).await.unwrap(), b"restart-row");
+}
