@@ -2884,6 +2884,20 @@ pub struct TierSnapshotSource(std::sync::Weak<RwLock<SmInner>>);
 pub(crate) struct TierSnapshotLease(tokio::sync::OwnedRwLockReadGuard<SmInner>);
 
 impl TierSnapshotSource {
+	/// The committed tier record for `slab_id`, without waiting: `WouldBlock`
+	/// when the state machine is busy, so a caller holding observer-side locks
+	/// never waits on the apply loop.
+	pub(crate) fn try_tiered_slab(&self, slab_id: SlabId) -> std::io::Result<Option<TieredSlab>> {
+		let inner = self
+			.0
+			.upgrade()
+			.ok_or_else(|| Error::new(ErrorKind::BrokenPipe, "canonical tier source closed"))?;
+		let guard = inner
+			.try_read()
+			.map_err(|_| Error::new(ErrorKind::WouldBlock, "canonical tier state busy"))?;
+		Ok(guard.state.tiered_slabs.get(&slab_id).cloned())
+	}
+
 	pub(crate) async fn read(&self) -> std::io::Result<TierSnapshotLease> {
 		let inner = self
 			.0

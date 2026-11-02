@@ -839,6 +839,9 @@ impl SlabManager {
 			tier_budget: tier_budget.clone(),
 			tier_tokens,
 			unapplied_tier_pointers: DashMap::new(),
+			canonical_tier_source: std::sync::OnceLock::new(),
+			#[cfg(test)]
+			replay_probe: Default::default(),
 			#[cfg(test)]
 			counter_rollback_fail_once: std::sync::atomic::AtomicBool::new(false),
 			#[cfg(test)]

@@ -2124,6 +2124,7 @@ impl ManagerTierObserver {
 #[async_trait]
 impl TierObserver for ManagerTierObserver {
 	fn bind_tier_snapshot_source(&self, source: crate::consensus::TierSnapshotSource) {
+		self.slab.bind_canonical_tier_source(source.clone());
 		let _ = self.snapshot_source.set(source);
 	}
 

@@ -1,3 +1,4 @@
+use super::tier_deferral::{DeferralOutcome, FenceCause, TierDeferral, TierReplay, fenced_error};
 use super::tier_plan::tier_row_owner;
 use super::*;
 use crate::storage::io_uring::DIRECT_IO_ALIGN;
@@ -621,10 +622,7 @@ impl SlabManager {
 		let matching_deferral = pointer.as_ref().is_some_and(|pointer| {
 			self.unapplied_tier_pointers
 				.get(&slab_id)
-				.is_some_and(|entry| {
-					entry.value().0 == *pointer
-						&& entry.value().1 == Some(StaleLocationReason::Fenced)
-				})
+				.is_some_and(|entry| entry.value().fences(pointer))
 		});
 		if pointer == local && !matching_deferral {
 			return Ok((false, None));
@@ -634,6 +632,30 @@ impl SlabManager {
 				if let Some(old) = local.as_ref().filter(|old| old.l2_uri != pointer.l2_uri) {
 					self.record_retained_pointer_transition(old, Some(&pointer), true)
 						.await?;
+				}
+				// A replayable fence of exactly this pointer is resolved by
+				// replaying its own callback, as the authority worker does.
+				let replayable = self
+					.unapplied_tier_pointers
+					.get(&slab_id)
+					.is_some_and(|entry| {
+						entry.value().fences(&pointer) && entry.value().replayable_index().is_some()
+					});
+				if replayable {
+					return match self
+						.replay_tier_deferral_under_publication_lock(
+							slab_id,
+							Some(&pointer),
+							observed_epoch,
+						)
+						.await
+					{
+						TierReplay::Replayed(result) => result.map(|()| (true, None)),
+						TierReplay::Superseded => Ok((true, None)),
+						TierReplay::NotReplayable
+						| TierReplay::Unchanged
+						| TierReplay::KeptFenced => Ok((false, None)),
+					};
 				}
 				self.apply_tier_slab_under_publication_lock(pointer, None, observed_epoch)
 					.await?;
@@ -689,6 +711,27 @@ impl SlabManager {
 		last_control_log_index: Option<u64>,
 		control_epoch: u64,
 	) -> std::io::Result<()> {
+		self.apply_tier_slab_under_publication_lock_as(
+			pointer,
+			last_control_log_index,
+			control_epoch,
+			false,
+		)
+		.await
+	}
+
+	/// `apply_tier_slab_under_publication_lock`. A `replay` of a deferred
+	/// `Some(index)` callback (`tier_deferral`) also requires, after every
+	/// wait that precedes its publication, that `control_epoch` is current
+	/// and that the committed pointer still is `pointer`; otherwise it refuses
+	/// typed and leaves the deferral exactly as it was.
+	pub(super) async fn apply_tier_slab_under_publication_lock_as(
+		&self,
+		pointer: TieredSlabPointer,
+		last_control_log_index: Option<u64>,
+		control_epoch: u64,
+		replay: bool,
+	) -> std::io::Result<()> {
 		if last_control_log_index.is_none() {
 			self.require_cleanup_authority()?;
 		}
@@ -708,24 +751,34 @@ impl SlabManager {
 			Err(_) => {
 				self.unapplied_tier_pointers.insert(
 					pointer.slab_id,
-					(
+					TierDeferral::fenced(
 						pointer.clone(),
-						Some(StaleLocationReason::Fenced),
+						FenceCause::IndexGate,
 						last_control_log_index,
 					),
 				);
-				return Err(stale_location_error(
+				return Err(fenced_error(
+					ErrorKind::Other,
 					pointer.slab_id,
-					StaleLocationReason::Fenced,
+					FenceCause::IndexGate,
 				));
 			}
 		};
 		if self.observer_is_superseded(last_control_log_index) {
 			return Ok(());
 		}
-		if last_control_log_index.is_none() && !self.snapshot_epoch_is_current(control_epoch) {
+		if (last_control_log_index.is_none() || replay)
+			&& !self.snapshot_epoch_is_current(control_epoch)
+		{
 			// A newer comparison owns this generation. Refusing this obsolete
 			// local completion must not install committed-pointer authority.
+			return Err(stale_location_error(
+				pointer.slab_id,
+				StaleLocationReason::Fenced,
+			));
+		}
+		if replay && !self.canonical_tier_pointer_is(&pointer) {
+			// A newer committed state owns the slab; its own callback resolves it.
 			return Err(stale_location_error(
 				pointer.slab_id,
 				StaleLocationReason::Fenced,
@@ -757,15 +810,16 @@ impl SlabManager {
 			}
 			self.unapplied_tier_pointers.insert(
 				pointer.slab_id,
-				(
+				TierDeferral::fenced(
 					pointer.clone(),
-					Some(StaleLocationReason::Fenced),
+					FenceCause::SnapshotInstall,
 					last_control_log_index,
 				),
 			);
-			return Err(stale_location_error(
+			return Err(fenced_error(
+				ErrorKind::Other,
 				pointer.slab_id,
-				StaleLocationReason::Fenced,
+				FenceCause::SnapshotInstall,
 			));
 		}
 		if self.retired_tier_slabs.contains(&pointer.slab_id) {
@@ -784,14 +838,10 @@ impl SlabManager {
 			|| (self.tier_authority.pending.contains_key(&pointer.slab_id)
 				&& !self.lsm_install_unresolved.is_empty())
 		{
-			let error = stale_location_error(pointer.slab_id, StaleLocationReason::Fenced);
+			let error = fenced_error(ErrorKind::Other, pointer.slab_id, FenceCause::LsmScope);
 			self.unapplied_tier_pointers.insert(
 				pointer.slab_id,
-				(
-					pointer,
-					Some(StaleLocationReason::Fenced),
-					last_control_log_index,
-				),
+				TierDeferral::fenced(pointer, FenceCause::LsmScope, last_control_log_index),
 			);
 			return Err(error);
 		}
@@ -803,10 +853,7 @@ impl SlabManager {
 			let incompatible_refusal = self
 				.unapplied_tier_pointers
 				.get(&pointer.slab_id)
-				.is_some_and(|entry| {
-					entry.value().0 != pointer
-						|| entry.value().1 != Some(StaleLocationReason::Fenced)
-				});
+				.is_some_and(|entry| !entry.value().fences(&pointer));
 			if self.index_authority_unavailable.load(Ordering::Acquire)
 				|| own_dirty || incompatible_refusal
 			{
@@ -855,9 +902,8 @@ impl SlabManager {
 		// Structural refusals remain typed and cached. A Fenced dependency
 		// can finish, so a retry must recheck all normal publication guards.
 		if let Some(entry) = self.unapplied_tier_pointers.get(&pointer.slab_id)
-			&& entry.value().0 == pointer
-			&& let Some(reason) = entry.value().1
-			&& reason != StaleLocationReason::Fenced
+			&& entry.value().pointer == pointer
+			&& let DeferralOutcome::Refused(reason) = entry.value().outcome
 		{
 			return Err(stale_location_error(pointer.slab_id, reason));
 		}
@@ -887,10 +933,13 @@ impl SlabManager {
 			}
 			Err(_) if already_published => {}
 			Err(error) => {
-				let reason = stale_location(error).map(|refusal| refusal.reason);
 				self.unapplied_tier_pointers.insert(
 					pointer.slab_id,
-					(pointer.clone(), reason, last_control_log_index),
+					TierDeferral {
+						pointer: pointer.clone(),
+						outcome: DeferralOutcome::of(error),
+						provenance: last_control_log_index,
+					},
 				);
 			}
 		}
@@ -902,7 +951,7 @@ impl SlabManager {
 	pub(crate) fn unapplied_tier_pointer(&self, slab_id: SlabId) -> Option<TieredSlabPointer> {
 		self.unapplied_tier_pointers
 			.get(&slab_id)
-			.map(|entry| entry.value().0.clone())
+			.map(|entry| entry.value().pointer.clone())
 	}
 
 	/// Caller holds the LSM scope read gate through this check and publication.
@@ -1388,6 +1437,23 @@ impl SlabManager {
 					.value()
 					.pointer
 					.same_object_generation(&mark.pointer)
+			}) {
+			return Ok(false);
+		}
+		// A fenced deferral of another object generation from a callback newer
+		// than this mark is newer committed authority, exactly as a pending
+		// entry is: decline, so its replay publishes and supersedes the mark
+		// durably. This only declines a destructive step; it cancels nothing.
+		if self
+			.unapplied_tier_pointers
+			.get(&slab_id)
+			.is_some_and(|entry| {
+				let deferral = entry.value();
+				deferral.is_fenced()
+					&& !deferral.pointer.same_object_generation(&mark.pointer)
+					&& deferral
+						.provenance
+						.is_some_and(|index| mark.snapshot_index.is_none_or(|mark| index > mark))
 			}) {
 			return Ok(false);
 		}

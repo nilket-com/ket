@@ -457,13 +457,11 @@ impl SlabManager {
 		match fence {
 			Some(reason) => {
 				crate::metrics::global().observe_tier_publication_fenced(reason);
-				Error::new(
-					ErrorKind::WouldBlock,
-					StaleLocation {
-						slab_id,
-						reason: StaleLocationReason::Fenced,
-					},
-				)
+				let cause = match reason {
+					Fence::NoScratch => super::tier_deferral::FenceCause::NoScratch,
+					_ => super::tier_deferral::FenceCause::NoBudget,
+				};
+				super::tier_deferral::fenced_error(ErrorKind::WouldBlock, slab_id, cause)
 			}
 			None => {
 				observe_tier_rewrite_refusal(&error);

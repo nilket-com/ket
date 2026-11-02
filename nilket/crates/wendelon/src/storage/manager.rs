@@ -210,6 +210,7 @@ use retention_reclaim::{
 mod relocation;
 pub(crate) mod tier_authority;
 mod tier_budget;
+mod tier_deferral;
 mod tier_generation;
 mod tier_tokens;
 pub use tier_tokens::{TierProposal, TierSubmission};
@@ -800,12 +801,15 @@ pub struct SlabManager {
 	tier_budget: Arc<tier_budget::TierMemoryBudget>,
 	/// Proposer history reservations awaiting their outcome (§7 tokens).
 	tier_tokens: Arc<tier_tokens::TierTokenRegistry>,
-	/// Committed tier pointers this node failed to publish, with the typed
-	/// refusal when the failure was one (replayed without retrying the plan).
-	// The optional third field is evidence of an actual Some-index TierSlab
-	// callback. Metadata/comparison refusals never invent replay provenance.
-	unapplied_tier_pointers:
-		DashMap<SlabId, (TieredSlabPointer, Option<StaleLocationReason>, Option<u64>)>,
+	/// Committed tier pointers this node failed to publish, with the outcome
+	/// of the apply that could not (`tier_deferral`).
+	unapplied_tier_pointers: DashMap<SlabId, tier_deferral::TierDeferral>,
+	/// The committed tier state this manager observes, once bound
+	/// (`TierObserver::bind_tier_snapshot_source`); the replay revalidates
+	/// against it.
+	canonical_tier_source: std::sync::OnceLock<crate::consensus::TierSnapshotSource>,
+	#[cfg(test)]
+	replay_probe: tier_deferral::ReplayProbe,
 	#[cfg(test)]
 	counter_rollback_fail_once: std::sync::atomic::AtomicBool,
 	#[cfg(test)]

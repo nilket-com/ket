@@ -74,12 +74,15 @@ pub fn stale_location_error(slab_id: SlabId, reason: StaleLocationReason) -> Err
 	Error::new(ErrorKind::Other, StaleLocation { slab_id, reason })
 }
 
-/// The typed refusal carried by `error`, if any.
+/// The typed refusal carried by `error`, if any, including a fence that also
+/// records its cause (`tier_deferral::CausedFence`).
 pub fn stale_location(error: &Error) -> Option<StaleLocation> {
-	error
-		.get_ref()
-		.and_then(|inner| inner.downcast_ref::<StaleLocation>())
-		.copied()
+	let inner = error.get_ref()?;
+	inner.downcast_ref::<StaleLocation>().copied().or_else(|| {
+		inner
+			.downcast_ref::<super::tier_deferral::CausedFence>()
+			.map(|fence| fence.stale())
+	})
 }
 
 /// The history of one tiered slab's published generations, complete for the

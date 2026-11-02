@@ -220,6 +220,20 @@ impl TierAuthority {
 			.get(&id)
 			.is_some_and(|entry| *entry.value() == index)
 	}
+	/// Wake the worker: local tier state it waits on changed.
+	pub(super) fn notify_changed(&self) {
+		self.changed.notify_waiters();
+	}
+
+	/// Whether a snapshot's tier reconciliation is still pending or fenced.
+	pub(super) fn snapshot_reconciliation_pending(&self) -> bool {
+		self.snapshot_fences.load(Ordering::Acquire) != 0
+			|| self
+				.snapshot_reconciliation
+				.lock()
+				.unwrap_or_else(|e| e.into_inner())
+				.is_some()
+	}
 	#[cfg(test)]
 	pub(super) fn snapshot_retry_pending_for_test(&self) -> bool {
 		self.snapshot_reconciliation.lock().unwrap().is_some()
@@ -915,6 +929,7 @@ fn obsolete_verification() -> Error {
 impl TierAuthority {
 	async fn run(self: &Arc<Self>) {
 		let mut delay = Duration::from_millis(200);
+		let mut replay_schedule = std::collections::HashMap::new();
 		loop {
 			let changed = self.changed.notified();
 			tokio::pin!(changed);
@@ -1008,16 +1023,46 @@ impl TierAuthority {
 				Some(manager) => manager.retry_completed_metadata_operations().await,
 				None => false,
 			};
-			let manager_blocked =
-				self.manager
-					.get()
-					.and_then(Weak::upgrade)
-					.is_some_and(|manager| {
-						manager.awaiting_cluster.load(Ordering::Acquire)
-							|| !manager.unapplied_tier_pointers.is_empty()
-					});
+			let (manager_blocked, replay) = match self.manager.get().and_then(Weak::upgrade) {
+				Some(manager) => {
+					let awaiting = manager.awaiting_cluster.load(Ordering::Acquire);
+					let blocked = awaiting || !manager.unapplied_tier_pointers.is_empty();
+					// Replay deferrals the worker is meant to clear instead of
+					// parking on them (ADR 0696 r3 E).
+					let replay = if blocked && !awaiting {
+						let round = manager.replay_tier_deferrals(&mut replay_schedule).await;
+						let budget = manager.tier_budget.clone();
+						let seen = budget.release_epoch();
+						Some((round, budget, seen))
+					} else {
+						None
+					};
+					(blocked, replay)
+				}
+				None => (false, None),
+			};
 			if manager_blocked {
-				changed.await;
+				match replay {
+					Some((round, _, _)) if round.progressed => continue,
+					Some((round, budget, seen)) => {
+						let released = budget.released().notified();
+						tokio::pin!(released);
+						released.as_mut().enable();
+						// A release between the round and the wait is not missed.
+						if round.waits_for_budget && budget.release_epoch() != seen {
+							continue;
+						}
+						let wake = round.next.unwrap_or_else(|| {
+							tokio::time::Instant::now() + Duration::from_secs(3600)
+						});
+						tokio::select! {
+							_ = &mut changed => {}
+							_ = tokio::time::sleep_until(wake), if round.next.is_some() => {}
+							_ = &mut released, if round.waits_for_budget => {}
+						}
+					}
+					None => changed.await,
+				}
 				continue;
 			}
 			match self.status() {
@@ -1951,8 +1996,7 @@ impl SlabManager {
 						// Complete replay may migrate only its exact canonical
 						// transient deferral into the existing verification flight.
 						// Structural failures and pointer discrepancies remain evidence.
-						entry.value().0 != committed[id]
-							|| entry.value().1 != Some(StaleLocationReason::Fenced)
+						!entry.value().fences(&committed[id])
 					})
 			})) {
 			return Err(Error::new(
@@ -2048,11 +2092,10 @@ impl SlabManager {
 							.unapplied_tier_pointers
 							.get(&pointer.slab_id)
 							.is_some_and(|entry| {
-								entry.value().0 == **pointer
-									&& entry.value().1 == Some(StaleLocationReason::Fenced)
+								entry.value().fences(pointer)
 									&& entry
 										.value()
-										.2
+										.provenance
 										.zip(index)
 										.is_some_and(|(callback, applied)| callback <= applied)
 							}))
@@ -2080,20 +2123,20 @@ impl SlabManager {
 					})
 			});
 			let matching_deferral = index.is_some()
-				&& self.unapplied_tier_pointers.get(&id).is_some_and(|entry| {
-					entry.value().0 == pointer
-						&& entry.value().1 == Some(StaleLocationReason::Fenced)
-				});
+				&& self
+					.unapplied_tier_pointers
+					.get(&id)
+					.is_some_and(|entry| entry.value().fences(&pointer));
 			let superseded_deferral = index.is_some_and(|incoming| {
 				known.as_ref().is_some_and(|old| {
 					old.pointer != pointer
 						&& old
 							.last_control_log_index
 							.is_none_or(|index| incoming > index)
-						&& self.unapplied_tier_pointers.get(&id).is_some_and(|entry| {
-							entry.value().0 == old.pointer
-								&& entry.value().1 == Some(StaleLocationReason::Fenced)
-						})
+						&& self
+							.unapplied_tier_pointers
+							.get(&id)
+							.is_some_and(|entry| entry.value().fences(&old.pointer))
 				})
 			});
 			if conflicting_pending || self.retired_tier_slabs.contains(&id) {
@@ -2182,11 +2225,13 @@ impl SlabManager {
 				.cancel_older_snapshot_retirement(id, snapshot_epoch);
 		}
 		for (id, pointer) in conflicts {
-			self.unapplied_tier_pointers.entry(id).or_insert((
-				pointer,
-				Some(StaleLocationReason::Fenced),
-				None,
-			));
+			self.unapplied_tier_pointers.entry(id).or_insert(
+				super::tier_deferral::TierDeferral::fenced(
+					pointer,
+					super::tier_deferral::FenceCause::Staged,
+					None,
+				),
+			);
 		}
 		#[cfg(test)]
 		self.snapshot_after_retirement_mark_pause_point().await;
@@ -2321,10 +2366,7 @@ impl SlabManager {
 			&& self
 				.unapplied_tier_pointers
 				.get(&pointer.slab_id)
-				.is_some_and(|entry| {
-					entry.value().0 == pointer
-						&& entry.value().1 == Some(StaleLocationReason::Fenced)
-				});
+				.is_some_and(|entry| entry.value().fences(&pointer));
 		let superseded_deferral = last_control_log_index.is_some_and(|incoming| {
 			known.as_ref().is_some_and(|old| {
 				old.pointer != pointer
@@ -2334,10 +2376,7 @@ impl SlabManager {
 					&& self
 						.unapplied_tier_pointers
 						.get(&pointer.slab_id)
-						.is_some_and(|entry| {
-							entry.value().0 == old.pointer
-								&& entry.value().1 == Some(StaleLocationReason::Fenced)
-						})
+						.is_some_and(|entry| entry.value().fences(&old.pointer))
 			})
 		});
 		if snapshot
@@ -2552,9 +2591,7 @@ impl SlabManager {
 		if registered
 			&& self
 				.unapplied_tier_pointers
-				.remove_if(&pointer.slab_id, |_, entry| {
-					entry.0 == *pointer && entry.1 == Some(StaleLocationReason::Fenced)
-				})
+				.remove_if(&pointer.slab_id, |_, entry| entry.fences(pointer))
 				.is_some()
 		{
 			self.tier_authority.changed.notify_waiters();
@@ -2603,10 +2640,7 @@ impl SlabManager {
 				}) {
 				self.unapplied_tier_pointers
 					.get(&pointer.slab_id)
-					.filter(|entry| {
-						entry.value().0 == old.pointer
-							&& entry.value().1 == Some(StaleLocationReason::Fenced)
-					})
+					.filter(|entry| entry.value().fences(&old.pointer))
 					.map(|entry| entry.value().clone())
 			} else {
 				None

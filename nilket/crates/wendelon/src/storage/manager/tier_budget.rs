@@ -210,9 +210,14 @@ impl TierMemoryBudget {
 		state.peak = state.held();
 	}
 
-	#[cfg(test)]
+	/// Advances on every refund (see `release_epoch`).
 	pub(super) fn release_epoch(&self) -> u64 {
 		self.release_epoch.load(Ordering::Acquire)
+	}
+
+	/// Notified on every refund.
+	pub(super) fn released(&self) -> &tokio::sync::Notify {
+		&self.released
 	}
 
 	/// Test seam: the history credit `backing` lends, if still live.

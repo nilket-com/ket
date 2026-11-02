@@ -661,3 +661,12 @@ Evidence: /home/me/work/reviews/cut-e1-crypto-repair-20261023/.
 State: source repair and focused validation in progress. Joint source review,
 fresh named main ladder-2, root supplement, final audit and publication remain
 required. Successful controls do not convert ladder-1 into a PASS.
+
+## Candidates found by the §7 fast follow slice 2 gate (2026-11-01)
+
+Found on bigfoot, `CARGO_TARGET_DIR=~/work/target-s7`, at the cargo-cgroup default parallelism, during `cargo-cgroup test --locked -p wendelon --features test-support --lib --no-fail-fast`.
+
+| ID | Test | Rate | Symptom | Hypothesis / finding | Status |
+|---|---|---|---|---|---|
+| PD-26 | `storage::manager::tests::committed_tier_retirement_records_gap_when_cleanup_authority_is_missing` (and the same assertion in the reopen gap test beside it) | 1/1 full lib run, then 0/3 after the fix | `storage_cleanup_unrecorded_supersessions_total` delta 8, expected 7 | Confirmed by source: an exact `+1` on a process-global counter that seven cleanup-table-removing tests also increment. The same class as PD-01 and PD-02. | Fixed on `claude/s7-fast-follow`: the global counter is asserted only to advance, and the exact per-manager `cleanup_authority_gap_count() == 1` is kept. 3 later full lib runs passed. |
+| PD-27 | `storage::manager::tests::b1t_real_follower_debt_completes_after_leadership_change` | 1/7 full in-process lib runs (slice 1: 0/3; slice 2: 1/4); 0/30 nextest `--stress-count 30` under full-lib load; never alone | `participant2 must win a real election before the campaign deadline: Elapsed` (60 s) | Unverified. Election timing under in-process CPU contention. Not reproduced cross-process. Slice 2's new tier-deferral replay worker was checked and refuted as a spinner: 8 replay attempts in 90 s, with and without a progress guard. | Open: needs repeated in-process runs at a fixed `--test-threads` to measure, and an election-progress trace on failure. |

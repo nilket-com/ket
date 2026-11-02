@@ -33171,11 +33171,12 @@ async fn missing_cleanup_table_reopen_fences_manager() {
 			.unwrap(),
 		expected
 	);
-	assert_eq!(
+	// The counter is process-wide and other tests record gaps in parallel; the
+	// exact count is this manager's own `cleanup_authority_gap_count`.
+	assert!(
 		metrics()
 			.storage_cleanup_unrecorded_supersessions_total
-			.get(),
-		before + 1
+			.get() > before
 	);
 	let index = reopened.persistent_index.as_ref().unwrap();
 	assert_eq!(index.cleanup_authority_gap_count().await.unwrap(), 1);
@@ -33517,11 +33518,12 @@ async fn committed_tier_retirement_records_gap_when_cleanup_authority_is_missing
 			.unwrap(),
 		1
 	);
-	assert_eq!(
+	// The counter is process-wide and other tests record gaps in parallel; the
+	// exact count is this manager's own `cleanup_authority_gap_count`.
+	assert!(
 		metrics()
 			.storage_cleanup_unrecorded_supersessions_total
-			.get(),
-		before + 1
+			.get() > before
 	);
 	mgr.persistent_index
 		.as_ref()
@@ -35553,7 +35555,7 @@ async fn tier_apply_bounds_its_index_gate_wait_and_defers_the_pointer() {
 			.get(&slab_id)
 			.expect("the timed-out pointer is recorded as deferred");
 		assert_eq!(
-			*deferred.value(),
+			deferred.value().parts(),
 			(pointer.clone(), Some(StaleLocationReason::Fenced), None)
 		);
 	}
@@ -35676,7 +35678,7 @@ async fn sweeper_recovery_of_a_fenced_republication_supersedes_an_older_snapshot
 	assert_eq!(
 		mgr.unapplied_tier_pointers
 			.get(&slab_id)
-			.map(|entry| entry.value().clone()),
+			.map(|entry| entry.value().parts()),
 		Some((
 			pointer.clone(),
 			Some(StaleLocationReason::Fenced),
@@ -35745,7 +35747,7 @@ async fn sweeper_recovery_of_a_fenced_replacement_cancels_an_obsolete_snapshot_r
 	let deferral = mgr
 		.unapplied_tier_pointers
 		.get(&old.slab_id)
-		.map(|entry| entry.value().clone());
+		.map(|entry| entry.value().parts());
 	eprintln!("fenced apply: {fenced:?}; deferral: {deferral:?}");
 	assert!(fenced.is_err(), "premise: the gate bound fences the apply");
 	assert_eq!(
@@ -35793,14 +35795,20 @@ async fn sweeper_recovery_of_a_fenced_replacement_cancels_an_obsolete_snapshot_r
 		.unwrap();
 }
 
-/// The real-state-machine route for the fenced-replacement RED: a snapshot at
-/// 822 that no longer names slab X is installed while an append is in flight,
-/// so its tier reconciliation is deferred to the authority worker; entry 823
-/// then commits a replacement pointer for X through the real observer while
-/// the index gate is held, so that apply is fenced. Observations are recorded
-/// before any assertion so a typed refusal can be told from a silent omission.
+/// Through the real state machine and observer: a snapshot at 822 that no
+/// longer names slab X is installed (its retirement completes inside the
+/// install, before 823 can apply, so X is retired in this process); entry 823
+/// then commits a replacement pointer for X while the index gate is held, so
+/// that apply is fenced (cause `IndexGate`, provenance 823). This node has no
+/// backing or rows to serve or verify the replacement from, so under ADR 0696
+/// r3 E2 the fence stays: neither the authority worker's replay nor the
+/// sweeper's publishes from node-local identity, readiness stays closed, and
+/// reads of X refuse typed while canonical state names the replacement. Never
+/// an absent answer. (A registered availability limitation, with ADR 0693's
+/// node-local slab-identity limits.) Observations are recorded before any
+/// assertion so a typed refusal can be told from a silent omission.
 #[tokio::test]
-async fn real_sm_fenced_replacement_after_a_deferred_snapshot_retirement_is_served_or_refused() {
+async fn real_sm_fenced_pointer_for_a_retired_slab_stays_typed_fenced_while_canonical_names_it() {
 	use crate::consensus::WendelonStateMachine;
 	use crate::storage::sweeper::ManagerTierObserver;
 	use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
@@ -35953,7 +35961,7 @@ async fn real_sm_fenced_replacement_after_a_deferred_snapshot_retirement_is_serv
 				manager
 					.unapplied_tier_pointers
 					.get(&slab_id)
-					.map(|entry| (entry.value().1, entry.value().2)),
+					.map(|entry| (entry.value().outcome, entry.value().provenance)),
 				manager.retired_tier_slabs.contains(&slab_id),
 				manager.tier_authority_readiness_reason(),
 			);
@@ -35965,6 +35973,13 @@ async fn real_sm_fenced_replacement_after_a_deferred_snapshot_retirement_is_serv
 		committed.as_ref().map(|p| &p.l2_uri)
 	);
 	let (missing_after_worker, _) = observe("after worker").await;
+	eprintln!(
+		"worker replay attempts so far: {}",
+		manager
+			.replay_probe
+			.attempts
+			.load(std::sync::atomic::Ordering::Acquire)
+	);
 
 	let observed_epoch = manager.capture_snapshot_epoch();
 	let retry = manager
@@ -35984,13 +35999,35 @@ async fn real_sm_fenced_replacement_after_a_deferred_snapshot_retirement_is_serv
 	);
 	assert_eq!(
 		manager.tier_pointer(slab_id).await,
-		Some(replacement),
-		"the newer committed pointer is published"
+		None,
+		"nothing is published from node-local identity"
+	);
+	assert_eq!(
+		manager
+			.unapplied_tier_pointers
+			.get(&slab_id)
+			.map(|entry| entry.value().clone()),
+		Some(super::tier_deferral::TierDeferral::fenced(
+			replacement,
+			super::tier_deferral::FenceCause::IndexGate,
+			Some(823)
+		)),
+		"the fence stays, with its cause and provenance"
 	);
 	assert!(
-		matches!(read_after_retry, Some(Ok(Ok(ref value))) if value == "tiered-row"),
-		"the row is served after recovery: {read_after_retry:?}"
+		manager.tier_authority_readiness_reason().is_some(),
+		"readiness stays closed"
 	);
+	assert!(
+		manager
+			.lookup(tenant(), key)
+			.as_ref()
+			.err()
+			.and_then(stale_location)
+			.is_some_and(|stale| stale.reason == StaleLocationReason::Fenced),
+		"reads of X refuse typed"
+	);
+	assert!(read_after_retry.is_none(), "nothing is read for X");
 }
 
 async fn a6_undecodable_stored_counter_identity_control(counter_class: bool) {
@@ -38616,11 +38653,13 @@ async fn b6c_complete_replay_preserves_structural_refusal() {
 	assert!(target.lookup(tenant(), key).is_err());
 	target.unapplied_tier_pointers.insert(
 		pointer.slab_id,
-		(
-			pointer.clone(),
-			Some(StaleLocationReason::LayoutCollision),
-			None,
-		),
+		super::tier_deferral::TierDeferral {
+			pointer: pointer.clone(),
+			outcome: super::tier_deferral::DeferralOutcome::Refused(
+				StaleLocationReason::LayoutCollision,
+			),
+			provenance: None,
+		},
 	);
 	assert!(
 		target
@@ -38637,7 +38676,8 @@ async fn b6c_complete_replay_preserves_structural_refusal() {
 			.get(&pointer.slab_id)
 			.unwrap()
 			.value()
-			.1,
+			.outcome
+			.reason(),
 		Some(StaleLocationReason::LayoutCollision)
 	);
 }
@@ -43331,7 +43371,7 @@ async fn a_publication_short_of_plan_scratch_fences_typed_and_is_counted() {
 	assert_eq!(
 		mgr.unapplied_tier_pointers
 			.get(&old.slab_id)
-			.map(|entry| entry.value().clone()),
+			.map(|entry| entry.value().parts()),
 		Some((replacement, Some(StaleLocationReason::Fenced), Some(901))),
 		"the deferral is typed for retry"
 	);
@@ -43628,4 +43668,607 @@ async fn relocating_one_row_of_a_long_chain_stays_within_its_prepared_scratch() 
 	);
 	chain[100_000] = new;
 	assert_eq!(*mgr.key_index.get(&(tenant(), key)).unwrap(), chain);
+}
+
+/// A fenced committed apply at `index` of `pointer` (the index gate held past
+/// its bound), returning the deferral it left.
+async fn fence_committed_apply(
+	mgr: &Arc<SlabManager>,
+	pointer: &TieredSlabPointer,
+	index: u64,
+) -> super::tier_deferral::TierDeferral {
+	let gate = mgr.hold_index_write_gate_for_test().await;
+	let fenced = mgr
+		.apply_tier_slab_committed(pointer.clone(), Some(index))
+		.await;
+	drop(gate);
+	assert!(fenced.is_err(), "premise: the gate bound fences the apply");
+	mgr.unapplied_tier_pointers
+		.get(&pointer.slab_id)
+		.map(|entry| entry.value().clone())
+		.expect("premise: the fence is deferred")
+}
+
+/// The sweeper's authoritative pass over `slab_id` with `committed` as the
+/// canonical pointer.
+async fn sweep_with_committed(
+	mgr: &Arc<SlabManager>,
+	slab_id: SlabId,
+	committed: Option<TieredSlabPointer>,
+) -> std::io::Result<(bool, Option<TieredSlabPointer>)> {
+	let observed = mgr.capture_snapshot_epoch();
+	mgr.reconcile_tier_slab_at_snapshot_epoch(slab_id, observed, || async move { Ok(committed) })
+		.await
+}
+
+/// The first-tier form of the fenced-replacement recovery: a sealed local
+/// slab's first committed tier pointer, fenced by the index gate, is
+/// published by the replay of its own callback (sealed to tiered through the
+/// ordinary observer path), and the deferral is cleared.
+#[tokio::test]
+async fn replay_of_a_fenced_first_tier_publishes_it_through_its_callback() {
+	let (_dirs, mgr, l2) = fresh_manager_with_l2("s7-replay-first-tier").await;
+	let key = id(0x7e01);
+	mgr.append_durable(tenant(), key, hlc(700), b"first-tier")
+		.await
+		.unwrap();
+	let slab_id = force_seal_active(&mgr).await;
+	let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
+	let encrypted = mgr.encrypt_tiered_object_blob(slab_id, &raw).unwrap();
+	let uri = l2
+		.put("s7-replay-first-tier/p0", &encrypted.bytes)
+		.await
+		.unwrap();
+	let pointer = tiered_pointer_from_blob(&mgr, slab_id, uri, &encrypted.bytes);
+	let deferral = fence_committed_apply(&mgr, &pointer, 830).await;
+	assert_eq!(
+		deferral,
+		super::tier_deferral::TierDeferral::fenced(
+			pointer.clone(),
+			super::tier_deferral::FenceCause::IndexGate,
+			Some(830)
+		)
+	);
+	assert_eq!(
+		mgr.tier_pointer(slab_id).await,
+		None,
+		"premise: still sealed"
+	);
+
+	assert_eq!(
+		sweep_with_committed(&mgr, slab_id, Some(pointer.clone()))
+			.await
+			.unwrap(),
+		(true, None)
+	);
+	assert_eq!(mgr.tier_pointer(slab_id).await, Some(pointer));
+	assert!(mgr.unapplied_tier_pointers.get(&slab_id).is_none());
+	let location = mgr.lookup(tenant(), key).unwrap().unwrap();
+	assert_eq!(mgr.read(location).await.unwrap(), b"first-tier");
+}
+
+/// A replay never publishes a deferred pointer the committed state has moved
+/// past: with canonical state naming a newer pointer it changes nothing, and
+/// the newer pointer's own callback publishes it and replaces the deferral.
+#[tokio::test]
+async fn a_newer_committed_pointer_wins_over_the_replay_of_an_older_fence() {
+	let (_dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let bytes = l2.get(&old.l2_uri).await.unwrap();
+	let fenced = TieredSlabPointer {
+		l2_uri: l2.put("tier/s7-race-823.wnd", &bytes).await.unwrap(),
+		..old.clone()
+	};
+	let newer = TieredSlabPointer {
+		l2_uri: l2.put("tier/s7-race-824.wnd", &bytes).await.unwrap(),
+		..old.clone()
+	};
+	let deferral = fence_committed_apply(&mgr, &fenced, 823).await;
+	{
+		let lock = mgr.tier_publication_lock(old.slab_id);
+		let _guard = lock.lock().await;
+		let epoch = mgr.capture_snapshot_epoch();
+		let outcome = mgr
+			.replay_tier_deferral_under_publication_lock(old.slab_id, Some(&newer), epoch)
+			.await;
+		assert!(
+			matches!(outcome, super::tier_deferral::TierReplay::Unchanged),
+			"{outcome:?}"
+		);
+	}
+	assert_eq!(
+		mgr.unapplied_tier_pointers
+			.get(&old.slab_id)
+			.map(|entry| entry.value().clone()),
+		Some(deferral),
+		"the replay leaves the deferral exactly as it was"
+	);
+	assert_eq!(mgr.tier_pointer(old.slab_id).await, Some(old.clone()));
+
+	mgr.apply_tier_slab_committed(newer.clone(), Some(824))
+		.await
+		.unwrap();
+	assert_eq!(mgr.tier_pointer(old.slab_id).await, Some(newer.clone()));
+	assert!(mgr.unapplied_tier_pointers.get(&old.slab_id).is_none());
+	assert_eq!(
+		sweep_with_committed(&mgr, old.slab_id, Some(newer.clone()))
+			.await
+			.unwrap(),
+		(false, None),
+		"nothing is left to replay"
+	);
+	assert_eq!(mgr.tier_pointer(old.slab_id).await, Some(newer));
+}
+
+/// A control snapshot installed at or above the deferred callback's index
+/// owns the slab: the replay loses (the pointer is not published) and clears
+/// exactly that deferral once the snapshot's reconciliation is complete.
+#[tokio::test]
+async fn an_installed_snapshot_at_or_above_the_callback_index_makes_its_replay_lose() {
+	let (_dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let bytes = l2.get(&old.l2_uri).await.unwrap();
+	let fenced = TieredSlabPointer {
+		l2_uri: l2.put("tier/s7-superseded-823.wnd", &bytes).await.unwrap(),
+		..old.clone()
+	};
+	fence_committed_apply(&mgr, &fenced, 823).await;
+	let epoch = mgr.begin_tier_snapshot_install().unwrap();
+	let installed = mgr
+		.finish_tier_snapshot_install_at_epoch(vec![old.clone()], Some(830), epoch)
+		.await;
+	eprintln!("snapshot install at 830: {installed:?}");
+	assert!(mgr.observer_is_superseded(Some(823)), "premise: 823 <= 830");
+	let deferral_after_install = mgr
+		.unapplied_tier_pointers
+		.get(&old.slab_id)
+		.map(|entry| entry.value().clone());
+	eprintln!("deferral after install: {deferral_after_install:?}");
+	tokio::time::timeout(Duration::from_secs(60), async {
+		while mgr.tier_authority.snapshot_reconciliation_pending() {
+			tokio::time::sleep(Duration::from_millis(10)).await;
+		}
+	})
+	.await
+	.expect("the snapshot's reconciliation completes");
+	if deferral_after_install.is_some() {
+		let lock = mgr.tier_publication_lock(old.slab_id);
+		let _guard = lock.lock().await;
+		let outcome = mgr
+			.replay_tier_deferral_under_publication_lock(
+				old.slab_id,
+				Some(&fenced),
+				mgr.capture_snapshot_epoch(),
+			)
+			.await;
+		assert!(
+			matches!(outcome, super::tier_deferral::TierReplay::Superseded),
+			"{outcome:?}"
+		);
+	}
+	assert!(mgr.unapplied_tier_pointers.get(&old.slab_id).is_none());
+	assert_eq!(
+		mgr.tier_pointer(old.slab_id).await,
+		Some(old),
+		"the superseded callback's pointer is never published"
+	);
+}
+
+/// The retirement-time decline protects only a newer committed callback.
+/// A snapshot install at 822 retires slab X; while it is paused before its
+/// retirement apply, a fenced deferral of another generation is present. Only
+/// a deferral from a callback after 822 declines the retirement; one at or
+/// before 822, or one with no callback provenance, never stops it.
+#[tokio::test]
+async fn retirement_is_declined_only_for_a_fenced_callback_newer_than_its_mark() {
+	for (provenance, declined) in [
+		(Some(823), true),
+		(Some(822), false),
+		(Some(821), false),
+		(None, false),
+	] {
+		let (_dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+		let bytes = l2.get(&old.l2_uri).await.unwrap();
+		let replacement = TieredSlabPointer {
+			l2_uri: l2.put("tier/s7-decline.wnd", &bytes).await.unwrap(),
+			..old.clone()
+		};
+		let pause = mgr.pause_snapshot_before_retirement_apply_once();
+		let epoch = mgr.begin_tier_snapshot_install().unwrap();
+		let install = {
+			let mgr = mgr.clone();
+			tokio::spawn(async move {
+				mgr.finish_tier_snapshot_install_at_epoch(vec![], Some(822), epoch)
+					.await
+			})
+		};
+		tokio::time::timeout(Duration::from_secs(60), pause.reached.notified())
+			.await
+			.unwrap();
+		mgr.unapplied_tier_pointers.insert(
+			old.slab_id,
+			super::tier_deferral::TierDeferral::fenced(
+				replacement,
+				super::tier_deferral::FenceCause::IndexGate,
+				provenance,
+			),
+		);
+		pause.resume.notify_one();
+		let installed = install.await.unwrap();
+		let case = format!("provenance {provenance:?} against a mark at 822");
+		eprintln!("{case}: install {installed:?}");
+		assert_eq!(
+			mgr.tier_pointer(old.slab_id).await.is_some(),
+			declined,
+			"{case}: only a newer callback declines the retirement"
+		);
+		assert_eq!(
+			mgr.retired_tier_slabs.contains(&old.slab_id),
+			!declined,
+			"{case}"
+		);
+	}
+}
+
+/// A replay that fails again re-defers with the new failure's cause: the
+/// cause survives replay instead of being dropped or kept stale.
+#[tokio::test]
+async fn a_replay_that_fails_again_records_the_new_cause() {
+	use super::tier_deferral::{FenceCause, TierDeferral};
+	let (_dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let bytes = l2.get(&old.l2_uri).await.unwrap();
+	let replacement = TieredSlabPointer {
+		l2_uri: l2.put("tier/s7-refence.wnd", &bytes).await.unwrap(),
+		..old.clone()
+	};
+	assert_eq!(
+		fence_committed_apply(&mgr, &replacement, 840).await,
+		TierDeferral::fenced(replacement.clone(), FenceCause::IndexGate, Some(840))
+	);
+	let floor = mgr.tier_budget.used();
+	mgr.tier_budget.set_limit_for_test(floor);
+	assert!(
+		sweep_with_committed(&mgr, old.slab_id, Some(replacement.clone()))
+			.await
+			.is_err()
+	);
+	assert_eq!(
+		mgr.unapplied_tier_pointers
+			.get(&old.slab_id)
+			.map(|entry| entry.value().clone()),
+		Some(TierDeferral::fenced(
+			replacement.clone(),
+			FenceCause::NoScratch,
+			Some(840)
+		)),
+		"the re-fence records its own cause and keeps the callback's provenance"
+	);
+	mgr.tier_budget
+		.set_limit_for_test(super::tier_budget::DEFAULT_TIER_BUDGET_BYTES);
+	assert_eq!(
+		sweep_with_committed(&mgr, old.slab_id, Some(replacement.clone()))
+			.await
+			.unwrap(),
+		(true, None)
+	);
+	assert_eq!(mgr.tier_pointer(old.slab_id).await, Some(replacement));
+	assert!(mgr.unapplied_tier_pointers.get(&old.slab_id).is_none());
+}
+
+/// A manager bound to a real state machine whose committed tier record for
+/// its one tiered slab is `old`.
+async fn worker_replay_fixture(
+	tag: &str,
+) -> (
+	impl Sized,
+	Arc<SlabManager>,
+	Arc<dyn ObjectStore>,
+	crate::consensus::WendelonStateMachine,
+	TieredSlabPointer,
+	Identity,
+) {
+	use crate::consensus::WendelonStateMachine;
+	use crate::storage::sweeper::ManagerTierObserver;
+	let (dirs, manager, l2) = fresh_manager_with_l2(tag).await;
+	let key = id(0x5e900);
+	manager
+		.append_durable(tenant(), key, hlc(900), b"replayed-row")
+		.await
+		.unwrap();
+	let old = tier_kv_slab(&manager, &l2, &format!("{tag}/p0")).await;
+	let target = WendelonStateMachine::new()
+		.with_tier_observer(Arc::new(ManagerTierObserver::new(manager.clone())));
+	target.seed_tiered_slab_for_test(b10_tier(&old)).await;
+	(dirs, manager, l2, target, old, key)
+}
+
+async fn commit_tier_entry(
+	target: &mut crate::consensus::WendelonStateMachine,
+	pointer: &TieredSlabPointer,
+	index: u64,
+) {
+	use openraft::storage::RaftStateMachine;
+	use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
+	RaftStateMachine::apply(
+		target,
+		[Entry {
+			log_id: LogId::new(CommittedLeaderId::new(3, 1), index),
+			payload: EntryPayload::Normal(crate::consensus::WendelonRequest::TierSlab(b10_tier(
+				pointer,
+			))),
+		}],
+	)
+	.await
+	.unwrap();
+}
+
+/// The authority worker replays a fenced committed callback itself, instead
+/// of parking on it: no sweeper pass is needed. A structural, provenance-free
+/// deferral on another slab neither strands it nor is touched, and keeps
+/// public readiness closed.
+#[tokio::test]
+async fn the_authority_worker_replays_a_fenced_callback_beside_a_structural_deferral() {
+	use super::tier_deferral::{DeferralOutcome, FenceCause, TierDeferral};
+	let (_keep, manager, l2, mut target, old, key) =
+		worker_replay_fixture("s7-worker-replay").await;
+	let bytes = l2.get(&old.l2_uri).await.unwrap();
+	let replacement = TieredSlabPointer {
+		l2_uri: l2.put("s7-worker-replay/p1", &bytes).await.unwrap(),
+		..old.clone()
+	};
+	let other = SlabId::new(old.slab_id.get() + 1000);
+	let structural = TierDeferral {
+		pointer: TieredSlabPointer {
+			slab_id: other,
+			..old.clone()
+		},
+		outcome: DeferralOutcome::Refused(StaleLocationReason::LayoutCollision),
+		provenance: None,
+	};
+	manager
+		.unapplied_tier_pointers
+		.insert(other, structural.clone());
+
+	let gate = manager.hold_index_write_gate_for_test().await;
+	commit_tier_entry(&mut target, &replacement, 900).await;
+	drop(gate);
+	assert_eq!(
+		manager
+			.unapplied_tier_pointers
+			.get(&old.slab_id)
+			.map(|entry| entry.value().clone()),
+		Some(TierDeferral::fenced(
+			replacement.clone(),
+			FenceCause::IndexGate,
+			Some(900)
+		)),
+		"premise: the observer's apply was fenced"
+	);
+	manager.tier_authority.start();
+	manager.tier_authority.notify_changed();
+	tokio::time::timeout(Duration::from_secs(60), async {
+		while manager.tier_pointer(old.slab_id).await.as_ref() != Some(&replacement) {
+			tokio::time::sleep(Duration::from_millis(10)).await;
+		}
+	})
+	.await
+	.expect("the worker publishes the replayed callback");
+	assert!(manager.unapplied_tier_pointers.get(&old.slab_id).is_none());
+	assert_eq!(
+		manager
+			.unapplied_tier_pointers
+			.get(&other)
+			.map(|entry| entry.value().clone()),
+		Some(structural),
+		"the structural deferral is untouched"
+	);
+	assert!(
+		manager.tier_authority_readiness_reason().is_some(),
+		"the structural deferral keeps readiness closed"
+	);
+	let location = manager.lookup(tenant(), key);
+	eprintln!("lookup while readiness is closed: {location:?}");
+}
+
+/// A budget-fenced replay waits for a release instead of its backoff: one
+/// reservation's refund wakes the worker, which then publishes.
+#[tokio::test]
+async fn a_budget_release_wakes_the_replay_of_a_budget_fenced_callback() {
+	use super::tier_budget::TierBudgetKind;
+	use super::tier_deferral::DeferralOutcome;
+	let (_keep, manager, l2, mut target, old, _key) =
+		worker_replay_fixture("s7-worker-budget").await;
+	let bytes = l2.get(&old.l2_uri).await.unwrap();
+	let replacement = TieredSlabPointer {
+		l2_uri: l2.put("s7-worker-budget/p1", &bytes).await.unwrap(),
+		..old.clone()
+	};
+	// Every scheduled retry is an hour away, so only a release can wake it.
+	*manager.replay_probe.backoff.lock().unwrap() = Some(Duration::from_secs(3600));
+	let room = manager.tier_budget.limit() - manager.tier_budget.used();
+	let hog = manager
+		.tier_budget
+		.try_reserve(TierBudgetKind::Scratch, room)
+		.unwrap();
+	commit_tier_entry(&mut target, &replacement, 901).await;
+	let outcome = manager
+		.unapplied_tier_pointers
+		.get(&old.slab_id)
+		.map(|entry| entry.value().outcome);
+	assert!(
+		matches!(outcome, Some(DeferralOutcome::Fenced(cause)) if cause.waits_for_budget()),
+		"premise: the apply is fenced on the budget: {outcome:?}"
+	);
+	manager.tier_authority.start();
+	manager.tier_authority.notify_changed();
+	tokio::time::timeout(Duration::from_secs(60), async {
+		while manager
+			.replay_probe
+			.attempts
+			.load(std::sync::atomic::Ordering::Acquire)
+			== 0
+		{
+			tokio::time::sleep(Duration::from_millis(10)).await;
+		}
+	})
+	.await
+	.expect("the worker tried the replay and scheduled it an hour out");
+	assert_eq!(manager.tier_pointer(old.slab_id).await, Some(old.clone()));
+
+	drop(hog);
+	tokio::time::timeout(Duration::from_secs(30), async {
+		while manager.tier_pointer(old.slab_id).await.as_ref() != Some(&replacement) {
+			tokio::time::sleep(Duration::from_millis(10)).await;
+		}
+	})
+	.await
+	.expect("the release wakes the replay, well before its backoff");
+	assert!(manager.unapplied_tier_pointers.get(&old.slab_id).is_none());
+}
+
+fn reopen_test_config(
+	dir: &std::path::Path,
+	io: crate::storage::io_uring::IoRingHandle,
+	l2: Arc<dyn ObjectStore>,
+	crypto: Arc<CryptoManager>,
+) -> SlabManagerConfig {
+	SlabManagerConfig {
+		dir: dir.to_path_buf(),
+		max_slab_bytes: 1 << 20,
+		io,
+		l2: Some(l2),
+		rehydration: RehydrationPolicy::default(),
+		l2_column_fetch: Default::default(),
+		row_group_writer: Default::default(),
+		l2_row_group_fetch: Default::default(),
+		encoding_writer: Default::default(),
+		l2_chunk_layout: Default::default(),
+		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
+		group_commit: GroupCommitConfig::default(),
+		crypto,
+	}
+}
+
+/// Reopen before the replay (ADR 0696 r3 E2, crash). A snapshot at 822
+/// retires slab X while 823's committed replacement is fenced, so the
+/// retirement is declined and its durable mark stays. The process stops
+/// before the replay: the deferral and the volatile decline are lost. On
+/// reopen the committed state already includes 823 and 823's callback is not
+/// replayed. The durable 822 mark must never be applied against the slab
+/// whose committed pointer is 823's, and a committed row is never answered as
+/// absent. Observations are recorded before any assertion.
+#[tokio::test]
+async fn reopen_before_replay_never_applies_an_older_mark_against_the_newer_committed_pointer() {
+	let l1_dir = fresh_dir("s7-reopen-l1");
+	let l2_dir = fresh_dir("s7-reopen-l2");
+	let io = spawn_io_thread(64).unwrap();
+	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_dir).unwrap());
+	let crypto = test_crypto();
+	let mgr = SlabManager::initialize_new_store(reopen_test_config(
+		&l1_dir,
+		io.clone(),
+		l2.clone(),
+		crypto.clone(),
+	))
+	.await
+	.unwrap();
+	let key = id(0x5e822);
+	mgr.append_durable(tenant(), key, hlc(822), b"committed-row")
+		.await
+		.unwrap();
+	let old = tier_kv_slab(&mgr, &l2, "s7-reopen/p0").await;
+	let slab_id = old.slab_id;
+	let bytes = l2.get(&old.l2_uri).await.unwrap();
+	let replacement = TieredSlabPointer {
+		l2_uri: l2.put("s7-reopen/p1", &bytes).await.unwrap(),
+		..old.clone()
+	};
+
+	let pause = mgr.pause_snapshot_before_retirement_apply_once();
+	let epoch = mgr.begin_tier_snapshot_install().unwrap();
+	let install = {
+		let mgr = mgr.clone();
+		tokio::spawn(async move {
+			mgr.finish_tier_snapshot_install_at_epoch(vec![], Some(822), epoch)
+				.await
+		})
+	};
+	tokio::time::timeout(Duration::from_secs(60), pause.reached.notified())
+		.await
+		.unwrap();
+	fence_committed_apply(&mgr, &replacement, 823).await;
+	pause.resume.notify_one();
+	let installed = install.await.unwrap();
+	let marks_before = mgr
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot_retirement_marks()
+		.await
+		.unwrap();
+	eprintln!(
+		"before stop: install {installed:?}; pointer {:?}; marks {:?}",
+		mgr.tier_pointer(slab_id).await.map(|p| p.l2_uri),
+		marks_before
+			.iter()
+			.map(|mark| mark.snapshot_index)
+			.collect::<Vec<_>>()
+	);
+	assert_eq!(
+		mgr.tier_pointer(slab_id).await,
+		Some(old.clone()),
+		"premise: the retirement was declined"
+	);
+	assert_eq!(marks_before.len(), 1, "premise: the 822 mark is durable");
+	drop(mgr);
+
+	let reopened = SlabManager::open(reopen_test_config(&l1_dir, io, l2, crypto))
+		.await
+		.unwrap();
+	let observe = |stage: &'static str| {
+		let reopened = reopened.clone();
+		async move {
+			let lookup = reopened.lookup(tenant(), key);
+			let marks = reopened
+				.persistent_index
+				.as_ref()
+				.unwrap()
+				.load_snapshot_retirement_marks()
+				.await
+				.unwrap()
+				.len();
+			let pointer = reopened.tier_pointer(slab_id).await;
+			let retired = reopened.retired_tier_slabs.contains(&slab_id);
+			eprintln!(
+				"{stage}: pointer={:?} retired={retired} marks={marks} readiness={:?} lookup={lookup:?}",
+				pointer.as_ref().map(|p| &p.l2_uri),
+				reopened.tier_authority_readiness_reason(),
+			);
+			(pointer, retired, lookup.is_ok_and(|found| found.is_none()))
+		}
+	};
+	let (_, retired_at_open, missing_at_open) = observe("after reopen").await;
+	// The authoritative pass recovery runs, with committed state at 823.
+	let swept = sweep_with_committed(&reopened, slab_id, Some(replacement.clone())).await;
+	eprintln!("sweeper pass: {swept:?}");
+	let (pointer, retired_after_sweep, missing_after_sweep) = observe("after sweeper pass").await;
+	let ready = tokio::time::timeout(
+		Duration::from_secs(30),
+		reopened.wait_tier_authority_ready(),
+	)
+	.await;
+	eprintln!("ready: {ready:?}");
+	let (final_pointer, retired_finally, missing_finally) = observe("after readiness wait").await;
+
+	assert!(
+		!retired_at_open && !retired_after_sweep && !retired_finally,
+		"the 822 mark is never applied against 823's slab"
+	);
+	assert!(
+		!missing_at_open && !missing_after_sweep && !missing_finally,
+		"a committed row is never answered as absent"
+	);
+	assert!(
+		pointer.is_some() && final_pointer.is_some(),
+		"the slab stays published: {pointer:?}"
+	);
 }
