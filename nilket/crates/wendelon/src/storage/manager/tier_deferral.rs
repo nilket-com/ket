@@ -290,9 +290,10 @@ impl SlabManager {
 #[derive(Clone, Copy, Debug)]
 pub(super) struct ReplaySchedule {
 	not_before: tokio::time::Instant,
-	/// The budget's release epoch when the last attempt ended. Replay
-	/// attempts never advance it (`within_replay_attempt`), so a later epoch
-	/// is a genuine release.
+	/// The budget's release epoch when the last attempt began. An attempt's
+	/// own reservations never advance it (`within_replay_attempt`), so a
+	/// later epoch is a release during or after that attempt, which may have
+	/// made room for it.
 	release_epoch: u64,
 	/// The deferral left by the last attempt is fenced on the budget.
 	budget: bool,
@@ -321,6 +322,13 @@ pub(super) struct ReplayProbe {
 	/// Failed attempts whose schedule is recorded.
 	pub(super) failures: std::sync::atomic::AtomicU64,
 	pub(super) backoff: std::sync::Mutex<Option<std::time::Duration>>,
+	/// Drop this reservation inside the next attempt for its slab: capacity
+	/// held before the attempt and freed during it (as a consumed token is).
+	pub(super) free_during_attempt:
+		std::sync::Mutex<Option<(SlabId, super::tier_budget::BudgetReservation)>>,
+	/// Hold the worker after an attempt's outcome, before its schedule.
+	pub(super) after_outcome:
+		std::sync::Mutex<Option<(Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>>,
 	/// Hold the worker after a round that attempted nothing, just before it
 	/// registers its waiters: the last point a release can be missed.
 	pub(super) before_wait:
@@ -380,7 +388,15 @@ impl SlabManager {
 			self.replay_probe
 				.attempts
 				.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+			let watermark = self.tier_budget.release_epoch();
 			let outcome = super::tier_budget::within_replay_attempt(async {
+				#[cfg(test)]
+				{
+					let mut slot = self.replay_probe.free_during_attempt.lock().unwrap();
+					if slot.as_ref().is_some_and(|(slab, _)| *slab == slab_id) {
+						drop(slot.take());
+					}
+				}
 				match self.try_canonical_tier_pointer(slab_id) {
 					Some(committed) => {
 						self.replay_tier_deferral_under_publication_lock(
@@ -394,7 +410,16 @@ impl SlabManager {
 				}
 			})
 			.await;
-			let release_epoch = self.tier_budget.release_epoch();
+			#[cfg(test)]
+			{
+				let hold = self.replay_probe.after_outcome.lock().unwrap().clone();
+				if let Some((entered, release)) = hold {
+					entered.add_permits(1);
+					if let Ok(permit) = release.acquire().await {
+						permit.forget();
+					}
+				}
+			}
 			// Progress is the exact deferral gone or replaced, never a reported
 			// success alone: an `Ok` that leaves it in place is retried on the
 			// backoff, so the worker cannot spin.
@@ -418,7 +443,7 @@ impl SlabManager {
 				slab_id,
 				ReplaySchedule {
 					not_before: tokio::time::Instant::now() + backoff,
-					release_epoch,
+					release_epoch: watermark,
 					// What the deferral is fenced on now, after this attempt.
 					budget: fenced_on_budget(current.as_ref()),
 					attempts,

@@ -44295,6 +44295,135 @@ async fn a_release_before_the_worker_waits_still_wakes_the_replay() {
 	);
 }
 
+/// A release during a failed replay attempt, after its budget refusal and
+/// before its schedule is recorded, is not lost: the attempt's watermark is
+/// taken before it began, so the released room makes it eligible again.
+#[tokio::test]
+async fn a_release_during_a_failed_attempt_still_wakes_its_replay() {
+	use super::tier_budget::TierBudgetKind;
+	let (_keep, manager, l2, mut target, old, _key) =
+		worker_replay_fixture("s7-worker-during").await;
+	let bytes = l2.get(&old.l2_uri).await.unwrap();
+	let replacement = TieredSlabPointer {
+		l2_uri: l2.put("s7-worker-during/p1", &bytes).await.unwrap(),
+		..old.clone()
+	};
+	*manager.replay_probe.backoff.lock().unwrap() = Some(Duration::from_secs(3600));
+	manager.wait_tier_authority_ready().await.unwrap();
+	let room = manager.tier_budget.limit() - manager.tier_budget.used();
+	let hog = manager
+		.tier_budget
+		.try_reserve(TierBudgetKind::Scratch, room)
+		.unwrap();
+	let entered = Arc::new(tokio::sync::Semaphore::new(0));
+	let release = Arc::new(tokio::sync::Semaphore::new(0));
+	*manager.replay_probe.after_outcome.lock().unwrap() = Some((entered.clone(), release.clone()));
+	commit_tier_entry(&mut target, &replacement, 903).await;
+	tokio::time::timeout(Duration::from_secs(60), entered.acquire())
+		.await
+		.unwrap_or_else(|_| {
+			panic!(
+				"the woken worker's attempt reached its outcome: {}",
+				replay_diagnostics(&manager, old.slab_id)
+			)
+		})
+		.unwrap()
+		.forget();
+	*manager.replay_probe.after_outcome.lock().unwrap() = None;
+	assert_eq!(manager.tier_pointer(old.slab_id).await, Some(old.clone()));
+	// The external release lands between the refusal and the schedule.
+	drop(hog);
+	release.add_permits(1);
+	assert!(
+		eventually(30, async || manager
+			.tier_pointer(old.slab_id)
+			.await
+			.as_ref() == Some(&replacement))
+		.await,
+		"the release during the attempt is seen, well before the hour-long backoff: {}",
+		replay_diagnostics(&manager, old.slab_id)
+	);
+}
+
+/// Capacity held before a replay attempt and freed during it (as a
+/// successful replay frees its consumed proposer token) is a release: slab
+/// B, already scheduled on the budget, is replayed after slab A's successful
+/// replay frees it, with no other refund and no manual wake.
+#[tokio::test]
+async fn a_successful_replay_freeing_held_capacity_wakes_another_budget_fenced_replay() {
+	use super::tier_budget::TierBudgetKind;
+	use super::tier_deferral::DeferralOutcome;
+	let (_keep, manager, l2, mut target, a_old, _key) =
+		worker_replay_fixture("s7-worker-pair").await;
+	manager
+		.append_durable(tenant(), id(0x5e9b0), hlc(950), b"second-slab-row")
+		.await
+		.unwrap();
+	let b_old = tier_kv_slab(&manager, &l2, "s7-worker-pair/b0").await;
+	target.seed_tiered_slab_for_test(b10_tier(&b_old)).await;
+	let replacement = |old: &TieredSlabPointer, name: &'static str| {
+		let l2 = l2.clone();
+		let old = old.clone();
+		async move {
+			let bytes = l2.get(&old.l2_uri).await.unwrap();
+			TieredSlabPointer {
+				l2_uri: l2.put(name, &bytes).await.unwrap(),
+				..old
+			}
+		}
+	};
+	let a_new = replacement(&a_old, "s7-worker-pair/a1").await;
+	let b_new = replacement(&b_old, "s7-worker-pair/b1").await;
+	*manager.replay_probe.backoff.lock().unwrap() = Some(Duration::from_secs(3600));
+	manager.wait_tier_authority_ready().await.unwrap();
+	let room = manager.tier_budget.limit() - manager.tier_budget.used();
+	let held = manager
+		.tier_budget
+		.try_reserve(TierBudgetKind::Token, room)
+		.unwrap();
+
+	// B is fenced on the budget and scheduled an hour out.
+	commit_tier_entry(&mut target, &b_new, 910).await;
+	assert!(
+		matches!(
+			manager
+				.unapplied_tier_pointers
+				.get(&b_old.slab_id)
+				.map(|entry| entry.value().outcome),
+			Some(DeferralOutcome::Fenced(cause)) if cause.waits_for_budget()
+		),
+		"premise: B is fenced on the budget"
+	);
+	assert!(
+		eventually(60, async || replay_failures(&manager) >= 1).await,
+		"premise: B's replay failed and was scheduled: {}",
+		replay_diagnostics(&manager, b_old.slab_id)
+	);
+	// A's next attempt frees the held capacity, as consuming its token does.
+	*manager.replay_probe.free_during_attempt.lock().unwrap() = Some((a_old.slab_id, held));
+	let gate = manager.hold_index_write_gate_for_test().await;
+	commit_tier_entry(&mut target, &a_new, 911).await;
+	drop(gate);
+	assert!(
+		eventually(30, async || manager
+			.tier_pointer(a_old.slab_id)
+			.await
+			.as_ref() == Some(&a_new))
+		.await,
+		"A's replay publishes: {}",
+		replay_diagnostics(&manager, a_old.slab_id)
+	);
+	assert!(
+		eventually(30, async || manager
+			.tier_pointer(b_old.slab_id)
+			.await
+			.as_ref() == Some(&b_new))
+		.await,
+		"the capacity A freed wakes B, well before its hour-long backoff: {}",
+		replay_diagnostics(&manager, b_old.slab_id)
+	);
+}
+
 fn reopen_test_config(
 	dir: &std::path::Path,
 	io: crate::storage::io_uring::IoRingHandle,

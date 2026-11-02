@@ -14,15 +14,27 @@ use std::sync::{Arc, Mutex};
 use super::SlabId;
 
 tokio::task_local! {
-	/// Set while a tier deferral replay attempt runs (`within_replay_attempt`).
-	static REPLAY_ATTEMPT: ();
+	/// The id of the tier deferral replay attempt this task is running
+	/// (`within_replay_attempt`).
+	static REPLAY_ATTEMPT: u64;
 }
 
-/// Run one replay attempt. Its refunds are not releases: a failed attempt
-/// gives back only what it reserved, so it never makes room that was not
-/// there before it, and counting it would let replays wake each other.
+/// Run one replay attempt. A reservation it takes and refunds within it is
+/// not a release: that gives back only what the attempt itself took, never
+/// room that was there before it, and counting it would let budget-fenced
+/// replays wake each other in turn. Every other refund is a release,
+/// including capacity held before the attempt and freed during it (a
+/// consumed proposer token, a replaced layout) and an attempt's reservation
+/// refunded after it ends.
 pub(super) async fn within_replay_attempt<F: std::future::Future>(attempt: F) -> F::Output {
-	REPLAY_ATTEMPT.scope((), attempt).await
+	static NEXT_ATTEMPT: AtomicU64 = AtomicU64::new(1);
+	let id = NEXT_ATTEMPT.fetch_add(1, Ordering::Relaxed);
+	REPLAY_ATTEMPT.scope(id, attempt).await
+}
+
+/// The replay attempt the current task is running, if any.
+fn current_replay_attempt() -> Option<u64> {
+	REPLAY_ATTEMPT.try_with(|id| *id).ok()
 }
 
 /// The §7 default per manager.
@@ -364,12 +376,20 @@ impl TierMemoryBudget {
 			backed: backing
 				.filter(|_| overlap > 0)
 				.map(|backing| (backing, overlap)),
+			attempt: current_replay_attempt(),
 		})
 	}
 
-	/// Refund `bytes` of a `kind` reservation, first returning `give` bytes of
-	/// its claim on `backing`, in one critical section.
-	fn release(&self, kind: TierBudgetKind, bytes: u64, claim: Option<(TokenBacking, u64)>) {
+	/// Refund `bytes` of a `kind` reservation taken in replay attempt
+	/// `attempt` (if any), first returning `give` bytes of its claim on
+	/// `backing`, in one critical section.
+	fn release(
+		&self,
+		kind: TierBudgetKind,
+		bytes: u64,
+		claim: Option<(TokenBacking, u64)>,
+		attempt: Option<u64>,
+	) {
 		{
 			let mut state = self.lock();
 			if let Some((backing, give)) = claim {
@@ -381,7 +401,8 @@ impl TierMemoryBudget {
 			return;
 		}
 		kind.discharge(bytes);
-		if REPLAY_ATTEMPT.try_with(|()| ()).is_err() {
+		// Only the attempt that took it giving it back is not a release.
+		if attempt.is_none() || current_replay_attempt() != attempt {
 			self.release_epoch.fetch_add(1, Ordering::AcqRel);
 			self.released.notify_waiters();
 		}
@@ -397,6 +418,8 @@ pub(super) struct BudgetReservation {
 	bytes: u64,
 	/// The token overlap this reservation claimed, at most `bytes`.
 	backed: Option<(TokenBacking, u64)>,
+	/// The replay attempt that took it (`within_replay_attempt`).
+	attempt: Option<u64>,
 }
 
 impl BudgetReservation {
@@ -419,7 +442,8 @@ impl BudgetReservation {
 			*overlap -= give;
 			(*backing, give)
 		});
-		self.budget.release(self.kind, self.bytes - actual, claim);
+		self.budget
+			.release(self.kind, self.bytes - actual, claim, self.attempt);
 		self.bytes = actual;
 		Ok(())
 	}
@@ -433,7 +457,8 @@ impl BudgetReservation {
 
 impl Drop for BudgetReservation {
 	fn drop(&mut self) {
-		self.budget.release(self.kind, self.bytes, self.backed);
+		self.budget
+			.release(self.kind, self.bytes, self.backed, self.attempt);
 	}
 }
 
@@ -724,12 +749,15 @@ mod tests {
 		assert!(budget.peak() <= budget.limit());
 	}
 
-	/// A failed replay attempt's own refunds are not releases, so they never
-	/// wake a replay (its own or another's); a refund outside any attempt is.
+	/// Only a reservation taken and refunded within the same replay attempt
+	/// is not a release. Capacity held before an attempt and freed during
+	/// it, an attempt's reservation refunded after it, and one refunded in
+	/// another attempt all are.
 	#[tokio::test]
-	async fn refunds_inside_a_replay_attempt_are_not_releases() {
+	async fn only_an_attempts_own_refunds_are_not_releases() {
 		let budget = TierMemoryBudget::new(1_000);
-		let before = budget.release_epoch();
+		let epoch = || budget.release_epoch();
+		let start = epoch();
 		let notified = budget.released().notified();
 		tokio::pin!(notified);
 		notified.as_mut().enable();
@@ -737,23 +765,42 @@ mod tests {
 			drop(budget.try_reserve(TierBudgetKind::Scratch, 100).unwrap());
 		})
 		.await;
-		assert_eq!(
-			budget.release_epoch(),
-			before,
-			"an attempt's refund is no release"
-		);
+		assert_eq!(epoch(), start, "an attempt's own refund is no release");
 		assert!(
 			tokio::time::timeout(std::time::Duration::from_millis(50), notified.as_mut())
 				.await
 				.is_err(),
 			"and wakes no waiter"
 		);
-		let outside = budget.try_reserve(TierBudgetKind::Scratch, 100).unwrap();
-		drop(outside);
-		assert_eq!(budget.release_epoch(), before + 1);
+
+		let held_before = budget.try_reserve(TierBudgetKind::Token, 100).unwrap();
+		within_replay_attempt(async move { drop(held_before) }).await;
+		assert_eq!(
+			epoch(),
+			start + 1,
+			"capacity held before the attempt is released"
+		);
 		tokio::time::timeout(std::time::Duration::from_secs(5), notified)
 			.await
-			.expect("a release outside any attempt wakes the waiter");
+			.expect("and wakes the waiter");
+
+		let kept = within_replay_attempt(async {
+			budget.try_reserve(TierBudgetKind::Layout, 100).unwrap()
+		})
+		.await;
+		drop(kept);
+		assert_eq!(
+			epoch(),
+			start + 2,
+			"an attempt's reservation refunded after it"
+		);
+
+		let other = within_replay_attempt(async {
+			budget.try_reserve(TierBudgetKind::Layout, 100).unwrap()
+		})
+		.await;
+		within_replay_attempt(async move { drop(other) }).await;
+		assert_eq!(epoch(), start + 3, "and one refunded in another attempt");
 	}
 
 	#[test]
