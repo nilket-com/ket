@@ -1390,9 +1390,7 @@ impl SlabManager {
 		for row in &rows {
 			self.rollback_indexed_location(row.tenant_id, row.key_identity, row.location);
 		}
-		self.relocated_reads.retain(|old_location, new_location| {
-			old_location.slab_id != slab_id && new_location.slab_id != slab_id
-		});
+		self.redirects.remove_touching(&self.tier_budget, slab_id);
 		self.clear_tiered_stats_cache_for_slab(slab_id);
 		if let Some(publication) = publication {
 			publication.complete();
@@ -1502,8 +1500,7 @@ impl SlabManager {
 		for row in &rows {
 			self.rollback_indexed_location(row.tenant_id, row.key_identity, row.location);
 		}
-		self.relocated_reads
-			.retain(|old, new| old.slab_id != slab_id && new.slab_id != slab_id);
+		self.redirects.remove_touching(&self.tier_budget, slab_id);
 		self.clear_tiered_stats_cache_for_slab(slab_id);
 		if let Some(intent) = retained {
 			self.note_snapshot_retirement_applied(
@@ -2156,7 +2153,7 @@ impl SlabManager {
 		for run in entries.chunk_by(|left, right| left.0 == right.0) {
 			let count =
 				|wanted: fn(&RefreshEntry) -> bool| run.iter().filter(|e| wanted(&e.2)).count();
-			let mut relocation = KeyRelocation::new(run[0].2.locality(), false);
+			let mut relocation = KeyRelocation::new(run[0].2.locality(), None);
 			relocation
 				.pairs
 				.try_reserve_exact(count(|e| matches!(e, RefreshEntry::Pair { .. })))

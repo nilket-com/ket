@@ -1899,7 +1899,7 @@ impl SlabManager {
 		for relocation in &relocations {
 			by_key
 				.entry((relocation.tenant_id, relocation.key_identity))
-				.or_insert_with(|| KeyRelocation::new(relocation.routing_locality, false))
+				.or_insert_with(|| KeyRelocation::new(relocation.routing_locality, None))
 				.pairs
 				.push(RelocationPair {
 					old: relocation.old,
@@ -1911,7 +1911,7 @@ impl SlabManager {
 			if !paired_sources.contains(&row.location) {
 				by_key
 					.entry((row.tenant_id, row.key_identity))
-					.or_insert_with(|| KeyRelocation::new(row.routing_locality, false))
+					.or_insert_with(|| KeyRelocation::new(row.routing_locality, None))
 					.removals
 					.push(row.location);
 			}
@@ -4093,6 +4093,7 @@ impl SlabManager {
 			}
 			let publication = self.begin_index_publication(vec![slab_id]).await?;
 			self.gc_unlink_owned_slab_file(slab_id).await?;
+			self.redirects.remove_touching(&self.tier_budget, slab_id);
 			index
 				.apply_with_publication_guard(
 					PersistentIndexUpdate {
@@ -4362,6 +4363,7 @@ impl SlabManager {
 				));
 			}
 			self.gc_unlink_owned_slab_file(slab_id).await?;
+			self.redirects.remove_touching(&self.tier_budget, slab_id);
 			let publication = self.begin_index_publication(vec![slab_id]).await?;
 			index
 				.apply_with_publication_guard(

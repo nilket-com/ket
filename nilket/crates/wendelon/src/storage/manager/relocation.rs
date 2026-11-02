@@ -38,7 +38,9 @@ pub(super) struct KeyRelocation {
 	pub(super) pairs: Vec<RelocationPair>,
 	pub(super) removals: Vec<RecordLocation>,
 	pub(super) insertions: Vec<RelocationInsertion>,
-	pub(super) publish_redirects: bool,
+	/// The rewrite's prepared cross-slab redirects, if any: an applied pair
+	/// publishes its entry (`redirect_store`).
+	pub(super) redirects: Option<Arc<super::redirect_store::SourceRedirects>>,
 }
 
 use super::tier_budget::{BudgetedSet, try_bounded_set};
@@ -143,13 +145,16 @@ impl RelocationScratch {
 }
 
 impl KeyRelocation {
-	pub(super) fn new(routing_locality: Locality, publish_redirects: bool) -> Self {
+	pub(super) fn new(
+		routing_locality: Locality,
+		redirects: Option<Arc<super::redirect_store::SourceRedirects>>,
+	) -> Self {
 		Self {
 			routing_locality,
 			pairs: Vec::new(),
 			removals: Vec::new(),
 			insertions: Vec::new(),
-			publish_redirects,
+			redirects,
 		}
 	}
 }
@@ -257,8 +262,8 @@ impl SlabManager {
 				if let Some(table_object_id) = pair.table_object_id {
 					self.add_published_table_reference(tenant_id, table_object_id, pair.new);
 				}
-				if relocation.publish_redirects {
-					self.relocated_reads.insert(pair.old, pair.new);
+				if let Some(redirects) = &relocation.redirects {
+					redirects.publish(&pair.old);
 				}
 				// A copy of a conflicting version stays marked wherever it moves.
 				if self.conflicted_locations.contains(&pair.old) {

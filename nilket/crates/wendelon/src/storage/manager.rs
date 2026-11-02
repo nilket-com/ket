@@ -207,6 +207,7 @@ mod stats_facts;
 use retention_reclaim::{
 	cleanup_retention_rewrite_tmp_files, retention_rewrite_tmp_path, table_drop_rewrite_tmp_path,
 };
+mod redirect_store;
 mod relocation;
 pub(crate) mod tier_authority;
 mod tier_budget;
@@ -704,11 +705,11 @@ pub struct SlabManager {
 	/// published reference. The picker skips only plans touching these slabs;
 	/// transient compaction failures retain their retry behavior.
 	quarantined_compaction_slabs: DashSet<SlabId>,
-	/// Best-effort compatibility map for in-flight readers that
-	/// raced a compaction rewrite. New lookups pivot to the fresh
-	/// location through `key_index`; a stale snapshot of the prior
-	/// location follows this chain to the replacement slab.
-	relocated_reads: DashMap<RecordLocation, RecordLocation>,
+	/// Cross-slab redirects for in-flight readers that raced a maintenance
+	/// rewrite (`redirect_store`). New lookups pivot to the fresh location
+	/// through `key_index`; a stale holder of an old location follows a
+	/// published redirect to the replacement slab.
+	redirects: redirect_store::RedirectStores,
 	/// Persistent restart index for the local slab set.
 	///
 	/// Ordinary record rows remain authoritative in slab bytes plus
@@ -3342,7 +3343,7 @@ impl SlabManager {
 
 	fn relocate_read_location(&self, mut location: RecordLocation) -> RecordLocation {
 		for _ in 0..8 {
-			let Some(next) = self.relocated_reads.get(&location).map(|entry| *entry) else {
+			let Some(next) = self.redirects.resolve(&location) else {
 				return location;
 			};
 			if next == location {

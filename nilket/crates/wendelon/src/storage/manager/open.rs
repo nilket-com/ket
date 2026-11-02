@@ -798,7 +798,7 @@ impl SlabManager {
 			secondary_index_table_references_by_slab,
 			integrity_failures: DashMap::new(),
 			quarantined_compaction_slabs: DashSet::new(),
-			relocated_reads: DashMap::new(),
+			redirects: Default::default(),
 			persistent_index,
 			pending_metadata_tokens,
 			completed_metadata_retries: DashMap::new(),

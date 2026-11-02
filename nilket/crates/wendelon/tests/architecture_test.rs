@@ -9717,6 +9717,8 @@ fn adr078_manager_source_concatenates_submodules() {
 			"pause_hooks.rs",
 			"publication_accounting.rs",
 			// ADR 0692: per-key relocation and atomic empty-key removal.
+			// ADR 0696 (0692 §7): charged cross-slab redirects of maintenance rewrites.
+			"redirect_store.rs",
 			"relocation.rs",
 			"retention_reclaim.rs",
 			"secondary_index_cleanup.rs",

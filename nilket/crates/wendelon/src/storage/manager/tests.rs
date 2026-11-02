@@ -22111,7 +22111,7 @@ async fn different_record_classes_at_one_version_conflict_through_relocation() {
 		])
 	);
 	let active = mgr.state.lock().await.active.clone();
-	let mut relocation = KeyRelocation::new(Locality::from(key), true);
+	let mut relocation = KeyRelocation::new(Locality::from(key), None);
 	for (old, (header, bytes)) in copies.iter().zip(frames) {
 		let new = active
 			.write_framed(
@@ -36622,7 +36622,7 @@ async fn a9_missing_sources_refuse_before_d2_or_fail_stop_on_refused_delta_error
 #[tokio::test]
 async fn a9_shared_output_pair_with_one_present_source_is_not_refused() {
 	let f = a9_maintenance_fixture(true).await;
-	let mut relocation = KeyRelocation::new(Locality::from(f.key), true);
+	let mut relocation = KeyRelocation::new(Locality::from(f.key), None);
 	for row in f.relocations.iter().filter(|row| row.key_identity == f.key) {
 		relocation.pairs.push(RelocationPair {
 			old: row.old_location,
@@ -43238,7 +43238,7 @@ fn reference_tier_refresh_relocations(plan: &TieredRowRefreshPlan) -> String {
 		paired_new.insert(*new);
 		by_key
 			.entry((old_row.tenant_id, old_row.key_identity))
-			.or_insert_with(|| KeyRelocation::new(new_row.routing_locality, false))
+			.or_insert_with(|| KeyRelocation::new(new_row.routing_locality, None))
 			.pairs
 			.push(RelocationPair {
 				old: *old,
@@ -43256,7 +43256,7 @@ fn reference_tier_refresh_relocations(plan: &TieredRowRefreshPlan) -> String {
 		if !paired_old.contains(&row.location) && !kept(row, &new_by_location) {
 			by_key
 				.entry((row.tenant_id, row.key_identity))
-				.or_insert_with(|| KeyRelocation::new(row.routing_locality, false))
+				.or_insert_with(|| KeyRelocation::new(row.routing_locality, None))
 				.removals
 				.push(row.location);
 		}
@@ -43265,7 +43265,7 @@ fn reference_tier_refresh_relocations(plan: &TieredRowRefreshPlan) -> String {
 		if !paired_new.contains(&row.location) && !kept(row, &old_by_location) {
 			by_key
 				.entry((row.tenant_id, row.key_identity))
-				.or_insert_with(|| KeyRelocation::new(row.routing_locality, false))
+				.or_insert_with(|| KeyRelocation::new(row.routing_locality, None))
 				.insertions
 				.push(RelocationInsertion {
 					location: row.location,
@@ -43632,7 +43632,7 @@ async fn relocation_within_scratch_edits_chains_exactly_as_before() {
 			.map(|_| location(&mut next))
 			.collect::<Vec<_>>();
 		chain.sort_by_key(|location| location.hlc);
-		let mut relocation = KeyRelocation::new(Locality::new(0), false);
+		let mut relocation = KeyRelocation::new(Locality::new(0), None);
 		for _ in 0..next() % 6 {
 			let old = if !chain.is_empty() && next() % 4 != 0 {
 				chain[(next() as usize) % chain.len()]
@@ -43711,7 +43711,7 @@ async fn relocating_one_row_of_a_long_chain_stays_within_its_prepared_scratch() 
 	chain[100_000] = old;
 	mgr.key_index.insert((tenant(), key), chain.clone());
 	let new = relocation_test_location(4, 4096, 10 + 100_000);
-	let mut relocation = KeyRelocation::new(Locality::new(0), false);
+	let mut relocation = KeyRelocation::new(Locality::new(0), None);
 	relocation.pairs.push(RelocationPair {
 		old,
 		new,
@@ -44572,4 +44572,146 @@ async fn reopen_before_replay_never_applies_an_older_mark_against_the_newer_comm
 		pointer.is_some() && final_pointer.is_some(),
 		"the slab stays published: {pointer:?}"
 	);
+}
+
+/// Only an applied pair publishes its redirect: the idempotent branch (old
+/// absent, new already indexed) and a refused pair (both absent) publish
+/// nothing, though the prepared map holds an entry for each.
+#[tokio::test]
+async fn only_an_applied_pair_publishes_its_cross_slab_redirect() {
+	use super::redirect_store::SourceRedirects;
+	let (_dir, mgr) = fresh_manager().await;
+	let key = Identity::new([0x5c; 32]);
+	let applied = (
+		relocation_test_location(1, 0, 10),
+		relocation_test_location(2, 0, 10),
+	);
+	let idempotent = (
+		relocation_test_location(1, 4096, 11),
+		relocation_test_location(2, 4096, 11),
+	);
+	let refused = (
+		relocation_test_location(1, 8192, 12),
+		relocation_test_location(2, 8192, 12),
+	);
+	mgr.key_index
+		.insert((tenant(), key), vec![applied.0, idempotent.1]);
+	let pairs = [applied, idempotent, refused];
+	let map = SourceRedirects::try_build(
+		&mgr.tier_budget,
+		SlabId::new(1),
+		SlabId::new(2),
+		pairs.len(),
+		pairs.iter().copied(),
+	)
+	.unwrap();
+	assert!(
+		mgr.redirects.install(
+			mgr.redirects
+				.reserve_install(&mgr.tier_budget, map.clone())
+				.unwrap()
+		)
+	);
+	let mut relocation = KeyRelocation::new(Locality::new(0), Some(map));
+	for (old, new) in pairs {
+		relocation.pairs.push(RelocationPair {
+			old,
+			new,
+			table_object_id: None,
+		});
+	}
+	let refused_pairs = mgr
+		.relocate_indexed_locations(
+			tenant(),
+			key,
+			&relocation,
+			&mut RelocationScratch::for_relocation(&relocation),
+		)
+		.to_vec();
+	assert_eq!(refused_pairs, vec![refused]);
+	assert_eq!(mgr.redirects.resolve(&applied.0), Some(applied.1));
+	assert_eq!(
+		mgr.redirects.resolve(&idempotent.0),
+		None,
+		"idempotent: nothing published"
+	);
+	assert_eq!(
+		mgr.redirects.resolve(&refused.0),
+		None,
+		"refused: nothing published"
+	);
+}
+
+/// A maintenance rewrite publishes a redirect for every relocated survivor:
+/// a stale holder of an old location resolves to its new one and reads its
+/// version there, through the charged per-source map.
+#[tokio::test]
+async fn a_maintenance_rewrite_publishes_charged_redirects_for_its_survivors() {
+	use super::tier_budget::TierBudgetKind;
+	let (_dir, mgr) = fresh_manager().await;
+	let (keys, _doomed, tombstone) = seed_maintenance_relocation_fixture(&mgr).await;
+	let before = keys
+		.iter()
+		.map(|key| (*key, mgr.lookup(tenant(), *key).unwrap().unwrap()))
+		.collect::<Vec<_>>();
+	let (schemas, indexes) = empty_compaction_catalogs();
+	let report = mgr
+		.reclaim_tombstoned_ranges(&[tombstone], &schemas, &indexes, 1)
+		.await
+		.unwrap();
+	assert_eq!(report.compacted_slabs, 1, "premise: the slab was rewritten");
+	let source = before[0].1.slab_id;
+	let map = mgr
+		.redirects
+		.source_map_for_test(source)
+		.expect("the rewrite installed its map");
+	assert!(mgr.tier_budget.used_by(TierBudgetKind::Redirect) > 0);
+	assert!(mgr.tier_budget.used_by(TierBudgetKind::RedirectStore) > 0);
+	drop(map);
+	for (key, old) in before.into_iter().filter(|(_, old)| old.slab_id == source) {
+		let current = mgr.lookup(tenant(), key).unwrap().unwrap();
+		assert_ne!(current.slab_id, source, "premise: {key:?} was relocated");
+		assert_eq!(mgr.redirects.resolve(&old), Some(current), "{key:?}");
+		assert_eq!(
+			mgr.read(old).await.unwrap(),
+			mgr.read(current).await.unwrap(),
+			"a stale holder reads its version"
+		);
+	}
+}
+
+/// A rewrite whose redirect map cannot be reserved still completes: the map
+/// is skipped and counted, and a stale holder reads its version from the
+/// retained old slab.
+#[tokio::test]
+async fn a_rewrite_without_room_for_its_redirects_skips_them_and_counts_it() {
+	let (_dir, mgr) = fresh_manager().await;
+	let (keys, _doomed, tombstone) = seed_maintenance_relocation_fixture(&mgr).await;
+	let before = keys
+		.iter()
+		.map(|key| (*key, mgr.lookup(tenant(), *key).unwrap().unwrap()))
+		.collect::<Vec<_>>();
+	let source = before[0].1.slab_id;
+	let skipped = crate::metrics::global().relocation_redirects_skipped.get();
+	mgr.tier_budget.set_limit_for_test(mgr.tier_budget.used());
+	let (schemas, indexes) = empty_compaction_catalogs();
+	let report = mgr
+		.reclaim_tombstoned_ranges(&[tombstone], &schemas, &indexes, 1)
+		.await
+		.unwrap();
+	assert_eq!(
+		report.compacted_slabs, 1,
+		"the rewrite does not need its redirects"
+	);
+	assert!(mgr.redirects.source_map_for_test(source).is_none());
+	assert!(crate::metrics::global().relocation_redirects_skipped.get() > skipped);
+	for (key, old) in before.into_iter().filter(|(_, old)| old.slab_id == source) {
+		let current = mgr.lookup(tenant(), key).unwrap().unwrap();
+		assert_eq!(mgr.redirects.resolve(&old), None);
+		assert_eq!(
+			mgr.read(old).await.unwrap(),
+			mgr.read(current).await.unwrap(),
+			"the retained old slab still serves {key:?}"
+		);
+	}
 }
