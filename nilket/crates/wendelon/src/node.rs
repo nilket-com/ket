@@ -1076,8 +1076,10 @@ impl WendelonNode {
 					Self::restore_cluster_backup_artifacts(backup, &cfg, &owner).await?
 				}
 				startup::RestoreChoice::Replacement(backup, source) => {
-					Self::prepare_replacement_from_cluster_backup(backup, source, &cfg, &owner)
-						.await?
+					let evidence =
+						Self::prepare_replacement_from_cluster_backup(backup, source, &cfg, &owner)
+							.await?;
+					scope.set_replacement_restore(evidence);
 				}
 			}
 			match transport {
@@ -1316,7 +1318,7 @@ impl WendelonNode {
 		source_node_id: u32,
 		cfg: &NodeBootstrapConfig,
 		owner: &DataDirectoryOwner,
-	) -> std::io::Result<()> {
+	) -> std::io::Result<startup::ReplacementRestoreEvidence> {
 		Self::validate_replacement_target(source_node_id, cfg)?;
 		owner.ensure_path(&cfg.data_dir)?;
 		std::fs::create_dir_all(&cfg.data_dir)?;
@@ -1363,7 +1365,9 @@ impl WendelonNode {
 			std::fs::File::open(&cfg.data_dir)?.sync_all()?;
 		}
 		SlabManager::restore_backup(&node_backup.storage, &cfg.data_dir, owner, false).await?;
-		Ok(())
+		Ok(startup::ReplacementRestoreEvidence::restored(
+			&node_backup.storage,
+		))
 	}
 
 	pub async fn export_cluster_backup(&self) -> std::io::Result<ClusterBackupImage> {
@@ -1700,7 +1704,19 @@ impl WendelonNode {
 		// Control replay is validated before it can authorize a missing-index rebuild.
 		let recovered_control = log_store.recovered_state_machine().await?;
 		let index_recovery =
-			startup::validated_index_recovery(&owner, cfg.node_id, &recovered_control).await?;
+			match startup::validated_index_recovery(&owner, cfg.node_id, &recovered_control).await?
+			{
+				Some(authority) => Some(authority),
+				None => {
+					startup::validated_replacement_recovery(&owner, scope.replacement_restore())
+						.await?
+				}
+			};
+		// A first bootstrap interrupted before the storage index existed resumes
+		// as a fresh storage creation, on pristine Control evidence only.
+		let storage_init_fresh = scope.storage_init_fresh()
+			|| (index_recovery.is_none()
+				&& startup::interrupted_first_creation(&owner, &log_store).await?);
 
 		// 3. L1 slab storage.
 		let l2 = cfg
@@ -1741,9 +1757,7 @@ impl WendelonNode {
 			{
 				SlabManager::initialize_recovered_store_with_owner(config, owner.clone(), authority)
 					.await?
-			} else if scope.storage_init_fresh()
-				&& !cfg.data_dir.join("storage_index.redb").exists()
-			{
+			} else if storage_init_fresh && !cfg.data_dir.join("storage_index.redb").exists() {
 				SlabManager::initialize_new_store_with_owner(config, owner.clone()).await?
 			} else {
 				SlabManager::open_with_owner(config, owner.clone()).await?
@@ -1769,7 +1783,7 @@ impl WendelonNode {
 				crypto: crypto.clone(),
 			};
 			let initialize =
-				scope.storage_init_fresh() && !cfg.data_dir.join("storage_index.redb").exists();
+				storage_init_fresh && !cfg.data_dir.join("storage_index.redb").exists();
 			if !cfg.data_dir.join("storage_index.redb").exists()
 				&& let Some(authority) = &index_recovery
 			{

@@ -959,7 +959,7 @@ impl SlabManager {
 		}
 
 		let old_bytes = slab.write_cursor();
-		let replacement_id = self.reserve_slab_id().await;
+		let replacement_id = self.reserve_slab_id().await?;
 		let replacement_path =
 			maintenance_staged_slab_path(&self.config.dir, slab_id, replacement_id);
 		let replacement = Arc::new(
@@ -1347,7 +1347,7 @@ impl SlabManager {
 			}));
 		}
 
-		let replacement_id = self.reserve_slab_id().await;
+		let replacement_id = self.reserve_slab_id().await?;
 		let replacement_path =
 			maintenance_staged_slab_path(&self.config.dir, slab_id, replacement_id);
 		let replacement = Arc::new(

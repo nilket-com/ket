@@ -4988,25 +4988,26 @@ mod tests {
 				.unwrap();
 			slab.fsync().await.unwrap();
 		}
-		let manager = SlabManager::initialize_new_store(SlabManagerConfig {
-			tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
-			dir: l1_dir.to_path_buf(),
-			max_slab_bytes: 1 << 20,
-			io: spawn_io_thread(64).unwrap(),
-			l2: Some(l2.clone()),
-			rehydration: crate::storage::manager::RehydrationPolicy::default(),
-			l2_column_fetch: Default::default(),
-			row_group_writer: Default::default(),
-			l2_row_group_fetch: Default::default(),
-			encoding_writer: Default::default(),
-			l2_chunk_layout: Default::default(),
-			l2_encoding_fetch: Default::default(),
-			encoding_compute: Default::default(),
-			group_commit: crate::storage::GroupCommitConfig::default(),
-			crypto: test_crypto(),
-		})
-		.await
-		.unwrap();
+		let manager =
+			SlabManager::initialize_store_adopting_existing_slabs_for_test(SlabManagerConfig {
+				tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
+				dir: l1_dir.to_path_buf(),
+				max_slab_bytes: 1 << 20,
+				io: spawn_io_thread(64).unwrap(),
+				l2: Some(l2.clone()),
+				rehydration: crate::storage::manager::RehydrationPolicy::default(),
+				l2_column_fetch: Default::default(),
+				row_group_writer: Default::default(),
+				l2_row_group_fetch: Default::default(),
+				encoding_writer: Default::default(),
+				l2_chunk_layout: Default::default(),
+				l2_encoding_fetch: Default::default(),
+				encoding_compute: Default::default(),
+				group_commit: crate::storage::GroupCommitConfig::default(),
+				crypto: test_crypto(),
+			})
+			.await
+			.unwrap();
 		let copies_of = |manager: &SlabManager| {
 			let mut copies = manager
 				.scan_all_versions(Locality::ZERO, Locality::MAX, hlc_at(0))
@@ -5379,25 +5380,26 @@ mod tests {
 			.unwrap();
 			slab.fsync().await.unwrap();
 		}
-		let manager = SlabManager::initialize_new_store(SlabManagerConfig {
-			tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
-			dir: l1_dir.to_path_buf(),
-			max_slab_bytes: 1 << 20,
-			io: spawn_io_thread(64).unwrap(),
-			l2: Some(l2.clone()),
-			rehydration: crate::storage::manager::RehydrationPolicy::default(),
-			l2_column_fetch: Default::default(),
-			row_group_writer: Default::default(),
-			l2_row_group_fetch: Default::default(),
-			encoding_writer: Default::default(),
-			l2_chunk_layout: Default::default(),
-			l2_encoding_fetch: Default::default(),
-			encoding_compute: Default::default(),
-			group_commit: crate::storage::GroupCommitConfig::default(),
-			crypto: test_crypto(),
-		})
-		.await
-		.unwrap();
+		let manager =
+			SlabManager::initialize_store_adopting_existing_slabs_for_test(SlabManagerConfig {
+				tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
+				dir: l1_dir.to_path_buf(),
+				max_slab_bytes: 1 << 20,
+				io: spawn_io_thread(64).unwrap(),
+				l2: Some(l2.clone()),
+				rehydration: crate::storage::manager::RehydrationPolicy::default(),
+				l2_column_fetch: Default::default(),
+				row_group_writer: Default::default(),
+				l2_row_group_fetch: Default::default(),
+				encoding_writer: Default::default(),
+				l2_chunk_layout: Default::default(),
+				l2_encoding_fetch: Default::default(),
+				encoding_compute: Default::default(),
+				group_commit: crate::storage::GroupCommitConfig::default(),
+				crypto: test_crypto(),
+			})
+			.await
+			.unwrap();
 		let sm = WendelonStateMachine::new();
 		let pointer =
 			tier_active_slab(&manager, &l2, &sm, "tier/retention-conflicting-once.wnd").await;

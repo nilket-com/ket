@@ -329,6 +329,101 @@ pub(crate) fn delete_maintenance_receipt_table_for_test(path: &Path) {
 	write_txn.commit().unwrap();
 }
 const META_LAST_CONTROL_LOG_INDEX: &str = "last_control_log_index";
+/// The store's incarnation, written once by fresh initialization and never
+/// rewritten. Its absence on open means the store predates slab identity.
+const META_STORE_INCARNATION_HIGH: &str = "store_incarnation_high_v1";
+const META_STORE_INCARNATION_LOW: &str = "store_incarnation_low_v1";
+/// The exclusive bound on every slab id this store has issued. It is
+/// committed before any id below it is used, so reopen never reissues one.
+const META_SLAB_ID_HIGH_WATER: &str = "slab_id_high_water_v1";
+
+/// A random 128-bit identity for one store, fixed at creation. A slab id is
+/// local to the incarnation that issued it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct StoreIncarnation(u128);
+
+impl StoreIncarnation {
+	fn fresh() -> Self {
+		loop {
+			let value = uuid::Uuid::new_v4().as_u128();
+			if value != 0 {
+				return Self(value);
+			}
+		}
+	}
+
+	pub(crate) fn get(self) -> u128 {
+		self.0
+	}
+}
+
+#[derive(Debug)]
+struct StoreIdentityMissing;
+
+impl std::fmt::Display for StoreIdentityMissing {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str(
+			"store identity is missing: the store predates the slab identity format and cannot be opened; re-create it",
+		)
+	}
+}
+
+impl std::error::Error for StoreIdentityMissing {}
+
+fn initializing_index_path(path: &Path) -> PathBuf {
+	let mut name = path.file_name().unwrap_or_default().to_os_string();
+	name.push(".initializing");
+	path.with_file_name(name)
+}
+
+fn store_identity_missing() -> Error {
+	Error::new(ErrorKind::InvalidData, StoreIdentityMissing)
+}
+
+/// An old-format store is refused, never opened in a degraded mode.
+pub(crate) fn is_store_identity_missing(error: &Error) -> bool {
+	error
+		.get_ref()
+		.is_some_and(|cause| cause.is::<StoreIdentityMissing>())
+}
+
+#[cfg(test)]
+pub(crate) fn remove_store_identity_for_test(path: &Path) {
+	let db = Database::create(path).unwrap();
+	let write_txn = db.begin_write().unwrap();
+	{
+		let mut meta = write_txn.open_table(META_TABLE).unwrap();
+		meta.remove(META_STORE_INCARNATION_HIGH).unwrap();
+		meta.remove(META_STORE_INCARNATION_LOW).unwrap();
+	}
+	write_txn.commit().unwrap();
+}
+
+/// Test seam: an intent row that cannot be decoded, so the index and its H
+/// open but the snapshot does not load.
+#[cfg(test)]
+pub(crate) fn insert_undecodable_lsm_intent_for_test(path: &Path) {
+	let db = Database::create(path).unwrap();
+	let write_txn = db.begin_write().unwrap();
+	{
+		let mut intents = write_txn.open_table(LSM_INSTALL_INTENTS_TABLE).unwrap();
+		intents
+			.insert(u64::MAX, b"not-an-intent".as_slice())
+			.unwrap();
+	}
+	write_txn.commit().unwrap();
+}
+
+#[cfg(test)]
+pub(crate) fn overwrite_slab_id_high_water_for_test(path: &Path, bound: u64) {
+	let db = Database::create(path).unwrap();
+	let write_txn = db.begin_write().unwrap();
+	{
+		let mut meta = write_txn.open_table(META_TABLE).unwrap();
+		meta.insert(META_SLAB_ID_HIGH_WATER, &bound).unwrap();
+	}
+	write_txn.commit().unwrap();
+}
 /// ADR 0097 decision 4: set once, when the receipt table is first created.
 ///
 /// Its whole purpose is to tell "this store has never had receipts" apart from
@@ -534,6 +629,7 @@ pub(crate) struct PersistentLocalIndex {
 	/// False for the lifetime of this handle if initialized cleanup history is missing.
 	cleanup_available: bool,
 	persisted_cleanup_gaps: std::sync::Arc<CleanupGapContribution>,
+	incarnation: StoreIncarnation,
 	/// Test seam: make the next receipt mutations fail, so the policy's
 	/// fail-closed paths can be exercised against a real store.
 	#[cfg(test)]
@@ -800,7 +896,7 @@ impl PersistentLocalIndex {
 		let path = path.into();
 		let mut delay = std::time::Duration::from_millis(200);
 		loop {
-			match Self::open_index(path.clone(), owner.clone(), false).await {
+			match Self::open_index(path.clone(), owner.clone(), None).await {
 				Err(error)
 					if error
 						.get_ref()
@@ -826,18 +922,32 @@ impl PersistentLocalIndex {
 		self.db.test_handle()
 	}
 
+	#[cfg(test)]
 	pub(crate) async fn initialize_new(
 		path: impl Into<PathBuf>,
 		owner: Option<DataDirectoryOwner>,
 	) -> std::io::Result<Self> {
-		Self::open_index(path, owner, true).await
+		Self::initialize_new_with_high_water(path, owner, 0).await
+	}
+
+	/// Create the index with its identity and an initial slab id high-water
+	/// in one transaction. The file is built under a temporary name and
+	/// linked into place only after that commit, so a crash leaves either no
+	/// index or a complete one.
+	pub(crate) async fn initialize_new_with_high_water(
+		path: impl Into<PathBuf>,
+		owner: Option<DataDirectoryOwner>,
+		initial_high_water: u64,
+	) -> std::io::Result<Self> {
+		Self::open_index(path, owner, Some(initial_high_water)).await
 	}
 
 	async fn open_index(
 		path: impl Into<PathBuf>,
 		owner: Option<DataDirectoryOwner>,
-		initialize_new: bool,
+		initial_high_water: Option<u64>,
 	) -> std::io::Result<Self> {
+		let initialize_new = initial_high_water.is_some();
 		let path = path.into();
 		if let Some(owner) = &owner {
 			owner.ensure_contains(&path)?;
@@ -847,14 +957,28 @@ impl PersistentLocalIndex {
 		// closure, while the permit still holds the owner open.
 		let bind_owner = owner.clone();
 		let opened = spawn_blocking_owned_io(owner, move || {
+			let staging = initializing_index_path(&path);
 			let db = if initialize_new {
-				// O_EXCL makes an explicit fresh initialization incapable of opening
-				// or replacing an unexpected existing authority file.
+				// An explicit fresh initialization can never open or replace an
+				// existing authority file: it is built under a staging name and
+				// linked into place without clobbering (below). A staging file
+				// left by a crash was never linked, so it is not authority.
+				if path.exists() {
+					return Err(Error::new(
+						ErrorKind::AlreadyExists,
+						format!("storage index already exists: {}", path.display()),
+					));
+				}
+				match std::fs::remove_file(&staging) {
+					Ok(()) => {}
+					Err(error) if error.kind() == ErrorKind::NotFound => {}
+					Err(error) => return Err(error),
+				}
 				let file = std::fs::OpenOptions::new()
 					.read(true)
 					.write(true)
 					.create_new(true)
-					.open(&path)?;
+					.open(&staging)?;
 				Database::builder().create_file(file).map_err(redb_to_io)?
 			} else {
 				Database::open(&path).map_err(|error| match error {
@@ -1066,7 +1190,50 @@ impl PersistentLocalIndex {
 					.is_some();
 				missing
 			};
+			let incarnation = {
+				let mut meta = write_txn.open_table(META_TABLE).map_err(redb_to_io)?;
+				if initialize_new {
+					let incarnation = StoreIncarnation::fresh();
+					meta.insert(META_STORE_INCARNATION_HIGH, &((incarnation.0 >> 64) as u64))
+						.map_err(redb_to_io)?;
+					meta.insert(META_STORE_INCARNATION_LOW, &(incarnation.0 as u64))
+						.map_err(redb_to_io)?;
+					meta.insert(
+						META_SLAB_ID_HIGH_WATER,
+						&initial_high_water.unwrap_or_default(),
+					)
+					.map_err(redb_to_io)?;
+					incarnation
+				} else {
+					let read = |key| {
+						meta.get(key)
+							.map_err(redb_to_io)
+							.map(|value| value.map(|value| value.value()))
+					};
+					let (Some(high), Some(low), Some(_)) = (
+						read(META_STORE_INCARNATION_HIGH)?,
+						read(META_STORE_INCARNATION_LOW)?,
+						read(META_SLAB_ID_HIGH_WATER)?,
+					) else {
+						return Err(store_identity_missing());
+					};
+					let incarnation = StoreIncarnation((u128::from(high) << 64) | u128::from(low));
+					if incarnation.0 == 0 {
+						return Err(store_identity_missing());
+					}
+					incarnation
+				}
+			};
 			write_txn.commit().map_err(redb_to_io)?;
+			if initialize_new {
+				// hard_link refuses an existing target, so this never replaces
+				// an index that appeared meanwhile.
+				std::fs::hard_link(&staging, &path)?;
+				std::fs::remove_file(&staging)?;
+				if let Some(parent) = path.parent() {
+					std::fs::File::open(parent)?.sync_all()?;
+				}
+			}
 			let db = crate::storage::owned_redb::OwnedRedb::new(db, "storage index");
 			if let Some(owner) = bind_owner {
 				db.bind_owner(owner)?;
@@ -1077,10 +1244,11 @@ impl PersistentLocalIndex {
 				cleanup_ok,
 				initial_gaps,
 				history_incomplete,
+				incarnation,
 			))
 		})
 		.await?;
-		let (db, receipts_ok, cleanup_ok, initial_gaps, history_incomplete) = opened;
+		let (db, receipts_ok, cleanup_ok, initial_gaps, history_incomplete, incarnation) = opened;
 		if history_incomplete {
 			crate::metrics::global()
 				.storage_cleanup_history_incomplete
@@ -1098,6 +1266,7 @@ impl PersistentLocalIndex {
 				count: std::sync::atomic::AtomicU64::new(initial_gaps),
 				history_incomplete,
 			}),
+			incarnation,
 			#[cfg(test)]
 			fail_receipt_mutations: Default::default(),
 			#[cfg(test)]
@@ -1940,6 +2109,52 @@ impl PersistentLocalIndex {
 				{
 					let _table = tx
 						.open_table(SNAPSHOT_CLEANUP_INTENTS_TABLE)
+						.map_err(redb_to_io)?;
+				}
+				tx.commit().map_err(redb_to_io)
+			})
+			.await
+	}
+
+	pub(crate) fn store_incarnation(&self) -> StoreIncarnation {
+		self.incarnation
+	}
+
+	/// The committed exclusive bound on issued slab ids.
+	pub(crate) async fn slab_id_high_water(&self) -> std::io::Result<u64> {
+		self.db
+			.run(move |db| {
+				let tx = db.begin_read().map_err(redb_to_io)?;
+				let meta = tx.open_table(META_TABLE).map_err(redb_to_io)?;
+				meta.get(META_SLAB_ID_HIGH_WATER)
+					.map_err(redb_to_io)?
+					.map(|value| value.value())
+					.ok_or_else(store_identity_missing)
+			})
+			.await
+	}
+
+	/// Commit a raised slab id bound. It returns only after the commit is
+	/// durable; a failure exposes no id above the previous bound.
+	pub(crate) async fn persist_slab_id_high_water(&self, bound: u64) -> std::io::Result<()> {
+		let _guard = self.write_lock.lock().await;
+		self.db
+			.run(move |db| {
+				let tx = db.begin_write().map_err(redb_to_io)?;
+				{
+					let mut meta = tx.open_table(META_TABLE).map_err(redb_to_io)?;
+					let current = meta
+						.get(META_SLAB_ID_HIGH_WATER)
+						.map_err(redb_to_io)?
+						.map(|value| value.value())
+						.ok_or_else(store_identity_missing)?;
+					if bound < current {
+						return Err(Error::new(
+							ErrorKind::InvalidInput,
+							format!("slab id high-water only rises: {bound} < {current}"),
+						));
+					}
+					meta.insert(META_SLAB_ID_HIGH_WATER, &bound)
 						.map_err(redb_to_io)?;
 				}
 				tx.commit().map_err(redb_to_io)

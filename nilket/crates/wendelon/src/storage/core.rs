@@ -463,6 +463,19 @@ impl LocalSlabStore {
 		group_commit: GroupCommitConfig,
 		acknowledged: Option<&BTreeSet<u64>>,
 	) -> std::io::Result<Self> {
+		Self::open_recovered(path, slab_id, file_ops, group_commit, acknowledged, true).await
+	}
+
+	/// As [`open_with_acknowledged`](Self::open_with_acknowledged), but with
+	/// `create: false` a missing file is an error rather than a new slab.
+	pub(crate) async fn open_recovered(
+		path: impl AsRef<Path>,
+		slab_id: SlabId,
+		file_ops: Arc<dyn AsyncFileOps>,
+		group_commit: GroupCommitConfig,
+		acknowledged: Option<&BTreeSet<u64>>,
+		create: bool,
+	) -> std::io::Result<Self> {
 		let path = path.as_ref();
 		let file = file_ops
 			.open(
@@ -470,7 +483,7 @@ impl LocalSlabStore {
 				OpenFlags {
 					read: true,
 					write: true,
-					create: true,
+					create,
 					direct: true,
 					..Default::default()
 				},

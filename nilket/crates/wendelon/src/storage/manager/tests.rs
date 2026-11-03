@@ -2830,6 +2830,16 @@ async fn initialize_manager_at_dir(
 	.unwrap()
 }
 
+/// Issue every slab id up to `last` through the allocator, so a fixture may
+/// name `last` as a slab this store issued (and later lost).
+async fn issue_slab_ids_through(manager: &SlabManager, last: SlabId) {
+	let next = manager.state.lock().await.next_slab_id;
+	if last >= next {
+		let count = usize::try_from(last.get() - next.get() + 1).unwrap();
+		manager.reserve_lsm_output_slab_ids(count).await.unwrap();
+	}
+}
+
 async fn open_manager_at_dir(
 	dir: std::path::PathBuf,
 	io: crate::storage::io_uring::IoRingHandle,
@@ -5150,6 +5160,7 @@ async fn recovery_fences_missing_secondary_index_source_slab() {
 		crypto.clone(),
 	)
 	.await;
+	issue_slab_ids_through(&manager, SlabId::new(5_039)).await;
 	let segment = secondary_index_segment_for_test(SlabId::new(5_039));
 	let info = manager
 		.persist_secondary_index_segment(&segment)
@@ -15791,7 +15802,7 @@ async fn maintenance_publication_refuses_relocation_survivor_mismatch() {
 		retention_ambiguous: false,
 		retention_lag_seconds: 0,
 	}];
-	let replacement_id = mgr.reserve_slab_id().await;
+	let replacement_id = mgr.reserve_slab_id().await.unwrap();
 	let staged_path = maintenance_staged_slab_path(&mgr.config.dir, old_slab, replacement_id);
 	let replacement = Arc::new(
 		LocalSlabStore::open(
@@ -16783,47 +16794,86 @@ async fn recovery_resumes_past_a_torn_region_at_the_next_acknowledged_record() {
 	assert!(next.offset > acked.offset);
 }
 
-/// ADR 0099 without a boundary oracle still stops at the first anomaly.
-/// S4 fences manager admission when redb is unavailable, so create the
-/// forensic fixture through the local store and inspect recovery privately.
+/// ADR 0099 without a boundary oracle still stops at the first anomaly. A
+/// manager no longer opens without its durable index (ADR 0697), so the
+/// forensic fixture is built and recovered at the slab store directly, with no
+/// acknowledged offsets.
 #[tokio::test]
 async fn recovery_without_the_durable_index_stops_at_the_first_anomaly() {
 	let dir = fresh_dir("adr0099-no-oracle");
-	std::fs::create_dir_all(persistent_index_path(&dir)).unwrap();
-	let crypto = test_crypto();
-	let io = spawn_io_thread(64).unwrap();
-	let manager = open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
-	assert!(manager.persistent_index.is_none());
-
-	let (slab, reservation) = manager.target_for_append(16, None).await.unwrap();
-	drop(reservation);
+	// Slab 0 is issued by a real store through the durable allocator.
+	let issued = SlabManager::initialize_new_store(gc_owned_test_config(&dir))
+		.await
+		.unwrap();
+	assert_eq!(issued.active_slab_id().await, SlabId::ZERO);
+	drop(issued);
+	let path = slab_path(&dir, SlabId::ZERO);
+	let open = || {
+		crate::storage::LocalSlabStore::open_with_acknowledged(
+			&path,
+			SlabId::ZERO,
+			Arc::new(BlockingFileOps),
+			GroupCommitConfig::default(),
+			None,
+		)
+	};
+	let slab = open().await.unwrap();
+	drop(slab.reserve_append(16).unwrap());
 	let key = id(0x99B0);
-	let after = slab
-		.append(tenant(), key, hlc(150), b"after-the-hole")
+	slab.append(tenant(), key, hlc(150), b"after-the-hole")
 		.await
 		.unwrap();
 	slab.wait_durable_commit().await.unwrap();
-	assert_eq!(after.slab_id, slab.slab_id());
-	assert!(
-		manager
-			.append_durable(tenant(), id(0x99B1), hlc(151), b"refused")
-			.await
-			.is_err()
-	);
 	drop(slab);
-	drop(manager);
 
-	let reopened = open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
-	assert!(
-		reopened.lookup(tenant(), key).is_err(),
-		"public answers remain fenced"
-	);
-	let active = reopened.state.lock().await.active.clone();
+	let reopened = open().await.unwrap();
 	assert_eq!(
-		active.lookup(tenant(), key).unwrap(),
+		reopened.lookup(tenant(), key).unwrap(),
 		None,
 		"without boundary evidence the walk stops at the hole"
 	);
+	drop(reopened);
+
+	// Through the whole manager path: with the index unavailable it opens
+	// fenced over the existing slab and changes no name and no byte.
+	std::fs::remove_file(persistent_index_path(&dir)).unwrap();
+	std::fs::create_dir(persistent_index_path(&dir)).unwrap();
+	let listing = || {
+		let mut entries: Vec<_> = std::fs::read_dir(&*dir)
+			.unwrap()
+			.map(|entry| {
+				let entry = entry.unwrap();
+				let bytes = entry
+					.file_type()
+					.unwrap()
+					.is_file()
+					.then(|| std::fs::read(entry.path()).unwrap());
+				(entry.file_name(), bytes)
+			})
+			.collect();
+		entries.sort();
+		entries
+	};
+	let before = listing();
+	let manager = open_manager_at_dir(
+		dir.to_path_buf(),
+		spawn_io_thread(64).unwrap(),
+		test_crypto(),
+	)
+	.await;
+	assert!(
+		manager.persistent_index.is_none(),
+		"premise: redb unavailable"
+	);
+	assert!(
+		manager.lookup(tenant(), key).is_err(),
+		"public answers remain fenced"
+	);
+	let active = manager.state.lock().await.active.clone();
+	assert_eq!(active.lookup(tenant(), key).unwrap(), None);
+	drop(active);
+	drop(manager);
+	assert_eq!(listing(), before, "the degraded open changed the store");
 }
 
 /// ADR 0099 decision 3, the reviewer's round trip: a sealed slab whose first
@@ -24700,7 +24750,7 @@ async fn replacement_compaction_finisher_waits_for_source_tier_lock() {
 		retention_ambiguous: false,
 		retention_lag_seconds: 0,
 	};
-	let replacement_id = mgr.reserve_slab_id().await;
+	let replacement_id = mgr.reserve_slab_id().await.unwrap();
 	let staged = maintenance_staged_slab_path(&mgr.config.dir, slab_id, replacement_id);
 	let replacement = Arc::new(
 		LocalSlabStore::open(
@@ -24890,22 +24940,28 @@ async fn unreadable_index_preserves_staged_lsm_output_and_fences_admission() {
 	let staged = dir.join("compaction-temp-0000000000000001-slab_0000000000000001.wnd");
 	let bytes = b"staged-output-evidence";
 	std::fs::write(&staged, bytes).unwrap();
-	let mgr = open_manager_at_dir(
-		dir.to_path_buf(),
-		spawn_io_thread(64).unwrap(),
-		test_crypto(),
-	)
-	.await;
+	// With no usable index and no existing active slab there is nothing to
+	// serve fenced: the open is refused (ADR 0697 creates no slab without
+	// identity and high-water), and the staged output stays untouched.
+	let opened = SlabManager::open(gc_owned_test_config(&dir)).await;
 	let preserved = std::fs::read(&staged);
-	let admission = mgr
-		.append_durable(tenant(), id(0x9ad1), hlc(131), b"not-admitted")
-		.await;
 	assert!(
 		matches!(preserved, Ok(ref data) if data == bytes),
 		"open deleted or changed the staged output"
 	);
-	let error = admission.expect_err("unreadable intent authority must fence admission");
-	assert_eq!(error.kind(), ErrorKind::WouldBlock);
+	let error = opened
+		.err()
+		.expect("unreadable intent authority with no active slab must refuse");
+	assert_eq!(error.kind(), ErrorKind::InvalidData, "{error}");
+	let entries: Vec<_> = std::fs::read_dir(&*dir)
+		.unwrap()
+		.map(|entry| entry.unwrap().file_name())
+		.collect();
+	assert_eq!(
+		entries.len(),
+		2,
+		"only the staged output and the unreadable index remain: {entries:?}"
+	);
 }
 
 /// A published tentative still owns its source slab until its final outcome.
@@ -25231,9 +25287,11 @@ async fn own_unresolved_index_publication_refuses_private_retirement() {
 #[tokio::test]
 async fn unresolved_lsm_intent_fences_open_and_preserves_staged_output() {
 	let dir = fresh_dir("lsm-unresolved-open");
-	let index = crate::storage::index::PersistentLocalIndex::initialize_new(
+	// The fixture's intent names slabs 2 and 3: the store issued them.
+	let index = crate::storage::index::PersistentLocalIndex::initialize_new_with_high_water(
 		persistent_index_path(&dir),
 		None,
+		4,
 	)
 	.await
 	.unwrap();
@@ -36452,7 +36510,7 @@ async fn a9_maintenance_fixture(keep_source: bool) -> A9MaintenanceFixture {
 		.unwrap();
 	let old_slab = force_seal_active(&manager).await;
 	manager.ensure_live_lsm_run_for_maintenance(old_slab, 8192);
-	let new_slab = manager.reserve_slab_id().await;
+	let new_slab = manager.reserve_slab_id().await.unwrap();
 	let staged = maintenance_staged_slab_path(&manager.config.dir, old_slab, new_slab);
 	let replacement = Arc::new(
 		LocalSlabStore::open(
@@ -45893,4 +45951,464 @@ async fn a_node_restarted_while_fenced_converges_to_its_committed_pointer() {
 
 fn tiered_slab_pointer_for_test(tier: &crate::consensus::TieredSlab) -> TieredSlabPointer {
 	super::tier_tokens::tiered_slab_pointer(tier)
+}
+
+/// DC-160a RED: slab ids issued before a clean reopen must never be issued
+/// again. Today open recomputes the allocator from surviving evidence, so an
+/// unused LSM output reservation above every surviving id is reissued.
+#[tokio::test]
+async fn dc160a_reserved_slab_ids_are_not_reissued_after_reopen() {
+	let dir = fresh_dir("dc160a-reserve-reopen");
+	let manager = SlabManager::initialize_new_store(gc_owned_test_config(&dir))
+		.await
+		.unwrap();
+	manager
+		.append_durable(tenant(), id(0xA160), hlc(10), b"row")
+		.await
+		.unwrap();
+	let before = manager.reserve_lsm_output_slab_ids(4).await.unwrap();
+	drop(manager);
+
+	let reopened = SlabManager::open(gc_owned_test_config(&dir)).await.unwrap();
+	let after = reopened.reserve_lsm_output_slab_ids(4).await.unwrap();
+	let reissued: Vec<_> = after.iter().filter(|id| before.contains(id)).collect();
+	assert!(
+		reissued.is_empty(),
+		"slab ids {reissued:?} reissued after reopen (before {before:?}, after {after:?})"
+	);
+}
+
+/// DC-160 RED: two data nodes on one control ring each own an unrelated
+/// physical slab with the same bare id. Tiering node A's slab must not touch
+/// node B's: B keeps no tier pointer for it and still serves its own row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dc160_tiering_one_data_nodes_slab_leaves_anothers_same_id_slab_untouched() {
+	let l2_root = fresh_dir("dc160-l2");
+	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
+	let (dir_a, dir_b) = (fresh_dir("dc160-node-a"), fresh_dir("dc160-node-b"));
+	let open = async |dir: &Path| {
+		SlabManager::initialize_new_store(SlabManagerConfig {
+			l2: Some(l2.clone()),
+			..gc_owned_test_config(dir)
+		})
+		.await
+		.unwrap()
+	};
+	let (a, b) = (open(&dir_a).await, open(&dir_b).await);
+	let (key_a, key_b) = (id(0xA160), id(0xB160));
+	a.append_durable(tenant(), key_a, hlc(10), b"node-a-row")
+		.await
+		.unwrap();
+	b.append_durable(tenant(), key_b, hlc(10), b"node-b-row")
+		.await
+		.unwrap();
+	let (slab_a, slab_b) = (force_seal_active(&a).await, force_seal_active(&b).await);
+	assert_eq!(
+		slab_a, slab_b,
+		"premise: independent allocators issue the same bare id"
+	);
+
+	let raw = a.read_sealed_raw(slab_a).await.unwrap();
+	let encrypted = a.encrypt_tiered_object_blob(slab_a, &raw).unwrap();
+	let pointer = TieredSlabPointer {
+		slab_id: slab_a,
+		l2_uri: l2
+			.put(&format!("tier/dc160_a_{slab_a:016x}.wnd"), &encrypted.bytes)
+			.await
+			.unwrap(),
+		payload_hash: crate::hash::content::digest(&encrypted.bytes),
+		is_encrypted: true,
+		tenant_id: Some(tenant()),
+		tenant_kek_id: Some(encrypted.tenant_kek_id),
+		stats_format_version: None,
+		stats_block_len: None,
+		stats_block_hash128: None,
+		tombstone_metadata: TombstoneMetadata::None,
+		supersession_metadata: SupersessionMetadata::None,
+	};
+	let cluster = control_cluster_observing(&[(1, &a), (2, &b)]).await;
+	cluster.commit_tier(1, &pointer).await;
+	assert!(
+		eventually(30, async || a.tier_pointer(slab_a).await.as_ref()
+			== Some(&pointer))
+		.await,
+		"node A publishes its own tier pointer"
+	);
+
+	assert_eq!(
+		b.tier_pointer(slab_b).await,
+		None,
+		"node B's unrelated slab {slab_b:?} took node A's tier pointer"
+	);
+	let location = b
+		.lookup(tenant(), key_b)
+		.expect("node B's index is not fenced")
+		.expect("node B still indexes its own row");
+	assert_eq!(location.slab_id, slab_b);
+	b.read(location)
+		.await
+		.expect("node B still serves its own row");
+}
+
+/// [`control_cluster`] with a manager observer on each listed voter.
+async fn control_cluster_observing(observers: &[(u32, &Arc<SlabManager>)]) -> ControlCluster {
+	use crate::consensus::{WendelonLogStore, WendelonRaft};
+	let network = b1t_network::Network::default();
+	let config = Arc::new(
+		crate::consensus::retention::ControlRetention::default()
+			.openraft_config("wendelon")
+			.validate()
+			.unwrap(),
+	);
+	let (mut logs, mut dirs, mut nodes) = (Vec::new(), Vec::new(), Vec::new());
+	for node_id in 1_u32..=3 {
+		let dir = fresh_dir("dc160-control-cluster-wal");
+		let log = WendelonLogStore::open_for_retention_test(&dir, 64 * 4096, None)
+			.await
+			.unwrap();
+		let mut sm = log.recovered_state_machine().await.unwrap();
+		if let Some((_, manager)) = observers.iter().find(|(id, _)| *id == node_id) {
+			sm = sm.with_tier_observer(Arc::new(crate::storage::ManagerTierObserver::new(
+				(*manager).clone(),
+			)));
+		}
+		let raft = WendelonRaft::new(node_id, config.clone(), network.clone(), log.clone(), sm)
+			.await
+			.unwrap();
+		network.0.lock().unwrap().insert(node_id, raft.clone());
+		logs.push(log);
+		dirs.push(dir);
+		nodes.push(raft);
+	}
+	let members = (1_u32..=3)
+		.map(|id| {
+			(
+				id,
+				openraft::BasicNode {
+					addr: "127.0.0.1:0".into(),
+				},
+			)
+		})
+		.collect::<BTreeMap<_, _>>();
+	nodes[0].initialize(members).await.unwrap();
+	for node in &nodes {
+		node.wait(Some(Duration::from_secs(60)))
+			.current_leader(1, "initial control leader")
+			.await
+			.unwrap();
+	}
+	ControlCluster {
+		nodes,
+		_network: network,
+		_logs: logs,
+		_dirs: dirs,
+	}
+}
+
+/// DC-161 RED: GC whose node lost control leadership after the tick gate.
+/// `LeaderGatedLsmGcDriver` checks leadership only at tick start; this calls
+/// the sweep directly on node 1 after node 2 won a real election, standing in
+/// for that window. The commit never reaches a log, yet the store must not be
+/// left with an unresolvable GC intent and a node-wide fence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dc161_gc_after_leadership_loss_leaves_no_unresolvable_intent() {
+	let (_dir, manager) = fresh_manager().await;
+	let (slab_id, _key) = seed_small_retired_gc_slab(&manager).await;
+	let cluster = control_cluster_observing(&[(1, &manager)]).await;
+	cluster.elect(2).await;
+	let committer = crate::storage::RaftCommitter::new(cluster.nodes[0].clone());
+	let gc = LsmGcWorker::new(LsmConfig::default(), manager.slab_pin_table()).unwrap();
+	let outcome = manager
+		.sweep_lsm_delete_pending_once_via_control_ring(&gc, &committer)
+		.await;
+	let durable = manager
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot()
+		.await
+		.unwrap();
+	assert_eq!(
+		(
+			durable.lsm_install_intents.len(),
+			manager.tier_authority_readiness_reason()
+		),
+		(0, None),
+		"slab {slab_id:?}: GC on a deposed leader left an unresolved intent and fence (sweep: {outcome:?})"
+	);
+}
+
+/// Slice 1 of the slab identity ADR: the store incarnation is written once at
+/// creation and kept by every ordinary reopen; another store gets its own.
+#[tokio::test]
+async fn store_incarnation_is_fixed_at_creation_and_kept_on_reopen() {
+	let incarnation = |manager: &SlabManager| {
+		manager
+			.persistent_index
+			.as_ref()
+			.expect("redb store")
+			.store_incarnation()
+	};
+	let dir = fresh_dir("store-incarnation-reopen");
+	let manager = SlabManager::initialize_new_store(gc_owned_test_config(&dir))
+		.await
+		.unwrap();
+	let created = incarnation(&manager);
+	drop(manager);
+	let reopened = SlabManager::open(gc_owned_test_config(&dir)).await.unwrap();
+	assert_eq!(incarnation(&reopened), created);
+
+	let other_dir = fresh_dir("store-incarnation-other");
+	let other = SlabManager::initialize_new_store(gc_owned_test_config(&other_dir))
+		.await
+		.unwrap();
+	assert_ne!(incarnation(&other), created);
+}
+
+/// A store without an identity predates the format and is refused at open,
+/// never opened in the degraded redb-less mode.
+#[tokio::test]
+async fn open_refuses_a_store_without_identity() {
+	let dir = fresh_dir("store-identity-missing");
+	let manager = SlabManager::initialize_new_store(gc_owned_test_config(&dir))
+		.await
+		.unwrap();
+	drop(manager);
+	crate::storage::index::remove_store_identity_for_test(&persistent_index_path(&dir));
+	let error = SlabManager::open(gc_owned_test_config(&dir))
+		.await
+		.err()
+		.expect("an old-format store must not open");
+	assert!(
+		crate::storage::index::is_store_identity_missing(&error),
+		"refused for the wrong reason: {error}"
+	);
+}
+
+/// Own slab files above the committed high-water mean an id was used before
+/// it was durable. Open fails closed instead of repairing the bound upward.
+#[tokio::test]
+async fn open_fails_closed_when_the_high_water_is_below_own_evidence() {
+	let dir = fresh_dir("slab-high-water-below-evidence");
+	let manager = SlabManager::initialize_new_store(gc_owned_test_config(&dir))
+		.await
+		.unwrap();
+	for n in 0..3u8 {
+		manager
+			.append_durable(
+				tenant(),
+				id(0x1600 + u64::from(n)),
+				hlc(10 + u64::from(n)),
+				b"row",
+			)
+			.await
+			.unwrap();
+		manager.force_seal_active_for_test().await;
+	}
+	let active = manager.active_slab_id().await;
+	assert!(
+		active.get() >= 3,
+		"premise: slabs 0..3 sealed, active {active:?}"
+	);
+	drop(manager);
+	crate::storage::index::overwrite_slab_id_high_water_for_test(&persistent_index_path(&dir), 1);
+	let error = SlabManager::open(gc_owned_test_config(&dir))
+		.await
+		.err()
+		.expect("a high-water below own evidence must not open");
+	assert_eq!(error.kind(), ErrorKind::InvalidData, "{error}");
+	assert!(
+		error
+			.to_string()
+			.contains("below this store's own evidence floor"),
+		"{error}"
+	);
+}
+
+/// Without a usable durable index the store has no identity or high-water,
+/// so open itself is refused and creates no slab file.
+#[tokio::test]
+async fn open_without_the_durable_index_is_refused_and_creates_no_slab() {
+	let dir = fresh_dir("slab-ids-no-index");
+	std::fs::create_dir_all(persistent_index_path(&dir)).unwrap();
+	assert!(
+		SlabManager::open(gc_owned_test_config(&dir)).await.is_err(),
+		"a store without its durable index must not open"
+	);
+	let slab_files: Vec<_> = std::fs::read_dir(&*dir)
+		.unwrap()
+		.filter_map(|entry| entry.ok())
+		.filter(|entry| entry.file_name().to_string_lossy().starts_with("slab_"))
+		.map(|entry| entry.file_name())
+		.collect();
+	assert!(slab_files.is_empty(), "open created {slab_files:?}");
+}
+
+/// A fresh initialization never adopts slab files it finds: only a verified
+/// restore may.
+#[tokio::test]
+async fn fresh_initialization_refuses_existing_slab_files() {
+	let dir = fresh_dir("fresh-init-existing-slab");
+	std::fs::write(dir.join("slab_0000000000000005.wnd"), b"").unwrap();
+	let error = SlabManager::initialize_new_store(gc_owned_test_config(&dir))
+		.await
+		.err()
+		.expect("fresh initialization over slab files must refuse");
+	assert_eq!(error.kind(), ErrorKind::InvalidInput, "{error}");
+	assert!(
+		!persistent_index_path(&dir).exists(),
+		"no index may be left behind"
+	);
+}
+
+/// A verified restore adopts the restored slab files as issued in the same
+/// transaction that writes the identity. A crash that left a staging index
+/// behind (never linked into place) does not block the restore from resuming,
+/// and the reopened store keeps the identity the restore created.
+#[tokio::test]
+async fn verified_restore_resumes_after_an_interrupted_index_creation() {
+	use crate::storage::ownership::DataDirectoryOwner;
+	let dir = fresh_dir("restore-interrupted-index");
+	std::fs::write(dir.join("slab_0000000000000007.wnd"), b"").unwrap();
+	let index_path = persistent_index_path(&dir);
+	let mut staging = index_path.file_name().unwrap().to_os_string();
+	staging.push(".initializing");
+	std::fs::write(index_path.with_file_name(&staging), b"torn").unwrap();
+	let owner = DataDirectoryOwner::acquire_existing(&*dir).unwrap();
+	let authority =
+		crate::storage::manager::IndexRecoveryAuthority::verified_restore(owner.clone());
+	let restored = SlabManager::initialize_recovered_store_with_owner(
+		gc_owned_test_config(&dir),
+		owner.clone(),
+		&authority,
+	)
+	.await
+	.unwrap();
+	let index = restored.persistent_index.as_ref().unwrap();
+	let incarnation = index.store_incarnation();
+	assert!(
+		index.slab_id_high_water().await.unwrap() >= 8,
+		"the restored slab 7 is covered"
+	);
+	assert!(!index_path.with_file_name(&staging).exists());
+	tokio::time::timeout(Duration::from_secs(3), owner.close(Duration::from_secs(2)))
+		.await
+		.unwrap()
+		.unwrap();
+	drop(restored);
+	drop(owner);
+	let next_owner = DataDirectoryOwner::acquire_existing(&*dir).unwrap();
+	let reopened = SlabManager::open_with_owner(gc_owned_test_config(&dir), next_owner)
+		.await
+		.unwrap();
+	assert_eq!(
+		reopened
+			.persistent_index
+			.as_ref()
+			.unwrap()
+			.store_incarnation(),
+		incarnation
+	);
+}
+
+/// H is validated against unmodified evidence: a mismatch refuses before any
+/// recovery step renames or removes staged and temporary files.
+#[tokio::test]
+async fn a_high_water_mismatch_refuses_before_recovery_touches_evidence() {
+	let dir = fresh_dir("slab-high-water-before-recovery");
+	let manager = SlabManager::initialize_new_store(gc_owned_test_config(&dir))
+		.await
+		.unwrap();
+	drop(manager);
+	let staged = dir.join("maintenance-staged-0000000000000000-00000000000000c8.wnd");
+	let temp = dir.join("compaction-temp-0000000000000001-slab_00000000000000c9.wnd");
+	std::fs::write(&staged, b"staged").unwrap();
+	std::fs::write(&temp, b"temp").unwrap();
+	let error = SlabManager::open(gc_owned_test_config(&dir))
+		.await
+		.err()
+		.expect("evidence above H must refuse");
+	assert_eq!(error.kind(), ErrorKind::InvalidData, "{error}");
+	assert_eq!(std::fs::read(&staged).unwrap(), b"staged");
+	assert_eq!(std::fs::read(&temp).unwrap(), b"temp");
+}
+
+/// The index and its H open but the durable snapshot does not load. Open
+/// refuses before any recovery or creation, changing no name and no byte.
+#[tokio::test]
+async fn an_unloadable_snapshot_refuses_before_recovery_or_creation() {
+	let dir = fresh_dir("slab-census-unloadable-snapshot");
+	let manager = SlabManager::initialize_new_store(gc_owned_test_config(&dir))
+		.await
+		.unwrap();
+	let active = manager.active_slab_id().await;
+	drop(manager);
+	std::fs::remove_file(slab_path(&dir, active)).unwrap();
+	crate::storage::index::insert_undecodable_lsm_intent_for_test(&persistent_index_path(&dir));
+	let temp = dir.join("compaction-temp-0000000000000001-slab_0000000000000001.wnd");
+	std::fs::write(&temp, b"temp").unwrap();
+	let listing = || {
+		let mut entries: Vec<_> = std::fs::read_dir(&*dir)
+			.unwrap()
+			.map(|entry| {
+				let entry = entry.unwrap();
+				// Opening redb runs its own setup transaction; every other file
+				// is compared byte for byte.
+				let bytes = (entry.file_name() != "storage_index.redb")
+					.then(|| std::fs::read(entry.path()).unwrap());
+				(entry.file_name(), bytes)
+			})
+			.collect();
+		entries.sort();
+		entries
+	};
+	let before = listing();
+	assert!(
+		SlabManager::open(gc_owned_test_config(&dir)).await.is_err(),
+		"an unloadable snapshot must refuse"
+	);
+	assert_eq!(listing(), before, "the refused open changed the store");
+	assert!(
+		!slab_path(&dir, active).exists(),
+		"no active slab was created"
+	);
+}
+
+/// An exclusive u64 bound cannot cover id u64::MAX: startup refuses rather
+/// than issuing it, and creates no slab file.
+#[tokio::test]
+async fn startup_refuses_to_issue_the_maximum_slab_id() {
+	let dir = fresh_dir("slab-high-water-max");
+	let manager = SlabManager::initialize_new_store(gc_owned_test_config(&dir))
+		.await
+		.unwrap();
+	let active = manager.active_slab_id().await;
+	drop(manager);
+	std::fs::remove_file(slab_path(&dir, active)).unwrap();
+	crate::storage::index::overwrite_slab_id_high_water_for_test(
+		&persistent_index_path(&dir),
+		u64::MAX,
+	);
+	let error = SlabManager::open(gc_owned_test_config(&dir))
+		.await
+		.err()
+		.expect("slab id u64::MAX must not be issued");
+	assert!(error.to_string().contains("exhausted"), "{error}");
+	assert!(!slab_path(&dir, SlabId::new(u64::MAX)).exists());
+}
+
+/// Evidence naming id u64::MAX has no representable exclusive bound.
+#[tokio::test]
+async fn evidence_at_the_maximum_slab_id_is_refused() {
+	let dir = fresh_dir("slab-evidence-max");
+	let manager = SlabManager::initialize_new_store(gc_owned_test_config(&dir))
+		.await
+		.unwrap();
+	drop(manager);
+	std::fs::write(slab_path(&dir, SlabId::new(u64::MAX)), b"").unwrap();
+	let error = SlabManager::open(gc_owned_test_config(&dir))
+		.await
+		.err()
+		.expect("evidence at u64::MAX must refuse");
+	assert!(error.to_string().contains("exhausted"), "{error}");
 }

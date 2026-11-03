@@ -201,7 +201,9 @@ mod encoding_compute;
 mod metadata_observation;
 mod observation;
 mod open;
+mod slab_ids;
 pub(crate) use open::IndexRecoveryAuthority;
+use slab_ids::{SLAB_ID_LEASE, slab_ids_exhausted};
 mod retention_reclaim;
 mod stats_facts;
 use retention_reclaim::{
@@ -956,6 +958,9 @@ struct ManagerState {
 	/// hot-read path against duplicate local installs.
 	rehydrating: HashSet<SlabId>,
 	next_slab_id: SlabId,
+	/// The committed slab id high-water: no id at or above it has been
+	/// issued. `next_slab_id` never passes it.
+	durable_slab_id_bound: SlabId,
 	/// Each tiered slab's published generation history; absent means
 	/// generation 0 with no history.
 	tier_layouts: DashMap<SlabId, Arc<TierLayout>>,
@@ -967,13 +972,22 @@ struct ManagerState {
 impl ManagerState {
 	/// The only writer of `next_slab_id` after open. A released slab id is
 	/// below it and is never allocated again, so the id-keyed release in
-	/// `slab_file_quarantine.rs` can never unlink a newer file.
-	fn advance_slab_allocator(&mut self, next: SlabId) {
+	/// `slab_file_quarantine.rs` can never unlink a newer file. Ids must
+	/// already be covered by the durable bound (`SlabManager::cover_slab_ids_through`).
+	fn advance_slab_allocator(&mut self, next: SlabId) -> std::io::Result<()> {
 		debug_assert!(
 			next >= self.next_slab_id,
 			"the slab allocator only advances"
 		);
+		if next > self.durable_slab_id_bound {
+			return Err(Error::other(format!(
+				"slab id {} is not covered by the durable high-water {}",
+				next.get(),
+				self.durable_slab_id_bound.get()
+			)));
+		}
 		self.next_slab_id = self.next_slab_id.max(next);
+		Ok(())
 	}
 }
 
@@ -1658,7 +1672,7 @@ impl SlabManager {
 			config,
 			None,
 			crate::metrics::global(),
-			false,
+			open::StoreOpen::Existing,
 			#[cfg(any(test, feature = "test-support"))]
 			None,
 		)
@@ -1677,7 +1691,7 @@ impl SlabManager {
 			config,
 			None,
 			maintenance_metrics,
-			false,
+			open::StoreOpen::Existing,
 			#[cfg(any(test, feature = "test-support"))]
 			None,
 		)
@@ -1694,7 +1708,7 @@ impl SlabManager {
 			config,
 			Some(owner),
 			crate::metrics::global(),
-			false,
+			open::StoreOpen::Existing,
 			#[cfg(any(test, feature = "test-support"))]
 			None,
 		)
@@ -1711,7 +1725,7 @@ impl SlabManager {
 			config,
 			Some(owner),
 			crate::metrics::global(),
-			false,
+			open::StoreOpen::Existing,
 			Some(file_ops),
 		)
 		.await
@@ -1727,7 +1741,7 @@ impl SlabManager {
 			config,
 			None,
 			crate::metrics::global(),
-			false,
+			open::StoreOpen::Existing,
 			Some(file_ops),
 		)
 		.await
@@ -3285,6 +3299,7 @@ impl SlabManager {
 		// under the same lock, so concurrent overflow triggers
 		// exactly one rotation.
 		let next_id = state.next_slab_id;
+		let next_end = self.cover_slab_ids_through(&mut state, next_id).await?;
 		let next_path = slab_path(&self.config.dir, next_id);
 		let next_slab = Arc::new(
 			LocalSlabStore::open(
@@ -3300,7 +3315,7 @@ impl SlabManager {
 		let sealed_id = sealed_slab.slab_id();
 		let sealed_size = sealed_slab.write_cursor();
 		state.install_sealed(&self.tier_budget, sealed_id, sealed_slab);
-		state.advance_slab_allocator(next_id.saturating_add(1));
+		state.advance_slab_allocator(next_end)?;
 		self.record_l0_compaction_run(sealed_id, sealed_size);
 
 		let mut reservation = next_slab.reserve_append(frame_len)?;
@@ -4099,11 +4114,12 @@ impl SlabManager {
 		}))
 	}
 
-	async fn reserve_slab_id(&self) -> SlabId {
+	async fn reserve_slab_id(&self) -> std::io::Result<SlabId> {
 		let mut state = self.state.lock().await;
 		let next_id = state.next_slab_id;
-		state.advance_slab_allocator(next_id.saturating_add(1));
-		next_id
+		let end = self.cover_slab_ids_through(&mut state, next_id).await?;
+		state.advance_slab_allocator(end)?;
+		Ok(next_id)
 	}
 }
 

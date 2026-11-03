@@ -2431,8 +2431,12 @@ impl SlabManager {
 		let id = pointer.slab_id;
 		self.quarantine_bootstrap_collision_locked(&mut state, id, committed_id_floor, snapshot)
 			.await?;
-		let next = state.next_slab_id.max(id.saturating_add(1));
-		state.advance_slab_allocator(next);
+		let next = if state.next_slab_id > id {
+			state.next_slab_id
+		} else {
+			self.cover_slab_ids_through(&mut state, id).await?
+		};
+		state.advance_slab_allocator(next)?;
 		self.update_pending_tier_authority(pointer.clone(), last_control_log_index)?;
 		self.resume_matching_tier_deferral(&pointer);
 		drop(state);
@@ -2492,6 +2496,7 @@ impl SlabManager {
 				if next <= id || next <= committed_id_floor {
 					return Err(Error::other("slab allocator exhausted"));
 				}
+				let next_end = self.cover_slab_ids_through(state, next).await?;
 				let slab = Arc::new(
 					LocalSlabStore::open(
 						slab_path(&self.config.dir, next),
@@ -2501,7 +2506,7 @@ impl SlabManager {
 					)
 					.await?,
 				);
-				state.advance_slab_allocator(next.saturating_add(1));
+				state.advance_slab_allocator(next_end)?;
 				Some(slab)
 			} else {
 				None

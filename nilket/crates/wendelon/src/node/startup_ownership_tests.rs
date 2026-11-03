@@ -811,9 +811,56 @@ async fn pd25_every_adopted_prefix_err_cancel_panic_releases_real_tls_socket_and
 					.load(std::sync::atomic::Ordering::Acquire),
 				"{site}: owner not certified closed"
 			);
-			let reopened = WendelonNode::bootstrap(healthy)
+			let reopened = WendelonNode::bootstrap(healthy.clone())
 				.await
 				.unwrap_or_else(|e| panic!("{site} {mode:?} reboot: {e}"));
+			if site == "io_workers" {
+				use crate::storage::StorageEngine;
+				// The first boot stopped before the storage index existed. The
+				// retry must create a real durable index and identity and serve
+				// a row, not come up fenced without one; the identity then
+				// stays fixed across a further reopen.
+				assert!(
+					dir.join("storage_index.redb").exists(),
+					"{site} {mode:?}: no durable index"
+				);
+				let incarnation = reopened
+					.slab
+					.store_incarnation_for_test()
+					.unwrap_or_else(|| panic!("{site} {mode:?}: no store identity"));
+				let tenant = crate::schema::TenantId::ZERO;
+				let key = crate::schema::Identity::new([0x25; 32]);
+				let payload = b"pd25 resumed first creation";
+				let location = reopened
+					.slab
+					.append_durable(
+						tenant,
+						key,
+						crate::schema::HybridTimestamp {
+							physical_ms: 125,
+							logical: 0,
+							node_id: 1,
+						},
+						payload,
+					)
+					.await
+					.unwrap_or_else(|e| panic!("{site} {mode:?}: write refused: {e}"));
+				assert_eq!(reopened.slab.lookup(tenant, key).unwrap(), Some(location));
+				assert_eq!(reopened.slab.read(location).await.unwrap(), payload);
+				reopened.shutdown().await.unwrap();
+				let again = WendelonNode::bootstrap(healthy)
+					.await
+					.unwrap_or_else(|e| panic!("{site} {mode:?} second reopen: {e}"));
+				assert_eq!(
+					again.slab.store_incarnation_for_test(),
+					Some(incarnation),
+					"{site} {mode:?}: identity changed"
+				);
+				assert_eq!(again.slab.read(location).await.unwrap(), payload);
+				again.shutdown().await.unwrap();
+				eprintln!("PD25 MATRIX {site} {mode:?} PASS (resumed first creation)");
+				continue;
+			}
 			if matches!(
 				site,
 				"epoch_reconcile" | "tenant_seed" | "set_pending_finalization_reconciler"

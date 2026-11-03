@@ -1083,7 +1083,11 @@ impl SlabManager {
 				"LSM output slab reservation would overflow SlabId",
 			)
 		})?;
-		state.advance_slab_allocator(SlabId::new(end));
+		if end > start {
+			self.cover_slab_ids_through(&mut state, SlabId::new(end - 1))
+				.await?;
+		}
+		state.advance_slab_allocator(SlabId::new(end))?;
 		Ok((start..end).map(SlabId::new).collect())
 	}
 
@@ -2994,6 +2998,7 @@ impl SlabManager {
 		} else {
 			state.next_slab_id
 		};
+		let next_end = self.cover_slab_ids_through(state, next_id).await?;
 		let next_path = slab_path(&self.config.dir, next_id);
 		let next_slab = Arc::new(
 			LocalSlabStore::open(
@@ -3024,14 +3029,14 @@ impl SlabManager {
 				// unlink; retaining the slab keeps it visible to this process's
 				// recovery state and leaves the old one-file leak explicit.
 				state.install_sealed(&self.tier_budget, sealed_id, sealed_slab);
-				state.advance_slab_allocator(next_id.saturating_add(1));
+				state.advance_slab_allocator(next_end)?;
 				return Err(error);
 			}
 		} else {
 			state.install_sealed(&self.tier_budget, sealed_id, sealed_slab);
 			self.record_l0_compaction_run(sealed_id, sealed_size);
 		}
-		state.advance_slab_allocator(next_id.saturating_add(1));
+		state.advance_slab_allocator(next_end)?;
 		Ok(())
 	}
 

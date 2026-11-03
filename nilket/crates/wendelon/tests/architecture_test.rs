@@ -9730,6 +9730,8 @@ fn adr078_manager_source_concatenates_submodules() {
 			// Local slab files that disagree with the committed tier state, and
 			// the ownership rule for every slab-path unlink.
 			"slab_file_quarantine.rs",
+			// ADR 0697: the durable slab id high-water, committed before use.
+			"slab_ids.rs",
 			"stats_facts.rs",
 			// ADR 0692: tier generations, the read snapshot and the typed refusal.
 			"tier_authority.rs",

@@ -319,6 +319,7 @@ impl SlabManager {
 			let sealed_id = sealed.slab_id();
 			let sealed_size = sealed.write_cursor();
 			let next_id = state.next_slab_id;
+			let next_end = self.cover_slab_ids_through(&mut state, next_id).await?;
 			let next = Arc::new(
 				LocalSlabStore::open(
 					&slab_path(&self.config.dir, next_id),
@@ -330,7 +331,7 @@ impl SlabManager {
 			);
 			state.active = next;
 			state.install_sealed(&self.tier_budget, sealed_id, sealed);
-			state.advance_slab_allocator(next_id.saturating_add(1));
+			state.advance_slab_allocator(next_end)?;
 			self.record_l0_compaction_run(sealed_id, sealed_size);
 			sealed_id
 		};

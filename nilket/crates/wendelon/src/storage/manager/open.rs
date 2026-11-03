@@ -80,6 +80,18 @@ fn refuse_unaccounted_durable_versions(
 	))
 }
 
+/// How `open_shared` treats the durable index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum StoreOpen {
+	/// Open an existing store; its identity and high-water must be present.
+	Existing,
+	/// Create a store in a directory with no slab evidence.
+	Fresh,
+	/// Create the index over slab files a verified restore laid down; they are
+	/// adopted as issued in the index's creating transaction.
+	VerifiedRestore,
+}
+
 impl SlabManager {
 	pub(crate) async fn initialize_recovered_store_with_owner(
 		config: SlabManagerConfig,
@@ -87,7 +99,15 @@ impl SlabManager {
 		authority: &IndexRecoveryAuthority,
 	) -> std::io::Result<Arc<Self>> {
 		authority.check(&owner, &config.dir)?;
-		Self::initialize_new_store_with_owner(config, owner).await
+		Self::open_shared(
+			config,
+			Some(owner),
+			crate::metrics::global(),
+			StoreOpen::VerifiedRestore,
+			#[cfg(any(test, feature = "test-support"))]
+			None,
+		)
+		.await
 	}
 
 	#[cfg(feature = "test-support")]
@@ -98,7 +118,30 @@ impl SlabManager {
 		authority: &IndexRecoveryAuthority,
 	) -> std::io::Result<Arc<Self>> {
 		authority.check(&owner, &config.dir)?;
-		Self::initialize_new_store_with_file_ops_and_owner(config, file_ops, owner).await
+		Self::open_shared(
+			config,
+			Some(owner),
+			crate::metrics::global(),
+			StoreOpen::VerifiedRestore,
+			Some(file_ops),
+		)
+		.await
+	}
+
+	/// Test fixtures that lay raw slab files down before the index exists
+	/// adopt them explicitly, as a verified restore would.
+	#[cfg(test)]
+	pub(crate) async fn initialize_store_adopting_existing_slabs_for_test(
+		config: SlabManagerConfig,
+	) -> std::io::Result<Arc<Self>> {
+		Self::open_shared(
+			config,
+			None,
+			crate::metrics::global(),
+			StoreOpen::VerifiedRestore,
+			None,
+		)
+		.await
 	}
 
 	/// Explicitly initialize a new store; the caller must establish Fresh.
@@ -108,7 +151,7 @@ impl SlabManager {
 			config,
 			None,
 			crate::metrics::global(),
-			true,
+			StoreOpen::Fresh,
 			#[cfg(any(test, feature = "test-support"))]
 			None,
 		)
@@ -124,7 +167,7 @@ impl SlabManager {
 			config,
 			Some(owner),
 			crate::metrics::global(),
-			true,
+			StoreOpen::Fresh,
 			#[cfg(any(test, feature = "test-support"))]
 			None,
 		)
@@ -141,7 +184,7 @@ impl SlabManager {
 			config,
 			Some(owner),
 			crate::metrics::global(),
-			true,
+			StoreOpen::Fresh,
 			Some(file_ops),
 		)
 		.await
@@ -152,7 +195,14 @@ impl SlabManager {
 		config: SlabManagerConfig,
 		file_ops: Arc<dyn AsyncFileOps>,
 	) -> std::io::Result<Arc<Self>> {
-		Self::open_shared(config, None, crate::metrics::global(), true, Some(file_ops)).await
+		Self::open_shared(
+			config,
+			None,
+			crate::metrics::global(),
+			StoreOpen::Fresh,
+			Some(file_ops),
+		)
+		.await
 	}
 
 	#[cfg(test)]
@@ -164,7 +214,7 @@ impl SlabManager {
 			config,
 			None,
 			metrics,
-			true,
+			StoreOpen::Fresh,
 			#[cfg(any(test, feature = "test-support"))]
 			None,
 		)
@@ -175,7 +225,7 @@ impl SlabManager {
 		mut config: SlabManagerConfig,
 		owner: Option<DataDirectoryOwner>,
 		maintenance_metrics: &'static crate::metrics::MetricsRegistry,
-		initialize_index: bool,
+		mode: StoreOpen,
 		#[cfg(any(test, feature = "test-support"))] file_ops_override: Option<
 			Arc<dyn AsyncFileOps>,
 		>,
@@ -232,23 +282,89 @@ impl SlabManager {
 			.await?
 			.is_some();
 		let index_path = persistent_index_path(&config.dir);
-		let index_result = if initialize_index {
-			PersistentLocalIndex::initialize_new(index_path, owner.clone()).await
-		} else {
-			PersistentLocalIndex::open_with_owner(index_path, owner.clone()).await
-		};
-		let persistent_index = match index_result {
-			Ok(index) => Some(Arc::new(index)),
-			Err(err) if initialize_index => return Err(err),
-			Err(err) => {
-				tracing::warn!(
-					error = %err,
-					dir = %config.dir.display(),
-					"failed to open redb storage index; continuing with in-memory recovery"
-				);
-				None
+		// An existing store whose index cannot be opened still starts fenced
+		// (reads and writes refused until a reopen with the index). Without
+		// identity and high-water nothing may be issued or created, so that
+		// degraded open only opens existing slab files, without repair. An
+		// old-format store (no identity) is refused outright.
+		let index = match mode {
+			StoreOpen::Existing => {
+				match PersistentLocalIndex::open_with_owner(index_path, owner.clone()).await {
+					Ok(index) => Some(index),
+					Err(err) if crate::storage::index::is_store_identity_missing(&err) => {
+						return Err(err);
+					}
+					Err(err) => {
+						tracing::warn!(
+							error = %err,
+							dir = %config.dir.display(),
+							"failed to open redb storage index; opening existing slabs fenced, without issuing ids"
+						);
+						None
+					}
+				}
+			}
+			StoreOpen::Fresh | StoreOpen::VerifiedRestore => {
+				// Read-only census before the index exists. Only a verified
+				// restore adopts slab files already present, and it records them
+				// in the same transaction that writes the identity.
+				let floor =
+					slab_ids::slab_id_evidence_floor(file_ops.as_ref(), &config.dir, None).await?;
+				if mode == StoreOpen::Fresh && floor > SlabId::ZERO {
+					return Err(Error::new(
+						ErrorKind::InvalidInput,
+						format!(
+							"fresh store initialization found existing slab evidence up to id {} in {}; only a verified restore adopts existing slab files",
+							floor.get() - 1,
+							config.dir.display()
+						),
+					));
+				}
+				Some(
+					PersistentLocalIndex::initialize_new_with_high_water(
+						index_path,
+						owner.clone(),
+						floor.get(),
+					)
+					.await?,
+				)
 			}
 		};
+		// Validate H against the store's unmodified evidence before any
+		// recovery step below may rename, unlink, clear or zero-fill it. Own
+		// evidence at or above H means an id was used without being made
+		// durable: open fails closed and never repairs H upward.
+		let validated_high_water = match &index {
+			None => None,
+			Some(index) => Some({
+				let high_water = SlabId::new(index.slab_id_high_water().await?);
+				// The census must read the durable evidence it validates
+				// against: a snapshot that fails to load is refused here, never
+				// treated as "no durable evidence" by a store that can issue ids.
+				let census = index.load_snapshot().await?;
+				let floor =
+					slab_ids::slab_id_evidence_floor(file_ops.as_ref(), &config.dir, Some(&census))
+						.await?;
+				if high_water < floor {
+					return Err(Error::new(
+						ErrorKind::InvalidData,
+						format!(
+							"slab id high-water {} is below this store's own evidence floor {}",
+							high_water.get(),
+							floor.get()
+						),
+					));
+				}
+				tracing::info!(
+					dir = %config.dir.display(),
+					incarnation = %format_args!("{:032x}", index.store_incarnation().get()),
+					slab_id_high_water = high_water.get(),
+					"opened store"
+				);
+				high_water
+			}),
+		};
+		let persistent_index = index.map(Arc::new);
 		let pending_metadata_tokens = DashMap::new();
 		if let Some(index) = &persistent_index {
 			index.recover_metadata_tokens().await?;
@@ -477,7 +593,13 @@ impl SlabManager {
 			.chain(unresolved_outputs.iter().copied())
 			.chain(discovered_ids.iter().copied())
 			.max()
-			.map(|id| id.saturating_add(1))
+			.map(|id| {
+				id.get()
+					.checked_add(1)
+					.map(SlabId::new)
+					.ok_or_else(slab_ids_exhausted)
+			})
+			.transpose()?
 			.unwrap_or(SlabId::ZERO);
 		let highest_discovered_is_quarantined = discovered_ids.last().is_some_and(|id| {
 			tier_pointer_ids.contains(id)
@@ -575,31 +697,82 @@ impl SlabManager {
 		// shadow earlier ones.
 		for &id in &non_empty_sealed_ids {
 			let slab = Arc::new(
-				LocalSlabStore::open_with_acknowledged(
+				LocalSlabStore::open_recovered(
 					slab_path(&config.dir, id),
 					id,
 					file_ops.clone(),
 					config.group_commit.clone(),
 					acknowledged_for(id).as_ref(),
+					// A store without its durable index opens only existing slabs.
+					persistent_index.is_some(),
 				)
 				.await?,
 			);
 			drain_slab_index(&slab, &key_index, &mut recovered_key_localities);
 			sealed.insert(id, slab);
 		}
-		let active_id = active_id.unwrap_or(allocator_floor);
+		// Recovery only renames or removes evidence counted by the census
+		// above, so the validated H still covers the floor here.
+		if let Some(high_water) = validated_high_water
+			&& high_water < allocator_floor
+		{
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"slab id high-water {} is below this store's recovered evidence floor {}",
+					high_water.get(),
+					allocator_floor.get()
+				),
+			));
+		}
+		// A fresh active slab starts at H, never below it, and H covers it
+		// before its file exists. Without H there is no fresh active slab.
+		let active_id = match (active_id, validated_high_water) {
+			(Some(active_id), _) => active_id,
+			(None, Some(high_water)) => high_water,
+			(None, None) => {
+				return Err(Error::new(
+					ErrorKind::InvalidData,
+					format!(
+						"store in {} has no usable durable index and no existing active slab; no slab is created without its identity and high-water",
+						config.dir.display()
+					),
+				));
+			}
+		};
+		let active_end = active_id
+			.get()
+			.checked_add(1)
+			.map(SlabId::new)
+			.ok_or_else(slab_ids_exhausted)?;
+		let durable_slab_id_bound = match (&persistent_index, validated_high_water) {
+			(Some(index), Some(high_water)) if active_end > high_water => {
+				let bound = active_end
+					.get()
+					.checked_add(SLAB_ID_LEASE)
+					.ok_or_else(slab_ids_exhausted)?;
+				index.persist_slab_id_high_water(bound).await?;
+				SlabId::new(bound)
+			}
+			(_, high_water) => high_water.unwrap_or(SlabId::ZERO),
+		};
 		let active = Arc::new(
-			LocalSlabStore::open_with_acknowledged(
+			LocalSlabStore::open_recovered(
 				slab_path(&config.dir, active_id),
 				active_id,
 				file_ops.clone(),
 				config.group_commit.clone(),
 				acknowledged_for(active_id).as_ref(),
+				// A store without its durable index opens only existing slabs.
+				persistent_index.is_some(),
 			)
 			.await?,
 		);
 		drain_slab_index(&active, &key_index, &mut recovered_key_localities);
-		let next_slab_id = active_id.saturating_add(1).max(allocator_floor);
+		// Every id below the validated H may have been issued before this open.
+		let next_slab_id = active_end
+			.max(allocator_floor)
+			.max(validated_high_water.unwrap_or(SlabId::ZERO));
 
 		// Every durable row names a version the node acknowledged. Recovery
 		// replaces the durable index from memory, so each one must still be
@@ -784,6 +957,7 @@ impl SlabManager {
 				hot_read_counts: HashMap::new(),
 				rehydrating: HashSet::new(),
 				next_slab_id,
+				durable_slab_id_bound,
 				tier_layouts: DashMap::new(),
 				disposal_evidence: Default::default(),
 			}),

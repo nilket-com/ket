@@ -542,6 +542,7 @@ async fn restored_noncanonical_sidecar_paths_remain_deletable() {
 			test_crypto(),
 		)
 		.await;
+		issue_slab_ids_through(&manager, SlabId::new(84)).await;
 		let mut info = manager
 			.persist_secondary_index_segment(&segment_with_key(SlabId::new(84), 1))
 			.await
@@ -632,6 +633,7 @@ async fn interrupted_real_sidecar_publisher_is_cleaned_on_owned_reopen() {
 			manager.persistent_index.is_some(),
 			"real publisher control requires its durable catalog"
 		);
+		issue_slab_ids_through(&manager, slab).await;
 		let original = manager
 			.persist_secondary_index_segment(&segment_with_key(slab, 1))
 			.await
@@ -1256,9 +1258,21 @@ async fn open_fresh_sidecar_manager_with_ops(
 	.unwrap()
 }
 
+/// The store's index is unavailable, so the manager opens fenced over its
+/// existing active slab (it creates none without identity and high-water) and
+/// refuses publication.
 #[tokio::test]
 async fn publication_refuses_when_persistent_index_is_unavailable() {
 	let dir = fresh_dir("sidecar-index-unavailable");
+	// A real store issues its active slab through the durable allocator; its
+	// index then becomes unreadable.
+	drop(
+		SlabManager::initialize_new_store(gc_owned_test_config(&dir))
+			.await
+			.unwrap(),
+	);
+	std::fs::remove_file(persistent_index_path(&dir)).unwrap();
+	std::fs::create_dir(persistent_index_path(&dir)).unwrap();
 	let manager = open_manager_at_dir(
 		dir.to_path_buf(),
 		spawn_io_thread(64).unwrap(),

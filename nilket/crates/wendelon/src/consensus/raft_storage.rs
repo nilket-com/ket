@@ -941,6 +941,21 @@ impl WendelonLogStore {
 		self.inner.read().await.recovery_checkpoint
 	}
 
+	/// True only when nothing has ever been made durable here: no vote, no
+	/// retained or purged log position, no entry, no snapshot, no checkpoint
+	/// and no committed pointer. Empty artifacts that a bootstrap created and
+	/// then abandoned qualify; compaction or an uncommitted entry does not.
+	pub(crate) async fn is_pristine(&self) -> bool {
+		let inner = self.inner.read().await;
+		inner.vote.is_none()
+			&& inner.last_log_id.is_none()
+			&& inner.last_purged.is_none()
+			&& inner.entries.is_empty()
+			&& inner.recovered_snapshot.is_none()
+			&& inner.recovery_checkpoint.is_none()
+			&& inner.recovery_committed.is_none()
+	}
+
 	/// `poison`, mapped to the storage error a Raft log mutator returns.
 	async fn poisoned_storage(
 		&self,
