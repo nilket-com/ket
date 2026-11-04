@@ -983,6 +983,8 @@ impl SlabManager {
 			completed_metadata_retries: DashMap::new(),
 			persistent_index_gate: Arc::new(tokio::sync::RwLock::new(())),
 			index_authority_unavailable: AtomicBool::new(index_authority_unavailable),
+			control_node: std::sync::OnceLock::new(),
+			owner_authority_fence: std::sync::OnceLock::new(),
 			lsm_install_unresolved: lsm_install_intents,
 			lsm_intent_scope_gate: Arc::new(tokio::sync::RwLock::new(())),
 			pending_index_publications: Arc::new(DashMap::new()),

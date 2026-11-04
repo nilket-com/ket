@@ -100,6 +100,10 @@ pub(super) struct TierAuthority {
 	ready: AtomicBool,
 	retirement_fence: AtomicBool,
 	snapshot_fences: SnapshotFences,
+	/// The newest control index a begun comparison has read: delivered owner
+	/// evidence at or below it is covered, whatever that comparison's outcome,
+	/// because its readers hold at least that view. Only rises.
+	comparison_read_index: std::sync::RwLock<Option<u64>>,
 	snapshot_reconciliation: std::sync::Mutex<Option<SnapshotReconciliation>>,
 	retirements: DashMap<SlabId, Option<u64>>,
 	snapshot_retirements: DashMap<SlabId, (u64, Option<u64>)>,
@@ -188,6 +192,7 @@ impl TierAuthority {
 			ready: AtomicBool::new(false),
 			retirement_fence: AtomicBool::new(false),
 			snapshot_fences: SnapshotFences::default(),
+			comparison_read_index: std::sync::RwLock::new(None),
 			snapshot_reconciliation: std::sync::Mutex::new(None),
 			retirements: DashMap::new(),
 			snapshot_retirements: DashMap::new(),
@@ -364,7 +369,11 @@ impl TierAuthority {
 		if self.closed.load(Ordering::Acquire) || manager.capture_snapshot_epoch() != retry.epoch {
 			return Err(obsolete_verification());
 		}
-		let mut pointers: Vec<_> = canonical.tiers().iter().map(snapshot_pointer).collect();
+		// ADR 0697: only this store's own committed pointers; a view that is
+		// not authoritative for this store never verifies.
+		let mut pointers = manager
+			.own_tier_view(canonical.tiers().iter(), canonical.incarnations())
+			.ok_or_else(obsolete_verification)?;
 		// MigrationComplete may arrive before this snapshot has registered any
 		// local pending pointer for its metadata observer. Without a verified
 		// row census, derive the same conservative summary from canonical
@@ -935,11 +944,27 @@ impl std::fmt::Display for ObsoleteVerification {
 
 impl std::error::Error for ObsoleteVerification {}
 
-fn obsolete_verification() -> Error {
+pub(crate) fn obsolete_verification() -> Error {
 	Error::new(ErrorKind::Interrupted, ObsoleteVerification)
 }
 
 impl TierAuthority {
+	/// This store's own pointers in a canonical tier snapshot (ADR 0697). A
+	/// view that is not authoritative for this store never verifies.
+	fn own_canonical_pointers(
+		&self,
+		canonical: &crate::consensus::TierSnapshotLease,
+	) -> std::io::Result<Vec<TieredSlabPointer>> {
+		let manager = self
+			.manager
+			.get()
+			.and_then(Weak::upgrade)
+			.ok_or_else(obsolete_verification)?;
+		manager
+			.own_tier_view(canonical.tiers().iter(), canonical.incarnations())
+			.ok_or_else(obsolete_verification)
+	}
+
 	async fn run(self: &Arc<Self>) {
 		let mut delay = Duration::from_millis(200);
 		let mut replay_schedule = std::collections::HashMap::new();
@@ -1300,10 +1325,10 @@ impl TierAuthority {
 				if !self.snapshot_revision_matches(canonical.revision()) {
 					return Err(obsolete_verification());
 				}
-				if !canonical
-					.tiers()
+				if !self
+					.own_canonical_pointers(canonical)?
 					.iter()
-					.any(|tier| snapshot_pointer(tier).same_object_generation(&pending.pointer))
+					.any(|pointer| pointer.same_object_generation(&pending.pointer))
 				{
 					return Err(obsolete_verification());
 				}
@@ -1369,12 +1394,11 @@ impl TierAuthority {
 			if !self.snapshot_revision_matches(canonical.revision()) {
 				return Err(obsolete_verification());
 			}
-			let tiers = canonical.tiers();
-			if tiers.len() != snapshot.len()
+			let own = self.own_canonical_pointers(canonical)?;
+			if own.len() != snapshot.len()
 				|| snapshot.iter().any(|pending| {
-					!tiers
-						.iter()
-						.any(|tier| snapshot_pointer(tier).same_object_generation(&pending.pointer))
+					!own.iter()
+						.any(|pointer| pointer.same_object_generation(&pending.pointer))
 				}) {
 				return Err(obsolete_verification());
 			}
@@ -1421,22 +1445,6 @@ impl std::fmt::Display for IndexAuthorityUnavailable {
 	}
 }
 impl std::error::Error for IndexAuthorityUnavailable {}
-
-fn snapshot_pointer(tier: &crate::consensus::TieredSlab) -> TieredSlabPointer {
-	TieredSlabPointer {
-		slab_id: tier.slab_id,
-		l2_uri: tier.l2_uri.clone(),
-		payload_hash: tier.payload_hash,
-		is_encrypted: tier.is_encrypted,
-		tenant_id: tier.tenant_id,
-		tenant_kek_id: tier.tenant_kek_id,
-		stats_format_version: tier.stats_format_version,
-		stats_block_len: tier.stats_block_len,
-		stats_block_hash128: tier.stats_block_hash128,
-		tombstone_metadata: tier.tombstone_metadata,
-		supersession_metadata: tier.supersession_metadata,
-	}
-}
 
 impl SlabManager {
 	pub(crate) fn is_snapshot_append_deferral(&self, error: &Error) -> bool {
@@ -1530,6 +1538,9 @@ impl SlabManager {
 	}
 
 	fn tier_authority_refusal(&self) -> Error {
+		if let Some(reason) = self.owner_authority_fence.get() {
+			return Error::new(ErrorKind::WouldBlock, *reason);
+		}
 		if let Some(error) = self.tier_authority.integrity_error() {
 			return error;
 		}
@@ -1732,6 +1743,9 @@ impl SlabManager {
 	/// Kept separate from persistence distrust: waiting for L2 must not shut
 	/// down Raft participation during node bootstrap.
 	pub(crate) fn tier_authority_readiness_reason(&self) -> Option<String> {
+		if let Some(reason) = self.owner_authority_fence.get() {
+			return Some((*reason).into());
+		}
 		if let Some(error) = self.tier_authority.integrity_error() {
 			return Some(error.to_string());
 		}
@@ -1852,10 +1866,40 @@ impl SlabManager {
 	/// Fence admissions before snapshot publication. A failed or cancelled
 	/// installation deliberately retains its own fence until recovery.
 	pub(crate) fn begin_tier_snapshot_install(&self) -> std::io::Result<u64> {
-		self.begin_tier_comparison(false)
+		self.begin_tier_comparison(false, None)
 	}
 
-	fn begin_tier_comparison(&self, replay: bool) -> std::io::Result<u64> {
+	/// Begin installing the snapshot at `index`, whose decoded `registries` are
+	/// committed state newer than this store has applied. They are classified
+	/// before the snapshot's index covers any delivery, so if publication then
+	/// fails, what the covered deliveries said has still been consumed.
+	pub(crate) fn begin_tier_snapshot_install_at(
+		&self,
+		index: Option<u64>,
+		registries: &std::collections::BTreeMap<u32, crate::consensus::IncarnationRegistry>,
+	) -> std::io::Result<u64> {
+		self.begin_tier_comparison(false, index.map(|index| (index, Some(registries))))
+	}
+
+	/// Whether a begun comparison read a view at or past `index`.
+	pub(super) fn comparison_covers_index(&self, index: u64) -> bool {
+		self.tier_authority
+			.comparison_read_index
+			.read()
+			.unwrap_or_else(|e| e.into_inner())
+			.is_some_and(|read| index <= read)
+	}
+
+	/// `reads` is the index this comparison's view reached, with its registries
+	/// when they have not been classified yet.
+	fn begin_tier_comparison(
+		&self,
+		replay: bool,
+		reads: Option<(
+			u64,
+			Option<&std::collections::BTreeMap<u32, crate::consensus::IncarnationRegistry>>,
+		)>,
+	) -> std::io::Result<u64> {
 		if let Some(error) = self.tier_authority.integrity_error() {
 			return Err(error);
 		}
@@ -1880,6 +1924,19 @@ impl SlabManager {
 			.map_err(|_| Error::other("snapshot epoch exhausted"))?
 			+ 1;
 		self.tier_authority.snapshot_fences.insert(epoch);
+		if let Some((reads, registries)) = reads {
+			let superseded =
+				self.comparison_covers_index(reads) || self.observer_is_superseded(Some(reads));
+			if let Some(registries) = registries.filter(|_| !superseded) {
+				self.classify_incoming_registries(registries);
+			}
+			let mut read = self
+				.tier_authority
+				.comparison_read_index
+				.write()
+				.unwrap_or_else(|e| e.into_inner());
+			*read = Some(read.map_or(reads, |old| old.max(reads)));
+		}
 		if self
 			.tier_authority
 			.epoch
@@ -1937,7 +1994,8 @@ impl SlabManager {
 				"replacement is below leader confirmation",
 			));
 		}
-		let epoch = self.begin_tier_comparison(true)?;
+		// `raft_server` classified this view's registry before starting replay.
+		let epoch = self.begin_tier_comparison(true, Some((applied, None)))?;
 		struct ReplayFence<'a>(&'a SlabManager, u64);
 		impl Drop for ReplayFence<'_> {
 			fn drop(&mut self) {
@@ -2566,11 +2624,9 @@ impl SlabManager {
 					"snapshot deferral requires exact canonical index",
 				)
 			})?;
-		let mut pointers = canonical
-			.tiers()
-			.iter()
-			.map(snapshot_pointer)
-			.collect::<Vec<_>>();
+		let mut pointers = self
+			.own_tier_view(canonical.tiers().iter(), canonical.incarnations())
+			.ok_or_else(obsolete_verification)?;
 		pointers.sort_by_key(|pointer| pointer.slab_id);
 		let mut locks = Vec::new();
 		for pointer in &pointers {

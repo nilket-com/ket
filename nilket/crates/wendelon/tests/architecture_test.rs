@@ -10205,8 +10205,9 @@ fn adr0093_quic_config_construction_is_confined_to_the_tls_choke_point() {
 	);
 }
 
-/// ADR 0093/0094/0095 exercise ADR 0092's versioning mechanism: superseded
-/// bodies stay immutable, v5 is current, and every byte fixture is guarded.
+/// ADR 0093/0094/0095 froze superseded snapshot bodies; ADR 0697 (v6) refuses
+/// them instead of upconverting. The stored fixtures stay as refusal inputs,
+/// and the v6 golden is guarded.
 #[test]
 fn adr0093_snapshot_v2_and_v3_fixtures_are_both_guarded() {
 	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -10220,16 +10221,16 @@ fn adr0093_snapshot_v2_and_v3_fixtures_are_both_guarded() {
 		.unwrap();
 	let v5 = fs::read_to_string(manifest_dir.join("tests/fixtures/consensus_body/snapshot_v5.txt"))
 		.unwrap();
-	assert!(core.contains("pub const SNAPSHOT_FORMAT_VERSION: u8 = 5;"));
+	assert!(core.contains("pub const SNAPSHOT_FORMAT_VERSION: u8 = 6;"));
+	assert!(!manifest_dir.join("src/consensus/snapshot_body.rs").exists());
 	for required in [
-		"snapshot_body::v2::decode_state",
-		"snapshot_body::v3::decode_state",
 		"SNAPSHOT_V2_MANIFEST",
 		"SNAPSHOT_V3_MANIFEST",
 		"SNAPSHOT_V4_MANIFEST",
 		"SNAPSHOT_V5_MANIFEST",
-		"adr0093_snapshot_v2_fixture_is_frozen_and_upconverts_without_outcomes",
-		"adr0093_snapshot_v3_active_saga_and_drop_outcome_match_stored_golden",
+		"SNAPSHOT_V6_MANIFEST",
+		"adr0697_every_pre_v6_snapshot_body_is_refused_before_decode",
+		"adr0697_current_wal_v6_and_snapshot_v6_match_stored_goldens",
 	] {
 		assert!(
 			raft.contains(required),
@@ -10261,7 +10262,7 @@ fn adr0094_write_cap_and_legacy_replay_have_one_authority() {
 	let client = fs::read_to_string(manifest_dir.join("src/client/core.rs")).unwrap();
 	let schema = fs::read_to_string(manifest_dir.join("src/schema/core.rs")).unwrap();
 	let raft = fs::read_to_string(manifest_dir.join("src/consensus/raft_storage.rs")).unwrap();
-	assert!(schema.contains("pub const WAL_FORMAT_VERSION: u8 = 5;"));
+	assert!(schema.contains("pub const WAL_FORMAT_VERSION: u8 = 6;"));
 	assert_eq!(core.matches("pub const MAX_SECTION_BYTES:").count(), 1);
 	assert_eq!(
 		client
@@ -10295,7 +10296,6 @@ fn adr0094_write_cap_and_legacy_replay_have_one_authority() {
 		vec![
 			"src/consensus/core.rs",
 			"src/consensus/raft_storage.rs",
-			"src/consensus/wal_body.rs",
 			"src/schema/ctas.rs",
 			"src/storage/mutation_visibility/root2/committed.rs",
 		],
@@ -11418,8 +11418,8 @@ fn snapshot_lease_writers_do_not_await_local_publication_locks() {
 		.split("fn apply_entry_to_state(")
 		.next()
 		.unwrap();
-	// Six cfg(test) seeding helpers plus the two production writers.
-	assert_eq!(sm.matches("self.inner.write().await").count(), 8);
+	// Seven cfg(test) seeding helpers plus the two production writers.
+	assert_eq!(sm.matches("self.inner.write().await").count(), 9);
 	let apply = sm
 		.split("let pending_checkpoint = {\n\t\t\tlet mut guard = self.inner.write().await;")
 		.nth(1)

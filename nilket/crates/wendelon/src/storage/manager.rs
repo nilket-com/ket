@@ -203,6 +203,7 @@ mod observation;
 mod open;
 mod slab_ids;
 pub(crate) use open::IndexRecoveryAuthority;
+pub(crate) use slab_ids::{OwnTierView, OwnerEvidence, Ownership};
 use slab_ids::{SLAB_ID_LEASE, slab_ids_exhausted};
 mod retention_reclaim;
 mod stats_facts;
@@ -278,7 +279,7 @@ use secondary_index_segments::{
 };
 use stats_facts::{TieredStatsCacheKey, tiered_stats_cache_key};
 
-const STORAGE_BACKUP_FORMAT_VERSION: u16 = 1;
+pub(crate) const STORAGE_BACKUP_FORMAT_VERSION: u16 = 2;
 
 type TenantKey = (TenantId, Identity);
 type PendingCounterFrame = (TenantId, Identity, u64, u32, u32, u32, SlabId, u64);
@@ -517,6 +518,8 @@ pub struct LocalSlabBackup {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StorageBackupManifest {
 	pub format_version: u16,
+	/// The store these local slab ids and pointers belong to (ADR 0697).
+	pub source: crate::consensus::OwnerRef,
 	pub active_slab_id: SlabId,
 	pub next_slab_id: SlabId,
 	pub sealed_slab_ids: Vec<SlabId>,
@@ -728,6 +731,11 @@ pub struct SlabManager {
 	completed_metadata_retries: DashMap<(SlabId, u64), crate::storage::index::MetadataKind>,
 	persistent_index_gate: Arc<tokio::sync::RwLock<()>>,
 	index_authority_unavailable: AtomicBool,
+	/// ADR 0697: the control-ring node this store serves, bound once.
+	control_node: std::sync::OnceLock<u32>,
+	/// ADR 0697: set once when the ring shows this store is not (or no longer)
+	/// its node's current incarnation; never cleared in this process.
+	owner_authority_fence: std::sync::OnceLock<&'static str>,
 	lsm_install_unresolved: DashMap<CompactionJobId, lsm_driver::UnresolvedLsmScope>,
 	// Lock order: all required tier locks, then this scope gate, then state.
 	// Never acquire a tier lock while holding either scope guard.
@@ -2747,6 +2755,7 @@ impl SlabManager {
 		Ok(StorageBackupImage {
 			manifest: StorageBackupManifest {
 				format_version: STORAGE_BACKUP_FORMAT_VERSION,
+				source: self.owner_ref()?,
 				active_slab_id,
 				next_slab_id,
 				sealed_slab_ids,
@@ -2769,6 +2778,7 @@ impl SlabManager {
 		owner: &DataDirectoryOwner,
 		resume: bool,
 	) -> std::io::Result<()> {
+		backup.validate_format()?;
 		let dir = dir.as_ref();
 		owner.ensure_path(dir)?;
 		if !dir.is_dir() {

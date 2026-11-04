@@ -165,6 +165,7 @@ fn request_class(request: &WendelonRequest) -> (EntryClass2, Option<CarrierComma
 		| WendelonRequest::TierSlab(_)
 		| WendelonRequest::RetireTieredSlab(_)
 		| WendelonRequest::CompactionCommit(_)
+		| WendelonRequest::RegisterIncarnation(_)
 		| WendelonRequest::SeedMigration(_)
 		| WendelonRequest::MigrationComplete(_)
 		| WendelonRequest::CreateTenant(_)

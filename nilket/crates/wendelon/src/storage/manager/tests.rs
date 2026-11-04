@@ -2694,7 +2694,7 @@ impl TierCommitter for DirectLsmCommitter {
 		))
 	}
 
-	async fn retire_tiered_slab(&self, _slab_id: SlabId) -> std::io::Result<()> {
+	async fn retire_tiered_slab(&self, _slab: crate::consensus::SlabRef) -> std::io::Result<()> {
 		Err(Error::new(
 			ErrorKind::Unsupported,
 			"tier retirements are not used by this test committer",
@@ -2724,7 +2724,7 @@ impl TierCommitter for DirectTierCommitter {
 		let applied = self
 			.manager
 			.apply_tier_slab(TieredSlabPointer {
-				slab_id: tier.slab_id,
+				slab_id: tier.slab.local_id(),
 				l2_uri: tier.l2_uri,
 				payload_hash: tier.payload_hash,
 				is_encrypted: tier.is_encrypted,
@@ -2743,7 +2743,8 @@ impl TierCommitter for DirectTierCommitter {
 		applied
 	}
 
-	async fn retire_tiered_slab(&self, slab_id: SlabId) -> std::io::Result<()> {
+	async fn retire_tiered_slab(&self, slab: crate::consensus::SlabRef) -> std::io::Result<()> {
+		let slab_id = slab.local_id();
 		self.manager.retire_tiered_slab(slab_id).await.map(|_| ())
 	}
 }
@@ -2762,7 +2763,7 @@ impl TierCommitter for FailingLsmCommitter {
 		))
 	}
 
-	async fn retire_tiered_slab(&self, _slab_id: SlabId) -> std::io::Result<()> {
+	async fn retire_tiered_slab(&self, _slab: crate::consensus::SlabRef) -> std::io::Result<()> {
 		Err(Error::new(
 			ErrorKind::Unsupported,
 			"tier retirements are not used by this test committer",
@@ -5679,7 +5680,7 @@ impl TierCommitter for PausingLsmCommitter {
 		Err(Error::new(ErrorKind::Unsupported, "unused"))
 	}
 
-	async fn retire_tiered_slab(&self, _slab_id: SlabId) -> std::io::Result<()> {
+	async fn retire_tiered_slab(&self, _slab: crate::consensus::SlabRef) -> std::io::Result<()> {
 		Err(Error::new(ErrorKind::Unsupported, "unused"))
 	}
 
@@ -13535,6 +13536,7 @@ async fn lsm_compaction_rejects_sidecar_covered_source_runs_without_catalog_cont
 		dominant_reason: crate::storage::DominantReason::Operator,
 	};
 	let commit = CompactionCommit {
+		owner: manager.owner_ref().unwrap(),
 		job_id: plan.job_id,
 		manifest_epoch_pre: plan.manifest_epoch_pre,
 		slabs_to_retire: vec![source_slab_id],
@@ -15143,7 +15145,12 @@ async fn adr0097_rewritten_partial_survivor_frame_survives_install_and_reopen() 
 		.lsm_single_row_bridge_digest_summary(&plan, &prepared, &written, &source_frames)
 		.await
 		.unwrap();
-	let commit = worker.build_written_compaction_commit(&plan, &written, digest_summary);
+	let commit = worker.build_written_compaction_commit(
+		manager.owner_ref().unwrap(),
+		&plan,
+		&written,
+		digest_summary,
+	);
 	let installed_slabs = written.iter().map(|run| run.slab_id).collect::<Vec<_>>();
 	manager
 		.install_lsm_compaction_temp_outputs(&plan, &prepared, &written, &commit)
@@ -21345,7 +21352,7 @@ impl TierCommitter for UnpublishedDropCommitter {
 	) -> std::io::Result<()> {
 		let tier = proposal.tier().clone();
 		let pointer = TieredSlabPointer {
-			slab_id: tier.slab_id,
+			slab_id: tier.slab.local_id(),
 			l2_uri: tier.l2_uri,
 			payload_hash: tier.payload_hash,
 			is_encrypted: tier.is_encrypted,
@@ -21378,7 +21385,7 @@ impl TierCommitter for UnpublishedDropCommitter {
 		Ok(())
 	}
 
-	async fn retire_tiered_slab(&self, _slab_id: SlabId) -> std::io::Result<()> {
+	async fn retire_tiered_slab(&self, _slab: crate::consensus::SlabRef) -> std::io::Result<()> {
 		panic!("the fixture must rewrite, not retire")
 	}
 }
@@ -21583,7 +21590,7 @@ async fn table_drop_cleanup_refuses_to_delete_either_object_with_an_unpublished_
 	committer
 		.commit_tier_slab(crate::storage::TierProposal::unreserved_for_test(
 			TieredSlab {
-				slab_id: old.slab_id,
+				slab: mgr.owner_ref().unwrap().slab(old.slab_id),
 				l2_uri: new_uri,
 				payload_hash: old.payload_hash,
 				is_encrypted: old.is_encrypted,
@@ -21649,7 +21656,7 @@ impl TierCommitter for AmbiguousDropCommitter {
 	) -> std::io::Result<()> {
 		let tier = proposal.tier().clone();
 		let pointer = TieredSlabPointer {
-			slab_id: tier.slab_id,
+			slab_id: tier.slab.local_id(),
 			l2_uri: tier.l2_uri,
 			payload_hash: tier.payload_hash,
 			is_encrypted: tier.is_encrypted,
@@ -21670,7 +21677,7 @@ impl TierCommitter for AmbiguousDropCommitter {
 			"the commit response was lost",
 		))
 	}
-	async fn retire_tiered_slab(&self, _slab_id: SlabId) -> std::io::Result<()> {
+	async fn retire_tiered_slab(&self, _slab: crate::consensus::SlabRef) -> std::io::Result<()> {
 		panic!("the fixture must rewrite")
 	}
 }
@@ -23963,7 +23970,7 @@ async fn committed_retirement_during_verification_fences_reads_until_ready() {
 	let mut sm = WendelonStateMachine::new()
 		.with_tier_observer(Arc::new(ManagerTierObserver::new(f.manager.clone())));
 	sm.seed_tiered_slab_for_test(TieredSlab {
-		slab_id: p.slab_id,
+		slab: f.manager.owner_ref().unwrap().slab(p.slab_id),
 		l2_uri: p.l2_uri.clone(),
 		payload_hash: p.payload_hash,
 		is_encrypted: p.is_encrypted,
@@ -23979,7 +23986,7 @@ async fn committed_retirement_during_verification_fences_reads_until_ready() {
 	let entry = Entry {
 		log_id: LogId::new(CommittedLeaderId::new(3, 1), 701),
 		payload: EntryPayload::Normal(WendelonRequest::RetireTieredSlab(RetireTieredSlab {
-			slab_id: p.slab_id,
+			slab: f.manager.owner_ref().unwrap().slab(p.slab_id),
 		})),
 	};
 	RaftStateMachine::apply(&mut sm, [entry]).await.unwrap();
@@ -23987,7 +23994,7 @@ async fn committed_retirement_during_verification_fences_reads_until_ready() {
 		!sm.state_snapshot()
 			.await
 			.tiered_slabs
-			.contains_key(&p.slab_id)
+			.contains_key(&f.manager.owner_ref().unwrap().slab(p.slab_id))
 	);
 	assert!(f.manager.tier_pointer(p.slab_id).await.is_none());
 	assert_authority_pending(f.manager.lookup(tenant(), id(0x7f61)));
@@ -24035,41 +24042,69 @@ impl crate::consensus::TierObserver for PausedRetirementObserver {
 		self.inner.bind_tier_snapshot_source(source);
 	}
 
-	fn before_slab_retired(&self, slab_id: SlabId, applied_log_index: u64) {
-		self.inner.before_slab_retired(slab_id, applied_log_index);
+	fn before_slab_retired(
+		&self,
+		slab: crate::consensus::SlabRef,
+		registry: &crate::consensus::IncarnationRegistry,
+		applied_log_index: u64,
+	) {
+		self.inner
+			.before_slab_retired(slab, registry, applied_log_index);
 	}
 
-	fn before_tier_snapshot_install(&self) -> std::io::Result<u64> {
-		self.inner.before_tier_snapshot_install()
+	fn before_tier_snapshot_install(
+		&self,
+		index: Option<u64>,
+		registries: &BTreeMap<u32, crate::consensus::IncarnationRegistry>,
+	) -> std::io::Result<u64> {
+		self.inner.before_tier_snapshot_install(index, registries)
 	}
 
 	async fn on_tier_snapshot_installed(
 		&self,
 		tiers: &[crate::consensus::TieredSlab],
+		registries: &std::collections::BTreeMap<u32, crate::consensus::IncarnationRegistry>,
 		index: Option<u64>,
 		snapshot_epoch: u64,
 	) -> std::io::Result<()> {
 		self.inner
-			.on_tier_snapshot_installed(tiers, index, snapshot_epoch)
+			.on_tier_snapshot_installed(tiers, registries, index, snapshot_epoch)
 			.await
 	}
 
 	async fn on_slab_tiered(
 		&self,
 		tier: &crate::consensus::TieredSlab,
+		registry: &crate::consensus::IncarnationRegistry,
 		applied_log_index: u64,
 	) -> std::io::Result<()> {
-		self.inner.on_slab_tiered(tier, applied_log_index).await
+		self.inner
+			.on_slab_tiered(tier, registry, applied_log_index)
+			.await
 	}
 
 	async fn on_slab_retired(
 		&self,
-		slab_id: SlabId,
+		slab: crate::consensus::SlabRef,
+		registry: &crate::consensus::IncarnationRegistry,
 		applied_log_index: u64,
 	) -> std::io::Result<()> {
 		self.entered.add_permits(1);
 		self.release.acquire().await.unwrap().forget();
-		self.inner.on_slab_retired(slab_id, applied_log_index).await
+		self.inner
+			.on_slab_retired(slab, registry, applied_log_index)
+			.await
+	}
+
+	async fn on_incarnation_registry(
+		&self,
+		node: u32,
+		registry: &crate::consensus::IncarnationRegistry,
+		applied_log_index: u64,
+	) -> std::io::Result<()> {
+		self.inner
+			.on_incarnation_registry(node, registry, applied_log_index)
+			.await
 	}
 
 	async fn on_migrated_range_tombstone(
@@ -24085,10 +24120,11 @@ impl crate::consensus::TierObserver for PausedRetirementObserver {
 	async fn on_lsm_compaction_committed(
 		&self,
 		commit: &crate::storage::CompactionCommit,
+		registry: &crate::consensus::IncarnationRegistry,
 		applied_log_index: u64,
 	) -> std::io::Result<()> {
 		self.inner
-			.on_lsm_compaction_committed(commit, applied_log_index)
+			.on_lsm_compaction_committed(commit, registry, applied_log_index)
 			.await
 	}
 }
@@ -24107,6 +24143,7 @@ async fn committed_retirement_fences_ready_reads_before_local_retirement() {
 		.await
 		.unwrap();
 	let p = tier_kv_slab(&mgr, &l2, "tier/committed-retire-ready-window.wnd").await;
+	let p_ref = mgr.owner_ref().unwrap().slab(p.slab_id);
 	// Premise: ready authority and a readable tiered row, with no pending
 	// verification, deferred pointer, or held index writer.
 	assert_eq!(mgr.tier_authority_readiness_reason(), None);
@@ -24128,7 +24165,7 @@ async fn committed_retirement_fences_ready_reads_before_local_retirement() {
 		release: release.clone(),
 	}));
 	sm.seed_tiered_slab_for_test(TieredSlab {
-		slab_id: p.slab_id,
+		slab: p_ref,
 		l2_uri: p.l2_uri.clone(),
 		payload_hash: p.payload_hash,
 		is_encrypted: p.is_encrypted,
@@ -24149,7 +24186,7 @@ async fn committed_retirement_fences_ready_reads_before_local_retirement() {
 				[Entry {
 					log_id: LogId::new(CommittedLeaderId::new(3, 1), 711),
 					payload: EntryPayload::Normal(WendelonRequest::RetireTieredSlab(
-						RetireTieredSlab { slab_id: p.slab_id },
+						RetireTieredSlab { slab: p_ref },
 					)),
 				}],
 			)
@@ -24171,7 +24208,7 @@ async fn committed_retirement_fences_ready_reads_before_local_retirement() {
 		.await
 		.expect("the shared SM state is readable during the callback")
 		.tiered_slabs
-		.contains_key(&p.slab_id);
+		.contains_key(&p_ref);
 	let local_pointer = mgr.tier_pointer(p.slab_id).await;
 	let locally_retired = mgr.retired_tier_slabs.contains(&p.slab_id);
 	let verification_pending = !mgr.tier_authority.pending.is_empty();
@@ -25296,6 +25333,7 @@ async fn unresolved_lsm_intent_fences_open_and_preserves_staged_output() {
 	.await
 	.unwrap();
 	let commit = CompactionCommit::gc_remove(
+		crate::consensus::OwnerRef::new(1, index.store_incarnation()),
 		CompactionJobId::new(718),
 		ManifestEpoch::new(1),
 		vec![SlabId::new(2)],
@@ -25488,7 +25526,7 @@ impl TierCommitter for DefiniteRejectLsmCommitter {
 	) -> std::io::Result<()> {
 		Err(Error::new(ErrorKind::Unsupported, "unused"))
 	}
-	async fn retire_tiered_slab(&self, _: SlabId) -> std::io::Result<()> {
+	async fn retire_tiered_slab(&self, _slab: crate::consensus::SlabRef) -> std::io::Result<()> {
 		Err(Error::new(ErrorKind::Unsupported, "unused"))
 	}
 	async fn commit_lsm_compaction(&self, _: CompactionCommit) -> std::io::Result<()> {
@@ -25507,7 +25545,7 @@ impl TierCommitter for AmbiguousLsmCommitter {
 	) -> std::io::Result<()> {
 		Err(Error::new(ErrorKind::Unsupported, "unused"))
 	}
-	async fn retire_tiered_slab(&self, _: SlabId) -> std::io::Result<()> {
+	async fn retire_tiered_slab(&self, _slab: crate::consensus::SlabRef) -> std::io::Result<()> {
 		Err(Error::new(ErrorKind::Unsupported, "unused"))
 	}
 	async fn commit_lsm_compaction(&self, _: CompactionCommit) -> std::io::Result<()> {
@@ -26028,7 +26066,12 @@ async fn local_lsm_cancel_after_rename_quarantines_outputs_and_recovers_inputs()
 		.lsm_single_row_bridge_digest_summary(&plan, &prepared, &written, &frames)
 		.await
 		.unwrap();
-	let commit = worker.build_written_compaction_commit(&plan, &written, digest);
+	let commit = worker.build_written_compaction_commit(
+		manager.owner_ref().unwrap(),
+		&plan,
+		&written,
+		digest,
+	);
 	let entered = Arc::new(tokio::sync::Semaphore::new(0));
 	let release = Arc::new(tokio::sync::Semaphore::new(0));
 	*manager.lsm_after_rename_hold.lock().unwrap() = Some((entered.clone(), release));
@@ -26174,7 +26217,12 @@ async fn local_lsm_cancel_after_publication_recovers_committed_outputs() {
 		.lsm_single_row_bridge_digest_summary(&plan, &prepared, &written, &frames)
 		.await
 		.unwrap();
-	let commit = worker.build_written_compaction_commit(&plan, &written, digest);
+	let commit = worker.build_written_compaction_commit(
+		manager.owner_ref().unwrap(),
+		&plan,
+		&written,
+		digest,
+	);
 	let entered = Arc::new(tokio::sync::Semaphore::new(0));
 	let release = Arc::new(tokio::sync::Semaphore::new(0));
 	*manager.lsm_after_install_hold.lock().unwrap() = Some((entered.clone(), release));
@@ -26299,7 +26347,12 @@ async fn local_lsm_cancel_after_output_publication_finishes_input_retirement() {
 		.lsm_single_row_bridge_digest_summary(&plan, &prepared, &written, &frames)
 		.await
 		.unwrap();
-	let commit = worker.build_written_compaction_commit(&plan, &written, digest);
+	let commit = worker.build_written_compaction_commit(
+		manager.owner_ref().unwrap(),
+		&plan,
+		&written,
+		digest,
+	);
 	let entered = Arc::new(tokio::sync::Semaphore::new(0));
 	let release = Arc::new(tokio::sync::Semaphore::new(0));
 	*manager.lsm_after_output_publish_hold.lock().unwrap() = Some((entered.clone(), release));
@@ -26452,7 +26505,12 @@ async fn local_lsm_changed_input_keeps_intent_and_output_fenced() {
 		.lsm_single_row_bridge_digest_summary(&plan, &prepared, &written, &frames)
 		.await
 		.unwrap();
-	let commit = worker.build_written_compaction_commit(&plan, &written, digest);
+	let commit = worker.build_written_compaction_commit(
+		manager.owner_ref().unwrap(),
+		&plan,
+		&written,
+		digest,
+	);
 	let entered = Arc::new(tokio::sync::Semaphore::new(0));
 	let release = Arc::new(tokio::sync::Semaphore::new(0));
 	*manager.lsm_after_rename_hold.lock().unwrap() = Some((entered.clone(), release));
@@ -26790,7 +26848,12 @@ async fn local_lsm_quarantine_resumes_after_link_before_fsync() {
 		.lsm_single_row_bridge_digest_summary(&plan, &prepared, &written, &frames)
 		.await
 		.unwrap();
-	let commit = worker.build_written_compaction_commit(&plan, &written, digest);
+	let commit = worker.build_written_compaction_commit(
+		manager.owner_ref().unwrap(),
+		&plan,
+		&written,
+		digest,
+	);
 	let entered = Arc::new(tokio::sync::Semaphore::new(0));
 	let release = Arc::new(tokio::sync::Semaphore::new(0));
 	*manager.lsm_after_rename_hold.lock().unwrap() = Some((entered.clone(), release));
@@ -26945,7 +27008,12 @@ async fn local_lsm_quarantine_resumes_after_link_after_fsync() {
 		.lsm_single_row_bridge_digest_summary(&plan, &prepared, &written, &frames)
 		.await
 		.unwrap();
-	let commit = worker.build_written_compaction_commit(&plan, &written, digest);
+	let commit = worker.build_written_compaction_commit(
+		manager.owner_ref().unwrap(),
+		&plan,
+		&written,
+		digest,
+	);
 	let entered = Arc::new(tokio::sync::Semaphore::new(0));
 	let release = Arc::new(tokio::sync::Semaphore::new(0));
 	*manager.lsm_after_rename_hold.lock().unwrap() = Some((entered.clone(), release));
@@ -27101,7 +27169,12 @@ async fn local_lsm_quarantine_resumes_after_unlink_before_fsync() {
 		.lsm_single_row_bridge_digest_summary(&plan, &prepared, &written, &frames)
 		.await
 		.unwrap();
-	let commit = worker.build_written_compaction_commit(&plan, &written, digest);
+	let commit = worker.build_written_compaction_commit(
+		manager.owner_ref().unwrap(),
+		&plan,
+		&written,
+		digest,
+	);
 	let entered = Arc::new(tokio::sync::Semaphore::new(0));
 	let release = Arc::new(tokio::sync::Semaphore::new(0));
 	*manager.lsm_after_rename_hold.lock().unwrap() = Some((entered.clone(), release));
@@ -27258,7 +27331,12 @@ async fn local_lsm_quarantine_resumes_after_unlink_after_fsync() {
 		.lsm_single_row_bridge_digest_summary(&plan, &prepared, &written, &frames)
 		.await
 		.unwrap();
-	let commit = worker.build_written_compaction_commit(&plan, &written, digest);
+	let commit = worker.build_written_compaction_commit(
+		manager.owner_ref().unwrap(),
+		&plan,
+		&written,
+		digest,
+	);
 	let entered = Arc::new(tokio::sync::Semaphore::new(0));
 	let release = Arc::new(tokio::sync::Semaphore::new(0));
 	*manager.lsm_after_rename_hold.lock().unwrap() = Some((entered.clone(), release));
@@ -27416,7 +27494,12 @@ async fn local_lsm_sidecar_evidence_keeps_intent_and_outputs_fenced() {
 		.lsm_single_row_bridge_digest_summary(&plan, &prepared, &written, &frames)
 		.await
 		.unwrap();
-	let commit = worker.build_written_compaction_commit(&plan, &written, digest);
+	let commit = worker.build_written_compaction_commit(
+		manager.owner_ref().unwrap(),
+		&plan,
+		&written,
+		digest,
+	);
 	let entered = Arc::new(tokio::sync::Semaphore::new(0));
 	let release = Arc::new(tokio::sync::Semaphore::new(0));
 	*manager.lsm_after_rename_hold.lock().unwrap() = Some((entered.clone(), release));
@@ -27547,7 +27630,12 @@ async fn local_lsm_preflight_refusal_precedes_durable_intent_and_orphan_mark() {
 		.lsm_single_row_bridge_digest_summary(&plan, &prepared, &written, &frames)
 		.await
 		.unwrap();
-	let commit = worker.build_written_compaction_commit(&plan, &written, digest);
+	let commit = worker.build_written_compaction_commit(
+		manager.owner_ref().unwrap(),
+		&plan,
+		&written,
+		digest,
+	);
 	// Make the install deterministically preflight-refusable: a sidecar-covered
 	// input without catalog context. The manifest epoch is unchanged.
 	{
@@ -27664,7 +27752,12 @@ async fn local_lsm_recovery_preserves_unrelated_run_change() {
 		.lsm_single_row_bridge_digest_summary(&plan, &prepared, &written, &frames)
 		.await
 		.unwrap();
-	let commit = worker.build_written_compaction_commit(&plan, &written, digest);
+	let commit = worker.build_written_compaction_commit(
+		manager.owner_ref().unwrap(),
+		&plan,
+		&written,
+		digest,
+	);
 	let entered = Arc::new(tokio::sync::Semaphore::new(0));
 	let release = Arc::new(tokio::sync::Semaphore::new(0));
 	*manager.lsm_after_output_publish_hold.lock().unwrap() = Some((entered.clone(), release));
@@ -27819,7 +27912,12 @@ async fn empty_output_local_lsm_recovers_at_phase(outputs_published: bool) {
 		.lsm_single_row_bridge_digest_summary(&plan, &prepared, &written, &frames)
 		.await
 		.unwrap();
-	let commit = worker.build_written_compaction_commit(&plan, &written, digest);
+	let commit = worker.build_written_compaction_commit(
+		manager.owner_ref().unwrap(),
+		&plan,
+		&written,
+		digest,
+	);
 	let entered = Arc::new(tokio::sync::Semaphore::new(0));
 	let release = Arc::new(tokio::sync::Semaphore::new(0));
 	if outputs_published {
@@ -28090,7 +28188,12 @@ async fn retention_empty_output_local_lsm_recovers_at_phase(outputs_published: b
 		.lsm_single_row_bridge_digest_summary(&plan, &prepared, &written, &frames)
 		.await
 		.unwrap();
-	let commit = worker.build_written_compaction_commit(&plan, &written, digest);
+	let commit = worker.build_written_compaction_commit(
+		manager.owner_ref().unwrap(),
+		&plan,
+		&written,
+		digest,
+	);
 	let entered = Arc::new(tokio::sync::Semaphore::new(0));
 	let release = Arc::new(tokio::sync::Semaphore::new(0));
 	if outputs_published {
@@ -29170,7 +29273,12 @@ async fn local_lsm_renamed_outputs_before_publication_never_duplicate_recovered_
 		.lsm_single_row_bridge_digest_summary(&plan, &prepared, &written, &frames)
 		.await
 		.unwrap();
-	let commit = worker.build_written_compaction_commit(&plan, &written, digest);
+	let commit = worker.build_written_compaction_commit(
+		manager.owner_ref().unwrap(),
+		&plan,
+		&written,
+		digest,
+	);
 	let outputs = written.iter().map(|run| run.slab_id).collect::<Vec<_>>();
 	let entered = Arc::new(tokio::sync::Semaphore::new(0));
 	let release = Arc::new(tokio::sync::Semaphore::new(0));
@@ -30543,7 +30651,7 @@ impl TierCommitter for GcPauseAfterRemoveCommit {
 	) -> std::io::Result<()> {
 		Err(Error::new(ErrorKind::Unsupported, "unused"))
 	}
-	async fn retire_tiered_slab(&self, _: SlabId) -> std::io::Result<()> {
+	async fn retire_tiered_slab(&self, _slab: crate::consensus::SlabRef) -> std::io::Result<()> {
 		Err(Error::new(ErrorKind::Unsupported, "unused"))
 	}
 	async fn commit_lsm_compaction(&self, commit: CompactionCommit) -> std::io::Result<()> {
@@ -30577,6 +30685,7 @@ async fn gc_control_revision_mismatch_keeps_file_and_fences_reopen() {
 	drop(direct);
 	let snapshot = manager.compaction_manifest_snapshot();
 	let commit = CompactionCommit::gc_mark_delete_pending(
+		manager.owner_ref().unwrap(),
 		CompactionJobId::new(0xdd01),
 		snapshot.manifest_epoch,
 		vec![target],
@@ -30929,6 +31038,7 @@ async fn gc_crash_steps_preserve_or_complete_deletion_on_reopen() {
 async fn mark_gc_target_for_control_test(manager: &Arc<SlabManager>, slab_id: SlabId) {
 	let snapshot = manager.compaction_manifest_snapshot();
 	let commit = CompactionCommit::gc_mark_delete_pending(
+		manager.owner_ref().unwrap(),
 		CompactionJobId::new(0xdd21),
 		snapshot.manifest_epoch,
 		vec![slab_id],
@@ -31564,7 +31674,7 @@ async fn install_snapshot_with_tier_set_for_test(include_local_tier: bool) {
 	if include_local_tier {
 		source
 			.seed_tiered_slab_for_test(TieredSlab {
-				slab_id: pointer.slab_id,
+				slab: manager.owner_ref().unwrap().slab(pointer.slab_id),
 				l2_uri: pointer.l2_uri.clone(),
 				payload_hash: pointer.payload_hash,
 				is_encrypted: pointer.is_encrypted,
@@ -31711,7 +31821,7 @@ async fn snapshot_index_discards_old_tier_observer_but_accepts_newer_one() {
 	let mut source = WendelonStateMachine::new();
 	source
 		.seed_tiered_slab_for_test(TieredSlab {
-			slab_id: original.slab_id,
+			slab: manager.owner_ref().unwrap().slab(original.slab_id),
 			l2_uri: original.l2_uri.clone(),
 			payload_hash: original.payload_hash,
 			is_encrypted: original.is_encrypted,
@@ -31886,7 +31996,7 @@ async fn snapshot_new_tier_is_verified_for_test(awaiting_cluster: bool) {
 	let mut source = WendelonStateMachine::new();
 	source
 		.seed_tiered_slab_for_test(TieredSlab {
-			slab_id: pointer.slab_id,
+			slab: target_manager.owner_ref().unwrap().slab(pointer.slab_id),
 			l2_uri: pointer.l2_uri.clone(),
 			payload_hash: pointer.payload_hash,
 			is_encrypted: pointer.is_encrypted,
@@ -31962,7 +32072,7 @@ async fn snapshot_newer_pending_tier_is_verified_before_readiness() {
 	let mut source = WendelonStateMachine::new();
 	source
 		.seed_tiered_slab_for_test(TieredSlab {
-			slab_id: replacement.slab_id,
+			slab: f.manager.owner_ref().unwrap().slab(replacement.slab_id),
 			l2_uri: replacement.l2_uri.clone(),
 			payload_hash: replacement.payload_hash,
 			is_encrypted: replacement.is_encrypted,
@@ -32071,7 +32181,7 @@ async fn snapshot_index_rejects_observer_paused_before_publication_gate() {
 	let mut source = WendelonStateMachine::new();
 	source
 		.seed_tiered_slab_for_test(TieredSlab {
-			slab_id: original.slab_id,
+			slab: manager.owner_ref().unwrap().slab(original.slab_id),
 			l2_uri: original.l2_uri.clone(),
 			payload_hash: original.payload_hash,
 			is_encrypted: original.is_encrypted,
@@ -32134,7 +32244,8 @@ async fn older_retirement_callback_cannot_clear_newer_retirement_marker() {
 	let pointer = tier_kv_slab(&manager, &l2, "dc112-retirement-marker-order/object").await;
 	let old_location = manager.lookup(tenant(), key).unwrap().unwrap();
 	let observer = Arc::new(ManagerTierObserver::new(manager.clone()));
-	observer.before_slab_retired(pointer.slab_id, 701);
+	let (slab, registry) = own_slab(&manager, pointer.slab_id);
+	observer.before_slab_retired(slab, &registry, 701);
 	let entered = Arc::new(tokio::sync::Semaphore::new(0));
 	let release = Arc::new(tokio::sync::Semaphore::new(0));
 	*manager
@@ -32144,15 +32255,15 @@ async fn older_retirement_callback_cannot_clear_newer_retirement_marker() {
 		.unwrap() = Some((entered.clone(), release.clone()));
 	let callback = {
 		let observer = observer.clone();
-		let slab_id = pointer.slab_id;
-		tokio::spawn(async move { observer.on_slab_retired(slab_id, 701).await })
+		let registry = registry.clone();
+		tokio::spawn(async move { observer.on_slab_retired(slab, &registry, 701).await })
 	};
 	tokio::time::timeout(Duration::from_secs(60), entered.acquire())
 		.await
 		.unwrap()
 		.unwrap()
 		.forget();
-	observer.before_slab_retired(pointer.slab_id, 702);
+	observer.before_slab_retired(slab, &registry, 702);
 	release.add_permits(1);
 	callback.await.unwrap().unwrap();
 	assert_eq!(
@@ -32307,7 +32418,7 @@ async fn snapshot_epoch_fences_unindexed_tier_publication_paused_before_gate() {
 	let mut source = WendelonStateMachine::new();
 	source
 		.seed_tiered_slab_for_test(TieredSlab {
-			slab_id: original.slab_id,
+			slab: manager.owner_ref().unwrap().slab(original.slab_id),
 			l2_uri: original.l2_uri.clone(),
 			payload_hash: original.payload_hash,
 			is_encrypted: original.is_encrypted,
@@ -32840,7 +32951,7 @@ async fn snapshot_supersession_preserves_unknown_size_across_reopen() {
 	let mut source = WendelonStateMachine::new();
 	source
 		.seed_tiered_slab_for_test(TieredSlab {
-			slab_id: replacement.slab_id,
+			slab: mgr.owner_ref().unwrap().slab(replacement.slab_id),
 			l2_uri: replacement.l2_uri.clone(),
 			payload_hash: replacement.payload_hash,
 			is_encrypted: replacement.is_encrypted,
@@ -32983,7 +33094,7 @@ async fn snapshot_displacing_unverified_pointer_does_not_invent_publication_evid
 	let mut source = WendelonStateMachine::new();
 	source
 		.seed_tiered_slab_for_test(TieredSlab {
-			slab_id: old.slab_id,
+			slab: mgr.owner_ref().unwrap().slab(old.slab_id),
 			l2_uri: old.l2_uri.clone(),
 			payload_hash: old.payload_hash,
 			is_encrypted: old.is_encrypted,
@@ -34443,7 +34554,7 @@ async fn snapshot_after_append_observation_refuses_stale_supersession_metadata()
 	let mut source = WendelonStateMachine::new();
 	source
 		.seed_tiered_slab_for_test(TieredSlab {
-			slab_id: original.slab_id,
+			slab: manager.owner_ref().unwrap().slab(original.slab_id),
 			l2_uri: original.l2_uri.clone(),
 			payload_hash: original.payload_hash,
 			is_encrypted: original.is_encrypted,
@@ -34525,7 +34636,7 @@ async fn snapshot_after_migrated_range_observation_refuses_stale_metadata() {
 	let mut source = WendelonStateMachine::new();
 	source
 		.seed_tiered_slab_for_test(TieredSlab {
-			slab_id: original.slab_id,
+			slab: manager.owner_ref().unwrap().slab(original.slab_id),
 			l2_uri: original.l2_uri.clone(),
 			payload_hash: original.payload_hash,
 			is_encrypted: original.is_encrypted,
@@ -34607,7 +34718,7 @@ async fn snapshot_after_multirow_observation_refuses_stale_metadata() {
 	let mut source = WendelonStateMachine::new();
 	source
 		.seed_tiered_slab_for_test(TieredSlab {
-			slab_id: original.slab_id,
+			slab: manager.owner_ref().unwrap().slab(original.slab_id),
 			l2_uri: original.l2_uri.clone(),
 			payload_hash: original.payload_hash,
 			is_encrypted: original.is_encrypted,
@@ -34682,7 +34793,7 @@ async fn snapshot_after_multirow_tombstone_observation_refuses_stale_metadata() 
 	let mut source = WendelonStateMachine::new();
 	source
 		.seed_tiered_slab_for_test(TieredSlab {
-			slab_id: original.slab_id,
+			slab: manager.owner_ref().unwrap().slab(original.slab_id),
 			l2_uri: original.l2_uri.clone(),
 			payload_hash: original.payload_hash,
 			is_encrypted: original.is_encrypted,
@@ -35966,6 +36077,7 @@ async fn real_sm_fenced_pointer_for_a_retired_slab_stays_typed_fenced_while_cano
 		.unwrap();
 	let old = tier_kv_slab(&manager, &l2, "s7-real-sm/p0").await;
 	let slab_id = old.slab_id;
+	let own_slab_ref = manager.owner_ref().unwrap().slab(slab_id);
 	let bytes = l2.get(&old.l2_uri).await.unwrap();
 	let replacement = TieredSlabPointer {
 		l2_uri: l2.put("s7-real-sm/p1", &bytes).await.unwrap(),
@@ -35980,8 +36092,12 @@ async fn real_sm_fenced_pointer_for_a_retired_slab_stays_typed_fenced_while_cano
 		"premise: the tiered row is served at P0"
 	);
 
-	// The snapshot at 822 no longer names X.
+	// The snapshot at 822 no longer names X; it still carries the owner's
+	// registration (ADR 0697), as every real snapshot after it would.
 	let mut source = WendelonStateMachine::new();
+	source
+		.seed_registration_for_test(manager.owner_ref().unwrap())
+		.await;
 	RaftStateMachine::apply(
 		&mut source,
 		[Entry {
@@ -35998,7 +36114,9 @@ async fn real_sm_fenced_pointer_for_a_retired_slab_stays_typed_fenced_while_cano
 		.unwrap();
 	let mut target = WendelonStateMachine::new()
 		.with_tier_observer(Arc::new(ManagerTierObserver::new(manager.clone())));
-	target.seed_tiered_slab_for_test(b10_tier(&old)).await;
+	target
+		.seed_tiered_slab_for_test(b10_tier(&manager, &old))
+		.await;
 
 	// An in-flight append makes the snapshot's reconciliation defer.
 	let active = Arc::clone(&manager.state.lock().await.active);
@@ -36029,6 +36147,7 @@ async fn real_sm_fenced_pointer_for_a_retired_slab_stays_typed_fenced_while_cano
 		[Entry {
 			log_id: LogId::new(CommittedLeaderId::new(3, 1), 823),
 			payload: EntryPayload::Normal(crate::consensus::WendelonRequest::TierSlab(b10_tier(
+				&manager,
 				&replacement,
 			))),
 		}],
@@ -36063,9 +36182,9 @@ async fn real_sm_fenced_pointer_for_a_retired_slab_stays_typed_fenced_while_cano
 				.state_snapshot()
 				.await
 				.tiered_slabs
-				.get(&slab_id)
+				.get(&own_slab_ref)
 				.map(|tier| TieredSlabPointer {
-					slab_id: tier.slab_id,
+					slab_id: tier.slab.local_id(),
 					l2_uri: tier.l2_uri.clone(),
 					payload_hash: tier.payload_hash,
 					is_encrypted: tier.is_encrypted,
@@ -37188,7 +37307,7 @@ impl TierCommitter for B1tRoleCommitter {
 		.commit_tier_slab(proposal)
 		.await
 	}
-	async fn retire_tiered_slab(&self, slab: SlabId) -> std::io::Result<()> {
+	async fn retire_tiered_slab(&self, slab: crate::consensus::SlabRef) -> std::io::Result<()> {
 		self.calls.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
 		if !self.should_propose() {
 			return Err(Error::new(
@@ -37430,6 +37549,8 @@ async fn b1t_real_follower_debt_completes_after_leadership_change() {
 			.validate()
 			.unwrap(),
 	);
+	// ADR 0697: the observed store serves node 2.
+	mgr.bind_control_node(2).unwrap();
 	let mut stores = Vec::new();
 	let mut dirs = Vec::new();
 	let mut nodes = Vec::new();
@@ -37469,22 +37590,43 @@ async fn b1t_real_follower_debt_completes_after_leadership_change() {
 			.await
 			.unwrap();
 	}
-	let committed = nodes[0]
-		.client_write(crate::consensus::WendelonRequest::TierSlab(TieredSlab {
-			slab_id: old.slab_id,
-			l2_uri: old.l2_uri.clone(),
-			payload_hash: old.payload_hash,
-			is_encrypted: old.is_encrypted,
-			tenant_id: old.tenant_id,
-			tenant_kek_id: old.tenant_kek_id,
-			stats_format_version: old.stats_format_version,
-			stats_block_len: old.stats_block_len,
-			stats_block_hash128: old.stats_block_hash128,
-			tombstone_metadata: old.tombstone_metadata,
-			supersession_metadata: old.supersession_metadata,
-		}))
+	let tier = TieredSlab {
+		slab: mgr.owner_ref().unwrap().slab(old.slab_id),
+		l2_uri: old.l2_uri.clone(),
+		payload_hash: old.payload_hash,
+		is_encrypted: old.is_encrypted,
+		tenant_id: old.tenant_id,
+		tenant_kek_id: old.tenant_kek_id,
+		stats_format_version: old.stats_format_version,
+		stats_block_len: old.stats_block_len,
+		stats_block_hash128: old.stats_block_hash128,
+		tombstone_metadata: old.tombstone_metadata,
+		supersession_metadata: old.supersession_metadata,
+	};
+	// ADR 0697: leader 1 never appends node 2's slab command.
+	let refused = nodes[0]
+		.client_write(crate::consensus::WendelonRequest::TierSlab(tier.clone()))
 		.await
 		.unwrap();
+	assert_eq!(
+		refused.data,
+		crate::consensus::WendelonResponse::Refused(
+			crate::consensus::SlabRefusal::NotAppendingLeader {
+				owner_node: 2,
+				leader_node: 1,
+			}
+		)
+	);
+	// The owner commits its pointer while it leads, then node 1 leads again
+	// so participant2 is a real follower holding the debt.
+	elect_among(&nodes, 2).await;
+	register_owner(&nodes[1], &mgr).await;
+	let committed = nodes[1]
+		.client_write(crate::consensus::WendelonRequest::TierSlab(tier))
+		.await
+		.unwrap();
+	assert_eq!(committed.data, crate::consensus::WendelonResponse::Success);
+	elect_among(&nodes, 1).await;
 	for node in &nodes {
 		node.wait(Some(Duration::from_secs(60)))
 			.applied_index_at_least(
@@ -37794,10 +37936,11 @@ async fn b4_committed_retirement_can_finish_before_its_tier_read_verification() 
 		"remote verification is genuinely pending"
 	);
 	let observer = crate::storage::ManagerTierObserver::new(fixture.manager.clone());
-	observer.before_slab_retired(fixture.pointer.slab_id, 1001);
+	let (slab, registry) = own_slab(&fixture.manager, fixture.pointer.slab_id);
+	observer.before_slab_retired(slab, &registry, 1001);
 	let result = tokio::time::timeout(
 		Duration::from_secs(30),
-		observer.on_slab_retired(fixture.pointer.slab_id, 1001),
+		observer.on_slab_retired(slab, &registry, 1001),
 	)
 	.await;
 	let retired = fixture
@@ -37945,7 +38088,8 @@ async fn b5_stale_local_retirement_does_not_overwrite_a_committed_log_fence() {
 	let object = l2.get(&pointer.l2_uri).await.unwrap();
 	let prior = b5_advance_snapshot(&mgr, &pointer).await;
 	let observer = crate::storage::ManagerTierObserver::new(mgr.clone());
-	observer.before_slab_retired(pointer.slab_id, 901);
+	let (slab, registry) = own_slab(&mgr, pointer.slab_id);
+	observer.before_slab_retired(slab, &registry, 901);
 	assert!(mgr.lookup(tenant(), id(0x421)).is_err());
 	assert!(
 		mgr.retire_tiered_slab_at_snapshot_epoch(pointer.slab_id, prior)
@@ -37953,7 +38097,7 @@ async fn b5_stale_local_retirement_does_not_overwrite_a_committed_log_fence() {
 			.is_err()
 	);
 	observer
-		.on_slab_retired(pointer.slab_id, 901)
+		.on_slab_retired(slab, &registry, 901)
 		.await
 		.unwrap();
 	assert!(mgr.tier_pointer(pointer.slab_id).await.is_none());
@@ -38515,9 +38659,10 @@ async fn b6b_retired_slab_cannot_register_snapshot_flight() {
 	assert!(manager.tier_pointer(pointer.slab_id).await.is_none());
 }
 
-fn b6_control_tier(p: &TieredSlabPointer) -> crate::consensus::TieredSlab {
+/// The ring pointer naming `manager`'s own `p` (ADR 0697).
+fn b6_control_tier(manager: &SlabManager, p: &TieredSlabPointer) -> crate::consensus::TieredSlab {
 	crate::consensus::TieredSlab {
-		slab_id: p.slab_id,
+		slab: manager.owner_ref().unwrap().slab(p.slab_id),
 		l2_uri: p.l2_uri.clone(),
 		payload_hash: p.payload_hash,
 		is_encrypted: p.is_encrypted,
@@ -38569,11 +38714,19 @@ async fn b6_replacement_tier_log_entry_finishes_complete_replay_authority() {
 	let mut sm = WendelonStateMachine::new().with_tier_observer(Arc::new(
 		crate::storage::ManagerTierObserver::new(target.clone()),
 	));
+	// ADR 0697: this fixture constructs target-owned authority: the canonical
+	// pointer already names the replacement's own registered incarnation. It
+	// does not demonstrate a source-to-target ownership transfer or a supported
+	// cold restore; the restore refusals and DC-162 remain that boundary.
+	sm.seed_registration_for_test(target.owner_ref().unwrap())
+		.await;
 	RaftStateMachine::apply(
 		&mut sm,
 		[Entry {
 			log_id: LogId::new(CommittedLeaderId::new(3, 1), 901),
-			payload: EntryPayload::Normal(WendelonRequest::TierSlab(b6_control_tier(&pointer))),
+			payload: EntryPayload::Normal(WendelonRequest::TierSlab(b6_control_tier(
+				&target, &pointer,
+			))),
 		}],
 	)
 	.await
@@ -38582,7 +38735,7 @@ async fn b6_replacement_tier_log_entry_finishes_complete_replay_authority() {
 		sm.state_snapshot()
 			.await
 			.tiered_slabs
-			.contains_key(&pointer.slab_id)
+			.contains_key(&target.owner_ref().unwrap().slab(pointer.slab_id))
 	);
 	assert!(
 		target.lookup(tenant(), key).is_err(),
@@ -38660,11 +38813,19 @@ async fn b6c_complete_replay_resumes_matching_lsm_deferral() {
 	let mut sm = WendelonStateMachine::new().with_tier_observer(Arc::new(
 		crate::storage::ManagerTierObserver::new(target.clone()),
 	));
+	// ADR 0697: this fixture constructs target-owned authority: the canonical
+	// pointer already names the replacement's own registered incarnation. It
+	// does not demonstrate a source-to-target ownership transfer or a supported
+	// cold restore; the restore refusals and DC-162 remain that boundary.
+	sm.seed_registration_for_test(target.owner_ref().unwrap())
+		.await;
 	RaftStateMachine::apply(
 		&mut sm,
 		[Entry {
 			log_id: LogId::new(CommittedLeaderId::new(3, 1), 901),
-			payload: EntryPayload::Normal(WendelonRequest::TierSlab(b6_control_tier(&pointer))),
+			payload: EntryPayload::Normal(WendelonRequest::TierSlab(b6_control_tier(
+				&target, &pointer,
+			))),
 		}],
 	)
 	.await
@@ -38673,7 +38834,7 @@ async fn b6c_complete_replay_resumes_matching_lsm_deferral() {
 		sm.state_snapshot()
 			.await
 			.tiered_slabs
-			.contains_key(&pointer.slab_id)
+			.contains_key(&target.owner_ref().unwrap().slab(pointer.slab_id))
 	);
 	assert!(
 		target.lookup(tenant(), key).is_err(),
@@ -38765,11 +38926,19 @@ async fn b6c_complete_replay_preserves_structural_refusal() {
 	let mut sm = WendelonStateMachine::new().with_tier_observer(Arc::new(
 		crate::storage::ManagerTierObserver::new(target.clone()),
 	));
+	// ADR 0697: this fixture constructs target-owned authority: the canonical
+	// pointer already names the replacement's own registered incarnation. It
+	// does not demonstrate a source-to-target ownership transfer or a supported
+	// cold restore; the restore refusals and DC-162 remain that boundary.
+	sm.seed_registration_for_test(target.owner_ref().unwrap())
+		.await;
 	RaftStateMachine::apply(
 		&mut sm,
 		[Entry {
 			log_id: LogId::new(CommittedLeaderId::new(3, 1), 901),
-			payload: EntryPayload::Normal(WendelonRequest::TierSlab(b6_control_tier(&pointer))),
+			payload: EntryPayload::Normal(WendelonRequest::TierSlab(b6_control_tier(
+				&target, &pointer,
+			))),
 		}],
 	)
 	.await
@@ -38778,7 +38947,7 @@ async fn b6c_complete_replay_preserves_structural_refusal() {
 		sm.state_snapshot()
 			.await
 			.tiered_slabs
-			.contains_key(&pointer.slab_id)
+			.contains_key(&target.owner_ref().unwrap().slab(pointer.slab_id))
 	);
 	assert!(
 		target.lookup(tenant(), key).is_err(),
@@ -38868,11 +39037,19 @@ async fn b6c_nonempty_replay_crash_before_marker_clear_rechecks_on_reopen() {
 	let mut sm = WendelonStateMachine::new().with_tier_observer(Arc::new(
 		crate::storage::ManagerTierObserver::new(target.clone()),
 	));
+	// ADR 0697: this fixture constructs target-owned authority: the canonical
+	// pointer already names the replacement's own registered incarnation. It
+	// does not demonstrate a source-to-target ownership transfer or a supported
+	// cold restore; the restore refusals and DC-162 remain that boundary.
+	sm.seed_registration_for_test(target.owner_ref().unwrap())
+		.await;
 	RaftStateMachine::apply(
 		&mut sm,
 		[Entry {
 			log_id: LogId::new(CommittedLeaderId::new(3, 1), 901),
-			payload: EntryPayload::Normal(WendelonRequest::TierSlab(b6_control_tier(&pointer))),
+			payload: EntryPayload::Normal(WendelonRequest::TierSlab(b6_control_tier(
+				&target, &pointer,
+			))),
 		}],
 	)
 	.await
@@ -38881,7 +39058,7 @@ async fn b6c_nonempty_replay_crash_before_marker_clear_rechecks_on_reopen() {
 		sm.state_snapshot()
 			.await
 			.tiered_slabs
-			.contains_key(&pointer.slab_id)
+			.contains_key(&target.owner_ref().unwrap().slab(pointer.slab_id))
 	);
 	assert!(
 		target.lookup(tenant(), key).is_err(),
@@ -40197,7 +40374,7 @@ async fn b10_snapshot_install_defers_live_append_collision_without_fatal_storage
 	let mut canonical = WendelonStateMachine::new();
 	canonical
 		.seed_tiered_slab_for_test(TieredSlab {
-			slab_id: pointer.slab_id,
+			slab: manager.owner_ref().unwrap().slab(pointer.slab_id),
 			l2_uri: pointer.l2_uri.clone(),
 			payload_hash: pointer.payload_hash,
 			is_encrypted: pointer.is_encrypted,
@@ -40386,7 +40563,7 @@ async fn b10_append_fixture() -> B10AppendFixture {
 
 	canonical
 		.seed_tiered_slab_for_test(TieredSlab {
-			slab_id: pointer.slab_id,
+			slab: manager.owner_ref().unwrap().slab(pointer.slab_id),
 			l2_uri: pointer.l2_uri.clone(),
 			payload_hash: pointer.payload_hash,
 			is_encrypted: pointer.is_encrypted,
@@ -40478,9 +40655,29 @@ async fn b10_apply(f: &mut B10AppendFixture, request: crate::consensus::Wendelon
 		901
 	);
 }
-fn b10_tier(p: &TieredSlabPointer) -> crate::consensus::TieredSlab {
+/// `manager`'s own slab on the ring, with its node's registry naming that
+/// store current, as a committed slab event carries it (ADR 0697).
+fn own_slab(
+	manager: &SlabManager,
+	slab: SlabId,
+) -> (
+	crate::consensus::SlabRef,
+	crate::consensus::IncarnationRegistry,
+) {
+	let owner = manager.owner_ref().unwrap();
+	(
+		owner.slab(slab),
+		crate::consensus::IncarnationRegistry {
+			current: Some(owner.incarnation()),
+			..Default::default()
+		},
+	)
+}
+
+/// The ring pointer naming `manager`'s own `p` (ADR 0697).
+fn b10_tier(manager: &SlabManager, p: &TieredSlabPointer) -> crate::consensus::TieredSlab {
 	crate::consensus::TieredSlab {
-		slab_id: p.slab_id,
+		slab: manager.owner_ref().unwrap().slab(p.slab_id),
 		l2_uri: p.l2_uri.clone(),
 		payload_hash: p.payload_hash,
 		is_encrypted: p.is_encrypted,
@@ -40502,11 +40699,8 @@ async fn b10_retry_uses_later_tier_slab_entry() {
 		f.l2.put("b10/entry901.wnd", &f.l2.get(&next.l2_uri).await.unwrap())
 			.await
 			.unwrap();
-	b10_apply(
-		&mut f,
-		crate::consensus::WendelonRequest::TierSlab(b10_tier(&next)),
-	)
-	.await;
+	let tier = b10_tier(&f.manager, &next);
+	b10_apply(&mut f, crate::consensus::WendelonRequest::TierSlab(tier)).await;
 	assert!(f.manager.lookup(tenant(), id(0xb100)).is_err());
 	b10_drain_append(&mut f).await;
 	b10_ready(&f).await;
@@ -40538,10 +40732,11 @@ async fn b10_retry_uses_later_tier_slab_entry() {
 async fn b10_retry_uses_later_retirement_entry() {
 	let mut f = b10_append_fixture().await;
 	let slab_id = f.pointer.slab_id;
+	let slab = f.manager.owner_ref().unwrap().slab(slab_id);
 	b10_apply(
 		&mut f,
 		crate::consensus::WendelonRequest::RetireTieredSlab(crate::consensus::RetireTieredSlab {
-			slab_id,
+			slab,
 		}),
 	)
 	.await;
@@ -40629,7 +40824,9 @@ async fn b10_newer_snapshot_supersedes_only_the_old_retry_fence() {
 		)
 		.await
 		.unwrap();
-	canonical.seed_tiered_slab_for_test(b10_tier(&next)).await;
+	canonical
+		.seed_tiered_slab_for_test(b10_tier(&f.manager, &next))
+		.await;
 	RaftStateMachine::apply(
 		&mut canonical,
 		[Entry {
@@ -40712,12 +40909,17 @@ async fn b10_owner_close_stops_queued_snapshot_retry_without_late_publication() 
 struct B10UnknownObserver(Arc<SlabManager>);
 #[async_trait::async_trait]
 impl crate::consensus::TierObserver for B10UnknownObserver {
-	fn before_tier_snapshot_install(&self) -> std::io::Result<u64> {
-		self.0.begin_tier_snapshot_install()
+	fn before_tier_snapshot_install(
+		&self,
+		index: Option<u64>,
+		registries: &BTreeMap<u32, crate::consensus::IncarnationRegistry>,
+	) -> std::io::Result<u64> {
+		self.0.begin_tier_snapshot_install_at(index, registries)
 	}
 	async fn on_tier_snapshot_installed(
 		&self,
 		_tiers: &[crate::consensus::TieredSlab],
+		_registries: &std::collections::BTreeMap<u32, crate::consensus::IncarnationRegistry>,
 		_index: Option<u64>,
 		_epoch: u64,
 	) -> std::io::Result<()> {
@@ -40728,6 +40930,7 @@ impl crate::consensus::TierObserver for B10UnknownObserver {
 	async fn on_slab_tiered(
 		&self,
 		_tier: &crate::consensus::TieredSlab,
+		_registry: &crate::consensus::IncarnationRegistry,
 		_index: u64,
 	) -> std::io::Result<()> {
 		Ok(())
@@ -40801,7 +41004,7 @@ async fn b10_publication_lease_excludes_a_later_canonical_writer() {
 	.unwrap()
 	.unwrap();
 	let mut later = f.target.clone();
-	let tier = b10_tier(&next);
+	let tier = b10_tier(&f.manager, &next);
 	let applying = tokio::spawn(async move {
 		RaftStateMachine::apply(
 			&mut later,
@@ -40814,7 +41017,10 @@ async fn b10_publication_lease_excludes_a_later_canonical_writer() {
 	});
 	let queued = tokio::time::timeout(Duration::from_secs(5), async {
 		loop {
-			if f.target.try_tiered_slab(next.slab_id).is_err() {
+			if f.target
+				.try_tiered_slab(f.manager.owner_ref().unwrap().slab(next.slab_id))
+				.is_err()
+			{
 				break;
 			}
 			tokio::task::yield_now().await;
@@ -40866,10 +41072,11 @@ async fn b10_quarantine_before_exact_retirement_clear_survives_reopen() {
 	use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
 	let mut f = b10_append_fixture().await;
 	let slab_id = f.pointer.slab_id;
+	let slab = f.manager.owner_ref().unwrap().slab(slab_id);
 	b10_apply(
 		&mut f,
 		crate::consensus::WendelonRequest::RetireTieredSlab(crate::consensus::RetireTieredSlab {
-			slab_id,
+			slab,
 		}),
 	)
 	.await;
@@ -41078,10 +41285,11 @@ async fn b10_crash_after_retirement_before_append_drains_uses_durable_staging() 
 		saved.tiered_slabs.contains(&f.pointer),
 		"before OpenRaft acceptance, the unverified canonical pointer is durable"
 	);
+	let slab = f.manager.owner_ref().unwrap().slab(slab_id);
 	b10_apply(
 		&mut f,
 		crate::consensus::WendelonRequest::RetireTieredSlab(crate::consensus::RetireTieredSlab {
-			slab_id,
+			slab,
 		}),
 	)
 	.await;
@@ -41189,7 +41397,12 @@ async fn b11_staging_lock_control(maintenance: bool) {
 		.lsm_single_row_bridge_digest_summary(&plan, &prepared, &written, &frames)
 		.await
 		.unwrap();
-	let commit = worker.build_written_compaction_commit(&plan, &written, digest);
+	let commit = worker.build_written_compaction_commit(
+		manager.owner_ref().unwrap(),
+		&plan,
+		&written,
+		digest,
+	);
 	let output_paths = written
 		.iter()
 		.map(|run| slab_path(&manager.config.dir, run.slab_id))
@@ -41542,6 +41755,7 @@ async fn b11b_bad_proof_refuses(kind: u8) {
 		}
 		3 => {
 			bad.commit = CompactionCommit::gc_mark_delete_pending(
+				bad.commit.owner,
 				bad.commit.job_id,
 				bad.commit.manifest_epoch_pre,
 				vec![bad.inputs[0].slab_id],
@@ -41761,7 +41975,12 @@ async fn local_lsm_error_after_input_run_materialization_leaves_no_orphan_fence(
 		.lsm_single_row_bridge_digest_summary(&plan, &prepared, &written, &frames)
 		.await
 		.unwrap();
-	let commit = worker.build_written_compaction_commit(&plan, &written, digest);
+	let commit = worker.build_written_compaction_commit(
+		manager.owner_ref().unwrap(),
+		&plan,
+		&written,
+		digest,
+	);
 	// An I/O error while hashing the output evidence, after materialization.
 	std::fs::remove_file(&written[0].temp_path).unwrap();
 	let error = manager
@@ -41841,7 +42060,12 @@ async fn control_lsm_preflight_refusal_precedes_durable_intent_and_hold() {
 		.lsm_single_row_bridge_digest_summary(&plan, &prepared, &written, &frames)
 		.await
 		.unwrap();
-	let commit = worker.build_written_compaction_commit(&plan, &written, digest);
+	let commit = worker.build_written_compaction_commit(
+		manager.owner_ref().unwrap(),
+		&plan,
+		&written,
+		digest,
+	);
 	// Preflight-refusable: a sidecar-covered input without catalog context.
 	// The manifest epoch is unchanged.
 	{
@@ -42982,7 +43206,7 @@ async fn the_recovery_verifier_walks_a_moved_replacement_with_its_own_layout() {
 		let mut source = WendelonStateMachine::new();
 		source
 			.seed_tiered_slab_for_test(TieredSlab {
-				slab_id: replacement.slab_id,
+				slab: mgr.owner_ref().unwrap().slab(replacement.slab_id),
 				l2_uri: replacement.l2_uri.clone(),
 				payload_hash: replacement.payload_hash,
 				is_encrypted: replacement.is_encrypted,
@@ -43202,7 +43426,7 @@ async fn staged_plaintext_that_only_shares_a_prefix_with_the_published_object_re
 	let mut source = WendelonStateMachine::new();
 	source
 		.seed_tiered_slab_for_test(TieredSlab {
-			slab_id: staged.slab_id,
+			slab: mgr.owner_ref().unwrap().slab(staged.slab_id),
 			l2_uri: staged.l2_uri.clone(),
 			payload_hash: staged.payload_hash,
 			is_encrypted: staged.is_encrypted,
@@ -44150,12 +44374,15 @@ async fn worker_replay_fixture_over(
 	let old = tier_kv_slab(&manager, &l2, &format!("{tag}/p0")).await;
 	let target = WendelonStateMachine::new()
 		.with_tier_observer(Arc::new(ManagerTierObserver::new(manager.clone())));
-	target.seed_tiered_slab_for_test(b10_tier(&old)).await;
+	target
+		.seed_tiered_slab_for_test(b10_tier(&manager, &old))
+		.await;
 	(dirs, manager, l2, target, old, key)
 }
 
 async fn commit_tier_entry(
 	target: &mut crate::consensus::WendelonStateMachine,
+	manager: &SlabManager,
 	pointer: &TieredSlabPointer,
 	index: u64,
 ) {
@@ -44166,7 +44393,7 @@ async fn commit_tier_entry(
 		[Entry {
 			log_id: LogId::new(CommittedLeaderId::new(3, 1), index),
 			payload: EntryPayload::Normal(crate::consensus::WendelonRequest::TierSlab(b10_tier(
-				pointer,
+				manager, pointer,
 			))),
 		}],
 	)
@@ -44243,7 +44470,7 @@ async fn recording_a_replayable_fence_wakes_the_parked_authority_worker() {
 		.insert(other, structural.clone());
 
 	let gate = manager.hold_index_write_gate_for_test().await;
-	commit_tier_entry(&mut target, &replacement, 900).await;
+	commit_tier_entry(&mut target, &manager, &replacement, 900).await;
 	assert_eq!(
 		manager
 			.unapplied_tier_pointers
@@ -44299,7 +44526,7 @@ async fn a_replay_that_re_fences_on_the_budget_is_woken_by_a_release() {
 	*manager.replay_probe.backoff.lock().unwrap() = Some(Duration::from_secs(3600));
 	manager.wait_tier_authority_ready().await.unwrap();
 	let gate = manager.hold_index_write_gate_for_test().await;
-	commit_tier_entry(&mut target, &replacement, 901).await;
+	commit_tier_entry(&mut target, &manager, &replacement, 901).await;
 	// The woken worker's replay now waits on the gate. Exhaust the budget
 	// before freeing it, so the replay re-fences on plan scratch.
 	let room = manager.tier_budget.limit() - manager.tier_budget.used();
@@ -44360,7 +44587,7 @@ async fn a_release_before_the_worker_waits_still_wakes_the_replay() {
 	let entered = Arc::new(tokio::sync::Semaphore::new(0));
 	let release = Arc::new(tokio::sync::Semaphore::new(0));
 	*manager.replay_probe.before_wait.lock().unwrap() = Some((entered.clone(), release.clone()));
-	commit_tier_entry(&mut target, &replacement, 902).await;
+	commit_tier_entry(&mut target, &manager, &replacement, 902).await;
 	let outcome = manager
 		.unapplied_tier_pointers
 		.get(&old.slab_id)
@@ -44421,7 +44648,7 @@ async fn a_release_during_a_failed_attempt_still_wakes_its_replay() {
 	let entered = Arc::new(tokio::sync::Semaphore::new(0));
 	let release = Arc::new(tokio::sync::Semaphore::new(0));
 	*manager.replay_probe.after_outcome.lock().unwrap() = Some((entered.clone(), release.clone()));
-	commit_tier_entry(&mut target, &replacement, 903).await;
+	commit_tier_entry(&mut target, &manager, &replacement, 903).await;
 	tokio::time::timeout(Duration::from_secs(60), entered.acquire())
 		.await
 		.unwrap_or_else(|_| {
@@ -44463,7 +44690,9 @@ async fn a_successful_replay_freeing_held_capacity_wakes_another_budget_fenced_r
 		.await
 		.unwrap();
 	let b_old = tier_kv_slab(&manager, &l2, "s7-worker-pair/b0").await;
-	target.seed_tiered_slab_for_test(b10_tier(&b_old)).await;
+	target
+		.seed_tiered_slab_for_test(b10_tier(&manager, &b_old))
+		.await;
 	let replacement = |old: &TieredSlabPointer, name: &'static str| {
 		let l2 = l2.clone();
 		let old = old.clone();
@@ -44486,7 +44715,7 @@ async fn a_successful_replay_freeing_held_capacity_wakes_another_budget_fenced_r
 		.unwrap();
 
 	// B is fenced on the budget and scheduled an hour out.
-	commit_tier_entry(&mut target, &b_new, 910).await;
+	commit_tier_entry(&mut target, &manager, &b_new, 910).await;
 	assert!(
 		matches!(
 			manager
@@ -44505,7 +44734,7 @@ async fn a_successful_replay_freeing_held_capacity_wakes_another_budget_fenced_r
 	// A's next attempt frees the held capacity, as consuming its token does.
 	*manager.replay_probe.free_during_attempt.lock().unwrap() = Some((a_old.slab_id, held));
 	let gate = manager.hold_index_write_gate_for_test().await;
-	commit_tier_entry(&mut target, &a_new, 911).await;
+	commit_tier_entry(&mut target, &manager, &a_new, 911).await;
 	drop(gate);
 	assert!(
 		eventually(30, async || manager
@@ -45109,7 +45338,7 @@ async fn an_l2_outage_fences_the_committed_publication_until_l2_recovers() {
 	manager.wait_tier_authority_ready().await.unwrap();
 	let fenced = fenced_counter("l2_unavailable");
 	down.store(true, std::sync::atomic::Ordering::Release);
-	commit_tier_entry(&mut target, &replacement, 920).await;
+	commit_tier_entry(&mut target, &manager, &replacement, 920).await;
 	assert_eq!(
 		manager
 			.unapplied_tier_pointers
@@ -45463,6 +45692,7 @@ fn a_block_reset_keeps_its_starting_headroom_through_a_refund() {
 /// `observer` applies through `manager`'s tier observer.
 struct ControlCluster {
 	nodes: Vec<crate::consensus::WendelonRaft>,
+	state_machines: Vec<crate::consensus::WendelonStateMachine>,
 	_network: b1t_network::Network,
 	_logs: Vec<crate::consensus::WendelonLogStore>,
 	_dirs: Vec<crate::test_support::TestDir>,
@@ -45478,6 +45708,7 @@ async fn control_cluster(observer: u32, manager: &Arc<SlabManager>) -> ControlCl
 			.unwrap(),
 	);
 	let (mut logs, mut dirs, mut nodes) = (Vec::new(), Vec::new(), Vec::new());
+	let mut state_machines = Vec::new();
 	for node_id in 1_u32..=3 {
 		let dir = fresh_dir("s7-control-cluster-wal");
 		let log = WendelonLogStore::open_for_retention_test(&dir, 64 * 4096, None)
@@ -45485,10 +45716,13 @@ async fn control_cluster(observer: u32, manager: &Arc<SlabManager>) -> ControlCl
 			.unwrap();
 		let mut sm = log.recovered_state_machine().await.unwrap();
 		if node_id == observer {
+			// ADR 0697: the observing store serves this node.
+			manager.bind_control_node(node_id).unwrap();
 			sm = sm.with_tier_observer(Arc::new(crate::storage::ManagerTierObserver::new(
 				manager.clone(),
 			)));
 		}
+		state_machines.push(sm.clone());
 		let raft = WendelonRaft::new(node_id, config.clone(), network.clone(), log.clone(), sm)
 			.await
 			.unwrap();
@@ -45516,22 +45750,55 @@ async fn control_cluster(observer: u32, manager: &Arc<SlabManager>) -> ControlCl
 	}
 	ControlCluster {
 		nodes,
+		state_machines,
 		_network: network,
 		_logs: logs,
 		_dirs: dirs,
 	}
 }
 
+/// Registers `manager`'s incarnation through `raft`, which must be the
+/// owner's node and lead, as its committer does before its first slab
+/// proposal (ADR 0697); an exact replay is a receipt.
+async fn register_owner(raft: &crate::consensus::WendelonRaft, manager: &SlabManager) {
+	let owner = manager.owner_ref().unwrap();
+	let registered = raft
+		.client_write(crate::consensus::WendelonRequest::RegisterIncarnation(
+			crate::consensus::RegisterIncarnation {
+				node: owner.node(),
+				incarnation: owner.incarnation(),
+				supersedes: None,
+			},
+		))
+		.await
+		.unwrap();
+	assert_eq!(registered.data, crate::consensus::WendelonResponse::Success);
+}
+
 impl ControlCluster {
-	/// Commit `pointer` through the current leader `leader` (1-based) and
-	/// wait until every voter applied it.
-	async fn commit_tier(&self, leader: u32, pointer: &TieredSlabPointer) -> u64 {
-		let committed = self.nodes[leader as usize - 1]
+	/// Commit `manager`'s own `pointer` and wait until every voter applied
+	/// it. ADR 0697: only the owner's node, as leader, appends its slab
+	/// commands, so when `leader` is another node the owner is elected first;
+	/// the owner registers its incarnation (an exact replay is a receipt).
+	async fn commit_tier(
+		&self,
+		leader: u32,
+		manager: &SlabManager,
+		pointer: &TieredSlabPointer,
+	) -> u64 {
+		let owner = manager.owner_ref().unwrap();
+		if owner.node() != leader {
+			self.elect(owner.node()).await;
+		}
+		let raft = &self.nodes[owner.node() as usize - 1];
+		register_owner(raft, manager).await;
+		let committed = raft
 			.client_write(crate::consensus::WendelonRequest::TierSlab(b10_tier(
-				pointer,
+				manager, pointer,
 			)))
 			.await
 			.unwrap();
+		assert_eq!(committed.data, crate::consensus::WendelonResponse::Success);
 		for node in &self.nodes {
 			node.wait(Some(Duration::from_secs(60)))
 				.applied_index_at_least(Some(committed.log_id.index), "every voter applied")
@@ -45543,23 +45810,27 @@ impl ControlCluster {
 
 	/// Make `node` (1-based) the leader through a real election.
 	async fn elect(&self, node: u32) {
-		let target = &self.nodes[node as usize - 1];
-		tokio::time::timeout(Duration::from_secs(60), async {
-			loop {
-				if self
-					.nodes
-					.iter()
-					.all(|raft| raft.metrics().borrow().current_leader == Some(node))
-				{
-					break;
-				}
-				let _ = target.trigger().elect().await;
-				tokio::time::sleep(Duration::from_millis(200)).await;
-			}
-		})
-		.await
-		.expect("the node wins a real election");
+		elect_among(&self.nodes, node).await;
 	}
+}
+
+/// Make `node` (1-based) the leader of `nodes` through a real election.
+async fn elect_among(nodes: &[crate::consensus::WendelonRaft], node: u32) {
+	let target = &nodes[node as usize - 1];
+	tokio::time::timeout(Duration::from_secs(60), async {
+		loop {
+			if nodes
+				.iter()
+				.all(|raft| raft.metrics().borrow().current_leader == Some(node))
+			{
+				break;
+			}
+			let _ = target.trigger().elect().await;
+			tokio::time::sleep(Duration::from_millis(200)).await;
+		}
+	})
+	.await
+	.expect("the node wins a real election");
 }
 
 /// Multinode: a follower funds its own apply. The leader commits the pointer;
@@ -45573,7 +45844,7 @@ async fn a_followers_apply_funds_itself_fences_on_its_budget_and_publishes_on_re
 	use super::tier_deferral::DeferralOutcome;
 	let (_dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
 	let cluster = control_cluster(2, &mgr).await;
-	cluster.commit_tier(1, &old).await;
+	cluster.commit_tier(1, &mgr, &old).await;
 	assert_eq!(mgr.tier_pointer(old.slab_id).await, Some(old.clone()));
 	let bytes = l2.get(&old.l2_uri).await.unwrap();
 	let replacement = TieredSlabPointer {
@@ -45586,7 +45857,7 @@ async fn a_followers_apply_funds_itself_fences_on_its_budget_and_publishes_on_re
 		.tier_budget
 		.try_reserve(TierBudgetKind::Scratch, room)
 		.unwrap();
-	let index = cluster.commit_tier(1, &replacement).await;
+	let index = cluster.commit_tier(1, &mgr, &replacement).await;
 	let deferral = mgr
 		.unapplied_tier_pointers
 		.get(&old.slab_id)
@@ -45621,13 +45892,13 @@ async fn a_delayed_apply_after_its_proposers_token_was_released_funds_itself() {
 	use crate::storage::TierCommitter;
 	let (_dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
 	let cluster = control_cluster(1, &mgr).await;
-	cluster.commit_tier(1, &old).await;
+	cluster.commit_tier(1, &mgr, &old).await;
 	let bytes = l2.get(&old.l2_uri).await.unwrap();
 	let p1 = TieredSlabPointer {
 		l2_uri: l2.put("tier/s7-released-token.wnd", &bytes).await.unwrap(),
 		..old.clone()
 	};
-	let proposal = mgr.reserve_tier_history(b10_tier(&p1)).await.unwrap();
+	let proposal = mgr.reserve_tier_history(b10_tier(&mgr, &p1)).await.unwrap();
 	let (slots, bytes_held) = mgr.tier_tokens.held();
 	assert_eq!(slots, 1, "premise: a real proposer token is reserved");
 	assert!(bytes_held > 0);
@@ -45676,7 +45947,7 @@ async fn a_delayed_apply_after_its_proposers_token_was_released_funds_itself() {
 async fn across_a_leader_change_an_older_replay_never_publishes_over_newer_authority() {
 	let (_dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
 	let cluster = control_cluster(2, &mgr).await;
-	cluster.commit_tier(1, &old).await;
+	cluster.commit_tier(1, &mgr, &old).await;
 	let bytes = l2.get(&old.l2_uri).await.unwrap();
 	let p1 = TieredSlabPointer {
 		l2_uri: l2.put("tier/s7-leader-p1.wnd", &bytes).await.unwrap(),
@@ -45700,7 +45971,7 @@ async fn across_a_leader_change_an_older_replay_never_publishes_over_newer_autho
 	*mgr.replay_probe.before_replay_apply.lock().unwrap() =
 		Some((entered.clone(), release.clone()));
 	let gate = mgr.hold_index_write_gate_for_test().await;
-	let p1_index = cluster.commit_tier(1, &p1).await;
+	let p1_index = cluster.commit_tier(1, &mgr, &p1).await;
 	assert!(
 		mgr.unapplied_tier_pointers
 			.get(&old.slab_id)
@@ -45715,14 +45986,20 @@ async fn across_a_leader_change_an_older_replay_never_publishes_over_newer_autho
 		.expect("node 2's replay of P1 passed its canonical check and holds")
 		.unwrap()
 		.forget();
+	// The leader changes, then node 2 (the owner, ADR 0697: only it appends
+	// its slab commands) leads again in a newer term and commits P2.
 	cluster.elect(3).await;
+	cluster.elect(2).await;
 	let commit = {
-		let node = cluster.nodes[2].clone();
-		let p2 = p2.clone();
+		let node = cluster.nodes[1].clone();
+		let tier = b10_tier(&mgr, &p2);
 		tokio::spawn(async move {
-			node.client_write(crate::consensus::WendelonRequest::TierSlab(b10_tier(&p2)))
+			node.client_write(crate::consensus::WendelonRequest::TierSlab(tier))
 				.await
-				.map(|response| response.log_id.index)
+				.map(|response| {
+					assert_eq!(response.data, crate::consensus::WendelonResponse::Success);
+					response.log_id.index
+				})
 		})
 	};
 	assert!(
@@ -45841,14 +46118,23 @@ async fn a_node_restarted_while_fenced_converges_to_its_committed_pointer() {
 		..old.clone()
 	};
 	let (raft, log, _network) = single_voter(&wal_dir, &mgr, true).await;
-	raft.client_write(crate::consensus::WendelonRequest::TierSlab(b10_tier(&old)))
+	register_owner(&raft, &mgr).await;
+	let committed = raft
+		.client_write(crate::consensus::WendelonRequest::TierSlab(b10_tier(
+			&mgr, &old,
+		)))
 		.await
 		.unwrap();
+	assert_eq!(committed.data, crate::consensus::WendelonResponse::Success);
 	assert_eq!(mgr.tier_pointer(old.slab_id).await, Some(old.clone()));
 	let gate = mgr.hold_index_write_gate_for_test().await;
-	raft.client_write(crate::consensus::WendelonRequest::TierSlab(b10_tier(&p1)))
+	let committed = raft
+		.client_write(crate::consensus::WendelonRequest::TierSlab(b10_tier(
+			&mgr, &p1,
+		)))
 		.await
 		.unwrap();
+	assert_eq!(committed.data, crate::consensus::WendelonResponse::Success);
 	assert!(
 		mgr.unapplied_tier_pointers
 			.get(&old.slab_id)
@@ -45879,8 +46165,8 @@ async fn a_node_restarted_while_fenced_converges_to_its_committed_pointer() {
 	let recovered_index = recovered.last_applied_log_id.map(|id| id.index);
 	let committed_x = recovered
 		.tiered_slabs
-		.get(&old.slab_id)
-		.map(tiered_slab_pointer_for_test);
+		.get(&reopened.owner_ref().unwrap().slab(old.slab_id))
+		.map(TieredSlabPointer::from_ring);
 	assert_eq!(
 		committed_x,
 		Some(p1.clone()),
@@ -45898,21 +46184,20 @@ async fn a_node_restarted_while_fenced_converges_to_its_committed_pointer() {
 	if let Some(index) = recovered_index {
 		reopened.seed_installed_snapshot_index(index);
 	}
-	let committed_ids = recovered.tiered_slabs.keys().copied().collect();
+	// ADR 0697: as node bootstrap does, only this store's own pointers.
+	let mut tiers = reopened
+		.own_tier_view(recovered.tiered_slabs.values(), &recovered.incarnations)
+		.expect("the view is authoritative for this store");
+	let committed_ids = tiers.iter().map(|tier| tier.slab_id).collect();
 	reopened
 		.fence_local_tiers_absent_from_committed(&committed_ids, recovered_index)
 		.await
 		.unwrap();
-	let mut tiers = recovered.tiered_slabs.values().cloned().collect::<Vec<_>>();
 	tiers.sort_by_key(|tier| tier.slab_id);
 	let floor = tiers.last().map_or(SlabId::ZERO, |tier| tier.slab_id);
 	for tier in &tiers {
 		reopened
-			.stage_bootstrap_tier_authority(
-				tiered_slab_pointer_for_test(tier),
-				recovered_index,
-				floor,
-			)
+			.stage_bootstrap_tier_authority(tier.clone(), recovered_index, floor)
 			.await
 			.unwrap();
 	}
@@ -45947,10 +46232,6 @@ async fn a_node_restarted_while_fenced_converges_to_its_committed_pointer() {
 	let location = reopened.lookup(tenant(), key).unwrap().unwrap();
 	assert_eq!(reopened.read(location).await.unwrap(), b"restart-row");
 	raft.shutdown().await.unwrap();
-}
-
-fn tiered_slab_pointer_for_test(tier: &crate::consensus::TieredSlab) -> TieredSlabPointer {
-	super::tier_tokens::tiered_slab_pointer(tier)
 }
 
 /// DC-160a RED: slab ids issued before a clean reopen must never be issued
@@ -46027,7 +46308,7 @@ async fn dc160_tiering_one_data_nodes_slab_leaves_anothers_same_id_slab_untouche
 		supersession_metadata: SupersessionMetadata::None,
 	};
 	let cluster = control_cluster_observing(&[(1, &a), (2, &b)]).await;
-	cluster.commit_tier(1, &pointer).await;
+	cluster.commit_tier(1, &a, &pointer).await;
 	assert!(
 		eventually(30, async || a.tier_pointer(slab_a).await.as_ref()
 			== Some(&pointer))
@@ -46045,9 +46326,19 @@ async fn dc160_tiering_one_data_nodes_slab_leaves_anothers_same_id_slab_untouche
 		.expect("node B's index is not fenced")
 		.expect("node B still indexes its own row");
 	assert_eq!(location.slab_id, slab_b);
-	b.read(location)
-		.await
-		.expect("node B still serves its own row");
+	assert_eq!(
+		b.read(location)
+			.await
+			.expect("node B still serves its own row"),
+		b"node-b-row",
+		"node B serves exactly its own bytes"
+	);
+	// A's row stays A's, through A's own (tiered) pointer.
+	let location_a = a
+		.lookup(tenant(), key_a)
+		.expect("node A's index is not fenced")
+		.expect("node A still indexes its own row");
+	assert_eq!(a.read(location_a).await.unwrap(), b"node-a-row");
 }
 
 /// [`control_cluster`] with a manager observer on each listed voter.
@@ -46061,6 +46352,7 @@ async fn control_cluster_observing(observers: &[(u32, &Arc<SlabManager>)]) -> Co
 			.unwrap(),
 	);
 	let (mut logs, mut dirs, mut nodes) = (Vec::new(), Vec::new(), Vec::new());
+	let mut state_machines = Vec::new();
 	for node_id in 1_u32..=3 {
 		let dir = fresh_dir("dc160-control-cluster-wal");
 		let log = WendelonLogStore::open_for_retention_test(&dir, 64 * 4096, None)
@@ -46068,10 +46360,13 @@ async fn control_cluster_observing(observers: &[(u32, &Arc<SlabManager>)]) -> Co
 			.unwrap();
 		let mut sm = log.recovered_state_machine().await.unwrap();
 		if let Some((_, manager)) = observers.iter().find(|(id, _)| *id == node_id) {
+			// ADR 0697: the observing store serves this node.
+			manager.bind_control_node(node_id).unwrap();
 			sm = sm.with_tier_observer(Arc::new(crate::storage::ManagerTierObserver::new(
 				(*manager).clone(),
 			)));
 		}
+		state_machines.push(sm.clone());
 		let raft = WendelonRaft::new(node_id, config.clone(), network.clone(), log.clone(), sm)
 			.await
 			.unwrap();
@@ -46099,6 +46394,7 @@ async fn control_cluster_observing(observers: &[(u32, &Arc<SlabManager>)]) -> Co
 	}
 	ControlCluster {
 		nodes,
+		state_machines,
 		_network: network,
 		_logs: logs,
 		_dirs: dirs,
@@ -46115,8 +46411,13 @@ async fn dc161_gc_after_leadership_loss_leaves_no_unresolvable_intent() {
 	let (_dir, manager) = fresh_manager().await;
 	let (slab_id, _key) = seed_small_retired_gc_slab(&manager).await;
 	let cluster = control_cluster_observing(&[(1, &manager)]).await;
+	// Node 1 registered while it led, so the sweep passes the registration
+	// check and its compaction client_write itself is what the lost
+	// leadership refuses.
+	register_owner(&cluster.nodes[0], &manager).await;
 	cluster.elect(2).await;
-	let committer = crate::storage::RaftCommitter::new(cluster.nodes[0].clone());
+	let committer = crate::storage::RaftCommitter::new(cluster.nodes[0].clone())
+		.with_state_machine(cluster.state_machines[0].clone());
 	let gc = LsmGcWorker::new(LsmConfig::default(), manager.slab_pin_table()).unwrap();
 	let outcome = manager
 		.sweep_lsm_delete_pending_once_via_control_ring(&gc, &committer)
@@ -46411,4 +46712,826 @@ async fn evidence_at_the_maximum_slab_id_is_refused() {
 		.err()
 		.expect("evidence at u64::MAX must refuse");
 	assert!(error.to_string().contains("exhausted"), "{error}");
+}
+
+/// ADR 0697 slice 2 RED: a CompactionCommit from one data node names its own
+/// slab id. Both nodes hold an unrelated retired run with the same bare id at
+/// the same manifest epoch (so the commit is applicable on both); node A's GC
+/// of its run must not change node B's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cross_owner_gc_commit_leaves_another_nodes_same_id_run_untouched() {
+	let (_dir_a, a) = fresh_manager().await;
+	let (_dir_b, b) = fresh_manager().await;
+	let (slab_a, _key_a) = seed_small_retired_gc_slab(&a).await;
+	let (slab_b, _key_b) = seed_small_retired_gc_slab(&b).await;
+	assert_eq!(slab_a, slab_b, "premise: equal bare slab ids");
+	assert_eq!(
+		a.compaction_manifest_snapshot().manifest_epoch,
+		b.compaction_manifest_snapshot().manifest_epoch,
+		"premise: equal manifest epochs, so A's commit is applicable on B"
+	);
+	let run_b_before = b.compaction_manifest_snapshot().run(slab_b).cloned();
+	assert!(
+		run_b_before.is_some(),
+		"premise: B's slab is a manifest run"
+	);
+
+	let cluster = control_cluster_observing(&[(1, &a), (2, &b)]).await;
+	let committer = crate::storage::RaftCommitter::new(cluster.nodes[0].clone());
+	let gc = LsmGcWorker::new(LsmConfig::default(), a.slab_pin_table()).unwrap();
+	let outcome = a
+		.sweep_lsm_delete_pending_once_via_control_ring(&gc, &committer)
+		.await;
+	let leader_applied = cluster.nodes[0]
+		.metrics()
+		.borrow()
+		.last_applied
+		.map(|log_id| log_id.index);
+	cluster.nodes[1]
+		.wait(Some(Duration::from_secs(60)))
+		.applied_index_at_least(leader_applied, "node B applied A's GC")
+		.await
+		.unwrap();
+	assert_ne!(
+		a.compaction_manifest_snapshot().run(slab_a).cloned(),
+		run_b_before,
+		"premise: A's GC committed for its own run (sweep: {outcome:?})"
+	);
+
+	assert_eq!(
+		b.compaction_manifest_snapshot().run(slab_b).cloned(),
+		run_b_before,
+		"node B's unrelated run {slab_b:?} was changed by node A's GC commit"
+	);
+}
+
+fn owner_test_tier(
+	owner: crate::consensus::OwnerRef,
+	slab: SlabId,
+) -> crate::consensus::TieredSlab {
+	crate::consensus::TieredSlab {
+		slab: owner.slab(slab),
+		l2_uri: "memory://tier/classification".into(),
+		payload_hash: [0x5A; 32],
+		is_encrypted: false,
+		tenant_id: None,
+		tenant_kek_id: None,
+		stats_format_version: None,
+		stats_block_len: None,
+		stats_block_hash128: None,
+		tombstone_metadata: TombstoneMetadata::None,
+		supersession_metadata: SupersessionMetadata::None,
+	}
+}
+
+fn owner_test_registry(
+	current: crate::consensus::StoreIncarnation,
+	retired: &[crate::consensus::StoreIncarnation],
+) -> crate::consensus::IncarnationRegistry {
+	crate::consensus::IncarnationRegistry {
+		current: Some(current),
+		retired: retired.iter().copied().collect(),
+		..Default::default()
+	}
+}
+
+fn owner_test_fence(manager: &SlabManager) -> Option<String> {
+	manager
+		.tier_authority_readiness_reason()
+		.filter(|reason| reason.contains("Owner") || reason.contains("OwnIdentity"))
+		.map(|reason| reason.to_string())
+}
+
+/// ADR 0697: evidence older than this store's newest authority never mints the
+/// permanent owner fence. A store whose installed snapshot at 20 names it
+/// current ignores delayed deliveries at or below 20 from when an earlier
+/// incarnation was current, and does not stop serving. The same evidence newer
+/// than the snapshot still fences, so the check is not a blanket pass.
+#[tokio::test]
+async fn an_obsolete_owner_delivery_never_fences_the_current_store() {
+	use crate::consensus::{StoreIncarnation, TierObserver};
+	let (tier, registry, owner_fence) = (owner_test_tier, owner_test_registry, owner_test_fence);
+	let earlier = StoreIncarnation::from_raw(0x99);
+
+	let (_dir, mgr) = fresh_manager().await;
+	mgr.bind_control_node(1).unwrap();
+	let own = mgr.owner_ref().unwrap();
+	let old_owner = crate::consensus::OwnerRef::for_test(1, 0x99);
+	let observer = crate::storage::sweeper::ManagerTierObserver::new(mgr.clone());
+	let epoch = observer
+		.before_tier_snapshot_install(
+			Some(20),
+			&BTreeMap::from([(1, registry(own.incarnation(), &[earlier]))]),
+		)
+		.unwrap();
+	observer
+		.on_tier_snapshot_installed(
+			&[],
+			&BTreeMap::from([(1, registry(own.incarnation(), &[earlier]))]),
+			Some(20),
+			epoch,
+		)
+		.await
+		.unwrap();
+	assert!(
+		mgr.observer_is_superseded(Some(20)),
+		"premise: the snapshot at 20 is installed"
+	);
+	assert_eq!(owner_fence(&mgr), None);
+
+	let stale = registry(earlier, &[]);
+	observer
+		.on_incarnation_registry(1, &stale, 10)
+		.await
+		.unwrap();
+	assert_eq!(owner_fence(&mgr), None, "a delayed registry event fenced");
+	observer
+		.on_slab_tiered(&tier(old_owner, SlabId::ZERO), &stale, 11)
+		.await
+		.unwrap();
+	assert_eq!(owner_fence(&mgr), None, "a delayed tier event fenced");
+	observer.before_slab_retired(old_owner.slab(SlabId::ZERO), &stale, 12);
+	assert_eq!(owner_fence(&mgr), None, "a delayed retire pre-hook fenced");
+	observer
+		.on_slab_retired(old_owner.slab(SlabId::ZERO), &stale, 13)
+		.await
+		.unwrap();
+	assert_eq!(owner_fence(&mgr), None, "a delayed retire event fenced");
+	observer
+		.on_lsm_compaction_committed(
+			&CompactionCommit::gc_mark_delete_pending(
+				old_owner,
+				CompactionJobId::new(0x0697),
+				ManifestEpoch::new(0),
+				vec![SlabId::ZERO],
+			),
+			&stale,
+			20,
+		)
+		.await
+		.unwrap();
+	assert_eq!(owner_fence(&mgr), None, "a delayed compaction event fenced");
+	assert_eq!(mgr.tier_pointer(SlabId::ZERO).await, None);
+	mgr.append_durable(tenant(), id(0x0697), hlc(1), b"still current")
+		.await
+		.expect("the current store keeps serving");
+
+	// The same evidence, newer than the snapshot, is not obsolete.
+	observer
+		.on_incarnation_registry(1, &stale, 21)
+		.await
+		.unwrap();
+	assert_eq!(owner_fence(&mgr).as_deref(), Some("UnexplainedOwnIdentity"));
+
+	// A delivery at or below the index an in-flight install read is covered by
+	// that install's registry: it mints nothing.
+	let (_dir, mgr) = fresh_manager().await;
+	mgr.bind_control_node(1).unwrap();
+	let own = mgr.owner_ref().unwrap();
+	let observer = crate::storage::sweeper::ManagerTierObserver::new(mgr.clone());
+	let epoch = observer
+		.before_tier_snapshot_install(
+			Some(20),
+			&BTreeMap::from([(1, registry(own.incarnation(), &[earlier]))]),
+		)
+		.unwrap();
+	observer
+		.on_incarnation_registry(1, &stale, 10)
+		.await
+		.unwrap();
+	assert_eq!(owner_fence(&mgr), None, "fenced during the install");
+	observer
+		.on_tier_snapshot_installed(
+			&[],
+			&BTreeMap::from([(1, registry(own.incarnation(), &[earlier]))]),
+			Some(20),
+			epoch,
+		)
+		.await
+		.unwrap();
+	assert_eq!(owner_fence(&mgr), None);
+}
+
+/// ADR 0697: a snapshot callback a newer comparison has superseded mints no
+/// owner fence, and is refused as obsolete as it always was. The current
+/// epoch's same registry does fence. A store genuinely superseded by its
+/// snapshot stays fenced when a delivery that was Own before that arrives.
+#[tokio::test]
+async fn an_obsolete_snapshot_callback_never_fences_and_a_superseded_store_stays_fenced() {
+	use crate::consensus::{StoreIncarnation, TierObserver};
+	let (tier, registry, owner_fence) = (owner_test_tier, owner_test_registry, owner_test_fence);
+	let other = StoreIncarnation::from_raw(0x99);
+
+	let (_dir, mgr) = fresh_manager().await;
+	mgr.bind_control_node(1).unwrap();
+	let own = mgr.owner_ref().unwrap();
+	let observer = crate::storage::sweeper::ManagerTierObserver::new(mgr.clone());
+	let older = observer
+		.before_tier_snapshot_install(Some(10), &BTreeMap::new())
+		.unwrap();
+	let newer = observer
+		.before_tier_snapshot_install(
+			Some(20),
+			&BTreeMap::from([(1, registry(own.incarnation(), &[other]))]),
+		)
+		.unwrap();
+	let stale = BTreeMap::from([(1, registry(other, &[]))]);
+	assert!(
+		observer
+			.on_tier_snapshot_installed(&[], &stale, Some(10), older)
+			.await
+			.is_err(),
+		"the superseded epoch is refused as obsolete"
+	);
+	assert_eq!(owner_fence(&mgr), None, "an obsolete snapshot fenced");
+	observer
+		.on_tier_snapshot_installed(
+			&[],
+			&BTreeMap::from([(1, registry(own.incarnation(), &[other]))]),
+			Some(20),
+			newer,
+		)
+		.await
+		.unwrap();
+	assert_eq!(owner_fence(&mgr), None);
+
+	// The current epoch's registry that does not explain this store fences.
+	let (_dir, mgr) = fresh_manager().await;
+	mgr.bind_control_node(1).unwrap();
+	let observer = crate::storage::sweeper::ManagerTierObserver::new(mgr.clone());
+	let epoch = observer
+		.before_tier_snapshot_install(Some(20), &stale)
+		.unwrap();
+	observer
+		.on_tier_snapshot_installed(&[], &stale, Some(20), epoch)
+		.await
+		.unwrap();
+	assert_eq!(owner_fence(&mgr).as_deref(), Some("UnexplainedOwnIdentity"));
+
+	// Superseded by its snapshot: the fence survives a delayed formerly-Own event.
+	let (_dir, mgr) = fresh_manager().await;
+	mgr.bind_control_node(1).unwrap();
+	let own = mgr.owner_ref().unwrap();
+	let observer = crate::storage::sweeper::ManagerTierObserver::new(mgr.clone());
+	let epoch = observer
+		.before_tier_snapshot_install(
+			Some(20),
+			&BTreeMap::from([(1, registry(other, &[own.incarnation()]))]),
+		)
+		.unwrap();
+	observer
+		.on_tier_snapshot_installed(
+			&[],
+			&BTreeMap::from([(1, registry(other, &[own.incarnation()]))]),
+			Some(20),
+			epoch,
+		)
+		.await
+		.unwrap();
+	assert_eq!(
+		owner_fence(&mgr).as_deref(),
+		Some("OwnerAuthoritySuperseded")
+	);
+	observer
+		.on_slab_tiered(
+			&tier(own, SlabId::ZERO),
+			&registry(own.incarnation(), &[]),
+			10,
+		)
+		.await
+		.unwrap();
+	assert_eq!(mgr.tier_pointer(SlabId::ZERO).await, None);
+	assert_eq!(
+		owner_fence(&mgr).as_deref(),
+		Some("OwnerAuthoritySuperseded")
+	);
+}
+
+/// ADR 0697: a comparison covers only the view it read. A genuine supersession
+/// newer than that view, arriving while the comparison waits, fences at once,
+/// and the comparison completing cannot return authority to the old store. This
+/// is the real replacement path; the snapshot path follows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_supersession_newer_than_an_in_flight_comparison_is_not_forgotten() {
+	use crate::consensus::{StoreIncarnation, TierObserver};
+	let (registry, owner_fence) = (owner_test_registry, owner_test_fence);
+	let successor = StoreIncarnation::from_raw(0x55);
+
+	let dir = fresh_dir("owner-comparison-replacement");
+	std::fs::write(dir.join(AWAITING_CLUSTER_MARKER), b"awaiting-cluster-v1\n").unwrap();
+	let mgr = SlabManager::initialize_new_store(gc_owned_test_config(&dir))
+		.await
+		.unwrap();
+	assert!(mgr.is_awaiting_cluster(), "premise: a replacement store");
+	mgr.bind_control_node(1).unwrap();
+	let own = mgr.owner_ref().unwrap();
+	let observer = crate::storage::sweeper::ManagerTierObserver::new(mgr.clone());
+
+	// The comparison read index 20 and waits for the index gate.
+	let gate = mgr.hold_index_write_gate_for_test().await;
+	let comparison = {
+		let mgr = mgr.clone();
+		tokio::spawn(async move { mgr.finish_replacement_log_replay(vec![], 20, 20).await })
+	};
+	assert!(
+		eventually(60, async || mgr.snapshot_install_in_flight()).await,
+		"premise: the comparison began"
+	);
+	// Older evidence stays covered by what it read.
+	observer
+		.on_incarnation_registry(1, &registry(StoreIncarnation::from_raw(0x99), &[]), 10)
+		.await
+		.unwrap();
+	assert_eq!(owner_fence(&mgr), None, "covered evidence fenced");
+	// The supersession at 21 is newer than anything it read.
+	observer
+		.on_incarnation_registry(1, &registry(successor, &[own.incarnation()]), 21)
+		.await
+		.unwrap();
+	assert_eq!(
+		owner_fence(&mgr).as_deref(),
+		Some("OwnerAuthoritySuperseded"),
+		"the supersession was forgotten while the comparison was in flight"
+	);
+	drop(gate);
+	tokio::time::timeout(Duration::from_secs(60), comparison)
+		.await
+		.expect("the comparison finishes")
+		.unwrap()
+		.expect("the comparison at 20 completes; it is not what fences the store");
+	assert_eq!(
+		owner_fence(&mgr).as_deref(),
+		Some("OwnerAuthoritySuperseded"),
+		"the comparison's completion returned authority"
+	);
+	assert!(
+		mgr.require_cleanup_authority().is_err(),
+		"a superseded store holds no cleanup authority"
+	);
+	assert!(
+		mgr.append_durable(tenant(), id(0x0697), hlc(1), b"superseded")
+			.await
+			.is_err(),
+		"a superseded store admits no writes"
+	);
+	assert!(mgr.lookup(tenant(), id(0x0697)).is_err());
+
+	// A snapshot install and its deferred reconciliation use the same order.
+	let (_dir, mgr) = fresh_manager().await;
+	mgr.bind_control_node(1).unwrap();
+	let own = mgr.owner_ref().unwrap();
+	let observer = crate::storage::sweeper::ManagerTierObserver::new(mgr.clone());
+	let epoch = observer
+		.before_tier_snapshot_install(
+			Some(20),
+			&BTreeMap::from([(1, registry(own.incarnation(), &[]))]),
+		)
+		.unwrap();
+	observer
+		.on_incarnation_registry(1, &registry(successor, &[own.incarnation()]), 21)
+		.await
+		.unwrap();
+	assert_eq!(
+		owner_fence(&mgr).as_deref(),
+		Some("OwnerAuthoritySuperseded"),
+		"the supersession was forgotten during the snapshot install"
+	);
+	observer
+		.on_tier_snapshot_installed(
+			&[],
+			&BTreeMap::from([(1, registry(own.incarnation(), &[]))]),
+			Some(20),
+			epoch,
+		)
+		.await
+		.unwrap();
+	assert_eq!(
+		owner_fence(&mgr).as_deref(),
+		Some("OwnerAuthoritySuperseded"),
+		"the install at 20 returned authority"
+	);
+	assert!(mgr.require_cleanup_authority().is_err());
+}
+
+/// ADR 0697: beginning an install does not cover deliveries until its decoded
+/// registry has been classified. Publication fails at the rename, before any
+/// callback: a snapshot naming this store retired has still fenced it, a delayed
+/// delivery changes nothing, and a retry after reopen fences again. A snapshot
+/// naming this store current raises the same coverage and fences nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_snapshot_publication_cannot_forget_a_supersession() {
+	use crate::consensus::{
+		RegisterIncarnation, StoreIncarnation, TierObserver, WendelonLogStore, WendelonRequest,
+		WendelonStateMachine,
+	};
+	use crate::storage::file_ops::{FaultAction, FaultOp, FaultyFileOps, InjectedFault};
+	use crate::storage::ownership::StorageWorker;
+	use openraft::storage::RaftStateMachine;
+	let (registry, owner_fence) = (owner_test_registry, owner_test_fence);
+	let successor = StoreIncarnation::from_raw(0x55);
+	let register = |incarnation, supersedes| {
+		WendelonRequest::RegisterIncarnation(RegisterIncarnation {
+			node: 1,
+			incarnation,
+			supersedes,
+		})
+	};
+	let failing_install = async |manager: &Arc<SlabManager>, requests: Vec<WendelonRequest>| {
+		let source = fresh_dir("owner-failed-publication-source");
+		let snapshot = WendelonLogStore::control_snapshot_for_test(&source, requests, 1).await;
+		let wal = fresh_dir("owner-failed-publication-wal");
+		let faults = Arc::new(FaultyFileOps::new(wal.to_path_buf()).unwrap());
+		let store = WendelonLogStore::open_with_faults_for_test(&wal, faults.clone())
+			.await
+			.unwrap();
+		let mut sm = store
+			.recovered_state_machine()
+			.await
+			.unwrap()
+			.with_tier_observer(Arc::new(crate::storage::ManagerTierObserver::new(
+				manager.clone(),
+			)));
+		faults.inject(InjectedFault::on(
+			FaultOp::Rename,
+			FaultAction::Error {
+				kind: ErrorKind::Other,
+				message: "injected install rename failure".into(),
+			},
+		));
+		assert!(
+			<WendelonStateMachine as RaftStateMachine<crate::consensus::WendelonTypeConfig>>::install_snapshot(
+				&mut sm,
+				&snapshot.meta,
+				snapshot.snapshot,
+			)
+			.await
+			.is_err(),
+			"the install fails at publication"
+		);
+		assert!(
+			manager.comparison_covers_index(2),
+			"premise: the install began, so its index covers earlier deliveries"
+		);
+	};
+
+	// The snapshot names this store retired.
+	let dir = fresh_dir("owner-failed-publication");
+	let mgr = SlabManager::initialize_new_store(gc_owned_test_config(&dir))
+		.await
+		.unwrap();
+	mgr.bind_control_node(1).unwrap();
+	let own = mgr.owner_ref().unwrap();
+	let observer = crate::storage::sweeper::ManagerTierObserver::new(mgr.clone());
+	let superseded = vec![
+		register(own.incarnation(), None),
+		register(successor, Some(own.incarnation())),
+	];
+	failing_install(&mgr, superseded.clone()).await;
+	assert_eq!(
+		owner_fence(&mgr).as_deref(),
+		Some("OwnerAuthoritySuperseded"),
+		"the failed install forgot the supersession it had decoded"
+	);
+	assert!(
+		mgr.require_cleanup_authority().is_err(),
+		"no cleanup authority while the supersession is unresolved"
+	);
+	// The earlier supersession callback arrives after the install began.
+	observer
+		.on_incarnation_registry(1, &registry(successor, &[own.incarnation()]), 2)
+		.await
+		.unwrap();
+	assert_eq!(
+		owner_fence(&mgr).as_deref(),
+		Some("OwnerAuthoritySuperseded")
+	);
+	assert!(mgr.require_cleanup_authority().is_err());
+
+	// After reopen the process-local fence is gone, and the older local view
+	// holds no registry. The redelivered snapshot fences before anything else.
+	drop(observer);
+	mgr.tier_authority.close_and_join().await.unwrap();
+	drop(mgr);
+	let reopened = SlabManager::open(gc_owned_test_config(&dir)).await.unwrap();
+	reopened.bind_control_node(1).unwrap();
+	assert_eq!(
+		reopened.owner_ref().unwrap(),
+		own,
+		"premise: the same store"
+	);
+	let source = fresh_dir("owner-failed-publication-retry-source");
+	let snapshot = WendelonLogStore::control_snapshot_for_test(&source, superseded, 1).await;
+	let wal = fresh_dir("owner-failed-publication-retry-wal");
+	let store = WendelonLogStore::open_for_retention_test(&wal, 64 * 4096, None)
+		.await
+		.unwrap();
+	let mut sm = store
+		.recovered_state_machine()
+		.await
+		.unwrap()
+		.with_tier_observer(Arc::new(crate::storage::ManagerTierObserver::new(
+			reopened.clone(),
+		)));
+	<WendelonStateMachine as RaftStateMachine<crate::consensus::WendelonTypeConfig>>::install_snapshot(
+		&mut sm,
+		&snapshot.meta,
+		snapshot.snapshot,
+	)
+	.await
+	.unwrap();
+	assert_eq!(
+		owner_fence(&reopened).as_deref(),
+		Some("OwnerAuthoritySuperseded"),
+		"a retry restored authority from an older view"
+	);
+	assert!(reopened.require_cleanup_authority().is_err());
+
+	// The snapshot names this store current: the same failure fences nothing.
+	let (_dir, mgr) = fresh_manager().await;
+	mgr.bind_control_node(1).unwrap();
+	let own = mgr.owner_ref().unwrap();
+	let observer = crate::storage::sweeper::ManagerTierObserver::new(mgr.clone());
+	failing_install(
+		&mgr,
+		vec![
+			register(successor, None),
+			register(own.incarnation(), Some(successor)),
+		],
+	)
+	.await;
+	assert_eq!(owner_fence(&mgr), None);
+	mgr.require_cleanup_authority()
+		.expect("a current store keeps cleanup authority");
+	// A stale delivery the snapshot covers still mints nothing.
+	observer
+		.on_incarnation_registry(1, &registry(successor, &[]), 1)
+		.await
+		.unwrap();
+	assert_eq!(owner_fence(&mgr), None);
+}
+
+/// ADR 0697 slice 2: the ring→local boundary classifies every slab event by
+/// owner and the owner node's registry. Foreign and retired-other events have
+/// no effect; an unexplained own identity fences; a registry-only supersession
+/// of this store fences, and a later Own event neither applies nor lifts it.
+#[tokio::test]
+async fn observer_classifies_ring_events_by_owner_and_registry() {
+	use crate::consensus::{OwnerRef, StoreIncarnation, TierObserver};
+	let (tier, registry, owner_fence) = (owner_test_tier, owner_test_registry, owner_test_fence);
+
+	// Foreign, and a retired earlier incarnation of this node: no effect.
+	let (_dir, mgr) = fresh_manager().await;
+	mgr.bind_control_node(1).unwrap();
+	let own = mgr.owner_ref().unwrap();
+	let observer = crate::storage::sweeper::ManagerTierObserver::new(mgr.clone());
+	let foreign = OwnerRef::for_test(2, 0x22);
+	observer
+		.on_slab_tiered(
+			&tier(foreign, SlabId::ZERO),
+			&registry(foreign.incarnation(), &[]),
+			7,
+		)
+		.await
+		.unwrap();
+	let retired = OwnerRef::for_test(1, 0x99);
+	observer
+		.on_slab_tiered(
+			&tier(retired, SlabId::ZERO),
+			&registry(own.incarnation(), &[retired.incarnation()]),
+			8,
+		)
+		.await
+		.unwrap();
+	assert_eq!(mgr.tier_pointer(SlabId::ZERO).await, None);
+	assert_eq!(owner_fence(&mgr), None, "neither case fences this store");
+
+	// An own-node identity the registry does not explain fences.
+	let (_dir, mgr) = fresh_manager().await;
+	mgr.bind_control_node(1).unwrap();
+	let own = mgr.owner_ref().unwrap();
+	let observer = crate::storage::sweeper::ManagerTierObserver::new(mgr.clone());
+	let stranger = OwnerRef::for_test(1, 0x77);
+	observer
+		.on_slab_tiered(
+			&tier(stranger, SlabId::ZERO),
+			&registry(own.incarnation(), &[]),
+			9,
+		)
+		.await
+		.unwrap();
+	assert_eq!(mgr.tier_pointer(SlabId::ZERO).await, None);
+	assert_eq!(owner_fence(&mgr).as_deref(), Some("UnexplainedOwnIdentity"));
+
+	// A registration-only supersession of this store fences it; a delayed
+	// event that was Own before the supersession changes nothing.
+	let (_dir, mgr) = fresh_manager().await;
+	mgr.bind_control_node(1).unwrap();
+	let own = mgr.owner_ref().unwrap();
+	let observer = crate::storage::sweeper::ManagerTierObserver::new(mgr.clone());
+	let successor = StoreIncarnation::from_raw(0x55);
+	observer
+		.on_incarnation_registry(1, &registry(successor, &[own.incarnation()]), 10)
+		.await
+		.unwrap();
+	assert_eq!(
+		owner_fence(&mgr).as_deref(),
+		Some("OwnerAuthoritySuperseded")
+	);
+	observer
+		.on_slab_tiered(
+			&tier(own, SlabId::ZERO),
+			&registry(own.incarnation(), &[]),
+			9,
+		)
+		.await
+		.unwrap();
+	assert_eq!(mgr.tier_pointer(SlabId::ZERO).await, None);
+	assert_eq!(
+		owner_fence(&mgr).as_deref(),
+		Some("OwnerAuthoritySuperseded")
+	);
+	assert!(
+		mgr.append_durable(tenant(), id(0x0697), hlc(1), b"after supersession")
+			.await
+			.is_err(),
+		"a superseded store admits no writes"
+	);
+}
+
+/// ADR 0697 slice 2: when the ring names another current incarnation for this
+/// node, a committer with no registry view proposes its registration and every
+/// path stops at that refusal, before its slab command is sent: never success,
+/// never LsmCommitRejected. The slab commands' own mappers are the next control.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn committer_without_a_registry_is_refused_at_registration_on_every_path() {
+	use crate::storage::TierCommitter;
+	use crate::storage::sweeper::{LsmCommitRejected, SlabCommitRefused};
+	let (_dir, mgr) = fresh_manager().await;
+	let cluster = control_cluster_observing(&[(1, &mgr)]).await;
+	let other = crate::consensus::StoreIncarnation::from_raw(0x0697_0001);
+	let registered = cluster.nodes[0]
+		.client_write(crate::consensus::WendelonRequest::RegisterIncarnation(
+			crate::consensus::RegisterIncarnation {
+				node: 1,
+				incarnation: other,
+				supersedes: None,
+			},
+		))
+		.await
+		.unwrap();
+	assert_eq!(registered.data, crate::consensus::WendelonResponse::Success);
+	let refused = |error: std::io::Error| {
+		assert!(
+			error
+				.get_ref()
+				.is_some_and(|cause| cause.is::<SlabCommitRefused>()),
+			"expected an owner refusal, got {error}"
+		);
+		assert!(
+			!error
+				.get_ref()
+				.is_some_and(|cause| cause.is::<LsmCommitRejected>()),
+			"an owner refusal is never a definite LSM rejection"
+		);
+	};
+	let committer = crate::storage::RaftCommitter::new(cluster.nodes[0].clone());
+	let owner = mgr.owner_ref().unwrap();
+	let tier = crate::consensus::TieredSlab {
+		slab: owner.slab(SlabId::ZERO),
+		l2_uri: "memory://tier/refused".into(),
+		payload_hash: [1; 32],
+		is_encrypted: false,
+		tenant_id: None,
+		tenant_kek_id: None,
+		stats_format_version: None,
+		stats_block_len: None,
+		stats_block_hash128: None,
+		tombstone_metadata: TombstoneMetadata::None,
+		supersession_metadata: SupersessionMetadata::None,
+	};
+	refused(
+		committer
+			.commit_tier_slab(crate::storage::TierProposal::unreserved_for_test(tier))
+			.await
+			.unwrap_err(),
+	);
+	refused(
+		committer
+			.retire_tiered_slab(owner.slab(SlabId::ZERO))
+			.await
+			.unwrap_err(),
+	);
+	refused(
+		committer
+			.commit_lsm_compaction(CompactionCommit::gc_mark_delete_pending(
+				owner,
+				CompactionJobId::new(0x0697),
+				ManifestEpoch::new(0),
+				vec![SlabId::ZERO],
+			))
+			.await
+			.unwrap_err(),
+	);
+}
+
+/// ADR 0697 slice 2: each slab command reaches apply and is refused there, and
+/// its production mapper makes that a non-outcome. Node 2's owner registered
+/// while it led, so with node 1 leading, node 1's committer passes the
+/// registration check from its own state machine and submits the command; only
+/// apply can answer NotAppendingLeader, and each one advances the log. Never
+/// success, the proposal not applied (its reservation kept), never
+/// LsmCommitRejected (no cleanup authority), nothing recorded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn committer_maps_a_refused_slab_command_to_a_non_outcome_on_every_path() {
+	use crate::storage::TierCommitter;
+	use crate::storage::sweeper::{LsmCommitRejected, SlabCommitRefused};
+	let (_dirs, mgr, _l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let cluster = control_cluster_observing(&[(2, &mgr)]).await;
+	cluster.elect(2).await;
+	register_owner(&cluster.nodes[1], &mgr).await;
+	cluster.elect(1).await;
+	let owner = mgr.owner_ref().unwrap();
+	let leader_sm = cluster.state_machines[0].clone();
+	assert!(
+		eventually(60, async || leader_sm.incarnation_registry(2).await.current
+			== Some(owner.incarnation()))
+		.await,
+		"premise: node 1's state machine holds node 2's registration"
+	);
+	let committer = crate::storage::RaftCommitter::new(cluster.nodes[0].clone())
+		.with_state_machine(leader_sm.clone());
+	assert!(committer.should_propose(), "premise: node 1 leads");
+	// The state machine applies before the response returns; the metrics
+	// watch may lag it.
+	let applied = async || {
+		leader_sm
+			.state_snapshot()
+			.await
+			.last_applied_log_id
+			.map(|id| id.index)
+	};
+	let refused =
+		|command: &str, before: Option<u64>, after: Option<u64>, error: std::io::Error| {
+			assert_eq!(
+				error
+					.get_ref()
+					.and_then(|cause| cause.downcast_ref::<SlabCommitRefused>())
+					.map(|refused| refused.0),
+				Some(crate::consensus::SlabRefusal::NotAppendingLeader {
+					owner_node: 2,
+					leader_node: 1,
+				}),
+				"{command}: expected the state machine's own refusal, got {error}"
+			);
+			assert!(
+				!error
+					.get_ref()
+					.is_some_and(|cause| cause.is::<LsmCommitRejected>()),
+				"{command}: an owner refusal is never a definite LSM rejection"
+			);
+			assert_eq!(
+				after,
+				before.map(|index| index + 1),
+				"{command}: exactly the command itself reached apply"
+			);
+		};
+
+	let proposal = mgr
+		.reserve_tier_history(b10_tier(&mgr, &old))
+		.await
+		.unwrap();
+	let held = mgr.tier_tokens.held();
+	assert_eq!(held.0, 1, "premise: a real proposer token is reserved");
+	let before = applied().await;
+	let error = committer.commit_tier_slab(proposal).await.unwrap_err();
+	refused("TierSlab", before, applied().await, error);
+	assert_eq!(
+		mgr.tier_tokens.held(),
+		held,
+		"a refused proposal is not applied: its reservation stays"
+	);
+
+	let before = applied().await;
+	let error = committer
+		.retire_tiered_slab(owner.slab(old.slab_id))
+		.await
+		.unwrap_err();
+	refused("RetireTieredSlab", before, applied().await, error);
+
+	let before = applied().await;
+	let error = committer
+		.commit_lsm_compaction(CompactionCommit::gc_mark_delete_pending(
+			owner,
+			CompactionJobId::new(0x0697),
+			ManifestEpoch::new(0),
+			vec![old.slab_id],
+		))
+		.await
+		.unwrap_err();
+	refused("CompactionCommit", before, applied().await, error);
+
+	assert!(
+		leader_sm.state_snapshot().await.tiered_slabs.is_empty(),
+		"a refused command records nothing"
+	);
 }

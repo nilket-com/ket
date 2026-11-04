@@ -3213,6 +3213,9 @@ impl WendelonDataServer {
 			WendelonResponse::Error(message) => Err(Error::other(format!(
 				"drop reclaim {stage} was rejected: {message}"
 			))),
+			WendelonResponse::Refused(refusal) => Err(Error::other(format!(
+				"unexpected slab refusal for a non-slab command: {refusal:?}"
+			))),
 			WendelonResponse::Root2Dormant => Err(Error::other("Root2 carrier is dormant")),
 			WendelonResponse::LeaseDenied => Err(Error::other(format!(
 				"drop reclaim {stage} returned unexpected lease denial"
@@ -3822,6 +3825,9 @@ impl WendelonDataServer {
 								"lease manager: state machine rejected AcquireLease: {message}"
 							),
 						)),
+						WendelonResponse::Refused(refusal) => Err(Error::other(format!(
+							"unexpected slab refusal for a non-slab command: {refusal:?}"
+						))),
 						WendelonResponse::Root2Dormant => {
 							Err(Error::other("Root2 carrier is dormant"))
 						}

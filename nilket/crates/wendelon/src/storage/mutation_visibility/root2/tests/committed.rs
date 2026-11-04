@@ -199,7 +199,9 @@ fn identity_error_is_typed() {
 }
 
 #[test]
-fn carrier_legacy_wal_decoded_identities_are_frozen_for_versions_zero_through_four() {
+/// ADR 0697: legacy WAL bodies are refused, never upconverted; the stored
+/// fixtures stay as the refusal inputs, still pinned by their raw digests.
+fn carrier_legacy_wal_bodies_are_refused_for_versions_zero_through_four() {
 	let oracle: serde_json::Value =
 		serde_json::from_str(include_str!("wal_legacy_identity_vectors.json")).unwrap();
 	let fixtures = [
@@ -232,32 +234,18 @@ fn carrier_legacy_wal_decoded_identities_are_frozen_for_versions_zero_through_fo
 		{
 			let (name, hex) = line.split_once('=').unwrap();
 			let raw = unhex(hex);
-			let entry = crate::consensus::raft_storage::carrier_legacy_fixture_entry(version, name)
-				.unwrap();
 			let expected = &oracle[version.to_string()][name];
 			assert_eq!(
 				hash(b"", &raw).as_slice(),
 				unhex(expected["raw_sha256"].as_str().unwrap())
 			);
-			assert_eq!(
-				postcard::to_stdvec(&entry).unwrap(),
-				unhex(expected["decoded_current_hex"].as_str().unwrap()),
-				"v{version} {name}: frozen upconversion"
-			);
-			let (_, identity, class) = adapt(&entry).entry_fields();
-			let expected_class = match &entry.payload {
-				EntryPayload::Blank => EntryClass2::Blank,
-				EntryPayload::Membership(_) => EntryClass2::Membership,
-				EntryPayload::Normal(request) => {
-					assert!(!matches!(request, WendelonRequest::Root2Command(_)));
-					EntryClass2::NonRoot2
-				}
-			};
-			assert!(class == expected_class);
-			assert_eq!(
-				identity.as_slice(),
-				unhex(expected["identity"].as_str().unwrap()),
-				"v{version} {name}: decoded-value identity"
+			let error = crate::consensus::raft_storage::carrier_legacy_fixture_entry(version, name)
+				.unwrap_err();
+			assert!(
+				error
+					.get_ref()
+					.is_some_and(|cause| cause.is::<crate::consensus::UnsupportedControlFormat>()),
+				"v{version} {name}: {error}"
 			);
 			count += 1;
 		}

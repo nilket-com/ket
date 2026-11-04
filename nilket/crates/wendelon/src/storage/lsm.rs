@@ -633,6 +633,10 @@ impl CompactionDigestSummary {
 /// manifest validation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompactionCommit {
+	/// The one store this whole commit belongs to (ADR 0697). Every slab id,
+	/// successor, sidecar reference, job id and manifest epoch below is local
+	/// to it; the ring never applies them to any other store.
+	pub owner: crate::consensus::OwnerRef,
 	pub job_id: CompactionJobId,
 	pub manifest_epoch_pre: ManifestEpoch,
 	pub slabs_to_retire: Vec<SlabId>,
@@ -647,12 +651,14 @@ pub struct CompactionCommit {
 
 impl CompactionCommit {
 	pub fn gc_mark_delete_pending(
+		owner: crate::consensus::OwnerRef,
 		job_id: CompactionJobId,
 		manifest_epoch_pre: ManifestEpoch,
 		mut slabs_to_mark_delete_pending: Vec<SlabId>,
 	) -> Self {
 		slabs_to_mark_delete_pending.sort_unstable();
 		Self {
+			owner,
 			job_id,
 			manifest_epoch_pre,
 			slabs_to_retire: Vec::new(),
@@ -665,12 +671,14 @@ impl CompactionCommit {
 	}
 
 	pub fn gc_remove(
+		owner: crate::consensus::OwnerRef,
 		job_id: CompactionJobId,
 		manifest_epoch_pre: ManifestEpoch,
 		mut slabs_to_remove: Vec<SlabId>,
 	) -> Self {
 		slabs_to_remove.sort_unstable();
 		Self {
+			owner,
 			job_id,
 			manifest_epoch_pre,
 			slabs_to_retire: Vec::new(),

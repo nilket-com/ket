@@ -79,8 +79,9 @@ use crate::schema::{SupersessionMetadata, TombstoneMetadata};
 use crate::storage::MvccRetentionPolicy;
 use crate::storage::l2::ObjectStore;
 use crate::storage::manager::{
-	PreparedTieredRetentionRewrite, RetentionCompactionStats, SealedSlabInfo, SlabManager,
-	StaleLocationReason, TierProposal, TieredSlabPointer, stale_location_error,
+	OwnTierView, OwnerEvidence, Ownership, PreparedTieredRetentionRewrite,
+	RetentionCompactionStats, SealedSlabInfo, SlabManager, StaleLocationReason, TierProposal,
+	TieredSlabPointer, stale_location_error,
 };
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -203,9 +204,9 @@ pub trait TierCommitter: Send + Sync {
 	/// §7); a committer resolves it through [`TierProposal::begin_submission`].
 	async fn commit_tier_slab(&self, proposal: TierProposal) -> std::io::Result<()>;
 
-	/// Submit a RetireTieredSlab entry. Returns `Ok(())` only after
-	/// the local state machine has applied the retirement.
-	async fn retire_tiered_slab(&self, slab_id: SlabId) -> std::io::Result<()>;
+	/// Submit a RetireTieredSlab entry for the proposer's own slab. Returns
+	/// `Ok(())` only after the local state machine has applied the retirement.
+	async fn retire_tiered_slab(&self, slab: crate::consensus::SlabRef) -> std::io::Result<()>;
 
 	/// Submit an ADR 055 LSM CompactionCommit entry. Returns
 	/// `Ok(())` only after the local state machine has applied the
@@ -281,17 +282,117 @@ pub(crate) async fn propose_tier_slab(
 /// including ForwardToLeader, remains ambiguous and retains uploaded bytes.
 pub struct RaftCommitter {
 	raft: WendelonRaft,
+	/// The local state machine, to verify the proposer's incarnation is
+	/// current before each slab proposal (ADR 0697).
+	registry: Option<WendelonStateMachine>,
 	#[cfg(test)]
 	submit_without_role_check: bool,
+}
+
+/// The state machine refused a slab command without applying or recording
+/// anything (ADR 0697). Not an outcome: it grants no cleanup authority, marks
+/// no proposal applied, and does not prove an earlier attempt never applied.
+#[derive(Debug)]
+pub(crate) struct SlabCommitRefused(pub(crate) crate::consensus::SlabRefusal);
+impl std::fmt::Display for SlabCommitRefused {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(f, "slab command refused: {:?}", self.0)
+	}
+}
+impl std::error::Error for SlabCommitRefused {}
+
+fn slab_refused(refusal: crate::consensus::SlabRefusal) -> std::io::Error {
+	std::io::Error::new(std::io::ErrorKind::WouldBlock, SlabCommitRefused(refusal))
+}
+
+/// Map a slab command's response: only `Success` acknowledges application.
+fn slab_command_applied(
+	command: &str,
+	data: crate::consensus::WendelonResponse,
+) -> std::io::Result<()> {
+	match data {
+		crate::consensus::WendelonResponse::Success => Ok(()),
+		crate::consensus::WendelonResponse::Refused(refusal) => Err(slab_refused(refusal)),
+		other => Err(std::io::Error::other(format!(
+			"{command} was not applied: {other:?}"
+		))),
+	}
 }
 
 impl RaftCommitter {
 	pub fn new(raft: WendelonRaft) -> Self {
 		Self {
 			raft,
+			registry: None,
 			#[cfg(test)]
 			submit_without_role_check: false,
 		}
+	}
+
+	/// Verify the proposer's incarnation against the local state machine's
+	/// registry before each slab proposal.
+	pub fn with_state_machine(mut self, state_machine: WendelonStateMachine) -> Self {
+		self.registry = Some(state_machine);
+		self
+	}
+
+	/// ADR 0697: before each slab proposal, `owner` must be its node's current
+	/// incarnation. An unregistered node registers lazily; a node whose
+	/// registry names another incarnation is refused, never re-registered.
+	/// A registration receipt is not authority: the registry is read again,
+	/// and admission at apply stays final.
+	async fn ensure_registered(&self, owner: crate::consensus::OwnerRef) -> std::io::Result<()> {
+		let current = match &self.registry {
+			Some(state_machine) => {
+				let registry = state_machine.incarnation_registry(owner.node()).await;
+				if registry.current == Some(owner.incarnation()) {
+					return Ok(());
+				}
+				if registry.current.is_some() || registry.retired.contains(&owner.incarnation()) {
+					return Err(slab_refused(
+						crate::consensus::SlabRefusal::NotCurrentOwner {
+							owner,
+							current: registry.current,
+						},
+					));
+				}
+				registry.current
+			}
+			None => None,
+		};
+		let response = self
+			.raft
+			.client_write(WendelonRequest::RegisterIncarnation(
+				crate::consensus::RegisterIncarnation {
+					node: owner.node(),
+					incarnation: owner.incarnation(),
+					supersedes: current,
+				},
+			))
+			.await
+			.map_err(|error| {
+				std::io::Error::new(
+					std::io::ErrorKind::WouldBlock,
+					TierCommitNotSubmitted(format!(
+						"incarnation registration not confirmed: {error}"
+					)),
+				)
+			})?;
+		slab_command_applied("RegisterIncarnation", response.data)?;
+		if let Some(state_machine) = &self.registry
+			&& state_machine
+				.incarnation_registry(owner.node())
+				.await
+				.current != Some(owner.incarnation())
+		{
+			return Err(slab_refused(
+				crate::consensus::SlabRefusal::NotCurrentOwner {
+					owner,
+					current: None,
+				},
+			));
+		}
+		Ok(())
 	}
 	fn require_submission_role(&self) -> std::io::Result<()> {
 		let allowed = self.should_propose();
@@ -320,6 +421,7 @@ impl TierCommitter for RaftCommitter {
 		// Dropping the proposal on this refusal releases its reservation.
 		self.require_submission_role()?;
 		let tier = proposal.tier().clone();
+		self.ensure_registered(tier.slab.owner()).await?;
 		let submission = proposal.begin_submission().map_err(|refusal| {
 			std::io::Error::new(
 				refusal.kind(),
@@ -331,7 +433,8 @@ impl TierCommitter for RaftCommitter {
 			.client_write(WendelonRequest::TierSlab(tier))
 			.await
 		{
-			Ok(_) => {
+			Ok(response) => {
+				slab_command_applied("TierSlab", response.data)?;
 				submission.applied();
 				Ok(())
 			}
@@ -348,16 +451,15 @@ impl TierCommitter for RaftCommitter {
 		}
 	}
 
-	async fn retire_tiered_slab(&self, slab_id: SlabId) -> std::io::Result<()> {
+	async fn retire_tiered_slab(&self, slab: crate::consensus::SlabRef) -> std::io::Result<()> {
 		self.require_submission_role()?;
+		self.ensure_registered(slab.owner()).await?;
 		match self
 			.raft
-			.client_write(WendelonRequest::RetireTieredSlab(RetireTieredSlab {
-				slab_id,
-			}))
+			.client_write(WendelonRequest::RetireTieredSlab(RetireTieredSlab { slab }))
 			.await
 		{
-			Ok(_) => Ok(()),
+			Ok(response) => slab_command_applied("RetireTieredSlab", response.data),
 			Err(openraft::error::RaftError::APIError(
 				openraft::error::ClientWriteError::ForwardToLeader(error),
 			)) => Err(std::io::Error::new(
@@ -375,6 +477,7 @@ impl TierCommitter for RaftCommitter {
 		&self,
 		commit: crate::storage::CompactionCommit,
 	) -> std::io::Result<()> {
+		self.ensure_registered(commit.owner).await?;
 		match self
 			.raft
 			.client_write(WendelonRequest::CompactionCommit(commit))
@@ -382,6 +485,9 @@ impl TierCommitter for RaftCommitter {
 		{
 			Ok(response) => match response.data {
 				crate::consensus::WendelonResponse::Success => Ok(()),
+				// A refusal is never the definite rejection that grants an
+				// LSM intent cleanup authority.
+				crate::consensus::WendelonResponse::Refused(refusal) => Err(slab_refused(refusal)),
 				crate::consensus::WendelonResponse::Error(message) => Err(std::io::Error::new(
 					std::io::ErrorKind::InvalidData,
 					LsmCommitRejected(message),
@@ -604,12 +710,7 @@ impl SlabSweeper {
 		// Every upload attempt writes a fresh object: a published generation is
 		// immutable, and a retried attempt can never overwrite an object a
 		// committed pointer names.
-		let key = format!(
-			"{}slab_{:016x}_{}.wnd",
-			self.config.key_prefix,
-			info.slab_id,
-			uuid::Uuid::new_v4().simple()
-		);
+		let key = self.object_key("", info.slab_id)?;
 		let upload_started = tokio::time::Instant::now();
 		let l2_uri = self.object_store.put(&key, &encrypted.bytes).await?;
 		metrics()
@@ -647,7 +748,7 @@ impl SlabSweeper {
 		let (stats_format_version, stats_block_len, stats_block_hash128) =
 			stats_advisory_fields(encrypted.stats_locator);
 		let tier = TieredSlab {
-			slab_id: info.slab_id,
+			slab: self.slab.owner_ref()?.slab(info.slab_id),
 			l2_uri: l2_uri.clone(),
 			payload_hash: expected_hash,
 			is_encrypted: true,
@@ -818,7 +919,7 @@ impl SlabSweeper {
 		// `rewrite_one_plaintext_tiered_slab`) or failed and was
 		// best-effort deleted; either way, a fresh key keeps the two
 		// attempts independent.
-		let key = self.rewritten_key(pointer.slab_id);
+		let key = self.rewritten_key(pointer.slab_id)?;
 		let planned_uri = self.object_store.planned_upload_uri(&key)?;
 		self.slab
 			.stage_table_drop_l2_cleanup(
@@ -871,7 +972,7 @@ impl SlabSweeper {
 		let (stats_format_version, stats_block_len, stats_block_hash128) =
 			stats_advisory_fields(encrypted.stats_locator);
 		let tier = TieredSlab {
-			slab_id: pointer.slab_id,
+			slab: self.slab.owner_ref()?.slab(pointer.slab_id),
 			l2_uri: new_uri.clone(),
 			payload_hash: expected_hash,
 			is_encrypted: true,
@@ -1021,7 +1122,7 @@ impl SlabSweeper {
 			let (stats_format_version, stats_block_len, stats_block_hash128) =
 				stats_advisory_fields(footer.stats_locator);
 			let tier = TieredSlab {
-				slab_id: pointer.slab_id,
+				slab: self.slab.owner_ref()?.slab(pointer.slab_id),
 				l2_uri: pointer.l2_uri.clone(),
 				payload_hash: pointer.payload_hash,
 				is_encrypted: true,
@@ -1058,7 +1159,7 @@ impl SlabSweeper {
 			)));
 		}
 		let expected_hash = crate::hash::content::digest(&encrypted.bytes);
-		let key = self.rewritten_key(pointer.slab_id);
+		let key = self.rewritten_key(pointer.slab_id)?;
 		let planned_uri = self.object_store.planned_upload_uri(&key)?;
 		self.slab
 			.stage_table_drop_l2_cleanup(
@@ -1111,7 +1212,7 @@ impl SlabSweeper {
 		let (stats_format_version, stats_block_len, stats_block_hash128) =
 			stats_advisory_fields(encrypted.stats_locator);
 		let tier = TieredSlab {
-			slab_id: pointer.slab_id,
+			slab: self.slab.owner_ref()?.slab(pointer.slab_id),
 			l2_uri: new_uri.clone(),
 			payload_hash: expected_hash,
 			is_encrypted: true,
@@ -1289,7 +1390,7 @@ impl SlabSweeper {
 				retention_stats,
 				reclaimed_bytes,
 			} => {
-				let key = self.retention_rewritten_key(slab_id);
+				let key = self.retention_rewritten_key(slab_id)?;
 				let planned_uri = self.object_store.planned_upload_uri(&key)?;
 				self.slab
 					.stage_table_drop_l2_cleanup(
@@ -1354,7 +1455,7 @@ impl SlabSweeper {
 				let (stats_format_version, stats_block_len, stats_block_hash128) =
 					stats_advisory_fields(footer.stats_locator);
 				let tier = TieredSlab {
-					slab_id,
+					slab: self.slab.owner_ref()?.slab(slab_id),
 					l2_uri: new_uri.clone(),
 					payload_hash,
 					is_encrypted: true,
@@ -1443,7 +1544,9 @@ impl SlabSweeper {
 					.stage_table_drop_l2_cleanup(slab_id, &old_l2_uri, Some(old_bytes), None)
 					.await?;
 				let observed_epoch = self.slab.capture_snapshot_epoch();
-				self.raft.retire_tiered_slab(slab_id).await?;
+				self.raft
+					.retire_tiered_slab(self.slab.owner_ref()?.slab(slab_id))
+					.await?;
 				self.slab
 					.retire_tiered_slab_at_snapshot_epoch(slab_id, observed_epoch)
 					.await?;
@@ -1587,63 +1690,30 @@ impl SlabSweeper {
 	/// apply didn't land — which we treat as a terminal failure
 	/// upstream.
 	async fn sm_tier_pointer(&self, slab_id: SlabId) -> Option<TieredSlabPointer> {
+		// ADR 0697: this store's own pointer only, by its owner-qualified key.
+		let owner = self.slab.owner_ref().ok()?;
 		self.state_machine
-			.tiered_slab(slab_id)
+			.tiered_slab(owner.slab(slab_id))
 			.await
-			.map(|t| TieredSlabPointer {
-				slab_id: t.slab_id,
-				l2_uri: t.l2_uri.clone(),
-				payload_hash: t.payload_hash,
-				is_encrypted: t.is_encrypted,
-				tenant_id: t.tenant_id,
-				tenant_kek_id: t.tenant_kek_id,
-				stats_format_version: t.stats_format_version,
-				stats_block_len: t.stats_block_len,
-				stats_block_hash128: t.stats_block_hash128,
-				tombstone_metadata: t.tombstone_metadata,
-				supersession_metadata: t.supersession_metadata,
-			})
+			.map(|t| TieredSlabPointer::from_ring(&t))
 	}
 	fn try_sm_tier_pointer(&self, slab_id: SlabId) -> std::io::Result<Option<TieredSlabPointer>> {
+		let owner = self.slab.owner_ref()?;
 		Ok(self
 			.state_machine
-			.try_tiered_slab(slab_id)?
-			.map(|t| TieredSlabPointer {
-				slab_id: t.slab_id,
-				l2_uri: t.l2_uri.clone(),
-				payload_hash: t.payload_hash,
-				is_encrypted: t.is_encrypted,
-				tenant_id: t.tenant_id,
-				tenant_kek_id: t.tenant_kek_id,
-				stats_format_version: t.stats_format_version,
-				stats_block_len: t.stats_block_len,
-				stats_block_hash128: t.stats_block_hash128,
-				tombstone_metadata: t.tombstone_metadata,
-				supersession_metadata: t.supersession_metadata,
-			}))
+			.try_tiered_slab(owner.slab(slab_id))?
+			.map(|t| TieredSlabPointer::from_ring(&t)))
 	}
 
-	async fn sm_tier_pointers(&self) -> Vec<TieredSlabPointer> {
+	async fn sm_tier_pointers(&self) -> Option<Vec<TieredSlabPointer>> {
+		// ADR 0697: only this store's own pointers. A view that is not
+		// authoritative for this store yields nothing to reconcile.
 		let state = self.state_machine.state_snapshot().await;
-		let mut pointers = state
-			.tiered_slabs
-			.values()
-			.map(|tier| TieredSlabPointer {
-				slab_id: tier.slab_id,
-				l2_uri: tier.l2_uri.clone(),
-				payload_hash: tier.payload_hash,
-				is_encrypted: tier.is_encrypted,
-				tenant_id: tier.tenant_id,
-				tenant_kek_id: tier.tenant_kek_id,
-				stats_format_version: tier.stats_format_version,
-				stats_block_len: tier.stats_block_len,
-				stats_block_hash128: tier.stats_block_hash128,
-				tombstone_metadata: tier.tombstone_metadata,
-				supersession_metadata: tier.supersession_metadata,
-			})
-			.collect::<Vec<_>>();
+		let mut pointers = self
+			.slab
+			.own_tier_view(state.tiered_slabs.values(), &state.incarnations)?;
 		pointers.sort_by_key(|pointer| pointer.slab_id);
-		pointers
+		Some(pointers)
 	}
 
 	/// A proposal plans from this node's published generation. When the
@@ -1718,7 +1788,11 @@ impl SlabSweeper {
 	) -> std::io::Result<TieredStateReconcileReport> {
 		let mut report = TieredStateReconcileReport::default();
 		let observed_epoch = self.slab.capture_snapshot_epoch();
-		let authoritative = self.sm_tier_pointers().await;
+		// A view that is not authoritative for this store (already fenced)
+		// must not read as "nothing committed": reconcile nothing.
+		let Some(authoritative) = self.sm_tier_pointers().await else {
+			return Ok(report);
+		};
 		#[cfg(test)]
 		{
 			let hold = self.reconcile_snapshot_hold.lock().unwrap().take();
@@ -1878,7 +1952,7 @@ impl SlabSweeper {
 			.await?;
 		let supersession_metadata = self.slab.slab_supersession_metadata(pointer.slab_id)?;
 		let tier = TieredSlab {
-			slab_id: pointer.slab_id,
+			slab: self.slab.owner_ref()?.slab(pointer.slab_id),
 			l2_uri: pointer.l2_uri.clone(),
 			payload_hash: pointer.payload_hash,
 			is_encrypted: pointer.is_encrypted,
@@ -1961,22 +2035,27 @@ impl SlabSweeper {
 		}
 	}
 
-	fn rewritten_key(&self, slab_id: SlabId) -> String {
-		format!(
-			"{}crypto/slab_{:016x}_{}.wnd",
+	/// A fresh object key for one of this store's slabs. The owner segment
+	/// (ADR 0697) is for legibility and prefix listing only: authority comes
+	/// from the owner-qualified committed pointer, never from a key.
+	fn object_key(&self, kind: &str, slab_id: SlabId) -> std::io::Result<String> {
+		let owner = self.slab.owner_ref()?;
+		Ok(format!(
+			"{}{kind}{:08x}-{:032x}/slab_{:016x}_{}.wnd",
 			self.config.key_prefix,
+			owner.node(),
+			owner.incarnation().get(),
 			slab_id,
 			uuid::Uuid::new_v4().simple()
-		)
+		))
 	}
 
-	fn retention_rewritten_key(&self, slab_id: SlabId) -> String {
-		format!(
-			"{}retention/slab_{:016x}_{}.wnd",
-			self.config.key_prefix,
-			slab_id,
-			uuid::Uuid::new_v4().simple()
-		)
+	fn rewritten_key(&self, slab_id: SlabId) -> std::io::Result<String> {
+		self.object_key("crypto/", slab_id)
+	}
+
+	fn retention_rewritten_key(&self, slab_id: SlabId) -> std::io::Result<String> {
+		self.object_key("retention/", slab_id)
 	}
 
 	/// Background loop shape: sleep until the next scan deadline
@@ -2128,36 +2207,41 @@ impl TierObserver for ManagerTierObserver {
 		let _ = self.snapshot_source.set(source);
 	}
 
-	fn before_tier_snapshot_install(&self) -> std::io::Result<u64> {
-		self.slab.begin_tier_snapshot_install()
+	fn before_tier_snapshot_install(
+		&self,
+		index: Option<u64>,
+		registries: &std::collections::BTreeMap<u32, crate::consensus::IncarnationRegistry>,
+	) -> std::io::Result<u64> {
+		self.slab.begin_tier_snapshot_install_at(index, registries)
 	}
 
 	async fn on_tier_snapshot_installed(
 		&self,
 		tiers: &[TieredSlab],
+		registries: &std::collections::BTreeMap<u32, crate::consensus::IncarnationRegistry>,
 		index: Option<u64>,
 		snapshot_epoch: u64,
 	) -> std::io::Result<()> {
+		// ADR 0697: reconcile only this store's own pointers. A view that is
+		// not authoritative for this store (already fenced) retires nothing
+		// and leaves the snapshot install fence in place.
+		// A callback a newer comparison superseded decides nothing and mints no
+		// fence: it is refused as obsolete, as the comparison would refuse it.
+		let pointers = match self.slab.own_tier_view_from(
+			tiers.iter(),
+			registries,
+			OwnerEvidence::SnapshotInstall(snapshot_epoch),
+		) {
+			OwnTierView::Authoritative(pointers) => pointers,
+			OwnTierView::NotAuthoritative => return Ok(()),
+			OwnTierView::Obsolete => {
+				return Err(crate::storage::manager::tier_authority::obsolete_verification());
+			}
+		};
 		let canonical = match self.snapshot_source.get() {
 			Some(source) => Some(source.read().await?),
 			None => None,
 		};
-		let pointers = tiers
-			.iter()
-			.map(|tier| TieredSlabPointer {
-				slab_id: tier.slab_id,
-				l2_uri: tier.l2_uri.clone(),
-				payload_hash: tier.payload_hash,
-				is_encrypted: tier.is_encrypted,
-				tenant_id: tier.tenant_id,
-				tenant_kek_id: tier.tenant_kek_id,
-				stats_format_version: tier.stats_format_version,
-				stats_block_len: tier.stats_block_len,
-				stats_block_hash128: tier.stats_block_hash128,
-				tombstone_metadata: tier.tombstone_metadata,
-				supersession_metadata: tier.supersession_metadata,
-			})
-			.collect();
 		match self
 			.slab
 			.finish_tier_snapshot_install_at_epoch(pointers, index, snapshot_epoch)
@@ -2189,7 +2273,16 @@ impl TierObserver for ManagerTierObserver {
 		}
 	}
 
-	fn before_slab_retired(&self, slab_id: SlabId, applied_log_index: u64) {
+	fn before_slab_retired(
+		&self,
+		slab: crate::consensus::SlabRef,
+		registry: &crate::consensus::IncarnationRegistry,
+		applied_log_index: u64,
+	) {
+		let evidence = OwnerEvidence::Applied(applied_log_index);
+		let Ownership::Own(slab_id) = self.slab.classify_ring_slab(slab, registry, evidence) else {
+			return;
+		};
 		if !self.slab.observer_is_superseded(Some(applied_log_index)) {
 			self.slab
 				.fence_unapplied_tier_retirement(slab_id, Some(applied_log_index));
@@ -2199,33 +2292,35 @@ impl TierObserver for ManagerTierObserver {
 	async fn on_slab_tiered(
 		&self,
 		tier: &TieredSlab,
+		registry: &crate::consensus::IncarnationRegistry,
 		applied_log_index: u64,
 	) -> std::io::Result<()> {
+		// ADR 0697: only this store's own slab reaches the manager.
+		if !matches!(
+			self.slab.classify_ring_slab(
+				tier.slab,
+				registry,
+				OwnerEvidence::Applied(applied_log_index)
+			),
+			Ownership::Own(_)
+		) {
+			return Ok(());
+		}
 		self.slab
-			.apply_tier_slab_committed(
-				TieredSlabPointer {
-					slab_id: tier.slab_id,
-					l2_uri: tier.l2_uri.clone(),
-					payload_hash: tier.payload_hash,
-					is_encrypted: tier.is_encrypted,
-					tenant_id: tier.tenant_id,
-					tenant_kek_id: tier.tenant_kek_id,
-					stats_format_version: tier.stats_format_version,
-					stats_block_len: tier.stats_block_len,
-					stats_block_hash128: tier.stats_block_hash128,
-					tombstone_metadata: tier.tombstone_metadata,
-					supersession_metadata: tier.supersession_metadata,
-				},
-				Some(applied_log_index),
-			)
+			.apply_tier_slab_committed(TieredSlabPointer::from_ring(tier), Some(applied_log_index))
 			.await
 	}
 
 	async fn on_slab_retired(
 		&self,
-		slab_id: SlabId,
+		slab: crate::consensus::SlabRef,
+		registry: &crate::consensus::IncarnationRegistry,
 		applied_log_index: u64,
 	) -> std::io::Result<()> {
+		let evidence = OwnerEvidence::Applied(applied_log_index);
+		let Ownership::Own(slab_id) = self.slab.classify_ring_slab(slab, registry, evidence) else {
+			return Ok(());
+		};
 		let result = self
 			.slab
 			.retire_tiered_slab_committed(slab_id, Some(applied_log_index))
@@ -2252,11 +2347,42 @@ impl TierObserver for ManagerTierObserver {
 	async fn on_lsm_compaction_committed(
 		&self,
 		commit: &crate::storage::CompactionCommit,
+		registry: &crate::consensus::IncarnationRegistry,
 		applied_log_index: u64,
 	) -> std::io::Result<()> {
+		// ADR 0697: a compaction commit is single-owner; every id in it is
+		// local to that owner and never applied to another store.
+		if !matches!(
+			self.slab.classify_ring_owner(
+				commit.owner,
+				registry,
+				OwnerEvidence::Applied(applied_log_index)
+			),
+			Ownership::Own(_)
+		) {
+			return Ok(());
+		}
 		self.slab
 			.observe_lsm_compaction_commit(commit, applied_log_index)
 			.await
+	}
+
+	async fn on_incarnation_registry(
+		&self,
+		node: u32,
+		registry: &crate::consensus::IncarnationRegistry,
+		applied_log_index: u64,
+	) -> std::io::Result<()> {
+		// A registration-only supersession of this store fences it.
+		if self
+			.slab
+			.owner_ref()
+			.is_ok_and(|local| local.node() == node)
+		{
+			self.slab
+				.classify_own_node(registry, OwnerEvidence::Applied(applied_log_index));
+		}
+		Ok(())
 	}
 }
 
@@ -2351,19 +2477,23 @@ mod tests {
 			if let Some(sm) = &self.state_machine {
 				sm.seed_tiered_slab_for_test(tier.clone()).await;
 			}
-			self.observer.on_slab_tiered(&tier, 0).await?;
+			self.observer
+				.on_slab_tiered(&tier, &current_registry(tier.slab.owner()), 0)
+				.await?;
 			submission.applied();
 			Ok(())
 		}
 
-		async fn retire_tiered_slab(&self, slab_id: SlabId) -> std::io::Result<()> {
+		async fn retire_tiered_slab(&self, slab: crate::consensus::SlabRef) -> std::io::Result<()> {
 			if let Some(kind) = *self.persistent_err.lock().await {
 				return Err(std::io::Error::new(kind, "simulated commit failure"));
 			}
 			if let Some(sm) = &self.state_machine {
-				sm.retire_tiered_slab_for_test(slab_id).await;
+				sm.retire_tiered_slab_for_test(slab).await;
 			}
-			self.observer.on_slab_retired(slab_id, 0).await?;
+			self.observer
+				.on_slab_retired(slab, &current_registry(slab.owner()), 0)
+				.await?;
 			Ok(())
 		}
 	}
@@ -2382,9 +2512,23 @@ mod tests {
 		crate::test_support::TestDir::new(&format!("wendelon-sweeper-{tag}"))
 	}
 
-	async fn seed_state_machine_pointer(sm: &WendelonStateMachine, pointer: &TieredSlabPointer) {
+	/// The registry a committed slab command carries for its owner (ADR 0697).
+	fn current_registry(
+		owner: crate::consensus::OwnerRef,
+	) -> crate::consensus::IncarnationRegistry {
+		crate::consensus::IncarnationRegistry {
+			current: Some(owner.incarnation()),
+			..Default::default()
+		}
+	}
+
+	async fn seed_state_machine_pointer(
+		sm: &WendelonStateMachine,
+		manager: &SlabManager,
+		pointer: &TieredSlabPointer,
+	) {
 		sm.seed_tiered_slab_for_test(TieredSlab {
-			slab_id: pointer.slab_id,
+			slab: manager.owner_ref().unwrap().slab(pointer.slab_id),
 			l2_uri: pointer.l2_uri.clone(),
 			payload_hash: pointer.payload_hash,
 			is_encrypted: pointer.is_encrypted,
@@ -2723,7 +2867,7 @@ mod tests {
 		let snapshot = sm.state_snapshot().await;
 		let committed_pointer = snapshot
 			.tiered_slabs
-			.get(&sealed_id)
+			.get(&manager.owner_ref().unwrap().slab(sealed_id))
 			.expect("state machine committed tier pointer");
 		assert_eq!(
 			committed_pointer.tombstone_metadata,
@@ -2909,7 +3053,7 @@ mod tests {
 		}
 		let observer: Arc<dyn TierObserver> = Arc::new(ManagerTierObserver::new(manager.clone()));
 		let sm = WendelonStateMachine::new().with_tier_observer(observer.clone());
-		seed_state_machine_pointer(&sm, &old).await;
+		seed_state_machine_pointer(&sm, &manager, &old).await;
 		let committer: Arc<dyn TierCommitter> =
 			Arc::new(DirectApplyCommitter::ok(sm.clone(), observer));
 		let sweeper = SlabSweeper::new(
@@ -2936,7 +3080,7 @@ mod tests {
 				log_id: LogId::new(CommittedLeaderId::new(3, 1), 702),
 				payload: EntryPayload::Normal(crate::consensus::WendelonRequest::TierSlab(
 					TieredSlab {
-						slab_id: current.slab_id,
+						slab: manager.owner_ref().unwrap().slab(current.slab_id),
 						l2_uri: current.l2_uri.clone(),
 						payload_hash: current.payload_hash,
 						is_encrypted: current.is_encrypted,
@@ -3049,7 +3193,7 @@ mod tests {
 		current.tenant_kek_id = Some(new_object.tenant_kek_id);
 		let observer: Arc<dyn TierObserver> = Arc::new(ManagerTierObserver::new(manager.clone()));
 		let sm = WendelonStateMachine::new().with_tier_observer(observer.clone());
-		seed_state_machine_pointer(&sm, &old).await;
+		seed_state_machine_pointer(&sm, &manager, &old).await;
 		let committer: Arc<dyn TierCommitter> =
 			Arc::new(DirectApplyCommitter::ok(sm.clone(), observer));
 		let sweeper = SlabSweeper::new(
@@ -3076,7 +3220,7 @@ mod tests {
 				log_id: LogId::new(CommittedLeaderId::new(3, 1), 702),
 				payload: EntryPayload::Normal(crate::consensus::WendelonRequest::TierSlab(
 					TieredSlab {
-						slab_id: current.slab_id,
+						slab: manager.owner_ref().unwrap().slab(current.slab_id),
 						l2_uri: current.l2_uri.clone(),
 						payload_hash: current.payload_hash,
 						is_encrypted: current.is_encrypted,
@@ -3183,26 +3327,43 @@ mod tests {
 			.unwrap()
 			.forget();
 		let mut target = sm.clone();
+		// The owner registers first, as its committer does before its first
+		// slab proposal (ADR 0697); the reconcile view was captured before both.
+		let owner = manager.owner_ref().unwrap();
 		RaftStateMachine::apply(
 			&mut target,
-			[Entry {
-				log_id: LogId::new(CommittedLeaderId::new(3, 1), 703),
-				payload: EntryPayload::Normal(crate::consensus::WendelonRequest::TierSlab(
-					TieredSlab {
-						slab_id: pointer.slab_id,
-						l2_uri: pointer.l2_uri.clone(),
-						payload_hash: pointer.payload_hash,
-						is_encrypted: pointer.is_encrypted,
-						tenant_id: pointer.tenant_id,
-						tenant_kek_id: pointer.tenant_kek_id,
-						stats_format_version: pointer.stats_format_version,
-						stats_block_len: pointer.stats_block_len,
-						stats_block_hash128: pointer.stats_block_hash128,
-						tombstone_metadata: pointer.tombstone_metadata,
-						supersession_metadata: pointer.supersession_metadata,
-					},
-				)),
-			}],
+			[
+				Entry {
+					log_id: LogId::new(CommittedLeaderId::new(3, 1), 702),
+					payload: EntryPayload::Normal(
+						crate::consensus::WendelonRequest::RegisterIncarnation(
+							crate::consensus::RegisterIncarnation {
+								node: owner.node(),
+								incarnation: owner.incarnation(),
+								supersedes: None,
+							},
+						),
+					),
+				},
+				Entry {
+					log_id: LogId::new(CommittedLeaderId::new(3, 1), 703),
+					payload: EntryPayload::Normal(crate::consensus::WendelonRequest::TierSlab(
+						TieredSlab {
+							slab: manager.owner_ref().unwrap().slab(pointer.slab_id),
+							l2_uri: pointer.l2_uri.clone(),
+							payload_hash: pointer.payload_hash,
+							is_encrypted: pointer.is_encrypted,
+							tenant_id: pointer.tenant_id,
+							tenant_kek_id: pointer.tenant_kek_id,
+							stats_format_version: pointer.stats_format_version,
+							stats_block_len: pointer.stats_block_len,
+							stats_block_hash128: pointer.stats_block_hash128,
+							tombstone_metadata: pointer.tombstone_metadata,
+							supersession_metadata: pointer.supersession_metadata,
+						},
+					)),
+				},
+			],
 		)
 		.await
 		.unwrap();
@@ -3223,7 +3384,7 @@ mod tests {
 			sm.state_snapshot()
 				.await
 				.tiered_slabs
-				.get(&pointer.slab_id)
+				.get(&manager.owner_ref().unwrap().slab(pointer.slab_id))
 				.map(|p| p.l2_uri.clone()),
 			Some(pointer.l2_uri.clone()),
 			"the state machine still names the live slab"
@@ -3279,6 +3440,21 @@ mod tests {
 			let tier = proposal.tier().clone();
 			self.entered.add_permits(1);
 			self.release.acquire().await.unwrap().forget();
+			// ADR 0697: the owner registers before its slab command (an exact
+			// replay is a receipt).
+			let owner = tier.slab.owner();
+			a4_apply_control_request(
+				&self.sm,
+				&self.index,
+				crate::consensus::WendelonRequest::RegisterIncarnation(
+					crate::consensus::RegisterIncarnation {
+						node: owner.node(),
+						incarnation: owner.incarnation(),
+						supersedes: None,
+					},
+				),
+			)
+			.await?;
 			a4_apply_control_request(
 				&self.sm,
 				&self.index,
@@ -3286,11 +3462,11 @@ mod tests {
 			)
 			.await
 		}
-		async fn retire_tiered_slab(&self, slab_id: SlabId) -> std::io::Result<()> {
+		async fn retire_tiered_slab(&self, slab: crate::consensus::SlabRef) -> std::io::Result<()> {
 			a4_apply_control_request(
 				&self.sm,
 				&self.index,
-				crate::consensus::WendelonRequest::RetireTieredSlab(RetireTieredSlab { slab_id }),
+				crate::consensus::WendelonRequest::RetireTieredSlab(RetireTieredSlab { slab }),
 			)
 			.await
 		}
@@ -3332,7 +3508,7 @@ mod tests {
 		assert_eq!(manager.read(location).await.unwrap(), b"hello-1");
 		let observer: Arc<dyn TierObserver> = Arc::new(ManagerTierObserver::new(manager.clone()));
 		let sm = WendelonStateMachine::new().with_tier_observer(observer);
-		seed_state_machine_pointer(&sm, &old).await;
+		seed_state_machine_pointer(&sm, &manager, &old).await;
 		if !backfill {
 			let crypto = manager.retained_cleanup_test_crypto();
 			let rotation = crypto.prepare_rotation(tenant()).unwrap();
@@ -3364,7 +3540,9 @@ mod tests {
 			a4_apply_control_request(
 				&sm,
 				&index,
-				crate::consensus::WendelonRequest::RetireTieredSlab(RetireTieredSlab { slab_id }),
+				crate::consensus::WendelonRequest::RetireTieredSlab(RetireTieredSlab {
+					slab: manager.owner_ref().unwrap().slab(slab_id),
+				}),
 			)
 			.await
 			.unwrap();
@@ -3403,7 +3581,7 @@ mod tests {
 						&sm,
 						&index,
 						crate::consensus::WendelonRequest::RetireTieredSlab(RetireTieredSlab {
-							slab_id,
+							slab: manager.owner_ref().unwrap().slab(slab_id),
 						}),
 					)
 					.await
@@ -3412,7 +3590,7 @@ mod tests {
 						!sm.state_snapshot()
 							.await
 							.tiered_slabs
-							.contains_key(&slab_id),
+							.contains_key(&manager.owner_ref().unwrap().slab(slab_id)),
 						"retirement must be applied before stale maintenance resumes"
 					);
 					drop(claim);
@@ -3427,7 +3605,7 @@ mod tests {
 						&sm,
 						&index,
 						crate::consensus::WendelonRequest::RetireTieredSlab(RetireTieredSlab {
-							slab_id,
+							slab: manager.owner_ref().unwrap().slab(slab_id),
 						}),
 					)
 					.await
@@ -3441,7 +3619,7 @@ mod tests {
 			!sm.state_snapshot()
 				.await
 				.tiered_slabs
-				.contains_key(&slab_id),
+				.contains_key(&manager.owner_ref().unwrap().slab(slab_id)),
 			"A4 stale maintenance resurrected a retired slab; backfill={backfill}; maintenance={result:?}"
 		);
 		if let Ok(Some(location)) = manager.lookup(tenant(), id(1)) {
@@ -3592,7 +3770,7 @@ mod tests {
 			.unwrap();
 		let observer: Arc<dyn TierObserver> = Arc::new(ManagerTierObserver::new(manager.clone()));
 		let sm = WendelonStateMachine::new().with_tier_observer(observer.clone());
-		seed_state_machine_pointer(&sm, &old_pointer).await;
+		seed_state_machine_pointer(&sm, &manager, &old_pointer).await;
 		let committer: Arc<dyn TierCommitter> =
 			Arc::new(DirectApplyCommitter::ok(sm.clone(), observer));
 		let sweeper = SlabSweeper::new(
@@ -3612,7 +3790,7 @@ mod tests {
 			.unwrap()
 			.forget();
 		let mut source = WendelonStateMachine::new();
-		seed_state_machine_pointer(&source, &current_pointer).await;
+		seed_state_machine_pointer(&source, &manager, &current_pointer).await;
 		RaftStateMachine::apply(
 			&mut source,
 			[Entry {
@@ -3671,7 +3849,7 @@ mod tests {
 		manager.apply_tier_slab(old.clone()).await.unwrap();
 		let observer: Arc<dyn TierObserver> = Arc::new(ManagerTierObserver::new(manager.clone()));
 		let sm = WendelonStateMachine::new().with_tier_observer(observer.clone());
-		seed_state_machine_pointer(&sm, &old).await;
+		seed_state_machine_pointer(&sm, &manager, &old).await;
 		let committer: Arc<dyn TierCommitter> =
 			Arc::new(DirectApplyCommitter::ok(sm.clone(), observer));
 		let sweeper = SlabSweeper::new(
@@ -3708,7 +3886,7 @@ mod tests {
 			tombstone_metadata: TombstoneMetadata::None,
 			supersession_metadata: SupersessionMetadata::None,
 		};
-		seed_state_machine_pointer(&source, &old_pointer).await;
+		seed_state_machine_pointer(&source, &manager, &old_pointer).await;
 		RaftStateMachine::apply(
 			&mut source,
 			[Entry {
@@ -3839,7 +4017,7 @@ mod tests {
 		let mut replacement = old;
 		replacement.l2_uri = new_uri;
 		let mut source = WendelonStateMachine::new();
-		seed_state_machine_pointer(&source, &replacement).await;
+		seed_state_machine_pointer(&source, &manager, &replacement).await;
 		RaftStateMachine::apply(
 			&mut source,
 			[Entry {
@@ -3891,7 +4069,7 @@ mod tests {
 		let mut replacement = old;
 		replacement.l2_uri = new_uri;
 		let sm = WendelonStateMachine::new();
-		seed_state_machine_pointer(&sm, &replacement).await;
+		seed_state_machine_pointer(&sm, &manager, &replacement).await;
 		let observer: Arc<dyn TierObserver> = Arc::new(ManagerTierObserver::new(manager.clone()));
 		let committer: Arc<dyn TierCommitter> =
 			Arc::new(DirectApplyCommitter::ok(sm.clone(), observer));
@@ -3943,7 +4121,7 @@ mod tests {
 		assert_eq!(manager.read(loc).await.unwrap(), b"hello-1");
 
 		let sm = WendelonStateMachine::new();
-		seed_state_machine_pointer(&sm, &old_pointer).await;
+		seed_state_machine_pointer(&sm, &manager, &old_pointer).await;
 		let observer: Arc<dyn TierObserver> = Arc::new(ManagerTierObserver::new(manager.clone()));
 		let committer: Arc<dyn TierCommitter> =
 			Arc::new(DirectApplyCommitter::ok(sm.clone(), observer));
@@ -4176,7 +4354,7 @@ mod tests {
 			.apply_tier_slab(metadata_missing_pointer.clone())
 			.await
 			.unwrap();
-		seed_state_machine_pointer(&sm, &metadata_missing_pointer).await;
+		seed_state_machine_pointer(&sm, &manager, &metadata_missing_pointer).await;
 
 		let second = sweeper.sweep_once().await.unwrap();
 		assert_eq!(second.rewrapped_tiered_deks, 0);
@@ -4282,7 +4460,7 @@ mod tests {
 		);
 
 		let sm = WendelonStateMachine::new();
-		seed_state_machine_pointer(&sm, &old_pointer).await;
+		seed_state_machine_pointer(&sm, &manager, &old_pointer).await;
 		let observer: Arc<dyn TierObserver> = Arc::new(ManagerTierObserver::new(manager.clone()));
 		let committer: Arc<dyn TierCommitter> =
 			Arc::new(DirectApplyCommitter::ok(sm.clone(), observer));
@@ -4433,7 +4611,7 @@ mod tests {
 		manager.apply_tier_slab(old_pointer.clone()).await.unwrap();
 
 		let sm = WendelonStateMachine::new();
-		seed_state_machine_pointer(&sm, &old_pointer).await;
+		seed_state_machine_pointer(&sm, &manager, &old_pointer).await;
 		let observer: Arc<dyn TierObserver> = Arc::new(ManagerTierObserver::new(manager.clone()));
 		let committer: Arc<dyn TierCommitter> =
 			Arc::new(DirectApplyCommitter::ok(sm.clone(), observer));
@@ -4582,7 +4760,7 @@ mod tests {
 			.unwrap();
 
 		let sm = WendelonStateMachine::new();
-		seed_state_machine_pointer(&sm, &old_pointer).await;
+		seed_state_machine_pointer(&sm, &manager, &old_pointer).await;
 		let observer: Arc<dyn TierObserver> = Arc::new(ManagerTierObserver::new(manager.clone()));
 		let committer: Arc<dyn TierCommitter> =
 			Arc::new(DirectApplyCommitter::ok(sm.clone(), observer));
@@ -4741,7 +4919,7 @@ mod tests {
 		manager.apply_tier_slab(old_pointer.clone()).await.unwrap();
 
 		let sm = WendelonStateMachine::new();
-		seed_state_machine_pointer(&sm, &old_pointer).await;
+		seed_state_machine_pointer(&sm, &manager, &old_pointer).await;
 		let observer: Arc<dyn TierObserver> = Arc::new(ManagerTierObserver::new(manager.clone()));
 		let committer: Arc<dyn TierCommitter> =
 			Arc::new(DirectApplyCommitter::ok(sm.clone(), observer));
@@ -4873,7 +5051,7 @@ mod tests {
 		manager.apply_tier_slab(old_pointer.clone()).await.unwrap();
 
 		let sm = WendelonStateMachine::new();
-		seed_state_machine_pointer(&sm, &old_pointer).await;
+		seed_state_machine_pointer(&sm, &manager, &old_pointer).await;
 		let observer: Arc<dyn TierObserver> = Arc::new(ManagerTierObserver::new(manager.clone()));
 		let committer: Arc<dyn TierCommitter> =
 			Arc::new(DirectApplyCommitter::ok(sm.clone(), observer));
@@ -5079,7 +5257,7 @@ mod tests {
 		};
 		manager.apply_tier_slab(old_pointer.clone()).await.unwrap();
 		let sm = WendelonStateMachine::new();
-		seed_state_machine_pointer(&sm, &old_pointer).await;
+		seed_state_machine_pointer(&sm, &manager, &old_pointer).await;
 		let observer: Arc<dyn TierObserver> = Arc::new(ManagerTierObserver::new(manager.clone()));
 		let committer: Arc<dyn TierCommitter> =
 			Arc::new(DirectApplyCommitter::ok(sm.clone(), observer));
@@ -5206,7 +5384,7 @@ mod tests {
 			supersession_metadata: SupersessionMetadata::None,
 		};
 		manager.apply_tier_slab(pointer.clone()).await.unwrap();
-		seed_state_machine_pointer(sm, &pointer).await;
+		seed_state_machine_pointer(sm, &manager, &pointer).await;
 		pointer
 	}
 
@@ -5468,7 +5646,7 @@ mod tests {
 			payload_hash: [0x5A; 32],
 			..pointer.clone()
 		};
-		seed_state_machine_pointer(&sm, &unapplied).await;
+		seed_state_machine_pointer(&sm, &manager, &unapplied).await;
 		let sweeper = retention_sweeper(&manager, &l2, &sm, now_ms);
 		let objects = l2_object_names(&l2).await;
 
@@ -5614,7 +5792,7 @@ mod tests {
 		manager.apply_tier_slab(old_pointer.clone()).await.unwrap();
 
 		let sm = WendelonStateMachine::new();
-		seed_state_machine_pointer(&sm, &old_pointer).await;
+		seed_state_machine_pointer(&sm, &manager, &old_pointer).await;
 		let observer: Arc<dyn TierObserver> = Arc::new(ManagerTierObserver::new(manager.clone()));
 		let ambiguous_committer: Arc<dyn TierCommitter> =
 			Arc::new(DirectApplyCommitter::commit_applied_then_err(
@@ -5645,7 +5823,7 @@ mod tests {
 			.state_snapshot()
 			.await
 			.tiered_slabs
-			.get(&sealed_id)
+			.get(&manager.owner_ref().unwrap().slab(sealed_id))
 			.expect("state machine should still commit the rewritten pointer")
 			.l2_uri
 			.clone();
@@ -5865,7 +6043,7 @@ mod tests {
 			.state_snapshot()
 			.await
 			.tiered_slabs
-			.get(&sealed_id)
+			.get(&manager.owner_ref().unwrap().slab(sealed_id))
 			.expect("premise: the first attempt's pointer is committed")
 			.clone();
 		assert!(
@@ -5978,7 +6156,7 @@ mod tests {
 					.state_snapshot()
 					.await
 					.tiered_slabs
-					.contains_key(&sealed_id),
+					.contains_key(&manager.owner_ref().unwrap().slab(sealed_id)),
 			"a counter-bearing slab got a tier pointer through the sweeper"
 		);
 		assert!(
@@ -6153,7 +6331,7 @@ mod tests {
 		let (raft, _log, _sm) = b1_real_follower(&wal).await;
 		let before = raft.metrics().borrow().last_log_index;
 		let tier = TieredSlab {
-			slab_id: SlabId::new(71),
+			slab: crate::consensus::OwnerRef::for_test(1, 1).slab(SlabId::new(71)),
 			l2_uri: "b1/unsubmitted".into(),
 			payload_hash: [7; 32],
 			is_encrypted: false,
@@ -6229,7 +6407,7 @@ mod tests {
 		) -> std::io::Result<()> {
 			self.0.commit_tier_slab(proposal).await
 		}
-		async fn retire_tiered_slab(&self, slab: SlabId) -> std::io::Result<()> {
+		async fn retire_tiered_slab(&self, slab: crate::consensus::SlabRef) -> std::io::Result<()> {
 			self.0.retire_tiered_slab(slab).await
 		}
 	}
@@ -6287,7 +6465,11 @@ mod tests {
 		let (_l1, manager) = build_manager_with_sealed_slabs(Some(l2.clone())).await;
 		let sealed = manager.list_sealed_slabs().await;
 		let (raft, _log, sm) = b1_real_follower(&wal).await;
-		let mut production = RaftCommitter::new(raft.clone());
+		// The owner registered while it led (ADR 0697), so the committer's
+		// registration check passes and the slab command itself is invoked.
+		sm.seed_registration_for_test(manager.owner_ref().unwrap())
+			.await;
+		let mut production = RaftCommitter::new(raft.clone()).with_state_machine(sm.clone());
 		// Models the earlier role check passing, followed by role loss. The
 		// real client_write still executes and returns its own Forward error.
 		production.submit_without_role_check = true;
@@ -6326,7 +6508,7 @@ mod tests {
 		let wal = fresh_dir("b1n-pre-invocation");
 		let (raft, _log, _sm) = b1_real_follower(&wal).await;
 		let error = RaftCommitter::new(raft.clone())
-			.retire_tiered_slab(SlabId::new(71))
+			.retire_tiered_slab(crate::consensus::OwnerRef::for_test(1, 1).slab(SlabId::new(71)))
 			.await
 			.unwrap_err();
 		raft.shutdown().await.unwrap();
@@ -6432,7 +6614,7 @@ mod tests {
 		};
 		manager.apply_tier_slab(old.clone()).await.unwrap();
 		let sm = WendelonStateMachine::new();
-		seed_state_machine_pointer(&sm, &old).await;
+		seed_state_machine_pointer(&sm, &manager, &old).await;
 		let observer: Arc<dyn TierObserver> = Arc::new(ManagerTierObserver::new(manager.clone()));
 		let committer = Arc::new(DirectApplyCommitter::ok(sm.clone(), observer));
 		let sweeper = SlabSweeper::new(
@@ -6538,7 +6720,7 @@ mod tests {
 		};
 		manager.apply_tier_slab(old.clone()).await.unwrap();
 		let sm = WendelonStateMachine::new();
-		seed_state_machine_pointer(&sm, &old).await;
+		seed_state_machine_pointer(&sm, &manager, &old).await;
 		let observer: Arc<dyn TierObserver> = Arc::new(ManagerTierObserver::new(manager.clone()));
 		let sweeper = SlabSweeper::new(
 			manager.clone(),
@@ -6638,7 +6820,7 @@ mod tests {
 		use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
 		let (_dirs, manager, store, old) = b2_failed_delete_fixture().await;
 		let mut source = WendelonStateMachine::new();
-		seed_state_machine_pointer(&source, &old).await;
+		seed_state_machine_pointer(&source, &manager, &old).await;
 		RaftStateMachine::apply(
 			&mut source,
 			[Entry {
@@ -6671,7 +6853,7 @@ mod tests {
 				log_id: LogId::new(CommittedLeaderId::new(4, 1), 202),
 				payload: EntryPayload::Normal(crate::consensus::WendelonRequest::TierSlab(
 					TieredSlab {
-						slab_id: old.slab_id,
+						slab: manager.owner_ref().unwrap().slab(old.slab_id),
 						l2_uri: old.l2_uri.clone(),
 						payload_hash: old.payload_hash,
 						is_encrypted: false,

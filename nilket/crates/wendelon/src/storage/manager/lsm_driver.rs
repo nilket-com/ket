@@ -2353,7 +2353,12 @@ impl SlabManager {
 				return Err(err);
 			}
 		};
-		let commit = worker.build_written_compaction_commit(&plan, &written, digest_summary);
+		let commit = worker.build_written_compaction_commit(
+			self.owner_ref()?,
+			&plan,
+			&written,
+			digest_summary,
+		);
 		let post_epoch = match self
 			.install_lsm_compaction_temp_outputs(&plan, &prepared, &written, &commit)
 			.await
@@ -2417,7 +2422,12 @@ impl SlabManager {
 				return Err(err);
 			}
 		};
-		let commit = worker.build_written_compaction_commit(&plan, &written, digest_summary);
+		let commit = worker.build_written_compaction_commit(
+			self.owner_ref()?,
+			&plan,
+			&written,
+			digest_summary,
+		);
 		let post_epoch = match self
 			.install_lsm_compaction_temp_outputs_via_control_ring_with_context(
 				&plan,
@@ -4171,6 +4181,7 @@ impl SlabManager {
 			};
 			let snapshot = self.compaction_manifest_snapshot();
 			let commit = CompactionCommit::gc_mark_delete_pending(
+				self.owner_ref()?,
 				Self::lsm_gc_job_id(snapshot.manifest_epoch, 0xD1, &[slab_id]),
 				snapshot.manifest_epoch,
 				vec![slab_id],
@@ -4281,6 +4292,7 @@ impl SlabManager {
 			};
 			let snapshot = self.compaction_manifest_snapshot();
 			let commit = CompactionCommit::gc_remove(
+				self.owner_ref()?,
 				Self::lsm_gc_job_id(snapshot.manifest_epoch, 0xD2, &[slab_id]),
 				snapshot.manifest_epoch,
 				vec![slab_id],

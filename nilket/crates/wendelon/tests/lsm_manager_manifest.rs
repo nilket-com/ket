@@ -6,13 +6,21 @@ async fn open_test_manager(
 	config: SlabManagerConfig,
 ) -> std::io::Result<std::sync::Arc<SlabManager>> {
 	let owner = wendelon::storage::ownership::DataDirectoryOwner::acquire_existing(&config.dir)?;
-	SlabManager::open_with_owner(config, owner).await
+	let manager = SlabManager::open_with_owner(config, owner).await?;
+	// ADR 0697: this store names its slabs on the ring as node 0, the leader
+	// recorded on this harness's hand-built entries.
+	manager.bind_control_node(0)?;
+	Ok(manager)
 }
 async fn initialize_test_manager(
 	config: SlabManagerConfig,
 ) -> std::io::Result<std::sync::Arc<SlabManager>> {
 	let owner = wendelon::storage::ownership::DataDirectoryOwner::acquire_existing(&config.dir)?;
-	SlabManager::initialize_new_store_with_owner(config, owner).await
+	let manager = SlabManager::initialize_new_store_with_owner(config, owner).await?;
+	// ADR 0697: this store names its slabs on the ring as node 0, the leader
+	// recorded on this harness's hand-built entries.
+	manager.bind_control_node(0)?;
+	Ok(manager)
 }
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -29,6 +37,12 @@ use wendelon::storage::{
 	IoUringFileOps, LocalSlabStore, LsmCompactionWorker, LsmConfig, LsmGcWorker, LsmRunSummary,
 	SidecarSwap, SlabState, TierCommitter, VersionLifecycle,
 };
+
+/// A fixed ring owner for fixtures without a store, minted the way the control
+/// ring itself decodes one (ADR 0697: only a store mints its own owner).
+fn test_owner() -> wendelon::consensus::OwnerRef {
+	serde_json::from_str(r#"{"node":1,"incarnation":1}"#).unwrap()
+}
 
 fn tenant() -> TenantId {
 	TenantId::ZERO
@@ -82,7 +96,7 @@ impl TierCommitter for ManifestApplyingCommitter {
 		))
 	}
 
-	async fn retire_tiered_slab(&self, _slab_id: SlabId) -> std::io::Result<()> {
+	async fn retire_tiered_slab(&self, _slab: wendelon::consensus::SlabRef) -> std::io::Result<()> {
 		Err(std::io::Error::new(
 			std::io::ErrorKind::Unsupported,
 			"tier retirements are not used by this test committer",
@@ -565,6 +579,7 @@ async fn manager_installs_lsm_temp_outputs_into_manifest_and_lookup_index() {
 	let temp_path = written[0].temp_path.clone();
 	let final_path = dir.join(format!("slab_{:016x}.wnd", written[0].slab_id));
 	let commit = CompactionCommit {
+		owner: test_owner(),
 		job_id: plan.job_id,
 		manifest_epoch_pre: plan.manifest_epoch_pre,
 		slabs_to_retire: plan.touched_slabs(),
@@ -998,7 +1013,7 @@ async fn manager_install_rejects_bad_digest_before_manifest_apply() {
 		.unwrap();
 	let mut bad_digest = digest_summary();
 	bad_digest.visible_post = StateDigest::new([7; 32]);
-	let commit = worker.build_written_compaction_commit(&plan, &written, bad_digest);
+	let commit = worker.build_written_compaction_commit(test_owner(), &plan, &written, bad_digest);
 
 	let err = manager
 		.install_lsm_compaction_temp_outputs(&plan, &prepared, &written, &commit)
@@ -1084,7 +1099,8 @@ async fn manager_install_rejects_explicit_lsm_sidecar_swaps() {
 		.write_lsm_compaction_temp_outputs(&plan, &prepared, &frames)
 		.await
 		.unwrap();
-	let mut commit = worker.build_written_compaction_commit(&plan, &written, digest_summary());
+	let mut commit =
+		worker.build_written_compaction_commit(test_owner(), &plan, &written, digest_summary());
 	commit.sidecar_swaps.push(SidecarSwap {
 		source_slab_id: first.slab_id,
 		output_slab_id: written[0].slab_id,
@@ -1258,6 +1274,7 @@ async fn manager_applies_lsm_manifest_compaction_commit() {
 		before.manifest_epoch,
 	);
 	let commit = CompactionCommit {
+		owner: test_owner(),
 		job_id: CompactionJobId::new(1000),
 		manifest_epoch_pre: before.manifest_epoch,
 		slabs_to_retire: vec![input.slab_id],
@@ -1337,6 +1354,7 @@ async fn manager_lsm_gc_waits_for_authoritative_index_rewrite() {
 		before.manifest_epoch,
 	);
 	let commit = CompactionCommit {
+		owner: test_owner(),
 		job_id: CompactionJobId::new(1001),
 		manifest_epoch_pre: before.manifest_epoch,
 		slabs_to_retire: vec![input.slab_id],

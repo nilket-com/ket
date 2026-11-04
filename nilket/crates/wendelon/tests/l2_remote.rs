@@ -69,6 +69,21 @@ struct AppliedStateMachineCommitter {
 	next_index: AtomicU64,
 }
 
+/// ADR 0697: the ring admits a slab command only for its owner node's
+/// registered current incarnation, appended by that node as leader.
+fn registration(owner: wendelon::consensus::OwnerRef, index: u64) -> Entry<WendelonTypeConfig> {
+	Entry::<WendelonTypeConfig> {
+		log_id: LogId::new(CommittedLeaderId::new(1, owner.node()), index),
+		payload: EntryPayload::Normal(WendelonRequest::RegisterIncarnation(
+			wendelon::consensus::RegisterIncarnation {
+				node: owner.node(),
+				incarnation: owner.incarnation(),
+				supersedes: None,
+			},
+		)),
+	}
+}
+
 impl AppliedStateMachineCommitter {
 	fn new(sm: WendelonStateMachine) -> Self {
 		Self {
@@ -85,27 +100,28 @@ impl TierCommitter for AppliedStateMachineCommitter {
 		proposal: wendelon::storage::TierProposal,
 	) -> std::io::Result<()> {
 		let tier = proposal.tier().clone();
-		let index = self.next_index.fetch_add(1, Ordering::Relaxed);
+		let owner = tier.slab.owner();
+		let index = self.next_index.fetch_add(2, Ordering::Relaxed);
 		let entry = Entry::<WendelonTypeConfig> {
-			log_id: LogId::new(CommittedLeaderId::new(1, 0), index),
+			log_id: LogId::new(CommittedLeaderId::new(1, owner.node()), index + 1),
 			payload: EntryPayload::Normal(WendelonRequest::TierSlab(tier)),
 		};
 		let mut sm = self.sm.lock().await;
 		<WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::apply(
 			&mut *sm,
-			vec![entry],
+			vec![registration(owner, index), entry],
 		)
 		.await
 		.map_err(|err| Error::other(format!("test tier commit failed: {err}")))?;
 		Ok(())
 	}
 
-	async fn retire_tiered_slab(&self, slab_id: wendelon::schema::SlabId) -> std::io::Result<()> {
+	async fn retire_tiered_slab(&self, slab: wendelon::consensus::SlabRef) -> std::io::Result<()> {
 		let index = self.next_index.fetch_add(1, Ordering::Relaxed);
 		let entry = Entry::<WendelonTypeConfig> {
-			log_id: LogId::new(CommittedLeaderId::new(1, 0), index),
+			log_id: LogId::new(CommittedLeaderId::new(1, slab.owner().node()), index),
 			payload: EntryPayload::Normal(WendelonRequest::RetireTieredSlab(RetireTieredSlab {
-				slab_id,
+				slab,
 			})),
 		};
 		let mut sm = self.sm.lock().await;
@@ -552,6 +568,9 @@ async fn build_manager_with_sealed_slabs(
 	)
 	.await
 	.unwrap();
+	// ADR 0697: this store names its slabs on the ring as node 0, the leader
+	// recorded on this harness's hand-built entries.
+	manager.bind_control_node(0).unwrap();
 	manager
 		.append(tenant(), id(1), hlc(), b"hello-1")
 		.await
@@ -671,10 +690,16 @@ async fn sweeper_persists_remote_uri_shape_in_tier_metadata() {
 		"expected tier metadata to be committed into the state machine"
 	);
 	for tiered in snapshot.tiered_slabs.values() {
+		// ADR 0697: the key carries the owner segment `{node:08x}-{incarnation:032x}/`
+		// (legibility only) before the slab name.
+		let owner = tiered.slab.owner();
+		let expected = format!(
+			"l2://wendelon-tier/tiered/sealed/{:08x}-{:032x}/slab_",
+			owner.node(),
+			owner.incarnation().get()
+		);
 		assert!(
-			tiered
-				.l2_uri
-				.starts_with("l2://wendelon-tier/tiered/sealed/slab_"),
+			tiered.l2_uri.starts_with(&expected),
 			"unexpected tier URI: {}",
 			tiered.l2_uri
 		);

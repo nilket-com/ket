@@ -45,21 +45,12 @@ fn carrier_wal5_v4_fixtures_and_caps_unchanged() {
 	let b = postcard::to_stdvec(&e).unwrap();
 	let decoded: wire::E = postcard::from_bytes(&b).unwrap();
 	assert_eq!(postcard::to_stdvec(&decoded).unwrap(), b);
-	let manifest =
-		include_str!("../../../../../../tests/fixtures/consensus_body/wal_v4_entries.txt");
-	let hex = manifest
-		.lines()
-		.find_map(|l| l.strip_prefix("finalize="))
-		.unwrap();
-	let expected: Vec<u8> = (0..hex.len())
-		.step_by(2)
-		.map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
-		.collect();
+	// ADR 0697: legacy WAL bodies are refused, never decoded.
 	for version in [0, 4] {
-		let legacy =
+		assert!(
 			crate::consensus::raft_storage::carrier_legacy_fixture_entry(version, "finalize")
-				.unwrap();
-		assert_eq!(postcard::to_stdvec(&legacy).unwrap(), expected);
+				.is_err()
+		);
 	} /* Current carrier roundtrip is not an additional WAL decoder proof; unchanged full WAL corpus tests retain that obligation. */
 }
 #[test]

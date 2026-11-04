@@ -215,6 +215,7 @@ impl LsmCompactionWorker {
 
 	pub fn build_compaction_commit(
 		&self,
+		owner: crate::consensus::OwnerRef,
 		plan: &CompactionPlan,
 		prepared: &LsmPreparedOutputs,
 		digest_summary: CompactionDigestSummary,
@@ -222,6 +223,7 @@ impl LsmCompactionWorker {
 		let mut slabs_to_retire = plan.touched_slabs();
 		slabs_to_retire.sort_unstable();
 		CompactionCommit {
+			owner,
 			job_id: plan.job_id,
 			manifest_epoch_pre: plan.manifest_epoch_pre,
 			slabs_to_retire,
@@ -239,6 +241,7 @@ impl LsmCompactionWorker {
 
 	pub fn build_written_compaction_commit(
 		&self,
+		owner: crate::consensus::OwnerRef,
 		plan: &CompactionPlan,
 		written: &[LsmWrittenOutputRun],
 		digest_summary: CompactionDigestSummary,
@@ -246,6 +249,7 @@ impl LsmCompactionWorker {
 		let mut slabs_to_retire = plan.touched_slabs();
 		slabs_to_retire.sort_unstable();
 		CompactionCommit {
+			owner,
 			job_id: plan.job_id,
 			manifest_epoch_pre: plan.manifest_epoch_pre,
 			slabs_to_retire,

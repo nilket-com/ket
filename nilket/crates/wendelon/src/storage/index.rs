@@ -337,25 +337,7 @@ const META_STORE_INCARNATION_LOW: &str = "store_incarnation_low_v1";
 /// committed before any id below it is used, so reopen never reissues one.
 const META_SLAB_ID_HIGH_WATER: &str = "slab_id_high_water_v1";
 
-/// A random 128-bit identity for one store, fixed at creation. A slab id is
-/// local to the incarnation that issued it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct StoreIncarnation(u128);
-
-impl StoreIncarnation {
-	fn fresh() -> Self {
-		loop {
-			let value = uuid::Uuid::new_v4().as_u128();
-			if value != 0 {
-				return Self(value);
-			}
-		}
-	}
-
-	pub(crate) fn get(self) -> u128 {
-		self.0
-	}
-}
+pub(crate) use crate::consensus::StoreIncarnation;
 
 #[derive(Debug)]
 struct StoreIdentityMissing;
@@ -1194,9 +1176,12 @@ impl PersistentLocalIndex {
 				let mut meta = write_txn.open_table(META_TABLE).map_err(redb_to_io)?;
 				if initialize_new {
 					let incarnation = StoreIncarnation::fresh();
-					meta.insert(META_STORE_INCARNATION_HIGH, &((incarnation.0 >> 64) as u64))
-						.map_err(redb_to_io)?;
-					meta.insert(META_STORE_INCARNATION_LOW, &(incarnation.0 as u64))
+					meta.insert(
+						META_STORE_INCARNATION_HIGH,
+						&((incarnation.get() >> 64) as u64),
+					)
+					.map_err(redb_to_io)?;
+					meta.insert(META_STORE_INCARNATION_LOW, &(incarnation.get() as u64))
 						.map_err(redb_to_io)?;
 					meta.insert(
 						META_SLAB_ID_HIGH_WATER,
@@ -1217,8 +1202,9 @@ impl PersistentLocalIndex {
 					) else {
 						return Err(store_identity_missing());
 					};
-					let incarnation = StoreIncarnation((u128::from(high) << 64) | u128::from(low));
-					if incarnation.0 == 0 {
+					let incarnation =
+						StoreIncarnation::from_raw((u128::from(high) << 64) | u128::from(low));
+					if incarnation.get() == 0 {
 						return Err(store_identity_missing());
 					}
 					incarnation
@@ -4898,6 +4884,7 @@ mod tests {
 			.await
 			.unwrap();
 		let commit = crate::storage::lsm::CompactionCommit::gc_remove(
+			crate::consensus::OwnerRef::for_test(1, 1),
 			crate::schema::CompactionJobId::new(5),
 			ManifestEpoch::new(3),
 			vec![SlabId::new(51)],
@@ -5360,6 +5347,7 @@ mod tests {
 			.await
 			.unwrap();
 		let commit = crate::storage::lsm::CompactionCommit::gc_remove(
+			crate::consensus::OwnerRef::for_test(1, 1),
 			crate::schema::CompactionJobId::new(55),
 			ManifestEpoch::new(3),
 			vec![SlabId::new(51)],

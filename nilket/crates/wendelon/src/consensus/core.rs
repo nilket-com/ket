@@ -12,6 +12,82 @@ use std::collections::BTreeMap;
 
 /// Payload of a `TierSlab` Raft entry (ADR 006).
 ///
+/// A random 128-bit identity for one store, fixed at its creation (ADR 0697).
+/// A slab id is local to the store incarnation that issued it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct StoreIncarnation(u128);
+
+impl StoreIncarnation {
+	pub(crate) fn fresh() -> Self {
+		loop {
+			let value = uuid::Uuid::new_v4().as_u128();
+			if value != 0 {
+				return Self(value);
+			}
+		}
+	}
+
+	pub(crate) fn from_raw(value: u128) -> Self {
+		Self(value)
+	}
+
+	pub fn get(self) -> u128 {
+		self.0
+	}
+}
+
+/// The store that owns a slab: its node and that store's incarnation. Only a
+/// `SlabManager` mints one for its own store; the control ring decodes and
+/// compares them but never builds one from a bare slab id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct OwnerRef {
+	node: u32,
+	incarnation: StoreIncarnation,
+}
+
+impl OwnerRef {
+	pub(crate) fn new(node: u32, incarnation: StoreIncarnation) -> Self {
+		Self { node, incarnation }
+	}
+
+	pub fn node(self) -> u32 {
+		self.node
+	}
+
+	pub fn incarnation(self) -> StoreIncarnation {
+		self.incarnation
+	}
+
+	/// A fixed owner for unit fixtures that build ring commands without a store.
+	#[cfg(test)]
+	pub(crate) fn for_test(node: u32, incarnation: u128) -> Self {
+		Self::new(node, StoreIncarnation::from_raw(incarnation))
+	}
+
+	/// The owner-qualified name of one of this store's slabs.
+	pub fn slab(self, slab: SlabId) -> SlabRef {
+		SlabRef { owner: self, slab }
+	}
+}
+
+/// A slab named across the control ring: the bare id is local to `owner`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct SlabRef {
+	owner: OwnerRef,
+	slab: SlabId,
+}
+
+impl SlabRef {
+	pub fn owner(self) -> OwnerRef {
+		self.owner
+	}
+
+	/// The local id, meaningful only inside `owner`'s store.
+	pub fn local_id(self) -> SlabId {
+		self.slab
+	}
+}
+
 /// Commited when the background sweeper has successfully streamed
 /// a sealed L1 slab to L2 and verified the round-trip hash. The
 /// state machine records the pointer so every replica knows that
@@ -20,8 +96,8 @@ use std::collections::BTreeMap;
 /// unlinks its own L1 file.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TieredSlab {
-	/// Identity of the slab that has been promoted to L2.
-	pub slab_id: SlabId,
+	/// The owner-qualified slab that has been promoted to L2 (ADR 0697).
+	pub slab: SlabRef,
 	/// Opaque URI the L2 [`ObjectStore`] hands back from `put`.
 	/// Treated as an opaque string by the state machine — only
 	/// the read path interprets it.
@@ -210,7 +286,42 @@ pub struct TableDropSettlementRequest {
 /// observes the apply to drop any cached rows / rehydrated copy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetireTieredSlab {
-	pub slab_id: SlabId,
+	pub slab: SlabRef,
+}
+
+/// Payload of a `RegisterIncarnation` Raft entry (ADR 0697 §3): record a
+/// node's current store incarnation. A first registration names no
+/// predecessor; a replacement names the exact current one it supersedes. A
+/// retired incarnation never becomes current again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegisterIncarnation {
+	pub node: u32,
+	pub incarnation: StoreIncarnation,
+	pub supersedes: Option<StoreIncarnation>,
+}
+
+/// Why the state machine refused a slab command without applying or
+/// recording anything. A refusal is not an outcome: it grants no cleanup
+/// authority and does not prove an earlier attempt never applied.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SlabRefusal {
+	/// The command's owner is not its node's current store incarnation.
+	NotCurrentOwner {
+		owner: OwnerRef,
+		current: Option<StoreIncarnation>,
+	},
+	/// The command's owner node is not the leader that appended the entry.
+	NotAppendingLeader { owner_node: u32, leader_node: u32 },
+	/// A registration that does not name the node's current incarnation.
+	StaleSupersede {
+		node: u32,
+		current: Option<StoreIncarnation>,
+	},
+	/// A registration of an incarnation that was already retired.
+	RetiredIncarnation {
+		node: u32,
+		incarnation: StoreIncarnation,
+	},
 }
 
 /// The unified Node ID type used across Wendelon.
@@ -626,8 +737,12 @@ pub enum WendelonRequest {
 	TableDropLogicalFinalize(TableDropLogicalFinalizeRequest),
 	/// ADR 0095 physical settlement after the complete stamped set attests.
 	TableDropSettlement(TableDropSettlementRequest),
-	/// V-S1 durable carrier, held without domain-state effects.
+	/// V-S1 durable carrier, held without domain-state effects. Its wire
+	/// position is pinned by the Root2 audit vectors.
 	Root2Command(crate::consensus::Root2Carrier1),
+	/// Record a node's current store incarnation (ADR 0697). Appended after
+	/// the Root2 carrier so its pinned wire position does not move.
+	RegisterIncarnation(RegisterIncarnation),
 }
 
 impl WendelonRequest {
@@ -637,7 +752,7 @@ impl WendelonRequest {
 	/// variant moves no existing golden bytes, so the corpus alone cannot see
 	/// it — the count and this list can. Adding a variant here means the WAL
 	/// format version must move with it.
-	pub const ALL_VARIANT_NAMES: [&'static str; 27] = [
+	pub const ALL_VARIANT_NAMES: [&'static str; 28] = [
 		"finalize",
 		"acquire_lease",
 		"release_lease",
@@ -665,6 +780,7 @@ impl WendelonRequest {
 		"table_drop_logical_finalize",
 		"table_drop_settlement",
 		"root2_command",
+		"register_incarnation",
 	];
 
 	/// Total by construction: a new variant fails this match at compile time,
@@ -699,6 +815,7 @@ impl WendelonRequest {
 			Self::TableDropLogicalFinalize(_) => "table_drop_logical_finalize",
 			Self::TableDropSettlement(_) => "table_drop_settlement",
 			Self::Root2Command(_) => "root2_command",
+			Self::RegisterIncarnation(_) => "register_incarnation",
 		}
 	}
 }
@@ -715,6 +832,8 @@ pub enum WendelonResponse {
 	Error(String),
 	/// Committed and held: the Root2 carrier is dormant, not domain-applied.
 	Root2Dormant,
+	/// Refused without applying or recording anything (ADR 0697).
+	Refused(SlabRefusal),
 }
 
 // The Wendelon implementation of the `openraft::RaftTypeConfig` trait.

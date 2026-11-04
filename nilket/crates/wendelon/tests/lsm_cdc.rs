@@ -15,6 +15,12 @@ use wendelon::storage::{
 	apply_elision, check_read_against_retention,
 };
 
+/// A fixed ring owner for fixtures without a store, minted the way the control
+/// ring itself decodes one (ADR 0697: only a store mints its own owner).
+fn test_owner() -> wendelon::consensus::OwnerRef {
+	serde_json::from_str(r#"{"node":1,"incarnation":1}"#).unwrap()
+}
+
 fn hlc(ms: u64) -> HybridTimestamp {
 	HybridTimestamp {
 		physical_ms: ms,
@@ -95,6 +101,7 @@ async fn cdc_catchup_live_tail_handoff_is_monotonic_across_compaction_commit() {
 	manifest.insert_live_run(run(1, CompactionLevelIndex::L0, 10, 20));
 
 	let commit = CompactionCommit {
+		owner: test_owner(),
 		job_id: CompactionJobId::new(800),
 		manifest_epoch_pre: ManifestEpoch::new(10),
 		slabs_to_retire: vec![SlabId::new(1)],

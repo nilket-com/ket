@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Error, ErrorKind};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const CLUSTER_BACKUP_FORMAT_VERSION: u16 = 1;
+pub const CLUSTER_BACKUP_FORMAT_VERSION: u16 = 2;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClusterBackupConsistentCut {
@@ -22,6 +22,8 @@ pub struct ClusterBackupConsistentCut {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClusterNodeBackupManifest {
 	pub node_id: u32,
+	/// The store this node's local ids and pointers belong to (ADR 0697).
+	pub source: crate::consensus::OwnerRef,
 	pub active_slab_id: SlabId,
 	pub next_slab_id: SlabId,
 	pub local_copy_slab_ids: Vec<SlabId>,
@@ -111,6 +113,10 @@ impl ClusterBackupImage {
 				),
 			));
 		}
+		self.control.validate_format()?;
+		for node in &self.nodes {
+			node.storage.validate_format()?;
+		}
 		if self.manifest.control_image_hash != artifact_hash(&self.control)? {
 			return Err(Error::new(
 				ErrorKind::InvalidData,
@@ -172,6 +178,16 @@ impl ClusterBackupImage {
 					),
 				));
 			}
+			if node.storage.manifest.source.node() != node.node_id {
+				return Err(Error::new(
+					ErrorKind::InvalidData,
+					format!(
+						"cluster backup storage for node {} names source node {}",
+						node.node_id,
+						node.storage.manifest.source.node()
+					),
+				));
+			}
 			let expected =
 				storage_manifest_for_node(node.node_id, &node.storage, recomputed_storage_hash)?;
 			if **recorded != expected {
@@ -183,6 +199,256 @@ impl ClusterBackupImage {
 					),
 				));
 			}
+		}
+		Ok(())
+	}
+}
+
+/// Where a backup node's storage is being restored to (ADR 0697).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RestoreTarget {
+	/// The same node id, as a fresh store incarnation.
+	SameNode,
+	/// A replacement node with a different id, as a fresh store incarnation.
+	Replacement { target_node: u32 },
+}
+
+/// ADR 0697: a restore this release cannot perform safely, refused before any
+/// restore effect. Restoring a registered node to a fresh incarnation and
+/// re-admitting cold data need an arbitrated owner transition (DC-162).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UnsupportedRestore {
+	/// The source store has tiered or omitted (cold) data that a fresh
+	/// incarnation would not own.
+	ColdReferences {
+		source: crate::consensus::OwnerRef,
+		tiered: usize,
+		omitted: usize,
+	},
+	/// The target node is already bound to a store incarnation on the ring; a
+	/// fresh store cannot take it over without an owner transition.
+	IncarnationTransition { node: u32 },
+}
+
+impl std::fmt::Display for UnsupportedRestore {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			Self::ColdReferences {
+				source,
+				tiered,
+				omitted,
+			} => write!(
+				f,
+				"UnsupportedRestore::ColdReferences: source {source:?} has {tiered} tiered and {omitted} omitted slab references; restoring cold data to a fresh store is not supported (DC-162)"
+			),
+			Self::IncarnationTransition { node } => write!(
+				f,
+				"UnsupportedRestore::IncarnationTransition: node {node} is bound to a store incarnation on the ring; a fresh store cannot take it over (DC-162)"
+			),
+		}
+	}
+}
+
+impl std::error::Error for UnsupportedRestore {}
+
+/// A backup artifact declares a manifest format this build does not read
+/// (ADR 0697). There is no migration path; the artifact is refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnsupportedBackupFormat {
+	pub artifact: &'static str,
+	pub found: u16,
+	pub required: u16,
+}
+
+impl std::fmt::Display for UnsupportedBackupFormat {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(
+			f,
+			"UnsupportedBackupFormat: {} backup manifest declares format version {} (this build reads only {})",
+			self.artifact, self.found, self.required
+		)
+	}
+}
+
+impl std::error::Error for UnsupportedBackupFormat {}
+
+fn validate_backup_format(
+	artifact: &'static str,
+	found: u16,
+	required: u16,
+) -> std::io::Result<()> {
+	if found == required {
+		return Ok(());
+	}
+	Err(Error::new(
+		ErrorKind::InvalidData,
+		UnsupportedBackupFormat {
+			artifact,
+			found,
+			required,
+		},
+	))
+}
+
+impl ControlRingBackupImage {
+	/// This artifact's own manifest format, never inferred from a successful
+	/// decode or from the current bodies it encloses.
+	pub(crate) fn validate_format(&self) -> std::io::Result<()> {
+		validate_backup_format(
+			"control",
+			self.manifest.format_version,
+			crate::consensus::raft_storage::CONTROL_RING_BACKUP_FORMAT_VERSION,
+		)
+	}
+}
+
+impl StorageBackupImage {
+	/// This artifact's own manifest format, never inferred from a successful
+	/// decode.
+	pub(crate) fn validate_format(&self) -> std::io::Result<()> {
+		validate_backup_format(
+			"storage",
+			self.manifest.format_version,
+			crate::storage::manager::STORAGE_BACKUP_FORMAT_VERSION,
+		)
+	}
+}
+
+/// The image's storage does not agree with the control state its own bytes
+/// replay to (ADR 0697 restore preflight); the image is refused as invalid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackupSourceMismatch {
+	/// The storage manifest's source names another node.
+	SourceNode {
+		node: u32,
+		source: crate::consensus::OwnerRef,
+	},
+	/// The source is registered but is not its node's current incarnation.
+	NotCurrentIncarnation { source: crate::consensus::OwnerRef },
+	/// The storage references differ from the source's committed pointers.
+	ReferencesDiffer { source: crate::consensus::OwnerRef },
+	/// The control state holds pointers for a node that never registered.
+	UnregisteredPointers { node: u32 },
+}
+
+impl std::fmt::Display for BackupSourceMismatch {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			Self::SourceNode { node, source } => write!(
+				f,
+				"BackupSourceMismatch::SourceNode: storage for node {node} names source {source:?}"
+			),
+			Self::NotCurrentIncarnation { source } => write!(
+				f,
+				"BackupSourceMismatch::NotCurrentIncarnation: backup source {source:?} is not its node's current incarnation in the backup's control state"
+			),
+			Self::ReferencesDiffer { source } => write!(
+				f,
+				"BackupSourceMismatch::ReferencesDiffer: backup storage references for {source:?} do not match its committed pointers"
+			),
+			Self::UnregisteredPointers { node } => write!(
+				f,
+				"BackupSourceMismatch::UnregisteredPointers: backup control state holds pointers for unregistered node {node}"
+			),
+		}
+	}
+}
+
+impl std::error::Error for BackupSourceMismatch {}
+
+impl ClusterBackupImage {
+	/// ADR 0697 restore preflight, decided from the control state these exact
+	/// backup bytes replay to, before any restore marker, artifact or
+	/// publication. It binds the node's storage to its source store, checks
+	/// the source's complete canonical pointer set against the image, and
+	/// refuses cold references and registered-node incarnation transitions.
+	pub(crate) fn validate_restore_eligibility(
+		&self,
+		source_node: u32,
+		target: RestoreTarget,
+	) -> std::io::Result<()> {
+		let node = self
+			.nodes
+			.iter()
+			.find(|node| node.node_id == source_node)
+			.ok_or_else(|| {
+				Error::new(
+					ErrorKind::NotFound,
+					format!("cluster backup has no storage for node {source_node}"),
+				)
+			})?;
+		let source = node.storage.manifest.source;
+		if source.node() != source_node {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				BackupSourceMismatch::SourceNode {
+					node: source_node,
+					source,
+				},
+			));
+		}
+		let state = self.control.replayed_state()?;
+		let registry = state.incarnations.get(&source.node());
+		let registered = registry
+			.is_some_and(|registry| registry.current.is_some() || !registry.retired.is_empty());
+		let mut canonical: Vec<TieredSlabPointer> = state
+			.tiered_slabs
+			.values()
+			.filter(|tier| tier.slab.owner() == source)
+			.map(TieredSlabPointer::from_ring)
+			.collect();
+		canonical.sort_by_key(|pointer| pointer.slab_id);
+		let mut referenced = node.storage.manifest.tiered_slabs.clone();
+		referenced.sort_by_key(|pointer| pointer.slab_id);
+		if registered {
+			if registry.and_then(|registry| registry.current) != Some(source.incarnation()) {
+				return Err(Error::new(
+					ErrorKind::InvalidData,
+					BackupSourceMismatch::NotCurrentIncarnation { source },
+				));
+			}
+			if canonical != referenced {
+				return Err(Error::new(
+					ErrorKind::InvalidData,
+					BackupSourceMismatch::ReferencesDiffer { source },
+				));
+			}
+		} else if state
+			.tiered_slabs
+			.keys()
+			.any(|slab| slab.owner().node() == source.node())
+		{
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				BackupSourceMismatch::UnregisteredPointers {
+					node: source.node(),
+				},
+			));
+		}
+		let omitted = node.storage.manifest.omitted_rehydrated_slabs.len();
+		if !referenced.is_empty() || !canonical.is_empty() || omitted > 0 {
+			return Err(Error::new(
+				ErrorKind::Unsupported,
+				UnsupportedRestore::ColdReferences {
+					source,
+					tiered: referenced.len().max(canonical.len()),
+					omitted,
+				},
+			));
+		}
+		let target_node = match target {
+			RestoreTarget::SameNode => source.node(),
+			RestoreTarget::Replacement { target_node } => target_node,
+		};
+		if state
+			.incarnations
+			.get(&target_node)
+			.is_some_and(|registry| registry.current.is_some())
+		{
+			return Err(Error::new(
+				ErrorKind::Unsupported,
+				UnsupportedRestore::IncarnationTransition { node: target_node },
+			));
 		}
 		Ok(())
 	}
@@ -226,6 +492,7 @@ fn storage_manifest_for_node(
 	local_copy_slab_ids.sort_unstable();
 	Ok(ClusterNodeBackupManifest {
 		node_id,
+		source: storage.manifest.source,
 		active_slab_id: storage.manifest.active_slab_id,
 		next_slab_id: storage.manifest.next_slab_id,
 		local_copy_slab_ids,

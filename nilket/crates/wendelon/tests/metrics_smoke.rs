@@ -5,7 +5,11 @@ async fn initialize_test_manager(
 	config: SlabManagerConfig,
 ) -> std::io::Result<std::sync::Arc<SlabManager>> {
 	let owner = wendelon::storage::ownership::DataDirectoryOwner::acquire_existing(&config.dir)?;
-	SlabManager::initialize_new_store_with_owner(config, owner).await
+	let manager = SlabManager::initialize_new_store_with_owner(config, owner).await?;
+	// ADR 0697: this store names its slabs on the ring as node 0, the leader
+	// recorded on this harness's hand-built entries.
+	manager.bind_control_node(0)?;
+	Ok(manager)
 }
 
 use arrow::array::{LargeBinaryArray, LargeBinaryBuilder};
@@ -155,6 +159,16 @@ fn metric_value(body: &str, name: &str) -> u64 {
 		.unwrap_or(0)
 }
 
+/// ADR 0697: the registry a committed slab command carries for its owner.
+fn current_registry(
+	owner: wendelon::consensus::OwnerRef,
+) -> wendelon::consensus::IncarnationRegistry {
+	wendelon::consensus::IncarnationRegistry {
+		current: Some(owner.incarnation()),
+		..Default::default()
+	}
+}
+
 struct DirectApplyCommitter {
 	observer: Arc<dyn TierObserver>,
 }
@@ -166,11 +180,15 @@ impl TierCommitter for DirectApplyCommitter {
 		proposal: wendelon::storage::TierProposal,
 	) -> std::io::Result<()> {
 		let tier = proposal.tier().clone();
-		self.observer.on_slab_tiered(&tier, 0).await
+		self.observer
+			.on_slab_tiered(&tier, &current_registry(tier.slab.owner()), 0)
+			.await
 	}
 
-	async fn retire_tiered_slab(&self, slab_id: wendelon::schema::SlabId) -> std::io::Result<()> {
-		self.observer.on_slab_retired(slab_id, 0).await
+	async fn retire_tiered_slab(&self, slab: wendelon::consensus::SlabRef) -> std::io::Result<()> {
+		self.observer
+			.on_slab_retired(slab, &current_registry(slab.owner()), 0)
+			.await
 	}
 }
 

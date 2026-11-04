@@ -12,6 +12,12 @@ use wendelon::storage::{
 	SurvivorOrDrop, VersionEntry, VersionLifecycle,
 };
 
+/// A fixed ring owner for fixtures without a store, minted the way the control
+/// ring itself decodes one (ADR 0697: only a store mints its own owner).
+fn test_owner() -> wendelon::consensus::OwnerRef {
+	serde_json::from_str(r#"{"node":1,"incarnation":1}"#).unwrap()
+}
+
 fn hlc(ms: u64) -> HybridTimestamp {
 	HybridTimestamp {
 		physical_ms: ms,
@@ -243,7 +249,7 @@ fn compaction_worker_builds_commit_and_outcome_from_prepared_outputs() {
 		)
 		.unwrap();
 
-	let commit = worker.build_compaction_commit(&plan, &prepared, digest_summary());
+	let commit = worker.build_compaction_commit(test_owner(), &plan, &prepared, digest_summary());
 
 	assert_eq!(commit.job_id, plan.job_id);
 	assert_eq!(commit.manifest_epoch_pre, ManifestEpoch::new(5));
@@ -293,7 +299,7 @@ fn worker_commit_artifact_passes_manifest_plan_validation() {
 			[SlabId::new(10)],
 		)
 		.unwrap();
-	let commit = worker.build_compaction_commit(&plan, &prepared, digest_summary());
+	let commit = worker.build_compaction_commit(test_owner(), &plan, &prepared, digest_summary());
 	let mut manifest = CompactionManifest::new(plan.manifest_epoch_pre);
 	manifest.insert_live_run(LsmRunSummary::new(
 		SlabId::new(1),

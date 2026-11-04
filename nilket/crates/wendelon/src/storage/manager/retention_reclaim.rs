@@ -793,6 +793,10 @@ impl SlabManager {
 	}
 
 	pub(crate) fn require_cleanup_authority(&self) -> std::io::Result<()> {
+		// ADR 0697: a superseded or unexplained store cleans up nothing.
+		if let Some(reason) = self.owner_authority_fence.get() {
+			return Err(Error::new(ErrorKind::WouldBlock, *reason));
+		}
 		if self
 			.persistent_index
 			.as_ref()
@@ -1929,7 +1933,7 @@ impl SlabManager {
 					let (stats_format_version, stats_block_len, stats_block_hash128) =
 						stats_advisory_fields(footer.stats_locator);
 					let tier = TieredSlab {
-						slab_id,
+						slab: self.owner_ref()?.slab(slab_id),
 						l2_uri: new_uri.clone(),
 						payload_hash,
 						is_encrypted: true,
@@ -1998,7 +2002,10 @@ impl SlabManager {
 				} => {
 					self.stage_table_drop_l2_cleanup(slab_id, &old_l2_uri, Some(old_bytes), None)
 						.await?;
-					if let Err(error) = committer.retire_tiered_slab(slab_id).await {
+					if let Err(error) = committer
+						.retire_tiered_slab(self.owner_ref()?.slab(slab_id))
+						.await
+					{
 						// As above, a transport error does not prove the retirement failed.
 						// Reconciliation compares the durable pointer with the marker.
 						return Err(error);
@@ -2489,7 +2496,7 @@ impl SlabManager {
 					let (stats_format_version, stats_block_len, stats_block_hash128) =
 						stats_advisory_fields(footer.stats_locator);
 					let tier = TieredSlab {
-						slab_id,
+						slab: self.owner_ref()?.slab(slab_id),
 						l2_uri: new_uri.clone(),
 						payload_hash,
 						is_encrypted: true,
@@ -2557,7 +2564,9 @@ impl SlabManager {
 				} => {
 					self.stage_table_drop_l2_cleanup(slab_id, &old_l2_uri, Some(old_bytes), None)
 						.await?;
-					committer.retire_tiered_slab(slab_id).await?;
+					committer
+						.retire_tiered_slab(self.owner_ref()?.slab(slab_id))
+						.await?;
 					Self::retain_superseded_l2_object(slab_id, &old_l2_uri, "tier retirement")?;
 					self.clear_retired_tiered_cleanup(slab_id);
 					report.compacted_slabs += 1;

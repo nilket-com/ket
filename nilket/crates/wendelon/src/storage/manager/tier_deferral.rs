@@ -245,11 +245,20 @@ impl SlabManager {
 		&self,
 		slab_id: SlabId,
 	) -> Option<Option<TieredSlabPointer>> {
-		let tier = self
+		// ADR 0697: this store's own pointer, classified against its node's
+		// registry from the same state; a store that is not current reads none.
+		let owner = self.owner_ref().ok()?;
+		let (tier, registry) = self
 			.canonical_tier_source
 			.get()?
-			.try_tiered_slab(slab_id)
+			.try_tiered_slab(owner.slab(slab_id))
 			.ok()?;
+		if !matches!(
+			self.classify_own_node(&registry, super::slab_ids::OwnerEvidence::Current),
+			super::slab_ids::Ownership::Own(_)
+		) {
+			return None;
+		}
 		Some(tier.as_ref().map(super::tier_tokens::tiered_slab_pointer))
 	}
 

@@ -1281,6 +1281,9 @@ impl WendelonNode {
 	) -> std::io::Result<()> {
 		std::fs::create_dir_all(&cfg.data_dir)?;
 		backup.validate_integrity()?;
+		// ADR 0697: eligibility from the backup's replayed control state, before
+		// any restore marker or artifact.
+		backup.validate_restore_eligibility(cfg.node_id, crate::backup::RestoreTarget::SameNode)?;
 		let node_backup = backup
 			.nodes
 			.iter()
@@ -1335,6 +1338,14 @@ impl WendelonNode {
 			}
 		}
 		backup.validate_integrity()?;
+		// ADR 0697: eligibility from the backup's replayed control state, before
+		// the AWAITING_CLUSTER marker or any artifact.
+		backup.validate_restore_eligibility(
+			source_node_id,
+			crate::backup::RestoreTarget::Replacement {
+				target_node: cfg.node_id,
+			},
+		)?;
 		let node_backup = backup
 			.nodes
 			.iter()
@@ -1831,6 +1842,8 @@ impl WendelonNode {
 				}
 			}
 		};
+		// ADR 0697: this store names its slabs on the ring as this node.
+		slab.bind_control_node(cfg.node_id)?;
 
 		let bootstrap_mode = log_store.bootstrap_mode().await;
 		let checkpoint_coordinator = CheckpointCoordinator::new(log_store.clone());
@@ -1878,50 +1891,39 @@ impl WendelonNode {
 		// Safe because Raft has not been constructed yet, so no tenant-KEK
 		// observer callback can race this authoritative bootstrap snapshot.
 		crypto.replace_keysets_from_authoritative_snapshot(&recovered_state.tenant_keysets)?;
-		let mut recovered_tiers = recovered_state
-			.tiered_slabs
-			.values()
-			.cloned()
-			.collect::<Vec<_>>();
+		// ADR 0697: only this store's own committed pointers are its tier
+		// evidence. A view that is not authoritative for this store (a
+		// superseded or unexplained identity, already fenced) stages nothing
+		// and retires nothing.
+		let own_tiers = slab.own_tier_view(
+			recovered_state.tiered_slabs.values(),
+			&recovered_state.incarnations,
+		);
 		let recovered_log_index = recovered_state.last_applied_log_id.map(|id| id.index);
 		if !slab.is_awaiting_cluster() {
 			if let Some(index) = recovered_log_index {
 				slab.seed_installed_snapshot_index(index);
 			}
 		}
-		// A recovered committed prefix is complete before Raft and observer startup.
-		// Replacement imports remain fenced until a complete leader state arrives.
-		if !slab.is_awaiting_cluster() && recovered_state.last_applied_log_id.is_some() {
-			let committed_ids = recovered_tiers.iter().map(|tier| tier.slab_id).collect();
-			slab.fence_local_tiers_absent_from_committed(&committed_ids, recovered_log_index)
-				.await?;
-		}
-		recovered_tiers.sort_by_key(|tier| tier.slab_id);
-		let committed_id_floor = recovered_tiers
-			.last()
-			.map(|tier| tier.slab_id)
-			.unwrap_or(SlabId::ZERO);
-		// Recovered committed callbacks are replay evidence even on an awaiting
-		// replacement. Register them without clearing its marker or serving data.
-		for tier in recovered_tiers {
-			slab.stage_bootstrap_tier_authority(
-				crate::storage::TieredSlabPointer {
-					slab_id: tier.slab_id,
-					l2_uri: tier.l2_uri,
-					payload_hash: tier.payload_hash,
-					is_encrypted: tier.is_encrypted,
-					tenant_id: tier.tenant_id,
-					tenant_kek_id: tier.tenant_kek_id,
-					stats_format_version: tier.stats_format_version,
-					stats_block_len: tier.stats_block_len,
-					stats_block_hash128: tier.stats_block_hash128,
-					tombstone_metadata: tier.tombstone_metadata,
-					supersession_metadata: tier.supersession_metadata,
-				},
-				recovered_log_index,
-				committed_id_floor,
-			)
-			.await?;
+		if let Some(mut recovered_tiers) = own_tiers {
+			// A recovered committed prefix is complete before Raft and observer startup.
+			// Replacement imports remain fenced until a complete leader state arrives.
+			if !slab.is_awaiting_cluster() && recovered_state.last_applied_log_id.is_some() {
+				let committed_ids = recovered_tiers.iter().map(|tier| tier.slab_id).collect();
+				slab.fence_local_tiers_absent_from_committed(&committed_ids, recovered_log_index)
+					.await?;
+			}
+			recovered_tiers.sort_by_key(|tier| tier.slab_id);
+			let committed_id_floor = recovered_tiers
+				.last()
+				.map(|tier| tier.slab_id)
+				.unwrap_or(SlabId::ZERO);
+			// Recovered committed callbacks are replay evidence even on an awaiting
+			// replacement. Register them without clearing its marker or serving data.
+			for tier in recovered_tiers {
+				slab.stage_bootstrap_tier_authority(tier, recovered_log_index, committed_id_floor)
+					.await?;
+			}
 		}
 		let seed_epoch = select_bootstrap_epoch(&recovered_state, &fallback_epoch, cfg.rf)?;
 		let (epoch_tx, epoch_rx) = watch::channel(Arc::new(seed_epoch));
@@ -2373,7 +2375,8 @@ impl WendelonNode {
 			));
 		#[cfg(test)]
 		scope.checkpoint(&cfg, "set_eviction_watchdog").await?;
-		let raft_committer: Arc<dyn TierCommitter> = Arc::new(RaftCommitter::new(raft.clone()));
+		let raft_committer: Arc<dyn TierCommitter> =
+			Arc::new(RaftCommitter::new(raft.clone()).with_state_machine(state_machine.clone()));
 		let lsm_worker = LsmCompactionWorker::new(LsmConfig::default(), slab.slab_pin_table())?;
 		let lsm_driver = Arc::new(LeaderGatedLsmCompactionDriver::new(
 			slab.clone(),
@@ -3067,6 +3070,9 @@ fn install_tenant_kek_response(response: WendelonResponse, context: &str) -> std
 			ErrorKind::AlreadyExists,
 			format!("{context}: {message}"),
 		)),
+		crate::consensus::WendelonResponse::Refused(refusal) => Err(Error::other(format!(
+			"unexpected slab refusal for a non-slab command: {refusal:?}"
+		))),
 		crate::consensus::WendelonResponse::Root2Dormant => {
 			let message = String::from("Root2 carrier is dormant, not applied");
 			Err(Error::new(
@@ -3099,6 +3105,9 @@ fn tenant_request_response(response: WendelonResponse, context: &str) -> std::io
 			ErrorKind::InvalidInput,
 			format!("{context}: {message}"),
 		)),
+		WendelonResponse::Refused(refusal) => Err(Error::other(format!(
+			"unexpected slab refusal for a non-slab command: {refusal:?}"
+		))),
 		WendelonResponse::Root2Dormant => {
 			let message = String::from("Root2 carrier is dormant, not applied");
 			Err(Error::new(
@@ -3706,6 +3715,26 @@ mod tests {
 	use std::sync::atomic::{AtomicBool, Ordering};
 	use std::time::Duration;
 
+	/// ADR 0697: register this node's store on the ring (an exact replay is a
+	/// receipt) and return its owner, for tests that write slab commands
+	/// straight through Raft rather than through the committer.
+	async fn registered_owner(node: &WendelonNode) -> crate::consensus::OwnerRef {
+		let owner = node.slab.owner_ref().unwrap();
+		let response = node
+			.raft
+			.client_write(WendelonRequest::RegisterIncarnation(
+				crate::consensus::RegisterIncarnation {
+					node: owner.node(),
+					incarnation: owner.incarnation(),
+					supersedes: None,
+				},
+			))
+			.await
+			.unwrap();
+		assert_eq!(response.data, crate::consensus::WendelonResponse::Success);
+		owner
+	}
+
 	fn tempdir(tag: &str) -> crate::test_support::TestDir {
 		crate::test_support::TestDir::new(&format!("wendelon-bootstrap-{tag}"))
 	}
@@ -4269,8 +4298,227 @@ mod tests {
 		recovered.handles.abort();
 	}
 
+	/// ADR 0697 (DC-162 interim): a never-registered store's local-only image
+	/// restores to its node as a fresh incarnation and serves. Once the node
+	/// has registered its store on the ring, the same local-only restore is
+	/// refused before any restore effect: a fresh store cannot take it over.
 	#[tokio::test]
-	async fn single_node_bootstrap_reconciles_tiered_slabs_from_recovered_state() {
+	async fn local_only_restore_requires_an_unregistered_target() {
+		let tenant = crate::schema::TenantId::ZERO;
+		let key = Identity::blake3(b"local-only-row");
+		let hlc = crate::schema::HybridTimestamp {
+			physical_ms: 13,
+			logical: 0,
+			node_id: 13,
+		};
+		let fresh_restore_dir = |source: &std::path::Path, tag: &str| {
+			let dir = tempdir(tag);
+			std::fs::create_dir_all(dir.join(".wendelon")).unwrap();
+			std::fs::copy(
+				source.join(".wendelon/dev-root-kek.bin"),
+				dir.join(".wendelon/dev-root-kek.bin"),
+			)
+			.unwrap();
+			dir
+		};
+
+		// Never registered: restores and serves.
+		let dir = tempdir("local-only-restore-source");
+		let cfg = NodeBootstrapConfig::dev(13, dir.to_path_buf(), "127.0.0.1:0".into());
+		let node = WendelonNode::bootstrap_single_node(cfg.clone())
+			.await
+			.unwrap();
+		node.slab
+			.append_durable(tenant, key, hlc, b"local-only-row")
+			.await
+			.unwrap();
+		let backup = node.export_cluster_backup().await.unwrap();
+		node.shutdown().await.unwrap();
+		assert!(
+			!backup
+				.control
+				.replayed_state()
+				.unwrap()
+				.incarnations
+				.contains_key(&13),
+			"premise: the source store never registered on the ring"
+		);
+		let restore_dir = fresh_restore_dir(&dir, "local-only-restore-target");
+		let mut restore_cfg = cfg.clone();
+		restore_cfg.data_dir = restore_dir.to_path_buf();
+		let restored = WendelonNode::restore_from_cluster_backup(&backup, restore_cfg.clone())
+			.await
+			.unwrap();
+		wait_for_ready(&restored).await;
+		let location = restored.slab.lookup(tenant, key).unwrap().unwrap();
+		assert_eq!(
+			restored.slab.read(location).await.unwrap(),
+			b"local-only-row"
+		);
+		restored.shutdown().await.unwrap();
+		// The restored store reopens as itself and still serves.
+		let reopened = WendelonNode::bootstrap_single_node(restore_cfg.clone())
+			.await
+			.unwrap();
+		wait_for_ready(&reopened).await;
+		let location = reopened.slab.lookup(tenant, key).unwrap().unwrap();
+		assert_eq!(
+			reopened.slab.read(location).await.unwrap(),
+			b"local-only-row"
+		);
+		reopened.shutdown().await.unwrap();
+
+		// Registered: the same kind of local-only restore is refused.
+		let dir = tempdir("local-only-registered-source");
+		let cfg = NodeBootstrapConfig::dev(13, dir.to_path_buf(), "127.0.0.1:0".into());
+		let node = WendelonNode::bootstrap_single_node(cfg.clone())
+			.await
+			.unwrap();
+		node.slab
+			.append_durable(tenant, key, hlc, b"local-only-row")
+			.await
+			.unwrap();
+		registered_owner(&node).await;
+		let backup = node.export_cluster_backup().await.unwrap();
+		node.shutdown().await.unwrap();
+		let restore_dir = fresh_restore_dir(&dir, "local-only-registered-target");
+		let mut restore_cfg = cfg.clone();
+		restore_cfg.data_dir = restore_dir.to_path_buf();
+		let error = WendelonNode::restore_from_cluster_backup(&backup, restore_cfg)
+			.await
+			.err()
+			.expect("a registered node cannot be taken over by a fresh store");
+		assert!(
+			error.get_ref().is_some_and(|cause| matches!(
+				cause.downcast_ref::<crate::backup::UnsupportedRestore>(),
+				Some(crate::backup::UnsupportedRestore::IncarnationTransition { node: 13 })
+			)),
+			"{error}"
+		);
+		for artifact in [
+			"storage_index.redb",
+			"control.wal",
+			"STORAGE_INDEX_RESTORE_AUTHORITY",
+		] {
+			assert!(
+				!restore_dir.join(artifact).exists(),
+				"restore wrote {artifact}"
+			);
+		}
+	}
+
+	/// ADR 0697: an image whose embedded storage or control backup manifest
+	/// declares a format this build does not read is refused at both restore
+	/// entry points with no restore effect, though its outer hashes are valid
+	/// and its enclosed bodies are current.
+	#[tokio::test]
+	async fn restore_refuses_an_unsupported_embedded_backup_format_at_both_entries() {
+		let dir = tempdir("embedded-format-source");
+		let cfg = NodeBootstrapConfig::dev(14, dir.to_path_buf(), "127.0.0.1:0".into());
+		let node = WendelonNode::bootstrap_single_node(cfg.clone())
+			.await
+			.unwrap();
+		node.slab
+			.append_durable(
+				crate::schema::TenantId::ZERO,
+				Identity::blake3(b"embedded-format-row"),
+				crate::schema::HybridTimestamp {
+					physical_ms: 14,
+					logical: 0,
+					node_id: 14,
+				},
+				b"embedded-format-row",
+			)
+			.await
+			.unwrap();
+		let backup = node.export_cluster_backup().await.unwrap();
+		node.shutdown().await.unwrap();
+		let state = backup.control.replayed_state().unwrap();
+		let no_effects = |target: &std::path::Path| {
+			for artifact in [
+				"storage_index.redb",
+				"control.wal",
+				"vote.wnd",
+				"snapshot.wnd",
+				"STORAGE_INDEX_RESTORE_AUTHORITY",
+				crate::storage::manager::AWAITING_CLUSTER_MARKER,
+			] {
+				assert!(!target.join(artifact).exists(), "restore wrote {artifact}");
+			}
+		};
+		let refused = |error: std::io::Error, artifact: &str, found: u16| {
+			let format = error
+				.get_ref()
+				.and_then(|cause| cause.downcast_ref::<crate::backup::UnsupportedBackupFormat>())
+				.copied();
+			assert_eq!(
+				format.map(|format| (format.artifact.to_string(), format.found)),
+				Some((artifact.to_string(), found)),
+				"{error}"
+			);
+		};
+		for (artifact, found) in [
+			("storage", 1_u16),
+			("storage", 99),
+			("control", 0),
+			("control", 99),
+		] {
+			let mut control = backup.control.clone();
+			let mut nodes = backup.nodes.clone();
+			match artifact {
+				"storage" => nodes[0].storage.manifest.format_version = found,
+				_ => control.manifest.format_version = found,
+			}
+			let image =
+				crate::backup::ClusterBackupImage::assemble(control, &state, nodes).unwrap();
+
+			let target = tempdir("embedded-format-cluster");
+			std::fs::create_dir_all(target.join(".wendelon")).unwrap();
+			std::fs::copy(
+				dir.join(".wendelon/dev-root-kek.bin"),
+				target.join(".wendelon/dev-root-kek.bin"),
+			)
+			.unwrap();
+			let mut same = cfg.clone();
+			same.data_dir = target.to_path_buf();
+			let error = WendelonNode::restore_from_cluster_backup(&image, same)
+				.await
+				.err()
+				.expect("an unsupported embedded format must not restore");
+			refused(error, artifact, found);
+			no_effects(&target);
+
+			let target = tempdir("embedded-format-replacement");
+			std::fs::create_dir_all(target.join(".wendelon")).unwrap();
+			std::fs::copy(
+				dir.join(".wendelon/dev-root-kek.bin"),
+				target.join(".wendelon/dev-root-kek.bin"),
+			)
+			.unwrap();
+			let mut replacement =
+				NodeBootstrapConfig::dev(15, target.to_path_buf(), "127.0.0.1:0".into());
+			replacement.cluster = ClusterBootstrapConfig::Join {
+				seeds: vec![SeedNodeConfig {
+					node_id: 14,
+					address: "127.0.0.1:1".into(),
+				}],
+			};
+			let error =
+				WendelonNode::restore_replacement_from_cluster_backup(&image, 14, replacement)
+					.await
+					.err()
+					.expect("an unsupported embedded format must not restore");
+			refused(error, artifact, found);
+			no_effects(&target);
+		}
+	}
+
+	#[tokio::test]
+	/// ADR 0697 (DC-162 interim): restoring a store with tiered data to a
+	/// fresh incarnation is refused before any restore effect, from the
+	/// backup's replayed control state; clearing the image's reference sets
+	/// cannot hide the committed pointers.
+	async fn single_node_restore_with_tiered_data_is_refused_before_any_restore_effect() {
 		let dir = tempdir("restart-tiered");
 		let l2_dir = tempdir("restart-tiered-l2");
 		let mut cfg = NodeBootstrapConfig::dev(12, dir.to_path_buf(), "127.0.0.1:0".into());
@@ -4338,7 +4586,7 @@ mod tests {
 
 		node.raft
 			.client_write(WendelonRequest::TierSlab(TieredSlab {
-				slab_id: sealed_id,
+				slab: registered_owner(&node).await.slab(sealed_id),
 				l2_uri,
 				payload_hash,
 				is_encrypted: true,
@@ -4381,20 +4629,111 @@ mod tests {
 		cfg.data_dir = restore_dir.to_path_buf();
 		assert!(!cfg.data_dir.join("storage_index.redb").exists());
 
-		let recovered = WendelonNode::restore_from_cluster_backup(&backup, cfg)
-			.await
-			.unwrap();
-		wait_for_ready(&recovered).await;
-		assert!(recovered.slab.is_tiered(sealed_id).await);
-		let location = recovered
-			.slab
-			.lookup(tenant_id, tiered_key)
-			.unwrap()
-			.expect("tiered key should be restored from recovered state");
-		assert_eq!(location.slab_id, sealed_id);
-		assert_eq!(recovered.slab.read(location).await.unwrap(), tiered_bytes);
+		let no_restore_effects = |dir: &std::path::Path| {
+			for artifact in [
+				"storage_index.redb",
+				"control.wal",
+				"vote.wnd",
+				"snapshot.wnd",
+				"STORAGE_INDEX_RESTORE_AUTHORITY",
+				crate::storage::manager::AWAITING_CLUSTER_MARKER,
+			] {
+				assert!(!dir.join(artifact).exists(), "restore wrote {artifact}");
+			}
+			assert!(
+				std::fs::read_dir(dir).unwrap().all(|entry| !entry
+					.unwrap()
+					.file_name()
+					.to_string_lossy()
+					.starts_with("slab_")),
+				"restore wrote a slab file"
+			);
+		};
 
-		recovered.handles.abort();
+		// The real image: refused as cold data a fresh store would not own.
+		let error = WendelonNode::restore_from_cluster_backup(&backup, cfg.clone())
+			.await
+			.err()
+			.expect("a restore with tiered data must be refused");
+		assert!(
+			error.get_ref().is_some_and(|cause| matches!(
+				cause.downcast_ref::<crate::backup::UnsupportedRestore>(),
+				Some(crate::backup::UnsupportedRestore::ColdReferences { .. })
+			)),
+			"{error}"
+		);
+		no_restore_effects(&cfg.data_dir);
+
+		// A re-assembled image (valid outer hashes) whose storage reference
+		// sets were cleared: the replayed control state still names the
+		// source's committed pointers, so it cannot pass as local-only.
+		let state = backup.control.replayed_state().unwrap();
+		let mut nodes = backup.nodes.clone();
+		nodes[0].storage.manifest.tiered_slabs.clear();
+		nodes[0].storage.manifest.omitted_rehydrated_slabs.clear();
+		let tampered =
+			crate::backup::ClusterBackupImage::assemble(backup.control.clone(), &state, nodes)
+				.unwrap();
+		tampered.validate_integrity().unwrap();
+		let hidden_dir = tempdir("restart-tiered-hidden-cold");
+		std::fs::create_dir_all(hidden_dir.join(".wendelon")).unwrap();
+		std::fs::copy(
+			dir.join(".wendelon/dev-root-kek.bin"),
+			hidden_dir.join(".wendelon/dev-root-kek.bin"),
+		)
+		.unwrap();
+		let mut hidden_cfg = cfg.clone();
+		hidden_cfg.data_dir = hidden_dir.to_path_buf();
+		let error = WendelonNode::restore_from_cluster_backup(&tampered, hidden_cfg)
+			.await
+			.err()
+			.expect("cleared reference sets cannot hide committed cold pointers");
+		assert!(
+			error.get_ref().is_some_and(|cause| matches!(
+				cause.downcast_ref::<crate::backup::BackupSourceMismatch>(),
+				Some(crate::backup::BackupSourceMismatch::ReferencesDiffer { .. })
+			)),
+			"refused by the replayed control state, not by a hash check: {error}"
+		);
+		no_restore_effects(&hidden_dir);
+
+		// The same image with its control WAL re-declared at v5 (outer hashes
+		// recomputed): refused as an unsupported control format before any
+		// restore effect, never replayed as an empty or default state.
+		let legacy = crate::backup::ClusterBackupImage::assemble(
+			backup.control.with_wal_format_version_for_test(5),
+			&state,
+			backup.nodes.clone(),
+		)
+		.unwrap();
+		legacy.validate_integrity().unwrap();
+		let legacy_dir = tempdir("restart-tiered-legacy-control");
+		std::fs::create_dir_all(legacy_dir.join(".wendelon")).unwrap();
+		std::fs::copy(
+			dir.join(".wendelon/dev-root-kek.bin"),
+			legacy_dir.join(".wendelon/dev-root-kek.bin"),
+		)
+		.unwrap();
+		let mut legacy_cfg = cfg.clone();
+		legacy_cfg.data_dir = legacy_dir.to_path_buf();
+		let error = WendelonNode::restore_from_cluster_backup(&legacy, legacy_cfg)
+			.await
+			.err()
+			.expect("a pre-v6 control image must not restore");
+		let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(&error);
+		let mut unsupported = false;
+		while let Some(current) = cause {
+			unsupported |= current.is::<crate::consensus::UnsupportedControlFormat>();
+			// An io::Error's own source() skips its payload; walk the payload.
+			cause = match current.downcast_ref::<std::io::Error>() {
+				Some(io) => io
+					.get_ref()
+					.map(|inner| inner as &(dyn std::error::Error + 'static)),
+				None => current.source(),
+			};
+		}
+		assert!(unsupported, "refused for the wrong reason: {error}");
+		no_restore_effects(&legacy_dir);
 	}
 
 	#[tokio::test]
@@ -4439,7 +4778,7 @@ mod tests {
 		let raw = node.slab.read_sealed_raw(slab_id).await.unwrap();
 		let encrypted = node.slab.encrypt_tiered_object_blob(slab_id, &raw).unwrap();
 		let tier = TieredSlab {
-			slab_id,
+			slab: registered_owner(&node).await.slab(slab_id),
 			l2_uri: l2
 				.put("rolled-back-node/generation-0", &encrypted.bytes)
 				.await
@@ -4604,7 +4943,7 @@ mod tests {
 			.unwrap();
 		node.raft
 			.client_write(WendelonRequest::TierSlab(TieredSlab {
-				slab_id: sealed_id,
+				slab: registered_owner(&node).await.slab(sealed_id),
 				l2_uri,
 				payload_hash,
 				is_encrypted: true,
@@ -4630,7 +4969,9 @@ mod tests {
 		node.slab.fail_next_retirement_transaction_for_test();
 		node.raft
 			.client_write(WendelonRequest::RetireTieredSlab(
-				crate::consensus::RetireTieredSlab { slab_id: sealed_id },
+				crate::consensus::RetireTieredSlab {
+					slab: registered_owner(&node).await.slab(sealed_id),
+				},
 			))
 			.await
 			.unwrap();
@@ -4640,7 +4981,7 @@ mod tests {
 				.state_snapshot()
 				.await
 				.tiered_slabs
-				.contains_key(&sealed_id)
+				.contains_key(&node.slab.owner_ref().unwrap().slab(sealed_id))
 		);
 		assert!(
 			node.slab.is_tiered(sealed_id).await,
@@ -4766,7 +5107,7 @@ mod tests {
 			.unwrap();
 		node.raft
 			.client_write(WendelonRequest::TierSlab(TieredSlab {
-				slab_id: sealed_id,
+				slab: registered_owner(&node).await.slab(sealed_id),
 				l2_uri,
 				payload_hash,
 				is_encrypted: true,
@@ -4795,7 +5136,12 @@ mod tests {
 			committed.last_applied_log_id.is_some(),
 			"tier publication is committed"
 		);
-		assert!(committed.tiered_slabs.remove(&sealed_id).is_some());
+		assert!(
+			committed
+				.tiered_slabs
+				.remove(&node.slab.owner_ref().unwrap().slab(sealed_id))
+				.is_some()
+		);
 		let mut source = WendelonStateMachine::new();
 		source
 			.seed_complete_snapshot_state_for_test(committed)
@@ -4905,7 +5251,7 @@ mod tests {
 
 		node.raft
 			.client_write(WendelonRequest::TierSlab(TieredSlab {
-				slab_id: sealed_id,
+				slab: registered_owner(&node).await.slab(sealed_id),
 				l2_uri: l2_uri.clone(),
 				payload_hash,
 				is_encrypted: true,
@@ -5094,7 +5440,7 @@ mod tests {
 
 		node.raft
 			.client_write(WendelonRequest::TierSlab(TieredSlab {
-				slab_id: sealed_id,
+				slab: registered_owner(&node).await.slab(sealed_id),
 				l2_uri: l2_uri.clone(),
 				payload_hash,
 				is_encrypted: true,
