@@ -1864,6 +1864,7 @@ impl SlabManager {
 				PreparedTieredTableDropRewrite::Rewrite {
 					slab_id,
 					old_l2_uri,
+					old_generation,
 					old_bytes,
 					encrypted_bytes,
 					payload_hash,
@@ -1947,8 +1948,13 @@ impl SlabManager {
 					};
 					self.prepare_tier_candidate_proposal(slab_id, &new_uri)
 						.await?;
-					if let Err(error) =
-						crate::storage::sweeper::propose_tier_slab(self, committer, tier).await
+					if let Err(error) = crate::storage::sweeper::propose_tier_slab(
+						self,
+						committer,
+						tier,
+						Some(old_generation),
+					)
+					.await
 					{
 						if crate::storage::sweeper::tier_proposal_not_submitted(&error) {
 							self.record_tier_candidate_not_submitted(
@@ -1996,15 +2002,22 @@ impl SlabManager {
 				PreparedTieredTableDropRewrite::Retire {
 					slab_id,
 					old_l2_uri,
+					old_generation,
 					old_bytes,
 					reclaimed_records,
 					reclaimed_bytes,
 				} => {
+					committer.preflight(self.owner_ref()?).await?;
+					self.require_op_index()?.ensure_op_room(1).await?;
 					self.stage_table_drop_l2_cleanup(slab_id, &old_l2_uri, Some(old_bytes), None)
 						.await?;
-					if let Err(error) = committer
-						.retire_tiered_slab(self.owner_ref()?.slab(slab_id))
-						.await
+					if let Err(error) = crate::storage::sweeper::propose_tier_retirement(
+						self,
+						committer,
+						slab_id,
+						old_generation,
+					)
+					.await
 					{
 						// As above, a transport error does not prove the retirement failed.
 						// Reconciliation compares the durable pointer with the marker.
@@ -2427,6 +2440,7 @@ impl SlabManager {
 				PreparedTieredTableDropRewrite::Rewrite {
 					slab_id,
 					old_l2_uri,
+					old_generation,
 					old_bytes,
 					encrypted_bytes,
 					payload_hash,
@@ -2512,8 +2526,13 @@ impl SlabManager {
 					// unresolved intent keeps both objects, even across restart.
 					self.prepare_tier_candidate_proposal(slab_id, &new_uri)
 						.await?;
-					if let Err(error) =
-						crate::storage::sweeper::propose_tier_slab(self, committer, tier).await
+					if let Err(error) = crate::storage::sweeper::propose_tier_slab(
+						self,
+						committer,
+						tier,
+						Some(old_generation),
+					)
+					.await
 					{
 						if crate::storage::sweeper::tier_proposal_not_submitted(&error) {
 							self.record_tier_candidate_not_submitted(
@@ -2558,15 +2577,22 @@ impl SlabManager {
 				PreparedTieredTableDropRewrite::Retire {
 					slab_id,
 					old_l2_uri,
+					old_generation,
 					old_bytes,
 					reclaimed_records,
 					reclaimed_bytes,
 				} => {
+					committer.preflight(self.owner_ref()?).await?;
+					self.require_op_index()?.ensure_op_room(1).await?;
 					self.stage_table_drop_l2_cleanup(slab_id, &old_l2_uri, Some(old_bytes), None)
 						.await?;
-					committer
-						.retire_tiered_slab(self.owner_ref()?.slab(slab_id))
-						.await?;
+					crate::storage::sweeper::propose_tier_retirement(
+						self,
+						committer,
+						slab_id,
+						old_generation,
+					)
+					.await?;
 					Self::retain_superseded_l2_object(slab_id, &old_l2_uri, "tier retirement")?;
 					self.clear_retired_tiered_cleanup(slab_id);
 					report.compacted_slabs += 1;

@@ -130,6 +130,7 @@ use crate::hash::sha256 as control_artifact_hash;
 
 // Offline, read-only scan of a node's retained Control log over the same replay readers.
 mod read_only;
+mod slab_op_apply;
 #[cfg(test)]
 pub(crate) use read_only::fixture as read_only_fixture;
 pub(crate) use read_only::scan_control_log_read_only;
@@ -2785,6 +2786,9 @@ pub struct SmState {
 	/// is admitted only for its node's current incarnation.
 	#[serde(default)]
 	pub incarnations: BTreeMap<u32, IncarnationRegistry>,
+	/// Each admitted owner's decision window (ADR 0697 §5.3).
+	#[serde(default)]
+	pub op_tables: BTreeMap<OwnerRef, crate::consensus::slab_ops::OpTable>,
 	/// Migration Ledger (Plan 019). Keyed by `migration_id` so
 	/// apply-time idempotency and chained-migration reconciliation
 	/// are both O(1). Entries never fall out of the map during
@@ -3047,6 +3051,29 @@ impl TierSnapshotLease {
 	pub(crate) fn tiers(&self) -> Vec<TieredSlab> {
 		self.0.state.tiered_slabs.values().cloned().collect()
 	}
+	/// Whether `key` is decided Applied under `digest` and its owner is still its
+	/// node's current incarnation, from this one coherent state (ADR 0697 §5.5).
+	pub(crate) fn op_applied_for_current_owner(
+		&self,
+		key: crate::consensus::slab_ops::OpKey,
+		digest: [u8; 32],
+	) -> bool {
+		use crate::consensus::slab_ops::RecordedOutcome;
+		let state = &self.0.state;
+		let applied = state
+			.op_tables
+			.get(&key.owner)
+			.and_then(|table| table.outcomes.get(&key.op_seq))
+			.is_some_and(|entry| {
+				entry.digest == digest && matches!(entry.outcome, RecordedOutcome::Applied { .. })
+			});
+		let current = state
+			.incarnations
+			.get(&key.owner.node())
+			.is_some_and(|registry| registry.current == Some(key.owner.incarnation()));
+		applied && current
+	}
+
 	/// The incarnation registries coherent with `tiers()` (ADR 0697).
 	pub(crate) fn incarnations(&self) -> &BTreeMap<u32, IncarnationRegistry> {
 		&self.0.state.incarnations
@@ -3124,6 +3151,16 @@ pub trait TierObserver: Send + Sync {
 
 	/// A node's incarnation registry changed. A store that is no longer its
 	/// node's current incarnation must fence even if no slab event follows.
+	/// A delete-pending run's removal was decided (ADR 0697).
+	async fn on_gc_removed(
+		&self,
+		_remove: &crate::consensus::slab_ops::GcRemove,
+		_registry: &IncarnationRegistry,
+		_applied_log_index: u64,
+	) -> std::io::Result<()> {
+		Ok(())
+	}
+
 	async fn on_incarnation_registry(
 		&self,
 		node: u32,
@@ -4082,6 +4119,17 @@ impl WendelonStateMachine {
 	}
 
 	/// One node's incarnation registry (ADR 0697), read under the SM lock.
+	/// `owner`'s acknowledged prefix in this state machine's view.
+	pub(crate) async fn op_acked_through(&self, owner: OwnerRef) -> u64 {
+		self.inner
+			.read()
+			.await
+			.state
+			.op_tables
+			.get(&owner)
+			.map_or(0, |table| table.acked_through)
+	}
+
 	pub(crate) async fn incarnation_registry(&self, node: u32) -> IncarnationRegistry {
 		self.inner
 			.read()
@@ -4232,15 +4280,14 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 				}
 				// Owner admission runs before the pre-hook: a retirement the
 				// state machine will refuse must have no local effect.
-				if let EntryPayload::Normal(WendelonRequest::RetireTieredSlab(retire)) =
-					&entry.payload && guard.state.tiered_slabs.contains_key(&retire.slab)
-					&& let Ok(registry) = admit_slab_owner(
+				if let EntryPayload::Normal(WendelonRequest::SlabOp(op)) = &entry.payload
+					&& let Some((slab, registry)) = slab_op_apply::op_retirement(
 						&guard.state,
-						retire.slab.owner(),
+						op,
 						entry.log_id.leader_id.node_id,
 					) && let Some(observer) = self.tier_observer.as_ref()
 				{
-					observer.before_slab_retired(retire.slab, &registry, entry.log_id.index);
+					observer.before_slab_retired(slab, &registry, entry.log_id.index);
 				}
 				let drop_prepare_operation = match &entry.payload {
 					EntryPayload::Normal(WendelonRequest::TableDropPrepare(request)) => {
@@ -4369,6 +4416,10 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 						.on_migrated_range_tombstone(tombstone, *applied_log_index)
 						.await
 						.map_err(|error| (SlabId::new(0), error)),
+					TierObserverEvent::GcRemoved(remove, registry) => observer
+						.on_gc_removed(remove, registry, *applied_log_index)
+						.await
+						.map_err(|error| (remove.slab, error)),
 					TierObserverEvent::LsmCompactionCommitted(commit, registry) => observer
 						.on_lsm_compaction_committed(commit, registry, *applied_log_index)
 						.await
@@ -4772,6 +4823,7 @@ enum TierObserverEvent {
 	/// A node's registry changed: a superseded local store must fence even
 	/// when no later slab event names it.
 	Registry(u32, IncarnationRegistry),
+	GcRemoved(crate::consensus::slab_ops::GcRemove, IncarnationRegistry),
 }
 
 /// ADR 0697: a control artifact (WAL record or snapshot) written before
@@ -5194,8 +5246,19 @@ fn raft_audit_event_with_context(
 			.with_tenant(finalization.tenant_id)
 			.with_record_identity(finalization.key_identity),
 		),
-		WendelonRequest::TierSlab(_) | WendelonRequest::RetireTieredSlab(_) => None,
-		WendelonRequest::CompactionCommit(commit) => {
+		WendelonRequest::RetiredTierSlab(never)
+		| WendelonRequest::RetiredRetireTieredSlab(never)
+		| WendelonRequest::RetiredCompactionCommit(never) => match *never {},
+		WendelonRequest::CancelOp(_) | WendelonRequest::AckOutcomes(_) => None,
+		WendelonRequest::SlabOp(op)
+			if !matches!(op.command, crate::consensus::slab_ops::SlabCommand::Compaction(_)) =>
+		{
+			None
+		}
+		WendelonRequest::SlabOp(crate::consensus::slab_ops::SlabOp {
+			command: crate::consensus::slab_ops::SlabCommand::Compaction(commit),
+			..
+		}) => {
 			let op = if is_err {
 				AuditOperation::LsmInvariantViolation
 			} else {
@@ -5966,10 +6029,10 @@ fn apply_request(
 ) -> (WendelonResponse, Option<TierObserverEvent>) {
 	// Tests apply directly, as if the owner's own node appended the entry.
 	let leader_node = match &req {
-		WendelonRequest::TierSlab(tier) => tier.slab.owner().node(),
-		WendelonRequest::RetireTieredSlab(retire) => retire.slab.owner().node(),
-		WendelonRequest::CompactionCommit(commit) => commit.owner.node(),
 		WendelonRequest::RegisterIncarnation(register) => register.node,
+		WendelonRequest::SlabOp(op) => op.command.owner().node(),
+		WendelonRequest::CancelOp(cancel) => cancel.key.owner.node(),
+		WendelonRequest::AckOutcomes(ack) => ack.owner.node(),
 		_ => 0,
 	};
 	apply_request_at_log_index(state, req, 0, leader_node)
@@ -6133,65 +6196,23 @@ fn apply_request_at_log_index(
 			};
 			(response, None)
 		}
-		WendelonRequest::TierSlab(tier) => {
-			let registry = match admit_slab_owner(state, tier.slab.owner(), leader_node) {
-				Ok(registry) => registry,
-				Err(refusal) => return (WendelonResponse::Refused(refusal), None),
-			};
-			// Idempotent replays keep the existing mapping; pointer
-			// refreshes (for re-encryption or URI/hash repair) update
-			// the record in place and still notify the tier
-			// observer so runtime readers pick up the new pointer.
-			if let Some(existing) = state.tiered_slabs.get(&tier.slab) {
-				if existing == &tier {
-					return (WendelonResponse::Success, None);
-				}
-				state.tiered_slabs.insert(tier.slab, tier.clone());
-				return (
-					WendelonResponse::Success,
-					Some(TierObserverEvent::Tiered(tier, registry)),
-				);
-			}
-			state.tiered_slabs.insert(tier.slab, tier.clone());
-			(
-				WendelonResponse::Success,
-				Some(TierObserverEvent::Tiered(tier, registry)),
-			)
-		}
-		WendelonRequest::RetireTieredSlab(retire) => {
-			let registry = match admit_slab_owner(state, retire.slab.owner(), leader_node) {
-				Ok(registry) => registry,
-				Err(refusal) => return (WendelonResponse::Refused(refusal), None),
-			};
-			if state.tiered_slabs.remove(&retire.slab).is_some() {
-				return (
-					WendelonResponse::Success,
-					Some(TierObserverEvent::Retired(retire.slab, registry)),
-				);
-			}
-			(WendelonResponse::Success, None)
-		}
+		WendelonRequest::RetiredTierSlab(never)
+		| WendelonRequest::RetiredRetireTieredSlab(never)
+		| WendelonRequest::RetiredCompactionCommit(never) => match never {},
 		WendelonRequest::RegisterIncarnation(register) => {
 			apply_register_incarnation(state, register, leader_node)
 		}
-		WendelonRequest::CompactionCommit(commit) => {
-			let registry = match admit_slab_owner(state, commit.owner, leader_node) {
-				Ok(registry) => registry,
-				Err(refusal) => return (WendelonResponse::Refused(refusal), None),
-			};
-			if commit.digest_summary.visible_pre != commit.digest_summary.visible_post {
-				return (
-					WendelonResponse::Error(
-						"LSM compaction visible-domain digest changed".to_owned(),
-					),
-					None,
-				);
-			}
-			(
-				WendelonResponse::Success,
-				Some(TierObserverEvent::LsmCompactionCommitted(commit, registry)),
-			)
+		WendelonRequest::SlabOp(op) => {
+			slab_op_apply::apply_slab_op(state, op, entry_log_index, leader_node)
 		}
+		WendelonRequest::CancelOp(cancel) => (
+			slab_op_apply::apply_cancel_op(state, cancel, entry_log_index, leader_node),
+			None,
+		),
+		WendelonRequest::AckOutcomes(ack) => (
+			slab_op_apply::apply_ack_outcomes(state, ack, leader_node),
+			None,
+		),
 		WendelonRequest::CreateTenant(create) => (apply_create_tenant(state, create), None),
 		WendelonRequest::UpdateTenantQuota(update) => {
 			(apply_update_tenant_quota(state, update), None)
@@ -9392,10 +9413,15 @@ fn serialize_entry_page(entry: &Entry<WendelonTypeConfig>) -> Result<AlignedBuf,
 		| EntryPayload::Normal(WendelonRequest::ReplayLegacyCtasRowDispatched(_)) => {
 			(LogEntryKind::APPEND, 0)
 		}
-		EntryPayload::Normal(WendelonRequest::TierSlab(_)) => (LogEntryKind::APPEND, 0),
-		EntryPayload::Normal(WendelonRequest::RetireTieredSlab(_)) => (LogEntryKind::APPEND, 0),
-		EntryPayload::Normal(WendelonRequest::CompactionCommit(_)) => (LogEntryKind::APPEND, 0),
+		EntryPayload::Normal(
+			WendelonRequest::RetiredTierSlab(never)
+			| WendelonRequest::RetiredRetireTieredSlab(never)
+			| WendelonRequest::RetiredCompactionCommit(never),
+		) => match *never {},
 		EntryPayload::Normal(WendelonRequest::RegisterIncarnation(_)) => (LogEntryKind::APPEND, 0),
+		EntryPayload::Normal(WendelonRequest::SlabOp(_)) => (LogEntryKind::APPEND, 0),
+		EntryPayload::Normal(WendelonRequest::CancelOp(_)) => (LogEntryKind::APPEND, 0),
+		EntryPayload::Normal(WendelonRequest::AckOutcomes(_)) => (LogEntryKind::APPEND, 0),
 		EntryPayload::Normal(WendelonRequest::CreateTenant(_)) => (LogEntryKind::APPEND, 0),
 		EntryPayload::Normal(WendelonRequest::UpdateTenantQuota(_)) => (LogEntryKind::APPEND, 0),
 		EntryPayload::Normal(WendelonRequest::SuspendTenant(_)) => (LogEntryKind::APPEND, 0),
@@ -9695,6 +9721,7 @@ fn decode_snapshot_reader_with_identity<R: Read>(
 	// the one version this build reads: a decode failure is a shape mismatch.
 	let state = decode_snapshot_state_bytes(&body)?;
 	validate_slab_identity_state(&state)?;
+	slab_op_apply::validate_op_tables(&state)?;
 	let mut artifact = control_artifact_hash::Context::new();
 	artifact.update(&header_bytes);
 	artifact.update(&body);
@@ -19037,7 +19064,7 @@ mod migration_tests {
 #[cfg(test)]
 mod tiered_slab_tests {
 	use super::*;
-	use crate::consensus::RetireTieredSlab;
+	use crate::consensus::slab_ops::{RetireOp, SlabCommand, SlabOp, TierGeneration, TierOp};
 
 	fn owner() -> OwnerRef {
 		OwnerRef::for_test(1, 0x11)
@@ -19049,6 +19076,42 @@ mod tiered_slab_tests {
 			incarnation: StoreIncarnation::from_raw(incarnation),
 			supersedes: supersedes.map(StoreIncarnation::from_raw),
 		})
+	}
+
+	/// The next sequence for the command's owner, as its allocator would give it.
+	fn op(state: &SmState, command: SlabCommand) -> WendelonRequest {
+		let table = state.op_tables.get(&command.owner());
+		let op_seq = table.map_or(1, |table| {
+			table.acked_through + table.outcomes.len() as u64 + 1
+		});
+		WendelonRequest::SlabOp(SlabOp { op_seq, command })
+	}
+
+	fn tier_op(tier: TieredSlab) -> SlabCommand {
+		SlabCommand::Tier(TierOp {
+			tier,
+			replaces: None,
+		})
+	}
+
+	fn retire_op(slab: SlabRef) -> SlabCommand {
+		SlabCommand::Retire(RetireOp {
+			slab,
+			expected: TierGeneration::from(&tier(slab)),
+		})
+	}
+
+	fn applied(response: &WendelonResponse) -> bool {
+		matches!(
+			response,
+			WendelonResponse::Op(crate::consensus::slab_ops::OpResponse::Receipt(receipt))
+				if matches!(
+					receipt.outcome,
+					crate::consensus::slab_ops::OpOutcome::Recorded(
+						crate::consensus::slab_ops::RecordedOutcome::Applied { .. }
+					)
+				)
+		)
 	}
 
 	/// A state whose node 1 has registered `owner()` as current.
@@ -19116,36 +19179,6 @@ mod tiered_slab_tests {
 		}
 	}
 
-	#[test]
-	fn retire_tiered_slab_removes_pointer_and_is_idempotent() {
-		let (mut state, registry) = registered_state();
-		let slab = owner().slab(SlabId::new(7));
-		let tier = tier(slab);
-
-		let (resp, event) = apply_request(&mut state, WendelonRequest::TierSlab(tier.clone()));
-		assert_eq!(resp, WendelonResponse::Success);
-		assert_eq!(
-			event,
-			Some(TierObserverEvent::Tiered(tier.clone(), registry.clone()))
-		);
-		assert_eq!(state.tiered_slabs.get(&slab), Some(&tier));
-
-		let (resp, event) = apply_request(
-			&mut state,
-			WendelonRequest::RetireTieredSlab(RetireTieredSlab { slab }),
-		);
-		assert_eq!(resp, WendelonResponse::Success);
-		assert_eq!(event, Some(TierObserverEvent::Retired(slab, registry)));
-		assert!(!state.tiered_slabs.contains_key(&slab));
-
-		let (resp, event) = apply_request(
-			&mut state,
-			WendelonRequest::RetireTieredSlab(RetireTieredSlab { slab }),
-		);
-		assert_eq!(resp, WendelonResponse::Success);
-		assert_eq!(event, None);
-	}
-
 	/// ADR 0697: two stores' slabs with the same local id are distinct keys.
 	#[test]
 	fn same_local_id_on_two_owners_is_two_pointers() {
@@ -19154,14 +19187,13 @@ mod tiered_slab_tests {
 		let a = owner().slab(SlabId::new(0));
 		let b = OwnerRef::for_test(2, 0x22).slab(SlabId::new(0));
 		for slab in [a, b] {
-			let (resp, _) = apply_request(&mut state, WendelonRequest::TierSlab(tier(slab)));
-			assert_eq!(resp, WendelonResponse::Success);
+			let request = op(&state, tier_op(tier(slab)));
+			let (resp, _) = apply_request(&mut state, request);
+			assert!(applied(&resp), "{resp:?}");
 		}
 		assert_eq!(state.tiered_slabs.len(), 2);
-		apply_request(
-			&mut state,
-			WendelonRequest::RetireTieredSlab(RetireTieredSlab { slab: a }),
-		);
+		let request = op(&state, retire_op(a));
+		apply_request(&mut state, request);
 		assert!(state.tiered_slabs.contains_key(&b) && !state.tiered_slabs.contains_key(&a));
 	}
 
@@ -19172,16 +19204,15 @@ mod tiered_slab_tests {
 		let (mut state, _) = registered_state();
 		let stranger = OwnerRef::for_test(1, 0x99);
 		let before = state.tiered_slabs.clone();
-		for request in [
-			WendelonRequest::TierSlab(tier(stranger.slab(SlabId::new(7)))),
-			WendelonRequest::RetireTieredSlab(RetireTieredSlab {
-				slab: stranger.slab(SlabId::new(7)),
-			}),
-			WendelonRequest::CompactionCommit(CompactionCommit {
+		for command in [
+			tier_op(tier(stranger.slab(SlabId::new(7)))),
+			retire_op(stranger.slab(SlabId::new(7))),
+			SlabCommand::Compaction(CompactionCommit {
 				owner: stranger,
 				..lsm_commit(0)
 			}),
 		] {
+			let request = op(&state, command);
 			let (resp, event) = apply_request(&mut state, request);
 			assert_eq!(
 				resp,
@@ -19194,10 +19225,8 @@ mod tiered_slab_tests {
 		}
 		assert_eq!(state.tiered_slabs, before);
 		let unregistered = OwnerRef::for_test(3, 0x33);
-		let (resp, _) = apply_request(
-			&mut state,
-			WendelonRequest::TierSlab(tier(unregistered.slab(SlabId::new(1)))),
-		);
+		let request = op(&state, tier_op(tier(unregistered.slab(SlabId::new(1)))));
+		let (resp, _) = apply_request(&mut state, request);
 		assert!(matches!(
 			resp,
 			WendelonResponse::Refused(SlabRefusal::NotCurrentOwner { current: None, .. })
@@ -19211,7 +19240,10 @@ mod tiered_slab_tests {
 		let (mut state, _) = registered_state();
 		let (resp, event) = apply_request_at_log_index(
 			&mut state,
-			WendelonRequest::TierSlab(tier(owner().slab(SlabId::new(7)))),
+			WendelonRequest::SlabOp(SlabOp {
+				op_seq: 1,
+				command: tier_op(tier(owner().slab(SlabId::new(7)))),
+			}),
 			9,
 			2,
 		);
@@ -19263,10 +19295,11 @@ mod tiered_slab_tests {
 			Some(StoreIncarnation::from_raw(0xB))
 		);
 		// The old incarnation's slab commands are refused.
-		let (resp, _) = apply_request(
-			&mut state,
-			WendelonRequest::TierSlab(tier(OwnerRef::for_test(1, 0xA).slab(SlabId::new(1)))),
+		let request = op(
+			&state,
+			tier_op(tier(OwnerRef::for_test(1, 0xA).slab(SlabId::new(1)))),
 		);
+		let (resp, _) = apply_request(&mut state, request);
 		assert!(matches!(
 			resp,
 			WendelonResponse::Refused(SlabRefusal::NotCurrentOwner { .. })
@@ -19278,29 +19311,14 @@ mod tiered_slab_tests {
 		let (mut state, registry) = registered_state();
 		let commit = lsm_commit(0);
 
-		let (resp, event) = apply_request(
-			&mut state,
-			WendelonRequest::CompactionCommit(commit.clone()),
-		);
+		let request = op(&state, SlabCommand::Compaction(commit.clone()));
+		let (resp, event) = apply_request(&mut state, request);
 
-		assert_eq!(resp, WendelonResponse::Success);
+		assert!(applied(&resp), "{resp:?}");
 		assert_eq!(
 			event,
 			Some(TierObserverEvent::LsmCompactionCommitted(commit, registry))
 		);
-	}
-
-	#[test]
-	fn compaction_commit_request_rejects_visible_digest_mismatch() {
-		let (mut state, _) = registered_state();
-
-		let (resp, event) =
-			apply_request(&mut state, WendelonRequest::CompactionCommit(lsm_commit(7)));
-
-		assert!(
-			matches!(resp, WendelonResponse::Error(error) if error.contains("visible-domain digest"))
-		);
-		assert_eq!(event, None);
 	}
 }
 
@@ -19615,7 +19633,7 @@ mod tenant_kek_tests {
 #[cfg(test)]
 pub(crate) mod body_format_corpus {
 	use super::*;
-	use crate::consensus::{EpochPeer, RetireTieredSlab};
+	use crate::consensus::EpochPeer;
 
 	/// The fixed store owner every slab-keyed corpus body names (ADR 0697).
 	pub(crate) fn canonical_owner() -> OwnerRef {
@@ -19625,16 +19643,14 @@ pub(crate) mod body_format_corpus {
 		)
 	}
 	use crate::crypto::WrappedTenantKek;
-	use crate::hash::state_digest::StateDigest;
 	use crate::integration::compute::{DropOperationId, SchemaGeneration};
 	use crate::schema::{
-		CompactionJobId, CtasExpectedBinding, CtasIntentFingerprint, CtasOperationId,
-		CtasSagaMutation, DurabilityLevel, FinalizationMarker, Identity, LeaseDescriptor,
-		LocalityPolicy, ManifestEpoch, PolicyGeneration, PrimaryKeyDescriptor,
-		ReleaseLeaseRequestMeta, RowIdentityPolicy, SchemaEvolutionPolicy, TableObjectId,
-		TableRetentionPolicy, TableSchemaDescriptor, TenantId,
+		CtasExpectedBinding, CtasIntentFingerprint, CtasOperationId, CtasSagaMutation,
+		DurabilityLevel, FinalizationMarker, Identity, LeaseDescriptor, LocalityPolicy,
+		PolicyGeneration, PrimaryKeyDescriptor, ReleaseLeaseRequestMeta, RowIdentityPolicy,
+		SchemaEvolutionPolicy, TableObjectId, TableRetentionPolicy, TableSchemaDescriptor,
+		TenantId,
 	};
-	use crate::storage::CompactionDigestSummary;
 	use arrow::datatypes::{DataType, Field, Schema};
 	use std::collections::BTreeMap;
 
@@ -19910,46 +19926,6 @@ pub(crate) mod body_format_corpus {
 				WendelonRequest::SchemaUpdate(vec![0x5C; 8]),
 			),
 			(
-				"tier_slab",
-				WendelonRequest::TierSlab(TieredSlab {
-					slab: canonical_owner().slab(SlabId::new(3)),
-					l2_uri: "l2://slab/3".to_string(),
-					payload_hash: [0x33; 32],
-					is_encrypted: false,
-					tenant_id: None,
-					tenant_kek_id: None,
-					stats_format_version: None,
-					stats_block_len: None,
-					stats_block_hash128: None,
-					tombstone_metadata: TombstoneMetadata::default(),
-					supersession_metadata: SupersessionMetadata::default(),
-				}),
-			),
-			(
-				"retire_tiered_slab",
-				WendelonRequest::RetireTieredSlab(RetireTieredSlab {
-					slab: canonical_owner().slab(SlabId::new(3)),
-				}),
-			),
-			(
-				"compaction_commit",
-				WendelonRequest::CompactionCommit(CompactionCommit {
-					owner: canonical_owner(),
-					job_id: CompactionJobId::new(5),
-					manifest_epoch_pre: ManifestEpoch::new(4),
-					slabs_to_retire: vec![SlabId::new(3)],
-					slabs_to_add: Vec::new(),
-					slabs_to_mark_delete_pending: Vec::new(),
-					slabs_to_remove: Vec::new(),
-					sidecar_swaps: Vec::new(),
-					digest_summary: CompactionDigestSummary {
-						visible_pre: StateDigest::default(),
-						visible_post: StateDigest::default(),
-						version_entry_delta: StateDigest::default(),
-					},
-				}),
-			),
-			(
 				"seed_migration",
 				WendelonRequest::SeedMigration(SeedMigration {
 					entry: canonical_ledger_entry(),
@@ -20102,6 +20078,47 @@ pub(crate) mod body_format_corpus {
 					supersedes: Some(StoreIncarnation::from_raw(0x0696)),
 				}),
 			),
+			(
+				"slab_op",
+				WendelonRequest::SlabOp(crate::consensus::slab_ops::SlabOp {
+					op_seq: 1,
+					command: crate::consensus::slab_ops::SlabCommand::Tier(
+						crate::consensus::slab_ops::TierOp {
+							tier: TieredSlab {
+								slab: canonical_owner().slab(SlabId::new(3)),
+								l2_uri: "l2://slab/3".to_string(),
+								payload_hash: [0x33; 32],
+								is_encrypted: false,
+								tenant_id: None,
+								tenant_kek_id: None,
+								stats_format_version: None,
+								stats_block_len: None,
+								stats_block_hash128: None,
+								tombstone_metadata: TombstoneMetadata::default(),
+								supersession_metadata: SupersessionMetadata::default(),
+							},
+							replaces: None,
+						},
+					),
+				}),
+			),
+			(
+				"cancel_op",
+				WendelonRequest::CancelOp(crate::consensus::slab_ops::CancelOp {
+					key: crate::consensus::slab_ops::OpKey {
+						owner: canonical_owner(),
+						op_seq: 2,
+					},
+					target_digest: [0x44; 32],
+				}),
+			),
+			(
+				"ack_outcomes",
+				WendelonRequest::AckOutcomes(crate::consensus::slab_ops::AckOutcomes {
+					owner: canonical_owner(),
+					seqs: vec![1, 2],
+				}),
+			),
 		]
 	}
 
@@ -20177,6 +20194,35 @@ pub(crate) mod body_format_corpus {
 					(
 						owner.incarnation(),
 						Some(StoreIncarnation::from_raw(0x0696)),
+					),
+				]),
+			},
+		);
+		state.op_tables.insert(
+			owner,
+			crate::consensus::slab_ops::OpTable {
+				acked_through: 3,
+				outcomes: BTreeMap::from([
+					(
+						4,
+						crate::consensus::slab_ops::OpEntry {
+							digest: [0x41; 32],
+							outcome: crate::consensus::slab_ops::RecordedOutcome::Applied {
+								index: 9,
+							},
+							acked: true,
+						},
+					),
+					(
+						5,
+						crate::consensus::slab_ops::OpEntry {
+							digest: [0x42; 32],
+							outcome: crate::consensus::slab_ops::RecordedOutcome::Rejected {
+								reason: crate::consensus::slab_ops::SlabRejection::Cancelled,
+								index: 10,
+							},
+							acked: false,
+						},
 					),
 				]),
 			},
@@ -20297,14 +20343,18 @@ pub(crate) mod body_format_corpus {
 		assert_eq!(by_variant_name, names);
 	}
 
-	const WAL_V6_MANIFEST: &str =
+	const WAL_V6_OUTGOING_MANIFEST: &str =
 		include_str!("../../tests/fixtures/consensus_body/wal_v6_entries.txt");
-	const SNAPSHOT_V6_MANIFEST: &str =
+	const SNAPSHOT_V6_OUTGOING_MANIFEST: &str =
 		include_str!("../../tests/fixtures/consensus_body/snapshot_v6.txt");
+	const WAL_V7_MANIFEST: &str =
+		include_str!("../../tests/fixtures/consensus_body/wal_v7_entries.txt");
+	const SNAPSHOT_V7_MANIFEST: &str =
+		include_str!("../../tests/fixtures/consensus_body/snapshot_v7.txt");
 
 	#[test]
-	fn adr0697_current_wal_v6_and_snapshot_v6_match_stored_goldens() {
-		let stored_wal = parse_manifest(WAL_V6_MANIFEST);
+	fn adr0697_current_wal_v7_and_snapshot_v7_match_stored_goldens() {
+		let stored_wal = parse_manifest(WAL_V7_MANIFEST);
 		let corpus = wal_corpus();
 		assert_eq!(stored_wal.len(), corpus.len());
 		for (name, bytes) in corpus {
@@ -20315,7 +20365,7 @@ pub(crate) mod body_format_corpus {
 			);
 		}
 
-		let stored_snapshot = parse_manifest(SNAPSHOT_V6_MANIFEST);
+		let stored_snapshot = parse_manifest(SNAPSHOT_V7_MANIFEST);
 		let state = canonical_current_sm_state();
 		assert_eq!(
 			hex(&postcard::to_stdvec(&state).unwrap()),
@@ -20326,7 +20376,7 @@ pub(crate) mod body_format_corpus {
 		assert!(!state.tiered_slabs.is_empty() && !state.incarnations.is_empty());
 	}
 
-	/// Every stored pre-v6 body, by the version it was written at.
+	/// Every stored pre-v7 body, by the version it was written at.
 	fn historical_bodies(manifests: &[(u8, &'static str)]) -> Vec<(u8, String, Vec<u8>)> {
 		manifests
 			.iter()
@@ -20341,7 +20391,7 @@ pub(crate) mod body_format_corpus {
 	/// ADR 0697: a snapshot written at any earlier version, including before
 	/// format versioning, is refused before its body is decoded.
 	#[test]
-	fn adr0697_every_pre_v6_snapshot_body_is_refused_before_decode() {
+	fn adr0697_every_pre_v7_snapshot_body_is_refused_before_decode() {
 		let bodies = historical_bodies(&[
 			(0, V1_SNAPSHOT_MANIFEST),
 			(1, V1_SNAPSHOT_MANIFEST),
@@ -20349,6 +20399,7 @@ pub(crate) mod body_format_corpus {
 			(3, SNAPSHOT_V3_MANIFEST),
 			(4, SNAPSHOT_V4_MANIFEST),
 			(5, SNAPSHOT_V5_MANIFEST),
+			(6, SNAPSHOT_V6_OUTGOING_MANIFEST),
 		]);
 		assert!(bodies.len() >= 6);
 		for (version, name, body) in bodies {
@@ -20367,10 +20418,35 @@ pub(crate) mod body_format_corpus {
 		}
 	}
 
+	/// ADR 0697: the retired unkeyed slab commands keep their wire positions and
+	/// never decode: a body naming one fails as unsupported, in the current
+	/// format, and manufactures no command. The next position still decodes.
+	#[test]
+	fn adr0697_a_retired_slab_command_body_fails_as_unsupported() {
+		for tag in [5_u8, 6, 7] {
+			postcard::from_bytes::<WendelonRequest>(&[tag, 0, 0, 0])
+				.expect_err("a retired variant has no value");
+		}
+		let requests = canonical_requests();
+		let seed = requests
+			.iter()
+			.find(|(name, _)| *name == "seed_migration")
+			.map(|(_, request)| postcard::to_stdvec(request).unwrap())
+			.unwrap();
+		assert_eq!(seed[0], 8, "the next variant keeps its wire position");
+		assert!(postcard::from_bytes::<WendelonRequest>(&seed).is_ok());
+		let root2 = requests
+			.iter()
+			.find(|(name, _)| *name == "root2_command")
+			.map(|(_, request)| postcard::to_stdvec(request).unwrap())
+			.unwrap();
+		assert_eq!(root2[0], 26, "Root2Command keeps its wire position");
+	}
+
 	/// ADR 0697: a WAL record written at any earlier version, including before
 	/// format versioning, is refused before its payload is decoded.
 	#[test]
-	fn adr0697_every_pre_v6_wal_body_is_refused_before_decode() {
+	fn adr0697_every_pre_v7_wal_body_is_refused_before_decode() {
 		let bodies = historical_bodies(&[
 			(0, WAL_V4_MANIFEST),
 			(1, V1_WAL_MANIFEST),
@@ -20378,6 +20454,7 @@ pub(crate) mod body_format_corpus {
 			(3, WAL_V3_MANIFEST),
 			(4, WAL_V4_MANIFEST),
 			(5, WAL_V5_OUTGOING_MANIFEST),
+			(6, WAL_V6_OUTGOING_MANIFEST),
 		]);
 		assert!(bodies.len() >= 6);
 		let fixed_size = std::mem::size_of::<RaftLogEntryFixed>();
@@ -20426,7 +20503,7 @@ pub(crate) mod body_format_corpus {
 		for (name, bytes) in wal_corpus() {
 			wal.push_str(&format!("{name}={}\n", hex(&bytes)));
 		}
-		std::fs::write(dir.join("wal_v6_entries.txt"), wal).unwrap();
+		std::fs::write(dir.join("wal_v7_entries.txt"), wal).unwrap();
 		let mut mutations = String::new();
 		for (name, mutation) in canonical_mutations() {
 			mutations.push_str(&format!(
@@ -20446,7 +20523,7 @@ pub(crate) mod body_format_corpus {
 			hex(&postcard::to_stdvec(&state).unwrap()),
 			hex(&postcard::to_stdvec(&entry).unwrap())
 		);
-		std::fs::write(dir.join("snapshot_v6.txt"), snapshot).unwrap();
+		std::fs::write(dir.join("snapshot_v7.txt"), snapshot).unwrap();
 		println!("manifests written to {}", dir.display());
 	}
 }

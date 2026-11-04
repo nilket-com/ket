@@ -331,6 +331,12 @@ pub(crate) fn delete_maintenance_receipt_table_for_test(path: &Path) {
 const META_LAST_CONTROL_LOG_INDEX: &str = "last_control_log_index";
 /// The store's incarnation, written once by fresh initialization and never
 /// rewritten. Its absence on open means the store predates slab identity.
+mod op_state;
+pub use op_state::OpTicket;
+pub(crate) use op_state::{LoadedOp, TerminalBacklog, is_op_state_invalid};
+#[cfg(test)]
+pub(crate) use op_state::{OpHolderState, remove_op_state_meta_for_test};
+
 const META_STORE_INCARNATION_HIGH: &str = "store_incarnation_high_v1";
 const META_STORE_INCARNATION_LOW: &str = "store_incarnation_low_v1";
 /// The exclusive bound on every slab id this store has issued. It is
@@ -526,6 +532,9 @@ pub(crate) struct LsmInstallIntent {
 	pub phase: LsmInstallPhase,
 	pub commit: crate::storage::lsm::CompactionCommit,
 	pub commit_digest: [u8; 32],
+	/// The operations this intent's work belongs to, linked in the transaction
+	/// that allocated them (ADR 0697).
+	pub ops: Vec<crate::consensus::slab_ops::OpKey>,
 	pub inputs: Vec<LsmInputAuthority>,
 	pub local_input_rows_digest: [u8; 32],
 	pub local_output_rows_digest: [u8; 32],
@@ -605,6 +614,12 @@ impl std::fmt::Debug for RetainedCharge {
 pub(crate) struct PersistentLocalIndex {
 	db: crate::storage::owned_redb::OwnedRedb,
 	write_lock: Mutex<()>,
+	#[cfg(test)]
+	op_txn_cut: std::sync::Mutex<Option<op_state::OpTxnCut>>,
+	#[cfg(test)]
+	#[allow(clippy::type_complexity)]
+	op_handoff_hold:
+		std::sync::Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
 	/// ADR 0097: false when this store previously held receipts and the table is
 	/// now gone - lost history, not empty history.
 	receipts_available: bool,
@@ -1210,6 +1225,11 @@ impl PersistentLocalIndex {
 					incarnation
 				}
 			};
+			if initialize_new {
+				op_state::initialize_op_state(&write_txn)?;
+			} else {
+				op_state::validate_op_state(&write_txn)?;
+			}
 			write_txn.commit().map_err(redb_to_io)?;
 			if initialize_new {
 				// hard_link refuses an existing target, so this never replaces
@@ -1246,6 +1266,10 @@ impl PersistentLocalIndex {
 		Ok(Self {
 			db,
 			write_lock: Mutex::new(()),
+			#[cfg(test)]
+			op_txn_cut: std::sync::Mutex::new(None),
+			#[cfg(test)]
+			op_handoff_hold: std::sync::Mutex::new(None),
 			receipts_available: receipts_ok,
 			cleanup_available: cleanup_ok,
 			persisted_cleanup_gaps: std::sync::Arc::new(CleanupGapContribution {
@@ -4900,6 +4924,7 @@ mod tests {
 			local_output_files: Vec::new(),
 			commit,
 			commit_digest,
+			ops: Vec::new(),
 			inputs: vec![LsmInputAuthority {
 				slab_id: SlabId::new(51),
 				revision: 7,
@@ -5356,6 +5381,7 @@ mod tests {
 			kind: LsmInstallKind::Local,
 			phase: LsmInstallPhase::Prepared,
 			commit_digest: *blake3::hash(&serde_json::to_vec(&commit).unwrap()).as_bytes(),
+			ops: Vec::new(),
 			commit,
 			inputs: Vec::new(),
 			local_input_rows_digest: [0; 32],

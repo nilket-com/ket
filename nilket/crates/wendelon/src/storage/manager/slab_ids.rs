@@ -10,6 +10,35 @@ pub(super) fn slab_ids_exhausted() -> Error {
 	Error::other("slab id space exhausted")
 }
 
+impl From<&TieredSlabPointer> for crate::consensus::slab_ops::TierGeneration {
+	fn from(pointer: &TieredSlabPointer) -> Self {
+		// Exhaustive: a new field must be classified as identity or advisory.
+		let TieredSlabPointer {
+			slab_id: _,
+			l2_uri,
+			payload_hash,
+			is_encrypted,
+			tenant_id,
+			tenant_kek_id,
+			stats_format_version,
+			stats_block_len,
+			stats_block_hash128,
+			tombstone_metadata: _,
+			supersession_metadata: _,
+		} = pointer;
+		Self {
+			l2_uri: l2_uri.clone(),
+			payload_hash: *payload_hash,
+			is_encrypted: *is_encrypted,
+			tenant_id: *tenant_id,
+			tenant_kek_id: *tenant_kek_id,
+			stats_format_version: *stats_format_version,
+			stats_block_len: *stats_block_len,
+			stats_block_hash128: *stats_block_hash128,
+		}
+	}
+}
+
 impl TieredSlabPointer {
 	/// The local pointer for a ring pointer this store owns. Callers have
 	/// classified the owner (`classify_ring_slab` / `own_tier_view`).

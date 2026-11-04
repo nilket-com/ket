@@ -129,9 +129,9 @@ fn carrier_wal_versions_zero_through_five_are_refused() {
 	);
 }
 #[test]
-fn carrier_current_v6_corpus_matches_independent_manifest_and_writer_kind() {
+fn carrier_current_v7_corpus_matches_independent_manifest_and_writer_kind() {
 	let stored = manifest(include_str!(
-		"../../../tests/fixtures/consensus_body/wal_v6_entries.txt"
+		"../../../tests/fixtures/consensus_body/wal_v7_entries.txt"
 	));
 	let requests = body_format_corpus::canonical_requests();
 	assert_eq!(stored.len(), requests.len() + 2);

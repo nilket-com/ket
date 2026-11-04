@@ -291,7 +291,10 @@ impl SlabManager {
 			StoreOpen::Existing => {
 				match PersistentLocalIndex::open_with_owner(index_path, owner.clone()).await {
 					Ok(index) => Some(index),
-					Err(err) if crate::storage::index::is_store_identity_missing(&err) => {
+					Err(err)
+						if crate::storage::index::is_store_identity_missing(&err)
+							|| crate::storage::index::is_op_state_invalid(&err) =>
+					{
 						return Err(err);
 					}
 					Err(err) => {
@@ -421,6 +424,12 @@ impl SlabManager {
 							intent,
 						)
 						.await
+					}
+					// ADR 0697: an intent linked to an operation is not recovered
+					// from local evidence alone. It stays fenced until recovery
+					// holds that operation's receipt and current authority.
+					crate::storage::index::LsmInstallKind::Control if !intent.ops.is_empty() => {
+						Ok(false)
 					}
 					crate::storage::index::LsmInstallKind::Control => {
 						lsm_driver::reconcile_completed_control_lsm_intent(
@@ -1103,6 +1112,7 @@ impl SlabManager {
 				"published reference integrity failure detected during recovery; preserving durable index evidence"
 			);
 		}
+		manager.fence_unresolved_ops_at_open().await?;
 		Ok(manager)
 	}
 }

@@ -12,7 +12,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex as AsyncMutex;
 use wendelon::consensus::{
-	RetireTieredSlab, TierObserver, WendelonRequest, WendelonStateMachine, WendelonTypeConfig,
+	TierObserver, WendelonRequest, WendelonStateMachine, WendelonTypeConfig,
 };
 use wendelon::crypto::{CryptoManager, test_support};
 use wendelon::schema::{HybridTimestamp, Identity, TenantId};
@@ -95,16 +95,18 @@ impl AppliedStateMachineCommitter {
 
 #[async_trait]
 impl TierCommitter for AppliedStateMachineCommitter {
-	async fn commit_tier_slab(
+	async fn submit_op(
 		&self,
-		proposal: wendelon::storage::TierProposal,
-	) -> std::io::Result<()> {
-		let tier = proposal.tier().clone();
-		let owner = tier.slab.owner();
+		ticket: &wendelon::storage::OpTicket,
+	) -> std::io::Result<wendelon::storage::VerifiedReceipt> {
+		let owner = ticket.key().owner;
 		let index = self.next_index.fetch_add(2, Ordering::Relaxed);
 		let entry = Entry::<WendelonTypeConfig> {
 			log_id: LogId::new(CommittedLeaderId::new(1, owner.node()), index + 1),
-			payload: EntryPayload::Normal(WendelonRequest::TierSlab(tier)),
+			payload: EntryPayload::Normal(WendelonRequest::SlabOp(wendelon::consensus::SlabOp {
+				op_seq: ticket.key().op_seq,
+				command: ticket.command().clone(),
+			})),
 		};
 		let mut sm = self.sm.lock().await;
 		<WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::apply(
@@ -112,26 +114,8 @@ impl TierCommitter for AppliedStateMachineCommitter {
 			vec![registration(owner, index), entry],
 		)
 		.await
-		.map_err(|err| Error::other(format!("test tier commit failed: {err}")))?;
-		Ok(())
-	}
-
-	async fn retire_tiered_slab(&self, slab: wendelon::consensus::SlabRef) -> std::io::Result<()> {
-		let index = self.next_index.fetch_add(1, Ordering::Relaxed);
-		let entry = Entry::<WendelonTypeConfig> {
-			log_id: LogId::new(CommittedLeaderId::new(1, slab.owner().node()), index),
-			payload: EntryPayload::Normal(WendelonRequest::RetireTieredSlab(RetireTieredSlab {
-				slab,
-			})),
-		};
-		let mut sm = self.sm.lock().await;
-		<WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::apply(
-			&mut *sm,
-			vec![entry],
-		)
-		.await
-		.map_err(|err| Error::other(format!("test retire commit failed: {err}")))?;
-		Ok(())
+		.map_err(|err| Error::other(format!("test op commit failed: {err}")))?;
+		Ok(wendelon::storage::VerifiedReceipt::Applied { index: index + 1 })
 	}
 }
 
@@ -673,6 +657,7 @@ async fn sweeper_persists_remote_uri_shape_in_tier_metadata() {
 		state_machine.clone(),
 		SweeperConfig {
 			scan_interval: Duration::from_millis(10),
+			op_driver_interval: Duration::from_millis(500),
 			min_slab_bytes: 0,
 			max_upload_bytes_per_sec: None,
 			key_prefix: "sealed/".into(),

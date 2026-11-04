@@ -31,7 +31,9 @@ use wendelon::storage::core::StorageEngine;
 use wendelon::storage::io_uring::spawn_io_thread;
 use wendelon::storage::l2::{LocalFsObjectStore, ObjectStore};
 use wendelon::storage::manager::{SlabManager, SlabManagerConfig};
-use wendelon::storage::sweeper::{ManagerTierObserver, SlabSweeper, SweeperConfig, TierCommitter};
+use wendelon::storage::sweeper::{
+	CommandCommitter, ManagerTierObserver, SlabSweeper, SweeperConfig, TierCommitter,
+};
 
 fn hlc(physical_ms: u64, node_id: u32) -> HybridTimestamp {
 	HybridTimestamp {
@@ -174,7 +176,7 @@ struct DirectApplyCommitter {
 }
 
 #[async_trait]
-impl TierCommitter for DirectApplyCommitter {
+impl CommandCommitter for DirectApplyCommitter {
 	async fn commit_tier_slab(
 		&self,
 		proposal: wendelon::storage::TierProposal,
@@ -287,6 +289,7 @@ async fn scrape_endpoint_exposes_data_ring_and_storage_metrics() {
 		sm,
 		SweeperConfig {
 			scan_interval: std::time::Duration::from_millis(10),
+			op_driver_interval: std::time::Duration::from_millis(500),
 			min_slab_bytes: 0,
 			max_upload_bytes_per_sec: None,
 			key_prefix: "metrics/".into(),

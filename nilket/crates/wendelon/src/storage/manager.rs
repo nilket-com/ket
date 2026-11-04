@@ -203,6 +203,7 @@ mod observation;
 mod open;
 mod slab_ids;
 pub(crate) use open::IndexRecoveryAuthority;
+mod op_hooks;
 pub(crate) use slab_ids::{OwnTierView, OwnerEvidence, Ownership};
 use slab_ids::{SLAB_ID_LEASE, slab_ids_exhausted};
 mod retention_reclaim;
@@ -487,10 +488,9 @@ impl TieredSlabPointer {
 	/// Immutable object generation for retirement. Advisory visibility
 	/// summaries can change without reintroducing a retired object.
 	pub(crate) fn same_object_generation(&self, other: &Self) -> bool {
-		let mut normalized = other.clone();
-		normalized.tombstone_metadata = self.tombstone_metadata;
-		normalized.supersession_metadata = self.supersession_metadata;
-		self == &normalized
+		self.slab_id == other.slab_id
+			&& crate::consensus::slab_ops::TierGeneration::from(self)
+				== crate::consensus::slab_ops::TierGeneration::from(other)
 	}
 
 	pub fn record_tombstone_hlc(&mut self, tombstone_hlc: HybridTimestamp) {
@@ -616,6 +616,7 @@ pub(crate) enum PreparedTieredRetentionRewrite {
 	Rewrite {
 		slab_id: SlabId,
 		old_l2_uri: String,
+		old_generation: crate::consensus::slab_ops::TierGeneration,
 		old_bytes: u64,
 		encrypted_bytes: Vec<u8>,
 		payload_hash: [u8; 32],
@@ -628,6 +629,7 @@ pub(crate) enum PreparedTieredRetentionRewrite {
 	Retire {
 		slab_id: SlabId,
 		old_l2_uri: String,
+		old_generation: crate::consensus::slab_ops::TierGeneration,
 		old_bytes: u64,
 		pruned_versions: usize,
 		retention_stats: RetentionCompactionStats,
@@ -642,6 +644,7 @@ pub(crate) enum PreparedTieredTableDropRewrite {
 	Rewrite {
 		slab_id: SlabId,
 		old_l2_uri: String,
+		old_generation: crate::consensus::slab_ops::TierGeneration,
 		old_bytes: u64,
 		encrypted_bytes: Vec<u8>,
 		payload_hash: [u8; 32],
@@ -653,6 +656,7 @@ pub(crate) enum PreparedTieredTableDropRewrite {
 	Retire {
 		slab_id: SlabId,
 		old_l2_uri: String,
+		old_generation: crate::consensus::slab_ops::TierGeneration,
 		old_bytes: u64,
 		reclaimed_records: usize,
 		reclaimed_bytes: u64,
@@ -3864,6 +3868,7 @@ impl SlabManager {
 			return Ok(Some(PreparedTieredRetentionRewrite::Retire {
 				slab_id: pointer.slab_id,
 				old_l2_uri: pointer.l2_uri.clone(),
+				old_generation: crate::consensus::slab_ops::TierGeneration::from(pointer),
 				old_bytes: old_blob.len() as u64,
 				pruned_versions,
 				retention_stats,
@@ -3947,6 +3952,7 @@ impl SlabManager {
 		Ok(Some(PreparedTieredRetentionRewrite::Rewrite {
 			slab_id: pointer.slab_id,
 			old_l2_uri: pointer.l2_uri.clone(),
+			old_generation: crate::consensus::slab_ops::TierGeneration::from(pointer),
 			old_bytes: old_blob.len() as u64,
 			payload_hash: crate::hash::content::digest(&encrypted.bytes),
 			tombstone_metadata: merge_row_tombstone_metadata(
@@ -4029,6 +4035,7 @@ impl SlabManager {
 			return Ok(Some(PreparedTieredTableDropRewrite::Retire {
 				slab_id: pointer.slab_id,
 				old_l2_uri: pointer.l2_uri.clone(),
+				old_generation: crate::consensus::slab_ops::TierGeneration::from(pointer),
 				old_bytes: old_blob.len() as u64,
 				reclaimed_records,
 				reclaimed_bytes: old_blob.len() as u64,
@@ -4111,6 +4118,7 @@ impl SlabManager {
 		Ok(Some(PreparedTieredTableDropRewrite::Rewrite {
 			slab_id: pointer.slab_id,
 			old_l2_uri: pointer.l2_uri.clone(),
+			old_generation: crate::consensus::slab_ops::TierGeneration::from(pointer),
 			old_bytes: old_blob.len() as u64,
 			payload_hash: crate::hash::content::digest(&encrypted.bytes),
 			tombstone_metadata: merge_row_tombstone_metadata(

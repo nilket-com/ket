@@ -6,7 +6,6 @@ use crate::schema::{
 	PolicyGeneration, ReleaseLeaseRequestMeta, SlabId, SupersessionMetadata, TableObjectId,
 	TableRetentionPolicy, TenantId, TenantKekId, TombstoneMetadata,
 };
-use crate::storage::CompactionCommit;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -278,17 +277,6 @@ pub struct TableDropSettlementRequest {
 	pub attested_participants: crate::schema::TableDropParticipantSet,
 }
 
-/// Payload of a `RetireTieredSlab` Raft entry.
-///
-/// Committed when a previously-tiered slab no longer has any live
-/// rows after MVCC retention pruning. Every replica removes the
-/// pointer from replicated state and the local `SlabManager`
-/// observes the apply to drop any cached rows / rehydrated copy.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RetireTieredSlab {
-	pub slab: SlabRef,
-}
-
 /// Payload of a `RegisterIncarnation` Raft entry (ADR 0697 §3): record a
 /// node's current store incarnation. A first registration names no
 /// predecessor; a replacement names the exact current one it supersedes. A
@@ -322,6 +310,13 @@ pub enum SlabRefusal {
 		node: u32,
 		incarnation: StoreIncarnation,
 	},
+	/// An operation past its owner's window. A correct owner never sends one.
+	OutsideWindow {
+		key: crate::consensus::slab_ops::OpKey,
+		acked_through: u64,
+	},
+	/// An acknowledgement batch larger than the window.
+	AckBatchTooLarge { len: u64 },
 }
 
 /// The unified Node ID type used across Wendelon.
@@ -671,14 +666,17 @@ pub enum WendelonRequest {
 	/// Committing this entry causes every replica's state machine
 	/// to record the L2 pointer and — via the tier observer — the
 	/// local `SlabManager` to pivot reads and unlink the L1 file.
-	TierSlab(TieredSlab),
+	/// Retired by ADR 0697; the position stays so later variants keep their wire tags.
+	RetiredTierSlab(crate::consensus::slab_ops::RetiredSlabCommand),
 	/// A previously-tiered slab has become fully reclaimable and its
 	/// L2 pointer should be removed from replicated state.
-	RetireTieredSlab(RetireTieredSlab),
+	/// Retired by ADR 0697; the position stays so later variants keep their wire tags.
+	RetiredRetireTieredSlab(crate::consensus::slab_ops::RetiredSlabCommand),
 	/// Commit an ADR 055 LSM manifest transition. The control ring
 	/// carries the compaction digest summary but does not introduce
 	/// any separate digest mutation or eviction marker.
-	CompactionCommit(CompactionCommit),
+	/// Retired by ADR 0697; the position stays so later variants keep their wire tags.
+	RetiredCompactionCommit(crate::consensus::slab_ops::RetiredSlabCommand),
 	/// Seed a Migration Ledger entry for a reassigned range
 	/// (Plan 019). Idempotent: a replay with the same
 	/// `migration_id` is a no-op.
@@ -743,6 +741,12 @@ pub enum WendelonRequest {
 	/// Record a node's current store incarnation (ADR 0697). Appended after
 	/// the Root2 carrier so its pinned wire position does not move.
 	RegisterIncarnation(RegisterIncarnation),
+	/// One operation of a slab's owner (ADR 0697 §5).
+	SlabOp(crate::consensus::slab_ops::SlabOp),
+	/// Close an operation by its original digest (ADR 0697 §5.4).
+	CancelOp(crate::consensus::slab_ops::CancelOp),
+	/// The owner has durably finished these operations (ADR 0697 §5.3).
+	AckOutcomes(crate::consensus::slab_ops::AckOutcomes),
 }
 
 impl WendelonRequest {
@@ -758,9 +762,6 @@ impl WendelonRequest {
 		"release_lease",
 		"advance_epoch",
 		"schema_update",
-		"tier_slab",
-		"retire_tiered_slab",
-		"compaction_commit",
 		"seed_migration",
 		"migration_complete",
 		"create_tenant",
@@ -781,6 +782,9 @@ impl WendelonRequest {
 		"table_drop_settlement",
 		"root2_command",
 		"register_incarnation",
+		"slab_op",
+		"cancel_op",
+		"ack_outcomes",
 	];
 
 	/// Total by construction: a new variant fails this match at compile time,
@@ -793,9 +797,9 @@ impl WendelonRequest {
 			Self::ReleaseLease(_) => "release_lease",
 			Self::AdvanceEpoch(_) => "advance_epoch",
 			Self::SchemaUpdate(_) => "schema_update",
-			Self::TierSlab(_) => "tier_slab",
-			Self::RetireTieredSlab(_) => "retire_tiered_slab",
-			Self::CompactionCommit(_) => "compaction_commit",
+			Self::RetiredTierSlab(never)
+			| Self::RetiredRetireTieredSlab(never)
+			| Self::RetiredCompactionCommit(never) => match *never {},
 			Self::SeedMigration(_) => "seed_migration",
 			Self::MigrationComplete(_) => "migration_complete",
 			Self::CreateTenant(_) => "create_tenant",
@@ -816,6 +820,9 @@ impl WendelonRequest {
 			Self::TableDropSettlement(_) => "table_drop_settlement",
 			Self::Root2Command(_) => "root2_command",
 			Self::RegisterIncarnation(_) => "register_incarnation",
+			Self::SlabOp(_) => "slab_op",
+			Self::CancelOp(_) => "cancel_op",
+			Self::AckOutcomes(_) => "ack_outcomes",
 		}
 	}
 }
@@ -834,6 +841,8 @@ pub enum WendelonResponse {
 	Root2Dormant,
 	/// Refused without applying or recording anything (ADR 0697).
 	Refused(SlabRefusal),
+	/// Operation evidence (ADR 0697 §5).
+	Op(crate::consensus::slab_ops::OpResponse),
 }
 
 // The Wendelon implementation of the `openraft::RaftTypeConfig` trait.

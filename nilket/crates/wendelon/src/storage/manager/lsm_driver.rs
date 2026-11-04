@@ -1326,6 +1326,7 @@ impl SlabManager {
 			commit: commit.clone(),
 			commit_digest: *blake3::hash(&serde_json::to_vec(commit).map_err(Error::other)?)
 				.as_bytes(),
+			ops: Vec::new(),
 			inputs: expected.clone(),
 		};
 		// Register while no new mark is held across the scope-lock await. Mark
@@ -1452,6 +1453,17 @@ impl SlabManager {
 		secondary_index_context: Option<SecondaryIndexCompactionContext<'_>>,
 	) -> Result<ManifestEpoch, CompactionFailure> {
 		self.require_tier_authority_ready()?;
+		committer.preflight(commit.owner).await?;
+		#[cfg(test)]
+		let precheck = !self
+			.continuity_test_holds
+			.skip_op_room_precheck
+			.load(std::sync::atomic::Ordering::Acquire);
+		#[cfg(not(test))]
+		let precheck = true;
+		if precheck {
+			self.require_op_index()?.ensure_op_room(1).await?;
+		}
 		self.preflight_lsm_compaction_outputs(
 			plan,
 			prepared,
@@ -1491,7 +1503,34 @@ impl SlabManager {
 		self.tier_authority.notify_publication_change();
 		// Mark before entering OwnedRedb: its blocking transaction may outlive a
 		// cancelled caller. Any uncertain result retains the mark and evidence.
-		index.put_lsm_install_intent(intent.clone()).await?;
+		// The operation and its intent commit together, so neither exists without
+		// the other (ADR 0697).
+		let allocation = match index
+			.allocate_ops(
+				vec![crate::consensus::slab_ops::SlabCommand::Compaction(
+					commit.clone(),
+				)],
+				Some(intent),
+			)
+			.await
+		{
+			Ok(allocation) => allocation,
+			// Proven: nothing was written. Only the owned runtime scope goes, so
+			// the refused producer leaves no fence on reserved work. Any other
+			// result may have committed and keeps the fence.
+			Err(error) if crate::storage::sweeper::op_window_refused(&error) => {
+				self.clear_registered_lsm_intent(commit.job_id).await;
+				_intent_owner.complete();
+				self.tier_authority.notify_publication_change();
+				return Err(error.into());
+			}
+			Err(error) => return Err(error.into()),
+		};
+		let ticket = allocation.first;
+		let intent = allocation
+			.linked
+			.ok_or_else(|| Error::other("an allocated LSM operation returns its intent"))?;
+
 		#[cfg(test)]
 		self.pause_control_lsm_install_for_test(ControlLsmInstallCut::BeforeRename)
 			.await;
@@ -1508,7 +1547,8 @@ impl SlabManager {
 		{
 			Ok(staged) => staged,
 			Err(LsmStageFailure::BeforeRename(failure)) => {
-				self.clear_refused_lsm_intent(index, &intent).await?;
+				self.cancel_unsubmitted_lsm_op(index, committer, &ticket, &intent)
+					.await?;
 				_intent_owner.complete();
 				return Err(failure);
 			}
@@ -1525,11 +1565,8 @@ impl SlabManager {
 		#[cfg(test)]
 		self.pause_control_lsm_install_for_test(ControlLsmInstallCut::AfterRename)
 			.await;
-		let commit_result = committer.commit_lsm_compaction(commit.clone()).await;
-		if let Err(error) = commit_result {
-			if error
-				.get_ref()
-				.is_some_and(|cause| cause.is::<crate::storage::sweeper::LsmCommitRejected>())
+		let receipt = committer.submit_op(&ticket).await?;
+		if let crate::storage::sweeper::VerifiedReceipt::Rejected { reason, .. } = receipt {
 			{
 				let _maintenance = self
 					.maintenance_publication_gate
@@ -1555,12 +1592,18 @@ impl SlabManager {
 					unlink_local_file(self.file_ops.as_ref(), &path).await?;
 					fsync_parent_dir(self.file_ops.as_ref(), &path).await?;
 				}
-				index.clear_lsm_install_intent(intent).await?;
+				index
+					.hand_off_op(ticket.key(), ticket.digest(), Some(intent))
+					.await?;
 				self.clear_registered_lsm_intent(commit.job_id).await;
 				_intent_owner.complete();
 				self.tier_authority.notify_publication_change();
 			}
-			return Err(error.into());
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				crate::storage::sweeper::LsmCommitRejected(format!("{reason:?}")),
+			)
+			.into());
 		}
 		#[cfg(test)]
 		self.pause_control_lsm_install_for_test(ControlLsmInstallCut::AfterAcceptance)
@@ -1623,7 +1666,9 @@ impl SlabManager {
 				let _ = release.acquire().await;
 			}
 		}
-		index.clear_lsm_install_intent(completed_intent).await?;
+		index
+			.hand_off_op(ticket.key(), ticket.digest(), Some(completed_intent))
+			.await?;
 		self.clear_registered_lsm_intent(commit.job_id).await;
 		_intent_owner.complete();
 		self.tier_authority.notify_publication_change();
@@ -1764,6 +1809,7 @@ impl SlabManager {
 			commit: commit.clone(),
 			commit_digest: *blake3::hash(&serde_json::to_vec(commit).map_err(Error::other)?)
 				.as_bytes(),
+			ops: Vec::new(),
 			inputs: inputs.clone(),
 		})
 	}
@@ -4154,8 +4200,21 @@ impl SlabManager {
 			.cloned()
 			.collect::<Vec<_>>();
 		retired.sort_unstable_by_key(|run| run.slab_id);
+		// A full window refuses new marks and new removals, and never keeps this
+		// sweep from the removals already reserved.
+		let mut backlog = None;
 		for expected_run in retired {
 			let slab_id = expected_run.slab_id;
+			// No lock spans this control-ring await, and nothing is allocated
+			// or marked for an owner that cannot propose.
+			committer.preflight(self.owner_ref()?).await?;
+			if let Err(error) = index.ensure_op_room(2).await {
+				if !crate::storage::sweeper::op_window_refused(&error) {
+					return Err(error);
+				}
+				backlog = Some(error);
+				break;
+			}
 			let expected = {
 				let _maintenance = self.maintenance_publication_gate.clone().read_owned().await;
 				let tier_lock = self.tier_publication_lock(slab_id);
@@ -4186,6 +4245,14 @@ impl SlabManager {
 				snapshot.manifest_epoch,
 				vec![slab_id],
 			);
+			// The removal is built whole now and reserved with the mark, so it
+			// never needs a fresh sequence (ADR 0697 §5.2).
+			let remove = crate::consensus::slab_ops::GcRemove {
+				owner: commit.owner,
+				job_id: Self::lsm_gc_job_id(snapshot.manifest_epoch, 0xD2, &[slab_id]),
+				slab: slab_id,
+				expected_run: crate::consensus::slab_ops::RunIdentity::of(&expected_run),
+			};
 			let digest =
 				*blake3::hash(&serde_json::to_vec(&commit).map_err(Error::other)?).as_bytes();
 			let intent = crate::storage::index::LsmInstallIntent {
@@ -4198,6 +4265,7 @@ impl SlabManager {
 				local_output_files: Vec::new(),
 				commit: commit.clone(),
 				commit_digest: digest,
+				ops: Vec::new(),
 				inputs: expected.clone(),
 			};
 			let Some(_intent_owner) = self.register_lsm_install_intent(&intent).await else {
@@ -4207,8 +4275,39 @@ impl SlabManager {
 				));
 			};
 			self.tier_authority.notify_publication_change();
-			index.put_lsm_install_intent(intent.clone()).await?;
-			committer.commit_lsm_compaction(commit.clone()).await?;
+			let allocation = match index
+				.allocate_ops(
+					vec![
+						crate::consensus::slab_ops::SlabCommand::Compaction(commit.clone()),
+						crate::consensus::slab_ops::SlabCommand::GcRemove(remove),
+					],
+					Some(intent),
+				)
+				.await
+			{
+				Ok(allocation) => allocation,
+				// Nothing was written: the window is full, and this run is
+				// not marked. Only new work is refused.
+				Err(error) if crate::storage::sweeper::op_window_refused(&error) => {
+					self.slab_pins.clear_delete_pending(slab_id);
+					self.clear_registered_lsm_intent(commit.job_id).await;
+					_intent_owner.complete();
+					self.tier_authority.notify_publication_change();
+					backlog = Some(error);
+					break;
+				}
+				Err(error) => return Err(error),
+			};
+			let removal = allocation
+				.later
+				.first()
+				.map(|reserved| reserved.key())
+				.ok_or_else(|| Error::other("a GC mark reserves its removal"))?;
+			let ticket = allocation.first;
+			let intent = allocation
+				.linked
+				.ok_or_else(|| Error::other("an allocated GC operation returns its intent"))?;
+			Self::require_gc_applied(committer.submit_op(&ticket).await?)?;
 			let _claim = self.acquire_slab_rewrite_exclusive_claim(slab_id).await;
 			let _maintenance = self
 				.maintenance_publication_gate
@@ -4253,7 +4352,15 @@ impl SlabManager {
 				.await?;
 			gc_worker.observe_manifest_snapshot(&snapshot);
 			publication.complete();
-			index.clear_lsm_install_intent(intent).await?;
+			// The mark's own revision change is in this authority; anything after it
+			// is not, and the removal refuses it.
+			let left_for_removal = self
+				.lsm_input_authority_locked(&[slab_id])
+				.await
+				.map_err(|error| Error::other(error.to_string()))?;
+			index
+				.hand_off_gc_mark(&ticket, intent, removal, left_for_removal)
+				.await?;
 			self.clear_registered_lsm_intent(commit.job_id).await;
 			_intent_owner.complete();
 			self.tier_authority.notify_publication_change();
@@ -4271,6 +4378,17 @@ impl SlabManager {
 			if self.is_compaction_slab_quarantined(slab_id) {
 				continue;
 			}
+			#[cfg(test)]
+			if self
+				.continuity_test_holds
+				.gc_remove_held
+				.load(std::sync::atomic::Ordering::Acquire)
+			{
+				continue;
+			}
+			// No lock spans this control-ring await, and nothing is allocated
+			// or marked for an owner that cannot propose.
+			committer.preflight(self.owner_ref()?).await?;
 			let expected = {
 				let _maintenance = self.maintenance_publication_gate.clone().read_owned().await;
 				let tier_lock = self.tier_publication_lock(slab_id);
@@ -4290,10 +4408,39 @@ impl SlabManager {
 					Err(_) => continue,
 				}
 			};
+			// The removal reserved with this run's mark. A run marked by another
+			// path has none, and takes a new operation under the window's bound.
+			let reserved = match self
+				.gc_remove_reservation_or_allocate(index, &expected_run)
+				.await
+			{
+				Ok(reserved) => reserved,
+				Err(error) if crate::storage::sweeper::op_window_refused(&error) => {
+					backlog = Some(error);
+					continue;
+				}
+				Err(error) => return Err(error),
+			};
+			// Its mark has not finished; its intent is what fences this run.
+			if reserved.awaits_its_workflow() {
+				continue;
+			}
+			// The authority this reservation was made for, or nothing: a different
+			// object is never adopted as the same operation.
+			if reserved
+				.expected_inputs
+				.as_ref()
+				.is_some_and(|inputs| *inputs != expected)
+			{
+				return Err(Error::new(
+					ErrorKind::WouldBlock,
+					"a reserved GC removal's input authority changed; it remains fenced",
+				));
+			}
 			let snapshot = self.compaction_manifest_snapshot();
 			let commit = CompactionCommit::gc_remove(
 				self.owner_ref()?,
-				Self::lsm_gc_job_id(snapshot.manifest_epoch, 0xD2, &[slab_id]),
+				reserved.job_id,
 				snapshot.manifest_epoch,
 				vec![slab_id],
 			);
@@ -4309,6 +4456,7 @@ impl SlabManager {
 				local_output_files: Vec::new(),
 				commit: commit.clone(),
 				commit_digest: digest,
+				ops: Vec::new(),
 				inputs: expected.clone(),
 			};
 			let Some(_intent_owner) = self.register_lsm_install_intent(&intent).await else {
@@ -4318,9 +4466,12 @@ impl SlabManager {
 				));
 			};
 			self.tier_authority.notify_publication_change();
+			let mut intent = intent;
+			intent.ops = vec![reserved.key()];
 			index.put_lsm_install_intent(intent.clone()).await?;
+			let ticket = reserved.into_ticket(index).await?;
 			// No maintenance, tier or rewrite lock spans the control-ring await.
-			committer.commit_lsm_compaction(commit.clone()).await?;
+			Self::require_gc_applied(committer.submit_op(&ticket).await?)?;
 			let _claim = self.acquire_slab_rewrite_exclusive_claim(slab_id).await;
 			let _maintenance = self
 				.maintenance_publication_gate
@@ -4397,7 +4548,9 @@ impl SlabManager {
 			#[cfg(test)]
 			self.pause_gc_before_clear_for_test().await;
 			publication.complete();
-			index.clear_lsm_install_intent(intent).await?;
+			index
+				.hand_off_op(ticket.key(), ticket.digest(), Some(intent))
+				.await?;
 			self.clear_registered_lsm_intent(commit.job_id).await;
 			_intent_owner.complete();
 			self.slab_pins.clear_delete_pending(slab_id);
@@ -4406,7 +4559,10 @@ impl SlabManager {
 			self.pause_gc_after_clear_for_test().await;
 			deleted.push(slab_id);
 		}
-		Ok(deleted)
+		match backlog {
+			Some(error) if deleted.is_empty() => Err(error),
+			_ => Ok(deleted),
+		}
 	}
 
 	pub(super) fn lsm_gc_job_id(

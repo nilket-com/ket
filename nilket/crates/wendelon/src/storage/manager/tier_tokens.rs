@@ -247,6 +247,12 @@ pub struct TierProposal {
 }
 
 impl TierProposal {
+	/// A proposal with no reservation of its own, for a [`crate::storage::sweeper::CommandCommitter`]
+	/// whose caller already holds the reservation.
+	pub(crate) fn tokenless(tier: TieredSlab) -> Self {
+		Self { tier, token: None }
+	}
+
 	/// The entry to propose.
 	pub fn tier(&self) -> &TieredSlab {
 		&self.tier
@@ -320,6 +326,13 @@ impl TierSubmission {
 
 	/// The command was refused before `client_write`: it can never apply.
 	pub fn not_submitted(self) {
+		self.release();
+	}
+
+	/// The state machine definitely rejected this submitted command: it applied
+	/// nothing and never will, so the reservation goes. Distinct from
+	/// [`Self::not_submitted`], which proves it was never sent.
+	pub fn rejected(self) {
 		self.release();
 	}
 

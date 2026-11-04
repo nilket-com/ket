@@ -853,6 +853,9 @@ impl WendelonControlServer {
 				WendelonResponse::Refused(refusal) => Err(Error::other(format!(
 					"unexpected slab refusal for a non-slab command: {refusal:?}"
 				))),
+				WendelonResponse::Op(refusal) => Err(Error::other(format!(
+					"unexpected slab refusal for a non-slab command: {refusal:?}"
+				))),
 				WendelonResponse::Root2Dormant => {
 					let message = String::from("Root2 carrier is dormant, not applied");
 					Err(Error::new(ErrorKind::Other, message))
@@ -1093,6 +1096,9 @@ impl WendelonControlServer {
 							CtasSagaResponse::Rejected,
 						),
 					WendelonResponse::Refused(_) => {
+						CtasSagaResponse::Rejected(CtasSagaReject::InvalidTransition)
+					}
+					WendelonResponse::Op(_) => {
 						CtasSagaResponse::Rejected(CtasSagaReject::InvalidTransition)
 					}
 					WendelonResponse::Root2Dormant => {
@@ -1854,6 +1860,9 @@ impl WendelonControlServer {
 				WendelonResponse::Refused(refusal) => Err(Error::other(format!(
 					"unexpected slab refusal for a non-slab command: {refusal:?}"
 				))),
+				WendelonResponse::Op(refusal) => Err(Error::other(format!(
+					"unexpected slab refusal for a non-slab command: {refusal:?}"
+				))),
 				WendelonResponse::Root2Dormant => {
 					let message = String::from("Root2 carrier is dormant, not applied");
 					self.revocation_admin_rejection(
@@ -2096,6 +2105,9 @@ impl WendelonControlServer {
 					None,
 				),
 				WendelonResponse::Refused(refusal) => Err(Error::other(format!(
+					"unexpected slab refusal for a non-slab command: {refusal:?}"
+				))),
+				WendelonResponse::Op(refusal) => Err(Error::other(format!(
 					"unexpected slab refusal for a non-slab command: {refusal:?}"
 				))),
 				WendelonResponse::Root2Dormant => {
@@ -3065,6 +3077,9 @@ impl WendelonControlServer {
 				WendelonResponse::Refused(refusal) => Err(WendelonAdminError::Transport {
 					message: format!("unexpected slab refusal for a non-slab command: {refusal:?}"),
 				}),
+				WendelonResponse::Op(refusal) => Err(WendelonAdminError::Transport {
+					message: format!("unexpected slab refusal for a non-slab command: {refusal:?}"),
+				}),
 				WendelonResponse::Root2Dormant => {
 					let message = String::from("Root2 carrier is dormant, not applied");
 					Err(WendelonAdminError::Transport { message })
@@ -3101,6 +3116,9 @@ impl WendelonControlServer {
 					None,
 				),
 				WendelonResponse::Refused(refusal) => Err(Error::other(format!(
+					"unexpected slab refusal for a non-slab command: {refusal:?}"
+				))),
+				WendelonResponse::Op(refusal) => Err(Error::other(format!(
 					"unexpected slab refusal for a non-slab command: {refusal:?}"
 				))),
 				WendelonResponse::Root2Dormant => {
@@ -3161,6 +3179,9 @@ impl WendelonControlServer {
 					None,
 				),
 				WendelonResponse::Refused(refusal) => Err(Error::other(format!(
+					"unexpected slab refusal for a non-slab command: {refusal:?}"
+				))),
+				WendelonResponse::Op(refusal) => Err(Error::other(format!(
 					"unexpected slab refusal for a non-slab command: {refusal:?}"
 				))),
 				WendelonResponse::Root2Dormant => {
@@ -3261,6 +3282,9 @@ impl WendelonControlServer {
 					None,
 				),
 				WendelonResponse::Refused(refusal) => Err(Error::other(format!(
+					"unexpected slab refusal for a non-slab command: {refusal:?}"
+				))),
+				WendelonResponse::Op(refusal) => Err(Error::other(format!(
 					"unexpected slab refusal for a non-slab command: {refusal:?}"
 				))),
 				WendelonResponse::Root2Dormant => {
@@ -3369,6 +3393,9 @@ impl WendelonControlServer {
 					None,
 				),
 				WendelonResponse::Refused(refusal) => Err(Error::other(format!(
+					"unexpected slab refusal for a non-slab command: {refusal:?}"
+				))),
+				WendelonResponse::Op(refusal) => Err(Error::other(format!(
 					"unexpected slab refusal for a non-slab command: {refusal:?}"
 				))),
 				WendelonResponse::Root2Dormant => {
@@ -3835,6 +3862,7 @@ impl WendelonControlServer {
 				WendelonResponse::LeaseDenied => LeaseStatus::DENIED_OVERLAP,
 				WendelonResponse::Error(_) => LeaseStatus::INTERNAL_ERROR,
 				WendelonResponse::Refused(_) => LeaseStatus::INTERNAL_ERROR,
+				WendelonResponse::Op(_) => LeaseStatus::INTERNAL_ERROR,
 				WendelonResponse::Root2Dormant => LeaseStatus::INTERNAL_ERROR,
 			},
 			Err(_) if !self.is_leader().await => LeaseStatus::DENIED_NOT_LEADER,
@@ -3873,6 +3901,7 @@ impl WendelonControlServer {
 				WendelonResponse::LeaseDenied => LeaseStatus::DENIED_INVALID_TARGET,
 				WendelonResponse::Error(_) => LeaseStatus::INTERNAL_ERROR,
 				WendelonResponse::Refused(_) => LeaseStatus::INTERNAL_ERROR,
+				WendelonResponse::Op(_) => LeaseStatus::INTERNAL_ERROR,
 				WendelonResponse::Root2Dormant => LeaseStatus::INTERNAL_ERROR,
 			},
 			Err(_) if !self.is_leader().await => LeaseStatus::DENIED_NOT_LEADER,

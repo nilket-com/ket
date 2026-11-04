@@ -721,7 +721,7 @@ fn test_adr055_lsm_compaction_substrate_guards() {
 		}
 	}
 
-	for required in ["CompactionCommit(CompactionCommit)", "control ring"] {
+	for required in ["RetiredCompactionCommit(", "control ring"] {
 		if !consensus_core.contains(required) {
 			violations.push(format!(
 				"src/consensus/core.rs: missing ADR 055 control-ring token {required}"
@@ -729,7 +729,7 @@ fn test_adr055_lsm_compaction_substrate_guards() {
 		}
 	}
 	for required in [
-		"WendelonRequest::CompactionCommit",
+		"SlabCommand::Compaction(commit)",
 		"TierObserverEvent::LsmCompactionCommitted",
 		"on_lsm_compaction_committed",
 		"AuditOperation::LsmCompactionCommitted",
@@ -744,8 +744,7 @@ fn test_adr055_lsm_compaction_substrate_guards() {
 	for required in [
 		"on_lsm_compaction_committed",
 		"observe_lsm_compaction_commit(commit, applied_log_index)",
-		"commit_lsm_compaction",
-		"WendelonRequest::CompactionCommit(commit)",
+		"on_gc_removed",
 	] {
 		if !storage_sweeper.contains(required) {
 			violations.push(format!(
@@ -9715,6 +9714,7 @@ fn adr078_manager_source_concatenates_submodules() {
 			"metadata_observation.rs",
 			// ADR 629 counted publication helpers preserve the existing entry points.
 			"observation.rs",
+			"op_hooks.rs",
 			"open.rs",
 			// ADR 0692: test-only pause points (compiled only under cfg(test)), kept
 			// out of the bounded root.
@@ -10221,16 +10221,16 @@ fn adr0093_snapshot_v2_and_v3_fixtures_are_both_guarded() {
 		.unwrap();
 	let v5 = fs::read_to_string(manifest_dir.join("tests/fixtures/consensus_body/snapshot_v5.txt"))
 		.unwrap();
-	assert!(core.contains("pub const SNAPSHOT_FORMAT_VERSION: u8 = 6;"));
+	assert!(core.contains("pub const SNAPSHOT_FORMAT_VERSION: u8 = 7;"));
 	assert!(!manifest_dir.join("src/consensus/snapshot_body.rs").exists());
 	for required in [
 		"SNAPSHOT_V2_MANIFEST",
 		"SNAPSHOT_V3_MANIFEST",
 		"SNAPSHOT_V4_MANIFEST",
 		"SNAPSHOT_V5_MANIFEST",
-		"SNAPSHOT_V6_MANIFEST",
-		"adr0697_every_pre_v6_snapshot_body_is_refused_before_decode",
-		"adr0697_current_wal_v6_and_snapshot_v6_match_stored_goldens",
+		"SNAPSHOT_V7_MANIFEST",
+		"adr0697_every_pre_v7_snapshot_body_is_refused_before_decode",
+		"adr0697_current_wal_v7_and_snapshot_v7_match_stored_goldens",
 	] {
 		assert!(
 			raft.contains(required),
@@ -10262,7 +10262,7 @@ fn adr0094_write_cap_and_legacy_replay_have_one_authority() {
 	let client = fs::read_to_string(manifest_dir.join("src/client/core.rs")).unwrap();
 	let schema = fs::read_to_string(manifest_dir.join("src/schema/core.rs")).unwrap();
 	let raft = fs::read_to_string(manifest_dir.join("src/consensus/raft_storage.rs")).unwrap();
-	assert!(schema.contains("pub const WAL_FORMAT_VERSION: u8 = 6;"));
+	assert!(schema.contains("pub const WAL_FORMAT_VERSION: u8 = 7;"));
 	assert_eq!(core.matches("pub const MAX_SECTION_BYTES:").count(), 1);
 	assert_eq!(
 		client
@@ -11320,10 +11320,18 @@ fn snapshot_lease_scopes_exclude_remote_io_and_backoff() {
 	assert_eq!(
 		sites,
 		vec![
+			PathBuf::from("src/storage/manager/op_hooks.rs"),
 			PathBuf::from("src/storage/manager/tier_authority.rs"),
 			PathBuf::from("src/storage/sweeper.rs")
 		]
 	);
+	// The operation handoff's lease spans local state and one redb commit only.
+	let op_hooks = fs::read_to_string(root.join("src/storage/manager/op_hooks.rs")).unwrap();
+	assert_eq!(op_hooks.matches("source.read().await").count(), 1);
+	let handoff = manager_method_body(&op_hooks, "hand_off_op_if_complete");
+	for remote in ["object_store", "l2", "sleep", "client_write", "backoff"] {
+		assert!(!handoff.contains(remote), "{remote}");
+	}
 	assert!(compare.contains("let canonical = retry.source.read().await?;\n\t\tlet manager"));
 	assert!(callback.contains("let canonical = match self.snapshot_source.get()"));
 	assert!(
@@ -11504,7 +11512,7 @@ fn control_lsm_output_rename_has_one_guarded_staging_path() {
 	);
 	assert!(
 		control.find(".stage_lsm_compaction_outputs(").unwrap()
-			< control.find("committer.commit_lsm_compaction(").unwrap()
+			< control.find("committer.submit_op(").unwrap()
 	);
 	assert_eq!(
 		source
@@ -11531,7 +11539,7 @@ fn completed_control_lsm_recovery_has_one_accepted_private_issuer() {
 		"install_lsm_compaction_temp_outputs_via_control_ring_with_context",
 	);
 	assert!(
-		control.find("committer.commit_lsm_compaction(").unwrap()
+		control.find("committer.submit_op(").unwrap()
 			< control.find("new_after_acceptance(").unwrap()
 	);
 	assert!(control.contains("prepared_sidecars.is_none()"));
@@ -11652,13 +11660,22 @@ fn lsm_stage_refusal_is_definite_only_before_rename() {
 		2,
 		"no other conversion into a stage failure"
 	);
-	assert_eq!(source.matches(".clear_refused_lsm_intent(").count(), 2);
-	for caller in [
-		"install_lsm_compaction_temp_outputs",
-		"install_lsm_compaction_temp_outputs_via_control_ring_with_context",
+	// The local path clears its refused intent; the control path has an allocated
+	// operation, which closes only through the ring (ADR 0697).
+	assert_eq!(source.matches(".clear_refused_lsm_intent(").count(), 1);
+	assert_eq!(source.matches(".cancel_unsubmitted_lsm_op(").count(), 1);
+	for (caller, clear) in [
+		(
+			"install_lsm_compaction_temp_outputs",
+			".clear_refused_lsm_intent(",
+		),
+		(
+			"install_lsm_compaction_temp_outputs_via_control_ring_with_context",
+			".cancel_unsubmitted_lsm_op(",
+		),
 	] {
 		let body = manager_method_body(&source, caller);
-		let clear = body.find(".clear_refused_lsm_intent(").unwrap();
+		let clear = body.find(clear).unwrap();
 		assert!(body[..clear].contains("LsmStageFailure::BeforeRename("));
 		assert!(body.contains("LsmStageFailure::Uncertain(failure)) => return Err(failure)"));
 	}
@@ -11688,33 +11705,22 @@ fn every_tier_proposer_holds_a_history_token() {
 		.map(|(body, _)| body.to_owned())
 		.expect("propose_tier_slab exists");
 	assert!(
-		helper.contains("reserve_tier_history(tier)")
-			&& helper.contains("committer.commit_tier_slab(proposal)"),
-		"the helper reserves the token, then proposes with it"
-	);
-	assert!(
-		sweeper.contains(
-			"async fn commit_tier_slab(&self, proposal: TierProposal) -> std::io::Result<()>;"
-		),
-		"the committer receives the bound proposal, never a bare entry"
+		helper.contains("reserve_tier_history(tier.clone())")
+			&& helper.contains("submit_tier_proposal(slab, committer, proposal, allocation.first)"),
+		"the helper reserves the token, allocates, then submits under it"
 	);
 	for (name, source) in [("sweeper.rs", &sweeper), ("retention_reclaim.rs", &reclaim)] {
-		let direct = source
-			.match_indices(".commit_tier_slab(")
-			.filter(|(at, _)| !source[..*at].ends_with("committer"))
-			.count();
+		// The one production builder, and the fixture adapter's dispatch.
+		let direct = source.matches("SlabCommand::Tier(").count();
+		let direct = direct - if name == "sweeper.rs" { 2 } else { 0 };
 		assert_eq!(
 			direct, 0,
 			"{name}: production proposals go through propose_tier_slab"
 		);
 	}
-	assert!(sweeper.matches("propose_tier_slab(&self.slab,").count() >= 6);
-	assert_eq!(
-		reclaim
-			.matches("propose_tier_slab(self, committer, tier)")
-			.count(),
-		2
-	);
+	// The definition, and its six production call sites.
+	assert!(sweeper.matches("propose_tier_slab(").count() >= 7);
+	assert_eq!(reclaim.matches("sweeper::propose_tier_slab(").count(), 2);
 	let manager = manager_source(manifest_dir);
 	assert_eq!(
 		manager.matches("fn reserve_tier_history(").count(),

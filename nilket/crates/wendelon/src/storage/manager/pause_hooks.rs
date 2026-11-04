@@ -458,6 +458,14 @@ pub(super) struct TestHolds {
 		std::sync::Mutex<Option<(Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>>,
 	pub(super) gc_after_fsync_hold:
 		std::sync::Mutex<Option<(Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>>,
+	/// Pauses an operation's handoff inside its canonical lease.
+	pub(super) op_handoff_hold:
+		std::sync::Mutex<Option<(Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>>,
+	/// Reaches the allocation's own window check, as a lost race with another
+	/// producer would.
+	pub(super) skip_op_room_precheck: std::sync::atomic::AtomicBool,
+	/// Keeps the GC sweep from reaching a removal, as a blocker would.
+	pub(super) gc_remove_held: std::sync::atomic::AtomicBool,
 	pub(super) gc_before_clear_hold:
 		std::sync::Mutex<Option<(Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>>,
 	pub(super) gc_after_clear_hold:
@@ -469,6 +477,19 @@ impl SlabManager {
 		let hold = self
 			.continuity_test_holds
 			.gc_after_clear_hold
+			.lock()
+			.unwrap()
+			.clone();
+		if let Some((entered, release)) = hold {
+			entered.add_permits(1);
+			let _ = release.acquire().await;
+		}
+	}
+
+	pub(super) async fn pause_op_handoff_for_test(&self) {
+		let hold = self
+			.continuity_test_holds
+			.op_handoff_hold
 			.lock()
 			.unwrap()
 			.clone();

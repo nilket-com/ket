@@ -766,6 +766,7 @@ pub struct NodeHandles {
 	pub lsm_compaction: JoinHandle<()>,
 	pub lsm_compaction_control: LsmCompactionServiceControl,
 	pub lsm_gc: JoinHandle<()>,
+	pub op_driver: JoinHandle<()>,
 	pub secondary_index_lifecycle: JoinHandle<()>,
 	pub tiering_sweeper: Option<JoinHandle<()>>,
 	pub restore_validation: Option<JoinHandle<()>>,
@@ -789,6 +790,7 @@ impl NodeHandles {
 		self.migration_sweeper.abort();
 		self.lsm_compaction.abort();
 		self.lsm_gc.abort();
+		self.op_driver.abort();
 		self.secondary_index_lifecycle.abort();
 		if let Some(handle) = &self.tiering_sweeper {
 			handle.abort();
@@ -840,6 +842,7 @@ impl NodeHandles {
 		join_all_way!(self.migration_sweeper, "migration sweeper");
 		join_all_way!(self.lsm_compaction, "LSM compaction");
 		join_all_way!(self.lsm_gc, "LSM GC");
+		join_all_way!(self.op_driver, "operation driver");
 		join_all_way!(self.secondary_index_lifecycle, "secondary-index lifecycle");
 		if let Some(handle) = self.tiering_sweeper {
 			join_all_way!(handle, "tiering sweeper");
@@ -2408,6 +2411,15 @@ impl WendelonNode {
 			.set_lsm_gc(LsmGcService::new(lsm_gc_driver, lsm_gc_worker).spawn());
 		#[cfg(test)]
 		scope.checkpoint(&cfg, "set_lsm_gc").await?;
+		scope.handles().set_op_driver(tokio::spawn(
+			Arc::new(crate::storage::op_driver::OpDriver::new(
+				slab.clone(),
+				raft_committer.clone(),
+			))
+			.run(cfg.tiering.op_driver_interval),
+		));
+		#[cfg(test)]
+		scope.checkpoint(&cfg, "set_op_driver").await?;
 		scope
 			.handles()
 			.set_secondary_index_lifecycle(spawn_secondary_index_lifecycle_driver(
@@ -3073,6 +3085,9 @@ fn install_tenant_kek_response(response: WendelonResponse, context: &str) -> std
 		crate::consensus::WendelonResponse::Refused(refusal) => Err(Error::other(format!(
 			"unexpected slab refusal for a non-slab command: {refusal:?}"
 		))),
+		crate::consensus::WendelonResponse::Op(refusal) => Err(Error::other(format!(
+			"unexpected slab refusal for a non-slab command: {refusal:?}"
+		))),
 		crate::consensus::WendelonResponse::Root2Dormant => {
 			let message = String::from("Root2 carrier is dormant, not applied");
 			Err(Error::new(
@@ -3106,6 +3121,9 @@ fn tenant_request_response(response: WendelonResponse, context: &str) -> std::io
 			format!("{context}: {message}"),
 		)),
 		WendelonResponse::Refused(refusal) => Err(Error::other(format!(
+			"unexpected slab refusal for a non-slab command: {refusal:?}"
+		))),
+		WendelonResponse::Op(refusal) => Err(Error::other(format!(
 			"unexpected slab refusal for a non-slab command: {refusal:?}"
 		))),
 		WendelonResponse::Root2Dormant => {
@@ -3921,6 +3939,7 @@ mod tests {
 		cfg.tiering.min_slab_bytes = u64::MAX;
 		cfg.tiering.max_plaintext_rewrites_per_pass = 0;
 		cfg.tiering.max_dek_rewraps_per_pass = 0;
+		cfg.tiering.op_driver_interval = Duration::from_secs(3600);
 	}
 
 	#[test]
@@ -4513,6 +4532,81 @@ mod tests {
 		}
 	}
 
+	/// ADR 0697 R7, through a real restarted node. An Ack that reached the ring
+	/// whose response was lost is redriven after restart, the row retires by the
+	/// canonical prefix with no sequence reused, and a duplicate of the pruned
+	/// operation applies nothing.
+	#[tokio::test]
+	async fn a_restarted_node_redrives_a_lost_ack_and_a_pruned_duplicate_applies_nothing() {
+		use crate::consensus::slab_ops::{AckOutcomes, OpOutcome, OpResponse};
+		let dir = tempdir("op-restart");
+		let mut cfg = NodeBootstrapConfig::dev(16, dir.to_path_buf(), "127.0.0.1:0".into());
+		park_background_tiering(&mut cfg);
+		let node = WendelonNode::bootstrap_single_node(cfg.clone())
+			.await
+			.unwrap();
+		wait_for_local_leader(&node).await;
+		let owner = registered_owner(&node).await;
+		let request = node
+			.slab
+			.retire_request_for_test(owner.slab(SlabId::new(0x7000)))
+			.await;
+		let decided = node.raft.client_write(request.clone()).await.unwrap();
+		assert!(matches!(decided.data, WendelonResponse::Op(_)));
+		let seq = match &request {
+			WendelonRequest::SlabOp(op) => op.op_seq,
+			other => panic!("expected a slab op, got {other:?}"),
+		};
+		let index = node.slab.require_op_index().unwrap();
+		assert_eq!(index.load_ack_pending().await.unwrap(), vec![(seq, false)]);
+		// The Ack lands on the ring; its response never reaches the local row.
+		let acked = node
+			.raft
+			.client_write(WendelonRequest::AckOutcomes(AckOutcomes {
+				owner,
+				seqs: vec![seq],
+			}))
+			.await
+			.unwrap();
+		assert!(matches!(
+			acked.data,
+			WendelonResponse::Op(OpResponse::Ack(ref receipt)) if receipt.acked_through >= seq
+		));
+		assert_eq!(index.load_ack_pending().await.unwrap(), vec![(seq, false)]);
+		node.shutdown().await.unwrap();
+
+		// Same store, driver running.
+		cfg.tiering.op_driver_interval = Duration::from_millis(20);
+		let restarted = WendelonNode::bootstrap_single_node(cfg.clone())
+			.await
+			.unwrap();
+		wait_for_local_leader(&restarted).await;
+		let index = restarted.slab.require_op_index().unwrap();
+		tokio::time::timeout(Duration::from_secs(60), async {
+			while !index.load_ack_pending().await.unwrap().is_empty() {
+				tokio::time::sleep(Duration::from_millis(20)).await;
+			}
+		})
+		.await
+		.expect("the driver redrives after restart with no later handoff or election");
+
+		let duplicate = restarted.raft.client_write(request).await.unwrap();
+		assert!(matches!(
+			duplicate.data,
+			WendelonResponse::Op(OpResponse::Receipt(ref receipt))
+				if receipt.outcome == OpOutcome::Unavailable
+		));
+		let next = restarted
+			.slab
+			.retire_request_for_test(owner.slab(SlabId::new(0x7001)))
+			.await;
+		assert!(
+			matches!(&next, WendelonRequest::SlabOp(op) if op.op_seq > seq),
+			"no sequence is reused"
+		);
+		restarted.shutdown().await.unwrap();
+	}
+
 	#[tokio::test]
 	/// ADR 0697 (DC-162 interim): restoring a store with tiered data to a
 	/// fresh incarnation is refused before any restore effect, from the
@@ -4585,25 +4679,29 @@ mod tests {
 			.unwrap();
 
 		node.raft
-			.client_write(WendelonRequest::TierSlab(TieredSlab {
-				slab: registered_owner(&node).await.slab(sealed_id),
-				l2_uri,
-				payload_hash,
-				is_encrypted: true,
-				tenant_id: Some(tenant_id),
-				tenant_kek_id: Some(encrypted.tenant_kek_id),
-				stats_format_version: encrypted
-					.stats_locator
-					.map(|locator| locator.stats_format_version),
-				stats_block_len: encrypted
-					.stats_locator
-					.map(|locator| locator.stats_block_len),
-				stats_block_hash128: encrypted
-					.stats_locator
-					.map(|locator| locator.stats_block_hash128),
-				tombstone_metadata: TombstoneMetadata::None,
-				supersession_metadata: SupersessionMetadata::None,
-			}))
+			.client_write(
+				node.slab
+					.tier_request_for_test(TieredSlab {
+						slab: registered_owner(&node).await.slab(sealed_id),
+						l2_uri,
+						payload_hash,
+						is_encrypted: true,
+						tenant_id: Some(tenant_id),
+						tenant_kek_id: Some(encrypted.tenant_kek_id),
+						stats_format_version: encrypted
+							.stats_locator
+							.map(|locator| locator.stats_format_version),
+						stats_block_len: encrypted
+							.stats_locator
+							.map(|locator| locator.stats_block_len),
+						stats_block_hash128: encrypted
+							.stats_locator
+							.map(|locator| locator.stats_block_hash128),
+						tombstone_metadata: TombstoneMetadata::None,
+						supersession_metadata: SupersessionMetadata::None,
+					})
+					.await,
+			)
 			.await
 			.unwrap();
 		assert!(node.slab.is_tiered(sealed_id).await);
@@ -4800,7 +4898,7 @@ mod tests {
 				.expect("fixture supersession summary must be readable"),
 		};
 		node.raft
-			.client_write(WendelonRequest::TierSlab(tier.clone()))
+			.client_write(node.slab.tier_request_for_test(tier.clone()).await)
 			.await
 			.unwrap();
 		assert!(
@@ -4848,7 +4946,7 @@ mod tests {
 			..tier
 		};
 		node.raft
-			.client_write(WendelonRequest::TierSlab(replacement.clone()))
+			.client_write(node.slab.tier_request_for_test(replacement.clone()).await)
 			.await
 			.unwrap();
 		assert!(
@@ -4942,25 +5040,29 @@ mod tests {
 			.await
 			.unwrap();
 		node.raft
-			.client_write(WendelonRequest::TierSlab(TieredSlab {
-				slab: registered_owner(&node).await.slab(sealed_id),
-				l2_uri,
-				payload_hash,
-				is_encrypted: true,
-				tenant_id: Some(tenant_id),
-				tenant_kek_id: Some(encrypted.tenant_kek_id),
-				stats_format_version: encrypted
-					.stats_locator
-					.map(|locator| locator.stats_format_version),
-				stats_block_len: encrypted
-					.stats_locator
-					.map(|locator| locator.stats_block_len),
-				stats_block_hash128: encrypted
-					.stats_locator
-					.map(|locator| locator.stats_block_hash128),
-				tombstone_metadata: TombstoneMetadata::None,
-				supersession_metadata: SupersessionMetadata::None,
-			}))
+			.client_write(
+				node.slab
+					.tier_request_for_test(TieredSlab {
+						slab: registered_owner(&node).await.slab(sealed_id),
+						l2_uri,
+						payload_hash,
+						is_encrypted: true,
+						tenant_id: Some(tenant_id),
+						tenant_kek_id: Some(encrypted.tenant_kek_id),
+						stats_format_version: encrypted
+							.stats_locator
+							.map(|locator| locator.stats_format_version),
+						stats_block_len: encrypted
+							.stats_locator
+							.map(|locator| locator.stats_block_len),
+						stats_block_hash128: encrypted
+							.stats_locator
+							.map(|locator| locator.stats_block_hash128),
+						tombstone_metadata: TombstoneMetadata::None,
+						supersession_metadata: SupersessionMetadata::None,
+					})
+					.await,
+			)
 			.await
 			.unwrap();
 		assert!(node.slab.is_tiered(sealed_id).await);
@@ -4968,11 +5070,11 @@ mod tests {
 		let old_uri = node.slab.tier_pointer(sealed_id).await.unwrap().l2_uri;
 		node.slab.fail_next_retirement_transaction_for_test();
 		node.raft
-			.client_write(WendelonRequest::RetireTieredSlab(
-				crate::consensus::RetireTieredSlab {
-					slab: registered_owner(&node).await.slab(sealed_id),
-				},
-			))
+			.client_write(
+				node.slab
+					.retire_request_for_test(registered_owner(&node).await.slab(sealed_id))
+					.await,
+			)
 			.await
 			.unwrap();
 		assert!(
@@ -5106,25 +5208,29 @@ mod tests {
 			.await
 			.unwrap();
 		node.raft
-			.client_write(WendelonRequest::TierSlab(TieredSlab {
-				slab: registered_owner(&node).await.slab(sealed_id),
-				l2_uri,
-				payload_hash,
-				is_encrypted: true,
-				tenant_id: Some(tenant_id),
-				tenant_kek_id: Some(encrypted.tenant_kek_id),
-				stats_format_version: encrypted
-					.stats_locator
-					.map(|locator| locator.stats_format_version),
-				stats_block_len: encrypted
-					.stats_locator
-					.map(|locator| locator.stats_block_len),
-				stats_block_hash128: encrypted
-					.stats_locator
-					.map(|locator| locator.stats_block_hash128),
-				tombstone_metadata: TombstoneMetadata::None,
-				supersession_metadata: SupersessionMetadata::None,
-			}))
+			.client_write(
+				node.slab
+					.tier_request_for_test(TieredSlab {
+						slab: registered_owner(&node).await.slab(sealed_id),
+						l2_uri,
+						payload_hash,
+						is_encrypted: true,
+						tenant_id: Some(tenant_id),
+						tenant_kek_id: Some(encrypted.tenant_kek_id),
+						stats_format_version: encrypted
+							.stats_locator
+							.map(|locator| locator.stats_format_version),
+						stats_block_len: encrypted
+							.stats_locator
+							.map(|locator| locator.stats_block_len),
+						stats_block_hash128: encrypted
+							.stats_locator
+							.map(|locator| locator.stats_block_hash128),
+						tombstone_metadata: TombstoneMetadata::None,
+						supersession_metadata: SupersessionMetadata::None,
+					})
+					.await,
+			)
 			.await
 			.unwrap();
 		assert!(node.slab.is_tiered(sealed_id).await);
@@ -5250,25 +5356,29 @@ mod tests {
 			.unwrap();
 
 		node.raft
-			.client_write(WendelonRequest::TierSlab(TieredSlab {
-				slab: registered_owner(&node).await.slab(sealed_id),
-				l2_uri: l2_uri.clone(),
-				payload_hash,
-				is_encrypted: true,
-				tenant_id: Some(tenant_id),
-				tenant_kek_id: Some(encrypted.tenant_kek_id),
-				stats_format_version: encrypted
-					.stats_locator
-					.map(|locator| locator.stats_format_version),
-				stats_block_len: encrypted
-					.stats_locator
-					.map(|locator| locator.stats_block_len),
-				stats_block_hash128: encrypted
-					.stats_locator
-					.map(|locator| locator.stats_block_hash128),
-				tombstone_metadata: TombstoneMetadata::None,
-				supersession_metadata: SupersessionMetadata::None,
-			}))
+			.client_write(
+				node.slab
+					.tier_request_for_test(TieredSlab {
+						slab: registered_owner(&node).await.slab(sealed_id),
+						l2_uri: l2_uri.clone(),
+						payload_hash,
+						is_encrypted: true,
+						tenant_id: Some(tenant_id),
+						tenant_kek_id: Some(encrypted.tenant_kek_id),
+						stats_format_version: encrypted
+							.stats_locator
+							.map(|locator| locator.stats_format_version),
+						stats_block_len: encrypted
+							.stats_locator
+							.map(|locator| locator.stats_block_len),
+						stats_block_hash128: encrypted
+							.stats_locator
+							.map(|locator| locator.stats_block_hash128),
+						tombstone_metadata: TombstoneMetadata::None,
+						supersession_metadata: SupersessionMetadata::None,
+					})
+					.await,
+			)
 			.await
 			.unwrap();
 
@@ -5439,25 +5549,29 @@ mod tests {
 			.unwrap();
 
 		node.raft
-			.client_write(WendelonRequest::TierSlab(TieredSlab {
-				slab: registered_owner(&node).await.slab(sealed_id),
-				l2_uri: l2_uri.clone(),
-				payload_hash,
-				is_encrypted: true,
-				tenant_id: Some(tenant_id),
-				tenant_kek_id: Some(encrypted.tenant_kek_id),
-				stats_format_version: encrypted
-					.stats_locator
-					.map(|locator| locator.stats_format_version),
-				stats_block_len: encrypted
-					.stats_locator
-					.map(|locator| locator.stats_block_len),
-				stats_block_hash128: encrypted
-					.stats_locator
-					.map(|locator| locator.stats_block_hash128),
-				tombstone_metadata: TombstoneMetadata::None,
-				supersession_metadata: SupersessionMetadata::None,
-			}))
+			.client_write(
+				node.slab
+					.tier_request_for_test(TieredSlab {
+						slab: registered_owner(&node).await.slab(sealed_id),
+						l2_uri: l2_uri.clone(),
+						payload_hash,
+						is_encrypted: true,
+						tenant_id: Some(tenant_id),
+						tenant_kek_id: Some(encrypted.tenant_kek_id),
+						stats_format_version: encrypted
+							.stats_locator
+							.map(|locator| locator.stats_format_version),
+						stats_block_len: encrypted
+							.stats_locator
+							.map(|locator| locator.stats_block_len),
+						stats_block_hash128: encrypted
+							.stats_locator
+							.map(|locator| locator.stats_block_hash128),
+						tombstone_metadata: TombstoneMetadata::None,
+						supersession_metadata: SupersessionMetadata::None,
+					})
+					.await,
+			)
 			.await
 			.unwrap();
 
@@ -5616,6 +5730,7 @@ mod tests {
 			node.state_machine.clone(),
 			SweeperConfig {
 				scan_interval: Duration::from_millis(10),
+				op_driver_interval: Duration::from_millis(500),
 				min_slab_bytes: 0,
 				max_upload_bytes_per_sec: None,
 				key_prefix: "sealed/".into(),

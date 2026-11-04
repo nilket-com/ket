@@ -33,9 +33,9 @@ use wendelon::storage::core::StorageEngine;
 use wendelon::storage::io_uring::spawn_io_thread;
 use wendelon::storage::manager::{RehydrationPolicy, SlabManager, SlabManagerConfig};
 use wendelon::storage::{
-	CompactionCommit, CompactionDigestSummary, CompactionPlan, DominantReason, GroupCommitConfig,
-	IoUringFileOps, LocalSlabStore, LsmCompactionWorker, LsmConfig, LsmGcWorker, LsmRunSummary,
-	SidecarSwap, SlabState, TierCommitter, VersionLifecycle,
+	CommandCommitter, CompactionCommit, CompactionDigestSummary, CompactionPlan, DominantReason,
+	GroupCommitConfig, IoUringFileOps, LocalSlabStore, LsmCompactionWorker, LsmConfig, LsmGcWorker,
+	LsmRunSummary, SidecarSwap, SlabState, VersionLifecycle,
 };
 
 /// A fixed ring owner for fixtures without a store, minted the way the control
@@ -85,7 +85,7 @@ struct ManifestApplyingCommitter {
 }
 
 #[async_trait]
-impl TierCommitter for ManifestApplyingCommitter {
+impl CommandCommitter for ManifestApplyingCommitter {
 	async fn commit_tier_slab(
 		&self,
 		_proposal: wendelon::storage::TierProposal,
@@ -101,6 +101,21 @@ impl TierCommitter for ManifestApplyingCommitter {
 			std::io::ErrorKind::Unsupported,
 			"tier retirements are not used by this test committer",
 		))
+	}
+
+	async fn commit_gc_remove(
+		&self,
+		remove: &wendelon::consensus::GcRemove,
+	) -> std::io::Result<()> {
+		*self.last_commit.lock().unwrap() = Some(CompactionCommit::gc_remove(
+			remove.owner,
+			remove.job_id,
+			wendelon::schema::ManifestEpoch::new(0),
+			vec![remove.slab],
+		));
+		self.manager.apply_lsm_gc_removal(remove).map(|_| {
+			self.applied.fetch_add(1, Ordering::SeqCst);
+		})
 	}
 
 	async fn commit_lsm_compaction(&self, commit: CompactionCommit) -> std::io::Result<()> {

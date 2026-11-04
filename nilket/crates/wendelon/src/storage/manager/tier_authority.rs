@@ -104,6 +104,9 @@ pub(super) struct TierAuthority {
 	/// evidence at or below it is covered, whatever that comparison's outcome,
 	/// because its readers hold at least that view. Only rises.
 	comparison_read_index: std::sync::RwLock<Option<u64>>,
+	/// A reopen found tier or retire operations with no durable decision. Only
+	/// their receipts can resolve them, so nothing is served until they do.
+	pub(super) unresolved_op_fence: AtomicBool,
 	snapshot_reconciliation: std::sync::Mutex<Option<SnapshotReconciliation>>,
 	retirements: DashMap<SlabId, Option<u64>>,
 	snapshot_retirements: DashMap<SlabId, (u64, Option<u64>)>,
@@ -193,6 +196,7 @@ impl TierAuthority {
 			retirement_fence: AtomicBool::new(false),
 			snapshot_fences: SnapshotFences::default(),
 			comparison_read_index: std::sync::RwLock::new(None),
+			unresolved_op_fence: AtomicBool::new(false),
 			snapshot_reconciliation: std::sync::Mutex::new(None),
 			retirements: DashMap::new(),
 			snapshot_retirements: DashMap::new(),
@@ -1541,6 +1545,13 @@ impl SlabManager {
 		if let Some(reason) = self.owner_authority_fence.get() {
 			return Error::new(ErrorKind::WouldBlock, *reason);
 		}
+		if self
+			.tier_authority
+			.unresolved_op_fence
+			.load(Ordering::Acquire)
+		{
+			return Error::new(ErrorKind::WouldBlock, "UnresolvedOpIntent");
+		}
 		if let Some(error) = self.tier_authority.integrity_error() {
 			return error;
 		}
@@ -1745,6 +1756,13 @@ impl SlabManager {
 	pub(crate) fn tier_authority_readiness_reason(&self) -> Option<String> {
 		if let Some(reason) = self.owner_authority_fence.get() {
 			return Some((*reason).into());
+		}
+		if self
+			.tier_authority
+			.unresolved_op_fence
+			.load(Ordering::Acquire)
+		{
+			return Some("UnresolvedOpIntent".into());
 		}
 		if let Some(error) = self.tier_authority.integrity_error() {
 			return Some(error.to_string());

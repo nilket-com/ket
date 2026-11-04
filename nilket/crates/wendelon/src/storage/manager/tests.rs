@@ -20,6 +20,7 @@ use crate::schema::{
 	SecondaryIndexKeyDescriptor, TableLifecycleCatalog, TableRetentionPolicy,
 };
 use crate::storage::EncodingPageDescriptor;
+use crate::storage::index::LoadedOp;
 use crate::storage::io_uring::spawn_io_thread;
 use crate::storage::l2::{LocalFsObjectStore, ObjectStore};
 use crate::storage::multirow::pack_record_batch_by_bucket;
@@ -34,6 +35,7 @@ use crate::storage::stats::{
 	decode_column_stats_payload, encode_float64_stat_value, encode_length_prefixed_bytes,
 	encode_signed_stat_value, parse_column_stats_block,
 };
+use crate::storage::sweeper::CommandCommitter;
 use crate::storage::{
 	FaultAction, FaultOp, FaultyFileOps, IndexQuery, InjectedFault, LsmConfig, SecondaryIndexEntry,
 	SecondaryIndexIdentity,
@@ -2683,7 +2685,7 @@ struct DirectLsmCommitter {
 }
 
 #[async_trait]
-impl TierCommitter for DirectLsmCommitter {
+impl CommandCommitter for DirectLsmCommitter {
 	async fn commit_tier_slab(
 		&self,
 		_proposal: crate::storage::TierProposal,
@@ -2701,6 +2703,14 @@ impl TierCommitter for DirectLsmCommitter {
 		))
 	}
 
+	async fn commit_gc_remove(
+		&self,
+		remove: &crate::consensus::slab_ops::GcRemove,
+	) -> std::io::Result<()> {
+		self.manager.apply_lsm_gc_removal(remove)?;
+		Ok(())
+	}
+
 	async fn commit_lsm_compaction(&self, commit: CompactionCommit) -> std::io::Result<()> {
 		self.manager
 			.apply_lsm_manifest_compaction_commit(&commit)
@@ -2714,7 +2724,7 @@ struct DirectTierCommitter {
 }
 
 #[async_trait]
-impl TierCommitter for DirectTierCommitter {
+impl CommandCommitter for DirectTierCommitter {
 	async fn commit_tier_slab(
 		&self,
 		proposal: crate::storage::TierProposal,
@@ -2752,7 +2762,7 @@ impl TierCommitter for DirectTierCommitter {
 struct FailingLsmCommitter;
 
 #[async_trait]
-impl TierCommitter for FailingLsmCommitter {
+impl CommandCommitter for FailingLsmCommitter {
 	async fn commit_tier_slab(
 		&self,
 		_proposal: crate::storage::TierProposal,
@@ -5672,7 +5682,7 @@ struct PausingLsmCommitter {
 }
 
 #[async_trait]
-impl TierCommitter for PausingLsmCommitter {
+impl CommandCommitter for PausingLsmCommitter {
 	async fn commit_tier_slab(
 		&self,
 		_proposal: crate::storage::TierProposal,
@@ -14066,6 +14076,7 @@ impl SlabManager {
 			return Ok(Some(PreparedTieredRetentionRewrite::Retire {
 				slab_id: pointer.slab_id,
 				old_l2_uri: pointer.l2_uri.clone(),
+				old_generation: crate::consensus::slab_ops::TierGeneration::from(pointer),
 				old_bytes: old_blob.len() as u64,
 				pruned_versions,
 				retention_stats,
@@ -14141,6 +14152,7 @@ impl SlabManager {
 		Ok(Some(PreparedTieredRetentionRewrite::Rewrite {
 			slab_id: pointer.slab_id,
 			old_l2_uri: pointer.l2_uri.clone(),
+			old_generation: crate::consensus::slab_ops::TierGeneration::from(pointer),
 			old_bytes: old_blob.len() as u64,
 			payload_hash: crate::hash::content::digest(&encrypted.bytes),
 			tombstone_metadata: merge_row_tombstone_metadata(
@@ -21345,7 +21357,7 @@ struct UnpublishedDropCommitter {
 }
 
 #[async_trait]
-impl TierCommitter for UnpublishedDropCommitter {
+impl CommandCommitter for UnpublishedDropCommitter {
 	async fn commit_tier_slab(
 		&self,
 		proposal: crate::storage::TierProposal,
@@ -21649,7 +21661,7 @@ struct AmbiguousDropCommitter {
 }
 
 #[async_trait]
-impl TierCommitter for AmbiguousDropCommitter {
+impl CommandCommitter for AmbiguousDropCommitter {
 	async fn commit_tier_slab(
 		&self,
 		proposal: crate::storage::TierProposal,
@@ -23956,7 +23968,7 @@ async fn bootstrap_rotation_skips_all_committed_pointer_ids() {
 
 #[tokio::test]
 async fn committed_retirement_during_verification_fences_reads_until_ready() {
-	use crate::consensus::{RetireTieredSlab, TieredSlab, WendelonRequest, WendelonStateMachine};
+	use crate::consensus::{TieredSlab, WendelonStateMachine};
 	use crate::storage::sweeper::ManagerTierObserver;
 	use openraft::storage::RaftStateMachine;
 	use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
@@ -23985,9 +23997,11 @@ async fn committed_retirement_during_verification_fences_reads_until_ready() {
 	.await;
 	let entry = Entry {
 		log_id: LogId::new(CommittedLeaderId::new(3, 1), 701),
-		payload: EntryPayload::Normal(WendelonRequest::RetireTieredSlab(RetireTieredSlab {
-			slab: f.manager.owner_ref().unwrap().slab(p.slab_id),
-		})),
+		payload: EntryPayload::Normal(
+			f.manager
+				.retire_request_for_test(f.manager.owner_ref().unwrap().slab(p.slab_id))
+				.await,
+		),
 	};
 	RaftStateMachine::apply(&mut sm, [entry]).await.unwrap();
 	assert!(
@@ -24133,7 +24147,7 @@ impl crate::consensus::TierObserver for PausedRetirementObserver {
 /// the SM has applied RetireTieredSlab, local retirement has not completed.
 #[tokio::test]
 async fn committed_retirement_fences_ready_reads_before_local_retirement() {
-	use crate::consensus::{RetireTieredSlab, TieredSlab, WendelonRequest, WendelonStateMachine};
+	use crate::consensus::{TieredSlab, WendelonStateMachine};
 	use openraft::storage::RaftStateMachine;
 	use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
 
@@ -24178,6 +24192,7 @@ async fn committed_retirement_fences_ready_reads_before_local_retirement() {
 		supersession_metadata: p.supersession_metadata,
 	})
 	.await;
+	let request = mgr.retire_request_for_test(p_ref).await;
 	let mut apply = {
 		let mut sm = sm.clone();
 		tokio::spawn(async move {
@@ -24185,9 +24200,7 @@ async fn committed_retirement_fences_ready_reads_before_local_retirement() {
 				&mut sm,
 				[Entry {
 					log_id: LogId::new(CommittedLeaderId::new(3, 1), 711),
-					payload: EntryPayload::Normal(WendelonRequest::RetireTieredSlab(
-						RetireTieredSlab { slab: p_ref },
-					)),
+					payload: EntryPayload::Normal(request),
 				}],
 			)
 			.await
@@ -25339,6 +25352,7 @@ async fn unresolved_lsm_intent_fences_open_and_preserves_staged_output() {
 		vec![SlabId::new(2)],
 	);
 	let intent = crate::storage::index::LsmInstallIntent {
+		ops: Vec::new(),
 		kind: crate::storage::index::LsmInstallKind::Control,
 		phase: crate::storage::index::LsmInstallPhase::Prepared,
 		local_input_rows_digest: [0; 32],
@@ -25519,7 +25533,7 @@ async fn lsm_crash_after_output_rename_before_proposal_keeps_intent_and_output()
 
 struct DefiniteRejectLsmCommitter;
 #[async_trait]
-impl TierCommitter for DefiniteRejectLsmCommitter {
+impl CommandCommitter for DefiniteRejectLsmCommitter {
 	async fn commit_tier_slab(
 		&self,
 		_proposal: crate::storage::TierProposal,
@@ -25538,7 +25552,7 @@ impl TierCommitter for DefiniteRejectLsmCommitter {
 }
 struct AmbiguousLsmCommitter;
 #[async_trait]
-impl TierCommitter for AmbiguousLsmCommitter {
+impl CommandCommitter for AmbiguousLsmCommitter {
 	async fn commit_tier_slab(
 		&self,
 		_proposal: crate::storage::TierProposal,
@@ -30644,7 +30658,7 @@ struct GcPauseAfterRemoveCommit {
 }
 
 #[async_trait]
-impl TierCommitter for GcPauseAfterRemoveCommit {
+impl CommandCommitter for GcPauseAfterRemoveCommit {
 	async fn commit_tier_slab(
 		&self,
 		_proposal: crate::storage::TierProposal,
@@ -30654,6 +30668,16 @@ impl TierCommitter for GcPauseAfterRemoveCommit {
 	async fn retire_tiered_slab(&self, _slab: crate::consensus::SlabRef) -> std::io::Result<()> {
 		Err(Error::new(ErrorKind::Unsupported, "unused"))
 	}
+	async fn commit_gc_remove(
+		&self,
+		remove: &crate::consensus::slab_ops::GcRemove,
+	) -> std::io::Result<()> {
+		self.manager.apply_lsm_gc_removal(remove)?;
+		self.entered.add_permits(1);
+		let _ = self.release.acquire().await;
+		Ok(())
+	}
+
 	async fn commit_lsm_compaction(&self, commit: CompactionCommit) -> std::io::Result<()> {
 		self.manager
 			.apply_lsm_manifest_compaction_commit(&commit)
@@ -36146,10 +36170,11 @@ async fn real_sm_fenced_pointer_for_a_retired_slab_stays_typed_fenced_while_cano
 		&mut target,
 		[Entry {
 			log_id: LogId::new(CommittedLeaderId::new(3, 1), 823),
-			payload: EntryPayload::Normal(crate::consensus::WendelonRequest::TierSlab(b10_tier(
-				&manager,
-				&replacement,
-			))),
+			payload: EntryPayload::Normal(
+				manager
+					.tier_request_for_test(b10_tier(&manager, &replacement))
+					.await,
+			),
 		}],
 	)
 	.await
@@ -37286,7 +37311,7 @@ struct B1tRoleCommitter {
 	calls: std::sync::atomic::AtomicUsize,
 }
 #[async_trait]
-impl TierCommitter for B1tRoleCommitter {
+impl CommandCommitter for B1tRoleCommitter {
 	fn should_propose(&self) -> bool {
 		self.leader.load(std::sync::atomic::Ordering::Acquire)
 	}
@@ -37295,7 +37320,7 @@ impl TierCommitter for B1tRoleCommitter {
 		proposal: crate::storage::TierProposal,
 	) -> std::io::Result<()> {
 		self.calls.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-		if !self.should_propose() {
+		if !CommandCommitter::should_propose(self) {
 			return Err(Error::new(
 				ErrorKind::WouldBlock,
 				"B1t local participant is not leader",
@@ -37309,7 +37334,7 @@ impl TierCommitter for B1tRoleCommitter {
 	}
 	async fn retire_tiered_slab(&self, slab: crate::consensus::SlabRef) -> std::io::Result<()> {
 		self.calls.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-		if !self.should_propose() {
+		if !CommandCommitter::should_propose(self) {
 			return Err(Error::new(
 				ErrorKind::WouldBlock,
 				"B1t local participant is not leader",
@@ -37605,7 +37630,7 @@ async fn b1t_real_follower_debt_completes_after_leadership_change() {
 	};
 	// ADR 0697: leader 1 never appends node 2's slab command.
 	let refused = nodes[0]
-		.client_write(crate::consensus::WendelonRequest::TierSlab(tier.clone()))
+		.client_write(mgr.tier_request_for_test(tier.clone()).await)
 		.await
 		.unwrap();
 	assert_eq!(
@@ -37622,10 +37647,10 @@ async fn b1t_real_follower_debt_completes_after_leadership_change() {
 	elect_among(&nodes, 2).await;
 	register_owner(&nodes[1], &mgr).await;
 	let committed = nodes[1]
-		.client_write(crate::consensus::WendelonRequest::TierSlab(tier))
+		.client_write(mgr.tier_request_for_test(tier).await)
 		.await
 		.unwrap();
-	assert_eq!(committed.data, crate::consensus::WendelonResponse::Success);
+	assert_op_applied(&committed.data);
 	elect_among(&nodes, 1).await;
 	for node in &nodes {
 		node.wait(Some(Duration::from_secs(60)))
@@ -37662,8 +37687,16 @@ async fn b1t_real_follower_debt_completes_after_leadership_change() {
 		mut participant_metrics,
 		mut third_metrics,
 	] = [nodes[0].metrics(), nodes[1].metrics(), nodes[2].metrics()];
+	let timeline = std::sync::Mutex::new(Vec::new());
+	let started = std::time::Instant::now();
 	let campaign = async {
 		let mut requested_at_term = participant_metrics.borrow().current_term;
+		let mut last_request = tokio::time::Instant::now();
+		timeline.lock().unwrap().push((
+			started.elapsed().as_millis(),
+			"request",
+			requested_at_term,
+		));
 		nodes[1].trigger().elect().await.unwrap();
 		loop {
 			let observed = [
@@ -37678,22 +37711,56 @@ async fn b1t_real_follower_debt_completes_after_leadership_change() {
 				break;
 			}
 			let participant = &observed[1];
+			// An instant re-request landed on each freshly elected leader and
+			// never won, churning two terms every 230 ms for the whole deadline
+			// (observed sporadically, DC-163). Give a new leader time to settle.
 			if participant.current_term > requested_at_term
 				&& participant.current_leader.is_some_and(|leader| leader != 2)
+				&& last_request.elapsed() >= Duration::from_secs(1)
 			{
 				requested_at_term = participant.current_term;
+				last_request = tokio::time::Instant::now();
+				timeline.lock().unwrap().push((
+					started.elapsed().as_millis(),
+					"request",
+					requested_at_term,
+				));
 				nodes[1].trigger().elect().await.unwrap();
 			}
 			tokio::select! {
 				changed = first_metrics.changed() => changed.unwrap(),
 				changed = participant_metrics.changed() => changed.unwrap(),
 				changed = third_metrics.changed() => changed.unwrap(),
+				() = tokio::time::sleep(Duration::from_millis(100)) => {}
 			}
 		}
 	};
-	tokio::time::timeout(Duration::from_secs(60), campaign)
+	if tokio::time::timeout(Duration::from_secs(60), campaign)
 		.await
-		.expect("participant2 must win a real election before the campaign deadline");
+		.is_err()
+	{
+		let observed: Vec<_> = nodes
+			.iter()
+			.map(|node| {
+				let metrics = node.metrics().borrow().clone();
+				(
+					metrics.id,
+					metrics.state,
+					metrics.current_term,
+					metrics.current_leader,
+					metrics.vote,
+					metrics.last_log_index,
+					metrics.last_applied,
+				)
+			})
+			.collect();
+		let timeline = timeline.lock().unwrap();
+		let requests = timeline.len();
+		let recent = &timeline[requests.saturating_sub(6)..];
+		panic!(
+			"participant2 must win a real election before the campaign deadline: {observed:?}; {requests} requests, last {recent:?}"
+		);
+	}
 	assert!(committer.should_propose());
 	let next = mgr
 		.reclaim_table_drop_tiered_storage_slice(tenant(), &target, &schemas, &committer, cursor, 1)
@@ -38677,7 +38744,7 @@ fn b6_control_tier(manager: &SlabManager, p: &TieredSlabPointer) -> crate::conse
 }
 #[tokio::test]
 async fn b6_replacement_tier_log_entry_finishes_complete_replay_authority() {
-	use crate::consensus::{WendelonRequest, WendelonStateMachine};
+	use crate::consensus::WendelonStateMachine;
 	use openraft::storage::RaftStateMachine;
 	use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
 	let (_dirs, source, l2) = fresh_manager_with_l2("b6-replacement-source").await;
@@ -38724,9 +38791,11 @@ async fn b6_replacement_tier_log_entry_finishes_complete_replay_authority() {
 		&mut sm,
 		[Entry {
 			log_id: LogId::new(CommittedLeaderId::new(3, 1), 901),
-			payload: EntryPayload::Normal(WendelonRequest::TierSlab(b6_control_tier(
-				&target, &pointer,
-			))),
+			payload: EntryPayload::Normal(
+				target
+					.tier_request_for_test(b6_control_tier(&target, &pointer))
+					.await,
+			),
 		}],
 	)
 	.await
@@ -38764,7 +38833,7 @@ async fn b6_replacement_tier_log_entry_finishes_complete_replay_authority() {
 }
 #[tokio::test]
 async fn b6c_complete_replay_resumes_matching_lsm_deferral() {
-	use crate::consensus::{WendelonRequest, WendelonStateMachine};
+	use crate::consensus::WendelonStateMachine;
 	use openraft::storage::RaftStateMachine;
 	use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
 	let (_dirs, source, l2) = fresh_manager_with_l2("b6-replacement-source").await;
@@ -38823,9 +38892,11 @@ async fn b6c_complete_replay_resumes_matching_lsm_deferral() {
 		&mut sm,
 		[Entry {
 			log_id: LogId::new(CommittedLeaderId::new(3, 1), 901),
-			payload: EntryPayload::Normal(WendelonRequest::TierSlab(b6_control_tier(
-				&target, &pointer,
-			))),
+			payload: EntryPayload::Normal(
+				target
+					.tier_request_for_test(b6_control_tier(&target, &pointer))
+					.await,
+			),
 		}],
 	)
 	.await
@@ -38877,7 +38948,7 @@ async fn b6c_complete_replay_resumes_matching_lsm_deferral() {
 }
 #[tokio::test]
 async fn b6c_complete_replay_preserves_structural_refusal() {
-	use crate::consensus::{WendelonRequest, WendelonStateMachine};
+	use crate::consensus::WendelonStateMachine;
 	use openraft::storage::RaftStateMachine;
 	use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
 	let (_dirs, source, l2) = fresh_manager_with_l2("b6-replacement-source").await;
@@ -38936,9 +39007,11 @@ async fn b6c_complete_replay_preserves_structural_refusal() {
 		&mut sm,
 		[Entry {
 			log_id: LogId::new(CommittedLeaderId::new(3, 1), 901),
-			payload: EntryPayload::Normal(WendelonRequest::TierSlab(b6_control_tier(
-				&target, &pointer,
-			))),
+			payload: EntryPayload::Normal(
+				target
+					.tier_request_for_test(b6_control_tier(&target, &pointer))
+					.await,
+			),
 		}],
 	)
 	.await
@@ -39000,7 +39073,7 @@ async fn b6c_complete_replay_preserves_structural_refusal() {
 
 #[tokio::test]
 async fn b6c_nonempty_replay_crash_before_marker_clear_rechecks_on_reopen() {
-	use crate::consensus::{WendelonRequest, WendelonStateMachine};
+	use crate::consensus::WendelonStateMachine;
 	use openraft::storage::RaftStateMachine;
 	use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
 	let (_dirs, source, l2) = fresh_manager_with_l2("b6-replacement-source").await;
@@ -39047,9 +39120,11 @@ async fn b6c_nonempty_replay_crash_before_marker_clear_rechecks_on_reopen() {
 		&mut sm,
 		[Entry {
 			log_id: LogId::new(CommittedLeaderId::new(3, 1), 901),
-			payload: EntryPayload::Normal(WendelonRequest::TierSlab(b6_control_tier(
-				&target, &pointer,
-			))),
+			payload: EntryPayload::Normal(
+				target
+					.tier_request_for_test(b6_control_tier(&target, &pointer))
+					.await,
+			),
 		}],
 	)
 	.await
@@ -40700,7 +40775,8 @@ async fn b10_retry_uses_later_tier_slab_entry() {
 			.await
 			.unwrap();
 	let tier = b10_tier(&f.manager, &next);
-	b10_apply(&mut f, crate::consensus::WendelonRequest::TierSlab(tier)).await;
+	let request = f.manager.tier_request_for_test(tier).await;
+	b10_apply(&mut f, request).await;
 	assert!(f.manager.lookup(tenant(), id(0xb100)).is_err());
 	b10_drain_append(&mut f).await;
 	b10_ready(&f).await;
@@ -40733,13 +40809,8 @@ async fn b10_retry_uses_later_retirement_entry() {
 	let mut f = b10_append_fixture().await;
 	let slab_id = f.pointer.slab_id;
 	let slab = f.manager.owner_ref().unwrap().slab(slab_id);
-	b10_apply(
-		&mut f,
-		crate::consensus::WendelonRequest::RetireTieredSlab(crate::consensus::RetireTieredSlab {
-			slab,
-		}),
-	)
-	.await;
+	let request = f.manager.retire_request_for_test(slab).await;
+	b10_apply(&mut f, request).await;
 	b10_drain_append(&mut f).await;
 	let before_l1 = std::fs::read(slab_path(&f._dst, slab_id)).unwrap();
 	let before_l2 = f.l2.get(&f.pointer.l2_uri).await.unwrap();
@@ -41005,12 +41076,23 @@ async fn b10_publication_lease_excludes_a_later_canonical_writer() {
 	.unwrap();
 	let mut later = f.target.clone();
 	let tier = b10_tier(&f.manager, &next);
+	// This fixture's delayed writer holds the index, so the entry is not
+	// allocated through it; no later allocation can collide in this test.
+	let request = crate::consensus::WendelonRequest::SlabOp(crate::consensus::slab_ops::SlabOp {
+		op_seq: 1000,
+		command: crate::consensus::slab_ops::SlabCommand::Tier(
+			crate::consensus::slab_ops::TierOp {
+				tier,
+				replaces: Some(crate::consensus::slab_ops::TierGeneration::from(&f.pointer)),
+			},
+		),
+	});
 	let applying = tokio::spawn(async move {
 		RaftStateMachine::apply(
 			&mut later,
 			[Entry {
 				log_id: LogId::new(CommittedLeaderId::new(3, 1), 901),
-				payload: EntryPayload::Normal(crate::consensus::WendelonRequest::TierSlab(tier)),
+				payload: EntryPayload::Normal(request),
 			}],
 		)
 		.await
@@ -41073,13 +41155,8 @@ async fn b10_quarantine_before_exact_retirement_clear_survives_reopen() {
 	let mut f = b10_append_fixture().await;
 	let slab_id = f.pointer.slab_id;
 	let slab = f.manager.owner_ref().unwrap().slab(slab_id);
-	b10_apply(
-		&mut f,
-		crate::consensus::WendelonRequest::RetireTieredSlab(crate::consensus::RetireTieredSlab {
-			slab,
-		}),
-	)
-	.await;
+	let request = f.manager.retire_request_for_test(slab).await;
+	b10_apply(&mut f, request).await;
 	// Preserve a real canonical snapshot at901, as a subsequent compacted
 	// bootstrap sees it: the retired id is absent, not a replayed tier pointer.
 	let mut builder = RaftStateMachine::get_snapshot_builder(&mut f.target).await;
@@ -41286,13 +41363,8 @@ async fn b10_crash_after_retirement_before_append_drains_uses_durable_staging() 
 		"before OpenRaft acceptance, the unverified canonical pointer is durable"
 	);
 	let slab = f.manager.owner_ref().unwrap().slab(slab_id);
-	b10_apply(
-		&mut f,
-		crate::consensus::WendelonRequest::RetireTieredSlab(crate::consensus::RetireTieredSlab {
-			slab,
-		}),
-	)
-	.await;
+	let request = f.manager.retire_request_for_test(slab).await;
+	b10_apply(&mut f, request).await;
 	let mut builder = RaftStateMachine::get_snapshot_builder(&mut f.target).await;
 	let built = builder.build_snapshot().await.unwrap();
 	let old_l2 = f.l2.get(&f.pointer.l2_uri).await.unwrap();
@@ -41468,6 +41540,7 @@ async fn b11_output_staging_waits_for_input_tier_publication_lock() {
 }
 
 #[tokio::test]
+#[ignore = "ADR 0697 intermediate: a linked control intent stays fenced until slice 5 recovers it through a verified receipt; this is its eventual acceptance, kept unchanged"]
 async fn b11_completed_control_install_recovers_after_crash_before_intent_clear() {
 	let (dir, manager) = fresh_manager().await;
 	let keys = seed_lsm_relocation_fixture(&manager).await;
@@ -41729,6 +41802,7 @@ async fn b11b_crash_after_acceptance_before_publication_stays_fenced() {
 	b11b_check_crash_cut(lsm_driver::ControlLsmInstallCut::AfterAcceptance, false).await;
 }
 #[tokio::test]
+#[ignore = "ADR 0697 intermediate: a linked control intent stays fenced until slice 5 recovers it through a verified receipt; this is its eventual acceptance, kept unchanged"]
 async fn b11b_crash_after_publication_recovers_exact_rows() {
 	b11b_check_crash_cut(lsm_driver::ControlLsmInstallCut::AfterPublication, true).await;
 }
@@ -44392,9 +44466,11 @@ async fn commit_tier_entry(
 		target,
 		[Entry {
 			log_id: LogId::new(CommittedLeaderId::new(3, 1), index),
-			payload: EntryPayload::Normal(crate::consensus::WendelonRequest::TierSlab(b10_tier(
-				manager, pointer,
-			))),
+			payload: EntryPayload::Normal(
+				manager
+					.tier_request_for_test(b10_tier(manager, pointer))
+					.await,
+			),
 		}],
 	)
 	.await
@@ -45757,6 +45833,19 @@ async fn control_cluster(observer: u32, manager: &Arc<SlabManager>) -> ControlCl
 	}
 }
 
+/// The response a slab operation gets when it applied.
+fn assert_op_applied(response: &crate::consensus::WendelonResponse) {
+	use crate::consensus::slab_ops::{OpOutcome, OpResponse, RecordedOutcome};
+	match response {
+		crate::consensus::WendelonResponse::Op(OpResponse::Receipt(receipt))
+			if matches!(
+				receipt.outcome,
+				OpOutcome::Recorded(RecordedOutcome::Applied { .. })
+			) => {}
+		other => panic!("expected an applied operation, got {other:?}"),
+	}
+}
+
 /// Registers `manager`'s incarnation through `raft`, which must be the
 /// owner's node and lead, as its committer does before its first slab
 /// proposal (ADR 0697); an exact replay is a receipt.
@@ -45793,12 +45882,14 @@ impl ControlCluster {
 		let raft = &self.nodes[owner.node() as usize - 1];
 		register_owner(raft, manager).await;
 		let committed = raft
-			.client_write(crate::consensus::WendelonRequest::TierSlab(b10_tier(
-				manager, pointer,
-			)))
+			.client_write(
+				manager
+					.tier_request_for_test(b10_tier(manager, pointer))
+					.await,
+			)
 			.await
 			.unwrap();
-		assert_eq!(committed.data, crate::consensus::WendelonResponse::Success);
+		assert_op_applied(&committed.data);
 		for node in &self.nodes {
 			node.wait(Some(Duration::from_secs(60)))
 				.applied_index_at_least(Some(committed.log_id.index), "every voter applied")
@@ -45889,7 +45980,6 @@ async fn a_followers_apply_funds_itself_fences_on_its_budget_and_publishes_on_re
 /// (the worker's replay of that callback) publishes P1 with its own funding.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_delayed_apply_after_its_proposers_token_was_released_funds_itself() {
-	use crate::storage::TierCommitter;
 	let (_dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
 	let cluster = control_cluster(1, &mgr).await;
 	cluster.commit_tier(1, &mgr, &old).await;
@@ -45903,10 +45993,29 @@ async fn a_delayed_apply_after_its_proposers_token_was_released_funds_itself() {
 	assert_eq!(slots, 1, "premise: a real proposer token is reserved");
 	assert!(bytes_held > 0);
 	let gate = mgr.hold_index_write_gate_for_test().await;
-	crate::storage::RaftCommitter::new(cluster.nodes[0].clone())
-		.commit_tier_slab(proposal)
+	let ticket = mgr
+		.require_op_index()
+		.unwrap()
+		.allocate_ops(
+			vec![crate::consensus::slab_ops::SlabCommand::Tier(
+				crate::consensus::slab_ops::TierOp {
+					tier: b10_tier(&mgr, &p1),
+					replaces: Some(crate::consensus::slab_ops::TierGeneration::from(&old)),
+				},
+			)],
+			None,
+		)
 		.await
-		.unwrap();
+		.unwrap()
+		.first;
+	crate::storage::sweeper::submit_tier_proposal(
+		&mgr,
+		&crate::storage::RaftCommitter::new(cluster.nodes[0].clone()),
+		proposal,
+		ticket,
+	)
+	.await
+	.unwrap();
 	assert_eq!(
 		mgr.tier_tokens.held(),
 		(0, 0),
@@ -45993,13 +46102,12 @@ async fn across_a_leader_change_an_older_replay_never_publishes_over_newer_autho
 	let commit = {
 		let node = cluster.nodes[1].clone();
 		let tier = b10_tier(&mgr, &p2);
+		let request = mgr.tier_request_for_test(tier).await;
 		tokio::spawn(async move {
-			node.client_write(crate::consensus::WendelonRequest::TierSlab(tier))
-				.await
-				.map(|response| {
-					assert_eq!(response.data, crate::consensus::WendelonResponse::Success);
-					response.log_id.index
-				})
+			node.client_write(request).await.map(|response| {
+				assert_op_applied(&response.data);
+				response.log_id.index
+			})
 		})
 	};
 	assert!(
@@ -46120,21 +46228,17 @@ async fn a_node_restarted_while_fenced_converges_to_its_committed_pointer() {
 	let (raft, log, _network) = single_voter(&wal_dir, &mgr, true).await;
 	register_owner(&raft, &mgr).await;
 	let committed = raft
-		.client_write(crate::consensus::WendelonRequest::TierSlab(b10_tier(
-			&mgr, &old,
-		)))
+		.client_write(mgr.tier_request_for_test(b10_tier(&mgr, &old)).await)
 		.await
 		.unwrap();
-	assert_eq!(committed.data, crate::consensus::WendelonResponse::Success);
+	assert_op_applied(&committed.data);
 	assert_eq!(mgr.tier_pointer(old.slab_id).await, Some(old.clone()));
 	let gate = mgr.hold_index_write_gate_for_test().await;
 	let committed = raft
-		.client_write(crate::consensus::WendelonRequest::TierSlab(b10_tier(
-			&mgr, &p1,
-		)))
+		.client_write(mgr.tier_request_for_test(b10_tier(&mgr, &p1)).await)
 		.await
 		.unwrap();
-	assert_eq!(committed.data, crate::consensus::WendelonResponse::Success);
+	assert_op_applied(&committed.data);
 	assert!(
 		mgr.unapplied_tier_pointers
 			.get(&old.slab_id)
@@ -46416,8 +46520,11 @@ async fn dc161_gc_after_leadership_loss_leaves_no_unresolvable_intent() {
 	// leadership refuses.
 	register_owner(&cluster.nodes[0], &manager).await;
 	cluster.elect(2).await;
+	// The role check passed at the tick gate and again before allocation; the
+	// role is lost in the window after it.
 	let committer = crate::storage::RaftCommitter::new(cluster.nodes[0].clone())
-		.with_state_machine(cluster.state_machines[0].clone());
+		.with_state_machine(cluster.state_machines[0].clone())
+		.with_role_lost_after_preflight();
 	let gc = LsmGcWorker::new(LsmConfig::default(), manager.slab_pin_table()).unwrap();
 	let outcome = manager
 		.sweep_lsm_delete_pending_once_via_control_ring(&gc, &committer)
@@ -47359,11 +47466,11 @@ async fn observer_classifies_ring_events_by_owner_and_registry() {
 }
 
 /// ADR 0697 slice 2: when the ring names another current incarnation for this
-/// node, a committer with no registry view proposes its registration and every
-/// path stops at that refusal, before its slab command is sent: never success,
+/// node, a committer with no registry view proposes its registration and its
+/// preflight stops at that refusal, before anything is allocated: never success,
 /// never LsmCommitRejected. The slab commands' own mappers are the next control.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn committer_without_a_registry_is_refused_at_registration_on_every_path() {
+async fn committer_without_a_registry_is_refused_at_registration_in_its_preflight() {
 	use crate::storage::TierCommitter;
 	use crate::storage::sweeper::{LsmCommitRejected, SlabCommitRefused};
 	let (_dir, mgr) = fresh_manager().await;
@@ -47380,57 +47487,21 @@ async fn committer_without_a_registry_is_refused_at_registration_on_every_path()
 		.await
 		.unwrap();
 	assert_eq!(registered.data, crate::consensus::WendelonResponse::Success);
-	let refused = |error: std::io::Error| {
-		assert!(
-			error
-				.get_ref()
-				.is_some_and(|cause| cause.is::<SlabCommitRefused>()),
-			"expected an owner refusal, got {error}"
-		);
-		assert!(
-			!error
-				.get_ref()
-				.is_some_and(|cause| cause.is::<LsmCommitRejected>()),
-			"an owner refusal is never a definite LSM rejection"
-		);
-	};
-	let committer = crate::storage::RaftCommitter::new(cluster.nodes[0].clone());
-	let owner = mgr.owner_ref().unwrap();
-	let tier = crate::consensus::TieredSlab {
-		slab: owner.slab(SlabId::ZERO),
-		l2_uri: "memory://tier/refused".into(),
-		payload_hash: [1; 32],
-		is_encrypted: false,
-		tenant_id: None,
-		tenant_kek_id: None,
-		stats_format_version: None,
-		stats_block_len: None,
-		stats_block_hash128: None,
-		tombstone_metadata: TombstoneMetadata::None,
-		supersession_metadata: SupersessionMetadata::None,
-	};
-	refused(
-		committer
-			.commit_tier_slab(crate::storage::TierProposal::unreserved_for_test(tier))
-			.await
-			.unwrap_err(),
+	let error = crate::storage::RaftCommitter::new(cluster.nodes[0].clone())
+		.preflight(mgr.owner_ref().unwrap())
+		.await
+		.unwrap_err();
+	assert!(
+		error
+			.get_ref()
+			.is_some_and(|cause| cause.is::<SlabCommitRefused>()),
+		"expected an owner refusal, got {error}"
 	);
-	refused(
-		committer
-			.retire_tiered_slab(owner.slab(SlabId::ZERO))
-			.await
-			.unwrap_err(),
-	);
-	refused(
-		committer
-			.commit_lsm_compaction(CompactionCommit::gc_mark_delete_pending(
-				owner,
-				CompactionJobId::new(0x0697),
-				ManifestEpoch::new(0),
-				vec![SlabId::ZERO],
-			))
-			.await
-			.unwrap_err(),
+	assert!(
+		!error
+			.get_ref()
+			.is_some_and(|cause| cause.is::<LsmCommitRejected>()),
+		"an owner refusal is never a definite LSM rejection"
 	);
 }
 
@@ -47503,7 +47574,18 @@ async fn committer_maps_a_refused_slab_command_to_a_non_outcome_on_every_path() 
 	let held = mgr.tier_tokens.held();
 	assert_eq!(held.0, 1, "premise: a real proposer token is reserved");
 	let before = applied().await;
-	let error = committer.commit_tier_slab(proposal).await.unwrap_err();
+	let index = mgr.require_op_index().unwrap();
+	let allocate = async |command| index.allocate_ops(vec![command], None).await.unwrap().first;
+	let ticket = allocate(crate::consensus::slab_ops::SlabCommand::Tier(
+		crate::consensus::slab_ops::TierOp {
+			tier: b10_tier(&mgr, &old),
+			replaces: None,
+		},
+	))
+	.await;
+	let error = crate::storage::sweeper::submit_tier_proposal(&mgr, &committer, proposal, ticket)
+		.await
+		.unwrap_err();
 	refused("TierSlab", before, applied().await, error);
 	assert_eq!(
 		mgr.tier_tokens.held(),
@@ -47512,26 +47594,1355 @@ async fn committer_maps_a_refused_slab_command_to_a_non_outcome_on_every_path() 
 	);
 
 	let before = applied().await;
-	let error = committer
-		.retire_tiered_slab(owner.slab(old.slab_id))
-		.await
-		.unwrap_err();
+	let ticket = allocate(crate::consensus::slab_ops::SlabCommand::Retire(
+		crate::consensus::slab_ops::RetireOp {
+			slab: owner.slab(old.slab_id),
+			expected: crate::consensus::slab_ops::TierGeneration::from(&old),
+		},
+	))
+	.await;
+	let error = committer.submit_op(&ticket).await.unwrap_err();
 	refused("RetireTieredSlab", before, applied().await, error);
 
 	let before = applied().await;
-	let error = committer
-		.commit_lsm_compaction(CompactionCommit::gc_mark_delete_pending(
+	let ticket = allocate(crate::consensus::slab_ops::SlabCommand::Compaction(
+		CompactionCommit::gc_mark_delete_pending(
 			owner,
 			CompactionJobId::new(0x0697),
 			ManifestEpoch::new(0),
 			vec![old.slab_id],
-		))
-		.await
-		.unwrap_err();
+		),
+	))
+	.await;
+	let error = committer.submit_op(&ticket).await.unwrap_err();
 	refused("CompactionCommit", before, applied().await, error);
 
 	assert!(
 		leader_sm.state_snapshot().await.tiered_slabs.is_empty(),
 		"a refused command records nothing"
 	);
+}
+
+/// A real ring's committer for `manager` on 1-based `node`, reading that node's
+/// own state machine.
+fn op_committer(cluster: &ControlCluster, node: usize) -> crate::storage::RaftCommitter {
+	crate::storage::RaftCommitter::new(cluster.nodes[node - 1].clone())
+		.with_state_machine(cluster.state_machines[node - 1].clone())
+}
+
+fn op_driver(
+	_cluster: &ControlCluster,
+	manager: &Arc<SlabManager>,
+	committer: Arc<dyn crate::storage::TierCommitter>,
+) -> crate::storage::op_driver::OpDriver {
+	crate::storage::op_driver::OpDriver::new(manager.clone(), committer)
+}
+
+/// ADR 0697 §5.6 through a real ring: an applied tier operation whose effect is
+/// durable hands off, its Ack lands, and only a canonical prefix retires its row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tier_op_through_a_real_ring_hands_off_acks_and_retires_its_row() {
+	let (_dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let cluster = control_cluster_observing(&[(1, &mgr)]).await;
+	let committer = Arc::new(op_committer(&cluster, 1));
+	crate::storage::sweeper::propose_tier_slab(
+		&mgr,
+		committer.as_ref(),
+		b10_tier(&mgr, &old),
+		None,
+	)
+	.await
+	.unwrap();
+	let index = mgr.require_op_index().unwrap();
+	let owner = mgr.owner_ref().unwrap();
+	assert!(index.load_op_intents().await.unwrap().is_empty());
+	assert_eq!(index.load_ack_pending().await.unwrap(), vec![(1, false)]);
+	assert_eq!(cluster.state_machines[0].op_acked_through(owner).await, 0);
+
+	op_driver(&cluster, &mgr, committer.clone())
+		.drive_once()
+		.await
+		.unwrap();
+	assert_eq!(cluster.state_machines[0].op_acked_through(owner).await, 1);
+	assert_eq!(index.load_ack_pending().await.unwrap(), vec![]);
+
+	// A replacement names the generation it replaces.
+	let bytes = l2.get(&old.l2_uri).await.unwrap();
+	let replacement = TieredSlabPointer {
+		l2_uri: l2.put("tier/op-replacement.wnd", &bytes).await.unwrap(),
+		..old.clone()
+	};
+	crate::storage::sweeper::propose_tier_slab(
+		&mgr,
+		committer.as_ref(),
+		b10_tier(&mgr, &replacement),
+		Some(crate::consensus::slab_ops::TierGeneration::from(&old)),
+	)
+	.await
+	.unwrap();
+	assert_eq!(mgr.tier_pointer(old.slab_id).await, Some(replacement));
+	assert_eq!(index.load_ack_pending().await.unwrap(), vec![(2, false)]);
+}
+
+/// A fenced or deferred apply is not local completion: the operation stays an
+/// intent, with no Ack, until its effect is durable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_deferred_tier_stays_an_intent_until_its_effect_is_durable() {
+	let (_dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let cluster = control_cluster_observing(&[(1, &mgr)]).await;
+	let committer = Arc::new(op_committer(&cluster, 1));
+	crate::storage::sweeper::propose_tier_slab(
+		&mgr,
+		committer.as_ref(),
+		b10_tier(&mgr, &old),
+		None,
+	)
+	.await
+	.unwrap();
+	let driver = op_driver(&cluster, &mgr, committer.clone());
+	driver.drive_once().await.unwrap();
+	let bytes = l2.get(&old.l2_uri).await.unwrap();
+	let replacement = TieredSlabPointer {
+		l2_uri: l2.put("tier/op-deferred.wnd", &bytes).await.unwrap(),
+		..old.clone()
+	};
+	let gate = mgr.hold_index_write_gate_for_test().await;
+	crate::storage::sweeper::propose_tier_slab(
+		&mgr,
+		committer.as_ref(),
+		b10_tier(&mgr, &replacement),
+		Some(crate::consensus::slab_ops::TierGeneration::from(&old)),
+	)
+	.await
+	.unwrap();
+	assert!(
+		mgr.unapplied_tier_pointers
+			.get(&old.slab_id)
+			.is_some_and(|entry| entry.value().fences(&replacement)),
+		"premise: the apply is deferred"
+	);
+	let index = mgr.require_op_index().unwrap();
+	driver.drive_once().await.unwrap();
+	assert_eq!(
+		index.load_op_intents().await.unwrap().len(),
+		1,
+		"an Applied receipt alone does not hand a deferred op off"
+	);
+	assert_eq!(index.load_ack_pending().await.unwrap(), vec![]);
+
+	drop(gate);
+	assert!(
+		eventually(60, async || mgr.tier_pointer(old.slab_id).await.as_ref()
+			== Some(&replacement))
+		.await,
+		"the deferred apply publishes"
+	);
+	assert!(
+		eventually(60, async || mgr.unapplied_tier_pointers.is_empty()).await,
+		"its deferral clears"
+	);
+	driver.drive_once().await.unwrap();
+	assert!(index.load_op_intents().await.unwrap().is_empty());
+	assert_eq!(
+		cluster.state_machines[0]
+			.op_acked_through(mgr.owner_ref().unwrap())
+			.await,
+		2
+	);
+}
+
+/// An Ack whose response is lost, or only partly accepted, marks only what the
+/// response accepted, and the driver retries with no later handoff or election.
+struct FlakyAckCommitter {
+	inner: crate::storage::RaftCommitter,
+	lose_next_ack_response: std::sync::atomic::AtomicBool,
+	accept_only_first: std::sync::atomic::AtomicBool,
+	answer_another_batch: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait]
+impl crate::storage::TierCommitter for FlakyAckCommitter {
+	fn should_propose(&self) -> bool {
+		self.inner.should_propose()
+	}
+	async fn preflight(&self, owner: crate::consensus::OwnerRef) -> std::io::Result<()> {
+		self.inner.preflight(owner).await
+	}
+	async fn submit_op(
+		&self,
+		ticket: &crate::storage::OpTicket,
+	) -> std::io::Result<crate::storage::VerifiedReceipt> {
+		self.inner.submit_op(ticket).await
+	}
+	async fn ack_outcomes(
+		&self,
+		owner: crate::consensus::OwnerRef,
+		seqs: Vec<u64>,
+	) -> std::io::Result<crate::consensus::slab_ops::AckReceipt> {
+		use std::sync::atomic::Ordering;
+		if self.answer_another_batch.swap(false, Ordering::AcqRel) {
+			return Ok(crate::consensus::slab_ops::AckReceipt {
+				owner,
+				accepted: vec![seqs.iter().max().unwrap() + 100],
+				not_decided: Vec::new(),
+				outside_window: Vec::new(),
+				acked_through: 0,
+			});
+		}
+		if self.accept_only_first.swap(false, Ordering::AcqRel) {
+			let mut receipt = self.inner.ack_outcomes(owner, vec![seqs[0]]).await?;
+			receipt.not_decided = seqs[1..].to_vec();
+			return Ok(receipt);
+		}
+		let receipt = self.inner.ack_outcomes(owner, seqs).await?;
+		if self.lose_next_ack_response.swap(false, Ordering::AcqRel) {
+			return Err(Error::other("injected lost Ack response"));
+		}
+		Ok(receipt)
+	}
+	async fn op_prefix(&self, owner: crate::consensus::OwnerRef) -> std::io::Result<Option<u64>> {
+		self.inner.op_prefix(owner).await
+	}
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lost_or_partial_ack_marks_only_what_was_accepted_and_is_redriven() {
+	use std::sync::atomic::{AtomicBool, Ordering};
+	let (_dirs, mgr, _l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let cluster = control_cluster_observing(&[(1, &mgr)]).await;
+	let flaky = Arc::new(FlakyAckCommitter {
+		inner: op_committer(&cluster, 1),
+		lose_next_ack_response: AtomicBool::new(true),
+		accept_only_first: AtomicBool::new(false),
+		answer_another_batch: AtomicBool::new(false),
+	});
+	let index = mgr.require_op_index().unwrap();
+	let owner = mgr.owner_ref().unwrap();
+	let driver = op_driver(&cluster, &mgr, flaky.clone());
+	crate::storage::sweeper::propose_tier_slab(&mgr, flaky.as_ref(), b10_tier(&mgr, &old), None)
+		.await
+		.unwrap();
+
+	// Applied by the ring, its response lost: nothing marks, and a retry is
+	// idempotent however far the prefix moved.
+	assert!(driver.drive_once().await.is_err());
+	assert_eq!(index.load_ack_pending().await.unwrap(), vec![(1, false)]);
+	assert_eq!(cluster.state_machines[0].op_acked_through(owner).await, 1);
+	driver.drive_once().await.unwrap();
+	assert_eq!(index.load_ack_pending().await.unwrap(), vec![]);
+
+	// Two rows, one accepted: the other stays unacked for the next pass.
+	for slab in [0x700, 0x701] {
+		let request = mgr
+			.retire_request_for_test(owner.slab(SlabId::new(slab)))
+			.await;
+		cluster.nodes[0].client_write(request).await.unwrap();
+	}
+	flaky.accept_only_first.store(true, Ordering::Release);
+	driver.drive_once().await.unwrap();
+	assert_eq!(index.load_ack_pending().await.unwrap(), vec![(3, false)]);
+	// A same-owner receipt naming sequences this batch did not request changes
+	// nothing locally.
+	flaky.answer_another_batch.store(true, Ordering::Release);
+	let wrong = driver.drive_once().await.unwrap_err();
+	assert!(wrong.to_string().contains("does not answer"), "{wrong}");
+	assert_eq!(index.load_ack_pending().await.unwrap(), vec![(3, false)]);
+	driver.drive_once().await.unwrap();
+	assert_eq!(index.load_ack_pending().await.unwrap(), vec![]);
+	assert_eq!(cluster.state_machines[0].op_acked_through(owner).await, 3);
+}
+
+/// §5.6 and §9.3: fill the window behind a reserved removal, on the real path.
+/// A new producer is refused, naming the holder. Releasing the legitimate
+/// blocker lets the reserved removal run with no new sequence and with no
+/// readiness gate in its way; its Ack advances the prefix and new work resumes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_full_window_refuses_new_work_and_the_reserved_gc_removal_still_drains() {
+	use crate::consensus::slab_ops::OPS_WINDOW_W;
+	use crate::storage::index::{OpHolderState, TerminalBacklog};
+	use std::sync::atomic::Ordering;
+	let (_dir, mgr) = fresh_manager().await;
+	// An unreserved delete-pending run, ordered before the reserved one.
+	let (unreserved, _) = seed_small_retired_gc_slab(&mgr).await;
+	let (slab_id, _key) = seed_small_retired_gc_slab(&mgr).await;
+	assert!(
+		unreserved < slab_id,
+		"premise: the unreserved run sorts first"
+	);
+	let cluster = control_cluster_observing(&[(1, &mgr)]).await;
+	let owner = mgr.owner_ref().unwrap();
+	let snapshot = mgr.compaction_manifest_snapshot();
+	mgr.apply_lsm_manifest_compaction_commit(&CompactionCommit::gc_mark_delete_pending(
+		owner,
+		CompactionJobId::new(0x0697_0001),
+		snapshot.manifest_epoch,
+		vec![unreserved],
+	))
+	.unwrap();
+	let committer = Arc::new(op_committer(&cluster, 1));
+	let gc = LsmGcWorker::new(LsmConfig::default(), mgr.slab_pin_table()).unwrap();
+	let index = mgr.require_op_index().unwrap();
+
+	mgr.continuity_test_holds
+		.gc_remove_held
+		.store(true, Ordering::Release);
+	let deleted = mgr
+		.sweep_lsm_delete_pending_once_via_control_ring(&gc, committer.as_ref())
+		.await
+		.unwrap();
+	assert!(deleted.is_empty(), "premise: only the mark ran");
+	assert!(
+		mgr.compaction_manifest_snapshot()
+			.delete_pending_runs()
+			.any(|run| run.slab_id == slab_id),
+		"premise: the run is delete-pending"
+	);
+	let driver = op_driver(&cluster, &mgr, committer.clone());
+	driver.drive_once().await.unwrap();
+	assert_eq!(
+		cluster.state_machines[0].op_acked_through(owner).await,
+		1,
+		"the mark is acknowledged; its reserved removal holds the prefix"
+	);
+
+	// Fill the rest of the window with real, decided operations. Their local
+	// bookkeeping is the fixture's shortcut.
+	let retire = |offset: u64| owner.slab(SlabId::new(0x10_000 + offset));
+	for offset in 0..OPS_WINDOW_W - 1 {
+		let request = mgr.retire_request_for_test(retire(offset)).await;
+		cluster.nodes[0].client_write(request).await.unwrap();
+	}
+	driver.drive_once().await.unwrap();
+	assert_eq!(
+		cluster.state_machines[0].op_acked_through(owner).await,
+		1,
+		"acknowledged sequences do not cross the reserved removal"
+	);
+
+	let backlog_of = |error: &Error| {
+		error
+			.get_ref()
+			.and_then(|cause| cause.downcast_ref::<TerminalBacklog>())
+			.copied()
+			.unwrap_or_else(|| panic!("expected TerminalBacklog, got {error}"))
+	};
+
+	// A real producer is refused, at its precheck and, having lost the race to
+	// the last slot, at its allocation. Neither leaves a fence on reserved work.
+	let compaction = LsmCompactionWorker::new(LsmConfig::default(), mgr.slab_pin_table()).unwrap();
+	let key = id(0xdd77);
+	let written = mgr
+		.append_durable(tenant(), key, hlc(30), b"new-compaction-input")
+		.await
+		.unwrap();
+	assert_eq!(mgr.force_seal_active_for_test().await, written.slab_id);
+	for skip_precheck in [false, true] {
+		mgr.continuity_test_holds
+			.skip_op_room_precheck
+			.store(skip_precheck, Ordering::Release);
+		let before = mgr.compaction_manifest_snapshot();
+		let plan = CompactionPlan {
+			job_id: CompactionJobId::new(0x0697_0002),
+			source_level: CompactionLevelIndex::L0,
+			target_level: CompactionLevelIndex::L1,
+			manifest_epoch_pre: before.manifest_epoch,
+			input_slabs: vec![written.slab_id],
+			overlapping_slabs: Vec::new(),
+			retention_floor_snapshot: hlc(0),
+			compaction_start_hlc: hlc(40),
+			dominant_reason: crate::storage::DominantReason::Operator,
+		};
+		let refused = mgr
+			.run_lsm_compaction_once_via_control_ring(&compaction, plan, committer.as_ref())
+			.await;
+		assert!(
+			format!("{:?}", refused.expect_err("refused")).contains("TerminalBacklog"),
+			"the producer is refused by the window"
+		);
+		assert!(
+			!mgr.has_orphaned_lsm_intents(),
+			"a proven no-allocation refusal leaves no orphaned scope (skip={skip_precheck})"
+		);
+		assert_eq!(mgr.tier_authority_readiness_reason(), None);
+	}
+	mgr.continuity_test_holds
+		.skip_op_room_precheck
+		.store(false, Ordering::Release);
+
+	let error = index
+		.allocate_ops(
+			vec![crate::consensus::slab_ops::SlabCommand::GcRemove(
+				crate::consensus::slab_ops::GcRemove {
+					owner,
+					job_id: CompactionJobId::new(0x0697),
+					slab: SlabId::new(0x20_000),
+					expected_run: crate::consensus::slab_ops::RunIdentity {
+						compaction_level: crate::schema::CompactionLevelIndex::L0,
+						size_bytes: crate::schema::ByteCount::new(0),
+						row_count: crate::schema::RowCount::new(0),
+						min_row_hlc: hlc(1),
+						max_row_hlc: hlc(1),
+					},
+				},
+			)],
+			None,
+		)
+		.await
+		.unwrap_err();
+	let holder = backlog_of(&error).holder.expect("status names the holder");
+	assert_eq!(holder.op_seq, 2);
+	assert_eq!(holder.transition, Some("gc_remove"));
+	assert_eq!(holder.state, OpHolderState::Reserved);
+
+	// A competing retired run wants a new mark, and the unreserved run a new
+	// removal; both are refused and neither starves the reserved removal.
+	let (competing, _) = seed_small_retired_gc_slab(&mgr).await;
+	mgr.continuity_test_holds
+		.gc_remove_held
+		.store(false, Ordering::Release);
+	let deleted = mgr
+		.sweep_lsm_delete_pending_once_via_control_ring(&gc, committer.as_ref())
+		.await
+		.unwrap();
+	assert_eq!(
+		deleted,
+		vec![slab_id],
+		"the reserved removal drains when full"
+	);
+	assert!(
+		mgr.compaction_manifest_snapshot()
+			.delete_pending_runs()
+			.any(|run| run.slab_id == unreserved),
+		"the unreserved run waits for room"
+	);
+	assert!(
+		mgr.compaction_manifest_snapshot()
+			.retired_runs()
+			.any(|run| run.slab_id == competing),
+		"the competing run is not marked"
+	);
+	driver.drive_once().await.unwrap();
+	let prefix = cluster.state_machines[0].op_acked_through(owner).await;
+	assert_eq!(prefix, OPS_WINDOW_W + 1);
+	assert_eq!(index.load_ack_pending().await.unwrap(), vec![]);
+
+	// Room again: the fresh work proceeds, with no sequence reused.
+	let deleted = mgr
+		.sweep_lsm_delete_pending_once_via_control_ring(&gc, committer.as_ref())
+		.await
+		.unwrap();
+	assert!(deleted.contains(&unreserved), "{deleted:?}");
+	assert!(
+		mgr.compaction_manifest_snapshot().run(competing).is_none(),
+		"the competing run is marked and removed"
+	);
+}
+
+/// The role preflight runs before anything is allocated or marked, for every
+/// producer: a follower leaves no row and no local state to resolve.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_follower_allocates_nothing_and_marks_nothing() {
+	let (_dir, mgr) = fresh_manager().await;
+	let (slab_id, _key) = seed_small_retired_gc_slab(&mgr).await;
+	let cluster = control_cluster_observing(&[(2, &mgr)]).await;
+	let committer = op_committer(&cluster, 2);
+	let gc = LsmGcWorker::new(LsmConfig::default(), mgr.slab_pin_table()).unwrap();
+	let swept = mgr
+		.sweep_lsm_delete_pending_once_via_control_ring(&gc, &committer)
+		.await
+		.unwrap_err();
+	assert!(
+		crate::storage::sweeper::tier_proposal_not_submitted(&swept),
+		"{swept}"
+	);
+	let index = mgr.require_op_index().unwrap();
+	assert!(index.load_op_intents().await.unwrap().is_empty());
+	assert_eq!(index.load_ack_pending().await.unwrap(), vec![]);
+	assert!(
+		!mgr.compaction_manifest_snapshot()
+			.delete_pending_runs()
+			.any(|run| run.slab_id == slab_id)
+	);
+	assert_eq!(mgr.tier_authority_readiness_reason(), None);
+}
+
+/// A receipt answers "what happened"; it never grants a superseded owner a local
+/// effect. Its Applied intent is not handed off, and its Ack is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_superseded_owners_receipt_grants_no_local_effect() {
+	let (_dirs, mgr, _l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let cluster = control_cluster_observing(&[(1, &mgr)]).await;
+	let committer = Arc::new(op_committer(&cluster, 1));
+	register_owner(&cluster.nodes[0], &mgr).await;
+	let owner = mgr.owner_ref().unwrap();
+	let index = mgr.require_op_index().unwrap();
+	let ticket = index
+		.allocate_ops(
+			vec![crate::consensus::slab_ops::SlabCommand::Tier(
+				crate::consensus::slab_ops::TierOp {
+					tier: b10_tier(&mgr, &old),
+					replaces: None,
+				},
+			)],
+			None,
+		)
+		.await
+		.unwrap()
+		.first;
+	use crate::storage::TierCommitter;
+	let first = committer.submit_op(&ticket).await.unwrap();
+	assert!(matches!(
+		first,
+		crate::storage::VerifiedReceipt::Applied { .. }
+	));
+	let successor = crate::consensus::StoreIncarnation::from_raw(0x55);
+	let superseded = cluster.nodes[0]
+		.client_write(crate::consensus::WendelonRequest::RegisterIncarnation(
+			crate::consensus::RegisterIncarnation {
+				node: 1,
+				incarnation: successor,
+				supersedes: Some(owner.incarnation()),
+			},
+		))
+		.await
+		.unwrap();
+	assert_eq!(superseded.data, crate::consensus::WendelonResponse::Success);
+	assert_eq!(
+		mgr.tier_authority_readiness_reason().as_deref(),
+		Some("OwnerAuthoritySuperseded")
+	);
+
+	// The retry still learns what happened, at its original index.
+	assert_eq!(committer.submit_op(&ticket).await.unwrap(), first);
+
+	op_driver(&cluster, &mgr, committer.clone())
+		.drive_once()
+		.await
+		.unwrap();
+	assert_eq!(
+		index.load_op_intents().await.unwrap().len(),
+		1,
+		"a superseded owner's Applied receipt authorizes no handoff"
+	);
+	let refused = committer
+		.ack_outcomes(owner, vec![ticket.key().op_seq])
+		.await;
+	assert!(
+		refused
+			.as_ref()
+			.err()
+			.and_then(|error| error.get_ref())
+			.is_some_and(|cause| cause.is::<crate::storage::sweeper::SlabCommitRefused>()),
+		"an Ack from a superseded owner is refused: {refused:?}"
+	);
+}
+
+/// A receipt is used only if its owner, sequence and digest are the ticket's;
+/// a conflict or an unavailable outcome is an anomaly that grants nothing.
+#[tokio::test]
+async fn a_receipt_for_another_operation_or_with_no_decision_is_an_anomaly() {
+	use crate::consensus::slab_ops::{OpOutcome, OpReceipt, RecordedOutcome};
+	use crate::storage::sweeper::{OpReceiptAnomaly, verify_receipt};
+	let (_dir, mgr) = fresh_manager().await;
+	let owner = mgr.owner_ref().unwrap();
+	let ticket = mgr
+		.require_op_index()
+		.unwrap()
+		.allocate_ops(
+			vec![crate::consensus::slab_ops::SlabCommand::Compaction(
+				CompactionCommit::gc_mark_delete_pending(
+					owner,
+					CompactionJobId::new(1),
+					ManifestEpoch::new(0),
+					vec![SlabId::new(1)],
+				),
+			)],
+			None,
+		)
+		.await
+		.unwrap()
+		.first;
+	let applied = OpOutcome::Recorded(RecordedOutcome::Applied { index: 7 });
+	let good = OpReceipt {
+		key: ticket.key(),
+		digest: ticket.digest(),
+		outcome: applied.clone(),
+	};
+	assert_eq!(
+		verify_receipt(&ticket, good.clone()).unwrap(),
+		crate::storage::VerifiedReceipt::Applied { index: 7 }
+	);
+	let mut other_seq = good.clone();
+	other_seq.key.op_seq += 1;
+	let mut other_owner = good.clone();
+	other_owner.key.owner = crate::consensus::OwnerRef::for_test(9, 9);
+	let mut other_digest = good.clone();
+	other_digest.digest = [9; 32];
+	let mut conflict = good.clone();
+	conflict.outcome = OpOutcome::Conflict;
+	let mut unavailable = good;
+	unavailable.outcome = OpOutcome::Unavailable;
+	for receipt in [other_seq, other_owner, other_digest, conflict, unavailable] {
+		let error = verify_receipt(&ticket, receipt).unwrap_err();
+		assert!(
+			error
+				.get_ref()
+				.is_some_and(|cause| cause.is::<OpReceiptAnomaly>()),
+			"{error}"
+		);
+	}
+}
+
+/// A store whose operation state is unusable is refused at open, never opened
+/// in the degraded mode, and never given a fresh sequence space.
+#[tokio::test]
+async fn open_refuses_a_store_with_unusable_operation_state() {
+	let dir = fresh_dir("op-state-missing");
+	let manager = SlabManager::initialize_new_store(gc_owned_test_config(&dir))
+		.await
+		.unwrap();
+	drop(manager);
+	crate::storage::index::remove_op_state_meta_for_test(
+		&persistent_index_path(&dir),
+		"next_op_seq_v1",
+	);
+	let error = SlabManager::open(gc_owned_test_config(&dir))
+		.await
+		.err()
+		.expect("unusable operation state must not open");
+	assert!(
+		crate::storage::index::is_op_state_invalid(&error),
+		"refused for the wrong reason: {error}"
+	);
+}
+
+/// A reopen with a submitted tier operation and no decision fences until a
+/// verified receipt and a durable effect resolve it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reopen_with_an_undecided_tier_op_fences_until_its_receipt_resolves_it() {
+	let (_dirs, mgr, _l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let cluster = control_cluster_observing(&[(1, &mgr)]).await;
+	let committer = Arc::new(op_committer(&cluster, 1));
+	register_owner(&cluster.nodes[0], &mgr).await;
+	mgr.require_op_index()
+		.unwrap()
+		.allocate_ops(
+			vec![crate::consensus::slab_ops::SlabCommand::Tier(
+				crate::consensus::slab_ops::TierOp {
+					tier: b10_tier(&mgr, &old),
+					replaces: None,
+				},
+			)],
+			None,
+		)
+		.await
+		.unwrap();
+	mgr.fence_unresolved_ops_at_open().await.unwrap();
+	assert_eq!(
+		mgr.tier_authority_readiness_reason().as_deref(),
+		Some("UnresolvedOpIntent")
+	);
+	let driver = op_driver(&cluster, &mgr, committer.clone());
+	driver.drive_once().await.unwrap();
+	assert_eq!(
+		mgr.tier_authority_readiness_reason().as_deref(),
+		Some("UnresolvedOpIntent"),
+		"no receipt, no resolution"
+	);
+	use crate::storage::TierCommitter;
+	let LoadedOp::Submittable(ticket) = mgr
+		.require_op_index()
+		.unwrap()
+		.load_op_intents()
+		.await
+		.unwrap()
+		.remove(0)
+	else {
+		panic!("the first operation is submittable");
+	};
+	committer.submit_op(&ticket).await.unwrap();
+	driver.drive_once().await.unwrap();
+	assert_eq!(mgr.tier_authority_readiness_reason(), None);
+}
+
+/// An intent linked to an operation is not recovered from local evidence alone.
+/// A fully published control install, crashed before its intent cleared, would
+/// otherwise pass every local proof: at reopen it stays and fences its scope until
+/// recovery holds its receipt (slice 5). The intermediate state, not the
+/// acceptance: see `b11_completed_control_install_recovers_after_crash_before_intent_clear`.
+#[tokio::test]
+async fn a_published_control_install_with_a_linked_op_stays_fenced_at_reopen() {
+	let (dir, manager, task, _) =
+		b11b_paused_control_install(lsm_driver::ControlLsmInstallCut::AfterPublication).await;
+	task.abort();
+	assert!(task.await.unwrap_err().is_cancelled());
+	let saved = manager
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot()
+		.await
+		.unwrap();
+	assert_eq!(
+		saved.lsm_install_intents.len(),
+		1,
+		"premise: crashed before clear"
+	);
+	assert_eq!(saved.lsm_install_intents[0].ops.len(), 1, "premise: linked");
+	drop(manager);
+	let reopened = open_manager_at_dir(
+		dir.to_path_buf(),
+		spawn_io_thread(64).unwrap(),
+		test_crypto(),
+	)
+	.await;
+	assert_eq!(
+		reopened.tier_authority_readiness_reason().as_deref(),
+		Some("TierAuthorityLsmUnresolved"),
+		"local evidence alone recovered a linked intent"
+	);
+	let index = reopened.persistent_index.as_ref().unwrap();
+	assert_eq!(
+		index
+			.load_snapshot()
+			.await
+			.unwrap()
+			.lsm_install_intents
+			.len(),
+		1
+	);
+	assert_eq!(
+		index.load_op_intents().await.unwrap().len(),
+		1,
+		"its operation is still open"
+	);
+}
+
+/// Holds this store's registry delivery, so canonical state can move ahead of
+/// its observer-derived fence.
+struct HeldRegistryDelivery {
+	inner: crate::storage::ManagerTierObserver,
+	entered: Arc<tokio::sync::Semaphore>,
+	release: Arc<tokio::sync::Semaphore>,
+	armed: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait]
+impl crate::consensus::TierObserver for HeldRegistryDelivery {
+	fn bind_tier_snapshot_source(&self, source: crate::consensus::TierSnapshotSource) {
+		self.inner.bind_tier_snapshot_source(source);
+	}
+	async fn on_slab_tiered(
+		&self,
+		tier: &crate::consensus::TieredSlab,
+		registry: &crate::consensus::IncarnationRegistry,
+		applied_log_index: u64,
+	) -> std::io::Result<()> {
+		self.inner
+			.on_slab_tiered(tier, registry, applied_log_index)
+			.await
+	}
+	async fn on_incarnation_registry(
+		&self,
+		node: u32,
+		registry: &crate::consensus::IncarnationRegistry,
+		applied_log_index: u64,
+	) -> std::io::Result<()> {
+		if self.armed.load(std::sync::atomic::Ordering::Acquire) {
+			self.entered.add_permits(1);
+			self.release.acquire().await.unwrap().forget();
+		}
+		self.inner
+			.on_incarnation_registry(node, registry, applied_log_index)
+			.await
+	}
+}
+
+/// §5.5 R3: an Applied receipt is not authority. Canonical state has superseded
+/// this store while its registry delivery is still held, so no fence has latched:
+/// the matching receipt and the durable mirror still must not hand the op off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_canonical_supersession_blocks_handoff_while_its_delivery_is_held() {
+	use openraft::storage::RaftStateMachine;
+	use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
+	let (_dirs, mgr, _l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let owner = mgr.owner_ref().unwrap();
+	let entered = Arc::new(tokio::sync::Semaphore::new(0));
+	let release = Arc::new(tokio::sync::Semaphore::new(0));
+	let observer = Arc::new(HeldRegistryDelivery {
+		inner: crate::storage::ManagerTierObserver::new(mgr.clone()),
+		entered: entered.clone(),
+		release: release.clone(),
+		armed: std::sync::atomic::AtomicBool::new(false),
+	});
+	let mut sm = crate::consensus::WendelonStateMachine::new().with_tier_observer(observer.clone());
+	let entry = |index: u64, request| Entry {
+		log_id: LogId::new(CommittedLeaderId::new(3, owner.node()), index),
+		payload: EntryPayload::Normal(request),
+	};
+	let register = |incarnation, supersedes| {
+		crate::consensus::WendelonRequest::RegisterIncarnation(
+			crate::consensus::RegisterIncarnation {
+				node: owner.node(),
+				incarnation,
+				supersedes,
+			},
+		)
+	};
+	let index = mgr.require_op_index().unwrap();
+	let ticket = index
+		.allocate_ops(
+			vec![crate::consensus::slab_ops::SlabCommand::Tier(
+				crate::consensus::slab_ops::TierOp {
+					tier: b10_tier(&mgr, &old),
+					replaces: None,
+				},
+			)],
+			None,
+		)
+		.await
+		.unwrap()
+		.first;
+	RaftStateMachine::apply(
+		&mut sm,
+		[
+			entry(1, register(owner.incarnation(), None)),
+			entry(
+				2,
+				crate::consensus::WendelonRequest::SlabOp(crate::consensus::slab_ops::SlabOp {
+					op_seq: ticket.key().op_seq,
+					command: ticket.command().clone(),
+				}),
+			),
+		],
+	)
+	.await
+	.unwrap();
+	assert!(
+		mgr.op_effect_is_durable(ticket.command()).await,
+		"premise: the mirror names this generation"
+	);
+
+	observer
+		.armed
+		.store(true, std::sync::atomic::Ordering::Release);
+	let successor = crate::consensus::StoreIncarnation::from_raw(0x55);
+	let mut applying = sm.clone();
+	let supersede = entry(3, register(successor, Some(owner.incarnation())));
+	let task = tokio::spawn(async move {
+		RaftStateMachine::apply(&mut applying, [supersede])
+			.await
+			.unwrap();
+	});
+	tokio::time::timeout(Duration::from_secs(30), entered.acquire())
+		.await
+		.unwrap()
+		.unwrap()
+		.forget();
+	assert_eq!(
+		sm.incarnation_registry(owner.node()).await.current,
+		Some(successor),
+		"premise: canonical state has superseded this store"
+	);
+	assert_eq!(
+		mgr.tier_authority_readiness_reason(),
+		None,
+		"premise: its delivery is held, so no fence has latched"
+	);
+
+	mgr.hand_off_op_if_complete(&ticket).await.unwrap();
+	assert_eq!(
+		index.load_op_intents().await.unwrap().len(),
+		1,
+		"the old Intent is not erased under obsolete authority"
+	);
+	assert_eq!(index.load_ack_pending().await.unwrap(), vec![]);
+
+	release.add_permits(1);
+	task.await.unwrap();
+	assert_eq!(
+		mgr.tier_authority_readiness_reason().as_deref(),
+		Some("OwnerAuthoritySuperseded")
+	);
+}
+
+/// R3: the lease holds through the local action. A supersession arriving while a
+/// handoff is committing cannot apply until that handoff, made under the
+/// authority it read, has finished.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_supersession_during_a_handoff_waits_for_it() {
+	let (_dirs, mgr, _l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let cluster = control_cluster_observing(&[(1, &mgr)]).await;
+	let committer = Arc::new(op_committer(&cluster, 1));
+	use crate::storage::TierCommitter;
+	committer.preflight(mgr.owner_ref().unwrap()).await.unwrap();
+	let owner = mgr.owner_ref().unwrap();
+	let index = mgr.require_op_index().unwrap();
+	let ticket = index
+		.allocate_ops(
+			vec![crate::consensus::slab_ops::SlabCommand::Tier(
+				crate::consensus::slab_ops::TierOp {
+					tier: b10_tier(&mgr, &old),
+					replaces: None,
+				},
+			)],
+			None,
+		)
+		.await
+		.unwrap()
+		.first;
+	committer.submit_op(&ticket).await.unwrap();
+
+	let entered = Arc::new(tokio::sync::Semaphore::new(0));
+	let release = Arc::new(tokio::sync::Semaphore::new(0));
+	*mgr.continuity_test_holds.op_handoff_hold.lock().unwrap() =
+		Some((entered.clone(), release.clone()));
+	let handoff = {
+		let mgr = mgr.clone();
+		let ticket = ticket.clone();
+		tokio::spawn(async move { mgr.hand_off_op_if_complete(&ticket).await })
+	};
+	tokio::time::timeout(Duration::from_secs(30), entered.acquire())
+		.await
+		.unwrap()
+		.unwrap()
+		.forget();
+
+	let successor = crate::consensus::StoreIncarnation::from_raw(0x55);
+	let writer = cluster.nodes[0].clone();
+	let incarnation = owner.incarnation();
+	let supersede = tokio::spawn(async move {
+		writer
+			.client_write(crate::consensus::WendelonRequest::RegisterIncarnation(
+				crate::consensus::RegisterIncarnation {
+					node: 1,
+					incarnation: successor,
+					supersedes: Some(incarnation),
+				},
+			))
+			.await
+			.unwrap()
+	});
+	tokio::time::sleep(Duration::from_millis(300)).await;
+	assert!(
+		!supersede.is_finished(),
+		"the supersession cannot apply while the handoff holds its lease"
+	);
+	release.add_permits(1);
+	handoff.await.unwrap().unwrap();
+	assert_eq!(
+		supersede.await.unwrap().data,
+		crate::consensus::WendelonResponse::Success
+	);
+	assert_eq!(
+		index.load_ack_pending().await.unwrap(),
+		vec![(ticket.key().op_seq, false)],
+		"the handoff was made under the authority it read"
+	);
+}
+
+/// R5: the reserved removal refuses a changed input authority even with identical
+/// run statistics, before any unlink, and does not mind unrelated epochs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reserved_removal_refuses_changed_input_authority_and_ignores_unrelated_epochs() {
+	use std::sync::atomic::Ordering;
+	let (dir, mgr) = fresh_manager().await;
+	let (slab_id, _key) = seed_small_retired_gc_slab(&mgr).await;
+	let cluster = control_cluster_observing(&[(1, &mgr)]).await;
+	let committer = op_committer(&cluster, 1);
+	let gc = LsmGcWorker::new(LsmConfig::default(), mgr.slab_pin_table()).unwrap();
+	mgr.continuity_test_holds
+		.gc_remove_held
+		.store(true, Ordering::Release);
+	assert!(
+		mgr.sweep_lsm_delete_pending_once_via_control_ring(&gc, &committer)
+			.await
+			.unwrap()
+			.is_empty()
+	);
+	mgr.continuity_test_holds
+		.gc_remove_held
+		.store(false, Ordering::Release);
+	let before = mgr.compaction_manifest_snapshot();
+	let identity = crate::consensus::slab_ops::RunIdentity::of(before.run(slab_id).unwrap());
+
+	// An unrelated manifest change: the epoch moves, the input does not.
+	let (other, _) = seed_small_retired_gc_slab(&mgr).await;
+	assert!(
+		mgr.compaction_manifest_snapshot().manifest_epoch > before.manifest_epoch,
+		"premise: the epoch moved"
+	);
+	assert_ne!(other, slab_id);
+
+	// The same statistics, a different revision: not the same object.
+	mgr.bump_slab_publication_revision(slab_id).unwrap();
+	assert_eq!(
+		crate::consensus::slab_ops::RunIdentity::of(
+			mgr.compaction_manifest_snapshot().run(slab_id).unwrap()
+		),
+		identity,
+		"premise: the statistics cannot tell these apart"
+	);
+	let refused = mgr
+		.sweep_lsm_delete_pending_once_via_control_ring(&gc, &committer)
+		.await
+		.unwrap_err();
+	assert!(
+		refused.to_string().contains("input authority changed"),
+		"{refused}"
+	);
+	assert!(
+		slab_path(&dir, slab_id).exists(),
+		"refused before any unlink"
+	);
+	assert!(
+		mgr.compaction_manifest_snapshot().run(slab_id).is_some(),
+		"the run stays"
+	);
+}
+
+/// R5's positive case: only an unrelated epoch change, and the removal runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reserved_removal_runs_after_unrelated_epochs_advance() {
+	use std::sync::atomic::Ordering;
+	let (_dir, mgr) = fresh_manager().await;
+	let (slab_id, _key) = seed_small_retired_gc_slab(&mgr).await;
+	let cluster = control_cluster_observing(&[(1, &mgr)]).await;
+	let committer = op_committer(&cluster, 1);
+	let gc = LsmGcWorker::new(LsmConfig::default(), mgr.slab_pin_table()).unwrap();
+	mgr.continuity_test_holds
+		.gc_remove_held
+		.store(true, Ordering::Release);
+	mgr.sweep_lsm_delete_pending_once_via_control_ring(&gc, &committer)
+		.await
+		.unwrap();
+	let before = mgr.compaction_manifest_snapshot().manifest_epoch;
+	let (other, _) = seed_small_retired_gc_slab(&mgr).await;
+	assert!(mgr.compaction_manifest_snapshot().manifest_epoch > before);
+	mgr.continuity_test_holds
+		.gc_remove_held
+		.store(false, Ordering::Release);
+	let deleted = mgr
+		.sweep_lsm_delete_pending_once_via_control_ring(&gc, &committer)
+		.await
+		.unwrap();
+	assert!(deleted.contains(&slab_id), "{deleted:?}, other {other:?}");
+}
+
+/// R1: a real rewrite planned from A cannot overwrite a newer B. B commits after
+/// the rewrite planned and uploaded, before it proposes; the candidate still names
+/// A, the state machine rejects it, and B stands. Its candidate stays accounted.
+struct PublishesBeforeProposing {
+	inner: crate::storage::RaftCommitter,
+	publish: tokio::sync::Mutex<Option<crate::consensus::WendelonRequest>>,
+	raft: crate::consensus::WendelonRaft,
+}
+
+#[async_trait]
+impl crate::storage::TierCommitter for PublishesBeforeProposing {
+	fn should_propose(&self) -> bool {
+		self.inner.should_propose()
+	}
+	async fn preflight(&self, owner: crate::consensus::OwnerRef) -> std::io::Result<()> {
+		self.inner.preflight(owner).await?;
+		if let Some(request) = self.publish.lock().await.take() {
+			let response = self.raft.client_write(request).await.unwrap();
+			assert_op_applied(&response.data);
+		}
+		Ok(())
+	}
+	async fn submit_op(
+		&self,
+		ticket: &crate::storage::OpTicket,
+	) -> std::io::Result<crate::storage::VerifiedReceipt> {
+		self.inner.submit_op(ticket).await
+	}
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rewrite_planned_from_a_cannot_overwrite_a_newer_b() {
+	let (_dirs, mgr, l2, target, schemas, old) = unpublished_drop_fixture().await;
+	let cluster = control_cluster_observing(&[(1, &mgr)]).await;
+	register_owner(&cluster.nodes[0], &mgr).await;
+	let committed = cluster.nodes[0]
+		.client_write(mgr.tier_request_for_test(b10_tier(&mgr, &old)).await)
+		.await
+		.unwrap();
+	assert_op_applied(&committed.data);
+	assert_eq!(
+		mgr.try_canonical_tier_pointer(old.slab_id),
+		Some(Some(old.clone())),
+		"premise: A is committed"
+	);
+
+	let bytes = l2.get(&old.l2_uri).await.unwrap();
+	let newer = TieredSlabPointer {
+		l2_uri: l2.put("tier/newer-b.wnd", &bytes).await.unwrap(),
+		..old.clone()
+	};
+	let publish = mgr.tier_request_for_test(b10_tier(&mgr, &newer)).await;
+	let committer = PublishesBeforeProposing {
+		inner: op_committer(&cluster, 1),
+		publish: tokio::sync::Mutex::new(Some(publish)),
+		raft: cluster.nodes[0].clone(),
+	};
+	let error = mgr
+		.reclaim_table_drop_tiered_storage_slice(
+			tenant(),
+			&target,
+			&schemas,
+			&committer,
+			TableDropReclaimCursor::default(),
+			1,
+		)
+		.await
+		.expect_err("the stale rewrite is refused");
+	assert!(
+		matches!(
+			error
+				.get_ref()
+				.and_then(|cause| cause.downcast_ref::<crate::storage::sweeper::SlabOpRejected>())
+				.map(|rejected| &rejected.0),
+			Some(crate::consensus::slab_ops::SlabRejection::GenerationMismatch { .. })
+		),
+		"{error}"
+	);
+	assert_eq!(
+		mgr.try_canonical_tier_pointer(old.slab_id),
+		Some(Some(newer.clone())),
+		"B is unchanged"
+	);
+	assert_eq!(
+		mgr.tier_pointer(old.slab_id).await,
+		Some(newer),
+		"and this store still publishes it"
+	);
+	let candidates = mgr
+		.require_op_index()
+		.unwrap()
+		.load_rejected_tier_candidates()
+		.await
+		.unwrap();
+	assert_eq!(
+		candidates.len(),
+		1,
+		"the rejected candidate stays accounted"
+	);
+	assert!(
+		l2.get(&candidates[0].l2_uri).await.is_ok(),
+		"its upload is retained"
+	);
+}
+
+/// A retirement planned from A, proposed after B replaced it, is rejected and
+/// leaves B. Its cleanup marker stays as independent evidence, bound to A:
+/// neither a retirement nor a deletion is inferred from the rejection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rejected_retirement_leaves_the_newer_generation_and_its_cleanup_marker() {
+	let (_dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let cluster = control_cluster_observing(&[(1, &mgr)]).await;
+	register_owner(&cluster.nodes[0], &mgr).await;
+	let committed = cluster.nodes[0]
+		.client_write(mgr.tier_request_for_test(b10_tier(&mgr, &old)).await)
+		.await
+		.unwrap();
+	assert_op_applied(&committed.data);
+	let committer = op_committer(&cluster, 1);
+	let planned = crate::consensus::slab_ops::TierGeneration::from(&old);
+	let bytes = l2.get(&old.l2_uri).await.unwrap();
+	let newer = TieredSlabPointer {
+		l2_uri: l2.put("tier/newer-than-retire.wnd", &bytes).await.unwrap(),
+		..old.clone()
+	};
+	let replaced = cluster.nodes[0]
+		.client_write(mgr.tier_request_for_test(b10_tier(&mgr, &newer)).await)
+		.await
+		.unwrap();
+	assert_op_applied(&replaced.data);
+	mgr.stage_table_drop_l2_cleanup(old.slab_id, &old.l2_uri, Some(bytes.len() as u64), None)
+		.await
+		.unwrap();
+
+	let error =
+		crate::storage::sweeper::propose_tier_retirement(&mgr, &committer, old.slab_id, planned)
+			.await
+			.unwrap_err();
+	assert!(
+		matches!(
+			error
+				.get_ref()
+				.and_then(|cause| cause.downcast_ref::<crate::storage::sweeper::SlabOpRejected>())
+				.map(|rejected| &rejected.0),
+			Some(crate::consensus::slab_ops::SlabRejection::GenerationMismatch { .. })
+		),
+		"{error}"
+	);
+	assert_eq!(
+		mgr.try_canonical_tier_pointer(old.slab_id),
+		Some(Some(newer)),
+		"nothing is retired"
+	);
+	let durable = mgr
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot_cleanup_intents()
+		.await
+		.unwrap();
+	assert!(
+		durable
+			.iter()
+			.any(|(slab, uri, _)| *slab == old.slab_id && *uri == old.l2_uri),
+		"the marker survives the rejection, bound to A: {durable:?}"
+	);
+	assert!(mgr.refuse_unresolved_cleanup(old.slab_id).is_err());
+	assert!(
+		l2.get(&old.l2_uri).await.is_ok(),
+		"no deletion is inferred from it"
+	);
+}
+
+/// R3 across cancellation: the blocking handoff owns its lease. Its caller is
+/// aborted while the transaction is paused before commit. A supersession cannot
+/// apply until that transaction ends, so no handoff commits after supersession.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancelled_handoff_keeps_its_authority_until_its_transaction_ends() {
+	use crate::storage::TierCommitter;
+	let (_dirs, mgr, _l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let cluster = control_cluster_observing(&[(1, &mgr)]).await;
+	let committer = Arc::new(op_committer(&cluster, 1));
+	let owner = mgr.owner_ref().unwrap();
+	committer.preflight(owner).await.unwrap();
+	let index = mgr.require_op_index().unwrap();
+	let ticket = index
+		.allocate_ops(
+			vec![crate::consensus::slab_ops::SlabCommand::Tier(
+				crate::consensus::slab_ops::TierOp {
+					tier: b10_tier(&mgr, &old),
+					replaces: None,
+				},
+			)],
+			None,
+		)
+		.await
+		.unwrap()
+		.first;
+	committer.submit_op(&ticket).await.unwrap();
+
+	let (entered, release) = index.hold_next_handoff_txn();
+	let handoff = {
+		let mgr = mgr.clone();
+		let ticket = ticket.clone();
+		tokio::spawn(async move { mgr.hand_off_op_if_complete(&ticket).await })
+	};
+	tokio::task::spawn_blocking(move || entered.recv_timeout(Duration::from_secs(30)))
+		.await
+		.unwrap()
+		.expect("the blocking transaction started");
+	handoff.abort();
+	assert!(
+		handoff.await.unwrap_err().is_cancelled(),
+		"premise: the async caller is gone, its transaction is not"
+	);
+
+	let applied_before = cluster.nodes[0]
+		.metrics()
+		.borrow()
+		.last_applied
+		.map(|id| id.index);
+	let writer = cluster.nodes[0].clone();
+	let successor = crate::consensus::StoreIncarnation::from_raw(0x55);
+	let incarnation = owner.incarnation();
+	let supersede = tokio::spawn(async move {
+		writer
+			.client_write(crate::consensus::WendelonRequest::RegisterIncarnation(
+				crate::consensus::RegisterIncarnation {
+					node: 1,
+					incarnation: successor,
+					supersedes: Some(incarnation),
+				},
+			))
+			.await
+			.unwrap()
+	});
+	tokio::time::sleep(Duration::from_millis(500)).await;
+	assert_eq!(
+		cluster.nodes[0]
+			.metrics()
+			.borrow()
+			.last_applied
+			.map(|id| id.index),
+		applied_before,
+		"the supersession applied while the old handoff could still commit"
+	);
+	assert!(!supersede.is_finished());
+	assert_eq!(mgr.tier_authority_readiness_reason(), None);
+
+	release.send(()).unwrap();
+	assert_eq!(
+		tokio::time::timeout(Duration::from_secs(30), supersede)
+			.await
+			.unwrap()
+			.unwrap()
+			.data,
+		crate::consensus::WendelonResponse::Success
+	);
+	assert_eq!(
+		cluster.state_machines[0]
+			.incarnation_registry(1)
+			.await
+			.current,
+		Some(successor)
+	);
+	assert_eq!(
+		index.load_ack_pending().await.unwrap(),
+		vec![(ticket.key().op_seq, false)],
+		"the handoff committed before the supersession applied"
+	);
+}
+
+/// Current-owner evidence does not stand in for cleanup evidence: with cleanup
+/// history missing, an applied Tier stays an Intent. Handoff is what lets its
+/// replaced object go, so it stays with the store's cleanup refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_store_missing_cleanup_evidence_refuses_to_hand_off_an_applied_op() {
+	use crate::storage::TierCommitter;
+	let (dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	mgr.persistent_index
+		.as_ref()
+		.unwrap()
+		.remove_cleanup_table_for_test()
+		.await
+		.unwrap();
+	let mgr = try_restart_tier_manager(mgr, &dirs, &l2).await.unwrap();
+	mgr.wait_tier_authority_ready().await.unwrap();
+	assert!(mgr.require_cleanup_authority().is_err());
+	let cluster = control_cluster_observing(&[(1, &mgr)]).await;
+	let committer = Arc::new(op_committer(&cluster, 1));
+	committer.preflight(mgr.owner_ref().unwrap()).await.unwrap();
+	let index = mgr.require_op_index().unwrap();
+	let ticket = index
+		.allocate_ops(
+			vec![crate::consensus::slab_ops::SlabCommand::Tier(
+				crate::consensus::slab_ops::TierOp {
+					tier: b10_tier(&mgr, &old),
+					replaces: None,
+				},
+			)],
+			None,
+		)
+		.await
+		.unwrap()
+		.first;
+	assert!(matches!(
+		committer.submit_op(&ticket).await.unwrap(),
+		crate::storage::VerifiedReceipt::Applied { .. }
+	));
+
+	mgr.hand_off_op_if_complete(&ticket).await.unwrap();
+	assert!(
+		index.load_ack_pending().await.unwrap().is_empty(),
+		"an applied op left its Intent without cleanup evidence"
+	);
+	assert_eq!(index.load_op_intents().await.unwrap().len(), 1);
 }

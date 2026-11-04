@@ -670,6 +670,7 @@ const PREFIX_SITES: &[&str] = &[
 	"set_lsm_compaction_control",
 	"set_lsm_compaction",
 	"set_lsm_gc",
+	"set_op_driver",
 	"set_secondary_index_lifecycle",
 	"set_lease_manager",
 	"set_pending_finalization_reconciler",

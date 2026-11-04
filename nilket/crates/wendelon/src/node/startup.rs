@@ -720,6 +720,7 @@ pub(super) struct NodeHandlesBuilder {
 	pub(super) lsm_compaction: Option<JoinHandle<()>>,
 	pub(super) lsm_compaction_control: Option<LsmCompactionServiceControl>,
 	pub(super) lsm_gc: Option<JoinHandle<()>>,
+	pub(super) op_driver: Option<JoinHandle<()>>,
 	pub(super) secondary_index_lifecycle: Option<JoinHandle<()>>,
 	pub(super) tiering_sweeper: Option<JoinHandle<()>>,
 	pub(super) restore_validation: Option<JoinHandle<()>>,
@@ -815,6 +816,12 @@ impl NodeHandlesBuilder {
 			self.duplicate = true;
 		}
 	}
+	pub(super) fn set_op_driver(&mut self, value: JoinHandle<()>) {
+		if let Some(previous) = self.op_driver.replace(value) {
+			self.extra.push(("op driver", previous));
+			self.duplicate = true;
+		}
+	}
 	pub(super) fn set_secondary_index_lifecycle(&mut self, value: JoinHandle<()>) {
 		if let Some(previous) = self.secondary_index_lifecycle.replace(value) {
 			self.extra.push(("secondary index lifecycle", previous));
@@ -891,6 +898,9 @@ impl NodeHandlesBuilder {
 			task.abort();
 		}
 		if let Some(task) = &self.lsm_gc {
+			task.abort();
+		}
+		if let Some(task) = &self.op_driver {
 			task.abort();
 		}
 		if let Some(task) = &self.secondary_index_lifecycle {
@@ -1003,6 +1013,12 @@ impl NodeHandlesBuilder {
 		if self.lsm_gc.is_none() {
 			return Err(Error::new(ErrorKind::InvalidData, "startup missing lsm_gc"));
 		}
+		if self.op_driver.is_none() {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"startup missing op_driver",
+			));
+		}
 		if self.secondary_index_lifecycle.is_none() {
 			return Err(Error::new(
 				ErrorKind::InvalidData,
@@ -1088,6 +1104,10 @@ impl NodeHandlesBuilder {
 				.lsm_gc
 				.take()
 				.expect("validated complete startup handle set"),
+			op_driver: self
+				.op_driver
+				.take()
+				.expect("validated complete startup handle set"),
 			secondary_index_lifecycle: self
 				.secondary_index_lifecycle
 				.take()
@@ -1148,6 +1168,9 @@ impl NodeHandlesBuilder {
 		}
 		if let Some(task) = self.lsm_gc.take() {
 			tasks.push(("lsm gc", task));
+		}
+		if let Some(task) = self.op_driver.take() {
+			tasks.push(("op driver", task));
 		}
 		if let Some(task) = self.secondary_index_lifecycle.take() {
 			tasks.push(("secondary index lifecycle", task));
@@ -1211,6 +1234,9 @@ impl NodeHandlesBuilder {
 		}
 		if let Some(task) = &self.lsm_gc {
 			tasks.push(("lsm_gc", task.abort_handle()));
+		}
+		if let Some(task) = &self.op_driver {
+			tasks.push(("op_driver", task.abort_handle()));
 		}
 		if let Some(task) = &self.secondary_index_lifecycle {
 			tasks.push(("secondary_index_lifecycle", task.abort_handle()));

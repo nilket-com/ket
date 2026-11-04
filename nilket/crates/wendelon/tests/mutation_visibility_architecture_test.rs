@@ -151,8 +151,8 @@ fn dormant_authority_has_no_production_provider_or_activation() {
 	// The live formats are pinned at their current versions; this substrate adds no
 	// boot/WAL/reader wiring.
 	let core = fs::read_to_string(root.join("src/schema/core.rs")).unwrap();
-	assert!(core.contains("SNAPSHOT_FORMAT_VERSION: u8 = 6"));
-	assert!(core.contains("WAL_FORMAT_VERSION: u8 = 6"));
+	assert!(core.contains("SNAPSHOT_FORMAT_VERSION: u8 = 7"));
+	assert!(core.contains("WAL_FORMAT_VERSION: u8 = 7"));
 	// The one admitted outside caller is the offline, read-only compromise audit CLI (ADR 0101
 	// C-S6): exactly one mention, its canonical import of the single audit entry point.
 	let audit_cli = root.join("src/cli/root2_audit.rs");
@@ -5923,11 +5923,11 @@ fn root2_carrier_is_bounded_private_held_and_response_mappings_are_explicit() {
 	assert!(text.contains("if version != 1"));
 	let core =
 		syn::parse_file(&fs::read_to_string(src.join("consensus/core.rs")).unwrap()).unwrap();
-	// ADR 0697 appends RegisterIncarnation after Root2Command and Refused after
-	// Root2Dormant, whose wire positions stay pinned; nothing else may follow them.
+	// ADR 0697 appends after Root2Command and Root2Dormant, whose wire positions
+	// stay pinned; each list's last variant is the newest append.
 	for (name, last) in [
-		("WendelonRequest", "RegisterIncarnation"),
-		("WendelonResponse", "Refused"),
+		("WendelonRequest", "AckOutcomes"),
+		("WendelonResponse", "Op"),
 	] {
 		let e = core
 			.items
@@ -5947,14 +5947,10 @@ fn root2_carrier_is_bounded_private_held_and_response_mappings_are_explicit() {
 				.iter()
 				.position(|variant| variant.ident == "Root2Command")
 				.unwrap();
-			assert_eq!(
-				root2,
-				e.variants.len() - 2,
-				"Root2Command keeps its wire position"
-			);
+			assert_eq!(root2, 26, "Root2Command keeps its wire position");
 		}
 	}
-	// ADR 0697: no frozen legacy decoder remains; every pre-v6 body is refused
+	// ADR 0697: no frozen legacy decoder remains; every pre-v7 body is refused
 	// before its payload is decoded, and only the current shape is dispatched.
 	assert!(!src.join("consensus/wal_body.rs").exists());
 	let storage = fs::read_to_string(src.join("consensus/raft_storage.rs")).unwrap();
