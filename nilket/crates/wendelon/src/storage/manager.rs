@@ -203,6 +203,9 @@ mod observation;
 mod open;
 mod slab_ids;
 pub(crate) use open::IndexRecoveryAuthority;
+mod gc_disposal;
+mod reservations;
+pub use reservations::{ExposedSlab, OversizedReservation, ReservedSlab};
 mod op_hooks;
 pub(crate) use slab_ids::{OwnTierView, OwnerEvidence, Ownership};
 use slab_ids::{SLAB_ID_LEASE, slab_ids_exhausted};
@@ -254,7 +257,8 @@ use compaction::{
 };
 mod maintenance_publication;
 use maintenance_publication::{
-	maintenance_staged_slab_path, reconcile_staged_maintenance_publications,
+	maintenance_staged_path_of, maintenance_staged_slab_path,
+	reconcile_staged_maintenance_publications,
 };
 mod index_publication;
 use index_publication::{IndexPublication, IndexPublicationState, SingleAppendEvidence};
@@ -872,6 +876,8 @@ pub struct SlabManager {
 	/// Slab ids whose local file an operation of this process removed from
 	/// `state` and has not yet unlinked: the only slab files it may unlink.
 	released_slab_files: DashSet<SlabId>,
+	/// Ids a running job owns, registered before their rows are visible; not evidence.
+	live_reservations: Arc<DashSet<SlabId>>,
 	/// Test-only pause points (manager/pause_hooks.rs).
 	#[cfg(test)]
 	test_pauses: pause_hooks::TestPauses,
@@ -973,6 +979,8 @@ struct ManagerState {
 	/// The committed slab id high-water: no id at or above it has been
 	/// issued. `next_slab_id` never passes it.
 	durable_slab_id_bound: SlabId,
+	/// In memory only, never durable coverage: see `take_slab_range_before_its_commit`.
+	reservation_in_flight_bound: SlabId,
 	/// Each tiered slab's published generation history; absent means
 	/// generation 0 with no history.
 	tier_layouts: DashMap<SlabId, Arc<TierLayout>>,
@@ -991,7 +999,11 @@ impl ManagerState {
 			next >= self.next_slab_id,
 			"the slab allocator only advances"
 		);
-		if next > self.durable_slab_id_bound {
+		if next
+			> self
+				.durable_slab_id_bound
+				.max(self.reservation_in_flight_bound)
+		{
 			return Err(Error::other(format!(
 				"slab id {} is not covered by the durable high-water {}",
 				next.get(),
@@ -4130,14 +4142,6 @@ impl SlabManager {
 			reclaimed_records,
 			encrypted_bytes: encrypted.bytes,
 		}))
-	}
-
-	async fn reserve_slab_id(&self) -> std::io::Result<SlabId> {
-		let mut state = self.state.lock().await;
-		let next_id = state.next_slab_id;
-		let end = self.cover_slab_ids_through(&mut state, next_id).await?;
-		state.advance_slab_allocator(end)?;
-		Ok(next_id)
 	}
 }
 

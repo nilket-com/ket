@@ -411,7 +411,7 @@ async fn an_existing_store_with_absent_partial_or_inconsistent_op_state_is_refus
 		let tx = db.begin_write().unwrap();
 		tx.open_table(OP_ACK_PENDING_TABLE)
 			.unwrap()
-			.insert(&1, &false)
+			.insert(&1, &(false, [0; 32]))
 			.unwrap();
 		tx.commit().unwrap();
 	}
@@ -427,7 +427,7 @@ async fn an_existing_store_with_absent_partial_or_inconsistent_op_state_is_refus
 		let tx = db.begin_write().unwrap();
 		tx.open_table(OP_ACK_PENDING_TABLE)
 			.unwrap()
-			.insert(&7, &false)
+			.insert(&7, &(false, [0; 32]))
 			.unwrap();
 		tx.commit().unwrap();
 	}
@@ -647,4 +647,335 @@ async fn a_mark_handoff_leaves_its_reserved_removal_the_input_authority() {
 			.lsm_install_intents
 			.is_empty()
 	);
+}
+
+/// A removal is T1's Complete: its reserved row cannot become submittable until the
+/// run is durably gone, and Cancelling it after a rejected claim needs no such thing.
+#[tokio::test]
+async fn a_reserved_removal_cannot_be_submitted_before_its_run_is_gone() {
+	let (_dir, _path, index) = fresh().await;
+	let hlc = crate::schema::HybridTimestamp {
+		physical_ms: 1,
+		logical: 0,
+		node_id: 0,
+	};
+	let removal = SlabCommand::GcRemove(crate::consensus::slab_ops::GcRemove {
+		job_id: crate::schema::CompactionJobId::new(7),
+		slab: owner().slab(SlabId::new(70)),
+		expected_run: crate::consensus::slab_ops::RunIdentity {
+			compaction_level: crate::schema::CompactionLevelIndex::L0,
+			size_bytes: crate::schema::ByteCount::new(1),
+			row_count: crate::schema::RowCount::new(1),
+			min_row_hlc: hlc,
+			max_row_hlc: hlc,
+		},
+	});
+	let allocation = index
+		.allocate_ops(vec![tier_command(1), removal], None)
+		.await
+		.unwrap();
+	let reserved = allocation.later.into_iter().next().unwrap();
+	assert!(is_op_state_invalid(
+		&index
+			.mark_may_be_submitted(reserved.clone())
+			.await
+			.unwrap_err()
+	));
+	index
+		.advance_op_progress(
+			OpProgressUpdate {
+				key: reserved.key(),
+				digest: reserved.digest(),
+				progress: OpProgress::RunDropped(None),
+			},
+			None,
+		)
+		.await
+		.unwrap();
+	index.mark_may_be_submitted(reserved).await.unwrap();
+
+	// A run-less Complete is held to the same order.
+	let slab = SlabId::new(71);
+	index.reserve_slab_ids(vec![slab], None).await.unwrap();
+	index.expose_reserved_id(slab).await.unwrap();
+	index
+		.abandon_exposed_id(
+			slab,
+			AbandonedOutput {
+				file: None,
+				relocated: false,
+			},
+			None,
+		)
+		.await
+		.unwrap();
+	let (_claim, complete) = index
+		.begin_cleanup(slab, owner(), crate::schema::CompactionJobId::new(8))
+		.await
+		.unwrap();
+	assert!(is_op_state_invalid(
+		&index.mark_may_be_submitted(complete).await.unwrap_err()
+	));
+}
+
+// ADR 0697 §4 T2 and T3: the reservation lifecycle and its charge.
+
+fn ids(range: std::ops::Range<u64>) -> Vec<SlabId> {
+	range.map(SlabId::new).collect()
+}
+
+fn refusal(error: &Error) -> &ReservationRefused {
+	error
+		.get_ref()
+		.and_then(|cause| cause.downcast_ref::<ReservationRefused>())
+		.unwrap_or_else(|| panic!("expected a typed refusal, got {error}"))
+}
+
+#[tokio::test]
+async fn a_reservation_is_charged_before_any_row_and_refused_whole() {
+	let (_dir, _path, index) = fresh().await;
+	// 513 ids would promise 1026 sequences of a window of 1024.
+	let error = index.reserve_slab_ids(ids(1..514), None).await.unwrap_err();
+	backlog(&error);
+	assert!(index.load_reserved_ids().await.unwrap().is_empty());
+
+	index.reserve_slab_ids(ids(1..513), None).await.unwrap();
+	// Every producer sees the charge, through both of its admission paths.
+	backlog(&index.ensure_op_room(1).await.unwrap_err());
+	backlog(
+		&index
+			.allocate_ops(vec![tier_command(9)], None)
+			.await
+			.unwrap_err(),
+	);
+	backlog(
+		&index
+			.reserve_slab_ids(ids(600..601), None)
+			.await
+			.unwrap_err(),
+	);
+}
+
+/// §4: `S + 2C` cannot rise through a conversion, and a retry cannot spend twice.
+#[tokio::test]
+async fn a_charge_converts_once_and_a_full_window_still_cleans_up() {
+	let (_dir, path, index) = fresh().await;
+	index.reserve_slab_ids(ids(1..513), None).await.unwrap();
+	let slab = SlabId::new(1);
+	index.expose_reserved_id(slab).await.unwrap();
+	index
+		.abandon_exposed_id(
+			slab,
+			AbandonedOutput {
+				file: None,
+				relocated: false,
+			},
+			None,
+		)
+		.await
+		.unwrap();
+	let job = crate::schema::CompactionJobId::new(1);
+	let (claim, complete) = index.begin_cleanup(slab, owner(), job).await.unwrap();
+	assert_eq!((claim.key().op_seq, complete.key().op_seq), (1, 2));
+	assert!(matches!(
+		refusal(&index.begin_cleanup(slab, owner(), job).await.unwrap_err()).found,
+		Some(ReservedIdState::Cleaning { .. })
+	));
+	// One charge became two allocated sequences: still exactly full.
+	backlog(&index.ensure_op_room(1).await.unwrap_err());
+	// A burn at a full window spends less than it held.
+	let burned = SlabId::new(2);
+	let ticket = index.begin_burn(burned, owner()).await.unwrap();
+	assert_eq!(ticket.key().op_seq, 3);
+	index.ensure_op_room(1).await.unwrap();
+	drop(index);
+	reopen(&path)
+		.await
+		.expect("the accounting validates at open");
+}
+
+/// Only a present `Unsubmitted` row exposes. Burning is permanent.
+#[tokio::test]
+async fn exposure_comes_only_from_unsubmitted_and_a_burn_is_never_revived() {
+	let (_dir, path, index) = fresh().await;
+	let (a, b) = (SlabId::new(1), SlabId::new(2));
+	index.reserve_slab_ids(vec![a, b], None).await.unwrap();
+
+	index.expose_reserved_id(a).await.unwrap();
+	assert_eq!(
+		refusal(&index.expose_reserved_id(a).await.unwrap_err()).found,
+		Some(ReservedIdState::Exposed { abandoned: None })
+	);
+	// Exposed takes T1: there is no burning it.
+	assert!(matches!(
+		refusal(&index.begin_burn(a, owner()).await.unwrap_err()).found,
+		Some(ReservedIdState::Exposed { .. })
+	));
+
+	index.begin_burn(b, owner()).await.unwrap();
+	assert!(matches!(
+		refusal(&index.expose_reserved_id(b).await.unwrap_err()).found,
+		Some(ReservedIdState::Burning { .. })
+	));
+	assert_eq!(
+		refusal(&index.expose_reserved_id(SlabId::new(99)).await.unwrap_err()).found,
+		None
+	);
+	drop(index);
+	let index = reopen(&path).await.unwrap();
+	assert!(matches!(
+		refusal(&index.expose_reserved_id(b).await.unwrap_err()).found,
+		Some(ReservedIdState::Burning { .. })
+	));
+}
+
+/// Each T2 transition at its commit boundary: all of it or none of it.
+#[tokio::test]
+async fn each_reservation_transition_commits_whole_at_either_cut() {
+	for cut in [OpTxnCut::BeforeCommit, OpTxnCut::AfterCommit] {
+		let committed = cut == OpTxnCut::AfterCommit;
+		let (_dir, path, index) = fresh().await;
+		let slab = SlabId::new(1);
+		let water = index.slab_id_high_water().await.unwrap();
+
+		// The row and the bound, one transaction.
+		index.cut_next_op_txn(cut);
+		assert!(
+			index
+				.reserve_slab_ids(vec![slab], Some(water + 64))
+				.await
+				.is_err()
+		);
+		drop(index);
+		let index = reopen(&path).await.unwrap();
+		assert_eq!(
+			index.reserved_id_state(slab).await.unwrap(),
+			committed.then_some(ReservedIdState::Unsubmitted)
+		);
+		assert_eq!(
+			index.slab_id_high_water().await.unwrap(),
+			if committed { water + 64 } else { water }
+		);
+		if !committed {
+			index.reserve_slab_ids(vec![slab], None).await.unwrap();
+		}
+
+		// The burn and its operation, one transaction.
+		index.cut_next_op_txn(cut);
+		assert!(index.begin_burn(slab, owner()).await.is_err());
+		drop(index);
+		let index = reopen(&path).await.unwrap();
+		let state = index.reserved_id_state(slab).await.unwrap().unwrap();
+		let ops = index.load_op_intents().await.unwrap();
+		assert_eq!(
+			matches!(state, ReservedIdState::Burning { .. }),
+			committed,
+			"{cut:?}"
+		);
+		assert_eq!(ops.len(), usize::from(committed), "{cut:?}");
+
+		// Exposure, on a second id.
+		let exposed = SlabId::new(2);
+		index.reserve_slab_ids(vec![exposed], None).await.unwrap();
+		index.cut_next_op_txn(cut);
+		assert!(index.expose_reserved_id(exposed).await.is_err());
+		drop(index);
+		let index = reopen(&path).await.unwrap();
+		assert_eq!(
+			matches!(
+				index.reserved_id_state(exposed).await.unwrap(),
+				Some(ReservedIdState::Exposed { .. })
+			),
+			committed
+		);
+	}
+}
+
+#[tokio::test]
+async fn open_refuses_reservations_that_break_the_accounting() {
+	let write = |path: &Path, id: u64, state: ReservedIdState| {
+		let db = Database::open(path).unwrap();
+		let tx = db.begin_write().unwrap();
+		tx.open_table(RESERVED_SLAB_IDS_TABLE)
+			.unwrap()
+			.insert(&id, postcard::to_stdvec(&state).unwrap().as_slice())
+			.unwrap();
+		tx.commit().unwrap();
+	};
+	// More promised than the window holds.
+	let (_dir, path, index) = fresh().await;
+	drop(index);
+	for id in 1..=513 {
+		write(&path, id, ReservedIdState::Unsubmitted);
+	}
+	assert!(is_op_state_invalid(
+		&reopen(&path).await.err().expect("refused")
+	));
+	// A burn with no operation behind it.
+	let (_dir, path, index) = fresh().await;
+	drop(index);
+	write(
+		&path,
+		1,
+		ReservedIdState::Burning {
+			op: OpKey {
+				owner: owner(),
+				op_seq: 40,
+			},
+		},
+	);
+	assert!(is_op_state_invalid(
+		&reopen(&path).await.err().expect("refused")
+	));
+}
+
+/// A rejected install's outputs all transfer with its handoff, or none do.
+#[tokio::test]
+async fn a_rejected_install_transfers_every_output_or_none() {
+	let (_dir, _path, index) = fresh().await;
+	let (a, b) = (SlabId::new(1), SlabId::new(2));
+	index.reserve_slab_ids(vec![a, b], None).await.unwrap();
+	index.expose_reserved_id(a).await.unwrap();
+	let ticket = allocate_one(&index, 9).await;
+	let output = AbandonedOutput {
+		file: None,
+		relocated: false,
+	};
+	// `b` was never exposed: nothing about this handoff happens.
+	assert!(
+		index
+			.hand_off_op_with(
+				ticket.key(),
+				ticket.digest(),
+				None,
+				HandoffEvidence::AbandonOutputs(vec![(a, output.clone()), (b, output.clone())]),
+				None,
+			)
+			.await
+			.is_err()
+	);
+	assert_eq!(index.load_op_intents().await.unwrap().len(), 1);
+	assert_eq!(
+		index.reserved_id_state(a).await.unwrap(),
+		Some(ReservedIdState::Exposed { abandoned: None })
+	);
+	index.expose_reserved_id(b).await.unwrap();
+	index
+		.hand_off_op_with(
+			ticket.key(),
+			ticket.digest(),
+			None,
+			HandoffEvidence::AbandonOutputs(vec![(a, output.clone()), (b, output.clone())]),
+			None,
+		)
+		.await
+		.unwrap();
+	for id in [a, b] {
+		assert_eq!(
+			index.reserved_id_state(id).await.unwrap(),
+			Some(ReservedIdState::Exposed {
+				abandoned: Some(output.clone())
+			})
+		);
+	}
 }

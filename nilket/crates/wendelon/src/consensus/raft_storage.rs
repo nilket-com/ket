@@ -2789,6 +2789,10 @@ pub struct SmState {
 	/// Each admitted owner's decision window (ADR 0697 §5.3).
 	#[serde(default)]
 	pub op_tables: BTreeMap<OwnerRef, crate::consensus::slab_ops::OpTable>,
+	/// ADR 0697 §4: per owner, the slabs claimed for a terminal transition and
+	/// those whose identity has ended.
+	#[serde(default)]
+	pub slab_terminal: BTreeMap<OwnerRef, crate::consensus::slab_ops::OwnerTerminal>,
 	/// Migration Ledger (Plan 019). Keyed by `migration_id` so
 	/// apply-time idempotency and chained-migration reconciliation
 	/// are both O(1). Entries never fall out of the map during
@@ -3036,6 +3040,22 @@ impl TierSnapshotSource {
 		))
 	}
 
+	/// Advisory, without waiting: whether `slab` is known tiered or removed, so
+	/// a claim that cannot succeed is not proposed. Never cleanup authority; the
+	/// ring still arbitrates. `None` when the state machine is busy.
+	pub(crate) fn try_known_unclaimable(&self, slab: SlabRef) -> Option<bool> {
+		let inner = self.0.upgrade()?;
+		let guard = inner.try_read().ok()?;
+		Some(
+			guard.state.tiered_slabs.contains_key(&slab)
+				|| guard
+					.state
+					.slab_terminal
+					.get(&slab.owner())
+					.is_some_and(|terminal| terminal.removed.contains(slab.local_id())),
+		)
+	}
+
 	pub(crate) async fn read(&self) -> std::io::Result<TierSnapshotLease> {
 		let inner = self
 			.0
@@ -3072,6 +3092,73 @@ impl TierSnapshotLease {
 			.get(&key.owner.node())
 			.is_some_and(|registry| registry.current == Some(key.owner.incarnation()));
 		applied && current
+	}
+
+	/// A rejected mark and its Cancelled removal as the state machine recorded
+	/// them, for the current owner: what lets the two hand off together.
+	pub(crate) fn rejected_claim_decided_for_current_owner(
+		&self,
+		mark: (crate::consensus::slab_ops::OpKey, [u8; 32]),
+		removal: (crate::consensus::slab_ops::OpKey, [u8; 32]),
+	) -> bool {
+		use crate::consensus::slab_ops::{RecordedOutcome, SlabRejection};
+		let state = &self.0.state;
+		let entry = |(key, digest): (crate::consensus::slab_ops::OpKey, [u8; 32])| {
+			state
+				.op_tables
+				.get(&key.owner)
+				.and_then(|table| table.outcomes.get(&key.op_seq))
+				.filter(|entry| entry.digest == digest)
+		};
+		let rejected = entry(mark)
+			.is_some_and(|entry| matches!(entry.outcome, RecordedOutcome::Rejected { .. }));
+		let cancelled = entry(removal).is_some_and(|entry| {
+			matches!(
+				entry.outcome,
+				RecordedOutcome::Rejected {
+					reason: SlabRejection::Cancelled,
+					..
+				}
+			)
+		});
+		let current = state
+			.incarnations
+			.get(&mark.0.owner.node())
+			.is_some_and(|registry| registry.current == Some(mark.0.owner.incarnation()));
+		rejected && cancelled && current
+	}
+
+	/// §6.1 claim-stage guard: this job holds the claim, for the current owner.
+	pub(crate) fn claim_held_by_current_owner(
+		&self,
+		slab: SlabRef,
+		job_id: crate::schema::CompactionJobId,
+	) -> bool {
+		let state = &self.0.state;
+		let held = state
+			.slab_terminal
+			.get(&slab.owner())
+			.and_then(|terminal| terminal.claimed.get(&slab.local_id()))
+			== Some(&job_id);
+		held && state
+			.incarnations
+			.get(&slab.owner().node())
+			.is_some_and(|registry| registry.current == Some(slab.owner().incarnation()))
+	}
+
+	/// §6.1 post-Complete guard: the identity has ended, for the current owner.
+	/// A live claim is not required: Complete ended it.
+	pub(crate) fn removed_for_current_owner(&self, slab: SlabRef) -> bool {
+		let state = &self.0.state;
+		let removed = state
+			.slab_terminal
+			.get(&slab.owner())
+			.is_some_and(|terminal| terminal.removed.contains(slab.local_id()));
+		removed
+			&& state
+				.incarnations
+				.get(&slab.owner().node())
+				.is_some_and(|registry| registry.current == Some(slab.owner().incarnation()))
 	}
 
 	/// The incarnation registries coherent with `tiers()` (ADR 0697).
@@ -3155,6 +3242,7 @@ pub trait TierObserver: Send + Sync {
 	async fn on_gc_removed(
 		&self,
 		_remove: &crate::consensus::slab_ops::GcRemove,
+		_op_seq: u64,
 		_registry: &IncarnationRegistry,
 		_applied_log_index: u64,
 	) -> std::io::Result<()> {
@@ -4110,6 +4198,11 @@ impl WendelonStateMachine {
 	/// A caller holding a slab publication lock cannot await this lock: a
 	/// snapshot retry may hold the canonical read lease while draining that
 	/// publication lock. Refusal leaves its reconciliation work for next pass.
+	#[cfg(test)]
+	pub(crate) fn tier_snapshot_source_for_test(&self) -> TierSnapshotSource {
+		TierSnapshotSource(Arc::downgrade(&self.inner))
+	}
+
 	pub(crate) fn try_tiered_slab(&self, slab: SlabRef) -> std::io::Result<Option<TieredSlab>> {
 		let guard = self
 			.inner
@@ -4416,10 +4509,10 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 						.on_migrated_range_tombstone(tombstone, *applied_log_index)
 						.await
 						.map_err(|error| (SlabId::new(0), error)),
-					TierObserverEvent::GcRemoved(remove, registry) => observer
-						.on_gc_removed(remove, registry, *applied_log_index)
+					TierObserverEvent::GcRemoved(remove, op_seq, registry) => observer
+						.on_gc_removed(remove, *op_seq, registry, *applied_log_index)
 						.await
-						.map_err(|error| (remove.slab, error)),
+						.map_err(|error| (remove.slab.local_id(), error)),
 					TierObserverEvent::LsmCompactionCommitted(commit, registry) => observer
 						.on_lsm_compaction_committed(commit, registry, *applied_log_index)
 						.await
@@ -4823,7 +4916,11 @@ enum TierObserverEvent {
 	/// A node's registry changed: a superseded local store must fence even
 	/// when no later slab event names it.
 	Registry(u32, IncarnationRegistry),
-	GcRemoved(crate::consensus::slab_ops::GcRemove, IncarnationRegistry),
+	GcRemoved(
+		crate::consensus::slab_ops::GcRemove,
+		u64,
+		IncarnationRegistry,
+	),
 }
 
 /// ADR 0697: a control artifact (WAL record or snapshot) written before
@@ -9538,6 +9635,8 @@ fn serialize_checkpoint_page(
 
 /// Encode a complete snapshot: `[SnapshotHeader][postcard(SmState)]`.
 fn encode_snapshot(state: &SmState) -> Result<Vec<u8>, AnyError> {
+	slab_op_apply::validate_slab_terminal(state)
+		.map_err(|error| AnyError::new(&std::io::Error::other(error)))?;
 	let body = postcard::to_allocvec(state).map_err(|e| AnyError::new(&e))?;
 	let header = snapshot_header_template(state);
 	let header = SnapshotHeader {
@@ -9722,6 +9821,7 @@ fn decode_snapshot_reader_with_identity<R: Read>(
 	let state = decode_snapshot_state_bytes(&body)?;
 	validate_slab_identity_state(&state)?;
 	slab_op_apply::validate_op_tables(&state)?;
+	slab_op_apply::validate_slab_terminal(&state)?;
 	let mut artifact = control_artifact_hash::Context::new();
 	artifact.update(&header_bytes);
 	artifact.update(&body);
@@ -20198,6 +20298,14 @@ pub(crate) mod body_format_corpus {
 				]),
 			},
 		);
+		let mut terminal = crate::consensus::slab_ops::OwnerTerminal::default();
+		terminal
+			.claimed
+			.insert(SlabId::new(90), crate::schema::CompactionJobId::new(0x90));
+		terminal.removed.insert(SlabId::new(80));
+		terminal.removed.insert(SlabId::new(81));
+		terminal.removed.insert(SlabId::new(85));
+		state.slab_terminal.insert(owner, terminal);
 		state.op_tables.insert(
 			owner,
 			crate::consensus::slab_ops::OpTable {
@@ -20347,25 +20455,29 @@ pub(crate) mod body_format_corpus {
 		include_str!("../../tests/fixtures/consensus_body/wal_v6_entries.txt");
 	const SNAPSHOT_V6_OUTGOING_MANIFEST: &str =
 		include_str!("../../tests/fixtures/consensus_body/snapshot_v6.txt");
-	const WAL_V7_MANIFEST: &str =
+	const WAL_V7_OUTGOING_MANIFEST: &str =
 		include_str!("../../tests/fixtures/consensus_body/wal_v7_entries.txt");
-	const SNAPSHOT_V7_MANIFEST: &str =
+	const SNAPSHOT_V7_OUTGOING_MANIFEST: &str =
 		include_str!("../../tests/fixtures/consensus_body/snapshot_v7.txt");
+	const WAL_V8_MANIFEST: &str =
+		include_str!("../../tests/fixtures/consensus_body/wal_v8_entries.txt");
+	const SNAPSHOT_V8_MANIFEST: &str =
+		include_str!("../../tests/fixtures/consensus_body/snapshot_v8.txt");
 
 	#[test]
-	fn adr0697_current_wal_v7_and_snapshot_v7_match_stored_goldens() {
-		let stored_wal = parse_manifest(WAL_V7_MANIFEST);
+	fn adr0697_current_wal_v8_and_snapshot_v8_match_stored_goldens() {
+		let stored_wal = parse_manifest(WAL_V8_MANIFEST);
 		let corpus = wal_corpus();
 		assert_eq!(stored_wal.len(), corpus.len());
 		for (name, bytes) in corpus {
 			assert_eq!(
 				hex(&bytes),
 				hex(&stored_wal[name]),
-				"WAL v6 body moved for {name}; bump the format and add a refusal fixture"
+				"WAL v8 body moved for {name}; bump the format and add a refusal fixture"
 			);
 		}
 
-		let stored_snapshot = parse_manifest(SNAPSHOT_V7_MANIFEST);
+		let stored_snapshot = parse_manifest(SNAPSHOT_V8_MANIFEST);
 		let state = canonical_current_sm_state();
 		assert_eq!(
 			hex(&postcard::to_stdvec(&state).unwrap()),
@@ -20376,7 +20488,7 @@ pub(crate) mod body_format_corpus {
 		assert!(!state.tiered_slabs.is_empty() && !state.incarnations.is_empty());
 	}
 
-	/// Every stored pre-v7 body, by the version it was written at.
+	/// Every stored pre-v8 body, by the version it was written at.
 	fn historical_bodies(manifests: &[(u8, &'static str)]) -> Vec<(u8, String, Vec<u8>)> {
 		manifests
 			.iter()
@@ -20391,7 +20503,7 @@ pub(crate) mod body_format_corpus {
 	/// ADR 0697: a snapshot written at any earlier version, including before
 	/// format versioning, is refused before its body is decoded.
 	#[test]
-	fn adr0697_every_pre_v7_snapshot_body_is_refused_before_decode() {
+	fn adr0697_every_pre_v8_snapshot_body_is_refused_before_decode() {
 		let bodies = historical_bodies(&[
 			(0, V1_SNAPSHOT_MANIFEST),
 			(1, V1_SNAPSHOT_MANIFEST),
@@ -20400,6 +20512,7 @@ pub(crate) mod body_format_corpus {
 			(4, SNAPSHOT_V4_MANIFEST),
 			(5, SNAPSHOT_V5_MANIFEST),
 			(6, SNAPSHOT_V6_OUTGOING_MANIFEST),
+			(7, SNAPSHOT_V7_OUTGOING_MANIFEST),
 		]);
 		assert!(bodies.len() >= 6);
 		for (version, name, body) in bodies {
@@ -20446,7 +20559,7 @@ pub(crate) mod body_format_corpus {
 	/// ADR 0697: a WAL record written at any earlier version, including before
 	/// format versioning, is refused before its payload is decoded.
 	#[test]
-	fn adr0697_every_pre_v7_wal_body_is_refused_before_decode() {
+	fn adr0697_every_pre_v8_wal_body_is_refused_before_decode() {
 		let bodies = historical_bodies(&[
 			(0, WAL_V4_MANIFEST),
 			(1, V1_WAL_MANIFEST),
@@ -20455,6 +20568,7 @@ pub(crate) mod body_format_corpus {
 			(4, WAL_V4_MANIFEST),
 			(5, WAL_V5_OUTGOING_MANIFEST),
 			(6, WAL_V6_OUTGOING_MANIFEST),
+			(7, WAL_V7_OUTGOING_MANIFEST),
 		]);
 		assert!(bodies.len() >= 6);
 		let fixed_size = std::mem::size_of::<RaftLogEntryFixed>();
@@ -20503,7 +20617,7 @@ pub(crate) mod body_format_corpus {
 		for (name, bytes) in wal_corpus() {
 			wal.push_str(&format!("{name}={}\n", hex(&bytes)));
 		}
-		std::fs::write(dir.join("wal_v7_entries.txt"), wal).unwrap();
+		std::fs::write(dir.join("wal_v8_entries.txt"), wal).unwrap();
 		let mut mutations = String::new();
 		for (name, mutation) in canonical_mutations() {
 			mutations.push_str(&format!(
@@ -20523,7 +20637,7 @@ pub(crate) mod body_format_corpus {
 			hex(&postcard::to_stdvec(&state).unwrap()),
 			hex(&postcard::to_stdvec(&entry).unwrap())
 		);
-		std::fs::write(dir.join("snapshot_v7.txt"), snapshot).unwrap();
+		std::fs::write(dir.join("snapshot_v8.txt"), snapshot).unwrap();
 		println!("manifests written to {}", dir.display());
 	}
 }

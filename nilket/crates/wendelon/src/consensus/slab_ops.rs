@@ -114,10 +114,95 @@ impl RunIdentity {
 /// immutable after, so it carries no manifest epoch.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GcRemove {
-	pub owner: OwnerRef,
+	/// The job its mark claimed the slab for: this removal is T1's Complete.
 	pub job_id: CompactionJobId,
-	pub slab: SlabId,
+	pub slab: SlabRef,
 	pub expected_run: RunIdentity,
+}
+
+/// T1's claim, for a slab with no manifest run for a mark to carry it. Once
+/// accepted, a TierSlab of the slab is rejected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimOp {
+	pub slab: SlabRef,
+	pub job_id: CompactionJobId,
+}
+
+/// T1's terminal acknowledgement of a `ClaimOp`: claimed moves to removed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompleteOp {
+	pub slab: SlabRef,
+	pub job_id: CompactionJobId,
+}
+
+/// A reservation durably known never to have been exposed goes straight to
+/// removed (T2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BurnOp {
+	pub slab: SlabRef,
+}
+
+/// Exact, coalesced sets of one owner's slab ids. Inclusive, so the top id needs
+/// no one-past-the-end. Never expanded id by id, and no bound on its size is
+/// claimed. It exists only beneath an owner, in [`OwnerTerminal`].
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SlabIntervals(Vec<(u64, u64)>);
+
+impl SlabIntervals {
+	pub fn contains(&self, slab: SlabId) -> bool {
+		let id = slab.get();
+		let after = self.0.partition_point(|(first, _)| *first <= id);
+		after > 0 && self.0[after - 1].1 >= id
+	}
+
+	pub fn insert(&mut self, slab: SlabId) {
+		let id = slab.get();
+		let after = self.0.partition_point(|(first, _)| *first <= id);
+		if after > 0 && self.0[after - 1].1 >= id {
+			return;
+		}
+		let joins_before = after > 0 && self.0[after - 1].1.checked_add(1) == Some(id);
+		let joins_after = after < self.0.len() && id.checked_add(1) == Some(self.0[after].0);
+		match (joins_before, joins_after) {
+			(true, true) => {
+				self.0[after - 1].1 = self.0[after].1;
+				self.0.remove(after);
+			}
+			(true, false) => self.0[after - 1].1 = id,
+			(false, true) => self.0[after].0 = id,
+			(false, false) => self.0.insert(after, (id, id)),
+		}
+	}
+
+	/// Ordered, each interval well formed, and neither overlapping nor adjacent
+	/// to the next: the one encoding of this set.
+	pub fn is_canonical(&self) -> bool {
+		self.0.iter().all(|(first, last)| first <= last)
+			&& self.0.windows(2).all(|pair| {
+				pair[0]
+					.1
+					.checked_add(1)
+					.is_some_and(|next| next < pair[1].0)
+			})
+	}
+
+	pub fn intervals(&self) -> &[(u64, u64)] {
+		&self.0
+	}
+
+	#[cfg(test)]
+	pub(crate) fn from_raw_for_test(intervals: Vec<(u64, u64)>) -> Self {
+		Self(intervals)
+	}
+}
+
+/// The terminal half of one owner's slab namespace (ADR 0697 §4). Its ids are
+/// qualified by the key they sit under, and this is pairwise disjoint with that
+/// owner's tiered slabs.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnerTerminal {
+	pub claimed: BTreeMap<SlabId, CompactionJobId>,
+	pub removed: SlabIntervals,
 }
 
 /// Every command that names a slab. Its owner has one source, the command.
@@ -127,6 +212,9 @@ pub enum SlabCommand {
 	Retire(RetireOp),
 	Compaction(CompactionCommit),
 	GcRemove(GcRemove),
+	Claim(ClaimOp),
+	Complete(CompleteOp),
+	BurnReserved(BurnOp),
 }
 
 const DIGEST_DOMAIN: &[u8] = b"wendelon.slab-op.v1";
@@ -134,6 +222,9 @@ const DIGEST_KIND_TIER: u8 = 1;
 const DIGEST_KIND_RETIRE: u8 = 2;
 const DIGEST_KIND_COMPACTION: u8 = 3;
 const DIGEST_KIND_GC_REMOVE: u8 = 4;
+const DIGEST_KIND_CLAIM: u8 = 5;
+const DIGEST_KIND_COMPLETE: u8 = 6;
+const DIGEST_KIND_BURN: u8 = 7;
 
 fn payload_digest<T: Serialize>(kind: u8, payload: &T) -> [u8; 32] {
 	// These are plain structs with deterministic field order; postcard cannot
@@ -152,7 +243,10 @@ impl SlabCommand {
 			Self::Tier(op) => op.tier.slab.owner(),
 			Self::Retire(op) => op.slab.owner(),
 			Self::Compaction(commit) => commit.owner,
-			Self::GcRemove(remove) => remove.owner,
+			Self::GcRemove(remove) => remove.slab.owner(),
+			Self::Claim(op) => op.slab.owner(),
+			Self::Complete(op) => op.slab.owner(),
+			Self::BurnReserved(op) => op.slab.owner(),
 		}
 	}
 
@@ -165,6 +259,9 @@ impl SlabCommand {
 			Self::Retire(op) => payload_digest(DIGEST_KIND_RETIRE, op),
 			Self::Compaction(commit) => payload_digest(DIGEST_KIND_COMPACTION, commit),
 			Self::GcRemove(remove) => payload_digest(DIGEST_KIND_GC_REMOVE, remove),
+			Self::Claim(op) => payload_digest(DIGEST_KIND_CLAIM, op),
+			Self::Complete(op) => payload_digest(DIGEST_KIND_COMPLETE, op),
+			Self::BurnReserved(op) => payload_digest(DIGEST_KIND_BURN, op),
 		}
 	}
 }
@@ -226,6 +323,14 @@ pub enum SlabRejection {
 	VisibleDomainMismatch,
 	/// Closed by `CancelOp` before the original was decided.
 	Cancelled,
+	/// A terminal transition of a slab that holds a tier pointer.
+	Tiered,
+	/// Claimed by another job, or a tier of a claimed slab.
+	ClaimedBy { job_id: CompactionJobId },
+	/// The slab's identity has ended; nothing names it again.
+	Removed,
+	/// A Complete whose job does not hold the claim.
+	NotClaimedBy { current: Option<CompactionJobId> },
 }
 
 /// A decision as the state machine recorded it, at its original index.

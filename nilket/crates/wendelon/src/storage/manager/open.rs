@@ -967,6 +967,7 @@ impl SlabManager {
 				rehydrating: HashSet::new(),
 				next_slab_id,
 				durable_slab_id_bound,
+				reservation_in_flight_bound: SlabId::new(0),
 				tier_layouts: DashMap::new(),
 				disposal_evidence: Default::default(),
 			}),
@@ -1056,6 +1057,7 @@ impl SlabManager {
 			cleanup_scan_schedule: Default::default(),
 			quarantined_slab_files,
 			released_slab_files: DashSet::new(),
+			live_reservations: Arc::new(DashSet::new()),
 			#[cfg(test)]
 			test_pauses: Default::default(),
 		});

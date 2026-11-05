@@ -103,6 +103,13 @@ pub(crate) enum OwnTierView {
 impl SlabManager {
 	/// Bind this store to the control-ring node it serves. A manager serves
 	/// one node for its whole life.
+	/// Whether this store serves a control ring. Sticky from node bootstrap,
+	/// before any maintenance service starts, so a store never takes a local-only
+	/// destructive path because its ring is unavailable at the moment.
+	pub(crate) fn control_node_bound(&self) -> bool {
+		self.control_node.get().is_some()
+	}
+
 	pub fn bind_control_node(&self, node: u32) -> std::io::Result<()> {
 		let bound = *self.control_node.get_or_init(|| node);
 		if bound != node {
@@ -374,6 +381,12 @@ impl SlabManager {
 			.map(|index| index.store_incarnation())
 	}
 
+	/// The bound a reservation ending at `end` raises the high-water to.
+	pub(super) fn lease_bound_through(&self, end: u64) -> std::io::Result<u64> {
+		end.checked_add(SLAB_ID_LEASE)
+			.ok_or_else(slab_ids_exhausted)
+	}
+
 	/// Commit the durable high-water past `last` before any id up to it is
 	/// used, and return `last + 1`. The bound is raised a lease ahead so most
 	/// allocations need no redb commit. A failed commit issues nothing.
@@ -416,6 +429,12 @@ fn slab_ids_named_by_file(name: &str) -> Vec<SlabId> {
 		u64::from_str_radix(digits, 16).ok().map(SlabId::new)
 	};
 	let mut ids = Vec::new();
+	if let Some(body) = name.strip_prefix("gc-quarantine-") {
+		ids.extend(hex16(body));
+	}
+	if let Some(body) = name.strip_prefix("abandoned-output-") {
+		ids.extend(hex16(body));
+	}
 	if let Some(body) = name.strip_prefix("maintenance-staged-") {
 		ids.extend(hex16(body));
 		ids.extend(body.get(17..).and_then(hex16));

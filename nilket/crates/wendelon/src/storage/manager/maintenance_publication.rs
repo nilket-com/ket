@@ -72,6 +72,15 @@ impl SlabManager {
 pub(super) fn maintenance_staged_slab_path(
 	dir: &Path,
 	old_slab_id: SlabId,
+	replacement: &ExposedSlab,
+) -> PathBuf {
+	maintenance_staged_path_of(dir, old_slab_id, replacement.id())
+}
+
+/// The name itself, for checking a path the capability already named.
+pub(super) fn maintenance_staged_path_of(
+	dir: &Path,
+	old_slab_id: SlabId,
 	replacement_slab_id: SlabId,
 ) -> PathBuf {
 	dir.join(format!(

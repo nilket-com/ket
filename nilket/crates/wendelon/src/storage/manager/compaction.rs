@@ -959,9 +959,10 @@ impl SlabManager {
 		}
 
 		let old_bytes = slab.write_cursor();
-		let replacement_id = self.reserve_slab_id().await?;
+		let replacement_exposed = self.reserve_exposed_slab_id().await?;
+		let replacement_id = replacement_exposed.id();
 		let replacement_path =
-			maintenance_staged_slab_path(&self.config.dir, slab_id, replacement_id);
+			maintenance_staged_slab_path(&self.config.dir, slab_id, &replacement_exposed);
 		let replacement = Arc::new(
 			LocalSlabStore::open(
 				&replacement_path,
@@ -1197,7 +1198,7 @@ impl SlabManager {
 		if !self
 			.finish_compaction_with_replacement(
 				slab_id,
-				replacement_id,
+				&replacement_exposed,
 				replacement.clone(),
 				&records,
 				&relocations,
@@ -1347,9 +1348,10 @@ impl SlabManager {
 			}));
 		}
 
-		let replacement_id = self.reserve_slab_id().await?;
+		let replacement_exposed = self.reserve_exposed_slab_id().await?;
+		let replacement_id = replacement_exposed.id();
 		let replacement_path =
-			maintenance_staged_slab_path(&self.config.dir, slab_id, replacement_id);
+			maintenance_staged_slab_path(&self.config.dir, slab_id, &replacement_exposed);
 		let replacement = Arc::new(
 			LocalSlabStore::open(
 				&replacement_path,
@@ -1423,7 +1425,7 @@ impl SlabManager {
 		if !self
 			.finish_compaction_with_replacement(
 				slab_id,
-				replacement_id,
+				&replacement_exposed,
 				replacement.clone(),
 				&records,
 				&relocations,
@@ -1512,15 +1514,21 @@ impl SlabManager {
 		)
 		.await?;
 		self.apply_maintenance_manifest_publication(slab_id, None)?;
-		{
-			let state = self.state.lock().await;
-			if state.sealed.remove(&slab_id).is_some() {
-				self.release_slab_file(slab_id);
+		// ADR 0697 §4: the run is logically retired either way. In a ring the file
+		// is terminal only through GC's claim, like a replaced input's, so readers
+		// keep their backing and its bytes are reclaimed when that sweep runs.
+		let release_locally = !self.control_node_bound();
+		if release_locally {
+			{
+				let state = self.state.lock().await;
+				if state.sealed.remove(&slab_id).is_some() {
+					self.release_slab_file(slab_id);
+				}
 			}
+			// The old slab is disposed: its redirects go with it.
+			self.redirects.remove_touching(&self.tier_budget, slab_id);
+			self.record_disposal_evidence(slab_id).await;
 		}
-		// The old slab is disposed: its redirects go with it.
-		self.redirects.remove_touching(&self.tier_budget, slab_id);
-		self.record_disposal_evidence(slab_id).await;
 		for record in records {
 			self.rollback_indexed_location(
 				record.tenant_id,
@@ -1533,20 +1541,23 @@ impl SlabManager {
 		// `reconcile_secondary_index_segments_after_compaction` returned proof. The
 		// scan-based `can_retire_local_slab` guard remains on the sweep paths, where
 		// no reconciliation proof exists.
-		self.unlink_released_slab_file(slab_id).await?;
+		if release_locally {
+			self.unlink_released_slab_file(slab_id).await?;
+		}
 		Ok(())
 	}
 
 	pub(super) async fn finish_compaction_with_replacement(
 		&self,
 		old_slab_id: SlabId,
-		new_slab_id: SlabId,
+		replacement_exposed: &ExposedSlab,
 		replacement: Arc<LocalSlabStore>,
 		records: &[CompactionRecord],
 		relocations: &[RelocatedRecord],
 		counter_relocations: &[RelocatedCounterFrame],
 		staged_path: &Path,
 	) -> std::io::Result<bool> {
+		let new_slab_id = replacement_exposed.id();
 		let publication_gate = self
 			.maintenance_publication_gate
 			.clone()
@@ -1789,6 +1800,14 @@ impl SlabManager {
 				delete_records: removed_rows,
 				put_records: inserted_rows,
 				put_lsm_runs: lsm_runs,
+				// Its capability is held by the caller; this publication makes it live.
+				// Mandatory: a missing, stale or abandoned row refuses this whole
+				// transaction, and nothing here has moved yet.
+				promote_reservations: replacement_exposed
+					.has_reservation_row()
+					.then_some(new_slab_id)
+					.into_iter()
+					.collect(),
 				..Default::default()
 			},
 			&index_publication,
@@ -1799,7 +1818,7 @@ impl SlabManager {
 		// Only a durable publication is ever allowed to occupy the normal
 		// discovery namespace.
 		let expected_staged_path =
-			maintenance_staged_slab_path(&self.config.dir, old_slab_id, new_slab_id);
+			maintenance_staged_path_of(&self.config.dir, old_slab_id, new_slab_id);
 		if staged_path != expected_staged_path
 			|| self.file_ops.file_len(staged_path).await?.is_none()
 		{

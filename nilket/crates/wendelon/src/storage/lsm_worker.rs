@@ -21,11 +21,51 @@ pub struct LsmCompactionWorker {
 	slab_pins: Arc<SlabPinTable>,
 }
 
+/// A pure plan over ids it was handed. It is not proposable: only
+/// [`LsmPreparedOutputs::bind`] makes it so, and that takes each id's capability.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LsmPlannedOutputs {
+	pub decisions: Vec<SurvivorOrDrop>,
+	pub output_runs: Vec<PlannedOutputRun>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LsmPreparedOutputs {
 	pub decisions: Vec<SurvivorOrDrop>,
 	pub output_runs: Vec<PlannedOutputRun>,
 	pub(crate) input_authority: Option<Vec<crate::storage::index::LsmInputAuthority>>,
+	/// Each output's exposure, held until its publication or its job's end.
+	pub(crate) reservations: Arc<Vec<crate::storage::ExposedSlab>>,
+}
+
+impl LsmPreparedOutputs {
+	/// The one way to a proposable plan (ADR 0697 §4 T2): every output id must be
+	/// exactly one of the exposed capabilities, so skipping exposure does not compile.
+	pub(crate) fn bind(
+		planned: LsmPlannedOutputs,
+		reservations: Vec<crate::storage::ExposedSlab>,
+	) -> std::io::Result<Self> {
+		let exposed = reservations
+			.iter()
+			.map(|slab| slab.id())
+			.collect::<std::collections::BTreeSet<_>>();
+		let named = planned
+			.output_runs
+			.iter()
+			.map(|run| run.slab_id)
+			.collect::<std::collections::BTreeSet<_>>();
+		if exposed != named {
+			return Err(std::io::Error::other(format!(
+				"a plan names outputs {named:?} with capabilities for {exposed:?}"
+			)));
+		}
+		Ok(Self {
+			decisions: planned.decisions,
+			output_runs: planned.output_runs,
+			input_authority: None,
+			reservations: Arc::new(reservations),
+		})
+	}
 }
 
 #[async_trait]
@@ -189,7 +229,7 @@ impl LsmCompactionWorker {
 		plan: &CompactionPlan,
 		records: impl IntoIterator<Item = VersionEntry>,
 		output_slab_ids: impl IntoIterator<Item = SlabId>,
-	) -> Result<LsmPreparedOutputs, CompactionFailure> {
+	) -> Result<LsmPlannedOutputs, CompactionFailure> {
 		let target_size = self
 			.config
 			.output_run_target_bytes(plan.target_level)
@@ -206,10 +246,9 @@ impl LsmCompactionWorker {
 			target_size,
 			output_slab_ids,
 		)?;
-		Ok(LsmPreparedOutputs {
+		Ok(LsmPlannedOutputs {
 			decisions,
 			output_runs,
-			input_authority: None,
 		})
 	}
 
@@ -465,3 +504,7 @@ impl LsmGcWorker {
 		removed
 	}
 }
+
+#[cfg(test)]
+#[path = "lsm_worker/tests.rs"]
+mod tests;

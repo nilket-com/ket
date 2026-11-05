@@ -11,14 +11,16 @@ use crate::consensus::slab_ops::{OPS_WINDOW_W, OpKey, SlabCommand};
 use redb::ReadableTableMetadata;
 
 const OP_INTENTS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("slab_op_intents_v1");
-const OP_ACK_PENDING_TABLE: TableDefinition<u64, bool> =
+const OP_ACK_PENDING_TABLE: TableDefinition<u64, (bool, [u8; 32])> =
 	TableDefinition::new("slab_op_ack_pending_v1");
+const RESERVED_SLAB_IDS_TABLE: TableDefinition<u64, &[u8]> =
+	TableDefinition::new("reserved_slab_ids_v1");
 const REJECTED_TIER_CANDIDATES_TABLE: TableDefinition<u64, &[u8]> =
 	TableDefinition::new("rejected_tier_candidates_v1");
 const META_OP_STATE_VERSION: &str = "op_state_version_v1";
 const META_NEXT_OP_SEQ: &str = "next_op_seq_v1";
 const META_KNOWN_ACKED_THROUGH: &str = "known_acked_through_v1";
-const OP_STATE_VERSION: u64 = 1;
+const OP_STATE_VERSION: u64 = 2;
 
 /// What an intent's phase guarantees.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -30,14 +32,301 @@ pub(crate) enum OpPhase {
 	MayBeSubmitted,
 }
 
+/// The exact local file a terminal workflow disposes of: its content, its
+/// publication revision, and the inode that content was read from.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct GcFileIdentity {
+	pub length: u64,
+	pub digest: [u8; 32],
+	pub revision: u64,
+	pub dev: u64,
+	pub ino: u64,
+}
+
+/// How far a terminal workflow's local work has gone (ADR 0697 §6.1), on the
+/// operation that continues it. The order is the T1 order: nothing here precedes
+/// its authority, and each step names exactly what the last one recorded.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum OpProgress {
+	/// P1/P2: recorded before the quarantine link. The original and the
+	/// quarantine entry on disk say which of the two it reached.
+	QuarantineRecorded(GcFileIdentity),
+	/// P3: the run is gone, durably, in the transaction that wrote this. `None`
+	/// only for a store outside a ring whose file an earlier local release took.
+	RunDropped(Option<GcFileIdentity>),
+	/// P3c: Complete applied, and purging this entry is authorized. It says
+	/// nothing about whether the unlink has happened.
+	PurgeAuthorized(GcFileIdentity),
+	/// P4: the unlink and its directory sync finished.
+	Purged(GcFileIdentity),
+	/// On a mark: decided rejected and undone. Its reserved removal must be
+	/// Cancelled before the two operations hand off together.
+	ClaimRejected {
+		reason: crate::consensus::slab_ops::SlabRejection,
+		pre_run: LsmRunSummary,
+		/// Whether the pin table already said delete-pending before the mark.
+		pre_delete_pending: bool,
+		removal: OpKey,
+	},
+}
+
+impl OpProgress {
+	/// Whether this may directly follow `previous` on one operation's row.
+	fn follows(&self, previous: Option<&OpProgress>) -> bool {
+		match (previous, self) {
+			(None, Self::QuarantineRecorded(_) | Self::ClaimRejected { .. }) => true,
+			(None, Self::RunDropped(None)) => true,
+			(Some(Self::QuarantineRecorded(recorded)), Self::RunDropped(Some(file))) => {
+				recorded == file
+			}
+			(Some(Self::RunDropped(Some(dropped))), Self::PurgeAuthorized(file)) => dropped == file,
+			(Some(Self::PurgeAuthorized(authorized)), Self::Purged(file)) => authorized == file,
+			_ => false,
+		}
+	}
+}
+
+/// One step of an operation's local progress, written in the caller's transaction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct OpProgressUpdate {
+	pub key: OpKey,
+	pub digest: [u8; 32],
+	pub progress: OpProgress,
+}
+
+/// What this store durably knows about one sequence, asked about one digest.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum OpEvidence {
+	/// This exact operation is undecided, or decided with local work outstanding.
+	Intent(Option<OpProgress>),
+	/// This exact operation's local work is finished; its row says so.
+	Finished,
+	/// At or below the acknowledged prefix. No row remains, so nothing here says
+	/// which operation it was: a callback naming it is an obsolete duplicate to
+	/// ignore, and this is never positive evidence of any local effect.
+	BelowPrefix,
+	/// The sequence holds a different operation, or none.
+	Unknown,
+}
+
+/// A mark decided rejected, whose reserved removal still has to be Cancelled.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RejectedClaim {
+	pub mark: OpTicket,
+	pub removal: LoadedOp,
+	pub pre_run: LsmRunSummary,
+}
+
+/// Delete exactly the linked LSM intent whose local work has finished, in the
+/// caller's transaction. It must be the one this workflow wrote.
+pub(crate) fn complete_linked_lsm_intent(
+	tx: &redb::WriteTransaction,
+	intent: &LsmInstallIntent,
+) -> std::io::Result<()> {
+	let bytes = serde_json::to_vec(intent).map_err(Error::other)?;
+	let job = intent.commit.job_id.get();
+	let mut table = tx
+		.open_table(LSM_INSTALL_INTENTS_TABLE)
+		.map_err(redb_to_io)?;
+	let matches = table
+		.get(&job)
+		.map_err(redb_to_io)?
+		.is_some_and(|existing| existing.value() == bytes.as_slice());
+	if !matches {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"LSM intent changed or disappeared",
+		));
+	}
+	table.remove(&job).map_err(redb_to_io)?;
+	Ok(())
+}
+
+pub(crate) fn apply_op_progress(
+	tx: &redb::WriteTransaction,
+	update: &OpProgressUpdate,
+) -> std::io::Result<()> {
+	let mut intents = tx.open_table(OP_INTENTS_TABLE).map_err(redb_to_io)?;
+	let op_seq = update.key.op_seq;
+	let mut intent = match intents.get(&op_seq).map_err(redb_to_io)? {
+		Some(bytes) => decode_intent(op_seq, bytes.value())?,
+		None => {
+			return Err(op_state_invalid(format!(
+				"op {op_seq} has no intent to record its progress"
+			)));
+		}
+	};
+	if intent.digest != update.digest || intent.command.owner() != update.key.owner {
+		return Err(op_state_invalid(format!(
+			"op {op_seq} is not the operation whose progress this is"
+		)));
+	}
+	if !update.progress.follows(intent.progress.as_ref()) {
+		return Err(op_state_invalid(format!(
+			"op {op_seq} cannot move from {:?} to {:?}",
+			intent.progress, update.progress
+		)));
+	}
+	intent.progress = Some(update.progress.clone());
+	let bytes = encode_intent(&intent)?;
+	intents
+		.insert(&op_seq, bytes.as_slice())
+		.map_err(redb_to_io)?;
+	Ok(())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct OpIntent {
 	pub digest: [u8; 32],
 	pub command: SlabCommand,
 	pub phase: OpPhase,
+	/// How far this operation's own workflow has gone locally.
+	pub progress: Option<OpProgress>,
 	/// The exact local input authority an earlier op of this workflow left for
 	/// this one, which it must still find.
 	pub expected_inputs: Option<Vec<LsmInputAuthority>>,
+}
+
+/// A file an abandoned reservation still has to dispose of, by its exact identity.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct AbandonedOutput {
+	/// Absent when the job never left a file at this id's path: nothing to dispose
+	/// of, though the id's terminal transition is still owed.
+	pub file: Option<GcFileIdentity>,
+	/// Whether the file was moved out of the discovery namespace, to its abandoned
+	/// name. Only a durable publication may occupy a slab path across a reopen.
+	pub relocated: bool,
+}
+
+/// One reservation's lifecycle (ADR 0697 §4 T2). `Unsubmitted` is the only positive
+/// evidence that an id was never exposed.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum ReservedIdState {
+	Unsubmitted,
+	Exposed {
+		abandoned: Option<AbandonedOutput>,
+	},
+	/// The charge became these two allocated operations.
+	Cleaning {
+		job_id: crate::schema::CompactionJobId,
+		claim: OpKey,
+		complete: OpKey,
+		output: AbandonedOutput,
+	},
+	/// The charge became this one allocated operation. Never revived.
+	Burning {
+		op: OpKey,
+	},
+}
+
+impl ReservedIdState {
+	/// Whether this row still holds window capacity for its terminal transition.
+	fn charged(&self) -> bool {
+		matches!(self, Self::Unsubmitted | Self::Exposed { .. })
+	}
+}
+
+/// Each charged reservation holds this many sequences: the worst case it can need,
+/// a claim and its Complete (ADR 0697 §4 T3).
+pub(crate) const RESERVATION_CHARGE: u64 = 2;
+
+/// The largest output count a single job can be admitted with: its charges, and
+/// its own install operation.
+pub(crate) const MAX_RESERVED_OUTPUTS_PER_JOB: u64 = (OPS_WINDOW_W - 1) / RESERVATION_CHARGE;
+
+/// `S + k + 2C <= W`. Checked throughout, including the sequences a charge promises.
+fn admits(next: u64, known: u64, requested: u64, charged: u64) -> bool {
+	(next - 1)
+		.checked_sub(known)
+		.and_then(|span| span.checked_add(requested))
+		.zip(charged.checked_mul(RESERVATION_CHARGE))
+		.and_then(|(span, promised)| span.checked_add(promised))
+		.is_some_and(|total| total <= OPS_WINDOW_W)
+		&& (next - 1)
+			.checked_add(requested)
+			.and_then(|last| last.checked_add(charged.checked_mul(RESERVATION_CHARGE)?))
+			.is_some()
+}
+
+fn decode_reserved(bytes: &[u8]) -> std::io::Result<ReservedIdState> {
+	postcard::from_bytes(bytes)
+		.map_err(|error| op_state_invalid(format!("reserved id row does not decode: {error}")))
+}
+
+fn charged_reservations(table: &impl ReadableTable<u64, &'static [u8]>) -> std::io::Result<u64> {
+	let mut charged = 0;
+	for row in table.iter().map_err(redb_to_io)? {
+		let (_, bytes) = row.map_err(redb_to_io)?;
+		if decode_reserved(bytes.value())?.charged() {
+			charged += 1;
+		}
+	}
+	Ok(charged)
+}
+
+fn read_reserved(
+	table: &impl ReadableTable<u64, &'static [u8]>,
+	id: SlabId,
+) -> std::io::Result<Option<ReservedIdState>> {
+	table
+		.get(&id.get())
+		.map_err(redb_to_io)?
+		.map(|bytes| decode_reserved(bytes.value()))
+		.transpose()
+}
+
+fn write_reserved(
+	table: &mut redb::Table<u64, &'static [u8]>,
+	id: SlabId,
+	state: &ReservedIdState,
+) -> std::io::Result<()> {
+	let bytes = postcard::to_stdvec(state).map_err(Error::other)?;
+	table
+		.insert(&id.get(), bytes.as_slice())
+		.map_err(redb_to_io)?;
+	Ok(())
+}
+
+/// A reservation transition that does not apply to the row found. Typed: a burned,
+/// burning, absent or already exposed id is refused, never revived.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ReservationRefused {
+	pub id: SlabId,
+	pub found: Option<ReservedIdState>,
+}
+
+impl std::fmt::Display for ReservationRefused {
+	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(
+			formatter,
+			"reserved id {} cannot make this transition from {:?}",
+			self.id, self.found
+		)
+	}
+}
+
+impl std::error::Error for ReservationRefused {}
+
+fn refused(id: SlabId, found: Option<ReservedIdState>) -> Error {
+	Error::new(ErrorKind::WouldBlock, ReservationRefused { id, found })
+}
+
+/// Promote reservations in the caller's publication transaction: each id is now a
+/// live slab, proven by the records and manifest row written with it, and its
+/// charge is released. Only an exposed id can have been published.
+pub(crate) fn promote_reservations(
+	tx: &redb::WriteTransaction,
+	ids: &[SlabId],
+) -> std::io::Result<()> {
+	let mut rows = tx.open_table(RESERVED_SLAB_IDS_TABLE).map_err(redb_to_io)?;
+	for id in ids {
+		let state = read_reserved(&rows, *id)?;
+		if !matches!(state, Some(ReservedIdState::Exposed { abandoned: None })) {
+			return Err(refused(*id, state));
+		}
+		rows.remove(&id.get()).map_err(redb_to_io)?;
+	}
+	Ok(())
 }
 
 /// A rejected tier candidate's identity, kept after its operation's Intent is
@@ -59,6 +348,7 @@ pub struct OpTicket {
 	key: OpKey,
 	digest: [u8; 32],
 	command: SlabCommand,
+	progress: Option<OpProgress>,
 	expected_inputs: Option<Vec<LsmInputAuthority>>,
 }
 
@@ -82,6 +372,7 @@ pub(crate) struct ReservedOp {
 	key: OpKey,
 	digest: [u8; 32],
 	command: SlabCommand,
+	progress: Option<OpProgress>,
 	expected_inputs: Option<Vec<LsmInputAuthority>>,
 }
 
@@ -90,8 +381,16 @@ impl ReservedOp {
 		self.key
 	}
 
+	pub(crate) fn digest(&self) -> [u8; 32] {
+		self.digest
+	}
+
 	pub(crate) fn command(&self) -> &SlabCommand {
 		&self.command
+	}
+
+	pub(crate) fn progress(&self) -> Option<&OpProgress> {
+		self.progress.as_ref()
 	}
 }
 
@@ -112,6 +411,14 @@ pub(crate) enum LoadedOp {
 }
 
 impl LoadedOp {
+	/// How far this operation's own workflow has gone locally.
+	pub(crate) fn progress(&self) -> Option<&OpProgress> {
+		match self {
+			Self::Submittable(ticket) => ticket.progress.as_ref(),
+			Self::Reserved(reserved) => reserved.progress.as_ref(),
+		}
+	}
+
 	/// The input authority this operation's workflow left for it.
 	pub(crate) fn reserved_inputs(&self) -> Option<&[LsmInputAuthority]> {
 		match self {
@@ -218,15 +525,53 @@ fn loaded_op(op_seq: u64, intent: OpIntent) -> LoadedOp {
 			key,
 			digest: intent.digest,
 			command: intent.command,
+			progress: intent.progress,
 			expected_inputs: intent.expected_inputs,
 		}),
 		OpPhase::Reserved => LoadedOp::Reserved(ReservedOp {
 			key,
 			digest: intent.digest,
 			command: intent.command,
+			progress: intent.progress,
 			expected_inputs: intent.expected_inputs,
 		}),
 	}
+}
+
+/// Allocate sequences a row's charge already promised: no admission check, since
+/// the charge is in the sum. Sequence exhaustion still refuses.
+fn allocate_charged(
+	tx: &redb::WriteTransaction,
+	commands: Vec<SlabCommand>,
+) -> std::io::Result<Vec<(u64, OpIntent)>> {
+	let mut meta = tx.open_table(META_TABLE).map_err(redb_to_io)?;
+	let (next, _) = read_counters(&meta)?;
+	let after = next
+		.checked_add(commands.len() as u64)
+		.ok_or_else(|| op_state_invalid("operation sequences exhausted"))?;
+	let mut intents = tx.open_table(OP_INTENTS_TABLE).map_err(redb_to_io)?;
+	let mut allocated = Vec::with_capacity(commands.len());
+	for (offset, command) in commands.into_iter().enumerate() {
+		let op_seq = next + offset as u64;
+		let intent = OpIntent {
+			digest: command.digest(),
+			phase: if offset == 0 {
+				OpPhase::MayBeSubmitted
+			} else {
+				OpPhase::Reserved
+			},
+			command,
+			progress: None,
+			expected_inputs: None,
+		};
+		let bytes = encode_intent(&intent)?;
+		intents
+			.insert(&op_seq, bytes.as_slice())
+			.map_err(redb_to_io)?;
+		allocated.push((op_seq, intent));
+	}
+	meta.insert(META_NEXT_OP_SEQ, &after).map_err(redb_to_io)?;
+	Ok(allocated)
 }
 
 /// Write the initial operation state of a store being created.
@@ -238,6 +583,7 @@ pub(super) fn initialize_op_state(tx: &redb::WriteTransaction) -> std::io::Resul
 	meta.insert(META_KNOWN_ACKED_THROUGH, &0)
 		.map_err(redb_to_io)?;
 	drop(meta);
+	tx.open_table(RESERVED_SLAB_IDS_TABLE).map_err(redb_to_io)?;
 	tx.open_table(OP_INTENTS_TABLE).map_err(redb_to_io)?;
 	tx.open_table(OP_ACK_PENDING_TABLE).map_err(redb_to_io)?;
 	tx.open_table(REJECTED_TIER_CANDIDATES_TABLE)
@@ -293,7 +639,21 @@ pub(super) fn validate_op_state(tx: &redb::WriteTransaction) -> std::io::Result<
 		let ack = pending.get(&seq).map_err(redb_to_io)?;
 		match (&intent, &ack) {
 			(Some(bytes), None) => {
-				decode_intent(seq, bytes.value())?;
+				let intent = decode_intent(seq, bytes.value())?;
+				let consistent = match (&intent.command, &intent.progress) {
+					(_, None) => true,
+					(SlabCommand::Compaction(_), Some(OpProgress::ClaimRejected { .. })) => true,
+					(SlabCommand::Compaction(_), Some(_)) => false,
+					(SlabCommand::GcRemove(_), Some(OpProgress::ClaimRejected { .. })) => false,
+					(SlabCommand::GcRemove(_) | SlabCommand::Complete(_), Some(_)) => true,
+					(_, Some(_)) => false,
+				};
+				if !consistent {
+					return Err(op_state_invalid(format!(
+						"op {seq} cannot have reached {:?}",
+						intent.progress
+					)));
+				}
 			}
 			(None, Some(_)) => {}
 			(None, None) => return Err(op_state_invalid(format!("seq {seq} has no row"))),
@@ -306,6 +666,36 @@ pub(super) fn validate_op_state(tx: &redb::WriteTransaction) -> std::io::Result<
 			"{rows} rows for an allocated span of {span}"
 		)));
 	}
+	let reserved = tx.open_table(RESERVED_SLAB_IDS_TABLE).map_err(redb_to_io)?;
+	let charged = charged_reservations(&reserved)?;
+	if !admits(next, known, 0, charged) {
+		return Err(op_state_invalid(format!(
+			"{charged} charged reservations do not fit a span of {span} in the window"
+		)));
+	}
+	for row in reserved.iter().map_err(redb_to_io)? {
+		let (id, bytes) = row.map_err(redb_to_io)?;
+		let (id, state) = (id.value(), decode_reserved(bytes.value())?);
+		// A row that spent its charge is bounded by the operation it links to.
+		let linked: Vec<OpKey> = match &state {
+			ReservedIdState::Burning { op } => vec![*op],
+			ReservedIdState::Cleaning {
+				claim, complete, ..
+			} => vec![*claim, *complete],
+			_ => Vec::new(),
+		};
+		for key in linked {
+			if key.op_seq <= known
+				|| (intents.get(&key.op_seq).map_err(redb_to_io)?.is_none()
+					&& pending.get(&key.op_seq).map_err(redb_to_io)?.is_none())
+			{
+				return Err(op_state_invalid(format!(
+					"reserved id {id} links op {} with no row",
+					key.op_seq
+				)));
+			}
+		}
+	}
 	Ok(())
 }
 
@@ -313,7 +703,7 @@ fn oldest_holder(
 	known: u64,
 	next: u64,
 	intents: &impl ReadableTable<u64, &'static [u8]>,
-	pending: &impl ReadableTable<u64, bool>,
+	pending: &impl ReadableTable<u64, (bool, [u8; 32])>,
 ) -> std::io::Result<Option<OpHolder>> {
 	let op_seq = known + 1;
 	if op_seq >= next {
@@ -330,6 +720,9 @@ fn oldest_holder(
 			SlabCommand::Retire(_) => "retire",
 			SlabCommand::Compaction(_) => "compaction",
 			SlabCommand::GcRemove(_) => "gc_remove",
+			SlabCommand::Claim(_) => "claim",
+			SlabCommand::Complete(_) => "complete",
+			SlabCommand::BurnReserved(_) => "burn",
 		};
 		return Ok(Some(OpHolder {
 			op_seq,
@@ -339,7 +732,7 @@ fn oldest_holder(
 	}
 	let state = match pending.get(&op_seq).map_err(redb_to_io)? {
 		Some(acked) => OpHolderState::AwaitingAck {
-			acked: acked.value(),
+			acked: acked.value().0,
 		},
 		None => OpHolderState::Missing,
 	};
@@ -379,6 +772,15 @@ fn commit_op_txn(
 /// What else a handoff makes durable, in its one transaction.
 enum HandoffEvidence {
 	None,
+	/// A rejected install's outputs leave the intent and become their reservations'
+	/// own abandoned evidence, for every output, in this one transaction.
+	AbandonOutputs(Vec<(SlabId, AbandonedOutput)>),
+	/// A run-less T1 finished: this row goes with its Complete.
+	CleanupFinished(SlabId),
+	/// A burn was applied: this row goes with its operation.
+	BurnFinished(SlabId),
+	/// A removal's local work is finished: the row must say so.
+	RemovalFinished,
 	Removal(OpKey, Vec<LsmInputAuthority>),
 	RejectedTier(RejectedTierCandidate),
 }
@@ -390,8 +792,578 @@ impl PersistentLocalIndex {
 	}
 
 	#[cfg(test)]
-	fn take_op_txn_cut(&self) -> Option<OpTxnCut> {
+	pub(super) fn take_op_txn_cut(&self) -> Option<OpTxnCut> {
+		let mut skip = self.op_txn_cut_skip.lock().unwrap();
+		if let Some((left, cut)) = skip.as_mut() {
+			if *left == 0 {
+				let cut = *cut;
+				*skip = None;
+				return Some(cut);
+			}
+			*left -= 1;
+			return None;
+		}
+		drop(skip);
 		self.op_txn_cut.lock().unwrap().take()
+	}
+
+	/// The next sequence this store would allocate.
+	#[cfg(test)]
+	pub(crate) async fn next_op_seq_for_test(&self) -> std::io::Result<u64> {
+		self.db
+			.run(|db| {
+				let tx = db.begin_read().map_err(redb_to_io)?;
+				let meta = tx.open_table(META_TABLE).map_err(redb_to_io)?;
+				Ok(meta
+					.get(META_NEXT_OP_SEQ)
+					.map_err(redb_to_io)?
+					.map_or(1, |value| value.value()))
+			})
+			.await
+	}
+
+	/// Record one step of an operation's local progress. The transaction owns
+	/// `authority` until it ends, whatever happens to its caller.
+	pub(crate) async fn advance_op_progress(
+		&self,
+		update: OpProgressUpdate,
+		authority: Option<Box<dyn std::any::Any + Send>>,
+	) -> std::io::Result<()> {
+		#[cfg(test)]
+		let cut = self.take_op_txn_cut();
+		let _write = self.write_lock.lock().await;
+		self.db
+			.run(move |db| {
+				let _authority = authority;
+				let tx = db.begin_write().map_err(redb_to_io)?;
+				apply_op_progress(&tx, &update)?;
+				commit_op_txn(
+					tx,
+					#[cfg(test)]
+					cut,
+				)
+			})
+			.await
+	}
+
+	/// Cut the run-drop transaction: the progress step after the next one.
+	#[cfg(test)]
+	pub(crate) fn cut_next_progress_txn_after_one(&self, cut: OpTxnCut) {
+		*self.op_txn_cut_skip.lock().unwrap() = Some((1, cut));
+	}
+
+	/// Cut the step after the run drop: the reserved removal's transition.
+	#[cfg(test)]
+	pub(crate) fn cut_next_progress_txn_after_two(&self, cut: OpTxnCut) {
+		*self.op_txn_cut_skip.lock().unwrap() = Some((2, cut));
+	}
+
+	/// Write `ids`' `Unsubmitted` rows and their charge, before any caller holds an
+	/// id. When they extend the durable bound, `high_water` rises in this same
+	/// transaction. `Err` exposes nothing; an ambiguous commit is reconciled from
+	/// the durable row, whose id no caller ever received.
+	pub(crate) async fn reserve_slab_ids(
+		&self,
+		ids: Vec<SlabId>,
+		high_water: Option<u64>,
+	) -> std::io::Result<()> {
+		#[cfg(test)]
+		let cut = self.take_op_txn_cut();
+		let _write = self.write_lock.lock().await;
+		#[cfg(test)]
+		let hold = self.op_handoff_hold.lock().unwrap().take();
+		self.db
+			.run(move |db| {
+				#[cfg(test)]
+				if let Some((entered, release)) = hold {
+					let _ = entered.send(());
+					let _ = release.recv();
+				}
+				let tx = db.begin_write().map_err(redb_to_io)?;
+				{
+					let mut meta = tx.open_table(META_TABLE).map_err(redb_to_io)?;
+					let (next, known) = read_counters(&meta)?;
+					let mut rows = tx.open_table(RESERVED_SLAB_IDS_TABLE).map_err(redb_to_io)?;
+					let charged = charged_reservations(&rows)? + ids.len() as u64;
+					if !admits(next, known, 0, charged) {
+						let intents = tx.open_table(OP_INTENTS_TABLE).map_err(redb_to_io)?;
+						let pending = tx.open_table(OP_ACK_PENDING_TABLE).map_err(redb_to_io)?;
+						let holder = oldest_holder(known, next, &intents, &pending)?;
+						return Err(Error::new(
+							ErrorKind::WouldBlock,
+							TerminalBacklog {
+								next_op_seq: next,
+								known_acked_through: known,
+								requested: ids.len() as u64 * RESERVATION_CHARGE,
+								holder,
+							},
+						));
+					}
+					for id in &ids {
+						if let Some(found) = read_reserved(&rows, *id)? {
+							return Err(refused(*id, Some(found)));
+						}
+						write_reserved(&mut rows, *id, &ReservedIdState::Unsubmitted)?;
+					}
+					if let Some(bound) = high_water {
+						let current = meta
+							.get(META_SLAB_ID_HIGH_WATER)
+							.map_err(redb_to_io)?
+							.map(|value| value.value())
+							.ok_or_else(store_identity_missing)?;
+						if bound < current {
+							return Err(Error::new(
+								ErrorKind::InvalidInput,
+								format!("slab id high-water only rises: {bound} < {current}"),
+							));
+						}
+						meta.insert(META_SLAB_ID_HIGH_WATER, &bound)
+							.map_err(redb_to_io)?;
+					}
+				}
+				commit_op_txn(
+					tx,
+					#[cfg(test)]
+					cut,
+				)
+			})
+			.await
+	}
+
+	/// Move one row by its durable state, never a cached read.
+	async fn transition_reserved_id(
+		&self,
+		id: SlabId,
+		authority: Option<Box<dyn std::any::Any + Send>>,
+		apply: impl FnOnce(
+			Option<ReservedIdState>,
+		) -> Result<ReservedIdState, Box<Option<ReservedIdState>>>
+		+ Send
+		+ 'static,
+	) -> std::io::Result<()> {
+		#[cfg(test)]
+		let cut = self.take_op_txn_cut();
+		let _write = self.write_lock.lock().await;
+		#[cfg(test)]
+		let hold = self.op_handoff_hold.lock().unwrap().take();
+		self.db
+			.run(move |db| {
+				let _authority = authority;
+				#[cfg(test)]
+				if let Some((entered, release)) = hold {
+					let _ = entered.send(());
+					let _ = release.recv();
+				}
+				let tx = db.begin_write().map_err(redb_to_io)?;
+				{
+					let mut rows = tx.open_table(RESERVED_SLAB_IDS_TABLE).map_err(redb_to_io)?;
+					let next =
+						apply(read_reserved(&rows, id)?).map_err(|found| refused(id, *found))?;
+					write_reserved(&mut rows, id, &next)?;
+				}
+				commit_op_txn(
+					tx,
+					#[cfg(test)]
+					cut,
+				)
+			})
+			.await
+	}
+
+	/// The only writer of `Exposed`: only from a present `Unsubmitted` row.
+	pub(crate) async fn expose_reserved_id(&self, id: SlabId) -> std::io::Result<()> {
+		self.transition_reserved_id(id, None, |found| match found {
+			Some(ReservedIdState::Unsubmitted) => Ok(ReservedIdState::Exposed { abandoned: None }),
+			other => Err(Box::new(other)),
+		})
+		.await
+	}
+
+	/// Record that an exposed id's job is gone, with what it left. The transaction
+	/// owns `authority` until it ends, whatever happens to its caller.
+	pub(crate) async fn abandon_exposed_id(
+		&self,
+		id: SlabId,
+		output: AbandonedOutput,
+		authority: Option<Box<dyn std::any::Any + Send>>,
+	) -> std::io::Result<()> {
+		self.transition_reserved_id(id, authority, move |found| match found {
+			Some(ReservedIdState::Exposed { abandoned: None }) => Ok(ReservedIdState::Exposed {
+				abandoned: Some(output),
+			}),
+			other => Err(Box::new(other)),
+		})
+		.await
+	}
+
+	/// A reservation's durable state.
+	pub(crate) async fn reserved_id_state(
+		&self,
+		id: SlabId,
+	) -> std::io::Result<Option<ReservedIdState>> {
+		self.db
+			.run(move |db| {
+				let tx = db.begin_read().map_err(redb_to_io)?;
+				read_reserved(
+					&tx.open_table(RESERVED_SLAB_IDS_TABLE).map_err(redb_to_io)?,
+					id,
+				)
+			})
+			.await
+	}
+
+	/// Every reservation row.
+	pub(crate) async fn load_reserved_ids(
+		&self,
+	) -> std::io::Result<Vec<(SlabId, ReservedIdState)>> {
+		self.db
+			.run(|db| {
+				let tx = db.begin_read().map_err(redb_to_io)?;
+				let rows = tx.open_table(RESERVED_SLAB_IDS_TABLE).map_err(redb_to_io)?;
+				let mut loaded = Vec::new();
+				for row in rows.iter().map_err(redb_to_io)? {
+					let (id, bytes) = row.map_err(redb_to_io)?;
+					loaded.push((SlabId::new(id.value()), decode_reserved(bytes.value())?));
+				}
+				Ok(loaded)
+			})
+			.await
+	}
+
+	/// `Unsubmitted` to `Burning` and the burn's own operation, in one transaction,
+	/// so `Burning` cannot exist without its operation. Spends this row's charge, so
+	/// capacity cannot refuse it.
+	pub(crate) async fn begin_burn(
+		&self,
+		id: SlabId,
+		owner: crate::consensus::OwnerRef,
+	) -> std::io::Result<OpTicket> {
+		let command = SlabCommand::BurnReserved(crate::consensus::slab_ops::BurnOp {
+			slab: owner.slab(id),
+		});
+		#[cfg(test)]
+		let cut = self.take_op_txn_cut();
+		let _write = self.write_lock.lock().await;
+		self.db
+			.run(move |db| {
+				let tx = db.begin_write().map_err(redb_to_io)?;
+				let ticket;
+				{
+					let mut rows = tx.open_table(RESERVED_SLAB_IDS_TABLE).map_err(redb_to_io)?;
+					let found = read_reserved(&rows, id)?;
+					if found != Some(ReservedIdState::Unsubmitted) {
+						return Err(refused(id, found));
+					}
+					let mut allocated = allocate_charged(&tx, vec![command])?;
+					let (seq, intent) = allocated.remove(0);
+					let key = OpKey {
+						owner: intent.command.owner(),
+						op_seq: seq,
+					};
+					write_reserved(&mut rows, id, &ReservedIdState::Burning { op: key })?;
+					let LoadedOp::Submittable(loaded) = loaded_op(seq, intent) else {
+						return Err(op_state_invalid("a burn is submittable at once"));
+					};
+					ticket = loaded;
+				}
+				commit_op_txn(
+					tx,
+					#[cfg(test)]
+					cut,
+				)?;
+				Ok(ticket)
+			})
+			.await
+	}
+
+	/// An abandoned id's charge becomes its claim and Complete, explicitly, in one
+	/// transaction. A retry finds `Cleaning` and is refused, so it cannot spend the
+	/// charge twice.
+	pub(crate) async fn begin_cleanup(
+		&self,
+		id: SlabId,
+		owner: crate::consensus::OwnerRef,
+		job_id: crate::schema::CompactionJobId,
+	) -> std::io::Result<(OpTicket, ReservedOp)> {
+		use crate::consensus::slab_ops::{ClaimOp, CompleteOp};
+		let slab = owner.slab(id);
+		let commands = vec![
+			SlabCommand::Claim(ClaimOp { slab, job_id }),
+			SlabCommand::Complete(CompleteOp { slab, job_id }),
+		];
+		#[cfg(test)]
+		let cut = self.take_op_txn_cut();
+		let _write = self.write_lock.lock().await;
+		self.db
+			.run(move |db| {
+				let tx = db.begin_write().map_err(redb_to_io)?;
+				let pair;
+				{
+					let mut rows = tx.open_table(RESERVED_SLAB_IDS_TABLE).map_err(redb_to_io)?;
+					let found = read_reserved(&rows, id)?;
+					let Some(ReservedIdState::Exposed {
+						abandoned: Some(output),
+					}) = found
+					else {
+						return Err(refused(id, found));
+					};
+					let mut allocated = allocate_charged(&tx, commands)?;
+					let (complete_seq, complete) = allocated.remove(1);
+					let (claim_seq, claim) = allocated.remove(0);
+					let keys = (
+						OpKey {
+							owner: claim.command.owner(),
+							op_seq: claim_seq,
+						},
+						OpKey {
+							owner: complete.command.owner(),
+							op_seq: complete_seq,
+						},
+					);
+					write_reserved(
+						&mut rows,
+						id,
+						&ReservedIdState::Cleaning {
+							job_id,
+							claim: keys.0,
+							complete: keys.1,
+							output,
+						},
+					)?;
+					let (LoadedOp::Submittable(claim), LoadedOp::Reserved(complete)) = (
+						loaded_op(claim_seq, claim),
+						loaded_op(complete_seq, complete),
+					) else {
+						return Err(op_state_invalid("a cleanup's phases are fixed"));
+					};
+					pair = (claim, complete);
+				}
+				commit_op_txn(
+					tx,
+					#[cfg(test)]
+					cut,
+				)?;
+				Ok(pair)
+			})
+			.await
+	}
+
+	/// A rejected install hands off with every output's identity moving to its
+	/// reservation, so nothing is pruned before its cleanup evidence exists.
+	pub(crate) async fn hand_off_rejected_install(
+		&self,
+		ticket: &OpTicket,
+		intent: LsmInstallIntent,
+		outputs: Vec<(SlabId, AbandonedOutput)>,
+	) -> std::io::Result<()> {
+		self.hand_off_op_with(
+			ticket.key(),
+			ticket.digest(),
+			Some(intent),
+			HandoffEvidence::AbandonOutputs(outputs),
+			None,
+		)
+		.await
+	}
+
+	/// An applied burn's operation and row end together.
+	pub(crate) async fn hand_off_burn(
+		&self,
+		ticket: &OpTicket,
+		id: SlabId,
+		authority: Option<Box<dyn std::any::Any + Send>>,
+	) -> std::io::Result<()> {
+		self.hand_off_op_with(
+			ticket.key(),
+			ticket.digest(),
+			None,
+			HandoffEvidence::BurnFinished(id),
+			authority,
+		)
+		.await
+	}
+
+	/// A finished cleanup's Complete and row end together.
+	pub(crate) async fn hand_off_finished_cleanup(
+		&self,
+		ticket: &OpTicket,
+		id: SlabId,
+	) -> std::io::Result<()> {
+		self.hand_off_op_with(
+			ticket.key(),
+			ticket.digest(),
+			None,
+			HandoffEvidence::CleanupFinished(id),
+			None,
+		)
+		.await
+	}
+
+	/// What is durably known about one operation.
+	pub(crate) async fn op_evidence(
+		&self,
+		op_seq: u64,
+		digest: [u8; 32],
+	) -> std::io::Result<OpEvidence> {
+		self.db
+			.run(move |db| {
+				let tx = db.begin_read().map_err(redb_to_io)?;
+				let intents = tx.open_table(OP_INTENTS_TABLE).map_err(redb_to_io)?;
+				if let Some(bytes) = intents.get(&op_seq).map_err(redb_to_io)? {
+					let intent = decode_intent(op_seq, bytes.value())?;
+					return Ok(if intent.digest == digest {
+						OpEvidence::Intent(intent.progress)
+					} else {
+						OpEvidence::Unknown
+					});
+				}
+				let pending = tx.open_table(OP_ACK_PENDING_TABLE).map_err(redb_to_io)?;
+				if let Some(row) = pending.get(&op_seq).map_err(redb_to_io)? {
+					return Ok(if row.value().1 == digest {
+						OpEvidence::Finished
+					} else {
+						OpEvidence::Unknown
+					});
+				}
+				let meta = tx.open_table(META_TABLE).map_err(redb_to_io)?;
+				let acked = meta
+					.get(META_KNOWN_ACKED_THROUGH)
+					.map_err(redb_to_io)?
+					.map_or(0, |value| value.value());
+				Ok(if op_seq <= acked {
+					OpEvidence::BelowPrefix
+				} else {
+					OpEvidence::Unknown
+				})
+			})
+			.await
+	}
+
+	/// Every mark decided rejected, with what is needed to finish it.
+	pub(crate) async fn load_rejected_claims(&self) -> std::io::Result<Vec<RejectedClaim>> {
+		self.db
+			.run(|db| {
+				let tx = db.begin_read().map_err(redb_to_io)?;
+				let intents = tx.open_table(OP_INTENTS_TABLE).map_err(redb_to_io)?;
+				let mut claims = Vec::new();
+				for row in intents.iter().map_err(redb_to_io)? {
+					let (seq, bytes) = row.map_err(redb_to_io)?;
+					let op_seq = seq.value();
+					let intent = decode_intent(op_seq, bytes.value())?;
+					let Some(OpProgress::ClaimRejected {
+						pre_run, removal, ..
+					}) = intent.progress.clone()
+					else {
+						continue;
+					};
+					let LoadedOp::Submittable(mark) = loaded_op(op_seq, intent) else {
+						return Err(op_state_invalid(format!(
+							"rejected mark {op_seq} was never submittable"
+						)));
+					};
+					let removal_row = match intents.get(&removal.op_seq).map_err(redb_to_io)? {
+						Some(bytes) => decode_intent(removal.op_seq, bytes.value())?,
+						None => {
+							return Err(op_state_invalid(format!(
+								"rejected mark {op_seq} has lost its removal {}",
+								removal.op_seq
+							)));
+						}
+					};
+					claims.push(RejectedClaim {
+						mark,
+						removal: loaded_op(removal.op_seq, removal_row),
+						pre_run,
+					});
+				}
+				Ok(claims)
+			})
+			.await
+	}
+
+	/// Finish a rejected mark: both operations hand off and the linked intent
+	/// clears together, only after the removal's Cancel is definite.
+	pub(crate) async fn hand_off_rejected_claim(
+		&self,
+		mark: &OpTicket,
+		removal: &OpTicket,
+		linked: LsmInstallIntent,
+		authority: Option<Box<dyn std::any::Any + Send>>,
+	) -> std::io::Result<()> {
+		if !linked.ops.contains(&mark.key()) || !linked.ops.contains(&removal.key()) {
+			return Err(op_state_invalid(format!(
+				"LSM intent for job {} does not link ops {:?} and {:?}",
+				linked.commit.job_id.get(),
+				mark.key(),
+				removal.key()
+			)));
+		}
+		let (mark_key, mark_digest) = (mark.key(), mark.digest());
+		let (removal_key, removal_digest) = (removal.key(), removal.digest());
+		#[cfg(test)]
+		let cut = self.take_op_txn_cut();
+		let _write = self.write_lock.lock().await;
+		#[cfg(test)]
+		let hold = self.op_handoff_hold.lock().unwrap().take();
+		self.db
+			.run(move |db| {
+				let _authority = authority;
+				#[cfg(test)]
+				if let Some((entered, release)) = hold {
+					let _ = entered.send(());
+					let _ = release.recv();
+				}
+				let tx = db.begin_write().map_err(redb_to_io)?;
+				{
+					let mut intents = tx.open_table(OP_INTENTS_TABLE).map_err(redb_to_io)?;
+					let mut pending = tx.open_table(OP_ACK_PENDING_TABLE).map_err(redb_to_io)?;
+					for (key, digest) in [(mark_key, mark_digest), (removal_key, removal_digest)] {
+						let op_seq = key.op_seq;
+						let intent = match intents.get(&op_seq).map_err(redb_to_io)? {
+							Some(bytes) => decode_intent(op_seq, bytes.value())?,
+							None => {
+								return Err(op_state_invalid(format!(
+									"op {op_seq} has no intent to hand off"
+								)));
+							}
+						};
+						if intent.digest != digest {
+							return Err(op_state_invalid(format!(
+								"op {op_seq} is not the operation handed off"
+							)));
+						}
+						if op_seq == mark_key.op_seq
+							&& !matches!(
+								&intent.progress,
+								Some(OpProgress::ClaimRejected { removal, .. })
+									if *removal == removal_key
+							) {
+							return Err(op_state_invalid(format!(
+								"mark {op_seq} is not rejected with this removal"
+							)));
+						}
+						intents.remove(&op_seq).map_err(redb_to_io)?;
+						pending
+							.insert(&op_seq, &(false, digest))
+							.map_err(redb_to_io)?;
+					}
+				}
+				complete_linked_lsm_intent(&tx, &linked)?;
+				commit_op_txn(
+					tx,
+					#[cfg(test)]
+					cut,
+				)
+			})
+			.await
+	}
+
+	/// Pauses the next reservation's commit.
+	#[cfg(test)]
+	pub(crate) fn hold_next_reservation_commit(
+		&self,
+	) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+		self.hold_next_handoff_txn()
 	}
 
 	/// Pauses the next handoff's transaction after it starts, before its commit.
@@ -435,8 +1407,10 @@ impl PersistentLocalIndex {
 					let mut intents = tx.open_table(OP_INTENTS_TABLE).map_err(redb_to_io)?;
 					let pending = tx.open_table(OP_ACK_PENDING_TABLE).map_err(redb_to_io)?;
 					let requested = commands.len() as u64;
-					let last = (next - 1).checked_add(requested);
-					let fits = last.is_some_and(|last| last - known <= OPS_WINDOW_W);
+					let charged = charged_reservations(
+						&tx.open_table(RESERVED_SLAB_IDS_TABLE).map_err(redb_to_io)?,
+					)?;
+					let fits = admits(next, known, requested, charged);
 					let Some(after) = next.checked_add(requested).filter(|_| fits) else {
 						let holder = oldest_holder(known, next, &intents, &pending)?;
 						return Err(Error::new(
@@ -460,6 +1434,7 @@ impl PersistentLocalIndex {
 								OpPhase::Reserved
 							},
 							command,
+							progress: None,
 							expected_inputs: None,
 						};
 						let bytes = encode_intent(&intent)?;
@@ -528,10 +1503,29 @@ impl PersistentLocalIndex {
 	}
 
 	/// The durable transition before a reserved operation's first submission.
-	/// Commit uncertainty yields no ticket, so nothing can be submitted on it.
+	/// Commit uncertainty yields no ticket, so nothing can be submitted on it. A
+	/// removal is T1's Complete: it can be submitted only after the run it
+	/// removes is durably gone.
 	pub(crate) async fn mark_may_be_submitted(
 		&self,
 		reserved: ReservedOp,
+	) -> std::io::Result<OpTicket> {
+		self.transition_reserved(reserved, true).await
+	}
+
+	/// The same transition for the sole purpose of Cancelling a reserved removal
+	/// whose claim was rejected: no local work ever preceded it.
+	pub(crate) async fn reserved_for_cancel(
+		&self,
+		reserved: ReservedOp,
+	) -> std::io::Result<OpTicket> {
+		self.transition_reserved(reserved, false).await
+	}
+
+	async fn transition_reserved(
+		&self,
+		reserved: ReservedOp,
+		submitting: bool,
 	) -> std::io::Result<OpTicket> {
 		#[cfg(test)]
 		let cut = self.take_op_txn_cut();
@@ -555,6 +1549,17 @@ impl PersistentLocalIndex {
 							"reserved op {op_seq} changed its digest"
 						)));
 					}
+					if submitting
+						&& matches!(
+							intent.command,
+							SlabCommand::GcRemove(_) | SlabCommand::Complete(_)
+						) && !matches!(intent.progress, Some(OpProgress::RunDropped(_)))
+					{
+						return Err(op_state_invalid(format!(
+							"removal {op_seq} cannot be submitted from {:?}",
+							intent.progress
+						)));
+					}
 					intent.phase = OpPhase::MayBeSubmitted;
 					let bytes = encode_intent(&intent)?;
 					intents
@@ -570,6 +1575,7 @@ impl PersistentLocalIndex {
 					key: reserved.key,
 					digest: reserved.digest,
 					command: reserved.command,
+					progress: reserved.progress,
 					expected_inputs: reserved.expected_inputs,
 				})
 			})
@@ -666,8 +1672,22 @@ impl PersistentLocalIndex {
 							"op {op_seq} is not the operation handed off"
 						)));
 					}
+					if matches!(
+						evidence,
+						HandoffEvidence::RemovalFinished | HandoffEvidence::CleanupFinished(_)
+					) && !matches!(
+						intent.progress,
+						Some(OpProgress::Purged(_)) | Some(OpProgress::RunDropped(None))
+					) {
+						return Err(op_state_invalid(format!(
+							"removal {op_seq} cannot hand off from {:?}",
+							intent.progress
+						)));
+					}
 					intents.remove(&op_seq).map_err(redb_to_io)?;
-					pending.insert(&op_seq, &false).map_err(redb_to_io)?;
+					pending
+						.insert(&op_seq, &(false, digest))
+						.map_err(redb_to_io)?;
 					if let Some((intent, bytes)) = &linked {
 						if !intent.ops.contains(&key) {
 							return Err(op_state_invalid(format!(
@@ -691,7 +1711,39 @@ impl PersistentLocalIndex {
 						table.remove(&job).map_err(redb_to_io)?;
 					}
 					match evidence {
-						HandoffEvidence::None => {}
+						HandoffEvidence::None | HandoffEvidence::RemovalFinished => {}
+						HandoffEvidence::AbandonOutputs(outputs) => {
+							let mut rows =
+								tx.open_table(RESERVED_SLAB_IDS_TABLE).map_err(redb_to_io)?;
+							for (id, output) in outputs {
+								let state = read_reserved(&rows, id)?;
+								if !matches!(
+									state,
+									Some(ReservedIdState::Exposed { abandoned: None })
+								) {
+									return Err(op_state_invalid(format!(
+										"output {id} cannot be abandoned from {state:?}"
+									)));
+								}
+								write_reserved(
+									&mut rows,
+									id,
+									&ReservedIdState::Exposed {
+										abandoned: Some(output),
+									},
+								)?;
+							}
+						}
+						HandoffEvidence::CleanupFinished(id)
+						| HandoffEvidence::BurnFinished(id) => {
+							tx.open_table(RESERVED_SLAB_IDS_TABLE)
+								.map_err(redb_to_io)?
+								.remove(&id.get())
+								.map_err(redb_to_io)?
+								.ok_or_else(|| {
+									op_state_invalid(format!("reserved id {id} has no row"))
+								})?;
+						}
 						HandoffEvidence::Removal(removal, inputs) => {
 							let seq = removal.op_seq;
 							let mut reserved = match intents.get(&seq).map_err(redb_to_io)? {
@@ -739,6 +1791,19 @@ impl PersistentLocalIndex {
 			ticket.digest(),
 			Some(intent),
 			HandoffEvidence::Removal(removal, inputs),
+			None,
+		)
+		.await
+	}
+
+	/// Hand off a removal whose Complete applied and whose purge finished. Its
+	/// linked intent went with the run; this row is what remains of it.
+	pub(crate) async fn hand_off_finished_removal(&self, ticket: &OpTicket) -> std::io::Result<()> {
+		self.hand_off_op_with(
+			ticket.key(),
+			ticket.digest(),
+			None,
+			HandoffEvidence::RemovalFinished,
 			None,
 		)
 		.await
@@ -797,10 +1862,10 @@ impl PersistentLocalIndex {
 				let tx = db.begin_read().map_err(redb_to_io)?;
 				let meta = tx.open_table(META_TABLE).map_err(redb_to_io)?;
 				let (next, known) = read_counters(&meta)?;
-				let fits = (next - 1)
-					.checked_add(requested)
-					.is_some_and(|last| last - known <= OPS_WINDOW_W);
-				if fits {
+				let charged = charged_reservations(
+					&tx.open_table(RESERVED_SLAB_IDS_TABLE).map_err(redb_to_io)?,
+				)?;
+				if admits(next, known, requested, charged) {
 					return Ok(());
 				}
 				let intents = tx.open_table(OP_INTENTS_TABLE).map_err(redb_to_io)?;
@@ -828,7 +1893,7 @@ impl PersistentLocalIndex {
 				let mut rows = Vec::new();
 				for row in pending.iter().map_err(redb_to_io)? {
 					let (op_seq, acked) = row.map_err(redb_to_io)?;
-					rows.push((op_seq.value(), acked.value()));
+					rows.push((op_seq.value(), acked.value().0));
 				}
 				Ok(rows)
 			})
@@ -847,8 +1912,12 @@ impl PersistentLocalIndex {
 					let mut pending = tx.open_table(OP_ACK_PENDING_TABLE).map_err(redb_to_io)?;
 					for seq in seqs {
 						// A sequence already below the known prefix has no row.
-						if pending.get(&seq).map_err(redb_to_io)?.is_some() {
-							pending.insert(&seq, &true).map_err(redb_to_io)?;
+						let digest = pending
+							.get(&seq)
+							.map_err(redb_to_io)?
+							.map(|row| row.value().1);
+						if let Some(digest) = digest {
+							pending.insert(&seq, &(true, digest)).map_err(redb_to_io)?;
 						}
 					}
 				}

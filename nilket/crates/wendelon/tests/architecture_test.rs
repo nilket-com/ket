@@ -9707,6 +9707,7 @@ fn adr078_manager_source_concatenates_submodules() {
 			// ADR 0696 (0692 §7): disposal evidence for typed Superseded after disposal.
 			"disposal_evidence.rs",
 			"encoding_compute.rs",
+			"gc_disposal.rs",
 			"index_publication.rs",
 			"lsm_driver.rs",
 			"maintenance_publication.rs",
@@ -9724,6 +9725,8 @@ fn adr078_manager_source_concatenates_submodules() {
 			"redirect_store.rs",
 			// ADR 0692: per-key relocation and atomic empty-key removal.
 			"relocation.rs",
+			// ADR 0697 §4: reserved ids, their capability and their terminal paths.
+			"reservations.rs",
 			"retention_reclaim.rs",
 			"secondary_index_cleanup.rs",
 			"secondary_index_segments.rs",
@@ -10221,16 +10224,16 @@ fn adr0093_snapshot_v2_and_v3_fixtures_are_both_guarded() {
 		.unwrap();
 	let v5 = fs::read_to_string(manifest_dir.join("tests/fixtures/consensus_body/snapshot_v5.txt"))
 		.unwrap();
-	assert!(core.contains("pub const SNAPSHOT_FORMAT_VERSION: u8 = 7;"));
+	assert!(core.contains("pub const SNAPSHOT_FORMAT_VERSION: u8 = 8;"));
 	assert!(!manifest_dir.join("src/consensus/snapshot_body.rs").exists());
 	for required in [
 		"SNAPSHOT_V2_MANIFEST",
 		"SNAPSHOT_V3_MANIFEST",
 		"SNAPSHOT_V4_MANIFEST",
 		"SNAPSHOT_V5_MANIFEST",
-		"SNAPSHOT_V7_MANIFEST",
-		"adr0697_every_pre_v7_snapshot_body_is_refused_before_decode",
-		"adr0697_current_wal_v7_and_snapshot_v7_match_stored_goldens",
+		"SNAPSHOT_V8_MANIFEST",
+		"adr0697_every_pre_v8_snapshot_body_is_refused_before_decode",
+		"adr0697_current_wal_v8_and_snapshot_v8_match_stored_goldens",
 	] {
 		assert!(
 			raft.contains(required),
@@ -10262,7 +10265,7 @@ fn adr0094_write_cap_and_legacy_replay_have_one_authority() {
 	let client = fs::read_to_string(manifest_dir.join("src/client/core.rs")).unwrap();
 	let schema = fs::read_to_string(manifest_dir.join("src/schema/core.rs")).unwrap();
 	let raft = fs::read_to_string(manifest_dir.join("src/consensus/raft_storage.rs")).unwrap();
-	assert!(schema.contains("pub const WAL_FORMAT_VERSION: u8 = 7;"));
+	assert!(schema.contains("pub const WAL_FORMAT_VERSION: u8 = 8;"));
 	assert_eq!(core.matches("pub const MAX_SECTION_BYTES:").count(), 1);
 	assert_eq!(
 		client
@@ -10834,6 +10837,9 @@ fn every_slab_path_installer_uses_a_fresh_id_or_links_without_replacing() {
 			// recovery-time zero-length cleanup (no manager yet), the rotation's
 			// fresh next id, sealed-file reads and the backup copy
 			("manager.rs".to_string(), 7),
+			// GC's identity read, its exclusive recheck and its quarantine link's
+			// source: all existing files, none installed at a slab path.
+			("gc_disposal.rs".to_string(), 3),
 			// Fresh output paths, identity-only reads, and intent-guarded cleanup.
 			// Control output recovery and input capture add read-only identity checks.
 			("lsm_driver.rs".to_string(), 12),
@@ -10841,6 +10847,10 @@ fn every_slab_path_installer_uses_a_fresh_id_or_links_without_replacing() {
 			("maintenance_publication.rs".to_string(), 1),
 			// open-time discovery (no manager yet)
 			("open.rs".to_string(), 4),
+			// An existing file only: a rejected output moved out of this namespace,
+			// and an abandoned one read and disposed of after its claim. Nothing is
+			// installed at a slab path.
+			("reservations.rs".to_string(), 3),
 			// retention reclaim's fresh active slab
 			("retention_reclaim.rs".to_string(), 1),
 			// the declaration cut (fresh id) and segment source reads
@@ -10860,9 +10870,14 @@ fn every_slab_path_installer_uses_a_fresh_id_or_links_without_replacing() {
 	assert_eq!(
 		installs,
 		vec![
+			// GC's no-replace link into its quarantine name, never to a slab path.
+			("gc_disposal.rs".to_string(), 1),
 			// Staged output rename and no-replace link into the quarantine namespace.
 			("lsm_driver.rs".to_string(), 2),
 			("maintenance_publication.rs".to_string(), 1),
+			// A rejected output's no-replace link out of the slab namespace, and a
+			// reservation cleanup's into its quarantine name. Neither installs a slab.
+			("reservations.rs".to_string(), 2),
 			("secondary_index_segments.rs".to_string(), 1),
 			("tiered_io.rs".to_string(), 1),
 		],
@@ -11320,7 +11335,9 @@ fn snapshot_lease_scopes_exclude_remote_io_and_backoff() {
 	assert_eq!(
 		sites,
 		vec![
+			PathBuf::from("src/storage/manager/gc_disposal.rs"),
 			PathBuf::from("src/storage/manager/op_hooks.rs"),
+			PathBuf::from("src/storage/manager/reservations.rs"),
 			PathBuf::from("src/storage/manager/tier_authority.rs"),
 			PathBuf::from("src/storage/sweeper.rs")
 		]
@@ -11331,6 +11348,52 @@ fn snapshot_lease_scopes_exclude_remote_io_and_backoff() {
 	let handoff = manager_method_body(&op_hooks, "hand_off_op_if_complete");
 	for remote in ["object_store", "l2", "sleep", "client_write", "backoff"] {
 		assert!(!handoff.contains(remote), "{remote}");
+	}
+	// GC's two local stages hold the lease across local files and redb only.
+	let disposal = fs::read_to_string(root.join("src/storage/manager/gc_disposal.rs")).unwrap();
+	assert_eq!(disposal.matches("source.read().await").count(), 3);
+	// A reservation's local stages hold it across local files and redb only, and a
+	// burn asks the ring first and holds it only after.
+	let reservations =
+		fs::read_to_string(root.join("src/storage/manager/reservations.rs")).unwrap();
+	assert_eq!(reservations.matches("source.read().await").count(), 3);
+	for stage in ["cleanup_dispose", "cleanup_finish"] {
+		let body = manager_method_body(&reservations, stage);
+		for remote in [
+			"object_store",
+			"sleep",
+			"client_write",
+			"backoff",
+			"committer",
+			"submit_op",
+		] {
+			assert!(!body.contains(remote), "{stage}: {remote}");
+		}
+	}
+	let burn = manager_method_body(&reservations, "finish_burn");
+	let after_lease = burn.split("let lease = match").nth(1).unwrap();
+	for remote in ["committer", "submit_op", "client_write", "sleep", "backoff"] {
+		assert!(!after_lease.contains(remote), "{remote}");
+	}
+	// The rejected-claim handoff asks the ring first, and holds its lease only after.
+	let resolve = manager_method_body(&disposal, "resolve_rejected_claim");
+	let after_lease = resolve.split("let lease = match").nth(1).unwrap();
+	for remote in ["committer", "cancel_op", "client_write", "sleep", "backoff"] {
+		assert!(!after_lease.contains(remote), "{remote}");
+	}
+	for stage in ["gc_dispose_run", "gc_finish_removal"] {
+		let body = manager_method_body(&disposal, stage);
+		for remote in [
+			"object_store",
+			"l2",
+			"sleep",
+			"client_write",
+			"backoff",
+			"committer",
+			"submit_op",
+		] {
+			assert!(!body.contains(remote), "{stage}: {remote}");
+		}
 	}
 	assert!(compare.contains("let canonical = retry.source.read().await?;\n\t\tlet manager"));
 	assert!(callback.contains("let canonical = match self.snapshot_source.get()"));
@@ -11799,4 +11862,72 @@ fn every_published_layout_transition_updates_the_lineage_census() {
 			"no `{forbidden}` bypasses the census"
 		);
 	}
+}
+
+/// The body of `item` (`pub struct Name` or `pub enum Name`) in `source`.
+fn brace_body<'a>(source: &'a str, item: &str) -> &'a str {
+	let at = source
+		.find(&format!("{item} {{"))
+		.unwrap_or_else(|| panic!("{item} not found"));
+	let open = at + source[at..].find('{').unwrap();
+	let mut depth = 0;
+	for (offset, character) in source[open..].char_indices() {
+		match character {
+			'{' => depth += 1,
+			'}' => {
+				depth -= 1;
+				if depth == 0 {
+					return &source[open..open + offset];
+				}
+			}
+			_ => {}
+		}
+	}
+	panic!("{item} is not closed");
+}
+
+/// ADR 0697 §9.4: no bare slab id in a control-ring command, the state machine or
+/// its snapshot. A slab id is only ever qualified: by a `SlabRef`, or beneath an
+/// owner that is inseparable from it. Each such nesting is named here, not waived.
+#[test]
+fn a_ring_command_or_state_never_names_a_bare_slab_id() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let ops = fs::read_to_string(root.join("src/consensus/slab_ops.rs")).unwrap();
+	let raft = fs::read_to_string(root.join("src/consensus/raft_storage.rs")).unwrap();
+	let lsm = fs::read_to_string(root.join("src/storage/lsm.rs")).unwrap();
+	for item in [
+		"pub struct TierOp",
+		"pub struct RetireOp",
+		"pub struct GcRemove",
+		"pub struct ClaimOp",
+		"pub struct CompleteOp",
+		"pub struct BurnOp",
+		"pub struct OpKey",
+		"pub struct SlabOp",
+		"pub enum SlabCommand",
+		"pub struct CancelOp",
+		"pub struct AckOutcomes",
+		"pub enum SlabRejection",
+	] {
+		assert!(!brace_body(&ops, item).contains("SlabId"), "{item}");
+	}
+	assert!(!brace_body(&raft, "pub struct SmState").contains("SlabId"));
+	let requests = fs::read_to_string(root.join("src/consensus/core.rs")).unwrap();
+	assert!(!brace_body(&requests, "pub enum WendelonRequest").contains("SlabId"));
+	assert!(
+		brace_body(&raft, "pub struct SmState")
+			.contains("BTreeMap<OwnerRef, crate::consensus::slab_ops::OwnerTerminal>"),
+		"terminal sets sit beneath their owner"
+	);
+	// The two nestings: the claimed map and the intervals exist only under that key.
+	let terminal = brace_body(&ops, "pub struct OwnerTerminal");
+	assert_eq!(terminal.matches("SlabId").count(), 1);
+	assert!(terminal.contains("pub claimed: BTreeMap<SlabId, CompactionJobId>"));
+	assert!(terminal.contains("pub removed: SlabIntervals"));
+	assert!(ops.contains("pub struct SlabIntervals(Vec<(u64, u64)>);"));
+	// A compaction commit's vectors are all local to its one owner field.
+	assert!(
+		brace_body(&lsm, "pub struct CompactionCommit")
+			.contains("pub owner: crate::consensus::OwnerRef")
+	);
 }

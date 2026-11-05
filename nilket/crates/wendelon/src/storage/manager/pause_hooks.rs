@@ -452,6 +452,14 @@ pub(super) struct TestHolds {
 		std::sync::Mutex<Option<(Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>>,
 	pub(super) rebuild_snapshot_hold:
 		std::sync::Mutex<Option<(Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>>,
+	/// At a GC removal's disposal entry: the intent and the file identity are
+	/// captured, and no exclusion, authority check or local effect has happened.
+	/// After a reservation cleanup's file was validated: stage 1 before its disposal,
+	/// stage 2 before its purge.
+	pub(super) cleanup_validated_hold:
+		std::sync::Mutex<Option<(u8, Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>>,
+	pub(super) gc_disposal_entry_hold:
+		std::sync::Mutex<Option<(Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>>,
 	pub(super) gc_before_unlink_hold:
 		std::sync::Mutex<Option<(Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>>,
 	pub(super) gc_after_unlink_hold:
@@ -490,6 +498,34 @@ impl SlabManager {
 		let hold = self
 			.continuity_test_holds
 			.op_handoff_hold
+			.lock()
+			.unwrap()
+			.clone();
+		if let Some((entered, release)) = hold {
+			entered.add_permits(1);
+			let _ = release.acquire().await;
+		}
+	}
+
+	pub(super) async fn pause_cleanup_validated_for_test(&self, stage: u8) {
+		let hold = self
+			.continuity_test_holds
+			.cleanup_validated_hold
+			.lock()
+			.unwrap()
+			.clone();
+		if let Some((wanted, entered, release)) = hold
+			&& wanted == stage
+		{
+			entered.add_permits(1);
+			let _ = release.acquire().await;
+		}
+	}
+
+	pub(super) async fn pause_gc_disposal_entry_for_test(&self) {
+		let hold = self
+			.continuity_test_holds
+			.gc_disposal_entry_hold
 			.lock()
 			.unwrap()
 			.clone();

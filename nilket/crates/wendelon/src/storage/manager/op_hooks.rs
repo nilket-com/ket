@@ -7,6 +7,25 @@ use crate::consensus::slab_ops::{GcRemove, RunIdentity, SlabCommand, TierGenerat
 use crate::storage::index::{LoadedOp, OpTicket};
 use crate::storage::sweeper::{SlabOpRejected, VerifiedReceipt};
 
+/// A delete-pending run in a ring with no removal reserved. It has no claim behind
+/// it, so it stays fenced, and it never keeps a sweep from valid reserved work.
+#[derive(Debug)]
+pub(super) struct GcRemoveUnreserved;
+
+impl std::fmt::Display for GcRemoveUnreserved {
+	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		formatter.write_str("a delete-pending run has no reserved removal; it remains fenced")
+	}
+}
+
+impl std::error::Error for GcRemoveUnreserved {}
+
+pub(super) fn is_gc_remove_unreserved(error: &Error) -> bool {
+	error
+		.get_ref()
+		.is_some_and(|cause| cause.is::<GcRemoveUnreserved>())
+}
+
 /// A GC removal reserved with its mark, in the phase a reopen found it.
 pub(super) struct GcRemoveReservation {
 	loaded: LoadedOp,
@@ -28,6 +47,25 @@ impl GcRemoveReservation {
 		}
 	}
 
+	pub(super) fn digest(&self) -> [u8; 32] {
+		match &self.loaded {
+			LoadedOp::Submittable(ticket) => ticket.digest(),
+			LoadedOp::Reserved(reserved) => reserved.digest(),
+		}
+	}
+
+	/// The removal command, as it was built when its mark was allocated.
+	pub(super) fn remove_command(&self) -> std::io::Result<GcRemove> {
+		let command = match &self.loaded {
+			LoadedOp::Submittable(ticket) => ticket.command(),
+			LoadedOp::Reserved(reserved) => reserved.command(),
+		};
+		match command {
+			SlabCommand::GcRemove(remove) => Ok(remove.clone()),
+			other => Err(Error::other(format!("not a GC removal: {other:?}"))),
+		}
+	}
+
 	/// The durable transition before a reserved removal's first submission.
 	pub(super) async fn into_ticket(
 		self,
@@ -40,9 +78,18 @@ impl GcRemoveReservation {
 	}
 }
 
-/// A submitted tier or retire operation. An LSM operation has its linked intent
-/// fencing its own scope, and a reserved one was never sent.
+/// A submitted tier or retire operation, or a removal past its local disposal,
+/// whose linked intent went with the run: a restart has not re-established that
+/// phase's authority, reserved or not. Any other LSM operation has its linked
+/// intent fencing its own scope, and any other reserved one was never sent.
 fn op_needs_receipt(op: &LoadedOp) -> bool {
+	use crate::storage::index::OpProgress;
+	if matches!(
+		op.progress(),
+		Some(OpProgress::RunDropped(_) | OpProgress::PurgeAuthorized(_) | OpProgress::Purged(_))
+	) {
+		return true;
+	}
 	matches!(op, LoadedOp::Submittable(ticket) if matches!(
 		ticket.command(),
 		SlabCommand::Tier(_) | SlabCommand::Retire(_)
@@ -119,7 +166,11 @@ impl SlabManager {
 				self.unapplied_tier_pointers.get(&id).is_none()
 					&& self.tier_pointer(id).await.is_none()
 			}
-			SlabCommand::Compaction(_) | SlabCommand::GcRemove(_) => false,
+			SlabCommand::Compaction(_)
+			| SlabCommand::GcRemove(_)
+			| SlabCommand::Claim(_)
+			| SlabCommand::Complete(_)
+			| SlabCommand::BurnReserved(_) => false,
 		}
 	}
 
@@ -180,13 +231,17 @@ impl SlabManager {
 		if let Some(reservation) = self.gc_remove_reservation(index, run.slab_id).await? {
 			return Ok(reservation);
 		}
+		// In a ring, every delete-pending run came through a mark, which reserved
+		// its removal; one with no reservation has no claim behind it.
+		if self.control_node_bound() {
+			return Err(Error::new(ErrorKind::WouldBlock, GcRemoveUnreserved));
+		}
 		let job_id = Self::lsm_gc_job_id(run.manifest_epoch, 0xD2, &[run.slab_id]);
 		let allocation = index
 			.allocate_ops(
 				vec![SlabCommand::GcRemove(GcRemove {
-					owner: self.owner_ref()?,
 					job_id,
-					slab: run.slab_id,
+					slab: self.owner_ref()?.slab(run.slab_id),
 					expected_run: RunIdentity::of(run),
 				})],
 				None,
@@ -211,7 +266,7 @@ impl SlabManager {
 				LoadedOp::Reserved(reserved) => reserved.command(),
 			};
 			if let SlabCommand::GcRemove(GcRemove { slab, job_id, .. }) = command
-				&& *slab == slab_id
+				&& slab.local_id() == slab_id
 			{
 				let job_id = *job_id;
 				let expected_inputs = loaded.reserved_inputs().map(<[_]>::to_vec);
@@ -263,6 +318,7 @@ impl SlabManager {
 	pub(crate) async fn observe_lsm_gc_removed(
 		&self,
 		remove: &GcRemove,
+		op_seq: u64,
 		index: u64,
 	) -> std::io::Result<()> {
 		let _gate = self.persistent_index_gate.clone().read_owned().await;
@@ -277,30 +333,43 @@ impl SlabManager {
 				"snapshot installation fences LSM observer",
 			));
 		}
-		self.apply_lsm_gc_removal(remove)
-	}
-
-	/// The exact-run check and manifest step of a decided GC removal.
-	#[doc(hidden)]
-	pub fn apply_lsm_gc_removal(&self, remove: &GcRemove) -> std::io::Result<()> {
-		let snapshot = self.compaction_manifest_snapshot();
-		let exact = snapshot.run(remove.slab).is_some_and(|run| {
-			run.state == SlabState::DeletePending && RunIdentity::of(run) == remove.expected_run
-		});
-		if !exact {
+		// §6.1: the local work precedes Complete, so the run is already gone and
+		// nothing is left to do here. Only this operation's own durable evidence
+		// explains an absent run, and a present one is unexplained.
+		let store = self.require_op_index()?;
+		let evidence = store
+			.op_evidence(op_seq, SlabCommand::GcRemove(remove.clone()).digest())
+			.await?;
+		use crate::storage::index::{OpEvidence, OpProgress};
+		let absent = self
+			.compaction_manifest_snapshot()
+			.run(remove.slab.local_id())
+			.is_none();
+		// An obsolete duplicate: this sequence is below the acknowledged prefix, so
+		// no row says which operation it was. Ignored, and it proves nothing: this
+		// branch authorizes no effect and clears no fence. A present run falls
+		// through and is unexplained.
+		if absent && evidence == OpEvidence::BelowPrefix {
+			return Ok(());
+		}
+		// This exact operation's own durable state, past its local disposal.
+		let explained = match evidence {
+			OpEvidence::Intent(Some(progress)) => matches!(
+				progress,
+				OpProgress::RunDropped(_) | OpProgress::PurgeAuthorized(_) | OpProgress::Purged(_)
+			),
+			OpEvidence::Finished => true,
+			_ => false,
+		};
+		if !(explained && absent) {
+			self.index_authority_unavailable
+				.store(true, Ordering::Release);
 			return Err(Error::new(
 				ErrorKind::InvalidData,
-				"a decided GC removal does not name this store's delete-pending run",
+				"a decided GC removal does not match this store's local progress",
 			));
 		}
-		self.apply_lsm_manifest_compaction_commit(&CompactionCommit::gc_remove(
-			remove.owner,
-			remove.job_id,
-			snapshot.manifest_epoch,
-			vec![remove.slab],
-		))
-		.map(|_| ())
-		.map_err(|err| Error::other(err.to_string()))
+		Ok(())
 	}
 }
 

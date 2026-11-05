@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::consensus::slab_ops::{GcRemove, RunIdentity, SlabCommand, SlabOp};
+
 use crate::schema::{
 	ByteCount, CompactionJobId, CompactionLevelIndex, HybridTimestamp, RowCount, SlabId,
 	SupersessionMetadata, TombstoneMetadata,
@@ -674,9 +675,8 @@ fn command_digests_are_pinned_per_kind() {
 		(
 			"gc_remove",
 			SlabCommand::GcRemove(GcRemove {
-				owner: own,
 				job_id: CompactionJobId::new(9),
-				slab: SlabId::new(7),
+				slab: own.slab(SlabId::new(7)),
 				expected_run: RunIdentity {
 					compaction_level: CompactionLevelIndex::L1,
 					size_bytes: ByteCount::new(4096),
@@ -684,6 +684,26 @@ fn command_digests_are_pinned_per_kind() {
 					min_row_hlc: hlc,
 					max_row_hlc: hlc,
 				},
+			}),
+		),
+		(
+			"claim",
+			SlabCommand::Claim(ClaimOp {
+				slab: own.slab(SlabId::new(7)),
+				job_id: CompactionJobId::new(9),
+			}),
+		),
+		(
+			"complete",
+			SlabCommand::Complete(CompleteOp {
+				slab: own.slab(SlabId::new(7)),
+				job_id: CompactionJobId::new(9),
+			}),
+		),
+		(
+			"burn",
+			SlabCommand::BurnReserved(BurnOp {
+				slab: own.slab(SlabId::new(7)),
 			}),
 		),
 	];
@@ -708,8 +728,381 @@ fn command_digests_are_pinned_per_kind() {
 			),
 			(
 				"gc_remove",
-				"b3aab68dd064e8425a687a5f876cc65b2dd42f80ab443635db02da864d6b5ba1".to_string()
+				"1336b4e81cc6f7c16b6361461c6a15851c454ac6baa0eb1337d51019f2259f98".to_string()
+			),
+			(
+				"claim",
+				"332b0c00f4430a896b559ce51953d599819ea35e23d25ce1a9cffbc02a853453".to_string()
+			),
+			(
+				"complete",
+				"4a990e72c22018e67e3d975d08548636d5b417c1845ff1183b29a2d66f5e83a4".to_string()
+			),
+			(
+				"burn",
+				"e967ccab39fcf6dd2249639ebe583b05f43184486b84fd0645194e10e26dd97c".to_string()
 			),
 		]
 	);
+}
+
+// ADR 0697 §4: terminal arbitration at the state machine.
+
+const JOB: CompactionJobId = CompactionJobId::new(0x51);
+const OTHER_JOB: CompactionJobId = CompactionJobId::new(0x52);
+
+fn claim_of(owner: OwnerRef, slab: u64, job_id: CompactionJobId) -> SlabCommand {
+	SlabCommand::Claim(ClaimOp {
+		slab: owner.slab(SlabId::new(slab)),
+		job_id,
+	})
+}
+
+fn complete_of(owner: OwnerRef, slab: u64, job_id: CompactionJobId) -> SlabCommand {
+	SlabCommand::Complete(CompleteOp {
+		slab: owner.slab(SlabId::new(slab)),
+		job_id,
+	})
+}
+
+fn mark_of(owner: OwnerRef, slab: u64, job_id: CompactionJobId) -> SlabCommand {
+	SlabCommand::Compaction(crate::storage::CompactionCommit::gc_mark_delete_pending(
+		owner,
+		job_id,
+		crate::schema::ManifestEpoch::new(4),
+		vec![SlabId::new(slab)],
+	))
+}
+
+fn gc_remove_of(owner: OwnerRef, slab: u64, job_id: CompactionJobId) -> SlabCommand {
+	let hlc = HybridTimestamp {
+		physical_ms: 1,
+		logical: 0,
+		node_id: 0,
+	};
+	SlabCommand::GcRemove(GcRemove {
+		job_id,
+		slab: owner.slab(SlabId::new(slab)),
+		expected_run: RunIdentity {
+			compaction_level: CompactionLevelIndex::L1,
+			size_bytes: ByteCount::new(4096),
+			row_count: RowCount::new(3),
+			min_row_hlc: hlc,
+			max_row_hlc: hlc,
+		},
+	})
+}
+
+#[track_caller]
+fn assert_rejected(response: (WendelonResponse, Option<TierObserverEvent>), reason: SlabRejection) {
+	let (response, event) = response;
+	match response {
+		WendelonResponse::Op(OpResponse::Receipt(OpReceipt {
+			outcome: OpOutcome::Recorded(RecordedOutcome::Rejected { reason: actual, .. }),
+			..
+		})) => assert_eq!(actual, reason),
+		other => panic!("expected a rejection, got {other:?}"),
+	}
+	assert!(event.is_none(), "a rejection notifies no one");
+}
+
+#[track_caller]
+fn assert_applied(response: (WendelonResponse, Option<TierObserverEvent>)) {
+	match response.0 {
+		WendelonResponse::Op(OpResponse::Receipt(OpReceipt {
+			outcome: OpOutcome::Recorded(RecordedOutcome::Applied { .. }),
+			..
+		})) => {}
+		other => panic!("expected Applied, got {other:?}"),
+	}
+}
+
+#[test]
+fn a_tier_of_a_claimed_or_removed_slab_is_rejected_and_a_claim_of_a_tiered_slab_is_too() {
+	let own = owner(1);
+	let mut state = registered(1);
+	assert_applied(apply_op(&mut state, 1, first_tier(own, 5), 2));
+	assert_rejected(
+		apply_op(&mut state, 2, claim_of(own, 5, JOB), 3),
+		SlabRejection::Tiered,
+	);
+	assert_rejected(
+		apply_op(&mut state, 3, mark_of(own, 5, JOB), 4),
+		SlabRejection::Tiered,
+	);
+
+	assert_applied(apply_op(&mut state, 4, mark_of(own, 6, JOB), 5));
+	assert_rejected(
+		apply_op(&mut state, 5, first_tier(own, 6), 6),
+		SlabRejection::ClaimedBy { job_id: JOB },
+	);
+	assert_rejected(
+		apply_op(&mut state, 6, claim_of(own, 6, OTHER_JOB), 7),
+		SlabRejection::ClaimedBy { job_id: JOB },
+	);
+
+	assert_applied(apply_op(&mut state, 7, gc_remove_of(own, 6, JOB), 8));
+	assert_rejected(
+		apply_op(&mut state, 8, first_tier(own, 6), 9),
+		SlabRejection::Removed,
+	);
+	assert_rejected(
+		apply_op(&mut state, 9, claim_of(own, 6, JOB), 10),
+		SlabRejection::Removed,
+	);
+	validate_slab_terminal(&state).unwrap();
+}
+
+#[test]
+fn a_complete_needs_the_exact_claim_and_moves_it_to_removed() {
+	let own = owner(1);
+	let mut state = registered(1);
+	assert_rejected(
+		apply_op(&mut state, 1, complete_of(own, 7, JOB), 2),
+		SlabRejection::NotClaimedBy { current: None },
+	);
+	assert_applied(apply_op(&mut state, 2, claim_of(own, 7, JOB), 3));
+	assert_rejected(
+		apply_op(&mut state, 3, complete_of(own, 7, OTHER_JOB), 4),
+		SlabRejection::NotClaimedBy { current: Some(JOB) },
+	);
+	assert_rejected(
+		apply_op(&mut state, 4, gc_remove_of(own, 7, OTHER_JOB), 5),
+		SlabRejection::NotClaimedBy { current: Some(JOB) },
+	);
+	assert_applied(apply_op(&mut state, 5, complete_of(own, 7, JOB), 6));
+	let terminal = &state.slab_terminal[&own];
+	assert!(terminal.claimed.is_empty());
+	assert!(terminal.removed.contains(SlabId::new(7)));
+	assert_rejected(
+		apply_op(&mut state, 6, complete_of(own, 7, JOB), 7),
+		SlabRejection::Removed,
+	);
+}
+
+#[test]
+fn a_retirement_ends_the_identity_in_its_one_entry() {
+	let own = owner(1);
+	let mut state = registered(1);
+	let tier = tier(own, 5, "l2://a");
+	assert_applied(apply_op(
+		&mut state,
+		1,
+		SlabCommand::Tier(TierOp {
+			tier: tier.clone(),
+			replaces: None,
+		}),
+		2,
+	));
+	assert_applied(apply_op(
+		&mut state,
+		2,
+		SlabCommand::Retire(RetireOp {
+			slab: tier.slab,
+			expected: TierGeneration::from(&tier),
+		}),
+		3,
+	));
+	assert!(state.slab_terminal[&own].removed.contains(SlabId::new(5)));
+	assert_rejected(
+		apply_op(&mut state, 3, first_tier(own, 5), 4),
+		SlabRejection::Removed,
+	);
+	validate_slab_terminal(&state).unwrap();
+}
+
+#[test]
+fn a_burn_ends_an_untouched_id_and_nothing_else() {
+	let own = owner(1);
+	let mut state = registered(1);
+	let burn = |slab: u64| {
+		SlabCommand::BurnReserved(BurnOp {
+			slab: own.slab(SlabId::new(slab)),
+		})
+	};
+	assert_applied(apply_op(&mut state, 1, burn(4), 2));
+	assert_rejected(
+		apply_op(&mut state, 2, claim_of(own, 4, JOB), 3),
+		SlabRejection::Removed,
+	);
+	assert_rejected(apply_op(&mut state, 3, burn(4), 4), SlabRejection::Removed);
+	assert_applied(apply_op(&mut state, 4, first_tier(own, 5), 5));
+	assert_rejected(apply_op(&mut state, 5, burn(5), 6), SlabRejection::Tiered);
+	assert_applied(apply_op(&mut state, 6, claim_of(own, 6, JOB), 7));
+	assert_rejected(
+		apply_op(&mut state, 7, burn(6), 8),
+		SlabRejection::ClaimedBy { job_id: JOB },
+	);
+}
+
+#[test]
+fn a_new_run_cannot_name_an_ended_identity() {
+	let own = owner(1);
+	let mut state = registered(1);
+	assert_applied(apply_op(&mut state, 1, claim_of(own, 7, JOB), 2));
+	assert_applied(apply_op(&mut state, 2, complete_of(own, 7, JOB), 3));
+	let hlc = HybridTimestamp {
+		physical_ms: 1,
+		logical: 0,
+		node_id: 0,
+	};
+	let mut commit = crate::storage::CompactionCommit::gc_mark_delete_pending(
+		own,
+		OTHER_JOB,
+		crate::schema::ManifestEpoch::new(4),
+		Vec::new(),
+	);
+	commit.slabs_to_add.push(crate::storage::LsmRunSummary {
+		slab_id: SlabId::new(7),
+		compaction_level: CompactionLevelIndex::L1,
+		size_bytes: ByteCount::new(1),
+		row_count: RowCount::new(1),
+		min_row_hlc: hlc,
+		max_row_hlc: hlc,
+		state: crate::storage::SlabState::Live,
+		sidecar_coverage: Default::default(),
+		manifest_epoch: crate::schema::ManifestEpoch::new(5),
+		retention_debt_score: 0,
+		tombstone_debt_score: 0,
+		index_coverage_debt_score: 0,
+		layout_debt_score: 0,
+	});
+	assert_rejected(
+		apply_op(&mut state, 3, SlabCommand::Compaction(commit), 4),
+		SlabRejection::Removed,
+	);
+}
+
+/// A rejected or superseded claim changes nothing, and a receipt read after
+/// supersession is history, not authority.
+#[test]
+fn the_terminal_sets_are_per_owner_and_history_precedes_current_owner_admission() {
+	let (old, new) = (owner(1), owner(2));
+	let mut state = registered(1);
+	assert_applied(apply_op(&mut state, 1, claim_of(old, 7, JOB), 2));
+	supersede(&mut state, 1, 2);
+	assert_applied(apply_op(&mut state, 1, first_tier(new, 7), 3));
+	let (retry, event) = apply_op(&mut state, 1, claim_of(old, 7, JOB), 4);
+	assert!(
+		matches!(
+			retry,
+			WendelonResponse::Op(OpResponse::Receipt(OpReceipt {
+				outcome: OpOutcome::Recorded(RecordedOutcome::Applied { .. }),
+				..
+			}))
+		),
+		"the old owner's retry still learns its answer: {retry:?}"
+	);
+	assert!(event.is_none());
+	let (fresh, _) = apply_op(&mut state, 2, complete_of(old, 7, JOB), 5);
+	assert!(
+		matches!(
+			fresh,
+			WendelonResponse::Refused(SlabRefusal::NotCurrentOwner { .. })
+		),
+		"a new effect by the old owner is refused: {fresh:?}"
+	);
+	assert_eq!(state.slab_terminal[&old].claimed[&SlabId::new(7)], JOB);
+}
+
+#[test]
+fn intervals_coalesce_exactly_and_never_lose_the_top_id() {
+	let mut set = crate::consensus::slab_ops::SlabIntervals::default();
+	for id in [5, 7, 6, 1, 3, 2, u64::MAX, u64::MAX - 1, 5] {
+		set.insert(SlabId::new(id));
+	}
+	assert_eq!(set.intervals(), &[(1, 3), (5, 7), (u64::MAX - 1, u64::MAX)]);
+	assert!(set.is_canonical());
+	for id in [1, 3, 5, 7, u64::MAX - 1, u64::MAX] {
+		assert!(set.contains(SlabId::new(id)), "{id}");
+	}
+	for id in [0, 4, 8, u64::MAX - 2] {
+		assert!(!set.contains(SlabId::new(id)), "{id}");
+	}
+}
+
+/// A state that breaks §4 is refused where a snapshot is written, and where one
+/// is decoded or installed.
+#[test]
+fn a_snapshot_that_breaks_the_terminal_sets_is_refused_written_and_read() {
+	use crate::consensus::slab_ops::{OwnerTerminal, SlabIntervals};
+	let own = owner(1);
+	let with = |edit: &dyn Fn(&mut SmState, &mut OwnerTerminal)| {
+		let mut state = registered(1);
+		let mut terminal = OwnerTerminal::default();
+		edit(&mut state, &mut terminal);
+		state.slab_terminal.insert(own, terminal);
+		state
+	};
+	let tiered = tier(own, 7, "l2://a");
+	let cases: Vec<(&str, SmState, &str)> = vec![
+		(
+			"claimed and removed",
+			with(&|_, terminal| {
+				terminal.claimed.insert(SlabId::new(7), JOB);
+				terminal.removed.insert(SlabId::new(7));
+			}),
+			"both claimed and removed",
+		),
+		(
+			"claimed and tiered",
+			with(&|state, terminal| {
+				terminal.claimed.insert(SlabId::new(7), JOB);
+				state.tiered_slabs.insert(tiered.slab, tiered.clone());
+			}),
+			"both claimed and tiered",
+		),
+		(
+			"removed and tiered",
+			with(&|state, terminal| {
+				terminal.removed.insert(SlabId::new(7));
+				state.tiered_slabs.insert(tiered.slab, tiered.clone());
+			}),
+			"both tiered and removed",
+		),
+		(
+			"adjacent intervals",
+			with(&|_, terminal| {
+				terminal.removed = SlabIntervals::from_raw_for_test(vec![(1, 2), (3, 4)]);
+			}),
+			"not canonical",
+		),
+		(
+			"overlapping intervals",
+			with(&|_, terminal| {
+				terminal.removed = SlabIntervals::from_raw_for_test(vec![(1, 5), (3, 8)]);
+			}),
+			"not canonical",
+		),
+		(
+			"inverted interval",
+			with(&|_, terminal| {
+				terminal.removed = SlabIntervals::from_raw_for_test(vec![(5, 1)]);
+			}),
+			"not canonical",
+		),
+		(
+			"unregistered owner",
+			{
+				let mut state = SmState::default();
+				state.slab_terminal.insert(own, OwnerTerminal::default());
+				state
+			},
+			"incarnation registry",
+		),
+	];
+	for (name, state, expected) in cases {
+		let error = validate_slab_terminal(&state).unwrap_err();
+		assert!(error.contains(expected), "{name}: {error}");
+		assert!(encode_snapshot(&state).is_err(), "{name}: written");
+		let body = postcard::to_stdvec(&state).unwrap();
+		let header = SnapshotHeader {
+			state_sha256: control_artifact_digest_32(&body),
+			..snapshot_header_template(&state)
+		};
+		let mut bytes = bytemuck::bytes_of(&header).to_vec();
+		bytes.extend_from_slice(&body);
+		let error = decode_snapshot_reader(bytes.as_slice()).unwrap_err();
+		assert!(error.contains(expected), "{name}: read: {error}");
+	}
 }

@@ -12,6 +12,12 @@ async fn open_test_manager(
 	manager.bind_control_node(0)?;
 	Ok(manager)
 }
+async fn initialize_unbound_test_manager(
+	config: SlabManagerConfig,
+) -> std::io::Result<std::sync::Arc<SlabManager>> {
+	let owner = wendelon::storage::ownership::DataDirectoryOwner::acquire_existing(&config.dir)?;
+	SlabManager::initialize_new_store_with_owner(config, owner).await
+}
 async fn initialize_test_manager(
 	config: SlabManagerConfig,
 ) -> std::io::Result<std::sync::Arc<SlabManager>> {
@@ -108,14 +114,13 @@ impl CommandCommitter for ManifestApplyingCommitter {
 		remove: &wendelon::consensus::GcRemove,
 	) -> std::io::Result<()> {
 		*self.last_commit.lock().unwrap() = Some(CompactionCommit::gc_remove(
-			remove.owner,
+			remove.slab.owner(),
 			remove.job_id,
 			wendelon::schema::ManifestEpoch::new(0),
-			vec![remove.slab],
+			vec![remove.slab.local_id()],
 		));
-		self.manager.apply_lsm_gc_removal(remove).map(|_| {
-			self.applied.fetch_add(1, Ordering::SeqCst);
-		})
+		self.applied.fetch_add(1, Ordering::SeqCst);
+		Ok(())
 	}
 
 	async fn commit_lsm_compaction(&self, commit: CompactionCommit) -> std::io::Result<()> {
@@ -228,7 +233,13 @@ async fn lsm_output_slab_id_reservation_advances_manager_sequence() {
 	.await
 	.unwrap();
 
-	let reserved = manager.reserve_lsm_output_slab_ids(3).await.unwrap();
+	let reserved = manager
+		.reserve_lsm_output_slab_ids(3)
+		.await
+		.unwrap()
+		.iter()
+		.map(|slab| slab.id())
+		.collect::<Vec<_>>();
 
 	assert_eq!(
 		reserved,
@@ -356,7 +367,13 @@ async fn manager_prepares_lsm_outputs_from_extracted_entries_and_reserved_ids() 
 	assert_eq!(prepared.output_runs[0].slab_id, SlabId::new(2));
 	assert_eq!(prepared.output_runs[0].rows[0].row_key_id, id(51));
 	assert_eq!(manager.active_slab_id().await, SlabId::new(1));
-	let reserved = manager.reserve_lsm_output_slab_ids(1).await.unwrap();
+	let reserved = manager
+		.reserve_lsm_output_slab_ids(1)
+		.await
+		.unwrap()
+		.iter()
+		.map(|slab| slab.id())
+		.collect::<Vec<_>>();
 	assert_eq!(reserved, vec![SlabId::new(3)]);
 }
 
@@ -1328,7 +1345,8 @@ async fn manager_applies_lsm_manifest_compaction_commit() {
 #[tokio::test]
 async fn manager_lsm_gc_waits_for_authoritative_index_rewrite() {
 	let l1_dir = fresh_dir("manifest-gc");
-	let manager = initialize_test_manager(SlabManagerConfig {
+	// This sweep is the local-only path: a store with no ring, never bound to one.
+	let manager = initialize_unbound_test_manager(SlabManagerConfig {
 		tier_history_budget_bytes: wendelon::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: l1_dir.to_path_buf(),
 		max_slab_bytes: 1,

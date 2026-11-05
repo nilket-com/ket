@@ -1,22 +1,14 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use wendelon::hash::state_digest::StateDigest;
 use wendelon::schema::{
 	CompactionJobId, CompactionLevelIndex, HybridTimestamp, Identity, ManifestEpoch,
 	RecordRowIndex, SlabId, TenantId,
 };
 use wendelon::storage::{
-	CompactionDigestSummary, CompactionFailure, CompactionManifest, CompactionPlan, DominantReason,
-	DropReason, LsmCompactionDriver, LsmCompactionService, LsmCompactionWorker, LsmConfig,
-	LsmGcDriver, LsmGcService, LsmGcWorker, LsmRunSummary, RecordLocation, SlabPinTable,
-	SurvivorOrDrop, VersionEntry, VersionLifecycle,
+	CompactionFailure, CompactionPlan, DominantReason, DropReason, LsmCompactionDriver,
+	LsmCompactionService, LsmCompactionWorker, LsmConfig, LsmGcDriver, LsmGcService, LsmGcWorker,
+	RecordLocation, SlabPinTable, SurvivorOrDrop, VersionEntry, VersionLifecycle,
 };
-
-/// A fixed ring owner for fixtures without a store, minted the way the control
-/// ring itself decodes one (ADR 0697: only a store mints its own owner).
-fn test_owner() -> wendelon::consensus::OwnerRef {
-	serde_json::from_str(r#"{"node":1,"incarnation":1}"#).unwrap()
-}
 
 fn hlc(ms: u64) -> HybridTimestamp {
 	HybridTimestamp {
@@ -37,28 +29,6 @@ fn plan() -> CompactionPlan {
 		retention_floor_snapshot: hlc(0),
 		compaction_start_hlc: hlc(10),
 		dominant_reason: DominantReason::LevelSize,
-	}
-}
-
-fn valid_plan() -> CompactionPlan {
-	CompactionPlan {
-		job_id: CompactionJobId::new(78),
-		source_level: CompactionLevelIndex::L0,
-		target_level: CompactionLevelIndex::L1,
-		manifest_epoch_pre: ManifestEpoch::new(5),
-		input_slabs: vec![SlabId::new(1)],
-		overlapping_slabs: vec![SlabId::new(2)],
-		retention_floor_snapshot: hlc(25),
-		compaction_start_hlc: hlc(50),
-		dominant_reason: DominantReason::LevelSize,
-	}
-}
-
-fn digest_summary() -> CompactionDigestSummary {
-	CompactionDigestSummary {
-		visible_pre: StateDigest::ZERO,
-		visible_post: StateDigest::ZERO,
-		version_entry_delta: StateDigest::ZERO,
 	}
 }
 
@@ -223,107 +193,4 @@ fn compaction_worker_plans_survivor_outputs_with_configured_target_size() {
 	assert_eq!(prepared.output_runs[0].rows[0].row_hlc, hlc(30));
 	assert_eq!(prepared.output_runs[1].slab_id, SlabId::new(11));
 	assert_eq!(prepared.output_runs[1].rows[0].row_hlc, hlc(40));
-}
-
-#[test]
-fn compaction_worker_builds_commit_and_outcome_from_prepared_outputs() {
-	let pins = Arc::new(SlabPinTable::default());
-	let worker = LsmCompactionWorker::new(
-		LsmConfig {
-			lsm_l1_slab_size_target_bytes: 15,
-			..LsmConfig::default()
-		},
-		pins,
-	)
-	.unwrap();
-	let plan = valid_plan();
-	let prepared = worker
-		.plan_survivor_outputs(
-			&plan,
-			[
-				version(1, 10, 10, VersionLifecycle::AppendOnly),
-				version(1, 30, 10, VersionLifecycle::AppendOnly),
-				version(1, 40, 10, VersionLifecycle::AppendOnly),
-			],
-			[SlabId::new(10), SlabId::new(11)],
-		)
-		.unwrap();
-
-	let commit = worker.build_compaction_commit(test_owner(), &plan, &prepared, digest_summary());
-
-	assert_eq!(commit.job_id, plan.job_id);
-	assert_eq!(commit.manifest_epoch_pre, ManifestEpoch::new(5));
-	assert_eq!(commit.slabs_to_retire, vec![SlabId::new(1), SlabId::new(2)]);
-	assert_eq!(
-		commit
-			.slabs_to_add
-			.iter()
-			.map(|run| (run.slab_id, run.compaction_level, run.row_count.get()))
-			.collect::<Vec<_>>(),
-		vec![
-			(SlabId::new(10), CompactionLevelIndex::L1, 1),
-			(SlabId::new(11), CompactionLevelIndex::L1, 1),
-		]
-	);
-
-	let outcome =
-		worker.compaction_outcome_from_commit(&plan, &prepared, &commit, ManifestEpoch::new(6));
-
-	assert_eq!(outcome.job_id, plan.job_id);
-	assert_eq!(outcome.manifest_epoch_pre, ManifestEpoch::new(5));
-	assert_eq!(outcome.manifest_epoch_post, ManifestEpoch::new(6));
-	assert_eq!(outcome.rows_in, 3);
-	assert_eq!(outcome.rows_out, 2);
-	assert_eq!(outcome.elided_versions, 1);
-	assert_eq!(outcome.bytes_in, 30);
-	assert_eq!(outcome.bytes_out, 20);
-	assert_eq!(
-		outcome
-			.output_slabs
-			.iter()
-			.map(|run| run.manifest_epoch)
-			.collect::<Vec<_>>(),
-		vec![ManifestEpoch::new(6), ManifestEpoch::new(6)]
-	);
-}
-
-#[test]
-fn worker_commit_artifact_passes_manifest_plan_validation() {
-	let pins = Arc::new(SlabPinTable::default());
-	let worker = LsmCompactionWorker::new(LsmConfig::default(), pins).unwrap();
-	let plan = valid_plan();
-	let prepared = worker
-		.plan_survivor_outputs(
-			&plan,
-			[version(1, 30, 10, VersionLifecycle::AppendOnly)],
-			[SlabId::new(10)],
-		)
-		.unwrap();
-	let commit = worker.build_compaction_commit(test_owner(), &plan, &prepared, digest_summary());
-	let mut manifest = CompactionManifest::new(plan.manifest_epoch_pre);
-	manifest.insert_live_run(LsmRunSummary::new(
-		SlabId::new(1),
-		CompactionLevelIndex::L0,
-		hlc(10),
-		hlc(20),
-		wendelon::schema::ByteCount::new(10),
-		wendelon::schema::RowCount::new(1),
-		plan.manifest_epoch_pre,
-	));
-	manifest.insert_live_run(LsmRunSummary::new(
-		SlabId::new(2),
-		CompactionLevelIndex::L1,
-		hlc(15),
-		hlc(30),
-		wendelon::schema::ByteCount::new(10),
-		wendelon::schema::RowCount::new(1),
-		plan.manifest_epoch_pre,
-	));
-
-	let post_epoch = manifest
-		.apply_planned_compaction_commit(&plan, &commit)
-		.unwrap();
-
-	assert_eq!(post_epoch, ManifestEpoch::new(6));
-	assert!(manifest.get_run(SlabId::new(10)).unwrap().state.is_live());
 }

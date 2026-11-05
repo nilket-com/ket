@@ -4,8 +4,9 @@
 //! A deferral records the outcome of the apply that could not publish: a
 //! fence with its typed cause, a typed structural refusal, or an untyped
 //! failure. Only a fence has a cause, and only a fence whose cause can clear
-//! (the index gate, or the node budget) and that came from a real
-//! `Some(index)` log callback is replayed (`replay_tier_deferral`): the
+//! (the index gate, the node budget, or an LSM scope that has resolved) and that
+//! came from a real `Some(index)` log callback is replayed
+//! (`replay_tier_deferral`): the
 //! replay runs that callback again through the function it used.
 use std::io::{Error, ErrorKind};
 
@@ -39,7 +40,11 @@ impl FenceCause {
 	pub(super) const fn replayable(self) -> bool {
 		matches!(
 			self,
-			Self::IndexGate | Self::NoBudget | Self::NoScratch | Self::L2Unavailable
+			Self::IndexGate
+				| Self::NoBudget
+				| Self::NoScratch
+				| Self::L2Unavailable
+				| Self::LsmScope
 		)
 	}
 

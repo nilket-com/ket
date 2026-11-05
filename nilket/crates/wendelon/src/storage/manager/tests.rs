@@ -75,7 +75,7 @@ async fn maintenance_staged_publication_recovery_distinguishes_s0_from_s1() {
 	let file_ops = BlockingFileOps;
 	let old = SlabId::new(41);
 	let replacement = SlabId::new(42);
-	let staged = maintenance_staged_slab_path(&dir, old, replacement);
+	let staged = maintenance_staged_path_of(&dir, old, replacement);
 	std::fs::write(&staged, b"staged-replacement").unwrap();
 
 	let old_run = LsmRunSummary::new(
@@ -113,7 +113,7 @@ async fn maintenance_staged_publication_recovery_distinguishes_s0_from_s1() {
 	);
 
 	let s0_replacement = SlabId::new(43);
-	let s0 = maintenance_staged_slab_path(&dir, old, s0_replacement);
+	let s0 = maintenance_staged_path_of(&dir, old, s0_replacement);
 	std::fs::write(&s0, b"uncommitted-replacement").unwrap();
 	reconcile_staged_maintenance_publications(&file_ops, &dir, None, None)
 		.await
@@ -130,7 +130,7 @@ async fn maintenance_staged_install_retries_and_preserves_s1_for_recovery() {
 	let dir = fresh_dir("maintenance-staged-install-retry");
 	let old = SlabId::new(51);
 	let replacement = SlabId::new(52);
-	let staged = maintenance_staged_slab_path(&dir, old, replacement);
+	let staged = maintenance_staged_path_of(&dir, old, replacement);
 	let final_path = slab_path(&dir, replacement);
 	let old_run = LsmRunSummary::new(
 		old,
@@ -2707,7 +2707,7 @@ impl CommandCommitter for DirectLsmCommitter {
 		&self,
 		remove: &crate::consensus::slab_ops::GcRemove,
 	) -> std::io::Result<()> {
-		self.manager.apply_lsm_gc_removal(remove)?;
+		let _ = remove;
 		Ok(())
 	}
 
@@ -15821,8 +15821,9 @@ async fn maintenance_publication_refuses_relocation_survivor_mismatch() {
 		retention_ambiguous: false,
 		retention_lag_seconds: 0,
 	}];
-	let replacement_id = mgr.reserve_slab_id().await.unwrap();
-	let staged_path = maintenance_staged_slab_path(&mgr.config.dir, old_slab, replacement_id);
+	let replacement_exposed = mgr.reserve_exposed_slab_id().await.unwrap();
+	let replacement_id = replacement_exposed.id();
+	let staged_path = maintenance_staged_path_of(&mgr.config.dir, old_slab, replacement_id);
 	let replacement = Arc::new(
 		LocalSlabStore::open(
 			&staged_path,
@@ -15838,7 +15839,7 @@ async fn maintenance_publication_refuses_relocation_survivor_mismatch() {
 	let err = mgr
 		.finish_compaction_with_replacement(
 			old_slab,
-			replacement_id,
+			&ExposedSlab::unbound_for_test(replacement_id),
 			replacement,
 			&records,
 			&[],
@@ -24800,8 +24801,9 @@ async fn replacement_compaction_finisher_waits_for_source_tier_lock() {
 		retention_ambiguous: false,
 		retention_lag_seconds: 0,
 	};
-	let replacement_id = mgr.reserve_slab_id().await.unwrap();
-	let staged = maintenance_staged_slab_path(&mgr.config.dir, slab_id, replacement_id);
+	let replacement_exposed = mgr.reserve_exposed_slab_id().await.unwrap();
+	let replacement_id = replacement_exposed.id();
+	let staged = maintenance_staged_path_of(&mgr.config.dir, slab_id, replacement_id);
 	let replacement = Arc::new(
 		LocalSlabStore::open(
 			&staged,
@@ -24820,7 +24822,7 @@ async fn replacement_compaction_finisher_waits_for_source_tier_lock() {
 		tokio::spawn(async move {
 			mgr.finish_compaction_with_replacement(
 				slab_id,
-				replacement_id,
+				&ExposedSlab::unbound_for_test(replacement_id),
 				replacement,
 				&[record],
 				&[],
@@ -30651,6 +30653,22 @@ async fn dc126_replacement_retains_old_sidecar_and_counts_its_bytes() {
 	);
 }
 
+/// Hold a GC removal at its disposal entry: its intent and expected input are
+/// captured, and nothing exclusive or destructive has happened. A concurrent change
+/// landing here must be refused by the local recheck, with Complete never sent.
+fn hold_gc_disposal_entry(
+	manager: &SlabManager,
+) -> (Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>) {
+	let entered = Arc::new(tokio::sync::Semaphore::new(0));
+	let release = Arc::new(tokio::sync::Semaphore::new(0));
+	*manager
+		.continuity_test_holds
+		.gc_disposal_entry_hold
+		.lock()
+		.unwrap() = Some((entered.clone(), release.clone()));
+	(entered, release)
+}
+
 struct GcPauseAfterRemoveCommit {
 	manager: Arc<SlabManager>,
 	entered: Arc<tokio::sync::Semaphore>,
@@ -30672,7 +30690,7 @@ impl CommandCommitter for GcPauseAfterRemoveCommit {
 		&self,
 		remove: &crate::consensus::slab_ops::GcRemove,
 	) -> std::io::Result<()> {
-		self.manager.apply_lsm_gc_removal(remove)?;
+		let _ = remove;
 		self.entered.add_permits(1);
 		let _ = self.release.acquire().await;
 		Ok(())
@@ -30736,6 +30754,7 @@ async fn gc_control_revision_mismatch_keeps_file_and_fences_reopen() {
 	assert!(path.exists());
 	let entered = Arc::new(tokio::sync::Semaphore::new(0));
 	let release = Arc::new(tokio::sync::Semaphore::new(0));
+	let (disposal_entered, disposal_release) = hold_gc_disposal_entry(&manager);
 	let committer = Arc::new(GcPauseAfterRemoveCommit {
 		manager: manager.clone(),
 		entered: entered.clone(),
@@ -30751,7 +30770,7 @@ async fn gc_control_revision_mismatch_keeps_file_and_fences_reopen() {
 				.await
 		})
 	};
-	tokio::time::timeout(Duration::from_secs(60), entered.acquire())
+	tokio::time::timeout(Duration::from_secs(60), disposal_entered.acquire())
 		.await
 		.unwrap()
 		.unwrap()
@@ -30764,7 +30783,7 @@ async fn gc_control_revision_mismatch_keeps_file_and_fences_reopen() {
 	let guard = tier_lock.lock().await;
 	manager.bump_slab_publication_revision(target).unwrap();
 	drop(guard);
-	release.add_permits(1);
+	disposal_release.add_permits(1);
 	assert_eq!(
 		task.await.unwrap().unwrap_err().kind(),
 		ErrorKind::WouldBlock
@@ -30795,6 +30814,11 @@ async fn gc_control_revision_mismatch_keeps_file_and_fences_reopen() {
 		Some("TierAuthorityLsmUnresolved")
 	);
 	assert!(path.exists());
+	assert_eq!(
+		entered.available_permits(),
+		0,
+		"Complete was never submitted after the failed local check"
+	);
 }
 
 async fn seed_small_retired_gc_slab(manager: &Arc<SlabManager>) -> (SlabId, Identity) {
@@ -31026,7 +31050,29 @@ async fn gc_crash_steps_preserve_or_complete_deletion_on_reopen() {
 					.iter()
 					.all(|row| row.location.slab_id != slab_id)
 			);
-			if kind == "control" && boundary != "cleared" {
+			if kind == "control" && boundary == "clear" {
+				// Past the run drop the LSM scope is finished; the removal's own row
+				// is what remains, and a restart stays fenced on it.
+				assert!(
+					snapshot.lsm_install_intents.is_empty(),
+					"{step}: the finished LSM scope went with the run"
+				);
+				assert_eq!(
+					manager
+						.require_op_index()
+						.unwrap()
+						.load_op_intents()
+						.await
+						.unwrap()
+						.len(),
+					1,
+					"{step}: the removal's row stays"
+				);
+				assert_eq!(
+					manager.tier_authority_readiness_reason().as_deref(),
+					Some("UnresolvedOpIntent")
+				);
+			} else if kind == "control" && boundary != "cleared" {
 				assert!(
 					!snapshot.lsm_install_intents.is_empty(),
 					"{step}: unfinished control intent survives"
@@ -31102,6 +31148,7 @@ async fn gc_control_concurrent_tier_apply_refuses_stale_local_removal() {
 	mark_gc_target_for_control_test(&manager, slab_id).await;
 	let entered = Arc::new(tokio::sync::Semaphore::new(0));
 	let release = Arc::new(tokio::sync::Semaphore::new(0));
+	let (disposal_entered, disposal_release) = hold_gc_disposal_entry(&manager);
 	let committer = Arc::new(GcPauseAfterRemoveCommit {
 		manager: manager.clone(),
 		entered: entered.clone(),
@@ -31117,7 +31164,7 @@ async fn gc_control_concurrent_tier_apply_refuses_stale_local_removal() {
 				.await
 		})
 	};
-	tokio::time::timeout(Duration::from_secs(60), entered.acquire())
+	tokio::time::timeout(Duration::from_secs(60), disposal_entered.acquire())
 		.await
 		.unwrap()
 		.unwrap()
@@ -31137,7 +31184,7 @@ async fn gc_control_concurrent_tier_apply_refuses_stale_local_removal() {
 		);
 		println!("concurrent tier observer published its pointer");
 	}
-	release.add_permits(1);
+	disposal_release.add_permits(1);
 	assert_eq!(
 		task.await.unwrap().unwrap_err().kind(),
 		ErrorKind::WouldBlock
@@ -31174,6 +31221,11 @@ async fn gc_control_concurrent_tier_apply_refuses_stale_local_removal() {
 	assert_eq!(
 		reopened.tier_authority_readiness_reason().as_deref(),
 		Some("TierAuthorityLsmUnresolved")
+	);
+	assert_eq!(
+		entered.available_permits(),
+		0,
+		"Complete was never submitted after the failed local check"
 	);
 }
 
@@ -31214,6 +31266,7 @@ async fn gc_control_concurrent_tier_retirement_refuses_stale_local_removal() {
 	mark_gc_target_for_control_test(&manager, slab_id).await;
 	let entered = Arc::new(tokio::sync::Semaphore::new(0));
 	let release = Arc::new(tokio::sync::Semaphore::new(0));
+	let (disposal_entered, disposal_release) = hold_gc_disposal_entry(&manager);
 	let committer = Arc::new(GcPauseAfterRemoveCommit {
 		manager: manager.clone(),
 		entered: entered.clone(),
@@ -31229,13 +31282,13 @@ async fn gc_control_concurrent_tier_retirement_refuses_stale_local_removal() {
 				.await
 		})
 	};
-	tokio::time::timeout(Duration::from_secs(60), entered.acquire())
+	tokio::time::timeout(Duration::from_secs(60), disposal_entered.acquire())
 		.await
 		.unwrap()
 		.unwrap()
 		.forget();
 	assert!(manager.retire_tiered_slab(slab_id).await.unwrap());
-	release.add_permits(1);
+	disposal_release.add_permits(1);
 	assert_eq!(
 		task.await.unwrap().unwrap_err().kind(),
 		ErrorKind::WouldBlock
@@ -31259,6 +31312,11 @@ async fn gc_control_concurrent_tier_retirement_refuses_stale_local_removal() {
 	assert_eq!(
 		reopened.tier_authority_readiness_reason().as_deref(),
 		Some("TierAuthorityLsmUnresolved")
+	);
+	assert_eq!(
+		entered.available_permits(),
+		0,
+		"Complete was never submitted after the failed local check"
 	);
 }
 
@@ -31531,6 +31589,7 @@ async fn shared_key_tier_refresh_during_gc_refuses_and_records_pointer() {
 	mark_gc_target_for_control_test(&manager, gc_slab).await;
 	let entered = Arc::new(tokio::sync::Semaphore::new(0));
 	let release = Arc::new(tokio::sync::Semaphore::new(0));
+	let (disposal_entered, disposal_release) = hold_gc_disposal_entry(&manager);
 	let committer = Arc::new(GcPauseAfterRemoveCommit {
 		manager: manager.clone(),
 		entered: entered.clone(),
@@ -31546,7 +31605,7 @@ async fn shared_key_tier_refresh_during_gc_refuses_and_records_pointer() {
 				.await
 		})
 	};
-	tokio::time::timeout(Duration::from_secs(60), entered.acquire())
+	tokio::time::timeout(Duration::from_secs(60), disposal_entered.acquire())
 		.await
 		.unwrap()
 		.unwrap()
@@ -31572,6 +31631,8 @@ async fn shared_key_tier_refresh_during_gc_refuses_and_records_pointer() {
 		&second
 	);
 
+	disposal_release.add_permits(1);
+	// The refused tier is a different slab's: this GC goes on to Complete.
 	release.add_permits(1);
 	assert!(task.await.unwrap().unwrap().contains(&gc_slab));
 	assert!(
@@ -31628,6 +31689,7 @@ async fn physical_key_missing_from_private_index_still_blocks_tier_refresh() {
 	mark_gc_target_for_control_test(&manager, gc_slab).await;
 	let entered = Arc::new(tokio::sync::Semaphore::new(0));
 	let release = Arc::new(tokio::sync::Semaphore::new(0));
+	let (disposal_entered, disposal_release) = hold_gc_disposal_entry(&manager);
 	let committer = Arc::new(GcPauseAfterRemoveCommit {
 		manager: manager.clone(),
 		entered: entered.clone(),
@@ -31643,7 +31705,7 @@ async fn physical_key_missing_from_private_index_still_blocks_tier_refresh() {
 				.await
 		})
 	};
-	tokio::time::timeout(Duration::from_secs(60), entered.acquire())
+	tokio::time::timeout(Duration::from_secs(60), disposal_entered.acquire())
 		.await
 		.unwrap()
 		.unwrap()
@@ -31669,6 +31731,8 @@ async fn physical_key_missing_from_private_index_still_blocks_tier_refresh() {
 		&second
 	);
 
+	disposal_release.add_permits(1);
+	// The refused tier is a different slab's: this GC goes on to Complete.
 	release.add_permits(1);
 	assert!(task.await.unwrap().unwrap().contains(&gc_slab));
 	assert!(
@@ -36654,8 +36718,9 @@ async fn a9_maintenance_fixture(keep_source: bool) -> A9MaintenanceFixture {
 		.unwrap();
 	let old_slab = force_seal_active(&manager).await;
 	manager.ensure_live_lsm_run_for_maintenance(old_slab, 8192);
-	let new_slab = manager.reserve_slab_id().await.unwrap();
-	let staged = maintenance_staged_slab_path(&manager.config.dir, old_slab, new_slab);
+	let new_exposed = manager.reserve_exposed_slab_id().await.unwrap();
+	let new_slab = new_exposed.id();
+	let staged = maintenance_staged_path_of(&manager.config.dir, old_slab, new_slab);
 	let replacement = Arc::new(
 		LocalSlabStore::open(
 			&staged,
@@ -36744,7 +36809,7 @@ async fn a9_shared_output_keeps_the_live_survivor_in_the_durable_index() {
 		.manager
 		.finish_compaction_with_replacement(
 			f.old_slab,
-			f.new_slab,
+			&ExposedSlab::unbound_for_test(f.new_slab),
 			f.replacement.clone(),
 			&f.records,
 			&f.relocations,
@@ -36799,7 +36864,7 @@ async fn a9_missing_sources_refuse_before_d2_or_fail_stop_on_refused_delta_error
 		manager
 			.finish_compaction_with_replacement(
 				old,
-				new,
+				&ExposedSlab::unbound_for_test(new),
 				replacement,
 				&records,
 				&relocations,
@@ -36894,7 +36959,7 @@ async fn a9_missing_sources_cannot_reappear_from_the_second_persist_crash_window
 		manager
 			.finish_compaction_with_replacement(
 				old,
-				new,
+				&ExposedSlab::unbound_for_test(new),
 				replacement,
 				&records,
 				&relocations,
@@ -36962,7 +37027,7 @@ async fn a9_unexpected_refusal_after_d2_retains_the_maintenance_gate() {
 		manager
 			.finish_compaction_with_replacement(
 				old,
-				new,
+				&ExposedSlab::unbound_for_test(new),
 				replacement,
 				&records,
 				&relocations,
@@ -37023,7 +37088,7 @@ async fn a9_durable_survivors_stay_readable_after_a_d2_crash() {
 		manager
 			.finish_compaction_with_replacement(
 				old,
-				new,
+				&ExposedSlab::unbound_for_test(new),
 				replacement,
 				&records,
 				&relocations,
@@ -46351,11 +46416,14 @@ async fn dc160a_reserved_slab_ids_are_not_reissued_after_reopen() {
 		.append_durable(tenant(), id(0xA160), hlc(10), b"row")
 		.await
 		.unwrap();
-	let before = manager.reserve_lsm_output_slab_ids(4).await.unwrap();
+	let ids = |reserved: Vec<crate::storage::ReservedSlab>| {
+		reserved.iter().map(|slab| slab.id()).collect::<Vec<_>>()
+	};
+	let before = ids(manager.reserve_lsm_output_slab_ids(4).await.unwrap());
 	drop(manager);
 
 	let reopened = SlabManager::open(gc_owned_test_config(&dir)).await.unwrap();
-	let after = reopened.reserve_lsm_output_slab_ids(4).await.unwrap();
+	let after = ids(reopened.reserve_lsm_output_slab_ids(4).await.unwrap());
 	let reissued: Vec<_> = after.iter().filter(|id| before.contains(id)).collect();
 	assert!(
 		reissued.is_empty(),
@@ -47907,6 +47975,8 @@ async fn a_full_window_refuses_new_work_and_the_reserved_gc_removal_still_drains
 
 	// Fill the rest of the window with real, decided operations. Their local
 	// bookkeeping is the fixture's shortcut.
+	// Seeded before the window fills: its compaction is admitted work like any other.
+	let (competing, _) = seed_small_retired_gc_slab(&mgr).await;
 	let retire = |offset: u64| owner.slab(SlabId::new(0x10_000 + offset));
 	for offset in 0..OPS_WINDOW_W - 1 {
 		let request = mgr.retire_request_for_test(retire(offset)).await;
@@ -47927,8 +47997,9 @@ async fn a_full_window_refuses_new_work_and_the_reserved_gc_removal_still_drains
 			.unwrap_or_else(|| panic!("expected TerminalBacklog, got {error}"))
 	};
 
-	// A real producer is refused, at its precheck and, having lost the race to
-	// the last slot, at its allocation. Neither leaves a fence on reserved work.
+	// A real producer is refused with durable charging on, and leaves no fence on
+	// reserved work. Its late-allocation arm is the forward-admission control, whose
+	// state is legal: here the window is simply full.
 	let compaction = LsmCompactionWorker::new(LsmConfig::default(), mgr.slab_pin_table()).unwrap();
 	let key = id(0xdd77);
 	let written = mgr
@@ -47936,10 +48007,7 @@ async fn a_full_window_refuses_new_work_and_the_reserved_gc_removal_still_drains
 		.await
 		.unwrap();
 	assert_eq!(mgr.force_seal_active_for_test().await, written.slab_id);
-	for skip_precheck in [false, true] {
-		mgr.continuity_test_holds
-			.skip_op_room_precheck
-			.store(skip_precheck, Ordering::Release);
+	{
 		let before = mgr.compaction_manifest_snapshot();
 		let plan = CompactionPlan {
 			job_id: CompactionJobId::new(0x0697_0002),
@@ -47961,21 +48029,17 @@ async fn a_full_window_refuses_new_work_and_the_reserved_gc_removal_still_drains
 		);
 		assert!(
 			!mgr.has_orphaned_lsm_intents(),
-			"a proven no-allocation refusal leaves no orphaned scope (skip={skip_precheck})"
+			"a proven no-allocation refusal leaves no orphaned scope"
 		);
 		assert_eq!(mgr.tier_authority_readiness_reason(), None);
 	}
-	mgr.continuity_test_holds
-		.skip_op_room_precheck
-		.store(false, Ordering::Release);
 
 	let error = index
 		.allocate_ops(
 			vec![crate::consensus::slab_ops::SlabCommand::GcRemove(
 				crate::consensus::slab_ops::GcRemove {
-					owner,
 					job_id: CompactionJobId::new(0x0697),
-					slab: SlabId::new(0x20_000),
+					slab: owner.slab(SlabId::new(0x20_000)),
 					expected_run: crate::consensus::slab_ops::RunIdentity {
 						compaction_level: crate::schema::CompactionLevelIndex::L0,
 						size_bytes: crate::schema::ByteCount::new(0),
@@ -47994,9 +48058,9 @@ async fn a_full_window_refuses_new_work_and_the_reserved_gc_removal_still_drains
 	assert_eq!(holder.transition, Some("gc_remove"));
 	assert_eq!(holder.state, OpHolderState::Reserved);
 
-	// A competing retired run wants a new mark, and the unreserved run a new
-	// removal; both are refused and neither starves the reserved removal.
-	let (competing, _) = seed_small_retired_gc_slab(&mgr).await;
+	// A competing retired run wants a new mark, refused by the window. The run
+	// with no reservation has no claim behind it and stays fenced. Neither starves
+	// the reserved removal.
 	mgr.continuity_test_holds
 		.gc_remove_held
 		.store(false, Ordering::Release);
@@ -48013,7 +48077,7 @@ async fn a_full_window_refuses_new_work_and_the_reserved_gc_removal_still_drains
 		mgr.compaction_manifest_snapshot()
 			.delete_pending_runs()
 			.any(|run| run.slab_id == unreserved),
-		"the unreserved run waits for room"
+		"the unreserved run stays fenced"
 	);
 	assert!(
 		mgr.compaction_manifest_snapshot()
@@ -48031,10 +48095,16 @@ async fn a_full_window_refuses_new_work_and_the_reserved_gc_removal_still_drains
 		.sweep_lsm_delete_pending_once_via_control_ring(&gc, committer.as_ref())
 		.await
 		.unwrap();
-	assert!(deleted.contains(&unreserved), "{deleted:?}");
-	assert!(
-		mgr.compaction_manifest_snapshot().run(competing).is_none(),
+	assert_eq!(
+		deleted,
+		vec![competing],
 		"the competing run is marked and removed"
+	);
+	assert!(
+		mgr.compaction_manifest_snapshot()
+			.delete_pending_runs()
+			.any(|run| run.slab_id == unreserved),
+		"room creates no authority for the run with no claim"
 	);
 }
 
@@ -48802,6 +48872,29 @@ async fn a_rejected_retirement_leaves_the_newer_generation_and_its_cleanup_marke
 	);
 }
 
+/// A supersession cannot apply while the lease stands. Read from the state itself:
+/// the raft metric lags `client_write`, so a sample of it taken just after an earlier
+/// entry can move for that entry alone. Busy means a writer is queued behind the lease.
+async fn assert_supersession_stays_behind_the_lease<T>(
+	cluster: &ControlCluster,
+	owner: crate::consensus::OwnerRef,
+	supersede: &tokio::task::JoinHandle<T>,
+) {
+	tokio::time::sleep(Duration::from_millis(500)).await;
+	assert!(
+		!supersede.is_finished(),
+		"the supersession finished while the old stage could still commit"
+	);
+	let source = cluster.state_machines[0].tier_snapshot_source_for_test();
+	if let Ok((_, registry)) = source.try_tiered_slab(owner.slab(SlabId::new(0))) {
+		assert_eq!(
+			registry.current,
+			Some(owner.incarnation()),
+			"the supersession applied while the old stage could still commit"
+		);
+	}
+}
+
 /// R3 across cancellation: the blocking handoff owns its lease. Its caller is
 /// aborted while the transaction is paused before commit. A supersession cannot
 /// apply until that transaction ends, so no handoff commits after supersession.
@@ -48845,11 +48938,6 @@ async fn a_cancelled_handoff_keeps_its_authority_until_its_transaction_ends() {
 		"premise: the async caller is gone, its transaction is not"
 	);
 
-	let applied_before = cluster.nodes[0]
-		.metrics()
-		.borrow()
-		.last_applied
-		.map(|id| id.index);
 	let writer = cluster.nodes[0].clone();
 	let successor = crate::consensus::StoreIncarnation::from_raw(0x55);
 	let incarnation = owner.incarnation();
@@ -48865,16 +48953,7 @@ async fn a_cancelled_handoff_keeps_its_authority_until_its_transaction_ends() {
 			.await
 			.unwrap()
 	});
-	tokio::time::sleep(Duration::from_millis(500)).await;
-	assert_eq!(
-		cluster.nodes[0]
-			.metrics()
-			.borrow()
-			.last_applied
-			.map(|id| id.index),
-		applied_before,
-		"the supersession applied while the old handoff could still commit"
-	);
+	assert_supersession_stays_behind_the_lease(&cluster, owner, &supersede).await;
 	assert!(!supersede.is_finished());
 	assert_eq!(mgr.tier_authority_readiness_reason(), None);
 
@@ -48945,4 +49024,2750 @@ async fn a_store_missing_cleanup_evidence_refuses_to_hand_off_an_applied_op() {
 		"an applied op left its Intent without cleanup evidence"
 	);
 	assert_eq!(index.load_op_intents().await.unwrap().len(), 1);
+}
+
+/// DC-157 on a real ring: a pause around GC's mark, so a TierSlab can land with
+/// the ring ordering either side first.
+struct PauseAroundMark {
+	/// Pause before the mark reaches the ring, or after it is decided.
+	before: bool,
+	inner: crate::storage::RaftCommitter,
+	entered: Arc<tokio::sync::Semaphore>,
+	release: Arc<tokio::sync::Semaphore>,
+}
+
+#[async_trait]
+impl TierCommitter for PauseAroundMark {
+	async fn preflight(&self, owner: crate::consensus::OwnerRef) -> std::io::Result<()> {
+		self.inner.preflight(owner).await
+	}
+	async fn submit_op(
+		&self,
+		ticket: &crate::storage::index::OpTicket,
+	) -> std::io::Result<crate::storage::VerifiedReceipt> {
+		let mark = matches!(
+			ticket.command(),
+			crate::consensus::slab_ops::SlabCommand::Compaction(_)
+		);
+		if mark && self.before {
+			self.entered.add_permits(1);
+			let _ = self.release.acquire().await;
+		}
+		let receipt = self.inner.submit_op(ticket).await;
+		if mark && !self.before {
+			self.entered.add_permits(1);
+			let _ = self.release.acquire().await;
+		}
+		receipt
+	}
+	async fn cancel_op(
+		&self,
+		ticket: &crate::storage::index::OpTicket,
+	) -> std::io::Result<crate::storage::VerifiedReceipt> {
+		self.inner.cancel_op(ticket).await
+	}
+	async fn ack_outcomes(
+		&self,
+		owner: crate::consensus::OwnerRef,
+		seqs: Vec<u64>,
+	) -> std::io::Result<crate::consensus::slab_ops::AckReceipt> {
+		self.inner.ack_outcomes(owner, seqs).await
+	}
+	async fn op_prefix(&self, owner: crate::consensus::OwnerRef) -> std::io::Result<Option<u64>> {
+		self.inner.op_prefix(owner).await
+	}
+}
+
+/// A retired slab with its tier candidate uploaded, on a store serving a ring.
+async fn dc157_ring_fixture(
+	label: &str,
+) -> (
+	[crate::test_support::TestDir; 2],
+	Arc<SlabManager>,
+	ControlCluster,
+	SlabId,
+	TieredSlabPointer,
+) {
+	let (dirs, mgr, l2) = fresh_manager_with_l2(label).await;
+	let (slab_id, _key) = seed_small_retired_gc_slab(&mgr).await;
+	let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
+	let encrypted = mgr.encrypt_tiered_object_blob(slab_id, &raw).unwrap();
+	let uri = l2
+		.put(&format!("{label}/object"), &encrypted.bytes)
+		.await
+		.unwrap();
+	let pointer = tiered_pointer_from_blob(&mgr, slab_id, uri, &encrypted.bytes);
+	let cluster = control_cluster_observing(&[(1, &mgr)]).await;
+	register_owner(&cluster.nodes[0], &mgr).await;
+	(dirs, mgr, cluster, slab_id, pointer)
+}
+
+/// Availability after GC met a tier of its slab, whichever came first: the race
+/// resolved, and the store serves unrelated work with nothing left unresolved.
+async fn assert_dc157_resolved(mgr: &Arc<SlabManager>, key: u64) {
+	let index = mgr.require_op_index().unwrap();
+	assert_eq!(
+		mgr.lsm_install_unresolved.len(),
+		0,
+		"the race left an unresolved LSM intent"
+	);
+	// The tier the race fenced retries once the intent is gone.
+	let ready = tokio::time::timeout(Duration::from_secs(30), async {
+		while mgr.tier_authority_readiness_reason().is_some() {
+			mgr.tier_authority.notify_publication_change();
+			tokio::time::sleep(Duration::from_millis(50)).await;
+		}
+	})
+	.await;
+	assert!(
+		ready.is_ok(),
+		"readiness stayed {:?}",
+		mgr.tier_authority_readiness_reason()
+	);
+	assert!(
+		index
+			.load_snapshot()
+			.await
+			.unwrap()
+			.lsm_install_intents
+			.is_empty(),
+		"the race left a durable LSM intent"
+	);
+	mgr.append_durable(tenant(), id(key), hlc(30_000), b"dc157-unrelated")
+		.await
+		.expect("an unrelated key stays writable");
+}
+
+/// Control: a slab already tiered when the sweep looks at it is skipped by local
+/// checks, before any sequence is spent. This is not the race; see the next test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dc157_real_ring_control_a_slab_tiered_before_the_sweep_is_never_marked() {
+	let (_dirs, mgr, cluster, slab_id, pointer) = dc157_ring_fixture("dc157-tier-before").await;
+	let committer = Arc::new(op_committer(&cluster, 1));
+	let retired = mgr.compaction_manifest_snapshot().run(slab_id).cloned();
+	crate::storage::sweeper::propose_tier_slab(
+		&mgr,
+		committer.as_ref(),
+		b10_tier(&mgr, &pointer),
+		None,
+	)
+	.await
+	.unwrap();
+	let index = mgr.require_op_index().unwrap();
+	let spent = index.next_op_seq_for_test().await.unwrap();
+	let gc = LsmGcWorker::new(LsmConfig::default(), mgr.slab_pin_table()).unwrap();
+	let deleted = tokio::time::timeout(
+		Duration::from_secs(60),
+		mgr.sweep_lsm_delete_pending_once_via_control_ring(&gc, committer.as_ref()),
+	)
+	.await
+	.expect("GC joins")
+	.unwrap();
+	assert!(deleted.is_empty());
+	assert_eq!(index.next_op_seq_for_test().await.unwrap(), spent);
+	assert_dc157_resolved(&mgr, 0xdd61).await;
+	assert_eq!(
+		mgr.compaction_manifest_snapshot().run(slab_id).cloned(),
+		retired
+	);
+	assert_eq!(mgr.try_canonical_tier_pointer(slab_id), Some(Some(pointer)));
+}
+
+/// The ring ordered the tier first, after GC's local checks passed and its mark
+/// was allocated: the mark is the rejected side. The pointer stands, the run stays
+/// exactly Retired, the node is available, and no later sweep retries the claim.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dc157_real_ring_tier_first_rejects_the_mark_and_leaves_the_node_available() {
+	let (_dirs, mgr, cluster, slab_id, pointer) = dc157_ring_fixture("dc157-tier-first").await;
+	let plain = Arc::new(op_committer(&cluster, 1));
+	let retired = mgr.compaction_manifest_snapshot().run(slab_id).cloned();
+	let entered = Arc::new(tokio::sync::Semaphore::new(0));
+	let release = Arc::new(tokio::sync::Semaphore::new(0));
+	let pausing = Arc::new(PauseAroundMark {
+		before: true,
+		inner: op_committer(&cluster, 1),
+		entered: entered.clone(),
+		release: release.clone(),
+	});
+	let sweep = {
+		let mgr = mgr.clone();
+		let pausing = pausing.clone();
+		tokio::spawn(async move {
+			let gc = LsmGcWorker::new(LsmConfig::default(), mgr.slab_pin_table()).unwrap();
+			mgr.sweep_lsm_delete_pending_once_via_control_ring(&gc, pausing.as_ref())
+				.await
+		})
+	};
+	tokio::time::timeout(Duration::from_secs(60), entered.acquire())
+		.await
+		.expect("GC's mark is allocated and about to reach the ring")
+		.unwrap()
+		.forget();
+	crate::storage::sweeper::propose_tier_slab(
+		&mgr,
+		plain.as_ref(),
+		b10_tier(&mgr, &pointer),
+		None,
+	)
+	.await
+	.unwrap();
+	// While the overlapping scope stands, however often the replay runs, the
+	// committed pointer cannot publish locally.
+	for _ in 0..10 {
+		mgr.tier_authority.notify_publication_change();
+		tokio::time::sleep(Duration::from_millis(50)).await;
+	}
+	assert!(mgr.unapplied_tier_pointers.contains_key(&slab_id));
+	assert_eq!(mgr.tier_pointer(slab_id).await, None);
+	release.add_permits(8);
+	let first = tokio::time::timeout(Duration::from_secs(60), sweep)
+		.await
+		.expect("GC joins")
+		.unwrap();
+	assert!(
+		first.as_ref().is_ok_and(|deleted| deleted.is_empty()),
+		"a rejected claim deletes nothing and is not an error: {first:?}"
+	);
+	assert_dc157_resolved(&mgr, 0xdd64).await;
+	assert_eq!(
+		mgr.compaction_manifest_snapshot().run(slab_id).cloned(),
+		retired
+	);
+	assert_eq!(mgr.try_canonical_tier_pointer(slab_id), Some(Some(pointer)));
+	let index = mgr.require_op_index().unwrap();
+	let spent = index.next_op_seq_for_test().await.unwrap();
+	let gc = LsmGcWorker::new(LsmConfig::default(), mgr.slab_pin_table()).unwrap();
+	mgr.sweep_lsm_delete_pending_once_via_control_ring(&gc, plain.as_ref())
+		.await
+		.unwrap();
+	assert_eq!(
+		index.next_op_seq_for_test().await.unwrap(),
+		spent,
+		"a rejection that cannot change is not proposed again"
+	);
+}
+
+/// The ring ordered the mark first: the TierSlab is the rejected side, GC finishes
+/// its removal, and the id can never be tiered afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dc157_real_ring_mark_first_rejects_the_tier_and_finishes_the_removal() {
+	let (_dirs, mgr, cluster, slab_id, pointer) = dc157_ring_fixture("dc157-mark-first").await;
+	let plain = Arc::new(op_committer(&cluster, 1));
+	let entered = Arc::new(tokio::sync::Semaphore::new(0));
+	let release = Arc::new(tokio::sync::Semaphore::new(0));
+	let pausing = Arc::new(PauseAroundMark {
+		before: false,
+		inner: op_committer(&cluster, 1),
+		entered: entered.clone(),
+		release: release.clone(),
+	});
+	let sweep = {
+		let mgr = mgr.clone();
+		let pausing = pausing.clone();
+		tokio::spawn(async move {
+			let gc = LsmGcWorker::new(LsmConfig::default(), mgr.slab_pin_table()).unwrap();
+			mgr.sweep_lsm_delete_pending_once_via_control_ring(&gc, pausing.as_ref())
+				.await
+		})
+	};
+	tokio::time::timeout(Duration::from_secs(60), entered.acquire())
+		.await
+		.expect("GC's mark is decided")
+		.unwrap()
+		.forget();
+	let tier = crate::storage::sweeper::propose_tier_slab(
+		&mgr,
+		plain.as_ref(),
+		b10_tier(&mgr, &pointer),
+		None,
+	)
+	.await;
+	release.add_permits(8);
+	let gc_outcome = tokio::time::timeout(Duration::from_secs(60), sweep)
+		.await
+		.expect("GC joins")
+		.unwrap();
+	assert_eq!(
+		mgr.try_canonical_tier_pointer(slab_id),
+		Some(None),
+		"a tier of a claimed slab applied; it returned {tier:?}"
+	);
+	assert_eq!(gc_outcome.unwrap(), vec![slab_id]);
+	assert_dc157_resolved(&mgr, 0xdd62).await;
+	assert!(mgr.compaction_manifest_snapshot().run(slab_id).is_none());
+
+	let retry = crate::storage::sweeper::propose_tier_slab(
+		&mgr,
+		plain.as_ref(),
+		b10_tier(&mgr, &pointer),
+		None,
+	)
+	.await;
+	assert_eq!(
+		mgr.try_canonical_tier_pointer(slab_id),
+		Some(None),
+		"a tier of a removed slab applied; it returned {retry:?}"
+	);
+}
+
+/// Paired control for both orderings: the same GC from Retired on the same ring,
+/// with no tier, marks, removes and clears.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dc157_real_ring_control_the_same_gc_without_a_tier_completes() {
+	let (_dirs, mgr, cluster, slab_id, _pointer) = dc157_ring_fixture("dc157-ring-alone").await;
+	let committer = Arc::new(op_committer(&cluster, 1));
+	let gc = LsmGcWorker::new(LsmConfig::default(), mgr.slab_pin_table()).unwrap();
+	let deleted = tokio::time::timeout(
+		Duration::from_secs(60),
+		mgr.sweep_lsm_delete_pending_once_via_control_ring(&gc, committer.as_ref()),
+	)
+	.await
+	.expect("GC joins")
+	.unwrap();
+	assert_eq!(deleted, vec![slab_id]);
+	assert_dc157_resolved(&mgr, 0xdd63).await;
+	assert!(mgr.compaction_manifest_snapshot().run(slab_id).is_none());
+}
+
+// ADR 0697 §6.1: the live T1 order on a real ring.
+
+/// What the ring and the disk looked like when a removal reached the ring, and
+/// optional faults around it.
+struct WatchesRemoval {
+	inner: crate::storage::RaftCommitter,
+	mgr: Arc<SlabManager>,
+	dir: PathBuf,
+	/// Seen at the removal's submission.
+	seen: std::sync::Mutex<Option<(crate::storage::index::OpEvidence, bool, bool, bool)>>,
+	/// Answer the removal with a transport failure, after reading all of that.
+	fail_removal: std::sync::atomic::AtomicBool,
+	/// Supersede this store right after the removal applies.
+	supersede_after_removal: std::sync::atomic::AtomicBool,
+	raft: crate::consensus::WendelonRaft,
+	/// Transport failures left for Cancel.
+	lost_cancels: std::sync::atomic::AtomicU32,
+	/// Answer Cancel with a definite result that is not Cancelled.
+	wrong_cancel: std::sync::atomic::AtomicBool,
+	/// Supersede this store right after Cancel is decided.
+	supersede_after_cancel: std::sync::atomic::AtomicBool,
+	/// The removal, as it reached the ring.
+	removal: std::sync::Mutex<Option<(crate::consensus::slab_ops::GcRemove, u64)>>,
+	/// Before the removal reaches the ring: 1 replaces the quarantine entry with
+	/// other bytes of the same length, 2 removes it.
+	tamper_quarantine: std::sync::atomic::AtomicU32,
+}
+
+impl WatchesRemoval {
+	fn new(cluster: &ControlCluster, mgr: &Arc<SlabManager>, dir: &Path) -> Arc<Self> {
+		Arc::new(Self {
+			inner: op_committer(cluster, 1),
+			mgr: mgr.clone(),
+			dir: dir.to_path_buf(),
+			seen: Default::default(),
+			fail_removal: Default::default(),
+			supersede_after_removal: Default::default(),
+			raft: cluster.nodes[0].clone(),
+			lost_cancels: Default::default(),
+			wrong_cancel: Default::default(),
+			supersede_after_cancel: Default::default(),
+			tamper_quarantine: Default::default(),
+			removal: Default::default(),
+		})
+	}
+}
+
+async fn supersede_store(raft: &crate::consensus::WendelonRaft, owner: crate::consensus::OwnerRef) {
+	raft.client_write(crate::consensus::WendelonRequest::RegisterIncarnation(
+		crate::consensus::RegisterIncarnation {
+			node: owner.node(),
+			incarnation: crate::consensus::StoreIncarnation::from_raw(0x5555),
+			supersedes: Some(owner.incarnation()),
+		},
+	))
+	.await
+	.unwrap();
+}
+
+#[async_trait]
+impl TierCommitter for WatchesRemoval {
+	async fn preflight(&self, owner: crate::consensus::OwnerRef) -> std::io::Result<()> {
+		self.inner.preflight(owner).await
+	}
+	async fn submit_op(
+		&self,
+		ticket: &crate::storage::index::OpTicket,
+	) -> std::io::Result<crate::storage::VerifiedReceipt> {
+		let crate::consensus::slab_ops::SlabCommand::GcRemove(remove) = ticket.command() else {
+			return self.inner.submit_op(ticket).await;
+		};
+		*self.removal.lock().unwrap() = Some((remove.clone(), ticket.key().op_seq));
+		let index = self.mgr.require_op_index().unwrap();
+		let slab_id = remove.slab.local_id();
+		let evidence = index
+			.op_evidence(ticket.key().op_seq, ticket.digest())
+			.await?;
+		let durable_run = index
+			.load_snapshot()
+			.await?
+			.lsm_runs
+			.iter()
+			.any(|run| run.slab_id == slab_id);
+		*self.seen.lock().unwrap() = Some((
+			evidence,
+			durable_run,
+			slab_path(&self.dir, slab_id).exists(),
+			super::gc_disposal::gc_quarantine_path(&self.dir, slab_id, remove.job_id).exists(),
+		));
+		let quarantine = super::gc_disposal::gc_quarantine_path(&self.dir, slab_id, remove.job_id);
+		match self.tamper_quarantine.load(Ordering::Acquire) {
+			1 => {
+				let length = std::fs::metadata(&quarantine)?.len() as usize;
+				std::fs::remove_file(&quarantine)?;
+				std::fs::write(&quarantine, vec![0x5a; length])?;
+			}
+			2 => std::fs::remove_file(&quarantine)?,
+			_ => {}
+		}
+		if self.fail_removal.load(Ordering::Acquire) {
+			return Err(Error::other("injected transport failure"));
+		}
+		let receipt = self.inner.submit_op(ticket).await;
+		if self.supersede_after_removal.load(Ordering::Acquire) {
+			supersede_store(&self.raft, remove.slab.owner()).await;
+		}
+		receipt
+	}
+	async fn cancel_op(
+		&self,
+		ticket: &crate::storage::index::OpTicket,
+	) -> std::io::Result<crate::storage::VerifiedReceipt> {
+		if self.wrong_cancel.load(Ordering::Acquire) {
+			return Ok(crate::storage::VerifiedReceipt::Applied { index: 1 });
+		}
+		if self
+			.lost_cancels
+			.fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+				left.checked_sub(1)
+			})
+			.is_ok()
+		{
+			return Err(Error::other("injected loss of Cancel's response"));
+		}
+		let receipt = self.inner.cancel_op(ticket).await;
+		if self.supersede_after_cancel.load(Ordering::Acquire) {
+			supersede_store(&self.raft, ticket.key().owner).await;
+		}
+		receipt
+	}
+	async fn ack_outcomes(
+		&self,
+		owner: crate::consensus::OwnerRef,
+		seqs: Vec<u64>,
+	) -> std::io::Result<crate::consensus::slab_ops::AckReceipt> {
+		self.inner.ack_outcomes(owner, seqs).await
+	}
+	async fn op_prefix(&self, owner: crate::consensus::OwnerRef) -> std::io::Result<Option<u64>> {
+		self.inner.op_prefix(owner).await
+	}
+}
+
+fn new_gc(mgr: &SlabManager) -> LsmGcWorker {
+	LsmGcWorker::new(LsmConfig::default(), mgr.slab_pin_table()).unwrap()
+}
+
+/// Complete reaches the ring only with the run durably gone and the original moved
+/// to its quarantine entry, and its Applied is what lets that entry go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn complete_reaches_the_ring_only_after_the_run_is_durably_gone() {
+	let (dirs, mgr, cluster, slab_id, _pointer) = dc157_ring_fixture("t1-order").await;
+	let committer = WatchesRemoval::new(&cluster, &mgr, &dirs[0]);
+	assert_eq!(
+		mgr.sweep_lsm_delete_pending_once_via_control_ring(&new_gc(&mgr), committer.as_ref())
+			.await
+			.unwrap(),
+		vec![slab_id]
+	);
+	let (evidence, durable_run, original, quarantine) =
+		committer.seen.lock().unwrap().clone().expect("submitted");
+	assert!(
+		matches!(
+			evidence,
+			crate::storage::index::OpEvidence::Intent(Some(
+				crate::storage::index::OpProgress::RunDropped(Some(_))
+			))
+		),
+		"{evidence:?}"
+	);
+	assert!(!durable_run, "the run is durably gone before Complete");
+	assert!(!original, "the original is gone before Complete");
+	assert!(quarantine, "its evidence is in quarantine before Complete");
+	assert!(
+		std::fs::read_dir(&*dirs[0]).unwrap().all(|entry| !entry
+			.unwrap()
+			.file_name()
+			.to_string_lossy()
+			.starts_with("gc-quarantine-")),
+		"Complete's Applied purged the entry"
+	);
+	let owner = mgr.owner_ref().unwrap();
+	assert!(
+		mgr.canonical_tier_source
+			.get()
+			.unwrap()
+			.read()
+			.await
+			.unwrap()
+			.removed_for_current_owner(owner.slab(slab_id))
+	);
+}
+
+/// Unexpected file loss cannot impersonate progress: the local check refuses, the
+/// run and the intent stay, and nothing reaches the ring.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_missing_original_fences_and_is_never_adopted_as_progress() {
+	let (dirs, mgr, cluster, slab_id, _pointer) = dc157_ring_fixture("t1-missing").await;
+	let committer = WatchesRemoval::new(&cluster, &mgr, &dirs[0]);
+	let (entered, release) = hold_gc_disposal_entry(&mgr);
+	let sweep = {
+		let (mgr, committer) = (mgr.clone(), committer.clone());
+		tokio::spawn(async move {
+			mgr.sweep_lsm_delete_pending_once_via_control_ring(&new_gc(&mgr), committer.as_ref())
+				.await
+		})
+	};
+	tokio::time::timeout(Duration::from_secs(60), entered.acquire())
+		.await
+		.unwrap()
+		.unwrap()
+		.forget();
+	std::fs::remove_file(slab_path(&dirs[0], slab_id)).unwrap();
+	release.add_permits(1);
+	assert_eq!(
+		sweep.await.unwrap().unwrap_err().kind(),
+		ErrorKind::WouldBlock
+	);
+	assert!(
+		committer.seen.lock().unwrap().is_none(),
+		"Complete was sent"
+	);
+	assert!(mgr.compaction_manifest_snapshot().run(slab_id).is_some());
+	let index = mgr.require_op_index().unwrap();
+	assert_eq!(
+		index
+			.load_snapshot()
+			.await
+			.unwrap()
+			.lsm_install_intents
+			.len(),
+		1
+	);
+	assert!(
+		index
+			.load_op_intents()
+			.await
+			.unwrap()
+			.iter()
+			.all(|op| op.progress().is_none()),
+		"no phase was recorded for a file that is not there"
+	);
+}
+
+/// A completed removal whose owner was superseded purges nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_superseded_owner_purges_nothing_after_complete() {
+	let (dirs, mgr, cluster, slab_id, _pointer) = dc157_ring_fixture("t1-superseded").await;
+	let committer = WatchesRemoval::new(&cluster, &mgr, &dirs[0]);
+	committer
+		.supersede_after_removal
+		.store(true, Ordering::Release);
+	let swept = mgr
+		.sweep_lsm_delete_pending_once_via_control_ring(&new_gc(&mgr), committer.as_ref())
+		.await;
+	assert_eq!(swept.unwrap_err().kind(), ErrorKind::WouldBlock);
+	let job = {
+		let index = mgr.require_op_index().unwrap();
+		let loaded = index.load_op_intents().await.unwrap();
+		assert_eq!(loaded.len(), 1, "the removal's row stays");
+		assert!(matches!(
+			loaded[0].progress(),
+			Some(crate::storage::index::OpProgress::RunDropped(Some(_)))
+		));
+		let LoadedOp::Submittable(ticket) = &loaded[0] else {
+			panic!("submitted");
+		};
+		let crate::consensus::slab_ops::SlabCommand::GcRemove(remove) = ticket.command() else {
+			panic!("a removal");
+		};
+		remove.job_id
+	};
+	assert!(
+		super::gc_disposal::gc_quarantine_path(&dirs[0], slab_id, job).exists(),
+		"the evidence stays"
+	);
+}
+
+/// Hold a sweep inside one filesystem step, abort its caller, and show authority
+/// cannot change until that step has finished.
+async fn assert_filesystem_step_keeps_authority(
+	label: &str,
+	hold: fn(
+		&SlabManager,
+	) -> &std::sync::Mutex<
+		Option<(Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>,
+	>,
+) -> ([crate::test_support::TestDir; 2], Arc<SlabManager>, SlabId) {
+	let (dirs, mgr, cluster, slab_id, _pointer) = dc157_ring_fixture(label).await;
+	let committer = WatchesRemoval::new(&cluster, &mgr, &dirs[0]);
+	let entered = Arc::new(tokio::sync::Semaphore::new(0));
+	let release = Arc::new(tokio::sync::Semaphore::new(0));
+	*hold(&mgr).lock().unwrap() = Some((entered.clone(), release.clone()));
+	let sweep = {
+		let (mgr, committer) = (mgr.clone(), committer.clone());
+		tokio::spawn(async move {
+			mgr.sweep_lsm_delete_pending_once_via_control_ring(&new_gc(&mgr), committer.as_ref())
+				.await
+		})
+	};
+	tokio::time::timeout(Duration::from_secs(60), entered.acquire())
+		.await
+		.unwrap()
+		.unwrap()
+		.forget();
+	sweep.abort();
+	assert!(sweep.await.unwrap_err().is_cancelled());
+
+	let owner = mgr.owner_ref().unwrap();
+	let writer = cluster.nodes[0].clone();
+	let supersede = tokio::spawn(async move { supersede_store(&writer, owner).await });
+	assert_supersession_stays_behind_the_lease(&cluster, owner, &supersede).await;
+	release.add_permits(8);
+	tokio::time::timeout(Duration::from_secs(30), supersede)
+		.await
+		.expect("supersession applies once the step ends")
+		.unwrap();
+	(dirs, mgr, slab_id)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_aborted_sweep_keeps_its_authority_through_the_disposal_unlink() {
+	let (dirs, mgr, slab_id) = assert_filesystem_step_keeps_authority("t1-abort-dispose", |mgr| {
+		&mgr.continuity_test_holds.gc_before_unlink_hold
+	})
+	.await;
+	assert!(!slab_path(&dirs[0], slab_id).exists());
+	assert!(mgr.compaction_manifest_snapshot().run(slab_id).is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_aborted_sweep_keeps_its_authority_through_the_purge_and_handoff() {
+	let (_dirs, mgr, _slab_id) = assert_filesystem_step_keeps_authority("t1-abort-purge", |mgr| {
+		&mgr.continuity_test_holds.gc_before_clear_hold
+	})
+	.await;
+	let index = mgr.require_op_index().unwrap();
+	assert!(
+		index.load_op_intents().await.unwrap().is_empty(),
+		"the detached stage finished its handoff"
+	);
+}
+
+/// A cut around the transaction that drops the run: either nothing changed and the
+/// scope still fences, or it all committed and its result was lost, which never
+/// admits anything on hope.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cut_at_the_run_drop_commits_all_of_it_or_none_and_admits_nothing_on_hope() {
+	for cut in [
+		crate::storage::index::OpTxnCut::BeforeCommit,
+		crate::storage::index::OpTxnCut::AfterCommit,
+	] {
+		let (dirs, mgr, cluster, slab_id, _pointer) = dc157_ring_fixture("t1-p3-cut").await;
+		let committer = WatchesRemoval::new(&cluster, &mgr, &dirs[0]);
+		let (entered, release) = hold_gc_disposal_entry(&mgr);
+		let sweep = {
+			let (mgr, committer) = (mgr.clone(), committer.clone());
+			tokio::spawn(async move {
+				mgr.sweep_lsm_delete_pending_once_via_control_ring(
+					&new_gc(&mgr),
+					committer.as_ref(),
+				)
+				.await
+			})
+		};
+		tokio::time::timeout(Duration::from_secs(60), entered.acquire())
+			.await
+			.unwrap()
+			.unwrap()
+			.forget();
+		let index = mgr.require_op_index().unwrap();
+		// The first progress step records the identity; the next is the run drop.
+		index.cut_next_progress_txn_after_one(cut);
+		release.add_permits(1);
+		assert!(sweep.await.unwrap().is_err());
+		assert!(
+			committer.seen.lock().unwrap().is_none(),
+			"Complete was sent"
+		);
+		let durable = index.load_snapshot().await.unwrap();
+		let dropped = !durable.lsm_runs.iter().any(|run| run.slab_id == slab_id);
+		assert_eq!(dropped, durable.lsm_install_intents.is_empty(), "{cut:?}");
+		assert_eq!(dropped, cut == crate::storage::index::OpTxnCut::AfterCommit);
+		assert_eq!(
+			index
+				.load_op_intents()
+				.await
+				.unwrap()
+				.iter()
+				.any(|op| matches!(
+					op.progress(),
+					Some(crate::storage::index::OpProgress::RunDropped(_))
+				)),
+			dropped
+		);
+		assert!(
+			mgr.compaction_manifest_snapshot().run(slab_id).is_some(),
+			"memory never moved on an uncertain commit: {cut:?}"
+		);
+		assert_eq!(
+			mgr.tier_authority_readiness_reason().as_deref(),
+			Some("TierAuthorityLsmUnresolved"),
+			"{cut:?}"
+		);
+	}
+}
+
+/// After the local run is gone: no LSM row, the Complete row stays, the prefix is
+/// held, and a restart is fenced until phase-specific recovery exists. A driver
+/// tick does not lift it. Both a reserved and a submitted row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reopen_past_the_run_drop_keeps_its_explicit_fence() {
+	for reserved in [true, false] {
+		let (dirs, mgr, cluster, _slab_id, _pointer) = dc157_ring_fixture("t1-reopen").await;
+		let committer = WatchesRemoval::new(&cluster, &mgr, &dirs[0]);
+		committer.fail_removal.store(true, Ordering::Release);
+		let index = mgr.require_op_index().unwrap();
+		let (entered, release) = hold_gc_disposal_entry(&mgr);
+		let sweep = {
+			let (mgr, committer) = (mgr.clone(), committer.clone());
+			tokio::spawn(async move {
+				mgr.sweep_lsm_delete_pending_once_via_control_ring(
+					&new_gc(&mgr),
+					committer.as_ref(),
+				)
+				.await
+			})
+		};
+		tokio::time::timeout(Duration::from_secs(60), entered.acquire())
+			.await
+			.unwrap()
+			.unwrap()
+			.forget();
+		if reserved {
+			// The transition before submission is the one that fails.
+			index.cut_next_progress_txn_after_two(crate::storage::index::OpTxnCut::BeforeCommit);
+		}
+		release.add_permits(1);
+		assert!(sweep.await.unwrap().is_err());
+		let durable = index.load_snapshot().await.unwrap();
+		assert!(durable.lsm_install_intents.is_empty(), "no LSM row");
+		let loaded = index.load_op_intents().await.unwrap();
+		assert_eq!(loaded.len(), 1, "the Complete row stays");
+		assert_eq!(matches!(loaded[0], LoadedOp::Reserved(_)), reserved);
+		mgr.fence_unresolved_ops_at_open().await.unwrap();
+		assert_eq!(
+			mgr.tier_authority_readiness_reason().as_deref(),
+			Some("UnresolvedOpIntent")
+		);
+		let inner: Arc<dyn TierCommitter> = Arc::new(op_committer(&cluster, 1));
+		op_driver(&cluster, &mgr, inner).drive_once().await.unwrap();
+		assert_eq!(
+			mgr.tier_authority_readiness_reason().as_deref(),
+			Some("UnresolvedOpIntent"),
+			"a driver tick does not re-establish that phase's authority"
+		);
+		assert_eq!(index.load_op_intents().await.unwrap().len(), 1);
+		let owner = mgr.owner_ref().unwrap();
+		assert!(
+			cluster.state_machines[0].op_acked_through(owner).await < 2,
+			"the prefix stays held"
+		);
+	}
+}
+
+/// Live scope still gives way to a disjoint key before disposal: the overlap
+/// refusals have a positive control at the same boundary.
+#[tokio::test]
+async fn a_disjoint_tier_refresh_proceeds_at_the_disposal_boundary() {
+	let (_dirs, manager, l2) = fresh_manager_with_l2("gc-disjoint-entry").await;
+	let (gc_slab, _gc_key) = seed_small_retired_gc_slab(&manager).await;
+	let tier_key = id(0xdd71);
+	manager
+		.append_durable(tenant(), tier_key, hlc(70), b"unrelated-tier")
+		.await
+		.unwrap();
+	let tier_slab = manager.force_seal_active_for_test().await;
+	let raw = manager.read_sealed_raw(tier_slab).await.unwrap();
+	let encrypted = manager.encrypt_tiered_object_blob(tier_slab, &raw).unwrap();
+	let first_uri = l2
+		.put("gc-disjoint-entry/first", &encrypted.bytes)
+		.await
+		.unwrap();
+	let second_uri = l2
+		.put("gc-disjoint-entry/second", &encrypted.bytes)
+		.await
+		.unwrap();
+	let first = tiered_pointer_from_blob(&manager, tier_slab, first_uri, &encrypted.bytes);
+	let second = tiered_pointer_from_blob(&manager, tier_slab, second_uri, &encrypted.bytes);
+	manager.apply_tier_slab(first).await.unwrap();
+	mark_gc_target_for_control_test(&manager, gc_slab).await;
+	let (entered, release) = hold_gc_disposal_entry(&manager);
+	let committer = Arc::new(GcPauseAfterRemoveCommit {
+		manager: manager.clone(),
+		entered: Arc::new(tokio::sync::Semaphore::new(0)),
+		release: Arc::new(tokio::sync::Semaphore::new(1)),
+	});
+	let sweep = {
+		let (manager, committer) = (manager.clone(), committer.clone());
+		tokio::spawn(async move {
+			manager
+				.sweep_lsm_delete_pending_once_via_control_ring(
+					&new_gc(&manager),
+					committer.as_ref(),
+				)
+				.await
+		})
+	};
+	tokio::time::timeout(Duration::from_secs(60), entered.acquire())
+		.await
+		.unwrap()
+		.unwrap()
+		.forget();
+	manager.apply_tier_slab(second.clone()).await.unwrap();
+	assert!(!manager.unapplied_tier_pointers.contains_key(&tier_slab));
+	release.add_permits(1);
+	assert!(sweep.await.unwrap().unwrap().contains(&gc_slab));
+}
+
+/// §4: a mark that lost finishes through a canonical Cancel. Until that is definite
+/// the row, the undo evidence and the fence all stay, across a lost response and a
+/// reopen, and only the exact definite answer lets both operations hand off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rejected_claim_survives_a_lost_cancel_and_finishes_by_its_exact_answer() {
+	let (dirs, mgr, cluster, slab_id, pointer) = dc157_ring_fixture("t1-cancel").await;
+	let plain = Arc::new(op_committer(&cluster, 1));
+	let retired = mgr
+		.compaction_manifest_snapshot()
+		.run(slab_id)
+		.cloned()
+		.unwrap();
+	let entered = Arc::new(tokio::sync::Semaphore::new(0));
+	let release = Arc::new(tokio::sync::Semaphore::new(0));
+	let pausing = Arc::new(PauseAroundMark {
+		before: true,
+		inner: op_committer(&cluster, 1),
+		entered: entered.clone(),
+		release: release.clone(),
+	});
+	let watching = WatchesRemoval::new(&cluster, &mgr, &dirs[0]);
+	watching.lost_cancels.store(1, Ordering::Release);
+	struct ThenWatching(Arc<PauseAroundMark>, Arc<WatchesRemoval>);
+	#[async_trait]
+	impl TierCommitter for ThenWatching {
+		async fn preflight(&self, owner: crate::consensus::OwnerRef) -> std::io::Result<()> {
+			self.1.preflight(owner).await
+		}
+		async fn submit_op(
+			&self,
+			ticket: &crate::storage::index::OpTicket,
+		) -> std::io::Result<crate::storage::VerifiedReceipt> {
+			self.0.submit_op(ticket).await
+		}
+		async fn cancel_op(
+			&self,
+			ticket: &crate::storage::index::OpTicket,
+		) -> std::io::Result<crate::storage::VerifiedReceipt> {
+			self.1.cancel_op(ticket).await
+		}
+	}
+	let committer = Arc::new(ThenWatching(pausing, watching.clone()));
+	let sweep = {
+		let (mgr, committer) = (mgr.clone(), committer.clone());
+		tokio::spawn(async move {
+			mgr.sweep_lsm_delete_pending_once_via_control_ring(&new_gc(&mgr), committer.as_ref())
+				.await
+		})
+	};
+	tokio::time::timeout(Duration::from_secs(60), entered.acquire())
+		.await
+		.unwrap()
+		.unwrap()
+		.forget();
+	crate::storage::sweeper::propose_tier_slab(
+		&mgr,
+		plain.as_ref(),
+		b10_tier(&mgr, &pointer),
+		None,
+	)
+	.await
+	.unwrap();
+	release.add_permits(8);
+	assert!(
+		sweep.await.unwrap().is_err(),
+		"the Cancel's response was lost"
+	);
+
+	let index = mgr.require_op_index().unwrap();
+	let claims = index.load_rejected_claims().await.unwrap();
+	assert_eq!(claims.len(), 1);
+	assert_eq!(claims[0].pre_run, retired);
+	assert_eq!(
+		mgr.compaction_manifest_snapshot().run(slab_id),
+		Some(&retired),
+		"undone: still exactly Retired"
+	);
+	assert!(
+		!mgr.slab_pins.is_delete_pending(slab_id),
+		"undone: the mark's pin state is back"
+	);
+	assert!(
+		!index
+			.load_snapshot()
+			.await
+			.unwrap()
+			.lsm_install_intents
+			.is_empty(),
+		"the intent stays until the Cancel is definite"
+	);
+
+	// A reopen finds the same phase, and the driver finishes it.
+	mgr.fence_unresolved_ops_at_open().await.unwrap();
+	let driver = op_driver(&cluster, &mgr, watching.clone());
+
+	// A definite answer that is not Cancelled clears nothing.
+	watching.wrong_cancel.store(true, Ordering::Release);
+	assert_eq!(
+		driver.drive_once().await.unwrap_err().kind(),
+		ErrorKind::WouldBlock
+	);
+	assert_eq!(index.load_rejected_claims().await.unwrap().len(), 1);
+	watching.wrong_cancel.store(false, Ordering::Release);
+
+	// The final transaction fails: the Cancel stands and is asked again.
+	index.cut_next_op_txn(crate::storage::index::OpTxnCut::BeforeCommit);
+	assert!(driver.drive_once().await.is_err());
+	assert_eq!(index.load_rejected_claims().await.unwrap().len(), 1);
+
+	driver.drive_once().await.unwrap();
+	assert!(index.load_rejected_claims().await.unwrap().is_empty());
+	assert!(
+		index
+			.load_op_intents()
+			.await
+			.unwrap()
+			.iter()
+			.all(|op| !matches!(op, LoadedOp::Reserved(_)))
+	);
+	assert!(
+		index
+			.load_snapshot()
+			.await
+			.unwrap()
+			.lsm_install_intents
+			.is_empty()
+	);
+	// The reopen fence also covers the tier that won, which its replay publishes
+	// and the driver then hands off.
+	tokio::time::timeout(Duration::from_secs(30), async {
+		while mgr.tier_authority_readiness_reason().is_some() {
+			mgr.tier_authority.notify_publication_change();
+			driver.drive_once().await.unwrap();
+			tokio::time::sleep(Duration::from_millis(50)).await;
+		}
+	})
+	.await
+	.expect("readiness recovers");
+	assert_dc157_resolved(&mgr, 0xdd72).await;
+}
+
+/// Q1: a store serving a ring cannot take the local-only destructive paths, whatever
+/// the ring's state. D3: its no-survivor compaction retires logically, keeps the
+/// backing readers need, and GC's claim is what reclaims the bytes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_ring_store_refuses_local_gc_and_its_no_survivor_release_waits_for_the_claim() {
+	let (dirs, mgr) = fresh_manager().await;
+	let key = id(0xdd73);
+	let bytes = b"no-survivors".to_vec();
+	let location = mgr
+		.append_durable(tenant(), key, hlc(73), &bytes)
+		.await
+		.unwrap();
+	let slab_id = force_seal_active(&mgr).await;
+	mgr.ensure_live_lsm_run_for_maintenance(slab_id, 1024);
+	let cluster = control_cluster_observing(&[(1, &mgr)]).await;
+	register_owner(&cluster.nodes[0], &mgr).await;
+	let refused = mgr
+		.sweep_lsm_delete_pending_once(&new_gc(&mgr))
+		.await
+		.unwrap_err();
+	assert_eq!(refused.kind(), ErrorKind::PermissionDenied);
+
+	mgr.finish_compaction_without_replacement(
+		slab_id,
+		&[CompactionRecord {
+			tenant_id: tenant(),
+			key_identity: key,
+			routing_locality: Locality::from(key),
+			old_location: location,
+			reclaim: true,
+			retention_ambiguous: false,
+			retention_lag_seconds: 0,
+		}],
+	)
+	.await
+	.unwrap();
+	assert!(
+		mgr.lookup(tenant(), key).unwrap().is_none(),
+		"logically gone"
+	);
+	let path = slab_path(&dirs, slab_id);
+	assert!(path.exists(), "the backing waits for the claim");
+	assert!(
+		mgr.compaction_manifest_snapshot()
+			.retired_runs()
+			.any(|run| run.slab_id == slab_id)
+	);
+	assert_eq!(mgr.read(location).await.unwrap(), bytes, "readers keep it");
+
+	let committer = op_committer(&cluster, 1);
+	assert_eq!(
+		mgr.sweep_lsm_delete_pending_once_via_control_ring(&new_gc(&mgr), &committer)
+			.await
+			.unwrap(),
+		vec![slab_id]
+	);
+	assert!(!path.exists(), "the bytes are reclaimed by GC");
+}
+
+/// The claim-stage guard: an owner superseded before its disposal disposes of
+/// nothing, and the ring is never asked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_superseded_owner_disposes_of_nothing() {
+	let (dirs, mgr, cluster, slab_id, _pointer) = dc157_ring_fixture("t1-superseded-entry").await;
+	let committer = WatchesRemoval::new(&cluster, &mgr, &dirs[0]);
+	let (entered, release) = hold_gc_disposal_entry(&mgr);
+	let sweep = {
+		let (mgr, committer) = (mgr.clone(), committer.clone());
+		tokio::spawn(async move {
+			mgr.sweep_lsm_delete_pending_once_via_control_ring(&new_gc(&mgr), committer.as_ref())
+				.await
+		})
+	};
+	tokio::time::timeout(Duration::from_secs(60), entered.acquire())
+		.await
+		.unwrap()
+		.unwrap()
+		.forget();
+	supersede_store(&cluster.nodes[0], mgr.owner_ref().unwrap()).await;
+	release.add_permits(1);
+	assert_eq!(
+		sweep.await.unwrap().unwrap_err().kind(),
+		ErrorKind::WouldBlock
+	);
+	assert!(
+		committer.seen.lock().unwrap().is_none(),
+		"Complete was sent"
+	);
+	assert!(slab_path(&dirs[0], slab_id).exists());
+	assert!(mgr.compaction_manifest_snapshot().run(slab_id).is_some());
+}
+
+/// The observer of a decided removal: only this exact operation's durable state
+/// explains an absent run. An acknowledged sequence is an obsolete duplicate to
+/// ignore, proving nothing. Anything else fences, and no second removal happens.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_decided_removal_is_explained_only_by_its_own_operations_evidence() {
+	use crate::consensus::slab_ops::{GcRemove, RunIdentity, SlabCommand};
+	// Before its local work: the run is present and its row has reached nothing.
+	let (dirs, mgr, cluster, slab_id, _pointer) = dc157_ring_fixture("t1-observer").await;
+	let run = mgr
+		.compaction_manifest_snapshot()
+		.run(slab_id)
+		.cloned()
+		.unwrap();
+	let unrelated = GcRemove {
+		job_id: CompactionJobId::new(0x0701),
+		slab: mgr.owner_ref().unwrap().slab(slab_id),
+		expected_run: RunIdentity::of(&run),
+	};
+	let epoch = mgr.compaction_manifest_snapshot().manifest_epoch;
+	assert_eq!(
+		mgr.observe_lsm_gc_removed(&unrelated, 99, 1000)
+			.await
+			.unwrap_err()
+			.kind(),
+		ErrorKind::InvalidData,
+		"a run present with no row"
+	);
+	assert!(mgr.compaction_manifest_snapshot().run(slab_id).is_some());
+	assert_eq!(mgr.compaction_manifest_snapshot().manifest_epoch, epoch);
+	assert!(
+		mgr.tier_authority_readiness_reason()
+			.is_some_and(|reason| reason.contains("IndexUnavailable"))
+	);
+
+	// With the run gone: each kind of evidence, on a store past that stage.
+	let (dirs2, mgr, cluster2, slab_id, _pointer) = dc157_ring_fixture("t1-observer2").await;
+	let _ = (dirs, cluster);
+	let committer = WatchesRemoval::new(&cluster2, &mgr, &dirs2[0]);
+	committer.fail_removal.store(true, Ordering::Release);
+	assert!(
+		mgr.sweep_lsm_delete_pending_once_via_control_ring(&new_gc(&mgr), committer.as_ref())
+			.await
+			.is_err()
+	);
+	let index = mgr.require_op_index().unwrap();
+	let loaded = index.load_op_intents().await.unwrap();
+	let LoadedOp::Submittable(ticket) = &loaded[0] else {
+		panic!("transitioned before the failed submission");
+	};
+	let SlabCommand::GcRemove(remove) = ticket.command().clone() else {
+		panic!("a removal");
+	};
+	let seq = ticket.key().op_seq;
+	assert!(mgr.compaction_manifest_snapshot().run(slab_id).is_none());
+	let epoch = mgr.compaction_manifest_snapshot().manifest_epoch;
+
+	// The matching continuation explains it, with no second removal.
+	mgr.observe_lsm_gc_removed(&remove, seq, 1001)
+		.await
+		.unwrap();
+	assert_eq!(mgr.compaction_manifest_snapshot().manifest_epoch, epoch);
+	let other_job = GcRemove {
+		job_id: CompactionJobId::new(0x0702),
+		..remove.clone()
+	};
+	// The same sequence with another digest, and an absent run with no evidence.
+	assert!(
+		mgr.observe_lsm_gc_removed(&other_job, seq, 1002)
+			.await
+			.is_err()
+	);
+	assert!(
+		mgr.observe_lsm_gc_removed(&remove, seq + 500, 1003)
+			.await
+			.is_err()
+	);
+
+	// Handed off: the digest still decides while the row exists.
+	index
+		.hand_off_op(ticket.key(), ticket.digest(), None)
+		.await
+		.unwrap();
+	mgr.observe_lsm_gc_removed(&remove, seq, 1004)
+		.await
+		.unwrap();
+	assert!(
+		mgr.observe_lsm_gc_removed(&other_job, seq, 1005)
+			.await
+			.is_err(),
+		"a finished sequence is not evidence for a different operation"
+	);
+	assert_eq!(mgr.compaction_manifest_snapshot().manifest_epoch, epoch);
+}
+
+/// A mark paused around, with Cancel answered by the watching committer.
+struct Both(Arc<PauseAroundMark>, Arc<WatchesRemoval>);
+#[async_trait]
+impl TierCommitter for Both {
+	async fn preflight(&self, owner: crate::consensus::OwnerRef) -> std::io::Result<()> {
+		self.1.preflight(owner).await
+	}
+	async fn submit_op(
+		&self,
+		ticket: &crate::storage::index::OpTicket,
+	) -> std::io::Result<crate::storage::VerifiedReceipt> {
+		self.0.submit_op(ticket).await
+	}
+	async fn cancel_op(
+		&self,
+		ticket: &crate::storage::index::OpTicket,
+	) -> std::io::Result<crate::storage::VerifiedReceipt> {
+		self.1.cancel_op(ticket).await
+	}
+}
+
+/// A rejected claim, undone and durably recorded, with its Cancel's first answer lost.
+async fn rejected_claim_fixture(
+	label: &str,
+) -> (
+	[crate::test_support::TestDir; 2],
+	Arc<SlabManager>,
+	ControlCluster,
+	Arc<WatchesRemoval>,
+) {
+	let (dirs, mgr, cluster, _slab_id, pointer) = dc157_ring_fixture(label).await;
+	let plain = Arc::new(op_committer(&cluster, 1));
+	let entered = Arc::new(tokio::sync::Semaphore::new(0));
+	let release = Arc::new(tokio::sync::Semaphore::new(0));
+	let pausing = Arc::new(PauseAroundMark {
+		before: true,
+		inner: op_committer(&cluster, 1),
+		entered: entered.clone(),
+		release: release.clone(),
+	});
+	let watching = WatchesRemoval::new(&cluster, &mgr, &dirs[0]);
+	watching.lost_cancels.store(1, Ordering::Release);
+	let committer = Arc::new(Both(pausing, watching.clone()));
+	let sweep = {
+		let (mgr, committer) = (mgr.clone(), committer.clone());
+		tokio::spawn(async move {
+			mgr.sweep_lsm_delete_pending_once_via_control_ring(&new_gc(&mgr), committer.as_ref())
+				.await
+		})
+	};
+	tokio::time::timeout(Duration::from_secs(60), entered.acquire())
+		.await
+		.unwrap()
+		.unwrap()
+		.forget();
+	crate::storage::sweeper::propose_tier_slab(
+		&mgr,
+		plain.as_ref(),
+		b10_tier(&mgr, &pointer),
+		None,
+	)
+	.await
+	.unwrap();
+	release.add_permits(8);
+	assert!(
+		sweep.await.unwrap().is_err(),
+		"the Cancel's response was lost"
+	);
+	assert_eq!(
+		mgr.require_op_index()
+			.unwrap()
+			.load_rejected_claims()
+			.await
+			.unwrap()
+			.len(),
+		1
+	);
+	(dirs, mgr, cluster, watching)
+}
+
+/// A Cancelled receipt is history. An owner superseded after it clears nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_supersession_after_cancel_leaves_the_rejected_claim_fenced() {
+	let (_dirs, mgr, cluster, watching) = rejected_claim_fixture("t1-after-cancel").await;
+	watching
+		.supersede_after_cancel
+		.store(true, Ordering::Release);
+	let index = mgr.require_op_index().unwrap();
+	let claim = index.load_rejected_claims().await.unwrap().remove(0);
+	assert_eq!(
+		mgr.resolve_rejected_claim(watching.as_ref(), claim)
+			.await
+			.unwrap_err()
+			.kind(),
+		ErrorKind::WouldBlock
+	);
+	assert_eq!(index.load_rejected_claims().await.unwrap().len(), 1);
+	assert!(
+		!index
+			.load_snapshot()
+			.await
+			.unwrap()
+			.lsm_install_intents
+			.is_empty()
+	);
+	let _ = cluster;
+}
+
+/// The blocking handoff owns its authority: aborting its caller cannot let a
+/// supersession apply before the transaction has ended.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_aborted_rejected_claim_handoff_keeps_its_authority_until_its_transaction_ends() {
+	let (_dirs, mgr, cluster, watching) = rejected_claim_fixture("t1-claim-abort").await;
+	let index = mgr.require_op_index().unwrap();
+	let claim = index.load_rejected_claims().await.unwrap().remove(0);
+	let (entered, release) = index.hold_next_handoff_txn();
+	let resolve = {
+		let (mgr, watching) = (mgr.clone(), watching.clone());
+		tokio::spawn(async move { mgr.resolve_rejected_claim(watching.as_ref(), claim).await })
+	};
+	tokio::task::spawn_blocking(move || entered.recv_timeout(Duration::from_secs(30)))
+		.await
+		.unwrap()
+		.expect("the blocking transaction started");
+	resolve.abort();
+	assert!(resolve.await.unwrap_err().is_cancelled());
+	let owner = mgr.owner_ref().unwrap();
+	let writer = cluster.nodes[0].clone();
+	let supersede = tokio::spawn(async move { supersede_store(&writer, owner).await });
+	assert_supersession_stays_behind_the_lease(&cluster, owner, &supersede).await;
+	release.send(()).unwrap();
+	tokio::time::timeout(Duration::from_secs(30), supersede)
+		.await
+		.unwrap()
+		.unwrap();
+	assert!(index.load_rejected_claims().await.unwrap().is_empty());
+}
+
+/// The LSM row the handoff deletes must be the exact one linked to these operations.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rejected_claim_handoff_refuses_a_mismatched_linked_intent() {
+	let (_dirs, mgr, _cluster, watching) = rejected_claim_fixture("t1-claim-link").await;
+	let index = mgr.require_op_index().unwrap();
+	let claim = index.load_rejected_claims().await.unwrap().remove(0);
+	let LoadedOp::Submittable(removal) = claim.removal.clone() else {
+		panic!("Cancel was attempted, so it is submittable");
+	};
+	let mut linked = index
+		.load_snapshot()
+		.await
+		.unwrap()
+		.lsm_install_intents
+		.remove(0);
+	let good = linked.clone();
+	linked.commit_digest = [0xEE; 32];
+	assert!(
+		index
+			.hand_off_rejected_claim(&claim.mark, &removal, linked, None)
+			.await
+			.is_err()
+	);
+	let mut unlinked = good.clone();
+	unlinked.ops.clear();
+	assert!(
+		index
+			.hand_off_rejected_claim(&claim.mark, &removal, unlinked, None)
+			.await
+			.is_err()
+	);
+	assert_eq!(index.load_rejected_claims().await.unwrap().len(), 1);
+	assert_eq!(
+		index.load_snapshot().await.unwrap().lsm_install_intents,
+		vec![good]
+	);
+	let _ = watching;
+}
+
+/// One unresolved claim stays fenced and is reported, and independent work still
+/// drains. The prefix stops at its sequence; that is not refusing every Ack.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unresolved_claim_does_not_starve_independent_acknowledgements() {
+	let (_dirs, mgr, cluster, watching) = rejected_claim_fixture("t1-independent").await;
+	watching.wrong_cancel.store(true, Ordering::Release);
+	let index = mgr.require_op_index().unwrap();
+	let owner = mgr.owner_ref().unwrap();
+	// An operation with nothing to do with the claim: real, decided, finished.
+	let independent = index
+		.allocate_ops(
+			vec![crate::consensus::slab_ops::SlabCommand::Claim(
+				crate::consensus::slab_ops::ClaimOp {
+					slab: owner.slab(SlabId::new(0x30_000)),
+					job_id: CompactionJobId::new(0x0703),
+				},
+			)],
+			None,
+		)
+		.await
+		.unwrap()
+		.first;
+	assert!(matches!(
+		watching.submit_op(&independent).await.unwrap(),
+		crate::storage::VerifiedReceipt::Applied { .. }
+	));
+	index
+		.hand_off_op(independent.key(), independent.digest(), None)
+		.await
+		.unwrap();
+
+	let driver = op_driver(&cluster, &mgr, watching.clone());
+	assert!(
+		driver.drive_once().await.is_err(),
+		"the claim stays reported"
+	);
+	assert!(
+		index
+			.load_ack_pending()
+			.await
+			.unwrap()
+			.contains(&(independent.key().op_seq, true)),
+		"independent work was acknowledged"
+	);
+	assert_eq!(index.load_rejected_claims().await.unwrap().len(), 1);
+	assert_eq!(
+		cluster.state_machines[0].op_acked_through(owner).await,
+		0,
+		"the prefix stops at the unresolved mark"
+	);
+}
+
+/// The purge deletes only the file this workflow recorded. A replaced or a missing
+/// entry fences: nothing is unlinked, recorded as purged or handed off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_purge_refuses_a_quarantine_entry_that_is_not_the_recorded_file() {
+	for tamper in [1_u32, 2] {
+		let (dirs, mgr, cluster, slab_id, _pointer) = dc157_ring_fixture("t1-purge").await;
+		let committer = WatchesRemoval::new(&cluster, &mgr, &dirs[0]);
+		committer.tamper_quarantine.store(tamper, Ordering::Release);
+		assert_eq!(
+			mgr.sweep_lsm_delete_pending_once_via_control_ring(&new_gc(&mgr), committer.as_ref())
+				.await
+				.unwrap_err()
+				.kind(),
+			ErrorKind::WouldBlock,
+			"tamper {tamper}"
+		);
+		let index = mgr.require_op_index().unwrap();
+		let loaded = index.load_op_intents().await.unwrap();
+		assert_eq!(loaded.len(), 1, "the removal stays");
+		assert!(
+			matches!(
+				loaded[0].progress(),
+				Some(crate::storage::index::OpProgress::RunDropped(Some(_)))
+			),
+			"no purge phase was recorded: {:?}",
+			loaded[0].progress()
+		);
+		if tamper == 1 {
+			let LoadedOp::Submittable(ticket) = &loaded[0] else {
+				panic!("submitted");
+			};
+			let crate::consensus::slab_ops::SlabCommand::GcRemove(remove) = ticket.command() else {
+				panic!("a removal");
+			};
+			assert!(
+				super::gc_disposal::gc_quarantine_path(&dirs[0], slab_id, remove.job_id).exists(),
+				"the replacement was not unlinked"
+			);
+		}
+	}
+}
+
+/// With the supersession applied and not yet delivered to this store, no fence has
+/// latched and only the canonical read can refuse. A historical Cancelled receipt
+/// grants nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rejected_claim_handoff_reads_its_authority_canonically_before_any_fence() {
+	let (dirs, mgr, l2) = fresh_manager_with_l2("t1-claim-lag").await;
+	let (slab_id, _key) = seed_small_retired_gc_slab(&mgr).await;
+	let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
+	let encrypted = mgr.encrypt_tiered_object_blob(slab_id, &raw).unwrap();
+	let uri = l2
+		.put("t1-claim-lag/object", &encrypted.bytes)
+		.await
+		.unwrap();
+	let pointer = tiered_pointer_from_blob(&mgr, slab_id, uri, &encrypted.bytes);
+	// This store observes nothing from the ring: its fence can never latch here.
+	let cluster = control_cluster_observing(&[]).await;
+	mgr.bind_control_node(1).unwrap();
+	mgr.bind_canonical_tier_source(cluster.state_machines[0].tier_snapshot_source_for_test());
+	register_owner(&cluster.nodes[0], &mgr).await;
+
+	let entered = Arc::new(tokio::sync::Semaphore::new(0));
+	let release = Arc::new(tokio::sync::Semaphore::new(0));
+	let pausing = Arc::new(PauseAroundMark {
+		before: true,
+		inner: op_committer(&cluster, 1),
+		entered: entered.clone(),
+		release: release.clone(),
+	});
+	let watching = WatchesRemoval::new(&cluster, &mgr, &dirs[0]);
+	watching.lost_cancels.store(1, Ordering::Release);
+	let committer = Arc::new(Both(pausing, watching.clone()));
+	let sweep = {
+		let (mgr, committer) = (mgr.clone(), committer.clone());
+		tokio::spawn(async move {
+			mgr.sweep_lsm_delete_pending_once_via_control_ring(&new_gc(&mgr), committer.as_ref())
+				.await
+		})
+	};
+	tokio::time::timeout(Duration::from_secs(60), entered.acquire())
+		.await
+		.unwrap()
+		.unwrap()
+		.forget();
+	let index = mgr.require_op_index().unwrap();
+	let tier = index
+		.allocate_ops(
+			vec![crate::consensus::slab_ops::SlabCommand::Tier(
+				crate::consensus::slab_ops::TierOp {
+					tier: b10_tier(&mgr, &pointer),
+					replaces: None,
+				},
+			)],
+			None,
+		)
+		.await
+		.unwrap()
+		.first;
+	watching.submit_op(&tier).await.unwrap();
+	release.add_permits(8);
+	assert!(
+		sweep.await.unwrap().is_err(),
+		"the Cancel's response was lost"
+	);
+	assert_eq!(index.load_rejected_claims().await.unwrap().len(), 1);
+
+	supersede_store(&cluster.nodes[0], mgr.owner_ref().unwrap()).await;
+	assert!(
+		mgr.require_cleanup_authority().is_ok(),
+		"premise: no fence has latched on this store"
+	);
+	let claim = index.load_rejected_claims().await.unwrap().remove(0);
+	assert_eq!(
+		mgr.resolve_rejected_claim(&AnswersCancelAnyway(watching.clone()), claim)
+			.await
+			.unwrap_err()
+			.kind(),
+		ErrorKind::WouldBlock
+	);
+	assert_eq!(
+		index.load_rejected_claims().await.unwrap().len(),
+		1,
+		"the undo evidence stays"
+	);
+}
+
+/// The superseded owner's preflight would refuse first: past it, a Cancel's receipt
+/// is what a replay can still return.
+struct AnswersCancelAnyway(Arc<WatchesRemoval>);
+
+#[async_trait]
+impl TierCommitter for AnswersCancelAnyway {
+	async fn submit_op(
+		&self,
+		ticket: &crate::storage::index::OpTicket,
+	) -> std::io::Result<crate::storage::VerifiedReceipt> {
+		self.0.submit_op(ticket).await
+	}
+	async fn cancel_op(
+		&self,
+		ticket: &crate::storage::index::OpTicket,
+	) -> std::io::Result<crate::storage::VerifiedReceipt> {
+		Ok(crate::storage::VerifiedReceipt::Rejected {
+			reason: crate::consensus::slab_ops::SlabRejection::Cancelled,
+			index: ticket.key().op_seq,
+		})
+	}
+}
+
+// ADR 0697 §4 T2 on a real ring: a dead job's ids reach a terminal state.
+
+async fn ring_store_for_reservations(
+	label: &str,
+) -> (
+	crate::test_support::TestDir,
+	Arc<SlabManager>,
+	ControlCluster,
+	Arc<crate::storage::RaftCommitter>,
+	crate::storage::op_driver::OpDriver,
+) {
+	let _ = label;
+	let (dir, mgr) = fresh_manager().await;
+	let cluster = control_cluster_observing(&[(1, &mgr)]).await;
+	register_owner(&cluster.nodes[0], &mgr).await;
+	let committer = Arc::new(op_committer(&cluster, 1));
+	let driver = op_driver(&cluster, &mgr, committer.clone());
+	(dir, mgr, cluster, committer, driver)
+}
+
+async fn removed_on_the_ring(mgr: &SlabManager, slab: SlabId) -> bool {
+	mgr.canonical_tier_source
+		.get()
+		.unwrap()
+		.read()
+		.await
+		.unwrap()
+		.removed_for_current_owner(mgr.owner_ref().unwrap().slab(slab))
+}
+
+/// Liveness: a running job's id is left alone. Once it is gone, positive
+/// `Unsubmitted` burns it, the row goes, and the ring refuses the id afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dead_unsubmitted_reservation_burns_and_a_running_one_does_not() {
+	let (_dir, mgr, _cluster, _committer, driver) = ring_store_for_reservations("t2-burn").await;
+	let index = mgr.require_op_index().unwrap();
+	let mut reserved = mgr.reserve_slab_ids(1).await.unwrap();
+	let slab = reserved[0].id();
+	driver.drive_once().await.unwrap();
+	assert_eq!(
+		index.reserved_id_state(slab).await.unwrap(),
+		Some(crate::storage::index::ReservedIdState::Unsubmitted),
+		"a running job's reservation is not burned"
+	);
+	drop(reserved.pop());
+	driver.drive_once().await.unwrap();
+	assert_eq!(index.reserved_id_state(slab).await.unwrap(), None);
+	assert!(removed_on_the_ring(&mgr, slab).await);
+	assert!(
+		mgr.expose_reserved_id_for_test(slab).await.is_err(),
+		"a burned id is never revived"
+	);
+}
+
+/// §4: exposure and burn race under one lock, on the durable row. The loser refuses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn exposure_and_burn_of_one_id_serialize_and_one_refuses() {
+	let (_dir, mgr, _cluster, _committer, _driver) = ring_store_for_reservations("t2-race").await;
+	let index = mgr.require_op_index().unwrap();
+	let mut reserved = mgr.reserve_slab_ids(1).await.unwrap();
+	let slab = reserved[0].id();
+	let exposed = mgr
+		.expose_reserved_id(reserved.pop().unwrap())
+		.await
+		.unwrap();
+	// Exposed wins: the burn path takes T1 instead, and never burns it.
+	drop(exposed);
+	assert!(
+		index
+			.begin_burn(slab, mgr.owner_ref().unwrap())
+			.await
+			.is_err()
+	);
+
+	let mut reserved = mgr.reserve_slab_ids(1).await.unwrap();
+	let other = reserved[0].id();
+	let held = reserved.pop().unwrap();
+	index
+		.begin_burn(other, mgr.owner_ref().unwrap())
+		.await
+		.unwrap();
+	// Burn wins: the job's own exposure is refused, typed, with nothing named.
+	let error = mgr.expose_reserved_id(held).await.unwrap_err();
+	assert!(
+		error
+			.get_ref()
+			.is_some_and(|cause| cause.is::<crate::storage::index::ReservationRefused>()),
+		"{error}"
+	);
+}
+
+/// An exposed id with no owner and no file still owes its terminal transition.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_exposed_id_with_no_owner_and_no_file_takes_t1() {
+	let (_dir, mgr, _cluster, _committer, driver) = ring_store_for_reservations("t2-t1").await;
+	let index = mgr.require_op_index().unwrap();
+	let exposed = mgr.reserve_exposed_slab_ids(1).await.unwrap();
+	let slab = exposed[0].id();
+	drive_until_gone(&driver, &index, slab, Some(exposed)).await;
+	assert!(removed_on_the_ring(&mgr, slab).await);
+}
+
+async fn drive_until_gone(
+	driver: &crate::storage::op_driver::OpDriver,
+	index: &PersistentLocalIndex,
+	slab: SlabId,
+	owned: Option<Vec<crate::storage::ExposedSlab>>,
+) {
+	drop(owned);
+	for _ in 0..8 {
+		driver.drive_once().await.unwrap();
+		if index.reserved_id_state(slab).await.unwrap().is_none() {
+			return;
+		}
+	}
+	panic!("still {:?}", index.reserved_id_state(slab).await.unwrap());
+}
+
+/// With a file at its path, T1's order: claim, recorded disposal, Complete, purge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_abandoned_output_is_disposed_only_after_its_claim() {
+	let (dir, mgr, _cluster, _committer, driver) = ring_store_for_reservations("t2-file").await;
+	let index = mgr.require_op_index().unwrap();
+	let exposed = mgr.reserve_exposed_slab_ids(1).await.unwrap();
+	let slab = exposed[0].id();
+	let path = slab_path(&dir, slab);
+	std::fs::write(&path, b"an output nothing ever published").unwrap();
+	drop(exposed);
+	// The first pass records exactly what is there, and disposes of nothing yet.
+	driver.drive_once().await.unwrap();
+	assert!(matches!(
+		index.reserved_id_state(slab).await.unwrap(),
+		Some(crate::storage::index::ReservedIdState::Exposed {
+			abandoned: Some(crate::storage::index::AbandonedOutput { file: Some(_), .. })
+		})
+	));
+	assert!(path.exists());
+	drive_until_gone(&driver, &index, slab, None).await;
+	assert!(!path.exists());
+	assert!(removed_on_the_ring(&mgr, slab).await);
+	assert!(
+		std::fs::read_dir(&*dir).unwrap().all(|entry| !entry
+			.unwrap()
+			.file_name()
+			.to_string_lossy()
+			.starts_with("gc-quarantine-")),
+		"its quarantine entry was purged"
+	);
+}
+
+/// A recorded file that goes missing is not a successful disposal, unlike an
+/// exposure that never created one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_recorded_output_that_goes_missing_fences_its_cleanup() {
+	let (dir, mgr, _cluster, _committer, driver) = ring_store_for_reservations("t2-missing").await;
+	let index = mgr.require_op_index().unwrap();
+	let exposed = mgr.reserve_exposed_slab_ids(1).await.unwrap();
+	let slab = exposed[0].id();
+	let path = slab_path(&dir, slab);
+	std::fs::write(&path, b"recorded, then lost").unwrap();
+	drop(exposed);
+	driver.drive_once().await.unwrap();
+	std::fs::remove_file(&path).unwrap();
+	assert_eq!(
+		driver.drive_once().await.unwrap_err().kind(),
+		ErrorKind::WouldBlock
+	);
+	assert!(matches!(
+		index.reserved_id_state(slab).await.unwrap(),
+		Some(crate::storage::index::ReservedIdState::Cleaning { .. })
+	));
+	assert!(
+		!removed_on_the_ring(&mgr, slab).await,
+		"no Complete for a file that cannot be accounted for"
+	);
+}
+
+/// An `Exposed` row is not unused because no intent names it: a durable reference
+/// fences, and an intent's own outputs stay that intent's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_exposed_row_that_something_durable_references_is_left_alone() {
+	let (_dir, mgr, _cluster, _committer, driver) = ring_store_for_reservations("t2-ref").await;
+	let index = mgr.require_op_index().unwrap();
+	let exposed = mgr.reserve_exposed_slab_ids(1).await.unwrap();
+	let slab = exposed[0].id();
+	index
+		.apply_with_publication_guard(
+			PersistentIndexUpdate {
+				put_lsm_runs: vec![LsmRunSummary::new(
+					slab,
+					CompactionLevelIndex::L1,
+					hlc(1),
+					hlc(1),
+					crate::schema::ByteCount::new(1),
+					crate::schema::RowCount::new(1),
+					crate::schema::ManifestEpoch::new(1),
+				)],
+				..Default::default()
+			},
+			None,
+		)
+		.await
+		.unwrap();
+	drop(exposed);
+	assert_eq!(
+		driver.drive_once().await.unwrap_err().kind(),
+		ErrorKind::WouldBlock
+	);
+	assert_eq!(
+		index.reserved_id_state(slab).await.unwrap(),
+		Some(crate::storage::index::ReservedIdState::Exposed { abandoned: None })
+	);
+}
+
+/// `reacquire_exposed` rebuilds from a durable `Exposed` row only, after a restart
+/// too, with no transition; every other state refuses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reacquiring_rebuilds_the_capability_from_exposed_only() {
+	let (_dir, mgr, _cluster, _committer, _driver) = ring_store_for_reservations("t2-re").await;
+	let index = mgr.require_op_index().unwrap();
+	let exposed = mgr.reserve_exposed_slab_ids(1).await.unwrap();
+	let slab = exposed[0].id();
+	drop(exposed);
+	let again = mgr.reacquire_exposed(slab).await.unwrap();
+	assert_eq!(again.id(), slab);
+	assert_eq!(
+		index.reserved_id_state(slab).await.unwrap(),
+		Some(crate::storage::index::ReservedIdState::Exposed { abandoned: None }),
+		"no transition"
+	);
+	let mut unsubmitted = mgr.reserve_slab_ids(2).await.unwrap();
+	let (a, b) = (unsubmitted[0].id(), unsubmitted[1].id());
+	assert!(mgr.reacquire_exposed(a).await.is_err(), "Unsubmitted");
+	index.begin_burn(b, mgr.owner_ref().unwrap()).await.unwrap();
+	assert!(mgr.reacquire_exposed(b).await.is_err(), "Burning");
+	assert!(
+		mgr.reacquire_exposed(SlabId::new(0x40_000)).await.is_err(),
+		"absent"
+	);
+	unsubmitted.clear();
+}
+
+/// A job that could never fit its own charges is refused before anything is named.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_job_too_large_for_the_window_is_refused_typed_before_any_reservation() {
+	let (_dir, mgr, _cluster, _committer, _driver) = ring_store_for_reservations("t2-big").await;
+	let index = mgr.require_op_index().unwrap();
+	let limit = crate::storage::index::MAX_RESERVED_OUTPUTS_PER_JOB as usize;
+	let error = mgr.reserve_slab_ids(limit + 1).await.unwrap_err();
+	assert!(
+		error
+			.get_ref()
+			.is_some_and(|cause| cause.is::<crate::storage::OversizedReservation>()),
+		"{error}"
+	);
+	assert!(index.load_reserved_ids().await.unwrap().is_empty());
+	assert!(mgr.live_reservations.is_empty());
+	drop(mgr.reserve_slab_ids(limit).await.unwrap());
+	assert_eq!(index.load_reserved_ids().await.unwrap().len(), limit);
+}
+
+/// The liveness guard exists before the row can be seen: the scanner never takes a
+/// reservation whose job is still being handed it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reservation_is_live_before_its_row_can_be_seen() {
+	let (_dir, mgr, _cluster, _committer, driver) = ring_store_for_reservations("t2-live").await;
+	let index = mgr.require_op_index().unwrap();
+	let (entered, release) = index.hold_next_reservation_commit();
+	let reserving = {
+		let mgr = mgr.clone();
+		tokio::spawn(async move { mgr.reserve_slab_ids(1).await })
+	};
+	tokio::task::spawn_blocking(move || entered.recv_timeout(Duration::from_secs(30)))
+		.await
+		.unwrap()
+		.unwrap();
+	assert_eq!(mgr.live_reservations.len(), 1, "live before the commit");
+	release.send(()).unwrap();
+	let held = reserving.await.unwrap().unwrap();
+	driver.drive_once().await.unwrap();
+	assert_eq!(
+		index.reserved_id_state(held[0].id()).await.unwrap(),
+		Some(crate::storage::index::ReservedIdState::Unsubmitted)
+	);
+}
+
+/// A committer that decides an LSM install rejected, standing in for a ring whose
+/// state refused it.
+struct RejectsInstall(Arc<crate::storage::RaftCommitter>);
+
+#[async_trait]
+impl TierCommitter for RejectsInstall {
+	async fn preflight(&self, owner: crate::consensus::OwnerRef) -> std::io::Result<()> {
+		self.0.preflight(owner).await
+	}
+	async fn submit_op(
+		&self,
+		ticket: &crate::storage::index::OpTicket,
+	) -> std::io::Result<crate::storage::VerifiedReceipt> {
+		if matches!(
+			ticket.command(),
+			crate::consensus::slab_ops::SlabCommand::Compaction(_)
+		) {
+			return Ok(crate::storage::VerifiedReceipt::Rejected {
+				reason: crate::consensus::slab_ops::SlabRejection::VisibleDomainMismatch,
+				index: ticket.key().op_seq,
+			});
+		}
+		self.0.submit_op(ticket).await
+	}
+}
+
+/// A compaction of one sealed slab, on a store serving a ring.
+async fn seeded_compaction_plan(mgr: &Arc<SlabManager>) -> (SlabId, CompactionPlan) {
+	let input = mgr
+		.append_durable(tenant(), id(0xdd81), hlc(81), b"survivor")
+		.await
+		.unwrap();
+	assert_eq!(mgr.force_seal_active_for_test().await, input.slab_id);
+	let snapshot = mgr.compaction_manifest_snapshot();
+	(
+		input.slab_id,
+		CompactionPlan {
+			job_id: CompactionJobId::new(0xdd81),
+			source_level: CompactionLevelIndex::L0,
+			target_level: CompactionLevelIndex::L1,
+			manifest_epoch_pre: snapshot.manifest_epoch,
+			input_slabs: vec![input.slab_id],
+			overlapping_slabs: Vec::new(),
+			retention_floor_snapshot: hlc(0),
+			compaction_start_hlc: hlc(90),
+			dominant_reason: crate::storage::DominantReason::Operator,
+		},
+	)
+}
+
+/// R2: a rejected install's outputs stay until each one's own claim, their identity
+/// moves with the handoff, and that cleanup still runs at a full window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rejected_install_keeps_its_outputs_until_their_claims_even_at_a_full_window() {
+	let (dir, mgr, cluster, committer, driver) = ring_store_for_reservations("t2-rejected").await;
+	let (_input, plan) = seeded_compaction_plan(&mgr).await;
+	let index = mgr.require_op_index().unwrap();
+	let worker = LsmCompactionWorker::new(LsmConfig::default(), mgr.slab_pin_table()).unwrap();
+	let rejecting = RejectsInstall(committer.clone());
+	let error = mgr
+		.run_lsm_compaction_once_via_control_ring(&worker, plan, &rejecting)
+		.await
+		.expect_err("rejected");
+	assert!(
+		format!("{error:?}").contains("LsmCommitRejected"),
+		"{error:?}"
+	);
+	let rows = index.load_reserved_ids().await.unwrap();
+	assert_eq!(rows.len(), 1, "one output");
+	let (output, state) = rows[0].clone();
+	assert!(
+		matches!(
+			state,
+			crate::storage::index::ReservedIdState::Exposed {
+				abandoned: Some(crate::storage::index::AbandonedOutput { file: Some(_), .. })
+			}
+		),
+		"{state:?}"
+	);
+	let path = super::reservations::abandoned_output_path(&dir, output);
+	assert!(path.exists(), "nothing is unlinked before its claim");
+	assert!(
+		!slab_path(&dir, output).exists(),
+		"it left the namespace a reopen discovers"
+	);
+	assert!(
+		index
+			.load_snapshot()
+			.await
+			.unwrap()
+			.lsm_install_intents
+			.is_empty(),
+		"the install could be pruned with its cleanup evidence safe"
+	);
+
+	// Fill what is left of the window: no new work fits, and the cleanup does.
+	let owner = mgr.owner_ref().unwrap();
+	let mut filler = Vec::new();
+	loop {
+		if index.ensure_op_room(filler.len() as u64 + 1).await.is_err() {
+			break;
+		}
+		filler.push(crate::consensus::slab_ops::SlabCommand::Claim(
+			crate::consensus::slab_ops::ClaimOp {
+				slab: owner.slab(SlabId::new(0x50_000 + filler.len() as u64)),
+				job_id: CompactionJobId::new(0x0704),
+			},
+		));
+	}
+	index.allocate_ops(filler, None).await.unwrap();
+	assert!(index.ensure_op_room(1).await.is_err(), "premise: full");
+	drive_until_gone(&driver, &index, output, None).await;
+	assert!(!path.exists());
+	assert!(removed_on_the_ring(&mgr, output).await);
+	let _ = cluster;
+}
+
+/// A successful install: its publication promotes every output, the charge goes
+/// back, and no cleanup ever takes a promoted output for abandoned.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_published_install_promotes_its_outputs_and_nothing_abandons_them() {
+	let (dir, mgr, _cluster, committer, driver) = ring_store_for_reservations("t2-promote").await;
+	let (_input, plan) = seeded_compaction_plan(&mgr).await;
+	let index = mgr.require_op_index().unwrap();
+	let worker = LsmCompactionWorker::new(LsmConfig::default(), mgr.slab_pin_table()).unwrap();
+	mgr.run_lsm_compaction_once_via_control_ring(&worker, plan, committer.as_ref())
+		.await
+		.unwrap();
+	assert!(index.load_reserved_ids().await.unwrap().is_empty());
+	assert!(mgr.live_reservations.is_empty());
+	driver.drive_once().await.unwrap();
+	let key = id(0xdd81);
+	let location = mgr.lookup(tenant(), key).unwrap().unwrap();
+	assert_eq!(mgr.read(location).await.unwrap(), b"survivor");
+	assert!(slab_path(&dir, location.slab_id).exists());
+	assert!(!removed_on_the_ring(&mgr, location.slab_id).await);
+}
+
+/// R2: charges can leave no room for a job's own install. Its failure ends its
+/// ownership, and its reservations drain, so it never waits on capacity it occupies.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_job_refused_at_its_own_install_drains_what_it_reserved() {
+	// At the outer precheck, and past it at the allocation itself: a legal state
+	// where the reservation fits and the install does not.
+	for skip_precheck in [false, true] {
+		let (_dir, mgr, _cluster, committer, driver) =
+			ring_store_for_reservations("t2-forward").await;
+		let (_input, plan) = seeded_compaction_plan(&mgr).await;
+		let index = mgr.require_op_index().unwrap();
+		let owner = mgr.owner_ref().unwrap();
+		// Leave exactly a charge for one output, and nothing for the install itself.
+		let mut filler = Vec::new();
+		loop {
+			if index.ensure_op_room(filler.len() as u64 + 3).await.is_err() {
+				break;
+			}
+			filler.push(crate::consensus::slab_ops::SlabCommand::Claim(
+				crate::consensus::slab_ops::ClaimOp {
+					slab: owner.slab(SlabId::new(0x60_000 + filler.len() as u64)),
+					job_id: CompactionJobId::new(0x0705),
+				},
+			));
+		}
+		index.allocate_ops(filler, None).await.unwrap();
+		mgr.continuity_test_holds
+			.skip_op_room_precheck
+			.store(skip_precheck, Ordering::Release);
+		let worker = LsmCompactionWorker::new(LsmConfig::default(), mgr.slab_pin_table()).unwrap();
+		let refused = mgr
+			.run_lsm_compaction_once_via_control_ring(&worker, plan, committer.as_ref())
+			.await
+			.expect_err("no room for the install");
+		assert!(
+			format!("{refused:?}").contains("TerminalBacklog"),
+			"{refused:?}"
+		);
+		assert!(
+			mgr.live_reservations.is_empty(),
+			"the job's ownership ended"
+		);
+		for _ in 0..8 {
+			driver.drive_once().await.unwrap();
+			if index.load_reserved_ids().await.unwrap().is_empty() {
+				break;
+			}
+		}
+		assert!(
+			index.load_reserved_ids().await.unwrap().is_empty(),
+			"it drained rather than waiting on capacity it held"
+		);
+		assert!(!mgr.has_orphaned_lsm_intents());
+	}
+}
+
+/// A callback for a sequence below the acknowledged prefix is an obsolete duplicate:
+/// ignored, matching digest or not, with nothing changed. A run still present there
+/// is still unexplained.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_callback_below_the_prefix_changes_nothing_and_proves_nothing() {
+	let (dirs, mgr, cluster, slab_id, _pointer) = dc157_ring_fixture("t1-below").await;
+	let committer = WatchesRemoval::new(&cluster, &mgr, &dirs[0]);
+	mgr.sweep_lsm_delete_pending_once_via_control_ring(&new_gc(&mgr), committer.as_ref())
+		.await
+		.unwrap();
+	let (remove, seq) = committer.removal.lock().unwrap().clone().unwrap();
+	let plain: Arc<dyn TierCommitter> = Arc::new(op_committer(&cluster, 1));
+	let driver = op_driver(&cluster, &mgr, plain);
+	let owner = mgr.owner_ref().unwrap();
+	for _ in 0..8 {
+		driver.drive_once().await.unwrap();
+		if cluster.state_machines[0].op_acked_through(owner).await >= seq {
+			break;
+		}
+	}
+	let index = mgr.require_op_index().unwrap();
+	assert!(
+		index.load_ack_pending().await.unwrap().is_empty(),
+		"premise: the row was pruned"
+	);
+	assert!(mgr.compaction_manifest_snapshot().run(slab_id).is_none());
+	let epoch = mgr.compaction_manifest_snapshot().manifest_epoch;
+	let other = crate::consensus::slab_ops::GcRemove {
+		job_id: CompactionJobId::new(0x0706),
+		..remove.clone()
+	};
+	mgr.observe_lsm_gc_removed(&remove, seq, 2000)
+		.await
+		.unwrap();
+	mgr.observe_lsm_gc_removed(&other, seq, 2001).await.unwrap();
+	assert_eq!(mgr.compaction_manifest_snapshot().manifest_epoch, epoch);
+	assert!(index.load_op_intents().await.unwrap().is_empty());
+	assert_eq!(mgr.tier_authority_readiness_reason(), None);
+	// A present run is unexplained even below the prefix.
+	let (live, _key) = seed_small_retired_gc_slab(&mgr).await;
+	let present = crate::consensus::slab_ops::GcRemove {
+		slab: owner.slab(live),
+		..remove
+	};
+	assert!(
+		mgr.observe_lsm_gc_removed(&present, seq, 2002)
+			.await
+			.is_err()
+	);
+	assert!(mgr.compaction_manifest_snapshot().run(live).is_some());
+}
+
+/// The callback, repeated while its operation moves from continuation through
+/// handoff to a pruned row: explained at every step, and never a second removal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_removal_callback_is_explained_across_its_handoff_and_prefix_advance() {
+	let (dirs, mgr, cluster, slab_id, _pointer) = dc157_ring_fixture("t1-across").await;
+	let committer = WatchesRemoval::new(&cluster, &mgr, &dirs[0]);
+	let stop = Arc::new(AtomicBool::new(false));
+	let (entered, release) = {
+		let entered = Arc::new(tokio::sync::Semaphore::new(0));
+		let release = Arc::new(tokio::sync::Semaphore::new(0));
+		*mgr.continuity_test_holds
+			.gc_before_clear_hold
+			.lock()
+			.unwrap() = Some((entered.clone(), release.clone()));
+		(entered, release)
+	};
+	let sweep = {
+		let (mgr, committer) = (mgr.clone(), committer.clone());
+		tokio::spawn(async move {
+			mgr.sweep_lsm_delete_pending_once_via_control_ring(&new_gc(&mgr), committer.as_ref())
+				.await
+		})
+	};
+	tokio::time::timeout(Duration::from_secs(60), entered.acquire())
+		.await
+		.unwrap()
+		.unwrap()
+		.forget();
+	let (remove, seq) = committer.removal.lock().unwrap().clone().unwrap();
+	let epoch = mgr.compaction_manifest_snapshot().manifest_epoch;
+	let observing = {
+		let (mgr, stop) = (mgr.clone(), stop.clone());
+		tokio::spawn(async move {
+			let mut calls = 0_u64;
+			while !stop.load(Ordering::Acquire) {
+				mgr.observe_lsm_gc_removed(&remove, seq, 3000 + calls)
+					.await
+					.expect("explained at every step");
+				calls += 1;
+				tokio::task::yield_now().await;
+			}
+			calls
+		})
+	};
+	release.add_permits(8);
+	sweep.await.unwrap().unwrap();
+	let plain: Arc<dyn TierCommitter> = Arc::new(op_committer(&cluster, 1));
+	let driver = op_driver(&cluster, &mgr, plain);
+	let owner = mgr.owner_ref().unwrap();
+	for _ in 0..8 {
+		driver.drive_once().await.unwrap();
+		if cluster.state_machines[0].op_acked_through(owner).await >= seq {
+			break;
+		}
+	}
+	tokio::time::sleep(Duration::from_millis(50)).await;
+	stop.store(true, Ordering::Release);
+	assert!(observing.await.unwrap() > 0);
+	assert_eq!(mgr.compaction_manifest_snapshot().manifest_epoch, epoch);
+	assert!(mgr.compaction_manifest_snapshot().run(slab_id).is_none());
+}
+
+/// Shutdown during disposal: closing the directory owner refuses the stage's next
+/// file step, so it fails closed. Nothing is claimed complete, Complete is not sent,
+/// and the reopened store is fenced, not healed by the file state it finds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_close_during_disposal_fails_closed_and_the_reopen_is_fenced() {
+	for boundary in ["entry", "preunlink"] {
+		let dir = fresh_dir("t1-close");
+		let owner = DataDirectoryOwner::acquire_existing(&dir).unwrap();
+		let mgr =
+			SlabManager::initialize_new_store_with_owner(gc_owned_test_config(&dir), owner.clone())
+				.await
+				.unwrap();
+		let (slab_id, _key) = seed_small_retired_gc_slab(&mgr).await;
+		let cluster = control_cluster_observing(&[(1, &mgr)]).await;
+		register_owner(&cluster.nodes[0], &mgr).await;
+		let committer = WatchesRemoval::new(&cluster, &mgr, &dir);
+		let entered = Arc::new(tokio::sync::Semaphore::new(0));
+		let release = Arc::new(tokio::sync::Semaphore::new(0));
+		let hold = Some((entered.clone(), release.clone()));
+		*match boundary {
+			"entry" => &mgr.continuity_test_holds.gc_disposal_entry_hold,
+			_ => &mgr.continuity_test_holds.gc_before_unlink_hold,
+		}
+		.lock()
+		.unwrap() = hold;
+		let sweep = {
+			let (mgr, committer) = (mgr.clone(), committer.clone());
+			tokio::spawn(async move {
+				mgr.sweep_lsm_delete_pending_once_via_control_ring(
+					&new_gc(&mgr),
+					committer.as_ref(),
+				)
+				.await
+			})
+		};
+		tokio::time::timeout(Duration::from_secs(60), entered.acquire())
+			.await
+			.unwrap()
+			.unwrap()
+			.forget();
+		owner.begin_close();
+		release.add_permits(8);
+		let outcome = tokio::time::timeout(Duration::from_secs(60), sweep)
+			.await
+			.expect("the stage ends")
+			.unwrap();
+		assert!(outcome.is_err(), "{boundary}: {outcome:?}");
+		assert!(
+			committer.seen.lock().unwrap().is_none(),
+			"{boundary}: Complete was sent"
+		);
+		assert!(
+			slab_path(&dir, slab_id).exists(),
+			"{boundary}: the original stays"
+		);
+		let _ =
+			tokio::time::timeout(Duration::from_secs(5), owner.close(Duration::from_secs(2))).await;
+		drop(committer);
+		drop(cluster);
+		drop(mgr);
+		let next = DataDirectoryOwner::acquire_existing(&dir).expect("released");
+		let reopened = SlabManager::open_with_owner(gc_owned_test_config(&dir), next.clone())
+			.await
+			.unwrap();
+		assert_eq!(
+			reopened.tier_authority_readiness_reason().as_deref(),
+			Some("TierAuthorityLsmUnresolved"),
+			"{boundary}"
+		);
+		let durable = reopened
+			.require_op_index()
+			.unwrap()
+			.load_snapshot()
+			.await
+			.unwrap();
+		assert!(
+			durable.lsm_runs.iter().any(|run| run.slab_id == slab_id),
+			"{boundary}: the run stays"
+		);
+		assert_eq!(durable.lsm_install_intents.len(), 1, "{boundary}");
+		drop(reopened);
+		let _ = next.close(Duration::from_secs(2)).await;
+	}
+}
+
+/// A rejected install leaves a file at a final slab path with no manifest row. A
+/// reopen must neither adopt it nor delete it: its row still says what it is, the
+/// id is not served, and its T1 finishes it exactly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reopen_after_a_rejected_install_neither_adopts_nor_deletes_its_outputs() {
+	let dir = fresh_dir("t2-reopen");
+	let owner = DataDirectoryOwner::acquire_existing(&dir).unwrap();
+	let mgr =
+		SlabManager::initialize_new_store_with_owner(gc_owned_test_config(&dir), owner.clone())
+			.await
+			.unwrap();
+	let cluster = control_cluster_observing(&[(1, &mgr)]).await;
+	register_owner(&cluster.nodes[0], &mgr).await;
+	let committer = Arc::new(op_committer(&cluster, 1));
+	let (_input, plan) = seeded_compaction_plan(&mgr).await;
+	let worker = LsmCompactionWorker::new(LsmConfig::default(), mgr.slab_pin_table()).unwrap();
+	let rejecting = RejectsInstall(committer.clone());
+	mgr.run_lsm_compaction_once_via_control_ring(&worker, plan, &rejecting)
+		.await
+		.expect_err("rejected");
+	let rows = mgr
+		.require_op_index()
+		.unwrap()
+		.load_reserved_ids()
+		.await
+		.unwrap();
+	assert_eq!(rows.len(), 1);
+	let (output, state) = rows[0].clone();
+	let path = super::reservations::abandoned_output_path(&dir, output);
+	let bytes = std::fs::read(&path).unwrap();
+	owner.close(Duration::from_secs(5)).await.unwrap();
+	drop(committer);
+	drop(rejecting);
+	drop(cluster);
+	drop(worker);
+	drop(mgr);
+
+	let next = DataDirectoryOwner::acquire_existing(&dir).expect("released");
+	let reopened = SlabManager::open_with_owner(gc_owned_test_config(&dir), next.clone())
+		.await
+		.unwrap();
+	assert_eq!(
+		std::fs::read(&path).unwrap(),
+		bytes,
+		"not deleted or rewritten"
+	);
+	let index = reopened.require_op_index().unwrap();
+	assert_eq!(
+		index.reserved_id_state(output).await.unwrap(),
+		Some(state),
+		"its reservation still says what it is"
+	);
+	assert!(
+		reopened
+			.compaction_manifest_snapshot()
+			.run(output)
+			.is_none(),
+		"not adopted as a run"
+	);
+	assert!(
+		!reopened.state.lock().await.sealed.contains_key(&output),
+		"not adopted as a sealed slab"
+	);
+	// The survivor is still served from its input, not the abandoned output.
+	let location = reopened.lookup(tenant(), id(0xdd81)).unwrap().unwrap();
+	assert_ne!(location.slab_id, output);
+	assert_eq!(reopened.read(location).await.unwrap(), b"survivor");
+
+	// Its T1 still finishes it, from where it waits, on the reopened store.
+	let cluster = control_cluster_observing(&[(1, &reopened)]).await;
+	register_owner(&cluster.nodes[0], &reopened).await;
+	let committer = Arc::new(op_committer(&cluster, 1));
+	let driver = op_driver(&cluster, &reopened, committer);
+	drive_until_gone(&driver, index, output, None).await;
+	assert!(!path.exists());
+	assert!(removed_on_the_ring(&reopened, output).await);
+	let _ = next.close(Duration::from_secs(2)).await;
+}
+
+// Aggregate HOLD R1: a reservation whose answer was lost, by a fault or by its caller
+// going away, may waste its ids and must never reissue them.
+
+/// Enough ids to extend the durable bound, which is the path where the row and the
+/// high-water share one transaction.
+const IDS_TO_EXTEND_THE_BOUND: usize = 70;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lost_reservation_answer_never_reissues_its_ids_even_once_burned() {
+	let (_dir, mgr, _cluster, _committer, driver) = ring_store_for_reservations("r1-lost").await;
+	let index = mgr.require_op_index().unwrap();
+	index.cut_next_op_txn(crate::storage::index::OpTxnCut::AfterCommit);
+	assert!(mgr.reserve_slab_ids(IDS_TO_EXTEND_THE_BOUND).await.is_err());
+	let lost: Vec<SlabId> = index
+		.load_reserved_ids()
+		.await
+		.unwrap()
+		.into_iter()
+		.map(|(id, _)| id)
+		.collect();
+	assert_eq!(
+		lost.len(),
+		IDS_TO_EXTEND_THE_BOUND,
+		"premise: the commit landed"
+	);
+	// The driver burns them: the rows go, and the ring has ended those identities.
+	for _ in 0..4 {
+		driver.drive_once().await.unwrap();
+	}
+	assert!(index.load_reserved_ids().await.unwrap().is_empty());
+	assert!(removed_on_the_ring(&mgr, lost[0]).await);
+	let again = mgr.reserve_slab_ids(1).await.unwrap();
+	assert!(
+		!lost.contains(&again[0].id()),
+		"id {:?} was reissued after its reservation's answer was lost",
+		again[0].id()
+	);
+	assert!(
+		!lost.contains(&mgr.active_slab_id().await) || mgr.active_slab_id().await < lost[0],
+		"the active slab must not move into a lost range"
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancelled_reservation_never_reissues_the_ids_its_commit_may_write() {
+	let (_dir, mgr, _cluster, _committer, _driver) = ring_store_for_reservations("r1-cancel").await;
+	let index = mgr.require_op_index().unwrap();
+	let range_end = {
+		let start = mgr.state.lock().await.next_slab_id.get();
+		SlabId::new(start + IDS_TO_EXTEND_THE_BOUND as u64 - 1)
+	};
+	let (entered, release) = index.hold_next_reservation_commit();
+	let reserving = {
+		let mgr = mgr.clone();
+		tokio::spawn(async move { mgr.reserve_slab_ids(IDS_TO_EXTEND_THE_BOUND).await })
+	};
+	tokio::task::spawn_blocking(move || entered.recv_timeout(Duration::from_secs(30)))
+		.await
+		.unwrap()
+		.unwrap();
+	reserving.abort();
+	assert!(reserving.await.unwrap_err().is_cancelled());
+	release.send(()).unwrap();
+	// The worker can finish after its caller is gone, in either order with what
+	// comes next: if it lands second, its lower high-water refuses it, which only
+	// wastes its range. What the new id must never be is one of that range.
+	let again = mgr.reserve_slab_ids(1).await.unwrap();
+	assert!(
+		again[0].id() > range_end,
+		"id {:?} was issued from the cancelled reservation's range, ending {range_end:?}",
+		again[0].id()
+	);
+	// Whole or not at all, at any instant.
+	let rows = index.load_reserved_ids().await.unwrap();
+	assert!(
+		rows.len() == 1 || rows.len() == IDS_TO_EXTEND_THE_BOUND + 1,
+		"a partial reservation: {} rows",
+		rows.len()
+	);
+	assert_eq!(
+		rows.iter().filter(|(id, _)| *id == again[0].id()).count(),
+		1
+	);
+}
+
+// Aggregate HOLD R2: reacquisition is exclusive, and serialized with abandonment.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_reacquire_refuses_and_leaves_the_first_holder_live() {
+	let (_dir, mgr, _cluster, _committer, _driver) = ring_store_for_reservations("r2-dup").await;
+	let exposed = mgr.reserve_exposed_slab_ids(1).await.unwrap();
+	let slab = exposed[0].id();
+	drop(exposed);
+	let first = mgr.reacquire_exposed(slab).await.unwrap();
+	assert!(
+		mgr.reacquire_exposed(slab).await.is_err(),
+		"two capabilities for one id"
+	);
+	assert!(
+		mgr.live_reservations.contains(&slab),
+		"a refused reacquire must not clear the holder's liveness"
+	);
+	drop(first);
+	assert!(!mgr.live_reservations.contains(&slab));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reacquire_racing_a_reconcile_has_exactly_one_winner() {
+	let (_dir, mgr, _cluster, _committer, _driver) = ring_store_for_reservations("r2-race").await;
+	let index = mgr.require_op_index().unwrap();
+	for _ in 0..40 {
+		let exposed = mgr.reserve_exposed_slab_ids(1).await.unwrap();
+		let slab = exposed[0].id();
+		drop(exposed);
+		// Both proceed from the same lock release.
+		let lock = mgr.tier_publication_lock(slab);
+		let held = lock.lock().await;
+		let reacquiring = {
+			let mgr = mgr.clone();
+			tokio::spawn(async move { mgr.reacquire_exposed(slab).await })
+		};
+		let reconciling = {
+			let mgr = mgr.clone();
+			tokio::spawn(async move { mgr.reconcile_exposed_without_owner(slab).await })
+		};
+		tokio::task::yield_now().await;
+		drop(held);
+		let reacquired = reacquiring.await.unwrap();
+		reconciling.await.unwrap().unwrap();
+		let abandoned = matches!(
+			index.reserved_id_state(slab).await.unwrap(),
+			Some(crate::storage::index::ReservedIdState::Exposed { abandoned: Some(_) })
+		);
+		assert_ne!(
+			reacquired.is_ok(),
+			abandoned,
+			"a live capability and an abandoned row, or neither"
+		);
+	}
+}
+
+// Aggregate HOLD R3: a ring store's replacement publication requires its reservation.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replacement_publication_with_no_reservation_row_is_refused_and_changes_nothing() {
+	let (_dir, mgr, _cluster, _committer, _driver) =
+		ring_store_for_reservations("r3-missing").await;
+	let key = id(0xdd91);
+	let location = mgr
+		.append_durable(tenant(), key, hlc(91), b"replace-me")
+		.await
+		.unwrap();
+	let old_slab = force_seal_active(&mgr).await;
+	assert_eq!(location.slab_id, old_slab);
+	mgr.ensure_live_lsm_run_for_maintenance(old_slab, 8192);
+	let exposed = mgr.reserve_exposed_slab_id().await.unwrap();
+	let new_slab = exposed.id();
+	let staged = maintenance_staged_path_of(&mgr.config.dir, old_slab, new_slab);
+	let replacement = Arc::new(
+		LocalSlabStore::open(
+			&staged,
+			new_slab,
+			mgr.file_ops.clone(),
+			mgr.config.group_commit.clone(),
+		)
+		.await
+		.unwrap(),
+	);
+	replacement.fsync().await.unwrap();
+	// A stale row: the capability is still held, and its reservation is abandoned.
+	mgr.require_op_index()
+		.unwrap()
+		.abandon_exposed_id(
+			new_slab,
+			crate::storage::index::AbandonedOutput {
+				file: None,
+				relocated: false,
+			},
+			None,
+		)
+		.await
+		.unwrap();
+	let before = mgr.compaction_manifest_snapshot();
+	let published = mgr
+		.finish_compaction_with_replacement(
+			old_slab,
+			&exposed,
+			replacement.clone(),
+			&[],
+			&[],
+			&[],
+			&staged,
+		)
+		.await;
+	assert!(
+		published.is_err(),
+		"a publication with no valid reservation succeeded: {published:?}"
+	);
+	assert_eq!(
+		mgr.compaction_manifest_snapshot().run(old_slab),
+		before.run(old_slab),
+		"the manifest did not move"
+	);
+	assert!(mgr.compaction_manifest_snapshot().run(new_slab).is_none());
+}
+
+// Aggregate HOLD R4: a reservation cleanup keeps stage 1's identity protection. A
+// replacement after validation is refused and preserved, at both destructive steps.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reservation_cleanup_refuses_a_file_replaced_after_its_validation() {
+	for stage in [1_u8, 2] {
+		let (dir, mgr, _cluster, _committer, driver) =
+			ring_store_for_reservations("r4-replace").await;
+		let driver = Arc::new(driver);
+		let index = mgr.require_op_index().unwrap();
+		let exposed = mgr.reserve_exposed_slab_ids(1).await.unwrap();
+		let slab = exposed[0].id();
+		let path = slab_path(&dir, slab);
+		std::fs::write(&path, b"the recorded output bytes").unwrap();
+		drop(exposed);
+		driver.drive_once().await.unwrap();
+		let entered = Arc::new(tokio::sync::Semaphore::new(0));
+		let release = Arc::new(tokio::sync::Semaphore::new(0));
+		*mgr.continuity_test_holds
+			.cleanup_validated_hold
+			.lock()
+			.unwrap() = Some((stage, entered.clone(), release.clone()));
+		let pass = {
+			let driver = driver.clone();
+			tokio::spawn(async move { driver.drive_once().await })
+		};
+		tokio::time::timeout(Duration::from_secs(60), entered.acquire())
+			.await
+			.unwrap()
+			.unwrap()
+			.forget();
+		let Some(crate::storage::index::ReservedIdState::Cleaning { job_id, .. }) =
+			index.reserved_id_state(slab).await.unwrap()
+		else {
+			panic!("the cleanup has begun");
+		};
+		let target = if stage == 1 {
+			path.clone()
+		} else {
+			super::gc_disposal::gc_quarantine_path(&dir, slab, job_id)
+		};
+		std::fs::remove_file(&target).unwrap();
+		std::fs::write(&target, b"a different file, same len").unwrap();
+		release.add_permits(8);
+		assert_eq!(
+			pass.await.unwrap().unwrap_err().kind(),
+			ErrorKind::WouldBlock,
+			"stage {stage}"
+		);
+		assert_eq!(
+			std::fs::read(&target).unwrap(),
+			b"a different file, same len",
+			"stage {stage}: the replacement is preserved"
+		);
+		let advanced = index.load_op_intents().await.unwrap().iter().any(|op| {
+			matches!(
+				op.progress(),
+				Some(
+					crate::storage::index::OpProgress::PurgeAuthorized(_)
+						| crate::storage::index::OpProgress::Purged(_)
+				)
+			)
+		});
+		assert!(!advanced, "stage {stage}: no purge phase was recorded");
+		if stage == 1 {
+			assert!(
+				!removed_on_the_ring(&mgr, slab).await,
+				"no Complete for a file that is not the recorded one"
+			);
+		}
+	}
+}
+
+/// Reading 3's interval: a crash after a rejected output left the discovery namespace
+/// and before its handoff. The bytes are retained, nothing adopts them, the linked
+/// intent still fences, and a cleanup pass leaves it alone. Recovery is slice 5's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_crash_between_relocation_and_handoff_retains_the_bytes_and_refuses() {
+	struct RejectsThenCuts(Arc<crate::storage::RaftCommitter>, Arc<SlabManager>);
+	#[async_trait]
+	impl TierCommitter for RejectsThenCuts {
+		async fn preflight(&self, owner: crate::consensus::OwnerRef) -> std::io::Result<()> {
+			self.0.preflight(owner).await
+		}
+		async fn submit_op(
+			&self,
+			ticket: &crate::storage::index::OpTicket,
+		) -> std::io::Result<crate::storage::VerifiedReceipt> {
+			// The next op transaction is the handoff.
+			self.1
+				.require_op_index()
+				.unwrap()
+				.cut_next_op_txn(crate::storage::index::OpTxnCut::BeforeCommit);
+			Ok(crate::storage::VerifiedReceipt::Rejected {
+				reason: crate::consensus::slab_ops::SlabRejection::VisibleDomainMismatch,
+				index: ticket.key().op_seq,
+			})
+		}
+	}
+	let dir = fresh_dir("r3-crash");
+	let owner = DataDirectoryOwner::acquire_existing(&dir).unwrap();
+	let mgr =
+		SlabManager::initialize_new_store_with_owner(gc_owned_test_config(&dir), owner.clone())
+			.await
+			.unwrap();
+	let cluster = control_cluster_observing(&[(1, &mgr)]).await;
+	register_owner(&cluster.nodes[0], &mgr).await;
+	let (_input, plan) = seeded_compaction_plan(&mgr).await;
+	let worker = LsmCompactionWorker::new(LsmConfig::default(), mgr.slab_pin_table()).unwrap();
+	let rejecting = RejectsThenCuts(Arc::new(op_committer(&cluster, 1)), mgr.clone());
+	mgr.run_lsm_compaction_once_via_control_ring(&worker, plan, &rejecting)
+		.await
+		.expect_err("the handoff failed");
+	let rows = mgr
+		.require_op_index()
+		.unwrap()
+		.load_reserved_ids()
+		.await
+		.unwrap();
+	assert_eq!(rows.len(), 1);
+	let output = rows[0].0;
+	let path = super::reservations::abandoned_output_path(&dir, output);
+	let bytes = std::fs::read(&path).expect("relocated before the handoff");
+	owner.close(Duration::from_secs(5)).await.unwrap();
+	drop((rejecting, worker, cluster, mgr));
+
+	let next = DataDirectoryOwner::acquire_existing(&dir).expect("released");
+	let reopened = SlabManager::open_with_owner(gc_owned_test_config(&dir), next.clone())
+		.await
+		.unwrap();
+	assert_eq!(std::fs::read(&path).unwrap(), bytes, "retained");
+	assert!(
+		reopened
+			.compaction_manifest_snapshot()
+			.run(output)
+			.is_none(),
+		"not adopted as a run"
+	);
+	assert!(
+		!reopened.state.lock().await.sealed.contains_key(&output),
+		"not adopted as a sealed slab"
+	);
+	assert_eq!(
+		reopened.tier_authority_readiness_reason().as_deref(),
+		Some("TierAuthorityLsmUnresolved"),
+		"refused: the linked intent still fences"
+	);
+	let index = reopened.require_op_index().unwrap();
+	assert_eq!(
+		index.reserved_id_state(output).await.unwrap(),
+		Some(crate::storage::index::ReservedIdState::Exposed { abandoned: None }),
+		"no identity moved: its handoff never committed"
+	);
+	let cluster = control_cluster_observing(&[(1, &reopened)]).await;
+	register_owner(&cluster.nodes[0], &reopened).await;
+	let driver = op_driver(&cluster, &reopened, Arc::new(op_committer(&cluster, 1)));
+	driver.drive_once().await.unwrap();
+	assert!(
+		path.exists(),
+		"a cleanup pass leaves an intent's own output alone"
+	);
+	assert_eq!(
+		index.reserved_id_state(output).await.unwrap(),
+		Some(crate::storage::index::ReservedIdState::Exposed { abandoned: None })
+	);
+	let _ = next.close(Duration::from_secs(2)).await;
+}
+
+/// A recorded file whose bytes changed in place keeps its inode: only its content
+/// check can refuse it, and that fences its cleanup with nothing disposed of.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_recorded_output_changed_in_place_fences_its_cleanup() {
+	let (dir, mgr, _cluster, _committer, driver) = ring_store_for_reservations("r4-inplace").await;
+	let index = mgr.require_op_index().unwrap();
+	let exposed = mgr.reserve_exposed_slab_ids(1).await.unwrap();
+	let slab = exposed[0].id();
+	let path = slab_path(&dir, slab);
+	std::fs::write(&path, b"recorded output bytes").unwrap();
+	drop(exposed);
+	driver.drive_once().await.unwrap();
+	// Same inode, same length, different content.
+	std::fs::write(&path, b"RECORDED OUTPUT BYTES").unwrap();
+	assert_eq!(
+		driver.drive_once().await.unwrap_err().kind(),
+		ErrorKind::WouldBlock
+	);
+	assert_eq!(std::fs::read(&path).unwrap(), b"RECORDED OUTPUT BYTES");
+	assert!(!removed_on_the_ring(&mgr, slab).await);
+	assert!(
+		index
+			.load_op_intents()
+			.await
+			.unwrap()
+			.iter()
+			.all(|op| op.progress().is_none()),
+		"no disposal phase was recorded"
+	);
+}
+
+/// R2 past its caller: an abandonment's worker can outlive an aborted reconcile. The
+/// exclusion must last until that worker has ended, or a reacquire reads the row the
+/// worker is about to change, and a live capability ends up over an abandoned row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_aborted_reconcile_keeps_its_exclusion_until_its_worker_ends() {
+	let (_dir, mgr, _cluster, _committer, _driver) = ring_store_for_reservations("r2-life").await;
+	let index = mgr.require_op_index().unwrap();
+	let exposed = mgr.reserve_exposed_slab_ids(1).await.unwrap();
+	let slab = exposed[0].id();
+	drop(exposed);
+	let (entered, release) = index.hold_next_reservation_commit();
+	let reconciling = {
+		let mgr = mgr.clone();
+		tokio::spawn(async move { mgr.reconcile_exposed_without_owner(slab).await })
+	};
+	tokio::task::spawn_blocking(move || entered.recv_timeout(Duration::from_secs(30)))
+		.await
+		.unwrap()
+		.expect("the abandonment's worker started");
+	reconciling.abort();
+	assert!(reconciling.await.unwrap_err().is_cancelled());
+
+	let reacquiring = {
+		let mgr = mgr.clone();
+		tokio::spawn(async move { mgr.reacquire_exposed(slab).await })
+	};
+	tokio::time::sleep(Duration::from_millis(300)).await;
+	release.send(()).unwrap();
+	let reacquired = tokio::time::timeout(Duration::from_secs(30), reacquiring)
+		.await
+		.expect("the exclusion ends with the worker")
+		.unwrap();
+	let state = loop {
+		let state = index.reserved_id_state(slab).await.unwrap();
+		if !matches!(
+			state,
+			Some(crate::storage::index::ReservedIdState::Exposed { abandoned: None })
+		) {
+			break state;
+		}
+		tokio::time::sleep(Duration::from_millis(10)).await;
+	};
+	assert!(
+		matches!(
+			state,
+			Some(crate::storage::index::ReservedIdState::Exposed { abandoned: Some(_) })
+		),
+		"premise: the worker committed: {state:?}"
+	);
+	assert!(
+		reacquired.is_err(),
+		"a live capability over an abandoned row"
+	);
+	assert!(!mgr.live_reservations.contains(&slab));
 }

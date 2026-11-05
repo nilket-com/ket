@@ -376,6 +376,13 @@ impl<T: CommandCommitter> TierCommitter for T {
 			SlabCommand::Retire(RetireOp { slab, .. }) => self.retire_tiered_slab(*slab).await,
 			SlabCommand::Compaction(commit) => self.commit_lsm_compaction(commit.clone()).await,
 			SlabCommand::GcRemove(remove) => self.commit_gc_remove(remove).await,
+			// Arbitration only a real ring can decide; never a synthetic answer.
+			SlabCommand::Claim(_) | SlabCommand::Complete(_) | SlabCommand::BurnReserved(_) => {
+				Err(std::io::Error::new(
+					std::io::ErrorKind::Unsupported,
+					"this committer has no ring to arbitrate a terminal transition",
+				))
+			}
 		};
 		match decided {
 			Ok(()) => Ok(VerifiedReceipt::Applied { index: 0 }),
@@ -2712,12 +2719,13 @@ impl TierObserver for ManagerTierObserver {
 	async fn on_gc_removed(
 		&self,
 		remove: &crate::consensus::slab_ops::GcRemove,
+		op_seq: u64,
 		registry: &crate::consensus::IncarnationRegistry,
 		applied_log_index: u64,
 	) -> std::io::Result<()> {
 		if !matches!(
 			self.slab.classify_ring_owner(
-				remove.owner,
+				remove.slab.owner(),
 				registry,
 				OwnerEvidence::Applied(applied_log_index)
 			),
@@ -2726,7 +2734,7 @@ impl TierObserver for ManagerTierObserver {
 			return Ok(());
 		}
 		self.slab
-			.observe_lsm_gc_removed(remove, applied_log_index)
+			.observe_lsm_gc_removed(remove, op_seq, applied_log_index)
 			.await
 	}
 

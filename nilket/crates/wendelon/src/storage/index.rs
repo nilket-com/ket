@@ -333,9 +333,13 @@ const META_LAST_CONTROL_LOG_INDEX: &str = "last_control_log_index";
 /// rewritten. Its absence on open means the store predates slab identity.
 mod op_state;
 pub use op_state::OpTicket;
-pub(crate) use op_state::{LoadedOp, TerminalBacklog, is_op_state_invalid};
+pub(crate) use op_state::{
+	AbandonedOutput, GcFileIdentity, LoadedOp, MAX_RESERVED_OUTPUTS_PER_JOB, OpEvidence,
+	OpProgress, OpProgressUpdate, RejectedClaim, ReservationRefused, ReservedIdState, ReservedOp,
+	TerminalBacklog, is_op_state_invalid,
+};
 #[cfg(test)]
-pub(crate) use op_state::{OpHolderState, remove_op_state_meta_for_test};
+pub(crate) use op_state::{OpHolderState, OpTxnCut, remove_op_state_meta_for_test};
 
 const META_STORE_INCARNATION_HIGH: &str = "store_incarnation_high_v1";
 const META_STORE_INCARNATION_LOW: &str = "store_incarnation_low_v1";
@@ -590,6 +594,12 @@ pub(crate) struct PersistentIndexUpdate {
 	pub delete_secondary_index_segments: Vec<PersistentSecondaryIndexSegmentKey>,
 	pub put_lsm_runs: Vec<LsmRunSummary>,
 	pub delete_lsm_run_ids: Vec<SlabId>,
+	/// One step of an operation's local progress, durable with this update.
+	pub op_progress: Option<op_state::OpProgressUpdate>,
+	/// The linked LSM intent whose local work this update finishes.
+	pub complete_lsm_intent: Option<LsmInstallIntent>,
+	/// Reservations this publication makes live slabs: their rows end here.
+	pub promote_reservations: Vec<SlabId>,
 	pub last_control_log_index: Option<u64>,
 	/// A budget charge for the memory this update holds (ADR 0692 §7: the
 	/// row copies of a tier publication). It moves with the update into the
@@ -616,6 +626,8 @@ pub(crate) struct PersistentLocalIndex {
 	write_lock: Mutex<()>,
 	#[cfg(test)]
 	op_txn_cut: std::sync::Mutex<Option<op_state::OpTxnCut>>,
+	#[cfg(test)]
+	op_txn_cut_skip: std::sync::Mutex<Option<(u32, op_state::OpTxnCut)>>,
 	#[cfg(test)]
 	#[allow(clippy::type_complexity)]
 	op_handoff_hold:
@@ -1269,6 +1281,8 @@ impl PersistentLocalIndex {
 			#[cfg(test)]
 			op_txn_cut: std::sync::Mutex::new(None),
 			#[cfg(test)]
+			op_txn_cut_skip: std::sync::Mutex::new(None),
+			#[cfg(test)]
 			op_handoff_hold: std::sync::Mutex::new(None),
 			receipts_available: receipts_ok,
 			cleanup_available: cleanup_ok,
@@ -1794,6 +1808,12 @@ impl PersistentLocalIndex {
 		let before_commit_hold = self.guarded_delta_before_commit_hold.lock().unwrap().take();
 		#[cfg(test)]
 		let before_rows_hold = self.guarded_delta_before_rows_hold.lock().unwrap().take();
+		#[cfg(test)]
+		let progress_cut = update
+			.op_progress
+			.is_some()
+			.then(|| self.take_op_txn_cut())
+			.flatten();
 		self.db
 			.run(move |db| {
 				let _publication = publication;
@@ -1884,6 +1904,13 @@ impl PersistentLocalIndex {
 					}
 				}
 				{
+					if let Some(progress) = &update.op_progress {
+						op_state::apply_op_progress(&write_txn, progress)?;
+					}
+					if let Some(intent) = &update.complete_lsm_intent {
+						op_state::complete_linked_lsm_intent(&write_txn, intent)?;
+					}
+					op_state::promote_reservations(&write_txn, &update.promote_reservations)?;
 					let mut table = write_txn.open_table(LSM_RUNS_TABLE).map_err(redb_to_io)?;
 					for slab_id in update.delete_lsm_run_ids {
 						let _ = table.remove(&slab_id.get()).map_err(redb_to_io)?;
@@ -1942,7 +1969,15 @@ impl PersistentLocalIndex {
 					release.wait();
 					if fail { return Err(Error::other("injected delta failure before commit")); }
 				}
+				#[cfg(test)]
+				if progress_cut == Some(op_state::OpTxnCut::BeforeCommit) {
+					return Err(Error::other("injected fault before a progress commit"));
+				}
 				write_txn.commit().map_err(redb_to_io)?;
+				#[cfg(test)]
+				if progress_cut == Some(op_state::OpTxnCut::AfterCommit) {
+					return Err(Error::other("injected loss of a progress commit's result"));
+				}
 				publish_metadata_degradation_counts(degradation_counts);
 				let gap_count = missing_cleanup_supersessions.len() as u64;
 				persisted_cleanup_gaps.count.fetch_add(gap_count, std::sync::atomic::Ordering::Relaxed);

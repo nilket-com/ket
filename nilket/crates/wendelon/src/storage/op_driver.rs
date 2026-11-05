@@ -26,10 +26,31 @@ impl OpDriver {
 		}
 		let index = self.slab.require_op_index()?;
 		let owner = self.slab.owner_ref()?;
+		// A role failure stops the pass. One claim's failure does not: it stays
+		// fenced and visible while independent work keeps draining, and is reported
+		// after. The prefix still stops at its sequence.
+		let claims = index.load_rejected_claims().await?;
+		if !claims.is_empty() {
+			self.committer.preflight(owner).await?;
+		}
+		let mut unresolved = None;
+		for claim in claims {
+			if let Err(error) = self
+				.slab
+				.resolve_rejected_claim(self.committer.as_ref(), claim)
+				.await
+			{
+				tracing::warn!(%error, "a rejected claim is unresolved");
+				unresolved.get_or_insert(error);
+			}
+		}
 		for loaded in index.load_op_intents().await? {
 			if let LoadedOp::Submittable(ticket) = loaded {
 				self.slab.hand_off_op_if_complete(&ticket).await?;
 			}
+		}
+		if let Err(error) = self.slab.drive_reserved_ids(self.committer.as_ref()).await {
+			unresolved.get_or_insert(error);
 		}
 		self.slab.release_resolved_op_fence().await?;
 		let pending = index.load_ack_pending().await?;
@@ -62,7 +83,7 @@ impl OpDriver {
 				"oldest operation holding the window"
 			);
 		}
-		Ok(())
+		unresolved.map_or(Ok(()), Err)
 	}
 
 	/// Run until the task is aborted. Errors are expected while leadership moves
