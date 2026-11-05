@@ -704,6 +704,70 @@ impl SlabManager {
 			.await
 	}
 
+	/// What delivering a committed pointer needs from object storage, gathered with no
+	/// authority held: object storage can stall, and a state machine must not wait on it.
+	/// A slab with no rows has normally lost them, and they come back from its object. A retired
+	/// run has none because compaction gave them to its successors: restoring them would add a
+	/// second version of each key, naming a slab a reopen drops from its index. Every route that
+	/// derives rows from an object asks this, publication and post-reopen verification alike.
+	pub(super) fn run_gave_its_rows_to_successors(&self, slab_id: SlabId) -> bool {
+		!self.has_rows_for_slab(slab_id)
+			&& self
+				.compaction_manifest_snapshot()
+				.run(slab_id)
+				.is_some_and(|run| !run.state.is_live())
+	}
+
+	/// Whether this delivery moves or restores rows. A run that gave its rows away publishes its
+	/// pointer alone.
+	fn tier_delivery_needs_row_plan(
+		&self,
+		pointer: &TieredSlabPointer,
+		old_pointer: Option<&TieredSlabPointer>,
+	) -> bool {
+		if self.run_gave_its_rows_to_successors(pointer.slab_id) {
+			return false;
+		}
+		old_pointer.is_some_and(|old| old != pointer) || !self.has_rows_for_slab(pointer.slab_id)
+	}
+
+	pub(super) async fn prepare_tier_delivery(
+		&self,
+		pointer: &TieredSlabPointer,
+	) -> std::io::Result<PreparedTierDelivery> {
+		let old_pointer = self.tier_pointer(pointer.slab_id).await;
+		let plan = if self.tier_delivery_needs_row_plan(pointer, old_pointer.as_ref()) {
+			Some(
+				self.build_tiered_row_refresh_plan(pointer, old_pointer.as_ref())
+					.await?,
+			)
+		} else {
+			None
+		};
+		Ok(PreparedTierDelivery { old_pointer, plan })
+	}
+
+	/// Publish `pointer` from what was prepared. Local files and redb only: if the published
+	/// generation moved since it was prepared, this refuses rather than going to fetch.
+	pub(super) async fn apply_prepared_tier_delivery(
+		&self,
+		pointer: TieredSlabPointer,
+		last_control_log_index: Option<u64>,
+		prepared: PreparedTierDelivery,
+	) -> std::io::Result<()> {
+		let control_epoch = self.capture_snapshot_epoch();
+		let tier_lock = self.tier_publication_lock(pointer.slab_id);
+		let _tier_guard = tier_lock.lock().await;
+		self.apply_tier_slab_under_publication_lock_prepared(
+			pointer,
+			last_control_log_index,
+			control_epoch,
+			false,
+			Some(prepared),
+		)
+		.await
+	}
+
 	/// Caller owns this slab's tier publication lock, including authority comparison.
 	async fn apply_tier_slab_under_publication_lock(
 		&self,
@@ -731,6 +795,24 @@ impl SlabManager {
 		last_control_log_index: Option<u64>,
 		control_epoch: u64,
 		replay: bool,
+	) -> std::io::Result<()> {
+		self.apply_tier_slab_under_publication_lock_prepared(
+			pointer,
+			last_control_log_index,
+			control_epoch,
+			replay,
+			None,
+		)
+		.await
+	}
+
+	async fn apply_tier_slab_under_publication_lock_prepared(
+		&self,
+		pointer: TieredSlabPointer,
+		last_control_log_index: Option<u64>,
+		control_epoch: u64,
+		replay: bool,
+		prepared: Option<PreparedTierDelivery>,
 	) -> std::io::Result<()> {
 		if last_control_log_index.is_none() {
 			self.require_cleanup_authority()?;
@@ -916,6 +998,7 @@ impl SlabManager {
 					old_pointer,
 					last_control_log_index,
 					gate,
+					prepared,
 				)
 				.await
 			}
@@ -1071,18 +1154,26 @@ impl SlabManager {
 		old_pointer: Option<TieredSlabPointer>,
 		last_control_log_index: Option<u64>,
 		gate: Arc<tokio::sync::OwnedRwLockReadGuard<()>>,
+		prepared: Option<PreparedTierDelivery>,
 	) -> std::io::Result<()> {
 		let pointer = pointer.clone();
-		let refresh_plan = if old_pointer.as_ref().is_some_and(|old| old != &pointer)
-			|| !self.has_rows_for_slab(pointer.slab_id)
-		{
-			Some(
+		let needs_plan = self.tier_delivery_needs_row_plan(&pointer, old_pointer.as_ref());
+		let refresh_plan = match prepared {
+			Some(prepared) => {
+				if prepared.old_pointer != old_pointer || prepared.plan.is_some() != needs_plan {
+					return Err(Error::new(
+						ErrorKind::WouldBlock,
+						"the published tier generation moved since this delivery was prepared",
+					));
+				}
+				prepared.plan
+			}
+			None if needs_plan => Some(
 				self.build_tiered_row_refresh_plan(&pointer, old_pointer.as_ref())
 					.await
 					.map_err(|error| self.observed_publication_error(pointer.slab_id, error))?,
-			)
-		} else {
-			None
+			),
+			None => None,
 		};
 		#[cfg(debug_assertions)]
 		if old_pointer.as_ref().is_some_and(|old| old == &pointer) {
@@ -1779,12 +1870,16 @@ impl SlabManager {
 			&plaintext.bytes,
 			&plaintext.record_offsets,
 		)?;
-		let new_rows = self.tiered_rows_within(
-			&plaintext.bytes,
-			pointer.slab_id,
-			&plaintext.record_offsets,
-			&scratch,
-		)?;
+		let new_rows = if self.run_gave_its_rows_to_successors(pointer.slab_id) {
+			Vec::new()
+		} else {
+			self.tiered_rows_within(
+				&plaintext.bytes,
+				pointer.slab_id,
+				&plaintext.record_offsets,
+				&scratch,
+			)?
+		};
 		let old_rows = self.record_rows_for_slab_for_recovery_within(pointer.slab_id, &scratch)?;
 		let relocated_reads = self.pair_tier_rows(
 			pointer.slab_id,
@@ -2643,4 +2738,10 @@ pub(super) fn tier_refresh_prepare_bytes(old: usize, new: usize) -> Option<u64> 
 		// than the plan has old rows, whatever its version chain holds.
 		super::relocation::RelocationScratch::bytes_bound(old, old),
 	])
+}
+
+/// What a tier delivery fetched before it held any authority.
+pub(super) struct PreparedTierDelivery {
+	old_pointer: Option<TieredSlabPointer>,
+	plan: Option<TieredRowRefreshPlan>,
 }

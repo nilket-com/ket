@@ -1106,3 +1106,73 @@ fn a_snapshot_that_breaks_the_terminal_sets_is_refused_written_and_read() {
 		assert!(error.contains(expected), "{name}: read: {error}");
 	}
 }
+
+/// §9.3: a retry of an accepted operation after what came later changed everything it
+/// touched. Its original receipt, at its original index, with no effect.
+#[test]
+fn an_accepted_retry_after_its_replacement_and_retirement_returns_its_receipt() {
+	let mut state = registered(0xA);
+	let own = owner(0xA);
+	let first = first_tier(own, 1);
+	apply_op(&mut state, 1, first.clone(), 10);
+	let SlabCommand::Tier(TierOp { tier, .. }) = first.clone() else {
+		panic!("a tier");
+	};
+	let mut newer = tier.clone();
+	newer.l2_uri = "memory://replacement".to_string();
+	newer.payload_hash = [9; 32];
+	let replacement = SlabCommand::Tier(TierOp {
+		tier: newer.clone(),
+		replaces: Some(TierGeneration::from(&tier)),
+	});
+	assert_eq!(
+		outcome(&apply_op(&mut state, 2, replacement.clone(), 11).0),
+		&applied(11)
+	);
+	let unchanged = state.tiered_slabs.clone();
+	let (retry, event) = apply_op(&mut state, 1, first.clone(), 12);
+	assert_eq!(outcome(&retry), &applied(10), "after its replacement");
+	assert!(event.is_none());
+	assert_eq!(state.tiered_slabs, unchanged);
+
+	let retire = SlabCommand::Retire(RetireOp {
+		slab: newer.slab,
+		expected: TierGeneration::from(&newer),
+	});
+	assert_eq!(
+		outcome(&apply_op(&mut state, 3, retire.clone(), 13).0),
+		&applied(13)
+	);
+	let unchanged = state.tiered_slabs.clone();
+	for (seq, command, index) in [(1, &first, 10), (2, &replacement, 11)] {
+		let (retry, event) = apply_op(&mut state, seq, command.clone(), 14);
+		assert_eq!(outcome(&retry), &applied(index), "after its retirement");
+		assert!(event.is_none());
+	}
+	assert_eq!(state.tiered_slabs, unchanged);
+
+	let (_, mut restored) = decode_snapshot_reader(&encode_snapshot(&state).unwrap()[..]).unwrap();
+	let (retry, event) = apply_op(&mut restored, 1, first, 15);
+	assert_eq!(outcome(&retry), &applied(10), "after a snapshot");
+	assert!(event.is_none());
+}
+
+/// §9.3: a Cancel of another digest, on a key already decided, is an anomaly with no effect.
+#[test]
+fn a_cancel_of_another_digest_changes_nothing() {
+	let mut state = registered(0xA);
+	let own = owner(0xA);
+	let key = |op_seq| OpKey { owner: own, op_seq };
+	let decided = first_tier(own, 1);
+	apply_op(&mut state, 1, decided.clone(), 10);
+	let before = entries(&state, own);
+	let tiers = state.tiered_slabs.clone();
+	assert_eq!(
+		outcome(&cancel(&mut state, key(1), first_tier(own, 2).digest(), 11)),
+		&OpOutcome::Conflict
+	);
+	assert_eq!(entries(&state, own), before);
+	assert_eq!(state.tiered_slabs, tiers);
+	let (retry, _) = apply_op(&mut state, 1, decided, 12);
+	assert_eq!(outcome(&retry), &applied(10), "its decision stands");
+}

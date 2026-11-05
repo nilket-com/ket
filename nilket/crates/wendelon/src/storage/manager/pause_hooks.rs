@@ -458,6 +458,21 @@ pub(super) struct TestHolds {
 	/// stage 2 before its purge.
 	pub(super) cleanup_validated_hold:
 		std::sync::Mutex<Option<(u8, Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>>,
+	/// Holds a deferred open before it starts, and fails one attempt of it.
+	pub(super) deferred_open_hold:
+		std::sync::Mutex<Option<(Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>>,
+	pub(super) deferred_open_fail_once: std::sync::atomic::AtomicBool,
+	/// Parks a rename in its own task, as a late worker would be.
+	pub(super) lsm_rename_hold:
+		std::sync::Mutex<Option<(Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>>,
+	/// Parks a tier delivery after its evidence is prepared, before its authority.
+	pub(super) tier_delivery_hold:
+		std::sync::Mutex<Option<(Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>>,
+	/// Fails the next read of what a recovered publication left.
+	pub(super) fail_publication_readback: std::sync::atomic::AtomicBool,
+	/// Parks a deferred open at one named stage, for a process death there.
+	pub(super) deferred_open_stage_hold:
+		std::sync::Mutex<Option<(u8, Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>>,
 	pub(super) gc_disposal_entry_hold:
 		std::sync::Mutex<Option<(Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>>,
 	pub(super) gc_before_unlink_hold:
@@ -520,6 +535,42 @@ impl SlabManager {
 			entered.add_permits(1);
 			let _ = release.acquire().await;
 		}
+	}
+
+	pub(super) async fn pause_deferred_open_stage_for_test(&self, stage: u8) {
+		let hold = self
+			.continuity_test_holds
+			.deferred_open_stage_hold
+			.lock()
+			.unwrap()
+			.clone();
+		if let Some((at, entered, release)) = hold
+			&& at == stage
+		{
+			entered.add_permits(1);
+			let _ = release.acquire().await;
+		}
+	}
+
+	pub(super) async fn pause_deferred_open_for_test(&self) -> std::io::Result<()> {
+		let hold = self
+			.continuity_test_holds
+			.deferred_open_hold
+			.lock()
+			.unwrap()
+			.clone();
+		if let Some((entered, release)) = hold {
+			entered.add_permits(1);
+			let _ = release.acquire().await;
+		}
+		if self
+			.continuity_test_holds
+			.deferred_open_fail_once
+			.swap(false, std::sync::atomic::Ordering::AcqRel)
+		{
+			return Err(std::io::Error::other("injected: a deferred open failed"));
+		}
+		Ok(())
 	}
 
 	pub(super) async fn pause_gc_disposal_entry_for_test(&self) {

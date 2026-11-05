@@ -1193,6 +1193,18 @@ impl AsyncFileOps for FaultyFileOps {
 		self.inner.write_permit()
 	}
 
+	fn bind_directory_owner(
+		self: Arc<Self>,
+		owner: DataDirectoryOwner,
+	) -> std::io::Result<Arc<dyn AsyncFileOps>> {
+		// The faults stay shared: whoever holds the unbound handle still injects them.
+		Ok(Arc::new(Self {
+			root: self.root.clone(),
+			inner: BlockingFileOps::with_owner(owner),
+			state: self.state.clone(),
+		}))
+	}
+
 	async fn open(&self, path: &Path, flags: OpenFlags) -> std::io::Result<FileHandle> {
 		let handle = self.inner.open(path, flags).await?;
 		self.state

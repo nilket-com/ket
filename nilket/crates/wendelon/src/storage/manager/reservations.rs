@@ -3,16 +3,18 @@
 //! id was never exposed; anything else takes T1, and nothing revives a burned id.
 
 use super::gc_disposal::{
-	gc_quarantine_path, gc_require_quarantine_content, gc_require_quarantine_inode,
+	gc_quarantine_path, gc_require_recorded_content, gc_require_recorded_inode,
 };
 use super::*;
+use crate::consensus::slab_ops::SlabRejection;
 use crate::storage::index::{
-	AbandonedOutput, GcFileIdentity, LoadedOp, MAX_RESERVED_OUTPUTS_PER_JOB, OpProgress,
-	OpProgressUpdate, OpTicket, ReservationRefused, ReservedIdState, ReservedOp,
+	AbandonedOutput, GcFileIdentity, LoadedOp, MAX_RESERVED_OUTPUTS_PER_JOB, OpOwnership,
+	OpProgress, OpProgressUpdate, OpTicket, ReservationRefused, ReservedIdState, ReservedOp,
 };
 use crate::storage::sweeper::VerifiedReceipt;
 
-/// A reserved id a job owns. In-process liveness only: dropped, the row is the
+/// A reserved id a job owns, held in `live_reservations` from before its row is
+/// visible. In-process liveness only, never evidence: dropped, the row is the
 /// driver's. Not `Clone`, so ownership is one job's.
 #[derive(Debug)]
 pub struct ReservedSlab {
@@ -258,6 +260,16 @@ impl SlabManager {
 					abandoned: Some(_), ..
 				} => self.begin_abandoned_cleanup(id, committer).await,
 				ReservedIdState::Cleaning { .. } => self.resume_cleanup(id, committer).await,
+				// Ended, and holding no window. Its file waits as evidence for a decision no
+				// local authority can make.
+				ReservedIdState::ClaimRefused { reason, .. } => {
+					tracing::debug!(
+						slab_id = id.get(),
+						?reason,
+						"a refused cleanup keeps its file"
+					);
+					Ok(())
+				}
 			};
 			if let Err(error) = step {
 				tracing::warn!(slab_id = id.get(), %error, "a reservation is unresolved");
@@ -286,6 +298,7 @@ impl SlabManager {
 			}
 			index.begin_burn(id, owner).await?
 		};
+		let (ticket, _ownership) = ticket;
 		self.finish_burn(id, ticket, committer).await
 	}
 
@@ -358,15 +371,46 @@ impl SlabManager {
 		&self,
 		id: SlabId,
 	) -> std::io::Result<AbandonedOutput> {
-		use std::os::unix::fs::MetadataExt;
 		let path = slab_path(&self.config.dir, id);
-		let metadata = std::fs::symlink_metadata(&path)?;
-		let (length, digest) = hash_file(&path).await?;
+		self.relocate_rejected_output_from(&path, id).await
+	}
+
+	/// The same from a temp name, which an install rejected before its rename still has.
+	pub(super) async fn relocate_rejected_output_from(
+		&self,
+		path: &Path,
+		id: SlabId,
+	) -> std::io::Result<AbandonedOutput> {
+		use std::os::unix::fs::MetadataExt;
+		let metadata = std::fs::symlink_metadata(path)?;
+		let (length, digest) = hash_file(path).await?;
 		let moved = abandoned_output_path(&self.config.dir, id);
-		self.file_ops.link_no_replace(&path, &moved).await?;
+		self.file_ops.link_no_replace(path, &moved).await?;
 		fsync_parent_dir(self.file_ops.as_ref(), &moved).await?;
-		self.file_ops.unlink(&path).await?;
-		fsync_parent_dir(self.file_ops.as_ref(), &path).await?;
+		self.file_ops.unlink(path).await?;
+		fsync_parent_dir(self.file_ops.as_ref(), path).await?;
+		Ok(AbandonedOutput {
+			file: Some(GcFileIdentity {
+				length,
+				digest,
+				revision: 0,
+				dev: metadata.dev(),
+				ino: metadata.ino(),
+			}),
+			relocated: true,
+		})
+	}
+
+	/// What a relocation that already moved its file left at the abandoned name.
+	pub(super) async fn abandoned_output_evidence(
+		&self,
+		moved: &Path,
+	) -> std::io::Result<AbandonedOutput> {
+		use std::os::unix::fs::MetadataExt;
+		let metadata = std::fs::symlink_metadata(moved)?;
+		let (length, digest) = hash_file(moved).await?;
+		// Its directory entry may be all a crash left undurable.
+		fsync_parent_dir(self.file_ops.as_ref(), moved).await?;
 		Ok(AbandonedOutput {
 			file: Some(GcFileIdentity {
 				length,
@@ -463,7 +507,7 @@ impl SlabManager {
 		let owner = self.owner_ref()?;
 		committer.preflight(owner).await?;
 		let job_id = Self::lsm_gc_job_id(ManifestEpoch::new(0), 0xD3, &[id]);
-		let (claim, complete) = {
+		let (claim, complete, ownership) = {
 			let _maintenance = self.maintenance_publication_gate.clone().read_owned().await;
 			let tier_lock = self.tier_publication_lock(id);
 			let _tier_guard = tier_lock.lock().await;
@@ -472,12 +516,13 @@ impl SlabManager {
 			}
 			index.begin_cleanup(id, owner, job_id).await?
 		};
-		self.run_cleanup(id, job_id, claim, complete, committer)
+		self.run_cleanup(id, job_id, claim, complete, ownership, committer)
 			.await
 	}
 
-	/// A cleanup a restart or an earlier pass left. With local work started, it stays
-	/// fenced for slice 5's phase recovery; before that, it simply carries on.
+	/// A cleanup a restart or an earlier pass left, from what its rows recorded: §6.1's
+	/// table, run-less. Its claim goes first; a disposal resumes from whichever of its files
+	/// is left; Complete keeps its key and digest; and only its own Applied purges.
 	async fn resume_cleanup(
 		self: &Arc<Self>,
 		id: SlabId,
@@ -488,34 +533,234 @@ impl SlabManager {
 			job_id,
 			claim,
 			complete,
-			..
+			output,
 		}) = index.reserved_id_state(id).await?
 		else {
 			return Ok(());
 		};
-		committer.preflight(self.owner_ref()?).await?;
-		let loaded = index.load_op_intents().await?;
-		let find = |seq: u64| {
-			loaded.iter().find(|op| match op {
-				LoadedOp::Submittable(ticket) => ticket.key().op_seq == seq,
-				LoadedOp::Reserved(reserved) => reserved.key().op_seq == seq,
-			})
+		let fence = |why: String| {
+			Err(Error::new(
+				ErrorKind::WouldBlock,
+				format!("the cleanup of {id}: {why}; it remains fenced"),
+			))
 		};
-		let (Some(LoadedOp::Submittable(claim)), Some(LoadedOp::Reserved(complete))) =
-			(find(claim.op_seq), find(complete.op_seq))
+		committer.preflight(self.owner_ref()?).await?;
+		let Some(ownership) = index.try_acquire_ops(vec![claim.op_seq, complete.op_seq]) else {
+			return Ok(());
+		};
+		// Holding them now: the rows as they stand.
+		let loaded = index.load_op_intents().await?;
+		let find = |seq: u64| loaded.iter().find(|op| op.key().op_seq == seq);
+		let claim_row = find(claim.op_seq);
+		let Some(complete_row) = find(complete.op_seq) else {
+			return fence("its Complete has no row".into());
+		};
+		let original = if output.relocated {
+			abandoned_output_path(&self.config.dir, id)
+		} else {
+			slab_path(&self.config.dir, id)
+		};
+		let view = committer
+			.op_view(
+				complete_row.key(),
+				complete_row.digest(),
+				complete_row.command().slabs(),
+			)
+			.await?;
+		if !view.owner_current {
+			return Ok(());
+		}
+		use crate::consensus::slab_ops::{RecordedOutcome, ViewOutcome};
+		let phase = complete_row.progress().cloned();
+		match (view.outcome, phase) {
+			(ViewOutcome::Conflict, _) => fence("Complete was decided under another digest".into()),
+			// Its Cancel landed and its handoff did not. The claim's own answer still decides.
+			(
+				ViewOutcome::Recorded(RecordedOutcome::Rejected {
+					reason: SlabRejection::Cancelled,
+					..
+				}),
+				None,
+			) => {
+				self.resume_refused_cleanup(id, claim_row, complete_row, ownership, committer)
+					.await
+			}
+			(ViewOutcome::Recorded(RecordedOutcome::Rejected { reason, .. }), _) => {
+				fence(format!("Complete was rejected {reason:?}"))
+			}
+			(
+				ViewOutcome::Recorded(RecordedOutcome::Applied { .. }),
+				Some(
+					phase @ (OpProgress::RunDropped(_)
+					| OpProgress::PurgeAuthorized(_)
+					| OpProgress::Purged(_)),
+				),
+			) => {
+				let LoadedOp::Submittable(ticket) = complete_row.clone() else {
+					return fence("Complete applied without its submission".into());
+				};
+				tokio::spawn(
+					self.clone()
+						.cleanup_finish(id, job_id, ticket, phase, ownership),
+				)
+				.await
+				.map_err(Error::other)?
+			}
+			(ViewOutcome::Recorded(RecordedOutcome::Applied { .. }), phase) => {
+				fence(format!("Complete applied at {phase:?}"))
+			}
+			// Marked for its Cancel, whether or not one was sent: never for disposal, since a
+			// Complete goes to submission only with its run dropped.
+			(ViewOutcome::None, None) if matches!(complete_row, LoadedOp::Submittable(_)) => {
+				self.resume_refused_cleanup(id, claim_row, complete_row, ownership, committer)
+					.await
+			}
+			(ViewOutcome::None, None) => {
+				let (Some(LoadedOp::Submittable(claim)), LoadedOp::Reserved(complete)) =
+					(claim_row.cloned(), complete_row.clone())
+				else {
+					return fence("nothing recorded, and its claim is not submittable".into());
+				};
+				self.run_cleanup(id, job_id, claim, complete, ownership, committer)
+					.await
+			}
+			(ViewOutcome::None, Some(OpProgress::QuarantineRecorded(file))) => {
+				let Some(LoadedOp::Submittable(claim)) = claim_row.cloned() else {
+					return fence("its disposal began and its claim has no row".into());
+				};
+				// The claim's decision is read again under the lease this stage holds.
+				match committer.submit_op(&claim).await? {
+					VerifiedReceipt::Applied { .. } => {}
+					VerifiedReceipt::Rejected { reason, .. } => {
+						return fence(format!("the claim was rejected {reason:?}"));
+					}
+				}
+				tokio::spawn(self.clone().cleanup_resume_disposal(
+					id,
+					job_id,
+					claim,
+					complete,
+					complete_row.digest(),
+					original,
+					file,
+					ownership,
+				))
+				.await
+				.map_err(Error::other)?
+				.map(drop)
+			}
+			(ViewOutcome::None, Some(OpProgress::RunDropped(file))) => {
+				if let Some(LoadedOp::Submittable(claim)) = claim_row {
+					index.hand_off_op(claim.key(), claim.digest(), None).await?;
+				}
+				if let Some(file) = &file {
+					gc_require_recorded_inode(
+						&gc_quarantine_path(&self.config.dir, id, job_id),
+						file,
+					)?;
+				}
+				let ticket = match complete_row.clone() {
+					LoadedOp::Submittable(ticket) => ticket,
+					LoadedOp::Reserved(reserved) => index.mark_may_be_submitted(reserved).await?,
+				};
+				match committer.submit_op(&ticket).await? {
+					VerifiedReceipt::Applied { .. } => Ok(()),
+					VerifiedReceipt::Rejected { reason, .. } => {
+						fence(format!("Complete was rejected {reason:?}"))
+					}
+				}
+			}
+			(ViewOutcome::None, phase) => fence(format!("no decision at {phase:?}")),
+		}
+	}
+
+	/// The claim's own recorded answer decides a cleanup whose Complete already left its
+	/// reservation. Applied here contradicts everything else on its rows.
+	async fn resume_refused_cleanup(
+		&self,
+		id: SlabId,
+		claim_row: Option<&LoadedOp>,
+		complete_row: &LoadedOp,
+		ownership: OpOwnership,
+		committer: &dyn crate::storage::TierCommitter,
+	) -> std::io::Result<()> {
+		let (Some(LoadedOp::Submittable(claim)), LoadedOp::Submittable(complete)) =
+			(claim_row, complete_row)
 		else {
 			return Err(Error::new(
 				ErrorKind::WouldBlock,
-				format!("a cleanup of {id} is past what a pass may resume; it remains fenced"),
+				format!("the cleanup of {id}: its rows are not a refusal's; it remains fenced"),
 			));
 		};
-		if complete.progress().is_some() {
+		match committer.submit_op(claim).await? {
+			VerifiedReceipt::Rejected { reason, .. } => {
+				self.refuse_cleanup(id, claim, complete, reason, ownership, committer)
+					.await
+			}
+			VerifiedReceipt::Applied { .. } => Err(Error::new(
+				ErrorKind::WouldBlock,
+				format!(
+					"the cleanup of {id}: its claim applied and its Complete is Cancelled; it remains fenced"
+				),
+			)),
+		}
+	}
+
+	/// §9.3: a rejected claim Cancels its reserved Complete, by its original key and digest.
+	/// Only that exact answer ends them. Anything else stays fenced with its rows and file, and
+	/// no answer here authorizes touching the file.
+	async fn refuse_cleanup(
+		&self,
+		id: SlabId,
+		claim: &OpTicket,
+		complete: &OpTicket,
+		reason: SlabRejection,
+		ownership: OpOwnership,
+		committer: &dyn crate::storage::TierCommitter,
+	) -> std::io::Result<()> {
+		match committer.cancel_op(complete).await? {
+			VerifiedReceipt::Rejected {
+				reason: SlabRejection::Cancelled,
+				..
+			} => {}
+			other => {
+				return Err(Error::new(
+					ErrorKind::WouldBlock,
+					format!(
+						"the Complete of a refused cleanup of {id} answered {other:?}; it remains fenced"
+					),
+				));
+			}
+		}
+		self.require_cleanup_authority()?;
+		let lease = match self.canonical_tier_source.get() {
+			Some(source) => Some(source.read().await?),
+			None => None,
+		};
+		if lease.as_ref().is_some_and(|lease| {
+			!lease.rejected_claim_decided_for_current_owner(
+				(claim.key(), claim.digest()),
+				(complete.key(), complete.digest()),
+			)
+		}) {
 			return Err(Error::new(
 				ErrorKind::WouldBlock,
-				format!("a cleanup of {id} has local progress; it remains fenced"),
+				"a refused cleanup is not decided for the current owner; it remains fenced",
 			));
 		}
-		self.run_cleanup(id, job_id, claim.clone(), complete.clone(), committer)
+		tracing::warn!(
+			slab_id = id.get(),
+			?reason,
+			"a cleanup's claim was refused; its file is kept"
+		);
+		self.require_op_index()?
+			.hand_off_refused_cleanup(
+				claim,
+				complete,
+				id,
+				reason,
+				Some(Box::new((lease, ownership))),
+			)
 			.await
 	}
 
@@ -528,16 +773,17 @@ impl SlabManager {
 		job_id: CompactionJobId,
 		claim: OpTicket,
 		complete: ReservedOp,
+		ownership: OpOwnership,
 		committer: &dyn crate::storage::TierCommitter,
 	) -> std::io::Result<()> {
 		let index = self.require_op_index()?;
 		match committer.submit_op(&claim).await? {
 			VerifiedReceipt::Applied { .. } => {}
 			VerifiedReceipt::Rejected { reason, .. } => {
-				return Err(Error::new(
-					ErrorKind::WouldBlock,
-					format!("the claim of {id} was rejected {reason:?}; it remains fenced"),
-				));
+				let complete = index.reserved_for_cancel(complete).await?;
+				return self
+					.refuse_cleanup(id, &claim, &complete, reason, ownership, committer)
+					.await;
 			}
 		}
 		let Some(ReservedIdState::Cleaning { output, .. }) = index.reserved_id_state(id).await?
@@ -550,7 +796,7 @@ impl SlabManager {
 			slab_path(&self.config.dir, id)
 		};
 		let file = output.file;
-		tokio::spawn(self.clone().cleanup_dispose(
+		let ownership = tokio::spawn(self.clone().cleanup_dispose(
 			id,
 			job_id,
 			claim,
@@ -558,6 +804,7 @@ impl SlabManager {
 			complete.digest(),
 			original,
 			file.clone(),
+			ownership,
 		))
 		.await
 		.map_err(Error::other)??;
@@ -571,13 +818,19 @@ impl SlabManager {
 				));
 			}
 		}
-		tokio::spawn(self.clone().cleanup_finish(id, job_id, ticket, file))
-			.await
-			.map_err(Error::other)?
+		tokio::spawn(self.clone().cleanup_finish(
+			id,
+			job_id,
+			ticket,
+			OpProgress::RunDropped(file),
+			ownership,
+		))
+		.await
+		.map_err(Error::other)?
 	}
 
 	/// The claim's Applied authorizes this, read with the owner and held throughout.
-	async fn cleanup_dispose(
+	pub(super) async fn cleanup_dispose(
 		self: Arc<Self>,
 		id: SlabId,
 		job_id: CompactionJobId,
@@ -586,13 +839,14 @@ impl SlabManager {
 		complete_digest: [u8; 32],
 		original: PathBuf,
 		file: Option<GcFileIdentity>,
-	) -> std::io::Result<()> {
+		ownership: OpOwnership,
+	) -> std::io::Result<OpOwnership> {
 		let index = self.require_op_index()?;
 		let slab = claim.key().owner.slab(id);
 		// Content first, from the inode it names and outside the lease: this can be a
 		// whole slab. The same inode is rechecked under the lease and the locks.
 		if let Some(file) = &file {
-			gc_require_quarantine_content(&original, file).await?;
+			gc_require_recorded_content(&original, file).await?;
 		}
 		#[cfg(test)]
 		self.pause_cleanup_validated_for_test(1).await;
@@ -612,23 +866,23 @@ impl SlabManager {
 		let _maintenance = self.maintenance_publication_gate.clone().read_owned().await;
 		let tier_lock = self.tier_publication_lock(id);
 		let _tier_guard = tier_lock.lock().await;
-		if self.live_reservations.contains(&id)
-			|| !matches!(
-				index.reserved_id_state(id).await?,
-				Some(ReservedIdState::Cleaning { job_id: job, .. }) if job == job_id
-			) {
-			return Err(Error::new(
-				ErrorKind::WouldBlock,
-				"this cleanup no longer owns its id; it remains fenced",
-			));
-		}
+		self.cleanup_require_stands(
+			id,
+			job_id,
+			Some(claim.key()),
+			complete,
+			complete_digest,
+			None,
+			file.as_ref(),
+		)
+		.await?;
 		let progress = |progress| OpProgressUpdate {
 			key: complete,
 			digest: complete_digest,
 			progress,
 		};
 		if let Some(file) = &file {
-			gc_require_quarantine_inode(&original, file)?;
+			gc_require_recorded_inode(&original, file)?;
 			index
 				.advance_op_progress(progress(OpProgress::QuarantineRecorded(file.clone())), None)
 				.await?;
@@ -645,22 +899,161 @@ impl SlabManager {
 			.await?;
 		index.hand_off_op(claim.key(), claim.digest(), None).await?;
 		drop(lease);
-		Ok(())
+		Ok(ownership)
+	}
+
+	/// Holding its exclusions, before any effect: this id's cleanup is this job, this claim,
+	/// this Complete and this file, with its Complete at exactly this phase. A later commit
+	/// would refuse too, but that protects the row, not the files in front of it.
+	async fn cleanup_require_stands(
+		&self,
+		id: SlabId,
+		job_id: CompactionJobId,
+		claim: Option<crate::consensus::slab_ops::OpKey>,
+		complete: crate::consensus::slab_ops::OpKey,
+		digest: [u8; 32],
+		phase: Option<&OpProgress>,
+		file: Option<&GcFileIdentity>,
+	) -> std::io::Result<()> {
+		let index = self.require_op_index()?;
+		let bound = matches!(
+			index.reserved_id_state(id).await?,
+			Some(ReservedIdState::Cleaning {
+				job_id: job,
+				claim: found_claim,
+				complete: found,
+				ref output,
+			}) if job == job_id
+				&& claim.is_none_or(|claim| claim == found_claim)
+				&& found == complete
+				&& output.file.as_ref() == file
+		);
+		if self.live_reservations.contains(&id) || !bound {
+			return Err(Error::new(
+				ErrorKind::WouldBlock,
+				"this cleanup no longer owns its id; it remains fenced",
+			));
+		}
+		self.gc_require_row_stands(complete, digest, |at| at == phase, None)
+			.await
+	}
+
+	/// The disposal a row recorded and did not finish, from whichever of its files is left.
+	/// Both exact: unlink. Original only: link first. Entry only: nothing is left to move.
+	/// Anything else, or a claim no longer held, fences.
+	#[allow(clippy::too_many_arguments)]
+	pub(super) async fn cleanup_resume_disposal(
+		self: Arc<Self>,
+		id: SlabId,
+		job_id: CompactionJobId,
+		claim: OpTicket,
+		complete: crate::consensus::slab_ops::OpKey,
+		complete_digest: [u8; 32],
+		original: PathBuf,
+		file: GcFileIdentity,
+		ownership: OpOwnership,
+	) -> std::io::Result<OpOwnership> {
+		let index = self.require_op_index()?;
+		let slab = claim.key().owner.slab(id);
+		let quarantine = gc_quarantine_path(&self.config.dir, id, job_id);
+		let present = |path: &Path| -> std::io::Result<bool> {
+			match std::fs::symlink_metadata(path) {
+				Ok(_) => {
+					gc_require_recorded_inode(path, &file)?;
+					Ok(true)
+				}
+				Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+				Err(error) => Err(error),
+			}
+		};
+		let readable = if present(&quarantine)? {
+			&quarantine
+		} else {
+			&original
+		};
+		gc_require_recorded_content(readable, &file).await?;
+		let lease = match self.canonical_tier_source.get() {
+			Some(source) => Some(source.read().await?),
+			None => None,
+		};
+		if lease
+			.as_ref()
+			.is_some_and(|lease| !lease.claim_held_by_current_owner(slab, job_id))
+		{
+			return Err(Error::new(
+				ErrorKind::WouldBlock,
+				"this cleanup does not hold the claim for the current owner; it remains fenced",
+			));
+		}
+		let _maintenance = self.maintenance_publication_gate.clone().read_owned().await;
+		let tier_lock = self.tier_publication_lock(id);
+		let _tier_guard = tier_lock.lock().await;
+		let recorded = OpProgress::QuarantineRecorded(file.clone());
+		self.cleanup_require_stands(
+			id,
+			job_id,
+			Some(claim.key()),
+			complete,
+			complete_digest,
+			Some(&recorded),
+			Some(&file),
+		)
+		.await?;
+		let has_original = present(&original)?;
+		if !present(&quarantine)? {
+			self.file_ops
+				.link_no_replace(&original, &quarantine)
+				.await?;
+		}
+		fsync_parent_dir(self.file_ops.as_ref(), &quarantine).await?;
+		if has_original {
+			self.file_ops.unlink(&original).await?;
+		}
+		fsync_parent_dir(self.file_ops.as_ref(), &original).await?;
+		index
+			.advance_op_progress(
+				OpProgressUpdate {
+					key: complete,
+					digest: complete_digest,
+					progress: OpProgress::RunDropped(Some(file)),
+				},
+				None,
+			)
+			.await?;
+		index.hand_off_op(claim.key(), claim.digest(), None).await?;
+		drop(lease);
+		Ok(ownership)
 	}
 
 	/// Complete's exact Applied and the removed set authorize the purge, held
-	/// through the transaction that ends this operation and its row.
-	async fn cleanup_finish(
+	/// through the transaction that ends this operation and its row. From
+	/// `PurgeAuthorized` an absent entry is an unlink that already happened, with its sync
+	/// still owed; from `Purged`, an entry here is not this workflow's.
+	pub(super) async fn cleanup_finish(
 		self: Arc<Self>,
 		id: SlabId,
 		job_id: CompactionJobId,
 		ticket: OpTicket,
-		file: Option<GcFileIdentity>,
+		phase: OpProgress,
+		_ownership: OpOwnership,
 	) -> std::io::Result<()> {
 		let index = self.require_op_index()?;
 		let quarantine = gc_quarantine_path(&self.config.dir, id, job_id);
-		if let Some(file) = &file {
-			gc_require_quarantine_content(&quarantine, file).await?;
+		let present = |path: &Path| -> std::io::Result<bool> {
+			match std::fs::symlink_metadata(path) {
+				Ok(_) => Ok(true),
+				Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+				Err(error) => Err(error),
+			}
+		};
+		match &phase {
+			OpProgress::RunDropped(Some(file)) => {
+				gc_require_recorded_content(&quarantine, file).await?;
+			}
+			OpProgress::PurgeAuthorized(file) if present(&quarantine)? => {
+				gc_require_recorded_content(&quarantine, file).await?;
+			}
+			_ => {}
 		}
 		#[cfg(test)]
 		self.pause_cleanup_validated_for_test(2).await;
@@ -679,17 +1072,63 @@ impl SlabManager {
 		}
 		let tier_lock = self.tier_publication_lock(id);
 		let _tier_guard = tier_lock.lock().await;
-		if let Some(file) = file {
-			gc_require_quarantine_inode(&quarantine, &file)?;
-			let update = |progress| OpProgressUpdate {
-				key: ticket.key(),
-				digest: ticket.digest(),
-				progress,
-			};
-			index
-				.advance_op_progress(update(OpProgress::PurgeAuthorized(file.clone())), None)
-				.await?;
-			self.file_ops.unlink(&quarantine).await?;
+		let file = match &phase {
+			OpProgress::RunDropped(file) => file.clone(),
+			OpProgress::PurgeAuthorized(file) | OpProgress::Purged(file) => Some(file.clone()),
+			_ => None,
+		};
+		// Its claim has handed off by now, and its row is gone.
+		self.cleanup_require_stands(
+			id,
+			job_id,
+			None,
+			ticket.key(),
+			ticket.digest(),
+			Some(&phase),
+			file.as_ref(),
+		)
+		.await?;
+		let update = |progress| OpProgressUpdate {
+			key: ticket.key(),
+			digest: ticket.digest(),
+			progress,
+		};
+		let purge = match phase {
+			OpProgress::RunDropped(None) => None,
+			OpProgress::RunDropped(Some(file)) => {
+				gc_require_recorded_inode(&quarantine, &file)?;
+				index
+					.advance_op_progress(update(OpProgress::PurgeAuthorized(file.clone())), None)
+					.await?;
+				Some((file, true))
+			}
+			OpProgress::PurgeAuthorized(file) => {
+				let here = present(&quarantine)?;
+				if here {
+					gc_require_recorded_inode(&quarantine, &file)?;
+				}
+				Some((file, here))
+			}
+			OpProgress::Purged(_) => {
+				if present(&quarantine)? {
+					return Err(Error::new(
+						ErrorKind::WouldBlock,
+						"a purged cleanup's entry is back; it remains fenced",
+					));
+				}
+				None
+			}
+			other => {
+				return Err(Error::new(
+					ErrorKind::WouldBlock,
+					format!("a cleanup at {other:?} cannot finish; it remains fenced"),
+				));
+			}
+		};
+		if let Some((file, here)) = purge {
+			if here {
+				self.file_ops.unlink(&quarantine).await?;
+			}
 			fsync_parent_dir(self.file_ops.as_ref(), &quarantine).await?;
 			index
 				.advance_op_progress(update(OpProgress::Purged(file)), None)

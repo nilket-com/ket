@@ -1604,7 +1604,7 @@ impl SlabManager {
 		context: SecondaryIndexCompactionContext<'_>,
 	) -> std::io::Result<Vec<(TenantId, TableSchemaDescriptor, SecondaryIndexDescriptor)>> {
 		let plaintext = self
-			.secondary_index_source_slab_plaintext(source_slab_id)
+			.secondary_index_source_slab_plaintext_unfenced(source_slab_id)
 			.await?;
 		self.secondary_index_compaction_descriptors_for_plaintext(
 			source_slab_id,
@@ -1875,7 +1875,7 @@ impl SlabManager {
 					tenant_id,
 					&descriptor,
 				));
-				let segment = self.build_secondary_index_segment_from_plaintext(
+				let segment = self.build_secondary_index_segment_unfenced(
 					tenant_id,
 					&table,
 					&descriptor,
@@ -1915,7 +1915,7 @@ impl SlabManager {
 		source_slab_id: SlabId,
 		plaintext: &[u8],
 	) -> Result<(), CompactionFailure> {
-		let cold_rebuild = self.build_secondary_index_segment_from_plaintext(
+		let cold_rebuild = self.build_secondary_index_segment_unfenced(
 			tenant_id,
 			table,
 			descriptor,
@@ -2294,6 +2294,25 @@ impl SlabManager {
 		plaintext: &[u8],
 	) -> std::io::Result<SecondaryIndexSegment> {
 		self.require_tier_authority_ready()?;
+		self.build_secondary_index_segment_unfenced(
+			tenant_id,
+			table,
+			descriptor,
+			source_slab_id,
+			plaintext,
+		)
+	}
+
+	/// For a caller holding its own authority: a live install checked readiness on entry,
+	/// and a recovered one is why this store is fenced.
+	pub(super) fn build_secondary_index_segment_unfenced(
+		&self,
+		tenant_id: TenantId,
+		table: &TableSchemaDescriptor,
+		descriptor: &SecondaryIndexDescriptor,
+		source_slab_id: SlabId,
+		plaintext: &[u8],
+	) -> std::io::Result<SecondaryIndexSegment> {
 		let identity = SecondaryIndexIdentity::from_descriptor(tenant_id, descriptor);
 		let mut index_entries = Vec::new();
 		for recovered in recover_slab_entries_from_blob_skipping_counters(
@@ -2360,6 +2379,14 @@ impl SlabManager {
 		source_slab_id: SlabId,
 	) -> std::io::Result<Vec<u8>> {
 		self.require_tier_authority_ready()?;
+		self.secondary_index_source_slab_plaintext_unfenced(source_slab_id)
+			.await
+	}
+
+	async fn secondary_index_source_slab_plaintext_unfenced(
+		&self,
+		source_slab_id: SlabId,
+	) -> std::io::Result<Vec<u8>> {
 		let tier_pointer = {
 			let state = self.state.lock().await;
 			if state.active.slab_id() == source_slab_id {
@@ -2382,7 +2409,11 @@ impl SlabManager {
 		if let Some(pointer) = tier_pointer {
 			self.tiered_plaintext_from_l2(&pointer).await
 		} else {
-			self.read_sealed_raw(source_slab_id).await
+			// Sealed and claimed by this caller, whose exclusions hold it still: the file is
+			// its bytes, and `read_sealed_raw`'s readiness is what recovery is restoring.
+			self.file_ops
+				.read_all(&slab_path(&self.config.dir, source_slab_id))
+				.await
 		}
 	}
 

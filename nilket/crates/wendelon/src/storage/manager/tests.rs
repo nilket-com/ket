@@ -22648,6 +22648,45 @@ async fn unverified_authority_refuses_existing_and_absent_index_answers() {
 	);
 }
 
+/// DC-165: an attempt that succeeds between a wait's ready check and its attempt check
+/// is a store that is ready. Under load the wait used to refuse it, at a node's startup.
+#[tokio::test]
+async fn a_readiness_wait_accepts_an_attempt_that_succeeds_inside_its_window() {
+	let f = pending_authority_fixture().await;
+	tokio::time::timeout(Duration::from_secs(2), f.store.entered.notified())
+		.await
+		.expect("open starts verification");
+	let authority = f.manager.tier_authority.clone();
+	let entered = Arc::new(tokio::sync::Semaphore::new(0));
+	let release = Arc::new(tokio::sync::Semaphore::new(0));
+	*authority.wait_before_attempt_check_hold.lock().unwrap() =
+		Some((entered.clone(), release.clone()));
+	let attempts = authority.completed_attempts_for_test();
+	let wait = {
+		let manager = f.manager.clone();
+		tokio::spawn(async move { manager.wait_tier_authority_ready().await })
+	};
+	tokio::time::timeout(Duration::from_secs(5), entered.acquire())
+		.await
+		.unwrap()
+		.unwrap()
+		.forget();
+	f.store.release();
+	tokio::time::timeout(Duration::from_secs(5), async {
+		while authority.completed_attempts_for_test() == attempts {
+			tokio::task::yield_now().await;
+		}
+	})
+	.await
+	.expect("the attempt finishes");
+	release.add_permits(1);
+	tokio::time::timeout(Duration::from_secs(5), wait)
+		.await
+		.unwrap()
+		.unwrap()
+		.expect("the attempt succeeded: this store is ready");
+}
+
 #[tokio::test]
 async fn unverified_authority_starts_eagerly_and_readers_share_one_flight() {
 	let f = pending_authority_fixture().await;
@@ -25365,6 +25404,7 @@ async fn unresolved_lsm_intent_fences_open_and_preserves_staged_output() {
 		commit_digest: *blake3::hash(&serde_json::to_vec(&commit).unwrap()).as_bytes(),
 		commit,
 		inputs: vec![crate::storage::index::LsmInputAuthority {
+			opened: 0,
 			slab_id: SlabId::new(2),
 			revision: 3,
 			tiered: None,
@@ -41569,7 +41609,9 @@ async fn b11_staging_lock_control(maintenance: bool) {
 		let manager = manager.clone();
 		tokio::spawn(async move {
 			manager
-				.stage_lsm_compaction_outputs(&plan, &prepared, &written, &commit, false, true)
+				.stage_lsm_compaction_outputs(
+					&plan, &prepared, &written, &commit, false, true, None,
+				)
 				.await
 		})
 	};
@@ -41605,9 +41647,17 @@ async fn b11_output_staging_waits_for_input_tier_publication_lock() {
 }
 
 #[tokio::test]
-#[ignore = "ADR 0697 intermediate: a linked control intent stays fenced until slice 5 recovers it through a verified receipt; this is its eventual acceptance, kept unchanged"]
+// ADR 0697 slice 5: on a real ring, because recovery now needs the ring's decision.
 async fn b11_completed_control_install_recovers_after_crash_before_intent_clear() {
-	let (dir, manager) = fresh_manager().await;
+	let dir = fresh_dir("s5-b11");
+	let owner = DataDirectoryOwner::acquire_existing(&dir).unwrap();
+	let manager =
+		SlabManager::initialize_new_store_with_owner(gc_owned_test_config(&dir), owner.clone())
+			.await
+			.unwrap();
+	let cluster = control_cluster_observing(&[(1, &manager)]).await;
+	register_owner(&cluster.nodes[0], &manager).await;
+	let plain = Arc::new(op_committer(&cluster, 1));
 	let keys = seed_lsm_relocation_fixture(&manager).await;
 	let worker = LsmCompactionWorker::new(LsmConfig::default(), manager.slab_pin_table()).unwrap();
 	let plan = manager
@@ -41623,20 +41673,17 @@ async fn b11_completed_control_install_recovers_after_crash_before_intent_clear(
 	let release = Arc::new(tokio::sync::Semaphore::new(0));
 	*manager.lsm_after_install_hold.lock().unwrap() = Some((entered.clone(), release));
 	let mut task = {
-		let manager = manager.clone();
+		let (manager, plain) = (manager.clone(), plain.clone());
 		tokio::spawn(async move {
-			let committer = DirectLsmCommitter {
-				manager: manager.clone(),
-			};
 			manager
-				.run_lsm_compaction_once_via_control_ring(&worker, plan, &committer)
+				.run_lsm_compaction_once_via_control_ring(&worker, plan, plain.as_ref())
 				.await
 		})
 	};
 	tokio::select! {
 		result = entered.acquire() => { result.unwrap().forget(); },
 		result = &mut task => panic!("control install exited before the post-publication crash cut: {result:?}"),
-		_ = tokio::time::sleep(Duration::from_secs(60)) => { task.abort(); let _ = task.await; panic!("control install did not reach crash cut; observed_phase_count={}", progress.available_permits()); }
+		_ = tokio::time::sleep(Duration::from_secs(60)) => { task.abort(); let _ = task.await; panic!("control install did not reach the post-publication crash cut"); },
 	}
 	let saved = manager
 		.persistent_index
@@ -41672,12 +41719,17 @@ async fn b11_completed_control_install_recovers_after_crash_before_intent_clear(
 	task.abort();
 	assert!(task.await.unwrap_err().is_cancelled());
 	drop(manager);
-	let reopened = open_manager_at_dir(
-		dir.to_path_buf(),
-		spawn_io_thread(64).unwrap(),
-		test_crypto(),
-	)
-	.await;
+	let _ = owner.close(Duration::from_secs(5)).await;
+	let next = DataDirectoryOwner::acquire_existing(&dir).expect("released");
+	let reopened = SlabManager::open_with_owner(gc_owned_test_config(&dir), next.clone())
+		.await
+		.unwrap();
+	reopened.bind_control_node(1).unwrap();
+	reopened.bind_canonical_tier_source(cluster.state_machines[0].tier_snapshot_source_for_test());
+	let driver = op_driver(&cluster, &reopened, plain);
+	for _ in 0..8 {
+		let _ = driver.drive_once().await;
+	}
 	assert!(
 		reopened.tier_authority_readiness_reason().is_none(),
 		"a fully published control install must recover after the crash before intent clear; reason={:?}",
@@ -41698,6 +41750,7 @@ async fn b11_completed_control_install_recovers_after_crash_before_intent_clear(
 	for key in keys {
 		assert!(reopened.lookup(tenant(), key).unwrap().is_some());
 	}
+	assert_memory_matches_a_fresh_open(&dir, reopened, next, "b11").await;
 }
 
 async fn b11b_paused_control_install(
@@ -41867,9 +41920,12 @@ async fn b11b_crash_after_acceptance_before_publication_stays_fenced() {
 	b11b_check_crash_cut(lsm_driver::ControlLsmInstallCut::AfterAcceptance, false).await;
 }
 #[tokio::test]
-#[ignore = "ADR 0697 intermediate: a linked control intent stays fenced until slice 5 recovers it through a verified receipt; this is its eventual acceptance, kept unchanged"]
+// ADR 0697 slice 5: on a real ring, because recovery now needs the ring's decision.
 async fn b11b_crash_after_publication_recovers_exact_rows() {
-	b11b_check_crash_cut(lsm_driver::ControlLsmInstallCut::AfterPublication, true).await;
+	reopen_install_at(lsm_driver::ControlLsmInstallCut::AfterPublication)
+		.await
+		.assert_applied_install_ends("b11b")
+		.await;
 }
 
 // API-only negative guards supplement the actual install/crash/reopen controls.
@@ -45973,7 +46029,9 @@ impl ControlCluster {
 /// Make `node` (1-based) the leader of `nodes` through a real election.
 async fn elect_among(nodes: &[crate::consensus::WendelonRaft], node: u32) {
 	let target = &nodes[node as usize - 1];
-	tokio::time::timeout(Duration::from_secs(60), async {
+	let triggers = std::sync::atomic::AtomicU64::new(0);
+	let elected = tokio::time::timeout(Duration::from_secs(60), async {
+		let mut pause = Duration::from_millis(200);
 		loop {
 			if nodes
 				.iter()
@@ -45981,12 +46039,36 @@ async fn elect_among(nodes: &[crate::consensus::WendelonRaft], node: u32) {
 			{
 				break;
 			}
-			let _ = target.trigger().elect().await;
-			tokio::time::sleep(Duration::from_millis(200)).await;
+			// At a fixed 200 ms under load the target churned through campaigns with nobody
+			// leading: a new round plausibly abandons one whose votes are still on their way.
+			// One that already leads only has to be heard.
+			if target.metrics().borrow().current_leader != Some(node) {
+				triggers.fetch_add(1, Ordering::Relaxed);
+				let _ = target.trigger().elect().await;
+			}
+			tokio::time::sleep(pause).await;
+			pause = (pause * 2).min(Duration::from_millis(3200));
 		}
 	})
-	.await
-	.expect("the node wins a real election");
+	.await;
+	if elected.is_err() {
+		let view = nodes
+			.iter()
+			.map(|raft| {
+				let metrics = raft.metrics().borrow().clone();
+				(
+					metrics.id,
+					metrics.current_term,
+					metrics.current_leader,
+					format!("{:?}", metrics.state),
+				)
+			})
+			.collect::<Vec<_>>();
+		panic!(
+			"the node wins a real election: {} triggers, target {node}, (id, term, leader, state) {view:?}",
+			triggers.load(Ordering::Relaxed)
+		);
+	}
 }
 
 /// Multinode: a follower funds its own apply. The leader commits the pointer;
@@ -46578,6 +46660,7 @@ async fn control_cluster_observing(observers: &[(u32, &Arc<SlabManager>)]) -> Co
 /// the sweep directly on node 1 after node 2 won a real election, standing in
 /// for that window. The commit never reaches a log, yet the store must not be
 /// left with an unresolvable GC intent and a node-wide fence.
+#[ignore = "superseded history (ADR 0697 §9.1): its no-fence outcome is stronger than the leader-only policy; see the three §9.2 tests, dc161_a_*"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dc161_gc_after_leadership_loss_leaves_no_unresolvable_intent() {
 	let (_dir, manager) = fresh_manager().await;
@@ -47826,6 +47909,7 @@ struct FlakyAckCommitter {
 	lose_next_ack_response: std::sync::atomic::AtomicBool,
 	accept_only_first: std::sync::atomic::AtomicBool,
 	answer_another_batch: std::sync::atomic::AtomicBool,
+	submitted: std::sync::atomic::AtomicU64,
 }
 
 #[async_trait]
@@ -47840,6 +47924,8 @@ impl crate::storage::TierCommitter for FlakyAckCommitter {
 		&self,
 		ticket: &crate::storage::OpTicket,
 	) -> std::io::Result<crate::storage::VerifiedReceipt> {
+		self.submitted
+			.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 		self.inner.submit_op(ticket).await
 	}
 	async fn ack_outcomes(
@@ -47883,6 +47969,7 @@ async fn a_lost_or_partial_ack_marks_only_what_was_accepted_and_is_redriven() {
 		lose_next_ack_response: AtomicBool::new(true),
 		accept_only_first: AtomicBool::new(false),
 		answer_another_batch: AtomicBool::new(false),
+		submitted: std::sync::atomic::AtomicU64::new(0),
 	});
 	let index = mgr.require_op_index().unwrap();
 	let owner = mgr.owner_ref().unwrap();
@@ -47898,6 +47985,11 @@ async fn a_lost_or_partial_ack_marks_only_what_was_accepted_and_is_redriven() {
 	assert_eq!(cluster.state_machines[0].op_acked_through(owner).await, 1);
 	driver.drive_once().await.unwrap();
 	assert_eq!(index.load_ack_pending().await.unwrap(), vec![]);
+	assert_eq!(
+		flaky.submitted.load(Ordering::SeqCst),
+		1,
+		"the Ack is redriven and the operation is not replayed"
+	);
 
 	// Two rows, one accepted: the other stays unacked for the next pass.
 	for slab in [0x700, 0x701] {
@@ -48020,12 +48112,31 @@ async fn a_full_window_refuses_new_work_and_the_reserved_gc_removal_still_drains
 			compaction_start_hlc: hlc(40),
 			dominant_reason: crate::storage::DominantReason::Operator,
 		};
+		let rows = mgr
+			.require_op_index()
+			.unwrap()
+			.load_op_intents()
+			.await
+			.unwrap();
+		let next = mgr
+			.require_op_index()
+			.unwrap()
+			.next_op_seq_for_test()
+			.await
+			.unwrap();
 		let refused = mgr
 			.run_lsm_compaction_once_via_control_ring(&compaction, plan, committer.as_ref())
 			.await;
 		assert!(
 			format!("{:?}", refused.expect_err("refused")).contains("TerminalBacklog"),
 			"the producer is refused by the window"
+		);
+		let index_after = mgr.require_op_index().unwrap();
+		assert_eq!(index_after.load_op_intents().await.unwrap(), rows, "no row");
+		assert_eq!(
+			index_after.next_op_seq_for_test().await.unwrap(),
+			next,
+			"no sequence"
 		);
 		assert!(
 			!mgr.has_orphaned_lsm_intents(),
@@ -48252,7 +48363,7 @@ async fn a_receipt_for_another_operation_or_with_no_decision_is_an_anomaly() {
 	conflict.outcome = OpOutcome::Conflict;
 	let mut unavailable = good;
 	unavailable.outcome = OpOutcome::Unavailable;
-	for receipt in [other_seq, other_owner, other_digest, conflict, unavailable] {
+	for receipt in [other_seq, other_owner, other_digest, conflict] {
 		let error = verify_receipt(&ticket, receipt).unwrap_err();
 		assert!(
 			error
@@ -48261,6 +48372,16 @@ async fn a_receipt_for_another_operation_or_with_no_decision_is_an_anomaly() {
 			"{error}"
 		);
 	}
+	// A pruned outcome has its own type: it is not a decision, and it is not a bad receipt.
+	let error = verify_receipt(&ticket, unavailable).unwrap_err();
+	assert_eq!(error.kind(), ErrorKind::WouldBlock);
+	assert!(
+		error
+			.get_ref()
+			.and_then(|cause| cause.downcast_ref::<crate::storage::sweeper::OpOutcomeUnavailable>())
+			.is_some_and(|cause| cause.0 == ticket.key()),
+		"{error}"
+	);
 }
 
 /// A store whose operation state is unusable is refused at open, never opened
@@ -48286,10 +48407,10 @@ async fn open_refuses_a_store_with_unusable_operation_state() {
 	);
 }
 
-/// A reopen with a submitted tier operation and no decision fences until a
-/// verified receipt and a durable effect resolve it.
+/// A reopen with a submitted tier operation and no decision fences until the driver
+/// closes it by its own digest, and that decision resolves it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_reopen_with_an_undecided_tier_op_fences_until_its_receipt_resolves_it() {
+async fn a_reopen_with_an_undecided_tier_op_fences_until_its_cancel_resolves_it() {
 	let (_dirs, mgr, _l2, _target, _schemas, old) = unpublished_drop_fixture().await;
 	let cluster = control_cluster_observing(&[(1, &mgr)]).await;
 	let committer = Arc::new(op_committer(&cluster, 1));
@@ -48312,27 +48433,19 @@ async fn a_reopen_with_an_undecided_tier_op_fences_until_its_receipt_resolves_it
 		mgr.tier_authority_readiness_reason().as_deref(),
 		Some("UnresolvedOpIntent")
 	);
+	// Slice 5: the driver no longer waits for one. It closes the undecided operation by its
+	// own digest, and that decision, read back, is the receipt that resolves it.
 	let driver = op_driver(&cluster, &mgr, committer.clone());
 	driver.drive_once().await.unwrap();
-	assert_eq!(
-		mgr.tier_authority_readiness_reason().as_deref(),
-		Some("UnresolvedOpIntent"),
-		"no receipt, no resolution"
-	);
-	use crate::storage::TierCommitter;
-	let LoadedOp::Submittable(ticket) = mgr
-		.require_op_index()
-		.unwrap()
-		.load_op_intents()
-		.await
-		.unwrap()
-		.remove(0)
-	else {
-		panic!("the first operation is submittable");
-	};
-	committer.submit_op(&ticket).await.unwrap();
-	driver.drive_once().await.unwrap();
 	assert_eq!(mgr.tier_authority_readiness_reason(), None);
+	assert!(
+		mgr.require_op_index()
+			.unwrap()
+			.load_op_intents()
+			.await
+			.unwrap()
+			.is_empty()
+	);
 }
 
 /// An intent linked to an operation is not recovered from local evidence alone.
@@ -49390,6 +49503,15 @@ async fn supersede_store(raft: &crate::consensus::WendelonRaft, owner: crate::co
 
 #[async_trait]
 impl TierCommitter for WatchesRemoval {
+	// Slice 5: a pass reads a view for every row it could recover.
+	async fn op_view(
+		&self,
+		key: crate::consensus::slab_ops::OpKey,
+		digest: [u8; 32],
+		slabs: Vec<crate::consensus::SlabRef>,
+	) -> std::io::Result<crate::consensus::slab_ops::OpView> {
+		self.inner.op_view(key, digest, slabs).await
+	}
 	async fn preflight(&self, owner: crate::consensus::OwnerRef) -> std::io::Result<()> {
 		self.inner.preflight(owner).await
 	}
@@ -51592,7 +51714,9 @@ async fn a_reservation_cleanup_refuses_a_file_replaced_after_its_validation() {
 
 /// Reading 3's interval: a crash after a rejected output left the discovery namespace
 /// and before its handoff. The bytes are retained, nothing adopts them, the linked
-/// intent still fences, and a cleanup pass leaves it alone. Recovery is slice 5's.
+/// intent still fences, and a cleanup pass leaves it alone. Its rejection was synthetic and
+/// the ring below is a new one with no history, so what finishes here is a Cancel from the
+/// abandoned name, not the recovery of a recorded rejection: see the same-ring controls.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_crash_between_relocation_and_handoff_retains_the_bytes_and_refuses() {
 	struct RejectsThenCuts(Arc<crate::storage::RaftCommitter>, Arc<SlabManager>);
@@ -51672,8 +51796,8 @@ async fn a_crash_between_relocation_and_handoff_retains_the_bytes_and_refuses() 
 	);
 	let cluster = control_cluster_observing(&[(1, &reopened)]).await;
 	register_owner(&cluster.nodes[0], &reopened).await;
-	let driver = op_driver(&cluster, &reopened, Arc::new(op_committer(&cluster, 1)));
-	driver.drive_once().await.unwrap();
+	let plain = Arc::new(op_committer(&cluster, 1));
+	reopened.drive_reserved_ids(plain.as_ref()).await.unwrap();
 	assert!(
 		path.exists(),
 		"a cleanup pass leaves an intent's own output alone"
@@ -51682,6 +51806,16 @@ async fn a_crash_between_relocation_and_handoff_retains_the_bytes_and_refuses() 
 		index.reserved_id_state(output).await.unwrap(),
 		Some(crate::storage::index::ReservedIdState::Exposed { abandoned: None })
 	);
+	let driver = op_driver(&cluster, &reopened, plain);
+	for _ in 0..16 {
+		let _ = driver.drive_once().await;
+		if index.reserved_id_state(output).await.unwrap().is_none() {
+			break;
+		}
+	}
+	assert_eq!(index.reserved_id_state(output).await.unwrap(), None);
+	assert!(!path.exists(), "its own claim disposed of it");
+	assert_eq!(reopened.tier_authority_readiness_reason(), None);
 	let _ = next.close(Duration::from_secs(2)).await;
 }
 
@@ -51770,4 +51904,8946 @@ async fn an_aborted_reconcile_keeps_its_exclusion_until_its_worker_ends() {
 		"a live capability over an abandoned row"
 	);
 	assert!(!mgr.live_reservations.contains(&slab));
+}
+
+// ADR 0697 slice 5, stage 1 REDs: §9.2 and the decision table.
+
+/// Decides nothing for a mark: its entry lands, and the answer is lost on the way back.
+struct LosesMarkResponse(Arc<crate::storage::RaftCommitter>);
+
+#[async_trait]
+impl TierCommitter for LosesMarkResponse {
+	async fn preflight(&self, owner: crate::consensus::OwnerRef) -> std::io::Result<()> {
+		self.0.preflight(owner).await
+	}
+	async fn submit_op(
+		&self,
+		ticket: &crate::storage::index::OpTicket,
+	) -> std::io::Result<crate::storage::VerifiedReceipt> {
+		let receipt = self.0.submit_op(ticket).await;
+		if matches!(
+			ticket.command(),
+			crate::consensus::slab_ops::SlabCommand::Compaction(_)
+		) {
+			return Err(Error::other("injected loss of the mark's response"));
+		}
+		receipt
+	}
+}
+
+async fn drive_until_quiet(
+	driver: &crate::storage::op_driver::OpDriver,
+	mgr: &Arc<SlabManager>,
+	gc: bool,
+	committer: &dyn TierCommitter,
+) {
+	for _ in 0..16 {
+		mgr.tier_authority.notify_publication_change();
+		let _ = driver.drive_once().await;
+		if gc {
+			let _ = mgr
+				.sweep_lsm_delete_pending_once_via_control_ring(&new_gc(mgr), committer)
+				.await;
+		}
+		tokio::time::sleep(Duration::from_millis(25)).await;
+	}
+}
+
+/// §9.2(a): accepted before leadership was lost, with the response lost. Node 1 is
+/// fenced with `AwaitingLeadership` and keeps its intent. Leading again, it resolves
+/// as Applied with the GC follow-up, its Ack is committed, and readiness returns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dc161_a_gc_accepted_before_leadership_loss_resolves_as_applied_on_regaining_it() {
+	let (_dirs, mgr, cluster, slab_id, _pointer) = dc157_ring_fixture("s5-a").await;
+	let plain = Arc::new(op_committer(&cluster, 1));
+	let losing = LosesMarkResponse(plain.clone());
+	assert!(
+		mgr.sweep_lsm_delete_pending_once_via_control_ring(&new_gc(&mgr), &losing)
+			.await
+			.is_err()
+	);
+	let index = mgr.require_op_index().unwrap();
+	assert_eq!(
+		index
+			.load_snapshot()
+			.await
+			.unwrap()
+			.lsm_install_intents
+			.len(),
+		1,
+		"premise: the intent stays"
+	);
+	cluster.elect(2).await;
+	let driver = op_driver(&cluster, &mgr, plain.clone());
+	driver.drive_once().await.unwrap();
+	assert_eq!(
+		mgr.tier_authority_readiness_reason().as_deref(),
+		Some("AwaitingLeadership")
+	);
+	assert_eq!(
+		index
+			.load_snapshot()
+			.await
+			.unwrap()
+			.lsm_install_intents
+			.len(),
+		1,
+		"a follower clears nothing"
+	);
+
+	cluster.elect(1).await;
+	drive_until_quiet(&driver, &mgr, true, plain.as_ref()).await;
+	assert!(mgr.compaction_manifest_snapshot().run(slab_id).is_none());
+	assert!(
+		index
+			.load_snapshot()
+			.await
+			.unwrap()
+			.lsm_install_intents
+			.is_empty()
+	);
+	assert!(index.load_op_intents().await.unwrap().is_empty());
+	assert_eq!(mgr.tier_authority_readiness_reason(), None);
+	assert!(
+		cluster.state_machines[0]
+			.op_acked_through(mgr.owner_ref().unwrap())
+			.await >= 2,
+		"the Ack is committed"
+	);
+}
+
+/// §9.2(b): never appended. Leading again, it resolves as Cancelled: the run is back
+/// exactly as it was, nothing was removed, and readiness returns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dc161_a_gc_never_appended_resolves_as_cancelled_on_regaining_leadership() {
+	let (_dirs, mgr, cluster, slab_id, _pointer) = dc157_ring_fixture("s5-b").await;
+	let retired = mgr.compaction_manifest_snapshot().run(slab_id).cloned();
+	cluster.elect(2).await;
+	let refused = crate::storage::RaftCommitter::new(cluster.nodes[0].clone())
+		.with_state_machine(cluster.state_machines[0].clone())
+		.with_role_lost_after_preflight();
+	assert!(
+		mgr.sweep_lsm_delete_pending_once_via_control_ring(&new_gc(&mgr), &refused)
+			.await
+			.is_err()
+	);
+	let plain = Arc::new(op_committer(&cluster, 1));
+	let driver = op_driver(&cluster, &mgr, plain.clone());
+	driver.drive_once().await.unwrap();
+	assert_eq!(
+		mgr.tier_authority_readiness_reason().as_deref(),
+		Some("AwaitingLeadership")
+	);
+	cluster.elect(1).await;
+	drive_until_quiet(&driver, &mgr, false, plain.as_ref()).await;
+	assert_eq!(
+		mgr.compaction_manifest_snapshot().run(slab_id).cloned(),
+		retired
+	);
+	assert!(slab_path(&_dirs[0], slab_id).exists());
+	let index = mgr.require_op_index().unwrap();
+	assert!(
+		index
+			.load_snapshot()
+			.await
+			.unwrap()
+			.lsm_install_intents
+			.is_empty()
+	);
+	assert!(index.load_op_intents().await.unwrap().is_empty());
+	assert_eq!(mgr.tier_authority_readiness_reason(), None);
+}
+
+/// §9.2(c): a later attempt that sees `ForwardToLeader` or a generic error clears
+/// nothing on that observation alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dc161_a_later_forward_to_leader_or_error_clears_nothing() {
+	let (_dirs, mgr, cluster, _slab_id, _pointer) = dc157_ring_fixture("s5-c").await;
+	cluster.elect(2).await;
+	let refused = crate::storage::RaftCommitter::new(cluster.nodes[0].clone())
+		.with_state_machine(cluster.state_machines[0].clone())
+		.with_role_lost_after_preflight();
+	assert!(
+		mgr.sweep_lsm_delete_pending_once_via_control_ring(&new_gc(&mgr), &refused)
+			.await
+			.is_err()
+	);
+	let index = mgr.require_op_index().unwrap();
+	let rows = index.load_op_intents().await.unwrap();
+	assert_eq!(rows.len(), 2);
+	// Again, with the same answer, then through a pass with a committer on a follower.
+	let _ = mgr
+		.sweep_lsm_delete_pending_once_via_control_ring(&new_gc(&mgr), &refused)
+		.await;
+	let driver = op_driver(&cluster, &mgr, Arc::new(refused));
+	let _ = driver.drive_once().await;
+	assert_eq!(index.load_op_intents().await.unwrap(), rows);
+	assert_eq!(
+		index
+			.load_snapshot()
+			.await
+			.unwrap()
+			.lsm_install_intents
+			.len(),
+		1
+	);
+	assert!(mgr.tier_authority_readiness_reason().is_some());
+}
+
+/// A driver pass must never act on a live producer's row: presence is not abandonment.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_recovery_pass_leaves_a_live_producers_operation_alone() {
+	let (_dirs, mgr, cluster, slab_id, _pointer) = dc157_ring_fixture("s5-live").await;
+	let entered = Arc::new(tokio::sync::Semaphore::new(0));
+	let release = Arc::new(tokio::sync::Semaphore::new(0));
+	let pausing = Arc::new(PauseAroundMark {
+		before: true,
+		inner: op_committer(&cluster, 1),
+		entered: entered.clone(),
+		release: release.clone(),
+	});
+	let sweep = {
+		let (mgr, pausing) = (mgr.clone(), pausing.clone());
+		tokio::spawn(async move {
+			mgr.sweep_lsm_delete_pending_once_via_control_ring(&new_gc(&mgr), pausing.as_ref())
+				.await
+		})
+	};
+	tokio::time::timeout(Duration::from_secs(60), entered.acquire())
+		.await
+		.unwrap()
+		.unwrap()
+		.forget();
+	let driver = op_driver(&cluster, &mgr, Arc::new(op_committer(&cluster, 1)));
+	driver.drive_once().await.unwrap();
+	let index = mgr.require_op_index().unwrap();
+	assert_eq!(
+		index.load_op_intents().await.unwrap().len(),
+		2,
+		"nothing was cancelled under a live producer"
+	);
+	release.add_permits(8);
+	assert_eq!(sweep.await.unwrap().unwrap(), vec![slab_id]);
+}
+
+/// A superseded store recovers nothing: a historical Applied is not authority.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_superseded_store_recovers_nothing_from_a_historical_applied() {
+	let (_dirs, mgr, cluster, slab_id, _pointer) = dc157_ring_fixture("s5-superseded").await;
+	let plain = Arc::new(op_committer(&cluster, 1));
+	let losing = LosesMarkResponse(plain.clone());
+	let _ = mgr
+		.sweep_lsm_delete_pending_once_via_control_ring(&new_gc(&mgr), &losing)
+		.await;
+	supersede_store(&cluster.nodes[0], mgr.owner_ref().unwrap()).await;
+	let index = mgr.require_op_index().unwrap();
+	let rows = index.load_op_intents().await.unwrap();
+	// Nothing to resolve, and so no fence to report: its owner is what stopped it.
+	mgr.recover_abandoned_marks(plain.as_ref()).await.unwrap();
+	let driver = op_driver(&cluster, &mgr, plain);
+	let _ = driver.drive_once().await;
+	assert_eq!(index.load_op_intents().await.unwrap(), rows);
+	assert!(slab_path(&_dirs[0], slab_id).exists());
+}
+
+/// A row can be visible before its caller has the result. It is still owned.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_row_visible_before_its_caller_has_a_result_is_not_recovered() {
+	let (_dirs, mgr, cluster, slab_id, _pointer) = dc157_ring_fixture("s5-visible").await;
+	let plain = Arc::new(op_committer(&cluster, 1));
+	let index = mgr.require_op_index().unwrap();
+	let (entered, release) = index.hold_after_next_allocation_commit();
+	let sweep = {
+		let (mgr, plain) = (mgr.clone(), plain.clone());
+		tokio::spawn(async move {
+			mgr.sweep_lsm_delete_pending_once_via_control_ring(&new_gc(&mgr), plain.as_ref())
+				.await
+		})
+	};
+	tokio::task::spawn_blocking(move || entered.recv_timeout(Duration::from_secs(30)))
+		.await
+		.unwrap()
+		.unwrap();
+	let rows = index.load_op_intents().await.unwrap();
+	assert_eq!(rows.len(), 2, "premise: visible");
+	let driver = op_driver(&cluster, &mgr, plain.clone());
+	driver.drive_once().await.unwrap();
+	assert_eq!(index.load_op_intents().await.unwrap(), rows);
+	release.send(()).unwrap();
+	assert_eq!(sweep.await.unwrap().unwrap(), vec![slab_id]);
+}
+
+/// A caller gone with its allocation's worker still pending: ownership lasts until
+/// that worker can no longer write, then it is free for recovery.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancelled_allocation_keeps_ownership_until_its_worker_ends() {
+	let (_dirs, mgr, cluster, slab_id, _pointer) = dc157_ring_fixture("s5-pending").await;
+	let plain = Arc::new(op_committer(&cluster, 1));
+	let index = mgr.require_op_index().unwrap();
+	let (entered, release) = index.hold_after_next_allocation_commit();
+	let sweep = {
+		let (mgr, plain) = (mgr.clone(), plain.clone());
+		tokio::spawn(async move {
+			mgr.sweep_lsm_delete_pending_once_via_control_ring(&new_gc(&mgr), plain.as_ref())
+				.await
+		})
+	};
+	tokio::task::spawn_blocking(move || entered.recv_timeout(Duration::from_secs(30)))
+		.await
+		.unwrap()
+		.unwrap();
+	sweep.abort();
+	assert!(sweep.await.unwrap_err().is_cancelled());
+	let rows = index.load_op_intents().await.unwrap();
+	assert_eq!(rows.len(), 2);
+	let seqs = |rows: &[LoadedOp]| {
+		rows.iter()
+			.map(|op| match op {
+				LoadedOp::Submittable(ticket) => ticket.key().op_seq,
+				LoadedOp::Reserved(reserved) => reserved.key().op_seq,
+			})
+			.collect::<Vec<_>>()
+	};
+	assert!(
+		index.try_acquire_ops(seqs(&rows)).is_none(),
+		"its worker still owns it"
+	);
+	release.send(()).unwrap();
+	tokio::time::timeout(Duration::from_secs(30), async {
+		while index.try_acquire_ops(seqs(&rows)).is_none() {
+			tokio::time::sleep(Duration::from_millis(5)).await;
+		}
+	})
+	.await
+	.expect("released when the worker ends");
+	// Recovery takes it from here: never sent, so Cancelled, and exactly restored.
+	let driver = op_driver(&cluster, &mgr, plain.clone());
+	drive_until_quiet(&driver, &mgr, false, plain.as_ref()).await;
+	assert!(index.load_op_intents().await.unwrap().is_empty());
+	assert!(mgr.compaction_manifest_snapshot().run(slab_id).is_some());
+}
+
+/// Puts a different operation at a mark's sequence: the ring's decision conflicts.
+struct DecidesAnotherOperation(
+	crate::consensus::WendelonRaft,
+	Arc<crate::storage::RaftCommitter>,
+);
+
+#[async_trait]
+impl TierCommitter for DecidesAnotherOperation {
+	async fn preflight(&self, owner: crate::consensus::OwnerRef) -> std::io::Result<()> {
+		self.1.preflight(owner).await
+	}
+	async fn submit_op(
+		&self,
+		ticket: &crate::storage::index::OpTicket,
+	) -> std::io::Result<crate::storage::VerifiedReceipt> {
+		self.0
+			.client_write(crate::consensus::WendelonRequest::SlabOp(
+				crate::consensus::slab_ops::SlabOp {
+					op_seq: ticket.key().op_seq,
+					command: crate::consensus::slab_ops::SlabCommand::Claim(
+						crate::consensus::slab_ops::ClaimOp {
+							slab: ticket.key().owner.slab(SlabId::new(0x70_000)),
+							job_id: CompactionJobId::new(0x0707),
+						},
+					),
+				},
+			))
+			.await
+			.unwrap();
+		Err(Error::other("injected loss of the response"))
+	}
+}
+
+/// §6: `OpConflict` is a fenced anomaly. Nothing is unlinked or cleared.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_conflicting_decision_fences_its_operation_and_clears_nothing() {
+	let (_dirs, mgr, cluster, slab_id, _pointer) = dc157_ring_fixture("s5-conflict").await;
+	let plain = Arc::new(op_committer(&cluster, 1));
+	let conflicting = DecidesAnotherOperation(cluster.nodes[0].clone(), plain.clone());
+	assert!(
+		mgr.sweep_lsm_delete_pending_once_via_control_ring(&new_gc(&mgr), &conflicting)
+			.await
+			.is_err()
+	);
+	let index = mgr.require_op_index().unwrap();
+	let rows = index.load_op_intents().await.unwrap();
+	let driver = op_driver(&cluster, &mgr, plain);
+	assert_eq!(
+		driver.drive_once().await.unwrap_err().kind(),
+		ErrorKind::WouldBlock
+	);
+	assert_eq!(index.load_op_intents().await.unwrap(), rows);
+	assert!(slab_path(&_dirs[0], slab_id).exists());
+	assert_eq!(
+		index
+			.load_snapshot()
+			.await
+			.unwrap()
+			.lsm_install_intents
+			.len(),
+		1
+	);
+}
+
+/// §5.6 cannot produce an intent at or below the canonical prefix. Finding one is an
+/// anomaly, preserved and reported, never authority from a pruned outcome.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_intent_at_or_below_the_prefix_is_an_anomaly_with_no_authority() {
+	let (_dirs, mgr, cluster, slab_id, _pointer) = dc157_ring_fixture("s5-prefix").await;
+	let plain = Arc::new(op_committer(&cluster, 1));
+	let conflicting = DecidesAnotherOperation(cluster.nodes[0].clone(), plain.clone());
+	let _ = mgr
+		.sweep_lsm_delete_pending_once_via_control_ring(&new_gc(&mgr), &conflicting)
+		.await;
+	let owner = mgr.owner_ref().unwrap();
+	let index = mgr.require_op_index().unwrap();
+	let rows = index.load_op_intents().await.unwrap();
+	let LoadedOp::Submittable(mark) = &rows[0] else {
+		panic!("the mark is submittable");
+	};
+	// The ring acknowledges what it decided at that sequence, so the entry is pruned.
+	let receipt = plain
+		.ack_outcomes(owner, vec![mark.key().op_seq])
+		.await
+		.unwrap();
+	assert!(receipt.acked_through >= mark.key().op_seq, "{receipt:?}");
+	let driver = op_driver(&cluster, &mgr, plain);
+	assert_eq!(
+		driver.drive_once().await.unwrap_err().kind(),
+		ErrorKind::WouldBlock
+	);
+	assert_eq!(index.load_op_intents().await.unwrap(), rows, "preserved");
+	assert!(slab_path(&_dirs[0], slab_id).exists());
+}
+
+// ADR 0697 slice 5 HOLD H1 and H2: authority through both branches' writes, and a
+// mark's local publication retried from its own postimage.
+
+/// Supersedes this store right after a view or a Cancel answers.
+struct SupersedesAfterAnswer {
+	inner: Arc<crate::storage::RaftCommitter>,
+	raft: crate::consensus::WendelonRaft,
+}
+
+#[async_trait]
+impl TierCommitter for SupersedesAfterAnswer {
+	async fn preflight(&self, owner: crate::consensus::OwnerRef) -> std::io::Result<()> {
+		self.inner.preflight(owner).await
+	}
+	async fn submit_op(
+		&self,
+		ticket: &crate::storage::index::OpTicket,
+	) -> std::io::Result<crate::storage::VerifiedReceipt> {
+		self.inner.submit_op(ticket).await
+	}
+	async fn op_view(
+		&self,
+		key: crate::consensus::slab_ops::OpKey,
+		digest: [u8; 32],
+		slabs: Vec<crate::consensus::SlabRef>,
+	) -> std::io::Result<crate::consensus::slab_ops::OpView> {
+		let view = self.inner.op_view(key, digest, slabs).await;
+		if view
+			.as_ref()
+			.is_ok_and(|view| view.outcome != crate::consensus::slab_ops::ViewOutcome::None)
+		{
+			supersede_store(&self.raft, key.owner).await;
+		}
+		view
+	}
+	async fn cancel_op(
+		&self,
+		ticket: &crate::storage::index::OpTicket,
+	) -> std::io::Result<crate::storage::VerifiedReceipt> {
+		let receipt = self.inner.cancel_op(ticket).await;
+		supersede_store(&self.raft, ticket.key().owner).await;
+		receipt
+	}
+}
+
+fn first_row_is_mark_prepared(rows: &[LoadedOp]) -> bool {
+	matches!(
+		rows.first().and_then(LoadedOp::progress),
+		Some(crate::storage::index::OpProgress::MarkPrepared { .. })
+	)
+}
+
+/// A view said current and Applied, and the owner was superseded before any local
+/// write: nothing is published and nothing hands off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_supersession_after_the_view_stops_an_applied_marks_recovery() {
+	let (_dirs, mgr, cluster, slab_id, _pointer) = dc157_ring_fixture("h1-applied").await;
+	let plain = Arc::new(op_committer(&cluster, 1));
+	let losing = LosesMarkResponse(plain.clone());
+	let _ = mgr
+		.sweep_lsm_delete_pending_once_via_control_ring(&new_gc(&mgr), &losing)
+		.await;
+	let index = mgr.require_op_index().unwrap();
+	let committer = Arc::new(SupersedesAfterAnswer {
+		inner: plain,
+		raft: cluster.nodes[0].clone(),
+	});
+	let driver = op_driver(&cluster, &mgr, committer);
+	let _ = driver.drive_once().await;
+	assert!(
+		first_row_is_mark_prepared(&index.load_op_intents().await.unwrap()),
+		"the mark handed off under superseded authority"
+	);
+	let durable = index.load_snapshot().await.unwrap();
+	assert!(
+		durable
+			.lsm_runs
+			.iter()
+			.any(|run| run.slab_id == slab_id && !matches!(run.state, SlabState::DeletePending)),
+		"the postimage was published under superseded authority"
+	);
+}
+
+/// The same for the rejected side: the undo needs current authority of its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_supersession_after_cancel_stops_a_marks_undo() {
+	let (_dirs, mgr, cluster, slab_id, _pointer) = dc157_ring_fixture("h1-rejected").await;
+	cluster.elect(2).await;
+	let refused = crate::storage::RaftCommitter::new(cluster.nodes[0].clone())
+		.with_state_machine(cluster.state_machines[0].clone())
+		.with_role_lost_after_preflight();
+	let _ = mgr
+		.sweep_lsm_delete_pending_once_via_control_ring(&new_gc(&mgr), &refused)
+		.await;
+	cluster.elect(1).await;
+	let index = mgr.require_op_index().unwrap();
+	assert!(mgr.slab_pins.is_delete_pending(slab_id), "premise");
+	let committer = Arc::new(SupersedesAfterAnswer {
+		inner: Arc::new(op_committer(&cluster, 1)),
+		raft: cluster.nodes[0].clone(),
+	});
+	let driver = op_driver(&cluster, &mgr, committer);
+	let _ = driver.drive_once().await;
+	assert!(
+		first_row_is_mark_prepared(&index.load_op_intents().await.unwrap()),
+		"the undo was recorded under superseded authority"
+	);
+	assert!(
+		mgr.slab_pins.is_delete_pending(slab_id),
+		"the pin state was restored under superseded authority"
+	);
+}
+
+/// H2: a transaction failure around the mark's handoff is retried from its own
+/// postimage, in the same process. Its own revision bump is not someone else's change.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_mark_handoff_retries_from_its_own_postimage() {
+	for cut in [
+		crate::storage::index::OpTxnCut::BeforeCommit,
+		crate::storage::index::OpTxnCut::AfterCommit,
+	] {
+		let (_dirs, mgr, cluster, slab_id, _pointer) = dc157_ring_fixture("h2-retry").await;
+		let plain = Arc::new(op_committer(&cluster, 1));
+		let losing = LosesMarkResponse(plain.clone());
+		let _ = mgr
+			.sweep_lsm_delete_pending_once_via_control_ring(&new_gc(&mgr), &losing)
+			.await;
+		let index = mgr.require_op_index().unwrap();
+		let driver = op_driver(&cluster, &mgr, plain.clone());
+		// Past the publication, at the handoff.
+		index.cut_next_progress_txn_after_one(cut);
+		assert!(
+			driver.drive_once().await.is_err(),
+			"{cut:?}: premise: it failed"
+		);
+		drive_until_quiet(&driver, &mgr, true, plain.as_ref()).await;
+		assert!(
+			index.load_op_intents().await.unwrap().is_empty(),
+			"{cut:?}: {:?}",
+			index.load_op_intents().await.unwrap()
+		);
+		assert!(
+			mgr.compaction_manifest_snapshot().run(slab_id).is_none(),
+			"{cut:?}"
+		);
+		assert_eq!(mgr.tier_authority_readiness_reason(), None, "{cut:?}");
+	}
+}
+
+/// A failed publication keeps this store's own discipline: it stays fenced until a
+/// restart, with nothing handed off, and the row says exactly how far it got.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_mark_publication_stays_fenced_with_its_row_exact() {
+	for (cut, published) in [
+		(crate::storage::index::OpTxnCut::BeforeCommit, false),
+		(crate::storage::index::OpTxnCut::AfterCommit, true),
+	] {
+		let (_dirs, mgr, cluster, _slab_id, _pointer) = dc157_ring_fixture("h2-publish").await;
+		let plain = Arc::new(op_committer(&cluster, 1));
+		let losing = LosesMarkResponse(plain.clone());
+		let _ = mgr
+			.sweep_lsm_delete_pending_once_via_control_ring(&new_gc(&mgr), &losing)
+			.await;
+		let index = mgr.require_op_index().unwrap();
+		let driver = op_driver(&cluster, &mgr, plain.clone());
+		index.cut_next_op_txn(cut);
+		assert!(driver.drive_once().await.is_err(), "{cut:?}");
+		let _ = driver.drive_once().await;
+		let rows = index.load_op_intents().await.unwrap();
+		assert_eq!(rows.len(), 2, "{cut:?}: nothing handed off");
+		assert_eq!(
+			matches!(
+				rows[0].progress(),
+				Some(crate::storage::index::OpProgress::MarkPublished { .. })
+			),
+			published,
+			"{cut:?}"
+		);
+		assert!(
+			mgr.tier_authority_readiness_reason()
+				.is_some_and(
+					|reason| reason.contains("RestartRequired") || reason.contains("LsmUnresolved")
+				),
+			"{cut:?}: {:?}",
+			mgr.tier_authority_readiness_reason()
+		);
+	}
+}
+
+async fn assert_aborted_pass_keeps_authority(label: &str, never_appended: bool, hold_label: &str) {
+	let (_dirs, mgr, cluster, _slab_id, _pointer) = dc157_ring_fixture(label).await;
+	let plain = Arc::new(op_committer(&cluster, 1));
+	if never_appended {
+		cluster.elect(2).await;
+		let refused = crate::storage::RaftCommitter::new(cluster.nodes[0].clone())
+			.with_state_machine(cluster.state_machines[0].clone())
+			.with_role_lost_after_preflight();
+		let _ = mgr
+			.sweep_lsm_delete_pending_once_via_control_ring(&new_gc(&mgr), &refused)
+			.await;
+		cluster.elect(1).await;
+	} else {
+		let losing = LosesMarkResponse(plain.clone());
+		let _ = mgr
+			.sweep_lsm_delete_pending_once_via_control_ring(&new_gc(&mgr), &losing)
+			.await;
+	}
+	let index = mgr.require_op_index().unwrap();
+	let (entered, release) = index.hold_next_handoff_txn();
+	let driver = Arc::new(op_driver(&cluster, &mgr, plain));
+	let pass = {
+		let driver = driver.clone();
+		tokio::spawn(async move { driver.drive_once().await })
+	};
+	tokio::task::spawn_blocking(move || entered.recv_timeout(Duration::from_secs(30)))
+		.await
+		.unwrap()
+		.unwrap_or_else(|_| panic!("{hold_label}: its worker started"));
+	pass.abort();
+	assert!(pass.await.unwrap_err().is_cancelled());
+	let owner = mgr.owner_ref().unwrap();
+	let writer = cluster.nodes[0].clone();
+	let supersede = tokio::spawn(async move { supersede_store(&writer, owner).await });
+	assert_supersession_stays_behind_the_lease(&cluster, owner, &supersede).await;
+	release.send(()).unwrap();
+	tokio::time::timeout(Duration::from_secs(30), supersede)
+		.await
+		.expect("it applies once the worker ends")
+		.unwrap();
+}
+
+/// An aborted pass cannot release authority while its handoff worker can still write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_aborted_mark_recovery_keeps_its_authority_through_its_handoff() {
+	assert_aborted_pass_keeps_authority("h1-abort-applied", false, "handoff").await;
+}
+
+/// Nor while its undo's worker can still write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_aborted_mark_undo_keeps_its_authority_through_its_worker() {
+	assert_aborted_pass_keeps_authority("h1-abort-undo", true, "undo").await;
+}
+
+/// A committer with no ring cannot answer: its row is reported unresolved, with no
+/// local answer, and other rows still go on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_committer_with_no_view_reports_its_row_unresolved() {
+	struct NoView(Arc<crate::storage::RaftCommitter>);
+	#[async_trait]
+	impl TierCommitter for NoView {
+		async fn submit_op(
+			&self,
+			ticket: &crate::storage::index::OpTicket,
+		) -> std::io::Result<crate::storage::VerifiedReceipt> {
+			self.0.submit_op(ticket).await
+		}
+		async fn ack_outcomes(
+			&self,
+			owner: crate::consensus::OwnerRef,
+			seqs: Vec<u64>,
+		) -> std::io::Result<crate::consensus::slab_ops::AckReceipt> {
+			self.0.ack_outcomes(owner, seqs).await
+		}
+	}
+	let (_dirs, mgr, cluster, _slab_id, _pointer) = dc157_ring_fixture("s5-noview").await;
+	let plain = Arc::new(op_committer(&cluster, 1));
+	let losing = LosesMarkResponse(plain.clone());
+	let _ = mgr
+		.sweep_lsm_delete_pending_once_via_control_ring(&new_gc(&mgr), &losing)
+		.await;
+	let index = mgr.require_op_index().unwrap();
+	let rows = index.load_op_intents().await.unwrap();
+	let driver = op_driver(&cluster, &mgr, Arc::new(NoView(plain)));
+	assert_eq!(
+		driver.drive_once().await.unwrap_err().kind(),
+		ErrorKind::Unsupported
+	);
+	assert_eq!(index.load_op_intents().await.unwrap(), rows);
+}
+
+/// A persisted input revision means nothing after a reopen: revisions restart there.
+/// Recovery must neither fence forever on that, nor accept a change made since.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_marks_recovery_survives_the_reopen_that_resets_revisions() {
+	let dir = fresh_dir("s5-revisions");
+	let owner = DataDirectoryOwner::acquire_existing(&dir).unwrap();
+	let mgr =
+		SlabManager::initialize_new_store_with_owner(gc_owned_test_config(&dir), owner.clone())
+			.await
+			.unwrap();
+	let (slab_id, _key) = seed_small_retired_gc_slab(&mgr).await;
+	// A revision above zero, recorded in the intent the mark writes.
+	let lock = mgr.tier_publication_lock(slab_id);
+	{
+		let guard = lock.lock().await;
+		mgr.bump_slab_publication_revision(slab_id).unwrap();
+		drop(guard);
+	}
+	let cluster = control_cluster_observing(&[(1, &mgr)]).await;
+	register_owner(&cluster.nodes[0], &mgr).await;
+	cluster.elect(2).await;
+	let refused = crate::storage::RaftCommitter::new(cluster.nodes[0].clone())
+		.with_state_machine(cluster.state_machines[0].clone())
+		.with_role_lost_after_preflight();
+	let _ = mgr
+		.sweep_lsm_delete_pending_once_via_control_ring(&new_gc(&mgr), &refused)
+		.await;
+	let rows = mgr
+		.require_op_index()
+		.unwrap()
+		.load_op_intents()
+		.await
+		.unwrap();
+	assert_eq!(rows.len(), 2, "premise: abandoned, never appended");
+	owner.close(Duration::from_secs(5)).await.unwrap();
+	drop((refused, cluster, mgr));
+
+	let next = DataDirectoryOwner::acquire_existing(&dir).expect("released");
+	let reopened = SlabManager::open_with_owner(gc_owned_test_config(&dir), next.clone())
+		.await
+		.unwrap();
+	let cluster = control_cluster_observing(&[(1, &reopened)]).await;
+	register_owner(&cluster.nodes[0], &reopened).await;
+	let plain = Arc::new(op_committer(&cluster, 1));
+	let driver = op_driver(&cluster, &reopened, plain.clone());
+	drive_until_quiet(&driver, &reopened, false, plain.as_ref()).await;
+	let index = reopened.require_op_index().unwrap();
+	assert!(
+		index.load_op_intents().await.unwrap().is_empty(),
+		"{:?}",
+		index.load_op_intents().await.unwrap()
+	);
+	assert!(
+		reopened
+			.compaction_manifest_snapshot()
+			.retired_runs()
+			.any(|run| run.slab_id == slab_id)
+	);
+	let _ = next.close(Duration::from_secs(2)).await;
+}
+
+/// H2 across a reopen, with an Applied mark: its input revision was recorded above zero,
+/// revisions restart at open, and its row still completes from its own evidence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_applied_marks_recovery_survives_the_reopen_that_resets_revisions() {
+	let dir = fresh_dir("s5-applied-reopen");
+	let owner = DataDirectoryOwner::acquire_existing(&dir).unwrap();
+	let mgr =
+		SlabManager::initialize_new_store_with_owner(gc_owned_test_config(&dir), owner.clone())
+			.await
+			.unwrap();
+	let (slab_id, _key) = seed_small_retired_gc_slab(&mgr).await;
+	let lock = mgr.tier_publication_lock(slab_id);
+	{
+		let guard = lock.lock().await;
+		mgr.bump_slab_publication_revision(slab_id).unwrap();
+		drop(guard);
+	}
+	drop(lock);
+	let cluster = control_cluster_observing(&[(1, &mgr)]).await;
+	register_owner(&cluster.nodes[0], &mgr).await;
+	let plain = Arc::new(op_committer(&cluster, 1));
+	let losing = LosesMarkResponse(plain.clone());
+	let _ = mgr
+		.sweep_lsm_delete_pending_once_via_control_ring(&new_gc(&mgr), &losing)
+		.await;
+	owner.close(Duration::from_secs(5)).await.unwrap();
+
+	// The same ring, which decided the mark, and a reopened store.
+	let next = DataDirectoryOwner::acquire_existing(&dir).expect("released");
+	let reopened = SlabManager::open_with_owner(gc_owned_test_config(&dir), next.clone())
+		.await
+		.unwrap();
+	reopened.bind_control_node(1).unwrap();
+	reopened.bind_canonical_tier_source(cluster.state_machines[0].tier_snapshot_source_for_test());
+	let driver = op_driver(&cluster, &reopened, plain);
+	let index = reopened.require_op_index().unwrap();
+	let mut last = Ok(());
+	for _ in 0..8 {
+		last = driver.drive_once().await;
+	}
+	let rows = index.load_op_intents().await.unwrap();
+	assert_eq!(rows.len(), 1, "the mark handed off: {last:?}");
+	assert!(
+		matches!(rows[0], LoadedOp::Reserved(_)),
+		"its removal remains, reserved: {rows:?}"
+	);
+	assert!(
+		index
+			.load_snapshot()
+			.await
+			.unwrap()
+			.lsm_runs
+			.iter()
+			.any(|run| run.slab_id == slab_id && matches!(run.state, SlabState::DeletePending)),
+		"the postimage is durable"
+	);
+	let _ = next.close(Duration::from_secs(2)).await;
+}
+
+/// A change made after the reopen is still a change: the reset does not launder it.
+#[test]
+fn input_authority_compares_exactly_within_an_open_and_by_durable_evidence_across_one() {
+	use crate::storage::index::LsmInputAuthority;
+	let at = |opened, revision| LsmInputAuthority {
+		slab_id: SlabId::new(7),
+		revision,
+		tiered: None,
+		opened,
+	};
+	assert!(at(1, 3).unchanged_since(&at(1, 3)));
+	assert!(
+		!at(1, 4).unchanged_since(&at(1, 3)),
+		"within an open, exactly"
+	);
+	assert!(
+		at(2, 0).unchanged_since(&at(1, 3)),
+		"a reopen with nothing since"
+	);
+	assert!(
+		!at(2, 1).unchanged_since(&at(1, 3)),
+		"a publication since the reopen is a change"
+	);
+}
+
+// ADR 0697 slice 5, stage 2: each §6.1 GC row resumes, on the ring that decided it, after
+// this store went away at that exact point. In-process stops close the owner and reopen;
+// the process-kill control is below them. The ring has to outlive the store.
+
+/// Answers a removal with a lost response, or fails it, around the real ring.
+struct RemovalFaults {
+	inner: Arc<crate::storage::RaftCommitter>,
+	/// Never reaches the ring.
+	unsent: bool,
+	/// Reaches the ring; the answer is lost.
+	lost: bool,
+}
+
+#[async_trait]
+impl TierCommitter for RemovalFaults {
+	async fn preflight(&self, owner: crate::consensus::OwnerRef) -> std::io::Result<()> {
+		self.inner.preflight(owner).await
+	}
+	async fn submit_op(
+		&self,
+		ticket: &crate::storage::index::OpTicket,
+	) -> std::io::Result<crate::storage::VerifiedReceipt> {
+		if matches!(
+			ticket.command(),
+			crate::consensus::slab_ops::SlabCommand::GcRemove(_)
+		) {
+			if self.unsent {
+				return Err(Error::other("injected: the removal never reached the ring"));
+			}
+			if self.lost {
+				self.inner.submit_op(ticket).await.unwrap();
+				return Err(Error::other("injected: the removal's answer was lost"));
+			}
+		}
+		self.inner.submit_op(ticket).await
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum GcStop {
+	/// P0: the mark handed off, its removal not begun.
+	MarkHandedOff,
+	/// P1: quarantine linked, original still there.
+	BeforeUnlink,
+	/// P2: original gone, the run not yet dropped.
+	AfterUnlink,
+	/// P3, Reserved: the run dropped and the transition to submission never committed.
+	RunDroppedReserved,
+	/// P3, MayBeSubmitted, Complete never sent.
+	CompleteUnsent,
+	/// P3c: Complete applied, its answer lost.
+	CompleteAppliedAnswerLost,
+	/// `PurgeAuthorized`, entry still there.
+	PurgeAuthorizedEntryPresent,
+	/// `PurgeAuthorized` and the entry gone: the Q3 substate.
+	PurgeAuthorizedEntryGone,
+	/// P4: `Purged`, not handed off.
+	Purged,
+}
+
+struct ReopenedGc {
+	dir: crate::test_support::TestDir,
+	mgr: Arc<SlabManager>,
+	owner: DataDirectoryOwner,
+	cluster: ControlCluster,
+	slab_id: SlabId,
+	plain: Arc<crate::storage::RaftCommitter>,
+	faults: Arc<FaultyFileOps>,
+}
+
+impl ReopenedGc {
+	fn entry(&self) -> PathBuf {
+		let job = self.remove_job();
+		super::gc_disposal::gc_quarantine_path(&self.dir, self.slab_id, job)
+	}
+
+	fn remove_job(&self) -> CompactionJobId {
+		let name = std::fs::read_to_string(self.dir.join("gc-job")).unwrap();
+		CompactionJobId::new(name.parse().unwrap())
+	}
+
+	fn original(&self) -> PathBuf {
+		slab_path(&self.dir, self.slab_id)
+	}
+
+	async fn rows(&self) -> Vec<LoadedOp> {
+		self.mgr
+			.require_op_index()
+			.unwrap()
+			.load_op_intents()
+			.await
+			.unwrap()
+	}
+
+	async fn removed_on_ring(&self) -> bool {
+		self.mgr
+			.canonical_tier_source
+			.get()
+			.unwrap()
+			.read()
+			.await
+			.unwrap()
+			.removed_for_current_owner(self.mgr.owner_ref().unwrap().slab(self.slab_id))
+	}
+
+	fn driver(
+		&self,
+		committer: Arc<dyn crate::storage::TierCommitter>,
+	) -> crate::storage::op_driver::OpDriver {
+		op_driver(&self.cluster, &self.mgr, committer)
+	}
+
+	/// Drive with the plain committer until nothing is left, or report what is.
+	async fn finish(&self, label: impl std::fmt::Debug) {
+		let driver = self.driver(self.plain.clone());
+		let mut last = Ok(());
+		for _ in 0..12 {
+			last = driver.drive_once().await;
+			let _ = self
+				.mgr
+				.sweep_lsm_delete_pending_once_via_control_ring(
+					&new_gc(&self.mgr),
+					self.plain.as_ref(),
+				)
+				.await;
+			// A cancelled mark ends its own rows, and a later sweep starts the run over.
+			if self.rows().await.is_empty() && !self.original().exists() {
+				break;
+			}
+		}
+		let rows = self.rows().await;
+		assert!(rows.is_empty(), "{label:?}: {last:?}: {rows:?}");
+		assert!(!self.original().exists(), "{label:?}: the original is gone");
+		assert!(
+			std::fs::read_dir(&*self.dir).unwrap().all(|entry| !entry
+				.unwrap()
+				.file_name()
+				.to_string_lossy()
+				.starts_with("gc-quarantine-")),
+			"{label:?}: the quarantine entry is gone"
+		);
+		assert!(
+			!self
+				.mgr
+				.require_op_index()
+				.unwrap()
+				.load_snapshot()
+				.await
+				.unwrap()
+				.lsm_runs
+				.iter()
+				.any(|run| run.slab_id == self.slab_id),
+			"{label:?}: the run is durably gone"
+		);
+		assert!(
+			self.removed_on_ring().await,
+			"{label:?}: the identity ended on the ring"
+		);
+		assert_eq!(
+			self.mgr.tier_authority_readiness_reason(),
+			None,
+			"{label:?}: readiness returned with the work"
+		);
+	}
+
+	/// The store goes away again, with the same ring.
+	async fn reopen(self) -> Self {
+		let _ = self.owner.close(Duration::from_secs(5)).await;
+		let Self {
+			dir,
+			cluster,
+			slab_id,
+			plain,
+			..
+		} = self;
+		reopen_on_ring(dir, cluster, slab_id, plain).await
+	}
+
+	/// This row stays exactly as it is, with both files as they are, and fenced.
+	async fn assert_fences(&self, committer: Arc<dyn crate::storage::TierCommitter>) {
+		let rows = self.rows().await;
+		let files = (self.original().exists(), self.entry().exists());
+		let removed = self.removed_on_ring().await;
+		let driver = self.driver(committer);
+		for _ in 0..3 {
+			let error = driver.drive_once().await.unwrap_err();
+			assert_eq!(error.kind(), ErrorKind::WouldBlock, "{error}");
+		}
+		assert_eq!(self.rows().await, rows, "the row moved");
+		assert_eq!(
+			(self.original().exists(), self.entry().exists()),
+			files,
+			"a file moved"
+		);
+		assert_eq!(self.removed_on_ring().await, removed, "the ring moved");
+	}
+
+	async fn close(self) {
+		let _ = self.owner.close(Duration::from_secs(2)).await;
+	}
+}
+
+async fn reopen_on_ring(
+	dir: crate::test_support::TestDir,
+	cluster: ControlCluster,
+	slab_id: SlabId,
+	plain: Arc<crate::storage::RaftCommitter>,
+) -> ReopenedGc {
+	let owner = DataDirectoryOwner::acquire_existing(&dir).expect("released");
+	let faults = Arc::new(FaultyFileOps::new(dir.to_path_buf()).unwrap());
+	let mgr = SlabManager::open_with_file_ops_and_owner(
+		gc_owned_test_config(&dir),
+		faults.clone(),
+		owner.clone(),
+	)
+	.await
+	.unwrap();
+	mgr.bind_control_node(1).unwrap();
+	mgr.bind_canonical_tier_source(cluster.state_machines[0].tier_snapshot_source_for_test());
+	ReopenedGc {
+		dir,
+		mgr,
+		owner,
+		cluster,
+		slab_id,
+		plain,
+		faults,
+	}
+}
+
+/// Interrupt a real GC at `stop`, close the store, and reopen it against the same ring.
+async fn reopen_gc_at(stop: GcStop) -> ReopenedGc {
+	use crate::consensus::slab_ops::SlabCommand;
+	use crate::storage::index::OpProgress;
+	let dir = fresh_dir("s5-gc-phase");
+	let owner = DataDirectoryOwner::acquire_existing(&dir).unwrap();
+	let mgr =
+		SlabManager::initialize_new_store_with_owner(gc_owned_test_config(&dir), owner.clone())
+			.await
+			.unwrap();
+	let (slab_id, _key) = seed_small_retired_gc_slab(&mgr).await;
+	let cluster = control_cluster_observing(&[(1, &mgr)]).await;
+	register_owner(&cluster.nodes[0], &mgr).await;
+	let plain = Arc::new(op_committer(&cluster, 1));
+	let index = mgr.require_op_index().unwrap();
+	let past_complete = matches!(
+		stop,
+		GcStop::CompleteAppliedAnswerLost
+			| GcStop::PurgeAuthorizedEntryPresent
+			| GcStop::PurgeAuthorizedEntryGone
+			| GcStop::Purged
+	);
+	let faults = Arc::new(RemovalFaults {
+		inner: plain.clone(),
+		unsent: stop == GcStop::CompleteUnsent,
+		lost: past_complete,
+	});
+	let held = Arc::new(tokio::sync::Semaphore::new(0));
+	let release = Arc::new(tokio::sync::Semaphore::new(0));
+	let hold = Some((held.clone(), release.clone()));
+	// The mark, on its own.
+	mgr.continuity_test_holds
+		.gc_remove_held
+		.store(true, Ordering::Release);
+	mgr.sweep_lsm_delete_pending_once_via_control_ring(&new_gc(&mgr), faults.as_ref())
+		.await
+		.unwrap();
+	let rows = index.load_op_intents().await.unwrap();
+	let SlabCommand::GcRemove(remove) = rows[0].command() else {
+		panic!("the mark's removal: {rows:?}");
+	};
+	std::fs::write(dir.join("gc-job"), remove.job_id.get().to_string()).unwrap();
+	let job = remove.job_id;
+	if stop != GcStop::MarkHandedOff {
+		mgr.continuity_test_holds
+			.gc_remove_held
+			.store(false, Ordering::Release);
+		let parked = match stop {
+			GcStop::BeforeUnlink => {
+				*mgr.continuity_test_holds
+					.gc_before_unlink_hold
+					.lock()
+					.unwrap() = hold;
+				true
+			}
+			GcStop::AfterUnlink => {
+				*mgr.continuity_test_holds
+					.gc_after_fsync_hold
+					.lock()
+					.unwrap() = hold;
+				true
+			}
+			GcStop::RunDroppedReserved => {
+				index
+					.cut_next_progress_txn_after_two(crate::storage::index::OpTxnCut::BeforeCommit);
+				false
+			}
+			_ => false,
+		};
+		let sweep = {
+			let (mgr, faults) = (mgr.clone(), faults.clone());
+			tokio::spawn(async move {
+				mgr.sweep_lsm_delete_pending_once_via_control_ring(&new_gc(&mgr), faults.as_ref())
+					.await
+			})
+		};
+		if parked {
+			tokio::time::timeout(Duration::from_secs(60), held.acquire())
+				.await
+				.unwrap()
+				.unwrap()
+				.forget();
+			owner.begin_close();
+			release.add_permits(8);
+		}
+		let _ = tokio::time::timeout(Duration::from_secs(60), sweep)
+			.await
+			.expect("the sweep ends");
+	}
+	if matches!(
+		stop,
+		GcStop::PurgeAuthorizedEntryPresent | GcStop::PurgeAuthorizedEntryGone | GcStop::Purged
+	) {
+		// The real purge stage's own writes, cut where this row stands.
+		let loaded = index.load_op_intents().await.unwrap();
+		let LoadedOp::Submittable(ticket) = loaded[0].clone() else {
+			panic!("a removal past its submission");
+		};
+		let Some(OpProgress::RunDropped(Some(file))) = loaded[0].progress().cloned() else {
+			panic!("past its run drop: {:?}", loaded[0].progress());
+		};
+		let update = |progress| crate::storage::index::OpProgressUpdate {
+			key: ticket.key(),
+			digest: ticket.digest(),
+			progress,
+		};
+		index
+			.advance_op_progress(update(OpProgress::PurgeAuthorized(file.clone())), None)
+			.await
+			.unwrap();
+		if stop != GcStop::PurgeAuthorizedEntryPresent {
+			std::fs::remove_file(super::gc_disposal::gc_quarantine_path(&dir, slab_id, job))
+				.unwrap();
+		}
+		if stop == GcStop::Purged {
+			index
+				.advance_op_progress(update(OpProgress::Purged(file)), None)
+				.await
+				.unwrap();
+		}
+	}
+	let _ = owner.close(Duration::from_secs(5)).await;
+	let reopened = reopen_on_ring(dir, cluster, slab_id, plain).await;
+	assert_gc_stopped_at(&reopened, stop).await;
+	reopened
+}
+
+/// A control is worth what its starting point is: each stop must stand where it says.
+async fn assert_gc_stopped_at(gc: &ReopenedGc, stop: GcStop) {
+	use crate::storage::index::OpProgress as P;
+	let rows = gc.rows().await;
+	let progress = rows[0].progress();
+	let (original, entry) = (gc.original().exists(), gc.entry().exists());
+	let submittable = matches!(rows[0], LoadedOp::Submittable(_));
+	let stands = match stop {
+		GcStop::MarkHandedOff => progress.is_none() && original && !entry,
+		GcStop::BeforeUnlink => {
+			matches!(progress, Some(P::QuarantineRecorded(_))) && original && entry
+		}
+		GcStop::AfterUnlink => {
+			matches!(progress, Some(P::QuarantineRecorded(_))) && !original && entry
+		}
+		GcStop::RunDroppedReserved => {
+			matches!(progress, Some(P::RunDropped(Some(_)))) && !submittable && !original && entry
+		}
+		GcStop::CompleteUnsent | GcStop::CompleteAppliedAnswerLost => {
+			matches!(progress, Some(P::RunDropped(Some(_)))) && submittable && !original && entry
+		}
+		GcStop::PurgeAuthorizedEntryPresent => {
+			matches!(progress, Some(P::PurgeAuthorized(_))) && !original && entry
+		}
+		GcStop::PurgeAuthorizedEntryGone => {
+			matches!(progress, Some(P::PurgeAuthorized(_))) && !original && !entry
+		}
+		GcStop::Purged => matches!(progress, Some(P::Purged(_))) && !original && !entry,
+	};
+	assert!(
+		stands,
+		"{stop:?} stands at {progress:?}, submittable {submittable}, original {original}, entry {entry}"
+	);
+}
+
+async fn assert_gc_finishes_from(stop: GcStop) {
+	let gc = reopen_gc_at(stop).await;
+	gc.finish(stop).await;
+	gc.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_gc_resumes_from_a_handed_off_mark_after_a_reopen() {
+	assert_gc_finishes_from(GcStop::MarkHandedOff).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_gc_resumes_from_p1_after_a_reopen() {
+	assert_gc_finishes_from(GcStop::BeforeUnlink).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_gc_resumes_from_p2_after_a_reopen() {
+	assert_gc_finishes_from(GcStop::AfterUnlink).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_gc_resumes_from_p3_still_reserved_after_a_reopen() {
+	assert_gc_finishes_from(GcStop::RunDroppedReserved).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_gc_resumes_from_p3_with_complete_never_sent_after_a_reopen() {
+	assert_gc_finishes_from(GcStop::CompleteUnsent).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_gc_resumes_from_p3c_with_complete_applied_after_a_reopen() {
+	assert_gc_finishes_from(GcStop::CompleteAppliedAnswerLost).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_gc_resumes_from_purge_authorized_with_its_entry_after_a_reopen() {
+	assert_gc_finishes_from(GcStop::PurgeAuthorizedEntryPresent).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_gc_resumes_from_purge_authorized_with_its_entry_already_gone() {
+	assert_gc_finishes_from(GcStop::PurgeAuthorizedEntryGone).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_gc_resumes_from_p4_after_a_reopen() {
+	assert_gc_finishes_from(GcStop::Purged).await;
+}
+
+/// §6.1's "original only": the row recorded the quarantine and the link never happened.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_gc_resumes_from_an_original_whose_link_never_happened() {
+	let gc = reopen_gc_at(GcStop::BeforeUnlink).await;
+	std::fs::remove_file(gc.entry()).unwrap();
+	gc.finish("original only").await;
+	gc.close().await;
+}
+
+/// §6.1: a lost original with no quarantine evidence does not complete.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lost_original_with_no_quarantine_evidence_fences_after_a_reopen() {
+	let gc = reopen_gc_at(GcStop::BeforeUnlink).await;
+	std::fs::remove_file(gc.entry()).unwrap();
+	std::fs::remove_file(gc.original()).unwrap();
+	gc.assert_fences(gc.plain.clone()).await;
+	assert!(!gc.removed_on_ring().await, "Complete was not sent");
+	gc.close().await;
+}
+
+/// The recorded inode decides, for either name: a look-alike is not this workflow's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replaced_original_or_entry_at_quarantine_fences_and_is_kept() {
+	let replace = |path: &Path| {
+		let bytes = std::fs::read(path).unwrap();
+		std::fs::remove_file(path).unwrap();
+		std::fs::write(path, bytes).unwrap();
+	};
+	let gc = reopen_gc_at(GcStop::BeforeUnlink).await;
+	replace(&gc.original());
+	gc.assert_fences(gc.plain.clone()).await;
+	gc.close().await;
+	let gc = reopen_gc_at(GcStop::AfterUnlink).await;
+	replace(&gc.entry());
+	gc.assert_fences(gc.plain.clone()).await;
+	gc.close().await;
+}
+
+/// The same inode with other bytes is not the recorded file either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn corrupted_bytes_at_quarantine_or_before_purge_fence() {
+	let corrupt = |path: &Path| {
+		use std::os::unix::fs::FileExt;
+		let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+		file.write_at(b"\xff\xfe\xfd", 0).unwrap();
+	};
+	for stop in [
+		GcStop::AfterUnlink,
+		GcStop::CompleteAppliedAnswerLost,
+		GcStop::PurgeAuthorizedEntryPresent,
+	] {
+		let gc = reopen_gc_at(stop).await;
+		corrupt(&gc.entry());
+		gc.assert_fences(gc.plain.clone()).await;
+		gc.close().await;
+	}
+}
+
+/// Missing evidence before `PurgeAuthorized` fences, and Complete is not even sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_missing_entry_before_purge_authorized_fences() {
+	for stop in [GcStop::CompleteUnsent, GcStop::CompleteAppliedAnswerLost] {
+		let gc = reopen_gc_at(stop).await;
+		let applied = gc.removed_on_ring().await;
+		std::fs::remove_file(gc.entry()).unwrap();
+		gc.assert_fences(gc.plain.clone()).await;
+		assert_eq!(gc.removed_on_ring().await, applied, "{stop:?}");
+		gc.close().await;
+	}
+}
+
+/// Q3's negative: a replaced entry at `PurgeAuthorized` is preserved and fences.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replaced_entry_at_purge_authorized_is_preserved_and_fences() {
+	let gc = reopen_gc_at(GcStop::PurgeAuthorizedEntryPresent).await;
+	std::fs::remove_file(gc.entry()).unwrap();
+	std::fs::write(gc.entry(), b"something else").unwrap();
+	gc.assert_fences(gc.plain.clone()).await;
+	assert_eq!(std::fs::read(gc.entry()).unwrap(), b"something else");
+	gc.close().await;
+}
+
+/// `Purged` with a reappearing entry is not accepted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_entry_reappearing_after_purged_is_preserved_and_fences() {
+	let gc = reopen_gc_at(GcStop::Purged).await;
+	std::fs::write(gc.entry(), b"something else").unwrap();
+	gc.assert_fences(gc.plain.clone()).await;
+	assert_eq!(std::fs::read(gc.entry()).unwrap(), b"something else");
+	gc.close().await;
+}
+
+/// An original back at its path after the run drop is a contradiction, not a purge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_original_present_after_complete_fences_the_purge() {
+	let gc = reopen_gc_at(GcStop::CompleteAppliedAnswerLost).await;
+	std::fs::write(gc.original(), b"something else").unwrap();
+	let rows = gc.rows().await;
+	let driver = gc.driver(gc.plain.clone());
+	for _ in 0..3 {
+		assert!(driver.drive_once().await.is_err());
+	}
+	assert_eq!(gc.rows().await, rows);
+	assert!(gc.entry().exists(), "nothing purged");
+	gc.close().await;
+}
+
+/// Alters what a pass reads and counts what it sends. The lease each phase reads stays
+/// the ring's own, so a forged view shows which decisions the view alone can reach.
+struct ForgedView {
+	inner: Arc<crate::storage::RaftCommitter>,
+	forge: fn(&mut crate::consensus::slab_ops::OpView),
+	submitted: std::sync::atomic::AtomicU64,
+}
+
+impl ForgedView {
+	fn new(
+		inner: Arc<crate::storage::RaftCommitter>,
+		forge: fn(&mut crate::consensus::slab_ops::OpView),
+	) -> Arc<Self> {
+		Arc::new(Self {
+			inner,
+			forge,
+			submitted: std::sync::atomic::AtomicU64::new(0),
+		})
+	}
+}
+
+#[async_trait]
+impl TierCommitter for ForgedView {
+	async fn preflight(&self, owner: crate::consensus::OwnerRef) -> std::io::Result<()> {
+		self.inner.preflight(owner).await
+	}
+	async fn submit_op(
+		&self,
+		ticket: &crate::storage::index::OpTicket,
+	) -> std::io::Result<crate::storage::VerifiedReceipt> {
+		self.submitted.fetch_add(1, Ordering::SeqCst);
+		self.inner.submit_op(ticket).await
+	}
+	async fn cancel_op(
+		&self,
+		ticket: &crate::storage::index::OpTicket,
+	) -> std::io::Result<crate::storage::VerifiedReceipt> {
+		self.submitted.fetch_add(1, Ordering::SeqCst);
+		self.inner.cancel_op(ticket).await
+	}
+	async fn ack_outcomes(
+		&self,
+		owner: crate::consensus::OwnerRef,
+		seqs: Vec<u64>,
+	) -> std::io::Result<crate::consensus::slab_ops::AckReceipt> {
+		self.inner.ack_outcomes(owner, seqs).await
+	}
+	async fn op_prefix(&self, owner: crate::consensus::OwnerRef) -> std::io::Result<Option<u64>> {
+		self.inner.op_prefix(owner).await
+	}
+	async fn op_view(
+		&self,
+		key: crate::consensus::slab_ops::OpKey,
+		digest: [u8; 32],
+		slabs: Vec<crate::consensus::SlabRef>,
+	) -> std::io::Result<crate::consensus::slab_ops::OpView> {
+		let mut view = self.inner.op_view(key, digest, slabs).await?;
+		(self.forge)(&mut view);
+		Ok(view)
+	}
+}
+
+fn forge_applied(view: &mut crate::consensus::slab_ops::OpView) {
+	view.outcome = crate::consensus::slab_ops::ViewOutcome::Recorded(
+		crate::consensus::slab_ops::RecordedOutcome::Applied { index: 1 },
+	);
+}
+fn forge_rejected(view: &mut crate::consensus::slab_ops::OpView) {
+	view.outcome = crate::consensus::slab_ops::ViewOutcome::Recorded(
+		crate::consensus::slab_ops::RecordedOutcome::Rejected {
+			reason: crate::consensus::slab_ops::SlabRejection::Removed,
+			index: 1,
+		},
+	);
+}
+fn forge_conflict(view: &mut crate::consensus::slab_ops::OpView) {
+	view.outcome = crate::consensus::slab_ops::ViewOutcome::Conflict;
+}
+fn forge_undecided(view: &mut crate::consensus::slab_ops::OpView) {
+	view.outcome = crate::consensus::slab_ops::ViewOutcome::None;
+}
+fn forge_claim_gone(view: &mut crate::consensus::slab_ops::OpView) {
+	for (_, standing) in &mut view.slabs {
+		*standing = crate::consensus::slab_ops::SlabStanding::Unknown;
+	}
+}
+fn forge_prefix_past(view: &mut crate::consensus::slab_ops::OpView) {
+	view.acked_through = u64::MAX;
+}
+
+async fn assert_forged_fences(stop: GcStop, forge: fn(&mut crate::consensus::slab_ops::OpView)) {
+	let gc = reopen_gc_at(stop).await;
+	let forged = ForgedView::new(gc.plain.clone(), forge);
+	gc.assert_fences(forged.clone()).await;
+	assert_eq!(forged.submitted.load(Ordering::SeqCst), 0, "{stop:?}: sent");
+	gc.close().await;
+}
+
+/// Applied never justifies disposal not yet performed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_applied_complete_at_an_earlier_phase_fences() {
+	assert_forged_fences(GcStop::BeforeUnlink, forge_applied).await;
+	assert_forged_fences(GcStop::AfterUnlink, forge_applied).await;
+	// Applied on a Complete this row never made submittable.
+	assert_forged_fences(GcStop::RunDroppedReserved, forge_applied).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rejected_or_conflicting_complete_fences_at_every_phase() {
+	for stop in [
+		GcStop::BeforeUnlink,
+		GcStop::CompleteUnsent,
+		GcStop::PurgeAuthorizedEntryPresent,
+	] {
+		assert_forged_fences(stop, forge_rejected).await;
+		assert_forged_fences(stop, forge_conflict).await;
+	}
+}
+
+/// With no decision, a phase past the submission contradicts what it recorded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn no_decision_at_purge_authorized_or_purged_fences() {
+	assert_forged_fences(GcStop::PurgeAuthorizedEntryPresent, forge_undecided).await;
+	assert_forged_fences(GcStop::Purged, forge_undecided).await;
+}
+
+/// Past `QuarantineRecorded`, with no decision and the claim gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn no_decision_and_no_claim_fences() {
+	assert_forged_fences(GcStop::BeforeUnlink, forge_claim_gone).await;
+	assert_forged_fences(GcStop::CompleteUnsent, forge_claim_gone).await;
+}
+
+/// An Intent at or below the prefix is an anomaly, with no authority.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_removal_at_or_below_the_prefix_fences() {
+	assert_forged_fences(GcStop::BeforeUnlink, forge_prefix_past).await;
+}
+
+/// A view alone purges nothing: the ring's own Applied, under the lease, does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_view_saying_applied_grants_no_purge_without_the_rings_decision() {
+	let gc = reopen_gc_at(GcStop::CompleteUnsent).await;
+	let forged = ForgedView::new(gc.plain.clone(), forge_applied);
+	gc.assert_fences(forged).await;
+	assert!(
+		!gc.removed_on_ring().await,
+		"premise: the ring did not apply it"
+	);
+	assert!(gc.entry().exists());
+	gc.close().await;
+}
+
+/// §6's first check: a store that is no longer current recovers nothing, at any phase.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_superseded_store_recovers_no_removal() {
+	for stop in [
+		GcStop::BeforeUnlink,
+		GcStop::CompleteUnsent,
+		GcStop::PurgeAuthorizedEntryPresent,
+	] {
+		let gc = reopen_gc_at(stop).await;
+		supersede_store(&gc.cluster.nodes[0], gc.mgr.owner_ref().unwrap()).await;
+		let rows = gc.rows().await;
+		let files = (gc.original().exists(), gc.entry().exists());
+		// Nothing to resolve, and so no fence to report: its owner is what stopped it.
+		gc.mgr
+			.recover_abandoned_removals(gc.plain.as_ref())
+			.await
+			.unwrap();
+		let asked = ForgedView::new(gc.plain.clone(), |_| {});
+		let driver = gc.driver(asked.clone());
+		for _ in 0..3 {
+			let _ = driver.drive_once().await;
+		}
+		assert_eq!(
+			asked.submitted.load(Ordering::SeqCst),
+			0,
+			"{stop:?}: it asks the ring for nothing"
+		);
+		assert_eq!(gc.rows().await, rows, "{stop:?}");
+		assert_eq!(
+			(gc.original().exists(), gc.entry().exists()),
+			files,
+			"{stop:?}"
+		);
+		gc.close().await;
+	}
+}
+
+/// Supersedes the owner once its view has been read.
+struct SupersedesAfterView {
+	inner: Arc<crate::storage::RaftCommitter>,
+	raft: crate::consensus::WendelonRaft,
+}
+
+#[async_trait]
+impl TierCommitter for SupersedesAfterView {
+	async fn preflight(&self, owner: crate::consensus::OwnerRef) -> std::io::Result<()> {
+		self.inner.preflight(owner).await
+	}
+	async fn submit_op(
+		&self,
+		ticket: &crate::storage::index::OpTicket,
+	) -> std::io::Result<crate::storage::VerifiedReceipt> {
+		self.inner.submit_op(ticket).await
+	}
+	async fn op_view(
+		&self,
+		key: crate::consensus::slab_ops::OpKey,
+		digest: [u8; 32],
+		slabs: Vec<crate::consensus::SlabRef>,
+	) -> std::io::Result<crate::consensus::slab_ops::OpView> {
+		let view = self.inner.op_view(key, digest, slabs).await?;
+		supersede_store(&self.raft, key.owner).await;
+		Ok(view)
+	}
+}
+
+/// The view said current, and each phase's lease then did not: nothing moves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_supersession_after_the_view_stops_a_removals_resume_and_its_purge() {
+	for stop in [
+		GcStop::BeforeUnlink,
+		GcStop::AfterUnlink,
+		GcStop::CompleteAppliedAnswerLost,
+		GcStop::PurgeAuthorizedEntryPresent,
+		GcStop::Purged,
+	] {
+		let gc = reopen_gc_at(stop).await;
+		let rows = gc.rows().await;
+		let files = (gc.original().exists(), gc.entry().exists());
+		let committer = Arc::new(SupersedesAfterView {
+			inner: gc.plain.clone(),
+			raft: gc.cluster.nodes[0].clone(),
+		});
+		let driver = gc.driver(committer);
+		let _ = driver.drive_once().await;
+		assert_eq!(gc.rows().await, rows, "{stop:?}");
+		assert_eq!(
+			(gc.original().exists(), gc.entry().exists()),
+			files,
+			"{stop:?}"
+		);
+		gc.close().await;
+	}
+}
+
+/// A row that recorded progress keeps its store unready, so no sweep can restart it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sweep_refuses_while_a_recorded_removal_is_unresolved() {
+	for stop in [GcStop::BeforeUnlink, GcStop::AfterUnlink] {
+		let gc = reopen_gc_at(stop).await;
+		let rows = gc.rows().await;
+		let files = (gc.original().exists(), gc.entry().exists());
+		let error = gc
+			.mgr
+			.sweep_lsm_delete_pending_once_via_control_ring(&new_gc(&gc.mgr), gc.plain.as_ref())
+			.await
+			.unwrap_err();
+		assert_eq!(error.kind(), ErrorKind::WouldBlock, "{stop:?}: {error}");
+		assert_eq!(gc.rows().await, rows, "{stop:?}");
+		assert_eq!(
+			(gc.original().exists(), gc.entry().exists()),
+			files,
+			"{stop:?}"
+		);
+		gc.finish(stop).await;
+		gc.close().await;
+	}
+}
+
+/// A live sweep owns its removal through every stage, and a pass takes nothing from it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_recovery_pass_leaves_a_live_sweeps_removal_alone() {
+	let dir = fresh_dir("s5-live-removal");
+	let owner = DataDirectoryOwner::acquire_existing(&dir).unwrap();
+	let mgr =
+		SlabManager::initialize_new_store_with_owner(gc_owned_test_config(&dir), owner.clone())
+			.await
+			.unwrap();
+	let (slab_id, _key) = seed_small_retired_gc_slab(&mgr).await;
+	let cluster = control_cluster_observing(&[(1, &mgr)]).await;
+	register_owner(&cluster.nodes[0], &mgr).await;
+	let plain = Arc::new(op_committer(&cluster, 1));
+	let (entered, release) = hold_gc_disposal_entry(&mgr);
+	let sweep = {
+		let (mgr, plain) = (mgr.clone(), plain.clone());
+		tokio::spawn(async move {
+			mgr.sweep_lsm_delete_pending_once_via_control_ring(&new_gc(&mgr), plain.as_ref())
+				.await
+		})
+	};
+	tokio::time::timeout(Duration::from_secs(60), entered.acquire())
+		.await
+		.unwrap()
+		.unwrap()
+		.forget();
+	let index = mgr.require_op_index().unwrap();
+	let rows = index.load_op_intents().await.unwrap();
+	let driver = op_driver(&cluster, &mgr, plain.clone());
+	driver.drive_once().await.unwrap();
+	assert_eq!(index.load_op_intents().await.unwrap(), rows);
+	assert!(slab_path(&dir, slab_id).exists());
+	release.add_permits(8);
+	assert_eq!(
+		tokio::time::timeout(Duration::from_secs(60), sweep)
+			.await
+			.unwrap()
+			.unwrap()
+			.unwrap(),
+		vec![slab_id]
+	);
+	let _ = owner.close(Duration::from_secs(2)).await;
+}
+
+/// §6.1's full-window row: Complete was reserved with its mark, so resuming it takes no
+/// room from a window full of other decided work.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_recorded_removal_resumes_at_a_full_window() {
+	use crate::consensus::slab_ops::OPS_WINDOW_W;
+	let gc = reopen_gc_at(GcStop::RunDroppedReserved).await;
+	let owner = gc.mgr.owner_ref().unwrap();
+	let driver = gc.driver(gc.plain.clone());
+	// The mark's ack, so what holds the prefix is the removal alone.
+	let _ = driver.drive_once().await;
+	let index = gc.mgr.require_op_index().unwrap();
+	let base = index.load_op_intents().await.unwrap()[0].key().op_seq;
+	for offset in 1..OPS_WINDOW_W {
+		let request = gc
+			.mgr
+			.retire_request_for_test(owner.slab(SlabId::new(0x10_000 + offset)))
+			.await;
+		gc.cluster.nodes[0].client_write(request).await.unwrap();
+	}
+	assert!(
+		index.ensure_op_room(1).await.is_err(),
+		"premise: the window is full from {base}"
+	);
+	gc.finish("a full window").await;
+	gc.close().await;
+}
+
+/// Commit cuts over every transaction a resume writes: a store that can retry does, and
+/// one whose publication is uncertain reopens first and then resumes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cuts_on_a_resumes_run_drop_finish_after_the_reopen() {
+	use crate::storage::index::OpTxnCut;
+	for stop in [GcStop::BeforeUnlink, GcStop::AfterUnlink] {
+		for cut in [OpTxnCut::BeforeCommit, OpTxnCut::AfterCommit] {
+			let gc = reopen_gc_at(stop).await;
+			gc.mgr.require_op_index().unwrap().cut_next_op_txn(cut);
+			let driver = gc.driver(gc.plain.clone());
+			assert!(driver.drive_once().await.is_err(), "{stop:?} {cut:?}");
+			drop(driver);
+			let gc = gc.reopen().await;
+			gc.finish((stop, cut)).await;
+			gc.close().await;
+		}
+	}
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cuts_on_a_resumed_completes_own_transactions_retry_in_place() {
+	use crate::storage::index::OpTxnCut;
+	// The transition to submission, the purge's authorization, its `Purged`, and the
+	// handoff: each with the commit lost, and landed with the answer lost.
+	for (stop, skip) in [
+		(GcStop::RunDroppedReserved, 0),
+		(GcStop::CompleteAppliedAnswerLost, 0),
+		(GcStop::CompleteAppliedAnswerLost, 1),
+		(GcStop::PurgeAuthorizedEntryPresent, 0),
+		(GcStop::Purged, 0),
+	] {
+		for cut in [OpTxnCut::BeforeCommit, OpTxnCut::AfterCommit] {
+			let gc = reopen_gc_at(stop).await;
+			let index = gc.mgr.require_op_index().unwrap();
+			match skip {
+				0 => index.cut_next_op_txn(cut),
+				_ => index.cut_next_progress_txn_after_one(cut),
+			}
+			let driver = gc.driver(gc.plain.clone());
+			assert!(
+				driver.drive_once().await.is_err(),
+				"{stop:?} {skip} {cut:?}: the cut lands"
+			);
+			gc.finish((stop, skip, cut)).await;
+			gc.close().await;
+		}
+	}
+}
+
+/// The directory sync of a purge is owed before `Purged` is written, including from
+/// `PurgeAuthorized` with the entry already gone: its unlink may not be durable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_purge_sync_stays_unresolved_and_is_retried() {
+	use crate::storage::index::OpProgress;
+	for stop in [
+		GcStop::CompleteAppliedAnswerLost,
+		GcStop::PurgeAuthorizedEntryPresent,
+		GcStop::PurgeAuthorizedEntryGone,
+	] {
+		let gc = reopen_gc_at(stop).await;
+		gc.faults.inject(InjectedFault::on(
+			FaultOp::FsyncDir,
+			FaultAction::Error {
+				kind: ErrorKind::Other,
+				message: "injected purge directory sync failure".into(),
+			},
+		));
+		let driver = gc.driver(gc.plain.clone());
+		assert!(driver.drive_once().await.is_err(), "{stop:?}");
+		assert!(
+			matches!(
+				gc.rows().await[0].progress(),
+				Some(OpProgress::PurgeAuthorized(_))
+			),
+			"{stop:?}: no `Purged` before its sync"
+		);
+		gc.finish(stop).await;
+		gc.close().await;
+	}
+}
+
+/// Likewise the resume's own sync, before it drops the run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_quarantine_sync_on_resume_leaves_the_run_and_retries() {
+	let gc = reopen_gc_at(GcStop::AfterUnlink).await;
+	let rows = gc.rows().await;
+	gc.faults.inject(InjectedFault::on(
+		FaultOp::FsyncDir,
+		FaultAction::Error {
+			kind: ErrorKind::Other,
+			message: "injected quarantine directory sync failure".into(),
+		},
+	));
+	let driver = gc.driver(gc.plain.clone());
+	assert!(driver.drive_once().await.is_err());
+	assert_eq!(
+		gc.rows().await,
+		rows,
+		"the run is not dropped past a failed sync"
+	);
+	gc.finish("a failed sync").await;
+	gc.close().await;
+}
+
+/// A reopen rebuilds the memory index from slab files, so a retired run's old rows come
+/// back there and mean nothing: the durable rows decide whether it can be collected,
+/// or a restart would leave every retired run behind. RED first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_retired_run_is_collected_after_a_reopen() {
+	let dir = fresh_dir("s5-retired-reopen");
+	let owner = DataDirectoryOwner::acquire_existing(&dir).unwrap();
+	let mgr =
+		SlabManager::initialize_new_store_with_owner(gc_owned_test_config(&dir), owner.clone())
+			.await
+			.unwrap();
+	let (slab_id, key) = seed_small_retired_gc_slab(&mgr).await;
+	let cluster = control_cluster_observing(&[(1, &mgr)]).await;
+	register_owner(&cluster.nodes[0], &mgr).await;
+	let plain = Arc::new(op_committer(&cluster, 1));
+	owner.close(Duration::from_secs(5)).await.unwrap();
+	let gc = reopen_on_ring(dir, cluster, slab_id, plain).await;
+	std::fs::write(gc.dir.join("gc-job"), "0").unwrap();
+	gc.finish("a retired run").await;
+	let current = gc.mgr.lookup(tenant(), key).unwrap().unwrap();
+	assert_ne!(current.slab_id, slab_id);
+	gc.close().await;
+}
+
+/// The same after a mark recovered across the reopen that left its row in memory.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_mark_recovered_across_a_reopen_goes_on_to_collect_its_run() {
+	let dir = fresh_dir("s5-mark-then-collect");
+	let owner = DataDirectoryOwner::acquire_existing(&dir).unwrap();
+	let mgr =
+		SlabManager::initialize_new_store_with_owner(gc_owned_test_config(&dir), owner.clone())
+			.await
+			.unwrap();
+	let (slab_id, key) = seed_small_retired_gc_slab(&mgr).await;
+	let cluster = control_cluster_observing(&[(1, &mgr)]).await;
+	register_owner(&cluster.nodes[0], &mgr).await;
+	let plain = Arc::new(op_committer(&cluster, 1));
+	let losing = LosesMarkResponse(plain.clone());
+	let _ = mgr
+		.sweep_lsm_delete_pending_once_via_control_ring(&new_gc(&mgr), &losing)
+		.await;
+	owner.close(Duration::from_secs(5)).await.unwrap();
+	let gc = reopen_on_ring(dir, cluster, slab_id, plain).await;
+	std::fs::write(gc.dir.join("gc-job"), "0").unwrap();
+	gc.finish("a recovered mark").await;
+	let current = gc.mgr.lookup(tenant(), key).unwrap().unwrap();
+	assert_ne!(current.slab_id, slab_id);
+	gc.close().await;
+}
+
+/// A store in a child process proposing to a ring its parent owns: each proposal is a file
+/// the parent answers after the ring has decided it. So what the child dies with was
+/// really committed before it died, and the ring it reopens against outlived it.
+struct ChildRingCommitter {
+	dir: PathBuf,
+	step: String,
+	/// What a ring's observer delivers on this node, for a workflow that waits on it: the
+	/// ring itself is in the parent, with this store out of its reach.
+	observer: Option<Arc<SlabManager>>,
+}
+
+fn write_ring_file(path: &Path, bytes: &[u8]) {
+	let staged = path.with_extension("staged");
+	std::fs::write(&staged, bytes).unwrap();
+	std::fs::rename(&staged, path).unwrap();
+}
+
+fn child_reached(step: &str) -> ! {
+	println!("gc kill boundary reached: {step}");
+	std::io::Write::flush(&mut std::io::stdout()).unwrap();
+	std::process::exit(0);
+}
+
+#[async_trait]
+impl TierCommitter for ChildRingCommitter {
+	async fn submit_op(
+		&self,
+		ticket: &crate::storage::index::OpTicket,
+	) -> std::io::Result<crate::storage::VerifiedReceipt> {
+		use crate::consensus::slab_ops::{RecordedOutcome, SlabCommand};
+		let kind = match ticket.command() {
+			SlabCommand::GcRemove(_) => "complete",
+			_ => "mark",
+		};
+		if self.step == format!("{kind}-unsent") {
+			child_reached(&self.step);
+		}
+		let seq = ticket.key().op_seq;
+		let bytes = postcard::to_stdvec(&(seq, ticket.digest(), ticket.command().clone()))
+			.map_err(Error::other)?;
+		write_ring_file(&self.dir.join(format!("ring-req-{seq:020}")), &bytes);
+		let answer = self.dir.join(format!("ring-ans-{seq:020}"));
+		let bytes = loop {
+			match std::fs::read(&answer) {
+				Ok(bytes) => break bytes,
+				Err(error) if error.kind() == ErrorKind::NotFound => {
+					tokio::time::sleep(Duration::from_millis(2)).await;
+				}
+				Err(error) => return Err(error),
+			}
+		};
+		// The ring decided this; the answer goes no further than here.
+		if self.step == format!("{kind}-unanswered") {
+			child_reached(&self.step);
+		}
+		let outcome = postcard::from_bytes(&bytes).map_err(Error::other)?;
+		if let (RecordedOutcome::Applied { .. }, Some(manager), SlabCommand::Compaction(commit)) =
+			(&outcome, &self.observer, ticket.command())
+		{
+			manager
+				.apply_lsm_manifest_compaction_commit(commit)
+				.map_err(Error::other)?;
+		}
+		Ok(match outcome {
+			RecordedOutcome::Applied { index } => {
+				crate::storage::VerifiedReceipt::Applied { index }
+			}
+			RecordedOutcome::Rejected { reason, index } => {
+				crate::storage::VerifiedReceipt::Rejected { reason, index }
+			}
+		})
+	}
+}
+
+/// The parent's half: registers the child's store and decides what it proposes, on a real
+/// ring, until it is gone.
+async fn serve_child_ring(
+	dir: PathBuf,
+	cluster: &ControlCluster,
+	child: tokio::task::JoinHandle<std::io::Result<std::process::Output>>,
+) -> std::process::Output {
+	use crate::consensus::slab_ops::{OpKey, SlabCommand, SlabOp, ViewOutcome};
+	let raft = &cluster.nodes[0];
+	let mut owner = None;
+	let mut served = std::collections::BTreeSet::new();
+	while !child.is_finished() {
+		if owner.is_none()
+			&& let Ok(bytes) = std::fs::read(dir.join("ring-owner"))
+		{
+			let found: crate::consensus::OwnerRef = postcard::from_bytes(&bytes).unwrap();
+			raft.client_write(crate::consensus::WendelonRequest::RegisterIncarnation(
+				crate::consensus::RegisterIncarnation {
+					node: found.node(),
+					incarnation: found.incarnation(),
+					supersedes: None,
+				},
+			))
+			.await
+			.unwrap();
+			write_ring_file(&dir.join("ring-registered"), b"yes");
+			owner = Some(found);
+		}
+		for entry in std::fs::read_dir(&dir).unwrap() {
+			let path = entry.unwrap().path();
+			let name = path.file_name().unwrap().to_string_lossy().into_owned();
+			if !name.starts_with("ring-req-")
+				|| name.ends_with(".staged")
+				|| !served.insert(name.clone())
+			{
+				continue;
+			}
+			let (op_seq, digest, command): (u64, [u8; 32], SlabCommand) =
+				postcard::from_bytes(&std::fs::read(&path).unwrap()).unwrap();
+			let slabs = command.slabs();
+			raft.client_write(crate::consensus::WendelonRequest::SlabOp(SlabOp {
+				op_seq,
+				command,
+			}))
+			.await
+			.unwrap();
+			let key = OpKey {
+				owner: owner.expect("registered before it proposes"),
+				op_seq,
+			};
+			let view = cluster.state_machines[0].op_view(key, digest, slabs).await;
+			let ViewOutcome::Recorded(outcome) = view.outcome else {
+				panic!("the ring decided this op by its digest: {view:?}");
+			};
+			write_ring_file(
+				&dir.join(name.replace("ring-req-", "ring-ans-")),
+				&postcard::to_stdvec(&outcome).unwrap(),
+			);
+		}
+		tokio::time::sleep(Duration::from_millis(2)).await;
+	}
+	child.await.unwrap().unwrap()
+}
+
+/// §9.2 by process death. The ring is the parent's and live throughout: each proposal the
+/// child made was decided before the child died, whether or not it heard the answer, and
+/// none is replayed afterward. Exit is a process death for redb and the owner lock, not
+/// power loss, and this is one store and its ring, not a three-node restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_gc_killed_at_each_boundary_resumes_on_a_ring_that_outlived_it() {
+	const CHILD_DIR: &str = "WENDELON_GC_KILL_STEP_DIR";
+	const CHILD_STEP: &str = "WENDELON_GC_KILL_STEP_KIND";
+	if let (Some(path), Ok(step)) = (std::env::var_os(CHILD_DIR), std::env::var(CHILD_STEP)) {
+		let dir = PathBuf::from(path);
+		let owner = DataDirectoryOwner::acquire_existing(&dir).unwrap();
+		let manager =
+			SlabManager::initialize_new_store_with_owner(gc_owned_test_config(&dir), owner)
+				.await
+				.unwrap();
+		manager.bind_control_node(1).unwrap();
+		let (slab_id, _) = seed_small_retired_gc_slab(&manager).await;
+		write_ring_file(&dir.join("gc-target"), slab_id.get().to_string().as_bytes());
+		write_ring_file(
+			&dir.join("ring-owner"),
+			&postcard::to_stdvec(&manager.owner_ref().unwrap()).unwrap(),
+		);
+		while !dir.join("ring-registered").exists() {
+			tokio::time::sleep(Duration::from_millis(2)).await;
+		}
+		let entered = Arc::new(tokio::sync::Semaphore::new(0));
+		let release = Arc::new(tokio::sync::Semaphore::new(0));
+		let hold = Some((entered.clone(), release));
+		let holds = &manager.continuity_test_holds;
+		let selected = match step.as_str() {
+			"entry" => Some(&holds.gc_disposal_entry_hold),
+			"preunlink" => Some(&holds.gc_before_unlink_hold),
+			"unlink" => Some(&holds.gc_after_unlink_hold),
+			"fsync" => Some(&holds.gc_after_fsync_hold),
+			"clear" => Some(&holds.gc_before_clear_hold),
+			"cleared" => Some(&holds.gc_after_clear_hold),
+			_ => None,
+		};
+		if let Some(selected) = selected {
+			*selected.lock().unwrap() = hold;
+		}
+		let job = {
+			let manager = manager.clone();
+			let committer = ChildRingCommitter {
+				dir: dir.clone(),
+				step: step.clone(),
+				observer: None,
+			};
+			tokio::spawn(async move {
+				manager
+					.sweep_lsm_delete_pending_once_via_control_ring(&new_gc(&manager), &committer)
+					.await
+			})
+		};
+		if selected.is_some() {
+			tokio::time::timeout(Duration::from_secs(120), entered.acquire())
+				.await
+				.unwrap()
+				.unwrap()
+				.forget();
+			assert!(!job.is_finished());
+			child_reached(&step);
+		}
+		panic!("the sweep ended short of {step}: {:?}", job.await);
+	}
+	let test = concat!(
+		module_path!(),
+		"::a_gc_killed_at_each_boundary_resumes_on_a_ring_that_outlived_it"
+	)
+	.trim_start_matches("wendelon::");
+	for (step, snapshot) in [
+		("mark-unsent", false),
+		("mark-unanswered", false),
+		("entry", false),
+		("preunlink", false),
+		("unlink", false),
+		("fsync", false),
+		("complete-unsent", false),
+		("complete-unanswered", false),
+		("clear", false),
+		("cleared", false),
+		("mark-unanswered", true),
+		("preunlink", true),
+		("complete-unanswered", true),
+		("clear", true),
+	] {
+		let dir = fresh_dir("gc-kill-boundary");
+		let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+		command
+			.args([test, "--exact", "--nocapture"])
+			.env(CHILD_DIR, dir.as_os_str())
+			.env(CHILD_STEP, step);
+		let cluster = control_cluster_observing(&[]).await;
+		let child = tokio::spawn(async move {
+			crate::test_support::run_test_child(&mut command, Duration::from_secs(180)).await
+		});
+		let output = serve_child_ring(dir.to_path_buf(), &cluster, child).await;
+		assert!(
+			output.status.success()
+				&& String::from_utf8_lossy(&output.stdout)
+					.contains(&format!("gc kill boundary reached: {step}")),
+			"{step}: {} {}",
+			String::from_utf8_lossy(&output.stdout),
+			String::from_utf8_lossy(&output.stderr)
+		);
+		let slab_id = SlabId::new(
+			std::fs::read_to_string(dir.join("gc-target"))
+				.unwrap()
+				.parse()
+				.unwrap(),
+		);
+		// §6.1, D7: this ring delivers to no store, so what a snapshot install might have
+		// skipped is exactly what recovery has to read for itself.
+		if snapshot {
+			install_a_peers_snapshot(&cluster).await;
+		}
+		let plain = Arc::new(op_committer(&cluster, 1));
+		let gc = reopen_on_ring(dir, cluster, slab_id, plain).await;
+		std::fs::write(gc.dir.join("gc-job"), "0").unwrap();
+		gc.finish(step).await;
+		let key = id(0xdd10);
+		let current = gc.mgr.lookup(tenant(), key).unwrap().unwrap();
+		assert_ne!(current.slab_id, slab_id, "{step}");
+		assert_eq!(
+			gc.mgr.read(current).await.unwrap(),
+			b"gc-survivor",
+			"{step}"
+		);
+		gc.close().await;
+	}
+}
+
+/// A reader's pin, or a run no longer what the removal names, stops a resumed disposal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pinned_run_stops_a_resumed_disposal() {
+	let gc = reopen_gc_at(GcStop::BeforeUnlink).await;
+	let pin = gc.mgr.slab_pins.acquire(&[gc.slab_id]).unwrap();
+	gc.assert_fences(gc.plain.clone()).await;
+	drop(pin);
+	gc.finish("after the reader").await;
+	gc.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_changed_run_stops_a_resumed_disposal() {
+	let gc = reopen_gc_at(GcStop::AfterUnlink).await;
+	let index = gc.mgr.require_op_index().unwrap();
+	let mut run = gc
+		.mgr
+		.compaction_manifest_snapshot()
+		.run(gc.slab_id)
+		.unwrap()
+		.clone();
+	run.state = SlabState::Retired {
+		successors: Default::default(),
+	};
+	index
+		.apply(PersistentIndexUpdate {
+			put_lsm_runs: vec![run],
+			..Default::default()
+		})
+		.await
+		.unwrap();
+	let gc = gc.reopen().await;
+	gc.assert_fences(gc.plain.clone()).await;
+	gc.close().await;
+}
+
+/// A durable row naming the run stops a resumed disposal, whatever memory says.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_durable_row_stops_a_resumed_disposal() {
+	let gc = reopen_gc_at(GcStop::AfterUnlink).await;
+	let index = gc.mgr.require_op_index().unwrap();
+	let mut row = index
+		.load_snapshot()
+		.await
+		.unwrap()
+		.record_rows
+		.first()
+		.cloned()
+		.expect("premise: a live row elsewhere");
+	row.location.slab_id = gc.slab_id;
+	index
+		.apply(PersistentIndexUpdate {
+			put_records: vec![row],
+			..Default::default()
+		})
+		.await
+		.unwrap();
+	gc.assert_fences(gc.plain.clone()).await;
+	gc.close().await;
+}
+
+/// The first row of the table, in one open: its disposal's first write was cut, and the
+/// workflow is gone. The driver restarts it against the authority the mark left, and only
+/// if that authority is still what it finds.
+async fn gc_cut_before_it_recorded() -> ReopenedGc {
+	let gc = reopen_gc_at(GcStop::MarkHandedOff).await;
+	let index = gc.mgr.require_op_index().unwrap();
+	index.cut_next_op_txn(crate::storage::index::OpTxnCut::BeforeCommit);
+	assert!(
+		gc.mgr
+			.sweep_lsm_delete_pending_once_via_control_ring(&new_gc(&gc.mgr), gc.plain.as_ref())
+			.await
+			.is_err(),
+		"the cut lands"
+	);
+	let rows = gc.rows().await;
+	assert!(
+		rows[0].progress().is_none(),
+		"premise: nothing recorded: {rows:?}"
+	);
+	gc
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_disposal_cut_before_it_recorded_restarts_from_the_driver() {
+	let gc = gc_cut_before_it_recorded().await;
+	gc.finish("a restart").await;
+	gc.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_changed_authority_stops_a_restarted_disposal() {
+	let gc = gc_cut_before_it_recorded().await;
+	gc.mgr.bump_slab_publication_revision(gc.slab_id).unwrap();
+	gc.assert_fences(gc.plain.clone()).await;
+	gc.close().await;
+}
+
+/// A pass cancelled while its stage is parked: the stage keeps its row's ownership until
+/// it can no longer write, and then finishes on its own.
+async fn assert_aborted_removal_pass_keeps_ownership(stop: GcStop, purge: bool) {
+	let gc = reopen_gc_at(stop).await;
+	let seq = gc.rows().await[0].key().op_seq;
+	let entered = Arc::new(tokio::sync::Semaphore::new(0));
+	let release = Arc::new(tokio::sync::Semaphore::new(0));
+	let hold = Some((entered.clone(), release.clone()));
+	let holds = &gc.mgr.continuity_test_holds;
+	if purge {
+		*holds.gc_before_clear_hold.lock().unwrap() = hold;
+	} else {
+		*holds.gc_before_unlink_hold.lock().unwrap() = hold;
+	}
+	let driver = Arc::new(gc.driver(gc.plain.clone()));
+	let pass = {
+		let driver = driver.clone();
+		tokio::spawn(async move { driver.drive_once().await })
+	};
+	tokio::time::timeout(Duration::from_secs(60), entered.acquire())
+		.await
+		.unwrap()
+		.unwrap()
+		.forget();
+	pass.abort();
+	let _ = pass.await;
+	let index = gc.mgr.require_op_index().unwrap();
+	assert!(
+		index.try_acquire_ops(vec![seq]).is_none(),
+		"{stop:?}: the aborted pass's stage still owns its row"
+	);
+	release.add_permits(8);
+	let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+	loop {
+		let free = index.try_acquire_ops(vec![seq]);
+		if free.is_some() {
+			break;
+		}
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"{stop:?}: never released"
+		);
+		tokio::task::yield_now().await;
+	}
+	gc.finish(stop).await;
+	gc.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_aborted_removal_resume_keeps_its_ownership_through_its_stage() {
+	assert_aborted_removal_pass_keeps_ownership(GcStop::BeforeUnlink, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_aborted_removal_finish_keeps_its_ownership_through_its_stage() {
+	assert_aborted_removal_pass_keeps_ownership(GcStop::CompleteAppliedAnswerLost, true).await;
+}
+
+/// Past its run drop a live sweep has no scope left, and still owns its row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_recovery_pass_leaves_a_live_sweep_past_its_run_drop() {
+	let dir = fresh_dir("s5-live-past-drop");
+	let owner = DataDirectoryOwner::acquire_existing(&dir).unwrap();
+	let mgr =
+		SlabManager::initialize_new_store_with_owner(gc_owned_test_config(&dir), owner.clone())
+			.await
+			.unwrap();
+	let (slab_id, _key) = seed_small_retired_gc_slab(&mgr).await;
+	let cluster = control_cluster_observing(&[(1, &mgr)]).await;
+	register_owner(&cluster.nodes[0], &mgr).await;
+	let plain = Arc::new(op_committer(&cluster, 1));
+	let entered = Arc::new(tokio::sync::Semaphore::new(0));
+	let release = Arc::new(tokio::sync::Semaphore::new(0));
+	*mgr.continuity_test_holds
+		.gc_before_clear_hold
+		.lock()
+		.unwrap() = Some((entered.clone(), release.clone()));
+	let sweep = {
+		let (mgr, plain) = (mgr.clone(), plain.clone());
+		tokio::spawn(async move {
+			mgr.sweep_lsm_delete_pending_once_via_control_ring(&new_gc(&mgr), plain.as_ref())
+				.await
+		})
+	};
+	tokio::time::timeout(Duration::from_secs(60), entered.acquire())
+		.await
+		.unwrap()
+		.unwrap()
+		.forget();
+	let index = mgr.require_op_index().unwrap();
+	let rows = index.load_op_intents().await.unwrap();
+	assert!(
+		matches!(
+			rows[0].progress(),
+			Some(crate::storage::index::OpProgress::Purged(_))
+		),
+		"premise: past its purge: {rows:?}"
+	);
+	// The sweep is parked. Nothing else may park here, so a pass that took this row
+	// would finish it and be seen to.
+	*mgr.continuity_test_holds
+		.gc_before_clear_hold
+		.lock()
+		.unwrap() = None;
+	let driver = op_driver(&cluster, &mgr, plain.clone());
+	// Recovery comes first in a pass. Its Ack then waits for this sweep's lease, as
+	// anything that applies does, so the pass may not end while the sweep is parked here.
+	let _ = tokio::time::timeout(Duration::from_secs(2), driver.drive_once()).await;
+	assert_eq!(
+		index.load_op_intents().await.unwrap(),
+		rows,
+		"a pass took the row"
+	);
+	release.add_permits(8);
+	assert_eq!(
+		tokio::time::timeout(Duration::from_secs(60), sweep)
+			.await
+			.unwrap()
+			.unwrap()
+			.unwrap(),
+		vec![slab_id]
+	);
+	let _ = owner.close(Duration::from_secs(2)).await;
+}
+
+/// The write boundary decides, not the scan that chose the work: a stale linked intent
+/// drops no run, and a phase its row does not follow is not written. Everything survives
+/// to resume from what the row really says.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stale_intent_or_phase_is_refused_at_the_resume_boundary() {
+	use crate::consensus::slab_ops::SlabCommand;
+	use crate::storage::index::{OpProgress, OpProgressUpdate};
+	let gc = reopen_gc_at(GcStop::AfterUnlink).await;
+	let index = gc.mgr.require_op_index().unwrap();
+	let rows = gc.rows().await;
+	let SlabCommand::GcRemove(remove) = rows[0].command().clone() else {
+		panic!("a removal: {rows:?}");
+	};
+	let Some(OpProgress::QuarantineRecorded(file)) = rows[0].progress().cloned() else {
+		panic!("recorded: {rows:?}");
+	};
+	let (key, digest) = (rows[0].key(), rows[0].digest());
+	for progress in [
+		OpProgress::Purged(file.clone()),
+		OpProgress::PurgeAuthorized(file.clone()),
+		OpProgress::RunDropped(Some(crate::storage::index::GcFileIdentity {
+			length: file.length + 1,
+			..file.clone()
+		})),
+	] {
+		assert!(
+			index
+				.advance_op_progress(
+					OpProgressUpdate {
+						key,
+						digest,
+						progress: progress.clone(),
+					},
+					None
+				)
+				.await
+				.is_err(),
+			"{progress:?} does not follow its row"
+		);
+		assert_eq!(gc.rows().await, rows, "{progress:?}");
+	}
+	let mut stale = index
+		.load_snapshot()
+		.await
+		.unwrap()
+		.lsm_install_intents
+		.into_iter()
+		.find(|intent| intent.commit.job_id == remove.job_id)
+		.expect("its linked intent");
+	stale.commit_digest = [9; 32];
+	let ownership = index.try_acquire_ops(vec![key.op_seq]).unwrap();
+	gc.mgr
+		.clone()
+		.gc_resume_disposal(remove, key, digest, stale, file, ownership)
+		.await
+		.unwrap_err();
+	assert_eq!(gc.rows().await, rows, "the row did not move");
+	assert!(
+		index
+			.load_snapshot()
+			.await
+			.unwrap()
+			.lsm_runs
+			.iter()
+			.any(|run| run.slab_id == gc.slab_id),
+		"the run was not dropped"
+	);
+	let gc = gc.reopen().await;
+	gc.finish("after the refusal").await;
+	gc.close().await;
+}
+
+/// R2: a stale linked intent is refused while the original is still here, with nothing
+/// moved: no link, no unlink, no phase, and both names as they were.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stale_intent_is_refused_before_the_original_is_touched() {
+	use crate::consensus::slab_ops::SlabCommand;
+	use crate::storage::index::OpProgress;
+	for entry_present in [true, false] {
+		let gc = reopen_gc_at(GcStop::BeforeUnlink).await;
+		if !entry_present {
+			std::fs::remove_file(gc.entry()).unwrap();
+		}
+		let index = gc.mgr.require_op_index().unwrap();
+		let rows = gc.rows().await;
+		let SlabCommand::GcRemove(remove) = rows[0].command().clone() else {
+			panic!("a removal: {rows:?}");
+		};
+		let Some(OpProgress::QuarantineRecorded(file)) = rows[0].progress().cloned() else {
+			panic!("recorded: {rows:?}");
+		};
+		let mut stale = index
+			.load_snapshot()
+			.await
+			.unwrap()
+			.lsm_install_intents
+			.into_iter()
+			.find(|intent| intent.commit.job_id == remove.job_id)
+			.expect("its linked intent");
+		stale.commit_digest = [9; 32];
+		let ownership = index.try_acquire_ops(vec![rows[0].key().op_seq]).unwrap();
+		gc.mgr
+			.clone()
+			.gc_resume_disposal(
+				remove,
+				rows[0].key(),
+				rows[0].digest(),
+				stale,
+				file,
+				ownership,
+			)
+			.await
+			.unwrap_err();
+		assert_eq!(gc.rows().await, rows, "the row did not move");
+		assert!(gc.original().exists(), "the original was touched");
+		assert_eq!(gc.entry().exists(), entry_present, "a link was made");
+		gc.finish("after the refusal").await;
+		gc.close().await;
+	}
+}
+
+/// R2: a purge's phase is the row's, or nothing is purged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stale_purge_phase_is_refused_before_the_entry_is_touched() {
+	use crate::consensus::slab_ops::SlabCommand;
+	use crate::storage::index::OpProgress;
+	let gc = reopen_gc_at(GcStop::CompleteAppliedAnswerLost).await;
+	let index = gc.mgr.require_op_index().unwrap();
+	let rows = gc.rows().await;
+	let LoadedOp::Submittable(ticket) = rows[0].clone() else {
+		panic!("submitted: {rows:?}");
+	};
+	let SlabCommand::GcRemove(remove) = ticket.command().clone() else {
+		panic!("a removal");
+	};
+	let Some(OpProgress::RunDropped(Some(file))) = rows[0].progress().cloned() else {
+		panic!("dropped: {rows:?}");
+	};
+	for phase in [
+		OpProgress::PurgeAuthorized(file.clone()),
+		OpProgress::Purged(file.clone()),
+		OpProgress::RunDropped(None),
+	] {
+		let ownership = index.try_acquire_ops(vec![ticket.key().op_seq]).unwrap();
+		gc.mgr
+			.clone()
+			.gc_finish_removal(remove.clone(), ticket.clone(), phase.clone(), ownership)
+			.await
+			.unwrap_err();
+		assert_eq!(gc.rows().await, rows, "{phase:?}: the row did not move");
+		assert!(gc.entry().exists(), "{phase:?}: the entry was touched");
+	}
+	gc.finish("after the refusal").await;
+	gc.close().await;
+}
+
+/// R1: only NotFound is absence. A lookup that failed says nothing about what is there, so
+/// a removal does not advance on it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_lookup_is_not_absence() {
+	use std::os::unix::fs::PermissionsExt;
+	for stop in [
+		GcStop::AfterUnlink,
+		GcStop::CompleteAppliedAnswerLost,
+		GcStop::PurgeAuthorizedEntryPresent,
+		GcStop::PurgeAuthorizedEntryGone,
+		GcStop::Purged,
+	] {
+		let gc = reopen_gc_at(stop).await;
+		let rows = gc.rows().await;
+		let before = std::fs::metadata(&*gc.dir).unwrap().permissions();
+		std::fs::set_permissions(&*gc.dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+		assert_eq!(
+			std::fs::symlink_metadata(gc.original()).unwrap_err().kind(),
+			ErrorKind::PermissionDenied,
+			"premise: a failed lookup, not an absent file (does this run as root?)"
+		);
+		let driver = gc.driver(gc.plain.clone());
+		let outcome = driver.drive_once().await;
+		let after = gc.rows().await;
+		std::fs::set_permissions(&*gc.dir, before).unwrap();
+		assert!(outcome.is_err(), "{stop:?}: it is unresolved");
+		assert_eq!(after, rows, "{stop:?}: it advanced on a failed lookup");
+		gc.finish(stop).await;
+		gc.close().await;
+	}
+}
+
+/// R2 for the two other stages that mutate: a fresh disposal and a mark's postimage.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stale_intent_is_refused_before_a_fresh_disposal_starts() {
+	use crate::consensus::slab_ops::SlabCommand;
+	let gc = gc_cut_before_it_recorded().await;
+	let index = gc.mgr.require_op_index().unwrap();
+	let rows = gc.rows().await;
+	let SlabCommand::GcRemove(remove) = rows[0].command().clone() else {
+		panic!("a removal: {rows:?}");
+	};
+	let durable = index.load_snapshot().await.unwrap();
+	let mut stale = durable
+		.lsm_install_intents
+		.iter()
+		.find(|intent| intent.commit.job_id == remove.job_id)
+		.cloned()
+		.expect("its linked intent");
+	stale.commit_digest = [9; 32];
+	let run = gc
+		.mgr
+		.compaction_manifest_snapshot()
+		.run(gc.slab_id)
+		.unwrap()
+		.clone();
+	// The authority as it stands: only the stale intent is wrong here.
+	let expected = {
+		let lock = gc.mgr.tier_publication_lock(gc.slab_id);
+		let _guard = lock.lock().await;
+		gc.mgr
+			.lsm_input_authority_locked(&[gc.slab_id])
+			.await
+			.unwrap()
+	};
+	let file = gc.mgr.gc_read_original_identity(gc.slab_id).await.unwrap();
+	let ownership = index.try_acquire_ops(vec![rows[0].key().op_seq]).unwrap();
+	let refused = gc
+		.mgr
+		.clone()
+		.gc_dispose_run(
+			remove,
+			rows[0].key(),
+			rows[0].digest(),
+			expected,
+			run,
+			stale,
+			file,
+			ownership,
+		)
+		.await;
+	assert!(refused.is_err(), "a stale intent is refused");
+	assert_eq!(gc.rows().await, rows, "the row did not move");
+	assert!(gc.original().exists(), "the original was touched");
+	assert!(!gc.entry().exists(), "a link was made");
+	gc.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stale_intent_is_refused_before_a_marks_postimage() {
+	use crate::consensus::slab_ops::{OpKey, SlabCommand};
+	let dir = fresh_dir("s5-stale-mark");
+	let owner = DataDirectoryOwner::acquire_existing(&dir).unwrap();
+	let mgr =
+		SlabManager::initialize_new_store_with_owner(gc_owned_test_config(&dir), owner.clone())
+			.await
+			.unwrap();
+	let (slab_id, _key) = seed_small_retired_gc_slab(&mgr).await;
+	let cluster = control_cluster_observing(&[(1, &mgr)]).await;
+	register_owner(&cluster.nodes[0], &mgr).await;
+	let plain = Arc::new(op_committer(&cluster, 1));
+	let losing = LosesMarkResponse(plain.clone());
+	let _ = mgr
+		.sweep_lsm_delete_pending_once_via_control_ring(&new_gc(&mgr), &losing)
+		.await;
+	let index = mgr.require_op_index().unwrap();
+	let rows = index.load_op_intents().await.unwrap();
+	let LoadedOp::Submittable(mark) = rows[0].clone() else {
+		panic!("the mark: {rows:?}");
+	};
+	let SlabCommand::Compaction(commit) = mark.command() else {
+		panic!("the mark's command");
+	};
+	let mut stale = index
+		.load_snapshot()
+		.await
+		.unwrap()
+		.lsm_install_intents
+		.into_iter()
+		.find(|intent| intent.commit.job_id == commit.job_id)
+		.expect("its linked intent");
+	let removal: OpKey = stale
+		.ops
+		.iter()
+		.find(|key| **key != mark.key())
+		.copied()
+		.unwrap();
+	let pre_run = stale.local_input_runs[0].clone();
+	stale.commit_digest = [9; 32];
+	let before = mgr.compaction_manifest_snapshot().run(slab_id).cloned();
+	let ownership = index
+		.try_acquire_ops(vec![mark.key().op_seq, removal.op_seq])
+		.unwrap();
+	let refused = mgr
+		.clone()
+		.gc_complete_mark(mark.clone(), removal, stale, pre_run, ownership)
+		.await;
+	assert!(refused.is_err(), "a stale intent is refused");
+	assert_eq!(index.load_op_intents().await.unwrap(), rows);
+	assert_eq!(
+		mgr.compaction_manifest_snapshot().run(slab_id).cloned(),
+		before,
+		"memory took a postimage"
+	);
+	let _ = owner.close(Duration::from_secs(2)).await;
+}
+
+// ADR 0697 slice 5, stage 3: an LSM install resumes on the ring that decided it, after
+// the store went away at each cut. The commit, the outputs and the keys are real.
+
+struct ReopenedInstall {
+	dir: crate::test_support::TestDir,
+	mgr: Arc<SlabManager>,
+	owner: DataDirectoryOwner,
+	cluster: ControlCluster,
+	plain: Arc<crate::storage::RaftCommitter>,
+	keys: [Identity; 2],
+	inputs: [SlabId; 2],
+	intent: crate::storage::index::LsmInstallIntent,
+}
+
+/// Interrupt a real control install at `cut` on a real ring, and reopen against that ring.
+async fn reopen_install_at(cut: lsm_driver::ControlLsmInstallCut) -> ReopenedInstall {
+	reopen_install_seeded(cut, async |manager, keys| {
+		manager
+			.append_durable(tenant(), keys[0], hlc(1), b"b11b-first")
+			.await
+			.unwrap();
+		let first = manager.force_seal_active_for_test().await;
+		manager
+			.append_durable(tenant(), keys[1], hlc(2), b"b11b-second")
+			.await
+			.unwrap();
+		[first, manager.force_seal_active_for_test().await]
+	})
+	.await
+}
+
+async fn reopen_install_with_config(
+	cut: lsm_driver::ControlLsmInstallCut,
+	config: LsmConfig,
+) -> ReopenedInstall {
+	reopen_install_seeded_with(cut, config, async |manager, keys| {
+		manager
+			.append_durable(tenant(), keys[0], hlc(1), b"b11b-first")
+			.await
+			.unwrap();
+		let first = manager.force_seal_active_for_test().await;
+		manager
+			.append_durable(tenant(), keys[1], hlc(2), b"b11b-second")
+			.await
+			.unwrap();
+		[first, manager.force_seal_active_for_test().await]
+	})
+	.await
+}
+
+async fn reopen_install_seeded(
+	cut: lsm_driver::ControlLsmInstallCut,
+	seed: impl AsyncFnOnce(&Arc<SlabManager>, [Identity; 2]) -> [SlabId; 2],
+) -> ReopenedInstall {
+	reopen_install_seeded_with(cut, LsmConfig::default(), seed).await
+}
+
+async fn reopen_install_seeded_with(
+	cut: lsm_driver::ControlLsmInstallCut,
+	config: LsmConfig,
+	seed: impl AsyncFnOnce(&Arc<SlabManager>, [Identity; 2]) -> [SlabId; 2],
+) -> ReopenedInstall {
+	reopen_install_retaining(cut, config, hlc(100), seed).await
+}
+
+async fn reopen_install_retaining(
+	cut: lsm_driver::ControlLsmInstallCut,
+	config: LsmConfig,
+	retention_floor: HybridTimestamp,
+	seed: impl AsyncFnOnce(&Arc<SlabManager>, [Identity; 2]) -> [SlabId; 2],
+) -> ReopenedInstall {
+	let dir = fresh_dir("s5-install");
+	let owner = DataDirectoryOwner::acquire_existing(&dir).unwrap();
+	let manager =
+		SlabManager::initialize_new_store_with_owner(gc_owned_test_config(&dir), owner.clone())
+			.await
+			.unwrap();
+	let cluster = control_cluster_observing(&[(1, &manager)]).await;
+	register_owner(&cluster.nodes[0], &manager).await;
+	let plain = Arc::new(op_committer(&cluster, 1));
+	let keys = [id(0xb11b01), id(0xb11b02)];
+	let [first, second] = seed(&manager, keys).await;
+	let snapshot = manager.compaction_manifest_snapshot();
+	let plan = CompactionPlan {
+		job_id: CompactionJobId::new(0xb11b),
+		source_level: CompactionLevelIndex::L0,
+		target_level: CompactionLevelIndex::L1,
+		manifest_epoch_pre: snapshot.manifest_epoch,
+		input_slabs: vec![first, second],
+		overlapping_slabs: Vec::new(),
+		retention_floor_snapshot: retention_floor,
+		compaction_start_hlc: hlc(101),
+		dominant_reason: crate::storage::DominantReason::Operator,
+	};
+	let entered = Arc::new(tokio::sync::Semaphore::new(0));
+	let release = Arc::new(tokio::sync::Semaphore::new(0));
+	*manager.lsm_control_install_hold.lock().unwrap() =
+		Some((cut, entered.clone(), release.clone()));
+	let task = {
+		let (manager, plain) = (manager.clone(), plain.clone());
+		tokio::spawn(async move {
+			let worker = LsmCompactionWorker::new(config, manager.slab_pin_table()).unwrap();
+			manager
+				.run_lsm_compaction_once_via_control_ring(&worker, plan, plain.as_ref())
+				.await
+		})
+	};
+	let mut task = task;
+	tokio::select! {
+		reached = entered.acquire() => reached.unwrap().forget(),
+		result = &mut task => panic!("the install returned before {cut:?}: {result:?}"),
+		_ = tokio::time::sleep(Duration::from_secs(60)) => panic!("the install never reached {cut:?}"),
+	}
+	let intent = manager
+		.require_op_index()
+		.unwrap()
+		.load_snapshot()
+		.await
+		.unwrap()
+		.lsm_install_intents
+		.remove(0);
+	// It stops here. Releasing it would carry on to the ring whatever the owner is doing.
+	task.abort();
+	let _ = task.await;
+	drop(release);
+	let _ = owner.close(Duration::from_secs(5)).await;
+	let next = DataDirectoryOwner::acquire_existing(&dir).expect("released");
+	let mgr = SlabManager::open_with_owner(gc_owned_test_config(&dir), next.clone())
+		.await
+		.unwrap();
+	mgr.bind_control_node(1).unwrap();
+	mgr.bind_canonical_tier_source(cluster.state_machines[0].tier_snapshot_source_for_test());
+	// A control is worth what its starting point is.
+	let rows = mgr
+		.require_op_index()
+		.unwrap()
+		.load_op_intents()
+		.await
+		.unwrap();
+	let view = plain
+		.op_view(rows[0].key(), rows[0].digest(), rows[0].command().slabs())
+		.await
+		.unwrap();
+	let applied = matches!(
+		view.outcome,
+		crate::consensus::slab_ops::ViewOutcome::Recorded(
+			crate::consensus::slab_ops::RecordedOutcome::Applied { .. }
+		)
+	);
+	let output = intent.local_output_files[0].slab_id;
+	assert_eq!(
+		applied,
+		matches!(
+			cut,
+			lsm_driver::ControlLsmInstallCut::AfterAcceptance
+				| lsm_driver::ControlLsmInstallCut::AfterPublication
+		),
+		"{cut:?}: {view:?}"
+	);
+	assert_eq!(
+		slab_path(&dir, output).exists(),
+		cut != lsm_driver::ControlLsmInstallCut::BeforeRename,
+		"{cut:?}: its final path"
+	);
+	ReopenedInstall {
+		dir,
+		mgr,
+		owner: next,
+		cluster,
+		plain,
+		keys,
+		inputs: [first, second],
+		intent,
+	}
+}
+
+/// What `open` does with an output under a Prepared intent: the first thing stage 3 must
+/// know. Each cut says what this store holds in memory and on disk for each output.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn what_open_holds_for_an_install_output_at_each_cut() {
+	use lsm_driver::ControlLsmInstallCut as Cut;
+	for cut in [
+		Cut::BeforeRename,
+		Cut::AfterRename,
+		Cut::AfterAcceptance,
+		Cut::AfterPublication,
+	] {
+		let reopened = reopen_install_at(cut).await;
+		let mgr = &reopened.mgr;
+		let index = mgr.require_op_index().unwrap();
+		let durable = index.load_snapshot().await.unwrap();
+		for output in &reopened.intent.local_output_files {
+			let id = output.slab_id;
+			let (sealed, in_key_index) = {
+				let state = mgr.state.lock().await;
+				let sealed = state.sealed.contains_key(&id);
+				drop(state);
+				(
+					sealed,
+					mgr.key_index
+						.iter()
+						.flat_map(|entry| entry.value().clone())
+						.filter(|location| location.slab_id == id)
+						.count(),
+				)
+			};
+			println!(
+				"PROBE {cut:?} output {id:?}: final {} temp {} manifest {} durable-run {} durable-rows {} sealed {sealed} key-index {in_key_index} reservation {:?}",
+				slab_path(&reopened.dir, id).exists(),
+				lsm_driver::lsm_compaction_tmp_path(
+					&reopened.dir,
+					reopened.intent.commit.job_id,
+					id
+				)
+				.exists(),
+				mgr.compaction_manifest_snapshot().run(id).is_some(),
+				durable.lsm_runs.iter().any(|run| run.slab_id == id),
+				durable
+					.record_rows
+					.iter()
+					.filter(|row| row.location.slab_id == id)
+					.count(),
+				index.reserved_id_state(id).await,
+			);
+		}
+		println!(
+			"PROBE {cut:?} rows {:?} intents {} reason {:?} input-rows {} view {:?}",
+			index
+				.load_op_intents()
+				.await
+				.unwrap()
+				.iter()
+				.map(|op| (
+					op.key().op_seq,
+					op.progress().is_some(),
+					matches!(op, LoadedOp::Submittable(_))
+				))
+				.collect::<Vec<_>>(),
+			durable.lsm_install_intents.len(),
+			mgr.tier_authority_readiness_reason(),
+			durable
+				.record_rows
+				.iter()
+				.filter(|row| reopened.inputs.contains(&row.location.slab_id))
+				.count(),
+			index
+				.load_op_intents()
+				.await
+				.unwrap()
+				.first()
+				.map(|op| op.key()),
+		);
+		let _ = reopened.owner.close(Duration::from_secs(2)).await;
+	}
+}
+
+/// `open` under an unresolved intent skips what a clean open does: dropping non-live rows
+/// from memory and rebuilding the durable mirror. Resolving the intent in that process has
+/// to finish them, or a ready store serves with them undone. RED first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resolving_the_last_intent_finishes_what_its_open_deferred() {
+	let dir = fresh_dir("s5-deferred-open");
+	let owner = DataDirectoryOwner::acquire_existing(&dir).unwrap();
+	let mgr =
+		SlabManager::initialize_new_store_with_owner(gc_owned_test_config(&dir), owner.clone())
+			.await
+			.unwrap();
+	let (slab_id, _key) = seed_small_retired_gc_slab(&mgr).await;
+	let cluster = control_cluster_observing(&[(1, &mgr)]).await;
+	register_owner(&cluster.nodes[0], &mgr).await;
+	let plain = Arc::new(op_committer(&cluster, 1));
+	let losing = LosesMarkResponse(plain.clone());
+	let _ = mgr
+		.sweep_lsm_delete_pending_once_via_control_ring(&new_gc(&mgr), &losing)
+		.await;
+	owner.close(Duration::from_secs(5)).await.unwrap();
+	let gc = reopen_on_ring(dir, cluster, slab_id, plain).await;
+	let named = |mgr: &SlabManager| {
+		mgr.key_index
+			.iter()
+			.flat_map(|entry| entry.value().clone())
+			.filter(|location| location.slab_id == slab_id)
+			.count()
+	};
+	assert_ne!(
+		named(&gc.mgr),
+		0,
+		"premise: this open left the retired rows in memory"
+	);
+	std::fs::write(gc.dir.join("gc-job"), "0").unwrap();
+	gc.finish("a deferred open").await;
+	assert_eq!(
+		named(&gc.mgr),
+		0,
+		"a ready store still names a slab that is gone"
+	);
+	gc.close().await;
+}
+
+impl ReopenedInstall {
+	async fn rows(&self) -> Vec<LoadedOp> {
+		self.mgr
+			.require_op_index()
+			.unwrap()
+			.load_op_intents()
+			.await
+			.unwrap()
+	}
+
+	fn output(&self) -> SlabId {
+		self.intent.local_output_files[0].slab_id
+	}
+
+	/// Drive until this install's rows, intent and reservation are gone. The inputs serve,
+	/// no output is anywhere, and a later reopen finds nothing to do.
+	async fn assert_rejected_install_ends(self, label: impl std::fmt::Debug) {
+		let index = self.mgr.require_op_index().unwrap();
+		let driver = op_driver(&self.cluster, &self.mgr, self.plain.clone());
+		let mut last = Ok(());
+		for _ in 0..16 {
+			last = driver.drive_once().await;
+			if self.rows().await.is_empty()
+				&& index
+					.reserved_id_state(self.output())
+					.await
+					.unwrap()
+					.is_none()
+			{
+				break;
+			}
+		}
+		let rows = self.rows().await;
+		assert!(rows.is_empty(), "{label:?}: {last:?}: {rows:?}");
+		assert_eq!(
+			index.reserved_id_state(self.output()).await.unwrap(),
+			None,
+			"{label:?}"
+		);
+		let durable = index.load_snapshot().await.unwrap();
+		assert!(durable.lsm_install_intents.is_empty(), "{label:?}");
+		assert!(
+			!durable
+				.lsm_runs
+				.iter()
+				.any(|run| run.slab_id == self.output()),
+			"{label:?}"
+		);
+		assert!(
+			!slab_path(&self.dir, self.output()).exists(),
+			"{label:?}: at its final path"
+		);
+		assert!(
+			!lsm_driver::lsm_compaction_tmp_path(
+				&self.dir,
+				self.intent.commit.job_id,
+				self.output()
+			)
+			.exists(),
+			"{label:?}: at its temp path"
+		);
+		assert!(
+			!super::reservations::abandoned_output_path(&self.dir, self.output()).exists(),
+			"{label:?}: at its abandoned name"
+		);
+		assert_eq!(
+			self.mgr.tier_authority_readiness_reason(),
+			None,
+			"{label:?}: readiness returned"
+		);
+		for (key, bytes) in self
+			.keys
+			.into_iter()
+			.zip([b"b11b-first".as_slice(), b"b11b-second".as_slice()])
+		{
+			let location = self.mgr.lookup(tenant(), key).unwrap().unwrap();
+			assert!(
+				self.inputs.contains(&location.slab_id),
+				"{label:?}: from its input"
+			);
+			assert_eq!(self.mgr.read(location).await.unwrap(), bytes, "{label:?}");
+		}
+		assert_memory_matches_a_fresh_open(&self.dir, self.mgr, self.owner, label).await;
+	}
+}
+
+/// No decision: Cancel by its digest, and the Rejected path from wherever its file stood.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_undecided_install_cancels_from_its_temp_file_after_a_reopen() {
+	reopen_install_at(lsm_driver::ControlLsmInstallCut::BeforeRename)
+		.await
+		.assert_rejected_install_ends("temp")
+		.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_undecided_install_cancels_from_its_final_path_after_a_reopen() {
+	reopen_install_at(lsm_driver::ControlLsmInstallCut::AfterRename)
+		.await
+		.assert_rejected_install_ends("final")
+		.await;
+}
+
+/// A relocation that stopped between its link and its unlink resumes, and one that
+/// finished keeps its abandoned name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rejected_install_resumes_a_relocation_at_either_name() {
+	for unlinked in [false, true] {
+		let reopened = reopen_install_at(lsm_driver::ControlLsmInstallCut::AfterRename).await;
+		let (path, moved) = (
+			slab_path(&reopened.dir, reopened.output()),
+			super::reservations::abandoned_output_path(&reopened.dir, reopened.output()),
+		);
+		std::fs::hard_link(&path, &moved).unwrap();
+		if unlinked {
+			std::fs::remove_file(&path).unwrap();
+		}
+		reopened.assert_rejected_install_ends(unlinked).await;
+	}
+}
+
+/// Every name found must be the recorded file, or nothing moves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rejected_install_with_a_changed_output_moves_nothing() {
+	let reopened = reopen_install_at(lsm_driver::ControlLsmInstallCut::AfterRename).await;
+	let path = slab_path(&reopened.dir, reopened.output());
+	let mut bytes = std::fs::read(&path).unwrap();
+	bytes[0] ^= 0xff;
+	std::fs::write(&path, &bytes).unwrap();
+	let driver = op_driver(&reopened.cluster, &reopened.mgr, reopened.plain.clone());
+	let rows = reopened.rows().await;
+	assert_eq!(
+		driver.drive_once().await.unwrap_err().kind(),
+		ErrorKind::WouldBlock
+	);
+	assert_eq!(reopened.rows().await, rows);
+	assert_eq!(std::fs::read(&path).unwrap(), bytes, "the output stays");
+	assert!(!super::reservations::abandoned_output_path(&reopened.dir, reopened.output()).exists());
+	let _ = reopened.owner.close(Duration::from_secs(2)).await;
+}
+
+/// §6: a rejected decision against a durable postimage is a contradiction.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rejected_decision_on_a_published_install_fences() {
+	let reopened = reopen_install_at(lsm_driver::ControlLsmInstallCut::AfterPublication).await;
+	let forged = ForgedView::new(reopened.plain.clone(), forge_rejected);
+	let driver = op_driver(&reopened.cluster, &reopened.mgr, forged.clone());
+	let rows = reopened.rows().await;
+	assert_eq!(
+		driver.drive_once().await.unwrap_err().kind(),
+		ErrorKind::WouldBlock
+	);
+	assert_eq!(reopened.rows().await, rows);
+	assert_eq!(forged.submitted.load(Ordering::SeqCst), 0);
+	assert!(
+		slab_path(&reopened.dir, reopened.output()).exists(),
+		"never relocated"
+	);
+	let _ = reopened.owner.close(Duration::from_secs(2)).await;
+}
+
+/// A view saying rejected is not the ring's rejection: the lease reads the ring.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_view_saying_rejected_moves_no_output_without_the_rings_decision() {
+	let reopened = reopen_install_at(lsm_driver::ControlLsmInstallCut::AfterRename).await;
+	let forged = ForgedView::new(reopened.plain.clone(), forge_rejected);
+	let driver = op_driver(&reopened.cluster, &reopened.mgr, forged);
+	let rows = reopened.rows().await;
+	assert_eq!(
+		driver.drive_once().await.unwrap_err().kind(),
+		ErrorKind::WouldBlock
+	);
+	assert_eq!(reopened.rows().await, rows);
+	assert!(slab_path(&reopened.dir, reopened.output()).exists());
+	let _ = reopened.owner.close(Duration::from_secs(2)).await;
+}
+
+/// A conflict, a prefix anomaly, and a superseded owner each move nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_conflict_or_prefix_anomaly_fences_an_install() {
+	for forge in [forge_conflict, forge_prefix_past] {
+		let reopened = reopen_install_at(lsm_driver::ControlLsmInstallCut::AfterRename).await;
+		let forged = ForgedView::new(reopened.plain.clone(), forge);
+		let driver = op_driver(&reopened.cluster, &reopened.mgr, forged.clone());
+		let rows = reopened.rows().await;
+		assert_eq!(
+			driver.drive_once().await.unwrap_err().kind(),
+			ErrorKind::WouldBlock
+		);
+		assert_eq!(reopened.rows().await, rows);
+		assert_eq!(forged.submitted.load(Ordering::SeqCst), 0);
+		assert!(slab_path(&reopened.dir, reopened.output()).exists());
+		let _ = reopened.owner.close(Duration::from_secs(2)).await;
+	}
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_superseded_store_recovers_no_install() {
+	let reopened = reopen_install_at(lsm_driver::ControlLsmInstallCut::AfterRename).await;
+	supersede_store(
+		&reopened.cluster.nodes[0],
+		reopened.mgr.owner_ref().unwrap(),
+	)
+	.await;
+	let rows = reopened.rows().await;
+	reopened
+		.mgr
+		.recover_abandoned_installs(reopened.plain.as_ref())
+		.await
+		.unwrap();
+	assert_eq!(reopened.rows().await, rows);
+	assert!(slab_path(&reopened.dir, reopened.output()).exists());
+	let _ = reopened.owner.close(Duration::from_secs(2)).await;
+}
+
+/// What a store knows in memory, without what differs by opening alone. A store that
+/// recovered in process and a fresh open of the same stopped directory must agree.
+async fn memory_picture(mgr: &SlabManager) -> Vec<(&'static str, String)> {
+	let mut tables = mgr
+		.table_by_location
+		.iter()
+		.map(|entry| format!("{:?}={:?}", entry.key(), entry.value()))
+		.collect::<Vec<_>>();
+	tables.sort();
+	let mut references = mgr
+		.table_references_by_slab
+		.iter()
+		.map(|entry| format!("{:?}={:?}", entry.key(), entry.value()))
+		.collect::<Vec<_>>();
+	references.sort();
+	let mut localities = mgr
+		.key_localities
+		.iter()
+		.map(|entry| format!("{:?}={:?}", entry.key(), entry.value()))
+		.collect::<Vec<_>>();
+	localities.sort();
+	let locality_index = {
+		let index =
+			crate::storage::manager::recover_rwlock_read(&mgr.locality_index, "locality_index");
+		format!(
+			"{:?}",
+			index
+				.iter()
+				.map(|(tenant, members)| (*tenant, members.iter().copied().collect::<Vec<_>>()))
+				.collect::<BTreeMap<_, _>>()
+		)
+	};
+	let mut conflicts = mgr
+		.conflicted_locations
+		.iter()
+		.map(|entry| format!("{:?}", entry.key()))
+		.collect::<Vec<_>>();
+	conflicts.sort();
+	let state = mgr.state.lock().await;
+	let mut sealed = state
+		.sealed
+		.iter()
+		.map(|entry| *entry.key())
+		.collect::<Vec<_>>();
+	drop(state);
+	sealed.sort_unstable();
+	let mut runs = mgr.compaction_manifest_snapshot().runs().to_vec();
+	runs.sort_unstable_by_key(|run| run.slab_id);
+	vec![
+		(
+			"rows",
+			format!("{:?}", mgr.persistent_record_rows_snapshot()),
+		),
+		("runs", format!("{runs:?}")),
+		("tables", format!("{tables:?}")),
+		("table references", format!("{references:?}")),
+		("key localities", format!("{localities:?}")),
+		("conflicts", format!("{conflicts:?}")),
+		("sealed", format!("{sealed:?}")),
+		(
+			"pending counters",
+			format!("{}", mgr.counter_pending_frames.len()),
+		),
+		("locality index", locality_index),
+		("sidecar references", {
+			let mut references = mgr
+				.secondary_index_table_references_by_slab
+				.iter()
+				.filter(|entry| !entry.value().is_empty())
+				.map(|entry| format!("{:?}={:?}", entry.key(), entry.value()))
+				.collect::<Vec<_>>();
+			references.sort();
+			format!("{references:?}")
+		}),
+		("sidecars", {
+			let mut sidecars = mgr
+				.secondary_index_segments
+				.iter()
+				.map(|entry| format!("{:?}", entry.key()))
+				.collect::<Vec<_>>();
+			sidecars.sort();
+			format!("{sidecars:?}")
+		}),
+	]
+}
+
+/// The differential control: stop this store, open its directory fresh, and compare.
+async fn assert_memory_matches_a_fresh_open(
+	dir: &crate::test_support::TestDir,
+	mgr: Arc<SlabManager>,
+	owner: DataDirectoryOwner,
+	label: impl std::fmt::Debug,
+) {
+	let recovered = memory_picture(&mgr).await;
+	let _ = owner.close(Duration::from_secs(5)).await;
+	drop(mgr);
+	let next = DataDirectoryOwner::acquire_existing(dir).expect("released");
+	let fresh = SlabManager::open_with_owner(gc_owned_test_config(dir), next.clone())
+		.await
+		.unwrap();
+	for ((name, recovered), (_, fresh)) in recovered.into_iter().zip(memory_picture(&fresh).await) {
+		assert_eq!(
+			recovered, fresh,
+			"{label:?}: {name} differs from a fresh open"
+		);
+	}
+	let _ = next.close(Duration::from_secs(2)).await;
+}
+
+impl ReopenedInstall {
+	async fn drive_until_ready(&self, label: impl std::fmt::Debug) {
+		let driver = op_driver(&self.cluster, &self.mgr, self.plain.clone());
+		let mut last = Ok(());
+		for _ in 0..16 {
+			last = driver.drive_once().await;
+			if self.rows().await.is_empty() && self.mgr.tier_authority_readiness_reason().is_none()
+			{
+				return;
+			}
+		}
+		panic!(
+			"{label:?}: {last:?}: {:?}, reason {:?}",
+			self.rows().await,
+			self.mgr.tier_authority_readiness_reason()
+		);
+	}
+
+	/// §9.3's exact rows: every key from its output, once, with its bytes, nothing left of
+	/// the inputs' rows or the reservation, and memory as a fresh open would build it.
+	async fn assert_applied_install_ends(self, label: impl std::fmt::Debug) {
+		self.drive_until_ready(&label).await;
+		let index = self.mgr.require_op_index().unwrap();
+		let durable = index.load_snapshot().await.unwrap();
+		assert!(durable.lsm_install_intents.is_empty(), "{label:?}");
+		assert_eq!(
+			index.reserved_id_state(self.output()).await.unwrap(),
+			None,
+			"{label:?}"
+		);
+		assert!(
+			!durable
+				.record_rows
+				.iter()
+				.any(|row| self.inputs.contains(&row.location.slab_id)),
+			"{label:?}: an input row survived"
+		);
+		assert!(
+			self.intent.commit.slabs_to_add.iter().all(|add| durable
+				.lsm_runs
+				.iter()
+				.any(|run| run.slab_id == add.slab_id && run.state.is_live())),
+			"{label:?}: its run is live"
+		);
+		for (key, bytes) in self
+			.keys
+			.into_iter()
+			.zip([b"b11b-first".as_slice(), b"b11b-second".as_slice()])
+		{
+			let versions = self.mgr.key_index.get(&(tenant(), key)).unwrap().clone();
+			assert_eq!(
+				versions.len(),
+				1,
+				"{label:?}: no duplicate version: {versions:?}"
+			);
+			let location = self.mgr.lookup(tenant(), key).unwrap().unwrap();
+			assert_eq!(
+				location.slab_id,
+				self.output(),
+				"{label:?}: from its output"
+			);
+			assert_eq!(self.mgr.read(location).await.unwrap(), bytes, "{label:?}");
+			assert_eq!(
+				durable
+					.record_rows
+					.iter()
+					.filter(|row| row.key_identity == key)
+					.count(),
+				1,
+				"{label:?}: one durable row"
+			);
+		}
+		assert_eq!(
+			self.mgr.control_lsm_intent_metrics_for_test(),
+			(0, 0),
+			"{label:?}"
+		);
+		for file in &self.intent.local_output_files {
+			assert_eq!(
+				lsm_driver::lsm_file_identity(
+					self.mgr.file_ops.as_ref(),
+					&slab_path(&self.dir, file.slab_id),
+					file.slab_id
+				)
+				.await
+				.unwrap(),
+				*file,
+				"{label:?}: its output is the recorded file"
+			);
+		}
+		assert_memory_matches_a_fresh_open(&self.dir, self.mgr, self.owner, label).await;
+	}
+}
+
+/// The ring applied it and the store died before publishing: published from durable
+/// evidence, with its reservation consumed once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_applied_install_publishes_after_a_reopen() {
+	reopen_install_at(lsm_driver::ControlLsmInstallCut::AfterAcceptance)
+		.await
+		.assert_applied_install_ends("unpublished")
+		.await;
+}
+
+/// An output that is not the recorded file is not published.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_applied_install_with_a_changed_output_fences() {
+	let reopened = reopen_install_at(lsm_driver::ControlLsmInstallCut::AfterAcceptance).await;
+	let path = slab_path(&reopened.dir, reopened.output());
+	let mut bytes = std::fs::read(&path).unwrap();
+	bytes[0] ^= 0xff;
+	std::fs::write(&path, &bytes).unwrap();
+	let rows = reopened.rows().await;
+	let driver = op_driver(&reopened.cluster, &reopened.mgr, reopened.plain.clone());
+	assert_eq!(
+		driver.drive_once().await.unwrap_err().kind(),
+		ErrorKind::WouldBlock
+	);
+	assert_eq!(reopened.rows().await, rows);
+	assert!(
+		!reopened
+			.mgr
+			.require_op_index()
+			.unwrap()
+			.load_snapshot()
+			.await
+			.unwrap()
+			.lsm_runs
+			.iter()
+			.any(|run| run.slab_id == reopened.output()),
+		"nothing published"
+	);
+	let _ = reopened.owner.close(Duration::from_secs(2)).await;
+}
+
+/// A cut around the publication and its handoff resumes from what is durable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cuts_around_an_applied_installs_publication_resume() {
+	use crate::storage::index::OpTxnCut;
+	for cut in [OpTxnCut::BeforeCommit, OpTxnCut::AfterCommit] {
+		let reopened = reopen_install_at(lsm_driver::ControlLsmInstallCut::AfterPublication).await;
+		let rows = reopened.rows().await;
+		reopened
+			.mgr
+			.require_op_index()
+			.unwrap()
+			.cut_next_op_txn(cut);
+		let driver = op_driver(&reopened.cluster, &reopened.mgr, reopened.plain.clone());
+		let outcome = driver.drive_once().await;
+		// A lost commit is unresolved, and a landed one with its answer lost is simply done.
+		assert_eq!(
+			outcome.is_err(),
+			cut == OpTxnCut::BeforeCommit,
+			"{cut:?}: {outcome:?}"
+		);
+		assert_eq!(
+			reopened.rows().await == rows,
+			cut == OpTxnCut::BeforeCommit,
+			"{cut:?}"
+		);
+		reopened.assert_applied_install_ends(cut).await;
+	}
+}
+
+/// The last intent's clear exposes nothing: until this open's work is done, nothing is
+/// admitted. Failing that work leaves it to be retried.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_deferred_open_stays_fenced_until_it_finishes_and_retries() {
+	let reopened = reopen_install_at(lsm_driver::ControlLsmInstallCut::AfterPublication).await;
+	let holds = &reopened.mgr.continuity_test_holds;
+	holds.deferred_open_fail_once.store(true, Ordering::Release);
+	let driver = op_driver(&reopened.cluster, &reopened.mgr, reopened.plain.clone());
+	driver.drive_once().await.unwrap_err();
+	assert_eq!(
+		reopened.mgr.tier_authority_readiness_reason().as_deref(),
+		Some("DeferredOpenIncomplete"),
+		"its failure leaves it deferred"
+	);
+	let entered = Arc::new(tokio::sync::Semaphore::new(0));
+	let release = Arc::new(tokio::sync::Semaphore::new(0));
+	*holds.deferred_open_hold.lock().unwrap() = Some((entered.clone(), release.clone()));
+	let driver = Arc::new(driver);
+	let pass = {
+		let driver = driver.clone();
+		tokio::spawn(async move { driver.drive_once().await })
+	};
+	tokio::time::timeout(Duration::from_secs(30), entered.acquire())
+		.await
+		.unwrap()
+		.unwrap()
+		.forget();
+	assert!(
+		reopened
+			.mgr
+			.require_op_index()
+			.unwrap()
+			.load_snapshot()
+			.await
+			.unwrap()
+			.lsm_install_intents
+			.is_empty(),
+		"premise: the last intent has cleared"
+	);
+	assert_eq!(
+		reopened.mgr.tier_authority_readiness_reason().as_deref(),
+		Some("DeferredOpenIncomplete")
+	);
+	assert!(reopened.mgr.require_tier_authority_ready().is_err());
+	assert!(reopened.mgr.lookup(tenant(), reopened.keys[0]).is_err());
+	assert!(
+		reopened
+			.mgr
+			.append_durable(tenant(), id(0xd0d0), hlc(9000), b"refused")
+			.await
+			.is_err(),
+		"no write is admitted"
+	);
+	release.add_permits(8);
+	pass.await.unwrap().unwrap();
+	reopened
+		.assert_applied_install_ends("after the retry")
+		.await;
+}
+
+/// A death with this open's work unfinished needs only the next open: nothing it requires
+/// lived in memory, and no driver or second restart is involved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_store_closed_before_its_deferred_open_finishes_opens_clean() {
+	let reopened = reopen_install_at(lsm_driver::ControlLsmInstallCut::AfterPublication).await;
+	reopened
+		.mgr
+		.continuity_test_holds
+		.deferred_open_fail_once
+		.store(true, Ordering::Release);
+	let driver = op_driver(&reopened.cluster, &reopened.mgr, reopened.plain.clone());
+	driver.drive_once().await.unwrap_err();
+	let _ = reopened.owner.close(Duration::from_secs(5)).await;
+	let next = DataDirectoryOwner::acquire_existing(&reopened.dir).expect("released");
+	let fresh = SlabManager::open_with_owner(gc_owned_test_config(&reopened.dir), next.clone())
+		.await
+		.unwrap();
+	fresh.wait_tier_authority_ready().await.unwrap();
+	assert_eq!(fresh.tier_authority_readiness_reason(), None);
+	for key in reopened.keys {
+		let location = fresh.lookup(tenant(), key).unwrap().unwrap();
+		assert_eq!(location.slab_id, reopened.output());
+		fresh.read(location).await.unwrap();
+	}
+	let _ = next.close(Duration::from_secs(2)).await;
+}
+
+/// A record the slab holds and the mirror lost comes back with this open's rebuild, in
+/// the store that deferred it, and GC's own recovery ends in a store a fresh open agrees with.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_recovered_gc_finishes_its_deferred_open_and_restores_an_unmirrored_record() {
+	let dir = fresh_dir("s5-unmirrored");
+	let owner = DataDirectoryOwner::acquire_existing(&dir).unwrap();
+	let mgr =
+		SlabManager::initialize_new_store_with_owner(gc_owned_test_config(&dir), owner.clone())
+			.await
+			.unwrap();
+	let (slab_id, _key) = seed_small_retired_gc_slab(&mgr).await;
+	let cluster = control_cluster_observing(&[(1, &mgr)]).await;
+	register_owner(&cluster.nodes[0], &mgr).await;
+	let plain = Arc::new(op_committer(&cluster, 1));
+	let key = id(0xabcd01);
+	mgr.append_durable(tenant(), key, hlc(7000), b"unmirrored")
+		.await
+		.unwrap();
+	let losing = LosesMarkResponse(plain.clone());
+	let _ = mgr
+		.sweep_lsm_delete_pending_once_via_control_ring(&new_gc(&mgr), &losing)
+		.await;
+	let index = mgr.require_op_index().unwrap();
+	let row = index
+		.load_snapshot()
+		.await
+		.unwrap()
+		.record_rows
+		.into_iter()
+		.find(|row| row.key_identity == key)
+		.expect("premise: mirrored");
+	index
+		.apply(PersistentIndexUpdate {
+			delete_records: vec![row],
+			..Default::default()
+		})
+		.await
+		.unwrap();
+	owner.close(Duration::from_secs(5)).await.unwrap();
+	let gc = reopen_on_ring(dir, cluster, slab_id, plain).await;
+	std::fs::write(gc.dir.join("gc-job"), "0").unwrap();
+	gc.finish("an unmirrored record").await;
+	let index = gc.mgr.require_op_index().unwrap();
+	assert!(
+		index
+			.load_snapshot()
+			.await
+			.unwrap()
+			.record_rows
+			.iter()
+			.any(|row| row.key_identity == key),
+		"the rebuild restored its row"
+	);
+	let location = gc.mgr.lookup(tenant(), key).unwrap().unwrap();
+	assert_eq!(gc.mgr.read(location).await.unwrap(), b"unmirrored");
+	let (dir, mgr, owner) = (gc.dir, gc.mgr, gc.owner);
+	assert_memory_matches_a_fresh_open(&dir, mgr, owner, "gc").await;
+}
+
+impl ReopenedInstall {
+	/// The durable intent replaced by one with `craft` applied, so nothing but the guard
+	/// under test tells them apart: its digest is right and it is what the row links.
+	async fn craft_durable_intent(
+		&self,
+		craft: impl FnOnce(&mut crate::storage::index::LsmInstallIntent),
+	) {
+		let index = self.mgr.require_op_index().unwrap();
+		let mut crafted = self.intent.clone();
+		craft(&mut crafted);
+		crafted.commit_digest =
+			*blake3::hash(&serde_json::to_vec(&crafted.commit).unwrap()).as_bytes();
+		index
+			.clear_lsm_install_intent(self.intent.clone())
+			.await
+			.unwrap();
+		index.put_lsm_install_intent(crafted).await.unwrap();
+	}
+
+	/// This pass refuses, the row stays, and nothing is published.
+	async fn assert_applied_recovery_fences(self, label: &str) {
+		let index = self.mgr.require_op_index().unwrap();
+		let rows = self.rows().await;
+		let driver = op_driver(&self.cluster, &self.mgr, self.plain.clone());
+		assert_eq!(
+			driver.drive_once().await.unwrap_err().kind(),
+			ErrorKind::WouldBlock,
+			"{label}"
+		);
+		assert_eq!(self.rows().await, rows, "{label}");
+		let durable = index.load_snapshot().await.unwrap();
+		assert_eq!(
+			durable.lsm_install_intents.len(),
+			1,
+			"{label}: its evidence stays"
+		);
+		assert!(slab_path(&self.dir, self.output()).exists(), "{label}");
+		let _ = self.owner.close(Duration::from_secs(2)).await;
+	}
+}
+
+/// A persisted swap no producer can write is evidence of something else: it stays fenced
+/// and nothing is dropped as done.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_crafted_sidecar_swap_stays_fenced_with_its_evidence() {
+	let reopened = reopen_install_at(lsm_driver::ControlLsmInstallCut::AfterAcceptance).await;
+	reopened
+		.craft_durable_intent(|intent| {
+			intent.commit.sidecar_swaps = vec![crate::storage::SidecarSwap {
+				source_slab_id: SlabId::new(1),
+				output_slab_id: SlabId::new(2),
+				old_sidecar_digest: [1; 32],
+				new_sidecar_digest: [2; 32],
+			}];
+		})
+		.await;
+	reopened.assert_applied_recovery_fences("swap").await;
+}
+
+/// The recorded rows decide, not merely a row-shaped read of the output.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_applied_install_whose_outputs_are_not_its_recorded_rows_fences() {
+	let reopened = reopen_install_at(lsm_driver::ControlLsmInstallCut::AfterAcceptance).await;
+	reopened
+		.craft_durable_intent(|intent| intent.local_output_rows_digest = [7; 32])
+		.await;
+	reopened.assert_applied_recovery_fences("rows").await;
+}
+
+/// A view saying applied publishes nothing the ring did not apply.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_view_saying_applied_publishes_nothing_without_the_rings_decision() {
+	let reopened = reopen_install_at(lsm_driver::ControlLsmInstallCut::AfterRename).await;
+	let forged = ForgedView::new(reopened.plain.clone(), forge_applied);
+	let driver = op_driver(&reopened.cluster, &reopened.mgr, forged.clone());
+	let rows = reopened.rows().await;
+	assert_eq!(
+		driver.drive_once().await.unwrap_err().kind(),
+		ErrorKind::WouldBlock
+	);
+	assert_eq!(reopened.rows().await, rows);
+	assert_eq!(forged.submitted.load(Ordering::SeqCst), 0);
+	assert!(
+		!reopened
+			.mgr
+			.require_op_index()
+			.unwrap()
+			.load_snapshot()
+			.await
+			.unwrap()
+			.lsm_runs
+			.iter()
+			.any(|run| run.slab_id == reopened.output()),
+		"nothing published"
+	);
+	let _ = reopened.owner.close(Duration::from_secs(2)).await;
+}
+
+/// Past its publication too, the output must still be the recorded file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_published_install_with_a_changed_output_fences() {
+	let reopened = reopen_install_at(lsm_driver::ControlLsmInstallCut::AfterPublication).await;
+	let path = slab_path(&reopened.dir, reopened.output());
+	let mut bytes = std::fs::read(&path).unwrap();
+	bytes[0] ^= 0xff;
+	std::fs::write(&path, &bytes).unwrap();
+	reopened.assert_applied_recovery_fences("published").await;
+}
+
+/// A location is not dropped for its slab being absent from the manifest alone: a durable
+/// row naming it says it is not this path's to forget.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_location_a_durable_row_names_survives_a_deferred_open() {
+	let gc = reopen_gc_at(GcStop::AfterUnlink).await;
+	let index = gc.mgr.require_op_index().unwrap();
+	let mut row = index
+		.load_snapshot()
+		.await
+		.unwrap()
+		.record_rows
+		.first()
+		.cloned()
+		.expect("premise: a live row elsewhere");
+	row.location.slab_id = SlabId::new(0x7777);
+	row.location.offset += 1;
+	index
+		.apply(PersistentIndexUpdate {
+			put_records: vec![row],
+			..Default::default()
+		})
+		.await
+		.unwrap();
+	gc.mgr
+		.key_index
+		.entry((row.tenant_id, row.key_identity))
+		.and_modify(|versions| versions.push(row.location));
+	// A row naming a slab that is nowhere cannot be served, so this store stays fenced, as a
+	// fresh open of it would refuse. What matters here is that nothing forgot the row.
+	let driver = gc.driver(gc.plain.clone());
+	for _ in 0..12 {
+		let _ = driver.drive_once().await;
+		if gc.rows().await.is_empty() {
+			break;
+		}
+	}
+	let _ = driver.drive_once().await;
+	assert!(
+		gc.rows().await.is_empty(),
+		"premise: the removal itself ended"
+	);
+	assert!(
+		gc.mgr
+			.key_index
+			.get(&(row.tenant_id, row.key_identity))
+			.unwrap()
+			.contains(&row.location),
+		"absence from the manifest alone says nothing"
+	);
+	assert!(
+		index
+			.load_snapshot()
+			.await
+			.unwrap()
+			.record_rows
+			.iter()
+			.any(|durable| durable.location == row.location),
+		"nor did the mirror lose it"
+	);
+	gc.close().await;
+}
+
+/// The producer's half: a swap is refused before any durable intent or submission.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sidecar_swap_is_refused_before_its_intent_or_submission() {
+	let (_dir, manager) = fresh_manager().await;
+	manager
+		.append_durable(tenant(), id(0x5c01), hlc(1), b"swap")
+		.await
+		.unwrap();
+	let input = manager.force_seal_active_for_test().await;
+	let snapshot = manager.compaction_manifest_snapshot();
+	let plan = CompactionPlan {
+		job_id: CompactionJobId::new(0x5c02),
+		source_level: CompactionLevelIndex::L0,
+		target_level: CompactionLevelIndex::L1,
+		manifest_epoch_pre: snapshot.manifest_epoch,
+		input_slabs: vec![input],
+		overlapping_slabs: Vec::new(),
+		retention_floor_snapshot: hlc(100),
+		compaction_start_hlc: hlc(101),
+		dominant_reason: crate::storage::DominantReason::Operator,
+	};
+	let mut commit = CompactionCommit::gc_remove(
+		manager.owner_ref().unwrap(),
+		plan.job_id,
+		snapshot.manifest_epoch,
+		Vec::new(),
+	);
+	commit.sidecar_swaps = vec![crate::storage::SidecarSwap {
+		source_slab_id: SlabId::new(1),
+		output_slab_id: SlabId::new(2),
+		old_sidecar_digest: [1; 32],
+		new_sidecar_digest: [2; 32],
+	}];
+	assert!(matches!(
+		manager.validate_lsm_sidecar_swap_readiness(&plan, &commit, true),
+		Err(CompactionFailure::SidecarDigestMismatch)
+	));
+	assert!(
+		manager
+			.require_op_index()
+			.unwrap()
+			.load_snapshot()
+			.await
+			.unwrap()
+			.lsm_install_intents
+			.is_empty()
+	);
+}
+
+/// §9.2 by process death for an install: the child proposes to a ring the parent owns, and
+/// dies at each boundary. Nothing is replayed. The same limits as the GC control.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_install_killed_at_each_boundary_resumes_on_a_ring_that_outlived_it() {
+	const CHILD_DIR: &str = "WENDELON_INSTALL_KILL_STEP_DIR";
+	const CHILD_STEP: &str = "WENDELON_INSTALL_KILL_STEP_KIND";
+	let keys = [id(0xb11b01), id(0xb11b02)];
+	if let (Some(path), Ok(step)) = (std::env::var_os(CHILD_DIR), std::env::var(CHILD_STEP)) {
+		use lsm_driver::ControlLsmInstallCut as Cut;
+		let dir = PathBuf::from(path);
+		let owner = DataDirectoryOwner::acquire_existing(&dir).unwrap();
+		let manager =
+			SlabManager::initialize_new_store_with_owner(gc_owned_test_config(&dir), owner)
+				.await
+				.unwrap();
+		manager.bind_control_node(1).unwrap();
+		write_ring_file(
+			&dir.join("ring-owner"),
+			&postcard::to_stdvec(&manager.owner_ref().unwrap()).unwrap(),
+		);
+		while !dir.join("ring-registered").exists() {
+			tokio::time::sleep(Duration::from_millis(2)).await;
+		}
+		manager
+			.append_durable(tenant(), keys[0], hlc(1), b"b11b-first")
+			.await
+			.unwrap();
+		let first = manager.force_seal_active_for_test().await;
+		manager
+			.append_durable(tenant(), keys[1], hlc(2), b"b11b-second")
+			.await
+			.unwrap();
+		let second = manager.force_seal_active_for_test().await;
+		write_ring_file(
+			&dir.join("install-inputs"),
+			&postcard::to_stdvec(&(first.get(), second.get())).unwrap(),
+		);
+		let snapshot = manager.compaction_manifest_snapshot();
+		let plan = CompactionPlan {
+			job_id: CompactionJobId::new(0xb11b),
+			source_level: CompactionLevelIndex::L0,
+			target_level: CompactionLevelIndex::L1,
+			manifest_epoch_pre: snapshot.manifest_epoch,
+			input_slabs: vec![first, second],
+			overlapping_slabs: Vec::new(),
+			retention_floor_snapshot: hlc(100),
+			compaction_start_hlc: hlc(101),
+			dominant_reason: crate::storage::DominantReason::Operator,
+		};
+		let cut = match step.as_str() {
+			"before-rename" => Some(Cut::BeforeRename),
+			"after-rename" => Some(Cut::AfterRename),
+			"after-acceptance" => Some(Cut::AfterAcceptance),
+			"after-publication" => Some(Cut::AfterPublication),
+			_ => None,
+		};
+		let entered = Arc::new(tokio::sync::Semaphore::new(0));
+		if let Some(cut) = cut {
+			*manager.lsm_control_install_hold.lock().unwrap() = Some((
+				cut,
+				entered.clone(),
+				Arc::new(tokio::sync::Semaphore::new(0)),
+			));
+		}
+		let job = {
+			let manager = manager.clone();
+			let committer = ChildRingCommitter {
+				dir: dir.clone(),
+				step: step.clone(),
+				observer: Some(manager.clone()),
+			};
+			tokio::spawn(async move {
+				let worker =
+					LsmCompactionWorker::new(LsmConfig::default(), manager.slab_pin_table())
+						.unwrap();
+				manager
+					.run_lsm_compaction_once_via_control_ring(&worker, plan, &committer)
+					.await
+			})
+		};
+		if cut.is_some() {
+			tokio::time::timeout(Duration::from_secs(120), entered.acquire())
+				.await
+				.unwrap()
+				.unwrap()
+				.forget();
+			child_reached(&step);
+		}
+		panic!("the install ended short of {step}: {:?}", job.await);
+	}
+	let test = concat!(
+		module_path!(),
+		"::an_install_killed_at_each_boundary_resumes_on_a_ring_that_outlived_it"
+	)
+	.trim_start_matches("wendelon::");
+	for (step, applied, snapshot) in [
+		("before-rename", false, false),
+		("after-rename", false, false),
+		("mark-unsent", false, false),
+		("mark-unanswered", true, false),
+		("after-acceptance", true, false),
+		("after-publication", true, false),
+		("after-rename", false, true),
+		("after-acceptance", true, true),
+		("after-publication", true, true),
+	] {
+		let dir = fresh_dir("install-kill-boundary");
+		let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+		command
+			.args([test, "--exact", "--nocapture"])
+			.env(CHILD_DIR, dir.as_os_str())
+			.env(CHILD_STEP, step);
+		let cluster = control_cluster_observing(&[]).await;
+		let child = tokio::spawn(async move {
+			crate::test_support::run_test_child(&mut command, Duration::from_secs(180)).await
+		});
+		let output = serve_child_ring(dir.to_path_buf(), &cluster, child).await;
+		assert!(
+			output.status.success()
+				&& String::from_utf8_lossy(&output.stdout)
+					.contains(&format!("gc kill boundary reached: {step}")),
+			"{step}: {} {}",
+			String::from_utf8_lossy(&output.stdout),
+			String::from_utf8_lossy(&output.stderr)
+		);
+		if snapshot {
+			install_a_peers_snapshot(&cluster).await;
+		}
+		let (first, second): (u64, u64) =
+			postcard::from_bytes(&std::fs::read(dir.join("install-inputs")).unwrap()).unwrap();
+		let next = DataDirectoryOwner::acquire_existing(&dir).expect("released");
+		let mgr = SlabManager::open_with_owner(gc_owned_test_config(&dir), next.clone())
+			.await
+			.unwrap();
+		mgr.bind_control_node(1).unwrap();
+		mgr.bind_canonical_tier_source(cluster.state_machines[0].tier_snapshot_source_for_test());
+		let index = mgr.require_op_index().unwrap();
+		let intent = index
+			.load_snapshot()
+			.await
+			.unwrap()
+			.lsm_install_intents
+			.remove(0);
+		let plain = Arc::new(op_committer(&cluster, 1));
+		let reopened = ReopenedInstall {
+			dir,
+			mgr,
+			owner: next,
+			cluster,
+			plain,
+			keys,
+			inputs: [SlabId::new(first), SlabId::new(second)],
+			intent,
+		};
+		if applied {
+			reopened.assert_applied_install_ends(step).await;
+		} else {
+			reopened.assert_rejected_install_ends(step).await;
+		}
+	}
+}
+
+/// `reacquire_exposed`'s first production use: the capability is rebuilt from `Exposed`
+/// only. An output whose reservation is anything else is not published, whatever the
+/// ring decided and whatever the file says.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_applied_install_needs_each_outputs_exposed_reservation() {
+	let reopened = reopen_install_at(lsm_driver::ControlLsmInstallCut::AfterAcceptance).await;
+	let index = reopened.mgr.require_op_index().unwrap();
+	index
+		.abandon_exposed_id(
+			reopened.output(),
+			crate::storage::index::AbandonedOutput {
+				file: None,
+				relocated: false,
+			},
+			None,
+		)
+		.await
+		.unwrap();
+	let rows = reopened.rows().await;
+	let driver = op_driver(&reopened.cluster, &reopened.mgr, reopened.plain.clone());
+	assert!(driver.drive_once().await.is_err());
+	assert_eq!(reopened.rows().await, rows);
+	assert!(
+		!index
+			.load_snapshot()
+			.await
+			.unwrap()
+			.lsm_runs
+			.iter()
+			.any(|run| run.slab_id == reopened.output()),
+		"nothing published"
+	);
+	let _ = reopened.owner.close(Duration::from_secs(2)).await;
+}
+
+/// What the capability alone gives: exclusivity. An output another holder has live is not
+/// published from under it, though its row is `Exposed` and its file is exact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_applied_install_does_not_publish_an_output_another_holder_has_live() {
+	let reopened = reopen_install_at(lsm_driver::ControlLsmInstallCut::AfterAcceptance).await;
+	let held = reopened
+		.mgr
+		.reacquire_exposed(reopened.output())
+		.await
+		.unwrap();
+	let rows = reopened.rows().await;
+	let driver = op_driver(&reopened.cluster, &reopened.mgr, reopened.plain.clone());
+	assert!(driver.drive_once().await.is_err());
+	assert_eq!(reopened.rows().await, rows);
+	assert!(
+		!reopened
+			.mgr
+			.require_op_index()
+			.unwrap()
+			.load_snapshot()
+			.await
+			.unwrap()
+			.lsm_runs
+			.iter()
+			.any(|run| run.slab_id == reopened.output()),
+		"nothing published"
+	);
+	drop(held);
+	reopened
+		.assert_applied_install_ends("after its holder")
+		.await;
+}
+
+// ADR 0697 slice 5, stage 4: a Tier or Retire whose workflow is gone, on a ring that applied,
+// rejected or never saw it. This ring has no observer, so nothing but recovery delivers an
+// Applied to this store: the same fact a snapshot install leaves behind.
+
+struct ReopenedTierOp {
+	_dirs: [crate::test_support::TestDir; 2],
+	mgr: Arc<SlabManager>,
+	l2: Arc<dyn ObjectStore>,
+	cluster: ControlCluster,
+	plain: Arc<crate::storage::RaftCommitter>,
+	old: TieredSlabPointer,
+}
+
+impl ReopenedTierOp {
+	async fn rows(&self) -> Vec<LoadedOp> {
+		self.mgr
+			.require_op_index()
+			.unwrap()
+			.load_op_intents()
+			.await
+			.unwrap()
+	}
+
+	fn driver(&self, committer: Arc<dyn TierCommitter>) -> crate::storage::op_driver::OpDriver {
+		op_driver(&self.cluster, &self.mgr, committer)
+	}
+
+	async fn drive_until_no_rows(&self, label: &str) {
+		let driver = self.driver(self.plain.clone());
+		let mut last = Ok(());
+		for _ in 0..12 {
+			last = driver.drive_once().await;
+			if self.rows().await.is_empty() {
+				break;
+			}
+		}
+		let rows = self.rows().await;
+		assert!(rows.is_empty(), "{label}: {last:?}: {rows:?}");
+		// A pointer this store holds is verified after a reopen, independently of its rows.
+		self.mgr.wait_tier_authority_ready().await.unwrap();
+		assert_eq!(self.mgr.tier_authority_readiness_reason(), None, "{label}");
+	}
+}
+
+/// A store with `old` ready to tier and one allocated op, decided by `decide` on a real ring
+/// that has no observer, then reopened against that ring.
+async fn reopen_tier_op(
+	retire: bool,
+	decide: impl AsyncFnOnce(&crate::storage::RaftCommitter, &crate::storage::index::OpTicket),
+) -> ReopenedTierOp {
+	use crate::consensus::slab_ops::{RetireOp, SlabCommand, TierGeneration, TierOp};
+	let (dirs, mgr, l2, old) = if retire {
+		// Its pointer is installed, and committed on the ring below.
+		let (dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+		(dirs, mgr, l2, old)
+	} else {
+		let (dirs, mgr, l2) = fresh_manager_with_l2("s5-tier-op").await;
+		let (slab_id, _key) = seed_small_retired_gc_slab(&mgr).await;
+		let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
+		let encrypted = mgr.encrypt_tiered_object_blob(slab_id, &raw).unwrap();
+		let uri = l2.put("s5-tier-op/object", &encrypted.bytes).await.unwrap();
+		let old = tiered_pointer_from_blob(&mgr, slab_id, uri, &encrypted.bytes);
+		(dirs, mgr, l2, old)
+	};
+	let cluster = control_cluster_observing(&[]).await;
+	mgr.bind_control_node(1).unwrap();
+	register_owner(&cluster.nodes[0], &mgr).await;
+	let plain = Arc::new(op_committer(&cluster, 1));
+	let index = mgr.require_op_index().unwrap();
+	let owner = mgr.owner_ref().unwrap();
+	if retire {
+		let tier = index
+			.allocate_ops(
+				vec![SlabCommand::Tier(TierOp {
+					tier: b10_tier(&mgr, &old),
+					replaces: None,
+				})],
+				None,
+			)
+			.await
+			.unwrap()
+			.first;
+		plain.submit_op(&tier).await.unwrap();
+		mgr.hand_off_op_if_complete(&tier).await.unwrap();
+	}
+	let command = if retire {
+		SlabCommand::Retire(RetireOp {
+			slab: owner.slab(old.slab_id),
+			expected: TierGeneration::from(&old),
+		})
+	} else {
+		SlabCommand::Tier(TierOp {
+			tier: b10_tier(&mgr, &old),
+			replaces: None,
+		})
+	};
+	let ticket = index.allocate_ops(vec![command], None).await.unwrap().first;
+	decide(plain.as_ref(), &ticket).await;
+	let mgr = try_restart_tier_manager(mgr, &dirs, &l2).await.unwrap();
+	mgr.bind_control_node(1).unwrap();
+	mgr.bind_canonical_tier_source(cluster.state_machines[0].tier_snapshot_source_for_test());
+	ReopenedTierOp {
+		_dirs: dirs,
+		mgr,
+		l2,
+		cluster,
+		plain,
+		old,
+	}
+}
+
+/// Applied, and no one delivered it: recovery installs exactly that pointer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_applied_tier_op_installs_its_pointer_after_a_reopen() {
+	let tier = reopen_tier_op(false, async |plain, ticket| {
+		plain.submit_op(ticket).await.unwrap();
+	})
+	.await;
+	assert_eq!(
+		tier.mgr.tier_pointer(tier.old.slab_id).await,
+		None,
+		"premise"
+	);
+	tier.drive_until_no_rows("applied").await;
+	assert_eq!(
+		tier.mgr.tier_pointer(tier.old.slab_id).await,
+		Some(tier.old.clone())
+	);
+	assert!(
+		tier.mgr
+			.require_op_index()
+			.unwrap()
+			.load_rejected_tier_candidates()
+			.await
+			.unwrap()
+			.is_empty()
+	);
+}
+
+/// Never appended: Cancel by its digest, and the candidate is recorded. No L2 deletion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_undecided_tier_op_cancels_and_keeps_its_candidate_after_a_reopen() {
+	let tier = reopen_tier_op(false, async |_, _| {}).await;
+	let bytes = tier.l2.get(&tier.old.l2_uri).await.unwrap();
+	tier.drive_until_no_rows("cancelled").await;
+	assert_eq!(tier.mgr.tier_pointer(tier.old.slab_id).await, None);
+	let candidates = tier
+		.mgr
+		.require_op_index()
+		.unwrap()
+		.load_rejected_tier_candidates()
+		.await
+		.unwrap();
+	assert_eq!(candidates.len(), 1);
+	assert_eq!(candidates[0].l2_uri, tier.old.l2_uri);
+	assert_eq!(
+		tier.l2.get(&tier.old.l2_uri).await.unwrap(),
+		bytes,
+		"no L2 deletion"
+	);
+}
+
+/// Rejected on the ring and its answer lost: the same candidate path, from the ring's word.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rejected_tier_op_records_its_candidate_after_a_reopen() {
+	let tier = reopen_tier_op(false, async |plain, ticket| {
+		plain.cancel_op(ticket).await.unwrap();
+		// The ring's decision stands; the late original gets the same answer.
+		assert!(matches!(
+			plain.submit_op(ticket).await.unwrap(),
+			crate::storage::VerifiedReceipt::Rejected { .. }
+		));
+	})
+	.await;
+	tier.drive_until_no_rows("rejected").await;
+	assert_eq!(tier.mgr.tier_pointer(tier.old.slab_id).await, None);
+	assert_eq!(
+		tier.mgr
+			.require_op_index()
+			.unwrap()
+			.load_rejected_tier_candidates()
+			.await
+			.unwrap()
+			.len(),
+		1
+	);
+}
+
+/// A retirement the ring applied ends its local pointer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_applied_retire_op_ends_its_pointer_after_a_reopen() {
+	let retire = reopen_tier_op(true, async |plain, ticket| {
+		plain.submit_op(ticket).await.unwrap();
+	})
+	.await;
+	assert!(
+		retire.mgr.tier_pointer(retire.old.slab_id).await.is_some(),
+		"premise"
+	);
+	retire.drive_until_no_rows("applied").await;
+	assert_eq!(retire.mgr.tier_pointer(retire.old.slab_id).await, None);
+}
+
+/// Never appended: the pointer stands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_undecided_retire_op_cancels_and_its_pointer_stands_after_a_reopen() {
+	let retire = reopen_tier_op(true, async |_, _| {}).await;
+	retire.drive_until_no_rows("cancelled").await;
+	assert_eq!(
+		retire.mgr.tier_pointer(retire.old.slab_id).await,
+		Some(retire.old.clone())
+	);
+}
+
+/// A view alone neither installs nor records anything, and a contradiction fences.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tier_ops_forged_or_conflicting_view_moves_nothing() {
+	for forge in [
+		forge_applied,
+		forge_rejected,
+		forge_conflict,
+		forge_prefix_past,
+	] {
+		let tier = reopen_tier_op(false, async |_, _| {}).await;
+		let rows = tier.rows().await;
+		let forged = ForgedView::new(tier.plain.clone(), forge);
+		let driver = tier.driver(forged.clone());
+		assert_eq!(
+			driver.drive_once().await.unwrap_err().kind(),
+			ErrorKind::WouldBlock
+		);
+		assert_eq!(tier.rows().await, rows);
+		assert_eq!(forged.submitted.load(Ordering::SeqCst), 0);
+		assert_eq!(tier.mgr.tier_pointer(tier.old.slab_id).await, None);
+		assert!(
+			tier.mgr
+				.require_op_index()
+				.unwrap()
+				.load_rejected_tier_candidates()
+				.await
+				.unwrap()
+				.is_empty()
+		);
+	}
+}
+
+/// A superseded store delivers nothing, and reports nothing for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_superseded_store_recovers_no_tier_op() {
+	let tier = reopen_tier_op(false, async |plain, ticket| {
+		plain.submit_op(ticket).await.unwrap();
+	})
+	.await;
+	supersede_store(&tier.cluster.nodes[0], tier.mgr.owner_ref().unwrap()).await;
+	let rows = tier.rows().await;
+	tier.mgr
+		.recover_abandoned_tier_ops(tier.plain.as_ref())
+		.await
+		.unwrap();
+	assert_eq!(tier.rows().await, rows);
+	assert_eq!(tier.mgr.tier_pointer(tier.old.slab_id).await, None);
+}
+
+/// R2: the publication transaction itself cut, on both sides of its commit. In place, no
+/// reopen: a lost commit leaves this retry its own preimage, and a lost answer is done.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cut_applied_install_publication_retries_in_place() {
+	use crate::storage::index::OpTxnCut;
+	for cut in [OpTxnCut::BeforeCommit, OpTxnCut::AfterCommit] {
+		let reopened = reopen_install_at(lsm_driver::ControlLsmInstallCut::AfterAcceptance).await;
+		// The publication's own transaction: its first with a promotion in it.
+		reopened
+			.mgr
+			.require_op_index()
+			.unwrap()
+			.cut_next_op_txn(cut);
+		let driver = op_driver(&reopened.cluster, &reopened.mgr, reopened.plain.clone());
+		let _ = driver.drive_once().await;
+		assert!(
+			!reopened.mgr.has_orphaned_index_publications(),
+			"{cut:?}: its own publication ended"
+		);
+		reopened.assert_applied_install_ends(cut).await;
+	}
+}
+
+/// R2: the same id and rows digest are not the postimage if the run itself differs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_published_install_with_an_altered_run_fences() {
+	let reopened = reopen_install_at(lsm_driver::ControlLsmInstallCut::AfterPublication).await;
+	let index = reopened.mgr.require_op_index().unwrap();
+	let mut run = index
+		.load_snapshot()
+		.await
+		.unwrap()
+		.lsm_runs
+		.into_iter()
+		.find(|run| run.slab_id == reopened.output())
+		.unwrap();
+	run.max_row_hlc = hlc(9_999_999);
+	index
+		.apply(PersistentIndexUpdate {
+			put_lsm_runs: vec![run],
+			..Default::default()
+		})
+		.await
+		.unwrap();
+	reopened.assert_applied_recovery_fences("altered").await;
+}
+
+/// R1: a live run's file lost while this open's work is pending is refused, and the durable
+/// rows it held survive. Absence never becomes an empty rebuild.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_missing_output_stops_a_deferred_open_with_its_rows_kept() {
+	let reopened = reopen_install_at(lsm_driver::ControlLsmInstallCut::AfterPublication).await;
+	let entered = Arc::new(tokio::sync::Semaphore::new(0));
+	let release = Arc::new(tokio::sync::Semaphore::new(0));
+	*reopened
+		.mgr
+		.continuity_test_holds
+		.deferred_open_hold
+		.lock()
+		.unwrap() = Some((entered.clone(), release.clone()));
+	let driver = Arc::new(op_driver(
+		&reopened.cluster,
+		&reopened.mgr,
+		reopened.plain.clone(),
+	));
+	let pass = {
+		let driver = driver.clone();
+		tokio::spawn(async move { driver.drive_once().await })
+	};
+	tokio::time::timeout(Duration::from_secs(30), entered.acquire())
+		.await
+		.unwrap()
+		.unwrap()
+		.forget();
+	let index = reopened.mgr.require_op_index().unwrap();
+	let rows_before = index.load_snapshot().await.unwrap().record_rows;
+	std::fs::remove_file(slab_path(&reopened.dir, reopened.output())).unwrap();
+	release.add_permits(8);
+	assert!(pass.await.unwrap().is_err(), "refused, not absent");
+	assert_eq!(
+		index.load_snapshot().await.unwrap().record_rows,
+		rows_before,
+		"the only evidence of what it held"
+	);
+	assert_eq!(
+		reopened.mgr.tier_authority_readiness_reason().as_deref(),
+		Some("DeferredOpenIncomplete")
+	);
+	let _ = reopened.owner.close(Duration::from_secs(2)).await;
+}
+
+/// R1: `open`'s own conditions hold here too: with an independent fence standing the mirror
+/// is not rebuilt, even though every intent has resolved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_independent_fence_stops_a_deferred_opens_rebuild() {
+	let reopened = reopen_install_at(lsm_driver::ControlLsmInstallCut::AfterPublication).await;
+	let index = reopened.mgr.require_op_index().unwrap();
+	// Past its install first, so that what stops the rebuild can only be the fence.
+	reopened
+		.mgr
+		.continuity_test_holds
+		.deferred_open_fail_once
+		.store(true, Ordering::Release);
+	let driver = op_driver(&reopened.cluster, &reopened.mgr, reopened.plain.clone());
+	let _ = driver.drive_once().await;
+	assert!(
+		reopened.rows().await.is_empty(),
+		"premise: its install resolved"
+	);
+	let mut lost = index.load_snapshot().await.unwrap().record_rows;
+	let lost = lost.pop().unwrap();
+	index
+		.apply(PersistentIndexUpdate {
+			delete_records: vec![lost],
+			..Default::default()
+		})
+		.await
+		.unwrap();
+	reopened
+		.mgr
+		.index_authority_unavailable
+		.store(true, Ordering::Release);
+	let refused = reopened.mgr.complete_deferred_open().await;
+	assert_eq!(refused.unwrap_err().kind(), ErrorKind::WouldBlock);
+	assert!(
+		reopened
+			.mgr
+			.tier_authority
+			.deferred_open
+			.load(Ordering::Acquire),
+		"still owed"
+	);
+	assert!(
+		!index
+			.load_snapshot()
+			.await
+			.unwrap()
+			.record_rows
+			.iter()
+			.any(|row| row.location == lost.location),
+		"no rebuild ran under the fence"
+	);
+	let _ = reopened.owner.close(Duration::from_secs(2)).await;
+}
+
+/// R3: the handoff after an output moved, cut. Its retry finds what it left, on both sides
+/// of the commit, from temp and from final, in place and after a reopen.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cut_rejected_install_handoff_resumes_from_what_it_left() {
+	use crate::storage::index::OpTxnCut;
+	use lsm_driver::ControlLsmInstallCut as Cut;
+	for install in [Cut::BeforeRename, Cut::AfterRename] {
+		for cut in [OpTxnCut::BeforeCommit, OpTxnCut::AfterCommit] {
+			let reopened = reopen_install_at(install).await;
+			reopened
+				.mgr
+				.require_op_index()
+				.unwrap()
+				.cut_next_op_txn(cut);
+			let driver = op_driver(&reopened.cluster, &reopened.mgr, reopened.plain.clone());
+			let _ = driver.drive_once().await;
+			assert!(
+				super::reservations::abandoned_output_path(&reopened.dir, reopened.output())
+					.exists() || reopened
+					.mgr
+					.require_op_index()
+					.unwrap()
+					.reserved_id_state(reopened.output())
+					.await
+					.unwrap()
+					.is_none(),
+				"{install:?} {cut:?}: its identity is somewhere"
+			);
+			reopened.assert_rejected_install_ends((install, cut)).await;
+		}
+	}
+}
+
+/// R3: with no name left there is no proof it was cleaned, so nothing is called done.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rejected_install_with_no_name_left_fences() {
+	let reopened = reopen_install_at(lsm_driver::ControlLsmInstallCut::AfterRename).await;
+	std::fs::remove_file(slab_path(&reopened.dir, reopened.output())).unwrap();
+	let rows = reopened.rows().await;
+	let driver = op_driver(&reopened.cluster, &reopened.mgr, reopened.plain.clone());
+	assert_eq!(
+		driver.drive_once().await.unwrap_err().kind(),
+		ErrorKind::WouldBlock
+	);
+	let after = reopened.rows().await;
+	assert_eq!(after.len(), rows.len(), "the row stays");
+	assert_eq!(
+		reopened
+			.mgr
+			.require_op_index()
+			.unwrap()
+			.reserved_id_state(reopened.output())
+			.await
+			.unwrap(),
+		Some(crate::storage::index::ReservedIdState::Exposed { abandoned: None })
+	);
+	let _ = reopened.owner.close(Duration::from_secs(2)).await;
+}
+
+/// R4: a key at a locality not derived from itself routes the same after recovery.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_applied_install_keeps_a_keys_chosen_locality() {
+	let chosen = Locality::from(id(0x4242_4242));
+	let reopened = reopen_install_seeded(
+		lsm_driver::ControlLsmInstallCut::AfterAcceptance,
+		async |manager, keys| {
+			manager
+				.append_durable_with_locality(tenant(), keys[0], chosen, hlc(1), b"b11b-first")
+				.await
+				.unwrap();
+			let first = manager.force_seal_active_for_test().await;
+			manager
+				.append_durable(tenant(), keys[1], hlc(2), b"b11b-second")
+				.await
+				.unwrap();
+			[first, manager.force_seal_active_for_test().await]
+		},
+	)
+	.await;
+	reopened.drive_until_ready("locality").await;
+	assert_eq!(
+		reopened
+			.mgr
+			.routing_locality_for_key(tenant(), reopened.keys[0]),
+		chosen
+	);
+	reopened.assert_applied_install_ends("locality").await;
+}
+
+/// Runs one real install of inputs `seed` wrote, on a ring, and answers how it ended.
+async fn run_install_of_seeded_inputs(
+	seed: impl AsyncFnOnce(&Arc<SlabManager>, [Identity; 2]) -> [SlabId; 2],
+) -> (
+	Arc<SlabManager>,
+	Result<crate::storage::CompactionOutcome, CompactionFailure>,
+	DataDirectoryOwner,
+	crate::test_support::TestDir,
+) {
+	let dir = fresh_dir("s5-install-refused");
+	let owner = DataDirectoryOwner::acquire_existing(&dir).unwrap();
+	let manager =
+		SlabManager::initialize_new_store_with_owner(gc_owned_test_config(&dir), owner.clone())
+			.await
+			.unwrap();
+	let cluster = control_cluster_observing(&[(1, &manager)]).await;
+	register_owner(&cluster.nodes[0], &manager).await;
+	let plain = op_committer(&cluster, 1);
+	let [first, second] = seed(&manager, [id(0xb11b01), id(0xb11b02)]).await;
+	let snapshot = manager.compaction_manifest_snapshot();
+	let plan = CompactionPlan {
+		job_id: CompactionJobId::new(0xb11b),
+		source_level: CompactionLevelIndex::L0,
+		target_level: CompactionLevelIndex::L1,
+		manifest_epoch_pre: snapshot.manifest_epoch,
+		input_slabs: vec![first, second],
+		overlapping_slabs: Vec::new(),
+		retention_floor_snapshot: hlc(100),
+		compaction_start_hlc: hlc(101),
+		dominant_reason: crate::storage::DominantReason::Operator,
+	};
+	let worker = LsmCompactionWorker::new(LsmConfig::default(), manager.slab_pin_table()).unwrap();
+	let result = manager
+		.run_lsm_compaction_once_via_control_ring(&worker, plan, &plain)
+		.await;
+	(manager, result, owner, dir)
+}
+
+/// R4's counters, for an install: counter frames are refused before any durable intent, so
+/// no recovered output can carry one. If a producer ever changes that, this says so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn counter_inputs_are_refused_before_any_install_intent() {
+	let origin = counter_origin(1);
+	let (manager, result, owner, _dir) = run_install_of_seeded_inputs(async |manager, keys| {
+		committed_counter_frame(manager, keys[0], 10, 7, origin).await;
+		let first = manager.force_seal_active_for_test().await;
+		manager
+			.append_durable(tenant(), keys[1], hlc(6), b"b11b-second")
+			.await
+			.unwrap();
+		[first, manager.force_seal_active_for_test().await]
+	})
+	.await;
+	assert!(
+		matches!(result, Err(CompactionFailure::CounterMaintenanceSkipped)),
+		"{result:?}"
+	);
+	assert!(
+		manager
+			.require_op_index()
+			.unwrap()
+			.load_snapshot()
+			.await
+			.unwrap()
+			.lsm_install_intents
+			.is_empty()
+	);
+	let _ = owner.close(Duration::from_secs(2)).await;
+}
+
+/// R4's conflicts, as a preflight control, not a recovery. A live append refuses them, so
+/// they arrive only through recovery: two copies of one version on disk, which a clean open
+/// records. An install over them is refused at its source read, with no intent, so no
+/// recovered install has one. This says nothing about conflicts elsewhere in a store that
+/// has a deferred open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_install_over_a_recorded_conflict_is_refused_before_its_intent() {
+	let dir = fresh_dir("s5-install-conflict");
+	let owner = DataDirectoryOwner::acquire_existing(&dir).unwrap();
+	let manager =
+		SlabManager::initialize_new_store_with_owner(gc_owned_test_config(&dir), owner.clone())
+			.await
+			.unwrap();
+	let keys = [id(0xb11b01), id(0xb11b02)];
+	let active = manager.state.lock().await.active.clone();
+	active
+		.append(tenant(), keys[0], hlc(5), b"one")
+		.await
+		.unwrap();
+	active
+		.append(tenant(), keys[0], hlc(5), b"two")
+		.await
+		.unwrap();
+	drop(active);
+	manager.fsync_all_local_slabs().await.unwrap();
+	drop(manager);
+	owner.close(Duration::from_secs(5)).await.unwrap();
+	let owner = DataDirectoryOwner::acquire_existing(&dir).expect("released");
+	let manager = SlabManager::open_with_owner(gc_owned_test_config(&dir), owner.clone())
+		.await
+		.unwrap();
+	manager.wait_tier_authority_ready().await.unwrap();
+	assert!(
+		!manager.conflicted_locations.is_empty(),
+		"premise: a clean open recorded the conflict"
+	);
+	let first = manager.force_seal_active_for_test().await;
+	manager
+		.append_durable(tenant(), keys[1], hlc(6), b"b11b-second")
+		.await
+		.unwrap();
+	let second = manager.force_seal_active_for_test().await;
+	let cluster = control_cluster_observing(&[(1, &manager)]).await;
+	register_owner(&cluster.nodes[0], &manager).await;
+	let plain = op_committer(&cluster, 1);
+	let snapshot = manager.compaction_manifest_snapshot();
+	let plan = CompactionPlan {
+		job_id: CompactionJobId::new(0xb11b),
+		source_level: CompactionLevelIndex::L0,
+		target_level: CompactionLevelIndex::L1,
+		manifest_epoch_pre: snapshot.manifest_epoch,
+		input_slabs: vec![first, second],
+		overlapping_slabs: Vec::new(),
+		retention_floor_snapshot: hlc(100),
+		compaction_start_hlc: hlc(101),
+		dominant_reason: crate::storage::DominantReason::Operator,
+	};
+	let worker = LsmCompactionWorker::new(LsmConfig::default(), manager.slab_pin_table()).unwrap();
+	let result = manager
+		.run_lsm_compaction_once_via_control_ring(&worker, plan, &plain)
+		.await;
+	let Err(CompactionFailure::IoError(error)) = result else {
+		panic!("refused at its source read: {result:?}");
+	};
+	assert!(error.to_string().contains("conflicting_version"), "{error}");
+	assert!(
+		manager
+			.require_op_index()
+			.unwrap()
+			.load_snapshot()
+			.await
+			.unwrap()
+			.lsm_install_intents
+			.is_empty(),
+		"before any intent"
+	);
+	let _ = owner.close(Duration::from_secs(2)).await;
+}
+
+/// R5: a producer holding the maintenance gate holds this open's work off, and nothing is
+/// admitted in between. Its cleanup and rebuild run only once it is gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_paused_producer_holds_off_a_deferred_open() {
+	let reopened = reopen_install_at(lsm_driver::ControlLsmInstallCut::AfterPublication).await;
+	reopened
+		.mgr
+		.continuity_test_holds
+		.deferred_open_fail_once
+		.store(true, Ordering::Release);
+	let driver = Arc::new(op_driver(
+		&reopened.cluster,
+		&reopened.mgr,
+		reopened.plain.clone(),
+	));
+	let _ = driver.drive_once().await;
+	assert!(
+		reopened.rows().await.is_empty(),
+		"premise: its install resolved"
+	);
+	let producer = reopened
+		.mgr
+		.maintenance_publication_gate
+		.clone()
+		.read_owned()
+		.await;
+	let pass = {
+		let driver = driver.clone();
+		tokio::spawn(async move { driver.drive_once().await })
+	};
+	tokio::time::sleep(Duration::from_millis(300)).await;
+	assert!(!pass.is_finished(), "the pass waits for the producer");
+	assert_eq!(
+		reopened.mgr.tier_authority_readiness_reason().as_deref(),
+		Some("DeferredOpenIncomplete"),
+		"nothing admitted while the producer is live"
+	);
+	drop(producer);
+	tokio::time::timeout(Duration::from_secs(30), pass)
+		.await
+		.unwrap()
+		.unwrap()
+		.unwrap();
+	reopened
+		.assert_applied_install_ends("after the producer")
+		.await;
+}
+
+/// R4: a real process death inside the deferred open, at each of its stages. Everything it
+/// needs is durable, so the next open is clean, with no driver and no second restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_process_killed_during_a_deferred_open_opens_clean() {
+	const CHILD_DIR: &str = "WENDELON_DEFERRED_KILL_DIR";
+	const CHILD_STAGE: &str = "WENDELON_DEFERRED_KILL_STAGE";
+	if let (Some(path), Ok(stage)) = (std::env::var_os(CHILD_DIR), std::env::var(CHILD_STAGE)) {
+		let dir = PathBuf::from(path);
+		let stage: u8 = stage.parse().unwrap();
+		let owner = DataDirectoryOwner::acquire_existing(&dir).unwrap();
+		let manager = SlabManager::open_with_owner(gc_owned_test_config(&dir), owner)
+			.await
+			.unwrap();
+		manager.bind_control_node(1).unwrap();
+		let index = manager.require_op_index().unwrap();
+		let rows = index.load_op_intents().await.unwrap();
+		let LoadedOp::Submittable(ticket) = rows[0].clone() else {
+			panic!("the install's row: {rows:?}");
+		};
+		let intent = index
+			.load_snapshot()
+			.await
+			.unwrap()
+			.lsm_install_intents
+			.remove(0);
+		let ownership = index.try_acquire_ops(vec![ticket.key().op_seq]).unwrap();
+		// Its decision is the parent's ring's, shown before this child started. This process
+		// has no ring: only local work follows it.
+		manager
+			.clone()
+			.finish_applied_install(ticket, intent, false, None, ownership)
+			.await
+			.unwrap();
+		let entered = Arc::new(tokio::sync::Semaphore::new(0));
+		*manager
+			.continuity_test_holds
+			.deferred_open_stage_hold
+			.lock()
+			.unwrap() = Some((
+			stage,
+			entered.clone(),
+			Arc::new(tokio::sync::Semaphore::new(0)),
+		));
+		let job = {
+			let manager = manager.clone();
+			tokio::spawn(async move { manager.complete_deferred_open().await })
+		};
+		tokio::time::timeout(Duration::from_secs(120), entered.acquire())
+			.await
+			.unwrap()
+			.unwrap()
+			.forget();
+		assert!(!job.is_finished());
+		child_reached(&stage.to_string());
+	}
+	let test = concat!(
+		module_path!(),
+		"::a_process_killed_during_a_deferred_open_opens_clean"
+	)
+	.trim_start_matches("wendelon::");
+	for stage in [1_u8, 2, 3, 4] {
+		let reopened = reopen_install_at(lsm_driver::ControlLsmInstallCut::AfterAcceptance).await;
+		let view = reopened
+			.plain
+			.op_view(
+				reopened.rows().await[0].key(),
+				reopened.rows().await[0].digest(),
+				reopened.rows().await[0].command().slabs(),
+			)
+			.await
+			.unwrap();
+		assert!(
+			matches!(
+				view.outcome,
+				crate::consensus::slab_ops::ViewOutcome::Recorded(
+					crate::consensus::slab_ops::RecordedOutcome::Applied { .. }
+				)
+			),
+			"premise: the ring applied it"
+		);
+		let ReopenedInstall {
+			dir,
+			owner,
+			keys,
+			intent,
+			..
+		} = reopened;
+		let _ = owner.close(Duration::from_secs(5)).await;
+		let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+		command
+			.args([test, "--exact", "--nocapture"])
+			.env(CHILD_DIR, dir.as_os_str())
+			.env(CHILD_STAGE, stage.to_string());
+		let output = crate::test_support::run_test_child(&mut command, Duration::from_secs(180))
+			.await
+			.unwrap();
+		assert!(
+			output.status.success()
+				&& String::from_utf8_lossy(&output.stdout)
+					.contains(&format!("gc kill boundary reached: {stage}")),
+			"{stage}: {} {}",
+			String::from_utf8_lossy(&output.stdout),
+			String::from_utf8_lossy(&output.stderr)
+		);
+		let next = DataDirectoryOwner::acquire_existing(&dir).expect("released");
+		let fresh = SlabManager::open_with_owner(gc_owned_test_config(&dir), next.clone())
+			.await
+			.unwrap();
+		fresh.wait_tier_authority_ready().await.unwrap();
+		assert_eq!(fresh.tier_authority_readiness_reason(), None, "{stage}");
+		for (key, bytes) in keys
+			.into_iter()
+			.zip([b"b11b-first".as_slice(), b"b11b-second".as_slice()])
+		{
+			let location = fresh.lookup(tenant(), key).unwrap().unwrap();
+			assert_eq!(
+				location.slab_id, intent.local_output_files[0].slab_id,
+				"{stage}"
+			);
+			assert_eq!(fresh.read(location).await.unwrap(), bytes, "{stage}");
+		}
+		let _ = next.close(Duration::from_secs(2)).await;
+	}
+}
+
+/// The catalogs for one covered store, from wherever this test decides.
+struct CatalogCommitter {
+	inner: Arc<crate::storage::RaftCommitter>,
+	catalogs: std::sync::Mutex<Option<(TableSchemaCatalog, SecondaryIndexCatalog)>>,
+}
+
+#[async_trait]
+impl TierCommitter for CatalogCommitter {
+	async fn preflight(&self, owner: crate::consensus::OwnerRef) -> std::io::Result<()> {
+		self.inner.preflight(owner).await
+	}
+	async fn submit_op(
+		&self,
+		ticket: &crate::storage::index::OpTicket,
+	) -> std::io::Result<crate::storage::VerifiedReceipt> {
+		self.inner.submit_op(ticket).await
+	}
+	async fn cancel_op(
+		&self,
+		ticket: &crate::storage::index::OpTicket,
+	) -> std::io::Result<crate::storage::VerifiedReceipt> {
+		self.inner.cancel_op(ticket).await
+	}
+	async fn ack_outcomes(
+		&self,
+		owner: crate::consensus::OwnerRef,
+		seqs: Vec<u64>,
+	) -> std::io::Result<crate::consensus::slab_ops::AckReceipt> {
+		self.inner.ack_outcomes(owner, seqs).await
+	}
+	async fn op_prefix(&self, owner: crate::consensus::OwnerRef) -> std::io::Result<Option<u64>> {
+		self.inner.op_prefix(owner).await
+	}
+	async fn op_view(
+		&self,
+		key: crate::consensus::slab_ops::OpKey,
+		digest: [u8; 32],
+		slabs: Vec<crate::consensus::SlabRef>,
+	) -> std::io::Result<crate::consensus::slab_ops::OpView> {
+		self.inner.op_view(key, digest, slabs).await
+	}
+	async fn secondary_index_catalogs(
+		&self,
+	) -> std::io::Result<(TableSchemaCatalog, SecondaryIndexCatalog)> {
+		self.catalogs.lock().unwrap().clone().ok_or_else(|| {
+			Error::new(
+				ErrorKind::Unsupported,
+				"this test has no catalogs right now",
+			)
+		})
+	}
+}
+
+struct CoveredInstall {
+	dir: crate::test_support::TestDir,
+	mgr: Arc<SlabManager>,
+	owner: DataDirectoryOwner,
+	cluster: ControlCluster,
+	committer: Arc<CatalogCommitter>,
+	descriptor: crate::schema::SecondaryIndexDescriptor,
+	input: SlabId,
+	output: SlabId,
+	row: Identity,
+	old: crate::storage::manager::SecondaryIndexSegmentInfo,
+	faults: Arc<FaultyFileOps>,
+}
+
+/// A store with a real sidecar on a real input, its install run on a real ring with its
+/// catalogs and stopped at `cut`, reopened against that ring.
+async fn reopen_covered_install_at(cut: lsm_driver::ControlLsmInstallCut) -> CoveredInstall {
+	let dir = fresh_dir("s5-covered");
+	let owner = DataDirectoryOwner::acquire_existing(&dir).unwrap();
+	let manager =
+		SlabManager::initialize_new_store_with_owner(gc_owned_test_config(&dir), owner.clone())
+			.await
+			.unwrap();
+	let table = secondary_index_table_descriptor_for_test();
+	let descriptor = secondary_index_descriptor_for_test();
+	let row =
+		append_secondary_index_table_row_for_test(&manager, &table, 7, Some(10), hlc(10)).await;
+	let input = manager.force_seal_active_for_test().await;
+	let mut schemas = TableSchemaCatalog::default();
+	schemas.upsert(tenant(), table.clone()).unwrap();
+	let mut secondary_indexes = SecondaryIndexCatalog::default();
+	secondary_indexes
+		.create(tenant(), descriptor.clone(), &schemas)
+		.unwrap();
+	let tick = manager
+		.run_secondary_index_backfill_once(tenant(), &table, &descriptor, 8, 4096)
+		.await
+		.unwrap();
+	assert_eq!(tick.completed.len(), 1, "premise: its sidecar exists");
+	let old = manager
+		.list_secondary_index_segments(
+			tenant(),
+			descriptor.table_object_id,
+			descriptor.index_object_id,
+			descriptor.logical_schema_fingerprint,
+		)
+		.into_iter()
+		.find(|info| info.source_slab_id == input)
+		.expect("premise: the input's sidecar");
+	let cluster = control_cluster_observing(&[(1, &manager)]).await;
+	register_owner(&cluster.nodes[0], &manager).await;
+	let plain = Arc::new(op_committer(&cluster, 1));
+	let snapshot = manager.compaction_manifest_snapshot();
+	let plan = CompactionPlan {
+		job_id: CompactionJobId::new(0x5151),
+		source_level: CompactionLevelIndex::L0,
+		target_level: CompactionLevelIndex::L1,
+		manifest_epoch_pre: snapshot.manifest_epoch,
+		input_slabs: vec![input],
+		overlapping_slabs: Vec::new(),
+		retention_floor_snapshot: hlc(100),
+		compaction_start_hlc: hlc(101),
+		dominant_reason: crate::storage::DominantReason::Operator,
+	};
+	let entered = Arc::new(tokio::sync::Semaphore::new(0));
+	let release = Arc::new(tokio::sync::Semaphore::new(0));
+	*manager.lsm_control_install_hold.lock().unwrap() =
+		Some((cut, entered.clone(), release.clone()));
+	let mut task = {
+		let (manager, plain) = (manager.clone(), plain.clone());
+		let (schemas, secondary_indexes) = (schemas.clone(), secondary_indexes.clone());
+		tokio::spawn(async move {
+			let worker =
+				LsmCompactionWorker::new(LsmConfig::default(), manager.slab_pin_table()).unwrap();
+			manager
+				.run_lsm_compaction_once_via_control_ring_with_context(
+					&worker,
+					plan,
+					plain.as_ref(),
+					Some(SecondaryIndexCompactionContext {
+						table_schemas: &schemas,
+						secondary_indexes: &secondary_indexes,
+					}),
+				)
+				.await
+		})
+	};
+	tokio::select! {
+		reached = entered.acquire() => reached.unwrap().forget(),
+		result = &mut task => panic!("the install returned before {cut:?}: {result:?}"),
+		_ = tokio::time::sleep(Duration::from_secs(60)) => panic!("the install never reached {cut:?}"),
+	}
+	let intent = manager
+		.require_op_index()
+		.unwrap()
+		.load_snapshot()
+		.await
+		.unwrap()
+		.lsm_install_intents
+		.remove(0);
+	let output = intent.local_output_files[0].slab_id;
+	task.abort();
+	let _ = task.await;
+	drop(release);
+	let _ = owner.close(Duration::from_secs(5)).await;
+	let next = DataDirectoryOwner::acquire_existing(&dir).expect("released");
+	let faults = Arc::new(FaultyFileOps::new(dir.to_path_buf()).unwrap());
+	let mgr = SlabManager::open_with_file_ops_and_owner(
+		gc_owned_test_config(&dir),
+		faults.clone(),
+		next.clone(),
+	)
+	.await
+	.unwrap();
+	mgr.bind_control_node(1).unwrap();
+	mgr.bind_canonical_tier_source(cluster.state_machines[0].tier_snapshot_source_for_test());
+	let committer = Arc::new(CatalogCommitter {
+		inner: plain,
+		catalogs: std::sync::Mutex::new(Some((schemas, secondary_indexes))),
+	});
+	CoveredInstall {
+		dir,
+		mgr,
+		owner: next,
+		cluster,
+		committer,
+		descriptor,
+		input,
+		output,
+		row,
+		old,
+		faults,
+	}
+}
+
+impl CoveredInstall {
+	async fn rows(&self) -> Vec<LoadedOp> {
+		self.mgr
+			.require_op_index()
+			.unwrap()
+			.load_op_intents()
+			.await
+			.unwrap()
+	}
+
+	async fn assert_ends_covered(self, label: impl std::fmt::Debug) {
+		let driver = op_driver(&self.cluster, &self.mgr, self.committer.clone());
+		let mut last = Ok(());
+		for _ in 0..12 {
+			last = driver.drive_once().await;
+			if self.rows().await.is_empty() && self.mgr.tier_authority_readiness_reason().is_none()
+			{
+				break;
+			}
+		}
+		assert!(self.rows().await.is_empty(), "{label:?}: {last:?}");
+		assert_eq!(
+			self.mgr.tier_authority_readiness_reason(),
+			None,
+			"{label:?}: {last:?}"
+		);
+		let listed = self.mgr.list_secondary_index_segments(
+			tenant(),
+			self.descriptor.table_object_id,
+			self.descriptor.index_object_id,
+			self.descriptor.logical_schema_fingerprint,
+		);
+		assert_eq!(listed.len(), 1, "{label:?}: one sidecar: {listed:?}");
+		assert_eq!(
+			listed[0].source_slab_id, self.output,
+			"{label:?}: for its output"
+		);
+		let segment = self
+			.mgr
+			.load_secondary_index_segment(&listed[0])
+			.await
+			.unwrap()
+			.unwrap();
+		assert_eq!(segment.entries.len(), 1, "{label:?}");
+		assert_eq!(segment.entries[0].row_key_id, self.row, "{label:?}");
+		assert!(
+			self.mgr
+				.load_secondary_index_segment(&self.old)
+				.await
+				.unwrap()
+				.is_none(),
+			"{label:?}: the input's sidecar is retired"
+		);
+		assert_eq!(
+			self.mgr
+				.compaction_manifest_snapshot()
+				.run(self.output)
+				.unwrap()
+				.sidecar_coverage,
+			crate::storage::SidecarCoverage::Complete,
+			"{label:?}: coverage is what the ring accepted and what it now holds"
+		);
+		let coverage = self
+			.mgr
+			.secondary_index_coverage_snapshot(listed[0].coverage_key())
+			.unwrap();
+		assert_eq!(coverage.covered_slabs, vec![self.output], "{label:?}");
+		assert!(coverage.uncovered_slabs.is_empty(), "{label:?}");
+		let _ = self.input;
+		assert_memory_matches_a_fresh_open(&self.dir, self.mgr, self.owner, label).await;
+	}
+}
+
+/// Before its rows, after its rows and before its sidecars, and after both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_covered_install_republishes_its_sidecars_from_every_cut() {
+	use lsm_driver::ControlLsmInstallCut as Cut;
+	for cut in [
+		Cut::AfterAcceptance,
+		Cut::AfterRowsPublished,
+		Cut::AfterPublication,
+	] {
+		reopen_covered_install_at(cut)
+			.await
+			.assert_ends_covered(cut)
+			.await;
+	}
+}
+
+/// No catalogs, no recovery, and nothing lost: it finishes once they are there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_covered_install_without_catalogs_stays_fenced_and_retries() {
+	let covered =
+		reopen_covered_install_at(lsm_driver::ControlLsmInstallCut::AfterAcceptance).await;
+	let held = covered.committer.catalogs.lock().unwrap().take();
+	let rows = covered.rows().await;
+	let driver = op_driver(&covered.cluster, &covered.mgr, covered.committer.clone());
+	assert_eq!(
+		driver.drive_once().await.unwrap_err().kind(),
+		ErrorKind::Unsupported
+	);
+	assert_eq!(covered.rows().await, rows);
+	*covered.committer.catalogs.lock().unwrap() = held;
+	covered.assert_ends_covered("after its catalogs").await;
+}
+
+/// An index replaced since the sidecars were built is not what they were built for: nothing
+/// is prepared against it, and restoring the catalog lets it finish.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_covered_install_against_an_incompatible_catalog_stays_fenced() {
+	use lsm_driver::ControlLsmInstallCut as Cut;
+	for cut in [
+		Cut::AfterAcceptance,
+		Cut::AfterRowsPublished,
+		Cut::AfterPublication,
+	] {
+		let covered = reopen_covered_install_at(cut).await;
+		let held = covered.committer.catalogs.lock().unwrap().clone();
+		let (schemas, _) = held.clone().unwrap();
+		*covered.committer.catalogs.lock().unwrap() =
+			Some((schemas, SecondaryIndexCatalog::default()));
+		let rows = covered.rows().await;
+		let driver = op_driver(&covered.cluster, &covered.mgr, covered.committer.clone());
+		assert_eq!(
+			driver.drive_once().await.unwrap_err().kind(),
+			ErrorKind::WouldBlock,
+			"{cut:?}"
+		);
+		assert_eq!(covered.rows().await, rows, "{cut:?}");
+		*covered.committer.catalogs.lock().unwrap() = held;
+		covered.assert_ends_covered(cut).await;
+	}
+}
+
+/// R3: under its own exclusion, before any file moves: a stale intent moves nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stale_intent_is_refused_before_a_rejected_outputs_file_moves() {
+	let reopened = reopen_install_at(lsm_driver::ControlLsmInstallCut::AfterRename).await;
+	let rows = reopened.rows().await;
+	let LoadedOp::Submittable(ticket) = rows[0].clone() else {
+		panic!("submitted: {rows:?}");
+	};
+	reopened.plain.cancel_op(&ticket).await.unwrap();
+	let mut stale = reopened.intent.clone();
+	stale.local_input_rows_digest = [3; 32];
+	let index = reopened.mgr.require_op_index().unwrap();
+	let ownership = index.try_acquire_ops(vec![ticket.key().op_seq]).unwrap();
+	let refused = reopened
+		.mgr
+		.clone()
+		.undo_abandoned_install(ticket, stale, ownership)
+		.await;
+	assert_eq!(refused.unwrap_err().kind(), ErrorKind::WouldBlock);
+	assert_eq!(reopened.rows().await, rows);
+	assert!(
+		slab_path(&reopened.dir, reopened.output()).exists(),
+		"nothing moved"
+	);
+	assert!(
+		!super::reservations::abandoned_output_path(&reopened.dir, reopened.output()).exists(),
+		"nothing moved"
+	);
+	reopened
+		.assert_rejected_install_ends("after the refusal")
+		.await;
+}
+
+// ADR 0697 slice 5, stage 4: a reservation's cleanup, from what its rows recorded.
+
+/// One reserved output at its final path, abandoned by a pass and ready for its cleanup.
+async fn abandoned_output_for_cleanup(
+	dir: &Path,
+	mgr: &Arc<SlabManager>,
+	driver: &crate::storage::op_driver::OpDriver,
+	reopenable: bool,
+) -> SlabId {
+	let _ = reopenable;
+	let exposed = mgr.reserve_exposed_slab_ids(1).await.unwrap();
+	let slab = exposed[0].id();
+	std::fs::write(slab_path(dir, slab), b"recorded output bytes").unwrap();
+	drop(exposed);
+	driver.drive_once().await.unwrap();
+	slab
+}
+
+async fn drive_until_id_ends(
+	mgr: &Arc<SlabManager>,
+	driver: &crate::storage::op_driver::OpDriver,
+	slab: SlabId,
+) {
+	let index = mgr.require_op_index().unwrap();
+	let mut last = Ok(());
+	for _ in 0..12 {
+		last = driver.drive_once().await;
+		if index.reserved_id_state(slab).await.unwrap().is_none() {
+			break;
+		}
+	}
+	assert_eq!(
+		index.reserved_id_state(slab).await.unwrap(),
+		None,
+		"{last:?}: {:?}",
+		index.load_op_intents().await.unwrap()
+	);
+	assert!(
+		removed_on_the_ring(mgr, slab).await,
+		"the identity ended on the ring"
+	);
+}
+
+fn no_cleanup_entries(dir: &Path) -> bool {
+	std::fs::read_dir(dir).unwrap().all(|entry| {
+		let name = entry.unwrap().file_name();
+		let name = name.to_string_lossy();
+		!name.starts_with("gc-quarantine-") && !name.starts_with("abandoned-output-")
+	})
+}
+
+/// A cut on each of a cleanup's own transactions, on both sides of the commit, resumes from
+/// what it recorded. These used to stay fenced for this slice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cut_cleanup_resumes_from_what_it_recorded() {
+	use crate::storage::index::OpTxnCut;
+	// The steps in order: the rows' allocation, QuarantineRecorded, RunDropped, the claim's
+	// handoff, the transition to submission, PurgeAuthorized, Purged, the final handoff.
+	for skip in 0..8_u8 {
+		for cut in [OpTxnCut::BeforeCommit, OpTxnCut::AfterCommit] {
+			let (dir, mgr, _cluster, _committer, driver) =
+				ring_store_for_reservations("s4-cut").await;
+			let slab = abandoned_output_for_cleanup(&dir, &mgr, &driver, false).await;
+			let index = mgr.require_op_index().unwrap();
+			index.cut_nth_op_txn(skip, cut);
+			let _ = driver.drive_once().await;
+			drive_until_id_ends(&mgr, &driver, slab).await;
+			assert!(no_cleanup_entries(&dir), "{skip} {cut:?}");
+			assert!(!slab_path(&dir, slab).exists(), "{skip} {cut:?}");
+		}
+	}
+}
+
+/// §6.1's file shapes at `QuarantineRecorded`, by hand: entry only and original only each
+/// finish, and neither name left fences with nothing recorded as done.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cleanups_recorded_disposal_resumes_from_its_files_or_fences() {
+	use crate::storage::index::{OpProgress, OpTxnCut};
+	for shape in ["both", "entry only", "original only", "neither"] {
+		let (dir, mgr, _cluster, _committer, driver) =
+			ring_store_for_reservations("s4-shape").await;
+		let slab = abandoned_output_for_cleanup(&dir, &mgr, &driver, false).await;
+		let index = mgr.require_op_index().unwrap();
+		// Past `QuarantineRecorded`, the run drop's own commit lost.
+		index.cut_nth_op_txn(2, OpTxnCut::BeforeCommit);
+		let _ = driver.drive_once().await;
+		let rows = index.load_op_intents().await.unwrap();
+		let recorded = rows.iter().find_map(|op| match op.progress() {
+			Some(OpProgress::QuarantineRecorded(file)) => Some(file.clone()),
+			_ => None,
+		});
+		assert!(recorded.is_some(), "premise: {rows:?}");
+		let entry = std::fs::read_dir(&*dir)
+			.unwrap()
+			.map(|entry| entry.unwrap().path())
+			.find(|path| {
+				path.file_name()
+					.unwrap()
+					.to_string_lossy()
+					.starts_with("gc-quarantine-")
+			})
+			.expect("premise: its entry");
+		let original = super::reservations::abandoned_output_path(&dir, slab);
+		let final_or_moved = if original.exists() {
+			original
+		} else {
+			slab_path(&dir, slab)
+		};
+		match shape {
+			"entry only" => {
+				let _ = std::fs::remove_file(&final_or_moved);
+			}
+			"original only" => {
+				if !final_or_moved.exists() {
+					std::fs::hard_link(&entry, &final_or_moved).unwrap();
+				}
+				std::fs::remove_file(&entry).unwrap();
+			}
+			"neither" => {
+				let _ = std::fs::remove_file(&final_or_moved);
+				std::fs::remove_file(&entry).unwrap();
+			}
+			_ => {
+				if !final_or_moved.exists() {
+					std::fs::hard_link(&entry, &final_or_moved).unwrap();
+				}
+			}
+		}
+		if shape == "neither" {
+			assert_eq!(
+				driver.drive_once().await.unwrap_err().kind(),
+				ErrorKind::WouldBlock
+			);
+			assert_eq!(
+				index.load_op_intents().await.unwrap(),
+				rows,
+				"nothing recorded as done"
+			);
+			assert!(!removed_on_the_ring(&mgr, slab).await);
+			continue;
+		}
+		drive_until_id_ends(&mgr, &driver, slab).await;
+		assert!(no_cleanup_entries(&dir), "{shape}");
+	}
+}
+
+/// A pass cancelled while its cleanup's stage is parked: the stage keeps both sequences until
+/// it can no longer write. This is the lifetime your stage 1 ruling carried to here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_aborted_cleanup_pass_keeps_its_ownership_through_its_stages() {
+	for stage in [1_u8, 2] {
+		let (dir, mgr, _cluster, _committer, driver) =
+			ring_store_for_reservations("s4-abort").await;
+		let driver = Arc::new(driver);
+		let slab = abandoned_output_for_cleanup(&dir, &mgr, &driver, false).await;
+		let entered = Arc::new(tokio::sync::Semaphore::new(0));
+		let release = Arc::new(tokio::sync::Semaphore::new(0));
+		*mgr.continuity_test_holds
+			.cleanup_validated_hold
+			.lock()
+			.unwrap() = Some((stage, entered.clone(), release.clone()));
+		let pass = {
+			let driver = driver.clone();
+			tokio::spawn(async move { driver.drive_once().await })
+		};
+		tokio::time::timeout(Duration::from_secs(60), entered.acquire())
+			.await
+			.unwrap()
+			.unwrap()
+			.forget();
+		pass.abort();
+		let _ = pass.await;
+		let index = mgr.require_op_index().unwrap();
+		let rows = index.load_op_intents().await.unwrap();
+		let seqs = rows.iter().map(|op| op.key().op_seq).collect::<Vec<_>>();
+		assert!(!seqs.is_empty(), "premise");
+		assert!(
+			index.try_acquire_ops(seqs.clone()).is_none(),
+			"{stage}: the aborted pass's stage still owns its rows"
+		);
+		release.add_permits(8);
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+		while index.try_acquire_ops(seqs.clone()).is_none() {
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"{stage}: never released"
+			);
+			tokio::task::yield_now().await;
+		}
+		*mgr.continuity_test_holds
+			.cleanup_validated_hold
+			.lock()
+			.unwrap() = None;
+		drive_until_id_ends(&mgr, &driver, slab).await;
+	}
+}
+
+/// A view saying applied grants no purge, and a contradiction fences at any phase.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cleanups_forged_or_conflicting_view_moves_nothing() {
+	use crate::storage::index::OpTxnCut;
+	for forge in [forge_applied, forge_rejected, forge_conflict] {
+		let (dir, mgr, cluster, committer, driver) = ring_store_for_reservations("s4-forge").await;
+		let slab = abandoned_output_for_cleanup(&dir, &mgr, &driver, false).await;
+		let index = mgr.require_op_index().unwrap();
+		index.cut_nth_op_txn(2, OpTxnCut::BeforeCommit);
+		let _ = driver.drive_once().await;
+		let rows = index.load_op_intents().await.unwrap();
+		let forged = ForgedView::new(committer.clone(), forge);
+		let driver = op_driver(&cluster, &mgr, forged.clone());
+		assert_eq!(
+			driver.drive_once().await.unwrap_err().kind(),
+			ErrorKind::WouldBlock
+		);
+		assert_eq!(index.load_op_intents().await.unwrap(), rows);
+		assert_eq!(forged.submitted.load(Ordering::SeqCst), 0);
+		assert!(!removed_on_the_ring(&mgr, slab).await);
+	}
+}
+
+/// §6.1, D7: a snapshot installed between apply and reopen. It delivers no callbacks, and
+/// recovery reads the decision from the state machine, so nothing it decided is lost.
+async fn install_a_peers_snapshot(cluster: &ControlCluster) {
+	use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
+	let target = cluster.nodes[0].metrics().borrow().last_applied;
+	tokio::time::timeout(Duration::from_secs(30), async {
+		while cluster.nodes[1].metrics().borrow().last_applied < target {
+			tokio::time::sleep(Duration::from_millis(5)).await;
+		}
+	})
+	.await
+	.expect("the peer applied what this node did");
+	let mut source = cluster.state_machines[1].clone();
+	let mut builder = <crate::consensus::WendelonStateMachine as RaftStateMachine<
+		crate::consensus::WendelonTypeConfig,
+	>>::get_snapshot_builder(&mut source)
+	.await;
+	let built = builder.build_snapshot().await.unwrap();
+	let meta = built.meta.clone();
+	let mut installed = cluster.state_machines[0].clone();
+	<crate::consensus::WendelonStateMachine as RaftStateMachine<
+		crate::consensus::WendelonTypeConfig,
+	>>::install_snapshot(&mut installed, &meta, built.snapshot)
+	.await
+	.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_snapshot_install_changes_no_decision_a_tier_op_resumes_from() {
+	let tier = reopen_tier_op(false, async |plain, ticket| {
+		plain.submit_op(ticket).await.unwrap();
+	})
+	.await;
+	install_a_peers_snapshot(&tier.cluster).await;
+	tier.drive_until_no_rows("applied").await;
+	assert_eq!(
+		tier.mgr.tier_pointer(tier.old.slab_id).await,
+		Some(tier.old.clone())
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_snapshot_install_changes_no_decision_a_cleanup_resumes_from() {
+	use crate::storage::index::OpTxnCut;
+	let (dir, mgr, cluster, _committer, driver) = ring_store_for_reservations("s4-snapshot").await;
+	let slab = abandoned_output_for_cleanup(&dir, &mgr, &driver, false).await;
+	mgr.require_op_index()
+		.unwrap()
+		.cut_nth_op_txn(5, OpTxnCut::BeforeCommit);
+	let _ = driver.drive_once().await;
+	assert!(
+		removed_on_the_ring(&mgr, slab).await,
+		"premise: Complete applied"
+	);
+	install_a_peers_snapshot(&cluster).await;
+	drive_until_id_ends(&mgr, &driver, slab).await;
+	assert!(no_cleanup_entries(&dir));
+}
+
+/// The real accessor, with a populated catalog: the state machine's, after its barrier.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_covered_install_recovers_from_the_state_machines_own_catalogs() {
+	let covered =
+		reopen_covered_install_at(lsm_driver::ControlLsmInstallCut::AfterAcceptance).await;
+	let (schemas, indexes) = covered.committer.catalogs.lock().unwrap().clone().unwrap();
+	covered.cluster.state_machines[0]
+		.seed_catalogs_for_test(schemas, indexes)
+		.await;
+	let CoveredInstall {
+		dir,
+		mgr,
+		owner,
+		cluster,
+		committer,
+		descriptor,
+		input,
+		output,
+		row,
+		old,
+		faults,
+	} = covered;
+	let plain = committer.inner.clone();
+	let (read_schemas, read_indexes) = plain.secondary_index_catalogs().await.unwrap();
+	assert!(
+		!read_indexes
+			.for_table(tenant(), descriptor.table_object_id)
+			.is_empty(),
+		"premise: the real accessor reads them"
+	);
+	let _ = read_schemas;
+	*committer.catalogs.lock().unwrap() = None;
+	let driver = op_driver(&cluster, &mgr, plain.clone());
+	for _ in 0..8 {
+		let _ = driver.drive_once().await;
+	}
+	let restored = CoveredInstall {
+		dir,
+		mgr,
+		owner,
+		cluster,
+		committer,
+		descriptor,
+		input,
+		output,
+		row,
+		old,
+		faults,
+	};
+	restored
+		.assert_ends_covered("through the real accessor")
+		.await;
+}
+
+/// A sidecar that cannot be persisted is not silently dropped: durable Partial and uncovered
+/// before the handoff, a query knows to fall back, and a reopen still knows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_sidecar_persist_is_durably_recorded_before_the_handoff() {
+	let covered =
+		reopen_covered_install_at(lsm_driver::ControlLsmInstallCut::AfterAcceptance).await;
+	covered.faults.inject(InjectedFault::on(
+		FaultOp::Link,
+		FaultAction::Error {
+			kind: ErrorKind::Other,
+			message: "injected sidecar publication failure".into(),
+		},
+	));
+	let driver = op_driver(&covered.cluster, &covered.mgr, covered.committer.clone());
+	for _ in 0..12 {
+		let _ = driver.drive_once().await;
+		if covered.rows().await.is_empty()
+			&& covered.mgr.tier_authority_readiness_reason().is_none()
+		{
+			break;
+		}
+	}
+	assert!(covered.rows().await.is_empty());
+	let index = covered.mgr.require_op_index().unwrap();
+	let run = index
+		.load_snapshot()
+		.await
+		.unwrap()
+		.lsm_runs
+		.into_iter()
+		.find(|run| run.slab_id == covered.output)
+		.unwrap();
+	assert_eq!(
+		run.sidecar_coverage,
+		crate::storage::SidecarCoverage::Partial
+	);
+	let key = covered.old.coverage_key();
+	let uncovered = |mgr: &SlabManager| {
+		mgr.secondary_index_coverage_snapshot(key)
+			.map(|coverage| coverage.covered_slabs)
+			.unwrap_or_default()
+	};
+	assert!(
+		!uncovered(&covered.mgr).contains(&covered.output),
+		"a query must not trust a sidecar that is not there"
+	);
+	// The query itself, through the ordinary path: this gap is refused, by name, and the row
+	// stays readable from its output.
+	let probe = TableLookupByIndexRequest::from_descriptor(
+		tenant(),
+		&covered.descriptor,
+		IndexQuery::PointEqual {
+			encoded_key: secondary_index_encoded_i64_for_test(10),
+		},
+		hlc(99),
+	);
+	let refused = covered
+		.mgr
+		.table_lookup_by_index(&probe, &covered.descriptor, SecondaryIndexState::Ready)
+		.await
+		.expect_err("a lookup over this gap refuses, and gives no incomplete answer");
+	assert!(refused.to_string().contains("uncovered"), "{refused}");
+	let location = covered.mgr.lookup(tenant(), covered.row).unwrap().unwrap();
+	assert_eq!(location.slab_id, covered.output, "its row is in its output");
+	let bytes = covered.mgr.read(location).await.unwrap();
+	let row = covered.row;
+	let CoveredInstall {
+		dir,
+		mgr,
+		owner,
+		output,
+		descriptor,
+		..
+	} = covered;
+	let _ = owner.close(Duration::from_secs(5)).await;
+	drop(mgr);
+	let next = DataDirectoryOwner::acquire_existing(&dir).expect("released");
+	let fresh = SlabManager::open_with_owner(gc_owned_test_config(&dir), next.clone())
+		.await
+		.unwrap();
+	assert_eq!(
+		fresh
+			.compaction_manifest_snapshot()
+			.run(output)
+			.unwrap()
+			.sidecar_coverage,
+		crate::storage::SidecarCoverage::Partial,
+		"a reopen still knows"
+	);
+	assert!(!uncovered(&fresh).contains(&output));
+	let refused = fresh
+		.table_lookup_by_index(&probe, &descriptor, SecondaryIndexState::Ready)
+		.await
+		.expect_err("still refused after a reopen");
+	assert!(refused.to_string().contains("uncovered"), "{refused}");
+	let location = fresh.lookup(tenant(), row).unwrap().unwrap();
+	assert_eq!(
+		fresh.read(location).await.unwrap(),
+		bytes,
+		"the same row, read again"
+	);
+	let _ = next.close(Duration::from_secs(2)).await;
+}
+
+/// H1: a rename parked in its own task, its caller cancelled. Recovery cannot take the row
+/// while the rename can still happen, and once it has, no final name survives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_late_rename_holds_recovery_off_and_no_final_name_survives() {
+	let dir = fresh_dir("s5-late-rename");
+	let owner = DataDirectoryOwner::acquire_existing(&dir).unwrap();
+	let manager =
+		SlabManager::initialize_new_store_with_owner(gc_owned_test_config(&dir), owner.clone())
+			.await
+			.unwrap();
+	let cluster = control_cluster_observing(&[(1, &manager)]).await;
+	register_owner(&cluster.nodes[0], &manager).await;
+	let plain = Arc::new(op_committer(&cluster, 1));
+	let keys = [id(0xb11b01), id(0xb11b02)];
+	manager
+		.append_durable(tenant(), keys[0], hlc(1), b"b11b-first")
+		.await
+		.unwrap();
+	let first = manager.force_seal_active_for_test().await;
+	manager
+		.append_durable(tenant(), keys[1], hlc(2), b"b11b-second")
+		.await
+		.unwrap();
+	let second = manager.force_seal_active_for_test().await;
+	let snapshot = manager.compaction_manifest_snapshot();
+	let plan = CompactionPlan {
+		job_id: CompactionJobId::new(0xb11b),
+		source_level: CompactionLevelIndex::L0,
+		target_level: CompactionLevelIndex::L1,
+		manifest_epoch_pre: snapshot.manifest_epoch,
+		input_slabs: vec![first, second],
+		overlapping_slabs: Vec::new(),
+		retention_floor_snapshot: hlc(100),
+		compaction_start_hlc: hlc(101),
+		dominant_reason: crate::storage::DominantReason::Operator,
+	};
+	let entered = Arc::new(tokio::sync::Semaphore::new(0));
+	let release = Arc::new(tokio::sync::Semaphore::new(0));
+	*manager
+		.continuity_test_holds
+		.lsm_rename_hold
+		.lock()
+		.unwrap() = Some((entered.clone(), release.clone()));
+	let task = {
+		let (manager, plain) = (manager.clone(), plain.clone());
+		tokio::spawn(async move {
+			let worker =
+				LsmCompactionWorker::new(LsmConfig::default(), manager.slab_pin_table()).unwrap();
+			manager
+				.run_lsm_compaction_once_via_control_ring(&worker, plan, plain.as_ref())
+				.await
+		})
+	};
+	tokio::time::timeout(Duration::from_secs(60), entered.acquire())
+		.await
+		.unwrap()
+		.unwrap()
+		.forget();
+	task.abort();
+	let _ = task.await;
+	let index = manager.require_op_index().unwrap();
+	let intent = index
+		.load_snapshot()
+		.await
+		.unwrap()
+		.lsm_install_intents
+		.remove(0);
+	let output = intent.local_output_files[0].slab_id;
+	let temp = lsm_driver::lsm_compaction_tmp_path(&dir, intent.commit.job_id, output);
+	let rows = index.load_op_intents().await.unwrap();
+	let driver = op_driver(&cluster, &manager, plain.clone());
+	let _ = driver.drive_once().await;
+	assert_eq!(
+		index.load_op_intents().await.unwrap(),
+		rows,
+		"recovery took the row"
+	);
+	assert!(temp.exists(), "recovery moved the file under its worker");
+	assert!(
+		!super::reservations::abandoned_output_path(&dir, output).exists(),
+		"recovery moved the file under its worker"
+	);
+	*manager
+		.continuity_test_holds
+		.lsm_rename_hold
+		.lock()
+		.unwrap() = None;
+	release.add_permits(8);
+	let seq = rows[0].key().op_seq;
+	tokio::time::timeout(Duration::from_secs(60), async {
+		while index.try_acquire_ops(vec![seq]).is_none() {
+			tokio::time::sleep(Duration::from_millis(5)).await;
+		}
+	})
+	.await
+	.expect("the rename finished and let go");
+	assert!(slab_path(&dir, output).exists(), "premise: it did rename");
+	let reopened = ReopenedInstall {
+		dir,
+		mgr: manager,
+		owner,
+		cluster,
+		plain,
+		keys,
+		inputs: [first, second],
+		intent,
+	};
+	reopened
+		.assert_rejected_install_ends("after its rename")
+		.await;
+}
+
+/// H1: more than one output, cut part way: one moved, then the handoff lost. The retry finds
+/// each where it is. The ring decided Cancel; every id reaches its end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_multi_output_rejected_install_resumes_from_each_outputs_name() {
+	use crate::storage::index::OpTxnCut;
+	let reopened = reopen_install_with_config(
+		lsm_driver::ControlLsmInstallCut::BeforeRename,
+		LsmConfig {
+			lsm_l1_slab_size_target_bytes: 1,
+			..LsmConfig::default()
+		},
+	)
+	.await;
+	let outputs = reopened
+		.intent
+		.local_output_files
+		.iter()
+		.map(|file| file.slab_id)
+		.collect::<Vec<_>>();
+	assert!(outputs.len() > 1, "premise: {outputs:?}");
+	let temp = lsm_driver::lsm_compaction_tmp_path(
+		&reopened.dir,
+		reopened.intent.commit.job_id,
+		outputs[0],
+	);
+	let moved = super::reservations::abandoned_output_path(&reopened.dir, outputs[0]);
+	std::fs::hard_link(&temp, &moved).unwrap();
+	std::fs::remove_file(&temp).unwrap();
+	let index = reopened.mgr.require_op_index().unwrap();
+	index.cut_next_op_txn(OpTxnCut::BeforeCommit);
+	let driver = op_driver(&reopened.cluster, &reopened.mgr, reopened.plain.clone());
+	assert!(
+		driver.drive_once().await.is_err(),
+		"the handoff's cut lands"
+	);
+	for _ in 0..24 {
+		let _ = driver.drive_once().await;
+	}
+	for output in &outputs {
+		assert_eq!(
+			index.reserved_id_state(*output).await.unwrap(),
+			None,
+			"{output:?}"
+		);
+		assert!(!slab_path(&reopened.dir, *output).exists());
+		assert!(!super::reservations::abandoned_output_path(&reopened.dir, *output).exists());
+	}
+	reopened.assert_rejected_install_ends("multi-output").await;
+}
+
+/// Your call 4: a rejection the ring recorded that is not a Cancel, surviving the store, and
+/// what recovery does with it: the install ends, its inputs serve, and its output is moved
+/// out of the namespace with its identity on its reservation. Tiering the output's id first
+/// is what makes a real ring refuse it, and it also refuses that id's later claim.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_recorded_non_cancel_rejection_recovers_an_install_after_a_reopen() {
+	use crate::consensus::slab_ops::{RecordedOutcome, SlabRejection, ViewOutcome};
+	let reopened = reopen_install_at(lsm_driver::ControlLsmInstallCut::AfterRename).await;
+	let owner = reopened.mgr.owner_ref().unwrap();
+	let rows = reopened.rows().await;
+	let LoadedOp::Submittable(ticket) = rows[0].clone() else {
+		panic!("submitted: {rows:?}");
+	};
+	let output = reopened.output();
+	let tier = crate::consensus::TieredSlab {
+		slab: owner.slab(output),
+		..b10_tier(
+			&reopened.mgr,
+			&TieredSlabPointer {
+				slab_id: output,
+				l2_uri: "memory://s5/never-read".to_string(),
+				payload_hash: [7; 32],
+				is_encrypted: false,
+				tenant_id: Some(tenant()),
+				tenant_kek_id: None,
+				stats_format_version: None,
+				stats_block_len: None,
+				stats_block_hash128: None,
+				tombstone_metadata: Default::default(),
+				supersession_metadata: Default::default(),
+			},
+		)
+	};
+	let tier_op = reopened
+		.mgr
+		.require_op_index()
+		.unwrap()
+		.allocate_ops(
+			vec![crate::consensus::slab_ops::SlabCommand::Tier(
+				crate::consensus::slab_ops::TierOp {
+					tier,
+					replaces: None,
+				},
+			)],
+			None,
+		)
+		.await
+		.unwrap()
+		.first;
+	reopened.plain.submit_op(&tier_op).await.unwrap();
+	assert!(matches!(
+		reopened.plain.submit_op(&ticket).await.unwrap(),
+		crate::storage::VerifiedReceipt::Rejected {
+			reason: SlabRejection::Tiered,
+			..
+		}
+	));
+	let view = reopened
+		.plain
+		.op_view(ticket.key(), ticket.digest(), ticket.command().slabs())
+		.await
+		.unwrap();
+	assert!(
+		matches!(
+			view.outcome,
+			ViewOutcome::Recorded(RecordedOutcome::Rejected {
+				reason: SlabRejection::Tiered,
+				..
+			})
+		),
+		"premise: {view:?}"
+	);
+	let index = reopened.mgr.require_op_index().unwrap();
+	reopened
+		.mgr
+		.recover_abandoned_installs(reopened.plain.as_ref())
+		.await
+		.unwrap();
+	assert!(
+		!index
+			.load_op_intents()
+			.await
+			.unwrap()
+			.iter()
+			.any(|op| op.key() == ticket.key()),
+		"the install ended"
+	);
+	assert!(
+		index
+			.load_snapshot()
+			.await
+			.unwrap()
+			.lsm_install_intents
+			.is_empty()
+	);
+	assert!(
+		!slab_path(&reopened.dir, output).exists(),
+		"moved out of the namespace"
+	);
+	assert!(super::reservations::abandoned_output_path(&reopened.dir, output).exists());
+	assert!(matches!(
+		index.reserved_id_state(output).await.unwrap(),
+		Some(crate::storage::index::ReservedIdState::Exposed { abandoned: Some(_) })
+	));
+	let _ = reopened.owner.close(Duration::from_secs(2)).await;
+}
+
+/// H3: a publication's outcome could not be read, on either side of its commit. Nothing is
+/// completed on a guess and nothing is orphaned: the next pass decides it and finishes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unreadable_publication_outcome_is_decided_by_the_next_pass() {
+	use crate::storage::index::OpTxnCut;
+	for cut in [
+		None,
+		Some(OpTxnCut::BeforeCommit),
+		Some(OpTxnCut::AfterCommit),
+	] {
+		let reopened = reopen_install_at(lsm_driver::ControlLsmInstallCut::AfterAcceptance).await;
+		if let Some(cut) = cut {
+			reopened
+				.mgr
+				.require_op_index()
+				.unwrap()
+				.cut_next_op_txn(cut);
+		}
+		reopened
+			.mgr
+			.continuity_test_holds
+			.fail_publication_readback
+			.store(true, Ordering::Release);
+		let rows = reopened.rows().await;
+		let driver = op_driver(&reopened.cluster, &reopened.mgr, reopened.plain.clone());
+		assert!(driver.drive_once().await.is_err(), "{cut:?}");
+		assert_eq!(
+			reopened.rows().await,
+			rows,
+			"{cut:?}: no handoff on an unknown outcome"
+		);
+		assert!(
+			!reopened.mgr.has_orphaned_index_publications(),
+			"{cut:?}: held, not orphaned"
+		);
+		reopened.assert_applied_install_ends(cut).await;
+	}
+}
+
+/// H2: this hold sits after the tier's evidence is prepared and before its lease is taken. It
+/// shows no authority is held at that point and that a supersession there installs nothing. It
+/// is not a stalled object store; source order answers for the fetch itself.
+async fn parked_tier_delivery() -> (
+	ReopenedTierOp,
+	Arc<tokio::sync::Semaphore>,
+	tokio::task::JoinHandle<std::io::Result<()>>,
+) {
+	let tier = reopen_tier_op(false, async |plain, ticket| {
+		plain.submit_op(ticket).await.unwrap();
+	})
+	.await;
+	let entered = Arc::new(tokio::sync::Semaphore::new(0));
+	let release = Arc::new(tokio::sync::Semaphore::new(0));
+	*tier
+		.mgr
+		.continuity_test_holds
+		.tier_delivery_hold
+		.lock()
+		.unwrap() = Some((entered.clone(), release.clone()));
+	let pass = {
+		let (mgr, plain) = (tier.mgr.clone(), tier.plain.clone());
+		tokio::spawn(async move { mgr.recover_abandoned_tier_ops(plain.as_ref()).await })
+	};
+	tokio::time::timeout(Duration::from_secs(30), entered.acquire())
+		.await
+		.unwrap()
+		.unwrap()
+		.forget();
+	(tier, release, pass)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tier_delivery_holds_no_authority_between_preparing_and_its_lease() {
+	let (tier, release, pass) = parked_tier_delivery().await;
+	// A write to the state machine, which any held lease would stop.
+	tokio::time::timeout(
+		Duration::from_secs(10),
+		tier.cluster.nodes[0].client_write(crate::consensus::WendelonRequest::RegisterIncarnation(
+			crate::consensus::RegisterIncarnation {
+				node: 2,
+				incarnation: crate::consensus::StoreIncarnation::from_raw(0x2222),
+				supersedes: None,
+			},
+		)),
+	)
+	.await
+	.expect("no authority is held while it gathers")
+	.unwrap();
+	release.add_permits(8);
+	pass.await.unwrap().unwrap();
+	tier.drive_until_no_rows("applied").await;
+	assert_eq!(
+		tier.mgr.tier_pointer(tier.old.slab_id).await,
+		Some(tier.old.clone())
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_supersession_during_a_tier_delivery_installs_nothing() {
+	let (tier, release, pass) = parked_tier_delivery().await;
+	supersede_store(&tier.cluster.nodes[0], tier.mgr.owner_ref().unwrap()).await;
+	release.add_permits(8);
+	assert_eq!(
+		pass.await.unwrap().unwrap_err().kind(),
+		ErrorKind::WouldBlock
+	);
+	assert_eq!(tier.mgr.tier_pointer(tier.old.slab_id).await, None);
+	assert_eq!(tier.rows().await.len(), 1, "its row stays");
+}
+
+/// A replacement generation is the path that does reach object storage for its old payload.
+/// It is prepared first, and what it prepared is what it publishes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_applied_replacement_tier_op_installs_its_generation_after_a_reopen() {
+	use crate::consensus::slab_ops::{SlabCommand, TierGeneration, TierOp};
+	let (dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let cluster = control_cluster_observing(&[]).await;
+	mgr.bind_control_node(1).unwrap();
+	register_owner(&cluster.nodes[0], &mgr).await;
+	let plain = Arc::new(op_committer(&cluster, 1));
+	let index = mgr.require_op_index().unwrap();
+	let first = index
+		.allocate_ops(
+			vec![SlabCommand::Tier(TierOp {
+				tier: b10_tier(&mgr, &old),
+				replaces: None,
+			})],
+			None,
+		)
+		.await
+		.unwrap()
+		.first;
+	plain.submit_op(&first).await.unwrap();
+	mgr.hand_off_op_if_complete(&first).await.unwrap();
+	let bytes = l2.get(&old.l2_uri).await.unwrap();
+	let replacement = TieredSlabPointer {
+		l2_uri: l2.put("tier/s5-replacement.wnd", &bytes).await.unwrap(),
+		..old.clone()
+	};
+	let ticket = index
+		.allocate_ops(
+			vec![SlabCommand::Tier(TierOp {
+				tier: b10_tier(&mgr, &replacement),
+				replaces: Some(TierGeneration::from(&old)),
+			})],
+			None,
+		)
+		.await
+		.unwrap()
+		.first;
+	plain.submit_op(&ticket).await.unwrap();
+	let mgr = try_restart_tier_manager(mgr, &dirs, &l2).await.unwrap();
+	mgr.bind_control_node(1).unwrap();
+	mgr.bind_canonical_tier_source(cluster.state_machines[0].tier_snapshot_source_for_test());
+	let tier = ReopenedTierOp {
+		_dirs: dirs,
+		mgr,
+		l2,
+		cluster,
+		plain,
+		old,
+	};
+	assert_eq!(
+		tier.mgr.tier_pointer(tier.old.slab_id).await,
+		Some(tier.old.clone()),
+		"premise"
+	);
+	tier.drive_until_no_rows("replacement").await;
+	assert_eq!(
+		tier.mgr.tier_pointer(tier.old.slab_id).await,
+		Some(replacement)
+	);
+}
+
+/// A key whose only version was in a run that is gone leaves the routing indexes too, as it
+/// would from a fresh open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_key_only_in_a_gone_run_leaves_the_routing_indexes() {
+	let gc = reopen_gc_at(GcStop::AfterUnlink).await;
+	let ghost = id(0xa11ce);
+	let location = RecordLocation {
+		slab_id: gc.slab_id,
+		offset: 1 << 20,
+		..gc.mgr
+			.key_index
+			.iter()
+			.next()
+			.map(|entry| entry.value()[0])
+			.unwrap()
+	};
+	let locality = Locality::from(id(0xbeef));
+	gc.mgr.key_index.insert((tenant(), ghost), vec![location]);
+	gc.mgr.key_localities.insert((tenant(), ghost), locality);
+	crate::storage::manager::recover_rwlock_write(&gc.mgr.locality_index, "locality_index")
+		.entry(tenant())
+		.or_default()
+		.insert((locality, ghost));
+	gc.finish("a gone key").await;
+	assert!(gc.mgr.key_localities.get(&(tenant(), ghost)).is_none());
+	assert!(
+		!crate::storage::manager::recover_rwlock_read(&gc.mgr.locality_index, "locality_index")
+			.get(&tenant())
+			.is_some_and(|members| members.contains(&(locality, ghost))),
+		"its routing entry went with it"
+	);
+	gc.close().await;
+}
+
+// ADR 0697 §9.3, the partials a line-by-line audit found.
+
+/// A reservation store that can be reopened against its ring.
+async fn reopenable_reservation_store(
+	label: &str,
+) -> (
+	crate::test_support::TestDir,
+	Arc<SlabManager>,
+	DataDirectoryOwner,
+	ControlCluster,
+	Arc<crate::storage::RaftCommitter>,
+) {
+	let dir = fresh_dir(label);
+	let owner = DataDirectoryOwner::acquire_existing(&dir).unwrap();
+	let mgr =
+		SlabManager::initialize_new_store_with_owner(gc_owned_test_config(&dir), owner.clone())
+			.await
+			.unwrap();
+	let cluster = control_cluster_observing(&[(1, &mgr)]).await;
+	register_owner(&cluster.nodes[0], &mgr).await;
+	let plain = Arc::new(op_committer(&cluster, 1));
+	(dir, mgr, owner, cluster, plain)
+}
+
+async fn reopen_reservation_store(
+	dir: &crate::test_support::TestDir,
+	owner: DataDirectoryOwner,
+	cluster: &ControlCluster,
+) -> (Arc<SlabManager>, DataDirectoryOwner) {
+	let _ = owner.close(Duration::from_secs(5)).await;
+	let next = DataDirectoryOwner::acquire_existing(dir).expect("released");
+	let mgr = SlabManager::open_with_owner(gc_owned_test_config(dir), next.clone())
+		.await
+		.unwrap();
+	mgr.bind_control_node(1).unwrap();
+	mgr.bind_canonical_tier_source(cluster.state_machines[0].tier_snapshot_source_for_test());
+	(mgr, next)
+}
+
+/// `reacquire_exposed` after a real restart, with nothing live-held: `Exposed` rebuilds, and
+/// `Burning`, `Unsubmitted` and absent each refuse, typed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn after_a_reopen_only_exposed_rebuilds_the_capability() {
+	use crate::storage::index::ReservationRefused;
+	let (dir, mgr, owner, cluster, _plain) = reopenable_reservation_store("a93-reacquire").await;
+	let index = mgr.require_op_index().unwrap();
+	let exposed = mgr.reserve_exposed_slab_ids(1).await.unwrap();
+	let live = exposed[0].id();
+	let unsubmitted = mgr.reserve_slab_ids(2).await.unwrap();
+	let (kept, burned) = (unsubmitted[0].id(), unsubmitted[1].id());
+	drop(exposed);
+	drop(unsubmitted);
+	index
+		.begin_burn(burned, mgr.owner_ref().unwrap())
+		.await
+		.unwrap();
+	drop(mgr);
+	let (mgr, next) = reopen_reservation_store(&dir, owner, &cluster).await;
+	assert_eq!(mgr.reacquire_exposed(live).await.unwrap().id(), live);
+	let absent = SlabId::new(0x40_000);
+	for (id, name) in [
+		(kept, "Unsubmitted"),
+		(burned, "Burning"),
+		(absent, "absent"),
+	] {
+		let error = mgr.reacquire_exposed(id).await.expect_err(name);
+		assert_eq!(error.kind(), ErrorKind::WouldBlock, "{name}");
+		assert!(
+			error
+				.get_ref()
+				.is_some_and(|cause| cause.is::<ReservationRefused>()),
+			"{name}: {error}"
+		);
+	}
+	let _ = next.close(Duration::from_secs(2)).await;
+}
+
+/// A crash in `Burning`, with a real reopen: its driver finishes the burn, and the id can
+/// never be exposed again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_burn_resumes_after_a_reopen_and_stays_burned() {
+	let (dir, mgr, owner, cluster, plain) = reopenable_reservation_store("a93-burn").await;
+	let index = mgr.require_op_index().unwrap();
+	let reserved = mgr.reserve_slab_ids(1).await.unwrap();
+	let id = reserved[0].id();
+	drop(reserved);
+	index
+		.begin_burn(id, mgr.owner_ref().unwrap())
+		.await
+		.unwrap();
+	drop(mgr);
+	let (mgr, next) = reopen_reservation_store(&dir, owner, &cluster).await;
+	assert!(
+		mgr.reacquire_exposed(id).await.is_err(),
+		"refused before it finishes"
+	);
+	let driver = op_driver(&cluster, &mgr, plain);
+	let index = mgr.require_op_index().unwrap();
+	for _ in 0..8 {
+		let _ = driver.drive_once().await;
+		if index.reserved_id_state(id).await.unwrap().is_none() {
+			break;
+		}
+	}
+	assert_eq!(index.reserved_id_state(id).await.unwrap(), None);
+	assert!(removed_on_the_ring(&mgr, id).await);
+	let after = mgr
+		.reacquire_exposed(id)
+		.await
+		.expect_err("refused after, too");
+	assert!(
+		after
+			.get_ref()
+			.is_some_and(|cause| cause.is::<crate::storage::index::ReservationRefused>()),
+		"{after}"
+	);
+	let _ = next.close(Duration::from_secs(2)).await;
+}
+
+/// Drives everything but the Ack: what a store that dies between the two left.
+struct HoldsAcks(Arc<crate::storage::RaftCommitter>);
+
+#[async_trait]
+impl TierCommitter for HoldsAcks {
+	async fn preflight(&self, owner: crate::consensus::OwnerRef) -> std::io::Result<()> {
+		self.0.preflight(owner).await
+	}
+	async fn submit_op(
+		&self,
+		ticket: &crate::storage::index::OpTicket,
+	) -> std::io::Result<crate::storage::VerifiedReceipt> {
+		self.0.submit_op(ticket).await
+	}
+	async fn cancel_op(
+		&self,
+		ticket: &crate::storage::index::OpTicket,
+	) -> std::io::Result<crate::storage::VerifiedReceipt> {
+		self.0.cancel_op(ticket).await
+	}
+	async fn op_view(
+		&self,
+		key: crate::consensus::slab_ops::OpKey,
+		digest: [u8; 32],
+		slabs: Vec<crate::consensus::SlabRef>,
+	) -> std::io::Result<crate::consensus::slab_ops::OpView> {
+		self.0.op_view(key, digest, slabs).await
+	}
+	async fn ack_outcomes(
+		&self,
+		_owner: crate::consensus::OwnerRef,
+		_seqs: Vec<u64>,
+	) -> std::io::Result<crate::consensus::slab_ops::AckReceipt> {
+		Err(Error::other("injected: this store died before its Ack"))
+	}
+}
+
+/// A crash between the handoff and the Ack: the Ack is driven with nothing replayed, the
+/// prefix moves, and nothing is left behind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_crash_between_a_handoff_and_its_ack_acks_with_no_replay() {
+	let gc = reopen_gc_at(GcStop::CompleteAppliedAnswerLost).await;
+	let owner = gc.mgr.owner_ref().unwrap();
+	let holding = gc.driver(Arc::new(HoldsAcks(gc.plain.clone())));
+	for _ in 0..8 {
+		let _ = holding.drive_once().await;
+		if gc.rows().await.is_empty() {
+			break;
+		}
+	}
+	drop(holding);
+	assert!(gc.rows().await.is_empty(), "premise: handed off");
+	let index = gc.mgr.require_op_index().unwrap();
+	assert!(
+		!index.load_ack_pending().await.unwrap().is_empty(),
+		"premise: not acked"
+	);
+	assert_eq!(
+		gc.cluster.state_machines[0].op_acked_through(owner).await,
+		0,
+		"premise: the ring has no Ack"
+	);
+	let gc = gc.reopen().await;
+	let index = gc.mgr.require_op_index().unwrap();
+	let asked = ForgedView::new(gc.plain.clone(), |_| {});
+	let driver = gc.driver(asked.clone());
+	for _ in 0..4 {
+		driver.drive_once().await.unwrap();
+	}
+	assert_eq!(
+		asked.submitted.load(Ordering::SeqCst),
+		0,
+		"nothing replayed"
+	);
+	assert!(
+		index.load_ack_pending().await.unwrap().is_empty(),
+		"no leak"
+	);
+	assert_eq!(
+		gc.cluster.state_machines[0].op_acked_through(owner).await,
+		2,
+		"the prefix moved past both"
+	);
+	gc.close().await;
+}
+
+/// A sweep's mark held at the ring's door while a tier of its slab lands, so the ring really
+/// decides the claim against it: a sweep that knows of the tier never proposes a mark.
+async fn lose_a_claim_to_a_tier(
+	mgr: &Arc<SlabManager>,
+	cluster: &ControlCluster,
+	pointer: &TieredSlabPointer,
+) {
+	let entered = Arc::new(tokio::sync::Semaphore::new(0));
+	let release = Arc::new(tokio::sync::Semaphore::new(0));
+	let pausing = PauseAroundMark {
+		before: true,
+		inner: op_committer(cluster, 1),
+		entered: entered.clone(),
+		release: release.clone(),
+	};
+	let sweep = {
+		let mgr = mgr.clone();
+		tokio::spawn(async move {
+			mgr.sweep_lsm_delete_pending_once_via_control_ring(&new_gc(&mgr), &pausing)
+				.await
+		})
+	};
+	tokio::time::timeout(Duration::from_secs(60), entered.acquire())
+		.await
+		.unwrap()
+		.unwrap()
+		.forget();
+	crate::storage::sweeper::propose_tier_slab(
+		mgr,
+		&op_committer(cluster, 1),
+		b10_tier(mgr, pointer),
+		None,
+	)
+	.await
+	.unwrap();
+	release.add_permits(8);
+	let swept = tokio::time::timeout(Duration::from_secs(60), sweep)
+		.await
+		.expect("the parked sweep finishes")
+		.expect("the parked sweep does not panic")
+		.expect("a lost claim is a recorded outcome, not a failed sweep");
+	assert_eq!(swept, Vec::new(), "it collected nothing");
+	// That it lost, to the tier, is read from the ring and the row it recorded.
+	assert_eq!(
+		rejected_on_the_ring(
+			mgr,
+			cluster,
+			crate::consensus::slab_ops::SlabRejection::Tiered
+		)
+		.await,
+		1,
+		"its mark lost to the tier"
+	);
+}
+
+/// How many of this store's outcomes the ring has recorded rejected for `wanted`.
+async fn rejected_on_the_ring(
+	mgr: &SlabManager,
+	cluster: &ControlCluster,
+	wanted: crate::consensus::slab_ops::SlabRejection,
+) -> usize {
+	cluster.state_machines[0].state_snapshot().await.op_tables[&mgr.owner_ref().unwrap()]
+		.outcomes
+		.values()
+		.filter(|entry| {
+			matches!(
+				&entry.outcome,
+				crate::consensus::slab_ops::RecordedOutcome::Rejected { reason, .. }
+					if *reason == wanted
+			)
+		})
+		.count()
+}
+
+/// A lost claim, all the way through: its Complete Cancelled, read from the ring before any
+/// Ack prunes it, and both rows gone, with the driver stopping only at the Ack it was denied.
+async fn assert_a_lost_claim_resolves(
+	mgr: &Arc<SlabManager>,
+	cluster: &ControlCluster,
+	plain: Arc<crate::storage::RaftCommitter>,
+	slab_id: SlabId,
+	before: &LsmRunSummary,
+) {
+	use crate::consensus::slab_ops::SlabRejection;
+	assert!(!before.state.is_live(), "premise: a retired run");
+	let driver = op_driver(cluster, mgr, Arc::new(HoldsAcks(plain)));
+	let held = driver.drive_once().await.unwrap_err();
+	assert!(held.to_string().contains("before its Ack"), "{held}");
+	assert_eq!(
+		rejected_on_the_ring(mgr, cluster, SlabRejection::Tiered).await,
+		1,
+		"the claim"
+	);
+	assert_eq!(
+		rejected_on_the_ring(mgr, cluster, SlabRejection::Cancelled).await,
+		1,
+		"its reserved Complete"
+	);
+	let index = mgr.require_op_index().unwrap();
+	assert_eq!(index.load_rejected_claims().await.unwrap().len(), 0);
+	// The tier that won keeps its own row and its own lifecycle; the claim's two have ended.
+	let rows = index.load_op_intents().await.unwrap();
+	assert!(
+		rows.iter().all(|op| matches!(
+			op.command(),
+			crate::consensus::slab_ops::SlabCommand::Tier(_)
+		)),
+		"{rows:?}"
+	);
+	// Restored to what it was, not to live: in memory, and in the row a reopen reads.
+	assert_eq!(
+		mgr.compaction_manifest_snapshot()
+			.run(slab_id)
+			.map(|run| run.state.clone()),
+		Some(before.state.clone()),
+		"in memory"
+	);
+	let durable = index.load_snapshot().await.unwrap();
+	let row = durable
+		.lsm_runs
+		.iter()
+		.find(|run| run.slab_id == slab_id)
+		.expect("its durable run");
+	assert_eq!(row.state, before.state, "durably");
+}
+
+/// A rejected claim's Complete is Cancelled on the ring, as well as gone locally: read from
+/// the ring's own table before any Ack prunes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rejected_claims_complete_is_cancelled_on_the_ring() {
+	let (_dirs, mgr, cluster, slab_id, pointer) = dc157_ring_fixture("a93-claim").await;
+	let plain = Arc::new(op_committer(&cluster, 1));
+	let before = mgr
+		.compaction_manifest_snapshot()
+		.run(slab_id)
+		.cloned()
+		.unwrap();
+	lose_a_claim_to_a_tier(&mgr, &cluster, &pointer).await;
+	assert_a_lost_claim_resolves(&mgr, &cluster, plain, slab_id, &before).await;
+}
+
+/// A rejected claim restores what it found: a pin bit that was already set stays set.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rejected_claim_keeps_a_delete_pending_bit_it_found_set() {
+	let (_dirs, mgr, cluster, slab_id, pointer) = dc157_ring_fixture("a93-pin").await;
+	let plain = Arc::new(op_committer(&cluster, 1));
+	assert!(
+		mgr.slab_pins.mark_delete_pending(slab_id),
+		"premise: set before the sweep"
+	);
+	let before = mgr
+		.compaction_manifest_snapshot()
+		.run(slab_id)
+		.cloned()
+		.unwrap();
+	lose_a_claim_to_a_tier(&mgr, &cluster, &pointer).await;
+	assert_a_lost_claim_resolves(&mgr, &cluster, plain, slab_id, &before).await;
+	assert!(
+		mgr.slab_pins.is_delete_pending(slab_id),
+		"a claim that lost does not clear what it did not set"
+	);
+}
+
+/// R1 and the hole, on one allocator and one real ring: a hole holds the window through Acks
+/// of everything after it, new work is refused, and Cancel, Ack and the prefix resume it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hole_holds_admission_through_later_acks_and_its_cancel_resumes_it() {
+	use crate::consensus::slab_ops::{OPS_WINDOW_W, SlabCommand};
+	use crate::storage::index::TerminalBacklog;
+	let (dir, mgr, owner_guard, cluster, plain) = reopenable_reservation_store("a93-hole").await;
+	let _ = (&dir, &owner_guard);
+	let index = mgr.require_op_index().unwrap();
+	let owner = mgr.owner_ref().unwrap();
+	// Sequence one: allocated, and never sent.
+	let burn = |offset: u64| {
+		SlabCommand::BurnReserved(crate::consensus::slab_ops::BurnOp {
+			slab: owner.slab(SlabId::new(0x20_000 + offset)),
+		})
+	};
+	let hole = index.allocate_ops(vec![burn(0)], None).await.unwrap().first;
+	let mut later = Vec::new();
+	for offset in 1..OPS_WINDOW_W {
+		let ticket = index
+			.allocate_ops(vec![burn(offset)], None)
+			.await
+			.unwrap()
+			.first;
+		plain.submit_op(&ticket).await.unwrap();
+		index
+			.hand_off_op(ticket.key(), ticket.digest(), None)
+			.await
+			.unwrap();
+		later.push(ticket.key().op_seq);
+	}
+	for chunk in later.chunks(64) {
+		let receipt = plain.ack_outcomes(owner, chunk.to_vec()).await.unwrap();
+		assert_eq!(receipt.accepted, chunk, "these Acks are accepted");
+		index.mark_ops_acked(receipt.accepted).await.unwrap();
+	}
+	assert_eq!(
+		cluster.state_machines[0].op_acked_through(owner).await,
+		0,
+		"the hole holds the prefix"
+	);
+	let refused = index
+		.allocate_ops(vec![burn(9_999)], None)
+		.await
+		.expect_err("refused");
+	assert!(
+		refused
+			.get_ref()
+			.is_some_and(|cause| cause.is::<TerminalBacklog>()),
+		"{refused}"
+	);
+	let next = index.next_op_seq_for_test().await.unwrap();
+	// Recovery closes the hole by its own digest, and the driver acks and reads the prefix.
+	let driver = op_driver(&cluster, &mgr, plain.clone());
+	plain.cancel_op(&hole).await.unwrap();
+	index
+		.hand_off_op(hole.key(), hole.digest(), None)
+		.await
+		.unwrap();
+	for _ in 0..4 {
+		let _ = driver.drive_once().await;
+	}
+	assert!(
+		cluster.state_machines[0].op_acked_through(owner).await >= OPS_WINDOW_W,
+		"the prefix crossed the closed hole"
+	);
+	assert_eq!(
+		index.next_op_seq_for_test().await.unwrap(),
+		next,
+		"the refusal took nothing"
+	);
+	let admitted = index
+		.allocate_ops(vec![burn(9_999)], None)
+		.await
+		.unwrap()
+		.first;
+	assert_eq!(admitted.key().op_seq, next, "admission resumed");
+}
+
+/// A lost answer, retried with the same key and digest: the original decision, at its
+/// original index, with nothing applied twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_retry_after_a_lost_answer_returns_the_original_receipt() {
+	let gc = reopen_gc_at(GcStop::CompleteAppliedAnswerLost).await;
+	let rows = gc.rows().await;
+	let LoadedOp::Submittable(ticket) = rows[0].clone() else {
+		panic!("submitted: {rows:?}");
+	};
+	let view = gc
+		.plain
+		.op_view(ticket.key(), ticket.digest(), ticket.command().slabs())
+		.await
+		.unwrap();
+	let crate::consensus::slab_ops::ViewOutcome::Recorded(
+		crate::consensus::slab_ops::RecordedOutcome::Applied { index },
+	) = view.outcome
+	else {
+		panic!("premise: the ring applied it");
+	};
+	let before = gc.cluster.state_machines[0].state_snapshot().await;
+	let retried = gc.plain.submit_op(&ticket).await.unwrap();
+	assert!(
+		matches!(retried, crate::storage::VerifiedReceipt::Applied { index: found } if found == index),
+		"{retried:?} against {index}"
+	);
+	let after = gc.cluster.state_machines[0].state_snapshot().await;
+	assert_eq!(
+		before.op_tables[&ticket.key().owner].outcomes.len(),
+		after.op_tables[&ticket.key().owner].outcomes.len(),
+		"nothing new recorded"
+	);
+	gc.finish("after the retry").await;
+	gc.close().await;
+}
+
+/// §9.3's "for every producer", for these four: each, at a full window, refused typed with no
+/// row. It does not cover every producer by itself; the acceptance map names the rest.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tier_retire_mark_and_reservation_are_refused_at_a_full_window() {
+	use crate::consensus::slab_ops::{OPS_WINDOW_W, SlabCommand};
+	let (_dirs, mgr, cluster, slab_id, pointer) = dc157_ring_fixture("a93-producers").await;
+	let plain = Arc::new(op_committer(&cluster, 1));
+	let index = mgr.require_op_index().unwrap();
+	let owner = mgr.owner_ref().unwrap();
+	let burn = |offset: u64| {
+		SlabCommand::BurnReserved(crate::consensus::slab_ops::BurnOp {
+			slab: owner.slab(SlabId::new(0x20_000 + offset)),
+		})
+	};
+	for offset in 0..OPS_WINDOW_W {
+		index.allocate_ops(vec![burn(offset)], None).await.unwrap();
+	}
+	let rows = index.load_op_intents().await.unwrap();
+	let is_backlog = |error: &Error| crate::storage::sweeper::op_window_refused(error);
+	let tier = crate::storage::sweeper::propose_tier_slab(
+		&mgr,
+		plain.as_ref(),
+		b10_tier(&mgr, &pointer),
+		None,
+	)
+	.await
+	.unwrap_err();
+	assert!(is_backlog(&tier), "Tier: {tier}");
+	let retire = crate::storage::sweeper::propose_tier_retirement(
+		&mgr,
+		plain.as_ref(),
+		slab_id,
+		crate::consensus::slab_ops::TierGeneration::from(&pointer),
+	)
+	.await
+	.unwrap_err();
+	assert!(is_backlog(&retire), "Retire: {retire}");
+	let mark = mgr
+		.sweep_lsm_delete_pending_once_via_control_ring(&new_gc(&mgr), plain.as_ref())
+		.await
+		.unwrap_err();
+	assert!(is_backlog(&mark), "a GC mark: {mark}");
+	let reservation = mgr
+		.reserve_exposed_slab_ids(1)
+		.await
+		.expect_err("a reservation");
+	assert!(is_backlog(&reservation), "a reservation: {reservation}");
+	assert_eq!(
+		index.load_op_intents().await.unwrap(),
+		rows,
+		"nothing was inserted"
+	);
+}
+
+/// A real `install_snapshot`, not a round trip of the bytes: a duplicate after its Ack is
+/// unavailable through it too, and applies nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_duplicate_after_its_ack_is_unavailable_after_a_real_snapshot_install() {
+	let tier = reopen_tier_op(false, async |plain, ticket| {
+		plain.submit_op(ticket).await.unwrap();
+	})
+	.await;
+	let rows = tier.rows().await;
+	let LoadedOp::Submittable(ticket) = rows[0].clone() else {
+		panic!("submitted: {rows:?}");
+	};
+	tier.drive_until_no_rows("applied").await;
+	let owner = tier.mgr.owner_ref().unwrap();
+	assert!(
+		tier.cluster.state_machines[0].op_acked_through(owner).await >= ticket.key().op_seq,
+		"premise: acknowledged"
+	);
+	install_a_peers_snapshot(&tier.cluster).await;
+	let before = tier.cluster.state_machines[0].state_snapshot().await;
+	let duplicate = tier
+		.plain
+		.submit_op(&ticket)
+		.await
+		.expect_err("unavailable, not a decision");
+	assert!(
+		duplicate
+			.get_ref()
+			.and_then(|cause| cause.downcast_ref::<crate::storage::sweeper::OpOutcomeUnavailable>())
+			.is_some_and(|cause| cause.0 == ticket.key()),
+		"not some other failure: {duplicate}"
+	);
+	let after = tier.cluster.state_machines[0].state_snapshot().await;
+	assert_eq!(before.tiered_slabs, after.tiered_slabs, "applies nothing");
+	assert_eq!(
+		before.op_tables[&owner].acked_through,
+		after.op_tables[&owner].acked_through
+	);
+}
+
+/// H2: what was prepared is only good for the generation it was prepared against.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tier_delivery_refuses_a_generation_that_moved_after_it_prepared() {
+	let (tier, release, pass) = parked_tier_delivery().await;
+	let bytes = tier.l2.get(&tier.old.l2_uri).await.unwrap();
+	let moved = TieredSlabPointer {
+		l2_uri: tier.l2.put("s5-tier-op/moved", &bytes).await.unwrap(),
+		..tier.old.clone()
+	};
+	tier.mgr
+		.apply_tier_slab_committed(moved.clone(), Some(1))
+		.await
+		.unwrap();
+	assert_eq!(
+		tier.mgr.tier_pointer(tier.old.slab_id).await,
+		Some(moved.clone()),
+		"premise: the generation moved while it waited"
+	);
+	release.add_permits(8);
+	assert_eq!(
+		pass.await.unwrap().unwrap_err().kind(),
+		ErrorKind::WouldBlock
+	);
+	assert_eq!(
+		tier.mgr.tier_pointer(tier.old.slab_id).await,
+		Some(moved),
+		"what it prepared was not for this generation"
+	);
+	assert_eq!(tier.rows().await.len(), 1, "its row stays");
+}
+
+/// H3: a held publication whose durable outcome is neither its postimage nor nothing stays
+/// held and fenced, and is not called done.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_held_publication_with_a_partial_outcome_stays_fenced() {
+	use crate::storage::index::OpTxnCut;
+	let reopened = reopen_install_at(lsm_driver::ControlLsmInstallCut::AfterAcceptance).await;
+	let index = reopened.mgr.require_op_index().unwrap();
+	index.cut_next_op_txn(OpTxnCut::AfterCommit);
+	reopened
+		.mgr
+		.continuity_test_holds
+		.fail_publication_readback
+		.store(true, Ordering::Release);
+	let driver = op_driver(&reopened.cluster, &reopened.mgr, reopened.plain.clone());
+	assert!(driver.drive_once().await.is_err());
+	let mut run = index
+		.load_snapshot()
+		.await
+		.unwrap()
+		.lsm_runs
+		.into_iter()
+		.find(|run| run.slab_id == reopened.output())
+		.expect("premise: it landed");
+	run.max_row_hlc = hlc(9_999_999);
+	index
+		.apply(PersistentIndexUpdate {
+			put_lsm_runs: vec![run],
+			..Default::default()
+		})
+		.await
+		.unwrap();
+	let rows = reopened.rows().await;
+	assert_eq!(
+		driver.drive_once().await.unwrap_err().kind(),
+		ErrorKind::WouldBlock
+	);
+	assert_eq!(reopened.rows().await, rows, "not handed off");
+	assert_eq!(
+		reopened
+			.mgr
+			.tier_authority
+			.held_install_publications
+			.lock()
+			.unwrap()
+			.len(),
+		1,
+		"still held"
+	);
+	let _ = reopened.owner.close(Duration::from_secs(2)).await;
+}
+
+/// A cleanup's lease, on each side of Complete: a supersession after the view moves nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_supersession_after_the_view_stops_a_cleanups_resume_and_its_purge() {
+	use crate::storage::index::OpTxnCut;
+	// A cut on the run drop leaves `QuarantineRecorded`; one on `PurgeAuthorized` leaves
+	// `RunDropped`, with Complete applied.
+	for skip in [2_u8, 5] {
+		let (dir, mgr, cluster, committer, driver) = ring_store_for_reservations("s4-super").await;
+		let slab = abandoned_output_for_cleanup(&dir, &mgr, &driver, false).await;
+		let index = mgr.require_op_index().unwrap();
+		index.cut_nth_op_txn(skip, OpTxnCut::BeforeCommit);
+		for _ in 0..4 {
+			if driver.drive_once().await.is_err() {
+				break;
+			}
+		}
+		let rows = index.load_op_intents().await.unwrap();
+		assert!(!rows.is_empty(), "premise: {skip}");
+		let names = || {
+			let mut names = std::fs::read_dir(&*dir)
+				.unwrap()
+				.map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+				.filter(|name| name.starts_with("gc-quarantine-") || name.starts_with("abandoned-"))
+				.collect::<Vec<_>>();
+			names.sort();
+			names
+		};
+		let files = names();
+		let superseding = Arc::new(SupersedesAfterView {
+			inner: committer.clone(),
+			raft: cluster.nodes[0].clone(),
+		});
+		let _ = mgr.drive_reserved_ids(superseding.as_ref()).await;
+		assert_eq!(
+			index.load_op_intents().await.unwrap(),
+			rows,
+			"{skip}: a row moved"
+		);
+		assert_eq!(names(), files, "{skip}: a file moved");
+		let _ = slab;
+	}
+}
+
+// Z1: an install with no outputs. Its whole postimage is its inputs' retirement.
+
+struct ZeroOutputInstall {
+	dir: crate::test_support::TestDir,
+	mgr: Arc<SlabManager>,
+	owner: DataDirectoryOwner,
+	cluster: ControlCluster,
+	plain: Arc<crate::storage::RaftCommitter>,
+	input: SlabId,
+	intent: crate::storage::index::LsmInstallIntent,
+	elided: Option<(Identity, RecordLocation)>,
+}
+
+/// How an install comes to have no outputs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ZeroOutput {
+	/// A sealed zero-row run, durable.
+	EmptyRun,
+	/// A real row, below its retention floor: nothing carries forward, and its row goes.
+	Elided,
+}
+
+/// A real control install with no outputs, on a real ring, stopped at `cut` and reopened
+/// against that ring.
+async fn reopen_zero_output_install_at(
+	shape: ZeroOutput,
+	cut: lsm_driver::ControlLsmInstallCut,
+) -> ZeroOutputInstall {
+	let dir = fresh_dir("s5-zero-output");
+	let owner = DataDirectoryOwner::acquire_existing(&dir).unwrap();
+	let manager =
+		SlabManager::initialize_new_store_with_owner(gc_owned_test_config(&dir), owner.clone())
+			.await
+			.unwrap();
+	let cluster = control_cluster_observing(&[(1, &manager)]).await;
+	register_owner(&cluster.nodes[0], &manager).await;
+	let plain = Arc::new(op_committer(&cluster, 1));
+	let table_id = TableObjectId::new([0xd1; 16]);
+	let descriptor = append_only_retention_descriptor(table_id);
+	let mut elided = None;
+	if shape == ZeroOutput::Elided {
+		let frame = encode_test_append_only_storage_frame(
+			table_id,
+			&[(id(0xd125), Locality::new(25), hlc(1), 7, false)],
+		);
+		let entries = storage_multirow_index_entries_from_frame(&frame)
+			.unwrap()
+			.unwrap();
+		manager
+			.append_durable_multirow_with_locality(tenant(), &frame, &entries)
+			.await
+			.unwrap();
+		elided = manager
+			.lookup(tenant(), id(0xd125))
+			.unwrap()
+			.map(|saved| (id(0xd125), saved));
+		assert!(elided.is_some(), "premise: its row is written");
+	}
+	let input = manager.force_seal_active_for_test().await;
+	if shape == ZeroOutput::EmptyRun {
+		let run = {
+			let mut manifest =
+				recover_rwlock_write(&manager.compaction_manifest, "compaction_manifest");
+			let epoch = manifest.manifest_epoch();
+			let run = LsmRunSummary::new(
+				input,
+				CompactionLevelIndex::L0,
+				hlc(0),
+				hlc(0),
+				ByteCount::new(0),
+				RowCount::new(0),
+				epoch,
+			);
+			manifest.insert_live_run(run.clone());
+			run
+		};
+		// A run only in this process's memory would not be there to recover.
+		manager
+			.require_op_index()
+			.unwrap()
+			.apply(PersistentIndexUpdate {
+				put_lsm_runs: vec![run],
+				..Default::default()
+			})
+			.await
+			.unwrap();
+	}
+	let snapshot = manager.compaction_manifest_snapshot();
+	let plan = CompactionPlan {
+		job_id: CompactionJobId::new(0xd125),
+		source_level: CompactionLevelIndex::L0,
+		target_level: CompactionLevelIndex::L1,
+		manifest_epoch_pre: snapshot.manifest_epoch,
+		input_slabs: vec![input],
+		overlapping_slabs: Vec::new(),
+		retention_floor_snapshot: hlc(100),
+		compaction_start_hlc: hlc(101),
+		dominant_reason: crate::storage::DominantReason::Operator,
+	};
+	let entered = Arc::new(tokio::sync::Semaphore::new(0));
+	let release = Arc::new(tokio::sync::Semaphore::new(0));
+	*manager.lsm_control_install_hold.lock().unwrap() =
+		Some((cut, entered.clone(), release.clone()));
+	let mut task = {
+		let (manager, plain) = (manager.clone(), plain.clone());
+		tokio::spawn(async move {
+			let mut schemas = TableSchemaCatalog::default();
+			schemas.upsert(tenant(), descriptor).unwrap();
+			let secondary_indexes = SecondaryIndexCatalog::default();
+			let worker =
+				LsmCompactionWorker::new(LsmConfig::default(), manager.slab_pin_table()).unwrap();
+			manager
+				.run_lsm_compaction_once_via_control_ring_with_context(
+					&worker,
+					plan,
+					plain.as_ref(),
+					Some(SecondaryIndexCompactionContext {
+						table_schemas: &schemas,
+						secondary_indexes: &secondary_indexes,
+					}),
+				)
+				.await
+		})
+	};
+	tokio::select! {
+		reached = entered.acquire() => reached.unwrap().forget(),
+		result = &mut task => panic!("the install returned before {cut:?}: {result:?}"),
+		_ = tokio::time::sleep(Duration::from_secs(60)) => panic!("never reached {cut:?}"),
+	}
+	let intent = manager
+		.require_op_index()
+		.unwrap()
+		.load_snapshot()
+		.await
+		.unwrap()
+		.lsm_install_intents
+		.remove(0);
+	assert!(intent.commit.slabs_to_add.is_empty(), "premise: no outputs");
+	assert_eq!(intent.commit.slabs_to_retire, vec![input], "premise");
+	task.abort();
+	let _ = task.await;
+	drop(release);
+	let _ = owner.close(Duration::from_secs(5)).await;
+	let next = DataDirectoryOwner::acquire_existing(&dir).expect("released");
+	let mgr = SlabManager::open_with_owner(gc_owned_test_config(&dir), next.clone())
+		.await
+		.unwrap();
+	mgr.bind_control_node(1).unwrap();
+	mgr.bind_canonical_tier_source(cluster.state_machines[0].tier_snapshot_source_for_test());
+	if cut == lsm_driver::ControlLsmInstallCut::AfterAcceptance {
+		let rows = mgr
+			.require_op_index()
+			.unwrap()
+			.load_snapshot()
+			.await
+			.unwrap()
+			.record_rows
+			.iter()
+			.filter(|row| row.location.slab_id == input)
+			.count();
+		assert_eq!(
+			rows > 0,
+			shape == ZeroOutput::Elided,
+			"premise: {rows} rows"
+		);
+	}
+	ZeroOutputInstall {
+		dir,
+		mgr,
+		owner: next,
+		cluster,
+		plain,
+		input,
+		intent,
+		elided,
+	}
+}
+
+impl ZeroOutputInstall {
+	/// In this process, with no second restart: no row, no intent, its input retired, ready,
+	/// and memory as a fresh open would build it.
+	async fn assert_ends(self, label: impl std::fmt::Debug) {
+		let driver = op_driver(&self.cluster, &self.mgr, self.plain.clone());
+		let index = self.mgr.require_op_index().unwrap();
+		let mut last = Ok(());
+		for _ in 0..8 {
+			last = driver.drive_once().await;
+			if index.load_op_intents().await.unwrap().is_empty()
+				&& self.mgr.tier_authority_readiness_reason().is_none()
+			{
+				break;
+			}
+		}
+		assert_eq!(
+			index.load_op_intents().await.unwrap(),
+			Vec::new(),
+			"{label:?}: {last:?}"
+		);
+		assert_eq!(
+			self.mgr.tier_authority_readiness_reason(),
+			None,
+			"{label:?}"
+		);
+		let durable = index.load_snapshot().await.unwrap();
+		assert!(durable.lsm_install_intents.is_empty(), "{label:?}");
+		assert!(
+			durable.lsm_runs.iter().any(|run| run.slab_id == self.input
+				&& matches!(&run.state, SlabState::Retired { successors } if successors.is_empty())),
+			"{label:?}: its input is retired, with no successors"
+		);
+		assert!(
+			matches!(
+				self.mgr
+					.compaction_manifest_snapshot()
+					.run(self.input)
+					.map(|run| run.state.clone()),
+				Some(SlabState::Retired { .. })
+			),
+			"{label:?}: memory follows"
+		);
+		assert!(
+			!self.mgr.has_orphaned_index_publications(),
+			"{label:?}: nothing orphaned"
+		);
+		assert!(
+			!durable
+				.record_rows
+				.iter()
+				.any(|row| row.location.slab_id == self.input),
+			"{label:?}: none of its rows remain"
+		);
+		// Retention released this version: both supported reads say it is gone.
+		if let Some((key, saved)) = self.elided {
+			assert_eq!(
+				self.mgr.lookup_as_of(tenant(), key, hlc(99)).unwrap(),
+				None,
+				"{label:?}"
+			);
+			let gone = self
+				.mgr
+				.resolve_logical_version(tenant(), key, hlc(1), saved)
+				.unwrap_err();
+			assert!(
+				format!("{gone:?}").contains("VersionGone"),
+				"{label:?}: {gone:?}"
+			);
+		}
+		drop((driver, index));
+		assert_memory_matches_a_fresh_open(&self.dir, self.mgr, self.owner, label).await;
+	}
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_zero_output_install_recovers_before_and_after_its_publication() {
+	use lsm_driver::ControlLsmInstallCut as Cut;
+	for shape in [ZeroOutput::EmptyRun, ZeroOutput::Elided] {
+		for cut in [Cut::AfterAcceptance, Cut::AfterPublication] {
+			reopen_zero_output_install_at(shape, cut)
+				.await
+				.assert_ends((shape, cut))
+				.await;
+		}
+	}
+}
+
+/// Its handoff cut, either side of its commit, after a publication this process did not see.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_zero_output_install_survives_a_failed_handoff() {
+	use crate::storage::index::OpTxnCut;
+	for shape in [ZeroOutput::EmptyRun, ZeroOutput::Elided] {
+		for cut in [OpTxnCut::BeforeCommit, OpTxnCut::AfterCommit] {
+			let install = reopen_zero_output_install_at(
+				shape,
+				lsm_driver::ControlLsmInstallCut::AfterPublication,
+			)
+			.await;
+			install.mgr.require_op_index().unwrap().cut_next_op_txn(cut);
+			install.assert_ends((shape, cut)).await;
+		}
+	}
+}
+
+/// Its publication's outcome unreadable, with its transaction refused, cut, or landed. The
+/// landed case is the one with no output to look at, and no output to index for one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_zero_output_install_decides_an_unreadable_publication_on_the_next_pass() {
+	use crate::storage::index::OpTxnCut;
+	for shape in [ZeroOutput::EmptyRun, ZeroOutput::Elided] {
+		for cut in [
+			None,
+			Some(OpTxnCut::BeforeCommit),
+			Some(OpTxnCut::AfterCommit),
+		] {
+			let install = reopen_zero_output_install_at(
+				shape,
+				lsm_driver::ControlLsmInstallCut::AfterAcceptance,
+			)
+			.await;
+			let index = install.mgr.require_op_index().unwrap();
+			if let Some(cut) = cut {
+				index.cut_next_run_publication(cut);
+			}
+			install
+				.mgr
+				.continuity_test_holds
+				.fail_publication_readback
+				.store(true, Ordering::Release);
+			let rows = index.load_op_intents().await.unwrap();
+			let driver = op_driver(&install.cluster, &install.mgr, install.plain.clone());
+			assert!(driver.drive_once().await.is_err(), "{shape:?} {cut:?}");
+			assert_eq!(
+				index.load_op_intents().await.unwrap(),
+				rows,
+				"{shape:?} {cut:?}: no handoff on an unknown outcome"
+			);
+			assert!(
+				!install.mgr.has_orphaned_index_publications(),
+				"{shape:?} {cut:?}: held, not orphaned"
+			);
+			let landed = index
+				.load_snapshot()
+				.await
+				.unwrap()
+				.lsm_runs
+				.iter()
+				.any(|run| run.slab_id == install.input && !run.state.is_live());
+			assert_eq!(
+				landed,
+				cut != Some(OpTxnCut::BeforeCommit),
+				"{shape:?} {cut:?}: premise"
+			);
+			drop((driver, index));
+			install.assert_ends((shape, cut)).await;
+		}
+	}
+}
+
+/// Part of a zero-output postimage durable, written directly: no transaction of this store can
+/// leave one. Neither the preimage nor the postimage, so nothing here may treat it as either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_partial_zero_output_postimage_stays_fenced() {
+	use crate::storage::index::OpTxnCut;
+	#[derive(Clone, Copy, Debug)]
+	enum Partial {
+		RowsGone,
+		InputRetired,
+		InputRetiredToAnother,
+	}
+	#[derive(Clone, Copy, Debug)]
+	enum Reached {
+		Applied,
+		HeldPublication,
+		Rejected,
+	}
+	for partial in [
+		Partial::RowsGone,
+		Partial::InputRetired,
+		Partial::InputRetiredToAnother,
+	] {
+		for reached in [
+			Reached::Applied,
+			Reached::HeldPublication,
+			Reached::Rejected,
+		] {
+			let label = format!("{partial:?} {reached:?}");
+			let install = reopen_zero_output_install_at(
+				ZeroOutput::Elided,
+				lsm_driver::ControlLsmInstallCut::AfterAcceptance,
+			)
+			.await;
+			let index = install.mgr.require_op_index().unwrap();
+			let committer: Arc<dyn TierCommitter> = if matches!(reached, Reached::Rejected) {
+				ForgedView::new(install.plain.clone(), forge_rejected)
+			} else {
+				install.plain.clone()
+			};
+			let driver = op_driver(&install.cluster, &install.mgr, committer);
+			let held = || {
+				install
+					.mgr
+					.tier_authority
+					.held_install_publications
+					.lock()
+					.unwrap()
+					.len()
+			};
+			if matches!(reached, Reached::HeldPublication) {
+				index.cut_next_run_publication(OpTxnCut::BeforeCommit);
+				install
+					.mgr
+					.continuity_test_holds
+					.fail_publication_readback
+					.store(true, Ordering::Release);
+				assert!(driver.drive_once().await.is_err(), "{label}");
+				assert_eq!(held(), 1, "{label}: premise, held");
+			}
+			let durable = index.load_snapshot().await.unwrap();
+			let retired = |successors: Vec<SlabId>| {
+				install.intent.local_input_runs[0]
+					.clone()
+					.with_state(SlabState::Retired { successors })
+			};
+			index
+				.apply(match partial {
+					Partial::RowsGone => PersistentIndexUpdate {
+						delete_records: durable
+							.record_rows
+							.iter()
+							.filter(|row| row.location.slab_id == install.input)
+							.copied()
+							.collect(),
+						..Default::default()
+					},
+					Partial::InputRetired => PersistentIndexUpdate {
+						put_lsm_runs: vec![retired(Vec::new())],
+						..Default::default()
+					},
+					Partial::InputRetiredToAnother => PersistentIndexUpdate {
+						put_lsm_runs: vec![retired(vec![SlabId::new(0xbad)])],
+						..Default::default()
+					},
+				})
+				.await
+				.unwrap();
+			let rows = index.load_op_intents().await.unwrap();
+			let durable = index.load_snapshot().await.unwrap();
+			let input_file = slab_path(&install.dir, install.input);
+			assert!(input_file.exists(), "{label}: premise");
+			for _ in 0..2 {
+				let error = driver.drive_once().await.unwrap_err();
+				assert_eq!(error.kind(), ErrorKind::WouldBlock, "{label}: {error}");
+			}
+			let now = index.load_snapshot().await.unwrap();
+			assert_eq!(index.load_op_intents().await.unwrap(), rows, "{label}");
+			assert_eq!(now.lsm_runs, durable.lsm_runs, "{label}");
+			assert_eq!(now.record_rows, durable.record_rows, "{label}");
+			assert_eq!(now.lsm_install_intents.len(), 1, "{label}");
+			assert!(input_file.exists(), "{label}: its input stays");
+			assert_eq!(
+				held(),
+				matches!(reached, Reached::HeldPublication) as usize,
+				"{label}"
+			);
+			assert!(
+				install.mgr.tier_authority_readiness_reason().is_some(),
+				"{label}: still fenced"
+			);
+			drop((driver, index));
+			let _ = install.owner.close(Duration::from_secs(2)).await;
+		}
+	}
+}
+
+/// A held publication's memory cannot follow its exact durable postimage. It stays held: the
+/// guard is what fences the index, and dropping it on the way out would orphan it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_memory_reconcile_keeps_a_held_publication_held() {
+	use crate::storage::index::OpTxnCut;
+	let reopened = reopen_install_at(lsm_driver::ControlLsmInstallCut::AfterAcceptance).await;
+	let index = reopened.mgr.require_op_index().unwrap();
+	index.cut_next_op_txn(OpTxnCut::AfterCommit);
+	reopened
+		.mgr
+		.continuity_test_holds
+		.fail_publication_readback
+		.store(true, Ordering::Release);
+	let rows = reopened.rows().await;
+	let driver = op_driver(&reopened.cluster, &reopened.mgr, reopened.plain.clone());
+	assert!(driver.drive_once().await.is_err());
+	let held = || {
+		reopened
+			.mgr
+			.tier_authority
+			.held_install_publications
+			.lock()
+			.unwrap()
+			.len()
+	};
+	assert_eq!(held(), 1, "premise: held");
+	// Memory now disagrees with what is durable, under the output's own id.
+	let mut stray = reopened.intent.commit.slabs_to_add[0].clone();
+	stray.row_count = RowCount::new(999);
+	recover_rwlock_write(&reopened.mgr.compaction_manifest, "compaction_manifest")
+		.insert_live_run(stray);
+	let error = driver.drive_once().await.unwrap_err();
+	assert_eq!(error.kind(), ErrorKind::WouldBlock, "{error}");
+	assert_eq!(held(), 1, "still held");
+	assert!(!reopened.mgr.has_orphaned_index_publications());
+	assert_eq!(reopened.rows().await, rows, "not handed off");
+	let _ = reopened.owner.close(Duration::from_secs(2)).await;
+}
+
+/// What a reopen does with `seq`'s row rewritten by `edit`: refused, typed, with the row and
+/// every file exactly as found, and after restoring those bytes the store opens as before.
+/// A refused open has no driver, so nothing is submitted for this row by construction.
+async fn assert_row_refuses_the_reopen(
+	dir: &crate::test_support::TestDir,
+	mgr: Arc<SlabManager>,
+	owner: DataDirectoryOwner,
+	seq: u64,
+	edit: impl FnOnce(&mut crate::storage::index::OpIntent) + Send + 'static,
+	label: &str,
+) {
+	mgr.require_op_index()
+		.unwrap()
+		.force_op_row_for_test(seq, edit)
+		.await
+		.unwrap();
+	drop(mgr);
+	assert_refused_at_open(dir, owner, seq, None, label).await;
+}
+
+/// `forged`, where given, replaces the row's raw bytes in the closed store. The row as this
+/// found it goes back at the end, whichever bytes it was.
+async fn assert_refused_at_open(
+	dir: &crate::test_support::TestDir,
+	owner: DataDirectoryOwner,
+	seq: u64,
+	forged: Option<fn(&mut Vec<u8>)>,
+	label: &str,
+) {
+	use crate::storage::index::{op_row_bytes_at, set_op_row_bytes_at};
+	let _ = owner.close(Duration::from_secs(5)).await;
+	let path = dir.join("storage_index.redb");
+	let names = || {
+		let mut names = std::fs::read_dir(&**dir)
+			.unwrap()
+			.map(|entry| {
+				let entry = entry.unwrap();
+				let name = entry.file_name().to_string_lossy().into_owned();
+				let length = entry.metadata().unwrap().len();
+				(name.clone(), (!name.contains("redb")).then_some(length))
+			})
+			.collect::<Vec<_>>();
+		names.sort();
+		names
+	};
+	let mut stored = op_row_bytes_at(&path, seq);
+	if let Some(forged) = forged {
+		forged(&mut stored);
+		set_op_row_bytes_at(&path, seq, &stored);
+	}
+	let files = names();
+	let next = DataDirectoryOwner::acquire_existing(dir).expect("released");
+	let error = SlabManager::open_with_owner(gc_owned_test_config(dir), next.clone())
+		.await
+		.err()
+		.unwrap_or_else(|| panic!("{label}: this row opened"));
+	assert!(
+		crate::storage::index::is_op_state_invalid(&error),
+		"{label}: {error}"
+	);
+	let _ = next.close(Duration::from_secs(2)).await;
+	assert_eq!(op_row_bytes_at(&path, seq), stored, "{label}: its row");
+	assert_eq!(names(), files, "{label}: its files");
+}
+
+/// The reload obligation: `follows` guards every write, so it says nothing of a row already on
+/// disk. A phase its command's workflow never writes refuses the reopen.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_phase_its_command_never_writes_refuses_the_reopen() {
+	use crate::consensus::slab_ops::{SlabCommand, SlabRejection};
+	use crate::storage::index::{GcFileIdentity, OpPhase, OpProgress, OpTxnCut, ReservedIdState};
+	let file = GcFileIdentity {
+		length: 1,
+		digest: [1; 32],
+		revision: 0,
+		dev: 0,
+		ino: 0,
+	};
+	let disposal = [
+		OpProgress::QuarantineRecorded(file.clone()),
+		OpProgress::RunDropped(None),
+		OpProgress::PurgeAuthorized(file.clone()),
+		OpProgress::Purged(file.clone()),
+	];
+	let mark_published = OpProgress::MarkPublished { left: Vec::new() };
+	// An install records no phase at all.
+	for phase in disposal.iter().cloned().chain([mark_published.clone()]) {
+		let reopened = reopen_install_at(lsm_driver::ControlLsmInstallCut::AfterRename).await;
+		let seq = reopened.rows().await[0].key().op_seq;
+		let label = format!("install at {phase:?}");
+		let ReopenedInstall {
+			dir, mgr, owner, ..
+		} = reopened;
+		assert_row_refuses_the_reopen(
+			&dir,
+			mgr,
+			owner,
+			seq,
+			move |intent| {
+				assert!(
+					matches!(&intent.command, SlabCommand::Compaction(commit)
+						if commit.slabs_to_mark_delete_pending.is_empty()),
+					"premise"
+				);
+				intent.progress = Some(phase);
+			},
+			&label,
+		)
+		.await;
+	}
+	// A removal given a mark's phase.
+	let gc = reopen_gc_at(GcStop::BeforeUnlink).await;
+	let seq = gc.rows().await[0].key().op_seq;
+	let phase = mark_published.clone();
+	let ReopenedGc {
+		dir, mgr, owner, ..
+	} = gc;
+	assert_row_refuses_the_reopen(
+		&dir,
+		mgr,
+		owner,
+		seq,
+		move |intent| {
+			assert!(
+				matches!(intent.command, SlabCommand::GcRemove(_)),
+				"premise"
+			);
+			intent.progress = Some(phase);
+		},
+		"removal at MarkPublished",
+	)
+	.await;
+	// Past Complete with nothing ever submitted.
+	let gc = reopen_gc_at(GcStop::RunDroppedReserved).await;
+	let seq = gc.rows().await[0].key().op_seq;
+	let phase = OpProgress::PurgeAuthorized(file.clone());
+	let ReopenedGc {
+		dir, mgr, owner, ..
+	} = gc;
+	assert_row_refuses_the_reopen(
+		&dir,
+		mgr,
+		owner,
+		seq,
+		move |intent| {
+			assert!(
+				matches!(intent.command, SlabCommand::GcRemove(_)),
+				"premise"
+			);
+			assert_eq!(intent.phase, OpPhase::Reserved, "premise");
+			intent.progress = Some(phase);
+		},
+		"a never submitted removal at PurgeAuthorized",
+	)
+	.await;
+	// A cleanup's Complete given a mark's phases.
+	for rejected in [false, true] {
+		let (dir, mgr, owner, cluster, plain) = reopenable_reservation_store("a93-phase").await;
+		let driver = op_driver(&cluster, &mgr, plain);
+		let slab = abandoned_output_for_cleanup(&dir, &mgr, &driver, true).await;
+		let index = mgr.require_op_index().unwrap();
+		index.cut_nth_op_txn(1, OpTxnCut::BeforeCommit);
+		let _ = driver.drive_once().await;
+		let Some(ReservedIdState::Cleaning { complete, .. }) =
+			index.reserved_id_state(slab).await.unwrap()
+		else {
+			panic!("premise: cleaning");
+		};
+		let phase = if rejected {
+			OpProgress::ClaimRejected {
+				reason: SlabRejection::Cancelled,
+				pre_run: LsmRunSummary::new(
+					slab,
+					CompactionLevelIndex::L0,
+					hlc(0),
+					hlc(0),
+					ByteCount::new(0),
+					RowCount::new(0),
+					mgr.compaction_manifest_snapshot().manifest_epoch,
+				),
+				pre_delete_pending: false,
+				removal: complete,
+			}
+		} else {
+			mark_published.clone()
+		};
+		drop((driver, index));
+		let label = format!("complete at {phase:?}");
+		assert_row_refuses_the_reopen(
+			&dir,
+			mgr,
+			owner,
+			complete.op_seq,
+			move |intent| {
+				assert!(
+					matches!(intent.command, SlabCommand::Complete(_)),
+					"premise"
+				);
+				intent.progress = Some(phase);
+			},
+			&label,
+		)
+		.await;
+	}
+	// A reservation linking an operation for another job.
+	let (dir, mgr, owner, cluster, plain) = reopenable_reservation_store("a93-link").await;
+	let driver = op_driver(&cluster, &mgr, plain);
+	let slab = abandoned_output_for_cleanup(&dir, &mgr, &driver, true).await;
+	let index = mgr.require_op_index().unwrap();
+	index.cut_nth_op_txn(1, OpTxnCut::BeforeCommit);
+	let _ = driver.drive_once().await;
+	let Some(ReservedIdState::Cleaning { complete, .. }) =
+		index.reserved_id_state(slab).await.unwrap()
+	else {
+		panic!("premise: cleaning");
+	};
+	drop((driver, index));
+	assert_row_refuses_the_reopen(
+		&dir,
+		mgr,
+		owner,
+		complete.op_seq,
+		|intent| {
+			let SlabCommand::Complete(op) = &mut intent.command else {
+				panic!("premise: its Complete");
+			};
+			op.job_id = CompactionJobId::new(0x0bad);
+			intent.digest = intent.command.digest();
+		},
+		"a Complete for another job",
+	)
+	.await;
+	// A tier operation records no phase either: a tier store's own close, and this table's
+	// existing refusal, stay under this control.
+	let tier = reopen_tier_op(false, async |_, _| {}).await;
+	let seq = tier.rows().await[0].key().op_seq;
+	tier.mgr
+		.require_op_index()
+		.unwrap()
+		.force_op_row_for_test(seq, move |intent| {
+			intent.progress = Some(OpProgress::QuarantineRecorded(file));
+		})
+		.await
+		.unwrap();
+	let ReopenedTierOp { _dirs, mgr, l2, .. } = tier;
+	let error = try_restart_tier_manager(mgr, &_dirs, &l2)
+		.await
+		.err()
+		.expect("refused");
+	assert!(
+		crate::storage::index::is_op_state_invalid(&error),
+		"{error}"
+	);
+}
+
+/// A row no build of this store wrote, from an unknown variant anywhere in it: a typed refusal,
+/// never a panic.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unknown_encoded_variant_refuses_the_reopen() {
+	// Past the digest, the command's own variant.
+	let command: fn(&mut Vec<u8>) = |bytes| bytes[32] = 0x7f;
+	let phase: fn(&mut Vec<u8>) = |bytes| {
+		let at = crate::storage::index::op_row_progress_offset(bytes) - 2;
+		bytes[at] = 0x7f;
+	};
+	for (forged, label) in [(command, "command"), (phase, "phase")] {
+		let reopened = reopen_install_at(lsm_driver::ControlLsmInstallCut::AfterRename).await;
+		let seq = reopened.rows().await[0].key().op_seq;
+		let ReopenedInstall {
+			dir, mgr, owner, ..
+		} = reopened;
+		drop(mgr);
+		assert_refused_at_open(&dir, owner, seq, Some(forged), label).await;
+	}
+	// An unknown progress variant, on a row that may have progress.
+	let gc = reopen_gc_at(GcStop::BeforeUnlink).await;
+	let seq = gc.rows().await[0].key().op_seq;
+	let ReopenedGc {
+		dir, mgr, owner, ..
+	} = gc;
+	drop(mgr);
+	let progress: fn(&mut Vec<u8>) = |bytes| {
+		let at = crate::storage::index::op_row_progress_offset(bytes);
+		bytes[at] = 0x7f;
+	};
+	assert_refused_at_open(&dir, owner, seq, Some(progress), "progress").await;
+}
+
+/// A cleanup's stage is bound to its row and reservation before any file is touched: a phase
+/// that row is not at moves nothing, where a later commit would refuse only the row's half.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stale_phase_is_refused_before_a_cleanups_file_is_touched() {
+	use crate::storage::index::{LoadedOp, OpProgress, OpTxnCut, ReservedIdState};
+	let (dir, mgr, _cluster, _committer, driver) = ring_store_for_reservations("s4-stale").await;
+	let slab = abandoned_output_for_cleanup(&dir, &mgr, &driver, false).await;
+	let index = mgr.require_op_index().unwrap();
+	// A cut on `PurgeAuthorized`: its Complete applied, its row still at `RunDropped`.
+	index.cut_nth_op_txn(5, OpTxnCut::BeforeCommit);
+	for _ in 0..4 {
+		if driver.drive_once().await.is_err() {
+			break;
+		}
+	}
+	let Some(ReservedIdState::Cleaning {
+		job_id, complete, ..
+	}) = index.reserved_id_state(slab).await.unwrap()
+	else {
+		panic!("premise: cleaning");
+	};
+	let rows = index.load_op_intents().await.unwrap();
+	let row = rows
+		.iter()
+		.find(|op| op.key().op_seq == complete.op_seq)
+		.cloned()
+		.expect("its Complete");
+	let Some(OpProgress::RunDropped(Some(file))) = row.progress().cloned() else {
+		panic!("premise: run dropped, {row:?}");
+	};
+	let LoadedOp::Submittable(ticket) = row else {
+		panic!("premise: submitted");
+	};
+	let entry = super::gc_disposal::gc_quarantine_path(&dir, slab, job_id);
+	assert!(entry.exists(), "premise");
+	for phase in [
+		OpProgress::PurgeAuthorized(file.clone()),
+		OpProgress::Purged(file.clone()),
+	] {
+		let ownership = index.try_acquire_ops(vec![complete.op_seq]).unwrap();
+		let error = mgr
+			.clone()
+			.cleanup_finish(slab, job_id, ticket.clone(), phase.clone(), ownership)
+			.await
+			.unwrap_err();
+		assert_eq!(error.kind(), ErrorKind::WouldBlock, "{phase:?}: {error}");
+		assert!(entry.exists(), "{phase:?}: the entry was touched");
+		assert_eq!(index.load_op_intents().await.unwrap(), rows, "{phase:?}");
+	}
+	// And the real phase, for the job it is not.
+	let ownership = index.try_acquire_ops(vec![complete.op_seq]).unwrap();
+	mgr.clone()
+		.cleanup_finish(
+			slab,
+			CompactionJobId::new(0x0bad),
+			ticket.clone(),
+			OpProgress::RunDropped(Some(file)),
+			ownership,
+		)
+		.await
+		.unwrap_err();
+	assert_eq!(index.load_op_intents().await.unwrap(), rows, "another job");
+	drive_until_id_ends(&mgr, &driver, slab).await;
+}
+
+/// The same for a resume: a row at no phase has not recorded the disposal this was told to
+/// resume, so its original stays where it is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_resume_of_a_disposal_its_row_never_recorded_moves_nothing() {
+	use crate::storage::index::{LoadedOp, OpTxnCut, ReservedIdState};
+	let (dir, mgr, _cluster, _committer, driver) = ring_store_for_reservations("s4-resume").await;
+	let slab = abandoned_output_for_cleanup(&dir, &mgr, &driver, false).await;
+	let index = mgr.require_op_index().unwrap();
+	// A cut on `QuarantineRecorded`: its claim applied, its Complete at no phase.
+	index.cut_nth_op_txn(1, OpTxnCut::BeforeCommit);
+	let _ = driver.drive_once().await;
+	let Some(ReservedIdState::Cleaning {
+		job_id,
+		claim,
+		complete,
+		output,
+	}) = index.reserved_id_state(slab).await.unwrap()
+	else {
+		panic!("premise: cleaning");
+	};
+	let rows = index.load_op_intents().await.unwrap();
+	let find = |seq: u64| rows.iter().find(|op| op.key().op_seq == seq).cloned();
+	let complete_row = find(complete.op_seq).expect("its Complete");
+	assert_eq!(complete_row.progress(), None, "premise");
+	let Some(LoadedOp::Submittable(claim_ticket)) = find(claim.op_seq) else {
+		panic!("premise: its claim");
+	};
+	let original = if output.relocated {
+		super::reservations::abandoned_output_path(&dir, slab)
+	} else {
+		slab_path(&dir, slab)
+	};
+	assert!(original.exists(), "premise");
+	let entry = super::gc_disposal::gc_quarantine_path(&dir, slab, job_id);
+	let ownership = index
+		.try_acquire_ops(vec![claim.op_seq, complete.op_seq])
+		.unwrap();
+	mgr.clone()
+		.cleanup_resume_disposal(
+			slab,
+			job_id,
+			claim_ticket,
+			complete,
+			complete_row.digest(),
+			original.clone(),
+			output.file.clone().expect("premise: a file"),
+			ownership,
+		)
+		.await
+		.map(drop)
+		.unwrap_err();
+	assert!(original.exists(), "its original moved");
+	assert!(!entry.exists(), "its entry appeared");
+	assert_eq!(index.load_op_intents().await.unwrap(), rows);
+	drive_until_id_ends(&mgr, &driver, slab).await;
+}
+
+/// Each disagreement between a cleanup's reservation and what its stage was given stops it
+/// before a file moves, with its row a real one at the phase it claims. Claim only where a
+/// stage still holds one: a finish runs after its claim's row has handed off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cleanup_whose_reservation_disagrees_moves_nothing() {
+	use crate::storage::index::{GcFileIdentity, LoadedOp, OpProgress, OpTxnCut, ReservedIdState};
+	/// Who stops at which transaction, and the evidence a Cleaning row can disagree on.
+	fn disagreements(
+		found: &ReservedIdState,
+		claim_too: bool,
+	) -> Vec<(&'static str, ReservedIdState)> {
+		let ReservedIdState::Cleaning {
+			job_id,
+			claim,
+			complete,
+			output,
+		} = found.clone()
+		else {
+			panic!("premise: cleaning");
+		};
+		let other = |key: crate::consensus::slab_ops::OpKey| crate::consensus::slab_ops::OpKey {
+			op_seq: key.op_seq + 100,
+			..key
+		};
+		let mut other_file = output.clone();
+		other_file.file = other_file.file.map(|file| GcFileIdentity {
+			digest: [9; 32],
+			..file
+		});
+		let cleaning = |job_id, claim, complete, output| ReservedIdState::Cleaning {
+			job_id,
+			claim,
+			complete,
+			output,
+		};
+		let mut cases = vec![
+			(
+				"another job",
+				cleaning(
+					CompactionJobId::new(0x0bad),
+					claim,
+					complete,
+					output.clone(),
+				),
+			),
+			(
+				"another Complete",
+				cleaning(job_id, claim, other(complete), output.clone()),
+			),
+			(
+				"another file",
+				cleaning(job_id, claim, complete, other_file),
+			),
+		];
+		if claim_too {
+			cases.push((
+				"another claim",
+				cleaning(job_id, other(claim), complete, output),
+			));
+		}
+		cases
+	}
+	// Finish: its Complete applied, its row at `RunDropped`, a purge next.
+	let (dir, mgr, _cluster, _committer, driver) = ring_store_for_reservations("s4-bind").await;
+	let slab = abandoned_output_for_cleanup(&dir, &mgr, &driver, false).await;
+	let index = mgr.require_op_index().unwrap();
+	index.cut_nth_op_txn(5, OpTxnCut::BeforeCommit);
+	for _ in 0..4 {
+		if driver.drive_once().await.is_err() {
+			break;
+		}
+	}
+	let found = index.reserved_id_state(slab).await.unwrap().unwrap();
+	let ReservedIdState::Cleaning {
+		job_id, complete, ..
+	} = found.clone()
+	else {
+		panic!("premise: cleaning");
+	};
+	let rows = index.load_op_intents().await.unwrap();
+	let row = rows
+		.iter()
+		.find(|op| op.key() == complete)
+		.cloned()
+		.expect("its Complete");
+	let Some(phase @ OpProgress::RunDropped(Some(_))) = row.progress().cloned() else {
+		panic!("premise: run dropped, {row:?}");
+	};
+	let LoadedOp::Submittable(ticket) = row else {
+		panic!("premise: submitted");
+	};
+	let entry = super::gc_disposal::gc_quarantine_path(&dir, slab, job_id);
+	assert!(entry.exists(), "premise");
+	for (label, state) in disagreements(&found, false) {
+		index.force_reserved_id_for_test(slab, state).await.unwrap();
+		let ownership = index.try_acquire_ops(vec![complete.op_seq]).unwrap();
+		let error = mgr
+			.clone()
+			.cleanup_finish(slab, job_id, ticket.clone(), phase.clone(), ownership)
+			.await
+			.unwrap_err();
+		assert_eq!(error.kind(), ErrorKind::WouldBlock, "{label}: {error}");
+		assert!(entry.exists(), "{label}: its entry was touched");
+		assert_eq!(index.load_op_intents().await.unwrap(), rows, "{label}");
+	}
+	index.force_reserved_id_for_test(slab, found).await.unwrap();
+	drive_until_id_ends(&mgr, &driver, slab).await;
+	// Resume, from a recorded disposal; and dispose, from none.
+	for (stop, resume) in [(2_u8, true), (1, false)] {
+		let (dir, mgr, _cluster, _committer, driver) =
+			ring_store_for_reservations("s4-bind-stage").await;
+		let slab = abandoned_output_for_cleanup(&dir, &mgr, &driver, false).await;
+		let index = mgr.require_op_index().unwrap();
+		index.cut_nth_op_txn(stop, OpTxnCut::BeforeCommit);
+		let _ = driver.drive_once().await;
+		let found = index.reserved_id_state(slab).await.unwrap().unwrap();
+		let ReservedIdState::Cleaning {
+			job_id,
+			claim,
+			complete,
+			ref output,
+		} = found
+		else {
+			panic!("premise: cleaning");
+		};
+		let file = output.file.clone().expect("premise: a file");
+		let original = if output.relocated {
+			super::reservations::abandoned_output_path(&dir, slab)
+		} else {
+			slab_path(&dir, slab)
+		};
+		let entry = super::gc_disposal::gc_quarantine_path(&dir, slab, job_id);
+		let rows = index.load_op_intents().await.unwrap();
+		let find = |seq: u64| rows.iter().find(|op| op.key().op_seq == seq).cloned();
+		let complete_row = find(complete.op_seq).expect("its Complete");
+		assert_eq!(
+			complete_row.progress().is_some(),
+			resume,
+			"premise: {complete_row:?}"
+		);
+		let Some(LoadedOp::Submittable(claim_ticket)) = find(claim.op_seq) else {
+			panic!("premise: its claim");
+		};
+		let files = || (original.exists(), entry.exists());
+		let before = files();
+		// A recorded disposal is cut after its unlink: only its entry and row are left to move.
+		assert_eq!(before, (!resume, resume), "premise");
+		let attempt = |ownership| {
+			let (mgr, claim_ticket, original, file) = (
+				mgr.clone(),
+				claim_ticket.clone(),
+				original.clone(),
+				file.clone(),
+			);
+			let digest = complete_row.digest();
+			async move {
+				if resume {
+					mgr.cleanup_resume_disposal(
+						slab,
+						job_id,
+						claim_ticket,
+						complete,
+						digest,
+						original,
+						file,
+						ownership,
+					)
+					.await
+				} else {
+					mgr.cleanup_dispose(
+						slab,
+						job_id,
+						claim_ticket,
+						complete,
+						digest,
+						original,
+						Some(file),
+						ownership,
+					)
+					.await
+				}
+				.map(drop)
+			}
+		};
+		for (label, state) in disagreements(&found, true) {
+			index.force_reserved_id_for_test(slab, state).await.unwrap();
+			let ownership = index
+				.try_acquire_ops(vec![claim.op_seq, complete.op_seq])
+				.unwrap();
+			let error = attempt(ownership).await.unwrap_err();
+			assert_eq!(
+				error.kind(),
+				ErrorKind::WouldBlock,
+				"{resume} {label}: {error}"
+			);
+			assert_eq!(files(), before, "{resume} {label}");
+			assert_eq!(
+				index.load_op_intents().await.unwrap(),
+				rows,
+				"{resume} {label}"
+			);
+		}
+		index
+			.force_reserved_id_for_test(slab, found.clone())
+			.await
+			.unwrap();
+		// And a live reservation of this id, which no cleanup may run beneath.
+		mgr.live_reservations.insert(slab);
+		let ownership = index
+			.try_acquire_ops(vec![claim.op_seq, complete.op_seq])
+			.unwrap();
+		let error = attempt(ownership).await.unwrap_err();
+		assert_eq!(error.kind(), ErrorKind::WouldBlock, "{resume}: {error}");
+		assert_eq!(files(), before, "{resume}: a live reservation");
+		mgr.live_reservations.remove(&slab);
+		drive_until_id_ends(&mgr, &driver, slab).await;
+	}
+}
+
+/// A real routing locality through a deferred open. Its keys come back with their rows, and
+/// the index routing reads them from is rebuilt with them, as a fresh open would.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_installs_routing_is_rebuilt_with_its_rows_from_every_cut() {
+	use lsm_driver::ControlLsmInstallCut as Cut;
+	for cut in [Cut::AfterAcceptance, Cut::AfterPublication] {
+		let reopened = reopen_install_seeded(cut, async |manager, keys| {
+			manager
+				.append_durable_with_locality(
+					tenant(),
+					keys[0],
+					Locality::new(25),
+					hlc(1),
+					b"b11b-first",
+				)
+				.await
+				.unwrap();
+			let first = manager.force_seal_active_for_test().await;
+			manager
+				.append_durable_with_locality(
+					tenant(),
+					keys[1],
+					Locality::new(26),
+					hlc(2),
+					b"b11b-second",
+				)
+				.await
+				.unwrap();
+			[first, manager.force_seal_active_for_test().await]
+		})
+		.await;
+		reopened.assert_applied_install_ends(cut).await;
+	}
+}
+
+// ADR 0697 §9.3, what the clause by clause map found unasserted.
+
+/// Recovery itself closes the hole, at a full window: not a test's own Cancel.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_recovery_pass_closes_a_hole_at_a_full_window() {
+	use crate::consensus::slab_ops::{OPS_WINDOW_W, SlabCommand};
+	use crate::storage::index::TerminalBacklog;
+	let tier = reopen_tier_op(false, async |_, _| {}).await;
+	let index = tier.mgr.require_op_index().unwrap();
+	let owner = tier.mgr.owner_ref().unwrap();
+	let hole = tier.rows().await[0].key().op_seq;
+	let burn = |offset: u64| {
+		SlabCommand::BurnReserved(crate::consensus::slab_ops::BurnOp {
+			slab: owner.slab(SlabId::new(0x20_000 + offset)),
+		})
+	};
+	let mut later = Vec::new();
+	for offset in 1..OPS_WINDOW_W {
+		let ticket = index
+			.allocate_ops(vec![burn(offset)], None)
+			.await
+			.unwrap()
+			.first;
+		tier.plain.submit_op(&ticket).await.unwrap();
+		index
+			.hand_off_op(ticket.key(), ticket.digest(), None)
+			.await
+			.unwrap();
+		later.push(ticket.key().op_seq);
+	}
+	for chunk in later.chunks(64) {
+		let receipt = tier
+			.plain
+			.ack_outcomes(owner, chunk.to_vec())
+			.await
+			.unwrap();
+		assert_eq!(receipt.accepted, chunk);
+		index.mark_ops_acked(receipt.accepted).await.unwrap();
+	}
+	let sm = &tier.cluster.state_machines[0];
+	assert_eq!(sm.op_acked_through(owner).await, hole - 1, "premise");
+	let refused = index
+		.allocate_ops(vec![burn(9_999)], None)
+		.await
+		.expect_err("refused");
+	assert!(
+		refused
+			.get_ref()
+			.is_some_and(|cause| cause.is::<TerminalBacklog>()),
+		"{refused}"
+	);
+	tier.drive_until_no_rows("a hole at a full window").await;
+	let driver = tier.driver(tier.plain.clone());
+	for _ in 0..4 {
+		driver.drive_once().await.unwrap();
+	}
+	assert!(
+		sm.op_acked_through(owner).await >= hole - 1 + OPS_WINDOW_W,
+		"the prefix crossed the hole"
+	);
+	assert_eq!(
+		tier.mgr.tier_pointer(tier.old.slab_id).await,
+		None,
+		"cancelled, so it installed nothing"
+	);
+	index
+		.allocate_ops(vec![burn(9_999)], None)
+		.await
+		.expect("admission resumed");
+}
+
+/// A Cancel answered OpConflict: an anomaly with no local cleanup at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancel_answered_with_a_conflict_cleans_up_nothing() {
+	let (dirs, mgr, cluster, slab_id, _pointer) = dc157_ring_fixture("a93-cancel").await;
+	let plain = Arc::new(op_committer(&cluster, 1));
+	let conflicting = DecidesAnotherOperation(cluster.nodes[0].clone(), plain.clone());
+	mgr.sweep_lsm_delete_pending_once_via_control_ring(&new_gc(&mgr), &conflicting)
+		.await
+		.unwrap_err();
+	let index = mgr.require_op_index().unwrap();
+	let rows = index.load_op_intents().await.unwrap();
+	// The view sees no decision, so recovery really does send its Cancel.
+	let blind = ForgedView::new(plain, |view| {
+		view.outcome = crate::consensus::slab_ops::ViewOutcome::None;
+	});
+	let driver = op_driver(&cluster, &mgr, blind.clone());
+	let error = driver.drive_once().await.unwrap_err();
+	assert_eq!(error.kind(), ErrorKind::WouldBlock, "{error}");
+	assert_eq!(blind.submitted.load(Ordering::SeqCst), 1, "premise: sent");
+	assert_eq!(index.load_op_intents().await.unwrap(), rows);
+	assert!(slab_path(&dirs[0], slab_id).exists());
+	assert_eq!(
+		index
+			.load_snapshot()
+			.await
+			.unwrap()
+			.lsm_install_intents
+			.len(),
+		1
+	);
+}
+
+/// An accepted retry after a real snapshot install, unacknowledged so its outcome survives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_accepted_retry_after_a_real_snapshot_install_returns_its_receipt() {
+	use crate::consensus::slab_ops::RecordedOutcome;
+	use crate::storage::sweeper::VerifiedReceipt;
+	let tier = reopen_tier_op(false, async |plain, ticket| {
+		plain.submit_op(ticket).await.unwrap();
+	})
+	.await;
+	let rows = tier.rows().await;
+	let LoadedOp::Submittable(ticket) = rows[0].clone() else {
+		panic!("submitted: {rows:?}");
+	};
+	let owner = tier.mgr.owner_ref().unwrap();
+	install_a_peers_snapshot(&tier.cluster).await;
+	let before = tier.cluster.state_machines[0].state_snapshot().await;
+	let RecordedOutcome::Applied { index } =
+		before.op_tables[&owner].outcomes[&ticket.key().op_seq].outcome
+	else {
+		panic!("premise: applied");
+	};
+	match tier.plain.submit_op(&ticket).await.unwrap() {
+		VerifiedReceipt::Applied { index: found } => assert_eq!(found, index, "its own receipt"),
+		other => panic!("{other:?}"),
+	}
+	let after = tier.cluster.state_machines[0].state_snapshot().await;
+	assert_eq!(before.tiered_slabs, after.tiered_slabs, "applies nothing");
+	assert_eq!(
+		before.op_tables[&owner].outcomes.len(),
+		after.op_tables[&owner].outcomes.len(),
+		"records nothing"
+	);
+}
+
+/// §6.1's second tier and retire states: the effect durable, a cut handoff, a real reopen.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_applied_tier_op_resumes_with_its_effect_already_durable() {
+	use crate::storage::index::OpTxnCut;
+	for retire in [false, true] {
+		let tier = reopen_tier_op(retire, async |plain, ticket| {
+			plain.submit_op(ticket).await.unwrap();
+		})
+		.await;
+		tier.mgr
+			.require_op_index()
+			.unwrap()
+			.cut_next_op_txn(OpTxnCut::BeforeCommit);
+		// This pass alone: the driver's later handoff pass would finish what is cut here.
+		tier.mgr
+			.recover_abandoned_tier_ops(tier.plain.as_ref())
+			.await
+			.unwrap_err();
+		assert_eq!(
+			tier.rows().await.len(),
+			1,
+			"{retire}: premise, its row stands"
+		);
+		let expected = (!retire).then(|| tier.old.clone());
+		assert_eq!(
+			tier.mgr.tier_pointer(tier.old.slab_id).await,
+			expected,
+			"{retire}: premise, its effect is durable"
+		);
+		let ReopenedTierOp {
+			_dirs,
+			mgr,
+			l2,
+			cluster,
+			plain,
+			old,
+		} = tier;
+		let mgr = try_restart_tier_manager(mgr, &_dirs, &l2).await.unwrap();
+		mgr.bind_control_node(1).unwrap();
+		mgr.bind_canonical_tier_source(cluster.state_machines[0].tier_snapshot_source_for_test());
+		let tier = ReopenedTierOp {
+			_dirs,
+			mgr,
+			l2,
+			cluster,
+			plain,
+			old,
+		};
+		tier.drive_until_no_rows("its effect was already durable")
+			.await;
+		assert_eq!(
+			tier.mgr.tier_pointer(tier.old.slab_id).await,
+			expected,
+			"{retire}: unchanged by the resume"
+		);
+	}
+}
+
+/// Every cut of a cleanup, now across a real reopen: a `Cleaning` row resumes from durable
+/// state with no process memory of it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cut_cleanup_resumes_across_a_real_reopen() {
+	use crate::storage::index::OpTxnCut;
+	for skip in 0..8_u8 {
+		for cut in [OpTxnCut::BeforeCommit, OpTxnCut::AfterCommit] {
+			let (dir, mgr, owner, cluster, plain) =
+				reopenable_reservation_store("a93-cleanup-reopen").await;
+			let driver = op_driver(&cluster, &mgr, plain.clone());
+			let slab = abandoned_output_for_cleanup(&dir, &mgr, &driver, true).await;
+			mgr.require_op_index().unwrap().cut_nth_op_txn(skip, cut);
+			let _ = driver.drive_once().await;
+			drop(driver);
+			drop(mgr);
+			eprintln!("reopening at {skip} {cut:?}");
+			let (mgr, next) = reopen_reservation_store(&dir, owner, &cluster).await;
+			let driver = op_driver(&cluster, &mgr, plain);
+			drive_until_id_ends(&mgr, &driver, slab).await;
+			assert!(no_cleanup_entries(&dir), "{skip} {cut:?}");
+			assert!(!slab_path(&dir, slab).exists(), "{skip} {cut:?}");
+			drop(driver);
+			drop(mgr);
+			let _ = next.close(Duration::from_secs(2)).await;
+		}
+	}
+}
+
+/// One cleanup fenced on its own file: another finishes, the fenced one's rows and bytes stay
+/// as they were, and it finishes once its file is right.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cleanup_touches_only_its_own_operation() {
+	use crate::storage::index::ReservedIdState;
+	let (dir, mgr, _cluster, _committer, driver) = ring_store_for_reservations("a93-own").await;
+	let exposed = mgr.reserve_exposed_slab_ids(2).await.unwrap();
+	let (fenced, other) = (exposed[0].id(), exposed[1].id());
+	let recorded: &[u8] = b"recorded output bytes";
+	std::fs::write(slab_path(&dir, fenced), recorded).unwrap();
+	std::fs::write(slab_path(&dir, other), b"another output's bytes").unwrap();
+	drop(exposed);
+	driver.drive_once().await.unwrap();
+	let index = mgr.require_op_index().unwrap();
+	assert!(matches!(
+		index.reserved_id_state(fenced).await.unwrap(),
+		Some(ReservedIdState::Exposed { abandoned: Some(_) })
+	));
+	let changed: &[u8] = b"not the recorded bytes";
+	std::fs::write(slab_path(&dir, fenced), changed).unwrap();
+	drive_until_id_ends_while_another_fences(&mgr, &driver, other).await;
+	let state = index.reserved_id_state(fenced).await.unwrap();
+	assert!(state.is_some(), "the fenced one has not ended");
+	let rows = index.load_op_intents().await.unwrap();
+	let _ = driver.drive_once().await;
+	assert_eq!(index.load_op_intents().await.unwrap(), rows, "unmoved");
+	assert_eq!(index.reserved_id_state(fenced).await.unwrap(), state);
+	assert_eq!(std::fs::read(slab_path(&dir, fenced)).unwrap(), changed);
+	std::fs::write(slab_path(&dir, fenced), recorded).unwrap();
+	drive_until_id_ends(&mgr, &driver, fenced).await;
+	assert!(no_cleanup_entries(&dir));
+}
+
+async fn drive_until_id_ends_while_another_fences(
+	mgr: &Arc<SlabManager>,
+	driver: &crate::storage::op_driver::OpDriver,
+	slab: SlabId,
+) {
+	let index = mgr.require_op_index().unwrap();
+	for _ in 0..12 {
+		let _ = driver.drive_once().await;
+		if index.reserved_id_state(slab).await.unwrap().is_none() {
+			break;
+		}
+	}
+	assert_eq!(index.reserved_id_state(slab).await.unwrap(), None);
+	assert!(removed_on_the_ring(mgr, slab).await);
+}
+
+/// Exposure and burn of one id, actually concurrent, repeatedly: exactly one wins, and the
+/// row says which. Which of them wins each round is not asserted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_concurrent_exposure_and_burn_of_one_id_have_exactly_one_winner() {
+	use crate::storage::index::ReservedIdState;
+	let (_dir, mgr, _cluster, _committer, driver) = ring_store_for_reservations("a93-race").await;
+	let owner = mgr.owner_ref().unwrap();
+	for round in 0..40 {
+		let mut reserved = mgr.reserve_slab_ids(1).await.unwrap();
+		let reservation = reserved.pop().unwrap();
+		let slab = reservation.id();
+		let start = Arc::new(tokio::sync::Barrier::new(2));
+		let expose = {
+			let (mgr, start) = (mgr.clone(), start.clone());
+			tokio::spawn(async move {
+				start.wait().await;
+				mgr.expose_reserved_id(reservation).await
+			})
+		};
+		let burn = {
+			let (mgr, start) = (mgr.clone(), start.clone());
+			tokio::spawn(async move {
+				start.wait().await;
+				mgr.require_op_index()
+					.unwrap()
+					.begin_burn(slab, owner)
+					.await
+					.map(drop)
+			})
+		};
+		let (exposed, burned) = (expose.await.unwrap(), burn.await.unwrap());
+		assert!(
+			exposed.is_ok() != burned.is_ok(),
+			"{round}: exposed {:?}, burned {:?}",
+			exposed.as_ref().err(),
+			burned.as_ref().err()
+		);
+		let state = mgr
+			.require_op_index()
+			.unwrap()
+			.reserved_id_state(slab)
+			.await
+			.unwrap();
+		assert!(
+			if exposed.is_ok() {
+				matches!(state, Some(ReservedIdState::Exposed { .. }))
+			} else {
+				matches!(state, Some(ReservedIdState::Burning { .. }))
+			},
+			"{round}: {state:?}"
+		);
+		drop(exposed);
+		drive_until_id_ends(&mgr, &driver, slab).await;
+	}
+}
+
+/// An abandoned output left at its slab path, reopened: not opened, not indexed, not rewritten,
+/// and its cleanup still finds the file it recorded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reopen_holds_back_an_abandoned_output_at_its_slab_path() {
+	let (dir, mgr, owner, cluster, plain) = reopenable_reservation_store("a93-holdback").await;
+	let driver = op_driver(&cluster, &mgr, plain.clone());
+	let slab = abandoned_output_for_cleanup(&dir, &mgr, &driver, true).await;
+	let bytes = std::fs::read(slab_path(&dir, slab)).unwrap();
+	drop(driver);
+	drop(mgr);
+	let (mgr, next) = reopen_reservation_store(&dir, owner, &cluster).await;
+	assert_eq!(
+		std::fs::read(slab_path(&dir, slab)).unwrap(),
+		bytes,
+		"unwritten"
+	);
+	assert_eq!(
+		mgr.compaction_manifest_snapshot().run(slab),
+		None,
+		"not a run"
+	);
+	assert!(
+		mgr.reserve_exposed_slab_ids(1).await.unwrap()[0].id() > slab,
+		"its id stays below the allocator"
+	);
+	let driver = op_driver(&cluster, &mgr, plain);
+	drive_until_id_ends(&mgr, &driver, slab).await;
+	assert!(!slab_path(&dir, slab).exists());
+	drop(driver);
+	drop(mgr);
+	let _ = next.close(Duration::from_secs(2)).await;
+}
+
+/// A claim's absence is legal only after its run is dropped. The same state with its Complete
+/// at no phase is a real hole in the ledger, and refuses the reopen.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cleanups_claim_may_be_gone_only_once_its_run_is_dropped() {
+	use crate::storage::index::{OpTxnCut, ReservedIdState};
+	let (dir, mgr, owner, cluster, plain) = reopenable_reservation_store("a93-claim-gone").await;
+	let driver = op_driver(&cluster, &mgr, plain);
+	let slab = abandoned_output_for_cleanup(&dir, &mgr, &driver, true).await;
+	let index = mgr.require_op_index().unwrap();
+	// A cut on the transition to submission: its claim handed off, and this pass acks it.
+	index.cut_nth_op_txn(4, OpTxnCut::BeforeCommit);
+	let _ = driver.drive_once().await;
+	let Some(ReservedIdState::Cleaning {
+		claim, complete, ..
+	}) = index.reserved_id_state(slab).await.unwrap()
+	else {
+		panic!("premise: cleaning");
+	};
+	let rows = index.load_op_intents().await.unwrap();
+	assert!(
+		!rows.iter().any(|op| op.key() == claim),
+		"premise: its claim has handed off"
+	);
+	drop((driver, index));
+	assert_row_refuses_the_reopen(
+		&dir,
+		mgr,
+		owner,
+		complete.op_seq,
+		|intent| intent.progress = None,
+		"a Complete at no phase, its claim gone",
+	)
+	.await;
+}
+
+/// The DC-157 race's other half: a tier landing on a run compaction has already retired. It adds
+/// no version of any key, a read still finds its successor, and the store reopens.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tier_of_a_retired_run_restores_no_rows_and_the_store_reopens() {
+	let tier = reopen_tier_op(false, async |plain, ticket| {
+		plain.submit_op(ticket).await.unwrap();
+	})
+	.await;
+	let index = tier.mgr.require_op_index().unwrap();
+	let key = id(0xdd10);
+	let before = index.load_snapshot().await.unwrap();
+	assert!(
+		before
+			.lsm_runs
+			.iter()
+			.any(|run| run.slab_id == tier.old.slab_id && !run.state.is_live()),
+		"premise: retired"
+	);
+	let location = tier.mgr.lookup(tenant(), key).unwrap().unwrap();
+	assert_ne!(location.slab_id, tier.old.slab_id, "premise: its successor");
+	tier.drive_until_no_rows("a retired run").await;
+	assert_eq!(
+		tier.mgr.tier_pointer(tier.old.slab_id).await,
+		Some(tier.old.clone()),
+		"its pointer is published"
+	);
+	let after = index.load_snapshot().await.unwrap();
+	assert_eq!(after.record_rows, before.record_rows, "no row came back");
+	assert_eq!(after.tiered_records, before.tiered_records);
+	assert_eq!(
+		tier.mgr.key_index.get(&(tenant(), key)).unwrap().clone(),
+		vec![location],
+		"one version, in its successor"
+	);
+	let bytes = tier.mgr.read(location).await.unwrap();
+	let ReopenedTierOp {
+		_dirs,
+		mgr,
+		l2,
+		old,
+		..
+	} = tier;
+	let mgr = try_restart_tier_manager(mgr, &_dirs, &l2)
+		.await
+		.expect("the store reopens");
+	// Verification rebuilds a pointer's rows after every reopen, in the background, so wait for
+	// it: asserting before it finished is how this control first passed with the defect in.
+	mgr.wait_tier_authority_ready().await.unwrap();
+	assert_eq!(mgr.tier_pointer(old.slab_id).await, Some(old.clone()));
+	assert_eq!(
+		mgr.key_index.get(&(tenant(), key)).unwrap().clone(),
+		vec![location],
+		"the same, once verified"
+	);
+	assert_eq!(mgr.read(location).await.unwrap(), bytes);
+	let durable = mgr
+		.require_op_index()
+		.unwrap()
+		.load_snapshot()
+		.await
+		.unwrap();
+	assert_eq!(
+		durable.record_rows, after.record_rows,
+		"nothing written back"
+	);
+	// What verification wrote is what the next open reads.
+	let mgr = try_restart_tier_manager(mgr, &_dirs, &l2)
+		.await
+		.expect("and a second reopen");
+	mgr.wait_tier_authority_ready().await.unwrap();
+	assert_eq!(
+		mgr.key_index.get(&(tenant(), key)).unwrap().clone(),
+		vec![location],
+		"the same, a second time"
+	);
+}
+
+// §9.3: a rejected claim Cancels its reserved Complete, for a reservation's cleanup too.
+
+/// An abandoned output whose id the ring has already removed, so its cleanup's claim is
+/// definitely rejected: a real decision on a real ring.
+async fn a_refused_cleanup_store(
+	label: &str,
+) -> (
+	crate::test_support::TestDir,
+	Arc<SlabManager>,
+	DataDirectoryOwner,
+	ControlCluster,
+	Arc<crate::storage::RaftCommitter>,
+	SlabId,
+) {
+	use crate::consensus::slab_ops::{BurnOp, SlabCommand};
+	let (dir, mgr, owner, cluster, plain) = reopenable_reservation_store(label).await;
+	let driver = op_driver(&cluster, &mgr, plain.clone());
+	let slab = abandoned_output_for_cleanup(&dir, &mgr, &driver, true).await;
+	let index = mgr.require_op_index().unwrap();
+	let burn = index
+		.allocate_ops(
+			vec![SlabCommand::BurnReserved(BurnOp {
+				slab: mgr.owner_ref().unwrap().slab(slab),
+			})],
+			None,
+		)
+		.await
+		.unwrap()
+		.first;
+	plain.submit_op(&burn).await.unwrap();
+	index
+		.hand_off_op(burn.key(), burn.digest(), None)
+		.await
+		.unwrap();
+	(dir, mgr, owner, cluster, plain, slab)
+}
+
+const RECORDED_OUTPUT: &[u8] = b"recorded output bytes";
+
+/// Where every path through a refusal ends: nothing holding the window, the reservation saying
+/// why, the file exact and no quarantine made of it, and further passes allocating nothing.
+async fn assert_cleanup_refused(
+	dir: &crate::test_support::TestDir,
+	mgr: &Arc<SlabManager>,
+	driver: &crate::storage::op_driver::OpDriver,
+	slab: SlabId,
+	label: impl std::fmt::Debug,
+) {
+	use crate::consensus::slab_ops::SlabRejection;
+	use crate::storage::index::ReservedIdState;
+	let index = mgr.require_op_index().unwrap();
+	let mut last = Ok(());
+	for _ in 0..8 {
+		last = driver.drive_once().await;
+		if last.is_ok() && index.load_ack_pending().await.unwrap().is_empty() {
+			break;
+		}
+	}
+	last.unwrap_or_else(|error| panic!("{label:?}: {error}"));
+	assert_eq!(
+		index.load_op_intents().await.unwrap(),
+		Vec::new(),
+		"{label:?}"
+	);
+	assert_eq!(
+		index.load_ack_pending().await.unwrap(),
+		Vec::new(),
+		"{label:?}"
+	);
+	let Some(ReservedIdState::ClaimRefused { reason, output, .. }) =
+		index.reserved_id_state(slab).await.unwrap()
+	else {
+		panic!("{label:?}: not refused");
+	};
+	assert_eq!(reason, SlabRejection::Removed, "{label:?}");
+	assert!(output.file.is_some(), "{label:?}: its identity is kept");
+	assert_eq!(
+		std::fs::read(slab_path(dir, slab)).unwrap(),
+		RECORDED_OUTPUT,
+		"{label:?}: its file is exact"
+	);
+	assert!(
+		!std::fs::read_dir(&**dir).unwrap().any(|entry| entry
+			.unwrap()
+			.file_name()
+			.to_string_lossy()
+			.starts_with("gc-quarantine-")),
+		"{label:?}: nothing authorized a disposal"
+	);
+	let next = index.next_op_seq_for_test().await.unwrap();
+	driver.drive_once().await.unwrap();
+	assert_eq!(
+		index.next_op_seq_for_test().await.unwrap(),
+		next,
+		"{label:?}: no repeated attempt spends the window"
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_cleanup_keeps_its_file_and_holds_no_window_across_a_reopen() {
+	use crate::storage::index::{ReservationRefused, ReservedIdState};
+	let (dir, mgr, owner, cluster, plain, slab) = a_refused_cleanup_store("z8-refused").await;
+	let driver = op_driver(&cluster, &mgr, plain.clone());
+	assert_cleanup_refused(&dir, &mgr, &driver, slab, "first").await;
+	let refused = mgr
+		.reacquire_exposed(slab)
+		.await
+		.expect_err("never revived");
+	assert!(
+		refused
+			.get_ref()
+			.is_some_and(|cause| cause.is::<ReservationRefused>()),
+		"{refused}"
+	);
+	let state = mgr
+		.require_op_index()
+		.unwrap()
+		.reserved_id_state(slab)
+		.await
+		.unwrap();
+	assert!(matches!(state, Some(ReservedIdState::ClaimRefused { .. })));
+	drop(driver);
+	drop(mgr);
+	let (mgr, next) = reopen_reservation_store(&dir, owner, &cluster).await;
+	assert_eq!(
+		mgr.require_op_index()
+			.unwrap()
+			.reserved_id_state(slab)
+			.await
+			.unwrap(),
+		state,
+		"the same, after a reopen"
+	);
+	assert_eq!(
+		mgr.compaction_manifest_snapshot().run(slab),
+		None,
+		"not a run"
+	);
+	let driver = op_driver(&cluster, &mgr, plain);
+	assert_cleanup_refused(&dir, &mgr, &driver, slab, "reopened").await;
+	drop(driver);
+	drop(mgr);
+	let _ = next.close(Duration::from_secs(2)).await;
+}
+
+/// A restart across every step of it: starting the cleanup, leaving its reservation, and its
+/// handoff, on both sides of each commit. No second restart, and the same end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_cleanup_resumes_across_a_real_reopen_from_every_cut() {
+	use crate::storage::index::OpTxnCut;
+	for skip in 0..3_u8 {
+		for cut in [OpTxnCut::BeforeCommit, OpTxnCut::AfterCommit] {
+			let (dir, mgr, owner, cluster, plain, slab) = a_refused_cleanup_store("z8-cuts").await;
+			let driver = op_driver(&cluster, &mgr, plain.clone());
+			mgr.require_op_index().unwrap().cut_nth_op_txn(skip, cut);
+			let _ = driver.drive_once().await;
+			drop(driver);
+			drop(mgr);
+			let (mgr, next) = reopen_reservation_store(&dir, owner, &cluster).await;
+			let driver = op_driver(&cluster, &mgr, plain);
+			assert_cleanup_refused(&dir, &mgr, &driver, slab, (skip, cut)).await;
+			drop(driver);
+			drop(mgr);
+			let _ = next.close(Duration::from_secs(2)).await;
+		}
+	}
+}
+
+/// A committer whose Cancel gives this answer and does not reach the ring.
+struct CancelAnswers {
+	inner: Arc<crate::storage::RaftCommitter>,
+	answer: fn() -> std::io::Result<crate::storage::VerifiedReceipt>,
+}
+
+#[async_trait]
+impl TierCommitter for CancelAnswers {
+	async fn preflight(&self, owner: crate::consensus::OwnerRef) -> std::io::Result<()> {
+		self.inner.preflight(owner).await
+	}
+	async fn submit_op(
+		&self,
+		ticket: &crate::storage::index::OpTicket,
+	) -> std::io::Result<crate::storage::VerifiedReceipt> {
+		self.inner.submit_op(ticket).await
+	}
+	async fn cancel_op(
+		&self,
+		_ticket: &crate::storage::index::OpTicket,
+	) -> std::io::Result<crate::storage::VerifiedReceipt> {
+		(self.answer)()
+	}
+	async fn ack_outcomes(
+		&self,
+		owner: crate::consensus::OwnerRef,
+		seqs: Vec<u64>,
+	) -> std::io::Result<crate::consensus::slab_ops::AckReceipt> {
+		self.inner.ack_outcomes(owner, seqs).await
+	}
+	async fn op_prefix(&self, owner: crate::consensus::OwnerRef) -> std::io::Result<Option<u64>> {
+		self.inner.op_prefix(owner).await
+	}
+	async fn op_view(
+		&self,
+		key: crate::consensus::slab_ops::OpKey,
+		digest: [u8; 32],
+		slabs: Vec<crate::consensus::SlabRef>,
+	) -> std::io::Result<crate::consensus::slab_ops::OpView> {
+		self.inner.op_view(key, digest, slabs).await
+	}
+}
+
+/// Anything but the exact Cancelled answer ends nothing: applied, conflicting, unavailable,
+/// ambiguous, or another rejection. Rows, reservation and file stay, and the real answer ends it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_contradictory_cancel_leaves_a_refused_cleanup_fenced() {
+	use crate::consensus::slab_ops::SlabRejection;
+	use crate::storage::VerifiedReceipt;
+	use crate::storage::index::ReservedIdState;
+	let answers: [(&str, fn() -> std::io::Result<VerifiedReceipt>); 4] = [
+		("applied", || Ok(VerifiedReceipt::Applied { index: 1 })),
+		("another rejection", || {
+			Ok(VerifiedReceipt::Rejected {
+				reason: SlabRejection::Removed,
+				index: 1,
+			})
+		}),
+		("conflict or unavailable", || {
+			Err(Error::new(ErrorKind::WouldBlock, "a receipt anomaly"))
+		}),
+		("ambiguous", || Err(Error::other("the answer was lost"))),
+	];
+	for (label, answer) in answers {
+		let (dir, mgr, _owner, cluster, plain, slab) = a_refused_cleanup_store("z8-cancel").await;
+		let index = mgr.require_op_index().unwrap();
+		let contradicting = Arc::new(CancelAnswers {
+			inner: plain.clone(),
+			answer,
+		});
+		let driver = op_driver(&cluster, &mgr, contradicting);
+		let _ = driver.drive_once().await;
+		let rows = index.load_op_intents().await.unwrap();
+		assert_eq!(rows.len(), 2, "{label}: its two rows");
+		let state = index.reserved_id_state(slab).await.unwrap();
+		assert!(
+			matches!(state, Some(ReservedIdState::Cleaning { .. })),
+			"{label}: {state:?}"
+		);
+		driver.drive_once().await.unwrap_err();
+		assert_eq!(index.load_op_intents().await.unwrap(), rows, "{label}");
+		assert_eq!(
+			index.reserved_id_state(slab).await.unwrap(),
+			state,
+			"{label}"
+		);
+		assert_eq!(
+			std::fs::read(slab_path(&dir, slab)).unwrap(),
+			RECORDED_OUTPUT,
+			"{label}"
+		);
+		let driver = op_driver(&cluster, &mgr, plain);
+		assert_cleanup_refused(&dir, &mgr, &driver, slab, label).await;
+	}
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rejected_cleanup_claim_cancels_its_complete_on_the_ring() {
+	use crate::consensus::slab_ops::SlabRejection;
+	let (dir, mgr, _owner, cluster, plain) = reopenable_reservation_store("z8-ring").await;
+	let holding = op_driver(&cluster, &mgr, Arc::new(HoldsAcks(plain.clone())));
+	let slab = abandoned_output_for_cleanup(&dir, &mgr, &holding, true).await;
+	let index = mgr.require_op_index().unwrap();
+	let burn = index
+		.allocate_ops(
+			vec![crate::consensus::slab_ops::SlabCommand::BurnReserved(
+				crate::consensus::slab_ops::BurnOp {
+					slab: mgr.owner_ref().unwrap().slab(slab),
+				},
+			)],
+			None,
+		)
+		.await
+		.unwrap()
+		.first;
+	plain.submit_op(&burn).await.unwrap();
+	index
+		.hand_off_op(burn.key(), burn.digest(), None)
+		.await
+		.unwrap();
+	let _ = holding.drive_once().await;
+	assert_eq!(
+		rejected_on_the_ring(&mgr, &cluster, SlabRejection::Removed).await,
+		1,
+		"its claim"
+	);
+	assert_eq!(
+		rejected_on_the_ring(&mgr, &cluster, SlabRejection::Cancelled).await,
+		1,
+		"its reserved Complete"
+	);
+	assert_eq!(
+		index.load_op_intents().await.unwrap(),
+		Vec::new(),
+		"no row holds the window"
+	);
+}
+
+/// A store of the previous operation-state version: its tags mean other things to this build,
+/// so nothing is decoded. Refused typed, left intact, and the current version opens the same
+/// store. No migration exists and none is implied.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_store_of_the_previous_op_state_version_refuses_to_open_and_is_left_intact() {
+	use crate::storage::index::{op_row_bytes_at, set_op_state_version_for_test};
+	let gc = reopen_gc_at(GcStop::BeforeUnlink).await;
+	let rows = gc.rows().await;
+	assert!(rows[0].progress().is_some(), "premise: a row with a phase");
+	let seq = rows[0].key().op_seq;
+	let ReopenedGc {
+		dir, mgr, owner, ..
+	} = gc;
+	drop(mgr);
+	let _ = owner.close(Duration::from_secs(5)).await;
+	let path = persistent_index_path(&dir);
+	let names = || {
+		let mut names = std::fs::read_dir(&*dir)
+			.unwrap()
+			.map(|entry| {
+				let entry = entry.unwrap();
+				let name = entry.file_name().to_string_lossy().into_owned();
+				let length = entry.metadata().unwrap().len();
+				(name.clone(), (!name.contains("redb")).then_some(length))
+			})
+			.collect::<Vec<_>>();
+		names.sort();
+		names
+	};
+	let current = set_op_state_version_for_test(&path, Some(2));
+	assert_eq!(current, 3, "premise: this build's version");
+	let bytes = op_row_bytes_at(&path, seq);
+	let files = names();
+	let next = DataDirectoryOwner::acquire_existing(&dir).expect("released");
+	let error = SlabManager::open_with_owner(gc_owned_test_config(&dir), next.clone())
+		.await
+		.err()
+		.expect("refused");
+	assert!(
+		crate::storage::index::is_op_state_invalid(&error),
+		"{error}"
+	);
+	assert!(error.to_string().contains("version 2"), "{error}");
+	let _ = next.close(Duration::from_secs(2)).await;
+	assert_eq!(op_row_bytes_at(&path, seq), bytes, "its row");
+	assert_eq!(names(), files, "its files");
+	assert_eq!(set_op_state_version_for_test(&path, None), 2, "untouched");
+	let next = DataDirectoryOwner::acquire_existing(&dir).expect("released");
+	let mgr = SlabManager::open_with_owner(gc_owned_test_config(&dir), next.clone())
+		.await
+		.expect("the current version opens");
+	assert_eq!(
+		mgr.require_op_index()
+			.unwrap()
+			.load_op_intents()
+			.await
+			.unwrap()
+			.len(),
+		rows.len()
+	);
+	drop(mgr);
+	let _ = next.close(Duration::from_secs(2)).await;
+}
+
+/// What the supported version reads answer once a deferred open has normalized its index.
+fn assert_versions_read(
+	mgr: &SlabManager,
+	key: Identity,
+	output: SlabId,
+	expected: &[(HybridTimestamp, &[u8])],
+	label: impl std::fmt::Debug + Copy,
+) -> Vec<(RecordLocation, Vec<u8>)> {
+	let mut reads = Vec::new();
+	for (version, bytes) in expected {
+		let as_of = mgr
+			.lookup_as_of(tenant(), key, *version)
+			.unwrap()
+			.unwrap_or_else(|| panic!("{label:?}: nothing as of {version:?}"));
+		assert_eq!(as_of.hlc, *version, "{label:?}: as of its own instant");
+		assert_eq!(as_of.slab_id, output, "{label:?}: remapped to its output");
+		let exact = mgr
+			.resolve_logical_version(tenant(), key, *version, as_of)
+			.unwrap();
+		assert_eq!(exact, as_of, "{label:?}: exact and as-of agree");
+		reads.push((exact, bytes.to_vec()));
+	}
+	reads
+}
+
+/// Older versions and the latest, through a real deferred open at both cuts where its inputs may
+/// already be gone, then a fresh reopen: `lookup_as_of` and exact-HLC resolution, not only the
+/// latest survivor. These rows have no table, so `apply_elision` keeps every version whatever the
+/// floor: retention's real removal is the `Elided` shape, which asserts `VersionGone` itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn retained_versions_read_after_a_deferred_open_and_a_reopen() {
+	use lsm_driver::ControlLsmInstallCut as Cut;
+	for cut in [Cut::AfterAcceptance, Cut::AfterPublication] {
+		let reopened =
+			reopen_install_retaining(cut, LsmConfig::default(), hlc(2), async |manager, keys| {
+				manager
+					.append_durable(tenant(), keys[0], hlc(1), b"oldest")
+					.await
+					.unwrap();
+				manager
+					.append_durable(tenant(), keys[0], hlc(2), b"retained-older")
+					.await
+					.unwrap();
+				let first = manager.force_seal_active_for_test().await;
+				manager
+					.append_durable(tenant(), keys[0], hlc(3), b"latest")
+					.await
+					.unwrap();
+				manager
+					.append_durable(tenant(), keys[1], hlc(4), b"another-key")
+					.await
+					.unwrap();
+				[first, manager.force_seal_active_for_test().await]
+			})
+			.await;
+		reopened.drive_until_ready(cut).await;
+		let key = reopened.keys[0];
+		let output = reopened.output();
+		let expected: [(HybridTimestamp, &[u8]); 3] = [
+			(hlc(1), b"oldest"),
+			(hlc(2), b"retained-older"),
+			(hlc(3), b"latest"),
+		];
+		for (location, bytes) in assert_versions_read(&reopened.mgr, key, output, &expected, cut) {
+			assert_eq!(reopened.mgr.read(location).await.unwrap(), bytes, "{cut:?}");
+		}
+		assert_eq!(
+			reopened.mgr.lookup(tenant(), key).unwrap().unwrap().hlc,
+			hlc(3),
+			"{cut:?}: the latest"
+		);
+		// An instant before every version answers nothing, and never a later version.
+		assert_eq!(
+			reopened.mgr.lookup_as_of(tenant(), key, hlc(0)).unwrap(),
+			None,
+			"{cut:?}"
+		);
+		let ReopenedInstall {
+			dir, mgr, owner, ..
+		} = reopened;
+		drop(mgr);
+		let _ = owner.close(Duration::from_secs(5)).await;
+		let next = DataDirectoryOwner::acquire_existing(&dir).expect("released");
+		let fresh = SlabManager::open_with_owner(gc_owned_test_config(&dir), next.clone())
+			.await
+			.unwrap();
+		for (location, bytes) in assert_versions_read(&fresh, key, output, &expected, cut) {
+			assert_eq!(
+				fresh.read(location).await.unwrap(),
+				bytes,
+				"{cut:?}: reopened"
+			);
+		}
+		drop(fresh);
+		let _ = next.close(Duration::from_secs(2)).await;
+	}
 }

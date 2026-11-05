@@ -335,11 +335,14 @@ mod op_state;
 pub use op_state::OpTicket;
 pub(crate) use op_state::{
 	AbandonedOutput, GcFileIdentity, LoadedOp, MAX_RESERVED_OUTPUTS_PER_JOB, OpEvidence,
-	OpProgress, OpProgressUpdate, RejectedClaim, ReservationRefused, ReservedIdState, ReservedOp,
-	TerminalBacklog, is_op_state_invalid,
+	OpOwnership, OpProgress, OpProgressUpdate, RejectedClaim, ReservationRefused, ReservedIdState,
+	ReservedOp, TerminalBacklog, is_op_state_invalid,
 };
 #[cfg(test)]
-pub(crate) use op_state::{OpHolderState, OpTxnCut, remove_op_state_meta_for_test};
+pub(crate) use op_state::{
+	OpHolderState, OpIntent, OpPhase, OpTxnCut, op_row_bytes_at, op_row_progress_offset,
+	remove_op_state_meta_for_test, set_op_row_bytes_at, set_op_state_version_for_test,
+};
 
 const META_STORE_INCARNATION_HIGH: &str = "store_incarnation_high_v1";
 const META_STORE_INCARNATION_LOW: &str = "store_incarnation_low_v1";
@@ -557,8 +560,32 @@ pub(crate) struct LsmFileIdentity {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct LsmInputAuthority {
 	pub slab_id: SlabId,
+	/// Counts publications in one open of this store, and restarts at the next:
+	/// meaningful only beside the `opened` it was read under.
 	pub revision: u64,
 	pub tiered: Option<TieredSlabPointer>,
+	/// Which open of this store read `revision`.
+	pub opened: u64,
+}
+
+impl LsmInputAuthority {
+	/// Whether this slab is unchanged since `recorded`. Within one open, exactly. A
+	/// reopen lost the revisions before it, so what can be compared is the durable
+	/// tier evidence, and no publication may have happened in this open.
+	pub(crate) fn unchanged_since(&self, recorded: &Self) -> bool {
+		if self.opened == recorded.opened {
+			return self == recorded;
+		}
+		self.slab_id == recorded.slab_id && self.tiered == recorded.tiered && self.revision == 0
+	}
+
+	pub(crate) fn all_unchanged_since(current: &[Self], recorded: &[Self]) -> bool {
+		current.len() == recorded.len()
+			&& current
+				.iter()
+				.zip(recorded)
+				.all(|(current, recorded)| current.unchanged_since(recorded))
+	}
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -624,10 +651,22 @@ impl std::fmt::Debug for RetainedCharge {
 pub(crate) struct PersistentLocalIndex {
 	db: crate::storage::owned_redb::OwnedRedb,
 	write_lock: Mutex<()>,
+	/// Sequences a live workflow holds (`op_state::OpOwnership`).
+	live_ops: std::sync::Arc<dashmap::DashSet<u64>>,
+	/// Distinguishes this open of the store from any other, for `LsmInputAuthority`.
+	open_nonce: u64,
+	#[cfg(test)]
+	#[allow(clippy::type_complexity)]
+	op_after_commit_hold:
+		std::sync::Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
 	#[cfg(test)]
 	op_txn_cut: std::sync::Mutex<Option<op_state::OpTxnCut>>,
 	#[cfg(test)]
 	op_txn_cut_skip: std::sync::Mutex<Option<(u32, op_state::OpTxnCut)>>,
+	/// A cut for the next publication of runs, which an install with no outputs is: it
+	/// carries no reservations and no progress for a cut on an operation's own step to find.
+	#[cfg(test)]
+	run_publication_cut: std::sync::Mutex<Option<op_state::OpTxnCut>>,
 	#[cfg(test)]
 	#[allow(clippy::type_complexity)]
 	op_handoff_hold:
@@ -1278,10 +1317,16 @@ impl PersistentLocalIndex {
 		Ok(Self {
 			db,
 			write_lock: Mutex::new(()),
+			live_ops: std::sync::Arc::new(dashmap::DashSet::new()),
+			open_nonce: rand::random::<u64>(),
+			#[cfg(test)]
+			op_after_commit_hold: std::sync::Mutex::new(None),
 			#[cfg(test)]
 			op_txn_cut: std::sync::Mutex::new(None),
 			#[cfg(test)]
 			op_txn_cut_skip: std::sync::Mutex::new(None),
+			#[cfg(test)]
+			run_publication_cut: std::sync::Mutex::new(None),
 			#[cfg(test)]
 			op_handoff_hold: std::sync::Mutex::new(None),
 			receipts_available: receipts_ok,
@@ -1809,11 +1854,14 @@ impl PersistentLocalIndex {
 		#[cfg(test)]
 		let before_rows_hold = self.guarded_delta_before_rows_hold.lock().unwrap().take();
 		#[cfg(test)]
-		let progress_cut = update
-			.op_progress
-			.is_some()
+		let progress_cut = (update.op_progress.is_some() || !update.promote_reservations.is_empty())
 			.then(|| self.take_op_txn_cut())
-			.flatten();
+			.flatten()
+			.or_else(|| {
+				(!update.put_lsm_runs.is_empty())
+					.then(|| self.run_publication_cut.lock().unwrap().take())
+					.flatten()
+			});
 		self.db
 			.run(move |db| {
 				let _publication = publication;
@@ -2181,6 +2229,11 @@ impl PersistentLocalIndex {
 
 	/// Commit a raised slab id bound. It returns only after the commit is
 	/// durable; a failure exposes no id above the previous bound.
+	/// Which open of this store this is.
+	pub(crate) fn open_nonce(&self) -> u64 {
+		self.open_nonce
+	}
+
 	pub(crate) async fn persist_slab_id_high_water(&self, bound: u64) -> std::io::Result<()> {
 		let _guard = self.write_lock.lock().await;
 		self.db
@@ -4963,6 +5016,7 @@ mod tests {
 			inputs: vec![LsmInputAuthority {
 				slab_id: SlabId::new(51),
 				revision: 7,
+				opened: 0,
 				tiered: None,
 			}],
 		};

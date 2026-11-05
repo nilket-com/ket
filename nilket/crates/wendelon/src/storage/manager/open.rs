@@ -47,7 +47,7 @@ type DurableVersions = HashMap<(TenantId, Identity, RecordLocation), Option<Tabl
 /// published-reference fence: that fence refuses every read of the table and
 /// keeps the durable index from being rebuilt. Untyped rows have no such
 /// fence, so for them the open itself refuses.
-fn refuse_unaccounted_durable_versions(
+pub(super) fn refuse_unaccounted_durable_versions(
 	manager: &SlabManager,
 	mut durable_versions: DurableVersions,
 ) -> std::io::Result<()> {
@@ -552,6 +552,19 @@ impl SlabManager {
 					.collect::<BTreeSet<_>>()
 			})
 			.unwrap_or_default();
+		// A reservation row means no durable publication has made this id a slab, whatever
+		// is at its path, and its publication ends the row in one transaction. Opening a file
+		// there would index an unpublished output, and recovery can rewrite it, destroying
+		// the identity its cleanup is bound to. So it is evidence too.
+		let unpublished_reservations = match &persistent_index {
+			Some(index) => index
+				.load_reserved_ids()
+				.await?
+				.into_iter()
+				.map(|(id, _)| id)
+				.collect::<BTreeSet<_>>(),
+			None => BTreeSet::new(),
+		};
 		// A discovered id with a committed tier pointer is quarantined before
 		// any file is opened: it serves only through its tier generation. Every
 		// slab id redb names, and every discovered id, stays below the
@@ -614,8 +627,11 @@ impl SlabManager {
 			tier_pointer_ids.contains(id)
 				|| retired_tier_ids.contains(id)
 				|| unresolved_outputs.contains(id)
+				|| unpublished_reservations.contains(id)
 		});
-		discovered_ids.retain(|id| !unresolved_outputs.contains(id));
+		discovered_ids.retain(|id| {
+			!unresolved_outputs.contains(id) && !unpublished_reservations.contains(id)
+		});
 		let (existing_ids, quarantined_slab_files) =
 			slab_file_quarantine::classify_discovered_slab_files(
 				file_ops.as_ref(),
@@ -841,11 +857,15 @@ impl SlabManager {
 				));
 			}
 			for row in snapshot.secondary_index_segments {
-				*secondary_index_table_references_by_slab
-					.entry(row.key.source_slab_id)
-					.or_default()
-					.entry((row.key.tenant_id, row.key.table_object_id))
-					.or_default() += 1;
+				// An unresolved output is held back, so a reference to it is no missing slab:
+				// a deferred open counts it when it loads that output.
+				if !unresolved_outputs.contains(&row.key.source_slab_id) {
+					*secondary_index_table_references_by_slab
+						.entry(row.key.source_slab_id)
+						.or_default()
+						.entry((row.key.tenant_id, row.key.table_object_id))
+						.or_default() += 1;
+				}
 				let coverage_key = secondary_index_coverage_key_from_persistent(&row.key);
 				secondary_index_coverage
 					.entry(coverage_key)
@@ -865,21 +885,11 @@ impl SlabManager {
 		let mut recovered_counter_slabs = vec![active.clone()];
 		recovered_counter_slabs.extend(sealed.iter().map(|entry| entry.value().clone()));
 		for slab in recovered_counter_slabs {
-			for candidate in &slab.recovered_counter_tentatives_v2 {
-				// Local recovery has already consumed physically paired copies.
-				// Never infer resolution of this remaining copy from another
-				// copy sharing the logical counter identity.
-				let pending = Self::pending_counter_frame(
-					candidate.tenant_id,
-					candidate.key_identity,
-					candidate.location.hlc,
-					candidate.origin,
-					candidate.location.slab_id,
-					candidate.location.offset,
-				);
-				counter_pending_frames.insert(pending);
-				counter_pending_guards.insert(pending, slab.track_recovered_counter()?);
-			}
+			Self::note_recovered_counter_tentatives(
+				&slab,
+				&counter_pending_frames,
+				&counter_pending_guards,
+			)?;
 		}
 		if !index_authority_unavailable && !lsm_install_unresolved {
 			remove_non_live_lsm_rows_from_index(&key_index, &recovered_lsm_runs);
@@ -1113,6 +1123,14 @@ impl SlabManager {
 				fenced_table_count = manager.integrity_failures.len(),
 				"published reference integrity failure detected during recovery; preserving durable index evidence"
 			);
+		}
+		// Before anyone holds this manager: what the checks above skipped for an intent is
+		// still owed when that intent resolves.
+		if lsm_install_unresolved && !awaiting_cluster && !index_authority_unavailable {
+			manager
+				.tier_authority
+				.deferred_open
+				.store(true, Ordering::Release);
 		}
 		manager.fence_unresolved_ops_at_open().await?;
 		Ok(manager)

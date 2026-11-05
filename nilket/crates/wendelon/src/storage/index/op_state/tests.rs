@@ -615,6 +615,7 @@ async fn a_mark_handoff_leaves_its_reserved_removal_the_input_authority() {
 		.await
 		.unwrap();
 	let authority = vec![LsmInputAuthority {
+		opened: 0,
 		slab_id: SlabId::new(1),
 		revision: 7,
 		tiered: None,
@@ -709,7 +710,7 @@ async fn a_reserved_removal_cannot_be_submitted_before_its_run_is_gone() {
 		)
 		.await
 		.unwrap();
-	let (_claim, complete) = index
+	let (_claim, complete, _ownership) = index
 		.begin_cleanup(slab, owner(), crate::schema::CompactionJobId::new(8))
 		.await
 		.unwrap();
@@ -775,7 +776,7 @@ async fn a_charge_converts_once_and_a_full_window_still_cleans_up() {
 		.await
 		.unwrap();
 	let job = crate::schema::CompactionJobId::new(1);
-	let (claim, complete) = index.begin_cleanup(slab, owner(), job).await.unwrap();
+	let (claim, complete, _ownership) = index.begin_cleanup(slab, owner(), job).await.unwrap();
 	assert_eq!((claim.key().op_seq, complete.key().op_seq), (1, 2));
 	assert!(matches!(
 		refusal(&index.begin_cleanup(slab, owner(), job).await.unwrap_err()).found,
@@ -785,7 +786,7 @@ async fn a_charge_converts_once_and_a_full_window_still_cleans_up() {
 	backlog(&index.ensure_op_room(1).await.unwrap_err());
 	// A burn at a full window spends less than it held.
 	let burned = SlabId::new(2);
-	let ticket = index.begin_burn(burned, owner()).await.unwrap();
+	let (ticket, _ownership) = index.begin_burn(burned, owner()).await.unwrap();
 	assert_eq!(ticket.key().op_seq, 3);
 	index.ensure_op_room(1).await.unwrap();
 	drop(index);

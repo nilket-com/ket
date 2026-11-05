@@ -217,6 +217,36 @@ pub enum SlabCommand {
 	BurnReserved(BurnOp),
 }
 
+/// What the state machine has decided for one operation, by its digest.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ViewOutcome {
+	Recorded(RecordedOutcome),
+	/// The sequence was decided under another digest.
+	Conflict,
+	/// No entry for this sequence.
+	None,
+}
+
+/// One slab's standing in its owner's terminal sets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlabStanding {
+	Tiered,
+	Claimed(CompactionJobId),
+	Removed,
+	Unknown,
+}
+
+/// One coherent read, after a barrier, of an operation's decision and everything
+/// its persisted command names (ADR 0697 §6 step 1). It is evidence, never authority:
+/// each phase rereads under its own lease before anything irreversible.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpView {
+	pub outcome: ViewOutcome,
+	pub acked_through: u64,
+	pub owner_current: bool,
+	pub slabs: Vec<(SlabRef, SlabStanding)>,
+}
+
 const DIGEST_DOMAIN: &[u8] = b"wendelon.slab-op.v1";
 const DIGEST_KIND_TIER: u8 = 1;
 const DIGEST_KIND_RETIRE: u8 = 2;
@@ -247,6 +277,27 @@ impl SlabCommand {
 			Self::Claim(op) => op.slab.owner(),
 			Self::Complete(op) => op.slab.owner(),
 			Self::BurnReserved(op) => op.slab.owner(),
+		}
+	}
+
+	/// Every slab this command names, which is the scope of its coherent read.
+	pub fn slabs(&self) -> Vec<SlabRef> {
+		match self {
+			Self::Tier(op) => vec![op.tier.slab],
+			Self::Retire(op) => vec![op.slab],
+			Self::Compaction(commit) => commit
+				.slabs_to_retire
+				.iter()
+				.chain(&commit.slabs_to_mark_delete_pending)
+				.chain(&commit.slabs_to_remove)
+				.copied()
+				.chain(commit.slabs_to_add.iter().map(|run| run.slab_id))
+				.map(|slab| commit.owner.slab(slab))
+				.collect(),
+			Self::GcRemove(remove) => vec![remove.slab],
+			Self::Claim(op) => vec![op.slab],
+			Self::Complete(op) => vec![op.slab],
+			Self::BurnReserved(op) => vec![op.slab],
 		}
 	}
 

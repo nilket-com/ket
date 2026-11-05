@@ -4590,12 +4590,24 @@ mod tests {
 		.await
 		.expect("the driver redrives after restart with no later handoff or election");
 
+		let before = restarted.state_machine.state_snapshot().await;
 		let duplicate = restarted.raft.client_write(request).await.unwrap();
 		assert!(matches!(
 			duplicate.data,
 			WendelonResponse::Op(OpResponse::Receipt(ref receipt))
 				if receipt.outcome == OpOutcome::Unavailable
 		));
+		let after = restarted.state_machine.state_snapshot().await;
+		assert_eq!(before.tiered_slabs, after.tiered_slabs, "applies nothing");
+		assert_eq!(
+			before.op_tables[&owner].acked_through,
+			after.op_tables[&owner].acked_through
+		);
+		assert_eq!(
+			before.op_tables[&owner].outcomes.len(),
+			after.op_tables[&owner].outcomes.len(),
+			"records nothing"
+		);
 		let next = restarted
 			.slab
 			.retire_request_for_test(owner.slab(SlabId::new(0x7001)))

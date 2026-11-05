@@ -9716,6 +9716,8 @@ fn adr078_manager_source_concatenates_submodules() {
 			// ADR 629 counted publication helpers preserve the existing entry points.
 			"observation.rs",
 			"op_hooks.rs",
+			// ADR 0697 §6: resolving operations no live workflow holds.
+			"op_recovery.rs",
 			"open.rs",
 			// ADR 0692: test-only pause points (compiled only under cfg(test)), kept
 			// out of the bounded root.
@@ -10838,23 +10840,28 @@ fn every_slab_path_installer_uses_a_fresh_id_or_links_without_replacing() {
 			// fresh next id, sealed-file reads and the backup copy
 			("manager.rs".to_string(), 7),
 			// GC's identity read, its exclusive recheck and its quarantine link's
-			// source: all existing files, none installed at a slab path.
-			("gc_disposal.rs".to_string(), 3),
+			// source, a resume's original and a finished removal's absence check: all
+			// existing files, none installed at a slab path.
+			("gc_disposal.rs".to_string(), 5),
 			// Fresh output paths, identity-only reads, and intent-guarded cleanup.
 			// Control output recovery and input capture add read-only identity checks.
 			("lsm_driver.rs".to_string(), 12),
 			// the staged replacement's final path (fresh reserved id)
 			("maintenance_publication.rs".to_string(), 1),
+			// Recovery of an abandoned install: reads and a rejected output's source, a live
+			// run's existing file, and the output its sidecars are prepared from. None installs
+			// anything at a slab path.
+			("op_recovery.rs".to_string(), 6),
 			// open-time discovery (no manager yet)
 			("open.rs".to_string(), 4),
 			// An existing file only: a rejected output moved out of this namespace,
 			// and an abandoned one read and disposed of after its claim. Nothing is
-			// installed at a slab path.
-			("reservations.rs".to_string(), 3),
+			// installed at a slab path. A resumed disposal names the original once more.
+			("reservations.rs".to_string(), 4),
 			// retention reclaim's fresh active slab
 			("retention_reclaim.rs".to_string(), 1),
 			// the declaration cut (fresh id) and segment source reads
-			("secondary_index_segments.rs".to_string(), 2),
+			("secondary_index_segments.rs".to_string(), 3),
 			// Open classification, owner-identity GC unlink, and released unlink.
 			("slab_file_quarantine.rs".to_string(), 3),
 			// Bootstrap checks the existing path and allocates a fresh replacement.
@@ -10870,14 +10877,16 @@ fn every_slab_path_installer_uses_a_fresh_id_or_links_without_replacing() {
 	assert_eq!(
 		installs,
 		vec![
-			// GC's no-replace link into its quarantine name, never to a slab path.
-			("gc_disposal.rs".to_string(), 1),
+			// GC's no-replace link into its quarantine name, never to a slab path, and a
+			// resume's for the link its row recorded and never made.
+			("gc_disposal.rs".to_string(), 2),
 			// Staged output rename and no-replace link into the quarantine namespace.
 			("lsm_driver.rs".to_string(), 2),
 			("maintenance_publication.rs".to_string(), 1),
 			// A rejected output's no-replace link out of the slab namespace, and a
 			// reservation cleanup's into its quarantine name. Neither installs a slab.
-			("reservations.rs".to_string(), 2),
+			// ... and a resumed disposal's link, for the row that recorded it and never made it.
+			("reservations.rs".to_string(), 3),
 			("secondary_index_segments.rs".to_string(), 1),
 			("tiered_io.rs".to_string(), 1),
 		],
@@ -10947,11 +10956,7 @@ fn tier_recovery_snapshots_have_only_the_reviewed_private_callers() {
 	for (name, expected) in [
 		(
 			"record_rows_for_slab_for_recovery",
-			vec![
-				("manager.rs", 2),
-				("manager/lsm_driver.rs", 1),
-				("manager/tiered_io.rs", 2),
-			],
+			vec![("manager.rs", 2), ("manager/tiered_io.rs", 2)],
 		),
 		(
 			// ADR 0696 (0692 §7): the bounded snapshot behind every tier
@@ -11337,6 +11342,7 @@ fn snapshot_lease_scopes_exclude_remote_io_and_backoff() {
 		vec![
 			PathBuf::from("src/storage/manager/gc_disposal.rs"),
 			PathBuf::from("src/storage/manager/op_hooks.rs"),
+			PathBuf::from("src/storage/manager/op_recovery.rs"),
 			PathBuf::from("src/storage/manager/reservations.rs"),
 			PathBuf::from("src/storage/manager/tier_authority.rs"),
 			PathBuf::from("src/storage/sweeper.rs")
@@ -11349,15 +11355,58 @@ fn snapshot_lease_scopes_exclude_remote_io_and_backoff() {
 	for remote in ["object_store", "l2", "sleep", "client_write", "backoff"] {
 		assert!(!handoff.contains(remote), "{remote}");
 	}
-	// GC's two local stages hold the lease across local files and redb only.
+	// GC's local stages hold the lease across local files and redb only.
 	let disposal = fs::read_to_string(root.join("src/storage/manager/gc_disposal.rs")).unwrap();
-	assert_eq!(disposal.matches("source.read().await").count(), 3);
+	assert_eq!(disposal.matches("source.read().await").count(), 6);
+	for stage in [
+		"gc_complete_mark",
+		"undo_rejected_claim",
+		"gc_dispose_run",
+		"gc_resume_disposal",
+		"gc_finish_removal",
+	] {
+		let body = manager_method_body(&disposal, stage);
+		for remote in [
+			"object_store",
+			"sleep",
+			"client_write",
+			"backoff",
+			"committer",
+			"submit_op",
+		] {
+			assert!(!body.contains(remote), "{stage}: {remote}");
+		}
+	}
+	// An abandoned install's stages too.
+	let recovery = fs::read_to_string(root.join("src/storage/manager/op_recovery.rs")).unwrap();
+	assert_eq!(recovery.matches("source.read().await").count(), 4);
+	for stage in [
+		"undo_abandoned_install",
+		"finish_applied_install",
+		"hand_off_rejected_tier_op",
+	] {
+		let body = manager_method_body(&recovery, stage);
+		for remote in [
+			"object_store",
+			"sleep",
+			"client_write",
+			"backoff",
+			"committer",
+			"submit_op",
+		] {
+			assert!(!body.contains(remote), "{stage}: {remote}");
+		}
+	}
 	// A reservation's local stages hold it across local files and redb only, and a
-	// burn asks the ring first and holds it only after.
+	// burn and a refusal ask the ring first and hold it only after.
 	let reservations =
 		fs::read_to_string(root.join("src/storage/manager/reservations.rs")).unwrap();
-	assert_eq!(reservations.matches("source.read().await").count(), 3);
-	for stage in ["cleanup_dispose", "cleanup_finish"] {
+	assert_eq!(reservations.matches("source.read().await").count(), 5);
+	for stage in [
+		"cleanup_dispose",
+		"cleanup_resume_disposal",
+		"cleanup_finish",
+	] {
 		let body = manager_method_body(&reservations, stage);
 		for remote in [
 			"object_store",
@@ -11489,8 +11538,8 @@ fn snapshot_lease_writers_do_not_await_local_publication_locks() {
 		.split("fn apply_entry_to_state(")
 		.next()
 		.unwrap();
-	// Seven cfg(test) seeding helpers plus the two production writers.
-	assert_eq!(sm.matches("self.inner.write().await").count(), 9);
+	// Eight cfg(test) seeding helpers plus the two production writers.
+	assert_eq!(sm.matches("self.inner.write().await").count(), 10);
 	let apply = sm
 		.split("let pending_checkpoint = {\n\t\t\tlet mut guard = self.inner.write().await;")
 		.nth(1)

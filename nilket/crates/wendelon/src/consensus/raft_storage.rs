@@ -3128,6 +3128,28 @@ impl TierSnapshotLease {
 		rejected && cancelled && current
 	}
 
+	/// This exact operation was decided rejected, and its owner is current.
+	pub(crate) fn op_rejected_for_current_owner(
+		&self,
+		key: crate::consensus::slab_ops::OpKey,
+		digest: [u8; 32],
+	) -> bool {
+		use crate::consensus::slab_ops::RecordedOutcome;
+		let state = &self.0.state;
+		let rejected = state
+			.op_tables
+			.get(&key.owner)
+			.and_then(|table| table.outcomes.get(&key.op_seq))
+			.is_some_and(|entry| {
+				entry.digest == digest && matches!(entry.outcome, RecordedOutcome::Rejected { .. })
+			});
+		rejected
+			&& state
+				.incarnations
+				.get(&key.owner.node())
+				.is_some_and(|registry| registry.current == Some(key.owner.incarnation()))
+	}
+
 	/// §6.1 claim-stage guard: this job holds the claim, for the current owner.
 	pub(crate) fn claim_held_by_current_owner(
 		&self,
@@ -4221,6 +4243,62 @@ impl WendelonStateMachine {
 			.op_tables
 			.get(&owner)
 			.map_or(0, |table| table.acked_through)
+	}
+
+	/// §6 step 1's coherent read. The caller has already passed a barrier.
+	/// Catalogs as a schema update would have left them, for a test of what reads them.
+	#[cfg(test)]
+	pub(crate) async fn seed_catalogs_for_test(
+		&self,
+		table_schemas: crate::schema::TableSchemaCatalog,
+		secondary_indexes: crate::schema::SecondaryIndexCatalog,
+	) {
+		let mut guard = self.inner.write().await;
+		guard.state.table_schemas = table_schemas;
+		guard.state.secondary_indexes = secondary_indexes;
+	}
+
+	pub(crate) async fn op_view(
+		&self,
+		key: crate::consensus::slab_ops::OpKey,
+		digest: [u8; 32],
+		slabs: Vec<SlabRef>,
+	) -> crate::consensus::slab_ops::OpView {
+		use crate::consensus::slab_ops::{OpView, SlabStanding, ViewOutcome};
+		let guard = self.inner.read().await;
+		let state = &guard.state;
+		let table = state.op_tables.get(&key.owner);
+		let outcome = match table.and_then(|table| table.outcomes.get(&key.op_seq)) {
+			Some(entry) if entry.digest == digest => ViewOutcome::Recorded(entry.outcome.clone()),
+			Some(_) => ViewOutcome::Conflict,
+			None => ViewOutcome::None,
+		};
+		let standing = |slab: SlabRef| {
+			let terminal = state.slab_terminal.get(&slab.owner());
+			if state.tiered_slabs.contains_key(&slab) {
+				SlabStanding::Tiered
+			} else if let Some(job) =
+				terminal.and_then(|terminal| terminal.claimed.get(&slab.local_id()))
+			{
+				SlabStanding::Claimed(*job)
+			} else if terminal.is_some_and(|terminal| terminal.removed.contains(slab.local_id())) {
+				SlabStanding::Removed
+			} else {
+				SlabStanding::Unknown
+			}
+		};
+		OpView {
+			outcome,
+			acked_through: table.map_or(0, |table| table.acked_through),
+			owner_current: state
+				.incarnations
+				.get(&key.owner.node())
+				.is_some_and(|registry| registry.current == Some(key.owner.incarnation())),
+			slabs: slabs
+				.into_iter()
+				.map(|slab| (slab, standing(slab)))
+				.collect(),
+		}
 	}
 
 	pub(crate) async fn incarnation_registry(&self, node: u32) -> IncarnationRegistry {

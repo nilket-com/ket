@@ -107,6 +107,8 @@ pub(super) struct TierAuthority {
 	/// A reopen found tier or retire operations with no durable decision. Only
 	/// their receipts can resolve them, so nothing is served until they do.
 	pub(super) unresolved_op_fence: AtomicBool,
+	/// A follower holding unresolved operations (ADR 0697 §6 step 4).
+	pub(super) awaiting_leadership: AtomicBool,
 	snapshot_reconciliation: std::sync::Mutex<Option<SnapshotReconciliation>>,
 	retirements: DashMap<SlabId, Option<u64>>,
 	snapshot_retirements: DashMap<SlabId, (u64, Option<u64>)>,
@@ -114,6 +116,12 @@ pub(super) struct TierAuthority {
 	exposed: AtomicBool,
 	staging: AtomicUsize,
 	completed_attempts: AtomicU64,
+	/// This store's open ran under an unresolved intent, and what it skipped is not done
+	/// yet. Set before the manager exists; cleared only by finishing that work.
+	pub(super) deferred_open: AtomicBool,
+	/// A recovered install's publication whose outcome could not be read, by job.
+	pub(super) held_install_publications:
+		std::sync::Mutex<HashMap<CompactionJobId, super::index_publication::IndexPublication>>,
 	status: std::sync::Mutex<AuthorityStatus>,
 	changed: Notify,
 	task: Mutex<Option<JoinHandle<()>>>,
@@ -135,6 +143,10 @@ pub(super) struct TierAuthority {
 	/// Readers that reached and parked in the verification wait.
 	#[cfg(test)]
 	pub(super) verification_waits_for_test: AtomicUsize,
+	/// Pauses a readiness wait between its ready check and its attempt check.
+	#[cfg(test)]
+	pub(super) wait_before_attempt_check_hold:
+		std::sync::Mutex<Option<(Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>>,
 }
 
 #[derive(Default)]
@@ -197,6 +209,7 @@ impl TierAuthority {
 			snapshot_fences: SnapshotFences::default(),
 			comparison_read_index: std::sync::RwLock::new(None),
 			unresolved_op_fence: AtomicBool::new(false),
+			awaiting_leadership: AtomicBool::new(false),
 			snapshot_reconciliation: std::sync::Mutex::new(None),
 			retirements: DashMap::new(),
 			snapshot_retirements: DashMap::new(),
@@ -204,6 +217,8 @@ impl TierAuthority {
 			exposed: AtomicBool::new(false),
 			staging: AtomicUsize::new(0),
 			completed_attempts: AtomicU64::new(0),
+			deferred_open: AtomicBool::new(false),
+			held_install_publications: std::sync::Mutex::new(HashMap::new()),
 			status: std::sync::Mutex::new(AuthorityStatus::Pending),
 			changed: Notify::new(),
 			task: Mutex::new(None),
@@ -220,6 +235,8 @@ impl TierAuthority {
 			verification_flights_for_test: std::sync::Mutex::new(Vec::new()),
 			#[cfg(test)]
 			verification_waits_for_test: AtomicUsize::new(0),
+			#[cfg(test)]
+			wait_before_attempt_check_hold: std::sync::Mutex::new(None),
 		})
 	}
 
@@ -302,6 +319,11 @@ impl TierAuthority {
 			.try_lock()
 			.ok()
 			.map(|task| task.as_ref().is_some_and(|task| !task.is_finished()))
+	}
+
+	#[cfg(test)]
+	pub(super) fn completed_attempts_for_test(&self) -> u64 {
+		self.completed_attempts.load(Ordering::Acquire)
 	}
 
 	#[cfg(test)]
@@ -1659,6 +1681,7 @@ impl SlabManager {
 		if !self.awaiting_cluster.load(Ordering::Acquire)
 			&& !self.index_authority_unavailable.load(Ordering::Acquire)
 			&& !self.has_orphaned_lsm_intents()
+			&& !self.tier_authority.deferred_open.load(Ordering::Acquire)
 			&& !self.has_orphaned_index_publications()
 			&& self.unapplied_tier_pointers.is_empty()
 			&& self.tier_authority.expose_if_ready()
@@ -1673,6 +1696,7 @@ impl SlabManager {
 		if !self.awaiting_cluster.load(Ordering::Acquire)
 			&& !self.index_authority_unavailable.load(Ordering::Acquire)
 			&& !self.has_orphaned_lsm_intents()
+			&& !self.tier_authority.deferred_open.load(Ordering::Acquire)
 			&& !self.has_orphaned_index_publications()
 			&& self.unapplied_tier_pointers.is_empty()
 			&& self.tier_authority.expose_read_scope_if_ready(slabs)
@@ -1708,6 +1732,7 @@ impl SlabManager {
 				|| self.tier_authority.closed.load(Ordering::Acquire)
 				|| self.index_authority_unavailable.load(Ordering::Acquire)
 				|| self.has_orphaned_lsm_intents()
+				|| self.tier_authority.deferred_open.load(Ordering::Acquire)
 				|| self.has_orphaned_index_publications()
 			{
 				return Err(self.tier_authority_refusal());
@@ -1720,6 +1745,19 @@ impl SlabManager {
 			if self.tier_authority.is_ready() {
 				return self.require_tier_authority_ready();
 			}
+			#[cfg(test)]
+			{
+				let hold = self
+					.tier_authority
+					.wait_before_attempt_check_hold
+					.lock()
+					.unwrap()
+					.take();
+				if let Some((entered, release)) = hold {
+					entered.add_permits(1);
+					let _ = release.acquire().await;
+				}
+			}
 			if matches!(
 				self.tier_authority.status(),
 				AuthorityStatus::Failed(_) | AuthorityStatus::Closed
@@ -1729,6 +1767,11 @@ impl SlabManager {
 				.load(Ordering::Acquire)
 				> initial
 			{
+				// That attempt can have succeeded since the check above, and its verdict is
+				// what this waited for: a ready store is not refused for finishing just now.
+				if self.tier_authority.is_ready() {
+					return self.require_tier_authority_ready();
+				}
 				return Err(self.tier_authority_refusal());
 			}
 			self.tier_authority.start();
@@ -1757,6 +1800,17 @@ impl SlabManager {
 		if let Some(reason) = self.owner_authority_fence.get() {
 			return Some((*reason).into());
 		}
+		// Below the sticky reasons, and only a follower with something to resolve.
+		if self
+			.tier_authority
+			.awaiting_leadership
+			.load(Ordering::Acquire)
+			&& self.tier_authority.integrity_error().is_none()
+			&& !self.index_authority_unavailable.load(Ordering::Acquire)
+			&& self.require_cleanup_authority().is_ok()
+		{
+			return Some("AwaitingLeadership".into());
+		}
 		if self
 			.tier_authority
 			.unresolved_op_fence
@@ -1778,6 +1832,9 @@ impl SlabManager {
 		}
 		if self.has_orphaned_lsm_intents() {
 			return Some("TierAuthorityLsmUnresolved".into());
+		}
+		if self.tier_authority.deferred_open.load(Ordering::Acquire) {
+			return Some("DeferredOpenIncomplete".into());
 		}
 		if self.has_orphaned_index_publications() {
 			return Some("TierAuthorityPublicationPending(RestartRequired)".into());

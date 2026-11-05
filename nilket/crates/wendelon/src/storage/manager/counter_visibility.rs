@@ -71,6 +71,23 @@ impl SlabManager {
 		key_index: &DashMap<(TenantId, Identity), Vec<RecordLocation>>,
 	) -> Arc<super::counter::visibility::EligibleCells<(TenantId, Identity)>> {
 		let counter_eligible = Arc::new(super::counter::visibility::EligibleCells::default());
+		Self::recover_counter_cells(
+			&counter_eligible,
+			counter_slabs,
+			counter_unsupported,
+			key_index,
+		);
+		counter_eligible
+	}
+
+	/// What these slabs say about counters, into `counter_eligible`. A slab opened after
+	/// the rest, by a deferred open, goes through this same path.
+	pub(super) fn recover_counter_cells(
+		counter_eligible: &super::counter::visibility::EligibleCells<(TenantId, Identity)>,
+		counter_slabs: &[Arc<LocalSlabStore>],
+		counter_unsupported: &DashSet<(TenantId, Identity)>,
+		key_index: &DashMap<(TenantId, Identity), Vec<RecordLocation>>,
+	) {
 		for slab in counter_slabs {
 			for &(tenant, key, version) in &slab.recovered_counter_versions {
 				counter_eligible.recover(&(tenant, key), version);
@@ -211,6 +228,5 @@ impl SlabManager {
 				super::counter::CounterVisibilityError::Unsupported,
 			);
 		}
-		counter_eligible
 	}
 }

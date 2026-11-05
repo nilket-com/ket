@@ -21,11 +21,48 @@ impl OpDriver {
 	/// One pass. Only the owner's node as leader can append an Ack, so a
 	/// follower waits; a superseded owner resolves nothing, and its Ack is refused.
 	pub async fn drive_once(&self) -> std::io::Result<()> {
+		let index = self.slab.require_op_index()?;
+		// §6 step 4: a follower resolves nothing. With unresolved rows it says so; a
+		// clean follower is not made unready by being a follower.
 		if !self.committer.should_propose() {
+			let unresolved = !index.load_op_intents().await?.is_empty();
+			self.slab.note_awaiting_leadership(unresolved);
 			return Ok(());
 		}
-		let index = self.slab.require_op_index()?;
+		self.slab.note_awaiting_leadership(false);
 		let owner = self.slab.owner_ref()?;
+		let mut unresolved = None;
+		if let Err(error) = self
+			.slab
+			.recover_abandoned_marks(self.committer.as_ref())
+			.await
+		{
+			unresolved.get_or_insert(error);
+		}
+		if let Err(error) = self
+			.slab
+			.recover_abandoned_removals(self.committer.as_ref())
+			.await
+		{
+			unresolved.get_or_insert(error);
+		}
+		if let Err(error) = self
+			.slab
+			.recover_abandoned_installs(self.committer.as_ref())
+			.await
+		{
+			unresolved.get_or_insert(error);
+		}
+		if let Err(error) = self
+			.slab
+			.recover_abandoned_tier_ops(self.committer.as_ref())
+			.await
+		{
+			unresolved.get_or_insert(error);
+		}
+		if let Err(error) = self.slab.complete_deferred_open().await {
+			unresolved.get_or_insert(error);
+		}
 		// A role failure stops the pass. One claim's failure does not: it stays
 		// fenced and visible while independent work keeps draining, and is reported
 		// after. The prefix still stops at its sequence.
@@ -33,8 +70,11 @@ impl OpDriver {
 		if !claims.is_empty() {
 			self.committer.preflight(owner).await?;
 		}
-		let mut unresolved = None;
 		for claim in claims {
+			// A workflow still resolving this claim owns it.
+			let Some(_ownership) = index.try_acquire_ops(claim.op_seqs()) else {
+				continue;
+			};
 			if let Err(error) = self
 				.slab
 				.resolve_rejected_claim(self.committer.as_ref(), claim)

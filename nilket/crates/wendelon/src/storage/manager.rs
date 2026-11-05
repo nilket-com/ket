@@ -207,6 +207,7 @@ mod gc_disposal;
 mod reservations;
 pub use reservations::{ExposedSlab, OversizedReservation, ReservedSlab};
 mod op_hooks;
+mod op_recovery;
 pub(crate) use slab_ids::{OwnTierView, OwnerEvidence, Ownership};
 use slab_ids::{SLAB_ID_LEASE, slab_ids_exhausted};
 mod retention_reclaim;
@@ -876,7 +877,6 @@ pub struct SlabManager {
 	/// Slab ids whose local file an operation of this process removed from
 	/// `state` and has not yet unlinked: the only slab files it may unlink.
 	released_slab_files: DashSet<SlabId>,
-	/// Ids a running job owns, registered before their rows are visible; not evidence.
 	live_reservations: Arc<DashSet<SlabId>>,
 	/// Test-only pause points (manager/pause_hooks.rs).
 	#[cfg(test)]

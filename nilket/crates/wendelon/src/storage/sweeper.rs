@@ -236,6 +236,36 @@ pub trait TierCommitter: Send + Sync {
 	async fn op_prefix(&self, _owner: crate::consensus::OwnerRef) -> std::io::Result<Option<u64>> {
 		Ok(None)
 	}
+
+	/// This operation's decision and the slabs it names, read together after a
+	/// barrier. A committer with no ring has no such read, and its row stays fenced:
+	/// ring-owned recovery never falls back to a local answer.
+	async fn op_view(
+		&self,
+		key: crate::consensus::slab_ops::OpKey,
+		_digest: [u8; 32],
+		_slabs: Vec<crate::consensus::SlabRef>,
+	) -> std::io::Result<crate::consensus::slab_ops::OpView> {
+		Err(std::io::Error::new(
+			std::io::ErrorKind::Unsupported,
+			format!("this committer cannot read op {key:?}"),
+		))
+	}
+
+	/// The table and index catalogs as this node's state machine has them, for recovering an
+	/// install whose sidecars the live workflow prepared and a crash took with it. A committer
+	/// with no state machine cannot answer, and the row stays fenced.
+	async fn secondary_index_catalogs(
+		&self,
+	) -> std::io::Result<(
+		crate::schema::TableSchemaCatalog,
+		crate::schema::SecondaryIndexCatalog,
+	)> {
+		Err(std::io::Error::new(
+			std::io::ErrorKind::Unsupported,
+			"this committer has no catalogs to recover an install's sidecars with",
+		))
+	}
 }
 
 /// Whether an Ack receipt answers exactly this owner's requested batch.
@@ -280,6 +310,21 @@ fn op_anomaly(message: String) -> std::io::Error {
 	std::io::Error::new(std::io::ErrorKind::WouldBlock, OpReceiptAnomaly(message))
 }
 
+/// The state machine pruned this operation's outcome: it is at or below its owner's
+/// acknowledged prefix. Not a decision, and nothing was applied by asking.
+#[derive(Debug)]
+pub(crate) struct OpOutcomeUnavailable(pub(crate) crate::consensus::slab_ops::OpKey);
+impl std::fmt::Display for OpOutcomeUnavailable {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(
+			f,
+			"operation receipt anomaly: op {:?} is at or below the acknowledged prefix",
+			self.0
+		)
+	}
+}
+impl std::error::Error for OpOutcomeUnavailable {}
+
 /// Use a receipt only if its owner, sequence and digest are the ticket's.
 pub(crate) fn verify_receipt(
 	ticket: &OpTicket,
@@ -304,10 +349,10 @@ pub(crate) fn verify_receipt(
 			"op {:?} was decided under another digest",
 			ticket.key()
 		))),
-		OpOutcome::Unavailable => Err(op_anomaly(format!(
-			"op {:?} is at or below the acknowledged prefix",
-			ticket.key()
-		))),
+		OpOutcome::Unavailable => Err(std::io::Error::new(
+			std::io::ErrorKind::WouldBlock,
+			OpOutcomeUnavailable(ticket.key()),
+		)),
 	}
 }
 
@@ -816,6 +861,45 @@ impl TierCommitter for RaftCommitter {
 			.await
 			.map_err(|e| std::io::Error::other(format!("op prefix barrier failed: {e}")))?;
 		Ok(Some(state_machine.op_acked_through(owner).await))
+	}
+
+	async fn op_view(
+		&self,
+		key: crate::consensus::slab_ops::OpKey,
+		digest: [u8; 32],
+		slabs: Vec<crate::consensus::SlabRef>,
+	) -> std::io::Result<crate::consensus::slab_ops::OpView> {
+		let Some(state_machine) = &self.registry else {
+			return Err(std::io::Error::new(
+				std::io::ErrorKind::Unsupported,
+				"this committer has no state machine to read",
+			));
+		};
+		self.raft
+			.ensure_linearizable()
+			.await
+			.map_err(|e| std::io::Error::other(format!("op view barrier failed: {e}")))?;
+		Ok(state_machine.op_view(key, digest, slabs).await)
+	}
+
+	async fn secondary_index_catalogs(
+		&self,
+	) -> std::io::Result<(
+		crate::schema::TableSchemaCatalog,
+		crate::schema::SecondaryIndexCatalog,
+	)> {
+		let Some(state_machine) = &self.registry else {
+			return Err(std::io::Error::new(
+				std::io::ErrorKind::Unsupported,
+				"this committer has no state machine to read",
+			));
+		};
+		self.raft
+			.ensure_linearizable()
+			.await
+			.map_err(|e| std::io::Error::other(format!("catalog barrier failed: {e}")))?;
+		let state = state_machine.state_snapshot().await;
+		Ok((state.table_schemas, state.secondary_indexes))
 	}
 }
 
