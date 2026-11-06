@@ -550,7 +550,7 @@ pub fn evaluate(inp: &Inputs<'_>) -> Value {
 		Err(e) => o.invalid(format!("activity counter invalid: {e}")),
 	}
 
-	// --- Budget extrema and lineage census at the final capture ----------
+	// --- Budget extrema at the final capture; lineage census at each capture
 	let gauges = (
 		last.quantity(PEAK),
 		last.quantity(MIN_HEADROOM),
@@ -585,10 +585,15 @@ pub fn evaluate(inp: &Inputs<'_>) -> Value {
 			o.predicate("block min headroom > 0", Value::Null, "invalid");
 		}
 	}
-	const P99: &str = "lineages over cap/4 * 100 <= lineages";
-	let census = (|| -> Result<Option<Value>, String> {
-		let buckets = last.buckets(LINEAGE)?;
-		let (count, over_gauge) = (last.quantity(LINEAGE_COUNT)?, last.quantity(OVER_QUARTER)?);
+	// A post-result experiment amendment (operator, 2026-11-06). The frozen rule read the final
+	// capture alone and refused an empty one, but retention keeps this population at 0 or 1, so
+	// that said more about where the last capture landed than about the cap. Every measured
+	// capture is checked, so repeats of one lineage are not independent samples, and at n <= 1
+	// this is a sparse sampled cap check, not a p99 over a population. Earlier verdicts stand.
+	const P99: &str = "at every measured capture: lineages over cap/4 * 100 <= lineages";
+	let census_at = |s: &Scrape| -> Result<Option<(u64, u64)>, String> {
+		let buckets = s.buckets(LINEAGE)?;
+		let (count, over_gauge) = (s.quantity(LINEAGE_COUNT)?, s.quantity(OVER_QUARTER)?);
 		if buckets.is_empty() && count.is_none() && over_gauge.is_none() {
 			return Ok(None);
 		}
@@ -611,20 +616,64 @@ pub fn evaluate(inp: &Inputs<'_>) -> Value {
 		if over != over_gauge {
 			return Err(format!("derived over-count {over} != gauge {over_gauge}"));
 		}
-		if count == 0 {
-			return Err("empty final lineage population".into());
+		Ok(Some((over, count)))
+	};
+	let census = (|| -> Result<Option<Value>, String> {
+		let measured_ticks = lines.iter().filter(|l| {
+			l["kind"] == "tick" && l["t_mono_ns"].as_u64().is_some_and(|t| t >= ms && t <= me)
+		});
+		let mut captures = Vec::new();
+		for l in measured_ticks {
+			let scrape = l["metrics"]
+				.as_str()
+				.ok_or("measured capture without metrics")
+				.and_then(|t| Scrape::parse(t).map_err(|_| "measured capture malformed"))?;
+			captures.push(census_at(&scrape)?);
 		}
-		let lhs = over.checked_mul(100).ok_or("over-count overflow")?;
-		Ok(Some(
-			json!({"over": over, "count": count, "pass": lhs <= count}),
-		))
+		let at_final = census_at(&last)?;
+		captures.push(at_final);
+		if captures.iter().all(Option::is_none) {
+			return Ok(None);
+		}
+		let captures = captures
+			.into_iter()
+			.collect::<Option<Vec<_>>>()
+			.ok_or("lineage census missing at a measured capture")?;
+		let nonempty = captures.iter().filter(|(_, count)| *count > 0).count();
+		if nonempty == 0 {
+			return Err("no measured capture has a lineage".into());
+		}
+		let mut breaches = 0u64;
+		for (over, count) in &captures {
+			let lhs = over.checked_mul(100).ok_or("over-count overflow")?;
+			if lhs > *count {
+				breaches += 1;
+			}
+		}
+		let (final_over, final_count) = captures[captures.len() - 1];
+		Ok(Some(json!({
+			"rule": "every measured capture; post-result experiment amendment 2026-11-06",
+			"captures": captures.len(),
+			"nonempty_captures": nonempty,
+			"breaching_captures": breaches,
+			"max_count": captures.iter().map(|c| c.1).max(),
+			"max_over": captures.iter().map(|c| c.0).max(),
+			"final_over": final_over,
+			"final_count": final_count,
+			"pass": breaches == 0,
+		})))
 	})();
 	let census = match census {
 		Ok(Some(c)) => {
 			let pass = c["pass"] == true;
 			o.predicate(
 				P99,
-				json!({"over": c["over"], "count": c["count"]}),
+				json!({
+					"breaching_captures": c["breaching_captures"],
+					"captures": c["captures"],
+					"nonempty_captures": c["nonempty_captures"],
+					"max_count": c["max_count"],
+				}),
 				if pass { "pass" } else { "fail" },
 			);
 			c
@@ -634,7 +683,7 @@ pub fn evaluate(inp: &Inputs<'_>) -> Value {
 			Value::Null
 		}
 		Ok(None) => {
-			o.invalid("fix lineage census missing at final");
+			o.invalid("fix lineage census missing at every measured capture");
 			o.predicate(P99, Value::Null, "invalid");
 			Value::Null
 		}

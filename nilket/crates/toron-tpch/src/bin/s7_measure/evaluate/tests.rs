@@ -18,6 +18,9 @@ const MS: u64 = T0 + 52 * S;
 const DEADLINE: u64 = MS + 700 * S;
 const F_REQ: u64 = DEADLINE + MSEC;
 const ME: u64 = F_REQ + 2 * MSEC;
+const P99: &str = "at every measured capture: lineages over cap/4 * 100 <= lineages";
+/// A tick well inside the measured window.
+const MIDDLE_TICK: u64 = 40;
 const PID: u64 = 4242;
 const START: u64 = 777;
 const SHA: &str = "manifest-sha";
@@ -369,10 +372,12 @@ fn a_clean_fix_block_passes() {
 	assert_eq!(verdict(&v), "PASS", "{v:#}");
 	assert_eq!(v["evidence"], false, "a TEST label is never evidence");
 	assert_eq!(
-		v["predicates"]["lineages over cap/4 * 100 <= lineages"]["value"],
-		json!({"over": 1, "count": 100}),
-		"1 of 100 above cap/4 is exactly the p99 bound"
+		v["predicates"][P99]["value"]["breaching_captures"],
+		json!(0),
+		"1 of 100 above cap/4 is exactly the bound"
 	);
+	assert_eq!(v["detail"]["census"]["final_over"], json!(1));
+	assert_eq!(v["detail"]["census"]["final_count"], json!(100));
 }
 
 #[test]
@@ -416,10 +421,7 @@ fn p99_fails_by_exact_count() {
 	f.fin.census = (98, 100);
 	let v = f.run();
 	assert_eq!(verdict(&v), "FAIL", "2 of 100 above cap/4: {v:#}");
-	assert_eq!(
-		v["failed_predicates"],
-		json!(["lineages over cap/4 * 100 <= lineages"])
-	);
+	assert_eq!(v["failed_predicates"], json!([P99]));
 }
 
 #[test]
@@ -488,13 +490,75 @@ fn an_idle_block_is_invalid_not_pass() {
 	assert!(reasons(&v).contains("no L2 retention pruned rows"), "{v:#}");
 }
 
+/// The amendment of 2026-11-06, which replaces the frozen rule's `an_empty_census_is_invalid`:
+/// an empty final capture alone is no longer INVALID, and it is reported.
 #[test]
-fn an_empty_census_is_invalid() {
+fn an_empty_final_capture_alone_is_valid_and_disclosed() {
 	let mut f = Fixture::fix();
 	f.fin.census = (0, 0);
 	let v = f.run();
-	assert_eq!(verdict(&v), "INVALID", "0/0 never passes p99: {v:#}");
-	assert!(reasons(&v).contains("empty final lineage population"));
+	assert_eq!(verdict(&v), "PASS", "{v:#}");
+	assert_eq!(v["detail"]["census"]["final_count"], json!(0));
+	let captures = v["detail"]["census"]["captures"].as_u64().unwrap();
+	assert_eq!(
+		v["detail"]["census"]["nonempty_captures"].as_u64().unwrap(),
+		captures - 1,
+		"occupancy is disclosed"
+	);
+}
+
+/// What the frozen rule's empty case still means: no capture in the window had a lineage.
+#[test]
+fn no_lineage_at_any_measured_capture_is_invalid() {
+	let mut f = Fixture::fix();
+	f.post.census = (0, 0);
+	f.fin.census = (0, 0);
+	assert_invalid(f, "no measured capture has a lineage");
+}
+
+/// A capture before the measured window is warm-up: it neither fails nor occupies the census.
+#[test]
+fn a_breach_before_the_measured_window_is_not_counted() {
+	let mut f = Fixture::fix();
+	f.pre.census = (0, 100);
+	let v = f.run();
+	assert_eq!(verdict(&v), "PASS", "{v:#}");
+}
+
+/// The final capture no longer speaks for the window: a breach anywhere in it fails.
+#[test]
+fn a_breach_at_a_middle_capture_fails() {
+	let mut f = Fixture::fix();
+	f.tick_override = Some((
+		MIDDLE_TICK,
+		Values {
+			census: (98, 100),
+			..f.post.clone()
+		},
+	));
+	let v = f.run();
+	assert_eq!(verdict(&v), "FAIL", "{v:#}");
+	assert_eq!(v["failed_predicates"], json!([P99]));
+	assert_eq!(v["detail"]["census"]["breaching_captures"], json!(1));
+}
+
+/// A malformed census at any measured capture is refused, not skipped.
+#[test]
+fn a_malformed_middle_capture_is_invalid() {
+	let mut f = Fixture::fix();
+	f.mutate = |b| {
+		let tick = b
+			.lines
+			.iter_mut()
+			.find(|l| l["kind"] == "tick" && l["index"] == json!(MIDDLE_TICK))
+			.unwrap();
+		let text = tick["metrics"].as_str().unwrap().replace(
+			"wendelon_test_tier_lineages_over_quarter_cap 0",
+			"wendelon_test_tier_lineages_over_quarter_cap 1",
+		);
+		tick["metrics"] = json!(text);
+	};
+	assert_invalid(f, "derived over-count 0 != gauge 1");
 }
 
 #[test]
@@ -760,10 +824,7 @@ fn an_invalid_census_is_invalid() {
 		"{}",
 		reasons(&v)
 	);
-	assert_eq!(
-		v["predicates"]["lineages over cap/4 * 100 <= lineages"]["verdict"],
-		"invalid"
-	);
+	assert_eq!(v["predicates"][P99]["verdict"], "invalid");
 }
 
 #[test]

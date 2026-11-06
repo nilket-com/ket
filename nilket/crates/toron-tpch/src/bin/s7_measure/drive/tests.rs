@@ -96,7 +96,9 @@ fn the_frozen_manifest_fits_its_overrun() {
 		"../../../../../../scripts/s7-measure/manifest.json"
 	))
 	.unwrap();
-	assert!(m.most_batches_admitted() > m.batches_in(m.warmup_secs) + m.batches_in(m.measured_secs));
+	assert!(
+		m.most_batches_admitted() > m.batches_in(m.warmup_secs) + m.batches_in(m.measured_secs)
+	);
 	let rows = (6_001_215.0 * m.scale_factor) as u64;
 	assert!(
 		m.most_batches_admitted() <= rows / m.batch_rows as u64,
