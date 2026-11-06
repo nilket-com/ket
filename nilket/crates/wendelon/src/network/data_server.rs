@@ -5005,6 +5005,30 @@ impl WendelonDataServer {
 			DataOperation::Read | DataOperation::Query => self.slab.require_tier_read_scope(&[])?,
 			_ => self.slab.require_tier_authority_ready()?,
 		}
+		self.admit_data_request_past_authority(actor, target_tenant, op)
+	}
+
+	/// A table write's appends each check for themselves and wait out a refusal that clears by
+	/// itself, so the door does not end the stream on one first. Any other refusal stops here.
+	fn try_admit_table_write_request(
+		&self,
+		actor: &ActorIdentity,
+		target_tenant: Option<TenantId>,
+	) -> std::io::Result<Result<DataRequestAdmission, BackpressureScope>> {
+		if let Err(refusal) = self.slab.require_append_admission()
+			&& !crate::storage::manager::tier_authority::append_refused_before_effects(&refusal)
+		{
+			return Err(refusal);
+		}
+		self.admit_data_request_past_authority(actor, target_tenant, DataOperation::Write)
+	}
+
+	fn admit_data_request_past_authority(
+		&self,
+		actor: &ActorIdentity,
+		target_tenant: Option<TenantId>,
+		op: DataOperation,
+	) -> std::io::Result<Result<DataRequestAdmission, BackpressureScope>> {
 		let claimed_tenant = actor.claimed_tenant_id()?;
 		let tenant_reservation = match op {
 			DataOperation::Write
@@ -6882,11 +6906,9 @@ impl DataRingServer for WendelonDataServer {
 						None,
 					)));
 				}
-				let _admission = match self.try_admit_data_request(
-					&context.actor,
-					Some(meta.tenant_id),
-					DataOperation::Write,
-				)? {
+				let _admission = match self
+					.try_admit_table_write_request(&context.actor, Some(meta.tenant_id))?
+				{
 					Ok(admission) => admission,
 					Err(_) => {
 						let resp = self.table_write_error_response(

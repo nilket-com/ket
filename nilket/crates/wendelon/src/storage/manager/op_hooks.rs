@@ -210,6 +210,28 @@ impl SlabManager {
 		Ok(())
 	}
 
+	/// `hand_off_op_if_complete` for a pass over the intents, which owns none of them. A workflow
+	/// still working an operation hands it off itself, and one that finished after the scan
+	/// already has, so holding it this reads the row as it stands.
+	pub(crate) async fn hand_off_unowned_op_if_complete(
+		&self,
+		key: crate::consensus::slab_ops::OpKey,
+	) -> std::io::Result<()> {
+		let index = self.require_op_index()?;
+		let Some(_ownership) = index.try_acquire_ops(vec![key.op_seq]) else {
+			return Ok(());
+		};
+		let Some(LoadedOp::Submittable(ticket)) = index
+			.load_op_intents()
+			.await?
+			.into_iter()
+			.find(|op| op.key() == key)
+		else {
+			return Ok(());
+		};
+		self.hand_off_op_if_complete(&ticket).await
+	}
+
 	/// GC has no undo for a definite rejection yet, so its intent stays and
 	/// fences until exact pre-state restoration exists (Addendum A1).
 	pub(super) fn require_gc_applied(receipt: VerifiedReceipt) -> std::io::Result<()> {

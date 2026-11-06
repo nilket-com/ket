@@ -48085,6 +48085,56 @@ async fn a_tier_op_through_a_real_ring_hands_off_acks_and_retires_its_row() {
 	assert_eq!(index.load_ack_pending().await.unwrap(), vec![(2, false)]);
 }
 
+/// The driver's pass over intents races a workflow it does not own: an applied operation whose
+/// workflow is about to hand it off stays that workflow's, and the workflow's handoff succeeds. A
+/// row the workflow finished after the scan is no error to the pass either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_op_driver_leaves_an_operation_its_workflow_still_owns() {
+	let (_dirs, mgr, _l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let cluster = control_cluster_observing(&[(1, &mgr)]).await;
+	let committer = Arc::new(op_committer(&cluster, 1));
+	let index = mgr.require_op_index().unwrap();
+	committer.preflight(mgr.owner_ref().unwrap()).await.unwrap();
+	let allocation = index
+		.allocate_ops(
+			vec![crate::consensus::slab_ops::SlabCommand::Tier(
+				crate::consensus::slab_ops::TierOp {
+					tier: b10_tier(&mgr, &old),
+					replaces: None,
+				},
+			)],
+			None,
+		)
+		.await
+		.unwrap();
+	let ticket = allocation.first.clone();
+	committer.submit_op(&ticket).await.unwrap();
+	assert_eq!(mgr.tier_pointer(old.slab_id).await, Some(old.clone()));
+	assert!(
+		mgr.op_effect_is_durable(ticket.command()).await,
+		"premise: only the handoff is left"
+	);
+
+	op_driver(&cluster, &mgr, committer.clone())
+		.drive_once()
+		.await
+		.unwrap();
+	assert_eq!(
+		index.load_op_intents().await.unwrap().len(),
+		1,
+		"the workflow owns it"
+	);
+	mgr.hand_off_op_if_complete(&ticket)
+		.await
+		.expect("the workflow's own handoff finds its intent");
+	assert!(index.load_op_intents().await.unwrap().is_empty());
+	drop(allocation);
+
+	mgr.hand_off_unowned_op_if_complete(ticket.key())
+		.await
+		.expect("a row already handed off is not an error to the pass");
+}
+
 /// A fenced or deferred apply is not local completion: the operation stays an
 /// intent, with no Ack, until its effect is durable.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -86,7 +86,9 @@ impl OpDriver {
 		}
 		for loaded in index.load_op_intents().await? {
 			if let LoadedOp::Submittable(ticket) = loaded {
-				self.slab.hand_off_op_if_complete(&ticket).await?;
+				self.slab
+					.hand_off_unowned_op_if_complete(ticket.key())
+					.await?;
 			}
 		}
 		if let Err(error) = self.slab.drive_reserved_ids(self.committer.as_ref()).await {

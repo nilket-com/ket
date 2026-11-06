@@ -18419,6 +18419,90 @@ async fn a_table_write_waits_out_a_retirement_fence() {
 	shutdown_lease_node(node).await;
 }
 
+fn table_write_frame_for_test(meta: &TableWriteRequestMeta, batch: &RecordBatch) -> HrftFrame {
+	let meta_bytes = bytemuck::bytes_of(meta).to_vec();
+	let payload = encode_batch(batch).unwrap();
+	HrftFrame {
+		header: FrameHeader {
+			magic: HRFT_MAGIC,
+			version: 1,
+			msg_type: MsgType::TABLE_WRITE_REQ.0,
+			flags: 0,
+			stream_id: 71,
+			meta_len: meta_bytes.len() as u32,
+			arrow_len: payload.len() as u32,
+			trailing_len: 0,
+		},
+		meta: crate::network::pool::PooledBuf::orphan(meta_bytes),
+		arrow_payload: Some(crate::network::pool::PooledBuf::orphan(payload)),
+		trailing: None,
+	}
+}
+
+/// The request as the wire delivers it, door included: a refusal that clears by itself waits with
+/// the append instead of ending the stream, which a client sees as `early eof`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_table_write_from_the_wire_waits_out_a_retirement_fence() {
+	let (dir, node) = leading_node_for_refusals("dc178-door").await;
+	let descriptor = typed_table_descriptor();
+	let batch = typed_table_batch(vec![7, 8]);
+	let mut meta = typed_table_meta(&descriptor, batch.num_rows());
+	meta.parent_write_id.sequence_no = 59;
+	meta.await_finalization = 1;
+	let slab = SlabId::new(0x7701);
+	node.slab.raise_retirement_fence_for_test(slab);
+	let frame = table_write_frame_for_test(&meta, &batch);
+	let context = RequestContext {
+		remote: Some(node.local_node),
+		actor: actor(ActorRole::Operator, None),
+	};
+	let write = {
+		let server = node.data_server.clone();
+		tokio::spawn(async move {
+			DataRingServer::handle_data_frame(server.as_ref(), context, frame).await
+		})
+	};
+	tokio::time::timeout(Duration::from_secs(30), node.slab.append_refusal_for_test())
+		.await
+		.expect("the fence actually refused it");
+	assert!(!write.is_finished(), "it waits while the fence stands");
+	node.slab.clear_retirement_fence_for_test(slab);
+	let response = tokio::time::timeout(Duration::from_secs(10), write)
+		.await
+		.expect("the fence cleared")
+		.unwrap()
+		.expect("the stream carries an answer")
+		.expect("a response frame");
+	let written: TableWriteResponseMeta =
+		*bytemuck::from_bytes(&response.meta[..std::mem::size_of::<TableWriteResponseMeta>()]);
+	assert_eq!(written.write.status, WriteStatus::OK, "{written:?}");
+	assert_not_fenced(&node, &dir, "waited out at the door").await;
+	shutdown_lease_node(node).await;
+}
+
+/// The door still stops a refusal that does not clear by itself: nothing waits on it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_table_write_door_keeps_refusing_what_does_not_clear() {
+	let (_dir, node) = leading_node_for_refusals("dc178-door-stays").await;
+	let slab = SlabId::new(0x7702);
+	node.slab.raise_retirement_fence_for_test(slab);
+	let operator = actor(ActorRole::Operator, None);
+	assert!(
+		node.data_server
+			.try_admit_table_write_request(&operator, Some(tenant()))
+			.is_ok(),
+		"premise: this one clears by itself, so the door passes it"
+	);
+	node.slab.fence_unresolved_op_for_test();
+	assert!(
+		node.data_server
+			.try_admit_table_write_request(&operator, Some(tenant()))
+			.is_err()
+	);
+	node.slab.clear_retirement_fence_for_test(slab);
+	shutdown_lease_node(node).await;
+}
+
 /// The same wait, for the refusal the conservative path used to meet: its first child durable,
 /// its second refused for a moment. The mutation carries on, with nothing left partly applied.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
