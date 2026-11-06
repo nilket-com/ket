@@ -578,10 +578,17 @@ impl SlabManager {
 		self.lsm_install_unresolved.remove(&job_id);
 	}
 
+	/// Called per row, so it must not allocate when there is nothing to find. `DashMap::iter`
+	/// allocates an `Arc` per shard it visits, even an empty one; `is_empty` only reads each shard.
+	/// Both visit the shards one at a time with no snapshot, so `is_empty` being true is an answer
+	/// the walk could also have given: an intent standing throughout is seen by both, and one
+	/// inserted behind the cursor by neither. With intents present, the walk runs and allocates.
 	pub(super) fn has_orphaned_lsm_intents(&self) -> bool {
-		self.lsm_install_unresolved
-			.iter()
-			.any(|entry| !entry.value().in_flight)
+		!self.lsm_install_unresolved.is_empty()
+			&& self
+				.lsm_install_unresolved
+				.iter()
+				.any(|entry| !entry.value().in_flight)
 	}
 
 	pub(super) fn lsm_intent_names_slab(&self, slab_id: SlabId) -> bool {

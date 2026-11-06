@@ -18968,6 +18968,33 @@ async fn a_held_retirement_ends_only_with_its_own_effect() {
 	owed("a record of this generation").await;
 }
 
+/// Readiness runs per row of every append, so it must not allocate while nothing is unresolved
+/// (DC-190). With an intent present it walks, and that cost is measured here rather than assumed.
+#[tokio::test]
+async fn tier_readiness_does_not_allocate_with_no_unresolved_intent() {
+	use crate::storage::mutation_visibility::tests::b1_assay::thread_allocs;
+	let (_dirs, mgr, _l2) = fresh_manager_with_l2("dc190-readiness").await;
+	mgr.wait_tier_authority_ready().await.unwrap();
+	// Synchronous, with no await, so this thread's count is these checks and nothing else.
+	let allocs_over = |calls: usize| {
+		let before = thread_allocs();
+		for _ in 0..calls {
+			mgr.require_tier_authority_ready().unwrap();
+		}
+		thread_allocs() - before
+	};
+	assert_eq!(allocs_over(1000), 0, "1000 checks with no intent");
+
+	let job = scope_holding(&mgr, 724, SlabId::new(0xb190));
+	let held = allocs_over(1000);
+	eprintln!("dc190: {held} allocations per 1000 checks with one in-flight intent");
+	assert!(
+		held >= 1000,
+		"the walk still runs with an intent present, and still allocates"
+	);
+	mgr.lsm_install_unresolved.remove(&job);
+}
+
 /// A real install over a really tiered input on a real ring, stopped at `cut` with its task parked.
 struct TieredInputInstall {
 	dir: crate::test_support::TestDir,
