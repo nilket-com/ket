@@ -92,6 +92,27 @@ impl SlabManager {
 			.store(0, Ordering::Release);
 	}
 
+	/// The next version check raises this fence, once: after its append's head admitted it.
+	pub(crate) fn fence_at_next_version_check_for_test(&self, slab_id: SlabId) {
+		*self
+			.continuity_test_holds
+			.fence_at_version_check
+			.lock()
+			.unwrap() = Some(slab_id);
+	}
+
+	pub(super) fn raise_fence_at_version_check_for_test(&self) {
+		let slab = self
+			.continuity_test_holds
+			.fence_at_version_check
+			.lock()
+			.unwrap()
+			.take();
+		if let Some(slab) = slab {
+			self.raise_retirement_fence_for_test(slab);
+		}
+	}
+
 	/// Raise and clear the real store-wide fence a tier retirement holds.
 	pub(crate) fn raise_retirement_fence_for_test(&self, slab_id: SlabId) {
 		self.tier_authority.mark_retirement(slab_id, Some(1));
@@ -529,6 +550,7 @@ pub(super) struct TestHolds {
 	/// Fails the next read of what a recovered publication left.
 	pub(super) fail_publication_readback: std::sync::atomic::AtomicBool,
 	pub(super) append_refusal_after: std::sync::atomic::AtomicU64,
+	pub(super) fence_at_version_check: std::sync::Mutex<Option<SlabId>>,
 	/// Appends that returned the proof-carrying refusal, and a wake-up for whoever awaits one.
 	pub(super) append_refusals_seen: std::sync::atomic::AtomicU64,
 	pub(super) append_refusal_seen: tokio::sync::Notify,

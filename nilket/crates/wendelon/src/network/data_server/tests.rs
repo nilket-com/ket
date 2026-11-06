@@ -18503,6 +18503,43 @@ async fn the_table_write_door_keeps_refusing_what_does_not_clear() {
 	shutdown_lease_node(node).await;
 }
 
+/// A fence raised after the append's head admitted it, while it checks each row's version: nothing
+/// has happened yet, so this is waited out too, and does not fence the node.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fence_raised_during_the_version_checks_is_waited_out() {
+	let (dir, node) = leading_node_for_refusals("dc182-version-check").await;
+	let descriptor = typed_table_descriptor();
+	let batch = typed_table_batch(vec![7, 8]);
+	let mut meta = typed_table_meta(&descriptor, batch.num_rows());
+	meta.parent_write_id.sequence_no = 60;
+	meta.await_finalization = 1;
+	let slab = SlabId::new(0x7703);
+	let before = node.slab.local_l1_bytes().await;
+	node.slab.fence_at_next_version_check_for_test(slab);
+	let write = {
+		let server = node.data_server.clone();
+		tokio::spawn(async move { server.table_write(meta, batch).await })
+	};
+	tokio::time::timeout(Duration::from_secs(10), node.slab.append_refusal_for_test())
+		.await
+		.expect("the version check refused it with the proof");
+	assert!(!write.is_finished(), "it waits while the fence stands");
+	assert_eq!(
+		node.slab.local_l1_bytes().await,
+		before,
+		"premise: nothing yet"
+	);
+	node.slab.clear_retirement_fence_for_test(slab);
+	let (written, _) = tokio::time::timeout(Duration::from_secs(10), write)
+		.await
+		.expect("the fence cleared")
+		.unwrap()
+		.unwrap();
+	assert_eq!(written.write.status, WriteStatus::OK, "{written:?}");
+	assert_not_fenced(&node, &dir, "waited out at the version check").await;
+	shutdown_lease_node(node).await;
+}
+
 /// The same wait, for the refusal the conservative path used to meet: its first child durable,
 /// its second refused for a moment. The mutation carries on, with nothing left partly applied.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

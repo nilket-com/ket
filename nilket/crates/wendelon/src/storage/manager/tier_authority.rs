@@ -1726,15 +1726,20 @@ impl SlabManager {
 		} else {
 			self.require_tier_authority_ready()
 		};
-		answer.map_err(|cause| {
-			if self.append_refusal_clears_by_itself() {
-				#[cfg(test)]
-				self.note_append_refusal_for_test();
-				Error::new(cause.kind(), AppendRefusedBeforeEffects(cause))
-			} else {
-				cause
-			}
-		})
+		answer.map_err(|cause| self.refused_before_effects(cause))
+	}
+
+	/// An authority refusal met before this append has done anything: it carries that proof if
+	/// it will clear by itself. Each check ahead of an append's first effect answers through
+	/// this, so a fence raised after the head of the append is waited out the same way.
+	pub(super) fn refused_before_effects(&self, cause: Error) -> Error {
+		if self.append_refusal_clears_by_itself() {
+			#[cfg(test)]
+			self.note_append_refusal_for_test();
+			Error::new(cause.kind(), AppendRefusedBeforeEffects(cause))
+		} else {
+			cause
+		}
 	}
 
 	/// Until the authority next changes, or `max` passes: never a claim that it is ready.
