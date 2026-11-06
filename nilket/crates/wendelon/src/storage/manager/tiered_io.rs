@@ -669,7 +669,7 @@ impl SlabManager {
 				self.record_retained_pointer_transition(&old, None, true)
 					.await?;
 				let changed = self
-					.retire_tiered_slab_under_publication_lock(slab_id, None, observed_epoch)
+					.retire_tiered_slab_under_publication_lock(slab_id, None, observed_epoch, false)
 					.await?;
 				Ok((changed, changed.then_some(old)))
 			}
@@ -1359,8 +1359,78 @@ impl SlabManager {
 			slab_id,
 			last_control_log_index,
 			control_epoch,
+			false,
 		)
 		.await
+	}
+
+	/// Apply what unresolved installs held back, once none names the slab. Nothing here is a queue
+	/// drained from memory: it is read from the durable marks and rows each pass, so a failed
+	/// attempt is simply tried again, and each ends only with its effect.
+	pub(crate) async fn retry_deferred_retirements(&self) -> std::io::Result<()> {
+		let Some(index) = &self.persistent_index else {
+			return Ok(());
+		};
+		let mut first_error = None;
+		// Marks first: a retirement that would strand one refuses until it has gone.
+		for mark in index.load_snapshot_retirement_marks().await? {
+			if self.lsm_install_holds_slab(mark.pointer.slab_id) {
+				continue;
+			}
+			if let Err(error) = self.apply_snapshot_retirement(mark).await {
+				first_error.get_or_insert(error);
+			}
+		}
+		for row in index.load_deferred_retirements().await? {
+			let slab_id = row.pointer.slab_id;
+			if self.lsm_install_holds_slab(slab_id) {
+				continue;
+			}
+			let tier_lock = self.tier_publication_lock(slab_id);
+			let _tier_guard = tier_lock.lock().await;
+			match index.deferred_retirement_is_owed(row.clone()).await {
+				Ok(true) => {}
+				Ok(false) => {
+					tracing::warn!(
+						slab_id = slab_id.get(),
+						"a held retirement cannot be accounted for; it stays owed and fenced"
+					);
+					continue;
+				}
+				Err(error) => {
+					first_error.get_or_insert(error);
+					continue;
+				}
+			}
+			// Memory not agreeing is incomplete knowledge, not a reason to end it.
+			let current = self
+				.state
+				.lock()
+				.await
+				.tiered
+				.get(&slab_id)
+				.map(|entry| entry.value().clone());
+			if !current
+				.as_ref()
+				.is_some_and(|pointer| pointer.same_object_generation(&row.pointer))
+			{
+				continue;
+			}
+			let epoch = self.capture_snapshot_epoch();
+			if let Err(error) = self
+				.retire_tiered_slab_under_publication_lock(
+					slab_id,
+					Some(row.log_index),
+					epoch,
+					true,
+				)
+				.await
+			{
+				tracing::warn!(%error, slab_id = slab_id.get(), "a held retirement is still owed");
+				first_error.get_or_insert(error);
+			}
+		}
+		first_error.map_or(Ok(()), Err)
 	}
 
 	/// Caller owns this slab's tier publication lock, including authority comparison.
@@ -1369,6 +1439,7 @@ impl SlabManager {
 		slab_id: SlabId,
 		last_control_log_index: Option<u64>,
 		control_epoch: u64,
+		deferred_row: bool,
 	) -> std::io::Result<bool> {
 		if last_control_log_index.is_none() {
 			self.require_cleanup_authority()?;
@@ -1435,7 +1506,7 @@ impl SlabManager {
 				return Err(stale_location_error(slab_id, StaleLocationReason::Fenced));
 			}
 		};
-		if self.observer_is_superseded(last_control_log_index) {
+		if !deferred_row && self.observer_is_superseded(last_control_log_index) {
 			return Ok(false);
 		}
 		if last_control_log_index.is_none() && !self.snapshot_epoch_is_current(control_epoch) {
@@ -1444,6 +1515,8 @@ impl SlabManager {
 			return Err(stale_location_error(slab_id, StaleLocationReason::Fenced));
 		}
 		self.require_private_retirement_authority(slab_id, last_control_log_index.is_some())?;
+		// Held through the deletion: a new install cannot name this slab between the check and it.
+		let _scope = self.lsm_intent_scope_gate.read().await;
 		let rows = self.record_rows_for_tier_retirement(slab_id);
 		let retired_pointer = {
 			let state = self.state.lock().await;
@@ -1452,6 +1525,53 @@ impl SlabManager {
 				.get(&slab_id)
 				.map(|entry| entry.value().clone())
 		};
+		// An unresolved install's evidence is these rows, this pointer and this revision, so they
+		// stay until it resolves. A log entry has decided this retirement, so it is owed durably;
+		// a caller with no log entry has nothing to owe and retries from its own authority.
+		if let Some(pointer) = &retired_pointer
+			&& self.lsm_install_holds_slab(slab_id)
+		{
+			let Some(log_index) = last_control_log_index else {
+				// The proposer's own local step, after its Retire's callback already held it.
+				if self
+					.tier_authority
+					.deferred_retirements()
+					.iter()
+					.any(|(held, _)| *held == slab_id)
+				{
+					return Ok(false);
+				}
+				return Err(stale_location_error(slab_id, StaleLocationReason::Fenced));
+			};
+			if let Some(index) = &self.persistent_index {
+				index
+					.defer_retirement(
+						crate::storage::index::DeferredRetirement {
+							pointer: pointer.clone(),
+							log_index,
+						},
+						gate.clone(),
+					)
+					.await?;
+				self.tier_authority
+					.note_deferred_retirement(slab_id, log_index);
+				return Ok(false);
+			}
+			return Err(stale_location_error(slab_id, StaleLocationReason::Fenced));
+		}
+		// A snapshot's mark of this generation that this authority would not resolve: deleting the
+		// pointer would leave that mark, and its store-wide fence, nothing to finish on.
+		if let (Some(pointer), Some(index)) = (&retired_pointer, &self.persistent_index)
+			&& index
+				.outstanding_mark_blocks_retirement(
+					pointer.clone(),
+					last_control_log_index,
+					self.capture_snapshot_epoch(),
+				)
+				.await?
+		{
+			return Err(stale_location_error(slab_id, StaleLocationReason::Fenced));
+		}
 		let should_remove = {
 			let state = self.state.lock().await;
 			retired_pointer.is_some() || state.rehydrated.contains_key(&slab_id) || !rows.is_empty()
@@ -1497,6 +1617,7 @@ impl SlabManager {
 			state.rehydrating.remove(&slab_id);
 		}
 		self.drop_retired_live_run(slab_id).await;
+		self.tier_authority.clear_deferred_retirement(slab_id);
 		self.retired_tier_slabs.insert(slab_id);
 		self.unapplied_tier_pointers.remove(&slab_id);
 		for row in &rows {
@@ -1554,6 +1675,12 @@ impl SlabManager {
 		let _tier_guard = tier_lock.lock().await;
 		let _cleanup_guard = self.cleanup_claim(slab_id).lock_owned().await;
 		let gate = Arc::new(self.persistent_index_gate.clone().read_owned().await);
+		// As for a log retirement: the mark is durable already, so it waits, with its own fence,
+		// and `retry_deferred_retirements` reads it back once no unresolved install names the slab.
+		let _scope = self.lsm_intent_scope_gate.read().await;
+		if self.lsm_install_holds_slab(slab_id) {
+			return Ok(false);
+		}
 		let local = self
 			.state
 			.lock()
@@ -1635,6 +1762,7 @@ impl SlabManager {
 			state.rehydrating.remove(&slab_id);
 		}
 		self.drop_retired_live_run(slab_id).await;
+		self.tier_authority.clear_deferred_retirement(slab_id);
 		self.retired_tier_slabs.insert(slab_id);
 		self.unapplied_tier_pointers.remove(&slab_id);
 		self.unverified_tier_slabs.remove(&slab_id);

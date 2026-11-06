@@ -1154,6 +1154,11 @@ impl SlabManager {
 			.await;
 		manager.load_unresolved_tier_cleanup().await?;
 		if let Some(index) = &manager.persistent_index {
+			for deferred in index.load_deferred_retirements().await? {
+				manager
+					.tier_authority
+					.note_deferred_retirement(deferred.pointer.slab_id, deferred.log_index);
+			}
 			for mark in index.load_snapshot_retirement_marks().await? {
 				manager.tier_authority.mark_snapshot_retirement(
 					mark.pointer.slab_id,

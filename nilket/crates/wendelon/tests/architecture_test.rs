@@ -11069,7 +11069,8 @@ fn tier_recovery_snapshots_have_only_the_reviewed_private_callers() {
 		tiered
 			.matches("retire_tiered_slab_under_publication_lock(")
 			.count(),
-		3
+		// With `retry_deferred_retirements`, which takes the tier lock first too.
+		4
 	);
 	assert!(tiered.contains("\n\tasync fn retire_tiered_slab_under_publication_lock("));
 	let snapshot_retirement = manager_method_body(&tiered, "apply_snapshot_retirement");

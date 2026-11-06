@@ -112,6 +112,10 @@ pub(super) struct TierAuthority {
 	snapshot_reconciliation: std::sync::Mutex<Option<SnapshotReconciliation>>,
 	retirements: DashMap<SlabId, Option<u64>>,
 	snapshot_retirements: DashMap<SlabId, (u64, Option<u64>)>,
+	/// Decided retirements held for an install, by slab, with their log index. Reads of the slab
+	/// refuse, and nothing else does: unlike a retirement fence, this can stand as long as the
+	/// install takes, and it does not stop the install's own private completion or undo.
+	deferred_retirements: DashMap<SlabId, u64>,
 	closed: AtomicBool,
 	exposed: AtomicBool,
 	staging: AtomicUsize,
@@ -213,6 +217,7 @@ impl TierAuthority {
 			snapshot_reconciliation: std::sync::Mutex::new(None),
 			retirements: DashMap::new(),
 			snapshot_retirements: DashMap::new(),
+			deferred_retirements: DashMap::new(),
 			closed: AtomicBool::new(false),
 			exposed: AtomicBool::new(false),
 			staging: AtomicUsize::new(0),
@@ -585,12 +590,37 @@ impl TierAuthority {
 			|| self.closed.load(Ordering::Acquire)
 			|| self.snapshot_fences.load(Ordering::Acquire) != 0
 			|| slabs.iter().any(|slab| {
-				self.retirements.contains_key(slab) || self.snapshot_retirements.contains_key(slab)
+				self.retirements.contains_key(slab)
+					|| self.snapshot_retirements.contains_key(slab)
+					|| self.deferred_retirements.contains_key(slab)
 			}) {
 			return false;
 		}
 		self.exposed.store(true, Ordering::Release);
 		true
+	}
+
+	#[cfg(test)]
+	pub(super) fn retirement_fence_stands(&self) -> bool {
+		self.retirement_fence.load(Ordering::Acquire)
+	}
+
+	pub(super) fn note_deferred_retirement(&self, slab_id: SlabId, index: u64) {
+		self.deferred_retirements.insert(slab_id, index);
+		self.changed.notify_waiters();
+	}
+
+	pub(super) fn clear_deferred_retirement(&self, slab_id: SlabId) {
+		if self.deferred_retirements.remove(&slab_id).is_some() {
+			self.changed.notify_waiters();
+		}
+	}
+
+	pub(super) fn deferred_retirements(&self) -> Vec<(SlabId, u64)> {
+		self.deferred_retirements
+			.iter()
+			.map(|entry| (*entry.key(), *entry.value()))
+			.collect()
 	}
 
 	fn expose_if_ready(&self) -> bool {

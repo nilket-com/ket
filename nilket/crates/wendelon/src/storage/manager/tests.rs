@@ -18698,6 +18698,575 @@ async fn a_run_held_across_a_restart_is_finished_when_its_install_resolves() {
 	let _ = reopened.owner.close(Duration::from_secs(2)).await;
 }
 
+/// A lower-level digest control, not a real-ring retirement: this input is sealed, not tiered, so
+/// the ring's Retire validator would refuse it, and no retirement record exists. It pins what
+/// recovery does when an input's rows are gone from under a cancelled install, which is what the
+/// deferral keeps a tiered input from ever reaching.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dc187_a_retired_input_leaves_a_cancelled_install_fenced() {
+	let reopened = reopen_install_at(lsm_driver::ControlLsmInstallCut::AfterRename).await;
+	let mgr = &reopened.mgr;
+	let held = reopened.inputs[0];
+	let index = mgr.require_op_index().unwrap();
+	assert!(
+		index
+			.load_snapshot()
+			.await
+			.unwrap()
+			.record_rows
+			.iter()
+			.any(|row| row.location.slab_id == held),
+		"premise: the input has rows"
+	);
+	assert!(
+		mgr.retire_tiered_slab_committed(held, Some(20))
+			.await
+			.unwrap(),
+		"premise: the retirement applied, under an unresolved install"
+	);
+	assert!(
+		index
+			.load_snapshot()
+			.await
+			.unwrap()
+			.record_rows
+			.iter()
+			.all(|row| row.location.slab_id != held),
+		"premise: and removed its rows"
+	);
+	let driver = op_driver(&reopened.cluster, mgr, reopened.plain.clone());
+	let error = driver.drive_once().await.unwrap_err();
+	assert!(
+		error.to_string().contains("conflicting input evidence"),
+		"{error}"
+	);
+	assert_eq!(
+		index
+			.load_snapshot()
+			.await
+			.unwrap()
+			.lsm_install_intents
+			.len(),
+		1,
+		"it stays unresolved"
+	);
+	let _ = reopened.owner.close(Duration::from_secs(2)).await;
+}
+
+/// A held retirement with no operation row of this store's behind it: only its own row and its
+/// fence carry it across a reopen. A snapshot installed since does not discard it.
+#[tokio::test]
+async fn a_held_retirement_with_no_operation_row_survives_a_reopen_and_a_newer_snapshot() {
+	let (dirs, mgr, l2) = fresh_manager_with_l2("dc187-no-op").await;
+	let key = id(0xb18702);
+	mgr.append_durable(tenant(), key, hlc(221), b"value")
+		.await
+		.unwrap();
+	let pointer = tier_kv_slab(&mgr, &l2, "dc187-no-op/object").await;
+	let job = CompactionJobId::new(721);
+	mgr.lsm_install_unresolved.insert(
+		job,
+		lsm_driver::UnresolvedLsmScope {
+			control_legacy: None,
+			control_metric: None,
+			slabs: HashSet::from([pointer.slab_id]),
+			keys_unknown: false,
+			in_flight: true,
+			owner_token: Arc::new(()),
+			gc_lifecycle: false,
+		},
+	);
+	assert!(
+		!mgr.retire_tiered_slab_committed(pointer.slab_id, Some(9))
+			.await
+			.unwrap(),
+		"held"
+	);
+	mgr.lsm_install_unresolved.remove(&job);
+	let mgr = restart_tier_manager(mgr, &dirs, &l2).await;
+	assert_eq!(
+		mgr.tier_authority.deferred_retirements(),
+		vec![(pointer.slab_id, 9)],
+		"its fence is back"
+	);
+	assert_eq!(
+		mgr.tier_pointer(pointer.slab_id).await,
+		Some(pointer.clone())
+	);
+	assert!(
+		mgr.lookup(tenant(), key).is_err(),
+		"reads of the slab refuse"
+	);
+
+	*mgr.installed_snapshot_index.write().unwrap() = Some(100);
+	assert!(mgr.observer_is_superseded(Some(9)), "premise");
+	mgr.retry_deferred_retirements().await.unwrap();
+	assert!(mgr.tier_pointer(pointer.slab_id).await.is_none());
+	assert!(
+		mgr.persistent_index
+			.as_ref()
+			.unwrap()
+			.load_deferred_retirements()
+			.await
+			.unwrap()
+			.is_empty()
+	);
+	assert!(mgr.tier_authority.deferred_retirements().is_empty());
+	assert!(mgr.lookup(tenant(), key).unwrap().is_none());
+}
+
+fn scope_holding(mgr: &SlabManager, job: u64, slab: SlabId) -> CompactionJobId {
+	let job = CompactionJobId::new(job);
+	mgr.lsm_install_unresolved.insert(
+		job,
+		lsm_driver::UnresolvedLsmScope {
+			control_legacy: None,
+			control_metric: None,
+			slabs: HashSet::from([slab]),
+			keys_unknown: false,
+			in_flight: true,
+			owner_token: Arc::new(()),
+			gc_lifecycle: false,
+		},
+	);
+	job
+}
+
+/// A snapshot's mark held for an install, with a log retirement of the same generation held too.
+/// The first attempt fails, and the obligation survives it with no restart and no new snapshot,
+/// and the log row may not delete the pointer out from under the mark meanwhile.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_held_snapshot_mark_survives_a_failed_attempt_and_the_log_row_waits_for_it() {
+	let (_dirs, mgr, l2) = fresh_manager_with_l2("dc187-mark").await;
+	mgr.append_durable(tenant(), id(0xb18703), hlc(221), b"value")
+		.await
+		.unwrap();
+	let pointer = tier_kv_slab(&mgr, &l2, "dc187-mark/object").await;
+	let job = scope_holding(&mgr, 722, pointer.slab_id);
+	assert!(
+		!mgr.retire_tiered_slab_committed(pointer.slab_id, Some(9))
+			.await
+			.unwrap()
+	);
+	let epoch = mgr.begin_tier_snapshot_install().unwrap();
+	mgr.finish_tier_snapshot_install_at_epoch(vec![], Some(818), epoch)
+		.await
+		.unwrap();
+	let index = mgr.persistent_index.as_ref().unwrap();
+	assert_eq!(
+		index.load_snapshot_retirement_marks().await.unwrap().len(),
+		1,
+		"premise: an install holds the mark too"
+	);
+	assert_eq!(
+		mgr.tier_pointer(pointer.slab_id).await,
+		Some(pointer.clone())
+	);
+
+	mgr.lsm_install_unresolved.remove(&job);
+	index
+		.fail_next_snapshot_retirement
+		.store(true, Ordering::Release);
+	assert!(mgr.retry_deferred_retirements().await.is_err());
+	assert_eq!(
+		mgr.tier_pointer(pointer.slab_id).await,
+		Some(pointer.clone()),
+		"the row must not strand the mark"
+	);
+	assert_eq!(
+		index.load_snapshot_retirement_marks().await.unwrap().len(),
+		1
+	);
+	assert_eq!(index.load_deferred_retirements().await.unwrap().len(), 1);
+
+	mgr.retry_deferred_retirements().await.unwrap();
+	assert!(mgr.tier_pointer(pointer.slab_id).await.is_none());
+	assert!(
+		index
+			.load_snapshot_retirement_marks()
+			.await
+			.unwrap()
+			.is_empty()
+	);
+	assert!(index.load_deferred_retirements().await.unwrap().is_empty());
+	assert!(mgr.tier_authority.deferred_retirements().is_empty());
+	assert!(
+		!mgr.tier_authority.retirement_fence_stands(),
+		"no fence outlives it"
+	);
+}
+
+/// Nothing but the retirement's own effect ends an accepted retirement: not a pointer missing from
+/// memory, nor another generation, nor a pointer gone, with or without a record of its object.
+#[tokio::test]
+async fn a_held_retirement_ends_only_with_its_own_effect() {
+	let (_dirs, mgr, l2) = fresh_manager_with_l2("dc187-proof").await;
+	mgr.append_durable(tenant(), id(0xb18704), hlc(221), b"value")
+		.await
+		.unwrap();
+	let pointer = tier_kv_slab(&mgr, &l2, "dc187-proof/object").await;
+	let slab = pointer.slab_id;
+	let job = scope_holding(&mgr, 723, slab);
+	assert!(
+		!mgr.retire_tiered_slab_committed(slab, Some(9))
+			.await
+			.unwrap()
+	);
+	mgr.lsm_install_unresolved.remove(&job);
+	let index = mgr.persistent_index.as_ref().unwrap().clone();
+	let owed = async |label: &str| {
+		mgr.retry_deferred_retirements().await.unwrap();
+		assert_eq!(
+			index.load_deferred_retirements().await.unwrap().len(),
+			1,
+			"{label}: still owed"
+		);
+		assert_eq!(
+			mgr.tier_authority.deferred_retirements(),
+			vec![(slab, 9)],
+			"{label}: still fenced"
+		);
+	};
+
+	// Absent from memory, the same generation on disk.
+	let kept = mgr.state.lock().await.tiered.remove(&slab).unwrap().1;
+	owed("absent from memory").await;
+	mgr.state.lock().await.tiered.insert(slab, kept);
+
+	// Another generation on disk.
+	let mut other = pointer.clone();
+	other.payload_hash[0] ^= 1;
+	index
+		.apply(PersistentIndexUpdate {
+			put_tiered_slabs: vec![other],
+			..Default::default()
+		})
+		.await
+		.unwrap();
+	owed("another generation").await;
+
+	// No pointer, and no record of this object.
+	index
+		.apply(PersistentIndexUpdate {
+			delete_tiered_slab_ids: vec![slab],
+			..Default::default()
+		})
+		.await
+		.unwrap();
+	owed("gone with no record").await;
+
+	// A retirement record proves nothing here: it names a slab and a URI, not this generation,
+	// and a different payload at that URI reads the same.
+	let mut same_uri = pointer.clone();
+	same_uri.payload_hash[0] ^= 1;
+	index.record_retirement_for_test(same_uri, 9).await.unwrap();
+	owed("a record of the same URI, another generation").await;
+	index
+		.record_retirement_for_test(pointer.clone(), 9)
+		.await
+		.unwrap();
+	owed("a record of this generation").await;
+}
+
+/// A real install over a really tiered input on a real ring, stopped at `cut` with its task parked.
+struct TieredInputInstall {
+	dir: crate::test_support::TestDir,
+	_l2_root: crate::test_support::TestDir,
+	l2: Arc<dyn ObjectStore>,
+	mgr: Arc<SlabManager>,
+	owner: DataDirectoryOwner,
+	cluster: ControlCluster,
+	plain: Arc<crate::storage::RaftCommitter>,
+	pointer: TieredSlabPointer,
+	key: Identity,
+	release: Arc<tokio::sync::Semaphore>,
+	task:
+		tokio::task::JoinHandle<Result<crate::storage::lsm::CompactionOutcome, CompactionFailure>>,
+}
+
+fn tiered_input_config(dir: &Path, l2: &Arc<dyn ObjectStore>) -> SlabManagerConfig {
+	SlabManagerConfig {
+		l2: Some(l2.clone()),
+		..gc_owned_test_config(dir)
+	}
+}
+
+async fn install_over_tiered_input(cut: lsm_driver::ControlLsmInstallCut) -> TieredInputInstall {
+	let dir = fresh_dir("dc187");
+	let l2_root = fresh_dir("dc187-l2");
+	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
+	let owner = DataDirectoryOwner::acquire_existing(&dir).unwrap();
+	let mgr =
+		SlabManager::initialize_new_store_with_owner(tiered_input_config(&dir, &l2), owner.clone())
+			.await
+			.unwrap();
+	let cluster = control_cluster_observing(&[(1, &mgr)]).await;
+	register_owner(&cluster.nodes[0], &mgr).await;
+	let plain = Arc::new(op_committer(&cluster, 1));
+	let key = id(0xb18701);
+	mgr.append_durable(tenant(), key, hlc(1), b"dc187")
+		.await
+		.unwrap();
+	let slab = mgr.force_seal_active_for_test().await;
+	let raw = mgr.read_sealed_raw(slab).await.unwrap();
+	let encrypted = mgr.encrypt_tiered_object_blob(slab, &raw).unwrap();
+	let uri = l2.put("dc187/object.wnd", &encrypted.bytes).await.unwrap();
+	let pointer = tiered_pointer_from_blob(&mgr, slab, uri, &encrypted.bytes);
+	crate::storage::sweeper::propose_tier_slab(
+		&mgr,
+		plain.as_ref(),
+		b10_tier(&mgr, &pointer),
+		None,
+	)
+	.await
+	.unwrap();
+	assert_eq!(mgr.tier_pointer(slab).await, Some(pointer.clone()));
+	let plan = CompactionPlan {
+		job_id: CompactionJobId::new(0xb187),
+		source_level: CompactionLevelIndex::L0,
+		target_level: CompactionLevelIndex::L1,
+		manifest_epoch_pre: mgr.compaction_manifest_snapshot().manifest_epoch,
+		input_slabs: vec![slab],
+		overlapping_slabs: Vec::new(),
+		retention_floor_snapshot: hlc(100),
+		compaction_start_hlc: hlc(101),
+		dominant_reason: crate::storage::DominantReason::Operator,
+	};
+	let entered = Arc::new(tokio::sync::Semaphore::new(0));
+	let release = Arc::new(tokio::sync::Semaphore::new(0));
+	*mgr.lsm_control_install_hold.lock().unwrap() = Some((cut, entered.clone(), release.clone()));
+	let mut task = {
+		let (mgr, plain) = (mgr.clone(), plain.clone());
+		tokio::spawn(async move {
+			let worker =
+				LsmCompactionWorker::new(LsmConfig::default(), mgr.slab_pin_table()).unwrap();
+			mgr.run_lsm_compaction_once_via_control_ring(&worker, plan, plain.as_ref())
+				.await
+		})
+	};
+	tokio::select! {
+		reached = entered.acquire() => reached.unwrap().forget(),
+		result = &mut task => panic!("the install returned before {cut:?}: {result:?}"),
+		_ = tokio::time::sleep(Duration::from_secs(60)) => panic!("never reached {cut:?}"),
+	}
+	TieredInputInstall {
+		dir,
+		_l2_root: l2_root,
+		l2,
+		mgr,
+		owner,
+		cluster,
+		plain,
+		pointer,
+		key,
+		release,
+		task,
+	}
+}
+
+/// The Retire is decided on the ring, and nothing local has moved: no early handoff.
+async fn assert_retirement_held(
+	mgr: &Arc<SlabManager>,
+	pointer: &TieredSlabPointer,
+	key: Identity,
+	retire_key: crate::consensus::slab_ops::OpKey,
+) {
+	let index = mgr.require_op_index().unwrap();
+	assert_eq!(
+		index.load_deferred_retirements().await.unwrap().len(),
+		1,
+		"owed durably"
+	);
+	assert_eq!(
+		mgr.tier_pointer(pointer.slab_id).await,
+		Some(pointer.clone())
+	);
+	assert!(
+		index
+			.load_snapshot()
+			.await
+			.unwrap()
+			.record_rows
+			.iter()
+			.any(|row| row.key_identity == key),
+		"its rows stay, so the install's evidence stays true"
+	);
+	assert!(
+		index
+			.load_op_intents()
+			.await
+			.unwrap()
+			.iter()
+			.any(|op| op.key() == retire_key),
+		"no handoff before the effect"
+	);
+	assert!(
+		mgr.lookup(tenant(), key).is_err(),
+		"reads of the slab refuse"
+	);
+}
+
+async fn propose_held_retirement(
+	mgr: &Arc<SlabManager>,
+	plain: &crate::storage::RaftCommitter,
+	pointer: &TieredSlabPointer,
+) -> crate::consensus::slab_ops::OpKey {
+	let index = mgr.require_op_index().unwrap();
+	let before = index.load_op_intents().await.unwrap();
+	crate::storage::sweeper::propose_tier_retirement(
+		mgr,
+		plain,
+		pointer.slab_id,
+		crate::consensus::slab_ops::TierGeneration::from(pointer),
+	)
+	.await
+	.unwrap();
+	index
+		.load_op_intents()
+		.await
+		.unwrap()
+		.into_iter()
+		.find(|op| !before.iter().any(|old| old.key() == op.key()))
+		.expect("the Retire stays an intent")
+		.key()
+}
+
+/// DC-187, accepted: the ring applied the install, then a Retire. The install completes on evidence
+/// that stayed true, and only then does the retirement take effect and hand off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_retirement_held_for_an_accepted_install_applies_after_it() {
+	let fix = install_over_tiered_input(lsm_driver::ControlLsmInstallCut::AfterAcceptance).await;
+	let (mgr, pointer) = (&fix.mgr, &fix.pointer);
+	let retire = propose_held_retirement(mgr, &fix.plain, pointer).await;
+	assert_retirement_held(mgr, pointer, fix.key, retire).await;
+	let driver = op_driver(&fix.cluster, mgr, fix.plain.clone());
+	let _ = driver.drive_once().await;
+	assert_retirement_held(mgr, pointer, fix.key, retire).await;
+
+	fix.release.add_permits(8);
+	fix.task.await.unwrap().unwrap();
+	driver.drive_once().await.unwrap();
+	let index = mgr.require_op_index().unwrap();
+	assert!(
+		mgr.tier_pointer(pointer.slab_id).await.is_none(),
+		"it applied"
+	);
+	assert!(index.load_deferred_retirements().await.unwrap().is_empty());
+	assert!(
+		index
+			.load_op_intents()
+			.await
+			.unwrap()
+			.iter()
+			.all(|op| op.key() != retire),
+		"and handed off"
+	);
+	let served = mgr
+		.lookup(tenant(), fix.key)
+		.unwrap()
+		.expect("the output has it");
+	assert_ne!(served.slab_id, pointer.slab_id, "never the retired input");
+	assert_eq!(mgr.read(served).await.unwrap(), b"dc187");
+	// DC-185, unchanged and disclosed: the install retired the run, and its backing is now gone.
+	assert!(matches!(
+		mgr.compaction_manifest_snapshot()
+			.run(pointer.slab_id)
+			.map(|run| &run.state),
+		Some(SlabState::Retired { .. })
+	));
+	let _ = fix.owner.close(Duration::from_secs(2)).await;
+}
+
+/// DC-187, abandoned and cancelled, with a restart while held: the digest stays true, so recovery
+/// undoes the install instead of fencing it for good, and the retirement then applies.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_retirement_held_for_a_cancelled_install_survives_a_restart_and_applies() {
+	let fix = install_over_tiered_input(lsm_driver::ControlLsmInstallCut::AfterRename).await;
+	fix.task.abort();
+	let _ = fix.task.await;
+	let retire = propose_held_retirement(&fix.mgr, &fix.plain, &fix.pointer).await;
+	assert_retirement_held(&fix.mgr, &fix.pointer, fix.key, retire).await;
+	drop(fix.release);
+	let _ = fix.owner.close(Duration::from_secs(5)).await;
+	let next = DataDirectoryOwner::acquire_existing(&fix.dir).expect("released");
+	let mgr = SlabManager::open_with_owner(tiered_input_config(&fix.dir, &fix.l2), next.clone())
+		.await
+		.unwrap();
+	mgr.bind_control_node(1).unwrap();
+	mgr.bind_canonical_tier_source(fix.cluster.state_machines[0].tier_snapshot_source_for_test());
+	assert_retirement_held(&mgr, &fix.pointer, fix.key, retire).await;
+	// What a node does on starting, from the ring's committed state, which no longer has it,
+	// at a recovered index past the Retire's own.
+	mgr.fence_local_tiers_absent_from_committed(&std::collections::HashSet::new(), Some(30))
+		.await
+		.unwrap();
+	assert_retirement_held(&mgr, &fix.pointer, fix.key, retire).await;
+
+	// The driver runs until nothing is owed; a pass may report what still stands, such as a
+	// verification the retirement has yet to finish.
+	let driver = op_driver(&fix.cluster, &mgr, fix.plain.clone());
+	let mut last = None;
+	for _ in 0..300 {
+		let answer = driver.drive_once().await;
+		if answer.is_ok() && mgr.tier_authority_readiness_reason().is_none() {
+			last = None;
+			break;
+		}
+		last = Some(format!(
+			"{answer:?} reason={:?} pending={:?} unverified={} deferred={:?} ptr={} intents={}",
+			mgr.tier_authority_readiness_reason(),
+			mgr.tier_authority
+				.pending
+				.iter()
+				.map(|e| *e.key())
+				.collect::<Vec<_>>(),
+			mgr.unverified_tier_slabs.len(),
+			mgr.tier_authority.deferred_retirements(),
+			mgr.tier_pointer(fix.pointer.slab_id).await.is_some(),
+			mgr.require_op_index()
+				.unwrap()
+				.load_snapshot()
+				.await
+				.unwrap()
+				.lsm_install_intents
+				.len(),
+		));
+		tokio::time::sleep(Duration::from_millis(100)).await;
+	}
+	assert_eq!(last, None, "the store finishes");
+	let index = mgr.require_op_index().unwrap();
+	assert!(
+		index
+			.load_snapshot()
+			.await
+			.unwrap()
+			.lsm_install_intents
+			.is_empty(),
+		"the install resolved, not fenced"
+	);
+	assert!(
+		mgr.tier_pointer(fix.pointer.slab_id).await.is_none(),
+		"it applied"
+	);
+	assert!(index.load_deferred_retirements().await.unwrap().is_empty());
+	assert!(
+		index
+			.load_op_intents()
+			.await
+			.unwrap()
+			.iter()
+			.all(|op| op.key() != retire),
+		"and handed off"
+	);
+	assert!(
+		mgr.compaction_manifest_snapshot()
+			.run(fix.pointer.slab_id)
+			.is_none(),
+		"the cancelled install left the run Live, so it went with the retirement"
+	);
+	let _ = next.close(Duration::from_secs(2)).await;
+}
+
 /// Open reads the epoch back from the rows. Removing the row that held the highest must not lower
 /// it, by retirement or by GC's removal, or an in-progress intent's epoch would be ahead of it.
 #[tokio::test]
@@ -26263,7 +26832,7 @@ async fn lsm_prepare_refuses_pointer_aba_during_source_read() {
 }
 
 #[tokio::test]
-async fn lsm_intent_fences_public_reads_but_not_private_retirement() {
+async fn an_intent_of_unknown_scope_fences_reads_and_holds_a_retirement() {
 	let (_dirs, mgr, l2) = fresh_manager_with_l2("private-retire-lsm-intent").await;
 	let key = id(0x9b61);
 	mgr.append_durable(tenant(), key, hlc(221), b"value")
@@ -26280,16 +26849,30 @@ async fn lsm_intent_fences_public_reads_but_not_private_retirement() {
 			keys_unknown: true,
 			in_flight: false,
 			owner_token: Arc::new(()),
+			gc_lifecycle: false,
 		},
 	);
 	assert!(mgr.lookup(tenant(), key).is_err());
-	let retired = mgr.retire_tiered_slab(pointer.slab_id).await;
 	assert!(
-		retired.unwrap(),
-		"the committed retirement must not be swallowed"
+		!mgr.retire_tiered_slab_committed(pointer.slab_id, Some(9))
+			.await
+			.unwrap(),
+		"a scope with unknown slabs may name it, so the retirement is held"
+	);
+	assert_eq!(
+		mgr.persistent_index
+			.as_ref()
+			.unwrap()
+			.load_deferred_retirements()
+			.await
+			.unwrap()
+			.len(),
+		1,
+		"and owed durably, so it is not swallowed"
 	);
 	assert!(mgr.lookup(tenant(), key).is_err());
 	mgr.lsm_install_unresolved.remove(&job);
+	mgr.retry_deferred_retirements().await.unwrap();
 	assert!(mgr.lookup(tenant(), key).unwrap().is_none());
 }
 
@@ -26510,7 +27093,7 @@ async fn clean_control_lsm_install_clears_its_intent() {
 }
 
 #[tokio::test]
-async fn lsm_retired_input_during_control_wait_keeps_intent_and_never_resurrects() {
+async fn a_retirement_during_a_control_wait_is_held_and_the_install_completes() {
 	let (dirs, mgr, l2) = fresh_manager_with_l2("lsm-retire-during-commit").await;
 	let key = id(0x9b71);
 	mgr.append_durable(tenant(), key, hlc(231), &[0, 0, 0, 0, 65])
@@ -26571,52 +27154,55 @@ async fn lsm_retired_input_during_control_wait_keeps_intent_and_never_resurrects
 		.map(|run| slab_path(&dirs[0], run.slab_id))
 		.collect();
 	assert!(!outputs.is_empty() && outputs.iter().all(|path| path.exists()));
-	let run = mgr
-		.compaction_manifest_snapshot()
-		.run(pointer.slab_id)
-		.cloned()
-		.unwrap();
-	put_run_row(&mgr, run).await;
-	assert!(mgr.retire_tiered_slab(pointer.slab_id).await.unwrap());
-	release_tx.send(()).unwrap();
-	assert!(matches!(
-		task.await.unwrap(),
-		Err(CompactionFailure::ManifestRace)
-	));
-	assert!(mgr.lookup(tenant(), key).is_err());
-	let snapshot = mgr
-		.persistent_index
-		.as_ref()
-		.unwrap()
-		.load_snapshot()
-		.await
-		.unwrap();
-	assert_eq!(snapshot.lsm_install_intents.len(), 1);
-	assert!(
-		snapshot
-			.tiered_slabs
-			.iter()
-			.all(|p| p.slab_id != pointer.slab_id)
-	);
-	assert!(
-		snapshot
-			.record_rows
-			.iter()
-			.all(|row| row.location.slab_id != pointer.slab_id)
-	);
-	assert!(outputs.iter().all(|path| path.exists()));
-	assert!(
-		durable_run(&mgr, pointer.slab_id).await.is_some(),
-		"the retirement left the unresolved install's run"
-	);
-	drop(committer);
-	let reopened = try_restart_tier_manager(mgr, &dirs, &l2).await.unwrap();
+	// A retirement with no log entry has nothing to owe: it refuses and its caller retries.
 	assert_eq!(
-		reopened.tier_authority_readiness_reason().as_deref(),
-		Some("TierAuthorityLsmUnresolved")
+		stale_location(&mgr.retire_tiered_slab(pointer.slab_id).await.unwrap_err()),
+		Some(StaleLocation {
+			slab_id: pointer.slab_id,
+			reason: StaleLocationReason::Fenced
+		})
 	);
-	assert!(reopened.lookup(tenant(), key).is_err());
+	// A decided one is held: the install's evidence stays true, so the install completes.
+	assert!(
+		!mgr.retire_tiered_slab_committed(pointer.slab_id, Some(5))
+			.await
+			.unwrap(),
+		"held, not applied"
+	);
+	assert_eq!(
+		mgr.persistent_index
+			.as_ref()
+			.unwrap()
+			.load_deferred_retirements()
+			.await
+			.unwrap()
+			.len(),
+		1
+	);
+	assert!(mgr.tier_pointer(pointer.slab_id).await.is_some());
+	release_tx.send(()).unwrap();
+	task.await.unwrap().unwrap();
 	assert!(outputs.iter().all(|path| path.exists()));
+	mgr.retry_deferred_retirements().await.unwrap();
+	assert!(mgr.tier_pointer(pointer.slab_id).await.is_none());
+	assert!(
+		mgr.persistent_index
+			.as_ref()
+			.unwrap()
+			.load_deferred_retirements()
+			.await
+			.unwrap()
+			.is_empty(),
+		"its row ends with its effect"
+	);
+	let served = mgr
+		.lookup(tenant(), key)
+		.unwrap()
+		.expect("the output has it");
+	assert_ne!(served.slab_id, pointer.slab_id, "never the retired input");
+	assert_eq!(mgr.read(served).await.unwrap(), [0, 0, 0, 0, 65]);
+	drop(committer);
+	let _ = (dirs, l2);
 }
 
 #[tokio::test]
@@ -39220,6 +39806,7 @@ async fn b6_newer_snapshot_replaces_an_older_pending_generation() {
 			keys_unknown: false,
 			in_flight: true,
 			owner_token: Arc::new(()),
+			gc_lifecycle: false,
 		},
 	);
 	assert!(
@@ -39457,6 +40044,7 @@ async fn b6b_recovery_publication_waits_for_live_lsm_scope_then_retries() {
 			keys_unknown: false,
 			in_flight: true,
 			owner_token: Arc::new(()),
+			gc_lifecycle: false,
 		},
 	);
 	fixture.store.release();
@@ -39773,6 +40361,7 @@ async fn b6c_complete_replay_resumes_matching_lsm_deferral() {
 			keys_unknown: false,
 			in_flight: true,
 			owner_token: Arc::new(()),
+			gc_lifecycle: false,
 		},
 	);
 	let mut sm = WendelonStateMachine::new().with_tier_observer(Arc::new(
@@ -39888,6 +40477,7 @@ async fn b6c_complete_replay_preserves_structural_refusal() {
 			keys_unknown: false,
 			in_flight: true,
 			owner_token: Arc::new(()),
+			gc_lifecycle: false,
 		},
 	);
 	let mut sm = WendelonStateMachine::new().with_tier_observer(Arc::new(

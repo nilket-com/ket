@@ -40,6 +40,9 @@ const TIERED_SLABS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("ti
 const SECONDARY_INDEX_SEGMENTS_TABLE: TableDefinition<&[u8], &[u8]> =
 	TableDefinition::new("secondary_index_segments_v1");
 const LSM_RUNS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("lsm_runs_v1");
+/// A committed Retire this store has yet to apply, because an unresolved install names the slab.
+const DEFERRED_RETIREMENTS_TABLE: TableDefinition<u64, &[u8]> =
+	TableDefinition::new("deferred_retirements_v1");
 const LSM_INSTALL_INTENTS_TABLE: TableDefinition<u64, &[u8]> =
 	TableDefinition::new("lsm_install_intents_v1");
 const META_LSM_INSTALL_INTENTS_INITIALIZED: &str = "lsm_install_intents_initialized_v1";
@@ -255,6 +258,53 @@ fn retirement_evidence_stands(
 		}
 	}
 	Ok(false)
+}
+
+/// A retirement a log entry has decided, of exactly this generation, held back while an install
+/// that names the slab is unresolved. Its rows, pointer and publication revision stay untouched,
+/// so that install's evidence stays true whichever way it resolves.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct DeferredRetirement {
+	pub pointer: TieredSlabPointer,
+	pub log_index: u64,
+}
+
+/// A retirement's row ends only with a retirement of the generation it names.
+fn clear_deferred_retirement_of(
+	tx: &redb::WriteTransaction,
+	pointer: &TieredSlabPointer,
+) -> std::io::Result<()> {
+	let mut table = tx
+		.open_table(DEFERRED_RETIREMENTS_TABLE)
+		.map_err(redb_to_io)?;
+	let same = table
+		.get(&pointer.slab_id.get())
+		.map_err(redb_to_io)?
+		.map(|value| {
+			postcard::from_bytes::<DeferredRetirement>(value.value())
+				.map_err(|e| Error::new(ErrorKind::InvalidData, e))
+		})
+		.transpose()?
+		.is_some_and(|row| row.pointer.same_object_generation(pointer));
+	if same {
+		table.remove(&pointer.slab_id.get()).map_err(redb_to_io)?;
+	}
+	Ok(())
+}
+
+/// A retry resolves only the intent covered by its authority: an older callback must leave a newer
+/// snapshot or log retirement intact.
+fn retirement_resolves_mark(
+	mark: &SnapshotRetirementMark,
+	last_control_log_index: Option<u64>,
+	retirement_epoch: u64,
+) -> bool {
+	mark.epoch <= retirement_epoch
+		&& match (last_control_log_index, mark.snapshot_index) {
+			(Some(applied), Some(required)) => applied >= required,
+			(_, None) => true,
+			(None, Some(_)) => false,
+		}
 }
 
 /// Remove a run row, keeping the manifest epoch it carried as a floor. Every removal comes here.
@@ -832,6 +882,8 @@ pub(crate) struct PersistentLocalIndex {
 		)>,
 	>,
 	#[cfg(test)]
+	pub(crate) fail_next_snapshot_retirement: std::sync::atomic::AtomicBool,
+	#[cfg(test)]
 	pub(crate) retirement_commit_hold: std::sync::Mutex<
 		Option<(
 			std::sync::Arc<std::sync::Barrier>,
@@ -1167,6 +1219,9 @@ impl PersistentLocalIndex {
 			}
 			{
 				let _table = write_txn.open_table(LSM_RUNS_TABLE).map_err(redb_to_io)?;
+				let _table = write_txn
+					.open_table(DEFERRED_RETIREMENTS_TABLE)
+					.map_err(redb_to_io)?;
 			}
 			{
 				let _table = write_txn.open_table(META_TABLE).map_err(redb_to_io)?;
@@ -1469,6 +1524,8 @@ impl PersistentLocalIndex {
 			guarded_delta_before_commit_hold: Default::default(),
 			#[cfg(test)]
 			guarded_delta_commit_hold: Default::default(),
+			#[cfg(test)]
+			fail_next_snapshot_retirement: std::sync::atomic::AtomicBool::new(false),
 			#[cfg(test)]
 			retirement_commit_hold: std::sync::Mutex::new(None),
 		})
@@ -2168,6 +2225,143 @@ impl PersistentLocalIndex {
 	}
 
 	/// Remove one slab and its pointer in one checked transaction.
+	/// Hold a decided retirement back, durably, before its local step is acknowledged. The pointer
+	/// must still be this generation: a retirement of any other has nothing to wait for here.
+	pub(crate) async fn defer_retirement(
+		&self,
+		deferred: DeferredRetirement,
+		gate: std::sync::Arc<tokio::sync::OwnedRwLockReadGuard<()>>,
+	) -> std::io::Result<()> {
+		let _guard = self.write_lock.lock().await;
+		self.db
+			.run(move |db| {
+				let _gate = gate;
+				let txn = db.begin_write().map_err(redb_to_io)?;
+				let slab_id = deferred.pointer.slab_id;
+				let same_generation = txn
+					.open_table(TIERED_SLABS_TABLE)
+					.map_err(redb_to_io)?
+					.get(&slab_id.get())
+					.map_err(redb_to_io)?
+					.map(|value| decode_tiered_pointer(slab_id, value.value()))
+					.transpose()?
+					.is_some_and(|pointer| pointer.same_object_generation(&deferred.pointer));
+				if !same_generation {
+					return Err(Error::new(
+						ErrorKind::WouldBlock,
+						"tier pointer changed before its retirement was deferred",
+					));
+				}
+				let bytes = postcard::to_stdvec(&deferred)
+					.map_err(|error| Error::new(ErrorKind::InvalidData, error))?;
+				txn.open_table(DEFERRED_RETIREMENTS_TABLE)
+					.map_err(redb_to_io)?
+					.insert(&slab_id.get(), bytes.as_slice())
+					.map_err(redb_to_io)?;
+				txn.commit().map_err(redb_to_io)
+			})
+			.await
+	}
+
+	/// Whether this exact held retirement is still to apply: its row as read, and a pointer of its
+	/// generation. Anything else keeps the obligation and its fence. Every retirement that takes
+	/// effect clears a row of its own generation in the same transaction, and nothing durable can
+	/// prove after the fact that some other route retired exactly this generation.
+	pub(crate) async fn deferred_retirement_is_owed(
+		&self,
+		row: DeferredRetirement,
+	) -> std::io::Result<bool> {
+		self.db
+			.run(move |db| {
+				let txn = db.begin_read().map_err(redb_to_io)?;
+				let slab_id = row.pointer.slab_id;
+				let saved = txn
+					.open_table(DEFERRED_RETIREMENTS_TABLE)
+					.map_err(redb_to_io)?
+					.get(&slab_id.get())
+					.map_err(redb_to_io)?
+					.map(|value| {
+						postcard::from_bytes::<DeferredRetirement>(value.value())
+							.map_err(|e| Error::new(ErrorKind::InvalidData, e))
+					})
+					.transpose()?;
+				if saved.as_ref() != Some(&row) {
+					return Ok(false);
+				}
+				let pointer = txn
+					.open_table(TIERED_SLABS_TABLE)
+					.map_err(redb_to_io)?
+					.get(&slab_id.get())
+					.map_err(redb_to_io)?
+					.map(|value| decode_tiered_pointer(slab_id, value.value()))
+					.transpose()?;
+				Ok(pointer.is_some_and(|pointer| pointer.same_object_generation(&row.pointer)))
+			})
+			.await
+	}
+
+	/// Whether a durable snapshot mark of this generation stands that a retirement with this
+	/// authority would not resolve. Deleting the pointer then would strand the mark, and its fence,
+	/// for good: the mark's own retry must take it instead.
+	pub(crate) async fn outstanding_mark_blocks_retirement(
+		&self,
+		pointer: TieredSlabPointer,
+		last_control_log_index: Option<u64>,
+		retirement_epoch: u64,
+	) -> std::io::Result<bool> {
+		self.db
+			.run(move |db| {
+				let tx = db.begin_read().map_err(redb_to_io)?;
+				let marks = tx
+					.open_table(SNAPSHOT_RETIREMENTS_TABLE)
+					.map_err(redb_to_io)?;
+				let mark = marks
+					.get(&pointer.slab_id.get())
+					.map_err(redb_to_io)?
+					.map(|v| {
+						postcard::from_bytes::<SnapshotRetirementMark>(v.value())
+							.map_err(|e| Error::new(ErrorKind::InvalidData, e))
+					})
+					.transpose()?;
+				Ok(mark.is_some_and(|mark| {
+					pointer.same_object_generation(&mark.pointer)
+						&& !retirement_resolves_mark(
+							&mark,
+							last_control_log_index,
+							retirement_epoch,
+						)
+				}))
+			})
+			.await
+	}
+
+	pub(crate) async fn load_deferred_retirements(
+		&self,
+	) -> std::io::Result<Vec<DeferredRetirement>> {
+		self.db
+			.run(move |db| {
+				let tx = db.begin_read().map_err(redb_to_io)?;
+				let table = tx
+					.open_table(DEFERRED_RETIREMENTS_TABLE)
+					.map_err(redb_to_io)?;
+				let mut rows = Vec::new();
+				for row in table.iter().map_err(redb_to_io)? {
+					let (key, value) = row.map_err(redb_to_io)?;
+					let deferred: DeferredRetirement = postcard::from_bytes(value.value())
+						.map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+					if deferred.pointer.slab_id.get() != key.value() {
+						return Err(Error::new(
+							ErrorKind::InvalidData,
+							"deferred retirement key mismatch",
+						));
+					}
+					rows.push(deferred);
+				}
+				Ok(rows)
+			})
+			.await
+	}
+
 	/// A Live run left by a retirement from before retirements disposed of their run. Only exact
 	/// evidence authorizes this: a published retirement record with a source and no tier pointer,
 	/// never a missing file. True when that evidence stands, so memory may follow.
@@ -2326,6 +2520,9 @@ impl PersistentLocalIndex {
 					}
 				}
 				dispose_retired_live_run(&txn, slab_id)?;
+				if let Some(pointer) = &expected {
+					clear_deferred_retirement_of(&txn, pointer)?;
+				}
 				if let Some(index) = last_control_log_index {
 					let mut meta = txn.open_table(META_TABLE).map_err(redb_to_io)?;
 					let current = meta
@@ -2349,12 +2546,7 @@ impl PersistentLocalIndex {
 						expected
 							.as_ref()
 							.is_some_and(|pointer| pointer.same_object_generation(&mark.pointer))
-							&& mark.epoch <= retirement_epoch
-							&& match (last_control_log_index, mark.snapshot_index) {
-								(Some(applied), Some(required)) => applied >= required,
-								(_, None) => true,
-								(None, Some(_)) => false,
-							}
+							&& retirement_resolves_mark(mark, last_control_log_index, retirement_epoch)
 					});
 					if resolved.is_some() { marks.remove(&slab_id.get()).map_err(redb_to_io)?; }
 					resolved
@@ -2981,6 +3173,13 @@ impl PersistentLocalIndex {
 			Vec<(String, RetainedObjectIntent)>,
 		)>,
 	> {
+		#[cfg(test)]
+		if self
+			.fail_next_snapshot_retirement
+			.swap(false, std::sync::atomic::Ordering::AcqRel)
+		{
+			return Err(Error::other("injected snapshot retirement failure"));
+		}
 		let _guard = self.write_lock.lock().await;
 		let cleanup_available = self.cleanup_available;
 		let gap_contribution = self.persisted_cleanup_gaps.clone();
@@ -3018,6 +3217,7 @@ impl PersistentLocalIndex {
 				for key in keys { records.remove(key.as_slice()).map_err(redb_to_io)?; }
 			}
 			dispose_retired_live_run(&tx, mark.pointer.slab_id)?;
+			clear_deferred_retirement_of(&tx, &mark.pointer)?;
 			let (retained, applied_evidence) = if cleanup_available {
 				let retirement_index = mark.snapshot_index.ok_or_else(|| Error::new(ErrorKind::WouldBlock, "snapshot retirement lacks an authority index"))?;
 				let (record, evidence) = persist_retirement_records(&tx, &mark.pointer, known_bytes, evidence, RetirementSource::Snapshot(retirement_index))?;

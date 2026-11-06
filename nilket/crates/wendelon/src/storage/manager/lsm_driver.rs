@@ -402,6 +402,8 @@ pub(super) struct UnresolvedLsmScope {
 	pub(super) keys_unknown: bool,
 	pub(super) in_flight: bool,
 	pub(super) owner_token: Arc<()>,
+	/// A GC step's lifecycle commit: it rewrites no rows, so a retirement need not wait for it.
+	pub(super) gc_lifecycle: bool,
 }
 
 pub(super) fn lsm_intent_scope(
@@ -439,6 +441,7 @@ pub(super) fn lsm_intent_scope(
 		slabs,
 		in_flight: !recovering,
 		owner_token: Arc::new(()),
+		gc_lifecycle: intent.commit.is_lsm_gc_lifecycle_commit(),
 		keys_unknown: recovering
 			|| !intent.commit.slabs_to_add.is_empty()
 			|| !intent.local_output_files.is_empty()
@@ -584,6 +587,14 @@ impl SlabManager {
 	pub(super) fn lsm_intent_names_slab(&self, slab_id: SlabId) -> bool {
 		self.lsm_install_unresolved.iter().any(|intent| {
 			intent.value().slabs.is_empty() || intent.value().slabs.contains(&slab_id)
+		})
+	}
+
+	/// Whether an unresolved install's evidence includes this slab, so a retirement must wait.
+	pub(super) fn lsm_install_holds_slab(&self, slab_id: SlabId) -> bool {
+		self.lsm_install_unresolved.iter().any(|intent| {
+			!intent.value().gc_lifecycle
+				&& (intent.value().slabs.is_empty() || intent.value().slabs.contains(&slab_id))
 		})
 	}
 

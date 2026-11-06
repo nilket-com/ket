@@ -53,6 +53,11 @@ impl OpDriver {
 		{
 			unresolved.get_or_insert(error);
 		}
+		// Installs have had their pass, so what they held comes next: a snapshot's mark before the
+		// tier operations, whose log index may be too old to resolve that mark, which would strand it.
+		if let Err(error) = self.slab.retry_deferred_retirements().await {
+			unresolved.get_or_insert(error);
+		}
 		if let Err(error) = self
 			.slab
 			.recover_abandoned_tier_ops(self.committer.as_ref())
