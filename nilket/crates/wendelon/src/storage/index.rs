@@ -222,6 +222,117 @@ pub(crate) enum RetainedObjectIntentState {
 }
 
 /// Record publication of predecessors and the retired object in one transaction.
+/// A published retirement record with a source, and no tier pointer: what open reads as
+/// `retired_tiered_slabs`.
+fn retirement_evidence_stands(
+	tx: &redb::WriteTransaction,
+	slab_id: SlabId,
+) -> std::io::Result<bool> {
+	if tx
+		.open_table(TIERED_SLABS_TABLE)
+		.map_err(redb_to_io)?
+		.get(&slab_id.get())
+		.map_err(redb_to_io)?
+		.is_some()
+	{
+		return Ok(false);
+	}
+	let cleanup = tx
+		.open_table(SNAPSHOT_CLEANUP_INTENTS_TABLE)
+		.map_err(redb_to_io)?;
+	let prefix = slab_id.get().to_be_bytes();
+	for row in cleanup.range(prefix.as_slice()..).map_err(redb_to_io)? {
+		let (key, value) = row.map_err(redb_to_io)?;
+		if !key.value().starts_with(&prefix) {
+			break;
+		}
+		let intent: RetainedObjectIntent = postcard::from_bytes(value.value())
+			.map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+		if intent.state == RetainedObjectIntentState::RetirementPublished
+			&& intent.retirement_source.is_some()
+		{
+			return Ok(true);
+		}
+	}
+	Ok(false)
+}
+
+/// Remove a run row, keeping the manifest epoch it carried as a floor. Every removal comes here.
+fn remove_lsm_run_row(
+	tx: &redb::WriteTransaction,
+	slab_id: SlabId,
+) -> std::io::Result<Option<LsmRunSummary>> {
+	let removed = {
+		let mut table = tx.open_table(LSM_RUNS_TABLE).map_err(redb_to_io)?;
+		let removed = table
+			.remove(&slab_id.get())
+			.map_err(redb_to_io)?
+			.map(|value| decode_lsm_run_summary(slab_id, value.value()))
+			.transpose()?;
+		removed
+	};
+	if let Some(run) = &removed {
+		let mut meta = tx.open_table(META_TABLE).map_err(redb_to_io)?;
+		let floor = meta
+			.get(META_LSM_MANIFEST_EPOCH_FLOOR)
+			.map_err(redb_to_io)?
+			.map(|value| value.value())
+			.unwrap_or(0);
+		if run.manifest_epoch.get() > floor {
+			meta.insert(META_LSM_MANIFEST_EPOCH_FLOOR, &run.manifest_epoch.get())
+				.map_err(redb_to_io)?;
+		}
+	}
+	Ok(removed)
+}
+
+/// Whether an unresolved install names this slab. Its commit still has to apply to that run, so
+/// the run waits for the install to resolve.
+fn install_intent_names_in<T: redb::ReadableTable<u64, &'static [u8]>>(
+	intents: &T,
+	slab_id: SlabId,
+) -> std::io::Result<bool> {
+	for row in intents.iter().map_err(redb_to_io)? {
+		let (_, value) = row.map_err(redb_to_io)?;
+		let intent: LsmInstallIntent =
+			serde_json::from_slice(value.value()).map_err(Error::other)?;
+		let commit = &intent.commit;
+		if commit.slabs_to_retire.contains(&slab_id)
+			|| commit.slabs_to_add.iter().any(|run| run.slab_id == slab_id)
+		{
+			return Ok(true);
+		}
+	}
+	Ok(false)
+}
+
+/// A tier retirement is this slab's terminal state, so a Live run of it ends with the same
+/// transaction: it has no backing left to compact, and GC has no file to claim. Any other state
+/// means LSM already owns the slab, and keeps its own lifecycle; so does a run an unresolved
+/// install names, until it resolves. True when this leaves no such run.
+fn dispose_retired_live_run(tx: &redb::WriteTransaction, slab_id: SlabId) -> std::io::Result<bool> {
+	if install_intent_names_in(
+		&tx.open_table(LSM_INSTALL_INTENTS_TABLE)
+			.map_err(redb_to_io)?,
+		slab_id,
+	)? {
+		return Ok(false);
+	}
+	let live = {
+		let table = tx.open_table(LSM_RUNS_TABLE).map_err(redb_to_io)?;
+		let run = table
+			.get(&slab_id.get())
+			.map_err(redb_to_io)?
+			.map(|value| decode_lsm_run_summary(slab_id, value.value()))
+			.transpose()?;
+		run.is_some_and(|run| run.state.is_live())
+	};
+	if live {
+		remove_lsm_run_row(tx, slab_id)?;
+	}
+	Ok(true)
+}
+
 fn persist_retirement_records(
 	tx: &redb::WriteTransaction,
 	pointer: &TieredSlabPointer,
@@ -349,6 +460,9 @@ const META_STORE_INCARNATION_LOW: &str = "store_incarnation_low_v1";
 /// The exclusive bound on every slab id this store has issued. It is
 /// committed before any id below it is used, so reopen never reissues one.
 const META_SLAB_ID_HIGH_WATER: &str = "slab_id_high_water_v1";
+/// The highest manifest epoch of any run row removed. Open reads the manifest epoch back from the
+/// rows, so a removed row must not take the epoch it carried with it.
+const META_LSM_MANIFEST_EPOCH_FLOOR: &str = "lsm_manifest_epoch_floor_v1";
 
 pub(crate) use crate::consensus::StoreIncarnation;
 
@@ -602,6 +716,7 @@ pub(crate) struct PersistentIndexSnapshot {
 	pub record_localities: Vec<(TenantId, Identity, Locality)>,
 	pub secondary_index_segments: Vec<PersistentSecondaryIndexSegmentRow>,
 	pub lsm_runs: Vec<LsmRunSummary>,
+	pub lsm_manifest_epoch_floor: crate::schema::ManifestEpoch,
 	pub lsm_install_intents: Vec<LsmInstallIntent>,
 	pub last_control_log_index: Option<u64>,
 }
@@ -1513,6 +1628,13 @@ impl PersistentLocalIndex {
 					.get(META_LAST_CONTROL_LOG_INDEX)
 					.map_err(redb_to_io)?
 					.map(|value| value.value());
+				let lsm_manifest_epoch_floor = crate::schema::ManifestEpoch::new(
+					meta_table
+						.get(META_LSM_MANIFEST_EPOCH_FLOOR)
+						.map_err(redb_to_io)?
+						.map(|value| value.value())
+						.unwrap_or(0),
+				);
 
 				Ok(PersistentIndexSnapshot {
 					record_rows,
@@ -1522,6 +1644,7 @@ impl PersistentLocalIndex {
 					record_localities,
 					secondary_index_segments,
 					lsm_runs,
+					lsm_manifest_epoch_floor,
 					lsm_install_intents,
 					last_control_log_index,
 				})
@@ -1959,10 +2082,10 @@ impl PersistentLocalIndex {
 						op_state::complete_linked_lsm_intent(&write_txn, intent)?;
 					}
 					op_state::promote_reservations(&write_txn, &update.promote_reservations)?;
-					let mut table = write_txn.open_table(LSM_RUNS_TABLE).map_err(redb_to_io)?;
 					for slab_id in update.delete_lsm_run_ids {
-						let _ = table.remove(&slab_id.get()).map_err(redb_to_io)?;
+						remove_lsm_run_row(&write_txn, slab_id)?;
 					}
+					let mut table = write_txn.open_table(LSM_RUNS_TABLE).map_err(redb_to_io)?;
 					for run in update.put_lsm_runs {
 						let value = encode_lsm_run_summary(&run)?;
 						table
@@ -2045,6 +2168,96 @@ impl PersistentLocalIndex {
 	}
 
 	/// Remove one slab and its pointer in one checked transaction.
+	/// A Live run left by a retirement from before retirements disposed of their run. Only exact
+	/// evidence authorizes this: a published retirement record with a source and no tier pointer,
+	/// never a missing file. True when that evidence stands, so memory may follow.
+	pub(crate) async fn dispose_retirement_remnant(
+		&self,
+		slab_id: SlabId,
+		gate: std::sync::Arc<tokio::sync::OwnedRwLockReadGuard<()>>,
+	) -> std::io::Result<bool> {
+		if !self.cleanup_available {
+			return Ok(false);
+		}
+		let _guard = self.write_lock.lock().await;
+		self.db
+			.run(move |db| {
+				let _gate = gate;
+				let txn = db.begin_write().map_err(redb_to_io)?;
+				if !retirement_evidence_stands(&txn, slab_id)? {
+					return Ok(false);
+				}
+				let disposed = dispose_retired_live_run(&txn, slab_id)?;
+				txn.commit().map_err(redb_to_io)?;
+				Ok(disposed)
+			})
+			.await
+	}
+
+	/// The record a retirement writes, on its own.
+	#[cfg(test)]
+	pub(crate) async fn record_retirement_for_test(
+		&self,
+		pointer: TieredSlabPointer,
+		index: u64,
+	) -> std::io::Result<()> {
+		let _guard = self.write_lock.lock().await;
+		self.db
+			.run(move |db| {
+				let txn = db.begin_write().map_err(redb_to_io)?;
+				persist_retirement_records(
+					&txn,
+					&pointer,
+					None,
+					Vec::new(),
+					RetirementSource::Log(index),
+				)?;
+				txn.commit().map_err(redb_to_io)
+			})
+			.await
+	}
+
+	/// Whether an unresolved install names this slab, as the disposal in a retirement reads it.
+	pub(crate) async fn install_intent_names(&self, slab_id: SlabId) -> std::io::Result<bool> {
+		self.db
+			.run(move |db| {
+				let read = db.begin_read().map_err(redb_to_io)?;
+				install_intent_names_in(
+					&read
+						.open_table(LSM_INSTALL_INTENTS_TABLE)
+						.map_err(redb_to_io)?,
+					slab_id,
+				)
+			})
+			.await
+	}
+
+	/// The open-time form of `dispose_retirement_remnant`: all of them, in one transaction.
+	pub(crate) async fn dispose_retirement_remnants(
+		&self,
+		slabs: Vec<SlabId>,
+	) -> std::io::Result<Vec<SlabId>> {
+		if !self.cleanup_available || slabs.is_empty() {
+			return Ok(Vec::new());
+		}
+		let _guard = self.write_lock.lock().await;
+		self.db
+			.run(move |db| {
+				let txn = db.begin_write().map_err(redb_to_io)?;
+				let mut disposed = Vec::new();
+				for slab_id in slabs {
+					if retirement_evidence_stands(&txn, slab_id)?
+						&& dispose_retired_live_run(&txn, slab_id)?
+					{
+						disposed.push(slab_id);
+					}
+				}
+				txn.commit().map_err(redb_to_io)?;
+				Ok(disposed)
+			})
+			.await
+	}
+
 	pub(crate) async fn retire_tiered_slab_checked(
 		&self,
 		slab_id: SlabId,
@@ -2112,6 +2325,7 @@ impl PersistentLocalIndex {
 						records.remove(key.as_slice()).map_err(redb_to_io)?;
 					}
 				}
+				dispose_retired_live_run(&txn, slab_id)?;
 				if let Some(index) = last_control_log_index {
 					let mut meta = txn.open_table(META_TABLE).map_err(redb_to_io)?;
 					let current = meta
@@ -2803,6 +3017,7 @@ impl PersistentLocalIndex {
 				}
 				for key in keys { records.remove(key.as_slice()).map_err(redb_to_io)?; }
 			}
+			dispose_retired_live_run(&tx, mark.pointer.slab_id)?;
 			let (retained, applied_evidence) = if cleanup_available {
 				let retirement_index = mark.snapshot_index.ok_or_else(|| Error::new(ErrorKind::WouldBlock, "snapshot retirement lacks an authority index"))?;
 				let (record, evidence) = persist_retirement_records(&tx, &mark.pointer, known_bytes, evidence, RetirementSource::Snapshot(retirement_index))?;

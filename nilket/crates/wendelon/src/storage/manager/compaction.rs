@@ -1500,7 +1500,7 @@ impl SlabManager {
 				)
 			})
 			.collect::<Vec<_>>();
-		let lsm_runs = self.maintenance_manifest_preview(slab_id, None)?;
+		let lsm_runs = self.maintenance_run_rows(slab_id, None)?;
 		let index_publication = self.begin_index_publication(vec![slab_id]).await?;
 		// D2′: records and the old run's Retired disposition become durable in
 		// one transaction before the in-memory index or backing changes.
@@ -1698,8 +1698,7 @@ impl SlabManager {
 			),
 			old_run.manifest_epoch,
 		);
-		let lsm_runs =
-			self.maintenance_manifest_preview(old_slab_id, Some(replacement_run.clone()))?;
+		let lsm_runs = self.maintenance_run_rows(old_slab_id, Some(replacement_run.clone()))?;
 
 		let mut by_key: BTreeMap<TenantKey, KeyRelocation> = BTreeMap::new();
 		let mut relocated_sources = HashSet::new();

@@ -18314,6 +18314,537 @@ async fn tier_row_refresh_keeps_every_row_visible_with_versions_and_locality() {
 	assert_tier_refresh_observation(&fixture, &observed, &expected_values, &before).await;
 }
 
+fn live_l0_has(mgr: &SlabManager, slab: SlabId) -> bool {
+	mgr.compaction_manifest_snapshot()
+		.slabs_at_compaction_level(CompactionLevelIndex::L0)
+		.iter()
+		.any(|run| run.slab_id == slab)
+}
+
+async fn durable_run(mgr: &SlabManager, slab: SlabId) -> Option<crate::storage::LsmRunSummary> {
+	mgr.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot()
+		.await
+		.unwrap()
+		.lsm_runs
+		.into_iter()
+		.find(|run| run.slab_id == slab)
+}
+
+async fn put_run_row(mgr: &SlabManager, run: crate::storage::LsmRunSummary) {
+	mgr.persistent_index
+		.as_ref()
+		.unwrap()
+		.apply_with_publication_guard(
+			crate::storage::index::PersistentIndexUpdate {
+				put_lsm_runs: vec![run],
+				..Default::default()
+			},
+			None,
+		)
+		.await
+		.unwrap();
+}
+
+/// A slab tiered the way production tiers one, its Live L0 run also durable.
+async fn seed_tiered_l0_run(
+	tag: &str,
+) -> (
+	[crate::test_support::TestDir; 2],
+	Arc<SlabManager>,
+	Arc<dyn ObjectStore>,
+	TieredSlabPointer,
+	crate::storage::LsmRunSummary,
+) {
+	let (dirs, mgr, l2) = fresh_manager_with_l2(tag).await;
+	mgr.append_durable(tenant(), id(0xb184), hlc(71), b"value")
+		.await
+		.unwrap();
+	let pointer = tier_kv_slab(&mgr, &l2, &format!("{tag}/object")).await;
+	// Production sealing registers this; the fixture's seal does not.
+	mgr.record_l0_compaction_run(pointer.slab_id, 1);
+	let run = mgr
+		.compaction_manifest_snapshot()
+		.run(pointer.slab_id)
+		.cloned()
+		.expect("premise: sealing registered the run");
+	assert!(live_l0_has(&mgr, pointer.slab_id), "premise: a live L0 run");
+	put_run_row(&mgr, run.clone()).await;
+	(dirs, mgr, l2, pointer, run)
+}
+
+/// A planner takes every Live L0 run as input, and a run with no backing fails the whole plan, so
+/// a retired tier slab left Live stops all L0 compaction for good.
+#[tokio::test]
+async fn a_retired_tier_slab_leaves_the_live_lsm_set() {
+	let (dirs, mgr, l2, pointer, _run) = seed_tiered_l0_run("dc184-committed").await;
+	let slab = pointer.slab_id;
+	assert!(
+		mgr.retire_tiered_slab_committed(slab, Some(10))
+			.await
+			.unwrap(),
+		"premise: the slab was retired"
+	);
+	assert!(
+		matches!(mgr.resolve_backing(slab).await, SlabBacking::Missing),
+		"premise: nothing backs it now"
+	);
+	assert!(
+		!live_l0_has(&mgr, slab),
+		"a run with no backing is not compaction input"
+	);
+	assert_eq!(durable_run(&mgr, slab).await, None, "gone with the pointer");
+	let mgr = restart_tier_manager(mgr, &dirs, &l2).await;
+	assert!(mgr.compaction_manifest_snapshot().run(slab).is_none());
+	assert_eq!(durable_run(&mgr, slab).await, None);
+}
+
+/// With no control index there is no retirement record, and the run still goes with the pointer.
+#[tokio::test]
+async fn a_retirement_with_no_control_index_also_disposes_of_its_run() {
+	let (dirs, mgr, l2, pointer, _run) = seed_tiered_l0_run("dc184-no-index").await;
+	let slab = pointer.slab_id;
+	assert!(mgr.retire_tiered_slab_committed(slab, None).await.unwrap());
+	assert!(!live_l0_has(&mgr, slab));
+	assert_eq!(durable_run(&mgr, slab).await, None);
+	let mgr = restart_tier_manager(mgr, &dirs, &l2).await;
+	assert!(mgr.compaction_manifest_snapshot().run(slab).is_none());
+}
+
+#[tokio::test]
+async fn a_snapshot_retirement_leaves_no_live_run() {
+	let (dirs, mgr, l2, pointer, _run) = seed_tiered_l0_run("dc184-snapshot").await;
+	let slab = pointer.slab_id;
+	// A snapshot with no tiers retires this one.
+	let epoch = mgr.begin_tier_snapshot_install().unwrap();
+	mgr.finish_tier_snapshot_install_at_epoch(vec![], Some(818), epoch)
+		.await
+		.unwrap();
+	assert!(mgr.tier_pointer(slab).await.is_none(), "premise: retired");
+	assert!(!live_l0_has(&mgr, slab));
+	assert_eq!(durable_run(&mgr, slab).await, None);
+	let mgr = restart_tier_manager(mgr, &dirs, &l2).await;
+	assert!(mgr.compaction_manifest_snapshot().run(slab).is_none());
+}
+
+/// A changed mark has no authority over this generation, and disposes of nothing.
+#[tokio::test]
+async fn a_stale_snapshot_mark_leaves_the_run() {
+	let (_dirs, mgr, _l2, pointer, _run) = seed_tiered_l0_run("dc184-stale-mark").await;
+	let slab = pointer.slab_id;
+	let stale = crate::storage::index::SnapshotRetirementMark {
+		epoch: mgr.capture_snapshot_epoch(),
+		snapshot_index: Some(5),
+		pointer: TieredSlabPointer {
+			l2_uri: "tier/not-this-generation.wnd".into(),
+			..pointer
+		},
+	};
+	assert!(!mgr.apply_snapshot_retirement(stale).await.unwrap());
+	assert!(live_l0_has(&mgr, slab));
+	assert!(durable_run(&mgr, slab).await.is_some());
+}
+
+/// The commit is the disposal: a process gone before memory followed reopens with neither.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_crash_after_the_retirement_commit_leaves_no_live_run() {
+	let (dirs, mgr, l2, pointer, _run) = seed_tiered_l0_run("dc184-crash").await;
+	let slab = pointer.slab_id;
+	let entered = Arc::new(std::sync::Barrier::new(2));
+	let release = Arc::new(std::sync::Barrier::new(2));
+	*mgr.persistent_index
+		.as_ref()
+		.unwrap()
+		.retirement_commit_hold
+		.lock()
+		.unwrap() = Some((entered.clone(), release.clone()));
+	let retirement = {
+		let mgr = mgr.clone();
+		tokio::spawn(async move { mgr.retire_tiered_slab_committed(slab, Some(10)).await })
+	};
+	tokio::time::timeout(
+		Duration::from_secs(60),
+		tokio::task::spawn_blocking(move || entered.wait()),
+	)
+	.await
+	.unwrap()
+	.unwrap();
+	assert!(live_l0_has(&mgr, slab), "premise: memory has not followed");
+	retirement.abort();
+	assert!(retirement.await.unwrap_err().is_cancelled());
+	tokio::task::spawn_blocking(move || release.wait())
+		.await
+		.unwrap();
+	let mgr = try_restart_tier_manager(mgr, &dirs, &l2).await.unwrap();
+	assert!(mgr.compaction_manifest_snapshot().run(slab).is_none());
+	assert_eq!(durable_run(&mgr, slab).await, None);
+}
+
+/// Any state but Live means LSM owns the slab; retirement does not decide for it.
+#[tokio::test]
+async fn a_retirement_leaves_a_run_lsm_already_retired() {
+	let (_dirs, mgr, _l2, pointer, run) = seed_tiered_l0_run("dc184-owned").await;
+	let slab = pointer.slab_id;
+	let successor = SlabId::new(0xb1840);
+	let retired = recover_rwlock_write(&mgr.compaction_manifest, "compaction_manifest")
+		.retire_run(slab, vec![successor])
+		.unwrap();
+	put_run_row(&mgr, retired.clone()).await;
+	assert_ne!(retired, run, "premise: no longer Live");
+	assert!(
+		mgr.retire_tiered_slab_committed(slab, Some(10))
+			.await
+			.unwrap()
+	);
+	assert_eq!(
+		mgr.compaction_manifest_snapshot().run(slab),
+		Some(&retired),
+		"memory keeps it"
+	);
+	assert_eq!(
+		durable_run(&mgr, slab).await,
+		Some(retired),
+		"and so does disk"
+	);
+}
+
+/// Old stores hold these. A published retirement authorizes the repair, once, at open.
+#[tokio::test]
+async fn open_removes_a_remnant_with_a_published_retirement() {
+	let (dirs, mgr, l2, pointer, run) = seed_tiered_l0_run("dc184-repair").await;
+	let slab = pointer.slab_id;
+	assert!(
+		mgr.retire_tiered_slab_committed(slab, Some(10))
+			.await
+			.unwrap()
+	);
+	put_run_row(&mgr, run).await;
+	let mgr = restart_tier_manager(mgr, &dirs, &l2).await;
+	assert!(mgr.compaction_manifest_snapshot().run(slab).is_none());
+	assert_eq!(durable_run(&mgr, slab).await, None);
+}
+
+/// A missing file authorizes nothing: with no retirement record the run stays, and refuses.
+#[tokio::test]
+async fn open_keeps_a_backless_run_with_no_retirement_evidence() {
+	let (dirs, mgr, l2, _pointer, run) = seed_tiered_l0_run("dc184-no-evidence").await;
+	// Below the durable slab id bound, as a real one is: nothing was ever issued this id here.
+	let slab = SlabId::new(40);
+	let orphan = crate::storage::LsmRunSummary {
+		slab_id: slab,
+		..run
+	};
+	put_run_row(&mgr, orphan).await;
+	let mgr = restart_tier_manager(mgr, &dirs, &l2).await;
+	assert!(live_l0_has(&mgr, slab), "it stays Live");
+	assert!(durable_run(&mgr, slab).await.is_some());
+	assert!(matches!(
+		mgr.resolve_backing(slab).await,
+		SlabBacking::Missing
+	));
+	let id = mgr.reserve_exposed_slab_id().await.unwrap();
+	assert!(id.id().get() > slab.get(), "and its id is not reissued");
+}
+
+/// A current callback may finish a remnant its own retirement left, with that retirement's
+/// record. A callback for a slab with no record finishes nothing.
+#[tokio::test]
+async fn a_current_callback_removes_only_a_remnant_with_evidence() {
+	let (_dirs, mgr, _l2, pointer, run) = seed_tiered_l0_run("dc184-callback").await;
+	let slab = pointer.slab_id;
+	assert!(
+		mgr.retire_tiered_slab_committed(slab, Some(10))
+			.await
+			.unwrap()
+	);
+	let restore = |run: crate::storage::LsmRunSummary| {
+		recover_rwlock_write(&mgr.compaction_manifest, "compaction_manifest").insert_live_run(run);
+	};
+	restore(run.clone());
+	put_run_row(&mgr, run.clone()).await;
+	assert!(
+		!mgr.retire_tiered_slab_committed(slab, Some(11))
+			.await
+			.unwrap(),
+		"nothing else was left to retire"
+	);
+	assert!(!live_l0_has(&mgr, slab));
+	assert_eq!(durable_run(&mgr, slab).await, None);
+
+	let other = SlabId::new(0xb1842);
+	let unbacked = crate::storage::LsmRunSummary {
+		slab_id: other,
+		..run
+	};
+	restore(unbacked.clone());
+	put_run_row(&mgr, unbacked).await;
+	assert!(
+		!mgr.retire_tiered_slab_committed(other, Some(12))
+			.await
+			.unwrap()
+	);
+	assert!(live_l0_has(&mgr, other), "no evidence, no removal");
+	assert!(durable_run(&mgr, other).await.is_some());
+}
+
+/// A run its retirement left for an install that has since resolved: the next plan naming it
+/// fails, once, and finishes it, so L0 compaction does not stay stopped until a restart.
+#[tokio::test]
+async fn a_plan_naming_a_retirement_remnant_finishes_it() {
+	let (_dirs, mgr, _l2, pointer, run) = seed_tiered_l0_run("dc184-heal").await;
+	let slab = pointer.slab_id;
+	assert!(
+		mgr.retire_tiered_slab_committed(slab, Some(10))
+			.await
+			.unwrap()
+	);
+	recover_rwlock_write(&mgr.compaction_manifest, "compaction_manifest")
+		.insert_live_run(run.clone());
+	put_run_row(&mgr, run).await;
+	let plan = CompactionPlan {
+		job_id: CompactionJobId::new(0xb185),
+		source_level: CompactionLevelIndex::L0,
+		target_level: CompactionLevelIndex::L1,
+		manifest_epoch_pre: mgr.compaction_manifest_snapshot().manifest_epoch,
+		input_slabs: vec![slab],
+		overlapping_slabs: Vec::new(),
+		retention_floor_snapshot: hlc(100),
+		compaction_start_hlc: hlc(101),
+		dominant_reason: crate::storage::DominantReason::Operator,
+	};
+	let worker =
+		LsmCompactionWorker::new(crate::storage::LsmConfig::default(), mgr.slab_pin_table())
+			.unwrap();
+	assert!(matches!(
+		mgr.run_lsm_compaction_once(&worker, plan).await,
+		Err(CompactionFailure::ManifestRace)
+	));
+	assert!(!live_l0_has(&mgr, slab), "the next plan will not name it");
+	assert_eq!(durable_run(&mgr, slab).await, None);
+}
+
+/// The restart across a held run: a retirement left it for an install, the store reopened with
+/// that install unresolved, then the install resolved without publishing. The install's commit
+/// still needed the run until then, and after it nothing else would finish it: deferred open
+/// would take the Live row for lost storage. One open is enough; no second restart is needed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_run_held_across_a_restart_is_finished_when_its_install_resolves() {
+	let reopened = reopen_install_at(lsm_driver::ControlLsmInstallCut::AfterRename).await;
+	let mgr = &reopened.mgr;
+	let held = reopened.inputs[0];
+	let index = mgr.require_op_index().unwrap();
+	// A sealed L0's run reaches disk with whatever publishes it first; here, as if already had.
+	let run = mgr
+		.compaction_manifest_snapshot()
+		.run(held)
+		.cloned()
+		.expect("premise: the input has a run");
+	assert!(run.state.is_live(), "premise: and it is Live");
+	put_run_row(mgr, run).await;
+	// A SYNTHETIC state, built after the reopen, for the continuation alone: the record, no file,
+	// no backing, with its rows left in place so that recovery's digest still matches. Neither a
+	// production retirement before a reopen nor a real input with no rows; a real retirement
+	// removes rows, recovery then refuses a rejected install, and that is DC-187, still open.
+	index
+		.record_retirement_for_test(
+			TieredSlabPointer {
+				slab_id: held,
+				l2_uri: "memory://held".to_owned(),
+				payload_hash: [0xAB; 32],
+				is_encrypted: false,
+				tenant_id: None,
+				tenant_kek_id: None,
+				stats_format_version: None,
+				stats_block_len: None,
+				stats_block_hash128: None,
+				tombstone_metadata: TombstoneMetadata::None,
+				supersession_metadata: SupersessionMetadata::None,
+			},
+			10,
+		)
+		.await
+		.unwrap();
+	mgr.state.lock().await.sealed.remove(&held);
+	std::fs::remove_file(slab_path(&reopened.dir, held)).unwrap();
+
+	// Its commit may still need it: nothing may discard it yet.
+	mgr.finish_retirement_remnant(held).await;
+	assert!(
+		durable_run(mgr, held).await.is_some(),
+		"the install holds it"
+	);
+	assert!(live_l0_has(mgr, held), "in memory too");
+
+	let driver = op_driver(&reopened.cluster, mgr, reopened.plain.clone());
+	driver.drive_once().await.unwrap();
+	assert!(
+		index
+			.load_snapshot()
+			.await
+			.unwrap()
+			.lsm_install_intents
+			.is_empty(),
+		"premise: the install resolved"
+	);
+	assert!(
+		!mgr.tier_authority.deferred_open.load(Ordering::Acquire),
+		"deferred open finishes"
+	);
+	assert_eq!(durable_run(mgr, held).await, None, "the run is gone");
+	assert!(!live_l0_has(mgr, held), "from memory too");
+	assert_eq!(mgr.tier_authority_readiness_reason(), None);
+	let _ = reopened.owner.close(Duration::from_secs(2)).await;
+}
+
+/// Open reads the epoch back from the rows. Removing the row that held the highest must not lower
+/// it, by retirement or by GC's removal, or an in-progress intent's epoch would be ahead of it.
+#[tokio::test]
+async fn removing_the_highest_epoch_run_does_not_lower_the_epoch() {
+	let (dirs, mgr, l2, pointer, run) = seed_tiered_l0_run("dc184-epoch").await;
+	let slab = pointer.slab_id;
+	put_run_row(
+		&mgr,
+		crate::storage::LsmRunSummary {
+			manifest_epoch: crate::schema::ManifestEpoch::new(99),
+			..run.clone()
+		},
+	)
+	.await;
+	assert!(
+		mgr.retire_tiered_slab_committed(slab, Some(10))
+			.await
+			.unwrap()
+	);
+	let mgr = restart_tier_manager(mgr, &dirs, &l2).await;
+	assert_eq!(
+		mgr.compaction_manifest_snapshot().manifest_epoch,
+		crate::schema::ManifestEpoch::new(99),
+		"retirement keeps the epoch"
+	);
+
+	let gone = SlabId::new(0xb1843);
+	let index = mgr.persistent_index.as_ref().unwrap();
+	put_run_row(
+		&mgr,
+		crate::storage::LsmRunSummary {
+			slab_id: gone,
+			state: SlabState::DeletePending,
+			manifest_epoch: crate::schema::ManifestEpoch::new(120),
+			..run
+		},
+	)
+	.await;
+	index
+		.apply_with_publication_guard(
+			crate::storage::index::PersistentIndexUpdate {
+				delete_lsm_run_ids: vec![gone],
+				..Default::default()
+			},
+			None,
+		)
+		.await
+		.unwrap();
+	let mgr = restart_tier_manager(mgr, &dirs, &l2).await;
+	assert_eq!(
+		mgr.compaction_manifest_snapshot().manifest_epoch,
+		crate::schema::ManifestEpoch::new(120),
+		"so does GC's removal"
+	);
+}
+
+/// What the bug stopped: a real L0 compaction lands after a tier retirement. It also writes only
+/// its own runs, so it cannot restore a run removed after a whole-manifest snapshot was taken.
+#[tokio::test]
+async fn an_l0_compaction_lands_after_a_tier_retirement_and_writes_only_its_runs() {
+	let (_dirs, mgr, _l2, pointer, run) = seed_tiered_l0_run("dc184-lands").await;
+	let retired = pointer.slab_id;
+	assert!(
+		mgr.retire_tiered_slab_committed(retired, Some(10))
+			.await
+			.unwrap()
+	);
+	let key = id(0xb1844);
+	let frame = encode_test_multirow_storage_frame(&[(key, Locality::new(0x61), hlc(80), 11)]);
+	let entries = storage_multirow_index_entries_from_frame(&frame)
+		.unwrap()
+		.unwrap();
+	mgr.append_durable_multirow_with_locality(tenant(), &frame, &entries)
+		.await
+		.unwrap();
+	let source = mgr.force_seal_active_for_test().await;
+	let unrelated = SlabId::new(0xb1845);
+	recover_rwlock_write(&mgr.compaction_manifest, "compaction_manifest").insert_live_run(
+		crate::storage::LsmRunSummary {
+			slab_id: unrelated,
+			compaction_level: CompactionLevelIndex::L2,
+			..run
+		},
+	);
+	let snapshot = mgr.compaction_manifest_snapshot();
+	let inputs = snapshot
+		.slabs_at_compaction_level(CompactionLevelIndex::L0)
+		.iter()
+		.map(|run| run.slab_id)
+		.collect::<Vec<_>>();
+	assert_eq!(inputs, vec![source], "the retired slab is not input");
+	let plan = CompactionPlan {
+		job_id: CompactionJobId::new(0xb184),
+		source_level: CompactionLevelIndex::L0,
+		target_level: CompactionLevelIndex::L1,
+		manifest_epoch_pre: snapshot.manifest_epoch,
+		input_slabs: inputs,
+		overlapping_slabs: Vec::new(),
+		retention_floor_snapshot: hlc(100),
+		compaction_start_hlc: hlc(101),
+		dominant_reason: crate::storage::DominantReason::Operator,
+	};
+	let worker =
+		LsmCompactionWorker::new(crate::storage::LsmConfig::default(), mgr.slab_pin_table())
+			.unwrap();
+	let outcome = mgr.run_lsm_compaction_once(&worker, plan).await.unwrap();
+	assert_eq!(outcome.output_slabs.len(), 1);
+	assert!(
+		durable_run(&mgr, outcome.output_slabs[0].slab_id)
+			.await
+			.is_some()
+	);
+	assert!(durable_run(&mgr, source).await.is_some());
+	assert_eq!(
+		durable_run(&mgr, unrelated).await,
+		None,
+		"the install wrote no run but its own"
+	);
+	assert_eq!(durable_run(&mgr, retired).await, None);
+}
+
+/// The same for a maintenance rewrite: the old run and its replacement, and no others.
+#[tokio::test]
+async fn a_maintenance_rewrite_writes_only_its_runs() {
+	let (_dirs, mgr, _l2, pointer, run) = seed_tiered_l0_run("dc184-maintenance").await;
+	let old = pointer.slab_id;
+	let replacement = SlabId::new(0xb1846);
+	let unrelated = SlabId::new(0xb1847);
+	recover_rwlock_write(&mgr.compaction_manifest, "compaction_manifest").insert_live_run(
+		crate::storage::LsmRunSummary {
+			slab_id: unrelated,
+			..run.clone()
+		},
+	);
+	let rows = mgr
+		.maintenance_run_rows(
+			old,
+			Some(crate::storage::LsmRunSummary {
+				slab_id: replacement,
+				..run
+			}),
+		)
+		.unwrap();
+	let ids = rows.iter().map(|run| run.slab_id).collect::<BTreeSet<_>>();
+	assert_eq!(ids, BTreeSet::from([old, replacement]));
+}
+
 #[tokio::test]
 async fn stale_tier_row_refresh_does_not_resurrect_a_retired_slab() {
 	let fixture = seed_tier_refresh_fixture("tier-refresh-stale").await;
@@ -26040,6 +26571,12 @@ async fn lsm_retired_input_during_control_wait_keeps_intent_and_never_resurrects
 		.map(|run| slab_path(&dirs[0], run.slab_id))
 		.collect();
 	assert!(!outputs.is_empty() && outputs.iter().all(|path| path.exists()));
+	let run = mgr
+		.compaction_manifest_snapshot()
+		.run(pointer.slab_id)
+		.cloned()
+		.unwrap();
+	put_run_row(&mgr, run).await;
 	assert!(mgr.retire_tiered_slab(pointer.slab_id).await.unwrap());
 	release_tx.send(()).unwrap();
 	assert!(matches!(
@@ -26068,6 +26605,10 @@ async fn lsm_retired_input_during_control_wait_keeps_intent_and_never_resurrects
 			.all(|row| row.location.slab_id != pointer.slab_id)
 	);
 	assert!(outputs.iter().all(|path| path.exists()));
+	assert!(
+		durable_run(&mgr, pointer.slab_id).await.is_some(),
+		"the retirement left the unresolved install's run"
+	);
 	drop(committer);
 	let reopened = try_restart_tier_manager(mgr, &dirs, &l2).await.unwrap();
 	assert_eq!(

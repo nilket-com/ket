@@ -39,16 +39,28 @@ impl SlabManager {
 			.await
 	}
 
-	pub(super) fn maintenance_manifest_preview(
+	/// The run rows this rewrite changes, and no others: writing a whole snapshot would restore
+	/// a run another slab's retirement removed after the snapshot was taken.
+	pub(super) fn maintenance_run_rows(
 		&self,
 		old_slab_id: SlabId,
 		replacement: Option<LsmRunSummary>,
 	) -> std::io::Result<Vec<LsmRunSummary>> {
+		let replacement_id = replacement.as_ref().map(|run| run.slab_id);
 		let manifest = recover_rwlock_read(&self.compaction_manifest, "compaction_manifest");
 		let mut preview = manifest.clone();
 		drop(manifest);
 		preview.apply_maintenance_rewrite(old_slab_id, replacement)?;
-		Ok(preview.snapshot().runs().to_vec())
+		let changed = |run: &&LsmRunSummary| {
+			run.slab_id == old_slab_id || Some(run.slab_id) == replacement_id
+		};
+		Ok(preview
+			.snapshot()
+			.runs()
+			.iter()
+			.filter(changed)
+			.cloned()
+			.collect())
 	}
 
 	pub(super) fn apply_maintenance_manifest_publication(

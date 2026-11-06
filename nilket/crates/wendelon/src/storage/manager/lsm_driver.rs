@@ -1391,7 +1391,14 @@ impl SlabManager {
 		}
 		let post_epoch = self.apply_lsm_manifest_planned_compaction_commit(plan, commit)?;
 		let post_epoch = self
-			.complete_lsm_compaction_install(staged, post_epoch, publication, None, Vec::new())
+			.complete_lsm_compaction_install(
+				staged,
+				post_epoch,
+				publication,
+				None,
+				Vec::new(),
+				commit,
+			)
 			.await?;
 		#[cfg(test)]
 		{
@@ -1652,6 +1659,7 @@ impl SlabManager {
 				publication,
 				completion,
 				self.lsm_reservations_to_promote(prepared),
+				commit,
 			)
 			.await?;
 		#[cfg(test)]
@@ -1954,8 +1962,23 @@ impl SlabManager {
 		publication: IndexPublication,
 		completion: Option<AcceptedControlLsmCompletion>,
 		promote_reservations: Vec<SlabId>,
+		commit: &CompactionCommit,
 	) -> Result<ManifestEpoch, CompactionFailure> {
-		let lsm_runs = self.compaction_manifest_snapshot().runs().to_vec();
+		// This install's inputs and outputs, which its slab locks hold still, and no others: a
+		// whole snapshot would restore a run another slab's retirement has since removed.
+		let lsm_runs = self
+			.compaction_manifest_snapshot()
+			.runs()
+			.iter()
+			.filter(|run| {
+				commit.slabs_to_retire.contains(&run.slab_id)
+					|| commit
+						.slabs_to_add
+						.iter()
+						.any(|output| output.slab_id == run.slab_id)
+			})
+			.cloned()
+			.collect::<Vec<_>>();
 		let LsmInstalledCompactionOutputs {
 			installed,
 			removed_rows,
@@ -2378,10 +2401,46 @@ impl SlabManager {
 				// Blob-tier recovery rejects record classes 1..=4 in
 				// recover_slab_entries_from_blob, so an accepted L2 slab is counter-free.
 				SlabBacking::L2(_) => {}
-				SlabBacking::Missing => return Err(CompactionFailure::ManifestRace),
+				SlabBacking::Missing => {
+					self.finish_retirement_remnant(slab_id).await;
+					return Err(CompactionFailure::ManifestRace);
+				}
 			}
 		}
 		Ok(())
+	}
+
+	/// A run its retirement had to leave behind, for an install that named it then, possibly in
+	/// an earlier process. The durable retirement record authorizes this, read in the transaction
+	/// along with whether an install still names it, so it goes now and the next plan does not
+	/// name it. Without that record a missing backing authorizes nothing.
+	pub(super) async fn finish_retirement_remnant(&self, slab_id: SlabId) {
+		let Some(index) = &self.persistent_index else {
+			return;
+		};
+		let tier_lock = self.tier_publication_lock(slab_id);
+		let _tier_guard = tier_lock.lock().await;
+		let answer = match self.begin_index_publication(vec![slab_id]).await {
+			Ok(publication) => {
+				match index
+					.dispose_retirement_remnant(slab_id, publication.gate.clone())
+					.await
+				{
+					Ok(disposed) => {
+						if disposed {
+							self.drop_live_run(slab_id);
+						}
+						publication.complete();
+						Ok(())
+					}
+					Err(error) => Err(error),
+				}
+			}
+			Err(error) => Err(error),
+		};
+		if let Err(error) = answer {
+			tracing::warn!(%error, slab_id = slab_id.get(), "a retirement remnant stays for now");
+		}
 	}
 
 	fn note_lsm_counter_deferral(&self, plan: &CompactionPlan, slab_id: SlabId) {

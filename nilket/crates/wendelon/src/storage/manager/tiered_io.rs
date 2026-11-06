@@ -1457,6 +1457,24 @@ impl SlabManager {
 			retired_pointer.is_some() || state.rehydrated.contains_key(&slab_id) || !rows.is_empty()
 		};
 		if !should_remove {
+			// A current callback for a retirement already applied: all that can be left is a run
+			// from before retirements disposed of theirs, and only its evidence authorizes that.
+			if last_control_log_index.is_some()
+				&& let Some(index) = &self.persistent_index
+				&& self
+					.compaction_manifest_snapshot()
+					.run(slab_id)
+					.is_some_and(|run| run.state.is_live())
+			{
+				let publication = self.begin_index_publication_with_gate(vec![slab_id], gate)?;
+				if index
+					.dispose_retirement_remnant(slab_id, publication.gate.clone())
+					.await?
+				{
+					self.drop_live_run(slab_id);
+				}
+				publication.complete();
+			}
 			return Ok(false);
 		}
 		self.bump_slab_publication_revision(slab_id)?;
@@ -1478,6 +1496,7 @@ impl SlabManager {
 			state.hot_read_counts.remove(&slab_id);
 			state.rehydrating.remove(&slab_id);
 		}
+		self.drop_retired_live_run(slab_id).await;
 		self.retired_tier_slabs.insert(slab_id);
 		self.unapplied_tier_pointers.remove(&slab_id);
 		for row in &rows {
@@ -1491,6 +1510,38 @@ impl SlabManager {
 		}
 		self.unlink_released_slab_file(slab_id).await?;
 		Ok(true)
+	}
+
+	/// Memory's half of a retirement's run disposal. A run with no durable row, as a sealed L0 may
+	/// be, goes too. An unresolved install's run waits, as in the durable half; an index that
+	/// cannot say leaves it waiting too, and a later plan or reopen finishes it.
+	async fn drop_retired_live_run(&self, slab_id: SlabId) {
+		if let Some(index) = &self.persistent_index {
+			match index.install_intent_names(slab_id).await {
+				Ok(false) => {}
+				Ok(true) => return,
+				Err(error) => {
+					tracing::warn!(%error, slab_id = slab_id.get(), "retired run left Live");
+					return;
+				}
+			}
+		}
+		self.drop_live_run(slab_id);
+	}
+
+	/// Any state but Live keeps its own lifecycle, as in the durable half.
+	pub(super) fn drop_live_run(&self, slab_id: SlabId) {
+		let mut manifest = recover_rwlock_write(&self.compaction_manifest, "compaction_manifest");
+		if !manifest
+			.get_run(slab_id)
+			.is_some_and(|run| run.state.is_live())
+		{
+			return;
+		}
+		manifest.remove_run(slab_id);
+		let snapshot = manifest.snapshot();
+		drop(manifest);
+		refresh_lsm_level_metrics(&snapshot);
 	}
 
 	/// Apply a snapshot-authorized retirement, or leave it for a newer snapshot.
@@ -1583,6 +1634,7 @@ impl SlabManager {
 			state.hot_read_counts.remove(&slab_id);
 			state.rehydrating.remove(&slab_id);
 		}
+		self.drop_retired_live_run(slab_id).await;
 		self.retired_tier_slabs.insert(slab_id);
 		self.unapplied_tier_pointers.remove(&slab_id);
 		self.unverified_tier_slabs.remove(&slab_id);

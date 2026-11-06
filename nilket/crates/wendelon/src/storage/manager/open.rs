@@ -819,6 +819,7 @@ impl SlabManager {
 		let counter_unsupported = DashSet::new();
 		let mut persistent_key_localities: Vec<(TenantId, Identity, Locality)> = Vec::new();
 		let mut recovered_lsm_runs: Vec<LsmRunSummary> = Vec::new();
+		let mut lsm_manifest_epoch_floor = ManifestEpoch::ZERO;
 		let recovered_control_index = snapshot
 			.as_ref()
 			.and_then(|snapshot| snapshot.last_control_log_index);
@@ -875,6 +876,46 @@ impl SlabManager {
 			}
 			persistent_key_localities.extend(snapshot.record_localities);
 			recovered_lsm_runs = snapshot.lsm_runs;
+			lsm_manifest_epoch_floor = snapshot.lsm_manifest_epoch_floor;
+			if let Some(index) = &persistent_index {
+				// Runs from before retirements disposed of theirs. A published retirement
+				// authorizes this, never a missing file, and a run an unresolved install
+				// names stays for that install to resolve.
+				let named = snapshot
+					.lsm_install_intents
+					.iter()
+					.flat_map(|intent| {
+						let commit = &intent.commit;
+						commit
+							.slabs_to_retire
+							.iter()
+							.copied()
+							.chain(commit.slabs_to_add.iter().map(|run| run.slab_id))
+					})
+					.collect::<BTreeSet<_>>();
+				let remnants = recovered_lsm_runs
+					.iter()
+					.filter(|run| {
+						run.state.is_live()
+							&& snapshot.retired_tiered_slabs.contains(&run.slab_id)
+							&& !named.contains(&run.slab_id)
+					})
+					.map(|run| run.slab_id)
+					.collect::<Vec<_>>();
+				let disposed = index.dispose_retirement_remnants(remnants).await?;
+				if !disposed.is_empty() {
+					tracing::warn!(
+						runs = disposed.len(),
+						"removed Live runs of slabs whose tier retirement left them behind"
+					);
+				}
+				for run in &recovered_lsm_runs {
+					if disposed.contains(&run.slab_id) {
+						lsm_manifest_epoch_floor = lsm_manifest_epoch_floor.max(run.manifest_epoch);
+					}
+				}
+				recovered_lsm_runs.retain(|run| !disposed.contains(&run.slab_id));
+			}
 		}
 		let counter_eligible =
 			Self::recover_counter_eligible(&active, &sealed, &counter_unsupported, &key_index);
@@ -913,9 +954,10 @@ impl SlabManager {
 			.iter()
 			.map(|run| run.manifest_epoch)
 			.max()
-			.unwrap_or(ManifestEpoch::ZERO);
+			.unwrap_or(ManifestEpoch::ZERO)
+			.max(lsm_manifest_epoch_floor);
 		let mut compaction_manifest = if recovered_lsm_runs.is_empty() {
-			CompactionManifest::new(ManifestEpoch::ZERO)
+			CompactionManifest::new(recovered_manifest_epoch)
 		} else {
 			CompactionManifest::from_recovered_runs(recovered_manifest_epoch, recovered_lsm_runs)
 		};
@@ -928,6 +970,27 @@ impl SlabManager {
 					compaction_manifest.manifest_epoch(),
 				));
 			}
+		}
+		// A run nothing backs fails every plan that names it. With no retirement record to
+		// authorize removing it, it stays, and this says so.
+		let backless = compaction_manifest
+			.snapshot()
+			.runs()
+			.iter()
+			.filter(|run| {
+				run.state.is_live()
+					&& !sealed.contains_key(&run.slab_id)
+					&& active.slab_id() != run.slab_id
+					&& !tier_pointer_ids.contains(&run.slab_id)
+			})
+			.map(|run| run.slab_id)
+			.collect::<Vec<_>>();
+		if !backless.is_empty() {
+			tracing::warn!(
+				runs = backless.len(),
+				first = ?backless.first(),
+				"Live runs with no backing and no retirement evidence block LSM compaction"
+			);
 		}
 
 		// ADR 0097 decision 4: admission truth is hydrated ONCE, before the manager

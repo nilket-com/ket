@@ -1413,7 +1413,18 @@ impl SlabManager {
 		.await?;
 		lsm_driver::cleanup_lsm_compaction_tmp_files(self.file_ops.as_ref(), &self.config.dir)
 			.await?;
-		let durable = self.require_op_index()?.load_snapshot().await?;
+		// Every install has resolved here, so a run a retirement left for one is finished before
+		// anything takes a Live row to mean live storage.
+		let index = self.require_op_index()?;
+		let held = index.load_snapshot().await?;
+		for run in held
+			.lsm_runs
+			.iter()
+			.filter(|run| run.state.is_live() && held.retired_tiered_slabs.contains(&run.slab_id))
+		{
+			self.finish_retirement_remnant(run.slab_id).await;
+		}
+		let durable = index.load_snapshot().await?;
 		#[cfg(test)]
 		self.pause_deferred_open_stage_for_test(1).await;
 		self.load_unopened_live_runs(&durable).await?;
