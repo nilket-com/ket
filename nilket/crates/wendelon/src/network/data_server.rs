@@ -8562,8 +8562,10 @@ impl WendelonDataServer {
 					#[cfg(test)]
 					append_hooks.before_append().await?;
 
-					slab.append_durable(tenant_id, key_identity, commit_hlc, bytes.as_slice())
-						.await
+					write_replication::append_waiting_out_a_refusal(&slab, || {
+						slab.append_durable(tenant_id, key_identity, commit_hlc, bytes.as_slice())
+					})
+					.await
 				})))
 			} else {
 				None

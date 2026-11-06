@@ -59,11 +59,46 @@ pub(crate) struct EmptyKeyRemovalPause {
 }
 
 impl SlabManager {
-	/// Refuse the `(skip+1)`th append from now at its head, as readiness would.
+	/// Refuse every append from the `(skip+1)`th on at its head, as readiness would, until cleared.
 	pub(crate) fn refuse_append_after_for_test(&self, skip: u64) {
 		self.continuity_test_holds
 			.append_refusal_after
 			.store(skip + 1, Ordering::Release);
+	}
+
+	pub(super) fn note_append_refusal_for_test(&self) {
+		let holds = &self.continuity_test_holds;
+		holds.append_refusals_seen.fetch_add(1, Ordering::AcqRel);
+		holds.append_refusal_seen.notify_waiters();
+	}
+
+	/// Until an append has actually returned the proof-carrying refusal.
+	pub(crate) async fn append_refusal_for_test(&self) {
+		let holds = &self.continuity_test_holds;
+		loop {
+			let seen = holds.append_refusal_seen.notified();
+			tokio::pin!(seen);
+			seen.as_mut().enable();
+			if holds.append_refusals_seen.load(Ordering::Acquire) > 0 {
+				return;
+			}
+			seen.await;
+		}
+	}
+
+	pub(crate) fn clear_append_refusal_for_test(&self) {
+		self.continuity_test_holds
+			.append_refusal_after
+			.store(0, Ordering::Release);
+	}
+
+	/// Raise and clear the real store-wide fence a tier retirement holds.
+	pub(crate) fn raise_retirement_fence_for_test(&self, slab_id: SlabId) {
+		self.tier_authority.mark_retirement(slab_id, Some(1));
+	}
+
+	pub(crate) fn clear_retirement_fence_for_test(&self, slab_id: SlabId) {
+		self.tier_authority.clear_retirement(slab_id, Some(1));
 	}
 
 	/// A refusal that does not clear by itself, as an unresolved operation's fence is.
@@ -77,8 +112,9 @@ impl SlabManager {
 		self.continuity_test_holds
 			.append_refusal_after
 			.fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
-				left.checked_sub(1)
-			}) == Ok(1)
+				(left > 1).then(|| left - 1)
+			})
+			.is_err_and(|left| left == 1)
 	}
 
 	/// Shared acceptance assertions for a fully applied retirement. Pending
@@ -493,6 +529,9 @@ pub(super) struct TestHolds {
 	/// Fails the next read of what a recovered publication left.
 	pub(super) fail_publication_readback: std::sync::atomic::AtomicBool,
 	pub(super) append_refusal_after: std::sync::atomic::AtomicU64,
+	/// Appends that returned the proof-carrying refusal, and a wake-up for whoever awaits one.
+	pub(super) append_refusals_seen: std::sync::atomic::AtomicU64,
+	pub(super) append_refusal_seen: tokio::sync::Notify,
 	/// Parks a deferred open at one named stage, for a process death there.
 	pub(super) deferred_open_stage_hold:
 		std::sync::Mutex<Option<(u8, Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>>,

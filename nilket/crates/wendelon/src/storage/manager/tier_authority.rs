@@ -1725,11 +1725,18 @@ impl SlabManager {
 		};
 		answer.map_err(|cause| {
 			if self.append_refusal_clears_by_itself() {
+				#[cfg(test)]
+				self.note_append_refusal_for_test();
 				Error::new(cause.kind(), AppendRefusedBeforeEffects(cause))
 			} else {
 				cause
 			}
 		})
+	}
+
+	/// Until the authority next changes, or `max` passes: never a claim that it is ready.
+	pub(crate) async fn tier_authority_change_within(&self, max: Duration) {
+		let _ = tokio::time::timeout(max, self.tier_authority.changed.notified()).await;
 	}
 
 	fn append_refusal_clears_by_itself(&self) -> bool {

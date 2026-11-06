@@ -593,6 +593,43 @@ pub(super) async fn append_bifurcated_table_children_durable(
 	.await
 }
 
+/// How long one append waits out a refusal that clears by itself. Routine tier retirement raises a
+/// store-wide fence for a moment, so a write that meets it should wait, not fail. Bounded so that a
+/// fence which does not clear, or which is waiting on this very write, still ends in its answer.
+#[cfg(not(test))]
+const APPEND_REFUSAL_WAIT: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const APPEND_REFUSAL_WAIT: Duration = Duration::from_millis(1_000);
+/// A missed wake-up costs this much, and no more.
+const APPEND_REFUSAL_RECHECK: Duration = Duration::from_millis(50);
+
+/// Attempt one append until admitted or out of time. A refused attempt has done nothing, so trying
+/// the same append again is the same append: nothing is partly applied, and the client sees no
+/// retry. Any other outcome returns at once. The last refusal is returned as it came.
+pub(super) async fn append_waiting_out_a_refusal<T, F, Fut>(
+	slab: &SlabManager,
+	mut append: F,
+) -> std::io::Result<T>
+where
+	F: FnMut() -> Fut,
+	Fut: std::future::Future<Output = std::io::Result<T>>,
+{
+	let deadline = tokio::time::Instant::now() + APPEND_REFUSAL_WAIT;
+	loop {
+		let attempt = append().await;
+		let refused = attempt
+			.as_ref()
+			.err()
+			.is_some_and(crate::storage::manager::tier_authority::append_refused_before_effects);
+		let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+		if !refused || left.is_zero() {
+			return attempt;
+		}
+		slab.tier_authority_change_within(left.min(APPEND_REFUSAL_RECHECK))
+			.await;
+	}
+}
+
 /// One proof-carrying refusal must not outlive its proof: once an earlier child of this mutation
 /// is durable, a later child's refusal no longer shows the mutation did nothing here, so it is
 /// handed on as a plain failure, on the conservative path, until a retry of a partly applied
@@ -617,14 +654,15 @@ pub(super) async fn append_table_children_tracking_effects(
 		let decoded = decode_batch(child.frame_bytes.as_slice())?;
 		if has_storage_synthetic_columns(&decoded) {
 			let entries = storage_index_entries_from_batch(&decoded)?;
-			let base_location = slab
-				.append_durable_multirow_with_locality(
+			let base_location = append_waiting_out_a_refusal(slab, || {
+				slab.append_durable_multirow_with_locality(
 					tenant_id,
 					child.frame_bytes.as_slice(),
 					&entries,
 				)
-				.await
-				.map_err(proof)?;
+			})
+			.await
+			.map_err(proof)?;
 			*wrote_a_child = true;
 			append_secondary_index_active_buffers_for_storage_batch(
 				slab,
@@ -636,16 +674,17 @@ pub(super) async fn append_table_children_tracking_effects(
 			.await;
 			metrics().observe_storage_multirow_record_written(entries.len() as u64);
 		} else {
-			let location = slab
-				.append_durable_with_locality(
+			let location = append_waiting_out_a_refusal(slab, || {
+				slab.append_durable_with_locality(
 					tenant_id,
 					child.key_identity,
 					child.locality,
 					commit_hlc,
 					child.frame_bytes.as_slice(),
 				)
-				.await
-				.map_err(proof)?;
+			})
+			.await
+			.map_err(proof)?;
 			*wrote_a_child = true;
 			append_secondary_index_active_buffers_for_single_row(
 				slab,

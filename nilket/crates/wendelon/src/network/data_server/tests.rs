@@ -18287,6 +18287,7 @@ async fn a_readiness_refusal_of_a_kv_append_does_not_fence_the_node() {
 	assert_eq!(refused.status, WriteStatus::INTERNAL_ERROR);
 	assert_eq!(node.slab.local_l1_bytes().await, before, "it wrote nothing");
 	assert_not_fenced(&node, &dir, "kv").await;
+	node.slab.clear_append_refusal_for_test();
 	let mut next = simple_write_meta(1);
 	next.write_id.sequence_no = 2;
 	next.client_hlc = hlc(2, 0, 0);
@@ -18318,6 +18319,7 @@ async fn a_readiness_refusal_of_a_tables_first_child_does_not_fence_the_node() {
 	assert_eq!(refused.write.status, WriteStatus::INTERNAL_ERROR);
 	assert_eq!(node.slab.local_l1_bytes().await, before, "it wrote nothing");
 	assert_not_fenced(&node, &dir, "first child").await;
+	node.slab.clear_append_refusal_for_test();
 	let (retried, _) = node.data_server.table_write(meta, batch).await.unwrap();
 	assert_eq!(retried.write.status, WriteStatus::OK, "{retried:?}");
 	assert_not_fenced(&node, &dir, "retried").await;
@@ -18377,5 +18379,73 @@ async fn a_refusal_that_will_not_clear_by_itself_still_fences() {
 		node.data_server.degraded_reason().as_deref(),
 		Some(LOCAL_PERSISTENCE_DISTRUST_REASON)
 	);
+	shutdown_lease_node(node).await;
+}
+
+/// DC-175, RED first: routine tier retirement raises a store-wide fence for a moment. A table
+/// write that meets it waits it out, on the real fence, and the client sees a success.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_table_write_waits_out_a_retirement_fence() {
+	let (dir, node) = leading_node_for_refusals("dc175-wait").await;
+	let descriptor = typed_table_descriptor();
+	let batch = typed_table_batch(vec![7, 8]);
+	let mut meta = typed_table_meta(&descriptor, batch.num_rows());
+	meta.parent_write_id.sequence_no = 57;
+	meta.await_finalization = 1;
+	let slab = SlabId::new(0x7700);
+	let before = node.slab.local_l1_bytes().await;
+	node.slab.raise_retirement_fence_for_test(slab);
+	let write = {
+		let server = node.data_server.clone();
+		tokio::spawn(async move { server.table_write(meta, batch).await })
+	};
+	tokio::time::timeout(Duration::from_secs(30), node.slab.append_refusal_for_test())
+		.await
+		.expect("the fence actually refused it");
+	assert!(!write.is_finished(), "it waits while the fence stands");
+	assert_eq!(
+		node.slab.local_l1_bytes().await,
+		before,
+		"premise: nothing yet"
+	);
+	node.slab.clear_retirement_fence_for_test(slab);
+	let (written, _) = tokio::time::timeout(Duration::from_secs(10), write)
+		.await
+		.expect("the fence cleared")
+		.unwrap()
+		.unwrap();
+	assert_eq!(written.write.status, WriteStatus::OK, "{written:?}");
+	assert_not_fenced(&node, &dir, "waited out").await;
+	shutdown_lease_node(node).await;
+}
+
+/// The same wait, for the refusal the conservative path used to meet: its first child durable,
+/// its second refused for a moment. The mutation carries on, with nothing left partly applied.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refusal_after_a_durable_child_is_waited_out_when_it_clears() {
+	let (dir, node) = leading_node_for_refusals("dc175-partial").await;
+	let descriptor = typed_table_descriptor();
+	let batch = typed_table_batch(vec![7, 8]);
+	let mut meta = typed_table_meta(&descriptor, batch.num_rows());
+	meta.parent_write_id.sequence_no = 58;
+	meta.await_finalization = 1;
+	let before = node.slab.local_l1_bytes().await;
+	node.slab.refuse_append_after_for_test(1);
+	let write = {
+		let server = node.data_server.clone();
+		tokio::spawn(async move { server.table_write(meta, batch).await })
+	};
+	tokio::time::timeout(Duration::from_secs(30), node.slab.append_refusal_for_test())
+		.await
+		.expect("its second child was actually refused");
+	assert!(
+		node.slab.local_l1_bytes().await > before,
+		"premise: its first child is durable"
+	);
+	assert!(!write.is_finished(), "it waits at its second child");
+	node.slab.clear_append_refusal_for_test();
+	let (written, _) = write.await.unwrap().unwrap();
+	assert_eq!(written.write.status, WriteStatus::OK, "{written:?}");
+	assert_not_fenced(&node, &dir, "second child").await;
 	shutdown_lease_node(node).await;
 }
