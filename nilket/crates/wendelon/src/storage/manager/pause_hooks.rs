@@ -59,6 +59,28 @@ pub(crate) struct EmptyKeyRemovalPause {
 }
 
 impl SlabManager {
+	/// Refuse the `(skip+1)`th append from now at its head, as readiness would.
+	pub(crate) fn refuse_append_after_for_test(&self, skip: u64) {
+		self.continuity_test_holds
+			.append_refusal_after
+			.store(skip + 1, Ordering::Release);
+	}
+
+	/// A refusal that does not clear by itself, as an unresolved operation's fence is.
+	pub(crate) fn fence_unresolved_op_for_test(&self) {
+		self.tier_authority
+			.unresolved_op_fence
+			.store(true, Ordering::Release);
+	}
+
+	pub(super) fn take_append_refusal_for_test(&self) -> bool {
+		self.continuity_test_holds
+			.append_refusal_after
+			.fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+				left.checked_sub(1)
+			}) == Ok(1)
+	}
+
 	/// Shared acceptance assertions for a fully applied retirement. Pending
 	/// retirement controls keep their separate fence/drain assertions.
 	pub(crate) async fn assert_retirement_completed_for_test(
@@ -470,6 +492,7 @@ pub(super) struct TestHolds {
 		std::sync::Mutex<Option<(Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>>,
 	/// Fails the next read of what a recovered publication left.
 	pub(super) fail_publication_readback: std::sync::atomic::AtomicBool,
+	pub(super) append_refusal_after: std::sync::atomic::AtomicU64,
 	/// Parks a deferred open at one named stage, for a process death there.
 	pub(super) deferred_open_stage_hold:
 		std::sync::Mutex<Option<(u8, Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>>,

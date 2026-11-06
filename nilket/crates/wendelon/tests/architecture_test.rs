@@ -11397,6 +11397,17 @@ fn snapshot_lease_scopes_exclude_remote_io_and_backoff() {
 			assert!(!body.contains(remote), "{stage}: {remote}");
 		}
 	}
+	// DC-158: the tier stats build decodes a whole slab, off the runtime's workers.
+	let sweeper_source = fs::read_to_string(root.join("src/storage/sweeper.rs")).unwrap();
+	let stats_stage = sweeper_source
+		.split("async fn encrypt_tiered_object_blob_with_current_stats(")
+		.nth(1)
+		.and_then(|rest| rest.split("\n\t}\n").next())
+		.expect("the stats stage");
+	assert!(
+		stats_stage.contains("cpu_bound_off_the_runtime_worker"),
+		"the stats build must not hold a runtime worker"
+	);
 	// A reservation's local stages hold it across local files and redb only, and a
 	// burn and a refusal ask the ring first and hold it only after.
 	let reservations =

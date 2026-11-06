@@ -6743,6 +6743,201 @@ async fn encrypt_tiered_object_blob_with_table_stats_builds_decryptable_csb() {
 	);
 }
 
+// DC-159 RED (decode count). The tier column-stats builder must decode each
+// physical multirow frame at most once per stats build. Today
+// `build_tiered_column_stats_block` decodes the whole frame once per
+// logical row, so its scoped decode count equals the slab's row count.
+//
+// Scope of the counter: `DecodeCountGuard` counts calls to
+// `crate::storage::multirow::decode_batch` (the `decode_record_batch` the
+// builder uses) on this thread only. The builder's own recovery walk
+// (`recover_slab_entries_from_blob`) decodes through core's
+// `decode_recovery_batch`, which this counter does not see, so the bound
+// for the scoped stats decode is the number of physical frames.
+
+/// An AppendOnly typed table whose MultiRow layout admits
+/// `rows_per_frame` rows in one record, with LZ4 record bodies as on the
+/// measured workload.
+fn tier_stats_decode_descriptor(
+	table_object_id: TableObjectId,
+	rows_per_frame: u32,
+) -> TableSchemaDescriptor {
+	let schema = Schema::new(vec![
+		Field::new("id", DataType::Int64, false),
+		Field::new("region", DataType::LargeUtf8, true),
+	]);
+	let mut descriptor = TableSchemaDescriptor::new_with_layout(
+		table_object_id,
+		1,
+		"analytics",
+		"tier_stats_decode",
+		&schema,
+		RowIdentityPolicy::AppendOnly,
+		LocalityPolicy::default_table_spread(),
+		RecordLayoutPolicy::MultiRow(
+			MultiRowLayoutDescriptor::new(rows_per_frame, rows_per_frame, 1024 * 1024).unwrap(),
+		),
+		SchemaEvolutionPolicy::AdditiveOnly,
+	)
+	.unwrap();
+	descriptor.record_body_compression_policy = RecordBodyCompressionPolicy::Lz4Frame;
+	descriptor.refresh_descriptor_fingerprints().unwrap();
+	descriptor.validate().unwrap();
+	descriptor
+}
+
+fn tier_stats_decode_batch(frame: usize, rows_per_frame: usize) -> RecordBatch {
+	let ids = (0..rows_per_frame)
+		.map(|row| Some((frame * rows_per_frame + row) as i64))
+		.collect::<Vec<_>>();
+	let regions = (0..rows_per_frame)
+		.map(|row| Some(format!("region-{:02}", (frame * rows_per_frame + row) % 7)))
+		.collect::<Vec<_>>();
+	RecordBatch::try_new(
+		Arc::new(Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("region", DataType::LargeUtf8, true),
+		])),
+		vec![
+			Arc::new(Int64Array::from(ids)) as Arc<dyn Array>,
+			Arc::new(LargeStringArray::from(regions)) as Arc<dyn Array>,
+		],
+	)
+	.unwrap()
+}
+
+/// Writes `frames` physical multirow frames of `rows_per_frame` rows each
+/// through the real admission + packing path into one sealed slab, builds
+/// the slab's column stats, and returns the scoped
+/// `multirow::decode_batch` count of the stats build alone.
+async fn tier_stats_build_decode_count(frames: usize, rows_per_frame: usize) -> usize {
+	let (_mgr_dir, mgr) = fresh_manager().await;
+	let descriptor = tier_stats_decode_descriptor(
+		TableObjectId::new([0xD1; 16]),
+		u32::try_from(rows_per_frame).unwrap(),
+	);
+	for frame in 0..frames {
+		let batch = tier_stats_decode_batch(frame, rows_per_frame);
+		let meta = layout_recluster_meta(&descriptor, batch.num_rows());
+		// A distinct commit HLC per request keeps the synthesized
+		// AppendOnly identities distinct across frames.
+		let packed = pack_record_batch_by_bucket(
+			&meta,
+			&descriptor,
+			&batch,
+			WriterNodeId::ZERO,
+			hlc(10_000 + 1_000 * frame as u64),
+		)
+		.unwrap();
+		assert_eq!(
+			packed.len(),
+			1,
+			"one request must pack into exactly one physical frame"
+		);
+		assert_eq!(packed[0].source_row_indices.len(), rows_per_frame);
+		let entries = storage_multirow_index_entries_from_frame(&packed[0].frame_bytes)
+			.unwrap()
+			.expect("typed multirow frame exposes per-row entries");
+		assert_eq!(entries.len(), rows_per_frame);
+		mgr.append_durable_multirow_with_locality(tenant(), &packed[0].frame_bytes, &entries)
+			.await
+			.unwrap();
+	}
+	let slab_id = force_seal_active(&mgr).await;
+	let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
+	let mut catalog = TableSchemaCatalog::default();
+	catalog.upsert(tenant(), descriptor.clone()).unwrap();
+	let acknowledged = mgr.acknowledged_offsets_in_slab(slab_id);
+	let total_rows = frames * rows_per_frame;
+
+	// Preconditions, outside the counted scope: the sealed slab holds every
+	// logical row, live, in exactly `frames` distinct physical frames.
+	let recovered = recover_slab_entries_from_blob(&raw, slab_id, &acknowledged).unwrap();
+	assert_eq!(recovered.len(), total_rows);
+	assert!(
+		recovered
+			.iter()
+			.all(|entry| entry.is_arrow_frame && !entry.location.is_tombstone)
+	);
+	let physical_frames = recovered
+		.iter()
+		.map(|entry| entry.location.offset)
+		.collect::<BTreeSet<_>>();
+	assert_eq!(physical_frames.len(), frames);
+
+	// Counted scope: the synchronous stats builder only.
+	let decode_guard = crate::storage::multirow::DecodeCountGuard::start();
+	let built =
+		mgr.build_tiered_column_stats_block(&raw, slab_id, tenant(), &catalog, &acknowledged);
+	let stats_decodes = decode_guard.finish();
+
+	// The build must succeed with a real stats block covering every row, so
+	// descriptor rejection or row skipping cannot make the count pass.
+	let block = built
+		.unwrap()
+		.expect("typed multirow slab must build column stats");
+	let crate::crypto::TieredColumnStatsBlock::Plaintext {
+		plaintext,
+		schema_generation,
+		column_count,
+		..
+	} = block
+	else {
+		panic!("the builder returns a plaintext stats block");
+	};
+	assert_eq!(schema_generation, descriptor.schema_generation);
+	assert!(column_count >= 1);
+	let parsed = parse_column_stats_block(&plaintext).unwrap();
+	assert_eq!(parsed.header.table_object_id, descriptor.table_object_id);
+	assert_eq!(parsed.header.row_count, total_rows as u64);
+
+	// The production entry point agrees: a stats locator is published.
+	let encrypted = mgr
+		.encrypt_tiered_object_blob_with_table_stats(slab_id, &raw, &catalog)
+		.unwrap();
+	assert!(encrypted.stats_locator.is_some());
+
+	// Scope sanity: the counter observed the builder. A fix that moves the
+	// stats decode to another decoder must move this counter with it.
+	assert_ne!(
+		stats_decodes, 0,
+		"the scoped counter must observe the stats build"
+	);
+	stats_decodes
+}
+
+#[tokio::test]
+async fn tier_stats_build_decodes_single_row_frames_once_each() {
+	// Control: with one row per frame, rows == frames, so the per-row decode
+	// already meets the bound. Expected to PASS before and after a fix.
+	let frames = 2;
+	let decodes = tier_stats_build_decode_count(frames, 1).await;
+	assert!(
+		decodes <= frames,
+		"stats build decoded {decodes} times for {frames} single-row frames"
+	);
+}
+
+#[tokio::test]
+async fn tier_stats_build_decodes_each_64_row_frame_at_most_once() {
+	let frames = 2;
+	let decodes = tier_stats_build_decode_count(frames, 64).await;
+	assert!(
+		decodes <= frames,
+		"stats build decoded {decodes} times for {frames} physical frames of 64 rows"
+	);
+}
+
+#[tokio::test]
+async fn tier_stats_build_decodes_each_256_row_frame_at_most_once() {
+	let frames = 2;
+	let decodes = tier_stats_build_decode_count(frames, 256).await;
+	assert!(
+		decodes <= frames,
+		"stats build decoded {decodes} times for {frames} physical frames of 256 rows"
+	);
+}
+
 #[tokio::test]
 async fn table_stats_are_stable_across_record_body_compression() {
 	let schema = Arc::new(Schema::new(vec![
@@ -60846,4 +61041,32 @@ async fn retained_versions_read_after_a_deferred_open_and_a_reopen() {
 		drop(fresh);
 		let _ = next.close(Duration::from_secs(2)).await;
 	}
+}
+
+/// DC-158: on a runtime with one worker, a task inside this helper is blocked until a task queued
+/// behind it runs. That only happens if the worker really is handed over.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn cpu_bound_work_does_not_hold_the_runtime_worker() {
+	let blocked = tokio::spawn(async {
+		let (release, released) = std::sync::mpsc::channel();
+		tokio::spawn(async move {
+			release.send(()).unwrap();
+		});
+		crate::storage::sweeper::cpu_bound_off_the_runtime_worker(|| {
+			released.recv_timeout(Duration::from_secs(20))
+		})
+	});
+	blocked
+		.await
+		.unwrap()
+		.expect("the task queued behind it ran while the work was blocked");
+}
+
+/// A current-thread runtime has no worker to hand over, and must not panic for lacking one.
+#[tokio::test]
+async fn cpu_bound_work_just_runs_on_a_current_thread_runtime() {
+	assert_eq!(
+		crate::storage::sweeper::cpu_bound_off_the_runtime_worker(|| 7),
+		7
+	);
 }

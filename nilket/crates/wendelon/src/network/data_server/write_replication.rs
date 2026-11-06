@@ -572,3 +572,92 @@ impl WendelonDataServer {
 		}).await
 	}
 }
+
+#[cfg(test)]
+pub(super) async fn append_bifurcated_table_children_durable(
+	slab: &SlabManager,
+	tenant_id: TenantId,
+	commit_hlc: HybridTimestamp,
+	children: &[BifurcatedTableChildWrite],
+	secondary_index_descriptors: &[SecondaryIndexDescriptor],
+) -> std::io::Result<()> {
+	let mut wrote_a_child = false;
+	append_table_children_tracking_effects(
+		slab,
+		tenant_id,
+		commit_hlc,
+		children,
+		secondary_index_descriptors,
+		&mut wrote_a_child,
+	)
+	.await
+}
+
+/// One proof-carrying refusal must not outlive its proof: once an earlier child of this mutation
+/// is durable, a later child's refusal no longer shows the mutation did nothing here, so it is
+/// handed on as a plain failure, on the conservative path, until a retry of a partly applied
+/// mutation is shown safe.
+pub(super) async fn append_table_children_tracking_effects(
+	slab: &SlabManager,
+	tenant_id: TenantId,
+	commit_hlc: HybridTimestamp,
+	children: &[BifurcatedTableChildWrite],
+	secondary_index_descriptors: &[SecondaryIndexDescriptor],
+	wrote_a_child: &mut bool,
+) -> std::io::Result<()> {
+	for child in children {
+		let earlier_child = *wrote_a_child;
+		let proof = move |error: std::io::Error| {
+			if earlier_child {
+				crate::storage::manager::tier_authority::without_before_effects_proof(error)
+			} else {
+				error
+			}
+		};
+		let decoded = decode_batch(child.frame_bytes.as_slice())?;
+		if has_storage_synthetic_columns(&decoded) {
+			let entries = storage_index_entries_from_batch(&decoded)?;
+			let base_location = slab
+				.append_durable_multirow_with_locality(
+					tenant_id,
+					child.frame_bytes.as_slice(),
+					&entries,
+				)
+				.await
+				.map_err(proof)?;
+			*wrote_a_child = true;
+			append_secondary_index_active_buffers_for_storage_batch(
+				slab,
+				tenant_id,
+				secondary_index_descriptors,
+				&decoded,
+				base_location,
+			)
+			.await;
+			metrics().observe_storage_multirow_record_written(entries.len() as u64);
+		} else {
+			let location = slab
+				.append_durable_with_locality(
+					tenant_id,
+					child.key_identity,
+					child.locality,
+					commit_hlc,
+					child.frame_bytes.as_slice(),
+				)
+				.await
+				.map_err(proof)?;
+			*wrote_a_child = true;
+			append_secondary_index_active_buffers_for_single_row(
+				slab,
+				tenant_id,
+				secondary_index_descriptors,
+				&decoded,
+				child.key_identity,
+				commit_hlc,
+				location,
+			)
+			.await;
+		}
+	}
+	Ok(())
+}

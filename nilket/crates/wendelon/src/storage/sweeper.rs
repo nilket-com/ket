@@ -310,6 +310,16 @@ fn op_anomaly(message: String) -> std::io::Error {
 	std::io::Error::new(std::io::ErrorKind::WouldBlock, OpReceiptAnomaly(message))
 }
 
+/// Run work that decodes a whole slab without holding a runtime worker: everything queued behind
+/// that worker would wait, writes included. A current-thread runtime has no other worker to hand
+/// its tasks to, so there it just runs.
+pub(crate) fn cpu_bound_off_the_runtime_worker<T>(work: impl FnOnce() -> T) -> T {
+	match tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor()) {
+		Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(work),
+		_ => work(),
+	}
+}
+
 /// The state machine pruned this operation's outcome: it is at or below its owner's
 /// acknowledged prefix. Not a decision, and nothing was applied by asking.
 #[derive(Debug)]
@@ -1228,11 +1238,13 @@ impl SlabSweeper {
 		plaintext_blob: &[u8],
 	) -> std::io::Result<crate::crypto::EncryptedTieredSlab> {
 		let snapshot = self.state_machine.state_snapshot().await;
-		self.slab.encrypt_tiered_object_blob_with_table_stats(
-			slab_id,
-			plaintext_blob,
-			&snapshot.table_schemas,
-		)
+		cpu_bound_off_the_runtime_worker(|| {
+			self.slab.encrypt_tiered_object_blob_with_table_stats(
+				slab_id,
+				plaintext_blob,
+				&snapshot.table_schemas,
+			)
+		})
 	}
 
 	async fn rewrite_plaintext_tiered_slabs_once(

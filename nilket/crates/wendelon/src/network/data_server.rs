@@ -209,6 +209,9 @@ mod table_query;
 use table_query::{QueryProjectedExecution, RowGroupFetchAuditCounters};
 mod observation;
 mod write_replication;
+#[cfg(test)]
+use write_replication::append_bifurcated_table_children_durable;
+use write_replication::append_table_children_tracking_effects;
 use write_replication::{DurableQuorumTracker, PendingFinalizationClaims, WriteOutcome};
 mod descriptor_migration;
 mod query_clocks;
@@ -2397,6 +2400,17 @@ impl WendelonDataServer {
 	) -> std::io::Result<()> {
 		let path = self.local_persistence_distrust_path.clone();
 		ownership::write_distrust_marker(self._directory_owner.as_ref(), path, detail).await
+	}
+
+	/// A refusal proven to precede every local effect of this write says nothing about local
+	/// persistence. The answer the client gets is unchanged: its remote legs were already running,
+	/// so the outcome stays indeterminate, and it keeps its existing retry rules.
+	async fn answer_refused_or_trip_distrust(&self, error: &std::io::Error, detail: String) {
+		if crate::storage::manager::tier_authority::append_refused_before_effects(error) {
+			tracing::warn!(%error, "a local append was refused before any local effect; no distrust");
+			return;
+		}
+		self.trip_local_persistence_distrust(detail).await;
 	}
 
 	async fn trip_local_persistence_distrust(&self, detail: impl Into<String>) {
@@ -8592,9 +8606,10 @@ impl WendelonDataServer {
 							quorum_tracker.note_local_durable();
 						}
 						Some(Ok(Err(err))) => {
-							self.trip_local_persistence_distrust(format!(
-								"local durable append returned error: {err}"
-							))
+							self.answer_refused_or_trip_distrust(
+								&err,
+								format!("local durable append returned error: {err}"),
+							)
 							.await;
 							return Ok(self.fenced_write_response(&meta).await);
 						}
@@ -8962,13 +8977,15 @@ impl WendelonDataServer {
 				#[cfg(test)]
 				append_hooks.before_append().await?;
 
+				let mut wrote_a_child = false;
 				for (index, children) in local_groups {
-					append_bifurcated_table_children_durable(
+					append_table_children_tracking_effects(
 						&slab,
 						tenant_id,
 						commit_hlc,
 						&children,
 						&secondary_index_descriptors,
+						&mut wrote_a_child,
 					)
 					.await?;
 					let _ = local_progress_tx.send(index);
@@ -9047,9 +9064,10 @@ impl WendelonDataServer {
 					match local_done {
 						Some(Ok(Ok(()))) => {}
 						Some(Ok(Err(err))) => {
-							self.trip_local_persistence_distrust(format!(
-								"local table durable append returned error: {err}"
-							))
+							self.answer_refused_or_trip_distrust(
+								&err,
+								format!("local table durable append returned error: {err}"),
+							)
 							.await;
 							return Ok(self.fenced_write_response(&synthetic).await);
 						}
@@ -15540,58 +15558,6 @@ fn validate_table_replica_payload(
 			ErrorKind::InvalidData,
 			"table replica group payload hash mismatch",
 		));
-	}
-	Ok(())
-}
-
-async fn append_bifurcated_table_children_durable(
-	slab: &SlabManager,
-	tenant_id: TenantId,
-	commit_hlc: HybridTimestamp,
-	children: &[BifurcatedTableChildWrite],
-	secondary_index_descriptors: &[SecondaryIndexDescriptor],
-) -> std::io::Result<()> {
-	for child in children {
-		let decoded = decode_batch(child.frame_bytes.as_slice())?;
-		if has_storage_synthetic_columns(&decoded) {
-			let entries = storage_index_entries_from_batch(&decoded)?;
-			let base_location = slab
-				.append_durable_multirow_with_locality(
-					tenant_id,
-					child.frame_bytes.as_slice(),
-					&entries,
-				)
-				.await?;
-			append_secondary_index_active_buffers_for_storage_batch(
-				slab,
-				tenant_id,
-				secondary_index_descriptors,
-				&decoded,
-				base_location,
-			)
-			.await;
-			metrics().observe_storage_multirow_record_written(entries.len() as u64);
-		} else {
-			let location = slab
-				.append_durable_with_locality(
-					tenant_id,
-					child.key_identity,
-					child.locality,
-					commit_hlc,
-					child.frame_bytes.as_slice(),
-				)
-				.await?;
-			append_secondary_index_active_buffers_for_single_row(
-				slab,
-				tenant_id,
-				secondary_index_descriptors,
-				&decoded,
-				child.key_identity,
-				commit_hlc,
-				location,
-			)
-			.await;
-		}
 	}
 	Ok(())
 }

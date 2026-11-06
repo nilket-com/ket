@@ -1453,6 +1453,38 @@ impl TierAuthority {
 	}
 }
 
+/// A retryable readiness refusal at the head of an append, which therefore wrote nothing. This
+/// says nothing about any other child of the same mutation, or its remote legs.
+#[derive(Debug)]
+pub(crate) struct AppendRefusedBeforeEffects(Error);
+impl AppendRefusedBeforeEffects {
+	pub(crate) fn cause(&self) -> &Error {
+		&self.0
+	}
+}
+impl std::fmt::Display for AppendRefusedBeforeEffects {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		self.0.fmt(f)
+	}
+}
+impl std::error::Error for AppendRefusedBeforeEffects {}
+
+/// Whether `error` is that refusal, and so proves this append itself did nothing.
+pub(crate) fn append_refused_before_effects(error: &Error) -> bool {
+	error
+		.get_ref()
+		.is_some_and(|cause| cause.is::<AppendRefusedBeforeEffects>())
+}
+
+/// The cause alone, for a caller whose earlier work means the refusal no longer proves that.
+pub(crate) fn without_before_effects_proof(error: Error) -> Error {
+	if !append_refused_before_effects(&error) {
+		return error;
+	}
+	let kind = error.kind();
+	Error::new(kind, error.to_string())
+}
+
 #[derive(Debug)]
 struct LsmInstallUnresolved;
 impl std::fmt::Display for LsmInstallUnresolved {
@@ -1673,6 +1705,48 @@ impl SlabManager {
 			return Ok(());
 		}
 		Err(stale_location_error(slab_id, StaleLocationReason::Fenced))
+	}
+
+	/// The head of an append: refused here, it has done nothing. Only a refusal the store clears
+	/// by itself says so. An integrity, owner, restart-required or closed refusal stays what it
+	/// was, for the caller to treat as it always has.
+	pub(crate) fn require_append_admission(&self) -> std::io::Result<()> {
+		#[cfg(test)]
+		let refused = self.take_append_refusal_for_test();
+		#[cfg(not(test))]
+		let refused = false;
+		let answer = if refused {
+			Err(stale_location_error(
+				SlabId::ZERO,
+				StaleLocationReason::Fenced,
+			))
+		} else {
+			self.require_tier_authority_ready()
+		};
+		answer.map_err(|cause| {
+			if self.append_refusal_clears_by_itself() {
+				Error::new(cause.kind(), AppendRefusedBeforeEffects(cause))
+			} else {
+				cause
+			}
+		})
+	}
+
+	fn append_refusal_clears_by_itself(&self) -> bool {
+		self.owner_authority_fence.get().is_none()
+			&& !self
+				.tier_authority
+				.unresolved_op_fence
+				.load(Ordering::Acquire)
+			&& self.tier_authority.integrity_error().is_none()
+			&& !self.awaiting_cluster.load(Ordering::Acquire)
+			&& !self.index_authority_unavailable.load(Ordering::Acquire)
+			&& !self.has_orphaned_index_publications()
+			&& !self.tier_authority.closed.load(Ordering::Acquire)
+			&& !matches!(
+				self.tier_authority.status(),
+				AuthorityStatus::Failed(_) | AuthorityStatus::Closed
+			)
 	}
 
 	/// Synchronous answer paths refuse rather than turn unverified authority

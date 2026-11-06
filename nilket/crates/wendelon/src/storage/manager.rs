@@ -1349,7 +1349,7 @@ impl SlabManager {
 		hlc: HybridTimestamp,
 		frame: &[u8],
 	) -> std::io::Result<RecordLocation> {
-		self.require_tier_authority_ready()?;
+		self.require_append_admission()?;
 		self.observe_publication(tenant_id, async {
 			let metadata_epoch = self.capture_snapshot_epoch();
 			let superseded = self.latest_location_before(tenant_id, key_identity, hlc);
@@ -1439,7 +1439,7 @@ impl SlabManager {
 		frame: &[u8],
 		entries: &[MultiRowIndexEntry],
 	) -> std::io::Result<RecordLocation> {
-		self.require_tier_authority_ready()?;
+		self.require_append_admission()?;
 		self.observe_publication(tenant_id, async {
 			let metadata_epoch = self.capture_snapshot_epoch();
 			let Some(primary) = entries.first().copied() else {

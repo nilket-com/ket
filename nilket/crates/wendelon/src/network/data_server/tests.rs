@@ -18219,3 +18219,163 @@ fn migration_cursor_wire_roundtrip_keeps_absent_apart_from_zero() {
 		ErrorKind::InvalidData
 	);
 }
+
+// DC-173: a refused append is not a persistence failure, when that can be shown.
+
+async fn leading_node_for_refusals(label: &str) -> (crate::test_support::TestDir, WendelonNode) {
+	let dir = bootstrap_tempdir(label);
+	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+		38,
+		dir.to_path_buf(),
+		"127.0.0.1:0".into(),
+	))
+	.await
+	.unwrap();
+	let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+	while node.raft.current_leader().await != Some(node.local_node.id) {
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"timed out waiting for leader"
+		);
+		tokio::time::sleep(Duration::from_millis(20)).await;
+	}
+	node.data_server
+		.refresh_leases_once(&node.ring, &*node.clock, 60_000)
+		.await;
+	let descriptor = typed_table_descriptor();
+	node.raft
+		.client_write(WendelonRequest::SchemaUpdate(typed_table_schema_update(
+			&descriptor,
+		)))
+		.await
+		.unwrap();
+	(dir, node)
+}
+
+/// The node is exactly as it was: no marker, no fence, still leading, still writing.
+async fn assert_not_fenced(node: &WendelonNode, dir: &std::path::Path, label: &str) {
+	assert_eq!(node.data_server.degraded_reason(), None, "{label}");
+	assert!(
+		!dir.join("local_persistence_distrust.flag").exists()
+			&& !std::fs::read_dir(dir).unwrap().any(|entry| entry
+				.unwrap()
+				.file_name()
+				.to_string_lossy()
+				.contains("distrust")),
+		"{label}: no marker"
+	);
+	assert_eq!(
+		node.raft.current_leader().await,
+		Some(node.local_node.id),
+		"{label}: Raft still runs"
+	);
+}
+
+/// The KV path. The refusal's answer stays INTERNAL_ERROR, and the next write succeeds.
+#[tokio::test]
+async fn a_readiness_refusal_of_a_kv_append_does_not_fence_the_node() {
+	let (dir, node) = leading_node_for_refusals("dc173-kv").await;
+	node.slab.refuse_append_after_for_test(0);
+	let mut meta = simple_write_meta(1);
+	meta.client_hlc = hlc(1, 0, 0);
+	let before = node.slab.local_l1_bytes().await;
+	let (refused, _) = node
+		.data_server
+		.write(meta, single_kv_batch())
+		.await
+		.unwrap();
+	assert_eq!(refused.status, WriteStatus::INTERNAL_ERROR);
+	assert_eq!(node.slab.local_l1_bytes().await, before, "it wrote nothing");
+	assert_not_fenced(&node, &dir, "kv").await;
+	let mut next = simple_write_meta(1);
+	next.write_id.sequence_no = 2;
+	next.client_hlc = hlc(2, 0, 0);
+	let (written, _) = node
+		.data_server
+		.write(next, single_kv_batch())
+		.await
+		.unwrap();
+	assert_eq!(written.status, WriteStatus::OK);
+	shutdown_lease_node(node).await;
+}
+
+/// The table path, refused at its first child. The same mutation identity then applies, once.
+#[tokio::test]
+async fn a_readiness_refusal_of_a_tables_first_child_does_not_fence_the_node() {
+	let (dir, node) = leading_node_for_refusals("dc173-table").await;
+	let descriptor = typed_table_descriptor();
+	let batch = typed_table_batch(vec![7, 8]);
+	let mut meta = typed_table_meta(&descriptor, batch.num_rows());
+	meta.parent_write_id.sequence_no = 56;
+	meta.await_finalization = 1;
+	node.slab.refuse_append_after_for_test(0);
+	let before = node.slab.local_l1_bytes().await;
+	let (refused, _) = node
+		.data_server
+		.table_write(meta, batch.clone())
+		.await
+		.unwrap();
+	assert_eq!(refused.write.status, WriteStatus::INTERNAL_ERROR);
+	assert_eq!(node.slab.local_l1_bytes().await, before, "it wrote nothing");
+	assert_not_fenced(&node, &dir, "first child").await;
+	let (retried, _) = node.data_server.table_write(meta, batch).await.unwrap();
+	assert_eq!(retried.write.status, WriteStatus::OK, "{retried:?}");
+	assert_not_fenced(&node, &dir, "retried").await;
+	shutdown_lease_node(node).await;
+}
+
+/// Refused after an earlier child is durable, the proof no longer holds for the mutation: the
+/// conservative path, until a retry of a partly applied mutation is shown safe.
+#[tokio::test]
+async fn a_refusal_after_a_durable_child_stays_on_the_conservative_path() {
+	let (_dir, node) = leading_node_for_refusals("dc173-partial").await;
+	let descriptor = typed_table_descriptor();
+	let batch = typed_table_batch(vec![7, 8]);
+	let mut meta = typed_table_meta(&descriptor, batch.num_rows());
+	meta.parent_write_id.sequence_no = 56;
+	meta.await_finalization = 1;
+	let children = bifurcate_table_write(
+		&meta,
+		&batch,
+		&descriptor,
+		WriterNodeId::ZERO,
+		meta.client_hlc,
+	)
+	.unwrap()
+	.children;
+	assert!(children.len() >= 2, "premise: {} children", children.len());
+	node.slab.refuse_append_after_for_test(1);
+	let before = node.slab.local_l1_bytes().await;
+	let (refused, _) = node.data_server.table_write(meta, batch).await.unwrap();
+	assert_eq!(refused.write.status, WriteStatus::INTERNAL_ERROR);
+	assert!(
+		node.slab.local_l1_bytes().await > before,
+		"premise: its first child is durable"
+	);
+	assert_eq!(
+		node.data_server.degraded_reason().as_deref(),
+		Some(LOCAL_PERSISTENCE_DISTRUST_REASON)
+	);
+	shutdown_lease_node(node).await;
+}
+
+/// Only a refusal that clears by itself carries the proof.
+#[tokio::test]
+async fn a_refusal_that_will_not_clear_by_itself_still_fences() {
+	let (_dir, node) = leading_node_for_refusals("dc173-sticky").await;
+	node.slab.fence_unresolved_op_for_test();
+	node.slab.refuse_append_after_for_test(0);
+	let mut meta = simple_write_meta(1);
+	meta.client_hlc = hlc(1, 0, 0);
+	let (refused, _) = node
+		.data_server
+		.write(meta, single_kv_batch())
+		.await
+		.unwrap();
+	assert_eq!(refused.status, WriteStatus::INTERNAL_ERROR);
+	assert_eq!(
+		node.data_server.degraded_reason().as_deref(),
+		Some(LOCAL_PERSISTENCE_DISTRUST_REASON)
+	);
+	shutdown_lease_node(node).await;
+}
