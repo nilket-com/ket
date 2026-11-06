@@ -68,8 +68,16 @@ check "evaluator failure: INVALID" evaluate-fails 4 INVALID 10
 check "verdict bound to another block: INVALID" verdict-unbound 4 INVALID 10
 jq '.label = "CAMPAIGN"' "$work/manifest.json" > "$work/campaign-manifest.json"
 check "CAMPAIGN without campaign build records is refused" clean 2 none 5 "$work/campaign-manifest.json"
-grep -q "refused: CAMPAIGN needs both build records" "$work/out-$n.log" \
+grep -q "refused: CAMPAIGN needs the fix build record" "$work/out-$n.log" \
 	|| { echo "FAIL campaign refusal reason"; failures=$((failures + 1)); }
+# Fix-only (operator, 2026-11-06): a CAMPAIGN base block is refused, and the driver has none.
+rc=0
+FAKE=clean S7_BIN=$work/fake-s7 S7_MANIFEST=$work/campaign-manifest.json CAMPAIGN=$work/campaign \
+	S7_LOGS=$work/logs S7_DATE=test "$here/run.sh" base 90 > "$work/out-base.log" 2>&1 || rc=$?
+if [ "$rc" = 2 ] && grep -q "CAMPAIGN is fix-only" "$work/out-base.log"; then echo "ok   a CAMPAIGN base block is refused"
+else echo "FAIL CAMPAIGN base block: exit $rc"; failures=$((failures + 1)); fi
+if grep -qx 'order=(fix fix fix)' "$here/campaign.sh"; then echo "ok   the campaign driver runs fix blocks only"
+else echo "FAIL the campaign driver's order"; failures=$((failures + 1)); fi
 
 # build-arms.sh campaign preconditions (refused before anything is built).
 refusal() { # name expected-message env...

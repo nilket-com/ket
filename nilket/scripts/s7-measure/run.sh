@@ -33,12 +33,12 @@ manifest_sha=$(sha256sum "$MANIFEST" | cut -d' ' -f1)
 refuse() { echo "run.sh: refused: $*" >&2; exit 2; }
 
 if [ "$label" = CAMPAIGN ]; then
-	# Evidence path: only the frozen, reviewed, release build of both arms,
-	# with the manifest it was built with.
-	other=$([ "$arm" = base ] && echo fix || echo base)
+	# Evidence path: only the frozen, reviewed, release build of the fix arm,
+	# with the manifest it was built with. Fix-only by the operator's decision
+	# of 2026-11-06, so a base block is no evidence of anything here.
+	[ "$arm" = fix ] || refuse "CAMPAIGN is fix-only; base evidence is historical"
 	rec=$CAMPAIGN/build/$arm.json
-	orec=$CAMPAIGN/build/$other.json
-	[ -f "$rec" ] && [ -f "$orec" ] || refuse "CAMPAIGN needs both build records in $CAMPAIGN/build"
+	[ -f "$rec" ] || refuse "CAMPAIGN needs the fix build record in $CAMPAIGN/build"
 	# The launcher running now is the frozen, reviewed one.
 	cmp -s "$here/run.sh" "$(jq -er .frozen_overlay "$rec")/nilket/scripts/s7-measure/run.sh" \
 		|| refuse "this run.sh is not the frozen launcher"
@@ -47,14 +47,10 @@ if [ "$label" = CAMPAIGN ]; then
 	jq -e '.mode == "campaign" and .profile == "release" and .overlay_uncommitted_files == 0
 		and (.ref | test("^[0-9a-f]{40}$")) and .build_warnings == 0' "$rec" > /dev/null \
 		|| refuse "$rec is not a clean campaign release build of a pinned commit"
-	jq -e '.mode == "campaign"' "$orec" > /dev/null || refuse "$orec is not a campaign build"
 	[ "$(sha256sum "$BIN" | cut -d' ' -f1)" = "$(jq -er .binary_sha256 "$rec")" ] \
 		|| refuse "binary $BIN does not match its build record"
 	[ "$manifest_sha" = "$(jq -er .overlay_manifest_sha256 "$rec")" ] \
 		|| refuse "manifest $MANIFEST is not the one frozen into the build"
-	for k in overlay_aggregate_sha256 overlay_manifest_sha256 toolchain wrapper_sha256 profile; do
-		[ "$(jq -c ".$k" "$rec")" = "$(jq -c ".$k" "$orec")" ] || refuse "arms differ in $k"
-	done
 	[ "$(jq -er .arm "$rec")" = "$arm" ] || refuse "build record arm mismatch"
 else
 	BIN=${S7_BIN:-$HOME/work/target-s7-meas-$arm/release/s7-measure}
