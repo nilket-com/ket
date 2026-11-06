@@ -312,15 +312,13 @@ fn remove_lsm_run_row(
 	tx: &redb::WriteTransaction,
 	slab_id: SlabId,
 ) -> std::io::Result<Option<LsmRunSummary>> {
-	let removed = {
-		let mut table = tx.open_table(LSM_RUNS_TABLE).map_err(redb_to_io)?;
-		let removed = table
-			.remove(&slab_id.get())
-			.map_err(redb_to_io)?
-			.map(|value| decode_lsm_run_summary(slab_id, value.value()))
-			.transpose()?;
-		removed
-	};
+	let mut table = tx.open_table(LSM_RUNS_TABLE).map_err(redb_to_io)?;
+	let removed = table
+		.remove(&slab_id.get())
+		.map_err(redb_to_io)?
+		.map(|value| decode_lsm_run_summary(slab_id, value.value()))
+		.transpose()?;
+	drop(table);
 	if let Some(run) = &removed {
 		let mut meta = tx.open_table(META_TABLE).map_err(redb_to_io)?;
 		let floor = meta
