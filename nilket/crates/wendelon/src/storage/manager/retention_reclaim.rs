@@ -2786,7 +2786,10 @@ impl SlabManager {
 			let Some(first_idx) = indices.first().copied() else {
 				continue;
 			};
-			let frame = extract_record_from_blob(plaintext, records[first_idx].old_location)?;
+			let frame = extract_record_from_blob(
+				plaintext,
+				crate::storage::core::FrameLocation::of_point_read(records[first_idx].old_location),
+			)?;
 			self.mark_record_group_for_table_drop(&frame, indices, records, tenant_id, descriptor)?;
 		}
 		Ok(())
@@ -2992,7 +2995,10 @@ impl SlabManager {
 				continue;
 			};
 			let first = records[first_idx];
-			let frame = extract_record_from_blob(plaintext, first.old_location)?;
+			let frame = extract_record_from_blob(
+				plaintext,
+				crate::storage::core::FrameLocation::of_point_read(first.old_location),
+			)?;
 			self.mark_record_group_for_table_retention(
 				&frame,
 				indices,

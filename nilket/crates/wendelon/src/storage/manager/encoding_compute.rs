@@ -2370,12 +2370,12 @@ pub(super) fn encoding_directories_from_slab_blob(
 	acknowledged: &BTreeSet<u64>,
 ) -> std::io::Result<Vec<EncodingDirectory>> {
 	let mut out = Vec::new();
-	let mut seen_records = BTreeSet::new();
-	for entry in recover_slab_entries_from_blob(blob, slab_id, acknowledged)? {
-		if !seen_records.insert((entry.location.offset, entry.location.length)) {
-			continue;
-		}
-		let frame = extract_record_from_blob(blob, entry.location)?;
+	for recovered in crate::storage::core::recovered_frames(&recover_slab_entries_from_blob(
+		blob,
+		slab_id,
+		acknowledged,
+	)?) {
+		let frame = extract_record_from_blob(blob, recovered.location())?;
 		if !ipc_stream_contains_encoding_directory(&frame) {
 			continue;
 		}
@@ -3488,7 +3488,10 @@ impl SlabManager {
 			let plaintext = self
 				.fetch_full_tiered_plaintext(l2.as_ref(), pointer)
 				.await?;
-			let frame = extract_record_from_blob(&plaintext, location)?;
+			let frame = extract_record_from_blob(
+				&plaintext,
+				crate::storage::core::FrameLocation::of_point_read(location),
+			)?;
 			let projected = decode_full_projected_l2_record(
 				pointer.slab_id,
 				location,
@@ -4544,7 +4547,10 @@ impl SlabManager {
 				.await?
 		} else {
 			let plaintext = self.fetch_full_tiered_plaintext(l2, pointer).await?;
-			extract_record_from_blob(&plaintext, location)?
+			extract_record_from_blob(
+				&plaintext,
+				crate::storage::core::FrameLocation::of_point_read(location),
+			)?
 		};
 		decode_full_projected_l2_record(pointer.slab_id, location, descriptor, requirement, &frame)
 	}

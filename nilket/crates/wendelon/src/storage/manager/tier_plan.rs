@@ -112,8 +112,14 @@ fn same_tier_row_payload(
 	right_plaintext: &[u8],
 	right: RecordLocation,
 ) -> std::io::Result<bool> {
-	let left_frame = extract_record_from_blob(left_plaintext, left)?;
-	let right_frame = extract_record_from_blob(right_plaintext, right)?;
+	let left_frame = extract_record_from_blob(
+		left_plaintext,
+		crate::storage::core::FrameLocation::of_point_read(left),
+	)?;
+	let right_frame = extract_record_from_blob(
+		right_plaintext,
+		crate::storage::core::FrameLocation::of_point_read(right),
+	)?;
 	match (
 		storage_multirow_index_entries_from_frame(&left_frame)?,
 		storage_multirow_index_entries_from_frame(&right_frame)?,

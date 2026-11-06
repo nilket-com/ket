@@ -11397,6 +11397,48 @@ fn snapshot_lease_scopes_exclude_remote_io_and_backoff() {
 			assert!(!body.contains(remote), "{stage}: {remote}");
 		}
 	}
+	// DC-176: a loop over a slab decodes per physical frame. Reading one record is a deliberate,
+	// named choice, and each new place that makes it is reviewed here.
+	let mut point_reads = Vec::new();
+	for (name, path) in [
+		("manager.rs", "src/storage/manager.rs"),
+		(
+			"encoding_compute.rs",
+			"src/storage/manager/encoding_compute.rs",
+		),
+		(
+			"retention_reclaim.rs",
+			"src/storage/manager/retention_reclaim.rs",
+		),
+		(
+			"secondary_index_segments.rs",
+			"src/storage/manager/secondary_index_segments.rs",
+		),
+		("stats_facts.rs", "src/storage/manager/stats_facts.rs"),
+		("tier_authority.rs", "src/storage/manager/tier_authority.rs"),
+		("tier_plan.rs", "src/storage/manager/tier_plan.rs"),
+		("tiered_io.rs", "src/storage/manager/tiered_io.rs"),
+	] {
+		let source = fs::read_to_string(root.join(path)).unwrap();
+		point_reads.push((
+			name,
+			source.matches("FrameLocation::of_point_read(").count(),
+		));
+	}
+	assert_eq!(
+		point_reads,
+		[
+			("manager.rs", 2),
+			("encoding_compute.rs", 2),
+			("retention_reclaim.rs", 2),
+			("secondary_index_segments.rs", 0),
+			("stats_facts.rs", 0),
+			("tier_authority.rs", 1),
+			("tier_plan.rs", 2),
+			("tiered_io.rs", 2),
+		],
+		"a new point read: if it is in a loop over a slab's entries, group by frame instead"
+	);
 	// DC-158: the tier stats build decodes a whole slab, off the runtime's workers.
 	let sweeper_source = fs::read_to_string(root.join("src/storage/sweeper.rs")).unwrap();
 	let stats_stage = sweeper_source

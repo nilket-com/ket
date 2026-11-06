@@ -1315,7 +1315,10 @@ impl TierAuthority {
 			SlabBacking::Local(slab) => slab.read_with_header(target).await,
 			SlabBacking::L2(pointer) => {
 				let object = self.plaintext(epoch, &pointer, cache).await?;
-				let record = tiered_io::extract_record_and_header_from_blob(&object.bytes, target)?;
+				let record = tiered_io::extract_record_and_header_from_blob(
+					&object.bytes,
+					crate::storage::core::FrameLocation::of_point_read(target),
+				)?;
 				lsm_driver::verify_frame_names_version(
 					&record.0,
 					&record.1,

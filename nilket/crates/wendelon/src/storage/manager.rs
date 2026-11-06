@@ -3908,8 +3908,10 @@ impl SlabManager {
 				let Some(first) = group.first().copied() else {
 					continue;
 				};
-				let frame =
-					Zeroizing::new(extract_record_from_blob(&plaintext, first.old_location)?);
+				let frame = Zeroizing::new(extract_record_from_blob(
+					&plaintext,
+					crate::storage::core::FrameLocation::of_point_read(first.old_location),
+				)?);
 				let Some(compacted) = compact_physical_record_frame(
 					frame.as_ref(),
 					group,
@@ -4074,8 +4076,10 @@ impl SlabManager {
 				let Some(first) = group.first().copied() else {
 					continue;
 				};
-				let frame =
-					Zeroizing::new(extract_record_from_blob(&plaintext, first.old_location)?);
+				let frame = Zeroizing::new(extract_record_from_blob(
+					&plaintext,
+					crate::storage::core::FrameLocation::of_point_read(first.old_location),
+				)?);
 				let Some(compacted) = compact_physical_record_frame(
 					frame.as_ref(),
 					group,
@@ -4222,21 +4226,13 @@ fn uncompressed_resident_bytes_in_slab(
 	table_schemas: &TableSchemaCatalog,
 	acknowledged: &BTreeSet<u64>,
 ) -> std::io::Result<u64> {
-	let mut entries_by_record: BTreeMap<(u64, u32), Vec<RecoveredSlabEntry>> = BTreeMap::new();
-	for entry in recover_slab_entries_from_blob(blob, slab_id, acknowledged)? {
-		entries_by_record
-			.entry((entry.location.offset, entry.location.length))
-			.or_default()
-			.push(entry);
-	}
+	let entries = recover_slab_entries_from_blob(blob, slab_id, acknowledged)?;
 
 	let mut descriptors_by_tenant: HashMap<TenantId, Vec<TableSchemaDescriptor>> = HashMap::new();
 	let mut bytes = 0_u64;
-	for entries in entries_by_record.values() {
-		let Some(first) = entries.first().copied() else {
-			continue;
-		};
-		let frame = extract_record_from_blob(blob, first.location)?;
+	for recovered in crate::storage::core::recovered_frames(&entries) {
+		let entries = recovered.entries();
+		let frame = extract_record_from_blob(blob, recovered.location())?;
 		let policy = match record_batch_compression_policy_from_ipc(&frame) {
 			Ok(policy) => policy,
 			Err(_) => continue,

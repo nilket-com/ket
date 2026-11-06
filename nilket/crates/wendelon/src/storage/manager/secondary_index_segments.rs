@@ -1579,20 +1579,32 @@ impl SlabManager {
 		plaintext: &[u8],
 	) -> std::io::Result<BTreeSet<(TenantId, TableObjectId)>> {
 		let mut table_ids = BTreeSet::new();
-		for recovered in recover_slab_entries_from_blob_skipping_counters(
-			plaintext,
-			source_slab_id,
-			&self.acknowledged_offsets_in_slab(source_slab_id),
-		)? {
-			if !recovered.is_arrow_frame {
+		for recovered_frame in crate::storage::core::recovered_frames(
+			&recover_slab_entries_from_blob_skipping_counters(
+				plaintext,
+				source_slab_id,
+				&self.acknowledged_offsets_in_slab(source_slab_id),
+			)?,
+		) {
+			if !recovered_frame
+				.entries()
+				.iter()
+				.any(|entry| entry.is_arrow_frame)
+			{
 				continue;
 			}
-			let frame = extract_record_from_blob(plaintext, recovered.location)?;
+			let frame = extract_record_from_blob(plaintext, recovered_frame.location())?;
 			let storage_batch = decode_record_batch(&frame)?;
-			if let Some(table_object_id) =
-				storage_row_table_object_id_at(&storage_batch, recovered.location.record_row_index)?
-			{
-				table_ids.insert((recovered.tenant_id, table_object_id));
+			for recovered in recovered_frame.entries() {
+				if !recovered.is_arrow_frame {
+					continue;
+				}
+				if let Some(table_object_id) = storage_row_table_object_id_at(
+					&storage_batch,
+					recovered.location.record_row_index,
+				)? {
+					table_ids.insert((recovered.tenant_id, table_object_id));
+				}
 			}
 		}
 		Ok(table_ids)
@@ -2315,55 +2327,64 @@ impl SlabManager {
 	) -> std::io::Result<SecondaryIndexSegment> {
 		let identity = SecondaryIndexIdentity::from_descriptor(tenant_id, descriptor);
 		let mut index_entries = Vec::new();
-		for recovered in recover_slab_entries_from_blob_skipping_counters(
-			plaintext,
-			source_slab_id,
-			&self.acknowledged_offsets_in_slab(source_slab_id),
-		)? {
-			if recovered.tenant_id != tenant_id
-				|| recovered.location.is_tombstone
-				|| !recovered.is_arrow_frame
-			{
+		for recovered_frame in crate::storage::core::recovered_frames(
+			&recover_slab_entries_from_blob_skipping_counters(
+				plaintext,
+				source_slab_id,
+				&self.acknowledged_offsets_in_slab(source_slab_id),
+			)?,
+		) {
+			let wanted = |recovered: &crate::storage::core::RecoveredSlabEntry| {
+				recovered.tenant_id == tenant_id
+					&& !recovered.location.is_tombstone
+					&& recovered.is_arrow_frame
+			};
+			if !recovered_frame.entries().iter().any(wanted) {
 				continue;
 			}
-			let frame = extract_record_from_blob(plaintext, recovered.location)?;
+			let frame = extract_record_from_blob(plaintext, recovered_frame.location())?;
 			let storage_batch = decode_record_batch(&frame)?;
-			let stored_table_object_id = storage_row_table_object_id_at(
-				&storage_batch,
-				recovered.location.record_row_index,
-			)?;
-			let materialized = match materialize_record_location_batch(
-				&storage_batch,
-				recovered.location.record_row_index,
-			) {
-				Ok(batch) if batch.num_rows() == 1 => batch,
-				Ok(_) => continue,
-				Err(err) => return Err(err),
-			};
-			let routing_locality = self.recovered_entry_routing_locality(&recovered);
-			if !descriptor_matches_tiered_row(
-				table,
-				tenant_id,
-				recovered.key_identity,
-				routing_locality,
-				stored_table_object_id,
-				&materialized,
-			)? {
-				continue;
+			for recovered in recovered_frame.entries().iter().copied() {
+				if !wanted(&recovered) {
+					continue;
+				}
+				let stored_table_object_id = storage_row_table_object_id_at(
+					&storage_batch,
+					recovered.location.record_row_index,
+				)?;
+				let materialized = match materialize_record_location_batch(
+					&storage_batch,
+					recovered.location.record_row_index,
+				) {
+					Ok(batch) if batch.num_rows() == 1 => batch,
+					Ok(_) => continue,
+					Err(err) => return Err(err),
+				};
+				let routing_locality = self.recovered_entry_routing_locality(&recovered);
+				if !descriptor_matches_tiered_row(
+					table,
+					tenant_id,
+					recovered.key_identity,
+					routing_locality,
+					stored_table_object_id,
+					&materialized,
+				)? {
+					continue;
+				}
+				let Some(encoded_key) = encode_secondary_index_key(&materialized, 0, descriptor)?
+				else {
+					continue;
+				};
+				index_entries.push(SecondaryIndexEntry {
+					encoded_key,
+					row_key_id: recovered.key_identity,
+					row_hlc: recovered.location.hlc,
+					record_location: RecordLocation {
+						is_tombstone: false,
+						..recovered.location
+					},
+				});
 			}
-			let Some(encoded_key) = encode_secondary_index_key(&materialized, 0, descriptor)?
-			else {
-				continue;
-			};
-			index_entries.push(SecondaryIndexEntry {
-				encoded_key,
-				row_key_id: recovered.key_identity,
-				row_hlc: recovered.location.hlc,
-				record_location: RecordLocation {
-					is_tombstone: false,
-					..recovered.location
-				},
-			});
 		}
 		SecondaryIndexSegment::build(
 			identity,

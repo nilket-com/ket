@@ -149,6 +149,57 @@ pub(crate) struct RecoveredSlabEntry {
 	pub location: RecordLocation,
 }
 
+/// Where one physical record is in a slab blob, whichever of its rows led here. Reading a frame
+/// takes this, not a row's location, because a multirow frame decodes to every row it holds:
+/// decoding it once per row costs rows times its whole size. It comes from a `RecoveredFrame`, or
+/// from `of_point_read` for code that really does want one record, which the architecture test pins.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FrameLocation {
+	location: RecordLocation,
+}
+
+impl FrameLocation {
+	pub(crate) fn of_point_read(location: RecordLocation) -> Self {
+		Self { location }
+	}
+
+	pub(crate) fn record(self) -> RecordLocation {
+		self.location
+	}
+}
+
+/// One physical record's recovered entries, borrowed from the recovery result. A loop over a slab
+/// decodes per one of these. Only `recovered_frames` makes one, and never an empty one.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RecoveredFrame<'a> {
+	entries: &'a [RecoveredSlabEntry],
+}
+
+impl<'a> RecoveredFrame<'a> {
+	pub(crate) fn location(self) -> FrameLocation {
+		FrameLocation {
+			location: self.entries[0].location,
+		}
+	}
+
+	pub(crate) fn entries(self) -> &'a [RecoveredSlabEntry] {
+		self.entries
+	}
+}
+
+/// Entries by physical record. Recovery emits each record's entries together, so grouping
+/// neighbours is exact. This allocates nothing, so a bounded caller owes nothing for it.
+pub(crate) fn recovered_frames(
+	entries: &[RecoveredSlabEntry],
+) -> impl Iterator<Item = RecoveredFrame<'_>> {
+	entries
+		.chunk_by(|left, right| {
+			left.location.offset == right.location.offset
+				&& left.location.length == right.location.length
+		})
+		.map(|entries| RecoveredFrame { entries })
+}
+
 type TenantKey = (TenantId, Identity);
 
 /// ADR 016 group-commit tuning knobs for slab durability.

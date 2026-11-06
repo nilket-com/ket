@@ -238,7 +238,7 @@ pub(super) fn validate_tiered_record_header_tenant(
 
 pub(super) fn extract_record_from_blob(
 	blob: &[u8],
-	location: RecordLocation,
+	location: crate::storage::core::FrameLocation,
 ) -> std::io::Result<Vec<u8>> {
 	extract_record_and_header_from_blob(blob, location).map(|(_, frame)| frame)
 }
@@ -246,8 +246,9 @@ pub(super) fn extract_record_from_blob(
 /// The record header and frame at `location` in a plaintext slab blob.
 pub(super) fn extract_record_and_header_from_blob(
 	blob: &[u8],
-	location: RecordLocation,
+	location: crate::storage::core::FrameLocation,
 ) -> std::io::Result<(SlabRecordHeader, Vec<u8>)> {
+	let location = location.record();
 	let offset = location.offset as usize;
 	let length = location.length as usize;
 	let header_size = std::mem::size_of::<crate::schema::SlabRecordHeader>();
@@ -1823,38 +1824,53 @@ impl SlabManager {
 		slab_id: SlabId,
 		acknowledged: &BTreeSet<u64>,
 	) -> std::io::Result<Vec<PersistentRecordRow>> {
-		recover_slab_entries_from_blob(plaintext, slab_id, acknowledged)?
-			.into_iter()
-			.map(|entry| self.persistent_row_from_recovered_entry(plaintext, entry))
-			.collect()
+		let entries = recover_slab_entries_from_blob(plaintext, slab_id, acknowledged)?;
+		let mut rows = Vec::with_capacity(entries.len());
+		for frame in crate::storage::core::recovered_frames(&entries) {
+			self.persistent_rows_from_recovered_frame(plaintext, frame, &mut rows)?;
+		}
+		Ok(rows)
 	}
 
-	/// The index row for one recovered entry of `plaintext`.
-	fn persistent_row_from_recovered_entry(
+	/// The index rows of one recovered frame of `plaintext`, decoded once. This runs on the Raft
+	/// apply path. Core recovery already classified synthetic rows: opaque blob bytes must never be
+	/// probed as an Arrow length-prefixed stream, so only a trusted row asks for the decode.
+	fn persistent_rows_from_recovered_frame(
 		&self,
 		plaintext: &[u8],
-		entry: crate::storage::core::RecoveredSlabEntry,
-	) -> std::io::Result<PersistentRecordRow> {
-		let frame = extract_record_from_blob(plaintext, entry.location)?;
-		// Core recovery already classified synthetic rows. Opaque blob bytes
-		// must never be probed as an Arrow length-prefixed stream.
-		let table_object_id = if entry.routing_locality_trusted {
-			let batch = decode_record_batch(&frame)?;
-			storage_row_table_object_id_at(&batch, entry.location.record_row_index)?
+		frame: crate::storage::core::RecoveredFrame<'_>,
+		rows: &mut Vec<PersistentRecordRow>,
+	) -> std::io::Result<()> {
+		let bytes = extract_record_from_blob(plaintext, frame.location())?;
+		let batch = if frame
+			.entries()
+			.iter()
+			.any(|entry| entry.routing_locality_trusted)
+		{
+			Some(decode_record_batch(&bytes)?)
 		} else {
 			None
 		};
-		Ok(PersistentRecordRow {
-			tenant_id: entry.tenant_id,
-			key_identity: entry.key_identity,
-			routing_locality: self.recovered_entry_routing_locality(&entry),
-			table_object_id,
-			// ADR 0090: recovery read the row's placement from the frame;
-			// re-tiering must not downgrade it.
-			placement: entry.location.placement,
-			partition: entry.location.partition,
-			location: entry.location,
-		})
+		for entry in frame.entries().iter().copied() {
+			let table_object_id = match &batch {
+				Some(batch) if entry.routing_locality_trusted => {
+					storage_row_table_object_id_at(batch, entry.location.record_row_index)?
+				}
+				_ => None,
+			};
+			rows.push(PersistentRecordRow {
+				tenant_id: entry.tenant_id,
+				key_identity: entry.key_identity,
+				routing_locality: self.recovered_entry_routing_locality(&entry),
+				table_object_id,
+				// ADR 0090: recovery read the row's placement from the frame;
+				// re-tiering must not downgrade it.
+				placement: entry.location.placement,
+				partition: entry.location.partition,
+				location: entry.location,
+			});
+		}
+		Ok(())
 	}
 
 	/// The verifier already fetched and authenticated this object without
@@ -1965,8 +1981,8 @@ impl SlabManager {
 				super::tier_budget::TierHistoryShortfall::Scratch,
 			)
 		})?;
-		for entry in entries {
-			rows.push(self.persistent_row_from_recovered_entry(plaintext, entry)?);
+		for frame in crate::storage::core::recovered_frames(&entries) {
+			self.persistent_rows_from_recovered_frame(plaintext, frame, &mut rows)?;
 		}
 		Ok(rows)
 	}
@@ -2367,7 +2383,10 @@ impl SlabManager {
 			let plaintext = self
 				.fetch_full_tiered_plaintext(l2.as_ref(), pointer)
 				.await?;
-			let record = extract_record_and_header_from_blob(&plaintext, location)?;
+			let record = extract_record_and_header_from_blob(
+				&plaintext,
+				crate::storage::core::FrameLocation::of_point_read(location),
+			)?;
 			plaintext_for_rehydration = Some(plaintext);
 			record
 		};
@@ -2488,10 +2507,10 @@ impl SlabManager {
 		validate_tiered_record_header_tenant(&record_bytes, footer.tenant_id, pointer.slab_id)?;
 		extract_record_and_header_from_blob(
 			&record_bytes,
-			RecordLocation {
+			crate::storage::core::FrameLocation::of_point_read(RecordLocation {
 				offset: 0,
 				..location
-			},
+			}),
 		)
 	}
 

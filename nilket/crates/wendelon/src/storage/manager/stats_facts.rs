@@ -1050,92 +1050,88 @@ impl SlabManager {
 		let mut candidates: Option<Vec<TableSchemaDescriptor>> = None;
 		let mut saw_unmatched_row = false;
 		let mut row_batches = Vec::with_capacity(entries.len());
-		// A multirow frame holds many logical entries, in a row. Each decodes to the same batch,
-		// and the row slices share its buffers, so the frame is decoded once however many rows
-		// it holds. A frame that does not decode stays that way for all of them.
-		let mut decoded_frame = None;
-
-		for entry in entries {
-			let record_tenant_id = entry.tenant_id;
-			let key_identity = entry.key_identity;
-			let routing_locality = self.recovered_entry_routing_locality(&entry);
-			let location = entry.location;
-			if record_tenant_id != tenant_id {
-				return Err(Error::new(
-					ErrorKind::InvalidInput,
-					format!(
-						"ADR 039 typed-table stats build saw tenant {} in slab {} after metadata chose tenant {}",
-						record_tenant_id.get(),
-						slab_id,
-						tenant_id.get(),
-					),
-				));
-			}
-			if !matches!(&decoded_frame, Some((offset, _)) if *offset == location.offset) {
-				let frame = extract_record_from_blob(blob, location)?;
-				decoded_frame = Some((location.offset, decode_record_batch(&frame).ok()));
-			}
-			let decoded = decoded_frame
-				.as_ref()
-				.and_then(|(_, decoded)| decoded.as_ref());
-			let (batch, stored_table_object_id) = match decoded {
-				Some(decoded) => {
-					// Phase 8.5: surface malformed
-					// `__row_table_object_id__` as storage corruption
-					// rather than silently treating it as PK. `Ok(None)`
-					// means the column is absent (PK row); only fail
-					// when the column is present but unreadable.
-					let table_object_id = crate::storage::multirow::storage_row_table_object_id_at(
-						decoded,
-						location.record_row_index,
-					)?;
-					match materialize_record_location_batch(decoded, location.record_row_index) {
-						Ok(batch) if batch.num_rows() == 1 => (batch, table_object_id),
-						_ => {
-							saw_unmatched_row = true;
-							continue;
-						}
-					}
-				}
-				None => {
-					saw_unmatched_row = true;
-					continue;
-				}
-			};
-			let had_candidates = candidates.is_some();
-			let matching = match candidates.take() {
-				Some(existing) => existing,
-				None => descriptors.clone(),
-			}
-			.into_iter()
-			.filter_map(|descriptor| {
-				match descriptor_matches_tiered_row(
-					&descriptor,
-					tenant_id,
-					key_identity,
-					routing_locality,
-					stored_table_object_id,
-					&batch,
-				) {
-					Ok(true) => Some(descriptor),
-					Ok(false) | Err(_) => None,
-				}
-			})
-			.collect::<Vec<_>>();
-			if matching.is_empty() {
-				if had_candidates {
+		for recovered in crate::storage::core::recovered_frames(&entries) {
+			// Its row slices share this one decode's buffers. A frame that does not decode stays
+			// that way for all its rows.
+			let decoded =
+				decode_record_batch(&extract_record_from_blob(blob, recovered.location())?).ok();
+			for entry in recovered.entries().iter().copied() {
+				let record_tenant_id = entry.tenant_id;
+				let key_identity = entry.key_identity;
+				let routing_locality = self.recovered_entry_routing_locality(&entry);
+				let location = entry.location;
+				if record_tenant_id != tenant_id {
 					return Err(Error::new(
-						ErrorKind::InvalidData,
+						ErrorKind::InvalidInput,
 						format!(
-							"ADR 039 typed-table slab {slab_id} contains a row outside the matched table descriptor; stats are mandatory for typed-table v2 slabs"
+							"ADR 039 typed-table stats build saw tenant {} in slab {} after metadata chose tenant {}",
+							record_tenant_id.get(),
+							slab_id,
+							tenant_id.get(),
 						),
 					));
 				}
-				saw_unmatched_row = true;
-				continue;
+				let (batch, stored_table_object_id) = match decoded.as_ref() {
+					Some(decoded) => {
+						// Phase 8.5: surface malformed
+						// `__row_table_object_id__` as storage corruption
+						// rather than silently treating it as PK. `Ok(None)`
+						// means the column is absent (PK row); only fail
+						// when the column is present but unreadable.
+						let table_object_id =
+							crate::storage::multirow::storage_row_table_object_id_at(
+								decoded,
+								location.record_row_index,
+							)?;
+						match materialize_record_location_batch(decoded, location.record_row_index)
+						{
+							Ok(batch) if batch.num_rows() == 1 => (batch, table_object_id),
+							_ => {
+								saw_unmatched_row = true;
+								continue;
+							}
+						}
+					}
+					None => {
+						saw_unmatched_row = true;
+						continue;
+					}
+				};
+				let had_candidates = candidates.is_some();
+				let matching = match candidates.take() {
+					Some(existing) => existing,
+					None => descriptors.clone(),
+				}
+				.into_iter()
+				.filter_map(|descriptor| {
+					match descriptor_matches_tiered_row(
+						&descriptor,
+						tenant_id,
+						key_identity,
+						routing_locality,
+						stored_table_object_id,
+						&batch,
+					) {
+						Ok(true) => Some(descriptor),
+						Ok(false) | Err(_) => None,
+					}
+				})
+				.collect::<Vec<_>>();
+				if matching.is_empty() {
+					if had_candidates {
+						return Err(Error::new(
+							ErrorKind::InvalidData,
+							format!(
+								"ADR 039 typed-table slab {slab_id} contains a row outside the matched table descriptor; stats are mandatory for typed-table v2 slabs"
+							),
+						));
+					}
+					saw_unmatched_row = true;
+					continue;
+				}
+				candidates = Some(matching);
+				row_batches.push(batch);
 			}
-			candidates = Some(matching);
-			row_batches.push(batch);
 		}
 
 		let Some(mut candidates) = candidates else {

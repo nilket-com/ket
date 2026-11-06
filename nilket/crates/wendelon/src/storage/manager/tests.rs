@@ -6906,6 +6906,59 @@ async fn tier_stats_build_decode_count(frames: usize, rows_per_frame: usize) -> 
 	stats_decodes
 }
 
+/// DC-176: the rows a tier publication derives from its object, the work the Raft apply path
+/// waits on. Each frame is decoded once however many rows it holds, and every row comes out right.
+#[tokio::test]
+async fn tier_rows_decode_each_frame_at_most_once() {
+	for (frames, rows_per_frame) in [(2_usize, 64_usize), (2, 256)] {
+		let (_mgr_dir, mgr) = fresh_manager().await;
+		let table_object_id = TableObjectId::new([0xD1; 16]);
+		let descriptor =
+			tier_stats_decode_descriptor(table_object_id, u32::try_from(rows_per_frame).unwrap());
+		for frame in 0..frames {
+			let batch = tier_stats_decode_batch(frame, rows_per_frame);
+			let meta = layout_recluster_meta(&descriptor, batch.num_rows());
+			let packed = pack_record_batch_by_bucket(
+				&meta,
+				&descriptor,
+				&batch,
+				WriterNodeId::ZERO,
+				hlc(10_000 + 1_000 * frame as u64),
+			)
+			.unwrap();
+			assert_eq!(packed.len(), 1, "one request packs into one physical frame");
+			let entries = storage_multirow_index_entries_from_frame(&packed[0].frame_bytes)
+				.unwrap()
+				.expect("typed multirow frame exposes per-row entries");
+			mgr.append_durable_multirow_with_locality(tenant(), &packed[0].frame_bytes, &entries)
+				.await
+				.unwrap();
+		}
+		let slab_id = force_seal_active(&mgr).await;
+		let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
+		let acknowledged = mgr.acknowledged_offsets_in_slab(slab_id);
+		let scratch = mgr
+			.reserve_tier_plan_scratch(slab_id, &raw, &acknowledged)
+			.unwrap();
+		let guard = crate::storage::multirow::DecodeCountGuard::start();
+		let rows = mgr
+			.tiered_rows_within(&raw, slab_id, &acknowledged, &scratch)
+			.unwrap();
+		let decodes = guard.finish();
+		assert_eq!(rows.len(), frames * rows_per_frame, "every row");
+		assert!(
+			rows.iter()
+				.all(|row| row.table_object_id == Some(table_object_id)),
+			"each row's table comes from its own position in its frame"
+		);
+		assert_ne!(decodes, 0, "the counter observed the row derivation");
+		assert!(
+			decodes <= frames,
+			"{decodes} decodes for {frames} frames of {rows_per_frame} rows"
+		);
+	}
+}
+
 #[tokio::test]
 async fn tier_stats_build_decodes_single_row_frames_once_each() {
 	// Control: with one row per frame, rows == frames, so the per-row decode
@@ -14298,8 +14351,10 @@ impl SlabManager {
 				let Some(first) = group.first().copied() else {
 					continue;
 				};
-				let frame =
-					Zeroizing::new(extract_record_from_blob(&plaintext, first.old_location)?);
+				let frame = Zeroizing::new(extract_record_from_blob(
+					&plaintext,
+					crate::storage::core::FrameLocation::of_point_read(first.old_location),
+				)?);
 				let Some(compacted) = compact_physical_record_frame(
 					frame.as_ref(),
 					group,
