@@ -433,9 +433,22 @@ pub(super) fn descriptor_matches_tiered_row(
 	}
 }
 
+pub(super) fn single_tenant_id_from_plain_slab(
+	blob: &[u8],
+	slab_id: SlabId,
+	acknowledged: &BTreeSet<u64>,
+) -> std::io::Result<TenantId> {
+	let entries = recover_slab_entries_from_blob(blob, slab_id, acknowledged)?;
+	let tenant_id = single_tenant_of_recovered_entries(&entries, slab_id)?;
+	// Object metadata refused a malformed directory while choosing its chunk size; this check
+	// still does, without choosing one.
+	visit_encoding_directories(blob, &entries, |_| {})?;
+	Ok(tenant_id)
+}
+
 /// The one tenant of these entries. Every entry is checked: a later record can contradict the
 /// first.
-pub(super) fn single_tenant_of_recovered_entries(
+fn single_tenant_of_recovered_entries(
 	entries: &[RecoveredSlabEntry],
 	slab_id: SlabId,
 ) -> std::io::Result<TenantId> {

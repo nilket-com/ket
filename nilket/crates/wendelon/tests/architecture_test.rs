@@ -10854,6 +10854,8 @@ fn every_slab_path_installer_uses_a_fresh_id_or_links_without_replacing() {
 			("op_recovery.rs".to_string(), 6),
 			// open-time discovery (no manager yet)
 			("open.rs".to_string(), 4),
+			// A test hook asking whether a file exists: it installs nothing.
+			("pause_hooks.rs".to_string(), 1),
 			// An existing file only: a rejected output moved out of this namespace,
 			// and an abandoned one read and disposed of after its claim. Nothing is
 			// installed at a slab path. A resumed disposal names the original once more.

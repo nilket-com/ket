@@ -178,6 +178,12 @@ fn dormant_authority_has_no_production_provider_or_activation() {
 					);
 					continue;
 				}
+				// Test code, not activation: this module's allocation counter, by that exact path.
+				let text = if p.ends_with("storage/manager/tests.rs") {
+					text.replace("storage::mutation_visibility::tests::b1_assay", "")
+				} else {
+					text
+				};
 				assert!(
 					!text.contains("storage::mutation_visibility"),
 					"no production activation in slice A"

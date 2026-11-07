@@ -250,7 +250,7 @@ pub(crate) use pause_hooks::LsmPublicationForTest;
 use tiered_io::{
 	RehydratedSlabState, SlabBacking, TierObjectEvidence, TieredPlaintext,
 	build_tiered_object_metadata, decode_tiered_blob, descriptor_matches_tiered_row,
-	extract_record_from_blob, fetch_tiered_ciphertext_runs, single_tenant_of_recovered_entries,
+	extract_record_from_blob, fetch_tiered_ciphertext_runs, single_tenant_id_from_plain_slab,
 	validate_tiered_blob, validate_tiered_record_header_tenant,
 };
 mod compaction;
@@ -4332,19 +4332,6 @@ fn merge_row_tombstone_metadata(
 		}
 		(current, TombstoneMetadata::Untracked) => current,
 	}
-}
-
-fn single_tenant_id_from_plain_slab(
-	blob: &[u8],
-	slab_id: SlabId,
-	acknowledged: &BTreeSet<u64>,
-) -> std::io::Result<TenantId> {
-	let entries = recover_slab_entries_from_blob(blob, slab_id, acknowledged)?;
-	let tenant_id = single_tenant_of_recovered_entries(&entries, slab_id)?;
-	// Object metadata refused a malformed directory while choosing its chunk size; this check
-	// still does, without choosing one.
-	visit_encoding_directories(blob, &entries, |_| {})?;
-	Ok(tenant_id)
 }
 
 fn slab_path(dir: &Path, slab_id: SlabId) -> PathBuf {
