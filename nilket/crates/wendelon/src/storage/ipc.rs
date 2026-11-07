@@ -158,6 +158,60 @@ pub(crate) fn validate_ipc_stream_envelope(bytes: &[u8]) -> std::io::Result<()> 
 	Ok(())
 }
 
+/// The logical rows an IPC stream declares: the sum of its record-batch
+/// messages' `length`, read from the flatbuffer headers without decoding a
+/// body. Spans are checked as `validate_ipc_stream_envelope` checks them; a
+/// negative length, an overflowing sum or an invalid span is an error.
+pub(crate) fn declared_record_batch_rows(bytes: &[u8]) -> std::io::Result<usize> {
+	let invalid = |message: &'static str| Error::new(ErrorKind::InvalidData, message);
+	let mut rows = 0_usize;
+	let mut offset = 0_usize;
+	while offset < bytes.len() {
+		let Some((start, metadata_len)) = read_message_prefix(bytes, &mut offset)
+			.map_err(|error| Error::new(ErrorKind::InvalidData, error))?
+		else {
+			return Ok(rows);
+		};
+		let end = start
+			.checked_add(metadata_len)
+			.ok_or_else(|| invalid("arrow metadata length overflow"))?;
+		if end > bytes.len() {
+			return Err(invalid("arrow metadata extends past stream"));
+		}
+		let message = root_as_message(&bytes[start..end]).map_err(|error| {
+			Error::new(
+				ErrorKind::InvalidData,
+				format!("arrow message flatbuffer parse: {error}"),
+			)
+		})?;
+		if message.header_type() == MessageHeader::RecordBatch {
+			let batch = message
+				.header_as_record_batch()
+				.ok_or_else(|| invalid("arrow record batch message without its header"))?;
+			let length = usize::try_from(batch.length())
+				.map_err(|_| invalid("negative arrow record batch length"))?;
+			rows = rows
+				.checked_add(length)
+				.ok_or_else(|| invalid("arrow record batch rows overflow"))?;
+		}
+		let body_len = usize::try_from(message.bodyLength())
+			.map_err(|_| invalid("negative arrow message body length"))?;
+		let body_end = end
+			.checked_add(body_len)
+			.ok_or_else(|| invalid("arrow body length overflow"))?;
+		if body_end > bytes.len() {
+			return Err(invalid("arrow message body extends past stream"));
+		}
+		offset = body_end
+			.checked_add(pad_to_alignment(8, body_len))
+			.ok_or_else(|| invalid("arrow body padding overflow"))?;
+		if offset > bytes.len() {
+			return Err(invalid("arrow message padding extends past stream"));
+		}
+	}
+	Ok(rows)
+}
+
 pub fn record_batch_compression_policy_from_ipc(
 	bytes: &[u8],
 ) -> std::io::Result<RecordBodyCompressionPolicy> {

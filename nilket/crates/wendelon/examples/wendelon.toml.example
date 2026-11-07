@@ -21,6 +21,10 @@ mode = "bootstrap"
 # Resolved relative to the config file location.
 data_dir = "{{DATA_DIR}}"
 slab_max_bytes = {{SLAB_MAX_BYTES}}
+# ADR 0692 §7 node budget for tier history, publication scratch, proposer
+# tokens and relocation redirects, in bytes. A publication that cannot
+# reserve its history within it is fenced and retried, never grown past it.
+# tier_history_budget_bytes = 268435456
 # Node-local ADR 055 maintenance switch. Leave false for ordinary nodes.
 lsm_compaction_paused = false
 # Control log retention: "compacting" (default) snapshots and purges the

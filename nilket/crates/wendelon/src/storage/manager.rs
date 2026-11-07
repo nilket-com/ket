@@ -207,9 +207,18 @@ mod stats_facts;
 use retention_reclaim::{
 	cleanup_retention_rewrite_tmp_files, retention_rewrite_tmp_path, table_drop_rewrite_tmp_path,
 };
+mod backing_install;
+mod disposal_evidence;
+mod redirect_store;
 mod relocation;
 pub(crate) mod tier_authority;
+mod tier_budget;
+mod tier_deferral;
 mod tier_generation;
+#[cfg(any(test, feature = "test-support"))]
+mod tier_measure;
+mod tier_tokens;
+pub use tier_tokens::{TierProposal, TierSubmission};
 mod tier_plan;
 mod version_identity;
 use tier_generation::{ReadTarget, TierLayout};
@@ -219,7 +228,10 @@ pub use tier_generation::{
 use version_identity::IncomingVersion;
 mod slab_file_quarantine;
 mod tiered_io;
-use relocation::{KeyRelocation, RelocationInsertion, RelocationPair, decrement_reference_count};
+use relocation::{
+	KeyRelocation, RelocationInsertion, RelocationPair, RelocationScratch,
+	decrement_reference_count,
+};
 pub use slab_file_quarantine::{
 	DisagreeingSlabFileReason, QuarantinedSlabFile, QuarantinedSlabFilesReport,
 };
@@ -342,7 +354,14 @@ pub struct SlabManagerConfig {
 	pub group_commit: GroupCommitConfig,
 	/// ADR 022 slab-object encryption service used for L2 object bytes.
 	pub crypto: Arc<CryptoManager>,
+	/// ADR 0692 §7: the node budget, in bytes, for tier history, publication
+	/// scratch, proposer tokens and relocation redirects. A manager whose
+	/// budget cannot hold its own fixed token registry refuses to open.
+	pub tier_history_budget_bytes: u64,
 }
+
+/// The §7 default node budget for tier history: 256 MiB.
+pub const DEFAULT_TIER_HISTORY_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Policy that governs L2 -> L1 slab rehydration.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -690,11 +709,11 @@ pub struct SlabManager {
 	/// published reference. The picker skips only plans touching these slabs;
 	/// transient compaction failures retain their retry behavior.
 	quarantined_compaction_slabs: DashSet<SlabId>,
-	/// Best-effort compatibility map for in-flight readers that
-	/// raced a compaction rewrite. New lookups pivot to the fresh
-	/// location through `key_index`; a stale snapshot of the prior
-	/// location follows this chain to the replacement slab.
-	relocated_reads: DashMap<RecordLocation, RecordLocation>,
+	/// Cross-slab redirects for in-flight readers that raced a maintenance
+	/// rewrite (`redirect_store`). New lookups pivot to the fresh location
+	/// through `key_index`; a stale holder of an old location follows a
+	/// published redirect to the replacement slab.
+	redirects: redirect_store::RedirectStores,
 	/// Persistent restart index for the local slab set.
 	///
 	/// Ordinary record rows remain authoritative in slab bytes plus
@@ -790,12 +809,19 @@ pub struct SlabManager {
 	awaiting_cluster: AtomicBool,
 	/// Tiered slabs retired in this process; a later publication for one is stale.
 	retired_tier_slabs: DashSet<SlabId>,
-	/// Committed tier pointers this node failed to publish, with the typed
-	/// refusal when the failure was one (replayed without retrying the plan).
-	// The optional third field is evidence of an actual Some-index TierSlab
-	// callback. Metadata/comparison refusals never invent replay provenance.
-	unapplied_tier_pointers:
-		DashMap<SlabId, (TieredSlabPointer, Option<StaleLocationReason>, Option<u64>)>,
+	/// The ADR 0692 §7 node budget for tier history and redirect memory.
+	tier_budget: Arc<tier_budget::TierMemoryBudget>,
+	/// Proposer history reservations awaiting their outcome (§7 tokens).
+	tier_tokens: Arc<tier_tokens::TierTokenRegistry>,
+	/// Committed tier pointers this node failed to publish, with the outcome
+	/// of the apply that could not (`tier_deferral`).
+	unapplied_tier_pointers: DashMap<SlabId, tier_deferral::TierDeferral>,
+	/// The committed tier state this manager observes, once bound
+	/// (`TierObserver::bind_tier_snapshot_source`); the replay revalidates
+	/// against it.
+	canonical_tier_source: std::sync::OnceLock<crate::consensus::TierSnapshotSource>,
+	#[cfg(test)]
+	replay_probe: tier_deferral::ReplayProbe,
 	#[cfg(test)]
 	counter_rollback_fail_once: std::sync::atomic::AtomicBool,
 	#[cfg(test)]
@@ -933,6 +959,9 @@ struct ManagerState {
 	/// Each tiered slab's published generation history; absent means
 	/// generation 0 with no history.
 	tier_layouts: DashMap<SlabId, Arc<TierLayout>>,
+	/// Slabs whose backing an authorized disposal removed
+	/// (`disposal_evidence`).
+	disposal_evidence: disposal_evidence::DisposalEvidence,
 }
 
 impl ManagerState {
@@ -3270,7 +3299,7 @@ impl SlabManager {
 		let sealed_slab = std::mem::replace(&mut state.active, next_slab.clone());
 		let sealed_id = sealed_slab.slab_id();
 		let sealed_size = sealed_slab.write_cursor();
-		state.sealed.insert(sealed_id, sealed_slab);
+		state.install_sealed(&self.tier_budget, sealed_id, sealed_slab);
 		state.advance_slab_allocator(next_id.saturating_add(1));
 		self.record_l0_compaction_run(sealed_id, sealed_size);
 
@@ -3321,7 +3350,7 @@ impl SlabManager {
 
 	fn relocate_read_location(&self, mut location: RecordLocation) -> RecordLocation {
 		for _ in 0..8 {
-			let Some(next) = self.relocated_reads.get(&location).map(|entry| *entry) else {
+			let Some(next) = self.redirects.resolve(&location) else {
 				return location;
 			};
 			if next == location {
@@ -3694,6 +3723,20 @@ impl SlabManager {
 	fn record_rows_for_slab(&self, slab_id: SlabId) -> std::io::Result<Vec<PersistentRecordRow>> {
 		self.require_tier_authority_ready()?;
 		Ok(self.record_rows_for_slab_for_recovery(slab_id))
+	}
+
+	/// How many index rows name `slab_id`, counted without collecting them.
+	fn count_record_rows_for_slab(&self, slab_id: SlabId) -> usize {
+		self.key_index
+			.iter()
+			.map(|entry| {
+				entry
+					.value()
+					.iter()
+					.filter(|location| location.slab_id == slab_id)
+					.count()
+			})
+			.sum()
 	}
 
 	fn record_rows_for_slab_for_recovery(&self, slab_id: SlabId) -> Vec<PersistentRecordRow> {

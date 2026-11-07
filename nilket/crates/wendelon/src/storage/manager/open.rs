@@ -763,6 +763,13 @@ impl SlabManager {
 				.ok_or_else(|| Error::other("snapshot epoch exhausted"))?,
 			None => 1,
 		};
+		let tier_budget =
+			super::tier_budget::TierMemoryBudget::new(config.tier_history_budget_bytes);
+		#[cfg(feature = "test-support")]
+		crate::metrics::global().set_tier_measurement_source(std::sync::Arc::downgrade(
+			&(tier_budget.clone() as std::sync::Arc<dyn crate::metrics::TierMeasurementSource>),
+		));
+		let tier_tokens = super::tier_tokens::TierTokenRegistry::new(&tier_budget)?;
 		let manager = Arc::new(Self {
 			_directory_owner: owner,
 			finality_observation:
@@ -778,6 +785,7 @@ impl SlabManager {
 				rehydrating: HashSet::new(),
 				next_slab_id,
 				tier_layouts: DashMap::new(),
+				disposal_evidence: Default::default(),
 			}),
 			compaction_manifest: RwLock::new(compaction_manifest),
 			slab_pins: Arc::new(SlabPinTable::default()),
@@ -795,7 +803,7 @@ impl SlabManager {
 			secondary_index_table_references_by_slab,
 			integrity_failures: DashMap::new(),
 			quarantined_compaction_slabs: DashSet::new(),
-			relocated_reads: DashMap::new(),
+			redirects: Default::default(),
 			persistent_index,
 			pending_metadata_tokens,
 			completed_metadata_retries: DashMap::new(),
@@ -832,7 +840,12 @@ impl SlabManager {
 			snapshot_epoch_gate: Arc::new(std::sync::RwLock::new(())),
 			awaiting_cluster: AtomicBool::new(awaiting_cluster),
 			retired_tier_slabs: DashSet::new(),
+			tier_budget: tier_budget.clone(),
+			tier_tokens,
 			unapplied_tier_pointers: DashMap::new(),
+			canonical_tier_source: std::sync::OnceLock::new(),
+			#[cfg(test)]
+			replay_probe: Default::default(),
 			#[cfg(test)]
 			counter_rollback_fail_once: std::sync::atomic::AtomicBool::new(false),
 			#[cfg(test)]

@@ -447,6 +447,7 @@ impl SlabManager {
 			return Ok(());
 		};
 		let _gate = self.persistent_index_gate.clone().write_owned().await;
+		self.clear_disposal_evidence().await;
 		if !self.lsm_install_unresolved.is_empty() || !self.pending_index_publications.is_empty() {
 			return Err(stale_location_error(
 				SlabId::ZERO,

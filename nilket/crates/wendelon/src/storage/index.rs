@@ -505,6 +505,24 @@ pub(crate) struct PersistentIndexUpdate {
 	pub put_lsm_runs: Vec<LsmRunSummary>,
 	pub delete_lsm_run_ids: Vec<SlabId>,
 	pub last_control_log_index: Option<u64>,
+	/// A budget charge for the memory this update holds (ADR 0692 §7: the
+	/// row copies of a tier publication). It moves with the update into the
+	/// blocking worker and is released only when that worker drops it.
+	pub retained_charge: Option<RetainedCharge>,
+}
+
+/// An opaque keep-alive for a charge that must live as long as the memory it
+/// pays for, wherever that memory moves.
+#[derive(Clone)]
+pub(crate) struct RetainedCharge(
+	#[allow(dead_code, reason = "a keep-alive: held, never read")]
+	pub(crate)  std::sync::Arc<dyn std::any::Any + Send + Sync>,
+);
+
+impl std::fmt::Debug for RetainedCharge {
+	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		formatter.write_str("RetainedCharge")
+	}
 }
 
 pub(crate) struct PersistentLocalIndex {
@@ -530,6 +548,15 @@ pub(crate) struct PersistentLocalIndex {
 	pub(crate) fail_next_retirement: std::sync::atomic::AtomicBool,
 	#[cfg(test)]
 	pub(crate) fail_cleanup_after_provisional_remove: std::sync::atomic::AtomicBool,
+	/// Test seam: hold the next guarded delta inside its blocking worker,
+	/// before the worker consumes the update's row copies.
+	#[cfg(test)]
+	pub(crate) guarded_delta_before_rows_hold: std::sync::Mutex<
+		Option<(
+			std::sync::mpsc::SyncSender<()>,
+			std::sync::mpsc::Receiver<()>,
+		)>,
+	>,
 	#[cfg(test)]
 	pub(crate) guarded_delta_before_commit_hold: std::sync::Mutex<
 		Option<(
@@ -1084,6 +1111,8 @@ impl PersistentLocalIndex {
 			#[cfg(test)]
 			fail_cleanup_after_provisional_remove: Default::default(),
 			#[cfg(test)]
+			guarded_delta_before_rows_hold: Default::default(),
+			#[cfg(test)]
 			guarded_delta_before_commit_hold: Default::default(),
 			#[cfg(test)]
 			guarded_delta_commit_hold: Default::default(),
@@ -1584,9 +1613,21 @@ impl PersistentLocalIndex {
 		let commit_hold = self.guarded_delta_commit_hold.lock().unwrap().clone();
 		#[cfg(test)]
 		let before_commit_hold = self.guarded_delta_before_commit_hold.lock().unwrap().take();
+		#[cfg(test)]
+		let before_rows_hold = self.guarded_delta_before_rows_hold.lock().unwrap().take();
 		self.db
 			.run(move |db| {
 				let _publication = publication;
+				// Bind the charge by name: a closure captures only the fields it
+				// uses, and the row copies below must stay charged until they drop.
+				let _retained_charge = update.retained_charge;
+				#[cfg(test)]
+				if let Some((entered, release)) = before_rows_hold {
+					// A test that already gave up drops both ends; never wait on it.
+					if entered.send(()).is_ok() {
+						let _ = release.recv();
+					}
+				}
 				let write_txn = db.begin_write().map_err(redb_to_io)?;
 				let mut degradation_counts = (0, 0);
 				let mut missing_cleanup_supersessions = Vec::new();

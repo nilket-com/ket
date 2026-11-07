@@ -1518,6 +1518,9 @@ impl SlabManager {
 				self.release_slab_file(slab_id);
 			}
 		}
+		// The old slab is disposed: its redirects go with it.
+		self.redirects.remove_touching(&self.tier_budget, slab_id);
+		self.record_disposal_evidence(slab_id).await;
 		for record in records {
 			self.rollback_indexed_location(
 				record.tenant_id,
@@ -1693,7 +1696,7 @@ impl SlabManager {
 			relocated_sources.insert(relocation.old_location);
 			by_key
 				.entry((relocation.tenant_id, relocation.key_identity))
-				.or_insert_with(|| KeyRelocation::new(relocation.routing_locality, true))
+				.or_insert_with(|| KeyRelocation::new(relocation.routing_locality, None))
 				.pairs
 				.push(RelocationPair {
 					old: relocation.old_location,
@@ -1708,7 +1711,7 @@ impl SlabManager {
 			relocated_sources.insert(relocation.old_location);
 			by_key
 				.entry((relocation.tenant_id, relocation.key_identity))
-				.or_insert_with(|| KeyRelocation::new(relocation.routing_locality, true))
+				.or_insert_with(|| KeyRelocation::new(relocation.routing_locality, None))
 				.pairs
 				.push(RelocationPair {
 					old: relocation.old_location,
@@ -1720,7 +1723,7 @@ impl SlabManager {
 			if !relocated_sources.contains(&record.old_location) {
 				by_key
 					.entry((record.tenant_id, record.key_identity))
-					.or_insert_with(|| KeyRelocation::new(record.routing_locality, true))
+					.or_insert_with(|| KeyRelocation::new(record.routing_locality, None))
 					.removals
 					.push(record.old_location);
 			}
@@ -1747,6 +1750,32 @@ impl SlabManager {
 			{
 				return Ok(false);
 			}
+		}
+
+		// Optional cross-slab redirects (ADR 0692 §7): reserved and built here,
+		// before D2, outside any other covered allocation. A map that cannot be
+		// is skipped and counted; the old slab stays sealed for stale holders.
+		let redirect_count = by_key
+			.values()
+			.map(|relocation| relocation.pairs.len())
+			.sum();
+		let redirect_install = super::redirect_store::SourceRedirects::try_build(
+			&self.tier_budget,
+			old_slab_id,
+			new_slab_id,
+			redirect_count,
+			by_key
+				.values()
+				.flat_map(|relocation| relocation.pairs.iter().map(|pair| (pair.old, pair.new))),
+		)
+		.and_then(|map| self.redirects.reserve_install(&self.tier_budget, map));
+		match &redirect_install {
+			Some(install) => {
+				for relocation in by_key.values_mut() {
+					relocation.redirects = Some(install.map().clone());
+				}
+			}
+			None => crate::metrics::global().relocation_redirects_skipped.inc(),
 		}
 
 		let index_publication = self
@@ -1804,12 +1833,22 @@ impl SlabManager {
 		// single key critical section. A stale holder of an old location follows
 		// the published redirect, or reads the retained old backing.
 		let state = self.state.lock().await;
-		state.sealed.insert(new_slab_id, replacement);
+		state.install_sealed(&self.tier_budget, new_slab_id, replacement);
+		// Installed before the key edits, so each applied pair's published bit
+		// is visible to readers of the store from then on.
+		if let Some(install) = redirect_install
+			&& !self.redirects.install(install)
+		{
+			crate::metrics::global().relocation_redirects_skipped.inc();
+		}
 		let mut refused_rows = Vec::new();
 		let mut relocated_any = false;
 		for ((tenant_id, key_identity), relocation) in &by_key {
-			for (_, new) in self.relocate_indexed_locations(*tenant_id, *key_identity, relocation) {
-				refused_rows.push(self.persistent_record_row(*tenant_id, *key_identity, new));
+			let mut scratch = RelocationScratch::for_relocation(relocation);
+			for (_, new) in
+				self.relocate_indexed_locations(*tenant_id, *key_identity, relocation, &mut scratch)
+			{
+				refused_rows.push(self.persistent_record_row(*tenant_id, *key_identity, *new));
 			}
 			if !relocated_any {
 				relocated_any = true;

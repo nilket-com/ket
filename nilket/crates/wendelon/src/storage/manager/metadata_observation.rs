@@ -294,7 +294,11 @@ impl SlabManager {
 				if last_control_log_index.is_some() {
 					self.unapplied_tier_pointers.insert(
 						slab_id,
-						(pointer.clone(), Some(StaleLocationReason::Fenced), None),
+						super::tier_deferral::TierDeferral::fenced(
+							pointer.clone(),
+							super::tier_deferral::FenceCause::Staged,
+							None,
+						),
 					);
 				}
 				publication.complete();

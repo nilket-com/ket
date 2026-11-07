@@ -2335,11 +2335,24 @@ async fn fresh_manager_with_l2(
 	Arc<SlabManager>,
 	Arc<dyn ObjectStore>,
 ) {
+	fresh_manager_with_wrapped_l2(tag, |l2| l2).await
+}
+
+/// `fresh_manager_with_l2`, with the manager's L2 store wrapped by `wrap`.
+async fn fresh_manager_with_wrapped_l2(
+	tag: &str,
+	wrap: impl FnOnce(Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore>,
+) -> (
+	[crate::test_support::TestDir; 2],
+	Arc<SlabManager>,
+	Arc<dyn ObjectStore>,
+) {
 	let l1_dir = fresh_dir(&format!("{tag}-l1"));
 	let l2_root = fresh_dir(&format!("{tag}-l2"));
-	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
+	let l2: Arc<dyn ObjectStore> = wrap(Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap()));
 	let io = spawn_io_thread(64).unwrap();
 	let manager = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: l1_dir.to_path_buf(),
 		max_slab_bytes: 1 << 20,
 		io,
@@ -2671,7 +2684,10 @@ struct DirectLsmCommitter {
 
 #[async_trait]
 impl TierCommitter for DirectLsmCommitter {
-	async fn commit_tier_slab(&self, _tier: crate::consensus::TieredSlab) -> std::io::Result<()> {
+	async fn commit_tier_slab(
+		&self,
+		_proposal: crate::storage::TierProposal,
+	) -> std::io::Result<()> {
 		Err(Error::new(
 			ErrorKind::Unsupported,
 			"tier commits are not used by this test committer",
@@ -2699,8 +2715,14 @@ struct DirectTierCommitter {
 
 #[async_trait]
 impl TierCommitter for DirectTierCommitter {
-	async fn commit_tier_slab(&self, tier: TieredSlab) -> std::io::Result<()> {
-		self.manager
+	async fn commit_tier_slab(
+		&self,
+		proposal: crate::storage::TierProposal,
+	) -> std::io::Result<()> {
+		let tier = proposal.tier().clone();
+		let submission = proposal.begin_submission()?;
+		let applied = self
+			.manager
 			.apply_tier_slab(TieredSlabPointer {
 				slab_id: tier.slab_id,
 				l2_uri: tier.l2_uri,
@@ -2714,7 +2736,11 @@ impl TierCommitter for DirectTierCommitter {
 				tombstone_metadata: tier.tombstone_metadata,
 				supersession_metadata: tier.supersession_metadata,
 			})
-			.await
+			.await;
+		if applied.is_ok() {
+			submission.applied();
+		}
+		applied
 	}
 
 	async fn retire_tiered_slab(&self, slab_id: SlabId) -> std::io::Result<()> {
@@ -2726,7 +2752,10 @@ struct FailingLsmCommitter;
 
 #[async_trait]
 impl TierCommitter for FailingLsmCommitter {
-	async fn commit_tier_slab(&self, _tier: crate::consensus::TieredSlab) -> std::io::Result<()> {
+	async fn commit_tier_slab(
+		&self,
+		_proposal: crate::storage::TierProposal,
+	) -> std::io::Result<()> {
 		Err(Error::new(
 			ErrorKind::Unsupported,
 			"tier commits are not used by this test committer",
@@ -2751,6 +2780,7 @@ async fn fresh_manager_with_group_commit(
 	let dir = fresh_dir("mv");
 	let io = spawn_io_thread(64).unwrap();
 	let manager = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dir.to_path_buf(),
 		// Large enough that no rotation fires during tests;
 		// we want every version in the same active slab so
@@ -2780,6 +2810,7 @@ async fn initialize_manager_at_dir(
 	crypto: Arc<CryptoManager>,
 ) -> Arc<SlabManager> {
 	SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir,
 		max_slab_bytes: 1024 * 1024,
 		io,
@@ -2805,6 +2836,7 @@ async fn open_manager_at_dir(
 	crypto: Arc<CryptoManager>,
 ) -> Arc<SlabManager> {
 	SlabManager::open(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir,
 		max_slab_bytes: 1024 * 1024,
 		io,
@@ -4361,6 +4393,7 @@ async fn fctr5a_lsm_compacts_tiered_ordinary_l0_with_local_runs() {
 	let io = spawn_io_thread(64).unwrap();
 	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_dir).unwrap());
 	let manager = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: l1_dir.to_path_buf(),
 		max_slab_bytes: 1,
 		io: io.clone(),
@@ -5628,7 +5661,10 @@ struct PausingLsmCommitter {
 
 #[async_trait]
 impl TierCommitter for PausingLsmCommitter {
-	async fn commit_tier_slab(&self, _tier: crate::consensus::TieredSlab) -> std::io::Result<()> {
+	async fn commit_tier_slab(
+		&self,
+		_proposal: crate::storage::TierProposal,
+	) -> std::io::Result<()> {
 		Err(Error::new(ErrorKind::Unsupported, "unused"))
 	}
 
@@ -6946,6 +6982,7 @@ async fn stats_advisory_drift_fails_closed_to_unavailable() {
 	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
 	let io = spawn_io_thread(64).unwrap();
 	let mgr = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: l1_dir.to_path_buf(),
 		max_slab_bytes: 1 << 20,
 		io,
@@ -7171,6 +7208,7 @@ async fn tiered_retention_rewrite_recomputes_stats_from_survivors() {
 	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
 	let io = spawn_io_thread(64).unwrap();
 	let mgr = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: l1_dir.to_path_buf(),
 		max_slab_bytes: 1 << 20,
 		io,
@@ -7337,6 +7375,7 @@ async fn tiered_retention_rewrite_filters_partial_multirow_storage_records() {
 	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
 	let io = spawn_io_thread(64).unwrap();
 	let mgr = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: l1_dir.to_path_buf(),
 		max_slab_bytes: 1 << 20,
 		io,
@@ -7695,6 +7734,7 @@ async fn table_drop_reclaim_rewrites_tiered_target_rows() {
 	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
 	let io = spawn_io_thread(64).unwrap();
 	let mgr = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: l1_dir.to_path_buf(),
 		max_slab_bytes: 1 << 20,
 		io,
@@ -8134,6 +8174,7 @@ async fn tiered_retention_rewrite_pair_gc_drops_data_and_row_tombstone() {
 	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
 	let io = spawn_io_thread(64).unwrap();
 	let mgr = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: l1_dir.to_path_buf(),
 		max_slab_bytes: 1 << 20,
 		io,
@@ -8255,6 +8296,7 @@ async fn tiered_table_retention_keeps_pk_boundary_tombstone_under_cluster_floor(
 	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
 	let io = spawn_io_thread(64).unwrap();
 	let mgr = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: l1_dir.to_path_buf(),
 		max_slab_bytes: 1 << 20,
 		io,
@@ -8399,6 +8441,7 @@ async fn tiered_table_retention_rewrite_prunes_append_only_rows_when_cluster_ret
 	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
 	let io = spawn_io_thread(64).unwrap();
 	let mgr = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: l1_dir.to_path_buf(),
 		max_slab_bytes: 1 << 20,
 		io,
@@ -8532,6 +8575,7 @@ async fn tiered_table_retention_reports_lag_without_rewrite_for_pair_waiting_on_
 	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
 	let io = spawn_io_thread(64).unwrap();
 	let mgr = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: l1_dir.to_path_buf(),
 		max_slab_bytes: 1 << 20,
 		io,
@@ -9103,6 +9147,7 @@ async fn recovery_fails_closed_on_cross_slab_consecutive_pk_tombstones() {
 	drop(manager);
 
 	let reopened = SlabManager::open(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dir.to_path_buf(),
 		max_slab_bytes: 1024 * 1024,
 		io,
@@ -9131,6 +9176,7 @@ async fn recovery_fails_closed_on_cross_slab_consecutive_pk_tombstones() {
 async fn recovery_reopens_mixed_record_body_compression_slab() {
 	let dir = fresh_dir("mixed-compression-recovery");
 	let mgr = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dir.to_path_buf(),
 		max_slab_bytes: 1024 * 1024,
 		io: spawn_io_thread(64).unwrap(),
@@ -9201,6 +9247,7 @@ async fn recovery_reopens_mixed_record_body_compression_slab() {
 	drop(mgr);
 
 	let reopened = SlabManager::open(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dir.to_path_buf(),
 		max_slab_bytes: 1024 * 1024,
 		io: spawn_io_thread(64).unwrap(),
@@ -9240,6 +9287,7 @@ async fn l2_reads_mixed_record_body_compression_slab() {
 	let l2_dir = fresh_dir("mixed-compression-l2-objects");
 	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_dir).unwrap());
 	let mgr = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: l1_dir.to_path_buf(),
 		max_slab_bytes: 1024 * 1024,
 		io: spawn_io_thread(64).unwrap(),
@@ -9490,6 +9538,7 @@ async fn compression_resident_gauge_counts_tiered_uncompressed_frames() {
 	let l2_dir = fresh_dir("compression-gauge-tiered-l2");
 	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_dir).unwrap());
 	let mgr = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: l1_dir.to_path_buf(),
 		max_slab_bytes: 1024 * 1024,
 		io: spawn_io_thread(64).unwrap(),
@@ -9620,6 +9669,7 @@ async fn projected_l2_read_materializes_sparse_multirow_record() {
 	let l2_dir = fresh_dir("projected-l2-l2");
 	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_dir).unwrap());
 	let mgr = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: l1_dir.to_path_buf(),
 		max_slab_bytes: 1024 * 1024 * 16,
 		io: spawn_io_thread(64).unwrap(),
@@ -9785,6 +9835,7 @@ async fn row_group_l2_point_read_materializes_projected_group() {
 	let l2_dir = fresh_dir("row-group-l2-l2");
 	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_dir).unwrap());
 	let mgr = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: l1_dir.to_path_buf(),
 		max_slab_bytes: 1024 * 1024 * 16,
 		io: spawn_io_thread(64).unwrap(),
@@ -10678,6 +10729,7 @@ async fn fsst_phase_b_l2_read_filters_a1_and_declines_a2_overlap() {
 		.enabled_predicate_evaluators
 		.insert(crate::storage::encoding::compute::EncodingComputeEvaluatorKind::FsstWholeBuffer);
 	let mgr = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: l1_dir.to_path_buf(),
 		max_slab_bytes: 1024 * 1024 * 16,
 		io: spawn_io_thread(64).unwrap(),
@@ -11209,6 +11261,7 @@ async fn sparse_projection_fetch_materializes_exact_cocd_clustered_pages() {
 	)));
 	let l2: Arc<dyn ObjectStore> = l2_counter.clone();
 	let mgr = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: l1_dir.to_path_buf(),
 		max_slab_bytes: 1024 * 1024 * 16,
 		io: spawn_io_thread(64).unwrap(),
@@ -11602,6 +11655,7 @@ async fn sparse_projection_fetch_materializes_exact_cocd_clustered_pages() {
 	)));
 	let scalar_l2: Arc<dyn ObjectStore> = scalar_l2_counter.clone();
 	let scalar_mgr = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: scalar_l1_dir.to_path_buf(),
 		max_slab_bytes: 1024 * 1024 * 16,
 		io: spawn_io_thread(64).unwrap(),
@@ -11825,6 +11879,7 @@ async fn adr061_enabled_chunk_layout_writes_16k_encrypted_slab() {
 		..Default::default()
 	};
 	let mgr = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dir.to_path_buf(),
 		max_slab_bytes: 1024 * 1024 * 16,
 		io: spawn_io_thread(64).unwrap(),
@@ -11988,6 +12043,7 @@ async fn encoding_secondary_index_fetches_only_selected_simd_pages() {
 	let l2_dir = fresh_dir("encoding-index-l2");
 	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_dir).unwrap());
 	let mgr = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: l1_dir.to_path_buf(),
 		max_slab_bytes: 1024 * 1024 * 16,
 		io: spawn_io_thread(64).unwrap(),
@@ -12736,6 +12792,7 @@ async fn scan_as_of_scopes_locality_membership_per_tenant() {
 async fn custom_routing_locality_survives_reopen() {
 	let dir = fresh_dir("custom-locality-reopen");
 	let manager = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dir.to_path_buf(),
 		max_slab_bytes: 1024 * 1024,
 		io: spawn_io_thread(64).unwrap(),
@@ -12775,6 +12832,7 @@ async fn custom_routing_locality_survives_reopen() {
 	drop(manager);
 
 	let reopened = SlabManager::open(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dir.to_path_buf(),
 		max_slab_bytes: 1024 * 1024,
 		io: spawn_io_thread(64).unwrap(),
@@ -12875,6 +12933,7 @@ async fn reopen_restores_tiered_rows_from_redb() {
 	let crypto = test_crypto();
 
 	let manager = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: l1_dir.to_path_buf(),
 		max_slab_bytes: 1,
 		io: io.clone(),
@@ -12949,6 +13008,7 @@ async fn reopen_restores_tiered_rows_from_redb() {
 	drop(manager);
 
 	let reopened = SlabManager::open(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: l1_dir.to_path_buf(),
 		max_slab_bytes: 1,
 		io,
@@ -13092,6 +13152,7 @@ async fn reopen_after_tombstone_compaction_preserves_survivor_lookup() {
 	let dir = fresh_dir("compaction-redb");
 	let io = spawn_io_thread(64).unwrap();
 	let manager = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dir.to_path_buf(),
 		max_slab_bytes: 1024 * 1024,
 		io: io.clone(),
@@ -13186,6 +13247,7 @@ async fn reopen_after_tombstone_compaction_preserves_survivor_lookup() {
 	drop(manager);
 
 	let reopened = SlabManager::open(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dir.to_path_buf(),
 		max_slab_bytes: 1024 * 1024,
 		io,
@@ -13219,6 +13281,7 @@ async fn lsm_compaction_does_not_retain_empty_active_slabs() {
 	let dir = fresh_dir("lsm-empty-active");
 	let io = spawn_io_thread(16).unwrap();
 	let manager = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dir.to_path_buf(),
 		max_slab_bytes: 1,
 		io: io.clone(),
@@ -13297,6 +13360,7 @@ async fn lsm_compaction_does_not_retain_empty_active_slabs() {
 
 	drop(manager);
 	let reopened = SlabManager::open(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dir.to_path_buf(),
 		max_slab_bytes: 1,
 		io,
@@ -13325,6 +13389,7 @@ async fn recovery_skips_zero_length_sealed_slabs_but_preserves_records_and_activ
 	let dir = fresh_dir("recovery-empty-sealed");
 	let io = spawn_io_thread(16).unwrap();
 	let manager = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dir.to_path_buf(),
 		max_slab_bytes: 1,
 		io: io.clone(),
@@ -13357,6 +13422,7 @@ async fn recovery_skips_zero_length_sealed_slabs_but_preserves_records_and_activ
 	}
 
 	let reopened = SlabManager::open(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dir.to_path_buf(),
 		max_slab_bytes: 1,
 		io,
@@ -13395,6 +13461,7 @@ async fn recovery_refuses_before_opening_more_than_the_slab_bound() {
 	}
 
 	let error = match SlabManager::open(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dir.to_path_buf(),
 		max_slab_bytes: 1,
 		io,
@@ -14413,6 +14480,7 @@ async fn repair_fixture_manager(
 	initialize: bool,
 ) -> Arc<SlabManager> {
 	let config = SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dir.to_path_buf(),
 		max_slab_bytes: 1,
 		io,
@@ -14609,6 +14677,7 @@ async fn adr0084_repair_refuses_without_a_durable_index() {
 async fn adr0089_locality_intervals_yield_exactly_the_rows_inside_them() {
 	let dir = fresh_dir("adr0089-range-discoverability");
 	let manager = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dir.to_path_buf(),
 		max_slab_bytes: 1024 * 1024,
 		io: spawn_io_thread(64).unwrap(),
@@ -15261,6 +15330,7 @@ async fn adr0090_compaction_preserves_partitioned_placement() {
 	let dir = fresh_dir("adr0090-compaction-placement");
 	let io = spawn_io_thread(64).unwrap();
 	let manager = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dir.to_path_buf(),
 		max_slab_bytes: 1024 * 1024,
 		io: io.clone(),
@@ -15835,6 +15905,7 @@ async fn open_policed_manager(
 	initialize: bool,
 ) -> Arc<SlabManager> {
 	let config = SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir,
 		// Every append rotates, so five appends are five L0 runs.
 		max_slab_bytes: 1,
@@ -16070,6 +16141,7 @@ async fn tombstone_reclaim_is_policed() {
 	            io: crate::storage::io_uring::IoRingHandle,
 	            fresh: bool| async move {
 		let config = SlabManagerConfig {
+			tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 			dir: dir.to_path_buf(),
 			max_slab_bytes: 1024 * 1024,
 			io,
@@ -18009,6 +18081,7 @@ async fn repeated_tier_row_refresh_is_idempotent_and_keeps_rows_visible() {
 		old_rows: plan.old_rows.clone(),
 		new_rows: plan.new_rows.clone(),
 		relocated_reads: plan.relocated_reads.clone(),
+		scratch: plan.scratch.clone(),
 	};
 	drop(plan);
 	// The authorized refresh: installs the rewritten pointer and applies the
@@ -18371,6 +18444,7 @@ async fn tier_reads_stay_valid_after_restart_before_publication() {
 	} = fixture;
 	drop(mgr);
 	let reopened = SlabManager::open(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dirs[0].to_path_buf(),
 		max_slab_bytes: 1 << 20,
 		io: spawn_io_thread(64).unwrap(),
@@ -18827,6 +18901,7 @@ async fn try_restart_tier_manager(
 		.replace_keysets_from_authoritative_snapshot(&keysets)
 		.unwrap();
 	SlabManager::open(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dirs[0].to_path_buf(),
 		max_slab_bytes: 1 << 20,
 		io: spawn_io_thread(64).unwrap(),
@@ -20122,6 +20197,7 @@ async fn restart_tier_manager_with(
 		.unwrap();
 	before_open(&dirs[0]);
 	let manager = SlabManager::open(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dirs[0].to_path_buf(),
 		max_slab_bytes: 1 << 20,
 		io: spawn_io_thread(64).unwrap(),
@@ -20558,7 +20634,14 @@ async fn a_disagreeing_slab_file_survives_tier_retirement_its_retry_and_deferred
 		.read(held)
 		.await
 		.expect_err("a location of the retired slab never serves");
-	assert_eq!(error.kind(), ErrorKind::NotFound, "{error}");
+	// Tier retirement is an authorized disposal (ADR 0696, plan r3 D): the
+	// stale holder gets the typed refusal, where it once got an untyped
+	// `NotFound`.
+	assert_eq!(
+		stale_location(&error).map(|stale| stale.reason),
+		Some(StaleLocationReason::Superseded),
+		"{error}"
+	);
 }
 
 #[tokio::test]
@@ -21206,7 +21289,11 @@ struct UnpublishedDropCommitter {
 
 #[async_trait]
 impl TierCommitter for UnpublishedDropCommitter {
-	async fn commit_tier_slab(&self, tier: TieredSlab) -> std::io::Result<()> {
+	async fn commit_tier_slab(
+		&self,
+		proposal: crate::storage::TierProposal,
+	) -> std::io::Result<()> {
+		let tier = proposal.tier().clone();
 		let pointer = TieredSlabPointer {
 			slab_id: tier.slab_id,
 			l2_uri: tier.l2_uri,
@@ -21226,7 +21313,18 @@ impl TierCommitter for UnpublishedDropCommitter {
 		std::fs::rename(&path, &hidden).unwrap();
 		let apply = self.manager.apply_tier_slab(pointer).await;
 		std::fs::rename(&hidden, &path).unwrap();
-		assert_eq!(apply.unwrap_err().kind(), ErrorKind::NotFound);
+		// An unavailable L2 object fences the publication typed, for retry
+		// (ADR 0696 fast follow item 3); it once failed untyped `NotFound`.
+		let error = apply.unwrap_err();
+		assert_eq!(
+			stale_location(&error).map(|stale| stale.reason),
+			Some(StaleLocationReason::Fenced),
+			"{error}"
+		);
+		assert_eq!(
+			super::tier_deferral::fence_cause(&error),
+			Some(super::tier_deferral::FenceCause::L2Unavailable)
+		);
 		Ok(())
 	}
 
@@ -21248,6 +21346,7 @@ async fn unpublished_drop_fixture() -> (
 	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
 	let io = spawn_io_thread(64).unwrap();
 	let mgr = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: l1_dir.to_path_buf(),
 		max_slab_bytes: 1 << 20,
 		io,
@@ -21432,19 +21531,21 @@ async fn table_drop_cleanup_refuses_to_delete_either_object_with_an_unpublished_
 		.await
 		.unwrap();
 	committer
-		.commit_tier_slab(TieredSlab {
-			slab_id: old.slab_id,
-			l2_uri: new_uri,
-			payload_hash: old.payload_hash,
-			is_encrypted: old.is_encrypted,
-			tenant_id: old.tenant_id,
-			tenant_kek_id: old.tenant_kek_id,
-			stats_format_version: old.stats_format_version,
-			stats_block_len: old.stats_block_len,
-			stats_block_hash128: old.stats_block_hash128,
-			tombstone_metadata: old.tombstone_metadata,
-			supersession_metadata: old.supersession_metadata,
-		})
+		.commit_tier_slab(crate::storage::TierProposal::unreserved_for_test(
+			TieredSlab {
+				slab_id: old.slab_id,
+				l2_uri: new_uri,
+				payload_hash: old.payload_hash,
+				is_encrypted: old.is_encrypted,
+				tenant_id: old.tenant_id,
+				tenant_kek_id: old.tenant_kek_id,
+				stats_format_version: old.stats_format_version,
+				stats_block_len: old.stats_block_len,
+				stats_block_hash128: old.stats_block_hash128,
+				tombstone_metadata: old.tombstone_metadata,
+				supersession_metadata: old.supersession_metadata,
+			},
+		))
 		.await
 		.unwrap();
 	let committed = committer.committed.lock().await.clone().unwrap();
@@ -21492,7 +21593,11 @@ struct AmbiguousDropCommitter {
 
 #[async_trait]
 impl TierCommitter for AmbiguousDropCommitter {
-	async fn commit_tier_slab(&self, tier: TieredSlab) -> std::io::Result<()> {
+	async fn commit_tier_slab(
+		&self,
+		proposal: crate::storage::TierProposal,
+	) -> std::io::Result<()> {
+		let tier = proposal.tier().clone();
 		let pointer = TieredSlabPointer {
 			slab_id: tier.slab_id,
 			l2_uri: tier.l2_uri,
@@ -22036,7 +22141,7 @@ async fn different_record_classes_at_one_version_conflict_through_relocation() {
 		])
 	);
 	let active = mgr.state.lock().await.active.clone();
-	let mut relocation = KeyRelocation::new(Locality::from(key), true);
+	let mut relocation = KeyRelocation::new(Locality::from(key), None);
 	for (old, (header, bytes)) in copies.iter().zip(frames) {
 		let new = active
 			.write_framed(
@@ -22055,8 +22160,13 @@ async fn different_record_classes_at_one_version_conflict_through_relocation() {
 		});
 	}
 	assert!(
-		mgr.relocate_indexed_locations(tenant(), key, &relocation)
-			.is_empty()
+		mgr.relocate_indexed_locations(
+			tenant(),
+			key,
+			&relocation,
+			&mut RelocationScratch::for_relocation(&relocation),
+		)
+		.is_empty()
 	);
 	for pair in relocation.pairs {
 		for location in [pair.old, pair.new] {
@@ -22095,6 +22205,7 @@ async fn reopen_duplicate_fixture(
 		.replace_keysets_from_authoritative_snapshot(&keysets)
 		.unwrap();
 	SlabManager::open(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dirs[0].to_path_buf(),
 		max_slab_bytes: 1 << 20,
 		io: spawn_io_thread(64).unwrap(),
@@ -22712,6 +22823,7 @@ async fn unverified_authority_close_joins_the_flight_and_reopen_has_a_new_owner(
 	let owner = DataDirectoryOwner::acquire_existing(&*f.dirs[0]).unwrap();
 	let manager = SlabManager::open_with_owner(
 		SlabManagerConfig {
+			tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 			dir: f.dirs[0].to_path_buf(),
 			max_slab_bytes: 1 << 20,
 			io: spawn_io_thread(64).unwrap(),
@@ -23050,6 +23162,7 @@ async fn open_owned_authority_fixture(
 ) -> Arc<SlabManager> {
 	SlabManager::open_with_owner(
 		SlabManagerConfig {
+			tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 			dir: dir.to_path_buf(),
 			max_slab_bytes: 1 << 20,
 			io: spawn_io_thread(64).unwrap(),
@@ -24255,6 +24368,7 @@ async fn cancelled_torn_append_blocks_tiering_until_zero_cleanup_finishes() {
 	let faults = Arc::new(FaultyFileOps::new(&*dir).unwrap());
 	let mgr = SlabManager::initialize_new_store_with_file_ops(
 		SlabManagerConfig {
+			tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 			dir: dir.to_path_buf(),
 			max_slab_bytes: 1024 * 1024,
 			io,
@@ -25310,7 +25424,10 @@ async fn lsm_crash_after_output_rename_before_proposal_keeps_intent_and_output()
 struct DefiniteRejectLsmCommitter;
 #[async_trait]
 impl TierCommitter for DefiniteRejectLsmCommitter {
-	async fn commit_tier_slab(&self, _: crate::consensus::TieredSlab) -> std::io::Result<()> {
+	async fn commit_tier_slab(
+		&self,
+		_proposal: crate::storage::TierProposal,
+	) -> std::io::Result<()> {
 		Err(Error::new(ErrorKind::Unsupported, "unused"))
 	}
 	async fn retire_tiered_slab(&self, _: SlabId) -> std::io::Result<()> {
@@ -25326,7 +25443,10 @@ impl TierCommitter for DefiniteRejectLsmCommitter {
 struct AmbiguousLsmCommitter;
 #[async_trait]
 impl TierCommitter for AmbiguousLsmCommitter {
-	async fn commit_tier_slab(&self, _: crate::consensus::TieredSlab) -> std::io::Result<()> {
+	async fn commit_tier_slab(
+		&self,
+		_proposal: crate::storage::TierProposal,
+	) -> std::io::Result<()> {
 		Err(Error::new(ErrorKind::Unsupported, "unused"))
 	}
 	async fn retire_tiered_slab(&self, _: SlabId) -> std::io::Result<()> {
@@ -25767,6 +25887,7 @@ async fn cancelled_tier_metadata_after_index_commit_fences_rebuild_and_reads() {
 	let crypto = mgr.config.crypto.clone();
 	drop(mgr);
 	let reopened = SlabManager::open(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dirs[0].to_path_buf(),
 		max_slab_bytes: 1 << 20,
 		io,
@@ -28511,6 +28632,7 @@ async fn single_append_reconciler_is_single_flight_and_close_joins_before_reopen
 	let owner = DataDirectoryOwner::acquire_existing(&dir).unwrap();
 	let crypto = test_crypto();
 	let config = |io| SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dir.to_path_buf(),
 		max_slab_bytes: 1 << 20,
 		io,
@@ -28632,6 +28754,7 @@ async fn single_append_reconciler_holds_no_manager_while_parked() {
 	let owner = DataDirectoryOwner::acquire_existing(&dir).unwrap();
 	let manager = SlabManager::initialize_new_store_with_owner(
 		SlabManagerConfig {
+			tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 			dir: dir.to_path_buf(),
 			max_slab_bytes: 1 << 20,
 			io: spawn_io_thread(64).unwrap(),
@@ -28733,6 +28856,7 @@ async fn single_append_reconciler_retries_after_epoch_changes() {
 	let owner = DataDirectoryOwner::acquire_existing(&dir).unwrap();
 	let crypto = test_crypto();
 	let config = |io| SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dir.to_path_buf(),
 		max_slab_bytes: 1 << 20,
 		io,
@@ -30355,7 +30479,10 @@ struct GcPauseAfterRemoveCommit {
 
 #[async_trait]
 impl TierCommitter for GcPauseAfterRemoveCommit {
-	async fn commit_tier_slab(&self, _: crate::consensus::TieredSlab) -> std::io::Result<()> {
+	async fn commit_tier_slab(
+		&self,
+		_proposal: crate::storage::TierProposal,
+	) -> std::io::Result<()> {
 		Err(Error::new(ErrorKind::Unsupported, "unused"))
 	}
 	async fn retire_tiered_slab(&self, _: SlabId) -> std::io::Result<()> {
@@ -30580,6 +30707,7 @@ async fn gc_refuses_if_slab_path_no_longer_names_its_owned_handle() {
 
 fn gc_owned_test_config(dir: &Path) -> SlabManagerConfig {
 	SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dir.to_path_buf(),
 		max_slab_bytes: 1 << 20,
 		io: spawn_io_thread(64).unwrap(),
@@ -31659,6 +31787,7 @@ async fn snapshot_new_tier_is_verified_for_test(awaiting_cluster: bool) {
 	let io = spawn_io_thread(64).unwrap();
 	let crypto = test_crypto();
 	let config = |dir: std::path::PathBuf| SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir,
 		max_slab_bytes: 1 << 20,
 		io: io.clone(),
@@ -32702,6 +32831,7 @@ async fn snapshot_supersession_preserves_unknown_size_across_reopen() {
 	.await
 	.unwrap();
 	let reopened = SlabManager::open(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dirs[0].to_path_buf(),
 		max_slab_bytes: 1 << 20,
 		io: spawn_io_thread(64).unwrap(),
@@ -33127,11 +33257,12 @@ async fn missing_cleanup_table_reopen_fences_manager() {
 			.unwrap(),
 		expected
 	);
-	assert_eq!(
+	// The counter is process-wide and other tests record gaps in parallel; the
+	// exact count is this manager's own `cleanup_authority_gap_count`.
+	assert!(
 		metrics()
 			.storage_cleanup_unrecorded_supersessions_total
-			.get(),
-		before + 1
+			.get() > before
 	);
 	let index = reopened.persistent_index.as_ref().unwrap();
 	assert_eq!(index.cleanup_authority_gap_count().await.unwrap(), 1);
@@ -33473,11 +33604,12 @@ async fn committed_tier_retirement_records_gap_when_cleanup_authority_is_missing
 			.unwrap(),
 		1
 	);
-	assert_eq!(
+	// The counter is process-wide and other tests record gaps in parallel; the
+	// exact count is this manager's own `cleanup_authority_gap_count`.
+	assert!(
 		metrics()
 			.storage_cleanup_unrecorded_supersessions_total
-			.get(),
-		before + 1
+			.get() > before
 	);
 	mgr.persistent_index
 		.as_ref()
@@ -35509,7 +35641,7 @@ async fn tier_apply_bounds_its_index_gate_wait_and_defers_the_pointer() {
 			.get(&slab_id)
 			.expect("the timed-out pointer is recorded as deferred");
 		assert_eq!(
-			*deferred.value(),
+			deferred.value().parts(),
 			(pointer.clone(), Some(StaleLocationReason::Fenced), None)
 		);
 	}
@@ -35596,6 +35728,392 @@ async fn committed_republication_resolves_unindexed_timeout_fence() {
 	);
 	assert!(mgr.tier_authority_readiness_reason().is_none());
 	assert!(mgr.lookup(tenant(), id(0x421)).unwrap().is_some());
+}
+
+/// A committed republication fenced by the index-gate bound and recovered by
+/// the sweeper's retry supersedes an older snapshot retirement, as the
+/// observer's own apply at that control index does.
+#[tokio::test]
+async fn sweeper_recovery_of_a_fenced_republication_supersedes_an_older_snapshot_retirement() {
+	let (_dirs, mgr, _l2, _target, _schemas, pointer) = unpublished_drop_fixture().await;
+	let slab_id = pointer.slab_id;
+	let epoch = mgr.capture_snapshot_epoch();
+	mgr.persistent_index
+		.as_ref()
+		.unwrap()
+		.stage_deferred_retirement(
+			crate::storage::index::SnapshotRetirementMark {
+				epoch,
+				snapshot_index: None,
+				pointer: pointer.clone(),
+			},
+			mgr.snapshot_epoch.clone(),
+			mgr.snapshot_epoch_gate.clone(),
+		)
+		.await
+		.unwrap()
+		.unwrap();
+	mgr.tier_authority
+		.mark_snapshot_retirement(slab_id, epoch, None);
+	let gate = mgr.hold_index_write_gate_for_test().await;
+	let fenced = mgr
+		.apply_tier_slab_committed(pointer.clone(), Some(820))
+		.await;
+	drop(gate);
+	assert!(fenced.is_err(), "premise: the gate bound fences the apply");
+	assert_eq!(
+		mgr.unapplied_tier_pointers
+			.get(&slab_id)
+			.map(|entry| entry.value().parts()),
+		Some((
+			pointer.clone(),
+			Some(StaleLocationReason::Fenced),
+			Some(820)
+		)),
+		"premise: the deferral carries the apply's control index"
+	);
+
+	let observed = mgr.capture_snapshot_epoch();
+	let authoritative = pointer.clone();
+	mgr.reconcile_tier_slab_at_snapshot_epoch(slab_id, observed, || async move {
+		Ok(Some(authoritative))
+	})
+	.await
+	.unwrap();
+	assert!(
+		mgr.unapplied_tier_pointers.get(&slab_id).is_none(),
+		"premise: the sweeper retry recovered the fence"
+	);
+	assert!(
+		mgr.persistent_index
+			.as_ref()
+			.unwrap()
+			.load_snapshot_retirement_marks()
+			.await
+			.unwrap()
+			.is_empty(),
+		"the republication at 820 supersedes the older durable retirement mark"
+	);
+	assert!(mgr.tier_authority_readiness_reason().is_none());
+	assert!(mgr.lookup(tenant(), id(0x421)).unwrap().is_some());
+}
+
+/// The fenced form of `newer_committed_pointer_cancels_obsolete_snapshot_retirement`:
+/// a committed replacement at control index 823, applied while an older
+/// snapshot retirement (822) is still pending, is fenced by the index-gate
+/// bound and then recovered only by the sweeper's retry. The recovery must
+/// supersede the older retirement exactly as the unfenced apply does.
+#[tokio::test]
+async fn sweeper_recovery_of_a_fenced_replacement_cancels_an_obsolete_snapshot_retirement() {
+	let (_dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let bytes = l2.get(&old.l2_uri).await.unwrap();
+	let uri = l2
+		.put("tier/after-pending-snapshot.wnd", &bytes)
+		.await
+		.unwrap();
+	let pause = mgr.pause_snapshot_before_retirement_apply_once();
+	let epoch = mgr.begin_tier_snapshot_install().unwrap();
+	let first = {
+		let mgr = mgr.clone();
+		tokio::spawn(async move {
+			mgr.finish_tier_snapshot_install_at_epoch(vec![], Some(822), epoch)
+				.await
+		})
+	};
+	tokio::time::timeout(Duration::from_secs(60), pause.reached.notified())
+		.await
+		.unwrap();
+	let mut replacement = old.clone();
+	replacement.l2_uri = uri;
+	let gate = mgr.hold_index_write_gate_for_test().await;
+	let fenced = mgr
+		.apply_tier_slab_committed(replacement.clone(), Some(823))
+		.await;
+	drop(gate);
+	let deferral = mgr
+		.unapplied_tier_pointers
+		.get(&old.slab_id)
+		.map(|entry| entry.value().parts());
+	eprintln!("fenced apply: {fenced:?}; deferral: {deferral:?}");
+	assert!(fenced.is_err(), "premise: the gate bound fences the apply");
+	assert_eq!(
+		deferral,
+		Some((
+			replacement.clone(),
+			Some(StaleLocationReason::Fenced),
+			Some(823)
+		)),
+		"premise: the deferral carries the apply's control index"
+	);
+	pause.resume.notify_one();
+	let snapshot = first.await.unwrap();
+	eprintln!("snapshot install: {snapshot:?}");
+
+	let observed = mgr.capture_snapshot_epoch();
+	let authoritative = replacement.clone();
+	let retry = mgr
+		.reconcile_tier_slab_at_snapshot_epoch(old.slab_id, observed, || async move {
+			Ok(Some(authoritative))
+		})
+		.await;
+	let marks = mgr
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot_retirement_marks()
+		.await
+		.unwrap();
+	eprintln!(
+		"sweeper retry: {retry:?}; pointer: {:?}; deferral: {:?}; marks: {marks:?}",
+		mgr.tier_pointer(old.slab_id).await,
+		mgr.unapplied_tier_pointers
+			.get(&old.slab_id)
+			.map(|entry| entry.value().clone())
+	);
+	assert_eq!(mgr.tier_pointer(old.slab_id).await, Some(replacement));
+	assert!(
+		marks.is_empty(),
+		"the replacement at 823 cancels the obsolete retirement at 822"
+	);
+	tokio::time::timeout(Duration::from_secs(60), mgr.wait_tier_authority_ready())
+		.await
+		.expect("authority becomes ready")
+		.unwrap();
+}
+
+/// Through the real state machine and observer: a snapshot at 822 that no
+/// longer names slab X is installed (its retirement completes inside the
+/// install, before 823 can apply, so X is retired in this process); entry 823
+/// then commits a replacement pointer for X while the index gate is held, so
+/// that apply is fenced (cause `IndexGate`, provenance 823). This node has no
+/// backing or rows to serve or verify the replacement from, so under ADR 0696
+/// r3 E2 the fence stays: neither the authority worker's replay nor the
+/// sweeper's publishes from node-local identity, readiness stays closed, and
+/// reads of X refuse typed while canonical state names the replacement. Never
+/// an absent answer. (A registered availability limitation, with ADR 0693's
+/// node-local slab-identity limits.) Observations are recorded before any
+/// assertion so a typed refusal can be told from a silent omission.
+#[tokio::test]
+async fn real_sm_fenced_pointer_for_a_retired_slab_stays_typed_fenced_while_canonical_names_it() {
+	use crate::consensus::WendelonStateMachine;
+	use crate::storage::sweeper::ManagerTierObserver;
+	use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
+	use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
+
+	let (_dirs, manager, l2) = fresh_manager_with_l2("s7-real-sm-fenced-replacement").await;
+	let key = id(0x5e823);
+	manager
+		.append_durable(tenant(), key, hlc(511), b"tiered-row")
+		.await
+		.unwrap();
+	let old = tier_kv_slab(&manager, &l2, "s7-real-sm/p0").await;
+	let slab_id = old.slab_id;
+	let bytes = l2.get(&old.l2_uri).await.unwrap();
+	let replacement = TieredSlabPointer {
+		l2_uri: l2.put("s7-real-sm/p1", &bytes).await.unwrap(),
+		..old.clone()
+	};
+	assert_eq!(
+		manager
+			.read(manager.lookup(tenant(), key).unwrap().unwrap())
+			.await
+			.unwrap(),
+		b"tiered-row",
+		"premise: the tiered row is served at P0"
+	);
+
+	// The snapshot at 822 no longer names X.
+	let mut source = WendelonStateMachine::new();
+	RaftStateMachine::apply(
+		&mut source,
+		[Entry {
+			log_id: LogId::new(CommittedLeaderId::new(3, 1), 822),
+			payload: EntryPayload::Blank,
+		}],
+	)
+	.await
+	.unwrap();
+	let built = RaftStateMachine::get_snapshot_builder(&mut source)
+		.await
+		.build_snapshot()
+		.await
+		.unwrap();
+	let mut target = WendelonStateMachine::new()
+		.with_tier_observer(Arc::new(ManagerTierObserver::new(manager.clone())));
+	target.seed_tiered_slab_for_test(b10_tier(&old)).await;
+
+	// An in-flight append makes the snapshot's reconciliation defer.
+	let active = Arc::clone(&manager.state.lock().await.active);
+	assert_ne!(active.slab_id(), slab_id);
+	let (entered, release) = active.hold_next_append_write_for_test();
+	let writer = {
+		let manager = manager.clone();
+		tokio::spawn(async move {
+			manager
+				.append_durable(tenant(), id(0x5e824), hlc(600), b"in-flight")
+				.await
+		})
+	};
+	tokio::time::timeout(Duration::from_secs(60), entered.acquire())
+		.await
+		.unwrap()
+		.unwrap()
+		.forget();
+	let installed =
+		RaftStateMachine::install_snapshot(&mut target, &built.meta, built.snapshot).await;
+	let deferred = manager.tier_authority.snapshot_retry_pending_for_test();
+	eprintln!("install_snapshot: {installed:?}; reconciliation deferred: {deferred}");
+
+	// Entry 823 commits the replacement; the observer's apply is fenced.
+	let gate = manager.hold_index_write_gate_for_test().await;
+	let applied = RaftStateMachine::apply(
+		&mut target,
+		[Entry {
+			log_id: LogId::new(CommittedLeaderId::new(3, 1), 823),
+			payload: EntryPayload::Normal(crate::consensus::WendelonRequest::TierSlab(b10_tier(
+				&replacement,
+			))),
+		}],
+	)
+	.await
+	.map(|_| ());
+	drop(gate);
+	let deferral = manager
+		.unapplied_tier_pointers
+		.get(&slab_id)
+		.map(|entry| entry.value().clone());
+	eprintln!("apply 823: {applied:?}; deferral: {deferral:?}");
+	release.close();
+	let wrote = tokio::time::timeout(Duration::from_secs(60), writer).await;
+	eprintln!("in-flight append: {wrote:?}");
+
+	// Let the authority worker run its deferred reconciliation.
+	let ready = tokio::time::timeout(Duration::from_secs(60), async {
+		loop {
+			if manager.require_tier_authority_ready().is_ok() {
+				break;
+			}
+			tokio::time::sleep(Duration::from_millis(10)).await;
+		}
+	})
+	.await
+	.is_ok();
+	let canonical = || {
+		let target = target.clone();
+		async move {
+			Ok(target
+				.state_snapshot()
+				.await
+				.tiered_slabs
+				.get(&slab_id)
+				.map(|tier| TieredSlabPointer {
+					slab_id: tier.slab_id,
+					l2_uri: tier.l2_uri.clone(),
+					payload_hash: tier.payload_hash,
+					is_encrypted: tier.is_encrypted,
+					tenant_id: tier.tenant_id,
+					tenant_kek_id: tier.tenant_kek_id,
+					stats_format_version: tier.stats_format_version,
+					stats_block_len: tier.stats_block_len,
+					stats_block_hash128: tier.stats_block_hash128,
+					tombstone_metadata: tier.tombstone_metadata,
+					supersession_metadata: tier.supersession_metadata,
+				}))
+		}
+	};
+	let committed = canonical().await.unwrap();
+	let observe = |stage: &'static str| {
+		let manager = manager.clone();
+		async move {
+			let lookup = manager.lookup(tenant(), key);
+			let read = match &lookup {
+				Ok(Some(location)) => Some(
+					tokio::time::timeout(Duration::from_secs(10), manager.read(*location))
+						.await
+						.map(|read| read.map(|bytes| String::from_utf8_lossy(&bytes).into_owned())),
+				),
+				_ => None,
+			};
+			let durable = manager
+				.persistent_index
+				.as_ref()
+				.unwrap()
+				.load_snapshot_retirement_marks()
+				.await
+				.map(|marks| marks.len());
+			eprintln!(
+				"{stage}: pointer={:?} deferral={:?} retired={} readiness={:?} lookup={lookup:?} read={read:?} marks={durable:?}",
+				manager.tier_pointer(slab_id).await.map(|p| p.l2_uri),
+				manager
+					.unapplied_tier_pointers
+					.get(&slab_id)
+					.map(|entry| (entry.value().outcome, entry.value().provenance)),
+				manager.retired_tier_slabs.contains(&slab_id),
+				manager.tier_authority_readiness_reason(),
+			);
+			(lookup.is_ok_and(|found| found.is_none()), read)
+		}
+	};
+	eprintln!(
+		"canonical pointer after 823: {:?}; worker ready: {ready}",
+		committed.as_ref().map(|p| &p.l2_uri)
+	);
+	let (missing_after_worker, _) = observe("after worker").await;
+	eprintln!(
+		"worker replay attempts so far: {}",
+		manager
+			.replay_probe
+			.attempts
+			.load(std::sync::atomic::Ordering::Acquire)
+	);
+
+	let observed_epoch = manager.capture_snapshot_epoch();
+	let retry = manager
+		.reconcile_tier_slab_at_snapshot_epoch(slab_id, observed_epoch, canonical)
+		.await;
+	eprintln!("sweeper retry: {retry:?}");
+	let (missing_after_retry, read_after_retry) = observe("after sweeper retry").await;
+
+	assert_eq!(
+		committed,
+		Some(replacement.clone()),
+		"premise: canonical state names 823's replacement"
+	);
+	assert!(
+		!missing_after_worker && !missing_after_retry,
+		"a committed row is never answered as absent"
+	);
+	assert_eq!(
+		manager.tier_pointer(slab_id).await,
+		None,
+		"nothing is published from node-local identity"
+	);
+	assert_eq!(
+		manager
+			.unapplied_tier_pointers
+			.get(&slab_id)
+			.map(|entry| entry.value().clone()),
+		Some(super::tier_deferral::TierDeferral::fenced(
+			replacement,
+			super::tier_deferral::FenceCause::IndexGate,
+			Some(823)
+		)),
+		"the fence stays, with its cause and provenance"
+	);
+	assert!(
+		manager.tier_authority_readiness_reason().is_some(),
+		"readiness stays closed"
+	);
+	assert!(
+		manager
+			.lookup(tenant(), key)
+			.as_ref()
+			.err()
+			.and_then(stale_location)
+			.is_some_and(|stale| stale.reason == StaleLocationReason::Fenced),
+		"reads of X refuse typed"
+	);
+	assert!(read_after_retry.is_none(), "nothing is read for X");
 }
 
 async fn a6_undecodable_stored_counter_identity_control(counter_class: bool) {
@@ -36134,7 +36652,7 @@ async fn a9_missing_sources_refuse_before_d2_or_fail_stop_on_refused_delta_error
 #[tokio::test]
 async fn a9_shared_output_pair_with_one_present_source_is_not_refused() {
 	let f = a9_maintenance_fixture(true).await;
-	let mut relocation = KeyRelocation::new(Locality::from(f.key), true);
+	let mut relocation = KeyRelocation::new(Locality::from(f.key), None);
 	for row in f.relocations.iter().filter(|row| row.key_identity == f.key) {
 		relocation.pairs.push(RelocationPair {
 			old: row.old_location,
@@ -36142,9 +36660,10 @@ async fn a9_shared_output_pair_with_one_present_source_is_not_refused() {
 			table_object_id: None,
 		});
 	}
+	let mut scratch = RelocationScratch::for_relocation(&relocation);
 	let refused = f
 		.manager
-		.relocate_indexed_locations(tenant(), f.key, &relocation);
+		.relocate_indexed_locations(tenant(), f.key, &relocation, &mut scratch);
 	assert!(
 		refused.is_empty(),
 		"A9 a shared output produced by another applied pair is not refused: {refused:?}"
@@ -36594,7 +37113,10 @@ impl TierCommitter for B1tRoleCommitter {
 	fn should_propose(&self) -> bool {
 		self.leader.load(std::sync::atomic::Ordering::Acquire)
 	}
-	async fn commit_tier_slab(&self, tier: TieredSlab) -> std::io::Result<()> {
+	async fn commit_tier_slab(
+		&self,
+		proposal: crate::storage::TierProposal,
+	) -> std::io::Result<()> {
 		self.calls.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
 		if !self.should_propose() {
 			return Err(Error::new(
@@ -36605,7 +37127,7 @@ impl TierCommitter for B1tRoleCommitter {
 		DirectTierCommitter {
 			manager: self.manager.clone(),
 		}
-		.commit_tier_slab(tier)
+		.commit_tier_slab(proposal)
 		.await
 	}
 	async fn retire_tiered_slab(&self, slab: SlabId) -> std::io::Result<()> {
@@ -37966,6 +38488,7 @@ async fn b6_replacement_tier_log_entry_finishes_complete_replay_authority() {
 	let marker = dst.join("TIER_AUTHORITY_AWAITING_CLUSTER");
 	std::fs::write(&marker, b"awaiting-cluster-v1\n").unwrap();
 	let target = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dst.to_path_buf(),
 		max_slab_bytes: 1 << 20,
 		io: spawn_io_thread(64).unwrap(),
@@ -38044,6 +38567,7 @@ async fn b6c_complete_replay_resumes_matching_lsm_deferral() {
 	let marker = dst.join("TIER_AUTHORITY_AWAITING_CLUSTER");
 	std::fs::write(&marker, b"awaiting-cluster-v1\n").unwrap();
 	let target = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dst.to_path_buf(),
 		max_slab_bytes: 1 << 20,
 		io: spawn_io_thread(64).unwrap(),
@@ -38148,6 +38672,7 @@ async fn b6c_complete_replay_preserves_structural_refusal() {
 	let marker = dst.join("TIER_AUTHORITY_AWAITING_CLUSTER");
 	std::fs::write(&marker, b"awaiting-cluster-v1\n").unwrap();
 	let target = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dst.to_path_buf(),
 		max_slab_bytes: 1 << 20,
 		io: spawn_io_thread(64).unwrap(),
@@ -38217,11 +38742,13 @@ async fn b6c_complete_replay_preserves_structural_refusal() {
 	assert!(target.lookup(tenant(), key).is_err());
 	target.unapplied_tier_pointers.insert(
 		pointer.slab_id,
-		(
-			pointer.clone(),
-			Some(StaleLocationReason::LayoutCollision),
-			None,
-		),
+		super::tier_deferral::TierDeferral {
+			pointer: pointer.clone(),
+			outcome: super::tier_deferral::DeferralOutcome::Refused(
+				StaleLocationReason::LayoutCollision,
+			),
+			provenance: None,
+		},
 	);
 	assert!(
 		target
@@ -38238,7 +38765,8 @@ async fn b6c_complete_replay_preserves_structural_refusal() {
 			.get(&pointer.slab_id)
 			.unwrap()
 			.value()
-			.1,
+			.outcome
+			.reason(),
 		Some(StaleLocationReason::LayoutCollision)
 	);
 }
@@ -38259,6 +38787,7 @@ async fn b6c_nonempty_replay_crash_before_marker_clear_rechecks_on_reopen() {
 	let marker = dst.join("TIER_AUTHORITY_AWAITING_CLUSTER");
 	std::fs::write(&marker, b"awaiting-cluster-v1\n").unwrap();
 	let target = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dst.to_path_buf(),
 		max_slab_bytes: 1 << 20,
 		io: spawn_io_thread(64).unwrap(),
@@ -38332,6 +38861,7 @@ async fn b6c_nonempty_replay_crash_before_marker_clear_rechecks_on_reopen() {
 	drop(sm);
 	drop(target);
 	let reopened = SlabManager::open(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dst.to_path_buf(),
 		max_slab_bytes: 1 << 20,
 		io,
@@ -38391,6 +38921,7 @@ async fn b6c_absent_canonical_without_registered_flight_still_refuses() {
 	let marker = dst.join("TIER_AUTHORITY_AWAITING_CLUSTER");
 	std::fs::write(&marker, b"awaiting-cluster-v1\n").unwrap();
 	let target = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dst.to_path_buf(),
 		max_slab_bytes: 1 << 20,
 		io: spawn_io_thread(64).unwrap(),
@@ -38479,6 +39010,7 @@ async fn b6c_recovered_prefix_registers_before_complete_confirmation() {
 	let marker = dst.join("TIER_AUTHORITY_AWAITING_CLUSTER");
 	std::fs::write(&marker, b"awaiting-cluster-v1\n").unwrap();
 	let target = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dst.to_path_buf(),
 		max_slab_bytes: 1 << 20,
 		io: spawn_io_thread(64).unwrap(),
@@ -38929,6 +39461,7 @@ fn b8_pending_config(
 	l2: Arc<dyn ObjectStore>,
 ) -> SlabManagerConfig {
 	SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir,
 		max_slab_bytes: 1 << 20,
 		io: spawn_io_thread(64).unwrap(),
@@ -39569,6 +40102,7 @@ async fn b10_snapshot_install_defers_live_append_collision_without_fatal_storage
 	let pointer = tier_kv_slab(&source, &l2, "b10/canonical.wnd").await;
 	let dst = fresh_dir("b10-receiver");
 	let manager = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dst.to_path_buf(),
 		max_slab_bytes: 1 << 20,
 		io: spawn_io_thread(64).unwrap(),
@@ -39721,6 +40255,7 @@ async fn b10_append_fixture() -> B10AppendFixture {
 	let owner = DataDirectoryOwner::acquire_existing(&dst).unwrap();
 	let manager = SlabManager::initialize_new_store_with_owner(
 		SlabManagerConfig {
+			tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 			dir: dst.to_path_buf(),
 			max_slab_bytes: 1 << 20,
 			io: spawn_io_thread(64).unwrap(),
@@ -40325,6 +40860,7 @@ async fn b10_quarantine_before_exact_retirement_clear_survives_reopen() {
 	// has not executed. Cancelling/joining the owned worker prevents late work.
 	f.owner.close(Duration::from_secs(10)).await.unwrap();
 	let config = SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: f._dst.to_path_buf(),
 		max_slab_bytes: 1 << 20,
 		io: spawn_io_thread(64).unwrap(),
@@ -40509,6 +41045,7 @@ async fn b10_crash_after_retirement_before_append_drains_uses_durable_staging() 
 	closing.await.unwrap().unwrap();
 	let old_l1 = std::fs::read(slab_path(&f._dst, slab_id)).unwrap();
 	let config = SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: f._dst.to_path_buf(),
 		max_slab_bytes: 1 << 20,
 		io: spawn_io_thread(64).unwrap(),
@@ -41547,6 +42084,7 @@ async fn durable_row_present(dir: &std::path::Path, key: Identity) -> bool {
 /// Open without unwrapping, so a recovery refusal is observable.
 async fn try_open_manager_at_dir(dir: std::path::PathBuf) -> std::io::Result<Arc<SlabManager>> {
 	SlabManager::open(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir,
 		max_slab_bytes: 1024 * 1024,
 		io: spawn_io_thread(64).unwrap(),
@@ -41937,6 +42475,7 @@ async fn open_rotating_manager_over_faults(
 	let faults = Arc::new(FaultyFileOps::new(dir.to_path_buf()).unwrap());
 	let mgr = SlabManager::open_with_file_ops(
 		SlabManagerConfig {
+			tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 			dir: dir.to_path_buf(),
 			max_slab_bytes: 16 * 1024,
 			io: spawn_io_thread(64).unwrap(),
@@ -42119,6 +42658,7 @@ async fn tiered_rewrite_refuses_a_historical_damaged_object(form: HistoricalObje
 	let l2_root = fresh_dir("tiered-damaged-ack-l2");
 	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
 	let mgr = SlabManager::initialize_new_store(SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: l1_dir.to_path_buf(),
 		max_slab_bytes: 1 << 20,
 		io: spawn_io_thread(64).unwrap(),
@@ -42641,4 +43181,2716 @@ async fn staged_plaintext_that_only_shares_a_prefix_with_the_published_object_re
 		Some(&published),
 		"the published generation stays"
 	);
+}
+
+// ------------------------------------------------------------------
+// ADR 0696 fast follow, slice 1 corrections (Codex 01a1983d).
+// ------------------------------------------------------------------
+
+/// The plan scratch charge travels with the row copies into the index
+/// worker: cancelling the publishing caller while its blocking worker still
+/// holds the copies keeps them charged until that worker drops the update.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tier_publication_scratch_stays_charged_while_its_index_worker_holds_the_row_copies() {
+	use super::tier_budget::TierBudgetKind;
+	let (_dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let bytes = l2.get(&old.l2_uri).await.unwrap();
+	let replacement = TieredSlabPointer {
+		l2_uri: l2.put("tier/s7-worker-scratch.wnd", &bytes).await.unwrap(),
+		..old.clone()
+	};
+	let (entered_tx, entered) = std::sync::mpsc::sync_channel(1);
+	let (release, release_rx) = std::sync::mpsc::sync_channel(1);
+	*mgr.persistent_index
+		.as_ref()
+		.unwrap()
+		.guarded_delta_before_rows_hold
+		.lock()
+		.unwrap() = Some((entered_tx, release_rx));
+	let before = mgr.tier_budget.used_by(TierBudgetKind::Scratch);
+	let task = {
+		let mgr = mgr.clone();
+		let replacement = replacement.clone();
+		tokio::spawn(async move { mgr.apply_tier_slab_committed(replacement, Some(900)).await })
+	};
+	tokio::task::spawn_blocking(move || entered.recv_timeout(Duration::from_secs(60)))
+		.await
+		.unwrap()
+		.expect("the publication reaches its index worker");
+	let held = mgr.tier_budget.used_by(TierBudgetKind::Scratch);
+	assert!(
+		held > before,
+		"the publication's scratch is charged: {held} > {before}"
+	);
+	task.abort();
+	let _ = task.await;
+	assert_eq!(
+		mgr.tier_budget.used_by(TierBudgetKind::Scratch),
+		held,
+		"the cancelled caller's plan is gone, but the worker still owns the copies"
+	);
+	release.send(()).unwrap();
+	tokio::time::timeout(Duration::from_secs(30), async {
+		while mgr.tier_budget.used_by(TierBudgetKind::Scratch) > before {
+			tokio::time::sleep(Duration::from_millis(10)).await;
+		}
+	})
+	.await
+	.expect("the charge is released once the worker drops the update");
+}
+
+/// The reference for `prepare_tiered_row_refresh`: the per-key relocations
+/// `apply_tiered_row_refresh_plan_locked` built before slice 1.
+fn reference_tier_refresh_relocations(plan: &TieredRowRefreshPlan) -> String {
+	let old_by_location = plan
+		.old_rows
+		.iter()
+		.map(|row| (row.location, row))
+		.collect::<HashMap<_, _>>();
+	let new_by_location = plan
+		.new_rows
+		.iter()
+		.map(|row| (row.location, row))
+		.collect::<HashMap<_, _>>();
+	let owner = |row: &PersistentRecordRow| super::tier_plan::tier_row_owner(row);
+	let mut by_key: BTreeMap<(TenantId, Identity), KeyRelocation> = BTreeMap::new();
+	let mut paired_old = HashSet::new();
+	let mut paired_new = HashSet::new();
+	for (old, new) in &plan.relocated_reads {
+		let (Some(old_row), Some(new_row)) = (old_by_location.get(old), new_by_location.get(new))
+		else {
+			continue;
+		};
+		if owner(old_row) != owner(new_row) {
+			continue;
+		}
+		paired_old.insert(*old);
+		paired_new.insert(*new);
+		by_key
+			.entry((old_row.tenant_id, old_row.key_identity))
+			.or_insert_with(|| KeyRelocation::new(new_row.routing_locality, None))
+			.pairs
+			.push(RelocationPair {
+				old: *old,
+				new: *new,
+				table_object_id: new_row.table_object_id,
+			});
+	}
+	let kept = |row: &PersistentRecordRow,
+	            other: &HashMap<RecordLocation, &PersistentRecordRow>| {
+		other
+			.get(&row.location)
+			.is_some_and(|other| owner(row) == owner(other))
+	};
+	for row in &plan.old_rows {
+		if !paired_old.contains(&row.location) && !kept(row, &new_by_location) {
+			by_key
+				.entry((row.tenant_id, row.key_identity))
+				.or_insert_with(|| KeyRelocation::new(row.routing_locality, None))
+				.removals
+				.push(row.location);
+		}
+	}
+	for row in &plan.new_rows {
+		if !paired_new.contains(&row.location) && !kept(row, &old_by_location) {
+			by_key
+				.entry((row.tenant_id, row.key_identity))
+				.or_insert_with(|| KeyRelocation::new(row.routing_locality, None))
+				.insertions
+				.push(RelocationInsertion {
+					location: row.location,
+					table_object_id: row.table_object_id,
+				});
+		}
+	}
+	format!("{:?}", by_key.into_iter().collect::<Vec<_>>())
+}
+
+/// Differential: the bounded, pre-publication `prepare_tiered_row_refresh`
+/// builds exactly the relocations the old post-publication code built, over
+/// generated plans with many distinct keys, large duplicate-owner runs,
+/// location collisions between generations and unmatched pairs.
+#[tokio::test]
+async fn prepared_tier_refresh_relocations_equal_the_pre_slice_construction() {
+	let (_dir, mgr) = fresh_manager().await;
+	let mut state = 0x5eed_0696_u64;
+	let mut next = move || {
+		state ^= state << 13;
+		state ^= state >> 7;
+		state ^= state << 17;
+		state
+	};
+	let row = |key: u8, hlc_ms: u64, offset: u64, locality: u64| PersistentRecordRow {
+		tenant_id: tenant(),
+		key_identity: Identity::new([key; 32]),
+		routing_locality: Locality::new(locality),
+		table_object_id: None,
+		placement: PlacementSemantics::RawLocality,
+		partition: None,
+		location: RecordLocation {
+			slab_id: SlabId::new(3),
+			offset,
+			length: 64,
+			hlc: hlc(hlc_ms),
+			record_row_index: RecordRowIndex::ZERO,
+			is_tombstone: false,
+			placement: PlacementSemantics::RawLocality,
+			partition: None,
+		},
+	};
+	for case in 0..2_000 {
+		let keys = if case % 10 == 0 {
+			1
+		} else {
+			(next() % 40) as u8 + 1
+		};
+		let rows = |next: &mut dyn FnMut() -> u64, count: usize| {
+			(0..count)
+				.map(|_| {
+					row(
+						(next() % u64::from(keys)) as u8,
+						10 + next() % 4,
+						(next() % 64) * 4096,
+						next() % 3,
+					)
+				})
+				.collect::<Vec<_>>()
+		};
+		let old_count = (next() % 60) as usize;
+		let old_rows = rows(&mut next, old_count);
+		let new_count = (next() % 60) as usize;
+		let new_rows = rows(&mut next, new_count);
+		let relocated_reads = (0..(next() % 40) as usize)
+			.filter_map(|_| {
+				let old = old_rows.get((next() % 64) as usize)?.location;
+				let new = new_rows.get((next() % 64) as usize)?.location;
+				Some((old, new))
+			})
+			.collect::<Vec<_>>();
+		let plan = TieredRowRefreshPlan {
+			pointer: None,
+			old_rows,
+			new_rows,
+			relocated_reads,
+			scratch: Default::default(),
+		};
+		let expected = reference_tier_refresh_relocations(&plan);
+		let prepared = mgr.prepare_tiered_row_refresh(&plan).unwrap();
+		let actual = format!("{:?}", prepared.relocations_for_test());
+		assert_eq!(actual, expected, "case {case}");
+	}
+	// Two large shapes: many distinct keys, each moved once; and one key whose
+	// thousands of versions all move, half of them pruned.
+	let wide = |index: usize, offset: u64| {
+		let mut identity = [0u8; 32];
+		identity[..8].copy_from_slice(&(index as u64).to_be_bytes());
+		PersistentRecordRow {
+			key_identity: Identity::new(identity),
+			..row(0, 10, offset, 0)
+		}
+	};
+	let distinct = 8_192;
+	let old_rows = (0..distinct)
+		.map(|index| wide(index, index as u64 * 4096))
+		.collect::<Vec<_>>();
+	let new_rows = (0..distinct)
+		.map(|index| wide(index, (distinct + index) as u64 * 4096))
+		.collect::<Vec<_>>();
+	let relocated_reads = old_rows
+		.iter()
+		.zip(&new_rows)
+		.map(|(old, new)| (old.location, new.location))
+		.collect();
+	let run = 8_192_u64;
+	let one_key_old = (0..run)
+		.map(|index| row(7, 10 + index, index * 4096, 0))
+		.collect::<Vec<_>>();
+	let one_key_new = (0..run / 2)
+		.map(|index| row(7, 10 + index, (run + index) * 4096, 0))
+		.collect::<Vec<_>>();
+	let one_key_reads = one_key_old
+		.iter()
+		.zip(&one_key_new)
+		.map(|(old, new)| (old.location, new.location))
+		.collect();
+	for (shape, plan) in [
+		(
+			"many distinct keys",
+			TieredRowRefreshPlan {
+				pointer: None,
+				old_rows,
+				new_rows,
+				relocated_reads,
+				scratch: Default::default(),
+			},
+		),
+		(
+			"one large run",
+			TieredRowRefreshPlan {
+				pointer: None,
+				old_rows: one_key_old,
+				new_rows: one_key_new,
+				relocated_reads: one_key_reads,
+				scratch: Default::default(),
+			},
+		),
+	] {
+		let expected = reference_tier_refresh_relocations(&plan);
+		let prepared = mgr.prepare_tiered_row_refresh(&plan).unwrap();
+		assert_eq!(
+			format!("{:?}", prepared.relocations_for_test()),
+			expected,
+			"{shape}"
+		);
+	}
+}
+
+/// A budget too small for a publication's plan scratch fences the committed
+/// apply typed (`Fenced`, cached for retry), allocates nothing it did not
+/// reserve, and is counted as a `no_scratch` fence.
+#[tokio::test]
+async fn a_publication_short_of_plan_scratch_fences_typed_and_is_counted() {
+	use super::tier_budget::TierBudgetKind;
+	let (_dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let bytes = l2.get(&old.l2_uri).await.unwrap();
+	let replacement = TieredSlabPointer {
+		l2_uri: l2.put("tier/s7-no-scratch.wnd", &bytes).await.unwrap(),
+		..old.clone()
+	};
+	let floor = mgr.tier_budget.used();
+	mgr.tier_budget.set_limit_for_test(floor);
+	let fenced_before = fenced_counter("no_scratch");
+	let result = mgr
+		.apply_tier_slab_committed(replacement.clone(), Some(901))
+		.await;
+	let error = result.expect_err("no scratch, no publication");
+	assert_eq!(
+		stale_location(&error).map(|stale| stale.reason),
+		Some(StaleLocationReason::Fenced),
+		"{error}"
+	);
+	assert_eq!(
+		mgr.unapplied_tier_pointers
+			.get(&old.slab_id)
+			.map(|entry| entry.value().parts()),
+		Some((replacement, Some(StaleLocationReason::Fenced), Some(901))),
+		"the deferral is typed for retry"
+	);
+	assert_eq!(mgr.tier_budget.used(), floor, "nothing left charged");
+	assert_eq!(mgr.tier_budget.used_by(TierBudgetKind::Scratch), 0);
+	assert!(
+		fenced_counter("no_scratch") > fenced_before,
+		"the fence is counted"
+	);
+	assert_eq!(mgr.tier_pointer(old.slab_id).await, Some(old));
+}
+
+/// A publication whose plan scratch fits but whose new layout does not
+/// fences typed at the layout reservation, counted as `no_budget`, leaves
+/// nothing charged, and publishes on retry once the budget covers exactly
+/// the peak an unlimited run of the same publication reached. The fixture's
+/// rewrite prunes a key, so its layout is not empty.
+#[tokio::test]
+async fn a_publication_short_of_its_layout_fences_typed_and_publishes_at_its_exact_peak() {
+	use super::tier_budget::TierBudgetKind;
+	let measured = seed_tier_refresh_fixture("s7-layout-measure").await;
+	let measured_floor = measured.mgr.tier_budget.used();
+	measured.mgr.tier_budget.reset_peak_for_test();
+	measured
+		.mgr
+		.apply_tier_slab_committed(measured.rewritten.clone(), None)
+		.await
+		.expect("an unlimited publication succeeds");
+	assert!(
+		measured.mgr.tier_budget.used_by(TierBudgetKind::Layout) > 0,
+		"premise: the published layout carries history"
+	);
+	let need = measured.mgr.tier_budget.peak() - measured_floor;
+
+	let fixture = seed_tier_refresh_fixture("s7-layout-short").await;
+	let mgr = &fixture.mgr;
+	let old = mgr.tier_pointer(fixture.slab_id).await;
+	let floor = mgr.tier_budget.used();
+	mgr.tier_budget.set_limit_for_test(floor + need - 1);
+	let no_budget = fenced_counter("no_budget");
+	mgr.tier_budget.reset_peak_for_test();
+	let error = mgr
+		.apply_tier_slab_committed(fixture.rewritten.clone(), None)
+		.await
+		.expect_err("one byte short of the peak, no publication");
+	assert_eq!(
+		stale_location(&error).map(|stale| stale.reason),
+		Some(StaleLocationReason::Fenced),
+		"{error}"
+	);
+	// Reservations are all-or-nothing, so a peak above the floor means the
+	// plan scratch was granted and a later reservation was refused.
+	assert!(
+		mgr.tier_budget.peak() > floor,
+		"the plan scratch fit; the refusal came later"
+	);
+	assert!(
+		fenced_counter("no_budget") > no_budget,
+		"the layout reservation is the one refused"
+	);
+	assert_eq!(mgr.tier_budget.used(), floor, "nothing left charged");
+	assert_eq!(mgr.tier_pointer(fixture.slab_id).await, old);
+
+	mgr.tier_budget.set_limit_for_test(floor + need);
+	mgr.apply_tier_slab_committed(fixture.rewritten.clone(), None)
+		.await
+		.expect("the exact peak is enough");
+	assert_eq!(
+		mgr.tier_pointer(fixture.slab_id).await,
+		Some(fixture.rewritten.clone())
+	);
+}
+
+/// The rendered value of `wendelon_tier_publication_fenced_total{reason}`.
+fn fenced_counter(reason: &str) -> u64 {
+	let rendered = crate::metrics::global().render_prometheus();
+	let prefix = format!("wendelon_tier_publication_fenced_total{{reason=\"{reason}\"}} ");
+	rendered
+		.lines()
+		.find_map(|line| line.strip_prefix(&prefix))
+		.map(|value| value.parse().unwrap())
+		.unwrap_or(0)
+}
+
+/// The chain edit `relocate_indexed_locations` made before its buffers moved
+/// into `RelocationScratch`, verbatim but for the index side effects (table
+/// references, redirects, conflict marks), which the edit does not read.
+fn reference_relocate_chain(
+	versions: &mut Vec<RecordLocation>,
+	relocation: &KeyRelocation,
+) -> Vec<(RecordLocation, RecordLocation)> {
+	let mut refused = Vec::new();
+	let mut matched = vec![false; versions.len()];
+	let mut applied = Vec::with_capacity(relocation.pairs.len());
+	for pair in &relocation.pairs {
+		if pair.old == pair.new {
+			continue;
+		}
+		let position = versions
+			.iter()
+			.enumerate()
+			.position(|(index, stored)| !matched[index] && *stored == pair.old);
+		match position {
+			Some(position) => {
+				matched[position] = true;
+				applied.push((position, *pair));
+			}
+			None if versions.contains(&pair.new) => {}
+			None => refused.push((pair.old, pair.new)),
+		}
+	}
+	let produced = applied
+		.iter()
+		.map(|(_, pair)| pair.new)
+		.collect::<HashSet<_>>();
+	refused.retain(|(_, new)| !produced.contains(new));
+	let mut moved = Vec::new();
+	for (position, pair) in &applied {
+		if pair.old.hlc == pair.new.hlc {
+			versions[*position] = pair.new;
+		} else {
+			moved.push(*position);
+		}
+	}
+	moved.sort_unstable();
+	for position in moved.iter().rev() {
+		versions.remove(*position);
+	}
+	for (_, pair) in &applied {
+		if pair.old.hlc != pair.new.hlc {
+			crate::storage::core::insert_version_sorted(versions, pair.new);
+		}
+	}
+	for (_, pair) in &applied {
+		let mut seen = false;
+		versions.retain(|stored| {
+			if *stored != pair.new {
+				return true;
+			}
+			let first = !seen;
+			seen = true;
+			first
+		});
+	}
+	for location in &relocation.removals {
+		crate::storage::core::remove_version_exact(versions, *location);
+	}
+	for insertion in &relocation.insertions {
+		if !versions.contains(&insertion.location) {
+			crate::storage::core::insert_version_sorted(versions, insertion.location);
+		}
+	}
+	refused
+}
+
+fn relocation_test_location(slab: u64, offset: u64, hlc_ms: u64) -> RecordLocation {
+	RecordLocation {
+		slab_id: SlabId::new(slab),
+		offset,
+		length: 64,
+		hlc: hlc(hlc_ms),
+		record_row_index: RecordRowIndex::ZERO,
+		is_tombstone: false,
+		placement: PlacementSemantics::RawLocality,
+		partition: None,
+	}
+}
+
+/// With its buffers in a caller's `RelocationScratch`, a relocation decides
+/// and edits every chain exactly as before: duplicates, shifting copies,
+/// absent sources, equal and moved HLCs, removals and insertions.
+#[tokio::test]
+async fn relocation_within_scratch_edits_chains_exactly_as_before() {
+	let (_dir, mgr) = fresh_manager().await;
+	let mut state = 0x0696_5c4a_u64;
+	let mut next = move || {
+		state ^= state << 13;
+		state ^= state >> 7;
+		state ^= state << 17;
+		state
+	};
+	for case in 0..20_000u64 {
+		let location = |next: &mut dyn FnMut() -> u64| {
+			relocation_test_location(1 + next() % 3, (next() % 6) * 4096, 10 + next() % 4)
+		};
+		let mut chain = (0..next() % 10)
+			.map(|_| location(&mut next))
+			.collect::<Vec<_>>();
+		chain.sort_by_key(|location| location.hlc);
+		let mut relocation = KeyRelocation::new(Locality::new(0), None);
+		for _ in 0..next() % 6 {
+			let old = if !chain.is_empty() && next() % 4 != 0 {
+				chain[(next() as usize) % chain.len()]
+			} else {
+				location(&mut next)
+			};
+			let new = match next() % 4 {
+				0 => old,
+				1 if !chain.is_empty() => chain[(next() as usize) % chain.len()],
+				2 => RecordLocation {
+					hlc: old.hlc,
+					..location(&mut next)
+				},
+				_ => location(&mut next),
+			};
+			relocation.pairs.push(RelocationPair {
+				old,
+				new,
+				table_object_id: None,
+			});
+		}
+		for _ in 0..next() % 3 {
+			relocation.removals.push(location(&mut next));
+		}
+		for _ in 0..next() % 3 {
+			relocation.insertions.push(RelocationInsertion {
+				location: location(&mut next),
+				table_object_id: None,
+			});
+		}
+		let mut identity = [0u8; 32];
+		identity[..8].copy_from_slice(&case.to_be_bytes());
+		let key = Identity::new(identity);
+		let mut expected = chain.clone();
+		let expected_refused = reference_relocate_chain(&mut expected, &relocation);
+		if !chain.is_empty() {
+			mgr.key_index.insert((tenant(), key), chain.clone());
+		}
+		let mut scratch =
+			RelocationScratch::try_for_counts(relocation.pairs.len(), relocation.removals.len())
+				.unwrap();
+		assert!(
+			scratch.allocation_for_test() as u64
+				<= RelocationScratch::bytes_bound(
+					relocation.pairs.len(),
+					relocation.removals.len()
+				)
+				.unwrap(),
+			"case {case}: the prepared buffers fit their charged bound"
+		);
+		let refused = mgr
+			.relocate_indexed_locations(tenant(), key, &relocation, &mut scratch)
+			.to_vec();
+		let actual = mgr
+			.key_index
+			.get(&(tenant(), key))
+			.map(|chain| chain.clone())
+			.unwrap_or_default();
+		assert_eq!(actual, expected, "case {case}: chain");
+		assert_eq!(refused, expected_refused, "case {case}: refused");
+		mgr.key_index.remove(&(tenant(), key));
+	}
+}
+
+/// A refreshed slab relocating one row of a key whose version chain is large
+/// (its other versions on other slabs) needs relocation buffers sized by that
+/// one pair, not by the chain: the scratch prepared for it is never grown.
+#[tokio::test]
+async fn relocating_one_row_of_a_long_chain_stays_within_its_prepared_scratch() {
+	let (_dir, mgr) = fresh_manager().await;
+	let key = Identity::new([0x96; 32]);
+	let mut chain = (0..200_000u64)
+		.map(|index| relocation_test_location(100 + index % 7, index * 64, 10 + index))
+		.collect::<Vec<_>>();
+	let old = relocation_test_location(3, 0, 10 + 100_000);
+	chain[100_000] = old;
+	mgr.key_index.insert((tenant(), key), chain.clone());
+	let new = relocation_test_location(4, 4096, 10 + 100_000);
+	let mut relocation = KeyRelocation::new(Locality::new(0), None);
+	relocation.pairs.push(RelocationPair {
+		old,
+		new,
+		table_object_id: None,
+	});
+	let mut scratch = RelocationScratch::try_for_counts(1, 0).unwrap();
+	let capacities = scratch.capacities_for_test();
+	assert!(
+		scratch.allocation_for_test() as u64 <= RelocationScratch::bytes_bound(1, 0).unwrap(),
+		"the prepared buffers fit their charged bound"
+	);
+	let chain_bytes = super::tier_budget::vec_bytes::<RecordLocation>(chain.len()).unwrap();
+	assert!(
+		RelocationScratch::bytes_bound(1, 0).unwrap() * 1000 < chain_bytes,
+		"one pair's buffers do not scale with the chain"
+	);
+	assert!(
+		mgr.relocate_indexed_locations(tenant(), key, &relocation, &mut scratch)
+			.is_empty()
+	);
+	assert_eq!(
+		scratch.capacities_for_test(),
+		capacities,
+		"no buffer grew past its prepared capacity"
+	);
+	chain[100_000] = new;
+	assert_eq!(*mgr.key_index.get(&(tenant(), key)).unwrap(), chain);
+}
+
+/// A fenced committed apply at `index` of `pointer` (the index gate held past
+/// its bound), returning the deferral it left.
+async fn fence_committed_apply(
+	mgr: &Arc<SlabManager>,
+	pointer: &TieredSlabPointer,
+	index: u64,
+) -> super::tier_deferral::TierDeferral {
+	let gate = mgr.hold_index_write_gate_for_test().await;
+	let fenced = mgr
+		.apply_tier_slab_committed(pointer.clone(), Some(index))
+		.await;
+	drop(gate);
+	assert!(fenced.is_err(), "premise: the gate bound fences the apply");
+	mgr.unapplied_tier_pointers
+		.get(&pointer.slab_id)
+		.map(|entry| entry.value().clone())
+		.expect("premise: the fence is deferred")
+}
+
+/// The sweeper's authoritative pass over `slab_id` with `committed` as the
+/// canonical pointer.
+async fn sweep_with_committed(
+	mgr: &Arc<SlabManager>,
+	slab_id: SlabId,
+	committed: Option<TieredSlabPointer>,
+) -> std::io::Result<(bool, Option<TieredSlabPointer>)> {
+	let observed = mgr.capture_snapshot_epoch();
+	mgr.reconcile_tier_slab_at_snapshot_epoch(slab_id, observed, || async move { Ok(committed) })
+		.await
+}
+
+/// The first-tier form of the fenced-replacement recovery: a sealed local
+/// slab's first committed tier pointer, fenced by the index gate, is
+/// published by the replay of its own callback (sealed to tiered through the
+/// ordinary observer path), and the deferral is cleared.
+#[tokio::test]
+async fn replay_of_a_fenced_first_tier_publishes_it_through_its_callback() {
+	let (_dirs, mgr, l2) = fresh_manager_with_l2("s7-replay-first-tier").await;
+	let key = id(0x7e01);
+	mgr.append_durable(tenant(), key, hlc(700), b"first-tier")
+		.await
+		.unwrap();
+	let slab_id = force_seal_active(&mgr).await;
+	let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
+	let encrypted = mgr.encrypt_tiered_object_blob(slab_id, &raw).unwrap();
+	let uri = l2
+		.put("s7-replay-first-tier/p0", &encrypted.bytes)
+		.await
+		.unwrap();
+	let pointer = tiered_pointer_from_blob(&mgr, slab_id, uri, &encrypted.bytes);
+	let deferral = fence_committed_apply(&mgr, &pointer, 830).await;
+	assert_eq!(
+		deferral,
+		super::tier_deferral::TierDeferral::fenced(
+			pointer.clone(),
+			super::tier_deferral::FenceCause::IndexGate,
+			Some(830)
+		)
+	);
+	assert_eq!(
+		mgr.tier_pointer(slab_id).await,
+		None,
+		"premise: still sealed"
+	);
+
+	assert_eq!(
+		sweep_with_committed(&mgr, slab_id, Some(pointer.clone()))
+			.await
+			.unwrap(),
+		(true, None)
+	);
+	assert_eq!(mgr.tier_pointer(slab_id).await, Some(pointer));
+	assert!(mgr.unapplied_tier_pointers.get(&slab_id).is_none());
+	let location = mgr.lookup(tenant(), key).unwrap().unwrap();
+	assert_eq!(mgr.read(location).await.unwrap(), b"first-tier");
+}
+
+/// A replay never publishes a deferred pointer the committed state has moved
+/// past: with canonical state naming a newer pointer it changes nothing, and
+/// the newer pointer's own callback publishes it and replaces the deferral.
+#[tokio::test]
+async fn a_newer_committed_pointer_wins_over_the_replay_of_an_older_fence() {
+	let (_dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let bytes = l2.get(&old.l2_uri).await.unwrap();
+	let fenced = TieredSlabPointer {
+		l2_uri: l2.put("tier/s7-race-823.wnd", &bytes).await.unwrap(),
+		..old.clone()
+	};
+	let newer = TieredSlabPointer {
+		l2_uri: l2.put("tier/s7-race-824.wnd", &bytes).await.unwrap(),
+		..old.clone()
+	};
+	let deferral = fence_committed_apply(&mgr, &fenced, 823).await;
+	{
+		let lock = mgr.tier_publication_lock(old.slab_id);
+		let _guard = lock.lock().await;
+		let epoch = mgr.capture_snapshot_epoch();
+		let outcome = mgr
+			.replay_tier_deferral_under_publication_lock(old.slab_id, Some(&newer), epoch)
+			.await;
+		assert!(
+			matches!(outcome, super::tier_deferral::TierReplay::Unchanged),
+			"{outcome:?}"
+		);
+	}
+	assert_eq!(
+		mgr.unapplied_tier_pointers
+			.get(&old.slab_id)
+			.map(|entry| entry.value().clone()),
+		Some(deferral),
+		"the replay leaves the deferral exactly as it was"
+	);
+	assert_eq!(mgr.tier_pointer(old.slab_id).await, Some(old.clone()));
+
+	mgr.apply_tier_slab_committed(newer.clone(), Some(824))
+		.await
+		.unwrap();
+	assert_eq!(mgr.tier_pointer(old.slab_id).await, Some(newer.clone()));
+	assert!(mgr.unapplied_tier_pointers.get(&old.slab_id).is_none());
+	assert_eq!(
+		sweep_with_committed(&mgr, old.slab_id, Some(newer.clone()))
+			.await
+			.unwrap(),
+		(false, None),
+		"nothing is left to replay"
+	);
+	assert_eq!(mgr.tier_pointer(old.slab_id).await, Some(newer));
+}
+
+/// A control snapshot installed at or above the deferred callback's index
+/// owns the slab: the replay loses (the pointer is not published) and clears
+/// exactly that deferral once the snapshot's reconciliation is complete.
+#[tokio::test]
+async fn an_installed_snapshot_at_or_above_the_callback_index_makes_its_replay_lose() {
+	let (_dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let bytes = l2.get(&old.l2_uri).await.unwrap();
+	let fenced = TieredSlabPointer {
+		l2_uri: l2.put("tier/s7-superseded-823.wnd", &bytes).await.unwrap(),
+		..old.clone()
+	};
+	fence_committed_apply(&mgr, &fenced, 823).await;
+	let epoch = mgr.begin_tier_snapshot_install().unwrap();
+	let installed = mgr
+		.finish_tier_snapshot_install_at_epoch(vec![old.clone()], Some(830), epoch)
+		.await;
+	eprintln!("snapshot install at 830: {installed:?}");
+	assert!(mgr.observer_is_superseded(Some(823)), "premise: 823 <= 830");
+	let deferral_after_install = mgr
+		.unapplied_tier_pointers
+		.get(&old.slab_id)
+		.map(|entry| entry.value().clone());
+	eprintln!("deferral after install: {deferral_after_install:?}");
+	tokio::time::timeout(Duration::from_secs(60), async {
+		while mgr.tier_authority.snapshot_reconciliation_pending() {
+			tokio::time::sleep(Duration::from_millis(10)).await;
+		}
+	})
+	.await
+	.expect("the snapshot's reconciliation completes");
+	if deferral_after_install.is_some() {
+		let lock = mgr.tier_publication_lock(old.slab_id);
+		let _guard = lock.lock().await;
+		let outcome = mgr
+			.replay_tier_deferral_under_publication_lock(
+				old.slab_id,
+				Some(&fenced),
+				mgr.capture_snapshot_epoch(),
+			)
+			.await;
+		assert!(
+			matches!(outcome, super::tier_deferral::TierReplay::Superseded),
+			"{outcome:?}"
+		);
+	}
+	assert!(mgr.unapplied_tier_pointers.get(&old.slab_id).is_none());
+	assert_eq!(
+		mgr.tier_pointer(old.slab_id).await,
+		Some(old),
+		"the superseded callback's pointer is never published"
+	);
+}
+
+/// The retirement-time decline protects only a newer committed callback.
+/// A snapshot install at 822 retires slab X; while it is paused before its
+/// retirement apply, a fenced deferral of another generation is present. Only
+/// a deferral from a callback after 822 declines the retirement; one at or
+/// before 822, or one with no callback provenance, never stops it.
+#[tokio::test]
+async fn retirement_is_declined_only_for_a_fenced_callback_newer_than_its_mark() {
+	for (provenance, declined) in [
+		(Some(823), true),
+		(Some(822), false),
+		(Some(821), false),
+		(None, false),
+	] {
+		let (_dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+		let bytes = l2.get(&old.l2_uri).await.unwrap();
+		let replacement = TieredSlabPointer {
+			l2_uri: l2.put("tier/s7-decline.wnd", &bytes).await.unwrap(),
+			..old.clone()
+		};
+		let pause = mgr.pause_snapshot_before_retirement_apply_once();
+		let epoch = mgr.begin_tier_snapshot_install().unwrap();
+		let install = {
+			let mgr = mgr.clone();
+			tokio::spawn(async move {
+				mgr.finish_tier_snapshot_install_at_epoch(vec![], Some(822), epoch)
+					.await
+			})
+		};
+		tokio::time::timeout(Duration::from_secs(60), pause.reached.notified())
+			.await
+			.unwrap();
+		mgr.unapplied_tier_pointers.insert(
+			old.slab_id,
+			super::tier_deferral::TierDeferral::fenced(
+				replacement,
+				super::tier_deferral::FenceCause::IndexGate,
+				provenance,
+			),
+		);
+		pause.resume.notify_one();
+		let installed = install.await.unwrap();
+		let case = format!("provenance {provenance:?} against a mark at 822");
+		eprintln!("{case}: install {installed:?}");
+		assert_eq!(
+			mgr.tier_pointer(old.slab_id).await.is_some(),
+			declined,
+			"{case}: only a newer callback declines the retirement"
+		);
+		assert_eq!(
+			mgr.retired_tier_slabs.contains(&old.slab_id),
+			!declined,
+			"{case}"
+		);
+	}
+}
+
+/// A replay that fails again re-defers with the new failure's cause: the
+/// cause survives replay instead of being dropped or kept stale.
+#[tokio::test]
+async fn a_replay_that_fails_again_records_the_new_cause() {
+	use super::tier_deferral::{FenceCause, TierDeferral};
+	let (_dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let bytes = l2.get(&old.l2_uri).await.unwrap();
+	let replacement = TieredSlabPointer {
+		l2_uri: l2.put("tier/s7-refence.wnd", &bytes).await.unwrap(),
+		..old.clone()
+	};
+	assert_eq!(
+		fence_committed_apply(&mgr, &replacement, 840).await,
+		TierDeferral::fenced(replacement.clone(), FenceCause::IndexGate, Some(840))
+	);
+	let floor = mgr.tier_budget.used();
+	mgr.tier_budget.set_limit_for_test(floor);
+	assert!(
+		sweep_with_committed(&mgr, old.slab_id, Some(replacement.clone()))
+			.await
+			.is_err()
+	);
+	assert_eq!(
+		mgr.unapplied_tier_pointers
+			.get(&old.slab_id)
+			.map(|entry| entry.value().clone()),
+		Some(TierDeferral::fenced(
+			replacement.clone(),
+			FenceCause::NoScratch,
+			Some(840)
+		)),
+		"the re-fence records its own cause and keeps the callback's provenance"
+	);
+	mgr.tier_budget
+		.set_limit_for_test(super::tier_budget::DEFAULT_TIER_BUDGET_BYTES);
+	assert_eq!(
+		sweep_with_committed(&mgr, old.slab_id, Some(replacement.clone()))
+			.await
+			.unwrap(),
+		(true, None)
+	);
+	assert_eq!(mgr.tier_pointer(old.slab_id).await, Some(replacement));
+	assert!(mgr.unapplied_tier_pointers.get(&old.slab_id).is_none());
+}
+
+/// A manager bound to a real state machine whose committed tier record for
+/// its one tiered slab is `old`.
+async fn worker_replay_fixture(
+	tag: &str,
+) -> (
+	impl Sized,
+	Arc<SlabManager>,
+	Arc<dyn ObjectStore>,
+	crate::consensus::WendelonStateMachine,
+	TieredSlabPointer,
+	Identity,
+) {
+	worker_replay_fixture_over(tag, |l2| l2).await
+}
+
+/// `worker_replay_fixture`, with the manager's L2 store wrapped by `wrap`.
+async fn worker_replay_fixture_over(
+	tag: &str,
+	wrap: impl FnOnce(Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore>,
+) -> (
+	impl Sized,
+	Arc<SlabManager>,
+	Arc<dyn ObjectStore>,
+	crate::consensus::WendelonStateMachine,
+	TieredSlabPointer,
+	Identity,
+) {
+	use crate::consensus::WendelonStateMachine;
+	use crate::storage::sweeper::ManagerTierObserver;
+	let (dirs, manager, l2) = fresh_manager_with_wrapped_l2(tag, wrap).await;
+	let key = id(0x5e900);
+	manager
+		.append_durable(tenant(), key, hlc(900), b"replayed-row")
+		.await
+		.unwrap();
+	let old = tier_kv_slab(&manager, &l2, &format!("{tag}/p0")).await;
+	let target = WendelonStateMachine::new()
+		.with_tier_observer(Arc::new(ManagerTierObserver::new(manager.clone())));
+	target.seed_tiered_slab_for_test(b10_tier(&old)).await;
+	(dirs, manager, l2, target, old, key)
+}
+
+async fn commit_tier_entry(
+	target: &mut crate::consensus::WendelonStateMachine,
+	pointer: &TieredSlabPointer,
+	index: u64,
+) {
+	use openraft::storage::RaftStateMachine;
+	use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
+	RaftStateMachine::apply(
+		target,
+		[Entry {
+			log_id: LogId::new(CommittedLeaderId::new(3, 1), index),
+			payload: EntryPayload::Normal(crate::consensus::WendelonRequest::TierSlab(b10_tier(
+				pointer,
+			))),
+		}],
+	)
+	.await
+	.unwrap();
+}
+
+/// Poll `cond` every 10 ms for up to `seconds`, without touching readiness
+/// (a readiness query would start the authority worker itself).
+async fn eventually(seconds: u64, mut cond: impl AsyncFnMut() -> bool) -> bool {
+	tokio::time::timeout(Duration::from_secs(seconds), async {
+		while !cond().await {
+			tokio::time::sleep(Duration::from_millis(10)).await;
+		}
+	})
+	.await
+	.is_ok()
+}
+
+/// The worker's replay state, for a control that timed out.
+fn replay_diagnostics(manager: &SlabManager, slab_id: SlabId) -> String {
+	format!(
+		"status={} attempts={} failures={} deferral={:?} task_running={:?}",
+		manager.tier_authority.status_for_test(),
+		manager
+			.replay_probe
+			.attempts
+			.load(std::sync::atomic::Ordering::Acquire),
+		replay_failures(manager),
+		manager
+			.unapplied_tier_pointers
+			.get(&slab_id)
+			.map(|entry| (entry.value().outcome, entry.value().provenance)),
+		manager.tier_authority.task_running_for_test(),
+	)
+}
+
+fn replay_failures(manager: &SlabManager) -> u64 {
+	manager
+		.replay_probe
+		.failures
+		.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Recording a replayable deferral schedules the authority worker: with the
+/// worker parked (ready, then blocked on a structural deferral it cannot
+/// clear) and no wake from the test, no sweeper and no readiness query, a
+/// committed callback fenced on the index gate is replayed by the worker and
+/// published once the gate is free. A structural, provenance-free deferral on
+/// another slab neither strands it nor is touched, and keeps readiness closed.
+#[tokio::test]
+async fn recording_a_replayable_fence_wakes_the_parked_authority_worker() {
+	use super::tier_deferral::{DeferralOutcome, FenceCause, TierDeferral};
+	let (_keep, manager, l2, mut target, old, _key) = worker_replay_fixture("s7-worker-wake").await;
+	let bytes = l2.get(&old.l2_uri).await.unwrap();
+	let replacement = TieredSlabPointer {
+		l2_uri: l2.put("s7-worker-wake/p1", &bytes).await.unwrap(),
+		..old.clone()
+	};
+	*manager.replay_probe.backoff.lock().unwrap() = Some(Duration::from_secs(3600));
+	manager.wait_tier_authority_ready().await.unwrap();
+	let other = SlabId::new(old.slab_id.get() + 1000);
+	let structural = TierDeferral {
+		pointer: TieredSlabPointer {
+			slab_id: other,
+			..old.clone()
+		},
+		outcome: DeferralOutcome::Refused(StaleLocationReason::LayoutCollision),
+		provenance: None,
+	};
+	// Inserted directly: no wake. The worker stays parked.
+	manager
+		.unapplied_tier_pointers
+		.insert(other, structural.clone());
+
+	let gate = manager.hold_index_write_gate_for_test().await;
+	commit_tier_entry(&mut target, &replacement, 900).await;
+	assert_eq!(
+		manager
+			.unapplied_tier_pointers
+			.get(&old.slab_id)
+			.map(|entry| entry.value().clone()),
+		Some(TierDeferral::fenced(
+			replacement.clone(),
+			FenceCause::IndexGate,
+			Some(900)
+		)),
+		"premise: the observer's apply was fenced"
+	);
+	drop(gate);
+	assert!(
+		eventually(60, async || manager
+			.tier_pointer(old.slab_id)
+			.await
+			.as_ref() == Some(&replacement))
+		.await,
+		"the worker, woken only by the recorded fence, publishes the replayed callback: {}",
+		replay_diagnostics(&manager, old.slab_id)
+	);
+	assert!(manager.unapplied_tier_pointers.get(&old.slab_id).is_none());
+	assert_eq!(
+		manager
+			.unapplied_tier_pointers
+			.get(&other)
+			.map(|entry| entry.value().clone()),
+		Some(structural),
+		"the structural deferral is untouched"
+	);
+	assert!(
+		manager.tier_authority_readiness_reason().is_some(),
+		"the structural deferral keeps readiness closed"
+	);
+}
+
+/// A replay whose cause changes to the budget waits for budget releases from
+/// then on: an index-gate fence is replayed, re-fences on plan scratch, and
+/// once that failed attempt is recorded a release publishes it, long before
+/// its scheduled retry.
+#[tokio::test]
+async fn a_replay_that_re_fences_on_the_budget_is_woken_by_a_release() {
+	use super::tier_budget::TierBudgetKind;
+	use super::tier_deferral::{DeferralOutcome, FenceCause};
+	let (_keep, manager, l2, mut target, old, _key) =
+		worker_replay_fixture("s7-worker-refence").await;
+	let bytes = l2.get(&old.l2_uri).await.unwrap();
+	let replacement = TieredSlabPointer {
+		l2_uri: l2.put("s7-worker-refence/p1", &bytes).await.unwrap(),
+		..old.clone()
+	};
+	*manager.replay_probe.backoff.lock().unwrap() = Some(Duration::from_secs(3600));
+	manager.wait_tier_authority_ready().await.unwrap();
+	let gate = manager.hold_index_write_gate_for_test().await;
+	commit_tier_entry(&mut target, &replacement, 901).await;
+	// The woken worker's replay now waits on the gate. Exhaust the budget
+	// before freeing it, so the replay re-fences on plan scratch.
+	let room = manager.tier_budget.limit() - manager.tier_budget.used();
+	let hog = manager
+		.tier_budget
+		.try_reserve(TierBudgetKind::Scratch, room)
+		.unwrap();
+	drop(gate);
+	assert!(
+		eventually(60, async || replay_failures(&manager) >= 1).await,
+		"the replay attempt failed and was scheduled: {}",
+		replay_diagnostics(&manager, old.slab_id)
+	);
+	assert_eq!(
+		manager
+			.unapplied_tier_pointers
+			.get(&old.slab_id)
+			.map(|entry| entry.value().outcome),
+		Some(DeferralOutcome::Fenced(FenceCause::NoScratch)),
+		"premise: the replay re-fenced on the budget"
+	);
+	assert_eq!(manager.tier_pointer(old.slab_id).await, Some(old.clone()));
+	drop(hog);
+	assert!(
+		eventually(30, async || manager
+			.tier_pointer(old.slab_id)
+			.await
+			.as_ref() == Some(&replacement))
+		.await,
+		"the release wakes the replay, well before its hour-long backoff: {}",
+		replay_diagnostics(&manager, old.slab_id)
+	);
+}
+
+/// A release after a budget-fenced attempt is recorded but before the worker
+/// registers its wait is not lost: the worker is held between its round and
+/// its wait, the reservation is released there, and the replay publishes.
+#[tokio::test]
+async fn a_release_before_the_worker_waits_still_wakes_the_replay() {
+	use super::tier_budget::TierBudgetKind;
+	use super::tier_deferral::DeferralOutcome;
+	let (_keep, manager, l2, mut target, old, _key) =
+		worker_replay_fixture("s7-worker-watermark").await;
+	let bytes = l2.get(&old.l2_uri).await.unwrap();
+	let replacement = TieredSlabPointer {
+		l2_uri: l2.put("s7-worker-watermark/p1", &bytes).await.unwrap(),
+		..old.clone()
+	};
+	*manager.replay_probe.backoff.lock().unwrap() = Some(Duration::from_secs(3600));
+	manager.wait_tier_authority_ready().await.unwrap();
+	let room = manager.tier_budget.limit() - manager.tier_budget.used();
+	let hog = manager
+		.tier_budget
+		.try_reserve(TierBudgetKind::Scratch, room)
+		.unwrap();
+	// Held after a blocked round that attempted nothing (the failed attempt's
+	// own re-record wakes one such round), just before it registers waiters.
+	let entered = Arc::new(tokio::sync::Semaphore::new(0));
+	let release = Arc::new(tokio::sync::Semaphore::new(0));
+	*manager.replay_probe.before_wait.lock().unwrap() = Some((entered.clone(), release.clone()));
+	commit_tier_entry(&mut target, &replacement, 902).await;
+	let outcome = manager
+		.unapplied_tier_pointers
+		.get(&old.slab_id)
+		.map(|entry| entry.value().outcome);
+	assert!(
+		matches!(outcome, Some(DeferralOutcome::Fenced(cause)) if cause.waits_for_budget()),
+		"premise: the apply is fenced on the budget: {outcome:?}"
+	);
+	tokio::time::timeout(Duration::from_secs(60), entered.acquire())
+		.await
+		.unwrap_or_else(|_| {
+			panic!(
+				"the worker, woken by the recorded fence, finished its round: {}",
+				replay_diagnostics(&manager, old.slab_id)
+			)
+		})
+		.unwrap()
+		.forget();
+	assert_eq!(
+		replay_failures(&manager),
+		1,
+		"premise: its replay failed and was scheduled an hour out"
+	);
+	assert_eq!(manager.tier_pointer(old.slab_id).await, Some(old.clone()));
+	drop(hog);
+	release.add_permits(1);
+	assert!(
+		eventually(30, async || manager
+			.tier_pointer(old.slab_id)
+			.await
+			.as_ref() == Some(&replacement))
+		.await,
+		"the release before the wait is seen, well before the hour-long backoff: {}",
+		replay_diagnostics(&manager, old.slab_id)
+	);
+}
+
+/// A release during a failed replay attempt, after its budget refusal and
+/// before its schedule is recorded, is not lost: the attempt's watermark is
+/// taken before it began, so the released room makes it eligible again.
+#[tokio::test]
+async fn a_release_during_a_failed_attempt_still_wakes_its_replay() {
+	use super::tier_budget::TierBudgetKind;
+	let (_keep, manager, l2, mut target, old, _key) =
+		worker_replay_fixture("s7-worker-during").await;
+	let bytes = l2.get(&old.l2_uri).await.unwrap();
+	let replacement = TieredSlabPointer {
+		l2_uri: l2.put("s7-worker-during/p1", &bytes).await.unwrap(),
+		..old.clone()
+	};
+	*manager.replay_probe.backoff.lock().unwrap() = Some(Duration::from_secs(3600));
+	manager.wait_tier_authority_ready().await.unwrap();
+	let room = manager.tier_budget.limit() - manager.tier_budget.used();
+	let hog = manager
+		.tier_budget
+		.try_reserve(TierBudgetKind::Scratch, room)
+		.unwrap();
+	let entered = Arc::new(tokio::sync::Semaphore::new(0));
+	let release = Arc::new(tokio::sync::Semaphore::new(0));
+	*manager.replay_probe.after_outcome.lock().unwrap() = Some((entered.clone(), release.clone()));
+	commit_tier_entry(&mut target, &replacement, 903).await;
+	tokio::time::timeout(Duration::from_secs(60), entered.acquire())
+		.await
+		.unwrap_or_else(|_| {
+			panic!(
+				"the woken worker's attempt reached its outcome: {}",
+				replay_diagnostics(&manager, old.slab_id)
+			)
+		})
+		.unwrap()
+		.forget();
+	*manager.replay_probe.after_outcome.lock().unwrap() = None;
+	assert_eq!(manager.tier_pointer(old.slab_id).await, Some(old.clone()));
+	// The external release lands between the refusal and the schedule.
+	drop(hog);
+	release.add_permits(1);
+	assert!(
+		eventually(30, async || manager
+			.tier_pointer(old.slab_id)
+			.await
+			.as_ref() == Some(&replacement))
+		.await,
+		"the release during the attempt is seen, well before the hour-long backoff: {}",
+		replay_diagnostics(&manager, old.slab_id)
+	);
+}
+
+/// Capacity held before a replay attempt and freed during it (as a
+/// successful replay frees its consumed proposer token) is a release: slab
+/// B, already scheduled on the budget, is replayed after slab A's successful
+/// replay frees it, with no other refund and no manual wake.
+#[tokio::test]
+async fn a_successful_replay_freeing_held_capacity_wakes_another_budget_fenced_replay() {
+	use super::tier_budget::TierBudgetKind;
+	use super::tier_deferral::DeferralOutcome;
+	let (_keep, manager, l2, mut target, a_old, _key) =
+		worker_replay_fixture("s7-worker-pair").await;
+	manager
+		.append_durable(tenant(), id(0x5e9b0), hlc(950), b"second-slab-row")
+		.await
+		.unwrap();
+	let b_old = tier_kv_slab(&manager, &l2, "s7-worker-pair/b0").await;
+	target.seed_tiered_slab_for_test(b10_tier(&b_old)).await;
+	let replacement = |old: &TieredSlabPointer, name: &'static str| {
+		let l2 = l2.clone();
+		let old = old.clone();
+		async move {
+			let bytes = l2.get(&old.l2_uri).await.unwrap();
+			TieredSlabPointer {
+				l2_uri: l2.put(name, &bytes).await.unwrap(),
+				..old
+			}
+		}
+	};
+	let a_new = replacement(&a_old, "s7-worker-pair/a1").await;
+	let b_new = replacement(&b_old, "s7-worker-pair/b1").await;
+	*manager.replay_probe.backoff.lock().unwrap() = Some(Duration::from_secs(3600));
+	manager.wait_tier_authority_ready().await.unwrap();
+	let room = manager.tier_budget.limit() - manager.tier_budget.used();
+	let held = manager
+		.tier_budget
+		.try_reserve(TierBudgetKind::Token, room)
+		.unwrap();
+
+	// B is fenced on the budget and scheduled an hour out.
+	commit_tier_entry(&mut target, &b_new, 910).await;
+	assert!(
+		matches!(
+			manager
+				.unapplied_tier_pointers
+				.get(&b_old.slab_id)
+				.map(|entry| entry.value().outcome),
+			Some(DeferralOutcome::Fenced(cause)) if cause.waits_for_budget()
+		),
+		"premise: B is fenced on the budget"
+	);
+	assert!(
+		eventually(60, async || replay_failures(&manager) >= 1).await,
+		"premise: B's replay failed and was scheduled: {}",
+		replay_diagnostics(&manager, b_old.slab_id)
+	);
+	// A's next attempt frees the held capacity, as consuming its token does.
+	*manager.replay_probe.free_during_attempt.lock().unwrap() = Some((a_old.slab_id, held));
+	let gate = manager.hold_index_write_gate_for_test().await;
+	commit_tier_entry(&mut target, &a_new, 911).await;
+	drop(gate);
+	assert!(
+		eventually(30, async || manager
+			.tier_pointer(a_old.slab_id)
+			.await
+			.as_ref() == Some(&a_new))
+		.await,
+		"A's replay publishes: {}",
+		replay_diagnostics(&manager, a_old.slab_id)
+	);
+	assert!(
+		eventually(30, async || manager
+			.tier_pointer(b_old.slab_id)
+			.await
+			.as_ref() == Some(&b_new))
+		.await,
+		"the capacity A freed wakes B, well before its hour-long backoff: {}",
+		replay_diagnostics(&manager, b_old.slab_id)
+	);
+}
+
+fn reopen_test_config(
+	dir: &std::path::Path,
+	io: crate::storage::io_uring::IoRingHandle,
+	l2: Arc<dyn ObjectStore>,
+	crypto: Arc<CryptoManager>,
+) -> SlabManagerConfig {
+	SlabManagerConfig {
+		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
+		dir: dir.to_path_buf(),
+		max_slab_bytes: 1 << 20,
+		io,
+		l2: Some(l2),
+		rehydration: RehydrationPolicy::default(),
+		l2_column_fetch: Default::default(),
+		row_group_writer: Default::default(),
+		l2_row_group_fetch: Default::default(),
+		encoding_writer: Default::default(),
+		l2_chunk_layout: Default::default(),
+		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
+		group_commit: GroupCommitConfig::default(),
+		crypto,
+	}
+}
+
+/// Reopen before the replay (ADR 0696 r3 E2, crash). A snapshot at 822
+/// retires slab X while 823's committed replacement is fenced, so the
+/// retirement is declined and its durable mark stays. The process stops
+/// before the replay: the deferral and the volatile decline are lost. On
+/// reopen the committed state already includes 823 and 823's callback is not
+/// replayed. The durable 822 mark must never be applied against the slab
+/// whose committed pointer is 823's, and a committed row is never answered as
+/// absent. Observations are recorded before any assertion.
+#[tokio::test]
+async fn reopen_before_replay_never_applies_an_older_mark_against_the_newer_committed_pointer() {
+	let l1_dir = fresh_dir("s7-reopen-l1");
+	let l2_dir = fresh_dir("s7-reopen-l2");
+	let io = spawn_io_thread(64).unwrap();
+	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_dir).unwrap());
+	let crypto = test_crypto();
+	let mgr = SlabManager::initialize_new_store(reopen_test_config(
+		&l1_dir,
+		io.clone(),
+		l2.clone(),
+		crypto.clone(),
+	))
+	.await
+	.unwrap();
+	let key = id(0x5e822);
+	mgr.append_durable(tenant(), key, hlc(822), b"committed-row")
+		.await
+		.unwrap();
+	let old = tier_kv_slab(&mgr, &l2, "s7-reopen/p0").await;
+	let slab_id = old.slab_id;
+	let bytes = l2.get(&old.l2_uri).await.unwrap();
+	let replacement = TieredSlabPointer {
+		l2_uri: l2.put("s7-reopen/p1", &bytes).await.unwrap(),
+		..old.clone()
+	};
+
+	let pause = mgr.pause_snapshot_before_retirement_apply_once();
+	let epoch = mgr.begin_tier_snapshot_install().unwrap();
+	let install = {
+		let mgr = mgr.clone();
+		tokio::spawn(async move {
+			mgr.finish_tier_snapshot_install_at_epoch(vec![], Some(822), epoch)
+				.await
+		})
+	};
+	tokio::time::timeout(Duration::from_secs(60), pause.reached.notified())
+		.await
+		.unwrap();
+	fence_committed_apply(&mgr, &replacement, 823).await;
+	pause.resume.notify_one();
+	let installed = install.await.unwrap();
+	let marks_before = mgr
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.load_snapshot_retirement_marks()
+		.await
+		.unwrap();
+	eprintln!(
+		"before stop: install {installed:?}; pointer {:?}; marks {:?}",
+		mgr.tier_pointer(slab_id).await.map(|p| p.l2_uri),
+		marks_before
+			.iter()
+			.map(|mark| mark.snapshot_index)
+			.collect::<Vec<_>>()
+	);
+	assert_eq!(
+		mgr.tier_pointer(slab_id).await,
+		Some(old.clone()),
+		"premise: the retirement was declined"
+	);
+	assert_eq!(marks_before.len(), 1, "premise: the 822 mark is durable");
+	drop(mgr);
+
+	let reopened = SlabManager::open(reopen_test_config(&l1_dir, io, l2, crypto))
+		.await
+		.unwrap();
+	let observe = |stage: &'static str| {
+		let reopened = reopened.clone();
+		async move {
+			let lookup = reopened.lookup(tenant(), key);
+			let marks = reopened
+				.persistent_index
+				.as_ref()
+				.unwrap()
+				.load_snapshot_retirement_marks()
+				.await
+				.unwrap()
+				.len();
+			let pointer = reopened.tier_pointer(slab_id).await;
+			let retired = reopened.retired_tier_slabs.contains(&slab_id);
+			eprintln!(
+				"{stage}: pointer={:?} retired={retired} marks={marks} readiness={:?} lookup={lookup:?}",
+				pointer.as_ref().map(|p| &p.l2_uri),
+				reopened.tier_authority_readiness_reason(),
+			);
+			(pointer, retired, lookup.is_ok_and(|found| found.is_none()))
+		}
+	};
+	let (_, retired_at_open, missing_at_open) = observe("after reopen").await;
+	// The authoritative pass recovery runs, with committed state at 823.
+	let swept = sweep_with_committed(&reopened, slab_id, Some(replacement.clone())).await;
+	eprintln!("sweeper pass: {swept:?}");
+	let (pointer, retired_after_sweep, missing_after_sweep) = observe("after sweeper pass").await;
+	let ready = tokio::time::timeout(
+		Duration::from_secs(30),
+		reopened.wait_tier_authority_ready(),
+	)
+	.await;
+	eprintln!("ready: {ready:?}");
+	let (final_pointer, retired_finally, missing_finally) = observe("after readiness wait").await;
+
+	assert!(
+		!retired_at_open && !retired_after_sweep && !retired_finally,
+		"the 822 mark is never applied against 823's slab"
+	);
+	assert!(
+		!missing_at_open && !missing_after_sweep && !missing_finally,
+		"a committed row is never answered as absent"
+	);
+	assert!(
+		pointer.is_some() && final_pointer.is_some(),
+		"the slab stays published: {pointer:?}"
+	);
+}
+
+/// Only an applied pair publishes its redirect: the idempotent branch (old
+/// absent, new already indexed) and a refused pair (both absent) publish
+/// nothing, though the prepared map holds an entry for each.
+#[tokio::test]
+async fn only_an_applied_pair_publishes_its_cross_slab_redirect() {
+	use super::redirect_store::SourceRedirects;
+	let (_dir, mgr) = fresh_manager().await;
+	let key = Identity::new([0x5c; 32]);
+	let applied = (
+		relocation_test_location(1, 0, 10),
+		relocation_test_location(2, 0, 10),
+	);
+	let idempotent = (
+		relocation_test_location(1, 4096, 11),
+		relocation_test_location(2, 4096, 11),
+	);
+	let refused = (
+		relocation_test_location(1, 8192, 12),
+		relocation_test_location(2, 8192, 12),
+	);
+	mgr.key_index
+		.insert((tenant(), key), vec![applied.0, idempotent.1]);
+	let pairs = [applied, idempotent, refused];
+	let map = SourceRedirects::try_build(
+		&mgr.tier_budget,
+		SlabId::new(1),
+		SlabId::new(2),
+		pairs.len(),
+		pairs.iter().copied(),
+	)
+	.unwrap();
+	assert!(
+		mgr.redirects.install(
+			mgr.redirects
+				.reserve_install(&mgr.tier_budget, map.clone())
+				.unwrap()
+		)
+	);
+	let mut relocation = KeyRelocation::new(Locality::new(0), Some(map));
+	for (old, new) in pairs {
+		relocation.pairs.push(RelocationPair {
+			old,
+			new,
+			table_object_id: None,
+		});
+	}
+	let refused_pairs = mgr
+		.relocate_indexed_locations(
+			tenant(),
+			key,
+			&relocation,
+			&mut RelocationScratch::for_relocation(&relocation),
+		)
+		.to_vec();
+	assert_eq!(refused_pairs, vec![refused]);
+	assert_eq!(mgr.redirects.resolve(&applied.0), Some(applied.1));
+	assert_eq!(
+		mgr.redirects.resolve(&idempotent.0),
+		None,
+		"idempotent: nothing published"
+	);
+	assert_eq!(
+		mgr.redirects.resolve(&refused.0),
+		None,
+		"refused: nothing published"
+	);
+}
+
+/// A maintenance rewrite publishes a redirect for every relocated survivor:
+/// a stale holder of an old location resolves to its new one and reads its
+/// version there, through the charged per-source map.
+#[tokio::test]
+async fn a_maintenance_rewrite_publishes_charged_redirects_for_its_survivors() {
+	use super::tier_budget::TierBudgetKind;
+	let (_dir, mgr) = fresh_manager().await;
+	let (keys, _doomed, tombstone) = seed_maintenance_relocation_fixture(&mgr).await;
+	let before = keys
+		.iter()
+		.map(|key| (*key, mgr.lookup(tenant(), *key).unwrap().unwrap()))
+		.collect::<Vec<_>>();
+	let (schemas, indexes) = empty_compaction_catalogs();
+	let report = mgr
+		.reclaim_tombstoned_ranges(&[tombstone], &schemas, &indexes, 1)
+		.await
+		.unwrap();
+	assert_eq!(report.compacted_slabs, 1, "premise: the slab was rewritten");
+	let source = before[0].1.slab_id;
+	let map = mgr
+		.redirects
+		.source_map_for_test(source)
+		.expect("the rewrite installed its map");
+	assert!(mgr.tier_budget.used_by(TierBudgetKind::Redirect) > 0);
+	assert!(mgr.tier_budget.used_by(TierBudgetKind::RedirectStore) > 0);
+	drop(map);
+	for (key, old) in before.into_iter().filter(|(_, old)| old.slab_id == source) {
+		let current = mgr.lookup(tenant(), key).unwrap().unwrap();
+		assert_ne!(current.slab_id, source, "premise: {key:?} was relocated");
+		assert_eq!(mgr.redirects.resolve(&old), Some(current), "{key:?}");
+		assert_eq!(
+			mgr.read(old).await.unwrap(),
+			mgr.read(current).await.unwrap(),
+			"a stale holder reads its version"
+		);
+	}
+}
+
+/// A rewrite whose redirect map cannot be reserved still completes: the map
+/// is skipped and counted, and a stale holder reads its version from the
+/// retained old slab.
+#[tokio::test]
+async fn a_rewrite_without_room_for_its_redirects_skips_them_and_counts_it() {
+	let (_dir, mgr) = fresh_manager().await;
+	let (keys, _doomed, tombstone) = seed_maintenance_relocation_fixture(&mgr).await;
+	let before = keys
+		.iter()
+		.map(|key| (*key, mgr.lookup(tenant(), *key).unwrap().unwrap()))
+		.collect::<Vec<_>>();
+	let source = before[0].1.slab_id;
+	let skipped = crate::metrics::global().relocation_redirects_skipped.get();
+	mgr.tier_budget.set_limit_for_test(mgr.tier_budget.used());
+	let (schemas, indexes) = empty_compaction_catalogs();
+	let report = mgr
+		.reclaim_tombstoned_ranges(&[tombstone], &schemas, &indexes, 1)
+		.await
+		.unwrap();
+	assert_eq!(
+		report.compacted_slabs, 1,
+		"the rewrite does not need its redirects"
+	);
+	assert!(mgr.redirects.source_map_for_test(source).is_none());
+	assert!(crate::metrics::global().relocation_redirects_skipped.get() > skipped);
+	for (key, old) in before.into_iter().filter(|(_, old)| old.slab_id == source) {
+		let current = mgr.lookup(tenant(), key).unwrap().unwrap();
+		assert_eq!(mgr.redirects.resolve(&old), None);
+		assert_eq!(
+			mgr.read(old).await.unwrap(),
+			mgr.read(current).await.unwrap(),
+			"the retained old slab still serves {key:?}"
+		);
+	}
+}
+
+/// `seed_small_retired_gc_slab`, also returning the stale holder's location:
+/// the row's original location in the now Retired input slab.
+async fn seed_small_retired_gc_slab_at(
+	manager: &Arc<SlabManager>,
+) -> (SlabId, Identity, RecordLocation) {
+	let key = id(0xdd20);
+	let old = manager
+		.append_durable(tenant(), key, hlc(10), b"gc-survivor")
+		.await
+		.unwrap();
+	assert_eq!(manager.force_seal_active_for_test().await, old.slab_id);
+	let before = manager.compaction_manifest_snapshot();
+	let plan = CompactionPlan {
+		job_id: CompactionJobId::new(0xdd20),
+		source_level: CompactionLevelIndex::L0,
+		target_level: CompactionLevelIndex::L1,
+		manifest_epoch_pre: before.manifest_epoch,
+		input_slabs: vec![old.slab_id],
+		overlapping_slabs: Vec::new(),
+		retention_floor_snapshot: hlc(0),
+		compaction_start_hlc: hlc(20),
+		dominant_reason: crate::storage::DominantReason::Operator,
+	};
+	let worker = LsmCompactionWorker::new(LsmConfig::default(), manager.slab_pin_table()).unwrap();
+	manager
+		.run_lsm_compaction_once(&worker, plan)
+		.await
+		.unwrap();
+	(old.slab_id, key, old)
+}
+
+fn is_superseded(result: &std::io::Result<Vec<u8>>) -> bool {
+	result
+		.as_ref()
+		.err()
+		.and_then(stale_location)
+		.map(|stale| stale.reason)
+		== Some(StaleLocationReason::Superseded)
+}
+
+async fn sweep_gc(manager: &Arc<SlabManager>, slab_id: SlabId) {
+	let gc = LsmGcWorker::new(LsmConfig::default(), manager.slab_pin_table()).unwrap();
+	assert!(
+		manager
+			.sweep_lsm_delete_pending_once(&gc)
+			.await
+			.unwrap()
+			.contains(&slab_id),
+		"premise: GC disposed of the Retired input"
+	);
+}
+
+/// A stale holder of a location in a slab LSM GC disposed of gets typed
+/// `Superseded`, read in the same snapshot as the missing backing; before
+/// GC, while the input is only Retired, it is served from the retained slab.
+#[tokio::test]
+async fn a_stale_holder_after_lsm_gc_gets_superseded_and_before_it_is_served() {
+	let (_dir, manager) = fresh_manager().await;
+	let (slab_id, key, old) = seed_small_retired_gc_slab_at(&manager).await;
+	assert_eq!(
+		manager.read(old).await.unwrap(),
+		b"gc-survivor",
+		"Retired, not yet disposed: the old backing serves"
+	);
+	sweep_gc(&manager, slab_id).await;
+	let read = manager.read(old).await;
+	assert!(is_superseded(&read), "{read:?}");
+	assert_eq!(
+		manager
+			.read(manager.lookup(tenant(), key).unwrap().unwrap())
+			.await
+			.unwrap(),
+		b"gc-survivor",
+		"the current location still serves"
+	);
+}
+
+/// Maintenance without replacement (every row of the slab reclaimed) is an
+/// authorized disposal too: a stale holder of a reclaimed row's location
+/// gets `Superseded`.
+#[tokio::test]
+async fn a_stale_holder_after_maintenance_without_replacement_gets_superseded() {
+	let (_dir, mgr) = fresh_manager().await;
+	let doomed = id(0xD100);
+	let old = mgr
+		.append(tenant(), doomed, hlc(10), b"doomed")
+		.await
+		.unwrap();
+	force_seal_active(&mgr).await;
+	mgr.append(tenant(), id(0xD1FF), hlc(40), b"active-row")
+		.await
+		.unwrap();
+	let target = Locality::from(doomed).get();
+	let tombstone = MigratedRangeTombstone {
+		migration_id: 1,
+		range_start: target,
+		range_end: target,
+		to_epoch: 2,
+		completed_by: NodeId {
+			id: 7,
+			_reserved: 0,
+		},
+		completed_at_hlc: hlc(1),
+		migration_hlc_floor: hlc(0),
+	};
+	let (schemas, indexes) = empty_compaction_catalogs();
+	let report = mgr
+		.reclaim_tombstoned_ranges(&[tombstone], &schemas, &indexes, 1)
+		.await
+		.unwrap();
+	eprintln!("reclaim report: {report:?}");
+	assert!(
+		mgr.state.lock().await.sealed.get(&old.slab_id).is_none(),
+		"premise: the slab was disposed without replacement"
+	);
+	let read = mgr.read(old).await;
+	assert!(is_superseded(&read), "{read:?}");
+}
+
+/// Installing a backing for a disposed slab again forgets its evidence: if
+/// that backing later goes missing for any other reason, the answer is the
+/// existing missing-slab failure, never `Superseded`.
+#[tokio::test]
+async fn reinstalling_a_disposed_slab_forgets_its_disposal_evidence() {
+	let (_dir, manager) = fresh_manager().await;
+	let (slab_id, _key, old) = seed_small_retired_gc_slab_at(&manager).await;
+	sweep_gc(&manager, slab_id).await;
+	assert!(is_superseded(&manager.read(old).await), "premise");
+	{
+		let state = manager.state.lock().await;
+		let active = state.active.clone();
+		state.install_sealed(&manager.tier_budget, slab_id, active);
+		assert!(!state.disposal_evidence.contains(slab_id));
+		state.sealed.remove(&slab_id);
+	}
+	let read = manager.read(old).await;
+	assert!(!is_superseded(&read), "{read:?}");
+	assert!(read.is_err());
+}
+
+/// A bulk authority event (here a snapshot comparison) clears all disposal
+/// evidence: a stale holder then gets the existing failure, not `Superseded`.
+#[tokio::test]
+async fn a_snapshot_comparison_after_disposal_clears_its_evidence() {
+	let (_dir, manager) = fresh_manager().await;
+	let (slab_id, _key, old) = seed_small_retired_gc_slab_at(&manager).await;
+	sweep_gc(&manager, slab_id).await;
+	assert!(is_superseded(&manager.read(old).await), "premise");
+	let epoch = manager.begin_tier_snapshot_install().unwrap();
+	let installed = manager
+		.finish_tier_snapshot_install_at_epoch(vec![], Some(1), epoch)
+		.await;
+	eprintln!("snapshot install: {installed:?}");
+	assert!(
+		!manager
+			.state
+			.lock()
+			.await
+			.disposal_evidence
+			.contains(slab_id)
+	);
+	let read = manager.read(old).await;
+	assert!(!is_superseded(&read), "{read:?}");
+}
+
+/// A disposal whose evidence the budget cannot hold records none: a stale
+/// holder gets the existing failure, never a `Superseded` without evidence.
+#[tokio::test]
+async fn a_disposal_without_room_for_its_evidence_degrades_to_the_existing_failure() {
+	let (_dir, manager) = fresh_manager().await;
+	let (slab_id, _key, old) = seed_small_retired_gc_slab_at(&manager).await;
+	manager
+		.tier_budget
+		.set_limit_for_test(manager.tier_budget.used());
+	sweep_gc(&manager, slab_id).await;
+	assert_eq!(
+		manager.state.lock().await.disposal_evidence.len_for_test(),
+		0
+	);
+	let read = manager.read(old).await;
+	assert!(!is_superseded(&read), "{read:?}");
+	assert!(read.is_err());
+}
+
+/// A GC sweep that aborts while the run is delete-pending (here because the
+/// slab path no longer names its owned handle) disposed of nothing, so it
+/// enters no evidence: a stale holder never gets `Superseded`.
+#[tokio::test]
+async fn a_gc_abort_while_delete_pending_enters_no_disposal_evidence() {
+	let (dir, manager) = fresh_manager().await;
+	let (slab_id, _key, old) = seed_small_retired_gc_slab_at(&manager).await;
+	let path = slab_path(&dir, slab_id);
+	std::fs::rename(&path, path.with_extension("saved")).unwrap();
+	std::fs::write(&path, b"unrelated replacement").unwrap();
+	let gc = LsmGcWorker::new(LsmConfig::default(), manager.slab_pin_table()).unwrap();
+	assert_eq!(
+		manager
+			.sweep_lsm_delete_pending_once(&gc)
+			.await
+			.unwrap_err()
+			.kind(),
+		ErrorKind::InvalidData,
+		"premise: the sweep aborts"
+	);
+	assert!(
+		!manager
+			.state
+			.lock()
+			.await
+			.disposal_evidence
+			.contains(slab_id)
+	);
+	let read = manager.read(old).await;
+	assert!(!is_superseded(&read), "{read:?}");
+}
+
+/// An L2 store whose fetches fail while `down` is set.
+struct OutageObjectStore {
+	inner: Arc<dyn ObjectStore>,
+	down: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl OutageObjectStore {
+	fn check(&self) -> std::io::Result<()> {
+		if self.down.load(std::sync::atomic::Ordering::Acquire) {
+			return Err(Error::new(ErrorKind::ConnectionRefused, "L2 outage (test)"));
+		}
+		Ok(())
+	}
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for OutageObjectStore {
+	fn planned_upload_uri(&self, key: &str) -> std::io::Result<String> {
+		self.inner.planned_upload_uri(key)
+	}
+
+	async fn put(&self, key: &str, bytes: &[u8]) -> std::io::Result<String> {
+		self.inner.put(key, bytes).await
+	}
+
+	async fn head(&self, uri: &str) -> std::io::Result<crate::storage::l2::ObjectMetadata> {
+		self.check()?;
+		self.inner.head(uri).await
+	}
+
+	async fn get_range(&self, uri: &str, range: std::ops::Range<u64>) -> std::io::Result<Bytes> {
+		self.check()?;
+		self.inner.get_range(uri, range).await
+	}
+
+	async fn get_bytes(&self, uri: &str) -> std::io::Result<Bytes> {
+		self.check()?;
+		self.inner.get_bytes(uri).await
+	}
+
+	async fn list(&self, prefix: &str) -> std::io::Result<Vec<crate::storage::l2::ObjectMetadata>> {
+		self.inner.list(prefix).await
+	}
+
+	async fn delete(&self, uri: &str) -> std::io::Result<()> {
+		self.inner.delete(uri).await
+	}
+}
+
+/// A committed publication that cannot fetch its object from L2 fences typed
+/// (`Fenced(L2Unavailable)`, counted as `l2_unavailable`) and stays unpublished
+/// while L2 is down; once L2 recovers, the authority worker replays the
+/// callback on its own (its backoff is the resume, as no release event exists
+/// for L2), with no sweeper and no manual wake.
+#[tokio::test]
+async fn an_l2_outage_fences_the_committed_publication_until_l2_recovers() {
+	use super::tier_deferral::{FenceCause, TierDeferral};
+	let down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+	let wrap = {
+		let down = down.clone();
+		move |inner: Arc<dyn ObjectStore>| -> Arc<dyn ObjectStore> {
+			Arc::new(OutageObjectStore { inner, down })
+		}
+	};
+	let (_keep, manager, l2, mut target, old, _key) =
+		worker_replay_fixture_over("s7-l2-outage", wrap).await;
+	let bytes = l2.get(&old.l2_uri).await.unwrap();
+	let replacement = TieredSlabPointer {
+		l2_uri: l2.put("s7-l2-outage/p1", &bytes).await.unwrap(),
+		..old.clone()
+	};
+	manager.wait_tier_authority_ready().await.unwrap();
+	let fenced = fenced_counter("l2_unavailable");
+	down.store(true, std::sync::atomic::Ordering::Release);
+	commit_tier_entry(&mut target, &replacement, 920).await;
+	assert_eq!(
+		manager
+			.unapplied_tier_pointers
+			.get(&old.slab_id)
+			.map(|entry| entry.value().clone()),
+		Some(TierDeferral::fenced(
+			replacement.clone(),
+			FenceCause::L2Unavailable,
+			Some(920)
+		)),
+		"the outage fences the committed publication typed"
+	);
+	assert!(
+		fenced_counter("l2_unavailable") > fenced,
+		"the fence is counted"
+	);
+	assert!(
+		eventually(60, async || replay_failures(&manager) >= 2).await,
+		"the worker keeps retrying while L2 is down: {}",
+		replay_diagnostics(&manager, old.slab_id)
+	);
+	assert_eq!(manager.tier_pointer(old.slab_id).await, Some(old.clone()));
+	down.store(false, std::sync::atomic::Ordering::Release);
+	assert!(
+		eventually(60, async || manager
+			.tier_pointer(old.slab_id)
+			.await
+			.as_ref() == Some(&replacement))
+		.await,
+		"after L2 recovers the worker publishes the replayed callback: {}",
+		replay_diagnostics(&manager, old.slab_id)
+	);
+	assert!(manager.unapplied_tier_pointers.get(&old.slab_id).is_none());
+}
+
+fn live_lineages(mgr: &SlabManager) -> u64 {
+	mgr.tier_budget.census().snapshot().iter().sum()
+}
+
+/// The §7 measurement instrument counts each live published layout once: a
+/// publication carrying history adds one lineage, a republication of the
+/// same slab replaces it, and a block reset restarts the block's peak and
+/// headroom, which render with the histogram.
+#[tokio::test]
+async fn the_lineage_instrument_counts_each_live_published_layout_once() {
+	let fixture = seed_tier_refresh_fixture("s7-instrument").await;
+	let mgr = &fixture.mgr;
+	let before = live_lineages(mgr);
+	mgr.apply_tier_slab_committed(fixture.rewritten.clone(), None)
+		.await
+		.unwrap();
+	assert_eq!(
+		live_lineages(mgr),
+		before + 1,
+		"one live lineage for the slab"
+	);
+	mgr.reset_tier_measurement_block();
+	let mut out = String::new();
+	crate::metrics::TierMeasurementSource::render_tier_measurement(&*mgr.tier_budget, &mut out);
+	assert!(
+		out.contains("wendelon_test_tier_lineage_entries_count "),
+		"{out}"
+	);
+	assert!(out.contains("wendelon_test_tier_budget_block_min_headroom_bytes "));
+	assert!(out.contains(&format!(
+		"wendelon_test_tier_budget_limit_bytes {}",
+		mgr.tier_budget.limit()
+	)));
+}
+
+/// Near-budget concurrency, abort and retry accounting, churn and peak
+/// live bytes (ADR 0696 fast follow controls). Eight tiered slabs are
+/// rewritten concurrently under a limit that holds about two publications:
+/// every apply publishes or fences typed on the budget, sweeper passes
+/// replay the fences until all publish, the peak never exceeds the limit,
+/// no scratch or token bytes remain, and the charged total is the registry
+/// plus the live layouts. Three churn rounds then keep exactly eight live
+/// lineages and stable layout bytes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_near_budget_publications_fence_typed_and_all_publish_on_retry() {
+	use super::tier_budget::TierBudgetKind;
+	use super::tier_deferral::DeferralOutcome;
+	let (_dirs, mgr, l2) = fresh_manager_with_l2("s7-near-budget").await;
+	let mut olds = Vec::new();
+	for slab in 0..8u64 {
+		for row in 0..4u64 {
+			mgr.append_durable(
+				tenant(),
+				id(0x7b00 + slab * 16 + row),
+				hlc(100 + slab * 16 + row),
+				format!("near-budget-{slab}-{row}").as_bytes(),
+			)
+			.await
+			.unwrap();
+		}
+		olds.push(tier_kv_slab(&mgr, &l2, &format!("s7-near-budget/s{slab}-0")).await);
+	}
+	let replacement = |old: &TieredSlabPointer, round: u64| {
+		let (l2, old) = (l2.clone(), old.clone());
+		async move {
+			let bytes = l2.get(&old.l2_uri).await.unwrap();
+			TieredSlabPointer {
+				l2_uri: l2
+					.put(
+						&format!("s7-near-budget/s{}-{round}", old.slab_id.get()),
+						&bytes,
+					)
+					.await
+					.unwrap(),
+				..old
+			}
+		}
+	};
+	// One publication's need, measured on the first slab alone.
+	let floor = mgr.tier_budget.used();
+	mgr.tier_budget.reset_peak_for_test();
+	let first = replacement(&olds[0], 1).await;
+	mgr.apply_tier_slab_committed(first.clone(), Some(2000))
+		.await
+		.unwrap();
+	let need = mgr.tier_budget.peak() - floor;
+	let mut current = vec![first];
+	for old in &olds[1..] {
+		current.push(old.clone());
+	}
+
+	// Round 1 for the other seven, concurrently, under about two needs.
+	let base = mgr.tier_budget.used();
+	let limit = base + 2 * need + need / 2;
+	mgr.tier_budget.set_limit_for_test(limit);
+	mgr.tier_budget.reset_peak_for_test();
+	let mut wanted = Vec::new();
+	for old in &olds[1..] {
+		wanted.push(replacement(old, 1).await);
+	}
+	let applies = wanted
+		.iter()
+		.enumerate()
+		.map(|(i, pointer)| {
+			let (mgr, pointer) = (mgr.clone(), pointer.clone());
+			tokio::spawn(async move {
+				mgr.apply_tier_slab_committed(pointer, Some(2001 + i as u64))
+					.await
+			})
+		})
+		.collect::<Vec<_>>();
+	let mut fenced = 0;
+	for (apply, pointer) in applies.into_iter().zip(&wanted) {
+		if let Err(error) = apply.await.unwrap() {
+			fenced += 1;
+			let outcome = mgr
+				.unapplied_tier_pointers
+				.get(&pointer.slab_id)
+				.map(|entry| entry.value().outcome);
+			assert!(
+				matches!(outcome, Some(DeferralOutcome::Fenced(cause)) if cause.waits_for_budget()),
+				"a near-budget apply fences typed on the budget: {error}, {outcome:?}"
+			);
+		}
+	}
+	eprintln!(
+		"near budget: need {need}, limit headroom {}, fenced {fenced} of 7",
+		limit - base
+	);
+	assert!(
+		fenced > 0,
+		"premise: the limit fences some of the concurrent publications"
+	);
+	for _ in 0..20 {
+		let pending = wanted
+			.iter()
+			.filter(|pointer| mgr.unapplied_tier_pointers.contains_key(&pointer.slab_id))
+			.cloned()
+			.collect::<Vec<_>>();
+		if pending.is_empty() {
+			break;
+		}
+		for pointer in pending {
+			let _ = sweep_with_committed(&mgr, pointer.slab_id, Some(pointer.clone())).await;
+		}
+	}
+	for pointer in &wanted {
+		assert_eq!(
+			mgr.tier_pointer(pointer.slab_id).await.as_ref(),
+			Some(pointer),
+			"every fenced publication is published on retry"
+		);
+	}
+	assert!(
+		mgr.tier_budget.peak() <= limit,
+		"the peak never exceeds the limit: {} > {limit}",
+		mgr.tier_budget.peak()
+	);
+	assert_eq!(
+		mgr.tier_budget.used_by(TierBudgetKind::Scratch),
+		0,
+		"no scratch left"
+	);
+	assert_eq!(
+		mgr.tier_budget.used_by(TierBudgetKind::Token),
+		0,
+		"no token left"
+	);
+	let accounted = mgr.tier_budget.used_by(TierBudgetKind::Registry)
+		+ mgr.tier_budget.used_by(TierBudgetKind::Layout);
+	assert_eq!(
+		mgr.tier_budget.used(),
+		accounted,
+		"registry plus live layouts"
+	);
+	for (pointer, slot) in wanted.into_iter().zip(&mut current[1..]) {
+		*slot = pointer;
+	}
+
+	// Churn: three more rounds, sequential, at the default budget.
+	mgr.tier_budget
+		.set_limit_for_test(super::tier_budget::DEFAULT_TIER_BUDGET_BYTES);
+	let mut layout_bytes = Vec::new();
+	for round in 2..5u64 {
+		for (i, pointer) in current.iter_mut().enumerate() {
+			let next = replacement(pointer, round).await;
+			mgr.apply_tier_slab_committed(next.clone(), Some(3000 + round * 10 + i as u64))
+				.await
+				.unwrap();
+			*pointer = next;
+		}
+		assert_eq!(
+			live_lineages(&mgr),
+			8,
+			"round {round}: one live lineage per slab"
+		);
+		layout_bytes.push(mgr.tier_budget.used_by(TierBudgetKind::Layout));
+	}
+	assert!(
+		layout_bytes.windows(2).all(|pair| pair[1] <= pair[0]),
+		"churn does not grow live layout bytes: {layout_bytes:?}"
+	);
+}
+
+/// The census counts exactly one sample per slab's published generation:
+/// a build paused before its state install is not a sample; a publication
+/// cancelled there leaves none; a replacement keeps one sample while an
+/// old generation's `Arc` is still held; a retirement removes it.
+#[tokio::test]
+async fn the_lineage_census_counts_only_each_slabs_published_generation() {
+	let fixture = seed_tier_refresh_fixture("s7-census").await;
+	let mgr = &fixture.mgr;
+	let base = live_lineages(mgr);
+
+	// Paused after the build and the durable step, before the state install.
+	let pause = mgr.pause_tier_publication_before_pointer_once();
+	let publication = {
+		let (mgr, pointer) = (mgr.clone(), fixture.rewritten.clone());
+		tokio::spawn(async move { mgr.apply_tier_slab_committed(pointer, None).await })
+	};
+	tokio::time::timeout(Duration::from_secs(60), pause.reached.notified())
+		.await
+		.unwrap();
+	assert_eq!(
+		live_lineages(mgr),
+		base,
+		"a prepared layout is not a sample"
+	);
+	// Cancelled there.
+	publication.abort();
+	let _ = publication.await;
+	assert_eq!(
+		live_lineages(mgr),
+		base,
+		"a cancelled publication leaves none"
+	);
+	// The cancellation came after its durable step, which leaves this
+	// manager fenced by the existing orphan protection: continue on a fresh
+	// one.
+	let fixture = seed_tier_refresh_fixture("s7-census-published").await;
+	let mgr = &fixture.mgr;
+	let base = live_lineages(mgr);
+
+	mgr.apply_tier_slab_committed(fixture.rewritten.clone(), None)
+		.await
+		.unwrap();
+	assert_eq!(
+		live_lineages(mgr),
+		base + 1,
+		"the published generation is one sample"
+	);
+	let held = mgr
+		.state
+		.lock()
+		.await
+		.tier_layouts
+		.get(&fixture.slab_id)
+		.map(|entry| entry.value().clone())
+		.expect("published layout");
+	let l2 = mgr.config.l2.clone().expect("the fixture has L2");
+	let bytes = l2.get(&fixture.rewritten.l2_uri).await.unwrap();
+	let next = TieredSlabPointer {
+		l2_uri: l2.put("s7-census/next", &bytes).await.unwrap(),
+		..fixture.rewritten.clone()
+	};
+	mgr.apply_tier_slab_committed(next.clone(), None)
+		.await
+		.unwrap();
+	assert_eq!(
+		live_lineages(mgr),
+		base + 1,
+		"a replacement keeps one sample, old generation held or not"
+	);
+	drop(held);
+	assert_eq!(live_lineages(mgr), base + 1);
+
+	{
+		let state = mgr.state.lock().await;
+		state.remove_tier_layout(&mgr.tier_budget, fixture.slab_id);
+	}
+	assert_eq!(
+		live_lineages(mgr),
+		base,
+		"a removed generation leaves the census"
+	);
+}
+
+/// A block reset starts the block at the current headroom: a refund before
+/// the first admission does not erase the block's minimum.
+#[test]
+fn a_block_reset_keeps_its_starting_headroom_through_a_refund() {
+	use super::tier_budget::{TierBudgetKind, TierMemoryBudget};
+	let budget = TierMemoryBudget::new(100);
+	let held = budget.try_reserve(TierBudgetKind::Scratch, 90).unwrap();
+	budget.reset_measurement_block();
+	drop(held);
+	let mut out = String::new();
+	crate::metrics::TierMeasurementSource::render_tier_measurement(&*budget, &mut out);
+	assert!(
+		out.contains("wendelon_test_tier_budget_block_min_headroom_bytes 10\n"),
+		"{out}"
+	);
+	assert!(
+		out.contains("wendelon_test_tier_budget_block_peak_bytes 90\n"),
+		"{out}"
+	);
+	drop(budget.try_reserve(TierBudgetKind::Scratch, 20).unwrap());
+	let mut out = String::new();
+	crate::metrics::TierMeasurementSource::render_tier_measurement(&*budget, &mut out);
+	assert!(
+		out.contains("wendelon_test_tier_budget_block_min_headroom_bytes 10\n"),
+		"a later, larger headroom does not raise the minimum: {out}"
+	);
+}
+/// A three-voter in-process control cluster (the b1t harness) whose node
+/// `observer` applies through `manager`'s tier observer.
+struct ControlCluster {
+	nodes: Vec<crate::consensus::WendelonRaft>,
+	_network: b1t_network::Network,
+	_logs: Vec<crate::consensus::WendelonLogStore>,
+	_dirs: Vec<crate::test_support::TestDir>,
+}
+
+async fn control_cluster(observer: u32, manager: &Arc<SlabManager>) -> ControlCluster {
+	use crate::consensus::{WendelonLogStore, WendelonRaft};
+	let network = b1t_network::Network::default();
+	let config = Arc::new(
+		crate::consensus::retention::ControlRetention::default()
+			.openraft_config("wendelon")
+			.validate()
+			.unwrap(),
+	);
+	let (mut logs, mut dirs, mut nodes) = (Vec::new(), Vec::new(), Vec::new());
+	for node_id in 1_u32..=3 {
+		let dir = fresh_dir("s7-control-cluster-wal");
+		let log = WendelonLogStore::open_for_retention_test(&dir, 64 * 4096, None)
+			.await
+			.unwrap();
+		let mut sm = log.recovered_state_machine().await.unwrap();
+		if node_id == observer {
+			sm = sm.with_tier_observer(Arc::new(crate::storage::ManagerTierObserver::new(
+				manager.clone(),
+			)));
+		}
+		let raft = WendelonRaft::new(node_id, config.clone(), network.clone(), log.clone(), sm)
+			.await
+			.unwrap();
+		network.0.lock().unwrap().insert(node_id, raft.clone());
+		logs.push(log);
+		dirs.push(dir);
+		nodes.push(raft);
+	}
+	let members = (1_u32..=3)
+		.map(|id| {
+			(
+				id,
+				openraft::BasicNode {
+					addr: "127.0.0.1:0".into(),
+				},
+			)
+		})
+		.collect::<BTreeMap<_, _>>();
+	nodes[0].initialize(members).await.unwrap();
+	for node in &nodes {
+		node.wait(Some(Duration::from_secs(60)))
+			.current_leader(1, "initial control leader")
+			.await
+			.unwrap();
+	}
+	ControlCluster {
+		nodes,
+		_network: network,
+		_logs: logs,
+		_dirs: dirs,
+	}
+}
+
+impl ControlCluster {
+	/// Commit `pointer` through the current leader `leader` (1-based) and
+	/// wait until every voter applied it.
+	async fn commit_tier(&self, leader: u32, pointer: &TieredSlabPointer) -> u64 {
+		let committed = self.nodes[leader as usize - 1]
+			.client_write(crate::consensus::WendelonRequest::TierSlab(b10_tier(
+				pointer,
+			)))
+			.await
+			.unwrap();
+		for node in &self.nodes {
+			node.wait(Some(Duration::from_secs(60)))
+				.applied_index_at_least(Some(committed.log_id.index), "every voter applied")
+				.await
+				.unwrap();
+		}
+		committed.log_id.index
+	}
+
+	/// Make `node` (1-based) the leader through a real election.
+	async fn elect(&self, node: u32) {
+		let target = &self.nodes[node as usize - 1];
+		tokio::time::timeout(Duration::from_secs(60), async {
+			loop {
+				if self
+					.nodes
+					.iter()
+					.all(|raft| raft.metrics().borrow().current_leader == Some(node))
+				{
+					break;
+				}
+				let _ = target.trigger().elect().await;
+				tokio::time::sleep(Duration::from_millis(200)).await;
+			}
+		})
+		.await
+		.expect("the node wins a real election");
+	}
+}
+
+/// Multinode: a follower funds its own apply. The leader commits the pointer;
+/// follower node 2, with its budget exhausted, fences it typed on the budget
+/// with the entry's provenance, and its own worker publishes it once a
+/// release makes room, with no sweeper and no manual wake. (No proposer token
+/// exists in this history: see the released-token control.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_followers_apply_funds_itself_fences_on_its_budget_and_publishes_on_release() {
+	use super::tier_budget::TierBudgetKind;
+	use super::tier_deferral::DeferralOutcome;
+	let (_dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let cluster = control_cluster(2, &mgr).await;
+	cluster.commit_tier(1, &old).await;
+	assert_eq!(mgr.tier_pointer(old.slab_id).await, Some(old.clone()));
+	let bytes = l2.get(&old.l2_uri).await.unwrap();
+	let replacement = TieredSlabPointer {
+		l2_uri: l2.put("tier/s7-follower.wnd", &bytes).await.unwrap(),
+		..old.clone()
+	};
+	*mgr.replay_probe.backoff.lock().unwrap() = Some(Duration::from_secs(3600));
+	let room = mgr.tier_budget.limit() - mgr.tier_budget.used();
+	let hog = mgr
+		.tier_budget
+		.try_reserve(TierBudgetKind::Scratch, room)
+		.unwrap();
+	let index = cluster.commit_tier(1, &replacement).await;
+	let deferral = mgr
+		.unapplied_tier_pointers
+		.get(&old.slab_id)
+		.map(|entry| entry.value().clone());
+	assert!(
+		deferral
+			.as_ref()
+			.is_some_and(|deferral| deferral.pointer == replacement
+				&& deferral.provenance == Some(index)
+				&& matches!(deferral.outcome, DeferralOutcome::Fenced(cause) if cause.waits_for_budget())),
+		"the follower fences typed on its own budget: {deferral:?}"
+	);
+	drop(hog);
+	assert!(
+		eventually(60, async || mgr.tier_pointer(old.slab_id).await.as_ref()
+			== Some(&replacement))
+		.await,
+		"the follower's worker publishes after the release: {}",
+		replay_diagnostics(&mgr, old.slab_id)
+	);
+}
+
+/// Multinode: a delayed apply after its proposer's token was released. The
+/// manager is on leader node 1 and reserves a real proposer token for P1;
+/// `RaftCommitter` submits it while node 1's observer is fenced on the index
+/// gate. The entry commits, `client_write` returns, and the committer's
+/// `applied()` releases the token: the registry holds nothing, and P1 is
+/// still unpublished. Only then is the gate released, and the delayed apply
+/// (the worker's replay of that callback) publishes P1 with its own funding.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delayed_apply_after_its_proposers_token_was_released_funds_itself() {
+	use crate::storage::TierCommitter;
+	let (_dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let cluster = control_cluster(1, &mgr).await;
+	cluster.commit_tier(1, &old).await;
+	let bytes = l2.get(&old.l2_uri).await.unwrap();
+	let p1 = TieredSlabPointer {
+		l2_uri: l2.put("tier/s7-released-token.wnd", &bytes).await.unwrap(),
+		..old.clone()
+	};
+	let proposal = mgr.reserve_tier_history(b10_tier(&p1)).await.unwrap();
+	let (slots, bytes_held) = mgr.tier_tokens.held();
+	assert_eq!(slots, 1, "premise: a real proposer token is reserved");
+	assert!(bytes_held > 0);
+	let gate = mgr.hold_index_write_gate_for_test().await;
+	crate::storage::RaftCommitter::new(cluster.nodes[0].clone())
+		.commit_tier_slab(proposal)
+		.await
+		.unwrap();
+	assert_eq!(
+		mgr.tier_tokens.held(),
+		(0, 0),
+		"the committed proposal's token is released"
+	);
+	assert!(
+		mgr.unapplied_tier_pointers
+			.get(&old.slab_id)
+			.is_some_and(|entry| entry.value().fences(&p1)),
+		"premise: the apply is still deferred"
+	);
+	assert_eq!(
+		mgr.tier_pointer(old.slab_id).await,
+		Some(old.clone()),
+		"premise: nothing published before the release"
+	);
+	drop(gate);
+	assert!(
+		eventually(60, async || mgr.tier_pointer(old.slab_id).await.as_ref()
+			== Some(&p1))
+		.await,
+		"the delayed apply publishes with its own funding: {}",
+		replay_diagnostics(&mgr, old.slab_id)
+	);
+	assert_eq!(mgr.tier_tokens.held(), (0, 0));
+}
+
+/// Multinode: across a leader change, an older replay never publishes over
+/// newer committed authority. Node 2 fences P1 on the index gate; its
+/// worker's replay is held just before re-running the callback (its
+/// canonical check passed for P1, its tier lock held). The leader moves to
+/// node 3, which commits P2: node 2's committed state names P2 (read without
+/// waiting), while node 2's own P2 callback waits behind the held replay.
+/// Released, the replay refuses at its canonical recheck, and P2's callback
+/// publishes: the layout generation advances exactly once, so P1 was never
+/// installed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn across_a_leader_change_an_older_replay_never_publishes_over_newer_authority() {
+	let (_dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let cluster = control_cluster(2, &mgr).await;
+	cluster.commit_tier(1, &old).await;
+	let bytes = l2.get(&old.l2_uri).await.unwrap();
+	let p1 = TieredSlabPointer {
+		l2_uri: l2.put("tier/s7-leader-p1.wnd", &bytes).await.unwrap(),
+		..old.clone()
+	};
+	let p2 = TieredSlabPointer {
+		l2_uri: l2.put("tier/s7-leader-p2.wnd", &bytes).await.unwrap(),
+		..old.clone()
+	};
+	let generation = || async {
+		mgr.state
+			.lock()
+			.await
+			.tier_layouts
+			.get(&old.slab_id)
+			.map_or(0, |layout| layout.generation)
+	};
+	let before = generation().await;
+	let entered = Arc::new(tokio::sync::Semaphore::new(0));
+	let release = Arc::new(tokio::sync::Semaphore::new(0));
+	*mgr.replay_probe.before_replay_apply.lock().unwrap() =
+		Some((entered.clone(), release.clone()));
+	let gate = mgr.hold_index_write_gate_for_test().await;
+	let p1_index = cluster.commit_tier(1, &p1).await;
+	assert!(
+		mgr.unapplied_tier_pointers
+			.get(&old.slab_id)
+			.is_some_and(
+				|entry| entry.value().fences(&p1) && entry.value().provenance == Some(p1_index)
+			),
+		"premise: node 2 fenced P1"
+	);
+	drop(gate);
+	tokio::time::timeout(Duration::from_secs(60), entered.acquire())
+		.await
+		.expect("node 2's replay of P1 passed its canonical check and holds")
+		.unwrap()
+		.forget();
+	cluster.elect(3).await;
+	let commit = {
+		let node = cluster.nodes[2].clone();
+		let p2 = p2.clone();
+		tokio::spawn(async move {
+			node.client_write(crate::consensus::WendelonRequest::TierSlab(b10_tier(&p2)))
+				.await
+				.map(|response| response.log_id.index)
+		})
+	};
+	assert!(
+		eventually(60, async || mgr
+			.try_canonical_tier_pointer(old.slab_id)
+			.is_some_and(|committed| committed.as_ref() == Some(&p2)))
+		.await,
+		"node 2's committed state names P2 while its replay of P1 holds"
+	);
+	assert_eq!(mgr.tier_pointer(old.slab_id).await, Some(old.clone()));
+	release.add_permits(1);
+	let p2_index = commit.await.unwrap().unwrap();
+	assert!(p2_index > p1_index);
+	assert!(
+		eventually(60, async || mgr.tier_pointer(old.slab_id).await.as_ref()
+			== Some(&p2))
+		.await,
+		"node 2 publishes the newer pointer: {}",
+		replay_diagnostics(&mgr, old.slab_id)
+	);
+	assert_eq!(
+		generation().await,
+		before + 1,
+		"one publication: the older replay never installed P1"
+	);
+	assert!(mgr.unapplied_tier_pointers.get(&old.slab_id).is_none());
+}
+
+/// One control voter over a persistent log in `dir`, applying through
+/// `manager`'s tier observer; `initialize` only on first start.
+async fn single_voter(
+	dir: &std::path::Path,
+	manager: &Arc<SlabManager>,
+	initialize: bool,
+) -> (
+	crate::consensus::WendelonRaft,
+	crate::consensus::WendelonLogStore,
+	b1t_network::Network,
+) {
+	use crate::consensus::{WendelonLogStore, WendelonRaft};
+	let network = b1t_network::Network::default();
+	let config = Arc::new(
+		crate::consensus::retention::ControlRetention::default()
+			.openraft_config("wendelon")
+			.validate()
+			.unwrap(),
+	);
+	let log = WendelonLogStore::open_for_retention_test(dir, 64 * 4096, None)
+		.await
+		.unwrap();
+	let sm = log
+		.recovered_state_machine()
+		.await
+		.unwrap()
+		.with_tier_observer(Arc::new(crate::storage::ManagerTierObserver::new(
+			manager.clone(),
+		)));
+	let raft = WendelonRaft::new(1, config, network.clone(), log.clone(), sm)
+		.await
+		.unwrap();
+	network.0.lock().unwrap().insert(1, raft.clone());
+	if initialize {
+		raft.initialize(BTreeMap::from([(
+			1,
+			openraft::BasicNode {
+				addr: "127.0.0.1:0".into(),
+			},
+		)]))
+		.await
+		.unwrap();
+	}
+	raft.wait(Some(Duration::from_secs(60)))
+		.current_leader(1, "the single voter leads")
+		.await
+		.unwrap();
+	(raft, log, network)
+}
+
+/// Multinode: restart while fenced, through the node's own startup order. A
+/// node fences committed P1 on the index gate. With the gate still held, its
+/// authority worker is closed and joined (no replay can run) and its voter
+/// shut down; the volatile deferral is lost with the manager. On restart the
+/// control follows `node.rs` bootstrap exactly: reopen the manager, recover
+/// the state machine from the log (premises asserted: committed P1, local
+/// P0, no deferral), seed the installed snapshot index, fence local tiers
+/// absent from committed state and stage every recovered committed tier, all
+/// before the voter starts. From then on readiness is never open while the
+/// node still names P0, and verification alone (no sweeper pass) converges it
+/// to P1: published, nothing deferred, readiness open, the row served.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_node_restarted_while_fenced_converges_to_its_committed_pointer() {
+	use crate::consensus::{WendelonLogStore, WendelonRaft};
+	use crate::storage::ownership::StorageWorker;
+	let l1_dir = fresh_dir("s7-restart-fenced-l1");
+	let l2_dir = fresh_dir("s7-restart-fenced-l2");
+	let wal_dir = fresh_dir("s7-restart-fenced-wal");
+	let io = spawn_io_thread(64).unwrap();
+	let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_dir).unwrap());
+	let crypto = test_crypto();
+	let mgr = SlabManager::initialize_new_store(reopen_test_config(
+		&l1_dir,
+		io.clone(),
+		l2.clone(),
+		crypto.clone(),
+	))
+	.await
+	.unwrap();
+	let key = id(0x5e930);
+	mgr.append_durable(tenant(), key, hlc(930), b"restart-row")
+		.await
+		.unwrap();
+	let old = tier_kv_slab(&mgr, &l2, "s7-restart-fenced/p0").await;
+	let bytes = l2.get(&old.l2_uri).await.unwrap();
+	let p1 = TieredSlabPointer {
+		l2_uri: l2.put("s7-restart-fenced/p1", &bytes).await.unwrap(),
+		..old.clone()
+	};
+	let (raft, log, _network) = single_voter(&wal_dir, &mgr, true).await;
+	raft.client_write(crate::consensus::WendelonRequest::TierSlab(b10_tier(&old)))
+		.await
+		.unwrap();
+	assert_eq!(mgr.tier_pointer(old.slab_id).await, Some(old.clone()));
+	let gate = mgr.hold_index_write_gate_for_test().await;
+	raft.client_write(crate::consensus::WendelonRequest::TierSlab(b10_tier(&p1)))
+		.await
+		.unwrap();
+	assert!(
+		mgr.unapplied_tier_pointers
+			.get(&old.slab_id)
+			.is_some_and(|entry| entry.value().fences(&p1)),
+		"premise: the node fenced P1"
+	);
+	assert_eq!(
+		mgr.tier_pointer(old.slab_id).await,
+		Some(old.clone()),
+		"premise before the stop: local P0"
+	);
+	// Stop with the dependency still fenced: no replay can publish P1.
+	mgr.tier_authority.close_and_join().await.unwrap();
+	raft.shutdown().await.unwrap();
+	drop(gate);
+	drop((raft, log));
+	drop(mgr);
+
+	// Restart, in node.rs bootstrap order.
+	let reopened = SlabManager::open(reopen_test_config(&l1_dir, io, l2, crypto))
+		.await
+		.unwrap();
+	let log = WendelonLogStore::open_for_retention_test(&wal_dir, 64 * 4096, None)
+		.await
+		.unwrap();
+	let state_machine = log.recovered_state_machine().await.unwrap();
+	let recovered = state_machine.state_snapshot().await;
+	let recovered_index = recovered.last_applied_log_id.map(|id| id.index);
+	let committed_x = recovered
+		.tiered_slabs
+		.get(&old.slab_id)
+		.map(tiered_slab_pointer_for_test);
+	assert_eq!(
+		committed_x,
+		Some(p1.clone()),
+		"premise: committed state names P1"
+	);
+	assert_eq!(
+		reopened.tier_pointer(old.slab_id).await,
+		Some(old.clone()),
+		"premise after the reopen: local P0"
+	);
+	assert!(
+		reopened.unapplied_tier_pointers.get(&old.slab_id).is_none(),
+		"premise after the reopen: no volatile deferral survived"
+	);
+	if let Some(index) = recovered_index {
+		reopened.seed_installed_snapshot_index(index);
+	}
+	let committed_ids = recovered.tiered_slabs.keys().copied().collect();
+	reopened
+		.fence_local_tiers_absent_from_committed(&committed_ids, recovered_index)
+		.await
+		.unwrap();
+	let mut tiers = recovered.tiered_slabs.values().cloned().collect::<Vec<_>>();
+	tiers.sort_by_key(|tier| tier.slab_id);
+	let floor = tiers.last().map_or(SlabId::ZERO, |tier| tier.slab_id);
+	for tier in &tiers {
+		reopened
+			.stage_bootstrap_tier_authority(
+				tiered_slab_pointer_for_test(tier),
+				recovered_index,
+				floor,
+			)
+			.await
+			.unwrap();
+	}
+	let network = b1t_network::Network::default();
+	let config = Arc::new(
+		crate::consensus::retention::ControlRetention::default()
+			.openraft_config("wendelon")
+			.validate()
+			.unwrap(),
+	);
+	let state_machine = state_machine.with_tier_observer(Arc::new(
+		crate::storage::ManagerTierObserver::new(reopened.clone()),
+	));
+	let raft = WendelonRaft::new(1, config, network.clone(), log.clone(), state_machine)
+		.await
+		.unwrap();
+	network.0.lock().unwrap().insert(1, raft.clone());
+
+	// Never ready while still naming P0; verification alone converges.
+	let converged = eventually(60, async || {
+		let ready = reopened.tier_authority_readiness_reason().is_none();
+		let pointer = reopened.tier_pointer(old.slab_id).await;
+		assert!(
+			!ready || pointer.as_ref() == Some(&p1),
+			"readiness open while the node names {pointer:?}"
+		);
+		ready && pointer.as_ref() == Some(&p1)
+	})
+	.await;
+	assert!(converged, "verification converges the restarted node to P1");
+	assert!(reopened.unapplied_tier_pointers.get(&old.slab_id).is_none());
+	let location = reopened.lookup(tenant(), key).unwrap().unwrap();
+	assert_eq!(reopened.read(location).await.unwrap(), b"restart-row");
+	raft.shutdown().await.unwrap();
+}
+
+fn tiered_slab_pointer_for_test(tier: &crate::consensus::TieredSlab) -> TieredSlabPointer {
+	super::tier_tokens::tiered_slab_pointer(tier)
 }

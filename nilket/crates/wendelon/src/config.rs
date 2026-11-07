@@ -199,6 +199,8 @@ struct RawStorageConfig {
 	data_dir: PathBuf,
 	#[serde(default = "default_slab_max_bytes")]
 	slab_max_bytes: u64,
+	#[serde(default = "default_tier_history_budget_bytes")]
+	tier_history_budget_bytes: u64,
 	#[serde(default)]
 	lsm_compaction_paused: bool,
 	#[serde(default)]
@@ -845,6 +847,12 @@ impl RawConfig {
 				),
 			));
 		}
+		if self.storage.tier_history_budget_bytes == 0 {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				"storage.tier_history_budget_bytes must be greater than zero",
+			));
+		}
 		if self.tuning.replication_factor == 0 {
 			return Err(Error::new(
 				ErrorKind::InvalidInput,
@@ -1005,6 +1013,7 @@ impl RawConfig {
 			data_dir,
 			slab_max_bytes,
 			group_commit: crate::storage::GroupCommitConfig::default(),
+			tier_history_budget_bytes: self.storage.tier_history_budget_bytes,
 			rf: self.tuning.replication_factor,
 			wal_io_depth,
 			slab_io_depth,
@@ -1228,6 +1237,10 @@ fn hex_string(bytes: [u8; 32]) -> String {
 		write!(&mut out, "{byte:02x}").expect("writing to string cannot fail");
 	}
 	out
+}
+
+const fn default_tier_history_budget_bytes() -> u64 {
+	crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES
 }
 
 const fn default_slab_max_bytes() -> u64 {

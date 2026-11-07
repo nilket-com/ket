@@ -1830,6 +1830,7 @@ async fn make_manager() -> (crate::test_support::TestDir, Arc<SlabManager>) {
 	(
 		scratch,
 		SlabManager::initialize_new_store(SlabManagerConfig {
+			tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 			dir,
 			max_slab_bytes: 1 << 30,
 			io,
@@ -1862,6 +1863,7 @@ async fn make_manager_with_l2(
 	(
 		scratch,
 		SlabManager::initialize_new_store(SlabManagerConfig {
+			tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 			dir,
 			max_slab_bytes: 1 << 30,
 			io,
@@ -1894,6 +1896,7 @@ async fn make_manager_with_l2_projected_fetch(
 	(
 		scratch,
 		SlabManager::initialize_new_store(SlabManagerConfig {
+			tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 			dir,
 			max_slab_bytes: 1 << 30,
 			io,
@@ -1930,6 +1933,7 @@ async fn make_manager_with_l2_encoded_compute(
 	(
 		scratch,
 		SlabManager::initialize_new_store(SlabManagerConfig {
+			tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 			dir,
 			max_slab_bytes: 1 << 30,
 			io,
@@ -11686,6 +11690,7 @@ impl CrashyReplicaService {
 		let max_slab_bytes = 1 << 30;
 		let manager = SlabManager::initialize_new_store_with_owner(
 			SlabManagerConfig {
+				tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 				dir: dir.clone(),
 				max_slab_bytes,
 				io: io.clone(),
@@ -11774,6 +11779,7 @@ impl CrashyReplicaService {
 		state.manager = Some(
 			SlabManager::open_with_owner(
 				SlabManagerConfig {
+					tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 					dir: self.dir.clone(),
 					max_slab_bytes: self.max_slab_bytes,
 					io,

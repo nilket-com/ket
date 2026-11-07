@@ -1943,7 +1943,9 @@ impl SlabManager {
 					};
 					self.prepare_tier_candidate_proposal(slab_id, &new_uri)
 						.await?;
-					if let Err(error) = committer.commit_tier_slab(tier).await {
+					if let Err(error) =
+						crate::storage::sweeper::propose_tier_slab(self, committer, tier).await
+					{
 						if crate::storage::sweeper::tier_proposal_not_submitted(&error) {
 							self.record_tier_candidate_not_submitted(
 								slab_id,
@@ -2503,7 +2505,9 @@ impl SlabManager {
 					// unresolved intent keeps both objects, even across restart.
 					self.prepare_tier_candidate_proposal(slab_id, &new_uri)
 						.await?;
-					if let Err(error) = committer.commit_tier_slab(tier).await {
+					if let Err(error) =
+						crate::storage::sweeper::propose_tier_slab(self, committer, tier).await
+					{
 						if crate::storage::sweeper::tier_proposal_not_submitted(&error) {
 							self.record_tier_candidate_not_submitted(
 								slab_id,
@@ -2605,7 +2609,7 @@ impl SlabManager {
 			.await?,
 		);
 		state.active = next;
-		state.sealed.insert(sealed_id, sealed);
+		state.install_sealed(&self.tier_budget, sealed_id, sealed);
 		state.advance_slab_allocator(next_id.saturating_add(1));
 		self.record_l0_compaction_run(sealed_id, sealed_size);
 		Ok(Some(sealed_id))

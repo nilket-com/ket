@@ -12,8 +12,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex as AsyncMutex;
 use wendelon::consensus::{
-	RetireTieredSlab, TierObserver, TieredSlab, WendelonRequest, WendelonStateMachine,
-	WendelonTypeConfig,
+	RetireTieredSlab, TierObserver, WendelonRequest, WendelonStateMachine, WendelonTypeConfig,
 };
 use wendelon::crypto::{CryptoManager, test_support};
 use wendelon::schema::{HybridTimestamp, Identity, TenantId};
@@ -81,7 +80,11 @@ impl AppliedStateMachineCommitter {
 
 #[async_trait]
 impl TierCommitter for AppliedStateMachineCommitter {
-	async fn commit_tier_slab(&self, tier: TieredSlab) -> std::io::Result<()> {
+	async fn commit_tier_slab(
+		&self,
+		proposal: wendelon::storage::TierProposal,
+	) -> std::io::Result<()> {
+		let tier = proposal.tier().clone();
 		let index = self.next_index.fetch_add(1, Ordering::Relaxed);
 		let entry = Entry::<WendelonTypeConfig> {
 			log_id: LogId::new(CommittedLeaderId::new(1, 0), index),
@@ -529,6 +532,7 @@ async fn build_manager_with_sealed_slabs(
 	let io = spawn_io_thread(64).unwrap();
 	let manager = SlabManager::initialize_new_store_with_owner(
 		SlabManagerConfig {
+			tier_history_budget_bytes: wendelon::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 			dir: dir.to_path_buf(),
 			max_slab_bytes: 1,
 			io,

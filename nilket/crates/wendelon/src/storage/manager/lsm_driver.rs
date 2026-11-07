@@ -1899,7 +1899,7 @@ impl SlabManager {
 		for relocation in &relocations {
 			by_key
 				.entry((relocation.tenant_id, relocation.key_identity))
-				.or_insert_with(|| KeyRelocation::new(relocation.routing_locality, false))
+				.or_insert_with(|| KeyRelocation::new(relocation.routing_locality, None))
 				.pairs
 				.push(RelocationPair {
 					old: relocation.old,
@@ -1911,7 +1911,7 @@ impl SlabManager {
 			if !paired_sources.contains(&row.location) {
 				by_key
 					.entry((row.tenant_id, row.key_identity))
-					.or_insert_with(|| KeyRelocation::new(row.routing_locality, false))
+					.or_insert_with(|| KeyRelocation::new(row.routing_locality, None))
 					.removals
 					.push(row.location);
 			}
@@ -1920,14 +1920,18 @@ impl SlabManager {
 		{
 			let state = self.state.lock().await;
 			for (run, slab) in installed {
-				state.sealed.insert(run.slab_id, slab);
+				state.install_sealed(&self.tier_budget, run.slab_id, slab);
 			}
 			let mut relocated_any = false;
 			for ((tenant_id, key_identity), relocation) in &by_key {
-				for (_, new) in
-					self.relocate_indexed_locations(*tenant_id, *key_identity, relocation)
-				{
-					refused_outputs.insert(new);
+				let mut scratch = RelocationScratch::for_relocation(relocation);
+				for (_, new) in self.relocate_indexed_locations(
+					*tenant_id,
+					*key_identity,
+					relocation,
+					&mut scratch,
+				) {
+					refused_outputs.insert(*new);
 				}
 				if !relocated_any {
 					relocated_any = true;
@@ -3019,12 +3023,12 @@ impl SlabManager {
 				// cleans up newly installed output files, but does not retry this
 				// unlink; retaining the slab keeps it visible to this process's
 				// recovery state and leaves the old one-file leak explicit.
-				state.sealed.insert(sealed_id, sealed_slab);
+				state.install_sealed(&self.tier_budget, sealed_id, sealed_slab);
 				state.advance_slab_allocator(next_id.saturating_add(1));
 				return Err(error);
 			}
 		} else {
-			state.sealed.insert(sealed_id, sealed_slab);
+			state.install_sealed(&self.tier_budget, sealed_id, sealed_slab);
 			self.record_l0_compaction_run(sealed_id, sealed_size);
 		}
 		state.advance_slab_allocator(next_id.saturating_add(1));
@@ -4089,6 +4093,8 @@ impl SlabManager {
 			}
 			let publication = self.begin_index_publication(vec![slab_id]).await?;
 			self.gc_unlink_owned_slab_file(slab_id).await?;
+			self.redirects.remove_touching(&self.tier_budget, slab_id);
+			self.record_disposal_evidence(slab_id).await;
 			index
 				.apply_with_publication_guard(
 					PersistentIndexUpdate {
@@ -4358,6 +4364,8 @@ impl SlabManager {
 				));
 			}
 			self.gc_unlink_owned_slab_file(slab_id).await?;
+			self.redirects.remove_touching(&self.tier_budget, slab_id);
+			self.record_disposal_evidence(slab_id).await;
 			let publication = self.begin_index_publication(vec![slab_id]).await?;
 			index
 				.apply_with_publication_guard(

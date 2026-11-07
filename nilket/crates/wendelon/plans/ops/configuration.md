@@ -66,6 +66,12 @@ audit_root_signing_secret = "<64 hex chars>"
   validation fails.
 - `slab_max_bytes`, `rf`, `wal_io_depth`, and `slab_io_depth` default to
   `67108864`, `1`, `64`, and `64` respectively when omitted.
+- `tier_history_budget_bytes` is the ADR 0692 §7 node budget for tier
+  history, publication scratch, proposer tokens and relocation redirects. It
+  defaults to `268435456` (256 MiB) and must be greater than zero. A
+  publication that cannot reserve its history within the budget is fenced and
+  retried rather than allowed to grow past it. A budget too small to hold the
+  manager's fixed proposer-token registry makes the node refuse to start.
 - `lsm_compaction_paused` is a node-local ADR 055 maintenance switch. It
   defaults to `false`; when set, the LSM compaction task starts but does not
   launch new jobs until resumed through the node's service control handle.

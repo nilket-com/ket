@@ -9701,8 +9701,12 @@ fn adr078_manager_source_concatenates_submodules() {
 		basenames,
 		vec![
 			"manager.rs",
+			// ADR 0696: every backing and tier-generation install into the state.
+			"backing_install.rs",
 			"compaction.rs",
 			"counter_visibility.rs",
+			// ADR 0696 (0692 §7): disposal evidence for typed Superseded after disposal.
+			"disposal_evidence.rs",
 			"encoding_compute.rs",
 			"index_publication.rs",
 			"lsm_driver.rs",
@@ -9716,6 +9720,8 @@ fn adr078_manager_source_concatenates_submodules() {
 			// out of the bounded root.
 			"pause_hooks.rs",
 			"publication_accounting.rs",
+			// ADR 0696 (0692 §7): charged cross-slab redirects of maintenance rewrites.
+			"redirect_store.rs",
 			// ADR 0692: per-key relocation and atomic empty-key removal.
 			"relocation.rs",
 			"retention_reclaim.rs",
@@ -9727,9 +9733,17 @@ fn adr078_manager_source_concatenates_submodules() {
 			"stats_facts.rs",
 			// ADR 0692: tier generations, the read snapshot and the typed refusal.
 			"tier_authority.rs",
+			// ADR 0696 (0692 §7): the node budget for tier history and redirects.
+			"tier_budget.rs",
+			// ADR 0696 (0692 §7): typed tier deferrals and their replay.
+			"tier_deferral.rs",
 			"tier_generation.rs",
+			// ADR 0696 (0692 §8): the test-support measurement instrument.
+			"tier_measure.rs",
 			// ADR 0692: tier publication plans pair rows by logical owner.
 			"tier_plan.rs",
+			// ADR 0696 (0692 §7): proposer history tokens.
+			"tier_tokens.rs",
 			"tiered_io.rs",
 			// ADR 0692: class-scoped version identity and tier verification.
 			"version_identity.rs",
@@ -10719,7 +10733,7 @@ fn relocating_writers_replace_versions_per_key_and_never_remove_then_insert() {
 		),
 		(
 			"src/storage/manager/tiered_io.rs",
-			"apply_tiered_row_refresh_plan_locked",
+			"apply_prepared_tiered_row_refresh",
 		),
 	] {
 		let source = fs::read_to_string(manifest_dir.join(file)).unwrap();
@@ -10919,8 +10933,14 @@ fn tier_recovery_snapshots_have_only_the_reviewed_private_callers() {
 			vec![
 				("manager.rs", 2),
 				("manager/lsm_driver.rs", 1),
-				("manager/tiered_io.rs", 4),
+				("manager/tiered_io.rs", 2),
 			],
+		),
+		(
+			// ADR 0696 (0692 §7): the bounded snapshot behind every tier
+			// publication plan; its callers are the plan builders.
+			"record_rows_for_slab_for_recovery_within",
+			vec![("manager/tiered_io.rs", 4)],
 		),
 		(
 			"published_table_object_id_for_recovery",
@@ -11639,5 +11659,136 @@ fn lsm_stage_refusal_is_definite_only_before_rename() {
 		let clear = body.find(".clear_refused_lsm_intent(").unwrap();
 		assert!(body[..clear].contains("LsmStageFailure::BeforeRename("));
 		assert!(body.contains("LsmStageFailure::Uncertain(failure)) => return Err(failure)"));
+	}
+}
+
+/// ADR 0692 §7 (ADR 0696 fast follow): every proposer of a tier pointer
+/// change holds a history token. Production code reaches
+/// `TierCommitter::commit_tier_slab` only through `propose_tier_slab`, which
+/// reserves the token first; the committer's argument is the
+/// `TierProposal` that binds the pointer to it, so no other path can
+/// propose a pointer without one.
+#[test]
+fn every_tier_proposer_holds_a_history_token() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let production = |path: &str| -> String {
+		let source = fs::read_to_string(manifest_dir.join(path)).unwrap();
+		match source.split_once("#[cfg(test)]\nmod tests {") {
+			Some((production, _)) => production.to_owned(),
+			None => source,
+		}
+	};
+	let sweeper = production("src/storage/sweeper.rs");
+	let reclaim = production("src/storage/manager/retention_reclaim.rs");
+	let helper = sweeper
+		.split_once("pub(crate) async fn propose_tier_slab(")
+		.and_then(|(_, tail)| tail.split_once("\n}\n"))
+		.map(|(body, _)| body.to_owned())
+		.expect("propose_tier_slab exists");
+	assert!(
+		helper.contains("reserve_tier_history(tier)")
+			&& helper.contains("committer.commit_tier_slab(proposal)"),
+		"the helper reserves the token, then proposes with it"
+	);
+	assert!(
+		sweeper.contains(
+			"async fn commit_tier_slab(&self, proposal: TierProposal) -> std::io::Result<()>;"
+		),
+		"the committer receives the bound proposal, never a bare entry"
+	);
+	for (name, source) in [("sweeper.rs", &sweeper), ("retention_reclaim.rs", &reclaim)] {
+		let direct = source
+			.match_indices(".commit_tier_slab(")
+			.filter(|(at, _)| !source[..*at].ends_with("committer"))
+			.count();
+		assert_eq!(
+			direct, 0,
+			"{name}: production proposals go through propose_tier_slab"
+		);
+	}
+	assert!(sweeper.matches("propose_tier_slab(&self.slab,").count() >= 6);
+	assert_eq!(
+		reclaim
+			.matches("propose_tier_slab(self, committer, tier)")
+			.count(),
+		2
+	);
+	let manager = manager_source(manifest_dir);
+	assert_eq!(
+		manager.matches("fn reserve_tier_history(").count(),
+		1,
+		"one constructor of a reserved proposal"
+	);
+	assert!(
+		!manager.contains("TierProposal {\n\t\t\ttier,\n\t\t\ttoken: None"),
+		"production never builds an unreserved proposal"
+	);
+}
+
+/// ADR 0696 (0692 §7, plan r3 D): every backing installed into the manager
+/// state goes through `ManagerState::install_{sealed,tiered,rehydrated}`,
+/// which forget the slab's disposal evidence first, so evidence never
+/// outlives a backing installed for that slab again.
+#[test]
+fn every_backing_install_forgets_disposal_evidence() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	for map in ["sealed", "tiered", "rehydrated"] {
+		let needle = format!(".{map}.insert(");
+		let found = manager_occurrences(manifest_dir, |source| source.matches(&needle).count());
+		assert_eq!(
+			found,
+			vec![("backing_install.rs".to_string(), 1)],
+			"`{needle}` only inside ManagerState::install_{map}"
+		);
+		let source =
+			fs::read_to_string(manifest_dir.join("src/storage/manager/backing_install.rs"))
+				.unwrap();
+		let helper = format!("fn install_{map}(");
+		let start = source.find(&helper).expect("the install helper exists");
+		let body = &source[start..start + source[start..].find("\n\t}").unwrap()];
+		let forget = body
+			.find("disposal_evidence.forget(")
+			.expect("it forgets evidence");
+		assert!(
+			forget < body.find(&needle).unwrap(),
+			"install_{map} forgets the evidence before it installs"
+		);
+	}
+}
+
+/// ADR 0696 (0692 §8, plan r3 F): the lineage census counts one sample per
+/// slab's published generation, so every write of `tier_layouts` goes
+/// through `ManagerState::{install_tier_layout, remove_tier_layout}`, the
+/// only places that update it.
+#[test]
+fn every_published_layout_transition_updates_the_lineage_census() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	for (write, helper) in [
+		(".tier_layouts.insert(", "fn install_tier_layout("),
+		(".tier_layouts.remove(", "fn remove_tier_layout("),
+	] {
+		let found = manager_occurrences(manifest_dir, |source| source.matches(write).count());
+		assert_eq!(
+			found,
+			vec![("backing_install.rs".to_string(), 1)],
+			"`{write}` only inside ManagerState::{helper}"
+		);
+		let source =
+			fs::read_to_string(manifest_dir.join("src/storage/manager/backing_install.rs"))
+				.unwrap();
+		let start = source.find(helper).expect("the helper exists");
+		let body = &source[start..start + source[start..].find("\n\t}").unwrap()];
+		assert!(body.contains(write), "{helper} performs the write");
+		assert!(
+			body.contains("census().replace("),
+			"{helper} updates the census"
+		);
+	}
+	for forbidden in [".tier_layouts.clear(", ".tier_layouts.retain("] {
+		assert!(
+			manager_occurrences(manifest_dir, |source| source.matches(forbidden).count())
+				.is_empty(),
+			"no `{forbidden}` bypasses the census"
+		);
 	}
 }
