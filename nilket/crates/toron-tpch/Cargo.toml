@@ -17,12 +17,21 @@ path = "src/main.rs"
 name = "toron-bench"
 path = "src/bin/toron-bench.rs"
 
+# The §8 measurement harness (scripts/s7-measure). Built only with its feature, identically onto
+# the base archive and the fix tree; `--cfg s7_fix` selects the fix-only instrument APIs.
+[[bin]]
+name = "s7-measure"
+path = "src/bin/s7_measure/main.rs"
+required-features = ["s7-measure"]
+
 [features]
 polars-sql-reference = ["dep:polars", "dep:polars-sql"]
+s7-measure = ["wendelon/test-support", "dep:wendelon-client"]
 
 [dependencies]
 toron = { path = "../toron" }
 wendelon = { path = "../wendelon" }
+wendelon-client = { path = "../wendelon/crates/wendelon-client", optional = true }
 arrow.workspace = true
 tokio.workspace = true
 async-trait = "0.1"
@@ -36,3 +45,6 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
 tpchgen = "2.0.2"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(s7_fix)"] }

@@ -5666,6 +5666,7 @@ dependencies = [
  "toron",
  "tpchgen",
  "wendelon",
+ "wendelon-client",
 ]
 
 [[package]]
