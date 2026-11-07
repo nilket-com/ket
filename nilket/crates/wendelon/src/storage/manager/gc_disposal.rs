@@ -515,10 +515,20 @@ impl SlabManager {
 		self.redirects.remove_touching(&self.tier_budget, slab_id);
 		self.record_disposal_evidence(slab_id).await;
 		let publication = self.begin_index_publication(vec![slab_id]).await?;
+		// Removing the run advances the manifest epoch, and no row will carry that: the floor
+		// does, in the transaction that drops the run, so memory never shows an epoch a reopen
+		// would not recover. A resume after it finds `RunDropped` and never comes here again; one
+		// before it finds the run and the progress as they were. The maintenance gate this
+		// workflow holds excludes every other writer of the epoch but an observed commit.
+		let transition = self.lsm_manifest_transition_gate.write().await;
+		let pre = self.compaction_manifest_snapshot().manifest_epoch;
 		index
 			.apply_with_publication_guard(
 				PersistentIndexUpdate {
 					delete_lsm_run_ids: vec![slab_id],
+					raise_lsm_manifest_epoch_floor: Some(
+						CompactionManifest::epoch_after_transition(pre),
+					),
 					op_progress: Some(OpProgressUpdate {
 						key,
 						digest,
@@ -530,16 +540,18 @@ impl SlabManager {
 				Some(publication.gate.clone()),
 			)
 			.await?;
+		#[cfg(test)]
+		self.pause_gc_after_run_dropped_for_test().await;
 		// Memory follows durability: a commit that fails or is uncertain leaves
 		// the run in the manifest, and the intent still fencing its scope.
-		let snapshot = self.compaction_manifest_snapshot();
 		self.apply_lsm_manifest_compaction_commit(&CompactionCommit::gc_remove(
 			remove.slab.owner(),
 			remove.job_id,
-			snapshot.manifest_epoch,
+			pre,
 			vec![slab_id],
 		))
 		.map_err(|error| Error::other(error.to_string()))?;
+		drop(transition);
 		publication.complete();
 		Ok(())
 	}

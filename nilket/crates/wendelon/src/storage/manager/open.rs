@@ -1079,6 +1079,7 @@ impl SlabManager {
 			secondary_index_segments,
 			secondary_index_coverage,
 			secondary_index_admission_gate: Arc::new(AsyncRwLock::new(())),
+			lsm_manifest_transition_gate: AsyncRwLock::new(()),
 			maintenance_publication_gate: Arc::new(AsyncRwLock::new(())),
 			maintenance_publication_restart_required: AtomicBool::new(false),
 			maintenance_publication_fail_stop: std::sync::Mutex::new(None),

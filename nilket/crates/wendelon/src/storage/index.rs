@@ -320,18 +320,27 @@ fn remove_lsm_run_row(
 		.transpose()?;
 	drop(table);
 	if let Some(run) = &removed {
-		let mut meta = tx.open_table(META_TABLE).map_err(redb_to_io)?;
-		let floor = meta
-			.get(META_LSM_MANIFEST_EPOCH_FLOOR)
-			.map_err(redb_to_io)?
-			.map(|value| value.value())
-			.unwrap_or(0);
-		if run.manifest_epoch.get() > floor {
-			meta.insert(META_LSM_MANIFEST_EPOCH_FLOOR, &run.manifest_epoch.get())
-				.map_err(redb_to_io)?;
-		}
+		raise_lsm_manifest_epoch_floor(tx, run.manifest_epoch)?;
 	}
 	Ok(removed)
+}
+
+/// A reopen recovers the manifest epoch from its run rows and this floor, which only rises.
+fn raise_lsm_manifest_epoch_floor(
+	tx: &redb::WriteTransaction,
+	epoch: crate::schema::ManifestEpoch,
+) -> std::io::Result<()> {
+	let mut meta = tx.open_table(META_TABLE).map_err(redb_to_io)?;
+	let floor = meta
+		.get(META_LSM_MANIFEST_EPOCH_FLOOR)
+		.map_err(redb_to_io)?
+		.map(|value| value.value())
+		.unwrap_or(0);
+	if epoch.get() > floor {
+		meta.insert(META_LSM_MANIFEST_EPOCH_FLOOR, &epoch.get())
+			.map_err(redb_to_io)?;
+	}
+	Ok(())
 }
 
 /// Whether an unresolved install names this slab. Its commit still has to apply to that run, so
@@ -784,6 +793,8 @@ pub(crate) struct PersistentIndexUpdate {
 	pub delete_secondary_index_segments: Vec<PersistentSecondaryIndexSegmentKey>,
 	pub put_lsm_runs: Vec<LsmRunSummary>,
 	pub delete_lsm_run_ids: Vec<SlabId>,
+	/// A manifest epoch no run row carries, which a reopen must still recover.
+	pub raise_lsm_manifest_epoch_floor: Option<crate::schema::ManifestEpoch>,
 	/// One step of an operation's local progress, durable with this update.
 	pub op_progress: Option<op_state::OpProgressUpdate>,
 	/// The linked LSM intent whose local work this update finishes.
@@ -2139,6 +2150,9 @@ impl PersistentLocalIndex {
 					op_state::promote_reservations(&write_txn, &update.promote_reservations)?;
 					for slab_id in update.delete_lsm_run_ids {
 						remove_lsm_run_row(&write_txn, slab_id)?;
+					}
+					if let Some(epoch) = update.raise_lsm_manifest_epoch_floor {
+						raise_lsm_manifest_epoch_floor(&write_txn, epoch)?;
 					}
 					let mut table = write_txn.open_table(LSM_RUNS_TABLE).map_err(redb_to_io)?;
 					for run in update.put_lsm_runs {

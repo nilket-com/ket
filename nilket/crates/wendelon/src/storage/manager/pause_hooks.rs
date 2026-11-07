@@ -92,6 +92,90 @@ impl SlabManager {
 			.store(0, Ordering::Release);
 	}
 
+	/// Record one published control install. Its durable result, a whole-index read made while
+	/// its slab locks and the maintenance gate still hold, only for a test that asked: no later
+	/// compaction or GC of these slabs can be in it.
+	pub(super) async fn note_lsm_publication_for_test(&self, commit: &CompactionCommit) {
+		let wanted = self
+			.continuity_test_holds
+			.lsm_publication_evidence
+			.load(Ordering::Acquire);
+		let durable = match self.persistent_index.as_ref() {
+			Some(index) if wanted => index.load_snapshot().await.ok(),
+			_ => None,
+		};
+		let durable = durable.map(|durable| {
+			let touched = commit
+				.slabs_to_retire
+				.iter()
+				.copied()
+				.chain(commit.slabs_to_add.iter().map(|run| run.slab_id))
+				.collect::<Vec<_>>();
+			LsmPublicationEvidenceForTest {
+				runs: durable
+					.lsm_runs
+					.iter()
+					.filter(|run| touched.contains(&run.slab_id))
+					.cloned()
+					.collect(),
+				intent_outstanding: durable
+					.lsm_install_intents
+					.iter()
+					.any(|intent| intent.commit.job_id == commit.job_id),
+				rows_per_slab: touched
+					.iter()
+					.map(|slab_id| {
+						let rows = durable
+							.record_rows
+							.iter()
+							.filter(|row| row.location.slab_id == *slab_id)
+							.count();
+						(*slab_id, rows)
+					})
+					.collect(),
+			}
+		});
+		self.continuity_test_holds
+			.lsm_publications
+			.lock()
+			.unwrap()
+			.push(LsmPublicationForTest {
+				commit: commit.clone(),
+				durable,
+			});
+	}
+
+	/// From now on, each published control install also records its durable result.
+	pub(crate) fn record_lsm_publication_evidence_for_test(&self) {
+		self.continuity_test_holds
+			.lsm_publication_evidence
+			.store(true, Ordering::Release);
+	}
+
+	/// Every control install this manager published, in order.
+	pub(crate) fn lsm_publications_for_test(&self) -> Vec<LsmPublicationForTest> {
+		self.continuity_test_holds
+			.lsm_publications
+			.lock()
+			.unwrap()
+			.clone()
+	}
+
+	pub(crate) async fn durable_index_snapshot_for_test(
+		&self,
+	) -> crate::storage::index::PersistentIndexSnapshot {
+		self.persistent_index
+			.as_ref()
+			.unwrap()
+			.load_snapshot()
+			.await
+			.unwrap()
+	}
+
+	pub(crate) fn slab_file_exists_for_test(&self, slab_id: SlabId) -> bool {
+		slab_path(&self.config.dir, slab_id).exists()
+	}
+
 	/// The next version check raises this fence, once: after its append's head admitted it.
 	pub(crate) fn fence_at_next_version_check_for_test(&self, slab_id: SlabId) {
 		*self
@@ -525,6 +609,21 @@ impl SlabManager {
 	}
 }
 
+/// One published control install.
+#[derive(Clone, Debug)]
+pub(crate) struct LsmPublicationForTest {
+	pub(crate) commit: CompactionCommit,
+	pub(crate) durable: Option<LsmPublicationEvidenceForTest>,
+}
+
+/// What one control install left durable, for the slabs it touched.
+#[derive(Clone, Debug)]
+pub(crate) struct LsmPublicationEvidenceForTest {
+	pub(crate) runs: Vec<LsmRunSummary>,
+	pub(crate) intent_outstanding: bool,
+	pub(crate) rows_per_slab: Vec<(SlabId, usize)>,
+}
+
 #[derive(Default)]
 pub(super) struct TestHolds {
 	pub(super) retirement_snapshot_hold:
@@ -550,6 +649,11 @@ pub(super) struct TestHolds {
 	/// Fails the next read of what a recovered publication left.
 	pub(super) fail_publication_readback: std::sync::atomic::AtomicBool,
 	pub(super) append_refusal_after: std::sync::atomic::AtomicU64,
+	/// Every control install's durable result, as it was published: later work may retire or
+	/// collect its runs, so a poll of the index cannot be relied on to see it.
+	pub(super) lsm_publications: std::sync::Mutex<Vec<LsmPublicationForTest>>,
+	/// Whether a publication also reads the index: most tests have no use for that cost.
+	pub(super) lsm_publication_evidence: std::sync::atomic::AtomicBool,
 	pub(super) fence_at_version_check: std::sync::Mutex<Option<SlabId>>,
 	/// Appends that returned the proof-carrying refusal, and a wake-up for whoever awaits one.
 	pub(super) append_refusals_seen: std::sync::atomic::AtomicU64,
@@ -573,6 +677,15 @@ pub(super) struct TestHolds {
 	pub(super) skip_op_room_precheck: std::sync::atomic::AtomicBool,
 	/// Keeps the GC sweep from reaching a removal, as a blocker would.
 	pub(super) gc_remove_held: std::sync::atomic::AtomicBool,
+	/// A commit the ring has applied, and whose observer has not yet told the manifest.
+	pub(super) lsm_observer_hold:
+		std::sync::Mutex<Option<(Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>>,
+	/// The same, holding the transition gate a removal needs.
+	pub(super) lsm_observer_in_gate_hold:
+		std::sync::Mutex<Option<(Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>>,
+	/// A GC with its run durably dropped and the manifest not yet told.
+	pub(super) gc_after_run_dropped_hold:
+		std::sync::Mutex<Option<(Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>>,
 	pub(super) gc_before_clear_hold:
 		std::sync::Mutex<Option<(Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>>,
 	pub(super) gc_after_clear_hold:
@@ -661,6 +774,45 @@ impl SlabManager {
 		let hold = self
 			.continuity_test_holds
 			.gc_disposal_entry_hold
+			.lock()
+			.unwrap()
+			.clone();
+		if let Some((entered, release)) = hold {
+			entered.add_permits(1);
+			let _ = release.acquire().await;
+		}
+	}
+
+	pub(super) async fn pause_lsm_observer_for_test(&self) {
+		let hold = self
+			.continuity_test_holds
+			.lsm_observer_hold
+			.lock()
+			.unwrap()
+			.clone();
+		if let Some((entered, release)) = hold {
+			entered.add_permits(1);
+			let _ = release.acquire().await;
+		}
+	}
+
+	pub(super) async fn pause_lsm_observer_in_gate_for_test(&self) {
+		let hold = self
+			.continuity_test_holds
+			.lsm_observer_in_gate_hold
+			.lock()
+			.unwrap()
+			.clone();
+		if let Some((entered, release)) = hold {
+			entered.add_permits(1);
+			let _ = release.acquire().await;
+		}
+	}
+
+	pub(super) async fn pause_gc_after_run_dropped_for_test(&self) {
+		let hold = self
+			.continuity_test_holds
+			.gc_after_run_dropped_hold
 			.lock()
 			.unwrap()
 			.clone();

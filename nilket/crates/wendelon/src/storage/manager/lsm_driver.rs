@@ -1708,6 +1708,8 @@ impl SlabManager {
 		index
 			.hand_off_op(ticket.key(), ticket.digest(), Some(completed_intent))
 			.await?;
+		#[cfg(test)]
+		self.note_lsm_publication_for_test(commit).await;
 		self.clear_registered_lsm_intent(commit.job_id).await;
 		_intent_owner.complete();
 		self.tier_authority.notify_publication_change();
@@ -1804,8 +1806,42 @@ impl SlabManager {
 				"persistent index unavailable for control LSM evidence",
 			)
 		})?;
-		let gate = self.persistent_index_gate.clone().read_owned().await;
-		let snapshot = index.load_snapshot().await?;
+		let gate = Arc::new(self.persistent_index_gate.clone().read_owned().await);
+		let mut snapshot = index.load_snapshot().await?;
+		// The intent records these runs exactly, and recovery compares them exactly. A slab with
+		// no run row is summarized again by `open`, at the epoch `open` recovers, so each input
+		// gets its row first. A row that disagrees is not overwritten.
+		let mut missing = Vec::new();
+		for run in &local_input_runs {
+			match snapshot
+				.lsm_runs
+				.iter()
+				.find(|stored| stored.slab_id == run.slab_id)
+			{
+				Some(stored) if stored != run => return Err(CompactionFailure::ManifestRace),
+				Some(_) => {}
+				None => missing.push(run.clone()),
+			}
+		}
+		if !missing.is_empty() {
+			let mut publication_slabs = plan.touched_slabs();
+			publication_slabs.extend(written.iter().map(|run| run.slab_id));
+			// As on the local path: these rows only mirror runs already live in memory, so a
+			// later refusal leaves nothing to publish and nothing untrue.
+			let publication =
+				self.begin_index_publication_with_gate(publication_slabs, gate.clone())?;
+			index
+				.apply_with_publication_guard(
+					PersistentIndexUpdate {
+						put_lsm_runs: missing,
+						..Default::default()
+					},
+					Some(publication.gate.clone()),
+				)
+				.await?;
+			publication.complete();
+			snapshot = index.load_snapshot().await?;
+		}
 		let input_digest = crate::storage::index::lsm_input_rows_digest(&snapshot, &input_ids);
 		let local_rows = self
 			.persistent_record_rows_snapshot()

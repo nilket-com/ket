@@ -54750,7 +54750,22 @@ async fn assert_gc_stopped_at(gc: &ReopenedGc, stop: GcStop) {
 
 async fn assert_gc_finishes_from(stop: GcStop) {
 	let gc = reopen_gc_at(stop).await;
+	let opened = gc.mgr.compaction_manifest_snapshot();
 	gc.finish(stop).await;
+	// The removal's epoch reaches the floor with the drop, so whichever side of that transaction
+	// the store stopped on, it counts once: here if the run was still there, already if not.
+	let finished = gc.mgr.compaction_manifest_snapshot().manifest_epoch;
+	let durable = gc.mgr.require_op_index().unwrap().load_snapshot().await;
+	assert_eq!(
+		durable.unwrap().lsm_manifest_epoch_floor,
+		finished,
+		"{stop:?}"
+	);
+	if opened.run(gc.slab_id).is_some() {
+		assert!(finished > opened.manifest_epoch, "{stop:?}");
+	} else {
+		assert_eq!(finished, opened.manifest_epoch, "{stop:?}");
+	}
 	gc.close().await;
 }
 
@@ -56262,6 +56277,23 @@ async fn reopen_install_retaining(
 	retention_floor: HybridTimestamp,
 	seed: impl AsyncFnOnce(&Arc<SlabManager>, [Identity; 2]) -> [SlabId; 2],
 ) -> ReopenedInstall {
+	reopen_install_seeded_on_ring(cut, config, retention_floor, async |manager, _, keys| {
+		seed(manager, keys).await
+	})
+	.await
+}
+
+/// As [`reopen_install_retaining`], with a seed that can use the ring before the install it seeds.
+async fn reopen_install_seeded_on_ring(
+	cut: lsm_driver::ControlLsmInstallCut,
+	config: LsmConfig,
+	retention_floor: HybridTimestamp,
+	seed: impl AsyncFnOnce(
+		&Arc<SlabManager>,
+		&Arc<crate::storage::RaftCommitter>,
+		[Identity; 2],
+	) -> [SlabId; 2],
+) -> ReopenedInstall {
 	let dir = fresh_dir("s5-install");
 	let owner = DataDirectoryOwner::acquire_existing(&dir).unwrap();
 	let manager =
@@ -56272,7 +56304,7 @@ async fn reopen_install_retaining(
 	register_owner(&cluster.nodes[0], &manager).await;
 	let plain = Arc::new(op_committer(&cluster, 1));
 	let keys = [id(0xb11b01), id(0xb11b02)];
-	let [first, second] = seed(&manager, keys).await;
+	let [first, second] = seed(&manager, &plain, keys).await;
 	let snapshot = manager.compaction_manifest_snapshot();
 	let plan = CompactionPlan {
 		job_id: CompactionJobId::new(0xb11b),
@@ -56916,6 +56948,396 @@ async fn an_applied_install_publishes_after_a_reopen() {
 		.await
 		.assert_applied_install_ends("unpublished")
 		.await;
+}
+
+/// Real GC advances the epoch, and an install prepared at the result is accepted by the ring when
+/// the store stops: recovery finishes it, and the store takes a write and serves every row. One
+/// cut, not a crash matrix. Before the fix this fenced for good, with the recorded input and the
+/// one `open` rebuilt differing only in their epoch.
+async fn an_install_accepted_after_gc_ends_after_a_reopen(inputs_sealed_before_gc: bool) {
+	let earlier = [id(0xdc19101), id(0xdc19102)];
+	let reopened = reopen_install_seeded_on_ring(
+		lsm_driver::ControlLsmInstallCut::AfterAcceptance,
+		LsmConfig::default(),
+		hlc(100),
+		async |manager, plain, keys| {
+			let seal_inputs = async || {
+				manager
+					.append_durable(tenant(), keys[0], hlc(1), b"b11b-first")
+					.await
+					.unwrap();
+				let first = manager.force_seal_active_for_test().await;
+				manager
+					.append_durable(tenant(), keys[1], hlc(2), b"b11b-second")
+					.await
+					.unwrap();
+				[first, manager.force_seal_active_for_test().await]
+			};
+			let sealed_before = if inputs_sealed_before_gc {
+				Some(seal_inputs().await)
+			} else {
+				None
+			};
+
+			// An earlier install and its real GC.
+			manager
+				.append_durable(tenant(), earlier[0], hlc(1), b"earlier-first")
+				.await
+				.unwrap();
+			let first = manager.force_seal_active_for_test().await;
+			manager
+				.append_durable(tenant(), earlier[1], hlc(2), b"earlier-second")
+				.await
+				.unwrap();
+			let second = manager.force_seal_active_for_test().await;
+			let before_gc = manager.compaction_manifest_snapshot().manifest_epoch;
+			let plan = CompactionPlan {
+				job_id: CompactionJobId::new(0xdc191),
+				source_level: CompactionLevelIndex::L0,
+				target_level: CompactionLevelIndex::L1,
+				manifest_epoch_pre: before_gc,
+				input_slabs: vec![first, second],
+				overlapping_slabs: Vec::new(),
+				retention_floor_snapshot: hlc(100),
+				compaction_start_hlc: hlc(50),
+				dominant_reason: crate::storage::DominantReason::Operator,
+			};
+			let worker =
+				LsmCompactionWorker::new(LsmConfig::default(), manager.slab_pin_table()).unwrap();
+			manager
+				.run_lsm_compaction_once_via_control_ring(&worker, plan, plain.as_ref())
+				.await
+				.unwrap();
+			let gc = LsmGcWorker::new(LsmConfig::default(), manager.slab_pin_table()).unwrap();
+			let mut last = Ok(Vec::new());
+			for _ in 0..64 {
+				let manifest = manager.compaction_manifest_snapshot();
+				if manifest.run(first).is_none() && manifest.run(second).is_none() {
+					break;
+				}
+				last = manager
+					.sweep_lsm_delete_pending_once_via_control_ring(&gc, plain.as_ref())
+					.await;
+				tokio::time::sleep(Duration::from_millis(50)).await;
+			}
+			let manifest = manager.compaction_manifest_snapshot();
+			assert!(
+				manifest.run(first).is_none() && manifest.run(second).is_none(),
+				"GC did not collect the inputs: {last:?}: {:?}",
+				manifest.runs()
+			);
+
+			// One install, then a mark and a removal for each of its two inputs, and a reopen
+			// here would recover every one of those transitions.
+			assert_eq!(
+				manifest.manifest_epoch,
+				ManifestEpoch::new(before_gc.get() + 5),
+				"{:?}",
+				manifest.runs()
+			);
+			let durable = manager
+				.require_op_index()
+				.unwrap()
+				.load_snapshot()
+				.await
+				.unwrap();
+			assert_eq!(durable.lsm_manifest_epoch_floor, manifest.manifest_epoch);
+
+			match sealed_before {
+				Some(inputs) => inputs,
+				None => seal_inputs().await,
+			}
+		},
+	)
+	.await;
+
+	// Open read the inputs back as the intent recorded them, whatever their epoch.
+	let pre = reopened.intent.commit.manifest_epoch_pre;
+	let manifest = reopened.mgr.compaction_manifest_snapshot();
+	assert_eq!(manifest.manifest_epoch, pre, "the epoch the commit names");
+	for run in &reopened.intent.local_input_runs {
+		assert_eq!(manifest.run(run.slab_id), Some(run));
+		assert_eq!(
+			run.manifest_epoch == pre,
+			!inputs_sealed_before_gc,
+			"{run:?}"
+		);
+	}
+
+	// Ordinary recovery, bounded.
+	tokio::time::timeout(
+		Duration::from_secs(120),
+		reopened.drive_until_ready(("inputs sealed before GC", inputs_sealed_before_gc)),
+	)
+	.await
+	.expect("recovery did not finish");
+	assert!(reopened.mgr.compaction_manifest_snapshot().manifest_epoch > pre);
+
+	// A real acknowledged write, and every row, exactly.
+	let after = id(0xdc19103);
+	reopened
+		.mgr
+		.append_durable(tenant(), after, hlc(200), b"after-recovery")
+		.await
+		.unwrap();
+	for (key, bytes) in [
+		(earlier[0], b"earlier-first".as_slice()),
+		(earlier[1], b"earlier-second".as_slice()),
+		(after, b"after-recovery".as_slice()),
+	] {
+		let location = reopened.mgr.lookup(tenant(), key).unwrap().unwrap();
+		assert_eq!(reopened.mgr.read(location).await.unwrap(), bytes);
+	}
+	reopened
+		.assert_applied_install_ends(("inputs sealed before GC", inputs_sealed_before_gc))
+		.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_install_accepted_after_gc_ends_after_a_reopen_with_inputs_sealed_after_it() {
+	an_install_accepted_after_gc_ends_after_a_reopen(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_install_accepted_after_gc_ends_after_a_reopen_with_inputs_sealed_before_it() {
+	an_install_accepted_after_gc_ends_after_a_reopen(true).await;
+}
+
+/// A real install's commit, applied by the ring, racing GC's removal of a run for the transition
+/// gate: GC's lease keeps the ring from applying during its drop, but an observer runs after the
+/// ring's write lock is released. In either order the epoch memory shows is one a reopen would
+/// recover. With the observer first, both also finish in this process. With the removal first this
+/// proves that boundary and no more: the install it overtook is left fenced, which is DC-192.
+async fn an_observed_commit_racing_a_gc_removal(observer_first: bool) {
+	async fn reached(what: &str, gate: &tokio::sync::Semaphore) {
+		tokio::time::timeout(Duration::from_secs(60), gate.acquire())
+			.await
+			.unwrap_or_else(|_| panic!("never reached: {what}"))
+			.unwrap()
+			.forget();
+	}
+	type Hold = (Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>);
+	let hold = || -> Hold {
+		(
+			Arc::new(tokio::sync::Semaphore::new(0)),
+			Arc::new(tokio::sync::Semaphore::new(0)),
+		)
+	};
+	let dir = fresh_dir("gc-overtaken");
+	let owner = DataDirectoryOwner::acquire_existing(&dir).unwrap();
+	let manager =
+		SlabManager::initialize_new_store_with_owner(gc_owned_test_config(&dir), owner.clone())
+			.await
+			.unwrap();
+	let cluster = control_cluster_observing(&[(1, &manager)]).await;
+	register_owner(&cluster.nodes[0], &manager).await;
+	let plain = Arc::new(op_committer(&cluster, 1));
+	let plan = |job: u64, pre: ManifestEpoch, inputs: [SlabId; 2], start: u64| CompactionPlan {
+		job_id: CompactionJobId::new(job),
+		source_level: CompactionLevelIndex::L0,
+		target_level: CompactionLevelIndex::L1,
+		manifest_epoch_pre: pre,
+		input_slabs: inputs.to_vec(),
+		overlapping_slabs: Vec::new(),
+		retention_floor_snapshot: hlc(100),
+		compaction_start_hlc: hlc(start),
+		dominant_reason: crate::storage::DominantReason::Operator,
+	};
+	let seal = async |key: Identity, at: u64, bytes: &[u8]| {
+		manager
+			.append_durable(tenant(), key, hlc(at), bytes)
+			.await
+			.unwrap();
+		manager.force_seal_active_for_test().await
+	};
+	let worker = LsmCompactionWorker::new(LsmConfig::default(), manager.slab_pin_table()).unwrap();
+
+	// What GC will collect.
+	let collected = [
+		seal(id(0xdc19201), 1, b"collected-first").await,
+		seal(id(0xdc19202), 2, b"collected-second").await,
+	];
+	manager
+		.run_lsm_compaction_once_via_control_ring(
+			&worker,
+			plan(
+				0xdc1921,
+				manager.compaction_manifest_snapshot().manifest_epoch,
+				collected,
+				50,
+			),
+			plain.as_ref(),
+		)
+		.await
+		.unwrap();
+	// What the overtaking install will merge.
+	let keys = [id(0xdc19203), id(0xdc19204)];
+	let merged = [
+		seal(keys[0], 3, b"merged-first").await,
+		seal(keys[1], 4, b"merged-second").await,
+	];
+
+	// GC stops at its first disposal, its run marked: the install is prepared at that epoch.
+	let entry = hold();
+	let dropped = hold();
+	*manager
+		.continuity_test_holds
+		.gc_disposal_entry_hold
+		.lock()
+		.unwrap() = Some(entry.clone());
+	*manager
+		.continuity_test_holds
+		.gc_after_run_dropped_hold
+		.lock()
+		.unwrap() = Some(dropped.clone());
+	let gc = LsmGcWorker::new(LsmConfig::default(), manager.slab_pin_table()).unwrap();
+	let sweep = {
+		let (manager, plain) = (manager.clone(), plain.clone());
+		tokio::spawn(async move {
+			manager
+				.sweep_lsm_delete_pending_once_via_control_ring(&gc, plain.as_ref())
+				.await
+		})
+	};
+	reached("GC's first disposal", &entry.0).await;
+	let observer = hold();
+	{
+		let holds = &manager.continuity_test_holds;
+		let at = if observer_first {
+			&holds.lsm_observer_in_gate_hold
+		} else {
+			&holds.lsm_observer_hold
+		};
+		*at.lock().unwrap() = Some(observer.clone());
+	}
+	let install = {
+		let (manager, plain) = (manager.clone(), plain.clone());
+		let plan = plan(
+			0xdc1922,
+			manager.compaction_manifest_snapshot().manifest_epoch,
+			merged,
+			101,
+		);
+		let worker = worker.clone();
+		tokio::spawn(async move {
+			manager
+				.run_lsm_compaction_once_via_control_ring(&worker, plan, plain.as_ref())
+				.await
+		})
+	};
+	reached("the ring applying the install's commit", &observer.0).await;
+	let index = manager.require_op_index().unwrap();
+	let floor = async || {
+		index
+			.load_snapshot()
+			.await
+			.unwrap()
+			.lsm_manifest_epoch_floor
+	};
+	let epoch = || manager.compaction_manifest_snapshot().manifest_epoch;
+	let prepared_at = epoch();
+
+	entry.1.add_permits(64);
+	if observer_first {
+		// The observer holds the gate, so the run does not go until it has told the manifest.
+		tokio::time::sleep(Duration::from_millis(200)).await;
+		assert_eq!(
+			dropped.0.available_permits(),
+			0,
+			"the drop waits for the gate"
+		);
+		observer.1.add_permits(64);
+		reached("the first run durably dropped", &dropped.0).await;
+		assert_eq!(epoch(), ManifestEpoch::new(prepared_at.get() + 1));
+		assert!(matches!(
+			manager
+				.compaction_manifest_snapshot()
+				.run(merged[0])
+				.unwrap()
+				.state,
+			crate::storage::SlabState::Retired { .. }
+		));
+	} else {
+		// The run goes first, and the observer waits for the gate.
+		reached("the first run durably dropped", &dropped.0).await;
+		observer.1.add_permits(64);
+		tokio::time::sleep(Duration::from_millis(200)).await;
+		assert_eq!(epoch(), prepared_at, "the observer waits for the removal");
+	}
+	// The drop is durable and memory has not moved: a stop here recovers more than it showed.
+	let at_drop = epoch();
+	assert_eq!(floor().await, ManifestEpoch::new(at_drop.get() + 1));
+
+	// Memory follows, to exactly what the floor already holds.
+	dropped.1.add_permits(64);
+	if !observer_first {
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+		while epoch() == at_drop {
+			assert!(tokio::time::Instant::now() < deadline, "memory never moved");
+			tokio::time::sleep(Duration::from_millis(5)).await;
+		}
+		assert_eq!(epoch(), ManifestEpoch::new(at_drop.get() + 1));
+		assert_eq!(floor().await, epoch());
+		assert!(
+			collected
+				.iter()
+				.any(|input| manager.compaction_manifest_snapshot().run(*input).is_none()),
+			"the removal is in the manifest"
+		);
+		// Nothing here can finish while DC-192 stands, so this stops, and cleans up.
+		sweep.abort();
+		install.abort();
+		let _ = sweep.await;
+		let _ = install.await;
+		let _ = owner.close(Duration::from_secs(2)).await;
+		return;
+	}
+	reached("GC's next disposal", &entry.0).await;
+	assert!(floor().await >= ManifestEpoch::new(at_drop.get() + 1));
+
+	// Both finish, in this process.
+	let swept = tokio::time::timeout(Duration::from_secs(60), sweep).await;
+	swept.expect("the sweep finished").unwrap().unwrap();
+	let installed = tokio::time::timeout(Duration::from_secs(60), install).await;
+	installed.expect("the install finished").unwrap().unwrap();
+	let manifest = manager.compaction_manifest_snapshot();
+	for input in collected {
+		assert!(manifest.run(input).is_none(), "{:?}", manifest.runs());
+		assert!(!slab_path(&dir, input).exists());
+	}
+	assert_eq!(
+		index
+			.load_snapshot()
+			.await
+			.unwrap()
+			.lsm_manifest_epoch_floor,
+		manifest.manifest_epoch
+	);
+	let after = id(0xdc19205);
+	manager
+		.append_durable(tenant(), after, hlc(200), b"after")
+		.await
+		.unwrap();
+	for (key, bytes) in [
+		(id(0xdc19201), b"collected-first".as_slice()),
+		(id(0xdc19202), b"collected-second".as_slice()),
+		(keys[0], b"merged-first".as_slice()),
+		(keys[1], b"merged-second".as_slice()),
+		(after, b"after".as_slice()),
+	] {
+		let location = manager.lookup(tenant(), key).unwrap().unwrap();
+		assert_eq!(manager.read(location).await.unwrap(), bytes);
+	}
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_observed_commit_ahead_of_a_gc_removal_keeps_both() {
+	an_observed_commit_racing_a_gc_removal(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_gc_removal_ahead_of_an_observed_commit_is_on_disk_before_memory() {
+	an_observed_commit_racing_a_gc_removal(false).await;
 }
 
 /// An output that is not the recorded file is not published.

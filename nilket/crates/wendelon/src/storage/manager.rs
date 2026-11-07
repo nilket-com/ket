@@ -245,6 +245,8 @@ pub use slab_file_quarantine::{
 };
 #[cfg(test)]
 mod pause_hooks;
+#[cfg(test)]
+pub(crate) use pause_hooks::LsmPublicationForTest;
 use tiered_io::{
 	RehydratedSlabState, SlabBacking, TierObjectEvidence, TieredPlaintext,
 	build_tiered_object_metadata, decode_tiered_blob, descriptor_matches_tiered_row,
@@ -787,6 +789,10 @@ pub struct SlabManager {
 	/// replacement in the live manager. Readers use the record index and slab
 	/// pins, so this gate is planner-only.
 	maintenance_publication_gate: Arc<AsyncRwLock<()>>,
+	/// Excludes an observed commit, the one writer of the manifest epoch outside the maintenance
+	/// gate, from a transition whose epoch must reach the disk first. Held only for that one
+	/// transaction and its memory change: the control ring's apply waits on it.
+	lsm_manifest_transition_gate: AsyncRwLock<()>,
 	/// A D2 publication whose staged replacement could not be installed after
 	/// the bounded S1 retry policy. Retaining the owned write guard keeps
 	/// planners out of the committed-but-uninstalled world until startup
@@ -3234,7 +3240,12 @@ impl SlabManager {
 		commit: &crate::storage::CompactionCommit,
 		index: u64,
 	) -> std::io::Result<()> {
+		#[cfg(test)]
+		self.pause_lsm_observer_for_test().await;
 		let _gate = self.persistent_index_gate.clone().read_owned().await;
+		let _transition = self.lsm_manifest_transition_gate.read().await;
+		#[cfg(test)]
+		self.pause_lsm_observer_in_gate_for_test().await;
 		if self.observer_is_superseded(Some(index)) {
 			return Ok(());
 		}

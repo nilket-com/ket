@@ -467,8 +467,13 @@ impl CompactionManifest {
 	}
 
 	pub fn advance_epoch(&mut self) -> ManifestEpoch {
-		self.manifest_epoch = self.manifest_epoch.saturating_add(1);
+		self.manifest_epoch = Self::epoch_after_transition(self.manifest_epoch);
 		self.manifest_epoch
+	}
+
+	/// The epoch a transition from `epoch` ends at.
+	pub fn epoch_after_transition(epoch: ManifestEpoch) -> ManifestEpoch {
+		epoch.saturating_add(1)
 	}
 
 	pub fn snapshot(&self) -> ManifestSnapshot {
