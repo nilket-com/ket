@@ -78,6 +78,10 @@ pub fn stale_location_error(slab_id: SlabId, reason: StaleLocationReason) -> Err
 /// records its cause (`tier_deferral::CausedFence`).
 pub fn stale_location(error: &Error) -> Option<StaleLocation> {
 	let inner = error.get_ref()?;
+	if let Some(refused) = inner.downcast_ref::<super::tier_authority::AppendRefusedBeforeEffects>()
+	{
+		return stale_location(refused.cause());
+	}
 	inner.downcast_ref::<StaleLocation>().copied().or_else(|| {
 		inner
 			.downcast_ref::<super::tier_deferral::CausedFence>()

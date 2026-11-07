@@ -106,10 +106,24 @@ impl SlabManager {
 		hlc: HybridTimestamp,
 		incoming: IncomingVersion<'_>,
 	) -> std::io::Result<usize> {
-		self.require_tier_authority_ready()?;
-		let candidates = self.same_hlc_locations(tenant_id, key_identity, hlc)?;
+		#[cfg(test)]
+		self.raise_fence_at_version_check_for_test();
+		// Every caller runs this ahead of its append's first effect.
+		self.require_tier_authority_ready()
+			.map_err(|cause| self.refused_before_effects(cause))?;
+		let candidates = self
+			.same_hlc_locations(tenant_id, key_identity, hlc)
+			.map_err(|cause| self.refused_before_effects(cause))?;
 		for candidate in &candidates {
-			let stored = self.read(*candidate).await?;
+			let stored = self.read(*candidate).await.map_err(|error| {
+				let fenced = stale_location(&error)
+					.is_some_and(|stale| matches!(stale.reason, StaleLocationReason::Fenced));
+				if fenced {
+					self.refused_before_effects(error)
+				} else {
+					error
+				}
+			})?;
 			let same = match &incoming {
 				IncomingVersion::Counter { value, origin } => {
 					match super::super::counter::decode_origin_frame(&stored) {

@@ -18219,3 +18219,661 @@ fn migration_cursor_wire_roundtrip_keeps_absent_apart_from_zero() {
 		ErrorKind::InvalidData
 	);
 }
+
+// DC-173: a refused append is not a persistence failure, when that can be shown.
+
+async fn leading_node_for_refusals(label: &str) -> (crate::test_support::TestDir, WendelonNode) {
+	let dir = bootstrap_tempdir(label);
+	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+		38,
+		dir.to_path_buf(),
+		"127.0.0.1:0".into(),
+	))
+	.await
+	.unwrap();
+	let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+	while node.raft.current_leader().await != Some(node.local_node.id) {
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"timed out waiting for leader"
+		);
+		tokio::time::sleep(Duration::from_millis(20)).await;
+	}
+	node.data_server
+		.refresh_leases_once(&node.ring, &*node.clock, 60_000)
+		.await;
+	let descriptor = typed_table_descriptor();
+	node.raft
+		.client_write(WendelonRequest::SchemaUpdate(typed_table_schema_update(
+			&descriptor,
+		)))
+		.await
+		.unwrap();
+	(dir, node)
+}
+
+/// The node is exactly as it was: no marker, no fence, still leading, still writing.
+async fn assert_not_fenced(node: &WendelonNode, dir: &std::path::Path, label: &str) {
+	assert_eq!(node.data_server.degraded_reason(), None, "{label}");
+	assert!(
+		!dir.join("local_persistence_distrust.flag").exists()
+			&& !std::fs::read_dir(dir).unwrap().any(|entry| entry
+				.unwrap()
+				.file_name()
+				.to_string_lossy()
+				.contains("distrust")),
+		"{label}: no marker"
+	);
+	assert_eq!(
+		node.raft.current_leader().await,
+		Some(node.local_node.id),
+		"{label}: Raft still runs"
+	);
+}
+
+/// The KV path. The refusal's answer stays INTERNAL_ERROR, and the next write succeeds.
+#[tokio::test]
+async fn a_readiness_refusal_of_a_kv_append_does_not_fence_the_node() {
+	let (dir, node) = leading_node_for_refusals("dc173-kv").await;
+	node.slab.refuse_append_after_for_test(0);
+	let mut meta = simple_write_meta(1);
+	meta.client_hlc = hlc(1, 0, 0);
+	let before = node.slab.local_l1_bytes().await;
+	let (refused, _) = node
+		.data_server
+		.write(meta, single_kv_batch())
+		.await
+		.unwrap();
+	assert_eq!(refused.status, WriteStatus::INTERNAL_ERROR);
+	assert_eq!(node.slab.local_l1_bytes().await, before, "it wrote nothing");
+	assert_not_fenced(&node, &dir, "kv").await;
+	node.slab.clear_append_refusal_for_test();
+	let mut next = simple_write_meta(1);
+	next.write_id.sequence_no = 2;
+	next.client_hlc = hlc(2, 0, 0);
+	let (written, _) = node
+		.data_server
+		.write(next, single_kv_batch())
+		.await
+		.unwrap();
+	assert_eq!(written.status, WriteStatus::OK);
+	shutdown_lease_node(node).await;
+}
+
+/// The table path, refused at its first child. The same mutation identity then applies, once.
+#[tokio::test]
+async fn a_readiness_refusal_of_a_tables_first_child_does_not_fence_the_node() {
+	let (dir, node) = leading_node_for_refusals("dc173-table").await;
+	let descriptor = typed_table_descriptor();
+	let batch = typed_table_batch(vec![7, 8]);
+	let mut meta = typed_table_meta(&descriptor, batch.num_rows());
+	meta.parent_write_id.sequence_no = 56;
+	meta.await_finalization = 1;
+	node.slab.refuse_append_after_for_test(0);
+	let before = node.slab.local_l1_bytes().await;
+	let (refused, _) = node
+		.data_server
+		.table_write(meta, batch.clone())
+		.await
+		.unwrap();
+	assert_eq!(refused.write.status, WriteStatus::INTERNAL_ERROR);
+	assert_eq!(node.slab.local_l1_bytes().await, before, "it wrote nothing");
+	assert_not_fenced(&node, &dir, "first child").await;
+	node.slab.clear_append_refusal_for_test();
+	let (retried, _) = node.data_server.table_write(meta, batch).await.unwrap();
+	assert_eq!(retried.write.status, WriteStatus::OK, "{retried:?}");
+	assert_not_fenced(&node, &dir, "retried").await;
+	shutdown_lease_node(node).await;
+}
+
+/// Refused after an earlier child is durable, the proof no longer holds for the mutation: the
+/// conservative path, until a retry of a partly applied mutation is shown safe.
+#[tokio::test]
+async fn a_refusal_after_a_durable_child_stays_on_the_conservative_path() {
+	let (_dir, node) = leading_node_for_refusals("dc173-partial").await;
+	let descriptor = typed_table_descriptor();
+	let batch = typed_table_batch(vec![7, 8]);
+	let mut meta = typed_table_meta(&descriptor, batch.num_rows());
+	meta.parent_write_id.sequence_no = 56;
+	meta.await_finalization = 1;
+	let children = bifurcate_table_write(
+		&meta,
+		&batch,
+		&descriptor,
+		WriterNodeId::ZERO,
+		meta.client_hlc,
+	)
+	.unwrap()
+	.children;
+	assert!(children.len() >= 2, "premise: {} children", children.len());
+	node.slab.refuse_append_after_for_test(1);
+	let before = node.slab.local_l1_bytes().await;
+	let (refused, _) = node.data_server.table_write(meta, batch).await.unwrap();
+	assert_eq!(refused.write.status, WriteStatus::INTERNAL_ERROR);
+	assert!(
+		node.slab.local_l1_bytes().await > before,
+		"premise: its first child is durable"
+	);
+	assert_eq!(
+		node.data_server.degraded_reason().as_deref(),
+		Some(LOCAL_PERSISTENCE_DISTRUST_REASON)
+	);
+	shutdown_lease_node(node).await;
+}
+
+/// Only a refusal that clears by itself carries the proof.
+#[tokio::test]
+async fn a_refusal_that_will_not_clear_by_itself_still_fences() {
+	let (_dir, node) = leading_node_for_refusals("dc173-sticky").await;
+	node.slab.fence_unresolved_op_for_test();
+	node.slab.refuse_append_after_for_test(0);
+	let mut meta = simple_write_meta(1);
+	meta.client_hlc = hlc(1, 0, 0);
+	let (refused, _) = node
+		.data_server
+		.write(meta, single_kv_batch())
+		.await
+		.unwrap();
+	assert_eq!(refused.status, WriteStatus::INTERNAL_ERROR);
+	assert_eq!(
+		node.data_server.degraded_reason().as_deref(),
+		Some(LOCAL_PERSISTENCE_DISTRUST_REASON)
+	);
+	shutdown_lease_node(node).await;
+}
+
+/// DC-175, RED first: routine tier retirement raises a store-wide fence for a moment. A table
+/// write that meets it waits it out, on the real fence, and the client sees a success.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_table_write_waits_out_a_retirement_fence() {
+	let (dir, node) = leading_node_for_refusals("dc175-wait").await;
+	let descriptor = typed_table_descriptor();
+	let batch = typed_table_batch(vec![7, 8]);
+	let mut meta = typed_table_meta(&descriptor, batch.num_rows());
+	meta.parent_write_id.sequence_no = 57;
+	meta.await_finalization = 1;
+	let slab = SlabId::new(0x7700);
+	let before = node.slab.local_l1_bytes().await;
+	node.slab.raise_retirement_fence_for_test(slab);
+	let write = {
+		let server = node.data_server.clone();
+		tokio::spawn(async move { server.table_write(meta, batch).await })
+	};
+	tokio::time::timeout(Duration::from_secs(30), node.slab.append_refusal_for_test())
+		.await
+		.expect("the fence actually refused it");
+	assert!(!write.is_finished(), "it waits while the fence stands");
+	assert_eq!(
+		node.slab.local_l1_bytes().await,
+		before,
+		"premise: nothing yet"
+	);
+	node.slab.clear_retirement_fence_for_test(slab);
+	let (written, _) = tokio::time::timeout(Duration::from_secs(10), write)
+		.await
+		.expect("the fence cleared")
+		.unwrap()
+		.unwrap();
+	assert_eq!(written.write.status, WriteStatus::OK, "{written:?}");
+	assert_not_fenced(&node, &dir, "waited out").await;
+	shutdown_lease_node(node).await;
+}
+
+/// Every row, exactly, through the real table query path.
+async fn all_rows_through_the_query_path(
+	node: &WendelonNode,
+	descriptor: &TableSchemaDescriptor,
+	as_of: HybridTimestamp,
+) -> std::collections::BTreeMap<i64, String> {
+	let program = Vec::new();
+	let query_meta = table_query_meta_for_test(descriptor, as_of, program.len());
+	let plan = node
+		.data_server
+		.prepare_table_query_execution_plan_with_migration(
+			&query_meta,
+			&program,
+			DecodedRuntimeFilter::Absent,
+		)
+		.await
+		.unwrap();
+	assert_eq!(plan.response.status, ReadStatus::OK);
+	let mut rows = std::collections::BTreeMap::new();
+	let mut seen = 0;
+	for batch in &plan.batches {
+		let ids = batch
+			.column_by_name("id")
+			.unwrap()
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.unwrap();
+		let names = batch
+			.column_by_name("name")
+			.unwrap()
+			.as_any()
+			.downcast_ref::<LargeStringArray>()
+			.unwrap();
+		for row in 0..batch.num_rows() {
+			rows.insert(ids.value(row), names.value(row).to_owned());
+			seen += 1;
+		}
+	}
+	assert_eq!(seen, rows.len(), "no row returned twice");
+	rows
+}
+
+/// The runs now holding what `outputs` held: each later install that consumed one replaces it by
+/// its own outputs.
+fn outputs_lineage(
+	outputs: &[SlabId],
+	later: &[crate::storage::manager::LsmPublicationForTest],
+) -> std::collections::BTreeSet<SlabId> {
+	let mut held = outputs
+		.iter()
+		.copied()
+		.collect::<std::collections::BTreeSet<_>>();
+	for publication in later {
+		let commit = &publication.commit;
+		if commit
+			.slabs_to_retire
+			.iter()
+			.any(|input| held.contains(input))
+		{
+			held.retain(|slab_id| !commit.slabs_to_retire.contains(slab_id));
+			held.extend(commit.slabs_to_add.iter().map(|run| run.slab_id));
+		}
+	}
+	held
+}
+
+/// The workflow no other test covers: a real node's own service loops compact real writes through
+/// the real ring and GC the inputs, and the rows read back exactly, before and after a restart.
+/// The restart aborts the node's tasks, shuts it down, and bootstraps a fresh node on the same
+/// directory: a real reopen, not a power loss and not a full graceful shutdown. All local inputs
+/// and one node: tiered inputs, transport, three nodes and backup are not here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_node_compacts_real_writes_and_serves_them_after_a_reopen() {
+	// The whole workflow, every await in it. The polls' shared deadline comes first so that the
+	// usual failure says what it saw; this bound catches an await that never returns.
+	const WORKFLOW_BOUND: Duration = Duration::from_secs(300);
+	let stage = std::sync::Arc::new(std::sync::Mutex::new("start".to_owned()));
+	let finished = tokio::time::timeout(WORKFLOW_BOUND, compaction_workflow(stage.clone())).await;
+	assert!(
+		finished.is_ok(),
+		"the workflow did not finish within {WORKFLOW_BOUND:?}, in: {}",
+		stage.lock().unwrap(),
+	);
+}
+
+async fn compaction_workflow(stage: std::sync::Arc<std::sync::Mutex<String>>) {
+	let enter = |now: String| *stage.lock().unwrap() = now;
+	let polls_end = tokio::time::Instant::now() + Duration::from_secs(270);
+	let dir = bootstrap_tempdir("compaction-workflow");
+	let mut cfg = NodeBootstrapConfig::dev(38, dir.to_path_buf(), "127.0.0.1:0".into());
+	cfg.slab_max_bytes = 8 * 1024;
+	enter("bootstrap".to_owned());
+	let node = WendelonNode::bootstrap_single_node(cfg.clone())
+		.await
+		.unwrap();
+	let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+	while node.raft.current_leader().await != Some(node.local_node.id) {
+		assert!(tokio::time::Instant::now() < deadline, "no leader");
+		tokio::time::sleep(Duration::from_millis(20)).await;
+	}
+	node.data_server
+		.refresh_leases_once(&node.ring, &*node.clock, 600_000)
+		.await;
+	let descriptor = typed_table_descriptor();
+	node.raft
+		.client_write(WendelonRequest::SchemaUpdate(typed_table_schema_update(
+			&descriptor,
+		)))
+		.await
+		.unwrap();
+	node.slab.record_lsm_publication_evidence_for_test();
+
+	// Write until the node's own service has published an install, sealing as slabs fill.
+	let mut expected = std::collections::BTreeMap::new();
+	let mut as_of = hlc(1, 0, 1);
+	let mut id = 0_i64;
+	let publication = loop {
+		if let Some(first) = node.slab.lsm_publications_for_test().into_iter().next() {
+			break first;
+		}
+		assert!(
+			tokio::time::Instant::now() < polls_end,
+			"no compaction landed: {} rows, sealed {}, runs {:?}, intents {}, readiness {:?}",
+			expected.len(),
+			node.slab.sealed_count().await,
+			node.slab.compaction_manifest_snapshot().runs(),
+			node.slab
+				.durable_index_snapshot_for_test()
+				.await
+				.lsm_install_intents
+				.len(),
+			node.slab.tier_authority_readiness_reason(),
+		);
+		id += 1;
+		enter(format!("write {id}"));
+		let name = format!("value-{id}-{}", "x".repeat(256));
+		let batch = typed_table_batch_with_names(vec![(id, name.as_str())]);
+		let mut meta = typed_table_meta(&descriptor, batch.num_rows());
+		meta.parent_write_id.sequence_no = 10_000 + id as u64;
+		let (written, _) = node.data_server.table_write(meta, batch).await.unwrap();
+		assert_eq!(written.write.status, WriteStatus::OK, "{written:?}");
+		as_of = written.write.commit_hlc;
+		expected.insert(id, name);
+		tokio::time::sleep(Duration::from_millis(5)).await;
+	};
+
+	// This operation's durable publication: the selected inputs retired to its outputs at the
+	// default L0 to L1 path, its rows moved, its intent gone, whatever work followed it.
+	enter(format!("publication of {:?}", publication.commit.job_id));
+	let inputs = publication.commit.slabs_to_retire.clone();
+	let outputs = publication
+		.commit
+		.slabs_to_add
+		.iter()
+		.map(|run| run.slab_id)
+		.collect::<Vec<_>>();
+	assert!(inputs.len() >= 2, "a real merge: {inputs:?}");
+	assert!(!outputs.is_empty(), "{:?}", publication.commit);
+	assert!(inputs.iter().all(|input| !outputs.contains(input)));
+	let durable = publication
+		.durable
+		.as_ref()
+		.expect("evidence was requested before the first write");
+	assert!(!durable.intent_outstanding, "{publication:?}");
+	let durable_run = |slab_id: SlabId| {
+		durable
+			.runs
+			.iter()
+			.find(|run| run.slab_id == slab_id)
+			.unwrap_or_else(|| panic!("no durable run for {slab_id:?}: {publication:?}"))
+	};
+	let durable_rows = |slab_id: SlabId| {
+		durable
+			.rows_per_slab
+			.iter()
+			.find(|(slab, _)| *slab == slab_id)
+			.map(|(_, rows)| *rows)
+			.unwrap()
+	};
+	for input in &inputs {
+		let run = durable_run(*input);
+		assert_eq!(
+			run.compaction_level,
+			crate::schema::CompactionLevelIndex::L0,
+			"{run:?}"
+		);
+		assert_eq!(
+			run.state,
+			crate::storage::SlabState::Retired {
+				successors: outputs.clone()
+			},
+			"{run:?}"
+		);
+		assert_eq!(durable_rows(*input), 0, "{input:?} keeps rows");
+	}
+	for output in &outputs {
+		let run = durable_run(*output);
+		assert!(run.state.is_live(), "{run:?}");
+		assert_eq!(
+			run.compaction_level,
+			crate::schema::CompactionLevelIndex::L1,
+			"{run:?}"
+		);
+		assert_eq!(
+			durable_rows(*output) as u64,
+			run.row_count.get(),
+			"{output:?}: {run:?}"
+		);
+	}
+
+	// GC, through the node's own loop: the inputs' runs and files go.
+	enter(format!("GC of {inputs:?}"));
+	loop {
+		let snapshot = node.slab.compaction_manifest_snapshot();
+		let gone = inputs.iter().all(|input| {
+			snapshot.run(*input).is_none() && !node.slab.slab_file_exists_for_test(*input)
+		});
+		if gone {
+			break;
+		}
+		assert!(
+			tokio::time::Instant::now() < polls_end,
+			"inputs not collected: {:?}",
+			inputs
+				.iter()
+				.map(|input| (
+					*input,
+					snapshot.run(*input).map(|run| run.state.clone()),
+					node.slab.slab_file_exists_for_test(*input)
+				))
+				.collect::<Vec<_>>()
+		);
+		tokio::time::sleep(Duration::from_millis(100)).await;
+	}
+
+	enter("query before the restart".to_owned());
+	assert_eq!(
+		all_rows_through_the_query_path(&node, &descriptor, as_of).await,
+		expected,
+		"every row, exactly, after the compaction and its GC"
+	);
+	let epoch = node.slab.compaction_manifest_snapshot().manifest_epoch;
+	let slab = node.slab.clone();
+	enter("shutdown".to_owned());
+	shutdown_lease_node(node).await;
+	let mut publications = slab.lsm_publications_for_test();
+	drop(slab);
+
+	// A real reopen: a fresh node and rings from what is on disk.
+	enter("reopen".to_owned());
+	let reopened = WendelonNode::bootstrap_single_node(cfg).await.unwrap();
+	let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+	while reopened.raft.current_leader().await != Some(reopened.local_node.id) {
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"no leader after reopen"
+		);
+		tokio::time::sleep(Duration::from_millis(20)).await;
+	}
+	reopened
+		.data_server
+		.refresh_leases_once(&reopened.ring, &*reopened.clock, 600_000)
+		.await;
+	// The manifest and the installs up to it. A publication is noted inside its install's gate,
+	// after its manifest change and before GC can take what it retired: with no note arriving
+	// across the read, every run of the lineage below is in this manifest, Live or Retired.
+	enter("manifest after the restart".to_owned());
+	let (snapshot, since_restart) = loop {
+		let before = reopened.slab.lsm_publications_for_test();
+		let snapshot = reopened.slab.compaction_manifest_snapshot();
+		if reopened.slab.lsm_publications_for_test().len() == before.len() {
+			break (snapshot, before);
+		}
+		assert!(
+			tokio::time::Instant::now() < polls_end,
+			"no quiet moment to read the manifest and its installs together"
+		);
+		tokio::time::sleep(Duration::from_millis(10)).await;
+	};
+	assert!(
+		snapshot.manifest_epoch >= epoch,
+		"the epoch is not lower: {:?} before the restart, {:?} after",
+		epoch,
+		snapshot.manifest_epoch,
+	);
+	assert!(inputs.iter().all(|input| snapshot.run(*input).is_none()));
+	// What the outputs held is still accounted for: in them, or in the validated successors of
+	// the later installs that took them, before the restart or since.
+	publications.extend(since_restart);
+	for held in outputs_lineage(&outputs, &publications[1..]) {
+		let run = snapshot.run(held);
+		assert!(
+			run.is_some_and(|run| run.state.is_live()
+				|| matches!(run.state, crate::storage::SlabState::Retired { .. })),
+			"{held:?} of the lineage of {outputs:?}: {run:?}"
+		);
+	}
+	enter("query after the restart".to_owned());
+	assert_eq!(
+		all_rows_through_the_query_path(&reopened, &descriptor, as_of).await,
+		expected,
+		"every row, exactly, after a real reopen"
+	);
+	enter("shutdown after the restart".to_owned());
+	shutdown_lease_node(reopened).await;
+}
+
+fn table_write_frame_for_test(meta: &TableWriteRequestMeta, batch: &RecordBatch) -> HrftFrame {
+	let meta_bytes = bytemuck::bytes_of(meta).to_vec();
+	let payload = encode_batch(batch).unwrap();
+	HrftFrame {
+		header: FrameHeader {
+			magic: HRFT_MAGIC,
+			version: 1,
+			msg_type: MsgType::TABLE_WRITE_REQ.0,
+			flags: 0,
+			stream_id: 71,
+			meta_len: meta_bytes.len() as u32,
+			arrow_len: payload.len() as u32,
+			trailing_len: 0,
+		},
+		meta: crate::network::pool::PooledBuf::orphan(meta_bytes),
+		arrow_payload: Some(crate::network::pool::PooledBuf::orphan(payload)),
+		trailing: None,
+	}
+}
+
+/// The request as the wire delivers it, door included: a refusal that clears by itself waits with
+/// the append instead of ending the stream, which a client sees as `early eof`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_table_write_from_the_wire_waits_out_a_retirement_fence() {
+	let (dir, node) = leading_node_for_refusals("dc178-door").await;
+	let descriptor = typed_table_descriptor();
+	let batch = typed_table_batch(vec![7, 8]);
+	let mut meta = typed_table_meta(&descriptor, batch.num_rows());
+	meta.parent_write_id.sequence_no = 59;
+	meta.await_finalization = 1;
+	let slab = SlabId::new(0x7701);
+	node.slab.raise_retirement_fence_for_test(slab);
+	let frame = table_write_frame_for_test(&meta, &batch);
+	let context = RequestContext {
+		remote: Some(node.local_node),
+		actor: actor(ActorRole::Operator, None),
+	};
+	let write = {
+		let server = node.data_server.clone();
+		tokio::spawn(async move {
+			DataRingServer::handle_data_frame(server.as_ref(), context, frame).await
+		})
+	};
+	tokio::time::timeout(Duration::from_secs(30), node.slab.append_refusal_for_test())
+		.await
+		.expect("the fence actually refused it");
+	assert!(!write.is_finished(), "it waits while the fence stands");
+	node.slab.clear_retirement_fence_for_test(slab);
+	let response = tokio::time::timeout(Duration::from_secs(10), write)
+		.await
+		.expect("the fence cleared")
+		.unwrap()
+		.expect("the stream carries an answer")
+		.expect("a response frame");
+	let written: TableWriteResponseMeta =
+		*bytemuck::from_bytes(&response.meta[..std::mem::size_of::<TableWriteResponseMeta>()]);
+	assert_eq!(written.write.status, WriteStatus::OK, "{written:?}");
+	assert_not_fenced(&node, &dir, "waited out at the door").await;
+	shutdown_lease_node(node).await;
+}
+
+/// The door still stops a refusal that does not clear by itself: nothing waits on it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_table_write_door_keeps_refusing_what_does_not_clear() {
+	let (_dir, node) = leading_node_for_refusals("dc178-door-stays").await;
+	let slab = SlabId::new(0x7702);
+	node.slab.raise_retirement_fence_for_test(slab);
+	let operator = actor(ActorRole::Operator, None);
+	assert!(
+		node.data_server
+			.try_admit_table_write_request(&operator, Some(tenant()))
+			.is_ok(),
+		"premise: this one clears by itself, so the door passes it"
+	);
+	node.slab.fence_unresolved_op_for_test();
+	assert!(
+		node.data_server
+			.try_admit_table_write_request(&operator, Some(tenant()))
+			.is_err()
+	);
+	node.slab.clear_retirement_fence_for_test(slab);
+	shutdown_lease_node(node).await;
+}
+
+/// A fence raised after the append's head admitted it, while it checks each row's version: nothing
+/// has happened yet, so this is waited out too, and does not fence the node.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fence_raised_during_the_version_checks_is_waited_out() {
+	let (dir, node) = leading_node_for_refusals("dc182-version-check").await;
+	let descriptor = typed_table_descriptor();
+	let batch = typed_table_batch(vec![7, 8]);
+	let mut meta = typed_table_meta(&descriptor, batch.num_rows());
+	meta.parent_write_id.sequence_no = 60;
+	meta.await_finalization = 1;
+	let slab = SlabId::new(0x7703);
+	let before = node.slab.local_l1_bytes().await;
+	node.slab.fence_at_next_version_check_for_test(slab);
+	let write = {
+		let server = node.data_server.clone();
+		tokio::spawn(async move { server.table_write(meta, batch).await })
+	};
+	tokio::time::timeout(Duration::from_secs(10), node.slab.append_refusal_for_test())
+		.await
+		.expect("the version check refused it with the proof");
+	assert!(!write.is_finished(), "it waits while the fence stands");
+	assert_eq!(
+		node.slab.local_l1_bytes().await,
+		before,
+		"premise: nothing yet"
+	);
+	node.slab.clear_retirement_fence_for_test(slab);
+	let (written, _) = tokio::time::timeout(Duration::from_secs(10), write)
+		.await
+		.expect("the fence cleared")
+		.unwrap()
+		.unwrap();
+	assert_eq!(written.write.status, WriteStatus::OK, "{written:?}");
+	assert_not_fenced(&node, &dir, "waited out at the version check").await;
+	shutdown_lease_node(node).await;
+}
+
+/// The same wait, for the refusal the conservative path used to meet: its first child durable,
+/// its second refused for a moment. The mutation carries on, with nothing left partly applied.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refusal_after_a_durable_child_is_waited_out_when_it_clears() {
+	let (dir, node) = leading_node_for_refusals("dc175-partial").await;
+	let descriptor = typed_table_descriptor();
+	let batch = typed_table_batch(vec![7, 8]);
+	let mut meta = typed_table_meta(&descriptor, batch.num_rows());
+	meta.parent_write_id.sequence_no = 58;
+	meta.await_finalization = 1;
+	let before = node.slab.local_l1_bytes().await;
+	node.slab.refuse_append_after_for_test(1);
+	let write = {
+		let server = node.data_server.clone();
+		tokio::spawn(async move { server.table_write(meta, batch).await })
+	};
+	tokio::time::timeout(Duration::from_secs(30), node.slab.append_refusal_for_test())
+		.await
+		.expect("its second child was actually refused");
+	assert!(
+		node.slab.local_l1_bytes().await > before,
+		"premise: its first child is durable"
+	);
+	assert!(!write.is_finished(), "it waits at its second child");
+	node.slab.clear_append_refusal_for_test();
+	let (written, _) = write.await.unwrap().unwrap();
+	assert_eq!(written.write.status, WriteStatus::OK, "{written:?}");
+	assert_not_fenced(&node, &dir, "second child").await;
+	shutdown_lease_node(node).await;
+}

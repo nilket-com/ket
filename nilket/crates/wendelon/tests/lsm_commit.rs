@@ -8,6 +8,12 @@ use wendelon::storage::{
 	CompactionPlan, DominantReason, LsmRunSummary, SlabState,
 };
 
+/// A fixed ring owner for fixtures without a store, minted the way the control
+/// ring itself decodes one (ADR 0697: only a store mints its own owner).
+fn test_owner() -> wendelon::consensus::OwnerRef {
+	serde_json::from_str(r#"{"node":1,"incarnation":1}"#).unwrap()
+}
+
 fn hlc(ms: u64) -> HybridTimestamp {
 	HybridTimestamp {
 		physical_ms: ms,
@@ -57,6 +63,7 @@ fn compaction_commit_swaps_inputs_for_outputs_at_epoch_boundary() {
 	manifest.insert_live_run(run(2, CompactionLevelIndex::L0));
 	let output = run(10, CompactionLevelIndex::L1);
 	let commit = CompactionCommit {
+		owner: test_owner(),
 		job_id: CompactionJobId::new(42),
 		manifest_epoch_pre: ManifestEpoch::new(10),
 		slabs_to_retire: vec![SlabId::new(1), SlabId::new(2)],
@@ -91,6 +98,7 @@ fn compaction_commit_replay_is_idempotent_after_epoch_advance() {
 	manifest.insert_live_run(run(1, CompactionLevelIndex::L0));
 	manifest.insert_live_run(run(2, CompactionLevelIndex::L0));
 	let commit = CompactionCommit {
+		owner: test_owner(),
 		job_id: CompactionJobId::new(42),
 		manifest_epoch_pre: ManifestEpoch::new(10),
 		slabs_to_retire: vec![SlabId::new(1), SlabId::new(2)],
@@ -122,6 +130,7 @@ fn gc_mark_delete_pending_commit_transitions_retired_runs() {
 	manifest.insert_live_run(run(1, CompactionLevelIndex::L0));
 	manifest.retire_run(SlabId::new(1), vec![SlabId::new(10)]);
 	let commit = CompactionCommit::gc_mark_delete_pending(
+		test_owner(),
 		CompactionJobId::new(70),
 		ManifestEpoch::new(10),
 		vec![SlabId::new(1)],
@@ -148,6 +157,7 @@ fn gc_remove_commit_deletes_delete_pending_runs() {
 	manifest.advance_epoch();
 	manifest.mark_delete_pending(SlabId::new(1));
 	let commit = CompactionCommit::gc_remove(
+		test_owner(),
 		CompactionJobId::new(71),
 		ManifestEpoch::new(11),
 		vec![SlabId::new(1)],
@@ -168,6 +178,7 @@ fn manifest_race_leaves_inputs_live() {
 	let mut manifest = CompactionManifest::new(ManifestEpoch::new(10));
 	manifest.insert_live_run(run(1, CompactionLevelIndex::L0));
 	let commit = CompactionCommit {
+		owner: test_owner(),
 		job_id: CompactionJobId::new(43),
 		manifest_epoch_pre: ManifestEpoch::new(9),
 		slabs_to_retire: vec![SlabId::new(1)],
@@ -191,6 +202,7 @@ fn visible_digest_mismatch_rejects_before_retiring_inputs() {
 	let mut manifest = CompactionManifest::new(ManifestEpoch::new(10));
 	manifest.insert_live_run(run(1, CompactionLevelIndex::L0));
 	let commit = CompactionCommit {
+		owner: test_owner(),
 		job_id: CompactionJobId::new(44),
 		manifest_epoch_pre: ManifestEpoch::new(10),
 		slabs_to_retire: vec![SlabId::new(1)],
@@ -218,6 +230,7 @@ fn stale_or_duplicate_output_id_rejects_as_manifest_race() {
 	manifest.insert_live_run(run(1, CompactionLevelIndex::L0));
 	manifest.insert_live_run(run(10, CompactionLevelIndex::L1));
 	let commit = CompactionCommit {
+		owner: test_owner(),
 		job_id: CompactionJobId::new(45),
 		manifest_epoch_pre: ManifestEpoch::new(10),
 		slabs_to_retire: vec![SlabId::new(1)],
@@ -241,6 +254,7 @@ fn planned_commit_validates_source_target_levels_and_retire_set() {
 	manifest.insert_live_run(run(2, CompactionLevelIndex::L1));
 	let plan = plan();
 	let commit = CompactionCommit {
+		owner: test_owner(),
 		job_id: plan.job_id,
 		manifest_epoch_pre: plan.manifest_epoch_pre,
 		slabs_to_retire: vec![SlabId::new(2), SlabId::new(1)],
@@ -273,6 +287,7 @@ fn planned_commit_rejects_wrong_source_level_before_mutation() {
 	manifest.insert_live_run(run(2, CompactionLevelIndex::L1));
 	let plan = plan();
 	let commit = CompactionCommit {
+		owner: test_owner(),
 		job_id: plan.job_id,
 		manifest_epoch_pre: plan.manifest_epoch_pre,
 		slabs_to_retire: vec![SlabId::new(1), SlabId::new(2)],
@@ -299,6 +314,7 @@ fn planned_commit_rejects_missing_overlap_retirement() {
 	manifest.insert_live_run(run(2, CompactionLevelIndex::L1));
 	let plan = plan();
 	let commit = CompactionCommit {
+		owner: test_owner(),
 		job_id: plan.job_id,
 		manifest_epoch_pre: plan.manifest_epoch_pre,
 		slabs_to_retire: vec![SlabId::new(1)],

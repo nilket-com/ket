@@ -122,23 +122,17 @@ impl WendelonRaftInternalServer {
 		{
 			return;
 		}
-		let pointers = state
-			.tiered_slabs
-			.values()
-			.map(|tier| crate::storage::TieredSlabPointer {
-				slab_id: tier.slab_id,
-				l2_uri: tier.l2_uri.clone(),
-				payload_hash: tier.payload_hash,
-				is_encrypted: tier.is_encrypted,
-				tenant_id: tier.tenant_id,
-				tenant_kek_id: tier.tenant_kek_id,
-				stats_format_version: tier.stats_format_version,
-				stats_block_len: tier.stats_block_len,
-				stats_block_hash128: tier.stats_block_hash128,
-				tombstone_metadata: tier.tombstone_metadata,
-				supersession_metadata: tier.supersession_metadata,
-			})
-			.collect();
+		// ADR 0697: compare only this store's own committed pointers. A view
+		// that is not authoritative for this store leaves replay fenced.
+		let Some(pointers) = slab.own_tier_view(state.tiered_slabs.values(), &state.incarnations)
+		else {
+			tracing::warn!(
+				applied,
+				confirmed,
+				"replacement replay comparison remains fenced: control view is not authoritative for this store"
+			);
+			return;
+		};
 		if let Err(error) = slab
 			.finish_replacement_log_replay(pointers, applied, confirmed)
 			.await

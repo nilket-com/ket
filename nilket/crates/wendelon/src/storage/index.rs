@@ -40,6 +40,9 @@ const TIERED_SLABS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("ti
 const SECONDARY_INDEX_SEGMENTS_TABLE: TableDefinition<&[u8], &[u8]> =
 	TableDefinition::new("secondary_index_segments_v1");
 const LSM_RUNS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("lsm_runs_v1");
+/// A committed Retire this store has yet to apply, because an unresolved install names the slab.
+const DEFERRED_RETIREMENTS_TABLE: TableDefinition<u64, &[u8]> =
+	TableDefinition::new("deferred_retirements_v1");
 const LSM_INSTALL_INTENTS_TABLE: TableDefinition<u64, &[u8]> =
 	TableDefinition::new("lsm_install_intents_v1");
 const META_LSM_INSTALL_INTENTS_INITIALIZED: &str = "lsm_install_intents_initialized_v1";
@@ -222,6 +225,171 @@ pub(crate) enum RetainedObjectIntentState {
 }
 
 /// Record publication of predecessors and the retired object in one transaction.
+/// A published retirement record with a source, and no tier pointer: what open reads as
+/// `retired_tiered_slabs`.
+fn retirement_evidence_stands(
+	tx: &redb::WriteTransaction,
+	slab_id: SlabId,
+) -> std::io::Result<bool> {
+	if tx
+		.open_table(TIERED_SLABS_TABLE)
+		.map_err(redb_to_io)?
+		.get(&slab_id.get())
+		.map_err(redb_to_io)?
+		.is_some()
+	{
+		return Ok(false);
+	}
+	let cleanup = tx
+		.open_table(SNAPSHOT_CLEANUP_INTENTS_TABLE)
+		.map_err(redb_to_io)?;
+	let prefix = slab_id.get().to_be_bytes();
+	for row in cleanup.range(prefix.as_slice()..).map_err(redb_to_io)? {
+		let (key, value) = row.map_err(redb_to_io)?;
+		if !key.value().starts_with(&prefix) {
+			break;
+		}
+		let intent: RetainedObjectIntent = postcard::from_bytes(value.value())
+			.map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+		if intent.state == RetainedObjectIntentState::RetirementPublished
+			&& intent.retirement_source.is_some()
+		{
+			return Ok(true);
+		}
+	}
+	Ok(false)
+}
+
+/// A retirement a log entry has decided, of exactly this generation, held back while an install
+/// that names the slab is unresolved. Its rows, pointer and publication revision stay untouched,
+/// so that install's evidence stays true whichever way it resolves.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct DeferredRetirement {
+	pub pointer: TieredSlabPointer,
+	pub log_index: u64,
+}
+
+/// A retirement's row ends only with a retirement of the generation it names.
+fn clear_deferred_retirement_of(
+	tx: &redb::WriteTransaction,
+	pointer: &TieredSlabPointer,
+) -> std::io::Result<()> {
+	let mut table = tx
+		.open_table(DEFERRED_RETIREMENTS_TABLE)
+		.map_err(redb_to_io)?;
+	let same = table
+		.get(&pointer.slab_id.get())
+		.map_err(redb_to_io)?
+		.map(|value| {
+			postcard::from_bytes::<DeferredRetirement>(value.value())
+				.map_err(|e| Error::new(ErrorKind::InvalidData, e))
+		})
+		.transpose()?
+		.is_some_and(|row| row.pointer.same_object_generation(pointer));
+	if same {
+		table.remove(&pointer.slab_id.get()).map_err(redb_to_io)?;
+	}
+	Ok(())
+}
+
+/// A retry resolves only the intent covered by its authority: an older callback must leave a newer
+/// snapshot or log retirement intact.
+fn retirement_resolves_mark(
+	mark: &SnapshotRetirementMark,
+	last_control_log_index: Option<u64>,
+	retirement_epoch: u64,
+) -> bool {
+	mark.epoch <= retirement_epoch
+		&& match (last_control_log_index, mark.snapshot_index) {
+			(Some(applied), Some(required)) => applied >= required,
+			(_, None) => true,
+			(None, Some(_)) => false,
+		}
+}
+
+/// Remove a run row, keeping the manifest epoch it carried as a floor. Every removal comes here.
+fn remove_lsm_run_row(
+	tx: &redb::WriteTransaction,
+	slab_id: SlabId,
+) -> std::io::Result<Option<LsmRunSummary>> {
+	let mut table = tx.open_table(LSM_RUNS_TABLE).map_err(redb_to_io)?;
+	let removed = table
+		.remove(&slab_id.get())
+		.map_err(redb_to_io)?
+		.map(|value| decode_lsm_run_summary(slab_id, value.value()))
+		.transpose()?;
+	drop(table);
+	if let Some(run) = &removed {
+		raise_lsm_manifest_epoch_floor(tx, run.manifest_epoch)?;
+	}
+	Ok(removed)
+}
+
+/// A reopen recovers the manifest epoch from its run rows and this floor, which only rises.
+fn raise_lsm_manifest_epoch_floor(
+	tx: &redb::WriteTransaction,
+	epoch: crate::schema::ManifestEpoch,
+) -> std::io::Result<()> {
+	let mut meta = tx.open_table(META_TABLE).map_err(redb_to_io)?;
+	let floor = meta
+		.get(META_LSM_MANIFEST_EPOCH_FLOOR)
+		.map_err(redb_to_io)?
+		.map(|value| value.value())
+		.unwrap_or(0);
+	if epoch.get() > floor {
+		meta.insert(META_LSM_MANIFEST_EPOCH_FLOOR, &epoch.get())
+			.map_err(redb_to_io)?;
+	}
+	Ok(())
+}
+
+/// Whether an unresolved install names this slab. Its commit still has to apply to that run, so
+/// the run waits for the install to resolve.
+fn install_intent_names_in<T: redb::ReadableTable<u64, &'static [u8]>>(
+	intents: &T,
+	slab_id: SlabId,
+) -> std::io::Result<bool> {
+	for row in intents.iter().map_err(redb_to_io)? {
+		let (_, value) = row.map_err(redb_to_io)?;
+		let intent: LsmInstallIntent =
+			serde_json::from_slice(value.value()).map_err(Error::other)?;
+		let commit = &intent.commit;
+		if commit.slabs_to_retire.contains(&slab_id)
+			|| commit.slabs_to_add.iter().any(|run| run.slab_id == slab_id)
+		{
+			return Ok(true);
+		}
+	}
+	Ok(false)
+}
+
+/// A tier retirement is this slab's terminal state, so a Live run of it ends with the same
+/// transaction: it has no backing left to compact, and GC has no file to claim. Any other state
+/// means LSM already owns the slab, and keeps its own lifecycle; so does a run an unresolved
+/// install names, until it resolves. True when this leaves no such run.
+fn dispose_retired_live_run(tx: &redb::WriteTransaction, slab_id: SlabId) -> std::io::Result<bool> {
+	if install_intent_names_in(
+		&tx.open_table(LSM_INSTALL_INTENTS_TABLE)
+			.map_err(redb_to_io)?,
+		slab_id,
+	)? {
+		return Ok(false);
+	}
+	let live = {
+		let table = tx.open_table(LSM_RUNS_TABLE).map_err(redb_to_io)?;
+		let run = table
+			.get(&slab_id.get())
+			.map_err(redb_to_io)?
+			.map(|value| decode_lsm_run_summary(slab_id, value.value()))
+			.transpose()?;
+		run.is_some_and(|run| run.state.is_live())
+	};
+	if live {
+		remove_lsm_run_row(tx, slab_id)?;
+	}
+	Ok(true)
+}
+
 fn persist_retirement_records(
 	tx: &redb::WriteTransaction,
 	pointer: &TieredSlabPointer,
@@ -329,6 +497,99 @@ pub(crate) fn delete_maintenance_receipt_table_for_test(path: &Path) {
 	write_txn.commit().unwrap();
 }
 const META_LAST_CONTROL_LOG_INDEX: &str = "last_control_log_index";
+/// The store's incarnation, written once by fresh initialization and never
+/// rewritten. Its absence on open means the store predates slab identity.
+mod op_state;
+pub use op_state::OpTicket;
+pub(crate) use op_state::{
+	AbandonedOutput, GcFileIdentity, LoadedOp, MAX_RESERVED_OUTPUTS_PER_JOB, OpEvidence,
+	OpOwnership, OpProgress, OpProgressUpdate, RejectedClaim, ReservationRefused, ReservedIdState,
+	ReservedOp, TerminalBacklog, is_op_state_invalid,
+};
+#[cfg(test)]
+pub(crate) use op_state::{
+	OpHolderState, OpIntent, OpPhase, OpTxnCut, op_row_bytes_at, op_row_progress_offset,
+	remove_op_state_meta_for_test, set_op_row_bytes_at, set_op_state_version_for_test,
+};
+
+const META_STORE_INCARNATION_HIGH: &str = "store_incarnation_high_v1";
+const META_STORE_INCARNATION_LOW: &str = "store_incarnation_low_v1";
+/// The exclusive bound on every slab id this store has issued. It is
+/// committed before any id below it is used, so reopen never reissues one.
+const META_SLAB_ID_HIGH_WATER: &str = "slab_id_high_water_v1";
+/// The highest manifest epoch of any run row removed. Open reads the manifest epoch back from the
+/// rows, so a removed row must not take the epoch it carried with it.
+const META_LSM_MANIFEST_EPOCH_FLOOR: &str = "lsm_manifest_epoch_floor_v1";
+
+pub(crate) use crate::consensus::StoreIncarnation;
+
+#[derive(Debug)]
+struct StoreIdentityMissing;
+
+impl std::fmt::Display for StoreIdentityMissing {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str(
+			"store identity is missing: the store predates the slab identity format and cannot be opened; re-create it",
+		)
+	}
+}
+
+impl std::error::Error for StoreIdentityMissing {}
+
+fn initializing_index_path(path: &Path) -> PathBuf {
+	let mut name = path.file_name().unwrap_or_default().to_os_string();
+	name.push(".initializing");
+	path.with_file_name(name)
+}
+
+fn store_identity_missing() -> Error {
+	Error::new(ErrorKind::InvalidData, StoreIdentityMissing)
+}
+
+/// An old-format store is refused, never opened in a degraded mode.
+pub(crate) fn is_store_identity_missing(error: &Error) -> bool {
+	error
+		.get_ref()
+		.is_some_and(|cause| cause.is::<StoreIdentityMissing>())
+}
+
+#[cfg(test)]
+pub(crate) fn remove_store_identity_for_test(path: &Path) {
+	let db = Database::create(path).unwrap();
+	let write_txn = db.begin_write().unwrap();
+	{
+		let mut meta = write_txn.open_table(META_TABLE).unwrap();
+		meta.remove(META_STORE_INCARNATION_HIGH).unwrap();
+		meta.remove(META_STORE_INCARNATION_LOW).unwrap();
+	}
+	write_txn.commit().unwrap();
+}
+
+/// Test seam: an intent row that cannot be decoded, so the index and its H
+/// open but the snapshot does not load.
+#[cfg(test)]
+pub(crate) fn insert_undecodable_lsm_intent_for_test(path: &Path) {
+	let db = Database::create(path).unwrap();
+	let write_txn = db.begin_write().unwrap();
+	{
+		let mut intents = write_txn.open_table(LSM_INSTALL_INTENTS_TABLE).unwrap();
+		intents
+			.insert(u64::MAX, b"not-an-intent".as_slice())
+			.unwrap();
+	}
+	write_txn.commit().unwrap();
+}
+
+#[cfg(test)]
+pub(crate) fn overwrite_slab_id_high_water_for_test(path: &Path, bound: u64) {
+	let db = Database::create(path).unwrap();
+	let write_txn = db.begin_write().unwrap();
+	{
+		let mut meta = write_txn.open_table(META_TABLE).unwrap();
+		meta.insert(META_SLAB_ID_HIGH_WATER, &bound).unwrap();
+	}
+	write_txn.commit().unwrap();
+}
 /// ADR 0097 decision 4: set once, when the receipt table is first created.
 ///
 /// Its whole purpose is to tell "this store has never had receipts" apart from
@@ -449,6 +710,9 @@ pub(crate) struct LsmInstallIntent {
 	pub phase: LsmInstallPhase,
 	pub commit: crate::storage::lsm::CompactionCommit,
 	pub commit_digest: [u8; 32],
+	/// The operations this intent's work belongs to, linked in the transaction
+	/// that allocated them (ADR 0697).
+	pub ops: Vec<crate::consensus::slab_ops::OpKey>,
 	pub inputs: Vec<LsmInputAuthority>,
 	pub local_input_rows_digest: [u8; 32],
 	pub local_output_rows_digest: [u8; 32],
@@ -467,8 +731,32 @@ pub(crate) struct LsmFileIdentity {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct LsmInputAuthority {
 	pub slab_id: SlabId,
+	/// Counts publications in one open of this store, and restarts at the next:
+	/// meaningful only beside the `opened` it was read under.
 	pub revision: u64,
 	pub tiered: Option<TieredSlabPointer>,
+	/// Which open of this store read `revision`.
+	pub opened: u64,
+}
+
+impl LsmInputAuthority {
+	/// Whether this slab is unchanged since `recorded`. Within one open, exactly. A
+	/// reopen lost the revisions before it, so what can be compared is the durable
+	/// tier evidence, and no publication may have happened in this open.
+	pub(crate) fn unchanged_since(&self, recorded: &Self) -> bool {
+		if self.opened == recorded.opened {
+			return self == recorded;
+		}
+		self.slab_id == recorded.slab_id && self.tiered == recorded.tiered && self.revision == 0
+	}
+
+	pub(crate) fn all_unchanged_since(current: &[Self], recorded: &[Self]) -> bool {
+		current.len() == recorded.len()
+			&& current
+				.iter()
+				.zip(recorded)
+				.all(|(current, recorded)| current.unchanged_since(recorded))
+	}
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -485,6 +773,7 @@ pub(crate) struct PersistentIndexSnapshot {
 	pub record_localities: Vec<(TenantId, Identity, Locality)>,
 	pub secondary_index_segments: Vec<PersistentSecondaryIndexSegmentRow>,
 	pub lsm_runs: Vec<LsmRunSummary>,
+	pub lsm_manifest_epoch_floor: crate::schema::ManifestEpoch,
 	pub lsm_install_intents: Vec<LsmInstallIntent>,
 	pub last_control_log_index: Option<u64>,
 }
@@ -504,6 +793,14 @@ pub(crate) struct PersistentIndexUpdate {
 	pub delete_secondary_index_segments: Vec<PersistentSecondaryIndexSegmentKey>,
 	pub put_lsm_runs: Vec<LsmRunSummary>,
 	pub delete_lsm_run_ids: Vec<SlabId>,
+	/// A manifest epoch no run row carries, which a reopen must still recover.
+	pub raise_lsm_manifest_epoch_floor: Option<crate::schema::ManifestEpoch>,
+	/// One step of an operation's local progress, durable with this update.
+	pub op_progress: Option<op_state::OpProgressUpdate>,
+	/// The linked LSM intent whose local work this update finishes.
+	pub complete_lsm_intent: Option<LsmInstallIntent>,
+	/// Reservations this publication makes live slabs: their rows end here.
+	pub promote_reservations: Vec<SlabId>,
 	pub last_control_log_index: Option<u64>,
 	/// A budget charge for the memory this update holds (ADR 0692 §7: the
 	/// row copies of a tier publication). It moves with the update into the
@@ -528,12 +825,33 @@ impl std::fmt::Debug for RetainedCharge {
 pub(crate) struct PersistentLocalIndex {
 	db: crate::storage::owned_redb::OwnedRedb,
 	write_lock: Mutex<()>,
+	/// Sequences a live workflow holds (`op_state::OpOwnership`).
+	live_ops: std::sync::Arc<dashmap::DashSet<u64>>,
+	/// Distinguishes this open of the store from any other, for `LsmInputAuthority`.
+	open_nonce: u64,
+	#[cfg(test)]
+	#[allow(clippy::type_complexity)]
+	op_after_commit_hold:
+		std::sync::Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+	#[cfg(test)]
+	op_txn_cut: std::sync::Mutex<Option<op_state::OpTxnCut>>,
+	#[cfg(test)]
+	op_txn_cut_skip: std::sync::Mutex<Option<(u32, op_state::OpTxnCut)>>,
+	/// A cut for the next publication of runs, which an install with no outputs is: it
+	/// carries no reservations and no progress for a cut on an operation's own step to find.
+	#[cfg(test)]
+	run_publication_cut: std::sync::Mutex<Option<op_state::OpTxnCut>>,
+	#[cfg(test)]
+	#[allow(clippy::type_complexity)]
+	op_handoff_hold:
+		std::sync::Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
 	/// ADR 0097: false when this store previously held receipts and the table is
 	/// now gone - lost history, not empty history.
 	receipts_available: bool,
 	/// False for the lifetime of this handle if initialized cleanup history is missing.
 	cleanup_available: bool,
 	persisted_cleanup_gaps: std::sync::Arc<CleanupGapContribution>,
+	incarnation: StoreIncarnation,
 	/// Test seam: make the next receipt mutations fail, so the policy's
 	/// fail-closed paths can be exercised against a real store.
 	#[cfg(test)]
@@ -572,6 +890,8 @@ pub(crate) struct PersistentLocalIndex {
 			std::sync::Arc<std::sync::Barrier>,
 		)>,
 	>,
+	#[cfg(test)]
+	pub(crate) fail_next_snapshot_retirement: std::sync::atomic::AtomicBool,
 	#[cfg(test)]
 	pub(crate) retirement_commit_hold: std::sync::Mutex<
 		Option<(
@@ -800,7 +1120,7 @@ impl PersistentLocalIndex {
 		let path = path.into();
 		let mut delay = std::time::Duration::from_millis(200);
 		loop {
-			match Self::open_index(path.clone(), owner.clone(), false).await {
+			match Self::open_index(path.clone(), owner.clone(), None).await {
 				Err(error)
 					if error
 						.get_ref()
@@ -826,18 +1146,32 @@ impl PersistentLocalIndex {
 		self.db.test_handle()
 	}
 
+	#[cfg(test)]
 	pub(crate) async fn initialize_new(
 		path: impl Into<PathBuf>,
 		owner: Option<DataDirectoryOwner>,
 	) -> std::io::Result<Self> {
-		Self::open_index(path, owner, true).await
+		Self::initialize_new_with_high_water(path, owner, 0).await
+	}
+
+	/// Create the index with its identity and an initial slab id high-water
+	/// in one transaction. The file is built under a temporary name and
+	/// linked into place only after that commit, so a crash leaves either no
+	/// index or a complete one.
+	pub(crate) async fn initialize_new_with_high_water(
+		path: impl Into<PathBuf>,
+		owner: Option<DataDirectoryOwner>,
+		initial_high_water: u64,
+	) -> std::io::Result<Self> {
+		Self::open_index(path, owner, Some(initial_high_water)).await
 	}
 
 	async fn open_index(
 		path: impl Into<PathBuf>,
 		owner: Option<DataDirectoryOwner>,
-		initialize_new: bool,
+		initial_high_water: Option<u64>,
 	) -> std::io::Result<Self> {
+		let initialize_new = initial_high_water.is_some();
 		let path = path.into();
 		if let Some(owner) = &owner {
 			owner.ensure_contains(&path)?;
@@ -847,14 +1181,28 @@ impl PersistentLocalIndex {
 		// closure, while the permit still holds the owner open.
 		let bind_owner = owner.clone();
 		let opened = spawn_blocking_owned_io(owner, move || {
+			let staging = initializing_index_path(&path);
 			let db = if initialize_new {
-				// O_EXCL makes an explicit fresh initialization incapable of opening
-				// or replacing an unexpected existing authority file.
+				// An explicit fresh initialization can never open or replace an
+				// existing authority file: it is built under a staging name and
+				// linked into place without clobbering (below). A staging file
+				// left by a crash was never linked, so it is not authority.
+				if path.exists() {
+					return Err(Error::new(
+						ErrorKind::AlreadyExists,
+						format!("storage index already exists: {}", path.display()),
+					));
+				}
+				match std::fs::remove_file(&staging) {
+					Ok(()) => {}
+					Err(error) if error.kind() == ErrorKind::NotFound => {}
+					Err(error) => return Err(error),
+				}
 				let file = std::fs::OpenOptions::new()
 					.read(true)
 					.write(true)
 					.create_new(true)
-					.open(&path)?;
+					.open(&staging)?;
 				Database::builder().create_file(file).map_err(redb_to_io)?
 			} else {
 				Database::open(&path).map_err(|error| match error {
@@ -880,6 +1228,9 @@ impl PersistentLocalIndex {
 			}
 			{
 				let _table = write_txn.open_table(LSM_RUNS_TABLE).map_err(redb_to_io)?;
+				let _table = write_txn
+					.open_table(DEFERRED_RETIREMENTS_TABLE)
+					.map_err(redb_to_io)?;
 			}
 			{
 				let _table = write_txn.open_table(META_TABLE).map_err(redb_to_io)?;
@@ -1066,7 +1417,59 @@ impl PersistentLocalIndex {
 					.is_some();
 				missing
 			};
+			let incarnation = {
+				let mut meta = write_txn.open_table(META_TABLE).map_err(redb_to_io)?;
+				if initialize_new {
+					let incarnation = StoreIncarnation::fresh();
+					meta.insert(
+						META_STORE_INCARNATION_HIGH,
+						&((incarnation.get() >> 64) as u64),
+					)
+					.map_err(redb_to_io)?;
+					meta.insert(META_STORE_INCARNATION_LOW, &(incarnation.get() as u64))
+						.map_err(redb_to_io)?;
+					meta.insert(
+						META_SLAB_ID_HIGH_WATER,
+						&initial_high_water.unwrap_or_default(),
+					)
+					.map_err(redb_to_io)?;
+					incarnation
+				} else {
+					let read = |key| {
+						meta.get(key)
+							.map_err(redb_to_io)
+							.map(|value| value.map(|value| value.value()))
+					};
+					let (Some(high), Some(low), Some(_)) = (
+						read(META_STORE_INCARNATION_HIGH)?,
+						read(META_STORE_INCARNATION_LOW)?,
+						read(META_SLAB_ID_HIGH_WATER)?,
+					) else {
+						return Err(store_identity_missing());
+					};
+					let incarnation =
+						StoreIncarnation::from_raw((u128::from(high) << 64) | u128::from(low));
+					if incarnation.get() == 0 {
+						return Err(store_identity_missing());
+					}
+					incarnation
+				}
+			};
+			if initialize_new {
+				op_state::initialize_op_state(&write_txn)?;
+			} else {
+				op_state::validate_op_state(&write_txn)?;
+			}
 			write_txn.commit().map_err(redb_to_io)?;
+			if initialize_new {
+				// hard_link refuses an existing target, so this never replaces
+				// an index that appeared meanwhile.
+				std::fs::hard_link(&staging, &path)?;
+				std::fs::remove_file(&staging)?;
+				if let Some(parent) = path.parent() {
+					std::fs::File::open(parent)?.sync_all()?;
+				}
+			}
 			let db = crate::storage::owned_redb::OwnedRedb::new(db, "storage index");
 			if let Some(owner) = bind_owner {
 				db.bind_owner(owner)?;
@@ -1077,10 +1480,11 @@ impl PersistentLocalIndex {
 				cleanup_ok,
 				initial_gaps,
 				history_incomplete,
+				incarnation,
 			))
 		})
 		.await?;
-		let (db, receipts_ok, cleanup_ok, initial_gaps, history_incomplete) = opened;
+		let (db, receipts_ok, cleanup_ok, initial_gaps, history_incomplete, incarnation) = opened;
 		if history_incomplete {
 			crate::metrics::global()
 				.storage_cleanup_history_incomplete
@@ -1092,12 +1496,25 @@ impl PersistentLocalIndex {
 		Ok(Self {
 			db,
 			write_lock: Mutex::new(()),
+			live_ops: std::sync::Arc::new(dashmap::DashSet::new()),
+			open_nonce: rand::random::<u64>(),
+			#[cfg(test)]
+			op_after_commit_hold: std::sync::Mutex::new(None),
+			#[cfg(test)]
+			op_txn_cut: std::sync::Mutex::new(None),
+			#[cfg(test)]
+			op_txn_cut_skip: std::sync::Mutex::new(None),
+			#[cfg(test)]
+			run_publication_cut: std::sync::Mutex::new(None),
+			#[cfg(test)]
+			op_handoff_hold: std::sync::Mutex::new(None),
 			receipts_available: receipts_ok,
 			cleanup_available: cleanup_ok,
 			persisted_cleanup_gaps: std::sync::Arc::new(CleanupGapContribution {
 				count: std::sync::atomic::AtomicU64::new(initial_gaps),
 				history_incomplete,
 			}),
+			incarnation,
 			#[cfg(test)]
 			fail_receipt_mutations: Default::default(),
 			#[cfg(test)]
@@ -1116,6 +1533,8 @@ impl PersistentLocalIndex {
 			guarded_delta_before_commit_hold: Default::default(),
 			#[cfg(test)]
 			guarded_delta_commit_hold: Default::default(),
+			#[cfg(test)]
+			fail_next_snapshot_retirement: std::sync::atomic::AtomicBool::new(false),
 			#[cfg(test)]
 			retirement_commit_hold: std::sync::Mutex::new(None),
 		})
@@ -1275,6 +1694,13 @@ impl PersistentLocalIndex {
 					.get(META_LAST_CONTROL_LOG_INDEX)
 					.map_err(redb_to_io)?
 					.map(|value| value.value());
+				let lsm_manifest_epoch_floor = crate::schema::ManifestEpoch::new(
+					meta_table
+						.get(META_LSM_MANIFEST_EPOCH_FLOOR)
+						.map_err(redb_to_io)?
+						.map(|value| value.value())
+						.unwrap_or(0),
+				);
 
 				Ok(PersistentIndexSnapshot {
 					record_rows,
@@ -1284,6 +1710,7 @@ impl PersistentLocalIndex {
 					record_localities,
 					secondary_index_segments,
 					lsm_runs,
+					lsm_manifest_epoch_floor,
 					lsm_install_intents,
 					last_control_log_index,
 				})
@@ -1615,6 +2042,15 @@ impl PersistentLocalIndex {
 		let before_commit_hold = self.guarded_delta_before_commit_hold.lock().unwrap().take();
 		#[cfg(test)]
 		let before_rows_hold = self.guarded_delta_before_rows_hold.lock().unwrap().take();
+		#[cfg(test)]
+		let progress_cut = (update.op_progress.is_some() || !update.promote_reservations.is_empty())
+			.then(|| self.take_op_txn_cut())
+			.flatten()
+			.or_else(|| {
+				(!update.put_lsm_runs.is_empty())
+					.then(|| self.run_publication_cut.lock().unwrap().take())
+					.flatten()
+			});
 		self.db
 			.run(move |db| {
 				let _publication = publication;
@@ -1705,10 +2141,20 @@ impl PersistentLocalIndex {
 					}
 				}
 				{
-					let mut table = write_txn.open_table(LSM_RUNS_TABLE).map_err(redb_to_io)?;
-					for slab_id in update.delete_lsm_run_ids {
-						let _ = table.remove(&slab_id.get()).map_err(redb_to_io)?;
+					if let Some(progress) = &update.op_progress {
+						op_state::apply_op_progress(&write_txn, progress)?;
 					}
+					if let Some(intent) = &update.complete_lsm_intent {
+						op_state::complete_linked_lsm_intent(&write_txn, intent)?;
+					}
+					op_state::promote_reservations(&write_txn, &update.promote_reservations)?;
+					for slab_id in update.delete_lsm_run_ids {
+						remove_lsm_run_row(&write_txn, slab_id)?;
+					}
+					if let Some(epoch) = update.raise_lsm_manifest_epoch_floor {
+						raise_lsm_manifest_epoch_floor(&write_txn, epoch)?;
+					}
+					let mut table = write_txn.open_table(LSM_RUNS_TABLE).map_err(redb_to_io)?;
 					for run in update.put_lsm_runs {
 						let value = encode_lsm_run_summary(&run)?;
 						table
@@ -1763,7 +2209,15 @@ impl PersistentLocalIndex {
 					release.wait();
 					if fail { return Err(Error::other("injected delta failure before commit")); }
 				}
+				#[cfg(test)]
+				if progress_cut == Some(op_state::OpTxnCut::BeforeCommit) {
+					return Err(Error::other("injected fault before a progress commit"));
+				}
 				write_txn.commit().map_err(redb_to_io)?;
+				#[cfg(test)]
+				if progress_cut == Some(op_state::OpTxnCut::AfterCommit) {
+					return Err(Error::other("injected loss of a progress commit's result"));
+				}
 				publish_metadata_degradation_counts(degradation_counts);
 				let gap_count = missing_cleanup_supersessions.len() as u64;
 				persisted_cleanup_gaps.count.fetch_add(gap_count, std::sync::atomic::Ordering::Relaxed);
@@ -1783,6 +2237,233 @@ impl PersistentLocalIndex {
 	}
 
 	/// Remove one slab and its pointer in one checked transaction.
+	/// Hold a decided retirement back, durably, before its local step is acknowledged. The pointer
+	/// must still be this generation: a retirement of any other has nothing to wait for here.
+	pub(crate) async fn defer_retirement(
+		&self,
+		deferred: DeferredRetirement,
+		gate: std::sync::Arc<tokio::sync::OwnedRwLockReadGuard<()>>,
+	) -> std::io::Result<()> {
+		let _guard = self.write_lock.lock().await;
+		self.db
+			.run(move |db| {
+				let _gate = gate;
+				let txn = db.begin_write().map_err(redb_to_io)?;
+				let slab_id = deferred.pointer.slab_id;
+				let same_generation = txn
+					.open_table(TIERED_SLABS_TABLE)
+					.map_err(redb_to_io)?
+					.get(&slab_id.get())
+					.map_err(redb_to_io)?
+					.map(|value| decode_tiered_pointer(slab_id, value.value()))
+					.transpose()?
+					.is_some_and(|pointer| pointer.same_object_generation(&deferred.pointer));
+				if !same_generation {
+					return Err(Error::new(
+						ErrorKind::WouldBlock,
+						"tier pointer changed before its retirement was deferred",
+					));
+				}
+				let bytes = postcard::to_stdvec(&deferred)
+					.map_err(|error| Error::new(ErrorKind::InvalidData, error))?;
+				txn.open_table(DEFERRED_RETIREMENTS_TABLE)
+					.map_err(redb_to_io)?
+					.insert(&slab_id.get(), bytes.as_slice())
+					.map_err(redb_to_io)?;
+				txn.commit().map_err(redb_to_io)
+			})
+			.await
+	}
+
+	/// Whether this exact held retirement is still to apply: its row as read, and a pointer of its
+	/// generation. Anything else keeps the obligation and its fence. Every retirement that takes
+	/// effect clears a row of its own generation in the same transaction, and nothing durable can
+	/// prove after the fact that some other route retired exactly this generation.
+	pub(crate) async fn deferred_retirement_is_owed(
+		&self,
+		row: DeferredRetirement,
+	) -> std::io::Result<bool> {
+		self.db
+			.run(move |db| {
+				let txn = db.begin_read().map_err(redb_to_io)?;
+				let slab_id = row.pointer.slab_id;
+				let saved = txn
+					.open_table(DEFERRED_RETIREMENTS_TABLE)
+					.map_err(redb_to_io)?
+					.get(&slab_id.get())
+					.map_err(redb_to_io)?
+					.map(|value| {
+						postcard::from_bytes::<DeferredRetirement>(value.value())
+							.map_err(|e| Error::new(ErrorKind::InvalidData, e))
+					})
+					.transpose()?;
+				if saved.as_ref() != Some(&row) {
+					return Ok(false);
+				}
+				let pointer = txn
+					.open_table(TIERED_SLABS_TABLE)
+					.map_err(redb_to_io)?
+					.get(&slab_id.get())
+					.map_err(redb_to_io)?
+					.map(|value| decode_tiered_pointer(slab_id, value.value()))
+					.transpose()?;
+				Ok(pointer.is_some_and(|pointer| pointer.same_object_generation(&row.pointer)))
+			})
+			.await
+	}
+
+	/// Whether a durable snapshot mark of this generation stands that a retirement with this
+	/// authority would not resolve. Deleting the pointer then would strand the mark, and its fence,
+	/// for good: the mark's own retry must take it instead.
+	pub(crate) async fn outstanding_mark_blocks_retirement(
+		&self,
+		pointer: TieredSlabPointer,
+		last_control_log_index: Option<u64>,
+		retirement_epoch: u64,
+	) -> std::io::Result<bool> {
+		self.db
+			.run(move |db| {
+				let tx = db.begin_read().map_err(redb_to_io)?;
+				let marks = tx
+					.open_table(SNAPSHOT_RETIREMENTS_TABLE)
+					.map_err(redb_to_io)?;
+				let mark = marks
+					.get(&pointer.slab_id.get())
+					.map_err(redb_to_io)?
+					.map(|v| {
+						postcard::from_bytes::<SnapshotRetirementMark>(v.value())
+							.map_err(|e| Error::new(ErrorKind::InvalidData, e))
+					})
+					.transpose()?;
+				Ok(mark.is_some_and(|mark| {
+					pointer.same_object_generation(&mark.pointer)
+						&& !retirement_resolves_mark(
+							&mark,
+							last_control_log_index,
+							retirement_epoch,
+						)
+				}))
+			})
+			.await
+	}
+
+	pub(crate) async fn load_deferred_retirements(
+		&self,
+	) -> std::io::Result<Vec<DeferredRetirement>> {
+		self.db
+			.run(move |db| {
+				let tx = db.begin_read().map_err(redb_to_io)?;
+				let table = tx
+					.open_table(DEFERRED_RETIREMENTS_TABLE)
+					.map_err(redb_to_io)?;
+				let mut rows = Vec::new();
+				for row in table.iter().map_err(redb_to_io)? {
+					let (key, value) = row.map_err(redb_to_io)?;
+					let deferred: DeferredRetirement = postcard::from_bytes(value.value())
+						.map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+					if deferred.pointer.slab_id.get() != key.value() {
+						return Err(Error::new(
+							ErrorKind::InvalidData,
+							"deferred retirement key mismatch",
+						));
+					}
+					rows.push(deferred);
+				}
+				Ok(rows)
+			})
+			.await
+	}
+
+	/// A Live run left by a retirement from before retirements disposed of their run. Only exact
+	/// evidence authorizes this: a published retirement record with a source and no tier pointer,
+	/// never a missing file. True when that evidence stands, so memory may follow.
+	pub(crate) async fn dispose_retirement_remnant(
+		&self,
+		slab_id: SlabId,
+		gate: std::sync::Arc<tokio::sync::OwnedRwLockReadGuard<()>>,
+	) -> std::io::Result<bool> {
+		if !self.cleanup_available {
+			return Ok(false);
+		}
+		let _guard = self.write_lock.lock().await;
+		self.db
+			.run(move |db| {
+				let _gate = gate;
+				let txn = db.begin_write().map_err(redb_to_io)?;
+				if !retirement_evidence_stands(&txn, slab_id)? {
+					return Ok(false);
+				}
+				let disposed = dispose_retired_live_run(&txn, slab_id)?;
+				txn.commit().map_err(redb_to_io)?;
+				Ok(disposed)
+			})
+			.await
+	}
+
+	/// The record a retirement writes, on its own.
+	#[cfg(test)]
+	pub(crate) async fn record_retirement_for_test(
+		&self,
+		pointer: TieredSlabPointer,
+		index: u64,
+	) -> std::io::Result<()> {
+		let _guard = self.write_lock.lock().await;
+		self.db
+			.run(move |db| {
+				let txn = db.begin_write().map_err(redb_to_io)?;
+				persist_retirement_records(
+					&txn,
+					&pointer,
+					None,
+					Vec::new(),
+					RetirementSource::Log(index),
+				)?;
+				txn.commit().map_err(redb_to_io)
+			})
+			.await
+	}
+
+	/// Whether an unresolved install names this slab, as the disposal in a retirement reads it.
+	pub(crate) async fn install_intent_names(&self, slab_id: SlabId) -> std::io::Result<bool> {
+		self.db
+			.run(move |db| {
+				let read = db.begin_read().map_err(redb_to_io)?;
+				install_intent_names_in(
+					&read
+						.open_table(LSM_INSTALL_INTENTS_TABLE)
+						.map_err(redb_to_io)?,
+					slab_id,
+				)
+			})
+			.await
+	}
+
+	/// The open-time form of `dispose_retirement_remnant`: all of them, in one transaction.
+	pub(crate) async fn dispose_retirement_remnants(
+		&self,
+		slabs: Vec<SlabId>,
+	) -> std::io::Result<Vec<SlabId>> {
+		if !self.cleanup_available || slabs.is_empty() {
+			return Ok(Vec::new());
+		}
+		let _guard = self.write_lock.lock().await;
+		self.db
+			.run(move |db| {
+				let txn = db.begin_write().map_err(redb_to_io)?;
+				let mut disposed = Vec::new();
+				for slab_id in slabs {
+					if retirement_evidence_stands(&txn, slab_id)?
+						&& dispose_retired_live_run(&txn, slab_id)?
+					{
+						disposed.push(slab_id);
+					}
+				}
+				txn.commit().map_err(redb_to_io)?;
+				Ok(disposed)
+			})
+			.await
+	}
+
 	pub(crate) async fn retire_tiered_slab_checked(
 		&self,
 		slab_id: SlabId,
@@ -1850,6 +2531,10 @@ impl PersistentLocalIndex {
 						records.remove(key.as_slice()).map_err(redb_to_io)?;
 					}
 				}
+				dispose_retired_live_run(&txn, slab_id)?;
+				if let Some(pointer) = &expected {
+					clear_deferred_retirement_of(&txn, pointer)?;
+				}
 				if let Some(index) = last_control_log_index {
 					let mut meta = txn.open_table(META_TABLE).map_err(redb_to_io)?;
 					let current = meta
@@ -1873,12 +2558,7 @@ impl PersistentLocalIndex {
 						expected
 							.as_ref()
 							.is_some_and(|pointer| pointer.same_object_generation(&mark.pointer))
-							&& mark.epoch <= retirement_epoch
-							&& match (last_control_log_index, mark.snapshot_index) {
-								(Some(applied), Some(required)) => applied >= required,
-								(_, None) => true,
-								(None, Some(_)) => false,
-							}
+							&& retirement_resolves_mark(mark, last_control_log_index, retirement_epoch)
 					});
 					if resolved.is_some() { marks.remove(&slab_id.get()).map_err(redb_to_io)?; }
 					resolved
@@ -1940,6 +2620,57 @@ impl PersistentLocalIndex {
 				{
 					let _table = tx
 						.open_table(SNAPSHOT_CLEANUP_INTENTS_TABLE)
+						.map_err(redb_to_io)?;
+				}
+				tx.commit().map_err(redb_to_io)
+			})
+			.await
+	}
+
+	pub(crate) fn store_incarnation(&self) -> StoreIncarnation {
+		self.incarnation
+	}
+
+	/// The committed exclusive bound on issued slab ids.
+	pub(crate) async fn slab_id_high_water(&self) -> std::io::Result<u64> {
+		self.db
+			.run(move |db| {
+				let tx = db.begin_read().map_err(redb_to_io)?;
+				let meta = tx.open_table(META_TABLE).map_err(redb_to_io)?;
+				meta.get(META_SLAB_ID_HIGH_WATER)
+					.map_err(redb_to_io)?
+					.map(|value| value.value())
+					.ok_or_else(store_identity_missing)
+			})
+			.await
+	}
+
+	/// Commit a raised slab id bound. It returns only after the commit is
+	/// durable; a failure exposes no id above the previous bound.
+	/// Which open of this store this is.
+	pub(crate) fn open_nonce(&self) -> u64 {
+		self.open_nonce
+	}
+
+	pub(crate) async fn persist_slab_id_high_water(&self, bound: u64) -> std::io::Result<()> {
+		let _guard = self.write_lock.lock().await;
+		self.db
+			.run(move |db| {
+				let tx = db.begin_write().map_err(redb_to_io)?;
+				{
+					let mut meta = tx.open_table(META_TABLE).map_err(redb_to_io)?;
+					let current = meta
+						.get(META_SLAB_ID_HIGH_WATER)
+						.map_err(redb_to_io)?
+						.map(|value| value.value())
+						.ok_or_else(store_identity_missing)?;
+					if bound < current {
+						return Err(Error::new(
+							ErrorKind::InvalidInput,
+							format!("slab id high-water only rises: {bound} < {current}"),
+						));
+					}
+					meta.insert(META_SLAB_ID_HIGH_WATER, &bound)
 						.map_err(redb_to_io)?;
 				}
 				tx.commit().map_err(redb_to_io)
@@ -2454,6 +3185,13 @@ impl PersistentLocalIndex {
 			Vec<(String, RetainedObjectIntent)>,
 		)>,
 	> {
+		#[cfg(test)]
+		if self
+			.fail_next_snapshot_retirement
+			.swap(false, std::sync::atomic::Ordering::AcqRel)
+		{
+			return Err(Error::other("injected snapshot retirement failure"));
+		}
 		let _guard = self.write_lock.lock().await;
 		let cleanup_available = self.cleanup_available;
 		let gap_contribution = self.persisted_cleanup_gaps.clone();
@@ -2490,6 +3228,8 @@ impl PersistentLocalIndex {
 				}
 				for key in keys { records.remove(key.as_slice()).map_err(redb_to_io)?; }
 			}
+			dispose_retired_live_run(&tx, mark.pointer.slab_id)?;
+			clear_deferred_retirement_of(&tx, &mark.pointer)?;
 			let (retained, applied_evidence) = if cleanup_available {
 				let retirement_index = mark.snapshot_index.ok_or_else(|| Error::new(ErrorKind::WouldBlock, "snapshot retirement lacks an authority index"))?;
 				let (record, evidence) = persist_retirement_records(&tx, &mark.pointer, known_bytes, evidence, RetirementSource::Snapshot(retirement_index))?;
@@ -4683,6 +5423,7 @@ mod tests {
 			.await
 			.unwrap();
 		let commit = crate::storage::lsm::CompactionCommit::gc_remove(
+			crate::consensus::OwnerRef::for_test(1, 1),
 			crate::schema::CompactionJobId::new(5),
 			ManifestEpoch::new(3),
 			vec![SlabId::new(51)],
@@ -4698,9 +5439,11 @@ mod tests {
 			local_output_files: Vec::new(),
 			commit,
 			commit_digest,
+			ops: Vec::new(),
 			inputs: vec![LsmInputAuthority {
 				slab_id: SlabId::new(51),
 				revision: 7,
+				opened: 0,
 				tiered: None,
 			}],
 		};
@@ -5145,6 +5888,7 @@ mod tests {
 			.await
 			.unwrap();
 		let commit = crate::storage::lsm::CompactionCommit::gc_remove(
+			crate::consensus::OwnerRef::for_test(1, 1),
 			crate::schema::CompactionJobId::new(55),
 			ManifestEpoch::new(3),
 			vec![SlabId::new(51)],
@@ -5153,6 +5897,7 @@ mod tests {
 			kind: LsmInstallKind::Local,
 			phase: LsmInstallPhase::Prepared,
 			commit_digest: *blake3::hash(&serde_json::to_vec(&commit).unwrap()).as_bytes(),
+			ops: Vec::new(),
 			commit,
 			inputs: Vec::new(),
 			local_input_rows_digest: [0; 32],

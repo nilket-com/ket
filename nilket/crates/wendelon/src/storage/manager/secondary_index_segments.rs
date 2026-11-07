@@ -319,6 +319,7 @@ impl SlabManager {
 			let sealed_id = sealed.slab_id();
 			let sealed_size = sealed.write_cursor();
 			let next_id = state.next_slab_id;
+			let next_end = self.cover_slab_ids_through(&mut state, next_id).await?;
 			let next = Arc::new(
 				LocalSlabStore::open(
 					&slab_path(&self.config.dir, next_id),
@@ -330,7 +331,7 @@ impl SlabManager {
 			);
 			state.active = next;
 			state.install_sealed(&self.tier_budget, sealed_id, sealed);
-			state.advance_slab_allocator(next_id.saturating_add(1));
+			state.advance_slab_allocator(next_end)?;
 			self.record_l0_compaction_run(sealed_id, sealed_size);
 			sealed_id
 		};
@@ -1578,20 +1579,32 @@ impl SlabManager {
 		plaintext: &[u8],
 	) -> std::io::Result<BTreeSet<(TenantId, TableObjectId)>> {
 		let mut table_ids = BTreeSet::new();
-		for recovered in recover_slab_entries_from_blob_skipping_counters(
-			plaintext,
-			source_slab_id,
-			&self.acknowledged_offsets_in_slab(source_slab_id),
-		)? {
-			if !recovered.is_arrow_frame {
+		for recovered_frame in crate::storage::core::recovered_frames(
+			&recover_slab_entries_from_blob_skipping_counters(
+				plaintext,
+				source_slab_id,
+				&self.acknowledged_offsets_in_slab(source_slab_id),
+			)?,
+		) {
+			if !recovered_frame
+				.entries()
+				.iter()
+				.any(|entry| entry.is_arrow_frame)
+			{
 				continue;
 			}
-			let frame = extract_record_from_blob(plaintext, recovered.location)?;
+			let frame = extract_record_from_blob(plaintext, recovered_frame.location())?;
 			let storage_batch = decode_record_batch(&frame)?;
-			if let Some(table_object_id) =
-				storage_row_table_object_id_at(&storage_batch, recovered.location.record_row_index)?
-			{
-				table_ids.insert((recovered.tenant_id, table_object_id));
+			for recovered in recovered_frame.entries() {
+				if !recovered.is_arrow_frame {
+					continue;
+				}
+				if let Some(table_object_id) = storage_row_table_object_id_at(
+					&storage_batch,
+					recovered.location.record_row_index,
+				)? {
+					table_ids.insert((recovered.tenant_id, table_object_id));
+				}
 			}
 		}
 		Ok(table_ids)
@@ -1603,7 +1616,7 @@ impl SlabManager {
 		context: SecondaryIndexCompactionContext<'_>,
 	) -> std::io::Result<Vec<(TenantId, TableSchemaDescriptor, SecondaryIndexDescriptor)>> {
 		let plaintext = self
-			.secondary_index_source_slab_plaintext(source_slab_id)
+			.secondary_index_source_slab_plaintext_unfenced(source_slab_id)
 			.await?;
 		self.secondary_index_compaction_descriptors_for_plaintext(
 			source_slab_id,
@@ -1874,7 +1887,7 @@ impl SlabManager {
 					tenant_id,
 					&descriptor,
 				));
-				let segment = self.build_secondary_index_segment_from_plaintext(
+				let segment = self.build_secondary_index_segment_unfenced(
 					tenant_id,
 					&table,
 					&descriptor,
@@ -1914,7 +1927,7 @@ impl SlabManager {
 		source_slab_id: SlabId,
 		plaintext: &[u8],
 	) -> Result<(), CompactionFailure> {
-		let cold_rebuild = self.build_secondary_index_segment_from_plaintext(
+		let cold_rebuild = self.build_secondary_index_segment_unfenced(
 			tenant_id,
 			table,
 			descriptor,
@@ -2293,57 +2306,85 @@ impl SlabManager {
 		plaintext: &[u8],
 	) -> std::io::Result<SecondaryIndexSegment> {
 		self.require_tier_authority_ready()?;
+		self.build_secondary_index_segment_unfenced(
+			tenant_id,
+			table,
+			descriptor,
+			source_slab_id,
+			plaintext,
+		)
+	}
+
+	/// For a caller holding its own authority: a live install checked readiness on entry,
+	/// and a recovered one is why this store is fenced.
+	pub(super) fn build_secondary_index_segment_unfenced(
+		&self,
+		tenant_id: TenantId,
+		table: &TableSchemaDescriptor,
+		descriptor: &SecondaryIndexDescriptor,
+		source_slab_id: SlabId,
+		plaintext: &[u8],
+	) -> std::io::Result<SecondaryIndexSegment> {
 		let identity = SecondaryIndexIdentity::from_descriptor(tenant_id, descriptor);
 		let mut index_entries = Vec::new();
-		for recovered in recover_slab_entries_from_blob_skipping_counters(
-			plaintext,
-			source_slab_id,
-			&self.acknowledged_offsets_in_slab(source_slab_id),
-		)? {
-			if recovered.tenant_id != tenant_id
-				|| recovered.location.is_tombstone
-				|| !recovered.is_arrow_frame
-			{
+		for recovered_frame in crate::storage::core::recovered_frames(
+			&recover_slab_entries_from_blob_skipping_counters(
+				plaintext,
+				source_slab_id,
+				&self.acknowledged_offsets_in_slab(source_slab_id),
+			)?,
+		) {
+			let wanted = |recovered: &crate::storage::core::RecoveredSlabEntry| {
+				recovered.tenant_id == tenant_id
+					&& !recovered.location.is_tombstone
+					&& recovered.is_arrow_frame
+			};
+			if !recovered_frame.entries().iter().any(wanted) {
 				continue;
 			}
-			let frame = extract_record_from_blob(plaintext, recovered.location)?;
+			let frame = extract_record_from_blob(plaintext, recovered_frame.location())?;
 			let storage_batch = decode_record_batch(&frame)?;
-			let stored_table_object_id = storage_row_table_object_id_at(
-				&storage_batch,
-				recovered.location.record_row_index,
-			)?;
-			let materialized = match materialize_record_location_batch(
-				&storage_batch,
-				recovered.location.record_row_index,
-			) {
-				Ok(batch) if batch.num_rows() == 1 => batch,
-				Ok(_) => continue,
-				Err(err) => return Err(err),
-			};
-			let routing_locality = self.recovered_entry_routing_locality(&recovered);
-			if !descriptor_matches_tiered_row(
-				table,
-				tenant_id,
-				recovered.key_identity,
-				routing_locality,
-				stored_table_object_id,
-				&materialized,
-			)? {
-				continue;
+			for recovered in recovered_frame.entries().iter().copied() {
+				if !wanted(&recovered) {
+					continue;
+				}
+				let stored_table_object_id = storage_row_table_object_id_at(
+					&storage_batch,
+					recovered.location.record_row_index,
+				)?;
+				let materialized = match materialize_record_location_batch(
+					&storage_batch,
+					recovered.location.record_row_index,
+				) {
+					Ok(batch) if batch.num_rows() == 1 => batch,
+					Ok(_) => continue,
+					Err(err) => return Err(err),
+				};
+				let routing_locality = self.recovered_entry_routing_locality(&recovered);
+				if !descriptor_matches_tiered_row(
+					table,
+					tenant_id,
+					recovered.key_identity,
+					routing_locality,
+					stored_table_object_id,
+					&materialized,
+				)? {
+					continue;
+				}
+				let Some(encoded_key) = encode_secondary_index_key(&materialized, 0, descriptor)?
+				else {
+					continue;
+				};
+				index_entries.push(SecondaryIndexEntry {
+					encoded_key,
+					row_key_id: recovered.key_identity,
+					row_hlc: recovered.location.hlc,
+					record_location: RecordLocation {
+						is_tombstone: false,
+						..recovered.location
+					},
+				});
 			}
-			let Some(encoded_key) = encode_secondary_index_key(&materialized, 0, descriptor)?
-			else {
-				continue;
-			};
-			index_entries.push(SecondaryIndexEntry {
-				encoded_key,
-				row_key_id: recovered.key_identity,
-				row_hlc: recovered.location.hlc,
-				record_location: RecordLocation {
-					is_tombstone: false,
-					..recovered.location
-				},
-			});
 		}
 		SecondaryIndexSegment::build(
 			identity,
@@ -2359,6 +2400,14 @@ impl SlabManager {
 		source_slab_id: SlabId,
 	) -> std::io::Result<Vec<u8>> {
 		self.require_tier_authority_ready()?;
+		self.secondary_index_source_slab_plaintext_unfenced(source_slab_id)
+			.await
+	}
+
+	async fn secondary_index_source_slab_plaintext_unfenced(
+		&self,
+		source_slab_id: SlabId,
+	) -> std::io::Result<Vec<u8>> {
 		let tier_pointer = {
 			let state = self.state.lock().await;
 			if state.active.slab_id() == source_slab_id {
@@ -2381,7 +2430,11 @@ impl SlabManager {
 		if let Some(pointer) = tier_pointer {
 			self.tiered_plaintext_from_l2(&pointer).await
 		} else {
-			self.read_sealed_raw(source_slab_id).await
+			// Sealed and claimed by this caller, whose exclusions hold it still: the file is
+			// its bytes, and `read_sealed_raw`'s readiness is what recovery is restoring.
+			self.file_ops
+				.read_all(&slab_path(&self.config.dir, source_slab_id))
+				.await
 		}
 	}
 

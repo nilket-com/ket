@@ -136,7 +136,11 @@ async fn backup_generation_exports_control_and_storage_artifacts() {
 	let backup = node.export_cluster_backup().await.unwrap();
 	let state = node.state_machine.state_snapshot().await;
 
-	assert_eq!(backup.manifest.format_version, 1);
+	assert_eq!(
+		backup.manifest.format_version,
+		wendelon::backup::CLUSTER_BACKUP_FORMAT_VERSION
+	);
+	assert_eq!(wendelon::backup::CLUSTER_BACKUP_FORMAT_VERSION, 2);
 	assert_eq!(
 		backup.manifest.consistent_cut.last_applied_log_id,
 		backup.control.manifest.last_applied_log_id

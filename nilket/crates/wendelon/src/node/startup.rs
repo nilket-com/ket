@@ -207,6 +207,115 @@ pub(super) async fn validated_index_recovery(
 	))
 }
 
+/// What a validated replacement restore leaves for its own bootstrap: the
+/// identity of the storage artifact it restored. It is minted only after
+/// `restore_backup` succeeds, never from directory contents, and grants index
+/// creation over those slabs only while the disk still matches it.
+pub(super) struct ReplacementRestoreEvidence {
+	active_slab_id: crate::schema::SlabId,
+	local_slabs_hash: [u8; 32],
+}
+
+impl ReplacementRestoreEvidence {
+	pub(super) fn restored(storage: &crate::storage::manager::StorageBackupImage) -> Self {
+		let mut slabs: Vec<_> = storage
+			.local_slabs
+			.iter()
+			.map(|slab| {
+				(
+					slab.slab_id,
+					slab.bytes.len() as u64,
+					crate::hash::content::digest(&slab.bytes),
+				)
+			})
+			.collect();
+		slabs.sort_unstable_by_key(|slab| slab.0);
+		Self {
+			active_slab_id: storage.manifest.active_slab_id,
+			local_slabs_hash: local_slabs_hash(storage.manifest.active_slab_id, &slabs),
+		}
+	}
+}
+
+/// The replacement-restore counterpart of `validated_index_recovery`.
+pub(super) async fn validated_replacement_recovery(
+	owner: &DataDirectoryOwner,
+	evidence: Option<&ReplacementRestoreEvidence>,
+) -> std::io::Result<Option<crate::storage::manager::IndexRecoveryAuthority>> {
+	let Some(evidence) = evidence else {
+		return Ok(None);
+	};
+	if owner.path().join("storage_index.redb").exists() {
+		return Ok(None);
+	}
+	let disk_owner = owner.clone();
+	let active_slab_id = evidence.active_slab_id;
+	let disk_hash =
+		tokio::task::spawn_blocking(move || restored_local_slabs_hash(&disk_owner, active_slab_id))
+			.await
+			.map_err(Error::other)??;
+	if disk_hash != evidence.local_slabs_hash {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"replacement restore does not match the restored local slabs",
+		));
+	}
+	Ok(Some(
+		crate::storage::manager::IndexRecoveryAuthority::verified_restore(owner.clone()),
+	))
+}
+
+/// A first bootstrap that stopped after creating its Control artifacts and
+/// before the storage index existed may resume as a fresh storage creation.
+/// It qualifies only when no storage index exists in any form, the recovered
+/// Control storage is pristine, and the directory holds nothing but the exact
+/// artifacts such a bootstrap leaves (no slab, staged, sidecar, restore or
+/// cluster evidence). Called with the owner held, before Raft starts.
+pub(super) async fn interrupted_first_creation(
+	owner: &DataDirectoryOwner,
+	control: &crate::consensus::WendelonLogStore,
+) -> std::io::Result<bool> {
+	let dir = owner.path();
+	match std::fs::symlink_metadata(dir.join("storage_index.redb")) {
+		Ok(_) => return Ok(false),
+		Err(error) if error.kind() == ErrorKind::NotFound => {}
+		Err(error) => return Err(error),
+	}
+	if !control.is_pristine().await {
+		return Ok(false);
+	}
+	for entry in std::fs::read_dir(dir)? {
+		let entry = entry?;
+		let name = entry.file_name();
+		let Some(name) = name.to_str() else {
+			return Ok(false);
+		};
+		if !entry.file_type()?.is_file() || !interrupted_bootstrap_artifact(name) {
+			return Ok(false);
+		}
+	}
+	Ok(true)
+}
+
+fn interrupted_bootstrap_artifact(name: &str) -> bool {
+	let wal_segment = name
+		.strip_prefix("control.wal.")
+		.and_then(|rest| rest.strip_suffix(".seg"))
+		.is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()));
+	wal_segment
+		|| matches!(
+			name,
+			"LOCK"
+				| "CLEAN_SHUTDOWN"
+				| ".CLEAN_SHUTDOWN.tmp"
+				| "control.wal"
+				| "vote.wnd" | "snapshot.wnd"
+				| ".snapshot.wnd.build.tmp"
+				| ".snapshot.wnd.receive.tmp"
+				| "storage_index.redb.initializing"
+		)
+}
+
 pub(super) fn complete_storage_index_recovery(owner: &DataDirectoryOwner) -> std::io::Result<()> {
 	let _permit = owner.write_permit()?;
 	match std::fs::remove_file(owner.path().join(STORAGE_INDEX_RESTORE_INTENT)) {
@@ -353,6 +462,7 @@ impl PartialResources {
 }
 pub(super) struct StartupScope {
 	storage_init_fresh: bool,
+	replacement_restore: Option<ReplacementRestoreEvidence>,
 	resources: Option<PartialResources>,
 	barrier: Option<StartupDrainBarrier>,
 	watchdog: Option<crate::shutdown_watchdog::ShutdownWatchdog>,
@@ -401,6 +511,7 @@ impl StartupScope {
 		match resources.owner.reserve_startup_drain() {
 			Ok(barrier) => Ok(Self {
 				storage_init_fresh: false,
+				replacement_restore: None,
 				resources: Some(resources),
 				barrier: Some(barrier),
 				watchdog: Some(watchdog),
@@ -408,6 +519,7 @@ impl StartupScope {
 			Err(original) => {
 				let mut scope = Self {
 					storage_init_fresh: false,
+					replacement_restore: None,
 					resources: Some(resources),
 					barrier: None,
 					watchdog: Some(watchdog),
@@ -434,6 +546,12 @@ impl StartupScope {
 	}
 	pub(super) fn storage_init_fresh(&self) -> bool {
 		self.storage_init_fresh
+	}
+	pub(super) fn set_replacement_restore(&mut self, evidence: ReplacementRestoreEvidence) {
+		self.replacement_restore = Some(evidence);
+	}
+	pub(super) fn replacement_restore(&self) -> Option<&ReplacementRestoreEvidence> {
+		self.replacement_restore.as_ref()
 	}
 
 	pub(super) fn owner(&self) -> &DataDirectoryOwner {
@@ -602,6 +720,7 @@ pub(super) struct NodeHandlesBuilder {
 	pub(super) lsm_compaction: Option<JoinHandle<()>>,
 	pub(super) lsm_compaction_control: Option<LsmCompactionServiceControl>,
 	pub(super) lsm_gc: Option<JoinHandle<()>>,
+	pub(super) op_driver: Option<JoinHandle<()>>,
 	pub(super) secondary_index_lifecycle: Option<JoinHandle<()>>,
 	pub(super) tiering_sweeper: Option<JoinHandle<()>>,
 	pub(super) restore_validation: Option<JoinHandle<()>>,
@@ -697,6 +816,12 @@ impl NodeHandlesBuilder {
 			self.duplicate = true;
 		}
 	}
+	pub(super) fn set_op_driver(&mut self, value: JoinHandle<()>) {
+		if let Some(previous) = self.op_driver.replace(value) {
+			self.extra.push(("op driver", previous));
+			self.duplicate = true;
+		}
+	}
 	pub(super) fn set_secondary_index_lifecycle(&mut self, value: JoinHandle<()>) {
 		if let Some(previous) = self.secondary_index_lifecycle.replace(value) {
 			self.extra.push(("secondary index lifecycle", previous));
@@ -773,6 +898,9 @@ impl NodeHandlesBuilder {
 			task.abort();
 		}
 		if let Some(task) = &self.lsm_gc {
+			task.abort();
+		}
+		if let Some(task) = &self.op_driver {
 			task.abort();
 		}
 		if let Some(task) = &self.secondary_index_lifecycle {
@@ -885,6 +1013,12 @@ impl NodeHandlesBuilder {
 		if self.lsm_gc.is_none() {
 			return Err(Error::new(ErrorKind::InvalidData, "startup missing lsm_gc"));
 		}
+		if self.op_driver.is_none() {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"startup missing op_driver",
+			));
+		}
 		if self.secondary_index_lifecycle.is_none() {
 			return Err(Error::new(
 				ErrorKind::InvalidData,
@@ -970,6 +1104,10 @@ impl NodeHandlesBuilder {
 				.lsm_gc
 				.take()
 				.expect("validated complete startup handle set"),
+			op_driver: self
+				.op_driver
+				.take()
+				.expect("validated complete startup handle set"),
 			secondary_index_lifecycle: self
 				.secondary_index_lifecycle
 				.take()
@@ -1030,6 +1168,9 @@ impl NodeHandlesBuilder {
 		}
 		if let Some(task) = self.lsm_gc.take() {
 			tasks.push(("lsm gc", task));
+		}
+		if let Some(task) = self.op_driver.take() {
+			tasks.push(("op driver", task));
 		}
 		if let Some(task) = self.secondary_index_lifecycle.take() {
 			tasks.push(("secondary index lifecycle", task));
@@ -1093,6 +1234,9 @@ impl NodeHandlesBuilder {
 		}
 		if let Some(task) = &self.lsm_gc {
 			tasks.push(("lsm_gc", task.abort_handle()));
+		}
+		if let Some(task) = &self.op_driver {
+			tasks.push(("op_driver", task.abort_handle()));
 		}
 		if let Some(task) = &self.secondary_index_lifecycle {
 			tasks.push(("secondary_index_lifecycle", task.abort_handle()));
@@ -1302,6 +1446,114 @@ impl Resources {
 mod tests {
 	use super::*;
 	use std::sync::atomic::{AtomicBool, Ordering};
+
+	/// An established node's Control history is never mistaken for an
+	/// interrupted first bootstrap, even with every storage artifact gone.
+	#[tokio::test]
+	async fn established_control_history_never_resumes_as_a_fresh_storage_creation() {
+		let dir = crate::test_support::TestDir::new("established-control-missing-index");
+		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			7113,
+			dir.to_path_buf(),
+			"127.0.0.1:0".into(),
+		))
+		.await
+		.unwrap();
+		node.shutdown().await.unwrap();
+		for entry in std::fs::read_dir(&*dir).unwrap() {
+			let entry = entry.unwrap();
+			let name = entry.file_name().to_string_lossy().into_owned();
+			if !interrupted_bootstrap_artifact(&name) {
+				if entry.file_type().unwrap().is_dir() {
+					std::fs::remove_dir_all(entry.path()).unwrap();
+				} else {
+					std::fs::remove_file(entry.path()).unwrap();
+				}
+			}
+		}
+		let owner = DataDirectoryOwner::acquire_existing(&*dir).unwrap();
+		let control = crate::consensus::WendelonLogStore::open(
+			dir.join("control.wal"),
+			dir.join("vote.wnd"),
+			dir.join("snapshot.wnd"),
+			crate::storage::io_uring::spawn_io_thread(64).unwrap(),
+		)
+		.await
+		.unwrap();
+		assert!(
+			!interrupted_first_creation(&owner, &control).await.unwrap(),
+			"initialized Control history must not resume as a fresh creation"
+		);
+	}
+
+	/// Only pristine Control evidence plus the exact artifacts an interrupted
+	/// first bootstrap leaves may resume as a fresh storage creation.
+	#[tokio::test]
+	async fn interrupted_first_creation_needs_pristine_control_and_only_bootstrap_artifacts() {
+		use openraft::storage::RaftLogStorage;
+		let dir = crate::test_support::TestDir::new("interrupted-first-creation");
+		let owner = DataDirectoryOwner::acquire_or_create(&*dir).unwrap();
+		let io = crate::storage::io_uring::spawn_io_thread(64).unwrap();
+		let (wal, vote, snapshot) = (
+			dir.join("control.wal"),
+			dir.join("vote.wnd"),
+			dir.join("snapshot.wnd"),
+		);
+		let mut control =
+			crate::consensus::WendelonLogStore::open(&wal, &vote, &snapshot, io.clone())
+				.await
+				.unwrap();
+		let listing = || {
+			std::fs::read_dir(&*dir)
+				.unwrap()
+				.map(|entry| entry.unwrap().file_name())
+				.collect::<Vec<_>>()
+		};
+		assert!(
+			interrupted_first_creation(&owner, &control).await.unwrap(),
+			"pristine Control and bootstrap artifacts only: {:?}",
+			listing()
+		);
+		for (name, what) in [
+			("slab_0000000000000000.wnd", "slab evidence"),
+			(
+				"compaction-temp-0000000000000001-slab_0000000000000001.wnd",
+				"staged evidence",
+			),
+			(STORAGE_INDEX_RESTORE_INTENT, "restore authority"),
+			(
+				crate::storage::manager::AWAITING_CLUSTER_MARKER,
+				"cluster replacement marker",
+			),
+			("notes.txt", "an unknown file"),
+		] {
+			std::fs::write(dir.join(name), b"x").unwrap();
+			assert!(
+				!interrupted_first_creation(&owner, &control).await.unwrap(),
+				"{what} must not resume as a fresh creation"
+			);
+			std::fs::remove_file(dir.join(name)).unwrap();
+		}
+		std::fs::create_dir(dir.join("storage_index.redb")).unwrap();
+		assert!(
+			!interrupted_first_creation(&owner, &control).await.unwrap(),
+			"an unreadable index is not an absent one"
+		);
+		std::fs::remove_dir(dir.join("storage_index.redb")).unwrap();
+		control.save_vote(&openraft::Vote::new(1, 1)).await.unwrap();
+		assert!(
+			!interrupted_first_creation(&owner, &control).await.unwrap(),
+			"a persisted vote is Control history"
+		);
+		drop(control);
+		let reopened = crate::consensus::WendelonLogStore::open(&wal, &vote, &snapshot, io)
+			.await
+			.unwrap();
+		assert!(
+			!interrupted_first_creation(&owner, &reopened).await.unwrap(),
+			"a persisted vote survives reopen"
+		);
+	}
 	struct FailingWorker(AtomicBool);
 	#[async_trait]
 	impl crate::storage::ownership::StorageWorker for FailingWorker {

@@ -59,6 +59,169 @@ pub(crate) struct EmptyKeyRemovalPause {
 }
 
 impl SlabManager {
+	/// Refuse every append from the `(skip+1)`th on at its head, as readiness would, until cleared.
+	pub(crate) fn refuse_append_after_for_test(&self, skip: u64) {
+		self.continuity_test_holds
+			.append_refusal_after
+			.store(skip + 1, Ordering::Release);
+	}
+
+	pub(super) fn note_append_refusal_for_test(&self) {
+		let holds = &self.continuity_test_holds;
+		holds.append_refusals_seen.fetch_add(1, Ordering::AcqRel);
+		holds.append_refusal_seen.notify_waiters();
+	}
+
+	/// Until an append has actually returned the proof-carrying refusal.
+	pub(crate) async fn append_refusal_for_test(&self) {
+		let holds = &self.continuity_test_holds;
+		loop {
+			let seen = holds.append_refusal_seen.notified();
+			tokio::pin!(seen);
+			seen.as_mut().enable();
+			if holds.append_refusals_seen.load(Ordering::Acquire) > 0 {
+				return;
+			}
+			seen.await;
+		}
+	}
+
+	pub(crate) fn clear_append_refusal_for_test(&self) {
+		self.continuity_test_holds
+			.append_refusal_after
+			.store(0, Ordering::Release);
+	}
+
+	/// Record one published control install. Its durable result, a whole-index read made while
+	/// its slab locks and the maintenance gate still hold, only for a test that asked: no later
+	/// compaction or GC of these slabs can be in it.
+	pub(super) async fn note_lsm_publication_for_test(&self, commit: &CompactionCommit) {
+		let wanted = self
+			.continuity_test_holds
+			.lsm_publication_evidence
+			.load(Ordering::Acquire);
+		let durable = match self.persistent_index.as_ref() {
+			Some(index) if wanted => index.load_snapshot().await.ok(),
+			_ => None,
+		};
+		let durable = durable.map(|durable| {
+			let touched = commit
+				.slabs_to_retire
+				.iter()
+				.copied()
+				.chain(commit.slabs_to_add.iter().map(|run| run.slab_id))
+				.collect::<Vec<_>>();
+			LsmPublicationEvidenceForTest {
+				runs: durable
+					.lsm_runs
+					.iter()
+					.filter(|run| touched.contains(&run.slab_id))
+					.cloned()
+					.collect(),
+				intent_outstanding: durable
+					.lsm_install_intents
+					.iter()
+					.any(|intent| intent.commit.job_id == commit.job_id),
+				rows_per_slab: touched
+					.iter()
+					.map(|slab_id| {
+						let rows = durable
+							.record_rows
+							.iter()
+							.filter(|row| row.location.slab_id == *slab_id)
+							.count();
+						(*slab_id, rows)
+					})
+					.collect(),
+			}
+		});
+		self.continuity_test_holds
+			.lsm_publications
+			.lock()
+			.unwrap()
+			.push(LsmPublicationForTest {
+				commit: commit.clone(),
+				durable,
+			});
+	}
+
+	/// From now on, each published control install also records its durable result.
+	pub(crate) fn record_lsm_publication_evidence_for_test(&self) {
+		self.continuity_test_holds
+			.lsm_publication_evidence
+			.store(true, Ordering::Release);
+	}
+
+	/// Every control install this manager published, in order.
+	pub(crate) fn lsm_publications_for_test(&self) -> Vec<LsmPublicationForTest> {
+		self.continuity_test_holds
+			.lsm_publications
+			.lock()
+			.unwrap()
+			.clone()
+	}
+
+	pub(crate) async fn durable_index_snapshot_for_test(
+		&self,
+	) -> crate::storage::index::PersistentIndexSnapshot {
+		self.persistent_index
+			.as_ref()
+			.unwrap()
+			.load_snapshot()
+			.await
+			.unwrap()
+	}
+
+	pub(crate) fn slab_file_exists_for_test(&self, slab_id: SlabId) -> bool {
+		slab_path(&self.config.dir, slab_id).exists()
+	}
+
+	/// The next version check raises this fence, once: after its append's head admitted it.
+	pub(crate) fn fence_at_next_version_check_for_test(&self, slab_id: SlabId) {
+		*self
+			.continuity_test_holds
+			.fence_at_version_check
+			.lock()
+			.unwrap() = Some(slab_id);
+	}
+
+	pub(super) fn raise_fence_at_version_check_for_test(&self) {
+		let slab = self
+			.continuity_test_holds
+			.fence_at_version_check
+			.lock()
+			.unwrap()
+			.take();
+		if let Some(slab) = slab {
+			self.raise_retirement_fence_for_test(slab);
+		}
+	}
+
+	/// Raise and clear the real store-wide fence a tier retirement holds.
+	pub(crate) fn raise_retirement_fence_for_test(&self, slab_id: SlabId) {
+		self.tier_authority.mark_retirement(slab_id, Some(1));
+	}
+
+	pub(crate) fn clear_retirement_fence_for_test(&self, slab_id: SlabId) {
+		self.tier_authority.clear_retirement(slab_id, Some(1));
+	}
+
+	/// A refusal that does not clear by itself, as an unresolved operation's fence is.
+	pub(crate) fn fence_unresolved_op_for_test(&self) {
+		self.tier_authority
+			.unresolved_op_fence
+			.store(true, Ordering::Release);
+	}
+
+	pub(super) fn take_append_refusal_for_test(&self) -> bool {
+		self.continuity_test_holds
+			.append_refusal_after
+			.fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+				(left > 1).then(|| left - 1)
+			})
+			.is_err_and(|left| left == 1)
+	}
+
 	/// Shared acceptance assertions for a fully applied retirement. Pending
 	/// retirement controls keep their separate fence/drain assertions.
 	pub(crate) async fn assert_retirement_completed_for_test(
@@ -446,17 +609,82 @@ impl SlabManager {
 	}
 }
 
+/// One published control install.
+#[derive(Clone, Debug)]
+pub(crate) struct LsmPublicationForTest {
+	pub(crate) commit: CompactionCommit,
+	pub(crate) durable: Option<LsmPublicationEvidenceForTest>,
+}
+
+/// What one control install left durable, for the slabs it touched.
+#[derive(Clone, Debug)]
+pub(crate) struct LsmPublicationEvidenceForTest {
+	pub(crate) runs: Vec<LsmRunSummary>,
+	pub(crate) intent_outstanding: bool,
+	pub(crate) rows_per_slab: Vec<(SlabId, usize)>,
+}
+
 #[derive(Default)]
 pub(super) struct TestHolds {
 	pub(super) retirement_snapshot_hold:
 		std::sync::Mutex<Option<(Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>>,
 	pub(super) rebuild_snapshot_hold:
 		std::sync::Mutex<Option<(Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>>,
+	/// At a GC removal's disposal entry: the intent and the file identity are
+	/// captured, and no exclusion, authority check or local effect has happened.
+	/// After a reservation cleanup's file was validated: stage 1 before its disposal,
+	/// stage 2 before its purge.
+	pub(super) cleanup_validated_hold:
+		std::sync::Mutex<Option<(u8, Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>>,
+	/// Holds a deferred open before it starts, and fails one attempt of it.
+	pub(super) deferred_open_hold:
+		std::sync::Mutex<Option<(Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>>,
+	pub(super) deferred_open_fail_once: std::sync::atomic::AtomicBool,
+	/// Parks a rename in its own task, as a late worker would be.
+	pub(super) lsm_rename_hold:
+		std::sync::Mutex<Option<(Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>>,
+	/// Parks a tier delivery after its evidence is prepared, before its authority.
+	pub(super) tier_delivery_hold:
+		std::sync::Mutex<Option<(Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>>,
+	/// Fails the next read of what a recovered publication left.
+	pub(super) fail_publication_readback: std::sync::atomic::AtomicBool,
+	pub(super) append_refusal_after: std::sync::atomic::AtomicU64,
+	/// Every control install's durable result, as it was published: later work may retire or
+	/// collect its runs, so a poll of the index cannot be relied on to see it.
+	pub(super) lsm_publications: std::sync::Mutex<Vec<LsmPublicationForTest>>,
+	/// Whether a publication also reads the index: most tests have no use for that cost.
+	pub(super) lsm_publication_evidence: std::sync::atomic::AtomicBool,
+	pub(super) fence_at_version_check: std::sync::Mutex<Option<SlabId>>,
+	/// Appends that returned the proof-carrying refusal, and a wake-up for whoever awaits one.
+	pub(super) append_refusals_seen: std::sync::atomic::AtomicU64,
+	pub(super) append_refusal_seen: tokio::sync::Notify,
+	/// Parks a deferred open at one named stage, for a process death there.
+	pub(super) deferred_open_stage_hold:
+		std::sync::Mutex<Option<(u8, Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>>,
+	pub(super) gc_disposal_entry_hold:
+		std::sync::Mutex<Option<(Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>>,
 	pub(super) gc_before_unlink_hold:
 		std::sync::Mutex<Option<(Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>>,
 	pub(super) gc_after_unlink_hold:
 		std::sync::Mutex<Option<(Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>>,
 	pub(super) gc_after_fsync_hold:
+		std::sync::Mutex<Option<(Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>>,
+	/// Pauses an operation's handoff inside its canonical lease.
+	pub(super) op_handoff_hold:
+		std::sync::Mutex<Option<(Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>>,
+	/// Reaches the allocation's own window check, as a lost race with another
+	/// producer would.
+	pub(super) skip_op_room_precheck: std::sync::atomic::AtomicBool,
+	/// Keeps the GC sweep from reaching a removal, as a blocker would.
+	pub(super) gc_remove_held: std::sync::atomic::AtomicBool,
+	/// A commit the ring has applied, and whose observer has not yet told the manifest.
+	pub(super) lsm_observer_hold:
+		std::sync::Mutex<Option<(Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>>,
+	/// Maintenance past its registry check, before its first publication effect.
+	pub(super) maintenance_in_intent_scope_hold:
+		std::sync::Mutex<Option<(Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>>,
+	/// A GC with its run durably dropped and the manifest not yet told.
+	pub(super) gc_after_run_dropped_hold:
 		std::sync::Mutex<Option<(Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>>,
 	pub(super) gc_before_clear_hold:
 		std::sync::Mutex<Option<(Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>>,
@@ -469,6 +697,122 @@ impl SlabManager {
 		let hold = self
 			.continuity_test_holds
 			.gc_after_clear_hold
+			.lock()
+			.unwrap()
+			.clone();
+		if let Some((entered, release)) = hold {
+			entered.add_permits(1);
+			let _ = release.acquire().await;
+		}
+	}
+
+	pub(super) async fn pause_op_handoff_for_test(&self) {
+		let hold = self
+			.continuity_test_holds
+			.op_handoff_hold
+			.lock()
+			.unwrap()
+			.clone();
+		if let Some((entered, release)) = hold {
+			entered.add_permits(1);
+			let _ = release.acquire().await;
+		}
+	}
+
+	pub(super) async fn pause_cleanup_validated_for_test(&self, stage: u8) {
+		let hold = self
+			.continuity_test_holds
+			.cleanup_validated_hold
+			.lock()
+			.unwrap()
+			.clone();
+		if let Some((wanted, entered, release)) = hold
+			&& wanted == stage
+		{
+			entered.add_permits(1);
+			let _ = release.acquire().await;
+		}
+	}
+
+	pub(super) async fn pause_deferred_open_stage_for_test(&self, stage: u8) {
+		let hold = self
+			.continuity_test_holds
+			.deferred_open_stage_hold
+			.lock()
+			.unwrap()
+			.clone();
+		if let Some((at, entered, release)) = hold
+			&& at == stage
+		{
+			entered.add_permits(1);
+			let _ = release.acquire().await;
+		}
+	}
+
+	pub(super) async fn pause_deferred_open_for_test(&self) -> std::io::Result<()> {
+		let hold = self
+			.continuity_test_holds
+			.deferred_open_hold
+			.lock()
+			.unwrap()
+			.clone();
+		if let Some((entered, release)) = hold {
+			entered.add_permits(1);
+			let _ = release.acquire().await;
+		}
+		if self
+			.continuity_test_holds
+			.deferred_open_fail_once
+			.swap(false, std::sync::atomic::Ordering::AcqRel)
+		{
+			return Err(std::io::Error::other("injected: a deferred open failed"));
+		}
+		Ok(())
+	}
+
+	pub(super) async fn pause_gc_disposal_entry_for_test(&self) {
+		let hold = self
+			.continuity_test_holds
+			.gc_disposal_entry_hold
+			.lock()
+			.unwrap()
+			.clone();
+		if let Some((entered, release)) = hold {
+			entered.add_permits(1);
+			let _ = release.acquire().await;
+		}
+	}
+
+	pub(super) async fn pause_lsm_observer_for_test(&self) {
+		let hold = self
+			.continuity_test_holds
+			.lsm_observer_hold
+			.lock()
+			.unwrap()
+			.clone();
+		if let Some((entered, release)) = hold {
+			entered.add_permits(1);
+			let _ = release.acquire().await;
+		}
+	}
+
+	pub(super) async fn pause_maintenance_in_intent_scope_for_test(&self) {
+		let hold = self
+			.continuity_test_holds
+			.maintenance_in_intent_scope_hold
+			.lock()
+			.unwrap()
+			.clone();
+		if let Some((entered, release)) = hold {
+			entered.add_permits(1);
+			let _ = release.acquire().await;
+		}
+	}
+
+	pub(super) async fn pause_gc_after_run_dropped_for_test(&self) {
+		let hold = self
+			.continuity_test_holds
+			.gc_after_run_dropped_hold
 			.lock()
 			.unwrap()
 			.clone();

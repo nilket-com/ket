@@ -100,13 +100,32 @@ pub(super) struct TierAuthority {
 	ready: AtomicBool,
 	retirement_fence: AtomicBool,
 	snapshot_fences: SnapshotFences,
+	/// The newest control index a begun comparison has read: delivered owner
+	/// evidence at or below it is covered, whatever that comparison's outcome,
+	/// because its readers hold at least that view. Only rises.
+	comparison_read_index: std::sync::RwLock<Option<u64>>,
+	/// A reopen found tier or retire operations with no durable decision. Only
+	/// their receipts can resolve them, so nothing is served until they do.
+	pub(super) unresolved_op_fence: AtomicBool,
+	/// A follower holding unresolved operations (ADR 0697 §6 step 4).
+	pub(super) awaiting_leadership: AtomicBool,
 	snapshot_reconciliation: std::sync::Mutex<Option<SnapshotReconciliation>>,
 	retirements: DashMap<SlabId, Option<u64>>,
 	snapshot_retirements: DashMap<SlabId, (u64, Option<u64>)>,
+	/// Decided retirements held for an install, by slab, with their log index. Reads of the slab
+	/// refuse, and nothing else does: unlike a retirement fence, this can stand as long as the
+	/// install takes, and it does not stop the install's own private completion or undo.
+	deferred_retirements: DashMap<SlabId, u64>,
 	closed: AtomicBool,
 	exposed: AtomicBool,
 	staging: AtomicUsize,
 	completed_attempts: AtomicU64,
+	/// This store's open ran under an unresolved intent, and what it skipped is not done
+	/// yet. Set before the manager exists; cleared only by finishing that work.
+	pub(super) deferred_open: AtomicBool,
+	/// A recovered install's publication whose outcome could not be read, by job.
+	pub(super) held_install_publications:
+		std::sync::Mutex<HashMap<CompactionJobId, super::index_publication::IndexPublication>>,
 	status: std::sync::Mutex<AuthorityStatus>,
 	changed: Notify,
 	task: Mutex<Option<JoinHandle<()>>>,
@@ -128,6 +147,10 @@ pub(super) struct TierAuthority {
 	/// Readers that reached and parked in the verification wait.
 	#[cfg(test)]
 	pub(super) verification_waits_for_test: AtomicUsize,
+	/// Pauses a readiness wait between its ready check and its attempt check.
+	#[cfg(test)]
+	pub(super) wait_before_attempt_check_hold:
+		std::sync::Mutex<Option<(Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>>,
 }
 
 #[derive(Default)]
@@ -188,13 +211,19 @@ impl TierAuthority {
 			ready: AtomicBool::new(false),
 			retirement_fence: AtomicBool::new(false),
 			snapshot_fences: SnapshotFences::default(),
+			comparison_read_index: std::sync::RwLock::new(None),
+			unresolved_op_fence: AtomicBool::new(false),
+			awaiting_leadership: AtomicBool::new(false),
 			snapshot_reconciliation: std::sync::Mutex::new(None),
 			retirements: DashMap::new(),
 			snapshot_retirements: DashMap::new(),
+			deferred_retirements: DashMap::new(),
 			closed: AtomicBool::new(false),
 			exposed: AtomicBool::new(false),
 			staging: AtomicUsize::new(0),
 			completed_attempts: AtomicU64::new(0),
+			deferred_open: AtomicBool::new(false),
+			held_install_publications: std::sync::Mutex::new(HashMap::new()),
 			status: std::sync::Mutex::new(AuthorityStatus::Pending),
 			changed: Notify::new(),
 			task: Mutex::new(None),
@@ -211,6 +240,8 @@ impl TierAuthority {
 			verification_flights_for_test: std::sync::Mutex::new(Vec::new()),
 			#[cfg(test)]
 			verification_waits_for_test: AtomicUsize::new(0),
+			#[cfg(test)]
+			wait_before_attempt_check_hold: std::sync::Mutex::new(None),
 		})
 	}
 
@@ -296,6 +327,11 @@ impl TierAuthority {
 	}
 
 	#[cfg(test)]
+	pub(super) fn completed_attempts_for_test(&self) -> u64 {
+		self.completed_attempts.load(Ordering::Acquire)
+	}
+
+	#[cfg(test)]
 	pub(super) fn status_for_test(&self) -> String {
 		format!("{:?}", self.status())
 	}
@@ -364,7 +400,11 @@ impl TierAuthority {
 		if self.closed.load(Ordering::Acquire) || manager.capture_snapshot_epoch() != retry.epoch {
 			return Err(obsolete_verification());
 		}
-		let mut pointers: Vec<_> = canonical.tiers().iter().map(snapshot_pointer).collect();
+		// ADR 0697: only this store's own committed pointers; a view that is
+		// not authoritative for this store never verifies.
+		let mut pointers = manager
+			.own_tier_view(canonical.tiers().iter(), canonical.incarnations())
+			.ok_or_else(obsolete_verification)?;
 		// MigrationComplete may arrive before this snapshot has registered any
 		// local pending pointer for its metadata observer. Without a verified
 		// row census, derive the same conservative summary from canonical
@@ -550,12 +590,37 @@ impl TierAuthority {
 			|| self.closed.load(Ordering::Acquire)
 			|| self.snapshot_fences.load(Ordering::Acquire) != 0
 			|| slabs.iter().any(|slab| {
-				self.retirements.contains_key(slab) || self.snapshot_retirements.contains_key(slab)
+				self.retirements.contains_key(slab)
+					|| self.snapshot_retirements.contains_key(slab)
+					|| self.deferred_retirements.contains_key(slab)
 			}) {
 			return false;
 		}
 		self.exposed.store(true, Ordering::Release);
 		true
+	}
+
+	#[cfg(test)]
+	pub(super) fn retirement_fence_stands(&self) -> bool {
+		self.retirement_fence.load(Ordering::Acquire)
+	}
+
+	pub(super) fn note_deferred_retirement(&self, slab_id: SlabId, index: u64) {
+		self.deferred_retirements.insert(slab_id, index);
+		self.changed.notify_waiters();
+	}
+
+	pub(super) fn clear_deferred_retirement(&self, slab_id: SlabId) {
+		if self.deferred_retirements.remove(&slab_id).is_some() {
+			self.changed.notify_waiters();
+		}
+	}
+
+	pub(super) fn deferred_retirements(&self) -> Vec<(SlabId, u64)> {
+		self.deferred_retirements
+			.iter()
+			.map(|entry| (*entry.key(), *entry.value()))
+			.collect()
 	}
 
 	fn expose_if_ready(&self) -> bool {
@@ -935,11 +1000,27 @@ impl std::fmt::Display for ObsoleteVerification {
 
 impl std::error::Error for ObsoleteVerification {}
 
-fn obsolete_verification() -> Error {
+pub(crate) fn obsolete_verification() -> Error {
 	Error::new(ErrorKind::Interrupted, ObsoleteVerification)
 }
 
 impl TierAuthority {
+	/// This store's own pointers in a canonical tier snapshot (ADR 0697). A
+	/// view that is not authoritative for this store never verifies.
+	fn own_canonical_pointers(
+		&self,
+		canonical: &crate::consensus::TierSnapshotLease,
+	) -> std::io::Result<Vec<TieredSlabPointer>> {
+		let manager = self
+			.manager
+			.get()
+			.and_then(Weak::upgrade)
+			.ok_or_else(obsolete_verification)?;
+		manager
+			.own_tier_view(canonical.tiers().iter(), canonical.incarnations())
+			.ok_or_else(obsolete_verification)
+	}
+
 	async fn run(self: &Arc<Self>) {
 		let mut delay = Duration::from_millis(200);
 		let mut replay_schedule = std::collections::HashMap::new();
@@ -1264,7 +1345,10 @@ impl TierAuthority {
 			SlabBacking::Local(slab) => slab.read_with_header(target).await,
 			SlabBacking::L2(pointer) => {
 				let object = self.plaintext(epoch, &pointer, cache).await?;
-				let record = tiered_io::extract_record_and_header_from_blob(&object.bytes, target)?;
+				let record = tiered_io::extract_record_and_header_from_blob(
+					&object.bytes,
+					crate::storage::core::FrameLocation::of_point_read(target),
+				)?;
 				lsm_driver::verify_frame_names_version(
 					&record.0,
 					&record.1,
@@ -1300,10 +1384,10 @@ impl TierAuthority {
 				if !self.snapshot_revision_matches(canonical.revision()) {
 					return Err(obsolete_verification());
 				}
-				if !canonical
-					.tiers()
+				if !self
+					.own_canonical_pointers(canonical)?
 					.iter()
-					.any(|tier| snapshot_pointer(tier).same_object_generation(&pending.pointer))
+					.any(|pointer| pointer.same_object_generation(&pending.pointer))
 				{
 					return Err(obsolete_verification());
 				}
@@ -1369,12 +1453,11 @@ impl TierAuthority {
 			if !self.snapshot_revision_matches(canonical.revision()) {
 				return Err(obsolete_verification());
 			}
-			let tiers = canonical.tiers();
-			if tiers.len() != snapshot.len()
+			let own = self.own_canonical_pointers(canonical)?;
+			if own.len() != snapshot.len()
 				|| snapshot.iter().any(|pending| {
-					!tiers
-						.iter()
-						.any(|tier| snapshot_pointer(tier).same_object_generation(&pending.pointer))
+					!own.iter()
+						.any(|pointer| pointer.same_object_generation(&pending.pointer))
 				}) {
 				return Err(obsolete_verification());
 			}
@@ -1403,6 +1486,38 @@ impl TierAuthority {
 	}
 }
 
+/// A retryable readiness refusal at the head of an append, which therefore wrote nothing. This
+/// says nothing about any other child of the same mutation, or its remote legs.
+#[derive(Debug)]
+pub(crate) struct AppendRefusedBeforeEffects(Error);
+impl AppendRefusedBeforeEffects {
+	pub(crate) fn cause(&self) -> &Error {
+		&self.0
+	}
+}
+impl std::fmt::Display for AppendRefusedBeforeEffects {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		self.0.fmt(f)
+	}
+}
+impl std::error::Error for AppendRefusedBeforeEffects {}
+
+/// Whether `error` is that refusal, and so proves this append itself did nothing.
+pub(crate) fn append_refused_before_effects(error: &Error) -> bool {
+	error
+		.get_ref()
+		.is_some_and(|cause| cause.is::<AppendRefusedBeforeEffects>())
+}
+
+/// The cause alone, for a caller whose earlier work means the refusal no longer proves that.
+pub(crate) fn without_before_effects_proof(error: Error) -> Error {
+	if !append_refused_before_effects(&error) {
+		return error;
+	}
+	let kind = error.kind();
+	Error::new(kind, error.to_string())
+}
+
 #[derive(Debug)]
 struct LsmInstallUnresolved;
 impl std::fmt::Display for LsmInstallUnresolved {
@@ -1421,22 +1536,6 @@ impl std::fmt::Display for IndexAuthorityUnavailable {
 	}
 }
 impl std::error::Error for IndexAuthorityUnavailable {}
-
-fn snapshot_pointer(tier: &crate::consensus::TieredSlab) -> TieredSlabPointer {
-	TieredSlabPointer {
-		slab_id: tier.slab_id,
-		l2_uri: tier.l2_uri.clone(),
-		payload_hash: tier.payload_hash,
-		is_encrypted: tier.is_encrypted,
-		tenant_id: tier.tenant_id,
-		tenant_kek_id: tier.tenant_kek_id,
-		stats_format_version: tier.stats_format_version,
-		stats_block_len: tier.stats_block_len,
-		stats_block_hash128: tier.stats_block_hash128,
-		tombstone_metadata: tier.tombstone_metadata,
-		supersession_metadata: tier.supersession_metadata,
-	}
-}
 
 impl SlabManager {
 	pub(crate) fn is_snapshot_append_deferral(&self, error: &Error) -> bool {
@@ -1530,6 +1629,16 @@ impl SlabManager {
 	}
 
 	fn tier_authority_refusal(&self) -> Error {
+		if let Some(reason) = self.owner_authority_fence.get() {
+			return Error::new(ErrorKind::WouldBlock, *reason);
+		}
+		if self
+			.tier_authority
+			.unresolved_op_fence
+			.load(Ordering::Acquire)
+		{
+			return Error::new(ErrorKind::WouldBlock, "UnresolvedOpIntent");
+		}
 		if let Some(error) = self.tier_authority.integrity_error() {
 			return error;
 		}
@@ -1631,12 +1740,67 @@ impl SlabManager {
 		Err(stale_location_error(slab_id, StaleLocationReason::Fenced))
 	}
 
+	/// The head of an append: refused here, it has done nothing. Only a refusal the store clears
+	/// by itself says so. An integrity, owner, restart-required or closed refusal stays what it
+	/// was, for the caller to treat as it always has.
+	pub(crate) fn require_append_admission(&self) -> std::io::Result<()> {
+		#[cfg(test)]
+		let refused = self.take_append_refusal_for_test();
+		#[cfg(not(test))]
+		let refused = false;
+		let answer = if refused {
+			Err(stale_location_error(
+				SlabId::ZERO,
+				StaleLocationReason::Fenced,
+			))
+		} else {
+			self.require_tier_authority_ready()
+		};
+		answer.map_err(|cause| self.refused_before_effects(cause))
+	}
+
+	/// An authority refusal met before this append has done anything: it carries that proof if
+	/// it will clear by itself. Each check ahead of an append's first effect answers through
+	/// this, so a fence raised after the head of the append is waited out the same way.
+	pub(super) fn refused_before_effects(&self, cause: Error) -> Error {
+		if self.append_refusal_clears_by_itself() {
+			#[cfg(test)]
+			self.note_append_refusal_for_test();
+			Error::new(cause.kind(), AppendRefusedBeforeEffects(cause))
+		} else {
+			cause
+		}
+	}
+
+	/// Until the authority next changes, or `max` passes: never a claim that it is ready.
+	pub(crate) async fn tier_authority_change_within(&self, max: Duration) {
+		let _ = tokio::time::timeout(max, self.tier_authority.changed.notified()).await;
+	}
+
+	fn append_refusal_clears_by_itself(&self) -> bool {
+		self.owner_authority_fence.get().is_none()
+			&& !self
+				.tier_authority
+				.unresolved_op_fence
+				.load(Ordering::Acquire)
+			&& self.tier_authority.integrity_error().is_none()
+			&& !self.awaiting_cluster.load(Ordering::Acquire)
+			&& !self.index_authority_unavailable.load(Ordering::Acquire)
+			&& !self.has_orphaned_index_publications()
+			&& !self.tier_authority.closed.load(Ordering::Acquire)
+			&& !matches!(
+				self.tier_authority.status(),
+				AuthorityStatus::Failed(_) | AuthorityStatus::Closed
+			)
+	}
+
 	/// Synchronous answer paths refuse rather than turn unverified authority
 	/// into an empty candidate list or an authoritative negative answer.
 	pub(crate) fn require_tier_authority_ready(&self) -> std::io::Result<()> {
 		if !self.awaiting_cluster.load(Ordering::Acquire)
 			&& !self.index_authority_unavailable.load(Ordering::Acquire)
 			&& !self.has_orphaned_lsm_intents()
+			&& !self.tier_authority.deferred_open.load(Ordering::Acquire)
 			&& !self.has_orphaned_index_publications()
 			&& self.unapplied_tier_pointers.is_empty()
 			&& self.tier_authority.expose_if_ready()
@@ -1651,6 +1815,7 @@ impl SlabManager {
 		if !self.awaiting_cluster.load(Ordering::Acquire)
 			&& !self.index_authority_unavailable.load(Ordering::Acquire)
 			&& !self.has_orphaned_lsm_intents()
+			&& !self.tier_authority.deferred_open.load(Ordering::Acquire)
 			&& !self.has_orphaned_index_publications()
 			&& self.unapplied_tier_pointers.is_empty()
 			&& self.tier_authority.expose_read_scope_if_ready(slabs)
@@ -1686,6 +1851,7 @@ impl SlabManager {
 				|| self.tier_authority.closed.load(Ordering::Acquire)
 				|| self.index_authority_unavailable.load(Ordering::Acquire)
 				|| self.has_orphaned_lsm_intents()
+				|| self.tier_authority.deferred_open.load(Ordering::Acquire)
 				|| self.has_orphaned_index_publications()
 			{
 				return Err(self.tier_authority_refusal());
@@ -1698,6 +1864,19 @@ impl SlabManager {
 			if self.tier_authority.is_ready() {
 				return self.require_tier_authority_ready();
 			}
+			#[cfg(test)]
+			{
+				let hold = self
+					.tier_authority
+					.wait_before_attempt_check_hold
+					.lock()
+					.unwrap()
+					.take();
+				if let Some((entered, release)) = hold {
+					entered.add_permits(1);
+					let _ = release.acquire().await;
+				}
+			}
 			if matches!(
 				self.tier_authority.status(),
 				AuthorityStatus::Failed(_) | AuthorityStatus::Closed
@@ -1707,6 +1886,11 @@ impl SlabManager {
 				.load(Ordering::Acquire)
 				> initial
 			{
+				// That attempt can have succeeded since the check above, and its verdict is
+				// what this waited for: a ready store is not refused for finishing just now.
+				if self.tier_authority.is_ready() {
+					return self.require_tier_authority_ready();
+				}
 				return Err(self.tier_authority_refusal());
 			}
 			self.tier_authority.start();
@@ -1732,6 +1916,27 @@ impl SlabManager {
 	/// Kept separate from persistence distrust: waiting for L2 must not shut
 	/// down Raft participation during node bootstrap.
 	pub(crate) fn tier_authority_readiness_reason(&self) -> Option<String> {
+		if let Some(reason) = self.owner_authority_fence.get() {
+			return Some((*reason).into());
+		}
+		// Below the sticky reasons, and only a follower with something to resolve.
+		if self
+			.tier_authority
+			.awaiting_leadership
+			.load(Ordering::Acquire)
+			&& self.tier_authority.integrity_error().is_none()
+			&& !self.index_authority_unavailable.load(Ordering::Acquire)
+			&& self.require_cleanup_authority().is_ok()
+		{
+			return Some("AwaitingLeadership".into());
+		}
+		if self
+			.tier_authority
+			.unresolved_op_fence
+			.load(Ordering::Acquire)
+		{
+			return Some("UnresolvedOpIntent".into());
+		}
 		if let Some(error) = self.tier_authority.integrity_error() {
 			return Some(error.to_string());
 		}
@@ -1746,6 +1951,9 @@ impl SlabManager {
 		}
 		if self.has_orphaned_lsm_intents() {
 			return Some("TierAuthorityLsmUnresolved".into());
+		}
+		if self.tier_authority.deferred_open.load(Ordering::Acquire) {
+			return Some("DeferredOpenIncomplete".into());
 		}
 		if self.has_orphaned_index_publications() {
 			return Some("TierAuthorityPublicationPending(RestartRequired)".into());
@@ -1852,10 +2060,40 @@ impl SlabManager {
 	/// Fence admissions before snapshot publication. A failed or cancelled
 	/// installation deliberately retains its own fence until recovery.
 	pub(crate) fn begin_tier_snapshot_install(&self) -> std::io::Result<u64> {
-		self.begin_tier_comparison(false)
+		self.begin_tier_comparison(false, None)
 	}
 
-	fn begin_tier_comparison(&self, replay: bool) -> std::io::Result<u64> {
+	/// Begin installing the snapshot at `index`, whose decoded `registries` are
+	/// committed state newer than this store has applied. They are classified
+	/// before the snapshot's index covers any delivery, so if publication then
+	/// fails, what the covered deliveries said has still been consumed.
+	pub(crate) fn begin_tier_snapshot_install_at(
+		&self,
+		index: Option<u64>,
+		registries: &std::collections::BTreeMap<u32, crate::consensus::IncarnationRegistry>,
+	) -> std::io::Result<u64> {
+		self.begin_tier_comparison(false, index.map(|index| (index, Some(registries))))
+	}
+
+	/// Whether a begun comparison read a view at or past `index`.
+	pub(super) fn comparison_covers_index(&self, index: u64) -> bool {
+		self.tier_authority
+			.comparison_read_index
+			.read()
+			.unwrap_or_else(|e| e.into_inner())
+			.is_some_and(|read| index <= read)
+	}
+
+	/// `reads` is the index this comparison's view reached, with its registries
+	/// when they have not been classified yet.
+	fn begin_tier_comparison(
+		&self,
+		replay: bool,
+		reads: Option<(
+			u64,
+			Option<&std::collections::BTreeMap<u32, crate::consensus::IncarnationRegistry>>,
+		)>,
+	) -> std::io::Result<u64> {
 		if let Some(error) = self.tier_authority.integrity_error() {
 			return Err(error);
 		}
@@ -1880,6 +2118,19 @@ impl SlabManager {
 			.map_err(|_| Error::other("snapshot epoch exhausted"))?
 			+ 1;
 		self.tier_authority.snapshot_fences.insert(epoch);
+		if let Some((reads, registries)) = reads {
+			let superseded =
+				self.comparison_covers_index(reads) || self.observer_is_superseded(Some(reads));
+			if let Some(registries) = registries.filter(|_| !superseded) {
+				self.classify_incoming_registries(registries);
+			}
+			let mut read = self
+				.tier_authority
+				.comparison_read_index
+				.write()
+				.unwrap_or_else(|e| e.into_inner());
+			*read = Some(read.map_or(reads, |old| old.max(reads)));
+		}
 		if self
 			.tier_authority
 			.epoch
@@ -1937,7 +2188,8 @@ impl SlabManager {
 				"replacement is below leader confirmation",
 			));
 		}
-		let epoch = self.begin_tier_comparison(true)?;
+		// `raft_server` classified this view's registry before starting replay.
+		let epoch = self.begin_tier_comparison(true, Some((applied, None)))?;
 		struct ReplayFence<'a>(&'a SlabManager, u64);
 		impl Drop for ReplayFence<'_> {
 			fn drop(&mut self) {
@@ -2431,8 +2683,12 @@ impl SlabManager {
 		let id = pointer.slab_id;
 		self.quarantine_bootstrap_collision_locked(&mut state, id, committed_id_floor, snapshot)
 			.await?;
-		let next = state.next_slab_id.max(id.saturating_add(1));
-		state.advance_slab_allocator(next);
+		let next = if state.next_slab_id > id {
+			state.next_slab_id
+		} else {
+			self.cover_slab_ids_through(&mut state, id).await?
+		};
+		state.advance_slab_allocator(next)?;
 		self.update_pending_tier_authority(pointer.clone(), last_control_log_index)?;
 		self.resume_matching_tier_deferral(&pointer);
 		drop(state);
@@ -2492,6 +2748,7 @@ impl SlabManager {
 				if next <= id || next <= committed_id_floor {
 					return Err(Error::other("slab allocator exhausted"));
 				}
+				let next_end = self.cover_slab_ids_through(state, next).await?;
 				let slab = Arc::new(
 					LocalSlabStore::open(
 						slab_path(&self.config.dir, next),
@@ -2501,7 +2758,7 @@ impl SlabManager {
 					)
 					.await?,
 				);
-				state.advance_slab_allocator(next.saturating_add(1));
+				state.advance_slab_allocator(next_end)?;
 				Some(slab)
 			} else {
 				None
@@ -2561,11 +2818,9 @@ impl SlabManager {
 					"snapshot deferral requires exact canonical index",
 				)
 			})?;
-		let mut pointers = canonical
-			.tiers()
-			.iter()
-			.map(snapshot_pointer)
-			.collect::<Vec<_>>();
+		let mut pointers = self
+			.own_tier_view(canonical.tiers().iter(), canonical.incarnations())
+			.ok_or_else(obsolete_verification)?;
 		pointers.sort_by_key(|pointer| pointer.slab_id);
 		let mut locks = Vec::new();
 		for pointer in &pointers {

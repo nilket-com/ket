@@ -721,7 +721,7 @@ fn test_adr055_lsm_compaction_substrate_guards() {
 		}
 	}
 
-	for required in ["CompactionCommit(CompactionCommit)", "control ring"] {
+	for required in ["RetiredCompactionCommit(", "control ring"] {
 		if !consensus_core.contains(required) {
 			violations.push(format!(
 				"src/consensus/core.rs: missing ADR 055 control-ring token {required}"
@@ -729,7 +729,7 @@ fn test_adr055_lsm_compaction_substrate_guards() {
 		}
 	}
 	for required in [
-		"WendelonRequest::CompactionCommit",
+		"SlabCommand::Compaction(commit)",
 		"TierObserverEvent::LsmCompactionCommitted",
 		"on_lsm_compaction_committed",
 		"AuditOperation::LsmCompactionCommitted",
@@ -744,8 +744,7 @@ fn test_adr055_lsm_compaction_substrate_guards() {
 	for required in [
 		"on_lsm_compaction_committed",
 		"observe_lsm_compaction_commit(commit, applied_log_index)",
-		"commit_lsm_compaction",
-		"WendelonRequest::CompactionCommit(commit)",
+		"on_gc_removed",
 	] {
 		if !storage_sweeper.contains(required) {
 			violations.push(format!(
@@ -9708,6 +9707,7 @@ fn adr078_manager_source_concatenates_submodules() {
 			// ADR 0696 (0692 §7): disposal evidence for typed Superseded after disposal.
 			"disposal_evidence.rs",
 			"encoding_compute.rs",
+			"gc_disposal.rs",
 			"index_publication.rs",
 			"lsm_driver.rs",
 			"maintenance_publication.rs",
@@ -9715,6 +9715,9 @@ fn adr078_manager_source_concatenates_submodules() {
 			"metadata_observation.rs",
 			// ADR 629 counted publication helpers preserve the existing entry points.
 			"observation.rs",
+			"op_hooks.rs",
+			// ADR 0697 §6: resolving operations no live workflow holds.
+			"op_recovery.rs",
 			"open.rs",
 			// ADR 0692: test-only pause points (compiled only under cfg(test)), kept
 			// out of the bounded root.
@@ -9724,12 +9727,16 @@ fn adr078_manager_source_concatenates_submodules() {
 			"redirect_store.rs",
 			// ADR 0692: per-key relocation and atomic empty-key removal.
 			"relocation.rs",
+			// ADR 0697 §4: reserved ids, their capability and their terminal paths.
+			"reservations.rs",
 			"retention_reclaim.rs",
 			"secondary_index_cleanup.rs",
 			"secondary_index_segments.rs",
 			// Local slab files that disagree with the committed tier state, and
 			// the ownership rule for every slab-path unlink.
 			"slab_file_quarantine.rs",
+			// ADR 0697: the durable slab id high-water, committed before use.
+			"slab_ids.rs",
 			"stats_facts.rs",
 			// ADR 0692: tier generations, the read snapshot and the typed refusal.
 			"tier_authority.rs",
@@ -10203,8 +10210,9 @@ fn adr0093_quic_config_construction_is_confined_to_the_tls_choke_point() {
 	);
 }
 
-/// ADR 0093/0094/0095 exercise ADR 0092's versioning mechanism: superseded
-/// bodies stay immutable, v5 is current, and every byte fixture is guarded.
+/// ADR 0093/0094/0095 froze superseded snapshot bodies; ADR 0697 (v6) refuses
+/// them instead of upconverting. The stored fixtures stay as refusal inputs,
+/// and the v6 golden is guarded.
 #[test]
 fn adr0093_snapshot_v2_and_v3_fixtures_are_both_guarded() {
 	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -10218,16 +10226,16 @@ fn adr0093_snapshot_v2_and_v3_fixtures_are_both_guarded() {
 		.unwrap();
 	let v5 = fs::read_to_string(manifest_dir.join("tests/fixtures/consensus_body/snapshot_v5.txt"))
 		.unwrap();
-	assert!(core.contains("pub const SNAPSHOT_FORMAT_VERSION: u8 = 5;"));
+	assert!(core.contains("pub const SNAPSHOT_FORMAT_VERSION: u8 = 8;"));
+	assert!(!manifest_dir.join("src/consensus/snapshot_body.rs").exists());
 	for required in [
-		"snapshot_body::v2::decode_state",
-		"snapshot_body::v3::decode_state",
 		"SNAPSHOT_V2_MANIFEST",
 		"SNAPSHOT_V3_MANIFEST",
 		"SNAPSHOT_V4_MANIFEST",
 		"SNAPSHOT_V5_MANIFEST",
-		"adr0093_snapshot_v2_fixture_is_frozen_and_upconverts_without_outcomes",
-		"adr0093_snapshot_v3_active_saga_and_drop_outcome_match_stored_golden",
+		"SNAPSHOT_V8_MANIFEST",
+		"adr0697_every_pre_v8_snapshot_body_is_refused_before_decode",
+		"adr0697_current_wal_v8_and_snapshot_v8_match_stored_goldens",
 	] {
 		assert!(
 			raft.contains(required),
@@ -10259,7 +10267,7 @@ fn adr0094_write_cap_and_legacy_replay_have_one_authority() {
 	let client = fs::read_to_string(manifest_dir.join("src/client/core.rs")).unwrap();
 	let schema = fs::read_to_string(manifest_dir.join("src/schema/core.rs")).unwrap();
 	let raft = fs::read_to_string(manifest_dir.join("src/consensus/raft_storage.rs")).unwrap();
-	assert!(schema.contains("pub const WAL_FORMAT_VERSION: u8 = 5;"));
+	assert!(schema.contains("pub const WAL_FORMAT_VERSION: u8 = 8;"));
 	assert_eq!(core.matches("pub const MAX_SECTION_BYTES:").count(), 1);
 	assert_eq!(
 		client
@@ -10293,7 +10301,6 @@ fn adr0094_write_cap_and_legacy_replay_have_one_authority() {
 		vec![
 			"src/consensus/core.rs",
 			"src/consensus/raft_storage.rs",
-			"src/consensus/wal_body.rs",
 			"src/schema/ctas.rs",
 			"src/storage/mutation_visibility/root2/committed.rs",
 		],
@@ -10832,17 +10839,31 @@ fn every_slab_path_installer_uses_a_fresh_id_or_links_without_replacing() {
 			// recovery-time zero-length cleanup (no manager yet), the rotation's
 			// fresh next id, sealed-file reads and the backup copy
 			("manager.rs".to_string(), 7),
+			// GC's identity read, its exclusive recheck and its quarantine link's
+			// source, a resume's original and a finished removal's absence check: all
+			// existing files, none installed at a slab path.
+			("gc_disposal.rs".to_string(), 5),
 			// Fresh output paths, identity-only reads, and intent-guarded cleanup.
 			// Control output recovery and input capture add read-only identity checks.
 			("lsm_driver.rs".to_string(), 12),
 			// the staged replacement's final path (fresh reserved id)
 			("maintenance_publication.rs".to_string(), 1),
+			// Recovery of an abandoned install: reads and a rejected output's source, a live
+			// run's existing file, and the output its sidecars are prepared from. None installs
+			// anything at a slab path.
+			("op_recovery.rs".to_string(), 6),
 			// open-time discovery (no manager yet)
 			("open.rs".to_string(), 4),
+			// A test hook asking whether a file exists: it installs nothing.
+			("pause_hooks.rs".to_string(), 1),
+			// An existing file only: a rejected output moved out of this namespace,
+			// and an abandoned one read and disposed of after its claim. Nothing is
+			// installed at a slab path. A resumed disposal names the original once more.
+			("reservations.rs".to_string(), 4),
 			// retention reclaim's fresh active slab
 			("retention_reclaim.rs".to_string(), 1),
 			// the declaration cut (fresh id) and segment source reads
-			("secondary_index_segments.rs".to_string(), 2),
+			("secondary_index_segments.rs".to_string(), 3),
 			// Open classification, owner-identity GC unlink, and released unlink.
 			("slab_file_quarantine.rs".to_string(), 3),
 			// Bootstrap checks the existing path and allocates a fresh replacement.
@@ -10858,9 +10879,16 @@ fn every_slab_path_installer_uses_a_fresh_id_or_links_without_replacing() {
 	assert_eq!(
 		installs,
 		vec![
+			// GC's no-replace link into its quarantine name, never to a slab path, and a
+			// resume's for the link its row recorded and never made.
+			("gc_disposal.rs".to_string(), 2),
 			// Staged output rename and no-replace link into the quarantine namespace.
 			("lsm_driver.rs".to_string(), 2),
 			("maintenance_publication.rs".to_string(), 1),
+			// A rejected output's no-replace link out of the slab namespace, and a
+			// reservation cleanup's into its quarantine name. Neither installs a slab.
+			// ... and a resumed disposal's link, for the row that recorded it and never made it.
+			("reservations.rs".to_string(), 3),
 			("secondary_index_segments.rs".to_string(), 1),
 			("tiered_io.rs".to_string(), 1),
 		],
@@ -10930,11 +10958,7 @@ fn tier_recovery_snapshots_have_only_the_reviewed_private_callers() {
 	for (name, expected) in [
 		(
 			"record_rows_for_slab_for_recovery",
-			vec![
-				("manager.rs", 2),
-				("manager/lsm_driver.rs", 1),
-				("manager/tiered_io.rs", 2),
-			],
+			vec![("manager.rs", 2), ("manager/tiered_io.rs", 2)],
 		),
 		(
 			// ADR 0696 (0692 §7): the bounded snapshot behind every tier
@@ -11047,7 +11071,8 @@ fn tier_recovery_snapshots_have_only_the_reviewed_private_callers() {
 		tiered
 			.matches("retire_tiered_slab_under_publication_lock(")
 			.count(),
-		3
+		// With `retry_deferred_retirements`, which takes the tier lock first too.
+		4
 	);
 	assert!(tiered.contains("\n\tasync fn retire_tiered_slab_under_publication_lock("));
 	let snapshot_retirement = manager_method_body(&tiered, "apply_snapshot_retirement");
@@ -11318,10 +11343,163 @@ fn snapshot_lease_scopes_exclude_remote_io_and_backoff() {
 	assert_eq!(
 		sites,
 		vec![
+			PathBuf::from("src/storage/manager/gc_disposal.rs"),
+			PathBuf::from("src/storage/manager/op_hooks.rs"),
+			PathBuf::from("src/storage/manager/op_recovery.rs"),
+			PathBuf::from("src/storage/manager/reservations.rs"),
 			PathBuf::from("src/storage/manager/tier_authority.rs"),
 			PathBuf::from("src/storage/sweeper.rs")
 		]
 	);
+	// The operation handoff's lease spans local state and one redb commit only.
+	let op_hooks = fs::read_to_string(root.join("src/storage/manager/op_hooks.rs")).unwrap();
+	assert_eq!(op_hooks.matches("source.read().await").count(), 1);
+	let handoff = manager_method_body(&op_hooks, "hand_off_op_if_complete");
+	for remote in ["object_store", "l2", "sleep", "client_write", "backoff"] {
+		assert!(!handoff.contains(remote), "{remote}");
+	}
+	// GC's local stages hold the lease across local files and redb only.
+	let disposal = fs::read_to_string(root.join("src/storage/manager/gc_disposal.rs")).unwrap();
+	assert_eq!(disposal.matches("source.read().await").count(), 6);
+	for stage in [
+		"gc_complete_mark",
+		"undo_rejected_claim",
+		"gc_dispose_run",
+		"gc_resume_disposal",
+		"gc_finish_removal",
+	] {
+		let body = manager_method_body(&disposal, stage);
+		for remote in [
+			"object_store",
+			"sleep",
+			"client_write",
+			"backoff",
+			"committer",
+			"submit_op",
+		] {
+			assert!(!body.contains(remote), "{stage}: {remote}");
+		}
+	}
+	// An abandoned install's stages too.
+	let recovery = fs::read_to_string(root.join("src/storage/manager/op_recovery.rs")).unwrap();
+	assert_eq!(recovery.matches("source.read().await").count(), 4);
+	for stage in [
+		"undo_abandoned_install",
+		"finish_applied_install",
+		"hand_off_rejected_tier_op",
+	] {
+		let body = manager_method_body(&recovery, stage);
+		for remote in [
+			"object_store",
+			"sleep",
+			"client_write",
+			"backoff",
+			"committer",
+			"submit_op",
+		] {
+			assert!(!body.contains(remote), "{stage}: {remote}");
+		}
+	}
+	// DC-176: a loop over a slab decodes per physical frame. Reading one record is a deliberate,
+	// named choice, and each new place that makes it is reviewed here.
+	let mut point_reads = Vec::new();
+	for (name, path) in [
+		("manager.rs", "src/storage/manager.rs"),
+		(
+			"encoding_compute.rs",
+			"src/storage/manager/encoding_compute.rs",
+		),
+		(
+			"retention_reclaim.rs",
+			"src/storage/manager/retention_reclaim.rs",
+		),
+		(
+			"secondary_index_segments.rs",
+			"src/storage/manager/secondary_index_segments.rs",
+		),
+		("stats_facts.rs", "src/storage/manager/stats_facts.rs"),
+		("tier_authority.rs", "src/storage/manager/tier_authority.rs"),
+		("tier_plan.rs", "src/storage/manager/tier_plan.rs"),
+		("tiered_io.rs", "src/storage/manager/tiered_io.rs"),
+	] {
+		let source = fs::read_to_string(root.join(path)).unwrap();
+		point_reads.push((
+			name,
+			source.matches("FrameLocation::of_point_read(").count(),
+		));
+	}
+	assert_eq!(
+		point_reads,
+		[
+			("manager.rs", 2),
+			("encoding_compute.rs", 2),
+			("retention_reclaim.rs", 2),
+			("secondary_index_segments.rs", 0),
+			("stats_facts.rs", 0),
+			("tier_authority.rs", 1),
+			("tier_plan.rs", 2),
+			("tiered_io.rs", 2),
+		],
+		"a new point read: if it is in a loop over a slab's entries, group by frame instead"
+	);
+	// DC-158: the tier stats build decodes a whole slab, off the runtime's workers.
+	let sweeper_source = fs::read_to_string(root.join("src/storage/sweeper.rs")).unwrap();
+	let stats_stage = sweeper_source
+		.split("async fn encrypt_tiered_object_blob_with_current_stats(")
+		.nth(1)
+		.and_then(|rest| rest.split("\n\t}\n").next())
+		.expect("the stats stage");
+	assert!(
+		stats_stage.contains("cpu_bound_off_the_runtime_worker"),
+		"the stats build must not hold a runtime worker"
+	);
+	// A reservation's local stages hold it across local files and redb only, and a
+	// burn and a refusal ask the ring first and hold it only after.
+	let reservations =
+		fs::read_to_string(root.join("src/storage/manager/reservations.rs")).unwrap();
+	assert_eq!(reservations.matches("source.read().await").count(), 5);
+	for stage in [
+		"cleanup_dispose",
+		"cleanup_resume_disposal",
+		"cleanup_finish",
+	] {
+		let body = manager_method_body(&reservations, stage);
+		for remote in [
+			"object_store",
+			"sleep",
+			"client_write",
+			"backoff",
+			"committer",
+			"submit_op",
+		] {
+			assert!(!body.contains(remote), "{stage}: {remote}");
+		}
+	}
+	let burn = manager_method_body(&reservations, "finish_burn");
+	let after_lease = burn.split("let lease = match").nth(1).unwrap();
+	for remote in ["committer", "submit_op", "client_write", "sleep", "backoff"] {
+		assert!(!after_lease.contains(remote), "{remote}");
+	}
+	// The rejected-claim handoff asks the ring first, and holds its lease only after.
+	let resolve = manager_method_body(&disposal, "resolve_rejected_claim");
+	let after_lease = resolve.split("let lease = match").nth(1).unwrap();
+	for remote in ["committer", "cancel_op", "client_write", "sleep", "backoff"] {
+		assert!(!after_lease.contains(remote), "{remote}");
+	}
+	for stage in ["gc_dispose_run", "gc_finish_removal"] {
+		let body = manager_method_body(&disposal, stage);
+		for remote in [
+			"object_store",
+			"l2",
+			"sleep",
+			"client_write",
+			"backoff",
+			"committer",
+			"submit_op",
+		] {
+			assert!(!body.contains(remote), "{stage}: {remote}");
+		}
+	}
 	assert!(compare.contains("let canonical = retry.source.read().await?;\n\t\tlet manager"));
 	assert!(callback.contains("let canonical = match self.snapshot_source.get()"));
 	assert!(
@@ -11416,8 +11594,8 @@ fn snapshot_lease_writers_do_not_await_local_publication_locks() {
 		.split("fn apply_entry_to_state(")
 		.next()
 		.unwrap();
-	// Six cfg(test) seeding helpers plus the two production writers.
-	assert_eq!(sm.matches("self.inner.write().await").count(), 8);
+	// Eight cfg(test) seeding helpers plus the two production writers.
+	assert_eq!(sm.matches("self.inner.write().await").count(), 10);
 	let apply = sm
 		.split("let pending_checkpoint = {\n\t\t\tlet mut guard = self.inner.write().await;")
 		.nth(1)
@@ -11502,7 +11680,7 @@ fn control_lsm_output_rename_has_one_guarded_staging_path() {
 	);
 	assert!(
 		control.find(".stage_lsm_compaction_outputs(").unwrap()
-			< control.find("committer.commit_lsm_compaction(").unwrap()
+			< control.find("committer.submit_op(").unwrap()
 	);
 	assert_eq!(
 		source
@@ -11529,7 +11707,7 @@ fn completed_control_lsm_recovery_has_one_accepted_private_issuer() {
 		"install_lsm_compaction_temp_outputs_via_control_ring_with_context",
 	);
 	assert!(
-		control.find("committer.commit_lsm_compaction(").unwrap()
+		control.find("committer.submit_op(").unwrap()
 			< control.find("new_after_acceptance(").unwrap()
 	);
 	assert!(control.contains("prepared_sidecars.is_none()"));
@@ -11650,13 +11828,22 @@ fn lsm_stage_refusal_is_definite_only_before_rename() {
 		2,
 		"no other conversion into a stage failure"
 	);
-	assert_eq!(source.matches(".clear_refused_lsm_intent(").count(), 2);
-	for caller in [
-		"install_lsm_compaction_temp_outputs",
-		"install_lsm_compaction_temp_outputs_via_control_ring_with_context",
+	// The local path clears its refused intent; the control path has an allocated
+	// operation, which closes only through the ring (ADR 0697).
+	assert_eq!(source.matches(".clear_refused_lsm_intent(").count(), 1);
+	assert_eq!(source.matches(".cancel_unsubmitted_lsm_op(").count(), 1);
+	for (caller, clear) in [
+		(
+			"install_lsm_compaction_temp_outputs",
+			".clear_refused_lsm_intent(",
+		),
+		(
+			"install_lsm_compaction_temp_outputs_via_control_ring_with_context",
+			".cancel_unsubmitted_lsm_op(",
+		),
 	] {
 		let body = manager_method_body(&source, caller);
-		let clear = body.find(".clear_refused_lsm_intent(").unwrap();
+		let clear = body.find(clear).unwrap();
 		assert!(body[..clear].contains("LsmStageFailure::BeforeRename("));
 		assert!(body.contains("LsmStageFailure::Uncertain(failure)) => return Err(failure)"));
 	}
@@ -11686,33 +11873,22 @@ fn every_tier_proposer_holds_a_history_token() {
 		.map(|(body, _)| body.to_owned())
 		.expect("propose_tier_slab exists");
 	assert!(
-		helper.contains("reserve_tier_history(tier)")
-			&& helper.contains("committer.commit_tier_slab(proposal)"),
-		"the helper reserves the token, then proposes with it"
-	);
-	assert!(
-		sweeper.contains(
-			"async fn commit_tier_slab(&self, proposal: TierProposal) -> std::io::Result<()>;"
-		),
-		"the committer receives the bound proposal, never a bare entry"
+		helper.contains("reserve_tier_history(tier.clone())")
+			&& helper.contains("submit_tier_proposal(slab, committer, proposal, allocation.first)"),
+		"the helper reserves the token, allocates, then submits under it"
 	);
 	for (name, source) in [("sweeper.rs", &sweeper), ("retention_reclaim.rs", &reclaim)] {
-		let direct = source
-			.match_indices(".commit_tier_slab(")
-			.filter(|(at, _)| !source[..*at].ends_with("committer"))
-			.count();
+		// The one production builder, and the fixture adapter's dispatch.
+		let direct = source.matches("SlabCommand::Tier(").count();
+		let direct = direct - if name == "sweeper.rs" { 2 } else { 0 };
 		assert_eq!(
 			direct, 0,
 			"{name}: production proposals go through propose_tier_slab"
 		);
 	}
-	assert!(sweeper.matches("propose_tier_slab(&self.slab,").count() >= 6);
-	assert_eq!(
-		reclaim
-			.matches("propose_tier_slab(self, committer, tier)")
-			.count(),
-		2
-	);
+	// The definition, and its six production call sites.
+	assert!(sweeper.matches("propose_tier_slab(").count() >= 7);
+	assert_eq!(reclaim.matches("sweeper::propose_tier_slab(").count(), 2);
 	let manager = manager_source(manifest_dir);
 	assert_eq!(
 		manager.matches("fn reserve_tier_history(").count(),
@@ -11791,4 +11967,72 @@ fn every_published_layout_transition_updates_the_lineage_census() {
 			"no `{forbidden}` bypasses the census"
 		);
 	}
+}
+
+/// The body of `item` (`pub struct Name` or `pub enum Name`) in `source`.
+fn brace_body<'a>(source: &'a str, item: &str) -> &'a str {
+	let at = source
+		.find(&format!("{item} {{"))
+		.unwrap_or_else(|| panic!("{item} not found"));
+	let open = at + source[at..].find('{').unwrap();
+	let mut depth = 0;
+	for (offset, character) in source[open..].char_indices() {
+		match character {
+			'{' => depth += 1,
+			'}' => {
+				depth -= 1;
+				if depth == 0 {
+					return &source[open..open + offset];
+				}
+			}
+			_ => {}
+		}
+	}
+	panic!("{item} is not closed");
+}
+
+/// ADR 0697 §9.4: no bare slab id in a control-ring command, the state machine or
+/// its snapshot. A slab id is only ever qualified: by a `SlabRef`, or beneath an
+/// owner that is inseparable from it. Each such nesting is named here, not waived.
+#[test]
+fn a_ring_command_or_state_never_names_a_bare_slab_id() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let ops = fs::read_to_string(root.join("src/consensus/slab_ops.rs")).unwrap();
+	let raft = fs::read_to_string(root.join("src/consensus/raft_storage.rs")).unwrap();
+	let lsm = fs::read_to_string(root.join("src/storage/lsm.rs")).unwrap();
+	for item in [
+		"pub struct TierOp",
+		"pub struct RetireOp",
+		"pub struct GcRemove",
+		"pub struct ClaimOp",
+		"pub struct CompleteOp",
+		"pub struct BurnOp",
+		"pub struct OpKey",
+		"pub struct SlabOp",
+		"pub enum SlabCommand",
+		"pub struct CancelOp",
+		"pub struct AckOutcomes",
+		"pub enum SlabRejection",
+	] {
+		assert!(!brace_body(&ops, item).contains("SlabId"), "{item}");
+	}
+	assert!(!brace_body(&raft, "pub struct SmState").contains("SlabId"));
+	let requests = fs::read_to_string(root.join("src/consensus/core.rs")).unwrap();
+	assert!(!brace_body(&requests, "pub enum WendelonRequest").contains("SlabId"));
+	assert!(
+		brace_body(&raft, "pub struct SmState")
+			.contains("BTreeMap<OwnerRef, crate::consensus::slab_ops::OwnerTerminal>"),
+		"terminal sets sit beneath their owner"
+	);
+	// The two nestings: the claimed map and the intervals exist only under that key.
+	let terminal = brace_body(&ops, "pub struct OwnerTerminal");
+	assert_eq!(terminal.matches("SlabId").count(), 1);
+	assert!(terminal.contains("pub claimed: BTreeMap<SlabId, CompactionJobId>"));
+	assert!(terminal.contains("pub removed: SlabIntervals"));
+	assert!(ops.contains("pub struct SlabIntervals(Vec<(u64, u64)>);"));
+	// A compaction commit's vectors are all local to its one owner field.
+	assert!(
+		brace_body(&lsm, "pub struct CompactionCommit")
+			.contains("pub owner: crate::consensus::OwnerRef")
+	);
 }

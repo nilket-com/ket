@@ -402,6 +402,8 @@ pub(super) struct UnresolvedLsmScope {
 	pub(super) keys_unknown: bool,
 	pub(super) in_flight: bool,
 	pub(super) owner_token: Arc<()>,
+	/// A GC step's lifecycle commit: it rewrites no rows, so a retirement need not wait for it.
+	pub(super) gc_lifecycle: bool,
 }
 
 pub(super) fn lsm_intent_scope(
@@ -439,6 +441,7 @@ pub(super) fn lsm_intent_scope(
 		slabs,
 		in_flight: !recovering,
 		owner_token: Arc::new(()),
+		gc_lifecycle: intent.commit.is_lsm_gc_lifecycle_commit(),
 		keys_unknown: recovering
 			|| !intent.commit.slabs_to_add.is_empty()
 			|| !intent.local_output_files.is_empty()
@@ -494,6 +497,8 @@ pub(super) enum ControlLsmInstallCut {
 	BeforeRename,
 	AfterRename,
 	AfterAcceptance,
+	/// The install's rows are durable, and its sidecars are not yet published.
+	AfterRowsPublished,
 	AfterPublication,
 }
 
@@ -541,20 +546,30 @@ impl SlabManager {
 		// key-disjoint check and memory publication. Registering a new intent
 		// cannot race between that check and the resulting key edits.
 		let _scope = self.lsm_intent_scope_gate.write().await;
-		match self.lsm_install_unresolved.entry(intent.commit.job_id) {
-			dashmap::mapref::entry::Entry::Vacant(entry) => {
-				let scope = lsm_intent_scope(intent, false);
-				let owner_token = scope.owner_token.clone();
-				entry.insert(scope);
-				Some(LsmIntentOwner {
-					manager: self,
-					job_id: intent.commit.job_id,
-					owner_token,
-					completed: false,
-				})
-			}
-			dashmap::mapref::entry::Entry::Occupied(_) => None,
+		// One job at a time, store-wide, from here until it is resolved. An accepted commit must
+		// apply from the epoch it was prepared at, and the epoch is the whole manifest's, so
+		// nothing may move it in between: this refuses before anything is durable or submitted.
+		// Maintenance, the one other writer, checks this registry under this same gate.
+		if !self.lsm_install_unresolved.is_empty() {
+			return None;
 		}
+		if !intent.commit.is_lsm_gc_removal_commit()
+			&& recover_rwlock_read(&self.compaction_manifest, "compaction_manifest")
+				.manifest_epoch()
+				!= intent.commit.manifest_epoch_pre
+		{
+			return None;
+		}
+		let scope = lsm_intent_scope(intent, false);
+		let owner_token = scope.owner_token.clone();
+		self.lsm_install_unresolved
+			.insert(intent.commit.job_id, scope);
+		Some(LsmIntentOwner {
+			manager: self,
+			job_id: intent.commit.job_id,
+			owner_token,
+			completed: false,
+		})
 	}
 
 	/// Nothing was renamed or proposed: clear exactly this durable intent.
@@ -573,15 +588,30 @@ impl SlabManager {
 		self.lsm_install_unresolved.remove(&job_id);
 	}
 
+	/// Called per row, so it must not allocate when there is nothing to find. `DashMap::iter`
+	/// allocates an `Arc` per shard it visits, even an empty one; `is_empty` only reads each shard.
+	/// Both visit the shards one at a time with no snapshot, so `is_empty` being true is an answer
+	/// the walk could also have given: an intent standing throughout is seen by both, and one
+	/// inserted behind the cursor by neither. With intents present, the walk runs and allocates.
 	pub(super) fn has_orphaned_lsm_intents(&self) -> bool {
-		self.lsm_install_unresolved
-			.iter()
-			.any(|entry| !entry.value().in_flight)
+		!self.lsm_install_unresolved.is_empty()
+			&& self
+				.lsm_install_unresolved
+				.iter()
+				.any(|entry| !entry.value().in_flight)
 	}
 
 	pub(super) fn lsm_intent_names_slab(&self, slab_id: SlabId) -> bool {
 		self.lsm_install_unresolved.iter().any(|intent| {
 			intent.value().slabs.is_empty() || intent.value().slabs.contains(&slab_id)
+		})
+	}
+
+	/// Whether an unresolved install's evidence includes this slab, so a retirement must wait.
+	pub(super) fn lsm_install_holds_slab(&self, slab_id: SlabId) -> bool {
+		self.lsm_install_unresolved.iter().any(|intent| {
+			!intent.value().gc_lifecycle
+				&& (intent.value().slabs.is_empty() || intent.value().slabs.contains(&slab_id))
 		})
 	}
 
@@ -1068,23 +1098,11 @@ pub(super) async fn cleanup_lsm_compaction_tmp_files(
 }
 
 impl SlabManager {
-	pub async fn reserve_lsm_output_slab_ids(&self, count: usize) -> std::io::Result<Vec<SlabId>> {
-		let count = u64::try_from(count).map_err(|_| {
-			Error::new(
-				ErrorKind::InvalidInput,
-				"LSM output slab reservation count does not fit in u64",
-			)
-		})?;
-		let mut state = self.state.lock().await;
-		let start = state.next_slab_id.get();
-		let end = start.checked_add(count).ok_or_else(|| {
-			Error::new(
-				ErrorKind::InvalidInput,
-				"LSM output slab reservation would overflow SlabId",
-			)
-		})?;
-		state.advance_slab_allocator(SlabId::new(end));
-		Ok((start..end).map(SlabId::new).collect())
+	pub async fn reserve_lsm_output_slab_ids(
+		&self,
+		count: usize,
+	) -> std::io::Result<Vec<ReservedSlab>> {
+		self.reserve_slab_ids(count).await
 	}
 
 	pub fn apply_lsm_manifest_compaction_commit(
@@ -1322,6 +1340,7 @@ impl SlabManager {
 			commit: commit.clone(),
 			commit_digest: *blake3::hash(&serde_json::to_vec(commit).map_err(Error::other)?)
 				.as_bytes(),
+			ops: Vec::new(),
 			inputs: expected.clone(),
 		};
 		// Register while no new mark is held across the scope-lock await. Mark
@@ -1345,7 +1364,7 @@ impl SlabManager {
 			return Err(Error::other("injected local LSM pre-rename failure").into());
 		}
 		let staged = match self
-			.stage_lsm_compaction_outputs_locked(plan, prepared, written, commit, false, true)
+			.stage_lsm_compaction_outputs_locked(plan, prepared, written, commit, false, true, None)
 			.await
 		{
 			Ok(staged) => staged,
@@ -1384,6 +1403,7 @@ impl SlabManager {
 					lsm_intent_transition: Some((intent.clone(), published_intent.clone())),
 					put_records: staged.inserted_rows.clone(),
 					put_lsm_runs: output_runs,
+					promote_reservations: self.lsm_reservations_to_promote(prepared),
 					..Default::default()
 				},
 				Some(publication.gate.clone()),
@@ -1399,7 +1419,14 @@ impl SlabManager {
 		}
 		let post_epoch = self.apply_lsm_manifest_planned_compaction_commit(plan, commit)?;
 		let post_epoch = self
-			.complete_lsm_compaction_install(staged, post_epoch, publication, None)
+			.complete_lsm_compaction_install(
+				staged,
+				post_epoch,
+				publication,
+				None,
+				Vec::new(),
+				commit,
+			)
 			.await?;
 		#[cfg(test)]
 		{
@@ -1448,6 +1475,17 @@ impl SlabManager {
 		secondary_index_context: Option<SecondaryIndexCompactionContext<'_>>,
 	) -> Result<ManifestEpoch, CompactionFailure> {
 		self.require_tier_authority_ready()?;
+		committer.preflight(commit.owner).await?;
+		#[cfg(test)]
+		let precheck = !self
+			.continuity_test_holds
+			.skip_op_room_precheck
+			.load(std::sync::atomic::Ordering::Acquire);
+		#[cfg(not(test))]
+		let precheck = true;
+		if precheck {
+			self.require_op_index()?.ensure_op_room(1).await?;
+		}
 		self.preflight_lsm_compaction_outputs(
 			plan,
 			prepared,
@@ -1487,10 +1525,39 @@ impl SlabManager {
 		self.tier_authority.notify_publication_change();
 		// Mark before entering OwnedRedb: its blocking transaction may outlive a
 		// cancelled caller. Any uncertain result retains the mark and evidence.
-		index.put_lsm_install_intent(intent.clone()).await?;
+		// The operation and its intent commit together, so neither exists without
+		// the other (ADR 0697).
+		let allocation = match index
+			.allocate_ops(
+				vec![crate::consensus::slab_ops::SlabCommand::Compaction(
+					commit.clone(),
+				)],
+				Some(intent),
+			)
+			.await
+		{
+			Ok(allocation) => allocation,
+			// Proven: nothing was written. Only the owned runtime scope goes, so
+			// the refused producer leaves no fence on reserved work. Any other
+			// result may have committed and keeps the fence.
+			Err(error) if crate::storage::sweeper::op_window_refused(&error) => {
+				self.clear_registered_lsm_intent(commit.job_id).await;
+				_intent_owner.complete();
+				self.tier_authority.notify_publication_change();
+				return Err(error.into());
+			}
+			Err(error) => return Err(error.into()),
+		};
+		let ticket = allocation.first;
+		let ownership = allocation.ownership;
+		let intent = allocation
+			.linked
+			.ok_or_else(|| Error::other("an allocated LSM operation returns its intent"))?;
+
 		#[cfg(test)]
 		self.pause_control_lsm_install_for_test(ControlLsmInstallCut::BeforeRename)
 			.await;
+		let rename_guard = Arc::new(ownership);
 		let staged = match self
 			.stage_lsm_compaction_outputs(
 				plan,
@@ -1499,12 +1566,14 @@ impl SlabManager {
 				commit,
 				secondary_index_context.is_some(),
 				true,
+				Some(rename_guard.clone()),
 			)
 			.await
 		{
 			Ok(staged) => staged,
 			Err(LsmStageFailure::BeforeRename(failure)) => {
-				self.clear_refused_lsm_intent(index, &intent).await?;
+				self.cancel_unsubmitted_lsm_op(index, committer, &ticket, &intent)
+					.await?;
 				_intent_owner.complete();
 				return Err(failure);
 			}
@@ -1521,11 +1590,8 @@ impl SlabManager {
 		#[cfg(test)]
 		self.pause_control_lsm_install_for_test(ControlLsmInstallCut::AfterRename)
 			.await;
-		let commit_result = committer.commit_lsm_compaction(commit.clone()).await;
-		if let Err(error) = commit_result {
-			if error
-				.get_ref()
-				.is_some_and(|cause| cause.is::<crate::storage::sweeper::LsmCommitRejected>())
+		let receipt = committer.submit_op(&ticket).await?;
+		if let crate::storage::sweeper::VerifiedReceipt::Rejected { reason, .. } = receipt {
 			{
 				let _maintenance = self
 					.maintenance_publication_gate
@@ -1543,20 +1609,40 @@ impl SlabManager {
 						return Err(CompactionFailure::ManifestRace);
 					}
 				}
-				// The sole submission definitely refused. Keep the intent until
-				// every installed output is durably removed; cancellation or an
-				// unlink error therefore leaves evidence and readiness fenced.
-				for (run, _) in &staged.installed {
-					let path = slab_path(&self.config.dir, run.slab_id);
-					unlink_local_file(self.file_ops.as_ref(), &path).await?;
-					fsync_parent_dir(self.file_ops.as_ref(), &path).await?;
+				// The sole submission definitely refused. In a ring these ids take T1:
+				// each output stays until its own claim, and the handoff moves all of
+				// their identities to their reservations in one transaction. Outside
+				// one, the intent stays until every output is durably removed.
+				if self.control_node_bound() {
+					let mut outputs = Vec::with_capacity(staged.installed.len());
+					for (run, _) in &staged.installed {
+						outputs.push((
+							run.slab_id,
+							self.relocate_rejected_output(run.slab_id).await?,
+						));
+					}
+					index
+						.hand_off_rejected_install(&ticket, intent, outputs)
+						.await?;
+				} else {
+					for (run, _) in &staged.installed {
+						let path = slab_path(&self.config.dir, run.slab_id);
+						unlink_local_file(self.file_ops.as_ref(), &path).await?;
+						fsync_parent_dir(self.file_ops.as_ref(), &path).await?;
+					}
+					index
+						.hand_off_op(ticket.key(), ticket.digest(), Some(intent))
+						.await?;
 				}
-				index.clear_lsm_install_intent(intent).await?;
 				self.clear_registered_lsm_intent(commit.job_id).await;
 				_intent_owner.complete();
 				self.tier_authority.notify_publication_change();
 			}
-			return Err(error.into());
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				crate::storage::sweeper::LsmCommitRejected(format!("{reason:?}")),
+			)
+			.into());
 		}
 		#[cfg(test)]
 		self.pause_control_lsm_install_for_test(ControlLsmInstallCut::AfterAcceptance)
@@ -1595,8 +1681,18 @@ impl SlabManager {
 			self.bump_slab_publication_revision(slab_id)?;
 		}
 		let post_epoch = self
-			.complete_lsm_compaction_install(staged, post_epoch, publication, completion)
+			.complete_lsm_compaction_install(
+				staged,
+				post_epoch,
+				publication,
+				completion,
+				self.lsm_reservations_to_promote(prepared),
+				commit,
+			)
 			.await?;
+		#[cfg(test)]
+		self.pause_control_lsm_install_for_test(ControlLsmInstallCut::AfterRowsPublished)
+			.await;
 		self.publish_prepared_lsm_secondary_index_segments_locked(prepared_sidecars)
 			.await;
 		if self.index_authority_unavailable.load(Ordering::Acquire)
@@ -1619,7 +1715,11 @@ impl SlabManager {
 				let _ = release.acquire().await;
 			}
 		}
-		index.clear_lsm_install_intent(completed_intent).await?;
+		index
+			.hand_off_op(ticket.key(), ticket.digest(), Some(completed_intent))
+			.await?;
+		#[cfg(test)]
+		self.note_lsm_publication_for_test(commit).await;
 		self.clear_registered_lsm_intent(commit.job_id).await;
 		_intent_owner.complete();
 		self.tier_authority.notify_publication_change();
@@ -1716,8 +1816,42 @@ impl SlabManager {
 				"persistent index unavailable for control LSM evidence",
 			)
 		})?;
-		let gate = self.persistent_index_gate.clone().read_owned().await;
-		let snapshot = index.load_snapshot().await?;
+		let gate = Arc::new(self.persistent_index_gate.clone().read_owned().await);
+		let mut snapshot = index.load_snapshot().await?;
+		// The intent records these runs exactly, and recovery compares them exactly. A slab with
+		// no run row is summarized again by `open`, at the epoch `open` recovers, so each input
+		// gets its row first. A row that disagrees is not overwritten.
+		let mut missing = Vec::new();
+		for run in &local_input_runs {
+			match snapshot
+				.lsm_runs
+				.iter()
+				.find(|stored| stored.slab_id == run.slab_id)
+			{
+				Some(stored) if stored != run => return Err(CompactionFailure::ManifestRace),
+				Some(_) => {}
+				None => missing.push(run.clone()),
+			}
+		}
+		if !missing.is_empty() {
+			let mut publication_slabs = plan.touched_slabs();
+			publication_slabs.extend(written.iter().map(|run| run.slab_id));
+			// As on the local path: these rows only mirror runs already live in memory, so a
+			// later refusal leaves nothing to publish and nothing untrue.
+			let publication =
+				self.begin_index_publication_with_gate(publication_slabs, gate.clone())?;
+			index
+				.apply_with_publication_guard(
+					PersistentIndexUpdate {
+						put_lsm_runs: missing,
+						..Default::default()
+					},
+					Some(publication.gate.clone()),
+				)
+				.await?;
+			publication.complete();
+			snapshot = index.load_snapshot().await?;
+		}
 		let input_digest = crate::storage::index::lsm_input_rows_digest(&snapshot, &input_ids);
 		let local_rows = self
 			.persistent_record_rows_snapshot()
@@ -1760,6 +1894,7 @@ impl SlabManager {
 			commit: commit.clone(),
 			commit_digest: *blake3::hash(&serde_json::to_vec(commit).map_err(Error::other)?)
 				.as_bytes(),
+			ops: Vec::new(),
 			inputs: inputs.clone(),
 		})
 	}
@@ -1774,6 +1909,7 @@ impl SlabManager {
 		commit: &CompactionCommit,
 		allow_sidecar_covered_inputs: bool,
 		keep_intent_outputs: bool,
+		rename_guard: Option<Arc<crate::storage::index::OpOwnership>>,
 	) -> Result<LsmInstalledCompactionOutputs, LsmStageFailure> {
 		let _maintenance = self
 			.maintenance_publication_gate
@@ -1804,6 +1940,7 @@ impl SlabManager {
 			commit,
 			allow_sidecar_covered_inputs,
 			keep_intent_outputs,
+			rename_guard,
 		)
 		.await
 	}
@@ -1817,6 +1954,7 @@ impl SlabManager {
 		commit: &CompactionCommit,
 		allow_sidecar_covered_inputs: bool,
 		keep_intent_outputs: bool,
+		rename_guard: Option<Arc<crate::storage::index::OpOwnership>>,
 	) -> Result<LsmInstalledCompactionOutputs, LsmStageFailure> {
 		self.preflight_lsm_compaction_outputs(
 			plan,
@@ -1828,7 +1966,7 @@ impl SlabManager {
 		.map_err(LsmStageFailure::BeforeRename)?;
 
 		let installed = self
-			.install_lsm_output_files(written, keep_intent_outputs)
+			.install_lsm_output_files(written, keep_intent_outputs, rename_guard)
 			.await?;
 		let max_output_slab_id = installed.iter().map(|(run, _)| run.slab_id).max();
 
@@ -1872,14 +2010,39 @@ impl SlabManager {
 		})
 	}
 
+	/// A publication's outputs become live slabs in its transaction: their
+	/// reservations end there. A store outside a ring has none.
+	fn lsm_reservations_to_promote(&self, prepared: &LsmPreparedOutputs) -> Vec<SlabId> {
+		if !self.control_node_bound() {
+			return Vec::new();
+		}
+		prepared.reservations.iter().map(ExposedSlab::id).collect()
+	}
+
 	pub(super) async fn complete_lsm_compaction_install(
 		&self,
 		staged: LsmInstalledCompactionOutputs,
 		post_epoch: ManifestEpoch,
 		publication: IndexPublication,
 		completion: Option<AcceptedControlLsmCompletion>,
+		promote_reservations: Vec<SlabId>,
+		commit: &CompactionCommit,
 	) -> Result<ManifestEpoch, CompactionFailure> {
-		let lsm_runs = self.compaction_manifest_snapshot().runs().to_vec();
+		// This install's inputs and outputs, which its slab locks hold still, and no others: a
+		// whole snapshot would restore a run another slab's retirement has since removed.
+		let lsm_runs = self
+			.compaction_manifest_snapshot()
+			.runs()
+			.iter()
+			.filter(|run| {
+				commit.slabs_to_retire.contains(&run.slab_id)
+					|| commit
+						.slabs_to_add
+						.iter()
+						.any(|output| output.slab_id == run.slab_id)
+			})
+			.cloned()
+			.collect::<Vec<_>>();
 		let LsmInstalledCompactionOutputs {
 			installed,
 			removed_rows,
@@ -1955,6 +2118,7 @@ impl SlabManager {
 			delete_records: removed_rows,
 			put_records: inserted_rows,
 			put_lsm_runs: lsm_runs,
+			promote_reservations,
 			..Default::default()
 		};
 		let index = self
@@ -2301,10 +2465,46 @@ impl SlabManager {
 				// Blob-tier recovery rejects record classes 1..=4 in
 				// recover_slab_entries_from_blob, so an accepted L2 slab is counter-free.
 				SlabBacking::L2(_) => {}
-				SlabBacking::Missing => return Err(CompactionFailure::ManifestRace),
+				SlabBacking::Missing => {
+					self.finish_retirement_remnant(slab_id).await;
+					return Err(CompactionFailure::ManifestRace);
+				}
 			}
 		}
 		Ok(())
+	}
+
+	/// A run its retirement had to leave behind, for an install that named it then, possibly in
+	/// an earlier process. The durable retirement record authorizes this, read in the transaction
+	/// along with whether an install still names it, so it goes now and the next plan does not
+	/// name it. Without that record a missing backing authorizes nothing.
+	pub(super) async fn finish_retirement_remnant(&self, slab_id: SlabId) {
+		let Some(index) = &self.persistent_index else {
+			return;
+		};
+		let tier_lock = self.tier_publication_lock(slab_id);
+		let _tier_guard = tier_lock.lock().await;
+		let answer = match self.begin_index_publication(vec![slab_id]).await {
+			Ok(publication) => {
+				match index
+					.dispose_retirement_remnant(slab_id, publication.gate.clone())
+					.await
+				{
+					Ok(disposed) => {
+						if disposed {
+							self.drop_live_run(slab_id);
+						}
+						publication.complete();
+						Ok(())
+					}
+					Err(error) => Err(error),
+				}
+			}
+			Err(error) => Err(error),
+		};
+		if let Err(error) = answer {
+			tracing::warn!(%error, slab_id = slab_id.get(), "a retirement remnant stays for now");
+		}
 	}
 
 	fn note_lsm_counter_deferral(&self, plan: &CompactionPlan, slab_id: SlabId) {
@@ -2349,7 +2549,12 @@ impl SlabManager {
 				return Err(err);
 			}
 		};
-		let commit = worker.build_written_compaction_commit(&plan, &written, digest_summary);
+		let commit = worker.build_written_compaction_commit(
+			self.owner_ref()?,
+			&plan,
+			&written,
+			digest_summary,
+		);
 		let post_epoch = match self
 			.install_lsm_compaction_temp_outputs(&plan, &prepared, &written, &commit)
 			.await
@@ -2413,7 +2618,12 @@ impl SlabManager {
 				return Err(err);
 			}
 		};
-		let commit = worker.build_written_compaction_commit(&plan, &written, digest_summary);
+		let commit = worker.build_written_compaction_commit(
+			self.owner_ref()?,
+			&plan,
+			&written,
+			digest_summary,
+		);
 		let post_epoch = match self
 			.install_lsm_compaction_temp_outputs_via_control_ring_with_context(
 				&plan,
@@ -2808,6 +3018,7 @@ impl SlabManager {
 		&self,
 		written: &[LsmWrittenOutputRun],
 		keep_intent_outputs: bool,
+		rename_guard: Option<Arc<crate::storage::index::OpOwnership>>,
 	) -> std::io::Result<Vec<(LsmWrittenOutputRun, Arc<LocalSlabStore>)>> {
 		let mut final_paths = Vec::with_capacity(written.len());
 		for run in written {
@@ -2829,8 +3040,33 @@ impl SlabManager {
 			async {
 				let mut installed = Vec::with_capacity(written.len());
 				for (run, final_path) in written.iter().zip(&final_paths) {
-					self.file_ops.rename(&run.temp_path, final_path).await?;
-					fsync_parent_dir(self.file_ops.as_ref(), final_path).await?;
+					// Its own task, owning the operation: a cancelled caller cannot release
+					// what recovery acquires while this rename can still happen.
+					let (ops, from, to, guard) = (
+						self.file_ops.clone(),
+						run.temp_path.clone(),
+						final_path.clone(),
+						rename_guard.clone(),
+					);
+					#[cfg(test)]
+					let hold = self
+						.continuity_test_holds
+						.lsm_rename_hold
+						.lock()
+						.unwrap()
+						.clone();
+					tokio::spawn(async move {
+						let _guard = guard;
+						#[cfg(test)]
+						if let Some((entered, release)) = hold {
+							entered.add_permits(1);
+							let _ = release.acquire().await;
+						}
+						ops.rename(&from, &to).await?;
+						fsync_parent_dir(ops.as_ref(), &to).await
+					})
+					.await
+					.map_err(Error::other)??;
 					installed_paths.push(final_path.clone());
 					let slab = Arc::new(
 						LocalSlabStore::open(
@@ -2994,6 +3230,7 @@ impl SlabManager {
 		} else {
 			state.next_slab_id
 		};
+		let next_end = self.cover_slab_ids_through(state, next_id).await?;
 		let next_path = slab_path(&self.config.dir, next_id);
 		let next_slab = Arc::new(
 			LocalSlabStore::open(
@@ -3024,14 +3261,14 @@ impl SlabManager {
 				// unlink; retaining the slab keeps it visible to this process's
 				// recovery state and leaves the old one-file leak explicit.
 				state.install_sealed(&self.tier_budget, sealed_id, sealed_slab);
-				state.advance_slab_allocator(next_id.saturating_add(1));
+				state.advance_slab_allocator(next_end)?;
 				return Err(error);
 			}
 		} else {
 			state.install_sealed(&self.tier_budget, sealed_id, sealed_slab);
 			self.record_l0_compaction_run(sealed_id, sealed_size);
 		}
-		state.advance_slab_allocator(next_id.saturating_add(1));
+		state.advance_slab_allocator(next_end)?;
 		Ok(())
 	}
 
@@ -3173,7 +3410,7 @@ impl SlabManager {
 	/// The caller holds the maintenance gate followed by every input's tier
 	/// lock in ascending order. Active and non-quiescent local slabs cannot be
 	/// captured: a reservation might still publish after our snapshot.
-	async fn lsm_input_authority_locked(
+	pub(super) async fn lsm_input_authority_locked(
 		&self,
 		slabs: &[SlabId],
 	) -> Result<Vec<crate::storage::index::LsmInputAuthority>, CompactionFailure> {
@@ -3208,6 +3445,10 @@ impl SlabManager {
 				.map(|entry| *entry.value())
 				.unwrap_or(0);
 			inputs.push(crate::storage::index::LsmInputAuthority {
+				opened: self
+					.persistent_index
+					.as_ref()
+					.map_or(0, |index| index.open_nonce()),
 				slab_id,
 				revision,
 				tiered,
@@ -3273,8 +3514,10 @@ impl SlabManager {
 		let decisions = apply_elision(entries.clone(), plan.retention_floor_snapshot);
 		let output_run_count =
 			required_output_run_count(survivor_records(&decisions), target_size)?;
-		let output_slab_ids = self.reserve_lsm_output_slab_ids(output_run_count).await?;
-		let mut prepared = worker.plan_survivor_outputs(plan, entries, output_slab_ids)?;
+		let exposed = self.reserve_exposed_slab_ids(output_run_count).await?;
+		let planned =
+			worker.plan_survivor_outputs(plan, entries, exposed.iter().map(ExposedSlab::id))?;
+		let mut prepared = LsmPreparedOutputs::bind(planned, exposed)?;
 		if self.capture_lsm_input_authority(plan).await? != authority {
 			return Err(CompactionFailure::ManifestRace);
 		}
@@ -3306,8 +3549,10 @@ impl SlabManager {
 		let decisions = apply_elision(entries.clone(), plan.retention_floor_snapshot);
 		let output_run_count =
 			required_output_run_count(survivor_records(&decisions), target_size)?;
-		let output_slab_ids = self.reserve_lsm_output_slab_ids(output_run_count).await?;
-		let mut prepared = worker.plan_survivor_outputs(plan, entries, output_slab_ids)?;
+		let exposed = self.reserve_exposed_slab_ids(output_run_count).await?;
+		let planned =
+			worker.plan_survivor_outputs(plan, entries, exposed.iter().map(ExposedSlab::id))?;
+		let mut prepared = LsmPreparedOutputs::bind(planned, exposed)?;
 		if self.capture_lsm_input_authority(plan).await? != authority {
 			return Err(CompactionFailure::ManifestRace);
 		}
@@ -3932,6 +4177,14 @@ impl SlabManager {
 		&self,
 		gc_worker: &LsmGcWorker,
 	) -> std::io::Result<Vec<SlabId>> {
+		// This path has no canonical namespace. A store in a ring never takes it,
+		// whatever its ring's state at the moment.
+		if self.control_node_bound() {
+			return Err(Error::new(
+				ErrorKind::PermissionDenied,
+				"a store serving a control ring cannot run local-only GC",
+			));
+		}
 		self.require_tier_authority_ready()?;
 		// Capture retired candidates, claim rewrites first (the same order as
 		// compaction), then serialize their manifest transition under tier locks.
@@ -4122,7 +4375,7 @@ impl SlabManager {
 	}
 
 	pub async fn sweep_lsm_delete_pending_once_via_control_ring(
-		&self,
+		self: &Arc<Self>,
 		gc_worker: &LsmGcWorker,
 		committer: &dyn TierCommitter,
 	) -> std::io::Result<Vec<SlabId>> {
@@ -4139,9 +4392,33 @@ impl SlabManager {
 			.cloned()
 			.collect::<Vec<_>>();
 		retired.sort_unstable_by_key(|run| run.slab_id);
+		// A full window refuses new marks and new removals, and never keeps this
+		// sweep from the removals already reserved.
+		let mut backlog = None;
+		// This sweep's own marked runs: handing a mark off does not expose its reserved
+		// removal to recovery while this workflow is still going to continue it.
+		let mut marked = std::collections::HashMap::new();
 		for expected_run in retired {
 			let slab_id = expected_run.slab_id;
-			let expected = {
+			// Advisory: a claim that cannot succeed is not proposed. The ring still
+			// arbitrates, and this is no authority over anything already reserved.
+			if self.canonical_tier_source.get().and_then(|source| {
+				source.try_known_unclaimable(self.owner_ref().ok()?.slab(slab_id))
+			}) == Some(true)
+			{
+				continue;
+			}
+			// No lock spans this control-ring await, and nothing is allocated
+			// or marked for an owner that cannot propose.
+			committer.preflight(self.owner_ref()?).await?;
+			if let Err(error) = index.ensure_op_room(2).await {
+				if !crate::storage::sweeper::op_window_refused(&error) {
+					return Err(error);
+				}
+				backlog = Some(error);
+				break;
+			}
+			let (expected, pre_delete_pending) = {
 				let _maintenance = self.maintenance_publication_gate.clone().read_owned().await;
 				let tier_lock = self.tier_publication_lock(slab_id);
 				let _tier_guard = tier_lock.lock().await;
@@ -4151,7 +4428,7 @@ impl SlabManager {
 					.any(|run| *run == expected_run)
 					|| self.slab_pins.pin_count(slab_id) != 0
 					|| self.counter_slab_has_pending_frames(slab_id)
-					|| !self.record_rows_for_slab(slab_id)?.is_empty()
+					|| self.gc_rows_still_name(slab_id).await?
 				{
 					continue;
 				}
@@ -4159,17 +4436,26 @@ impl SlabManager {
 					Ok(authority) => authority,
 					Err(_) => continue,
 				};
+				let pre_delete_pending = self.slab_pins.is_delete_pending(slab_id);
 				if !self.slab_pins.mark_delete_pending(slab_id) {
 					continue;
 				}
-				expected
+				(expected, pre_delete_pending)
 			};
 			let snapshot = self.compaction_manifest_snapshot();
 			let commit = CompactionCommit::gc_mark_delete_pending(
+				self.owner_ref()?,
 				Self::lsm_gc_job_id(snapshot.manifest_epoch, 0xD1, &[slab_id]),
 				snapshot.manifest_epoch,
 				vec![slab_id],
 			);
+			// The removal is built whole now and reserved with the mark, so it
+			// never needs a fresh sequence (ADR 0697 §5.2).
+			let remove = crate::consensus::slab_ops::GcRemove {
+				job_id: commit.job_id,
+				slab: commit.owner.slab(slab_id),
+				expected_run: crate::consensus::slab_ops::RunIdentity::of(&expected_run),
+			};
 			let digest =
 				*blake3::hash(&serde_json::to_vec(&commit).map_err(Error::other)?).as_bytes();
 			let intent = crate::storage::index::LsmInstallIntent {
@@ -4177,70 +4463,99 @@ impl SlabManager {
 				phase: crate::storage::index::LsmInstallPhase::Prepared,
 				local_input_rows_digest: [0; 32],
 				local_output_rows_digest: [0; 32],
-				local_input_runs: Vec::new(),
+				local_input_runs: vec![expected_run.clone()],
 				local_input_files: Vec::new(),
 				local_output_files: Vec::new(),
 				commit: commit.clone(),
 				commit_digest: digest,
+				ops: Vec::new(),
 				inputs: expected.clone(),
 			};
 			let Some(_intent_owner) = self.register_lsm_install_intent(&intent).await else {
+				if !pre_delete_pending {
+					self.slab_pins.clear_delete_pending(slab_id);
+				}
 				return Err(Error::new(
 					ErrorKind::WouldBlock,
-					"LSM GC intent already unresolved",
+					"another LSM job is unresolved; this mark waits",
 				));
 			};
 			self.tier_authority.notify_publication_change();
-			index.put_lsm_install_intent(intent.clone()).await?;
-			committer.commit_lsm_compaction(commit.clone()).await?;
-			let _claim = self.acquire_slab_rewrite_exclusive_claim(slab_id).await;
-			let _maintenance = self
-				.maintenance_publication_gate
-				.clone()
-				.write_owned()
-				.await;
-			let tier_lock = self.tier_publication_lock(slab_id);
-			let _tier_guard = tier_lock.lock().await;
-			let snapshot = self.compaction_manifest_snapshot();
-			let actual = snapshot.run(slab_id).cloned();
-			let exact = actual.as_ref().is_some_and(|run| {
-				let mut expected_after = expected_run.clone();
-				expected_after.state = SlabState::DeletePending;
-				expected_after.manifest_epoch = commit.manifest_epoch_pre.saturating_add(1);
-				*run == expected_after
-			});
-			if !exact
-				|| self
-					.lsm_input_authority_locked(&[slab_id])
-					.await
-					.ok()
-					.as_ref() != Some(&expected)
-				|| self.slab_pins.pin_count(slab_id) != 0
-				|| self.counter_slab_has_pending_frames(slab_id)
-				|| !self.record_rows_for_slab_for_recovery(slab_id).is_empty()
-			{
-				return Err(Error::new(
-					ErrorKind::WouldBlock,
-					"committed LSM GC mark changed; intent remains fenced",
-				));
-			}
-			self.bump_slab_publication_revision(slab_id)?;
-			let publication = self.begin_index_publication(vec![slab_id]).await?;
-			index
-				.apply_with_publication_guard(
-					PersistentIndexUpdate {
-						put_lsm_runs: vec![actual.unwrap()],
-						..Default::default()
-					},
-					Some(publication.gate.clone()),
+			let allocation = match index
+				.allocate_mark(
+					vec![
+						crate::consensus::slab_ops::SlabCommand::Compaction(commit.clone()),
+						crate::consensus::slab_ops::SlabCommand::GcRemove(remove),
+					],
+					intent,
+					expected_run.clone(),
+					pre_delete_pending,
 				)
-				.await?;
+				.await
+			{
+				Ok(allocation) => allocation,
+				// Nothing was written: the window is full, and this run is
+				// not marked. Only new work is refused.
+				Err(error) if crate::storage::sweeper::op_window_refused(&error) => {
+					self.slab_pins.clear_delete_pending(slab_id);
+					self.clear_registered_lsm_intent(commit.job_id).await;
+					_intent_owner.complete();
+					self.tier_authority.notify_publication_change();
+					backlog = Some(error);
+					break;
+				}
+				Err(error) => return Err(error),
+			};
+			let removal = allocation
+				.later
+				.first()
+				.map(|reserved| reserved.key())
+				.ok_or_else(|| Error::other("a GC mark reserves its removal"))?;
+			let allocation_ownership = allocation.ownership;
+			let ticket = allocation.first;
+			let intent = allocation
+				.linked
+				.ok_or_else(|| Error::other("an allocated GC operation returns its intent"))?;
+			if let crate::storage::sweeper::VerifiedReceipt::Rejected { reason, .. } =
+				committer.submit_op(&ticket).await?
+			{
+				// The ring ordered something else first: this is the loser of the
+				// race, and it finishes through a canonical Cancel.
+				let allocation_ownership = tokio::spawn(self.clone().undo_rejected_claim(
+					ticket.clone(),
+					removal,
+					reason,
+					expected_run.clone(),
+					pre_delete_pending,
+					allocation_ownership,
+				))
+				.await
+				.map_err(Error::other)??;
+				let _allocation_ownership = allocation_ownership;
+				let claim = index
+					.load_rejected_claims()
+					.await?
+					.into_iter()
+					.find(|claim| claim.mark.key() == ticket.key())
+					.ok_or_else(|| Error::other("a rejected claim lost its row"))?;
+				self.resolve_rejected_claim(committer, claim).await?;
+				_intent_owner.complete();
+				continue;
+			}
+			let (snapshot, allocation_ownership) = tokio::spawn(self.clone().gc_complete_mark(
+				ticket.clone(),
+				removal,
+				intent,
+				expected_run.clone(),
+				allocation_ownership,
+			))
+			.await
+			.map_err(Error::other)??;
 			gc_worker.observe_manifest_snapshot(&snapshot);
-			publication.complete();
-			index.clear_lsm_install_intent(intent).await?;
 			self.clear_registered_lsm_intent(commit.job_id).await;
 			_intent_owner.complete();
 			self.tier_authority.notify_publication_change();
+			marked.insert(slab_id, allocation_ownership);
 		}
 
 		let mut candidates = self
@@ -4255,6 +4570,17 @@ impl SlabManager {
 			if self.is_compaction_slab_quarantined(slab_id) {
 				continue;
 			}
+			#[cfg(test)]
+			if self
+				.continuity_test_holds
+				.gc_remove_held
+				.load(std::sync::atomic::Ordering::Acquire)
+			{
+				continue;
+			}
+			// No lock spans this control-ring await, and nothing is allocated
+			// or marked for an owner that cannot propose.
+			committer.preflight(self.owner_ref()?).await?;
 			let expected = {
 				let _maintenance = self.maintenance_publication_gate.clone().read_owned().await;
 				let tier_lock = self.tier_publication_lock(slab_id);
@@ -4265,7 +4591,7 @@ impl SlabManager {
 					.any(|run| *run == expected_run)
 					|| self.slab_pins.pin_count(slab_id) != 0
 					|| self.counter_slab_has_pending_frames(slab_id)
-					|| !self.record_rows_for_slab(slab_id)?.is_empty()
+					|| self.gc_rows_still_name(slab_id).await?
 				{
 					continue;
 				}
@@ -4274,9 +4600,48 @@ impl SlabManager {
 					Err(_) => continue,
 				}
 			};
+			// The removal reserved with this run's mark. A run marked by another
+			// path has none, and takes a new operation under the window's bound.
+			let reserved = match self
+				.gc_remove_reservation_or_allocate(index, &expected_run)
+				.await
+			{
+				Ok(reserved) => reserved,
+				Err(error)
+					if crate::storage::sweeper::op_window_refused(&error)
+						|| super::op_hooks::is_gc_remove_unreserved(&error) =>
+				{
+					backlog = Some(error);
+					continue;
+				}
+				Err(error) => return Err(error),
+			};
+			// Its mark has not finished; its intent is what fences this run.
+			if reserved.awaits_its_workflow() {
+				continue;
+			}
+			// Held already by this sweep's mark, or taken now. Anyone else's is theirs.
+			let ownership = match marked.remove(&slab_id) {
+				Some(held) => held,
+				None => match index.try_acquire_ops(vec![reserved.key().op_seq]) {
+					Some(acquired) => acquired,
+					None => continue,
+				},
+			};
+			// The authority this reservation was made for, or nothing: a different
+			// object is never adopted as the same operation.
+			if reserved.expected_inputs.as_ref().is_some_and(|inputs| {
+				!crate::storage::index::LsmInputAuthority::all_unchanged_since(&expected, inputs)
+			}) {
+				return Err(Error::new(
+					ErrorKind::WouldBlock,
+					"a reserved GC removal's input authority changed; it remains fenced",
+				));
+			}
 			let snapshot = self.compaction_manifest_snapshot();
 			let commit = CompactionCommit::gc_remove(
-				Self::lsm_gc_job_id(snapshot.manifest_epoch, 0xD2, &[slab_id]),
+				self.owner_ref()?,
+				reserved.job_id,
 				snapshot.manifest_epoch,
 				vec![slab_id],
 			);
@@ -4292,96 +4657,49 @@ impl SlabManager {
 				local_output_files: Vec::new(),
 				commit: commit.clone(),
 				commit_digest: digest,
+				ops: Vec::new(),
 				inputs: expected.clone(),
 			};
 			let Some(_intent_owner) = self.register_lsm_install_intent(&intent).await else {
 				return Err(Error::new(
 					ErrorKind::WouldBlock,
-					"LSM GC intent already unresolved",
+					"another LSM job is unresolved; this removal waits",
 				));
 			};
 			self.tier_authority.notify_publication_change();
+			let mut intent = intent;
+			intent.ops = vec![reserved.key()];
 			index.put_lsm_install_intent(intent.clone()).await?;
-			// No maintenance, tier or rewrite lock spans the control-ring await.
-			committer.commit_lsm_compaction(commit.clone()).await?;
-			let _claim = self.acquire_slab_rewrite_exclusive_claim(slab_id).await;
-			let _maintenance = self
-				.maintenance_publication_gate
-				.clone()
-				.write_owned()
-				.await;
-			let tier_lock = self.tier_publication_lock(slab_id);
-			let _tier_guard = tier_lock.lock().await;
-			if self
-				.lsm_input_authority_locked(&[slab_id])
-				.await
-				.ok()
-				.as_ref() != Some(&expected)
-				|| self.compaction_manifest_snapshot().run(slab_id).is_some()
-				|| self.slab_pins.pin_count(slab_id) != 0
-				|| self.counter_slab_has_pending_frames(slab_id)
-				|| !self.slab_pins.mark_delete_pending(slab_id)
-			{
-				return Err(Error::new(
-					ErrorKind::WouldBlock,
-					"committed LSM GC authority changed; intent remains fenced",
-				));
-			}
-			let durable = index.load_snapshot().await?;
-			if durable
-				.record_rows
-				.iter()
-				.chain(&durable.tiered_records)
-				.any(|row| row.location.slab_id == slab_id)
-			{
-				return Err(Error::new(
-					ErrorKind::WouldBlock,
-					"committed LSM GC has live record references",
-				));
-			}
-			for info in self.list_secondary_index_segments_for_source_slab(slab_id) {
-				self.retire_secondary_index_segment_for_replaced_slab_locked(&info)
-					.await?;
-			}
-			let durable = index.load_snapshot().await?;
-			if durable
-				.secondary_index_segments
-				.iter()
-				.any(|row| row.key.source_slab_id == slab_id)
-			{
-				return Err(Error::new(
-					ErrorKind::WouldBlock,
-					"committed LSM GC has sidecar references",
-				));
-			}
-			self.bump_slab_publication_revision(slab_id)?;
-			if self.slab_pins.pin_count(slab_id) != 0
-				|| self.counter_slab_has_pending_frames(slab_id)
-			{
-				return Err(Error::new(
-					ErrorKind::WouldBlock,
-					"LSM GC eligibility changed before unlink",
-				));
-			}
-			self.gc_unlink_owned_slab_file(slab_id).await?;
-			self.redirects.remove_touching(&self.tier_budget, slab_id);
-			self.record_disposal_evidence(slab_id).await;
-			let publication = self.begin_index_publication(vec![slab_id]).await?;
-			index
-				.apply_with_publication_guard(
-					PersistentIndexUpdate {
-						delete_lsm_run_ids: vec![slab_id],
-						..Default::default()
-					},
-					Some(publication.gate.clone()),
-				)
-				.await?;
-			gc_worker.observe_manifest_snapshot(&self.compaction_manifest_snapshot());
-			#[cfg(test)]
-			self.pause_gc_before_clear_for_test().await;
-			publication.complete();
-			index.clear_lsm_install_intent(intent).await?;
-			self.clear_registered_lsm_intent(commit.job_id).await;
+			// T1's order: local disposal, then Complete, then its purge. No maintenance,
+			// tier or rewrite lock spans the control-ring await. Each local stage is
+			// detached: an aborted sweep cannot release its exclusion or authority
+			// while filesystem work it started is still to come.
+			let remove = reserved.remove_command()?;
+			let file = self.gc_read_original_identity(slab_id).await?;
+			let snapshot = tokio::spawn(self.clone().gc_dispose_run(
+				remove.clone(),
+				reserved.key(),
+				reserved.digest(),
+				expected.clone(),
+				expected_run.clone(),
+				intent,
+				file.clone(),
+				ownership,
+			))
+			.await
+			.map_err(Error::other)??;
+			let (snapshot, ownership) = snapshot;
+			gc_worker.observe_manifest_snapshot(&snapshot);
+			let ticket = reserved.into_ticket(index).await?;
+			Self::require_gc_applied(committer.submit_op(&ticket).await?)?;
+			tokio::spawn(self.clone().gc_finish_removal(
+				remove,
+				ticket,
+				crate::storage::index::OpProgress::RunDropped(file),
+				ownership,
+			))
+			.await
+			.map_err(Error::other)??;
 			_intent_owner.complete();
 			self.slab_pins.clear_delete_pending(slab_id);
 			self.tier_authority.notify_publication_change();
@@ -4389,7 +4707,10 @@ impl SlabManager {
 			self.pause_gc_after_clear_for_test().await;
 			deleted.push(slab_id);
 		}
-		Ok(deleted)
+		match backlog {
+			Some(error) if deleted.is_empty() => Err(error),
+			_ => Ok(deleted),
+		}
 	}
 
 	pub(super) fn lsm_gc_job_id(

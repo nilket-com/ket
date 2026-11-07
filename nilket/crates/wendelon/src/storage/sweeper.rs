@@ -68,8 +68,7 @@
 use crate::audit::{AuditAuthority, AuditEvent, AuditOperation, AuditSink, NoopAuditSink};
 use crate::consensus::monitor::{PhysicalClock, SystemClock};
 use crate::consensus::{
-	MigratedRangeTombstone, RetireTieredSlab, TieredSlab, WendelonRaft, WendelonRequest,
-	WendelonStateMachine,
+	MigratedRangeTombstone, TieredSlab, WendelonRaft, WendelonRequest, WendelonStateMachine,
 };
 use crate::governance::{AutonomousActionSurface, authorize_autonomous_action};
 use crate::metrics::global as metrics;
@@ -77,10 +76,12 @@ use crate::schema::{HybridTimestamp, NodeId, SlabId, TenantId, TenantKekId};
 #[cfg(test)]
 use crate::schema::{SupersessionMetadata, TombstoneMetadata};
 use crate::storage::MvccRetentionPolicy;
+use crate::storage::index::{OpTicket, TerminalBacklog};
 use crate::storage::l2::ObjectStore;
 use crate::storage::manager::{
-	PreparedTieredRetentionRewrite, RetentionCompactionStats, SealedSlabInfo, SlabManager,
-	StaleLocationReason, TierProposal, TieredSlabPointer, stale_location_error,
+	OwnTierView, OwnerEvidence, Ownership, PreparedTieredRetentionRewrite,
+	RetentionCompactionStats, SealedSlabInfo, SlabManager, StaleLocationReason, TierProposal,
+	TieredSlabPointer, stale_location_error,
 };
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -111,6 +112,8 @@ fn stats_advisory_fields(
 pub struct SweeperConfig {
 	/// How often the sweeper checks for new sealed slabs.
 	pub scan_interval: Duration,
+	/// How often finished operations are driven to their acknowledgement.
+	pub op_driver_interval: Duration,
 	/// Only slabs at or above this size are eligible. Set to 0 to
 	/// tier every sealed slab — useful for tests; production
 	/// normally wants this non-zero so small gap-fill slabs are
@@ -138,6 +141,7 @@ impl Default for SweeperConfig {
 	fn default() -> Self {
 		Self {
 			scan_interval: Duration::from_secs(5),
+			op_driver_interval: Duration::from_millis(500),
 			min_slab_bytes: 0,
 			max_upload_bytes_per_sec: None,
 			key_prefix: String::new(),
@@ -192,24 +196,202 @@ pub trait TierCommitter: Send + Sync {
 		true
 	}
 
-	/// Submit a TierSlab entry. Returns `Ok(())` only after the
-	/// entry has been committed *and* applied locally, so the
-	/// caller can treat a successful return as "L1 file has been
-	/// unlinked via the SM apply observer". An error means the
-	/// sweeper should skip this slab and try again on the next
-	/// scan — the L1 file stays put.
-	///
-	/// The proposal carries the history its publication reserved (ADR 0692
-	/// §7); a committer resolves it through [`TierProposal::begin_submission`].
+	/// Everything that must hold before a sequence is allocated for `owner`
+	/// (ADR 0697 §6): an operation allocated and then refused for a reason
+	/// known in advance would only hold its owner's window.
+	async fn preflight(&self, _owner: crate::consensus::OwnerRef) -> std::io::Result<()> {
+		Ok(())
+	}
+
+	/// Submit one operation and return its verified receipt. Returns only after
+	/// the local state machine applied the entry. A refusal, an anomaly and an
+	/// unknown outcome are errors; each retains the intent and grants no cleanup.
+	async fn submit_op(&self, ticket: &OpTicket) -> std::io::Result<VerifiedReceipt>;
+
+	/// Close an operation by its original digest (ADR 0697 §5.4). The answer is
+	/// the recorded decision: a Cancel never overrules an operation that applied.
+	/// A committer with no ring has no such answer to give.
+	async fn cancel_op(&self, ticket: &OpTicket) -> std::io::Result<VerifiedReceipt> {
+		Err(std::io::Error::new(
+			std::io::ErrorKind::Unsupported,
+			format!("this committer cannot cancel op {:?}", ticket.key()),
+		))
+	}
+
+	/// Acknowledge durably finished operations. The receipt answers exactly the
+	/// requested owner and batch, or it is an anomaly.
+	async fn ack_outcomes(
+		&self,
+		owner: crate::consensus::OwnerRef,
+		_seqs: Vec<u64>,
+	) -> std::io::Result<crate::consensus::slab_ops::AckReceipt> {
+		Err(std::io::Error::new(
+			std::io::ErrorKind::Unsupported,
+			format!("this committer cannot acknowledge for {owner:?}"),
+		))
+	}
+
+	/// The owner's canonical acknowledged prefix after a linearizable barrier.
+	/// `None` when this committer has no such read: nothing may be retired.
+	async fn op_prefix(&self, _owner: crate::consensus::OwnerRef) -> std::io::Result<Option<u64>> {
+		Ok(None)
+	}
+
+	/// This operation's decision and the slabs it names, read together after a
+	/// barrier. A committer with no ring has no such read, and its row stays fenced:
+	/// ring-owned recovery never falls back to a local answer.
+	async fn op_view(
+		&self,
+		key: crate::consensus::slab_ops::OpKey,
+		_digest: [u8; 32],
+		_slabs: Vec<crate::consensus::SlabRef>,
+	) -> std::io::Result<crate::consensus::slab_ops::OpView> {
+		Err(std::io::Error::new(
+			std::io::ErrorKind::Unsupported,
+			format!("this committer cannot read op {key:?}"),
+		))
+	}
+
+	/// The table and index catalogs as this node's state machine has them, for recovering an
+	/// install whose sidecars the live workflow prepared and a crash took with it. A committer
+	/// with no state machine cannot answer, and the row stays fenced.
+	async fn secondary_index_catalogs(
+		&self,
+	) -> std::io::Result<(
+		crate::schema::TableSchemaCatalog,
+		crate::schema::SecondaryIndexCatalog,
+	)> {
+		Err(std::io::Error::new(
+			std::io::ErrorKind::Unsupported,
+			"this committer has no catalogs to recover an install's sidecars with",
+		))
+	}
+}
+
+/// Whether an Ack receipt answers exactly this owner's requested batch.
+pub(crate) fn ack_receipt_answers(
+	receipt: &crate::consensus::slab_ops::AckReceipt,
+	owner: crate::consensus::OwnerRef,
+	requested: &[u64],
+) -> bool {
+	receipt.owner == owner
+		&& receipt
+			.accepted
+			.iter()
+			.chain(&receipt.not_decided)
+			.chain(&receipt.outside_window)
+			.all(|seq| requested.contains(seq))
+}
+
+/// The decision a receipt recorded, verified to be this ticket's own.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VerifiedReceipt {
+	Applied {
+		index: u64,
+	},
+	Rejected {
+		reason: crate::consensus::slab_ops::SlabRejection,
+		index: u64,
+	},
+}
+
+/// A receipt that grants nothing: another operation's identity, a conflict, or
+/// an unavailable outcome. Fence, keep the intent, clean up nothing (ADR 0697 §5.5).
+#[derive(Debug)]
+pub(crate) struct OpReceiptAnomaly(pub(crate) String);
+impl std::fmt::Display for OpReceiptAnomaly {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(f, "operation receipt anomaly: {}", self.0)
+	}
+}
+impl std::error::Error for OpReceiptAnomaly {}
+
+fn op_anomaly(message: String) -> std::io::Error {
+	std::io::Error::new(std::io::ErrorKind::WouldBlock, OpReceiptAnomaly(message))
+}
+
+/// Run work that decodes a whole slab without holding a runtime worker: everything queued behind
+/// that worker would wait, writes included. A current-thread runtime has no other worker to hand
+/// its tasks to, so there it just runs.
+pub(crate) fn cpu_bound_off_the_runtime_worker<T>(work: impl FnOnce() -> T) -> T {
+	match tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor()) {
+		Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(work),
+		_ => work(),
+	}
+}
+
+/// The state machine pruned this operation's outcome: it is at or below its owner's
+/// acknowledged prefix. Not a decision, and nothing was applied by asking.
+#[derive(Debug)]
+pub(crate) struct OpOutcomeUnavailable(pub(crate) crate::consensus::slab_ops::OpKey);
+impl std::fmt::Display for OpOutcomeUnavailable {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(
+			f,
+			"operation receipt anomaly: op {:?} is at or below the acknowledged prefix",
+			self.0
+		)
+	}
+}
+impl std::error::Error for OpOutcomeUnavailable {}
+
+/// Use a receipt only if its owner, sequence and digest are the ticket's.
+pub(crate) fn verify_receipt(
+	ticket: &OpTicket,
+	receipt: crate::consensus::slab_ops::OpReceipt,
+) -> std::io::Result<VerifiedReceipt> {
+	use crate::consensus::slab_ops::{OpOutcome, RecordedOutcome};
+	if receipt.key != ticket.key() || receipt.digest != ticket.digest() {
+		return Err(op_anomaly(format!(
+			"receipt {:?} does not name op {:?}",
+			receipt.key,
+			ticket.key()
+		)));
+	}
+	match receipt.outcome {
+		OpOutcome::Recorded(RecordedOutcome::Applied { index }) => {
+			Ok(VerifiedReceipt::Applied { index })
+		}
+		OpOutcome::Recorded(RecordedOutcome::Rejected { reason, index }) => {
+			Ok(VerifiedReceipt::Rejected { reason, index })
+		}
+		OpOutcome::Conflict => Err(op_anomaly(format!(
+			"op {:?} was decided under another digest",
+			ticket.key()
+		))),
+		OpOutcome::Unavailable => Err(std::io::Error::new(
+			std::io::ErrorKind::WouldBlock,
+			OpOutcomeUnavailable(ticket.key()),
+		)),
+	}
+}
+
+/// The state machine decided this operation applied nothing. Definite for this
+/// one operation; the caller retains its candidate and fences nothing further.
+#[derive(Debug)]
+pub(crate) struct SlabOpRejected(pub(crate) crate::consensus::slab_ops::SlabRejection);
+impl std::fmt::Display for SlabOpRejected {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(f, "slab operation rejected: {:?}", self.0)
+	}
+}
+impl std::error::Error for SlabOpRejected {}
+
+/// A committer expressed by command, for fixtures that stand in for the ring:
+/// it decides directly, and each outcome becomes the receipt a real ring would
+/// have recorded for this ticket. Not used in production; [`RaftCommitter`]
+/// implements [`TierCommitter`] directly.
+#[doc(hidden)]
+#[async_trait]
+pub trait CommandCommitter: Send + Sync {
+	fn should_propose(&self) -> bool {
+		true
+	}
+
 	async fn commit_tier_slab(&self, proposal: TierProposal) -> std::io::Result<()>;
 
-	/// Submit a RetireTieredSlab entry. Returns `Ok(())` only after
-	/// the local state machine has applied the retirement.
-	async fn retire_tiered_slab(&self, slab_id: SlabId) -> std::io::Result<()>;
+	async fn retire_tiered_slab(&self, slab: crate::consensus::SlabRef) -> std::io::Result<()>;
 
-	/// Submit an ADR 055 LSM CompactionCommit entry. Returns
-	/// `Ok(())` only after the local state machine has applied the
-	/// commit and fired the local storage observer.
 	async fn commit_lsm_compaction(
 		&self,
 		commit: crate::storage::CompactionCommit,
@@ -219,6 +401,80 @@ pub trait TierCommitter: Send + Sync {
 			std::io::ErrorKind::Unsupported,
 			"LSM compaction commits are not supported by this committer",
 		))
+	}
+
+	async fn commit_gc_remove(
+		&self,
+		remove: &crate::consensus::slab_ops::GcRemove,
+	) -> std::io::Result<()> {
+		let _ = remove;
+		Err(std::io::Error::new(
+			std::io::ErrorKind::Unsupported,
+			"GC removals are not supported by this committer",
+		))
+	}
+}
+
+#[async_trait]
+impl<T: CommandCommitter> TierCommitter for T {
+	fn should_propose(&self) -> bool {
+		CommandCommitter::should_propose(self)
+	}
+
+	async fn submit_op(&self, ticket: &OpTicket) -> std::io::Result<VerifiedReceipt> {
+		use crate::consensus::slab_ops::{RetireOp, SlabCommand, SlabRejection, TierOp};
+		let decided = match ticket.command() {
+			SlabCommand::Tier(TierOp { tier, .. }) => {
+				self.commit_tier_slab(TierProposal::tokenless(tier.clone()))
+					.await
+			}
+			SlabCommand::Retire(RetireOp { slab, .. }) => self.retire_tiered_slab(*slab).await,
+			SlabCommand::Compaction(commit) => self.commit_lsm_compaction(commit.clone()).await,
+			SlabCommand::GcRemove(remove) => self.commit_gc_remove(remove).await,
+			// Arbitration only a real ring can decide; never a synthetic answer.
+			SlabCommand::Claim(_) | SlabCommand::Complete(_) | SlabCommand::BurnReserved(_) => {
+				Err(std::io::Error::new(
+					std::io::ErrorKind::Unsupported,
+					"this committer has no ring to arbitrate a terminal transition",
+				))
+			}
+		};
+		match decided {
+			Ok(()) => Ok(VerifiedReceipt::Applied { index: 0 }),
+			Err(error)
+				if error
+					.get_ref()
+					.is_some_and(|cause| cause.is::<LsmCommitRejected>()) =>
+			{
+				Ok(VerifiedReceipt::Rejected {
+					reason: SlabRejection::VisibleDomainMismatch,
+					index: 0,
+				})
+			}
+			Err(error) => Err(error),
+		}
+	}
+
+	// Synthetic, as this fixture's decisions are: there is no ring to ask.
+	async fn cancel_op(&self, ticket: &OpTicket) -> std::io::Result<VerifiedReceipt> {
+		Ok(VerifiedReceipt::Rejected {
+			reason: crate::consensus::slab_ops::SlabRejection::Cancelled,
+			index: ticket.key().op_seq,
+		})
+	}
+
+	async fn ack_outcomes(
+		&self,
+		owner: crate::consensus::OwnerRef,
+		seqs: Vec<u64>,
+	) -> std::io::Result<crate::consensus::slab_ops::AckReceipt> {
+		Ok(crate::consensus::slab_ops::AckReceipt {
+			owner,
+			accepted: seqs,
+			not_decided: Vec::new(),
+			outside_window: Vec::new(),
+			acked_through: 0,
+		})
 	}
 }
 
@@ -243,30 +499,123 @@ impl std::fmt::Display for TierCommitNotSubmitted {
 	}
 }
 impl std::error::Error for TierCommitNotSubmitted {}
+/// The window refused this allocation: proven to have written nothing.
+pub(crate) fn op_window_refused(error: &std::io::Error) -> bool {
+	error
+		.get_ref()
+		.is_some_and(|inner| inner.is::<TerminalBacklog>())
+}
+
 pub(crate) fn tier_proposal_not_submitted(error: &std::io::Error) -> bool {
 	error
 		.get_ref()
-		.and_then(|inner| inner.downcast_ref::<TierCommitNotSubmitted>())
-		.is_some()
+		.is_some_and(|inner| inner.is::<TierCommitNotSubmitted>() || inner.is::<TerminalBacklog>())
 }
 
-/// Reserve `tier`'s history and propose it. A refused reservation proposes
-/// nothing, so it is reported as a definite not-submitted outcome and the
-/// caller's existing cleanup of an unsubmitted upload applies unchanged.
+/// Reserve `tier`'s history and propose it as one operation. A refused
+/// reservation or a refused allocation proposes nothing, so it is reported as a
+/// definite not-submitted outcome and the caller's existing cleanup of an
+/// unsubmitted upload applies unchanged. A definite rejection after submission
+/// retains the upload: no committed pointer is inferred from it.
+///
+/// `replaces` is the generation this work was planned from: `None` for a first
+/// publication. It is never re-read here, so a candidate built from A cannot
+/// adopt a newer B as its precondition and overwrite it.
 pub(crate) async fn propose_tier_slab(
 	slab: &SlabManager,
 	committer: &dyn TierCommitter,
 	tier: TieredSlab,
+	replaces: Option<crate::consensus::slab_ops::TierGeneration>,
 ) -> std::io::Result<()> {
-	match slab.reserve_tier_history(tier).await {
-		Ok(proposal) => committer.commit_tier_slab(proposal).await,
+	use crate::consensus::slab_ops::{SlabCommand, TierOp};
+	committer.preflight(tier.slab.owner()).await?;
+	let proposal = match slab.reserve_tier_history(tier.clone()).await {
+		Ok(proposal) => proposal,
 		Err(refusal) => {
 			crate::metrics::global().observe_tier_rewrite_refusal(
 				crate::metrics::TierRewriteRefusalReason::NodeHistoryBudget,
 			);
-			Err(std::io::Error::new(
+			return Err(std::io::Error::new(
 				refusal.kind(),
 				TierCommitNotSubmitted(format!("tier history not reserved: {refusal}")),
+			));
+		}
+	};
+	// Dropping the proposal on this refusal releases its reservation.
+	let allocation = slab
+		.require_op_index()?
+		.allocate_ops(vec![SlabCommand::Tier(TierOp { tier, replaces })], None)
+		.await?;
+	submit_tier_proposal(slab, committer, proposal, allocation.first).await
+}
+
+/// Submit an allocated tier operation under its reservation. An unknown outcome
+/// drops the submission unresolved, which keeps the reservation.
+pub(crate) async fn submit_tier_proposal(
+	slab: &SlabManager,
+	committer: &dyn TierCommitter,
+	proposal: TierProposal,
+	ticket: OpTicket,
+) -> std::io::Result<()> {
+	let submission = proposal.begin_submission().map_err(|refusal| {
+		std::io::Error::new(
+			refusal.kind(),
+			TierCommitNotSubmitted(format!("tier history no longer reserved: {refusal}")),
+		)
+	})?;
+	match committer.submit_op(&ticket).await? {
+		VerifiedReceipt::Applied { .. } => {
+			submission.applied();
+			slab.hand_off_op_if_complete(&ticket).await
+		}
+		VerifiedReceipt::Rejected { reason, .. } => {
+			// The candidate's identity becomes durable in the handoff itself, before
+			// the reservation resolves: the Intent was its only record, and the
+			// caller's own cleanup is not a substitute. Uncertainty keeps both.
+			slab.require_op_index()?
+				.hand_off_rejected_tier(&ticket)
+				.await?;
+			submission.rejected();
+			Err(std::io::Error::new(
+				std::io::ErrorKind::WouldBlock,
+				SlabOpRejected(reason),
+			))
+		}
+	}
+}
+
+/// Retire exactly the generation the work was planned from, as one operation.
+/// The caller staged its cleanup marker first; the marker holds its own evidence,
+/// so it survives a rejection and reconciliation resolves it against the pointer.
+pub(crate) async fn propose_tier_retirement(
+	slab: &SlabManager,
+	committer: &dyn TierCommitter,
+	slab_id: crate::schema::SlabId,
+	expected: crate::consensus::slab_ops::TierGeneration,
+) -> std::io::Result<()> {
+	use crate::consensus::slab_ops::{RetireOp, SlabCommand};
+	let owner = slab.owner_ref()?;
+	committer.preflight(owner).await?;
+	let allocation = slab
+		.require_op_index()?
+		.allocate_ops(
+			vec![SlabCommand::Retire(RetireOp {
+				slab: owner.slab(slab_id),
+				expected,
+			})],
+			None,
+		)
+		.await?;
+	let ticket = allocation.first;
+	match committer.submit_op(&ticket).await? {
+		VerifiedReceipt::Applied { .. } => slab.hand_off_op_if_complete(&ticket).await,
+		VerifiedReceipt::Rejected { reason, .. } => {
+			slab.require_op_index()?
+				.hand_off_op(ticket.key(), ticket.digest(), None)
+				.await?;
+			Err(std::io::Error::new(
+				std::io::ErrorKind::WouldBlock,
+				SlabOpRejected(reason),
 			))
 		}
 	}
@@ -281,17 +630,124 @@ pub(crate) async fn propose_tier_slab(
 /// including ForwardToLeader, remains ambiguous and retains uploaded bytes.
 pub struct RaftCommitter {
 	raft: WendelonRaft,
+	/// The local state machine, to verify the proposer's incarnation is
+	/// current before each slab proposal (ADR 0697).
+	registry: Option<WendelonStateMachine>,
 	#[cfg(test)]
 	submit_without_role_check: bool,
+}
+
+/// The state machine refused a slab command without applying or recording
+/// anything (ADR 0697). Not an outcome: it grants no cleanup authority, marks
+/// no proposal applied, and does not prove an earlier attempt never applied.
+#[derive(Debug)]
+pub(crate) struct SlabCommitRefused(pub(crate) crate::consensus::SlabRefusal);
+impl std::fmt::Display for SlabCommitRefused {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(f, "slab command refused: {:?}", self.0)
+	}
+}
+impl std::error::Error for SlabCommitRefused {}
+
+fn slab_refused(refusal: crate::consensus::SlabRefusal) -> std::io::Error {
+	std::io::Error::new(std::io::ErrorKind::WouldBlock, SlabCommitRefused(refusal))
+}
+
+/// Map a slab command's response: only `Success` acknowledges application.
+fn slab_command_applied(
+	command: &str,
+	data: crate::consensus::WendelonResponse,
+) -> std::io::Result<()> {
+	match data {
+		crate::consensus::WendelonResponse::Success => Ok(()),
+		crate::consensus::WendelonResponse::Refused(refusal) => Err(slab_refused(refusal)),
+		other => Err(std::io::Error::other(format!(
+			"{command} was not applied: {other:?}"
+		))),
+	}
 }
 
 impl RaftCommitter {
 	pub fn new(raft: WendelonRaft) -> Self {
 		Self {
 			raft,
+			registry: None,
 			#[cfg(test)]
 			submit_without_role_check: false,
 		}
+	}
+
+	/// Models the role check passing and the role being lost right after.
+	#[cfg(test)]
+	pub(crate) fn with_role_lost_after_preflight(mut self) -> Self {
+		self.submit_without_role_check = true;
+		self
+	}
+
+	/// Verify the proposer's incarnation against the local state machine's
+	/// registry before each slab proposal.
+	pub fn with_state_machine(mut self, state_machine: WendelonStateMachine) -> Self {
+		self.registry = Some(state_machine);
+		self
+	}
+
+	/// ADR 0697: before each slab proposal, `owner` must be its node's current
+	/// incarnation. An unregistered node registers lazily; a node whose
+	/// registry names another incarnation is refused, never re-registered.
+	/// A registration receipt is not authority: the registry is read again,
+	/// and admission at apply stays final.
+	async fn ensure_registered(&self, owner: crate::consensus::OwnerRef) -> std::io::Result<()> {
+		let current = match &self.registry {
+			Some(state_machine) => {
+				let registry = state_machine.incarnation_registry(owner.node()).await;
+				if registry.current == Some(owner.incarnation()) {
+					return Ok(());
+				}
+				if registry.current.is_some() || registry.retired.contains(&owner.incarnation()) {
+					return Err(slab_refused(
+						crate::consensus::SlabRefusal::NotCurrentOwner {
+							owner,
+							current: registry.current,
+						},
+					));
+				}
+				registry.current
+			}
+			None => None,
+		};
+		let response = self
+			.raft
+			.client_write(WendelonRequest::RegisterIncarnation(
+				crate::consensus::RegisterIncarnation {
+					node: owner.node(),
+					incarnation: owner.incarnation(),
+					supersedes: current,
+				},
+			))
+			.await
+			.map_err(|error| {
+				std::io::Error::new(
+					std::io::ErrorKind::WouldBlock,
+					TierCommitNotSubmitted(format!(
+						"incarnation registration not confirmed: {error}"
+					)),
+				)
+			})?;
+		slab_command_applied("RegisterIncarnation", response.data)?;
+		if let Some(state_machine) = &self.registry
+			&& state_machine
+				.incarnation_registry(owner.node())
+				.await
+				.current != Some(owner.incarnation())
+		{
+			return Err(slab_refused(
+				crate::consensus::SlabRefusal::NotCurrentOwner {
+					owner,
+					current: None,
+				},
+			));
+		}
+		Ok(())
 	}
 	fn require_submission_role(&self) -> std::io::Result<()> {
 		let allowed = self.should_propose();
@@ -316,84 +772,144 @@ impl TierCommitter for RaftCommitter {
 		self.raft.metrics().borrow().state == openraft::ServerState::Leader
 	}
 
-	async fn commit_tier_slab(&self, proposal: TierProposal) -> std::io::Result<()> {
-		// Dropping the proposal on this refusal releases its reservation.
+	async fn preflight(&self, owner: crate::consensus::OwnerRef) -> std::io::Result<()> {
 		self.require_submission_role()?;
-		let tier = proposal.tier().clone();
-		let submission = proposal.begin_submission().map_err(|refusal| {
-			std::io::Error::new(
-				refusal.kind(),
-				TierCommitNotSubmitted(format!("tier history no longer reserved: {refusal}")),
-			)
-		})?;
-		match self
-			.raft
-			.client_write(WendelonRequest::TierSlab(tier))
-			.await
-		{
-			Ok(_) => {
-				submission.applied();
-				Ok(())
-			}
-			Err(openraft::error::RaftError::APIError(
-				openraft::error::ClientWriteError::ForwardToLeader(error),
-			)) => Err(std::io::Error::new(
-				std::io::ErrorKind::WouldBlock,
-				format!("tier proposal outcome ambiguous after client_write: {error}"),
-			)),
-			Err(e) => Err(std::io::Error::new(
-				std::io::ErrorKind::Other,
-				format!("TierSlab commit failed: {e}"),
-			)),
-		}
+		self.ensure_registered(owner).await
 	}
 
-	async fn retire_tiered_slab(&self, slab_id: SlabId) -> std::io::Result<()> {
-		self.require_submission_role()?;
+	async fn submit_op(&self, ticket: &OpTicket) -> std::io::Result<VerifiedReceipt> {
+		use crate::consensus::WendelonResponse;
+		use crate::consensus::slab_ops::{OpResponse, SlabOp};
+		// Every mapping lives here, once. The local role can change after the
+		// preflight; a Forward from here on is an unknown outcome.
 		match self
 			.raft
-			.client_write(WendelonRequest::RetireTieredSlab(RetireTieredSlab {
-				slab_id,
+			.client_write(WendelonRequest::SlabOp(SlabOp {
+				op_seq: ticket.key().op_seq,
+				command: ticket.command().clone(),
 			}))
 			.await
 		{
-			Ok(_) => Ok(()),
+			Ok(response) => match response.data {
+				WendelonResponse::Op(OpResponse::Receipt(receipt)) => {
+					verify_receipt(ticket, receipt)
+				}
+				WendelonResponse::Refused(refusal) => Err(slab_refused(refusal)),
+				other => Err(op_anomaly(format!(
+					"unexpected response to op {:?}: {other:?}",
+					ticket.key()
+				))),
+			},
 			Err(openraft::error::RaftError::APIError(
 				openraft::error::ClientWriteError::ForwardToLeader(error),
 			)) => Err(std::io::Error::new(
 				std::io::ErrorKind::WouldBlock,
-				format!("tier proposal outcome ambiguous after client_write: {error}"),
+				format!("operation outcome ambiguous after client_write: {error}"),
 			)),
-			Err(e) => Err(std::io::Error::new(
-				std::io::ErrorKind::Other,
-				format!("RetireTieredSlab commit failed: {e}"),
-			)),
+			Err(e) => Err(std::io::Error::other(format!(
+				"operation {:?} commit failed: {e}",
+				ticket.key()
+			))),
 		}
 	}
 
-	async fn commit_lsm_compaction(
-		&self,
-		commit: crate::storage::CompactionCommit,
-	) -> std::io::Result<()> {
-		match self
+	async fn cancel_op(&self, ticket: &OpTicket) -> std::io::Result<VerifiedReceipt> {
+		use crate::consensus::WendelonResponse;
+		use crate::consensus::slab_ops::{CancelOp, OpResponse};
+		let response = self
 			.raft
-			.client_write(WendelonRequest::CompactionCommit(commit))
+			.client_write(WendelonRequest::CancelOp(CancelOp {
+				key: ticket.key(),
+				target_digest: ticket.digest(),
+			}))
 			.await
-		{
-			Ok(response) => match response.data {
-				crate::consensus::WendelonResponse::Success => Ok(()),
-				crate::consensus::WendelonResponse::Error(message) => Err(std::io::Error::new(
-					std::io::ErrorKind::InvalidData,
-					LsmCommitRejected(message),
-				)),
-				other => Err(std::io::Error::other(format!(
-					"unexpected LSM response: {other:?}"
-				))),
-			},
-			Err(e) => Err(std::io::Error::other(format!(
-				"CompactionCommit commit failed: {e}"
+			.map_err(|e| std::io::Error::other(format!("CancelOp commit failed: {e}")))?;
+		match response.data {
+			WendelonResponse::Op(OpResponse::Receipt(receipt)) => verify_receipt(ticket, receipt),
+			WendelonResponse::Refused(refusal) => Err(slab_refused(refusal)),
+			other => Err(op_anomaly(format!(
+				"unexpected response to a Cancel of {:?}: {other:?}",
+				ticket.key()
 			))),
 		}
+	}
+
+	async fn ack_outcomes(
+		&self,
+		owner: crate::consensus::OwnerRef,
+		seqs: Vec<u64>,
+	) -> std::io::Result<crate::consensus::slab_ops::AckReceipt> {
+		use crate::consensus::WendelonResponse;
+		use crate::consensus::slab_ops::{AckOutcomes, OpResponse};
+		let response = self
+			.raft
+			.client_write(WendelonRequest::AckOutcomes(AckOutcomes {
+				owner,
+				seqs: seqs.clone(),
+			}))
+			.await
+			.map_err(|e| std::io::Error::other(format!("AckOutcomes commit failed: {e}")))?;
+		match response.data {
+			WendelonResponse::Op(OpResponse::Ack(receipt))
+				if ack_receipt_answers(&receipt, owner, &seqs) =>
+			{
+				Ok(receipt)
+			}
+			WendelonResponse::Refused(refusal) => Err(slab_refused(refusal)),
+			other => Err(op_anomaly(format!(
+				"unexpected response to an Ack for {owner:?}: {other:?}"
+			))),
+		}
+	}
+
+	async fn op_prefix(&self, owner: crate::consensus::OwnerRef) -> std::io::Result<Option<u64>> {
+		let Some(state_machine) = &self.registry else {
+			return Ok(None);
+		};
+		self.raft
+			.ensure_linearizable()
+			.await
+			.map_err(|e| std::io::Error::other(format!("op prefix barrier failed: {e}")))?;
+		Ok(Some(state_machine.op_acked_through(owner).await))
+	}
+
+	async fn op_view(
+		&self,
+		key: crate::consensus::slab_ops::OpKey,
+		digest: [u8; 32],
+		slabs: Vec<crate::consensus::SlabRef>,
+	) -> std::io::Result<crate::consensus::slab_ops::OpView> {
+		let Some(state_machine) = &self.registry else {
+			return Err(std::io::Error::new(
+				std::io::ErrorKind::Unsupported,
+				"this committer has no state machine to read",
+			));
+		};
+		self.raft
+			.ensure_linearizable()
+			.await
+			.map_err(|e| std::io::Error::other(format!("op view barrier failed: {e}")))?;
+		Ok(state_machine.op_view(key, digest, slabs).await)
+	}
+
+	async fn secondary_index_catalogs(
+		&self,
+	) -> std::io::Result<(
+		crate::schema::TableSchemaCatalog,
+		crate::schema::SecondaryIndexCatalog,
+	)> {
+		let Some(state_machine) = &self.registry else {
+			return Err(std::io::Error::new(
+				std::io::ErrorKind::Unsupported,
+				"this committer has no state machine to read",
+			));
+		};
+		self.raft
+			.ensure_linearizable()
+			.await
+			.map_err(|e| std::io::Error::other(format!("catalog barrier failed: {e}")))?;
+		let state = state_machine.state_snapshot().await;
+		Ok((state.table_schemas, state.secondary_indexes))
 	}
 }
 
@@ -604,12 +1120,7 @@ impl SlabSweeper {
 		// Every upload attempt writes a fresh object: a published generation is
 		// immutable, and a retried attempt can never overwrite an object a
 		// committed pointer names.
-		let key = format!(
-			"{}slab_{:016x}_{}.wnd",
-			self.config.key_prefix,
-			info.slab_id,
-			uuid::Uuid::new_v4().simple()
-		);
+		let key = self.object_key("", info.slab_id)?;
 		let upload_started = tokio::time::Instant::now();
 		let l2_uri = self.object_store.put(&key, &encrypted.bytes).await?;
 		metrics()
@@ -647,7 +1158,7 @@ impl SlabSweeper {
 		let (stats_format_version, stats_block_len, stats_block_hash128) =
 			stats_advisory_fields(encrypted.stats_locator);
 		let tier = TieredSlab {
-			slab_id: info.slab_id,
+			slab: self.slab.owner_ref()?.slab(info.slab_id),
 			l2_uri: l2_uri.clone(),
 			payload_hash: expected_hash,
 			is_encrypted: true,
@@ -669,7 +1180,7 @@ impl SlabSweeper {
 			}
 			return Err(error);
 		}
-		if let Err(error) = propose_tier_slab(&self.slab, self.raft.as_ref(), tier).await {
+		if let Err(error) = propose_tier_slab(&self.slab, self.raft.as_ref(), tier, None).await {
 			let not_applied = error
 				.get_ref()
 				.and_then(|inner| inner.downcast_ref::<TierCommitNotSubmitted>())
@@ -727,11 +1238,13 @@ impl SlabSweeper {
 		plaintext_blob: &[u8],
 	) -> std::io::Result<crate::crypto::EncryptedTieredSlab> {
 		let snapshot = self.state_machine.state_snapshot().await;
-		self.slab.encrypt_tiered_object_blob_with_table_stats(
-			slab_id,
-			plaintext_blob,
-			&snapshot.table_schemas,
-		)
+		cpu_bound_off_the_runtime_worker(|| {
+			self.slab.encrypt_tiered_object_blob_with_table_stats(
+				slab_id,
+				plaintext_blob,
+				&snapshot.table_schemas,
+			)
+		})
 	}
 
 	async fn rewrite_plaintext_tiered_slabs_once(
@@ -818,7 +1331,7 @@ impl SlabSweeper {
 		// `rewrite_one_plaintext_tiered_slab`) or failed and was
 		// best-effort deleted; either way, a fresh key keeps the two
 		// attempts independent.
-		let key = self.rewritten_key(pointer.slab_id);
+		let key = self.rewritten_key(pointer.slab_id)?;
 		let planned_uri = self.object_store.planned_upload_uri(&key)?;
 		self.slab
 			.stage_table_drop_l2_cleanup(
@@ -871,7 +1384,7 @@ impl SlabSweeper {
 		let (stats_format_version, stats_block_len, stats_block_hash128) =
 			stats_advisory_fields(encrypted.stats_locator);
 		let tier = TieredSlab {
-			slab_id: pointer.slab_id,
+			slab: self.slab.owner_ref()?.slab(pointer.slab_id),
 			l2_uri: new_uri.clone(),
 			payload_hash: expected_hash,
 			is_encrypted: true,
@@ -886,7 +1399,14 @@ impl SlabSweeper {
 		self.slab
 			.prepare_tier_candidate_proposal(pointer.slab_id, &new_uri)
 			.await?;
-		if let Err(error) = propose_tier_slab(&self.slab, self.raft.as_ref(), tier).await {
+		if let Err(error) = propose_tier_slab(
+			&self.slab,
+			self.raft.as_ref(),
+			tier,
+			Some(crate::consensus::slab_ops::TierGeneration::from(pointer)),
+		)
+		.await
+		{
 			self.cleanup_uploaded_object_after_failed_commit(
 				pointer.slab_id,
 				&new_uri,
@@ -1021,7 +1541,7 @@ impl SlabSweeper {
 			let (stats_format_version, stats_block_len, stats_block_hash128) =
 				stats_advisory_fields(footer.stats_locator);
 			let tier = TieredSlab {
-				slab_id: pointer.slab_id,
+				slab: self.slab.owner_ref()?.slab(pointer.slab_id),
 				l2_uri: pointer.l2_uri.clone(),
 				payload_hash: pointer.payload_hash,
 				is_encrypted: true,
@@ -1033,7 +1553,14 @@ impl SlabSweeper {
 				tombstone_metadata: pointer.tombstone_metadata,
 				supersession_metadata: pointer.supersession_metadata,
 			};
-			if let Err(error) = propose_tier_slab(&self.slab, self.raft.as_ref(), tier).await {
+			if let Err(error) = propose_tier_slab(
+				&self.slab,
+				self.raft.as_ref(),
+				tier,
+				Some(crate::consensus::slab_ops::TierGeneration::from(pointer)),
+			)
+			.await
+			{
 				return Err(error);
 			}
 			let observed_epoch = self.slab.capture_snapshot_epoch();
@@ -1058,7 +1585,7 @@ impl SlabSweeper {
 			)));
 		}
 		let expected_hash = crate::hash::content::digest(&encrypted.bytes);
-		let key = self.rewritten_key(pointer.slab_id);
+		let key = self.rewritten_key(pointer.slab_id)?;
 		let planned_uri = self.object_store.planned_upload_uri(&key)?;
 		self.slab
 			.stage_table_drop_l2_cleanup(
@@ -1111,7 +1638,7 @@ impl SlabSweeper {
 		let (stats_format_version, stats_block_len, stats_block_hash128) =
 			stats_advisory_fields(encrypted.stats_locator);
 		let tier = TieredSlab {
-			slab_id: pointer.slab_id,
+			slab: self.slab.owner_ref()?.slab(pointer.slab_id),
 			l2_uri: new_uri.clone(),
 			payload_hash: expected_hash,
 			is_encrypted: true,
@@ -1126,7 +1653,14 @@ impl SlabSweeper {
 		self.slab
 			.prepare_tier_candidate_proposal(pointer.slab_id, &new_uri)
 			.await?;
-		if let Err(error) = propose_tier_slab(&self.slab, self.raft.as_ref(), tier).await {
+		if let Err(error) = propose_tier_slab(
+			&self.slab,
+			self.raft.as_ref(),
+			tier,
+			Some(crate::consensus::slab_ops::TierGeneration::from(pointer)),
+		)
+		.await
+		{
 			self.cleanup_uploaded_object_after_failed_commit(
 				pointer.slab_id,
 				&new_uri,
@@ -1280,6 +1814,7 @@ impl SlabSweeper {
 			PreparedTieredRetentionRewrite::Rewrite {
 				slab_id,
 				old_l2_uri,
+				old_generation,
 				old_bytes,
 				encrypted_bytes,
 				payload_hash,
@@ -1289,7 +1824,7 @@ impl SlabSweeper {
 				retention_stats,
 				reclaimed_bytes,
 			} => {
-				let key = self.retention_rewritten_key(slab_id);
+				let key = self.retention_rewritten_key(slab_id)?;
 				let planned_uri = self.object_store.planned_upload_uri(&key)?;
 				self.slab
 					.stage_table_drop_l2_cleanup(
@@ -1354,7 +1889,7 @@ impl SlabSweeper {
 				let (stats_format_version, stats_block_len, stats_block_hash128) =
 					stats_advisory_fields(footer.stats_locator);
 				let tier = TieredSlab {
-					slab_id,
+					slab: self.slab.owner_ref()?.slab(slab_id),
 					l2_uri: new_uri.clone(),
 					payload_hash,
 					is_encrypted: true,
@@ -1369,7 +1904,10 @@ impl SlabSweeper {
 				self.slab
 					.prepare_tier_candidate_proposal(slab_id, &new_uri)
 					.await?;
-				if let Err(error) = propose_tier_slab(&self.slab, self.raft.as_ref(), tier).await {
+				if let Err(error) =
+					propose_tier_slab(&self.slab, self.raft.as_ref(), tier, Some(old_generation))
+						.await
+				{
 					self.cleanup_uploaded_object_after_failed_commit(
 						slab_id,
 						&new_uri,
@@ -1434,16 +1972,20 @@ impl SlabSweeper {
 			PreparedTieredRetentionRewrite::Retire {
 				slab_id,
 				old_l2_uri,
+				old_generation,
 				old_bytes,
 				pruned_versions,
 				retention_stats,
 				reclaimed_bytes,
 			} => {
+				self.raft.preflight(self.slab.owner_ref()?).await?;
+				self.slab.require_op_index()?.ensure_op_room(1).await?;
 				self.slab
 					.stage_table_drop_l2_cleanup(slab_id, &old_l2_uri, Some(old_bytes), None)
 					.await?;
 				let observed_epoch = self.slab.capture_snapshot_epoch();
-				self.raft.retire_tiered_slab(slab_id).await?;
+				propose_tier_retirement(&self.slab, self.raft.as_ref(), slab_id, old_generation)
+					.await?;
 				self.slab
 					.retire_tiered_slab_at_snapshot_epoch(slab_id, observed_epoch)
 					.await?;
@@ -1587,63 +2129,30 @@ impl SlabSweeper {
 	/// apply didn't land — which we treat as a terminal failure
 	/// upstream.
 	async fn sm_tier_pointer(&self, slab_id: SlabId) -> Option<TieredSlabPointer> {
+		// ADR 0697: this store's own pointer only, by its owner-qualified key.
+		let owner = self.slab.owner_ref().ok()?;
 		self.state_machine
-			.tiered_slab(slab_id)
+			.tiered_slab(owner.slab(slab_id))
 			.await
-			.map(|t| TieredSlabPointer {
-				slab_id: t.slab_id,
-				l2_uri: t.l2_uri.clone(),
-				payload_hash: t.payload_hash,
-				is_encrypted: t.is_encrypted,
-				tenant_id: t.tenant_id,
-				tenant_kek_id: t.tenant_kek_id,
-				stats_format_version: t.stats_format_version,
-				stats_block_len: t.stats_block_len,
-				stats_block_hash128: t.stats_block_hash128,
-				tombstone_metadata: t.tombstone_metadata,
-				supersession_metadata: t.supersession_metadata,
-			})
+			.map(|t| TieredSlabPointer::from_ring(&t))
 	}
 	fn try_sm_tier_pointer(&self, slab_id: SlabId) -> std::io::Result<Option<TieredSlabPointer>> {
+		let owner = self.slab.owner_ref()?;
 		Ok(self
 			.state_machine
-			.try_tiered_slab(slab_id)?
-			.map(|t| TieredSlabPointer {
-				slab_id: t.slab_id,
-				l2_uri: t.l2_uri.clone(),
-				payload_hash: t.payload_hash,
-				is_encrypted: t.is_encrypted,
-				tenant_id: t.tenant_id,
-				tenant_kek_id: t.tenant_kek_id,
-				stats_format_version: t.stats_format_version,
-				stats_block_len: t.stats_block_len,
-				stats_block_hash128: t.stats_block_hash128,
-				tombstone_metadata: t.tombstone_metadata,
-				supersession_metadata: t.supersession_metadata,
-			}))
+			.try_tiered_slab(owner.slab(slab_id))?
+			.map(|t| TieredSlabPointer::from_ring(&t)))
 	}
 
-	async fn sm_tier_pointers(&self) -> Vec<TieredSlabPointer> {
+	async fn sm_tier_pointers(&self) -> Option<Vec<TieredSlabPointer>> {
+		// ADR 0697: only this store's own pointers. A view that is not
+		// authoritative for this store yields nothing to reconcile.
 		let state = self.state_machine.state_snapshot().await;
-		let mut pointers = state
-			.tiered_slabs
-			.values()
-			.map(|tier| TieredSlabPointer {
-				slab_id: tier.slab_id,
-				l2_uri: tier.l2_uri.clone(),
-				payload_hash: tier.payload_hash,
-				is_encrypted: tier.is_encrypted,
-				tenant_id: tier.tenant_id,
-				tenant_kek_id: tier.tenant_kek_id,
-				stats_format_version: tier.stats_format_version,
-				stats_block_len: tier.stats_block_len,
-				stats_block_hash128: tier.stats_block_hash128,
-				tombstone_metadata: tier.tombstone_metadata,
-				supersession_metadata: tier.supersession_metadata,
-			})
-			.collect::<Vec<_>>();
+		let mut pointers = self
+			.slab
+			.own_tier_view(state.tiered_slabs.values(), &state.incarnations)?;
 		pointers.sort_by_key(|pointer| pointer.slab_id);
-		pointers
+		Some(pointers)
 	}
 
 	/// A proposal plans from this node's published generation. When the
@@ -1718,7 +2227,11 @@ impl SlabSweeper {
 	) -> std::io::Result<TieredStateReconcileReport> {
 		let mut report = TieredStateReconcileReport::default();
 		let observed_epoch = self.slab.capture_snapshot_epoch();
-		let authoritative = self.sm_tier_pointers().await;
+		// A view that is not authoritative for this store (already fenced)
+		// must not read as "nothing committed": reconcile nothing.
+		let Some(authoritative) = self.sm_tier_pointers().await else {
+			return Ok(report);
+		};
 		#[cfg(test)]
 		{
 			let hold = self.reconcile_snapshot_hold.lock().unwrap().take();
@@ -1878,7 +2391,7 @@ impl SlabSweeper {
 			.await?;
 		let supersession_metadata = self.slab.slab_supersession_metadata(pointer.slab_id)?;
 		let tier = TieredSlab {
-			slab_id: pointer.slab_id,
+			slab: self.slab.owner_ref()?.slab(pointer.slab_id),
 			l2_uri: pointer.l2_uri.clone(),
 			payload_hash: pointer.payload_hash,
 			is_encrypted: pointer.is_encrypted,
@@ -1890,7 +2403,13 @@ impl SlabSweeper {
 			tombstone_metadata: pointer.tombstone_metadata,
 			supersession_metadata,
 		};
-		propose_tier_slab(&self.slab, self.raft.as_ref(), tier).await?;
+		propose_tier_slab(
+			&self.slab,
+			self.raft.as_ref(),
+			tier,
+			Some(crate::consensus::slab_ops::TierGeneration::from(pointer)),
+		)
+		.await?;
 		let observed_epoch = self.slab.capture_snapshot_epoch();
 		if let Some(pointer) = self.sm_tier_pointer(pointer.slab_id).await {
 			self.slab
@@ -1961,22 +2480,27 @@ impl SlabSweeper {
 		}
 	}
 
-	fn rewritten_key(&self, slab_id: SlabId) -> String {
-		format!(
-			"{}crypto/slab_{:016x}_{}.wnd",
+	/// A fresh object key for one of this store's slabs. The owner segment
+	/// (ADR 0697) is for legibility and prefix listing only: authority comes
+	/// from the owner-qualified committed pointer, never from a key.
+	fn object_key(&self, kind: &str, slab_id: SlabId) -> std::io::Result<String> {
+		let owner = self.slab.owner_ref()?;
+		Ok(format!(
+			"{}{kind}{:08x}-{:032x}/slab_{:016x}_{}.wnd",
 			self.config.key_prefix,
+			owner.node(),
+			owner.incarnation().get(),
 			slab_id,
 			uuid::Uuid::new_v4().simple()
-		)
+		))
 	}
 
-	fn retention_rewritten_key(&self, slab_id: SlabId) -> String {
-		format!(
-			"{}retention/slab_{:016x}_{}.wnd",
-			self.config.key_prefix,
-			slab_id,
-			uuid::Uuid::new_v4().simple()
-		)
+	fn rewritten_key(&self, slab_id: SlabId) -> std::io::Result<String> {
+		self.object_key("crypto/", slab_id)
+	}
+
+	fn retention_rewritten_key(&self, slab_id: SlabId) -> std::io::Result<String> {
+		self.object_key("retention/", slab_id)
 	}
 
 	/// Background loop shape: sleep until the next scan deadline
@@ -2128,36 +2652,41 @@ impl TierObserver for ManagerTierObserver {
 		let _ = self.snapshot_source.set(source);
 	}
 
-	fn before_tier_snapshot_install(&self) -> std::io::Result<u64> {
-		self.slab.begin_tier_snapshot_install()
+	fn before_tier_snapshot_install(
+		&self,
+		index: Option<u64>,
+		registries: &std::collections::BTreeMap<u32, crate::consensus::IncarnationRegistry>,
+	) -> std::io::Result<u64> {
+		self.slab.begin_tier_snapshot_install_at(index, registries)
 	}
 
 	async fn on_tier_snapshot_installed(
 		&self,
 		tiers: &[TieredSlab],
+		registries: &std::collections::BTreeMap<u32, crate::consensus::IncarnationRegistry>,
 		index: Option<u64>,
 		snapshot_epoch: u64,
 	) -> std::io::Result<()> {
+		// ADR 0697: reconcile only this store's own pointers. A view that is
+		// not authoritative for this store (already fenced) retires nothing
+		// and leaves the snapshot install fence in place.
+		// A callback a newer comparison superseded decides nothing and mints no
+		// fence: it is refused as obsolete, as the comparison would refuse it.
+		let pointers = match self.slab.own_tier_view_from(
+			tiers.iter(),
+			registries,
+			OwnerEvidence::SnapshotInstall(snapshot_epoch),
+		) {
+			OwnTierView::Authoritative(pointers) => pointers,
+			OwnTierView::NotAuthoritative => return Ok(()),
+			OwnTierView::Obsolete => {
+				return Err(crate::storage::manager::tier_authority::obsolete_verification());
+			}
+		};
 		let canonical = match self.snapshot_source.get() {
 			Some(source) => Some(source.read().await?),
 			None => None,
 		};
-		let pointers = tiers
-			.iter()
-			.map(|tier| TieredSlabPointer {
-				slab_id: tier.slab_id,
-				l2_uri: tier.l2_uri.clone(),
-				payload_hash: tier.payload_hash,
-				is_encrypted: tier.is_encrypted,
-				tenant_id: tier.tenant_id,
-				tenant_kek_id: tier.tenant_kek_id,
-				stats_format_version: tier.stats_format_version,
-				stats_block_len: tier.stats_block_len,
-				stats_block_hash128: tier.stats_block_hash128,
-				tombstone_metadata: tier.tombstone_metadata,
-				supersession_metadata: tier.supersession_metadata,
-			})
-			.collect();
 		match self
 			.slab
 			.finish_tier_snapshot_install_at_epoch(pointers, index, snapshot_epoch)
@@ -2189,7 +2718,16 @@ impl TierObserver for ManagerTierObserver {
 		}
 	}
 
-	fn before_slab_retired(&self, slab_id: SlabId, applied_log_index: u64) {
+	fn before_slab_retired(
+		&self,
+		slab: crate::consensus::SlabRef,
+		registry: &crate::consensus::IncarnationRegistry,
+		applied_log_index: u64,
+	) {
+		let evidence = OwnerEvidence::Applied(applied_log_index);
+		let Ownership::Own(slab_id) = self.slab.classify_ring_slab(slab, registry, evidence) else {
+			return;
+		};
 		if !self.slab.observer_is_superseded(Some(applied_log_index)) {
 			self.slab
 				.fence_unapplied_tier_retirement(slab_id, Some(applied_log_index));
@@ -2199,33 +2737,35 @@ impl TierObserver for ManagerTierObserver {
 	async fn on_slab_tiered(
 		&self,
 		tier: &TieredSlab,
+		registry: &crate::consensus::IncarnationRegistry,
 		applied_log_index: u64,
 	) -> std::io::Result<()> {
+		// ADR 0697: only this store's own slab reaches the manager.
+		if !matches!(
+			self.slab.classify_ring_slab(
+				tier.slab,
+				registry,
+				OwnerEvidence::Applied(applied_log_index)
+			),
+			Ownership::Own(_)
+		) {
+			return Ok(());
+		}
 		self.slab
-			.apply_tier_slab_committed(
-				TieredSlabPointer {
-					slab_id: tier.slab_id,
-					l2_uri: tier.l2_uri.clone(),
-					payload_hash: tier.payload_hash,
-					is_encrypted: tier.is_encrypted,
-					tenant_id: tier.tenant_id,
-					tenant_kek_id: tier.tenant_kek_id,
-					stats_format_version: tier.stats_format_version,
-					stats_block_len: tier.stats_block_len,
-					stats_block_hash128: tier.stats_block_hash128,
-					tombstone_metadata: tier.tombstone_metadata,
-					supersession_metadata: tier.supersession_metadata,
-				},
-				Some(applied_log_index),
-			)
+			.apply_tier_slab_committed(TieredSlabPointer::from_ring(tier), Some(applied_log_index))
 			.await
 	}
 
 	async fn on_slab_retired(
 		&self,
-		slab_id: SlabId,
+		slab: crate::consensus::SlabRef,
+		registry: &crate::consensus::IncarnationRegistry,
 		applied_log_index: u64,
 	) -> std::io::Result<()> {
+		let evidence = OwnerEvidence::Applied(applied_log_index);
+		let Ownership::Own(slab_id) = self.slab.classify_ring_slab(slab, registry, evidence) else {
+			return Ok(());
+		};
 		let result = self
 			.slab
 			.retire_tiered_slab_committed(slab_id, Some(applied_log_index))
@@ -2252,11 +2792,64 @@ impl TierObserver for ManagerTierObserver {
 	async fn on_lsm_compaction_committed(
 		&self,
 		commit: &crate::storage::CompactionCommit,
+		registry: &crate::consensus::IncarnationRegistry,
 		applied_log_index: u64,
 	) -> std::io::Result<()> {
+		// ADR 0697: a compaction commit is single-owner; every id in it is
+		// local to that owner and never applied to another store.
+		if !matches!(
+			self.slab.classify_ring_owner(
+				commit.owner,
+				registry,
+				OwnerEvidence::Applied(applied_log_index)
+			),
+			Ownership::Own(_)
+		) {
+			return Ok(());
+		}
 		self.slab
 			.observe_lsm_compaction_commit(commit, applied_log_index)
 			.await
+	}
+
+	async fn on_gc_removed(
+		&self,
+		remove: &crate::consensus::slab_ops::GcRemove,
+		op_seq: u64,
+		registry: &crate::consensus::IncarnationRegistry,
+		applied_log_index: u64,
+	) -> std::io::Result<()> {
+		if !matches!(
+			self.slab.classify_ring_owner(
+				remove.slab.owner(),
+				registry,
+				OwnerEvidence::Applied(applied_log_index)
+			),
+			Ownership::Own(_)
+		) {
+			return Ok(());
+		}
+		self.slab
+			.observe_lsm_gc_removed(remove, op_seq, applied_log_index)
+			.await
+	}
+
+	async fn on_incarnation_registry(
+		&self,
+		node: u32,
+		registry: &crate::consensus::IncarnationRegistry,
+		applied_log_index: u64,
+	) -> std::io::Result<()> {
+		// A registration-only supersession of this store fences it.
+		if self
+			.slab
+			.owner_ref()
+			.is_ok_and(|local| local.node() == node)
+		{
+			self.slab
+				.classify_own_node(registry, OwnerEvidence::Applied(applied_log_index));
+		}
+		Ok(())
 	}
 }
 
@@ -2327,7 +2920,7 @@ mod tests {
 	}
 
 	#[async_trait]
-	impl TierCommitter for DirectApplyCommitter {
+	impl CommandCommitter for DirectApplyCommitter {
 		async fn commit_tier_slab(
 			&self,
 			proposal: crate::storage::TierProposal,
@@ -2351,19 +2944,23 @@ mod tests {
 			if let Some(sm) = &self.state_machine {
 				sm.seed_tiered_slab_for_test(tier.clone()).await;
 			}
-			self.observer.on_slab_tiered(&tier, 0).await?;
+			self.observer
+				.on_slab_tiered(&tier, &current_registry(tier.slab.owner()), 0)
+				.await?;
 			submission.applied();
 			Ok(())
 		}
 
-		async fn retire_tiered_slab(&self, slab_id: SlabId) -> std::io::Result<()> {
+		async fn retire_tiered_slab(&self, slab: crate::consensus::SlabRef) -> std::io::Result<()> {
 			if let Some(kind) = *self.persistent_err.lock().await {
 				return Err(std::io::Error::new(kind, "simulated commit failure"));
 			}
 			if let Some(sm) = &self.state_machine {
-				sm.retire_tiered_slab_for_test(slab_id).await;
+				sm.retire_tiered_slab_for_test(slab).await;
 			}
-			self.observer.on_slab_retired(slab_id, 0).await?;
+			self.observer
+				.on_slab_retired(slab, &current_registry(slab.owner()), 0)
+				.await?;
 			Ok(())
 		}
 	}
@@ -2382,9 +2979,23 @@ mod tests {
 		crate::test_support::TestDir::new(&format!("wendelon-sweeper-{tag}"))
 	}
 
-	async fn seed_state_machine_pointer(sm: &WendelonStateMachine, pointer: &TieredSlabPointer) {
+	/// The registry a committed slab command carries for its owner (ADR 0697).
+	fn current_registry(
+		owner: crate::consensus::OwnerRef,
+	) -> crate::consensus::IncarnationRegistry {
+		crate::consensus::IncarnationRegistry {
+			current: Some(owner.incarnation()),
+			..Default::default()
+		}
+	}
+
+	async fn seed_state_machine_pointer(
+		sm: &WendelonStateMachine,
+		manager: &SlabManager,
+		pointer: &TieredSlabPointer,
+	) {
 		sm.seed_tiered_slab_for_test(TieredSlab {
-			slab_id: pointer.slab_id,
+			slab: manager.owner_ref().unwrap().slab(pointer.slab_id),
 			l2_uri: pointer.l2_uri.clone(),
 			payload_hash: pointer.payload_hash,
 			is_encrypted: pointer.is_encrypted,
@@ -2610,6 +3221,7 @@ mod tests {
 			sm,
 			SweeperConfig {
 				scan_interval: Duration::from_millis(10),
+				op_driver_interval: Duration::from_millis(500),
 				min_slab_bytes: 0,
 				max_upload_bytes_per_sec: None,
 				key_prefix: "tier/".into(),
@@ -2702,6 +3314,7 @@ mod tests {
 			sm.clone(),
 			SweeperConfig {
 				scan_interval: Duration::from_millis(10),
+				op_driver_interval: Duration::from_millis(500),
 				min_slab_bytes: 0,
 				max_upload_bytes_per_sec: None,
 				key_prefix: "tier/".into(),
@@ -2723,7 +3336,7 @@ mod tests {
 		let snapshot = sm.state_snapshot().await;
 		let committed_pointer = snapshot
 			.tiered_slabs
-			.get(&sealed_id)
+			.get(&manager.owner_ref().unwrap().slab(sealed_id))
 			.expect("state machine committed tier pointer");
 		assert_eq!(
 			committed_pointer.tombstone_metadata,
@@ -2758,6 +3371,7 @@ mod tests {
 			sm,
 			SweeperConfig {
 				scan_interval: Duration::from_millis(10),
+				op_driver_interval: Duration::from_millis(500),
 				min_slab_bytes: 0,
 				max_upload_bytes_per_sec: None,
 				key_prefix: String::new(),
@@ -2790,6 +3404,7 @@ mod tests {
 			sm,
 			SweeperConfig {
 				scan_interval: Duration::from_millis(10),
+				op_driver_interval: Duration::from_millis(500),
 				// Each sealed slab is ~4K on disk; set the floor
 				// absurdly high so nothing qualifies.
 				min_slab_bytes: u64::MAX,
@@ -2825,6 +3440,7 @@ mod tests {
 			sm,
 			SweeperConfig {
 				scan_interval: Duration::from_millis(10),
+				op_driver_interval: Duration::from_millis(500),
 				min_slab_bytes: 0,
 				max_upload_bytes_per_sec: None,
 				key_prefix: String::new(),
@@ -2909,7 +3525,7 @@ mod tests {
 		}
 		let observer: Arc<dyn TierObserver> = Arc::new(ManagerTierObserver::new(manager.clone()));
 		let sm = WendelonStateMachine::new().with_tier_observer(observer.clone());
-		seed_state_machine_pointer(&sm, &old).await;
+		seed_state_machine_pointer(&sm, &manager, &old).await;
 		let committer: Arc<dyn TierCommitter> =
 			Arc::new(DirectApplyCommitter::ok(sm.clone(), observer));
 		let sweeper = SlabSweeper::new(
@@ -2934,21 +3550,23 @@ mod tests {
 			&mut target,
 			[Entry {
 				log_id: LogId::new(CommittedLeaderId::new(3, 1), 702),
-				payload: EntryPayload::Normal(crate::consensus::WendelonRequest::TierSlab(
-					TieredSlab {
-						slab_id: current.slab_id,
-						l2_uri: current.l2_uri.clone(),
-						payload_hash: current.payload_hash,
-						is_encrypted: current.is_encrypted,
-						tenant_id: current.tenant_id,
-						tenant_kek_id: current.tenant_kek_id,
-						stats_format_version: current.stats_format_version,
-						stats_block_len: current.stats_block_len,
-						stats_block_hash128: current.stats_block_hash128,
-						tombstone_metadata: current.tombstone_metadata,
-						supersession_metadata: current.supersession_metadata,
-					},
-				)),
+				payload: EntryPayload::Normal(
+					manager
+						.tier_request_for_test(TieredSlab {
+							slab: manager.owner_ref().unwrap().slab(current.slab_id),
+							l2_uri: current.l2_uri.clone(),
+							payload_hash: current.payload_hash,
+							is_encrypted: current.is_encrypted,
+							tenant_id: current.tenant_id,
+							tenant_kek_id: current.tenant_kek_id,
+							stats_format_version: current.stats_format_version,
+							stats_block_len: current.stats_block_len,
+							stats_block_hash128: current.stats_block_hash128,
+							tombstone_metadata: current.tombstone_metadata,
+							supersession_metadata: current.supersession_metadata,
+						})
+						.await,
+				),
 			}],
 		)
 		.await
@@ -3049,7 +3667,7 @@ mod tests {
 		current.tenant_kek_id = Some(new_object.tenant_kek_id);
 		let observer: Arc<dyn TierObserver> = Arc::new(ManagerTierObserver::new(manager.clone()));
 		let sm = WendelonStateMachine::new().with_tier_observer(observer.clone());
-		seed_state_machine_pointer(&sm, &old).await;
+		seed_state_machine_pointer(&sm, &manager, &old).await;
 		let committer: Arc<dyn TierCommitter> =
 			Arc::new(DirectApplyCommitter::ok(sm.clone(), observer));
 		let sweeper = SlabSweeper::new(
@@ -3074,21 +3692,23 @@ mod tests {
 			&mut target,
 			[Entry {
 				log_id: LogId::new(CommittedLeaderId::new(3, 1), 702),
-				payload: EntryPayload::Normal(crate::consensus::WendelonRequest::TierSlab(
-					TieredSlab {
-						slab_id: current.slab_id,
-						l2_uri: current.l2_uri.clone(),
-						payload_hash: current.payload_hash,
-						is_encrypted: current.is_encrypted,
-						tenant_id: current.tenant_id,
-						tenant_kek_id: current.tenant_kek_id,
-						stats_format_version: current.stats_format_version,
-						stats_block_len: current.stats_block_len,
-						stats_block_hash128: current.stats_block_hash128,
-						tombstone_metadata: current.tombstone_metadata,
-						supersession_metadata: current.supersession_metadata,
-					},
-				)),
+				payload: EntryPayload::Normal(
+					manager
+						.tier_request_for_test(TieredSlab {
+							slab: manager.owner_ref().unwrap().slab(current.slab_id),
+							l2_uri: current.l2_uri.clone(),
+							payload_hash: current.payload_hash,
+							is_encrypted: current.is_encrypted,
+							tenant_id: current.tenant_id,
+							tenant_kek_id: current.tenant_kek_id,
+							stats_format_version: current.stats_format_version,
+							stats_block_len: current.stats_block_len,
+							stats_block_hash128: current.stats_block_hash128,
+							tombstone_metadata: current.tombstone_metadata,
+							supersession_metadata: current.supersession_metadata,
+						})
+						.await,
+				),
 			}],
 		)
 		.await
@@ -3183,26 +3803,45 @@ mod tests {
 			.unwrap()
 			.forget();
 		let mut target = sm.clone();
+		// The owner registers first, as its committer does before its first
+		// slab proposal (ADR 0697); the reconcile view was captured before both.
+		let owner = manager.owner_ref().unwrap();
 		RaftStateMachine::apply(
 			&mut target,
-			[Entry {
-				log_id: LogId::new(CommittedLeaderId::new(3, 1), 703),
-				payload: EntryPayload::Normal(crate::consensus::WendelonRequest::TierSlab(
-					TieredSlab {
-						slab_id: pointer.slab_id,
-						l2_uri: pointer.l2_uri.clone(),
-						payload_hash: pointer.payload_hash,
-						is_encrypted: pointer.is_encrypted,
-						tenant_id: pointer.tenant_id,
-						tenant_kek_id: pointer.tenant_kek_id,
-						stats_format_version: pointer.stats_format_version,
-						stats_block_len: pointer.stats_block_len,
-						stats_block_hash128: pointer.stats_block_hash128,
-						tombstone_metadata: pointer.tombstone_metadata,
-						supersession_metadata: pointer.supersession_metadata,
-					},
-				)),
-			}],
+			[
+				Entry {
+					log_id: LogId::new(CommittedLeaderId::new(3, 1), 702),
+					payload: EntryPayload::Normal(
+						crate::consensus::WendelonRequest::RegisterIncarnation(
+							crate::consensus::RegisterIncarnation {
+								node: owner.node(),
+								incarnation: owner.incarnation(),
+								supersedes: None,
+							},
+						),
+					),
+				},
+				Entry {
+					log_id: LogId::new(CommittedLeaderId::new(3, 1), 703),
+					payload: EntryPayload::Normal(
+						manager
+							.tier_request_for_test(TieredSlab {
+								slab: manager.owner_ref().unwrap().slab(pointer.slab_id),
+								l2_uri: pointer.l2_uri.clone(),
+								payload_hash: pointer.payload_hash,
+								is_encrypted: pointer.is_encrypted,
+								tenant_id: pointer.tenant_id,
+								tenant_kek_id: pointer.tenant_kek_id,
+								stats_format_version: pointer.stats_format_version,
+								stats_block_len: pointer.stats_block_len,
+								stats_block_hash128: pointer.stats_block_hash128,
+								tombstone_metadata: pointer.tombstone_metadata,
+								supersession_metadata: pointer.supersession_metadata,
+							})
+							.await,
+					),
+				},
+			],
 		)
 		.await
 		.unwrap();
@@ -3223,7 +3862,7 @@ mod tests {
 			sm.state_snapshot()
 				.await
 				.tiered_slabs
-				.get(&pointer.slab_id)
+				.get(&manager.owner_ref().unwrap().slab(pointer.slab_id))
 				.map(|p| p.l2_uri.clone()),
 			Some(pointer.l2_uri.clone()),
 			"the state machine still names the live slab"
@@ -3272,27 +3911,39 @@ mod tests {
 
 	#[async_trait]
 	impl TierCommitter for A4PausedLogCommitter {
-		async fn commit_tier_slab(
-			&self,
-			proposal: crate::storage::TierProposal,
-		) -> std::io::Result<()> {
-			let tier = proposal.tier().clone();
-			self.entered.add_permits(1);
-			self.release.acquire().await.unwrap().forget();
+		async fn submit_op(&self, ticket: &OpTicket) -> std::io::Result<VerifiedReceipt> {
+			if matches!(
+				ticket.command(),
+				crate::consensus::slab_ops::SlabCommand::Tier(_)
+			) {
+				self.entered.add_permits(1);
+				self.release.acquire().await.unwrap().forget();
+			}
+			// ADR 0697: the owner registers before its slab command (an exact
+			// replay is a receipt).
+			let owner = ticket.key().owner;
 			a4_apply_control_request(
 				&self.sm,
 				&self.index,
-				crate::consensus::WendelonRequest::TierSlab(tier),
+				crate::consensus::WendelonRequest::RegisterIncarnation(
+					crate::consensus::RegisterIncarnation {
+						node: owner.node(),
+						incarnation: owner.incarnation(),
+						supersedes: None,
+					},
+				),
 			)
-			.await
-		}
-		async fn retire_tiered_slab(&self, slab_id: SlabId) -> std::io::Result<()> {
+			.await?;
 			a4_apply_control_request(
 				&self.sm,
 				&self.index,
-				crate::consensus::WendelonRequest::RetireTieredSlab(RetireTieredSlab { slab_id }),
+				crate::consensus::WendelonRequest::SlabOp(crate::consensus::slab_ops::SlabOp {
+					op_seq: ticket.key().op_seq,
+					command: ticket.command().clone(),
+				}),
 			)
-			.await
+			.await?;
+			Ok(VerifiedReceipt::Applied { index: 0 })
 		}
 	}
 
@@ -3332,7 +3983,7 @@ mod tests {
 		assert_eq!(manager.read(location).await.unwrap(), b"hello-1");
 		let observer: Arc<dyn TierObserver> = Arc::new(ManagerTierObserver::new(manager.clone()));
 		let sm = WendelonStateMachine::new().with_tier_observer(observer);
-		seed_state_machine_pointer(&sm, &old).await;
+		seed_state_machine_pointer(&sm, &manager, &old).await;
 		if !backfill {
 			let crypto = manager.retained_cleanup_test_crypto();
 			let rotation = crypto.prepare_rotation(tenant()).unwrap();
@@ -3364,7 +4015,9 @@ mod tests {
 			a4_apply_control_request(
 				&sm,
 				&index,
-				crate::consensus::WendelonRequest::RetireTieredSlab(RetireTieredSlab { slab_id }),
+				manager
+					.retire_request_for_test(manager.owner_ref().unwrap().slab(slab_id))
+					.await,
 			)
 			.await
 			.unwrap();
@@ -3402,9 +4055,9 @@ mod tests {
 					a4_apply_control_request(
 						&sm,
 						&index,
-						crate::consensus::WendelonRequest::RetireTieredSlab(RetireTieredSlab {
-							slab_id,
-						}),
+						manager
+							.retire_request_for_test(manager.owner_ref().unwrap().slab(slab_id))
+							.await,
 					)
 					.await
 					.unwrap();
@@ -3412,7 +4065,7 @@ mod tests {
 						!sm.state_snapshot()
 							.await
 							.tiered_slabs
-							.contains_key(&slab_id),
+							.contains_key(&manager.owner_ref().unwrap().slab(slab_id)),
 						"retirement must be applied before stale maintenance resumes"
 					);
 					drop(claim);
@@ -3426,9 +4079,9 @@ mod tests {
 					a4_apply_control_request(
 						&sm,
 						&index,
-						crate::consensus::WendelonRequest::RetireTieredSlab(RetireTieredSlab {
-							slab_id,
-						}),
+						manager
+							.retire_request_for_test(manager.owner_ref().unwrap().slab(slab_id))
+							.await,
 					)
 					.await
 					.unwrap();
@@ -3441,7 +4094,7 @@ mod tests {
 			!sm.state_snapshot()
 				.await
 				.tiered_slabs
-				.contains_key(&slab_id),
+				.contains_key(&manager.owner_ref().unwrap().slab(slab_id)),
 			"A4 stale maintenance resurrected a retired slab; backfill={backfill}; maintenance={result:?}"
 		);
 		if let Ok(Some(location)) = manager.lookup(tenant(), id(1)) {
@@ -3592,7 +4245,7 @@ mod tests {
 			.unwrap();
 		let observer: Arc<dyn TierObserver> = Arc::new(ManagerTierObserver::new(manager.clone()));
 		let sm = WendelonStateMachine::new().with_tier_observer(observer.clone());
-		seed_state_machine_pointer(&sm, &old_pointer).await;
+		seed_state_machine_pointer(&sm, &manager, &old_pointer).await;
 		let committer: Arc<dyn TierCommitter> =
 			Arc::new(DirectApplyCommitter::ok(sm.clone(), observer));
 		let sweeper = SlabSweeper::new(
@@ -3612,7 +4265,7 @@ mod tests {
 			.unwrap()
 			.forget();
 		let mut source = WendelonStateMachine::new();
-		seed_state_machine_pointer(&source, &current_pointer).await;
+		seed_state_machine_pointer(&source, &manager, &current_pointer).await;
 		RaftStateMachine::apply(
 			&mut source,
 			[Entry {
@@ -3671,7 +4324,7 @@ mod tests {
 		manager.apply_tier_slab(old.clone()).await.unwrap();
 		let observer: Arc<dyn TierObserver> = Arc::new(ManagerTierObserver::new(manager.clone()));
 		let sm = WendelonStateMachine::new().with_tier_observer(observer.clone());
-		seed_state_machine_pointer(&sm, &old).await;
+		seed_state_machine_pointer(&sm, &manager, &old).await;
 		let committer: Arc<dyn TierCommitter> =
 			Arc::new(DirectApplyCommitter::ok(sm.clone(), observer));
 		let sweeper = SlabSweeper::new(
@@ -3708,7 +4361,7 @@ mod tests {
 			tombstone_metadata: TombstoneMetadata::None,
 			supersession_metadata: SupersessionMetadata::None,
 		};
-		seed_state_machine_pointer(&source, &old_pointer).await;
+		seed_state_machine_pointer(&source, &manager, &old_pointer).await;
 		RaftStateMachine::apply(
 			&mut source,
 			[Entry {
@@ -3839,7 +4492,7 @@ mod tests {
 		let mut replacement = old;
 		replacement.l2_uri = new_uri;
 		let mut source = WendelonStateMachine::new();
-		seed_state_machine_pointer(&source, &replacement).await;
+		seed_state_machine_pointer(&source, &manager, &replacement).await;
 		RaftStateMachine::apply(
 			&mut source,
 			[Entry {
@@ -3891,7 +4544,7 @@ mod tests {
 		let mut replacement = old;
 		replacement.l2_uri = new_uri;
 		let sm = WendelonStateMachine::new();
-		seed_state_machine_pointer(&sm, &replacement).await;
+		seed_state_machine_pointer(&sm, &manager, &replacement).await;
 		let observer: Arc<dyn TierObserver> = Arc::new(ManagerTierObserver::new(manager.clone()));
 		let committer: Arc<dyn TierCommitter> =
 			Arc::new(DirectApplyCommitter::ok(sm.clone(), observer));
@@ -3943,7 +4596,7 @@ mod tests {
 		assert_eq!(manager.read(loc).await.unwrap(), b"hello-1");
 
 		let sm = WendelonStateMachine::new();
-		seed_state_machine_pointer(&sm, &old_pointer).await;
+		seed_state_machine_pointer(&sm, &manager, &old_pointer).await;
 		let observer: Arc<dyn TierObserver> = Arc::new(ManagerTierObserver::new(manager.clone()));
 		let committer: Arc<dyn TierCommitter> =
 			Arc::new(DirectApplyCommitter::ok(sm.clone(), observer));
@@ -3954,6 +4607,7 @@ mod tests {
 			sm,
 			SweeperConfig {
 				scan_interval: Duration::from_millis(10),
+				op_driver_interval: Duration::from_millis(500),
 				min_slab_bytes: 0,
 				max_upload_bytes_per_sec: None,
 				key_prefix: "tier/".into(),
@@ -4039,6 +4693,7 @@ mod tests {
 			sm,
 			SweeperConfig {
 				scan_interval: Duration::from_millis(10),
+				op_driver_interval: Duration::from_millis(500),
 				min_slab_bytes: 0,
 				max_upload_bytes_per_sec: None,
 				key_prefix: "tier/".into(),
@@ -4140,6 +4795,7 @@ mod tests {
 			sm.clone(),
 			SweeperConfig {
 				scan_interval: Duration::from_millis(10),
+				op_driver_interval: Duration::from_millis(500),
 				min_slab_bytes: 0,
 				max_upload_bytes_per_sec: None,
 				key_prefix: "tier/".into(),
@@ -4176,7 +4832,7 @@ mod tests {
 			.apply_tier_slab(metadata_missing_pointer.clone())
 			.await
 			.unwrap();
-		seed_state_machine_pointer(&sm, &metadata_missing_pointer).await;
+		seed_state_machine_pointer(&sm, &manager, &metadata_missing_pointer).await;
 
 		let second = sweeper.sweep_once().await.unwrap();
 		assert_eq!(second.rewrapped_tiered_deks, 0);
@@ -4282,7 +4938,7 @@ mod tests {
 		);
 
 		let sm = WendelonStateMachine::new();
-		seed_state_machine_pointer(&sm, &old_pointer).await;
+		seed_state_machine_pointer(&sm, &manager, &old_pointer).await;
 		let observer: Arc<dyn TierObserver> = Arc::new(ManagerTierObserver::new(manager.clone()));
 		let committer: Arc<dyn TierCommitter> =
 			Arc::new(DirectApplyCommitter::ok(sm.clone(), observer));
@@ -4293,6 +4949,7 @@ mod tests {
 			sm,
 			SweeperConfig {
 				scan_interval: Duration::from_millis(10),
+				op_driver_interval: Duration::from_millis(500),
 				min_slab_bytes: 0,
 				max_upload_bytes_per_sec: None,
 				key_prefix: "tier/".into(),
@@ -4433,7 +5090,7 @@ mod tests {
 		manager.apply_tier_slab(old_pointer.clone()).await.unwrap();
 
 		let sm = WendelonStateMachine::new();
-		seed_state_machine_pointer(&sm, &old_pointer).await;
+		seed_state_machine_pointer(&sm, &manager, &old_pointer).await;
 		let observer: Arc<dyn TierObserver> = Arc::new(ManagerTierObserver::new(manager.clone()));
 		let committer: Arc<dyn TierCommitter> =
 			Arc::new(DirectApplyCommitter::ok(sm.clone(), observer));
@@ -4445,6 +5102,7 @@ mod tests {
 			sm,
 			SweeperConfig {
 				scan_interval: Duration::from_millis(10),
+				op_driver_interval: Duration::from_millis(500),
 				min_slab_bytes: 0,
 				max_upload_bytes_per_sec: None,
 				key_prefix: "tier/".into(),
@@ -4582,7 +5240,7 @@ mod tests {
 			.unwrap();
 
 		let sm = WendelonStateMachine::new();
-		seed_state_machine_pointer(&sm, &old_pointer).await;
+		seed_state_machine_pointer(&sm, &manager, &old_pointer).await;
 		let observer: Arc<dyn TierObserver> = Arc::new(ManagerTierObserver::new(manager.clone()));
 		let committer: Arc<dyn TierCommitter> =
 			Arc::new(DirectApplyCommitter::ok(sm.clone(), observer));
@@ -4594,6 +5252,7 @@ mod tests {
 			sm,
 			SweeperConfig {
 				scan_interval: Duration::from_millis(10),
+				op_driver_interval: Duration::from_millis(500),
 				min_slab_bytes: 0,
 				max_upload_bytes_per_sec: None,
 				key_prefix: "tier/".into(),
@@ -4741,7 +5400,7 @@ mod tests {
 		manager.apply_tier_slab(old_pointer.clone()).await.unwrap();
 
 		let sm = WendelonStateMachine::new();
-		seed_state_machine_pointer(&sm, &old_pointer).await;
+		seed_state_machine_pointer(&sm, &manager, &old_pointer).await;
 		let observer: Arc<dyn TierObserver> = Arc::new(ManagerTierObserver::new(manager.clone()));
 		let committer: Arc<dyn TierCommitter> =
 			Arc::new(DirectApplyCommitter::ok(sm.clone(), observer));
@@ -4752,6 +5411,7 @@ mod tests {
 			sm,
 			SweeperConfig {
 				scan_interval: Duration::from_millis(10),
+				op_driver_interval: Duration::from_millis(500),
 				min_slab_bytes: 0,
 				max_upload_bytes_per_sec: None,
 				key_prefix: "tier/".into(),
@@ -4873,7 +5533,7 @@ mod tests {
 		manager.apply_tier_slab(old_pointer.clone()).await.unwrap();
 
 		let sm = WendelonStateMachine::new();
-		seed_state_machine_pointer(&sm, &old_pointer).await;
+		seed_state_machine_pointer(&sm, &manager, &old_pointer).await;
 		let observer: Arc<dyn TierObserver> = Arc::new(ManagerTierObserver::new(manager.clone()));
 		let committer: Arc<dyn TierCommitter> =
 			Arc::new(DirectApplyCommitter::ok(sm.clone(), observer));
@@ -4884,6 +5544,7 @@ mod tests {
 			sm,
 			SweeperConfig {
 				scan_interval: Duration::from_millis(10),
+				op_driver_interval: Duration::from_millis(500),
 				min_slab_bytes: 0,
 				max_upload_bytes_per_sec: None,
 				key_prefix: "tier/".into(),
@@ -4988,25 +5649,26 @@ mod tests {
 				.unwrap();
 			slab.fsync().await.unwrap();
 		}
-		let manager = SlabManager::initialize_new_store(SlabManagerConfig {
-			tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
-			dir: l1_dir.to_path_buf(),
-			max_slab_bytes: 1 << 20,
-			io: spawn_io_thread(64).unwrap(),
-			l2: Some(l2.clone()),
-			rehydration: crate::storage::manager::RehydrationPolicy::default(),
-			l2_column_fetch: Default::default(),
-			row_group_writer: Default::default(),
-			l2_row_group_fetch: Default::default(),
-			encoding_writer: Default::default(),
-			l2_chunk_layout: Default::default(),
-			l2_encoding_fetch: Default::default(),
-			encoding_compute: Default::default(),
-			group_commit: crate::storage::GroupCommitConfig::default(),
-			crypto: test_crypto(),
-		})
-		.await
-		.unwrap();
+		let manager =
+			SlabManager::initialize_store_adopting_existing_slabs_for_test(SlabManagerConfig {
+				tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
+				dir: l1_dir.to_path_buf(),
+				max_slab_bytes: 1 << 20,
+				io: spawn_io_thread(64).unwrap(),
+				l2: Some(l2.clone()),
+				rehydration: crate::storage::manager::RehydrationPolicy::default(),
+				l2_column_fetch: Default::default(),
+				row_group_writer: Default::default(),
+				l2_row_group_fetch: Default::default(),
+				encoding_writer: Default::default(),
+				l2_chunk_layout: Default::default(),
+				l2_encoding_fetch: Default::default(),
+				encoding_compute: Default::default(),
+				group_commit: crate::storage::GroupCommitConfig::default(),
+				crypto: test_crypto(),
+			})
+			.await
+			.unwrap();
 		let copies_of = |manager: &SlabManager| {
 			let mut copies = manager
 				.scan_all_versions(Locality::ZERO, Locality::MAX, hlc_at(0))
@@ -5078,7 +5740,7 @@ mod tests {
 		};
 		manager.apply_tier_slab(old_pointer.clone()).await.unwrap();
 		let sm = WendelonStateMachine::new();
-		seed_state_machine_pointer(&sm, &old_pointer).await;
+		seed_state_machine_pointer(&sm, &manager, &old_pointer).await;
 		let observer: Arc<dyn TierObserver> = Arc::new(ManagerTierObserver::new(manager.clone()));
 		let committer: Arc<dyn TierCommitter> =
 			Arc::new(DirectApplyCommitter::ok(sm.clone(), observer));
@@ -5089,6 +5751,7 @@ mod tests {
 			sm,
 			SweeperConfig {
 				scan_interval: Duration::from_millis(10),
+				op_driver_interval: Duration::from_millis(500),
 				min_slab_bytes: 0,
 				max_upload_bytes_per_sec: None,
 				key_prefix: "tier/".into(),
@@ -5205,7 +5868,7 @@ mod tests {
 			supersession_metadata: SupersessionMetadata::None,
 		};
 		manager.apply_tier_slab(pointer.clone()).await.unwrap();
-		seed_state_machine_pointer(sm, &pointer).await;
+		seed_state_machine_pointer(sm, &manager, &pointer).await;
 		pointer
 	}
 
@@ -5226,6 +5889,7 @@ mod tests {
 			sm.clone(),
 			SweeperConfig {
 				scan_interval: Duration::from_millis(10),
+				op_driver_interval: Duration::from_millis(500),
 				min_slab_bytes: 0,
 				max_upload_bytes_per_sec: None,
 				key_prefix: "tier/".into(),
@@ -5379,25 +6043,26 @@ mod tests {
 			.unwrap();
 			slab.fsync().await.unwrap();
 		}
-		let manager = SlabManager::initialize_new_store(SlabManagerConfig {
-			tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
-			dir: l1_dir.to_path_buf(),
-			max_slab_bytes: 1 << 20,
-			io: spawn_io_thread(64).unwrap(),
-			l2: Some(l2.clone()),
-			rehydration: crate::storage::manager::RehydrationPolicy::default(),
-			l2_column_fetch: Default::default(),
-			row_group_writer: Default::default(),
-			l2_row_group_fetch: Default::default(),
-			encoding_writer: Default::default(),
-			l2_chunk_layout: Default::default(),
-			l2_encoding_fetch: Default::default(),
-			encoding_compute: Default::default(),
-			group_commit: crate::storage::GroupCommitConfig::default(),
-			crypto: test_crypto(),
-		})
-		.await
-		.unwrap();
+		let manager =
+			SlabManager::initialize_store_adopting_existing_slabs_for_test(SlabManagerConfig {
+				tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
+				dir: l1_dir.to_path_buf(),
+				max_slab_bytes: 1 << 20,
+				io: spawn_io_thread(64).unwrap(),
+				l2: Some(l2.clone()),
+				rehydration: crate::storage::manager::RehydrationPolicy::default(),
+				l2_column_fetch: Default::default(),
+				row_group_writer: Default::default(),
+				l2_row_group_fetch: Default::default(),
+				encoding_writer: Default::default(),
+				l2_chunk_layout: Default::default(),
+				l2_encoding_fetch: Default::default(),
+				encoding_compute: Default::default(),
+				group_commit: crate::storage::GroupCommitConfig::default(),
+				crypto: test_crypto(),
+			})
+			.await
+			.unwrap();
 		let sm = WendelonStateMachine::new();
 		let pointer =
 			tier_active_slab(&manager, &l2, &sm, "tier/retention-conflicting-once.wnd").await;
@@ -5466,7 +6131,7 @@ mod tests {
 			payload_hash: [0x5A; 32],
 			..pointer.clone()
 		};
-		seed_state_machine_pointer(&sm, &unapplied).await;
+		seed_state_machine_pointer(&sm, &manager, &unapplied).await;
 		let sweeper = retention_sweeper(&manager, &l2, &sm, now_ms);
 		let objects = l2_object_names(&l2).await;
 
@@ -5612,7 +6277,7 @@ mod tests {
 		manager.apply_tier_slab(old_pointer.clone()).await.unwrap();
 
 		let sm = WendelonStateMachine::new();
-		seed_state_machine_pointer(&sm, &old_pointer).await;
+		seed_state_machine_pointer(&sm, &manager, &old_pointer).await;
 		let observer: Arc<dyn TierObserver> = Arc::new(ManagerTierObserver::new(manager.clone()));
 		let ambiguous_committer: Arc<dyn TierCommitter> =
 			Arc::new(DirectApplyCommitter::commit_applied_then_err(
@@ -5627,6 +6292,7 @@ mod tests {
 			sm.clone(),
 			SweeperConfig {
 				scan_interval: Duration::from_millis(10),
+				op_driver_interval: Duration::from_millis(500),
 				min_slab_bytes: 0,
 				max_upload_bytes_per_sec: None,
 				key_prefix: "tier/".into(),
@@ -5643,7 +6309,7 @@ mod tests {
 			.state_snapshot()
 			.await
 			.tiered_slabs
-			.get(&sealed_id)
+			.get(&manager.owner_ref().unwrap().slab(sealed_id))
 			.expect("state machine should still commit the rewritten pointer")
 			.l2_uri
 			.clone();
@@ -5668,6 +6334,7 @@ mod tests {
 			sm,
 			SweeperConfig {
 				scan_interval: Duration::from_millis(10),
+				op_driver_interval: Duration::from_millis(500),
 				min_slab_bytes: 0,
 				max_upload_bytes_per_sec: None,
 				key_prefix: "tier/".into(),
@@ -5785,6 +6452,7 @@ mod tests {
 			sm,
 			SweeperConfig {
 				scan_interval: Duration::from_millis(10),
+				op_driver_interval: Duration::from_millis(500),
 				min_slab_bytes: 0,
 				max_upload_bytes_per_sec: None,
 				key_prefix: "tier/".into(),
@@ -5840,6 +6508,7 @@ mod tests {
 		let sealed_id = manager.force_seal_active_for_test().await;
 		let config = || SweeperConfig {
 			scan_interval: Duration::from_millis(10),
+			op_driver_interval: Duration::from_millis(500),
 			min_slab_bytes: 0,
 			max_upload_bytes_per_sec: None,
 			key_prefix: "tier/".into(),
@@ -5863,7 +6532,7 @@ mod tests {
 			.state_snapshot()
 			.await
 			.tiered_slabs
-			.get(&sealed_id)
+			.get(&manager.owner_ref().unwrap().slab(sealed_id))
 			.expect("premise: the first attempt's pointer is committed")
 			.clone();
 		assert!(
@@ -5955,6 +6624,7 @@ mod tests {
 			sm.clone(),
 			SweeperConfig {
 				scan_interval: Duration::from_millis(10),
+				op_driver_interval: Duration::from_millis(500),
 				min_slab_bytes: 0,
 				max_upload_bytes_per_sec: None,
 				key_prefix: "tier/".into(),
@@ -5976,7 +6646,7 @@ mod tests {
 					.state_snapshot()
 					.await
 					.tiered_slabs
-					.contains_key(&sealed_id),
+					.contains_key(&manager.owner_ref().unwrap().slab(sealed_id)),
 			"a counter-bearing slab got a tier pointer through the sweeper"
 		);
 		assert!(
@@ -6099,6 +6769,7 @@ mod tests {
 	fn b1_config() -> SweeperConfig {
 		SweeperConfig {
 			scan_interval: Duration::from_millis(10),
+			op_driver_interval: Duration::from_millis(500),
 			min_slab_bytes: 0,
 			max_upload_bytes_per_sec: None,
 			key_prefix: "b1/".into(),
@@ -6151,7 +6822,7 @@ mod tests {
 		let (raft, _log, _sm) = b1_real_follower(&wal).await;
 		let before = raft.metrics().borrow().last_log_index;
 		let tier = TieredSlab {
-			slab_id: SlabId::new(71),
+			slab: crate::consensus::OwnerRef::for_test(1, 1).slab(SlabId::new(71)),
 			l2_uri: "b1/unsubmitted".into(),
 			payload_hash: [7; 32],
 			is_encrypted: false,
@@ -6165,8 +6836,7 @@ mod tests {
 		};
 		let error = tokio::time::timeout(
 			Duration::from_secs(60),
-			RaftCommitter::new(raft.clone())
-				.commit_tier_slab(crate::storage::TierProposal::unreserved_for_test(tier)),
+			RaftCommitter::new(raft.clone()).preflight(tier.slab.owner()),
 		)
 		.await
 		.unwrap()
@@ -6221,14 +6891,11 @@ mod tests {
 	struct B1UnhintedRaftCommitter(RaftCommitter);
 	#[async_trait]
 	impl TierCommitter for B1UnhintedRaftCommitter {
-		async fn commit_tier_slab(
-			&self,
-			proposal: crate::storage::TierProposal,
-		) -> std::io::Result<()> {
-			self.0.commit_tier_slab(proposal).await
+		async fn preflight(&self, owner: crate::consensus::OwnerRef) -> std::io::Result<()> {
+			self.0.preflight(owner).await
 		}
-		async fn retire_tiered_slab(&self, slab: SlabId) -> std::io::Result<()> {
-			self.0.retire_tiered_slab(slab).await
+		async fn submit_op(&self, ticket: &OpTicket) -> std::io::Result<VerifiedReceipt> {
+			self.0.submit_op(ticket).await
 		}
 	}
 
@@ -6285,7 +6952,11 @@ mod tests {
 		let (_l1, manager) = build_manager_with_sealed_slabs(Some(l2.clone())).await;
 		let sealed = manager.list_sealed_slabs().await;
 		let (raft, _log, sm) = b1_real_follower(&wal).await;
-		let mut production = RaftCommitter::new(raft.clone());
+		// The owner registered while it led (ADR 0697), so the committer's
+		// registration check passes and the slab command itself is invoked.
+		sm.seed_registration_for_test(manager.owner_ref().unwrap())
+			.await;
+		let mut production = RaftCommitter::new(raft.clone()).with_state_machine(sm.clone());
 		// Models the earlier role check passing, followed by role loss. The
 		// real client_write still executes and returns its own Forward error.
 		production.submit_without_role_check = true;
@@ -6324,7 +6995,7 @@ mod tests {
 		let wal = fresh_dir("b1n-pre-invocation");
 		let (raft, _log, _sm) = b1_real_follower(&wal).await;
 		let error = RaftCommitter::new(raft.clone())
-			.retire_tiered_slab(SlabId::new(71))
+			.preflight(crate::consensus::OwnerRef::for_test(1, 1))
 			.await
 			.unwrap_err();
 		raft.shutdown().await.unwrap();
@@ -6430,7 +7101,7 @@ mod tests {
 		};
 		manager.apply_tier_slab(old.clone()).await.unwrap();
 		let sm = WendelonStateMachine::new();
-		seed_state_machine_pointer(&sm, &old).await;
+		seed_state_machine_pointer(&sm, &manager, &old).await;
 		let observer: Arc<dyn TierObserver> = Arc::new(ManagerTierObserver::new(manager.clone()));
 		let committer = Arc::new(DirectApplyCommitter::ok(sm.clone(), observer));
 		let sweeper = SlabSweeper::new(
@@ -6536,7 +7207,7 @@ mod tests {
 		};
 		manager.apply_tier_slab(old.clone()).await.unwrap();
 		let sm = WendelonStateMachine::new();
-		seed_state_machine_pointer(&sm, &old).await;
+		seed_state_machine_pointer(&sm, &manager, &old).await;
 		let observer: Arc<dyn TierObserver> = Arc::new(ManagerTierObserver::new(manager.clone()));
 		let sweeper = SlabSweeper::new(
 			manager.clone(),
@@ -6636,7 +7307,7 @@ mod tests {
 		use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
 		let (_dirs, manager, store, old) = b2_failed_delete_fixture().await;
 		let mut source = WendelonStateMachine::new();
-		seed_state_machine_pointer(&source, &old).await;
+		seed_state_machine_pointer(&source, &manager, &old).await;
 		RaftStateMachine::apply(
 			&mut source,
 			[Entry {
@@ -6667,21 +7338,23 @@ mod tests {
 			&mut target,
 			[Entry {
 				log_id: LogId::new(CommittedLeaderId::new(4, 1), 202),
-				payload: EntryPayload::Normal(crate::consensus::WendelonRequest::TierSlab(
-					TieredSlab {
-						slab_id: old.slab_id,
-						l2_uri: old.l2_uri.clone(),
-						payload_hash: old.payload_hash,
-						is_encrypted: false,
-						tenant_id: None,
-						tenant_kek_id: None,
-						stats_format_version: None,
-						stats_block_len: None,
-						stats_block_hash128: None,
-						tombstone_metadata: old.tombstone_metadata,
-						supersession_metadata: old.supersession_metadata,
-					},
-				)),
+				payload: EntryPayload::Normal(
+					manager
+						.tier_request_for_test(TieredSlab {
+							slab: manager.owner_ref().unwrap().slab(old.slab_id),
+							l2_uri: old.l2_uri.clone(),
+							payload_hash: old.payload_hash,
+							is_encrypted: false,
+							tenant_id: None,
+							tenant_kek_id: None,
+							stats_format_version: None,
+							stats_block_len: None,
+							stats_block_hash128: None,
+							tombstone_metadata: old.tombstone_metadata,
+							supersession_metadata: old.supersession_metadata,
+						})
+						.await,
+				),
 			}],
 		)
 		.await

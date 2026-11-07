@@ -20,4 +20,4 @@ pub use error::VisibilityError;
 use error::redacted_debug;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

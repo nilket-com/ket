@@ -56,8 +56,9 @@ use crate::consensus::retention::{
 };
 use crate::consensus::{
 	AdvanceEpochRecord, CreateTenant, EpochConfig, MigratedRangeTombstone, MigrationComplete,
-	MigrationLedgerEntry, MigrationState, RevokeActorKey, RevokedActorKeyId, SeedMigration,
-	SetTableRetentionPolicy, TableDropFinalizeRequest, TableDropLogicalFinalizeRequest,
+	MigrationLedgerEntry, MigrationState, OwnerRef, RegisterIncarnation, RevokeActorKey,
+	RevokedActorKeyId, SeedMigration, SetTableRetentionPolicy, SlabRef, SlabRefusal,
+	StoreIncarnation, TableDropFinalizeRequest, TableDropLogicalFinalizeRequest,
 	TableDropPrepareRequest, TableDropSettlementRequest, TableReclaimCompletionRequest,
 	TenantFinalization, TenantLifecycleState, TenantRecord, TieredSlab, UpdateTenantQuota,
 	WendelonRequest, WendelonResponse, WendelonTypeConfig,
@@ -129,6 +130,7 @@ use crate::hash::sha256 as control_artifact_hash;
 
 // Offline, read-only scan of a node's retained Control log over the same replay readers.
 mod read_only;
+mod slab_op_apply;
 #[cfg(test)]
 pub(crate) use read_only::fixture as read_only_fixture;
 pub(crate) use read_only::scan_control_log_read_only;
@@ -143,7 +145,7 @@ const REC_SNAPSHOT_INSTALL: u8 = 2;
 #[allow(dead_code)]
 const REC_CHECKPOINT: u8 = 3;
 const FINALIZATION_BROADCAST_CAPACITY: usize = 1024;
-const CONTROL_RING_BACKUP_FORMAT_VERSION: u16 = 1;
+pub(crate) const CONTROL_RING_BACKUP_FORMAT_VERSION: u16 = 1;
 const DEFAULT_WAL_SEGMENT_BYTES: u64 = 128 * 1024 * 1024;
 const WAL_SEGMENT_SUFFIX: &str = ".seg";
 const WAL_SEGMENT_STAGING_SUFFIX: &str = ".staging";
@@ -198,6 +200,40 @@ pub struct ControlRingBackupImage {
 }
 
 impl ControlRingBackupImage {
+	/// The control state these exact backup bytes replay to, decoded and
+	/// replayed in memory by the export's own replay (ADR 0697 restore
+	/// preflight). No file, observer or restore authority is touched.
+	pub(crate) fn replayed_state(&self) -> std::io::Result<SmState> {
+		self.validate_format()?;
+		if self.wal.is_empty() && self.snapshot.is_empty() {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"control backup image has no WAL and no snapshot",
+			));
+		}
+		replay_exported_control_state(&self.wal, &self.snapshot)
+	}
+
+	/// This image with every WAL record re-declared at `version`, each record
+	/// checksum recomputed so only the declared body format differs.
+	#[cfg(test)]
+	pub(crate) fn with_wal_format_version_for_test(&self, version: u8) -> Self {
+		let header_size = std::mem::size_of::<WALRecordHeader>();
+		let mut image = self.clone();
+		let mut offset = 0;
+		while offset < image.wal.len() {
+			let mut header: WALRecordHeader =
+				*bytemuck::from_bytes(&image.wal[offset..offset + header_size]);
+			header.format_version = version;
+			let body_end = offset + header_size + header.body_len as usize;
+			image.wal[offset..offset + header_size].copy_from_slice(bytemuck::bytes_of(&header));
+			let checksum = control_artifact_checksum_u32(&image.wal[offset..body_end]);
+			image.wal[body_end..body_end + 4].copy_from_slice(&checksum.to_le_bytes());
+			offset += page_round_up(header_size + header.body_len as usize + 4);
+		}
+		image
+	}
+
 	/// Identity of the exact input bytes, independent of decoded map order.
 	pub(crate) fn restore_artifact_hash(&self) -> [u8; 32] {
 		restore_artifact_hash(
@@ -896,6 +932,62 @@ impl WendelonLogStore {
 	/// Test seam for the retention suite: a store over `dir` with blocking
 	/// file I/O and a small segment size, under `retention`.
 	#[cfg(test)]
+	#[cfg(test)]
+	pub(crate) async fn open_with_faults_for_test(
+		dir: &Path,
+		file_ops: Arc<dyn AsyncFileOps>,
+	) -> std::io::Result<Self> {
+		Self::open_with_options_and_retention(
+			dir.join("control.wal"),
+			dir.join("vote.wnd"),
+			dir.join("snapshot.wnd"),
+			file_ops,
+			WalOptions {
+				segment_bytes: 64 * 4096,
+			},
+			None,
+			None,
+		)
+		.await
+	}
+
+	/// A snapshot of the control state `requests` leave, appended as `leader`.
+	#[cfg(test)]
+	pub(crate) async fn control_snapshot_for_test(
+		dir: &Path,
+		requests: Vec<WendelonRequest>,
+		leader: u32,
+	) -> Snapshot<WendelonTypeConfig> {
+		use openraft::storage::RaftLogStorageExt;
+		let entry = |index: usize, request: WendelonRequest| Entry::<WendelonTypeConfig> {
+			log_id: LogId::new(CommittedLeaderId::new(3, leader), index as u64 + 1),
+			payload: EntryPayload::Normal(request),
+		};
+		let mut store = Self::open_for_retention_test(dir, 64 * 4096, None)
+			.await
+			.unwrap();
+		let mut sm = store.recovered_state_machine().await.unwrap();
+		for (index, request) in requests.into_iter().enumerate() {
+			store
+				.blocking_append(vec![entry(index, request.clone())])
+				.await
+				.unwrap();
+			<WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::apply(
+				&mut sm,
+				vec![entry(index, request)],
+			)
+			.await
+			.unwrap();
+		}
+		let mut builder =
+			<WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::get_snapshot_builder(
+				&mut sm,
+			)
+			.await;
+		builder.build_snapshot().await.unwrap()
+	}
+
+	#[cfg(test)]
 	pub(crate) async fn open_for_retention_test(
 		dir: &Path,
 		segment_bytes: u64,
@@ -939,6 +1031,21 @@ impl WendelonLogStore {
 
 	pub async fn recovery_checkpoint(&self) -> Option<RecoveryCheckpoint> {
 		self.inner.read().await.recovery_checkpoint
+	}
+
+	/// True only when nothing has ever been made durable here: no vote, no
+	/// retained or purged log position, no entry, no snapshot, no checkpoint
+	/// and no committed pointer. Empty artifacts that a bootstrap created and
+	/// then abandoned qualify; compaction or an uncommitted entry does not.
+	pub(crate) async fn is_pristine(&self) -> bool {
+		let inner = self.inner.read().await;
+		inner.vote.is_none()
+			&& inner.last_log_id.is_none()
+			&& inner.last_purged.is_none()
+			&& inner.entries.is_empty()
+			&& inner.recovered_snapshot.is_none()
+			&& inner.recovery_checkpoint.is_none()
+			&& inner.recovery_committed.is_none()
 	}
 
 	/// `poison`, mapped to the storage error a Raft log mutator returns.
@@ -1412,6 +1519,7 @@ impl WendelonLogStore {
 		owner: &DataDirectoryOwner,
 		resume: bool,
 	) -> std::io::Result<()> {
+		backup.validate_format()?;
 		let target_dir = target_dir.as_ref();
 		owner.ensure_path(target_dir)?;
 		if !target_dir.is_dir() {
@@ -2629,6 +2737,18 @@ impl CheckpointObserver for CheckpointCoordinator {
 //  STATE MACHINE
 // ============================================================
 
+/// A node's store incarnations as the control ring records them (ADR 0697).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IncarnationRegistry {
+	/// The incarnation whose slab commands are admitted.
+	pub current: Option<StoreIncarnation>,
+	/// Superseded incarnations; none ever becomes current again.
+	pub retired: BTreeSet<StoreIncarnation>,
+	/// Every accepted registration `(incarnation, supersedes)`, so an exact
+	/// replay returns its original receipt without changing who is current.
+	pub accepted: BTreeSet<(StoreIncarnation, Option<StoreIncarnation>)>,
+}
+
 /// In-memory state machine content. `Serialize + Deserialize` so
 /// the snapshot builder can postcard-encode it directly.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -2657,12 +2777,22 @@ pub struct SmState {
 	#[serde(default)]
 	pub last_e_safe_index: u64,
 	/// Slabs that have been tiered to L2 by the sweeper (ADR 006).
-	/// Keyed by `slab_id`; every replica must agree on the mapping
-	/// so read-path pivots are deterministic. Observers — the
-	/// local `SlabManager` — are fired out-of-band when an entry
-	/// lands here so they can unlink the L1 file.
+	/// Keyed by the owner-qualified slab (ADR 0697): a bare slab id is
+	/// local to the store that issued it. Every replica holds every
+	/// owner's pointers; only the owning store's observer applies them.
 	#[serde(default)]
-	pub tiered_slabs: HashMap<SlabId, TieredSlab>,
+	pub tiered_slabs: HashMap<SlabRef, TieredSlab>,
+	/// Each node's store incarnations (ADR 0697 §3). Every slab command
+	/// is admitted only for its node's current incarnation.
+	#[serde(default)]
+	pub incarnations: BTreeMap<u32, IncarnationRegistry>,
+	/// Each admitted owner's decision window (ADR 0697 §5.3).
+	#[serde(default)]
+	pub op_tables: BTreeMap<OwnerRef, crate::consensus::slab_ops::OpTable>,
+	/// ADR 0697 §4: per owner, the slabs claimed for a terminal transition and
+	/// those whose identity has ended.
+	#[serde(default)]
+	pub slab_terminal: BTreeMap<OwnerRef, crate::consensus::slab_ops::OwnerTerminal>,
 	/// Migration Ledger (Plan 019). Keyed by `migration_id` so
 	/// apply-time idempotency and chained-migration reconciliation
 	/// are both O(1). Entries never fall out of the map during
@@ -2884,10 +3014,14 @@ pub struct TierSnapshotSource(std::sync::Weak<RwLock<SmInner>>);
 pub(crate) struct TierSnapshotLease(tokio::sync::OwnedRwLockReadGuard<SmInner>);
 
 impl TierSnapshotSource {
-	/// The committed tier record for `slab_id`, without waiting: `WouldBlock`
-	/// when the state machine is busy, so a caller holding observer-side locks
-	/// never waits on the apply loop.
-	pub(crate) fn try_tiered_slab(&self, slab_id: SlabId) -> std::io::Result<Option<TieredSlab>> {
+	/// The committed tier record for `slab`, with its owner node's registry
+	/// from the same state, without waiting: `WouldBlock` when the state
+	/// machine is busy, so a caller holding observer-side locks never waits
+	/// on the apply loop.
+	pub(crate) fn try_tiered_slab(
+		&self,
+		slab: SlabRef,
+	) -> std::io::Result<(Option<TieredSlab>, IncarnationRegistry)> {
 		let inner = self
 			.0
 			.upgrade()
@@ -2895,7 +3029,31 @@ impl TierSnapshotSource {
 		let guard = inner
 			.try_read()
 			.map_err(|_| Error::new(ErrorKind::WouldBlock, "canonical tier state busy"))?;
-		Ok(guard.state.tiered_slabs.get(&slab_id).cloned())
+		Ok((
+			guard.state.tiered_slabs.get(&slab).cloned(),
+			guard
+				.state
+				.incarnations
+				.get(&slab.owner().node())
+				.cloned()
+				.unwrap_or_default(),
+		))
+	}
+
+	/// Advisory, without waiting: whether `slab` is known tiered or removed, so
+	/// a claim that cannot succeed is not proposed. Never cleanup authority; the
+	/// ring still arbitrates. `None` when the state machine is busy.
+	pub(crate) fn try_known_unclaimable(&self, slab: SlabRef) -> Option<bool> {
+		let inner = self.0.upgrade()?;
+		let guard = inner.try_read().ok()?;
+		Some(
+			guard.state.tiered_slabs.contains_key(&slab)
+				|| guard
+					.state
+					.slab_terminal
+					.get(&slab.owner())
+					.is_some_and(|terminal| terminal.removed.contains(slab.local_id())),
+		)
 	}
 
 	pub(crate) async fn read(&self) -> std::io::Result<TierSnapshotLease> {
@@ -2912,6 +3070,122 @@ impl TierSnapshotLease {
 	}
 	pub(crate) fn tiers(&self) -> Vec<TieredSlab> {
 		self.0.state.tiered_slabs.values().cloned().collect()
+	}
+	/// Whether `key` is decided Applied under `digest` and its owner is still its
+	/// node's current incarnation, from this one coherent state (ADR 0697 §5.5).
+	pub(crate) fn op_applied_for_current_owner(
+		&self,
+		key: crate::consensus::slab_ops::OpKey,
+		digest: [u8; 32],
+	) -> bool {
+		use crate::consensus::slab_ops::RecordedOutcome;
+		let state = &self.0.state;
+		let applied = state
+			.op_tables
+			.get(&key.owner)
+			.and_then(|table| table.outcomes.get(&key.op_seq))
+			.is_some_and(|entry| {
+				entry.digest == digest && matches!(entry.outcome, RecordedOutcome::Applied { .. })
+			});
+		let current = state
+			.incarnations
+			.get(&key.owner.node())
+			.is_some_and(|registry| registry.current == Some(key.owner.incarnation()));
+		applied && current
+	}
+
+	/// A rejected mark and its Cancelled removal as the state machine recorded
+	/// them, for the current owner: what lets the two hand off together.
+	pub(crate) fn rejected_claim_decided_for_current_owner(
+		&self,
+		mark: (crate::consensus::slab_ops::OpKey, [u8; 32]),
+		removal: (crate::consensus::slab_ops::OpKey, [u8; 32]),
+	) -> bool {
+		use crate::consensus::slab_ops::{RecordedOutcome, SlabRejection};
+		let state = &self.0.state;
+		let entry = |(key, digest): (crate::consensus::slab_ops::OpKey, [u8; 32])| {
+			state
+				.op_tables
+				.get(&key.owner)
+				.and_then(|table| table.outcomes.get(&key.op_seq))
+				.filter(|entry| entry.digest == digest)
+		};
+		let rejected = entry(mark)
+			.is_some_and(|entry| matches!(entry.outcome, RecordedOutcome::Rejected { .. }));
+		let cancelled = entry(removal).is_some_and(|entry| {
+			matches!(
+				entry.outcome,
+				RecordedOutcome::Rejected {
+					reason: SlabRejection::Cancelled,
+					..
+				}
+			)
+		});
+		let current = state
+			.incarnations
+			.get(&mark.0.owner.node())
+			.is_some_and(|registry| registry.current == Some(mark.0.owner.incarnation()));
+		rejected && cancelled && current
+	}
+
+	/// This exact operation was decided rejected, and its owner is current.
+	pub(crate) fn op_rejected_for_current_owner(
+		&self,
+		key: crate::consensus::slab_ops::OpKey,
+		digest: [u8; 32],
+	) -> bool {
+		use crate::consensus::slab_ops::RecordedOutcome;
+		let state = &self.0.state;
+		let rejected = state
+			.op_tables
+			.get(&key.owner)
+			.and_then(|table| table.outcomes.get(&key.op_seq))
+			.is_some_and(|entry| {
+				entry.digest == digest && matches!(entry.outcome, RecordedOutcome::Rejected { .. })
+			});
+		rejected
+			&& state
+				.incarnations
+				.get(&key.owner.node())
+				.is_some_and(|registry| registry.current == Some(key.owner.incarnation()))
+	}
+
+	/// §6.1 claim-stage guard: this job holds the claim, for the current owner.
+	pub(crate) fn claim_held_by_current_owner(
+		&self,
+		slab: SlabRef,
+		job_id: crate::schema::CompactionJobId,
+	) -> bool {
+		let state = &self.0.state;
+		let held = state
+			.slab_terminal
+			.get(&slab.owner())
+			.and_then(|terminal| terminal.claimed.get(&slab.local_id()))
+			== Some(&job_id);
+		held && state
+			.incarnations
+			.get(&slab.owner().node())
+			.is_some_and(|registry| registry.current == Some(slab.owner().incarnation()))
+	}
+
+	/// §6.1 post-Complete guard: the identity has ended, for the current owner.
+	/// A live claim is not required: Complete ended it.
+	pub(crate) fn removed_for_current_owner(&self, slab: SlabRef) -> bool {
+		let state = &self.0.state;
+		let removed = state
+			.slab_terminal
+			.get(&slab.owner())
+			.is_some_and(|terminal| terminal.removed.contains(slab.local_id()));
+		removed
+			&& state
+				.incarnations
+				.get(&slab.owner().node())
+				.is_some_and(|registry| registry.current == Some(slab.owner().incarnation()))
+	}
+
+	/// The incarnation registries coherent with `tiers()` (ADR 0697).
+	pub(crate) fn incarnations(&self) -> &BTreeMap<u32, IncarnationRegistry> {
+		&self.0.state.incarnations
 	}
 	pub(crate) fn has_migrated_ranges(&self) -> bool {
 		!self.0.state.tombstones.is_empty()
@@ -2934,35 +3208,76 @@ pub trait TierObserver: Send + Sync {
 
 	/// Fence new admissions before committed retirement changes control state.
 	/// This hook is synchronous and must not wait on filesystem or network IO.
-	fn before_slab_retired(&self, _slab_id: SlabId, _applied_log_index: u64) {}
+	/// It runs only for a retirement whose owner the state machine admits;
+	/// `registry` is that owner node's registry as of apply (ADR 0697).
+	fn before_slab_retired(
+		&self,
+		_slab: SlabRef,
+		_registry: &IncarnationRegistry,
+		_applied_log_index: u64,
+	) {
+	}
 
 	/// Called synchronously before publishing an incoming control snapshot.
-	fn before_tier_snapshot_install(&self) -> std::io::Result<u64> {
+	fn before_tier_snapshot_install(
+		&self,
+		_index: Option<u64>,
+		_registries: &BTreeMap<u32, IncarnationRegistry>,
+	) -> std::io::Result<u64> {
 		Ok(0)
 	}
 
 	/// Reconcile the complete committed tier set while admission stays fenced.
+	/// `registries` is the snapshot's own incarnation registry, coherent with
+	/// `tiers` (ADR 0697).
 	async fn on_tier_snapshot_installed(
 		&self,
 		_tiers: &[TieredSlab],
+		_registries: &BTreeMap<u32, IncarnationRegistry>,
 		_index: Option<u64>,
 		_snapshot_epoch: u64,
 	) -> std::io::Result<()> {
 		Ok(())
 	}
 
+	/// Every slab event carries its owner node's registry as of apply.
 	async fn on_slab_tiered(
 		&self,
 		tier: &TieredSlab,
+		registry: &IncarnationRegistry,
 		applied_log_index: u64,
 	) -> std::io::Result<()>;
 
 	async fn on_slab_retired(
 		&self,
-		slab_id: SlabId,
+		slab: SlabRef,
+		registry: &IncarnationRegistry,
 		applied_log_index: u64,
 	) -> std::io::Result<()> {
-		let _ = (slab_id, applied_log_index);
+		let _ = (slab, registry, applied_log_index);
+		Ok(())
+	}
+
+	/// A node's incarnation registry changed. A store that is no longer its
+	/// node's current incarnation must fence even if no slab event follows.
+	/// A delete-pending run's removal was decided (ADR 0697).
+	async fn on_gc_removed(
+		&self,
+		_remove: &crate::consensus::slab_ops::GcRemove,
+		_op_seq: u64,
+		_registry: &IncarnationRegistry,
+		_applied_log_index: u64,
+	) -> std::io::Result<()> {
+		Ok(())
+	}
+
+	async fn on_incarnation_registry(
+		&self,
+		node: u32,
+		registry: &IncarnationRegistry,
+		applied_log_index: u64,
+	) -> std::io::Result<()> {
+		let _ = (node, registry, applied_log_index);
 		Ok(())
 	}
 
@@ -2978,9 +3293,10 @@ pub trait TierObserver: Send + Sync {
 	async fn on_lsm_compaction_committed(
 		&self,
 		commit: &CompactionCommit,
+		registry: &IncarnationRegistry,
 		applied_log_index: u64,
 	) -> std::io::Result<()> {
-		let _ = (commit, applied_log_index);
+		let _ = (commit, registry, applied_log_index);
 		Ok(())
 	}
 }
@@ -3904,21 +4220,105 @@ impl WendelonStateMachine {
 	/// A caller holding a slab publication lock cannot await this lock: a
 	/// snapshot retry may hold the canonical read lease while draining that
 	/// publication lock. Refusal leaves its reconciliation work for next pass.
-	pub(crate) fn try_tiered_slab(&self, slab_id: SlabId) -> std::io::Result<Option<TieredSlab>> {
+	#[cfg(test)]
+	pub(crate) fn tier_snapshot_source_for_test(&self) -> TierSnapshotSource {
+		TierSnapshotSource(Arc::downgrade(&self.inner))
+	}
+
+	pub(crate) fn try_tiered_slab(&self, slab: SlabRef) -> std::io::Result<Option<TieredSlab>> {
 		let guard = self
 			.inner
 			.try_read()
 			.map_err(|_| Error::new(ErrorKind::WouldBlock, "canonical tier state busy"))?;
-		Ok(guard.state.tiered_slabs.get(&slab_id).cloned())
+		Ok(guard.state.tiered_slabs.get(&slab).cloned())
 	}
 
-	pub(crate) async fn tiered_slab(&self, slab_id: SlabId) -> Option<TieredSlab> {
+	/// One node's incarnation registry (ADR 0697), read under the SM lock.
+	/// `owner`'s acknowledged prefix in this state machine's view.
+	pub(crate) async fn op_acked_through(&self, owner: OwnerRef) -> u64 {
+		self.inner
+			.read()
+			.await
+			.state
+			.op_tables
+			.get(&owner)
+			.map_or(0, |table| table.acked_through)
+	}
+
+	/// §6 step 1's coherent read. The caller has already passed a barrier.
+	/// Catalogs as a schema update would have left them, for a test of what reads them.
+	#[cfg(test)]
+	pub(crate) async fn seed_catalogs_for_test(
+		&self,
+		table_schemas: crate::schema::TableSchemaCatalog,
+		secondary_indexes: crate::schema::SecondaryIndexCatalog,
+	) {
+		let mut guard = self.inner.write().await;
+		guard.state.table_schemas = table_schemas;
+		guard.state.secondary_indexes = secondary_indexes;
+	}
+
+	pub(crate) async fn op_view(
+		&self,
+		key: crate::consensus::slab_ops::OpKey,
+		digest: [u8; 32],
+		slabs: Vec<SlabRef>,
+	) -> crate::consensus::slab_ops::OpView {
+		use crate::consensus::slab_ops::{OpView, SlabStanding, ViewOutcome};
+		let guard = self.inner.read().await;
+		let state = &guard.state;
+		let table = state.op_tables.get(&key.owner);
+		let outcome = match table.and_then(|table| table.outcomes.get(&key.op_seq)) {
+			Some(entry) if entry.digest == digest => ViewOutcome::Recorded(entry.outcome.clone()),
+			Some(_) => ViewOutcome::Conflict,
+			None => ViewOutcome::None,
+		};
+		let standing = |slab: SlabRef| {
+			let terminal = state.slab_terminal.get(&slab.owner());
+			if state.tiered_slabs.contains_key(&slab) {
+				SlabStanding::Tiered
+			} else if let Some(job) =
+				terminal.and_then(|terminal| terminal.claimed.get(&slab.local_id()))
+			{
+				SlabStanding::Claimed(*job)
+			} else if terminal.is_some_and(|terminal| terminal.removed.contains(slab.local_id())) {
+				SlabStanding::Removed
+			} else {
+				SlabStanding::Unknown
+			}
+		};
+		OpView {
+			outcome,
+			acked_through: table.map_or(0, |table| table.acked_through),
+			owner_current: state
+				.incarnations
+				.get(&key.owner.node())
+				.is_some_and(|registry| registry.current == Some(key.owner.incarnation())),
+			slabs: slabs
+				.into_iter()
+				.map(|slab| (slab, standing(slab)))
+				.collect(),
+		}
+	}
+
+	pub(crate) async fn incarnation_registry(&self, node: u32) -> IncarnationRegistry {
+		self.inner
+			.read()
+			.await
+			.state
+			.incarnations
+			.get(&node)
+			.cloned()
+			.unwrap_or_default()
+	}
+
+	pub(crate) async fn tiered_slab(&self, slab: SlabRef) -> Option<TieredSlab> {
 		self.inner
 			.read()
 			.await
 			.state
 			.tiered_slabs
-			.get(&slab_id)
+			.get(&slab)
 			.cloned()
 	}
 
@@ -3967,9 +4367,24 @@ impl WendelonStateMachine {
 	}
 
 	#[cfg(test)]
-	pub async fn seed_tiered_slab_for_test(&self, tier: crate::consensus::TieredSlab) {
+	/// Seeds `owner` as its node's registered current incarnation, as an
+	/// accepted first registration leaves it (ADR 0697).
+	pub async fn seed_registration_for_test(&self, owner: OwnerRef) {
 		let mut guard = self.inner.write().await;
-		guard.state.tiered_slabs.insert(tier.slab_id, tier);
+		let registry = guard.state.incarnations.entry(owner.node()).or_default();
+		if registry.current.is_none() {
+			registry.current = Some(owner.incarnation());
+			registry.accepted.insert((owner.incarnation(), None));
+		}
+	}
+
+	#[cfg(test)]
+	/// Seeds `tier` as committed, with its owner registered as its node's
+	/// current incarnation, as the ring would have admitted it (ADR 0697).
+	pub async fn seed_tiered_slab_for_test(&self, tier: crate::consensus::TieredSlab) {
+		self.seed_registration_for_test(tier.slab.owner()).await;
+		let mut guard = self.inner.write().await;
+		guard.state.tiered_slabs.insert(tier.slab, tier);
 	}
 
 	#[cfg(test)]
@@ -3982,9 +4397,9 @@ impl WendelonStateMachine {
 	}
 
 	#[cfg(test)]
-	pub async fn retire_tiered_slab_for_test(&self, slab_id: SlabId) {
+	pub async fn retire_tiered_slab_for_test(&self, slab: SlabRef) {
 		let mut guard = self.inner.write().await;
-		guard.state.tiered_slabs.remove(&slab_id);
+		guard.state.tiered_slabs.remove(&slab);
 	}
 }
 
@@ -4034,11 +4449,16 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 					))
 					.into());
 				}
-				if let EntryPayload::Normal(WendelonRequest::RetireTieredSlab(retire)) =
-					&entry.payload && guard.state.tiered_slabs.contains_key(&retire.slab_id)
-					&& let Some(observer) = self.tier_observer.as_ref()
+				// Owner admission runs before the pre-hook: a retirement the
+				// state machine will refuse must have no local effect.
+				if let EntryPayload::Normal(WendelonRequest::SlabOp(op)) = &entry.payload
+					&& let Some((slab, registry)) = slab_op_apply::op_retirement(
+						&guard.state,
+						op,
+						entry.log_id.leader_id.node_id,
+					) && let Some(observer) = self.tier_observer.as_ref()
 				{
-					observer.before_slab_retired(retire.slab_id, entry.log_id.index);
+					observer.before_slab_retired(slab, &registry, entry.log_id.index);
 				}
 				let drop_prepare_operation = match &entry.payload {
 					EntryPayload::Normal(WendelonRequest::TableDropPrepare(request)) => {
@@ -4151,20 +4571,28 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 				// has already committed the pivot and followers
 				// must not diverge on a local filesystem hiccup.
 				let result = match event {
-					TierObserverEvent::Tiered(tier) => observer
-						.on_slab_tiered(tier, *applied_log_index)
+					TierObserverEvent::Tiered(tier, registry) => observer
+						.on_slab_tiered(tier, registry, *applied_log_index)
 						.await
-						.map_err(|error| (tier.slab_id, error)),
-					TierObserverEvent::Retired(slab_id) => observer
-						.on_slab_retired(*slab_id, *applied_log_index)
+						.map_err(|error| (tier.slab.local_id(), error)),
+					TierObserverEvent::Retired(slab, registry) => observer
+						.on_slab_retired(*slab, registry, *applied_log_index)
 						.await
-						.map_err(|error| (*slab_id, error)),
+						.map_err(|error| (slab.local_id(), error)),
+					TierObserverEvent::Registry(node, registry) => observer
+						.on_incarnation_registry(*node, registry, *applied_log_index)
+						.await
+						.map_err(|error| (SlabId::new(0), error)),
 					TierObserverEvent::MigratedRangeTombstone(tombstone) => observer
 						.on_migrated_range_tombstone(tombstone, *applied_log_index)
 						.await
 						.map_err(|error| (SlabId::new(0), error)),
-					TierObserverEvent::LsmCompactionCommitted(commit) => observer
-						.on_lsm_compaction_committed(commit, *applied_log_index)
+					TierObserverEvent::GcRemoved(remove, op_seq, registry) => observer
+						.on_gc_removed(remove, *op_seq, registry, *applied_log_index)
+						.await
+						.map_err(|error| (remove.slab.local_id(), error)),
+					TierObserverEvent::LsmCompactionCommitted(commit, registry) => observer
+						.on_lsm_compaction_committed(commit, registry, *applied_log_index)
 						.await
 						.map_err(|error| (SlabId::new(0), error)),
 				};
@@ -4379,7 +4807,14 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 			}
 		}
 		let snapshot_epoch = if let Some(observer) = self.tier_observer.as_ref() {
-			Some(observer.before_tier_snapshot_install().map_err(write_err)?)
+			Some(
+				observer
+					.before_tier_snapshot_install(
+						meta.last_log_id.map(|id| id.index),
+						&state.incarnations,
+					)
+					.map_err(write_err)?,
+			)
 		} else {
 			None
 		};
@@ -4401,6 +4836,7 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 			return Err(write_err(err));
 		}
 		let snapshot_tiers = state.tiered_slabs.values().cloned().collect::<Vec<_>>();
+		let snapshot_registries = state.incarnations.clone();
 		#[cfg(test)]
 		{
 			let hold = self
@@ -4479,6 +4915,7 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 			if let Err(err) = observer
 				.on_tier_snapshot_installed(
 					&snapshot_tiers,
+					&snapshot_registries,
 					meta.last_log_id.map(|id| id.index),
 					snapshot_epoch.expect("observer epoch"),
 				)
@@ -4548,10 +4985,165 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum TierObserverEvent {
-	Tiered(TieredSlab),
-	Retired(SlabId),
+	/// Each slab event carries its owner node's registry as of apply, so the
+	/// observer classifies it against coherent authority (ADR 0697).
+	Tiered(TieredSlab, IncarnationRegistry),
+	Retired(SlabRef, IncarnationRegistry),
 	MigratedRangeTombstone(MigratedRangeTombstone),
-	LsmCompactionCommitted(CompactionCommit),
+	LsmCompactionCommitted(CompactionCommit, IncarnationRegistry),
+	/// A node's registry changed: a superseded local store must fence even
+	/// when no later slab event names it.
+	Registry(u32, IncarnationRegistry),
+	GcRemoved(
+		crate::consensus::slab_ops::GcRemove,
+		u64,
+		IncarnationRegistry,
+	),
+}
+
+/// ADR 0697: a control artifact (WAL record or snapshot) written before
+/// owner-qualified slab identity. Refused, never decoded by guessing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnsupportedControlFormat {
+	pub artifact: &'static str,
+	pub found: u8,
+	pub required: u8,
+}
+
+impl std::fmt::Display for UnsupportedControlFormat {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(
+			f,
+			"UnsupportedControlFormat: {} format version {} predates owner-qualified slab identity (this build reads only {}); the artifact is refused, not migrated",
+			self.artifact, self.found, self.required
+		)
+	}
+}
+
+impl std::error::Error for UnsupportedControlFormat {}
+
+/// ADR 0697 snapshot validation: every tier pointer is keyed by its own
+/// owner-qualified slab, every owner is its node's registered current or
+/// retired incarnation, and no node's current incarnation is also retired.
+fn validate_slab_identity_state(state: &SmState) -> Result<(), String> {
+	for (node, registry) in &state.incarnations {
+		if let Some(current) = registry.current
+			&& registry.retired.contains(&current)
+		{
+			return Err(format!(
+				"snapshot incarnation registry for node {node} lists its current incarnation as retired"
+			));
+		}
+	}
+	for (key, tier) in &state.tiered_slabs {
+		if *key != tier.slab {
+			return Err(format!(
+				"snapshot tier pointer key {key:?} does not name its value {:?}",
+				tier.slab
+			));
+		}
+		let owner = key.owner();
+		let registered = state
+			.incarnations
+			.get(&owner.node())
+			.is_some_and(|registry| {
+				registry.current == Some(owner.incarnation())
+					|| registry.retired.contains(&owner.incarnation())
+			});
+		if !registered {
+			return Err(format!(
+				"snapshot tier pointer {key:?} names an owner its incarnation registry does not record"
+			));
+		}
+	}
+	Ok(())
+}
+
+/// ADR 0697: a slab command is admitted only from its owner node's leader
+/// entry, for that node's current incarnation. Checked before any effect.
+fn admit_slab_owner(
+	state: &SmState,
+	owner: OwnerRef,
+	leader_node: u32,
+) -> Result<IncarnationRegistry, SlabRefusal> {
+	if owner.node() != leader_node {
+		return Err(SlabRefusal::NotAppendingLeader {
+			owner_node: owner.node(),
+			leader_node,
+		});
+	}
+	let registry = state
+		.incarnations
+		.get(&owner.node())
+		.cloned()
+		.unwrap_or_default();
+	if registry.current != Some(owner.incarnation()) {
+		return Err(SlabRefusal::NotCurrentOwner {
+			owner,
+			current: registry.current,
+		});
+	}
+	Ok(registry)
+}
+
+/// ADR 0697 §3: a first registration names no predecessor; a replacement
+/// names the exact current incarnation; an exact replay returns its original
+/// receipt and changes nothing; a retired incarnation never returns.
+fn apply_register_incarnation(
+	state: &mut SmState,
+	register: RegisterIncarnation,
+	leader_node: u32,
+) -> (WendelonResponse, Option<TierObserverEvent>) {
+	if register.node != leader_node {
+		return (
+			WendelonResponse::Refused(SlabRefusal::NotAppendingLeader {
+				owner_node: register.node,
+				leader_node,
+			}),
+			None,
+		);
+	}
+	let registry = state.incarnations.entry(register.node).or_default();
+	if registry
+		.accepted
+		.contains(&(register.incarnation, register.supersedes))
+	{
+		return (WendelonResponse::Success, None);
+	}
+	if registry.retired.contains(&register.incarnation)
+		|| registry
+			.accepted
+			.iter()
+			.any(|(incarnation, _)| *incarnation == register.incarnation)
+	{
+		return (
+			WendelonResponse::Refused(SlabRefusal::RetiredIncarnation {
+				node: register.node,
+				incarnation: register.incarnation,
+			}),
+			None,
+		);
+	}
+	if registry.current != register.supersedes {
+		return (
+			WendelonResponse::Refused(SlabRefusal::StaleSupersede {
+				node: register.node,
+				current: registry.current,
+			}),
+			None,
+		);
+	}
+	if let Some(previous) = registry.current.replace(register.incarnation) {
+		registry.retired.insert(previous);
+	}
+	registry
+		.accepted
+		.insert((register.incarnation, register.supersedes));
+	let snapshot = registry.clone();
+	(
+		WendelonResponse::Success,
+		Some(TierObserverEvent::Registry(register.node, snapshot)),
+	)
 }
 
 /// Fold one committed [`WendelonRequest`] into the SM state.
@@ -4567,9 +5159,12 @@ fn apply_entry_to_state(
 ) -> (WendelonResponse, Option<TierObserverEvent>) {
 	match &entry.payload {
 		EntryPayload::Blank => (WendelonResponse::Success, None),
-		EntryPayload::Normal(req) => {
-			apply_request_at_log_index(state, req.clone(), entry.log_id.index)
-		}
+		EntryPayload::Normal(req) => apply_request_at_log_index(
+			state,
+			req.clone(),
+			entry.log_id.index,
+			entry.log_id.leader_id.node_id,
+		),
 		EntryPayload::Membership(membership) => {
 			state.last_membership = StoredMembership::new(Some(entry.log_id), membership.clone());
 			let voters = membership.voter_ids().collect::<BTreeSet<_>>();
@@ -4826,8 +5421,19 @@ fn raft_audit_event_with_context(
 			.with_tenant(finalization.tenant_id)
 			.with_record_identity(finalization.key_identity),
 		),
-		WendelonRequest::TierSlab(_) | WendelonRequest::RetireTieredSlab(_) => None,
-		WendelonRequest::CompactionCommit(commit) => {
+		WendelonRequest::RetiredTierSlab(never)
+		| WendelonRequest::RetiredRetireTieredSlab(never)
+		| WendelonRequest::RetiredCompactionCommit(never) => match *never {},
+		WendelonRequest::CancelOp(_) | WendelonRequest::AckOutcomes(_) => None,
+		WendelonRequest::SlabOp(op)
+			if !matches!(op.command, crate::consensus::slab_ops::SlabCommand::Compaction(_)) =>
+		{
+			None
+		}
+		WendelonRequest::SlabOp(crate::consensus::slab_ops::SlabOp {
+			command: crate::consensus::slab_ops::SlabCommand::Compaction(commit),
+			..
+		}) => {
 			let op = if is_err {
 				AuditOperation::LsmInvariantViolation
 			} else {
@@ -5596,13 +6202,22 @@ fn apply_request(
 	state: &mut SmState,
 	req: WendelonRequest,
 ) -> (WendelonResponse, Option<TierObserverEvent>) {
-	apply_request_at_log_index(state, req, 0)
+	// Tests apply directly, as if the owner's own node appended the entry.
+	let leader_node = match &req {
+		WendelonRequest::RegisterIncarnation(register) => register.node,
+		WendelonRequest::SlabOp(op) => op.command.owner().node(),
+		WendelonRequest::CancelOp(cancel) => cancel.key.owner.node(),
+		WendelonRequest::AckOutcomes(ack) => ack.owner.node(),
+		_ => 0,
+	};
+	apply_request_at_log_index(state, req, 0, leader_node)
 }
 
 fn apply_request_at_log_index(
 	state: &mut SmState,
 	req: WendelonRequest,
 	entry_log_index: u64,
+	leader_node: u32,
 ) -> (WendelonResponse, Option<TierObserverEvent>) {
 	match req {
 		WendelonRequest::Root2Command(_) => (WendelonResponse::Root2Dormant, None),
@@ -5756,50 +6371,23 @@ fn apply_request_at_log_index(
 			};
 			(response, None)
 		}
-		WendelonRequest::TierSlab(tier) => {
-			// Idempotent replays keep the existing mapping; pointer
-			// refreshes (for re-encryption or URI/hash repair) update
-			// the record in place and still notify the tier
-			// observer so runtime readers pick up the new pointer.
-			if let Some(existing) = state.tiered_slabs.get(&tier.slab_id) {
-				if existing == &tier {
-					return (WendelonResponse::Success, None);
-				}
-				state.tiered_slabs.insert(tier.slab_id, tier.clone());
-				return (
-					WendelonResponse::Success,
-					Some(TierObserverEvent::Tiered(tier)),
-				);
-			}
-			state.tiered_slabs.insert(tier.slab_id, tier.clone());
-			(
-				WendelonResponse::Success,
-				Some(TierObserverEvent::Tiered(tier)),
-			)
+		WendelonRequest::RetiredTierSlab(never)
+		| WendelonRequest::RetiredRetireTieredSlab(never)
+		| WendelonRequest::RetiredCompactionCommit(never) => match never {},
+		WendelonRequest::RegisterIncarnation(register) => {
+			apply_register_incarnation(state, register, leader_node)
 		}
-		WendelonRequest::RetireTieredSlab(retire) => {
-			if state.tiered_slabs.remove(&retire.slab_id).is_some() {
-				return (
-					WendelonResponse::Success,
-					Some(TierObserverEvent::Retired(retire.slab_id)),
-				);
-			}
-			(WendelonResponse::Success, None)
+		WendelonRequest::SlabOp(op) => {
+			slab_op_apply::apply_slab_op(state, op, entry_log_index, leader_node)
 		}
-		WendelonRequest::CompactionCommit(commit) => {
-			if commit.digest_summary.visible_pre != commit.digest_summary.visible_post {
-				return (
-					WendelonResponse::Error(
-						"LSM compaction visible-domain digest changed".to_owned(),
-					),
-					None,
-				);
-			}
-			(
-				WendelonResponse::Success,
-				Some(TierObserverEvent::LsmCompactionCommitted(commit)),
-			)
-		}
+		WendelonRequest::CancelOp(cancel) => (
+			slab_op_apply::apply_cancel_op(state, cancel, entry_log_index, leader_node),
+			None,
+		),
+		WendelonRequest::AckOutcomes(ack) => (
+			slab_op_apply::apply_ack_outcomes(state, ack, leader_node),
+			None,
+		),
 		WendelonRequest::CreateTenant(create) => (apply_create_tenant(state, create), None),
 		WendelonRequest::UpdateTenantQuota(update) => {
 			(apply_update_tenant_quota(state, update), None)
@@ -8855,24 +9443,23 @@ fn decode_log_record(
 		));
 	}
 	// The payload hash matched just above, so these bytes are exactly what
-	// their writer produced. ADR 0092's dispatch and classification rule hold
-	// from here: a superseded version is decoded by its own frozen shape and
-	// upconverted, and a hash-matched decode failure at a recognized version
-	// is a format mismatch named as such — never interior corruption, which
-	// stays reserved for damage and framing contradictions.
+	// their writer produced: a decode failure below is a format mismatch, never
+	// interior corruption. ADR 0697: bodies written before owner-qualified slab
+	// identity are refused before any payload is decoded; no older shape is
+	// upconverted.
+	if header.format_version != WAL_FORMAT_VERSION {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			UnsupportedControlFormat {
+				artifact: "wal",
+				found: header.format_version,
+				required: WAL_FORMAT_VERSION,
+			},
+		));
+	}
 	let entry: Entry<WendelonTypeConfig> = match header.format_version {
-		1 => crate::consensus::wal_body::v1::decode_entry(payload)
-			.map_err(|err| wal_body_format_mismatch(wal_path, offset, 1, &err.to_string()))?,
-		2 => crate::consensus::wal_body::v2::decode_entry(payload)
-			.map_err(|err| wal_body_format_mismatch(wal_path, offset, 2, &err.to_string()))?,
-		3 => crate::consensus::wal_body::v3::decode_entry(payload)
-			.map_err(|err| wal_body_format_mismatch(wal_path, offset, 3, &err.to_string()))?,
-		0 => crate::consensus::wal_body::v4::decode_entry(payload)
-			.map_err(|err| wal_body_format_mismatch(wal_path, offset, 0, &err.to_string()))?,
-		4 => crate::consensus::wal_body::v4::decode_entry(payload).map_err(|err| {
-			wal_body_format_mismatch(wal_path, offset, header.format_version, &err.to_string())
-		})?,
-		5 => match postcard::take_from_bytes::<Entry<WendelonTypeConfig>>(payload) {
+		WAL_FORMAT_VERSION => match postcard::take_from_bytes::<Entry<WendelonTypeConfig>>(payload)
+		{
 			Ok((entry, [])) => entry,
 			Ok((_entry, rest)) => {
 				return Err(wal_body_format_mismatch(
@@ -9001,9 +9588,15 @@ fn serialize_entry_page(entry: &Entry<WendelonTypeConfig>) -> Result<AlignedBuf,
 		| EntryPayload::Normal(WendelonRequest::ReplayLegacyCtasRowDispatched(_)) => {
 			(LogEntryKind::APPEND, 0)
 		}
-		EntryPayload::Normal(WendelonRequest::TierSlab(_)) => (LogEntryKind::APPEND, 0),
-		EntryPayload::Normal(WendelonRequest::RetireTieredSlab(_)) => (LogEntryKind::APPEND, 0),
-		EntryPayload::Normal(WendelonRequest::CompactionCommit(_)) => (LogEntryKind::APPEND, 0),
+		EntryPayload::Normal(
+			WendelonRequest::RetiredTierSlab(never)
+			| WendelonRequest::RetiredRetireTieredSlab(never)
+			| WendelonRequest::RetiredCompactionCommit(never),
+		) => match *never {},
+		EntryPayload::Normal(WendelonRequest::RegisterIncarnation(_)) => (LogEntryKind::APPEND, 0),
+		EntryPayload::Normal(WendelonRequest::SlabOp(_)) => (LogEntryKind::APPEND, 0),
+		EntryPayload::Normal(WendelonRequest::CancelOp(_)) => (LogEntryKind::APPEND, 0),
+		EntryPayload::Normal(WendelonRequest::AckOutcomes(_)) => (LogEntryKind::APPEND, 0),
 		EntryPayload::Normal(WendelonRequest::CreateTenant(_)) => (LogEntryKind::APPEND, 0),
 		EntryPayload::Normal(WendelonRequest::UpdateTenantQuota(_)) => (LogEntryKind::APPEND, 0),
 		EntryPayload::Normal(WendelonRequest::SuspendTenant(_)) => (LogEntryKind::APPEND, 0),
@@ -9120,6 +9713,8 @@ fn serialize_checkpoint_page(
 
 /// Encode a complete snapshot: `[SnapshotHeader][postcard(SmState)]`.
 fn encode_snapshot(state: &SmState) -> Result<Vec<u8>, AnyError> {
+	slab_op_apply::validate_slab_terminal(state)
+		.map_err(|error| AnyError::new(&std::io::Error::other(error)))?;
 	let body = postcard::to_allocvec(state).map_err(|e| AnyError::new(&e))?;
 	let header = snapshot_header_template(state);
 	let header = SnapshotHeader {
@@ -9271,6 +9866,16 @@ fn decode_snapshot_reader_with_identity<R: Read>(
 			header.format_version, PRE_VERSIONING_FORMAT, SNAPSHOT_FORMAT_VERSION
 		));
 	}
+	// ADR 0697: a snapshot written before owner-qualified slab identity is
+	// refused before its body is decoded; no older shape is upconverted.
+	if header.format_version != SNAPSHOT_FORMAT_VERSION {
+		return Err(UnsupportedControlFormat {
+			artifact: "snapshot",
+			found: header.format_version,
+			required: SNAPSHOT_FORMAT_VERSION,
+		}
+		.to_string());
+	}
 	if header.cache_checkpoint_len != 0 {
 		return Err(format!(
 			"snapshot cache checkpoint len {} is not supported yet",
@@ -9289,71 +9894,12 @@ fn decode_snapshot_reader_with_identity<R: Read>(
 			header.state_sha256, blake3_hash, sha256_hash
 		));
 	}
-	// The digest matched, so the body is exactly what its writer produced. A
-	// decode failure here is therefore a shape mismatch, never damage — and for a
-	// pre-versioning artifact that is the likeliest reading by far, since it is
-	// the case ADR 85 exists to explain.
-	// ADR 0092 dispatch: a superseded version with a registered replay
-	// decoder is decoded by its own frozen shape and upconverted; anything
-	// else decodes by the current shape, with the failure attributed to the
-	// version the header declares.
-	let state = match header.format_version {
-		1 => crate::consensus::snapshot_body::v1::decode_state(&body).map_err(|err| {
-			format!(
-				"{err}; the body's digest matched, so this artifact is intact, and it \
-				 declares snapshot format version 1, which this build replays — failing \
-				 that decode means the artifact was not written at its declared version; \
-				 this is a format mismatch, not corruption"
-			)
-		})?,
-		2 => crate::consensus::snapshot_body::v2::decode_state(&body).map_err(|err| {
-			format!(
-				"{err}; the body's digest matched, so this artifact is intact, and it \
-				 declares snapshot format version 2, which this build replays — failing \
-				 that decode means the artifact was not written at its declared version; \
-				 this is a format mismatch, not corruption"
-			)
-		})?,
-		3 => crate::consensus::snapshot_body::v3::decode_state(&body).map_err(|err| {
-			format!(
-				"{err}; the body's digest matched, so this artifact is intact, and it \
-				 declares snapshot format version 3, which this build replays — failing \
-				 that decode means the artifact was not written at its declared version; \
-				 this is a format mismatch, not corruption"
-			)
-		})?,
-		4 => crate::consensus::snapshot_body::v4::decode_state(&body).map_err(|err| {
-			format!(
-				"{err}; the body's digest matched, so this artifact is intact, and it \
-				 declares snapshot format version 4, which this build replays — failing \
-				 that decode means the artifact was not written at its declared version; \
-				 this is a format mismatch, not corruption"
-			)
-		})?,
-		_ => decode_snapshot_state_bytes(&body).map_err(|err| {
-			if header.format_version == PRE_VERSIONING_FORMAT {
-				format!(
-					"{err}; the body's digest matched, so this artifact is intact, and it \
-					 predates format versioning — it was very likely written by a build with \
-					 a different state-machine shape"
-				)
-			} else if header.format_version < SNAPSHOT_FORMAT_VERSION {
-				// An older-but-versioned artifact with no registered replay
-				// decoder. Unreachable until a third version exists; kept so
-				// the future gap fails with attribution rather than a bare
-				// decoder message.
-				format!(
-					"{err}; the body's digest matched, so this artifact is intact, and it was \
-					 written at snapshot format version {} while this build writes {}; this \
-					 build has no replay decoder for that version, so the older state cannot \
-					 be read",
-					header.format_version, SNAPSHOT_FORMAT_VERSION
-				)
-			} else {
-				err
-			}
-		})?,
-	};
+	// The digest matched, so the body is exactly what its writer produced, at
+	// the one version this build reads: a decode failure is a shape mismatch.
+	let state = decode_snapshot_state_bytes(&body)?;
+	validate_slab_identity_state(&state)?;
+	slab_op_apply::validate_op_tables(&state)?;
+	slab_op_apply::validate_slab_terminal(&state)?;
 	let mut artifact = control_artifact_hash::Context::new();
 	artifact.update(&header_bytes);
 	artifact.update(&body);
@@ -12920,16 +13466,14 @@ mod recovery_tests {
 		);
 	}
 
+	/// ADR 0697: a WAL record from before owner-qualified slab identity,
+	/// including a pre-versioning one, makes the store refuse to open rather
+	/// than replay it.
 	#[tokio::test]
-	async fn adr0085_pre_versioning_wal_record_still_replays() {
-		// The guarantee that keeps existing control rings starting: a record
-		// whose version byte is zero is read exactly as before.
+	async fn adr0697_pre_versioning_wal_record_is_refused_at_open() {
 		let dir = tempdir("wal-legacy-format");
-		let (wal, vote, _snapshot) = artifact_paths(&dir);
+		let (wal, vote, snapshot) = artifact_paths(&dir);
 		write_vote_file(&vote, Vote::new_committed(3, 7));
-		// Entry plus checkpoint, both stamped version zero: a checkpoint is what
-		// lets replay reach the state machine, so this exercises the record all
-		// the way through rather than stopping at a successful open.
 		write_wal_pages(
 			&wal,
 			&[
@@ -12943,249 +13487,15 @@ mod recovery_tests {
 				),
 			],
 		);
-
-		let store = open_store(&dir).await;
-		let recovered = store.recovered_state_machine().await.unwrap();
-		let snapshot = recovered.state_snapshot().await;
-		assert_eq!(snapshot.last_applied_log_id, Some(log_id(1, 1)));
+		let io = crate::storage::io_uring::spawn_io_thread(64).unwrap();
+		let error = WendelonLogStore::open(&wal, &vote, &snapshot, io)
+			.await
+			.err()
+			.expect("a pre-versioning WAL record must not replay");
 		assert!(
-			snapshot.leases.contains_key(&0),
-			"a pre-versioning record is recognized and replayed, not refused"
+			error.to_string().contains("UnsupportedControlFormat"),
+			"{error}"
 		);
-	}
-
-	/// ADR 0092: the grounding probe, flipped to the contract. Immutable
-	/// stored v1 bytes — never a current-encoder truncation — drive a real
-	/// recovery, and the recovered state must be byte-equal to what the
-	/// current certificate-less encoding of the same mutation produces. The
-	/// pre-fix behavior this test replaced: the same bytes refused bootstrap
-	/// as "interior corruption ... Hit the end of buffer".
-	#[tokio::test]
-	async fn adr0092_v1_ctas_provision_wal_record_replay_behavior() {
-		let stored = manifest_bytes(
-			include_str!("../../tests/fixtures/consensus_body/wal_v1_entries.txt"),
-			"ctas_saga_provision",
-		);
-
-		// Arm one: the stored v1 payload, framed at format version 1.
-		let dir = tempdir("wal-v1-provision");
-		let (wal, vote, _snapshot) = artifact_paths(&dir);
-		write_vote_file(&vote, Vote::new_committed(3, 7));
-		write_wal_pages(
-			&wal,
-			&[
-				wal_page_for_payload(&stored, 1),
-				serialize_checkpoint_page(11, 0, 11, 3),
-			],
-		);
-		let store = open_store(&dir).await;
-		let recovered = store.recovered_state_machine().await.unwrap();
-		let v1_state = recovered.state_snapshot().await;
-
-		// Arm two: the same mutation written by this build with
-		// `certificate: None`, replayed the ordinary way.
-		let dir = tempdir("wal-v2-provision-none");
-		let (wal, vote, _snapshot) = artifact_paths(&dir);
-		write_vote_file(&vote, Vote::new_committed(3, 7));
-		write_wal_pages(
-			&wal,
-			&[
-				serialize_entry_page(&provision_none_entry()).unwrap(),
-				serialize_checkpoint_page(11, 0, 11, 3),
-			],
-		);
-		let store = open_store(&dir).await;
-		let recovered = store.recovered_state_machine().await.unwrap();
-		let v2_state = recovered.state_snapshot().await;
-
-		let saga = v1_state
-			.ctas_sagas
-			.get(TenantId::new(7), provision_operation_id())
-			.expect("the v1 provision must replay into the catalog");
-		assert_eq!(
-			saga.certificate, None,
-			"upconversion adds certificate: None"
-		);
-		assert_eq!(
-			postcard::to_stdvec(&v1_state).unwrap(),
-			postcard::to_stdvec(&v2_state).unwrap(),
-			"a v1 body and its current certificate-less twin must recover \
-			 byte-identical states"
-		);
-	}
-
-	/// ADR 0092: a profile holding a v1 snapshot AND a v1 WAL tail boots to
-	/// the state a full replay produces — the steady upgrade state, where
-	/// both artifacts predate the running build.
-	#[tokio::test]
-	async fn adr0092_v1_snapshot_and_v1_wal_tail_boot_to_full_replay_state() {
-		let snapshot_body = manifest_bytes(
-			include_str!("../../tests/fixtures/consensus_body/snapshot_v1.txt"),
-			"smstate_active_saga",
-		);
-		let wal_payload = manifest_bytes(
-			include_str!("../../tests/fixtures/consensus_body/wal_v1_entries.txt"),
-			"ctas_saga_provision_tail_table",
-		);
-
-		let dir = tempdir("v1-snapshot-and-tail");
-		let (wal, vote, snapshot) = artifact_paths(&dir);
-		write_vote_file(&vote, Vote::new_committed(3, 7));
-		let mut snapshot_bytes =
-			Vec::with_capacity(std::mem::size_of::<SnapshotHeader>() + snapshot_body.len());
-		let header = SnapshotHeader {
-			last_included_index: 0,
-			last_included_term: 0,
-			last_included_epoch: 0,
-			snapshot_hlc: HybridTimestamp {
-				physical_ms: 0,
-				logical: 0,
-				node_id: 0,
-			},
-			state_sha256: control_artifact_digest_32(&snapshot_body),
-			cache_checkpoint_len: 0,
-			format_version: 1,
-			_pad: [0; 3],
-		};
-		snapshot_bytes.extend_from_slice(bytemuck::bytes_of(&header));
-		snapshot_bytes.extend_from_slice(&snapshot_body);
-		std::fs::write(&snapshot, snapshot_bytes).unwrap();
-		write_wal_pages(
-			&wal,
-			&[
-				wal_page_for_payload(&wal_payload, 1),
-				serialize_checkpoint_page(11, 0, 11, 3),
-			],
-		);
-
-		let store = open_store(&dir).await;
-		let recovered = store.recovered_state_machine().await.unwrap();
-		let state = recovered.state_snapshot().await;
-
-		// The snapshot's active saga (operation 0x55) and the tail's
-		// provision (operation 0x54) must both be present, certificate-less.
-		let mut op55 = [0x55u8; 16];
-		op55[..5].fill(0);
-		op55[5] = 1;
-		op55[6] = 0x70;
-		op55[8] = 0x80;
-		let snapshot_saga = state
-			.ctas_sagas
-			.get(TenantId::new(7), CtasOperationId::new(op55))
-			.expect("the snapshot's active saga survives the boot");
-		assert_eq!(snapshot_saga.certificate, None);
-		let tail_saga = state
-			.ctas_sagas
-			.get(TenantId::new(7), provision_operation_id())
-			.expect("the tail's provision applies on top of the snapshot");
-		assert_eq!(tail_saga.certificate, None);
-	}
-
-	fn manifest_bytes(manifest: &str, name: &str) -> Vec<u8> {
-		let line = manifest
-			.lines()
-			.find(|line| line.starts_with(&format!("{name}=")))
-			.unwrap_or_else(|| panic!("fixture manifest lacks `{name}`"));
-		let hex = &line[name.len() + 1..];
-		(0..hex.len())
-			.step_by(2)
-			.map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
-			.collect()
-	}
-
-	fn provision_operation_id() -> CtasOperationId {
-		let mut bytes = [0x54u8; 16];
-		bytes[..5].fill(0);
-		bytes[5] = 1;
-		bytes[6] = 0x70;
-		bytes[8] = 0x80;
-		CtasOperationId::new(bytes)
-	}
-
-	fn provision_none_entry() -> Entry<WendelonTypeConfig> {
-		let schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
-		let descriptor = TableSchemaDescriptor::new(
-			TableObjectId::new([4; 16]),
-			1,
-			"analytics",
-			"events",
-			&schema,
-			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
-			LocalityPolicy::default_table_spread(),
-			SchemaEvolutionPolicy::AdditiveOnly,
-		)
-		.unwrap();
-		let mut client_uuid = [0x54u8; 16];
-		client_uuid[6] = 0x70;
-		client_uuid[8] = 0x80;
-		Entry {
-			log_id: log_id(3, 11),
-			payload: EntryPayload::Normal(WendelonRequest::CtasSaga(CtasSagaMutation::Provision {
-				tenant_id: TenantId::new(7),
-				operation_id: provision_operation_id(),
-				intent_fingerprint: CtasIntentFingerprint::new([0x48; 32]),
-				descriptor,
-				expected_binding: CtasExpectedBinding::Absent,
-				prior_descriptor: None,
-				row_write_id: ClientWriteId {
-					client_uuid,
-					sequence_no: 7,
-					idempotency_ttl_ms: 300_000,
-					_pad: 0,
-				},
-				owner_epoch: 1,
-				observed_now_ms: 1,
-				owner_lease_expires_at_ms: 1_000,
-				certificate: None,
-			})),
-		}
-	}
-
-	/// Frame an already-encoded entry payload at a declared format version.
-	/// The framing (header, fixed prefix, hashes, checksum) is the current
-	/// writer's — only the BODY bytes are the fixture's — because framing is
-	/// not what the body format versions.
-	fn wal_page_for_payload(payload: &[u8], format_version: u8) -> AlignedBuf {
-		let (log_index, term) = (11u64, 3u64);
-		let header_size = std::mem::size_of::<WALRecordHeader>();
-		let fixed_size = std::mem::size_of::<RaftLogEntryFixed>();
-		let body_len = fixed_size + payload.len();
-		let mut page = AlignedBuf::new(page_round_up(header_size + body_len + 4));
-		let header = WALRecordHeader {
-			record_type: REC_LOG_ENTRY,
-			format_version,
-			_pad1: [0; 6],
-			body_len: body_len as u64,
-			log_index,
-			term,
-		};
-		let fixed = RaftLogEntryFixed {
-			kind: LogEntryKind::APPEND,
-			_pad1: [0; 7],
-			term,
-			index: log_index,
-			epoch: 0,
-			leader: SchemaNodeId {
-				id: 1,
-				_reserved: 0,
-			},
-			entry_hlc: HybridTimestamp {
-				physical_ms: 0,
-				logical: 0,
-				node_id: 1,
-			},
-			payload_len: payload.len() as u32,
-			_pad2: [0; 4],
-			payload_hash: control_artifact_digest_32(payload),
-		};
-		let dst = page.as_mut_slice();
-		dst[..header_size].copy_from_slice(bytemuck::bytes_of(&header));
-		dst[header_size..header_size + fixed_size].copy_from_slice(bytemuck::bytes_of(&fixed));
-		dst[header_size + fixed_size..header_size + body_len].copy_from_slice(payload);
-		let checksum = control_artifact_checksum_u32(&dst[..header_size + body_len]);
-		dst[header_size + body_len..header_size + body_len + 4]
-			.copy_from_slice(&checksum.to_le_bytes());
-		page
 	}
 
 	#[tokio::test]
@@ -18932,7 +19242,80 @@ mod migration_tests {
 #[cfg(test)]
 mod tiered_slab_tests {
 	use super::*;
-	use crate::consensus::RetireTieredSlab;
+	use crate::consensus::slab_ops::{RetireOp, SlabCommand, SlabOp, TierGeneration, TierOp};
+
+	fn owner() -> OwnerRef {
+		OwnerRef::for_test(1, 0x11)
+	}
+
+	fn register(node: u32, incarnation: u128, supersedes: Option<u128>) -> WendelonRequest {
+		WendelonRequest::RegisterIncarnation(RegisterIncarnation {
+			node,
+			incarnation: StoreIncarnation::from_raw(incarnation),
+			supersedes: supersedes.map(StoreIncarnation::from_raw),
+		})
+	}
+
+	/// The next sequence for the command's owner, as its allocator would give it.
+	fn op(state: &SmState, command: SlabCommand) -> WendelonRequest {
+		let table = state.op_tables.get(&command.owner());
+		let op_seq = table.map_or(1, |table| {
+			table.acked_through + table.outcomes.len() as u64 + 1
+		});
+		WendelonRequest::SlabOp(SlabOp { op_seq, command })
+	}
+
+	fn tier_op(tier: TieredSlab) -> SlabCommand {
+		SlabCommand::Tier(TierOp {
+			tier,
+			replaces: None,
+		})
+	}
+
+	fn retire_op(slab: SlabRef) -> SlabCommand {
+		SlabCommand::Retire(RetireOp {
+			slab,
+			expected: TierGeneration::from(&tier(slab)),
+		})
+	}
+
+	fn applied(response: &WendelonResponse) -> bool {
+		matches!(
+			response,
+			WendelonResponse::Op(crate::consensus::slab_ops::OpResponse::Receipt(receipt))
+				if matches!(
+					receipt.outcome,
+					crate::consensus::slab_ops::OpOutcome::Recorded(
+						crate::consensus::slab_ops::RecordedOutcome::Applied { .. }
+					)
+				)
+		)
+	}
+
+	/// A state whose node 1 has registered `owner()` as current.
+	fn registered_state() -> (SmState, IncarnationRegistry) {
+		let mut state = SmState::default();
+		let (resp, _) = apply_request(&mut state, register(1, 0x11, None));
+		assert_eq!(resp, WendelonResponse::Success);
+		let registry = state.incarnations[&1].clone();
+		(state, registry)
+	}
+
+	fn tier(slab: SlabRef) -> TieredSlab {
+		TieredSlab {
+			slab,
+			l2_uri: "memory://tier/slab_0000000000000007.wnd".into(),
+			payload_hash: [0xAB; 32],
+			is_encrypted: true,
+			tenant_id: None,
+			tenant_kek_id: None,
+			stats_format_version: None,
+			stats_block_len: None,
+			stats_block_hash128: None,
+			tombstone_metadata: TombstoneMetadata::None,
+			supersession_metadata: SupersessionMetadata::None,
+		}
+	}
 
 	fn lsm_commit(visible_digest_byte: u8) -> CompactionCommit {
 		let digest = crate::hash::state_digest::StateDigest::ZERO;
@@ -18942,6 +19325,7 @@ mod tiered_slab_tests {
 			crate::hash::state_digest::StateDigest::new([visible_digest_byte; 32])
 		};
 		CompactionCommit {
+			owner: owner(),
 			job_id: crate::schema::CompactionJobId::new(55),
 			manifest_epoch_pre: crate::schema::ManifestEpoch::new(7),
 			slabs_to_retire: vec![SlabId::new(1), SlabId::new(2)],
@@ -18973,73 +19357,146 @@ mod tiered_slab_tests {
 		}
 	}
 
+	/// ADR 0697: two stores' slabs with the same local id are distinct keys.
 	#[test]
-	fn retire_tiered_slab_removes_pointer_and_is_idempotent() {
-		let mut state = SmState::default();
-		let slab_id = SlabId::new(7);
-		let tier = TieredSlab {
-			slab_id,
-			l2_uri: "memory://tier/slab_0000000000000007.wnd".into(),
-			payload_hash: [0xAB; 32],
-			is_encrypted: true,
-			tenant_id: None,
-			tenant_kek_id: None,
-			stats_format_version: None,
-			stats_block_len: None,
-			stats_block_hash128: None,
-			tombstone_metadata: TombstoneMetadata::None,
-			supersession_metadata: SupersessionMetadata::None,
-		};
+	fn same_local_id_on_two_owners_is_two_pointers() {
+		let (mut state, _) = registered_state();
+		apply_request(&mut state, register(2, 0x22, None));
+		let a = owner().slab(SlabId::new(0));
+		let b = OwnerRef::for_test(2, 0x22).slab(SlabId::new(0));
+		for slab in [a, b] {
+			let request = op(&state, tier_op(tier(slab)));
+			let (resp, _) = apply_request(&mut state, request);
+			assert!(applied(&resp), "{resp:?}");
+		}
+		assert_eq!(state.tiered_slabs.len(), 2);
+		let request = op(&state, retire_op(a));
+		apply_request(&mut state, request);
+		assert!(state.tiered_slabs.contains_key(&b) && !state.tiered_slabs.contains_key(&a));
+	}
 
-		let (resp, event) = apply_request(&mut state, WendelonRequest::TierSlab(tier.clone()));
-		assert_eq!(resp, WendelonResponse::Success);
-		assert_eq!(event, Some(TierObserverEvent::Tiered(tier.clone())));
-		assert_eq!(state.tiered_slabs.get(&slab_id), Some(&tier));
+	/// ADR 0697: a slab command from an owner that is not its node's current
+	/// incarnation is refused, applies nothing and records nothing.
+	#[test]
+	fn slab_commands_from_a_non_current_owner_are_refused() {
+		let (mut state, _) = registered_state();
+		let stranger = OwnerRef::for_test(1, 0x99);
+		let before = state.tiered_slabs.clone();
+		for command in [
+			tier_op(tier(stranger.slab(SlabId::new(7)))),
+			retire_op(stranger.slab(SlabId::new(7))),
+			SlabCommand::Compaction(CompactionCommit {
+				owner: stranger,
+				..lsm_commit(0)
+			}),
+		] {
+			let request = op(&state, command);
+			let (resp, event) = apply_request(&mut state, request);
+			assert_eq!(
+				resp,
+				WendelonResponse::Refused(SlabRefusal::NotCurrentOwner {
+					owner: stranger,
+					current: Some(owner().incarnation()),
+				})
+			);
+			assert_eq!(event, None);
+		}
+		assert_eq!(state.tiered_slabs, before);
+		let unregistered = OwnerRef::for_test(3, 0x33);
+		let request = op(&state, tier_op(tier(unregistered.slab(SlabId::new(1)))));
+		let (resp, _) = apply_request(&mut state, request);
+		assert!(matches!(
+			resp,
+			WendelonResponse::Refused(SlabRefusal::NotCurrentOwner { current: None, .. })
+		));
+	}
 
-		let (resp, event) = apply_request(
+	/// ADR 0697: a slab command is admitted only from its owner node's own
+	/// leader entry, by the leader recorded in that entry.
+	#[test]
+	fn slab_command_appended_by_another_leader_is_refused() {
+		let (mut state, _) = registered_state();
+		let (resp, event) = apply_request_at_log_index(
 			&mut state,
-			WendelonRequest::RetireTieredSlab(RetireTieredSlab { slab_id }),
+			WendelonRequest::SlabOp(SlabOp {
+				op_seq: 1,
+				command: tier_op(tier(owner().slab(SlabId::new(7)))),
+			}),
+			9,
+			2,
 		);
-		assert_eq!(resp, WendelonResponse::Success);
-		assert_eq!(event, Some(TierObserverEvent::Retired(slab_id)));
-		assert!(!state.tiered_slabs.contains_key(&slab_id));
-
-		let (resp, event) = apply_request(
-			&mut state,
-			WendelonRequest::RetireTieredSlab(RetireTieredSlab { slab_id }),
+		assert_eq!(
+			resp,
+			WendelonResponse::Refused(SlabRefusal::NotAppendingLeader {
+				owner_node: 1,
+				leader_node: 2,
+			})
 		);
-		assert_eq!(resp, WendelonResponse::Success);
 		assert_eq!(event, None);
+		assert!(state.tiered_slabs.is_empty());
+	}
+
+	/// ADR 0697 §3: bootstrap, exact replay, stale supersede, supersession
+	/// and no reactivation of a retired incarnation.
+	#[test]
+	fn register_incarnation_follows_the_supersession_rule() {
+		let mut state = SmState::default();
+		let (resp, event) = apply_request(&mut state, register(1, 0xA, None));
+		assert_eq!(resp, WendelonResponse::Success);
+		assert!(matches!(event, Some(TierObserverEvent::Registry(1, _))));
+		// Exact replay returns its receipt and changes nothing.
+		let (resp, event) = apply_request(&mut state, register(1, 0xA, None));
+		assert_eq!((resp, event), (WendelonResponse::Success, None));
+		// A second bootstrap is stale.
+		let (resp, _) = apply_request(&mut state, register(1, 0xB, None));
+		assert!(matches!(
+			resp,
+			WendelonResponse::Refused(SlabRefusal::StaleSupersede { node: 1, .. })
+		));
+		// Supersede the exact current one.
+		let (resp, _) = apply_request(&mut state, register(1, 0xB, Some(0xA)));
+		assert_eq!(resp, WendelonResponse::Success);
+		let registry = &state.incarnations[&1];
+		assert_eq!(registry.current, Some(StoreIncarnation::from_raw(0xB)));
+		assert!(registry.retired.contains(&StoreIncarnation::from_raw(0xA)));
+		// A retired incarnation never becomes current again, and replaying its
+		// original registration does not change who is current.
+		let (resp, _) = apply_request(&mut state, register(1, 0xA, Some(0xB)));
+		assert!(matches!(
+			resp,
+			WendelonResponse::Refused(SlabRefusal::RetiredIncarnation { node: 1, .. })
+		));
+		let (resp, _) = apply_request(&mut state, register(1, 0xA, None));
+		assert_eq!(resp, WendelonResponse::Success);
+		assert_eq!(
+			state.incarnations[&1].current,
+			Some(StoreIncarnation::from_raw(0xB))
+		);
+		// The old incarnation's slab commands are refused.
+		let request = op(
+			&state,
+			tier_op(tier(OwnerRef::for_test(1, 0xA).slab(SlabId::new(1)))),
+		);
+		let (resp, _) = apply_request(&mut state, request);
+		assert!(matches!(
+			resp,
+			WendelonResponse::Refused(SlabRefusal::NotCurrentOwner { .. })
+		));
 	}
 
 	#[test]
 	fn compaction_commit_request_emits_lsm_observer_event() {
-		let mut state = SmState::default();
+		let (mut state, registry) = registered_state();
 		let commit = lsm_commit(0);
 
-		let (resp, event) = apply_request(
-			&mut state,
-			WendelonRequest::CompactionCommit(commit.clone()),
-		);
+		let request = op(&state, SlabCommand::Compaction(commit.clone()));
+		let (resp, event) = apply_request(&mut state, request);
 
-		assert_eq!(resp, WendelonResponse::Success);
+		assert!(applied(&resp), "{resp:?}");
 		assert_eq!(
 			event,
-			Some(TierObserverEvent::LsmCompactionCommitted(commit))
+			Some(TierObserverEvent::LsmCompactionCommitted(commit, registry))
 		);
-	}
-
-	#[test]
-	fn compaction_commit_request_rejects_visible_digest_mismatch() {
-		let mut state = SmState::default();
-
-		let (resp, event) =
-			apply_request(&mut state, WendelonRequest::CompactionCommit(lsm_commit(7)));
-
-		assert!(
-			matches!(resp, WendelonResponse::Error(error) if error.contains("visible-domain digest"))
-		);
-		assert_eq!(event, None);
 	}
 }
 
@@ -19208,10 +19665,11 @@ mod tenant_kek_tests {
 		let mut state = SmState::default();
 		seed_active_tenant(&mut state, tenant_id);
 		seed_two_version_keyset(&mut state, tenant_id, historical_id, active_id);
+		let slab = OwnerRef::for_test(1, 0x41).slab(SlabId::new(41));
 		state.tiered_slabs.insert(
-			SlabId::new(41),
+			slab,
 			TieredSlab {
-				slab_id: SlabId::new(41),
+				slab,
 				l2_uri: "s3://bucket/slab-41".to_string(),
 				payload_hash: [9; 32],
 				is_encrypted: true,
@@ -19336,107 +19794,6 @@ mod tenant_kek_tests {
 			"an intact artifact must never be reported as damaged: {error}"
 		);
 	}
-
-	#[test]
-	fn adr0085_pre_versioning_snapshot_still_decodes_and_is_not_refused() {
-		// The guarantee that keeps every existing profile starting: a
-		// version-zero artifact whose shape happens to match is read as before.
-		let state = SmState::default();
-		let bytes = snapshot_bytes_with_format_version(&state, PRE_VERSIONING_FORMAT);
-		let (header, decoded) = decode_snapshot_reader(bytes.as_slice())
-			.expect("version zero is recognized, not refused");
-		assert_eq!(header.format_version, PRE_VERSIONING_FORMAT);
-		assert_eq!(decoded.last_applied_log_id, state.last_applied_log_id);
-	}
-
-	#[test]
-	fn adr0092_v1_snapshot_of_the_exact_v1_shape_replays() {
-		// This control's ancestor (adr0085_older_versioned_snapshot_shape_
-		// mismatch_explains_itself_too) pinned the pre-replay behavior: an
-		// intact v1 body was refused with "no migrations". ADR 0092 gave v1 a
-		// replay decoder. The body is immutable stored evidence: after ADR 0093
-		// inserted a field in the current spine, truncating the current encoder
-		// could no longer construct any faithful older shape.
-		assert!(
-			SNAPSHOT_FORMAT_VERSION > 1,
-			"this control needs a version below the current one to exist"
-		);
-		let manifest = include_str!("../../tests/fixtures/consensus_body/snapshot_v1.txt");
-		let (_, encoded) = manifest.trim().split_once('=').unwrap();
-		let body = (0..encoded.len())
-			.step_by(2)
-			.map(|index| u8::from_str_radix(&encoded[index..index + 2], 16).unwrap())
-			.collect::<Vec<_>>();
-		let header = SnapshotHeader {
-			format_version: 1,
-			state_sha256: control_artifact_digest_32(&body),
-			..snapshot_header_template(&SmState::default())
-		};
-		let mut bytes = bytemuck::bytes_of(&header).to_vec();
-		bytes.extend_from_slice(&body);
-
-		let (header, decoded) = decode_snapshot_reader(bytes.as_slice())
-			.expect("an exact v1 body must replay, not refuse");
-		assert_eq!(header.format_version, 1);
-		assert_eq!(
-			decoded.ctas_sagas.len(),
-			1,
-			"the active v1 saga survives replay"
-		);
-		assert!(decoded.materialization_certificates.is_empty());
-		assert!(decoded.table_drop_outcomes.is_empty());
-	}
-
-	#[test]
-	fn adr0092_v1_stamped_snapshot_of_the_wrong_shape_is_refused_by_name() {
-		// A CURRENT-shaped body stamped version 1: the v1 decode leaves the
-		// certificate-catalog bytes unconsumed, so the artifact provably was
-		// not written at its declared version. The refusal names the version
-		// and stays out of the corruption vocabulary — the digest matched.
-		let bytes = snapshot_bytes_with_format_version(&SmState::default(), 1);
-		let error = decode_snapshot_reader(bytes.as_slice())
-			.expect_err("a mis-stamped body must not decode");
-		assert!(
-			error.contains("snapshot format version 1"),
-			"the refusal names the declared version: {error}"
-		);
-		assert!(
-			error.contains("intact"),
-			"the operator is told the bytes are sound: {error}"
-		);
-		assert!(
-			error.contains("not corruption"),
-			"a hash-matched recognized-version mismatch is never damage: {error}"
-		);
-		assert!(
-			!error.contains("predates format versioning"),
-			"a versioned artifact must not be described as pre-versioning: {error}"
-		);
-	}
-
-	#[test]
-	fn adr0085_pre_versioning_snapshot_shape_mismatch_names_the_format_not_damage() {
-		// The incident's exact shape: digest matches, body is intact, and the
-		// decoder runs off the end because the writer had different fields.
-		let mut bytes =
-			snapshot_bytes_with_format_version(&SmState::default(), PRE_VERSIONING_FORMAT);
-		let header_len = std::mem::size_of::<SnapshotHeader>();
-		bytes.truncate(bytes.len() - 1);
-		let mut header = *bytemuck::from_bytes::<SnapshotHeader>(&bytes[..header_len]);
-		header.state_sha256 = control_artifact_digest_32(&bytes[header_len..]);
-		bytes[..header_len].copy_from_slice(bytemuck::bytes_of(&header));
-
-		let error = decode_snapshot_reader(bytes.as_slice())
-			.expect_err("a truncated-shape body must not decode");
-		assert!(
-			error.contains("predates format versioning"),
-			"a pre-versioning shape failure explains itself: {error}"
-		);
-		assert!(
-			error.contains("intact"),
-			"the operator is told the bytes are sound: {error}"
-		);
-	}
 }
 
 /// ADR 0092: the consensus-body fixture corpus and its exact-set guards.
@@ -19454,18 +19811,24 @@ mod tenant_kek_tests {
 #[cfg(test)]
 pub(crate) mod body_format_corpus {
 	use super::*;
-	use crate::consensus::{EpochPeer, RetireTieredSlab};
+	use crate::consensus::EpochPeer;
+
+	/// The fixed store owner every slab-keyed corpus body names (ADR 0697).
+	pub(crate) fn canonical_owner() -> OwnerRef {
+		OwnerRef::new(
+			1,
+			StoreIncarnation::from_raw(0x0697_0697_0697_0697_0697_0697_0697_0697),
+		)
+	}
 	use crate::crypto::WrappedTenantKek;
-	use crate::hash::state_digest::StateDigest;
 	use crate::integration::compute::{DropOperationId, SchemaGeneration};
 	use crate::schema::{
-		CompactionJobId, CtasExpectedBinding, CtasIntentFingerprint, CtasOperationId,
-		CtasSagaMutation, DurabilityLevel, FinalizationMarker, Identity, LeaseDescriptor,
-		LocalityPolicy, ManifestEpoch, PolicyGeneration, PrimaryKeyDescriptor,
-		ReleaseLeaseRequestMeta, RowIdentityPolicy, SchemaEvolutionPolicy, TableObjectId,
-		TableRetentionPolicy, TableSchemaDescriptor, TenantId,
+		CtasExpectedBinding, CtasIntentFingerprint, CtasOperationId, CtasSagaMutation,
+		DurabilityLevel, FinalizationMarker, Identity, LeaseDescriptor, LocalityPolicy,
+		PolicyGeneration, PrimaryKeyDescriptor, ReleaseLeaseRequestMeta, RowIdentityPolicy,
+		SchemaEvolutionPolicy, TableObjectId, TableRetentionPolicy, TableSchemaDescriptor,
+		TenantId,
 	};
-	use crate::storage::CompactionDigestSummary;
 	use arrow::datatypes::{DataType, Field, Schema};
 	use std::collections::BTreeMap;
 
@@ -19741,45 +20104,6 @@ pub(crate) mod body_format_corpus {
 				WendelonRequest::SchemaUpdate(vec![0x5C; 8]),
 			),
 			(
-				"tier_slab",
-				WendelonRequest::TierSlab(TieredSlab {
-					slab_id: SlabId::new(3),
-					l2_uri: "l2://slab/3".to_string(),
-					payload_hash: [0x33; 32],
-					is_encrypted: false,
-					tenant_id: None,
-					tenant_kek_id: None,
-					stats_format_version: None,
-					stats_block_len: None,
-					stats_block_hash128: None,
-					tombstone_metadata: TombstoneMetadata::default(),
-					supersession_metadata: SupersessionMetadata::default(),
-				}),
-			),
-			(
-				"retire_tiered_slab",
-				WendelonRequest::RetireTieredSlab(RetireTieredSlab {
-					slab_id: SlabId::new(3),
-				}),
-			),
-			(
-				"compaction_commit",
-				WendelonRequest::CompactionCommit(CompactionCommit {
-					job_id: CompactionJobId::new(5),
-					manifest_epoch_pre: ManifestEpoch::new(4),
-					slabs_to_retire: vec![SlabId::new(3)],
-					slabs_to_add: Vec::new(),
-					slabs_to_mark_delete_pending: Vec::new(),
-					slabs_to_remove: Vec::new(),
-					sidecar_swaps: Vec::new(),
-					digest_summary: CompactionDigestSummary {
-						visible_pre: StateDigest::default(),
-						visible_post: StateDigest::default(),
-						version_entry_delta: StateDigest::default(),
-					},
-				}),
-			),
-			(
 				"seed_migration",
 				WendelonRequest::SeedMigration(SeedMigration {
 					entry: canonical_ledger_entry(),
@@ -19924,6 +20248,55 @@ pub(crate) mod body_format_corpus {
 					crate::consensus::Root2Carrier1::new(&bytes, Some(&[0x67; 296])).unwrap()
 				}),
 			),
+			(
+				"register_incarnation",
+				WendelonRequest::RegisterIncarnation(RegisterIncarnation {
+					node: 1,
+					incarnation: canonical_owner().incarnation(),
+					supersedes: Some(StoreIncarnation::from_raw(0x0696)),
+				}),
+			),
+			(
+				"slab_op",
+				WendelonRequest::SlabOp(crate::consensus::slab_ops::SlabOp {
+					op_seq: 1,
+					command: crate::consensus::slab_ops::SlabCommand::Tier(
+						crate::consensus::slab_ops::TierOp {
+							tier: TieredSlab {
+								slab: canonical_owner().slab(SlabId::new(3)),
+								l2_uri: "l2://slab/3".to_string(),
+								payload_hash: [0x33; 32],
+								is_encrypted: false,
+								tenant_id: None,
+								tenant_kek_id: None,
+								stats_format_version: None,
+								stats_block_len: None,
+								stats_block_hash128: None,
+								tombstone_metadata: TombstoneMetadata::default(),
+								supersession_metadata: SupersessionMetadata::default(),
+							},
+							replaces: None,
+						},
+					),
+				}),
+			),
+			(
+				"cancel_op",
+				WendelonRequest::CancelOp(crate::consensus::slab_ops::CancelOp {
+					key: crate::consensus::slab_ops::OpKey {
+						owner: canonical_owner(),
+						op_seq: 2,
+					},
+					target_digest: [0x44; 32],
+				}),
+			),
+			(
+				"ack_outcomes",
+				WendelonRequest::AckOutcomes(crate::consensus::slab_ops::AckOutcomes {
+					owner: canonical_owner(),
+					seqs: vec![1, 2],
+				}),
+			),
 		]
 	}
 
@@ -19986,62 +20359,75 @@ pub(crate) mod body_format_corpus {
 				ownership_epoch: 3,
 				participants: TableDropParticipantSet::new([node(1)]),
 			});
+		// ADR 0697: one owner-keyed tier pointer under a registered incarnation
+		// that superseded an earlier one.
+		let owner = body_format_corpus::canonical_owner();
+		state.incarnations.insert(
+			owner.node(),
+			IncarnationRegistry {
+				current: Some(owner.incarnation()),
+				retired: BTreeSet::from([StoreIncarnation::from_raw(0x0696)]),
+				accepted: BTreeSet::from([
+					(StoreIncarnation::from_raw(0x0696), None),
+					(
+						owner.incarnation(),
+						Some(StoreIncarnation::from_raw(0x0696)),
+					),
+				]),
+			},
+		);
+		let mut terminal = crate::consensus::slab_ops::OwnerTerminal::default();
+		terminal
+			.claimed
+			.insert(SlabId::new(90), crate::schema::CompactionJobId::new(0x90));
+		terminal.removed.insert(SlabId::new(80));
+		terminal.removed.insert(SlabId::new(81));
+		terminal.removed.insert(SlabId::new(85));
+		state.slab_terminal.insert(owner, terminal);
+		state.op_tables.insert(
+			owner,
+			crate::consensus::slab_ops::OpTable {
+				acked_through: 3,
+				outcomes: BTreeMap::from([
+					(
+						4,
+						crate::consensus::slab_ops::OpEntry {
+							digest: [0x41; 32],
+							outcome: crate::consensus::slab_ops::RecordedOutcome::Applied {
+								index: 9,
+							},
+							acked: true,
+						},
+					),
+					(
+						5,
+						crate::consensus::slab_ops::OpEntry {
+							digest: [0x42; 32],
+							outcome: crate::consensus::slab_ops::RecordedOutcome::Rejected {
+								reason: crate::consensus::slab_ops::SlabRejection::Cancelled,
+								index: 10,
+							},
+							acked: false,
+						},
+					),
+				]),
+			},
+		);
+		let tier = TieredSlab {
+			slab: owner.slab(SlabId::new(3)),
+			l2_uri: "l2://slab/3".to_string(),
+			payload_hash: [0x33; 32],
+			is_encrypted: false,
+			tenant_id: None,
+			tenant_kek_id: None,
+			stats_format_version: None,
+			stats_block_len: None,
+			stats_block_hash128: None,
+			tombstone_metadata: TombstoneMetadata::default(),
+			supersession_metadata: SupersessionMetadata::default(),
+		};
+		state.tiered_slabs.insert(tier.slab, tier);
 		state
-	}
-
-	fn canonical_v4_sm_state() -> crate::consensus::snapshot_body::v4::SmState {
-		crate::consensus::snapshot_body::v4::project(canonical_current_sm_state())
-	}
-
-	fn canonical_v3_sm_state() -> crate::consensus::snapshot_body::v3::SmState {
-		let state = canonical_current_sm_state();
-		crate::consensus::snapshot_body::v3::SmState {
-			last_applied_log_id: state.last_applied_log_id,
-			last_membership: state.last_membership,
-			epoch_history: state.epoch_history,
-			leases: state.leases,
-			e_safe_watermarks: state.e_safe_watermarks,
-			last_e_safe_index: state.last_e_safe_index,
-			tiered_slabs: state.tiered_slabs,
-			migrations: state.migrations,
-			tombstones: state.tombstones,
-			tenants: state.tenants,
-			tenant_keysets: state.tenant_keysets,
-			revoked_actor_keys: state.revoked_actor_keys,
-			table_schemas: state.table_schemas,
-			logical_types: state.logical_types,
-			secondary_indexes: state.secondary_indexes,
-			table_lifecycle: state.table_lifecycle,
-			table_drop_fences: state.table_drop_fences,
-			table_drop_outcomes: state.table_drop_outcomes,
-			ctas_sagas: crate::consensus::snapshot_body::pre_v4_ctas::project(state.ctas_sagas),
-			materialization_certificates: state.materialization_certificates,
-		}
-	}
-
-	fn canonical_v2_sm_state() -> crate::consensus::snapshot_body::v2::SmState {
-		let state = canonical_sm_state();
-		crate::consensus::snapshot_body::v2::SmState {
-			last_applied_log_id: state.last_applied_log_id,
-			last_membership: state.last_membership,
-			epoch_history: state.epoch_history,
-			leases: state.leases,
-			e_safe_watermarks: state.e_safe_watermarks,
-			last_e_safe_index: state.last_e_safe_index,
-			tiered_slabs: state.tiered_slabs,
-			migrations: state.migrations,
-			tombstones: state.tombstones,
-			tenants: state.tenants,
-			tenant_keysets: state.tenant_keysets,
-			revoked_actor_keys: state.revoked_actor_keys,
-			table_schemas: state.table_schemas,
-			logical_types: state.logical_types,
-			secondary_indexes: state.secondary_indexes,
-			table_lifecycle: state.table_lifecycle,
-			table_drop_fences: state.table_drop_fences,
-			ctas_sagas: crate::consensus::snapshot_body::pre_v4_ctas::project(state.ctas_sagas),
-			materialization_certificates: state.materialization_certificates,
-		}
 	}
 
 	fn parse_manifest(raw: &str) -> BTreeMap<String, Vec<u8>> {
@@ -20066,16 +20452,12 @@ pub(crate) mod body_format_corpus {
 
 	const WAL_MANIFEST: &str =
 		include_str!("../../tests/fixtures/consensus_body/wal_v2_entries.txt");
-	const MUTATION_MANIFEST: &str =
-		include_str!("../../tests/fixtures/consensus_body/ctas_mutations_v2.txt");
 	const SNAPSHOT_V2_MANIFEST: &str =
 		include_str!("../../tests/fixtures/consensus_body/snapshot_v2.txt");
 	const SNAPSHOT_V3_MANIFEST: &str =
 		include_str!("../../tests/fixtures/consensus_body/snapshot_v3.txt");
 	const WAL_V3_MANIFEST: &str =
 		include_str!("../../tests/fixtures/consensus_body/wal_v3_entries.txt");
-	const MUTATION_V3_MANIFEST: &str =
-		include_str!("../../tests/fixtures/consensus_body/ctas_mutations_v3.txt");
 	const SNAPSHOT_V4_MANIFEST: &str =
 		include_str!("../../tests/fixtures/consensus_body/snapshot_v4.txt");
 	const WAL_V4_MANIFEST: &str =
@@ -20083,92 +20465,10 @@ pub(crate) mod body_format_corpus {
 	const SNAPSHOT_V5_MANIFEST: &str =
 		include_str!("../../tests/fixtures/consensus_body/snapshot_v5.txt");
 
-	// Frozen before adding conditional promoted-JOIN commands. Never regenerate
-	// these bytes to repair drift; fork any payload leaf that subsequently moves.
+	// The historical v1–v5 manifests above are kept only as refusal inputs
+	// (ADR 0697): their bytes are never regenerated and never decoded.
 	const WAL_V5_OUTGOING_MANIFEST: &str =
 		include_str!("../../tests/fixtures/consensus_body/wal_v5_entries.txt");
-	const WAL_V5_OUTGOING_NAMES: [&str; 29] = [
-		"finalize",
-		"acquire_lease",
-		"release_lease",
-		"advance_epoch",
-		"schema_update",
-		"tier_slab",
-		"retire_tiered_slab",
-		"compaction_commit",
-		"seed_migration",
-		"migration_complete",
-		"create_tenant",
-		"update_tenant_quota",
-		"suspend_tenant",
-		"resume_tenant",
-		"delete_tenant",
-		"install_tenant_kek_version",
-		"retire_tenant_kek_version",
-		"revoke_actor_key",
-		"set_table_retention_policy",
-		"table_drop_prepare",
-		"table_reclaim_completion",
-		"table_drop_finalize",
-		"ctas_saga",
-		"replay_legacy_ctas_row_dispatched",
-		"table_drop_logical_finalize",
-		"table_drop_settlement",
-		"root2_command",
-		"membership",
-		"blank",
-	];
-
-	#[test]
-	fn pd11_frozen_outgoing_v5_spine_and_corpus_are_byte_exact() {
-		let stored = parse_manifest(WAL_V5_OUTGOING_MANIFEST);
-		let mut names = WAL_V5_OUTGOING_NAMES.map(str::to_owned).to_vec();
-		names.sort();
-		assert_eq!(stored.keys().cloned().collect::<Vec<_>>(), names);
-		let live: BTreeMap<_, _> = wal_corpus().into_iter().collect();
-		for (name, payload) in stored {
-			assert_eq!(
-				&live[name.as_str()],
-				&payload,
-				"outgoing v5 leaf drift for {name}"
-			);
-			let (frozen, rest) = postcard::take_from_bytes::<
-				Entry<crate::consensus::wal_body::v5::WendelonWalV5TypeConfig>,
-			>(&payload)
-			.unwrap();
-			assert!(rest.is_empty(), "frozen v5 decoder left bytes for {name}");
-			assert_eq!(postcard::to_stdvec(&frozen).unwrap(), payload);
-			let converted = crate::consensus::wal_body::v5::decode_entry(&payload).unwrap();
-			assert_eq!(postcard::to_stdvec(&converted).unwrap(), payload);
-		}
-	}
-
-	#[test]
-	fn pd11_outgoing_v5_production_replay_matches_frozen_spine_and_rejects_suffix() {
-		for (name, payload) in parse_manifest(WAL_V5_OUTGOING_MANIFEST) {
-			let frozen = crate::consensus::wal_body::v5::decode_entry(&payload).unwrap();
-			let production = super::root2_carrier_tests::record(&payload, 5).unwrap();
-			assert_eq!(
-				postcard::to_stdvec(&production).unwrap(),
-				postcard::to_stdvec(&frozen).unwrap(),
-				"production replay drift for {name}"
-			);
-			let mut suffix = payload;
-			suffix.push(0);
-			assert!(
-				crate::consensus::wal_body::v5::decode_entry(&suffix)
-					.unwrap_err()
-					.to_string()
-					.contains("unconsumed payload bytes")
-			);
-			assert!(
-				super::root2_carrier_tests::record(&suffix, 5)
-					.unwrap_err()
-					.to_string()
-					.contains("format mismatch")
-			);
-		}
-	}
 
 	fn wal_corpus() -> Vec<(&'static str, Vec<u8>)> {
 		let mut corpus: Vec<(&'static str, Vec<u8>)> = canonical_requests()
@@ -20229,139 +20529,33 @@ pub(crate) mod body_format_corpus {
 		assert_eq!(by_variant_name, names);
 	}
 
-	#[test]
-	fn adr0092_wal_v2_encodings_match_stored_goldens() {
-		let stored = parse_manifest(WAL_MANIFEST);
-		let corpus = wal_corpus()
-			.into_iter()
-			.filter(|(name, _)| {
-				!matches!(
-					*name,
-					"replay_legacy_ctas_row_dispatched"
-						| "table_drop_logical_finalize"
-						| "table_drop_settlement"
-						| "root2_command"
-				)
-			})
-			.collect::<Vec<_>>();
-		assert_eq!(
-			stored.keys().cloned().collect::<Vec<_>>(),
-			{
-				let mut names: Vec<String> =
-					corpus.iter().map(|(name, _)| name.to_string()).collect();
-				names.sort();
-				names
-			},
-			"stored manifest and corpus must hold exactly the same set"
-		);
-		for (name, bytes) in &corpus {
-			let golden = &stored[*name];
-			assert_eq!(
-				&hex(bytes),
-				&hex(golden),
-				"WAL body encoding moved for `{name}`; a shape change must ride a \
-				 WAL_FORMAT_VERSION bump with a frozen fixture of the outgoing version"
-			);
-			let decoded: Entry<WendelonTypeConfig> = postcard::from_bytes(golden).unwrap();
-			assert_eq!(
-				hex(&postcard::to_stdvec(&decoded).unwrap()),
-				hex(golden),
-				"stored golden must round-trip byte-stable for `{name}`"
-			);
-		}
-	}
+	const WAL_V6_OUTGOING_MANIFEST: &str =
+		include_str!("../../tests/fixtures/consensus_body/wal_v6_entries.txt");
+	const SNAPSHOT_V6_OUTGOING_MANIFEST: &str =
+		include_str!("../../tests/fixtures/consensus_body/snapshot_v6.txt");
+	const WAL_V7_OUTGOING_MANIFEST: &str =
+		include_str!("../../tests/fixtures/consensus_body/wal_v7_entries.txt");
+	const SNAPSHOT_V7_OUTGOING_MANIFEST: &str =
+		include_str!("../../tests/fixtures/consensus_body/snapshot_v7.txt");
+	const WAL_V8_MANIFEST: &str =
+		include_str!("../../tests/fixtures/consensus_body/wal_v8_entries.txt");
+	const SNAPSHOT_V8_MANIFEST: &str =
+		include_str!("../../tests/fixtures/consensus_body/snapshot_v8.txt");
 
 	#[test]
-	fn adr0092_mutation_v2_encodings_match_stored_goldens() {
-		let stored = parse_manifest(MUTATION_MANIFEST);
-		let corpus: Vec<(&'static str, Vec<u8>)> = canonical_mutations()
-			.into_iter()
-			.filter_map(|(name, mutation)| {
-				crate::consensus::wal_body::v2::project_mutation(mutation)
-					.map(|mutation| (name, postcard::to_stdvec(&mutation).unwrap()))
-			})
-			.collect();
-		assert_eq!(stored.keys().cloned().collect::<Vec<_>>(), {
-			let mut names: Vec<String> = corpus.iter().map(|(name, _)| name.to_string()).collect();
-			names.sort();
-			names
-		},);
-		for (name, bytes) in &corpus {
-			assert_eq!(
-				&hex(bytes),
-				&hex(&stored[*name]),
-				"CTAS mutation encoding moved for `{name}`"
-			);
-		}
-	}
-
-	#[test]
-	fn adr0094_frozen_wal_v3_and_mutation_corpora_match_goldens() {
-		let stored_wal = parse_manifest(WAL_V3_MANIFEST);
-		let corpus = wal_corpus()
-			.into_iter()
-			.filter(|(name, _)| {
-				!matches!(
-					*name,
-					"table_drop_logical_finalize" | "table_drop_settlement" | "root2_command"
-				)
-			})
-			.collect::<Vec<_>>();
+	fn adr0697_current_wal_v8_and_snapshot_v8_match_stored_goldens() {
+		let stored_wal = parse_manifest(WAL_V8_MANIFEST);
+		let corpus = wal_corpus();
 		assert_eq!(stored_wal.len(), corpus.len());
 		for (name, bytes) in corpus {
 			assert_eq!(
 				hex(&bytes),
 				hex(&stored_wal[name]),
-				"WAL v3 body moved for {name}"
-			);
-		}
-		let stored_mutations = parse_manifest(MUTATION_V3_MANIFEST);
-		let mutations = canonical_mutations();
-		assert_eq!(stored_mutations.len(), mutations.len());
-		for (name, mutation) in mutations {
-			assert_eq!(
-				hex(&postcard::to_stdvec(&mutation).unwrap()),
-				hex(&stored_mutations[name]),
-				"CTAS mutation v3 body moved for {name}"
-			);
-		}
-	}
-
-	#[test]
-	fn adr0094_frozen_snapshot_v4_matches_stored_golden() {
-		let stored = parse_manifest(SNAPSHOT_V4_MANIFEST);
-		let state = canonical_v4_sm_state();
-		assert_eq!(
-			hex(&postcard::to_stdvec(&state).unwrap()),
-			hex(&stored["smstate_active_saga_and_drop_outcome"])
-		);
-		let entry = state
-			.ctas_sagas
-			.get(TenantId::new(7), canonical_operation_id())
-			.unwrap();
-		assert_eq!(
-			hex(&postcard::to_stdvec(entry).unwrap()),
-			hex(&stored["ctas_saga_entry"])
-		);
-	}
-
-	#[test]
-	fn adr0095_current_wal_v4_and_snapshot_v5_match_stored_goldens() {
-		let stored_wal = parse_manifest(WAL_V4_MANIFEST);
-		let corpus = wal_corpus()
-			.into_iter()
-			.filter(|(name, _)| *name != "root2_command")
-			.collect::<Vec<_>>();
-		assert_eq!(stored_wal.len(), corpus.len());
-		for (name, bytes) in corpus {
-			assert_eq!(
-				hex(&bytes),
-				hex(&stored_wal[name]),
-				"WAL v4 body moved for {name}; bump and freeze the outgoing spine"
+				"WAL v8 body moved for {name}; bump the format and add a refusal fixture"
 			);
 		}
 
-		let stored_snapshot = parse_manifest(SNAPSHOT_V5_MANIFEST);
+		let stored_snapshot = parse_manifest(SNAPSHOT_V8_MANIFEST);
 		let state = canonical_current_sm_state();
 		assert_eq!(
 			hex(&postcard::to_stdvec(&state).unwrap()),
@@ -20369,73 +20563,116 @@ pub(crate) mod body_format_corpus {
 		);
 		assert_eq!(state.table_drop_tombstones.len(), 1);
 		assert_eq!(state.table_drop_reclaim_debts.len(), 1);
+		assert!(!state.tiered_slabs.is_empty() && !state.incarnations.is_empty());
 	}
 
-	#[test]
-	fn adr0093_snapshot_v2_fixture_is_frozen_and_upconverts_without_outcomes() {
-		let stored = parse_manifest(SNAPSHOT_V2_MANIFEST);
-		let state_bytes = postcard::to_stdvec(&canonical_v2_sm_state()).unwrap();
-		assert_eq!(
-			hex(&state_bytes),
-			hex(&stored["smstate_active_saga"]),
-			"the immutable v2 snapshot fixture must stay on the frozen v2 spine"
-		);
-		let converted =
-			crate::consensus::snapshot_body::v2::decode_state(&stored["smstate_active_saga"])
-				.unwrap();
-		assert!(
-			converted.table_drop_outcomes.is_empty(),
-			"pre-v3 snapshots upconvert with no fabricated DROP outcomes"
-		);
-		assert_eq!(
-			hex(&postcard::to_stdvec(&converted).unwrap()),
-			hex(&postcard::to_stdvec(&canonical_sm_state()).unwrap()),
-			"v2 upconversion changes only the addition of an empty outcome catalog"
-		);
+	/// Every stored pre-v8 body, by the version it was written at.
+	fn historical_bodies(manifests: &[(u8, &'static str)]) -> Vec<(u8, String, Vec<u8>)> {
+		manifests
+			.iter()
+			.flat_map(|(version, manifest)| {
+				parse_manifest(manifest)
+					.into_iter()
+					.map(move |(name, body)| (*version, name, body))
+			})
+			.collect()
 	}
 
+	/// ADR 0697: a snapshot written at any earlier version, including before
+	/// format versioning, is refused before its body is decoded.
 	#[test]
-	fn adr0093_snapshot_v3_active_saga_and_drop_outcome_match_stored_golden() {
-		let stored = parse_manifest(SNAPSHOT_V3_MANIFEST);
-		let state = canonical_v3_sm_state();
-		let state_bytes = postcard::to_stdvec(&state).unwrap();
-		assert_eq!(
-			hex(&state_bytes),
-			hex(&stored["smstate_active_saga_and_drop_outcome"]),
-			"current SmState encoding moved; a shape change must ride a \
-			 SNAPSHOT_FORMAT_VERSION bump with a frozen fixture of the outgoing version"
-		);
-		let entry = state
-			.ctas_sagas
-			.entries
-			.get(&(TenantId::new(7), canonical_operation_id()))
-			.expect("canonical state must hold its active saga")
-			.clone();
-		assert_eq!(
-			hex(&postcard::to_stdvec(&entry).unwrap()),
-			hex(&stored["ctas_saga_entry"]),
-			"CtasSagaEntry encoding moved"
-		);
-		let decoded: crate::consensus::snapshot_body::v3::SmState =
-			postcard::from_bytes(&stored["smstate_active_saga_and_drop_outcome"]).unwrap();
-		assert_eq!(
-			hex(&postcard::to_stdvec(&decoded).unwrap()),
-			hex(&stored["smstate_active_saga_and_drop_outcome"]),
-			"stored snapshot golden must round-trip byte-stable"
-		);
-		assert_eq!(decoded.table_drop_outcomes.len(), 1);
-		let encoded_snapshot = encode_snapshot(&canonical_current_sm_state()).unwrap();
-		let (header, round_tripped) = decode_snapshot_reader(encoded_snapshot.as_slice()).unwrap();
-		assert_eq!(header.format_version, SNAPSHOT_FORMAT_VERSION);
-		assert_eq!(
-			round_tripped
-				.table_drop_outcomes
-				.get(TenantId::new(7), TableObjectId::new([0xD3; 16])),
-			state
-				.table_drop_outcomes
-				.get(TenantId::new(7), TableObjectId::new([0xD3; 16])),
-			"the full snapshot envelope carries retained DROP outcomes"
-		);
+	fn adr0697_every_pre_v8_snapshot_body_is_refused_before_decode() {
+		let bodies = historical_bodies(&[
+			(0, V1_SNAPSHOT_MANIFEST),
+			(1, V1_SNAPSHOT_MANIFEST),
+			(2, SNAPSHOT_V2_MANIFEST),
+			(3, SNAPSHOT_V3_MANIFEST),
+			(4, SNAPSHOT_V4_MANIFEST),
+			(5, SNAPSHOT_V5_MANIFEST),
+			(6, SNAPSHOT_V6_OUTGOING_MANIFEST),
+			(7, SNAPSHOT_V7_OUTGOING_MANIFEST),
+		]);
+		assert!(bodies.len() >= 6);
+		for (version, name, body) in bodies {
+			let header = SnapshotHeader {
+				format_version: version,
+				state_sha256: control_artifact_digest_32(&body),
+				..snapshot_header_template(&SmState::default())
+			};
+			let mut bytes = bytemuck::bytes_of(&header).to_vec();
+			bytes.extend_from_slice(&body);
+			let error = decode_snapshot_reader(bytes.as_slice()).unwrap_err();
+			assert!(
+				error.starts_with("UnsupportedControlFormat"),
+				"snapshot v{version} {name}: {error}"
+			);
+		}
+	}
+
+	/// ADR 0697: the retired unkeyed slab commands keep their wire positions and
+	/// never decode: a body naming one fails as unsupported, in the current
+	/// format, and manufactures no command. The next position still decodes.
+	#[test]
+	fn adr0697_a_retired_slab_command_body_fails_as_unsupported() {
+		for tag in [5_u8, 6, 7] {
+			postcard::from_bytes::<WendelonRequest>(&[tag, 0, 0, 0])
+				.expect_err("a retired variant has no value");
+		}
+		let requests = canonical_requests();
+		let seed = requests
+			.iter()
+			.find(|(name, _)| *name == "seed_migration")
+			.map(|(_, request)| postcard::to_stdvec(request).unwrap())
+			.unwrap();
+		assert_eq!(seed[0], 8, "the next variant keeps its wire position");
+		assert!(postcard::from_bytes::<WendelonRequest>(&seed).is_ok());
+		let root2 = requests
+			.iter()
+			.find(|(name, _)| *name == "root2_command")
+			.map(|(_, request)| postcard::to_stdvec(request).unwrap())
+			.unwrap();
+		assert_eq!(root2[0], 26, "Root2Command keeps its wire position");
+	}
+
+	/// ADR 0697: a WAL record written at any earlier version, including before
+	/// format versioning, is refused before its payload is decoded.
+	#[test]
+	fn adr0697_every_pre_v8_wal_body_is_refused_before_decode() {
+		let bodies = historical_bodies(&[
+			(0, WAL_V4_MANIFEST),
+			(1, V1_WAL_MANIFEST),
+			(2, WAL_MANIFEST),
+			(3, WAL_V3_MANIFEST),
+			(4, WAL_V4_MANIFEST),
+			(5, WAL_V5_OUTGOING_MANIFEST),
+			(6, WAL_V6_OUTGOING_MANIFEST),
+			(7, WAL_V7_OUTGOING_MANIFEST),
+		]);
+		assert!(bodies.len() >= 6);
+		let fixed_size = std::mem::size_of::<RaftLogEntryFixed>();
+		for (version, name, payload) in bodies {
+			let mut fixed: RaftLogEntryFixed = bytemuck::Zeroable::zeroed();
+			fixed.payload_len = payload.len() as u32;
+			fixed.payload_hash = control_artifact_digest_32(&payload);
+			let mut body = bytemuck::bytes_of(&fixed).to_vec();
+			body.extend_from_slice(&payload);
+			let mut header: WALRecordHeader = bytemuck::Zeroable::zeroed();
+			header.format_version = version;
+			let error = decode_log_record(Path::new("control.wal"), 0, &header, &body, fixed_size)
+				.unwrap_err();
+			let refusal = error
+				.get_ref()
+				.and_then(|cause| cause.downcast_ref::<UnsupportedControlFormat>());
+			assert_eq!(
+				refusal,
+				Some(&UnsupportedControlFormat {
+					artifact: "wal",
+					found: version,
+					required: WAL_FORMAT_VERSION,
+				}),
+				"wal v{version} {name}: {error}"
+			);
+		}
 	}
 
 	// ---- ADR 0092: the frozen v1 fixtures and their replay controls ----
@@ -20444,294 +20681,6 @@ pub(crate) mod body_format_corpus {
 		include_str!("../../tests/fixtures/consensus_body/wal_v1_entries.txt");
 	const V1_SNAPSHOT_MANIFEST: &str =
 		include_str!("../../tests/fixtures/consensus_body/snapshot_v1.txt");
-
-	/// The canonical v1 `Provision` request, built from the frozen shadow
-	/// spine. Field values mirror `canonical_mutations()`'s provision so the
-	/// upconversion equality below is byte-exact.
-	fn v1_provision_request(operation_byte: u8) -> crate::consensus::wal_body::v1::WendelonRequest {
-		v1_provision_request_for(operation_byte, canonical_descriptor())
-	}
-
-	fn v1_provision_request_for(
-		operation_byte: u8,
-		descriptor: TableSchemaDescriptor,
-	) -> crate::consensus::wal_body::v1::WendelonRequest {
-		let mut operation_bytes = [operation_byte; 16];
-		operation_bytes[..5].fill(0);
-		operation_bytes[5] = 1;
-		operation_bytes[6] = 0x70;
-		operation_bytes[8] = 0x80;
-		crate::consensus::wal_body::v1::WendelonRequest::CtasSaga(
-			crate::consensus::wal_body::v1::CtasSagaMutation::Provision {
-				tenant_id: TenantId::new(7),
-				operation_id: CtasOperationId::new(operation_bytes),
-				intent_fingerprint: CtasIntentFingerprint::new([0x48; 32]),
-				descriptor,
-				expected_binding: CtasExpectedBinding::Absent,
-				prior_descriptor: None,
-				row_write_id: canonical_write_id(),
-				owner_epoch: 1,
-				observed_now_ms: 1,
-				owner_lease_expires_at_ms: 1_000,
-			},
-		)
-	}
-
-	/// A second table identity, so the mixed snapshot+tail control's tail
-	/// provision does not collide with the snapshot's saga binding.
-	fn tail_descriptor() -> TableSchemaDescriptor {
-		let schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
-		TableSchemaDescriptor::new(
-			TableObjectId::new([6; 16]),
-			1,
-			"analytics",
-			"events_tail",
-			&schema,
-			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
-			LocalityPolicy::default_table_spread(),
-			SchemaEvolutionPolicy::AdditiveOnly,
-		)
-		.unwrap()
-	}
-
-	fn v1_entry_bytes(request: crate::consensus::wal_body::v1::WendelonRequest) -> Vec<u8> {
-		postcard::to_stdvec(&openraft::Entry::<
-			crate::consensus::wal_body::v1::WendelonWalV1TypeConfig,
-		> {
-			log_id: LogId::new(CommittedLeaderId::new(3, 1), 11),
-			payload: EntryPayload::Normal(request),
-		})
-		.unwrap()
-	}
-
-	/// The current-shape provision with `certificate: None` — what the v1
-	/// fixture must upconvert to, and whose encoding must be the v1 bytes
-	/// plus exactly the trailing `None` discriminant.
-	fn v2_provision_none_entry(operation_byte: u8) -> Entry<WendelonTypeConfig> {
-		let mut operation_bytes = [operation_byte; 16];
-		operation_bytes[..5].fill(0);
-		operation_bytes[5] = 1;
-		operation_bytes[6] = 0x70;
-		operation_bytes[8] = 0x80;
-		entry_for(WendelonRequest::CtasSaga(CtasSagaMutation::Provision {
-			tenant_id: TenantId::new(7),
-			operation_id: CtasOperationId::new(operation_bytes),
-			intent_fingerprint: CtasIntentFingerprint::new([0x48; 32]),
-			descriptor: canonical_descriptor(),
-			expected_binding: CtasExpectedBinding::Absent,
-			prior_descriptor: None,
-			row_write_id: canonical_write_id(),
-			owner_epoch: 1,
-			observed_now_ms: 1,
-			owner_lease_expires_at_ms: 1_000,
-			certificate: None,
-		}))
-	}
-
-	/// The canonical v1 snapshot, projected FROM the live apply path so it is
-	/// faithful to what a real v1 writer held: the provision apply also
-	/// registers the provisional descriptor in `table_schemas`, and a
-	/// hand-built state missing that would pin a state no v1 build ever
-	/// wrote. Certificates are `None` throughout, so dropping the field is
-	/// the exact v1 projection.
-	fn v1_snapshot_state() -> crate::consensus::snapshot_body::v1::SmState {
-		let state = expected_converted_state();
-		let (entries, expired_through_ms) = state.ctas_sagas.into_replay_parts();
-		crate::consensus::snapshot_body::v1::SmState {
-			last_applied_log_id: state.last_applied_log_id,
-			last_membership: state.last_membership,
-			epoch_history: state.epoch_history,
-			leases: state.leases,
-			e_safe_watermarks: state.e_safe_watermarks,
-			last_e_safe_index: state.last_e_safe_index,
-			tiered_slabs: state.tiered_slabs,
-			migrations: state.migrations,
-			tombstones: state.tombstones,
-			tenants: state.tenants,
-			tenant_keysets: state.tenant_keysets,
-			revoked_actor_keys: state.revoked_actor_keys,
-			table_schemas: state.table_schemas,
-			logical_types: state.logical_types,
-			secondary_indexes: state.secondary_indexes,
-			table_lifecycle: state.table_lifecycle,
-			table_drop_fences: state.table_drop_fences,
-			ctas_sagas: crate::consensus::snapshot_body::v1::CtasSagaCatalog {
-				entries: entries
-					.into_iter()
-					.map(|(key, entry)| {
-						assert_eq!(
-							entry.certificate, None,
-							"the v1 projection only exists for certificate-less entries"
-						);
-						(
-							key,
-							crate::consensus::snapshot_body::v1::CtasSagaEntry {
-								tenant_id: entry.tenant_id,
-								operation_id: entry.operation_id,
-								intent_fingerprint: entry.intent_fingerprint,
-								descriptor: entry.descriptor,
-								expected_binding: entry.expected_binding,
-								prior_descriptor: entry.prior_descriptor,
-								row_write_id: entry.row_write_id,
-								row_count: entry.row_count,
-								phase: entry.phase,
-								terminal_cause: entry.terminal_cause,
-								owner_epoch: entry.owner_epoch,
-								owner_lease_expires_at_ms: entry.owner_lease_expires_at_ms,
-								retry_debt: entry.retry_debt,
-								terminal_at_ms: entry.terminal_at_ms,
-							},
-						)
-					})
-					.collect(),
-				expired_through_ms,
-			},
-		}
-	}
-
-	/// What the v1 snapshot must convert to: the same state built through the
-	/// live apply path with `certificate: None`.
-	fn expected_converted_state() -> SmState {
-		let mut operation_bytes = [0x55u8; 16];
-		operation_bytes[..5].fill(0);
-		operation_bytes[5] = 1;
-		operation_bytes[6] = 0x70;
-		operation_bytes[8] = 0x80;
-		let mut state = SmState::default();
-		state.last_e_safe_index = 10;
-		let response = apply_ctas_saga_mutation(
-			&mut state,
-			CtasSagaMutation::Provision {
-				tenant_id: TenantId::new(7),
-				operation_id: CtasOperationId::new(operation_bytes),
-				intent_fingerprint: CtasIntentFingerprint::new([0x48; 32]),
-				descriptor: canonical_descriptor(),
-				expected_binding: CtasExpectedBinding::Absent,
-				prior_descriptor: None,
-				row_write_id: canonical_write_id(),
-				owner_epoch: 1,
-				observed_now_ms: 1,
-				owner_lease_expires_at_ms: 1_000,
-				certificate: None,
-			},
-		);
-		assert!(matches!(response, CtasSagaResponse::Applied(_)));
-		state
-	}
-
-	#[test]
-	fn adr0092_v1_wal_fixture_decodes_and_upconverts_from_stored_bytes() {
-		let stored = parse_manifest(V1_WAL_MANIFEST);
-		let provision = &stored["ctas_saga_provision"];
-		// The frozen bytes tie back to the grounded reality: a v1 provision
-		// body is the current certificate-less encoding minus exactly its
-		// trailing None discriminant.
-		let v2_none = postcard::to_stdvec(&v2_provision_none_entry(0x54)).unwrap();
-		assert_eq!(v2_none.last(), Some(&0u8));
-		assert_eq!(
-			hex(provision),
-			hex(&v2_none[..v2_none.len() - 1]),
-			"the stored v1 provision must be the certificate-less current \
-			 encoding minus its trailing None byte"
-		);
-		let decoded = crate::consensus::wal_body::v1::decode_entry(provision).unwrap();
-		assert_eq!(
-			hex(&postcard::to_stdvec(&decoded).unwrap()),
-			hex(&v2_none),
-			"upconversion must land exactly on the current certificate-less shape"
-		);
-		// An unchanged-shape variant must pass through the v1 decode
-		// untouched: its v1 bytes are its v2 bytes.
-		let lease = &stored["acquire_lease"];
-		let v2_lease = wal_corpus()
-			.into_iter()
-			.find(|(name, _)| *name == "acquire_lease")
-			.unwrap()
-			.1;
-		assert_eq!(hex(lease), hex(&v2_lease));
-		let decoded = crate::consensus::wal_body::v1::decode_entry(lease).unwrap();
-		assert_eq!(hex(&postcard::to_stdvec(&decoded).unwrap()), hex(&v2_lease));
-	}
-
-	#[test]
-	fn adr0092_v1_wal_fixture_still_fails_the_current_shape_decode() {
-		// The discriminating run: v1 readability comes from the dispatch, not
-		// from a widened tolerance in the current decoder.
-		let stored = parse_manifest(V1_WAL_MANIFEST);
-		let provision = &stored["ctas_saga_provision"];
-		let err = postcard::from_bytes::<Entry<WendelonTypeConfig>>(provision)
-			.expect_err("the current shape must not decode a v1 provision body");
-		assert!(err.to_string().contains("end of buffer"), "{err}");
-	}
-
-	#[test]
-	fn adr0092_v1_snapshot_fixture_converts_the_active_saga() {
-		let stored = parse_manifest(V1_SNAPSHOT_MANIFEST);
-		let body = &stored["smstate_active_saga"];
-		// Stored bytes match the frozen shadow encoding.
-		assert_eq!(
-			hex(body),
-			hex(&postcard::to_stdvec(&v1_snapshot_state()).unwrap()),
-			"the stored v1 snapshot must be the frozen shadow's encoding"
-		);
-		let converted = crate::consensus::snapshot_body::v1::decode_state(body).unwrap();
-		let entry = converted
-			.ctas_sagas
-			.get(TenantId::new(7), {
-				let mut operation_bytes = [0x55u8; 16];
-				operation_bytes[..5].fill(0);
-				operation_bytes[5] = 1;
-				operation_bytes[6] = 0x70;
-				operation_bytes[8] = 0x80;
-				CtasOperationId::new(operation_bytes)
-			})
-			.expect("the active saga survives conversion");
-		assert_eq!(entry.certificate, None, "conversion adds certificate: None");
-		assert_eq!(
-			hex(&postcard::to_stdvec(&converted).unwrap()),
-			hex(&postcard::to_stdvec(&expected_converted_state()).unwrap()),
-			"conversion must land exactly on the live apply path's state"
-		);
-	}
-
-	/// Regeneration procedure for the v1 fixtures: unlike the current-version
-	/// corpus these are IMMUTABLE — regenerate only to create them, never to
-	/// repair a drift; a drift here means a referenced type moved under the
-	/// frozen spine and the shadow must fork its own copy instead.
-	#[test]
-	#[ignore = "generator: one-time creation of the immutable v1 fixtures"]
-	fn adr0092_generate_v1_fixtures_once() {
-		let dir = std::env::temp_dir().join("wendelon_body_corpus");
-		std::fs::create_dir_all(&dir).unwrap();
-		let wal = format!(
-			"ctas_saga_provision={}\nctas_saga_provision_tail_table={}\nacquire_lease={}\n",
-			hex(&v1_entry_bytes(v1_provision_request(0x54))),
-			hex(&v1_entry_bytes(v1_provision_request_for(
-				0x54,
-				tail_descriptor()
-			))),
-			hex(&v1_entry_bytes(
-				crate::consensus::wal_body::v1::WendelonRequest::AcquireLease(LeaseDescriptor {
-					epoch: 1,
-					holder: node(1),
-					range_start: 0x1000,
-					range_end: 0x1FFF,
-					lease_start: hts(5),
-					lease_expiry: hts(6),
-					min_commit_index: 0,
-					issuer: node(1),
-					signature: [0x5A; 64],
-				})
-			)),
-		);
-		std::fs::write(dir.join("wal_v1_entries.txt"), wal).unwrap();
-		let snapshot = format!(
-			"smstate_active_saga={}\n",
-			hex(&postcard::to_stdvec(&v1_snapshot_state()).unwrap())
-		);
-		std::fs::write(dir.join("snapshot_v1.txt"), snapshot).unwrap();
-		println!("v1 fixtures written to {}", dir.display());
-	}
 
 	/// Regeneration procedure, run only inside a format-version bump cut:
 	/// `cargo test ... adr0092_regenerate_body_corpus_manifests -- --ignored
@@ -20746,7 +20695,7 @@ pub(crate) mod body_format_corpus {
 		for (name, bytes) in wal_corpus() {
 			wal.push_str(&format!("{name}={}\n", hex(&bytes)));
 		}
-		std::fs::write(dir.join("wal_v5_entries.txt"), wal).unwrap();
+		std::fs::write(dir.join("wal_v8_entries.txt"), wal).unwrap();
 		let mut mutations = String::new();
 		for (name, mutation) in canonical_mutations() {
 			mutations.push_str(&format!(
@@ -20766,7 +20715,7 @@ pub(crate) mod body_format_corpus {
 			hex(&postcard::to_stdvec(&state).unwrap()),
 			hex(&postcard::to_stdvec(&entry).unwrap())
 		);
-		std::fs::write(dir.join("snapshot_v5.txt"), snapshot).unwrap();
+		std::fs::write(dir.join("snapshot_v8.txt"), snapshot).unwrap();
 		println!("manifests written to {}", dir.display());
 	}
 }
@@ -20780,50 +20729,17 @@ mod root2_carrier_tests;
 #[cfg(test)]
 pub(crate) fn carrier_legacy_fixture_entry(
 	version: u8,
-	name: &str,
+	_name: &str,
 ) -> std::io::Result<Entry<WendelonTypeConfig>> {
-	let manifest = match version {
-		0 | 4 => include_str!("../../tests/fixtures/consensus_body/wal_v4_entries.txt"),
-		1 => include_str!("../../tests/fixtures/consensus_body/wal_v1_entries.txt"),
-		2 => include_str!("../../tests/fixtures/consensus_body/wal_v2_entries.txt"),
-		3 => include_str!("../../tests/fixtures/consensus_body/wal_v3_entries.txt"),
-		_ => {
-			return Err(Error::new(
-				ErrorKind::InvalidInput,
-				"unsupported legacy carrier fixture version",
-			));
-		}
-	};
-	let hex = manifest
-		.lines()
-		.filter_map(|line| line.split_once('='))
-		.find_map(|(n, hex)| (n == name).then_some(hex))
-		.ok_or_else(|| {
-			Error::new(
-				ErrorKind::InvalidInput,
-				"unknown legacy carrier fixture name",
-			)
-		})?;
-	let bytes = (0..hex.len())
-		.step_by(2)
-		.map(|i| u8::from_str_radix(&hex[i..i + 2], 16))
-		.collect::<Result<Vec<_>, _>>()
-		.map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
-	match version {
-		0 | 4 => crate::consensus::wal_body::v4::decode_entry(&bytes),
-		1 => crate::consensus::wal_body::v1::decode_entry(&bytes),
-		2 => crate::consensus::wal_body::v2::decode_entry(&bytes),
-		3 => crate::consensus::wal_body::v3::decode_entry(&bytes),
-		_ => unreachable!(),
-	}
-}
-#[cfg(test)]
-fn assert_carrier_v4_fixture_round_trip(payload: &[u8]) {
-	let frozen = postcard::from_bytes::<
-		Entry<crate::consensus::wal_body::v4::WendelonWalV4TypeConfig>,
-	>(payload)
-	.unwrap();
-	assert_eq!(postcard::to_stdvec(&frozen).unwrap(), payload);
+	// ADR 0697: every pre-v6 WAL body is refused, never decoded.
+	Err(Error::new(
+		ErrorKind::InvalidData,
+		UnsupportedControlFormat {
+			artifact: "wal",
+			found: version,
+			required: WAL_FORMAT_VERSION,
+		},
+	))
 }
 
 #[cfg(test)]

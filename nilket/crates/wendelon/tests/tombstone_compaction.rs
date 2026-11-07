@@ -711,7 +711,11 @@ async fn mvcc_retention_fully_pruned_tiered_slab_retires_end_to_end() {
 		let report = sweeper.sweep_once().await.unwrap();
 		let snapshot = node.state_machine.state_snapshot().await;
 		let audit = std::fs::read_to_string(&audit_path).unwrap_or_default();
-		let retired_in_sm = !snapshot.tiered_slabs.contains_key(&retired_slab_id);
+		// One data node: its slab is the only owner with this local id.
+		let retired_in_sm = !snapshot
+			.tiered_slabs
+			.keys()
+			.any(|slab| slab.local_id() == retired_slab_id);
 		let retired_locally = node.slab.tier_pointer(retired_slab_id).await.is_none();
 		if retired_in_sm
 			&& retired_locally
@@ -731,7 +735,10 @@ async fn mvcc_retention_fully_pruned_tiered_slab_retires_end_to_end() {
 			"timed out waiting for fully-pruned tier retirement: report={report:?} \
 			 retired_in_sm={retired_in_sm} retired_locally={retired_locally} \
 			 tiered_in_sm={} retained_lookup={} stale_read_err={} audit_retire={}",
-			snapshot.tiered_slabs.contains_key(&retired_slab_id),
+			snapshot
+				.tiered_slabs
+				.keys()
+				.any(|slab| slab.local_id() == retired_slab_id),
 			node.slab
 				.lookup_as_of(tenant(), key_identity(key), oldest)
 				.unwrap()

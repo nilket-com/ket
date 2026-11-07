@@ -51,8 +51,30 @@ pub(super) fn record(payload: &[u8], version: u8) -> std::io::Result<Entry<Wende
 	};
 	decode_log_record(Path::new("carrier-test.wnd"), 0, &header, &body, fixed_size)
 }
+/// The response tags that predate ADR 0697 keep their wire positions; `Refused`
+/// is appended after them.
 #[test]
-fn carrier_wal_versions_zero_through_five_use_exact_frozen_dispatch() {
+fn existing_response_tags_stay_pinned() {
+	use crate::consensus::{SlabRefusal, WendelonResponse};
+	let tag = |response: &WendelonResponse| postcard::to_stdvec(response).unwrap()[0];
+	assert_eq!(tag(&WendelonResponse::Success), 0);
+	assert_eq!(tag(&WendelonResponse::LeaseDenied), 1);
+	assert_eq!(tag(&WendelonResponse::Error(String::new())), 2);
+	assert_eq!(tag(&WendelonResponse::Root2Dormant), 3);
+	assert_eq!(
+		tag(&WendelonResponse::Refused(
+			SlabRefusal::NotAppendingLeader {
+				owner_node: 2,
+				leader_node: 1,
+			}
+		)),
+		4
+	);
+}
+
+#[test]
+/// ADR 0697: every pre-v6 WAL body is refused before its payload is decoded.
+fn carrier_wal_versions_zero_through_five_are_refused() {
 	let manifests = [
 		(
 			0,
@@ -81,64 +103,35 @@ fn carrier_wal_versions_zero_through_five_use_exact_frozen_dispatch() {
 	];
 	for (version, text) in manifests {
 		for (name, payload) in manifest(text) {
-			let entry = record(&payload, version).unwrap();
-			let current = postcard::to_stdvec(&entry).unwrap();
-			if version == 1 && name.starts_with("ctas_saga_provision") {
-				let mut projected = payload.clone();
-				projected.push(0);
-				assert_eq!(current, projected);
-			} else {
-				assert_eq!(current, payload, "v{version} {name}");
-			}
-			let mut trailing = payload.clone();
-			trailing.push(0);
+			let error = record(&payload, version).unwrap_err();
 			assert!(
-				record(&trailing, version)
-					.unwrap_err()
-					.to_string()
-					.contains("format mismatch")
+				error
+					.get_ref()
+					.is_some_and(|cause| cause.is::<UnsupportedControlFormat>()),
+				"v{version} {name}: {error}"
 			);
-			if version == 0 || version == 4 {
-				assert_carrier_v4_fixture_round_trip(&payload);
-			}
 		}
-	}
-	let current = manifest(include_str!(
-		"../../../tests/fixtures/consensus_body/wal_v5_entries.txt"
-	));
-	let carrier = &current
-		.iter()
-		.find(|(name, _)| *name == "root2_command")
-		.unwrap()
-		.1;
-	for version in [0, 4, 6, 255] {
-		assert!(
-			record(carrier, version)
-				.unwrap_err()
-				.to_string()
-				.contains("format mismatch")
-		);
 	}
 	let mut overbound = vec![3, 1, 11, 1, 26, 1];
 	overbound.extend([0xb1, 0x80, 0x10]); //262193, no payload
 	assert!(
-		record(&overbound, 5)
+		record(&overbound, WAL_FORMAT_VERSION)
 			.unwrap_err()
 			.to_string()
 			.contains("format mismatch")
 	);
 	let wrong_version = vec![3, 1, 11, 1, 26, 2];
 	assert!(
-		record(&wrong_version, 5)
+		record(&wrong_version, WAL_FORMAT_VERSION)
 			.unwrap_err()
 			.to_string()
 			.contains("format mismatch")
 	);
 }
 #[test]
-fn carrier_current_v5_corpus_matches_independent_manifest_and_writer_kind() {
+fn carrier_current_v8_corpus_matches_independent_manifest_and_writer_kind() {
 	let stored = manifest(include_str!(
-		"../../../tests/fixtures/consensus_body/wal_v5_entries.txt"
+		"../../../tests/fixtures/consensus_body/wal_v8_entries.txt"
 	));
 	let requests = body_format_corpus::canonical_requests();
 	assert_eq!(stored.len(), requests.len() + 2);
@@ -157,7 +150,7 @@ fn carrier_current_v5_corpus_matches_independent_manifest_and_writer_kind() {
 			let fixed = *bytemuck::from_bytes::<RaftLogEntryFixed>(
 				&page.as_slice()[head..head + fixed_size],
 			);
-			assert_eq!(header.format_version, 5);
+			assert_eq!(header.format_version, WAL_FORMAT_VERSION);
 			assert_eq!(fixed.kind, LogEntryKind::APPEND);
 			assert_eq!(fixed.epoch, 0);
 			let decoded = decode_log_record(
@@ -175,11 +168,21 @@ fn carrier_current_v5_corpus_matches_independent_manifest_and_writer_kind() {
 struct NoTier(AtomicUsize);
 #[async_trait::async_trait]
 impl TierObserver for NoTier {
-	async fn on_slab_tiered(&self, _: &TieredSlab, _: u64) -> std::io::Result<()> {
+	async fn on_slab_tiered(
+		&self,
+		_: &TieredSlab,
+		_: &IncarnationRegistry,
+		_: u64,
+	) -> std::io::Result<()> {
 		self.0.fetch_add(1, Ordering::SeqCst);
 		Ok(())
 	}
-	async fn on_slab_retired(&self, _: SlabId, _: u64) -> std::io::Result<()> {
+	async fn on_slab_retired(
+		&self,
+		_: SlabRef,
+		_: &IncarnationRegistry,
+		_: u64,
+	) -> std::io::Result<()> {
 		self.0.fetch_add(1, Ordering::SeqCst);
 		Ok(())
 	}
@@ -205,7 +208,7 @@ async fn carrier_apply_is_held_with_metadata_only_and_no_audit_tier_or_cache_cha
 	let mut finalizations = sm.subscribe_finalizations();
 	let request = WendelonRequest::Root2Command(Root2Carrier1::new(&[7], None).unwrap());
 	let mut direct = before.clone();
-	let (response, event) = apply_request_at_log_index(&mut direct, request.clone(), 11);
+	let (response, event) = apply_request_at_log_index(&mut direct, request.clone(), 11, 1);
 	assert_eq!(response, WendelonResponse::Root2Dormant);
 	assert!(event.is_none());
 	assert_eq!(

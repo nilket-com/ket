@@ -148,10 +148,11 @@ fn dormant_authority_has_no_production_provider_or_activation() {
 			"{name}: keep substrate modules bounded"
 		);
 	}
-	// Existing live formats are deliberately untouched; no boot/WAL/reader wiring.
+	// The live formats are pinned at their current versions; this substrate adds no
+	// boot/WAL/reader wiring.
 	let core = fs::read_to_string(root.join("src/schema/core.rs")).unwrap();
-	assert!(core.contains("SNAPSHOT_FORMAT_VERSION: u8 = 5"));
-	assert!(core.contains("WAL_FORMAT_VERSION: u8 = 5"));
+	assert!(core.contains("SNAPSHOT_FORMAT_VERSION: u8 = 8"));
+	assert!(core.contains("WAL_FORMAT_VERSION: u8 = 8"));
 	// The one admitted outside caller is the offline, read-only compromise audit CLI (ADR 0101
 	// C-S6): exactly one mention, its canonical import of the single audit entry point.
 	let audit_cli = root.join("src/cli/root2_audit.rs");
@@ -177,6 +178,12 @@ fn dormant_authority_has_no_production_provider_or_activation() {
 					);
 					continue;
 				}
+				// Test code, not activation: this module's allocation counter, by that exact path.
+				let text = if p.ends_with("storage/manager/tests.rs") {
+					text.replace("storage::mutation_visibility::tests::b1_assay", "")
+				} else {
+					text
+				};
 				assert!(
 					!text.contains("storage::mutation_visibility"),
 					"no production activation in slice A"
@@ -5922,9 +5929,11 @@ fn root2_carrier_is_bounded_private_held_and_response_mappings_are_explicit() {
 	assert!(text.contains("if version != 1"));
 	let core =
 		syn::parse_file(&fs::read_to_string(src.join("consensus/core.rs")).unwrap()).unwrap();
+	// ADR 0697 appends after Root2Command and Root2Dormant, whose wire positions
+	// stay pinned; each list's last variant is the newest append.
 	for (name, last) in [
-		("WendelonRequest", "Root2Command"),
-		("WendelonResponse", "Root2Dormant"),
+		("WendelonRequest", "AckOutcomes"),
+		("WendelonResponse", "Op"),
 	] {
 		let e = core
 			.items
@@ -5938,46 +5947,29 @@ fn root2_carrier_is_bounded_private_held_and_response_mappings_are_explicit() {
 			})
 			.unwrap();
 		assert_eq!(e.variants.last().unwrap().ident.to_string(), last);
+		if name == "WendelonRequest" {
+			let root2 = e
+				.variants
+				.iter()
+				.position(|variant| variant.ident == "Root2Command")
+				.unwrap();
+			assert_eq!(root2, 26, "Root2Command keeps its wire position");
+		}
 	}
-	let frozen = fs::read_to_string(src.join("consensus/wal_body.rs")).unwrap();
-	let file = syn::parse_file(&frozen).unwrap();
-	let module = file
-		.items
-		.iter()
-		.find_map(|i| {
-			if let syn::Item::Mod(m) = i {
-				(m.ident == "v4").then_some(m)
-			} else {
-				None
-			}
-		})
-		.unwrap();
-	let (_, items) = module.content.as_ref().unwrap();
-	let request = items
-		.iter()
-		.find_map(|i| {
-			if let syn::Item::Enum(e) = i {
-				(e.ident == "WendelonRequest").then_some(e)
-			} else {
-				None
-			}
-		})
-		.unwrap();
-	assert_eq!(request.variants.len(), 26);
-	assert!(request.variants.iter().all(|v| v.ident != "Root2Command"));
+	// ADR 0697: no frozen legacy decoder remains; every pre-v7 body is refused
+	// before its payload is decoded, and only the current shape is dispatched.
+	assert!(!src.join("consensus/wal_body.rs").exists());
 	let storage = fs::read_to_string(src.join("consensus/raft_storage.rs")).unwrap();
-	let dispatch = storage
-		.split("let entry: Entry<WendelonTypeConfig> = match header.format_version {")
+	let decode = storage
+		.split("fn decode_log_record(")
 		.nth(1)
 		.unwrap()
 		.split("if entry.log_id.index != fixed.index")
 		.next()
 		.unwrap();
-	for version in 0..=5 {
-		assert!(dispatch.contains(&format!("{version} =>")));
-	}
-	assert!(dispatch.contains("version =>"));
-	assert!(!dispatch.contains("_ => match postcard"));
+	assert!(decode.contains("if header.format_version != WAL_FORMAT_VERSION {"));
+	assert!(decode.contains("UnsupportedControlFormat {"));
+	assert!(decode.contains("WAL_FORMAT_VERSION => match postcard"));
 	for (path, count) in [
 		("node.rs", 2),
 		("network/control_server.rs", 11),

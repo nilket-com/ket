@@ -2352,14 +2352,16 @@ pub struct SnapshotHeader {
 /// nothing to declare.
 pub const PRE_VERSIONING_FORMAT: u8 = 0;
 
-/// Shape of the `postcard(SmState)` body this build writes. ADR 0095 version 5
-/// appends logical-drop tombstones and durable reclaim debts.
-pub const SNAPSHOT_FORMAT_VERSION: u8 = 5;
+/// Shape of the `postcard(SmState)` body this build writes. ADR 0697 version 6
+/// keys tier pointers by owner-qualified slab and adds the incarnation
+/// registry; every earlier version is refused, not upconverted.
+pub const SNAPSHOT_FORMAT_VERSION: u8 = 8;
 
 /// Shape of the Control Ring WAL record bodies this build writes, including the
-/// `postcard(Entry<..>)` payload of a log record. ADR0100 V-S1 version 5 appends
-/// the held Root2 carrier; the outgoing version4 spine remains frozen.
-pub const WAL_FORMAT_VERSION: u8 = 5;
+/// `postcard(Entry<..>)` payload of a log record. ADR 0697 version 6 carries
+/// owner-qualified slab commands and incarnation registration; every earlier
+/// version is refused, not upconverted.
+pub const WAL_FORMAT_VERSION: u8 = 8;
 
 // Static assertions to ensure all our size calculations remain exactly correct
 const _: () = assert!(std::mem::size_of::<HybridTimestamp>() == 16);

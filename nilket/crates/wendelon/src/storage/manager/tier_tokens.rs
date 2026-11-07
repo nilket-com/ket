@@ -247,6 +247,12 @@ pub struct TierProposal {
 }
 
 impl TierProposal {
+	/// A proposal with no reservation of its own, for a [`crate::storage::sweeper::CommandCommitter`]
+	/// whose caller already holds the reservation.
+	pub(crate) fn tokenless(tier: TieredSlab) -> Self {
+		Self { tier, token: None }
+	}
+
 	/// The entry to propose.
 	pub fn tier(&self) -> &TieredSlab {
 		&self.tier
@@ -275,7 +281,7 @@ impl TierProposal {
 			// The reservation is gone (its manager closed): proposing now would
 			// propose without one.
 			Err(tier_history_refusal(
-				self.tier.slab_id,
+				self.tier.slab.local_id(),
 				TierHistoryShortfall::History,
 			))
 		}
@@ -323,6 +329,13 @@ impl TierSubmission {
 		self.release();
 	}
 
+	/// The state machine definitely rejected this submitted command: it applied
+	/// nothing and never will, so the reservation goes. Distinct from
+	/// [`Self::not_submitted`], which proves it was never sent.
+	pub fn rejected(self) {
+		self.release();
+	}
+
 	fn release(mut self) {
 		if let Some(token) = self.token.take() {
 			token.with_slot(|slot| *slot = None);
@@ -339,7 +352,14 @@ impl SlabManager {
 	/// per-lineage cap. Refuses typed when the budget or the registry is full.
 	pub async fn reserve_tier_history(&self, tier: TieredSlab) -> std::io::Result<TierProposal> {
 		crate::metrics::global().tier_history_reservations.inc();
-		let slab_id = tier.slab_id;
+		// ADR 0697: a store proposes only its own slabs.
+		if tier.slab.owner() != self.owner_ref()? {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				"tier proposal names another store's slab",
+			));
+		}
+		let slab_id = tier.slab.local_id();
 		let refuse = || tier_history_refusal(slab_id, TierHistoryShortfall::History);
 		let rows = self.count_record_rows_for_slab(slab_id);
 		// Read the history sizes, reserve, and only then copy the base, in one
@@ -488,19 +508,7 @@ impl SlabManager {
 
 /// The pointer a `TieredSlab` entry names.
 pub(super) fn tiered_slab_pointer(tier: &TieredSlab) -> TieredSlabPointer {
-	TieredSlabPointer {
-		slab_id: tier.slab_id,
-		l2_uri: tier.l2_uri.clone(),
-		payload_hash: tier.payload_hash,
-		is_encrypted: tier.is_encrypted,
-		tenant_id: tier.tenant_id,
-		tenant_kek_id: tier.tenant_kek_id,
-		stats_format_version: tier.stats_format_version,
-		stats_block_len: tier.stats_block_len,
-		stats_block_hash128: tier.stats_block_hash128,
-		tombstone_metadata: tier.tombstone_metadata,
-		supersession_metadata: tier.supersession_metadata,
-	}
+	TieredSlabPointer::from_ring(tier)
 }
 
 /// Count a refused tier rewrite under its §7 reason, if it is one.
@@ -559,7 +567,7 @@ mod tests {
 			.unwrap();
 		TierProposal {
 			tier: TieredSlab {
-				slab_id: SlabId::new(7),
+				slab: crate::consensus::OwnerRef::for_test(1, 1).slab(SlabId::new(7)),
 				l2_uri: uri.to_string(),
 				payload_hash: [0; 32],
 				is_encrypted: false,

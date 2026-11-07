@@ -402,35 +402,6 @@ pub struct CtasSagaCatalog {
 }
 
 impl CtasSagaCatalog {
-	/// ADR 0092: reassemble a catalog from a versioned-replay decode. The
-	/// fields stay private — this is the one seam through which a superseded
-	/// snapshot shape re-enters the live catalog, and it takes already
-	/// upconverted entries so the catalog never holds a partial conversion.
-	pub(crate) fn from_replay_parts(
-		entries: BTreeMap<(TenantId, CtasOperationId), CtasSagaEntry>,
-		expired_through_ms: BTreeMap<TenantId, u64>,
-	) -> Self {
-		Self {
-			entries,
-			expired_through_ms,
-		}
-	}
-
-	/// The consuming inverse of [`Self::from_replay_parts`], for projecting a
-	/// live state into a superseded fixture shape. Test-only by construction:
-	/// production replay only ever converts old shapes forward, so nothing in
-	/// a shipping build projects backward — only the fixture generators and
-	/// their controls do.
-	#[cfg(test)]
-	pub(crate) fn into_replay_parts(
-		self,
-	) -> (
-		BTreeMap<(TenantId, CtasOperationId), CtasSagaEntry>,
-		BTreeMap<TenantId, u64>,
-	) {
-		(self.entries, self.expired_through_ms)
-	}
-
 	pub fn get(
 		&self,
 		tenant_id: TenantId,
