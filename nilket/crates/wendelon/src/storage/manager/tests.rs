@@ -18968,6 +18968,161 @@ async fn a_held_retirement_ends_only_with_its_own_effect() {
 	owed("a record of this generation").await;
 }
 
+/// The tenant check on a tier read gives the verdict the whole object metadata gave, and the
+/// expected one, for each thing that metadata refused.
+fn tenant_check_verdict(
+	blob: &[u8],
+	slab_id: SlabId,
+	acknowledged: &BTreeSet<u64>,
+) -> std::io::Result<TenantId> {
+	let whole =
+		build_tiered_object_metadata(blob, slab_id, &L2ChunkLayoutConfig::default(), acknowledged)
+			.map(|metadata| metadata.tenant_id);
+	let check = single_tenant_id_from_plain_slab(blob, slab_id, acknowledged);
+	assert_eq!(
+		whole.as_ref().map_err(|err| (err.kind(), err.to_string())),
+		check.as_ref().map_err(|err| (err.kind(), err.to_string())),
+	);
+	check
+}
+
+#[tokio::test]
+async fn a_tier_tenant_check_refuses_what_object_metadata_refused() {
+	// None at all.
+	let err = tenant_check_verdict(&[], SlabId::new(77), &BTreeSet::new()).unwrap_err();
+	assert!(
+		err.to_string()
+			.contains("does not contain any committed records"),
+		"{err}"
+	);
+
+	// A record after the first contradicts it.
+	let (_dir, mgr) = fresh_manager().await;
+	mgr.append(tenant(), id(1), hlc(10), b"first")
+		.await
+		.unwrap();
+	mgr.append(tenant(), id(2), hlc(11), b"second")
+		.await
+		.unwrap();
+	mgr.append(TenantId::new(17), id(3), hlc(12), b"third")
+		.await
+		.unwrap();
+	let slab_id = force_seal_active(&mgr).await;
+	let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
+	let acknowledged = mgr.acknowledged_offsets_in_slab(slab_id);
+	let err = tenant_check_verdict(&raw, slab_id, &acknowledged).unwrap_err();
+	assert!(
+		err.to_string().contains("contains multiple tenants"),
+		"{err}"
+	);
+
+	// One tenant, then the same bytes damaged inside the last record, not in the slab's unused
+	// tail: cut short, and with a byte flipped. The evidence decides, so also with no acknowledged
+	// offsets at all.
+	let (_dir, mgr) = fresh_manager().await;
+	mgr.append(tenant(), id(1), hlc(10), b"first")
+		.await
+		.unwrap();
+	mgr.append(tenant(), id(2), hlc(11), b"second")
+		.await
+		.unwrap();
+	let slab_id = force_seal_active(&mgr).await;
+	let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
+	let acknowledged = mgr.acknowledged_offsets_in_slab(slab_id);
+	assert_eq!(
+		tenant_check_verdict(&raw, slab_id, &acknowledged).unwrap(),
+		tenant()
+	);
+	let last_payload = raw
+		.windows(b"second".len())
+		.position(|window| window == b"second")
+		.unwrap();
+	assert!(tenant_check_verdict(&raw[..last_payload + 2], slab_id, &acknowledged).is_err());
+	let mut flipped = raw.clone();
+	flipped[last_payload] ^= 0xff;
+	assert!(tenant_check_verdict(&flipped, slab_id, &acknowledged).is_err());
+	let _ = tenant_check_verdict(&raw, slab_id, &BTreeSet::new());
+
+	// A frame claiming an encoding directory that cannot be opened, the refusal chunk-size
+	// selection contributed.
+	let (_dir, mgr) = fresh_manager().await;
+	let mut payload = b"not an arrow stream ".to_vec();
+	payload.extend_from_slice(
+		crate::storage::encoding::types::ENCODING_DIRECTORY_METADATA_KEY.as_bytes(),
+	);
+	mgr.append(tenant(), id(1), hlc(10), &payload)
+		.await
+		.unwrap();
+	let slab_id = force_seal_active(&mgr).await;
+	let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
+	let acknowledged = mgr.acknowledged_offsets_in_slab(slab_id);
+	assert!(tenant_check_verdict(&raw, slab_id, &acknowledged).is_err());
+}
+
+/// What the tenant check saves on a slab of real multirow frames. Synchronous, with no await, so
+/// this thread's counts are the walk and nothing else.
+#[tokio::test]
+async fn a_tier_tenant_check_allocates_less_than_object_metadata() {
+	use crate::storage::mutation_visibility::tests::b1_assay::{thread_alloc_bytes, thread_allocs};
+	let (frames, rows_per_frame) = (64, 64);
+	let (_dir, mgr) = fresh_manager().await;
+	let descriptor = tier_stats_decode_descriptor(
+		TableObjectId::new([0xD1; 16]),
+		u32::try_from(rows_per_frame).unwrap(),
+	);
+	for frame in 0..frames {
+		let batch = tier_stats_decode_batch(frame, rows_per_frame);
+		let meta = layout_recluster_meta(&descriptor, batch.num_rows());
+		let packed = pack_record_batch_by_bucket(
+			&meta,
+			&descriptor,
+			&batch,
+			WriterNodeId::ZERO,
+			hlc(10_000 + 1_000 * frame as u64),
+		)
+		.unwrap();
+		assert_eq!(packed.len(), 1, "one request packs into one physical frame");
+		let entries = storage_multirow_index_entries_from_frame(&packed[0].frame_bytes)
+			.unwrap()
+			.expect("typed multirow frame exposes per-row entries");
+		mgr.append_durable_multirow_with_locality(tenant(), &packed[0].frame_bytes, &entries)
+			.await
+			.unwrap();
+	}
+	let slab_id = force_seal_active(&mgr).await;
+	let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
+	let acknowledged = mgr.acknowledged_offsets_in_slab(slab_id);
+	let measured = |walk: &dyn Fn()| {
+		let (calls, bytes) = (thread_allocs(), thread_alloc_bytes());
+		walk();
+		(thread_allocs() - calls, thread_alloc_bytes() - bytes)
+	};
+	let whole = measured(&|| {
+		build_tiered_object_metadata(
+			&raw,
+			slab_id,
+			&L2ChunkLayoutConfig::default(),
+			&acknowledged,
+		)
+		.unwrap();
+	});
+	let check = measured(&|| {
+		single_tenant_id_from_plain_slab(&raw, slab_id, &acknowledged).unwrap();
+	});
+	eprintln!(
+		"tenant check on {} bytes, {frames} frames of {rows_per_frame} rows: metadata {} calls {} bytes, check {} calls {} bytes",
+		raw.len(),
+		whole.0,
+		whole.1,
+		check.0,
+		check.1,
+	);
+	assert!(
+		check.0 < whole.0 && check.1 < whole.1,
+		"{check:?} {whole:?}"
+	);
+}
+
 /// Readiness runs per row of every append, so it must not allocate while nothing is unresolved
 /// (DC-190). With an intent present it walks, and that cost is measured here rather than assumed.
 #[tokio::test]

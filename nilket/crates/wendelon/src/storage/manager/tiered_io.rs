@@ -433,14 +433,13 @@ pub(super) fn descriptor_matches_tiered_row(
 	}
 }
 
-pub(super) fn build_tiered_object_metadata(
-	blob: &[u8],
+/// The one tenant of these entries. Every entry is checked: a later record can contradict the
+/// first.
+pub(super) fn single_tenant_of_recovered_entries(
+	entries: &[RecoveredSlabEntry],
 	slab_id: SlabId,
-	chunk_layout_config: &L2ChunkLayoutConfig,
-	acknowledged: &BTreeSet<u64>,
-) -> std::io::Result<TieredSlabObjectMetadata> {
-	let entries = recover_slab_entries_from_blob(blob, slab_id, acknowledged)?;
-	let Some(first_entry) = entries.first().copied() else {
+) -> std::io::Result<TenantId> {
+	let Some(first_entry) = entries.first() else {
 		return Err(Error::new(
 			ErrorKind::InvalidInput,
 			format!(
@@ -450,12 +449,8 @@ pub(super) fn build_tiered_object_metadata(
 		));
 	};
 	let tenant_id = first_entry.tenant_id;
-	let has_row_tombstone_records = entries.iter().any(|entry| entry.location.is_tombstone);
-	let mut offset_index = Vec::with_capacity(entries.len());
 	for entry in entries {
 		let other_tenant_id = entry.tenant_id;
-		let key_identity = entry.key_identity;
-		let location = entry.location;
 		if other_tenant_id != tenant_id {
 			return Err(Error::new(
 				ErrorKind::InvalidInput,
@@ -467,13 +462,33 @@ pub(super) fn build_tiered_object_metadata(
 				),
 			));
 		}
-		offset_index.push(TieredOffsetIndexEntry {
-			key_locator: IdentityPrefix::from(key_identity),
-			byte_offset: location.offset,
-			byte_length: location.length,
-			flags: 0,
-		});
 	}
+	Ok(tenant_id)
+}
+
+pub(super) fn build_tiered_object_metadata(
+	blob: &[u8],
+	slab_id: SlabId,
+	chunk_layout_config: &L2ChunkLayoutConfig,
+	acknowledged: &BTreeSet<u64>,
+) -> std::io::Result<TieredSlabObjectMetadata> {
+	let entries = recover_slab_entries_from_blob(blob, slab_id, acknowledged)?;
+	let tenant_id = single_tenant_of_recovered_entries(&entries, slab_id)?;
+	let first_entry = entries[0];
+	let has_row_tombstone_records = entries.iter().any(|entry| entry.location.is_tombstone);
+	let offset_index = entries
+		.into_iter()
+		.map(|entry| {
+			let key_identity = entry.key_identity;
+			let location = entry.location;
+			TieredOffsetIndexEntry {
+				key_locator: IdentityPrefix::from(key_identity),
+				byte_offset: location.offset,
+				byte_length: location.length,
+				flags: 0,
+			}
+		})
+		.collect();
 	Ok(TieredSlabObjectMetadata {
 		tenant_id,
 		created_hlc: first_entry.location.hlc.physical_ms,

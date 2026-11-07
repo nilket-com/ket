@@ -248,8 +248,8 @@ mod pause_hooks;
 use tiered_io::{
 	RehydratedSlabState, SlabBacking, TierObjectEvidence, TieredPlaintext,
 	build_tiered_object_metadata, decode_tiered_blob, descriptor_matches_tiered_row,
-	extract_record_from_blob, fetch_tiered_ciphertext_runs, validate_tiered_blob,
-	validate_tiered_record_header_tenant,
+	extract_record_from_blob, fetch_tiered_ciphertext_runs, single_tenant_of_recovered_entries,
+	validate_tiered_blob, validate_tiered_record_header_tenant,
 };
 mod compaction;
 use compaction::{
@@ -277,7 +277,7 @@ pub(crate) use encoding_compute::{
 use encoding_compute::{
 	encoding_compute_aggregate_kernels_enabled, encoding_compute_physical_user_column_ordinal,
 	encoding_compute_row_group_column_null_count, encoding_directories_from_slab_blob,
-	indexed_record_fetch_key, take_projected_indexed_rows,
+	indexed_record_fetch_key, take_projected_indexed_rows, visit_encoding_directories,
 };
 pub use secondary_index_segments::SecondaryIndexSegmentInfo;
 use secondary_index_segments::{
@@ -4330,10 +4330,12 @@ fn single_tenant_id_from_plain_slab(
 	slab_id: SlabId,
 	acknowledged: &BTreeSet<u64>,
 ) -> std::io::Result<TenantId> {
-	Ok(
-		build_tiered_object_metadata(blob, slab_id, &L2ChunkLayoutConfig::default(), acknowledged)?
-			.tenant_id,
-	)
+	let entries = recover_slab_entries_from_blob(blob, slab_id, acknowledged)?;
+	let tenant_id = single_tenant_of_recovered_entries(&entries, slab_id)?;
+	// Object metadata refused a malformed directory while choosing its chunk size; this check
+	// still does, without choosing one.
+	visit_encoding_directories(blob, &entries, |_| {})?;
+	Ok(tenant_id)
 }
 
 fn slab_path(dir: &Path, slab_id: SlabId) -> PathBuf {

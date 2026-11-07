@@ -2370,11 +2370,22 @@ pub(super) fn encoding_directories_from_slab_blob(
 	acknowledged: &BTreeSet<u64>,
 ) -> std::io::Result<Vec<EncodingDirectory>> {
 	let mut out = Vec::new();
-	for recovered in crate::storage::core::recovered_frames(&recover_slab_entries_from_blob(
+	visit_encoding_directories(
 		blob,
-		slab_id,
-		acknowledged,
-	)?) {
+		&recover_slab_entries_from_blob(blob, slab_id, acknowledged)?,
+		|directory| out.push(directory),
+	)?;
+	Ok(out)
+}
+
+/// Open and deserialize the encoding directory of each frame these recovered entries name,
+/// refusing a malformed one.
+pub(super) fn visit_encoding_directories(
+	blob: &[u8],
+	entries: &[RecoveredSlabEntry],
+	mut visit: impl FnMut(EncodingDirectory),
+) -> std::io::Result<()> {
+	for recovered in crate::storage::core::recovered_frames(entries) {
 		let frame = extract_record_from_blob(blob, recovered.location())?;
 		if !ipc_stream_contains_encoding_directory(&frame) {
 			continue;
@@ -2400,9 +2411,9 @@ pub(super) fn encoding_directories_from_slab_blob(
 						),
 					)
 				})?;
-		out.push(directory);
+		visit(directory);
 	}
-	Ok(out)
+	Ok(())
 }
 
 impl SlabManager {

@@ -72,10 +72,15 @@ fn copy_probe(schema: &ProofSchema, b: &RecordBatch) {
 // allocates nothing and registers no teardown. `try_with` still covers thread exit.
 thread_local! {
 	static THREAD_ALLOCS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+	static THREAD_ALLOC_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 /// Allocation calls made by this thread so far, unaffected by anything else in the process.
 pub(crate) fn thread_allocs() -> u64 {
 	THREAD_ALLOCS.with(std::cell::Cell::get)
+}
+/// Bytes this thread has requested so far, in the same scope as [`thread_allocs`].
+pub(crate) fn thread_alloc_bytes() -> u64 {
+	THREAD_ALLOC_BYTES.with(std::cell::Cell::get)
 }
 fn allocated(n: usize) {
 	let live = LIVE.fetch_add(n, Ordering::Relaxed) + n;
@@ -83,6 +88,7 @@ fn allocated(n: usize) {
 	ALLOCS.fetch_add(1, Ordering::Relaxed);
 	REQUESTED.fetch_add(n, Ordering::Relaxed);
 	let _ = THREAD_ALLOCS.try_with(|count| count.set(count.get() + 1));
+	let _ = THREAD_ALLOC_BYTES.try_with(|bytes| bytes.set(bytes.get() + n as u64));
 }
 unsafe impl GlobalAlloc for Counter {
 	unsafe fn alloc(&self, l: Layout) -> *mut u8 {
