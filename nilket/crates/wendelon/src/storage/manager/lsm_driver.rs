@@ -546,20 +546,30 @@ impl SlabManager {
 		// key-disjoint check and memory publication. Registering a new intent
 		// cannot race between that check and the resulting key edits.
 		let _scope = self.lsm_intent_scope_gate.write().await;
-		match self.lsm_install_unresolved.entry(intent.commit.job_id) {
-			dashmap::mapref::entry::Entry::Vacant(entry) => {
-				let scope = lsm_intent_scope(intent, false);
-				let owner_token = scope.owner_token.clone();
-				entry.insert(scope);
-				Some(LsmIntentOwner {
-					manager: self,
-					job_id: intent.commit.job_id,
-					owner_token,
-					completed: false,
-				})
-			}
-			dashmap::mapref::entry::Entry::Occupied(_) => None,
+		// One job at a time, store-wide, from here until it is resolved. An accepted commit must
+		// apply from the epoch it was prepared at, and the epoch is the whole manifest's, so
+		// nothing may move it in between: this refuses before anything is durable or submitted.
+		// Maintenance, the one other writer, checks this registry under this same gate.
+		if !self.lsm_install_unresolved.is_empty() {
+			return None;
 		}
+		if !intent.commit.is_lsm_gc_removal_commit()
+			&& recover_rwlock_read(&self.compaction_manifest, "compaction_manifest")
+				.manifest_epoch()
+				!= intent.commit.manifest_epoch_pre
+		{
+			return None;
+		}
+		let scope = lsm_intent_scope(intent, false);
+		let owner_token = scope.owner_token.clone();
+		self.lsm_install_unresolved
+			.insert(intent.commit.job_id, scope);
+		Some(LsmIntentOwner {
+			manager: self,
+			job_id: intent.commit.job_id,
+			owner_token,
+			completed: false,
+		})
 	}
 
 	/// Nothing was renamed or proposed: clear exactly this durable intent.
@@ -4462,9 +4472,12 @@ impl SlabManager {
 				inputs: expected.clone(),
 			};
 			let Some(_intent_owner) = self.register_lsm_install_intent(&intent).await else {
+				if !pre_delete_pending {
+					self.slab_pins.clear_delete_pending(slab_id);
+				}
 				return Err(Error::new(
 					ErrorKind::WouldBlock,
-					"LSM GC intent already unresolved",
+					"another LSM job is unresolved; this mark waits",
 				));
 			};
 			self.tier_authority.notify_publication_change();
@@ -4650,7 +4663,7 @@ impl SlabManager {
 			let Some(_intent_owner) = self.register_lsm_install_intent(&intent).await else {
 				return Err(Error::new(
 					ErrorKind::WouldBlock,
-					"LSM GC intent already unresolved",
+					"another LSM job is unresolved; this removal waits",
 				));
 			};
 			self.tier_authority.notify_publication_change();

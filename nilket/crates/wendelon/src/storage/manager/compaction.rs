@@ -1489,6 +1489,15 @@ impl SlabManager {
 				return Ok(());
 			}
 		}
+		let intents = self.lsm_intent_scope_gate.read().await;
+		if !self.lsm_install_unresolved.is_empty() {
+			return Err(Error::new(
+				ErrorKind::WouldBlock,
+				"an unresolved LSM job relies on the manifest epoch; this maintenance waits",
+			));
+		}
+		#[cfg(test)]
+		self.pause_maintenance_in_intent_scope_for_test().await;
 		self.bump_slab_publication_revision(slab_id)?;
 		let deleted_rows = records
 			.iter()
@@ -1514,6 +1523,7 @@ impl SlabManager {
 		)
 		.await?;
 		self.apply_maintenance_manifest_publication(slab_id, None)?;
+		drop(intents);
 		// ADR 0697 §4: the run is logically retired either way. In a ring the file
 		// is terminal only through GC's claim, like a replaced input's, so readers
 		// keep their backing and its bytes are reclaimed when that sweep runs.
@@ -1576,6 +1586,14 @@ impl SlabManager {
 				return Ok(false);
 			}
 		}
+		// An unresolved job relies on the manifest epoch this would move: the prepared
+		// replacement is discarded, and a later pass prepares again.
+		let intents = self.lsm_intent_scope_gate.read().await;
+		if !self.lsm_install_unresolved.is_empty() {
+			return Ok(false);
+		}
+		#[cfg(test)]
+		self.pause_maintenance_in_intent_scope_for_test().await;
 		self.bump_slab_publication_revision(old_slab_id)?;
 		let survivor_count = records.iter().filter(|record| !record.reclaim).count();
 		if relocations.len() != survivor_count
@@ -1846,6 +1864,7 @@ impl SlabManager {
 		// excludes a plan derived from the pre-publication Live run. Keep the old
 		// backing sealed for stale readers; Phase D owns its eventual disposal.
 		self.apply_maintenance_manifest_publication(old_slab_id, Some(replacement_run))?;
+		drop(intents);
 		// One relocation per key: every survivor (and indexed counter frame) is
 		// replaced by its new location, and reclaimed records are removed, in a
 		// single key critical section. A stale holder of an old location follows

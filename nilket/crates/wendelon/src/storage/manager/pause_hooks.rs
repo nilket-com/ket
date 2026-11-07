@@ -680,8 +680,8 @@ pub(super) struct TestHolds {
 	/// A commit the ring has applied, and whose observer has not yet told the manifest.
 	pub(super) lsm_observer_hold:
 		std::sync::Mutex<Option<(Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>>,
-	/// The same, holding the transition gate a removal needs.
-	pub(super) lsm_observer_in_gate_hold:
+	/// Maintenance past its registry check, before its first publication effect.
+	pub(super) maintenance_in_intent_scope_hold:
 		std::sync::Mutex<Option<(Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>>,
 	/// A GC with its run durably dropped and the manifest not yet told.
 	pub(super) gc_after_run_dropped_hold:
@@ -796,10 +796,10 @@ impl SlabManager {
 		}
 	}
 
-	pub(super) async fn pause_lsm_observer_in_gate_for_test(&self) {
+	pub(super) async fn pause_maintenance_in_intent_scope_for_test(&self) {
 		let hold = self
 			.continuity_test_holds
-			.lsm_observer_in_gate_hold
+			.maintenance_in_intent_scope_hold
 			.lock()
 			.unwrap()
 			.clone();

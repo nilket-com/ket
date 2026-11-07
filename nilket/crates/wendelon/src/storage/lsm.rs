@@ -697,6 +697,12 @@ impl CompactionCommit {
 			&& self.sidecar_swaps.is_empty()
 	}
 
+	/// A removal: its `GcRemove` operation fixes no epoch, so registration does not hold it to this
+	/// commit's pre-epoch, which is still checked where the commit applies.
+	pub fn is_lsm_gc_removal_commit(&self) -> bool {
+		self.is_lsm_gc_lifecycle_commit() && self.slabs_to_mark_delete_pending.is_empty()
+	}
+
 	pub fn has_lsm_gc_lifecycle_fields(&self) -> bool {
 		!self.slabs_to_mark_delete_pending.is_empty() || !self.slabs_to_remove.is_empty()
 	}

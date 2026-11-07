@@ -30817,6 +30817,9 @@ async fn stale_lsm_intent_owner_cannot_orphan_same_job_replacement() {
 		.unwrap()
 		.unwrap()
 		.forget();
+	// The epoch has moved since this job first registered, and a registration names the current one.
+	let mut intent = intent;
+	intent.commit.manifest_epoch_pre = manager.compaction_manifest_snapshot().manifest_epoch;
 	let replacement = manager
 		.register_lsm_install_intent(&intent)
 		.await
@@ -57103,241 +57106,448 @@ async fn an_install_accepted_after_gc_ends_after_a_reopen_with_inputs_sealed_bef
 	an_install_accepted_after_gc_ends_after_a_reopen(true).await;
 }
 
-/// A real install's commit, applied by the ring, racing GC's removal of a run for the transition
-/// gate: GC's lease keeps the ring from applying during its drop, but an observer runs after the
-/// ring's write lock is released. In either order the epoch memory shows is one a reopen would
-/// recover. With the observer first, both also finish in this process. With the removal first this
-/// proves that boundary and no more: the install it overtook is left fenced, which is DC-192.
-async fn an_observed_commit_racing_a_gc_removal(observer_first: bool) {
-	async fn reached(what: &str, gate: &tokio::sync::Semaphore) {
-		tokio::time::timeout(Duration::from_secs(60), gate.acquire())
-			.await
-			.unwrap_or_else(|_| panic!("never reached: {what}"))
-			.unwrap()
-			.forget();
-	}
-	type Hold = (Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>);
-	let hold = || -> Hold {
-		(
-			Arc::new(tokio::sync::Semaphore::new(0)),
-			Arc::new(tokio::sync::Semaphore::new(0)),
-		)
-	};
-	let dir = fresh_dir("gc-overtaken");
-	let owner = DataDirectoryOwner::acquire_existing(&dir).unwrap();
-	let manager =
-		SlabManager::initialize_new_store_with_owner(gc_owned_test_config(&dir), owner.clone())
-			.await
-			.unwrap();
-	let cluster = control_cluster_observing(&[(1, &manager)]).await;
-	register_owner(&cluster.nodes[0], &manager).await;
-	let plain = Arc::new(op_committer(&cluster, 1));
-	let plan = |job: u64, pre: ManifestEpoch, inputs: [SlabId; 2], start: u64| CompactionPlan {
-		job_id: CompactionJobId::new(job),
-		source_level: CompactionLevelIndex::L0,
-		target_level: CompactionLevelIndex::L1,
-		manifest_epoch_pre: pre,
-		input_slabs: inputs.to_vec(),
-		overlapping_slabs: Vec::new(),
-		retention_floor_snapshot: hlc(100),
-		compaction_start_hlc: hlc(start),
-		dominant_reason: crate::storage::DominantReason::Operator,
-	};
-	let seal = async |key: Identity, at: u64, bytes: &[u8]| {
-		manager
-			.append_durable(tenant(), key, hlc(at), bytes)
-			.await
-			.unwrap();
-		manager.force_seal_active_for_test().await
-	};
-	let worker = LsmCompactionWorker::new(LsmConfig::default(), manager.slab_pin_table()).unwrap();
+type LsmJobHold = (Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>);
 
-	// What GC will collect.
-	let collected = [
-		seal(id(0xdc19201), 1, b"collected-first").await,
-		seal(id(0xdc19202), 2, b"collected-second").await,
-	];
-	manager
-		.run_lsm_compaction_once_via_control_ring(
-			&worker,
-			plan(
-				0xdc1921,
-				manager.compaction_manifest_snapshot().manifest_epoch,
-				collected,
-				50,
-			),
-			plain.as_ref(),
-		)
+fn lsm_job_hold() -> LsmJobHold {
+	(
+		Arc::new(tokio::sync::Semaphore::new(0)),
+		Arc::new(tokio::sync::Semaphore::new(0)),
+	)
+}
+
+async fn lsm_job_reached(what: &str, gate: &tokio::sync::Semaphore) {
+	tokio::time::timeout(Duration::from_secs(60), gate.acquire())
 		.await
-		.unwrap();
-	// What the overtaking install will merge.
-	let keys = [id(0xdc19203), id(0xdc19204)];
-	let merged = [
-		seal(keys[0], 3, b"merged-first").await,
-		seal(keys[1], 4, b"merged-second").await,
-	];
+		.unwrap_or_else(|_| panic!("never reached: {what}"))
+		.unwrap()
+		.forget();
+}
 
-	// GC stops at its first disposal, its run marked: the install is prepared at that epoch.
-	let entry = hold();
-	let dropped = hold();
-	*manager
-		.continuity_test_holds
-		.gc_disposal_entry_hold
-		.lock()
-		.unwrap() = Some(entry.clone());
-	*manager
-		.continuity_test_holds
-		.gc_after_run_dropped_hold
-		.lock()
-		.unwrap() = Some(dropped.clone());
-	let gc = LsmGcWorker::new(LsmConfig::default(), manager.slab_pin_table()).unwrap();
-	let sweep = {
-		let (manager, plain) = (manager.clone(), plain.clone());
-		tokio::spawn(async move {
-			manager
-				.sweep_lsm_delete_pending_once_via_control_ring(&gc, plain.as_ref())
+/// A store on a real ring, with one finished install whose two inputs GC can collect, and two
+/// more sealed slabs another install can merge.
+struct LsmJobStore {
+	dir: crate::test_support::TestDir,
+	owner: DataDirectoryOwner,
+	manager: Arc<SlabManager>,
+	_cluster: ControlCluster,
+	plain: Arc<crate::storage::RaftCommitter>,
+	worker: LsmCompactionWorker,
+	collected: [SlabId; 2],
+	merged: [SlabId; 2],
+}
+
+const LSM_JOB_ROWS: [(u64, &[u8]); 4] = [
+	(0xdc19201, b"collected-first"),
+	(0xdc19202, b"collected-second"),
+	(0xdc19203, b"merged-first"),
+	(0xdc19204, b"merged-second"),
+];
+
+impl LsmJobStore {
+	async fn new(label: &str) -> Self {
+		let dir = fresh_dir(label);
+		let owner = DataDirectoryOwner::acquire_existing(&dir).unwrap();
+		let manager =
+			SlabManager::initialize_new_store_with_owner(gc_owned_test_config(&dir), owner.clone())
 				.await
-		})
-	};
-	reached("GC's first disposal", &entry.0).await;
-	let observer = hold();
-	{
-		let holds = &manager.continuity_test_holds;
-		let at = if observer_first {
-			&holds.lsm_observer_in_gate_hold
-		} else {
-			&holds.lsm_observer_hold
+				.unwrap();
+		let cluster = control_cluster_observing(&[(1, &manager)]).await;
+		register_owner(&cluster.nodes[0], &manager).await;
+		let plain = Arc::new(op_committer(&cluster, 1));
+		let worker =
+			LsmCompactionWorker::new(LsmConfig::default(), manager.slab_pin_table()).unwrap();
+		let mut sealed = Vec::new();
+		for (at, (key, bytes)) in LSM_JOB_ROWS.into_iter().enumerate() {
+			manager
+				.append_durable(tenant(), id(key), hlc(at as u64 + 1), bytes)
+				.await
+				.unwrap();
+			sealed.push(manager.force_seal_active_for_test().await);
+		}
+		let store = Self {
+			dir,
+			owner,
+			manager,
+			_cluster: cluster,
+			plain,
+			worker,
+			collected: [sealed[0], sealed[1]],
+			merged: [sealed[2], sealed[3]],
 		};
-		*at.lock().unwrap() = Some(observer.clone());
+		store.install(0xdc1921, store.collected, 50).await.unwrap();
+		store
 	}
-	let install = {
-		let (manager, plain) = (manager.clone(), plain.clone());
-		let plan = plan(
-			0xdc1922,
-			manager.compaction_manifest_snapshot().manifest_epoch,
-			merged,
-			101,
-		);
-		let worker = worker.clone();
+
+	fn epoch(&self) -> ManifestEpoch {
+		self.manager.compaction_manifest_snapshot().manifest_epoch
+	}
+
+	fn plan(&self, job: u64, inputs: [SlabId; 2], start: u64) -> CompactionPlan {
+		CompactionPlan {
+			job_id: CompactionJobId::new(job),
+			source_level: CompactionLevelIndex::L0,
+			target_level: CompactionLevelIndex::L1,
+			manifest_epoch_pre: self.epoch(),
+			input_slabs: inputs.to_vec(),
+			overlapping_slabs: Vec::new(),
+			retention_floor_snapshot: hlc(100),
+			compaction_start_hlc: hlc(start),
+			dominant_reason: crate::storage::DominantReason::Operator,
+		}
+	}
+
+	async fn install(
+		&self,
+		job: u64,
+		inputs: [SlabId; 2],
+		start: u64,
+	) -> Result<crate::storage::lsm::CompactionOutcome, CompactionFailure> {
+		self.manager
+			.run_lsm_compaction_once_via_control_ring(
+				&self.worker,
+				self.plan(job, inputs, start),
+				self.plain.as_ref(),
+			)
+			.await
+	}
+
+	fn spawn_install(
+		&self,
+		job: u64,
+		inputs: [SlabId; 2],
+		start: u64,
+	) -> tokio::task::JoinHandle<Result<crate::storage::lsm::CompactionOutcome, CompactionFailure>>
+	{
+		let (manager, plain) = (self.manager.clone(), self.plain.clone());
+		let (worker, plan) = (self.worker.clone(), self.plan(job, inputs, start));
 		tokio::spawn(async move {
 			manager
 				.run_lsm_compaction_once_via_control_ring(&worker, plan, plain.as_ref())
 				.await
 		})
-	};
-	reached("the ring applying the install's commit", &observer.0).await;
-	let index = manager.require_op_index().unwrap();
-	let floor = async || {
+	}
+
+	fn spawn_sweep(&self) -> tokio::task::JoinHandle<std::io::Result<Vec<SlabId>>> {
+		let gc = LsmGcWorker::new(LsmConfig::default(), self.manager.slab_pin_table()).unwrap();
+		let (manager, plain) = (self.manager.clone(), self.plain.clone());
+		tokio::spawn(async move {
+			manager
+				.sweep_lsm_delete_pending_once_via_control_ring(&gc, plain.as_ref())
+				.await
+		})
+	}
+
+	async fn ops(&self) -> usize {
+		let index = self.manager.require_op_index().unwrap();
+		index.load_op_intents().await.unwrap().len()
+	}
+
+	async fn floor(&self) -> ManifestEpoch {
+		let index = self.manager.require_op_index().unwrap();
 		index
 			.load_snapshot()
 			.await
 			.unwrap()
 			.lsm_manifest_epoch_floor
-	};
-	let epoch = || manager.compaction_manifest_snapshot().manifest_epoch;
-	let prepared_at = epoch();
-
-	entry.1.add_permits(64);
-	if observer_first {
-		// The observer holds the gate, so the run does not go until it has told the manifest.
-		tokio::time::sleep(Duration::from_millis(200)).await;
-		assert_eq!(
-			dropped.0.available_permits(),
-			0,
-			"the drop waits for the gate"
-		);
-		observer.1.add_permits(64);
-		reached("the first run durably dropped", &dropped.0).await;
-		assert_eq!(epoch(), ManifestEpoch::new(prepared_at.get() + 1));
-		assert!(matches!(
-			manager
-				.compaction_manifest_snapshot()
-				.run(merged[0])
-				.unwrap()
-				.state,
-			crate::storage::SlabState::Retired { .. }
-		));
-	} else {
-		// The run goes first, and the observer waits for the gate.
-		reached("the first run durably dropped", &dropped.0).await;
-		observer.1.add_permits(64);
-		tokio::time::sleep(Duration::from_millis(200)).await;
-		assert_eq!(epoch(), prepared_at, "the observer waits for the removal");
 	}
-	// The drop is durable and memory has not moved: a stop here recovers more than it showed.
-	let at_drop = epoch();
-	assert_eq!(floor().await, ManifestEpoch::new(at_drop.get() + 1));
 
-	// Memory follows, to exactly what the floor already holds.
-	dropped.1.add_permits(64);
-	if !observer_first {
-		let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-		while epoch() == at_drop {
-			assert!(tokio::time::Instant::now() < deadline, "memory never moved");
-			tokio::time::sleep(Duration::from_millis(5)).await;
-		}
-		assert_eq!(epoch(), ManifestEpoch::new(at_drop.get() + 1));
-		assert_eq!(floor().await, epoch());
-		assert!(
-			collected
+	/// Sweep until GC has collected these, within a bound: a refusal only means not yet.
+	async fn collect(&self) {
+		let gc = LsmGcWorker::new(LsmConfig::default(), self.manager.slab_pin_table()).unwrap();
+		let mut last = Ok(Vec::new());
+		for _ in 0..64 {
+			let manifest = self.manager.compaction_manifest_snapshot();
+			if self
+				.collected
 				.iter()
-				.any(|input| manager.compaction_manifest_snapshot().run(*input).is_none()),
-			"the removal is in the manifest"
-		);
-		// Nothing here can finish while DC-192 stands, so this stops, and cleans up.
-		sweep.abort();
-		install.abort();
-		let _ = sweep.await;
-		let _ = install.await;
-		let _ = owner.close(Duration::from_secs(2)).await;
-		return;
+				.all(|input| manifest.run(*input).is_none())
+			{
+				for input in self.collected {
+					assert!(!slab_path(&self.dir, input).exists());
+				}
+				return;
+			}
+			last = self
+				.manager
+				.sweep_lsm_delete_pending_once_via_control_ring(&gc, self.plain.as_ref())
+				.await;
+			tokio::time::sleep(Duration::from_millis(50)).await;
+		}
+		panic!("GC did not collect: {last:?}");
 	}
-	reached("GC's next disposal", &entry.0).await;
-	assert!(floor().await >= ManifestEpoch::new(at_drop.get() + 1));
 
-	// Both finish, in this process.
-	let swept = tokio::time::timeout(Duration::from_secs(60), sweep).await;
-	swept.expect("the sweep finished").unwrap().unwrap();
-	let installed = tokio::time::timeout(Duration::from_secs(60), install).await;
-	installed.expect("the install finished").unwrap().unwrap();
-	let manifest = manager.compaction_manifest_snapshot();
-	for input in collected {
-		assert!(manifest.run(input).is_none(), "{:?}", manifest.runs());
-		assert!(!slab_path(&dir, input).exists());
-	}
-	assert_eq!(
-		index
-			.load_snapshot()
+	/// A write is acknowledged and every row reads back, exactly.
+	async fn assert_serving(&self, write: u64) {
+		let after = id(write);
+		self.manager
+			.append_durable(tenant(), after, hlc(200), b"after")
 			.await
-			.unwrap()
-			.lsm_manifest_epoch_floor,
-		manifest.manifest_epoch
-	);
-	let after = id(0xdc19205);
-	manager
-		.append_durable(tenant(), after, hlc(200), b"after")
-		.await
-		.unwrap();
-	for (key, bytes) in [
-		(id(0xdc19201), b"collected-first".as_slice()),
-		(id(0xdc19202), b"collected-second".as_slice()),
-		(keys[0], b"merged-first".as_slice()),
-		(keys[1], b"merged-second".as_slice()),
-		(after, b"after".as_slice()),
-	] {
-		let location = manager.lookup(tenant(), key).unwrap().unwrap();
-		assert_eq!(manager.read(location).await.unwrap(), bytes);
+			.unwrap();
+		let rows = LSM_JOB_ROWS
+			.into_iter()
+			.map(|(key, bytes)| (id(key), bytes))
+			.chain([(after, b"after".as_slice())]);
+		for (key, bytes) in rows {
+			let location = self.manager.lookup(tenant(), key).unwrap().unwrap();
+			assert_eq!(self.manager.read(location).await.unwrap(), bytes);
+		}
 	}
 }
 
+/// A removal's epoch is on disk before memory shows it: a stop at the boundary recovers more than
+/// the store showed, and afterwards exactly what it shows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_observed_commit_ahead_of_a_gc_removal_keeps_both() {
-	an_observed_commit_racing_a_gc_removal(true).await;
+async fn a_gc_removal_is_on_disk_before_memory() {
+	let store = LsmJobStore::new("gc-boundary").await;
+	let dropped = lsm_job_hold();
+	*store
+		.manager
+		.continuity_test_holds
+		.gc_after_run_dropped_hold
+		.lock()
+		.unwrap() = Some(dropped.clone());
+	let sweep = store.spawn_sweep();
+	lsm_job_reached("the first run durably dropped", &dropped.0).await;
+	let at_drop = store.epoch();
+	assert_eq!(store.floor().await, ManifestEpoch::new(at_drop.get() + 1));
+	dropped.1.add_permits(1);
+	lsm_job_reached("the second run durably dropped", &dropped.0).await;
+	dropped.1.add_permits(1);
+	tokio::time::timeout(Duration::from_secs(60), sweep)
+		.await
+		.unwrap()
+		.unwrap()
+		.unwrap();
+	assert_eq!(store.floor().await, store.epoch());
+	store.assert_serving(0xdc19205).await;
 }
 
+/// Whichever registers first, the other is refused before anything is durable or submitted, and
+/// goes ahead once the first has finished: an accepted commit is never overtaken. An install
+/// whose observer has not run still holds its registration, the case that used to fence the store
+/// for good.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_gc_removal_ahead_of_an_observed_commit_is_on_disk_before_memory() {
-	an_observed_commit_racing_a_gc_removal(false).await;
+async fn an_install_and_a_gc_job_wait_each_other_out() {
+	// GC first, standing at its first removal.
+	let store = LsmJobStore::new("jobs-gc-first").await;
+	let entry = lsm_job_hold();
+	*store
+		.manager
+		.continuity_test_holds
+		.gc_disposal_entry_hold
+		.lock()
+		.unwrap() = Some(entry.clone());
+	let sweep = store.spawn_sweep();
+	lsm_job_reached("GC's first removal", &entry.0).await;
+	let (epoch, ops) = (store.epoch(), store.ops().await);
+	assert!(matches!(
+		store.install(0xdc1922, store.merged, 101).await,
+		Err(CompactionFailure::ManifestRace)
+	));
+	assert_eq!((store.epoch(), store.ops().await), (epoch, ops));
+	entry.1.add_permits(64);
+	tokio::time::timeout(Duration::from_secs(60), sweep)
+		.await
+		.unwrap()
+		.unwrap()
+		.unwrap();
+	store.install(0xdc1923, store.merged, 102).await.unwrap();
+	store.collect().await;
+	assert_eq!(store.manager.tier_authority_readiness_reason(), None);
+	store.assert_serving(0xdc19205).await;
+
+	// The install first, applied by the ring with its observer yet to run.
+	let store = LsmJobStore::new("jobs-install-first").await;
+	let observer = lsm_job_hold();
+	*store
+		.manager
+		.continuity_test_holds
+		.lsm_observer_hold
+		.lock()
+		.unwrap() = Some(observer.clone());
+	let install = store.spawn_install(0xdc1922, store.merged, 101);
+	lsm_job_reached("the ring applying the install's commit", &observer.0).await;
+	let (epoch, ops) = (store.epoch(), store.ops().await);
+	let refused = store.spawn_sweep().await.unwrap().unwrap_err();
+	assert_eq!(refused.kind(), ErrorKind::WouldBlock, "{refused}");
+	assert_eq!((store.epoch(), store.ops().await), (epoch, ops));
+	for input in store.collected {
+		assert!(
+			!store.manager.slab_pins.is_delete_pending(input),
+			"a refused mark leaves no pin"
+		);
+	}
+	observer.1.add_permits(64);
+	tokio::time::timeout(Duration::from_secs(60), install)
+		.await
+		.unwrap()
+		.unwrap()
+		.unwrap();
+	store.collect().await;
+	assert_eq!(store.manager.tier_authority_readiness_reason(), None);
+	store.assert_serving(0xdc19205).await;
+}
+
+/// The epoch's one writer outside the registry: maintenance moves it, so it waits for an unresolved
+/// job, and a job prepared before maintenance moved it is refused and prepares again. Both of its
+/// finish paths, one with survivors and one without.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn maintenance_and_an_lsm_job_wait_each_other_out() {
+	let store = LsmJobStore::new("jobs-maintenance").await;
+	let record = |key: u64, reclaim: bool| {
+		let key = id(key);
+		CompactionRecord {
+			tenant_id: tenant(),
+			key_identity: key,
+			routing_locality: Locality::from(key),
+			old_location: store.manager.lookup(tenant(), key).unwrap().unwrap(),
+			reclaim,
+			retention_ambiguous: false,
+			retention_lag_seconds: 0,
+		}
+	};
+	let mark_intent = |pre: ManifestEpoch| crate::storage::index::LsmInstallIntent {
+		kind: crate::storage::index::LsmInstallKind::Control,
+		phase: crate::storage::index::LsmInstallPhase::Prepared,
+		local_input_rows_digest: [0; 32],
+		local_output_rows_digest: [0; 32],
+		local_input_runs: Vec::new(),
+		local_input_files: Vec::new(),
+		local_output_files: Vec::new(),
+		commit: CompactionCommit::gc_mark_delete_pending(
+			store.manager.owner_ref().unwrap(),
+			CompactionJobId::new(0xdc1929),
+			pre,
+			vec![store.collected[0]],
+		),
+		commit_digest: [0; 32],
+		ops: Vec::new(),
+		inputs: Vec::new(),
+	};
+
+	// A slab with a row to reclaim and a row to keep, which is what reaches the replacement path.
+	for (at, key) in [(5, 0xdc19206), (6, 0xdc19207)] {
+		store
+			.manager
+			.append_durable(tenant(), id(key), hlc(at), b"rewritten")
+			.await
+			.unwrap();
+	}
+	let rewritten = store.manager.force_seal_active_for_test().await;
+
+	// A job stands: neither path moves anything, and the slab and its rows stay.
+	let job = scope_holding(&store.manager, 0xdc1928, store.merged[0]);
+	let epoch = store.epoch();
+	let refused =
+		compact_sealed_counter_fixture(&store.manager, store.merged[0], &[record(0xdc19203, true)])
+			.await
+			.err()
+			.expect("the path with no survivors refuses");
+	assert_eq!(refused.kind(), ErrorKind::WouldBlock, "{refused}");
+	assert!(
+		compact_sealed_counter_fixture(
+			&store.manager,
+			rewritten,
+			&[record(0xdc19206, true), record(0xdc19207, false)],
+		)
+		.await
+		.unwrap()
+		.is_none()
+	);
+	assert_eq!(store.epoch(), epoch);
+	store.manager.lsm_install_unresolved.remove(&job);
+	store.assert_serving(0xdc19205).await;
+
+	// Maintenance past its check: a job prepared at this epoch waits, and is then refused because
+	// the epoch has moved. Prepared again it registers.
+	let scope = lsm_job_hold();
+	*store
+		.manager
+		.continuity_test_holds
+		.maintenance_in_intent_scope_hold
+		.lock()
+		.unwrap() = Some(scope.clone());
+	let records = [record(0xdc19206, true), record(0xdc19207, false)];
+	let maintenance = {
+		let manager = store.manager.clone();
+		tokio::spawn(
+			async move { compact_sealed_counter_fixture(&manager, rewritten, &records).await },
+		)
+	};
+	lsm_job_reached("maintenance past its check", &scope.0).await;
+	let stale = mark_intent(store.epoch());
+	let registering = {
+		let manager = store.manager.clone();
+		tokio::spawn(async move {
+			let owner = manager.register_lsm_install_intent(&stale).await;
+			let registered = owner.is_some();
+			drop(owner);
+			registered
+		})
+	};
+	tokio::time::sleep(Duration::from_millis(200)).await;
+	assert!(
+		!registering.is_finished(),
+		"registration waits for maintenance"
+	);
+	scope.1.add_permits(64);
+	assert!(maintenance.await.unwrap().unwrap().is_some());
+	assert!(!registering.await.unwrap(), "its epoch has moved");
+	assert!(store.manager.lsm_install_unresolved.is_empty());
+	let fresh = mark_intent(store.epoch());
+	let owner = store.manager.register_lsm_install_intent(&fresh).await;
+	assert!(owner.is_some());
+	drop(owner);
+	store
+		.manager
+		.clear_registered_lsm_intent(fresh.commit.job_id)
+		.await;
+	let _ = store.owner.close(Duration::from_secs(2)).await;
+}
+
+/// A removal resumed by recovery registers nothing: its durable intent came back as an entry at
+/// open. So it is no way around the rule, and nothing else registers until it has finished.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_resumed_gc_removal_keeps_other_lsm_jobs_out_until_it_finishes() {
+	let stop = GcStop::AfterUnlink;
+	let gc = reopen_gc_at(stop).await;
+	let mark_intent = |pre: ManifestEpoch| crate::storage::index::LsmInstallIntent {
+		kind: crate::storage::index::LsmInstallKind::Control,
+		phase: crate::storage::index::LsmInstallPhase::Prepared,
+		local_input_rows_digest: [0; 32],
+		local_output_rows_digest: [0; 32],
+		local_input_runs: Vec::new(),
+		local_input_files: Vec::new(),
+		local_output_files: Vec::new(),
+		commit: CompactionCommit::gc_mark_delete_pending(
+			gc.mgr.owner_ref().unwrap(),
+			CompactionJobId::new(0xdc1927),
+			pre,
+			vec![gc.slab_id],
+		),
+		commit_digest: [0; 32],
+		ops: Vec::new(),
+		inputs: Vec::new(),
+	};
+	let epoch = gc.mgr.compaction_manifest_snapshot().manifest_epoch;
+	assert_eq!(gc.mgr.lsm_install_unresolved.len(), 1);
+	assert!(
+		gc.mgr
+			.register_lsm_install_intent(&mark_intent(epoch))
+			.await
+			.is_none()
+	);
+	assert_eq!(gc.mgr.lsm_install_unresolved.len(), 1, "its entry stands");
+	gc.finish(stop).await;
+	assert!(gc.mgr.lsm_install_unresolved.is_empty());
+	let fresh = mark_intent(gc.mgr.compaction_manifest_snapshot().manifest_epoch);
+	let owner = gc.mgr.register_lsm_install_intent(&fresh).await;
+	assert!(owner.is_some());
+	drop(owner);
+	gc.mgr
+		.clear_registered_lsm_intent(fresh.commit.job_id)
+		.await;
+	gc.close().await;
 }
 
 /// An output that is not the recorded file is not published.

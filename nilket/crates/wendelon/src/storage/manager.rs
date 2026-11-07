@@ -3244,8 +3244,6 @@ impl SlabManager {
 		self.pause_lsm_observer_for_test().await;
 		let _gate = self.persistent_index_gate.clone().read_owned().await;
 		let _transition = self.lsm_manifest_transition_gate.read().await;
-		#[cfg(test)]
-		self.pause_lsm_observer_in_gate_for_test().await;
 		if self.observer_is_superseded(Some(index)) {
 			return Ok(());
 		}
