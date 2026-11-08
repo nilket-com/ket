@@ -182,7 +182,13 @@ impl HrftService for MsgRouter {
 				|| x == MsgType::COUNTER_REPLICATE_REQ.0
 				|| x == MsgType::COUNTER_REPLICATE_RESP.0
 				|| x == MsgType::COUNTER_ROLLBACK_REQ.0
-				|| x == MsgType::COUNTER_ROLLBACK_RESP.0 =>
+				|| x == MsgType::COUNTER_ROLLBACK_RESP.0
+				|| x == MsgType::TABLE_CHILD_WRITE_REQ.0
+				|| x == MsgType::TABLE_CHILD_WRITE_RESP.0
+				|| x == MsgType::TABLE_CHILD_REPLICATE_REQ.0
+				|| x == MsgType::TABLE_CHILD_REPLICATE_RESP.0
+				|| x == MsgType::TABLE_CHILD_FETCH_REQ.0
+				|| x == MsgType::TABLE_CHILD_FETCH_RESP.0 =>
 			{
 				match &self.data {
 					Some(h) => h.handle_data_frame(context, frame).await,
@@ -282,6 +288,10 @@ fn is_control_extension_request(msg_type: u8) -> bool {
 		MsgType::CTAS_SAGA_REQ,
 		MsgType::MAINTENANCE_REPORT_REQ,
 		MsgType::MAINTENANCE_REQUEUE_REQ,
+		// ADR 0699 S3a. Node-required: not in ACTOR_AUTHORIZED_CONTROL_REQUESTS.
+		MsgType::DECISION_PROPOSE_REQ,
+		MsgType::DECISION_LOOKUP_REQ,
+		MsgType::DECISION_CUT_REQ,
 	]
 	.iter()
 	.any(|candidate| candidate.0 == msg_type)
@@ -301,6 +311,9 @@ fn is_extension_response(msg_type: u8) -> bool {
 		MsgType::CTAS_SAGA_RESP,
 		MsgType::MAINTENANCE_REPORT_RESP,
 		MsgType::MAINTENANCE_REQUEUE_RESP,
+		MsgType::DECISION_PROPOSE_RESP,
+		MsgType::DECISION_LOOKUP_RESP,
+		MsgType::DECISION_CUT_RESP,
 	]
 	.iter()
 	.any(|candidate| candidate.0 == msg_type)
@@ -595,6 +608,80 @@ mod tests {
 			)
 			.await
 			.unwrap();
+		assert_eq!(control.0.load(Ordering::Relaxed), 1);
+	}
+
+	/// ADR 0699 S3a: a forwarded decision reaches the control ring from an
+	/// authenticated node, never from another actor, and its response is never
+	/// dispatched as a request.
+	#[tokio::test]
+	async fn a_decision_proposal_routes_to_control_only_from_a_node() {
+		let control = Arc::new(CountingControl(AtomicUsize::new(0)));
+		let router = MsgRouterBuilder::default()
+			.with_control_ring(control.clone())
+			.build();
+		router
+			.handle_frame(node_context(2), frame(MsgType::DECISION_PROPOSE_REQ))
+			.await
+			.unwrap();
+		assert_eq!(control.0.load(Ordering::Relaxed), 1);
+		let error = router
+			.handle_frame(operator_context(), frame(MsgType::DECISION_PROPOSE_REQ))
+			.await
+			.unwrap_err();
+		assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+		assert!(
+			router
+				.handle_frame(node_context(2), frame(MsgType::DECISION_PROPOSE_RESP))
+				.await
+				.is_err()
+		);
+		assert_eq!(control.0.load(Ordering::Relaxed), 1);
+	}
+
+	#[tokio::test]
+	async fn a_decision_lookup_routes_to_control_only_from_a_node() {
+		let control = Arc::new(CountingControl(AtomicUsize::new(0)));
+		let router = MsgRouterBuilder::default()
+			.with_control_ring(control.clone())
+			.build();
+		router
+			.handle_frame(node_context(3), frame(MsgType::DECISION_LOOKUP_REQ))
+			.await
+			.unwrap();
+		assert_eq!(control.0.load(Ordering::Relaxed), 1);
+		assert!(
+			router
+				.handle_frame(operator_context(), frame(MsgType::DECISION_LOOKUP_REQ))
+				.await
+				.is_err()
+		);
+		assert!(
+			router
+				.handle_frame(node_context(3), frame(MsgType::DECISION_LOOKUP_RESP))
+				.await
+				.is_err()
+		);
+		assert_eq!(control.0.load(Ordering::Relaxed), 1);
+	}
+
+	#[tokio::test]
+	async fn a_decision_cut_routes_to_control_only_from_a_node() {
+		let control = Arc::new(CountingControl(AtomicUsize::new(0)));
+		let router = MsgRouterBuilder::default()
+			.with_control_ring(control.clone())
+			.build();
+		router
+			.handle_frame(node_context(3), frame(MsgType::DECISION_CUT_REQ))
+			.await
+			.unwrap();
+		assert_eq!(control.0.load(Ordering::Relaxed), 1);
+		for (context, msg_type) in [
+			(operator_context(), MsgType::DECISION_CUT_REQ),
+			(node_context(3), MsgType::DECISION_CUT_RESP),
+		] {
+			assert!(router.handle_frame(context, frame(msg_type)).await.is_err());
+		}
 		assert_eq!(control.0.load(Ordering::Relaxed), 1);
 	}
 

@@ -497,9 +497,11 @@ pub(crate) fn delete_maintenance_receipt_table_for_test(path: &Path) {
 	write_txn.commit().unwrap();
 }
 const META_LAST_CONTROL_LOG_INDEX: &str = "last_control_log_index";
+pub(crate) mod certified_base;
 /// The store's incarnation, written once by fresh initialization and never
 /// rewritten. Its absence on open means the store predates slab identity.
 mod op_state;
+pub(crate) mod parent_intents;
 pub use op_state::OpTicket;
 pub(crate) use op_state::{
 	AbandonedOutput, GcFileIdentity, LoadedOp, MAX_RESERVED_OUTPUTS_PER_JOB, OpEvidence,
@@ -1313,6 +1315,9 @@ impl PersistentLocalIndex {
 						.map_err(redb_to_io)?;
 				}
 			}
+			// ADR 0699 S3b: parent intents are created on first use; once
+			// initialized, a missing table refuses the open.
+			parent_intents::check_parent_intent_authority(&write_txn)?;
 			// Create only on first upgrade. A missing previously initialized table
 			// is lost authority, not evidence that no submission is outstanding.
 			{

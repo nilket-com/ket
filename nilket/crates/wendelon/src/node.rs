@@ -186,6 +186,10 @@ pub struct ObservabilityConfig {
 pub struct NodeBootstrapConfig {
 	#[cfg(test)]
 	pub(crate) startup_probe: Option<startup_ownership_tests::StartupProbe>,
+	/// ADR 0699 S3c, tests only: open table writes and child frames while the
+	/// ParentDecisions mode refuses service.
+	#[cfg(test)]
+	pub(crate) open_decision_writes_for_test: bool,
 	#[cfg(test)]
 	pub(crate) startup_fault: Option<startup_ownership_tests::StartupFault>,
 	/// Numeric node id — also the openraft peer id. Must be unique
@@ -259,6 +263,14 @@ pub struct NodeBootstrapConfig {
 	/// `Full` retains the Control log from genesis. See
 	/// [`crate::consensus::retention`].
 	pub control_retention: ControlRetention,
+	/// Not a setting: only this crate selects it, for disposable stores. See
+	/// `consensus::decision_mode`.
+	pub(crate) decision_mode: crate::consensus::decision_mode::DecisionMode,
+	/// ADR 0699 S3a: this node's decision-signing secret and every node's
+	/// verifying key, ParentDecisions only. Not settings either: unset, both are
+	/// the development keys, which that mode requires.
+	pub(crate) decision_signing_secret: Option<[u8; 32]>,
+	pub(crate) trusted_decision_signers: BTreeMap<u32, [u8; 32]>,
 	/// Node-local maintenance switch for physical MVCC retention reclaim.
 	/// Skips ONLY the reclaim pass inside the migration sweeper: migrations
 	/// and tombstoned-range reclaim still run, and read-floor semantics are
@@ -338,6 +350,8 @@ impl NodeBootstrapConfig {
 			#[cfg(test)]
 			startup_probe: None,
 			#[cfg(test)]
+			open_decision_writes_for_test: false,
+			#[cfg(test)]
 			startup_fault: None,
 			node_id,
 			data_dir,
@@ -371,6 +385,9 @@ impl NodeBootstrapConfig {
 			tiering: SweeperConfig::default(),
 			lsm_compaction_paused: false,
 			control_retention: ControlRetention::Compacting,
+			decision_mode: Default::default(),
+			decision_signing_secret: None,
+			trusted_decision_signers: BTreeMap::new(),
 			mvcc_retention_paused: false,
 			rehydration: RehydrationPolicy::default(),
 			l2_column_fetch: L2ColumnFetchConfig::default(),
@@ -506,6 +523,9 @@ impl NodeBootstrapConfig {
 		}
 		self.transport_admission.validate()?;
 		identity::validate_identity_keys(self)?;
+		if self.decision_mode == crate::consensus::decision_mode::DecisionMode::ParentDecisions {
+			identity::resolve_decision_keys(self)?;
+		}
 		self.rehydration.validate()?;
 		self.l2_column_fetch.validate()?;
 		self.row_group_writer.validate()?;
@@ -524,6 +544,19 @@ impl NodeBootstrapConfig {
 			}
 		}
 		self.mvcc_retention_policy.validate()?;
+		// ADR 0699: ParentDecisions keeps every acknowledged version until a
+		// certified cleanup removes it; a node MVCC retention window would let
+		// the tier sweeper prune tiered versions, destroying acknowledged copies.
+		if self.decision_mode == crate::consensus::decision_mode::DecisionMode::ParentDecisions
+			&& !matches!(
+				self.mvcc_retention_policy,
+				crate::storage::retention::MvccRetentionPolicy::Disabled
+			) {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				"ParentDecisions mode refuses a node MVCC retention window",
+			));
+		}
 		self.counter_retention.validate()?;
 		match &self.cluster {
 			ClusterBootstrapConfig::Bootstrap => {}
@@ -751,6 +784,26 @@ pub struct WendelonNode {
 
 /// Background task handles. Explicit shutdown aborts and joins these tasks;
 /// dropping a raw Tokio JoinHandle alone detaches its task.
+impl NodeBootstrapConfig {
+	/// ADR 0699 S3c: whether a test opened the write path; never in a build.
+	fn test_write_opening(&self) -> bool {
+		#[cfg(test)]
+		return self.open_decision_writes_for_test;
+		#[cfg(not(test))]
+		false
+	}
+}
+
+/// ADR 0699 S3a: how often a ParentDecisions node checks its signer binding and,
+/// as leader, the retry floor.
+const DECISION_MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+/// ADR 0699 S5a: how long a close waits for the decision maintenance loop to
+/// finish its current step. Past it the loop is aborted, and an interrupted
+/// lifecycle permit then revokes the clean record, as it must.
+const DECISION_MAINTENANCE_DRAIN: std::time::Duration = std::time::Duration::from_secs(15);
+/// ADR 0699 S3c: Resolve proposals per maintenance tick, at most.
+const DECISION_RESOLVE_BATCH: usize = 16;
+
 pub struct NodeHandles {
 	pub ring_updater: JoinHandle<()>,
 	pub drift_monitor: JoinHandle<()>,
@@ -773,6 +826,8 @@ pub struct NodeHandles {
 	pub audit_chain_root_rollup: JoinHandle<()>,
 	pub default_tenant_seeder: JoinHandle<()>,
 	pub checkpoint_emitter: JoinHandle<()>,
+	/// ADR 0699 S3a: ParentDecisions only.
+	pub decision_maintenance: Option<JoinHandle<()>>,
 }
 
 impl NodeHandles {
@@ -801,6 +856,24 @@ impl NodeHandles {
 		self.audit_chain_root_rollup.abort();
 		self.default_tenant_seeder.abort();
 		self.checkpoint_emitter.abort();
+		if let Some(handle) = &self.decision_maintenance {
+			handle.abort();
+		}
+	}
+
+	/// ADR 0699 S5a: waits, bounded, for the decision maintenance loop to stop
+	/// after its current step (its stop was signalled); past the bound it is
+	/// aborted, and an interrupted lifecycle permit then revokes the clean
+	/// record.
+	async fn drain_decision_maintenance(&mut self) {
+		if let Some(mut handle) = self.decision_maintenance.take()
+			&& tokio::time::timeout(DECISION_MAINTENANCE_DRAIN, &mut handle)
+				.await
+				.is_err()
+		{
+			handle.abort();
+			let _ = handle.await;
+		}
 	}
 
 	pub async fn shutdown(self) -> std::io::Result<()> {
@@ -853,6 +926,9 @@ impl NodeHandles {
 		join_all_way!(self.audit_chain_root_rollup, "audit chain root rollup");
 		join_all_way!(self.default_tenant_seeder, "default tenant seeder");
 		join_all_way!(self.checkpoint_emitter, "checkpoint emitter");
+		if let Some(handle) = self.decision_maintenance {
+			join_all_way!(handle, "decision maintenance");
+		}
 		match first_error {
 			Some(error) => Err(error),
 			None => Ok(()),
@@ -1652,6 +1728,15 @@ impl WendelonNode {
 		revocation_tx: watch::Sender<Arc<RevocationSnapshot>>,
 		scope: &mut startup::StartupScope,
 	) -> std::io::Result<startup::NodeParts> {
+		if cfg.decision_mode != crate::consensus::decision_mode::DecisionMode::Today
+			&& !cfg.allow_dev_keys
+		{
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				"the ParentDecisions authority is for disposable development stores only",
+			));
+		}
+		cfg.decision_mode.admit_store(&cfg.data_dir)?;
 		#[cfg(test)]
 		if let Some(fault) = &cfg.startup_fault {
 			for listener in &startup_listeners {
@@ -1713,6 +1798,7 @@ impl WendelonNode {
 			wal_io.clone(),
 			retention.clone(),
 			owner.clone(),
+			cfg.decision_mode,
 		)
 		.await?;
 		// Control replay is validated before it can authorize a missing-index rebuild.
@@ -1867,13 +1953,24 @@ impl WendelonNode {
 		//    If recovery finds a committed-but-unseeded transition,
 		//    `select_bootstrap_epoch` holds visibility at the prior
 		//    epoch until the reconciler finishes auto-seeding.
-		let fallback_epoch =
-			seed_single_node_epoch(local_node, &cfg.advertise_address, local_tiers);
+		let fallback_epoch = seed_single_node_epoch(
+			cfg.decision_mode,
+			local_node,
+			&cfg.advertise_address,
+			local_tiers,
+		);
 		let recovered_state = state_machine.state_snapshot().await;
 		// Recovery mode: the previous owner did not finish a complete shutdown
 		// (crash, kill, or self-termination after an incomplete close). Readiness
 		// stays gated until the existing restore validation has run.
 		let unclean_previous_shutdown = !owner.previous_shutdown_clean();
+		// ADR 0699 S5a: an unclean start under ParentDecisions owes a physical
+		// proof of its certified base before any close may record it clean.
+		if unclean_previous_shutdown
+			&& cfg.decision_mode == crate::consensus::decision_mode::DecisionMode::ParentDecisions
+		{
+			owner.require_base_recovery();
+		}
 		if unclean_previous_shutdown {
 			tracing::warn!(
 				data_dir = %cfg.data_dir.display(),
@@ -2022,7 +2119,8 @@ impl WendelonNode {
 		//    tier-negotiating dialer as the rest of the node, so
 		//    consensus traffic participates in the same QUIC/TCP
 		//    fallback behavior as join and data/control RPCs.
-		let raft_network = WendelonRaftNetworkFactory::new(dial_provider.clone(), pool.clone());
+		let raft_network = WendelonRaftNetworkFactory::new(dial_provider.clone(), pool.clone())
+			.with_decision_mode(cfg.decision_mode);
 
 		// 9. openraft engine. `validate()` pins heartbeat / election
 		//    timeouts against `Config`'s sanity checks.
@@ -2091,6 +2189,44 @@ impl WendelonNode {
 		//     monitor sees Raft-layer and data-ring signal. The
 		//     lease gate is flipped on only after bootstrap/join has
 		//     completed and the background lease manager starts.
+		// ADR 0699 S3a: decision proposals and signer binding, ParentDecisions only.
+		let decision_proposals = if cfg.decision_mode
+			== crate::consensus::decision_mode::DecisionMode::ParentDecisions
+		{
+			let (_, trusted) = identity::resolve_decision_keys(&cfg)?;
+			Some(Arc::new(
+				crate::network::decision_proposals::DecisionProposals::new(
+					cfg.decision_mode,
+					local_node,
+					raft.clone(),
+					state_machine.clone(),
+					trusted,
+					Some(tracker.clone()),
+					clock.clone(),
+					factory.clone(),
+					pool.clone(),
+				),
+			))
+		} else {
+			None
+		};
+		// ADR 0699 S3b: this store signs child acknowledgements as its incarnation.
+		let decision_signer = if cfg.decision_mode
+			== crate::consensus::decision_mode::DecisionMode::ParentDecisions
+		{
+			let (secret, _) = identity::resolve_decision_keys(&cfg)?;
+			Some(Arc::new(
+				crate::network::data_server::child_writes::DecisionSigner {
+					key: ed25519_dalek::SigningKey::from_bytes(&secret),
+					signer: crate::consensus::decisions::Signer {
+						node: local_node.id,
+						incarnation: slab.owner_ref()?.incarnation(),
+					},
+				},
+			))
+		} else {
+			None
+		};
 		let data_server = Arc::new(
 			WendelonDataServer::new(
 				slab.clone(),
@@ -2111,10 +2247,15 @@ impl WendelonNode {
 			.with_counter_retention(cfg.counter_retention)?
 			.with_tracker(tracker.clone())
 			.with_lease_gate(true)
+			.with_decision_mode(cfg.decision_mode)
+			.with_decision_signer(decision_signer)
+			.with_decision_proposals(decision_proposals.clone())
+			.with_test_write_opening(cfg.test_write_opening())
 			.with_directory_owner(owner.clone()),
 		);
 		let raft_server = Arc::new(
 			WendelonRaftInternalServer::new(raft.clone(), pool.clone(), retention.clone())
+				.with_decision_mode(cfg.decision_mode)
 				.with_tracker(tracker.clone())
 				.with_replacement_replay(slab.clone(), state_machine.clone(), log_store.clone()),
 		);
@@ -2132,12 +2273,46 @@ impl WendelonNode {
 			audit_sink.clone(),
 		)
 		.with_protocol_window(cfg.protocol)
+		.with_decision_mode(cfg.decision_mode)
 		.with_lease_authority(lease_authority.clone())
 		.with_transfer_authority(transfer_authority.clone())
-		.with_storage_manager(slab.clone());
+		.with_storage_manager(slab.clone())
+		.with_decision_proposals(decision_proposals.clone());
 		#[cfg(feature = "test-support")]
 		let control_server = control_server.with_join_promotion_gate(cfg.join_promotion_gate.clone());
 		let control_server = Arc::new(control_server);
+		if let Some(proposals) = decision_proposals {
+			let incarnation = slab.owner_ref()?.incarnation();
+			let data_server = data_server.clone();
+			let mut stop = data_server.decision_maintenance_stop();
+			scope
+				.handles()
+				.set_decision_maintenance(tokio::spawn(async move {
+					let mut ticker = tokio::time::interval(DECISION_MAINTENANCE_INTERVAL);
+					ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+					loop {
+						tokio::select! {
+							_ = ticker.tick() => {}
+							_ = stop.wait_for(|stopping| *stopping) => return,
+						}
+						let _ = proposals.ensure_signer_once(incarnation).await;
+						let _ = proposals.advance_floor_once().await;
+						let _ = proposals.resolve_closed_once(DECISION_RESOLVE_BATCH).await;
+						let _ = data_server.sweep_refused_intents().await;
+						// ADR 0699 S5a: certified generations; reads wait for the
+						// base to validate after each start.
+						// Validation (activation of a committed staged candidate
+						// first) precedes any new build or report.
+						let _ = proposals.generation_step().await;
+						let _ = data_server.validate_certified_base().await;
+						let _ = data_server.certification_step().await;
+						// ADR 0699 S5b: one bounded cleanup step and one debt
+						// sweep page, once the base is validated.
+						let _ = data_server.certified_cleanup_step().await;
+						let _ = data_server.debt_sweep_step().await;
+					}
+				}));
+		}
 
 		// 13. Ring-aware dispatch — the single `HrftService` the QUIC
 		//     listener hands every inbound frame to.
@@ -2263,7 +2438,7 @@ impl WendelonNode {
 							&cfg.advertise_address,
 							local_tiers,
 							advertised_roles(),
-							advertised_capabilities(),
+							advertised_capabilities(cfg.decision_mode),
 							cfg.protocol,
 							dial_provider.clone(),
 							pool.clone(),
@@ -2690,7 +2865,12 @@ impl WendelonNode {
 	pub async fn shutdown(self) -> std::io::Result<()> {
 		let lifecycle = self.lifecycle;
 		let transport_servers = self.transport_servers;
-		let handles = self.handles;
+		let mut handles = self.handles;
+		// ADR 0699 S5a: the decision maintenance loop stops between steps, while
+		// Raft still runs, so an orderly close never interrupts a lifecycle
+		// permit.
+		self.data_server.stop_decision_maintenance();
+		handles.drain_decision_maintenance().await;
 		lifecycle.begin_drain();
 		for server in &transport_servers {
 			server.begin_drain();
@@ -2798,6 +2978,16 @@ impl ReadinessReporter for NodeReadinessView {
 		let degraded_reason = self
 			.data_server
 			.degraded_reason()
+			.or_else(|| {
+				self.data_server
+					.certified_base_unvalidated()
+					.then(|| "CertifiedBaseUnvalidated".to_string())
+			})
+			.or_else(|| {
+				self.data_server
+					.decision_mode_refuses_service()
+					.then(|| "ParentDecisionsIncomplete".to_string())
+			})
 			.or_else(|| self.data_server.tier_authority_readiness_reason())
 			.or_else(|| self.restore_validation.borrow().degraded_reason())
 			.or_else(|| {
@@ -2980,6 +3170,7 @@ fn spawn_tcp_tls_server(
 // ============================================================
 
 fn seed_single_node_epoch(
+	decision_mode: crate::consensus::decision_mode::DecisionMode,
 	local: NodeId,
 	address: &str,
 	tiers: TransportTierSet,
@@ -2991,16 +3182,23 @@ fn seed_single_node_epoch(
 			address: address.to_string(),
 			tiers,
 			roles: advertised_roles(),
-			capabilities: advertised_capabilities(),
+			capabilities: advertised_capabilities(decision_mode),
 		},
 	);
 	MembershipEpoch { epoch: 1, peers }
 }
 
-fn advertised_capabilities() -> NodeCapabilitySet {
-	NodeCapabilitySet::empty()
+fn advertised_capabilities(
+	decision_mode: crate::consensus::decision_mode::DecisionMode,
+) -> NodeCapabilitySet {
+	let capabilities = NodeCapabilitySet::empty()
 		.with(NodeCapability::SlabStatsPruning)
-		.with(NodeCapability::PartialAggregatePushdown)
+		.with(NodeCapability::PartialAggregatePushdown);
+	if decision_mode == crate::consensus::decision_mode::DecisionMode::ParentDecisions {
+		capabilities.with(NodeCapability::ParentDecisions)
+	} else {
+		capabilities
+	}
 }
 
 fn transport_tiers_for_provider(provider_tier: TransportTier) -> TransportTierSet {
@@ -3088,6 +3286,9 @@ fn install_tenant_kek_response(response: WendelonResponse, context: &str) -> std
 		crate::consensus::WendelonResponse::Op(refusal) => Err(Error::other(format!(
 			"unexpected slab refusal for a non-slab command: {refusal:?}"
 		))),
+		crate::consensus::WendelonResponse::Decision(result) => Err(Error::other(format!(
+			"unexpected decision result for a non-decision command: {result:?}"
+		))),
 		crate::consensus::WendelonResponse::Root2Dormant => {
 			let message = String::from("Root2 carrier is dormant, not applied");
 			Err(Error::new(
@@ -3125,6 +3326,9 @@ fn tenant_request_response(response: WendelonResponse, context: &str) -> std::io
 		))),
 		WendelonResponse::Op(refusal) => Err(Error::other(format!(
 			"unexpected slab refusal for a non-slab command: {refusal:?}"
+		))),
+		WendelonResponse::Decision(result) => Err(Error::other(format!(
+			"unexpected decision result for a non-decision command: {result:?}"
 		))),
 		WendelonResponse::Root2Dormant => {
 			let message = String::from("Root2 carrier is dormant, not applied");
@@ -3801,6 +4005,190 @@ mod tests {
 				.is_some_and(|inner| inner.is::<crate::storage::ownership::ShutdownIncomplete>()),
 			"expected ShutdownIncomplete, got {error}"
 		);
+	}
+
+	/// ADR 0699: a node MVCC retention window is refused in ParentDecisions
+	/// mode before anything starts; the same window is accepted otherwise.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+	async fn the_parent_decisions_mode_refuses_a_node_retention_window() {
+		use crate::consensus::decision_mode::DecisionMode;
+		use crate::storage::retention::MvccRetentionPolicy;
+		let dir = tempdir("node-parent-decisions-retention");
+		let mut cfg = NodeBootstrapConfig::dev(7005, dir.to_path_buf(), "127.0.0.1:0".into());
+		cfg.mvcc_retention_policy = MvccRetentionPolicy::FixedWindow(Duration::from_secs(60));
+		cfg.validate().expect("accepted outside the mode");
+		cfg.decision_mode = DecisionMode::ParentDecisions;
+		let error = cfg.validate().expect_err("refused in the mode");
+		assert_eq!(error.kind(), ErrorKind::InvalidInput);
+		assert!(error.to_string().contains("MVCC retention"), "{error}");
+		let error = WendelonNode::bootstrap_single_node(cfg)
+			.await
+			.err()
+			.expect("bootstrap refuses it before starting");
+		assert_eq!(error.kind(), ErrorKind::InvalidInput);
+		assert!(!dir.join("CLEAN_SHUTDOWN").exists());
+	}
+
+	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+	async fn the_parent_decisions_mode_refuses_service_and_binds_its_store() {
+		use crate::consensus::decision_mode::DecisionMode;
+		let dir = tempdir("node-parent-decisions");
+		let mut cfg = NodeBootstrapConfig::dev(7004, dir.to_path_buf(), "127.0.0.1:0".into());
+		cfg.decision_mode = DecisionMode::ParentDecisions;
+
+		let node = WendelonNode::bootstrap_single_node(cfg.clone())
+			.await
+			.unwrap();
+		// ADR 0699 S5a: first the certified base validates, then the mode
+		// still refuses service.
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+		loop {
+			let snapshot = node.readiness_reporter().snapshot().await;
+			assert!(!snapshot.is_ready());
+			match snapshot.degraded_reason.as_deref() {
+				Some("ParentDecisionsIncomplete") => break,
+				Some("CertifiedBaseUnvalidated") => {
+					assert!(tokio::time::Instant::now() < deadline, "never validated");
+					tokio::time::sleep(Duration::from_millis(100)).await;
+				}
+				other => panic!("unexpected readiness {other:?}"),
+			}
+		}
+		let refuse = |msg_type: u8, version: u8| {
+			use crate::network::tls::ActorIdentity;
+			let router = node.router.clone();
+			async move {
+				let local = crate::schema::NodeId {
+					id: 7004,
+					_reserved: 0,
+				};
+				let context = crate::network::server::RequestContext {
+					remote: Some(local),
+					actor: ActorIdentity::data_node(local),
+				};
+				let frame = crate::network::core::HrftFrame {
+					header: crate::schema::FrameHeader {
+						magic: HRFT_MAGIC,
+						version,
+						msg_type,
+						flags: 0,
+						stream_id: 1,
+						meta_len: 0,
+						arrow_len: 0,
+						trailing_len: 0,
+					},
+					meta: crate::network::pool::PooledBuf::orphan(Vec::new()),
+					arrow_payload: None,
+					trailing: None,
+				};
+				crate::network::server::HrftService::handle_frame(&*router, context, frame)
+					.await
+					.err()
+					.map(|error| error.kind())
+			}
+		};
+		// Ordinary service is refused at dispatch, by a real frame through the router.
+		assert_eq!(
+			refuse(crate::schema::MsgType::READ_REQ.0, 1).await,
+			Some(std::io::ErrorKind::Unsupported),
+		);
+		assert_eq!(
+			refuse(crate::schema::MsgType::TABLE_WRITE_REQ.0, 1).await,
+			Some(std::io::ErrorKind::Unsupported),
+		);
+		// A Raft frame on the other authority's envelope is refused before decode.
+		assert_eq!(
+			refuse(crate::schema::MsgType::VOTE_REQ.0, 1).await,
+			Some(std::io::ErrorKind::PermissionDenied),
+		);
+		// The other envelope on a non-Raft frame is refused where frames are read,
+		// which these in-memory frames skip: `decision_mode::tests` covers it.
+		node.shutdown().await.unwrap();
+
+		// Its own authority reopens it. The other is refused, leaving it usable.
+		let mut other = cfg.clone();
+		other.decision_mode = DecisionMode::Today;
+		assert!(WendelonNode::bootstrap_single_node(other).await.is_err());
+		let node = WendelonNode::bootstrap_single_node(cfg.clone())
+			.await
+			.unwrap();
+		node.shutdown().await.unwrap();
+
+		// A store with data whose marker has gone is never adopted, by either
+		// authority. The interrupted-creation state, which holds only the first
+		// control-log record, is covered where admission and the log store are tested.
+		std::fs::remove_file(dir.join("PARENT_DECISIONS")).unwrap();
+		let mut today = cfg.clone();
+		today.decision_mode = DecisionMode::Today;
+		assert!(WendelonNode::bootstrap_single_node(today).await.is_err());
+		assert!(
+			WendelonNode::bootstrap_single_node(cfg.clone())
+				.await
+				.is_err()
+		);
+		assert!(!dir.join("PARENT_DECISIONS").exists());
+	}
+
+	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+	async fn a_parent_decisions_creation_stopped_before_its_marker_resumes() {
+		use crate::consensus::decision_mode::DecisionMode;
+		let dir = tempdir("node-parent-decisions-resume");
+		crate::consensus::raft_storage::WendelonLogStore::write_parent_decisions_holder_for_test(
+			&dir,
+		)
+		.await
+		.unwrap();
+		let mut cfg = NodeBootstrapConfig::dev(7007, dir.to_path_buf(), "127.0.0.1:0".into());
+		let mut today = cfg.clone();
+		today.decision_mode = DecisionMode::Today;
+		assert!(
+			WendelonNode::bootstrap_single_node(today.clone())
+				.await
+				.is_err()
+		);
+		assert!(!dir.join("vote.wnd").exists(), "the refusal wrote nothing");
+
+		cfg.decision_mode = DecisionMode::ParentDecisions;
+		let node = WendelonNode::bootstrap_single_node(cfg.clone())
+			.await
+			.unwrap();
+		assert!(dir.join("PARENT_DECISIONS").exists());
+		assert!(node.data_server.decision_mode_refuses_service());
+		node.shutdown().await.unwrap();
+		assert!(WendelonNode::bootstrap_single_node(today).await.is_err());
+		WendelonNode::bootstrap_single_node(cfg)
+			.await
+			.unwrap()
+			.shutdown()
+			.await
+			.unwrap();
+	}
+
+	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+	async fn the_parent_decisions_mode_refuses_an_existing_store_and_a_real_profile() {
+		use crate::consensus::decision_mode::DecisionMode;
+		let dir = tempdir("node-parent-decisions-existing");
+		let cfg = NodeBootstrapConfig::dev(7005, dir.to_path_buf(), "127.0.0.1:0".into());
+		let node = WendelonNode::bootstrap_single_node(cfg.clone())
+			.await
+			.unwrap();
+		assert!(!node.data_server.decision_mode_refuses_service());
+		node.shutdown().await.unwrap();
+		let mut changed = cfg.clone();
+		changed.decision_mode = DecisionMode::ParentDecisions;
+		assert!(WendelonNode::bootstrap_single_node(changed).await.is_err());
+		WendelonNode::bootstrap_single_node(cfg)
+			.await
+			.unwrap()
+			.shutdown()
+			.await
+			.unwrap();
+
+		let dir = tempdir("node-parent-decisions-profile");
+		let mut real = NodeBootstrapConfig::dev(7006, dir.to_path_buf(), "127.0.0.1:0".into());
+		real.decision_mode = DecisionMode::ParentDecisions;
+		real.allow_dev_keys = false;
+		assert!(WendelonNode::bootstrap_single_node(real).await.is_err());
 	}
 
 	#[tokio::test]
@@ -6102,3 +6490,7 @@ mod dormant_response_tests {
 
 #[cfg(test)]
 mod startup_ownership_tests;
+
+#[cfg(test)]
+#[path = "node/parent_decisions_cluster_tests.rs"]
+mod parent_decisions_cluster_tests;

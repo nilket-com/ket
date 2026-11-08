@@ -53,6 +53,7 @@
 //!   `ForwardToLeader` hints and fatal-shutdown signals propagate.
 
 use crate::consensus::WendelonTypeConfig;
+use crate::consensus::decision_mode::DecisionMode;
 use crate::network::core::{HRFT_MAGIC, read_frame, write_frame};
 use crate::network::pool::BufPool;
 use crate::network::transport::{TransportConnection, TransportProvider};
@@ -90,11 +91,22 @@ pub struct WendelonRaftNetworkFactory {
 	/// outputs and inbound frame sections both draw from and return
 	/// to this pool.
 	pool: Arc<BufPool>,
+	/// Raft frames carry this authority's envelope version.
+	decision_mode: DecisionMode,
 }
 
 impl WendelonRaftNetworkFactory {
 	pub fn new(provider: Arc<dyn TransportProvider>, pool: Arc<BufPool>) -> Self {
-		Self { provider, pool }
+		Self {
+			provider,
+			pool,
+			decision_mode: DecisionMode::Today,
+		}
+	}
+
+	pub(crate) fn with_decision_mode(mut self, decision_mode: DecisionMode) -> Self {
+		self.decision_mode = decision_mode;
+		self
 	}
 }
 
@@ -108,6 +120,7 @@ impl RaftNetworkFactory<WendelonTypeConfig> for WendelonRaftNetworkFactory {
 			provider: self.provider.clone(),
 			pool: self.pool.clone(),
 			connection: None,
+			decision_mode: self.decision_mode,
 		}
 	}
 }
@@ -138,6 +151,7 @@ pub struct WendelonRaftNetwork {
 	/// via [`Self::ensure_connection`] whenever the cached
 	/// connection reports `is_closed()`.
 	connection: Option<Arc<dyn TransportConnection>>,
+	decision_mode: DecisionMode,
 }
 
 impl WendelonRaftNetwork {
@@ -165,7 +179,12 @@ impl WendelonRaftNetwork {
 	/// * Opens a new bidi stream on the cached connection.
 	/// * Sends one HRFT frame carrying `postcard(req)` in `meta`.
 	/// * Reads one HRFT frame in reply and decodes `meta` as `Resp`.
-	async fn call<Req, Resp>(&mut self, msg_type: MsgType, req: &Req) -> std::io::Result<Resp>
+	async fn call<Req, Resp>(
+		&mut self,
+		msg_type: MsgType,
+		expected: MsgType,
+		req: &Req,
+	) -> std::io::Result<Resp>
 	where
 		Req: Serialize,
 		Resp: DeserializeOwned,
@@ -176,7 +195,7 @@ impl WendelonRaftNetwork {
 		let body = wire::encode_into(&self.pool, req)?;
 		let header = FrameHeader {
 			magic: HRFT_MAGIC,
-			version: 1,
+			version: self.decision_mode.raft_frame_version(),
 			msg_type: msg_type.0,
 			flags: 0,
 			stream_id: 0,
@@ -195,6 +214,11 @@ impl WendelonRaftNetwork {
 		drop(body);
 
 		let resp_frame = read_frame(&mut *stream, &self.pool).await?;
+		self.decision_mode.check_raft_response(
+			resp_frame.header.version,
+			resp_frame.header.msg_type,
+			expected.0,
+		)?;
 		wire::decode::<Resp>(&resp_frame.meta)
 	}
 }
@@ -207,7 +231,11 @@ impl RaftNetwork<WendelonTypeConfig> for WendelonRaftNetwork {
 	) -> Result<AppendEntriesResponse<u32>, RPCError<u32, BasicNode, RaftError<u32>>> {
 		let target = self.target;
 		let envelope: Result<AppendEntriesResponse<u32>, RaftError<u32>> = self
-			.call(MsgType::APPEND_ENTRIES_REQ, &rpc)
+			.call(
+				MsgType::APPEND_ENTRIES_REQ,
+				MsgType::APPEND_ENTRIES_RESP,
+				&rpc,
+			)
 			.await
 			.map_err(unreachable)?;
 		envelope.map_err(|e| RPCError::RemoteError(RemoteError::new(target, e)))
@@ -223,9 +251,13 @@ impl RaftNetwork<WendelonTypeConfig> for WendelonRaftNetwork {
 	> {
 		let target = self.target;
 		let envelope: Result<InstallSnapshotResponse<u32>, RaftError<u32, InstallSnapshotError>> =
-			self.call(MsgType::INSTALL_SNAPSHOT_REQ, &rpc)
-				.await
-				.map_err(unreachable)?;
+			self.call(
+				MsgType::INSTALL_SNAPSHOT_REQ,
+				MsgType::INSTALL_SNAPSHOT_RESP,
+				&rpc,
+			)
+			.await
+			.map_err(unreachable)?;
 		envelope.map_err(|e| RPCError::RemoteError(RemoteError::new(target, e)))
 	}
 
@@ -236,7 +268,7 @@ impl RaftNetwork<WendelonTypeConfig> for WendelonRaftNetwork {
 	) -> Result<VoteResponse<u32>, RPCError<u32, BasicNode, RaftError<u32>>> {
 		let target = self.target;
 		let envelope: Result<VoteResponse<u32>, RaftError<u32>> = self
-			.call(MsgType::VOTE_REQ, &rpc)
+			.call(MsgType::VOTE_REQ, MsgType::VOTE_RESP, &rpc)
 			.await
 			.map_err(unreachable)?;
 		envelope.map_err(|e| RPCError::RemoteError(RemoteError::new(target, e)))

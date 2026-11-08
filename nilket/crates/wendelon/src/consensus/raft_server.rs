@@ -63,6 +63,8 @@ pub struct WendelonRaftInternalServer {
 	/// The node's Control retention guard. Under full retention an inbound
 	/// snapshot is refused here, before decode and before openraft sees it.
 	retention: Arc<RetentionGuard>,
+	/// A frame from a peer on another decision authority is refused before decode.
+	decision_mode: crate::consensus::decision_mode::DecisionMode,
 }
 
 impl WendelonRaftInternalServer {
@@ -73,7 +75,16 @@ impl WendelonRaftInternalServer {
 			tracker: None,
 			replacement_replay: None,
 			retention,
+			decision_mode: Default::default(),
 		}
+	}
+
+	pub(crate) fn with_decision_mode(
+		mut self,
+		decision_mode: crate::consensus::decision_mode::DecisionMode,
+	) -> Self {
+		self.decision_mode = decision_mode;
+		self
 	}
 
 	/// Builder-style tracker attachment. See [`Self::tracker`] on
@@ -154,6 +165,7 @@ impl RaftInternalServer for WendelonRaftInternalServer {
 		_context: RequestContext,
 		frame: HrftFrame,
 	) -> std::io::Result<Option<HrftFrame>> {
+		self.decision_mode.check_raft_frame(frame.header.version)?;
 		let msg_type = MsgType(frame.header.msg_type);
 		if msg_type == MsgType::INSTALL_SNAPSHOT_REQ
 			&& self.retention.refuses(RetentionViolation::SnapshotRequest)
@@ -224,7 +236,7 @@ impl RaftInternalServer for WendelonRaftInternalServer {
 
 		let header = FrameHeader {
 			magic: HRFT_MAGIC,
-			version: 1,
+			version: self.decision_mode.raft_frame_version(),
 			msg_type: resp_type.0,
 			flags: 0,
 			stream_id: frame.header.stream_id,

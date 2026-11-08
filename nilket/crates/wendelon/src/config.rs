@@ -1004,6 +1004,8 @@ impl RawConfig {
 			#[cfg(test)]
 			startup_probe: None,
 			#[cfg(test)]
+			open_decision_writes_for_test: false,
+			#[cfg(test)]
 			startup_fault: None,
 			#[cfg(feature = "test-support")]
 			slab_file_ops: None,
@@ -1037,6 +1039,9 @@ impl RawConfig {
 			tiering: crate::storage::SweeperConfig::default(),
 			lsm_compaction_paused: self.storage.lsm_compaction_paused,
 			control_retention,
+			decision_mode: Default::default(),
+			decision_signing_secret: None,
+			trusted_decision_signers: BTreeMap::new(),
 			mvcc_retention_paused: self.storage.mvcc_retention_paused,
 			rehydration: crate::storage::manager::RehydrationPolicy::default(),
 			l2_column_fetch,

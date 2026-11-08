@@ -809,6 +809,24 @@ impl MsgType {
 	pub const MAINTENANCE_REPORT_RESP: Self = Self(0x5B);
 	pub const MAINTENANCE_REQUEUE_REQ: Self = Self(0x5C);
 	pub const MAINTENANCE_REQUEUE_RESP: Self = Self(0x5D);
+	/// ADR 0699 S3a: a data node asks the leader to propose a parent decision.
+	pub const DECISION_PROPOSE_REQ: Self = Self(0x5E);
+	pub const DECISION_PROPOSE_RESP: Self = Self(0x5F);
+	/// ADR 0699 S3b: coordinator to a child's holder, and holder to its plan.
+	pub const TABLE_CHILD_WRITE_REQ: Self = Self(0x60);
+	pub const TABLE_CHILD_WRITE_RESP: Self = Self(0x61);
+	pub const TABLE_CHILD_REPLICATE_REQ: Self = Self(0x62);
+	pub const TABLE_CHILD_REPLICATE_RESP: Self = Self(0x63);
+	/// ADR 0699 S3c: a node's authoritative read of a parent's recorded decision.
+	pub const DECISION_LOOKUP_REQ: Self = Self(0x64);
+	pub const DECISION_LOOKUP_RESP: Self = Self(0x65);
+	// ADR 0699 S4: a reader's linearizable cut, node-only, from the leader.
+	pub const DECISION_CUT_REQ: Self = Self(0x66);
+	pub const DECISION_CUT_RESP: Self = Self(0x67);
+	// ADR 0699 S4: the verified transfer of an Accepted child, plan member to
+	// plan member.
+	pub const TABLE_CHILD_FETCH_REQ: Self = Self(0x68);
+	pub const TABLE_CHILD_FETCH_RESP: Self = Self(0x69);
 
 	// raft internal (openraft RaftNetwork)
 	pub const APPEND_ENTRIES_REQ: Self = Self(0x20);
@@ -910,6 +928,18 @@ impl MsgType {
 		Self::MAINTENANCE_REPORT_RESP,
 		Self::MAINTENANCE_REQUEUE_REQ,
 		Self::MAINTENANCE_REQUEUE_RESP,
+		Self::DECISION_PROPOSE_REQ,
+		Self::DECISION_PROPOSE_RESP,
+		Self::TABLE_CHILD_WRITE_REQ,
+		Self::TABLE_CHILD_WRITE_RESP,
+		Self::TABLE_CHILD_REPLICATE_REQ,
+		Self::TABLE_CHILD_REPLICATE_RESP,
+		Self::DECISION_LOOKUP_REQ,
+		Self::DECISION_LOOKUP_RESP,
+		Self::DECISION_CUT_REQ,
+		Self::DECISION_CUT_RESP,
+		Self::TABLE_CHILD_FETCH_REQ,
+		Self::TABLE_CHILD_FETCH_RESP,
 		Self::APPEND_ENTRIES_REQ,
 		Self::APPEND_ENTRIES_RESP,
 		Self::INSTALL_SNAPSHOT_REQ,
@@ -2356,12 +2386,16 @@ pub const PRE_VERSIONING_FORMAT: u8 = 0;
 /// keys tier pointers by owner-qualified slab and adds the incarnation
 /// registry; every earlier version is refused, not upconverted.
 pub const SNAPSHOT_FORMAT_VERSION: u8 = 8;
+/// Snapshot format of a `ParentDecisions` store; see `consensus::decision_mode`.
+pub const SNAPSHOT_FORMAT_VERSION_PARENT_DECISIONS: u8 = 13;
 
 /// Shape of the Control Ring WAL record bodies this build writes, including the
 /// `postcard(Entry<..>)` payload of a log record. ADR 0697 version 6 carries
 /// owner-qualified slab commands and incarnation registration; every earlier
 /// version is refused, not upconverted.
 pub const WAL_FORMAT_VERSION: u8 = 8;
+/// Control-log format of a `ParentDecisions` store; see `consensus::decision_mode`.
+pub const WAL_FORMAT_VERSION_PARENT_DECISIONS: u8 = 13;
 
 // Static assertions to ensure all our size calculations remain exactly correct
 const _: () = assert!(std::mem::size_of::<HybridTimestamp>() == 16);

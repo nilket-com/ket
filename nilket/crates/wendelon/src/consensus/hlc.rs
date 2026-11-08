@@ -44,6 +44,17 @@ impl HybridLogicalClockDriver {
 		})
 	}
 
+	/// Test-only: forget every timestamp issued so far, as a node whose clock
+	/// is behind a version another clock wrote.
+	#[cfg(test)]
+	pub(crate) fn rewind_for_test(&self) {
+		*self.last.lock().expect("hlc mutex poisoned") = HybridTimestamp {
+			physical_ms: 0,
+			logical: 0,
+			node_id: 0,
+		};
+	}
+
 	pub fn merge(&self, remote: HybridTimestamp) -> HybridTimestamp {
 		let now_hlc = HybridTimestamp {
 			physical_ms: self.clock.now_ms(),

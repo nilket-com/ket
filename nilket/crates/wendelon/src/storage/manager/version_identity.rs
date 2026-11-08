@@ -75,6 +75,74 @@ impl SlabManager {
 		}
 	}
 
+	/// ADR 0699 S4: from now on, keep every stored version through rewrites.
+	/// Set once at startup in ParentDecisions and never cleared: no rewrite may
+	/// drop a stored version until S5's certified survivor rule exists.
+	/// Lossless moves continue.
+	pub(crate) fn contain_version_reclamation(&self) {
+		self.versions_contained
+			.store(true, std::sync::atomic::Ordering::Release);
+	}
+
+	pub(crate) fn versions_contained(&self) -> bool {
+		self.versions_contained
+			.load(std::sync::atomic::Ordering::Acquire)
+	}
+
+	/// Under containment no record of a rewrite is reclaimed, so a tombstone,
+	/// retention or prune rewrite drops nothing.
+	pub(super) fn keep_contained_versions(
+		&self,
+		records: &mut [super::compaction::CompactionRecord],
+	) {
+		if self.versions_contained() {
+			for record in records.iter_mut() {
+				record.reclaim = false;
+			}
+		}
+	}
+
+	/// ADR 0699 S4: every indexed location of the version `(tenant, key, hlc)`,
+	/// read for a reader that selected the version itself. Its routing
+	/// locality is the reader's to derive from the version's own bytes.
+	pub(crate) fn version_locations(
+		&self,
+		tenant_id: TenantId,
+		key_identity: Identity,
+		hlc: HybridTimestamp,
+	) -> std::io::Result<Vec<RecordLocation>> {
+		let locations = self.same_hlc_locations(tenant_id, key_identity, hlc)?;
+		let slabs: Vec<_> = locations.iter().map(|location| location.slab_id).collect();
+		self.require_tier_read_scope(&slabs)?;
+		Ok(locations)
+	}
+
+	/// Test-only: the key's current routing locality, one per key.
+	#[cfg(test)]
+	pub(crate) fn routing_locality_for_test(
+		&self,
+		tenant_id: TenantId,
+		key_identity: Identity,
+	) -> Option<Locality> {
+		self.key_localities
+			.get(&(tenant_id, key_identity))
+			.map(|entry| *entry.value())
+	}
+
+	/// Test-only: drop every indexed location of one version, as a store that
+	/// lost it.
+	#[cfg(test)]
+	pub(crate) fn forget_version_for_test(
+		&self,
+		tenant_id: TenantId,
+		key_identity: Identity,
+		hlc: HybridTimestamp,
+	) {
+		if let Some(mut chain) = self.key_index.get_mut(&(tenant_id, key_identity)) {
+			chain.retain(|location| location.hlc != hlc);
+		}
+	}
+
 	/// Every indexed location of `(tenant, key)` at exactly `hlc`.
 	pub(super) fn same_hlc_locations(
 		&self,
@@ -681,5 +749,33 @@ impl SlabManager {
 		}
 		publication.complete();
 		Ok(MigrationIngestOutcome::Inserted(location))
+	}
+}
+
+impl SlabManager {
+	/// ADR 0699 S3b: every stored copy of the version `(tenant, key, hlc)`, as
+	/// the one-row batch its frame holds at its record index. Read through the
+	/// same location read the conflict check uses; a frame that does not decode
+	/// or lacks the row is an error, never an absent copy.
+	pub(crate) async fn stored_rows_at_version(
+		&self,
+		tenant_id: TenantId,
+		key_identity: Identity,
+		hlc: HybridTimestamp,
+	) -> std::io::Result<Vec<RecordBatch>> {
+		let mut rows = Vec::new();
+		for location in self.same_hlc_locations(tenant_id, key_identity, hlc)? {
+			let stored = self.read(location).await?;
+			let batch = decode_record_batch(&stored)?;
+			let row = location.record_row_index.get() as usize;
+			if row >= batch.num_rows() {
+				return Err(Error::new(
+					ErrorKind::InvalidData,
+					"a stored version's record index is outside its frame",
+				));
+			}
+			rows.push(batch.slice(row, 1));
+		}
+		Ok(rows)
 	}
 }

@@ -11,6 +11,7 @@ use super::{
 	resolve_recovered_committed,
 };
 use crate::consensus::WendelonTypeConfig;
+use crate::consensus::decision_mode::DecisionMode;
 use crate::storage::io_uring::AlignedBuf;
 use crate::storage::{AsyncFileOps, BlockingFileOps, DirectoryEntry, FileHandle, OpenFlags};
 use async_trait::async_trait;
@@ -34,9 +35,10 @@ pub(crate) struct ControlLogScan {
 pub(crate) async fn scan_control_log_read_only(data_dir: &Path) -> std::io::Result<ControlLogScan> {
 	let ops = ReadOnlyFileOps;
 	let (wal, _, snapshot_path) = control_artifact_paths(data_dir);
-	let snapshot = load_snapshot_artifact(&ops, &snapshot_path).await?;
+	// Offline tools read the today authority; a ParentDecisions store is refused.
+	let snapshot = load_snapshot_artifact(&ops, &snapshot_path, DecisionMode::Today).await?;
 	let snapshot_boundary = snapshot.as_ref().and_then(|loaded| loaded.last_included);
-	let replay = replay_wal(&ops, &wal, snapshot.as_ref()).await?;
+	let replay = replay_wal(&ops, &wal, snapshot.as_ref(), DecisionMode::Today).await?;
 	check_retained_log_contiguous(
 		&wal,
 		snapshot_boundary,

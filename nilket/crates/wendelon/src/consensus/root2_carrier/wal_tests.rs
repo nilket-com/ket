@@ -49,7 +49,14 @@ pub(super) fn record(payload: &[u8], version: u8) -> std::io::Result<Entry<Wende
 		log_index: 11,
 		term: 3,
 	};
-	decode_log_record(Path::new("carrier-test.wnd"), 0, &header, &body, fixed_size)
+	decode_log_record(
+		crate::consensus::decision_mode::DecisionMode::Today,
+		Path::new("carrier-test.wnd"),
+		0,
+		&header,
+		&body,
+		fixed_size,
+	)
 }
 /// The response tags that predate ADR 0697 keep their wire positions; `Refused`
 /// is appended after them.
@@ -154,6 +161,7 @@ fn carrier_current_v8_corpus_matches_independent_manifest_and_writer_kind() {
 			assert_eq!(fixed.kind, LogEntryKind::APPEND);
 			assert_eq!(fixed.epoch, 0);
 			let decoded = decode_log_record(
+				crate::consensus::decision_mode::DecisionMode::Today,
 				Path::new("carrier-test.wnd"),
 				0,
 				&header,

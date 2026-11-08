@@ -8392,6 +8392,50 @@ async fn l1_retention_pruning_pair_gc_drops_data_and_row_tombstone() {
 	assert!(mgr.lookup_as_of(tenant(), key, hlc(10)).unwrap().is_none());
 }
 
+/// ADR 0699 S4: under containment a retention rewrite drops no stored version.
+#[tokio::test]
+async fn contained_versions_survive_a_retention_prune() {
+	let (_mgr_dir, mgr) = fresh_manager().await;
+	mgr.contain_version_reclamation();
+	let key = id(0x4703);
+	let loc = Locality::new(49);
+	let data_frame = encode_test_multirow_storage_frame(&[(key, loc, hlc(10), 100)]);
+	let data_entries = storage_multirow_index_entries_from_frame(&data_frame)
+		.unwrap()
+		.expect("data entry");
+	mgr.append_durable_multirow_with_locality(tenant(), &data_frame, &data_entries)
+		.await
+		.unwrap();
+	let (tombstone_frame, tombstone_entries) =
+		encode_test_row_tombstone_marker_frame(TableObjectId::new([0x49; 16]), key, loc, hlc(20));
+	mgr.append_durable_multirow_with_locality(tenant(), &tombstone_frame, &tombstone_entries)
+		.await
+		.unwrap();
+
+	force_seal_active(&mgr).await;
+	mgr.prune_versions_older_than(
+		hlc(30),
+		&empty_compaction_catalogs().0,
+		&empty_compaction_catalogs().1,
+		1,
+	)
+	.await
+	.unwrap();
+
+	assert!(
+		!mgr.lookup_as_of(tenant(), key, hlc(10))
+			.unwrap()
+			.expect("the data version is kept")
+			.is_tombstone
+	);
+	assert!(
+		mgr.lookup_as_of(tenant(), key, hlc(20))
+			.unwrap()
+			.expect("the tombstone is kept")
+			.is_tombstone
+	);
+}
+
 #[tokio::test]
 async fn l1_retention_pruning_keeps_pair_until_floor_passes_tombstone() {
 	let (_mgr_dir, mgr) = fresh_manager().await;
@@ -20108,6 +20152,573 @@ async fn tier_reads_follow_a_published_retention_rewrite() {
 			.is_none(),
 		"premise: the rewrite pruned x@10"
 	);
+}
+
+/// ADR 0699 S5b: the certified local rewrite reclaims exactly what a plan
+/// decided from one coherent read of the facts plus content evidence, and only
+/// under the generation it was decided in. The winner, an unlisted row and a
+/// debt version whose content does not match its record all stay; debt
+/// retires only once no copy is left.
+#[tokio::test]
+async fn certified_cleanup_reclaims_only_planned_debt_under_its_generation() {
+	use crate::storage::index::certified_base::{
+		Activation, BaseEntry, StagedCandidate, chunk_sums,
+	};
+	use crate::storage::index::parent_intents::{OwnedVersion, ParentIntent, ParentIntentState};
+	use crate::storage::manager::certified_cleanup::{
+		ContentEvidence, ReclamationPlan, StoredCopy,
+	};
+	let (_dir, mgr) = fresh_manager().await;
+	mgr.contain_version_reclamation();
+	let index = mgr.persistent_index().expect("a persistent index");
+	let table = TableObjectId::new([0x77; 16]);
+	let (obsolete, foreign, mismatched) = (id(0x7701), id(0x7702), id(0x7703));
+	let version = |key: Identity, at: u64, digest: u8| OwnedVersion {
+		table,
+		key_identity: *key.as_bytes(),
+		hlc: hlc(at),
+		row_digest: [digest; 32],
+	};
+	// An erased parent owned the obsolete version and a mismatched one; its
+	// intent is recorded before anything is appended, as in the real path.
+	let (old, odd) = (version(obsolete, 10, 0x10), version(mismatched, 11, 0x11));
+	index
+		.begin_parent_intent(ParentIntent {
+			tenant: tenant(),
+			rsv: 5,
+			ordinal: 0,
+			claim_digest: [5; 32],
+			range_start: 0,
+			range_end: u64::MAX,
+			content: [9; 32],
+			manifest: vec![old, odd],
+			state: ParentIntentState::Intent,
+		})
+		.await
+		.unwrap()
+		.unwrap();
+	for (key, at, value) in [
+		(obsolete, 10, 1),
+		(obsolete, 20, 2),
+		(foreign, 12, 3),
+		(mismatched, 11, 4),
+	] {
+		let frame = encode_test_append_only_storage_frame(
+			table,
+			&[(key, Locality::new(at), hlc(at), value, false)],
+		);
+		let entries = storage_multirow_index_entries_from_frame(&frame)
+			.unwrap()
+			.expect("entries");
+		mgr.append_durable_multirow_with_locality(tenant(), &frame, &entries)
+			.await
+			.unwrap();
+	}
+	let slab_id = force_seal_active(&mgr).await;
+	// Generation 1 certifies the obsolete key's version at 20; the erased
+	// parent's versions become debt.
+	let winner = BaseEntry {
+		tenant: tenant(),
+		table,
+		key_identity: *obsolete.as_bytes(),
+		hlc: hlc(20),
+		row_digest: [0x20; 32],
+		tombstone: false,
+		position: 0,
+	};
+	let activate = |gid: u64| {
+		let index = index.clone();
+		async move {
+			let candidate = StagedCandidate {
+				gid,
+				target_digest: [gid as u8; 32],
+				predecessor_gid: gid - 1,
+				chunks: chunk_sums(&[winner]),
+			};
+			index
+				.stage_base(candidate.clone(), vec![winner])
+				.await
+				.unwrap()
+				.unwrap();
+			index
+				.activate_base(Activation {
+					gid,
+					target_digest: candidate.target_digest,
+					predecessor_gid: gid - 1,
+					chunks: candidate.chunks,
+					t: 8,
+				})
+				.await
+				.unwrap()
+				.unwrap();
+		}
+	};
+	activate(1).await;
+	let decide = || async {
+		let job = mgr
+			.claim_for_certified_cleanup(slab_id)
+			.await
+			.unwrap()
+			.expect("the sealed slab is claimable");
+		let facts = index.version_facts(job.versions()).await.unwrap();
+		let mut evidence = Vec::new();
+		for at in 0..facts.candidates().len() {
+			let Some((key, debt)) = &facts.get(at).debt else {
+				continue;
+			};
+			// The obsolete version's copy matches its record; the mismatched
+			// one's stored content does not.
+			let stored = if key.key_identity == *obsolete.as_bytes() {
+				debt.row_digest
+			} else {
+				[0xEE; 32]
+			};
+			evidence.extend(ContentEvidence::check(
+				*key,
+				debt,
+				false,
+				&[StoredCopy {
+					tombstone: false,
+					row_digest: Some(stored),
+				}],
+			));
+		}
+		let plan = ReclamationPlan::decide(&job, &facts, &evidence).unwrap();
+		(job, plan)
+	};
+	let (job, plan) = decide().await;
+	assert_eq!(plan.reclaimed(), 1, "only the obsolete version");
+	// A newer activation between the decision and the rewrite: refused, and
+	// nothing is reclaimed.
+	activate(2).await;
+	let schemas = TableSchemaCatalog::default();
+	let indexes = SecondaryIndexCatalog::default();
+	assert_eq!(
+		mgr.finish_certified_cleanup(job, &plan, &schemas, &indexes)
+			.await
+			.unwrap(),
+		None
+	);
+	assert!(
+		mgr.lookup_as_of(tenant(), obsolete, hlc(10))
+			.unwrap()
+			.is_some()
+	);
+	// Decided again under generation 2: exactly the obsolete version goes.
+	let (job, plan) = decide().await;
+	assert_eq!(
+		mgr.finish_certified_cleanup(job, &plan, &schemas, &indexes)
+			.await
+			.unwrap(),
+		Some(1)
+	);
+	assert!(
+		mgr.lookup_as_of(tenant(), obsolete, hlc(10))
+			.unwrap()
+			.is_none(),
+		"the obsolete version is reclaimed"
+	);
+	assert_eq!(
+		mgr.lookup(tenant(), obsolete)
+			.unwrap()
+			.map(|location| location.hlc),
+		Some(hlc(20)),
+		"the certified winner stays"
+	);
+	assert!(
+		mgr.lookup(tenant(), foreign).unwrap().is_some(),
+		"an unlisted row stays"
+	);
+	assert!(
+		mgr.lookup(tenant(), mismatched).unwrap().is_some(),
+		"debt whose content does not match stays"
+	);
+	// Debt retires once no copy is left, and not before.
+	let debt = index.debt_page(None, 10).await.unwrap();
+	let find = |key: Identity| {
+		debt.iter()
+			.find(|(entry, _)| entry.key_identity == *key.as_bytes())
+			.cloned()
+			.unwrap()
+	};
+	let (old_key, old_debt) = find(obsolete);
+	let (odd_key, odd_debt) = find(mismatched);
+	assert!(index.retire_debt(old_key, old_debt).await.unwrap());
+	assert!(
+		!index.retire_debt(odd_key, odd_debt).await.unwrap(),
+		"a copy remains"
+	);
+}
+
+/// ADR 0699 S5b: a store with one sealed mixed slab under certified
+/// cleanup: an obsolete version (debt), its certified winner, a version owned
+/// by a retained parent, an unlisted row and debt whose stored content does
+/// not match. Generation 1 is active.
+struct CleanupFixture {
+	dir: crate::test_support::TestDir,
+	io: crate::storage::io_uring::IoRingHandle,
+	crypto: Arc<CryptoManager>,
+	slab_id: SlabId,
+	keys: [Identity; 5],
+}
+
+const CLEANUP_TABLE: TableObjectId = TableObjectId::new([0x78; 16]);
+
+fn cleanup_config(
+	dir: &Path,
+	io: &crate::storage::io_uring::IoRingHandle,
+	crypto: &Arc<CryptoManager>,
+) -> SlabManagerConfig {
+	SlabManagerConfig {
+		io: io.clone(),
+		crypto: crypto.clone(),
+		..gc_owned_test_config(dir)
+	}
+}
+
+async fn cleanup_fixture(tag: &str) -> (CleanupFixture, Arc<SlabManager>) {
+	use crate::storage::index::certified_base::{
+		Activation, BaseEntry, StagedCandidate, chunk_sums,
+	};
+	use crate::storage::index::parent_intents::{OwnedVersion, ParentIntent, ParentIntentState};
+	let dir = fresh_dir(tag);
+	let io = spawn_io_thread(64).unwrap();
+	let crypto = test_crypto();
+	let mgr = SlabManager::initialize_new_store(cleanup_config(&dir, &io, &crypto))
+		.await
+		.unwrap();
+	mgr.contain_version_reclamation();
+	let index = mgr.persistent_index().expect("a persistent index");
+	// obsolete, winner (same key), owned, unlisted, mismatched
+	let keys = [id(0x7801), id(0x7801), id(0x7802), id(0x7803), id(0x7804)];
+	let version = |key: Identity, at: u64, digest: u8| OwnedVersion {
+		table: CLEANUP_TABLE,
+		key_identity: *key.as_bytes(),
+		hlc: hlc(at),
+		row_digest: [digest; 32],
+	};
+	let intent = |rsv: u64, manifest: Vec<OwnedVersion>| ParentIntent {
+		tenant: tenant(),
+		rsv,
+		ordinal: 0,
+		claim_digest: [rsv as u8; 32],
+		range_start: 0,
+		range_end: u64::MAX,
+		content: [9; 32],
+		manifest,
+		state: ParentIntentState::Intent,
+	};
+	// rsv 5 (erased by T = 8) owned the obsolete and the mismatched versions;
+	// rsv 9 (retained) owns the protected one.
+	index
+		.begin_parent_intent(intent(
+			5,
+			vec![version(keys[0], 10, 0x10), version(keys[4], 11, 0x11)],
+		))
+		.await
+		.unwrap()
+		.unwrap();
+	index
+		.begin_parent_intent(intent(9, vec![version(keys[2], 15, 0x15)]))
+		.await
+		.unwrap()
+		.unwrap();
+	for (key, at, value) in [
+		(keys[0], 10, 1),
+		(keys[1], 20, 2),
+		(keys[2], 15, 3),
+		(keys[3], 12, 4),
+		(keys[4], 11, 5),
+	] {
+		let frame = encode_test_append_only_storage_frame(
+			CLEANUP_TABLE,
+			&[(key, Locality::new(at), hlc(at), value, false)],
+		);
+		let entries = storage_multirow_index_entries_from_frame(&frame)
+			.unwrap()
+			.expect("entries");
+		mgr.append_durable_multirow_with_locality(tenant(), &frame, &entries)
+			.await
+			.unwrap();
+	}
+	let slab_id = force_seal_active(&mgr).await;
+	let winner = BaseEntry {
+		tenant: tenant(),
+		table: CLEANUP_TABLE,
+		key_identity: *keys[1].as_bytes(),
+		hlc: hlc(20),
+		row_digest: [0x20; 32],
+		tombstone: false,
+		position: 0,
+	};
+	let candidate = StagedCandidate {
+		gid: 1,
+		target_digest: [1; 32],
+		predecessor_gid: 0,
+		chunks: chunk_sums(&[winner]),
+	};
+	index
+		.stage_base(candidate.clone(), vec![winner])
+		.await
+		.unwrap()
+		.unwrap();
+	index
+		.activate_base(Activation {
+			gid: 1,
+			target_digest: candidate.target_digest,
+			predecessor_gid: 0,
+			chunks: candidate.chunks,
+			t: 8,
+		})
+		.await
+		.unwrap()
+		.unwrap();
+	(
+		CleanupFixture {
+			dir,
+			io,
+			crypto,
+			slab_id,
+			keys,
+		},
+		mgr,
+	)
+}
+
+/// A plan for the fixture's slab: the obsolete version's copy matches its
+/// debt; the mismatched one's does not.
+async fn cleanup_plan(
+	mgr: &Arc<SlabManager>,
+	slab_id: SlabId,
+	obsolete: Identity,
+) -> (
+	crate::storage::manager::certified_cleanup::CleanupJob,
+	crate::storage::manager::certified_cleanup::ReclamationPlan,
+) {
+	use crate::storage::manager::certified_cleanup::{
+		ContentEvidence, ReclamationPlan, StoredCopy,
+	};
+	let index = mgr.persistent_index().unwrap();
+	let job = mgr
+		.claim_for_certified_cleanup(slab_id)
+		.await
+		.unwrap()
+		.expect("the sealed slab is claimable");
+	let facts = index.version_facts(job.versions()).await.unwrap();
+	let mut evidence = Vec::new();
+	for at in 0..facts.candidates().len() {
+		let Some((key, debt)) = &facts.get(at).debt else {
+			continue;
+		};
+		let stored = if key.key_identity == *obsolete.as_bytes() {
+			debt.row_digest
+		} else {
+			[0xEE; 32]
+		};
+		evidence.extend(ContentEvidence::check(
+			*key,
+			debt,
+			false,
+			&[StoredCopy {
+				tombstone: false,
+				row_digest: Some(stored),
+			}],
+		));
+	}
+	let plan = ReclamationPlan::decide(&job, &facts, &evidence).unwrap();
+	(job, plan)
+}
+
+impl CleanupFixture {
+	/// Every protected row is stored; the obsolete version is or is not.
+	fn assert_rows(&self, mgr: &SlabManager, obsolete_present: bool, what: &str) {
+		let [obsolete, winner, owned, unlisted, mismatched] = self.keys;
+		assert_eq!(
+			mgr.lookup_as_of(tenant(), obsolete, hlc(10))
+				.unwrap()
+				.is_some(),
+			obsolete_present,
+			"{what}: the obsolete version"
+		);
+		assert_eq!(
+			mgr.lookup(tenant(), winner)
+				.unwrap()
+				.map(|location| location.hlc),
+			Some(hlc(20)),
+			"{what}: the certified winner"
+		);
+		for (key, name) in [
+			(owned, "the retained parent's version"),
+			(unlisted, "the unlisted row"),
+			(mismatched, "the mismatched debt"),
+		] {
+			assert!(
+				mgr.lookup(tenant(), key).unwrap().is_some(),
+				"{what}: {name}"
+			);
+		}
+	}
+
+	async fn reopen(&self) -> Arc<SlabManager> {
+		let mgr = SlabManager::open(cleanup_config(&self.dir, &self.io, &self.crypto))
+			.await
+			.unwrap();
+		mgr.contain_version_reclamation();
+		mgr
+	}
+}
+
+/// ADR 0699 S5b, crash boundary before publication: a certified cleanup
+/// that wrote and synced its replacement, held before it publishes the
+/// index, then crashed. The reopened store keeps every row (the obsolete one
+/// included: nothing was installed), and a fresh certified cleanup reclaims
+/// exactly the obsolete version, keeping the winner, the retained parent's
+/// version, the unlisted row and the mismatched debt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_certified_cleanup_crashed_before_publication_reopens_whole() {
+	let (fixture, mgr) = cleanup_fixture("s5b-crash-before-publication").await;
+	let (job, plan) = cleanup_plan(&mgr, fixture.slab_id, fixture.keys[0]).await;
+	assert_eq!(plan.reclaimed(), 1);
+	let hold = lsm_job_hold();
+	*mgr.continuity_test_holds
+		.maintenance_in_intent_scope_hold
+		.lock()
+		.unwrap() = Some(hold.clone());
+	let rewrite = {
+		let mgr = mgr.clone();
+		tokio::spawn(async move {
+			mgr.finish_certified_cleanup(
+				job,
+				&plan,
+				&TableSchemaCatalog::default(),
+				&SecondaryIndexCatalog::default(),
+			)
+			.await
+		})
+	};
+	lsm_job_reached("the replacement, before publication", &hold.0).await;
+	// The crash: the rewrite never resumes and the process's state is gone.
+	rewrite.abort();
+	let _ = rewrite.await;
+	drop(mgr);
+	let reopened = fixture.reopen().await;
+	fixture.assert_rows(&reopened, true, "reopened before publication");
+	let (job, plan) = cleanup_plan(&reopened, fixture.slab_id, fixture.keys[0]).await;
+	assert_eq!(
+		reopened
+			.finish_certified_cleanup(
+				job,
+				&plan,
+				&TableSchemaCatalog::default(),
+				&SecondaryIndexCatalog::default()
+			)
+			.await
+			.unwrap(),
+		Some(1)
+	);
+	fixture.assert_rows(&reopened, false, "cleaned after the reopen");
+}
+
+/// ADR 0699 S5b, crash boundary after install: the certified cleanup
+/// published and installed its replacement, then the process crashed before
+/// the source's disposal. The reopened store serves the replacement: the
+/// obsolete version is gone and every protected row is stored.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_certified_cleanup_crashed_after_install_reopens_cleaned() {
+	let (fixture, mgr) = cleanup_fixture("s5b-crash-after-install").await;
+	fixture.assert_rows(&mgr, true, "before the cleanup");
+	let (job, plan) = cleanup_plan(&mgr, fixture.slab_id, fixture.keys[0]).await;
+	assert_eq!(
+		mgr.finish_certified_cleanup(
+			job,
+			&plan,
+			&TableSchemaCatalog::default(),
+			&SecondaryIndexCatalog::default()
+		)
+		.await
+		.unwrap(),
+		Some(1)
+	);
+	fixture.assert_rows(&mgr, false, "installed");
+	// The crash, before any disposal of the source.
+	drop(mgr);
+	let reopened = fixture.reopen().await;
+	fixture.assert_rows(&reopened, false, "reopened after install");
+}
+
+/// ADR 0699: under containment (ParentDecisions) neither tiered rewrite path
+/// prepares a rewrite or retires a slab, whatever drops or retention would
+/// otherwise remove. The uncontained twin is the premise: the same slab is
+/// retired by the drop rewrite.
+#[tokio::test]
+async fn contained_tiered_rewrites_drop_and_retire_nothing() {
+	let dropped = append_only_retention_descriptor(TableObjectId::new([0x66; 16]));
+	let mut schemas = TableSchemaCatalog::default();
+	schemas.upsert(tenant(), dropped.clone()).unwrap();
+	let lifecycle = TableLifecycleCatalog::default();
+	for contained in [false, true] {
+		let tag = if contained {
+			"contained"
+		} else {
+			"uncontained"
+		};
+		let (_dirs, mgr, l2) = fresh_manager_with_l2(&format!("tier-containment-{tag}")).await;
+		if contained {
+			mgr.contain_version_reclamation();
+		}
+		let frame = encode_test_append_only_storage_frame(
+			dropped.table_object_id,
+			&[
+				(id(0x6611), Locality::new(10), hlc(10), 1, false),
+				(id(0x6612), Locality::new(11), hlc(11), 2, false),
+			],
+		);
+		let entries = storage_multirow_index_entries_from_frame(&frame)
+			.unwrap()
+			.expect("entries");
+		mgr.append_durable_multirow_with_locality(tenant(), &frame, &entries)
+			.await
+			.unwrap();
+		let pointer = tier_kv_slab(&mgr, &l2, &format!("tier/containment-{tag}.wnd")).await;
+		let drop = mgr
+			.prepare_tiered_table_drop_rewrite(&pointer, tenant(), &dropped, &schemas)
+			.await
+			.unwrap();
+		let retention = mgr
+			.prepare_tiered_table_retention_rewrite(
+				&pointer,
+				MvccRetentionPolicy::FixedWindow(Duration::from_millis(1)),
+				&lifecycle,
+				&schemas,
+				u64::MAX / 2,
+			)
+			.await
+			.unwrap();
+		if contained {
+			assert!(drop.is_none(), "a contained drop rewrite drops nothing");
+			assert!(
+				!matches!(
+					retention,
+					Some(
+						PreparedTieredRetentionRewrite::Rewrite { .. }
+							| PreparedTieredRetentionRewrite::Retire { .. }
+					)
+				),
+				"a contained retention rewrite drops nothing"
+			);
+			for key in [id(0x6611), id(0x6612)] {
+				assert!(
+					mgr.lookup(tenant(), key).unwrap().is_some(),
+					"{key:?} stays"
+				);
+			}
+		} else {
+			assert!(
+				matches!(drop, Some(PreparedTieredTableDropRewrite::Retire { .. })),
+				"premise: uncontained, the drop rewrite retires the slab"
+			);
+		}
+	}
 }
 
 #[tokio::test]

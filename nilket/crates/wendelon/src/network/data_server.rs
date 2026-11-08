@@ -205,8 +205,18 @@ use scan_accounting::{
 	DecodedRecordCache, PostPackingScanPhaseTrace,
 	QUERY_REQUEST_FLAG_SAMPLED_POST_PACKING_PHASE_TRACE, ScanDecodeAudit, ScanPhase,
 };
+mod certification;
+// ADR 0699 S5b: a store's certified cleanup.
+mod cleanup;
+mod deletes;
+pub(crate) mod reader;
+mod repair;
 mod table_query;
-use table_query::{QueryProjectedExecution, RowGroupFetchAuditCounters};
+use table_query::{
+	QueryProjectedExecution, RowGroupFetchAuditCounters, TableQueryResponseStreamWriter,
+};
+pub(crate) mod child_writes;
+mod coordinator;
 mod observation;
 mod write_replication;
 #[cfg(test)]
@@ -840,6 +850,9 @@ pub struct WendelonDataServer {
 	/// calls [`Self::with_lease_gate`] to flip this on after the
 	/// lease manager has registered its first grant.
 	lease_gate_enabled: bool,
+	decision_mode: crate::consensus::decision_mode::DecisionMode,
+	/// ADR 0699 S3b: parent locks and this store's decision signer.
+	decisions: child_writes::DecisionPeer,
 	/// Local lease signing key plus trusted issuer verifier set.
 	lease_authority: Arc<LeaseAuthority>,
 	/// Transient dedup for concurrent migration pulls (Plan 019).
@@ -1220,6 +1233,8 @@ impl Clone for WendelonDataServer {
 			tracker: self.tracker.clone(),
 			leases: self.leases.clone(),
 			lease_gate_enabled: self.lease_gate_enabled,
+			decision_mode: self.decision_mode,
+			decisions: self.decisions.clone(),
 			lease_authority: self.lease_authority.clone(),
 			migration_registry: self.migration_registry.clone(),
 			table_query_cancellation: self.table_query_cancellation.clone(),
@@ -2270,6 +2285,8 @@ impl WendelonDataServer {
 			tracker: None,
 			leases: Arc::new(RwLock::new(Vec::new())),
 			lease_gate_enabled: false,
+			decision_mode: Default::default(),
+			decisions: Default::default(),
 			lease_authority: Arc::new(LeaseAuthority::dev_single_node(local_node)),
 			migration_registry: Arc::new(MigrationRegistry::new()),
 			table_query_cancellation: Arc::new(ActiveTableQueryRegistry::default()),
@@ -2342,6 +2359,7 @@ impl WendelonDataServer {
 	/// Enable the per-range lease gate (plan 018). Must be toggled
 	/// after the lease manager has filed its first grant — turning
 	/// it on with an empty cache rejects every write.
+
 	pub fn with_lease_gate(mut self, enabled: bool) -> Self {
 		self.lease_gate_enabled = enabled;
 		self
@@ -3230,9 +3248,11 @@ impl WendelonDataServer {
 			WendelonResponse::Refused(refusal) => Err(Error::other(format!(
 				"unexpected slab refusal for a non-slab command: {refusal:?}"
 			))),
-			WendelonResponse::Op(refusal) => Err(Error::other(format!(
-				"unexpected slab refusal for a non-slab command: {refusal:?}"
-			))),
+			unexpected @ (WendelonResponse::Op(_) | WendelonResponse::Decision(_)) => {
+				Err(Error::other(format!(
+					"unexpected response to this command: {unexpected:?}"
+				)))
+			}
 			WendelonResponse::Root2Dormant => Err(Error::other("Root2 carrier is dormant")),
 			WendelonResponse::LeaseDenied => Err(Error::other(format!(
 				"drop reclaim {stage} returned unexpected lease denial"
@@ -3449,10 +3469,6 @@ impl WendelonDataServer {
 			.await
 			.expect("pending finalizations should load")
 			.len()
-	}
-
-	fn merge_commit_hlc(&self, client_hlc: HybridTimestamp) -> HybridTimestamp {
-		self.hlc.merge(client_hlc)
 	}
 
 	fn make_signed_lease(
@@ -3845,9 +3861,11 @@ impl WendelonDataServer {
 						WendelonResponse::Refused(refusal) => Err(Error::other(format!(
 							"unexpected slab refusal for a non-slab command: {refusal:?}"
 						))),
-						WendelonResponse::Op(refusal) => Err(Error::other(format!(
-							"unexpected slab refusal for a non-slab command: {refusal:?}"
-						))),
+						unexpected @ (WendelonResponse::Op(_) | WendelonResponse::Decision(_)) => {
+							Err(Error::other(format!(
+								"unexpected response to this command: {unexpected:?}"
+							)))
+						}
 						WendelonResponse::Root2Dormant => {
 							Err(Error::other("Root2 carrier is dormant"))
 						}
@@ -5775,6 +5793,17 @@ impl WendelonDataServer {
 		cancellation_token: &CancellationToken,
 		mut stream_writer: Option<&mut TableQueryResponseStreamWriter<'_>>,
 	) -> std::io::Result<QueryExecutionPlan> {
+		if self.parent_decisions() {
+			return self
+				.parent_decisions_table_query(
+					meta,
+					bytecode,
+					runtime_filter,
+					cancellation_token,
+					stream_writer,
+				)
+				.await;
+		}
 		let mut range_meta = table_query_as_range_query(meta);
 		if matches!(
 			decode_table_query_trace_carrier(meta),
@@ -6061,6 +6090,7 @@ impl WendelonDataServer {
 			effective_retention.floor,
 			Some(cancellation_token),
 			stream_writer.as_deref_mut(),
+			reader::ScanSource::Base,
 		)
 		.await?;
 		plan.secondary_index_access_plan = secondary_index_access_plan;
@@ -6799,6 +6829,9 @@ impl DataRingServer for WendelonDataServer {
 		context: RequestContext,
 		frame: HrftFrame,
 	) -> std::io::Result<Option<HrftFrame>> {
+		if self.decision_mode.refuses_service() && !self.decisions.opens(frame.header.msg_type) {
+			return Err(self.decision_mode.service_refusal());
+		}
 		let msg_type = MsgType(frame.header.msg_type);
 		match msg_type {
 			MsgType::DROP_RECLAIM_SLICE_REQ => {
@@ -7013,6 +7046,10 @@ impl DataRingServer for WendelonDataServer {
 				self.handle_mutation_outcome_pin_request(&context.actor, &frame)
 					.await
 			}
+			// ADR 0699 S3b: refused above while this mode refuses service.
+			MsgType::TABLE_CHILD_WRITE_REQ
+			| MsgType::TABLE_CHILD_REPLICATE_REQ
+			| MsgType::TABLE_CHILD_FETCH_REQ => self.dispatch_child_frame(&context, frame).await.map(Some),
 			MsgType::TABLE_REPLICATE_REQ => {
 				if frame.meta.len() < std::mem::size_of::<TableReplicaWriteMeta>() {
 					return Err(Error::new(
@@ -7489,6 +7526,9 @@ impl DataRingServer for WendelonDataServer {
 		mut stream: Box<dyn TransportStream>,
 		_pool: Arc<BufPool>,
 	) -> std::io::Result<()> {
+		if self.decision_mode.refuses_service() && !self.decisions.opens(first_header.msg_type) {
+			return Err(self.decision_mode.service_refusal());
+		}
 		let frame = read_frame_from_header(&mut *stream, &self.pool, first_header).await?;
 		match MsgType(first_header.msg_type) {
 			MsgType::BULK_WRITE_REQ => {
@@ -9257,6 +9297,9 @@ impl WendelonDataServer {
 	) -> std::io::Result<(TableWriteResponseMeta, Option<FinalizationMarker>)> {
 		self.observe_table_write(&meta, async {
 			metrics().data_ring_write_requests_total.inc();
+			if self.decision_mode != crate::consensus::decision_mode::DecisionMode::Today {
+				return self.coordinate_table_write(meta, payload).await;
+			}
 			if meta.proxy_hop >= 2 {
 				return Ok((
 					self.table_write_error_response(
@@ -9753,6 +9796,9 @@ impl WendelonDataServer {
 		meta: TableDeleteRowsRequestMeta,
 		row_key_ids: Vec<Identity>,
 	) -> std::io::Result<(TableDeleteRowsResponseMeta, Option<FinalizationMarker>)> {
+		if self.parent_decisions() {
+			return Ok((self.coordinate_table_delete(meta, row_key_ids).await, None));
+		}
 		self.observe_table_delete(&meta, async {
 			metrics().data_ring_write_requests_total.inc();
 			if row_key_ids.is_empty() || row_key_ids.len() != meta.row_count as usize {
@@ -10170,6 +10216,9 @@ impl DataRing for WendelonDataServer {
 		meta: WriteRequestMeta,
 		payload: RecordBatch,
 	) -> std::io::Result<(WriteResponseMeta, Option<FinalizationMarker>)> {
+		if self.parent_decisions() {
+			return Ok((self.coordinate_kv_write(meta, payload).await, None));
+		}
 		self.observe_tenant_mutation(meta.tenant_id, async {
 			metrics().data_ring_write_requests_total.inc();
 			// 1. Proxy-hop guard — two-hop cap per ADR 003 §2.
@@ -10238,6 +10287,9 @@ impl DataRing for WendelonDataServer {
 		meta: ReadRequestMeta,
 		_key: RecordBatch,
 	) -> std::io::Result<(ReadResponseMeta, Option<RecordBatch>)> {
+		if self.parent_decisions() {
+			return self.parent_decisions_kv_read(meta, _key).await;
+		}
 		metrics().data_ring_read_requests_total.inc();
 		let admission = self.admission_snapshot();
 		let current_epoch = admission.current_epoch;
@@ -11051,123 +11103,6 @@ impl TableQueryResponseAccumulator {
 			remaining.push(next.slice(0, mid));
 		}
 		Ok(())
-	}
-}
-
-struct TableQueryResponseStreamWriter<'a> {
-	stream: &'a mut dyn TransportStream,
-	stream_id: u32,
-	provisional_response: QueryResponseMeta,
-	first_frame_sent: bool,
-	batch_count: usize,
-	total_arrow_bytes: usize,
-}
-
-impl<'a> TableQueryResponseStreamWriter<'a> {
-	fn new(
-		stream: &'a mut dyn TransportStream,
-		stream_id: u32,
-		provisional_response: QueryResponseMeta,
-	) -> Self {
-		Self {
-			stream,
-			stream_id,
-			provisional_response,
-			first_frame_sent: false,
-			batch_count: 0,
-			total_arrow_bytes: 0,
-		}
-	}
-
-	fn batch_count(&self) -> usize {
-		self.batch_count
-	}
-
-	fn total_arrow_bytes(&self) -> usize {
-		self.total_arrow_bytes
-	}
-
-	fn has_started(&self) -> bool {
-		self.first_frame_sent
-	}
-
-	/// ADR 0088: emit a payload the accumulator has already encoded and checked
-	/// against the frame cap. Splitting the encode from the write is what lets
-	/// the cap be enforced on the real bytes without encoding twice.
-	async fn emit_encoded_batch(&mut self, arrow: Vec<u8>) -> std::io::Result<()> {
-		let header = if self.first_frame_sent {
-			FrameHeader {
-				magic: HRFT_MAGIC,
-				version: 1,
-				msg_type: MsgType::TABLE_QUERY_RESP.0,
-				flags: 0,
-				stream_id: self.stream_id,
-				meta_len: 0,
-				arrow_len: arrow.len() as u32,
-				trailing_len: 0,
-			}
-		} else {
-			let response = QueryResponseMeta {
-				arrow_len: arrow.len() as u32,
-				..self.provisional_response
-			};
-			let meta_bytes = bytemuck::bytes_of(&response);
-			let header = FrameHeader {
-				magic: HRFT_MAGIC,
-				version: 1,
-				msg_type: MsgType::TABLE_QUERY_RESP.0,
-				flags: 0,
-				stream_id: self.stream_id,
-				meta_len: meta_bytes.len() as u32,
-				arrow_len: arrow.len() as u32,
-				trailing_len: 0,
-			};
-			write_frame(self.stream, &header, meta_bytes, Some(&arrow), None).await?;
-			self.first_frame_sent = true;
-			self.batch_count = self.batch_count.saturating_add(1);
-			self.total_arrow_bytes = self.total_arrow_bytes.saturating_add(arrow.len());
-			return Ok(());
-		};
-		write_frame(self.stream, &header, &[], Some(&arrow), None).await?;
-		self.batch_count = self.batch_count.saturating_add(1);
-		self.total_arrow_bytes = self.total_arrow_bytes.saturating_add(arrow.len());
-		Ok(())
-	}
-
-	async fn emit_terminal(&mut self, response: QueryResponseMeta) -> std::io::Result<()> {
-		self.emit_terminal_with_trailing(response, None).await
-	}
-
-	async fn emit_terminal_with_integrity(
-		&mut self,
-		response: QueryResponseMeta,
-		failure: TableReferenceIntegrityFailureMeta,
-	) -> std::io::Result<()> {
-		self.emit_terminal_with_trailing(response, Some(bytemuck::bytes_of(&failure)))
-			.await
-	}
-
-	async fn emit_terminal_with_trailing(
-		&mut self,
-		response: QueryResponseMeta,
-		trailing: Option<&[u8]>,
-	) -> std::io::Result<()> {
-		let response = QueryResponseMeta {
-			arrow_len: 0,
-			..response
-		};
-		let meta_bytes = bytemuck::bytes_of(&response);
-		let header = FrameHeader {
-			magic: HRFT_MAGIC,
-			version: 1,
-			msg_type: MsgType::TABLE_QUERY_RESP.0,
-			flags: FRAME_FLAG_STREAM_END,
-			stream_id: self.stream_id,
-			meta_len: meta_bytes.len() as u32,
-			arrow_len: 0,
-			trailing_len: trailing.map(|bytes| bytes.len() as u32).unwrap_or(0),
-		};
-		write_frame(self.stream, &header, meta_bytes, None, trailing).await
 	}
 }
 
@@ -13313,6 +13248,7 @@ async fn plan_query_execution_for_ranges_with_program(
 		logical_retention_floor,
 		None,
 		None,
+		reader::ScanSource::Base,
 	)
 	.await
 }
@@ -13331,6 +13267,7 @@ async fn plan_query_execution_for_ranges_with_program_maybe_cancelled(
 	logical_retention_floor: Option<HybridTimestamp>,
 	cancellation_token: Option<&CancellationToken>,
 	mut stream_writer: Option<&mut TableQueryResponseStreamWriter<'_>>,
+	source: reader::ScanSource<'_>,
 ) -> std::io::Result<QueryExecutionPlan> {
 	let budget = QueryExecutionBudget {
 		stats_pruning_enabled: budget.stats_pruning_enabled
@@ -13380,6 +13317,11 @@ async fn plan_query_execution_for_ranges_with_program_maybe_cancelled(
 			));
 		}
 	}
+	// ADR 0699 S4: proved rows, one list per range, in range order.
+	let mut proved = match source {
+		reader::ScanSource::Base => None,
+		reader::ScanSource::Proved(rows) => Some(rows.iter()),
+	};
 	'ranges: for range in ranges {
 		if row_limit_satisfied(rows, row_limit) {
 			break;
@@ -13394,12 +13336,15 @@ async fn plan_query_execution_for_ranges_with_program_maybe_cancelled(
 			}
 		}
 		let phase_started = phase_trace.started();
-		let scanned = slab.scan_as_of_with_identity_and_locality(
-			meta.tenant_id,
-			range.start,
-			range.end,
-			meta.as_of_hlc,
-		)?;
+		let scanned = match proved.as_mut() {
+			None => slab.scan_as_of_with_identity_and_locality(
+				meta.tenant_id,
+				range.start,
+				range.end,
+				meta.as_of_hlc,
+			)?,
+			Some(rows) => rows.next().cloned().unwrap_or_default(),
+		};
 		phase_trace.record(ScanPhase::IndexEntries, phase_started);
 		for (key_identity, locality, location) in scanned {
 			// Examining a location is progress whatever its disposition — pruned,

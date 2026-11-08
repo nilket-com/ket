@@ -2258,6 +2258,11 @@ impl SlabManager {
 		worker: &LsmCompactionWorker,
 		now: HybridTimestamp,
 	) -> Option<CompactionPlan> {
+		// ADR 0699 S4: a run may drop superseded versions; none runs under
+		// containment.
+		if self.versions_contained() {
+			return None;
+		}
 		// A maintenance rewrite holds this only across its durable
 		// publication/install handoff. Returning no plan while that handoff is
 		// in flight is preferable to planning the old Live run from the

@@ -5930,10 +5930,10 @@ fn root2_carrier_is_bounded_private_held_and_response_mappings_are_explicit() {
 	let core =
 		syn::parse_file(&fs::read_to_string(src.join("consensus/core.rs")).unwrap()).unwrap();
 	// ADR 0697 appends after Root2Command and Root2Dormant, whose wire positions
-	// stay pinned; each list's last variant is the newest append.
+	// stay pinned; each list's last variant is the newest append (ADR 0699 S2).
 	for (name, last) in [
-		("WendelonRequest", "AckOutcomes"),
-		("WendelonResponse", "Op"),
+		("WendelonRequest", "Decision"),
+		("WendelonResponse", "Decision"),
 	] {
 		let e = core
 			.items
@@ -5967,9 +5967,12 @@ fn root2_carrier_is_bounded_private_held_and_response_mappings_are_explicit() {
 		.split("if entry.log_id.index != fixed.index")
 		.next()
 		.unwrap();
-	assert!(decode.contains("if header.format_version != WAL_FORMAT_VERSION {"));
+	assert!(decode.contains("if header.format_version != required {"));
 	assert!(decode.contains("UnsupportedControlFormat {"));
-	assert!(decode.contains("WAL_FORMAT_VERSION => match postcard"));
+	assert!(decode.contains("version if version == required => {"));
+	assert!(
+		decode.contains("match postcard::take_from_bytes::<Entry<WendelonTypeConfig>>(payload)")
+	);
 	for (path, count) in [
 		("node.rs", 2),
 		("network/control_server.rs", 11),

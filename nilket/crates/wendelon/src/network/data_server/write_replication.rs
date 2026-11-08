@@ -254,6 +254,10 @@ impl WendelonDataServer {
 	/// than tearing down the HRFT stream — the sender's ack count
 	/// is the only signal that matters for quorum.
 	pub(super) async fn handle_replicate(&self, frame: HrftFrame) -> std::io::Result<HrftFrame> {
+		// ADR 0699 S3b: never an ingress under ParentDecisions; child writes are.
+		if self.decision_mode != crate::consensus::decision_mode::DecisionMode::Today {
+			return Err(self.decision_mode.service_refusal());
+		}
 		let observation = self.slab.finality_observation_registry().begin(
 			crate::storage::finality_observation::WorkScope::Node,
 			crate::storage::finality_observation::WorkKind::Mutation,
@@ -359,6 +363,10 @@ impl WendelonDataServer {
 		&self,
 		frame: HrftFrame,
 	) -> std::io::Result<HrftFrame> {
+		// ADR 0699 S3b: never an ingress under ParentDecisions; child writes are.
+		if self.decision_mode != crate::consensus::decision_mode::DecisionMode::Today {
+			return Err(self.decision_mode.service_refusal());
+		}
 		let observation = self.slab.finality_observation_registry().begin(
 			crate::storage::finality_observation::WorkScope::Node,
 			crate::storage::finality_observation::WorkKind::Mutation,

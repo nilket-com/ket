@@ -1131,7 +1131,8 @@ fn test_adr048_retention_policy_surface_stays_typed_and_brand_clean() {
 		state_digest_source
 			.matches("StateDigestDomain(b\"digest.")
 			.count(),
-		5,
+		// ADR 0699 S5a adds the certified-base domain; ADR 048 adds none.
+		6,
 		"ADR 048 must not add a new state-digest domain constant"
 	);
 	assert!(
@@ -3165,9 +3166,9 @@ fn test_adr053_wire_ipc_compression_architecture_guards() {
 	}
 	let transport_source =
 		fs::read_to_string(manifest_dir.join("src/network/transport.rs")).unwrap();
-	if !transport_source.contains("pub const ALL: [NodeCapability; 2]") {
+	if !transport_source.contains("pub const ALL: [NodeCapability; 3]") {
 		violations.push(
-			"src/network/transport.rs: ADR 053 must not add a node capability bit".to_string(),
+			"src/network/transport.rs: the capability census changed; only the decision authority added a bit since ADR 053".to_string(),
 		);
 	}
 
@@ -9446,7 +9447,18 @@ fn adr077_data_server_source_concatenates_submodules() {
 		basenames,
 		vec![
 			"data_server.rs",
+			// ADR 0699 S5a: a store's part in certified generations.
+			"certification.rs",
+			// ADR 0699 S3b: child writes under the ParentDecisions authority, kept
+			// out of the bounded root.
+			"child_writes.rs",
+			// ADR 0699 S5b: a store's certified cleanup.
+			"cleanup.rs",
+			// ADR 0699 S3c: the coordinator of a table write in that mode.
+			"coordinator.rs",
 			"counter.rs",
+			// ADR 0699 S4b: the single-row delete of that mode.
+			"deletes.rs",
 			"descriptor_migration.rs",
 			// ADR 542's durable outcome/replay wire is one named protocol seam;
 			// keep its framing and resolution state out of the bounded root.
@@ -9461,6 +9473,10 @@ fn adr077_data_server_source_concatenates_submodules() {
 			// keeps ratcheting down rather than absorbing each new one.
 			"query_clocks.rs",
 			"query_encode.rs",
+			// ADR 0699 S4: the reader of that mode, and the typed repair of an
+			// Accepted child it relies on.
+			"reader.rs",
+			"repair.rs",
 			"replica_routing.rs",
 			// ADR 0089's per-request scan accounting: the decode audit that makes
 			// read amortization checkable, the bounded cache that produces it, and
@@ -9702,6 +9718,8 @@ fn adr078_manager_source_concatenates_submodules() {
 			"manager.rs",
 			// ADR 0696: every backing and tier-generation install into the state.
 			"backing_install.rs",
+			// ADR 0699 S5b: the certified cleanup rewrite.
+			"certified_cleanup.rs",
 			"compaction.rs",
 			"counter_visibility.rs",
 			// ADR 0696 (0692 §7): disposal evidence for typed Superseded after disposal.
@@ -9709,6 +9727,8 @@ fn adr078_manager_source_concatenates_submodules() {
 			"encoding_compute.rs",
 			"gc_disposal.rs",
 			"index_publication.rs",
+			// ADR 0699 S4: the poison-recovery lock helpers, moved out of the root.
+			"lock_recovery.rs",
 			"lsm_driver.rs",
 			"maintenance_publication.rs",
 			// Snapshot-race metadata observations and durable operation tokens.
@@ -12035,4 +12055,104 @@ fn a_ring_command_or_state_never_names_a_bare_slab_id() {
 		brace_body(&lsm, "pub struct CompactionCommit")
 			.contains("pub owner: crate::consensus::OwnerRef")
 	);
+}
+
+/// ADR 0699 S2: decision commands have no producer outside tests, signatures
+/// verify nothing outside tests, and every snapshot body passes through the two
+/// mode-explicit codec functions.
+#[test]
+fn parent_decisions_have_no_producer_and_one_codec() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let src = root.join("src");
+	let mut sites = Vec::new();
+	walk_dir(&src, &mut |path| {
+		let name = path.file_name().unwrap().to_string_lossy().into_owned();
+		if path.extension().is_none_or(|ext| ext != "rs") || name.ends_with("tests.rs") {
+			return;
+		}
+		let source = fs::read_to_string(path).unwrap();
+		let production = source.split("#[cfg(test)]\nmod tests").next().unwrap();
+		for (offset, _) in production.match_indices("WendelonRequest::Decision(") {
+			let rest = &production[offset + "WendelonRequest::Decision(".len()..];
+			sites.push((name.clone(), rest.split_once(')').unwrap().0.to_owned()));
+		}
+	});
+	let mut per_file = std::collections::BTreeMap::new();
+	for (file, _) in &sites {
+		*per_file.entry(file.as_str()).or_insert(0usize) += 1;
+	}
+	assert_eq!(
+		per_file,
+		std::collections::BTreeMap::from([
+			("committed.rs", 1),
+			// ADR 0699 S5a: the leader's generation step proposes too.
+			("decision_proposals.rs", 3),
+			("raft_storage.rs", 2),
+		]),
+		"decisions are matched in apply and built only by the leader's proposal path"
+	);
+	assert!(sites.contains(&("raft_storage.rs".to_owned(), "_".to_owned())));
+	assert!(sites.contains(&("raft_storage.rs".to_owned(), "command".to_owned())));
+	let proposals = fs::read_to_string(src.join("network/decision_proposals.rs")).unwrap();
+	assert!(proposals.contains("Ok(WendelonRequest::Decision(command))"));
+	let forwarded = brace_body(&proposals, "pub enum ForwardedDecision");
+	assert!(!forwarded.contains("stamp") && !forwarded.contains("floor"));
+	assert!(
+		forwarded.contains("BindSigner {\n\t\tincarnation: StoreIncarnation,\n\t},"),
+		"a binding names only the incarnation: the leader supplies the sender and its key"
+	);
+
+	let decisions = fs::read_to_string(src.join("consensus/decisions.rs")).unwrap();
+	assert_eq!(
+		decisions.matches("Verified(").count(),
+		1,
+		"one private constructor"
+	);
+	assert!(decisions.contains("Ok(Verified(signed.body.clone()))"));
+	let verify = source_region(&decisions, "pub(crate) fn verify<T: Evidence>(", "\n\t}\n");
+	assert!(verify.contains(".signer_key(signed.signer)"));
+	assert!(verify.contains("key.verify_strict("));
+	assert!(
+		!decisions.contains("synthetic"),
+		"no stand-in signature remains"
+	);
+
+	// ADR 0699 S3b: the old replicate handlers are never an ingress in this mode.
+	let replication =
+		fs::read_to_string(src.join("network/data_server/write_replication.rs")).unwrap();
+	for handler in [
+		"async fn handle_replicate(&self, frame: HrftFrame)",
+		"async fn handle_table_replicate(",
+	] {
+		let head = replication
+			.split_once(handler)
+			.unwrap()
+			.1
+			.split("let observation")
+			.next()
+			.unwrap();
+		assert!(
+			head.contains(
+				"if self.decision_mode != crate::consensus::decision_mode::DecisionMode::Today"
+			),
+			"{handler} refuses first under ParentDecisions"
+		);
+	}
+
+	let raft = fs::read_to_string(src.join("consensus/raft_storage.rs")).unwrap();
+	let writer = source_region(&raft, "fn write_state_body<", "\nfn encode_state_body(");
+	assert_eq!(raft.matches("postcard::to_io(").count(), 2);
+	assert_eq!(writer.matches("postcard::to_io(").count(), 2);
+	assert!(writer.contains("(DecisionMode::Today, None) => postcard::to_io(state, writer)"));
+	assert_eq!(raft.matches("take_from_bytes::<SmState>").count(), 0);
+	let reader = source_region(
+		&raft,
+		"fn decode_state_body(",
+		"\nasync fn spawn_blocking_snapshot_io",
+	);
+	assert!(reader.contains("DecisionMode::Today => whole::<SmState>(body)"));
+	assert!(reader.contains("envelope.decisions.validate()?;"));
+	assert!(brace_body(&raft, "pub struct SmState").contains(
+		"#[serde(skip)]\n\tpub decisions: Option<crate::consensus::decisions::DecisionState>,"
+	));
 }

@@ -227,8 +227,10 @@ mod tier_generation;
 mod tier_measure;
 mod tier_tokens;
 pub use tier_tokens::{TierProposal, TierSubmission};
+mod lock_recovery;
 mod tier_plan;
 mod version_identity;
+use lock_recovery::{recover_rwlock_read, recover_rwlock_write};
 use tier_generation::{ReadTarget, TierLayout};
 pub use tier_generation::{
 	StaleLocation, StaleLocationReason, stale_location, stale_location_error,
@@ -248,11 +250,14 @@ mod pause_hooks;
 #[cfg(test)]
 pub(crate) use pause_hooks::LsmPublicationForTest;
 use tiered_io::{
-	RehydratedSlabState, SlabBacking, TierObjectEvidence, TieredPlaintext,
-	build_tiered_object_metadata, decode_tiered_blob, descriptor_matches_tiered_row,
-	extract_record_from_blob, fetch_tiered_ciphertext_runs, single_tenant_id_from_plain_slab,
+	RehydratedSlabState, SlabBacking, TierObjectEvidence, TieredPlaintext, decode_tiered_blob,
+	descriptor_matches_tiered_row, extract_record_from_blob, fetch_tiered_ciphertext_runs,
 	validate_tiered_blob, validate_tiered_record_header_tenant,
 };
+#[cfg(test)]
+use tiered_io::{build_tiered_object_metadata, single_tenant_id_from_plain_slab};
+// ADR 0699 S5b: the certified cleanup rewrite.
+pub(crate) mod certified_cleanup;
 mod compaction;
 use compaction::{
 	CompactionOutcome, CompactionRecord, compact_physical_record_frame,
@@ -301,32 +306,6 @@ const IDENTITY_MAX: Identity = Identity::new([0xFF; 32]);
 /// metadata is scanned without descriptors first, so a large population of
 /// empty historical slabs does not consume this budget.
 const MAX_RECOVERY_OPEN_SLABS: usize = 4096;
-
-fn recover_rwlock_read<'a, T>(
-	lock: &'a RwLock<T>,
-	name: &'static str,
-) -> std::sync::RwLockReadGuard<'a, T> {
-	match lock.read() {
-		Ok(guard) => guard,
-		Err(poisoned) => {
-			tracing::error!(lock = name, "recovering poisoned rwlock read guard");
-			poisoned.into_inner()
-		}
-	}
-}
-
-fn recover_rwlock_write<'a, T>(
-	lock: &'a RwLock<T>,
-	name: &'static str,
-) -> std::sync::RwLockWriteGuard<'a, T> {
-	match lock.write() {
-		Ok(guard) => guard,
-		Err(poisoned) => {
-			tracing::error!(lock = name, "recovering poisoned rwlock write guard");
-			poisoned.into_inner()
-		}
-	}
-}
 
 /// Construction parameters for [`SlabManager`].
 pub struct SlabManagerConfig {
@@ -825,6 +804,7 @@ pub struct SlabManager {
 	/// Every copy of a version whose identity is claimed by different payloads;
 	/// rebuilt at each open. Reads of these refuse.
 	conflicted_locations: DashSet<RecordLocation>,
+	versions_contained: AtomicBool,
 	/// Tiered slabs not yet verified against their objects since open.
 	unverified_tier_slabs: DashSet<SlabId>,
 	tier_authority: Arc<tier_authority::TierAuthority>,
@@ -3528,6 +3508,11 @@ impl SlabManager {
 		self.config.l2_column_fetch.enabled || self.config.l2_row_group_fetch.enabled
 	}
 
+	/// ADR 0699 S3b: the store's persistent index, where parent intents live.
+	pub(crate) fn persistent_index(&self) -> Option<Arc<PersistentLocalIndex>> {
+		self.persistent_index.clone()
+	}
+
 	pub(crate) fn row_group_writer_config(
 		&self,
 	) -> &crate::storage::row_group::RowGroupWriterConfig {
@@ -3872,6 +3857,9 @@ impl SlabManager {
 			now_ms,
 		)?;
 		self.keep_conflicting_versions(&mut records);
+		// ADR 0699: under containment a tiered rewrite drops nothing, so it is
+		// never prepared and never retires a slab holding records.
+		self.keep_contained_versions(&mut records);
 		records.sort_by_key(|record| record.old_location.offset);
 		let physical_groups = physical_compaction_groups(&records);
 		let pruned_versions = records.iter().filter(|record| record.reclaim).count();
@@ -4047,6 +4035,9 @@ impl SlabManager {
 			tenant_id,
 			descriptor,
 		)?;
+		// ADR 0699: under containment a tiered table-drop rewrite drops nothing,
+		// so it is never prepared and never retires a slab holding records.
+		self.keep_contained_versions(&mut records);
 		records.sort_by_key(|record| record.old_location.offset);
 		let physical_groups = physical_compaction_groups(&records);
 		let reclaimed_records = records.iter().filter(|record| record.reclaim).count();

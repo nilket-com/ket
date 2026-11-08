@@ -185,3 +185,64 @@ pub(super) fn validate_identity_keys(cfg: &NodeBootstrapConfig) -> std::io::Resu
 
 #[cfg(test)]
 mod tests;
+
+/// ADR 0699 S3a: this node's decision-signing secret and every node's decision
+/// verifying key. Unset, they are the development keys (the mode requires dev
+/// keys). The local key must be in the map, and the role reuses no key of the
+/// lease, transfer or audit roles, nor one key for two nodes.
+pub(crate) fn resolve_decision_keys(
+	cfg: &NodeBootstrapConfig,
+) -> std::io::Result<([u8; 32], BTreeMap<u32, [u8; 32]>)> {
+	use crate::consensus::decisions::{decision_verifying_key_bytes, dev_decision_signing_secret};
+	let secret = cfg
+		.decision_signing_secret
+		.unwrap_or_else(|| dev_decision_signing_secret(cfg.node_id));
+	let trusted = if cfg.trusted_decision_signers.is_empty() {
+		std::iter::once(cfg.node_id)
+			.chain(cfg.trusted_lease_signers.keys().copied())
+			.map(|id| {
+				(
+					id,
+					decision_verifying_key_bytes(dev_decision_signing_secret(id)),
+				)
+			})
+			.collect()
+	} else {
+		cfg.trusted_decision_signers.clone()
+	};
+	let refuse = |detail: &str| {
+		Err(Error::new(
+			ErrorKind::InvalidInput,
+			format!("decision signing key refused: {detail}"),
+		))
+	};
+	if trusted.get(&cfg.node_id) != Some(&decision_verifying_key_bytes(secret)) {
+		return refuse("the local key is missing from, or differs in, the decision signer map");
+	}
+	if [
+		cfg.lease_signing_secret,
+		cfg.transfer_signing_secret,
+		cfg.audit_root_signing_secret,
+	]
+	.contains(&secret)
+	{
+		return refuse("the secret is reused from another role");
+	}
+	let other_roles: BTreeSet<[u8; 32]> = cfg
+		.trusted_lease_signers
+		.values()
+		.chain(cfg.trusted_transfer_signers.values())
+		.chain(cfg.trusted_audit_root_keys.values())
+		.copied()
+		.collect();
+	let mut seen = BTreeSet::new();
+	for key in trusted.values() {
+		if other_roles.contains(key) {
+			return refuse("a verifying key is reused from another role");
+		}
+		if !seen.insert(*key) {
+			return refuse("one verifying key names two nodes");
+		}
+	}
+	Ok((secret, trusted))
+}

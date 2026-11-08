@@ -148,6 +148,39 @@ impl Drop for WritePermit {
 	}
 }
 
+/// ADR 0699 S5a: admission for one lifecycle operation that creates trusted
+/// durable state (a staged base, its report, an activation). It shares the
+/// drain accounting of writes, so close waits for it, and it is a separate type
+/// from [`WritePermit`], whose contract is unchanged. Move it into the work
+/// and keep it until the work finishes, even across cancellation. Dropped
+/// without [`LifecyclePermit::complete`], it revokes this run's clean-shutdown
+/// record for good: the next start is unclean and validates.
+pub struct LifecyclePermit {
+	inner: Arc<OwnerInner>,
+	completed: bool,
+}
+
+impl LifecyclePermit {
+	pub(crate) fn complete(mut self) {
+		self.completed = true;
+	}
+}
+
+impl Drop for LifecyclePermit {
+	fn drop(&mut self) {
+		if !self.completed {
+			self.inner
+				.clean_record_revoked
+				.store(true, std::sync::atomic::Ordering::Release);
+		}
+		let mut state = self.inner.state.lock().unwrap();
+		state.outstanding -= 1;
+		if state.outstanding == 0 {
+			self.inner.drained.notify_waiters();
+		}
+	}
+}
+
 /// Returned when another process already owns the canonical data directory.
 #[derive(Debug)]
 pub struct DataDirectoryBusy {
@@ -183,6 +216,13 @@ struct OwnerInner {
 	// Set when a run that started after an unclean shutdown finished its
 	// recovery validation. Only then may that run leave a clean record.
 	recovery_complete: std::sync::atomic::AtomicBool,
+	// ADR 0699 S5a: a lifecycle operation was interrupted. Sticky for the run:
+	// no later completion clears it, so this run leaves no clean record.
+	clean_record_revoked: std::sync::atomic::AtomicBool,
+	// ADR 0699 S5a: an unclean start owes the certified base's physical proof;
+	// until it is discharged no close records the directory clean, whatever
+	// other recovery finished.
+	base_recovery_pending: std::sync::atomic::AtomicBool,
 	state: Mutex<OwnerState>,
 	drained: Notify,
 	close_gate: tokio::sync::Mutex<()>,
@@ -477,6 +517,22 @@ impl DataDirectoryOwner {
 			.store(true, std::sync::atomic::Ordering::Release);
 	}
 
+	/// ADR 0699 S5a: this run must prove its certified base before a close may
+	/// record the directory clean.
+	pub(crate) fn require_base_recovery(&self) {
+		self.inner
+			.base_recovery_pending
+			.store(true, std::sync::atomic::Ordering::Release);
+	}
+
+	/// The certified base was proved for this run. Only a successful base
+	/// validation calls this; it never clears a sticky revocation.
+	pub(crate) fn complete_base_recovery(&self) {
+		self.inner
+			.base_recovery_pending
+			.store(false, std::sync::atomic::Ordering::Release);
+	}
+
 	pub(crate) fn mark_startup_failed(&self) {
 		self.inner
 			.startup_failed
@@ -487,6 +543,14 @@ impl DataDirectoryOwner {
 			.inner
 			.startup_failed
 			.load(std::sync::atomic::Ordering::Acquire)
+			|| self
+				.inner
+				.clean_record_revoked
+				.load(std::sync::atomic::Ordering::Acquire)
+			|| self
+				.inner
+				.base_recovery_pending
+				.load(std::sync::atomic::Ordering::Acquire)
 		{
 			return false;
 		}
@@ -510,6 +574,27 @@ impl DataDirectoryOwner {
 	/// A permit when owned; `None` for an unowned (test or tool) store.
 	pub(crate) fn optional_permit(owner: Option<&Self>) -> std::io::Result<Option<WritePermit>> {
 		owner.map(Self::write_permit).transpose()
+	}
+
+	/// ADR 0699 S5a: a lifecycle permit; refused once close began.
+	pub(crate) fn lifecycle_permit(&self) -> std::io::Result<LifecyclePermit> {
+		let mut state = self.inner.state.lock().unwrap();
+		if state.phase != OwnerPhase::Active {
+			return Err(closed_error());
+		}
+		state.outstanding += 1;
+		Ok(LifecyclePermit {
+			inner: self.inner.clone(),
+			completed: false,
+		})
+	}
+
+	/// Whether a lifecycle operation was interrupted during this run.
+	#[cfg(test)]
+	pub(crate) fn clean_record_revoked(&self) -> bool {
+		self.inner
+			.clean_record_revoked
+			.load(std::sync::atomic::Ordering::Acquire)
 	}
 
 	pub(crate) fn write_permit(&self) -> std::io::Result<WritePermit> {
@@ -805,6 +890,8 @@ fn acquire_lock(canonical: PathBuf) -> std::io::Result<DataDirectoryOwner> {
 		consume_clean_shutdown_record(&canonical)? || directory_is_fresh(&canonical)?;
 	Ok(DataDirectoryOwner {
 		inner: Arc::new(OwnerInner {
+			clean_record_revoked: std::sync::atomic::AtomicBool::new(false),
+			base_recovery_pending: std::sync::atomic::AtomicBool::new(false),
 			closed_signal: Arc::new(std::sync::atomic::AtomicBool::new(false)),
 			startup_failed: std::sync::atomic::AtomicBool::new(false),
 			path: canonical,
@@ -1214,6 +1301,46 @@ mod tests {
 		let again = DataDirectoryOwner::acquire_existing(dir.path()).unwrap();
 		drop(redb::Database::create(&path).unwrap());
 		drop(again);
+	}
+
+	/// ADR 0699 S5a: an interrupted lifecycle operation revokes the clean
+	/// record for good; a later successful one does not restore it.
+	#[tokio::test]
+	async fn an_interrupted_lifecycle_permit_revokes_the_clean_record_for_good() {
+		let dir = TestDir::new();
+		let owner = DataDirectoryOwner::acquire_existing(dir.path()).unwrap();
+		// A store with data, not a never-owned directory.
+		fs::write(dir.path().join("data.bin"), b"written").unwrap();
+		let interrupted = owner.lifecycle_permit().unwrap();
+		drop(interrupted);
+		assert!(owner.clean_record_revoked());
+		owner.lifecycle_permit().unwrap().complete();
+		assert!(owner.clean_record_revoked(), "completion never clears it");
+		owner.close(Duration::from_secs(5)).await.unwrap();
+		drop(owner);
+		assert!(!dir.path().join(CLEAN_SHUTDOWN_RECORD).exists());
+		let next = DataDirectoryOwner::acquire_existing(dir.path()).unwrap();
+		assert!(!next.previous_shutdown_clean(), "the next start is unclean");
+	}
+
+	/// A completed lifecycle permit leaves a clean close clean, and none is
+	/// granted once close began; close waits for one in flight.
+	#[tokio::test]
+	async fn a_lifecycle_permit_is_drained_by_close_and_refused_after_it() {
+		let dir = TestDir::new();
+		let owner = DataDirectoryOwner::acquire_existing(dir.path()).unwrap();
+		let held = owner.lifecycle_permit().unwrap();
+		let closing = {
+			let owner = owner.clone();
+			tokio::spawn(async move { owner.close(Duration::from_secs(5)).await })
+		};
+		tokio::task::yield_now().await;
+		assert!(owner.lifecycle_permit().is_err(), "none after close began");
+		assert!(!closing.is_finished(), "close waits for the permit");
+		held.complete();
+		closing.await.unwrap().unwrap();
+		drop(owner);
+		assert!(dir.path().join(CLEAN_SHUTDOWN_RECORD).exists());
 	}
 
 	#[tokio::test]

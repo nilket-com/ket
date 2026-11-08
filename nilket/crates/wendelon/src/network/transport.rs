@@ -342,12 +342,16 @@ pub enum NodeCapability {
 	SlabStatsPruning = 0,
 	/// ADR 040 partial aggregate pushdown.
 	PartialAggregatePushdown = 1,
+	/// This node runs the `ParentDecisions` authority. A cluster refuses a joiner
+	/// whose bit differs from its own.
+	ParentDecisions = 2,
 }
 
 impl NodeCapability {
-	pub const ALL: [NodeCapability; 2] = [
+	pub const ALL: [NodeCapability; 3] = [
 		NodeCapability::SlabStatsPruning,
 		NodeCapability::PartialAggregatePushdown,
+		NodeCapability::ParentDecisions,
 	];
 
 	#[inline]

@@ -51,6 +51,7 @@ use crate::audit::{
 	AuditMaterializationTracker, AuditOperation, AuditOutcome, AuditSchema, AuditSink,
 	DataAccessKind, DataAccessPhase, DataAccessSchema,
 };
+use crate::consensus::decision_mode::DecisionMode;
 use crate::consensus::retention::{
 	self, HistoryCheck, RetentionGuard, RetentionStartError, RetentionViolation,
 };
@@ -272,12 +273,14 @@ struct ControlArtifactPaths {
 #[derive(Clone, Copy, Debug)]
 struct WalOptions {
 	segment_bytes: u64,
+	decision_mode: DecisionMode,
 }
 
 impl Default for WalOptions {
 	fn default() -> Self {
 		Self {
 			segment_bytes: DEFAULT_WAL_SEGMENT_BYTES,
+			decision_mode: DecisionMode::Today,
 		}
 	}
 }
@@ -545,6 +548,7 @@ struct TruncatePlan {
 /// out another handle pointing at the same cache.
 #[derive(Clone)]
 pub struct WendelonLogStore {
+	decision_mode: DecisionMode,
 	inner: Arc<RwLock<LogStoreInner>>,
 	/// Serialises WAL submissions so append bodies and their
 	/// fsync barriers land in the intended order. `io_uring` CQE
@@ -582,6 +586,7 @@ impl WendelonLogStore {
 	/// Live node bootstrap must use [`Self::open`] instead.
 	pub fn in_memory() -> Self {
 		Self {
+			decision_mode: DecisionMode::Today,
 			inner: Arc::new(RwLock::new(LogStoreInner {
 				entries: BTreeMap::new(),
 				last_log_id: None,
@@ -697,6 +702,7 @@ impl WendelonLogStore {
 		io: IoRingHandle,
 		retention: Arc<RetentionGuard>,
 		owner: DataDirectoryOwner,
+		decision_mode: DecisionMode,
 	) -> std::io::Result<Self> {
 		let file_ops = Arc::new(IoUringFileOps::with_isolated_blocking(
 			io,
@@ -708,7 +714,10 @@ impl WendelonLogStore {
 			vote_path,
 			snapshot_path,
 			file_ops,
-			WalOptions::default(),
+			WalOptions {
+				decision_mode,
+				..WalOptions::default()
+			},
 			Some(retention),
 			Some(owner),
 		)
@@ -782,7 +791,26 @@ impl WendelonLogStore {
 
 		let artifacts =
 			inspect_artifacts(file_ops.as_ref(), wal_path, vote_path, snapshot_path).await?;
-		let bootstrap_mode = DurableBootstrapMode::from_artifacts(artifacts.any());
+		let mut bootstrap_mode = DurableBootstrapMode::from_artifacts(artifacts.any());
+		// A new-mode store's first artifact is a format-10 checkpoint holder, synced
+		// before its name exists, so every later crash leaves a record that a binary on
+		// the other authority refuses. It carries no state: a store holding only it is
+		// still a fresh store.
+		if options.decision_mode != DecisionMode::Today && !artifacts.any() {
+			create_wal_holder(
+				file_ops.as_ref(),
+				wal_path,
+				0,
+				vec![serialize_checkpoint_page_as(
+					0,
+					0,
+					0,
+					0,
+					options.decision_mode.wal_format(),
+				)],
+			)
+			.await?;
+		}
 		let full = retention
 			.as_ref()
 			.is_some_and(|guard| guard.mode() == crate::consensus::ControlRetention::Full);
@@ -801,9 +829,27 @@ impl WendelonLogStore {
 			.map_err(RetentionStartError::into_io)?;
 		}
 		let vote = load_vote_state(file_ops.as_ref(), vote_path).await?;
-		let snapshot = load_snapshot_artifact(file_ops.as_ref(), snapshot_path).await?;
-		let replay = replay_wal(file_ops.as_ref(), wal_path, snapshot.as_ref()).await?;
+		let snapshot =
+			load_snapshot_artifact(file_ops.as_ref(), snapshot_path, options.decision_mode).await?;
+		let replay = replay_wal(
+			file_ops.as_ref(),
+			wal_path,
+			snapshot.as_ref(),
+			options.decision_mode,
+		)
+		.await?;
 		let mut replay = replay;
+		if options.decision_mode != DecisionMode::Today
+			&& !artifacts.vote
+			&& !artifacts.snapshot
+			&& replay.entries.is_empty()
+			&& replay.last_purged.is_none()
+			&& replay
+				.checkpoint
+				.is_none_or(|checkpoint| checkpoint.commit_index == 0)
+		{
+			bootstrap_mode = DurableBootstrapMode::FreshBootstrap;
+		}
 		let recovery_committed =
 			resolve_recovered_committed(snapshot.as_ref(), &replay.entries, replay.checkpoint)?;
 		let history = if full {
@@ -877,6 +923,14 @@ impl WendelonLogStore {
 		} else {
 			None
 		};
+		// Replay has verified every record is this authority's. Its marker is written
+		// now, before the first artifact that is not a control-log record, so an
+		// interrupted creation leaves either the holder alone or holder and marker.
+		if options.decision_mode != DecisionMode::Today
+			&& let Some(data_dir) = wal_path.parent()
+		{
+			options.decision_mode.bind_store(data_dir)?;
+		}
 		let vote_file = open_control_artifact(file_ops.as_ref(), vote_path).await?;
 		let wal_cursor = replay
 			.wal_segments
@@ -889,6 +943,7 @@ impl WendelonLogStore {
 		};
 
 		let store = Self {
+			decision_mode: options.decision_mode,
 			inner: Arc::new(RwLock::new(LogStoreInner {
 				entries: replay.entries,
 				entry_positions: replay.entry_positions,
@@ -929,6 +984,26 @@ impl WendelonLogStore {
 		Ok(store)
 	}
 
+	/// The state a ParentDecisions creation leaves if it stops after its first
+	/// control-log record and before its marker.
+	#[cfg(test)]
+	pub(crate) async fn write_parent_decisions_holder_for_test(dir: &Path) -> std::io::Result<()> {
+		create_wal_holder(
+			&crate::storage::BlockingFileOps,
+			&dir.join("control.wal"),
+			0,
+			vec![serialize_checkpoint_page_as(
+				0,
+				0,
+				0,
+				0,
+				DecisionMode::ParentDecisions.wal_format(),
+			)],
+		)
+		.await
+		.map(|_| ())
+	}
+
 	/// Test seam for the retention suite: a store over `dir` with blocking
 	/// file I/O and a small segment size, under `retention`.
 	#[cfg(test)]
@@ -944,6 +1019,7 @@ impl WendelonLogStore {
 			file_ops,
 			WalOptions {
 				segment_bytes: 64 * 4096,
+				..WalOptions::default()
 			},
 			None,
 			None,
@@ -998,7 +1074,10 @@ impl WendelonLogStore {
 			dir.join("vote.wnd"),
 			dir.join("snapshot.wnd"),
 			Arc::new(crate::storage::BlockingFileOps),
-			WalOptions { segment_bytes },
+			WalOptions {
+				segment_bytes,
+				..WalOptions::default()
+			},
 			retention,
 			None,
 		)
@@ -1039,12 +1118,16 @@ impl WendelonLogStore {
 	/// then abandoned qualify; compaction or an uncommitted entry does not.
 	pub(crate) async fn is_pristine(&self) -> bool {
 		let inner = self.inner.read().await;
+		// A ParentDecisions store's genesis holder is a commit-0 checkpoint that
+		// carries no state; a store holding only it is still pristine.
+		let holder_only = self.decision_mode != DecisionMode::Today
+			&& inner.recovery_checkpoint == Some(RecoveryCheckpoint::default());
 		inner.vote.is_none()
 			&& inner.last_log_id.is_none()
 			&& inner.last_purged.is_none()
 			&& inner.entries.is_empty()
 			&& inner.recovered_snapshot.is_none()
-			&& inner.recovery_checkpoint.is_none()
+			&& (inner.recovery_checkpoint.is_none() || holder_only)
 			&& inner.recovery_committed.is_none()
 	}
 
@@ -1202,11 +1285,12 @@ impl WendelonLogStore {
 			guard.recovery_committed = Some(pointer);
 			return Ok(());
 		}
-		let page = serialize_checkpoint_page(
+		let page = serialize_checkpoint_page_as(
 			next_checkpoint.commit_index,
 			next_checkpoint.e_safe_index,
 			pointer.index,
 			pointer.leader_id.term,
+			self.decision_mode.wal_format(),
 		);
 		let file_ops = file_ops.ok_or_else(|| {
 			Error::new(
@@ -1387,12 +1471,15 @@ impl WendelonLogStore {
 		let (snapshot, entries, checkpoint, snapshot_runtime) = {
 			let guard = self.inner.read().await;
 			let snapshot_runtime = match (&guard.file_ops, &guard.artifact_paths) {
-				(Some(file_ops), Some(paths)) => SnapshotRuntime::new(
-					file_ops.clone(),
-					SnapshotPaths::from_current(paths.snapshot.clone()),
-					self.publication.clone(),
-					Some(Arc::new(self.clone()) as Arc<dyn DeferredPurge>),
-				),
+				(Some(file_ops), Some(paths)) => SnapshotRuntime {
+					decision_mode: self.decision_mode,
+					..SnapshotRuntime::new(
+						file_ops.clone(),
+						SnapshotPaths::from_current(paths.snapshot.clone()),
+						self.publication.clone(),
+						Some(Arc::new(self.clone()) as Arc<dyn DeferredPurge>),
+					)
+				},
 				_ => SnapshotRuntime::ephemeral(),
 			};
 			(
@@ -1437,6 +1524,12 @@ impl WendelonLogStore {
 	pub(crate) async fn export_backup_with_state(
 		&self,
 	) -> std::io::Result<(ControlRingBackupImage, SmState)> {
+		if self.decision_mode != DecisionMode::Today {
+			return Err(Error::new(
+				ErrorKind::Unsupported,
+				"a ParentDecisions store has no backup path yet",
+			));
+		}
 		let (wal, vote, snapshot) = {
 			let _wal = self.wal_gate.lock().await;
 			let (paths, file_ops, segments) = {
@@ -1787,7 +1880,10 @@ impl RaftLogStorage<WendelonTypeConfig> for WendelonLogStore {
 		// without mutating either the cache or the WAL cursor.
 		let mut pages: Vec<AlignedBuf> = Vec::with_capacity(batch.len());
 		for entry in &batch {
-			pages.push(serialize_entry_page(entry).map_err(StorageIOError::write_logs)?);
+			pages.push(
+				serialize_entry_page_as(entry, self.decision_mode.wal_format())
+					.map_err(StorageIOError::write_logs)?,
+			);
 		}
 
 		let _gate = self.wal_gate.lock().await;
@@ -1894,7 +1990,11 @@ impl RaftLogStorage<WendelonTypeConfig> for WendelonLogStore {
 				// latest checkpoint followed by the entry, so the checkpoint record survives.
 				// Without an in-memory checkpoint, every record in it was superseded at open by
 				// the validated snapshot, so the entry alone replaces them.
-				let checkpoint = match CheckpointPage::latest(checkpoint, committed_pointer) {
+				let checkpoint = match CheckpointPage::latest(
+					checkpoint,
+					committed_pointer,
+					self.decision_mode.wal_format(),
+				) {
 					Ok(None) if !superseded_at_open => Err(Error::new(
 						ErrorKind::InvalidData,
 						"checkpoint-only segment without an in-memory checkpoint",
@@ -2106,6 +2206,7 @@ impl RaftLogStorage<WendelonTypeConfig> for WendelonLogStore {
 				checkpoint: CheckpointPage::latest(
 					guard.recovery_checkpoint,
 					guard.recovery_committed,
+					self.decision_mode.wal_format(),
 				)
 				.map_err(refuse)?,
 			};
@@ -2366,8 +2467,12 @@ impl RaftLogStorage<WendelonTypeConfig> for WendelonLogStore {
 				guard.wal_file.clone(),
 				guard.wal_cursor,
 				guard.wal_segment_bytes,
-				CheckpointPage::latest(guard.recovery_checkpoint, guard.recovery_committed)
-					.map_err(refuse)?,
+				CheckpointPage::latest(
+					guard.recovery_checkpoint,
+					guard.recovery_committed,
+					self.decision_mode.wal_format(),
+				)
+				.map_err(refuse)?,
 				last_purged,
 				last_log_id,
 				physical_tail_next(Some(last_log_id), None).map_err(refuse)?,
@@ -2868,6 +2973,12 @@ pub struct SmState {
 	pub table_drop_tombstones: crate::schema::TableDropTombstoneCatalog,
 	/// ADR 0095 replicated physical-erasure obligations.
 	pub table_drop_reclaim_debts: crate::schema::TableDropReclaimDebtCatalog,
+	/// ADR 0699 S2: parent write decisions, `Some` exactly when the store runs
+	/// the `ParentDecisions` authority. Never part of today's body: only the
+	/// format-10 envelope carries it, through [`encode_state_body`] and
+	/// [`decode_state_body`], and today's encoder refuses a state holding it.
+	#[serde(skip)]
+	pub decisions: Option<crate::consensus::decisions::DecisionState>,
 }
 
 impl SmState {
@@ -3370,6 +3481,7 @@ impl SnapshotPaths {
 
 #[derive(Clone)]
 struct SnapshotRuntime {
+	decision_mode: DecisionMode,
 	file_ops: Arc<dyn AsyncFileOps>,
 	paths: SnapshotPaths,
 	/// The one authority over which artifact `current` names; shared with the log store.
@@ -3389,6 +3501,7 @@ impl SnapshotRuntime {
 		deferred_purge: Option<Arc<dyn DeferredPurge>>,
 	) -> Self {
 		Self {
+			decision_mode: DecisionMode::Today,
 			file_ops,
 			paths,
 			publication,
@@ -3838,12 +3951,22 @@ struct SmInner {
 }
 
 fn recover_sm_inner(
+	decision_mode: DecisionMode,
 	snapshot: Option<LoadedSnapshot>,
 	entries: Vec<Entry<WendelonTypeConfig>>,
 	checkpoint: Option<RecoveryCheckpoint>,
 ) -> std::io::Result<SmInner> {
 	let mut inner = SmInner::default();
+	if decision_mode == DecisionMode::ParentDecisions {
+		inner.state.decisions = Some(Default::default());
+	}
 	let snapshot_boundary = if let Some(snapshot) = snapshot.clone() {
+		if snapshot.state.decisions.is_some() != (decision_mode == DecisionMode::ParentDecisions) {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!("a recovered snapshot's decision state does not match {decision_mode:?}"),
+			));
+		}
 		inner.state = snapshot.state;
 		inner.state.last_applied_log_id = snapshot.held.meta.last_log_id;
 		inner.state.last_membership = snapshot.held.meta.last_membership.clone();
@@ -3996,7 +4119,12 @@ impl WendelonStateMachine {
 		observability_metrics: &'static MetricsRegistry,
 	) -> std::io::Result<Self> {
 		let (finalization_events, _) = broadcast::channel(FINALIZATION_BROADCAST_CAPACITY);
-		let inner = recover_sm_inner(snapshot, entries, checkpoint)?;
+		let inner = recover_sm_inner(
+			snapshot_runtime.decision_mode,
+			snapshot,
+			entries,
+			checkpoint,
+		)?;
 
 		let admission_snapshot = watch::channel(admission_snapshot_from_state(&inner.state)).0;
 		let revocation_snapshot = watch::channel(revocation_snapshot_from_state(&inner.state)).0;
@@ -4299,6 +4427,11 @@ impl WendelonStateMachine {
 				.map(|slab| (slab, standing(slab)))
 				.collect(),
 		}
+	}
+
+	/// A read of the applied state under its lock, without cloning it.
+	pub(crate) async fn read_state<R>(&self, read: impl FnOnce(&SmState) -> R) -> R {
+		read(&self.inner.read().await.state)
 	}
 
 	pub(crate) async fn incarnation_registry(&self, node: u32) -> IncarnationRegistry {
@@ -4756,12 +4889,15 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 			drop(snapshot);
 			receive_path
 		};
-		let (header, mut state) =
-			decode_snapshot_file(self.snapshot_runtime.file_ops.as_ref(), &receive_path)
-				.await
-				.map_err(|err| {
-					StorageIOError::read_snapshot(Some(meta.signature()), AnyError::new(&err))
-				})?;
+		let (header, mut state) = decode_snapshot_file(
+			self.snapshot_runtime.file_ops.as_ref(),
+			&receive_path,
+			self.snapshot_runtime.decision_mode,
+		)
+		.await
+		.map_err(|err| {
+			StorageIOError::read_snapshot(Some(meta.signature()), AnyError::new(&err))
+		})?;
 		validate_snapshot_header_log_coordinates(&header, state.last_applied_log_id).map_err(
 			|err| {
 				StorageIOError::read_snapshot(
@@ -6197,6 +6333,32 @@ fn checkpoint_observation_from_state(
 	})
 }
 
+/// ADR 0699 S3a tests: apply as appended by `leader` at `log_index`.
+#[cfg(test)]
+pub(crate) fn apply_at_leader_for_test(
+	state: &mut SmState,
+	req: WendelonRequest,
+	log_index: u64,
+	leader: u32,
+) -> WendelonResponse {
+	apply_request_at_log_index(state, req, log_index, leader).0
+}
+
+/// ADR 0699 S2 tests in other modules: apply at a given log index, as if the
+/// owner's own node appended the entry, and see only the response.
+#[cfg(test)]
+pub(crate) fn apply_request_at_index_for_test(
+	state: &mut SmState,
+	req: WendelonRequest,
+	log_index: u64,
+) -> WendelonResponse {
+	let leader_node = match &req {
+		WendelonRequest::RegisterIncarnation(register) => register.node,
+		_ => 0,
+	};
+	apply_request_at_log_index(state, req, log_index, leader_node).0
+}
+
 #[cfg(test)]
 fn apply_request(
 	state: &mut SmState,
@@ -6256,6 +6418,15 @@ fn apply_request_at_log_index(
 			if lease.range_end < lease.range_start {
 				return (WendelonResponse::LeaseDenied, None);
 			}
+			// ADR 0699 S2: the fixed range universe and its lineages.
+			let effect = if state.decisions.is_some() {
+				match crate::consensus::decisions::admit_lease_grant(state, &lease) {
+					Ok(effect) => Some(effect),
+					Err(()) => return (WendelonResponse::LeaseDenied, None),
+				}
+			} else {
+				None
+			};
 			// Per-range overlap sweep. Two ranges [a,b] and [c,d]
 			// overlap iff a <= d && c <= b. A live lease in the
 			// *same or newer* epoch blocks the grant unless it
@@ -6285,6 +6456,9 @@ fn apply_request_at_log_index(
 				}
 				return (WendelonResponse::LeaseDenied, None);
 			}
+			if let Some(effect) = effect {
+				crate::consensus::decisions::record_grant(state, &lease, effect);
+			}
 			state.leases.insert(lease.range_start, lease);
 			(WendelonResponse::Success, None)
 		}
@@ -6295,6 +6469,7 @@ fn apply_request_at_log_index(
 					&& existing.holder == release.holder =>
 			{
 				state.leases.remove(&release.range_start);
+				crate::consensus::decisions::record_release(state, &release);
 				(WendelonResponse::Success, None)
 			}
 			Some(_) => (WendelonResponse::LeaseDenied, None),
@@ -6302,12 +6477,18 @@ fn apply_request_at_log_index(
 		},
 		WendelonRequest::AdvanceEpoch(record) => {
 			apply_advance_epoch(state, record);
+			crate::consensus::decisions::prune_lineages(state);
 			(WendelonResponse::Success, None)
 		}
 		WendelonRequest::SchemaUpdate(bytes) => match apply_schema_update(state, &bytes) {
 			Ok(()) => (WendelonResponse::Success, None),
 			Err(err) => (WendelonResponse::Error(err), None),
 		},
+		// ADR 0699 S5a: the certified survivor rule assumes no drops in mode.
+		WendelonRequest::TableDropPrepare(_) if state.decisions.is_some() => (
+			WendelonResponse::Error("table drops are refused under ParentDecisions".into()),
+			None,
+		),
 		WendelonRequest::TableDropPrepare(request) => (
 			apply_table_drop_prepare(state, request, entry_log_index),
 			None,
@@ -6326,6 +6507,16 @@ fn apply_request_at_log_index(
 		),
 		WendelonRequest::TableDropSettlement(request) => {
 			(apply_table_drop_settlement(state, request), None)
+		}
+		// ADR 0699 S5a: CTAS writes rows outside parent decisions, so it is
+		// unsupported in this mode, refused rather than silently changed.
+		WendelonRequest::CtasSaga(_) | WendelonRequest::ReplayLegacyCtasRowDispatched(_)
+			if state.decisions.is_some() =>
+		{
+			(
+				WendelonResponse::Error("CTAS is refused under ParentDecisions".into()),
+				None,
+			)
 		}
 		WendelonRequest::CtasSaga(mutation) => {
 			let response = match apply_ctas_saga_mutation(state, mutation) {
@@ -6375,8 +6566,45 @@ fn apply_request_at_log_index(
 		| WendelonRequest::RetiredRetireTieredSlab(never)
 		| WendelonRequest::RetiredCompactionCommit(never) => match never {},
 		WendelonRequest::RegisterIncarnation(register) => {
-			apply_register_incarnation(state, register, leader_node)
+			// ADR 0699 S3a: under ParentDecisions the leader admits a registration
+			// only for the node authenticated on its connection
+			// (`network::decision_proposals`), so a follower can register its first
+			// incarnation. Today's authority keeps the appending-leader rule.
+			// Under this authority only a first registration or its exact retry
+			// applies: an established incarnation is never replaced, since this
+			// checkpoint has no replacement, copy or re-entry.
+			let appending = if state.decisions.is_some() {
+				let current = state
+					.incarnations
+					.get(&register.node)
+					.and_then(|registry| registry.current);
+				if register.supersedes.is_some()
+					|| current.is_some_and(|current| current != register.incarnation)
+				{
+					return (
+						WendelonResponse::Refused(SlabRefusal::StaleSupersede {
+							node: register.node,
+							current,
+						}),
+						None,
+					);
+				}
+				register.node
+			} else {
+				leader_node
+			};
+			let applied = apply_register_incarnation(state, register, appending);
+			crate::consensus::decisions::prune_lineages(state);
+			applied
 		}
+		WendelonRequest::Decision(command) => (
+			WendelonResponse::Decision(crate::consensus::decisions::apply(
+				state,
+				command,
+				entry_log_index,
+			)),
+			None,
+		),
 		WendelonRequest::SlabOp(op) => {
 			slab_op_apply::apply_slab_op(state, op, entry_log_index, leader_node)
 		}
@@ -6398,6 +6626,12 @@ fn apply_request_at_log_index(
 		),
 		WendelonRequest::ResumeTenant(tenant_id) => (
 			apply_tenant_state_transition(state, tenant_id, TenantLifecycleState::Active),
+			None,
+		),
+		// ADR 0699 S5a: a tenant delete drops its data, which the frozen survivor
+		// policy does not allow in this mode.
+		WendelonRequest::DeleteTenant(_) if state.decisions.is_some() => (
+			WendelonResponse::Error("tenant deletes are refused under ParentDecisions".into()),
 			None,
 		),
 		WendelonRequest::DeleteTenant(tenant_id) => (apply_delete_tenant(state, tenant_id), None),
@@ -6449,6 +6683,11 @@ fn apply_request_at_log_index(
 		WendelonRequest::RevokeActorKey(revocation) => {
 			(apply_revoke_actor_key(state, revocation), None)
 		}
+		// ADR 0699 S5a: the read and survivor policy is frozen in mode.
+		WendelonRequest::SetTableRetentionPolicy(_) if state.decisions.is_some() => (
+			WendelonResponse::Error("table retention is frozen under ParentDecisions".into()),
+			None,
+		),
 		WendelonRequest::SetTableRetentionPolicy(update) => {
 			(apply_set_table_retention_policy(state, update), None)
 		}
@@ -6591,6 +6830,14 @@ fn apply_table_schema_update(
 		SchemaMutationKind::Create | SchemaMutationKind::Alter => {
 			let descriptor = decode_table_schema_descriptor_v1(&envelope.payload)
 				.map_err(|err| err.to_string())?;
+			// ADR 0699 S4b: KV versions are owned under the reserved KV table id.
+			if state.decisions.is_some()
+				&& descriptor.table_object_id == crate::schema::TableObjectId::DEFAULT_KV
+			{
+				return Err(
+					"the reserved KV table id cannot be taken under ParentDecisions".to_owned(),
+				);
+			}
 			let current_descriptor = state
 				.table_schemas
 				.latest_by_name(
@@ -8062,6 +8309,7 @@ impl RaftSnapshotBuilder<WendelonTypeConfig> for WendelonSnapshotBuilder {
 		SnapshotPublication::healthy(&*self.snapshot_runtime.publication.state.lock().await)
 			.map_err(write_err)?;
 		persist_snapshot_artifact(
+			self.snapshot_runtime.decision_mode,
 			self.snapshot_runtime.file_ops.as_ref(),
 			&self.snapshot_runtime.paths,
 			&state,
@@ -8475,6 +8723,7 @@ async fn create_wal_holder(
 struct CheckpointPage {
 	checkpoint: RecoveryCheckpoint,
 	pointer: LogId<u32>,
+	format_version: u8,
 }
 
 impl CheckpointPage {
@@ -8483,6 +8732,7 @@ impl CheckpointPage {
 	fn latest(
 		checkpoint: Option<RecoveryCheckpoint>,
 		pointer: Option<LogId<u32>>,
+		format_version: u8,
 	) -> std::io::Result<Option<Self>> {
 		let Some(checkpoint) = checkpoint else {
 			return Ok(None);
@@ -8503,15 +8753,17 @@ impl CheckpointPage {
 		Ok(Some(Self {
 			checkpoint,
 			pointer,
+			format_version,
 		}))
 	}
 
 	fn page(&self) -> AlignedBuf {
-		serialize_checkpoint_page(
+		serialize_checkpoint_page_as(
 			self.checkpoint.commit_index,
 			self.checkpoint.e_safe_index,
 			self.pointer.index,
 			self.pointer.leader_id.term,
+			self.format_version,
 		)
 	}
 }
@@ -8635,12 +8887,13 @@ async fn load_vote_state(
 async fn load_snapshot_artifact(
 	file_ops: &dyn AsyncFileOps,
 	snapshot_path: &Path,
+	decision_mode: DecisionMode,
 ) -> std::io::Result<Option<LoadedSnapshot>> {
 	if !artifact_exists(file_ops, snapshot_path).await? {
 		return Ok(None);
 	}
 	let (header, state, artifact_hash, artifact_bytes) =
-		decode_snapshot_file_with_identity(file_ops, snapshot_path)
+		decode_snapshot_file_with_identity(file_ops, snapshot_path, decision_mode)
 			.await
 			.map_err(|err| {
 				Error::new(
@@ -8745,7 +8998,14 @@ fn replay_exported_control_state(wal: &[u8], snapshot_bytes: &[u8]) -> std::io::
 		last_purged: snapshot.as_ref().and_then(|s| s.last_included),
 		..Default::default()
 	};
-	replay_wal_segment_bytes(wal, &segment, snapshot.as_ref(), false, &mut replay)?;
+	replay_wal_segment_bytes(
+		wal,
+		&segment,
+		snapshot.as_ref(),
+		false,
+		DecisionMode::Today,
+		&mut replay,
+	)?;
 	check_retained_log_contiguous(
 		&segment.path,
 		snapshot.as_ref().and_then(|s| s.last_included),
@@ -8754,6 +9014,7 @@ fn replay_exported_control_state(wal: &[u8], snapshot_bytes: &[u8]) -> std::io::
 	)?;
 	resolve_recovered_committed(snapshot.as_ref(), &replay.entries, replay.checkpoint)?;
 	Ok(recover_sm_inner(
+		DecisionMode::Today,
 		snapshot,
 		replay.entries.into_values().collect(),
 		replay.checkpoint,
@@ -8765,6 +9026,7 @@ async fn replay_wal(
 	file_ops: &dyn AsyncFileOps,
 	wal_path: &Path,
 	snapshot: Option<&LoadedSnapshot>,
+	decision_mode: DecisionMode,
 ) -> std::io::Result<WALReplay> {
 	let mut replay = WALReplay {
 		artifact_hasher: Some(control_artifact_hash::Context::new()),
@@ -8789,8 +9051,15 @@ async fn replay_wal(
 	for (index, segment) in discovered.iter().enumerate() {
 		let allow_torn_tail = index + 1 == discovered.len();
 		let had_entries = !replay.entries.is_empty();
-		if let Some(meta) =
-			replay_wal_segment(file_ops, segment, snapshot, allow_torn_tail, &mut replay).await?
+		if let Some(meta) = replay_wal_segment(
+			file_ops,
+			segment,
+			snapshot,
+			allow_torn_tail,
+			decision_mode,
+			&mut replay,
+		)
+		.await?
 		{
 			replay.wal_segments.push(meta);
 		}
@@ -9130,6 +9399,7 @@ async fn replay_wal_segment(
 	segment: &DiscoveredWalSegment,
 	snapshot: Option<&LoadedSnapshot>,
 	allow_torn_tail: bool,
+	decision_mode: DecisionMode,
 	replay: &mut WALReplay,
 ) -> std::io::Result<Option<WalSegmentMeta>> {
 	let bytes = match file_ops.read_all(&segment.path).await {
@@ -9137,7 +9407,14 @@ async fn replay_wal_segment(
 		Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
 		Err(err) => return Err(err),
 	};
-	replay_wal_segment_bytes(&bytes, segment, snapshot, allow_torn_tail, replay)
+	replay_wal_segment_bytes(
+		&bytes,
+		segment,
+		snapshot,
+		allow_torn_tail,
+		decision_mode,
+		replay,
+	)
 }
 
 fn replay_wal_segment_bytes(
@@ -9145,6 +9422,7 @@ fn replay_wal_segment_bytes(
 	segment: &DiscoveredWalSegment,
 	snapshot: Option<&LoadedSnapshot>,
 	allow_torn_tail: bool,
+	decision_mode: DecisionMode,
 	replay: &mut WALReplay,
 ) -> std::io::Result<Option<WalSegmentMeta>> {
 	if let Some(hash) = &mut replay.artifact_hasher {
@@ -9195,7 +9473,20 @@ fn replay_wal_segment_bytes(
 		// Before `body_len` is trusted for anything. A record shaped by a build
 		// this one does not know is not a torn tail and not damage, and treating
 		// it as either would be a guess presented as a diagnosis.
-		if header.format_version > WAL_FORMAT_VERSION {
+		let required = decision_mode.wal_format();
+		// The new authority accepts only its own records, of every kind. Today keeps
+		// its historical acceptance of older checkpoint records.
+		if decision_mode != DecisionMode::Today && header.format_version != required {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				UnsupportedControlFormat {
+					artifact: "wal",
+					found: header.format_version,
+					required,
+				},
+			));
+		}
+		if header.format_version > required {
 			return Err(Error::new(
 				ErrorKind::InvalidData,
 				format!(
@@ -9206,7 +9497,7 @@ fn replay_wal_segment_bytes(
 					offset,
 					header.format_version,
 					PRE_VERSIONING_FORMAT,
-					WAL_FORMAT_VERSION
+					required
 				),
 			));
 		}
@@ -9257,7 +9548,14 @@ fn replay_wal_segment_bytes(
 		let body = &bytes[offset + header_size..body_end];
 		match header.record_type {
 			REC_LOG_ENTRY => {
-				let entry = decode_log_record(&segment.path, offset, &header, body, fixed_size)?;
+				let entry = decode_log_record(
+					decision_mode,
+					&segment.path,
+					offset,
+					&header,
+					body,
+					fixed_size,
+				)?;
 				if first_log_entry_index.is_none() {
 					first_log_entry_index = Some(entry.log_id.index);
 					if segment.start_index != 0 && segment.start_index != entry.log_id.index {
@@ -9406,6 +9704,7 @@ async fn open_control_artifact(
 }
 
 fn decode_log_record(
+	decision_mode: DecisionMode,
 	wal_path: &Path,
 	offset: usize,
 	header: &WALRecordHeader,
@@ -9447,40 +9746,42 @@ fn decode_log_record(
 	// interior corruption. ADR 0697: bodies written before owner-qualified slab
 	// identity are refused before any payload is decoded; no older shape is
 	// upconverted.
-	if header.format_version != WAL_FORMAT_VERSION {
+	let required = decision_mode.wal_format();
+	if header.format_version != required {
 		return Err(Error::new(
 			ErrorKind::InvalidData,
 			UnsupportedControlFormat {
 				artifact: "wal",
 				found: header.format_version,
-				required: WAL_FORMAT_VERSION,
+				required,
 			},
 		));
 	}
 	let entry: Entry<WendelonTypeConfig> = match header.format_version {
-		WAL_FORMAT_VERSION => match postcard::take_from_bytes::<Entry<WendelonTypeConfig>>(payload)
-		{
-			Ok((entry, [])) => entry,
-			Ok((_entry, rest)) => {
-				return Err(wal_body_format_mismatch(
-					wal_path,
-					offset,
-					header.format_version,
-					&format!(
-						"log entry decoded with {} unconsumed payload bytes",
-						rest.len()
-					),
-				));
+		version if version == required => {
+			match postcard::take_from_bytes::<Entry<WendelonTypeConfig>>(payload) {
+				Ok((entry, [])) => entry,
+				Ok((_entry, rest)) => {
+					return Err(wal_body_format_mismatch(
+						wal_path,
+						offset,
+						header.format_version,
+						&format!(
+							"log entry decoded with {} unconsumed payload bytes",
+							rest.len()
+						),
+					));
+				}
+				Err(err) => {
+					return Err(wal_body_format_mismatch(
+						wal_path,
+						offset,
+						header.format_version,
+						&format!("log entry postcard decode failed: {err}"),
+					));
+				}
 			}
-			Err(err) => {
-				return Err(wal_body_format_mismatch(
-					wal_path,
-					offset,
-					header.format_version,
-					&format!("log entry postcard decode failed: {err}"),
-				));
-			}
-		},
+		}
 		version => {
 			return Err(wal_body_format_mismatch(
 				wal_path,
@@ -9490,6 +9791,17 @@ fn decode_log_record(
 			));
 		}
 	};
+	if let EntryPayload::Normal(request) = &entry.payload
+		&& request.is_parent_decisions_only()
+		&& decision_mode != DecisionMode::ParentDecisions
+	{
+		return Err(wal_body_format_mismatch(
+			wal_path,
+			offset,
+			header.format_version,
+			"a parent decision record is not part of this WAL format",
+		));
+	}
 	if entry.log_id.index != fixed.index
 		|| entry.log_id.leader_id.term != fixed.term
 		|| header.log_index != fixed.index
@@ -9564,7 +9876,24 @@ fn validate_snapshot_header_log_coordinates(
 /// Build one page-padded WAL record for a single entry:
 /// `[WALRecordHeader][RaftLogEntryFixed][postcard(entry)][profile-hash-prefix checksum]`
 /// with the tail zero-padded to `DIRECT_IO_ALIGN`.
+#[cfg(any(test, feature = "test-support"))]
 fn serialize_entry_page(entry: &Entry<WendelonTypeConfig>) -> Result<AlignedBuf, AnyError> {
+	serialize_entry_page_as(entry, WAL_FORMAT_VERSION)
+}
+
+fn serialize_entry_page_as(
+	entry: &Entry<WendelonTypeConfig>,
+	format_version: u8,
+) -> Result<AlignedBuf, AnyError> {
+	if let EntryPayload::Normal(request) = &entry.payload
+		&& request.is_parent_decisions_only()
+		&& format_version != crate::schema::WAL_FORMAT_VERSION_PARENT_DECISIONS
+	{
+		return Err(AnyError::new(&Error::new(
+			ErrorKind::InvalidInput,
+			format!("WAL format {format_version} cannot carry a parent decision record"),
+		)));
+	}
 	let payload_len =
 		postcard::experimental::serialized_size(entry).map_err(|e| AnyError::new(&e))?;
 	let header_size = std::mem::size_of::<WALRecordHeader>();
@@ -9597,6 +9926,7 @@ fn serialize_entry_page(entry: &Entry<WendelonTypeConfig>) -> Result<AlignedBuf,
 		EntryPayload::Normal(WendelonRequest::SlabOp(_)) => (LogEntryKind::APPEND, 0),
 		EntryPayload::Normal(WendelonRequest::CancelOp(_)) => (LogEntryKind::APPEND, 0),
 		EntryPayload::Normal(WendelonRequest::AckOutcomes(_)) => (LogEntryKind::APPEND, 0),
+		EntryPayload::Normal(WendelonRequest::Decision(_)) => (LogEntryKind::APPEND, 0),
 		EntryPayload::Normal(WendelonRequest::CreateTenant(_)) => (LogEntryKind::APPEND, 0),
 		EntryPayload::Normal(WendelonRequest::UpdateTenantQuota(_)) => (LogEntryKind::APPEND, 0),
 		EntryPayload::Normal(WendelonRequest::SuspendTenant(_)) => (LogEntryKind::APPEND, 0),
@@ -9649,7 +9979,7 @@ fn serialize_entry_page(entry: &Entry<WendelonTypeConfig>) -> Result<AlignedBuf,
 
 	let header = WALRecordHeader {
 		record_type: REC_LOG_ENTRY,
-		format_version: WAL_FORMAT_VERSION,
+		format_version,
 		_pad1: [0; 6],
 		body_len: body_len as u64,
 		log_index: entry.log_id.index,
@@ -9679,11 +10009,28 @@ fn serialize_entry_page(entry: &Entry<WendelonTypeConfig>) -> Result<AlignedBuf,
 	Ok(buf)
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn serialize_checkpoint_page(
 	commit_index: u64,
 	e_safe_index: u64,
 	log_index: u64,
 	term: u64,
+) -> AlignedBuf {
+	serialize_checkpoint_page_as(
+		commit_index,
+		e_safe_index,
+		log_index,
+		term,
+		WAL_FORMAT_VERSION,
+	)
+}
+
+fn serialize_checkpoint_page_as(
+	commit_index: u64,
+	e_safe_index: u64,
+	log_index: u64,
+	term: u64,
+	format_version: u8,
 ) -> AlignedBuf {
 	let header_size = std::mem::size_of::<WALRecordHeader>();
 	let body_size = std::mem::size_of::<WALCheckpointBody>();
@@ -9695,7 +10042,7 @@ fn serialize_checkpoint_page(
 	};
 	let header = WALRecordHeader {
 		record_type: REC_CHECKPOINT,
-		format_version: WAL_FORMAT_VERSION,
+		format_version,
 		_pad1: [0; 6],
 		body_len: body_size as u64,
 		log_index,
@@ -9715,7 +10062,7 @@ fn serialize_checkpoint_page(
 fn encode_snapshot(state: &SmState) -> Result<Vec<u8>, AnyError> {
 	slab_op_apply::validate_slab_terminal(state)
 		.map_err(|error| AnyError::new(&std::io::Error::other(error)))?;
-	let body = postcard::to_allocvec(state).map_err(|e| AnyError::new(&e))?;
+	let body = encode_state_body(DecisionMode::Today, state).map_err(|e| AnyError::new(&e))?;
 	let header = snapshot_header_template(state);
 	let header = SnapshotHeader {
 		state_sha256: control_artifact_digest_32(&body),
@@ -9728,6 +10075,10 @@ fn encode_snapshot(state: &SmState) -> Result<Vec<u8>, AnyError> {
 }
 
 fn snapshot_header_template(state: &SmState) -> SnapshotHeader {
+	snapshot_header_template_as(state, SNAPSHOT_FORMAT_VERSION)
+}
+
+fn snapshot_header_template_as(state: &SmState, format_version: u8) -> SnapshotHeader {
 	let (last_index, last_term) = match state.last_applied_log_id {
 		Some(id) => (id.index, id.leader_id.term),
 		None => (0, 0),
@@ -9743,7 +10094,7 @@ fn snapshot_header_template(state: &SmState) -> SnapshotHeader {
 		},
 		state_sha256: [0; 32],
 		cache_checkpoint_len: 0,
-		format_version: SNAPSHOT_FORMAT_VERSION,
+		format_version,
 		_pad: [0; 3],
 	}
 }
@@ -9773,6 +10124,7 @@ async fn sync_snapshot_handle(
 /// Writes `state` to the build temporary file and syncs it. Publication (rename into `current`)
 /// is the caller's, under the publication lock.
 async fn persist_snapshot_artifact(
+	decision_mode: DecisionMode,
 	file_ops: &dyn AsyncFileOps,
 	paths: &SnapshotPaths,
 	state: &SmState,
@@ -9794,11 +10146,10 @@ async fn persist_snapshot_artifact(
 	let write_handle = handle.clone();
 	spawn_blocking_snapshot_io(move || {
 		let mut file = write_handle.try_clone()?;
-		let placeholder = snapshot_header_template(&state);
+		let placeholder = snapshot_header_template_as(&state, decision_mode.snapshot_format());
 		file.write_all(bytemuck::bytes_of(&placeholder))?;
 		let writer = HashingWriter::new(&mut file);
-		let writer = postcard::to_io(&state, writer)
-			.map_err(|err| Error::other(format!("snapshot postcard encode failed: {err}")))?;
+		let writer = write_state_body(decision_mode, &state, writer)?;
 		let (file, state_hash) = writer.finalize();
 		file.flush()?;
 		let header = SnapshotHeader {
@@ -9817,14 +10168,17 @@ async fn persist_snapshot_artifact(
 async fn decode_snapshot_file(
 	file_ops: &dyn AsyncFileOps,
 	path: &Path,
+	decision_mode: DecisionMode,
 ) -> std::io::Result<(SnapshotHeader, SmState)> {
-	let (header, state, _, _) = decode_snapshot_file_with_identity(file_ops, path).await?;
+	let (header, state, _, _) =
+		decode_snapshot_file_with_identity(file_ops, path, decision_mode).await?;
 	Ok((header, state))
 }
 
 async fn decode_snapshot_file_with_identity(
 	file_ops: &dyn AsyncFileOps,
 	path: &Path,
+	decision_mode: DecisionMode,
 ) -> std::io::Result<(SnapshotHeader, SmState, [u8; 32], u64)> {
 	let handle = file_ops
 		.open(
@@ -9837,7 +10191,7 @@ async fn decode_snapshot_file_with_identity(
 		.await?;
 	spawn_blocking_snapshot_io(move || {
 		let file = handle.try_clone()?;
-		decode_snapshot_reader_with_identity(file)
+		decode_snapshot_reader_as(decision_mode, file)
 			.map_err(|err| Error::new(ErrorKind::InvalidData, err))
 	})
 	.await
@@ -9849,6 +10203,13 @@ fn decode_snapshot_reader<R: Read>(reader: R) -> Result<(SnapshotHeader, SmState
 }
 
 fn decode_snapshot_reader_with_identity<R: Read>(
+	reader: R,
+) -> Result<(SnapshotHeader, SmState, [u8; 32], u64), String> {
+	decode_snapshot_reader_as(DecisionMode::Today, reader)
+}
+
+fn decode_snapshot_reader_as<R: Read>(
+	decision_mode: DecisionMode,
 	mut reader: R,
 ) -> Result<(SnapshotHeader, SmState, [u8; 32], u64), String> {
 	let mut header_bytes = [0u8; std::mem::size_of::<SnapshotHeader>()];
@@ -9859,20 +10220,21 @@ fn decode_snapshot_reader_with_identity<R: Read>(
 	// Ahead of the digest check on purpose. A version this build does not know
 	// describes a body whose shape it cannot reason about, and a digest computed
 	// over bytes it cannot interpret would only dress up the confusion.
-	if header.format_version > SNAPSHOT_FORMAT_VERSION {
+	let required = decision_mode.snapshot_format();
+	if header.format_version > required {
 		return Err(format!(
 			"snapshot format version {} is newer than this build accepts (supported: {}..={}); \
 			 the artifact is intact but written by a different build, not corrupt",
-			header.format_version, PRE_VERSIONING_FORMAT, SNAPSHOT_FORMAT_VERSION
+			header.format_version, PRE_VERSIONING_FORMAT, required
 		));
 	}
 	// ADR 0697: a snapshot written before owner-qualified slab identity is
 	// refused before its body is decoded; no older shape is upconverted.
-	if header.format_version != SNAPSHOT_FORMAT_VERSION {
+	if header.format_version != required {
 		return Err(UnsupportedControlFormat {
 			artifact: "snapshot",
 			found: header.format_version,
-			required: SNAPSHOT_FORMAT_VERSION,
+			required,
 		}
 		.to_string());
 	}
@@ -9896,7 +10258,7 @@ fn decode_snapshot_reader_with_identity<R: Read>(
 	}
 	// The digest matched, so the body is exactly what its writer produced, at
 	// the one version this build reads: a decode failure is a shape mismatch.
-	let state = decode_snapshot_state_bytes(&body)?;
+	let state = decode_state_body(decision_mode, &body)?;
 	validate_slab_identity_state(&state)?;
 	slab_op_apply::validate_op_tables(&state)?;
 	slab_op_apply::validate_slab_terminal(&state)?;
@@ -9911,14 +10273,72 @@ fn decode_snapshot_reader_with_identity<R: Read>(
 	))
 }
 
-fn decode_snapshot_state_bytes(body: &[u8]) -> Result<SmState, String> {
-	match postcard::take_from_bytes::<SmState>(body) {
-		Ok((state, [])) => Ok(state),
-		Ok((_state, trailing)) => Err(format!(
-			"snapshot has unexpected trailing bytes: {}",
-			trailing.len()
-		)),
-		Err(err) => Err(format!("snapshot postcard decode failed: {err}")),
+/// ADR 0699 S2: the one writer of a snapshot body. Today writes `SmState`,
+/// whose decision state is skipped, and so refuses a state that holds one; a
+/// `ParentDecisions` store writes the format-10 envelope, which carries it.
+fn write_state_body<W: std::io::Write>(
+	decision_mode: DecisionMode,
+	state: &SmState,
+	writer: W,
+) -> std::io::Result<W> {
+	let written = match (decision_mode, state.decisions.as_ref()) {
+		(DecisionMode::Today, None) => postcard::to_io(state, writer),
+		(DecisionMode::ParentDecisions, Some(decisions)) => postcard::to_io(
+			&crate::consensus::decisions::DecisionSnapshotRef {
+				version: crate::consensus::decisions::DECISION_SNAPSHOT_ENVELOPE_VERSION,
+				sm: state,
+				decisions,
+			},
+			writer,
+		),
+		(mode, decisions) => {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				format!(
+					"a {mode:?} snapshot cannot encode a state whose decision state is {}",
+					if decisions.is_some() {
+						"present"
+					} else {
+						"absent"
+					}
+				),
+			));
+		}
+	};
+	written.map_err(|err| Error::other(format!("snapshot postcard encode failed: {err}")))
+}
+
+fn encode_state_body(decision_mode: DecisionMode, state: &SmState) -> std::io::Result<Vec<u8>> {
+	write_state_body(decision_mode, state, Vec::new())
+}
+
+/// ADR 0699 S2: the one reader of a snapshot body, by the store's authority.
+fn decode_state_body(decision_mode: DecisionMode, body: &[u8]) -> Result<SmState, String> {
+	fn whole<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, String> {
+		match postcard::take_from_bytes::<T>(body) {
+			Ok((value, [])) => Ok(value),
+			Ok((_value, trailing)) => Err(format!(
+				"snapshot has unexpected trailing bytes: {}",
+				trailing.len()
+			)),
+			Err(err) => Err(format!("snapshot postcard decode failed: {err}")),
+		}
+	}
+	match decision_mode {
+		DecisionMode::Today => whole::<SmState>(body),
+		DecisionMode::ParentDecisions => {
+			let envelope = whole::<crate::consensus::decisions::DecisionSnapshot>(body)?;
+			if envelope.version != crate::consensus::decisions::DECISION_SNAPSHOT_ENVELOPE_VERSION {
+				return Err(format!(
+					"decision snapshot envelope version {} is not supported",
+					envelope.version
+				));
+			}
+			envelope.decisions.validate()?;
+			let mut state = envelope.sm;
+			state.decisions = Some(envelope.decisions);
+			Ok(state)
+		}
 	}
 }
 
@@ -9980,6 +10400,10 @@ fn clone_entry(e: &Entry<WendelonTypeConfig>) -> Entry<WendelonTypeConfig> {
 
 #[allow(dead_code)]
 fn _unused_request_type_witness(_r: WendelonRequest, _s: WendelonResponse) {}
+
+#[cfg(test)]
+#[path = "raft_storage/decision_mode_tests.rs"]
+mod decision_mode_tests;
 
 #[cfg(test)]
 mod schema_state_tests {
@@ -13133,7 +13557,10 @@ mod recovery_tests {
 			&vote,
 			&snapshot,
 			Arc::new(BlockingFileOps),
-			WalOptions { segment_bytes },
+			WalOptions {
+				segment_bytes,
+				..WalOptions::default()
+			},
 		)
 		.await
 	}
@@ -13146,7 +13573,10 @@ mod recovery_tests {
 			&vote,
 			&snapshot,
 			Arc::new(crate::storage::IoUringFileOps::new(io)),
-			WalOptions { segment_bytes },
+			WalOptions {
+				segment_bytes,
+				..WalOptions::default()
+			},
 		)
 		.await
 		.unwrap()
@@ -13171,7 +13601,10 @@ mod recovery_tests {
 			&vote,
 			&snapshot,
 			file_ops,
-			WalOptions { segment_bytes },
+			WalOptions {
+				segment_bytes,
+				..WalOptions::default()
+			},
 		)
 		.await
 		.unwrap()
@@ -14695,6 +15128,7 @@ mod recovery_tests {
 			file_ops.clone(),
 			WalOptions {
 				segment_bytes: DIRECT_IO_ALIGN as u64,
+				..WalOptions::default()
 			},
 		)
 		.await
@@ -15855,7 +16289,10 @@ mod recovery_tests {
 			&vote,
 			&snapshot,
 			file_ops,
-			WalOptions { segment_bytes },
+			WalOptions {
+				segment_bytes,
+				..WalOptions::default()
+			},
 		)
 		.await
 	}
@@ -20658,8 +21095,15 @@ pub(crate) mod body_format_corpus {
 			body.extend_from_slice(&payload);
 			let mut header: WALRecordHeader = bytemuck::Zeroable::zeroed();
 			header.format_version = version;
-			let error = decode_log_record(Path::new("control.wal"), 0, &header, &body, fixed_size)
-				.unwrap_err();
+			let error = decode_log_record(
+				DecisionMode::Today,
+				Path::new("control.wal"),
+				0,
+				&header,
+				&body,
+				fixed_size,
+			)
+			.unwrap_err();
 			let refusal = error
 				.get_ref()
 				.and_then(|cause| cause.downcast_ref::<UnsupportedControlFormat>());

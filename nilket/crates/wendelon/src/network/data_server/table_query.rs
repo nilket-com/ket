@@ -497,11 +497,13 @@ impl WendelonDataServer {
 		};
 		let cancellation_token = active_query.token();
 		let span = local_table_query_span(&meta, frame.header.stream_id, trace_carrier);
+		let read_check = ReadCheckSlot::new();
 		let mut writer = TableQueryResponseStreamWriter::new(
 			&mut *stream,
 			frame.header.stream_id,
 			provisional_response,
-		);
+		)
+		.with_read_check_slot(&read_check);
 		let plan = match self
 			.prepare_table_query_execution_plan_with_migration_with_cancellation_and_stream(
 				&meta,
@@ -558,11 +560,13 @@ impl WendelonDataServer {
 					request_id = meta.request_id.get(),
 					"table query execution failed; reporting typed terminal frame"
 				);
-				let response = query_error_meta(
-					&audit_meta,
-					ReadStatus::QUERY_EXECUTION_FAILED,
-					self.local_node,
-				);
+				// ADR 0699 S4: a read authority lost mid-statement is retryable.
+				let status = if err.kind() == ErrorKind::Interrupted {
+					ReadStatus::BACKPRESSURED
+				} else {
+					ReadStatus::QUERY_EXECUTION_FAILED
+				};
+				let response = query_error_meta(&audit_meta, status, self.local_node);
 				self.emit_query_completion_audit(actor, &audit_meta, &response, 0)?;
 				match writer.emit_terminal(response).await {
 					Ok(()) => {
@@ -605,6 +609,14 @@ impl WendelonDataServer {
 		let mut response = plan.response;
 		if response.status == ReadStatus::KEY_NOT_FOUND {
 			response.status = ReadStatus::OK;
+		}
+		// ADR 0699 S4: no success terminal unless the read authority still holds.
+		if response.status == ReadStatus::OK {
+			if let Err(error) = writer.check_read().await {
+				tracing::warn!(%error, "table query read authority lost before its terminal");
+				response =
+					query_error_meta(&audit_meta, ReadStatus::BACKPRESSURED, self.local_node);
+			}
 		}
 		if response.status == ReadStatus::QUERY_CANCELLED {
 			metrics().observe_table_query_cancellation("cancelled_response");
@@ -854,5 +866,158 @@ impl WendelonDataServer {
 
 		stream.finish().await?;
 		Ok(())
+	}
+}
+
+/// ADR 0699 S4: a statement's read authority, re-checked after each emitted
+/// batch. A failure fails the statement; no success terminal follows it.
+pub(super) type ReadCheck = Box<dyn Fn() -> ReadCheckFuture + Send + Sync>;
+pub(super) type ReadCheckFuture =
+	std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send>>;
+/// Where a statement's read check lives: created by the stream handler before
+/// its writer, filled by a reader that has an authority to check.
+pub(super) type ReadCheckSlot = std::sync::OnceLock<ReadCheck>;
+
+pub(super) struct TableQueryResponseStreamWriter<'a> {
+	stream: &'a mut dyn TransportStream,
+	stream_id: u32,
+	provisional_response: QueryResponseMeta,
+	first_frame_sent: bool,
+	batch_count: usize,
+	total_arrow_bytes: usize,
+	read_check: Option<&'a ReadCheckSlot>,
+}
+
+impl<'a> TableQueryResponseStreamWriter<'a> {
+	pub(super) fn new(
+		stream: &'a mut dyn TransportStream,
+		stream_id: u32,
+		provisional_response: QueryResponseMeta,
+	) -> Self {
+		Self {
+			stream,
+			stream_id,
+			provisional_response,
+			first_frame_sent: false,
+			batch_count: 0,
+			total_arrow_bytes: 0,
+			read_check: None,
+		}
+	}
+
+	/// ADR 0699 S4: a slot whose check, once set, runs after every emitted
+	/// batch and before a success terminal.
+	pub(super) fn with_read_check_slot(mut self, slot: &'a ReadCheckSlot) -> Self {
+		self.read_check = Some(slot);
+		self
+	}
+
+	/// Sets the statement's read check. False when this writer has no slot or
+	/// a check is already set.
+	pub(super) fn set_read_check(&self, check: ReadCheck) -> bool {
+		self.read_check.is_some_and(|slot| slot.set(check).is_ok())
+	}
+
+	/// The statement's read authority check, when one is set. The future owns
+	/// what it checks, so awaiting it holds no borrow of the writer.
+	pub(super) fn check_read(&self) -> ReadCheckFuture {
+		match self.read_check.and_then(|slot| slot.get()) {
+			Some(check) => check(),
+			None => Box::pin(async { Ok(()) }),
+		}
+	}
+
+	pub(super) fn batch_count(&self) -> usize {
+		self.batch_count
+	}
+
+	pub(super) fn total_arrow_bytes(&self) -> usize {
+		self.total_arrow_bytes
+	}
+
+	pub(super) fn has_started(&self) -> bool {
+		self.first_frame_sent
+	}
+
+	/// ADR 0088: emit a payload the accumulator has already encoded and checked
+	/// against the frame cap. Splitting the encode from the write is what lets
+	/// the cap be enforced on the real bytes without encoding twice.
+	pub(super) async fn emit_encoded_batch(&mut self, arrow: Vec<u8>) -> std::io::Result<()> {
+		let header = if self.first_frame_sent {
+			FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: MsgType::TABLE_QUERY_RESP.0,
+				flags: 0,
+				stream_id: self.stream_id,
+				meta_len: 0,
+				arrow_len: arrow.len() as u32,
+				trailing_len: 0,
+			}
+		} else {
+			let response = QueryResponseMeta {
+				arrow_len: arrow.len() as u32,
+				..self.provisional_response
+			};
+			let meta_bytes = bytemuck::bytes_of(&response);
+			let header = FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: MsgType::TABLE_QUERY_RESP.0,
+				flags: 0,
+				stream_id: self.stream_id,
+				meta_len: meta_bytes.len() as u32,
+				arrow_len: arrow.len() as u32,
+				trailing_len: 0,
+			};
+			write_frame(self.stream, &header, meta_bytes, Some(&arrow), None).await?;
+			self.first_frame_sent = true;
+			self.batch_count = self.batch_count.saturating_add(1);
+			self.total_arrow_bytes = self.total_arrow_bytes.saturating_add(arrow.len());
+			return self.check_read().await;
+		};
+		write_frame(self.stream, &header, &[], Some(&arrow), None).await?;
+		self.batch_count = self.batch_count.saturating_add(1);
+		self.total_arrow_bytes = self.total_arrow_bytes.saturating_add(arrow.len());
+		self.check_read().await
+	}
+
+	pub(super) async fn emit_terminal(
+		&mut self,
+		response: QueryResponseMeta,
+	) -> std::io::Result<()> {
+		self.emit_terminal_with_trailing(response, None).await
+	}
+
+	pub(super) async fn emit_terminal_with_integrity(
+		&mut self,
+		response: QueryResponseMeta,
+		failure: TableReferenceIntegrityFailureMeta,
+	) -> std::io::Result<()> {
+		self.emit_terminal_with_trailing(response, Some(bytemuck::bytes_of(&failure)))
+			.await
+	}
+
+	pub(super) async fn emit_terminal_with_trailing(
+		&mut self,
+		response: QueryResponseMeta,
+		trailing: Option<&[u8]>,
+	) -> std::io::Result<()> {
+		let response = QueryResponseMeta {
+			arrow_len: 0,
+			..response
+		};
+		let meta_bytes = bytemuck::bytes_of(&response);
+		let header = FrameHeader {
+			magic: HRFT_MAGIC,
+			version: 1,
+			msg_type: MsgType::TABLE_QUERY_RESP.0,
+			flags: FRAME_FLAG_STREAM_END,
+			stream_id: self.stream_id,
+			meta_len: meta_bytes.len() as u32,
+			arrow_len: 0,
+			trailing_len: trailing.map(|bytes| bytes.len() as u32).unwrap_or(0),
+		};
+		write_frame(self.stream, &header, meta_bytes, None, trailing).await
 	}
 }

@@ -39,8 +39,8 @@ use crate::network::tls::{
 use crate::network::traits::{TransferLeadershipRequestMeta, TransferLeadershipResponseMeta};
 use crate::network::transfer_signing::TransferAuthority;
 use crate::network::transport::{
-	MembershipEpoch, NodeCapabilitySet, NodeRole, NodeRoleSet, PeerCapabilities, TransportTier,
-	TransportTierSet,
+	MembershipEpoch, NodeCapability, NodeCapabilitySet, NodeRole, NodeRoleSet, PeerCapabilities,
+	TransportTier, TransportTierSet,
 };
 use crate::network::wire;
 use crate::schema::table::{decode_descriptor_wire_name, encode_table_schema_descriptors};
@@ -142,6 +142,7 @@ enum ControlOperation {
 	IndexStatus,
 	MaintenanceReport,
 	MaintenanceRequeue,
+	DecisionPropose,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -705,6 +706,8 @@ pub struct RevocationAdminResponseWire {
 pub mod join_test_support;
 
 pub struct WendelonControlServer {
+	/// A joiner on another decision authority is refused before it is a learner.
+	decision_mode: crate::consensus::decision_mode::DecisionMode,
 	raft: WendelonRaft,
 	state_machine: crate::consensus::raft_storage::WendelonStateMachine,
 	crypto: Arc<CryptoManager>,
@@ -721,6 +724,8 @@ pub struct WendelonControlServer {
 	storage_manager: Option<Arc<SlabManager>>,
 	protocol: ProtocolVersionWindow,
 	reconcile_lock: Mutex<()>,
+	/// ADR 0699 S3a: the leader side of decision proposals; ParentDecisions only.
+	decision_proposals: Option<Arc<crate::network::decision_proposals::DecisionProposals>>,
 	#[cfg(feature = "test-support")]
 	join_promotion_gate: Option<join_test_support::JoinPromotionGate>,
 }
@@ -739,6 +744,7 @@ fn control_operation_permission(operation: ControlOperation) -> ActorPermission 
 		ControlOperation::IndexStatus => ActorPermission::TenantAdminRead,
 		ControlOperation::MaintenanceReport => ActorPermission::ControlStatus,
 		ControlOperation::MaintenanceRequeue => ActorPermission::ClusterControl,
+		ControlOperation::DecisionPropose => ActorPermission::ClusterControl,
 	}
 }
 
@@ -763,6 +769,7 @@ impl WendelonControlServer {
 		audit_sink: Arc<dyn AuditSink>,
 	) -> Self {
 		Self {
+			decision_mode: Default::default(),
 			raft,
 			state_machine,
 			crypto,
@@ -779,9 +786,26 @@ impl WendelonControlServer {
 			storage_manager: None,
 			protocol: ProtocolVersionWindow::default(),
 			reconcile_lock: Mutex::new(()),
+			decision_proposals: None,
 			#[cfg(feature = "test-support")]
 			join_promotion_gate: None,
 		}
+	}
+
+	pub(crate) fn with_decision_proposals(
+		mut self,
+		proposals: Option<Arc<crate::network::decision_proposals::DecisionProposals>>,
+	) -> Self {
+		self.decision_proposals = proposals;
+		self
+	}
+
+	pub(crate) fn with_decision_mode(
+		mut self,
+		decision_mode: crate::consensus::decision_mode::DecisionMode,
+	) -> Self {
+		self.decision_mode = decision_mode;
+		self
 	}
 
 	pub fn with_audit_sink(mut self, audit_sink: Arc<dyn AuditSink>) -> Self {
@@ -855,6 +879,9 @@ impl WendelonControlServer {
 				))),
 				WendelonResponse::Op(refusal) => Err(Error::other(format!(
 					"unexpected slab refusal for a non-slab command: {refusal:?}"
+				))),
+				WendelonResponse::Decision(result) => Err(Error::other(format!(
+					"unexpected decision result for a non-decision command: {result:?}"
 				))),
 				WendelonResponse::Root2Dormant => {
 					let message = String::from("Root2 carrier is dormant, not applied");
@@ -1099,6 +1126,9 @@ impl WendelonControlServer {
 						CtasSagaResponse::Rejected(CtasSagaReject::InvalidTransition)
 					}
 					WendelonResponse::Op(_) => {
+						CtasSagaResponse::Rejected(CtasSagaReject::InvalidTransition)
+					}
+					WendelonResponse::Decision(_) => {
 						CtasSagaResponse::Rejected(CtasSagaReject::InvalidTransition)
 					}
 					WendelonResponse::Root2Dormant => {
@@ -1863,6 +1893,9 @@ impl WendelonControlServer {
 				WendelonResponse::Op(refusal) => Err(Error::other(format!(
 					"unexpected slab refusal for a non-slab command: {refusal:?}"
 				))),
+				WendelonResponse::Decision(result) => Err(Error::other(format!(
+					"unexpected decision result for a non-decision command: {result:?}"
+				))),
 				WendelonResponse::Root2Dormant => {
 					let message = String::from("Root2 carrier is dormant, not applied");
 					self.revocation_admin_rejection(
@@ -2109,6 +2142,9 @@ impl WendelonControlServer {
 				))),
 				WendelonResponse::Op(refusal) => Err(Error::other(format!(
 					"unexpected slab refusal for a non-slab command: {refusal:?}"
+				))),
+				WendelonResponse::Decision(result) => Err(Error::other(format!(
+					"unexpected decision result for a non-decision command: {result:?}"
 				))),
 				WendelonResponse::Root2Dormant => {
 					let message = String::from("Root2 carrier is dormant, not applied");
@@ -3080,6 +3116,11 @@ impl WendelonControlServer {
 				WendelonResponse::Op(refusal) => Err(WendelonAdminError::Transport {
 					message: format!("unexpected slab refusal for a non-slab command: {refusal:?}"),
 				}),
+				WendelonResponse::Decision(result) => Err(WendelonAdminError::Transport {
+					message: format!(
+						"unexpected decision result for a non-decision command: {result:?}"
+					),
+				}),
 				WendelonResponse::Root2Dormant => {
 					let message = String::from("Root2 carrier is dormant, not applied");
 					Err(WendelonAdminError::Transport { message })
@@ -3120,6 +3161,9 @@ impl WendelonControlServer {
 				))),
 				WendelonResponse::Op(refusal) => Err(Error::other(format!(
 					"unexpected slab refusal for a non-slab command: {refusal:?}"
+				))),
+				WendelonResponse::Decision(result) => Err(Error::other(format!(
+					"unexpected decision result for a non-decision command: {result:?}"
 				))),
 				WendelonResponse::Root2Dormant => {
 					let message = String::from("Root2 carrier is dormant, not applied");
@@ -3183,6 +3227,9 @@ impl WendelonControlServer {
 				))),
 				WendelonResponse::Op(refusal) => Err(Error::other(format!(
 					"unexpected slab refusal for a non-slab command: {refusal:?}"
+				))),
+				WendelonResponse::Decision(result) => Err(Error::other(format!(
+					"unexpected decision result for a non-decision command: {result:?}"
 				))),
 				WendelonResponse::Root2Dormant => {
 					let message = String::from("Root2 carrier is dormant, not applied");
@@ -3286,6 +3333,9 @@ impl WendelonControlServer {
 				))),
 				WendelonResponse::Op(refusal) => Err(Error::other(format!(
 					"unexpected slab refusal for a non-slab command: {refusal:?}"
+				))),
+				WendelonResponse::Decision(result) => Err(Error::other(format!(
+					"unexpected decision result for a non-decision command: {result:?}"
 				))),
 				WendelonResponse::Root2Dormant => {
 					let message = String::from("Root2 carrier is dormant, not applied");
@@ -3397,6 +3447,9 @@ impl WendelonControlServer {
 				))),
 				WendelonResponse::Op(refusal) => Err(Error::other(format!(
 					"unexpected slab refusal for a non-slab command: {refusal:?}"
+				))),
+				WendelonResponse::Decision(result) => Err(Error::other(format!(
+					"unexpected decision result for a non-decision command: {result:?}"
 				))),
 				WendelonResponse::Root2Dormant => {
 					let message = String::from("Root2 carrier is dormant, not applied");
@@ -3863,6 +3916,7 @@ impl WendelonControlServer {
 				WendelonResponse::Error(_) => LeaseStatus::INTERNAL_ERROR,
 				WendelonResponse::Refused(_) => LeaseStatus::INTERNAL_ERROR,
 				WendelonResponse::Op(_) => LeaseStatus::INTERNAL_ERROR,
+				WendelonResponse::Decision(_) => LeaseStatus::INTERNAL_ERROR,
 				WendelonResponse::Root2Dormant => LeaseStatus::INTERNAL_ERROR,
 			},
 			Err(_) if !self.is_leader().await => LeaseStatus::DENIED_NOT_LEADER,
@@ -3902,6 +3956,7 @@ impl WendelonControlServer {
 				WendelonResponse::Error(_) => LeaseStatus::INTERNAL_ERROR,
 				WendelonResponse::Refused(_) => LeaseStatus::INTERNAL_ERROR,
 				WendelonResponse::Op(_) => LeaseStatus::INTERNAL_ERROR,
+				WendelonResponse::Decision(_) => LeaseStatus::INTERNAL_ERROR,
 				WendelonResponse::Root2Dormant => LeaseStatus::INTERNAL_ERROR,
 			},
 			Err(_) if !self.is_leader().await => LeaseStatus::DENIED_NOT_LEADER,
@@ -4346,7 +4401,16 @@ impl WendelonControlServer {
 			self.replication_factor as usize,
 			&snapshot,
 		)?;
-		let missing = missing_seed_batch(&expected, &snapshot.migrations)?;
+		// ADR 0699: migration initiation is disabled under ParentDecisions. The
+		// fixed membership forms before any write is served, so no data moves;
+		// an in-flight migration would refuse every Reserve over its range.
+		let missing = if self.decision_mode
+			== crate::consensus::decision_mode::DecisionMode::ParentDecisions
+		{
+			Vec::new()
+		} else {
+			missing_seed_batch(&expected, &snapshot.migrations)?
+		};
 		drop(snapshot);
 
 		if !missing.is_empty() {
@@ -4425,6 +4489,124 @@ impl WendelonControlServer {
 
 	async fn is_leader(&self) -> bool {
 		self.raft.current_leader().await == Some(self.local_node.id)
+	}
+
+	/// ADR 0699 S3a: admit and propose for the authenticated sender, or say why
+	/// not. A store on today's authority answers `ModeToday`.
+	async fn handle_decision_propose(
+		&self,
+		remote: NodeId,
+		frame: HrftFrame,
+	) -> std::io::Result<HrftFrame> {
+		use crate::network::decision_proposals::{
+			ProposalRefusal, ProposalResponse, ProposeRequest, decode_bounded,
+		};
+		let response = match &self.decision_proposals {
+			None => ProposalResponse::Refused(ProposalRefusal::ModeToday),
+			Some(proposals) => match decode_bounded::<ProposeRequest>(frame.meta.as_ref()) {
+				Ok(propose) => {
+					proposals.observe_sender_clock(remote.id, propose.sent_ms);
+					proposals.propose_as(remote.id, propose.request).await
+				}
+				Err(_) => ProposalResponse::Refused(ProposalRefusal::Malformed),
+			},
+		};
+		let bytes = postcard::to_stdvec(&response).map_err(Error::other)?;
+		let mut meta = self.pool.acquire();
+		meta.as_mut_vec().extend_from_slice(&bytes);
+		Ok(HrftFrame {
+			header: FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: MsgType::DECISION_PROPOSE_RESP.0,
+				flags: 0,
+				stream_id: frame.header.stream_id,
+				meta_len: meta.len() as u32,
+				arrow_len: 0,
+				trailing_len: 0,
+			},
+			meta,
+			arrow_payload: None,
+			trailing: None,
+		})
+	}
+
+	/// ADR 0699 S3c: an authoritative read of a parent's recorded decision.
+	async fn handle_decision_lookup(
+		&self,
+		remote: NodeId,
+		frame: HrftFrame,
+	) -> std::io::Result<HrftFrame> {
+		use crate::network::decision_proposals::{
+			LookupRequest, LookupResponse, ProposalRefusal, decode_bounded,
+		};
+		let response = match &self.decision_proposals {
+			None => LookupResponse::Refused(ProposalRefusal::ModeToday),
+			Some(proposals) => match decode_bounded::<LookupRequest>(frame.meta.as_ref()) {
+				Ok(request) => {
+					proposals.observe_sender_clock(remote.id, request.sent_ms);
+					proposals.lookup_as_leader(request).await
+				}
+				Err(_) => LookupResponse::Refused(ProposalRefusal::Malformed),
+			},
+		};
+		let bytes = postcard::to_stdvec(&response).map_err(Error::other)?;
+		let mut meta = self.pool.acquire();
+		meta.as_mut_vec().extend_from_slice(&bytes);
+		Ok(HrftFrame {
+			header: FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: MsgType::DECISION_LOOKUP_RESP.0,
+				flags: 0,
+				stream_id: frame.header.stream_id,
+				meta_len: meta.len() as u32,
+				arrow_len: 0,
+				trailing_len: 0,
+			},
+			meta,
+			arrow_payload: None,
+			trailing: None,
+		})
+	}
+
+	/// ADR 0699 S4: a reader's linearizable cut, answered only by the leader.
+	async fn handle_decision_cut(
+		&self,
+		remote: NodeId,
+		frame: HrftFrame,
+	) -> std::io::Result<HrftFrame> {
+		use crate::network::decision_proposals::{
+			CutRequest, CutResponse, ProposalRefusal, decode_bounded,
+		};
+		let response = match &self.decision_proposals {
+			None => CutResponse::Refused(ProposalRefusal::ModeToday),
+			Some(proposals) => match decode_bounded::<CutRequest>(frame.meta.as_ref()) {
+				Ok(request) => {
+					proposals.observe_sender_clock(remote.id, request.sent_ms);
+					proposals.cut_as_leader().await
+				}
+				Err(_) => CutResponse::Refused(ProposalRefusal::Malformed),
+			},
+		};
+		let bytes = postcard::to_stdvec(&response).map_err(Error::other)?;
+		let mut meta = self.pool.acquire();
+		meta.as_mut_vec().extend_from_slice(&bytes);
+		Ok(HrftFrame {
+			header: FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: MsgType::DECISION_CUT_RESP.0,
+				flags: 0,
+				stream_id: frame.header.stream_id,
+				meta_len: meta.len() as u32,
+				arrow_len: 0,
+				trailing_len: 0,
+			},
+			meta,
+			arrow_payload: None,
+			trailing: None,
+		})
 	}
 
 	fn lease_response(
@@ -4789,6 +4971,10 @@ impl WendelonControlServer {
 				&visible,
 			);
 		}
+		self.decision_mode.check_joiner(
+			NodeCapabilitySet::from_u8(req.capability_bits)
+				.contains(NodeCapability::ParentDecisions),
+		)?;
 		#[cfg(feature = "test-support")]
 		if let Some(gate) = &self.join_promotion_gate {
 			gate.record_mutation_path(req.node_id);
@@ -4982,6 +5168,21 @@ impl ControlRingServer for WendelonControlServer {
 				self.authorize_control_operation(&context, ControlOperation::Lease)?;
 				let remote = context.require_authenticated_node("LEASE_REQ")?;
 				self.handle_lease(remote, frame).await?
+			}
+			MsgType::DECISION_CUT_REQ => {
+				self.authorize_control_operation(&context, ControlOperation::DecisionPropose)?;
+				let remote = context.require_authenticated_node("DECISION_CUT_REQ")?;
+				self.handle_decision_cut(remote, frame).await?
+			}
+			MsgType::DECISION_LOOKUP_REQ => {
+				self.authorize_control_operation(&context, ControlOperation::DecisionPropose)?;
+				let remote = context.require_authenticated_node("DECISION_LOOKUP_REQ")?;
+				self.handle_decision_lookup(remote, frame).await?
+			}
+			MsgType::DECISION_PROPOSE_REQ => {
+				self.authorize_control_operation(&context, ControlOperation::DecisionPropose)?;
+				let remote = context.require_authenticated_node("DECISION_PROPOSE_REQ")?;
+				self.handle_decision_propose(remote, frame).await?
 			}
 			MsgType::LEASE_RELEASE_REQ => {
 				self.authorize_control_operation(&context, ControlOperation::LeaseRelease)?;

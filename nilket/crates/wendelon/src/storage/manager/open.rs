@@ -1093,6 +1093,7 @@ impl SlabManager {
 			tier_publication_locks: DashMap::new(),
 			cleanup_claims: DashMap::new(),
 			conflicted_locations: DashSet::new(),
+			versions_contained: AtomicBool::new(false),
 			unverified_tier_slabs: DashSet::new(),
 			tier_authority: tier_authority::TierAuthority::new(),
 			installed_snapshot_index: std::sync::RwLock::new(None),

@@ -747,6 +747,9 @@ pub enum WendelonRequest {
 	CancelOp(crate::consensus::slab_ops::CancelOp),
 	/// The owner has durably finished these operations (ADR 0697 §5.3).
 	AckOutcomes(crate::consensus::slab_ops::AckOutcomes),
+	/// A parent write decision (ADR 0699 S2). Only the `ParentDecisions` WAL
+	/// format carries it; today's format refuses it both ways.
+	Decision(crate::consensus::decisions::DecisionCommand),
 }
 
 impl WendelonRequest {
@@ -787,6 +790,16 @@ impl WendelonRequest {
 		"ack_outcomes",
 	];
 
+	/// Variants only the `ParentDecisions` WAL format (10) carries, appended
+	/// after [`Self::ALL_VARIANT_NAMES`]. Today's format 8 refuses them on write
+	/// and on read, so its body set is exactly the list above.
+	pub const PARENT_DECISIONS_VARIANT_NAMES: [&'static str; 1] = ["decision"];
+
+	/// True for a variant today's WAL format must never carry.
+	pub fn is_parent_decisions_only(&self) -> bool {
+		matches!(self, Self::Decision(_))
+	}
+
 	/// Total by construction: a new variant fails this match at compile time,
 	/// which is the earliest possible moment to learn the WAL body shape is
 	/// about to change.
@@ -823,6 +836,7 @@ impl WendelonRequest {
 			Self::SlabOp(_) => "slab_op",
 			Self::CancelOp(_) => "cancel_op",
 			Self::AckOutcomes(_) => "ack_outcomes",
+			Self::Decision(_) => "decision",
 		}
 	}
 }
@@ -843,6 +857,8 @@ pub enum WendelonResponse {
 	Refused(SlabRefusal),
 	/// Operation evidence (ADR 0697 §5).
 	Op(crate::consensus::slab_ops::OpResponse),
+	/// The result of a parent write decision (ADR 0699 S2).
+	Decision(crate::consensus::decisions::DecisionResult),
 }
 
 // The Wendelon implementation of the `openraft::RaftTypeConfig` trait.

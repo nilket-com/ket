@@ -2514,6 +2514,7 @@ async fn table_query_resp_streams_with_terminal_metadata() {
 		None,
 		None,
 		Some(&mut writer),
+		super::reader::ScanSource::Base,
 	)
 	.await
 	.unwrap();
@@ -2821,6 +2822,7 @@ async fn cancelled_consumer_stops_before_all_row_groups_scanned() {
 		None,
 		None,
 		Some(&mut full_writer),
+		super::reader::ScanSource::Base,
 	)
 	.await
 	.unwrap();
@@ -2863,6 +2865,7 @@ async fn cancelled_consumer_stops_before_all_row_groups_scanned() {
 		None,
 		Some(&token),
 		Some(&mut cancel_writer),
+		super::reader::ScanSource::Base,
 	)
 	.await
 	.unwrap();
@@ -2906,6 +2909,7 @@ async fn whole_record_cancelled_consumer_stops_before_all_locations_scanned() {
 		None,
 		None,
 		Some(&mut full_writer),
+		super::reader::ScanSource::Base,
 	)
 	.await
 	.unwrap();
@@ -2940,6 +2944,7 @@ async fn whole_record_cancelled_consumer_stops_before_all_locations_scanned() {
 		None,
 		Some(&token),
 		Some(&mut cancel_writer),
+		super::reader::ScanSource::Base,
 	)
 	.await
 	.unwrap();
@@ -3042,6 +3047,7 @@ async fn stream_select_star_consume_one_batch_then_drop_stops_whole_record_scan(
 		None,
 		None,
 		Some(&mut full_writer),
+		super::reader::ScanSource::Base,
 	)
 	.await
 	.unwrap();
@@ -3076,6 +3082,7 @@ async fn stream_select_star_consume_one_batch_then_drop_stops_whole_record_scan(
 		None,
 		Some(&token),
 		Some(&mut dropped_writer),
+		super::reader::ScanSource::Base,
 	)
 	.await
 	.unwrap();
@@ -3190,6 +3197,7 @@ async fn bare_limit_three_bounds_remote_scan_without_row_limit_pushdown() {
 		None,
 		None,
 		Some(&mut full_writer),
+		super::reader::ScanSource::Base,
 	)
 	.await
 	.unwrap();
@@ -3232,6 +3240,7 @@ async fn bare_limit_three_bounds_remote_scan_without_row_limit_pushdown() {
 		None,
 		Some(&token),
 		Some(&mut dropped_writer),
+		super::reader::ScanSource::Base,
 	)
 	.await
 	.unwrap();
@@ -3300,6 +3309,7 @@ async fn terminal_metadata_totals_match_legacy_materialized_response() {
 		None,
 		None,
 		Some(&mut writer),
+		super::reader::ScanSource::Base,
 	)
 	.await
 	.unwrap();

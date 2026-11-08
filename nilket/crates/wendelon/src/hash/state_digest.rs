@@ -21,6 +21,8 @@ pub const DOMAIN_TABLE_ROW_TOMBSTONE: StateDigestDomain =
 pub const DOMAIN_SECONDARY_INDEX_ENTRY: StateDigestDomain =
 	StateDigestDomain(b"digest.secondary_index.entry.v1");
 pub const DOMAIN_RETENTION_GC: StateDigestDomain = StateDigestDomain(b"digest.retention.gc.v1");
+/// ADR 0699 S5a: one certified base survivor.
+pub const DOMAIN_CERTIFIED_BASE: StateDigestDomain = StateDigestDomain(b"digest.certified.base.v1");
 
 /// Compressed Ristretto255 state identity for an accumulated multiset.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Hash, Pod, Zeroable, Serialize)]

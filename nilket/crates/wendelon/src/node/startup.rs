@@ -313,6 +313,8 @@ fn interrupted_bootstrap_artifact(name: &str) -> bool {
 				| ".snapshot.wnd.build.tmp"
 				| ".snapshot.wnd.receive.tmp"
 				| "storage_index.redb.initializing"
+				| "PARENT_DECISIONS"
+				| ".PARENT_DECISIONS.tmp"
 		)
 }
 
@@ -727,6 +729,8 @@ pub(super) struct NodeHandlesBuilder {
 	pub(super) audit_chain_root_rollup: Option<JoinHandle<()>>,
 	pub(super) default_tenant_seeder: Option<JoinHandle<()>>,
 	pub(super) checkpoint_emitter: Option<JoinHandle<()>>,
+	/// ADR 0699 S3a: signer binding and the leader's floor, ParentDecisions only.
+	pub(super) decision_maintenance: Option<JoinHandle<()>>,
 	extra: Vec<(&'static str, JoinHandle<()>)>,
 	duplicate: bool,
 }
@@ -854,6 +858,12 @@ impl NodeHandlesBuilder {
 			self.duplicate = true;
 		}
 	}
+	pub(super) fn set_decision_maintenance(&mut self, value: JoinHandle<()>) {
+		if let Some(previous) = self.decision_maintenance.replace(value) {
+			self.extra.push(("decision maintenance", previous));
+			self.duplicate = true;
+		}
+	}
 	pub(super) fn set_checkpoint_emitter(&mut self, value: JoinHandle<()>) {
 		if let Some(previous) = self.checkpoint_emitter.replace(value) {
 			self.extra.push(("checkpoint emitter", previous));
@@ -919,6 +929,9 @@ impl NodeHandlesBuilder {
 			task.abort();
 		}
 		if let Some(task) = &self.checkpoint_emitter {
+			task.abort();
+		}
+		if let Some(task) = &self.decision_maintenance {
 			task.abort();
 		}
 		for (_, task) in &self.extra {
@@ -1126,6 +1139,7 @@ impl NodeHandlesBuilder {
 				.checkpoint_emitter
 				.take()
 				.expect("validated complete startup handle set"),
+			decision_maintenance: self.decision_maintenance.take(),
 		})
 	}
 	fn into_named(mut self) -> Vec<(&'static str, JoinHandle<()>)> {
@@ -1189,6 +1203,9 @@ impl NodeHandlesBuilder {
 		}
 		if let Some(task) = self.checkpoint_emitter.take() {
 			tasks.push(("checkpoint emitter", task));
+		}
+		if let Some(task) = self.decision_maintenance.take() {
+			tasks.push(("decision maintenance", task));
 		}
 		tasks.append(&mut self.extra);
 		tasks
@@ -1255,6 +1272,9 @@ impl NodeHandlesBuilder {
 		}
 		if let Some(task) = &self.checkpoint_emitter {
 			tasks.push(("checkpoint_emitter", task.abort_handle()));
+		}
+		if let Some(task) = &self.decision_maintenance {
+			tasks.push(("decision_maintenance", task.abort_handle()));
 		}
 		for (name, task) in &self.extra {
 			tasks.push((name, task.abort_handle()));

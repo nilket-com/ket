@@ -78,7 +78,7 @@ pub async fn read_frame_header<R: AsyncRead + Unpin + ?Sized>(
 			"invalid HRFT magic bytes",
 		));
 	}
-	wire::validate_frame_version(header.version)?;
+	wire::validate_frame_version(header.version, header.msg_type)?;
 	if header.flags & !FRAME_FLAG_KNOWN_MASK != 0 {
 		return Err(Error::new(
 			ErrorKind::InvalidData,

@@ -88,8 +88,16 @@ pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> std::io::Result<T> {
 
 /// Validate the fixed HRFT envelope version carried in
 /// `FrameHeader.version`.
-pub fn validate_frame_version(version: u8) -> std::io::Result<()> {
+pub fn validate_frame_version(version: u8, msg_type: u8) -> std::io::Result<()> {
 	if version == HRFT_ENVELOPE_VERSION {
+		return Ok(());
+	}
+	// Raft frames between `ParentDecisions` nodes carry their own version, and only
+	// those frames may. Which version a node accepts is the Raft handler's and the
+	// Raft client's decision; every other frame stays at the one version.
+	if version == crate::consensus::decision_mode::RAFT_FRAME_VERSION_PARENT_DECISIONS
+		&& crate::consensus::decision_mode::is_raft_frame(msg_type)
+	{
 		return Ok(());
 	}
 	Err(Error::new(

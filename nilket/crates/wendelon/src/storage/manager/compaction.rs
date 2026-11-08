@@ -3,6 +3,15 @@ use super::secondary_index_segments::MaintenanceClaims;
 use super::*;
 use crate::storage::maintenance_policy::{DeterministicOrigin, deterministic_failure};
 
+/// ADR 0699 S5b: what a sealed-slab rewrite may reclaim. `Contained` keeps
+/// containment in ParentDecisions mode; `Certified` exists only with a
+/// reclamation plan decided from coherent evidence for the claimed slab.
+#[derive(Clone, Copy)]
+pub(super) enum ReclaimAuthority<'a> {
+	Contained,
+	Certified(&'a super::certified_cleanup::ReclamationPlan),
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct CompactionRecord {
 	pub(super) tenant_id: TenantId,
@@ -71,9 +80,9 @@ struct CounterRewriteFrame {
 }
 
 #[derive(Default)]
-struct CounterRewritePlan {
+pub(super) struct CounterRewritePlan {
 	frames: Vec<CounterRewriteFrame>,
-	pending: bool,
+	pub(super) pending: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -405,7 +414,7 @@ pub(super) fn compaction_row_group_descriptor<'a>(
 }
 
 impl SlabManager {
-	async fn plan_counter_rewrite(
+	pub(super) async fn plan_counter_rewrite(
 		&self,
 		slab: &Arc<LocalSlabStore>,
 	) -> std::io::Result<CounterRewritePlan> {
@@ -578,7 +587,7 @@ impl SlabManager {
 		Ok(plan)
 	}
 
-	fn ordinary_compaction_records(
+	pub(super) fn ordinary_compaction_records(
 		records: &[CompactionRecord],
 		counter_plan: &CounterRewritePlan,
 	) -> Vec<CompactionRecord> {
@@ -1270,6 +1279,40 @@ impl SlabManager {
 		claims: &MaintenanceClaims,
 		counter_plan: &CounterRewritePlan,
 	) -> std::io::Result<Option<CompactionOutcome>> {
+		self.compact_sealed_slab_records_with_authority(
+			slab_id,
+			slab,
+			records,
+			secondary_index_context,
+			claims,
+			counter_plan,
+			ReclaimAuthority::Contained,
+		)
+		.await
+	}
+
+	/// The rewrite, under `authority`: an ordinary rewrite stays contained in
+	/// ParentDecisions mode; only a certified reclamation plan, decided for
+	/// this slab's claimed job, may reclaim there.
+	#[allow(clippy::too_many_arguments)]
+	pub(super) async fn compact_sealed_slab_records_with_authority(
+		&self,
+		slab_id: SlabId,
+		slab: Arc<LocalSlabStore>,
+		records: &[CompactionRecord],
+		secondary_index_context: SecondaryIndexCompactionContext<'_>,
+		claims: &MaintenanceClaims,
+		counter_plan: &CounterRewritePlan,
+		authority: ReclaimAuthority<'_>,
+	) -> std::io::Result<Option<CompactionOutcome>> {
+		if let ReclaimAuthority::Certified(plan) = authority
+			&& records.iter().filter(|record| record.reclaim).count() != plan.reclaimed()
+		{
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				"a certified rewrite must reclaim exactly what its plan decided",
+			));
+		}
 		if !claims.covers(slab_id) {
 			return Err(deterministic_failure(
 				ErrorKind::InvalidInput,
@@ -1286,6 +1329,11 @@ impl SlabManager {
 		}
 		let mut records = Self::ordinary_compaction_records(records, counter_plan);
 		self.keep_conflicting_versions(&mut records);
+		match authority {
+			ReclaimAuthority::Contained => self.keep_contained_versions(&mut records),
+			// The plan already decided exactly what is reclaimed.
+			ReclaimAuthority::Certified(_) => {}
+		}
 		if records.is_empty() && counter_plan.frames.is_empty()
 			|| records.iter().all(|record| !record.reclaim) && counter_plan.frames.is_empty()
 		{
