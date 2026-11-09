@@ -211,6 +211,8 @@ pub(crate) const CLOCK_PROBE_TIMEOUT: std::time::Duration = std::time::Duration:
 #[derive(Default)]
 pub(crate) struct DecisionClockSamples {
 	samples: std::sync::Mutex<BTreeMap<u32, (u64, std::time::Instant)>>,
+	/// ADR 0702: signalled on every recorded sample, for a waiting admission.
+	arrived: tokio::sync::Notify,
 }
 
 impl DecisionClockSamples {
@@ -219,6 +221,7 @@ impl DecisionClockSamples {
 			.lock()
 			.unwrap()
 			.insert(peer, (remote_ms, std::time::Instant::now()));
+		self.arrived.notify_waiters();
 	}
 
 	/// Every sample with its monotonic age.
@@ -232,6 +235,67 @@ impl DecisionClockSamples {
 				(*peer, *remote, now.saturating_duration_since(*received))
 			})
 			.collect()
+	}
+}
+
+/// ADR 0702: how long a time-bearing admission waits for the decision clock.
+pub(crate) const CLOCK_ADMISSION_WAIT: std::time::Duration = CLOCK_PROBE_TIMEOUT;
+
+/// ADR 0702: what a waited admission decided.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ClockWait {
+	/// The gate passed and this node is still leader: stamp with this.
+	Stamp(u64),
+	Refused(ProposalRefusal),
+	/// The gate passed but leadership moved meanwhile: nothing is proposed.
+	NotLeader,
+}
+
+/// ADR 0702: the unchanged decision clock gate, re-evaluated on each recorded
+/// sample until it passes. The whole evaluation, every gate evaluation and the
+/// final leadership check included, is bounded by `deadline` (absolute, never
+/// renewed): on expiry the gate's own `ClockUnhealthy` refusal stands and no
+/// stamp is returned, and a stamp ready only at the deadline does not win. No
+/// lock is held while waiting, and the arrival notification is armed before
+/// each evaluation so none is missed. A refusal other than `ClockUnhealthy`
+/// returns at once. This bounds admission, not the Raft commit that follows.
+pub(crate) async fn wait_for_decision_clock<G, GateFuture, L, LeaderFuture>(
+	arrived: &tokio::sync::Notify,
+	deadline: tokio::time::Instant,
+	mut gate: G,
+	still_leader: L,
+) -> ClockWait
+where
+	G: FnMut() -> GateFuture,
+	GateFuture: std::future::Future<Output = Result<u64, ProposalRefusal>>,
+	L: FnOnce() -> LeaderFuture,
+	LeaderFuture: std::future::Future<Output = bool>,
+{
+	let mut still_leader = Some(still_leader);
+	let admission = async {
+		loop {
+			let notified = arrived.notified();
+			tokio::pin!(notified);
+			notified.as_mut().enable();
+			match gate().await {
+				Ok(stamp_ms) => {
+					let check = still_leader.take().expect("the leadership check runs once");
+					return if check().await {
+						ClockWait::Stamp(stamp_ms)
+					} else {
+						ClockWait::NotLeader
+					};
+				}
+				Err(ProposalRefusal::ClockUnhealthy) => notified.await,
+				Err(refusal) => return ClockWait::Refused(refusal),
+			}
+		}
+	};
+	let unhealthy = ClockWait::Refused(ProposalRefusal::ClockUnhealthy);
+	match tokio::time::timeout_at(deadline, admission).await {
+		Ok(ClockWait::Stamp(_)) if tokio::time::Instant::now() >= deadline => unhealthy,
+		Ok(decided) => decided,
+		Err(_) => unhealthy,
 	}
 }
 
@@ -549,11 +613,29 @@ impl DecisionProposals {
 		}
 		let command = match admission(self.mode, sender, request, &self.trusted_keys) {
 			Ok(Admitted::Ready(command)) => command,
-			// Only the gated decision clock stamps a time-bearing command.
-			Ok(Admitted::Unstamped(unstamped)) => match self.decision_clock_now().await {
-				Ok(stamp_ms) => unstamped.stamp(stamp_ms),
-				Err(refusal) => return ProposalResponse::Refused(refusal),
-			},
+			// Only the gated decision clock stamps a time-bearing command. ADR
+			// 0702: after a leader change the gate may lack a fresh voter sample
+			// until a follower's probe arrives, so admission waits for it,
+			// bounded, then rechecks leadership before stamping.
+			Ok(Admitted::Unstamped(unstamped)) => {
+				let deadline = tokio::time::Instant::now() + CLOCK_ADMISSION_WAIT;
+				match wait_for_decision_clock(
+					&self.clock_samples.arrived,
+					deadline,
+					|| self.decision_clock_now(),
+					|| async { self.raft.current_leader().await == Some(self.local.id) },
+				)
+				.await
+				{
+					ClockWait::Stamp(stamp_ms) => unstamped.stamp(stamp_ms),
+					ClockWait::Refused(refusal) => return ProposalResponse::Refused(refusal),
+					ClockWait::NotLeader => {
+						return ProposalResponse::NotLeader {
+							leader_hint: self.raft.current_leader().await,
+						};
+					}
+				}
+			}
 			Err(refusal) => return ProposalResponse::Refused(refusal),
 		};
 		self.commit(command).await

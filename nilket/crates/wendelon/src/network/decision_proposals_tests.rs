@@ -448,3 +448,181 @@ async fn a_held_clock_probe_is_cancelled_by_stop_or_by_its_owner_dropping() {
 		.expect("dropping the owner cancels the probe")
 		.unwrap();
 }
+
+/// ADR 0702: a time-bearing admission waits, bounded by one absolute deadline,
+/// for the unchanged gate to pass. Each case runs on paused time.
+mod clock_admission_wait {
+	use super::*;
+	use std::sync::Arc;
+	use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+	fn deadline() -> tokio::time::Instant {
+		tokio::time::Instant::now() + CLOCK_ADMISSION_WAIT
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn a_sample_arriving_during_the_wait_admits_it() {
+		let arrived = Arc::new(tokio::sync::Notify::new());
+		let healthy = Arc::new(AtomicBool::new(false));
+		let (signal, flag) = (arrived.clone(), healthy.clone());
+		tokio::spawn(async move {
+			tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+			flag.store(true, Ordering::SeqCst);
+			signal.notify_waiters();
+		});
+		let started = tokio::time::Instant::now();
+		let outcome = wait_for_decision_clock(
+			&arrived,
+			deadline(),
+			|| {
+				let healthy = healthy.clone();
+				async move {
+					if healthy.load(Ordering::SeqCst) {
+						Ok(fixture::T0)
+					} else {
+						Err(ProposalRefusal::ClockUnhealthy)
+					}
+				}
+			},
+			|| async { true },
+		)
+		.await;
+		assert_eq!(outcome, ClockWait::Stamp(fixture::T0));
+		assert_eq!(started.elapsed(), std::time::Duration::from_millis(300));
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn no_sample_refuses_at_the_deadline_without_a_stamp() {
+		let arrived = tokio::sync::Notify::new();
+		let started = tokio::time::Instant::now();
+		let outcome = wait_for_decision_clock(
+			&arrived,
+			deadline(),
+			|| async { Err(ProposalRefusal::ClockUnhealthy) },
+			|| async { true },
+		)
+		.await;
+		assert_eq!(outcome, ClockWait::Refused(ProposalRefusal::ClockUnhealthy));
+		assert_eq!(started.elapsed(), CLOCK_ADMISSION_WAIT);
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn a_real_skew_still_refuses_at_the_same_deadline() {
+		// Samples keep arriving but disagree: each wake re-evaluates, and the
+		// deadline is never renewed.
+		let arrived = Arc::new(tokio::sync::Notify::new());
+		let signal = arrived.clone();
+		tokio::spawn(async move {
+			loop {
+				tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+				signal.notify_waiters();
+			}
+		});
+		let evaluations = Arc::new(AtomicUsize::new(0));
+		let started = tokio::time::Instant::now();
+		let outcome = wait_for_decision_clock(
+			&arrived,
+			deadline(),
+			|| {
+				evaluations.fetch_add(1, Ordering::SeqCst);
+				async { Err(ProposalRefusal::ClockUnhealthy) }
+			},
+			|| async { true },
+		)
+		.await;
+		assert_eq!(outcome, ClockWait::Refused(ProposalRefusal::ClockUnhealthy));
+		assert_eq!(started.elapsed(), CLOCK_ADMISSION_WAIT);
+		assert!(
+			evaluations.load(Ordering::SeqCst) > 10,
+			"re-evaluated on each sample"
+		);
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn another_refusal_returns_at_once() {
+		let arrived = tokio::sync::Notify::new();
+		let started = tokio::time::Instant::now();
+		let outcome = wait_for_decision_clock(
+			&arrived,
+			deadline(),
+			|| async { Err(ProposalRefusal::NotTheSender) },
+			|| async { true },
+		)
+		.await;
+		assert_eq!(outcome, ClockWait::Refused(ProposalRefusal::NotTheSender));
+		assert_eq!(started.elapsed(), std::time::Duration::ZERO);
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn a_gate_held_past_the_deadline_never_stamps() {
+		// The gate's own evaluation blocks (a contended state read) and then
+		// succeeds late, or exactly at the deadline: no stamp either way.
+		for late in [3_000u64, 2_000] {
+			let arrived = tokio::sync::Notify::new();
+			let started = tokio::time::Instant::now();
+			let outcome = wait_for_decision_clock(
+				&arrived,
+				deadline(),
+				|| async move {
+					tokio::time::sleep(std::time::Duration::from_millis(late)).await;
+					Ok(fixture::T0)
+				},
+				|| async { true },
+			)
+			.await;
+			assert_eq!(
+				outcome,
+				ClockWait::Refused(ProposalRefusal::ClockUnhealthy),
+				"late {late}"
+			);
+			assert_eq!(started.elapsed(), CLOCK_ADMISSION_WAIT, "late {late}");
+		}
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn a_leadership_check_held_past_the_deadline_never_stamps() {
+		let arrived = tokio::sync::Notify::new();
+		let started = tokio::time::Instant::now();
+		let outcome = wait_for_decision_clock(
+			&arrived,
+			deadline(),
+			|| async { Ok(fixture::T0) },
+			|| async {
+				tokio::time::sleep(std::time::Duration::from_millis(3_000)).await;
+				true
+			},
+		)
+		.await;
+		assert_eq!(outcome, ClockWait::Refused(ProposalRefusal::ClockUnhealthy));
+		assert_eq!(started.elapsed(), CLOCK_ADMISSION_WAIT);
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn leadership_lost_while_waiting_proposes_nothing() {
+		let arrived = Arc::new(tokio::sync::Notify::new());
+		let healthy = Arc::new(AtomicBool::new(false));
+		let (signal, flag) = (arrived.clone(), healthy.clone());
+		tokio::spawn(async move {
+			tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+			flag.store(true, Ordering::SeqCst);
+			signal.notify_waiters();
+		});
+		let outcome = wait_for_decision_clock(
+			&arrived,
+			deadline(),
+			|| {
+				let healthy = healthy.clone();
+				async move {
+					if healthy.load(Ordering::SeqCst) {
+						Ok(fixture::T0)
+					} else {
+						Err(ProposalRefusal::ClockUnhealthy)
+					}
+				}
+			},
+			|| async { false },
+		)
+		.await;
+		assert_eq!(outcome, ClockWait::NotLeader);
+	}
+}
