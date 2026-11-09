@@ -712,6 +712,7 @@ impl WendelonClient {
 			));
 		};
 		let mut preferred_target = None;
+		let mut unresolved = false;
 		for attempt in 0..DATA_RETRY_BUDGET {
 			request.meta.set_attempts_remaining(
 				u8::try_from(DATA_RETRY_BUDGET - attempt).expect("retry budget fits u8"),
@@ -729,13 +730,9 @@ impl WendelonClient {
 			let Some(retry) = retry_write_response(&result.response.write) else {
 				return Ok(result);
 			};
+			unresolved |= attempt_unresolved(&result.response.write);
 			if attempt + 1 == DATA_RETRY_BUDGET {
-				let knowledge = if result.response.write.status == WriteStatus::FINALIZATION_PENDING
-				{
-					crate::schema::MutationCommitKnowledge::INDETERMINATE
-				} else {
-					crate::schema::MutationCommitKnowledge::KNOWN_NOT_COMMITTED
-				};
+				let knowledge = exhausted_knowledge(unresolved);
 				result.response.write.status = WriteStatus::WRITE_ATTEMPTS_EXHAUSTED;
 				result.response.write = result.response.write.with_mutation_outcome(
 					knowledge,
@@ -760,6 +757,7 @@ impl WendelonClient {
 		let route_locality =
 			table_query_route_locality(request.meta.tenant_id, &request.descriptor)?;
 		let mut preferred_target = None;
+		let mut unresolved = false;
 		for attempt in 0..DATA_RETRY_BUDGET {
 			request.meta.set_attempts_remaining(
 				u8::try_from(DATA_RETRY_BUDGET - attempt).expect("retry budget fits u8"),
@@ -777,13 +775,9 @@ impl WendelonClient {
 			let Some(retry) = retry_write_response(&result.response.write) else {
 				return Ok(result);
 			};
+			unresolved |= attempt_unresolved(&result.response.write);
 			if attempt + 1 == DATA_RETRY_BUDGET {
-				let knowledge = if result.response.write.status == WriteStatus::FINALIZATION_PENDING
-				{
-					crate::schema::MutationCommitKnowledge::INDETERMINATE
-				} else {
-					crate::schema::MutationCommitKnowledge::KNOWN_NOT_COMMITTED
-				};
+				let knowledge = exhausted_knowledge(unresolved);
 				result.response.write.status = WriteStatus::WRITE_ATTEMPTS_EXHAUSTED;
 				result.response.write = result.response.write.with_mutation_outcome(
 					knowledge,
@@ -2997,7 +2991,31 @@ fn retry_write_response(response: &WriteResponseMeta) -> Option<RetryDirective> 
 		s if s == WriteStatus::BACKPRESSURED => Some(RetryDirective::backpressure(
 			nonzero_node_id(response.leader_hint),
 		)),
+		// ADR 0700: a stall is indeterminate, never an answer. The same request,
+		// under the same identity, is retried within the same budget.
+		s if s == WriteStatus::WRITE_STALLED => Some(RetryDirective::backpressure(
+			nonzero_node_id(response.leader_hint),
+		)),
 		_ => None,
+	}
+}
+
+/// ADR 0700: whether an attempt left its write's outcome unresolved. Once one
+/// has, exhaustion stays indeterminate: a later redirect, lease refusal or
+/// backpressure says nothing about the earlier attempt.
+fn attempt_unresolved(response: &WriteResponseMeta) -> bool {
+	response.status == WriteStatus::WRITE_STALLED
+		|| response.status == WriteStatus::FINALIZATION_PENDING
+		|| response.mutation_commit_knowledge()
+			== crate::schema::MutationCommitKnowledge::INDETERMINATE
+}
+
+/// The knowledge an exhausted retry loop reports.
+fn exhausted_knowledge(unresolved: bool) -> crate::schema::MutationCommitKnowledge {
+	if unresolved {
+		crate::schema::MutationCommitKnowledge::INDETERMINATE
+	} else {
+		crate::schema::MutationCommitKnowledge::KNOWN_NOT_COMMITTED
 	}
 }
 
@@ -5202,6 +5220,83 @@ mod tests {
 		assert_eq!(retry.preferred_target, Some(leader));
 		assert_eq!(retry.backoff, Some(FINALIZATION_RETRY_BACKOFF));
 		assert!(retry.refresh_topology);
+	}
+
+	fn write_response_with(status: WriteStatus) -> WriteResponseMeta {
+		WriteResponseMeta {
+			status,
+			_pad1: [0; 7],
+			log_index: 0,
+			term: 0,
+			epoch: 11,
+			commit_hlc: HybridTimestamp {
+				physical_ms: 123,
+				logical: 4,
+				node_id: 7,
+			},
+			leader_hint: NodeId {
+				id: 7,
+				_reserved: 0,
+			},
+			echoed_write_id: ClientWriteId {
+				client_uuid: [0xAB; 16],
+				sequence_no: 9,
+				idempotency_ttl_ms: 60_000,
+				_pad: 0,
+			},
+			has_finalization: 0,
+			_pad2: [0; 7],
+		}
+	}
+
+	/// ADR 0700: a stall is retried, with backoff and without refreshing the
+	/// topology, under the same request; it is never an answer.
+	#[test]
+	fn retry_write_status_treats_a_stall_as_retryable() {
+		let retry = retry_write_response(&write_response_with(WriteStatus::WRITE_STALLED))
+			.expect("a stall must be retryable");
+		assert_eq!(retry.backoff, Some(BACKPRESSURE_RETRY_BACKOFF));
+		assert!(!retry.refresh_topology);
+	}
+
+	/// ADR 0700: once an attempt left the outcome unresolved (a stall or a
+	/// pending finalization), exhaustion is INDETERMINATE whatever the later
+	/// attempts said, so it never licenses a new write identity. With no
+	/// unresolved attempt, exhaustion stays KNOWN_NOT_COMMITTED.
+	#[test]
+	fn exhaustion_after_an_unresolved_attempt_stays_indeterminate() {
+		use crate::schema::MutationCommitKnowledge;
+		let fold = |statuses: &[WriteStatus]| {
+			exhausted_knowledge(
+				statuses
+					.iter()
+					.any(|status| attempt_unresolved(&write_response_with(*status))),
+			)
+		};
+		assert_eq!(
+			fold(&[
+				WriteStatus::WRITE_STALLED,
+				WriteStatus::NOT_LEADER,
+				WriteStatus::LEASE_EXPIRED
+			]),
+			MutationCommitKnowledge::INDETERMINATE
+		);
+		assert_eq!(
+			fold(&[
+				WriteStatus::BACKPRESSURED,
+				WriteStatus::FINALIZATION_PENDING,
+				WriteStatus::BACKPRESSURED
+			]),
+			MutationCommitKnowledge::INDETERMINATE
+		);
+		assert_eq!(
+			fold(&[
+				WriteStatus::NOT_LEADER,
+				WriteStatus::LEASE_EXPIRED,
+				WriteStatus::BACKPRESSURED
+			]),
+			MutationCommitKnowledge::KNOWN_NOT_COMMITTED
+		);
 	}
 
 	#[test]

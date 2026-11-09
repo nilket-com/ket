@@ -186,10 +186,6 @@ pub struct ObservabilityConfig {
 pub struct NodeBootstrapConfig {
 	#[cfg(test)]
 	pub(crate) startup_probe: Option<startup_ownership_tests::StartupProbe>,
-	/// ADR 0699 S3c, tests only: open table writes and child frames while the
-	/// ParentDecisions mode refuses service.
-	#[cfg(test)]
-	pub(crate) open_decision_writes_for_test: bool,
 	#[cfg(test)]
 	pub(crate) startup_fault: Option<startup_ownership_tests::StartupFault>,
 	/// Numeric node id — also the openraft peer id. Must be unique
@@ -263,8 +259,9 @@ pub struct NodeBootstrapConfig {
 	/// `Full` retains the Control log from genesis. See
 	/// [`crate::consensus::retention`].
 	pub control_retention: ControlRetention,
-	/// Not a setting: only this crate selects it, for disposable stores. See
-	/// `consensus::decision_mode`.
+	/// Not a setting: selected only through
+	/// [`NodeBootstrapConfig::with_parent_decisions_for_disposable_store`], for
+	/// disposable stores. See `consensus::decision_mode`.
 	pub(crate) decision_mode: crate::consensus::decision_mode::DecisionMode,
 	/// ADR 0699 S3a: this node's decision-signing secret and every node's
 	/// verifying key, ParentDecisions only. Not settings either: unset, both are
@@ -349,8 +346,6 @@ impl NodeBootstrapConfig {
 		Self {
 			#[cfg(test)]
 			startup_probe: None,
-			#[cfg(test)]
-			open_decision_writes_for_test: false,
 			#[cfg(test)]
 			startup_fault: None,
 			node_id,
@@ -785,12 +780,14 @@ pub struct WendelonNode {
 /// Background task handles. Explicit shutdown aborts and joins these tasks;
 /// dropping a raw Tokio JoinHandle alone detaches its task.
 impl NodeBootstrapConfig {
-	/// ADR 0699 S3c: whether a test opened the write path; never in a build.
-	fn test_write_opening(&self) -> bool {
-		#[cfg(test)]
-		return self.open_decision_writes_for_test;
-		#[cfg(not(test))]
-		false
+	/// ADR 0700: selects the ParentDecisions authority for a fresh disposable
+	/// development store. Bootstrap refuses it unless development keys are
+	/// allowed (a disposable or test profile), refuses an existing store of the
+	/// other mode, and a store keeps the mode it was created with. The default
+	/// stays today's authority.
+	pub fn with_parent_decisions_for_disposable_store(mut self) -> Self {
+		self.decision_mode = crate::consensus::decision_mode::DecisionMode::ParentDecisions;
+		self
 	}
 }
 
@@ -2201,7 +2198,6 @@ impl WendelonNode {
 					raft.clone(),
 					state_machine.clone(),
 					trusted,
-					Some(tracker.clone()),
 					clock.clone(),
 					factory.clone(),
 					pool.clone(),
@@ -2250,7 +2246,6 @@ impl WendelonNode {
 			.with_decision_mode(cfg.decision_mode)
 			.with_decision_signer(decision_signer)
 			.with_decision_proposals(decision_proposals.clone())
-			.with_test_write_opening(cfg.test_write_opening())
 			.with_directory_owner(owner.clone()),
 		);
 		let raft_server = Arc::new(
@@ -2290,11 +2285,21 @@ impl WendelonNode {
 				.set_decision_maintenance(tokio::spawn(async move {
 					let mut ticker = tokio::time::interval(DECISION_MAINTENANCE_INTERVAL);
 					ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+					// ADR 0700: owned here; stopped with the loop, cancelled if
+					// the loop is aborted.
+					let mut probe = crate::network::decision_proposals::ClockProbe::default();
 					loop {
-						tokio::select! {
-							_ = ticker.tick() => {}
-							_ = stop.wait_for(|stopping| *stopping) => return,
+						let stopping = tokio::select! {
+							_ = ticker.tick() => false,
+							_ = stop.wait_for(|stopping| *stopping) => true,
+						};
+						if stopping {
+							probe.stop().await;
+							return;
 						}
+						// ADR 0700: keep this follower's clock sample fresh at
+						// the leader, whatever its readiness or the gate says.
+						proposals.clock_probe_step(&mut probe).await;
 						let _ = proposals.ensure_signer_once(incarnation).await;
 						let _ = proposals.advance_floor_once().await;
 						let _ = proposals.resolve_closed_once(DECISION_RESOLVE_BATCH).await;
@@ -2975,6 +2980,8 @@ impl ReadinessReporter for NodeReadinessView {
 		};
 		let audit_materialization_lag_entries = self.audit_materialization.lag_entries();
 		let fips_build_state = build_info::current_fips_build_state();
+		// ADR 0700: in ParentDecisions mode, Ready means this store can serve.
+		let decision_reason = self.data_server.decision_readiness_reason().await;
 		let degraded_reason = self
 			.data_server
 			.degraded_reason()
@@ -2983,11 +2990,7 @@ impl ReadinessReporter for NodeReadinessView {
 					.certified_base_unvalidated()
 					.then(|| "CertifiedBaseUnvalidated".to_string())
 			})
-			.or_else(|| {
-				self.data_server
-					.decision_mode_refuses_service()
-					.then(|| "ParentDecisionsIncomplete".to_string())
-			})
+			.or(decision_reason)
 			.or_else(|| self.data_server.tier_authority_readiness_reason())
 			.or_else(|| self.restore_validation.borrow().degraded_reason())
 			.or_else(|| {
@@ -4030,7 +4033,7 @@ mod tests {
 	}
 
 	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-	async fn the_parent_decisions_mode_refuses_service_and_binds_its_store() {
+	async fn the_parent_decisions_mode_serves_only_its_surfaces_and_binds_its_store() {
 		use crate::consensus::decision_mode::DecisionMode;
 		let dir = tempdir("node-parent-decisions");
 		let mut cfg = NodeBootstrapConfig::dev(7004, dir.to_path_buf(), "127.0.0.1:0".into());
@@ -4039,21 +4042,32 @@ mod tests {
 		let node = WendelonNode::bootstrap_single_node(cfg.clone())
 			.await
 			.unwrap();
-		// ADR 0699 S5a: first the certified base validates, then the mode
-		// still refuses service.
+		// ADR 0700: the store becomes Ready once it can serve: its base
+		// validated, its signer bound and its primary ranges leased.
 		let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
 		loop {
 			let snapshot = node.readiness_reporter().snapshot().await;
-			assert!(!snapshot.is_ready());
+			if snapshot.is_ready() {
+				break;
+			}
 			match snapshot.degraded_reason.as_deref() {
-				Some("ParentDecisionsIncomplete") => break,
-				Some("CertifiedBaseUnvalidated") => {
-					assert!(tokio::time::Instant::now() < deadline, "never validated");
+				Some(
+					"CertifiedBaseUnvalidated"
+					| "DecisionSignerUnbound"
+					| "IncarnationNotCurrent"
+					| "PrimaryRangeNotLeased",
+				) => {
+					assert!(
+						tokio::time::Instant::now() < deadline,
+						"never ready: {snapshot:?}"
+					);
 					tokio::time::sleep(Duration::from_millis(100)).await;
 				}
 				other => panic!("unexpected readiness {other:?}"),
 			}
 		}
+		// ADR 0700: no CDC heartbeat producer runs in this mode.
+		assert!(node.handles.cdc_locality_heartbeat.is_finished());
 		let refuse = |msg_type: u8, version: u8| {
 			use crate::network::tls::ActorIdentity;
 			let router = node.router.clone();
@@ -4087,13 +4101,19 @@ mod tests {
 					.map(|error| error.kind())
 			}
 		};
-		// Ordinary service is refused at dispatch, by a real frame through the router.
+		// Surfaces outside the checkpoint are refused at dispatch, by a real
+		// frame through the router; a served one passes the restriction (this
+		// empty frame then fails on its own terms, not as Unsupported).
 		assert_eq!(
-			refuse(crate::schema::MsgType::READ_REQ.0, 1).await,
+			refuse(crate::schema::MsgType::BULK_WRITE_REQ.0, 1).await,
 			Some(std::io::ErrorKind::Unsupported),
 		);
 		assert_eq!(
-			refuse(crate::schema::MsgType::TABLE_WRITE_REQ.0, 1).await,
+			refuse(crate::schema::MsgType::COUNTER_ADD_REQ.0, 1).await,
+			Some(std::io::ErrorKind::Unsupported),
+		);
+		assert_ne!(
+			refuse(crate::schema::MsgType::READ_REQ.0, 1).await,
 			Some(std::io::ErrorKind::Unsupported),
 		);
 		// A Raft frame on the other authority's envelope is refused before decode.
@@ -4434,6 +4454,9 @@ mod tests {
 		// Raft reaches leadership asynchronously after initialize.
 		wait_for_local_leader(&node).await;
 		assert_eq!(node.raft.current_leader().await, Some(node.local_node.id));
+		// Today runs the CDC heartbeat producer (ADR 0700 stops it only in
+		// ParentDecisions mode).
+		assert!(!node.handles.cdc_locality_heartbeat.is_finished());
 	}
 
 	#[tokio::test]

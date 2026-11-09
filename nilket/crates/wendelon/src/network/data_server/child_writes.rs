@@ -489,6 +489,31 @@ impl ChildPlan {
 }
 
 /// The live leases this node holds, as `(start, end, epoch)`, read when asked.
+/// ADR 0700: the applied grants to `local` at the current epoch that have not
+/// expired at `now_ms`, whatever leader issued them.
+pub(crate) fn applied_leases(
+	state: &SmState,
+	local: u32,
+	now_ms: u64,
+) -> Vec<crate::schema::LeaseDescriptor> {
+	let Some((_, config)) = state.epoch_history.last_key_value() else {
+		return Vec::new();
+	};
+	let now = HybridTimestamp {
+		physical_ms: now_ms,
+		logical: 0,
+		node_id: 0,
+	};
+	state
+		.leases
+		.values()
+		.filter(|lease| {
+			lease.holder.id == local && lease.epoch == config.epoch && now < lease.lease_expiry
+		})
+		.copied()
+		.collect()
+}
+
 pub(crate) type LeaseSource = Arc<
 	dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<(u64, u64, u64)>> + Send>>
 		+ Send
@@ -916,10 +941,6 @@ pub(crate) struct DecisionPeer {
 	pub(crate) debt_free: Arc<std::sync::Mutex<std::collections::BTreeMap<u64, u64>>>,
 	pub(crate) debt_cursor:
 		Arc<std::sync::Mutex<Option<crate::storage::index::certified_base::VersionKey>>>,
-	/// Test-only: let table writes and child frames through while this mode
-	/// refuses service. No configuration, CLI or bootstrap path sets it.
-	#[cfg(test)]
-	pub(crate) open_writes_for_test: bool,
 	/// ADR 0699 S5a: a committed generation has no matching staged candidate
 	/// here; the store refuses to serve until an operator decides (no reset).
 	pub(crate) behind_boundary: Arc<std::sync::atomic::AtomicBool>,
@@ -1019,8 +1040,6 @@ impl Default for DecisionPeer {
 			debt_free: Default::default(),
 			debt_cursor: Default::default(),
 			#[cfg(test)]
-			open_writes_for_test: false,
-			#[cfg(test)]
 			pauses: Default::default(),
 			behind_boundary: Default::default(),
 			base_validated: Default::default(),
@@ -1045,26 +1064,25 @@ impl Default for DecisionPeer {
 }
 
 impl DecisionPeer {
-	/// Whether `msg_type` passes this mode's service refusal: never, except in
-	/// a test that opened the write path.
+	/// ADR 0700: whether `msg_type` passes this mode's service restriction.
+	/// Exactly the checkpoint's surfaces are served: a table write and its
+	/// child frames, a streamed table query, a single-key KV write and read, and
+	/// a single-row delete. Each is then served only in its supported shape (the
+	/// reader, the coordinator and the delete path refuse the rest). Every
+	/// other data message (migration, bulk, counters, frames, other mutation
+	/// paths) stays refused.
 	pub(crate) fn opens(&self, msg_type: u8) -> bool {
-		#[cfg(test)]
-		if self.open_writes_for_test {
-			return [
-				MsgType::TABLE_WRITE_REQ,
-				MsgType::TABLE_CHILD_WRITE_REQ,
-				MsgType::TABLE_CHILD_REPLICATE_REQ,
-				MsgType::TABLE_CHILD_FETCH_REQ,
-				MsgType::TABLE_QUERY_REQ,
-				MsgType::WRITE_REQ,
-				MsgType::READ_REQ,
-				MsgType::TABLE_DELETE_REQ,
-			]
-			.iter()
-			.any(|open| open.0 == msg_type);
-		}
-		let _ = msg_type;
-		false
+		const SERVED: [MsgType; 8] = [
+			MsgType::TABLE_WRITE_REQ,
+			MsgType::TABLE_CHILD_WRITE_REQ,
+			MsgType::TABLE_CHILD_REPLICATE_REQ,
+			MsgType::TABLE_CHILD_FETCH_REQ,
+			MsgType::TABLE_QUERY_REQ,
+			MsgType::WRITE_REQ,
+			MsgType::READ_REQ,
+			MsgType::TABLE_DELETE_REQ,
+		];
+		SERVED.iter().any(|served| served.0 == msg_type)
 	}
 }
 
@@ -1180,18 +1198,6 @@ impl WendelonDataServer {
 		(reached, release)
 	}
 
-	/// ADR 0699 S3c: a test's opening of the write path; ignored in a build.
-	#[cfg_attr(not(test), allow(unused_mut))]
-	pub(crate) fn with_test_write_opening(mut self, open: bool) -> Self {
-		#[cfg(test)]
-		{
-			self.decisions.open_writes_for_test = open;
-		}
-		#[cfg(not(test))]
-		let _ = open;
-		self
-	}
-
 	pub(crate) fn with_decision_proposals(
 		mut self,
 		proposals: Option<Arc<crate::network::decision_proposals::DecisionProposals>>,
@@ -1239,6 +1245,67 @@ impl WendelonDataServer {
 	/// current step.
 	pub(crate) fn stop_decision_maintenance(&self) {
 		self.decisions.maintenance_stop.send_replace(true);
+	}
+
+	/// ADR 0700: why this store cannot serve in ParentDecisions mode now, or
+	/// `None`. A revocable observation, not a capability: admission and read
+	/// authority are still checked at use time. It requires this store's
+	/// decision signer bound at its current incarnation, and every range the
+	/// current ring makes it primary for (derived from the ring, so an empty
+	/// lineage set never passes) held as a lineage at that incarnation and
+	/// epoch and covered by its own lease at the current epoch. It never gates
+	/// the lease, recovery or control traffic that makes it true.
+	pub(crate) async fn decision_readiness_reason(&self) -> Option<String> {
+		if !self.decision_mode.refuses_service() {
+			return None;
+		}
+		let Some(signer) = self.decisions.signer.as_ref().map(|signer| signer.signer) else {
+			return Some("DecisionSignerMissing".into());
+		};
+		let leases = self.lease_source()().await;
+		self.state_machine
+			.read_state(move |state| {
+				let Some(decisions) = state.decisions.as_ref() else {
+					return Some("DecisionStateMissing".to_string());
+				};
+				let current = state
+					.incarnations
+					.get(&signer.node)
+					.and_then(|registry| registry.current);
+				if current != Some(signer.incarnation) {
+					return Some("IncarnationNotCurrent".into());
+				}
+				if decisions.signer_key(signer).is_none() {
+					return Some("DecisionSignerUnbound".into());
+				}
+				let Some((_, config)) = state.epoch_history.last_key_value() else {
+					return Some("NoEpoch".into());
+				};
+				let ring = crate::network::ring::RingState::build(
+					&crate::network::ring::membership_from_epoch_config(config),
+					1,
+				);
+				let node = crate::schema::NodeId {
+					id: signer.node,
+					_reserved: 0,
+				};
+				for (start, end) in ring.primary_ranges_for(node) {
+					let held = decisions.lineages().get(&start).is_some_and(|lineage| {
+						lineage.range_end == end
+							&& lineage.holder.id == signer.node
+							&& lineage.incarnation == signer.incarnation
+							&& lineage.epoch == config.epoch
+					});
+					let leased = leases.iter().any(|(low, high, epoch)| {
+						*epoch == config.epoch && *low <= start && end <= *high
+					});
+					if !held || !leased {
+						return Some("PrimaryRangeNotLeased".into());
+					}
+				}
+				None
+			})
+			.await
 	}
 
 	pub(crate) fn decision_mode_refuses_service(&self) -> bool {
@@ -1292,41 +1359,32 @@ impl WendelonDataServer {
 		}
 	}
 
-	/// This node's unexpired, verified leases from the current leader, with
-	/// their epochs, read afresh on each call.
+	/// ADR 0700: the ranges this store holds now, `(low, high, epoch)`. In this
+	/// mode the committed lease record is the authority, not the current
+	/// leader's signature on a cached grant: a lineage continues across a change
+	/// of issuer (`admit_lease_grant`), so an applied, unexpired grant of the
+	/// current epoch to this store still covers after a failover. It is read
+	/// with the current epoch in one state read; no uncommitted, cached or
+	/// prospective grant counts, and the issuer's signature must still verify.
+	/// It grants nothing by itself: holder admission, repair and readiness keep
+	/// their lineage (generation, holder incarnation), sender and plan checks.
 	fn lease_source(&self) -> LeaseSource {
-		let (raft, leases, clock, authority, local) = (
-			self.raft.clone(),
-			self.leases.clone(),
+		let (state_machine, clock, authority, local) = (
+			self.state_machine.clone(),
 			self.clock.clone(),
 			self.lease_authority.clone(),
-			self.local_node,
+			self.local_node.id,
 		);
 		Arc::new(move || {
-			let (raft, leases, clock, authority) = (
-				raft.clone(),
-				leases.clone(),
-				clock.clone(),
-				authority.clone(),
-			);
+			let (state_machine, clock, authority) =
+				(state_machine.clone(), clock.clone(), authority.clone());
 			Box::pin(async move {
-				let Some(leader) = raft.current_leader().await else {
-					return Vec::new();
-				};
-				let now = HybridTimestamp {
-					physical_ms: clock.now_ms(),
-					logical: 0,
-					node_id: 0,
-				};
-				let leases = recover_rwlock_read(&leases, "lease_cache").clone();
-				leases
+				let now_ms = clock.now_ms();
+				state_machine
+					.read_state(move |state| applied_leases(state, local, now_ms))
+					.await
 					.into_iter()
-					.filter(|lease| {
-						lease.holder.id == local.id
-							&& lease.issuer.id == leader
-							&& now < lease.lease_expiry
-							&& authority.verify_lease(lease).is_ok()
-					})
+					.filter(|lease| authority.verify_lease(lease).is_ok())
 					.map(|lease| (lease.range_start, lease.range_end, lease.epoch))
 					.collect()
 			})

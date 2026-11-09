@@ -18887,3 +18887,36 @@ async fn a_refusal_after_a_durable_child_is_waited_out_when_it_clears() {
 	assert_not_fenced(&node, &dir, "second child").await;
 	shutdown_lease_node(node).await;
 }
+
+/// ADR 0700: a read refused before admission is retryable exactly when the
+/// tier authority is not ready yet; any other refusal fails the statement.
+#[test]
+fn a_read_admission_refusal_is_retryable_only_while_the_tier_authority_is_not_ready() {
+	use crate::storage::manager::{StaleLocationReason, stale_location_error};
+	let status = WendelonDataServer::admission_refusal_read_status;
+	assert_eq!(
+		status(&stale_location_error(
+			SlabId::ZERO,
+			StaleLocationReason::Fenced
+		)),
+		ReadStatus::BACKPRESSURED
+	);
+	assert_eq!(
+		status(&Error::new(
+			ErrorKind::WouldBlock,
+			"TierAuthorityAwaitingCluster"
+		)),
+		ReadStatus::BACKPRESSURED
+	);
+	assert_eq!(
+		status(&stale_location_error(
+			SlabId::ZERO,
+			StaleLocationReason::VersionGone
+		)),
+		ReadStatus::QUERY_EXECUTION_FAILED
+	);
+	assert_eq!(
+		status(&Error::other("tier integrity failed")),
+		ReadStatus::QUERY_EXECUTION_FAILED
+	);
+}

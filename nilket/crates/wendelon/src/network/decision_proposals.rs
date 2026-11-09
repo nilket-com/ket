@@ -20,7 +20,7 @@ use crate::consensus::decisions::{
 	AbortBody, ChildAckBody, Claim, DECISION_EXPIRY_MS, DecisionCommand, DecisionResult, ParentKey,
 	Signed, Signer,
 };
-use crate::consensus::monitor::{MAX_OFFSET_MS, NodeTracker, PhysicalClock};
+use crate::consensus::monitor::{MAX_OFFSET_MS, PhysicalClock};
 use crate::consensus::raft_storage::{SmState, WendelonStateMachine};
 use crate::consensus::{
 	RegisterIncarnation, StoreIncarnation, WendelonRaft, WendelonRequest, WendelonResponse,
@@ -73,10 +73,34 @@ pub enum ForwardedDecision {
 	},
 }
 
-impl ForwardedDecision {
-	fn needs_clock(&self) -> bool {
-		matches!(self, Self::Reserve { .. })
+/// ADR 0700: a time-bearing command before the leader stamps it. It becomes a
+/// Raft command only through [`Unstamped::stamp`], whose input is the leader's
+/// gated decision clock, so no time-bearing command can be proposed unstamped.
+#[derive(Debug)]
+pub(crate) enum Unstamped {
+	Reserve {
+		claim: Signed<Claim>,
+	},
+	RecordNoop {
+		noop: Signed<crate::consensus::decisions::NoopBody>,
+	},
+}
+
+impl Unstamped {
+	pub(crate) fn stamp(self, stamp_ms: u64) -> WendelonRequest {
+		WendelonRequest::Decision(match self {
+			Self::Reserve { claim } => DecisionCommand::Reserve { claim, stamp_ms },
+			Self::RecordNoop { noop } => DecisionCommand::RecordNoop { noop, stamp_ms },
+		})
 	}
+}
+
+/// What the leader admits from a forwarded request: a command, or one that
+/// still needs the gated clock.
+#[derive(Debug)]
+pub(crate) enum Admitted {
+	Ready(WendelonRequest),
+	Unstamped(Unstamped),
 }
 
 /// A forwarded proposal on the wire, with the sender's clock reading. The
@@ -169,24 +193,114 @@ pub enum CutResponse {
 
 /// The leader's clock reading, refused unless the drift monitor's own test
 /// holds right now: a cluster median exists and the offset is within bound.
-pub(crate) fn leader_clock_now(
-	tracker: Option<&NodeTracker>,
-	clock: &dyn PhysicalClock,
+/// ADR 0700: how recent a peer's clock sample must be, by the monotonic
+/// clock, to count for the leader's decision clock. A follower that has sent
+/// the current leader nothing for [`CLOCK_PROBE_INTERVAL`] probes it, so this
+/// spans several missed probes and ordinary scheduling delay.
+pub(crate) const CLOCK_SAMPLE_FRESHNESS: std::time::Duration = std::time::Duration::from_secs(5);
+/// How long a follower may stay silent toward the current leader before its
+/// maintenance sends a clock probe.
+pub(crate) const CLOCK_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+/// The bound on one clock probe (a CUT round trip, which runs a linearizable
+/// barrier at the leader).
+pub(crate) const CLOCK_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// ADR 0700: the authenticated decision requests' clock readings, one per
+/// peer, each with its monotonic receipt. Only [`DecisionProposals::observe_sender_clock`]
+/// writes it, so no other path can refresh a sample.
+#[derive(Default)]
+pub(crate) struct DecisionClockSamples {
+	samples: std::sync::Mutex<BTreeMap<u32, (u64, std::time::Instant)>>,
+}
+
+impl DecisionClockSamples {
+	fn record(&self, peer: u32, remote_ms: u64) {
+		self.samples
+			.lock()
+			.unwrap()
+			.insert(peer, (remote_ms, std::time::Instant::now()));
+	}
+
+	/// Every sample with its monotonic age.
+	fn aged(&self) -> Vec<(u32, u64, std::time::Duration)> {
+		let now = std::time::Instant::now();
+		self.samples
+			.lock()
+			.unwrap()
+			.iter()
+			.map(|(peer, (remote, received))| {
+				(*peer, *remote, now.saturating_duration_since(*received))
+			})
+			.collect()
+	}
+}
+
+/// The voters of the control configuration, or `None` for a joint
+/// configuration, which this checkpoint does not support.
+pub(crate) fn current_voters(state: &SmState) -> Option<std::collections::BTreeSet<u32>> {
+	let membership = state.last_membership.membership();
+	if membership.get_joint_config().len() != 1 {
+		return None;
+	}
+	Some(membership.voter_ids().collect())
+}
+
+/// ADR 0700: the leader's decision clock gate. With `n` current voters (the
+/// leader one of them) it needs fresh samples from `floor(n/2)` other voters,
+/// so the leader and they form a majority; the median of ALL fresh voter
+/// samples, each projected by its monotonic age, must be within
+/// [`MAX_OFFSET_MS`] of the leader's clock. Self, non-voters and stale samples
+/// never count, and a wall-clock jump cannot rejuvenate a sample. A single
+/// voter has no peer median: its own clock is used unchecked. This is evidence
+/// of recent peer observations, not proof a peer is alive or that any clock is
+/// objectively right; Raft quorum and leadership checks stay mandatory.
+pub(crate) fn clock_gate(
+	now_ms: u64,
+	local: u32,
+	voters: Option<&std::collections::BTreeSet<u32>>,
+	samples: &[(u32, u64, std::time::Duration)],
 ) -> Result<u64, ProposalRefusal> {
-	let tracker = tracker.ok_or(ProposalRefusal::ClockUnhealthy)?;
-	let now = clock.now_ms();
-	let median = tracker
-		.median_cluster_ms(now)
-		.ok_or(ProposalRefusal::ClockUnhealthy)?;
-	if now.abs_diff(median) > MAX_OFFSET_MS {
+	let voters = voters.ok_or(ProposalRefusal::ClockUnhealthy)?;
+	if !voters.contains(&local) {
 		return Err(ProposalRefusal::ClockUnhealthy);
 	}
-	Ok(now)
+	let needed = voters.len() / 2;
+	let mut seen = std::collections::BTreeSet::new();
+	let mut projected: Vec<u64> = samples
+		.iter()
+		.filter(|(peer, _, age)| {
+			*peer != local
+				&& voters.contains(peer)
+				&& *age <= CLOCK_SAMPLE_FRESHNESS
+				&& seen.insert(*peer)
+		})
+		.map(|(_, remote, age)| remote.saturating_add(age.as_millis() as u64))
+		.collect();
+	if needed == 0 {
+		return Ok(now_ms);
+	}
+	if projected.len() < needed {
+		return Err(ProposalRefusal::ClockUnhealthy);
+	}
+	projected.sort_unstable();
+	let n = projected.len();
+	let median = if n % 2 == 1 {
+		projected[n / 2]
+	} else {
+		let (a, b) = (projected[n / 2 - 1], projected[n / 2]);
+		a / 2 + b / 2 + ((a & 1) + (b & 1)) / 2
+	};
+	if now_ms.abs_diff(median) > MAX_OFFSET_MS {
+		return Err(ProposalRefusal::ClockUnhealthy);
+	}
+	Ok(now_ms)
 }
 
 /// Turns a forwarded request from `sender` into the command the leader
 /// proposes. Pure: every check that does not need the replicated state, which
 /// apply then enforces itself.
+/// [`admission`], stamped from `clock_now` when it needs time.
+#[cfg(test)]
 pub(crate) fn admit(
 	mode: DecisionMode,
 	sender: u32,
@@ -194,6 +308,18 @@ pub(crate) fn admit(
 	trusted_keys: &BTreeMap<u32, [u8; 32]>,
 	clock_now: impl FnOnce() -> Result<u64, ProposalRefusal>,
 ) -> Result<WendelonRequest, ProposalRefusal> {
+	match admission(mode, sender, request, trusted_keys)? {
+		Admitted::Ready(command) => Ok(command),
+		Admitted::Unstamped(unstamped) => Ok(unstamped.stamp(clock_now()?)),
+	}
+}
+
+pub(crate) fn admission(
+	mode: DecisionMode,
+	sender: u32,
+	request: ForwardedDecision,
+	trusted_keys: &BTreeMap<u32, [u8; 32]>,
+) -> Result<Admitted, ProposalRefusal> {
 	if mode != DecisionMode::ParentDecisions {
 		return Err(ProposalRefusal::ModeToday);
 	}
@@ -207,10 +333,7 @@ pub(crate) fn admit(
 			if coordinator != Some(sender) {
 				return Err(ProposalRefusal::NotTheSender);
 			}
-			DecisionCommand::Reserve {
-				claim,
-				stamp_ms: clock_now()?,
-			}
+			return Ok(Admitted::Unstamped(Unstamped::Reserve { claim }));
 		}
 		ForwardedDecision::Finalize {
 			key,
@@ -229,7 +352,7 @@ pub(crate) fn admit(
 			request_digest,
 		},
 		ForwardedDecision::Abort { abort } => DecisionCommand::Abort { abort },
-		// Stamped like a Reserve: its freshness is judged on the leader's clock.
+		// Not time-bearing: a report is judged by its generation and membership.
 		ForwardedDecision::Report { report } => {
 			if report.body.reporter.node != sender {
 				return Err(ProposalRefusal::NotTheSender);
@@ -240,10 +363,7 @@ pub(crate) fn admit(
 			if noop.body.coordinator.node != sender {
 				return Err(ProposalRefusal::NotTheSender);
 			}
-			DecisionCommand::RecordNoop {
-				noop,
-				stamp_ms: clock_now()?,
-			}
+			return Ok(Admitted::Unstamped(Unstamped::RecordNoop { noop }));
 		}
 		ForwardedDecision::BindSigner { incarnation } => {
 			let key = *trusted_keys
@@ -258,14 +378,16 @@ pub(crate) fn admit(
 			}
 		}
 		ForwardedDecision::RegisterIncarnation { incarnation } => {
-			return Ok(WendelonRequest::RegisterIncarnation(RegisterIncarnation {
-				node: sender,
-				incarnation,
-				supersedes: None,
-			}));
+			return Ok(Admitted::Ready(WendelonRequest::RegisterIncarnation(
+				RegisterIncarnation {
+					node: sender,
+					incarnation,
+					supersedes: None,
+				},
+			)));
 		}
 	};
-	Ok(WendelonRequest::Decision(command))
+	Ok(Admitted::Ready(WendelonRequest::Decision(command)))
 }
 
 /// The leader's floor advance, if its healthy clock allows a higher floor.
@@ -299,10 +421,51 @@ pub struct DecisionProposals {
 	raft: WendelonRaft,
 	state_machine: WendelonStateMachine,
 	trusted_keys: Arc<BTreeMap<u32, [u8; 32]>>,
-	tracker: Option<Arc<NodeTracker>>,
 	clock: Arc<dyn PhysicalClock>,
 	factory: Arc<TransportProviderFactory>,
 	pool: Arc<BufPool>,
+	/// ADR 0700: peer clock samples for the decision clock gate.
+	clock_samples: DecisionClockSamples,
+	/// ADR 0700: the leader this node last sent a request to, and when.
+	last_sent: std::sync::Mutex<Option<(u32, std::time::Instant)>>,
+}
+
+/// ADR 0700: the one clock probe a maintenance loop owns; its presence is the
+/// in-flight guard. [`ClockProbe::stop`] cancels and awaits it, and dropping
+/// the owner (its loop aborted) cancels it, so a stopped node holds no probe
+/// and a cancelled probe never leaves the guard set.
+#[derive(Default)]
+pub(crate) struct ClockProbe(Option<tokio::task::JoinHandle<()>>);
+
+impl ClockProbe {
+	/// Whether a probe is still running; a finished one is released.
+	fn busy(&mut self) -> bool {
+		if self.0.as_ref().is_some_and(|probe| probe.is_finished()) {
+			self.0 = None;
+		}
+		self.0.is_some()
+	}
+
+	fn start(&mut self, probe: impl std::future::Future<Output = ()> + Send + 'static) {
+		debug_assert!(!self.busy());
+		self.0 = Some(tokio::spawn(probe));
+	}
+
+	/// Cancels the probe, if any, and waits for it to end.
+	pub(crate) async fn stop(&mut self) {
+		if let Some(probe) = self.0.take() {
+			probe.abort();
+			let _ = probe.await;
+		}
+	}
+}
+
+impl Drop for ClockProbe {
+	fn drop(&mut self) {
+		if let Some(probe) = &self.0 {
+			probe.abort();
+		}
+	}
 }
 
 impl DecisionProposals {
@@ -313,7 +476,6 @@ impl DecisionProposals {
 		raft: WendelonRaft,
 		state_machine: WendelonStateMachine,
 		trusted_keys: BTreeMap<u32, [u8; 32]>,
-		tracker: Option<Arc<NodeTracker>>,
 		clock: Arc<dyn PhysicalClock>,
 		factory: Arc<TransportProviderFactory>,
 		pool: Arc<BufPool>,
@@ -324,11 +486,53 @@ impl DecisionProposals {
 			raft,
 			state_machine,
 			trusted_keys: Arc::new(trusted_keys),
-			tracker,
 			clock,
 			factory,
 			pool,
+			clock_samples: DecisionClockSamples::default(),
+			last_sent: std::sync::Mutex::new(None),
 		}
+	}
+
+	/// ADR 0700: the decision clock now, through the gate.
+	async fn decision_clock_now(&self) -> Result<u64, ProposalRefusal> {
+		let voters = self.state_machine.read_state(current_voters).await;
+		clock_gate(
+			self.clock.now_ms(),
+			self.local.id,
+			voters.as_ref(),
+			&self.clock_samples.aged(),
+		)
+	}
+
+	/// ADR 0700: a follower that has sent the current leader nothing for
+	/// [`CLOCK_PROBE_INTERVAL`] sends it one bounded CUT, whose `sent_ms` the
+	/// leader records. At most one is in flight, owned by `probe`; it never
+	/// blocks the caller, and it runs whatever this node's readiness or the
+	/// clock gate says.
+	pub(crate) async fn clock_probe_step(self: &Arc<Self>, probe: &mut ClockProbe) {
+		if probe.busy() {
+			return;
+		}
+		if self.mode != DecisionMode::ParentDecisions {
+			return;
+		}
+		let Some(leader) = self.raft.current_leader().await else {
+			return;
+		};
+		if leader == self.local.id {
+			return;
+		}
+		if let Some((to, at)) = *self.last_sent.lock().unwrap()
+			&& to == leader
+			&& at.elapsed() < CLOCK_PROBE_INTERVAL
+		{
+			return;
+		}
+		let this = self.clone();
+		probe.start(async move {
+			let _ = tokio::time::timeout(CLOCK_PROBE_TIMEOUT, this.cut()).await;
+		});
 	}
 
 	/// Leader side: admit and propose a request authenticated as `sender`.
@@ -343,17 +547,13 @@ impl DecisionProposals {
 				leader_hint: leader,
 			};
 		}
-		let needs_clock = request.needs_clock();
-		let tracker = self.tracker.as_deref();
-		let clock = &*self.clock;
-		let command = match admit(self.mode, sender, request, &self.trusted_keys, || {
-			if needs_clock {
-				leader_clock_now(tracker, clock)
-			} else {
-				Ok(0)
-			}
-		}) {
-			Ok(command) => command,
+		let command = match admission(self.mode, sender, request, &self.trusted_keys) {
+			Ok(Admitted::Ready(command)) => command,
+			// Only the gated decision clock stamps a time-bearing command.
+			Ok(Admitted::Unstamped(unstamped)) => match self.decision_clock_now().await {
+				Ok(stamp_ms) => unstamped.stamp(stamp_ms),
+				Err(refusal) => return ProposalResponse::Refused(refusal),
+			},
 			Err(refusal) => return ProposalResponse::Refused(refusal),
 		};
 		self.commit(command).await
@@ -409,17 +609,13 @@ impl DecisionProposals {
 	}
 
 	/// Records a forwarding node's clock reading for the leader's drift test.
+	/// ADR 0700: the samples feed only the decision clock gate, which refuses
+	/// a decision rather than aborting the process. They no longer feed the
+	/// drift monitor's tracker: a request's transit and queueing delay under
+	/// load made them look like drift and aborted a healthy node.
 	pub(crate) fn observe_sender_clock(&self, sender: u32, sent_ms: u64) {
-		if let Some(tracker) = &self.tracker
-			&& sender != self.local.id
-		{
-			tracker.record(
-				NodeId {
-					id: sender,
-					_reserved: 0,
-				},
-				sent_ms,
-			);
+		if sender != self.local.id {
+			self.clock_samples.record(sender, sent_ms);
 		}
 	}
 
@@ -540,6 +736,7 @@ impl DecisionProposals {
 		request: &Q,
 	) -> std::io::Result<R> {
 		let meta = postcard::to_stdvec(request).map_err(Error::other)?;
+		*self.last_sent.lock().unwrap() = Some((leader, std::time::Instant::now()));
 		if meta.len() > MAX_DECISION_FRAME_BYTES {
 			return Err(Error::new(
 				ErrorKind::InvalidInput,
@@ -609,7 +806,7 @@ impl DecisionProposals {
 		{
 			return None;
 		}
-		let now = leader_clock_now(self.tracker.as_deref(), &*self.clock).ok()?;
+		let now = self.decision_clock_now().await.ok()?;
 		let command = self
 			.state_machine
 			.read_state(|state| floor_proposal(state, now))

@@ -12086,7 +12086,8 @@ fn parent_decisions_have_no_producer_and_one_codec() {
 		std::collections::BTreeMap::from([
 			("committed.rs", 1),
 			// ADR 0699 S5a: the leader's generation step proposes too.
-			("decision_proposals.rs", 3),
+			// ADR 0700: a time-bearing command is built only by `Unstamped::stamp`.
+			("decision_proposals.rs", 4),
 			("raft_storage.rs", 2),
 		]),
 		"decisions are matched in apply and built only by the leader's proposal path"
@@ -12094,7 +12095,20 @@ fn parent_decisions_have_no_producer_and_one_codec() {
 	assert!(sites.contains(&("raft_storage.rs".to_owned(), "_".to_owned())));
 	assert!(sites.contains(&("raft_storage.rs".to_owned(), "command".to_owned())));
 	let proposals = fs::read_to_string(src.join("network/decision_proposals.rs")).unwrap();
-	assert!(proposals.contains("Ok(WendelonRequest::Decision(command))"));
+	assert!(proposals.contains("Ok(Admitted::Ready(WendelonRequest::Decision(command)))"));
+	// ADR 0700: the time-bearing commands carry a stamp only through `stamp`.
+	let stamp = source_region(
+		&proposals,
+		"pub(crate) fn stamp(self, stamp_ms: u64) -> WendelonRequest {",
+		"\n\t}\n",
+	);
+	assert!(stamp.contains("DecisionCommand::Reserve { claim, stamp_ms }"));
+	assert!(stamp.contains("DecisionCommand::RecordNoop { noop, stamp_ms }"));
+	assert_eq!(
+		proposals.matches("stamp_ms }").count(),
+		2,
+		"stamped only in `stamp`"
+	);
 	let forwarded = brace_body(&proposals, "pub enum ForwardedDecision");
 	assert!(!forwarded.contains("stamp") && !forwarded.contains("floor"));
 	assert!(

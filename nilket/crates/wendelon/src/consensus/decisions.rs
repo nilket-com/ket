@@ -40,6 +40,10 @@ pub(crate) const DECISION_CLOCK_SKEW_MS: u64 = DEFAULT_COUNTER_CLOCK_SKEW_MS;
 pub(crate) const DECISION_EXPIRY_MS: u64 =
 	COUNTER_INCARNATION_LIFETIME_MS + DECISION_ATTEMPT_HORIZON_MS + DECISION_CLOCK_SKEW_MS;
 const _: () = assert!(DECISION_CLOCK_SKEW_MS <= DECISION_ATTEMPT_HORIZON_MS);
+/// ADR 0700: how far a new claim's commit HLC may lead the leader's stamp,
+/// the decision clock gate's own bound. It bounds admission of future physical
+/// timestamps only; it is not a real-time ordering guarantee.
+pub(crate) const DECISION_COMMIT_HLC_LEAD_MS: u64 = crate::consensus::monitor::MAX_OFFSET_MS;
 const _: () = assert!(
 	DECISION_EXPIRY_MS
 		>= COUNTER_INCARNATION_LIFETIME_MS + DECISION_ATTEMPT_HORIZON_MS + DECISION_CLOCK_SKEW_MS
@@ -461,6 +465,9 @@ pub enum DecisionRefusal {
 	ReportMismatch,
 	/// Not every member has reported.
 	BarrierIncomplete,
+	/// ADR 0700: a new claim's commit HLC is more than
+	/// [`DECISION_COMMIT_HLC_LEAD_MS`] ahead of the leader's stamp.
+	CommitFromFuture,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1202,6 +1209,7 @@ fn reserve(
 	let verified = evidence::verify(decisions, signed)?;
 	let claim = verified.body();
 	let clock_ms = fresh_clock(decisions, &claim.key, stamp_ms)?;
+	commit_hlc_not_ahead(claim, stamp_ms)?;
 	validate_claim(state, decisions, claim)?;
 	if let Operation::Delete { selection, .. } = &claim.operation {
 		if selection.cut >= log_index {
@@ -1250,6 +1258,19 @@ fn reserve(
 		},
 	);
 	Ok(DecisionResult::Reserved { reservation })
+}
+
+/// ADR 0700: a new claim's commit HLC leads the replicated leader stamp by at
+/// most [`DECISION_COMMIT_HLC_LEAD_MS`]. No lower bound: transit and queueing
+/// put every honest claim behind the stamp.
+fn commit_hlc_not_ahead(claim: &Claim, stamp_ms: u64) -> Result<(), DecisionRefusal> {
+	let latest = stamp_ms
+		.checked_add(DECISION_COMMIT_HLC_LEAD_MS)
+		.ok_or(DecisionRefusal::CounterOverflow)?;
+	if claim.commit_hlc.physical_ms > latest {
+		return Err(DecisionRefusal::CommitFromFuture);
+	}
+	Ok(())
 }
 
 /// E0 and E1 for an unrecorded key: its identity form, issuance not ahead of

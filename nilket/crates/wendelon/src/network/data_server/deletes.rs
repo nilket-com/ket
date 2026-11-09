@@ -396,12 +396,11 @@ impl WendelonDataServer {
 					};
 					let proposal = match selection.outcome {
 						DeleteOutcome::Deleted { winner_hlc, .. } => {
-							// Strictly above the selected winner, on any clock.
-							self.hlc.merge(winner_hlc);
-							let commit_hlc = self.merge_commit_hlc(meta.client_hlc);
-							if commit_hlc <= winner_hlc {
+							let Some(commit_hlc) =
+								tombstone_hlc(&self.hlc, winner_hlc, meta.client_hlc)
+							else {
 								return stalled;
-							}
+							};
 							let plan = self
 								.state_machine
 								.read_state(move |state| point_plan(state, tenant, position))
@@ -583,10 +582,56 @@ async fn bounded<T>(
 	}
 }
 
+/// A tombstone's commit HLC: strictly above the selected winner on any clock.
+/// The winner is merged first, so a coordinator whose clock is behind it still
+/// mints above it; `None` only if the result is somehow not above.
+fn tombstone_hlc(
+	hlc: &crate::consensus::hlc::HybridLogicalClockDriver,
+	winner_hlc: HybridTimestamp,
+	client_hlc: HybridTimestamp,
+) -> Option<HybridTimestamp> {
+	hlc.merge(winner_hlc);
+	let commit_hlc = hlc.merge(client_hlc);
+	(commit_hlc > winner_hlc).then_some(commit_hlc)
+}
+
 #[cfg(test)]
 mod tests {
 	use super::bounded;
 	use std::sync::atomic::{AtomicUsize, Ordering};
+
+	/// ADR 0700 (replaces the +600 s premise of the S4b control): a coordinator
+	/// whose clock is behind the selected winner still mints a tombstone whose
+	/// full HLC is strictly above it. Omitting the winner merge does not.
+	#[test]
+	fn a_tombstone_is_minted_strictly_above_a_winner_ahead_of_the_clock() {
+		use crate::consensus::hlc::HybridLogicalClockDriver;
+		use crate::consensus::monitor::FakeClock;
+		use crate::schema::{HybridTimestamp, NodeId};
+		let local = NodeId {
+			id: 2,
+			_reserved: 0,
+		};
+		let winner = HybridTimestamp {
+			physical_ms: 5_000,
+			logical: 7,
+			node_id: 9,
+		};
+		let client = HybridTimestamp {
+			physical_ms: 1,
+			logical: 0,
+			node_id: 0,
+		};
+		let behind =
+			|| HybridLogicalClockDriver::new(local, std::sync::Arc::new(FakeClock::new(1_000)));
+		let minted = super::tombstone_hlc(&behind(), winner, client).unwrap();
+		assert!(minted > winner, "{minted:?} not above {winner:?}");
+		// Same physical millisecond as the winner: ordered by the full HLC.
+		assert_eq!(minted.physical_ms, winner.physical_ms);
+		// Mutation control: without the winner merge the clock mints below it.
+		let unmerged = behind().merge(client);
+		assert!(unmerged <= winner, "{unmerged:?}");
+	}
 
 	#[tokio::test]
 	async fn an_expired_deadline_never_polls_the_work() {

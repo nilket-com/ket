@@ -2939,6 +2939,13 @@ impl WendelonDataServer {
 			return Ok(PendingFinalizationResolution::ObservedApplied(marker));
 		}
 
+		// ADR 0700: ParentDecisions refuses today's writes, so a legacy pending
+		// finalization here is unexpected; it is never executed as a mode write.
+		if self.parent_decisions() {
+			return Err(Error::other(
+				"a legacy pending finalization is not executed under ParentDecisions",
+			));
+		}
 		if self.raft.current_leader().await != Some(self.local_node.id) {
 			return Err(Error::new(
 				ErrorKind::WouldBlock,
@@ -3398,6 +3405,11 @@ impl WendelonDataServer {
 		interval: Duration,
 	) -> JoinHandle<()> {
 		tokio::spawn(async move {
+			// ADR 0700: ParentDecisions does not serve CDC, so it runs no
+			// heartbeat producer.
+			if self.parent_decisions() {
+				return;
+			}
 			let mut discovery = tokio::time::interval(interval);
 			discovery.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 			let mut spawned = BTreeSet::new();
@@ -5011,6 +5023,23 @@ impl WendelonDataServer {
 			key,
 			active: true,
 		})
+	}
+
+	/// ADR 0700: the typed answer to a read refused before admission. A tier
+	/// authority that is not ready (a WouldBlock refusal, or its pending fence)
+	/// answers BACKPRESSURED: a bounded retry is permitted while reads stay
+	/// refused, not a promise that the authority becomes ready (some of these
+	/// refusals need a restart). Any other refusal fails the statement.
+	pub(super) fn admission_refusal_read_status(refusal: &Error) -> ReadStatus {
+		let not_ready = refusal.kind() == ErrorKind::WouldBlock
+			|| crate::storage::manager::stale_location(refusal).is_some_and(|stale| {
+				stale.reason == crate::storage::manager::StaleLocationReason::Fenced
+			});
+		if not_ready {
+			ReadStatus::BACKPRESSURED
+		} else {
+			ReadStatus::QUERY_EXECUTION_FAILED
+		}
 	}
 
 	fn try_admit_data_request(
@@ -7691,27 +7720,34 @@ impl DataRingServer for WendelonDataServer {
 					stream.finish().await?;
 					return Ok(());
 				}
-				let _admission = match self.try_admit_data_request(
+				// ADR 0700: a refusal at admission (backpressure, or a tier
+				// authority not ready) is answered with a typed terminal rather
+				// than leaving the arm unframed. This closes only that escape:
+				// the denied audit and the transport write can still fail first.
+				let refused = match self.try_admit_data_request(
 					&context.actor,
 					Some(meta.tenant_id),
 					DataOperation::Query,
-				)? {
+				) {
+					Ok(Ok(admission)) => Ok(admission),
+					Ok(Err(scope)) => Err((
+						ReadStatus::BACKPRESSURED,
+						format!(
+							"post-auth request admission saturated at {}",
+							backpressure_scope_name(scope)
+						),
+					)),
+					Err(refusal) => Err((
+						Self::admission_refusal_read_status(&refusal),
+						format!("read admission refused: {refusal}"),
+					)),
+				};
+				let _admission = match refused {
 					Ok(admission) => admission,
-					Err(scope) => {
-						self.emit_query_denied_audit(
-							&context.actor,
-							&audit_meta,
-							ReadStatus::BACKPRESSURED,
-							format!(
-								"post-auth request admission saturated at {}",
-								backpressure_scope_name(scope)
-							),
-						)?;
-						let response = self.table_query_error_frame(
-							frame.header.stream_id,
-							&meta,
-							ReadStatus::BACKPRESSURED,
-						);
+					Err((status, reason)) => {
+						self.emit_query_denied_audit(&context.actor, &audit_meta, status, reason)?;
+						let response =
+							self.table_query_error_frame(frame.header.stream_id, &meta, status);
 						write_frame(&mut *stream, &response.header, &response.meta, None, None)
 							.await?;
 						stream.finish().await?;
@@ -8253,6 +8289,11 @@ impl WendelonDataServer {
 		&self,
 		locality_id: Locality,
 	) -> std::io::Result<()> {
+		if self.parent_decisions() {
+			return Err(Error::other(
+				"a CDC heartbeat is not produced under ParentDecisions",
+			));
+		}
 		if self.raft.current_leader().await != Some(self.local_node.id) {
 			return Ok(());
 		}

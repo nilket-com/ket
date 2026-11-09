@@ -555,11 +555,11 @@ fn a_renewal_continues_its_generation_and_a_gap_or_a_shortening_does_not() {
 		WendelonResponse::Success
 	);
 	let first = decisions(&state).lineages[&range.0];
-	// Continuous and not shorter: the same generation.
-	assert_eq!(
-		grant(&mut state, lease(holder, range, 500, 2_000)),
-		WendelonResponse::Success
-	);
+	// Continuous and not shorter: the same generation, whichever leader
+	// issues it (ADR 0700: a new leader's renewal continues the lineage).
+	let mut renewal = lease(holder, range, 500, 2_000);
+	renewal.issuer = node(2);
+	assert_eq!(grant(&mut state, renewal), WendelonResponse::Success);
 	assert_eq!(decisions(&state).lineages[&range.0], first);
 	// Shorter than the grant it continues: denied, nothing changes.
 	let before = state.clone();
@@ -577,6 +577,82 @@ fn a_renewal_continues_its_generation_and_a_gap_or_a_shortening_does_not() {
 	let after_gap = decisions(&state).lineages[&range.0];
 	assert!(after_gap.generation > first.generation);
 	assert_eq!(decisions(&state).next_generation, after_gap.generation + 1);
+}
+
+/// ADR 0700 delta 4: the mode's lease source is the applied record: this
+/// holder's unexpired grants of the current epoch, whoever issued them. A
+/// gapped grant still replaces the lineage, and its old parent cannot be
+/// accepted.
+#[test]
+fn the_applied_lease_source_follows_the_record_not_the_issuer() {
+	use crate::network::data_server::child_writes::applied_leases;
+	let covers = |state: &SmState, holder: u32, range: (u64, u64), now: u64| {
+		applied_leases(state, holder, now)
+			.iter()
+			.any(|lease| lease.range_start == range.0 && lease.range_end == range.1)
+	};
+	let mut state = base(3);
+	let (holder, range) = universe()[0];
+	let other = universe()
+		.into_iter()
+		.find(|(id, _)| *id != holder)
+		.unwrap()
+		.0;
+	assert!(!covers(&state, holder, range, T0));
+	assert_eq!(
+		grant(&mut state, lease(holder, range, 0, 1_000)),
+		WendelonResponse::Success
+	);
+	assert!(covers(&state, holder, range, 500));
+	assert!(!covers(&state, other, range, 500), "another holder's grant");
+	// The same bound as before: `now < lease_expiry` as an HLC.
+	assert!(!covers(&state, holder, range, 1_001), "expired");
+	// A former leader's grant still covers; a new leader's overlapping
+	// renewal keeps the lineage and extends it.
+	let first = decisions(&state).lineages[&range.0];
+	let mut renewal = lease(holder, range, 500, 2_000);
+	renewal.issuer = node(2);
+	assert_eq!(grant(&mut state, renewal), WendelonResponse::Success);
+	assert_eq!(decisions(&state).lineages[&range.0], first);
+	assert!(covers(&state, holder, range, 1_500));
+	// A previous epoch's grant does not cover.
+	let mut later = state.clone();
+	apply_next(
+		&mut later,
+		WendelonRequest::AdvanceEpoch(AdvanceEpochRecord {
+			from: epoch_config(EPOCH),
+			to: epoch_config(EPOCH + 1),
+		}),
+	);
+	assert!(!covers(&later, holder, range, 1_500), "a previous epoch");
+
+	// A gapped grant replaces the lineage; the parent reserved under the old
+	// one is refused, never accepted.
+	let (mut state, claim, rsv) = reserved_parent(1);
+	let child = claim.children[usize::from(claim.coordinator)].clone();
+	let range_end = decisions(&state).lineages[&child.lineage.range_start].range_end;
+	let mut gapped = lease(
+		child.holder.node,
+		(child.lineage.range_start, range_end),
+		2_000,
+		3_000,
+	);
+	gapped.issuer = node(2);
+	assert_eq!(grant(&mut state, gapped), WendelonResponse::Success);
+	assert_ne!(
+		decisions(&state).lineages[&child.lineage.range_start].generation,
+		child.lineage.generation
+	);
+	assert!(matches!(
+		finalize(&mut state, &claim, quorum_acks(&claim, rsv)),
+		DecisionResult::Terminal {
+			status: ParentStatus::Refused {
+				cause: RefusalCause::LineageClosed,
+				..
+			},
+			..
+		}
+	));
 }
 
 #[test]
@@ -743,6 +819,68 @@ fn identity_form_and_future_issuance_are_refused_without_moving_the_clock() {
 		DecisionResult::Reserved { .. }
 	));
 	assert_eq!(decisions(&state).clock_ms, T0);
+}
+
+#[test]
+fn a_new_claims_commit_hlc_may_lead_the_stamp_only_by_the_gate_bound() {
+	let mut state = base(3);
+	grant_all(&mut state);
+	let with_hlc = |state: &SmState, sequence_no: u64, physical_ms: u64| {
+		let mut claim = claim(key(T0, sequence_no), children(state, 1), 0);
+		claim.commit_hlc = hts(physical_ms);
+		claim
+	};
+	// Just beyond the bound: refused, and nothing changes.
+	let beyond = with_hlc(&state, 1, T0 + DECISION_COMMIT_HLC_LEAD_MS + 1);
+	let before = decisions(&state).clone();
+	assert_eq!(
+		reserve(&mut state, &beyond, T0),
+		refused(DecisionRefusal::CommitFromFuture)
+	);
+	assert_eq!(decisions(&state), &before);
+	// Overflow-safe: a stamp at the top of the range refuses, never wraps.
+	assert_eq!(
+		commit_hlc_not_ahead(&beyond, u64::MAX),
+		Err(DecisionRefusal::CounterOverflow)
+	);
+	// Exactly at the bound: admitted.
+	let edge = with_hlc(&state, 2, T0 + DECISION_COMMIT_HLC_LEAD_MS);
+	let DecisionResult::Reserved { reservation } = reserve(&mut state, &edge, T0) else {
+		panic!("the exact bound is admitted");
+	};
+	// An older claim, far behind the stamp but otherwise valid: admitted.
+	let older = with_hlc(&state, 3, T0 - 60_000);
+	assert!(matches!(
+		reserve(&mut state, &older, T0 + 10_000),
+		DecisionResult::Reserved { .. }
+	));
+	// A recorded claim answers as recorded after the stamp falls behind it
+	// (a new leader's clock) and after its authority ends.
+	assert_eq!(
+		reserve(&mut state, &edge, T0 - 1),
+		DecisionResult::Reserved { reservation }
+	);
+	let child = edge.children[0].clone();
+	let range_end = decisions(&state).lineages[&child.lineage.range_start].range_end;
+	apply_next(
+		&mut state,
+		WendelonRequest::ReleaseLease(ReleaseLeaseRequestMeta {
+			range_start: child.lineage.range_start,
+			range_end,
+			epoch: EPOCH,
+			holder: node(child.holder.node),
+		}),
+	);
+	assert_eq!(
+		reserve(&mut state, &edge, T0 - 1),
+		DecisionResult::Reserved { reservation }
+	);
+	let status = resolve(&mut state, &edge);
+	assert!(
+		matches!(status, DecisionResult::Terminal { .. }),
+		"{status:?}"
+	);
+	assert_eq!(reserve(&mut state, &edge, T0 - 1), status);
 }
 
 #[test]
@@ -1824,7 +1962,7 @@ fn delete_claim(state: &SmState, sequence_no: u64, n: u8, winner_ms: u64) -> Cla
 	}
 }
 
-fn noop_body(state: &SmState, sequence_no: u64, n: u8) -> NoopBody {
+pub(crate) fn noop_body(state: &SmState, sequence_no: u64, n: u8) -> NoopBody {
 	let request = delete_request(n);
 	let child = point_child(state, position_of(n));
 	NoopBody {
@@ -2142,6 +2280,14 @@ fn new_wire_variants_are_appended_after_the_existing_tags() {
 		})
 		.unwrap()),
 		6
+	);
+	assert_eq!(
+		tag(postcard::to_stdvec(&DecisionRefusal::BarrierIncomplete).unwrap()),
+		27
+	);
+	assert_eq!(
+		tag(postcard::to_stdvec(&DecisionRefusal::CommitFromFuture).unwrap()),
+		28
 	);
 	assert_eq!(tag(postcard::to_stdvec(&Lookup::Conflict).unwrap()), 2);
 	assert_eq!(

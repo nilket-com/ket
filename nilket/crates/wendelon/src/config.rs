@@ -1004,8 +1004,6 @@ impl RawConfig {
 			#[cfg(test)]
 			startup_probe: None,
 			#[cfg(test)]
-			open_decision_writes_for_test: false,
-			#[cfg(test)]
 			startup_fault: None,
 			#[cfg(feature = "test-support")]
 			slab_file_ops: None,

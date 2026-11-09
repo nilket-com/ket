@@ -55,7 +55,6 @@ fn member(id: u32) -> (crate::test_support::TestDir, NodeBootstrapConfig) {
 		);
 	}
 	cfg.decision_mode = crate::consensus::decision_mode::DecisionMode::ParentDecisions;
-	cfg.open_decision_writes_for_test = true;
 	(dir, cfg)
 }
 
@@ -1740,6 +1739,79 @@ fn counts(response: &crate::schema::TableDeleteRowsResponseMeta) -> [u32; 3] {
 	]
 }
 
+/// ADR 0700: a claim whose commit HLC is far ahead of the leader's stamp is
+/// refused at Reserve: nothing is reserved or written, and the client sees an
+/// unresolved stall. The client HLC was merged before admission, so the
+/// coordinator's later writes are refused too until its clock catches up: the
+/// registered availability behavior, recorded here, not fixed. The test-only
+/// rewind is fixture cleanup, not product recovery.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_claim_from_the_future_is_refused_without_effect() {
+	let (cluster, leader, descriptor) = ready().await;
+	let batch = || named_rows(&descriptor, &[(7, "f")]);
+	let primary = cluster
+		.node(leader)
+		.data_server
+		.primary_for_test(TenantId::ZERO, &descriptor, &batch())
+		.await
+		.unwrap();
+	let server = &cluster.node(primary).data_server;
+	let mut ahead = write_meta(&descriptor, 1, uuid_v7());
+	ahead.client_hlc = crate::schema::HybridTimestamp {
+		physical_ms: std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.unwrap()
+			.as_millis() as u64
+			+ 600_000,
+		logical: 0,
+		node_id: 0,
+	};
+	let unresolved = |response: &crate::schema::TableWriteResponseMeta, what: &str| {
+		assert_eq!(
+			response.write.status,
+			WriteStatus::WRITE_STALLED,
+			"{what}: {response:?}"
+		);
+		assert_eq!(
+			response.write.mutation_commit_knowledge(),
+			MutationCommitKnowledge::INDETERMINATE,
+			"{what}: {response:?}"
+		);
+	};
+	let (refused, _) = server.table_write_for_test(ahead, batch()).await.unwrap();
+	unresolved(&refused, "a claim from the future");
+	assert!(
+		record_of(&cluster, key_of(&descriptor, &ahead))
+			.await
+			.is_none()
+	);
+	// The poisoned coordinator HLC refuses a later ordinary write as well.
+	let ordinary = write_meta(&descriptor, 1, uuid_v7());
+	let (poisoned, _) = server
+		.table_write_for_test(ordinary, batch())
+		.await
+		.unwrap();
+	unresolved(&poisoned, "an ordinary write after the poisoning");
+	assert!(
+		record_of(&cluster, key_of(&descriptor, &ordinary))
+			.await
+			.is_none()
+	);
+	expect_everywhere(&cluster, &descriptor, &Expected::new(), "nothing written").await;
+	// Fixture cleanup only.
+	server.rewind_hlc_for_test();
+	assert_committed(
+		&write_through(
+			&cluster,
+			leader,
+			write_meta(&descriptor, 1, uuid_v7()),
+			batch(),
+		)
+		.await,
+		"after the fixture's rewind",
+	);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_single_row_delete_selects_at_its_cut_and_records_a_noop_when_nothing_matches() {
 	use crate::network::data_server::child_writes::PauseStage;
@@ -1834,7 +1906,11 @@ async fn a_single_row_delete_selects_at_its_cut_and_records_a_noop_when_nothing_
 	.await;
 
 	// CODEX-2 req 1: a coordinator whose clock is behind the selected winner
-	// still publishes its tombstone above it.
+	// still publishes its tombstone above it. ADR 0700: a winner far ahead of
+	// every clock is now refused at Reserve, so the property is proved
+	// deterministically by `deletes::tests::a_tombstone_is_minted_strictly_above_a_winner_ahead_of_the_clock`
+	// on the helper this path uses; end to end, a rewound coordinator's
+	// tombstone is strictly above the winner's full HLC.
 	let primary = leader_server
 		.primary_for_test(
 			TenantId::ZERO,
@@ -1843,34 +1919,23 @@ async fn a_single_row_delete_selects_at_its_cut_and_records_a_noop_when_nothing_
 		)
 		.await
 		.unwrap();
-	let mut ahead = write_meta(&descriptor, 1, uuid_v7());
-	let far = std::time::SystemTime::now()
-		.duration_since(std::time::UNIX_EPOCH)
-		.unwrap()
-		.as_millis() as u64
-		+ 600_000;
-	ahead.client_hlc = crate::schema::HybridTimestamp {
-		physical_ms: far,
-		logical: 0,
-		node_id: 0,
-	};
-	assert_committed(
-		&write_through(
-			&cluster,
-			leader,
-			ahead,
-			named_rows(&descriptor, &[(8, "b")]),
-		)
-		.await,
-		"a winner ahead of every clock",
-	);
+	let winner = write_through(
+		&cluster,
+		leader,
+		write_meta(&descriptor, 1, uuid_v7()),
+		named_rows(&descriptor, &[(8, "b")]),
+	)
+	.await;
+	assert_committed(&winner, "a winner before a rewound coordinator");
 	cluster.node(primary).data_server.rewind_hlc_for_test();
 	let behind = delete_through(&cluster, leader, delete_meta(&descriptor), vec![row_of(8)]).await;
 	assert_eq!(behind.write.status, WriteStatus::OK, "{behind:?}");
 	assert_eq!(counts(&behind), [1, 0, 0]);
 	assert!(
-		behind.write.commit_hlc.physical_ms >= far,
-		"above the winner"
+		behind.write.commit_hlc > winner.write.commit_hlc,
+		"above the winner: {:?} vs {:?}",
+		behind.write.commit_hlc,
+		winner.write.commit_hlc
 	);
 	expected.remove(&8);
 	expect_everywhere(
@@ -3471,6 +3536,159 @@ async fn certified_cleanup_reclaims_obsolete_kv_versions() {
 		}
 	}
 	kv_expect_everywhere(&cluster, b"alpha", Some(b"three"), "after cleanup").await;
+	for node in cluster.nodes {
+		let _ = tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown()).await;
+	}
+}
+
+/// ADR 0700, the failover transition behind the workflow's stalled writes
+/// (diag4): the original leader never forwards anything to a follower, so
+/// after it stops the new leader has clock samples from its one live peer
+/// only. Its decisions must still pass the clock gate, and a write becomes
+/// available again: one refused by the new authority is resent and commits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_new_leader_with_one_voter_down_still_decides() {
+	let (mut cluster, leader, descriptor) = ready().await;
+	assert_committed(
+		&write_through(
+			&cluster,
+			leader,
+			write_meta(&descriptor, 1, uuid_v7()),
+			named_rows(&descriptor, &[(1, "a")]),
+		)
+		.await,
+		"before the failover",
+	);
+	cluster.stop(leader, false).await;
+	let deadline = tokio::time::Instant::now() + BOUND;
+	let successor = loop {
+		let current = cluster.leader().await;
+		if current != leader {
+			break current;
+		}
+		assert!(tokio::time::Instant::now() < deadline, "no new leader");
+		tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+	};
+	// A parent refused by the new authority (its lineage closed by the new
+	// leader's grant) is a recorded, definite not-committed outcome: the write
+	// is sent again under a new identity, within the same bound. Any other
+	// answer keeps its identity (write_through already retries a stall).
+	let committed = loop {
+		let response = write_through(
+			&cluster,
+			successor,
+			write_meta(&descriptor, 1, uuid_v7()),
+			named_rows(&descriptor, &[(2, "b")]),
+		)
+		.await;
+		if response.write.status == WriteStatus::OK
+			&& response.write.mutation_commit_knowledge()
+				== MutationCommitKnowledge::KNOWN_NOT_COMMITTED
+			&& tokio::time::Instant::now() < deadline
+		{
+			continue;
+		}
+		break response;
+	};
+	assert_committed(&committed, "after the failover, with one voter down");
+	let expected: Expected = [(1, "a".to_string()), (2, "b".to_string())].into();
+	for node in NODES.into_iter().filter(|node| *node != leader) {
+		expect_at(&cluster, node, &descriptor, &expected, "after the failover").await;
+	}
+	for node in cluster.nodes {
+		let _ = tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown()).await;
+	}
+}
+
+/// ADR 0700 (r1 R2), the workflow's "with the old leader back" stage (diag3:
+/// early eof): after a failover the old leader is reopened, and every query at
+/// it, before and after it is Ready, ends in a typed terminal. None is a bare
+/// close. It answers OK with exactly the acknowledged rows within the bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_reopened_member_answers_every_query_with_a_typed_terminal() {
+	let (mut cluster, leader, descriptor) = ready().await;
+	assert_committed(
+		&write_through(
+			&cluster,
+			leader,
+			write_meta(&descriptor, 1, uuid_v7()),
+			named_rows(&descriptor, &[(1, "a")]),
+		)
+		.await,
+		"before the failover",
+	);
+	cluster.stop(leader, false).await;
+	let deadline = tokio::time::Instant::now() + BOUND;
+	while cluster.leader().await == leader {
+		assert!(tokio::time::Instant::now() < deadline, "no new leader");
+		tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+	}
+	cluster.reopen(leader).await;
+	let expected: Expected = [(1, "a".to_string())].into();
+	let mut seen = std::collections::BTreeMap::new();
+	loop {
+		let answer = cluster
+			.node(leader)
+			.data_server
+			.table_query_for_test(query_meta(&cluster, leader, &descriptor))
+			.await
+			.unwrap_or_else(|error| panic!("a bare close at the reopened member: {error:?}"));
+		let status = answer
+			.status
+			.unwrap_or_else(|| panic!("no terminal at the reopened member: {answer:?}"));
+		*seen.entry(status.as_str()).or_insert(0u32) += 1;
+		if status == crate::schema::ReadStatus::OK {
+			assert_eq!(answered(&answer), expected, "{seen:?}");
+			break;
+		}
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"never answered OK: {seen:?}"
+		);
+		tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+	}
+	eprintln!("reopened member answers: {seen:?}");
+	for node in cluster.nodes {
+		let _ = tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown()).await;
+	}
+}
+
+/// ADR 0700 (s6-inst2: "stale location in slab 0: fenced" closed a table
+/// query stream bare at a reopened member): a query refused at admission
+/// because the tier authority is not ready is answered with a typed,
+/// retryable terminal, then served once the authority is ready.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_query_before_the_tier_authority_is_ready_gets_a_typed_retryable_terminal() {
+	let (cluster, leader, descriptor) = ready().await;
+	assert_committed(
+		&write_through(
+			&cluster,
+			leader,
+			write_meta(&descriptor, 1, uuid_v7()),
+			named_rows(&descriptor, &[(1, "a")]),
+		)
+		.await,
+		"a row",
+	);
+	let node = NODES.into_iter().find(|id| *id != leader).unwrap();
+	cluster.node(node).slab.set_awaiting_cluster_for_test(true);
+	let held = cluster
+		.node(node)
+		.data_server
+		.table_query_for_test(query_meta(&cluster, node, &descriptor))
+		.await
+		.expect("a typed terminal, not a bare close");
+	assert_eq!(held.status, Some(crate::schema::ReadStatus::BACKPRESSURED));
+	assert!(held.batches.is_empty());
+	cluster.node(node).slab.set_awaiting_cluster_for_test(false);
+	expect_at(
+		&cluster,
+		node,
+		&descriptor,
+		&[(1, "a".to_string())].into(),
+		"once ready",
+	)
+	.await;
 	for node in cluster.nodes {
 		let _ = tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown()).await;
 	}

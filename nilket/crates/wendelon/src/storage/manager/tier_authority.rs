@@ -2565,6 +2565,13 @@ impl SlabManager {
 		Ok(())
 	}
 
+	/// Test-only: holds or releases this store's tier authority as a start
+	/// awaiting the cluster does.
+	#[cfg(test)]
+	pub(crate) fn set_awaiting_cluster_for_test(&self, awaiting: bool) {
+		self.awaiting_cluster.store(awaiting, Ordering::Release);
+	}
+
 	pub(crate) fn is_awaiting_cluster(&self) -> bool {
 		self.awaiting_cluster.load(Ordering::Acquire)
 	}

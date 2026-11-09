@@ -1111,8 +1111,10 @@ async fn a_holder_lease_that_expires_while_waiting_for_the_lock_stops_the_write(
 	assert_eq!(copies(&slab, &planned).await, vec![0]);
 }
 
+/// ADR 0700: the mode opens exactly the surfaces it serves, in production; no
+/// test-only opening exists.
 #[test]
-fn a_node_without_the_test_opening_opens_no_data_frame_or_stream() {
+fn the_mode_opens_exactly_the_surfaces_it_serves() {
 	let peer = DecisionPeer::default();
 	for msg_type in [
 		MsgType::TABLE_WRITE_REQ,
@@ -1121,11 +1123,19 @@ fn a_node_without_the_test_opening_opens_no_data_frame_or_stream() {
 		MsgType::TABLE_CHILD_FETCH_REQ,
 		MsgType::TABLE_QUERY_REQ,
 		MsgType::WRITE_REQ,
-		MsgType::QUERY_REQ,
 		MsgType::READ_REQ,
-		MsgType::AGG_REQ,
 		MsgType::TABLE_DELETE_REQ,
 	] {
-		assert!(!peer.opens(msg_type.0), "{msg_type:?}");
+		assert!(peer.opens(msg_type.0), "served: {msg_type:?}");
+	}
+	for msg_type in [
+		MsgType::QUERY_REQ,
+		MsgType::AGG_REQ,
+		MsgType::BULK_WRITE_REQ,
+		MsgType::STREAM_FIN_REQ,
+		MsgType::COUNTER_ADD_REQ,
+		MsgType::CDC_SUBSCRIBE_REQ,
+	] {
+		assert!(!peer.opens(msg_type.0), "refused: {msg_type:?}");
 	}
 }

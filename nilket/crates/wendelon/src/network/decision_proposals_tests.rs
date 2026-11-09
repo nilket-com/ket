@@ -2,7 +2,6 @@
 
 use super::*;
 use crate::consensus::decisions::tests as fixture;
-use crate::consensus::monitor::FakeClock;
 use crate::consensus::raft_storage::apply_at_leader_for_test;
 
 fn trusted() -> BTreeMap<u32, [u8; 32]> {
@@ -68,6 +67,98 @@ fn the_leader_stamps_a_reserve_and_only_for_its_coordinator() {
 		panic!("a Reserve");
 	};
 	assert_eq!(stamp_ms, fixture::T0);
+}
+
+/// ADR 0700 (r1 R1): exactly Reserve and RecordNoop bear time. The selection
+/// `propose_as` uses leaves both unstamped, so they reach Raft only stamped by
+/// the gated clock and both refuse unhealthy time; the operations that do not
+/// need time stay usable while it is unhealthy.
+#[test]
+fn only_reserve_and_record_noop_bear_time_and_both_need_the_gate() {
+	let mode = DecisionMode::ParentDecisions;
+	let mut state = fixture::base(3);
+	fixture::grant_all(&mut state);
+	let (reserve, coordinator) = reserve_request(&state);
+	let body = fixture::noop_body(&state, 2, 1);
+	let noop_sender = body.coordinator.node;
+	let noop = ForwardedDecision::RecordNoop {
+		noop: fixture::sign_for_test(body.clone(), body.coordinator),
+	};
+	let unhealthy = || Err(ProposalRefusal::ClockUnhealthy);
+	assert!(matches!(
+		admission(mode, coordinator, reserve.clone(), &trusted()),
+		Ok(Admitted::Unstamped(Unstamped::Reserve { .. }))
+	));
+	assert!(matches!(
+		admission(mode, noop_sender, noop.clone(), &trusted()),
+		Ok(Admitted::Unstamped(Unstamped::RecordNoop { .. }))
+	));
+	for (sender, request) in [(coordinator, reserve), (noop_sender, noop.clone())] {
+		assert_eq!(
+			admit(mode, sender, request, &trusted(), unhealthy),
+			Err(ProposalRefusal::ClockUnhealthy)
+		);
+	}
+	let Ok(WendelonRequest::Decision(DecisionCommand::RecordNoop { stamp_ms, .. })) =
+		admit(mode, noop_sender, noop, &trusted(), healthy)
+	else {
+		panic!("a RecordNoop");
+	};
+	assert_eq!(stamp_ms, fixture::T0);
+	let claim = fixture::claim(
+		fixture::key(fixture::T0, 3),
+		fixture::children(&state, 1),
+		0,
+	);
+	let DecisionCommand::Abort { abort } = fixture::abort_command(&claim, 1) else {
+		panic!("an Abort");
+	};
+	let recovery = [
+		(
+			coordinator,
+			ForwardedDecision::Finalize {
+				key: claim.key,
+				request_digest: claim.request_digest,
+				acks: Vec::new(),
+			},
+		),
+		(
+			coordinator,
+			ForwardedDecision::Resolve {
+				key: claim.key,
+				request_digest: claim.request_digest,
+			},
+		),
+		(
+			abort.body.coordinator.node,
+			ForwardedDecision::Abort { abort },
+		),
+		(
+			1,
+			ForwardedDecision::BindSigner {
+				incarnation: fixture::inc(1),
+			},
+		),
+		(
+			1,
+			ForwardedDecision::RegisterIncarnation {
+				incarnation: fixture::inc(1),
+			},
+		),
+	];
+	for (sender, request) in recovery {
+		assert!(
+			matches!(
+				admission(mode, sender, request.clone(), &trusted()),
+				Ok(Admitted::Ready(_))
+			),
+			"{request:?}"
+		);
+		assert!(
+			admit(mode, sender, request.clone(), &trusted(), unhealthy).is_ok(),
+			"{request:?} needs no time"
+		);
+	}
 }
 
 #[test]
@@ -196,49 +287,84 @@ fn today_keeps_the_appending_leader_rule_for_registration() {
 	);
 }
 
+/// ADR 0700: the decision clock gate needs fresh samples from floor(n/2)
+/// other current voters (3, 5 and 7 voters need 1, 2 and 3), counted and
+/// medianed over voters only; self, non-voters, duplicates and stale samples
+/// never count; a skewed peer median refuses; a joint configuration and a
+/// leader outside the voters refuse; a single voter has no peer median.
 #[test]
-fn the_leader_clock_must_pass_the_drift_test_at_proposal() {
-	let clock = Arc::new(FakeClock::new(fixture::T0));
+fn the_decision_clock_gate_needs_a_fresh_voter_majority() {
+	use std::collections::BTreeSet;
+	use std::time::Duration;
+	let now = fixture::T0;
+	let fresh = Duration::from_millis(100);
+	let stale = CLOCK_SAMPLE_FRESHNESS + Duration::from_millis(1);
+	let voters = |n: u32| (1..=n).collect::<BTreeSet<u32>>();
+	let samples = |peers: &[u32], age: Duration| {
+		peers
+			.iter()
+			.map(|peer| (*peer, now - age.as_millis() as u64, age))
+			.collect::<Vec<_>>()
+	};
+	for (n, needed) in [(3u32, 1usize), (5, 2), (7, 3)] {
+		let peers: Vec<u32> = (2..=n).collect();
+		assert_eq!(
+			clock_gate(
+				now,
+				1,
+				Some(&voters(n)),
+				&samples(&peers[..needed - 1], fresh)
+			),
+			Err(ProposalRefusal::ClockUnhealthy),
+			"{n} voters, {} fresh of {needed} needed",
+			needed - 1
+		);
+		assert_eq!(
+			clock_gate(now, 1, Some(&voters(n)), &samples(&peers[..needed], fresh)),
+			Ok(now),
+			"{n} voters, {needed} fresh"
+		);
+		assert_eq!(
+			clock_gate(now, 1, Some(&voters(n)), &samples(&peers[..needed], stale)),
+			Err(ProposalRefusal::ClockUnhealthy),
+			"{n} voters, only stale samples"
+		);
+	}
+	// Self, a non-voter and a duplicate do not count toward the majority.
+	let mut padded = samples(&[1, 9], fresh);
+	padded.extend(samples(&[2], fresh));
+	padded.extend(samples(&[2], fresh));
 	assert_eq!(
-		leader_clock_now(None, &*clock),
-		Err(ProposalRefusal::ClockUnhealthy)
-	);
-	let tracker = NodeTracker::new(
-		NodeId {
-			id: 1,
-			_reserved: 0,
-		},
-		clock.clone(),
-	);
-	assert_eq!(
-		leader_clock_now(Some(&tracker), &*clock),
+		clock_gate(now, 1, Some(&voters(5)), &padded),
 		Err(ProposalRefusal::ClockUnhealthy),
-		"no cluster median yet"
+		"one distinct eligible voter of two needed"
 	);
-	for peer in [2, 3] {
-		tracker.record(
-			NodeId {
-				id: peer,
-				_reserved: 0,
-			},
-			fixture::T0,
-		);
-	}
-	assert_eq!(leader_clock_now(Some(&tracker), &*clock), Ok(fixture::T0));
-	// The peers report times further behind than the drift bound allows.
-	for peer in [2, 3] {
-		tracker.record(
-			NodeId {
-				id: peer,
-				_reserved: 0,
-			},
-			fixture::T0 - MAX_OFFSET_MS - 1,
-		);
-	}
+	// A peer median skewed beyond the bound refuses.
+	let skewed = vec![
+		(2, now - MAX_OFFSET_MS - 200, fresh),
+		(3, now - MAX_OFFSET_MS - 200, fresh),
+	];
 	assert_eq!(
-		leader_clock_now(Some(&tracker), &*clock),
+		clock_gate(now, 1, Some(&voters(3)), &skewed),
 		Err(ProposalRefusal::ClockUnhealthy)
 	);
+	// A sample's age is monotonic: a later wall-clock jump forward does not
+	// make a stale sample count, and the projection follows its age.
+	assert_eq!(
+		clock_gate(now + 60_000, 1, Some(&voters(3)), &samples(&[2], stale)),
+		Err(ProposalRefusal::ClockUnhealthy)
+	);
+	// Joint configurations and a leader that is not a voter are refused.
+	assert_eq!(
+		clock_gate(now, 1, None, &samples(&[2, 3], fresh)),
+		Err(ProposalRefusal::ClockUnhealthy)
+	);
+	assert_eq!(
+		clock_gate(now, 4, Some(&voters(3)), &samples(&[2, 3], fresh)),
+		Err(ProposalRefusal::ClockUnhealthy)
+	);
+	// A single voter has no peer median.
+	assert_eq!(clock_gate(now, 1, Some(&voters(1)), &[]), Ok(now));
 }
 
 #[test]
@@ -278,4 +404,47 @@ fn an_oversized_or_malformed_frame_is_refused_before_decode() {
 		decode_bounded::<ForwardedDecision>(&bytes).unwrap(),
 		request
 	);
+}
+
+/// ADR 0700 (r1 R3): a held probe never outlives its owner. Stopping cancels
+/// and awaits it; dropping the owner, as an aborted maintenance loop does,
+/// cancels it; either way the in-flight guard is released.
+#[tokio::test]
+async fn a_held_clock_probe_is_cancelled_by_stop_or_by_its_owner_dropping() {
+	struct Ended(Option<tokio::sync::oneshot::Sender<()>>);
+	impl Drop for Ended {
+		fn drop(&mut self) {
+			let _ = self.0.take().unwrap().send(());
+		}
+	}
+	let held = || {
+		let (tx, rx) = tokio::sync::oneshot::channel();
+		let ended = Ended(Some(tx));
+		(
+			async move {
+				let _ended = ended;
+				std::future::pending::<()>().await;
+			},
+			rx,
+		)
+	};
+
+	let mut probe = ClockProbe::default();
+	let (future, mut ended) = held();
+	probe.start(future);
+	tokio::task::yield_now().await;
+	assert!(probe.busy(), "a held probe occupies its owner");
+	assert!(ended.try_recv().is_err());
+	probe.stop().await;
+	assert!(ended.try_recv().is_ok(), "stop cancelled and awaited it");
+	assert!(!probe.busy(), "the guard is released");
+
+	let (future, ended) = held();
+	probe.start(future);
+	tokio::task::yield_now().await;
+	drop(probe);
+	tokio::time::timeout(std::time::Duration::from_secs(5), ended)
+		.await
+		.expect("dropping the owner cancels the probe")
+		.unwrap();
 }
