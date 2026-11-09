@@ -235,6 +235,8 @@ use write_clocks::{WriteClocks, acquire_mutation_work_permit, bound_orphan_witne
 mod mutation_protocol;
 use mutation_protocol::{TableAdmissionError, mutation_expiry_response};
 mod streaming;
+// ADR 0701: a ParentDecisions holder's batched lease renewal.
+mod lease_batch;
 use counter::{CounterParticipantFactory, CounterReplicaNetworkTransport};
 use descriptor_migration::MigrationRegistry;
 
@@ -3255,11 +3257,11 @@ impl WendelonDataServer {
 			WendelonResponse::Refused(refusal) => Err(Error::other(format!(
 				"unexpected slab refusal for a non-slab command: {refusal:?}"
 			))),
-			unexpected @ (WendelonResponse::Op(_) | WendelonResponse::Decision(_)) => {
-				Err(Error::other(format!(
-					"unexpected response to this command: {unexpected:?}"
-				)))
-			}
+			unexpected @ (WendelonResponse::Op(_)
+			| WendelonResponse::Decision(_)
+			| WendelonResponse::LeaseResults(_)) => Err(Error::other(format!(
+				"unexpected response to this command: {unexpected:?}"
+			))),
 			WendelonResponse::Root2Dormant => Err(Error::other("Root2 carrier is dormant")),
 			WendelonResponse::LeaseDenied => Err(Error::other(format!(
 				"drop reclaim {stage} returned unexpected lease denial"
@@ -3822,6 +3824,37 @@ impl WendelonDataServer {
 				.set(guard.len() as u64);
 		}
 
+		let current_leader = self.raft.current_leader().await;
+		// ADR 0701: ParentDecisions renews a holder's ranges in one bounded entry
+		// per pass; Today renews one range at a time. Every request is stamped
+		// when it is made, never from a reading reused across a wait.
+		if self.parent_decisions() {
+			return self
+				.renew_leases_batched(&ranges, epoch, clock, ttl_ms, current_leader)
+				.await;
+		}
+		let mut granted = 0usize;
+		for (range_start, range_end) in ranges {
+			if self
+				.renew_lease_range(range_start, range_end, epoch, clock, ttl_ms, current_leader)
+				.await
+			{
+				granted += 1;
+			}
+		}
+		granted
+	}
+
+	/// One range's lease renewal, stamped from the clock when it is requested.
+	async fn renew_lease_range(
+		&self,
+		range_start: u64,
+		range_end: u64,
+		epoch: u64,
+		clock: &dyn PhysicalClock,
+		ttl_ms: u32,
+		current_leader: Option<u32>,
+	) -> bool {
 		let now_ms = clock.now_ms();
 		let now_hlc = HybridTimestamp {
 			physical_ms: now_ms,
@@ -3833,108 +3866,100 @@ impl WendelonDataServer {
 			logical: 0,
 			node_id: self.local_node.id,
 		};
-		let current_leader = self.raft.current_leader().await;
-		let mut granted = 0usize;
-		for (range_start, range_end) in ranges {
-			let request = AcquireLeaseRequestMeta {
+		let request = AcquireLeaseRequestMeta {
+			range_start,
+			range_end,
+			epoch,
+			holder: self.local_node,
+			requested_hlc: now_hlc,
+			ttl_ms,
+			_pad: 0,
+		};
+		let outcome = if current_leader == Some(self.local_node.id) {
+			let lease = self.make_signed_lease(
+				epoch,
+				self.local_node,
 				range_start,
 				range_end,
-				epoch,
-				holder: self.local_node,
-				requested_hlc: now_hlc,
-				ttl_ms,
-				_pad: 0,
-			};
-			let outcome = if current_leader == Some(self.local_node.id) {
-				let lease = self.make_signed_lease(
-					epoch,
-					self.local_node,
-					range_start,
-					range_end,
-					now_hlc,
-					expiry_hlc,
-				);
-				match self
-					.raft
-					.client_write(WendelonRequest::AcquireLease(lease))
-					.await
-				{
-					Ok(resp) => match resp.data {
-						WendelonResponse::Success => Ok(LeaseAcquireOutcome::Granted(lease)),
-						WendelonResponse::LeaseDenied => {
-							Ok(LeaseAcquireOutcome::Denied(LeaseStatus::DENIED_OVERLAP))
-						}
-						WendelonResponse::Error(message) => Err(Error::new(
-							ErrorKind::Other,
-							format!(
-								"lease manager: state machine rejected AcquireLease: {message}"
-							),
-						)),
-						WendelonResponse::Refused(refusal) => Err(Error::other(format!(
-							"unexpected slab refusal for a non-slab command: {refusal:?}"
-						))),
-						unexpected @ (WendelonResponse::Op(_) | WendelonResponse::Decision(_)) => {
-							Err(Error::other(format!(
-								"unexpected response to this command: {unexpected:?}"
-							)))
-						}
-						WendelonResponse::Root2Dormant => {
-							Err(Error::other("Root2 carrier is dormant"))
-						}
-					},
-					Err(err) => Err(Error::new(
-						ErrorKind::Other,
-						format!("lease manager: local AcquireLease commit failed: {err}"),
-					)),
-				}
-			} else if let Some(leader_id) = current_leader {
-				self.request_remote_lease(
-					NodeId {
-						id: leader_id,
-						_reserved: 0,
-					},
-					request,
-				)
+				now_hlc,
+				expiry_hlc,
+			);
+			match self
+				.raft
+				.client_write(WendelonRequest::AcquireLease(lease))
 				.await
-			} else {
-				continue;
-			};
-			match outcome {
-				Ok(LeaseAcquireOutcome::Granted(lease)) => {
-					if Some(lease.issuer.id) == current_leader
-						&& self.lease_authority.verify_lease(&lease).is_ok()
-					{
-						self.cache_granted_lease(lease);
-						granted += 1;
-						metrics().data_ring_lease_grants_total.inc();
-					} else {
-						tracing::warn!(
-							range_start,
-							range_end,
-							epoch,
-							"lease manager: leader returned an invalidly signed lease"
-						);
+			{
+				Ok(resp) => match resp.data {
+					WendelonResponse::Success => Ok(LeaseAcquireOutcome::Granted(lease)),
+					WendelonResponse::LeaseDenied => {
+						Ok(LeaseAcquireOutcome::Denied(LeaseStatus::DENIED_OVERLAP))
 					}
-				}
-				Ok(LeaseAcquireOutcome::Denied(_status)) => {
-					metrics().data_ring_lease_denials_total.inc();
-					// Another holder (or a stale-epoch request)
-					// blocks us — skip, keep the old entry if any.
-					// The next tick retries.
-				}
-				Err(e) => {
-					metrics().data_ring_lease_errors_total.inc();
+					WendelonResponse::Error(message) => Err(Error::new(
+						ErrorKind::Other,
+						format!("lease manager: state machine rejected AcquireLease: {message}"),
+					)),
+					WendelonResponse::Refused(refusal) => Err(Error::other(format!(
+						"unexpected slab refusal for a non-slab command: {refusal:?}"
+					))),
+					unexpected @ (WendelonResponse::Op(_)
+					| WendelonResponse::Decision(_)
+					| WendelonResponse::LeaseResults(_)) => Err(Error::other(format!(
+						"unexpected response to this command: {unexpected:?}"
+					))),
+					WendelonResponse::Root2Dormant => Err(Error::other("Root2 carrier is dormant")),
+				},
+				Err(err) => Err(Error::new(
+					ErrorKind::Other,
+					format!("lease manager: local AcquireLease commit failed: {err}"),
+				)),
+			}
+		} else if let Some(leader_id) = current_leader {
+			self.request_remote_lease(
+				NodeId {
+					id: leader_id,
+					_reserved: 0,
+				},
+				request,
+			)
+			.await
+		} else {
+			return false;
+		};
+		match outcome {
+			Ok(LeaseAcquireOutcome::Granted(lease)) => {
+				if Some(lease.issuer.id) == current_leader
+					&& self.lease_authority.verify_lease(&lease).is_ok()
+				{
+					self.cache_granted_lease(lease);
+					metrics().data_ring_lease_grants_total.inc();
+					return true;
+				} else {
 					tracing::warn!(
 						range_start,
 						range_end,
 						epoch,
-						error = %e,
-						"lease manager: client_write failed; will retry next tick"
+						"lease manager: leader returned an invalidly signed lease"
 					);
 				}
 			}
+			Ok(LeaseAcquireOutcome::Denied(_status)) => {
+				metrics().data_ring_lease_denials_total.inc();
+				// Another holder (or a stale-epoch request)
+				// blocks us — skip, keep the old entry if any.
+				// The next tick retries.
+			}
+			Err(e) => {
+				metrics().data_ring_lease_errors_total.inc();
+				tracing::warn!(
+					range_start,
+					range_end,
+					epoch,
+					error = %e,
+					"lease manager: client_write failed; will retry next tick"
+				);
+			}
 		}
-		granted
+		false
 	}
 
 	/// Spawn the lease manager background task. Fires on every

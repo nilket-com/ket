@@ -3198,7 +3198,9 @@ fn advertised_capabilities(
 		.with(NodeCapability::SlabStatsPruning)
 		.with(NodeCapability::PartialAggregatePushdown);
 	if decision_mode == crate::consensus::decision_mode::DecisionMode::ParentDecisions {
-		capabilities.with(NodeCapability::ParentDecisions)
+		capabilities
+			.with(NodeCapability::ParentDecisions)
+			.with(NodeCapability::ParentDecisionsBatchedLeases)
 	} else {
 		capabilities
 	}
@@ -3289,6 +3291,9 @@ fn install_tenant_kek_response(response: WendelonResponse, context: &str) -> std
 		crate::consensus::WendelonResponse::Op(refusal) => Err(Error::other(format!(
 			"unexpected slab refusal for a non-slab command: {refusal:?}"
 		))),
+		crate::consensus::WendelonResponse::LeaseResults(results) => Err(Error::other(format!(
+			"unexpected lease results for a non-lease command: {results:?}"
+		))),
 		crate::consensus::WendelonResponse::Decision(result) => Err(Error::other(format!(
 			"unexpected decision result for a non-decision command: {result:?}"
 		))),
@@ -3329,6 +3334,9 @@ fn tenant_request_response(response: WendelonResponse, context: &str) -> std::io
 		))),
 		WendelonResponse::Op(refusal) => Err(Error::other(format!(
 			"unexpected slab refusal for a non-slab command: {refusal:?}"
+		))),
+		WendelonResponse::LeaseResults(results) => Err(Error::other(format!(
+			"unexpected lease results for a non-lease command: {results:?}"
 		))),
 		WendelonResponse::Decision(result) => Err(Error::other(format!(
 			"unexpected decision result for a non-decision command: {result:?}"

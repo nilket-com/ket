@@ -2644,3 +2644,226 @@ fn a_reserved_parent_or_an_unretired_key_blocks_the_cut() {
 		refused(DecisionRefusal::TargetNotAdmissible)
 	);
 }
+
+// ============================================================
+//  ADR 0701: A HOLDER'S BATCHED LEASE RENEWAL
+// ============================================================
+
+fn lease_batch(leases: Vec<LeaseDescriptor>) -> WendelonRequest {
+	WendelonRequest::AcquireLeases(crate::consensus::LeaseBatch::new(leases).unwrap())
+}
+
+fn batch_results(response: WendelonResponse) -> Vec<(u64, bool)> {
+	match response {
+		WendelonResponse::LeaseResults(results) => results
+			.results()
+			.iter()
+			.map(|result| (result.range_start, result.granted))
+			.collect(),
+		other => panic!("not lease results: {other:?}"),
+	}
+}
+
+/// The same leases applied as one `AcquireLeases` and as separate
+/// `AcquireLease` entries, from equal states: equal per-lease outcomes, leases,
+/// lineages and generations. Returns the outcomes and the batched state.
+fn batch_matches_singles(
+	setup: impl Fn(&mut SmState),
+	leases: Vec<LeaseDescriptor>,
+) -> (Vec<(u64, bool)>, SmState) {
+	let (mut one, mut many) = (base(3), base(3));
+	setup(&mut one);
+	setup(&mut many);
+	let singles: Vec<(u64, bool)> = leases
+		.iter()
+		.map(|lease| {
+			let response = apply_next(&mut one, WendelonRequest::AcquireLease(*lease));
+			(lease.range_start, response == WendelonResponse::Success)
+		})
+		.collect();
+	let batched = batch_results(apply_next(&mut many, lease_batch(leases)));
+	assert_eq!(batched, singles);
+	assert_eq!(one.leases, many.leases);
+	assert_eq!(decisions(&one).lineages, decisions(&many).lineages);
+	assert_eq!(
+		decisions(&one).next_generation(),
+		decisions(&many).next_generation()
+	);
+	(singles, many)
+}
+
+/// ADR 0701: for a WELL-FORMED batch, one entry applies exactly as its leases
+/// one at a time, in declared order, so a later denial undoes nothing.
+#[test]
+fn a_well_formed_lease_batch_applies_as_its_leases_one_at_a_time() {
+	let holder = universe()[0].0;
+	let ranges: Vec<(u64, u64)> = universe()
+		.into_iter()
+		.filter(|(id, _)| *id == holder)
+		.map(|(_, range)| range)
+		.collect();
+	assert!(ranges.len() >= 3, "{ranges:?}");
+	let other = universe()
+		.into_iter()
+		.find(|(id, _)| *id != holder)
+		.unwrap()
+		.0;
+	let fresh = |range: (u64, u64)| lease(holder, range, 0, 1_000);
+
+	// Mixed outcome. SYNTHESIZED fixture: a live lease of another holder over
+	// the second range, put straight into state to exercise the shared reducer.
+	// A batch of canonical primary ranges cannot overlap within itself, and
+	// mode admission would not grant this lease; it is not claimed reachable.
+	let synthesized = |state: &mut SmState| {
+		state
+			.leases
+			.insert(ranges[1].0, lease(other, ranges[1], 0, 10_000));
+	};
+	let (outcomes, _) =
+		batch_matches_singles(synthesized, ranges[..3].iter().map(|r| fresh(*r)).collect());
+	assert_eq!(
+		outcomes,
+		vec![
+			(ranges[0].0, true),
+			(ranges[1].0, false),
+			(ranges[2].0, true)
+		]
+	);
+
+	// Continuous renewal by a new issuer keeps the generation.
+	let granted = |state: &mut SmState| {
+		for range in &ranges[..2] {
+			assert_eq!(grant(state, fresh(*range)), WendelonResponse::Success);
+		}
+	};
+	let mut before = base(3);
+	granted(&mut before);
+	let renewals = ranges[..2]
+		.iter()
+		.map(|range| {
+			let mut renewal = lease(holder, *range, 500, 2_000);
+			renewal.issuer = node(2);
+			renewal
+		})
+		.collect();
+	let (outcomes, after) = batch_matches_singles(granted, renewals);
+	assert!(outcomes.iter().all(|(_, granted)| *granted));
+	assert_eq!(decisions(&after).lineages, decisions(&before).lineages);
+
+	// A grant after a gap replaces the lineage.
+	let gapped = ranges[..2]
+		.iter()
+		.map(|range| lease(holder, *range, 2_000, 3_000))
+		.collect();
+	let (outcomes, after) = batch_matches_singles(granted, gapped);
+	assert!(outcomes.iter().all(|(_, granted)| *granted));
+	for range in &ranges[..2] {
+		assert!(
+			decisions(&after).lineages[&range.0].generation
+				> decisions(&before).lineages[&range.0].generation
+		);
+	}
+}
+
+/// ADR 0701: a gapped batch closes the lineage a reserved parent is bound to;
+/// that parent becomes Refused only through the Finalize that finds it closed.
+#[test]
+fn a_gapped_lease_batch_leaves_the_old_parent_to_be_refused_at_finalize() {
+	let (mut state, claim, rsv) = reserved_parent(1);
+	let child = claim.children[usize::from(claim.coordinator)].clone();
+	let range_end = decisions(&state).lineages[&child.lineage.range_start].range_end;
+	let mut gapped = lease(
+		child.holder.node,
+		(child.lineage.range_start, range_end),
+		2_000,
+		3_000,
+	);
+	gapped.issuer = node(2);
+	assert_eq!(
+		batch_results(apply_next(&mut state, lease_batch(vec![gapped]))),
+		vec![(child.lineage.range_start, true)]
+	);
+	assert_eq!(
+		decisions(&state).body(rsv).unwrap().status,
+		ParentStatus::Reserved,
+		"a grant alone records no outcome"
+	);
+	assert!(matches!(
+		finalize(&mut state, &claim, quorum_acks(&claim, rsv)),
+		DecisionResult::Terminal {
+			status: ParentStatus::Refused {
+				cause: RefusalCause::LineageClosed,
+				..
+			},
+			..
+		}
+	));
+}
+
+/// ADR 0701: an invalid envelope applies nothing, and Today refuses any batch.
+/// This is all-or-nothing refusal, not an equivalence with single grants.
+#[test]
+fn a_malformed_lease_batch_or_one_under_today_applies_nothing() {
+	let (holder, range) = universe()[0];
+	let (other, other_range) = universe()
+		.into_iter()
+		.find(|(id, _)| *id != holder)
+		.unwrap();
+	let good = lease(holder, range, 0, 1_000);
+	let mut later_epoch = lease(holder, (range.1 + 1, range.1 + 10), 0, 1_000);
+	later_epoch.epoch += 1;
+	let mut reversed = lease(holder, (range.1 + 10, range.1 + 1), 0, 1_000);
+	reversed.range_start = range.1 + 10;
+	for (why, leases) in [
+		("empty", vec![]),
+		("duplicate start", vec![good, good]),
+		(
+			"two holders",
+			vec![good, lease(other, other_range, 0, 1_000)],
+		),
+		("two epochs", vec![good, later_epoch]),
+		("reversed", vec![good, reversed]),
+	] {
+		let mut state = base(3);
+		let (leases_before, decisions_before) = (state.leases.clone(), decisions(&state).clone());
+		let response = apply_next(&mut state, lease_batch(leases));
+		assert!(
+			matches!(&response, WendelonResponse::Error(message) if message.starts_with("lease batch malformed")),
+			"{why}: {response:?}"
+		);
+		assert_eq!(state.leases, leases_before, "{why}");
+		assert_eq!(decisions(&state), &decisions_before, "{why}");
+	}
+	let mut today = SmState::default();
+	let response = apply_next(&mut today, lease_batch(vec![good]));
+	assert!(
+		matches!(response, WendelonResponse::Error(_)),
+		"{response:?}"
+	);
+	assert!(today.leases.is_empty() && today.decisions.is_none());
+}
+
+/// ADR 0701: decoding refuses a batch or a result list longer than the cap
+/// from its declared length, before reading or allocating an element.
+#[test]
+fn an_oversized_lease_batch_is_refused_from_its_length() {
+	use crate::consensus::{LeaseBatch, LeaseGrantResults};
+	use crate::schema::MAX_LEASES_PER_BATCH;
+	let one = lease(universe()[0].0, universe()[0].1, 0, 1_000);
+	let at_cap = postcard::to_stdvec(&vec![one; MAX_LEASES_PER_BATCH]).unwrap();
+	assert_eq!(
+		postcard::from_bytes::<LeaseBatch>(&at_cap)
+			.unwrap()
+			.leases()
+			.len(),
+		MAX_LEASES_PER_BATCH
+	);
+	let over = postcard::to_stdvec(&vec![one; MAX_LEASES_PER_BATCH + 1]).unwrap();
+	assert!(postcard::from_bytes::<LeaseBatch>(&over).is_err());
+	assert!(LeaseBatch::new(vec![one; MAX_LEASES_PER_BATCH + 1]).is_none());
+	// A declared length of a billion with no elements behind it is refused
+	// from the length alone.
+	let huge = postcard::to_stdvec(&1_000_000_000u32).unwrap();
+	assert!(postcard::from_bytes::<LeaseBatch>(&huge).is_err());
+	assert!(postcard::from_bytes::<LeaseGrantResults>(&huge).is_err());
+}

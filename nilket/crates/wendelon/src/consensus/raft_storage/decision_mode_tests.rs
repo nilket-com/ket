@@ -217,6 +217,10 @@ async fn a_new_mode_store_writes_its_own_format_and_reopens() {
 
 use crate::consensus::decisions::tests as fixture;
 
+const PARENT_DECISIONS_V14_MANIFEST: &str =
+	include_str!("../../../tests/fixtures/consensus_body/parent_decisions_v14.txt");
+/// S5a to ADR 0700's format-13 bodies, retained: no batched lease renewals.
+/// ADR 0701 only appended a variant, so every format-13 body is unchanged.
 const PARENT_DECISIONS_V13_MANIFEST: &str =
 	include_str!("../../../tests/fixtures/consensus_body/parent_decisions_v13.txt");
 /// S4b's format-12 bodies, retained: no generations.
@@ -234,7 +238,20 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 fn manifest() -> BTreeMap<String, String> {
-	parse(PARENT_DECISIONS_V13_MANIFEST)
+	parse(PARENT_DECISIONS_V14_MANIFEST)
+}
+
+/// ADR 0701: the batch pinned in the format-14 corpus, two leases of one holder.
+fn golden_lease_batch() -> WendelonRequest {
+	let (holder, range) = fixture::universe()[0];
+	let next = (range.1 + 1, range.1 + 1_000);
+	WendelonRequest::AcquireLeases(
+		crate::consensus::LeaseBatch::new(vec![
+			fixture::lease(holder, range, 0, 1_000),
+			fixture::lease(holder, next, 500, 2_000),
+		])
+		.unwrap(),
+	)
 }
 
 fn parse(raw: &str) -> BTreeMap<String, String> {
@@ -263,7 +280,7 @@ fn entry(index: u64, request: WendelonRequest) -> Entry<WendelonTypeConfig> {
 }
 
 #[test]
-fn the_format_13_bodies_match_their_goldens_and_round_trip() {
+fn the_format_14_bodies_match_their_goldens_and_round_trip() {
 	let stored = manifest();
 	let state = golden_state();
 	let body = encode_state_body(DecisionMode::ParentDecisions, &state).unwrap();
@@ -286,6 +303,10 @@ fn the_format_13_bodies_match_their_goldens_and_round_trip() {
 			hex(&postcard::to_stdvec(&request).unwrap()),
 		));
 	}
+	actual.push((
+		"acquire_leases_0".to_owned(),
+		hex(&postcard::to_stdvec(&golden_lease_batch()).unwrap()),
+	));
 	let moved: Vec<String> = actual
 		.iter()
 		.filter(|(name, hex)| stored.get(name) != Some(hex))
@@ -293,7 +314,7 @@ fn the_format_13_bodies_match_their_goldens_and_round_trip() {
 		.collect();
 	assert!(
 		moved.is_empty(),
-		"format-13 bodies moved or are missing; expected lines:\n{}",
+		"format-14 bodies moved or are missing; expected lines:\n{}",
 		moved.join("\n")
 	);
 	assert_eq!(stored.len(), actual.len());
@@ -308,6 +329,12 @@ fn the_format_13_bodies_match_their_goldens_and_round_trip() {
 	assert!(decisions.floor_ms() > 0 && decisions.next_generation() > 2);
 	// Today cannot read it as its own body.
 	assert!(decode_state_body(DecisionMode::Today, &body).is_err());
+	// ADR 0701 appended a variant: every retained format-13 body is unchanged.
+	let retained = parse(PARENT_DECISIONS_V13_MANIFEST);
+	for (name, hex) in &retained {
+		assert_eq!(stored.get(name), Some(hex), "{name}");
+	}
+	assert_eq!(stored.len(), retained.len() + 1);
 }
 
 #[test]

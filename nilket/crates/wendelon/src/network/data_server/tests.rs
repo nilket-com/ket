@@ -18920,3 +18920,265 @@ fn a_read_admission_refusal_is_retryable_only_while_the_tier_authority_is_not_re
 		ReadStatus::QUERY_EXECUTION_FAILED
 	);
 }
+
+/// ADR 0701: a lease batch's bytes are refused unless the count is within the
+/// cap and the length is exact, before any entry is read.
+#[test]
+fn a_lease_batch_on_the_wire_needs_an_exact_bounded_length() {
+	use crate::schema::{
+		AcquireLeasesRequestHeader, LeaseRangeWire, MAX_LEASES_PER_BATCH, decode_lease_batch,
+		lease_batch_bytes,
+	};
+	let decode = |bytes: &[u8]| {
+		decode_lease_batch::<AcquireLeasesRequestHeader, LeaseRangeWire>(bytes, |header| {
+			header.count
+		})
+	};
+	let header = |count: u32| AcquireLeasesRequestHeader {
+		epoch: 1,
+		holder: NodeId {
+			id: 1,
+			_reserved: 0,
+		},
+		requested_hlc: hlc(1, 0, 1),
+		ttl_ms: 3_000,
+		count,
+	};
+	let bytes = |count: u32, entries: usize| {
+		let mut out = bytemuck::bytes_of(&header(count)).to_vec();
+		for n in 0..entries as u64 {
+			out.extend_from_slice(bytemuck::bytes_of(&LeaseRangeWire {
+				range_start: n * 10,
+				range_end: n * 10 + 9,
+			}));
+		}
+		out
+	};
+	let (decoded, entries) = decode(&bytes(2, 2)).unwrap();
+	assert_eq!((decoded.count, entries.len()), (2, 2));
+	assert!(decode(&bytes(0, 0)).is_err(), "empty");
+	assert!(decode(&bytes(2, 1)).is_err(), "truncated");
+	assert!(decode(&bytes(2, 3)).is_err(), "extra");
+	assert!(
+		decode(&bytes(MAX_LEASES_PER_BATCH as u32 + 1, 0)).is_err(),
+		"over the cap"
+	);
+	assert!(decode(&bytes(u32::MAX, 0)).is_err(), "a huge count");
+	assert!(
+		decode(&bytemuck::bytes_of(&header(1))[..10]).is_err(),
+		"short header"
+	);
+	assert_eq!(
+		lease_batch_bytes::<AcquireLeasesRequestHeader, LeaseRangeWire>(MAX_LEASES_PER_BATCH),
+		Some(40 + 16 * MAX_LEASES_PER_BATCH)
+	);
+	assert_eq!(
+		lease_batch_bytes::<AcquireLeasesRequestHeader, LeaseRangeWire>(usize::MAX),
+		None
+	);
+}
+
+/// ADR 0701: a holder caches from a LEASES_RESP only when the whole response is
+/// valid: one result per requested range, in order, every granted lease the
+/// requested one, issued by the leader and verified. A refusal of the whole
+/// request caches nothing; any mismatch refuses the whole response.
+#[tokio::test]
+async fn only_a_whole_valid_leases_response_is_cached() {
+	use crate::schema::{AcquireLeasesResponseHeader, LeaseResultWire};
+	let dir = bootstrap_tempdir("leases-response");
+	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+		14,
+		dir.to_path_buf(),
+		"127.0.0.1:0".into(),
+	))
+	.await
+	.unwrap();
+	let server = &node.data_server;
+	let leader = node.local_node;
+	let chunk = [(0u64, 9u64), (10, 19)];
+	let signed = |range: (u64, u64)| {
+		server.make_signed_lease(
+			7,
+			leader,
+			range.0,
+			range.1,
+			hlc(100, 0, 14),
+			hlc(3_100, 0, 14),
+		)
+	};
+	let result = |range: (u64, u64), granted: bool| LeaseResultWire {
+		range_start: range.0,
+		status: if granted {
+			LeaseStatus::GRANTED
+		} else {
+			LeaseStatus::DENIED_OVERLAP
+		},
+		_pad: [0; 7],
+		lease: if granted {
+			signed(range)
+		} else {
+			bytemuck::Zeroable::zeroed()
+		},
+	};
+	let response = |status: LeaseStatus, results: &[LeaseResultWire]| {
+		let mut out = bytemuck::bytes_of(&AcquireLeasesResponseHeader {
+			status,
+			_pad: [0; 3],
+			count: results.len() as u32,
+		})
+		.to_vec();
+		out.extend_from_slice(bytemuck::cast_slice(results));
+		out
+	};
+	let accept = |meta: &[u8]| server.accept_leases_response(meta, leader, &chunk, 7);
+
+	// A complete response with an ordered denial: only the granted lease.
+	let granted = accept(&response(
+		LeaseStatus::GRANTED,
+		&[result(chunk[0], true), result(chunk[1], false)],
+	))
+	.unwrap();
+	assert_eq!(granted, vec![signed(chunk[0])]);
+	// The whole request refused: nothing, and no error.
+	assert!(
+		accept(&response(LeaseStatus::DENIED_NOT_LEADER, &[]))
+			.unwrap()
+			.is_empty()
+	);
+	// Each refuses the whole response.
+	let mut tampered = result(chunk[1], true);
+	tampered.lease.lease_expiry = hlc(9_999, 0, 14);
+	let mut foreign = result(chunk[1], true);
+	foreign.lease = signed((20, 29));
+	foreign.lease.range_start = chunk[1].0;
+	for (why, meta) in [
+		(
+			"truncated",
+			response(LeaseStatus::GRANTED, &[result(chunk[0], true)]),
+		),
+		(
+			"extra",
+			response(
+				LeaseStatus::GRANTED,
+				&[
+					result(chunk[0], true),
+					result(chunk[1], true),
+					result((20, 29), true),
+				],
+			),
+		),
+		(
+			"out of order",
+			response(
+				LeaseStatus::GRANTED,
+				&[result(chunk[1], true), result(chunk[0], true)],
+			),
+		),
+		(
+			"an unverifiable lease",
+			response(LeaseStatus::GRANTED, &[result(chunk[0], true), tampered]),
+		),
+		(
+			"another range's lease",
+			response(LeaseStatus::GRANTED, &[result(chunk[0], true), foreign]),
+		),
+		(
+			"a granted status with no results",
+			response(LeaseStatus::GRANTED, &[]),
+		),
+	] {
+		assert!(accept(&meta).is_err(), "{why}");
+	}
+	// ADR 0701 source r1 hold: an unknown status anywhere refuses the whole
+	// response; a valid granted prefix is never cached from a malformed one.
+	let mut unknown = result(chunk[1], false);
+	unknown.status = LeaseStatus(255);
+	let mut denial_with_lease = result(chunk[1], false);
+	denial_with_lease.lease = signed(chunk[1]);
+	for (why, meta) in [
+		(
+			"a granted prefix then an unknown status",
+			response(LeaseStatus::GRANTED, &[result(chunk[0], true), unknown]),
+		),
+		(
+			"a denial carrying a lease",
+			response(
+				LeaseStatus::GRANTED,
+				&[result(chunk[0], true), denial_with_lease],
+			),
+		),
+		("an unknown whole refusal", response(LeaseStatus(255), &[])),
+		(
+			"an overlap as a whole refusal",
+			response(LeaseStatus::DENIED_OVERLAP, &[]),
+		),
+	] {
+		assert!(accept(&meta).is_err(), "{why}");
+	}
+	for refusal in [
+		LeaseStatus::DENIED_EPOCH_STALE,
+		LeaseStatus::DENIED_INVALID_TARGET,
+		LeaseStatus::INTERNAL_ERROR,
+	] {
+		assert!(accept(&response(refusal, &[])).unwrap().is_empty());
+	}
+	let mut cut = response(
+		LeaseStatus::GRANTED,
+		&[result(chunk[0], true), result(chunk[1], true)],
+	);
+	cut.truncate(cut.len() - 1);
+	assert!(accept(&cut).is_err(), "a cut entry");
+}
+
+/// ADR 0701: under Today a lease is still renewed per range, and each request
+/// is stamped from the clock when it is made, never from one pass-start read.
+#[tokio::test]
+async fn each_today_lease_request_is_stamped_when_it_is_made() {
+	struct Ticking(std::sync::atomic::AtomicU64);
+	impl crate::consensus::monitor::PhysicalClock for Ticking {
+		fn now_ms(&self) -> u64 {
+			self.0.fetch_add(50, std::sync::atomic::Ordering::SeqCst)
+		}
+	}
+	let dir = bootstrap_tempdir("today-fresh-stamp");
+	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+		15,
+		dir.to_path_buf(),
+		"127.0.0.1:0".into(),
+	))
+	.await
+	.unwrap();
+	let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+	while node.raft.current_leader().await != Some(node.local_node.id) {
+		assert!(tokio::time::Instant::now() < deadline, "no leader");
+		tokio::time::sleep(Duration::from_millis(20)).await;
+	}
+	// This node's own lease manager would renew the same range meanwhile.
+	node.handles.lease_manager.abort();
+	let start = 4_000_000_000_000;
+	let clock = Ticking(std::sync::atomic::AtomicU64::new(start));
+	let epoch = node.ring.snapshot().epoch();
+	let leader = node.raft.current_leader().await;
+	// Three requests for the node's one primary range, one after another: each
+	// carries its own reading, not a reading shared across the waits.
+	let (low, high) = node.ring.snapshot().primary_ranges_for(node.local_node)[0];
+	let mut starts = Vec::new();
+	for _ in 0..3 {
+		assert!(
+			node.data_server
+				.renew_lease_range(low, high, epoch, &clock, 3_000, leader)
+				.await
+		);
+		let applied = node
+			.state_machine
+			.read_state(move |state| {
+				state
+					.leases
+					.get(&low)
+					.map(|lease| lease.lease_start.physical_ms)
+			})
+			.await;
+		starts.push(applied.unwrap());
+	}
+	assert_eq!(starts, vec![start, start + 50, start + 100]);
+}

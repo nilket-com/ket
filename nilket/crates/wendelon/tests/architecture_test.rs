@@ -3166,9 +3166,9 @@ fn test_adr053_wire_ipc_compression_architecture_guards() {
 	}
 	let transport_source =
 		fs::read_to_string(manifest_dir.join("src/network/transport.rs")).unwrap();
-	if !transport_source.contains("pub const ALL: [NodeCapability; 3]") {
+	if !transport_source.contains("pub const ALL: [NodeCapability; 4]") {
 		violations.push(
-			"src/network/transport.rs: the capability census changed; only the decision authority added a bit since ADR 053".to_string(),
+			"src/network/transport.rs: the capability census changed; only the decision authority (ADR 0699) and its batched leases (ADR 0701) added bits since ADR 053".to_string(),
 		);
 	}
 
@@ -9460,6 +9460,8 @@ fn adr077_data_server_source_concatenates_submodules() {
 			// ADR 0699 S4b: the single-row delete of that mode.
 			"deletes.rs",
 			"descriptor_migration.rs",
+			// ADR 0701: a ParentDecisions holder's batched lease renewal.
+			"lease_batch.rs",
 			// ADR 542's durable outcome/replay wire is one named protocol seam;
 			// keep its framing and resolution state out of the bounded root.
 			"mutation_protocol.rs",

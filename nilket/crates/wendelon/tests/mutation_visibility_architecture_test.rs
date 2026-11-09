@@ -5932,8 +5932,8 @@ fn root2_carrier_is_bounded_private_held_and_response_mappings_are_explicit() {
 	// ADR 0697 appends after Root2Command and Root2Dormant, whose wire positions
 	// stay pinned; each list's last variant is the newest append (ADR 0699 S2).
 	for (name, last) in [
-		("WendelonRequest", "Decision"),
-		("WendelonResponse", "Decision"),
+		("WendelonRequest", "AcquireLeases"),
+		("WendelonResponse", "LeaseResults"),
 	] {
 		let e = core
 			.items

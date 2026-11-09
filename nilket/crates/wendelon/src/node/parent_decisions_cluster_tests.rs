@@ -3693,3 +3693,186 @@ async fn a_query_before_the_tier_authority_is_ready_gets_a_typed_retryable_termi
 		let _ = tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown()).await;
 	}
 }
+
+/// ADR 0701: LEASES_REQ at the leader, as a follower sends it. A caller that
+/// is not the batch's holder, or a range that is not the holder's own, refuses
+/// the whole request before anything is signed or applied; the holder's own
+/// ranges are granted with one ordered result each.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_lease_batch_request_passes_the_single_grant_checks_for_every_range() {
+	use crate::schema::{
+		AcquireLeasesRequestHeader, AcquireLeasesResponseHeader, LeaseRangeWire, LeaseResultWire,
+		decode_lease_batch,
+	};
+	let (cluster, leader, _descriptor) = ready().await;
+	let follower = *NODES.iter().find(|id| **id != leader).unwrap();
+	let third = *NODES
+		.iter()
+		.find(|id| **id != leader && **id != follower)
+		.unwrap();
+	let node_id = |id: u32| crate::schema::NodeId { id, _reserved: 0 };
+	let ring = cluster.node(leader).ring.snapshot();
+	let own = ring.primary_ranges_for(node_id(follower));
+	let foreign = ring.primary_ranges_for(node_id(third))[0];
+	let epoch = ring.epoch();
+	let now = std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.unwrap()
+		.as_millis() as u64;
+	let send = |caller: u32, holder: u32, ranges: Vec<(u64, u64)>| {
+		let router = cluster.node(leader).router.clone();
+		async move {
+			let header = AcquireLeasesRequestHeader {
+				epoch,
+				holder: node_id(holder),
+				requested_hlc: crate::schema::HybridTimestamp {
+					physical_ms: now,
+					logical: 0,
+					node_id: holder,
+				},
+				ttl_ms: 3_000,
+				count: ranges.len() as u32,
+			};
+			let mut meta = bytemuck::bytes_of(&header).to_vec();
+			for (range_start, range_end) in &ranges {
+				meta.extend_from_slice(bytemuck::bytes_of(&LeaseRangeWire {
+					range_start: *range_start,
+					range_end: *range_end,
+				}));
+			}
+			let frame = crate::network::core::HrftFrame {
+				header: crate::schema::FrameHeader {
+					magic: crate::network::core::HRFT_MAGIC,
+					version: 1,
+					msg_type: crate::schema::MsgType::LEASES_REQ.0,
+					flags: 0,
+					stream_id: 1,
+					meta_len: meta.len() as u32,
+					arrow_len: 0,
+					trailing_len: 0,
+				},
+				meta: crate::network::pool::PooledBuf::orphan(meta),
+				arrow_payload: None,
+				trailing: None,
+			};
+			let context = crate::network::server::RequestContext {
+				remote: Some(node_id(caller)),
+				actor: crate::network::tls::ActorIdentity::data_node(node_id(caller)),
+			};
+			crate::network::server::HrftService::handle_frame(&*router, context, frame)
+				.await
+				.unwrap()
+				.unwrap()
+		}
+	};
+	let refused_whole = |response: crate::network::core::HrftFrame| {
+		let header: AcquireLeasesResponseHeader = bytemuck::pod_read_unaligned(&response.meta);
+		assert_eq!(
+			response.meta.len(),
+			std::mem::size_of::<AcquireLeasesResponseHeader>()
+		);
+		assert_eq!(
+			(header.status, header.count),
+			(crate::schema::LeaseStatus::DENIED_INVALID_TARGET, 0)
+		);
+	};
+	let issued_at = |cluster: &Cluster, ranges: Vec<(u64, u64)>| {
+		let state_machine = cluster.node(leader).state_machine.clone();
+		async move {
+			state_machine
+				.read_state(move |state| {
+					ranges
+						.iter()
+						.filter(|(low, _)| {
+							state
+								.leases
+								.get(low)
+								.is_some_and(|lease| lease.lease_start.physical_ms == now)
+						})
+						.count()
+				})
+				.await
+		}
+	};
+	// Another node asks for the follower's ranges.
+	refused_whole(send(third, follower, own.clone()).await);
+	// The follower includes a range that is not its own.
+	let mut mixed = own.clone();
+	mixed.push(foreign);
+	refused_whole(send(follower, follower, mixed.clone()).await);
+	assert_eq!(
+		issued_at(&cluster, mixed).await,
+		0,
+		"nothing was signed or applied"
+	);
+	// The follower's own ranges: one ordered result each.
+	let granted = send(follower, follower, own.clone()).await;
+	let (header, results): (AcquireLeasesResponseHeader, Vec<LeaseResultWire>) =
+		decode_lease_batch(&granted.meta, |header: &AcquireLeasesResponseHeader| {
+			header.count
+		})
+		.unwrap();
+	assert_eq!(header.status, crate::schema::LeaseStatus::GRANTED);
+	assert_eq!(
+		results
+			.iter()
+			.map(|result| result.range_start)
+			.collect::<Vec<_>>(),
+		own.iter().map(|(low, _)| *low).collect::<Vec<_>>()
+	);
+	for node in cluster.nodes {
+		let _ = tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown()).await;
+	}
+}
+
+/// ADR 0701: a ParentDecisions pass stamps each batch from the clock read when
+/// that batch is built; one chunk here, so the whole pass shares one reading
+/// taken for it, not one carried across earlier waits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_lease_batch_is_stamped_when_it_is_built() {
+	struct Ticking(std::sync::atomic::AtomicU64);
+	impl crate::consensus::monitor::PhysicalClock for Ticking {
+		fn now_ms(&self) -> u64 {
+			self.0.fetch_add(50, std::sync::atomic::Ordering::SeqCst)
+		}
+	}
+	let (cluster, leader, _descriptor) = ready().await;
+	let node = cluster.node(leader);
+	let start = std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.unwrap()
+		.as_millis() as u64
+		+ 1_000;
+	let clock = Ticking(std::sync::atomic::AtomicU64::new(start));
+	let ranges = node
+		.ring
+		.snapshot()
+		.primary_ranges_for(node.local_node)
+		.len();
+	let granted = node
+		.data_server
+		.refresh_leases_once(&node.ring, &clock, 3_000)
+		.await;
+	let local = node.local_node.id;
+	let starts: Vec<u64> = node
+		.state_machine
+		.read_state(move |state| {
+			state
+				.leases
+				.values()
+				.filter(|lease| lease.holder.id == local && lease.lease_start.physical_ms >= start)
+				.map(|lease| lease.lease_start.physical_ms)
+				.collect()
+		})
+		.await;
+	assert!(
+		ranges > 1 && ranges <= crate::schema::MAX_LEASES_PER_BATCH,
+		"{ranges}"
+	);
+	assert_eq!(granted, ranges, "one batch renewed every primary range");
+	assert_eq!(starts.len(), ranges);
+	assert!(starts.iter().all(|stamp| *stamp == start), "{starts:?}");
+	for node in cluster.nodes {
+		let _ = tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown()).await;
+	}
+}

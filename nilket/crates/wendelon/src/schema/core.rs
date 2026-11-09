@@ -447,6 +447,103 @@ pub struct AcquireLeaseResponseMeta {
 }
 
 // ============================================================
+//  ADR 0701: ONE HOLDER'S BATCHED LEASE RENEWAL (ParentDecisions)
+//
+//  LEASES_REQ meta = AcquireLeasesRequestHeader + count × LeaseRangeWire.
+//  LEASES_RESP meta = AcquireLeasesResponseHeader + count × LeaseResultWire.
+//  `count` is 1..=MAX_LEASES_PER_BATCH and the meta length must be exact.
+// ============================================================
+
+/// The most leases one batch carries: a wire and entry bound, not a membership
+/// bound. A holder has at most `VNODES_PER_NODE` merged primary ranges; a
+/// larger set is renewed in bounded chunks, never truncated.
+pub const MAX_LEASES_PER_BATCH: usize = 64;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+#[repr(C)]
+pub struct AcquireLeasesRequestHeader {
+	pub epoch: u64,     //  8
+	pub holder: NodeId, //  8
+	/// The requester's clock, read when this batch is built.
+	pub requested_hlc: HybridTimestamp, // 16
+	pub ttl_ms: u32,    //  4
+	pub count: u32,     //  4
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+#[repr(C)]
+pub struct LeaseRangeWire {
+	pub range_start: u64, //  8
+	pub range_end: u64,   //  8
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+#[repr(C)]
+pub struct AcquireLeasesResponseHeader {
+	/// GRANTED when the batch was proposed, so `count` results follow;
+	/// otherwise the whole request was refused and `count` is zero.
+	pub status: LeaseStatus, //  1
+	pub _pad: [u8; 3], //  3
+	pub count: u32,    //  4
+}
+
+/// One requested range's outcome, in request order. `lease` is meaningful
+/// only when `status` is GRANTED.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+#[repr(C)]
+pub struct LeaseResultWire {
+	pub range_start: u64,       //   8
+	pub status: LeaseStatus,    //   1
+	pub _pad: [u8; 7],          //   7
+	pub lease: LeaseDescriptor, // 144
+}
+
+/// The exact byte length of a header and `count` entries, by checked
+/// arithmetic; `None` for zero, above the cap, or an overflow.
+pub fn lease_batch_bytes<H, E>(count: usize) -> Option<usize> {
+	if count == 0 || count > MAX_LEASES_PER_BATCH {
+		return None;
+	}
+	std::mem::size_of::<E>()
+		.checked_mul(count)?
+		.checked_add(std::mem::size_of::<H>())
+}
+
+/// Splits `bytes` into its header and entries. The count and the exact length
+/// are checked before any entry is read or allocated.
+pub fn decode_lease_batch<H: Pod, E: Pod>(
+	bytes: &[u8],
+	count_of: impl Fn(&H) -> u32,
+) -> std::io::Result<(H, Vec<E>)> {
+	let invalid = |why: String| std::io::Error::new(std::io::ErrorKind::InvalidData, why);
+	let header_len = std::mem::size_of::<H>();
+	if bytes.len() < header_len {
+		return Err(invalid(format!(
+			"lease batch of {} bytes is shorter than its header",
+			bytes.len()
+		)));
+	}
+	let header: H = bytemuck::pod_read_unaligned(&bytes[..header_len]);
+	let count = count_of(&header) as usize;
+	let expected = lease_batch_bytes::<H, E>(count).ok_or_else(|| {
+		invalid(format!(
+			"lease batch count {count} is outside 1..={MAX_LEASES_PER_BATCH}"
+		))
+	})?;
+	if bytes.len() != expected {
+		return Err(invalid(format!(
+			"lease batch of {count} needs {expected} bytes, got {}",
+			bytes.len()
+		)));
+	}
+	let entries = bytes[header_len..]
+		.chunks_exact(std::mem::size_of::<E>())
+		.map(bytemuck::pod_read_unaligned)
+		.collect();
+	Ok((header, entries))
+}
+
+// ============================================================
 //  RELEASE LEASE REQUEST / RESPONSE METADATA
 // ============================================================
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable, Serialize, Deserialize)]
@@ -827,6 +924,9 @@ impl MsgType {
 	// plan member.
 	pub const TABLE_CHILD_FETCH_REQ: Self = Self(0x68);
 	pub const TABLE_CHILD_FETCH_RESP: Self = Self(0x69);
+	/// ADR 0701: one holder's batched lease renewal (ParentDecisions).
+	pub const LEASES_REQ: Self = Self(0x6A);
+	pub const LEASES_RESP: Self = Self(0x6B);
 
 	// raft internal (openraft RaftNetwork)
 	pub const APPEND_ENTRIES_REQ: Self = Self(0x20);
@@ -940,6 +1040,8 @@ impl MsgType {
 		Self::DECISION_CUT_RESP,
 		Self::TABLE_CHILD_FETCH_REQ,
 		Self::TABLE_CHILD_FETCH_RESP,
+		Self::LEASES_REQ,
+		Self::LEASES_RESP,
 		Self::APPEND_ENTRIES_REQ,
 		Self::APPEND_ENTRIES_RESP,
 		Self::INSTALL_SNAPSHOT_REQ,
@@ -2387,7 +2489,7 @@ pub const PRE_VERSIONING_FORMAT: u8 = 0;
 /// registry; every earlier version is refused, not upconverted.
 pub const SNAPSHOT_FORMAT_VERSION: u8 = 8;
 /// Snapshot format of a `ParentDecisions` store; see `consensus::decision_mode`.
-pub const SNAPSHOT_FORMAT_VERSION_PARENT_DECISIONS: u8 = 13;
+pub const SNAPSHOT_FORMAT_VERSION_PARENT_DECISIONS: u8 = 14;
 
 /// Shape of the Control Ring WAL record bodies this build writes, including the
 /// `postcard(Entry<..>)` payload of a log record. ADR 0697 version 6 carries
@@ -2395,7 +2497,7 @@ pub const SNAPSHOT_FORMAT_VERSION_PARENT_DECISIONS: u8 = 13;
 /// version is refused, not upconverted.
 pub const WAL_FORMAT_VERSION: u8 = 8;
 /// Control-log format of a `ParentDecisions` store; see `consensus::decision_mode`.
-pub const WAL_FORMAT_VERSION_PARENT_DECISIONS: u8 = 13;
+pub const WAL_FORMAT_VERSION_PARENT_DECISIONS: u8 = 14;
 
 // Static assertions to ensure all our size calculations remain exactly correct
 const _: () = assert!(std::mem::size_of::<HybridTimestamp>() == 16);
@@ -2408,6 +2510,10 @@ const _: () = assert!(std::mem::size_of::<LeaseDescriptor>() == 144);
 const _: () = assert!(std::mem::size_of::<LeaseStatus>() == 1);
 const _: () = assert!(std::mem::size_of::<AcquireLeaseRequestMeta>() == 56);
 const _: () = assert!(std::mem::size_of::<AcquireLeaseResponseMeta>() == 8);
+const _: () = assert!(std::mem::size_of::<AcquireLeasesRequestHeader>() == 40);
+const _: () = assert!(std::mem::size_of::<LeaseRangeWire>() == 16);
+const _: () = assert!(std::mem::size_of::<AcquireLeasesResponseHeader>() == 8);
+const _: () = assert!(std::mem::size_of::<LeaseResultWire>() == 160);
 const _: () = assert!(std::mem::size_of::<TableDescriptorGetRequestMeta>() == 264);
 const _: () = assert!(std::mem::size_of::<TableDescriptorGetResponseMeta>() == 24);
 const _: () = assert!(std::mem::size_of::<TableDescriptorListRequestMeta>() == 8);

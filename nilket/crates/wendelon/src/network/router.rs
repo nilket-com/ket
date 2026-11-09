@@ -292,6 +292,8 @@ fn is_control_extension_request(msg_type: u8) -> bool {
 		MsgType::DECISION_PROPOSE_REQ,
 		MsgType::DECISION_LOOKUP_REQ,
 		MsgType::DECISION_CUT_REQ,
+		// ADR 0701. Node-required, like the single lease request.
+		MsgType::LEASES_REQ,
 	]
 	.iter()
 	.any(|candidate| candidate.0 == msg_type)
@@ -314,6 +316,7 @@ fn is_extension_response(msg_type: u8) -> bool {
 		MsgType::DECISION_PROPOSE_RESP,
 		MsgType::DECISION_LOOKUP_RESP,
 		MsgType::DECISION_CUT_RESP,
+		MsgType::LEASES_RESP,
 	]
 	.iter()
 	.any(|candidate| candidate.0 == msg_type)

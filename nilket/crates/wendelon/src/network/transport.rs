@@ -345,13 +345,17 @@ pub enum NodeCapability {
 	/// This node runs the `ParentDecisions` authority. A cluster refuses a joiner
 	/// whose bit differs from its own.
 	ParentDecisions = 2,
+	/// ADR 0701: this node's `ParentDecisions` renews leases in batches.
+	/// Advertised with `ParentDecisions`; required by a cluster of that version.
+	ParentDecisionsBatchedLeases = 3,
 }
 
 impl NodeCapability {
-	pub const ALL: [NodeCapability; 3] = [
+	pub const ALL: [NodeCapability; 4] = [
 		NodeCapability::SlabStatsPruning,
 		NodeCapability::PartialAggregatePushdown,
 		NodeCapability::ParentDecisions,
+		NodeCapability::ParentDecisionsBatchedLeases,
 	];
 
 	#[inline]

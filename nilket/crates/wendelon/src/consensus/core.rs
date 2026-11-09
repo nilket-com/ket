@@ -750,6 +750,109 @@ pub enum WendelonRequest {
 	/// A parent write decision (ADR 0699 S2). Only the `ParentDecisions` WAL
 	/// format carries it; today's format refuses it both ways.
 	Decision(crate::consensus::decisions::DecisionCommand),
+	/// ADR 0701: one holder's lease renewals in one entry, each applied in
+	/// declared order exactly as an `AcquireLease`. `ParentDecisions` only.
+	AcquireLeases(LeaseBatch),
+}
+
+/// ADR 0701: at most [`crate::schema::MAX_LEASES_PER_BATCH`] leases. Decoding
+/// refuses a longer sequence from its length, before allocating it; the
+/// envelope's other rules (one holder and epoch, no duplicate start, well-formed
+/// ranges, not empty) are checked whole at apply.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LeaseBatch(Vec<crate::schema::LeaseDescriptor>);
+
+impl LeaseBatch {
+	/// `None` above the cap.
+	pub fn new(leases: Vec<crate::schema::LeaseDescriptor>) -> Option<Self> {
+		(leases.len() <= crate::schema::MAX_LEASES_PER_BATCH).then_some(Self(leases))
+	}
+
+	pub fn leases(&self) -> &[crate::schema::LeaseDescriptor] {
+		&self.0
+	}
+}
+
+impl Serialize for LeaseBatch {
+	fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+		serializer.collect_seq(&self.0)
+	}
+}
+
+impl<'de> Deserialize<'de> for LeaseBatch {
+	fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+		deserialize_bounded_seq(deserializer, crate::schema::MAX_LEASES_PER_BATCH).map(Self)
+	}
+}
+
+/// ADR 0701: one lease's outcome in a batch, in declared order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeaseGrantResult {
+	pub range_start: u64,
+	pub granted: bool,
+}
+
+/// ADR 0701: a batch's results, bounded like the batch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LeaseGrantResults(Vec<LeaseGrantResult>);
+
+impl LeaseGrantResults {
+	/// From an applied batch, which is itself bounded.
+	pub(crate) fn from_applied(results: Vec<LeaseGrantResult>) -> Self {
+		Self(results)
+	}
+
+	pub fn results(&self) -> &[LeaseGrantResult] {
+		&self.0
+	}
+}
+
+impl Serialize for LeaseGrantResults {
+	fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+		serializer.collect_seq(&self.0)
+	}
+}
+
+impl<'de> Deserialize<'de> for LeaseGrantResults {
+	fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+		deserialize_bounded_seq(deserializer, crate::schema::MAX_LEASES_PER_BATCH).map(Self)
+	}
+}
+
+/// A sequence of at most `max` elements; a longer declared length is refused
+/// before any element is allocated or read.
+fn deserialize_bounded_seq<'de, D, T>(deserializer: D, max: usize) -> Result<Vec<T>, D::Error>
+where
+	D: serde::Deserializer<'de>,
+	T: Deserialize<'de>,
+{
+	struct Bounded<T>(usize, std::marker::PhantomData<T>);
+	impl<'de, T: Deserialize<'de>> serde::de::Visitor<'de> for Bounded<T> {
+		type Value = Vec<T>;
+		fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+			write!(f, "a sequence of at most {} elements", self.0)
+		}
+		fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<T>, A::Error> {
+			if seq.size_hint().is_some_and(|len| len > self.0) {
+				return Err(serde::de::Error::custom(format!(
+					"sequence longer than {}",
+					self.0
+				)));
+			}
+			let mut out = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(self.0));
+			while let Some(item) = seq.next_element()? {
+				if out.len() == self.0 {
+					return Err(serde::de::Error::custom(format!(
+						"sequence longer than {}",
+						self.0
+					)));
+				}
+				out.push(item);
+			}
+			Ok(out)
+		}
+	}
+	deserializer.deserialize_seq(Bounded(max, std::marker::PhantomData))
 }
 
 impl WendelonRequest {
@@ -793,11 +896,11 @@ impl WendelonRequest {
 	/// Variants only the `ParentDecisions` WAL format (10) carries, appended
 	/// after [`Self::ALL_VARIANT_NAMES`]. Today's format 8 refuses them on write
 	/// and on read, so its body set is exactly the list above.
-	pub const PARENT_DECISIONS_VARIANT_NAMES: [&'static str; 1] = ["decision"];
+	pub const PARENT_DECISIONS_VARIANT_NAMES: [&'static str; 2] = ["decision", "acquire_leases"];
 
 	/// True for a variant today's WAL format must never carry.
 	pub fn is_parent_decisions_only(&self) -> bool {
-		matches!(self, Self::Decision(_))
+		matches!(self, Self::Decision(_) | Self::AcquireLeases(_))
 	}
 
 	/// Total by construction: a new variant fails this match at compile time,
@@ -837,6 +940,7 @@ impl WendelonRequest {
 			Self::CancelOp(_) => "cancel_op",
 			Self::AckOutcomes(_) => "ack_outcomes",
 			Self::Decision(_) => "decision",
+			Self::AcquireLeases(_) => "acquire_leases",
 		}
 	}
 }
@@ -859,6 +963,8 @@ pub enum WendelonResponse {
 	Op(crate::consensus::slab_ops::OpResponse),
 	/// The result of a parent write decision (ADR 0699 S2).
 	Decision(crate::consensus::decisions::DecisionResult),
+	/// ADR 0701: one result per lease of an applied batch, in declared order.
+	LeaseResults(LeaseGrantResults),
 }
 
 // The Wendelon implementation of the `openraft::RaftTypeConfig` trait.

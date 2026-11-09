@@ -6411,57 +6411,11 @@ fn apply_request_at_log_index(
 			}
 			(WendelonResponse::Success, None)
 		}
-		WendelonRequest::AcquireLease(lease) => {
-			// Range must be well-formed. A reversed window would
-			// otherwise overlap nothing in the existing map, so a
-			// nonsense grant would succeed silently.
-			if lease.range_end < lease.range_start {
-				return (WendelonResponse::LeaseDenied, None);
-			}
-			// ADR 0699 S2: the fixed range universe and its lineages.
-			let effect = if state.decisions.is_some() {
-				match crate::consensus::decisions::admit_lease_grant(state, &lease) {
-					Ok(effect) => Some(effect),
-					Err(()) => return (WendelonResponse::LeaseDenied, None),
-				}
-			} else {
-				None
-			};
-			// Per-range overlap sweep. Two ranges [a,b] and [c,d]
-			// overlap iff a <= d && c <= b. A live lease in the
-			// *same or newer* epoch blocks the grant unless it
-			// names the exact same window AND the same holder — in
-			// that case the new lease is a renewal that extends the
-			// expiry in place.
-			for existing in state.leases.values() {
-				if existing.lease_expiry <= lease.lease_start {
-					continue; // already expired at requested start
-				}
-				if existing.epoch < lease.epoch {
-					continue; // prior-epoch leases are invalid by
-					// the epoch-bump rule (plan 018)
-				}
-				let overlaps = lease.range_start <= existing.range_end
-					&& existing.range_start <= lease.range_end;
-				if !overlaps {
-					continue;
-				}
-				let same_range = existing.range_start == lease.range_start
-					&& existing.range_end == lease.range_end;
-				let same_holder = existing.holder.id == lease.holder.id;
-				if same_range && same_holder {
-					continue; // permissible renewal; falls through
-					// to the insert below which overwrites
-					// the prior entry with the new expiry.
-				}
-				return (WendelonResponse::LeaseDenied, None);
-			}
-			if let Some(effect) = effect {
-				crate::consensus::decisions::record_grant(state, &lease, effect);
-			}
-			state.leases.insert(lease.range_start, lease);
-			(WendelonResponse::Success, None)
-		}
+		WendelonRequest::AcquireLease(lease) => (apply_lease_grant(state, lease), None),
+		// ADR 0701: one holder's renewals, ParentDecisions only. An invalid
+		// envelope applies nothing; a valid one applies each lease in declared
+		// order exactly as an `AcquireLease`, so a later denial undoes nothing.
+		WendelonRequest::AcquireLeases(batch) => (apply_lease_batch(state, &batch), None),
 		WendelonRequest::ReleaseLease(release) => match state.leases.get(&release.range_start) {
 			Some(existing)
 				if existing.range_end == release.range_end
@@ -9927,6 +9881,10 @@ fn serialize_entry_page_as(
 		EntryPayload::Normal(WendelonRequest::CancelOp(_)) => (LogEntryKind::APPEND, 0),
 		EntryPayload::Normal(WendelonRequest::AckOutcomes(_)) => (LogEntryKind::APPEND, 0),
 		EntryPayload::Normal(WendelonRequest::Decision(_)) => (LogEntryKind::APPEND, 0),
+		EntryPayload::Normal(WendelonRequest::AcquireLeases(batch)) => (
+			LogEntryKind::APPEND,
+			batch.leases().first().map(|lease| lease.epoch).unwrap_or(0),
+		),
 		EntryPayload::Normal(WendelonRequest::CreateTenant(_)) => (LogEntryKind::APPEND, 0),
 		EntryPayload::Normal(WendelonRequest::UpdateTenantQuota(_)) => (LogEntryKind::APPEND, 0),
 		EntryPayload::Normal(WendelonRequest::SuspendTenant(_)) => (LogEntryKind::APPEND, 0),
@@ -10195,6 +10153,109 @@ async fn decode_snapshot_file_with_identity(
 			.map_err(|err| Error::new(ErrorKind::InvalidData, err))
 	})
 	.await
+}
+
+/// One lease grant: the single grant's rules, shared by `AcquireLease` and
+/// each lease of an `AcquireLeases` (ADR 0701).
+fn apply_lease_grant(
+	state: &mut SmState,
+	lease: crate::schema::LeaseDescriptor,
+) -> WendelonResponse {
+	// Range must be well-formed. A reversed window would
+	// otherwise overlap nothing in the existing map, so a
+	// nonsense grant would succeed silently.
+	if lease.range_end < lease.range_start {
+		return WendelonResponse::LeaseDenied;
+	}
+	// ADR 0699 S2: the fixed range universe and its lineages.
+	let effect = if state.decisions.is_some() {
+		match crate::consensus::decisions::admit_lease_grant(state, &lease) {
+			Ok(effect) => Some(effect),
+			Err(()) => return WendelonResponse::LeaseDenied,
+		}
+	} else {
+		None
+	};
+	// Per-range overlap sweep. Two ranges [a,b] and [c,d]
+	// overlap iff a <= d && c <= b. A live lease in the
+	// *same or newer* epoch blocks the grant unless it
+	// names the exact same window AND the same holder — in
+	// that case the new lease is a renewal that extends the
+	// expiry in place.
+	for existing in state.leases.values() {
+		if existing.lease_expiry <= lease.lease_start {
+			continue; // already expired at requested start
+		}
+		if existing.epoch < lease.epoch {
+			continue; // prior-epoch leases are invalid by
+			// the epoch-bump rule (plan 018)
+		}
+		let overlaps =
+			lease.range_start <= existing.range_end && existing.range_start <= lease.range_end;
+		if !overlaps {
+			continue;
+		}
+		let same_range =
+			existing.range_start == lease.range_start && existing.range_end == lease.range_end;
+		let same_holder = existing.holder.id == lease.holder.id;
+		if same_range && same_holder {
+			continue; // permissible renewal; falls through
+			// to the insert below which overwrites
+			// the prior entry with the new expiry.
+		}
+		return WendelonResponse::LeaseDenied;
+	}
+	if let Some(effect) = effect {
+		crate::consensus::decisions::record_grant(state, &lease, effect);
+	}
+	state.leases.insert(lease.range_start, lease);
+	WendelonResponse::Success
+}
+
+/// ADR 0701: why a lease batch is refused whole, or `None` when every lease may
+/// be applied: one holder and one epoch, no duplicate range start, every range
+/// well-formed. Emptiness is checked by the caller.
+fn lease_batch_malformed(leases: &[crate::schema::LeaseDescriptor]) -> Option<&'static str> {
+	let first = leases.first()?;
+	let mut starts = std::collections::BTreeSet::new();
+	for lease in leases {
+		if lease.holder != first.holder || lease.epoch != first.epoch {
+			return Some("leases of more than one holder or epoch");
+		}
+		if lease.range_end < lease.range_start {
+			return Some("a reversed range");
+		}
+		if !starts.insert(lease.range_start) {
+			return Some("a duplicate range start");
+		}
+	}
+	None
+}
+
+/// ADR 0701: an `AcquireLeases` entry. Refused whole, with no effect, under
+/// Today or when its envelope is invalid.
+fn apply_lease_batch(
+	state: &mut SmState,
+	batch: &crate::consensus::LeaseBatch,
+) -> WendelonResponse {
+	if state.decisions.is_none() {
+		return WendelonResponse::Error("a lease batch is refused under Today".into());
+	}
+	let leases = batch.leases();
+	if leases.is_empty() {
+		return WendelonResponse::Error("lease batch malformed: empty".into());
+	}
+	if let Some(why) = lease_batch_malformed(leases) {
+		return WendelonResponse::Error(format!("lease batch malformed: {why}"));
+	}
+	let results = leases
+		.iter()
+		.map(|lease| crate::consensus::LeaseGrantResult {
+			range_start: lease.range_start,
+			granted: apply_lease_grant(state, *lease) == WendelonResponse::Success,
+		})
+		.collect();
+	WendelonResponse::LeaseResults(crate::consensus::LeaseGrantResults::from_applied(results))
 }
 
 #[cfg(test)]

@@ -39,8 +39,8 @@ use crate::network::tls::{
 use crate::network::traits::{TransferLeadershipRequestMeta, TransferLeadershipResponseMeta};
 use crate::network::transfer_signing::TransferAuthority;
 use crate::network::transport::{
-	MembershipEpoch, NodeCapability, NodeCapabilitySet, NodeRole, NodeRoleSet, PeerCapabilities,
-	TransportTier, TransportTierSet,
+	MembershipEpoch, NodeCapabilitySet, NodeRole, NodeRoleSet, PeerCapabilities, TransportTier,
+	TransportTierSet,
 };
 use crate::network::wire;
 use crate::schema::table::{decode_descriptor_wire_name, encode_table_schema_descriptors};
@@ -880,6 +880,9 @@ impl WendelonControlServer {
 				WendelonResponse::Op(refusal) => Err(Error::other(format!(
 					"unexpected slab refusal for a non-slab command: {refusal:?}"
 				))),
+				WendelonResponse::LeaseResults(results) => Err(Error::other(format!(
+					"unexpected lease results for a non-lease command: {results:?}"
+				))),
 				WendelonResponse::Decision(result) => Err(Error::other(format!(
 					"unexpected decision result for a non-decision command: {result:?}"
 				))),
@@ -1128,7 +1131,7 @@ impl WendelonControlServer {
 					WendelonResponse::Op(_) => {
 						CtasSagaResponse::Rejected(CtasSagaReject::InvalidTransition)
 					}
-					WendelonResponse::Decision(_) => {
+					WendelonResponse::Decision(_) | WendelonResponse::LeaseResults(_) => {
 						CtasSagaResponse::Rejected(CtasSagaReject::InvalidTransition)
 					}
 					WendelonResponse::Root2Dormant => {
@@ -1893,6 +1896,9 @@ impl WendelonControlServer {
 				WendelonResponse::Op(refusal) => Err(Error::other(format!(
 					"unexpected slab refusal for a non-slab command: {refusal:?}"
 				))),
+				WendelonResponse::LeaseResults(results) => Err(Error::other(format!(
+					"unexpected lease results for a non-lease command: {results:?}"
+				))),
 				WendelonResponse::Decision(result) => Err(Error::other(format!(
 					"unexpected decision result for a non-decision command: {result:?}"
 				))),
@@ -2142,6 +2148,9 @@ impl WendelonControlServer {
 				))),
 				WendelonResponse::Op(refusal) => Err(Error::other(format!(
 					"unexpected slab refusal for a non-slab command: {refusal:?}"
+				))),
+				WendelonResponse::LeaseResults(results) => Err(Error::other(format!(
+					"unexpected lease results for a non-lease command: {results:?}"
 				))),
 				WendelonResponse::Decision(result) => Err(Error::other(format!(
 					"unexpected decision result for a non-decision command: {result:?}"
@@ -3116,6 +3125,11 @@ impl WendelonControlServer {
 				WendelonResponse::Op(refusal) => Err(WendelonAdminError::Transport {
 					message: format!("unexpected slab refusal for a non-slab command: {refusal:?}"),
 				}),
+				WendelonResponse::LeaseResults(results) => Err(WendelonAdminError::Transport {
+					message: format!(
+						"unexpected lease results for a non-lease command: {results:?}"
+					),
+				}),
 				WendelonResponse::Decision(result) => Err(WendelonAdminError::Transport {
 					message: format!(
 						"unexpected decision result for a non-decision command: {result:?}"
@@ -3161,6 +3175,9 @@ impl WendelonControlServer {
 				))),
 				WendelonResponse::Op(refusal) => Err(Error::other(format!(
 					"unexpected slab refusal for a non-slab command: {refusal:?}"
+				))),
+				WendelonResponse::LeaseResults(results) => Err(Error::other(format!(
+					"unexpected lease results for a non-lease command: {results:?}"
 				))),
 				WendelonResponse::Decision(result) => Err(Error::other(format!(
 					"unexpected decision result for a non-decision command: {result:?}"
@@ -3227,6 +3244,9 @@ impl WendelonControlServer {
 				))),
 				WendelonResponse::Op(refusal) => Err(Error::other(format!(
 					"unexpected slab refusal for a non-slab command: {refusal:?}"
+				))),
+				WendelonResponse::LeaseResults(results) => Err(Error::other(format!(
+					"unexpected lease results for a non-lease command: {results:?}"
 				))),
 				WendelonResponse::Decision(result) => Err(Error::other(format!(
 					"unexpected decision result for a non-decision command: {result:?}"
@@ -3333,6 +3353,9 @@ impl WendelonControlServer {
 				))),
 				WendelonResponse::Op(refusal) => Err(Error::other(format!(
 					"unexpected slab refusal for a non-slab command: {refusal:?}"
+				))),
+				WendelonResponse::LeaseResults(results) => Err(Error::other(format!(
+					"unexpected lease results for a non-lease command: {results:?}"
 				))),
 				WendelonResponse::Decision(result) => Err(Error::other(format!(
 					"unexpected decision result for a non-decision command: {result:?}"
@@ -3447,6 +3470,9 @@ impl WendelonControlServer {
 				))),
 				WendelonResponse::Op(refusal) => Err(Error::other(format!(
 					"unexpected slab refusal for a non-slab command: {refusal:?}"
+				))),
+				WendelonResponse::LeaseResults(results) => Err(Error::other(format!(
+					"unexpected lease results for a non-lease command: {results:?}"
 				))),
 				WendelonResponse::Decision(result) => Err(Error::other(format!(
 					"unexpected decision result for a non-decision command: {result:?}"
@@ -3916,13 +3942,164 @@ impl WendelonControlServer {
 				WendelonResponse::Error(_) => LeaseStatus::INTERNAL_ERROR,
 				WendelonResponse::Refused(_) => LeaseStatus::INTERNAL_ERROR,
 				WendelonResponse::Op(_) => LeaseStatus::INTERNAL_ERROR,
-				WendelonResponse::Decision(_) => LeaseStatus::INTERNAL_ERROR,
+				WendelonResponse::Decision(_) | WendelonResponse::LeaseResults(_) => {
+					LeaseStatus::INTERNAL_ERROR
+				}
 				WendelonResponse::Root2Dormant => LeaseStatus::INTERNAL_ERROR,
 			},
 			Err(_) if !self.is_leader().await => LeaseStatus::DENIED_NOT_LEADER,
 			Err(_) => LeaseStatus::INTERNAL_ERROR,
 		};
 		self.lease_response(&frame, status, None)
+	}
+
+	/// ADR 0701: one holder's batched renewal, ParentDecisions only. Every range
+	/// passes the single grant's checks before anything is signed; the leases
+	/// are proposed as one `AcquireLeases` entry, and each gets its own result.
+	async fn handle_leases(&self, remote: NodeId, frame: HrftFrame) -> std::io::Result<HrftFrame> {
+		use crate::schema::{
+			AcquireLeasesRequestHeader, LeaseRangeWire, LeaseResultWire, decode_lease_batch,
+		};
+		if self.decision_mode != crate::consensus::decision_mode::DecisionMode::ParentDecisions {
+			return Err(Error::new(
+				ErrorKind::Unsupported,
+				"LEASES_REQ is served only under ParentDecisions",
+			));
+		}
+		let (header, ranges): (AcquireLeasesRequestHeader, Vec<LeaseRangeWire>) =
+			decode_lease_batch(&frame.meta, |header: &AcquireLeasesRequestHeader| {
+				header.count
+			})?;
+		if header.epoch != self.current_epoch() {
+			return self.leases_response(&frame, LeaseStatus::DENIED_EPOCH_STALE, &[]);
+		}
+		if !self.is_leader().await {
+			return self.leases_response(&frame, LeaseStatus::DENIED_NOT_LEADER, &[]);
+		}
+		let mut starts = std::collections::BTreeSet::new();
+		for range in &ranges {
+			let single = AcquireLeaseRequestMeta {
+				range_start: range.range_start,
+				range_end: range.range_end,
+				epoch: header.epoch,
+				holder: header.holder,
+				requested_hlc: header.requested_hlc,
+				ttl_ms: header.ttl_ms,
+				_pad: 0,
+			};
+			if !starts.insert(range.range_start)
+				|| self
+					.validate_acquire_lease_target(remote, &single)
+					.await
+					.is_err()
+			{
+				return self.leases_response(&frame, LeaseStatus::DENIED_INVALID_TARGET, &[]);
+			}
+		}
+		let ttl_ms = header.ttl_ms.clamp(1, self.lease_ttl_cap_ms);
+		let leases: Vec<LeaseDescriptor> = ranges
+			.iter()
+			.map(|range| {
+				self.lease_authority.sign_lease(LeaseDescriptor {
+					epoch: header.epoch,
+					holder: header.holder,
+					range_start: range.range_start,
+					range_end: range.range_end,
+					lease_start: header.requested_hlc,
+					lease_expiry: HybridTimestamp {
+						physical_ms: header
+							.requested_hlc
+							.physical_ms
+							.saturating_add(ttl_ms as u64),
+						logical: header.requested_hlc.logical,
+						node_id: header.requested_hlc.node_id,
+					},
+					min_commit_index: 0,
+					signature: [0; 64],
+					issuer: self.local_node,
+				})
+			})
+			.collect();
+		let batch = crate::consensus::LeaseBatch::new(leases.clone())
+			.ok_or_else(|| Error::new(ErrorKind::InvalidData, "lease batch over its bound"))?;
+		let status = match self
+			.raft
+			.client_write(WendelonRequest::AcquireLeases(batch))
+			.await
+		{
+			Ok(resp) => match resp.data {
+				WendelonResponse::LeaseResults(results)
+					if results.results().len() == leases.len()
+						&& results
+							.results()
+							.iter()
+							.zip(&leases)
+							.all(|(result, lease)| result.range_start == lease.range_start) =>
+				{
+					let entries: Vec<LeaseResultWire> = results
+						.results()
+						.iter()
+						.zip(&leases)
+						.map(|(result, lease)| LeaseResultWire {
+							range_start: lease.range_start,
+							status: if result.granted {
+								LeaseStatus::GRANTED
+							} else {
+								LeaseStatus::DENIED_OVERLAP
+							},
+							_pad: [0; 7],
+							lease: if result.granted {
+								*lease
+							} else {
+								bytemuck::Zeroable::zeroed()
+							},
+						})
+						.collect();
+					return self.leases_response(&frame, LeaseStatus::GRANTED, &entries);
+				}
+				_ => LeaseStatus::INTERNAL_ERROR,
+			},
+			Err(_) if !self.is_leader().await => LeaseStatus::DENIED_NOT_LEADER,
+			Err(_) => LeaseStatus::INTERNAL_ERROR,
+		};
+		self.leases_response(&frame, status, &[])
+	}
+
+	/// ADR 0701: a LEASES_RESP: the header, then one result per requested range
+	/// when the batch was proposed (`status` GRANTED), else none.
+	fn leases_response(
+		&self,
+		frame: &HrftFrame,
+		status: LeaseStatus,
+		results: &[crate::schema::LeaseResultWire],
+	) -> std::io::Result<HrftFrame> {
+		let header = crate::schema::AcquireLeasesResponseHeader {
+			status,
+			_pad: [0; 3],
+			count: results.len() as u32,
+		};
+		let mut meta_buf = self.pool.acquire();
+		meta_buf
+			.as_mut_vec()
+			.extend_from_slice(bytemuck::bytes_of(&header));
+		meta_buf
+			.as_mut_vec()
+			.extend_from_slice(bytemuck::cast_slice(results));
+		Ok(HrftFrame {
+			header: FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: MsgType::LEASES_RESP.0,
+				flags: 0,
+				stream_id: frame.header.stream_id,
+				meta_len: meta_buf.len() as u32,
+				arrow_len: 0,
+				trailing_len: 0,
+			},
+			meta: meta_buf,
+			arrow_payload: None,
+			trailing: None,
+		})
 	}
 
 	async fn handle_release(&self, remote: NodeId, frame: HrftFrame) -> std::io::Result<HrftFrame> {
@@ -3956,7 +4133,9 @@ impl WendelonControlServer {
 				WendelonResponse::Error(_) => LeaseStatus::INTERNAL_ERROR,
 				WendelonResponse::Refused(_) => LeaseStatus::INTERNAL_ERROR,
 				WendelonResponse::Op(_) => LeaseStatus::INTERNAL_ERROR,
-				WendelonResponse::Decision(_) => LeaseStatus::INTERNAL_ERROR,
+				WendelonResponse::Decision(_) | WendelonResponse::LeaseResults(_) => {
+					LeaseStatus::INTERNAL_ERROR
+				}
 				WendelonResponse::Root2Dormant => LeaseStatus::INTERNAL_ERROR,
 			},
 			Err(_) if !self.is_leader().await => LeaseStatus::DENIED_NOT_LEADER,
@@ -4971,10 +5150,8 @@ impl WendelonControlServer {
 				&visible,
 			);
 		}
-		self.decision_mode.check_joiner(
-			NodeCapabilitySet::from_u8(req.capability_bits)
-				.contains(NodeCapability::ParentDecisions),
-		)?;
+		self.decision_mode
+			.check_joiner(NodeCapabilitySet::from_u8(req.capability_bits))?;
 		#[cfg(feature = "test-support")]
 		if let Some(gate) = &self.join_promotion_gate {
 			gate.record_mutation_path(req.node_id);
@@ -5168,6 +5345,11 @@ impl ControlRingServer for WendelonControlServer {
 				self.authorize_control_operation(&context, ControlOperation::Lease)?;
 				let remote = context.require_authenticated_node("LEASE_REQ")?;
 				self.handle_lease(remote, frame).await?
+			}
+			MsgType::LEASES_REQ => {
+				self.authorize_control_operation(&context, ControlOperation::Lease)?;
+				let remote = context.require_authenticated_node("LEASES_REQ")?;
+				self.handle_leases(remote, frame).await?
 			}
 			MsgType::DECISION_CUT_REQ => {
 				self.authorize_control_operation(&context, ControlOperation::DecisionPropose)?;
