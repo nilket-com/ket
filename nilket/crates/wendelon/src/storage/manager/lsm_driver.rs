@@ -630,9 +630,16 @@ pub(super) async fn reconcile_local_lsm_intent(
 	index: &PersistentLocalIndex,
 	snapshot: &crate::storage::index::PersistentIndexSnapshot,
 	intent: &crate::storage::index::LsmInstallIntent,
+	contained: bool,
 ) -> std::io::Result<bool> {
 	use crate::storage::index::{LsmInstallKind, LsmInstallPhase};
 	if intent.kind != LsmInstallKind::Local {
+		return Ok(false);
+	}
+	// ADR 0703: a certified install is never local, and a contained
+	// (ParentDecisions) store installs only certified ones: such an intent is
+	// not one this store could have written. It stays fenced.
+	if contained || snapshot.lsm_certificate(intent).is_some() {
 		return Ok(false);
 	}
 	let unique = |ids: Vec<SlabId>| {
@@ -905,6 +912,7 @@ pub(super) async fn reconcile_completed_control_lsm_intent(
 	index: &PersistentLocalIndex,
 	snapshot: &crate::storage::index::PersistentIndexSnapshot,
 	intent: &crate::storage::index::LsmInstallIntent,
+	contained: bool,
 ) -> std::io::Result<bool> {
 	use crate::storage::index::{LsmInstallKind, LsmInstallPhase};
 	if intent.kind != LsmInstallKind::Control
@@ -919,6 +927,11 @@ pub(super) async fn reconcile_completed_control_lsm_intent(
 	}
 	let commit_bytes = serde_json::to_vec(&intent.commit).map_err(Error::other)?;
 	if *blake3::hash(&commit_bytes).as_bytes() != intent.commit_digest {
+		return Ok(false);
+	}
+	// ADR 0703: a certificate must bind exactly this install before its exact
+	// postimage is accepted and cleared; otherwise it stays fenced.
+	if super::certified_lsm::certificate_of_install(intent, snapshot, contained).is_err() {
 		return Ok(false);
 	}
 	let unique = |ids: Vec<SlabId>| {
@@ -1181,6 +1194,14 @@ impl SlabManager {
 		commit: &CompactionCommit,
 	) -> Result<ManifestEpoch, CompactionFailure> {
 		self.require_tier_authority_ready()?;
+		// ADR 0703: a certified install needs the control ring's certificate.
+		if matches!(plan.elision, crate::storage::PlanElision::Certified(_)) {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				"a certified LSM plan installs only through the control ring",
+			)
+			.into());
+		}
 		let _maintenance = self
 			.maintenance_publication_gate
 			.clone()
@@ -1504,7 +1525,7 @@ impl SlabManager {
 			)
 			.await?;
 		self.verify_lsm_prepared_inputs(plan, prepared).await?;
-		let intent = self
+		let (intent, certificate) = self
 			.capture_control_lsm_intent(
 				plan,
 				prepared,
@@ -1513,6 +1534,11 @@ impl SlabManager {
 				secondary_index_context.is_some(),
 			)
 			.await?;
+		if matches!(plan.elision, crate::storage::PlanElision::Certified(_))
+			!= certificate.is_some()
+		{
+			return Err(Error::other("a certified LSM install lost its certificate").into());
+		}
 		let index = self.persistent_index.as_ref().ok_or_else(|| {
 			Error::new(
 				ErrorKind::WouldBlock,
@@ -1527,15 +1553,29 @@ impl SlabManager {
 		// cancelled caller. Any uncertain result retains the mark and evidence.
 		// The operation and its intent commit together, so neither exists without
 		// the other (ADR 0697).
-		let allocation = match index
-			.allocate_ops(
-				vec![crate::consensus::slab_ops::SlabCommand::Compaction(
-					commit.clone(),
-				)],
-				Some(intent),
-			)
-			.await
-		{
+		let commands = vec![crate::consensus::slab_ops::SlabCommand::Compaction(
+			commit.clone(),
+		)];
+		let allocated = match certificate {
+			// ADR 0703: written only under the generation the selection was
+			// decided under. A moved generation wrote nothing: the job abandons
+			// with its inputs, and the next step decides again.
+			Some(certificate) => match index
+				.allocate_certified_ops(commands, intent, certificate)
+				.await
+			{
+				Ok(Some(allocation)) => Ok(allocation),
+				Ok(None) => {
+					self.clear_registered_lsm_intent(commit.job_id).await;
+					_intent_owner.complete();
+					self.tier_authority.notify_publication_change();
+					return Err(CompactionFailure::ManifestRace);
+				}
+				Err(error) => Err(error),
+			},
+			None => index.allocate_ops(commands, Some(intent)).await,
+		};
+		let allocation = match allocated {
 			Ok(allocation) => allocation,
 			// Proven: nothing was written. Only the owned runtime scope goes, so
 			// the refused producer leaves no fence on reserved work. Any other
@@ -1769,7 +1809,13 @@ impl SlabManager {
 		written: &[LsmWrittenOutputRun],
 		commit: &CompactionCommit,
 		allow_sidecar_covered_inputs: bool,
-	) -> Result<crate::storage::index::LsmInstallIntent, CompactionFailure> {
+	) -> Result<
+		(
+			crate::storage::index::LsmInstallIntent,
+			Option<crate::storage::index::LsmCertificate>,
+		),
+		CompactionFailure,
+	> {
 		let _maintenance = self
 			.maintenance_publication_gate
 			.clone()
@@ -1860,6 +1906,20 @@ impl SlabManager {
 		if crate::storage::index::lsm_rows_digest(local_rows) != input_digest {
 			return Err(CompactionFailure::ManifestRace);
 		}
+		// ADR 0703: the drop multiset, from the durable input rows, against the
+		// selection the job was decided with and the decisions it ran.
+		let certified_drop = match &plan.elision {
+			crate::storage::PlanElision::Certified(selection) => {
+				Some(super::certified_lsm::certified_drop_at_capture(
+					selection,
+					&snapshot,
+					&input_ids,
+					input_digest,
+					&prepared.decisions,
+				)?)
+			}
+			crate::storage::PlanElision::RetentionFloor(_) => None,
+		};
 		let mut local_input_files = Vec::new();
 		for input in inputs {
 			if input.tiered.is_none() {
@@ -1881,7 +1941,7 @@ impl SlabManager {
 			);
 		}
 		drop(gate);
-		Ok(crate::storage::index::LsmInstallIntent {
+		let intent = crate::storage::index::LsmInstallIntent {
 			kind: crate::storage::index::LsmInstallKind::Control,
 			phase: crate::storage::index::LsmInstallPhase::Prepared,
 			local_input_rows_digest: input_digest,
@@ -1896,7 +1956,21 @@ impl SlabManager {
 				.as_bytes(),
 			ops: Vec::new(),
 			inputs: inputs.clone(),
-		})
+		};
+		let certificate = match (certified_drop, &plan.elision) {
+			(Some(drop), crate::storage::PlanElision::Certified(selection)) => {
+				Some(crate::storage::index::LsmCertificate {
+					job_fingerprint: selection.job_fingerprint(),
+					active_gid: selection.active_gid(),
+					drop_digest: drop.drop_digest,
+					drop_rows_digest: drop.drop_rows_digest,
+					drop_count: drop.drop_count,
+					intent_binding: crate::storage::index::intent_binding(&intent),
+				})
+			}
+			_ => None,
+		};
+		Ok((intent, certificate))
 	}
 
 	/// Guard output rename against concurrent maintenance and tier publication.
@@ -1965,8 +2039,15 @@ impl SlabManager {
 		)
 		.map_err(LsmStageFailure::BeforeRename)?;
 
+		// ADR 0703: a certified job's spawned renames hold their own lifecycle
+		// permits, so a shutdown drains them.
 		let installed = self
-			.install_lsm_output_files(written, keep_intent_outputs, rename_guard)
+			.install_lsm_output_files(
+				written,
+				keep_intent_outputs,
+				rename_guard,
+				matches!(plan.elision, crate::storage::PlanElision::Certified(_)),
+			)
 			.await?;
 		let max_output_slab_id = installed.iter().map(|(run, _)| run.slab_id).max();
 
@@ -2259,10 +2340,21 @@ impl SlabManager {
 		now: HybridTimestamp,
 	) -> Option<CompactionPlan> {
 		// ADR 0699 S4: a run may drop superseded versions; none runs under
-		// containment.
+		// containment. ADR 0703: the certified path picks for itself.
 		if self.versions_contained() {
 			return None;
 		}
+		self.pick_lsm_plan_excluding(worker, now, &HashSet::new())
+	}
+
+	/// The picker without the containment guard: a plan none of whose slabs
+	/// is in `excluded`.
+	pub(super) fn pick_lsm_plan_excluding(
+		&self,
+		worker: &LsmCompactionWorker,
+		now: HybridTimestamp,
+		excluded: &HashSet<SlabId>,
+	) -> Option<CompactionPlan> {
 		// A maintenance rewrite holds this only across its durable
 		// publication/install handoff. Returning no plan while that handoff is
 		// in flight is preferable to planning the old Live run from the
@@ -2299,10 +2391,9 @@ impl SlabManager {
 			|slab_id| self.counter_deferred_l0_slabs.contains(&slab_id),
 			|plan| {
 				let touched = plan.touched_slabs();
-				!touched
-					.iter()
-					.any(|slab_id| self.is_compaction_slab_quarantined(*slab_id))
-					&& policy.is_eligible(MaintenanceOperation::LsmCompaction, &touched, now_ms)
+				!touched.iter().any(|slab_id| {
+					self.is_compaction_slab_quarantined(*slab_id) || excluded.contains(slab_id)
+				}) && policy.is_eligible(MaintenanceOperation::LsmCompaction, &touched, now_ms)
 			},
 		)
 	}
@@ -2364,7 +2455,7 @@ impl SlabManager {
 	/// The touched set is captured BEFORE the plan is consumed by the run, and the
 	/// reservation it names is held across the run. A refusal is not a failure: the
 	/// tick simply had no admissible work.
-	async fn execute_lsm_plan_under_policy<Fut>(
+	pub(super) async fn execute_lsm_plan_under_policy<Fut>(
 		&self,
 		plan: CompactionPlan,
 		run: impl FnOnce(CompactionPlan) -> Fut,
@@ -2410,7 +2501,7 @@ impl SlabManager {
 	/// plans that are still perfectly valid. What the claim protects is that these
 	/// slabs stop moving; what this checks is that they were still there when it
 	/// started protecting them.
-	fn revalidate_lsm_plan_after_claims(
+	pub(super) fn revalidate_lsm_plan_after_claims(
 		&self,
 		plan: &CompactionPlan,
 	) -> Result<(), CompactionFailure> {
@@ -2443,7 +2534,7 @@ impl SlabManager {
 	/// temporary files are reserved. A counter-bearing (or unavailable) backing
 	/// gets a typed retryable deferral; the original plan and source bytes stay
 	/// untouched.
-	async fn refuse_lsm_counter_inputs(
+	pub(super) async fn refuse_lsm_counter_inputs(
 		&self,
 		plan: &CompactionPlan,
 	) -> Result<(), CompactionFailure> {
@@ -2589,6 +2680,30 @@ impl SlabManager {
 		let _claims = self.acquire_maintenance_claims(&plan.touched_slabs()).await;
 		self.revalidate_lsm_plan_after_claims(&plan)?;
 		self.refuse_lsm_counter_inputs(&plan).await?;
+		self.run_claimed_lsm_via_control_ring(worker, plan, committer, secondary_index_context)
+			.await
+	}
+
+	/// The control-ring job once its pins and claims are held, its plan
+	/// revalidated and its counter inputs refused. ADR 0703: a contained store
+	/// runs only a certified plan, and a certified plan installs only with its
+	/// certificate.
+	pub(super) async fn run_claimed_lsm_via_control_ring(
+		&self,
+		worker: &LsmCompactionWorker,
+		plan: CompactionPlan,
+		committer: &dyn TierCommitter,
+		secondary_index_context: Option<SecondaryIndexCompactionContext<'_>>,
+	) -> Result<crate::storage::lsm::CompactionOutcome, CompactionFailure> {
+		if self.versions_contained()
+			&& !matches!(plan.elision, crate::storage::PlanElision::Certified(_))
+		{
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				"a contained store runs only certified LSM plans",
+			)
+			.into());
+		}
 		let table_schemas = secondary_index_context
 			.as_ref()
 			.map(|context| context.table_schemas);
@@ -2802,11 +2917,25 @@ impl SlabManager {
 		// the actual output using the very same floor/predicate as the planner.
 		// Keep the simple above-floor invariant explicit: no planner decision
 		// may claim that a row visible at or above the floor can be dropped.
-		if prepared.decisions.iter().any(|decision| {
-			matches!(decision,
-			crate::storage::SurvivorOrDrop::Drop { record, .. }
-			if record.row_hlc >= plan.retention_floor_snapshot)
-		}) {
+		// ADR 0703: under a certified selection the drops are exactly the
+		// inputs it names, no more and no fewer.
+		let decision_breaks_policy =
+			|decision: &crate::storage::SurvivorOrDrop| match (&plan.elision, decision) {
+				(
+					crate::storage::PlanElision::RetentionFloor(floor),
+					crate::storage::SurvivorOrDrop::Drop { record, .. },
+				) => record.row_hlc >= *floor,
+				(crate::storage::PlanElision::RetentionFloor(_), _) => false,
+				(
+					crate::storage::PlanElision::Certified(selection),
+					crate::storage::SurvivorOrDrop::Drop { record, reason },
+				) => *reason != crate::storage::DropReason::Certified || !selection.selects(record),
+				(
+					crate::storage::PlanElision::Certified(selection),
+					crate::storage::SurvivorOrDrop::Survivor(record),
+				) => selection.selects(record),
+			};
+		if prepared.decisions.iter().any(decision_breaks_policy) {
 			return Err(CompactionFailure::VisibleDigestInvariance);
 		}
 		let input_rows = prepared
@@ -2849,8 +2978,11 @@ impl SlabManager {
 		// cannot prove which versions it covers. Preserve that entire row group.
 		// Migrated-range markers have independent elision semantics and are not
 		// ordinary row tombstones; they do not participate in this test.
+		// ADR 0703: a certified drop is proved by its debt and content evidence,
+		// not by tombstone coverage, so this override is the floor rule's alone.
+		let floor_rule = matches!(plan.elision, crate::storage::PlanElision::RetentionFloor(_));
 		let mut group_evidence = BTreeMap::new();
-		for record in &input_rows {
+		for record in input_rows.iter().filter(|_| floor_rule) {
 			if record.lifecycle == VersionLifecycle::MigratedRangeTombstone {
 				continue;
 			}
@@ -2862,7 +2994,7 @@ impl SlabManager {
 			evidence.0.get_or_insert(record.lifecycle);
 			evidence.1 |= record.location.is_tombstone;
 		}
-		let mut pre_decisions = apply_elision(input_rows, plan.retention_floor_snapshot);
+		let mut pre_decisions = apply_elision(input_rows, &plan.elision);
 		for decision in &mut pre_decisions {
 			if let crate::storage::SurvivorOrDrop::Drop { record, .. } = decision {
 				if record.lifecycle != VersionLifecycle::MigratedRangeTombstone
@@ -2875,7 +3007,7 @@ impl SlabManager {
 			}
 		}
 		let pre_visible = survivor_records(&pre_decisions);
-		let mut post_decisions = apply_elision(output_rows, plan.retention_floor_snapshot);
+		let mut post_decisions = apply_elision(output_rows, &plan.elision);
 		for decision in &mut post_decisions {
 			if let crate::storage::SurvivorOrDrop::Drop { record, .. } = decision {
 				if record.lifecycle != VersionLifecycle::MigratedRangeTombstone
@@ -3024,6 +3156,7 @@ impl SlabManager {
 		written: &[LsmWrittenOutputRun],
 		keep_intent_outputs: bool,
 		rename_guard: Option<Arc<crate::storage::index::OpOwnership>>,
+		permit_spawned: bool,
 	) -> std::io::Result<Vec<(LsmWrittenOutputRun, Arc<LocalSlabStore>)>> {
 		let mut final_paths = Vec::with_capacity(written.len());
 		for run in written {
@@ -3060,6 +3193,10 @@ impl SlabManager {
 						.lock()
 						.unwrap()
 						.clone();
+					let permit = match (permit_spawned, self.directory_owner()) {
+						(true, Some(owner)) => Some(owner.lifecycle_permit()?),
+						_ => None,
+					};
 					tokio::spawn(async move {
 						let _guard = guard;
 						#[cfg(test)]
@@ -3067,8 +3204,16 @@ impl SlabManager {
 							entered.add_permits(1);
 							let _ = release.acquire().await;
 						}
-						ops.rename(&from, &to).await?;
-						fsync_parent_dir(ops.as_ref(), &to).await
+						let renamed = async {
+							ops.rename(&from, &to).await?;
+							fsync_parent_dir(ops.as_ref(), &to).await
+						}
+						.await;
+						// Run to its end, interrupted or not: the outcome is the result.
+						if let Some(permit) = permit {
+							permit.complete();
+						}
+						renamed
 					})
 					.await
 					.map_err(Error::other)??;
@@ -3516,7 +3661,7 @@ impl SlabManager {
 					"invalid compaction output target level",
 				)
 			})?;
-		let decisions = apply_elision(entries.clone(), plan.retention_floor_snapshot);
+		let decisions = apply_elision(entries.clone(), &plan.elision);
 		let output_run_count =
 			required_output_run_count(survivor_records(&decisions), target_size)?;
 		let exposed = self.reserve_exposed_slab_ids(output_run_count).await?;
@@ -3551,7 +3696,7 @@ impl SlabManager {
 					"invalid compaction output target level",
 				)
 			})?;
-		let decisions = apply_elision(entries.clone(), plan.retention_floor_snapshot);
+		let decisions = apply_elision(entries.clone(), &plan.elision);
 		let output_run_count =
 			required_output_run_count(survivor_records(&decisions), target_size)?;
 		let exposed = self.reserve_exposed_slab_ids(output_run_count).await?;

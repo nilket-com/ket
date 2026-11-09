@@ -970,6 +970,10 @@ pub(crate) struct DecisionPeer {
 	/// error would.
 	#[cfg(test)]
 	pub(crate) fail_copy_read_once: Arc<std::sync::atomic::AtomicBool>,
+	/// Test-only (ADR 0703): this store's local certified cleanup and its own
+	/// LSM step are paused, so a test drives certified LSM itself.
+	#[cfg(test)]
+	pub(crate) pause_cleanup: Arc<std::sync::atomic::AtomicBool>,
 	/// Test-only: a KV key read as if at another position, the seam for a
 	/// different key at the same position.
 	#[cfg(test)]
@@ -1057,6 +1061,8 @@ impl Default for DecisionPeer {
 			fail_base_validation: Default::default(),
 			#[cfg(test)]
 			fail_copy_read_once: Default::default(),
+			#[cfg(test)]
+			pause_cleanup: Default::default(),
 			#[cfg(test)]
 			kv_position_override: Default::default(),
 		}

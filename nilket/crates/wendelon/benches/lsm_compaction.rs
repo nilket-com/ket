@@ -111,7 +111,10 @@ fn bench_survivor_elision(config: &BenchConfig, rows: usize, versions: &[Version
 	let started = Instant::now();
 	let mut survivors = 0usize;
 	for _ in 0..config.measure_iters {
-		let decisions = apply_elision(versions.to_vec(), retention_floor);
+		let decisions = apply_elision(
+			versions.to_vec(),
+			&wendelon::storage::PlanElision::RetentionFloor(retention_floor),
+		);
 		survivors = survivors.saturating_add(survivor_records(&decisions).len());
 		black_box(decisions);
 	}

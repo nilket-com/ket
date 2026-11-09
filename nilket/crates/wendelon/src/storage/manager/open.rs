@@ -391,6 +391,10 @@ impl SlabManager {
 			},
 			None => None,
 		};
+		// ADR 0703: the durable mode obligation, known before any install is
+		// reconciled. A marked (ParentDecisions) store installs only certified
+		// compactions; an unreadable marker refuses the open.
+		let contained = crate::consensus::decision_mode::store_is_marked(&config.dir)?;
 		// Local intent recovery runs before filename discovery. It removes an
 		// intent only after proving its input/output files and preserving any
 		// unpublished output under a non-discoverable quarantine name.
@@ -422,6 +426,7 @@ impl SlabManager {
 							index,
 							initial,
 							intent,
+							contained,
 						)
 						.await
 					}
@@ -438,6 +443,7 @@ impl SlabManager {
 							index,
 							initial,
 							intent,
+							contained,
 						)
 						.await
 					}
@@ -487,6 +493,31 @@ impl SlabManager {
 			}
 		}
 		let lsm_install_unresolved = !lsm_install_intents.is_empty();
+		// ADR 0703: a certificate whose install intent is gone is not reused or
+		// cleared here; it fences certified LSM on this store until an operator
+		// resolves it.
+		let orphan_lsm_certificates = snapshot
+			.as_ref()
+			.map(|snapshot| {
+				snapshot
+					.lsm_certificates
+					.iter()
+					.filter(|(job, _)| {
+						!snapshot
+							.lsm_install_intents
+							.iter()
+							.any(|intent| intent.commit.job_id.get() == *job)
+					})
+					.map(|(job, _)| *job)
+					.collect::<Vec<_>>()
+			})
+			.unwrap_or_default();
+		if !orphan_lsm_certificates.is_empty() {
+			tracing::error!(
+				jobs = ?orphan_lsm_certificates,
+				"LSM certificates without their install intents; certified LSM stays fenced"
+			);
+		}
 		// ADR 0099: the durable rows double as slab recovery's boundary
 		// oracle. A row exists only for a record that was fdatasynced and
 		// then acknowledged, so its offset is a place the walk may resume
@@ -1093,7 +1124,8 @@ impl SlabManager {
 			tier_publication_locks: DashMap::new(),
 			cleanup_claims: DashMap::new(),
 			conflicted_locations: DashSet::new(),
-			versions_contained: AtomicBool::new(false),
+			versions_contained: AtomicBool::new(contained),
+			certified_lsm_fenced: AtomicBool::new(!orphan_lsm_certificates.is_empty()),
 			unverified_tier_slabs: DashSet::new(),
 			tier_authority: tier_authority::TierAuthority::new(),
 			installed_snapshot_index: std::sync::RwLock::new(None),

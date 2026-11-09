@@ -90,6 +90,12 @@ impl ContentEvidence {
 			tombstone: expected_tombstone,
 		})
 	}
+
+	/// ADR 0703: whether this is the evidence for `key`'s `debt` record with
+	/// copies of this kind.
+	pub(crate) fn matches(&self, key: VersionKey, debt: &DebtRecord, tombstone: bool) -> bool {
+		self.key == key && self.debt == *debt && self.tombstone == tombstone
+	}
 }
 
 /// Which records of one claimed slab are reclaimed. Only

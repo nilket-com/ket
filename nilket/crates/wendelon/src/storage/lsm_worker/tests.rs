@@ -42,7 +42,7 @@ fn valid_plan() -> CompactionPlan {
 		manifest_epoch_pre: ManifestEpoch::new(5),
 		input_slabs: vec![SlabId::new(1)],
 		overlapping_slabs: vec![SlabId::new(2)],
-		retention_floor_snapshot: hlc(25),
+		elision: crate::storage::PlanElision::RetentionFloor(hlc(25)),
 		compaction_start_hlc: hlc(50),
 		dominant_reason: DominantReason::LevelSize,
 	}

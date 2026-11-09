@@ -120,6 +120,19 @@ pub(crate) enum OpEvidence {
 	Unknown,
 }
 
+/// ADR 0703: the active generation is not the one a certified selection was
+/// decided under; nothing was written.
+#[derive(Debug)]
+pub(crate) struct GenerationMoved;
+
+impl std::fmt::Display for GenerationMoved {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str("the active generation moved after the certified selection")
+	}
+}
+
+impl std::error::Error for GenerationMoved {}
+
 /// A mark decided rejected, whose reserved removal still has to be Cancelled.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RejectedClaim {
@@ -160,6 +173,8 @@ pub(crate) fn complete_linked_lsm_intent(
 		));
 	}
 	table.remove(&job).map_err(redb_to_io)?;
+	drop(table);
+	super::lsm_certificate::remove_certificate_of(tx, intent)?;
 	Ok(())
 }
 
@@ -1757,7 +1772,33 @@ impl PersistentLocalIndex {
 		commands: Vec<SlabCommand>,
 		linked: Option<LsmInstallIntent>,
 	) -> std::io::Result<OpAllocation> {
-		self.allocate_ops_with(commands, linked, None).await
+		self.allocate_ops_with(commands, linked, None, None).await
+	}
+
+	/// ADR 0703: a certified install's workflow. Its intent and certificate are
+	/// written with the operation only while the active generation is the one
+	/// its selection was decided under; otherwise `Ok(None)` and nothing is
+	/// written.
+	pub(crate) async fn allocate_certified_ops(
+		&self,
+		commands: Vec<SlabCommand>,
+		linked: LsmInstallIntent,
+		certificate: super::LsmCertificate,
+	) -> std::io::Result<Option<OpAllocation>> {
+		match self
+			.allocate_ops_with(commands, Some(linked), None, Some(certificate))
+			.await
+		{
+			Ok(allocation) => Ok(Some(allocation)),
+			Err(error)
+				if error
+					.get_ref()
+					.is_some_and(|inner| inner.is::<GenerationMoved>()) =>
+			{
+				Ok(None)
+			}
+			Err(error) => Err(error),
+		}
 	}
 
 	/// A GC mark's workflow, recording what a rejection of it restores.
@@ -1775,6 +1816,7 @@ impl PersistentLocalIndex {
 				pre_run,
 				pre_delete_pending,
 			}),
+			None,
 		)
 		.await
 	}
@@ -1789,7 +1831,14 @@ impl PersistentLocalIndex {
 		commands: Vec<SlabCommand>,
 		linked: Option<LsmInstallIntent>,
 		first_progress: Option<OpProgress>,
+		certificate: Option<super::LsmCertificate>,
 	) -> std::io::Result<OpAllocation> {
+		if certificate.is_some() && linked.is_none() {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				"an LSM certificate needs its install intent",
+			));
+		}
 		if commands.is_empty() {
 			return Err(Error::new(
 				ErrorKind::InvalidInput,
@@ -1890,6 +1939,12 @@ impl PersistentLocalIndex {
 					}
 					table.insert(&job, bytes.as_slice()).map_err(redb_to_io)?;
 					drop(table);
+					// ADR 0703: bound to its generation in this same transaction.
+					if let Some(certificate) = &certificate {
+						if !super::lsm_certificate::insert_certificate(&tx, &intent, certificate)? {
+							return Err(Error::new(ErrorKind::WouldBlock, GenerationMoved));
+						}
+					}
 					stored = Some(intent);
 				}
 				commit_op_txn(
@@ -2131,6 +2186,8 @@ impl PersistentLocalIndex {
 							));
 						}
 						table.remove(&job).map_err(redb_to_io)?;
+						drop(table);
+						super::lsm_certificate::remove_certificate_of(&tx, intent)?;
 					}
 					match evidence {
 						HandoffEvidence::None | HandoffEvidence::RemovalFinished => {}

@@ -2561,12 +2561,19 @@ impl WendelonNode {
 		let raft_committer: Arc<dyn TierCommitter> =
 			Arc::new(RaftCommitter::new(raft.clone()).with_state_machine(state_machine.clone()));
 		let lsm_worker = LsmCompactionWorker::new(LsmConfig::default(), slab.slab_pin_table())?;
-		let lsm_driver = Arc::new(LeaderGatedLsmCompactionDriver::new(
-			slab.clone(),
-			leader.clone(),
-			raft_committer.clone(),
-			state_machine.clone(),
-		));
+		let lsm_driver = Arc::new(
+			LeaderGatedLsmCompactionDriver::new(
+				slab.clone(),
+				leader.clone(),
+				raft_committer.clone(),
+				state_machine.clone(),
+			)
+			.with_certified(
+				(cfg.decision_mode
+					== crate::consensus::decision_mode::DecisionMode::ParentDecisions)
+					.then(|| data_server.clone()),
+			),
+		);
 		let lsm_service = LsmCompactionService::new(lsm_driver, lsm_worker);
 		let lsm_compaction_control = lsm_service.control();
 		if cfg.lsm_compaction_paused {
@@ -3798,6 +3805,8 @@ struct LeaderGatedLsmCompactionDriver {
 	leader: Arc<dyn LeaderStatus>,
 	committer: Arc<dyn TierCommitter>,
 	state_machine: WendelonStateMachine,
+	/// ADR 0703: the data server that admits certified jobs, in mode.
+	certified: Option<Arc<WendelonDataServer>>,
 }
 
 impl LeaderGatedLsmCompactionDriver {
@@ -3812,7 +3821,15 @@ impl LeaderGatedLsmCompactionDriver {
 			leader,
 			committer,
 			state_machine,
+			certified: None,
 		}
+	}
+
+	/// ADR 0703: in ParentDecisions mode every LSM job is a certified one,
+	/// admitted by this data server.
+	fn with_certified(mut self, data_server: Option<Arc<WendelonDataServer>>) -> Self {
+		self.certified = data_server;
+		self
 	}
 }
 
@@ -3823,8 +3840,14 @@ impl LsmCompactionDriver for LeaderGatedLsmCompactionDriver {
 		worker: &LsmCompactionWorker,
 		now: crate::schema::HybridTimestamp,
 	) -> Result<Option<crate::storage::CompactionOutcome>, crate::storage::CompactionFailure> {
+		// The admission check: only the leader compacts, certified or not.
 		if !self.leader.is_leader().await {
 			return Ok(None);
+		}
+		if let Some(data_server) = &self.certified {
+			return data_server
+				.certified_lsm_step(worker, now, self.committer.as_ref())
+				.await;
 		}
 		let state = self.state_machine.state_snapshot().await;
 		self.slab

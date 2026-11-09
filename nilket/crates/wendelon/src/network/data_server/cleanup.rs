@@ -34,6 +34,10 @@ impl WendelonDataServer {
 		if !self.may_clean() {
 			return Ok(0);
 		}
+		#[cfg(test)]
+		if self.cleanup_paused_for_test() {
+			return Ok(0);
+		}
 		self.under_permit(self.certified_cleanup_work()).await
 	}
 
@@ -248,5 +252,85 @@ impl WendelonDataServer {
 			page.last().map(|(key, _)| *key)
 		};
 		Ok(retired)
+	}
+}
+
+impl WendelonDataServer {
+	/// ADR 0703: one certified LSM job on this store, when it may clean.
+	/// The caller is the leader-gated LSM service (only the leader compacts).
+	/// The job runs under a lifecycle permit: an interrupted one revokes the
+	/// clean record, so the next start recovers it.
+	pub(crate) async fn certified_lsm_step(
+		&self,
+		worker: &crate::storage::LsmCompactionWorker,
+		now: HybridTimestamp,
+		committer: &dyn crate::storage::TierCommitter,
+	) -> Result<Option<crate::storage::CompactionOutcome>, crate::storage::CompactionFailure> {
+		if !self.parent_decisions() || !self.may_clean() {
+			return Ok(None);
+		}
+		#[cfg(test)]
+		if self.cleanup_paused_for_test() {
+			return Ok(None);
+		}
+		self.certified_lsm_step_unpaused(worker, now, committer)
+			.await
+	}
+
+	#[cfg(test)]
+	fn cleanup_paused_for_test(&self) -> bool {
+		self.decisions
+			.pause_cleanup
+			.load(std::sync::atomic::Ordering::Acquire)
+	}
+
+	/// The step itself, past its admission checks; a test drives it directly
+	/// while the store's own steps are paused.
+	pub(crate) async fn certified_lsm_step_unpaused(
+		&self,
+		worker: &crate::storage::LsmCompactionWorker,
+		now: HybridTimestamp,
+		committer: &dyn crate::storage::TierCommitter,
+	) -> Result<Option<crate::storage::CompactionOutcome>, crate::storage::CompactionFailure> {
+		if !self.parent_decisions() || !self.may_clean() {
+			return Ok(None);
+		}
+		let permit = match self.slab.directory_owner() {
+			Some(owner) => Some(owner.lifecycle_permit()?),
+			None => None,
+		};
+		let state = self.state_machine.state_snapshot().await;
+		let result = self
+			.slab
+			.run_certified_lsm_tick(
+				worker,
+				now,
+				committer,
+				&state.table_schemas,
+				&state.secondary_indexes,
+				self,
+			)
+			.await;
+		if let Some(permit) = permit {
+			permit.complete();
+		}
+		result
+	}
+}
+
+#[async_trait::async_trait]
+impl crate::storage::manager::certified_lsm::CertifiedLsmDecider for WendelonDataServer {
+	/// The job's selection, from one coherent read of exactly its versions'
+	/// facts and the content evidence for their debt.
+	async fn decide(
+		&self,
+		job: &crate::storage::manager::certified_lsm::LsmCertifiedJob,
+	) -> std::io::Result<crate::storage::manager::certified_lsm::CertifiedSelection> {
+		let index = self.slab.persistent_index().ok_or_else(|| {
+			std::io::Error::new(std::io::ErrorKind::NotFound, "no persistent index")
+		})?;
+		let facts = index.version_facts(job.versions()).await?;
+		let evidence = self.content_evidence(&facts).await?;
+		crate::storage::manager::certified_lsm::CertifiedSelection::decide(job, &facts, &evidence)
 	}
 }

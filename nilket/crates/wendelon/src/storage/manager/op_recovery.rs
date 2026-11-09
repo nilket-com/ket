@@ -557,6 +557,16 @@ impl SlabManager {
 			decided => decided,
 		};
 		let published = Self::install_left_a_trace(&intent, &durable);
+		// ADR 0703: a certified install's spawned recovery holds its own
+		// lifecycle permit, taken only where work is spawned, so a shutdown
+		// drains it.
+		let certified = durable.lsm_certificate(&intent).is_some();
+		let permit = || -> std::io::Result<Option<crate::storage::ownership::LifecyclePermit>> {
+			match (certified, self.directory_owner()) {
+				(true, Some(owner)) => Ok(Some(owner.lifecycle_permit()?)),
+				_ => Ok(None),
+			}
+		};
 		match outcome {
 			ViewOutcome::Recorded(RecordedOutcome::Rejected { .. }) if published => {
 				Err(fenced(format!(
@@ -565,10 +575,17 @@ impl SlabManager {
 				)))
 			}
 			ViewOutcome::Recorded(RecordedOutcome::Rejected { .. }) => {
-				tokio::spawn(
-					self.clone()
-						.undo_abandoned_install(ticket, intent, ownership),
-				)
+				let permit = permit()?;
+				let undo = self
+					.clone()
+					.undo_abandoned_install(ticket, intent, ownership);
+				tokio::spawn(async move {
+					let undone = undo.await;
+					if let Some(permit) = permit {
+						permit.complete();
+					}
+					undone
+				})
 				.await
 				.map_err(Error::other)??;
 				Ok(())
@@ -596,10 +613,17 @@ impl SlabManager {
 				} else {
 					None
 				};
-				tokio::spawn(
-					self.clone()
-						.finish_applied_install(ticket, intent, published, catalogs, ownership),
-				)
+				let permit = permit()?;
+				let finish = self
+					.clone()
+					.finish_applied_install(ticket, intent, published, catalogs, ownership);
+				tokio::spawn(async move {
+					let finished = finish.await;
+					if let Some(permit) = permit {
+						permit.complete();
+					}
+					finished
+				})
 				.await
 				.map_err(Error::other)??;
 				Ok(())
@@ -893,6 +917,15 @@ impl SlabManager {
 			}
 		}
 		let durable = index.load_snapshot().await?;
+		// ADR 0703: a certified install is finished only with the certificate that
+		// binds it, whatever its outputs look like; nothing is decided again.
+		let certificate = super::certified_lsm::certificate_of_install(
+			&intent,
+			&durable,
+			self.versions_contained(),
+		)
+		.map_err(refused)?
+		.cloned();
 		// An earlier attempt's outcome, just decided, may be what this finds.
 		let published = published || Self::install_left_a_trace(&intent, &durable);
 		let inputs = intent
@@ -908,7 +941,7 @@ impl SlabManager {
 				));
 			}
 		} else {
-			self.publish_applied_install(&intent, &durable, &inputs)
+			self.publish_applied_install(&intent, &durable, &inputs, certificate.as_ref())
 				.await?;
 		}
 		if catalogs.is_some() {
@@ -1092,7 +1125,7 @@ impl SlabManager {
 			manifest_epoch_pre: commit.manifest_epoch_pre,
 			input_slabs: intent.inputs.iter().map(|input| input.slab_id).collect(),
 			overlapping_slabs: Vec::new(),
-			retention_floor_snapshot: any_hlc,
+			elision: crate::storage::PlanElision::RetentionFloor(any_hlc),
 			compaction_start_hlc: any_hlc,
 			dominant_reason: crate::storage::DominantReason::Operator,
 		};
@@ -1173,6 +1206,7 @@ impl SlabManager {
 		intent: &LsmInstallIntent,
 		durable: &crate::storage::index::PersistentIndexSnapshot,
 		inputs: &std::collections::HashSet<SlabId>,
+		certificate: Option<&crate::storage::index::LsmCertificate>,
 	) -> std::io::Result<()> {
 		let job = intent.commit.job_id;
 		let refused = |why: &str| {
@@ -1214,6 +1248,7 @@ impl SlabManager {
 			.copied()
 			.collect::<Vec<_>>();
 		let mut inserted = Vec::new();
+		let mut produced = Vec::new();
 		for file in &intent.local_output_files {
 			let slab = LocalSlabStore::open_recovered(
 				slab_path(&self.config.dir, file.slab_id),
@@ -1227,6 +1262,7 @@ impl SlabManager {
 			for entry in slab.index.iter() {
 				let (tenant_id, key_identity) = *entry.key();
 				for location in entry.value().iter() {
+					produced.push((tenant_id, key_identity, location.hlc, location.is_tombstone));
 					let Some(source) = removed.iter().find(|row| {
 						row.tenant_id == tenant_id
 							&& row.key_identity == key_identity
@@ -1249,6 +1285,16 @@ impl SlabManager {
 			!= intent.local_output_rows_digest
 		{
 			return Err(refused("its outputs' rows are not the recorded ones"));
+		}
+		// ADR 0703: every output consumes one input copy; what is left is exactly
+		// the certificate's drop.
+		if let Some(certificate) = certificate {
+			let residual = super::certified_lsm::residual_after_outputs(&removed, &produced)
+				.map_err(refused)?;
+			let index = self.require_op_index()?;
+			let tables = super::certified_lsm::residual_tables(&index, &residual).await?;
+			super::certified_lsm::residual_matches_certificate(&residual, &tables, certificate)
+				.map_err(refused)?;
 		}
 		// The postimage is prepared aside. Memory moves only once the durable outcome is
 		// known, so a transaction that never landed leaves this retry its own preimage.

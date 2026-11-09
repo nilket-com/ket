@@ -158,7 +158,7 @@ fn retention_floor_rejects_cdc_cursor_while_lsm_elides_below_floor_rows() {
 			version(40, VersionLifecycle::AppendOnly),
 			version(60, VersionLifecycle::AppendOnly),
 		],
-		hlc(50),
+		&wendelon::storage::PlanElision::RetentionFloor(hlc(50)),
 	);
 	assert!(matches!(
 		&decisions[0],

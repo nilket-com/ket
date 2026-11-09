@@ -258,6 +258,7 @@ use tiered_io::{
 use tiered_io::{build_tiered_object_metadata, single_tenant_id_from_plain_slab};
 // ADR 0699 S5b: the certified cleanup rewrite.
 pub(crate) mod certified_cleanup;
+pub(crate) mod certified_lsm;
 mod compaction;
 use compaction::{
 	CompactionOutcome, CompactionRecord, compact_physical_record_frame,
@@ -805,6 +806,9 @@ pub struct SlabManager {
 	/// rebuilt at each open. Reads of these refuse.
 	conflicted_locations: DashSet<RecordLocation>,
 	versions_contained: AtomicBool,
+	/// ADR 0703: set at open when an LSM certificate has no install intent.
+	/// Certified LSM is then refused on this store.
+	certified_lsm_fenced: AtomicBool,
 	/// Tiered slabs not yet verified against their objects since open.
 	unverified_tier_slabs: DashSet<SlabId>,
 	tier_authority: Arc<tier_authority::TierAuthority>,

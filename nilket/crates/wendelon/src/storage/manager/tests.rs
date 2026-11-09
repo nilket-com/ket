@@ -5750,7 +5750,7 @@ async fn adr0097_lsm_owns_its_inputs_through_publication_and_retention_replans()
 		manifest_epoch_pre: snapshot.manifest_epoch,
 		input_slabs: vec![lower, higher],
 		overlapping_slabs: Vec::new(),
-		retention_floor_snapshot: hlc(9_000),
+		elision: crate::storage::PlanElision::RetentionFloor(hlc(9_000)),
 		compaction_start_hlc: hlc(9_001),
 		dominant_reason: crate::storage::DominantReason::Operator,
 	};
@@ -6220,7 +6220,7 @@ async fn lsm_compaction_rebuilds_secondary_index_sidecar_with_catalog_context() 
 		manifest_epoch_pre: snapshot.manifest_epoch,
 		input_slabs: vec![source_slab_id],
 		overlapping_slabs: Vec::new(),
-		retention_floor_snapshot: hlc(100),
+		elision: crate::storage::PlanElision::RetentionFloor(hlc(100)),
 		compaction_start_hlc: hlc(101),
 		dominant_reason: crate::storage::DominantReason::Operator,
 	};
@@ -6318,7 +6318,7 @@ async fn lsm_compaction_commit_failure_does_not_publish_prepared_sidecar() {
 		manifest_epoch_pre: snapshot.manifest_epoch,
 		input_slabs: vec![source_slab_id],
 		overlapping_slabs: Vec::new(),
-		retention_floor_snapshot: hlc(100),
+		elision: crate::storage::PlanElision::RetentionFloor(hlc(100)),
 		compaction_start_hlc: hlc(101),
 		dominant_reason: crate::storage::DominantReason::Operator,
 	};
@@ -6391,7 +6391,7 @@ async fn lsm_compaction_rejects_secondary_index_sidecar_without_catalog_context(
 		manifest_epoch_pre: snapshot.manifest_epoch,
 		input_slabs: vec![source_slab_id],
 		overlapping_slabs: Vec::new(),
-		retention_floor_snapshot: hlc(100),
+		elision: crate::storage::PlanElision::RetentionFloor(hlc(100)),
 		compaction_start_hlc: hlc(101),
 		dominant_reason: crate::storage::DominantReason::Operator,
 	};
@@ -6455,7 +6455,7 @@ async fn lsm_compaction_elides_non_visible_primary_key_versions_with_catalog_con
 		manifest_epoch_pre: snapshot.manifest_epoch,
 		input_slabs: vec![source_slab_id],
 		overlapping_slabs: Vec::new(),
-		retention_floor_snapshot: hlc(25),
+		elision: crate::storage::PlanElision::RetentionFloor(hlc(25)),
 		compaction_start_hlc: hlc(101),
 		dominant_reason: crate::storage::DominantReason::Operator,
 	};
@@ -13833,7 +13833,7 @@ async fn lsm_compaction_rejects_sidecar_covered_source_runs_without_catalog_cont
 		manifest_epoch_pre: snapshot.manifest_epoch,
 		input_slabs: vec![source_slab_id],
 		overlapping_slabs: Vec::new(),
-		retention_floor_snapshot: hlc(20),
+		elision: crate::storage::PlanElision::RetentionFloor(hlc(20)),
 		compaction_start_hlc: hlc(21),
 		dominant_reason: crate::storage::DominantReason::Operator,
 	};
@@ -13882,7 +13882,7 @@ async fn lsm_compaction_copies_whole_multirow_frame_into_output_run() {
 		manifest_epoch_pre: snapshot.manifest_epoch,
 		input_slabs: vec![source_slab_id],
 		overlapping_slabs: Vec::new(),
-		retention_floor_snapshot: hlc(100),
+		elision: crate::storage::PlanElision::RetentionFloor(hlc(100)),
 		compaction_start_hlc: hlc(101),
 		dominant_reason: crate::storage::DominantReason::Operator,
 	};
@@ -15215,7 +15215,7 @@ async fn adr0097_partial_survivor_frame_is_rewritten_before_installation() {
 		input_slabs: vec![slab_a, slab_b],
 		overlapping_slabs: Vec::new(),
 		// Above every row HLC: only versions below the floor are superseded.
-		retention_floor_snapshot: hlc(9_000),
+		elision: crate::storage::PlanElision::RetentionFloor(hlc(9_000)),
 		compaction_start_hlc: hlc(9_001),
 		dominant_reason: crate::storage::DominantReason::Operator,
 	};
@@ -15226,7 +15226,7 @@ async fn adr0097_partial_survivor_frame_is_rewritten_before_installation() {
 		.await
 		.unwrap();
 	assert_eq!(entries.len(), 4, "three frame rows plus the newer k2");
-	let decisions = crate::storage::lsm::apply_elision(entries, plan.retention_floor_snapshot);
+	let decisions = crate::storage::lsm::apply_elision(entries, &plan.elision);
 	let survivors = crate::storage::lsm::survivor_records(&decisions);
 	assert_eq!(
 		survivors.len(),
@@ -15399,7 +15399,7 @@ async fn adr0097_rewritten_partial_survivor_frame_survives_install_and_reopen() 
 		manifest_epoch_pre: snapshot.manifest_epoch,
 		input_slabs: vec![slab_a, slab_b],
 		overlapping_slabs: Vec::new(),
-		retention_floor_snapshot: hlc(9_000),
+		elision: crate::storage::PlanElision::RetentionFloor(hlc(9_000)),
 		compaction_start_hlc: hlc(9_001),
 		dominant_reason: crate::storage::DominantReason::Operator,
 	};
@@ -15591,7 +15591,7 @@ async fn adr0097_source_frames_are_read_once_per_physical_frame() {
 		manifest_epoch_pre: snapshot.manifest_epoch,
 		input_slabs: vec![source_slab_id],
 		overlapping_slabs: Vec::new(),
-		retention_floor_snapshot: hlc(5),
+		elision: crate::storage::PlanElision::RetentionFloor(hlc(5)),
 		compaction_start_hlc: hlc(200),
 		dominant_reason: crate::storage::DominantReason::Operator,
 	};
@@ -18654,7 +18654,7 @@ async fn a_plan_naming_a_retirement_remnant_finishes_it() {
 		manifest_epoch_pre: mgr.compaction_manifest_snapshot().manifest_epoch,
 		input_slabs: vec![slab],
 		overlapping_slabs: Vec::new(),
-		retention_floor_snapshot: hlc(100),
+		elision: crate::storage::PlanElision::RetentionFloor(hlc(100)),
 		compaction_start_hlc: hlc(101),
 		dominant_reason: crate::storage::DominantReason::Operator,
 	};
@@ -19254,7 +19254,7 @@ async fn install_over_tiered_input(cut: lsm_driver::ControlLsmInstallCut) -> Tie
 		manifest_epoch_pre: mgr.compaction_manifest_snapshot().manifest_epoch,
 		input_slabs: vec![slab],
 		overlapping_slabs: Vec::new(),
-		retention_floor_snapshot: hlc(100),
+		elision: crate::storage::PlanElision::RetentionFloor(hlc(100)),
 		compaction_start_hlc: hlc(101),
 		dominant_reason: crate::storage::DominantReason::Operator,
 	};
@@ -19591,7 +19591,7 @@ async fn an_l0_compaction_lands_after_a_tier_retirement_and_writes_only_its_runs
 		manifest_epoch_pre: snapshot.manifest_epoch,
 		input_slabs: inputs,
 		overlapping_slabs: Vec::new(),
-		retention_floor_snapshot: hlc(100),
+		elision: crate::storage::PlanElision::RetentionFloor(hlc(100)),
 		compaction_start_hlc: hlc(101),
 		dominant_reason: crate::storage::DominantReason::Operator,
 	};
@@ -27591,7 +27591,7 @@ async fn lsm_prepare_refuses_pointer_aba_during_source_read() {
 		manifest_epoch_pre: mgr.compaction_manifest_snapshot().manifest_epoch,
 		input_slabs: vec![pointer.slab_id],
 		overlapping_slabs: Vec::new(),
-		retention_floor_snapshot: hlc(212),
+		elision: crate::storage::PlanElision::RetentionFloor(hlc(212)),
 		compaction_start_hlc: hlc(213),
 		dominant_reason: crate::storage::DominantReason::Operator,
 	};
@@ -27908,7 +27908,7 @@ async fn a_retirement_during_a_control_wait_is_held_and_the_install_completes() 
 		manifest_epoch_pre: mgr.compaction_manifest_snapshot().manifest_epoch,
 		input_slabs: vec![pointer.slab_id],
 		overlapping_slabs: Vec::new(),
-		retention_floor_snapshot: hlc(232),
+		elision: crate::storage::PlanElision::RetentionFloor(hlc(232)),
 		compaction_start_hlc: hlc(233),
 		dominant_reason: crate::storage::DominantReason::Operator,
 	};
@@ -28265,7 +28265,7 @@ async fn local_lsm_cancel_after_rename_quarantines_outputs_and_recovers_inputs()
 		manifest_epoch_pre: snapshot.manifest_epoch,
 		input_slabs: vec![first, second],
 		overlapping_slabs: Vec::new(),
-		retention_floor_snapshot: hlc(100),
+		elision: crate::storage::PlanElision::RetentionFloor(hlc(100)),
 		compaction_start_hlc: hlc(101),
 		dominant_reason: crate::storage::DominantReason::Operator,
 	};
@@ -28416,7 +28416,7 @@ async fn local_lsm_cancel_after_publication_recovers_committed_outputs() {
 		manifest_epoch_pre: snapshot.manifest_epoch,
 		input_slabs: vec![first, second],
 		overlapping_slabs: Vec::new(),
-		retention_floor_snapshot: hlc(100),
+		elision: crate::storage::PlanElision::RetentionFloor(hlc(100)),
 		compaction_start_hlc: hlc(101),
 		dominant_reason: crate::storage::DominantReason::Operator,
 	};
@@ -28546,7 +28546,7 @@ async fn local_lsm_cancel_after_output_publication_finishes_input_retirement() {
 		manifest_epoch_pre: snapshot.manifest_epoch,
 		input_slabs: vec![first, second],
 		overlapping_slabs: Vec::new(),
-		retention_floor_snapshot: hlc(100),
+		elision: crate::storage::PlanElision::RetentionFloor(hlc(100)),
 		compaction_start_hlc: hlc(101),
 		dominant_reason: crate::storage::DominantReason::Operator,
 	};
@@ -28704,7 +28704,7 @@ async fn local_lsm_changed_input_keeps_intent_and_output_fenced() {
 		manifest_epoch_pre: snapshot.manifest_epoch,
 		input_slabs: vec![first, second],
 		overlapping_slabs: Vec::new(),
-		retention_floor_snapshot: hlc(100),
+		elision: crate::storage::PlanElision::RetentionFloor(hlc(100)),
 		compaction_start_hlc: hlc(101),
 		dominant_reason: crate::storage::DominantReason::Operator,
 	};
@@ -28812,7 +28812,7 @@ async fn local_lsm_failed_before_rename_keeps_temp_for_recovery() {
 		manifest_epoch_pre: snapshot.manifest_epoch,
 		input_slabs: vec![first, second],
 		overlapping_slabs: Vec::new(),
-		retention_floor_snapshot: hlc(100),
+		elision: crate::storage::PlanElision::RetentionFloor(hlc(100)),
 		compaction_start_hlc: hlc(101),
 		dominant_reason: crate::storage::DominantReason::Operator,
 	};
@@ -29047,7 +29047,7 @@ async fn local_lsm_quarantine_resumes_after_link_before_fsync() {
 		manifest_epoch_pre: snapshot.manifest_epoch,
 		input_slabs: vec![first, second],
 		overlapping_slabs: Vec::new(),
-		retention_floor_snapshot: hlc(100),
+		elision: crate::storage::PlanElision::RetentionFloor(hlc(100)),
 		compaction_start_hlc: hlc(101),
 		dominant_reason: crate::storage::DominantReason::Operator,
 	};
@@ -29207,7 +29207,7 @@ async fn local_lsm_quarantine_resumes_after_link_after_fsync() {
 		manifest_epoch_pre: snapshot.manifest_epoch,
 		input_slabs: vec![first, second],
 		overlapping_slabs: Vec::new(),
-		retention_floor_snapshot: hlc(100),
+		elision: crate::storage::PlanElision::RetentionFloor(hlc(100)),
 		compaction_start_hlc: hlc(101),
 		dominant_reason: crate::storage::DominantReason::Operator,
 	};
@@ -29368,7 +29368,7 @@ async fn local_lsm_quarantine_resumes_after_unlink_before_fsync() {
 		manifest_epoch_pre: snapshot.manifest_epoch,
 		input_slabs: vec![first, second],
 		overlapping_slabs: Vec::new(),
-		retention_floor_snapshot: hlc(100),
+		elision: crate::storage::PlanElision::RetentionFloor(hlc(100)),
 		compaction_start_hlc: hlc(101),
 		dominant_reason: crate::storage::DominantReason::Operator,
 	};
@@ -29530,7 +29530,7 @@ async fn local_lsm_quarantine_resumes_after_unlink_after_fsync() {
 		manifest_epoch_pre: snapshot.manifest_epoch,
 		input_slabs: vec![first, second],
 		overlapping_slabs: Vec::new(),
-		retention_floor_snapshot: hlc(100),
+		elision: crate::storage::PlanElision::RetentionFloor(hlc(100)),
 		compaction_start_hlc: hlc(101),
 		dominant_reason: crate::storage::DominantReason::Operator,
 	};
@@ -29693,7 +29693,7 @@ async fn local_lsm_sidecar_evidence_keeps_intent_and_outputs_fenced() {
 		manifest_epoch_pre: snapshot.manifest_epoch,
 		input_slabs: vec![first, second],
 		overlapping_slabs: Vec::new(),
-		retention_floor_snapshot: hlc(100),
+		elision: crate::storage::PlanElision::RetentionFloor(hlc(100)),
 		compaction_start_hlc: hlc(101),
 		dominant_reason: crate::storage::DominantReason::Operator,
 	};
@@ -29830,7 +29830,7 @@ async fn local_lsm_preflight_refusal_precedes_durable_intent_and_orphan_mark() {
 		manifest_epoch_pre: snapshot.manifest_epoch,
 		input_slabs: vec![first, second],
 		overlapping_slabs: Vec::new(),
-		retention_floor_snapshot: hlc(100),
+		elision: crate::storage::PlanElision::RetentionFloor(hlc(100)),
 		compaction_start_hlc: hlc(101),
 		dominant_reason: crate::storage::DominantReason::Operator,
 	};
@@ -29951,7 +29951,7 @@ async fn local_lsm_recovery_preserves_unrelated_run_change() {
 		manifest_epoch_pre: snapshot.manifest_epoch,
 		input_slabs: vec![first, second],
 		overlapping_slabs: Vec::new(),
-		retention_floor_snapshot: hlc(100),
+		elision: crate::storage::PlanElision::RetentionFloor(hlc(100)),
 		compaction_start_hlc: hlc(101),
 		dominant_reason: crate::storage::DominantReason::Operator,
 	};
@@ -30108,7 +30108,7 @@ async fn empty_output_local_lsm_recovers_at_phase(outputs_published: bool) {
 		manifest_epoch_pre: snapshot.manifest_epoch,
 		input_slabs: vec![input],
 		overlapping_slabs: Vec::new(),
-		retention_floor_snapshot: hlc(100),
+		elision: crate::storage::PlanElision::RetentionFloor(hlc(100)),
 		compaction_start_hlc: hlc(101),
 		dominant_reason: crate::storage::DominantReason::Operator,
 	};
@@ -30238,7 +30238,7 @@ async fn append_only_retention_elision_preserves_the_visible_domain_digest() {
 		manifest_epoch_pre: snapshot.manifest_epoch,
 		input_slabs: vec![input],
 		overlapping_slabs: Vec::new(),
-		retention_floor_snapshot: hlc(100),
+		elision: crate::storage::PlanElision::RetentionFloor(hlc(100)),
 		compaction_start_hlc: hlc(101),
 		dominant_reason: crate::storage::DominantReason::Operator,
 	};
@@ -30308,7 +30308,7 @@ async fn incorrectly_elided_above_floor_row_is_refused_by_visible_domain_digest(
 		manifest_epoch_pre: snapshot.manifest_epoch,
 		input_slabs: vec![input],
 		overlapping_slabs: Vec::new(),
-		retention_floor_snapshot: hlc(100),
+		elision: crate::storage::PlanElision::RetentionFloor(hlc(100)),
 		compaction_start_hlc: hlc(101),
 		dominant_reason: crate::storage::DominantReason::Operator,
 	};
@@ -30374,7 +30374,7 @@ async fn retention_empty_output_local_lsm_recovers_at_phase(outputs_published: b
 		manifest_epoch_pre: snapshot.manifest_epoch,
 		input_slabs: vec![input],
 		overlapping_slabs: Vec::new(),
-		retention_floor_snapshot: hlc(100),
+		elision: crate::storage::PlanElision::RetentionFloor(hlc(100)),
 		compaction_start_hlc: hlc(101),
 		dominant_reason: crate::storage::DominantReason::Operator,
 	};
@@ -31476,7 +31476,7 @@ async fn local_lsm_renamed_outputs_before_publication_never_duplicate_recovered_
 		manifest_epoch_pre: snapshot.manifest_epoch,
 		input_slabs: vec![first, second],
 		overlapping_slabs: Vec::new(),
-		retention_floor_snapshot: hlc(100),
+		elision: crate::storage::PlanElision::RetentionFloor(hlc(100)),
 		compaction_start_hlc: hlc(101),
 		dominant_reason: crate::storage::DominantReason::Operator,
 	};
@@ -31596,7 +31596,7 @@ async fn dc123_append_only_tombstone_pair(
 		manifest_epoch_pre: snapshot.manifest_epoch,
 		input_slabs: vec![input],
 		overlapping_slabs: Vec::new(),
-		retention_floor_snapshot: hlc(100),
+		elision: crate::storage::PlanElision::RetentionFloor(hlc(100)),
 		compaction_start_hlc: hlc(102),
 		dominant_reason: crate::storage::DominantReason::Operator,
 	};
@@ -31668,7 +31668,7 @@ async fn dc123_pk_boundary_is_preserved_when_key_spans_the_plan() {
 		manifest_epoch_pre: snapshot.manifest_epoch,
 		input_slabs: vec![input],
 		overlapping_slabs: Vec::new(),
-		retention_floor_snapshot: hlc(25),
+		elision: crate::storage::PlanElision::RetentionFloor(hlc(25)),
 		compaction_start_hlc: hlc(31),
 		dominant_reason: crate::storage::DominantReason::Operator,
 	};
@@ -31736,7 +31736,7 @@ async fn dc123_wrongly_dropped_pk_boundary_with_newer_version_is_refused() {
 		manifest_epoch_pre: snapshot.manifest_epoch,
 		input_slabs: vec![input],
 		overlapping_slabs: Vec::new(),
-		retention_floor_snapshot: hlc(25),
+		elision: crate::storage::PlanElision::RetentionFloor(hlc(25)),
 		compaction_start_hlc: hlc(31),
 		dominant_reason: crate::storage::DominantReason::Operator,
 	};
@@ -31822,7 +31822,7 @@ async fn dc123_written_output_integrity_control(change_value: bool) {
 		manifest_epoch_pre: snapshot.manifest_epoch,
 		input_slabs: vec![input],
 		overlapping_slabs: Vec::new(),
-		retention_floor_snapshot: hlc(100),
+		elision: crate::storage::PlanElision::RetentionFloor(hlc(100)),
 		compaction_start_hlc: hlc(102),
 		dominant_reason: crate::storage::DominantReason::Operator,
 	};
@@ -31904,7 +31904,7 @@ async fn dc125_lsm_output_preserves_partitioned_row_location() {
 		manifest_epoch_pre: snapshot.manifest_epoch,
 		input_slabs: vec![input],
 		overlapping_slabs: Vec::new(),
-		retention_floor_snapshot: hlc(25),
+		elision: crate::storage::PlanElision::RetentionFloor(hlc(25)),
 		compaction_start_hlc: hlc(31),
 		dominant_reason: crate::storage::DominantReason::Operator,
 	};
@@ -31995,7 +31995,7 @@ async fn dc125_partial_multirow_output_preserves_partitioned_locations() {
 		input_slabs: vec![slab_a, slab_b],
 		overlapping_slabs: Vec::new(),
 		// Above every row HLC: only versions below the floor are superseded.
-		retention_floor_snapshot: hlc(9_000),
+		elision: crate::storage::PlanElision::RetentionFloor(hlc(9_000)),
 		compaction_start_hlc: hlc(9_001),
 		dominant_reason: crate::storage::DominantReason::Operator,
 	};
@@ -32006,7 +32006,7 @@ async fn dc125_partial_multirow_output_preserves_partitioned_locations() {
 		.await
 		.unwrap();
 	assert_eq!(entries.len(), 4, "three frame rows plus the newer k2");
-	let decisions = crate::storage::lsm::apply_elision(entries, plan.retention_floor_snapshot);
+	let decisions = crate::storage::lsm::apply_elision(entries, &plan.elision);
 	let survivors = crate::storage::lsm::survivor_records(&decisions);
 	assert_eq!(
 		survivors.len(),
@@ -32087,7 +32087,7 @@ async fn dc125_opaque_output_preserves_supplied_location_metadata() {
 		manifest_epoch_pre: snapshot.manifest_epoch,
 		input_slabs: vec![first, second],
 		overlapping_slabs: Vec::new(),
-		retention_floor_snapshot: hlc(100),
+		elision: crate::storage::PlanElision::RetentionFloor(hlc(100)),
 		compaction_start_hlc: hlc(101),
 		dominant_reason: crate::storage::DominantReason::Operator,
 	};
@@ -32167,7 +32167,7 @@ async fn dc124_visible_covered_value_loss_is_refused_by_bridge() {
 		manifest_epoch_pre: snapshot.manifest_epoch,
 		input_slabs: vec![input],
 		overlapping_slabs: Vec::new(),
-		retention_floor_snapshot: hlc(100),
+		elision: crate::storage::PlanElision::RetentionFloor(hlc(100)),
 		compaction_start_hlc: hlc(102),
 		dominant_reason: crate::storage::DominantReason::Operator,
 	};
@@ -32248,7 +32248,7 @@ async fn dc123_omitted_input_decision_is_refused() {
 		manifest_epoch_pre: snapshot.manifest_epoch,
 		input_slabs: vec![input],
 		overlapping_slabs: Vec::new(),
-		retention_floor_snapshot: hlc(25),
+		elision: crate::storage::PlanElision::RetentionFloor(hlc(25)),
 		compaction_start_hlc: hlc(31),
 		dominant_reason: crate::storage::DominantReason::Operator,
 	};
@@ -32335,7 +32335,7 @@ async fn dc123_ambiguous_value_with_typed_tombstone_cannot_resurrect() {
 		manifest_epoch_pre: snapshot.manifest_epoch,
 		input_slabs: vec![input],
 		overlapping_slabs: Vec::new(),
-		retention_floor_snapshot: hlc(100),
+		elision: crate::storage::PlanElision::RetentionFloor(hlc(100)),
 		compaction_start_hlc: hlc(102),
 		dominant_reason: crate::storage::DominantReason::Operator,
 	};
@@ -32349,7 +32349,7 @@ async fn dc123_ambiguous_value_with_typed_tombstone_cannot_resurrect() {
 	// Allocate an output template without allowing the planner to elide the
 	// pair; the proof below still evaluates the injected plan at floor 100.
 	let mut allocation_plan = plan.clone();
-	allocation_plan.retention_floor_snapshot = hlc(0);
+	allocation_plan.elision = crate::storage::PlanElision::RetentionFloor(hlc(0));
 	let mut prepared = manager
 		.prepare_lsm_compaction_outputs_with_table_schemas(&worker, &allocation_plan, &catalog)
 		.await
@@ -32445,7 +32445,7 @@ async fn dc123_preserved_ambiguous_value_and_tombstone_are_accepted() {
 		manifest_epoch_pre: snapshot.manifest_epoch,
 		input_slabs: vec![input],
 		overlapping_slabs: Vec::new(),
-		retention_floor_snapshot: hlc(100),
+		elision: crate::storage::PlanElision::RetentionFloor(hlc(100)),
 		compaction_start_hlc: hlc(102),
 		dominant_reason: crate::storage::DominantReason::Operator,
 	};
@@ -32459,7 +32459,7 @@ async fn dc123_preserved_ambiguous_value_and_tombstone_are_accepted() {
 	// Allocate an output template without allowing the planner to elide the
 	// pair; the proof below still evaluates the injected plan at floor 100.
 	let mut allocation_plan = plan.clone();
-	allocation_plan.retention_floor_snapshot = hlc(0);
+	allocation_plan.elision = crate::storage::PlanElision::RetentionFloor(hlc(0));
 	let mut prepared = manager
 		.prepare_lsm_compaction_outputs_with_table_schemas(&worker, &allocation_plan, &catalog)
 		.await
@@ -32550,7 +32550,7 @@ async fn dc123_mixed_exact_lifecycles_cannot_drop_visible_value() {
 		manifest_epoch_pre: snapshot.manifest_epoch,
 		input_slabs: vec![input],
 		overlapping_slabs: Vec::new(),
-		retention_floor_snapshot: hlc(100),
+		elision: crate::storage::PlanElision::RetentionFloor(hlc(100)),
 		compaction_start_hlc: hlc(102),
 		dominant_reason: crate::storage::DominantReason::Operator,
 	};
@@ -32656,7 +32656,7 @@ async fn dc123_preserved_mixed_exact_lifecycles_are_accepted() {
 		manifest_epoch_pre: snapshot.manifest_epoch,
 		input_slabs: vec![input],
 		overlapping_slabs: Vec::new(),
-		retention_floor_snapshot: hlc(100),
+		elision: crate::storage::PlanElision::RetentionFloor(hlc(100)),
 		compaction_start_hlc: hlc(102),
 		dominant_reason: crate::storage::DominantReason::Operator,
 	};
@@ -32757,7 +32757,7 @@ async fn dc124_tombstone_lifecycle_requires_matching_source_identity_and_table()
 		manifest_epoch_pre: snapshot.manifest_epoch,
 		input_slabs: vec![input],
 		overlapping_slabs: Vec::new(),
-		retention_floor_snapshot: hlc(100),
+		elision: crate::storage::PlanElision::RetentionFloor(hlc(100)),
 		compaction_start_hlc: hlc(102),
 		dominant_reason: crate::storage::DominantReason::Operator,
 	};
@@ -33049,7 +33049,7 @@ async fn seed_small_retired_gc_slab(manager: &Arc<SlabManager>) -> (SlabId, Iden
 		manifest_epoch_pre: before.manifest_epoch,
 		input_slabs: vec![old.slab_id],
 		overlapping_slabs: Vec::new(),
-		retention_floor_snapshot: hlc(0),
+		elision: crate::storage::PlanElision::RetentionFloor(hlc(0)),
 		compaction_start_hlc: hlc(20),
 		dominant_reason: crate::storage::DominantReason::Operator,
 	};
@@ -33467,7 +33467,7 @@ async fn gc_control_concurrent_tier_retirement_refuses_stale_local_removal() {
 		manifest_epoch_pre: snapshot.manifest_epoch,
 		input_slabs: vec![slab_id],
 		overlapping_slabs: Vec::new(),
-		retention_floor_snapshot: hlc(0),
+		elision: crate::storage::PlanElision::RetentionFloor(hlc(0)),
 		compaction_start_hlc: hlc(20),
 		dominant_reason: crate::storage::DominantReason::Operator,
 	};
@@ -33712,7 +33712,7 @@ async fn unresolved_lsm_outputs_stay_unindexed_and_shared_key_tier_apply_refuses
 		manifest_epoch_pre: snapshot.manifest_epoch,
 		input_slabs: vec![input.slab_id],
 		overlapping_slabs: Vec::new(),
-		retention_floor_snapshot: hlc(0),
+		elision: crate::storage::PlanElision::RetentionFloor(hlc(0)),
 		compaction_start_hlc: hlc(30),
 		dominant_reason: crate::storage::DominantReason::Operator,
 	};
@@ -43958,7 +43958,7 @@ async fn b11b_paused_control_install(
 		manifest_epoch_pre: snapshot.manifest_epoch,
 		input_slabs: vec![first, second],
 		overlapping_slabs: Vec::new(),
-		retention_floor_snapshot: hlc(100),
+		elision: crate::storage::PlanElision::RetentionFloor(hlc(100)),
 		compaction_start_hlc: hlc(101),
 		dominant_reason: crate::storage::DominantReason::Operator,
 	};
@@ -44142,7 +44142,8 @@ async fn b11b_bad_proof_refuses(kind: u8) {
 			&dir,
 			index,
 			&saved,
-			&bad
+			&bad,
+			false
 		)
 		.await
 		.unwrap()
@@ -44321,7 +44322,7 @@ async fn local_lsm_error_after_input_run_materialization_leaves_no_orphan_fence(
 		manifest_epoch_pre: snapshot.manifest_epoch,
 		input_slabs: vec![first, second],
 		overlapping_slabs: Vec::new(),
-		retention_floor_snapshot: hlc(100),
+		elision: crate::storage::PlanElision::RetentionFloor(hlc(100)),
 		compaction_start_hlc: hlc(101),
 		dominant_reason: crate::storage::DominantReason::Operator,
 	};
@@ -44410,7 +44411,7 @@ async fn control_lsm_preflight_refusal_precedes_durable_intent_and_hold() {
 		manifest_epoch_pre: snapshot.manifest_epoch,
 		input_slabs: vec![first, second],
 		overlapping_slabs: Vec::new(),
-		retention_floor_snapshot: hlc(100),
+		elision: crate::storage::PlanElision::RetentionFloor(hlc(100)),
 		compaction_start_hlc: hlc(101),
 		dominant_reason: crate::storage::DominantReason::Operator,
 	};
@@ -44544,7 +44545,7 @@ async fn control_lsm_refusal_before_rename_clears_its_durable_intent() {
 		manifest_epoch_pre: snapshot.manifest_epoch,
 		input_slabs: vec![first, second],
 		overlapping_slabs: Vec::new(),
-		retention_floor_snapshot: hlc(100),
+		elision: crate::storage::PlanElision::RetentionFloor(hlc(100)),
 		compaction_start_hlc: hlc(101),
 		dominant_reason: crate::storage::DominantReason::Operator,
 	};
@@ -47441,7 +47442,7 @@ async fn seed_small_retired_gc_slab_at(
 		manifest_epoch_pre: before.manifest_epoch,
 		input_slabs: vec![old.slab_id],
 		overlapping_slabs: Vec::new(),
-		retention_floor_snapshot: hlc(0),
+		elision: crate::storage::PlanElision::RetentionFloor(hlc(0)),
 		compaction_start_hlc: hlc(20),
 		dominant_reason: crate::storage::DominantReason::Operator,
 	};
@@ -50335,7 +50336,7 @@ async fn a_full_window_refuses_new_work_and_the_reserved_gc_removal_still_drains
 			manifest_epoch_pre: before.manifest_epoch,
 			input_slabs: vec![written.slab_id],
 			overlapping_slabs: Vec::new(),
-			retention_floor_snapshot: hlc(0),
+			elision: crate::storage::PlanElision::RetentionFloor(hlc(0)),
 			compaction_start_hlc: hlc(40),
 			dominant_reason: crate::storage::DominantReason::Operator,
 		};
@@ -53231,7 +53232,7 @@ async fn seeded_compaction_plan(mgr: &Arc<SlabManager>) -> (SlabId, CompactionPl
 			manifest_epoch_pre: snapshot.manifest_epoch,
 			input_slabs: vec![input.slab_id],
 			overlapping_slabs: Vec::new(),
-			retention_floor_snapshot: hlc(0),
+			elision: crate::storage::PlanElision::RetentionFloor(hlc(0)),
 			compaction_start_hlc: hlc(90),
 			dominant_reason: crate::storage::DominantReason::Operator,
 		},
@@ -56927,7 +56928,7 @@ async fn reopen_install_seeded_on_ring(
 		manifest_epoch_pre: snapshot.manifest_epoch,
 		input_slabs: vec![first, second],
 		overlapping_slabs: Vec::new(),
-		retention_floor_snapshot: retention_floor,
+		elision: crate::storage::PlanElision::RetentionFloor(retention_floor),
 		compaction_start_hlc: hlc(101),
 		dominant_reason: crate::storage::DominantReason::Operator,
 	};
@@ -57612,7 +57613,7 @@ async fn an_install_accepted_after_gc_ends_after_a_reopen(inputs_sealed_before_g
 				manifest_epoch_pre: before_gc,
 				input_slabs: vec![first, second],
 				overlapping_slabs: Vec::new(),
-				retention_floor_snapshot: hlc(100),
+				elision: crate::storage::PlanElision::RetentionFloor(hlc(100)),
 				compaction_start_hlc: hlc(50),
 				dominant_reason: crate::storage::DominantReason::Operator,
 			};
@@ -57801,7 +57802,7 @@ impl LsmJobStore {
 			manifest_epoch_pre: self.epoch(),
 			input_slabs: inputs.to_vec(),
 			overlapping_slabs: Vec::new(),
-			retention_floor_snapshot: hlc(100),
+			elision: crate::storage::PlanElision::RetentionFloor(hlc(100)),
 			compaction_start_hlc: hlc(start),
 			dominant_reason: crate::storage::DominantReason::Operator,
 		}
@@ -58555,7 +58556,7 @@ async fn a_sidecar_swap_is_refused_before_its_intent_or_submission() {
 		manifest_epoch_pre: snapshot.manifest_epoch,
 		input_slabs: vec![input],
 		overlapping_slabs: Vec::new(),
-		retention_floor_snapshot: hlc(100),
+		elision: crate::storage::PlanElision::RetentionFloor(hlc(100)),
 		compaction_start_hlc: hlc(101),
 		dominant_reason: crate::storage::DominantReason::Operator,
 	};
@@ -58632,7 +58633,7 @@ async fn an_install_killed_at_each_boundary_resumes_on_a_ring_that_outlived_it()
 			manifest_epoch_pre: snapshot.manifest_epoch,
 			input_slabs: vec![first, second],
 			overlapping_slabs: Vec::new(),
-			retention_floor_snapshot: hlc(100),
+			elision: crate::storage::PlanElision::RetentionFloor(hlc(100)),
 			compaction_start_hlc: hlc(101),
 			dominant_reason: crate::storage::DominantReason::Operator,
 		};
@@ -59341,7 +59342,7 @@ async fn run_install_of_seeded_inputs(
 		manifest_epoch_pre: snapshot.manifest_epoch,
 		input_slabs: vec![first, second],
 		overlapping_slabs: Vec::new(),
-		retention_floor_snapshot: hlc(100),
+		elision: crate::storage::PlanElision::RetentionFloor(hlc(100)),
 		compaction_start_hlc: hlc(101),
 		dominant_reason: crate::storage::DominantReason::Operator,
 	};
@@ -59437,7 +59438,7 @@ async fn an_install_over_a_recorded_conflict_is_refused_before_its_intent() {
 		manifest_epoch_pre: snapshot.manifest_epoch,
 		input_slabs: vec![first, second],
 		overlapping_slabs: Vec::new(),
-		retention_floor_snapshot: hlc(100),
+		elision: crate::storage::PlanElision::RetentionFloor(hlc(100)),
 		compaction_start_hlc: hlc(101),
 		dominant_reason: crate::storage::DominantReason::Operator,
 	};
@@ -59749,7 +59750,7 @@ async fn reopen_covered_install_at(cut: lsm_driver::ControlLsmInstallCut) -> Cov
 		manifest_epoch_pre: snapshot.manifest_epoch,
 		input_slabs: vec![input],
 		overlapping_slabs: Vec::new(),
-		retention_floor_snapshot: hlc(100),
+		elision: crate::storage::PlanElision::RetentionFloor(hlc(100)),
 		compaction_start_hlc: hlc(101),
 		dominant_reason: crate::storage::DominantReason::Operator,
 	};
@@ -60460,7 +60461,7 @@ async fn a_late_rename_holds_recovery_off_and_no_final_name_survives() {
 		manifest_epoch_pre: snapshot.manifest_epoch,
 		input_slabs: vec![first, second],
 		overlapping_slabs: Vec::new(),
-		retention_floor_snapshot: hlc(100),
+		elision: crate::storage::PlanElision::RetentionFloor(hlc(100)),
 		compaction_start_hlc: hlc(101),
 		dominant_reason: crate::storage::DominantReason::Operator,
 	};
@@ -61702,7 +61703,7 @@ async fn reopen_zero_output_install_at(
 		manifest_epoch_pre: snapshot.manifest_epoch,
 		input_slabs: vec![input],
 		overlapping_slabs: Vec::new(),
-		retention_floor_snapshot: hlc(100),
+		elision: crate::storage::PlanElision::RetentionFloor(hlc(100)),
 		compaction_start_hlc: hlc(101),
 		dominant_reason: crate::storage::DominantReason::Operator,
 	};
@@ -63730,4 +63731,848 @@ async fn cpu_bound_work_just_runs_on_a_current_thread_runtime() {
 		crate::storage::sweeper::cpu_bound_off_the_runtime_worker(|| 7),
 		7
 	);
+}
+
+// ADR 0703: LSM compaction that elides exactly one certified selection, on a real ring.
+
+/// The identity of the test table's row `id`, as its frame would carry it.
+fn certified_lsm_identity(table: &TableSchemaDescriptor, id_value: i64) -> Identity {
+	let batch = secondary_index_user_batch_for_test(id_value, Some(0));
+	let meta = layout_recluster_meta(table, batch.num_rows());
+	let packed =
+		pack_record_batch_by_bucket(&meta, table, &batch, WriterNodeId::ZERO, hlc(1)).unwrap();
+	storage_multirow_index_entries_from_frame(&packed[0].frame_bytes)
+		.unwrap()
+		.unwrap()[0]
+		.key_identity
+}
+
+/// A contained store on a one-node ring with three sealed L0 runs of one
+/// primary-key table, and generation 1 active:
+/// - k1@10: obsolete (an erased parent's), with identical copies in runs A and B;
+/// - k1@20: its certified winner, in B;
+/// - k2@15: owned by a retained parent, in B;
+/// - k3@12: unlisted, in B;
+/// - k4@11: obsolete, but its stored content will not match its debt, in B;
+/// - k5@13: obsolete, in A and in C, which no job here touches.
+struct CertifiedLsmStore {
+	dir: crate::test_support::TestDir,
+	owner: DataDirectoryOwner,
+	mgr: Arc<SlabManager>,
+	cluster: ControlCluster,
+	plain: Arc<crate::storage::RaftCommitter>,
+	table: TableSchemaDescriptor,
+	keys: [Identity; 5],
+	inputs: [SlabId; 2],
+	outside: SlabId,
+}
+
+const CERTIFIED_LSM_JOB: u64 = 0x0703;
+
+async fn certified_lsm_activate(
+	index: &crate::storage::index::PersistentLocalIndex,
+	gid: u64,
+	winner: Identity,
+	table: TableObjectId,
+) {
+	use crate::storage::index::certified_base::{
+		Activation, BaseEntry, StagedCandidate, chunk_sums,
+	};
+	let winner = BaseEntry {
+		tenant: tenant(),
+		table,
+		key_identity: *winner.as_bytes(),
+		hlc: hlc(20),
+		row_digest: [0x20; 32],
+		tombstone: false,
+		position: 0,
+	};
+	let candidate = StagedCandidate {
+		gid,
+		target_digest: [gid as u8; 32],
+		predecessor_gid: gid - 1,
+		chunks: chunk_sums(&[winner]),
+	};
+	index
+		.stage_base(candidate.clone(), vec![winner])
+		.await
+		.unwrap()
+		.unwrap();
+	index
+		.activate_base(Activation {
+			gid,
+			target_digest: candidate.target_digest,
+			predecessor_gid: gid - 1,
+			chunks: candidate.chunks,
+			t: 8,
+		})
+		.await
+		.unwrap()
+		.unwrap();
+}
+
+async fn certified_lsm_store(tag: &str) -> CertifiedLsmStore {
+	use crate::storage::index::parent_intents::{OwnedVersion, ParentIntent, ParentIntentState};
+	let dir = fresh_dir(tag);
+	let owner = DataDirectoryOwner::acquire_existing(&dir).unwrap();
+	let mgr =
+		SlabManager::initialize_new_store_with_owner(gc_owned_test_config(&dir), owner.clone())
+			.await
+			.unwrap();
+	mgr.contain_version_reclamation();
+	let cluster = control_cluster_observing(&[(1, &mgr)]).await;
+	register_owner(&cluster.nodes[0], &mgr).await;
+	let plain = Arc::new(op_committer(&cluster, 1));
+	let table = secondary_index_table_descriptor_for_test();
+	let keys = [1, 2, 3, 4, 5].map(|id| certified_lsm_identity(&table, id));
+	let index = mgr.persistent_index().unwrap();
+	let owned = |key: Identity, at: u64| OwnedVersion {
+		table: table.table_object_id,
+		key_identity: *key.as_bytes(),
+		hlc: hlc(at),
+		row_digest: [at as u8; 32],
+	};
+	let intent = |rsv: u64, mut manifest: Vec<OwnedVersion>| {
+		// A manifest is canonical: sorted by version.
+		manifest.sort_by_key(|version| (version.table, version.key_identity, version.hlc));
+		ParentIntent {
+			tenant: tenant(),
+			rsv,
+			ordinal: 0,
+			claim_digest: [rsv as u8; 32],
+			range_start: 0,
+			range_end: u64::MAX,
+			content: [9; 32],
+			manifest,
+			state: ParentIntentState::Intent,
+		}
+	};
+	// Owners first, as in the real path: rsv 5 is erased by T = 8, rsv 9 kept.
+	index
+		.begin_parent_intent(intent(
+			5,
+			vec![owned(keys[0], 10), owned(keys[3], 11), owned(keys[4], 13)],
+		))
+		.await
+		.unwrap()
+		.unwrap();
+	index
+		.begin_parent_intent(intent(9, vec![owned(keys[1], 15)]))
+		.await
+		.unwrap()
+		.unwrap();
+	let append = async |id: i64, at: u64| {
+		append_secondary_index_table_row_for_test(&mgr, &table, id, Some(at as i64), hlc(at)).await;
+	};
+	append(1, 10).await;
+	append(5, 13).await;
+	let a = mgr.force_seal_active_for_test().await;
+	append(1, 10).await;
+	append(1, 20).await;
+	append(2, 15).await;
+	append(3, 12).await;
+	append(4, 11).await;
+	let b = mgr.force_seal_active_for_test().await;
+	append(5, 13).await;
+	let outside = mgr.force_seal_active_for_test().await;
+	certified_lsm_activate(&index, 1, keys[0], table.table_object_id).await;
+	CertifiedLsmStore {
+		dir,
+		owner,
+		mgr,
+		cluster,
+		plain,
+		table,
+		keys,
+		inputs: [a, b],
+		outside,
+	}
+}
+
+/// Decides as the data server does, from one read of the facts, with content
+/// evidence supplied by the test: k4's stored content does not match its debt.
+/// Optionally activates another generation right after deciding.
+struct CertifiedLsmTestDecider {
+	mismatched: Identity,
+	activate_after: Option<(u64, Identity, TableObjectId)>,
+	index: Arc<crate::storage::index::PersistentLocalIndex>,
+}
+
+#[async_trait]
+impl crate::storage::manager::certified_lsm::CertifiedLsmDecider for CertifiedLsmTestDecider {
+	async fn decide(
+		&self,
+		job: &crate::storage::manager::certified_lsm::LsmCertifiedJob,
+	) -> std::io::Result<crate::storage::manager::certified_lsm::CertifiedSelection> {
+		use crate::storage::manager::certified_cleanup::{ContentEvidence, StoredCopy};
+		let facts = self.index.version_facts(job.versions()).await?;
+		let mut evidence = Vec::new();
+		for at in 0..facts.candidates().len() {
+			let Some((key, debt)) = &facts.get(at).debt else {
+				continue;
+			};
+			let stored = if key.key_identity == *self.mismatched.as_bytes() {
+				[0xEE; 32]
+			} else {
+				debt.row_digest
+			};
+			evidence.extend(ContentEvidence::check(
+				*key,
+				debt,
+				false,
+				&[StoredCopy {
+					tombstone: false,
+					row_digest: Some(stored),
+				}],
+			));
+		}
+		let selection = crate::storage::manager::certified_lsm::CertifiedSelection::decide(
+			job, &facts, &evidence,
+		)?;
+		if let Some((gid, winner, table)) = self.activate_after {
+			certified_lsm_activate(&self.index, gid, winner, table).await;
+		}
+		Ok(selection)
+	}
+}
+
+impl CertifiedLsmStore {
+	fn plan(&self) -> CompactionPlan {
+		CompactionPlan {
+			job_id: CompactionJobId::new(CERTIFIED_LSM_JOB),
+			source_level: CompactionLevelIndex::L0,
+			target_level: CompactionLevelIndex::L1,
+			manifest_epoch_pre: self.mgr.compaction_manifest_snapshot().manifest_epoch,
+			input_slabs: self.inputs.to_vec(),
+			overlapping_slabs: Vec::new(),
+			// The certified job replaces this: a mode job never runs the floor rule.
+			elision: crate::storage::PlanElision::RetentionFloor(zero_hlc()),
+			compaction_start_hlc: hlc(101),
+			dominant_reason: crate::storage::DominantReason::Operator,
+		}
+	}
+
+	fn decider(&self, activate_after: Option<u64>) -> CertifiedLsmTestDecider {
+		CertifiedLsmTestDecider {
+			mismatched: self.keys[3],
+			activate_after: activate_after
+				.map(|gid| (gid, self.keys[0], self.table.table_object_id)),
+			index: self.mgr.persistent_index().unwrap(),
+		}
+	}
+
+	fn schemas(&self) -> TableSchemaCatalog {
+		let mut schemas = TableSchemaCatalog::default();
+		schemas.upsert(tenant(), self.table.clone()).unwrap();
+		schemas
+	}
+
+	async fn run(
+		&self,
+		activate_after: Option<u64>,
+	) -> Result<crate::storage::lsm::CompactionOutcome, CompactionFailure> {
+		let worker =
+			LsmCompactionWorker::new(LsmConfig::default(), self.mgr.slab_pin_table()).unwrap();
+		self.mgr
+			.run_certified_lsm_plan_for_test(
+				&worker,
+				self.plan(),
+				self.plain.as_ref(),
+				&self.schemas(),
+				&SecondaryIndexCatalog::default(),
+				&self.decider(activate_after),
+			)
+			.await
+	}
+
+	/// Copies of `key` at `at` in this store.
+	fn copies(&self, mgr: &SlabManager, key: usize, at: u64) -> Vec<SlabId> {
+		let mut slabs: Vec<SlabId> = mgr
+			.version_locations(tenant(), self.keys[key], hlc(at))
+			.unwrap()
+			.iter()
+			.map(|location| location.slab_id)
+			.collect();
+		slabs.sort_unstable();
+		slabs
+	}
+
+	/// Every protected version is stored and read exactly; the obsolete ones
+	/// k1@10 and k5@13 are either still in the inputs or gone from them.
+	fn assert_rows(&self, mgr: &SlabManager, elided: bool, what: &str) {
+		let [a, b] = self.inputs;
+		for (key, at, name) in [
+			(0, 20, "the certified winner"),
+			(1, 15, "the retained parent's version"),
+			(2, 12, "the unlisted version"),
+			(3, 11, "the mismatched debt"),
+		] {
+			assert_eq!(self.copies(mgr, key, at).len(), 1, "{what}: {name}");
+		}
+		assert_eq!(
+			mgr.lookup(tenant(), self.keys[0])
+				.unwrap()
+				.map(|location| location.hlc),
+			Some(hlc(20)),
+			"{what}: the winner reads"
+		);
+		if elided {
+			assert!(
+				self.copies(mgr, 0, 10).is_empty(),
+				"{what}: both copies of k1@10 go"
+			);
+			assert!(
+				mgr.lookup_as_of(tenant(), self.keys[0], hlc(15))
+					.unwrap()
+					.is_none(),
+				"{what}: k1@10 reads as gone"
+			);
+			assert_eq!(
+				self.copies(mgr, 4, 13),
+				vec![self.outside],
+				"{what}: k5's outside copy stays"
+			);
+		} else {
+			assert_eq!(
+				self.copies(mgr, 0, 10),
+				vec![a, b],
+				"{what}: k1@10 in both inputs"
+			);
+			assert_eq!(
+				mgr.lookup_as_of(tenant(), self.keys[0], hlc(15))
+					.unwrap()
+					.map(|location| location.hlc),
+				Some(hlc(10)),
+				"{what}: k1@10 reads"
+			);
+			let mut k5 = vec![a, self.outside];
+			k5.sort_unstable();
+			assert_eq!(self.copies(mgr, 4, 13), k5, "{what}: k5@13's copies");
+		}
+	}
+
+	async fn certificates(&self, mgr: &SlabManager) -> usize {
+		mgr.require_op_index()
+			.unwrap()
+			.load_snapshot()
+			.await
+			.unwrap()
+			.lsm_certificates
+			.len()
+	}
+}
+
+/// ADR 0703 acceptance: a certified LSM merge elides exactly the certified
+/// versions. Both identical copies of k1@10 and the input copy of k5@13 go;
+/// the winner, the retained parent's version, the unlisted version and the
+/// mismatched debt stay; reads are exact; and debt retires only where no copy
+/// is left. Distinct versions and rows are reported separately.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_certified_lsm_merge_drops_exactly_the_certified_versions() {
+	let store = certified_lsm_store("adr0703-acceptance").await;
+	store.assert_rows(&store.mgr, false, "before");
+	let outcome = store.run(None).await.unwrap();
+	assert_eq!(outcome.rows_in, 7, "{outcome:?}");
+	assert_eq!(
+		outcome.elided_versions, 3,
+		"two copies of k1@10, one of k5@13"
+	);
+	assert_eq!(outcome.rows_out, 4);
+	store.assert_rows(&store.mgr, true, "after");
+	assert_eq!(
+		store.certificates(&store.mgr).await,
+		0,
+		"cleared with its intent"
+	);
+	let index = store.mgr.persistent_index().unwrap();
+	let debt = index.debt_page(None, 10).await.unwrap();
+	let find = |key: usize| {
+		debt.iter()
+			.find(|(entry, _)| entry.key_identity == *store.keys[key].as_bytes())
+			.cloned()
+			.unwrap()
+	};
+	for (key, retires, name) in [
+		(0, true, "k1@10: no copy left"),
+		(4, false, "k5@13: a copy outside"),
+		(3, false, "k4@11: kept"),
+	] {
+		let (entry, record) = find(key);
+		assert_eq!(
+			index.retire_debt(entry, record).await.unwrap(),
+			retires,
+			"{name}"
+		);
+	}
+	eprintln!("ADR 0703 acceptance: 2 distinct versions elided as 3 rows (7 in, 4 out)");
+	let _ = store.owner.close(Duration::from_secs(2)).await;
+}
+
+/// ADR 0703: an activation between the decision and the install writes no
+/// intent and no certificate; the job abandons with its inputs. Decided again
+/// under the new generation, it elides.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_certified_lsm_job_abandons_when_the_generation_moves_before_its_intent() {
+	let store = certified_lsm_store("adr0703-pre-intent-activation").await;
+	assert!(matches!(
+		store.run(Some(2)).await,
+		Err(CompactionFailure::ManifestRace)
+	));
+	store.assert_rows(&store.mgr, false, "abandoned");
+	let durable = store
+		.mgr
+		.require_op_index()
+		.unwrap()
+		.load_snapshot()
+		.await
+		.unwrap();
+	assert!(durable.lsm_install_intents.is_empty());
+	assert!(durable.lsm_certificates.is_empty());
+	assert!(
+		store
+			.mgr
+			.require_op_index()
+			.unwrap()
+			.load_op_intents()
+			.await
+			.unwrap()
+			.is_empty()
+	);
+	store.run(None).await.unwrap();
+	store.assert_rows(&store.mgr, true, "decided again");
+	let _ = store.owner.close(Duration::from_secs(2)).await;
+}
+
+/// ADR 0703: in mode, the ordinary picker plans nothing and an uncertified plan
+/// is refused before it reads anything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_contained_store_runs_no_ordinary_lsm_plan() {
+	let store = certified_lsm_store("adr0703-ordinary").await;
+	let worker = LsmCompactionWorker::new(
+		LsmConfig {
+			max_l0_slab_count: 1,
+			..LsmConfig::default()
+		},
+		store.mgr.slab_pin_table(),
+	)
+	.unwrap();
+	assert!(
+		store
+			.mgr
+			.pick_lsm_compaction_plan(&worker, hlc(1_000_000))
+			.is_none()
+	);
+	assert!(
+		store
+			.mgr
+			.pick_lsm_plan_excluding(&worker, hlc(1_000_000), &HashSet::new())
+			.is_some(),
+		"premise: a plan is there to pick"
+	);
+	let refused = store
+		.mgr
+		.run_lsm_compaction_once_via_control_ring(&worker, store.plan(), store.plain.as_ref())
+		.await;
+	assert!(
+		matches!(refused, Err(CompactionFailure::IoError(ref error)) if error.kind() == ErrorKind::InvalidInput),
+		"{refused:?}"
+	);
+	store.assert_rows(&store.mgr, false, "nothing ran");
+	let _ = store.owner.close(Duration::from_secs(2)).await;
+}
+
+/// A certified install interrupted at `cut`, optionally after a later
+/// generation activated, and the store reopened, contained, on its ring.
+async fn certified_lsm_reopened_at(
+	cut: lsm_driver::ControlLsmInstallCut,
+	activate_while_held: bool,
+) -> (CertifiedLsmStore, crate::storage::index::LsmInstallIntent) {
+	let store = certified_lsm_store("adr0703-crash").await;
+	let entered = Arc::new(tokio::sync::Semaphore::new(0));
+	let release = Arc::new(tokio::sync::Semaphore::new(0));
+	*store.mgr.lsm_control_install_hold.lock().unwrap() =
+		Some((cut, entered.clone(), release.clone()));
+	let task = {
+		let (mgr, plain, plan, schemas, decider) = (
+			store.mgr.clone(),
+			store.plain.clone(),
+			store.plan(),
+			store.schemas(),
+			store.decider(None),
+		);
+		tokio::spawn(async move {
+			let worker =
+				LsmCompactionWorker::new(LsmConfig::default(), mgr.slab_pin_table()).unwrap();
+			mgr.run_certified_lsm_plan_for_test(
+				&worker,
+				plan,
+				plain.as_ref(),
+				&schemas,
+				&SecondaryIndexCatalog::default(),
+				&decider,
+			)
+			.await
+		})
+	};
+	let mut task = task;
+	tokio::select! {
+		reached = entered.acquire() => reached.unwrap().forget(),
+		result = &mut task => panic!("the install returned before {cut:?}: {result:?}"),
+		_ = tokio::time::sleep(Duration::from_secs(60)) => panic!("the install never reached {cut:?}"),
+	}
+	let index = store.mgr.require_op_index().unwrap();
+	let durable = index.load_snapshot().await.unwrap();
+	let intent = durable.lsm_install_intents[0].clone();
+	assert_eq!(
+		durable.lsm_certificates.len(),
+		1,
+		"{cut:?}: written with its intent"
+	);
+	if activate_while_held {
+		certified_lsm_activate(&index, 2, store.keys[0], store.table.table_object_id).await;
+	}
+	task.abort();
+	let _ = task.await;
+	drop(release);
+	let CertifiedLsmStore {
+		dir,
+		owner,
+		mgr,
+		cluster,
+		plain,
+		table,
+		keys,
+		inputs,
+		outside,
+	} = store;
+	drop(mgr);
+	let _ = owner.close(Duration::from_secs(5)).await;
+	let next = DataDirectoryOwner::acquire_existing(&dir).expect("released");
+	let mgr = SlabManager::open_with_owner(gc_owned_test_config(&dir), next.clone())
+		.await
+		.unwrap();
+	mgr.contain_version_reclamation();
+	mgr.bind_control_node(1).unwrap();
+	mgr.bind_canonical_tier_source(cluster.state_machines[0].tier_snapshot_source_for_test());
+	(
+		CertifiedLsmStore {
+			dir,
+			owner: next,
+			mgr,
+			cluster,
+			plain,
+			table,
+			keys,
+			inputs,
+			outside,
+		},
+		intent,
+	)
+}
+
+impl CertifiedLsmStore {
+	async fn drive_until_done(&self, label: &str) {
+		let driver = op_driver(&self.cluster, &self.mgr, self.plain.clone());
+		let mut last = Ok(());
+		for _ in 0..16 {
+			last = driver.drive_once().await;
+			let rows = self
+				.mgr
+				.require_op_index()
+				.unwrap()
+				.load_op_intents()
+				.await
+				.unwrap();
+			if rows.is_empty() && self.mgr.tier_authority_readiness_reason().is_none() {
+				return;
+			}
+		}
+		panic!(
+			"{label}: {last:?}, reason {:?}",
+			self.mgr.tier_authority_readiness_reason()
+		);
+	}
+
+	/// One pass refuses with the install's row, intent and certificate kept.
+	async fn assert_recovery_fences(&self, label: &str) {
+		let index = self.mgr.require_op_index().unwrap();
+		let rows = index.load_op_intents().await.unwrap();
+		let driver = op_driver(&self.cluster, &self.mgr, self.plain.clone());
+		assert_eq!(
+			driver.drive_once().await.unwrap_err().kind(),
+			ErrorKind::WouldBlock,
+			"{label}"
+		);
+		assert_eq!(index.load_op_intents().await.unwrap(), rows, "{label}");
+		assert_eq!(
+			index
+				.load_snapshot()
+				.await
+				.unwrap()
+				.lsm_install_intents
+				.len(),
+			1,
+			"{label}"
+		);
+	}
+}
+
+/// ADR 0703 crash controls: at each install boundary, reopened on the ring that
+/// outlived it. An undecided install is Cancelled and its inputs serve; an
+/// applied one publishes exactly its certified postimage. With a later
+/// generation activated after the intent too: the recorded outcome and
+/// certificate decide, never a new selection. The certificate goes with its
+/// intent either way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_certified_lsm_install_recovers_at_each_boundary_by_its_certificate() {
+	use lsm_driver::ControlLsmInstallCut as Cut;
+	for activate in [false, true] {
+		for (cut, applied) in [
+			(Cut::BeforeRename, false),
+			(Cut::AfterRename, false),
+			(Cut::AfterAcceptance, true),
+			(Cut::AfterPublication, true),
+		] {
+			let label = format!("{cut:?}, later generation {activate}");
+			let (store, _intent) = certified_lsm_reopened_at(cut, activate).await;
+			store.drive_until_done(&label).await;
+			store.assert_rows(&store.mgr, applied, &label);
+			let durable = store
+				.mgr
+				.require_op_index()
+				.unwrap()
+				.load_snapshot()
+				.await
+				.unwrap();
+			assert!(durable.lsm_install_intents.is_empty(), "{label}");
+			assert!(durable.lsm_certificates.is_empty(), "{label}");
+			let _ = store.owner.close(Duration::from_secs(2)).await;
+		}
+	}
+}
+
+/// ADR 0703 R1/R2: an applied, unpublished certified install whose recorded
+/// drop is not what its outputs leave out, or that lost its certificate in a
+/// contained store, fences with its evidence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_certified_lsm_install_without_its_exact_certificate_fences() {
+	for tamper in ["count", "digest", "missing"] {
+		let (store, intent) =
+			certified_lsm_reopened_at(lsm_driver::ControlLsmInstallCut::AfterAcceptance, false)
+				.await;
+		let index = store.mgr.require_op_index().unwrap();
+		let job = intent.commit.job_id.get();
+		let mut certificate = index
+			.load_snapshot()
+			.await
+			.unwrap()
+			.lsm_certificate(&intent)
+			.cloned()
+			.expect("its certificate");
+		let replacement = match tamper {
+			"count" => {
+				certificate.drop_count += 1;
+				Some(certificate)
+			}
+			"digest" => {
+				certificate.drop_digest[0] ^= 1;
+				Some(certificate)
+			}
+			_ => None,
+		};
+		index
+			.put_lsm_certificate_raw_for_test(job, replacement)
+			.await;
+		store.assert_recovery_fences(tamper).await;
+		// Fenced, the store serves nothing; durably, every input row stands.
+		let durable = index.load_snapshot().await.unwrap();
+		assert_eq!(
+			durable
+				.record_rows
+				.iter()
+				.filter(|row| store.inputs.contains(&row.location.slab_id))
+				.count(),
+			7,
+			"{tamper}: the inputs' rows"
+		);
+		let _ = store.owner.close(Duration::from_secs(2)).await;
+	}
+}
+
+/// ADR 0703 Q2: a certificate whose intent is gone fences certified LSM at the
+/// next open, and the job id is not reused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_orphan_lsm_certificate_fences_certified_lsm_at_open() {
+	let store = certified_lsm_store("adr0703-orphan").await;
+	store
+		.mgr
+		.persistent_index()
+		.unwrap()
+		.put_lsm_certificate_raw_for_test(
+			0xdead,
+			Some(crate::storage::index::LsmCertificate {
+				job_fingerprint: [1; 32],
+				active_gid: 1,
+				drop_digest: [2; 32],
+				drop_rows_digest: [3; 32],
+				drop_count: 1,
+				intent_binding: [4; 32],
+			}),
+		)
+		.await;
+	assert!(!store.mgr.certified_lsm_fenced_for_test());
+	let CertifiedLsmStore {
+		dir, owner, mgr, ..
+	} = store;
+	drop(mgr);
+	let _ = owner.close(Duration::from_secs(5)).await;
+	let next = DataDirectoryOwner::acquire_existing(&dir).unwrap();
+	let mgr = SlabManager::open_with_owner(gc_owned_test_config(&dir), next.clone())
+		.await
+		.unwrap();
+	assert!(mgr.certified_lsm_fenced_for_test());
+	assert_eq!(
+		mgr.require_op_index()
+			.unwrap()
+			.load_snapshot()
+			.await
+			.unwrap()
+			.lsm_certificates
+			.len(),
+		1,
+		"never cleared automatically"
+	);
+	let _ = next.close(Duration::from_secs(2)).await;
+}
+
+/// ADR 0703 R1: a frame's table stamp is read as typed, untyped or malformed,
+/// and a decoding error is never read as the absence of a stamp. Only a frame
+/// that is not multi-row, or has no table column, is untyped.
+#[test]
+fn a_frames_table_stamp_is_typed_untyped_or_malformed() {
+	use crate::storage::manager::certified_lsm::{FrameTable, frame_table_of};
+	let table = TableObjectId::new([0x79; 16]);
+	let row = RecordRowIndex::new(0);
+	let typed = encode_test_append_only_storage_frame(
+		table,
+		&[(id(0x7901), Locality::new(1), hlc(1), 1, false)],
+	);
+	assert_eq!(frame_table_of(&typed, row), FrameTable::Stamped(table));
+	assert_eq!(
+		frame_table_of(b"a single-row frame", row),
+		FrameTable::Untyped
+	);
+	// The same multi-row frame with its table column of the wrong Arrow type.
+	let wrong_type = {
+		let mut hlcs = FixedSizeBinaryBuilder::with_capacity(1, 16);
+		hlcs.append_value(test_hlc_storage_bytes(hlc(1))).unwrap();
+		let mut keys = FixedSizeBinaryBuilder::with_capacity(1, 32);
+		keys.append_value(id(0x7901).as_bytes()).unwrap();
+		let schema = Arc::new(Schema::new(vec![
+			Field::new("value", DataType::UInt64, false),
+			Field::new(STORAGE_ROW_HLC_COLUMN, DataType::FixedSizeBinary(16), false),
+			Field::new(
+				STORAGE_ROW_KEY_ID_COLUMN,
+				DataType::FixedSizeBinary(32),
+				false,
+			),
+			Field::new(STORAGE_ROW_ROUTING_LOCALITY_COLUMN, DataType::UInt64, false),
+			Field::new(STORAGE_ROW_TABLE_OBJECT_ID_COLUMN, DataType::UInt64, false),
+			Field::new(STORAGE_ROW_TOMBSTONE_COLUMN, DataType::Boolean, false),
+		]));
+		let batch = RecordBatch::try_new(
+			schema,
+			vec![
+				Arc::new(UInt64Array::from(vec![1_u64])) as Arc<dyn Array>,
+				Arc::new(hlcs.finish()) as Arc<dyn Array>,
+				Arc::new(keys.finish()) as Arc<dyn Array>,
+				Arc::new(UInt64Array::from(vec![1_u64])) as Arc<dyn Array>,
+				Arc::new(UInt64Array::from(vec![7_u64])) as Arc<dyn Array>,
+				Arc::new(BooleanArray::from(vec![false])) as Arc<dyn Array>,
+			],
+		)
+		.unwrap();
+		encode_test_batch(&batch)
+	};
+	assert_eq!(frame_table_of(&wrong_type, row), FrameTable::Malformed);
+}
+
+/// ADR 0703 R2: open knows the durable mode before it reconciles anything. A
+/// completed certified install whose intent names no operation and whose
+/// certificate is gone: in a marked (ParentDecisions) store it stays fenced,
+/// as a Control intent and as a Local one; in an unmarked (Today) store the
+/// same Control intent reconciles as before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_marked_store_keeps_an_uncertified_completed_install_fenced_at_open() {
+	use crate::storage::index::LsmInstallKind;
+	for (marked, kind) in [
+		(true, LsmInstallKind::Control),
+		(true, LsmInstallKind::Local),
+		(false, LsmInstallKind::Control),
+	] {
+		let label = format!("marked {marked}, {kind:?}");
+		let (store, _) =
+			certified_lsm_reopened_at(lsm_driver::ControlLsmInstallCut::AfterPublication, false)
+				.await;
+		let index = store.mgr.persistent_index().unwrap();
+		let durable = index.load_snapshot().await.unwrap();
+		let intent = durable.lsm_install_intents[0].clone();
+		// Premise: its outputs are durably published (the cut is after
+		// publication); the crafted intent says so.
+		assert!(
+			intent.commit.slabs_to_add.iter().all(|add| durable
+				.lsm_runs
+				.iter()
+				.any(|run| run.slab_id == add.slab_id && run.state.is_live())),
+			"{label}: premise"
+		);
+		// Clearing the intent clears its certificate; it returns with no
+		// operation linked and none.
+		index
+			.clear_lsm_install_intent(intent.clone())
+			.await
+			.unwrap();
+		let mut crafted = intent;
+		crafted.ops.clear();
+		crafted.kind = kind;
+		crafted.phase = crate::storage::index::LsmInstallPhase::OutputsPublished;
+		index.put_lsm_install_intent(crafted).await.unwrap();
+		assert!(
+			index
+				.load_snapshot()
+				.await
+				.unwrap()
+				.lsm_certificates
+				.is_empty(),
+			"{label}"
+		);
+		let CertifiedLsmStore {
+			dir, owner, mgr, ..
+		} = store;
+		drop(index);
+		drop(mgr);
+		let _ = owner.close(Duration::from_secs(5)).await;
+		if marked {
+			crate::consensus::decision_mode::write_mode_marker_for_test(&dir);
+		}
+		let next = DataDirectoryOwner::acquire_existing(&dir).unwrap();
+		let reopened = SlabManager::open_with_owner(gc_owned_test_config(&dir), next.clone())
+			.await
+			.unwrap();
+		assert_eq!(reopened.versions_contained(), marked, "{label}");
+		let intents = reopened
+			.require_op_index()
+			.unwrap()
+			.load_snapshot()
+			.await
+			.unwrap()
+			.lsm_install_intents
+			.len();
+		assert_eq!(
+			intents,
+			usize::from(marked),
+			"{label}: kept only where marked"
+		);
+		let _ = next.close(Duration::from_secs(2)).await;
+	}
 }

@@ -296,7 +296,7 @@ async fn lsm_version_entries_for_plan_come_from_manager_key_index() {
 		manifest_epoch_pre: snapshot.manifest_epoch,
 		input_slabs: vec![input.slab_id],
 		overlapping_slabs: Vec::new(),
-		retention_floor_snapshot: hlc(100),
+		elision: wendelon::storage::PlanElision::RetentionFloor(hlc(100)),
 		compaction_start_hlc: hlc(101),
 		dominant_reason: DominantReason::LevelSize,
 	};
@@ -351,7 +351,7 @@ async fn manager_prepares_lsm_outputs_from_extracted_entries_and_reserved_ids() 
 		manifest_epoch_pre: snapshot.manifest_epoch,
 		input_slabs: vec![input.slab_id],
 		overlapping_slabs: Vec::new(),
-		retention_floor_snapshot: hlc(100),
+		elision: wendelon::storage::PlanElision::RetentionFloor(hlc(100)),
 		compaction_start_hlc: hlc(101),
 		dominant_reason: DominantReason::LevelSize,
 	};
@@ -417,7 +417,7 @@ async fn manager_reads_lsm_single_row_source_frames_for_plan() {
 		manifest_epoch_pre: snapshot.manifest_epoch,
 		input_slabs: vec![input.slab_id],
 		overlapping_slabs: Vec::new(),
-		retention_floor_snapshot: hlc(100),
+		elision: wendelon::storage::PlanElision::RetentionFloor(hlc(100)),
 		compaction_start_hlc: hlc(101),
 		dominant_reason: DominantReason::LevelSize,
 	};
@@ -473,7 +473,7 @@ async fn manager_writes_lsm_temp_output_slabs_without_installing_them() {
 		manifest_epoch_pre: snapshot.manifest_epoch,
 		input_slabs: vec![input.slab_id],
 		overlapping_slabs: Vec::new(),
-		retention_floor_snapshot: hlc(100),
+		elision: wendelon::storage::PlanElision::RetentionFloor(hlc(100)),
 		compaction_start_hlc: hlc(101),
 		dominant_reason: DominantReason::LevelSize,
 	};
@@ -591,7 +591,7 @@ async fn manager_installs_lsm_temp_outputs_into_manifest_and_lookup_index() {
 		manifest_epoch_pre: snapshot.manifest_epoch,
 		input_slabs: vec![input.slab_id],
 		overlapping_slabs: Vec::new(),
-		retention_floor_snapshot: hlc(100),
+		elision: wendelon::storage::PlanElision::RetentionFloor(hlc(100)),
 		compaction_start_hlc: hlc(101),
 		dominant_reason: DominantReason::LevelSize,
 	};
@@ -696,7 +696,7 @@ async fn manager_runs_single_lsm_compaction_job_end_to_end() {
 		manifest_epoch_pre: snapshot.manifest_epoch,
 		input_slabs: vec![input.slab_id],
 		overlapping_slabs: Vec::new(),
-		retention_floor_snapshot: hlc(200),
+		elision: wendelon::storage::PlanElision::RetentionFloor(hlc(200)),
 		compaction_start_hlc: hlc(201),
 		dominant_reason: DominantReason::LevelSize,
 	};
@@ -769,7 +769,7 @@ async fn manager_runs_lsm_compaction_job_through_control_ring_committer() {
 		manifest_epoch_pre: snapshot.manifest_epoch,
 		input_slabs: vec![input.slab_id],
 		overlapping_slabs: Vec::new(),
-		retention_floor_snapshot: hlc(200),
+		elision: wendelon::storage::PlanElision::RetentionFloor(hlc(200)),
 		compaction_start_hlc: hlc(201),
 		dominant_reason: DominantReason::LevelSize,
 	};
@@ -934,7 +934,7 @@ async fn manager_reopens_with_persisted_lsm_manifest_filtering_retired_inputs() 
 		manifest_epoch_pre: snapshot.manifest_epoch,
 		input_slabs: vec![input.slab_id],
 		overlapping_slabs: Vec::new(),
-		retention_floor_snapshot: hlc(200),
+		elision: wendelon::storage::PlanElision::RetentionFloor(hlc(200)),
 		compaction_start_hlc: hlc(201),
 		dominant_reason: DominantReason::LevelSize,
 	};
@@ -1026,7 +1026,7 @@ async fn manager_install_rejects_bad_digest_before_manifest_apply() {
 		manifest_epoch_pre: snapshot.manifest_epoch,
 		input_slabs: vec![input.slab_id],
 		overlapping_slabs: Vec::new(),
-		retention_floor_snapshot: hlc(200),
+		elision: wendelon::storage::PlanElision::RetentionFloor(hlc(200)),
 		compaction_start_hlc: hlc(201),
 		dominant_reason: DominantReason::LevelSize,
 	};
@@ -1114,7 +1114,7 @@ async fn manager_install_rejects_explicit_lsm_sidecar_swaps() {
 		manifest_epoch_pre: snapshot.manifest_epoch,
 		input_slabs: vec![input.slab_id],
 		overlapping_slabs: Vec::new(),
-		retention_floor_snapshot: hlc(200),
+		elision: wendelon::storage::PlanElision::RetentionFloor(hlc(200)),
 		compaction_start_hlc: hlc(201),
 		dominant_reason: DominantReason::LevelSize,
 	};
@@ -1196,7 +1196,7 @@ async fn manager_removes_lsm_temp_output_on_missing_source_frame() {
 		manifest_epoch_pre: snapshot.manifest_epoch,
 		input_slabs: vec![input.slab_id],
 		overlapping_slabs: Vec::new(),
-		retention_floor_snapshot: hlc(100),
+		elision: wendelon::storage::PlanElision::RetentionFloor(hlc(100)),
 		compaction_start_hlc: hlc(101),
 		dominant_reason: DominantReason::LevelSize,
 	};
@@ -1473,7 +1473,7 @@ async fn manager_lsm_gc_lifecycle_commits_through_control_ring() {
 		manifest_epoch_pre: snapshot.manifest_epoch,
 		input_slabs: vec![input.slab_id],
 		overlapping_slabs: Vec::new(),
-		retention_floor_snapshot: hlc(100),
+		elision: wendelon::storage::PlanElision::RetentionFloor(hlc(100)),
 		compaction_start_hlc: hlc(101),
 		dominant_reason: DominantReason::LevelSize,
 	};

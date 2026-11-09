@@ -239,7 +239,7 @@ impl LsmCompactionWorker {
 					"invalid compaction output target level",
 				)
 			})?;
-		let decisions = apply_elision(records, plan.retention_floor_snapshot);
+		let decisions = apply_elision(records, &plan.elision);
 		let output_runs = plan_output_runs(
 			survivor_records(&decisions),
 			plan.target_level,

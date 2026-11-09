@@ -26,7 +26,7 @@ fn plan() -> CompactionPlan {
 		manifest_epoch_pre: ManifestEpoch::new(5),
 		input_slabs: vec![SlabId::new(3), SlabId::new(1)],
 		overlapping_slabs: vec![SlabId::new(2), SlabId::new(3)],
-		retention_floor_snapshot: hlc(0),
+		elision: wendelon::storage::PlanElision::RetentionFloor(hlc(0)),
 		compaction_start_hlc: hlc(10),
 		dominant_reason: DominantReason::LevelSize,
 	}
@@ -167,7 +167,7 @@ fn compaction_worker_plans_survivor_outputs_with_configured_target_size() {
 	)
 	.unwrap();
 	let mut plan = plan();
-	plan.retention_floor_snapshot = hlc(25);
+	plan.elision = wendelon::storage::PlanElision::RetentionFloor(hlc(25));
 
 	let prepared = worker
 		.plan_survivor_outputs(

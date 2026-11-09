@@ -21,7 +21,7 @@ use crate::schema::{
 /// older binaries do not read it, and for them that record is the boundary.
 const MODE_MARKER: &str = "PARENT_DECISIONS";
 const MODE_MARKER_TMP: &str = ".PARENT_DECISIONS.tmp";
-const MODE_MARKER_BYTES: &[u8] = b"parent-decisions-v6\n";
+const MODE_MARKER_BYTES: &[u8] = b"parent-decisions-v7\n";
 /// S1's development marker. Its stores hold format-9 records, whose bodies were
 /// today's; no conversion exists, so both authorities refuse it as malformed.
 #[cfg(test)]
@@ -42,6 +42,11 @@ const RETIRED_MARKER_BYTES_V4: &[u8] = b"parent-decisions-v4\n";
 /// untouched v5 store stays readable by its own binary.
 #[cfg(test)]
 const RETIRED_MARKER_BYTES_V5: &[u8] = b"parent-decisions-v5\n";
+/// ADR 0701 to ADR 0702's marker, for stores whose LSM installs carry no
+/// certificates (ADR 0703). A pre-0703 binary refuses the v7 marker, so it never
+/// recovers a certified install; this binary refuses v6 like the earlier ones.
+#[cfg(test)]
+const RETIRED_MARKER_BYTES_V6: &[u8] = b"parent-decisions-v6\n";
 
 /// Today's HRFT envelope version, which every other frame uses.
 pub(crate) const RAFT_FRAME_VERSION_TODAY: u8 = 1;
@@ -218,6 +223,19 @@ impl DecisionMode {
 		}
 		write_marker(data_dir)
 	}
+}
+
+/// ADR 0703: whether `data_dir` is durably a ParentDecisions store, read by the
+/// slab store's open before it reconciles any install. A marker it cannot
+/// read refuses; it is never taken for Today.
+pub(crate) fn store_is_marked(data_dir: &Path) -> std::io::Result<bool> {
+	read_marker(data_dir)
+}
+
+/// Test-only: marks `data_dir` as a ParentDecisions store.
+#[cfg(test)]
+pub(crate) fn write_mode_marker_for_test(data_dir: &Path) {
+	write_marker(data_dir).unwrap();
 }
 
 /// `Ok(true)` only for a regular file with exactly the expected bytes. Absence is
@@ -464,6 +482,7 @@ mod tests {
 			("s3-v3", 6),
 			("s4b-v4", 7),
 			("adr0700-v5", 8),
+			("adr0702-v6", 9),
 			("directory", 2),
 			("symlink", 3),
 		] {
@@ -471,12 +490,13 @@ mod tests {
 			let marker = dir.join(MODE_MARKER);
 			match make {
 				0 => fs::write(&marker, b"").unwrap(),
-				1 => fs::write(&marker, b"parent-decisions-v7\n").unwrap(),
+				1 => fs::write(&marker, b"parent-decisions-v8\n").unwrap(),
 				4 => fs::write(&marker, RETIRED_MARKER_BYTES_V1).unwrap(),
 				5 => fs::write(&marker, RETIRED_MARKER_BYTES_V2).unwrap(),
 				6 => fs::write(&marker, RETIRED_MARKER_BYTES_V3).unwrap(),
 				7 => fs::write(&marker, RETIRED_MARKER_BYTES_V4).unwrap(),
 				8 => fs::write(&marker, RETIRED_MARKER_BYTES_V5).unwrap(),
+				9 => fs::write(&marker, RETIRED_MARKER_BYTES_V6).unwrap(),
 				2 => fs::create_dir(&marker).unwrap(),
 				_ => {
 					fs::write(dir.join("target"), MODE_MARKER_BYTES).unwrap();

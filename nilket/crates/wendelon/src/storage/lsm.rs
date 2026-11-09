@@ -144,7 +144,18 @@ impl LsmRunSummary {
 	}
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// Which versions a compaction job elides. A job carries exactly one, read by
+/// every phase: planning, sizing, verification and the bridge's own check.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PlanElision {
+	/// ADR 055's lifecycle rule against a retention floor.
+	RetentionFloor(HybridTimestamp),
+	/// ADR 0703: in ParentDecisions mode, exactly the versions one certified
+	/// selection names, captured once for this job. No floor exists.
+	Certified(Arc<crate::storage::manager::certified_lsm::CertifiedSelection>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompactionPlan {
 	pub job_id: CompactionJobId,
 	pub source_level: CompactionLevelIndex,
@@ -152,7 +163,7 @@ pub struct CompactionPlan {
 	pub manifest_epoch_pre: ManifestEpoch,
 	pub input_slabs: Vec<SlabId>,
 	pub overlapping_slabs: Vec<SlabId>,
-	pub retention_floor_snapshot: HybridTimestamp,
+	pub elision: PlanElision,
 	pub compaction_start_hlc: HybridTimestamp,
 	pub dominant_reason: DominantReason,
 }
@@ -209,6 +220,8 @@ pub enum DropReason {
 	PkPrefix,
 	MigratedRange,
 	EmptyRun,
+	/// ADR 0703: named by the job's certified selection.
+	Certified,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -501,6 +514,32 @@ fn push_planned_output_run(
 /// from slab views; this function intentionally materializes and groups one
 /// compaction plan's version entries.
 pub fn apply_elision(
+	records: impl IntoIterator<Item = VersionEntry>,
+	elision: &PlanElision,
+) -> Vec<SurvivorOrDrop> {
+	match elision {
+		PlanElision::RetentionFloor(floor) => apply_floor_elision(records, *floor),
+		PlanElision::Certified(selection) => {
+			let mut ordered = records.into_iter().collect::<Vec<_>>();
+			ordered.sort_by_key(VersionEntry::merge_key);
+			ordered
+				.into_iter()
+				.map(|record| {
+					if selection.selects(&record) {
+						SurvivorOrDrop::Drop {
+							record,
+							reason: DropReason::Certified,
+						}
+					} else {
+						SurvivorOrDrop::Survivor(record)
+					}
+				})
+				.collect()
+		}
+	}
+}
+
+fn apply_floor_elision(
 	records: impl IntoIterator<Item = VersionEntry>,
 	retention_floor: HybridTimestamp,
 ) -> Vec<SurvivorOrDrop> {
@@ -910,7 +949,7 @@ fn pick_l0_compaction(
 		manifest_epoch_pre: manifest.manifest_epoch,
 		input_slabs: l0.into_iter().map(|run| run.slab_id).collect(),
 		overlapping_slabs: overlaps.into_iter().map(|run| run.slab_id).collect(),
-		retention_floor_snapshot: zero_hlc(),
+		elision: PlanElision::RetentionFloor(zero_hlc()),
 		compaction_start_hlc: now,
 		dominant_reason: DominantReason::LevelSize,
 	})
@@ -961,7 +1000,7 @@ fn pick_level_pressure_compaction(
 			manifest_epoch_pre: manifest.manifest_epoch,
 			input_slabs: vec![source.slab_id],
 			overlapping_slabs: overlaps.into_iter().map(|run| run.slab_id).collect(),
-			retention_floor_snapshot: zero_hlc(),
+			elision: PlanElision::RetentionFloor(zero_hlc()),
 			compaction_start_hlc: now,
 			dominant_reason: source.dominant_reason(true),
 		};

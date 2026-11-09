@@ -156,6 +156,22 @@ pub struct CoherentFacts {
 	facts: Vec<VersionFacts>,
 }
 
+#[cfg(test)]
+impl CoherentFacts {
+	/// Test-only: facts as one read would return them, for a pure decision.
+	pub(crate) fn for_test(
+		active_gid: u64,
+		candidates: Vec<VersionRef>,
+		facts: Vec<VersionFacts>,
+	) -> Self {
+		Self {
+			active_gid,
+			candidates,
+			facts,
+		}
+	}
+}
+
 impl CoherentFacts {
 	/// The active generation the transaction saw.
 	pub fn active_gid(&self) -> u64 {
@@ -276,6 +292,11 @@ pub struct Activation {
 	/// Every parent reserved at or before this was erased: its intents and
 	/// owner entries are retired with the activation.
 	pub t: u64,
+}
+
+/// ADR 0703: the active generation, read in the caller's write transaction.
+pub(super) fn active_gid_in(tx: &redb::WriteTransaction) -> std::io::Result<u64> {
+	Ok(read_meta(&tx.open_table(BASE_META_TABLE).map_err(redb_to_io)?)?.active_gid)
 }
 
 fn read_meta(table: &impl ReadableTable<&'static str, &'static [u8]>) -> std::io::Result<BaseMeta> {

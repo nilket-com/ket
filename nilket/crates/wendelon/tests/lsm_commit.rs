@@ -50,7 +50,7 @@ fn plan() -> CompactionPlan {
 		manifest_epoch_pre: ManifestEpoch::new(10),
 		input_slabs: vec![SlabId::new(1)],
 		overlapping_slabs: vec![SlabId::new(2)],
-		retention_floor_snapshot: hlc(0),
+		elision: wendelon::storage::PlanElision::RetentionFloor(hlc(0)),
 		compaction_start_hlc: hlc(100),
 		dominant_reason: DominantReason::LevelSize,
 	}

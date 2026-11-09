@@ -46,6 +46,7 @@ const DEFERRED_RETIREMENTS_TABLE: TableDefinition<u64, &[u8]> =
 const LSM_INSTALL_INTENTS_TABLE: TableDefinition<u64, &[u8]> =
 	TableDefinition::new("lsm_install_intents_v1");
 const META_LSM_INSTALL_INTENTS_INITIALIZED: &str = "lsm_install_intents_initialized_v1";
+const META_LSM_CERTIFICATES_INITIALIZED: &str = "lsm_certified_selections_initialized_v1";
 
 /// ADR 0097 decision 4: durable evidence of deterministic maintenance failures.
 ///
@@ -498,6 +499,8 @@ pub(crate) fn delete_maintenance_receipt_table_for_test(path: &Path) {
 }
 const META_LAST_CONTROL_LOG_INDEX: &str = "last_control_log_index";
 pub(crate) mod certified_base;
+mod lsm_certificate;
+pub(crate) use lsm_certificate::{LsmCertificate, intent_binding};
 /// The store's incarnation, written once by fresh initialization and never
 /// rewritten. Its absence on open means the store predates slab identity.
 mod op_state;
@@ -777,7 +780,20 @@ pub(crate) struct PersistentIndexSnapshot {
 	pub lsm_runs: Vec<LsmRunSummary>,
 	pub lsm_manifest_epoch_floor: crate::schema::ManifestEpoch,
 	pub lsm_install_intents: Vec<LsmInstallIntent>,
+	/// ADR 0703: certified installs' certificates, by job.
+	pub lsm_certificates: Vec<(u64, LsmCertificate)>,
 	pub last_control_log_index: Option<u64>,
+}
+
+impl PersistentIndexSnapshot {
+	/// ADR 0703: the certificate of `intent`'s job, if any.
+	pub(crate) fn lsm_certificate(&self, intent: &LsmInstallIntent) -> Option<&LsmCertificate> {
+		let job = intent.commit.job_id.get();
+		self.lsm_certificates
+			.iter()
+			.find(|(certified, _)| *certified == job)
+			.map(|(_, certificate)| certificate)
+	}
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1344,6 +1360,31 @@ impl PersistentLocalIndex {
 						.map_err(redb_to_io)?;
 				}
 			}
+			// ADR 0703: the same for certified installs' certificates.
+			{
+				let mut meta = write_txn.open_table(META_TABLE).map_err(redb_to_io)?;
+				let initialized = meta
+					.get(META_LSM_CERTIFICATES_INITIALIZED)
+					.map_err(redb_to_io)?
+					.is_some();
+				let present = write_txn
+					.list_tables()
+					.map_err(redb_to_io)?
+					.any(|table| table.name() == lsm_certificate::LSM_CERTIFICATES_TABLE.name());
+				if initialized && !present {
+					return Err(std::io::Error::new(
+						std::io::ErrorKind::InvalidData,
+						"LSM certificate authority is missing",
+					));
+				}
+				if !initialized {
+					let _table = write_txn
+						.open_table(lsm_certificate::LSM_CERTIFICATES_TABLE)
+						.map_err(redb_to_io)?;
+					meta.insert(META_LSM_CERTIFICATES_INITIALIZED, &1u64)
+						.map_err(redb_to_io)?;
+				}
+			}
 			// ADR 0097: create the receipt table ONLY on a store that has never had
 			// one, and record that fact durably in the same transaction. On a store
 			// whose marker is set, a missing table means history was lost, and the
@@ -1694,6 +1735,11 @@ impl PersistentLocalIndex {
 					}
 					lsm_install_intents.push(intent);
 				}
+				let lsm_certificates = lsm_certificate::read_certificates(
+					&read_txn
+						.open_table(lsm_certificate::LSM_CERTIFICATES_TABLE)
+						.map_err(redb_to_io)?,
+				)?;
 				let meta_table = read_txn.open_table(META_TABLE).map_err(redb_to_io)?;
 				let last_control_log_index = meta_table
 					.get(META_LAST_CONTROL_LOG_INDEX)
@@ -1717,6 +1763,7 @@ impl PersistentLocalIndex {
 					lsm_runs,
 					lsm_manifest_epoch_floor,
 					lsm_install_intents,
+					lsm_certificates,
 					last_control_log_index,
 				})
 			})
@@ -1786,6 +1833,7 @@ impl PersistentLocalIndex {
 					}
 					table.remove(&job).map_err(redb_to_io)?;
 				}
+				lsm_certificate::remove_certificate_of(&tx, &intent)?;
 				tx.commit().map_err(redb_to_io)
 			})
 			.await

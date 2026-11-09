@@ -9722,6 +9722,8 @@ fn adr078_manager_source_concatenates_submodules() {
 			"backing_install.rs",
 			// ADR 0699 S5b: the certified cleanup rewrite.
 			"certified_cleanup.rs",
+			// ADR 0703: LSM compaction that elides one certified selection.
+			"certified_lsm.rs",
 			"compaction.rs",
 			"counter_visibility.rs",
 			// ADR 0696 (0692 §7): disposal evidence for typed Superseded after disposal.

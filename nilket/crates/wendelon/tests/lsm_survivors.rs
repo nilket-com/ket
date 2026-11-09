@@ -66,7 +66,7 @@ fn drops(outcome: &[SurvivorOrDrop]) -> Vec<(u64, DropReason)> {
 fn append_only_row_below_floor_drops() {
 	let outcome = apply_elision(
 		[version(1, 10, 0, false, VersionLifecycle::AppendOnly)],
-		hlc(20),
+		&wendelon::storage::PlanElision::RetentionFloor(hlc(20)),
 	);
 
 	assert_eq!(survivors(&outcome), Vec::<u64>::new());
@@ -80,7 +80,7 @@ fn append_only_data_tombstone_pair_drops_only_when_delete_is_below_floor() {
 			version(1, 10, 0, false, VersionLifecycle::AppendOnly),
 			version(1, 20, 0, true, VersionLifecycle::AppendOnly),
 		],
-		hlc(30),
+		&wendelon::storage::PlanElision::RetentionFloor(hlc(30)),
 	);
 	assert_eq!(
 		drops(&below_delete),
@@ -95,7 +95,7 @@ fn append_only_data_tombstone_pair_drops_only_when_delete_is_below_floor() {
 			version(1, 10, 0, false, VersionLifecycle::AppendOnly),
 			version(1, 40, 0, true, VersionLifecycle::AppendOnly),
 		],
-		hlc(30),
+		&wendelon::storage::PlanElision::RetentionFloor(hlc(30)),
 	);
 	assert_eq!(survivors(&above_delete), vec![10, 40]);
 	assert!(drops(&above_delete).is_empty());
@@ -110,7 +110,7 @@ fn primary_key_chain_retains_above_floor_and_newest_below_floor_boundary() {
 			version(1, 30, 0, false, VersionLifecycle::PrimaryKey),
 			version(1, 40, 0, false, VersionLifecycle::PrimaryKey),
 		],
-		hlc(35),
+		&wendelon::storage::PlanElision::RetentionFloor(hlc(35)),
 	);
 
 	assert_eq!(survivors(&outcome), vec![30, 40]);
@@ -128,7 +128,7 @@ fn primary_key_boundary_tombstone_is_retained() {
 			version(1, 20, 0, true, VersionLifecycle::PrimaryKey),
 			version(1, 40, 0, false, VersionLifecycle::PrimaryKey),
 		],
-		hlc(30),
+		&wendelon::storage::PlanElision::RetentionFloor(hlc(30)),
 	);
 
 	assert_eq!(survivors(&outcome), vec![20, 40]);
@@ -139,7 +139,7 @@ fn primary_key_boundary_tombstone_is_retained() {
 fn ambiguous_table_ownership_rows_are_retained_fail_closed() {
 	let outcome = apply_elision(
 		[version(1, 10, 0, false, VersionLifecycle::AmbiguousTable)],
-		hlc(30),
+		&wendelon::storage::PlanElision::RetentionFloor(hlc(30)),
 	);
 
 	assert_eq!(survivors(&outcome), vec![10]);
@@ -153,7 +153,7 @@ fn migrated_range_tombstone_below_floor_drops() {
 			version(1, 10, 0, true, VersionLifecycle::MigratedRangeTombstone),
 			version(1, 40, 0, true, VersionLifecycle::MigratedRangeTombstone),
 		],
-		hlc(30),
+		&wendelon::storage::PlanElision::RetentionFloor(hlc(30)),
 	);
 
 	assert_eq!(survivors(&outcome), vec![40]);
@@ -168,7 +168,7 @@ fn survivor_output_is_sorted_by_merge_key() {
 			version(1, 10, 2, false, VersionLifecycle::PrimaryKey),
 			version(1, 10, 1, false, VersionLifecycle::PrimaryKey),
 		],
-		hlc(0),
+		&wendelon::storage::PlanElision::RetentionFloor(hlc(0)),
 	);
 
 	let merge_order = outcome
@@ -204,7 +204,7 @@ fn content_hash_duplicate_versions_are_not_recollapsed() {
 			version(1, 40, 0, false, VersionLifecycle::AppendOnlyContentHash),
 			version(1, 40, 1, false, VersionLifecycle::AppendOnlyContentHash),
 		],
-		hlc(30),
+		&wendelon::storage::PlanElision::RetentionFloor(hlc(30)),
 	);
 
 	assert_eq!(survivors(&outcome), vec![40, 40]);

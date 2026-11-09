@@ -3876,3 +3876,155 @@ async fn a_lease_batch_is_stamped_when_it_is_built() {
 		let _ = tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown()).await;
 	}
 }
+
+/// ADR 0703, CONTROLLED CLOCK (a finite workflow, not a capacity test): on
+/// the leader, whose local cleanup is paused, certified LSM compaction of the
+/// L0 runs holding the overwritten versions elides exactly the obsolete
+/// versions after generation 1. The winners and the winning tombstone stay,
+/// the leader's debt retires, and every read is exact everywhere. Distinct
+/// versions and elided rows are reported separately.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn certified_lsm_elides_the_obsolete_versions_on_the_leader() {
+	use std::sync::atomic::Ordering::{Acquire, Release};
+	let (cluster, leader, descriptor) = ready().await;
+	let server = cluster.node(leader).data_server.clone();
+	let pause = server.decision_peer_for_test().pause_cleanup.clone();
+	pause.store(true, Release);
+	let slab = cluster.node(leader).slab.clone();
+	let now = std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.unwrap()
+		.as_millis() as u64;
+	// Each write lands in its own L0 run on the leader.
+	let mut expected = Expected::new();
+	for value in ["a", "b", "c"] {
+		assert_committed(
+			&write_through(
+				&cluster,
+				leader,
+				write_meta(&descriptor, 1, uuid_v7()),
+				named_rows(&descriptor, &[(1, value)]),
+			)
+			.await,
+			"an overwrite",
+		);
+		slab.force_seal_active_for_test().await;
+	}
+	expected.insert(1, "c".into());
+	assert_committed(
+		&write_through(
+			&cluster,
+			leader,
+			write_meta(&descriptor, 1, uuid_v7()),
+			named_rows(&descriptor, &[(2, "a")]),
+		)
+		.await,
+		"a row to delete",
+	);
+	slab.force_seal_active_for_test().await;
+	let row_of = |id: i64| {
+		server
+			.row_identity_and_locality_for_test(
+				TenantId::ZERO,
+				&descriptor,
+				&named_rows(&descriptor, &[(id, "x")]),
+			)
+			.0
+	};
+	let deleted = delete_through(&cluster, leader, delete_meta(&descriptor), vec![row_of(2)]).await;
+	assert_eq!(counts(&deleted), [1, 0, 0], "{deleted:?}");
+	slab.force_seal_active_for_test().await;
+	expect_everywhere(&cluster, &descriptor, &expected, "before any generation").await;
+	let (one, two) = (row_of(1), row_of(2));
+	let ones = owned_versions(&cluster, leader, one).await;
+	let twos = owned_versions(&cluster, leader, two).await;
+	assert_eq!((ones.len(), twos.len()), (3, 2), "every version owned");
+	let obsolete = [(one, ones[0]), (one, ones[1]), (two, twos[0])];
+	jump_floor(&cluster, now + 60_000).await;
+	until_active(&cluster, 1).await;
+	// Certified LSM on the leader, driven here: every L0 run qualifies.
+	let worker = crate::storage::LsmCompactionWorker::new(
+		crate::storage::LsmConfig {
+			max_l0_slab_count: 1,
+			lsm_l0_max_age_millis: 0,
+			..crate::storage::LsmConfig::default()
+		},
+		slab.slab_pin_table(),
+	)
+	.unwrap();
+	let committer = crate::storage::RaftCommitter::new(cluster.node(leader).raft.clone())
+		.with_state_machine(cluster.node(leader).state_machine.clone());
+	let at = HybridTimestamp {
+		physical_ms: now + 120_000,
+		logical: 0,
+		node_id: 0,
+	};
+	let index = slab.persistent_index().unwrap();
+	let deadline = tokio::time::Instant::now() + BOUND;
+	let (mut jobs, mut elided) = (0, 0);
+	loop {
+		let mut stored = 0;
+		for (key, hlc) in &obsolete {
+			stored += slab
+				.version_locations(TenantId::ZERO, *key, *hlc)
+				.unwrap()
+				.len();
+		}
+		if stored == 0 {
+			break;
+		}
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"{stored} obsolete copies remain on the leader after {jobs} certified jobs"
+		);
+		match server
+			.certified_lsm_step_unpaused(&worker, at, &committer)
+			.await
+		{
+			Ok(Some(outcome)) => {
+				jobs += 1;
+				elided += outcome.elided_versions;
+			}
+			Ok(None) => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
+			Err(error) => panic!("a certified LSM job failed: {error}"),
+		}
+	}
+	// The winners stay on the leader: one entry per key, every one stored.
+	let base = index.base_entries(false).await.unwrap();
+	assert_eq!(base.len(), 2);
+	for entry in &base {
+		assert!(
+			!slab
+				.version_locations(
+					entry.tenant,
+					crate::schema::Identity::new(entry.key_identity),
+					entry.hlc
+				)
+				.unwrap()
+				.is_empty(),
+			"a certified winner is stored"
+		);
+	}
+	expect_everywhere(&cluster, &descriptor, &expected, "after certified LSM").await;
+	// The leader's debt retires through the ordinary sweep.
+	pause.store(false, Release);
+	assert!(!pause.load(Acquire));
+	loop {
+		let debt = index.debt_page(None, 100).await.unwrap().len();
+		if debt == 0 {
+			break;
+		}
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"{debt} debt records remain on the leader"
+		);
+		tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+	}
+	eprintln!(
+		"ADR 0703 leader {leader}: {} obsolete versions elided as {elided} rows by {jobs} certified LSM jobs",
+		obsolete.len()
+	);
+	for node in cluster.nodes {
+		let _ = tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown()).await;
+	}
+}
