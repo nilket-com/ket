@@ -6122,3 +6122,448 @@ async fn a_silent_leader_ends_a_forwarded_lookup_and_cut_unknown_within_the_dead
 		"the next cut dials again and is answered: {redialed_cut:?}"
 	);
 }
+
+// DC-207: a child write RPC's deadline.
+
+/// Scheduling margin over a child RPC budget.
+const CHILD_ANSWER_MARGIN: std::time::Duration = std::time::Duration::from_secs(5);
+/// How long after a held child write is shown at its holder the coordinator's
+/// answer may take. The held send started before that, so its budget ends
+/// sooner; nothing asserts that a whole budget elapses after arrival.
+const CHILD_WRITE_ANSWER_BOUND: std::time::Duration =
+	crate::network::data_server::child_writes::CHILD_WRITE_DEADLINE
+		.saturating_add(CHILD_ANSWER_MARGIN);
+/// The same for a held holder-to-replica replicate.
+const CHILD_REPLICATE_ANSWER_BOUND: std::time::Duration =
+	crate::network::data_server::child_writes::CHILD_REPLICATE_DEADLINE
+		.saturating_add(CHILD_ANSWER_MARGIN);
+
+/// One child frame's handling held at a peer (see `ChildHold`); dropping it
+/// releases the handler, so no failure path leaves it parked.
+struct HeldChild {
+	reached: Arc<tokio::sync::Notify>,
+	release: Arc<tokio::sync::Notify>,
+	held: Arc<std::sync::Mutex<Option<crate::network::data_server::child_writes::ChildWriteMeta>>>,
+}
+
+impl HeldChild {
+	fn meta(&self) -> Option<crate::network::data_server::child_writes::ChildWriteMeta> {
+		self.held.lock().unwrap().clone()
+	}
+}
+
+impl Drop for HeldChild {
+	fn drop(&mut self) {
+		self.release.notify_one();
+	}
+}
+
+/// Holds `at`'s handling of the next child frame of `role` from `sender`.
+fn hold_child(
+	cluster: &Cluster,
+	at: u32,
+	sender: u32,
+	role: crate::network::data_server::child_writes::ChildRole,
+) -> HeldChild {
+	let held = HeldChild {
+		reached: Arc::new(tokio::sync::Notify::new()),
+		release: Arc::new(tokio::sync::Notify::new()),
+		held: Arc::new(std::sync::Mutex::new(None)),
+	};
+	cluster
+		.node(at)
+		.data_server
+		.decision_peer_for_test()
+		.hold_child_for_test(crate::network::data_server::child_writes::ChildHold {
+			sender,
+			role,
+			reached: held.reached.clone(),
+			release: held.release.clone(),
+			held: held.held.clone(),
+		});
+	held
+}
+
+type SpawnedWrite = tokio::task::JoinHandle<
+	std::io::Result<(
+		crate::schema::TableWriteResponseMeta,
+		Option<crate::schema::FinalizationMarker>,
+	)>,
+>;
+
+/// One attempt of a table write at `node`, spawned, never retried.
+fn spawn_attempt(
+	cluster: &Cluster,
+	node: u32,
+	meta: TableWriteRequestMeta,
+	batch: RecordBatch,
+) -> SpawnedWrite {
+	let server = cluster.node(node).data_server.clone();
+	tokio::spawn(async move { server.table_write_for_test(meta, batch).await })
+}
+
+/// Waits until `hold` is reached; a write that answers first, or a hold never
+/// reached, fails here.
+async fn until_child_reached(what: &str, hold: &HeldChild, write: &mut SpawnedWrite) {
+	tokio::select! {
+		_ = hold.reached.notified() => {}
+		early = &mut *write => panic!("{what}: the write answered before its child frame reached the held peer: {:?}",
+			early.map(|result| result.map(|(response, _)| response))),
+		_ = tokio::time::sleep(BOUND) => panic!("{what}: the child frame never reached the held peer"),
+	}
+}
+
+/// The answer of `write` within `bound`, as text for a failure message.
+fn first_answer_text(
+	answer: &Result<
+		Result<
+			std::io::Result<(
+				crate::schema::TableWriteResponseMeta,
+				Option<crate::schema::FinalizationMarker>,
+			)>,
+			tokio::task::JoinError,
+		>,
+		tokio::time::error::Elapsed,
+	>,
+) -> String {
+	match answer {
+		Ok(Ok(Ok((response, _)))) => format!("{response:?}"),
+		other => format!("{other:?}"),
+	}
+}
+
+/// Ends a timed-out attempt after its hold was released, for the record.
+async fn original_after_release(
+	answer: &Result<impl Sized, tokio::time::error::Elapsed>,
+	write: &mut SpawnedWrite,
+) -> Option<String> {
+	if answer.is_ok() {
+		return None;
+	}
+	Some(match tokio::time::timeout(BOUND, write).await {
+		Ok(Ok(Ok((response, _)))) => format!("{response:?}"),
+		other => format!("{other:?}"),
+	})
+}
+
+/// Two rows whose first-row primary (the coordinator) and second-row primary
+/// (a remote holder) differ, from the leader's applied lineages.
+async fn rows_with_a_remote_holder(
+	cluster: &Cluster,
+	leader: u32,
+	descriptor: &TableSchemaDescriptor,
+) -> (i64, i64, u32, u32) {
+	let primary = |id: i64| async move {
+		cluster
+			.node(leader)
+			.data_server
+			.primary_for_test(TenantId::ZERO, descriptor, &rows(descriptor, &[id]))
+			.await
+			.expect("every position is leased")
+	};
+	let first = 1;
+	let coordinator = primary(first).await;
+	for second in first + 1..first + 200 {
+		let holder = primary(second).await;
+		if holder != coordinator {
+			return (first, second, coordinator, holder);
+		}
+	}
+	panic!("no row's primary differs from the coordinator's");
+}
+
+/// Every node's answer to a full table query.
+async fn reads_everywhere(
+	cluster: &Cluster,
+	descriptor: &TableSchemaDescriptor,
+) -> Vec<(u32, crate::network::data_server::reader::TestQueryAnswer)> {
+	let mut reads = Vec::new();
+	for node in NODES {
+		reads.push((node, read_at(cluster, node, descriptor).await));
+	}
+	reads
+}
+
+fn assert_reads(
+	what: &str,
+	reads: Vec<(u32, crate::network::data_server::reader::TestQueryAnswer)>,
+	expected: &Expected,
+) {
+	for (node, answer) in reads {
+		assert_eq!(
+			answer.status,
+			Some(crate::schema::ReadStatus::OK),
+			"{what}: at {node}: {answer:?}"
+		);
+		assert_eq!(&answered(&answer), expected, "{what}: at {node}");
+	}
+}
+
+/// DC-207 (acceptance 1): a write coordinated at one node has a child whose
+/// holder is another. That holder's handling of the child write is held once
+/// it arrived, so it never answers. The coordinator still answers within
+/// [`CHILD_WRITE_ANSWER_BOUND`] with a typed unknown outcome (WRITE_STALLED,
+/// INDETERMINATE: Finalize without that child's acknowledgements is pending
+/// evidence), never a known non-commit, and the parent stays Reserved.
+/// Released, the same parent retried reaches its one recorded outcome, with
+/// exactly its rows at every node.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_held_remote_holder_answers_unknown_and_its_retry_reaches_the_one_record() {
+	use crate::network::data_server::child_writes::ChildRole;
+	let (cluster, leader, descriptor) = ready().await;
+	let (first_row, second_row, coordinator, holder) =
+		rows_with_a_remote_holder(&cluster, leader, &descriptor).await;
+	let meta = write_meta(&descriptor, 2, uuid_v7());
+	let key = key_of(&descriptor, &meta);
+	let batch = named_rows(&descriptor, &[(first_row, "a"), (second_row, "b")]);
+	let hold = hold_child(&cluster, holder, coordinator, ChildRole::Holder);
+	let mut write = spawn_attempt(&cluster, coordinator, meta, batch.clone());
+	until_child_reached("held holder", &hold, &mut write).await;
+	let held = hold.meta();
+
+	let first = tokio::time::timeout(CHILD_WRITE_ANSWER_BOUND, &mut write).await;
+	let at_answer = records_of(&cluster, key).await;
+	drop(hold);
+	let original = original_after_release(&first, &mut write).await;
+	let retried = write_through(&cluster, coordinator, meta, batch).await;
+	let records = records_of(&cluster, key).await;
+	let reads = reads_everywhere(&cluster, &descriptor).await;
+	for node in cluster.nodes {
+		let _ = tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown()).await;
+	}
+
+	let first_text = first_answer_text(&first);
+	let Ok(Ok(Ok((first, _)))) = first else {
+		panic!(
+			"no answer within {CHILD_WRITE_ANSWER_BOUND:?} while the remote holder held the \
+			 child write: {first_text}; after the release the original attempt gave {original:?}"
+		);
+	};
+	assert_ne!(
+		first.write.mutation_commit_knowledge(),
+		MutationCommitKnowledge::KNOWN_NOT_COMMITTED,
+		"never a known non-commit: {first:?}"
+	);
+	assert_eq!(
+		(first.write.status, first.write.mutation_commit_knowledge()),
+		(
+			WriteStatus::WRITE_STALLED,
+			MutationCommitKnowledge::INDETERMINATE
+		),
+		"the first attempt: {first:?}"
+	);
+	assert_eq!(
+		at_answer.len(),
+		1,
+		"one parent at the answer: {at_answer:?}"
+	);
+	assert_eq!(
+		at_answer[0].status,
+		ParentStatus::Reserved,
+		"pending evidence leaves the parent Reserved"
+	);
+	let ordinal = at_answer[0]
+		.claim
+		.children
+		.iter()
+		.position(|child| child.holder.node == holder)
+		.expect("a child held at the remote holder");
+	assert!(
+		held.as_ref().is_some_and(
+			|held| held.rsv == at_answer[0].rsv && usize::from(held.ordinal) == ordinal
+		),
+		"the held child write is this parent's child {ordinal}: {held:?}"
+	);
+	assert_committed(&retried, "the same parent, retried");
+	assert_eq!(records.len(), 1, "one parent: {records:?}");
+	assert_eq!(
+		records[0].status,
+		ParentStatus::Accepted {
+			dec: retried.write.log_index
+		}
+	);
+	assert_reads(
+		"after the retry",
+		reads,
+		&[(first_row, "a".to_string()), (second_row, "b".to_string())].into(),
+	);
+}
+
+/// DC-207 (acceptance 2): a holder's replicate to one plan member is held at
+/// that member, so it never answers. The holder's own acknowledgement and the
+/// other member's are a majority of the three-member plan including the
+/// holder, so the first attempt commits from that evidence within
+/// [`CHILD_REPLICATE_ANSWER_BOUND`], and every node reads the row exactly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_held_replica_leaves_a_quorum_that_commits_after_its_deadline() {
+	use crate::network::data_server::child_writes::ChildRole;
+	let (cluster, leader, descriptor) = ready().await;
+	let (id, holder) = row_off_the_leader(&cluster, leader, &descriptor, 1).await;
+	let held_member = *NODES.iter().find(|node| **node != holder).unwrap();
+	let meta = write_meta(&descriptor, 1, uuid_v7());
+	let key = key_of(&descriptor, &meta);
+	let batch = named_rows(&descriptor, &[(id, "a")]);
+	let hold = hold_child(&cluster, held_member, holder, ChildRole::Replica);
+	let mut write = spawn_attempt(&cluster, holder, meta, batch.clone());
+	until_child_reached("held replica", &hold, &mut write).await;
+	let held = hold.meta();
+
+	let first = tokio::time::timeout(CHILD_REPLICATE_ANSWER_BOUND, &mut write).await;
+	let at_answer = records_of(&cluster, key).await;
+	drop(hold);
+	let original = original_after_release(&first, &mut write).await;
+	let retried = write_through(&cluster, holder, meta, batch).await;
+	let reads = reads_everywhere(&cluster, &descriptor).await;
+	for node in cluster.nodes {
+		let _ = tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown()).await;
+	}
+
+	let first_text = first_answer_text(&first);
+	let Ok(Ok(Ok((first, _)))) = first else {
+		panic!(
+			"no answer within {CHILD_REPLICATE_ANSWER_BOUND:?} while one replica held the \
+			 holder's replicate: {first_text}; after the release the original attempt gave \
+			 {original:?}"
+		);
+	};
+	assert_committed(&first, "the first attempt, from the other acknowledgements");
+	assert_eq!(at_answer.len(), 1, "one parent: {at_answer:?}");
+	assert_eq!(
+		at_answer[0].status,
+		ParentStatus::Accepted {
+			dec: first.write.log_index
+		}
+	);
+	let plan: Vec<u32> = at_answer[0].claim.children[0]
+		.plan
+		.iter()
+		.map(|member| member.node)
+		.collect();
+	assert_eq!(plan.len(), 3, "a three-member plan: {plan:?}");
+	assert!(
+		plan.contains(&held_member) && plan.contains(&holder),
+		"the held member and the holder are in the plan: {plan:?}"
+	);
+	assert!(
+		held.as_ref()
+			.is_some_and(|held| held.rsv == at_answer[0].rsv && held.ordinal == 0),
+		"the held replicate is this parent's child: {held:?}"
+	);
+	assert_committed(&retried, "the same parent, retried");
+	assert_eq!(retried.write.log_index, first.write.log_index);
+	assert_reads("after the commit", reads, &[(id, "a".to_string())].into());
+}
+
+/// DC-207 (acceptance 2, insufficient evidence): both of the holder's
+/// replicates are held, so only the holder's acknowledgement arrives, short
+/// of a majority. The first attempt answers WRITE_STALLED with INDETERMINATE
+/// within [`CHILD_REPLICATE_ANSWER_BOUND`] and the parent stays Reserved:
+/// pending evidence, never a terminal refusal. Released, the same parent
+/// retried commits, with exactly its row at every node.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn held_replicas_short_of_a_quorum_answer_unknown_and_never_refuse() {
+	use crate::network::data_server::child_writes::ChildRole;
+	let (cluster, leader, descriptor) = ready().await;
+	let (id, holder) = row_off_the_leader(&cluster, leader, &descriptor, 1).await;
+	let meta = write_meta(&descriptor, 1, uuid_v7());
+	let key = key_of(&descriptor, &meta);
+	let batch = named_rows(&descriptor, &[(id, "a")]);
+	let holds: Vec<HeldChild> = NODES
+		.iter()
+		.filter(|node| **node != holder)
+		.map(|member| hold_child(&cluster, *member, holder, ChildRole::Replica))
+		.collect();
+	let mut write = spawn_attempt(&cluster, holder, meta, batch.clone());
+	for hold in &holds {
+		until_child_reached("held replicas", hold, &mut write).await;
+	}
+
+	let first = tokio::time::timeout(CHILD_REPLICATE_ANSWER_BOUND, &mut write).await;
+	let at_answer = records_of(&cluster, key).await;
+	drop(holds);
+	let original = original_after_release(&first, &mut write).await;
+	let retried = write_through(&cluster, holder, meta, batch).await;
+	let records = records_of(&cluster, key).await;
+	let reads = reads_everywhere(&cluster, &descriptor).await;
+	for node in cluster.nodes {
+		let _ = tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown()).await;
+	}
+
+	let first_text = first_answer_text(&first);
+	let Ok(Ok(Ok((first, _)))) = first else {
+		panic!(
+			"no answer within {CHILD_REPLICATE_ANSWER_BOUND:?} while both replicas held the \
+			 holder's replicates: {first_text}; after the release the original attempt gave \
+			 {original:?}"
+		);
+	};
+	assert_eq!(
+		(first.write.status, first.write.mutation_commit_knowledge()),
+		(
+			WriteStatus::WRITE_STALLED,
+			MutationCommitKnowledge::INDETERMINATE
+		),
+		"the first attempt: {first:?}"
+	);
+	assert_eq!(
+		at_answer.len(),
+		1,
+		"one parent at the answer: {at_answer:?}"
+	);
+	assert_eq!(
+		at_answer[0].status,
+		ParentStatus::Reserved,
+		"pending evidence leaves the parent Reserved, never Refused"
+	);
+	assert_committed(&retried, "the same parent, retried");
+	assert_eq!(records.len(), 1, "one parent: {records:?}");
+	assert_eq!(
+		records[0].status,
+		ParentStatus::Accepted {
+			dec: retried.write.log_index
+		}
+	);
+	assert_reads("after the retry", reads, &[(id, "a".to_string())].into());
+}
+
+/// DC-207 (acceptance 3, the ordinary response): with nothing held, a write
+/// whose second child has a remote holder (a coordinator-to-holder write and
+/// both hops' replicates) commits on its first attempt at its one recorded
+/// decision, with exactly its rows at every node.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_write_with_a_remote_holder_answered_in_time_commits_on_its_first_attempt() {
+	let (cluster, leader, descriptor) = ready().await;
+	let (first_row, second_row, coordinator, _) =
+		rows_with_a_remote_holder(&cluster, leader, &descriptor).await;
+	let meta = write_meta(&descriptor, 2, uuid_v7());
+	let key = key_of(&descriptor, &meta);
+	let (response, _) = cluster
+		.node(coordinator)
+		.data_server
+		.table_write_for_test(
+			meta,
+			named_rows(&descriptor, &[(first_row, "a"), (second_row, "b")]),
+		)
+		.await
+		.unwrap();
+	assert_committed(&response, "the first attempt");
+	let records = records_of(&cluster, key).await;
+	assert_eq!(records.len(), 1, "one parent: {records:?}");
+	assert_eq!(records[0].claim.children.len(), 2, "two children");
+	assert_eq!(
+		records[0].status,
+		ParentStatus::Accepted {
+			dec: response.write.log_index
+		}
+	);
+	expect_everywhere(
+		&cluster,
+		&descriptor,
+		&[(first_row, "a".to_string()), (second_row, "b".to_string())].into(),
+		"answered in time",
+	)
+	.await;
+	for node in cluster.nodes {
+		let _ = tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown()).await;
+	}
+}

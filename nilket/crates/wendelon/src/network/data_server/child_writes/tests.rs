@@ -1139,3 +1139,285 @@ fn the_mode_opens_exactly_the_surfaces_it_serves() {
 		assert!(!peer.opens(msg_type.0), "refused: {msg_type:?}");
 	}
 }
+
+/// DC-207 (acceptance 3): a child RPC's one deadline covers the whole attempt.
+/// On a simulated network, against peers outside any cluster:
+/// - a peer that opens the stream but never reads it holds the sender in its
+///   transfer (the rows exceed the stream's buffer);
+/// - a peer that reads the whole request but never answers holds it waiting
+///   for the reply;
+/// - a dial held in its connect stage holds it before any stream exists.
+///
+/// Each attempt ends `TimedOut`, no earlier than its kind's budget measured
+/// from before the call, and within a margin. Afterwards the same cached
+/// connection (no new dial) serves an answered request, and a cancelled dial
+/// was never cached: the next send dials again and is answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_child_rpc_deadline_covers_the_dial_the_transfer_and_the_reply() {
+	use crate::network::core::{HrftFrame, read_frame};
+	use crate::network::server::{HrftService, RequestContext};
+	use crate::network::transport::{
+		CapabilityResolver, MembershipEpoch, NodeCapabilitySet, NodeRoleSet, PeerCapabilities,
+		TransportProvider, TransportStream, TransportTier, TransportTierSet,
+	};
+	use crate::simulator::network::{
+		InjectedSimulatedTransportFault, SimulatedTransportEventKind,
+		SimulatedTransportFaultAction, SimulatedTransportFaultOp, SimulatedTransportNetwork,
+		SimulatedTransportProvider,
+	};
+	use std::sync::atomic::{AtomicUsize, Ordering};
+	/// Scheduling margin over a budget.
+	const MARGIN: std::time::Duration = std::time::Duration::from_secs(5);
+	const LOCAL: u32 = 1;
+	const SILENT_UNREAD: u32 = 2;
+	const SILENT_READ: u32 = 3;
+	const HELD_DIAL: u32 = 4;
+	fn node(id: u32) -> NodeId {
+		NodeId { id, _reserved: 0 }
+	}
+	fn address(id: u32) -> String {
+		format!("loopback://child-rpc-peer-{id}")
+	}
+	struct Resolver;
+	#[async_trait::async_trait]
+	impl CapabilityResolver for Resolver {
+		async fn resolve(&self, node: NodeId) -> std::io::Result<PeerCapabilities> {
+			Ok(PeerCapabilities {
+				address: address(node.id),
+				tiers: TransportTierSet::empty().with(TransportTier::QuicIoUring),
+				roles: NodeRoleSet::empty(),
+				capabilities: NodeCapabilitySet::empty(),
+			})
+		}
+	}
+	/// Opens every stream; reads the request only if `reads`; never answers.
+	struct Silent {
+		reads: bool,
+		opened: AtomicUsize,
+		read: AtomicUsize,
+	}
+	#[async_trait::async_trait]
+	impl HrftService for Silent {
+		async fn handle_frame(
+			&self,
+			_context: RequestContext,
+			_frame: HrftFrame,
+		) -> std::io::Result<Option<HrftFrame>> {
+			std::future::pending().await
+		}
+
+		async fn handle_stream(
+			&self,
+			mut stream: Box<dyn TransportStream>,
+			pool: Arc<BufPool>,
+			_context: RequestContext,
+		) -> std::io::Result<()> {
+			self.opened.fetch_add(1, Ordering::SeqCst);
+			if self.reads {
+				read_frame(&mut *stream, &pool).await?;
+				self.read.fetch_add(1, Ordering::SeqCst);
+			}
+			std::future::pending().await
+		}
+	}
+	/// Answers every child frame with a refusal of its own kind.
+	struct Answering(Arc<BufPool>);
+	#[async_trait::async_trait]
+	impl HrftService for Answering {
+		async fn handle_frame(
+			&self,
+			_context: RequestContext,
+			frame: HrftFrame,
+		) -> std::io::Result<Option<HrftFrame>> {
+			let msg_type = if frame.header.msg_type == MsgType::TABLE_CHILD_WRITE_REQ.0 {
+				MsgType::TABLE_CHILD_WRITE_RESP
+			} else {
+				MsgType::TABLE_CHILD_REPLICATE_RESP
+			};
+			let bytes =
+				postcard::to_stdvec(&ChildWriteResponse::Refused("answered".into())).unwrap();
+			let mut meta = self.0.acquire();
+			meta.as_mut_vec().extend_from_slice(&bytes);
+			Ok(Some(HrftFrame {
+				header: FrameHeader {
+					magic: HRFT_MAGIC,
+					version: 1,
+					msg_type: msg_type.0,
+					flags: 0,
+					stream_id: frame.header.stream_id,
+					meta_len: meta.len() as u32,
+					arrow_len: 0,
+					trailing_len: 0,
+				},
+				meta,
+				arrow_payload: None,
+				trailing: None,
+			}))
+		}
+	}
+	/// One send, timed from before the call, under an outer bound so a
+	/// missing deadline fails here.
+	async fn timed(
+		send: impl std::future::Future<Output = std::io::Result<ChildWriteResponse>>,
+		rpc: ChildRpc,
+	) -> (
+		Option<std::io::Result<ChildWriteResponse>>,
+		std::time::Duration,
+	) {
+		let started = tokio::time::Instant::now();
+		let outcome = tokio::time::timeout(rpc.budget() + MARGIN, send).await.ok();
+		(outcome, started.elapsed())
+	}
+	fn timed_out(
+		what: &str,
+		rpc: ChildRpc,
+		(outcome, elapsed): &(
+			Option<std::io::Result<ChildWriteResponse>>,
+			std::time::Duration,
+		),
+	) {
+		assert!(
+			matches!(outcome, Some(Err(error)) if error.kind() == ErrorKind::TimedOut),
+			"{what}: after {elapsed:?} (budget {:?}, margin {MARGIN:?}): {outcome:?}",
+			rpc.budget()
+		);
+		assert!(
+			*elapsed >= rpc.budget(),
+			"{what}: ended at {elapsed:?}, before its budget"
+		);
+	}
+	fn connects(network: &SimulatedTransportNetwork, to: u32) -> usize {
+		network
+			.events()
+			.iter()
+			.filter(|event| {
+				event.source == Some(node(LOCAL))
+					&& event.target == Some(node(to))
+					&& event.kind == SimulatedTransportEventKind::Connect
+			})
+			.count()
+	}
+
+	let network = Arc::new(SimulatedTransportNetwork::default());
+	let pool = BufPool::new(64, 1 << 20);
+	let provider: Arc<dyn TransportProvider> = Arc::new(SimulatedTransportProvider::new(
+		node(LOCAL),
+		network.clone(),
+		pool.clone(),
+		TransportTier::QuicIoUring,
+	));
+	let (_epoch, epoch_rx) = tokio::sync::watch::channel(Arc::new(MembershipEpoch::empty()));
+	let factory = TransportProviderFactory::new(
+		TransportTierSet::empty().with(TransportTier::QuicIoUring),
+		[(TransportTier::QuicIoUring, provider)]
+			.into_iter()
+			.collect(),
+		Arc::new(Resolver),
+		epoch_rx,
+	);
+	let meta = postcard::to_stdvec(&ChildWriteMeta {
+		rsv: 1,
+		ordinal: 0,
+		claim_digest: [0; 32],
+		schema_generation: 1,
+	})
+	.unwrap();
+	let send = |to: u32, rpc: ChildRpc, rows: usize| {
+		send_child_frame(
+			factory.clone(),
+			pool.clone(),
+			node(to),
+			rpc,
+			meta.clone(),
+			Arc::new(vec![0; rows]),
+		)
+	};
+
+	// The transfer: 1 MiB of rows to a peer that never reads its stream.
+	let unread = Arc::new(Silent {
+		reads: false,
+		opened: AtomicUsize::new(0),
+		read: AtomicUsize::new(0),
+	});
+	network.publish(node(SILENT_UNREAD), &address(SILENT_UNREAD), unread.clone());
+	let transfer = timed(
+		send(SILENT_UNREAD, ChildRpc::Replicate, 1 << 20),
+		ChildRpc::Replicate,
+	)
+	.await;
+
+	// The reply: a peer that reads the whole request and never answers.
+	let silent = Arc::new(Silent {
+		reads: true,
+		opened: AtomicUsize::new(0),
+		read: AtomicUsize::new(0),
+	});
+	network.publish(node(SILENT_READ), &address(SILENT_READ), silent.clone());
+	let reply = timed(
+		send(SILENT_READ, ChildRpc::Replicate, 1024),
+		ChildRpc::Replicate,
+	)
+	.await;
+	// The same peer answering again, on the cached connection.
+	network.publish(
+		node(SILENT_READ),
+		&address(SILENT_READ),
+		Arc::new(Answering(pool.clone())),
+	);
+	let answered = timed(
+		send(SILENT_READ, ChildRpc::Replicate, 1024),
+		ChildRpc::Replicate,
+	)
+	.await;
+
+	// The dial: the first connect to this peer is held.
+	network.publish(
+		node(HELD_DIAL),
+		&address(HELD_DIAL),
+		Arc::new(Answering(pool.clone())),
+	);
+	network.inject(
+		InjectedSimulatedTransportFault::on(
+			SimulatedTransportFaultOp::Connect,
+			SimulatedTransportFaultAction::Delay(std::time::Duration::from_secs(3600)),
+		)
+		.from(node(LOCAL))
+		.to(node(HELD_DIAL)),
+	);
+	let dial = timed(send(HELD_DIAL, ChildRpc::Write, 1024), ChildRpc::Write).await;
+	let dials_held = connects(&network, HELD_DIAL);
+	let redialed = timed(send(HELD_DIAL, ChildRpc::Write, 1024), ChildRpc::Write).await;
+
+	timed_out("a peer that never reads", ChildRpc::Replicate, &transfer);
+	assert_eq!(
+		unread.opened.load(Ordering::SeqCst),
+		1,
+		"the stream was opened"
+	);
+	timed_out("a peer that never answers", ChildRpc::Replicate, &reply);
+	assert_eq!(
+		silent.read.load(Ordering::SeqCst),
+		1,
+		"the request was read whole"
+	);
+	assert!(
+		matches!(&answered.0, Some(Ok(ChildWriteResponse::Refused(why))) if why == "answered"),
+		"the same peer answering again: {answered:?}"
+	);
+	assert_eq!(
+		connects(&network, SILENT_READ),
+		1,
+		"the timed-out attempt left its connection cached and in use"
+	);
+	timed_out("a held dial", ChildRpc::Write, &dial);
+	assert_eq!(dials_held, 1, "the held dial was attempted");
+	assert!(
+		matches!(&redialed.0, Some(Ok(ChildWriteResponse::Refused(why))) if why == "answered"),
+		"the next send to the held dial's peer: {redialed:?}"
+	);
+	assert_eq!(
+		connects(&network, HELD_DIAL),
+		2,
+		"a cancelled dial is never cached: the next send dialed again"
+	);
+}

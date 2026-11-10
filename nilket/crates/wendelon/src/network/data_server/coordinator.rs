@@ -619,7 +619,7 @@ impl WendelonDataServer {
 						id: child.holder.node,
 						_reserved: 0,
 					},
-					MsgType::TABLE_CHILD_WRITE_REQ,
+					super::child_writes::ChildRpc::Write,
 					meta_bytes,
 					Arc::new(rows_bytes),
 				)

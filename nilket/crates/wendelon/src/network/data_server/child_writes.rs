@@ -996,6 +996,22 @@ pub(crate) struct DecisionPeer {
 	/// Test-only (ADR 0706): what each held certified step returned.
 	#[cfg(test)]
 	pub(crate) held_outcomes: Arc<std::sync::Mutex<Vec<HeldStepOutcome>>>,
+	/// Test-only (DC-207): this store's handling of one child frame, held.
+	#[cfg(test)]
+	pub(crate) child_hold: Arc<std::sync::Mutex<Option<ChildHold>>>,
+}
+
+/// Test-only (DC-207): holds this store's handling of the next child frame of
+/// `role` from `sender`, once, after it decoded and before anything is
+/// written: `reached` is notified with its metadata recorded in `held`, and the
+/// handler waits for `release`.
+#[cfg(test)]
+pub(crate) struct ChildHold {
+	pub(crate) sender: u32,
+	pub(crate) role: ChildRole,
+	pub(crate) reached: Arc<tokio::sync::Notify>,
+	pub(crate) release: Arc<tokio::sync::Notify>,
+	pub(crate) held: Arc<std::sync::Mutex<Option<ChildWriteMeta>>>,
 }
 
 /// Where a test may pause a coordinated write.
@@ -1060,6 +1076,28 @@ impl DecisionPeer {
 			None => false,
 		}
 	}
+
+	/// Test-only (DC-207): queues a hold of one child frame (see [`ChildHold`]).
+	pub(crate) fn hold_child_for_test(&self, hold: ChildHold) {
+		*self.child_hold.lock().unwrap() = Some(hold);
+	}
+
+	/// Test-only (DC-207): a child frame's handler pauses here if a queued hold
+	/// matches it.
+	async fn pause_child(&self, sender: u32, role: ChildRole, meta: &ChildWriteMeta) {
+		let hold = {
+			let mut slot = self.child_hold.lock().unwrap();
+			match slot.as_ref() {
+				Some(hold) if hold.sender == sender && hold.role == role => slot.take(),
+				_ => None,
+			}
+		};
+		if let Some(hold) = hold {
+			*hold.held.lock().unwrap() = Some(meta.clone());
+			hold.reached.notify_one();
+			hold.release.notified().await;
+		}
+	}
 }
 
 impl Default for DecisionPeer {
@@ -1077,6 +1115,8 @@ impl Default for DecisionPeer {
 			pauses: Default::default(),
 			#[cfg(test)]
 			held_outcomes: Default::default(),
+			#[cfg(test)]
+			child_hold: Default::default(),
 			behind_boundary: Default::default(),
 			base_validated: Default::default(),
 			#[cfg(test)]
@@ -1519,6 +1559,8 @@ impl WendelonDataServer {
 		let Ok(meta_bytes) = postcard::to_stdvec(meta) else {
 			return Vec::new();
 		};
+		// The set owns every send: each ends by its replicate deadline, and
+		// dropping the set (this future cancelled) aborts the rest.
 		let mut sends = tokio::task::JoinSet::new();
 		for member in members.into_iter().filter(|member| *member != local) {
 			sends.spawn(send_child_frame(
@@ -1528,7 +1570,7 @@ impl WendelonDataServer {
 					id: member,
 					_reserved: 0,
 				},
-				MsgType::TABLE_CHILD_REPLICATE_REQ,
+				ChildRpc::Replicate,
 				meta_bytes.clone(),
 				rows.clone(),
 			));
@@ -1550,7 +1592,12 @@ impl WendelonDataServer {
 		frame: HrftFrame,
 	) -> std::io::Result<HrftFrame> {
 		let rows: Option<&[u8]> = frame.arrow_payload.as_ref().map(|bytes| bytes.as_ref());
-		let response = match decode_child_frame(frame.meta.as_ref(), rows) {
+		let decoded = decode_child_frame(frame.meta.as_ref(), rows);
+		#[cfg(test)]
+		if let Ok((meta, _)) = &decoded {
+			self.decisions.pause_child(sender, role, meta).await;
+		}
+		let response = match decoded {
 			Err(reason) => ChildWriteResponse::Refused(reason),
 			Ok((meta, batch)) if role == ChildRole::Holder => {
 				let rows = Arc::new(rows.unwrap_or_default().to_vec());
@@ -1592,55 +1639,125 @@ impl WendelonDataServer {
 	}
 }
 
-/// Sends one child frame and decodes its bounded response.
+/// The bound on one coordinator-to-holder child write attempt, from before
+/// connecting until the reply is decoded. A design value, not a guarantee:
+/// the holder's work in it includes receiving and decoding the rows, waiting
+/// for the reservation to apply (nominally up to 2 s), local persistence and
+/// locking, its own fan-out (each send bounded by
+/// [`CHILD_REPLICATE_DEADLINE`]) and the reply. Persistence and locks have no
+/// demonstrated hard bound, so the margin over the replicate budget is
+/// headroom, not a promise that a healthy holder's answer arrives in time.
+pub(crate) const CHILD_WRITE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The bound on one holder-to-plan-member replicate attempt, from before
+/// connecting until the reply is decoded. A design value, not a guarantee:
+/// a receiver accepts up to [`MAX_CHILD_ROWS_BYTES`] of rows (the sender is
+/// bounded by rows per child, not bytes), and such a child needs at least
+/// 12.8 MiB/s of payload throughput to fit before any other latency. No
+/// maximum-size performance is claimed.
+pub(crate) const CHILD_REPLICATE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Which remote child RPC a send is: its request and reply types and its
+/// budget follow from it, so no message type falls back to a default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ChildRpc {
+	/// A coordinator's write of a child to its holder.
+	Write,
+	/// A holder's replicate of its child to one plan member.
+	Replicate,
+}
+
+impl ChildRpc {
+	fn request(self) -> MsgType {
+		match self {
+			Self::Write => MsgType::TABLE_CHILD_WRITE_REQ,
+			Self::Replicate => MsgType::TABLE_CHILD_REPLICATE_REQ,
+		}
+	}
+
+	fn response(self) -> MsgType {
+		match self {
+			Self::Write => MsgType::TABLE_CHILD_WRITE_RESP,
+			Self::Replicate => MsgType::TABLE_CHILD_REPLICATE_RESP,
+		}
+	}
+
+	/// The attempt's budget: [`CHILD_WRITE_DEADLINE`] or
+	/// [`CHILD_REPLICATE_DEADLINE`].
+	pub(crate) fn budget(self) -> std::time::Duration {
+		match self {
+			Self::Write => CHILD_WRITE_DEADLINE,
+			Self::Replicate => CHILD_REPLICATE_DEADLINE,
+		}
+	}
+}
+
+/// Sends one child frame of kind `rpc` and decodes its bounded response, the
+/// whole attempt bounded by `rpc`'s budget: resolution and connection,
+/// opening the stream, writing the metadata and rows, finishing and reading
+/// and decoding the reply. The deadline is set once, before the first of them,
+/// and never renewed. On expiry the attempt ends with [`ErrorKind::TimedOut`]
+/// and drops only its own stream; the shared connection stays usable. A
+/// timed-out attempt is no acknowledgement from `target`, never evidence that
+/// it did not store the child.
 pub(crate) async fn send_child_frame(
 	factory: Arc<TransportProviderFactory>,
 	pool: Arc<BufPool>,
 	target: NodeId,
-	msg_type: MsgType,
+	rpc: ChildRpc,
 	meta: Vec<u8>,
 	rows: Arc<Vec<u8>>,
 ) -> std::io::Result<ChildWriteResponse> {
-	let conn = factory.get_connection(target).await?;
-	let mut stream = conn.open_bi().await?;
-	let header = FrameHeader {
-		magic: HRFT_MAGIC,
-		version: 1,
-		msg_type: msg_type.0,
-		flags: 0,
-		stream_id: 0,
-		meta_len: meta.len() as u32,
-		arrow_len: rows.len() as u32,
-		trailing_len: 0,
+	let deadline = tokio::time::Instant::now() + rpc.budget();
+	let attempt = async {
+		let conn = factory.get_connection(target).await?;
+		let mut stream = conn.open_bi().await?;
+		let header = FrameHeader {
+			magic: HRFT_MAGIC,
+			version: 1,
+			msg_type: rpc.request().0,
+			flags: 0,
+			stream_id: 0,
+			meta_len: meta.len() as u32,
+			arrow_len: rows.len() as u32,
+			trailing_len: 0,
+		};
+		write_frame(&mut *stream, &header, &meta, Some(rows.as_slice()), None).await?;
+		stream
+			.finish()
+			.await
+			.map_err(|error| Error::new(ErrorKind::BrokenPipe, error))?;
+		let response = read_frame(&mut *stream, &pool).await?;
+		if response.header.msg_type != rpc.response().0 {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"unexpected child write response 0x{:02x}",
+					response.header.msg_type
+				),
+			));
+		}
+		if response.meta.len() > crate::network::decision_proposals::MAX_DECISION_FRAME_BYTES {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"child write response exceeds its bound",
+			));
+		}
+		postcard::from_bytes(response.meta.as_ref())
+			.map_err(|error| Error::new(ErrorKind::InvalidData, error))
 	};
-	write_frame(&mut *stream, &header, &meta, Some(rows.as_slice()), None).await?;
-	stream
-		.finish()
+	tokio::time::timeout_at(deadline, attempt)
 		.await
-		.map_err(|error| Error::new(ErrorKind::BrokenPipe, error))?;
-	let response = read_frame(&mut *stream, &pool).await?;
-	let expected = if msg_type == MsgType::TABLE_CHILD_WRITE_REQ {
-		MsgType::TABLE_CHILD_WRITE_RESP
-	} else {
-		MsgType::TABLE_CHILD_REPLICATE_RESP
-	};
-	if response.header.msg_type != expected.0 {
-		return Err(Error::new(
-			ErrorKind::InvalidData,
-			format!(
-				"unexpected child write response 0x{:02x}",
-				response.header.msg_type
-			),
-		));
-	}
-	if response.meta.len() > crate::network::decision_proposals::MAX_DECISION_FRAME_BYTES {
-		return Err(Error::new(
-			ErrorKind::InvalidData,
-			"child write response exceeds its bound",
-		));
-	}
-	postcard::from_bytes(response.meta.as_ref())
-		.map_err(|error| Error::new(ErrorKind::InvalidData, error))
+		.unwrap_or_else(|_| {
+			Err(Error::new(
+				ErrorKind::TimedOut,
+				format!(
+					"child {rpc:?} to node {} had no answer within {:?}",
+					target.id,
+					rpc.budget()
+				),
+			))
+		})
 }
 
 #[cfg(test)]
