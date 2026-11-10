@@ -10022,7 +10022,7 @@ fn validate_snapshot_header_log_coordinates(
 /// Build one page-padded WAL record for a single entry:
 /// `[WALRecordHeader][RaftLogEntryFixed][postcard(entry)][profile-hash-prefix checksum]`
 /// with the tail zero-padded to `DIRECT_IO_ALIGN`.
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 fn serialize_entry_page(entry: &Entry<WendelonTypeConfig>) -> Result<AlignedBuf, AnyError> {
 	serialize_entry_page_as(entry, WAL_FORMAT_VERSION)
 }
@@ -10159,7 +10159,7 @@ fn serialize_entry_page_as(
 	Ok(buf)
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 fn serialize_checkpoint_page(
 	commit_index: u64,
 	e_safe_index: u64,
