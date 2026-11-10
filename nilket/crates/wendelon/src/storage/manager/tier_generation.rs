@@ -34,6 +34,17 @@ pub enum StaleLocationReason {
 	ConflictingVersion,
 	/// The slab's committed generation is not yet published on this node.
 	Fenced,
+	/// The location is not addressable in the current object generation (it
+	/// lies below its base or beyond its end): moved or removed, unknown
+	/// which. Never proof of deletion.
+	OutsideGeneration,
+	/// A tier object's layout is invalid: a misaligned base, an overflowing
+	/// extent, or an offset index entry outside the object.
+	MalformedObjectLayout,
+	/// A successor object would reissue locations of its source: it is
+	/// neither the same object, nor a proven offset-preserving transform at
+	/// the source's base, nor based at or above the source's logical end.
+	LayoutRegression,
 }
 
 impl StaleLocationReason {
@@ -46,6 +57,9 @@ impl StaleLocationReason {
 			Self::AmbiguousVersion => "ambiguous_version",
 			Self::ConflictingVersion => "conflicting_version",
 			Self::Fenced => "fenced",
+			Self::OutsideGeneration => "outside_generation",
+			Self::MalformedObjectLayout => "malformed_object_layout",
+			Self::LayoutRegression => "layout_regression",
 		}
 	}
 }
@@ -370,14 +384,13 @@ fn select_in_snapshot(
 			Some(layout) => layout.resolve(location.slab_id, location)?,
 			None => location,
 		};
+		// ADR 0705: a rehydrated copy serves only the generation it was
+		// made from, and its reads convert through that object's layout.
 		let backing = match state.rehydrated.get(&location.slab_id) {
-			Some(copy) => SlabBacking::Local(copy.slab.clone()),
-			None => SlabBacking::L2(pointer.clone()),
+			Some(copy) if copy.serves(pointer.value()) => SlabBacking::Rehydrated(copy.clone()),
+			_ => SlabBacking::L2(pointer.clone()),
 		};
 		return Ok((backing, target));
-	}
-	if let Some(copy) = state.rehydrated.get(&location.slab_id) {
-		return Ok((SlabBacking::Local(copy.slab.clone()), location));
 	}
 	// Missing in this snapshot. Only evidence of an authorized disposal,
 	// read in the same snapshot, makes it a typed `Superseded`; otherwise the

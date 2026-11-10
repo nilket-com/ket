@@ -107,7 +107,7 @@ impl SlabManager {
 					state
 						.rehydrated
 						.get(&slab_id)
-						.map(|entry| entry.slab.clone())
+						.map(|entry| entry.store.clone())
 				})
 		};
 		let Some(handle) = handle else {

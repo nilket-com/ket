@@ -320,13 +320,12 @@ pub fn prepare_l2_column_fetch_strategy(
 		}
 		Err(err) => return Err(column_fetch_io_error(err)),
 	};
-	let record_plaintext_range = record_plaintext_range_for_crypto(record_location)?;
 	let tiered_plan = crypto.plan_tiered_multi_range_read(
 		record_location.slab_id,
 		object_size_bytes,
 		tail_window,
 		additional_metadata,
-		record_plaintext_range,
+		crate::storage::tier_object_layout::LogicalExtent::of(record_location),
 		&selected_ranges,
 	)?;
 	let candidate_plan = match build_column_fetch_plan(&directory, requirement, &tiered_plan) {
@@ -349,39 +348,6 @@ pub fn prepare_l2_column_fetch_strategy(
 			strategy,
 		},
 	))
-}
-
-fn record_plaintext_range_for_crypto(
-	record_location: &RecordLocation,
-) -> std::io::Result<std::ops::Range<usize>> {
-	let start = usize::try_from(record_location.offset).map_err(|_| {
-		Error::new(
-			ErrorKind::InvalidData,
-			format!(
-				"record offset {} does not fit into usize",
-				record_location.offset
-			),
-		)
-	})?;
-	let end_u64 = record_location
-		.offset
-		.checked_add(u64::from(record_location.length))
-		.ok_or_else(|| {
-			Error::new(
-				ErrorKind::InvalidData,
-				format!(
-					"record range overflows u64 for slab {} at offset {}",
-					record_location.slab_id, record_location.offset
-				),
-			)
-		})?;
-	let end = usize::try_from(end_u64).map_err(|_| {
-		Error::new(
-			ErrorKind::InvalidData,
-			format!("record end {end_u64} does not fit into usize"),
-		)
-	})?;
-	Ok(start..end)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3173,6 +3139,7 @@ mod tests {
 					tenant_id: TenantId::ZERO,
 					created_hlc: 0,
 					chunk_size_bytes: crate::crypto::SLAB_ENCRYPTION_DEFAULT_CHUNK_SIZE,
+					logical_base: 0,
 					offset_index: vec![TieredOffsetIndexEntry {
 						key_locator: IdentityPrefix::ZERO,
 						byte_offset: 0,
@@ -3304,6 +3271,7 @@ mod tests {
 					tenant_id: TenantId::ZERO,
 					created_hlc: 0,
 					chunk_size_bytes: crate::crypto::SLAB_ENCRYPTION_DEFAULT_CHUNK_SIZE,
+					logical_base: 0,
 					offset_index: vec![TieredOffsetIndexEntry {
 						key_locator: IdentityPrefix::ZERO,
 						byte_offset: 0,
@@ -3324,7 +3292,7 @@ mod tests {
 				object_size,
 				&encrypted.bytes[tail_start..],
 				None,
-				0..bytes.len(),
+				crate::storage::tier_object_layout::LogicalExtent::new(0, bytes.len() as u64),
 				&selected_ranges,
 			)
 			.unwrap();

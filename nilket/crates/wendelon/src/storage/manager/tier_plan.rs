@@ -14,6 +14,7 @@ use super::tier_budget::{TierHistoryShortfall, tier_history_refusal};
 use super::tiered_io::TieredRowRefreshPlan;
 use super::version_identity::same_row;
 use super::*;
+use crate::storage::tier_object_layout::SlabView;
 
 /// The logical owner of a tiered row.
 pub(super) type TierRowOwner = (TenantId, Identity, HybridTimestamp);
@@ -107,9 +108,9 @@ pub(super) fn tier_pairing_scratch_bytes(old: usize, new: usize) -> Option<u64> 
 /// frames, equal values in every column, compared both ways, for rows of
 /// multi-row frames. A frame whose rows cannot be decoded is an error.
 fn same_tier_row_payload(
-	left_plaintext: &[u8],
+	left_plaintext: SlabView<'_>,
 	left: RecordLocation,
-	right_plaintext: &[u8],
+	right_plaintext: SlabView<'_>,
 	right: RecordLocation,
 ) -> std::io::Result<bool> {
 	let left_frame = extract_record_from_blob(
@@ -178,8 +179,8 @@ fn pair_conflicting_copies(
 	slab_id: SlabId,
 	old: &[RecordLocation],
 	new: &[RecordLocation],
-	old_plaintext: &[u8],
-	new_plaintext: &[u8],
+	old_plaintext: SlabView<'_>,
+	new_plaintext: SlabView<'_>,
 ) -> std::io::Result<Vec<(RecordLocation, RecordLocation)>> {
 	let refuse = || stale_location_error(slab_id, StaleLocationReason::ConflictingVersion);
 	let mut payload_of_new = scratch_vec(slab_id, new.len())?;
@@ -247,8 +248,8 @@ impl SlabManager {
 		slab_id: SlabId,
 		old_rows: &[PersistentRecordRow],
 		new_rows: &[PersistentRecordRow],
-		old_plaintext: Option<&[u8]>,
-		new_plaintext: &[u8],
+		old_plaintext: Option<SlabView<'_>>,
+		new_plaintext: SlabView<'_>,
 	) -> std::io::Result<Vec<(RecordLocation, RecordLocation)>> {
 		let old_by_owner = locations_by_owner(slab_id, old_rows)?;
 		let new_by_owner = locations_by_owner(slab_id, new_rows)?;
@@ -310,8 +311,8 @@ impl SlabManager {
 	pub(super) async fn preflight_tier_publication(
 		&self,
 		slab_id: SlabId,
-		old_plaintext: &[u8],
-		new_plaintext: &[u8],
+		old_plaintext: SlabView<'_>,
+		new_plaintext: SlabView<'_>,
 		new_acknowledged: &BTreeSet<u64>,
 	) -> std::io::Result<()> {
 		// Count every refusal once, whichever step refused it (plan scratch,
@@ -329,10 +330,22 @@ impl SlabManager {
 	async fn preflight_tier_publication_inner(
 		&self,
 		slab_id: SlabId,
-		old_plaintext: &[u8],
-		new_plaintext: &[u8],
+		old_plaintext: SlabView<'_>,
+		new_plaintext: SlabView<'_>,
 		new_acknowledged: &BTreeSet<u64>,
 	) -> std::io::Result<()> {
+		// ADR 0705 §4: the leader classifies its successor against its exact
+		// source before anything is uploaded or proposed.
+		super::tier_transition::classify_tier_transition(
+			super::tier_transition::TierTransitionObject {
+				plaintext: old_plaintext,
+				payload_hash: None,
+			},
+			super::tier_transition::TierTransitionObject {
+				plaintext: new_plaintext,
+				payload_hash: None,
+			},
+		)?;
 		let scratch = self.reserve_tier_plan_scratch(slab_id, new_plaintext, new_acknowledged)?;
 		let new_rows =
 			self.tiered_rows_within(new_plaintext, slab_id, new_acknowledged, &scratch)?;

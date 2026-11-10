@@ -5,6 +5,7 @@ use crate::schema::{
 	RecordBodyByteLen, RecordBodyByteOffset, SlabId, TenantId, TenantKekId,
 };
 use crate::storage::ownership::DataDirectoryOwner;
+use crate::storage::tier_object_layout::{LogicalExtent, TierObjectLayout};
 use async_trait::async_trait;
 use base64::Engine as _;
 use chrono::Utc;
@@ -46,8 +47,14 @@ pub const SLAB_AAD_BYTES: usize = 48;
 pub const SLAB_STATS_AAD_BYTES: usize = 64;
 pub const SLAB_NONCE_BYTES: usize = 12;
 pub const SLAB_NONCE_VERSION: u32 = 0;
-pub const SLAB_ENVELOPE_FORMAT_VERSION: u32 = 1;
-pub const SLAB_ENVELOPE_FORMAT_VERSION_WITH_STATS: u32 = 2;
+/// The envelope versions this build writes and reads. Both carry the object's
+/// logical base in the footer.
+pub const SLAB_ENVELOPE_FORMAT_VERSION: u32 = 3;
+pub const SLAB_ENVELOPE_FORMAT_VERSION_WITH_STATS: u32 = 4;
+/// Envelope versions written before objects carried a logical base. Their
+/// layout cannot be validated, so they refuse typed `MalformedObjectLayout`
+/// (pre-release: no migration).
+const SLAB_ENVELOPE_FORMAT_VERSIONS_WITHOUT_LOGICAL_BASE: [u32; 2] = [1, 2];
 pub const SLAB_STATS_FORMAT_VERSION_ADR039: u16 = 1;
 pub const DEFAULT_TENANT_KEK_CACHE_MAX_ENTRIES: usize = 2048;
 pub const DEFAULT_SLAB_DEK_CACHE_MAX_ENTRIES: usize = 10_000;
@@ -61,8 +68,13 @@ const ADR_TIERED_SLAB_FOOTER_BYTES: usize = 256;
 const ADR_TIERED_SLAB_TAIL_BYTES: usize = 16;
 const ADR_TIERED_SLAB_INDEX_ENTRY_BYTES: usize = 32;
 const ADR_TIERED_SLAB_WIDE_ID_BYTES: usize = 16;
-const ADR_TIERED_SLAB_WRAPPED_DEK_BYTES: usize = 96;
+const ADR_TIERED_SLAB_WRAPPED_DEK_OFFSET: usize = 96;
+const ADR_TIERED_SLAB_WRAPPED_DEK_BYTES: usize = 88;
 const ADR_TIERED_SLAB_WRAPPED_DEK_PREFIX_BYTES: usize = 40;
+/// The object's logical base (`TierObjectLayout`): the last eight bytes
+/// before the HMAC, so the footer HMAC binds it.
+const ADR_TIERED_SLAB_LOGICAL_BASE_OFFSET: usize = 184;
+const ADR_TIERED_SLAB_LOGICAL_BASE_BYTES: usize = 8;
 const ADR_TIERED_SLAB_HMAC_OFFSET: usize = 192;
 const ADR_TIERED_SLAB_HMAC_BYTES: usize = 32;
 const ADR_TIERED_SLAB_RESERVED_SUFFIX_BYTES: usize = 32;
@@ -80,6 +92,25 @@ const _: [(); ADR039_STATS_LOCATOR_OFFSET] =
 const _: [(); ADR_TIERED_SLAB_FOOTER_BYTES] =
 	[(); ADR039_STATS_LOCATOR_OFFSET + ADR039_STATS_LOCATOR_BYTES];
 const _: [(); ADR_TIERED_SLAB_RESERVED_SUFFIX_BYTES] = [(); ADR039_STATS_LOCATOR_BYTES];
+const _: [(); ADR_TIERED_SLAB_LOGICAL_BASE_OFFSET] =
+	[(); ADR_TIERED_SLAB_WRAPPED_DEK_OFFSET + ADR_TIERED_SLAB_WRAPPED_DEK_BYTES];
+const _: [(); ADR_TIERED_SLAB_HMAC_OFFSET] =
+	[(); ADR_TIERED_SLAB_LOGICAL_BASE_OFFSET + ADR_TIERED_SLAB_LOGICAL_BASE_BYTES];
+/// The largest wrapped slab DEK any footer can carry. A slab DEK is
+/// `KeyMaterialBytes` (32 bytes) for every cipher (`PreparedSlabDek` keys both
+/// AES-256-GCM and AES-256-GCM-SIV with it), and its only wrapping is
+/// `SlabDek::wrap` -> `wrap_key`: AES-256 key wrap with padding (RFC 5649,
+/// aws-lc-rs `KeyWrapPadded`) under the tenant KEK. RFC 5649 §4.1 pads the key
+/// to whole 8-byte semiblocks and prepends one 8-byte integrity semiblock, so
+/// a 32-byte key wraps to 40 bytes. Root-KEK providers wrap tenant KEKs, which
+/// the footer never stores.
+const AES_KWP_SEMIBLOCK_BYTES: usize = 8;
+const MAX_WRAPPED_SLAB_DEK_BYTES: usize = std::mem::size_of::<KeyMaterialBytes>()
+	.div_ceil(AES_KWP_SEMIBLOCK_BYTES)
+	* AES_KWP_SEMIBLOCK_BYTES
+	+ AES_KWP_SEMIBLOCK_BYTES;
+const _: () = assert!(MAX_WRAPPED_SLAB_DEK_BYTES <= ADR_TIERED_SLAB_WRAPPED_DEK_BYTES);
+const _: () = assert!(MAX_WRAPPED_SLAB_DEK_BYTES == ADR_TIERED_SLAB_WRAPPED_DEK_PREFIX_BYTES);
 const SLAB_AAD_WIDE_FIELD_BYTES: usize = 16;
 const DEFAULT_TENANT_KEK_IDLE_TTL: Duration = Duration::from_secs(15 * 60);
 const DEFAULT_TENANT_KEK_ABSOLUTE_TTL: Duration = Duration::from_secs(60 * 60);
@@ -990,11 +1021,15 @@ pub struct DecryptedTieredSlab {
 	pub cipher_id: CipherId,
 	pub chunk_size_bytes: ChunkSizeBytes,
 	pub chunk_count: u32,
+	/// The object's validated layout: where its plaintext sits in the slab's
+	/// logical offsets.
+	pub layout: TierObjectLayout,
 	/// The distinct record start offsets the object's offset index lists,
 	/// decoded after the surface HMAC that binds the index and the chunk AEAD
 	/// verified. They describe this object's own layout: authenticated, but
 	/// written by whichever build produced the object, so they do not prove
-	/// that every acknowledged record was kept.
+	/// that every acknowledged record was kept. They are logical, each inside
+	/// `layout`.
 	pub record_offsets: BTreeSet<u64>,
 }
 
@@ -1131,6 +1166,10 @@ pub struct TieredSlabObjectMetadata {
 	/// Transitional until the slab footer carries the full in-memory HLC.
 	pub created_hlc: u64,
 	pub chunk_size_bytes: ChunkSizeBytes,
+	/// Where the plaintext starts in the slab's logical offsets; every
+	/// `offset_index` entry is logical and lies in `[logical_base,
+	/// logical_base + plaintext length)`.
+	pub logical_base: u64,
 	pub offset_index: Vec<TieredOffsetIndexEntry>,
 	pub column_stats_block: Option<TieredColumnStatsBlock>,
 	pub has_row_tombstone_records: bool,
@@ -1259,8 +1298,11 @@ impl TieredMultiRangeReadPlan {
 					.zip(decrypted_runs.iter())
 					.find(|(run, decrypted)| {
 						let run_start = run.base_plaintext_offset;
-						let run_end = run_start + decrypted.len();
-						requested.start >= run_start && requested.end <= run_end
+						run_start
+							.checked_add(decrypted.len())
+							.is_some_and(|run_end| {
+								requested.start >= run_start && requested.end <= run_end
+							})
 					})
 			else {
 				return Err(Error::new(
@@ -1268,6 +1310,7 @@ impl TieredMultiRangeReadPlan {
 					"requested plaintext range is not covered by decrypted chunk runs",
 				));
 			};
+			// Covered above: `run.base_plaintext_offset <= requested.start`.
 			let relative_start = requested.start - run.base_plaintext_offset;
 			let relative_end = requested.end - run.base_plaintext_offset;
 			out.push(decrypted[relative_start..relative_end].to_vec());
@@ -1279,6 +1322,9 @@ impl TieredMultiRangeReadPlan {
 struct TieredRangePlanningContext {
 	parsed: ParsedEncryptedFooterFields,
 	footer: FooterSummary,
+	/// The requested record's physical range in the object's plaintext,
+	/// converted once by the object's layout.
+	record_physical_range: Range<usize>,
 	prepared_slab_dek: Arc<PreparedSlabDek>,
 }
 
@@ -1652,6 +1698,13 @@ impl CryptoManager {
 			SLAB_ENVELOPE_FORMAT_VERSION
 		};
 		validate_slab_chunk_size(metadata.chunk_size_bytes)?;
+		let plaintext_len = u64::try_from(plaintext.len()).map_err(|_| {
+			Error::new(
+				ErrorKind::InvalidInput,
+				"tiered slab plaintext length does not fit into u64",
+			)
+		})?;
+		let layout = TierObjectLayout::new(slab_id, metadata.logical_base, plaintext_len)?;
 		let chunk_count = chunk_count_for_len(plaintext.len(), metadata.chunk_size_bytes)?;
 		let encrypted_chunks = encrypt_chunks(
 			cipher_id,
@@ -1671,7 +1724,7 @@ impl CryptoManager {
 			metadata.chunk_size_bytes,
 			chunk_count,
 		)?;
-		let index_bytes = encode_adr022_offset_index(&metadata.offset_index, plaintext.len())?;
+		let index_bytes = encode_adr022_offset_index(&metadata.offset_index, &layout)?;
 		let stats_ciphertext = metadata
 			.column_stats_block
 			.as_ref()
@@ -1703,6 +1756,7 @@ impl CryptoManager {
 			tenant_kek_id,
 			&encrypted_chunks.wrapped_slab_dek,
 			metadata.has_row_tombstone_records,
+			&layout,
 		)?;
 		let stats_locator = metadata
 			.column_stats_block
@@ -1831,6 +1885,15 @@ impl CryptoManager {
 			self.emit_decrypt_rejected(expected_slab_id, Some(footer), "hmac", &error);
 			return Err(error);
 		}
+		// The verified index must lie inside the object before any chunk is
+		// decrypted.
+		let record_offsets = match decode_adr022_record_offsets(parsed.index, &parsed.layout) {
+			Ok(offsets) => offsets,
+			Err(error) => {
+				self.emit_decrypt_rejected(expected_slab_id, Some(footer), "offset_index", &error);
+				return Err(error);
+			}
+		};
 		let slab_dek = match self.resolve_prepared_slab_dek(
 			parsed.tenant_id,
 			parsed.tenant_kek_id,
@@ -1852,19 +1915,12 @@ impl CryptoManager {
 			slab_dek,
 			parsed.chunk_size_bytes,
 			parsed.chunk_count,
-			parsed.plaintext_len,
+			parsed.layout.plaintext_len_usize(),
 			parsed.ciphertext,
 		) {
 			Ok(plaintext) => plaintext,
 			Err(error) => {
 				self.emit_decrypt_rejected(expected_slab_id, Some(footer), "aead_chunk", &error);
-				return Err(error);
-			}
-		};
-		let record_offsets = match decode_adr022_record_offsets(parsed.index, plaintext.len()) {
-			Ok(offsets) => offsets,
-			Err(error) => {
-				self.emit_decrypt_rejected(expected_slab_id, Some(footer), "offset_index", &error);
 				return Err(error);
 			}
 		};
@@ -1876,6 +1932,7 @@ impl CryptoManager {
 			cipher_id: parsed.cipher_id,
 			chunk_size_bytes: parsed.chunk_size_bytes,
 			chunk_count: parsed.chunk_count,
+			layout: parsed.layout,
 			record_offsets,
 		})
 	}
@@ -2071,13 +2128,18 @@ impl CryptoManager {
 		}))
 	}
 
+	/// The footer's layout is used only after the footer HMAC verified it.
+	/// Then, in order: every index entry lies in the object (else typed
+	/// `MalformedObjectLayout`); the logical `record` lies in the object (else
+	/// typed `OutsideGeneration`, before any subtraction or index lookup); the
+	/// index lists exactly that logical record.
 	fn prepare_tiered_range_read(
 		&self,
 		expected_slab_id: SlabId,
 		object_size_bytes: u64,
 		tail_window: &[u8],
 		additional_metadata: Option<&[u8]>,
-		indexed_plaintext_range: Range<usize>,
+		record: LogicalExtent,
 	) -> std::io::Result<TieredRangePlanningContext> {
 		let parsed = match parse_encrypted_footer_from_tail_window(object_size_bytes, tail_window) {
 			Ok(parsed) => parsed,
@@ -2109,21 +2171,6 @@ impl CryptoManager {
 			self.emit_decrypt_rejected(expected_slab_id, Some(footer), "footer_parse", &error);
 			return Err(error);
 		}
-		if indexed_plaintext_range.start > indexed_plaintext_range.end
-			|| indexed_plaintext_range.end > parsed.plaintext_len
-		{
-			let error = Error::new(
-				ErrorKind::InvalidInput,
-				format!(
-					"requested plaintext range {}..{} is outside slab plaintext length {}",
-					indexed_plaintext_range.start,
-					indexed_plaintext_range.end,
-					parsed.plaintext_len
-				),
-			);
-			self.emit_decrypt_rejected(expected_slab_id, Some(footer), "range_plan", &error);
-			return Err(error);
-		}
 		let tenant_kek = match self.get_tenant_kek(parsed.tenant_id, parsed.tenant_kek_id) {
 			Ok(tenant_kek) => tenant_kek,
 			Err(error) => {
@@ -2140,10 +2187,19 @@ impl CryptoManager {
 			self.emit_decrypt_rejected(expected_slab_id, Some(footer), "hmac", &error);
 			return Err(error);
 		}
-		if let Err(error) = verify_index_contains_range(
-			parsed.index_bytes(additional_metadata)?,
-			indexed_plaintext_range.clone(),
-		) {
+		let index_bytes = parsed.index_bytes(additional_metadata)?;
+		if let Err(error) = validate_adr022_index_extent(index_bytes, &parsed.layout) {
+			self.emit_decrypt_rejected(expected_slab_id, Some(footer), "offset_index", &error);
+			return Err(error);
+		}
+		let record_physical_range = match parsed.layout.physical_extent(record) {
+			Ok(range) => range,
+			Err(error) => {
+				self.emit_decrypt_rejected(expected_slab_id, Some(footer), "range_plan", &error);
+				return Err(error);
+			}
+		};
+		if let Err(error) = verify_index_contains_range(index_bytes, record) {
 			self.emit_decrypt_rejected(expected_slab_id, Some(footer), "range_plan", &error);
 			return Err(error);
 		}
@@ -2164,17 +2220,20 @@ impl CryptoManager {
 		Ok(TieredRangePlanningContext {
 			parsed,
 			footer,
+			record_physical_range,
 			prepared_slab_dek,
 		})
 	}
 
+	/// A read of `plaintext_ranges`, relative to the logical `record`'s start,
+	/// from the object whose tail is `tail_window`.
 	pub fn plan_tiered_multi_range_read(
 		&self,
 		expected_slab_id: SlabId,
 		object_size_bytes: u64,
 		tail_window: &[u8],
 		additional_metadata: Option<&[u8]>,
-		record_plaintext_range: Range<usize>,
+		record: LogicalExtent,
 		plaintext_ranges: &[TieredPlaintextRange],
 	) -> std::io::Result<TieredMultiRangeReadPlan> {
 		let context = self.prepare_tiered_range_read(
@@ -2182,12 +2241,12 @@ impl CryptoManager {
 			object_size_bytes,
 			tail_window,
 			additional_metadata,
-			record_plaintext_range.clone(),
+			record,
 		)?;
 		let requested_plaintext_ranges = record_relative_ranges_to_absolute(
-			record_plaintext_range,
+			context.record_physical_range.clone(),
 			plaintext_ranges,
-			context.parsed.plaintext_len,
+			context.parsed.plaintext_len(),
 		)
 		.map_err(|error| {
 			self.emit_decrypt_rejected(
@@ -2199,7 +2258,7 @@ impl CryptoManager {
 			error
 		})?;
 		let chunk_runs = chunk_read_runs_for_plaintext_ranges(
-			context.parsed.plaintext_len,
+			context.parsed.plaintext_len(),
 			context.parsed.chunk_size_bytes,
 			context.parsed.ciphertext_offset_in_object,
 			&requested_plaintext_ranges,
@@ -2221,39 +2280,49 @@ impl CryptoManager {
 			slab_format_version: context.parsed.slab_format_version,
 			cipher_id: context.parsed.cipher_id,
 			chunk_size_bytes: context.parsed.chunk_size_bytes,
-			plaintext_len: context.parsed.plaintext_len,
+			plaintext_len: context.parsed.plaintext_len(),
 			chunk_runs,
 			requested_plaintext_ranges,
 			prepared_slab_dek: context.prepared_slab_dek,
 		})
 	}
 
+	/// A read of the whole logical `record` from the object whose tail is
+	/// `tail_window`.
 	pub fn plan_tiered_range_read(
 		&self,
 		expected_slab_id: SlabId,
 		object_size_bytes: u64,
 		tail_window: &[u8],
 		additional_metadata: Option<&[u8]>,
-		plaintext_range: Range<usize>,
+		record: LogicalExtent,
 	) -> std::io::Result<TieredRangeReadPlan> {
-		let plaintext_len = plaintext_range
-			.end
-			.checked_sub(plaintext_range.start)
-			.ok_or_else(|| {
-				Error::new(
-					ErrorKind::InvalidInput,
-					"requested plaintext range start exceeds end",
-				)
-			})?;
-		let relative_range = TieredPlaintextRange::from_usize_unchecked(0, plaintext_len)?;
+		let record_len = usize::try_from(record.length).map_err(|_| {
+			Error::new(
+				ErrorKind::InvalidInput,
+				"requested record length does not fit into usize",
+			)
+		})?;
+		let relative_range = TieredPlaintextRange::from_usize_unchecked(0, record_len)?;
 		let multi = self.plan_tiered_multi_range_read(
 			expected_slab_id,
 			object_size_bytes,
 			tail_window,
 			additional_metadata,
-			plaintext_range.clone(),
+			record,
 			&[relative_range],
 		)?;
+		// The record's physical range, as the object's layout converted it.
+		let plaintext_range = multi
+			.requested_plaintext_ranges
+			.first()
+			.cloned()
+			.ok_or_else(|| {
+				Error::new(
+					ErrorKind::InvalidData,
+					"tiered range read planned no record range",
+				)
+			})?;
 		let Some(run) = multi.chunk_runs.first() else {
 			return Ok(TieredRangeReadPlan {
 				footer: multi.footer,
@@ -3448,6 +3517,31 @@ fn ciphertext_offset_for_chunk(
 	plaintext_offset + tag_offset
 }
 
+/// `ciphertext_offset_for_chunk` for a range plan, with checked arithmetic.
+fn checked_ciphertext_offset_for_chunk(
+	plaintext_len: usize,
+	chunk_size_bytes: ChunkSizeBytes,
+	chunk_index: usize,
+) -> std::io::Result<u64> {
+	let overflow = || {
+		Error::new(
+			ErrorKind::InvalidInput,
+			"tiered chunk ciphertext offset overflow",
+		)
+	};
+	let plaintext_offset = chunk_index
+		.checked_mul(chunk_size_usize(chunk_size_bytes))
+		.ok_or_else(overflow)?
+		.min(plaintext_len);
+	let tag_offset = chunk_index
+		.checked_mul(SLAB_AEAD_TAG_BYTES)
+		.ok_or_else(overflow)?;
+	let offset = plaintext_offset
+		.checked_add(tag_offset)
+		.ok_or_else(overflow)?;
+	u64::try_from(offset).map_err(|_| overflow())
+}
+
 fn record_relative_ranges_to_absolute(
 	record_plaintext_range: Range<usize>,
 	plaintext_ranges: &[TieredPlaintextRange],
@@ -3549,6 +3643,7 @@ fn chunk_read_runs_for_plaintext_ranges(
 			continue;
 		}
 		let start_chunk = plaintext_range.start / chunk_size;
+		// Non-empty above, so `end >= 1`.
 		let end_chunk = ((plaintext_range.end - 1) / chunk_size) + 1;
 		if let Some(last) = chunk_ranges.last_mut() {
 			if start_chunk <= last.end {
@@ -3578,11 +3673,11 @@ fn chunk_read_runs_for_plaintext_ranges(
 			)
 		})?;
 		let ciphertext_start = ciphertext_offset_in_object
-			.checked_add(ciphertext_offset_for_chunk(
+			.checked_add(checked_ciphertext_offset_for_chunk(
 				plaintext_len,
 				chunk_size_bytes,
 				chunk_range.start,
-			) as u64)
+			)?)
 			.ok_or_else(|| {
 				Error::new(
 					ErrorKind::InvalidInput,
@@ -3590,11 +3685,11 @@ fn chunk_read_runs_for_plaintext_ranges(
 				)
 			})?;
 		let ciphertext_end = ciphertext_offset_in_object
-			.checked_add(ciphertext_offset_for_chunk(
+			.checked_add(checked_ciphertext_offset_for_chunk(
 				plaintext_len,
 				chunk_size_bytes,
 				chunk_range.end,
-			) as u64)
+			)?)
 			.ok_or_else(|| {
 				Error::new(
 					ErrorKind::InvalidInput,
@@ -3635,7 +3730,9 @@ struct ParsedEncryptedFooterFields {
 	chunk_count: u32,
 	stats_locator: Option<TieredStatsBlockLocator>,
 	has_row_tombstone_records: bool,
-	plaintext_len: usize,
+	/// The validated layout; its extent is the plaintext once the ciphertext
+	/// length is known (`finalize_from_ciphertext_len`), empty before.
+	layout: TierObjectLayout,
 	nonce_version: u32,
 	wrapped_slab_dek: Vec<u8>,
 	surface_hmac: Vec<u8>,
@@ -3662,7 +3759,9 @@ struct ParsedEncryptedFooter<'a> {
 	chunk_count: u32,
 	stats_locator: Option<TieredStatsBlockLocator>,
 	has_row_tombstone_records: bool,
-	plaintext_len: usize,
+	/// The validated layout; its extent is the plaintext once the ciphertext
+	/// length is known (`finalize_from_ciphertext_len`), empty before.
+	layout: TierObjectLayout,
 	nonce_version: u32,
 	wrapped_slab_dek: Vec<u8>,
 	surface_hmac: Vec<u8>,
@@ -3680,12 +3779,23 @@ struct ParsedEncryptedFooter<'a> {
 
 impl ParsedEncryptedFooterFields {
 	fn finalize_from_ciphertext_len(mut self, ciphertext_len: usize) -> std::io::Result<Self> {
-		self.plaintext_len = plaintext_len_from_ciphertext_len(
+		let plaintext_len = plaintext_len_from_ciphertext_len(
 			ciphertext_len,
 			self.chunk_count,
 			self.chunk_size_bytes,
 		)?;
+		let plaintext_len = u64::try_from(plaintext_len).map_err(|_| {
+			Error::new(
+				ErrorKind::InvalidData,
+				"ADR 022 plaintext length does not fit into u64",
+			)
+		})?;
+		self.layout = TierObjectLayout::new(self.slab_id, self.layout.base(), plaintext_len)?;
 		Ok(self)
+	}
+
+	fn plaintext_len(&self) -> usize {
+		self.layout.plaintext_len_usize()
 	}
 
 	fn footer_summary(&self) -> FooterSummary {
@@ -4027,6 +4137,7 @@ fn encode_adr022_footer(
 	tenant_kek_id: TenantKekId,
 	wrapped_slab_dek: &[u8],
 	has_row_tombstone_records: bool,
+	layout: &TierObjectLayout,
 ) -> std::io::Result<[u8; ADR_TIERED_SLAB_FOOTER_BYTES]> {
 	validate_slab_chunk_size(chunk_size_bytes)?;
 	if wrapped_slab_dek.len() != ADR_TIERED_SLAB_WRAPPED_DEK_PREFIX_BYTES {
@@ -4052,24 +4163,36 @@ fn encode_adr022_footer(
 	footer[52..56].copy_from_slice(&chunk_count.to_be_bytes());
 	footer[56..64].copy_from_slice(&record_count.to_be_bytes());
 	encode_adr022_u64_slot(&mut footer[64..96], tenant_kek_id.get())?;
-	footer[96..96 + wrapped_slab_dek.len()].copy_from_slice(wrapped_slab_dek);
+	footer[ADR_TIERED_SLAB_WRAPPED_DEK_OFFSET
+		..ADR_TIERED_SLAB_WRAPPED_DEK_OFFSET + wrapped_slab_dek.len()]
+		.copy_from_slice(wrapped_slab_dek);
+	footer[ADR_TIERED_SLAB_LOGICAL_BASE_OFFSET
+		..ADR_TIERED_SLAB_LOGICAL_BASE_OFFSET + ADR_TIERED_SLAB_LOGICAL_BASE_BYTES]
+		.copy_from_slice(&layout.base().to_be_bytes());
 	Ok(footer)
 }
 
-fn verify_index_contains_range(
-	index_bytes: &[u8],
-	plaintext_range: Range<usize>,
-) -> std::io::Result<()> {
+fn verify_index_contains_range(index_bytes: &[u8], record: LogicalExtent) -> std::io::Result<()> {
 	// Cold tiered reads currently request exactly one record span from
 	// `RecordLocation`, so the ADR 022 footer index must contain the
-	// same record-aligned `(offset, length)` pair. A future multi-record
-	// pushdown path will need a separate coverage-based validator.
-	verify_adr022_index_contains_range(index_bytes, plaintext_range)
+	// same record-aligned logical `(offset, length)` pair. A future
+	// multi-record pushdown path will need a separate coverage-based
+	// validator.
+	verify_adr022_index_contains_range(index_bytes, record)
+}
+
+/// Every entry of a verified offset index lies inside the object (`layout`),
+/// or the object refuses typed `MalformedObjectLayout`.
+fn validate_adr022_index_extent(
+	index_bytes: &[u8],
+	layout: &TierObjectLayout,
+) -> std::io::Result<()> {
+	decode_adr022_record_offsets(index_bytes, layout).map(|_| ())
 }
 
 fn verify_adr022_index_contains_range(
 	index_bytes: &[u8],
-	plaintext_range: Range<usize>,
+	record: LogicalExtent,
 ) -> std::io::Result<()> {
 	if index_bytes.len() % ADR_TIERED_SLAB_INDEX_ENTRY_BYTES != 0 {
 		return Err(Error::new(
@@ -4077,38 +4200,33 @@ fn verify_adr022_index_contains_range(
 			"ADR 022 offset index length is not an integral number of entries",
 		));
 	}
-	let expected_offset = u64::try_from(plaintext_range.start).map_err(|_| {
+	let expected_len = u32::try_from(record.length).map_err(|_| {
 		Error::new(
 			ErrorKind::InvalidInput,
-			"requested plaintext range start does not fit into u64",
+			"requested record length does not fit into u32",
 		)
 	})?;
-	let expected_len = u32::try_from(plaintext_range.end.saturating_sub(plaintext_range.start))
-		.map_err(|_| {
-			Error::new(
-				ErrorKind::InvalidInput,
-				"requested plaintext range length does not fit into u32",
-			)
-		})?;
 	for entry in index_bytes.chunks_exact(ADR_TIERED_SLAB_INDEX_ENTRY_BYTES) {
 		let byte_offset = u64::from_be_bytes(entry[16..24].try_into().expect("slice len"));
 		let byte_length = u32::from_be_bytes(entry[24..28].try_into().expect("slice len"));
-		if byte_offset == expected_offset && byte_length == expected_len {
+		if byte_offset == record.offset && byte_length == expected_len {
 			return Ok(());
 		}
 	}
 	Err(Error::new(
 		ErrorKind::InvalidData,
 		format!(
-			"ADR 022 footer index does not contain requested plaintext range {}..{}",
-			plaintext_range.start, plaintext_range.end
+			"ADR 022 footer index does not contain requested logical record {}+{}",
+			record.offset, record.length
 		),
 	))
 }
 
+/// The offset index of an object with `layout`. Entries are logical; one
+/// outside the object refuses typed `MalformedObjectLayout`.
 fn encode_adr022_offset_index(
 	entries: &[TieredOffsetIndexEntry],
-	plaintext_len: usize,
+	layout: &TierObjectLayout,
 ) -> std::io::Result<Vec<u8>> {
 	let capacity = entries
 		.len()
@@ -4121,21 +4239,10 @@ fn encode_adr022_offset_index(
 		})?;
 	let mut out = Vec::with_capacity(capacity);
 	for entry in entries {
-		let end = entry
-			.byte_offset
-			.checked_add(entry.byte_length as u64)
-			.ok_or_else(|| {
-				Error::new(ErrorKind::InvalidInput, "tiered index entry range overflow")
-			})?;
-		if end > plaintext_len as u64 {
-			return Err(Error::new(
-				ErrorKind::InvalidInput,
-				format!(
-					"tiered index entry {}..{} falls outside plaintext slab length {}",
-					entry.byte_offset, end, plaintext_len
-				),
-			));
-		}
+		layout.check_index_entry(LogicalExtent::new(
+			entry.byte_offset,
+			u64::from(entry.byte_length),
+		))?;
 		out.extend_from_slice(entry.key_locator.as_bytes());
 		push_u64_be(&mut out, entry.byte_offset);
 		push_u32_be(&mut out, entry.byte_length);
@@ -4144,13 +4251,14 @@ fn encode_adr022_offset_index(
 	Ok(out)
 }
 
-/// The distinct record start offsets in an ADR 022 offset index. Every entry
-/// must lie inside the plaintext; one that does not, or a length that is not a
-/// whole number of entries, refuses the index rather than being dropped.
-/// Callers decode only bytes the surface HMAC already verified.
+/// The distinct logical record start offsets in an ADR 022 offset index.
+/// Every entry must lie inside the object's extent (`layout`); one that does
+/// not refuses the object typed `MalformedObjectLayout`, and a length that is
+/// not a whole number of entries refuses the index, rather than either being
+/// dropped. Callers decode only bytes the surface HMAC already verified.
 fn decode_adr022_record_offsets(
 	index_bytes: &[u8],
-	plaintext_len: usize,
+	layout: &TierObjectLayout,
 ) -> std::io::Result<BTreeSet<u64>> {
 	if index_bytes.len() % ADR_TIERED_SLAB_INDEX_ENTRY_BYTES != 0 {
 		return Err(Error::new(
@@ -4162,22 +4270,7 @@ fn decode_adr022_record_offsets(
 	for entry in index_bytes.chunks_exact(ADR_TIERED_SLAB_INDEX_ENTRY_BYTES) {
 		let byte_offset = u64::from_be_bytes(entry[16..24].try_into().expect("slice len"));
 		let byte_length = u32::from_be_bytes(entry[24..28].try_into().expect("slice len"));
-		let end = byte_offset
-			.checked_add(u64::from(byte_length))
-			.ok_or_else(|| {
-				Error::new(
-					ErrorKind::InvalidData,
-					"ADR 022 offset index entry range overflows",
-				)
-			})?;
-		if end > plaintext_len as u64 {
-			return Err(Error::new(
-				ErrorKind::InvalidData,
-				format!(
-					"ADR 022 offset index entry {byte_offset}..{end} falls outside plaintext length {plaintext_len}"
-				),
-			));
-		}
+		layout.check_index_entry(LogicalExtent::new(byte_offset, u64::from(byte_length)))?;
 		offsets.insert(byte_offset);
 	}
 	Ok(offsets)
@@ -4273,6 +4366,13 @@ fn parse_adr022_footer_fields(
 		));
 	}
 	let slab_format_version = u32::from_be_bytes(footer[..4].try_into().expect("slice len"));
+	if SLAB_ENVELOPE_FORMAT_VERSIONS_WITHOUT_LOGICAL_BASE.contains(&slab_format_version) {
+		let slab_id = SlabId::new(decode_adr022_u64_slot(&footer[8..24], "slab_id")?);
+		return Err(crate::storage::manager::stale_location_error(
+			slab_id,
+			crate::storage::manager::StaleLocationReason::MalformedObjectLayout,
+		));
+	}
 	if !matches!(
 		slab_format_version,
 		SLAB_ENVELOPE_FORMAT_VERSION | SLAB_ENVELOPE_FORMAT_VERSION_WITH_STATS
@@ -4326,7 +4426,8 @@ fn parse_adr022_footer_fields(
 				)
 			},
 		)?;
-	let wrapped_slot = &footer[96..96 + ADR_TIERED_SLAB_WRAPPED_DEK_BYTES];
+	let wrapped_slot = &footer[ADR_TIERED_SLAB_WRAPPED_DEK_OFFSET
+		..ADR_TIERED_SLAB_WRAPPED_DEK_OFFSET + ADR_TIERED_SLAB_WRAPPED_DEK_BYTES];
 	if wrapped_slot[ADR_TIERED_SLAB_WRAPPED_DEK_PREFIX_BYTES..]
 		.iter()
 		.any(|byte| *byte != 0)
@@ -4337,6 +4438,12 @@ fn parse_adr022_footer_fields(
 		));
 	}
 	let wrapped_slab_dek = wrapped_slot[..ADR_TIERED_SLAB_WRAPPED_DEK_PREFIX_BYTES].to_vec();
+	let logical_base = u64::from_be_bytes(
+		footer[ADR_TIERED_SLAB_LOGICAL_BASE_OFFSET
+			..ADR_TIERED_SLAB_LOGICAL_BASE_OFFSET + ADR_TIERED_SLAB_LOGICAL_BASE_BYTES]
+			.try_into()
+			.expect("slice len"),
+	);
 	let surface_hmac = footer
 		[ADR_TIERED_SLAB_HMAC_OFFSET..ADR_TIERED_SLAB_HMAC_OFFSET + ADR_TIERED_SLAB_HMAC_BYTES]
 		.to_vec();
@@ -4369,7 +4476,7 @@ fn parse_adr022_footer_fields(
 		chunk_count,
 		stats_locator,
 		has_row_tombstone_records,
-		plaintext_len: 0,
+		layout: TierObjectLayout::new(slab_id, logical_base, 0)?,
 		nonce_version: SLAB_NONCE_VERSION,
 		wrapped_slab_dek,
 		surface_hmac,
@@ -4437,7 +4544,7 @@ fn parse_adr022_encrypted_footer(blob: &[u8]) -> std::io::Result<ParsedEncrypted
 		chunk_count: fields.chunk_count,
 		stats_locator: fields.stats_locator,
 		has_row_tombstone_records: fields.has_row_tombstone_records,
-		plaintext_len: fields.plaintext_len,
+		layout: fields.layout,
 		nonce_version: fields.nonce_version,
 		wrapped_slab_dek: fields.wrapped_slab_dek,
 		surface_hmac: fields.surface_hmac,
@@ -5754,6 +5861,7 @@ where
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::storage::tier_object_layout::TIER_LAYOUT_PAGE_BYTES;
 	use std::collections::HashMap as StdHashMap;
 	use std::io::{BufRead, BufReader};
 	use std::net::{TcpListener, TcpStream};
@@ -6026,6 +6134,7 @@ mod tests {
 					tenant_id,
 					created_hlc: 0,
 					chunk_size_bytes: SLAB_ENCRYPTION_DEFAULT_CHUNK_SIZE,
+					logical_base: 0,
 					offset_index: vec![TieredOffsetIndexEntry {
 						key_locator: IdentityPrefix::ZERO,
 						byte_offset: 0,
@@ -6052,6 +6161,7 @@ mod tests {
 					tenant_id: TenantId::ZERO,
 					created_hlc: 47,
 					chunk_size_bytes: SLAB_ENCRYPTION_DEFAULT_CHUNK_SIZE,
+					logical_base: 0,
 					offset_index: vec![TieredOffsetIndexEntry {
 						key_locator: IdentityPrefix::ZERO,
 						byte_offset: 0,
@@ -6081,6 +6191,7 @@ mod tests {
 					tenant_id: TenantId::ZERO,
 					created_hlc: 48,
 					chunk_size_bytes: SLAB_ENCRYPTION_DEFAULT_CHUNK_SIZE,
+					logical_base: 0,
 					offset_index: vec![TieredOffsetIndexEntry {
 						key_locator: IdentityPrefix::ZERO,
 						byte_offset: 0,
@@ -6157,7 +6268,7 @@ mod tests {
 			&[
 				0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0, 0, 0, 0,
 				0, 0, 0, 0, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0, 0, 0, 0, 0, 0, 0, 9,
-				0, 0, 0, 1, 1, 0, 0, 0
+				0, 0, 0, 3, 1, 0, 0, 0
 			]
 		);
 	}
@@ -6213,6 +6324,7 @@ mod tests {
 					tenant_id: TenantId::ZERO,
 					created_hlc: 11,
 					chunk_size_bytes: SLAB_ENCRYPTION_DEFAULT_CHUNK_SIZE,
+					logical_base: 0,
 					offset_index: vec![TieredOffsetIndexEntry {
 						key_locator: IdentityPrefix::ZERO,
 						byte_offset: 4,
@@ -6229,7 +6341,13 @@ mod tests {
 		let tail_start = object_size.saturating_sub(64 * 1024) as usize;
 		let tail_window = &encrypted.bytes[tail_start..];
 		let err = crypto
-			.plan_tiered_range_read(SlabId::new(41), object_size, tail_window, None, 0..4)
+			.plan_tiered_range_read(
+				SlabId::new(41),
+				object_size,
+				tail_window,
+				None,
+				LogicalExtent::new(0, 4),
+			)
 			.err()
 			.expect("range plan should reject ranges absent from footer index");
 		assert!(
@@ -6251,6 +6369,7 @@ mod tests {
 					tenant_id: TenantId::ZERO,
 					created_hlc: 61,
 					chunk_size_bytes: chunk_size,
+					logical_base: 0,
 					offset_index: vec![TieredOffsetIndexEntry {
 						key_locator: IdentityPrefix::ZERO,
 						byte_offset: 0,
@@ -6276,7 +6395,7 @@ mod tests {
 				object_size,
 				tail_window,
 				None,
-				0..plaintext.len(),
+				LogicalExtent::new(0, plaintext.len() as u64),
 				&[range],
 			)
 			.unwrap();
@@ -6307,6 +6426,7 @@ mod tests {
 					tenant_id: TenantId::ZERO,
 					created_hlc: 61,
 					chunk_size_bytes: ChunkSizeBytes::new(12 * 1024),
+					logical_base: 0,
 					offset_index: vec![TieredOffsetIndexEntry {
 						key_locator: IdentityPrefix::ZERO,
 						byte_offset: 0,
@@ -6333,7 +6453,7 @@ mod tests {
 		let encrypted =
 			encrypt_test_tiered_slab(&crypto, SlabId::new(440), TenantId::ZERO, &plaintext);
 		let (object_size, tail_window) = tail_window_for(&encrypted);
-		let record_range = 0..plaintext.len();
+		let record_range = LogicalExtent::new(0, plaintext.len() as u64);
 
 		let single = crypto
 			.plan_tiered_range_read(
@@ -6341,7 +6461,7 @@ mod tests {
 				object_size,
 				tail_window,
 				None,
-				record_range.clone(),
+				record_range,
 			)
 			.unwrap();
 		let multi = crypto
@@ -6384,7 +6504,7 @@ mod tests {
 				object_size,
 				tail_window,
 				None,
-				0..plaintext.len(),
+				LogicalExtent::new(0, plaintext.len() as u64),
 				&[
 					rel_range(10, 40),
 					rel_range(20, 10),
@@ -6422,7 +6542,7 @@ mod tests {
 				object_size,
 				tail_window,
 				None,
-				0..plaintext.len(),
+				LogicalExtent::new(0, plaintext.len() as u64),
 				&[
 					rel_range(first.start, first.len()),
 					rel_range(second.start, second.len()),
@@ -6459,7 +6579,7 @@ mod tests {
 			object_size,
 			tail_window,
 			None,
-			0..plaintext.len(),
+			LogicalExtent::new(0, plaintext.len() as u64),
 			&[rel_range(120, 16)],
 		) {
 			Ok(_) => panic!("out-of-record range should fail"),
@@ -6485,7 +6605,7 @@ mod tests {
 				object_size,
 				tail_window,
 				None,
-				0..plaintext.len(),
+				LogicalExtent::new(0, plaintext.len() as u64),
 				&[rel_range(0, 16)],
 			)
 			.unwrap();
@@ -6513,6 +6633,7 @@ mod tests {
 					tenant_id: TenantId::ZERO,
 					created_hlc: 12,
 					chunk_size_bytes: SLAB_ENCRYPTION_DEFAULT_CHUNK_SIZE,
+					logical_base: 0,
 					offset_index: vec![TieredOffsetIndexEntry {
 						key_locator: IdentityPrefix::ZERO,
 						byte_offset: 0,
@@ -6626,6 +6747,7 @@ mod tests {
 					tenant_id: TenantId::ZERO,
 					created_hlc: 14,
 					chunk_size_bytes: SLAB_ENCRYPTION_DEFAULT_CHUNK_SIZE,
+					logical_base: 0,
 					offset_index: vec![TieredOffsetIndexEntry {
 						key_locator: IdentityPrefix::ZERO,
 						byte_offset: 0,
@@ -6851,6 +6973,305 @@ mod tests {
 		);
 	}
 
+	/// The typed `StaleLocation` reason an error carries, if any.
+	fn stale_reason(error: &Error) -> Option<crate::storage::manager::StaleLocationReason> {
+		crate::storage::manager::stale_location(error).map(|stale| stale.reason)
+	}
+
+	const MALFORMED: Option<crate::storage::manager::StaleLocationReason> =
+		Some(crate::storage::manager::StaleLocationReason::MalformedObjectLayout);
+	const OUTSIDE: Option<crate::storage::manager::StaleLocationReason> =
+		Some(crate::storage::manager::StaleLocationReason::OutsideGeneration);
+
+	/// An object of `plaintext` stored from logical `base`, with one index
+	/// entry per `records` (physical offset, length), shifted by `base`.
+	fn encrypt_based_test_slab(
+		crypto: &CryptoManager,
+		slab_id: SlabId,
+		base: u64,
+		plaintext: &[u8],
+		records: &[(u64, u32)],
+	) -> std::io::Result<EncryptedTieredSlab> {
+		crypto.encrypt_tiered_slab_object(
+			slab_id,
+			&TieredSlabObjectMetadata {
+				tenant_id: TenantId::ZERO,
+				created_hlc: 0,
+				chunk_size_bytes: SLAB_ENCRYPTION_DEFAULT_CHUNK_SIZE,
+				logical_base: base,
+				offset_index: records
+					.iter()
+					.map(|(offset, length)| TieredOffsetIndexEntry {
+						key_locator: IdentityPrefix::ZERO,
+						byte_offset: base + offset,
+						byte_length: *length,
+						flags: 0,
+					})
+					.collect(),
+				column_stats_block: None,
+				has_row_tombstone_records: false,
+			},
+			plaintext,
+		)
+	}
+
+	/// `bytes` with its footer and index rewritten by `edit` and the surface
+	/// HMAC signed again under the object's tenant KEK: an object whose
+	/// layout is wrong yet authentic, so only layout validation refuses it.
+	fn resigned(
+		crypto: &CryptoManager,
+		bytes: &[u8],
+		edit: impl FnOnce(&mut [u8], &mut [u8]),
+	) -> Vec<u8> {
+		let mut out = bytes.to_vec();
+		let (footer_len, index_len, tail_offset) = parse_adr022_tail_anchor(&out).unwrap();
+		let footer_start = tail_offset - footer_len as usize;
+		let index_start = footer_start - index_len as usize;
+		let (head, footer_and_tail) = out.split_at_mut(footer_start);
+		let (footer, _) = footer_and_tail.split_at_mut(footer_len as usize);
+		edit(footer, &mut head[index_start..]);
+		let tenant_id =
+			TenantId::new(decode_adr022_u64_slot(&footer[24..40], "tenant_id").unwrap());
+		let kek_id =
+			TenantKekId::try_from(decode_adr022_u64_slot(&footer[64..96], "kek").unwrap()).unwrap();
+		let tenant_kek = crypto.get_tenant_kek(tenant_id, kek_id).unwrap();
+		let header = &out[ADR_TIERED_SLAB_MAGIC_HEAD.len()
+			..ADR_TIERED_SLAB_MAGIC_HEAD.len() + ADR_TIERED_SLAB_HEADER_BYTES];
+		let footer = &out[footer_start..tail_offset];
+		let tag = compute_adr022_surface_hmac(
+			&tenant_kek,
+			header,
+			&out[index_start..footer_start],
+			&footer[..ADR_TIERED_SLAB_HMAC_OFFSET],
+			&footer[ADR_TIERED_SLAB_HMAC_OFFSET + ADR_TIERED_SLAB_HMAC_BYTES..],
+			footer_len,
+			index_len,
+		);
+		out[footer_start + ADR_TIERED_SLAB_HMAC_OFFSET
+			..footer_start + ADR_TIERED_SLAB_HMAC_OFFSET + ADR_TIERED_SLAB_HMAC_BYTES]
+			.copy_from_slice(tag.as_ref());
+		out
+	}
+
+	fn set_footer_base(footer: &mut [u8], base: u64) {
+		footer[ADR_TIERED_SLAB_LOGICAL_BASE_OFFSET
+			..ADR_TIERED_SLAB_LOGICAL_BASE_OFFSET + ADR_TIERED_SLAB_LOGICAL_BASE_BYTES]
+			.copy_from_slice(&base.to_be_bytes());
+	}
+
+	/// Both the full decrypt and the ranged planner refuse `bytes` with
+	/// `reason`, before anything is decrypted or a ciphertext range planned.
+	fn assert_object_refused(
+		crypto: &CryptoManager,
+		slab_id: SlabId,
+		bytes: &[u8],
+		record: LogicalExtent,
+		reason: Option<crate::storage::manager::StaleLocationReason>,
+		what: &str,
+	) {
+		let full = crypto.decrypt_tiered_slab(slab_id, bytes).unwrap_err();
+		assert_eq!(stale_reason(&full), reason, "{what}: full decrypt: {full}");
+		let ranged =
+			match crypto.plan_tiered_range_read(slab_id, bytes.len() as u64, bytes, None, record) {
+				Ok(_) => panic!("{what}: a ranged read was planned"),
+				Err(error) => error,
+			};
+		assert_eq!(
+			stale_reason(&ranged),
+			reason,
+			"{what}: ranged read: {ranged}"
+		);
+	}
+
+	#[test]
+	fn envelope_versions_without_a_logical_base_refuse_typed() {
+		let crypto = CryptoManager::new_dev();
+		crypto.install_local_only_for_tests(TenantId::ZERO).unwrap();
+		let slab_id = SlabId::new(705);
+		let plaintext = patterned_plaintext(64);
+		let encrypted = encrypt_test_tiered_slab(&crypto, slab_id, TenantId::ZERO, &plaintext);
+		assert_eq!(encrypted.slab_format_version, SLAB_ENVELOPE_FORMAT_VERSION);
+		assert_eq!(SLAB_ENVELOPE_FORMAT_VERSION, 3);
+		assert_eq!(SLAB_ENVELOPE_FORMAT_VERSION_WITH_STATS, 4);
+		let record = LogicalExtent::new(0, plaintext.len() as u64);
+		for old in SLAB_ENVELOPE_FORMAT_VERSIONS_WITHOUT_LOGICAL_BASE {
+			let mut bytes = encrypted.bytes.clone();
+			let (footer_len, _, tail_offset) = parse_adr022_tail_anchor(&bytes).unwrap();
+			let footer_start = tail_offset - footer_len as usize;
+			bytes[footer_start..footer_start + 4].copy_from_slice(&old.to_be_bytes());
+			assert_object_refused(
+				&crypto,
+				slab_id,
+				&bytes,
+				record,
+				MALFORMED,
+				&format!("version {old}"),
+			);
+			assert!(crypto.encrypted_footer_summary(&bytes).is_err());
+		}
+	}
+
+	#[test]
+	fn a_based_object_reads_as_a_base_zero_object_at_logical_offsets() {
+		let crypto = CryptoManager::new_dev();
+		crypto.install_local_only_for_tests(TenantId::ZERO).unwrap();
+		let slab_id = SlabId::new(706);
+		let chunk = SLAB_ENCRYPTION_DEFAULT_CHUNK_BYTES;
+		let plaintext = patterned_plaintext(chunk * 2 + 4096 + 100);
+		let records = [(0_u64, 4096_u32), (chunk as u64 + 4096, 4196_u32)];
+		let base = 7 * TIER_LAYOUT_PAGE_BYTES;
+		let dense = encrypt_based_test_slab(&crypto, slab_id, 0, &plaintext, &records).unwrap();
+		let based = encrypt_based_test_slab(&crypto, slab_id, base, &plaintext, &records).unwrap();
+
+		let dense_full = crypto.decrypt_tiered_slab(slab_id, &dense.bytes).unwrap();
+		let based_full = crypto.decrypt_tiered_slab(slab_id, &based.bytes).unwrap();
+		assert_eq!(dense_full.plaintext, based_full.plaintext);
+		assert_eq!(dense_full.layout.base(), 0);
+		assert_eq!(based_full.layout.base(), base);
+		assert_eq!(based_full.layout.plaintext_len(), plaintext.len() as u64);
+		assert_eq!(
+			based_full.layout.logical_end(),
+			(base + plaintext.len() as u64).next_multiple_of(TIER_LAYOUT_PAGE_BYTES)
+		);
+		assert_eq!(
+			based_full.record_offsets,
+			records.iter().map(|(offset, _)| base + offset).collect()
+		);
+
+		for (offset, length) in records {
+			let read = |bytes: &[u8], logical: u64| {
+				let plan = crypto
+					.plan_tiered_range_read(
+						slab_id,
+						bytes.len() as u64,
+						bytes,
+						None,
+						LogicalExtent::new(logical, u64::from(length)),
+					)
+					.unwrap();
+				let range = plan.ciphertext_range_in_object();
+				plan.decrypt(&bytes[range.start as usize..range.end as usize])
+					.unwrap()
+			};
+			let expected = &plaintext[offset as usize..(offset + u64::from(length)) as usize];
+			assert_eq!(read(&dense.bytes, offset), expected);
+			assert_eq!(read(&based.bytes, base + offset), expected);
+		}
+	}
+
+	#[test]
+	fn a_location_outside_a_based_object_refuses_typed_before_any_read_is_planned() {
+		let crypto = CryptoManager::new_dev();
+		crypto.install_local_only_for_tests(TenantId::ZERO).unwrap();
+		let slab_id = SlabId::new(707);
+		let plaintext = patterned_plaintext(8192);
+		let base = 2 * TIER_LAYOUT_PAGE_BYTES;
+		let based = encrypt_based_test_slab(
+			&crypto,
+			slab_id,
+			base,
+			&plaintext,
+			&[(0, 4096), (4096, 4096)],
+		)
+		.unwrap();
+		let plan = |record: LogicalExtent| {
+			crypto.plan_tiered_range_read(
+				slab_id,
+				based.bytes.len() as u64,
+				&based.bytes,
+				None,
+				record,
+			)
+		};
+		// Below the base (a source location the replacement does not hold),
+		// straddling the end, beyond the end, and an overflowing extent.
+		for (what, record) in [
+			("below base", LogicalExtent::new(0, 4096)),
+			("ends past base", LogicalExtent::new(base - 4096, 8192)),
+			("straddles end", LogicalExtent::new(base + 4096, 8192)),
+			("beyond end", LogicalExtent::new(base + 8192, 4096)),
+			("overflow", LogicalExtent::new(u64::MAX - 10, 4096)),
+		] {
+			let error = match plan(record) {
+				Ok(_) => panic!("{what}: a read was planned"),
+				Err(error) => error,
+			};
+			assert_eq!(stale_reason(&error), OUTSIDE, "{what}: {error}");
+		}
+		assert!(plan(LogicalExtent::new(base + 4096, 4096)).is_ok());
+	}
+
+	#[test]
+	fn an_object_layout_is_refused_typed_when_its_base_or_index_is_out_of_bounds() {
+		let crypto = CryptoManager::new_dev();
+		crypto.install_local_only_for_tests(TenantId::ZERO).unwrap();
+		let slab_id = SlabId::new(708);
+		// Not a whole number of pages, so an aligned end can overflow while
+		// `base + len` fits.
+		let plaintext = patterned_plaintext(8192 + 100);
+		let base = TIER_LAYOUT_PAGE_BYTES;
+		let records = [(0, 4096), (4096, 4196)];
+		let based = encrypt_based_test_slab(&crypto, slab_id, base, &plaintext, &records).unwrap();
+		let record = LogicalExtent::new(base, 4096);
+		// Control: re-signing alone changes nothing.
+		let control = resigned(&crypto, &based.bytes, |_, _| {});
+		assert_eq!(
+			crypto
+				.decrypt_tiered_slab(slab_id, &control)
+				.unwrap()
+				.plaintext,
+			plaintext
+		);
+
+		// The producer refuses a misaligned base and an index entry outside
+		// the object; nothing is encrypted.
+		for (what, result) in [
+			(
+				"misaligned base",
+				encrypt_based_test_slab(&crypto, slab_id, base + 1, &plaintext, &records),
+			),
+			(
+				"entry past the end",
+				encrypt_based_test_slab(&crypto, slab_id, base, &plaintext, &[(4096, 4300)]),
+			),
+		] {
+			let error = result.unwrap_err();
+			assert_eq!(stale_reason(&error), MALFORMED, "producer, {what}: {error}");
+		}
+
+		// An authentic object whose footer or index is wrong.
+		let aligned_max = u64::MAX - (u64::MAX % TIER_LAYOUT_PAGE_BYTES);
+		let cases: [(&str, Box<dyn Fn(&mut [u8], &mut [u8])>); 5] = [
+			(
+				"misaligned base",
+				Box::new(move |footer, _| set_footer_base(footer, base + 8)),
+			),
+			(
+				"base + len overflows",
+				Box::new(move |footer, _| set_footer_base(footer, aligned_max)),
+			),
+			(
+				"aligned end overflows",
+				// base + 8292 fits; its page-aligned end does not.
+				Box::new(move |footer, _| set_footer_base(footer, aligned_max - 8192)),
+			),
+			(
+				"index entry below the base",
+				Box::new(|_, index| index[16..24].copy_from_slice(&0_u64.to_be_bytes())),
+			),
+			(
+				"index entry beyond the end",
+				Box::new(move |_, index| {
+					index[16..24].copy_from_slice(&(base + 8192 + 100).to_be_bytes())
+				}),
+			),
+		];
+		for (what, edit) in cases {
+			let bytes = resigned(&crypto, &based.bytes, |footer, index| edit(footer, index));
+			assert_object_refused(&crypto, slab_id, &bytes, record, MALFORMED, what);
+		}
+	}
+
 	#[test]
 	fn record_offsets_decode_the_offset_index_and_refuse_bad_entries() {
 		let entry = |byte_offset: u64, byte_length: u32| TieredOffsetIndexEntry {
@@ -6859,24 +7280,34 @@ mod tests {
 			byte_length,
 			flags: 0,
 		};
+		let layout = |len: u64| TierObjectLayout::new(SlabId::new(9), 0, len).unwrap();
 		// Two rows of one record share an offset; the set holds it once.
 		let entries = [entry(0, 100), entry(0, 100), entry(4096, 200)];
-		let bytes = encode_adr022_offset_index(&entries, 8192).unwrap();
+		let bytes = encode_adr022_offset_index(&entries, &layout(8192)).unwrap();
 		assert_eq!(
-			decode_adr022_record_offsets(&bytes, 8192).unwrap(),
+			decode_adr022_record_offsets(&bytes, &layout(8192)).unwrap(),
 			BTreeSet::from([0, 4096])
 		);
 		assert_eq!(
-			decode_adr022_record_offsets(&[], 8192).unwrap(),
+			decode_adr022_record_offsets(&[], &layout(8192)).unwrap(),
 			BTreeSet::new()
 		);
 		// A partial entry, an entry past the plaintext, and an overflowing
 		// range each refuse the whole index; none is dropped.
-		assert!(decode_adr022_record_offsets(&bytes[..bytes.len() - 1], 8192).is_err());
-		assert!(decode_adr022_record_offsets(&bytes, 4296 - 1).is_err());
-		let mut overflow = encode_adr022_offset_index(&[entry(0, 1)], 8192).unwrap();
+		assert!(decode_adr022_record_offsets(&bytes[..bytes.len() - 1], &layout(8192)).is_err());
+		let malformed = |error: Error| {
+			crate::storage::manager::stale_location(&error).map(|stale| stale.reason)
+		};
+		assert_eq!(
+			malformed(decode_adr022_record_offsets(&bytes, &layout(4296 - 1)).unwrap_err()),
+			Some(crate::storage::manager::StaleLocationReason::MalformedObjectLayout)
+		);
+		let mut overflow = encode_adr022_offset_index(&[entry(0, 1)], &layout(8192)).unwrap();
 		overflow[16..24].copy_from_slice(&u64::MAX.to_be_bytes());
-		assert!(decode_adr022_record_offsets(&overflow, 8192).is_err());
+		assert_eq!(
+			malformed(decode_adr022_record_offsets(&overflow, &layout(8192)).unwrap_err()),
+			Some(crate::storage::manager::StaleLocationReason::MalformedObjectLayout)
+		);
 	}
 
 	#[test]
@@ -6906,6 +7337,7 @@ mod tests {
 					tenant_id: TenantId::ZERO,
 					created_hlc: 13,
 					chunk_size_bytes: SLAB_ENCRYPTION_DEFAULT_CHUNK_SIZE,
+					logical_base: 0,
 					offset_index: offset_index.clone(),
 					column_stats_block: Some(TieredColumnStatsBlock::plaintext(
 						stats_plaintext.clone(),
@@ -6919,7 +7351,11 @@ mod tests {
 			)
 			.unwrap();
 		let locator = encrypted.stats_locator.expect("stats locator");
-		let expected_index = encode_adr022_offset_index(&offset_index, plaintext.len()).unwrap();
+		let expected_index = encode_adr022_offset_index(
+			&offset_index,
+			&TierObjectLayout::new(SlabId::new(43), 0, plaintext.len() as u64).unwrap(),
+		)
+		.unwrap();
 		let stats_start = ADR_TIERED_SLAB_MAGIC_HEAD.len()
 			+ ADR_TIERED_SLAB_HEADER_BYTES
 			+ ciphertext_offset_for_chunk(
@@ -6997,6 +7433,7 @@ mod tests {
 					tenant_id: TenantId::ZERO,
 					created_hlc: 13,
 					chunk_size_bytes: SLAB_ENCRYPTION_DEFAULT_CHUNK_SIZE,
+					logical_base: 0,
 					offset_index: vec![TieredOffsetIndexEntry {
 						key_locator: IdentityPrefix::ZERO,
 						byte_offset: 0,
@@ -7108,6 +7545,7 @@ mod tests {
 					tenant_id: TenantId::ZERO,
 					created_hlc: 14,
 					chunk_size_bytes: SLAB_ENCRYPTION_DEFAULT_CHUNK_SIZE,
+					logical_base: 0,
 					offset_index: vec![TieredOffsetIndexEntry {
 						key_locator: IdentityPrefix::ZERO,
 						byte_offset: 0,
@@ -7617,7 +8055,31 @@ mod tests {
 	// Frozen from 71e096320 + aws-lc-rs 1.16.3, before the separate-tag repair.
 	// Fixed DEK=[0x35;32], tenant=7, slab=42, generation=9, chunk size=16.
 	// These are format compatibility controls; this key/nonce reuse is test-only.
+	// The envelope version is an AEAD input of both: the chunk AAD binds the
+	// object's version (layout pinned by `chunk_aad_matches_golden_layout`) and
+	// the stats AAD the with-stats version (`stats_aad_matches_golden_layout`).
+	// Re-frozen when production began writing versions 3 and 4 (ADR 0705): the
+	// chunk vectors pin what a version-3 object writes, the stats vectors what a
+	// version-4 object writes; only the version bytes of each AAD changed.
 	const FROZEN_SLAB_PLAINTEXT: &[u8] = b"fixed slab format control: three chunks!";
+
+	#[test]
+	fn stats_aad_matches_golden_layout() {
+		let aad = encode_stats_aad(
+			TenantId::new(0x0102_0304_0506_0708),
+			SlabId::new(0x1112_1314_1516_1718),
+			CipherId::Aes256GcmInjective,
+			9,
+		);
+		let mut expected = [0_u8; SLAB_STATS_AAD_BYTES];
+		expected[8..16].copy_from_slice(&[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]);
+		expected[24..32].copy_from_slice(&[0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18]);
+		expected[32..36].copy_from_slice(&[0, 0, 0, 4]);
+		expected[36..38].copy_from_slice(&[0, 1]);
+		expected[38] = CipherId::Aes256GcmInjective.to_wire();
+		expected[47] = 9;
+		assert_eq!(aad, expected);
+	}
 
 	fn prepared_slab_format_key(cipher: CipherId) -> PreparedSlabDek {
 		let key = KeyMaterialBytes::copy_from_slice(&[0x35; 32], "format control").unwrap();
@@ -7657,7 +8119,7 @@ mod tests {
 			cipher,
 			tenant,
 			slab,
-			SLAB_ENVELOPE_FORMAT_VERSION_WITH_STATS,
+			SLAB_ENVELOPE_FORMAT_VERSION,
 			size,
 			FROZEN_SLAB_PLAINTEXT,
 			0..3,
@@ -7671,7 +8133,7 @@ mod tests {
 			cipher,
 			tenant,
 			slab,
-			SLAB_ENVELOPE_FORMAT_VERSION_WITH_STATS,
+			SLAB_ENVELOPE_FORMAT_VERSION,
 			size,
 			FROZEN_SLAB_PLAINTEXT.len(),
 			expected,
@@ -7689,8 +8151,8 @@ mod tests {
 			&[
 				0x17, 0xd0, 0xc7, 0xa6, 0xec, 0xe7, 0x94, 0x40, 0xb1, 0xfd, 0x52, 0x69, 0x88, 0xbb,
 				0x4d, 0xdb, 0x80, 0x41, 0xf2, 0xdd, 0xb9, 0xb6, 0xc8, 0xce, 0x67, 0x59, 0xb4, 0x4d,
-				0xa1, 0x92, 0x42, 0x4a, 0x5b, 0xa8, 0x80, 0xbd, 0xe3, 0x7b, 0x9b, 0x44, 0x1e, 0xc2,
-				0xdc, 0x94, 0xf5, 0xe0, 0x1d, 0xe8, 0x7d, 0x4f, 0x12, 0xa5, 0x06, 0x6e, 0x97, 0x0e,
+				0xa1, 0x92, 0x42, 0x4a, 0x5b, 0xa8, 0x80, 0xbd, 0xe3, 0x7b, 0x9b, 0x44, 0x19, 0x76,
+				0xa9, 0xda, 0x3a, 0x51, 0xb4, 0x67, 0x22, 0x43, 0x76, 0x97, 0xe0, 0xf1, 0x65, 0xd7,
 			],
 		);
 	}
@@ -7701,12 +8163,12 @@ mod tests {
 			CipherId::Aes256GcmInjective,
 			&[
 				0x41, 0x0b, 0x00, 0x84, 0x83, 0xf5, 0x15, 0x2d, 0x3a, 0x02, 0x9b, 0xd2, 0x45, 0x18,
-				0x14, 0x15, 0x44, 0x5b, 0x80, 0x11, 0x47, 0x4d, 0x0e, 0x33, 0x73, 0x58, 0x59, 0x0c,
-				0xc8, 0xcc, 0xdc, 0xb8, 0x58, 0xd4, 0x34, 0xe8, 0x1d, 0x37, 0x99, 0x4f, 0xa6, 0xe9,
-				0x61, 0xbb, 0x97, 0x42, 0x9d, 0xea, 0xb3, 0x78, 0x3c, 0x71, 0xa2, 0x0b, 0xfb, 0x3b,
-				0xc3, 0xb6, 0x77, 0x7a, 0x21, 0xb8, 0x7f, 0xd5, 0x2b, 0x6e, 0xcb, 0x00, 0x71, 0xf5,
-				0x1f, 0xcb, 0xfa, 0x94, 0x79, 0xc0, 0xf0, 0x43, 0xb0, 0x77, 0x32, 0x56, 0xf7, 0xb1,
-				0x18, 0x59, 0x8a, 0x64,
+				0x14, 0x15, 0x81, 0xe5, 0x0f, 0xee, 0xd4, 0xc6, 0xe2, 0xdb, 0x72, 0xb3, 0xda, 0xeb,
+				0x36, 0xd0, 0xdf, 0x9f, 0x58, 0xd4, 0x34, 0xe8, 0x1d, 0x37, 0x99, 0x4f, 0xa6, 0xe9,
+				0x61, 0xbb, 0x97, 0x42, 0x9d, 0xea, 0x76, 0xc6, 0xb3, 0x8e, 0x31, 0x80, 0x17, 0xd3,
+				0xc2, 0x5d, 0xf4, 0x9d, 0xdf, 0xa4, 0x7c, 0xf2, 0x2b, 0x6e, 0xcb, 0x00, 0x71, 0xf5,
+				0x1f, 0xcb, 0x3f, 0x2a, 0xf6, 0x3f, 0x63, 0xc8, 0x5c, 0x9f, 0x33, 0xbd, 0x74, 0x56,
+				0xe6, 0x45, 0x89, 0x43,
 			],
 		);
 	}
@@ -7717,10 +8179,10 @@ mod tests {
 		assert_slab_stats_frozen_format(
 			CipherId::Aes256GcmSiv,
 			&[
-				0x16, 0x1f, 0x81, 0xef, 0x82, 0x11, 0x37, 0x25, 0x75, 0xf7, 0x69, 0x8c, 0x94, 0x59,
-				0x87, 0x00, 0x4f, 0x36, 0xce, 0x27, 0x2d, 0x4c, 0x14, 0x2e, 0xd5, 0x2e, 0xb7, 0x8a,
-				0x08, 0x21, 0x73, 0xf1, 0x59, 0x8b, 0xf4, 0xab, 0x43, 0x52, 0x92, 0xbf, 0xa3, 0x30,
-				0x0c, 0xa9, 0xe2, 0x51, 0x51, 0x1a, 0x94, 0xed, 0xa2, 0x42, 0xa6, 0x32, 0x73, 0x84,
+				0x8c, 0x62, 0x8a, 0x18, 0xd7, 0xa8, 0xb2, 0x62, 0x6d, 0x40, 0x85, 0x38, 0xf5, 0x51,
+				0x3d, 0x1c, 0x4d, 0x04, 0x39, 0xb3, 0xab, 0x49, 0x3b, 0x43, 0x73, 0xcb, 0xdc, 0x4a,
+				0x89, 0xf2, 0x3e, 0x69, 0x5d, 0x2e, 0xf8, 0x35, 0x53, 0x51, 0x62, 0x2f, 0xa5, 0xc8,
+				0x57, 0x6f, 0x1c, 0x31, 0x06, 0x41, 0x30, 0x68, 0x62, 0xe5, 0x6d, 0xe5, 0xfa, 0x9f,
 			],
 		);
 	}
@@ -7731,13 +8193,13 @@ mod tests {
 		assert_slab_chunks_frozen_format(
 			CipherId::Aes256GcmSiv,
 			&[
-				0xd7, 0x38, 0x8c, 0x85, 0x1e, 0x89, 0x95, 0x54, 0xb8, 0xd7, 0x5b, 0x0e, 0x27, 0x19,
-				0xda, 0x3b, 0x2e, 0x18, 0xf7, 0xa9, 0xa0, 0xae, 0x00, 0x80, 0x49, 0xcf, 0xc1, 0x7c,
-				0x01, 0x2c, 0x33, 0x84, 0x46, 0x8c, 0x68, 0x42, 0x1f, 0x99, 0xe3, 0x00, 0xce, 0xc2,
-				0x65, 0x5b, 0xe4, 0x52, 0x69, 0x01, 0x81, 0xd3, 0xb6, 0x77, 0xe9, 0xcb, 0xbd, 0xdc,
-				0x2c, 0x68, 0x04, 0x6d, 0x7b, 0x2a, 0xd2, 0xd5, 0x95, 0x82, 0x55, 0xcb, 0xfc, 0x8d,
-				0x9e, 0xa6, 0x73, 0x2a, 0x4c, 0x02, 0xdd, 0x2a, 0xc8, 0x0c, 0x26, 0xed, 0x96, 0x9b,
-				0x30, 0x04, 0xa7, 0x80,
+				0xf6, 0x82, 0x4e, 0x33, 0x1a, 0x22, 0x3f, 0x5b, 0x66, 0x39, 0xd8, 0xe2, 0x23, 0x77,
+				0x55, 0xd9, 0xf9, 0x70, 0x81, 0x1a, 0xc4, 0x24, 0xd3, 0x5b, 0xa3, 0x1d, 0xf0, 0x46,
+				0xf6, 0xc3, 0x2b, 0x18, 0xe4, 0x02, 0x7a, 0x19, 0xc5, 0x04, 0x43, 0x39, 0x64, 0x74,
+				0xaf, 0x23, 0x06, 0x75, 0xd1, 0x3a, 0x5d, 0xcf, 0x97, 0x50, 0xcb, 0x06, 0xc6, 0xfc,
+				0x7e, 0x7f, 0x62, 0xe8, 0x86, 0x5d, 0x27, 0x4e, 0x9c, 0xcd, 0x8a, 0x2b, 0x90, 0xb0,
+				0x6b, 0x48, 0x35, 0x43, 0x43, 0xba, 0xad, 0xa1, 0xe5, 0x28, 0x9d, 0x49, 0x93, 0x47,
+				0x42, 0xfb, 0xde, 0x93,
 			],
 		);
 	}

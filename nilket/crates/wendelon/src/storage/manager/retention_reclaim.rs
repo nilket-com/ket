@@ -1,5 +1,6 @@
 use super::*;
 use crate::storage::index::{RetainedObjectIntent, RetainedObjectIntentState};
+use crate::storage::tier_object_layout::SlabView;
 
 /// A nonleader defers L2 debt without uploading, proposing, or completing it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -2775,7 +2776,7 @@ impl SlabManager {
 
 	pub(super) fn mark_records_for_table_drop_from_blob(
 		&self,
-		plaintext: &[u8],
+		plaintext: SlabView<'_>,
 		records: &mut [CompactionRecord],
 		tenant_id: TenantId,
 		descriptor: &TableSchemaDescriptor,
@@ -2980,7 +2981,7 @@ impl SlabManager {
 
 	pub(super) fn mark_records_for_table_retention_from_blob(
 		&self,
-		plaintext: &[u8],
+		plaintext: SlabView<'_>,
 		records: &mut [CompactionRecord],
 		cluster_policy: MvccRetentionPolicy,
 		table_lifecycle: &TableLifecycleCatalog,
@@ -3292,7 +3293,7 @@ impl SlabManager {
 	pub(super) async fn build_tiered_replacement(
 		&self,
 		pointer: &TieredSlabPointer,
-		plaintext: &[u8],
+		plaintext: SlabView<'_>,
 		records: &[CompactionRecord],
 		table_schemas: &TableSchemaCatalog,
 		old_bytes: u64,
@@ -3302,8 +3303,10 @@ impl SlabManager {
 		let _ = unlink_local_file(self.file_ops.as_ref(), &tmp_path).await;
 		let mut multirow_recompact_count = 0_u64;
 		// The replacement's own record offsets: the index still describes the
-		// old layout, so every walk of the new bytes takes these instead.
-		let mut replacement_offsets = BTreeSet::new();
+		// old layout, so every walk of the new bytes takes these instead. The
+		// local store appends at physical offsets; the replacement's layout
+		// makes them logical.
+		let mut appended = BTreeSet::new();
 		let rewrite_result: std::io::Result<Zeroizing<Vec<u8>>> = async {
 			let rewritten = Arc::new(
 				LocalSlabStore::open(
@@ -3344,7 +3347,7 @@ impl SlabManager {
 						&compacted.frame,
 					)
 					.await?;
-				replacement_offsets.insert(location.offset);
+				appended.insert(location.offset);
 			}
 			rewritten.fsync().await?;
 			Ok(Zeroizing::new(self.file_ops.read_all(&tmp_path).await?))
@@ -3352,10 +3355,18 @@ impl SlabManager {
 		.await;
 		let _ = unlink_local_file(self.file_ops.as_ref(), &tmp_path).await;
 		let rewritten_plaintext = rewrite_result?;
+		// ADR 0705: a layout-changing rewrite starts at its validated source
+		// object's full aligned logical end, so it reissues no location.
+		let (rewritten_view, replacement_offsets) =
+			super::tier_transition::layout_changing_replacement(
+				plaintext.layout(),
+				&rewritten_plaintext,
+				&appended,
+			)?;
 		self.preflight_tier_publication(
 			pointer.slab_id,
 			plaintext,
-			&rewritten_plaintext,
+			rewritten_view,
 			&replacement_offsets,
 		)
 		.await?;
@@ -3363,16 +3374,12 @@ impl SlabManager {
 			metrics().observe_storage_multirow_recompact(multirow_recompact_count);
 		}
 		let encrypted = self.encrypt_tiered_blob_with_evidence(
-			pointer.slab_id,
-			rewritten_plaintext.as_ref(),
+			rewritten_view,
 			&replacement_offsets,
 			Some(table_schemas),
 		)?;
-		let row_tombstone_metadata = row_tombstone_metadata_from_blob(
-			rewritten_plaintext.as_ref(),
-			pointer.slab_id,
-			&replacement_offsets,
-		)?;
+		let row_tombstone_metadata =
+			row_tombstone_metadata_from_blob(rewritten_view, &replacement_offsets)?;
 		Ok(TieredReplacement {
 			payload_hash: crate::hash::content::digest(&encrypted.bytes),
 			tombstone_metadata: merge_row_tombstone_metadata(

@@ -2559,8 +2559,9 @@ impl SlabManager {
 					}
 				}
 				// Blob-tier recovery rejects record classes 1..=4 in
-				// recover_slab_entries_from_blob, so an accepted L2 slab is counter-free.
-				SlabBacking::L2(_) => {}
+				// recover_slab_entries_from_blob, so an accepted L2 slab is counter-free,
+				// and so is a rehydrated copy of its object (the same bytes).
+				SlabBacking::L2(_) | SlabBacking::Rehydrated(_) => {}
 				SlabBacking::Missing => {
 					self.finish_retirement_remnant(slab_id).await;
 					return Err(CompactionFailure::ManifestRace);
@@ -3762,6 +3763,7 @@ impl SlabManager {
 		let (backing, target, _pin) = self.recovery_read_target(location).await?;
 		match backing {
 			SlabBacking::Local(slab) => slab.read_with_header(target).await,
+			SlabBacking::Rehydrated(copy) => copy.read_with_header(target).await,
 			SlabBacking::L2(_) => Err(Error::new(
 				ErrorKind::InvalidData,
 				"tier conflict recovery requires the owned verification flight",
@@ -3773,7 +3775,40 @@ impl SlabManager {
 		}
 	}
 
+	/// ADR 0705 §6: a stale answer (`Superseded`, `OutsideGeneration`) for a
+	/// read that names its version leads to exactly one re-resolution through
+	/// the index; the second answer is final, so a second stale answer for the
+	/// same request is its typed refusal, never a retry loop. A read that does
+	/// not name its version cannot re-resolve: its stale answer is final.
 	async fn read_expected_version_with_header(
+		&self,
+		location: RecordLocation,
+		missing_origin: PublishedReferenceOrigin,
+		named: Option<(TenantId, Identity)>,
+	) -> std::io::Result<(SlabRecordHeader, Vec<u8>)> {
+		let first = self
+			.read_expected_version_once(location, missing_origin, named)
+			.await;
+		let (Err(error), Some((tenant_id, key_identity))) = (&first, named) else {
+			return first;
+		};
+		if !matches!(
+			stale_location(error).map(|stale| stale.reason),
+			Some(StaleLocationReason::Superseded | StaleLocationReason::OutsideGeneration)
+		) {
+			return first;
+		}
+		let current =
+			self.resolve_logical_version(tenant_id, key_identity, location.hlc, location)?;
+		if current == location {
+			// The index names the same stale location: the answer is final.
+			return first;
+		}
+		self.read_expected_version_once(current, missing_origin, named)
+			.await
+	}
+
+	async fn read_expected_version_once(
 		&self,
 		location: RecordLocation,
 		missing_origin: PublishedReferenceOrigin,
@@ -3807,6 +3842,20 @@ impl SlabManager {
 					if verify {
 						verify_frame_names_version(&header, &frame, target, expected)?;
 					}
+					return Ok((header, frame));
+				}
+				SlabBacking::Rehydrated(copy) => {
+					let started = Instant::now();
+					let result = copy.read_with_header(target).await;
+					metrics()
+						.l1_read_latency_seconds
+						.observe_duration(started.elapsed());
+					let (header, frame) = result?;
+					let expected = ExpectedVersion {
+						tenant_id: expected.tenant_id.or(copy.generation.tenant_id),
+						..expected
+					};
+					verify_frame_names_version(&header, &frame, target, expected)?;
 					return Ok((header, frame));
 				}
 				SlabBacking::L2(pointer) => {

@@ -2,6 +2,7 @@ use super::tier_deferral::{DeferralOutcome, FenceCause, TierDeferral, TierReplay
 use super::tier_plan::tier_row_owner;
 use super::*;
 use crate::storage::io_uring::DIRECT_IO_ALIGN;
+use crate::storage::tier_object_layout::{LogicalExtent, SlabView, TierObjectLayout};
 use std::collections::BTreeSet;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -58,10 +59,47 @@ fn covered_row_copy(
 	Ok(copy)
 }
 
+/// A rehydrated local copy of one tier object (ADR 0705 §3): the object's
+/// plaintext, dense on disk, with the object's validated layout and the
+/// generation it was made from. Every local read of it converts the location
+/// through `layout`, and it serves only the generation whose bytes it holds.
 #[derive(Clone)]
-pub(super) struct RehydratedSlabState {
-	pub(super) slab: Arc<LocalSlabStore>,
+pub(super) struct RehydratedCopy {
+	pub(super) store: Arc<LocalSlabStore>,
+	pub(super) layout: TierObjectLayout,
+	pub(super) generation: crate::consensus::slab_ops::TierGeneration,
 	pub(super) keep_local_until: Instant,
+}
+
+impl RehydratedCopy {
+	/// Whether this copy holds `pointer`'s object bytes: the same slab and the
+	/// same content hash, whatever advisory metadata the pointer carries.
+	pub(super) fn serves(&self, pointer: &TieredSlabPointer) -> bool {
+		self.layout.slab_id() == pointer.slab_id
+			&& self.generation.payload_hash == pointer.payload_hash
+	}
+
+	/// `location` in the copy's dense file, converted by the object's layout:
+	/// a location outside the object is refused typed `OutsideGeneration`.
+	pub(super) fn local_location(
+		&self,
+		location: RecordLocation,
+	) -> std::io::Result<RecordLocation> {
+		let range = self.layout.physical_range(&location)?;
+		let offset = u64::try_from(range.start).map_err(|_| {
+			stale_location_error(location.slab_id, StaleLocationReason::OutsideGeneration)
+		})?;
+		Ok(RecordLocation { offset, ..location })
+	}
+
+	pub(super) async fn read_with_header(
+		&self,
+		location: RecordLocation,
+	) -> std::io::Result<(SlabRecordHeader, Vec<u8>)> {
+		self.store
+			.read_with_header(self.local_location(location)?)
+			.await
+	}
 }
 
 /// Authoritative location for a slab, as observed by the read
@@ -70,6 +108,8 @@ pub(super) struct RehydratedSlabState {
 /// resolves the backing.
 pub(super) enum SlabBacking {
 	Local(Arc<LocalSlabStore>),
+	/// A tiered slab served from the rehydrated copy of its current object.
+	Rehydrated(RehydratedCopy),
 	L2(TieredSlabPointer),
 	Missing,
 }
@@ -138,11 +178,20 @@ pub(super) fn tier_object_evidence<'a>(
 	}
 }
 
-/// A tier object's plaintext with the record offsets that describe exactly
-/// these bytes; every walk of the bytes uses these offsets.
+/// A tier object's plaintext with its validated layout and the logical record
+/// offsets that describe exactly these bytes; every walk of the bytes uses
+/// both (`view`).
 pub(crate) struct TieredPlaintext {
 	pub(crate) bytes: Vec<u8>,
+	pub(crate) layout: TierObjectLayout,
 	pub(crate) record_offsets: BTreeSet<u64>,
+}
+
+impl TieredPlaintext {
+	/// The bytes under the object's layout.
+	pub(crate) fn view(&self) -> std::io::Result<SlabView<'_>> {
+		SlabView::new(&self.bytes, self.layout)
+	}
 }
 
 /// The tenant check walks the decrypted bytes with the generation's record
@@ -168,6 +217,7 @@ pub(super) fn decode_tiered_blob(
 			}
 			let DecryptedTieredSlab {
 				plaintext,
+				layout,
 				record_offsets: object_offsets,
 				..
 			} = crypto.decrypt_tiered_slab(pointer.slab_id, blob)?;
@@ -175,8 +225,10 @@ pub(super) fn decode_tiered_blob(
 				TierObjectEvidence::Indexed(acknowledged) => acknowledged.clone(),
 				TierObjectEvidence::Replacement => object_offsets,
 			};
-			let payload_tenant_id =
-				single_tenant_id_from_plain_slab(&plaintext, pointer.slab_id, &record_offsets)?;
+			let payload_tenant_id = single_tenant_id_from_plain_slab(
+				SlabView::new(&plaintext, layout)?,
+				&record_offsets,
+			)?;
 			if payload_tenant_id != tenant_id {
 				return Err(Error::new(
 					ErrorKind::InvalidData,
@@ -190,12 +242,16 @@ pub(super) fn decode_tiered_blob(
 			}
 			Ok(TieredPlaintext {
 				bytes: plaintext,
+				layout,
 				record_offsets,
 			})
 		}
+		// A plaintext object is only ever a first upload: base 0, its bytes
+		// the sealed slab's.
 		None => match evidence {
 			TierObjectEvidence::Indexed(acknowledged) => Ok(TieredPlaintext {
 				bytes: blob.to_vec(),
+				layout: TierObjectLayout::dense(pointer.slab_id, blob)?,
 				record_offsets: acknowledged.clone(),
 			}),
 			TierObjectEvidence::Replacement => Err(Error::new(
@@ -237,42 +293,49 @@ pub(super) fn validate_tiered_record_header_tenant(
 }
 
 pub(super) fn extract_record_from_blob(
-	blob: &[u8],
+	blob: SlabView<'_>,
 	location: crate::storage::core::FrameLocation,
 ) -> std::io::Result<Vec<u8>> {
 	extract_record_and_header_from_blob(blob, location).map(|(_, frame)| frame)
 }
 
-/// The record header and frame at `location` in a plaintext slab blob.
+/// The record header and frame at `location` in laid-out slab bytes. The
+/// record's bytes come only from the view's layout
+/// (`TierObjectLayout::physical_range`): a location outside the object is
+/// refused typed `OutsideGeneration`.
 pub(super) fn extract_record_and_header_from_blob(
-	blob: &[u8],
+	blob: SlabView<'_>,
 	location: crate::storage::core::FrameLocation,
 ) -> std::io::Result<(SlabRecordHeader, Vec<u8>)> {
-	let location = location.record();
-	let offset = location.offset as usize;
-	let length = location.length as usize;
+	record_and_header_from_record_bytes(blob.record(&location.record())?)
+}
+
+/// The header and frame of one record, given exactly its bytes (a
+/// location's `length`).
+pub(super) fn record_and_header_from_record_bytes(
+	record: &[u8],
+) -> std::io::Result<(SlabRecordHeader, Vec<u8>)> {
 	let header_size = std::mem::size_of::<crate::schema::SlabRecordHeader>();
-	if blob.len() < offset + header_size {
+	if record.len() < header_size {
 		return Err(Error::new(
 			ErrorKind::UnexpectedEof,
 			"L2 blob shorter than record header",
 		));
 	}
-	let header = bytemuck::pod_read_unaligned::<crate::schema::SlabRecordHeader>(
-		&blob[offset..offset + header_size],
-	);
-	let frame_len = header.frame_len as usize;
-	let end = offset
-		.checked_add(header_size)
-		.and_then(|h| h.checked_add(frame_len))
+	let header =
+		bytemuck::pod_read_unaligned::<crate::schema::SlabRecordHeader>(&record[..header_size]);
+	let frame_len = usize::try_from(header.frame_len)
+		.map_err(|_| Error::new(ErrorKind::InvalidData, "frame_len overflows usize"))?;
+	let end = header_size
+		.checked_add(frame_len)
 		.ok_or_else(|| Error::new(ErrorKind::InvalidData, "frame_len overflows usize"))?;
-	if end > blob.len() || header_size + frame_len > length {
+	if end > record.len() {
 		return Err(Error::new(
 			ErrorKind::InvalidData,
 			"L2 record extends past downloaded blob",
 		));
 	}
-	Ok((header, blob[offset + header_size..end].to_vec()))
+	Ok((header, record[header_size..end].to_vec()))
 }
 
 pub(super) async fn fetch_tiered_ciphertext_runs(
@@ -434,12 +497,11 @@ pub(super) fn descriptor_matches_tiered_row(
 }
 
 pub(super) fn single_tenant_id_from_plain_slab(
-	blob: &[u8],
-	slab_id: SlabId,
+	blob: SlabView<'_>,
 	acknowledged: &BTreeSet<u64>,
 ) -> std::io::Result<TenantId> {
-	let entries = recover_slab_entries_from_blob(blob, slab_id, acknowledged)?;
-	let tenant_id = single_tenant_of_recovered_entries(&entries, slab_id)?;
+	let entries = recover_slab_entries_from_blob(blob, acknowledged)?;
+	let tenant_id = single_tenant_of_recovered_entries(&entries, blob.slab_id())?;
 	// Object metadata refused a malformed directory while choosing its chunk size; this check
 	// still does, without choosing one.
 	visit_encoding_directories(blob, &entries, |_| {})?;
@@ -479,14 +541,15 @@ fn single_tenant_of_recovered_entries(
 	Ok(tenant_id)
 }
 
+/// The object metadata for `blob`: its logical base is the view's, and its
+/// offset index the logical locations the walk emits.
 pub(super) fn build_tiered_object_metadata(
-	blob: &[u8],
-	slab_id: SlabId,
+	blob: SlabView<'_>,
 	chunk_layout_config: &L2ChunkLayoutConfig,
 	acknowledged: &BTreeSet<u64>,
 ) -> std::io::Result<TieredSlabObjectMetadata> {
-	let entries = recover_slab_entries_from_blob(blob, slab_id, acknowledged)?;
-	let tenant_id = single_tenant_of_recovered_entries(&entries, slab_id)?;
+	let entries = recover_slab_entries_from_blob(blob, acknowledged)?;
+	let tenant_id = single_tenant_of_recovered_entries(&entries, blob.slab_id())?;
 	let first_entry = entries[0];
 	let has_row_tombstone_records = entries.iter().any(|entry| entry.location.is_tombstone);
 	let offset_index = entries
@@ -505,12 +568,8 @@ pub(super) fn build_tiered_object_metadata(
 	Ok(TieredSlabObjectMetadata {
 		tenant_id,
 		created_hlc: first_entry.location.hlc.physical_ms,
-		chunk_size_bytes: choose_tiered_object_chunk_size(
-			blob,
-			slab_id,
-			chunk_layout_config,
-			acknowledged,
-		)?,
+		chunk_size_bytes: choose_tiered_object_chunk_size(blob, chunk_layout_config, acknowledged)?,
+		logical_base: blob.layout().base(),
 		offset_index,
 		column_stats_block: None,
 		has_row_tombstone_records,
@@ -518,15 +577,14 @@ pub(super) fn build_tiered_object_metadata(
 }
 
 pub(super) fn choose_tiered_object_chunk_size(
-	blob: &[u8],
-	slab_id: SlabId,
+	blob: SlabView<'_>,
 	chunk_layout_config: &L2ChunkLayoutConfig,
 	acknowledged: &BTreeSet<u64>,
 ) -> std::io::Result<crate::schema::ChunkSizeBytes> {
 	if !chunk_layout_config.enabled {
 		return Ok(SLAB_ENCRYPTION_DEFAULT_CHUNK_SIZE);
 	}
-	let directories = encoding_directories_from_slab_blob(blob, slab_id, acknowledged)?;
+	let directories = encoding_directories_from_slab_blob(blob, acknowledged)?;
 	Ok(choose_chunk_size_bytes_for_directories(
 		directories.iter(),
 		chunk_layout_config,
@@ -545,7 +603,12 @@ impl SlabManager {
 		plaintext_blob: &[u8],
 	) -> std::io::Result<EncryptedTieredSlab> {
 		let acknowledged = self.acknowledged_offsets_in_slab(slab_id);
-		self.encrypt_tiered_blob_with_evidence(slab_id, plaintext_blob, &acknowledged, None)
+		// The sealed slab (or a base-0 object's plaintext): dense.
+		self.encrypt_tiered_blob_with_evidence(
+			SlabView::dense(slab_id, plaintext_blob)?,
+			&acknowledged,
+			None,
+		)
 	}
 
 	/// As `encrypt_tiered_object_blob`, with column stats.
@@ -557,35 +620,33 @@ impl SlabManager {
 	) -> std::io::Result<EncryptedTieredSlab> {
 		let acknowledged = self.acknowledged_offsets_in_slab(slab_id);
 		self.encrypt_tiered_blob_with_evidence(
-			slab_id,
-			plaintext_blob,
+			SlabView::dense(slab_id, plaintext_blob)?,
 			&acknowledged,
 			Some(table_schemas),
 		)
 	}
 
 	/// Every walk of `plaintext_blob` (offset index, chunk layout, column
-	/// stats) uses `acknowledged`, the record offsets in exactly these bytes.
-	/// A replacement written for the same slab id passes the offsets of its
-	/// own appends: the index still describes the old layout.
+	/// stats) uses `acknowledged`, the logical record offsets in exactly these
+	/// bytes, and the object carries the view's base. A replacement written
+	/// for the same slab id passes the offsets of its own appends: the index
+	/// still describes the old layout.
 	pub(crate) fn encrypt_tiered_blob_with_evidence(
 		&self,
-		slab_id: SlabId,
-		plaintext_blob: &[u8],
+		plaintext_blob: SlabView<'_>,
 		acknowledged: &BTreeSet<u64>,
 		table_schemas: Option<&TableSchemaCatalog>,
 	) -> std::io::Result<EncryptedTieredSlab> {
 		self.require_tier_authority_ready()?;
+		let slab_id = plaintext_blob.slab_id();
 		let mut metadata = build_tiered_object_metadata(
 			plaintext_blob,
-			slab_id,
 			&self.config.l2_chunk_layout,
 			acknowledged,
 		)?;
 		if let Some(table_schemas) = table_schemas {
 			metadata.column_stats_block = self.build_tiered_column_stats_block(
 				plaintext_blob,
-				slab_id,
 				metadata.tenant_id,
 				table_schemas,
 				acknowledged,
@@ -593,7 +654,59 @@ impl SlabManager {
 		}
 		self.config
 			.crypto
-			.encrypt_tiered_slab_object(slab_id, &metadata, plaintext_blob)
+			.encrypt_tiered_slab_object(slab_id, &metadata, plaintext_blob.bytes())
+	}
+
+	/// A byte-preserving successor of `plaintext`'s object (a DEK rewrap), with
+	/// column stats: the same plaintext and logical offsets under the same
+	/// layout, so the same base (ADR 0705 §3).
+	pub(crate) fn encrypt_tiered_object_preserving_layout(
+		&self,
+		plaintext: &TieredPlaintext,
+		table_schemas: &TableSchemaCatalog,
+	) -> std::io::Result<EncryptedTieredSlab> {
+		self.encrypt_tiered_blob_with_evidence(
+			plaintext.view()?,
+			&plaintext.record_offsets,
+			Some(table_schemas),
+		)
+	}
+
+	/// ADR 0705 §4, the leader's classification of an offset-preserving
+	/// successor before it is proposed: the uploaded successor's committed
+	/// bytes (`successor_blob`, whose content hash the caller checked against
+	/// `successor_hash`) are decoded under their own layout and must be a
+	/// proven offset-preserving transform of `source`'s decoded object.
+	pub(crate) fn preflight_offset_preserving_successor(
+		&self,
+		source: &TieredSlabPointer,
+		source_plaintext: &TieredPlaintext,
+		successor_hash: &[u8; 32],
+		successor_blob: &[u8],
+	) -> std::io::Result<()> {
+		let successor = decode_tiered_blob(
+			self.config.crypto.as_ref(),
+			source,
+			successor_blob,
+			TierObjectEvidence::Replacement,
+		)?;
+		let transition = super::tier_transition::classify_tier_transition(
+			super::tier_transition::TierTransitionObject {
+				plaintext: source_plaintext.view()?,
+				payload_hash: Some(&source.payload_hash),
+			},
+			super::tier_transition::TierTransitionObject {
+				plaintext: successor.view()?,
+				payload_hash: Some(successor_hash),
+			},
+		)?;
+		if transition != super::tier_transition::TierTransition::OffsetPreserving {
+			return Err(stale_location_error(
+				source.slab_id,
+				StaleLocationReason::LayoutRegression,
+			));
+		}
+		Ok(())
 	}
 
 	/// Detect whether a tiered object already carries an encrypted
@@ -1493,9 +1606,10 @@ impl SlabManager {
 				.await
 				.map_err(|_| stale_location_error(slab_id, StaleLocationReason::Fenced))?;
 			remaining -= blob.len();
-			let entries =
-				recover_slab_entries_from_blob(&blob, slab.slab_id(), &BTreeSet::new())
-					.map_err(|_| stale_location_error(slab_id, StaleLocationReason::Fenced))?;
+			// A local slab file: dense, so its offsets are its file offsets.
+			let entries = SlabView::dense(slab.slab_id(), &blob)
+				.and_then(|view| recover_slab_entries_from_blob(view, &BTreeSet::new()))
+				.map_err(|_| stale_location_error(slab_id, StaleLocationReason::Fenced))?;
 			let mut frames = entries
 				.iter()
 				.map(|entry| (entry.location.offset, entry.location.length))
@@ -2406,17 +2520,24 @@ impl SlabManager {
 		Ok(removed)
 	}
 
+	/// The validated layout of `pointer`'s object, for controls outside the manager.
+	#[cfg(test)]
+	pub(crate) async fn tier_object_layout_for_test(
+		&self,
+		pointer: &TieredSlabPointer,
+	) -> std::io::Result<TierObjectLayout> {
+		Ok(self.tiered_plaintext_from_l2(pointer).await?.layout)
+	}
+
 	/// The plaintext of `pointer`'s object, which must be the generation the
 	/// index describes (see `TierObjectEvidence::Indexed`).
 	pub(super) async fn tiered_plaintext_from_l2(
 		&self,
 		pointer: &TieredSlabPointer,
-	) -> std::io::Result<Vec<u8>> {
+	) -> std::io::Result<TieredPlaintext> {
 		let acknowledged = self.acknowledged_offsets_in_slab(pointer.slab_id);
-		Ok(self
-			.tiered_object_from_l2(pointer, TierObjectEvidence::Indexed(&acknowledged))
-			.await?
-			.bytes)
+		self.tiered_object_from_l2(pointer, TierObjectEvidence::Indexed(&acknowledged))
+			.await
 	}
 
 	/// `pointer`'s object decoded as the stated generation.
@@ -2452,11 +2573,7 @@ impl SlabManager {
 		let published = self.tier_pointer(pointer.slab_id).await;
 		let evidence = tier_object_evidence(published.as_ref(), pointer, &acknowledged, false);
 		let plaintext = self.tiered_object_from_l2(pointer, evidence).await?;
-		self.tiered_rows_from_plaintext_with_evidence(
-			&plaintext.bytes,
-			pointer.slab_id,
-			&plaintext.record_offsets,
-		)
+		self.tiered_rows_from_plaintext_with_evidence(plaintext.view()?, &plaintext.record_offsets)
 	}
 
 	/// The rows in `plaintext`, walked with `acknowledged`, the record offsets
@@ -2464,11 +2581,10 @@ impl SlabManager {
 	#[cfg(test)]
 	pub(super) fn tiered_rows_from_plaintext_with_evidence(
 		&self,
-		plaintext: &[u8],
-		slab_id: SlabId,
+		plaintext: SlabView<'_>,
 		acknowledged: &BTreeSet<u64>,
 	) -> std::io::Result<Vec<PersistentRecordRow>> {
-		let entries = recover_slab_entries_from_blob(plaintext, slab_id, acknowledged)?;
+		let entries = recover_slab_entries_from_blob(plaintext, acknowledged)?;
 		let mut rows = Vec::with_capacity(entries.len());
 		for frame in crate::storage::core::recovered_frames(&entries) {
 			self.persistent_rows_from_recovered_frame(plaintext, frame, &mut rows)?;
@@ -2481,7 +2597,7 @@ impl SlabManager {
 	/// probed as an Arrow length-prefixed stream, so only a trusted row asks for the decode.
 	fn persistent_rows_from_recovered_frame(
 		&self,
-		plaintext: &[u8],
+		plaintext: SlabView<'_>,
 		frame: crate::storage::core::RecoveredFrame<'_>,
 		rows: &mut Vec<PersistentRecordRow>,
 	) -> std::io::Result<()> {
@@ -2525,29 +2641,17 @@ impl SlabManager {
 		pointer: &TieredSlabPointer,
 		plaintext: &TieredPlaintext,
 	) -> std::io::Result<TieredRowRefreshPlan> {
-		let scratch = self.reserve_tier_plan_scratch(
-			pointer.slab_id,
-			&plaintext.bytes,
-			&plaintext.record_offsets,
-		)?;
+		let view = plaintext.view()?;
+		let scratch =
+			self.reserve_tier_plan_scratch(pointer.slab_id, view, &plaintext.record_offsets)?;
 		let new_rows = if self.run_gave_its_rows_to_successors(pointer.slab_id) {
 			Vec::new()
 		} else {
-			self.tiered_rows_within(
-				&plaintext.bytes,
-				pointer.slab_id,
-				&plaintext.record_offsets,
-				&scratch,
-			)?
+			self.tiered_rows_within(view, pointer.slab_id, &plaintext.record_offsets, &scratch)?
 		};
 		let old_rows = self.record_rows_for_slab_for_recovery_within(pointer.slab_id, &scratch)?;
-		let relocated_reads = self.pair_tier_rows(
-			pointer.slab_id,
-			&old_rows,
-			&new_rows,
-			None,
-			&plaintext.bytes,
-		)?;
+		let relocated_reads =
+			self.pair_tier_rows(pointer.slab_id, &old_rows, &new_rows, None, view)?;
 		Ok(TieredRowRefreshPlan {
 			pointer: Some(pointer.clone()),
 			old_rows,
@@ -2565,15 +2669,14 @@ impl SlabManager {
 	pub(super) fn reserve_tier_plan_scratch(
 		&self,
 		slab_id: SlabId,
-		plaintext: &[u8],
+		plaintext: SlabView<'_>,
 		acknowledged: &BTreeSet<u64>,
 	) -> std::io::Result<TierPlanScratch> {
 		use super::tier_budget::{
 			PlanScratch, TierBudgetKind, TierHistoryShortfall, checked_sum, tier_history_refusal,
 			vec_bytes,
 		};
-		let new_bound =
-			crate::storage::core::count_slab_entries_in_blob(plaintext, slab_id, acknowledged)?;
+		let new_bound = crate::storage::core::count_slab_entries_in_blob(plaintext, acknowledged)?;
 		let old_bound = self.count_record_rows_for_slab(slab_id);
 		let short = || tier_history_refusal(slab_id, TierHistoryShortfall::Scratch);
 		// Rows: the plan's vectors, the index transaction's copies of them
@@ -2606,14 +2709,13 @@ impl SlabManager {
 	/// `tiered_rows_from_plaintext_with_evidence` within `scratch`'s bound.
 	pub(super) fn tiered_rows_within(
 		&self,
-		plaintext: &[u8],
+		plaintext: SlabView<'_>,
 		slab_id: SlabId,
 		acknowledged: &BTreeSet<u64>,
 		scratch: &TierPlanScratch,
 	) -> std::io::Result<Vec<PersistentRecordRow>> {
 		let entries = crate::storage::core::recover_slab_entries_from_blob_bounded(
 			plaintext,
-			slab_id,
 			acknowledged,
 			scratch.new_bound,
 		)
@@ -2707,35 +2809,62 @@ impl SlabManager {
 		// tombstone or supersession metadata changed).
 		let acknowledged = self.acknowledged_offsets_in_slab(pointer.slab_id);
 		let evidence = tier_object_evidence(published, pointer, &acknowledged, false);
-		let TieredPlaintext {
-			bytes: new_plaintext,
-			record_offsets: new_offsets,
-		} = self.tiered_object_from_l2(pointer, evidence).await?;
+		let new_object = self.tiered_object_from_l2(pointer, evidence).await?;
+		let new_plaintext = new_object.view()?;
+		let new_offsets = &new_object.record_offsets;
+		// ADR 0705 §4: over a locally published source, the successor is
+		// classified against that exact source's validated object before any
+		// row moves. A source that cannot be fetched defers the delivery
+		// (`tiered_object_from_l2`'s typed L2 fence); a regression refuses it.
+		let source_object = match published {
+			Some(published) if published.payload_hash != pointer.payload_hash => {
+				let source = self.tiered_plaintext_from_l2(published).await?;
+				super::tier_transition::classify_tier_transition(
+					super::tier_transition::TierTransitionObject {
+						plaintext: source.view()?,
+						payload_hash: Some(&published.payload_hash),
+					},
+					super::tier_transition::TierTransitionObject {
+						plaintext: new_plaintext,
+						payload_hash: Some(&pointer.payload_hash),
+					},
+				)?;
+				Some(source)
+			}
+			_ => None,
+		};
 		let scratch =
-			self.reserve_tier_plan_scratch(pointer.slab_id, &new_plaintext, &new_offsets)?;
+			self.reserve_tier_plan_scratch(pointer.slab_id, new_plaintext, new_offsets)?;
 		let new_rows =
-			self.tiered_rows_within(&new_plaintext, pointer.slab_id, &new_offsets, &scratch)?;
+			self.tiered_rows_within(new_plaintext, pointer.slab_id, new_offsets, &scratch)?;
 		// The committed observer holds this slab's tier lock and has checked
 		// its private authority; unrelated intents fence public reads only.
 		let old_rows = self.record_rows_for_slab_for_recovery_within(pointer.slab_id, &scratch)?;
-		let old_plaintext = match published {
-			Some(published)
+		let old_plaintext = match (published, source_object) {
+			(Some(published), source)
 				if self.tier_pairing_needs_old_payloads(
 					pointer.slab_id,
 					&old_rows,
 					&new_rows,
 				)? =>
 			{
-				Some(self.tiered_plaintext_from_l2(published).await?)
+				match source {
+					Some(source) => Some(source),
+					None => Some(self.tiered_plaintext_from_l2(published).await?),
+				}
 			}
 			_ => None,
 		};
+		let old_plaintext = old_plaintext
+			.as_ref()
+			.map(TieredPlaintext::view)
+			.transpose()?;
 		let relocated_reads = self.pair_tier_rows(
 			pointer.slab_id,
 			&old_rows,
 			&new_rows,
-			old_plaintext.as_deref(),
-			&new_plaintext,
+			old_plaintext,
+			new_plaintext,
 		)?;
 		Ok(TieredRowRefreshPlan {
 			pointer: Some(pointer.clone()),
@@ -3028,7 +3157,7 @@ impl SlabManager {
 				.fetch_full_tiered_plaintext(l2.as_ref(), pointer)
 				.await?;
 			let record = extract_record_and_header_from_blob(
-				&plaintext,
+				plaintext.view()?,
 				crate::storage::core::FrameLocation::of_point_read(location),
 			)?;
 			plaintext_for_rehydration = Some(plaintext);
@@ -3043,8 +3172,9 @@ impl SlabManager {
 							.await?
 					}
 				};
-				self.rehydrate_tiered_slab(pointer.clone(), bytes::Bytes::from(plaintext))
-					.await
+				// A rehydrated copy is dense on disk; its local reads take
+				// the object's layout (ADR 0705 §3).
+				self.rehydrate_tiered_slab(pointer.clone(), plaintext).await
 			}
 			.await;
 			if let Err(err) = rehydrate_result {
@@ -3065,18 +3195,17 @@ impl SlabManager {
 		&self,
 		l2: &dyn ObjectStore,
 		pointer: &TieredSlabPointer,
-	) -> std::io::Result<Vec<u8>> {
+	) -> std::io::Result<TieredPlaintext> {
 		let blob = l2.get_bytes(&pointer.l2_uri).await?;
 		validate_tiered_blob(pointer, blob.as_ref())?;
 		// Reads serve the published generation, which the index describes.
 		let acknowledged = self.acknowledged_offsets_in_slab(pointer.slab_id);
-		Ok(decode_tiered_blob(
+		decode_tiered_blob(
 			self.config.crypto.as_ref(),
 			pointer,
 			blob.as_ref(),
 			TierObjectEvidence::Indexed(&acknowledged),
-		)?
-		.bytes)
+		)
 	}
 
 	pub(super) async fn read_encrypted_record_from_l2(
@@ -3103,30 +3232,6 @@ impl SlabManager {
 		let tail_window = l2
 			.get_range(&pointer.l2_uri, tail_start..metadata.size_bytes)
 			.await?;
-		let plaintext_start = usize::try_from(location.offset).map_err(|_| {
-			Error::new(
-				ErrorKind::InvalidData,
-				format!("record offset {} does not fit into usize", location.offset),
-			)
-		})?;
-		let plaintext_end_u64 = location
-			.offset
-			.checked_add(location.length as u64)
-			.ok_or_else(|| {
-				Error::new(
-					ErrorKind::InvalidData,
-					format!(
-						"record range overflows u64 for slab {} at offset {}",
-						pointer.slab_id, location.offset,
-					),
-				)
-			})?;
-		let plaintext_end = usize::try_from(plaintext_end_u64).map_err(|_| {
-			Error::new(
-				ErrorKind::InvalidData,
-				format!("record end {} does not fit into usize", plaintext_end_u64),
-			)
-		})?;
 		let additional_metadata_range = self.config.crypto.additional_tiered_metadata_range(
 			pointer.slab_id,
 			metadata.size_bytes,
@@ -3141,7 +3246,7 @@ impl SlabManager {
 			metadata.size_bytes,
 			tail_window.as_ref(),
 			additional_metadata.as_deref(),
-			plaintext_start..plaintext_end,
+			LogicalExtent::of(&location),
 		)?;
 		let footer = plan.footer();
 		let ciphertext = l2
@@ -3149,13 +3254,7 @@ impl SlabManager {
 			.await?;
 		let record_bytes = plan.decrypt(ciphertext.as_ref())?;
 		validate_tiered_record_header_tenant(&record_bytes, footer.tenant_id, pointer.slab_id)?;
-		extract_record_and_header_from_blob(
-			&record_bytes,
-			crate::storage::core::FrameLocation::of_point_read(RecordLocation {
-				offset: 0,
-				..location
-			}),
-		)
+		record_and_header_from_record_bytes(&record_bytes)
 	}
 
 	pub(super) async fn note_l2_read(&self, slab_id: SlabId) -> bool {
@@ -3186,10 +3285,10 @@ impl SlabManager {
 	pub(super) async fn rehydrate_tiered_slab(
 		&self,
 		pointer: TieredSlabPointer,
-		blob: Bytes,
+		plaintext: TieredPlaintext,
 	) -> std::io::Result<()> {
 		let result = self
-			.install_rehydrated_local_copy(pointer.slab_id, blob.as_ref())
+			.install_rehydrated_local_copy(&pointer, &plaintext)
 			.await;
 		let mut state = self.state.lock().await;
 		state.rehydrating.remove(&pointer.slab_id);
@@ -3230,9 +3329,12 @@ impl SlabManager {
 
 	pub(super) async fn install_rehydrated_local_copy(
 		&self,
-		slab_id: SlabId,
-		blob: &[u8],
-	) -> std::io::Result<RehydratedSlabState> {
+		pointer: &TieredSlabPointer,
+		plaintext: &TieredPlaintext,
+	) -> std::io::Result<RehydratedCopy> {
+		let slab_id = pointer.slab_id;
+		// The copy holds exactly the object's bytes under its layout.
+		let blob = plaintext.view()?.bytes();
 		if self.quarantined_slab_files.contains(slab_id) {
 			return Err(Error::new(
 				ErrorKind::AlreadyExists,
@@ -3273,8 +3375,10 @@ impl SlabManager {
 			)
 			.await?,
 		);
-		Ok(RehydratedSlabState {
-			slab,
+		Ok(RehydratedCopy {
+			store: slab,
+			layout: plaintext.layout,
+			generation: crate::consensus::slab_ops::TierGeneration::from(pointer),
 			keep_local_until: Instant::now() + self.config.rehydration.min_local_residency,
 		})
 	}

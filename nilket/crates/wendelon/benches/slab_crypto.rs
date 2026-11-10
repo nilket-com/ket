@@ -32,6 +32,7 @@ fn encrypt_bench_tiered_slab(
 			tenant_id: TenantId::ZERO,
 			created_hlc: 0,
 			chunk_size_bytes: SLAB_ENCRYPTION_DEFAULT_CHUNK_SIZE,
+			logical_base: 0,
 			offset_index: vec![TieredOffsetIndexEntry {
 				key_locator: IdentityPrefix::ZERO,
 				byte_offset: 0,

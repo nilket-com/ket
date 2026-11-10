@@ -36,7 +36,7 @@ impl ManagerState {
 		&self,
 		budget: &Arc<super::tier_budget::TierMemoryBudget>,
 		slab_id: SlabId,
-		copy: super::RehydratedSlabState,
+		copy: super::RehydratedCopy,
 	) {
 		self.disposal_evidence.forget(budget, slab_id);
 		self.rehydrated.insert(slab_id, copy);

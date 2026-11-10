@@ -61,6 +61,7 @@ use crate::schema::{
 	TenantId,
 };
 use crate::storage::io_uring::{AlignedBuf, DIRECT_IO_ALIGN};
+use crate::storage::tier_object_layout::{LogicalExtent, SlabView, TierObjectLayout};
 use crate::storage::{AsyncFileOps, FileHandle, OpenFlags};
 use arrow::array::{BooleanArray, FixedSizeBinaryArray, UInt64Array};
 use arrow::ipc::reader::StreamReader;
@@ -1884,10 +1885,35 @@ fn recover_slab(
 const ZERO_FILL_CHUNK_BYTES: usize = 1 << 20;
 
 /// The smallest acknowledged offset past `cursor` that a page can start at
-/// inside `len` bytes, or `None` when the anomaly at `cursor` is the tail.
+/// inside `len` bytes of a local slab file, or `None` when the anomaly at
+/// `cursor` is the tail.
 fn next_acknowledged_offset(acknowledged: &BTreeSet<u64>, cursor: u64, len: u64) -> Option<u64> {
-	let next = *acknowledged.range(cursor + 1..).next()?;
-	(next % DIRECT_IO_ALIGN as u64 == 0 && next + DIRECT_IO_ALIGN as u64 <= len).then_some(next)
+	let next = *acknowledged.range(cursor.checked_add(1)?..).next()?;
+	let page_end = next.checked_add(DIRECT_IO_ALIGN as u64)?;
+	(next % DIRECT_IO_ALIGN as u64 == 0 && page_end <= len).then_some(next)
+}
+
+/// `next_acknowledged_offset` in a laid-out view: the acknowledged offsets
+/// are logical, the cursor and the result physical, converted only by the
+/// view's layout. `None` when the anomaly at `cursor` is the tail, including
+/// when the next acknowledged page lies outside the object.
+fn next_acknowledged_cursor(
+	acknowledged: &BTreeSet<u64>,
+	layout: &TierObjectLayout,
+	cursor: usize,
+) -> std::io::Result<Option<usize>> {
+	let logical = layout.logical_of(cursor)?;
+	let Some(after) = logical.checked_add(1) else {
+		return Ok(None);
+	};
+	let Some(&next) = acknowledged.range(after..).next() else {
+		return Ok(None);
+	};
+	let page = LogicalExtent::new(next, DIRECT_IO_ALIGN as u64);
+	if next % DIRECT_IO_ALIGN as u64 != 0 || !layout.contains(page) {
+		return Ok(None);
+	}
+	layout.physical_extent(page).map(|range| Some(range.start))
 }
 
 /// Walk sealed slab bytes and return every record they hold.
@@ -1904,11 +1930,10 @@ fn next_acknowledged_offset(acknowledged: &BTreeSet<u64>, cursor: u64, len: u64)
 /// what it knows; there is no zero-page skip, because a zero page proves
 /// nothing about the pages after it (ADR 0099 decision 3).
 pub(crate) fn recover_slab_entries_from_blob(
-	blob: &[u8],
-	slab_id: SlabId,
+	blob: SlabView<'_>,
 	acknowledged: &BTreeSet<u64>,
 ) -> std::io::Result<Vec<RecoveredSlabEntry>> {
-	recover_slab_entries_from_blob_inner(blob, slab_id, acknowledged, false)
+	recover_slab_entries_from_blob_inner(blob, acknowledged, false)
 }
 
 /// Secondary-index discovery only consumes ordinary table rows. A maintenance
@@ -1916,16 +1941,14 @@ pub(crate) fn recover_slab_entries_from_blob(
 /// table attribution; skip those validated frames while retaining the default
 /// fail-closed behavior for tiering and other blob-recovery callers.
 pub(crate) fn recover_slab_entries_from_blob_skipping_counters(
-	blob: &[u8],
-	slab_id: SlabId,
+	blob: SlabView<'_>,
 	acknowledged: &BTreeSet<u64>,
 ) -> std::io::Result<Vec<RecoveredSlabEntry>> {
-	recover_slab_entries_from_blob_inner(blob, slab_id, acknowledged, true)
+	recover_slab_entries_from_blob_inner(blob, acknowledged, true)
 }
 
 fn recover_slab_entries_from_blob_inner(
-	blob: &[u8],
-	slab_id: SlabId,
+	blob: SlabView<'_>,
 	acknowledged: &BTreeSet<u64>,
 	skip_counter_frames: bool,
 ) -> std::io::Result<Vec<RecoveredSlabEntry>> {
@@ -1933,7 +1956,6 @@ fn recover_slab_entries_from_blob_inner(
 	let mut recovered_versions = HashMap::new();
 	walk_slab_records(
 		blob,
-		slab_id,
 		acknowledged,
 		skip_counter_frames,
 		|header, base_location, frame| {
@@ -1955,8 +1977,7 @@ fn recover_slab_entries_from_blob_inner(
 /// version instead of building per-key chains; it accepts and refuses
 /// exactly what the per-key chains do.
 pub(crate) fn recover_slab_entries_from_blob_bounded(
-	blob: &[u8],
-	slab_id: SlabId,
+	blob: SlabView<'_>,
 	acknowledged: &BTreeSet<u64>,
 	bound: SlabEntryBound,
 ) -> std::io::Result<Vec<RecoveredSlabEntry>> {
@@ -1965,25 +1986,19 @@ pub(crate) fn recover_slab_entries_from_blob_bounded(
 	entries
 		.try_reserve_exact(bound.entries)
 		.map_err(unallocated)?;
-	walk_slab_records(
-		blob,
-		slab_id,
-		acknowledged,
-		false,
-		|header, base_location, frame| {
-			// Refuse before decoding a record whose declared rows would not
-			// fit; the decoded count is checked again below.
-			if declared_logical_rows(frame).max(1) > bound.entries - entries.len() {
-				return Err(Error::other(EntryBoundExceeded));
-			}
-			let recovered = recover_entries_for_record(header, base_location, frame)?;
-			if recovered.len() > bound.entries - entries.len() {
-				return Err(Error::other(EntryBoundExceeded));
-			}
-			entries.extend(recovered);
-			Ok(())
-		},
-	)?;
+	walk_slab_records(blob, acknowledged, false, |header, base_location, frame| {
+		// Refuse before decoding a record whose declared rows would not
+		// fit; the decoded count is checked again below.
+		if declared_logical_rows(frame).max(1) > bound.entries - entries.len() {
+			return Err(Error::other(EntryBoundExceeded));
+		}
+		let recovered = recover_entries_for_record(header, base_location, frame)?;
+		if recovered.len() > bound.entries - entries.len() {
+			return Err(Error::other(EntryBoundExceeded));
+		}
+		entries.extend(recovered);
+		Ok(())
+	})?;
 	validate_recovered_row_tombstone_chains_grouped(&entries)?;
 	Ok(entries)
 }
@@ -2063,12 +2078,11 @@ impl std::error::Error for EntryBoundExceeded {}
 /// A bound, not a count: a record whose IPC headers cannot be read counts
 /// one, and a caller that fills past the bound must refuse rather than grow.
 pub(crate) fn count_slab_entries_in_blob(
-	blob: &[u8],
-	slab_id: SlabId,
+	blob: SlabView<'_>,
 	acknowledged: &BTreeSet<u64>,
 ) -> std::io::Result<SlabEntryBound> {
 	let mut bound = SlabEntryBound::default();
-	walk_slab_records(blob, slab_id, acknowledged, false, |_, _, frame| {
+	walk_slab_records(blob, acknowledged, false, |_, _, frame| {
 		let rows = declared_logical_rows(frame).max(1);
 		bound.entries = bound
 			.entries
@@ -2104,13 +2118,19 @@ fn declared_logical_rows(frame: &[u8]) -> usize {
 /// acknowledged-offset resynchronisation and the refusal of an acknowledged
 /// record the walk did not accept. `on_record` sees each accepted standard
 /// record in physical order; counter records are skipped or refused.
+///
+/// The walk's cursor is physical; every location it emits and every
+/// acknowledged offset it matches is logical, converted only by the view's
+/// layout.
 fn walk_slab_records(
-	blob: &[u8],
-	slab_id: SlabId,
+	view: SlabView<'_>,
 	acknowledged: &BTreeSet<u64>,
 	skip_counter_frames: bool,
 	mut on_record: impl FnMut(&SlabRecordHeader, RecordLocation, &[u8]) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
+	let blob = view.bytes();
+	let layout = view.layout();
+	let slab_id = view.slab_id();
 	let header_size = std::mem::size_of::<SlabRecordHeader>();
 	// Acknowledged offsets are matched against accepted records as the walk
 	// advances in offset order, so no set of accepted offsets is collected.
@@ -2118,7 +2138,10 @@ fn walk_slab_records(
 	let mut first_unaccepted = None;
 	let mut cursor: usize = 0;
 
-	while cursor + DIRECT_IO_ALIGN <= blob.len() {
+	while cursor
+		.checked_add(DIRECT_IO_ALIGN)
+		.is_some_and(|page_end| page_end <= blob.len())
+	{
 		let header: SlabRecordHeader =
 			*bytemuck::from_bytes::<SlabRecordHeader>(&blob[cursor..cursor + header_size]);
 
@@ -2131,7 +2154,10 @@ fn walk_slab_records(
 					Error::new(ErrorKind::InvalidData, "recovered frame_len overflow")
 				})?;
 			let padded = page_round_up(payload_size);
-			if cursor + padded > blob.len() {
+			if cursor
+				.checked_add(padded)
+				.is_none_or(|record_end| record_end > blob.len())
+			{
 				None
 			} else {
 				let frame = &blob[cursor + header_size..cursor + payload_size];
@@ -2142,18 +2168,19 @@ fn walk_slab_records(
 		};
 
 		let Some((payload_size, padded, frame)) = validated else {
-			match next_acknowledged_offset(acknowledged, cursor as u64, blob.len() as u64) {
+			match next_acknowledged_cursor(acknowledged, &layout, cursor)? {
 				Some(next) => {
-					cursor = next as usize;
+					cursor = next;
 					continue;
 				}
 				None => break,
 			}
 		};
 
+		let logical = layout.logical_of(cursor)?;
 		let base_location = RecordLocation {
 			slab_id,
-			offset: cursor as u64,
+			offset: logical,
 			length: payload_size as u32,
 			hlc: header.hlc,
 			record_row_index: RecordRowIndex::ZERO,
@@ -2162,10 +2189,10 @@ fn walk_slab_records(
 			partition: None,
 		};
 		while let Some(&offset) = pending_acknowledged.peek() {
-			if offset > cursor as u64 {
+			if offset > logical {
 				break;
 			}
-			if offset < cursor as u64 && first_unaccepted.is_none() {
+			if offset < logical && first_unaccepted.is_none() {
 				first_unaccepted = Some(offset);
 			}
 			pending_acknowledged.next();

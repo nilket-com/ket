@@ -1,4 +1,5 @@
 use super::*;
+use crate::storage::tier_object_layout::SlabView;
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct NdvColumnCandidate {
@@ -1031,13 +1032,13 @@ impl SlabManager {
 
 	pub(super) fn build_tiered_column_stats_block(
 		&self,
-		blob: &[u8],
-		slab_id: SlabId,
+		blob: SlabView<'_>,
 		tenant_id: TenantId,
 		table_schemas: &TableSchemaCatalog,
 		acknowledged: &BTreeSet<u64>,
 	) -> std::io::Result<Option<TieredColumnStatsBlock>> {
 		self.require_tier_authority_ready()?;
+		let slab_id = blob.slab_id();
 		let descriptors = table_schemas
 			.descriptors_for_tenant(tenant_id)
 			.into_iter()
@@ -1046,7 +1047,7 @@ impl SlabManager {
 		if descriptors.is_empty() {
 			return Ok(None);
 		}
-		let entries = recover_slab_entries_from_blob(blob, slab_id, acknowledged)?;
+		let entries = recover_slab_entries_from_blob(blob, acknowledged)?;
 		let mut candidates: Option<Vec<TableSchemaDescriptor>> = None;
 		let mut saw_unmatched_row = false;
 		let mut row_batches = Vec::with_capacity(entries.len());

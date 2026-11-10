@@ -163,6 +163,7 @@ use crate::storage::stats::{
 	locator_flags_for_parsed_column_stats_block,
 	max_column_stats_ciphertext_bytes_for_slab_payload, parse_column_stats_block,
 };
+use crate::storage::tier_object_layout::SlabView;
 use crate::storage::{
 	AsyncFileOps, BlockingFileOps, BlockingIoClass, CompactionCommit, CompactionDigestSummary,
 	CompactionFailure, CompactionManifest, CompactionPlan, IoUringFileOps, LsmCompactionDriver,
@@ -229,6 +230,7 @@ mod tier_tokens;
 pub use tier_tokens::{TierProposal, TierSubmission};
 mod lock_recovery;
 mod tier_plan;
+mod tier_transition;
 mod version_identity;
 use lock_recovery::{recover_rwlock_read, recover_rwlock_write};
 use tier_generation::{ReadTarget, TierLayout};
@@ -250,7 +252,7 @@ mod pause_hooks;
 #[cfg(test)]
 pub(crate) use pause_hooks::LsmPublicationForTest;
 use tiered_io::{
-	RehydratedSlabState, SlabBacking, TierObjectEvidence, TieredPlaintext, decode_tiered_blob,
+	RehydratedCopy, SlabBacking, TierObjectEvidence, decode_tiered_blob,
 	descriptor_matches_tiered_row, extract_record_from_blob, fetch_tiered_ciphertext_runs,
 	validate_tiered_blob, validate_tiered_record_header_tenant,
 };
@@ -258,6 +260,8 @@ use tiered_io::{
 use tiered_io::{build_tiered_object_metadata, single_tenant_id_from_plain_slab};
 // ADR 0704: the typed refusal a superseded tier delivery ends with.
 pub(crate) use tiered_io::is_tier_publication_superseded;
+// ADR 0705: a decoded tier object with its layout.
+pub(crate) use tiered_io::TieredPlaintext;
 // ADR 0699 S5b: the certified cleanup rewrite.
 pub(crate) mod certified_cleanup;
 pub(crate) mod certified_delivery;
@@ -968,7 +972,7 @@ struct ManagerState {
 	/// still live in L2. Kept outside `sealed` so compaction and
 	/// ordinary L1 -> L2 demotion never mistake a cache copy for a
 	/// new authoritative slab.
-	rehydrated: DashMap<SlabId, RehydratedSlabState>,
+	rehydrated: DashMap<SlabId, RehydratedCopy>,
 	/// Consecutive reads that had to fetch a slab from L2.
 	hot_read_counts: HashMap<SlabId, u32>,
 	/// Slabs currently being restored from L2 to L1. Guards the
@@ -1655,7 +1659,7 @@ impl SlabManager {
 			let rehydrated = state
 				.rehydrated
 				.iter()
-				.map(|entry| entry.value().slab.clone())
+				.map(|entry| entry.value().store.clone())
 				.collect::<Vec<_>>();
 			(active, sealed, rehydrated)
 		};
@@ -2259,7 +2263,7 @@ impl SlabManager {
 		for entry in state.rehydrated.iter() {
 			out.push(RehydratedSlabInfo {
 				slab_id: *entry.key(),
-				size_bytes: entry.value().slab.write_cursor(),
+				size_bytes: entry.value().store.write_cursor(),
 				keep_local_until: entry.value().keep_local_until,
 			});
 		}
@@ -2279,7 +2283,7 @@ impl SlabManager {
 			total = total.saturating_add(entry.value().write_cursor());
 		}
 		for entry in state.rehydrated.iter() {
-			total = total.saturating_add(entry.value().slab.write_cursor());
+			total = total.saturating_add(entry.value().store.write_cursor());
 		}
 		total
 	}
@@ -2531,8 +2535,7 @@ impl SlabManager {
 		for slab_id in sealed_ids {
 			let blob = self.read_sealed_raw(slab_id).await?;
 			bytes = bytes.saturating_add(uncompressed_resident_bytes_in_slab(
-				&blob,
-				slab_id,
+				SlabView::dense(slab_id, &blob)?,
 				table_schemas,
 				acknowledged_by_slab.get(&slab_id).unwrap_or(&empty),
 			)?);
@@ -2540,8 +2543,7 @@ impl SlabManager {
 		for pointer in tiered_pointers {
 			let blob = self.tiered_plaintext_from_l2(&pointer).await?;
 			bytes = bytes.saturating_add(uncompressed_resident_bytes_in_slab(
-				&blob,
-				pointer.slab_id,
+				blob.view()?,
 				table_schemas,
 				acknowledged_by_slab.get(&pointer.slab_id).unwrap_or(&empty),
 			)?);
@@ -2550,21 +2552,30 @@ impl SlabManager {
 		Ok(bytes)
 	}
 
+	#[cfg(test)]
 	pub(crate) fn decode_tiered_object_blob(
 		&self,
 		pointer: &TieredSlabPointer,
 		blob: &[u8],
 	) -> std::io::Result<Vec<u8>> {
+		Ok(self.decode_tiered_object(pointer, blob)?.bytes)
+	}
+
+	/// `pointer`'s object, the published generation the index describes, with
+	/// its validated layout (a rewrap keeps it).
+	pub(crate) fn decode_tiered_object(
+		&self,
+		pointer: &TieredSlabPointer,
+		blob: &[u8],
+	) -> std::io::Result<TieredPlaintext> {
 		validate_tiered_blob(pointer, blob)?;
-		// Callers decode the published generation (rewrap keeps its layout).
 		let acknowledged = self.acknowledged_offsets_in_slab(pointer.slab_id);
-		Ok(decode_tiered_blob(
+		decode_tiered_blob(
 			self.config.crypto.as_ref(),
 			pointer,
 			blob,
 			TierObjectEvidence::Indexed(&acknowledged),
-		)?
-		.bytes)
+		)
 	}
 
 	#[allow(dead_code)]
@@ -2696,7 +2707,10 @@ impl SlabManager {
 				return Ok(true);
 			}
 			let plaintext = self.read_sealed_raw(slab_id).await?;
-			let table_ids = self.secondary_index_table_ids_from_plaintext(slab_id, &plaintext)?;
+			let table_ids = self.secondary_index_table_ids_from_plaintext(
+				slab_id,
+				SlabView::dense(slab_id, &plaintext)?,
+			)?;
 			if table_ids.contains(&(tenant_id, descriptor.table_object_id)) {
 				return Ok(true);
 			}
@@ -3382,11 +3396,12 @@ impl SlabManager {
 		if let Some(s) = state.sealed.get(&slab_id) {
 			return SlabBacking::Local(s.clone());
 		}
-		if let Some(s) = state.rehydrated.get(&slab_id) {
-			return SlabBacking::Local(s.slab.clone());
-		}
+		// A rehydrated copy serves only the generation it was made from.
 		if let Some(p) = state.tiered.get(&slab_id) {
-			return SlabBacking::L2(p.clone());
+			return match state.rehydrated.get(&slab_id) {
+				Some(copy) if copy.serves(&p) => SlabBacking::Rehydrated(copy.clone()),
+				_ => SlabBacking::L2(p.clone()),
+			};
 		}
 		SlabBacking::Missing
 	}
@@ -3565,7 +3580,7 @@ impl SlabManager {
 			..
 		} = self.resolve_read_target(location, false).await?;
 		match backing {
-			SlabBacking::Local(_) => Ok(None),
+			SlabBacking::Local(_) | SlabBacking::Rehydrated(_) => Ok(None),
 			SlabBacking::L2(pointer) => {
 				let l2 = self.config.l2.as_ref().cloned().ok_or_else(|| {
 					Error::new(
@@ -3633,7 +3648,7 @@ impl SlabManager {
 			..
 		} = self.resolve_read_target(location, false).await?;
 		match backing {
-			SlabBacking::Local(_) => Ok(None),
+			SlabBacking::Local(_) | SlabBacking::Rehydrated(_) => Ok(None),
 			SlabBacking::L2(pointer) => {
 				let l2 = self.config.l2.as_ref().cloned().ok_or_else(|| {
 					Error::new(
@@ -3684,7 +3699,7 @@ impl SlabManager {
 			}
 		}
 		match backing {
-			SlabBacking::Local(_) => Ok(None),
+			SlabBacking::Local(_) | SlabBacking::Rehydrated(_) => Ok(None),
 			SlabBacking::L2(pointer) => {
 				let l2 = self.config.l2.as_ref().cloned().ok_or_else(|| {
 					Error::new(
@@ -3836,18 +3851,17 @@ impl SlabManager {
 		validate_tiered_blob(pointer, &old_blob)?;
 		// The rewrite source is the published generation: the index's offsets
 		// are the independent evidence for every acknowledged record in it.
-		let plaintext = Zeroizing::new(
-			decode_tiered_blob(
-				self.config.crypto.as_ref(),
-				pointer,
-				&old_blob,
-				TierObjectEvidence::Indexed(&self.acknowledged_offsets_in_slab(pointer.slab_id)),
-			)?
-			.bytes,
-		);
+		let decoded = decode_tiered_blob(
+			self.config.crypto.as_ref(),
+			pointer,
+			&old_blob,
+			TierObjectEvidence::Indexed(&self.acknowledged_offsets_in_slab(pointer.slab_id)),
+		)?;
+		let source_layout = decoded.layout;
+		let plaintext = Zeroizing::new(decoded.bytes);
+		let plaintext = SlabView::new(&plaintext, source_layout)?;
 		let mut records = recover_slab_entries_from_blob(
-			&plaintext,
-			pointer.slab_id,
+			plaintext,
 			&self.acknowledged_offsets_in_slab(pointer.slab_id),
 		)?
 		.into_iter()
@@ -3862,7 +3876,7 @@ impl SlabManager {
 		})
 		.collect::<Vec<_>>();
 		self.mark_records_for_table_retention_from_blob(
-			&plaintext,
+			plaintext,
 			&mut records,
 			cluster_policy,
 			table_lifecycle,
@@ -3900,7 +3914,7 @@ impl SlabManager {
 		let replacement = self
 			.build_tiered_replacement(
 				pointer,
-				&plaintext,
+				plaintext,
 				&records,
 				table_schemas,
 				old_blob.len() as u64,
@@ -3947,18 +3961,17 @@ impl SlabManager {
 		validate_tiered_blob(pointer, &old_blob)?;
 		// The rewrite source is the published generation: the index's offsets
 		// are the independent evidence for every acknowledged record in it.
-		let plaintext = Zeroizing::new(
-			decode_tiered_blob(
-				self.config.crypto.as_ref(),
-				pointer,
-				&old_blob,
-				TierObjectEvidence::Indexed(&self.acknowledged_offsets_in_slab(pointer.slab_id)),
-			)?
-			.bytes,
-		);
+		let decoded = decode_tiered_blob(
+			self.config.crypto.as_ref(),
+			pointer,
+			&old_blob,
+			TierObjectEvidence::Indexed(&self.acknowledged_offsets_in_slab(pointer.slab_id)),
+		)?;
+		let source_layout = decoded.layout;
+		let plaintext = Zeroizing::new(decoded.bytes);
+		let plaintext = SlabView::new(&plaintext, source_layout)?;
 		let mut records = recover_slab_entries_from_blob(
-			&plaintext,
-			pointer.slab_id,
+			plaintext,
 			&self.acknowledged_offsets_in_slab(pointer.slab_id),
 		)?
 		.into_iter()
@@ -3972,12 +3985,7 @@ impl SlabManager {
 			retention_lag_seconds: 0,
 		})
 		.collect::<Vec<_>>();
-		self.mark_records_for_table_drop_from_blob(
-			&plaintext,
-			&mut records,
-			tenant_id,
-			descriptor,
-		)?;
+		self.mark_records_for_table_drop_from_blob(plaintext, &mut records, tenant_id, descriptor)?;
 		// ADR 0699: under containment a tiered table-drop rewrite drops nothing,
 		// so it is never prepared and never retires a slab holding records.
 		self.keep_contained_versions(&mut records);
@@ -4003,8 +4011,10 @@ impl SlabManager {
 		let _ = unlink_local_file(self.file_ops.as_ref(), &tmp_path).await;
 		let mut multirow_recompact_count = 0_u64;
 		// The replacement's own record offsets: the index still describes the
-		// old layout, so every walk of the new bytes takes these instead.
-		let mut replacement_offsets = BTreeSet::new();
+		// old layout, so every walk of the new bytes takes these instead. The
+		// local store appends at physical offsets; the replacement's layout
+		// makes them logical.
+		let mut appended = BTreeSet::new();
 		let rewrite_result: std::io::Result<Zeroizing<Vec<u8>>> = async {
 			let rewritten = Arc::new(
 				LocalSlabStore::open(
@@ -4020,7 +4030,7 @@ impl SlabManager {
 					continue;
 				};
 				let frame = Zeroizing::new(extract_record_from_blob(
-					&plaintext,
+					plaintext,
 					crate::storage::core::FrameLocation::of_point_read(first.old_location),
 				)?);
 				let Some(compacted) = compact_physical_record_frame(
@@ -4045,7 +4055,7 @@ impl SlabManager {
 						&compacted.frame,
 					)
 					.await?;
-				replacement_offsets.insert(location.offset);
+				appended.insert(location.offset);
 			}
 			rewritten.fsync().await?;
 			Ok(Zeroizing::new(self.file_ops.read_all(&tmp_path).await?))
@@ -4053,10 +4063,17 @@ impl SlabManager {
 		.await;
 		let _ = unlink_local_file(self.file_ops.as_ref(), &tmp_path).await;
 		let rewritten_plaintext = rewrite_result?;
+		// ADR 0705: a layout-changing rewrite starts at its validated source
+		// object's full aligned logical end, so it reissues no location.
+		let (rewritten_view, replacement_offsets) = tier_transition::layout_changing_replacement(
+			plaintext.layout(),
+			&rewritten_plaintext,
+			&appended,
+		)?;
 		self.preflight_tier_publication(
 			pointer.slab_id,
-			&plaintext,
-			&rewritten_plaintext,
+			plaintext,
+			rewritten_view,
 			&replacement_offsets,
 		)
 		.await?;
@@ -4064,16 +4081,12 @@ impl SlabManager {
 			metrics().observe_storage_multirow_recompact(multirow_recompact_count);
 		}
 		let encrypted = self.encrypt_tiered_blob_with_evidence(
-			pointer.slab_id,
-			rewritten_plaintext.as_ref(),
+			rewritten_view,
 			&replacement_offsets,
 			Some(table_schemas),
 		)?;
-		let row_tombstone_metadata = row_tombstone_metadata_from_blob(
-			rewritten_plaintext.as_ref(),
-			pointer.slab_id,
-			&replacement_offsets,
-		)?;
+		let row_tombstone_metadata =
+			row_tombstone_metadata_from_blob(rewritten_view, &replacement_offsets)?;
 		Ok(Some(PreparedTieredTableDropRewrite::Rewrite {
 			slab_id: pointer.slab_id,
 			old_l2_uri: pointer.l2_uri.clone(),
@@ -4164,12 +4177,11 @@ fn arrow_io_error(error: arrow::error::ArrowError) -> Error {
 
 #[allow(dead_code)]
 fn uncompressed_resident_bytes_in_slab(
-	blob: &[u8],
-	slab_id: SlabId,
+	blob: SlabView<'_>,
 	table_schemas: &TableSchemaCatalog,
 	acknowledged: &BTreeSet<u64>,
 ) -> std::io::Result<u64> {
-	let entries = recover_slab_entries_from_blob(blob, slab_id, acknowledged)?;
+	let entries = recover_slab_entries_from_blob(blob, acknowledged)?;
 
 	let mut descriptors_by_tenant: HashMap<TenantId, Vec<TableSchemaDescriptor>> = HashMap::new();
 	let mut bytes = 0_u64;
@@ -4234,11 +4246,10 @@ fn uncompressed_resident_bytes_in_slab(
 }
 
 fn row_tombstone_metadata_from_blob(
-	blob: &[u8],
-	slab_id: SlabId,
+	blob: SlabView<'_>,
 	acknowledged: &BTreeSet<u64>,
 ) -> std::io::Result<TombstoneMetadata> {
-	let entries = recover_slab_entries_from_blob(blob, slab_id, acknowledged)?;
+	let entries = recover_slab_entries_from_blob(blob, acknowledged)?;
 	Ok(row_tombstone_metadata_from_entries(&entries))
 }
 

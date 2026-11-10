@@ -194,7 +194,7 @@ impl SlabManager {
 			let rehydrated = state
 				.rehydrated
 				.get(&slab_id)
-				.map(|entry| entry.slab.clone());
+				.map(|entry| entry.store.clone());
 			let expected = match (sealed.as_ref(), rehydrated.as_ref()) {
 				(Some(a), Some(b)) => {
 					let identity = a.opened_file_identity()?;

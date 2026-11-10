@@ -2081,7 +2081,8 @@ fn test_adr050_pk_delete_supersession_boundaries() {
 		.filter(|c| !c.is_whitespace())
 		.collect();
 	for needle in [
-		"row_tombstone_metadata_from_blob(rewritten_plaintext.as_ref()",
+		// ADR 0705: the rewritten plaintext is walked under its layout.
+		"row_tombstone_metadata_from_blob(rewritten_view,",
 		"tombstone_metadata:merge_row_tombstone_metadata(",
 	] {
 		if !manager_source.contains(needle) {
@@ -9779,6 +9780,8 @@ fn adr078_manager_source_concatenates_submodules() {
 			"tier_plan.rs",
 			// ADR 0696 (0692 §7): proposer history tokens.
 			"tier_tokens.rs",
+			// ADR 0705: the tier transition classifier.
+			"tier_transition.rs",
 			"tiered_io.rs",
 			// ADR 0692: class-scoped version identity and tier verification.
 			"version_identity.rs",
@@ -11603,7 +11606,9 @@ fn snapshot_lease_scopes_exclude_remote_io_and_backoff() {
 			("stats_facts.rs", 0),
 			("tier_authority.rs", 1),
 			("tier_plan.rs", 2),
-			("tiered_io.rs", 2),
+			// ADR 0705: the ranged L2 read splits the one record it decrypted
+			// (`record_and_header_from_record_bytes`) instead of re-locating it.
+			("tiered_io.rs", 1),
 			// ADR 0704: the certified tier claim reads each physical frame once.
 			("certified_tier.rs", 1),
 		],

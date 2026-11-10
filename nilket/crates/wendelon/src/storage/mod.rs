@@ -33,6 +33,7 @@ pub mod sketch;
 pub mod slab_pins;
 pub mod stats;
 pub mod sweeper;
+pub mod tier_object_layout;
 
 pub use aggregate::*;
 pub use cdc::*;

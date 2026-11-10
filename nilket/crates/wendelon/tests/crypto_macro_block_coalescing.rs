@@ -5,6 +5,7 @@ use wendelon::crypto::{
 use wendelon::schema::{
 	ChunkSizeBytes, IdentityPrefix, RecordBodyByteLen, RecordBodyByteOffset, SlabId, TenantId,
 };
+use wendelon::storage::tier_object_layout::LogicalExtent;
 
 const PLAINTEXT_BYTES: usize = 100 * 1024 * 1024;
 
@@ -21,6 +22,7 @@ fn encrypt_fixture(
 				tenant_id: TenantId::ZERO,
 				created_hlc: 61,
 				chunk_size_bytes: chunk_size,
+				logical_base: 0,
 				offset_index: vec![TieredOffsetIndexEntry {
 					key_locator: IdentityPrefix::ZERO,
 					byte_offset: 0,
@@ -69,7 +71,7 @@ fn adr061_dense_100mib_closed_set_chunks_coalesce_to_one_ciphertext_range() {
 				object_size,
 				&encrypted.bytes[tail_start..],
 				None,
-				0..PLAINTEXT_BYTES,
+				LogicalExtent::new(0, PLAINTEXT_BYTES as u64),
 				&requested,
 			)
 			.unwrap();
@@ -131,7 +133,7 @@ fn adr061_clustered_sparse_100mib_closed_set_chunks_coalesce_per_region() {
 				object_size,
 				&encrypted.bytes[tail_start..],
 				None,
-				0..PLAINTEXT_BYTES,
+				LogicalExtent::new(0, PLAINTEXT_BYTES as u64),
 				&requested,
 			)
 			.unwrap();

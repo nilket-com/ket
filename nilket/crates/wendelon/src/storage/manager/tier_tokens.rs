@@ -523,6 +523,7 @@ pub(super) fn observe_tier_rewrite_refusal(error: &Error) {
 			Some(TierHistoryShortfall::StalePlan) => Some(Reason::StalePlan),
 			None => match stale_location(error).map(|stale| stale.reason) {
 				Some(StaleLocationReason::LayoutCollision) => Some(Reason::LayoutCollision),
+				Some(StaleLocationReason::LayoutRegression) => Some(Reason::LayoutRegression),
 				_ => None,
 			},
 		};

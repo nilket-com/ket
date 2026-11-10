@@ -1378,10 +1378,25 @@ impl TierAuthority {
 		};
 		match backing {
 			SlabBacking::Local(slab) => slab.read_with_header(target).await,
+			// ADR 0705: the copy converts through its object's layout, and its
+			// frame must name the version as an L2 frame must.
+			SlabBacking::Rehydrated(copy) => {
+				let record = copy.read_with_header(target).await?;
+				lsm_driver::verify_frame_names_version(
+					&record.0,
+					&record.1,
+					target,
+					lsm_driver::ExpectedVersion {
+						tenant_id: copy.generation.tenant_id,
+						key_identity: None,
+					},
+				)?;
+				Ok(record)
+			}
 			SlabBacking::L2(pointer) => {
 				let object = self.plaintext(epoch, &pointer, cache).await?;
 				let record = tiered_io::extract_record_and_header_from_blob(
-					&object.bytes,
+					object.view()?,
 					crate::storage::core::FrameLocation::of_point_read(target),
 				)?;
 				lsm_driver::verify_frame_names_version(
@@ -1409,6 +1424,21 @@ impl TierAuthority {
 		};
 		let mut cache = RecoveryObjects::default();
 		for pending in &snapshot {
+			// ADR 0705 §5: where this store holds a published local source of
+			// another object, the pending generation is classified against it
+			// (below, under the publication lock); both objects are fetched
+			// here, with no lease or lock held.
+			let classified_source = {
+				let manager = self.upgrade(epoch).ok_or_else(obsolete_verification)?;
+				manager.tier_pointer(pending.pointer.slab_id).await
+			};
+			let source_object = match classified_source
+				.as_ref()
+				.filter(|source| source.payload_hash != pending.pointer.payload_hash)
+			{
+				Some(source) => Some((source, self.plaintext(epoch, source, &mut cache).await?)),
+				None => None,
+			};
 			let plaintext = self.plaintext(epoch, &pending.pointer, &mut cache).await?;
 			let canonical = self.snapshot_reconciliation_source();
 			let _canonical = match canonical {
@@ -1442,8 +1472,25 @@ impl TierAuthority {
 			}
 			let lock = manager.tier_publication_lock(pending.pointer.slab_id);
 			let _publication = lock.lock().await;
-			if !self.current(epoch) {
+			if !self.current(epoch)
+				|| manager.tier_pointer(pending.pointer.slab_id).await != classified_source
+			{
 				return Err(obsolete_verification());
+			}
+			if let Some((source, source_object)) = &source_object {
+				super::tier_transition::classify_tier_transition(
+					super::tier_transition::TierTransitionObject {
+						plaintext: source_object.view()?,
+						payload_hash: Some(&source.payload_hash),
+					},
+					super::tier_transition::TierTransitionObject {
+						plaintext: plaintext.view()?,
+						payload_hash: Some(&pending.pointer.payload_hash),
+					},
+				)
+				.map_err(|error| {
+					manager.observed_publication_error(pending.pointer.slab_id, error)
+				})?;
 			}
 			if manager
 				.retired_tier_slabs

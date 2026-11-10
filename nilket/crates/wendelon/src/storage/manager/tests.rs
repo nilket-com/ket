@@ -6852,7 +6852,9 @@ async fn tier_stats_build_decode_count(frames: usize, rows_per_frame: usize) -> 
 
 	// Preconditions, outside the counted scope: the sealed slab holds every
 	// logical row, live, in exactly `frames` distinct physical frames.
-	let recovered = recover_slab_entries_from_blob(&raw, slab_id, &acknowledged).unwrap();
+	let recovered =
+		recover_slab_entries_from_blob(SlabView::dense(slab_id, &raw).unwrap(), &acknowledged)
+			.unwrap();
 	assert_eq!(recovered.len(), total_rows);
 	assert!(
 		recovered
@@ -6867,8 +6869,12 @@ async fn tier_stats_build_decode_count(frames: usize, rows_per_frame: usize) -> 
 
 	// Counted scope: the synchronous stats builder only.
 	let decode_guard = crate::storage::multirow::DecodeCountGuard::start();
-	let built =
-		mgr.build_tiered_column_stats_block(&raw, slab_id, tenant(), &catalog, &acknowledged);
+	let built = mgr.build_tiered_column_stats_block(
+		SlabView::dense(slab_id, &raw).unwrap(),
+		tenant(),
+		&catalog,
+		&acknowledged,
+	);
 	let stats_decodes = decode_guard.finish();
 
 	// The build must succeed with a real stats block covering every row, so
@@ -6938,11 +6944,20 @@ async fn tier_rows_decode_each_frame_at_most_once() {
 		let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
 		let acknowledged = mgr.acknowledged_offsets_in_slab(slab_id);
 		let scratch = mgr
-			.reserve_tier_plan_scratch(slab_id, &raw, &acknowledged)
+			.reserve_tier_plan_scratch(
+				slab_id,
+				SlabView::dense(slab_id, &raw).unwrap(),
+				&acknowledged,
+			)
 			.unwrap();
 		let guard = crate::storage::multirow::DecodeCountGuard::start();
 		let rows = mgr
-			.tiered_rows_within(&raw, slab_id, &acknowledged, &scratch)
+			.tiered_rows_within(
+				SlabView::dense(slab_id, &raw).unwrap(),
+				slab_id,
+				&acknowledged,
+				&scratch,
+			)
 			.unwrap();
 		let decodes = guard.finish();
 		assert_eq!(rows.len(), frames * rows_per_frame, "every row");
@@ -7744,10 +7759,10 @@ async fn tiered_retention_rewrite_filters_partial_multirow_storage_records() {
 		&encrypted_bytes,
 		TierObjectEvidence::Replacement,
 	)
-	.unwrap()
-	.bytes;
+	.unwrap();
 	let recovered =
-		recover_slab_entries_from_blob(&rewritten_plaintext, slab_id, &BTreeSet::new()).unwrap();
+		recover_slab_entries_from_blob(rewritten_plaintext.view().unwrap(), &BTreeSet::new())
+			.unwrap();
 	assert!(
 		!recovered
 			.iter()
@@ -8594,10 +8609,10 @@ async fn tiered_retention_rewrite_pair_gc_drops_data_and_row_tombstone() {
 		&encrypted_bytes,
 		TierObjectEvidence::Replacement,
 	)
-	.unwrap()
-	.bytes;
+	.unwrap();
 	let recovered =
-		recover_slab_entries_from_blob(&rewritten_plaintext, slab_id, &BTreeSet::new()).unwrap();
+		recover_slab_entries_from_blob(rewritten_plaintext.view().unwrap(), &BTreeSet::new())
+			.unwrap();
 	assert_eq!(recovered.len(), 1);
 	assert_eq!(recovered[0].key_identity, key_b);
 	assert!(!recovered[0].location.is_tombstone);
@@ -8738,10 +8753,10 @@ async fn tiered_table_retention_keeps_pk_boundary_tombstone_under_cluster_floor(
 		&encrypted_bytes,
 		TierObjectEvidence::Replacement,
 	)
-	.unwrap()
-	.bytes;
+	.unwrap();
 	let recovered =
-		recover_slab_entries_from_blob(&rewritten_plaintext, slab_id, &BTreeSet::new()).unwrap();
+		recover_slab_entries_from_blob(rewritten_plaintext.view().unwrap(), &BTreeSet::new())
+			.unwrap();
 	assert_eq!(recovered.len(), 1);
 	assert_eq!(recovered[0].key_identity, key);
 	assert_eq!(recovered[0].location.hlc, hlc(20_000));
@@ -8874,10 +8889,10 @@ async fn tiered_table_retention_rewrite_prunes_append_only_rows_when_cluster_ret
 		&encrypted_bytes,
 		TierObjectEvidence::Replacement,
 	)
-	.unwrap()
-	.bytes;
+	.unwrap();
 	let recovered =
-		recover_slab_entries_from_blob(&rewritten_plaintext, slab_id, &BTreeSet::new()).unwrap();
+		recover_slab_entries_from_blob(rewritten_plaintext.view().unwrap(), &BTreeSet::new())
+			.unwrap();
 	assert_eq!(recovered.len(), 1);
 	assert_eq!(recovered[0].key_identity, live_key);
 }
@@ -12814,6 +12829,7 @@ async fn decode_tiered_blob_rejects_footer_tenant_mismatch_with_payload_tenant()
 				tenant_id: mismatched_tenant,
 				created_hlc: 10,
 				chunk_size_bytes: SLAB_ENCRYPTION_DEFAULT_CHUNK_SIZE,
+				logical_base: 0,
 				offset_index: vec![TieredOffsetIndexEntry {
 					key_locator: IdentityPrefix::ZERO,
 					byte_offset: 0,
@@ -14327,33 +14343,32 @@ impl SlabManager {
 			.get(&pointer.l2_uri)
 			.await?;
 		validate_tiered_blob(pointer, &old_blob)?;
-		let plaintext = Zeroizing::new(
-			decode_tiered_blob(
-				self.config.crypto.as_ref(),
-				pointer,
-				&old_blob,
-				TierObjectEvidence::Indexed(&self.acknowledged_offsets_in_slab(pointer.slab_id)),
-			)?
-			.bytes,
-		);
-		let mut records =
-			recover_slab_entries_from_blob(&plaintext, pointer.slab_id, &BTreeSet::new())?
-				.into_iter()
-				.map(|entry| CompactionRecord {
-					tenant_id: entry.tenant_id,
-					key_identity: entry.key_identity,
-					routing_locality: self.recovered_entry_routing_locality(&entry),
-					old_location: entry.location,
-					reclaim: self.is_retention_prunable(
-						entry.tenant_id,
-						entry.key_identity,
-						entry.location,
-						retention_floor,
-					),
-					retention_ambiguous: false,
-					retention_lag_seconds: 0,
-				})
-				.collect::<Vec<_>>();
+		let decoded = decode_tiered_blob(
+			self.config.crypto.as_ref(),
+			pointer,
+			&old_blob,
+			TierObjectEvidence::Indexed(&self.acknowledged_offsets_in_slab(pointer.slab_id)),
+		)?;
+		let source_layout = decoded.layout;
+		let plaintext = Zeroizing::new(decoded.bytes);
+		let plaintext = SlabView::new(&plaintext, source_layout)?;
+		let mut records = recover_slab_entries_from_blob(plaintext, &BTreeSet::new())?
+			.into_iter()
+			.map(|entry| CompactionRecord {
+				tenant_id: entry.tenant_id,
+				key_identity: entry.key_identity,
+				routing_locality: self.recovered_entry_routing_locality(&entry),
+				old_location: entry.location,
+				reclaim: self.is_retention_prunable(
+					entry.tenant_id,
+					entry.key_identity,
+					entry.location,
+					retention_floor,
+				),
+				retention_ambiguous: false,
+				retention_lag_seconds: 0,
+			})
+			.collect::<Vec<_>>();
 		Self::mark_retention_prunable_row_tombstone_pairs(&mut records, retention_floor);
 		self.keep_conflicting_versions(&mut records);
 		records.sort_by_key(|record| record.old_location.offset);
@@ -14380,7 +14395,7 @@ impl SlabManager {
 		let _ = unlink_local_file(self.file_ops.as_ref(), &tmp_path).await;
 		let mut multirow_recompact_count = 0_u64;
 		// The replacement's own record offsets, as the production rewrites keep.
-		let mut replacement_offsets = BTreeSet::new();
+		let mut appended = BTreeSet::new();
 		let rewrite_result: std::io::Result<Zeroizing<Vec<u8>>> = async {
 			let rewritten = Arc::new(
 				LocalSlabStore::open(
@@ -14396,7 +14411,7 @@ impl SlabManager {
 					continue;
 				};
 				let frame = Zeroizing::new(extract_record_from_blob(
-					&plaintext,
+					plaintext,
 					crate::storage::core::FrameLocation::of_point_read(first.old_location),
 				)?);
 				let Some(compacted) = compact_physical_record_frame(
@@ -14421,7 +14436,7 @@ impl SlabManager {
 						&compacted.frame,
 					)
 					.await?;
-				replacement_offsets.insert(location.offset);
+				appended.insert(location.offset);
 			}
 			rewritten.fsync().await?;
 			Ok(Zeroizing::new(self.file_ops.read_all(&tmp_path).await?))
@@ -14429,20 +14444,23 @@ impl SlabManager {
 		.await;
 		let _ = unlink_local_file(self.file_ops.as_ref(), &tmp_path).await;
 		let rewritten_plaintext = rewrite_result?;
+		// ADR 0705: based at the source's logical end, as production builds.
+		let (rewritten_view, replacement_offsets) =
+			super::tier_transition::layout_changing_replacement(
+				plaintext.layout(),
+				&rewritten_plaintext,
+				&appended,
+			)?;
 		if multirow_recompact_count > 0 {
 			metrics().observe_storage_multirow_recompact(multirow_recompact_count);
 		}
 		let encrypted = self.encrypt_tiered_blob_with_evidence(
-			pointer.slab_id,
-			rewritten_plaintext.as_ref(),
+			rewritten_view,
 			&replacement_offsets,
 			Some(table_schemas),
 		)?;
-		let row_tombstone_metadata = row_tombstone_metadata_from_blob(
-			rewritten_plaintext.as_ref(),
-			pointer.slab_id,
-			&replacement_offsets,
-		)?;
+		let row_tombstone_metadata =
+			row_tombstone_metadata_from_blob(rewritten_view, &replacement_offsets)?;
 		Ok(Some(PreparedTieredRetentionRewrite::Rewrite {
 			slab_id: pointer.slab_id,
 			old_l2_uri: pointer.l2_uri.clone(),
@@ -16884,13 +16902,19 @@ async fn blob_recovery_resumes_only_at_acknowledged_offsets() {
 	torn[before.offset as usize + page + 7] = 0xFF;
 
 	for (name, blob) in [("zero hole", &bytes), ("torn page", &torn)] {
-		let recovered = recover_slab_entries_from_blob(blob, before.slab_id, &evidence).unwrap();
+		let recovered = recover_slab_entries_from_blob(
+			SlabView::dense(before.slab_id, blob).unwrap(),
+			&evidence,
+		)
+		.unwrap();
 		assert_eq!(
 			offsets(&recovered),
 			vec![before.offset, after.offset],
 			"{name}: with evidence both records are recovered"
 		);
-		let recovered = recover_slab_entries_from_blob(blob, before.slab_id, &none).unwrap();
+		let recovered =
+			recover_slab_entries_from_blob(SlabView::dense(before.slab_id, blob).unwrap(), &none)
+				.unwrap();
 		assert_eq!(
 			offsets(&recovered),
 			vec![before.offset],
@@ -16940,8 +16964,9 @@ async fn blob_recovery_does_not_promote_a_payload_page_after_a_lost_header_page(
 	assert_eq!(shifted, BTreeSet::from([0]));
 	// With the evidence the outer record's acknowledged offset is damaged, so
 	// the walk refuses naming it; nothing is promoted.
-	let error = recover_slab_entries_from_blob(&torn, outer.slab_id, &shifted)
-		.expect_err("a damaged acknowledged record refuses the walk");
+	let error =
+		recover_slab_entries_from_blob(SlabView::dense(outer.slab_id, &torn).unwrap(), &shifted)
+			.expect_err("a damaged acknowledged record refuses the walk");
 	assert_eq!(
 		error
 			.get_ref()
@@ -16953,7 +16978,11 @@ async fn blob_recovery_does_not_promote_a_payload_page_after_a_lost_header_page(
 		"the refusal must name the damaged acknowledged record: {error}"
 	);
 	// Without evidence the walk stops at the zero page and promotes nothing.
-	let recovered = recover_slab_entries_from_blob(&torn, outer.slab_id, &BTreeSet::new()).unwrap();
+	let recovered = recover_slab_entries_from_blob(
+		SlabView::dense(outer.slab_id, &torn).unwrap(),
+		&BTreeSet::new(),
+	)
+	.unwrap();
 	assert!(
 		recovered.is_empty(),
 		"payload was promoted to a record: {recovered:?}"
@@ -19033,10 +19062,10 @@ fn tenant_check_verdict(
 	slab_id: SlabId,
 	acknowledged: &BTreeSet<u64>,
 ) -> std::io::Result<TenantId> {
-	let whole =
-		build_tiered_object_metadata(blob, slab_id, &L2ChunkLayoutConfig::default(), acknowledged)
-			.map(|metadata| metadata.tenant_id);
-	let check = single_tenant_id_from_plain_slab(blob, slab_id, acknowledged);
+	let blob = SlabView::dense(slab_id, blob).unwrap();
+	let whole = build_tiered_object_metadata(blob, &L2ChunkLayoutConfig::default(), acknowledged)
+		.map(|metadata| metadata.tenant_id);
+	let check = single_tenant_id_from_plain_slab(blob, acknowledged);
 	assert_eq!(
 		whole.as_ref().map_err(|err| (err.kind(), err.to_string())),
 		check.as_ref().map_err(|err| (err.kind(), err.to_string())),
@@ -19157,15 +19186,15 @@ async fn a_tier_tenant_check_allocates_less_than_object_metadata() {
 	};
 	let whole = measured(&|| {
 		build_tiered_object_metadata(
-			&raw,
-			slab_id,
+			SlabView::dense(slab_id, &raw).unwrap(),
 			&L2ChunkLayoutConfig::default(),
 			&acknowledged,
 		)
 		.unwrap();
 	});
 	let check = measured(&|| {
-		single_tenant_id_from_plain_slab(&raw, slab_id, &acknowledged).unwrap();
+		single_tenant_id_from_plain_slab(SlabView::dense(slab_id, &raw).unwrap(), &acknowledged)
+			.unwrap();
 	});
 	eprintln!(
 		"tenant check on {} bytes, {frames} frames of {rows_per_frame} rows: metadata {} calls {} bytes, check {} calls {} bytes",
@@ -21818,8 +21847,7 @@ async fn a_crash_between_tier_pointer_and_rows_never_serves_another_row() {
 	// still describes generation 1.
 	let encrypted = mgr
 		.encrypt_tiered_blob_with_evidence(
-			pointer.slab_id,
-			&raw,
+			SlabView::dense(pointer.slab_id, &raw).unwrap(),
 			&mgr.acknowledged_offsets_in_slab(scratch),
 			None,
 		)
@@ -21829,8 +21857,11 @@ async fn a_crash_between_tier_pointer_and_rows_never_serves_another_row() {
 		.await
 		.unwrap();
 	let published = tiered_pointer_from_blob(&mgr, pointer.slab_id, uri, &encrypted.bytes);
-	let rewritten =
-		recover_slab_entries_from_blob(&raw, pointer.slab_id, &BTreeSet::new()).unwrap();
+	let rewritten = recover_slab_entries_from_blob(
+		SlabView::dense(pointer.slab_id, &raw).unwrap(),
+		&BTreeSet::new(),
+	)
+	.unwrap();
 	assert!(
 		rewritten.iter().any(|entry| entry.key_identity == c
 			&& (entry.location.offset, entry.location.length)
@@ -23062,10 +23093,13 @@ async fn a_quarantined_slab_file_is_reported_exactly_and_never_authorizes_cleanu
 // ------------------------------------------------------------------
 // Physical location is not logical identity across a tier publication.
 // Keys a and b written in one batch share an HLC, and their rows have equal
-// sizes. A retention rewrite that prunes a@10 moves b@10 into a@10's old
-// physical slot: the same slab, offset, length, HLC and row index. A
-// `RecordLocation` carries no key, so a holder of a@10's location could not
-// be told apart from a holder of b@10's new one.
+// sizes. A retention rewrite written from offset 0 that prunes a@10 would move
+// b@10 into a@10's old physical slot: the same slab, offset, length, HLC and
+// row index. A `RecordLocation` carries no key, so a holder of a@10's location
+// could not be told apart from a holder of b@10's new one. Since ADR 0705 the
+// rewrite starts at its source's logical end, so the builder never produces
+// that object; the fixture still builds it by hand (the same plaintext, dense
+// from 0) as the object a proposer without the base would publish.
 // ------------------------------------------------------------------
 
 struct PrunedSlotReuseFixture {
@@ -23073,8 +23107,11 @@ struct PrunedSlotReuseFixture {
 	mgr: Arc<SlabManager>,
 	l2: Arc<dyn ObjectStore>,
 	pointer: TieredSlabPointer,
-	/// The rewrite a proposer without this node's history would publish.
+	/// The rewrite a proposer without the base would publish: the based
+	/// rewrite's plaintext, dense from offset 0, reusing a@10's location.
 	rewritten: TieredSlabPointer,
+	/// The rewrite the builder produces (ADR 0705): based at the source's end.
+	based: TieredSlabPointer,
 	held_a: RecordLocation,
 	held_b: RecordLocation,
 }
@@ -23113,13 +23150,40 @@ async fn seed_pruned_slot_reuse_fixture(tag: &str) -> PrunedSlotReuseFixture {
 		panic!("premise: a rewrite with survivors");
 	};
 	let uri = l2
-		.put(&format!("tier/{tag}-rewritten.wnd"), &encrypted_bytes)
+		.put(&format!("tier/{tag}-based.wnd"), &encrypted_bytes)
+		.await
+		.unwrap();
+	let based = TieredSlabPointer {
+		tombstone_metadata,
+		supersession_metadata,
+		..tiered_pointer_from_blob(&mgr, pointer.slab_id, uri, &encrypted_bytes)
+	};
+	let based_object = mgr
+		.tiered_object_from_l2(&based, TierObjectEvidence::Replacement)
+		.await
+		.unwrap();
+	let base = based_object.layout.base();
+	assert!(base > 0, "premise: the builder bases its rewrite");
+	let dense_offsets = based_object
+		.record_offsets
+		.iter()
+		.map(|offset| offset - base)
+		.collect::<BTreeSet<_>>();
+	let reusing = mgr
+		.encrypt_tiered_blob_with_evidence(
+			SlabView::dense(pointer.slab_id, &based_object.bytes).unwrap(),
+			&dense_offsets,
+			None,
+		)
+		.unwrap();
+	let uri = l2
+		.put(&format!("tier/{tag}-rewritten.wnd"), &reusing.bytes)
 		.await
 		.unwrap();
 	let rewritten = TieredSlabPointer {
 		tombstone_metadata,
 		supersession_metadata,
-		..tiered_pointer_from_blob(&mgr, pointer.slab_id, uri, &encrypted_bytes)
+		..tiered_pointer_from_blob(&mgr, pointer.slab_id, uri, &reusing.bytes)
 	};
 	let new_rows = mgr.load_tiered_rows_from_l2(&rewritten).await.unwrap();
 	let b_new = new_rows
@@ -23137,6 +23201,7 @@ async fn seed_pruned_slot_reuse_fixture(tag: &str) -> PrunedSlotReuseFixture {
 		l2,
 		pointer,
 		rewritten,
+		based,
 		held_a,
 		held_b,
 	}
@@ -23228,12 +23293,16 @@ async fn a_publication_that_moves_another_key_into_a_pruned_location_is_refused(
 		rewritten,
 		held_a,
 		held_b,
+		..
 	} = fixture;
 	assert_slot_reuse_reads_exact(&mgr, held_a, held_b, "before the publication").await;
 
 	// An observer applies the committed pointer: a@10's old location would
 	// name b@10, so the two meanings cannot be told apart and the publication
-	// is refused whole, before the pointer or any row changes.
+	// is refused whole, before the pointer or any row changes. Since ADR 0705
+	// the transition classifier refuses it first: a different object at its
+	// source's base whose plaintext differs (`LayoutRegression`); the history's
+	// `LayoutCollision` check stays behind it as defence.
 	let refused = mgr
 		.apply_tier_slab_committed(rewritten.clone(), None)
 		.await
@@ -23242,7 +23311,7 @@ async fn a_publication_that_moves_another_key_into_a_pruned_location_is_refused(
 		stale_location(&refused),
 		Some(StaleLocation {
 			slab_id: pointer.slab_id,
-			reason: StaleLocationReason::LayoutCollision,
+			reason: StaleLocationReason::LayoutRegression,
 		}),
 		"{refused}"
 	);
@@ -23275,7 +23344,7 @@ async fn a_publication_that_moves_another_key_into_a_pruned_location_is_refused(
 		.expect_err("the publication stays refused after a restart");
 	assert_eq!(
 		stale_location(&refused).map(|refusal| refusal.reason),
-		Some(StaleLocationReason::LayoutCollision),
+		Some(StaleLocationReason::LayoutRegression),
 		"{refused}"
 	);
 	for error in [
@@ -23290,8 +23359,11 @@ async fn a_publication_that_moves_another_key_into_a_pruned_location_is_refused(
 	}
 }
 
+/// The refresh of the builder's (based) rewrite removes the pruned a@10 and
+/// indexes b@10 once, at its new location past the source: the slot a dense
+/// rewrite would have reused (`fixture.held_a`) is named by nothing.
 #[tokio::test]
-async fn tier_row_refresh_removes_a_pruned_version_whose_location_another_key_takes() {
+async fn tier_row_refresh_removes_a_pruned_version_and_indexes_its_slot_neighbour_once() {
 	let fixture = seed_pruned_slot_reuse_fixture("slot-reuse-refresh").await;
 	let mgr = &fixture.mgr;
 	let (a, b) = (id(SLOT_REUSE_A), id(SLOT_REUSE_B));
@@ -23302,10 +23374,10 @@ async fn tier_row_refresh_removes_a_pruned_version_whose_location_another_key_ta
 		.lock()
 		.await
 		.tiered
-		.insert(slab_id, fixture.rewritten.clone());
+		.insert(slab_id, fixture.based.clone());
 	// The replaced generation, as production passes it to the refresh.
 	let plan = mgr
-		.build_tiered_row_refresh_plan(&fixture.rewritten, Some(&fixture.pointer))
+		.build_tiered_row_refresh_plan(&fixture.based, Some(&fixture.pointer))
 		.await
 		.unwrap();
 	mgr.apply_tiered_row_refresh_plan(plan).await;
@@ -23323,12 +23395,20 @@ async fn tier_row_refresh_removes_a_pruned_version_whose_location_another_key_ta
 			.map(|location| location.hlc)
 			.collect::<Vec<_>>(),
 		vec![hlc(20)],
-		"the pruned a@10 is removed even though b@10 now stands at its old location: {a_chain:?}"
+		"the pruned a@10 is removed: {a_chain:?}"
 	);
-	assert_eq!(
-		chain(b),
-		vec![fixture.held_a],
-		"b@10 is indexed once, at its new location"
+	let b_chain = chain(b);
+	assert_eq!(b_chain.len(), 1, "b@10 is indexed once: {b_chain:?}");
+	// The source object under its own layout (the index now describes the rewrite).
+	let source_end = mgr
+		.tiered_object_from_l2(&fixture.pointer, TierObjectEvidence::Replacement)
+		.await
+		.unwrap()
+		.layout
+		.logical_end();
+	assert!(
+		b_chain[0].offset >= source_end && b_chain[0] != fixture.held_a,
+		"b@10 at or above the source's logical end {source_end}, never a@10's old location: {b_chain:?}"
 	);
 	assert_eq!(mgr.read(a_chain[0]).await.unwrap(), b"a-20");
 	assert_eq!(
@@ -24696,7 +24776,7 @@ async fn pending_authority_fixture_with_fault(
 				damaged.len() as u64,
 				&damaged,
 				None,
-				(present.offset as usize)..(present.offset as usize + present.length as usize),
+				crate::storage::tier_object_layout::LogicalExtent::of(&present),
 			)
 			.unwrap();
 		let cipher_offset = plan.ciphertext_range_in_object().start as usize;
@@ -25176,19 +25256,32 @@ async fn unverified_authority_installs_only_the_latest_committed_pointer() {
 		.await
 		.expect("old authority fetch is paused");
 	let blob = f.store.inner.get(&f.pointer.l2_uri).await.unwrap();
-	let raw = f
-		.manager
-		.decode_tiered_object_blob(&f.pointer, &blob)
-		.unwrap();
+	let source = f.manager.decode_tiered_object(&f.pointer, &blob).unwrap();
+	let raw = source.bytes.clone();
 	let (_, padded) = LocalSlabStore::padded_record_size(f.present.length as usize).unwrap();
 	let first_frame_end = f.present.offset as usize + padded;
 	assert!(first_frame_end < raw.len());
 	let plaintext = &raw[..first_frame_end];
+	// ADR 0705: the newer generation drops a frame, so it changes the layout
+	// and is based at its source's logical end.
+	let base = source.layout.logical_end();
 	let metadata = build_tiered_object_metadata(
-		plaintext,
-		f.pointer.slab_id,
+		SlabView::new(
+			plaintext,
+			crate::storage::tier_object_layout::TierObjectLayout::new(
+				f.pointer.slab_id,
+				base,
+				plaintext.len() as u64,
+			)
+			.unwrap(),
+		)
+		.unwrap(),
 		&f.manager.config.l2_chunk_layout,
-		&f.manager.acknowledged_offsets_in_slab(f.pointer.slab_id),
+		&f.manager
+			.acknowledged_offsets_in_slab(f.pointer.slab_id)
+			.iter()
+			.map(|offset| offset + base)
+			.collect(),
 	)
 	.unwrap();
 	let encrypted = f
@@ -25668,7 +25761,11 @@ async fn bootstrap_collision_fixture(active: bool, extra: bool) -> BootstrapColl
 		mgr.acknowledged_offsets_in_slab(slab_id)
 	};
 	let encrypted = mgr
-		.encrypt_tiered_blob_with_evidence(slab_id, plaintext, &evidence, None)
+		.encrypt_tiered_blob_with_evidence(
+			SlabView::dense(slab_id, plaintext).unwrap(),
+			&evidence,
+			None,
+		)
 		.unwrap();
 	let uri = l2
 		.put("tier/bootstrap-collision.wnd", &encrypted.bytes)
@@ -30524,7 +30621,10 @@ async fn secondary_index_discovery_does_not_decode_opaque_records() {
 	let plaintext = manager.read_sealed_raw(location.slab_id).await.unwrap();
 	let decode_guard = crate::storage::multirow::DecodeCountGuard::start();
 	let tables = manager
-		.secondary_index_table_ids_from_plaintext(location.slab_id, &plaintext)
+		.secondary_index_table_ids_from_plaintext(
+			location.slab_id,
+			SlabView::dense(location.slab_id, &plaintext).unwrap(),
+		)
 		.unwrap();
 	let probes = decode_guard.finish();
 	assert!(tables.is_empty());
@@ -30563,7 +30663,10 @@ async fn secondary_index_discovery_and_builder_preserve_mixed_typed_rows() {
 	let plaintext = manager.read_sealed_raw(location.slab_id).await.unwrap();
 	let decode_guard = crate::storage::multirow::DecodeCountGuard::start();
 	let tables = manager
-		.secondary_index_table_ids_from_plaintext(location.slab_id, &plaintext)
+		.secondary_index_table_ids_from_plaintext(
+			location.slab_id,
+			SlabView::dense(location.slab_id, &plaintext).unwrap(),
+		)
 		.unwrap();
 	let probes = decode_guard.finish();
 	assert_eq!(
@@ -30582,7 +30685,7 @@ async fn secondary_index_discovery_and_builder_preserve_mixed_typed_rows() {
 			&first,
 			&descriptor,
 			location.slab_id,
-			&plaintext,
+			SlabView::dense(location.slab_id, &plaintext).unwrap(),
 		)
 		.unwrap();
 	let probes = decode_guard.finish();
@@ -30609,7 +30712,7 @@ async fn secondary_index_builder_does_not_decode_opaque_records() {
 			&table,
 			&descriptor,
 			location.slab_id,
-			&plaintext,
+			SlabView::dense(location.slab_id, &plaintext).unwrap(),
 		)
 		.unwrap();
 	let probes = decode_guard.finish();
@@ -30629,7 +30732,10 @@ async fn secondary_index_discovery_refuses_trusted_row_decode_error() {
 	let guard = crate::storage::multirow::DecodeCountGuard::start();
 	guard.fail_next();
 	let error = manager
-		.secondary_index_table_ids_from_plaintext(location.slab_id, &plaintext)
+		.secondary_index_table_ids_from_plaintext(
+			location.slab_id,
+			SlabView::dense(location.slab_id, &plaintext).unwrap(),
+		)
 		.unwrap_err();
 	assert_eq!(error.kind(), ErrorKind::InvalidData);
 	assert_eq!(guard.finish(), 1);
@@ -45484,7 +45590,11 @@ async fn tiered_rewrite_refuses_a_historical_damaged_object(form: HistoricalObje
 			let mut skipped = mgr.acknowledged_offsets_in_slab(slab_id);
 			skipped.remove(&damaged.offset);
 			let encrypted = mgr
-				.encrypt_tiered_blob_with_evidence(slab_id, &raw, &skipped, None)
+				.encrypt_tiered_blob_with_evidence(
+					SlabView::dense(slab_id, &raw).unwrap(),
+					&skipped,
+					None,
+				)
 				.unwrap();
 			(encrypted.bytes, true, Some(encrypted.tenant_kek_id))
 		}
@@ -45610,7 +45720,10 @@ async fn blob_recovery_refuses_an_acknowledged_record_past_the_bytes() {
 		),
 	]
 	.map(|(name, len)| {
-		let result = recover_slab_entries_from_blob(&bytes[..len], first.slab_id, &evidence);
+		let result = recover_slab_entries_from_blob(
+			SlabView::dense(first.slab_id, &bytes[..len]).unwrap(),
+			&evidence,
+		);
 		let refused = result.as_ref().err().and_then(|error| {
 			error
 				.get_ref()
@@ -45638,15 +45751,14 @@ async fn blob_recovery_refuses_an_acknowledged_record_past_the_bytes() {
 	}
 	// Control: the whole slab, and the strict walk without evidence, still pass.
 	assert_eq!(
-		recover_slab_entries_from_blob(&bytes, first.slab_id, &evidence)
+		recover_slab_entries_from_blob(SlabView::dense(first.slab_id, &bytes).unwrap(), &evidence)
 			.unwrap()
 			.len(),
 		2
 	);
 	assert!(
 		recover_slab_entries_from_blob(
-			&bytes[..last.offset as usize],
-			first.slab_id,
+			SlabView::dense(first.slab_id, &bytes[..last.offset as usize]).unwrap(),
 			&BTreeSet::new()
 		)
 		.is_ok()
@@ -64985,6 +65097,23 @@ async fn certified_tier_store_with(
 	winner: Identity,
 	observing: bool,
 ) -> CertifiedTierStore {
+	certified_tier_store_located(tag, rows, debt, owned, winner, observing, |_, at| {
+		Locality::new(at)
+	})
+	.await
+}
+
+/// `certified_tier_store_with`, each row's routing locality from `locality_of`
+/// (the default is the row's HLC, so two versions of a key differ).
+async fn certified_tier_store_located(
+	tag: &str,
+	rows: &[(Identity, u64, u64)],
+	debt: &[(Identity, u64)],
+	owned: &[(Identity, u64)],
+	winner: Identity,
+	observing: bool,
+	locality_of: fn(Identity, u64) -> Locality,
+) -> CertifiedTierStore {
 	use crate::storage::index::parent_intents::{OwnedVersion, ParentIntent, ParentIntentState};
 	let dir = fresh_dir(tag);
 	let l2_root = fresh_dir(&format!("{tag}-l2"));
@@ -65046,7 +65175,7 @@ async fn certified_tier_store_with(
 	for (key, at, value) in rows {
 		let frame = encode_test_append_only_storage_frame(
 			CERTIFIED_TIER_TABLE,
-			&[(*key, Locality::new(*at), hlc(*at), *value, false)],
+			&[(*key, locality_of(*key, *at), hlc(*at), *value, false)],
 		);
 		let entries = storage_multirow_index_entries_from_frame(&frame)
 			.unwrap()
@@ -65353,6 +65482,25 @@ impl CertifiedTierStore {
 				.await;
 		}
 		panic!("still unresolved after {outcomes:?}");
+	}
+
+	/// Waits, bounded, until this store's open-time verification of its slab
+	/// completed: a local redelivery while it is pending answers `WouldBlock`
+	/// by design (callers retry), so a control that redelivers after a restart
+	/// first establishes that premise.
+	async fn until_verified(&self) {
+		for _ in 0..40 {
+			if !self.mgr.tier_authority.pending.contains_key(&self.slab) {
+				return;
+			}
+			self.mgr
+				.tier_authority_change_within(Duration::from_millis(100))
+				.await;
+		}
+		panic!(
+			"the open-time verification of {:?} never completed",
+			self.slab
+		);
 	}
 
 	/// The one open operation of this store.
@@ -66029,7 +66177,9 @@ async fn a_certified_rewrite_delivered_before_its_hand_off_completes_as_already_
 			.await >= op.op_seq,
 		"pruned"
 	);
-	// Its certificate gone, a redelivery is already published.
+	// Its certificate gone, a redelivery is already published (once the
+	// restart's open-time verification has completed).
+	store.until_verified().await;
 	let committed = store.committed_pointer().await.unwrap();
 	store
 		.mgr
@@ -66853,13 +67003,17 @@ async fn a_superseded_tier_op_over_a_removed_slab_hands_off_only_at_its_empty_po
 	);
 }
 
-/// DC-195 (registered; a separate ADR fixes it): a tiered retention rewrite
-/// whose survivor would take a pruned row's exact location (same offset,
-/// length, HLC and row) is refused with a layout collision before anything is
-/// uploaded, and the old view stands. Asserts today's behaviour.
+/// DC-195, fixed by ADR 0705 (acceptance 1), the retention arm. The original
+/// shape: the pruned row and the survivor share an HLC and a frame length, so
+/// a replacement written from offset 0 would put the survivor at the pruned
+/// row's exact old location. The replacement now starts at its source
+/// object's logical end: the rewrite publishes, every read is exact before,
+/// after and after a real reopen, and a holder of the pruned row's location
+/// gets `Superseded` in process and `OutsideGeneration` after the reopen,
+/// never another row.
 #[tokio::test]
-async fn a_retention_rewrite_whose_survivor_takes_a_pruned_rows_location_is_refused() {
-	let (_dirs, mgr, l2) = fresh_manager_with_l2("dc195-retention").await;
+async fn a_retention_rewrite_never_reissues_a_pruned_rows_location() {
+	let (dirs, mgr, l2) = fresh_manager_with_l2("dc195-retention").await;
 	let (pruned, survivor) = (id(0x1951), id(0x1952));
 	mgr.append(tenant(), pruned, hlc(10), b"p-10")
 		.await
@@ -66871,49 +67025,875 @@ async fn a_retention_rewrite_whose_survivor_takes_a_pruned_rows_location_is_refu
 		.await
 		.unwrap();
 	let pointer = tier_kv_slab(&mgr, &l2, "tier/dc195-retention.wnd").await;
-	let mut expected = BTreeMap::new();
+	let source = mgr.tiered_plaintext_from_l2(&pointer).await.unwrap().layout;
+	let mut before = BTreeMap::new();
 	for (key, at) in [(pruned, 10), (survivor, 10), (pruned, 20)] {
 		let location = mgr
 			.lookup_as_of(tenant(), key, hlc(at))
 			.unwrap()
 			.expect("indexed");
-		expected.insert((key, at), (location, mgr.read(location).await.unwrap()));
+		before.insert((key, at), (location, mgr.read(location).await.unwrap()));
 	}
-	let objects = l2.list("").await.unwrap().len();
-	let error = mgr
-		.prepare_tiered_table_retention_rewrite(
-			&pointer,
-			crate::storage::retention::MvccRetentionPolicy::fixed_window(
-				std::time::Duration::from_secs(15),
-			),
-			&TableLifecycleCatalog::default(),
-			&TableSchemaCatalog::default(),
-			15_025,
-		)
-		.await
-		.err()
-		.expect("refused");
+	let (pruned_location, _) = before[&(pruned, 10)].clone();
+	let (survivor_before, _) = before[&(survivor, 10)].clone();
 	assert_eq!(
-		crate::storage::manager::stale_location(&error).map(|stale| stale.reason),
-		Some(StaleLocationReason::LayoutCollision),
+		(
+			survivor_before.length,
+			survivor_before.hlc,
+			survivor_before.record_row_index
+		),
+		(
+			pruned_location.length,
+			pruned_location.hlc,
+			pruned_location.record_row_index
+		),
+		"premise: the survivor is the pruned row's shape, so a dense replacement would reissue its location"
+	);
+	let (bytes, tombstone_metadata, supersession_metadata) =
+		prepare_production_retention_rewrite(&mgr, &pointer).await;
+	let uri = l2.put("tier/dc195-retention-2.wnd", &bytes).await.unwrap();
+	let published = TieredSlabPointer {
+		tombstone_metadata,
+		supersession_metadata,
+		..tiered_pointer_from_blob(&mgr, pointer.slab_id, uri, &bytes)
+	};
+	mgr.apply_tier_slab_committed(published.clone(), None)
+		.await
+		.unwrap();
+	assert_eq!(
+		mgr.tier_pointer(pointer.slab_id).await,
+		Some(published.clone())
+	);
+	let replacement = mgr
+		.tiered_plaintext_from_l2(&published)
+		.await
+		.unwrap()
+		.layout;
+	assert_eq!(
+		replacement.base(),
+		source.logical_end(),
+		"based at the source's end"
+	);
+	let survivors = |mgr: Arc<SlabManager>| async move {
+		let mut out = BTreeMap::new();
+		for (key, at) in [(survivor, 10), (pruned, 20)] {
+			let location = mgr
+				.lookup_as_of(tenant(), key, hlc(at))
+				.unwrap()
+				.expect("a survivor stays indexed");
+			out.insert((key, at), (location, mgr.read(location).await.unwrap()));
+		}
+		out
+	};
+	let after = survivors(mgr.clone()).await;
+	for (key, (location, bytes)) in &after {
+		assert!(
+			location.offset >= source.logical_end(),
+			"{key:?} at {location:?}"
+		);
+		assert_eq!(bytes, &before[key].1, "{key:?}: exact read");
+		assert_ne!(*location, pruned_location);
+	}
+	assert!(
+		mgr.lookup_as_of(tenant(), pruned, hlc(15))
+			.unwrap()
+			.is_none(),
+		"premise: the rewrite pruned p@10"
+	);
+	let reason = |result: std::io::Result<Vec<u8>>| {
+		let error = result.expect_err("the pruned location never reads another row");
+		crate::storage::manager::stale_location(&error).map(|stale| stale.reason)
+	};
+	assert_eq!(
+		reason(mgr.read(pruned_location).await),
+		Some(StaleLocationReason::Superseded),
+		"in process, the layout history knows the location was superseded"
+	);
+	// A real reopen: no in-memory history; the location is below the object's base.
+	let mgr = restart_tier_manager(mgr, &dirs, &l2).await;
+	assert_eq!(mgr.tier_pointer(pointer.slab_id).await, Some(published));
+	assert_eq!(
+		survivors(mgr.clone()).await,
+		after,
+		"exact reads after the reopen"
+	);
+	assert_eq!(
+		reason(mgr.read(pruned_location).await),
+		Some(StaleLocationReason::OutsideGeneration),
+		"after the reopen, outside the current generation"
+	);
+}
+
+/// ADR 0705 acceptance 6: a based object rehydrated is read locally through
+/// its layout, by the ordinary read, the counter reader and the recovery
+/// (verifier) frame read; the copy is never selected for another generation;
+/// after a real reopen the copy is gone and reads are exact from L2.
+#[tokio::test]
+async fn a_rehydrated_based_object_reads_through_its_layout_and_serves_only_its_generation() {
+	let (dirs, mgr, l2) = fresh_manager_with_l2("rehydrated-based").await;
+	let (pruned, survivor) = (id(0x1961), id(0x1962));
+	mgr.append(tenant(), pruned, hlc(10), b"p-10")
+		.await
+		.unwrap();
+	mgr.append(tenant(), survivor, hlc(10), b"s-10")
+		.await
+		.unwrap();
+	mgr.append(tenant(), pruned, hlc(20), b"p-20")
+		.await
+		.unwrap();
+	let pointer = tier_kv_slab(&mgr, &l2, "tier/rehydrated-based.wnd").await;
+	let (bytes, tombstone_metadata, supersession_metadata) =
+		prepare_production_retention_rewrite(&mgr, &pointer).await;
+	let uri = l2.put("tier/rehydrated-based-2.wnd", &bytes).await.unwrap();
+	let published = TieredSlabPointer {
+		tombstone_metadata,
+		supersession_metadata,
+		..tiered_pointer_from_blob(&mgr, pointer.slab_id, uri, &bytes)
+	};
+	mgr.apply_tier_slab_committed(published.clone(), None)
+		.await
+		.unwrap();
+	let plaintext = mgr.tiered_plaintext_from_l2(&published).await.unwrap();
+	assert!(plaintext.layout.base() > 0, "premise: a based object");
+	let mut expected = BTreeMap::new();
+	for (key, at, value) in [(survivor, 10, &b"s-10"[..]), (pruned, 20, &b"p-20"[..])] {
+		let location = mgr
+			.lookup_as_of(tenant(), key, hlc(at))
+			.unwrap()
+			.expect("indexed");
+		assert!(location.offset >= plaintext.layout.base());
+		expected.insert(key, (location, value.to_vec()));
+	}
+	mgr.rehydrate_tiered_slab(published.clone(), plaintext)
+		.await
+		.unwrap();
+	assert!(
+		mgr.is_rehydrated(pointer.slab_id).await,
+		"premise: a local copy"
+	);
+	assert!(matches!(
+		mgr.resolve_backing(pointer.slab_id).await,
+		SlabBacking::Rehydrated(_)
+	));
+	for (key, (location, value)) in &expected {
+		assert_eq!(
+			&mgr.read(*location).await.unwrap(),
+			value,
+			"{key}: local read"
+		);
+		// The recovery (verifier) frame read and the counter reader convert
+		// through the layout too: an unconverted offset names no record.
+		let (header, _) = mgr.read_recovery_frame(*location).await.unwrap();
+		assert_eq!(header.key_identity, *key);
+		mgr.counter_eligible_supported(tenant(), *key)
+			.await
+			.unwrap_or_else(|error| {
+				panic!("{key}: the counter reader must find its record: {error}")
+			});
+	}
+	mgr.refuse_counter_migration(pointer.slab_id).await.unwrap();
+	// A copy of another generation is never selected: reads go to L2.
+	{
+		let state = mgr.state.lock().await;
+		let mut copy = state.rehydrated.get_mut(&pointer.slab_id).unwrap();
+		copy.generation = crate::consensus::slab_ops::TierGeneration::from(&pointer);
+	}
+	assert!(matches!(
+		mgr.resolve_backing(pointer.slab_id).await,
+		SlabBacking::L2(_)
+	));
+	for (key, (location, value)) in &expected {
+		assert_eq!(&mgr.read(*location).await.unwrap(), value, "{key}: from L2");
+	}
+	let mgr = restart_tier_manager(mgr, &dirs, &l2).await;
+	assert!(
+		!mgr.is_rehydrated(pointer.slab_id).await,
+		"a copy is never reopened"
+	);
+	for (key, (location, value)) in &expected {
+		assert_eq!(
+			&mgr.read(*location).await.unwrap(),
+			value,
+			"{key}: after the reopen"
+		);
+	}
+}
+
+/// ADR 0705 acceptance 9's source: three rows in one tiered slab, its
+/// decoded object, and each row's location and value.
+struct TransitionFixture {
+	dirs: [crate::test_support::TestDir; 2],
+	mgr: Arc<SlabManager>,
+	l2: Arc<dyn ObjectStore>,
+	source: TieredSlabPointer,
+	source_object: TieredPlaintext,
+	expected: BTreeMap<Identity, (RecordLocation, Vec<u8>)>,
+}
+
+const TRANSITION_ROWS: [(u64, u64, &[u8]); 3] = [
+	(0x7c01, 10, b"va"),
+	(0x7c02, 20, b"vb"),
+	(0x7c03, 30, b"vc"),
+];
+
+async fn seed_transition_fixture(tag: &str) -> TransitionFixture {
+	let (dirs, mgr, l2) = fresh_manager_with_l2(tag).await;
+	for (key, at, value) in TRANSITION_ROWS {
+		mgr.append(tenant(), id(key), hlc(at), value).await.unwrap();
+	}
+	let source = tier_kv_slab(&mgr, &l2, &format!("tier/{tag}-source.wnd")).await;
+	let source_object = mgr.tiered_plaintext_from_l2(&source).await.unwrap();
+	assert!(
+		source_object.layout.logical_end()
+			>= 2 * crate::storage::tier_object_layout::TIER_LAYOUT_PAGE_BYTES,
+		"premise: a base inside the source exists"
+	);
+	let mut expected = BTreeMap::new();
+	for (key, _, value) in TRANSITION_ROWS {
+		let location = mgr.lookup(tenant(), id(key)).unwrap().expect("indexed");
+		expected.insert(id(key), (location, value.to_vec()));
+	}
+	TransitionFixture {
+		dirs,
+		mgr,
+		l2,
+		source,
+		source_object,
+		expected,
+	}
+}
+
+/// The successors acceptance 9 refuses, as (name, plaintext, layout base,
+/// logical offsets): (a) the source's plaintext at a base inside the source;
+/// (b) a scratch store's plaintext with the source's exact offsets, one
+/// payload or one owner changed.
+async fn regressing_successors(
+	fixture: &TransitionFixture,
+) -> Vec<(&'static str, Vec<u8>, u64, BTreeSet<u64>)> {
+	use crate::storage::tier_object_layout::TIER_LAYOUT_PAGE_BYTES;
+	let page = TIER_LAYOUT_PAGE_BYTES;
+	let mut out = vec![(
+		"(a) a base overlapping the source",
+		fixture.source_object.bytes.clone(),
+		page,
+		fixture
+			.source_object
+			.record_offsets
+			.iter()
+			.map(|offset| offset + page)
+			.collect(),
+	)];
+	let [(a, ..), (b, ..), (c, ..)] = TRANSITION_ROWS;
+	for (what, rows) in [
+		(
+			"(b) one payload changed",
+			[
+				(a, 10, &b"va"[..]),
+				(b, 20, &b"vX"[..]),
+				(c, 30, &b"vc"[..]),
+			],
+		),
+		(
+			"(b) one owner changed",
+			[
+				(a, 10, &b"va"[..]),
+				(0x7c04, 20, &b"vb"[..]),
+				(c, 30, &b"vc"[..]),
+			],
+		),
+	] {
+		let (_dirs, scratch, _) = fresh_manager_with_l2("transition-scratch").await;
+		for (key, at, value) in rows {
+			scratch
+				.append(tenant(), id(key), hlc(at), value)
+				.await
+				.unwrap();
+		}
+		let slab = force_seal_active(&scratch).await;
+		let raw = scratch.read_sealed_raw(slab).await.unwrap();
+		let offsets = scratch.acknowledged_offsets_in_slab(slab);
+		assert_eq!(
+			offsets, fixture.source_object.record_offsets,
+			"{what}: premise: equal offsets"
+		);
+		assert_ne!(
+			raw, fixture.source_object.bytes,
+			"{what}: premise: other bytes"
+		);
+		out.push((what, raw, 0, offsets));
+	}
+	out
+}
+
+/// ADR 0705 acceptance 9, at the leader's preflight: each regressing
+/// successor is refused typed `LayoutRegression` before anything is uploaded
+/// or proposed, and the byte-preserving re-encryption (7a's shape) is
+/// admitted by the plaintext proof. Nothing changes.
+#[tokio::test]
+async fn a_regressing_successor_is_refused_at_the_leaders_preflight() {
+	use crate::storage::tier_object_layout::TierObjectLayout;
+	let fixture = seed_transition_fixture("transition-preflight").await;
+	let mgr = &fixture.mgr;
+	let slab_id = fixture.source.slab_id;
+	let source_view = fixture.source_object.view().unwrap();
+	for (what, bytes, base, offsets) in regressing_successors(&fixture).await {
+		let layout = TierObjectLayout::new(slab_id, base, bytes.len() as u64).unwrap();
+		let view = SlabView::new(&bytes, layout).unwrap();
+		let error = mgr
+			.preflight_tier_publication(slab_id, source_view, view, &offsets)
+			.await
+			.expect_err("refused at the leader's preflight");
+		assert_eq!(
+			stale_location(&error).map(|stale| stale.reason),
+			Some(StaleLocationReason::LayoutRegression),
+			"{what}: {error}"
+		);
+	}
+	let encrypted = mgr
+		.encrypt_tiered_blob_with_evidence(source_view, &fixture.source_object.record_offsets, None)
+		.unwrap();
+	mgr.preflight_offset_preserving_successor(
+		&fixture.source,
+		&fixture.source_object,
+		&crate::hash::content::digest(&encrypted.bytes),
+		&encrypted.bytes,
+	)
+	.expect("the plaintext proof admits a byte-preserving successor");
+	assert_eq!(
+		mgr.tier_pointer(slab_id).await,
+		Some(fixture.source.clone())
+	);
+	for (key, (location, value)) in &fixture.expected {
+		assert_eq!(
+			&mgr.read(*location).await.unwrap(),
+			value,
+			"{key}: exact read"
+		);
+	}
+}
+
+/// ADR 0705 acceptance 9, at the node's publication: each regressing
+/// successor, committed, is refused typed `LayoutRegression` before its
+/// pointer or any row changes; the slab stays on its source, fenced typed
+/// (its committed generation is not published here), never serving another
+/// row, before and after a real reopen.
+#[tokio::test]
+async fn a_regressing_successor_is_refused_at_publication() {
+	use crate::storage::tier_object_layout::TierObjectLayout;
+	let probe = seed_transition_fixture("transition-publication-probe").await;
+	let cases = regressing_successors(&probe).await;
+	drop(probe);
+	for (index, (what, bytes, base, offsets)) in cases.into_iter().enumerate() {
+		let fixture = seed_transition_fixture(&format!("transition-publication-{index}")).await;
+		let TransitionFixture {
+			dirs,
+			mgr,
+			l2,
+			source,
+			source_object,
+			expected,
+		} = fixture;
+		assert_eq!(bytes.len(), source_object.bytes.len(), "{what}: premise");
+		let slab_id = source.slab_id;
+		let layout = TierObjectLayout::new(slab_id, base, bytes.len() as u64).unwrap();
+		let encrypted = mgr
+			.encrypt_tiered_blob_with_evidence(
+				SlabView::new(&bytes, layout).unwrap(),
+				&offsets,
+				None,
+			)
+			.unwrap();
+		let uri = l2
+			.put(
+				&format!("tier/transition-regressing-{index}.wnd"),
+				&encrypted.bytes,
+			)
+			.await
+			.unwrap();
+		let successor = tiered_pointer_from_blob(&mgr, slab_id, uri, &encrypted.bytes);
+		let error = mgr
+			.apply_tier_slab_committed(successor.clone(), None)
+			.await
+			.expect_err("refused at publication");
+		assert_eq!(
+			stale_location(&error).map(|stale| stale.reason),
+			Some(StaleLocationReason::LayoutRegression),
+			"{what}: {error}"
+		);
+		let assert_never_another_row = |mgr: Arc<SlabManager>, step: &'static str| {
+			let expected = expected.clone();
+			let source = source.clone();
+			async move {
+				assert_eq!(
+					mgr.tier_pointer(slab_id).await,
+					Some(source),
+					"{what} {step}: nothing published"
+				);
+				for (key, (location, value)) in &expected {
+					match mgr.read(*location).await {
+						Ok(read) => {
+							assert_eq!(&read, value, "{what} {step}: {key} read another row")
+						}
+						Err(error) => assert!(
+							stale_location(&error).is_some(),
+							"{what} {step}: {key}: an untyped failure: {error}"
+						),
+					}
+				}
+			}
+		};
+		assert_never_another_row(mgr.clone(), "in process").await;
+		let mgr = restart_tier_manager(mgr, &dirs, &l2).await;
+		assert_never_another_row(mgr.clone(), "after a reopen").await;
+	}
+}
+
+/// ADR 0705 acceptance 9 (c) and 7a's admission at publication: a same-base
+/// successor whose source cannot be fetched is deferred (a typed L2 fence),
+/// nothing published; once its source is fetchable the byte-preserving
+/// re-encryption is admitted by the plaintext proof and keeps every location
+/// and the source's layout.
+#[tokio::test]
+async fn a_same_base_successor_waits_for_its_source_and_is_admitted_by_the_plaintext_proof() {
+	let fixture = seed_transition_fixture("transition-unfetchable").await;
+	let TransitionFixture {
+		mgr,
+		l2,
+		source,
+		source_object,
+		expected,
+		..
+	} = &fixture;
+	let slab_id = source.slab_id;
+	let source_view = source_object.view().unwrap();
+	let encrypted = mgr
+		.encrypt_tiered_blob_with_evidence(source_view, &source_object.record_offsets, None)
+		.unwrap();
+	let source_blob = l2.get(&source.l2_uri).await.unwrap();
+	l2.delete(&source.l2_uri).await.unwrap();
+	let uri = l2
+		.put("tier/transition-rewrap.wnd", &encrypted.bytes)
+		.await
+		.unwrap();
+	let successor = tiered_pointer_from_blob(mgr, slab_id, uri, &encrypted.bytes);
+	let error = mgr
+		.apply_tier_slab_committed(successor.clone(), None)
+		.await
+		.expect_err("its source cannot be fetched: deferred");
+	assert_eq!(
+		stale_location(&error).map(|stale| stale.reason),
+		Some(StaleLocationReason::Fenced),
 		"{error}"
 	);
 	assert_eq!(
-		l2.list("").await.unwrap().len(),
-		objects,
-		"nothing uploaded"
+		mgr.tier_pointer(slab_id).await,
+		Some(source.clone()),
+		"nothing published"
 	);
 	assert_eq!(
-		mgr.tier_pointer(pointer.slab_id).await,
-		Some(pointer.clone())
+		l2.put("tier/transition-unfetchable-source.wnd", &source_blob)
+			.await
+			.unwrap(),
+		source.l2_uri,
+		"premise: the source is restored where it was"
 	);
-	for ((key, at), (location, bytes)) in &expected {
+	mgr.apply_tier_slab_committed(successor.clone(), None)
+		.await
+		.expect("admitted by the plaintext proof");
+	assert_eq!(mgr.tier_pointer(slab_id).await, Some(successor.clone()));
+	assert_eq!(
+		mgr.tiered_plaintext_from_l2(&successor)
+			.await
+			.unwrap()
+			.layout,
+		source_object.layout,
+		"the same base and extent"
+	);
+	for (key, (location, value)) in expected {
 		assert_eq!(
-			mgr.lookup_as_of(tenant(), *key, hlc(*at)).unwrap(),
-			Some(*location)
+			mgr.lookup(tenant(), *key).unwrap(),
+			Some(*location),
+			"every location kept"
 		);
-		assert_eq!(&mgr.read(*location).await.unwrap(), bytes, "exact read");
+		assert_eq!(&mgr.read(*location).await.unwrap(), value, "exact read");
 	}
+}
+
+/// ADR 0705 §6, the bound: a read that names its version re-resolves a stale
+/// answer through the index once. One stale answer then the version's current
+/// location reads exactly (a pre-rewrite location after a real reopen); two
+/// stale answers for one request end in the second one's typed refusal,
+/// promptly, never a retry loop.
+#[tokio::test]
+async fn a_named_read_re_resolves_a_stale_location_at_most_once() {
+	let (dirs, mgr, l2) = fresh_manager_with_l2("stale-re-resolution").await;
+	let (pruned, survivor) = (id(0x1981), id(0x1982));
+	mgr.append(tenant(), pruned, hlc(10), b"p-10")
+		.await
+		.unwrap();
+	mgr.append(tenant(), survivor, hlc(10), b"s-10")
+		.await
+		.unwrap();
+	mgr.append(tenant(), pruned, hlc(20), b"p-20")
+		.await
+		.unwrap();
+	let pointer = tier_kv_slab(&mgr, &l2, "tier/stale-re-resolution.wnd").await;
+	let held_pruned = mgr
+		.lookup_as_of(tenant(), pruned, hlc(15))
+		.unwrap()
+		.unwrap();
+	let held_survivor = mgr.lookup(tenant(), survivor).unwrap().unwrap();
+	let (bytes, tombstone_metadata, supersession_metadata) =
+		prepare_production_retention_rewrite(&mgr, &pointer).await;
+	let uri = l2
+		.put("tier/stale-re-resolution-2.wnd", &bytes)
+		.await
+		.unwrap();
+	let published = TieredSlabPointer {
+		tombstone_metadata,
+		supersession_metadata,
+		..tiered_pointer_from_blob(&mgr, pointer.slab_id, uri, &bytes)
+	};
+	mgr.apply_tier_slab_committed(published, None)
+		.await
+		.unwrap();
+	let reason = |error: &std::io::Error| stale_location(error).map(|stale| stale.reason);
+
+	// Two stale answers: the first is the history's `Superseded`; the index is
+	// made to name a second stale location for the version (below the
+	// object's base, outside its generation).
+	let first = mgr.read(held_pruned).await.expect_err("premise: stale");
+	assert_eq!(reason(&first), Some(StaleLocationReason::Superseded));
+	let second_stale = RecordLocation {
+		length: held_pruned.length + 1,
+		..held_pruned
+	};
+	mgr.key_index
+		.get_mut(&(tenant(), pruned))
+		.unwrap()
+		.insert(0, second_stale);
+	let error = tokio::time::timeout(
+		Duration::from_secs(10),
+		mgr.read_version(tenant(), pruned, held_pruned),
+	)
+	.await
+	.expect("a bounded read, never a retry loop")
+	.expect_err("two stale answers refuse");
+	assert_eq!(
+		reason(&error),
+		Some(StaleLocationReason::OutsideGeneration),
+		"the second stale answer is the typed refusal: {error}"
+	);
+	mgr.key_index
+		.get_mut(&(tenant(), pruned))
+		.unwrap()
+		.retain(|location| *location != second_stale);
+
+	// One stale answer, then the current location: after a real reopen the
+	// survivor's pre-rewrite location is outside the generation, and a read
+	// naming its version re-resolves once and reads it exactly.
+	let mgr = restart_tier_manager(mgr, &dirs, &l2).await;
+	let first = mgr.read(held_survivor).await.expect_err("premise: stale");
+	assert_eq!(reason(&first), Some(StaleLocationReason::OutsideGeneration));
+	assert_eq!(
+		tokio::time::timeout(
+			Duration::from_secs(10),
+			mgr.read_version(tenant(), survivor, held_survivor),
+		)
+		.await
+		.expect("a bounded read")
+		.unwrap(),
+		b"s-10"
+	);
+}
+
+/// ADR 0705 acceptance 3: the history-dependent arm of DC-195. Rows of one HLC
+/// and one length; gen1 prunes x@10 (its location superseded in a long-lived
+/// node's layout history), gen2 prunes a@11. A dense gen2 would slide y@10
+/// into x@10's gen0 location, refused only where that history survives. With
+/// monotonic bases, the node that kept its history and the node restarted
+/// between the rewrites both accept the committed replacement, with exact
+/// reads and no location issued twice.
+#[tokio::test]
+async fn a_long_lived_and_a_restarted_node_accept_the_same_committed_replacement() {
+	let mut accepted = Vec::new();
+	for restart in [false, true] {
+		let (dirs, mgr, l2) = fresh_manager_with_l2(&format!("unequal-history-{restart}")).await;
+		let (x, a, y) = (id(0x1971), id(0x1972), id(0x1973));
+		for (key, at, value) in [
+			(x, 10, &b"x-10"[..]),
+			(a, 11, &b"a-11"[..]),
+			(y, 10, &b"y-10"[..]),
+			(x, 12, &b"x-12"[..]),
+			(a, 13, &b"a-13"[..]),
+		] {
+			mgr.append(tenant(), key, hlc(at), value).await.unwrap();
+		}
+		let gen0 = tier_kv_slab(&mgr, &l2, &format!("tier/unequal-{restart}-0.wnd")).await;
+		let x_gen0 = mgr.lookup_as_of(tenant(), x, hlc(11)).unwrap().unwrap();
+		let gen1 = publish_tier_retention_rewrite(
+			&mgr,
+			&l2,
+			&gen0,
+			hlc(13),
+			&format!("tier/unequal-{restart}-1.wnd"),
+		)
+		.await;
+		let mgr = if restart {
+			restart_tier_manager(mgr, &dirs, &l2).await
+		} else {
+			mgr
+		};
+		let gen2 = publish_tier_retention_rewrite(
+			&mgr,
+			&l2,
+			&gen1,
+			hlc(14),
+			&format!("tier/unequal-{restart}-2.wnd"),
+		)
+		.await;
+		assert_eq!(mgr.tier_pointer(gen0.slab_id).await, Some(gen2.clone()));
+		let gen1_end = mgr
+			.tiered_object_from_l2(&gen1, TierObjectEvidence::Replacement)
+			.await
+			.unwrap()
+			.layout
+			.logical_end();
+		for (key, at, value) in [
+			(y, 10, &b"y-10"[..]),
+			(x, 12, &b"x-12"[..]),
+			(a, 13, &b"a-13"[..]),
+		] {
+			let location = mgr.lookup_as_of(tenant(), key, hlc(at)).unwrap().unwrap();
+			assert_eq!(location.hlc, hlc(at));
+			assert!(
+				location.offset >= gen1_end,
+				"restart {restart}: {key} at {location:?}"
+			);
+			assert_ne!(location, x_gen0, "restart {restart}: never x@10's location");
+			assert_eq!(
+				&mgr.read(location).await.unwrap(),
+				value,
+				"restart {restart}"
+			);
+		}
+		accepted.push(restart);
+	}
+	assert_eq!(accepted, vec![false, true], "both nodes accept");
+}
+
+/// ADR 0705 acceptance 2: one slab's lineage of three rewrites: retention,
+/// certified, retention. Each generation starts at its source's logical end,
+/// every location issued across the lineage is distinct, and reads are exact
+/// after each rewrite and after a real reopen. The store is a ParentDecisions
+/// store (the certified arm needs it); its retention rewrites are built by the
+/// test-only retention builder, which the store's containment does not stop,
+/// and are proposed through the ring as a sweeper proposes them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_three_rewrite_lineage_never_issues_a_location_twice() {
+	use crate::storage::manager::certified_tier::CertifiedTierStep;
+	let (obsolete, early, late) = (id(0x7601), id(0x7602), id(0x7603));
+	// retention #1 (floor 13) prunes early@11; the certified step reclaims
+	// obsolete@10 (debt, winner obsolete@20); retention #2 (floor 40) prunes
+	// late@30.
+	let rows = [
+		(obsolete, 10, 1),
+		(obsolete, 20, 2),
+		(early, 11, 3),
+		(early, 12, 4),
+		(late, 30, 5),
+		(late, 35, 6),
+	];
+	// One routing locality per key, as a key's rows carry in production: the
+	// index keeps one locality per key, so per-version localities would make a
+	// certified postimage differ from the published rows for a key with two
+	// versions (late), which this lineage needs.
+	let store = certified_tier_store_located(
+		"three-rewrite-lineage",
+		&rows,
+		&[(obsolete, 10)],
+		&[],
+		obsolete,
+		false,
+		|key, _| Locality::new(u64::from(key.as_bytes()[0])),
+	)
+	.await;
+	let slab = store.slab;
+	let versions = rows
+		.iter()
+		.map(|(key, at, _)| (*key, *at))
+		.collect::<Vec<_>>();
+	let mut issued = std::collections::HashSet::new();
+	// Every indexed location of every version, which must be new, and the
+	// reads, which must be exact (`None` where the lineage pruned a version).
+	let generation = |store: &CertifiedTierStore, floor: u64| {
+		let mut locations = Vec::new();
+		for (key, at) in &versions {
+			locations.extend(
+				store
+					.mgr
+					.version_locations(tenant(), *key, hlc(*at))
+					.unwrap()
+					.into_iter()
+					.filter(|location| location.slab_id == slab),
+			);
+		}
+		for location in &locations {
+			assert!(
+				location.offset >= floor,
+				"{location:?} below its base {floor}"
+			);
+		}
+		locations
+	};
+	let mut issue = |locations: Vec<RecordLocation>, what: &str| {
+		for location in locations {
+			assert!(issued.insert(location), "{what}: {location:?} issued twice");
+		}
+	};
+	let end_of = |store: &CertifiedTierStore, pointer: TieredSlabPointer| {
+		let mgr = store.mgr.clone();
+		async move {
+			mgr.tiered_object_from_l2(&pointer, TierObjectEvidence::Replacement)
+				.await
+				.unwrap()
+				.layout
+				.logical_end()
+		}
+	};
+	let expected_reads = |pruned: &[(Identity, u64)]| {
+		rows.iter()
+			.map(|(key, at, value)| (!pruned.contains(&(*key, *at))).then_some(*value))
+			.collect::<Vec<_>>()
+	};
+	issue(generation(&store, 0), "gen0");
+	assert_eq!(store.reads(&versions).await, expected_reads(&[]));
+
+	// A retention rewrite, proposed through the ring over the published source.
+	let retention = |store: &CertifiedTierStore, floor: u64, name: &'static str| {
+		let mgr = store.mgr.clone();
+		let l2 = store.l2.clone();
+		let plain = store.plain.clone();
+		async move {
+			let source = mgr.tier_pointer(slab).await.unwrap();
+			let prepared = mgr
+				.prepare_tiered_retention_rewrite(
+					&source,
+					hlc(floor),
+					&TableSchemaCatalog::default(),
+				)
+				.await
+				.unwrap()
+				.expect("a retention rewrite");
+			let PreparedTieredRetentionRewrite::Rewrite {
+				encrypted_bytes,
+				tombstone_metadata,
+				supersession_metadata,
+				..
+			} = prepared
+			else {
+				panic!("a rewrite with survivors");
+			};
+			let planned = l2.inner.planned_upload_uri(name).unwrap();
+			let source_bytes = l2.inner.get(&source.l2_uri).await.unwrap().len() as u64;
+			mgr.stage_table_drop_l2_cleanup(
+				slab,
+				&source.l2_uri,
+				Some(source_bytes),
+				Some((&planned, encrypted_bytes.len() as u64)),
+			)
+			.await
+			.unwrap();
+			let uri = l2.inner.put(name, &encrypted_bytes).await.unwrap();
+			assert_eq!(uri, planned);
+			mgr.prepare_tier_candidate_proposal(slab, &uri)
+				.await
+				.unwrap();
+			let replacement = TieredSlabPointer {
+				tombstone_metadata,
+				supersession_metadata,
+				..tiered_pointer_from_blob(&mgr, slab, uri, &encrypted_bytes)
+			};
+			crate::storage::sweeper::propose_tier_slab(
+				&mgr,
+				plain.as_ref(),
+				b10_tier(&mgr, &replacement),
+				Some(crate::consensus::slab_ops::TierGeneration::from(&source)),
+			)
+			.await
+			.unwrap();
+			// What the observer would deliver, then the sweeper's record that
+			// the staged replacement is published.
+			mgr.apply_tier_slab_committed(replacement.clone(), None)
+				.await
+				.unwrap();
+			mgr.record_cleanup_replacement_published(slab, &source.l2_uri, &replacement.l2_uri)
+				.await
+				.unwrap();
+			(source, replacement)
+		}
+	};
+
+	let (gen0, gen1) = retention(&store, 13, "tier/lineage-1.wnd").await;
+	store.drive_until_resolved().await;
+	assert_eq!(store.mgr.tier_pointer(slab).await, Some(gen1.clone()));
+	issue(
+		generation(&store, end_of(&store, gen0).await),
+		"gen1 (retention)",
+	);
+	assert_eq!(store.reads(&versions).await, expected_reads(&[(early, 11)]));
+
+	let step = store.step(&store.decider(None, false)).await.unwrap();
+	let CertifiedTierStep::Rewritten { .. } = step else {
+		let index = store.mgr.require_op_index().unwrap();
+		panic!(
+			"a certified rewrite: {step:?}; debt {:?}; committed {:?}; local {:?}; pending {}; unapplied {}; unverified {}; retired {}; unresolved {}; open ops {:?}",
+			index.debt_page(None, 10).await.unwrap(),
+			store.committed_pointer().await,
+			store.mgr.tier_pointer(slab).await,
+			store.mgr.tier_authority.pending.contains_key(&slab),
+			store.mgr.unapplied_tier_pointers.contains_key(&slab),
+			store.mgr.unverified_tier_slabs.contains(&slab),
+			store.mgr.retired_tier_slabs.contains(&slab),
+			store.mgr.unresolved_tier_cleanup.contains(slab),
+			index.load_op_intents().await.unwrap().len(),
+		);
+	};
+	store.drive_until_resolved().await;
+	let gen2 = store.mgr.tier_pointer(slab).await.unwrap();
+	assert!(gen2.l2_uri.contains("certified/"), "{gen2:?}");
+	issue(
+		generation(&store, end_of(&store, gen1).await),
+		"gen2 (certified)",
+	);
+	let pruned = [(early, 11), (obsolete, 10)];
+	assert_eq!(store.reads(&versions).await, expected_reads(&pruned));
+
+	let (source, gen3) = retention(&store, 40, "tier/lineage-3.wnd").await;
+	assert_eq!(source, gen2);
+	store.drive_until_resolved().await;
+	issue(
+		generation(&store, end_of(&store, gen2).await),
+		"gen3 (retention)",
+	);
+	let pruned = [(early, 11), (obsolete, 10), (late, 30)];
+	assert_eq!(store.reads(&versions).await, expected_reads(&pruned));
+	let gen3_locations = generation(&store, 0);
+
+	let store = store.restart().await;
+	store.drive_until_resolved().await;
+	assert_eq!(store.mgr.tier_pointer(slab).await, Some(gen3));
+	assert_eq!(
+		store.reads(&versions).await,
+		expected_reads(&pruned),
+		"after a reopen"
+	);
+	assert_eq!(
+		generation(&store, 0),
+		gen3_locations,
+		"the same locations after a reopen"
+	);
+	store.close().await;
 }
 
 /// ADR 0704 (Codex R1a): verification with no deferred-snapshot retry judges by the
@@ -67962,4 +68942,101 @@ async fn a_contained_store_refuses_an_uncertified_retirement_before_allocation()
 		"nothing allocated"
 	);
 	assert_eq!(mgr.tier_pointer(old.slab_id).await, Some(old));
+}
+
+/// ADR 0705 acceptance 4: a based object is the same plaintext as its base-0
+/// first upload, at logical offsets shifted by its base. Decoding, the blob
+/// walk and record extraction all go through the object's layout, so the
+/// based object yields the same rows at `base + offset`, and a location of the
+/// base-0 object (below the base) is refused typed, never read.
+#[tokio::test]
+async fn a_based_object_walks_and_reads_as_its_base_zero_upload_at_logical_offsets() {
+	use crate::storage::tier_object_layout::{TIER_LAYOUT_PAGE_BYTES, TierObjectLayout};
+	let (_dirs, mgr, _l2) = fresh_manager_with_l2("based-object-walk").await;
+	let loc = Locality::new(0x7b00_0000_0000_0001);
+	for (key, row_hlc, value) in [(id(0x7b01), hlc(10), 1), (id(0x7b02), hlc(20), 2)] {
+		let frame = encode_test_multirow_storage_frame(&[(key, loc, row_hlc, value)]);
+		let entries = storage_multirow_index_entries_from_frame(&frame)
+			.unwrap()
+			.expect("entries");
+		mgr.append_durable_multirow_with_locality(tenant(), &frame, &entries)
+			.await
+			.unwrap();
+	}
+	let slab_id = force_seal_active(&mgr).await;
+	let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
+	let acknowledged = mgr.acknowledged_offsets_in_slab(slab_id);
+	assert_eq!(acknowledged.len(), 2, "premise: two records");
+	let base = 9 * TIER_LAYOUT_PAGE_BYTES;
+	let based_acknowledged = acknowledged
+		.iter()
+		.map(|offset| offset + base)
+		.collect::<BTreeSet<_>>();
+	let based_layout = TierObjectLayout::new(slab_id, base, raw.len() as u64).unwrap();
+	let dense = mgr
+		.encrypt_tiered_blob_with_evidence(
+			SlabView::dense(slab_id, &raw).unwrap(),
+			&acknowledged,
+			None,
+		)
+		.unwrap();
+	let based = mgr
+		.encrypt_tiered_blob_with_evidence(
+			SlabView::new(&raw, based_layout).unwrap(),
+			&based_acknowledged,
+			None,
+		)
+		.unwrap();
+	let decode = |bytes: &[u8], uri: &str| {
+		let pointer = tiered_pointer_from_blob(&mgr, slab_id, uri.to_string(), bytes);
+		decode_tiered_blob(
+			mgr.config.crypto.as_ref(),
+			&pointer,
+			bytes,
+			TierObjectEvidence::Replacement,
+		)
+		.unwrap()
+	};
+	let dense = decode(&dense.bytes, "tier/based-walk-0.wnd");
+	let based = decode(&based.bytes, "tier/based-walk-1.wnd");
+	assert_eq!(dense.bytes, based.bytes, "the same dense plaintext");
+	assert_eq!(dense.layout.base(), 0);
+	assert_eq!(based.layout, based_layout);
+	assert_eq!(dense.record_offsets, acknowledged);
+	assert_eq!(based.record_offsets, based_acknowledged);
+
+	let dense_entries =
+		recover_slab_entries_from_blob(dense.view().unwrap(), &dense.record_offsets).unwrap();
+	let based_entries =
+		recover_slab_entries_from_blob(based.view().unwrap(), &based.record_offsets).unwrap();
+	assert_eq!(dense_entries.len(), 2);
+	assert_eq!(dense_entries.len(), based_entries.len());
+	for (dense_entry, based_entry) in dense_entries.iter().zip(&based_entries) {
+		let shifted = RecordLocation {
+			offset: dense_entry.location.offset + base,
+			..dense_entry.location
+		};
+		assert_eq!(based_entry.location, shifted);
+		assert_eq!(
+			(based_entry.tenant_id, based_entry.key_identity),
+			(dense_entry.tenant_id, dense_entry.key_identity)
+		);
+		let frame = |plaintext: &TieredPlaintext, at: RecordLocation| {
+			extract_record_and_header_from_blob(
+				plaintext.view().unwrap(),
+				crate::storage::core::FrameLocation::of_point_read(at),
+			)
+		};
+		let (dense_header, dense_frame) = frame(&dense, dense_entry.location).unwrap();
+		let (based_header, based_frame) = frame(&based, based_entry.location).unwrap();
+		assert_eq!(dense_frame, based_frame);
+		assert_eq!(dense_header.hlc, based_header.hlc);
+		// The base-0 object's location is below the based object's base.
+		let error = frame(&based, dense_entry.location).unwrap_err();
+		assert_eq!(
+			stale_location(&error).map(|stale| stale.reason),
+			Some(StaleLocationReason::OutsideGeneration),
+			"{error}"
+		);
+	}
 }

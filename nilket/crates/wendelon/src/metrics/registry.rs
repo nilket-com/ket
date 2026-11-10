@@ -42,6 +42,8 @@ impl TierAuthorityRetryClass {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TierRewriteRefusalReason {
 	LayoutCollision,
+	/// ADR 0705: a successor that would reissue its source's locations.
+	LayoutRegression,
 	LineageHistoryCap,
 	NodeHistoryBudget,
 	StalePlan,
@@ -50,6 +52,7 @@ pub enum TierRewriteRefusalReason {
 impl TierRewriteRefusalReason {
 	const LABELS: &'static [&'static str] = &[
 		"layout_collision",
+		"layout_regression",
 		"lineage_history_cap",
 		"node_history_budget",
 		"stale_plan",
@@ -58,6 +61,7 @@ impl TierRewriteRefusalReason {
 	fn label(self) -> &'static str {
 		match self {
 			Self::LayoutCollision => "layout_collision",
+			Self::LayoutRegression => "layout_regression",
 			Self::LineageHistoryCap => "lineage_history_cap",
 			Self::NodeHistoryBudget => "node_history_budget",
 			Self::StalePlan => "stale_plan",
@@ -6963,6 +6967,7 @@ mod tests {
 		let registry = MetricsRegistry::default();
 		for reason in [
 			Refusal::LayoutCollision,
+			Refusal::LayoutRegression,
 			Refusal::LineageHistoryCap,
 			Refusal::NodeHistoryBudget,
 			Refusal::StalePlan,
@@ -7000,7 +7005,7 @@ mod tests {
 				.lines()
 				.filter(|row| row.starts_with("wendelon_tier_rewrite_refusals_total{"))
 				.count(),
-			5,
+			Refusal::LABELS.len(),
 			"no per-slab labels"
 		);
 	}

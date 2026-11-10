@@ -689,7 +689,7 @@ impl SlabManager {
 		> = DashMap::new();
 		let sealed: DashMap<SlabId, Arc<LocalSlabStore>> = DashMap::new();
 		let tiered: DashMap<SlabId, TieredSlabPointer> = DashMap::new();
-		let rehydrated: DashMap<SlabId, RehydratedSlabState> = DashMap::new();
+		let rehydrated: DashMap<SlabId, RehydratedCopy> = DashMap::new();
 		let secondary_index_segments: DashMap<
 			PersistentSecondaryIndexSegmentKey,
 			PersistentSecondaryIndexSegmentRow,

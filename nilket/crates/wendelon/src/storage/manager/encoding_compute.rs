@@ -1,4 +1,5 @@
 use super::*;
+use crate::storage::tier_object_layout::{LogicalExtent, SlabView};
 use std::collections::BTreeSet;
 
 pub(crate) struct ProjectedL2RecordRead {
@@ -2191,34 +2192,11 @@ pub(super) fn record_body_location(location: RecordLocation) -> std::io::Result<
 	})
 }
 
-pub(super) fn record_plaintext_range_for_l2(
-	location: RecordLocation,
-) -> std::io::Result<std::ops::Range<usize>> {
-	let start = usize::try_from(location.offset).map_err(|_| {
-		Error::new(
-			ErrorKind::InvalidData,
-			format!("record offset {} does not fit into usize", location.offset),
-		)
-	})?;
-	let end_u64 = location
-		.offset
-		.checked_add(u64::from(location.length))
-		.ok_or_else(|| {
-			Error::new(
-				ErrorKind::InvalidData,
-				format!(
-					"record range overflows u64 for slab {} at offset {}",
-					location.slab_id, location.offset
-				),
-			)
-		})?;
-	let end = usize::try_from(end_u64).map_err(|_| {
-		Error::new(
-			ErrorKind::InvalidData,
-			format!("record end {end_u64} does not fit into usize"),
-		)
-	})?;
-	Ok(start..end)
+/// The logical record a ranged L2 read names; the object's layout converts
+/// it to physical bytes once its footer is verified (`CryptoManager::
+/// plan_tiered_multi_range_read`).
+pub(super) fn record_plaintext_range_for_l2(location: RecordLocation) -> LogicalExtent {
+	LogicalExtent::of(&location)
 }
 
 pub(super) fn record_body_ranges_to_record_ranges(
@@ -2365,14 +2343,13 @@ pub(super) fn observe_l2_row_group_fetch_strategy(
 }
 
 pub(super) fn encoding_directories_from_slab_blob(
-	blob: &[u8],
-	slab_id: SlabId,
+	blob: SlabView<'_>,
 	acknowledged: &BTreeSet<u64>,
 ) -> std::io::Result<Vec<EncodingDirectory>> {
 	let mut out = Vec::new();
 	visit_encoding_directories(
 		blob,
-		&recover_slab_entries_from_blob(blob, slab_id, acknowledged)?,
+		&recover_slab_entries_from_blob(blob, acknowledged)?,
 		|directory| out.push(directory),
 	)?;
 	Ok(out)
@@ -2381,7 +2358,7 @@ pub(super) fn encoding_directories_from_slab_blob(
 /// Open and deserialize the encoding directory of each frame these recovered entries name,
 /// refusing a malformed one.
 pub(super) fn visit_encoding_directories(
-	blob: &[u8],
+	blob: SlabView<'_>,
 	entries: &[RecoveredSlabEntry],
 	mut visit: impl FnMut(EncodingDirectory),
 ) -> std::io::Result<()> {
@@ -2424,7 +2401,7 @@ impl SlabManager {
 		object_size_bytes: u64,
 		tail_window: &[u8],
 		additional_metadata: Option<&[u8]>,
-		whole_record_range: std::ops::Range<usize>,
+		whole_record_range: LogicalExtent,
 		body_location: &RecordLocation,
 		header_size: u64,
 		record_directory: &RecordBufferDirectory,
@@ -2568,7 +2545,7 @@ impl SlabManager {
 			return Ok(None);
 		}
 		let body_location = record_body_location(location)?;
-		let whole_record_range = record_plaintext_range_for_l2(location)?;
+		let whole_record_range = record_plaintext_range_for_l2(location);
 		let metadata = l2.head(&pointer.l2_uri).await?;
 		let tail_start = metadata
 			.size_bytes
@@ -2607,7 +2584,7 @@ impl SlabManager {
 				metadata.size_bytes,
 				tail_window.as_ref(),
 				additional_metadata.as_deref(),
-				whole_record_range.clone(),
+				whole_record_range,
 				&[prefix_range],
 			)?;
 			let prefix_ciphertext = fetch_tiered_ciphertext_runs(
@@ -2727,7 +2704,7 @@ impl SlabManager {
 					metadata.size_bytes,
 					tail_window.as_ref(),
 					additional_metadata.as_deref(),
-					whole_record_range.clone(),
+					whole_record_range,
 					header_size,
 					&directory,
 					page_directory,
@@ -2913,7 +2890,7 @@ impl SlabManager {
 		object_size_bytes: u64,
 		tail_window: &[u8],
 		additional_metadata: Option<&[u8]>,
-		whole_record_range: std::ops::Range<usize>,
+		whole_record_range: LogicalExtent,
 		header_size: u64,
 		record_directory: &RecordBufferDirectory,
 		page_directory: &crate::storage::row_group::RecordPageDirectory,
@@ -3500,7 +3477,7 @@ impl SlabManager {
 				.fetch_full_tiered_plaintext(l2.as_ref(), pointer)
 				.await?;
 			let frame = extract_record_from_blob(
-				&plaintext,
+				plaintext.view()?,
 				crate::storage::core::FrameLocation::of_point_read(location),
 			)?;
 			let projected = decode_full_projected_l2_record(
@@ -3521,7 +3498,7 @@ impl SlabManager {
 
 		let planning_started = Instant::now();
 		let body_location = record_body_location(location)?;
-		let whole_record_range = record_plaintext_range_for_l2(location)?;
+		let whole_record_range = record_plaintext_range_for_l2(location);
 		let metadata = l2.head(&pointer.l2_uri).await?;
 		let tail_start = metadata
 			.size_bytes
@@ -3593,7 +3570,7 @@ impl SlabManager {
 				metadata.size_bytes,
 				tail_window.as_ref(),
 				additional_metadata.as_deref(),
-				whole_record_range.clone(),
+				whole_record_range,
 				&[prefix_range],
 			)?;
 			let prefix_ciphertext = fetch_tiered_ciphertext_runs(
@@ -3783,7 +3760,7 @@ impl SlabManager {
 							metadata.size_bytes,
 							tail_window.as_ref(),
 							additional_metadata.as_deref(),
-							whole_record_range.clone(),
+							whole_record_range,
 							&body_location,
 							header_size,
 							&directory,
@@ -3875,7 +3852,7 @@ impl SlabManager {
 							metadata.size_bytes,
 							tail_window.as_ref(),
 							additional_metadata.as_deref(),
-							whole_record_range.clone(),
+							whole_record_range,
 							header_size,
 							&directory,
 							&page_directory,
@@ -3972,7 +3949,7 @@ impl SlabManager {
 									metadata.size_bytes,
 									tail_window.as_ref(),
 									additional_metadata.as_deref(),
-									whole_record_range.clone(),
+									whole_record_range,
 									&predicate_record_ranges,
 								)?;
 							predicate_fetch = Some(
@@ -4174,7 +4151,7 @@ impl SlabManager {
 				metadata.size_bytes,
 				tail_window.as_ref(),
 				additional_metadata.as_deref(),
-				whole_record_range.clone(),
+				whole_record_range,
 				&selected_record_ranges,
 			)?;
 			let projection_fetch =
@@ -4559,7 +4536,7 @@ impl SlabManager {
 		} else {
 			let plaintext = self.fetch_full_tiered_plaintext(l2, pointer).await?;
 			extract_record_from_blob(
-				&plaintext,
+				plaintext.view()?,
 				crate::storage::core::FrameLocation::of_point_read(location),
 			)?
 		};

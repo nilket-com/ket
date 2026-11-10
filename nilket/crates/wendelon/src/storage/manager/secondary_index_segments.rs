@@ -1,4 +1,5 @@
 use super::*;
+use crate::storage::tier_object_layout::{SlabView, TierObjectLayout};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum SidecarDataErrorReason {
@@ -1576,13 +1577,12 @@ impl SlabManager {
 	pub(super) fn secondary_index_table_ids_from_plaintext(
 		&self,
 		source_slab_id: SlabId,
-		plaintext: &[u8],
+		plaintext: SlabView<'_>,
 	) -> std::io::Result<BTreeSet<(TenantId, TableObjectId)>> {
 		let mut table_ids = BTreeSet::new();
 		for recovered_frame in crate::storage::core::recovered_frames(
 			&recover_slab_entries_from_blob_skipping_counters(
 				plaintext,
-				source_slab_id,
 				&self.acknowledged_offsets_in_slab(source_slab_id),
 			)?,
 		) {
@@ -1620,7 +1620,7 @@ impl SlabManager {
 			.await?;
 		self.secondary_index_compaction_descriptors_for_plaintext(
 			source_slab_id,
-			&plaintext,
+			plaintext.view()?,
 			context,
 		)
 	}
@@ -1628,7 +1628,7 @@ impl SlabManager {
 	pub(super) fn secondary_index_compaction_descriptors_for_plaintext(
 		&self,
 		source_slab_id: SlabId,
-		plaintext: &[u8],
+		plaintext: SlabView<'_>,
 		context: SecondaryIndexCompactionContext<'_>,
 	) -> std::io::Result<Vec<(TenantId, TableSchemaDescriptor, SecondaryIndexDescriptor)>> {
 		let mut descriptors = Vec::new();
@@ -1877,10 +1877,12 @@ impl SlabManager {
 				slab_path(&self.config.dir, run.slab_id)
 			};
 			let plaintext = self.file_ops.read_all(&path).await?;
+			// A freshly written local run: dense.
+			let plaintext = SlabView::dense(run.slab_id, &plaintext)?;
 			for (tenant_id, table, descriptor) in self
 				.secondary_index_compaction_descriptors_for_plaintext(
 					run.slab_id,
-					&plaintext,
+					plaintext,
 					context,
 				)? {
 				let key = SecondaryIndexCoverageKey::from(SecondaryIndexIdentity::from_descriptor(
@@ -1892,7 +1894,7 @@ impl SlabManager {
 					&table,
 					&descriptor,
 					run.slab_id,
-					&plaintext,
+					plaintext,
 				)?;
 				self.verify_lsm_secondary_index_segment_cold_rebuild(
 					&segment,
@@ -1900,7 +1902,7 @@ impl SlabManager {
 					&table,
 					&descriptor,
 					run.slab_id,
-					&plaintext,
+					plaintext,
 				)?;
 				output_segments.push(LsmPreparedSecondaryIndexSegment {
 					key,
@@ -1925,7 +1927,7 @@ impl SlabManager {
 		table: &TableSchemaDescriptor,
 		descriptor: &SecondaryIndexDescriptor,
 		source_slab_id: SlabId,
-		plaintext: &[u8],
+		plaintext: SlabView<'_>,
 	) -> Result<(), CompactionFailure> {
 		let cold_rebuild = self.build_secondary_index_segment_unfenced(
 			tenant_id,
@@ -2293,7 +2295,7 @@ impl SlabManager {
 			table,
 			descriptor,
 			source_slab_id,
-			&plaintext,
+			plaintext.view()?,
 		)
 	}
 
@@ -2303,7 +2305,7 @@ impl SlabManager {
 		table: &TableSchemaDescriptor,
 		descriptor: &SecondaryIndexDescriptor,
 		source_slab_id: SlabId,
-		plaintext: &[u8],
+		plaintext: SlabView<'_>,
 	) -> std::io::Result<SecondaryIndexSegment> {
 		self.require_tier_authority_ready()?;
 		self.build_secondary_index_segment_unfenced(
@@ -2323,14 +2325,13 @@ impl SlabManager {
 		table: &TableSchemaDescriptor,
 		descriptor: &SecondaryIndexDescriptor,
 		source_slab_id: SlabId,
-		plaintext: &[u8],
+		plaintext: SlabView<'_>,
 	) -> std::io::Result<SecondaryIndexSegment> {
 		let identity = SecondaryIndexIdentity::from_descriptor(tenant_id, descriptor);
 		let mut index_entries = Vec::new();
 		for recovered_frame in crate::storage::core::recovered_frames(
 			&recover_slab_entries_from_blob_skipping_counters(
 				plaintext,
-				source_slab_id,
 				&self.acknowledged_offsets_in_slab(source_slab_id),
 			)?,
 		) {
@@ -2398,16 +2399,18 @@ impl SlabManager {
 	pub(super) async fn secondary_index_source_slab_plaintext(
 		&self,
 		source_slab_id: SlabId,
-	) -> std::io::Result<Vec<u8>> {
+	) -> std::io::Result<TieredPlaintext> {
 		self.require_tier_authority_ready()?;
 		self.secondary_index_source_slab_plaintext_unfenced(source_slab_id)
 			.await
 	}
 
+	/// The source slab's bytes with their layout: a tiered slab's published
+	/// object, or a sealed slab's dense local file.
 	async fn secondary_index_source_slab_plaintext_unfenced(
 		&self,
 		source_slab_id: SlabId,
-	) -> std::io::Result<Vec<u8>> {
+	) -> std::io::Result<TieredPlaintext> {
 		let tier_pointer = {
 			let state = self.state.lock().await;
 			if state.active.slab_id() == source_slab_id {
@@ -2432,9 +2435,16 @@ impl SlabManager {
 		} else {
 			// Sealed and claimed by this caller, whose exclusions hold it still: the file is
 			// its bytes, and `read_sealed_raw`'s readiness is what recovery is restoring.
-			self.file_ops
+			let bytes = self
+				.file_ops
 				.read_all(&slab_path(&self.config.dir, source_slab_id))
-				.await
+				.await?;
+			let layout = TierObjectLayout::dense(source_slab_id, &bytes)?;
+			Ok(TieredPlaintext {
+				bytes,
+				layout,
+				record_offsets: self.acknowledged_offsets_in_slab(source_slab_id),
+			})
 		}
 	}
 

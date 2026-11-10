@@ -1802,7 +1802,10 @@ fn runtime_fetch_and_decrypt(
 		object_size,
 		tail_window.as_ref(),
 		additional_metadata.as_deref(),
-		record_plaintext_range,
+		wendelon::storage::tier_object_layout::LogicalExtent::new(
+			record_plaintext_range.start as u64,
+			record_plaintext_range.len() as u64,
+		),
 		&plaintext_ranges,
 	)?;
 	let projection_ciphertext_bytes = tiered_plan
@@ -2527,6 +2530,7 @@ fn sparse_runtime_encrypted_dataset(
 		tenant_id: TenantId::ZERO,
 		created_hlc: 0,
 		chunk_size_bytes: wendelon::crypto::SLAB_ENCRYPTION_DEFAULT_CHUNK_SIZE,
+		logical_base: 0,
 		offset_index,
 		column_stats_block: None,
 		has_row_tombstone_records: false,
@@ -5931,6 +5935,7 @@ fn adr064_runtime_encrypted_dataset(
 		tenant_id: TenantId::ZERO,
 		created_hlc: 0,
 		chunk_size_bytes: wendelon::crypto::SLAB_ENCRYPTION_DEFAULT_CHUNK_SIZE,
+		logical_base: 0,
 		offset_index,
 		column_stats_block: None,
 		has_row_tombstone_records: false,
@@ -7752,6 +7757,7 @@ fn bench_adr061_macro_block_runtime(config: &BenchConfig) -> std::io::Result<()>
 				tenant_id: TenantId::ZERO,
 				created_hlc: 61,
 				chunk_size_bytes,
+				logical_base: 0,
 				offset_index: vec![TieredOffsetIndexEntry {
 					key_locator: IdentityPrefix::ZERO,
 					byte_offset: 0,
@@ -7771,7 +7777,7 @@ fn bench_adr061_macro_block_runtime(config: &BenchConfig) -> std::io::Result<()>
 			object_size,
 			&encrypted.bytes[tail_start..],
 			None,
-			0..PLAINTEXT_BYTES,
+			wendelon::storage::tier_object_layout::LogicalExtent::new(0, PLAINTEXT_BYTES as u64),
 			&requested,
 		)?;
 		let ciphertext_ranges = plan.ciphertext_ranges_in_object();

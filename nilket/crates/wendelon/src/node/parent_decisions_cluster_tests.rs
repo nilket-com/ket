@@ -4389,17 +4389,20 @@ fn committed_uri(tier: &crate::consensus::TieredSlab) -> Option<String> {
 	Some(tier.l2_uri.clone())
 }
 
-/// DC-195 (registered; a separate ADR fixes it), CONTROLLED CLOCK: the original
-/// workflow shape, row 3 written in the same parent as row 1 with a value of the
-/// same length. The certified rewrite of S1 would put survivor row 3 at row 1's
-/// exact old location, and the leader's step is refused with a layout collision
-/// before any upload or proposal: nothing is uploaded, allocated or proposed,
-/// the old view stands and reads are exact. Asserts today's behaviour.
+/// DC-195, fixed by ADR 0705 (acceptance 1), the certified arm, CONTROLLED
+/// CLOCK: the original workflow shape, row 3 written in the same parent as row
+/// 1 with a value of the same length, so a replacement written from offset 0
+/// would put survivor row 3 at row 1's exact old location. The certified
+/// rewrite now starts at its source's logical end: it publishes, reads are
+/// exact everywhere before, after and after the leader's real restart, row 3's
+/// new location is at or above the source's end, and a holder of row 1's
+/// pruned location gets `Superseded` in process and `OutsideGeneration` after
+/// the restart, never another row.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn a_certified_rewrite_whose_survivor_takes_a_pruned_rows_location_is_refused() {
+async fn a_certified_rewrite_never_reissues_a_pruned_rows_location() {
 	use crate::storage::l2::ObjectStore;
 	use std::sync::atomic::Ordering::Release;
-	let (cluster, leader, descriptor) = ready_with(Cluster::start_with(|id, cfg| {
+	let (mut cluster, leader, descriptor) = ready_with(Cluster::start_with(|id, cfg| {
 		let root = crate::test_support::TestDir::new(&format!("dc195-certified-l2-{id}"));
 		cfg.l2 = Some(crate::storage::ObjectStoreConfig::LocalFs {
 			root: root.to_path_buf(),
@@ -4458,45 +4461,112 @@ async fn a_certified_rewrite_whose_survivor_takes_a_pruned_rows_location_is_refu
 		}
 	}
 	let source = slab.tier_pointer(s1).await.unwrap();
+	// The versions and their S1 locations, read before the floor moves (the
+	// parents' intents are complete until then).
+	let row_of = |id: i64| {
+		server
+			.row_identity_and_locality_for_test(
+				TenantId::ZERO,
+				&descriptor,
+				&named_rows(&descriptor, &[(id, "x")]),
+			)
+			.0
+	};
+	let (k1, k3) = (row_of(1), row_of(3));
+	let (v1, v3) = (
+		owned_versions(&cluster, leader, k1).await,
+		owned_versions(&cluster, leader, k3).await,
+	);
+	let pruned = slab.version_locations(TenantId::ZERO, k1, v1[0]).unwrap()[0];
+	let survivor_before = slab.version_locations(TenantId::ZERO, k3, v3[0]).unwrap()[0];
+	assert_eq!(
+		(pruned.slab_id, survivor_before.slab_id),
+		(s1, s1),
+		"premise: both in S1"
+	);
 	jump_floor(&cluster, now + 60_000).await;
 	until_active(&cluster, 1).await;
 	expect_everywhere(&cluster, &descriptor, &expected, "before the step").await;
-	pause.store(false, Release);
 	let committer = crate::storage::RaftCommitter::new(cluster.node(leader).raft.clone())
 		.with_state_machine(cluster.node(leader).state_machine.clone());
+	let source_end = slab
+		.tier_object_layout_for_test(&source)
+		.await
+		.unwrap()
+		.logical_end();
+	pause.store(false, Release);
 	let deadline = tokio::time::Instant::now() + BOUND;
-	let refusal = loop {
-		match server.certified_tier_step(&committer).await {
-			Err(error) => break error,
-			Ok(step) => {
-				assert!(
-					tokio::time::Instant::now() < deadline,
-					"never refused; last step {step:?}"
-				);
-				tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-			}
-		}
-	};
-	assert_eq!(
-		crate::storage::manager::stale_location(&refusal).map(|stale| stale.reason),
-		Some(crate::storage::manager::StaleLocationReason::LayoutCollision),
-		"{refusal}"
-	);
-	assert!(
-		leader_l2.list("certified/").await.unwrap().is_empty(),
-		"nothing uploaded"
-	);
-	assert!(
-		slab.require_op_index()
-			.unwrap()
-			.load_op_intents()
+	loop {
+		let rewritten = slab
+			.tier_pointer(s1)
 			.await
-			.unwrap()
-			.is_empty(),
-		"nothing allocated or proposed"
+			.is_some_and(|pointer| pointer.l2_uri.contains("certified/"));
+		if rewritten
+			&& slab
+				.version_locations(TenantId::ZERO, k1, v1[0])
+				.unwrap()
+				.is_empty()
+		{
+			break;
+		}
+		if tokio::time::Instant::now() >= deadline {
+			let answer = server.certified_tier_step(&committer).await;
+			panic!("S1 never rewritten; the step answers {answer:?}");
+		}
+		tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+	}
+	let survivor = slab.version_locations(TenantId::ZERO, k3, v3[0]).unwrap()[0];
+	assert!(
+		survivor.offset >= source_end,
+		"row 3 at {survivor:?}, the source ended at {source_end}"
 	);
-	assert_eq!(slab.tier_pointer(s1).await, Some(source), "the old view");
-	expect_everywhere(&cluster, &descriptor, &expected, "after the refusal").await;
+	assert_ne!(survivor, pruned, "never the pruned row's location");
+	expect_everywhere(&cluster, &descriptor, &expected, "after the certified step").await;
+	let reason = |result: std::io::Result<Vec<u8>>| {
+		let error = result.expect_err("the pruned location never reads another row");
+		crate::storage::manager::stale_location(&error).map(|stale| stale.reason)
+	};
+	{
+		use crate::storage::core::StorageEngine;
+		assert_eq!(
+			reason(slab.read(pruned).await),
+			Some(crate::storage::manager::StaleLocationReason::Superseded),
+			"in process"
+		);
+	}
+	let rewritten = slab.tier_pointer(s1).await.unwrap();
+	drop(slab);
+	drop(server);
+	// The leader's real restart: no in-memory layout history survives it.
+	cluster.stop(leader, false).await;
+	cluster.reopen(leader).await;
+	until_settled(&cluster, &descriptor).await;
+	assert_eq!(
+		cluster.read_once_validated(leader, &descriptor).await,
+		expected,
+		"after the leader's restart"
+	);
+	expect_everywhere(&cluster, &descriptor, &expected, "after the restart").await;
+	let restarted = cluster.node(leader).slab.clone();
+	restarted.wait_tier_authority_ready().await.unwrap();
+	assert_eq!(restarted.tier_pointer(s1).await, Some(rewritten));
+	assert_eq!(
+		restarted
+			.version_locations(TenantId::ZERO, k3, v3[0])
+			.unwrap(),
+		vec![survivor],
+		"the survivor's location stands"
+	);
+	{
+		use crate::storage::core::StorageEngine;
+		assert_eq!(
+			reason(restarted.read(pruned).await),
+			Some(crate::storage::manager::StaleLocationReason::OutsideGeneration),
+			"after the restart"
+		);
+	}
+	assert!(!leader_l2.list("certified/").await.unwrap().is_empty());
+	drop(restarted);
 	for node in cluster.nodes {
 		let _ = tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown()).await;
 	}

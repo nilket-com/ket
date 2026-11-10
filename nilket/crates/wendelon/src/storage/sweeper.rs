@@ -949,6 +949,16 @@ impl TierCommitter for RaftCommitter {
 	}
 }
 
+/// A decoded tier object whose plaintext is wiped when it drops, as
+/// `Zeroizing` wipes plain bytes.
+struct ZeroizingPlaintext(crate::storage::manager::TieredPlaintext);
+
+impl Drop for ZeroizingPlaintext {
+	fn drop(&mut self) {
+		zeroize::Zeroize::zeroize(&mut self.0.bytes);
+	}
+}
+
 impl SlabSweeper {
 	pub fn new(
 		slab: Arc<SlabManager>,
@@ -1284,6 +1294,19 @@ impl SlabSweeper {
 		})
 	}
 
+	/// `encrypt_tiered_object_blob_with_current_stats` for a byte-preserving
+	/// successor: the source object's plaintext under its own layout.
+	async fn encrypt_tiered_object_preserving_layout_with_current_stats(
+		&self,
+		plaintext: &crate::storage::manager::TieredPlaintext,
+	) -> std::io::Result<crate::crypto::EncryptedTieredSlab> {
+		let snapshot = self.state_machine.state_snapshot().await;
+		cpu_bound_off_the_runtime_worker(|| {
+			self.slab
+				.encrypt_tiered_object_preserving_layout(plaintext, &snapshot.table_schemas)
+		})
+	}
+
 	async fn rewrite_plaintext_tiered_slabs_once(
 		&self,
 		max_slabs: usize,
@@ -1417,6 +1440,16 @@ impl SlabSweeper {
 				),
 			));
 		}
+		// ADR 0705 §4: a plaintext object is a base-0 first upload, and its
+		// encrypted successor keeps base 0 only as a proven offset-preserving
+		// transform of it.
+		let source = self.slab.decode_tiered_object(pointer, blob.as_ref())?;
+		self.slab.preflight_offset_preserving_successor(
+			pointer,
+			&source,
+			&expected_hash,
+			fetched.as_ref(),
+		)?;
 
 		let (stats_format_version, stats_block_len, stats_block_hash128) =
 			stats_advisory_fields(encrypted.stats_locator);
@@ -1610,12 +1643,12 @@ impl SlabSweeper {
 			}
 			return Ok(TenantKekRewrapOutcome::MetadataBackfilled);
 		}
-		let plaintext = Zeroizing::new(
-			self.slab
-				.decode_tiered_object_blob(pointer, blob.as_ref())?,
-		);
+		// ADR 0705 §3: a rewrap preserves the plaintext, so it keeps the source
+		// object's layout and base.
+		let plaintext = self.slab.decode_tiered_object(pointer, blob.as_ref())?;
+		let plaintext = ZeroizingPlaintext(plaintext);
 		let encrypted = self
-			.encrypt_tiered_object_blob_with_current_stats(pointer.slab_id, plaintext.as_ref())
+			.encrypt_tiered_object_preserving_layout_with_current_stats(&plaintext.0)
 			.await?;
 		if encrypted.tenant_kek_id != active_tenant_kek_id {
 			return Err(std::io::Error::other(format!(
@@ -1673,6 +1706,14 @@ impl SlabSweeper {
 				),
 			));
 		}
+		// ADR 0705 §4: admitted at the source's base only as a proven
+		// offset-preserving transform, classified before it is proposed.
+		self.slab.preflight_offset_preserving_successor(
+			pointer,
+			&plaintext.0,
+			&expected_hash,
+			fetched.as_ref(),
+		)?;
 
 		let (stats_format_version, stats_block_len, stats_block_hash128) =
 			stats_advisory_fields(encrypted.stats_locator);
@@ -3715,12 +3756,25 @@ mod tests {
 		new_slab.fsync().await.unwrap();
 		let new_raw = std::fs::read(new_path).unwrap();
 		// A compacted generation is produced encrypted, described by its own
-		// append's offset, as the production rewrites produce it.
+		// append's offset, as the production rewrites produce it: based at its
+		// source object's logical end (ADR 0705).
+		let base =
+			crate::storage::tier_object_layout::TierObjectLayout::dense(old.slab_id, &old_raw)
+				.unwrap()
+				.logical_end();
 		let new_object = manager
 			.encrypt_tiered_blob_with_evidence(
-				old.slab_id,
-				&new_raw,
-				&std::collections::BTreeSet::from([survivor.offset]),
+				crate::storage::tier_object_layout::SlabView::new(
+					&new_raw,
+					crate::storage::tier_object_layout::TierObjectLayout::new(
+						old.slab_id,
+						base,
+						new_raw.len() as u64,
+					)
+					.unwrap(),
+				)
+				.unwrap(),
+				&std::collections::BTreeSet::from([survivor.offset + base]),
 				None,
 			)
 			.unwrap();
@@ -4822,6 +4876,233 @@ mod tests {
 			"new_tenant_kek_id={}",
 			rotated_tenant_kek_id.get()
 		)));
+	}
+
+	/// A manager whose tiers are proposed through `committer`, the way the
+	/// sweeper's are, with a sweeper that rewraps and converts.
+	async fn rewrite_fixture(
+		tag: &str,
+	) -> (
+		[crate::test_support::TestDir; 2],
+		Arc<dyn ObjectStore>,
+		Arc<CryptoManager>,
+		Arc<SlabManager>,
+		WendelonStateMachine,
+		Arc<dyn TierCommitter>,
+		SlabSweeper,
+	) {
+		let l1_dir = fresh_dir(&format!("{tag}-l1"));
+		let l2_root = fresh_dir(&format!("{tag}-l2"));
+		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
+		let crypto = test_crypto();
+		let manager = SlabManager::initialize_new_store(SlabManagerConfig {
+			tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
+			dir: l1_dir.to_path_buf(),
+			max_slab_bytes: 1 << 20,
+			io: spawn_io_thread(64).unwrap(),
+			l2: Some(l2.clone()),
+			rehydration: crate::storage::manager::RehydrationPolicy::default(),
+			l2_column_fetch: Default::default(),
+			row_group_writer: Default::default(),
+			l2_row_group_fetch: Default::default(),
+			encoding_writer: Default::default(),
+			l2_chunk_layout: Default::default(),
+			l2_encoding_fetch: Default::default(),
+			encoding_compute: Default::default(),
+			group_commit: crate::storage::GroupCommitConfig::default(),
+			crypto: crypto.clone(),
+		})
+		.await
+		.unwrap();
+		let observer: Arc<dyn TierObserver> = Arc::new(ManagerTierObserver::new(manager.clone()));
+		let sm = WendelonStateMachine::new();
+		let committer: Arc<dyn TierCommitter> =
+			Arc::new(DirectApplyCommitter::ok(sm.clone(), observer));
+		let sweeper = SlabSweeper::new(
+			manager.clone(),
+			l2.clone(),
+			committer.clone(),
+			sm.clone(),
+			SweeperConfig {
+				scan_interval: Duration::from_millis(10),
+				op_driver_interval: Duration::from_millis(500),
+				min_slab_bytes: 0,
+				max_upload_bytes_per_sec: None,
+				key_prefix: "tier/".into(),
+				max_plaintext_rewrites_per_pass: 1,
+				max_dek_rewraps_per_pass: 1,
+			},
+		);
+		(
+			[l1_dir, l2_root],
+			l2,
+			crypto,
+			manager,
+			sm,
+			committer,
+			sweeper,
+		)
+	}
+
+	/// ADR 0705 acceptance 7a: a based encrypted object's DEK rewrap keeps its
+	/// base, its plaintext and every location; it is admitted only by the
+	/// plaintext proof (the refusals of a same-base successor with other bytes
+	/// are acceptance 9's control).
+	#[tokio::test]
+	async fn a_rewrap_of_a_based_object_keeps_its_base_and_every_location() {
+		use crate::storage::core::StorageEngine;
+		use crate::storage::tier_object_layout::{SlabView, TierObjectLayout};
+		let (_dirs, l2, crypto, manager, _sm, committer, sweeper) =
+			rewrite_fixture("rewrap-based").await;
+		let rows = [
+			(id(0x5160), &b"first-row"[..]),
+			(id(0x5161), &b"second-row"[..]),
+		];
+		for (key, value) in rows {
+			manager
+				.append(tenant(), key, hlc_at(10), value)
+				.await
+				.unwrap();
+		}
+		let slab_id = manager.force_seal_active_for_test().await;
+		assert_eq!(sweeper.sweep_once().await.unwrap().tiered, 1);
+		let first = manager.tier_pointer(slab_id).await.unwrap();
+		let first_blob = l2.get(&first.l2_uri).await.unwrap();
+		let source = manager.decode_tiered_object(&first, &first_blob).unwrap();
+		assert_eq!(source.layout.base(), 0, "premise: a first upload");
+
+		// A layout-changing successor of the same rows, based at the first
+		// object's end and proposed as a rewrite is: the object to rewrap.
+		let base = source.layout.logical_end();
+		let based_layout =
+			TierObjectLayout::new(slab_id, base, source.layout.plaintext_len()).unwrap();
+		let shifted = source
+			.record_offsets
+			.iter()
+			.map(|offset| offset + base)
+			.collect::<std::collections::BTreeSet<_>>();
+		let encrypted = manager
+			.encrypt_tiered_blob_with_evidence(
+				SlabView::new(&source.bytes, based_layout).unwrap(),
+				&shifted,
+				None,
+			)
+			.unwrap();
+		// Staged as every rewrite stages its objects before uploading.
+		let key = "tier/rewrap-based-1.wnd";
+		let planned = l2.planned_upload_uri(key).unwrap();
+		manager
+			.stage_table_drop_l2_cleanup(
+				slab_id,
+				&first.l2_uri,
+				Some(first_blob.len() as u64),
+				Some((&planned, encrypted.bytes.len() as u64)),
+			)
+			.await
+			.unwrap();
+		let uri = l2.put(key, &encrypted.bytes).await.unwrap();
+		assert_eq!(uri, planned);
+		manager
+			.prepare_tier_candidate_proposal(slab_id, &uri)
+			.await
+			.unwrap();
+		propose_tier_slab(
+			&manager,
+			committer.as_ref(),
+			TieredSlab {
+				slab: manager.owner_ref().unwrap().slab(slab_id),
+				l2_uri: uri.clone(),
+				payload_hash: crate::hash::content::digest(&encrypted.bytes),
+				is_encrypted: true,
+				tenant_id: Some(tenant()),
+				tenant_kek_id: Some(encrypted.tenant_kek_id),
+				stats_format_version: None,
+				stats_block_len: None,
+				stats_block_hash128: None,
+				tombstone_metadata: first.tombstone_metadata,
+				supersession_metadata: first.supersession_metadata,
+				certified: None,
+			},
+			Some(crate::consensus::slab_ops::TierGeneration::from(&first)),
+		)
+		.await
+		.unwrap();
+		let based = manager.tier_pointer(slab_id).await.unwrap();
+		assert_eq!(based.l2_uri, uri, "premise: the based object is published");
+		assert_eq!(
+			sweeper.sm_tier_pointer(slab_id).await.as_ref(),
+			Some(&based)
+		);
+		let mut locations = Vec::new();
+		for (key, value) in rows {
+			let location = manager.lookup(tenant(), key).unwrap().unwrap();
+			assert!(location.offset >= base, "premise: a based location");
+			assert_eq!(manager.read(location).await.unwrap(), value);
+			locations.push(location);
+		}
+
+		let rotation = crypto.prepare_rotation(tenant()).unwrap();
+		crypto.apply_rotation(&rotation).unwrap();
+		let report = sweeper.sweep_once().await.unwrap();
+		assert_eq!(report.rewrapped_tiered_deks, 1);
+		assert_eq!(report.dek_rewrap_failures, 0);
+		let rewrapped = manager.tier_pointer(slab_id).await.unwrap();
+		assert_ne!(rewrapped.payload_hash, based.payload_hash);
+		assert_eq!(rewrapped.tenant_kek_id, Some(rotation.tenant_kek_id));
+		let blob = l2.get(&rewrapped.l2_uri).await.unwrap();
+		let object = manager.decode_tiered_object(&rewrapped, &blob).unwrap();
+		assert_eq!(object.layout, based_layout, "the same base and extent");
+		assert_eq!(object.bytes, source.bytes, "the same plaintext");
+		for ((key, value), location) in rows.iter().zip(&locations) {
+			assert_eq!(
+				manager.lookup(tenant(), *key).unwrap(),
+				Some(*location),
+				"every location kept"
+			);
+			assert_eq!(&manager.read(*location).await.unwrap(), value);
+		}
+	}
+
+	/// ADR 0705 acceptance 7b: a base-0 plaintext first upload converted to
+	/// an encrypted object keeps base 0 and every location.
+	#[tokio::test]
+	async fn a_plaintext_first_upload_converts_to_encrypted_at_base_zero() {
+		use crate::storage::core::StorageEngine;
+		let (_dirs, l2, _crypto, manager, sm, _committer, sweeper) =
+			rewrite_fixture("plaintext-convert").await;
+		let key = id(0x5170);
+		let location = manager
+			.append(tenant(), key, hlc_at(10), b"plain-row")
+			.await
+			.unwrap();
+		let slab_id = manager.force_seal_active_for_test().await;
+		let raw = manager.read_sealed_raw(slab_id).await.unwrap();
+		let plain = TieredSlabPointer {
+			slab_id,
+			l2_uri: l2.put("tier/plaintext-first.wnd", &raw).await.unwrap(),
+			payload_hash: crate::hash::content::digest(&raw),
+			is_encrypted: false,
+			tenant_id: None,
+			tenant_kek_id: None,
+			stats_format_version: None,
+			stats_block_len: None,
+			stats_block_hash128: None,
+			tombstone_metadata: TombstoneMetadata::None,
+			supersession_metadata: SupersessionMetadata::None,
+		};
+		manager.apply_tier_slab(plain.clone()).await.unwrap();
+		seed_state_machine_pointer(&sm, &manager, &plain).await;
+		assert_eq!(manager.read(location).await.unwrap(), b"plain-row");
+		let report = sweeper.sweep_once().await.unwrap();
+		assert_eq!(report.rewritten_plaintext_tiered, 1, "{report:?}");
+		let converted = manager.tier_pointer(slab_id).await.unwrap();
+		assert!(converted.is_encrypted);
+		let blob = l2.get(&converted.l2_uri).await.unwrap();
+		let object = manager.decode_tiered_object(&converted, &blob).unwrap();
+		assert_eq!(object.layout.base(), 0, "base 0 kept");
+		assert_eq!(object.bytes, raw, "the same plaintext");
+		assert_eq!(manager.lookup(tenant(), key).unwrap(), Some(location));
+		assert_eq!(manager.read(location).await.unwrap(), b"plain-row");
 	}
 
 	#[tokio::test]
@@ -5987,9 +6268,9 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn a_rewrite_moving_another_key_into_a_pruned_location_is_refused_before_upload() {
+	async fn a_retention_rewrite_never_moves_another_key_into_a_pruned_location() {
 		use crate::storage::core::StorageEngine;
-		use crate::storage::manager::{StaleLocation, StaleLocationReason, stale_location};
+		use crate::storage::manager::{StaleLocationReason, stale_location};
 
 		let now_ms = SystemTime::now()
 			.duration_since(UNIX_EPOCH)
@@ -6025,49 +6306,52 @@ mod tests {
 		let sm = WendelonStateMachine::new();
 		let pointer = tier_active_slab(&manager, &l2, &sm, "tier/retention-slot-reuse.wnd").await;
 		let sweeper = retention_sweeper(&manager, &l2, &sm, now_ms);
-		let objects = l2_object_names(&l2).await;
 
-		// Pruning a's batch row moves b's row into its old physical location;
-		// the rewrite is refused in preparation, before any upload or commit.
-		let refused = sweeper
+		// DC-195 (ADR 0705): a rewrite written from offset 0 would move b's row
+		// into a's pruned location; it now starts at its source's logical end,
+		// so it publishes and no location of a means b.
+		let source_end = manager
+			.tier_object_layout_for_test(&pointer)
+			.await
+			.unwrap()
+			.logical_end();
+		sweeper
 			.rewrite_one_tiered_slab_for_retention(
 				&pointer,
 				now_ms,
 				hlc_at(now_ms.saturating_sub(15_000)),
 			)
 			.await
-			.expect_err("a rewrite whose old and new meanings of one location differ");
-		assert_eq!(
-			stale_location(&refused),
-			Some(StaleLocation {
-				slab_id: pointer.slab_id,
-				reason: StaleLocationReason::LayoutCollision,
-			}),
-			"{refused}"
-		);
-		let report = sweeper.sweep_once().await.unwrap();
-		assert_eq!(report.retention_rewritten_tiered, 0);
-		assert_eq!(report.retention_rewrite_failures, 1);
-		assert_eq!(
-			l2_object_names(&l2).await,
-			objects,
-			"a refused rewrite uploads nothing"
-		);
+			.expect("the rewrite publishes")
+			.expect("a rewrite with survivors");
+		let published = manager.tier_pointer(pointer.slab_id).await.unwrap();
+		assert_ne!(published, pointer, "a new generation");
 		assert_eq!(
 			sweeper.sm_tier_pointer(pointer.slab_id).await,
-			Some(pointer.clone()),
-			"a refused rewrite commits nothing"
+			Some(published)
 		);
+		let latest_b = manager.lookup(tenant(), b).unwrap().unwrap();
+		assert!(
+			latest_b.offset >= source_end && latest_b != held_a,
+			"b@old at {latest_b:?}, never a's pruned {held_a:?}"
+		);
+		assert_eq!(manager.read(latest_b).await.unwrap(), b"b-old");
 		assert_eq!(
-			manager.tier_pointer(pointer.slab_id).await,
-			Some(pointer.clone())
+			manager.read(held_b).await.unwrap(),
+			b"b-old",
+			"b's old location redirects to its version"
 		);
-		assert_eq!(manager.read(held_a).await.unwrap(), b"a-old");
-		assert_eq!(manager.read(held_b).await.unwrap(), b"b-old");
 		let latest_a = manager.lookup(tenant(), a).unwrap().unwrap();
 		assert_eq!(manager.read(latest_a).await.unwrap(), b"a-new");
-		let latest_b = manager.lookup(tenant(), b).unwrap().unwrap();
-		assert_eq!(manager.read(latest_b).await.unwrap(), b"b-old");
+		let error = manager
+			.read(held_a)
+			.await
+			.expect_err("a's pruned location never reads b's row");
+		assert_eq!(
+			stale_location(&error).map(|stale| stale.reason),
+			Some(StaleLocationReason::Superseded),
+			"{error}"
+		);
 	}
 
 	#[tokio::test]

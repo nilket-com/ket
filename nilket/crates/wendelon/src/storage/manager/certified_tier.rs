@@ -285,6 +285,8 @@ pub(crate) struct TierCertifiedJob {
 	source_rows_digest: [u8; 32],
 	fingerprint: [u8; 32],
 	plaintext: Zeroizing<Vec<u8>>,
+	/// The published object's validated layout: `plaintext` is its bytes.
+	plaintext_layout: crate::storage::tier_object_layout::TierObjectLayout,
 	/// One per indexed record of the published object, sorted by offset.
 	records: Vec<CompactionRecord>,
 	/// Each record's version entry and what its frame says of its table.
@@ -551,16 +553,17 @@ impl SlabManager {
 		};
 		validate_tiered_blob(&source, &old_blob)?;
 		let acknowledged = self.acknowledged_offsets_in_slab(slab_id);
-		let plaintext = Zeroizing::new(
-			decode_tiered_blob(
-				self.config.crypto.as_ref(),
-				&source,
-				&old_blob,
-				TierObjectEvidence::Indexed(&acknowledged),
-			)?
-			.bytes,
-		);
-		let mut records = recover_slab_entries_from_blob(&plaintext, slab_id, &acknowledged)?
+		let decoded = decode_tiered_blob(
+			self.config.crypto.as_ref(),
+			&source,
+			&old_blob,
+			TierObjectEvidence::Indexed(&acknowledged),
+		)?;
+		let source_layout = decoded.layout;
+		let plaintext_bytes = Zeroizing::new(decoded.bytes);
+		let plaintext =
+			crate::storage::tier_object_layout::SlabView::new(&plaintext_bytes, source_layout)?;
+		let mut records = recover_slab_entries_from_blob(plaintext, &acknowledged)?
 			.into_iter()
 			.map(|entry| CompactionRecord {
 				tenant_id: entry.tenant_id,
@@ -580,7 +583,7 @@ impl SlabManager {
 				continue;
 			};
 			let frame = Zeroizing::new(extract_record_from_blob(
-				&plaintext,
+				plaintext,
 				crate::storage::core::FrameLocation::of_point_read(records[first].old_location),
 			)?);
 			let rows: Vec<RecordRowIndex> = indices
@@ -614,7 +617,8 @@ impl SlabManager {
 			source_rows,
 			source_rows_digest,
 			fingerprint,
-			plaintext,
+			plaintext: plaintext_bytes,
+			plaintext_layout: source_layout,
 			records,
 			entries,
 			frame_tables,
@@ -737,7 +741,10 @@ impl SlabManager {
 		let replacement = self
 			.build_tiered_replacement(
 				&job.source,
-				&job.plaintext,
+				crate::storage::tier_object_layout::SlabView::new(
+					&job.plaintext,
+					job.plaintext_layout,
+				)?,
 				records,
 				table_schemas,
 				job.source_bytes,

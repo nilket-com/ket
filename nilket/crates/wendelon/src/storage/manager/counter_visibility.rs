@@ -28,6 +28,17 @@ impl SlabManager {
 						return Ok(false);
 					}
 				}
+				// ADR 0705: the copy's file holds the object at physical
+				// offsets; the location converts through its layout.
+				SlabBacking::Rehydrated(copy) => {
+					if !copy
+						.store
+						.counter_record_supported(tenant, key, copy.local_location(location)?)
+						.await?
+					{
+						return Ok(false);
+					}
+				}
 				SlabBacking::L2(_) | SlabBacking::Missing => return Ok(false),
 			}
 		}
@@ -38,12 +49,13 @@ impl SlabManager {
 	pub(crate) async fn refuse_counter_migration(&self, slab_id: SlabId) -> std::io::Result<()> {
 		match self.resolve_backing(slab_id).await {
 			SlabBacking::Local(slab) => slab.refuse_counter_maintenance(),
+			// A whole-file class scan: no location is read.
+			SlabBacking::Rehydrated(copy) => copy.store.refuse_counter_maintenance(),
 			SlabBacking::L2(pointer) => {
 				// This is the same class-aware walk used to admit blob-tier bytes.
-				let bytes = self.tiered_plaintext_from_l2(&pointer).await?;
+				let plaintext = self.tiered_plaintext_from_l2(&pointer).await?;
 				super::core::recover_slab_entries_from_blob(
-					&bytes,
-					slab_id,
+					plaintext.view()?,
 					&self.acknowledged_offsets_in_slab(slab_id),
 				)?;
 				Ok(())
