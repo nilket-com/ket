@@ -1930,8 +1930,11 @@ impl SlabSweeper {
 						"object store returned a different upload URI",
 					));
 				}
-				let fetched = self.object_store.get(&new_uri).await?;
-				let fetched_hash = crate::hash::content::digest(&fetched);
+				// The read-back is only hashed: it is dropped before anything else waits.
+				let fetched_hash = {
+					let fetched = self.object_store.get(&new_uri).await?;
+					crate::hash::content::digest(&fetched)
+				};
 				if fetched_hash != payload_hash {
 					if let Err(cleanup_error) = self
 						.slab
@@ -1966,6 +1969,10 @@ impl SlabSweeper {
 							),
 						)
 					})?;
+				// The footer was the object's last use: only its length is needed past
+				// here, so the bytes are not held across the proposal and the apply.
+				let encrypted_len = encrypted_bytes.len() as u64;
+				drop(encrypted_bytes);
 
 				let (stats_format_version, stats_block_len, stats_block_hash128) =
 					stats_advisory_fields(footer.stats_locator);
@@ -1993,7 +2000,7 @@ impl SlabSweeper {
 					self.cleanup_uploaded_object_after_failed_commit(
 						slab_id,
 						&new_uri,
-						encrypted_bytes.len() as u64,
+						encrypted_len,
 						&error,
 					)
 					.await?;
