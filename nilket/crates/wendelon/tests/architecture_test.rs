@@ -12322,3 +12322,237 @@ fn parent_decisions_have_no_producer_and_one_codec() {
 		"#[serde(skip)]\n\tpub decisions: Option<crate::consensus::decisions::DecisionState>,"
 	));
 }
+
+/// ADR 0706 (Decision 5): who keeps a production lifecycle permit across
+/// cancellation. A classification guard, not a proof of cancellation safety:
+/// the behavioural controls are the evidence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LifecyclePermitOwner {
+	/// A service an orderly close stops between steps and drains, bounded,
+	/// before Raft shuts down.
+	DrainedService(&'static str),
+	/// The spawned task that owns the work and the permit to its end.
+	SpawnedTask,
+	/// `under_permit` itself: each caller is classified on its own.
+	PermitHelper,
+}
+
+/// Every production `lifecycle_permit()` / `under_permit(` site, as (file
+/// under `src/`, enclosing function, owner).
+const LIFECYCLE_PERMIT_CENSUS: &[(&str, &str, LifecyclePermitOwner)] = &[
+	(
+		"network/data_server/certification.rs",
+		"certification_step",
+		LifecyclePermitOwner::DrainedService("decision maintenance"),
+	),
+	(
+		"network/data_server/certification.rs",
+		"under_permit",
+		LifecyclePermitOwner::PermitHelper,
+	),
+	(
+		"network/data_server/certification.rs",
+		"validate_certified_base",
+		LifecyclePermitOwner::DrainedService("decision maintenance"),
+	),
+	(
+		"network/data_server/cleanup.rs",
+		"certified_cleanup_step",
+		LifecyclePermitOwner::DrainedService("decision maintenance"),
+	),
+	(
+		"network/data_server/cleanup.rs",
+		"certified_lsm_step_unpaused",
+		LifecyclePermitOwner::DrainedService("LSM compaction"),
+	),
+	(
+		"network/data_server/cleanup.rs",
+		"certified_tier_step",
+		LifecyclePermitOwner::DrainedService("LSM compaction"),
+	),
+	(
+		"storage/manager/lsm_driver.rs",
+		"install_lsm_output_files",
+		LifecyclePermitOwner::SpawnedTask,
+	),
+	(
+		"storage/manager/op_recovery.rs",
+		"recover_abandoned_install",
+		LifecyclePermitOwner::SpawnedTask,
+	),
+];
+
+/// A source file's production part: everything before its first top-level
+/// test module.
+fn production_part(source: &str) -> &str {
+	let mut at = 0;
+	for line in source.split_inclusive('\n') {
+		if line.starts_with("#[cfg(")
+			&& line.contains("test")
+			&& source[at + line.len()..].starts_with("mod ")
+		{
+			return &source[..at];
+		}
+		at += line.len();
+	}
+	source
+}
+
+/// The lifecycle permit sites of one production source, as (file, enclosing
+/// function); commented lines and test modules are not sites.
+fn lifecycle_permit_sites(file: &str, source: &str) -> Vec<(String, String)> {
+	let production = production_part(source);
+	let mut sites = Vec::new();
+	for needle in ["lifecycle_permit()", "under_permit("] {
+		for (offset, _) in production.match_indices(needle) {
+			let line = production[..offset].rfind('\n').map_or(0, |at| at + 1);
+			if production[line..offset].trim_start().starts_with("//") {
+				continue;
+			}
+			let head = &production[..offset];
+			let function = head
+				.rfind("fn ")
+				.map(|at| {
+					head[at + 3..]
+						.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+						.next()
+						.unwrap_or_default()
+						.to_owned()
+				})
+				.unwrap_or_default();
+			sites.push((file.to_owned(), function));
+		}
+	}
+	sites.sort();
+	sites.dedup();
+	sites
+}
+
+/// The sites the census does not classify.
+fn unclassified_permit_sites(
+	sites: &[(String, String)],
+	census: &[(&str, &str, LifecyclePermitOwner)],
+) -> Vec<(String, String)> {
+	sites
+		.iter()
+		.filter(|(file, function)| {
+			!census
+				.iter()
+				.any(|(listed, name, _)| listed == file && name == function)
+		})
+		.cloned()
+		.collect()
+}
+
+/// ADR 0706 (Decision 5, acceptance 4): every production site that takes a
+/// lifecycle permit is classified with the owner that keeps it across
+/// cancellation; a new site fails here until it is. The drained services stop
+/// and drain before Raft does.
+#[test]
+fn every_lifecycle_permit_site_has_an_owner_that_outlives_cancellation() {
+	let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let mut sites = Vec::new();
+	walk_dir(&src, &mut |path| {
+		let name = path.file_name().unwrap().to_string_lossy().into_owned();
+		if path.extension().is_none_or(|ext| ext != "rs") || name.ends_with("tests.rs") {
+			return;
+		}
+		let file = path
+			.strip_prefix(&src)
+			.unwrap()
+			.to_string_lossy()
+			.into_owned();
+		sites.extend(lifecycle_permit_sites(
+			&file,
+			&fs::read_to_string(path).unwrap(),
+		));
+	});
+	sites.sort();
+	assert_eq!(
+		unclassified_permit_sites(&sites, LIFECYCLE_PERMIT_CENSUS),
+		Vec::<(String, String)>::new(),
+		"a lifecycle permit site without a classified owner"
+	);
+	let stale: Vec<_> = LIFECYCLE_PERMIT_CENSUS
+		.iter()
+		.filter(|(file, function, _)| {
+			!sites
+				.iter()
+				.any(|(found, name)| found == file && name == function)
+		})
+		.collect();
+	assert!(stale.is_empty(), "census entries with no site: {stale:?}");
+
+	// The drained services: both signalled, then drained, before the
+	// transports drain and Raft shuts down.
+	let node = fs::read_to_string(src.join("node.rs")).unwrap();
+	let shutdown = source_region(
+		&node,
+		"\tpub async fn shutdown(self) -> std::io::Result<()> {\n\t\tlet lifecycle = self.lifecycle;",
+		"\n\t}\n",
+	);
+	let order: Vec<_> = [
+		"self.data_server.stop_decision_maintenance();",
+		"handles.lsm_compaction_control.stop();",
+		"handles.drain_lifecycle_services().await",
+		"lifecycle.begin_drain();",
+		"self.raft.shutdown().await",
+	]
+	.iter()
+	.map(|step| {
+		shutdown
+			.find(step)
+			.unwrap_or_else(|| panic!("Node::shutdown lacks `{step}`"))
+	})
+	.collect();
+	assert!(
+		order.windows(2).all(|pair| pair[0] < pair[1]),
+		"stop both, drain both, then drain transports and stop Raft: {order:?}"
+	);
+	let drain = source_region(
+		&node,
+		"async fn drain_lifecycle_services(&mut self)",
+		"\n\t}\n",
+	);
+	for service in LIFECYCLE_PERMIT_CENSUS
+		.iter()
+		.filter_map(|(_, _, owner)| match owner {
+			LifecyclePermitOwner::DrainedService(service) => Some(*service),
+			_ => None,
+		}) {
+		assert!(
+			drain.contains(&format!("\"{service}\"")),
+			"the drain covers the {service} service"
+		);
+	}
+}
+
+/// ADR 0706 (acceptance 4, its negative control): an unlisted site is
+/// reported; a commented mention and a test module are not sites.
+#[test]
+fn an_unclassified_lifecycle_permit_site_fails_the_census() {
+	let source = "impl Rogue {\n\tasync fn rogue_step(&self) -> std::io::Result<()> {\n\t\tlet permit = owner.lifecycle_permit()?;\n\t\t// owner.lifecycle_permit() in a comment\n\t\tOk(())\n\t}\n}\n\n#[cfg(test)]\nmod tests {\n\tfn fixture() {\n\t\tlet _ = owner.lifecycle_permit();\n\t}\n}\n";
+	let sites = lifecycle_permit_sites("network/data_server/rogue.rs", source);
+	assert_eq!(
+		sites,
+		vec![(
+			"network/data_server/rogue.rs".to_owned(),
+			"rogue_step".to_owned()
+		)]
+	);
+	assert_eq!(
+		unclassified_permit_sites(&sites, LIFECYCLE_PERMIT_CENSUS),
+		sites,
+		"an unlisted site fails the census"
+	);
+	// A listed name in another file is still unlisted.
+	let moved = lifecycle_permit_sites(
+		"storage/rogue.rs",
+		"async fn certified_tier_step() { self.under_permit(work).await }\n",
+	);
+	assert_eq!(
+		unclassified_permit_sites(&moved, LIFECYCLE_PERMIT_CENSUS),
+		moved
+	);
+	assert!(!moved.is_empty());
+}

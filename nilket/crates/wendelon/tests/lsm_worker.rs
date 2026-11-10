@@ -194,3 +194,130 @@ fn compaction_worker_plans_survivor_outputs_with_configured_target_size() {
 	assert_eq!(prepared.output_runs[1].slab_id, SlabId::new(11));
 	assert_eq!(prepared.output_runs[1].rows[0].row_hlc, hlc(40));
 }
+
+/// A driver whose ticks each wait for one release, counting the ticks that
+/// entered and the ones that finished.
+struct HeldDriver {
+	entered: tokio::sync::Semaphore,
+	release: tokio::sync::Semaphore,
+	finished: AtomicUsize,
+}
+
+impl HeldDriver {
+	fn new() -> Self {
+		Self {
+			entered: tokio::sync::Semaphore::new(0),
+			release: tokio::sync::Semaphore::new(0),
+			finished: AtomicUsize::new(0),
+		}
+	}
+}
+
+#[async_trait::async_trait]
+impl LsmCompactionDriver for HeldDriver {
+	async fn run_lsm_compaction_tick(
+		&self,
+		_worker: &LsmCompactionWorker,
+		_now: HybridTimestamp,
+	) -> Result<Option<wendelon::storage::CompactionOutcome>, CompactionFailure> {
+		self.entered.add_permits(1);
+		self.release.acquire().await.unwrap().forget();
+		self.finished.fetch_add(1, Ordering::SeqCst);
+		Ok(None)
+	}
+}
+
+fn ticking_every(millis: u64) -> LsmCompactionWorker {
+	LsmCompactionWorker::new(
+		LsmConfig {
+			lsm_picker_tick_millis: millis,
+			..LsmConfig::default()
+		},
+		Arc::new(SlabPinTable::default()),
+	)
+	.unwrap()
+}
+
+/// ADR 0706 (acceptance 3): once the service has observed its stop, no new
+/// tick is admitted: the stop wakes a service sleeping between ticks (a tick a
+/// minute away) and a paused one, each loop ends promptly, and a later direct
+/// tick is refused too. The stop is sticky: resuming does not undo it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stopped_compaction_service_admits_no_new_tick() {
+	let prompt = std::time::Duration::from_secs(5);
+	// Sleeping between ticks.
+	let driver = Arc::new(CountingDriver::default());
+	let service = LsmCompactionService::new(driver.clone(), ticking_every(60_000));
+	let control = service.control();
+	let handle = service.spawn();
+	control.stop();
+	tokio::time::timeout(prompt, handle)
+		.await
+		.expect("the stop wakes a sleeping service")
+		.unwrap();
+	assert_eq!(control.admitted_ticks(), 0);
+	assert_eq!(driver.ticks.load(Ordering::SeqCst), 0);
+
+	// Paused, its loop waking every millisecond.
+	let driver = Arc::new(CountingDriver::default());
+	let service = LsmCompactionService::new(driver.clone(), ticking_every(1));
+	let control = service.control();
+	control.pause();
+	let handle = service.spawn();
+	tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+	assert!(!handle.is_finished(), "a paused service keeps running");
+	control.stop();
+	control.resume();
+	tokio::time::timeout(prompt, handle)
+		.await
+		.expect("the stop ends a paused service")
+		.unwrap();
+	assert_eq!(control.admitted_ticks(), 0);
+	assert_eq!(driver.ticks.load(Ordering::SeqCst), 0);
+
+	// A direct tick after the stop.
+	let driver = Arc::new(CountingDriver::default());
+	let service = LsmCompactionService::new(driver.clone(), ticking_every(1));
+	let control = service.control();
+	control.stop();
+	assert!(service.tick_once(hlc(100)).await.unwrap().is_none());
+	assert!(control.is_stopped());
+	assert_eq!(control.admitted_ticks(), 0);
+	assert_eq!(driver.ticks.load(Ordering::SeqCst), 0);
+}
+
+/// ADR 0706 (acceptance 3): a tick admitted before the stop runs to its end;
+/// the stop is never selected against it, and no tick follows it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tick_admitted_before_the_stop_finishes_and_none_follows() {
+	let prompt = std::time::Duration::from_secs(5);
+	let driver = Arc::new(HeldDriver::new());
+	let service = LsmCompactionService::new(driver.clone(), ticking_every(1));
+	let control = service.control();
+	let mut handle = service.spawn();
+	tokio::time::timeout(prompt, driver.entered.acquire())
+		.await
+		.expect("a tick was admitted")
+		.unwrap()
+		.forget();
+	control.stop();
+	assert!(
+		tokio::time::timeout(std::time::Duration::from_millis(300), &mut handle)
+			.await
+			.is_err(),
+		"the service waits for its admitted tick"
+	);
+	assert_eq!(driver.finished.load(Ordering::SeqCst), 0);
+	driver.release.add_permits(1);
+	tokio::time::timeout(prompt, handle)
+		.await
+		.expect("the service stops after its tick")
+		.unwrap();
+	assert_eq!(
+		driver.finished.load(Ordering::SeqCst),
+		1,
+		"the tick finished"
+	);
+	assert_eq!(control.admitted_ticks(), 1, "no tick after the stop");
+	assert_eq!(driver.entered.available_permits(), 0);
+}

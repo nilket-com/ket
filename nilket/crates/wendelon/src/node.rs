@@ -794,10 +794,12 @@ impl NodeBootstrapConfig {
 /// ADR 0699 S3a: how often a ParentDecisions node checks its signer binding and,
 /// as leader, the retry floor.
 const DECISION_MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
-/// ADR 0699 S5a: how long a close waits for the decision maintenance loop to
-/// finish its current step. Past it the loop is aborted, and an interrupted
+/// ADR 0699 S5a, ADR 0706: how long an orderly close waits, in all, for the
+/// lifecycle services (the decision maintenance loop and the LSM compaction
+/// service) to finish their current step. One deadline shared by both, drained
+/// concurrently. Past it a service is aborted and joined, and an interrupted
 /// lifecycle permit then revokes the clean record, as it must.
-const DECISION_MAINTENANCE_DRAIN: std::time::Duration = std::time::Duration::from_secs(15);
+const LIFECYCLE_SERVICES_DRAIN: std::time::Duration = std::time::Duration::from_secs(15);
 /// ADR 0699 S3c: Resolve proposals per maintenance tick, at most.
 const DECISION_RESOLVE_BATCH: usize = 16;
 
@@ -813,7 +815,8 @@ pub struct NodeHandles {
 	pub tenant_policy_reconciler: JoinHandle<()>,
 	pub drop_reclaim_sweeper: JoinHandle<()>,
 	pub migration_sweeper: JoinHandle<()>,
-	pub lsm_compaction: JoinHandle<()>,
+	/// ADR 0706: `None` once an orderly close drained it.
+	pub lsm_compaction: Option<JoinHandle<()>>,
 	pub lsm_compaction_control: LsmCompactionServiceControl,
 	pub lsm_gc: JoinHandle<()>,
 	pub op_driver: JoinHandle<()>,
@@ -823,8 +826,11 @@ pub struct NodeHandles {
 	pub audit_chain_root_rollup: JoinHandle<()>,
 	pub default_tenant_seeder: JoinHandle<()>,
 	pub checkpoint_emitter: JoinHandle<()>,
-	/// ADR 0699 S3a: ParentDecisions only.
+	/// ADR 0699 S3a: ParentDecisions only. `None` once an orderly close
+	/// drained it.
 	pub decision_maintenance: Option<JoinHandle<()>>,
+	/// The bound on the lifecycle services' orderly stop.
+	lifecycle_drain_bound: std::time::Duration,
 }
 
 impl NodeHandles {
@@ -840,7 +846,9 @@ impl NodeHandles {
 		self.tenant_policy_reconciler.abort();
 		self.drop_reclaim_sweeper.abort();
 		self.migration_sweeper.abort();
-		self.lsm_compaction.abort();
+		if let Some(handle) = &self.lsm_compaction {
+			handle.abort();
+		}
 		self.lsm_gc.abort();
 		self.op_driver.abort();
 		self.secondary_index_lifecycle.abort();
@@ -858,19 +866,30 @@ impl NodeHandles {
 		}
 	}
 
-	/// ADR 0699 S5a: waits, bounded, for the decision maintenance loop to stop
-	/// after its current step (its stop was signalled); past the bound it is
-	/// aborted, and an interrupted lifecycle permit then revokes the clean
-	/// record.
-	async fn drain_decision_maintenance(&mut self) {
-		if let Some(mut handle) = self.decision_maintenance.take()
-			&& tokio::time::timeout(DECISION_MAINTENANCE_DRAIN, &mut handle)
-				.await
-				.is_err()
-		{
-			handle.abort();
-			let _ = handle.await;
-		}
+	/// ADR 0699 S5a, ADR 0706: waits for the lifecycle services, whose stops
+	/// were both signalled, to stop after their current step: concurrently,
+	/// under one shared deadline. Each handle is consumed here, so
+	/// [`NodeHandles::shutdown`] never awaits it again. Past the deadline a
+	/// service is aborted and joined before this returns: an interrupted
+	/// lifecycle permit has then dropped and revoked the clean record. A panic
+	/// is a failure, never an orderly stop.
+	async fn drain_lifecycle_services(&mut self) -> std::io::Result<()> {
+		let deadline = tokio::time::Instant::now() + self.lifecycle_drain_bound;
+		let (lsm, decisions) = tokio::join!(
+			drain_lifecycle_service(self.lsm_compaction.take(), deadline, "LSM compaction"),
+			drain_lifecycle_service(
+				self.decision_maintenance.take(),
+				deadline,
+				"decision maintenance"
+			),
+		);
+		lsm.and(decisions)
+	}
+
+	/// Test-only: shortens the bound on the lifecycle services' orderly stop.
+	#[cfg(test)]
+	pub(crate) fn set_lifecycle_drain_bound_for_test(&mut self, bound: std::time::Duration) {
+		self.lifecycle_drain_bound = bound;
 	}
 
 	pub async fn shutdown(self) -> std::io::Result<()> {
@@ -910,7 +929,9 @@ impl NodeHandles {
 		join_all_way!(self.tenant_policy_reconciler, "tenant policy reconciler");
 		join_all_way!(self.drop_reclaim_sweeper, "drop reclaim sweeper");
 		join_all_way!(self.migration_sweeper, "migration sweeper");
-		join_all_way!(self.lsm_compaction, "LSM compaction");
+		if let Some(handle) = self.lsm_compaction {
+			join_all_way!(handle, "LSM compaction");
+		}
 		join_all_way!(self.lsm_gc, "LSM GC");
 		join_all_way!(self.op_driver, "operation driver");
 		join_all_way!(self.secondary_index_lifecycle, "secondary-index lifecycle");
@@ -950,6 +971,44 @@ impl RestoreValidationStatus {
 				Some("RecoveringAfterUncleanShutdown".to_string())
 			}
 			Self::Failed(reason) => Some(reason.clone()),
+		}
+	}
+}
+
+/// ADR 0706: one lifecycle service's bounded stop (its stop already
+/// signalled). Past `deadline` it is aborted, then joined.
+async fn drain_lifecycle_service(
+	handle: Option<JoinHandle<()>>,
+	deadline: tokio::time::Instant,
+	label: &str,
+) -> std::io::Result<()> {
+	let Some(mut handle) = handle else {
+		return Ok(());
+	};
+	match tokio::time::timeout_at(deadline, &mut handle).await {
+		Ok(Ok(())) => Ok(()),
+		Ok(Err(err)) if err.is_cancelled() => Ok(()),
+		Ok(Err(err)) => Err(Error::other(format!(
+			"{label} task failed while it drained: {err}"
+		))),
+		Err(_elapsed) => {
+			handle.abort();
+			match handle.await {
+				Err(err) if err.is_panic() => Err(Error::other(format!(
+					"{label} task failed while it drained: {err}"
+				))),
+				// Aborted (or finished at the deadline): the close is not orderly.
+				_ => {
+					tracing::error!(
+						service = label,
+						"a lifecycle service did not stop within its bound; aborted"
+					);
+					Err(Error::new(
+						ErrorKind::TimedOut,
+						format!("{label} did not stop within the lifecycle drain bound; aborted"),
+					))
+				}
+			}
 		}
 	}
 }
@@ -2878,18 +2937,20 @@ impl WendelonNode {
 		let lifecycle = self.lifecycle;
 		let transport_servers = self.transport_servers;
 		let mut handles = self.handles;
-		// ADR 0699 S5a: the decision maintenance loop stops between steps, while
-		// Raft still runs, so an orderly close never interrupts a lifecycle
-		// permit.
+		// ADR 0699 S5a, ADR 0706: the lifecycle services (decision maintenance
+		// and LSM compaction, whose certified steps hold lifecycle permits) stop
+		// between steps, while Raft, the committer and the transports still
+		// run, so an orderly close never interrupts a permit. Both are signalled
+		// before either is awaited, then drained under one shared deadline.
 		self.data_server.stop_decision_maintenance();
-		handles.drain_decision_maintenance().await;
+		handles.lsm_compaction_control.stop();
+		let mut first_error = handles.drain_lifecycle_services().await.err();
 		lifecycle.begin_drain();
 		for server in &transport_servers {
 			server.begin_drain();
 		}
-		let mut first_error = None;
 		if let Err(error) = self.raft.shutdown().await {
-			first_error = Some(Error::other(format!("Raft shutdown: {error}")));
+			first_error.get_or_insert(Error::other(format!("Raft shutdown: {error}")));
 		}
 		if let Err(error) = handles.shutdown().await {
 			first_error.get_or_insert(error);

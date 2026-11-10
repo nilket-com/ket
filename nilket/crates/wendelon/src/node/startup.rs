@@ -1105,10 +1105,11 @@ impl NodeHandlesBuilder {
 				.migration_sweeper
 				.take()
 				.expect("validated complete startup handle set"),
-			lsm_compaction: self
-				.lsm_compaction
-				.take()
-				.expect("validated complete startup handle set"),
+			lsm_compaction: Some(
+				self.lsm_compaction
+					.take()
+					.expect("validated complete startup handle set"),
+			),
 			lsm_compaction_control: self
 				.lsm_compaction_control
 				.take()
@@ -1140,6 +1141,7 @@ impl NodeHandlesBuilder {
 				.take()
 				.expect("validated complete startup handle set"),
 			decision_maintenance: self.decision_maintenance.take(),
+			lifecycle_drain_bound: crate::node::LIFECYCLE_SERVICES_DRAIN,
 		})
 	}
 	fn into_named(mut self) -> Vec<(&'static str, JoinHandle<()>)> {

@@ -35,7 +35,12 @@ impl WendelonDataServer {
 			return Ok(0);
 		}
 		#[cfg(test)]
-		if self.cleanup_paused_for_test() {
+		if self.cleanup_paused_for_test()
+			|| self
+				.decisions
+				.pause_local_cleanup
+				.load(std::sync::atomic::Ordering::Acquire)
+		{
 			return Ok(0);
 		}
 		self.under_permit(self.certified_cleanup_work()).await
@@ -299,6 +304,11 @@ impl WendelonDataServer {
 			Some(owner) => Some(owner.lifecycle_permit()?),
 			None => None,
 		};
+		#[cfg(test)]
+		let held = self
+			.decisions
+			.pause_at(super::child_writes::PauseStage::CertifiedLsmStep)
+			.await;
 		let state = self.state_machine.state_snapshot().await;
 		let result = self
 			.slab
@@ -313,6 +323,17 @@ impl WendelonDataServer {
 			.await;
 		if let Some(permit) = permit {
 			permit.complete();
+		}
+		#[cfg(test)]
+		if held {
+			self.decisions.held_outcomes.lock().unwrap().push(
+				super::child_writes::HeldStepOutcome::Lsm(
+					result
+						.as_ref()
+						.map(Clone::clone)
+						.map_err(ToString::to_string),
+				),
+			);
 		}
 		result
 	}
@@ -355,6 +376,11 @@ impl WendelonDataServer {
 			Some(owner) => Some(owner.lifecycle_permit()?),
 			None => None,
 		};
+		#[cfg(test)]
+		let held = self
+			.decisions
+			.pause_at(super::child_writes::PauseStage::CertifiedTierStep)
+			.await;
 		let state = self.state_machine.state_snapshot().await;
 		let result = self
 			.slab
@@ -362,6 +388,17 @@ impl WendelonDataServer {
 			.await;
 		if let Some(permit) = permit {
 			permit.complete();
+		}
+		#[cfg(test)]
+		if held {
+			self.decisions.held_outcomes.lock().unwrap().push(
+				super::child_writes::HeldStepOutcome::Tier(
+					result
+						.as_ref()
+						.map(Clone::clone)
+						.map_err(ToString::to_string),
+				),
+			);
 		}
 		result
 	}

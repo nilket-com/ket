@@ -148,6 +148,16 @@ impl Cluster {
 
 	/// Closes a node completely; whether the close recorded it clean.
 	async fn close(&mut self, id: u32) -> bool {
+		let (result, clean) = self.close_with_result(id).await;
+		result.unwrap();
+		clean
+	}
+
+	/// Closes a node, bounded; the close's own result and whether it recorded
+	/// the directory clean. Only a control that drives a close past its drain
+	/// bound on purpose inspects the error; every other close goes through
+	/// `close`, which requires success.
+	async fn close_with_result(&mut self, id: u32) -> (std::io::Result<()>, bool) {
 		let at = self
 			.nodes
 			.iter()
@@ -156,11 +166,13 @@ impl Cluster {
 		let node = self.nodes.remove(at);
 		self.network
 			.unpublish(crate::schema::NodeId { id, _reserved: 0 });
-		tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown())
+		let result = tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown())
 			.await
-			.expect("a complete close")
-			.unwrap();
-		self.configs[&id].data_dir.join("CLEAN_SHUTDOWN").exists()
+			.expect("a complete close");
+		(
+			result,
+			self.configs[&id].data_dir.join("CLEAN_SHUTDOWN").exists(),
+		)
 	}
 
 	/// Stops a node with a complete close, which must record it clean.
@@ -3457,7 +3469,9 @@ async fn certified_cleanup_reclaims_the_obsolete_local_versions() {
 
 /// ADR 0699 S5b, CONTROLLED CLOCK: a cleanup interrupted before its rewrite
 /// (the close past its drain bound aborts it) revokes the clean record; the
-/// next start is unclean, proves its certified base, and reads exactly.
+/// close reports the interruption (ADR 0706: `TimedOut`, naming decision
+/// maintenance); the next start is unclean, proves its certified base, and
+/// reads exactly.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn an_interrupted_cleanup_is_proved_on_an_unclean_reopen() {
 	let (mut cluster, leader, descriptor) = ready().await;
@@ -3473,8 +3487,15 @@ async fn an_interrupted_cleanup_is_proved_on_an_unclean_reopen() {
 		.await
 		.expect("the cleanup reached its rewrite");
 	// Never released: the close drains for its bound, then aborts the step.
+	let (closed, clean) = cluster.close_with_result(follower).await;
+	let error = closed.expect_err("a close past its drain bound reports it");
+	assert_eq!(error.kind(), std::io::ErrorKind::TimedOut, "{error}");
 	assert!(
-		!cluster.close(follower).await,
+		error.to_string().contains("decision maintenance"),
+		"the interrupted service is named: {error}"
+	);
+	assert!(
+		!clean,
 		"an interrupted cleanup never records a clean shutdown"
 	);
 	cluster.reopen(follower).await;
@@ -4567,6 +4588,461 @@ async fn a_certified_rewrite_never_reissues_a_pruned_rows_location() {
 	}
 	assert!(!leader_l2.list("certified/").await.unwrap().is_empty());
 	drop(restarted);
+	for node in cluster.nodes {
+		let _ = tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown()).await;
+	}
+}
+
+/// ADR 0706: closes `id` with the real `Node::shutdown`, as `Cluster::close`
+/// does, while one of its certified steps holds its lifecycle permit at a test
+/// hold already reached. The close must not finish while the step is held,
+/// and Raft must still run and lead then; the step is released and the close
+/// must finish. Returns whether the close recorded the directory clean, and
+/// the held step's terminal return.
+async fn close_while_held(
+	cluster: &mut Cluster,
+	id: u32,
+	release: Arc<tokio::sync::Notify>,
+) -> (
+	bool,
+	crate::network::data_server::child_writes::HeldStepOutcome,
+) {
+	let outcomes = cluster
+		.node(id)
+		.data_server
+		.decision_peer_for_test()
+		.held_outcomes
+		.clone();
+	let at = cluster
+		.nodes
+		.iter()
+		.position(|node| node.local_node.id == id)
+		.unwrap();
+	let node = cluster.nodes.remove(at);
+	cluster
+		.network
+		.unpublish(crate::schema::NodeId { id, _reserved: 0 });
+	let raft = node.raft.clone();
+	let clean_record = cluster.configs[&id].data_dir.join("CLEAN_SHUTDOWN");
+	let mut closing = tokio::spawn(node.shutdown());
+	if let Ok(closed) = tokio::time::timeout(std::time::Duration::from_secs(2), &mut closing).await
+	{
+		panic!(
+			"the close finished while the step was held ({closed:?}); clean record: {}",
+			clean_record.exists()
+		);
+	}
+	assert!(
+		outcomes.lock().unwrap().is_empty(),
+		"the step is still held"
+	);
+	tokio::time::timeout(
+		std::time::Duration::from_secs(10),
+		raft.ensure_linearizable(),
+	)
+	.await
+	.expect("Raft answers while the close waits")
+	.expect("Raft still runs and leads while the close waits");
+	release.notify_one();
+	tokio::time::timeout(std::time::Duration::from_secs(30), closing)
+		.await
+		.expect("the close finished")
+		.unwrap()
+		.unwrap();
+	let mut outcomes = std::mem::take(&mut *outcomes.lock().unwrap());
+	assert_eq!(
+		outcomes.len(),
+		1,
+		"exactly the held step returned: {outcomes:?}"
+	);
+	(clean_record.exists(), outcomes.pop().unwrap())
+}
+
+/// ADR 0706 (acceptance 1, the certified tier step), CONTROLLED CLOCK: every
+/// member tiers to its own LocalFs object store. On the leader, S0 holds row 3
+/// (nothing to reclaim), S1 an obsolete version of row 1 and row 4 (each its
+/// own parent), S2 row 1's winner. After generation 1 the leader's LSM service
+/// runs its first certified tier step, which visits S1 first (its cursor
+/// starts at 0 and takes the ids above it first), held after it took its
+/// lifecycle permit; the leader's close begins then. The close waits for the
+/// step with Raft live, the released step publishes S1's certified rewrite
+/// (exactly row 4), the close records the directory clean, and the restarted
+/// leader is not in recovery, keeps the rewrite and reads exactly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn an_orderly_close_waits_for_a_held_certified_tier_step_and_records_clean() {
+	use crate::network::data_server::child_writes::{HeldStepOutcome, PauseStage};
+	use crate::storage::manager::certified_tier::CertifiedTierStep;
+	use std::sync::atomic::Ordering::Release;
+	let (mut cluster, leader, descriptor) = ready_with(Cluster::start_with(|id, cfg| {
+		let root = crate::test_support::TestDir::new(&format!("held-tier-l2-{id}"));
+		cfg.l2 = Some(crate::storage::ObjectStoreConfig::LocalFs {
+			root: root.to_path_buf(),
+		});
+		cfg.tiering.scan_interval = std::time::Duration::from_millis(200);
+		Some(root)
+	}))
+	.await;
+	let server = cluster.node(leader).data_server.clone();
+	let pause = server.decision_peer_for_test().pause_cleanup.clone();
+	pause.store(true, Release);
+	let slab = cluster.node(leader).slab.clone();
+	let now = std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.unwrap()
+		.as_millis() as u64;
+	let write = async |rows: &[(i64, &str)], what: &str| {
+		assert_committed(
+			&write_through(
+				&cluster,
+				leader,
+				write_meta(&descriptor, rows.len(), uuid_v7()),
+				named_rows(&descriptor, rows),
+			)
+			.await,
+			what,
+		);
+	};
+	write(&[(3, "x")], "S0").await;
+	let s0 = slab.force_seal_active_for_test().await;
+	write(&[(1, "a")], "S1's obsolete row").await;
+	write(&[(4, "y")], "S1's survivor").await;
+	let s1 = slab.force_seal_active_for_test().await;
+	write(&[(1, "b")], "S2 (the winner)").await;
+	let s2 = slab.force_seal_active_for_test().await;
+	let expected = Expected::from([
+		(1, "b".to_string()),
+		(3, "x".to_string()),
+		(4, "y".to_string()),
+	]);
+	let row_of = |id: i64| {
+		server
+			.row_identity_and_locality_for_test(
+				TenantId::ZERO,
+				&descriptor,
+				&named_rows(&descriptor, &[(id, "x")]),
+			)
+			.0
+	};
+	let (k1, k3, k4) = (row_of(1), row_of(3), row_of(4));
+	let (v1, v3, v4) = (
+		owned_versions(&cluster, leader, k1).await,
+		owned_versions(&cluster, leader, k3).await,
+		owned_versions(&cluster, leader, k4).await,
+	);
+	assert_eq!(
+		(v1.len(), v3.len(), v4.len()),
+		(2, 1, 1),
+		"every version owned"
+	);
+	let deadline = tokio::time::Instant::now() + BOUND;
+	for id in [s0, s1, s2] {
+		while slab.tier_pointer(id).await.is_none() {
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"slab {id:?} never tiered"
+			);
+			tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+		}
+	}
+	jump_floor(&cluster, now + 60_000).await;
+	until_active(&cluster, 1).await;
+	expect_everywhere(&cluster, &descriptor, &expected, "before the held step").await;
+	let index = slab.persistent_index().unwrap();
+	let debt: Vec<_> = index
+		.debt_page(None, 100)
+		.await
+		.unwrap()
+		.into_iter()
+		.map(|(key, _)| (crate::schema::Identity::new(key.key_identity), key.hlc))
+		.collect();
+	assert_eq!(debt, vec![(k1, v1[0])], "premise: the leader's debt");
+	let mut tiered: Vec<_> = slab
+		.list_tiered_slabs()
+		.await
+		.into_iter()
+		.map(|pointer| pointer.slab_id)
+		.collect();
+	tiered.sort();
+	assert_eq!(
+		(tiered, s0.get()),
+		(vec![s0, s1, s2], 0),
+		"premise: the leader's tiered slabs, S1 first after the cursor"
+	);
+	// The leader's next certified tier step holds after taking its permit.
+	let (reached, release) = server.pause_coordinator_for_test(PauseStage::CertifiedTierStep);
+	pause.store(false, Release);
+	drop(index);
+	drop(slab);
+	drop(server);
+	tokio::time::timeout(BOUND, reached.notified())
+		.await
+		.expect("the certified tier step holds its permit");
+	let (clean, outcome) = close_while_held(&mut cluster, leader, release).await;
+	let candidate = match outcome {
+		HeldStepOutcome::Tier(Ok(CertifiedTierStep::Rewritten {
+			slab, candidate, ..
+		})) if slab == s1 => candidate,
+		other => panic!("the held step's terminal return (S1 {s1:?}): {other:?}"),
+	};
+	assert!(clean, "the close recorded a clean shutdown");
+	cluster.reopen(leader).await;
+	until_settled(&cluster, &descriptor).await;
+	assert!(
+		!cluster.node(leader).recovered_after_unclean_shutdown(),
+		"a clean close: no recovery"
+	);
+	assert_eq!(
+		cluster.read_once_validated(leader, &descriptor).await,
+		expected,
+		"after the leader's restart"
+	);
+	expect_everywhere(&cluster, &descriptor, &expected, "after the restart").await;
+	let restarted = cluster.node(leader).slab.clone();
+	restarted.wait_tier_authority_ready().await.unwrap();
+	assert_eq!(
+		restarted
+			.tier_pointer(s1)
+			.await
+			.map(|pointer| pointer.l2_uri),
+		Some(candidate),
+		"the published rewrite stands"
+	);
+	let durable = restarted
+		.persistent_index()
+		.unwrap()
+		.load_snapshot()
+		.await
+		.unwrap();
+	let s1_rows: Vec<_> = durable
+		.record_rows
+		.iter()
+		.filter(|row| row.location.slab_id == s1)
+		.map(|row| (row.key_identity, row.location.hlc))
+		.collect();
+	assert_eq!(s1_rows, vec![(k4, v4[0])], "the exact survivor set");
+	let copies = |key, hlc| {
+		restarted
+			.version_locations(TenantId::ZERO, key, hlc)
+			.unwrap()
+			.len()
+	};
+	assert_eq!(
+		(
+			copies(k1, v1[0]),
+			copies(k1, v1[1]),
+			copies(k3, v3[0]),
+			copies(k4, v4[0])
+		),
+		(0, 1, 1, 1)
+	);
+	drop(durable);
+	drop(restarted);
+	for node in cluster.nodes {
+		let _ = tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown()).await;
+	}
+}
+
+/// How many indexed copies `slab` keeps of each version.
+fn stored(
+	slab: &Arc<SlabManager>,
+	versions: &[(crate::schema::Identity, HybridTimestamp)],
+) -> Vec<usize> {
+	versions
+		.iter()
+		.map(|(key, hlc)| {
+			slab.version_locations(TenantId::ZERO, *key, *hlc)
+				.unwrap()
+				.len()
+		})
+		.collect()
+}
+
+/// ADR 0706 (acceptance 1, the certified LSM step), CONTROLLED CLOCK: the
+/// leader holds five L0 runs (the default picker's count) carrying row 1's
+/// overwritten versions and row 2's deleted row; its local cleanup stays
+/// paused. After generation 1, and once its oldest run is past the default
+/// picker's age, the leader's LSM service runs its certified LSM step, held
+/// after it took its lifecycle permit; the leader's close begins then. The
+/// close waits with Raft live, the released step publishes a job eliding
+/// exactly the obsolete versions, the close records the directory clean, and
+/// the restarted leader is not in recovery, has no obsolete copy, keeps every
+/// winner and reads exactly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn an_orderly_close_waits_for_a_held_certified_lsm_step_and_records_clean() {
+	use crate::network::data_server::child_writes::{HeldStepOutcome, PauseStage};
+	use std::sync::atomic::Ordering::Release;
+	let (mut cluster, leader, descriptor) = ready().await;
+	let server = cluster.node(leader).data_server.clone();
+	let peer = server.decision_peer_for_test();
+	let (pause, pause_local) = (peer.pause_cleanup.clone(), peer.pause_local_cleanup.clone());
+	pause.store(true, Release);
+	pause_local.store(true, Release);
+	let slab = cluster.node(leader).slab.clone();
+	let now = std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.unwrap()
+		.as_millis() as u64;
+	let mut first_run = None;
+	for value in ["a", "b", "c"] {
+		assert_committed(
+			&write_through(
+				&cluster,
+				leader,
+				write_meta(&descriptor, 1, uuid_v7()),
+				named_rows(&descriptor, &[(1, value)]),
+			)
+			.await,
+			"an overwrite",
+		);
+		slab.force_seal_active_for_test().await;
+		first_run.get_or_insert_with(tokio::time::Instant::now);
+	}
+	assert_committed(
+		&write_through(
+			&cluster,
+			leader,
+			write_meta(&descriptor, 1, uuid_v7()),
+			named_rows(&descriptor, &[(2, "a")]),
+		)
+		.await,
+		"a row to delete",
+	);
+	slab.force_seal_active_for_test().await;
+	let row_of = |id: i64| {
+		server
+			.row_identity_and_locality_for_test(
+				TenantId::ZERO,
+				&descriptor,
+				&named_rows(&descriptor, &[(id, "x")]),
+			)
+			.0
+	};
+	let deleted = delete_through(&cluster, leader, delete_meta(&descriptor), vec![row_of(2)]).await;
+	assert_eq!(counts(&deleted), [1, 0, 0], "{deleted:?}");
+	slab.force_seal_active_for_test().await;
+	let expected = Expected::from([(1, "c".to_string())]);
+	expect_everywhere(&cluster, &descriptor, &expected, "before any generation").await;
+	let (one, two) = (row_of(1), row_of(2));
+	let ones = owned_versions(&cluster, leader, one).await;
+	let twos = owned_versions(&cluster, leader, two).await;
+	assert_eq!((ones.len(), twos.len()), (3, 2), "every version owned");
+	let obsolete = [(one, ones[0]), (one, ones[1]), (two, twos[0])];
+	let winners = [(one, ones[2]), (two, twos[1])];
+	jump_floor(&cluster, now + 60_000).await;
+	until_active(&cluster, 1).await;
+	// The default picker also wants its oldest L0 run five seconds old.
+	tokio::time::sleep_until(first_run.unwrap() + std::time::Duration::from_secs(6)).await;
+	assert_eq!(stored(&slab, &obsolete), [1, 1, 1], "premise: stored once");
+	// The leader's next certified LSM step holds after taking its permit.
+	let (reached, release) = server.pause_coordinator_for_test(PauseStage::CertifiedLsmStep);
+	pause.store(false, Release);
+	drop(slab);
+	drop(server);
+	tokio::time::timeout(BOUND, reached.notified())
+		.await
+		.expect("the certified LSM step holds its permit");
+	let (clean, outcome) = close_while_held(&mut cluster, leader, release).await;
+	let outcome = match outcome {
+		HeldStepOutcome::Lsm(Ok(Some(outcome))) => outcome,
+		other => panic!("the held step's terminal return: {other:?}"),
+	};
+	assert_eq!(
+		outcome.elided_versions,
+		obsolete.len() as u64,
+		"exactly the obsolete versions: {outcome:?}"
+	);
+	assert!(clean, "the close recorded a clean shutdown");
+	cluster.reopen(leader).await;
+	until_settled(&cluster, &descriptor).await;
+	assert!(
+		!cluster.node(leader).recovered_after_unclean_shutdown(),
+		"a clean close: no recovery"
+	);
+	assert_eq!(
+		cluster.read_once_validated(leader, &descriptor).await,
+		expected,
+		"after the leader's restart"
+	);
+	expect_everywhere(&cluster, &descriptor, &expected, "after the restart").await;
+	let restarted = cluster.node(leader).slab.clone();
+	assert_eq!(stored(&restarted, &obsolete), [0, 0, 0], "elided, durably");
+	assert_eq!(stored(&restarted, &winners), [1, 1], "every winner stays");
+	drop(restarted);
+	for node in cluster.nodes {
+		let _ = tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown()).await;
+	}
+}
+
+/// ADR 0706 (acceptance 2): a certified step held and never released, with
+/// the lifecycle drain bound shortened: the close aborts the LSM service at
+/// the bound and joins it, reports the interruption, never records the
+/// directory clean, and the next start is unclean and validates before it
+/// reads exactly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_close_past_the_drain_bound_aborts_a_held_step_and_records_unclean() {
+	use crate::network::data_server::child_writes::PauseStage;
+	let (mut cluster, leader, descriptor) = ready().await;
+	assert_committed(
+		&write_through(
+			&cluster,
+			leader,
+			write_meta(&descriptor, 1, uuid_v7()),
+			named_rows(&descriptor, &[(1, "a")]),
+		)
+		.await,
+		"a row",
+	);
+	let expected = Expected::from([(1, "a".to_string())]);
+	let server = cluster.node(leader).data_server.clone();
+	let outcomes = server.decision_peer_for_test().held_outcomes.clone();
+	let (reached, _never_released) =
+		server.pause_coordinator_for_test(PauseStage::CertifiedLsmStep);
+	drop(server);
+	tokio::time::timeout(BOUND, reached.notified())
+		.await
+		.expect("the certified LSM step holds its permit");
+	let at = cluster
+		.nodes
+		.iter()
+		.position(|node| node.local_node.id == leader)
+		.unwrap();
+	let mut node = cluster.nodes.remove(at);
+	cluster.network.unpublish(crate::schema::NodeId {
+		id: leader,
+		_reserved: 0,
+	});
+	let bound = std::time::Duration::from_secs(2);
+	node.handles.set_lifecycle_drain_bound_for_test(bound);
+	let started = tokio::time::Instant::now();
+	let error = tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown())
+		.await
+		.expect("a bounded close")
+		.expect_err("an interrupted close is not orderly");
+	assert!(started.elapsed() >= bound, "it waited for the bound");
+	assert_eq!(error.kind(), std::io::ErrorKind::TimedOut, "{error}");
+	assert!(error.to_string().contains("LSM compaction"), "{error}");
+	assert!(
+		outcomes.lock().unwrap().is_empty(),
+		"the interrupted step never reached a terminal return"
+	);
+	assert!(
+		!cluster.configs[&leader]
+			.data_dir
+			.join("CLEAN_SHUTDOWN")
+			.exists(),
+		"an interrupted step's permit revoked the clean record"
+	);
+	cluster.reopen(leader).await;
+	until_settled(&cluster, &descriptor).await;
+	assert!(
+		cluster.node(leader).recovered_after_unclean_shutdown(),
+		"the next start is unclean"
+	);
+	assert_eq!(
+		cluster.read_once_validated(leader, &descriptor).await,
+		expected,
+		"validated, then exact"
+	);
 	for node in cluster.nodes {
 		let _ = tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown()).await;
 	}

@@ -11,7 +11,7 @@ use crate::storage::retention::{MvccRetentionPolicy, effective_table_retention};
 use crate::storage::slab_pins::{AcquireError, SlabPinGuard, SlabPinTable};
 use async_trait::async_trait;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::task::JoinHandle;
 
@@ -91,9 +91,25 @@ pub trait LsmGcDriver: Send + Sync {
 	async fn run_lsm_gc_tick(&self, worker: &LsmGcWorker) -> std::io::Result<Vec<SlabId>>;
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct LsmCompactionServiceControl {
 	paused: Arc<AtomicBool>,
+	/// ADR 0706: sticky; set once, at close. It wakes a sleeping or paused
+	/// service, and a service that observed it admits no new tick. A tick
+	/// admitted before finishes: it is never selected against.
+	stop: Arc<tokio::sync::watch::Sender<bool>>,
+	/// Ticks admitted to the driver, ever.
+	admitted: Arc<AtomicU64>,
+}
+
+impl Default for LsmCompactionServiceControl {
+	fn default() -> Self {
+		Self {
+			paused: Arc::default(),
+			stop: Arc::new(tokio::sync::watch::channel(false).0),
+			admitted: Arc::default(),
+		}
+	}
 }
 
 impl LsmCompactionServiceControl {
@@ -107,6 +123,21 @@ impl LsmCompactionServiceControl {
 
 	pub fn is_paused(&self) -> bool {
 		self.paused.load(Ordering::SeqCst)
+	}
+
+	/// ADR 0706: asks the service to stop after its current tick, if any.
+	/// Sticky: no resume undoes it.
+	pub fn stop(&self) {
+		self.stop.send_replace(true);
+	}
+
+	pub fn is_stopped(&self) -> bool {
+		*self.stop.borrow()
+	}
+
+	/// How many ticks the service has admitted to its driver.
+	pub fn admitted_ticks(&self) -> u64 {
+		self.admitted.load(Ordering::SeqCst)
 	}
 }
 
@@ -136,17 +167,30 @@ where
 		&self,
 		now: HybridTimestamp,
 	) -> Result<Option<CompactionOutcome>, CompactionFailure> {
-		if self.control.is_paused() {
+		// ADR 0706: the admission boundary. A stopped or paused service admits
+		// no tick; one admitted here runs to its own end, whatever arrives later.
+		if self.control.is_stopped() || self.control.is_paused() {
 			return Ok(None);
 		}
+		self.control.admitted.fetch_add(1, Ordering::SeqCst);
 		self.driver.run_lsm_compaction_tick(&self.worker, now).await
 	}
 
+	/// The service loop. ADR 0706: its stop wakes the wait between ticks and
+	/// ends the loop there; it is never selected against a running tick, so a
+	/// close drains the tick (and the lifecycle permits its steps hold).
 	pub fn spawn(self) -> JoinHandle<()> {
 		tokio::spawn(async move {
 			let tick = Duration::from_millis(self.worker.config().lsm_picker_tick_millis.max(1));
+			let mut stop = self.control.stop.subscribe();
 			loop {
-				tokio::time::sleep(tick).await;
+				let stopping = tokio::select! {
+					_ = tokio::time::sleep(tick) => false,
+					_ = stop.wait_for(|stopping| *stopping) => true,
+				};
+				if stopping {
+					return;
+				}
 				if let Err(err) = self.tick_once(lsm_service_now_hlc()).await {
 					tracing::warn!(error = %err, "LSM compaction service tick failed");
 				}

@@ -974,6 +974,10 @@ pub(crate) struct DecisionPeer {
 	/// LSM step are paused, so a test drives certified LSM itself.
 	#[cfg(test)]
 	pub(crate) pause_cleanup: Arc<std::sync::atomic::AtomicBool>,
+	/// Test-only (ADR 0706): only the local certified cleanup step is paused,
+	/// so a held certified LSM job is the only work on its slabs.
+	#[cfg(test)]
+	pub(crate) pause_local_cleanup: Arc<std::sync::atomic::AtomicBool>,
 	/// Test-only: a KV key read as if at another position, the seam for a
 	/// different key at the same position.
 	#[cfg(test)]
@@ -989,6 +993,9 @@ pub(crate) struct DecisionPeer {
 			)>,
 		>,
 	>,
+	/// Test-only (ADR 0706): what each held certified step returned.
+	#[cfg(test)]
+	pub(crate) held_outcomes: Arc<std::sync::Mutex<Vec<HeldStepOutcome>>>,
 }
 
 /// Where a test may pause a coordinated write.
@@ -1012,12 +1019,28 @@ pub(crate) enum PauseStage {
 	/// In a cleanup step, after its plan reclaims something and before the
 	/// rewrite.
 	CleanupBeforeRewrite,
+	/// ADR 0706: in the leader's certified tier step, holding its lifecycle
+	/// permit, before its work.
+	CertifiedTierStep,
+	/// ADR 0706: in the leader's certified LSM step, holding its lifecycle
+	/// permit, before its work.
+	CertifiedLsmStep,
+}
+
+/// Test-only (ADR 0706): the terminal return of a certified step that a test
+/// held, recorded after its permit completed.
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) enum HeldStepOutcome {
+	Tier(Result<crate::storage::manager::certified_tier::CertifiedTierStep, String>),
+	Lsm(Result<Option<crate::storage::CompactionOutcome>, String>),
 }
 
 #[cfg(test)]
 impl DecisionPeer {
-	/// Pauses here if the next queued pause is for this stage.
-	pub(crate) async fn pause_at(&self, stage: PauseStage) {
+	/// Pauses here if the next queued pause is for this stage; whether it
+	/// did.
+	pub(crate) async fn pause_at(&self, stage: PauseStage) -> bool {
 		let next = {
 			let mut queue = self.pauses.lock().unwrap();
 			match queue.front() {
@@ -1025,9 +1048,13 @@ impl DecisionPeer {
 				_ => None,
 			}
 		};
-		if let Some((_, reached, release)) = next {
-			reached.notify_one();
-			release.notified().await;
+		match next {
+			Some((_, reached, release)) => {
+				reached.notify_one();
+				release.notified().await;
+				true
+			}
+			None => false,
 		}
 	}
 }
@@ -1045,6 +1072,8 @@ impl Default for DecisionPeer {
 			debt_cursor: Default::default(),
 			#[cfg(test)]
 			pauses: Default::default(),
+			#[cfg(test)]
+			held_outcomes: Default::default(),
 			behind_boundary: Default::default(),
 			base_validated: Default::default(),
 			#[cfg(test)]
@@ -1063,6 +1092,8 @@ impl Default for DecisionPeer {
 			fail_copy_read_once: Default::default(),
 			#[cfg(test)]
 			pause_cleanup: Default::default(),
+			#[cfg(test)]
+			pause_local_cleanup: Default::default(),
 			#[cfg(test)]
 			kv_position_override: Default::default(),
 		}

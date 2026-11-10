@@ -1618,7 +1618,10 @@ async fn pd25_healthy_handoff_preserves_base_task_census_and_clean_shutdown() {
 			"migration_sweeper",
 			node.handles.migration_sweeper.abort_handle(),
 		),
-		("lsm_compaction", node.handles.lsm_compaction.abort_handle()),
+		(
+			"lsm_compaction",
+			node.handles.lsm_compaction.as_ref().unwrap().abort_handle(),
+		),
 		("lsm_gc", node.handles.lsm_gc.abort_handle()),
 		(
 			"secondary_index_lifecycle",
