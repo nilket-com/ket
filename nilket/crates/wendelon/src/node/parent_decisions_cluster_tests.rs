@@ -5567,3 +5567,558 @@ async fn the_maintenance_stop_never_cancels_an_ordinary_proposal() {
 		let _ = tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown()).await;
 	}
 }
+
+/// DC-206: a table write coordinated at a follower forwards its Reserve to
+/// the leader, whose handling is held once the request has arrived. The
+/// follower must still answer the client within [`UNKNOWN_ANSWER_BOUND`] with
+/// a typed unknown outcome (WRITE_STALLED, commit knowledge INDETERMINATE),
+/// never a refusal or a known non-commit. The hold is released, the original
+/// attempt allowed to end, the same identity retried to its recorded outcome
+/// and every node closed before anything is asserted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_follower_coordinated_write_answers_unknown_while_the_leader_holds_its_reserve() {
+	use crate::network::decision_proposals::{ForwardedDecision, ForwardedHold};
+	/// How long the client waits for the follower's answer once its Reserve
+	/// is shown held at the leader: above the remote round trip's proposed
+	/// bound, with margin for scheduling under suite load.
+	const UNKNOWN_ANSWER_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+	/// Releases the leader's held handling when dropped, so no failure path
+	/// leaves the handler parked.
+	struct ReleaseOnDrop(Arc<tokio::sync::Notify>);
+	impl Drop for ReleaseOnDrop {
+		fn drop(&mut self) {
+			self.0.notify_one();
+		}
+	}
+
+	let (cluster, leader, descriptor) = ready().await;
+	let (id, primary) = row_off_the_leader(&cluster, leader, &descriptor, 1).await;
+	let meta = write_meta(&descriptor, 1, uuid_v7());
+	let key = key_of(&descriptor, &meta);
+	let batch = rows(&descriptor, &[id]);
+	let (reached, release, held) = (
+		Arc::new(tokio::sync::Notify::new()),
+		Arc::new(tokio::sync::Notify::new()),
+		Arc::new(std::sync::Mutex::new(None)),
+	);
+	cluster
+		.node(leader)
+		.data_server
+		.decision_peer_for_test()
+		.proposals
+		.as_ref()
+		.unwrap()
+		.hold_forwarded_for_test(ForwardedHold {
+			sender: primary,
+			matches: |request| matches!(request, ForwardedDecision::Reserve { .. }),
+			reached: reached.clone(),
+			release: release.clone(),
+			held: held.clone(),
+		});
+	let release = ReleaseOnDrop(release);
+	let server = cluster.node(primary).data_server.clone();
+	let mut write = tokio::spawn({
+		let batch = batch.clone();
+		async move { server.table_write_for_test(meta, batch).await }
+	});
+	tokio::select! {
+		_ = reached.notified() => {}
+		early = &mut write => panic!("the write answered before its Reserve reached the leader: {:?}",
+			early.map(|result| result.map(|(response, _)| response))),
+		_ = tokio::time::sleep(BOUND) => panic!("the follower's Reserve never reached the leader's handler"),
+	}
+	assert!(
+		matches!(
+			held.lock().unwrap().as_ref(),
+			Some(ForwardedDecision::Reserve { claim }) if claim.body.key == key
+		),
+		"the held request is this write's Reserve"
+	);
+
+	let answer = tokio::time::timeout(UNKNOWN_ANSWER_BOUND, &mut write).await;
+	drop(release);
+	// Settle on every path before asserting.
+	let original = match &answer {
+		Ok(_) => None,
+		Err(_) => Some(
+			tokio::time::timeout(BOUND, &mut write)
+				.await
+				.map(|joined| joined.map(|result| result.map(|(response, _)| response))),
+		),
+	};
+	let retried = write_through(&cluster, primary, meta, batch).await;
+	for node in cluster.nodes {
+		let _ = tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown()).await;
+	}
+
+	let Ok(answer) = answer else {
+		panic!(
+			"no answer within {UNKNOWN_ANSWER_BOUND:?} while the leader held the follower's \
+			 forwarded Reserve; after the release the original attempt gave {original:?}"
+		);
+	};
+	let (response, _) = answer.unwrap().unwrap();
+	assert_eq!(
+		response.write.status,
+		WriteStatus::WRITE_STALLED,
+		"{response:?}"
+	);
+	assert_eq!(
+		response.write.mutation_commit_knowledge(),
+		MutationCommitKnowledge::INDETERMINATE,
+		"{response:?}"
+	);
+	assert_committed(&retried, "the same identity, retried after the release");
+}
+
+/// DC-206: how long past the remote decision RPC deadline a follower's typed
+/// unknown answer may take, for scheduling under suite load.
+const UNKNOWN_ANSWER_MARGIN: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Every applied parent record under `key`, at the leader.
+async fn records_of(
+	cluster: &Cluster,
+	key: ParentKey,
+) -> Vec<crate::consensus::decisions::ParentRecord> {
+	let leader = cluster.leader().await;
+	cluster
+		.node(leader)
+		.state_machine
+		.read_state(move |state| {
+			state
+				.decisions
+				.as_ref()
+				.map(|decisions| {
+					decisions
+						.bodies()
+						.values()
+						.filter(|body| body.claim.key == key)
+						.cloned()
+						.collect()
+				})
+				.unwrap_or_default()
+		})
+		.await
+}
+
+/// Which forwarded proposal of a follower-coordinated write the leader holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HeldForward {
+	Reserve,
+	Finalize,
+}
+
+/// DC-206 (acceptance 2): the leader holds one forwarded proposal of a write
+/// coordinated at a follower. The first attempt answers WRITE_STALLED with
+/// INDETERMINATE within the deadline and its margin. No lower bound: the
+/// timer starts after the reached handshake, while the RPC's own deadline
+/// started before it connected. Released, the held
+/// proposal commits late; the same original identity, retried, reaches that
+/// one record: one parent, one committed write at the recorded decision, and
+/// exactly the written row at every node.
+async fn a_held_forward_answers_unknown_and_its_retry_reaches_the_one_record(stage: HeldForward) {
+	use crate::network::decision_proposals::{
+		DECISION_RPC_DEADLINE, ForwardedDecision, ForwardedHold,
+	};
+	/// Releases the leader's held handling when dropped.
+	struct ReleaseOnDrop(Arc<tokio::sync::Notify>);
+	impl Drop for ReleaseOnDrop {
+		fn drop(&mut self) {
+			self.0.notify_one();
+		}
+	}
+
+	let (cluster, leader, descriptor) = ready().await;
+	let (id, primary) = row_off_the_leader(&cluster, leader, &descriptor, 1).await;
+	let meta = write_meta(&descriptor, 1, uuid_v7());
+	let key = key_of(&descriptor, &meta);
+	let batch = named_rows(&descriptor, &[(id, "a")]);
+	let (reached, release, held) = (
+		Arc::new(tokio::sync::Notify::new()),
+		Arc::new(tokio::sync::Notify::new()),
+		Arc::new(std::sync::Mutex::new(None)),
+	);
+	let matches: fn(&ForwardedDecision) -> bool = match stage {
+		HeldForward::Reserve => |request| matches!(request, ForwardedDecision::Reserve { .. }),
+		HeldForward::Finalize => |request| matches!(request, ForwardedDecision::Finalize { .. }),
+	};
+	cluster
+		.node(leader)
+		.data_server
+		.decision_peer_for_test()
+		.proposals
+		.as_ref()
+		.unwrap()
+		.hold_forwarded_for_test(ForwardedHold {
+			sender: primary,
+			matches,
+			reached: reached.clone(),
+			release: release.clone(),
+			held: held.clone(),
+		});
+	let release = ReleaseOnDrop(release);
+	let server = cluster.node(primary).data_server.clone();
+	let mut write = tokio::spawn({
+		let batch = batch.clone();
+		async move { server.table_write_for_test(meta, batch).await }
+	});
+	tokio::select! {
+		_ = reached.notified() => {}
+		early = &mut write => panic!("{stage:?}: the write answered before its forward reached the leader: {:?}",
+			early.map(|result| result.map(|(response, _)| response))),
+		_ = tokio::time::sleep(BOUND) => panic!("{stage:?}: the forward never reached the leader's handler"),
+	}
+	let held = held.lock().unwrap().clone();
+	let held_claim = match (&held, stage) {
+		(Some(ForwardedDecision::Reserve { claim }), HeldForward::Reserve)
+			if claim.body.key == key =>
+		{
+			Some(claim.body.clone())
+		}
+		(Some(ForwardedDecision::Finalize { key: held_key, .. }), HeldForward::Finalize)
+			if *held_key == key =>
+		{
+			None
+		}
+		other => panic!("{stage:?}: the held request is not this write's: {other:?}"),
+	};
+
+	let started = tokio::time::Instant::now();
+	let first =
+		tokio::time::timeout(DECISION_RPC_DEADLINE + UNKNOWN_ANSWER_MARGIN, &mut write).await;
+	let first_after = started.elapsed();
+	drop(release);
+	// Settle before asserting: the original attempt ends, the held proposal
+	// commits late, and the same identity is retried to its record.
+	let original = match &first {
+		Ok(_) => None,
+		Err(_) => Some(
+			tokio::time::timeout(BOUND, &mut write)
+				.await
+				.map(|joined| joined.map(|result| result.map(|(response, _)| response))),
+		),
+	};
+	let late_deadline = tokio::time::Instant::now() + BOUND;
+	let late = loop {
+		let records = records_of(&cluster, key).await;
+		let landed = records.first().is_some_and(|record| match stage {
+			HeldForward::Reserve => true,
+			HeldForward::Finalize => matches!(record.status, ParentStatus::Accepted { .. }),
+		});
+		if landed || tokio::time::Instant::now() >= late_deadline {
+			break records;
+		}
+		tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+	};
+	let retried = write_through(&cluster, primary, meta, batch).await;
+	let records = records_of(&cluster, key).await;
+	let mut reads = Vec::new();
+	for node in NODES {
+		reads.push((node, read_at(&cluster, node, &descriptor).await));
+	}
+	for node in cluster.nodes {
+		let _ = tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown()).await;
+	}
+
+	let Ok(first) = first else {
+		panic!(
+			"{stage:?}: no answer within {:?} while the leader held the forward; after the \
+			 release the original attempt gave {original:?}",
+			DECISION_RPC_DEADLINE + UNKNOWN_ANSWER_MARGIN
+		);
+	};
+	let (first, _) = first.unwrap().unwrap();
+	assert_eq!(
+		(first.write.status, first.write.mutation_commit_knowledge()),
+		(
+			WriteStatus::WRITE_STALLED,
+			MutationCommitKnowledge::INDETERMINATE
+		),
+		"{stage:?}: the first attempt, after {first_after:?}: {first:?}"
+	);
+	match stage {
+		HeldForward::Reserve => assert_eq!(
+			late.first().map(|record| &record.claim),
+			held_claim.as_ref(),
+			"{stage:?}: the held Reserve committed late as the recorded claim"
+		),
+		HeldForward::Finalize => assert!(
+			late.first()
+				.is_some_and(|record| matches!(record.status, ParentStatus::Accepted { .. })),
+			"{stage:?}: the held Finalize committed late: {late:?}"
+		),
+	}
+	assert_committed(&retried, &format!("{stage:?}: the same identity, retried"));
+	assert_eq!(records.len(), 1, "{stage:?}: one parent: {records:?}");
+	assert_eq!(
+		records[0].status,
+		ParentStatus::Accepted {
+			dec: retried.write.log_index
+		},
+		"{stage:?}: the retry answered the one recorded decision"
+	);
+	let expected: Expected = [(id, "a".to_string())].into();
+	for (node, answer) in reads {
+		assert_eq!(
+			answer.status,
+			Some(crate::schema::ReadStatus::OK),
+			"{stage:?}: at {node}: {answer:?}"
+		);
+		assert_eq!(answered(&answer), expected, "{stage:?}: at {node}");
+	}
+}
+
+/// DC-206 (acceptance 2): the held forwarded Reserve.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_reserve_held_past_the_deadline_is_unknown_and_its_retry_reaches_the_one_record() {
+	a_held_forward_answers_unknown_and_its_retry_reaches_the_one_record(HeldForward::Reserve).await;
+}
+
+/// DC-206 (acceptance 2): the held forwarded Finalize.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_finalize_held_past_the_deadline_is_unknown_and_its_retry_reaches_the_one_record() {
+	a_held_forward_answers_unknown_and_its_retry_reaches_the_one_record(HeldForward::Finalize)
+		.await;
+}
+
+/// DC-206 (acceptance 2, the normal path): a write coordinated at a follower
+/// whose forwards the leader answers in time commits on its first attempt, at
+/// its one recorded decision, and reads back exactly everywhere.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_follower_coordinated_write_answered_in_time_commits_on_its_first_attempt() {
+	let (cluster, leader, descriptor) = ready().await;
+	let (id, primary) = row_off_the_leader(&cluster, leader, &descriptor, 1).await;
+	let meta = write_meta(&descriptor, 1, uuid_v7());
+	let key = key_of(&descriptor, &meta);
+	let (response, _) = cluster
+		.node(primary)
+		.data_server
+		.table_write_for_test(meta, named_rows(&descriptor, &[(id, "a")]))
+		.await
+		.unwrap();
+	assert_committed(&response, "the first attempt");
+	let records = records_of(&cluster, key).await;
+	assert_eq!(records.len(), 1, "one parent: {records:?}");
+	assert_eq!(
+		records[0].status,
+		ParentStatus::Accepted {
+			dec: response.write.log_index
+		}
+	);
+	expect_everywhere(
+		&cluster,
+		&descriptor,
+		&[(id, "a".to_string())].into(),
+		"answered in time",
+	)
+	.await;
+	for node in cluster.nodes {
+		let _ = tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown()).await;
+	}
+}
+
+/// DC-206 (acceptance 3): the remote decision RPC's one deadline covers the
+/// whole transport sequence. With the follower's own maintenance stopped, so
+/// only this control's RPCs leave it:
+/// - a leader that accepts the follower's streams and reads each request but
+///   never answers ends a forwarded lookup and a cut `Indeterminate`, each
+///   no earlier than the deadline and within its margin; once the leader
+///   answers again the same cached connection (no new dial) serves both;
+/// - a dial held in its connect stage ends a cut the same way, and the next
+///   cut dials again and is answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_silent_leader_ends_a_forwarded_lookup_and_cut_unknown_within_the_deadline() {
+	use crate::network::decision_proposals::{
+		CutResponse, DECISION_RPC_DEADLINE, LookupRequest, LookupResponse,
+	};
+	use crate::simulator::network::{
+		InjectedSimulatedTransportFault, SimulatedTransportEventKind,
+		SimulatedTransportFaultAction, SimulatedTransportFaultOp,
+	};
+	use std::sync::atomic::{AtomicUsize, Ordering};
+	/// Accepts every stream and reads its request, but answers none until
+	/// released; then each handler ends without an answer. Counts the lookups
+	/// and cuts it read from `from`.
+	struct SilentPeer {
+		from: u32,
+		lookups: AtomicUsize,
+		cuts: AtomicUsize,
+		released: tokio::sync::watch::Receiver<bool>,
+	}
+	#[async_trait::async_trait]
+	impl crate::network::server::HrftService for SilentPeer {
+		async fn handle_frame(
+			&self,
+			_context: crate::network::server::RequestContext,
+			_frame: crate::network::core::HrftFrame,
+		) -> std::io::Result<Option<crate::network::core::HrftFrame>> {
+			let _ = self.released.clone().wait_for(|released| *released).await;
+			Err(std::io::Error::other("a silent peer answers nothing"))
+		}
+
+		async fn handle_stream(
+			&self,
+			mut stream: Box<dyn crate::network::transport::TransportStream>,
+			pool: Arc<crate::network::pool::BufPool>,
+			context: crate::network::server::RequestContext,
+		) -> std::io::Result<()> {
+			let frame = crate::network::core::read_frame(&mut *stream, &pool).await?;
+			if context.remote.map(|node| node.id) == Some(self.from) {
+				let msg_type = frame.header.msg_type;
+				if msg_type == crate::schema::MsgType::DECISION_LOOKUP_REQ.0 {
+					self.lookups.fetch_add(1, Ordering::SeqCst);
+				} else if msg_type == crate::schema::MsgType::DECISION_CUT_REQ.0 {
+					self.cuts.fetch_add(1, Ordering::SeqCst);
+				}
+			}
+			self.handle_frame(context, frame).await.map(|_| ())
+		}
+	}
+	/// One RPC, timed, under an outer bound so a missing deadline fails here.
+	async fn timed<T>(
+		rpc: impl std::future::Future<Output = T>,
+	) -> (Option<T>, std::time::Duration) {
+		let started = tokio::time::Instant::now();
+		let outcome = tokio::time::timeout(DECISION_RPC_DEADLINE + UNKNOWN_ANSWER_MARGIN, rpc)
+			.await
+			.ok();
+		(outcome, started.elapsed())
+	}
+
+	let (cluster, leader, descriptor) = ready().await;
+	let follower = *NODES.iter().find(|node| **node != leader).unwrap();
+	cluster
+		.node(follower)
+		.data_server
+		.stop_decision_maintenance();
+	let proposals = cluster
+		.node(follower)
+		.data_server
+		.decision_proposals_for_test();
+	let lookup = || {
+		proposals.lookup(LookupRequest {
+			key: ParentKey {
+				tenant: TenantId::ZERO,
+				namespace: ParentNamespace::Table(descriptor.table_object_id),
+				client_uuid: uuid_v7(),
+				sequence_no: 1,
+			},
+			request_digest: [7; 32],
+			sent_ms: proposals.now_ms(),
+		})
+	};
+	let leader_id = node_id(leader);
+	let leader_service = cluster.node(leader).service.clone();
+	// The follower's connection to the leader is cached and answered.
+	assert!(
+		matches!(proposals.cut().await, CutResponse::Cut(_)),
+		"answered before"
+	);
+	cluster.network.clear_events();
+
+	let (release, released) = tokio::sync::watch::channel(false);
+	let silent = Arc::new(SilentPeer {
+		from: follower,
+		lookups: AtomicUsize::new(0),
+		cuts: AtomicUsize::new(0),
+		released,
+	});
+	cluster
+		.network
+		.publish(leader_id, &address(leader), silent.clone());
+	let (silent_lookup, lookup_after) = timed(lookup()).await;
+	let (silent_cut, cut_after) = timed(proposals.cut()).await;
+	let (lookups_read, cuts_read) = (
+		silent.lookups.load(Ordering::SeqCst),
+		silent.cuts.load(Ordering::SeqCst),
+	);
+	cluster
+		.network
+		.publish(leader_id, &address(leader), leader_service.clone());
+	release.send_replace(true);
+	let cut_again = timed(proposals.cut()).await.0;
+	let lookup_again = timed(lookup()).await.0;
+	let dialed_while_silent = cluster.network.events().iter().any(|event| {
+		event.source == Some(node_id(follower))
+			&& event.target == Some(leader_id)
+			&& event.kind == SimulatedTransportEventKind::Connect
+	});
+
+	// The connect stage: the follower's next dial to the leader is held.
+	cluster.network.inject(
+		InjectedSimulatedTransportFault::on(
+			SimulatedTransportFaultOp::Connect,
+			SimulatedTransportFaultAction::Delay(std::time::Duration::from_secs(3600)),
+		)
+		.from(node_id(follower))
+		.to(leader_id),
+	);
+	cluster.network.unpublish(leader_id);
+	let (held_dial_cut, dial_after) = timed(proposals.cut()).await;
+	cluster
+		.network
+		.publish(leader_id, &address(leader), leader_service);
+	let dial_was_held = cluster.network.events().iter().any(|event| {
+		event.source == Some(node_id(follower))
+			&& event.target == Some(leader_id)
+			&& matches!(
+				event.kind,
+				SimulatedTransportEventKind::Fault {
+					op: SimulatedTransportFaultOp::Connect,
+					..
+				}
+			)
+	});
+	let redialed_cut = timed(proposals.cut()).await.0;
+	for node in cluster.nodes {
+		let _ = tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown()).await;
+	}
+
+	let bound = DECISION_RPC_DEADLINE + UNKNOWN_ANSWER_MARGIN;
+	assert_eq!(lookups_read, 1, "the silent leader read the lookup");
+	assert_eq!(cuts_read, 1, "the silent leader read the cut");
+	assert!(
+		matches!(silent_lookup, Some(LookupResponse::Indeterminate(_))),
+		"the lookup to a silent leader, after {lookup_after:?} (bound {bound:?}): {silent_lookup:?}"
+	);
+	assert!(
+		lookup_after >= DECISION_RPC_DEADLINE,
+		"the lookup ended at {lookup_after:?}"
+	);
+	assert!(
+		matches!(silent_cut, Some(CutResponse::Indeterminate(_))),
+		"the cut to a silent leader, after {cut_after:?} (bound {bound:?}): {silent_cut:?}"
+	);
+	assert!(
+		cut_after >= DECISION_RPC_DEADLINE,
+		"the cut ended at {cut_after:?}"
+	);
+	assert!(
+		matches!(cut_again, Some(CutResponse::Cut(_))),
+		"a cut once the leader answers again: {cut_again:?}"
+	);
+	assert!(
+		matches!(lookup_again, Some(LookupResponse::Found(_))),
+		"a lookup once the leader answers again: {lookup_again:?}"
+	);
+	assert!(
+		!dialed_while_silent,
+		"the timed-out RPCs left the cached connection in use: no new dial"
+	);
+	assert!(
+		dial_was_held,
+		"the follower's dial reached its held connect"
+	);
+	assert!(
+		matches!(held_dial_cut, Some(CutResponse::Indeterminate(_))),
+		"the cut whose dial is held, after {dial_after:?} (bound {bound:?}): {held_dial_cut:?}"
+	);
+	assert!(
+		dial_after >= DECISION_RPC_DEADLINE,
+		"the held dial's cut ended at {dial_after:?}"
+	);
+	assert!(
+		matches!(redialed_cut, Some(CutResponse::Cut(_))),
+		"the next cut dials again and is answered: {redialed_cut:?}"
+	);
+}

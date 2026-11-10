@@ -241,6 +241,18 @@ impl DecisionClockSamples {
 /// ADR 0702: how long a time-bearing admission waits for the decision clock.
 pub(crate) const CLOCK_ADMISSION_WAIT: std::time::Duration = CLOCK_PROBE_TIMEOUT;
 
+/// The bound on one remote decision RPC attempt (a forwarded proposal, a
+/// lookup or a cut), from before connecting until the answer is read. A design
+/// value, not a measured latency guarantee:
+/// - above [`CLOCK_ADMISSION_WAIT`] and [`CLOCK_PROBE_TIMEOUT`] (2 s), so an
+///   answer delayed only by the leader's clock admission still arrives;
+/// - below the 15 s lifecycle drain bound, so a follower's base-validation cut
+///   cannot alone exhaust a drain.
+///
+/// It bounds one attempt only, never a whole write or a shutdown: an operation
+/// makes several calls and has other waits. Expiry is an unknown outcome.
+pub(crate) const DECISION_RPC_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// ADR 0702: what a waited admission decided.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ClockWait {
@@ -852,7 +864,14 @@ impl DecisionProposals {
 			.map_err(|error| Error::new(ErrorKind::TimedOut, error.to_string()))
 	}
 
-	/// One bounded request and response with the leader.
+	/// One request and response with the leader, the whole attempt bounded
+	/// by [`DECISION_RPC_DEADLINE`]: resolution and connection, opening the
+	/// stream, writing, finishing and reading the answer. The deadline is set
+	/// once, before the first of them, and never renewed. On expiry the
+	/// attempt ends with [`ErrorKind::TimedOut`] and drops only its own
+	/// stream; the shared connection stays usable. A timed-out attempt is an
+	/// unknown outcome: the leader may still have admitted the request and
+	/// may commit it later.
 	async fn round_trip<Q: Serialize, R: serde::de::DeserializeOwned>(
 		&self,
 		leader: u32,
@@ -860,6 +879,7 @@ impl DecisionProposals {
 		response_type: MsgType,
 		request: &Q,
 	) -> std::io::Result<R> {
+		let deadline = tokio::time::Instant::now() + DECISION_RPC_DEADLINE;
 		let meta = postcard::to_stdvec(request).map_err(Error::other)?;
 		*self.last_sent.lock().unwrap() = Some((leader, std::time::Instant::now()));
 		if meta.len() > MAX_DECISION_FRAME_BYTES {
@@ -868,37 +888,50 @@ impl DecisionProposals {
 				"decision frame exceeds its bound",
 			));
 		}
-		let conn = self
-			.factory
-			.get_connection(NodeId {
-				id: leader,
-				_reserved: 0,
-			})
-			.await?;
-		let mut stream = conn.open_bi().await?;
-		let header = FrameHeader {
-			magic: HRFT_MAGIC,
-			version: 1,
-			msg_type: request_type.0,
-			flags: 0,
-			stream_id: stream.stream_id() as u32,
-			meta_len: meta.len() as u32,
-			arrow_len: 0,
-			trailing_len: 0,
+		let attempt = async {
+			let conn = self
+				.factory
+				.get_connection(NodeId {
+					id: leader,
+					_reserved: 0,
+				})
+				.await?;
+			let mut stream = conn.open_bi().await?;
+			let header = FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: request_type.0,
+				flags: 0,
+				stream_id: stream.stream_id() as u32,
+				meta_len: meta.len() as u32,
+				arrow_len: 0,
+				trailing_len: 0,
+			};
+			write_frame(&mut *stream, &header, &meta, None, None).await?;
+			stream.finish().await?;
+			let frame = read_frame(&mut *stream, &self.pool).await?;
+			if frame.header.msg_type != response_type.0 {
+				return Err(Error::new(
+					ErrorKind::InvalidData,
+					format!(
+						"unexpected decision response 0x{:02x}",
+						frame.header.msg_type
+					),
+				));
+			}
+			decode_bounded(frame.meta.as_ref())
 		};
-		write_frame(&mut *stream, &header, &meta, None, None).await?;
-		stream.finish().await?;
-		let frame = read_frame(&mut *stream, &self.pool).await?;
-		if frame.header.msg_type != response_type.0 {
-			return Err(Error::new(
-				ErrorKind::InvalidData,
-				format!(
-					"unexpected decision response 0x{:02x}",
-					frame.header.msg_type
-				),
-			));
-		}
-		decode_bounded(frame.meta.as_ref())
+		tokio::time::timeout_at(deadline, attempt)
+			.await
+			.unwrap_or_else(|_| {
+				Err(Error::new(
+					ErrorKind::TimedOut,
+					format!(
+						"decision request 0x{:02x} to the leader {leader} had no answer within {:?}",
+						request_type.0, DECISION_RPC_DEADLINE
+					),
+				))
+			})
 	}
 }
 
