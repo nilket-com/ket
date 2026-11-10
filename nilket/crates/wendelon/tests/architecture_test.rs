@@ -12556,3 +12556,79 @@ fn an_unclassified_lifecycle_permit_site_fails_the_census() {
 	);
 	assert!(!moved.is_empty());
 }
+
+/// ADR 0707: decision maintenance proposes only through its stop-aware
+/// capability, its loop sees a ready stop before a ready tick, and the stop is
+/// never attached to the `DecisionProposals` shared with client RPCs. A
+/// classification guard; the behavioural controls are the evidence.
+#[test]
+fn decision_maintenance_proposes_only_through_its_stop_aware_path() {
+	let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let node = fs::read_to_string(src.join("node.rs")).unwrap();
+	let maintenance = source_region(
+		&node,
+		"let maintenance = crate::network::decision_proposals::MaintenanceProposals::new(",
+		"certified_cleanup_step",
+	);
+	let order: Vec<_> = [
+		"biased;",
+		"stop.wait_for(|stopping| *stopping)",
+		"ticker.tick()",
+	]
+	.iter()
+	.map(|step| {
+		maintenance
+			.find(step)
+			.unwrap_or_else(|| panic!("the maintenance loop lacks `{step}`"))
+	})
+	.collect();
+	assert!(
+		order.windows(2).all(|pair| pair[0] < pair[1]),
+		"a ready stop wins over a ready tick: {order:?}"
+	);
+	for step in [
+		"maintenance.ensure_signer_once(",
+		"maintenance.advance_floor_once()",
+		"maintenance\n\t\t\t\t\t\t\t.resolve_closed_once(",
+		"maintenance.generation_step()",
+		"data_server.certification_step(&maintenance)",
+	] {
+		assert!(
+			maintenance.contains(step),
+			"the maintenance loop proposes through its capability: `{step}`"
+		);
+	}
+	for direct in [
+		".propose(",
+		".commit(",
+		"proposals.ensure_signer_once",
+		"proposals.generation_step",
+	] {
+		assert!(
+			!maintenance.contains(direct),
+			"no maintenance proposal bypasses the stop: `{direct}`"
+		);
+	}
+	let certification =
+		fs::read_to_string(src.join("network/data_server/certification.rs")).unwrap();
+	assert!(!certification.contains(".propose("));
+	assert!(certification.contains("let _ = maintenance.report(report).await;"));
+	let proposals = fs::read_to_string(src.join("network/decision_proposals.rs")).unwrap();
+	assert!(
+		!brace_body(&proposals, "pub struct DecisionProposals").contains("watch::"),
+		"the maintenance stop is never stored in the shared proposal path"
+	);
+	let result = brace_body(&proposals, "pub(crate) enum MaintenanceProposalResult");
+	assert!(result.contains("Stopped,") && result.contains("Response(ProposalResponse),"));
+	let derive = proposals
+		.split_once("pub(crate) enum MaintenanceProposalResult")
+		.unwrap()
+		.0
+		.rsplit("#[derive(")
+		.next()
+		.unwrap();
+	assert!(
+		!derive.contains("Serialize"),
+		"the stopped result is local, never serialized: {derive}"
+	);
+}

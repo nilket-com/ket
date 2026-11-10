@@ -492,6 +492,22 @@ pub struct DecisionProposals {
 	clock_samples: DecisionClockSamples,
 	/// ADR 0700: the leader this node last sent a request to, and when.
 	last_sent: std::sync::Mutex<Option<(u32, std::time::Instant)>>,
+	/// Test-only (ADR 0707): the leader's handling of one forwarded proposal,
+	/// held before it is admitted.
+	#[cfg(test)]
+	forwarded_hold: std::sync::Mutex<Option<ForwardedHold>>,
+}
+
+/// Test-only (ADR 0707): holds the leader's handling of the next forwarded
+/// proposal from `sender` that `matches`, once: `reached` is notified with the
+/// request recorded in `held`, and the handler waits for `release`.
+#[cfg(test)]
+pub(crate) struct ForwardedHold {
+	pub(crate) sender: u32,
+	pub(crate) matches: fn(&ForwardedDecision) -> bool,
+	pub(crate) reached: Arc<tokio::sync::Notify>,
+	pub(crate) release: Arc<tokio::sync::Notify>,
+	pub(crate) held: Arc<std::sync::Mutex<Option<ForwardedDecision>>>,
 }
 
 /// ADR 0700: the one clock probe a maintenance loop owns; its presence is the
@@ -555,6 +571,33 @@ impl DecisionProposals {
 			pool,
 			clock_samples: DecisionClockSamples::default(),
 			last_sent: std::sync::Mutex::new(None),
+			#[cfg(test)]
+			forwarded_hold: std::sync::Mutex::new(None),
+		}
+	}
+
+	/// Test-only (ADR 0707): queues a hold of the leader's handling of a
+	/// forwarded proposal (see [`ForwardedHold`]).
+	#[cfg(test)]
+	pub(crate) fn hold_forwarded_for_test(&self, hold: ForwardedHold) {
+		*self.forwarded_hold.lock().unwrap() = Some(hold);
+	}
+
+	/// Test-only (ADR 0707): the leader's handler of a forwarded proposal
+	/// pauses here if a queued hold matches it.
+	#[cfg(test)]
+	pub(crate) async fn pause_forwarded(&self, sender: u32, request: &ForwardedDecision) {
+		let hold = {
+			let mut slot = self.forwarded_hold.lock().unwrap();
+			match slot.as_ref() {
+				Some(hold) if hold.sender == sender && (hold.matches)(request) => slot.take(),
+				_ => None,
+			}
+		};
+		if let Some(hold) = hold {
+			*hold.held.lock().unwrap() = Some(request.clone());
+			hold.reached.notify_one();
+			hold.release.notified().await;
 		}
 	}
 
@@ -857,16 +900,86 @@ impl DecisionProposals {
 		}
 		decode_bounded(frame.meta.as_ref())
 	}
+}
+
+/// ADR 0707: what one of decision maintenance's own proposals came to, as the
+/// caller saw it. Local and never serialized: [`ProposalResponse`], the wire
+/// answer, is unchanged.
+#[derive(Debug)]
+pub(crate) enum MaintenanceProposalResult {
+	/// The node is stopping and the caller stopped waiting. A fact about the
+	/// caller only, never evidence about the proposal: it may not have been
+	/// submitted, or may be committed already or commit later. Raft alone
+	/// decides it, and nothing is cleared or compensated on this answer.
+	Stopped,
+	Response(ProposalResponse),
+}
+
+/// ADR 0707: waits for `proposal`'s answer only until `stop` is set. A stop
+/// already set returns [`MaintenanceProposalResult::Stopped`] before
+/// `proposal` is polled, so nothing is submitted; a stop set during the wait
+/// drops `proposal` wherever it waits. A closed stop channel never stops it.
+pub(crate) async fn until_stopped(
+	mut stop: tokio::sync::watch::Receiver<bool>,
+	proposal: impl std::future::Future<Output = ProposalResponse>,
+) -> MaintenanceProposalResult {
+	if *stop.borrow_and_update() {
+		return MaintenanceProposalResult::Stopped;
+	}
+	tokio::select! {
+		biased;
+		Ok(_) = stop.wait_for(|stopping| *stopping) => MaintenanceProposalResult::Stopped,
+		response = proposal => MaintenanceProposalResult::Response(response),
+	}
+}
+
+/// ADR 0707: decision maintenance's own proposal path, the only one the
+/// maintenance stop cancels. It wraps the whole proposal future: the leader's
+/// admission and `client_write`, or the follower's forward (connect, open,
+/// write, read). Proposals from client RPCs, and the leader's handling of
+/// forwarded ones, go through [`DecisionProposals`] and never see this stop.
+///
+/// Each method derives its command from applied state on every tick; the
+/// replay basis at each call site names the reducer check that makes a late,
+/// duplicate or re-derived copy harmless: each of those checks refuses before
+/// changing anything, under the maintained retained-bytes invariant. That is
+/// not a claim that every refusal leaves state unchanged: DC-205
+/// (`commit_generation`'s `CounterOverflow` after its removals) is a known,
+/// separate exception. Raft has no log-level dedup, and an old-term entry that
+/// survives a leader change is applied before anything the new leader appends.
+pub(crate) struct MaintenanceProposals<'a> {
+	proposals: &'a DecisionProposals,
+	stop: tokio::sync::watch::Receiver<bool>,
+}
+
+impl<'a> MaintenanceProposals<'a> {
+	pub(crate) fn new(
+		proposals: &'a DecisionProposals,
+		stop: tokio::sync::watch::Receiver<bool>,
+	) -> Self {
+		Self { proposals, stop }
+	}
+
+	/// Sender side, local or forwarded, until the node stops.
+	async fn propose(&self, request: ForwardedDecision) -> MaintenanceProposalResult {
+		until_stopped(self.stop.clone(), self.proposals.propose(request)).await
+	}
+
+	/// Leader side, until the node stops.
+	async fn commit(&self, command: WendelonRequest) -> MaintenanceProposalResult {
+		until_stopped(self.stop.clone(), self.proposals.commit(command)).await
+	}
 
 	/// ADR 0699 S5a, leader only: commits the pending generation once every
 	/// member reported, or proposes the next target. The reducer decides.
-	pub(crate) async fn generation_step(&self) -> Option<ProposalResponse> {
-		if self.mode != DecisionMode::ParentDecisions
-			|| self.raft.current_leader().await != Some(self.local.id)
+	pub(crate) async fn generation_step(&self) -> Option<MaintenanceProposalResult> {
+		let proposals = self.proposals;
+		if proposals.mode != DecisionMode::ParentDecisions
+			|| proposals.raft.current_leader().await != Some(proposals.local.id)
 		{
 			return None;
 		}
-		let command = self
+		let command = proposals
 			.state_machine
 			.read_state(|state| {
 				if let Some(gid) = crate::consensus::decisions::generations::ready_commit(state) {
@@ -877,34 +990,49 @@ impl DecisionProposals {
 					.map(|target| DecisionCommand::ProposeTarget { target })
 			})
 			.await?;
+		// Replay basis. ProposeTarget is derived with `gid = next_gid` while no
+		// current target is pending; a second copy is refused StaleGeneration,
+		// since the first moved `next_gid` (`consensus/decisions/generations.rs:167-176`,
+		// `:189`), and never replaces the recorded target or its reports.
+		// CommitGeneration is derived once every member reported; a second copy
+		// finds nothing pending, and one whose target was replaced fails the
+		// gid check, both StaleGeneration (`generations.rs:240-248`).
 		Some(self.commit(WendelonRequest::Decision(command)).await)
 	}
 
 	/// Leader-only floor task step. Proposes nothing unless leader with a
 	/// healthy clock and a higher floor to set.
-	pub(crate) async fn advance_floor_once(&self) -> Option<ProposalResponse> {
-		if self.mode != DecisionMode::ParentDecisions
-			|| self.raft.current_leader().await != Some(self.local.id)
+	pub(crate) async fn advance_floor_once(&self) -> Option<MaintenanceProposalResult> {
+		let proposals = self.proposals;
+		if proposals.mode != DecisionMode::ParentDecisions
+			|| proposals.raft.current_leader().await != Some(proposals.local.id)
 		{
 			return None;
 		}
-		let now = self.decision_clock_now().await.ok()?;
-		let command = self
+		let now = proposals.decision_clock_now().await.ok()?;
+		let command = proposals
 			.state_machine
 			.read_state(|state| floor_proposal(state, now))
 			.await?;
+		// Replay basis: derived only while the floor would rise. A floor at or
+		// below the current one is refused FloorNotAdvanced with the committed
+		// clock untouched (`consensus/decisions.rs:1756-1758`); a late copy with
+		// a higher floor stays valid, its floor being its own stamp minus the
+		// expiry.
 		Some(self.commit(command).await)
 	}
 
 	/// Proposes Resolve for the reserved parents this node should drive: a bound
 	/// lineage closed, and this node now holds the coordinator's range. Bounded
-	/// per call; the reducer decides.
+	/// per call; the reducer decides. Counts only Applied answers, and ends its
+	/// remaining loop once the node stops.
 	pub(crate) async fn resolve_closed_once(&self, limit: usize) -> usize {
-		if self.mode != DecisionMode::ParentDecisions {
+		let proposals = self.proposals;
+		if proposals.mode != DecisionMode::ParentDecisions {
 			return 0;
 		}
-		let local = self.local.id;
-		let candidates = self
+		let local = proposals.local.id;
+		let candidates = proposals
 			.state_machine
 			.read_state(move |state| {
 				crate::consensus::decisions::resolvable_by(state, local, limit)
@@ -912,15 +1040,23 @@ impl DecisionProposals {
 			.await;
 		let mut proposed = 0;
 		for (key, request_digest) in candidates {
-			if matches!(
-				self.propose(ForwardedDecision::Resolve {
+			// Replay basis: derived for non-terminal parents with a closed
+			// lineage. A terminal parent returns its existing result unchanged;
+			// one no longer open is concluded only while a lineage is still
+			// closed, otherwise StillOpen; a digest mismatch or an absent key is
+			// refused (`consensus/decisions.rs:1661-1674`).
+			match self
+				.propose(ForwardedDecision::Resolve {
 					key,
-					request_digest
+					request_digest,
 				})
-				.await,
-				ProposalResponse::Applied { .. }
-			) {
-				proposed += 1;
+				.await
+			{
+				MaintenanceProposalResult::Stopped => break,
+				MaintenanceProposalResult::Response(ProposalResponse::Applied { .. }) => {
+					proposed += 1;
+				}
+				MaintenanceProposalResult::Response(_) => {}
 			}
 		}
 		proposed
@@ -933,12 +1069,13 @@ impl DecisionProposals {
 	pub(crate) async fn ensure_signer_once(
 		&self,
 		incarnation: StoreIncarnation,
-	) -> Option<ProposalResponse> {
-		if self.mode != DecisionMode::ParentDecisions {
+	) -> Option<MaintenanceProposalResult> {
+		let proposals = self.proposals;
+		if proposals.mode != DecisionMode::ParentDecisions {
 			return None;
 		}
-		let local = self.local.id;
-		let (current, bound) = self
+		let local = proposals.local.id;
+		let (current, bound) = proposals
 			.state_machine
 			.read_state(|state| {
 				let current = state
@@ -957,7 +1094,27 @@ impl DecisionProposals {
 			})
 			.await;
 		let request = maintenance_step(current, bound, incarnation)?;
+		// Replay basis. RegisterIncarnation is derived only while the applied
+		// registry has no current incarnation for this node: an exact replay
+		// returns Success with no change (`consensus/raft_storage.rs:5434-5440`),
+		// and one after another incarnation got there first is refused
+		// StaleSupersede (`raft_storage.rs:6727-6737`). BindSigner is derived
+		// only while this incarnation's key is unbound: a second copy returns
+		// SignerBound and inserts nothing, a different key gets SignerRebind and
+		// a non-current incarnation SignerNotCurrent
+		// (`consensus/decisions.rs:1724-1731`).
 		Some(self.propose(request).await)
+	}
+
+	/// ADR 0699 S5a: a member's report of its durably staged candidate. The
+	/// caller ignores the answer: a later tick skips the report once applied
+	/// state holds it, and otherwise signs it again from the same staged
+	/// metadata.
+	pub(crate) async fn report(
+		&self,
+		report: Signed<crate::consensus::decisions::ReportBody>,
+	) -> MaintenanceProposalResult {
+		self.propose(ForwardedDecision::Report { report }).await
 	}
 }
 

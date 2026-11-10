@@ -1016,6 +1016,9 @@ pub(crate) enum PauseStage {
 	DeleteEvaluation,
 	/// In a certification step, holding its lifecycle permit.
 	CertificationStep,
+	/// ADR 0707: in a certification step, after its candidate is durably
+	/// staged and its report signed, before the report is proposed.
+	CertificationBeforeReport,
 	/// In a cleanup step, after its plan reclaims something and before the
 	/// rewrite.
 	CleanupBeforeRewrite,

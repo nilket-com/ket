@@ -626,3 +626,64 @@ mod clock_admission_wait {
 		assert_eq!(outcome, ClockWait::NotLeader);
 	}
 }
+
+/// ADR 0707 (acceptance 4), the admission check: a stop already set is seen
+/// before the proposal is polled, so nothing is submitted.
+#[tokio::test]
+async fn a_ready_stop_returns_stopped_without_polling_the_proposal() {
+	let (_stop, stopped) = tokio::sync::watch::channel(true);
+	let never_polled = std::future::poll_fn(|_| -> std::task::Poll<ProposalResponse> {
+		panic!("a proposal was polled after the stop")
+	});
+	assert!(matches!(
+		until_stopped(stopped, never_polled).await,
+		MaintenanceProposalResult::Stopped
+	));
+}
+
+/// ADR 0707: a stop set while the proposal waits ends the wait, however long
+/// the answer would take.
+#[tokio::test]
+async fn a_stop_during_the_wait_ends_it() {
+	let (stop, stopped) = tokio::sync::watch::channel(false);
+	let setter = tokio::spawn(async move {
+		tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+		stop.send_replace(true);
+		stop
+	});
+	let result = tokio::time::timeout(
+		std::time::Duration::from_secs(10),
+		until_stopped(stopped, std::future::pending::<ProposalResponse>()),
+	)
+	.await
+	.expect("the stop ends the wait");
+	assert!(matches!(result, MaintenanceProposalResult::Stopped));
+	drop(setter.await.unwrap());
+}
+
+/// ADR 0707: without a stop the answer is returned as it came, and a closed
+/// stop channel never stops a wait.
+#[tokio::test]
+async fn without_a_stop_the_answer_is_returned() {
+	let answer = || async {
+		tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+		ProposalResponse::NotLeader {
+			leader_hint: Some(7),
+		}
+	};
+	let (_stop, stopped) = tokio::sync::watch::channel(false);
+	assert!(matches!(
+		until_stopped(stopped, answer()).await,
+		MaintenanceProposalResult::Response(ProposalResponse::NotLeader {
+			leader_hint: Some(7)
+		})
+	));
+	let (stop, stopped) = tokio::sync::watch::channel(false);
+	drop(stop);
+	assert!(matches!(
+		until_stopped(stopped, answer()).await,
+		MaintenanceProposalResult::Response(ProposalResponse::NotLeader {
+			leader_hint: Some(7)
+		})
+	));
+}

@@ -4685,6 +4685,8 @@ impl WendelonControlServer {
 			Some(proposals) => match decode_bounded::<ProposeRequest>(frame.meta.as_ref()) {
 				Ok(propose) => {
 					proposals.observe_sender_clock(remote.id, propose.sent_ms);
+					#[cfg(test)]
+					proposals.pause_forwarded(remote.id, &propose.request).await;
 					proposals.propose_as(remote.id, propose.request).await
 				}
 				Err(_) => ProposalResponse::Refused(ProposalRefusal::Malformed),

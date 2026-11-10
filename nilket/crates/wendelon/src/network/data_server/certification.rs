@@ -11,7 +11,7 @@
 use super::*;
 use crate::consensus::decisions::ParentStatus;
 use crate::consensus::decisions::generations::{Pending, ReportBody};
-use crate::network::decision_proposals::ForwardedDecision;
+use crate::network::decision_proposals::MaintenanceProposals;
 use crate::storage::index::certified_base::{
 	ActivateRefusal, Activation, BaseEntry, StagedCandidate, chunk_sums,
 };
@@ -63,8 +63,13 @@ impl WendelonDataServer {
 	/// base, build, stage and report the pending one. A step that is
 	/// interrupted (cancelled at close) leaves the permit incomplete, which
 	/// revokes this run's clean-shutdown record for good; none starts after
-	/// close began.
-	pub(crate) async fn certification_step(&self) -> std::io::Result<()> {
+	/// close began. ADR 0707: the report goes through `maintenance`, whose wait
+	/// is the step's one cut point; a stopped wait returns normally, so the
+	/// permit completes through this ordinary path.
+	pub(crate) async fn certification_step(
+		&self,
+		maintenance: &MaintenanceProposals<'_>,
+	) -> std::io::Result<()> {
 		self.under_permit(async {
 			#[cfg(test)]
 			self.decisions
@@ -76,7 +81,7 @@ impl WendelonDataServer {
 				.base_validated
 				.load(std::sync::atomic::Ordering::Acquire)
 			{
-				self.certify_pending().await?;
+				self.certify_pending(maintenance).await?;
 			}
 			Ok(())
 		})
@@ -297,7 +302,7 @@ impl WendelonDataServer {
 	/// Builds, stages and reports the pending target's candidate. Only a
 	/// candidate whose every survivor is proved stored here is staged, and a
 	/// report is signed only from the durable staged metadata.
-	async fn certify_pending(&self) -> std::io::Result<()> {
+	async fn certify_pending(&self, maintenance: &MaintenanceProposals<'_>) -> std::io::Result<()> {
 		let Some(signer) = self.decisions.signer.clone() else {
 			return Ok(());
 		};
@@ -417,9 +422,6 @@ impl WendelonDataServer {
 		}) else {
 			return Ok(());
 		};
-		let Some(proposals) = self.decisions.proposals.clone() else {
-			return Ok(());
-		};
 		let report = crate::consensus::decisions::evidence::sign(
 			&signer.key,
 			ReportBody {
@@ -430,9 +432,21 @@ impl WendelonDataServer {
 			},
 			local,
 		);
-		proposals
-			.propose(ForwardedDecision::Report { report })
+		#[cfg(test)]
+		self.decisions
+			.pause_at(super::child_writes::PauseStage::CertificationBeforeReport)
 			.await;
+		// Replay basis: skipped above while applied state holds this node's
+		// report, and signed from the durable staged metadata. An identical copy
+		// returns ReportRecorded and inserts nothing; one after the target was
+		// replaced or committed is refused StaleGeneration, and a different body
+		// from the same reporter ReportMismatch
+		// (`consensus/decisions/generations.rs:201-216`). A stopped wait does not
+		// certify that the report failed: at reopen only the exact stored
+		// candidate is restaged (`storage/index/certified_base.rs:464-466`) and a
+		// different one for the same gid is refused (`certified_base.rs:410-415`),
+		// so a report proposed again equals the committed one.
+		let _ = maintenance.report(report).await;
 		Ok(())
 	}
 

@@ -5047,3 +5047,523 @@ async fn a_close_past_the_drain_bound_aborts_a_held_step_and_records_unclean() {
 		let _ = tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown()).await;
 	}
 }
+
+/// ADR 0707: how long a close that stops waiting for its maintenance
+/// proposals may take, far under the 15 s lifecycle drain bound.
+const PROMPT_CLOSE: std::time::Duration = std::time::Duration::from_secs(5);
+
+type LogEntry = openraft::Entry<crate::consensus::WendelonTypeConfig>;
+
+fn node_id(id: u32) -> crate::schema::NodeId {
+	crate::schema::NodeId { id, _reserved: 0 }
+}
+
+/// `id`'s last log index and last applied index, from its Raft metrics.
+fn log_and_applied(cluster: &Cluster, id: u32) -> (u64, u64) {
+	let metrics = cluster.node(id).raft.metrics();
+	let metrics = metrics.borrow();
+	(
+		metrics.last_log_index.unwrap_or(0),
+		metrics.last_applied.map_or(0, |log_id| log_id.index),
+	)
+}
+
+/// `id`'s Raft log entries in `range`, from its log store.
+async fn log_entries(
+	cluster: &Cluster,
+	id: u32,
+	range: std::ops::RangeInclusive<u64>,
+) -> Vec<LogEntry> {
+	use openraft::storage::RaftLogReader;
+	let mut store = cluster.node(id).log_store.clone();
+	store.try_get_log_entries(range).await.unwrap()
+}
+
+fn decision_of(entry: &LogEntry) -> Option<&crate::consensus::decisions::DecisionCommand> {
+	match &entry.payload {
+		openraft::EntryPayload::Normal(crate::consensus::WendelonRequest::Decision(command)) => {
+			Some(command)
+		}
+		_ => None,
+	}
+}
+
+/// The premise of a stopped wait: an entry in `id`'s log, past its applied
+/// index, that `wanted` picks and that is still unapplied after a settling
+/// pause, a proposal that cannot commit. Returns that entry.
+async fn stuck_entry(
+	cluster: &Cluster,
+	id: u32,
+	wanted: impl Fn(&LogEntry) -> bool,
+	what: &str,
+) -> LogEntry {
+	let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+	loop {
+		let (last, applied) = log_and_applied(cluster, id);
+		let pending = if last > applied {
+			log_entries(cluster, id, applied + 1..=last)
+				.await
+				.into_iter()
+				.find(|entry| wanted(entry))
+		} else {
+			None
+		};
+		if let Some(entry) = pending {
+			tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+			if log_and_applied(cluster, id).1 < entry.log_id.index {
+				return entry;
+			}
+		}
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"premise: {what} pending at {id}"
+		);
+		tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+	}
+}
+
+/// Closes `id` and requires an orderly, prompt and clean close.
+async fn close_promptly(cluster: &mut Cluster, id: u32, what: &str) {
+	let began = tokio::time::Instant::now();
+	let (result, clean) = cluster.close_with_result(id).await;
+	let took = began.elapsed();
+	eprintln!("ADR0707 close {what} node={id} took={took:?} result={result:?} clean={clean}");
+	result.unwrap_or_else(|error| panic!("{what}: the close is orderly: {error}"));
+	assert!(took < PROMPT_CLOSE, "{what}: the close took {took:?}");
+	assert!(clean, "{what}: the close recorded the directory clean");
+}
+
+/// Waits until `id` applied at least `index`.
+async fn until_applied(cluster: &Cluster, id: u32, index: u64) {
+	let deadline = tokio::time::Instant::now() + BOUND;
+	while log_and_applied(cluster, id).1 < index {
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"node {id} never applied {index}"
+		);
+		tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+	}
+}
+
+/// Whether `entry` survived at its index in `id`'s log (the old entry applied)
+/// or was replaced (truncated, and its command derived again if needed).
+async fn survived(cluster: &Cluster, id: u32, entry: &LogEntry) -> bool {
+	let index = entry.log_id.index;
+	let found = log_entries(cluster, id, index..=index).await;
+	found
+		.first()
+		.is_some_and(|kept| kept.log_id == entry.log_id)
+}
+
+/// `id`'s committed log up to the applied index it read with `read`, and that
+/// reading: a contiguous log, so every effect is accounted for.
+async fn committed_with<T>(
+	cluster: &Cluster,
+	id: u32,
+	read: impl FnOnce(&crate::consensus::raft_storage::SmState) -> T,
+) -> (Vec<LogEntry>, T) {
+	let (applied, value) = cluster
+		.node(id)
+		.state_machine
+		.read_state(move |state| {
+			(
+				state.last_applied_log_id.map_or(0, |log_id| log_id.index),
+				read(state),
+			)
+		})
+		.await;
+	let entries = log_entries(cluster, id, 0..=applied).await;
+	let first = entries.first().map_or(u64::MAX, |entry| entry.log_id.index);
+	assert!(
+		first <= 1
+			&& entries.last().map(|entry| entry.log_id.index) == Some(applied)
+			&& entries
+				.windows(2)
+				.all(|pair| pair[1].log_id.index == pair[0].log_id.index + 1),
+		"node {id}'s committed log is complete up to {applied}"
+	);
+	(entries, value)
+}
+
+/// ADR 0707 (acceptance 1), the DC-203 control: a leader that lost its last
+/// reachable voter (one follower closed, the other running but unpublished)
+/// with a floor advance pending in its log. Its close stops waiting for that
+/// proposal: orderly, prompt and clean (on main it took 15 s and returned
+/// TimedOut). With quorum back, either Raft outcome stands, and every node's
+/// floor is exactly the highest floor its committed log advanced to: no copy
+/// had a second effect.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_leader_without_quorum_stops_waiting_for_its_maintenance_proposal_and_closes() {
+	use crate::consensus::decisions::DecisionCommand;
+	let (mut cluster, leader, descriptor) = ready().await;
+	let mut followers = NODES.iter().copied().filter(|node| *node != leader);
+	let (closed, unpublished) = (followers.next().unwrap(), followers.next().unwrap());
+	assert!(
+		cluster.close(closed).await,
+		"the first follower closed clean"
+	);
+	// The second follower stays up but unreachable, as during its own close.
+	cluster.network.unpublish(node_id(unpublished));
+	let stuck = stuck_entry(
+		&cluster,
+		leader,
+		|entry| {
+			matches!(
+				decision_of(entry),
+				Some(DecisionCommand::AdvanceFloor { .. })
+			)
+		},
+		"a floor advance",
+	)
+	.await;
+	let Some(DecisionCommand::AdvanceFloor {
+		floor_ms: stuck_floor,
+		..
+	}) = decision_of(&stuck).cloned()
+	else {
+		unreachable!()
+	};
+	eprintln!(
+		"ADR0707 premise leader={leader} closed={closed} unpublished={unpublished} stuck={:?} applied={}",
+		stuck.log_id,
+		log_and_applied(&cluster, leader).1
+	);
+	close_promptly(&mut cluster, leader, "the leader without quorum").await;
+
+	// Quorum back: the unreachable follower is published again, the old
+	// leader and the closed follower reopen on their stores.
+	let service = cluster.node(unpublished).service.clone();
+	cluster
+		.network
+		.publish(node_id(unpublished), &address(unpublished), service);
+	cluster.reopen(leader).await;
+	cluster.reopen(closed).await;
+	until_settled(&cluster, &descriptor).await;
+	for id in NODES {
+		until_applied(&cluster, id, stuck.log_id.index).await;
+	}
+	let kept = survived(&cluster, cluster.leader().await, &stuck).await;
+	eprintln!(
+		"ADR0707 outcome: the stopped floor advance {}",
+		if kept {
+			"survived and was applied"
+		} else {
+			"was truncated"
+		}
+	);
+	for id in NODES {
+		let (entries, floor) = committed_with(&cluster, id, |state| {
+			state.decisions.as_ref().unwrap().floor_ms()
+		})
+		.await;
+		assert_eq!(
+			survived(&cluster, id, &stuck).await,
+			kept,
+			"node {id} agrees on the outcome"
+		);
+		let advances: Vec<u64> = entries
+			.iter()
+			.filter_map(|entry| match decision_of(entry) {
+				Some(DecisionCommand::AdvanceFloor { floor_ms, .. }) => Some(*floor_ms),
+				_ => None,
+			})
+			.collect();
+		assert_eq!(
+			Some(floor),
+			advances.iter().copied().max(),
+			"node {id}: the floor is exactly the highest committed advance"
+		);
+		if kept {
+			assert!(
+				floor >= stuck_floor,
+				"node {id}: the kept advance took effect"
+			);
+		}
+	}
+	for node in cluster.nodes {
+		let _ = tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown()).await;
+	}
+}
+
+/// ADR 0707 (acceptance 2): the leader's certification step is held after it
+/// durably staged its candidate and signed its report; quorum goes, the held
+/// report is proposed and cannot commit, and the leader closes. The step's
+/// Report wait is its one cut point: the step returns normally, its permit
+/// completes, and the close is orderly, prompt and clean. With quorum back the
+/// generation commits exactly the staged candidate, and every copy of the
+/// leader's report in the committed log is that same report.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_report_stopped_at_its_wait_without_quorum_completes_its_permit() {
+	use crate::consensus::decisions::DecisionCommand;
+	use crate::network::data_server::child_writes::PauseStage;
+	let (mut cluster, leader, descriptor) = ready().await;
+	let now = std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.unwrap()
+		.as_millis() as u64;
+	let mut expected = Expected::new();
+	for id in 1..=2 {
+		assert_committed(
+			&write_through(
+				&cluster,
+				leader,
+				write_meta(&descriptor, 1, uuid_v7()),
+				named_rows(&descriptor, &[(id, "a")]),
+			)
+			.await,
+			"a row",
+		);
+		expected.insert(id, "a".into());
+	}
+	let (reached, release) = cluster
+		.node(leader)
+		.data_server
+		.pause_coordinator_for_test(PauseStage::CertificationBeforeReport);
+	jump_floor(&cluster, now + 60_000).await;
+	tokio::time::timeout(BOUND, reached.notified())
+		.await
+		.expect("the leader's report is held after durable staging");
+	let staged = {
+		let index = cluster.node(leader).slab.persistent_index().unwrap();
+		let meta = index.base_meta().await.unwrap();
+		meta.staged
+			.expect("the candidate is staged before its report")
+	};
+	let mut followers = NODES.iter().copied().filter(|node| *node != leader);
+	let (closed, unpublished) = (followers.next().unwrap(), followers.next().unwrap());
+	assert!(
+		cluster.close(closed).await,
+		"the first follower closed clean"
+	);
+	cluster.network.unpublish(node_id(unpublished));
+	release.notify_one();
+	let reported_by_leader = move |entry: &LogEntry| {
+		matches!(
+			decision_of(entry),
+			Some(DecisionCommand::Report { report }) if report.body.reporter.node == leader
+		)
+	};
+	let stuck = stuck_entry(&cluster, leader, reported_by_leader, "the leader's report").await;
+	eprintln!(
+		"ADR0707 premise leader={leader} gid={} stuck={:?} applied={}",
+		staged.gid,
+		stuck.log_id,
+		log_and_applied(&cluster, leader).1
+	);
+	close_promptly(&mut cluster, leader, "the leader held at its report").await;
+
+	let service = cluster.node(unpublished).service.clone();
+	cluster
+		.network
+		.publish(node_id(unpublished), &address(unpublished), service);
+	cluster.reopen(leader).await;
+	cluster.reopen(closed).await;
+	assert!(
+		!cluster.node(leader).recovered_after_unclean_shutdown(),
+		"the permit completed: the next start is clean"
+	);
+	until_settled(&cluster, &descriptor).await;
+	until_active(&cluster, staged.gid).await;
+	let generations = generations_at_leader(&cluster).await;
+	let current = generations.current.clone().unwrap();
+	assert_eq!(
+		(
+			current.gid,
+			current.target_digest,
+			current.predecessor_gid,
+			&current.chunks
+		),
+		(
+			staged.gid,
+			staged.target_digest,
+			staged.predecessor_gid,
+			&staged.chunks
+		),
+		"the generation committed exactly the staged candidate"
+	);
+	let new_leader = cluster.leader().await;
+	let kept = survived(&cluster, new_leader, &stuck).await;
+	let (entries, ()) = committed_with(&cluster, new_leader, |_| ()).await;
+	let copies: Vec<_> = entries
+		.iter()
+		.filter(|entry| reported_by_leader(entry))
+		.filter_map(|entry| match decision_of(entry) {
+			Some(DecisionCommand::Report { report }) if report.body.gid == staged.gid => {
+				Some((entry.log_id, report.body.clone()))
+			}
+			_ => None,
+		})
+		.collect();
+	eprintln!(
+		"ADR0707 outcome: the stopped report {}; committed copies {:?}",
+		if kept {
+			"survived and was applied"
+		} else {
+			"was truncated"
+		},
+		copies.iter().map(|(log_id, _)| *log_id).collect::<Vec<_>>()
+	);
+	assert!(!copies.is_empty(), "the leader's report is committed");
+	for (log_id, body) in &copies {
+		assert_eq!(
+			(body.target_digest, &body.chunks),
+			(staged.target_digest, &staged.chunks),
+			"every committed copy ({log_id}) is the staged report"
+		);
+	}
+	for node in NODES {
+		let index = cluster.node(node).slab.persistent_index().unwrap();
+		assert_eq!(
+			index.base_meta().await.unwrap().active_chunks,
+			staged.chunks,
+			"node {node} activated the staged candidate"
+		);
+		assert_eq!(
+			cluster.read_once_validated(node, &descriptor).await,
+			expected,
+			"at {node}"
+		);
+	}
+	for node in cluster.nodes {
+		let _ = tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown()).await;
+	}
+}
+
+/// ADR 0707 (acceptance 3): a follower's forwarded report waits on the
+/// leader's answer, its handling held at the leader. The follower's close
+/// stops that wait: orderly, prompt and clean. Released afterwards, the
+/// report (or one derived again after the reopen) commits the generation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_followers_forward_waiting_on_the_leader_is_stopped_by_its_close() {
+	use crate::network::decision_proposals::{ForwardedDecision, ForwardedHold};
+	let (mut cluster, leader, descriptor) = ready().await;
+	let now = std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.unwrap()
+		.as_millis() as u64;
+	let mut expected = Expected::new();
+	for id in 1..=2 {
+		assert_committed(
+			&write_through(
+				&cluster,
+				leader,
+				write_meta(&descriptor, 1, uuid_v7()),
+				named_rows(&descriptor, &[(id, "a")]),
+			)
+			.await,
+			"a row",
+		);
+		expected.insert(id, "a".into());
+	}
+	let follower = *NODES.iter().find(|node| **node != leader).unwrap();
+	let (reached, release, held) = (
+		Arc::new(tokio::sync::Notify::new()),
+		Arc::new(tokio::sync::Notify::new()),
+		Arc::new(std::sync::Mutex::new(None)),
+	);
+	cluster
+		.node(leader)
+		.data_server
+		.decision_peer_for_test()
+		.proposals
+		.as_ref()
+		.unwrap()
+		.hold_forwarded_for_test(ForwardedHold {
+			sender: follower,
+			matches: |request| matches!(request, ForwardedDecision::Report { .. }),
+			reached: reached.clone(),
+			release: release.clone(),
+			held: held.clone(),
+		});
+	jump_floor(&cluster, now + 60_000).await;
+	tokio::time::timeout(BOUND, reached.notified())
+		.await
+		.expect("the follower's report reached the leader's handler");
+	assert!(
+		matches!(
+			held.lock().unwrap().as_ref(),
+			Some(ForwardedDecision::Report { report }) if report.body.reporter.node == follower
+		),
+		"the held request is the follower's report"
+	);
+	close_promptly(
+		&mut cluster,
+		follower,
+		"the follower waiting on its forward",
+	)
+	.await;
+	release.notify_one();
+	cluster.reopen(follower).await;
+	until_settled(&cluster, &descriptor).await;
+	until_active(&cluster, 1).await;
+	for node in NODES {
+		assert_eq!(
+			cluster.read_once_validated(node, &descriptor).await,
+			expected,
+			"at {node}"
+		);
+	}
+	for node in cluster.nodes {
+		let _ = tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown()).await;
+	}
+}
+
+/// ADR 0707 (acceptance 4): the maintenance stop is decision maintenance's
+/// alone. With it set on every node, ordinary proposals still complete: a
+/// write coordinated at the leader (its data server's local proposal) and one
+/// coordinated at a follower (forwarded to the leader's control server).
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn the_maintenance_stop_never_cancels_an_ordinary_proposal() {
+	let (cluster, leader, descriptor) = ready().await;
+	for id in NODES {
+		cluster.node(id).data_server.stop_decision_maintenance();
+		assert!(
+			*cluster
+				.node(id)
+				.data_server
+				.decision_maintenance_stop()
+				.borrow()
+		);
+	}
+	let mut on_leader = None;
+	for id in 1..200 {
+		let primary = cluster
+			.node(leader)
+			.data_server
+			.primary_for_test(TenantId::ZERO, &descriptor, &rows(&descriptor, &[id]))
+			.await
+			.expect("every position is leased");
+		if primary == leader {
+			on_leader = Some(id);
+			break;
+		}
+	}
+	let on_leader = on_leader.expect("a row whose primary is the leader");
+	let (off_leader, primary) = row_off_the_leader(&cluster, leader, &descriptor, 200).await;
+	for (id, entry, what) in [
+		(on_leader, leader, "coordinated at the leader"),
+		(off_leader, primary, "coordinated at a follower"),
+	] {
+		assert_committed(
+			&write_through(
+				&cluster,
+				entry,
+				write_meta(&descriptor, 1, uuid_v7()),
+				named_rows(&descriptor, &[(id, "a")]),
+			)
+			.await,
+			what,
+		);
+	}
+	let expected: Expected = [(on_leader, "a".to_string()), (off_leader, "a".to_string())].into();
+	expect_everywhere(
+		&cluster,
+		&descriptor,
+		&expected,
+		"with the maintenance stop set",
+	)
+	.await;
+	for node in cluster.nodes {
+		let _ = tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown()).await;
+	}
+}

@@ -2347,10 +2347,20 @@ impl WendelonNode {
 					// ADR 0700: owned here; stopped with the loop, cancelled if
 					// the loop is aborted.
 					let mut probe = crate::network::decision_proposals::ClockProbe::default();
+					// ADR 0707: this loop's own proposals wait for their answer
+					// only until the node stops; once the stop is set no later
+					// step of the admitted tick submits one, and the tick's
+					// remaining local work finishes under the drain bound.
+					let maintenance = crate::network::decision_proposals::MaintenanceProposals::new(
+						&proposals,
+						stop.clone(),
+					);
 					loop {
+						// ADR 0707: a ready stop wins over a ready tick.
 						let stopping = tokio::select! {
-							_ = ticker.tick() => false,
+							biased;
 							_ = stop.wait_for(|stopping| *stopping) => true,
+							_ = ticker.tick() => false,
 						};
 						if stopping {
 							probe.stop().await;
@@ -2359,17 +2369,19 @@ impl WendelonNode {
 						// ADR 0700: keep this follower's clock sample fresh at
 						// the leader, whatever its readiness or the gate says.
 						proposals.clock_probe_step(&mut probe).await;
-						let _ = proposals.ensure_signer_once(incarnation).await;
-						let _ = proposals.advance_floor_once().await;
-						let _ = proposals.resolve_closed_once(DECISION_RESOLVE_BATCH).await;
+						let _ = maintenance.ensure_signer_once(incarnation).await;
+						let _ = maintenance.advance_floor_once().await;
+						let _ = maintenance
+							.resolve_closed_once(DECISION_RESOLVE_BATCH)
+							.await;
 						let _ = data_server.sweep_refused_intents().await;
 						// ADR 0699 S5a: certified generations; reads wait for the
 						// base to validate after each start.
 						// Validation (activation of a committed staged candidate
 						// first) precedes any new build or report.
-						let _ = proposals.generation_step().await;
+						let _ = maintenance.generation_step().await;
 						let _ = data_server.validate_certified_base().await;
-						let _ = data_server.certification_step().await;
+						let _ = data_server.certification_step(&maintenance).await;
 						// ADR 0699 S5b: one bounded cleanup step and one debt
 						// sweep page, once the base is validated.
 						let _ = data_server.certified_cleanup_step().await;
