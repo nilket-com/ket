@@ -18463,7 +18463,7 @@ async fn a_snapshot_retirement_leaves_no_live_run() {
 	let slab = pointer.slab_id;
 	// A snapshot with no tiers retires this one.
 	let epoch = mgr.begin_tier_snapshot_install().unwrap();
-	mgr.finish_tier_snapshot_install_at_epoch(vec![], Some(818), epoch)
+	mgr.finish_tier_snapshot_install_at_epoch(vec![], Some(818), epoch, None)
 		.await
 		.unwrap();
 	assert!(mgr.tier_pointer(slab).await.is_none(), "premise: retired");
@@ -18486,7 +18486,7 @@ async fn a_stale_snapshot_mark_leaves_the_run() {
 			..pointer
 		},
 	};
-	assert!(!mgr.apply_snapshot_retirement(stale).await.unwrap());
+	assert!(!mgr.apply_snapshot_retirement(stale, None).await.unwrap());
 	assert!(live_l0_has(&mgr, slab));
 	assert!(durable_run(&mgr, slab).await.is_some());
 }
@@ -18746,12 +18746,26 @@ async fn a_run_held_across_a_restart_is_finished_when_its_install_resolves() {
 /// the ring's Retire validator would refuse it, and no retirement record exists. It pins what
 /// recovery does when an input's rows are gone from under a cancelled install, which is what the
 /// deferral keeps a tiered input from ever reaching.
+///
+/// ADR 0704: a retirement proceeds only while one is in force in the committed state. The
+/// state-machine fixture ends the input's identity, as an applied Retire leaves it, and the
+/// retirement's index is one the state machine has applied.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dc187_a_retired_input_leaves_a_cancelled_install_fenced() {
 	let reopened = reopen_install_at(lsm_driver::ControlLsmInstallCut::AfterRename).await;
 	let mgr = &reopened.mgr;
 	let held = reopened.inputs[0];
 	let index = mgr.require_op_index().unwrap();
+	let held_ref = mgr.owner_ref().unwrap().slab(held);
+	for sm in &reopened.cluster.state_machines {
+		sm.retire_tiered_slab_for_test(held_ref).await;
+	}
+	let retired_at = reopened.cluster.state_machines[0]
+		.state_snapshot()
+		.await
+		.last_applied_log_id
+		.expect("premise: the state machine has applied entries")
+		.index;
 	assert!(
 		index
 			.load_snapshot()
@@ -18763,7 +18777,7 @@ async fn dc187_a_retired_input_leaves_a_cancelled_install_fenced() {
 		"premise: the input has rows"
 	);
 	assert!(
-		mgr.retire_tiered_slab_committed(held, Some(20))
+		mgr.retire_tiered_slab_committed(held, Some(retired_at))
 			.await
 			.unwrap(),
 		"premise: the retirement applied, under an unresolved install"
@@ -18893,7 +18907,7 @@ async fn a_held_snapshot_mark_survives_a_failed_attempt_and_the_log_row_waits_fo
 			.unwrap()
 	);
 	let epoch = mgr.begin_tier_snapshot_install().unwrap();
-	mgr.finish_tier_snapshot_install_at_epoch(vec![], Some(818), epoch)
+	mgr.finish_tier_snapshot_install_at_epoch(vec![], Some(818), epoch, None)
 		.await
 		.unwrap();
 	let index = mgr.persistent_index.as_ref().unwrap();
@@ -19931,13 +19945,23 @@ async fn tier_kv_slab(
 	l2: &Arc<dyn ObjectStore>,
 	object: &str,
 ) -> TieredSlabPointer {
+	let pointer = upload_kv_slab(mgr, l2, object).await;
+	mgr.apply_tier_slab(pointer.clone()).await.unwrap();
+	pointer
+}
+
+/// `tier_kv_slab`'s seal and upload, with nothing published: the pointer a
+/// commit would name.
+async fn upload_kv_slab(
+	mgr: &Arc<SlabManager>,
+	l2: &Arc<dyn ObjectStore>,
+	object: &str,
+) -> TieredSlabPointer {
 	let slab_id = force_seal_active(mgr).await;
 	let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
 	let encrypted = mgr.encrypt_tiered_object_blob(slab_id, &raw).unwrap();
 	let uri = l2.put(object, &encrypted.bytes).await.unwrap();
-	let pointer = tiered_pointer_from_blob(mgr, slab_id, uri, &encrypted.bytes);
-	mgr.apply_tier_slab(pointer.clone()).await.unwrap();
-	pointer
+	tiered_pointer_from_blob(mgr, slab_id, uri, &encrypted.bytes)
 }
 
 fn tiered_pointer_from_blob(
@@ -23757,6 +23781,7 @@ async fn table_drop_cleanup_refuses_to_delete_either_object_with_an_unpublished_
 				stats_block_hash128: old.stats_block_hash128,
 				tombstone_metadata: old.tombstone_metadata,
 				supersession_metadata: old.supersession_metadata,
+				certified: None,
 			},
 		))
 		.await
@@ -26176,6 +26201,7 @@ async fn committed_retirement_during_verification_fences_reads_until_ready() {
 		stats_block_hash128: p.stats_block_hash128,
 		tombstone_metadata: p.tombstone_metadata,
 		supersession_metadata: p.supersession_metadata,
+		certified: None,
 	})
 	.await;
 	let entry = Entry {
@@ -26373,6 +26399,7 @@ async fn committed_retirement_fences_ready_reads_before_local_retirement() {
 		stats_block_hash128: p.stats_block_hash128,
 		tombstone_metadata: p.tombstone_metadata,
 		supersession_metadata: p.supersession_metadata,
+		certified: None,
 	})
 	.await;
 	let request = mgr.retire_request_for_test(p_ref).await;
@@ -33986,6 +34013,7 @@ async fn install_snapshot_with_tier_set_for_test(include_local_tier: bool) {
 				stats_block_hash128: pointer.stats_block_hash128,
 				tombstone_metadata: pointer.tombstone_metadata,
 				supersession_metadata: pointer.supersession_metadata,
+				certified: None,
 			})
 			.await;
 	}
@@ -34133,6 +34161,7 @@ async fn snapshot_index_discards_old_tier_observer_but_accepts_newer_one() {
 			stats_block_hash128: original.stats_block_hash128,
 			tombstone_metadata: original.tombstone_metadata,
 			supersession_metadata: original.supersession_metadata,
+			certified: None,
 		})
 		.await;
 	RaftStateMachine::apply(
@@ -34160,6 +34189,33 @@ async fn snapshot_index_discards_old_tier_observer_but_accepts_newer_one() {
 		vec![original],
 		"an observer covered by the installed snapshot must publish nothing"
 	);
+	// ADR 0704: entry 703 committed the replacement, and the state machine has applied it: a
+	// publication installs only the committed generation, at an index the state covers.
+	target
+		.seed_tiered_slab_for_test(TieredSlab {
+			slab: manager.owner_ref().unwrap().slab(replacement.slab_id),
+			l2_uri: replacement.l2_uri.clone(),
+			payload_hash: replacement.payload_hash,
+			is_encrypted: replacement.is_encrypted,
+			tenant_id: replacement.tenant_id,
+			tenant_kek_id: replacement.tenant_kek_id,
+			stats_format_version: replacement.stats_format_version,
+			stats_block_len: replacement.stats_block_len,
+			stats_block_hash128: replacement.stats_block_hash128,
+			tombstone_metadata: replacement.tombstone_metadata,
+			supersession_metadata: replacement.supersession_metadata,
+			certified: None,
+		})
+		.await;
+	RaftStateMachine::apply(
+		&mut target,
+		[Entry {
+			log_id: LogId::new(CommittedLeaderId::new(3, 1), 703),
+			payload: EntryPayload::Blank,
+		}],
+	)
+	.await
+	.unwrap();
 	manager
 		.apply_tier_slab_committed(replacement.clone(), Some(703))
 		.await
@@ -34308,6 +34364,7 @@ async fn snapshot_new_tier_is_verified_for_test(awaiting_cluster: bool) {
 			stats_block_hash128: pointer.stats_block_hash128,
 			tombstone_metadata: pointer.tombstone_metadata,
 			supersession_metadata: pointer.supersession_metadata,
+			certified: None,
 		})
 		.await;
 	RaftStateMachine::apply(
@@ -34384,6 +34441,7 @@ async fn snapshot_newer_pending_tier_is_verified_before_readiness() {
 			stats_block_hash128: replacement.stats_block_hash128,
 			tombstone_metadata: replacement.tombstone_metadata,
 			supersession_metadata: replacement.supersession_metadata,
+			certified: None,
 		})
 		.await;
 	RaftStateMachine::apply(
@@ -34493,6 +34551,7 @@ async fn snapshot_index_rejects_observer_paused_before_publication_gate() {
 			stats_block_hash128: original.stats_block_hash128,
 			tombstone_metadata: original.tombstone_metadata,
 			supersession_metadata: original.supersession_metadata,
+			certified: None,
 		})
 		.await;
 	RaftStateMachine::apply(
@@ -34518,6 +34577,33 @@ async fn snapshot_index_rejects_observer_paused_before_publication_gate() {
 		vec![original],
 		"an observer covered by the installed snapshot must publish nothing"
 	);
+	// ADR 0704: entry 703 committed the replacement, and the state machine has applied it: a
+	// publication installs only the committed generation, at an index the state covers.
+	target
+		.seed_tiered_slab_for_test(TieredSlab {
+			slab: manager.owner_ref().unwrap().slab(replacement.slab_id),
+			l2_uri: replacement.l2_uri.clone(),
+			payload_hash: replacement.payload_hash,
+			is_encrypted: replacement.is_encrypted,
+			tenant_id: replacement.tenant_id,
+			tenant_kek_id: replacement.tenant_kek_id,
+			stats_format_version: replacement.stats_format_version,
+			stats_block_len: replacement.stats_block_len,
+			stats_block_hash128: replacement.stats_block_hash128,
+			tombstone_metadata: replacement.tombstone_metadata,
+			supersession_metadata: replacement.supersession_metadata,
+			certified: None,
+		})
+		.await;
+	RaftStateMachine::apply(
+		&mut target,
+		[Entry {
+			log_id: LogId::new(CommittedLeaderId::new(3, 1), 703),
+			payload: EntryPayload::Blank,
+		}],
+	)
+	.await
+	.unwrap();
 	manager
 		.apply_tier_slab_committed(replacement.clone(), Some(703))
 		.await
@@ -34730,6 +34816,7 @@ async fn snapshot_epoch_fences_unindexed_tier_publication_paused_before_gate() {
 			stats_block_hash128: original.stats_block_hash128,
 			tombstone_metadata: original.tombstone_metadata,
 			supersession_metadata: original.supersession_metadata,
+			certified: None,
 		})
 		.await;
 	RaftStateMachine::apply(
@@ -35263,6 +35350,7 @@ async fn snapshot_supersession_preserves_unknown_size_across_reopen() {
 			stats_block_hash128: replacement.stats_block_hash128,
 			tombstone_metadata: replacement.tombstone_metadata,
 			supersession_metadata: replacement.supersession_metadata,
+			certified: None,
 		})
 		.await;
 	RaftStateMachine::apply(
@@ -35406,6 +35494,7 @@ async fn snapshot_displacing_unverified_pointer_does_not_invent_publication_evid
 			stats_block_hash128: old.stats_block_hash128,
 			tombstone_metadata: old.tombstone_metadata,
 			supersession_metadata: old.supersession_metadata,
+			certified: None,
 		})
 		.await;
 	RaftStateMachine::apply(
@@ -36297,7 +36386,7 @@ async fn snapshot_retirement_fence_only_blocks_affected_slab_reads() {
 	let task = {
 		let mgr = mgr.clone();
 		tokio::spawn(async move {
-			mgr.finish_tier_snapshot_install_at_epoch(vec![], Some(818), epoch)
+			mgr.finish_tier_snapshot_install_at_epoch(vec![], Some(818), epoch, None)
 				.await
 		})
 	};
@@ -36342,7 +36431,7 @@ async fn newer_snapshot_takes_over_or_cancels_pending_retirement() {
 		let first = {
 			let mgr = mgr.clone();
 			tokio::spawn(async move {
-				mgr.finish_tier_snapshot_install_at_epoch(vec![], Some(820), first_epoch)
+				mgr.finish_tier_snapshot_install_at_epoch(vec![], Some(820), first_epoch, None)
 					.await
 			})
 		};
@@ -36351,7 +36440,7 @@ async fn newer_snapshot_takes_over_or_cancels_pending_retirement() {
 			.unwrap();
 		let newer_epoch = mgr.begin_tier_snapshot_install().unwrap();
 		let pointers = if keep_old { vec![old.clone()] } else { vec![] };
-		mgr.finish_tier_snapshot_install_at_epoch(pointers, Some(821), newer_epoch)
+		mgr.finish_tier_snapshot_install_at_epoch(pointers, Some(821), newer_epoch, None)
 			.await
 			.unwrap();
 		pause.resume.notify_one();
@@ -36383,7 +36472,7 @@ async fn newer_committed_pointer_cancels_obsolete_snapshot_retirement() {
 	let first = {
 		let mgr = mgr.clone();
 		tokio::spawn(async move {
-			mgr.finish_tier_snapshot_install_at_epoch(vec![], Some(822), epoch)
+			mgr.finish_tier_snapshot_install_at_epoch(vec![], Some(822), epoch, None)
 				.await
 		})
 	};
@@ -36422,7 +36511,7 @@ async fn snapshot_retirement_waits_for_tier_lock_without_blocking_other_reads() 
 	let mut task = {
 		let mgr = mgr.clone();
 		tokio::spawn(async move {
-			mgr.finish_tier_snapshot_install_at_epoch(vec![], Some(824), epoch)
+			mgr.finish_tier_snapshot_install_at_epoch(vec![], Some(824), epoch, None)
 				.await
 		})
 	};
@@ -36465,7 +36554,7 @@ async fn snapshot_retirement_gap_and_pointer_removal_roll_back_together() {
 		.store(true, std::sync::atomic::Ordering::Release);
 	let epoch = mgr.begin_tier_snapshot_install().unwrap();
 	assert!(
-		mgr.finish_tier_snapshot_install_at_epoch(vec![], Some(825), epoch)
+		mgr.finish_tier_snapshot_install_at_epoch(vec![], Some(825), epoch, None)
 			.await
 			.is_err()
 	);
@@ -36486,7 +36575,7 @@ async fn snapshot_retirement_gap_and_pointer_removal_roll_back_together() {
 			.any(|p| p == &old)
 	);
 	let newer = mgr.begin_tier_snapshot_install().unwrap();
-	mgr.finish_tier_snapshot_install_at_epoch(vec![], Some(826), newer)
+	mgr.finish_tier_snapshot_install_at_epoch(vec![], Some(826), newer, None)
 		.await
 		.unwrap();
 	assert!(mgr.tier_pointer(old.slab_id).await.is_none());
@@ -36558,7 +36647,7 @@ async fn snapshot_retirement_uses_locally_known_replacement_size() {
 		.await
 		.unwrap();
 	let epoch = mgr.begin_tier_snapshot_install().unwrap();
-	mgr.finish_tier_snapshot_install_at_epoch(vec![], Some(829), epoch)
+	mgr.finish_tier_snapshot_install_at_epoch(vec![], Some(829), epoch, None)
 		.await
 		.unwrap();
 	assert_eq!(
@@ -36591,7 +36680,7 @@ async fn snapshot_retirement_resolves_unobserved_legacy_replacement_and_is_nonfe
 	pointer_a.l2_uri = a.clone();
 	mgr.apply_tier_slab(pointer_a).await.unwrap();
 	let epoch = mgr.begin_tier_snapshot_install().unwrap();
-	mgr.finish_tier_snapshot_install_at_epoch(vec![], Some(830), epoch)
+	mgr.finish_tier_snapshot_install_at_epoch(vec![], Some(830), epoch, None)
 		.await
 		.unwrap();
 	let index = mgr.persistent_index.as_ref().unwrap();
@@ -36678,7 +36767,7 @@ async fn republished_retired_uri_clears_retirement_proof_before_retier() {
 	let (dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
 	let object = l2.get(&old.l2_uri).await.unwrap();
 	let epoch = mgr.begin_tier_snapshot_install().unwrap();
-	mgr.finish_tier_snapshot_install_at_epoch(vec![], Some(832), epoch)
+	mgr.finish_tier_snapshot_install_at_epoch(vec![], Some(832), epoch, None)
 		.await
 		.unwrap();
 	let mgr = restart_tier_manager(mgr, &dirs, &l2).await;
@@ -36770,7 +36859,7 @@ async fn snapshot_retirement_preserves_unresolved_replacement_until_publication(
 		.await
 		.unwrap();
 	let epoch = mgr.begin_tier_snapshot_install().unwrap();
-	mgr.finish_tier_snapshot_install_at_epoch(vec![], Some(835), epoch)
+	mgr.finish_tier_snapshot_install_at_epoch(vec![], Some(835), epoch, None)
 		.await
 		.unwrap();
 	let index = mgr.persistent_index.as_ref().unwrap();
@@ -36866,6 +36955,7 @@ async fn snapshot_after_append_observation_refuses_stale_supersession_metadata()
 			stats_block_hash128: original.stats_block_hash128,
 			tombstone_metadata: original.tombstone_metadata,
 			supersession_metadata: original.supersession_metadata,
+			certified: None,
 		})
 		.await;
 	RaftStateMachine::apply(
@@ -36948,6 +37038,7 @@ async fn snapshot_after_migrated_range_observation_refuses_stale_metadata() {
 			stats_block_hash128: original.stats_block_hash128,
 			tombstone_metadata: original.tombstone_metadata,
 			supersession_metadata: original.supersession_metadata,
+			certified: None,
 		})
 		.await;
 	RaftStateMachine::apply(
@@ -37030,6 +37121,7 @@ async fn snapshot_after_multirow_observation_refuses_stale_metadata() {
 			stats_block_hash128: original.stats_block_hash128,
 			tombstone_metadata: original.tombstone_metadata,
 			supersession_metadata: original.supersession_metadata,
+			certified: None,
 		})
 		.await;
 	RaftStateMachine::apply(
@@ -37105,6 +37197,7 @@ async fn snapshot_after_multirow_tombstone_observation_refuses_stale_metadata() 
 			stats_block_hash128: original.stats_block_hash128,
 			tombstone_metadata: original.tombstone_metadata,
 			supersession_metadata: original.supersession_metadata,
+			certified: None,
 		})
 		.await;
 	RaftStateMachine::apply(
@@ -37263,7 +37356,7 @@ async fn snapshot_applies_pending_tokens_to_unchanged_pointer() {
 		.await
 		.unwrap();
 	let epoch = mgr.begin_tier_snapshot_install().unwrap();
-	mgr.finish_tier_snapshot_install_at_epoch(vec![pointer.clone()], Some(900), epoch)
+	mgr.finish_tier_snapshot_install_at_epoch(vec![pointer.clone()], Some(900), epoch, None)
 		.await
 		.unwrap();
 	let current = mgr.tier_pointer(pointer.slab_id).await.unwrap();
@@ -37341,7 +37434,7 @@ async fn hundred_appends_share_one_pending_slab_record_through_snapshot() {
 		"one additional token transaction per affected append"
 	);
 	let epoch = mgr.begin_tier_snapshot_install().unwrap();
-	mgr.finish_tier_snapshot_install_at_epoch(vec![pointer.clone()], Some(901), epoch)
+	mgr.finish_tier_snapshot_install_at_epoch(vec![pointer.clone()], Some(901), epoch, None)
 		.await
 		.unwrap();
 	assert!(
@@ -37540,7 +37633,7 @@ async fn durable_append_finishes_while_snapshot_fence_is_raised() {
 			.len(),
 		1
 	);
-	mgr.finish_tier_snapshot_install_at_epoch(vec![pointer.clone()], Some(902), epoch)
+	mgr.finish_tier_snapshot_install_at_epoch(vec![pointer.clone()], Some(902), epoch, None)
 		.await
 		.unwrap();
 	assert!(
@@ -37619,7 +37712,7 @@ async fn metadata_token_written_between_snapshot_stage_and_pointer_publication_i
 		let mgr = mgr.clone();
 		let replacement = replacement.clone();
 		tokio::spawn(async move {
-			mgr.finish_tier_snapshot_install_at_epoch(vec![replacement], Some(903), epoch)
+			mgr.finish_tier_snapshot_install_at_epoch(vec![replacement], Some(903), epoch, None)
 				.await
 		})
 	};
@@ -37712,7 +37805,7 @@ async fn cancelled_snapshot_with_completed_append_recovers_pending_degrade() {
 		let mgr = mgr.clone();
 		let pointer = pointer.clone();
 		tokio::spawn(async move {
-			mgr.finish_tier_snapshot_install_at_epoch(vec![pointer], Some(904), epoch)
+			mgr.finish_tier_snapshot_install_at_epoch(vec![pointer], Some(904), epoch, None)
 				.await
 		})
 	};
@@ -38245,8 +38338,8 @@ async fn sweeper_recovery_of_a_fenced_republication_supersedes_an_older_snapshot
 
 	let observed = mgr.capture_snapshot_epoch();
 	let authoritative = pointer.clone();
-	mgr.reconcile_tier_slab_at_snapshot_epoch(slab_id, observed, || async move {
-		Ok(Some(authoritative))
+	mgr.reconcile_tier_slab_at_snapshot_epoch(slab_id, observed, |_| {
+		Ok(Some(authoritative.clone()))
 	})
 	.await
 	.unwrap();
@@ -38286,7 +38379,7 @@ async fn sweeper_recovery_of_a_fenced_replacement_cancels_an_obsolete_snapshot_r
 	let first = {
 		let mgr = mgr.clone();
 		tokio::spawn(async move {
-			mgr.finish_tier_snapshot_install_at_epoch(vec![], Some(822), epoch)
+			mgr.finish_tier_snapshot_install_at_epoch(vec![], Some(822), epoch, None)
 				.await
 		})
 	};
@@ -38322,8 +38415,8 @@ async fn sweeper_recovery_of_a_fenced_replacement_cancels_an_obsolete_snapshot_r
 	let observed = mgr.capture_snapshot_epoch();
 	let authoritative = replacement.clone();
 	let retry = mgr
-		.reconcile_tier_slab_at_snapshot_epoch(old.slab_id, observed, || async move {
-			Ok(Some(authoritative))
+		.reconcile_tier_slab_at_snapshot_epoch(old.slab_id, observed, |_| {
+			Ok(Some(authoritative.clone()))
 		})
 		.await;
 	let marks = mgr
@@ -38477,30 +38570,32 @@ async fn real_sm_fenced_pointer_for_a_retired_slab_stays_typed_fenced_while_cano
 	})
 	.await
 	.is_ok();
-	let canonical = || {
-		let target = target.clone();
-		async move {
-			Ok(target
-				.state_snapshot()
-				.await
-				.tiered_slabs
-				.get(&own_slab_ref)
-				.map(|tier| TieredSlabPointer {
-					slab_id: tier.slab.local_id(),
-					l2_uri: tier.l2_uri.clone(),
-					payload_hash: tier.payload_hash,
-					is_encrypted: tier.is_encrypted,
-					tenant_id: tier.tenant_id,
-					tenant_kek_id: tier.tenant_kek_id,
-					stats_format_version: tier.stats_format_version,
-					stats_block_len: tier.stats_block_len,
-					stats_block_hash128: tier.stats_block_hash128,
-					tombstone_metadata: tier.tombstone_metadata,
-					supersession_metadata: tier.supersession_metadata,
-				}))
-		}
+	let to_pointer = |tier: &crate::consensus::TieredSlab| TieredSlabPointer {
+		slab_id: tier.slab.local_id(),
+		l2_uri: tier.l2_uri.clone(),
+		payload_hash: tier.payload_hash,
+		is_encrypted: tier.is_encrypted,
+		tenant_id: tier.tenant_id,
+		tenant_kek_id: tier.tenant_kek_id,
+		stats_format_version: tier.stats_format_version,
+		stats_block_len: tier.stats_block_len,
+		stats_block_hash128: tier.stats_block_hash128,
+		tombstone_metadata: tier.tombstone_metadata,
+		supersession_metadata: tier.supersession_metadata,
 	};
-	let committed = canonical().await.unwrap();
+	// ADR 0704: the reconcile reads the committed pointer from the lease it holds.
+	let canonical = |lease: Option<&crate::consensus::TierSnapshotLease>| {
+		Ok(lease
+			.and_then(|lease| lease.committed_tier(own_slab_ref))
+			.as_ref()
+			.map(to_pointer))
+	};
+	let committed = target
+		.state_snapshot()
+		.await
+		.tiered_slabs
+		.get(&own_slab_ref)
+		.map(to_pointer);
 	let observe = |stage: &'static str| {
 		let manager = manager.clone();
 		async move {
@@ -39905,6 +40000,7 @@ async fn b1t_real_follower_debt_completes_after_leadership_change() {
 		stats_block_hash128: old.stats_block_hash128,
 		tombstone_metadata: old.tombstone_metadata,
 		supersession_metadata: old.supersession_metadata,
+		certified: None,
 	};
 	// ADR 0697: leader 1 never appends node 2's slab command.
 	let refused = nodes[0]
@@ -40065,7 +40161,7 @@ async fn b2_snapshot_retirement_proof_survives_aborting_an_unsubmitted_candidate
 		.await
 		.unwrap();
 	let epoch = mgr.begin_tier_snapshot_install().unwrap();
-	mgr.finish_tier_snapshot_install_at_epoch(vec![], Some(912), epoch)
+	mgr.finish_tier_snapshot_install_at_epoch(vec![], Some(912), epoch, None)
 		.await
 		.unwrap();
 	mgr.reconcile_table_drop_l2_cleanup_markers(&*l2, usize::MAX)
@@ -40391,7 +40487,7 @@ async fn b4_autonomous_retirement_still_requires_verified_private_authority() {
 async fn b5_advance_snapshot(mgr: &SlabManager, pointer: &TieredSlabPointer) -> u64 {
 	let prior = mgr.capture_snapshot_epoch();
 	let epoch = mgr.begin_tier_snapshot_install().unwrap();
-	mgr.finish_tier_snapshot_install_at_epoch(vec![pointer.clone()], Some(900), epoch)
+	mgr.finish_tier_snapshot_install_at_epoch(vec![pointer.clone()], Some(900), epoch, None)
 		.await
 		.unwrap();
 	tokio::time::timeout(Duration::from_secs(30), mgr.wait_tier_authority_ready())
@@ -40477,7 +40573,7 @@ async fn b5_stale_local_retirement_does_not_overwrite_a_committed_log_fence() {
 async fn b6_advance_snapshot(mgr: &SlabManager, pointer: &TieredSlabPointer) -> u64 {
 	let prior = mgr.capture_snapshot_epoch();
 	let epoch = mgr.begin_tier_snapshot_install().unwrap();
-	mgr.finish_tier_snapshot_install_at_epoch(vec![pointer.clone()], Some(900), epoch)
+	mgr.finish_tier_snapshot_install_at_epoch(vec![pointer.clone()], Some(900), epoch, None)
 		.await
 		.unwrap();
 	tokio::time::timeout(Duration::from_secs(30), mgr.wait_tier_authority_ready())
@@ -40561,7 +40657,7 @@ async fn b6_transient_snapshot_refusal_is_retried_after_canonical_comparison() {
 		"registration must not publish before the canonical comparison"
 	);
 	assert!(mgr.lookup(tenant(), id(0x421)).is_err());
-	mgr.finish_tier_snapshot_install_at_epoch(vec![next.clone()], Some(902), epoch)
+	mgr.finish_tier_snapshot_install_at_epoch(vec![next.clone()], Some(902), epoch, None)
 		.await
 		.unwrap();
 	mgr.apply_tier_slab_committed(next.clone(), Some(903))
@@ -40629,7 +40725,7 @@ async fn b6_newer_snapshot_replaces_an_older_pending_generation() {
 	let epoch = fixture.manager.begin_tier_snapshot_install().unwrap();
 	fixture
 		.manager
-		.finish_tier_snapshot_install_at_epoch(vec![next.clone()], Some(902), epoch)
+		.finish_tier_snapshot_install_at_epoch(vec![next.clone()], Some(902), epoch, None)
 		.await
 		.unwrap();
 	fixture.store.release();
@@ -40910,7 +41006,7 @@ async fn b6b_equal_index_snapshot_conflict_is_sticky_integrity_error() {
 	let epoch = fixture.manager.begin_tier_snapshot_install().unwrap();
 	let error = fixture
 		.manager
-		.finish_tier_snapshot_install_at_epoch(vec![next], Some(901), epoch)
+		.finish_tier_snapshot_install_at_epoch(vec![next], Some(901), epoch, None)
 		.await
 		.expect_err("B6B: a snapshot at the same index cannot replace a different pending pointer");
 	assert_eq!(error.kind(), ErrorKind::InvalidData);
@@ -41020,6 +41116,7 @@ fn b6_control_tier(manager: &SlabManager, p: &TieredSlabPointer) -> crate::conse
 		stats_block_hash128: p.stats_block_hash128,
 		tombstone_metadata: p.tombstone_metadata,
 		supersession_metadata: p.supersession_metadata,
+		certified: None,
 	}
 }
 #[tokio::test]
@@ -41686,7 +41783,7 @@ async fn b7_metadata_update_during_retirement(tombstone: bool) {
 	let task = {
 		let mgr = mgr.clone();
 		tokio::spawn(async move {
-			mgr.finish_tier_snapshot_install_at_epoch(vec![], Some(950), epoch)
+			mgr.finish_tier_snapshot_install_at_epoch(vec![], Some(950), epoch, None)
 				.await
 		})
 	};
@@ -41751,7 +41848,7 @@ async fn b7_pending_metadata_only_change_is_retired_without_resurrection() {
 	let task = {
 		let mgr = mgr.clone();
 		tokio::spawn(async move {
-			mgr.finish_tier_snapshot_install_at_epoch(vec![], Some(950), epoch)
+			mgr.finish_tier_snapshot_install_at_epoch(vec![], Some(950), epoch, None)
 				.await
 		})
 	};
@@ -41901,7 +41998,7 @@ async fn b8_snapshot_retires_pending_only_committed_generation_without_resurrect
 	let old_bytes = f.store.inner.get(&f.pointer.l2_uri).await.unwrap();
 	let epoch = f.manager.begin_tier_snapshot_install().unwrap();
 	f.manager
-		.finish_tier_snapshot_install_at_epoch(vec![], Some(900), epoch)
+		.finish_tier_snapshot_install_at_epoch(vec![], Some(900), epoch, None)
 		.await
 		.unwrap();
 	assert!(
@@ -41972,7 +42069,7 @@ async fn b8_refuses_unordered_pending_retirement(old: Option<u64>, snapshot: u64
 	let epoch = f.manager.begin_tier_snapshot_install().unwrap();
 	let result = f
 		.manager
-		.finish_tier_snapshot_install_at_epoch(vec![], Some(snapshot), epoch)
+		.finish_tier_snapshot_install_at_epoch(vec![], Some(snapshot), epoch, None)
 		.await;
 	assert!(
 		result.is_err(),
@@ -42030,7 +42127,7 @@ async fn b8_pending_retirement_does_not_overwrite_another_durable_generation() {
 	let epoch = f.manager.begin_tier_snapshot_install().unwrap();
 	assert!(
 		f.manager
-			.finish_tier_snapshot_install_at_epoch(vec![], Some(900), epoch)
+			.finish_tier_snapshot_install_at_epoch(vec![], Some(900), epoch, None)
 			.await
 			.is_err(),
 		"B8: pending retirement must refuse a different durable generation"
@@ -42140,7 +42237,7 @@ async fn b8_pending_retirement_stage_crash_reopens_fenced_and_finishes() {
 		let target = target.clone();
 		tokio::spawn(async move {
 			target
-				.finish_tier_snapshot_install_at_epoch(vec![], Some(900), epoch)
+				.finish_tier_snapshot_install_at_epoch(vec![], Some(900), epoch, None)
 				.await
 		})
 	};
@@ -42232,7 +42329,7 @@ async fn b8_pending_retirement_without_cleanup_authority_counts_gap() {
 	let old_bytes = store.inner.get(&pointer.l2_uri).await.unwrap();
 	let epoch = target.begin_tier_snapshot_install().unwrap();
 	target
-		.finish_tier_snapshot_install_at_epoch(vec![], Some(900), epoch)
+		.finish_tier_snapshot_install_at_epoch(vec![], Some(900), epoch, None)
 		.await
 		.unwrap();
 	assert!(
@@ -42435,9 +42532,14 @@ async fn b9_epoch_change_after_tier_commit_mirrors_committed_generation_before_e
 		.lock()
 		.unwrap() = Some((entered.clone(), release.clone()));
 	let initial_epoch = mgr.begin_tier_snapshot_install().unwrap();
-	mgr.finish_tier_snapshot_install_at_epoch(vec![pointer.clone()], Some(900), initial_epoch)
-		.await
-		.unwrap();
+	mgr.finish_tier_snapshot_install_at_epoch(
+		vec![pointer.clone()],
+		Some(900),
+		initial_epoch,
+		None,
+	)
+	.await
+	.unwrap();
 	assert!(
 		!mgr.state.lock().await.rehydrated.contains_key(&f.slab_id),
 		"registered snapshot staging quarantines the old local backing"
@@ -42488,9 +42590,14 @@ async fn b9_epoch_change_after_tier_commit_mirrors_committed_generation_before_e
 		.collect::<Vec<_>>();
 	assert_eq!(durable_rows.len(), plan.new_rows.len());
 	assert!(plan.new_rows.iter().all(|row| durable_rows.contains(&row)));
-	mgr.finish_tier_snapshot_install_at_epoch(vec![pointer.clone()], Some(901), snapshot_epoch)
-		.await
-		.unwrap();
+	mgr.finish_tier_snapshot_install_at_epoch(
+		vec![pointer.clone()],
+		Some(901),
+		snapshot_epoch,
+		None,
+	)
+	.await
+	.unwrap();
 	tokio::time::timeout(Duration::from_secs(30), mgr.wait_tier_authority_ready())
 		.await
 		.unwrap()
@@ -42590,7 +42697,7 @@ async fn b9_obsolete_committed_republication_mirrors_retained_accounting() {
 	assert_eq!(cached.1.state, durable.2.state);
 	assert!(!f.manager.has_orphaned_index_publications());
 	f.manager
-		.finish_tier_snapshot_install_at_epoch(vec![f.pointer.clone()], Some(901), epoch)
+		.finish_tier_snapshot_install_at_epoch(vec![f.pointer.clone()], Some(901), epoch, None)
 		.await
 		.unwrap();
 	tokio::time::timeout(
@@ -42742,6 +42849,7 @@ async fn b10_snapshot_install_defers_live_append_collision_without_fatal_storage
 			stats_block_hash128: pointer.stats_block_hash128,
 			tombstone_metadata: pointer.tombstone_metadata,
 			supersession_metadata: pointer.supersession_metadata,
+			certified: None,
 		})
 		.await;
 	RaftStateMachine::apply(
@@ -42931,6 +43039,7 @@ async fn b10_append_fixture() -> B10AppendFixture {
 			stats_block_hash128: pointer.stats_block_hash128,
 			tombstone_metadata: pointer.tombstone_metadata,
 			supersession_metadata: pointer.supersession_metadata,
+			certified: None,
 		})
 		.await;
 	RaftStateMachine::apply(
@@ -43045,6 +43154,7 @@ fn b10_tier(manager: &SlabManager, p: &TieredSlabPointer) -> crate::consensus::T
 		stats_block_hash128: p.stats_block_hash128,
 		tombstone_metadata: p.tombstone_metadata,
 		supersession_metadata: p.supersession_metadata,
+		certified: None,
 	}
 }
 
@@ -45570,8 +45680,10 @@ async fn the_recovery_verifier_walks_a_moved_replacement_with_its_own_layout() {
 		"premise: the old generation is published"
 	);
 	// The replacement arrives as committed state in a snapshot, so the
-	// recovery verifier, not live publication, brings it in.
-	{
+	// recovery verifier, not live publication, brings it in. The state machine
+	// stays alive, as a node's does: its canonical state is what verification
+	// judges the replacement current by.
+	let _target = {
 		use crate::consensus::{TieredSlab, WendelonStateMachine};
 		use crate::storage::sweeper::ManagerTierObserver;
 		use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
@@ -45590,6 +45702,7 @@ async fn the_recovery_verifier_walks_a_moved_replacement_with_its_own_layout() {
 				stats_block_hash128: replacement.stats_block_hash128,
 				tombstone_metadata: replacement.tombstone_metadata,
 				supersession_metadata: replacement.supersession_metadata,
+				certified: None,
 			})
 			.await;
 		RaftStateMachine::apply(
@@ -45608,7 +45721,8 @@ async fn the_recovery_verifier_walks_a_moved_replacement_with_its_own_layout() {
 		RaftStateMachine::install_snapshot(&mut target, &built.meta, built.snapshot)
 			.await
 			.unwrap();
-	}
+		target
+	};
 	tokio::time::timeout(Duration::from_secs(60), mgr.wait_tier_authority_ready())
 		.await
 		.expect("verification finishes")
@@ -45810,6 +45924,7 @@ async fn staged_plaintext_that_only_shares_a_prefix_with_the_published_object_re
 			stats_block_hash128: staged.stats_block_hash128,
 			tombstone_metadata: staged.tombstone_metadata,
 			supersession_metadata: staged.supersession_metadata,
+			certified: None,
 		})
 		.await;
 	RaftStateMachine::apply(
@@ -46453,7 +46568,7 @@ async fn sweep_with_committed(
 	committed: Option<TieredSlabPointer>,
 ) -> std::io::Result<(bool, Option<TieredSlabPointer>)> {
 	let observed = mgr.capture_snapshot_epoch();
-	mgr.reconcile_tier_slab_at_snapshot_epoch(slab_id, observed, || async move { Ok(committed) })
+	mgr.reconcile_tier_slab_at_snapshot_epoch(slab_id, observed, |_| Ok(committed.clone()))
 		.await
 }
 
@@ -46524,7 +46639,13 @@ async fn a_newer_committed_pointer_wins_over_the_replay_of_an_older_fence() {
 		let _guard = lock.lock().await;
 		let epoch = mgr.capture_snapshot_epoch();
 		let outcome = mgr
-			.replay_tier_deferral_under_publication_lock(old.slab_id, Some(&newer), epoch)
+			.replay_tier_deferral_under_publication_lock(
+				old.slab_id,
+				Some(&newer),
+				epoch,
+				None,
+				None,
+			)
 			.await;
 		assert!(
 			matches!(outcome, super::tier_deferral::TierReplay::Unchanged),
@@ -46569,7 +46690,7 @@ async fn an_installed_snapshot_at_or_above_the_callback_index_makes_its_replay_l
 	fence_committed_apply(&mgr, &fenced, 823).await;
 	let epoch = mgr.begin_tier_snapshot_install().unwrap();
 	let installed = mgr
-		.finish_tier_snapshot_install_at_epoch(vec![old.clone()], Some(830), epoch)
+		.finish_tier_snapshot_install_at_epoch(vec![old.clone()], Some(830), epoch, None)
 		.await;
 	eprintln!("snapshot install at 830: {installed:?}");
 	assert!(mgr.observer_is_superseded(Some(823)), "premise: 823 <= 830");
@@ -46593,6 +46714,8 @@ async fn an_installed_snapshot_at_or_above_the_callback_index_makes_its_replay_l
 				old.slab_id,
 				Some(&fenced),
 				mgr.capture_snapshot_epoch(),
+				None,
+				None,
 			)
 			.await;
 		assert!(
@@ -46632,7 +46755,7 @@ async fn retirement_is_declined_only_for_a_fenced_callback_newer_than_its_mark()
 		let install = {
 			let mgr = mgr.clone();
 			tokio::spawn(async move {
-				mgr.finish_tier_snapshot_install_at_epoch(vec![], Some(822), epoch)
+				mgr.finish_tier_snapshot_install_at_epoch(vec![], Some(822), epoch, None)
 					.await
 			})
 		};
@@ -47064,10 +47187,13 @@ async fn a_successful_replay_freeing_held_capacity_wakes_another_budget_fenced_r
 		.append_durable(tenant(), id(0x5e9b0), hlc(950), b"second-slab-row")
 		.await
 		.unwrap();
-	let b_old = tier_kv_slab(&manager, &l2, "s7-worker-pair/b0").await;
+	// B is committed before this store publishes it: with the canonical state
+	// bound, a local publication installs only the committed generation.
+	let b_old = upload_kv_slab(&manager, &l2, "s7-worker-pair/b0").await;
 	target
 		.seed_tiered_slab_for_test(b10_tier(&manager, &b_old))
 		.await;
+	manager.apply_tier_slab(b_old.clone()).await.unwrap();
 	let replacement = |old: &TieredSlabPointer, name: &'static str| {
 		let l2 = l2.clone();
 		let old = old.clone();
@@ -47196,7 +47322,7 @@ async fn reopen_before_replay_never_applies_an_older_mark_against_the_newer_comm
 	let install = {
 		let mgr = mgr.clone();
 		tokio::spawn(async move {
-			mgr.finish_tier_snapshot_install_at_epoch(vec![], Some(822), epoch)
+			mgr.finish_tier_snapshot_install_at_epoch(vec![], Some(822), epoch, None)
 				.await
 		})
 	};
@@ -47573,7 +47699,7 @@ async fn a_snapshot_comparison_after_disposal_clears_its_evidence() {
 	assert!(is_superseded(&manager.read(old).await), "premise");
 	let epoch = manager.begin_tier_snapshot_install().unwrap();
 	let installed = manager
-		.finish_tier_snapshot_install_at_epoch(vec![], Some(1), epoch)
+		.finish_tier_snapshot_install_at_epoch(vec![], Some(1), epoch, None)
 		.await;
 	eprintln!("snapshot install: {installed:?}");
 	assert!(
@@ -48370,13 +48496,13 @@ async fn a_delayed_apply_after_its_proposers_token_was_released_funds_itself() {
 
 /// Multinode: across a leader change, an older replay never publishes over
 /// newer committed authority. Node 2 fences P1 on the index gate; its
-/// worker's replay is held just before re-running the callback (its
-/// canonical check passed for P1, its tier lock held). The leader moves to
-/// node 3, which commits P2: node 2's committed state names P2 (read without
-/// waiting), while node 2's own P2 callback waits behind the held replay.
-/// Released, the replay refuses at its canonical recheck, and P2's callback
-/// publishes: the layout generation advances exactly once, so P1 was never
-/// installed.
+/// worker's replay of P1 is held just before it takes the canonical lease
+/// (ADR 0704: a replay judges the committed pointer under that lease, which
+/// ring apply waits behind, so it is held where it holds nothing). The leader
+/// moves to node 3, then node 2 commits P2: node 2's committed state names P2
+/// (read without waiting), and P2's own callback publishes it while the older
+/// replay is held. Released, the replay never installs P1: the layout
+/// generation advances exactly once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn across_a_leader_change_an_older_replay_never_publishes_over_newer_authority() {
 	let (_dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
@@ -48417,7 +48543,7 @@ async fn across_a_leader_change_an_older_replay_never_publishes_over_newer_autho
 	drop(gate);
 	tokio::time::timeout(Duration::from_secs(60), entered.acquire())
 		.await
-		.expect("node 2's replay of P1 passed its canonical check and holds")
+		.expect("node 2's replay of P1 is held before its lease")
 		.unwrap()
 		.forget();
 	// The leader changes, then node 2 (the owner, ADR 0697: only it appends
@@ -48442,7 +48568,9 @@ async fn across_a_leader_change_an_older_replay_never_publishes_over_newer_autho
 		.await,
 		"node 2's committed state names P2 while its replay of P1 holds"
 	);
-	assert_eq!(mgr.tier_pointer(old.slab_id).await, Some(old.clone()));
+	// ADR 0704: the held replay holds no lease or slab lock, so P2's own callback is not
+	// behind it; P1 is never installed meanwhile.
+	assert_ne!(mgr.tier_pointer(old.slab_id).await, Some(p1.clone()));
 	release.add_permits(1);
 	let p2_index = commit.await.unwrap().unwrap();
 	assert!(p2_index > p1_index);
@@ -49217,6 +49345,7 @@ fn owner_test_tier(
 		stats_block_hash128: None,
 		tombstone_metadata: TombstoneMetadata::None,
 		supersession_metadata: SupersessionMetadata::None,
+		certified: None,
 	}
 }
 
@@ -49927,6 +50056,7 @@ async fn committer_maps_a_refused_slab_command_to_a_non_outcome_on_every_path() 
 		crate::consensus::slab_ops::RetireOp {
 			slab: owner.slab(old.slab_id),
 			expected: crate::consensus::slab_ops::TierGeneration::from(&old),
+			certified: None,
 		},
 	))
 	.await;
@@ -58907,6 +59037,7 @@ async fn reopen_tier_op(
 		SlabCommand::Retire(RetireOp {
 			slab: owner.slab(old.slab_id),
 			expected: TierGeneration::from(&old),
+			certified: None,
 		})
 	} else {
 		SlabCommand::Tier(TierOp {
@@ -61484,21 +61615,39 @@ async fn a_duplicate_after_its_ack_is_unavailable_after_a_real_snapshot_install(
 }
 
 /// H2: what was prepared is only good for the generation it was prepared against.
+///
+/// ADR 0704: the generation moves the one way the committed state allows while the operation
+/// stays current: this store's own delivery of the same committed generation (its observer's
+/// event, at the operation's real applied index) installs it while recovery is parked after
+/// preparing against the generation before. Recovery's preparation no longer matches.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_tier_delivery_refuses_a_generation_that_moved_after_it_prepared() {
+	use crate::consensus::slab_ops::{RecordedOutcome, ViewOutcome};
 	let (tier, release, pass) = parked_tier_delivery().await;
-	let bytes = tier.l2.get(&tier.old.l2_uri).await.unwrap();
-	let moved = TieredSlabPointer {
-		l2_uri: tier.l2.put("s5-tier-op/moved", &bytes).await.unwrap(),
-		..tier.old.clone()
+	let rows = tier.rows().await;
+	let LoadedOp::Submittable(ticket) = rows[0].clone() else {
+		panic!("premise: one submitted tier operation: {rows:?}");
 	};
+	let view = tier
+		.plain
+		.op_view(ticket.key(), ticket.digest(), ticket.command().slabs())
+		.await
+		.unwrap();
+	let ViewOutcome::Recorded(RecordedOutcome::Applied { index: applied }) = view.outcome else {
+		panic!("premise: applied on the ring: {:?}", view.outcome);
+	};
+	assert_eq!(
+		tier.mgr.tier_pointer(tier.old.slab_id).await,
+		None,
+		"premise: recovery prepared against no published generation"
+	);
 	tier.mgr
-		.apply_tier_slab_committed(moved.clone(), Some(1))
+		.apply_tier_slab_committed(tier.old.clone(), Some(applied))
 		.await
 		.unwrap();
 	assert_eq!(
 		tier.mgr.tier_pointer(tier.old.slab_id).await,
-		Some(moved.clone()),
+		Some(tier.old.clone()),
 		"premise: the generation moved while it waited"
 	);
 	release.add_permits(8);
@@ -61508,7 +61657,7 @@ async fn a_tier_delivery_refuses_a_generation_that_moved_after_it_prepared() {
 	);
 	assert_eq!(
 		tier.mgr.tier_pointer(tier.old.slab_id).await,
-		Some(moved),
+		Some(tier.old.clone()),
 		"what it prepared was not for this generation"
 	);
 	assert_eq!(tier.rows().await.len(), 1, "its row stays");
@@ -63572,8 +63721,8 @@ async fn a_store_of_the_previous_op_state_version_refuses_to_open_and_is_left_in
 		names.sort();
 		names
 	};
-	let current = set_op_state_version_for_test(&path, Some(2));
-	assert_eq!(current, 3, "premise: this build's version");
+	let current = set_op_state_version_for_test(&path, Some(4));
+	assert_eq!(current, 5, "premise: this build's version");
 	let bytes = op_row_bytes_at(&path, seq);
 	let files = names();
 	let next = DataDirectoryOwner::acquire_existing(&dir).expect("released");
@@ -63585,11 +63734,11 @@ async fn a_store_of_the_previous_op_state_version_refuses_to_open_and_is_left_in
 		crate::storage::index::is_op_state_invalid(&error),
 		"{error}"
 	);
-	assert!(error.to_string().contains("version 2"), "{error}");
+	assert!(error.to_string().contains("version 4"), "{error}");
 	let _ = next.close(Duration::from_secs(2)).await;
 	assert_eq!(op_row_bytes_at(&path, seq), bytes, "its row");
 	assert_eq!(names(), files, "its files");
-	assert_eq!(set_op_state_version_for_test(&path, None), 2, "untouched");
+	assert_eq!(set_op_state_version_for_test(&path, None), 4, "untouched");
 	let next = DataDirectoryOwner::acquire_existing(&dir).expect("released");
 	let mgr = SlabManager::open_with_owner(gc_owned_test_config(&dir), next.clone())
 		.await
@@ -64445,6 +64594,2485 @@ async fn an_orphan_lsm_certificate_fences_certified_lsm_at_open() {
 	let _ = next.close(Duration::from_secs(2)).await;
 }
 
+/// ADR 0704 §3: one certified tier job, owned by this store, decided under `gid`.
+fn certified_tier_job(
+	mgr: &SlabManager,
+	slab: u64,
+	gid: u64,
+) -> (
+	crate::storage::index::CertifiedTierWork,
+	crate::storage::index::TierSelectionEvidence,
+) {
+	let tier = TieredSlab {
+		slab: mgr.owner_ref().unwrap().slab(SlabId::new(slab)),
+		l2_uri: format!("l2://certified/{slab}"),
+		payload_hash: [slab as u8; 32],
+		is_encrypted: false,
+		tenant_id: None,
+		tenant_kek_id: None,
+		stats_format_version: None,
+		stats_block_len: None,
+		stats_block_hash128: None,
+		tombstone_metadata: TombstoneMetadata::None,
+		supersession_metadata: SupersessionMetadata::None,
+		certified: None,
+	};
+	let mut source = crate::consensus::slab_ops::TierGeneration::from(&tier);
+	source.l2_uri = format!("l2://source/{slab}");
+	(
+		crate::storage::index::CertifiedTierWork::Rewrite {
+			tier,
+			postimage_rows_digest: [7; 32],
+		},
+		crate::storage::index::TierSelectionEvidence {
+			job_fingerprint: [3; 32],
+			active_gid: gid,
+			source_generation: source,
+			source_rows_digest: [4; 32],
+			drop_digest: [5; 32],
+			drop_rows_digest: [6; 32],
+			drop_count: 1,
+		},
+	)
+}
+
+/// What a read of `key` answers, success or refusal, compared across reopens.
+async fn tier_certificate_read_outcome(
+	mgr: &SlabManager,
+	key: Identity,
+) -> Result<Vec<u8>, String> {
+	let location = mgr
+		.lookup(tenant(), key)
+		.map_err(|error| error.to_string())?
+		.ok_or_else(|| "absent".to_string())?;
+	mgr.read(location).await.map_err(|error| error.to_string())
+}
+
+/// ADR 0704 §3: certified tiered cleanup is admitted only in ParentDecisions
+/// mode, refused typed with nothing written outside it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_certified_tier_allocation_outside_parent_decisions_mode_is_refused_typed() {
+	use crate::storage::index::CertifiedTierAllocation;
+	use crate::storage::manager::certified_tier::{CertifiedTierRefusal, certified_tier_refusal};
+	let dir = fresh_dir("certified-tier-mode");
+	let owner = DataDirectoryOwner::acquire_existing(&dir).unwrap();
+	let mgr =
+		SlabManager::initialize_new_store_with_owner(gc_owned_test_config(&dir), owner.clone())
+			.await
+			.unwrap();
+	assert_eq!(mgr.certified_tier_cleanup_fenced(), None);
+	let (work, evidence) = certified_tier_job(&mgr, 0x7704, 0);
+	let error = mgr
+		.allocate_certified_tier_op(work.clone(), evidence.clone())
+		.await
+		.expect_err("refused");
+	assert_eq!(
+		certified_tier_refusal(&error),
+		Some(&CertifiedTierRefusal::NotInMode),
+		"{error}"
+	);
+	let index = mgr.require_op_index().unwrap();
+	assert_eq!(
+		index.next_op_seq_for_test().await.unwrap(),
+		1,
+		"nothing written"
+	);
+	assert_eq!(index.tier_certificate(1).await.unwrap(), None);
+	mgr.contain_version_reclamation();
+	let CertifiedTierAllocation::Allocated(allocation) = mgr
+		.allocate_certified_tier_op(work, evidence)
+		.await
+		.unwrap()
+	else {
+		panic!("in mode, under its generation, it allocates");
+	};
+	assert_eq!(allocation.first.key().op_seq, 1);
+	assert!(index.tier_certificate(1).await.unwrap().is_some());
+	drop(allocation);
+	let _ = owner.close(Duration::from_secs(2)).await;
+}
+
+/// ADR 0704 §3: each shape of disagreement between an op intent and its tier
+/// certificate fences certified tiered cleanup at a real reopen. The store
+/// opens, reads answer exactly what they answered with consistent state,
+/// nothing is cleared, and a further reopen still fences.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn each_tier_certificate_orphan_fences_certified_cleanup_at_a_real_reopen() {
+	use crate::storage::index::{
+		CertifiedTierAllocation, CertifiedTierOrphan, PersistentLocalIndex,
+	};
+	use crate::storage::manager::certified_tier::{
+		CertifiedTierFence, CertifiedTierRefusal, certified_tier_refusal,
+	};
+	for shape in [
+		"certificate-without-intent",
+		"intent-without-certificate",
+		"certificate-of-uncertified-intent",
+		"tampered-binding",
+	] {
+		let dir = fresh_dir("certified-tier-orphan");
+		let owner = DataDirectoryOwner::acquire_existing(&dir).unwrap();
+		let mgr =
+			SlabManager::initialize_new_store_with_owner(gc_owned_test_config(&dir), owner.clone())
+				.await
+				.unwrap();
+		mgr.contain_version_reclamation();
+		let key = id(0x0704);
+		mgr.append_durable(tenant(), key, hlc(1), b"before")
+			.await
+			.unwrap();
+		// The consistent state each shape starts from.
+		let index = mgr.require_op_index().unwrap();
+		let certificate = match shape {
+			"certificate-without-intent" => {
+				let (work, evidence) = certified_tier_job(&mgr, 0x7704, 0);
+				let CertifiedTierAllocation::Allocated(allocation) = mgr
+					.allocate_certified_tier_op(work, evidence)
+					.await
+					.unwrap()
+				else {
+					panic!("{shape}: allocates");
+				};
+				let certificate = index.tier_certificate(1).await.unwrap().unwrap();
+				index
+					.hand_off_op(allocation.first.key(), allocation.first.digest(), None)
+					.await
+					.unwrap();
+				certificate
+			}
+			"certificate-of-uncertified-intent" => {
+				let (work, evidence) = certified_tier_job(&mgr, 0x7704, 0);
+				let CertifiedTierAllocation::Allocated(allocation) = mgr
+					.allocate_certified_tier_op(work, evidence)
+					.await
+					.unwrap()
+				else {
+					panic!("{shape}: allocates");
+				};
+				let certificate = index.tier_certificate(1).await.unwrap().unwrap();
+				index
+					.hand_off_op(allocation.first.key(), allocation.first.digest(), None)
+					.await
+					.unwrap();
+				// An ordinary operation at sequence 2.
+				let crate::consensus::slab_ops::SlabCommand::Tier(mut op) =
+					allocation.first.command().clone()
+				else {
+					unreachable!()
+				};
+				op.tier.certified = None;
+				index
+					.allocate_ops(
+						vec![crate::consensus::slab_ops::SlabCommand::Tier(op)],
+						None,
+					)
+					.await
+					.unwrap();
+				certificate
+			}
+			_ => {
+				let (work, evidence) = certified_tier_job(&mgr, 0x7704, 0);
+				let CertifiedTierAllocation::Allocated(_) = mgr
+					.allocate_certified_tier_op(work, evidence)
+					.await
+					.unwrap()
+				else {
+					panic!("{shape}: allocates");
+				};
+				index.tier_certificate(1).await.unwrap().unwrap()
+			}
+		};
+		drop(mgr);
+		let _ = owner.close(Duration::from_secs(5)).await;
+		let reopen = || async {
+			let next = DataDirectoryOwner::acquire_existing(&dir).unwrap();
+			let mgr = SlabManager::open_with_owner(gc_owned_test_config(&dir), next.clone())
+				.await
+				.unwrap_or_else(|error| panic!("{shape}: the store opens: {error}"));
+			mgr.contain_version_reclamation();
+			(next, mgr)
+		};
+		// The baseline: consistent state, unfenced, and what a read answers.
+		let (next, mgr) = reopen().await;
+		assert_eq!(mgr.certified_tier_cleanup_fenced(), None, "{shape}");
+		let baseline = tier_certificate_read_outcome(&mgr, key).await;
+		let readiness = mgr.tier_authority_readiness_reason();
+		if shape == "certificate-without-intent" {
+			assert_eq!(baseline, Ok(b"before".to_vec()), "{shape}");
+		}
+		let index = mgr.require_op_index().unwrap();
+		let (op_seq, bytes, orphan) = match shape {
+			"certificate-without-intent" => (
+				1,
+				Some(PersistentLocalIndex::encode_tier_certificate_for_test(
+					&certificate,
+				)),
+				CertifiedTierOrphan::CertificateWithoutIntent { op_seq: 1 },
+			),
+			"intent-without-certificate" => (
+				1,
+				None,
+				CertifiedTierOrphan::IntentWithoutCertificate { op_seq: 1 },
+			),
+			"certificate-of-uncertified-intent" => (
+				2,
+				Some(PersistentLocalIndex::encode_tier_certificate_for_test(
+					&certificate,
+				)),
+				CertifiedTierOrphan::CertificateOfUncertifiedIntent { op_seq: 2 },
+			),
+			_ => {
+				let mut tampered = certificate.clone();
+				tampered.op_binding[0] ^= 1;
+				(
+					1,
+					Some(PersistentLocalIndex::encode_tier_certificate_for_test(
+						&tampered,
+					)),
+					CertifiedTierOrphan::CertificateBindsAnotherOp { op_seq: 1 },
+				)
+			}
+		};
+		index
+			.put_tier_certificate_raw_for_test(op_seq, bytes.clone())
+			.await;
+		assert_eq!(
+			mgr.certified_tier_cleanup_fenced(),
+			None,
+			"{shape}: found at open, not before"
+		);
+		drop(mgr);
+		let _ = next.close(Duration::from_secs(5)).await;
+		for round in ["first reopen", "second reopen"] {
+			let (next, mgr) = reopen().await;
+			let fence = Some(CertifiedTierFence::Orphans(vec![orphan]));
+			assert_eq!(
+				mgr.certified_tier_cleanup_fenced(),
+				fence.as_ref(),
+				"{shape}: {round}"
+			);
+			assert_eq!(
+				tier_certificate_read_outcome(&mgr, key).await,
+				baseline,
+				"{shape}: {round}: reads are unaffected"
+			);
+			assert_eq!(
+				mgr.tier_authority_readiness_reason(),
+				readiness,
+				"{shape}: {round}"
+			);
+			let (work, evidence) = certified_tier_job(&mgr, 0x7705, 0);
+			let error = mgr
+				.allocate_certified_tier_op(work, evidence)
+				.await
+				.expect_err("fenced");
+			assert_eq!(
+				certified_tier_refusal(&error),
+				Some(&CertifiedTierRefusal::Fenced(fence.clone().unwrap())),
+				"{shape}: {round}: {error}"
+			);
+			// Nothing is cleared automatically.
+			let index = mgr.require_op_index().unwrap();
+			assert_eq!(
+				index
+					.tier_certificate(op_seq)
+					.await
+					.unwrap()
+					.map(
+						|certificate| PersistentLocalIndex::encode_tier_certificate_for_test(
+							&certificate
+						)
+					),
+				bytes,
+				"{shape}: {round}"
+			);
+			drop(mgr);
+			let _ = next.close(Duration::from_secs(5)).await;
+		}
+	}
+}
+
+/// ADR 0704: an object store whose reads can be switched off.
+struct SwitchableObjectStore {
+	inner: Arc<dyn ObjectStore>,
+	down: std::sync::atomic::AtomicBool,
+}
+
+impl SwitchableObjectStore {
+	fn refuse(&self) -> std::io::Result<()> {
+		if self.down.load(std::sync::atomic::Ordering::Acquire) {
+			return Err(std::io::Error::new(
+				std::io::ErrorKind::ConnectionRefused,
+				"the object store is down",
+			));
+		}
+		Ok(())
+	}
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for SwitchableObjectStore {
+	fn planned_upload_uri(&self, key: &str) -> std::io::Result<String> {
+		self.inner.planned_upload_uri(key)
+	}
+
+	async fn put(&self, key: &str, bytes: &[u8]) -> std::io::Result<String> {
+		self.refuse()?;
+		self.inner.put(key, bytes).await
+	}
+
+	async fn head(&self, uri: &str) -> std::io::Result<crate::storage::l2::ObjectMetadata> {
+		self.refuse()?;
+		self.inner.head(uri).await
+	}
+
+	async fn get_range(&self, uri: &str, range: std::ops::Range<u64>) -> std::io::Result<Bytes> {
+		self.refuse()?;
+		self.inner.get_range(uri, range).await
+	}
+
+	async fn get_bytes(&self, uri: &str) -> std::io::Result<Bytes> {
+		self.refuse()?;
+		self.inner.get_bytes(uri).await
+	}
+
+	async fn list(&self, prefix: &str) -> std::io::Result<Vec<crate::storage::l2::ObjectMetadata>> {
+		self.inner.list(prefix).await
+	}
+
+	async fn delete(&self, uri: &str) -> std::io::Result<()> {
+		self.inner.delete(uri).await
+	}
+}
+
+const CERTIFIED_TIER_TABLE: TableObjectId = TableObjectId::new([0x74; 16]);
+
+/// ADR 0704: a ParentDecisions store whose one tiered slab, published through
+/// a real ring, holds `rows` (key, HLC, value). Parent rsv 5 (erased by T = 8)
+/// owned `debt`, rsv 9 (retained) owns `owned`; generation 1 is active with
+/// `winner` at HLC 20.
+struct CertifiedTierStore {
+	dir: crate::test_support::TestDir,
+	_l2_root: crate::test_support::TestDir,
+	l2: Arc<SwitchableObjectStore>,
+	owner: DataDirectoryOwner,
+	mgr: Arc<SlabManager>,
+	cluster: ControlCluster,
+	plain: Arc<crate::storage::RaftCommitter>,
+	slab: SlabId,
+	pointer: TieredSlabPointer,
+	winner: Identity,
+}
+
+async fn certified_tier_store(
+	tag: &str,
+	rows: &[(Identity, u64, u64)],
+	debt: &[(Identity, u64)],
+	owned: &[(Identity, u64)],
+	winner: Identity,
+) -> CertifiedTierStore {
+	certified_tier_store_with(tag, rows, debt, owned, winner, true).await
+}
+
+/// `certified_tier_store`; with `observing` false, the ring delivers nothing to
+/// this store (its canonical state is bound directly), so a test delivers and
+/// restarts it as it chooses. The store is durably marked (ParentDecisions).
+async fn certified_tier_store_with(
+	tag: &str,
+	rows: &[(Identity, u64, u64)],
+	debt: &[(Identity, u64)],
+	owned: &[(Identity, u64)],
+	winner: Identity,
+	observing: bool,
+) -> CertifiedTierStore {
+	use crate::storage::index::parent_intents::{OwnedVersion, ParentIntent, ParentIntentState};
+	let dir = fresh_dir(tag);
+	let l2_root = fresh_dir(&format!("{tag}-l2"));
+	let l2 = Arc::new(SwitchableObjectStore {
+		inner: Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap()),
+		down: std::sync::atomic::AtomicBool::new(false),
+	});
+	let shared: Arc<dyn ObjectStore> = l2.clone();
+	let owner = DataDirectoryOwner::acquire_existing(&dir).unwrap();
+	let mgr = SlabManager::initialize_new_store_with_owner(
+		tiered_input_config(&dir, &shared),
+		owner.clone(),
+	)
+	.await
+	.unwrap();
+	mgr.contain_version_reclamation();
+	crate::consensus::decision_mode::write_mode_marker_for_test(&dir);
+	let cluster = if observing {
+		control_cluster_observing(&[(1, &mgr)]).await
+	} else {
+		let cluster = control_cluster_observing(&[]).await;
+		mgr.bind_control_node(1).unwrap();
+		cluster
+	};
+	register_owner(&cluster.nodes[0], &mgr).await;
+	if !observing {
+		mgr.bind_canonical_tier_source(cluster.state_machines[0].tier_snapshot_source_for_test());
+	}
+	let plain = Arc::new(op_committer(&cluster, 1));
+	let index = mgr.persistent_index().unwrap();
+	let version = |(key, at): &(Identity, u64)| OwnedVersion {
+		table: CERTIFIED_TIER_TABLE,
+		key_identity: *key.as_bytes(),
+		hlc: hlc(*at),
+		row_digest: [*at as u8; 32],
+	};
+	for (rsv, versions) in [(5, debt), (9, owned)] {
+		if versions.is_empty() {
+			continue;
+		}
+		let mut manifest: Vec<OwnedVersion> = versions.iter().map(version).collect();
+		manifest.sort_by_key(|version| (version.table, version.key_identity, version.hlc));
+		index
+			.begin_parent_intent(ParentIntent {
+				tenant: tenant(),
+				rsv,
+				ordinal: 0,
+				claim_digest: [rsv as u8; 32],
+				range_start: 0,
+				range_end: u64::MAX,
+				content: [9; 32],
+				manifest,
+				state: ParentIntentState::Intent,
+			})
+			.await
+			.unwrap()
+			.unwrap();
+	}
+	for (key, at, value) in rows {
+		let frame = encode_test_append_only_storage_frame(
+			CERTIFIED_TIER_TABLE,
+			&[(*key, Locality::new(*at), hlc(*at), *value, false)],
+		);
+		let entries = storage_multirow_index_entries_from_frame(&frame)
+			.unwrap()
+			.expect("entries");
+		mgr.append_durable_multirow_with_locality(tenant(), &frame, &entries)
+			.await
+			.unwrap();
+	}
+	let slab = mgr.force_seal_active_for_test().await;
+	let raw = mgr.read_sealed_raw(slab).await.unwrap();
+	let encrypted = mgr.encrypt_tiered_object_blob(slab, &raw).unwrap();
+	let uri = shared
+		.put(&format!("tier/{tag}.wnd"), &encrypted.bytes)
+		.await
+		.unwrap();
+	let pointer = tiered_pointer_from_blob(&mgr, slab, uri, &encrypted.bytes);
+	crate::storage::sweeper::propose_tier_slab(
+		&mgr,
+		plain.as_ref(),
+		b10_tier(&mgr, &pointer),
+		None,
+	)
+	.await
+	.unwrap();
+	if !observing {
+		// What the observer would have delivered, then the hand-off it would have allowed.
+		mgr.apply_tier_slab_committed(pointer.clone(), None)
+			.await
+			.unwrap();
+		op_driver(&cluster, &mgr, plain.clone())
+			.drive_once()
+			.await
+			.unwrap();
+		assert_eq!(
+			mgr.require_op_index()
+				.unwrap()
+				.load_op_intents()
+				.await
+				.unwrap(),
+			Vec::new(),
+			"premise: the tiering handed off"
+		);
+	}
+	assert_eq!(mgr.tier_pointer(slab).await, Some(pointer.clone()));
+	certified_lsm_activate(&index, 1, winner, CERTIFIED_TIER_TABLE).await;
+	CertifiedTierStore {
+		dir,
+		_l2_root: l2_root,
+		l2,
+		owner,
+		mgr,
+		cluster,
+		plain,
+		slab,
+		pointer,
+		winner,
+	}
+}
+
+/// Decides as the data server does, from one read of the facts, with content
+/// evidence supplied by the test: `mismatched`'s stored content does not match
+/// its debt. Optionally activates generation 2 right after deciding.
+struct CertifiedTierTestDecider {
+	mismatched: Option<Identity>,
+	activate_after: Option<Identity>,
+	index: Arc<crate::storage::index::PersistentLocalIndex>,
+}
+
+#[async_trait]
+impl crate::storage::manager::certified_tier::CertifiedTierDecider for CertifiedTierTestDecider {
+	async fn decide(
+		&self,
+		job: &crate::storage::manager::certified_tier::TierCertifiedJob,
+	) -> std::io::Result<crate::storage::manager::certified_lsm::CertifiedSelection> {
+		use crate::storage::manager::certified_cleanup::{ContentEvidence, StoredCopy};
+		let facts = self.index.version_facts(job.versions()).await?;
+		let mut evidence = Vec::new();
+		for at in 0..facts.candidates().len() {
+			let Some((key, debt)) = &facts.get(at).debt else {
+				continue;
+			};
+			let stored = if Some(Identity::new(key.key_identity)) == self.mismatched {
+				[0xEE; 32]
+			} else {
+				debt.row_digest
+			};
+			evidence.extend(ContentEvidence::check(
+				*key,
+				debt,
+				false,
+				&[StoredCopy {
+					tombstone: false,
+					row_digest: Some(stored),
+				}],
+			));
+		}
+		let selection = crate::storage::manager::certified_lsm::CertifiedSelection::decide_tiered(
+			job, &facts, &evidence,
+		)?;
+		if let Some(winner) = self.activate_after {
+			certified_lsm_activate(&self.index, 2, winner, CERTIFIED_TIER_TABLE).await;
+		}
+		Ok(selection)
+	}
+}
+
+impl CertifiedTierStore {
+	fn decider(
+		&self,
+		mismatched: Option<Identity>,
+		activate_after: bool,
+	) -> CertifiedTierTestDecider {
+		CertifiedTierTestDecider {
+			mismatched,
+			activate_after: activate_after.then_some(self.winner),
+			index: self.mgr.persistent_index().unwrap(),
+		}
+	}
+
+	async fn step(
+		&self,
+		decider: &CertifiedTierTestDecider,
+	) -> std::io::Result<crate::storage::manager::certified_tier::CertifiedTierStep> {
+		self.mgr
+			.run_certified_tier_step(self.plain.as_ref(), decider, &TableSchemaCatalog::default())
+			.await
+	}
+
+	/// The slab's durable rows, by (key, HLC).
+	async fn durable_rows(&self) -> Vec<(Identity, HybridTimestamp)> {
+		let snapshot = self
+			.mgr
+			.persistent_index()
+			.unwrap()
+			.load_snapshot()
+			.await
+			.unwrap();
+		let mut rows: Vec<_> = snapshot
+			.record_rows
+			.iter()
+			.filter(|row| row.location.slab_id == self.slab)
+			.map(|row| (row.key_identity, row.location.hlc))
+			.collect();
+		rows.sort();
+		rows
+	}
+
+	async fn durable_rows_digest(&self) -> [u8; 32] {
+		let snapshot = self
+			.mgr
+			.persistent_index()
+			.unwrap()
+			.load_snapshot()
+			.await
+			.unwrap();
+		crate::storage::index::lsm_rows_digest(
+			snapshot
+				.record_rows
+				.iter()
+				.filter(|row| row.location.slab_id == self.slab)
+				.copied(),
+		)
+	}
+
+	async fn committed(&self) -> Option<crate::consensus::TieredSlab> {
+		self.cluster.state_machines[0]
+			.tiered_slab(self.mgr.owner_ref().unwrap().slab(self.slab))
+			.await
+	}
+
+	async fn l2_objects(&self) -> usize {
+		self.l2.inner.list("").await.unwrap().len()
+	}
+
+	async fn close(self) {
+		let _ = self.owner.close(Duration::from_secs(2)).await;
+	}
+
+	/// A real restart of a non-observing store: dropped, its owner closed,
+	/// reopened from disk, then bound to the same ring as at boot.
+	async fn restart(self) -> Self {
+		let CertifiedTierStore {
+			dir,
+			_l2_root,
+			l2,
+			owner,
+			mgr,
+			cluster,
+			plain,
+			slab,
+			pointer,
+			winner,
+		} = self;
+		mgr.fsync_all_local_slabs().await.unwrap();
+		let crypto = mgr.config.crypto.clone();
+		drop(mgr);
+		let _ = owner.close(Duration::from_secs(5)).await;
+		let keysets = crypto.tenant_keysets_snapshot().unwrap();
+		crypto
+			.replace_keysets_from_authoritative_snapshot(&keysets)
+			.unwrap();
+		let shared: Arc<dyn ObjectStore> = l2.clone();
+		let owner = DataDirectoryOwner::acquire_existing(&dir).unwrap();
+		let mgr = SlabManager::open_with_owner(
+			SlabManagerConfig {
+				crypto,
+				..tiered_input_config(&dir, &shared)
+			},
+			owner.clone(),
+		)
+		.await
+		.unwrap();
+		assert!(mgr.versions_contained(), "reopened marked");
+		mgr.bind_control_node(1).unwrap();
+		mgr.bind_canonical_tier_source(cluster.state_machines[0].tier_snapshot_source_for_test());
+		CertifiedTierStore {
+			dir,
+			_l2_root,
+			l2,
+			owner,
+			mgr,
+			cluster,
+			plain,
+			slab,
+			pointer,
+			winner,
+		}
+	}
+
+	/// `restart`, but the reopened store is bound to no control node and no
+	/// canonical state.
+	async fn restart_unbound(self) -> Self {
+		let CertifiedTierStore {
+			dir,
+			_l2_root,
+			l2,
+			owner,
+			mgr,
+			cluster,
+			plain,
+			slab,
+			pointer,
+			winner,
+		} = self;
+		mgr.fsync_all_local_slabs().await.unwrap();
+		let crypto = mgr.config.crypto.clone();
+		drop(mgr);
+		let _ = owner.close(Duration::from_secs(5)).await;
+		let keysets = crypto.tenant_keysets_snapshot().unwrap();
+		crypto
+			.replace_keysets_from_authoritative_snapshot(&keysets)
+			.unwrap();
+		let shared: Arc<dyn ObjectStore> = l2.clone();
+		let owner = DataDirectoryOwner::acquire_existing(&dir).unwrap();
+		let mgr = SlabManager::open_with_owner(
+			SlabManagerConfig {
+				crypto,
+				..tiered_input_config(&dir, &shared)
+			},
+			owner.clone(),
+		)
+		.await
+		.unwrap();
+		assert!(mgr.versions_contained(), "reopened marked");
+		CertifiedTierStore {
+			dir,
+			_l2_root,
+			l2,
+			owner,
+			mgr,
+			cluster,
+			plain,
+			slab,
+			pointer,
+			winner,
+		}
+	}
+
+	/// One recovery pass of this store's op driver.
+	async fn drive(&self) -> std::io::Result<()> {
+		op_driver(&self.cluster, &self.mgr, self.plain.clone())
+			.drive_once()
+			.await
+	}
+
+	/// Recovery passes until no operation is open, waiting on the tier authority
+	/// between them: its open-time verification and replays run in the background.
+	async fn drive_until_resolved(&self) {
+		let mut outcomes = Vec::new();
+		for _ in 0..40 {
+			outcomes.push(format!("{:?}", self.drive().await));
+			let open = self
+				.mgr
+				.require_op_index()
+				.unwrap()
+				.load_op_intents()
+				.await
+				.unwrap();
+			if open.is_empty() {
+				return;
+			}
+			self.mgr
+				.tier_authority_change_within(Duration::from_millis(100))
+				.await;
+		}
+		panic!("still unresolved after {outcomes:?}");
+	}
+
+	/// The one open operation of this store.
+	async fn open_op(&self) -> crate::storage::index::OpTicket {
+		let loaded = self
+			.mgr
+			.require_op_index()
+			.unwrap()
+			.load_op_intents()
+			.await
+			.unwrap();
+		let [LoadedOp::Submittable(ticket)] = loaded.as_slice() else {
+			panic!("one open operation: {loaded:?}");
+		};
+		ticket.clone()
+	}
+
+	/// The log index `ticket` was decided Applied at.
+	async fn applied_at(&self, ticket: &crate::storage::index::OpTicket) -> u64 {
+		use crate::consensus::slab_ops::{RecordedOutcome, ViewOutcome};
+		let view = self
+			.plain
+			.op_view(ticket.key(), ticket.digest(), ticket.command().slabs())
+			.await
+			.unwrap();
+		let ViewOutcome::Recorded(RecordedOutcome::Applied { index }) = view.outcome else {
+			panic!("premise: applied, {view:?}");
+		};
+		index
+	}
+
+	/// The ring's committed pointer, as a store pointer.
+	async fn committed_pointer(&self) -> Option<TieredSlabPointer> {
+		self.committed()
+			.await
+			.map(|tier| TieredSlabPointer::from_ring(&tier))
+	}
+
+	/// Each listed version's exact read: its row's value, or `None` when absent.
+	/// Waits for the tier authority first, as a reader does.
+	async fn reads(&self, versions: &[(Identity, u64)]) -> Vec<Option<u64>> {
+		let diagnose = |error: std::io::Error| -> ! {
+			panic!(
+				"read refused: {error}; readiness {:?}; deferrals {:?}; pending {:?}",
+				self.mgr.tier_authority_readiness_reason(),
+				self.mgr
+					.unapplied_tier_pointers
+					.iter()
+					.map(|entry| (*entry.key(), entry.value().outcome))
+					.collect::<Vec<_>>(),
+				self.mgr
+					.tier_authority
+					.pending
+					.iter()
+					.map(|entry| *entry.key())
+					.collect::<Vec<_>>(),
+			)
+		};
+		if let Err(error) = self.mgr.wait_tier_authority_ready().await {
+			diagnose(error);
+		}
+		let mut reads = Vec::new();
+		for (key, at) in versions {
+			let location = match self.mgr.lookup_as_of(tenant(), *key, hlc(*at)) {
+				Ok(location) => location,
+				Err(error) => diagnose(error),
+			};
+			reads.push(match location {
+				Some(location) if location.hlc == hlc(*at) => {
+					let frame = self.mgr.read(location).await.unwrap();
+					let row = materialize_record_location_batch(
+						&decode_record_batch(&frame).unwrap(),
+						location.record_row_index,
+					)
+					.unwrap();
+					Some(
+						row.column_by_name("value")
+							.expect("a value column")
+							.as_any()
+							.downcast_ref::<UInt64Array>()
+							.expect("u64 values")
+							.value(0),
+					)
+				}
+				_ => None,
+			});
+		}
+		reads
+	}
+}
+
+/// ADR 0704 §1: a certified step over a slab holding an obsolete version
+/// (debt with matching content), its winner, an owned version, an unlisted
+/// row and debt whose content does not match. Exactly the obsolete version is
+/// reclaimed into a fresh `certified/` object through one certified `Tier`;
+/// the survivors are exactly the rest; the ring's postimage rows digest is the
+/// delivery's own derivation (the published rows); the old object is retained.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_certified_tier_step_rewrites_a_partial_selection_to_exactly_its_survivors() {
+	use crate::storage::manager::certified_tier::CertifiedTierStep;
+	let (obsolete, owned, unlisted, mismatched) = (id(0x7401), id(0x7402), id(0x7403), id(0x7404));
+	let store = certified_tier_store(
+		"certified-tier-partial",
+		&[
+			(obsolete, 10, 1),
+			(obsolete, 20, 2),
+			(owned, 15, 3),
+			(unlisted, 12, 4),
+			(mismatched, 11, 5),
+		],
+		&[(obsolete, 10), (mismatched, 11)],
+		&[(owned, 15)],
+		obsolete,
+	)
+	.await;
+	let source = store.pointer.clone();
+	let before = store.durable_rows().await;
+	assert_eq!(before.len(), 5, "premise: five durable rows");
+	let step = store
+		.step(&store.decider(Some(mismatched), false))
+		.await
+		.unwrap();
+	let CertifiedTierStep::Rewritten {
+		slab,
+		op,
+		candidate,
+	} = step
+	else {
+		panic!("a partial selection rewrites: {step:?}");
+	};
+	assert_eq!(slab, store.slab);
+	assert!(candidate.contains("certified/"), "{candidate}");
+	// The survivors are exactly the rest.
+	let mut survivors: Vec<_> = before
+		.iter()
+		.copied()
+		.filter(|row| *row != (obsolete, hlc(10)))
+		.collect();
+	survivors.sort();
+	assert_eq!(store.durable_rows().await, survivors);
+	// The ring names the certified rewrite; its postimage digest is the rows
+	// the delivery published.
+	let committed = store.committed().await.expect("a committed pointer");
+	assert_eq!(committed.l2_uri, candidate);
+	let provenance = committed.certified.clone().expect("certified provenance");
+	assert_eq!(provenance.op, op);
+	assert_eq!(
+		provenance.source,
+		crate::consensus::slab_ops::TierGeneration::from(&source)
+	);
+	assert_eq!(
+		provenance.postimage_rows_digest,
+		store.durable_rows_digest().await,
+		"the delivery's own derivation"
+	);
+	assert_eq!(
+		store.mgr.tier_pointer(store.slab).await.map(|p| p.l2_uri),
+		Some(candidate.clone())
+	);
+	// Reads: the obsolete version is gone, everything else answers.
+	assert!(
+		store
+			.mgr
+			.lookup_as_of(tenant(), obsolete, hlc(10))
+			.unwrap()
+			.is_none()
+	);
+	for key in [obsolete, owned, unlisted, mismatched] {
+		let location = store.mgr.lookup(tenant(), key).unwrap().expect("survives");
+		store.mgr.read(location).await.unwrap();
+	}
+	// The old object is retained, and reported as the certified path's.
+	let bytes = store.l2.inner.get(&source.l2_uri).await.unwrap().len() as u64;
+	let retained = store.mgr.certified_retained_objects_for_test();
+	assert_eq!(
+		(retained.count, retained.bytes, retained.uris),
+		(1, bytes, vec![source.l2_uri.clone()])
+	);
+	// What the existing delivery path did with the Applied certified op.
+	let index = store.mgr.require_op_index().unwrap();
+	assert_eq!(
+		index.load_op_intents().await.unwrap(),
+		Vec::new(),
+		"handed off"
+	);
+	assert_eq!(
+		index.tier_certificate(op.op_seq).await.unwrap(),
+		None,
+		"the hand-off cleared its certificate"
+	);
+	store.close().await;
+}
+
+/// ADR 0704 §1: a slab holding only obsolete versions proposes one certified
+/// `Retire` of its source generation; the old object is retained.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_certified_tier_step_retires_an_all_obsolete_slab() {
+	use crate::storage::manager::certified_tier::CertifiedTierStep;
+	let (first, second) = (id(0x7411), id(0x7412));
+	let store = certified_tier_store(
+		"certified-tier-retire",
+		&[(first, 10, 1), (second, 11, 2)],
+		&[(first, 10), (second, 11)],
+		&[],
+		first,
+	)
+	.await;
+	let step = store.step(&store.decider(None, false)).await.unwrap();
+	let CertifiedTierStep::Retired { slab, op } = step else {
+		panic!("an all-obsolete slab retires: {step:?}");
+	};
+	assert_eq!(slab, store.slab);
+	assert_eq!(store.committed().await, None, "no committed pointer");
+	assert_eq!(store.mgr.tier_pointer(store.slab).await, None);
+	assert_eq!(store.durable_rows().await, Vec::new());
+	for (key, at) in [(first, 10), (second, 11)] {
+		assert!(
+			store
+				.mgr
+				.lookup_as_of(tenant(), key, hlc(at))
+				.unwrap()
+				.is_none()
+		);
+	}
+	let bytes = store
+		.l2
+		.inner
+		.get(&store.pointer.l2_uri)
+		.await
+		.unwrap()
+		.len() as u64;
+	let retained = store.mgr.certified_retained_objects_for_test();
+	assert_eq!(
+		(retained.count, retained.bytes, retained.uris),
+		(1, bytes, vec![store.pointer.l2_uri.clone()])
+	);
+	let index = store.mgr.require_op_index().unwrap();
+	assert_eq!(
+		index.load_op_intents().await.unwrap(),
+		Vec::new(),
+		"handed off"
+	);
+	assert_eq!(index.tier_certificate(op.op_seq).await.unwrap(), None);
+	store.close().await;
+}
+
+/// ADR 0704 §1: a slab none of whose versions is certified obsolete proposes
+/// nothing and writes nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_certified_tier_step_with_an_empty_selection_writes_nothing() {
+	use crate::storage::manager::certified_tier::CertifiedTierStep;
+	let (debt_elsewhere, owned, unlisted) = (id(0x7421), id(0x7422), id(0x7423));
+	let store = certified_tier_store(
+		"certified-tier-empty",
+		&[(owned, 15, 1), (unlisted, 12, 2)],
+		&[(debt_elsewhere, 10)],
+		&[(owned, 15)],
+		debt_elsewhere,
+	)
+	.await;
+	let index = store.mgr.require_op_index().unwrap();
+	let next = index.next_op_seq_for_test().await.unwrap();
+	let objects = store.l2_objects().await;
+	let rows = store.durable_rows().await;
+	let step = store.step(&store.decider(None, false)).await.unwrap();
+	assert_eq!(step, CertifiedTierStep::NothingSelected(store.slab));
+	assert_eq!(
+		index.next_op_seq_for_test().await.unwrap(),
+		next,
+		"no operation"
+	);
+	assert_eq!(store.l2_objects().await, objects, "no upload");
+	assert_eq!(store.durable_rows().await, rows);
+	assert_eq!(
+		store.mgr.tier_pointer(store.slab).await,
+		Some(store.pointer.clone())
+	);
+	store.close().await;
+}
+
+/// ADR 0704 §3: a generation that moves between the decision and the
+/// allocation allocates nothing: no sequence, no intent, no certificate, the
+/// pointer unchanged, and the uploaded candidate retained and unreferenced.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_generation_moving_between_decision_and_allocation_allocates_nothing() {
+	use crate::storage::manager::certified_tier::CertifiedTierStep;
+	let (obsolete, unlisted) = (id(0x7431), id(0x7432));
+	let store = certified_tier_store(
+		"certified-tier-moved",
+		&[(obsolete, 10, 1), (obsolete, 20, 2), (unlisted, 12, 3)],
+		&[(obsolete, 10)],
+		&[],
+		obsolete,
+	)
+	.await;
+	let index = store.mgr.require_op_index().unwrap();
+	let next = index.next_op_seq_for_test().await.unwrap();
+	let rows = store.durable_rows().await;
+	let step = store.step(&store.decider(None, true)).await.unwrap();
+	let CertifiedTierStep::GenerationMoved {
+		slab,
+		candidate: Some(candidate),
+	} = step
+	else {
+		panic!("the generation moved: {step:?}");
+	};
+	assert_eq!(slab, store.slab);
+	assert_eq!(
+		index.next_op_seq_for_test().await.unwrap(),
+		next,
+		"no sequence"
+	);
+	assert_eq!(index.load_op_intents().await.unwrap(), Vec::new());
+	assert_eq!(index.tier_certificate(next).await.unwrap(), None);
+	assert_eq!(
+		store.mgr.tier_pointer(store.slab).await,
+		Some(store.pointer.clone())
+	);
+	assert_eq!(
+		store.committed().await.map(|tier| tier.l2_uri),
+		Some(store.pointer.l2_uri.clone())
+	);
+	assert_eq!(store.durable_rows().await, rows, "nothing reclaimed");
+	store
+		.l2
+		.inner
+		.get(&candidate)
+		.await
+		.expect("the candidate is retained");
+	store.close().await;
+}
+
+/// ADR 0704 §6: the step refuses, typed and writing nothing, off the leader,
+/// outside ParentDecisions mode, when fenced, with no canonical tier state, and
+/// when the object store cannot serve the claimed object.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_certified_tier_step_refuses_off_the_leader_outside_mode_when_fenced_and_without_its_object()
+ {
+	use crate::storage::manager::certified_tier::{CertifiedTierRefusal, certified_tier_refusal};
+	let refusal = |result: std::io::Result<_>| {
+		let error = result.expect_err("refused");
+		certified_tier_refusal(&error)
+			.cloned()
+			.unwrap_or_else(|| panic!("not a typed refusal: {error}"))
+	};
+	let (obsolete, unlisted) = (id(0x7441), id(0x7442));
+	let store = certified_tier_store(
+		"certified-tier-refusals",
+		&[(obsolete, 10, 1), (obsolete, 20, 2), (unlisted, 12, 3)],
+		&[(obsolete, 10)],
+		&[],
+		obsolete,
+	)
+	.await;
+	let index = store.mgr.require_op_index().unwrap();
+	let next = index.next_op_seq_for_test().await.unwrap();
+	let decider = store.decider(None, false);
+	// A follower's committer.
+	let follower = op_committer(&store.cluster, 2);
+	assert_eq!(
+		refusal(
+			store
+				.mgr
+				.run_certified_tier_step(&follower, &decider, &TableSchemaCatalog::default())
+				.await
+		),
+		CertifiedTierRefusal::NotLeader
+	);
+	// The object store cannot serve the published object at the claim.
+	store
+		.l2
+		.down
+		.store(true, std::sync::atomic::Ordering::Release);
+	assert_eq!(
+		refusal(store.step(&decider).await),
+		CertifiedTierRefusal::ObjectStoreUnavailable
+	);
+	store
+		.l2
+		.down
+		.store(false, std::sync::atomic::Ordering::Release);
+	assert_eq!(
+		index.next_op_seq_for_test().await.unwrap(),
+		next,
+		"nothing proposed"
+	);
+	assert_eq!(
+		store.mgr.tier_pointer(store.slab).await,
+		Some(store.pointer.clone())
+	);
+	store.close().await;
+
+	// Outside mode; then, in mode, an isolated store with no canonical state;
+	// then the same store fenced by an orphan certificate at its reopen.
+	let dir = fresh_dir("certified-tier-refusals-isolated");
+	let owner = DataDirectoryOwner::acquire_existing(&dir).unwrap();
+	let mgr =
+		SlabManager::initialize_new_store_with_owner(gc_owned_test_config(&dir), owner.clone())
+			.await
+			.unwrap();
+	let committer = DirectTierCommitter {
+		manager: mgr.clone(),
+	};
+	let run = |mgr: Arc<SlabManager>| {
+		let decider = CertifiedTierTestDecider {
+			mismatched: None,
+			activate_after: None,
+			index: mgr.persistent_index().unwrap(),
+		};
+		let committer = DirectTierCommitter {
+			manager: mgr.clone(),
+		};
+		async move {
+			mgr.run_certified_tier_step(&committer, &decider, &TableSchemaCatalog::default())
+				.await
+		}
+	};
+	drop(committer);
+	assert_eq!(
+		refusal(run(mgr.clone()).await),
+		CertifiedTierRefusal::NotInMode
+	);
+	mgr.contain_version_reclamation();
+	assert_eq!(
+		refusal(run(mgr.clone()).await),
+		CertifiedTierRefusal::NoCanonicalSource
+	);
+	mgr.require_op_index()
+		.unwrap()
+		.put_tier_certificate_raw_for_test(9, Some(b"orphan".to_vec()))
+		.await;
+	drop(mgr);
+	let _ = owner.close(Duration::from_secs(5)).await;
+	let next = DataDirectoryOwner::acquire_existing(&dir).unwrap();
+	let mgr = SlabManager::open_with_owner(gc_owned_test_config(&dir), next.clone())
+		.await
+		.unwrap();
+	mgr.contain_version_reclamation();
+	assert!(matches!(
+		refusal(run(mgr.clone()).await),
+		CertifiedTierRefusal::Fenced(_)
+	));
+	drop(mgr);
+	let _ = next.close(Duration::from_secs(2)).await;
+}
+
+/// ADR 0704 §4: the partial store of the delivery controls: an obsolete version
+/// (debt, matching content), its winner, and an unlisted row. Non-observing.
+async fn certified_partial_store(tag: &str) -> CertifiedTierStore {
+	let (obsolete, unlisted) = (id(0x7501), id(0x7502));
+	certified_tier_store_with(
+		tag,
+		&[(obsolete, 10, 1), (obsolete, 20, 2), (unlisted, 12, 3)],
+		&[(obsolete, 10)],
+		&[],
+		obsolete,
+		false,
+	)
+	.await
+}
+
+const CERTIFIED_PARTIAL_VERSIONS: [(u64, u64); 3] = [(0x7501, 10), (0x7501, 20), (0x7502, 12)];
+
+fn certified_partial_versions() -> Vec<(Identity, u64)> {
+	CERTIFIED_PARTIAL_VERSIONS
+		.iter()
+		.map(|(key, at)| (id(*key), *at))
+		.collect()
+}
+
+/// ADR 0704 §4: the all-obsolete store: two debt versions with matching content.
+async fn certified_retire_store(tag: &str) -> CertifiedTierStore {
+	let (first, second) = (id(0x7511), id(0x7512));
+	certified_tier_store_with(
+		tag,
+		&[(first, 10, 1), (second, 11, 2)],
+		&[(first, 10), (second, 11)],
+		&[],
+		first,
+		false,
+	)
+	.await
+}
+
+fn certified_retire_versions() -> Vec<(Identity, u64)> {
+	vec![(id(0x7511), 10), (id(0x7512), 11)]
+}
+
+fn is_certified_evidence_fence(error: &std::io::Error) -> bool {
+	tier_deferral::fence_cause(error) == Some(tier_deferral::FenceCause::CertifiedEvidence)
+}
+
+/// The step, cut where `cut` says, as a crash would end it.
+async fn certified_step_cut_at(
+	store: &CertifiedTierStore,
+	cut: crate::storage::manager::certified_tier::CertifiedTierCut,
+) {
+	store.mgr.cut_next_certified_tier_step(cut);
+	let error = store
+		.step(&store.decider(None, false))
+		.await
+		.expect_err("cut");
+	assert!(error.to_string().contains("cut at"), "{error}");
+}
+
+/// ADR 0704 acceptance 2: a crash after the candidate's upload and before any
+/// proposal reopens to the old view: no operation, the source pointer, its rows
+/// and reads exact, and the candidate retained and never referenced.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_certified_rewrite_cut_after_upload_reopens_to_the_old_view() {
+	use crate::storage::manager::certified_tier::CertifiedTierCut;
+	let store = certified_partial_store("certified-cut-upload").await;
+	let (rows, reads) = (
+		store.durable_rows().await,
+		store.reads(&certified_partial_versions()).await,
+	);
+	let objects = store.l2_objects().await;
+	certified_step_cut_at(&store, CertifiedTierCut::AfterUpload).await;
+	let store = store.restart().await;
+	store.drive().await.unwrap();
+	let index = store.mgr.require_op_index().unwrap();
+	assert_eq!(index.load_op_intents().await.unwrap(), Vec::new());
+	assert_eq!(
+		store.mgr.tier_pointer(store.slab).await,
+		Some(store.pointer.clone())
+	);
+	assert_eq!(store.committed_pointer().await, Some(store.pointer.clone()));
+	assert_eq!(store.durable_rows().await, rows);
+	assert_eq!(store.reads(&certified_partial_versions()).await, reads);
+	assert_eq!(
+		store.l2_objects().await,
+		objects + 1,
+		"the candidate is retained"
+	);
+	store.close().await;
+}
+
+/// ADR 0704 acceptance 2: a crash after the proposal's intent and certificate
+/// and before any decision: recovery's Cancel rejects it, the candidate is a
+/// rejected candidate, the certificate goes with the hand-off, the old view stands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_certified_rewrite_cut_before_a_decision_is_cancelled_to_a_rejected_candidate() {
+	use crate::storage::manager::certified_tier::CertifiedTierCut;
+	let store = certified_partial_store("certified-cut-decision").await;
+	let (rows, reads) = (
+		store.durable_rows().await,
+		store.reads(&certified_partial_versions()).await,
+	);
+	certified_step_cut_at(&store, CertifiedTierCut::BeforeSubmit).await;
+	let ticket = store.open_op().await;
+	assert_eq!(
+		ticket.certificate_requirement(),
+		crate::storage::index::CertificateRequirement::Required
+	);
+	let store = store.restart().await;
+	store.drive().await.unwrap();
+	let index = store.mgr.require_op_index().unwrap();
+	assert_eq!(index.load_op_intents().await.unwrap(), Vec::new());
+	assert_eq!(
+		index.tier_certificate(ticket.key().op_seq).await.unwrap(),
+		None
+	);
+	let rejected = index.load_rejected_tier_candidates().await.unwrap();
+	assert_eq!(rejected.len(), 1, "{rejected:?}");
+	assert!(rejected[0].l2_uri.contains("certified/"), "{rejected:?}");
+	assert_eq!(
+		store.mgr.tier_pointer(store.slab).await,
+		Some(store.pointer.clone())
+	);
+	assert_eq!(store.durable_rows().await, rows);
+	assert_eq!(store.reads(&certified_partial_versions()).await, reads);
+	store.close().await;
+}
+
+/// ADR 0704 acceptance 2: a crash after the ring accepted the rewrite and before
+/// this store delivered it: at reopen recovery publishes it by the table
+/// (certificate present, source exact), then hands it off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_certified_rewrite_cut_after_acceptance_is_published_by_the_table_at_reopen() {
+	use crate::storage::manager::certified_tier::CertifiedTierCut;
+	let store = certified_partial_store("certified-cut-acceptance").await;
+	let rows = store.durable_rows().await;
+	let reads = store.reads(&certified_partial_versions()).await;
+	certified_step_cut_at(&store, CertifiedTierCut::AfterAcceptance).await;
+	let ticket = store.open_op().await;
+	let committed = store.committed_pointer().await.expect("committed");
+	assert_ne!(committed, store.pointer, "premise: the ring moved");
+	assert_eq!(
+		store.mgr.tier_pointer(store.slab).await,
+		Some(store.pointer.clone()),
+		"premise: not delivered"
+	);
+	let store = store.restart().await;
+	store.drive_until_resolved().await;
+	assert_eq!(
+		store
+			.mgr
+			.tier_pointer(store.slab)
+			.await
+			.map(|pointer| pointer.l2_uri),
+		Some(committed.l2_uri.clone())
+	);
+	let survivors: Vec<_> = rows
+		.iter()
+		.copied()
+		.filter(|row| *row != (id(0x7501), hlc(10)))
+		.collect();
+	assert_eq!(store.durable_rows().await, survivors);
+	assert_eq!(
+		store.durable_rows_digest().await,
+		store
+			.committed()
+			.await
+			.unwrap()
+			.certified
+			.unwrap()
+			.postimage_rows_digest
+	);
+	assert_eq!(
+		store.reads(&certified_partial_versions()).await,
+		vec![None, reads[1].clone(), reads[2].clone()]
+	);
+	let index = store.mgr.require_op_index().unwrap();
+	assert_eq!(
+		index.load_op_intents().await.unwrap(),
+		Vec::new(),
+		"handed off"
+	);
+	assert_eq!(
+		index.tier_certificate(ticket.key().op_seq).await.unwrap(),
+		None
+	);
+	store.close().await;
+}
+
+/// ADR 0704 acceptance 2: a rewrite delivered and not yet handed off when the
+/// store restarts completes as already published; after its acknowledgement and
+/// pruning (its certificate gone), a redelivery is still a no-op, and a further
+/// restart reads exactly the same.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_certified_rewrite_delivered_before_its_hand_off_completes_as_already_published() {
+	use crate::storage::manager::certified_tier::CertifiedTierStep;
+	let store = certified_partial_store("certified-delivered-rewrite").await;
+	let step = store.step(&store.decider(None, false)).await.unwrap();
+	let CertifiedTierStep::Rewritten { op, .. } = step else {
+		panic!("rewritten: {step:?}");
+	};
+	assert_eq!(
+		store.open_op().await.key(),
+		op,
+		"premise: delivered, not handed off"
+	);
+	let rows = store.durable_rows().await;
+	let reads = store.reads(&certified_partial_versions()).await;
+	assert_eq!(reads[0], None, "premise: the obsolete version is gone");
+	let store = store.restart().await;
+	store.drive_until_resolved().await;
+	store.drive().await.unwrap();
+	let index = store.mgr.require_op_index().unwrap();
+	assert_eq!(
+		index.load_op_intents().await.unwrap(),
+		Vec::new(),
+		"handed off"
+	);
+	assert_eq!(index.tier_certificate(op.op_seq).await.unwrap(), None);
+	assert_eq!(
+		index.load_ack_pending().await.unwrap(),
+		Vec::new(),
+		"acknowledged"
+	);
+	assert!(
+		store.cluster.state_machines[0]
+			.op_acked_through(op.owner)
+			.await >= op.op_seq,
+		"pruned"
+	);
+	// Its certificate gone, a redelivery is already published.
+	let committed = store.committed_pointer().await.unwrap();
+	store
+		.mgr
+		.apply_tier_slab_committed(committed.clone(), None)
+		.await
+		.unwrap();
+	assert_eq!(store.durable_rows().await, rows);
+	let store = store.restart().await;
+	store.drive().await.unwrap();
+	assert_eq!(store.mgr.tier_pointer(store.slab).await, Some(committed));
+	assert_eq!(store.durable_rows().await, rows);
+	assert_eq!(store.reads(&certified_partial_versions()).await, reads);
+	store.close().await;
+}
+
+/// ADR 0704 acceptance 2: a retirement delivered and not yet handed off when the
+/// store restarts completes as already published; after acknowledgement and
+/// pruning no retained entry names it, and a redelivery of the ring's removal
+/// over the empty local postimage is a duplicate no-op.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_certified_retirement_delivered_before_its_hand_off_completes_as_already_published() {
+	use crate::storage::manager::certified_tier::CertifiedTierStep;
+	let store = certified_retire_store("certified-delivered-retire").await;
+	let step = store.step(&store.decider(None, false)).await.unwrap();
+	let CertifiedTierStep::Retired { op, .. } = step else {
+		panic!("retired: {step:?}");
+	};
+	let ticket = store.open_op().await;
+	assert_eq!(ticket.key(), op, "premise: delivered, not handed off");
+	let applied = store.applied_at(&ticket).await;
+	let store = store.restart().await;
+	store.drive_until_resolved().await;
+	store.drive().await.unwrap();
+	let index = store.mgr.require_op_index().unwrap();
+	assert_eq!(
+		index.load_op_intents().await.unwrap(),
+		Vec::new(),
+		"handed off"
+	);
+	assert_eq!(index.tier_certificate(op.op_seq).await.unwrap(), None);
+	assert_eq!(
+		index.load_ack_pending().await.unwrap(),
+		Vec::new(),
+		"acknowledged"
+	);
+	let owner = store.mgr.owner_ref().unwrap();
+	let lease = store.cluster.state_machines[0]
+		.tier_snapshot_source_for_test()
+		.read()
+		.await
+		.unwrap();
+	assert_eq!(
+		lease
+			.certified_retirement(owner, owner.slab(store.slab))
+			.unwrap(),
+		None,
+		"pruned"
+	);
+	drop(lease);
+	assert!(
+		!store
+			.mgr
+			.retire_tiered_slab_committed(store.slab, Some(applied))
+			.await
+			.unwrap(),
+		"a duplicate no-op"
+	);
+	let store = store.restart().await;
+	store.drive().await.unwrap();
+	assert_eq!(store.mgr.tier_pointer(store.slab).await, None);
+	assert_eq!(store.durable_rows().await, Vec::new());
+	assert_eq!(
+		store.reads(&certified_retire_versions()).await,
+		vec![None, None]
+	);
+	store.close().await;
+}
+
+/// ADR 0704 acceptance 5: a certificate deleted before the observer delivers
+/// its operation: the delivery defers, typed, installs nothing, and reads of the
+/// slab refuse; recovery leaves the operation unresolved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_certificate_deleted_before_delivery_defers_and_installs_nothing_certified() {
+	use crate::storage::manager::certified_tier::CertifiedTierCut;
+	let store = certified_partial_store("certified-deleted-certificate").await;
+	let rows = store.durable_rows().await;
+	certified_step_cut_at(&store, CertifiedTierCut::AfterAcceptance).await;
+	let ticket = store.open_op().await;
+	let applied = store.applied_at(&ticket).await;
+	let index = store.mgr.require_op_index().unwrap();
+	index
+		.put_tier_certificate_raw_for_test(ticket.key().op_seq, None)
+		.await;
+	let committed = store.committed_pointer().await.unwrap();
+	let error = store
+		.mgr
+		.apply_tier_slab_committed(committed.clone(), Some(applied))
+		.await
+		.expect_err("deferred");
+	assert!(is_certified_evidence_fence(&error), "{error}");
+	assert_eq!(
+		store.mgr.tier_pointer(store.slab).await,
+		Some(store.pointer.clone())
+	);
+	assert_eq!(store.durable_rows().await, rows, "nothing installed");
+	assert!(
+		store
+			.mgr
+			.unapplied_tier_pointers
+			.get(&store.slab)
+			.is_some_and(|entry| entry.value().pointer == committed),
+		"deferred, typed"
+	);
+	assert!(
+		store.mgr.lookup(tenant(), id(0x7502)).is_err(),
+		"reads refuse"
+	);
+	let _ = store.drive().await;
+	assert_eq!(store.open_op().await.key(), ticket.key(), "unresolved");
+	assert_eq!(
+		store.mgr.tier_pointer(store.slab).await,
+		Some(store.pointer.clone())
+	);
+	store.close().await;
+}
+
+/// ADR 0704 acceptance 5: a tampered certificate (its drop count) fences the
+/// publication through the observer and, after a restart, through recovery.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tampered_certificate_fences_its_certified_publication() {
+	use crate::storage::index::PersistentLocalIndex;
+	use crate::storage::manager::certified_tier::CertifiedTierCut;
+	let store = certified_partial_store("certified-tampered-certificate").await;
+	let rows = store.durable_rows().await;
+	certified_step_cut_at(&store, CertifiedTierCut::AfterAcceptance).await;
+	let ticket = store.open_op().await;
+	let applied = store.applied_at(&ticket).await;
+	let index = store.mgr.require_op_index().unwrap();
+	let mut certificate = index
+		.tier_certificate(ticket.key().op_seq)
+		.await
+		.unwrap()
+		.unwrap();
+	certificate.drop_count += 1;
+	index
+		.put_tier_certificate_raw_for_test(
+			ticket.key().op_seq,
+			Some(PersistentLocalIndex::encode_tier_certificate_for_test(
+				&certificate,
+			)),
+		)
+		.await;
+	let committed = store.committed_pointer().await.unwrap();
+	let error = store
+		.mgr
+		.apply_tier_slab_committed(committed, Some(applied))
+		.await
+		.expect_err("fenced");
+	assert!(is_certified_evidence_fence(&error), "{error}");
+	assert_eq!(
+		store.mgr.tier_pointer(store.slab).await,
+		Some(store.pointer.clone())
+	);
+	assert_eq!(store.durable_rows().await, rows);
+	let store = store.restart().await;
+	let _ = store.drive().await;
+	assert_eq!(store.open_op().await.key(), ticket.key(), "unresolved");
+	assert_eq!(
+		store.mgr.tier_pointer(store.slab).await,
+		Some(store.pointer.clone())
+	);
+	assert_eq!(store.durable_rows().await, rows, "nothing installed");
+	store.close().await;
+}
+
+/// A certified X applied and undelivered, then an ordinary Y replacing X,
+/// applied and installed: returns X's ticket and applied index, and Y's pointer.
+async fn certified_superseded_by_ordinary(
+	store: &CertifiedTierStore,
+) -> (crate::storage::index::OpTicket, u64, TieredSlabPointer) {
+	use crate::consensus::slab_ops::{SlabCommand, TierGeneration, TierOp};
+	use crate::storage::manager::certified_tier::CertifiedTierCut;
+	certified_step_cut_at(store, CertifiedTierCut::AfterAcceptance).await;
+	let first = store.open_op().await;
+	let first_index = store.applied_at(&first).await;
+	let certified = store.committed_pointer().await.unwrap();
+	let bytes = store.l2.inner.get(&store.pointer.l2_uri).await.unwrap();
+	let newer = TieredSlabPointer {
+		l2_uri: store
+			.l2
+			.inner
+			.put("tier/certified-newer.wnd", &bytes)
+			.await
+			.unwrap(),
+		..store.pointer.clone()
+	};
+	let index = store.mgr.require_op_index().unwrap();
+	let second = index
+		.allocate_ops(
+			vec![SlabCommand::Tier(TierOp {
+				tier: b10_tier(&store.mgr, &newer),
+				replaces: Some(TierGeneration::from(&certified)),
+			})],
+			None,
+		)
+		.await
+		.unwrap()
+		.first;
+	let crate::storage::VerifiedReceipt::Applied {
+		index: second_index,
+	} = store.plain.submit_op(&second).await.unwrap()
+	else {
+		panic!("premise: Y applied");
+	};
+	store
+		.mgr
+		.apply_tier_slab_committed(newer.clone(), Some(second_index))
+		.await
+		.unwrap();
+	store.mgr.hand_off_op_if_complete(&second).await.unwrap();
+	assert_eq!(
+		store.mgr.tier_pointer(store.slab).await,
+		Some(newer.clone())
+	);
+	(first, first_index, newer)
+}
+
+/// ADR 0704 acceptance 4: an observer event for a certified X while the state
+/// holds Y is skipped; recovery hands X off as superseded once Y is exactly
+/// published here, its certificate going with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_observer_event_for_a_superseded_certified_generation_is_skipped() {
+	let store = certified_partial_store("certified-superseded").await;
+	let rows = store.durable_rows().await;
+	let (first, first_index, newer) = certified_superseded_by_ordinary(&store).await;
+	let certified = TieredSlabPointer::from_ring(match first.command() {
+		crate::consensus::slab_ops::SlabCommand::Tier(op) => &op.tier,
+		other => panic!("{other:?}"),
+	});
+	let error = store
+		.mgr
+		.apply_tier_slab_committed(certified, Some(first_index))
+		.await
+		.expect_err("skipped");
+	assert!(is_tier_publication_superseded(&error), "{error}");
+	assert_eq!(
+		store.mgr.tier_pointer(store.slab).await,
+		Some(newer.clone())
+	);
+	assert_eq!(store.durable_rows().await, rows, "Y keeps every row");
+	store.drive_until_resolved().await;
+	let index = store.mgr.require_op_index().unwrap();
+	assert_eq!(
+		index.load_op_intents().await.unwrap(),
+		Vec::new(),
+		"X handed off"
+	);
+	assert_eq!(
+		index.tier_certificate(first.key().op_seq).await.unwrap(),
+		None
+	);
+	assert_eq!(store.mgr.tier_pointer(store.slab).await, Some(newer));
+	store.close().await;
+}
+
+/// ADR 0704 acceptance 4: with authority unknown (X's delivery claims an index
+/// the state has not applied, and the state holds Y), nothing is installed and
+/// X is not handed off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unknown_standing_installs_or_hands_off_nothing_for_a_certified_op() {
+	let store = certified_partial_store("certified-unknown").await;
+	let (first, _, newer) = certified_superseded_by_ordinary(&store).await;
+	let certified = TieredSlabPointer::from_ring(match first.command() {
+		crate::consensus::slab_ops::SlabCommand::Tier(op) => &op.tier,
+		other => panic!("{other:?}"),
+	});
+	let beyond = u64::MAX - 1;
+	let error = store
+		.mgr
+		.apply_tier_slab_committed(certified, Some(beyond))
+		.await
+		.expect_err("unknown");
+	assert!(!is_tier_publication_superseded(&error), "{error}");
+	assert_eq!(
+		store.mgr.tier_pointer(store.slab).await,
+		Some(newer.clone())
+	);
+	store
+		.mgr
+		.hand_off_superseded_tier_op(&first, beyond)
+		.await
+		.unwrap();
+	assert_eq!(store.open_op().await.key(), first.key(), "not handed off");
+	assert!(
+		store
+			.mgr
+			.require_op_index()
+			.unwrap()
+			.tier_certificate(first.key().op_seq)
+			.await
+			.unwrap()
+			.is_some()
+	);
+	assert_eq!(store.mgr.tier_pointer(store.slab).await, Some(newer));
+	store.close().await;
+}
+
+/// ADR 0704 acceptance 4: a certified Retire allocated (and never decided)
+/// leaves the ring pointing at the slab; a retirement callback then retires
+/// nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stale_certified_retirement_never_retires_a_slab_still_pointed_at() {
+	use crate::storage::manager::certified_tier::CertifiedTierCut;
+	let store = certified_retire_store("certified-stale-retire").await;
+	let rows = store.durable_rows().await;
+	certified_step_cut_at(&store, CertifiedTierCut::BeforeSubmit).await;
+	assert!(matches!(
+		store.open_op().await.command(),
+		crate::consensus::slab_ops::SlabCommand::Retire(_)
+	));
+	assert!(
+		store
+			.mgr
+			.retire_tiered_slab_committed(store.slab, Some(1))
+			.await
+			.is_err()
+	);
+	assert_eq!(
+		store.mgr.tier_pointer(store.slab).await,
+		Some(store.pointer.clone())
+	);
+	assert_eq!(store.durable_rows().await, rows);
+	store.close().await;
+}
+
+/// ADR 0704 §4: the ring removed a slab this store still holds, with an Applied
+/// certified retirement and its certificate: the local retirement publishes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_removed_slab_with_an_applied_certified_retirement_retires_locally() {
+	use crate::storage::manager::certified_tier::CertifiedTierCut;
+	let store = certified_retire_store("certified-retire-authority").await;
+	certified_step_cut_at(&store, CertifiedTierCut::AfterAcceptance).await;
+	let ticket = store.open_op().await;
+	let applied = store.applied_at(&ticket).await;
+	assert_eq!(
+		store.committed().await,
+		None,
+		"premise: the ring removed it"
+	);
+	assert!(
+		store.mgr.tier_pointer(store.slab).await.is_some(),
+		"premise: held"
+	);
+	assert!(
+		store
+			.mgr
+			.retire_tiered_slab_committed(store.slab, Some(applied))
+			.await
+			.unwrap()
+	);
+	assert_eq!(store.mgr.tier_pointer(store.slab).await, None);
+	assert_eq!(store.durable_rows().await, Vec::new());
+	assert_eq!(
+		store.reads(&certified_retire_versions()).await,
+		vec![None, None]
+	);
+	store.close().await;
+}
+
+/// ADR 0704 §4: the ring removed a slab this marked store still holds, and no
+/// Applied certified retirement names it (an ordinary Retire the Today ring
+/// accepted): absence of provenance is never deletion authority. Fenced, typed;
+/// the pointer and every row stay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_removed_slab_without_certified_provenance_and_a_held_preimage_is_fenced() {
+	use crate::consensus::slab_ops::{RetireOp, SlabCommand, TierGeneration};
+	let store = certified_retire_store("certified-retire-none").await;
+	let rows = store.durable_rows().await;
+	let index = store.mgr.require_op_index().unwrap();
+	let ticket = index
+		.allocate_ops(
+			vec![SlabCommand::Retire(RetireOp {
+				slab: store.mgr.owner_ref().unwrap().slab(store.slab),
+				expected: TierGeneration::from(&store.pointer),
+				certified: None,
+			})],
+			None,
+		)
+		.await
+		.unwrap()
+		.first;
+	let crate::storage::VerifiedReceipt::Applied { index: applied } =
+		store.plain.submit_op(&ticket).await.unwrap()
+	else {
+		panic!("premise: the Today ring applies an ordinary Retire");
+	};
+	assert_eq!(store.committed().await, None, "premise: removed");
+	let error = store
+		.mgr
+		.retire_tiered_slab_committed(store.slab, Some(applied))
+		.await
+		.expect_err("fenced");
+	assert!(is_certified_evidence_fence(&error), "{error}");
+	assert_eq!(
+		store.mgr.tier_pointer(store.slab).await,
+		Some(store.pointer.clone())
+	);
+	assert_eq!(store.durable_rows().await, rows, "nothing deleted");
+	assert!(store.mgr.unapplied_tier_pointers.get(&store.slab).is_some());
+	store.close().await;
+}
+
+/// ADR 0704 acceptance 3: the object store unavailable when a certified rewrite
+/// is delivered: fenced, reads refuse, nothing deleted (the source object and
+/// every row stay).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_object_store_unavailable_at_certified_delivery_fences_and_deletes_nothing() {
+	use crate::storage::manager::certified_tier::CertifiedTierCut;
+	let store = certified_partial_store("certified-delivery-unavailable").await;
+	let rows = store.durable_rows().await;
+	certified_step_cut_at(&store, CertifiedTierCut::AfterAcceptance).await;
+	let ticket = store.open_op().await;
+	let applied = store.applied_at(&ticket).await;
+	let committed = store.committed_pointer().await.unwrap();
+	store
+		.l2
+		.down
+		.store(true, std::sync::atomic::Ordering::Release);
+	assert!(
+		store
+			.mgr
+			.apply_tier_slab_committed(committed.clone(), Some(applied))
+			.await
+			.is_err()
+	);
+	assert_eq!(
+		store.mgr.tier_pointer(store.slab).await,
+		Some(store.pointer.clone())
+	);
+	assert!(
+		store
+			.mgr
+			.unapplied_tier_pointers
+			.get(&store.slab)
+			.is_some_and(|entry| entry.value().pointer == committed),
+		"fenced"
+	);
+	assert!(
+		store.mgr.lookup(tenant(), id(0x7502)).is_err(),
+		"reads refuse"
+	);
+	store
+		.l2
+		.down
+		.store(false, std::sync::atomic::Ordering::Release);
+	assert_eq!(store.durable_rows().await, rows, "no row deleted");
+	store.l2.inner.get(&store.pointer.l2_uri).await.unwrap();
+	assert_eq!(store.open_op().await.key(), ticket.key(), "unresolved");
+	store.close().await;
+}
+
+/// A snapshot of `source`'s current state, installed into a fresh state machine
+/// whose tier observer is `mgr`'s: what a node catching up through a snapshot does.
+async fn install_snapshot_into_observer(
+	source: &crate::consensus::WendelonStateMachine,
+	mgr: &Arc<SlabManager>,
+) -> std::io::Result<()> {
+	use crate::storage::sweeper::ManagerTierObserver;
+	use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
+	let mut source = source.clone();
+	let mut builder = RaftStateMachine::get_snapshot_builder(&mut source).await;
+	let built = builder.build_snapshot().await.unwrap();
+	let mut target = crate::consensus::WendelonStateMachine::new()
+		.with_tier_observer(Arc::new(ManagerTierObserver::new(mgr.clone())));
+	RaftStateMachine::install_snapshot(&mut target, &built.meta, built.snapshot)
+		.await
+		.map_err(|error| std::io::Error::other(error.to_string()))
+}
+
+/// ADR 0704 §4: a node catching up through a real snapshot install finds its own
+/// tiered slab absent while it still holds it, and the installed state names no
+/// certified retirement of it. A marked store keeps its non-empty preimage fenced:
+/// the install completes, nothing is deleted, reads of it refuse.
+#[tokio::test]
+async fn a_snapshot_install_removing_a_held_slab_without_certified_retirement_is_fenced() {
+	use crate::consensus::WendelonStateMachine;
+	use openraft::storage::RaftStateMachine;
+	use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
+	let (_dirs, manager, l2) = fresh_manager_with_l2("certified-snapshot-none").await;
+	manager.contain_version_reclamation();
+	let key = id(0x7601);
+	manager
+		.append_durable(tenant(), key, hlc(511), b"held")
+		.await
+		.unwrap();
+	let pointer = tier_kv_slab(&manager, &l2, "certified-snapshot-none/object").await;
+	let rows = manager.record_rows_for_slab_for_recovery(pointer.slab_id);
+	assert!(!rows.is_empty(), "premise: a held preimage");
+	let mut source = WendelonStateMachine::new();
+	RaftStateMachine::apply(
+		&mut source,
+		[Entry {
+			log_id: LogId::new(CommittedLeaderId::new(3, 1), 701),
+			payload: EntryPayload::Blank,
+		}],
+	)
+	.await
+	.unwrap();
+	install_snapshot_into_observer(&source, &manager)
+		.await
+		.expect("the install completes");
+	assert_eq!(
+		manager.tier_pointer(pointer.slab_id).await,
+		Some(pointer.clone())
+	);
+	assert_eq!(
+		manager.record_rows_for_slab_for_recovery(pointer.slab_id),
+		rows,
+		"nothing deleted"
+	);
+	assert!(
+		manager
+			.unapplied_tier_pointers
+			.get(&pointer.slab_id)
+			.is_some_and(|entry| entry.value().outcome
+				== tier_deferral::DeferralOutcome::Fenced(
+					tier_deferral::FenceCause::CertifiedEvidence
+				)),
+		"fenced, typed"
+	);
+	assert!(manager.lookup(tenant(), key).is_err(), "reads refuse");
+	l2.get(&pointer.l2_uri).await.expect("the object stays");
+}
+
+/// ADR 0704 §4: the same catch-up, with an Applied certified retirement of the
+/// slab (its certificate present) in the installed state: the local retirement
+/// publishes from that coherent state.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_snapshot_install_with_an_applied_certified_retirement_retires_the_held_slab() {
+	use crate::storage::manager::certified_tier::CertifiedTierCut;
+	let store = certified_retire_store("certified-snapshot-applied").await;
+	certified_step_cut_at(&store, CertifiedTierCut::AfterAcceptance).await;
+	assert_eq!(
+		store.committed().await,
+		None,
+		"premise: the ring removed it"
+	);
+	assert!(
+		store.mgr.tier_pointer(store.slab).await.is_some(),
+		"premise: held"
+	);
+	install_snapshot_into_observer(&store.cluster.state_machines[0], &store.mgr)
+		.await
+		.expect("the install completes");
+	assert_eq!(store.mgr.tier_pointer(store.slab).await, None);
+	assert_eq!(store.durable_rows().await, Vec::new());
+	store.close().await;
+}
+
+/// ADR 0704 §4: the no-source fallback (an isolated store with no canonical tier
+/// state) refuses certified work it can see: an operation intent naming the slab
+/// that requires a certificate. Refused, typed: nothing installed or retired.
+/// Ordinary work on another slab is unchanged.
+#[tokio::test]
+async fn the_no_source_fallback_refuses_certified_work_and_installs_nothing() {
+	use crate::storage::index::{
+		CertifiedTierAllocation, CertifiedTierWork, TierSelectionEvidence,
+	};
+	use crate::storage::manager::certified_delivery::is_certified_work_without_source;
+	let (_dirs, manager, l2) = fresh_manager_with_l2("certified-no-source").await;
+	manager.contain_version_reclamation();
+	manager
+		.append_durable(tenant(), id(0x7701), hlc(10), b"certified")
+		.await
+		.unwrap();
+	let pointer = tier_kv_slab(&manager, &l2, "certified-no-source/object").await;
+	let bytes = l2.get(&pointer.l2_uri).await.unwrap();
+	let candidate = TieredSlabPointer {
+		l2_uri: l2
+			.put("certified-no-source/candidate", &bytes)
+			.await
+			.unwrap(),
+		..pointer.clone()
+	};
+	let CertifiedTierAllocation::Allocated(_) = manager
+		.require_op_index()
+		.unwrap()
+		.allocate_certified_tier_op(
+			CertifiedTierWork::Rewrite {
+				tier: b10_tier(&manager, &candidate),
+				postimage_rows_digest: [7; 32],
+			},
+			TierSelectionEvidence {
+				job_fingerprint: [1; 32],
+				active_gid: 0,
+				source_generation: crate::consensus::slab_ops::TierGeneration::from(&pointer),
+				source_rows_digest: [2; 32],
+				drop_digest: [3; 32],
+				drop_rows_digest: [4; 32],
+				drop_count: 1,
+			},
+		)
+		.await
+		.unwrap()
+	else {
+		panic!("premise: allocated");
+	};
+	let error = manager
+		.apply_tier_slab(candidate.clone())
+		.await
+		.expect_err("refused");
+	assert!(is_certified_work_without_source(&error), "{error}");
+	let error = manager
+		.retire_tiered_slab(pointer.slab_id)
+		.await
+		.expect_err("refused");
+	assert!(is_certified_work_without_source(&error), "{error}");
+	assert_eq!(
+		manager.tier_pointer(pointer.slab_id).await,
+		Some(pointer.clone())
+	);
+	assert!(manager.lookup(tenant(), id(0x7701)).unwrap().is_some());
+	// Ordinary work on another slab of this contained store is unchanged.
+	manager
+		.append_durable(tenant(), id(0x7702), hlc(11), b"ordinary")
+		.await
+		.unwrap();
+	let ordinary = tier_kv_slab(&manager, &l2, "certified-no-source/ordinary").await;
+	assert_eq!(manager.tier_pointer(ordinary.slab_id).await, Some(ordinary));
+}
+
+/// ADR 0704 (Codex R1): a real, successful snapshot install carries certified B
+/// over this store's local source A, with no deferred snapshot retry, and the
+/// tier authority's verification runs. It publishes B only with B's exact
+/// certificate: absent or mismatched, neither B's pointer nor its rows are
+/// published and reads stay fenced; valid, B publishes with exactly its rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_snapshot_installed_certified_generation_verifies_only_with_its_exact_certificate() {
+	use crate::storage::index::PersistentLocalIndex;
+	use crate::storage::manager::certified_tier::CertifiedTierCut;
+	for case in ["absent", "mismatched", "valid"] {
+		let store = certified_partial_store(&format!("certified-snapshot-verify-{case}")).await;
+		let rows = store.durable_rows().await;
+		certified_step_cut_at(&store, CertifiedTierCut::AfterAcceptance).await;
+		let ticket = store.open_op().await;
+		let committed = store.committed_pointer().await.expect("B committed");
+		let index = store.mgr.require_op_index().unwrap();
+		let op_seq = ticket.key().op_seq;
+		match case {
+			"absent" => index.put_tier_certificate_raw_for_test(op_seq, None).await,
+			"mismatched" => {
+				let mut certificate = index.tier_certificate(op_seq).await.unwrap().unwrap();
+				certificate.drop_count += 1;
+				index
+					.put_tier_certificate_raw_for_test(
+						op_seq,
+						Some(PersistentLocalIndex::encode_tier_certificate_for_test(
+							&certificate,
+						)),
+					)
+					.await;
+			}
+			_ => {}
+		}
+		install_snapshot_into_observer(&store.cluster.state_machines[0], &store.mgr)
+			.await
+			.unwrap_or_else(|error| panic!("{case}: the install completes: {error}"));
+		assert!(
+			store
+				.mgr
+				.tier_authority
+				.pending
+				.get(&store.slab)
+				.is_some_and(|entry| entry.pointer == committed)
+				|| store.mgr.tier_pointer(store.slab).await == Some(committed.clone()),
+			"{case}: premise: the install staged B for verification"
+		);
+		// The authority worker verifies, and retries, in the background.
+		for _ in 0..30 {
+			if store.mgr.tier_pointer(store.slab).await == Some(committed.clone()) {
+				break;
+			}
+			store
+				.mgr
+				.tier_authority_change_within(Duration::from_millis(100))
+				.await;
+		}
+		if case == "valid" {
+			assert_eq!(
+				store.mgr.tier_pointer(store.slab).await,
+				Some(committed.clone()),
+				"{case}: B publishes"
+			);
+			let survivors: Vec<_> = rows
+				.iter()
+				.copied()
+				.filter(|row| *row != (id(0x7501), hlc(10)))
+				.collect();
+			assert_eq!(store.durable_rows().await, survivors, "{case}");
+		} else {
+			assert_eq!(
+				store.mgr.tier_pointer(store.slab).await,
+				Some(store.pointer.clone()),
+				"{case}: no B pointer"
+			);
+			assert_eq!(store.durable_rows().await, rows, "{case}: no B rows");
+			assert!(
+				store.mgr.lookup(tenant(), id(0x7502)).is_err(),
+				"{case}: reads stay fenced"
+			);
+		}
+		store.close().await;
+	}
+}
+
+/// ADR 0704 (Codex R2): a superseded Tier X whose slab the ring then removed hands
+/// off only at the exact empty postimage. With terminal removal, no pointer and
+/// residual rows, X's intent stays; once the local retirement removed them, it
+/// hands off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_superseded_tier_op_over_a_removed_slab_hands_off_only_at_its_empty_postimage() {
+	use crate::consensus::slab_ops::{RetireOp, SlabCommand, TierGeneration, TierOp};
+	// A sealed local slab whose object is uploaded: X tiers it on the ring, and is
+	// never delivered here, so this store holds its rows and no pointer.
+	let (_dirs, mgr, l2) = fresh_manager_with_l2("superseded-removed-slab").await;
+	mgr.append(tenant(), id(0x7801), hlc(10), b"residual")
+		.await
+		.unwrap();
+	let slab_id = force_seal_active(&mgr).await;
+	let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
+	let encrypted = mgr.encrypt_tiered_object_blob(slab_id, &raw).unwrap();
+	let uri = l2
+		.put("tier/superseded-removed-slab.wnd", &encrypted.bytes)
+		.await
+		.unwrap();
+	let old = tiered_pointer_from_blob(&mgr, slab_id, uri, &encrypted.bytes);
+	let cluster = control_cluster_observing(&[]).await;
+	mgr.bind_control_node(1).unwrap();
+	register_owner(&cluster.nodes[0], &mgr).await;
+	mgr.bind_canonical_tier_source(cluster.state_machines[0].tier_snapshot_source_for_test());
+	let plain = Arc::new(op_committer(&cluster, 1));
+	let index = mgr.require_op_index().unwrap();
+	// X: tiers the slab on the ring; never delivered here.
+	let first = index
+		.allocate_ops(
+			vec![SlabCommand::Tier(TierOp {
+				tier: b10_tier(&mgr, &old),
+				replaces: None,
+			})],
+			None,
+		)
+		.await
+		.unwrap()
+		.first;
+	let crate::storage::VerifiedReceipt::Applied { index: first_index } =
+		plain.submit_op(&first).await.unwrap()
+	else {
+		panic!("premise: X applied");
+	};
+	// The ring then removes the slab.
+	let retire = index
+		.allocate_ops(
+			vec![SlabCommand::Retire(RetireOp {
+				slab: mgr.owner_ref().unwrap().slab(old.slab_id),
+				expected: TierGeneration::from(&old),
+				certified: None,
+			})],
+			None,
+		)
+		.await
+		.unwrap()
+		.first;
+	let crate::storage::VerifiedReceipt::Applied {
+		index: retire_index,
+	} = plain.submit_op(&retire).await.unwrap()
+	else {
+		panic!("premise: the Retire applied");
+	};
+	assert_eq!(
+		mgr.tier_pointer(old.slab_id).await,
+		None,
+		"premise: no pointer"
+	);
+	assert!(
+		!mgr.record_rows_for_slab_for_recovery(old.slab_id)
+			.is_empty(),
+		"premise: residual rows"
+	);
+	let key = first.key();
+	mgr.hand_off_superseded_tier_op(&first, first_index)
+		.await
+		.unwrap();
+	assert!(
+		index
+			.load_op_intents()
+			.await
+			.unwrap()
+			.iter()
+			.any(|op| op.key() == key),
+		"residual rows: X's intent stays"
+	);
+	// The local retirement empties the slab; then X hands off.
+	mgr.retire_tiered_slab_committed(old.slab_id, Some(retire_index))
+		.await
+		.unwrap();
+	assert!(
+		mgr.record_rows_for_slab_for_recovery(old.slab_id)
+			.is_empty()
+	);
+	mgr.hand_off_superseded_tier_op(&first, first_index)
+		.await
+		.unwrap();
+	assert!(
+		!index
+			.load_op_intents()
+			.await
+			.unwrap()
+			.iter()
+			.any(|op| op.key() == key),
+		"the empty, resolved postimage: handed off"
+	);
+}
+
+/// DC-195 (registered; a separate ADR fixes it): a tiered retention rewrite
+/// whose survivor would take a pruned row's exact location (same offset,
+/// length, HLC and row) is refused with a layout collision before anything is
+/// uploaded, and the old view stands. Asserts today's behaviour.
+#[tokio::test]
+async fn a_retention_rewrite_whose_survivor_takes_a_pruned_rows_location_is_refused() {
+	let (_dirs, mgr, l2) = fresh_manager_with_l2("dc195-retention").await;
+	let (pruned, survivor) = (id(0x1951), id(0x1952));
+	mgr.append(tenant(), pruned, hlc(10), b"p-10")
+		.await
+		.unwrap();
+	mgr.append(tenant(), survivor, hlc(10), b"s-10")
+		.await
+		.unwrap();
+	mgr.append(tenant(), pruned, hlc(20), b"p-20")
+		.await
+		.unwrap();
+	let pointer = tier_kv_slab(&mgr, &l2, "tier/dc195-retention.wnd").await;
+	let mut expected = BTreeMap::new();
+	for (key, at) in [(pruned, 10), (survivor, 10), (pruned, 20)] {
+		let location = mgr
+			.lookup_as_of(tenant(), key, hlc(at))
+			.unwrap()
+			.expect("indexed");
+		expected.insert((key, at), (location, mgr.read(location).await.unwrap()));
+	}
+	let objects = l2.list("").await.unwrap().len();
+	let error = mgr
+		.prepare_tiered_table_retention_rewrite(
+			&pointer,
+			crate::storage::retention::MvccRetentionPolicy::fixed_window(
+				std::time::Duration::from_secs(15),
+			),
+			&TableLifecycleCatalog::default(),
+			&TableSchemaCatalog::default(),
+			15_025,
+		)
+		.await
+		.err()
+		.expect("refused");
+	assert_eq!(
+		crate::storage::manager::stale_location(&error).map(|stale| stale.reason),
+		Some(StaleLocationReason::LayoutCollision),
+		"{error}"
+	);
+	assert_eq!(
+		l2.list("").await.unwrap().len(),
+		objects,
+		"nothing uploaded"
+	);
+	assert_eq!(
+		mgr.tier_pointer(pointer.slab_id).await,
+		Some(pointer.clone())
+	);
+	for ((key, at), (location, bytes)) in &expected {
+		assert_eq!(
+			mgr.lookup_as_of(tenant(), *key, hlc(*at)).unwrap(),
+			Some(*location)
+		);
+		assert_eq!(&mgr.read(*location).await.unwrap(), bytes, "exact read");
+	}
+}
+
+/// ADR 0704 (Codex R1a): verification with no deferred-snapshot retry judges by the
+/// bound canonical state: a pending generation A that the state does not hold (it
+/// holds B, or has removed the slab) is never published.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn verification_never_publishes_a_pending_generation_the_canonical_state_does_not_hold() {
+	use crate::consensus::slab_ops::{RetireOp, SlabCommand, TierGeneration, TierOp};
+	for removed in [false, true] {
+		let (_dirs, mgr, l2) = fresh_manager_with_l2(&format!("verify-stale-{removed}")).await;
+		mgr.append(tenant(), id(0x7901), hlc(10), b"pending")
+			.await
+			.unwrap();
+		let slab_id = force_seal_active(&mgr).await;
+		let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
+		let encrypted = mgr.encrypt_tiered_object_blob(slab_id, &raw).unwrap();
+		let pointer = |uri| tiered_pointer_from_blob(&mgr, slab_id, uri, &encrypted.bytes);
+		let a = pointer(l2.put("tier/verify-a.wnd", &encrypted.bytes).await.unwrap());
+		let b = pointer(l2.put("tier/verify-b.wnd", &encrypted.bytes).await.unwrap());
+		let cluster = control_cluster_observing(&[]).await;
+		mgr.bind_control_node(1).unwrap();
+		register_owner(&cluster.nodes[0], &mgr).await;
+		mgr.bind_canonical_tier_source(cluster.state_machines[0].tier_snapshot_source_for_test());
+		let plain = Arc::new(op_committer(&cluster, 1));
+		let index = mgr.require_op_index().unwrap();
+		let mut commands = vec![SlabCommand::Tier(TierOp {
+			tier: b10_tier(&mgr, &b),
+			replaces: None,
+		})];
+		if removed {
+			commands.push(SlabCommand::Retire(RetireOp {
+				slab: mgr.owner_ref().unwrap().slab(slab_id),
+				expected: TierGeneration::from(&b),
+				certified: None,
+			}));
+		}
+		for command in commands {
+			let ticket = index.allocate_ops(vec![command], None).await.unwrap().first;
+			assert!(matches!(
+				plain.submit_op(&ticket).await.unwrap(),
+				crate::storage::VerifiedReceipt::Applied { .. }
+			));
+		}
+		// A snapshot comparison stages A as pending authority; the bound canonical state,
+		// with no deferred-snapshot retry record, holds B (or no pointer).
+		let epoch = mgr.begin_tier_snapshot_install().unwrap();
+		let _ = mgr
+			.finish_tier_snapshot_install_at_epoch(vec![a.clone()], Some(1), epoch, None)
+			.await;
+		assert!(
+			mgr.tier_authority
+				.pending
+				.get(&slab_id)
+				.is_some_and(|entry| entry.pointer == a),
+			"removed {removed}: premise: A is pending"
+		);
+		mgr.tier_authority.start();
+		for _ in 0..20 {
+			mgr.tier_authority_change_within(Duration::from_millis(100))
+				.await;
+		}
+		assert_ne!(
+			mgr.tier_pointer(slab_id).await,
+			Some(a.clone()),
+			"removed {removed}: A is never published"
+		);
+		assert!(
+			mgr.tier_authority_readiness_reason().is_some(),
+			"removed {removed}: not certified Ready"
+		);
+	}
+}
+
+/// ADR 0704 (Codex R1b): a marked store reopened with a tiered generation and no
+/// op intent naming it waits, retryably, while no canonical state is bound; once
+/// the source binds, verification progresses and reads are exact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_marked_reopen_verifies_only_once_its_canonical_state_is_bound() {
+	let store = certified_partial_store("marked-reopen-unbound").await;
+	let reads = store.reads(&certified_partial_versions()).await;
+	assert_eq!(
+		store
+			.mgr
+			.require_op_index()
+			.unwrap()
+			.load_op_intents()
+			.await
+			.unwrap(),
+		Vec::new(),
+		"premise: no op intent names the generation"
+	);
+	let store = store.restart_unbound().await;
+	for _ in 0..10 {
+		store
+			.mgr
+			.tier_authority_change_within(Duration::from_millis(100))
+			.await;
+	}
+	assert!(
+		store.mgr.tier_authority_readiness_reason().is_some(),
+		"waits without its canonical state"
+	);
+	assert_eq!(
+		store.mgr.tier_authority_failure_kind(),
+		None,
+		"retryable, never a sticky failure"
+	);
+	assert!(
+		store.mgr.lookup(tenant(), id(0x7502)).is_err(),
+		"reads wait"
+	);
+	store.mgr.bind_control_node(1).unwrap();
+	store.mgr.bind_canonical_tier_source(
+		store.cluster.state_machines[0].tier_snapshot_source_for_test(),
+	);
+	let mut ready = false;
+	for _ in 0..100 {
+		store.mgr.tier_authority.start();
+		if store.mgr.tier_authority_readiness_reason().is_none() {
+			ready = true;
+			break;
+		}
+		store
+			.mgr
+			.tier_authority_change_within(Duration::from_millis(100))
+			.await;
+	}
+	assert!(
+		ready,
+		"progresses once bound: {:?}",
+		store.mgr.tier_authority_readiness_reason()
+	);
+	assert_eq!(store.reads(&certified_partial_versions()).await, reads);
+	store.close().await;
+}
+
+/// ADR 0704 (Codex R3): a marked store with a deferred snapshot reconciliation
+/// retry record and a nonempty tier set reaches Ready under the retry's own lease,
+/// and clears the retry record.
+#[tokio::test]
+async fn a_marked_store_completes_a_deferred_snapshot_reconciliation_under_its_retry_lease() {
+	let mut f = b10_append_fixture().await;
+	f.manager.contain_version_reclamation();
+	assert!(
+		f.manager.tier_authority.snapshot_retry_pending_for_test(),
+		"premise: a retry record"
+	);
+	assert!(
+		!f.manager.tier_authority_snapshot().await.is_empty(),
+		"premise: a nonempty tier set"
+	);
+	b10_drain_append(&mut f).await;
+	b10_ready(&f).await;
+	assert_eq!(
+		f.manager.tier_pointer(f.pointer.slab_id).await,
+		Some(f.pointer.clone())
+	);
+}
+
 /// ADR 0703 R1: a frame's table stamp is read as typed, untyped or malformed,
 /// and a decoding error is never read as the absence of a stamp. Only a frame
 /// that is not multi-row, or has no table column, is untyped.
@@ -64575,4 +67203,763 @@ async fn a_marked_store_keeps_an_uncertified_completed_install_fenced_at_open() 
 		);
 		let _ = next.close(Duration::from_secs(2)).await;
 	}
+}
+
+/// ADR 0704 §5, RED-first probe: an older applied tier op is never delivered over a newer
+/// generation. A (the first tiering) and B (a replacement of A's generation) are both applied
+/// on the ring; this store installed B through its observer and B's workflow handed off, while
+/// A's intent never was. Recovery then meets A while B is installed: the store must keep B (the
+/// ring's pointer), never reinstall A. Probed after a restart and in process.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_older_applied_tier_op_never_reinstalls_over_a_newer_generation() {
+	for restart in [true, false] {
+		older_applied_tier_op_over_newer(restart).await;
+	}
+}
+
+async fn older_applied_tier_op_over_newer(restart: bool) {
+	use crate::consensus::slab_ops::{SlabCommand, TierGeneration, TierOp};
+	let (dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let cluster = control_cluster_observing(&[]).await;
+	mgr.bind_control_node(1).unwrap();
+	register_owner(&cluster.nodes[0], &mgr).await;
+	mgr.bind_canonical_tier_source(cluster.state_machines[0].tier_snapshot_source_for_test());
+	let plain = Arc::new(op_committer(&cluster, 1));
+	let index = mgr.require_op_index().unwrap();
+	// A: applied, never handed off.
+	let first = index
+		.allocate_ops(
+			vec![SlabCommand::Tier(TierOp {
+				tier: b10_tier(&mgr, &old),
+				replaces: None,
+			})],
+			None,
+		)
+		.await
+		.unwrap()
+		.first;
+	let receipt = plain.submit_op(&first).await.unwrap();
+	assert!(
+		matches!(receipt, crate::storage::VerifiedReceipt::Applied { .. }),
+		"premise: A applied, {receipt:?}"
+	);
+	// B: replaces A's generation, applied, and installed by this store's observer.
+	let bytes = l2.get(&old.l2_uri).await.unwrap();
+	let replacement = TieredSlabPointer {
+		l2_uri: l2.put("tier/s0704-newer.wnd", &bytes).await.unwrap(),
+		..old.clone()
+	};
+	let second = index
+		.allocate_ops(
+			vec![SlabCommand::Tier(TierOp {
+				tier: b10_tier(&mgr, &replacement),
+				replaces: Some(TierGeneration::from(&old)),
+			})],
+			None,
+		)
+		.await
+		.unwrap()
+		.first;
+	let receipt = plain.submit_op(&second).await.unwrap();
+	assert!(
+		matches!(receipt, crate::storage::VerifiedReceipt::Applied { .. }),
+		"premise: B applied, {receipt:?}"
+	);
+	let ring = cluster.state_machines[0]
+		.try_tiered_slab(mgr.owner_ref().unwrap().slab(old.slab_id))
+		.unwrap()
+		.expect("premise: the ring holds a pointer");
+	assert_eq!(
+		crate::consensus::slab_ops::TierGeneration::from(&ring),
+		TierGeneration::from(&replacement),
+		"premise: the ring's pointer is B"
+	);
+	mgr.apply_tier_slab_committed(replacement.clone(), None)
+		.await
+		.unwrap();
+	assert_eq!(
+		mgr.tier_pointer(old.slab_id).await,
+		Some(replacement.clone()),
+		"premise: B installed"
+	);
+	// B's workflow ends, as it does live once its effect is published; A's never did.
+	mgr.hand_off_op_if_complete(&second).await.unwrap();
+	let mgr = if restart {
+		let mgr = try_restart_tier_manager(mgr, &dirs, &l2).await.unwrap();
+		mgr.bind_control_node(1).unwrap();
+		mgr.bind_canonical_tier_source(cluster.state_machines[0].tier_snapshot_source_for_test());
+		mgr
+	} else {
+		// In process: the op driver meets A while B is already installed.
+		mgr
+	};
+	let driver = op_driver(&cluster, &mgr, plain.clone());
+	let mut outcomes = Vec::new();
+	for _ in 0..12 {
+		outcomes.push(format!("{:?}", driver.drive_once().await));
+		eprintln!(
+			"ADR0704-RED restart {restart} pass {}: {} pointer is newer {} older {} rows {}",
+			outcomes.len(),
+			outcomes.last().unwrap(),
+			mgr.tier_pointer(old.slab_id).await.as_ref() == Some(&replacement),
+			mgr.tier_pointer(old.slab_id).await.as_ref() == Some(&old),
+			mgr.require_op_index()
+				.unwrap()
+				.load_op_intents()
+				.await
+				.unwrap()
+				.len()
+		);
+		assert_ne!(
+			mgr.tier_pointer(old.slab_id).await,
+			Some(old.clone()),
+			"restart {restart}: the older generation A was reinstalled over B after {outcomes:?}"
+		);
+	}
+	assert_eq!(
+		mgr.tier_pointer(old.slab_id).await,
+		Some(replacement),
+		"restart {restart}: the store keeps the ring's generation B: {outcomes:?}"
+	);
+}
+
+/// ADR 0704 controls: two applied tier generations of one slab through a real ring. A (the
+/// first tiering, `old`, already this store's local generation) applied and never handed off;
+/// B (`replacement`, replacing A's generation) applied and, with `install_newer`, installed by
+/// this store and handed off. Carries A's ticket and A's and B's applied indexes.
+struct TwoAppliedGenerations {
+	_dirs: [crate::test_support::TestDir; 2],
+	mgr: Arc<SlabManager>,
+	cluster: ControlCluster,
+	old: TieredSlabPointer,
+	first: crate::storage::index::OpTicket,
+	first_index: u64,
+	replacement: TieredSlabPointer,
+	second_index: u64,
+}
+
+async fn two_applied_tier_generations(install_newer: bool) -> TwoAppliedGenerations {
+	use crate::consensus::slab_ops::{SlabCommand, TierGeneration, TierOp};
+	let (dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let cluster = control_cluster_observing(&[]).await;
+	mgr.bind_control_node(1).unwrap();
+	register_owner(&cluster.nodes[0], &mgr).await;
+	mgr.bind_canonical_tier_source(cluster.state_machines[0].tier_snapshot_source_for_test());
+	let plain = Arc::new(op_committer(&cluster, 1));
+	let index = mgr.require_op_index().unwrap();
+	let first = index
+		.allocate_ops(
+			vec![SlabCommand::Tier(TierOp {
+				tier: b10_tier(&mgr, &old),
+				replaces: None,
+			})],
+			None,
+		)
+		.await
+		.unwrap()
+		.first;
+	let crate::storage::VerifiedReceipt::Applied { index: first_index } =
+		plain.submit_op(&first).await.unwrap()
+	else {
+		panic!("premise: A applied");
+	};
+	let bytes = l2.get(&old.l2_uri).await.unwrap();
+	let replacement = TieredSlabPointer {
+		l2_uri: l2
+			.put("tier/s0704-control-newer.wnd", &bytes)
+			.await
+			.unwrap(),
+		..old.clone()
+	};
+	let second = index
+		.allocate_ops(
+			vec![SlabCommand::Tier(TierOp {
+				tier: b10_tier(&mgr, &replacement),
+				replaces: Some(TierGeneration::from(&old)),
+			})],
+			None,
+		)
+		.await
+		.unwrap()
+		.first;
+	let crate::storage::VerifiedReceipt::Applied {
+		index: second_index,
+	} = plain.submit_op(&second).await.unwrap()
+	else {
+		panic!("premise: B applied");
+	};
+	assert!(first_index < second_index, "premise: A applied before B");
+	if install_newer {
+		mgr.apply_tier_slab_committed(replacement.clone(), None)
+			.await
+			.unwrap();
+		assert_eq!(
+			mgr.tier_pointer(old.slab_id).await,
+			Some(replacement.clone()),
+			"premise: B installed"
+		);
+		mgr.hand_off_op_if_complete(&second).await.unwrap();
+	}
+	TwoAppliedGenerations {
+		_dirs: dirs,
+		mgr,
+		cluster,
+		old,
+		first,
+		first_index,
+		replacement,
+		second_index,
+	}
+}
+
+/// The registry of this store's node in the ring's current state.
+async fn own_node_registry(
+	cluster: &ControlCluster,
+	mgr: &SlabManager,
+) -> crate::consensus::IncarnationRegistry {
+	cluster.state_machines[0]
+		.state_snapshot()
+		.await
+		.incarnations
+		.get(&mgr.owner_ref().unwrap().node())
+		.cloned()
+		.unwrap_or_default()
+}
+
+/// ADR 0704 §2 and §4: the observer's event for an older generation A, arriving when the
+/// committed state already holds the newer B and this store installed it, installs nothing
+/// and records no deferral. Called directly it refuses typed as superseded; through the
+/// observer it ends Ok, the newer state's own delivery having installed B.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_observer_event_for_an_older_generation_installs_nothing_over_a_newer_one() {
+	use crate::consensus::TierObserver;
+	let f = two_applied_tier_generations(true).await;
+	let slab_id = f.old.slab_id;
+	let error = f
+		.mgr
+		.apply_tier_slab_committed(f.old.clone(), Some(f.first_index))
+		.await
+		.expect_err("an older generation is never installed over a newer committed one");
+	assert!(
+		crate::storage::manager::is_tier_publication_superseded(&error),
+		"refused as superseded: {error:?}"
+	);
+	assert_eq!(
+		f.mgr.tier_pointer(slab_id).await,
+		Some(f.replacement.clone())
+	);
+	assert!(
+		f.mgr.unapplied_tier_pointers.get(&slab_id).is_none(),
+		"a superseded event records no deferral"
+	);
+
+	let registry = own_node_registry(&f.cluster, &f.mgr).await;
+	let observer = crate::storage::sweeper::ManagerTierObserver::new(f.mgr.clone());
+	observer
+		.on_slab_tiered(&b10_tier(&f.mgr, &f.old), &registry, f.first_index)
+		.await
+		.expect("the observer skips a superseded event");
+	assert_eq!(
+		f.mgr.tier_pointer(slab_id).await,
+		Some(f.replacement.clone()),
+		"the store keeps the ring's generation B"
+	);
+	assert!(f.mgr.unapplied_tier_pointers.get(&slab_id).is_none());
+	// The newer event is current: it still applies, idempotently.
+	observer
+		.on_slab_tiered(&b10_tier(&f.mgr, &f.replacement), &registry, f.second_index)
+		.await
+		.unwrap();
+	assert_eq!(f.mgr.tier_pointer(slab_id).await, Some(f.replacement));
+}
+
+/// ADR 0704 §2: a stale Retire never retires a slab the ring still points at. Neither the
+/// observer's retirement callback nor a local retirement removes B while B is committed and
+/// the slab's identity has not ended.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stale_retire_never_retires_a_slab_the_ring_still_points_at() {
+	use crate::consensus::TierObserver;
+	let f = two_applied_tier_generations(true).await;
+	let slab_id = f.old.slab_id;
+	let slab = f.mgr.owner_ref().unwrap().slab(slab_id);
+	let registry = own_node_registry(&f.cluster, &f.mgr).await;
+	let observer = crate::storage::sweeper::ManagerTierObserver::new(f.mgr.clone());
+	let observed = observer
+		.on_slab_retired(slab, &registry, f.second_index)
+		.await;
+	eprintln!("ADR0704 stale retire through the observer: {observed:?}");
+	assert!(observed.is_err(), "a retirement not in force is refused");
+	assert_eq!(
+		f.mgr.tier_pointer(slab_id).await,
+		Some(f.replacement.clone()),
+		"the ring's generation stays installed"
+	);
+	let local = f.mgr.retire_tiered_slab(slab_id).await;
+	eprintln!("ADR0704 stale local retire: {local:?}");
+	assert!(local.is_err(), "a local retirement not in force is refused");
+	assert_eq!(
+		f.mgr.tier_pointer(slab_id).await,
+		Some(f.replacement),
+		"the ring's generation stays installed"
+	);
+	assert!(
+		!f.mgr.retired_tier_slabs.contains(&slab_id),
+		"nothing was retired in this process"
+	);
+}
+
+/// ADR 0704 §2: where the committed state proves neither current nor superseded, nothing is
+/// installed and recovery hands nothing off; and a local generation the committed state does
+/// not name never serves: it is fenced for reads, never retired, until the committed state is
+/// provable. First, before anything is committed, a local publication of a pointer that is not
+/// current is refused and fences the local generation; once A commits that generation, the
+/// reconcile clears the fence. Then A's pointer is removed from the committed state without its
+/// identity ending (no ring command does this): recovery of A is never prepared, refuses, fences
+/// the local generation with A's index, and keeps A's intent across passes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unknown_committed_standing_installs_nothing_and_hands_nothing_off() {
+	use crate::consensus::slab_ops::{SlabCommand, TierOp};
+	let (dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let cluster = control_cluster_observing(&[]).await;
+	mgr.bind_control_node(1).unwrap();
+	register_owner(&cluster.nodes[0], &mgr).await;
+	mgr.bind_canonical_tier_source(cluster.state_machines[0].tier_snapshot_source_for_test());
+	let plain = Arc::new(op_committer(&cluster, 1));
+	let index = mgr.require_op_index().unwrap();
+	let slab_id = old.slab_id;
+
+	// A local publication of a pointer the ring never committed: not current, unprovable.
+	let bytes = l2.get(&old.l2_uri).await.unwrap();
+	let uncommitted = TieredSlabPointer {
+		l2_uri: l2.put("tier/s0704-uncommitted.wnd", &bytes).await.unwrap(),
+		..old.clone()
+	};
+	let error = mgr
+		.apply_tier_slab_committed(uncommitted.clone(), None)
+		.await
+		.expect_err("a pointer that is not the committed generation is never installed");
+	eprintln!("ADR0704 unknown local publication: {error:?}");
+	assert_eq!(error.kind(), ErrorKind::WouldBlock);
+	assert!(!crate::storage::manager::is_tier_publication_superseded(
+		&error
+	));
+	assert_eq!(mgr.tier_pointer(slab_id).await, Some(old.clone()));
+	let fenced = |mgr: &SlabManager| {
+		mgr.unapplied_tier_pointers
+			.get(&slab_id)
+			.map(|entry| entry.value().clone())
+	};
+	assert_eq!(
+		fenced(&mgr),
+		Some(super::tier_deferral::TierDeferral::fenced(
+			old.clone(),
+			super::tier_deferral::FenceCause::CommittedStanding,
+			None,
+		)),
+		"the unproven local generation is fenced, typed"
+	);
+	assert!(
+		mgr.require_tier_read_scope(&[slab_id]).is_err(),
+		"an unproven local generation never serves"
+	);
+
+	// A applied, then its committed pointer dropped without ending the slab's identity.
+	let first = index
+		.allocate_ops(
+			vec![SlabCommand::Tier(TierOp {
+				tier: b10_tier(&mgr, &old),
+				replaces: None,
+			})],
+			None,
+		)
+		.await
+		.unwrap()
+		.first;
+	let receipt = plain.submit_op(&first).await.unwrap();
+	assert!(
+		matches!(receipt, crate::storage::VerifiedReceipt::Applied { .. }),
+		"premise: A applied, {receipt:?}"
+	);
+	let slab = mgr.owner_ref().unwrap().slab(slab_id);
+	// The committed state now names the local generation: the reconcile clears its fence.
+	let committed = |lease: Option<&crate::consensus::TierSnapshotLease>| {
+		Ok(lease
+			.and_then(|lease| lease.committed_tier(slab))
+			.as_ref()
+			.map(TieredSlabPointer::from_ring))
+	};
+	mgr.reconcile_tier_slab_at_snapshot_epoch(slab_id, mgr.capture_snapshot_epoch(), committed)
+		.await
+		.unwrap();
+	assert_eq!(fenced(&mgr), None, "a provable generation clears the fence");
+	assert_eq!(mgr.tier_pointer(slab_id).await, Some(old.clone()));
+	for sm in &cluster.state_machines {
+		sm.drop_tiered_slab_pointer_for_test(slab).await;
+	}
+	let driver = op_driver(&cluster, &mgr, plain.clone());
+	for pass in 1..=4 {
+		let outcome = driver.drive_once().await;
+		let intents = mgr
+			.require_op_index()
+			.unwrap()
+			.load_op_intents()
+			.await
+			.unwrap();
+		eprintln!(
+			"ADR0704-UNKNOWN pass {pass}: {outcome:?} deferral {:?} intents {}",
+			mgr.unapplied_tier_pointers
+				.get(&slab_id)
+				.map(|entry| entry.value().clone()),
+			intents.len()
+		);
+		assert!(
+			intents.iter().any(|op| op.key() == first.key()),
+			"pass {pass}: A is never handed off while its standing is unknown"
+		);
+		assert_eq!(
+			mgr.tier_pointer(slab_id).await,
+			Some(old.clone()),
+			"pass {pass}: nothing installed, nothing retired"
+		);
+		assert!(
+			fenced(&mgr).is_some_and(|deferral| deferral.pointer == old
+				&& deferral.outcome
+					== super::tier_deferral::DeferralOutcome::Fenced(
+						super::tier_deferral::FenceCause::CommittedStanding
+					)),
+			"pass {pass}: the unproven local generation stays fenced"
+		);
+		assert!(
+			mgr.require_tier_read_scope(&[slab_id]).is_err(),
+			"pass {pass}: it never serves"
+		);
+	}
+	let _ = dirs;
+}
+
+/// ADR 0704 R1: a stale event for A, with A then B really committed and B not yet published
+/// here, is classified before anything it could cause. Whether the store is awaiting its
+/// cluster, in a snapshot install, or holds B as pending authority (staged by B's own callback
+/// during a snapshot install whose fence has since ended), A is refused as superseded: it
+/// stages nothing, defers nothing, and leaves B's pending authority as it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stale_tier_event_stages_nothing_and_leaves_newer_authority_untouched() {
+	for case in ["awaiting cluster", "snapshot install", "pending authority"] {
+		let f = two_applied_tier_generations(false).await;
+		let slab_id = f.old.slab_id;
+		assert_eq!(
+			f.mgr.tier_pointer(slab_id).await,
+			Some(f.old.clone()),
+			"{case}: premise: B is not published here"
+		);
+		match case {
+			"awaiting cluster" => f.mgr.set_awaiting_cluster_for_test(true),
+			"snapshot install" => {
+				f.mgr.begin_tier_snapshot_install().unwrap();
+				assert!(f.mgr.snapshot_install_in_flight(), "{case}: premise");
+			}
+			_ => {
+				// B's own callback stages B as pending authority during a snapshot install
+				// (once exposed, a store stages only there); the install's fence then ends,
+				// leaving B pending for verification.
+				let epoch = f.mgr.begin_tier_snapshot_install().unwrap();
+				f.mgr
+					.apply_tier_slab_committed(f.replacement.clone(), Some(f.second_index))
+					.await
+					.unwrap();
+				f.mgr.tier_authority.release_snapshot_fence_for_test(epoch);
+				assert!(!f.mgr.snapshot_install_in_flight(), "{case}: premise");
+			}
+		}
+		let pending_before = f
+			.mgr
+			.tier_authority
+			.pending
+			.get(&slab_id)
+			.map(|entry| entry.value().clone());
+		let deferral_before = f
+			.mgr
+			.unapplied_tier_pointers
+			.get(&slab_id)
+			.map(|entry| entry.value().clone());
+		eprintln!("ADR0704-R1 {case}: pending {pending_before:?} deferral {deferral_before:?}");
+		let error = f
+			.mgr
+			.apply_tier_slab_committed(f.old.clone(), Some(f.first_index))
+			.await
+			.expect_err("a stale event is refused");
+		assert!(
+			crate::storage::manager::is_tier_publication_superseded(&error),
+			"{case}: refused as superseded, before any staging: {error:?}"
+		);
+		let pending_after = f
+			.mgr
+			.tier_authority
+			.pending
+			.get(&slab_id)
+			.map(|entry| entry.value().clone());
+		assert!(
+			pending_after
+				.as_ref()
+				.is_none_or(|pending| pending.pointer != f.old),
+			"{case}: A is never staged as committed authority: {pending_after:?}"
+		);
+		if case == "pending authority" {
+			assert!(
+				pending_before
+					.as_ref()
+					.is_some_and(|pending| pending.pointer == f.replacement
+						&& pending.last_control_log_index == Some(f.second_index)),
+				"{case}: premise: B is pending: {pending_before:?}"
+			);
+			// B's verification may publish it meanwhile; A never replaces or touches it.
+			assert!(
+				pending_after.is_none() || pending_after == pending_before,
+				"{case}: B's pending authority is unchanged: {pending_after:?}"
+			);
+		} else {
+			assert_eq!(pending_after, None, "{case}: nothing staged");
+		}
+		let deferral_after = f
+			.mgr
+			.unapplied_tier_pointers
+			.get(&slab_id)
+			.map(|entry| entry.value().clone());
+		assert!(
+			deferral_after
+				.as_ref()
+				.is_none_or(|deferral| deferral.pointer != f.old),
+			"{case}: A defers nothing: {deferral_after:?}"
+		);
+		if case != "pending authority" {
+			assert_eq!(
+				deferral_after, deferral_before,
+				"{case}: deferrals untouched"
+			);
+			assert_eq!(
+				f.mgr.tier_pointer(slab_id).await,
+				Some(f.old.clone()),
+				"{case}: nothing installed"
+			);
+		}
+		f.mgr.set_awaiting_cluster_for_test(false);
+	}
+}
+
+/// ADR 0704 R2: a preparation that fails after its lease and slab lock were released is
+/// settled under fresh authority, never from outside it. A is committed and current when its
+/// event classifies; its fetch is parked; meanwhile B commits over A and B holds its own
+/// deferral. The fetch then fails: A, now superseded, adds nothing, and B's deferral stands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_preparation_settles_under_fresh_authority_and_keeps_newer_deferrals() {
+	use super::tier_deferral::{FenceCause, TierDeferral};
+	use crate::consensus::slab_ops::{SlabCommand, TierGeneration, TierOp};
+	let (dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let cluster = control_cluster_observing(&[]).await;
+	mgr.bind_control_node(1).unwrap();
+	register_owner(&cluster.nodes[0], &mgr).await;
+	mgr.bind_canonical_tier_source(cluster.state_machines[0].tier_snapshot_source_for_test());
+	let plain = Arc::new(op_committer(&cluster, 1));
+	let index = mgr.require_op_index().unwrap();
+	let slab_id = old.slab_id;
+	let bytes = l2.get(&old.l2_uri).await.unwrap();
+	let a = TieredSlabPointer {
+		l2_uri: l2.put("tier/s0704-r2-a.wnd", &bytes).await.unwrap(),
+		..old.clone()
+	};
+	let b = TieredSlabPointer {
+		l2_uri: l2.put("tier/s0704-r2-b.wnd", &bytes).await.unwrap(),
+		..old.clone()
+	};
+	let submit = async |command| {
+		let ticket = index.allocate_ops(vec![command], None).await.unwrap().first;
+		let crate::storage::VerifiedReceipt::Applied { index: applied } =
+			plain.submit_op(&ticket).await.unwrap()
+		else {
+			panic!("premise: applied");
+		};
+		applied
+	};
+	let a_index = submit(SlabCommand::Tier(TierOp {
+		tier: b10_tier(&mgr, &a),
+		replaces: None,
+	}))
+	.await;
+	let entered = Arc::new(tokio::sync::Semaphore::new(0));
+	let release = Arc::new(tokio::sync::Semaphore::new(0));
+	*mgr.continuity_test_holds
+		.tier_prepare_fail_hold
+		.lock()
+		.unwrap() = Some((entered.clone(), release.clone()));
+	let event = {
+		let (mgr, a) = (mgr.clone(), a.clone());
+		tokio::spawn(async move { mgr.apply_tier_slab_committed(a, Some(a_index)).await })
+	};
+	tokio::time::timeout(Duration::from_secs(60), entered.acquire())
+		.await
+		.expect("A was current, needed its object, and parked with no authority held")
+		.unwrap()
+		.forget();
+	let b_index = submit(SlabCommand::Tier(TierOp {
+		tier: b10_tier(&mgr, &b),
+		replaces: Some(TierGeneration::from(&a)),
+	}))
+	.await;
+	let b_deferral = TierDeferral::fenced(b.clone(), FenceCause::Staged, Some(b_index));
+	mgr.record_tier_deferral(slab_id, b_deferral.clone());
+	release.add_permits(1);
+	let result = event.await.unwrap();
+	eprintln!("ADR0704-R2 A's event after its failed preparation: {result:?}");
+	assert!(result.is_err(), "A's preparation failed");
+	assert_eq!(
+		mgr.unapplied_tier_pointers
+			.get(&slab_id)
+			.map(|entry| entry.value().clone()),
+		Some(b_deferral),
+		"B's deferral is unchanged: a superseded A adds nothing"
+	);
+	assert_eq!(
+		mgr.tier_pointer(slab_id).await,
+		Some(old),
+		"nothing installed"
+	);
+	let _ = dirs;
+}
+
+/// ADR 0704 R3: a fence of an unproven local generation never borrows another generation's
+/// callback index. An Unknown event for A over a local B fences B with no callback index; a
+/// snapshot covering A's index does not clear it; the reconcile does once B is provable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unknown_fence_of_a_local_generation_outlives_a_snapshot_covering_another_index() {
+	use super::tier_deferral::{FenceCause, TierDeferral};
+	let f = two_applied_tier_generations(true).await;
+	let slab_id = f.old.slab_id;
+	let slab = f.mgr.owner_ref().unwrap().slab(slab_id);
+	for sm in &f.cluster.state_machines {
+		sm.drop_tiered_slab_pointer_for_test(slab).await;
+	}
+	let error = f
+		.mgr
+		.apply_tier_slab_committed(f.old.clone(), Some(f.first_index))
+		.await
+		.expect_err("an unknown standing installs nothing");
+	assert!(!crate::storage::manager::is_tier_publication_superseded(
+		&error
+	));
+	let fence = TierDeferral::fenced(f.replacement.clone(), FenceCause::CommittedStanding, None);
+	let deferral = |mgr: &SlabManager| {
+		mgr.unapplied_tier_pointers
+			.get(&slab_id)
+			.map(|entry| entry.value().clone())
+	};
+	assert_eq!(
+		deferral(&f.mgr),
+		Some(fence.clone()),
+		"the local B is fenced with no callback index"
+	);
+	assert!(f.mgr.require_tier_read_scope(&[slab_id]).is_err());
+	// A snapshot that covers A's index is no evidence about B.
+	f.mgr.seed_installed_snapshot_index(f.first_index);
+	let round = f
+		.mgr
+		.replay_tier_deferrals(&mut std::collections::HashMap::new())
+		.await;
+	eprintln!("ADR0704-R3 replay round after a snapshot covering A: {round:?}");
+	assert_eq!(
+		deferral(&f.mgr),
+		Some(fence),
+		"the fence outlives that snapshot"
+	);
+	assert_eq!(
+		f.mgr.tier_pointer(slab_id).await,
+		Some(f.replacement.clone())
+	);
+	// B provable again: the reconcile, with fresh authority, clears it.
+	let tier = b10_tier(&f.mgr, &f.replacement);
+	for sm in &f.cluster.state_machines {
+		sm.seed_tiered_slab_for_test(tier.clone()).await;
+	}
+	let committed = |lease: Option<&crate::consensus::TierSnapshotLease>| {
+		Ok(lease
+			.and_then(|lease| lease.committed_tier(slab))
+			.as_ref()
+			.map(TieredSlabPointer::from_ring))
+	};
+	f.mgr
+		.reconcile_tier_slab_at_snapshot_epoch(slab_id, f.mgr.capture_snapshot_epoch(), committed)
+		.await
+		.unwrap();
+	assert_eq!(deferral(&f.mgr), None, "a provable B clears its fence");
+	assert_eq!(f.mgr.tier_pointer(slab_id).await, Some(f.replacement));
+}
+
+/// ADR 0704 R4: the superseded handoff keeps the cleanup-authority guard of
+/// `hand_off_op_if_complete`. With the store's cleanup authority unavailable (its sticky owner
+/// fence), a superseded A whose slab has converged keeps its intent; without it, A hands off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_superseded_tier_op_is_not_handed_off_without_cleanup_authority() {
+	for unavailable in [true, false] {
+		let f = two_applied_tier_generations(true).await;
+		if unavailable {
+			f.mgr
+				.owner_authority_fence
+				.set("ADR 0704 R4 control: cleanup authority unavailable")
+				.unwrap();
+			assert!(f.mgr.require_cleanup_authority().is_err(), "premise");
+		}
+		f.mgr
+			.hand_off_superseded_tier_op(&f.first, f.first_index)
+			.await
+			.unwrap();
+		let held = f
+			.mgr
+			.require_op_index()
+			.unwrap()
+			.load_op_intents()
+			.await
+			.unwrap()
+			.iter()
+			.any(|op| op.key() == f.first.key());
+		assert_eq!(
+			held, unavailable,
+			"unavailable {unavailable}: the superseded intent stays only without cleanup authority"
+		);
+	}
+}
+
+/// ADR 0704 §2: a ParentDecisions store (its versions contained) refuses an ordinary
+/// retirement before allocating anything: in that mode only a certified retirement
+/// may retire a tiered slab. The ring refuses it as well (`CertificationRequired`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_contained_store_refuses_an_uncertified_retirement_before_allocation() {
+	let (_dirs, mgr, _l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let cluster = control_cluster_observing(&[]).await;
+	mgr.bind_control_node(1).unwrap();
+	register_owner(&cluster.nodes[0], &mgr).await;
+	let plain = op_committer(&cluster, 1);
+	mgr.contain_version_reclamation();
+	let error = crate::storage::sweeper::propose_tier_retirement(
+		&mgr,
+		&plain,
+		old.slab_id,
+		crate::consensus::slab_ops::TierGeneration::from(&old),
+	)
+	.await
+	.expect_err("refused in mode");
+	assert!(
+		error.get_ref().is_some_and(|inner| inner
+			.is::<crate::storage::sweeper::UncertifiedRetirementRefused>(
+		)),
+		"{error}"
+	);
+	assert!(
+		mgr.require_op_index()
+			.unwrap()
+			.load_op_intents()
+			.await
+			.unwrap()
+			.is_empty(),
+		"nothing allocated"
+	);
+	assert_eq!(mgr.tier_pointer(old.slab_id).await, Some(old));
 }

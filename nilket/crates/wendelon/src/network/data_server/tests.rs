@@ -18071,7 +18071,7 @@ async fn data_admission_allows_unrelated_reads_during_snapshot_retirement() {
 	let task = {
 		let mgr = mgr.clone();
 		tokio::spawn(async move {
-			mgr.finish_tier_snapshot_install_at_epoch(vec![], Some(827), epoch)
+			mgr.finish_tier_snapshot_install_at_epoch(vec![], Some(827), epoch, None)
 				.await
 		})
 	};

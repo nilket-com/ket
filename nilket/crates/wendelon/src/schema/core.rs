@@ -2486,18 +2486,27 @@ pub const PRE_VERSIONING_FORMAT: u8 = 0;
 
 /// Shape of the `postcard(SmState)` body this build writes. ADR 0697 version 6
 /// keys tier pointers by owner-qualified slab and adds the incarnation
-/// registry; every earlier version is refused, not upconverted.
-pub const SNAPSHOT_FORMAT_VERSION: u8 = 8;
+/// registry; ADR 0704 version 15 adds certified provenance to tier pointers and a
+/// retained retirement link to op outcomes (9 to 14 were `ParentDecisions`
+/// development and ADR 0701 to ADR 0703 versions, so a version is never reused).
+/// Every earlier version is refused, not upconverted.
+pub const SNAPSHOT_FORMAT_VERSION: u8 = 15;
 /// Snapshot format of a `ParentDecisions` store; see `consensus::decision_mode`.
-pub const SNAPSHOT_FORMAT_VERSION_PARENT_DECISIONS: u8 = 14;
+/// ADR 0704: 16 (14 was ADR 0701 to ADR 0703's, before certified provenance; 15 is
+/// Today's).
+pub const SNAPSHOT_FORMAT_VERSION_PARENT_DECISIONS: u8 = 16;
 
 /// Shape of the Control Ring WAL record bodies this build writes, including the
 /// `postcard(Entry<..>)` payload of a log record. ADR 0697 version 6 carries
-/// owner-qualified slab commands and incarnation registration; every earlier
-/// version is refused, not upconverted.
-pub const WAL_FORMAT_VERSION: u8 = 8;
+/// owner-qualified slab commands and incarnation registration; ADR 0704 version 15
+/// carries certified provenance on Tier and Retire commands (9 to 14 were
+/// `ParentDecisions` versions, so a version is never reused). Every earlier version
+/// is refused, not upconverted.
+pub const WAL_FORMAT_VERSION: u8 = 15;
 /// Control-log format of a `ParentDecisions` store; see `consensus::decision_mode`.
-pub const WAL_FORMAT_VERSION_PARENT_DECISIONS: u8 = 14;
+/// ADR 0704: 16 (14 was ADR 0701 to ADR 0703's, before certified provenance; 15 is
+/// Today's).
+pub const WAL_FORMAT_VERSION_PARENT_DECISIONS: u8 = 16;
 
 // Static assertions to ensure all our size calculations remain exactly correct
 const _: () = assert!(std::mem::size_of::<HybridTimestamp>() == 16);

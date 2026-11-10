@@ -159,12 +159,13 @@ impl SlabManager {
 				self.unapplied_tier_pointers.get(&id).is_none()
 					&& self.tier_pointer(id).await.is_some_and(|pointer| {
 						TierGeneration::from(&pointer) == TierGeneration::from(&op.tier)
-					})
+					}) && self.local_postimage_is_exact(&op.tier)
 			}
 			SlabCommand::Retire(op) => {
 				let id = op.slab.local_id();
 				self.unapplied_tier_pointers.get(&id).is_none()
 					&& self.tier_pointer(id).await.is_none()
+					&& (op.certified.is_none() || self.local_retirement_is_exact(id))
 			}
 			SlabCommand::Compaction(_)
 			| SlabCommand::GcRemove(_)
@@ -195,6 +196,14 @@ impl SlabManager {
 		};
 		if let Some(lease) = &lease
 			&& !lease.op_applied_for_current_owner(ticket.key(), ticket.digest())
+		{
+			return Ok(());
+		}
+		// ADR 0704: certified work is never handed off on a committer's word alone.
+		if lease.is_none()
+			&& (ticket.certificate_requirement()
+				== crate::storage::index::CertificateRequirement::Required
+				|| super::certified_delivery::command_is_certified(ticket.command()))
 		{
 			return Ok(());
 		}
@@ -462,6 +471,7 @@ impl SlabManager {
 		self.op_request_for_test(SlabCommand::Retire(crate::consensus::slab_ops::RetireOp {
 			slab,
 			expected,
+			certified: None,
 		}))
 		.await
 	}

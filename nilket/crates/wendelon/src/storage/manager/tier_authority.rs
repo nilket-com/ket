@@ -442,7 +442,12 @@ impl TierAuthority {
 			})
 			.collect::<Vec<_>>();
 		manager
-			.finish_tier_snapshot_install_at_epoch(pointers, canonical.index(), retry.epoch)
+			.finish_tier_snapshot_install_at_epoch(
+				pointers,
+				canonical.index(),
+				retry.epoch,
+				Some(&canonical),
+			)
 			.await?;
 		#[cfg(test)]
 		if !deferred.is_empty() {
@@ -1000,6 +1005,19 @@ impl std::fmt::Display for ObsoleteVerification {
 
 impl std::error::Error for ObsoleteVerification {}
 
+/// ADR 0704: a marked store's verification with no canonical tier state bound: it
+/// waits, retryably, and publishes nothing.
+#[derive(Debug)]
+pub(crate) struct VerificationAwaitsCanonicalState;
+
+impl std::fmt::Display for VerificationAwaitsCanonicalState {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str("tier verification in a marked store awaits the canonical tier state")
+	}
+}
+
+impl std::error::Error for VerificationAwaitsCanonicalState {}
+
 pub(crate) fn obsolete_verification() -> Error {
 	Error::new(ErrorKind::Interrupted, ObsoleteVerification)
 }
@@ -1019,6 +1037,23 @@ impl TierAuthority {
 		manager
 			.own_tier_view(canonical.tiers().iter(), canonical.incarnations())
 			.ok_or_else(obsolete_verification)
+	}
+
+	/// ADR 0704: the lease a verification judges by. With none, a marked
+	/// (ParentDecisions) store waits, retryably, for its canonical state, whatever
+	/// op intents it holds; Today verifies as before.
+	fn verification_authority<'a>(
+		&self,
+		manager: &SlabManager,
+		lease: Option<&'a crate::consensus::TierSnapshotLease>,
+	) -> std::io::Result<Option<&'a crate::consensus::TierSnapshotLease>> {
+		if lease.is_none() && manager.versions_contained() {
+			return Err(Error::new(
+				ErrorKind::WouldBlock,
+				VerificationAwaitsCanonicalState,
+			));
+		}
+		Ok(lease)
 	}
 
 	async fn run(self: &Arc<Self>) {
@@ -1380,19 +1415,31 @@ impl TierAuthority {
 				Some(source) => Some(source.read().await?),
 				None => None,
 			};
-			if let Some(canonical) = &_canonical {
-				if !self.snapshot_revision_matches(canonical.revision()) {
-					return Err(obsolete_verification());
-				}
-				if !self
-					.own_canonical_pointers(canonical)?
-					.iter()
-					.any(|pointer| pointer.same_object_generation(&pending.pointer))
-				{
-					return Err(obsolete_verification());
-				}
+			if let Some(canonical) = &_canonical
+				&& !self.snapshot_revision_matches(canonical.revision())
+			{
+				return Err(obsolete_verification());
 			}
 			let manager = self.upgrade(epoch).ok_or_else(obsolete_verification)?;
+			// ADR 0704: with no deferred-snapshot retry, the manager's bound canonical state;
+			// held, as the retry's lease is, before the slab lock and through the
+			// publication. No object bytes are fetched under it.
+			let bound = match &_canonical {
+				Some(_) => None,
+				None => manager.canonical_tier_lease().await?,
+			};
+			let lease =
+				self.verification_authority(&manager, _canonical.as_ref().or(bound.as_ref()))?;
+			// Whichever lease is held, the pending generation must be this store's current
+			// committed one: absent or another generation never publishes.
+			if let Some(lease) = lease
+				&& !self
+					.own_canonical_pointers(lease)?
+					.iter()
+					.any(|pointer| pointer.same_object_generation(&pending.pointer))
+			{
+				return Err(obsolete_verification());
+			}
 			let lock = manager.tier_publication_lock(pending.pointer.slab_id);
 			let _publication = lock.lock().await;
 			if !self.current(epoch) {
@@ -1418,6 +1465,17 @@ impl TierAuthority {
 				.map_err(|error| {
 					manager.observed_publication_error(pending.pointer.slab_id, error)
 				})?;
+			// ADR 0704: a pending certified generation publishes only its proved rows.
+			if let Some(lease) = lease {
+				super::certified_delivery::verify_certified_generation(
+					&manager,
+					lease,
+					&pending.pointer,
+					&plan.old_rows,
+					&plan.new_rows,
+				)
+				.await?;
+			}
 			if plan.old_rows != plan.new_rows {
 				metrics().observe_storage_tier_rows_repaired_at_first_serve();
 			}
@@ -1463,6 +1521,31 @@ impl TierAuthority {
 			}
 		}
 		let manager = self.upgrade(epoch).ok_or_else(obsolete_verification)?;
+		// ADR 0704: with no retry, the bound canonical state, held through the Ready
+		// transition below: every verified generation is still this store's current one,
+		// so a stale pending set is never certified Ready.
+		let bound = match &_canonical {
+			Some(_) => None,
+			None => manager.canonical_tier_lease().await?,
+		};
+		// Whichever lease is held (the retry's, or the bound one), both kept alive
+		// through Ready.
+		let held = match snapshot.is_empty() {
+			// Nothing to certify: no generation can be stale.
+			true => None,
+			false => {
+				self.verification_authority(&manager, _canonical.as_ref().or(bound.as_ref()))?
+			}
+		};
+		if let Some(held) = held {
+			let own = self.own_canonical_pointers(held)?;
+			if snapshot.iter().any(|pending| {
+				!own.iter()
+					.any(|pointer| pointer.same_object_generation(&pending.pointer))
+			}) {
+				return Err(obsolete_verification());
+			}
+		}
 		let state = manager.state.lock().await;
 		let mut status = self.status.lock().unwrap_or_else(|e| e.into_inner());
 		if !self.current(epoch)
@@ -1706,8 +1789,18 @@ impl SlabManager {
 				|| (self.tier_authority.ready.load(Ordering::Acquire)
 					&& !self.tier_authority.pending.contains_key(&slab_id)
 					&& !self.unverified_tier_slabs.contains(&slab_id)))
-			&& !self.unapplied_tier_pointers.contains_key(&slab_id)
-		{
+			// ADR 0704: a fence on an unprovable committed standing is no authority against a
+			// retirement. It exists only under a canonical lease, which lets a retirement through
+			// only while one is in force, and that retirement is what clears it.
+			&& self
+				.unapplied_tier_pointers
+				.get(&slab_id)
+				.is_none_or(|entry| {
+					entry.value().outcome
+						== super::tier_deferral::DeferralOutcome::Fenced(
+							super::tier_deferral::FenceCause::CommittedStanding,
+						)
+				}) {
 			return Ok(());
 		}
 		Err(stale_location_error(slab_id, StaleLocationReason::Fenced))
@@ -2050,8 +2143,10 @@ impl SlabManager {
 		drop(gate);
 		self.tier_authority.snapshot_fences.release(epoch);
 		self.tier_authority.changed.notify_waiters();
+		// Bootstrap: no installed state is held here; a marked store fences a held
+		// preimage rather than retire it (ADR 0704).
 		for mark in marks {
-			self.apply_snapshot_retirement(mark).await?;
+			self.apply_snapshot_retirement(mark, None).await?;
 		}
 		self.tier_authority.start();
 		Ok(())
@@ -2159,17 +2254,25 @@ impl SlabManager {
 		pointers: Vec<TieredSlabPointer>,
 		index: Option<u64>,
 	) -> std::io::Result<()> {
-		self.finish_tier_snapshot_install_at_epoch(pointers, index, self.capture_snapshot_epoch())
-			.await
+		self.finish_tier_snapshot_install_at_epoch(
+			pointers,
+			index,
+			self.capture_snapshot_epoch(),
+			None,
+		)
+		.await
 	}
 
+	/// `lease`: the installed state, held by the caller (ADR 0704: it classifies every
+	/// retirement mark this comparison applies).
 	pub(crate) async fn finish_tier_snapshot_install_at_epoch(
 		&self,
 		pointers: Vec<TieredSlabPointer>,
 		index: Option<u64>,
 		snapshot_epoch: u64,
+		lease: Option<&crate::consensus::TierSnapshotLease>,
 	) -> std::io::Result<()> {
-		self.finish_tier_comparison_at_epoch(pointers, index, snapshot_epoch, None)
+		self.finish_tier_comparison_at_epoch(pointers, index, snapshot_epoch, None, lease)
 			.await
 	}
 
@@ -2198,7 +2301,7 @@ impl SlabManager {
 			}
 		}
 		let _fence = ReplayFence(self, epoch);
-		self.finish_tier_comparison_at_epoch(pointers, Some(applied), epoch, Some(confirmed))
+		self.finish_tier_comparison_at_epoch(pointers, Some(applied), epoch, Some(confirmed), None)
 			.await
 	}
 
@@ -2208,6 +2311,7 @@ impl SlabManager {
 		index: Option<u64>,
 		snapshot_epoch: u64,
 		replay_confirmation: Option<u64>,
+		lease: Option<&crate::consensus::TierSnapshotLease>,
 	) -> std::io::Result<()> {
 		let _gate = self.persistent_index_gate.clone().write_owned().await;
 		if self.tier_authority.closed.load(Ordering::Acquire) {
@@ -2559,7 +2663,7 @@ impl SlabManager {
 		#[cfg(test)]
 		self.snapshot_before_retirement_apply_pause_point().await;
 		for mark in post_retirement_marks {
-			self.apply_snapshot_retirement(mark).await?;
+			self.apply_snapshot_retirement(mark, lease).await?;
 		}
 		self.tier_authority.start();
 		Ok(())

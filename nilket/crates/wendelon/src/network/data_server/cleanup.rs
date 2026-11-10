@@ -334,3 +334,54 @@ impl crate::storage::manager::certified_lsm::CertifiedLsmDecider for WendelonDat
 		crate::storage::manager::certified_lsm::CertifiedSelection::decide(job, &facts, &evidence)
 	}
 }
+
+impl WendelonDataServer {
+	/// ADR 0704: one certified tier job on this store, when it may clean. The
+	/// caller is the leader-gated LSM service; the step refuses, typed, off the
+	/// leader. It runs under a lifecycle permit over the step and its work.
+	pub(crate) async fn certified_tier_step(
+		&self,
+		committer: &dyn crate::storage::TierCommitter,
+	) -> std::io::Result<crate::storage::manager::certified_tier::CertifiedTierStep> {
+		use crate::storage::manager::certified_tier::CertifiedTierStep;
+		if !self.parent_decisions() || !self.may_clean() {
+			return Ok(CertifiedTierStep::Idle);
+		}
+		#[cfg(test)]
+		if self.cleanup_paused_for_test() {
+			return Ok(CertifiedTierStep::Idle);
+		}
+		let permit = match self.slab.directory_owner() {
+			Some(owner) => Some(owner.lifecycle_permit()?),
+			None => None,
+		};
+		let state = self.state_machine.state_snapshot().await;
+		let result = self
+			.slab
+			.run_certified_tier_step(committer, self, &state.table_schemas)
+			.await;
+		if let Some(permit) = permit {
+			permit.complete();
+		}
+		result
+	}
+}
+
+#[async_trait::async_trait]
+impl crate::storage::manager::certified_tier::CertifiedTierDecider for WendelonDataServer {
+	/// The job's selection, from one coherent read of exactly its versions'
+	/// facts and the content evidence for their debt.
+	async fn decide(
+		&self,
+		job: &crate::storage::manager::certified_tier::TierCertifiedJob,
+	) -> std::io::Result<crate::storage::manager::certified_lsm::CertifiedSelection> {
+		let index = self.slab.persistent_index().ok_or_else(|| {
+			std::io::Error::new(std::io::ErrorKind::NotFound, "no persistent index")
+		})?;
+		let facts = index.version_facts(job.versions()).await?;
+		let evidence = self.content_evidence(&facts).await?;
+		crate::storage::manager::certified_lsm::CertifiedSelection::decide_tiered(
+			job, &facts, &evidence,
+		)
+	}
+}

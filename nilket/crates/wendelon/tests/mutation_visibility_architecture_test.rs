@@ -151,8 +151,10 @@ fn dormant_authority_has_no_production_provider_or_activation() {
 	// The live formats are pinned at their current versions; this substrate adds no
 	// boot/WAL/reader wiring.
 	let core = fs::read_to_string(root.join("src/schema/core.rs")).unwrap();
-	assert!(core.contains("SNAPSHOT_FORMAT_VERSION: u8 = 8"));
-	assert!(core.contains("WAL_FORMAT_VERSION: u8 = 8"));
+	// ADR 0704 bumped both to 15 (certified tier provenance; 9 to 14 were
+	// ParentDecisions versions).
+	assert!(core.contains("SNAPSHOT_FORMAT_VERSION: u8 = 15"));
+	assert!(core.contains("WAL_FORMAT_VERSION: u8 = 15"));
 	// The one admitted outside caller is the offline, read-only compromise audit CLI (ADR 0101
 	// C-S6): exactly one mention, its canonical import of the single audit entry point.
 	let audit_cli = root.join("src/cli/root2_audit.rs");

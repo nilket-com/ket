@@ -3845,6 +3845,14 @@ impl LsmCompactionDriver for LeaderGatedLsmCompactionDriver {
 			return Ok(None);
 		}
 		if let Some(data_server) = &self.certified {
+			// ADR 0704: one certified tier job, then the certified LSM job; a
+			// tier step that fails leaves the LSM step to run.
+			if let Err(error) = data_server
+				.certified_tier_step(self.committer.as_ref())
+				.await
+			{
+				tracing::warn!(%error, "certified tier step refused or failed; retried next tick");
+			}
 			return data_server
 				.certified_lsm_step(worker, now, self.committer.as_ref())
 				.await;
@@ -5153,6 +5161,7 @@ mod tests {
 							.map(|locator| locator.stats_block_hash128),
 						tombstone_metadata: TombstoneMetadata::None,
 						supersession_metadata: SupersessionMetadata::None,
+						certified: None,
 					})
 					.await,
 			)
@@ -5350,6 +5359,7 @@ mod tests {
 				.slab
 				.slab_supersession_metadata(slab_id)
 				.expect("fixture supersession summary must be readable"),
+			certified: None,
 		};
 		node.raft
 			.client_write(node.slab.tier_request_for_test(tier.clone()).await)
@@ -5514,6 +5524,7 @@ mod tests {
 							.map(|locator| locator.stats_block_hash128),
 						tombstone_metadata: TombstoneMetadata::None,
 						supersession_metadata: SupersessionMetadata::None,
+						certified: None,
 					})
 					.await,
 			)
@@ -5682,6 +5693,7 @@ mod tests {
 							.map(|locator| locator.stats_block_hash128),
 						tombstone_metadata: TombstoneMetadata::None,
 						supersession_metadata: SupersessionMetadata::None,
+						certified: None,
 					})
 					.await,
 			)
@@ -5830,6 +5842,7 @@ mod tests {
 							.map(|locator| locator.stats_block_hash128),
 						tombstone_metadata: TombstoneMetadata::None,
 						supersession_metadata: SupersessionMetadata::None,
+						certified: None,
 					})
 					.await,
 			)
@@ -6023,6 +6036,7 @@ mod tests {
 							.map(|locator| locator.stats_block_hash128),
 						tombstone_metadata: TombstoneMetadata::None,
 						supersession_metadata: SupersessionMetadata::None,
+						certified: None,
 					})
 					.await,
 			)

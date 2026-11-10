@@ -7156,6 +7156,7 @@ mod tests {
 				stats_block_hash128: None,
 				tombstone_metadata: TombstoneMetadata::None,
 				supersession_metadata: SupersessionMetadata::None,
+				certified: None,
 			},
 		);
 		snapshot.tiered_slabs.insert(
@@ -7172,6 +7173,7 @@ mod tests {
 				stats_block_hash128: None,
 				tombstone_metadata: TombstoneMetadata::None,
 				supersession_metadata: SupersessionMetadata::None,
+				certified: None,
 			},
 		);
 

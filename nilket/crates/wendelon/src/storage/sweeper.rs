@@ -492,7 +492,7 @@ impl std::error::Error for LsmCommitRejected {}
 /// This command was refused before client_write was invoked. A later Raft
 /// error, including ForwardToLeader, never carries this proof.
 #[derive(Debug)]
-struct TierCommitNotSubmitted(String);
+pub(crate) struct TierCommitNotSubmitted(pub(crate) String);
 impl std::fmt::Display for TierCommitNotSubmitted {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		f.write_str(&self.0)
@@ -584,6 +584,24 @@ pub(crate) async fn submit_tier_proposal(
 	}
 }
 
+/// ADR 0704: an ordinary (uncertified) retirement proposed by a ParentDecisions
+/// store, refused before allocation: in that mode only a certified retirement may
+/// retire a tiered slab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UncertifiedRetirementRefused(pub(crate) crate::schema::SlabId);
+
+impl std::fmt::Display for UncertifiedRetirementRefused {
+	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(
+			formatter,
+			"slab {} cannot be retired without certified provenance in ParentDecisions mode",
+			self.0.get()
+		)
+	}
+}
+
+impl std::error::Error for UncertifiedRetirementRefused {}
+
 /// Retire exactly the generation the work was planned from, as one operation.
 /// The caller staged its cleanup marker first; the marker holds its own evidence,
 /// so it survives a rejection and reconciliation resolves it against the pointer.
@@ -595,6 +613,14 @@ pub(crate) async fn propose_tier_retirement(
 ) -> std::io::Result<()> {
 	use crate::consensus::slab_ops::{RetireOp, SlabCommand};
 	let owner = slab.owner_ref()?;
+	// ADR 0704: in ParentDecisions mode a retirement must be certified; this ordinary
+	// one is refused before anything is allocated (the ring refuses it too).
+	if slab.versions_contained() {
+		return Err(std::io::Error::new(
+			std::io::ErrorKind::PermissionDenied,
+			UncertifiedRetirementRefused(slab_id),
+		));
+	}
 	committer.preflight(owner).await?;
 	let allocation = slab
 		.require_op_index()?
@@ -602,13 +628,23 @@ pub(crate) async fn propose_tier_retirement(
 			vec![SlabCommand::Retire(RetireOp {
 				slab: owner.slab(slab_id),
 				expected,
+				certified: None,
 			})],
 			None,
 		)
 		.await?;
-	let ticket = allocation.first;
-	match committer.submit_op(&ticket).await? {
-		VerifiedReceipt::Applied { .. } => slab.hand_off_op_if_complete(&ticket).await,
+	submit_tier_retirement(slab, committer, &allocation.first).await
+}
+
+/// Submit an allocated retirement: Applied hands off once its effect is durable;
+/// a definite rejection hands off and reports it.
+pub(crate) async fn submit_tier_retirement(
+	slab: &SlabManager,
+	committer: &dyn TierCommitter,
+	ticket: &OpTicket,
+) -> std::io::Result<()> {
+	match committer.submit_op(ticket).await? {
+		VerifiedReceipt::Applied { .. } => slab.hand_off_op_if_complete(ticket).await,
 		VerifiedReceipt::Rejected { reason, .. } => {
 			slab.require_op_index()?
 				.hand_off_op(ticket.key(), ticket.digest(), None)
@@ -1169,6 +1205,7 @@ impl SlabSweeper {
 			stats_block_hash128,
 			tombstone_metadata: self.slab.slab_row_tombstone_metadata(info.slab_id)?,
 			supersession_metadata: self.slab.slab_supersession_metadata(info.slab_id)?,
+			certified: None,
 		};
 		if let Err(error) = self
 			.slab
@@ -1395,6 +1432,7 @@ impl SlabSweeper {
 			stats_block_hash128,
 			tombstone_metadata: pointer.tombstone_metadata,
 			supersession_metadata: pointer.supersession_metadata,
+			certified: None,
 		};
 		self.slab
 			.prepare_tier_candidate_proposal(pointer.slab_id, &new_uri)
@@ -1552,6 +1590,7 @@ impl SlabSweeper {
 				stats_block_hash128,
 				tombstone_metadata: pointer.tombstone_metadata,
 				supersession_metadata: pointer.supersession_metadata,
+				certified: None,
 			};
 			if let Err(error) = propose_tier_slab(
 				&self.slab,
@@ -1649,6 +1688,7 @@ impl SlabSweeper {
 			stats_block_hash128,
 			tombstone_metadata: pointer.tombstone_metadata,
 			supersession_metadata: pointer.supersession_metadata,
+			certified: None,
 		};
 		self.slab
 			.prepare_tier_candidate_proposal(pointer.slab_id, &new_uri)
@@ -1900,6 +1940,7 @@ impl SlabSweeper {
 					stats_block_hash128,
 					tombstone_metadata,
 					supersession_metadata,
+					certified: None,
 				};
 				self.slab
 					.prepare_tier_candidate_proposal(slab_id, &new_uri)
@@ -2255,8 +2296,16 @@ impl SlabSweeper {
 				.await;
 			let retired = match self
 				.slab
-				.reconcile_tier_slab_at_snapshot_epoch(slab_id, observed_epoch, || {
-					std::future::ready(self.try_sm_tier_pointer(slab_id))
+				.reconcile_tier_slab_at_snapshot_epoch(slab_id, observed_epoch, |lease| {
+					// ADR 0704: the committed pointer from the lease the reconcile holds; the
+					// state machine is read directly only for a manager with no bound source.
+					match lease {
+						Some(lease) => Ok(lease
+							.committed_tier(self.slab.owner_ref()?.slab(slab_id))
+							.as_ref()
+							.map(TieredSlabPointer::from_ring)),
+						None => self.try_sm_tier_pointer(slab_id),
+					}
 				})
 				.await
 			{
@@ -2402,6 +2451,7 @@ impl SlabSweeper {
 			stats_block_hash128: pointer.stats_block_hash128,
 			tombstone_metadata: pointer.tombstone_metadata,
 			supersession_metadata,
+			certified: None,
 		};
 		propose_tier_slab(
 			&self.slab,
@@ -2689,7 +2739,12 @@ impl TierObserver for ManagerTierObserver {
 		};
 		match self
 			.slab
-			.finish_tier_snapshot_install_at_epoch(pointers, index, snapshot_epoch)
+			.finish_tier_snapshot_install_at_epoch(
+				pointers,
+				index,
+				snapshot_epoch,
+				canonical.as_ref(),
+			)
 			.await
 		{
 			Ok(()) => Ok(()),
@@ -2751,9 +2806,17 @@ impl TierObserver for ManagerTierObserver {
 		) {
 			return Ok(());
 		}
-		self.slab
+		match self
+			.slab
 			.apply_tier_slab_committed(TieredSlabPointer::from_ring(tier), Some(applied_log_index))
 			.await
+		{
+			// ADR 0704: a newer committed generation, or a retirement in force, replaced this
+			// one after it applied. Nothing is installed; the newer state's own event, or a
+			// reconcile, installs it.
+			Err(error) if crate::storage::manager::is_tier_publication_superseded(&error) => Ok(()),
+			result => result,
+		}
 	}
 
 	async fn on_slab_retired(
@@ -3006,6 +3069,7 @@ mod tests {
 			stats_block_hash128: pointer.stats_block_hash128,
 			tombstone_metadata: pointer.tombstone_metadata,
 			supersession_metadata: pointer.supersession_metadata,
+			certified: None,
 		})
 		.await;
 	}
@@ -3564,6 +3628,7 @@ mod tests {
 							stats_block_hash128: current.stats_block_hash128,
 							tombstone_metadata: current.tombstone_metadata,
 							supersession_metadata: current.supersession_metadata,
+							certified: None,
 						})
 						.await,
 				),
@@ -3706,6 +3771,7 @@ mod tests {
 							stats_block_hash128: current.stats_block_hash128,
 							tombstone_metadata: current.tombstone_metadata,
 							supersession_metadata: current.supersession_metadata,
+							certified: None,
 						})
 						.await,
 				),
@@ -3837,6 +3903,7 @@ mod tests {
 								stats_block_hash128: pointer.stats_block_hash128,
 								tombstone_metadata: pointer.tombstone_metadata,
 								supersession_metadata: pointer.supersession_metadata,
+								certified: None,
 							})
 							.await,
 					),
@@ -4180,8 +4247,13 @@ mod tests {
 		let sm = WendelonStateMachine::new().with_tier_observer(observer.clone());
 		let committer: Arc<dyn TierCommitter> =
 			Arc::new(DirectApplyCommitter::ok(sm.clone(), observer));
-		let sweeper =
-			SlabSweeper::new(manager.clone(), l2, committer, sm, SweeperConfig::default());
+		let sweeper = SlabSweeper::new(
+			manager.clone(),
+			l2,
+			committer,
+			sm.clone(),
+			SweeperConfig::default(),
+		);
 		let gate = manager.hold_index_write_gate_for_test().await;
 		let report = tokio::time::timeout(
 			Duration::from_secs(35),
@@ -4203,6 +4275,10 @@ mod tests {
 			lookup.is_err(),
 			"constructed absent-tier timeout must fence: lookup={lookup:?}, read={read:?}, expected_before={before:?}"
 		);
+		// ADR 0704: the fence stands until the committed state is provable. Here it becomes a
+		// retirement in force, as an applied Retire leaves it, and the retry retires.
+		sm.retire_tiered_slab_for_test(manager.owner_ref().unwrap().slab(loc.slab_id))
+			.await;
 		let retry = sweeper.reconcile_tiered_runtime_state_once().await.unwrap();
 		assert_eq!(retry.failed, 0);
 		assert_eq!(retry.reconciled, 1);
@@ -6833,6 +6909,7 @@ mod tests {
 			stats_block_hash128: None,
 			tombstone_metadata: crate::schema::TombstoneMetadata::None,
 			supersession_metadata: crate::schema::SupersessionMetadata::None,
+			certified: None,
 		};
 		let error = tokio::time::timeout(
 			Duration::from_secs(60),
@@ -7352,6 +7429,7 @@ mod tests {
 							stats_block_hash128: None,
 							tombstone_metadata: old.tombstone_metadata,
 							supersession_metadata: old.supersession_metadata,
+							certified: None,
 						})
 						.await,
 				),

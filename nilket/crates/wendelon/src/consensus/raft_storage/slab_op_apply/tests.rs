@@ -27,6 +27,7 @@ fn tier(owner: OwnerRef, slab: u64, uri: &str) -> TieredSlab {
 		stats_block_hash128: None,
 		tombstone_metadata: TombstoneMetadata::None,
 		supersession_metadata: SupersessionMetadata::None,
+		certified: None,
 	}
 }
 
@@ -468,6 +469,7 @@ fn a_tier_or_retire_of_a_stale_generation_is_rejected_and_records_that() {
 		SlabCommand::Retire(RetireOp {
 			slab: own.slab(SlabId::new(1)),
 			expected,
+			certified: None,
 		})
 	};
 	let mismatch = |expected, current| SlabRejection::GenerationMismatch { expected, current };
@@ -556,6 +558,7 @@ fn only_a_new_valid_retirement_reaches_the_pre_apply_hook() {
 		command: SlabCommand::Retire(RetireOp {
 			slab: own.slab(SlabId::new(1)),
 			expected,
+			certified: None,
 		}),
 	};
 	assert!(op_retirement(&state, &retire(2, current.clone()), NODE).is_some());
@@ -610,6 +613,7 @@ fn a_snapshot_with_an_invalid_op_table_is_refused() {
 		digest: [0; 32],
 		outcome: RecordedOutcome::Applied { index: 1 },
 		acked: false,
+		retirement: None,
 	};
 	let table = state.op_tables.entry(owner(0xA)).or_default();
 	table.acked_through = 5;
@@ -631,7 +635,9 @@ fn a_snapshot_with_an_invalid_op_table_is_refused() {
 }
 
 /// The digest contract: pinned per kind, so neither a codec change nor a new
-/// `SlabCommand` variant can move it silently.
+/// `SlabCommand` variant can move it silently. ADR 0704 moved Tier and Retire
+/// (each carries a trailing `certified` option, encoded even when `None`) with
+/// the format bump; the other kinds are unchanged.
 #[test]
 fn command_digests_are_pinned_per_kind() {
 	let own = OwnerRef::for_test(3, 0x0697);
@@ -661,6 +667,7 @@ fn command_digests_are_pinned_per_kind() {
 			SlabCommand::Retire(RetireOp {
 				slab: own.slab(SlabId::new(7)),
 				expected: generation,
+				certified: None,
 			}),
 		),
 		(
@@ -716,11 +723,11 @@ fn command_digests_are_pinned_per_kind() {
 		vec![
 			(
 				"tier",
-				"66e90e334a75580067c399f3518d182576560f68b7acf6058eac9979a7f87ca9".to_string()
+				"71e9ec64eddf825d2bb3b660c83ef74c76a0aea5d89972a4ebe0e3d45cd49ee5".to_string()
 			),
 			(
 				"retire",
-				"5d3e1b0103831f35d88502702206807b42b62c3f779e41fc654bd8e5557c0b4f".to_string()
+				"4e257b4787362ba0977206ee068bbb26ee7fab779383270eb6e7b0e91fa0d501".to_string()
 			),
 			(
 				"compaction",
@@ -900,6 +907,7 @@ fn a_retirement_ends_the_identity_in_its_one_entry() {
 		SlabCommand::Retire(RetireOp {
 			slab: tier.slab,
 			expected: TierGeneration::from(&tier),
+			certified: None,
 		}),
 		3,
 	));
@@ -1138,6 +1146,7 @@ fn an_accepted_retry_after_its_replacement_and_retirement_returns_its_receipt() 
 	let retire = SlabCommand::Retire(RetireOp {
 		slab: newer.slab,
 		expected: TierGeneration::from(&newer),
+		certified: None,
 	});
 	assert_eq!(
 		outcome(&apply_op(&mut state, 3, retire.clone(), 13).0),
@@ -1175,4 +1184,425 @@ fn a_cancel_of_another_digest_changes_nothing() {
 	assert_eq!(state.tiered_slabs, tiers);
 	let (retry, _) = apply_op(&mut state, 1, decided, 12);
 	assert_eq!(outcome(&retry), &applied(10), "its decision stands");
+}
+
+// ADR 0704: certified provenance on the ring.
+
+fn generation(owner: OwnerRef, slab: u64, uri: &str) -> TierGeneration {
+	TierGeneration::from(&tier(owner, slab, uri))
+}
+
+fn certified_tier(
+	owner: OwnerRef,
+	slab: u64,
+	uri: &str,
+	op: OpKey,
+	source: TierGeneration,
+) -> TieredSlab {
+	TieredSlab {
+		certified: Some(crate::consensus::slab_ops::CertifiedProvenance {
+			op,
+			source,
+			postimage_rows_digest: [0x55; 32],
+		}),
+		..tier(owner, slab, uri)
+	}
+}
+
+fn certified_retire(
+	owner: OwnerRef,
+	slab: u64,
+	expected: TierGeneration,
+	op: OpKey,
+	named_slab: u64,
+	source: TierGeneration,
+) -> SlabCommand {
+	SlabCommand::Retire(RetireOp {
+		slab: owner.slab(SlabId::new(slab)),
+		expected,
+		certified: Some(CertifiedRetirement {
+			op,
+			slab: owner.slab(SlabId::new(named_slab)),
+			source,
+		}),
+	})
+}
+
+fn key(owner: OwnerRef, op_seq: u64) -> OpKey {
+	OpKey { owner, op_seq }
+}
+
+/// ADR 0704 §2: apply validates certified provenance against its own envelope. A
+/// Tier or Retire whose provenance names another operation, another source
+/// generation or another slab is rejected, typed, and changes nothing; the same
+/// commands with their own provenance apply, and only the applied retirement
+/// leaves its link in its own outcome entry.
+#[test]
+fn apply_refuses_provenance_naming_another_op_source_or_slab() {
+	let mut state = registered(0xA);
+	let own = owner(0xA);
+	assert_applied(apply_op(&mut state, 1, first_tier(own, 1), 10));
+	let source = generation(own, 1, "l2://a");
+	let other = generation(own, 1, "l2://elsewhere");
+	let committed = state.tiered_slabs.clone();
+	let tier_with = |op, source, replaces| {
+		SlabCommand::Tier(TierOp {
+			tier: certified_tier(own, 1, "l2://b", op, source),
+			replaces,
+		})
+	};
+	let refused = [
+		(
+			"tier naming another op",
+			2,
+			tier_with(key(own, 99), source.clone(), Some(source.clone())),
+		),
+		(
+			"tier naming another owner's op",
+			3,
+			tier_with(key(owner(0xB), 3), source.clone(), Some(source.clone())),
+		),
+		(
+			"tier naming another source",
+			4,
+			tier_with(key(own, 4), other.clone(), Some(source.clone())),
+		),
+		(
+			"a certified tier with no replaced generation",
+			5,
+			SlabCommand::Tier(TierOp {
+				tier: certified_tier(own, 2, "l2://b", key(own, 5), source.clone()),
+				replaces: None,
+			}),
+		),
+		(
+			"retire naming another op",
+			6,
+			certified_retire(own, 1, source.clone(), key(own, 99), 1, source.clone()),
+		),
+		(
+			"retire naming another source",
+			7,
+			certified_retire(own, 1, source.clone(), key(own, 7), 1, other.clone()),
+		),
+		(
+			"retire naming another slab",
+			8,
+			certified_retire(own, 1, source.clone(), key(own, 8), 2, source.clone()),
+		),
+	];
+	for (case, op_seq, command) in refused {
+		assert_rejected(
+			apply_op(&mut state, op_seq, command, 10 + op_seq),
+			SlabRejection::ProvenanceMismatch,
+		);
+		assert_eq!(state.tiered_slabs, committed, "{case}: nothing applied");
+		assert!(
+			state
+				.slab_terminal
+				.get(&own)
+				.is_none_or(|terminal| !terminal.removed.contains(SlabId::new(1))),
+			"{case}: nothing removed"
+		);
+		assert!(
+			state.op_tables[&own].outcomes[&op_seq].retirement.is_none(),
+			"{case}: no retirement link"
+		);
+	}
+
+	// Their own provenance applies: the committed tier carries it, and only the
+	// applied retirement's own entry keeps the link.
+	let replacement = certified_tier(own, 1, "l2://b", key(own, 9), source.clone());
+	assert_applied(apply_op(
+		&mut state,
+		9,
+		SlabCommand::Tier(TierOp {
+			tier: replacement.clone(),
+			replaces: Some(source.clone()),
+		}),
+		20,
+	));
+	assert_eq!(
+		state.tiered_slabs[&own.slab(SlabId::new(1))].certified,
+		replacement.certified
+	);
+	let newer = TierGeneration::from(&replacement);
+	assert_applied(apply_op(
+		&mut state,
+		10,
+		certified_retire(own, 1, newer.clone(), key(own, 10), 1, newer.clone()),
+		21,
+	));
+	assert_eq!(
+		state.op_tables[&own].outcomes[&10].retirement,
+		Some(CertifiedRetirement {
+			op: key(own, 10),
+			slab: own.slab(SlabId::new(1)),
+			source: newer,
+		})
+	);
+	assert!(!state.tiered_slabs.contains_key(&own.slab(SlabId::new(1))));
+}
+
+/// ADR 0704 §2: a certified retirement's link lives exactly as long as its own
+/// retained outcome. It is found (only for the current owner, only Applied, only
+/// its own slab) while retained, survives a snapshot round trip with its entry,
+/// and is gone once the acknowledged prefix retires the entry, including after a
+/// snapshot. Several matches refuse, typed; a misplaced link fails snapshot
+/// validation.
+#[test]
+fn a_certified_retirements_link_lives_exactly_as_long_as_its_retained_outcome() {
+	use super::certified_retirement_in as found;
+	let mut state = registered(0xA);
+	let own = owner(0xA);
+	let slab = own.slab(SlabId::new(1));
+	assert_applied(apply_op(&mut state, 1, first_tier(own, 1), 10));
+	let source = generation(own, 1, "l2://a");
+	assert_applied(apply_op(
+		&mut state,
+		2,
+		certified_retire(own, 1, source.clone(), key(own, 2), 1, source.clone()),
+		11,
+	));
+	// A rejected certified retirement of another slab leaves no link.
+	assert_rejected(
+		apply_op(
+			&mut state,
+			3,
+			certified_retire(own, 3, source.clone(), key(own, 3), 3, source.clone()),
+			12,
+		),
+		SlabRejection::NotTiered,
+	);
+	let link = CertifiedRetirement {
+		op: key(own, 2),
+		slab,
+		source,
+	};
+	assert_eq!(found(&state, own, slab).unwrap(), Some(link.clone()));
+	assert_eq!(found(&state, own, own.slab(SlabId::new(3))).unwrap(), None);
+	assert_eq!(
+		found(&state, owner(0xB), slab).unwrap(),
+		None,
+		"another owner"
+	);
+
+	// Carried with its entry through a snapshot.
+	let (_, restored) = decode_snapshot_reader(&encode_snapshot(&state).unwrap()[..]).unwrap();
+	assert_eq!(restored.op_tables, state.op_tables);
+	assert_eq!(found(&restored, own, slab).unwrap(), Some(link.clone()));
+
+	// A superseded owner's retained link is no authority.
+	let mut superseded = state.clone();
+	supersede(&mut superseded, 0xA, 0xC);
+	assert_eq!(found(&superseded, own, slab).unwrap(), None);
+
+	// Two applied entries naming one slab are inconsistent: refused, never chosen.
+	let mut twice = state.clone();
+	let mut copy = twice.op_tables[&own].outcomes[&2].clone();
+	copy.retirement = Some(CertifiedRetirement {
+		op: key(own, 4),
+		..link.clone()
+	});
+	twice
+		.op_tables
+		.get_mut(&own)
+		.unwrap()
+		.outcomes
+		.insert(4, copy);
+	let error = found(&twice, own, slab).unwrap_err();
+	assert!(
+		error
+			.get_ref()
+			.is_some_and(|inner| inner.is::<super::InconsistentCertifiedRetirement>()),
+		"{error}"
+	);
+
+	// A link that is not its own applied entry's fails snapshot validation.
+	for (case, retirement, outcome) in [
+		(
+			"another op's link",
+			CertifiedRetirement {
+				op: key(own, 9),
+				..link.clone()
+			},
+			RecordedOutcome::Applied { index: 11 },
+		),
+		(
+			"a rejected entry's link",
+			link.clone(),
+			RecordedOutcome::Rejected {
+				reason: SlabRejection::Cancelled,
+				index: 11,
+			},
+		),
+	] {
+		let mut broken = state.clone();
+		let entry = broken
+			.op_tables
+			.get_mut(&own)
+			.unwrap()
+			.outcomes
+			.get_mut(&2)
+			.unwrap();
+		entry.retirement = Some(retirement);
+		entry.outcome = outcome;
+		assert!(validate_op_tables(&broken).is_err(), "{case}");
+	}
+
+	// The acknowledged prefix retires the entry, and its link with it.
+	ack(&mut state, own, vec![1, 2, 3]);
+	assert_eq!(state.op_tables[&own].acked_through, 3);
+	assert_eq!(found(&state, own, slab).unwrap(), None);
+	let (_, restored) = decode_snapshot_reader(&encode_snapshot(&state).unwrap()[..]).unwrap();
+	assert_eq!(found(&restored, own, slab).unwrap(), None);
+	assert!(restored.op_tables[&own].outcomes.is_empty());
+}
+
+/// ADR 0704 §2: provenance is not identity. `TierGeneration` and the store's own
+/// pointer are the same with and without it.
+#[test]
+fn provenance_leaves_the_tier_generation_unchanged() {
+	let own = owner(0xA);
+	let plain = tier(own, 1, "l2://b");
+	let certified = certified_tier(own, 1, "l2://b", key(own, 2), generation(own, 1, "l2://a"));
+	assert_ne!(plain, certified);
+	assert_eq!(
+		TierGeneration::from(&plain),
+		TierGeneration::from(&certified)
+	);
+	assert_eq!(
+		crate::storage::TieredSlabPointer::from_ring(&plain),
+		crate::storage::TieredSlabPointer::from_ring(&certified)
+	);
+}
+
+/// ADR 0704 §2: in ParentDecisions mode (the state carries decisions) a
+/// retirement without certified provenance is rejected, typed, and retires
+/// nothing; a certified one applies. Today keeps the ordinary retirement.
+#[test]
+fn in_parent_decisions_mode_only_a_certified_retirement_applies() {
+	let own = owner(0xA);
+	let source = generation(own, 1, "l2://a");
+	let ordinary = SlabCommand::Retire(RetireOp {
+		slab: own.slab(SlabId::new(1)),
+		expected: source.clone(),
+		certified: None,
+	});
+
+	let mut mode = registered(0xA);
+	mode.decisions = Some(Default::default());
+	assert_applied(apply_op(&mut mode, 1, first_tier(own, 1), 10));
+	assert_rejected(
+		apply_op(&mut mode, 2, ordinary.clone(), 11),
+		SlabRejection::CertificationRequired,
+	);
+	assert!(mode.tiered_slabs.contains_key(&own.slab(SlabId::new(1))));
+	assert_applied(apply_op(
+		&mut mode,
+		3,
+		certified_retire(own, 1, source.clone(), key(own, 3), 1, source),
+		12,
+	));
+	assert!(!mode.tiered_slabs.contains_key(&own.slab(SlabId::new(1))));
+
+	let mut today = registered(0xA);
+	assert_applied(apply_op(&mut today, 1, first_tier(own, 1), 10));
+	assert_applied(apply_op(&mut today, 2, ordinary, 11));
+	assert!(!today.tiered_slabs.contains_key(&own.slab(SlabId::new(1))));
+}
+
+/// ADR 0704 §2, through a state machine and its canonical lease: the lease reads
+/// the committed generation's provenance, and the certified retirement link while
+/// its outcome is retained; once the acknowledged prefix retires the outcome, the
+/// lease finds no link.
+#[tokio::test]
+async fn the_lease_reads_committed_provenance_and_a_retained_retirement_link() {
+	use openraft::storage::RaftStateMachine;
+	use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
+	let own = owner(0xA);
+	let slab = own.slab(SlabId::new(1));
+	let source = generation(own, 1, "l2://a");
+	let replacement = certified_tier(own, 1, "l2://b", key(own, 2), source.clone());
+	let newer = TierGeneration::from(&replacement);
+	let entry = |index: u64, request: WendelonRequest| Entry::<WendelonTypeConfig> {
+		log_id: LogId::new(CommittedLeaderId::new(1, NODE), index),
+		payload: EntryPayload::Normal(request),
+	};
+	let op = |op_seq, command| WendelonRequest::SlabOp(SlabOp { op_seq, command });
+	let mut sm = WendelonStateMachine::new();
+	let source_of_lease = sm.tier_snapshot_source_for_test();
+	RaftStateMachine::apply(
+		&mut sm,
+		[
+			entry(
+				1,
+				WendelonRequest::RegisterIncarnation(RegisterIncarnation {
+					node: NODE,
+					incarnation: own.incarnation(),
+					supersedes: None,
+				}),
+			),
+			entry(2, op(1, first_tier(own, 1))),
+			entry(
+				3,
+				op(
+					2,
+					SlabCommand::Tier(TierOp {
+						tier: replacement.clone(),
+						replaces: Some(source),
+					}),
+				),
+			),
+		],
+	)
+	.await
+	.unwrap();
+	{
+		let lease = source_of_lease.read().await.unwrap();
+		assert_eq!(lease.committed_provenance(slab), replacement.certified);
+		assert_eq!(lease.certified_retirement(own, slab).unwrap(), None);
+	}
+	RaftStateMachine::apply(
+		&mut sm,
+		[entry(
+			4,
+			op(
+				3,
+				certified_retire(own, 1, newer.clone(), key(own, 3), 1, newer.clone()),
+			),
+		)],
+	)
+	.await
+	.unwrap();
+	{
+		let lease = source_of_lease.read().await.unwrap();
+		assert_eq!(lease.committed_provenance(slab), None, "retired");
+		assert_eq!(
+			lease.certified_retirement(own, slab).unwrap(),
+			Some(CertifiedRetirement {
+				op: key(own, 3),
+				slab,
+				source: newer,
+			})
+		);
+	}
+	RaftStateMachine::apply(
+		&mut sm,
+		[entry(
+			5,
+			WendelonRequest::AckOutcomes(AckOutcomes {
+				owner: own,
+				seqs: vec![1, 2, 3],
+			}),
+		)],
+	)
+	.await
+	.unwrap();
+	let lease = source_of_lease.read().await.unwrap();
+	assert_eq!(
+		lease.certified_retirement(own, slab).unwrap(),
+		None,
+		"pruned with its outcome"
+	);
 }

@@ -646,8 +646,17 @@ pub(super) struct TestHolds {
 	/// Parks a tier delivery after its evidence is prepared, before its authority.
 	pub(super) tier_delivery_hold:
 		std::sync::Mutex<Option<(Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>>,
+	/// ADR 0704: parks the next on-demand preparation of a committed publication, with its
+	/// lease and slab lock released, then fails it as an unavailable object store would.
+	pub(super) tier_prepare_fail_hold:
+		std::sync::Mutex<Option<(Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>>,
 	/// Fails the next read of what a recovered publication left.
 	pub(super) fail_publication_readback: std::sync::atomic::AtomicBool,
+	/// ADR 0704: ends the next certified tier step at this cut, as a crash would.
+	pub(super) certified_tier_cut:
+		std::sync::Mutex<Option<super::certified_tier::CertifiedTierCut>>,
+	/// ADR 0704 §5: the source objects (URI, bytes) the certified path retained.
+	pub(super) certified_retained: std::sync::Mutex<Vec<(String, u64)>>,
 	pub(super) append_refusal_after: std::sync::atomic::AtomicU64,
 	/// Every control install's durable result, as it was published: later work may retire or
 	/// collect its runs, so a poll of the index cannot be relied on to see it.
@@ -878,5 +887,26 @@ impl SlabManager {
 			.entry((tenant_id, key_identity))
 			.or_default()
 			.push(location);
+	}
+}
+
+#[cfg(test)]
+impl SlabManager {
+	/// ADR 0704: the next on-demand preparation's parking and injected failure, if armed.
+	pub(super) async fn tier_prepare_fail_hold_for_test(&self) -> Option<Error> {
+		let hold = self
+			.continuity_test_holds
+			.tier_prepare_fail_hold
+			.lock()
+			.unwrap()
+			.take();
+		let (entered, release) = hold?;
+		entered.add_permits(1);
+		if let Ok(permit) = release.acquire().await {
+			permit.forget();
+		}
+		Some(super::tier_deferral::l2_unavailable(Error::other(
+			"injected object store failure",
+		)))
 	}
 }

@@ -21,7 +21,19 @@ const REJECTED_TIER_CANDIDATES_TABLE: TableDefinition<u64, &[u8]> =
 const META_OP_STATE_VERSION: &str = "op_state_version_v1";
 const META_NEXT_OP_SEQ: &str = "next_op_seq_v1";
 const META_KNOWN_ACKED_THROUGH: &str = "known_acked_through_v1";
-const OP_STATE_VERSION: u64 = 3;
+/// ADR 0704: 5. Intents hold slab commands whose Tier and Retire carry certified
+/// provenance (4), and each intent records whether its operation needs a local
+/// certificate (5). An older store's rows encode neither and are refused.
+const OP_STATE_VERSION: u64 = 5;
+
+/// Whether an operation's intent needs its local certificate. Allocation sets it
+/// from the command: `Required` exactly for a Tier or Retire with certified
+/// provenance, which only the certified tier allocation writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum CertificateRequirement {
+	None,
+	Required,
+}
 
 /// What an intent's phase guarantees.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -221,6 +233,8 @@ pub(crate) struct OpIntent {
 	/// The exact local input authority an earlier op of this workflow left for
 	/// this one, which it must still find.
 	pub expected_inputs: Option<Vec<LsmInputAuthority>>,
+	/// Whether this operation's certificate must be found beside it.
+	pub certificate: CertificateRequirement,
 }
 
 /// A file an abandoned reservation still has to dispose of, by its exact identity.
@@ -395,6 +409,7 @@ pub struct OpTicket {
 	command: SlabCommand,
 	progress: Option<OpProgress>,
 	expected_inputs: Option<Vec<LsmInputAuthority>>,
+	certificate: CertificateRequirement,
 }
 
 impl OpTicket {
@@ -409,6 +424,12 @@ impl OpTicket {
 	pub fn command(&self) -> &SlabCommand {
 		&self.command
 	}
+
+	/// Whether its intent requires a certificate, as durably recorded.
+	#[cfg_attr(not(test), allow(dead_code))]
+	pub(crate) fn certificate_requirement(&self) -> CertificateRequirement {
+		self.certificate
+	}
 }
 
 /// A later operation of a workflow, durable but not yet submittable.
@@ -419,6 +440,7 @@ pub(crate) struct ReservedOp {
 	command: SlabCommand,
 	progress: Option<OpProgress>,
 	expected_inputs: Option<Vec<LsmInputAuthority>>,
+	certificate: CertificateRequirement,
 }
 
 impl ReservedOp {
@@ -489,6 +511,14 @@ pub(crate) enum LoadedOp {
 }
 
 impl LoadedOp {
+	/// ADR 0704: whether its intent requires a certificate, as durably recorded.
+	pub(crate) fn certificate_requirement(&self) -> CertificateRequirement {
+		match self {
+			Self::Submittable(ticket) => ticket.certificate,
+			Self::Reserved(reserved) => reserved.certificate,
+		}
+	}
+
 	pub(crate) fn key(&self) -> OpKey {
 		match self {
 			Self::Submittable(ticket) => ticket.key(),
@@ -654,6 +684,7 @@ fn loaded_op(op_seq: u64, intent: OpIntent) -> LoadedOp {
 			command: intent.command,
 			progress: intent.progress,
 			expected_inputs: intent.expected_inputs,
+			certificate: intent.certificate,
 		}),
 		OpPhase::Reserved => LoadedOp::Reserved(ReservedOp {
 			key,
@@ -661,8 +692,21 @@ fn loaded_op(op_seq: u64, intent: OpIntent) -> LoadedOp {
 			command: intent.command,
 			progress: intent.progress,
 			expected_inputs: intent.expected_inputs,
+			certificate: intent.certificate,
 		}),
 	}
+}
+
+/// A command with certified provenance is allocated only with its certificate,
+/// through the certified tier allocation.
+fn refuse_uncertified_allocation_of(command: &SlabCommand) -> std::io::Result<()> {
+	if super::tier_certificate::requirement_of(command) == CertificateRequirement::Required {
+		return Err(Error::new(
+			ErrorKind::InvalidInput,
+			"a certified tier command is allocated only with its certificate",
+		));
+	}
+	Ok(())
 }
 
 /// Allocate sequences a row's charge already promised: no admission check, since
@@ -683,6 +727,7 @@ fn allocate_charged(
 	let mut allocated = Vec::with_capacity(commands.len());
 	for (offset, command) in commands.into_iter().enumerate() {
 		let op_seq = next + offset as u64;
+		refuse_uncertified_allocation_of(&command)?;
 		let intent = OpIntent {
 			digest: command.digest(),
 			phase: if offset == 0 {
@@ -693,6 +738,7 @@ fn allocate_charged(
 			command,
 			progress: None,
 			expected_inputs: None,
+			certificate: CertificateRequirement::None,
 		};
 		let bytes = encode_intent(&intent)?;
 		intents
@@ -1521,6 +1567,7 @@ impl PersistentLocalIndex {
 							)));
 						}
 						intents.remove(&op_seq).map_err(redb_to_io)?;
+						super::tier_certificate::remove_certificate_of(&tx, op_seq, &intent)?;
 						pending
 							.insert(&op_seq, &(false, digest))
 							.map_err(redb_to_io)?;
@@ -1717,6 +1764,7 @@ impl PersistentLocalIndex {
 							)));
 						}
 						intents.remove(&op_seq).map_err(redb_to_io)?;
+						super::tier_certificate::remove_certificate_of(&tx, op_seq, &intent)?;
 						pending
 							.insert(&op_seq, &(false, digest))
 							.map_err(redb_to_io)?;
@@ -1772,7 +1820,8 @@ impl PersistentLocalIndex {
 		commands: Vec<SlabCommand>,
 		linked: Option<LsmInstallIntent>,
 	) -> std::io::Result<OpAllocation> {
-		self.allocate_ops_with(commands, linked, None, None).await
+		self.allocate_ops_with(commands, linked, None, None, None)
+			.await
 	}
 
 	/// ADR 0703: a certified install's workflow. Its intent and certificate are
@@ -1786,7 +1835,7 @@ impl PersistentLocalIndex {
 		certificate: super::LsmCertificate,
 	) -> std::io::Result<Option<OpAllocation>> {
 		match self
-			.allocate_ops_with(commands, Some(linked), None, Some(certificate))
+			.allocate_ops_with(commands, Some(linked), None, Some(certificate), None)
 			.await
 		{
 			Ok(allocation) => Ok(Some(allocation)),
@@ -1817,8 +1866,36 @@ impl PersistentLocalIndex {
 				pre_delete_pending,
 			}),
 			None,
+			None,
 		)
 		.await
+	}
+
+	/// A certified tier job's one operation and its certificate, in one
+	/// transaction: the sequence is assigned, the provenance names that key and
+	/// the selection's source, and only then is the command digest fixed and
+	/// bound by the certificate. Allocated only while the active generation is
+	/// the selection's; otherwise nothing is written and no sequence is consumed.
+	/// Callers check the store's decision mode (`SlabManager`).
+	pub(crate) async fn allocate_certified_tier_op(
+		&self,
+		work: super::CertifiedTierWork,
+		evidence: super::TierSelectionEvidence,
+	) -> std::io::Result<super::CertifiedTierAllocation> {
+		match self
+			.allocate_ops_with(Vec::new(), None, None, None, Some((work, evidence)))
+			.await
+		{
+			Ok(allocation) => Ok(super::CertifiedTierAllocation::Allocated(allocation)),
+			Err(error)
+				if error
+					.get_ref()
+					.is_some_and(|inner| inner.is::<GenerationMoved>()) =>
+			{
+				Ok(super::CertifiedTierAllocation::GenerationMoved)
+			}
+			Err(error) => Err(error),
+		}
 	}
 
 	/// Whether any workflow holds these sequences; if not, hold them all.
@@ -1832,6 +1909,7 @@ impl PersistentLocalIndex {
 		linked: Option<LsmInstallIntent>,
 		first_progress: Option<OpProgress>,
 		certificate: Option<super::LsmCertificate>,
+		certified_tier: Option<(super::CertifiedTierWork, super::TierSelectionEvidence)>,
 	) -> std::io::Result<OpAllocation> {
 		if certificate.is_some() && linked.is_none() {
 			return Err(Error::new(
@@ -1839,11 +1917,23 @@ impl PersistentLocalIndex {
 				"an LSM certificate needs its install intent",
 			));
 		}
-		if commands.is_empty() {
+		// A certified tier job is exactly one operation, built here from its key.
+		if certified_tier.is_some()
+			&& (!commands.is_empty() || linked.is_some() || first_progress.is_some())
+		{
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				"a certified tier job allocates exactly its one operation",
+			));
+		}
+		if commands.is_empty() && certified_tier.is_none() {
 			return Err(Error::new(
 				ErrorKind::InvalidInput,
 				"an operation workflow needs at least one command",
 			));
+		}
+		for command in &commands {
+			refuse_uncertified_allocation_of(command)?;
 		}
 		#[cfg(test)]
 		let cut = self.take_op_txn_cut();
@@ -1863,7 +1953,11 @@ impl PersistentLocalIndex {
 					let (next, known) = read_counters(&meta)?;
 					let mut intents = tx.open_table(OP_INTENTS_TABLE).map_err(redb_to_io)?;
 					let pending = tx.open_table(OP_ACK_PENDING_TABLE).map_err(redb_to_io)?;
-					let requested = commands.len() as u64;
+					let requested = if certified_tier.is_some() {
+						1
+					} else {
+						commands.len() as u64
+					};
 					let charged = charged_reservations(
 						&tx.open_table(RESERVED_SLAB_IDS_TABLE).map_err(redb_to_io)?,
 					)?;
@@ -1884,9 +1978,22 @@ impl PersistentLocalIndex {
 					// until it can no longer write, whatever became of its caller.
 					ownership = OpOwnership::acquire(&live, (next..after).collect())
 						.ok_or_else(|| op_state_invalid("a fresh sequence already has an owner"))?;
+					// The certified operation's provenance names its own key before
+					// its digest is fixed below.
+					let commands = match &certified_tier {
+						Some((work, evidence)) => vec![work.command_of(
+							OpKey {
+								owner: work.slab().owner(),
+								op_seq: next,
+							},
+							&evidence.source_generation,
+						)?],
+						None => commands,
+					};
 					let mut allocated = Vec::with_capacity(commands.len());
 					for (offset, command) in commands.into_iter().enumerate() {
 						let op_seq = next + offset as u64;
+						let certificate = super::tier_certificate::requirement_of(&command);
 						let intent = OpIntent {
 							digest: command.digest(),
 							phase: if offset == 0 {
@@ -1901,6 +2008,7 @@ impl PersistentLocalIndex {
 								None
 							},
 							expected_inputs: None,
+							certificate,
 						};
 						let bytes = encode_intent(&intent)?;
 						intents
@@ -1910,6 +2018,17 @@ impl PersistentLocalIndex {
 					}
 					meta.insert(META_NEXT_OP_SEQ, &after).map_err(redb_to_io)?;
 					keys = allocated;
+				}
+				// Bound to the digest just fixed and to its generation, in this same
+				// transaction; a moved generation commits nothing.
+				if let Some((work, evidence)) = &certified_tier {
+					let [(op_seq, intent)] = keys.as_slice() else {
+						return Err(Error::other("a certified tier job is one operation"));
+					};
+					let certificate = work.certificate(evidence, intent.digest);
+					if !super::tier_certificate::insert_certificate(&tx, *op_seq, &certificate)? {
+						return Err(Error::new(ErrorKind::WouldBlock, GenerationMoved));
+					}
 				}
 				if let Some(mut intent) = linked {
 					let commit_bytes = serde_json::to_vec(&intent.commit).map_err(Error::other)?;
@@ -2054,6 +2173,7 @@ impl PersistentLocalIndex {
 					command: reserved.command,
 					progress: reserved.progress,
 					expected_inputs: reserved.expected_inputs,
+					certificate: reserved.certificate,
 				})
 			})
 			.await
@@ -2073,6 +2193,52 @@ impl PersistentLocalIndex {
 					loaded.push(loaded_op(op_seq, decode_intent(op_seq, bytes.value())?));
 				}
 				Ok(loaded)
+			})
+			.await
+	}
+
+	/// Whether operation `op_seq`'s intent requires a certificate; `None` when it
+	/// has no intent.
+	#[cfg_attr(not(test), allow(dead_code))]
+	pub(crate) async fn op_certificate_requirement(
+		&self,
+		op_seq: u64,
+	) -> std::io::Result<Option<CertificateRequirement>> {
+		self.db
+			.run(move |db| {
+				let tx = db.begin_read().map_err(redb_to_io)?;
+				let intents = tx.open_table(OP_INTENTS_TABLE).map_err(redb_to_io)?;
+				intents
+					.get(&op_seq)
+					.map_err(redb_to_io)?
+					.map(|bytes| {
+						decode_intent(op_seq, bytes.value()).map(|intent| intent.certificate)
+					})
+					.transpose()
+			})
+			.await
+	}
+
+	/// Every disagreement between the op intents and the tier certificates, read
+	/// in one transaction: what fences certified tiered cleanup at open.
+	pub(crate) async fn certified_tier_orphans(
+		&self,
+	) -> std::io::Result<Vec<super::CertifiedTierOrphan>> {
+		self.db
+			.run(|db| {
+				let tx = db.begin_read().map_err(redb_to_io)?;
+				let table = tx.open_table(OP_INTENTS_TABLE).map_err(redb_to_io)?;
+				let mut intents = Vec::new();
+				for row in table.iter().map_err(redb_to_io)? {
+					let (op_seq, bytes) = row.map_err(redb_to_io)?;
+					let op_seq = op_seq.value();
+					intents.push((op_seq, decode_intent(op_seq, bytes.value())?));
+				}
+				super::tier_certificate::orphans(
+					&intents,
+					&tx.open_table(super::tier_certificate::TIER_CERTIFICATES_TABLE)
+						.map_err(redb_to_io)?,
+				)
 			})
 			.await
 	}
@@ -2162,6 +2328,8 @@ impl PersistentLocalIndex {
 						)));
 					}
 					intents.remove(&op_seq).map_err(redb_to_io)?;
+					// The certificate goes only with its own intent, by exact binding.
+					super::tier_certificate::remove_certificate_of(&tx, op_seq, &intent)?;
 					pending
 						.insert(&op_seq, &(false, digest))
 						.map_err(redb_to_io)?;

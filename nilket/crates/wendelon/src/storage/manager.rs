@@ -212,9 +212,9 @@ pub(crate) use slab_ids::{OwnTierView, OwnerEvidence, Ownership};
 use slab_ids::{SLAB_ID_LEASE, slab_ids_exhausted};
 mod retention_reclaim;
 mod stats_facts;
-use retention_reclaim::{
-	cleanup_retention_rewrite_tmp_files, retention_rewrite_tmp_path, table_drop_rewrite_tmp_path,
-};
+#[cfg(test)]
+use retention_reclaim::retention_rewrite_tmp_path;
+use retention_reclaim::{cleanup_retention_rewrite_tmp_files, table_drop_rewrite_tmp_path};
 mod backing_install;
 mod disposal_evidence;
 mod redirect_store;
@@ -256,9 +256,13 @@ use tiered_io::{
 };
 #[cfg(test)]
 use tiered_io::{build_tiered_object_metadata, single_tenant_id_from_plain_slab};
+// ADR 0704: the typed refusal a superseded tier delivery ends with.
+pub(crate) use tiered_io::is_tier_publication_superseded;
 // ADR 0699 S5b: the certified cleanup rewrite.
 pub(crate) mod certified_cleanup;
+pub(crate) mod certified_delivery;
 pub(crate) mod certified_lsm;
+pub(crate) mod certified_tier;
 mod compaction;
 use compaction::{
 	CompactionOutcome, CompactionRecord, compact_physical_record_frame,
@@ -809,6 +813,11 @@ pub struct SlabManager {
 	/// ADR 0703: set at open when an LSM certificate has no install intent.
 	/// Certified LSM is then refused on this store.
 	certified_lsm_fenced: AtomicBool,
+	/// ADR 0704: set at open when op intents and tier certificates disagree.
+	/// Certified tiered cleanup is then refused on this store.
+	certified_tier_fence: Option<certified_tier::CertifiedTierFence>,
+	/// The last tiered slab a certified tier step visited (a pass cursor).
+	certified_tier_cursor: std::sync::atomic::AtomicU64,
 	/// Tiered slabs not yet verified against their objects since open.
 	unverified_tier_slabs: DashSet<SlabId>,
 	tier_authority: Arc<tier_authority::TierAuthority>,
@@ -3865,7 +3874,6 @@ impl SlabManager {
 		// never prepared and never retires a slab holding records.
 		self.keep_contained_versions(&mut records);
 		records.sort_by_key(|record| record.old_location.offset);
-		let physical_groups = physical_compaction_groups(&records);
 		let pruned_versions = records.iter().filter(|record| record.reclaim).count();
 		let retention_stats = Self::retention_compaction_stats(&records);
 		let survivors = records.iter().filter(|record| !record.reclaim).count();
@@ -3889,96 +3897,27 @@ impl SlabManager {
 			}));
 		}
 
-		let tmp_path = retention_rewrite_tmp_path(&self.config.dir, pointer.slab_id);
-		let _ = unlink_local_file(self.file_ops.as_ref(), &tmp_path).await;
-		let mut multirow_recompact_count = 0_u64;
-		// The replacement's own record offsets: the index still describes the
-		// old layout, so every walk of the new bytes takes these instead.
-		let mut replacement_offsets = BTreeSet::new();
-		let rewrite_result: std::io::Result<Zeroizing<Vec<u8>>> = async {
-			let rewritten = Arc::new(
-				LocalSlabStore::open(
-					&tmp_path,
-					pointer.slab_id,
-					self.file_ops.clone(),
-					self.config.group_commit.clone(),
-				)
-				.await?,
-			);
-			for group in physical_groups.values() {
-				let Some(first) = group.first().copied() else {
-					continue;
-				};
-				let frame = Zeroizing::new(extract_record_from_blob(
-					&plaintext,
-					crate::storage::core::FrameLocation::of_point_read(first.old_location),
-				)?);
-				let Some(compacted) = compact_physical_record_frame(
-					frame.as_ref(),
-					group,
-					Some(table_schemas),
-					&self.config.row_group_writer,
-					&self.config.encoding_writer,
-					&self.config.l2_chunk_layout,
-				)?
-				else {
-					continue;
-				};
-				if compacted.was_multirow {
-					multirow_recompact_count = multirow_recompact_count.saturating_add(1);
-				}
-				let location = rewritten
-					.append(
-						compacted.tenant_id,
-						compacted.key_identity,
-						compacted.hlc,
-						&compacted.frame,
-					)
-					.await?;
-				replacement_offsets.insert(location.offset);
-			}
-			rewritten.fsync().await?;
-			Ok(Zeroizing::new(self.file_ops.read_all(&tmp_path).await?))
-		}
-		.await;
-		let _ = unlink_local_file(self.file_ops.as_ref(), &tmp_path).await;
-		let rewritten_plaintext = rewrite_result?;
-		self.preflight_tier_publication(
-			pointer.slab_id,
-			&plaintext,
-			&rewritten_plaintext,
-			&replacement_offsets,
-		)
-		.await?;
-		if multirow_recompact_count > 0 {
-			metrics().observe_storage_multirow_recompact(multirow_recompact_count);
-		}
-		let encrypted = self.encrypt_tiered_blob_with_evidence(
-			pointer.slab_id,
-			rewritten_plaintext.as_ref(),
-			&replacement_offsets,
-			Some(table_schemas),
-		)?;
-		let row_tombstone_metadata = row_tombstone_metadata_from_blob(
-			rewritten_plaintext.as_ref(),
-			pointer.slab_id,
-			&replacement_offsets,
-		)?;
+		let replacement = self
+			.build_tiered_replacement(
+				pointer,
+				&plaintext,
+				&records,
+				table_schemas,
+				old_blob.len() as u64,
+			)
+			.await?;
 		Ok(Some(PreparedTieredRetentionRewrite::Rewrite {
 			slab_id: pointer.slab_id,
 			old_l2_uri: pointer.l2_uri.clone(),
 			old_generation: crate::consensus::slab_ops::TierGeneration::from(pointer),
 			old_bytes: old_blob.len() as u64,
-			payload_hash: crate::hash::content::digest(&encrypted.bytes),
-			tombstone_metadata: merge_row_tombstone_metadata(
-				pointer.tombstone_metadata,
-				row_tombstone_metadata,
-			),
-			supersession_metadata: self.slab_supersession_metadata(pointer.slab_id)?,
-			reclaimed_bytes: (old_blob.len() as u64).saturating_sub(encrypted.bytes.len() as u64),
+			payload_hash: replacement.payload_hash,
+			tombstone_metadata: replacement.tombstone_metadata,
+			supersession_metadata: replacement.supersession_metadata,
+			reclaimed_bytes: replacement.reclaimed_bytes,
 			pruned_versions,
 			retention_stats,
-			encrypted_bytes: encrypted.bytes,
+			encrypted_bytes: replacement.encrypted_bytes,
 		}))
 	}
 

@@ -385,7 +385,7 @@ impl UnresolvedTierCleanup {
 			.collect()
 	}
 
-	fn contains(&self, slab_id: SlabId) -> bool {
+	pub(super) fn contains(&self, slab_id: SlabId) -> bool {
 		let intents = self.intents.lock().unwrap();
 		let unresolved_legacy =
 			intents
@@ -1945,6 +1945,7 @@ impl SlabManager {
 						stats_block_hash128,
 						tombstone_metadata,
 						supersession_metadata,
+						certified: None,
 					};
 					self.prepare_tier_candidate_proposal(slab_id, &new_uri)
 						.await?;
@@ -2521,6 +2522,7 @@ impl SlabManager {
 						stats_block_hash128,
 						tombstone_metadata,
 						supersession_metadata,
+						certified: None,
 					};
 					// A lost response is not proof of a failed proposal. The durable
 					// unresolved intent keeps both objects, even across restart.
@@ -3271,5 +3273,115 @@ mod cleanup_union_controls {
 			},
 		);
 		assert_eq!(union.totals(), (2, 107, 0));
+	}
+}
+
+/// A tiered slab's replacement object, built and preflighted, not yet uploaded.
+pub(crate) struct TieredReplacement {
+	pub(crate) encrypted_bytes: Vec<u8>,
+	pub(crate) payload_hash: [u8; 32],
+	pub(crate) tombstone_metadata: TombstoneMetadata,
+	pub(crate) supersession_metadata: SupersessionMetadata,
+	pub(crate) reclaimed_bytes: u64,
+}
+
+impl SlabManager {
+	/// The replacement of `pointer`'s object: its records not reclaimed
+	/// (`records`, sorted by offset), recompacted into a fresh encrypted
+	/// object, preflighted against the published generation.
+	pub(super) async fn build_tiered_replacement(
+		&self,
+		pointer: &TieredSlabPointer,
+		plaintext: &[u8],
+		records: &[CompactionRecord],
+		table_schemas: &TableSchemaCatalog,
+		old_bytes: u64,
+	) -> std::io::Result<TieredReplacement> {
+		let physical_groups = physical_compaction_groups(records);
+		let tmp_path = retention_rewrite_tmp_path(&self.config.dir, pointer.slab_id);
+		let _ = unlink_local_file(self.file_ops.as_ref(), &tmp_path).await;
+		let mut multirow_recompact_count = 0_u64;
+		// The replacement's own record offsets: the index still describes the
+		// old layout, so every walk of the new bytes takes these instead.
+		let mut replacement_offsets = BTreeSet::new();
+		let rewrite_result: std::io::Result<Zeroizing<Vec<u8>>> = async {
+			let rewritten = Arc::new(
+				LocalSlabStore::open(
+					&tmp_path,
+					pointer.slab_id,
+					self.file_ops.clone(),
+					self.config.group_commit.clone(),
+				)
+				.await?,
+			);
+			for group in physical_groups.values() {
+				let Some(first) = group.first().copied() else {
+					continue;
+				};
+				let frame = Zeroizing::new(extract_record_from_blob(
+					plaintext,
+					crate::storage::core::FrameLocation::of_point_read(first.old_location),
+				)?);
+				let Some(compacted) = compact_physical_record_frame(
+					frame.as_ref(),
+					group,
+					Some(table_schemas),
+					&self.config.row_group_writer,
+					&self.config.encoding_writer,
+					&self.config.l2_chunk_layout,
+				)?
+				else {
+					continue;
+				};
+				if compacted.was_multirow {
+					multirow_recompact_count = multirow_recompact_count.saturating_add(1);
+				}
+				let location = rewritten
+					.append(
+						compacted.tenant_id,
+						compacted.key_identity,
+						compacted.hlc,
+						&compacted.frame,
+					)
+					.await?;
+				replacement_offsets.insert(location.offset);
+			}
+			rewritten.fsync().await?;
+			Ok(Zeroizing::new(self.file_ops.read_all(&tmp_path).await?))
+		}
+		.await;
+		let _ = unlink_local_file(self.file_ops.as_ref(), &tmp_path).await;
+		let rewritten_plaintext = rewrite_result?;
+		self.preflight_tier_publication(
+			pointer.slab_id,
+			plaintext,
+			&rewritten_plaintext,
+			&replacement_offsets,
+		)
+		.await?;
+		if multirow_recompact_count > 0 {
+			metrics().observe_storage_multirow_recompact(multirow_recompact_count);
+		}
+		let encrypted = self.encrypt_tiered_blob_with_evidence(
+			pointer.slab_id,
+			rewritten_plaintext.as_ref(),
+			&replacement_offsets,
+			Some(table_schemas),
+		)?;
+		let row_tombstone_metadata = row_tombstone_metadata_from_blob(
+			rewritten_plaintext.as_ref(),
+			pointer.slab_id,
+			&replacement_offsets,
+		)?;
+		Ok(TieredReplacement {
+			payload_hash: crate::hash::content::digest(&encrypted.bytes),
+			tombstone_metadata: merge_row_tombstone_metadata(
+				pointer.tombstone_metadata,
+				row_tombstone_metadata,
+			),
+			supersession_metadata: self.slab_supersession_metadata(pointer.slab_id)?,
+			reclaimed_bytes: old_bytes.saturating_sub(encrypted.bytes.len() as u64),
+			encrypted_bytes: encrypted.bytes,
+		})
 	}
 }

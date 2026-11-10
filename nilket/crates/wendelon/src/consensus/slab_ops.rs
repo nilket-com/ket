@@ -42,6 +42,32 @@ pub struct TierGeneration {
 	pub stats_block_hash128: Option<[u8; 16]>,
 }
 
+/// ADR 0704: the ring provenance of a certified tiered rewrite, carried by its
+/// `TieredSlab` in the command and the committed state. It classifies the
+/// generation (ordinary or certified) for every publication path; it is not
+/// part of the object's identity, `TierGeneration`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CertifiedProvenance {
+	/// The operation that proposed this generation: apply requires its own key.
+	pub op: OpKey,
+	/// The generation it replaced: apply requires the command's `replaces`.
+	pub source: TierGeneration,
+	/// The delivery's own rows derivation over the uploaded object.
+	pub postimage_rows_digest: [u8; 32],
+}
+
+/// ADR 0704: the ring provenance of a certified retirement. On apply it is kept
+/// only in the operation's own retained outcome entry, and pruned with it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CertifiedRetirement {
+	/// The operation that proposed it: apply requires its own key.
+	pub op: OpKey,
+	/// The retired slab: apply requires the command's own slab.
+	pub slab: SlabRef,
+	/// The generation it retired: apply requires the command's `expected`.
+	pub source: TierGeneration,
+}
+
 impl From<&TieredSlab> for TierGeneration {
 	fn from(tier: &TieredSlab) -> Self {
 		// Exhaustive: a new field must be classified as identity or advisory.
@@ -57,6 +83,8 @@ impl From<&TieredSlab> for TierGeneration {
 			stats_block_hash128,
 			tombstone_metadata: _,
 			supersession_metadata: _,
+			// ADR 0704: provenance classifies a generation; it never names one.
+			certified: _,
 		} = tier;
 		Self {
 			l2_uri: l2_uri.clone(),
@@ -84,6 +112,8 @@ pub struct TierOp {
 pub struct RetireOp {
 	pub slab: SlabRef,
 	pub expected: TierGeneration,
+	/// ADR 0704: a certified retirement's provenance. Required in ParentDecisions mode.
+	pub certified: Option<CertifiedRetirement>,
 }
 
 /// The run a GC removal was reserved against, for the owner's own exact check.
@@ -382,6 +412,11 @@ pub enum SlabRejection {
 	Removed,
 	/// A Complete whose job does not hold the claim.
 	NotClaimedBy { current: Option<CompactionJobId> },
+	/// ADR 0704: certified provenance that names another operation, another source
+	/// generation or another slab than its own command.
+	ProvenanceMismatch,
+	/// ADR 0704: in ParentDecisions mode a retirement must carry its certified provenance.
+	CertificationRequired,
 }
 
 /// A decision as the state machine recorded it, at its original index.
@@ -443,6 +478,9 @@ pub struct OpEntry {
 	pub digest: [u8; 32],
 	pub outcome: RecordedOutcome,
 	pub acked: bool,
+	/// ADR 0704: an Applied certified retirement's validated provenance, retained
+	/// only with this entry and pruned with it by the acknowledged prefix.
+	pub retirement: Option<CertifiedRetirement>,
 }
 
 impl OpTable {

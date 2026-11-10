@@ -4,9 +4,10 @@
 //! Recovery here is leader-only, and a store that is not its node's current incarnation
 //! recovers nothing: history answers what happened, and grants no authority.
 
+use super::tiered_io::is_tier_publication_superseded;
 use super::*;
 use crate::consensus::slab_ops::{
-	RecordedOutcome, RunIdentity, SlabCommand, SlabStanding, ViewOutcome,
+	RecordedOutcome, RunIdentity, SlabCommand, SlabStanding, TierGeneration, ViewOutcome,
 };
 use crate::storage::index::{LoadedOp, LsmInstallIntent, OpProgress, OpTicket};
 
@@ -1781,22 +1782,62 @@ impl SlabManager {
 
 	/// §6.1's adapter: what the ring's observer would have delivered, had this store been
 	/// here, then the handoff once it is durable. A failed apply keeps its row.
+	///
+	/// ADR 0704: classified first, under the lease and before any object I/O. A generation the
+	/// committed state superseded after it applied is never prepared or installed: once this
+	/// store holds the committed state it hands off as superseded. An unknown standing is left
+	/// unresolved (the publication path fences what it must). Only a current generation is
+	/// prepared, with no authority held, and published under a fresh lease that rechecks it.
 	async fn deliver_applied_tier_op(
 		self: Arc<Self>,
 		ticket: OpTicket,
 		applied: u64,
 		_ownership: crate::storage::index::OpOwnership,
 	) -> std::io::Result<()> {
-		// Object storage first, with no authority held: it can stall, and a state machine
-		// writer must not wait on it. What it found is only used if nothing moved since.
-		let prepared = match ticket.command() {
-			SlabCommand::Tier(op) => Some((
-				TieredSlabPointer::from_ring(&op.tier),
-				self.prepare_tier_delivery(&TieredSlabPointer::from_ring(&op.tier))
-					.await?,
-			)),
-			_ => None,
+		let op = match ticket.command() {
+			SlabCommand::Tier(op) => op.clone(),
+			SlabCommand::Retire(op) => {
+				// The lease, then the slab lock; the retirement proceeds only in force.
+				let lease = self.canonical_tier_lease().await?;
+				Self::require_applied_for_current_owner(lease.as_ref(), &ticket)?;
+				self.retire_tiered_slab_leased(
+					op.slab.local_id(),
+					Some(applied),
+					self.capture_snapshot_epoch(),
+					lease.as_ref(),
+				)
+				.await?;
+				drop(lease);
+				return self.hand_off_op_if_complete(&ticket).await;
+			}
+			other => return Err(Error::other(format!("not a tier operation: {other:?}"))),
 		};
+		let pointer = TieredSlabPointer::from_ring(&op.tier);
+		let slab = self.owner_ref()?.slab(pointer.slab_id);
+		let generation = TierGeneration::from(&op.tier);
+		{
+			let lease = self.canonical_tier_lease().await?;
+			Self::require_applied_for_current_owner(lease.as_ref(), &ticket)?;
+			match lease
+				.as_ref()
+				.map(|lease| lease.tier_standing(slab, &generation, Some(applied)))
+			{
+				Some(crate::consensus::TierStanding::Superseded) => {
+					drop(lease);
+					return self.finish_superseded_tier_op(&ticket, applied).await;
+				}
+				Some(crate::consensus::TierStanding::Unknown) => {
+					// Never prepared: the rule refuses, and fences what it must.
+					return self
+						.apply_prepared_tier_delivery(pointer, Some(applied), None, lease.as_ref())
+						.await;
+				}
+				Some(crate::consensus::TierStanding::Current) | None => {}
+			}
+		}
+		// Object storage, with no authority held: it can stall, and a state machine writer
+		// must not wait on it. What it found is only used if nothing moved since.
+		let prepared = self.prepare_tier_delivery(&pointer).await?;
 		#[cfg(test)]
 		{
 			let hold = self
@@ -1810,12 +1851,40 @@ impl SlabManager {
 				let _ = release.acquire().await;
 			}
 		}
-		let lease = match self.canonical_tier_source.get() {
-			Some(source) => Some(source.read().await?),
-			None => None,
-		};
-		if lease
+		let lease = self.canonical_tier_lease().await?;
+		Self::require_applied_for_current_owner(lease.as_ref(), &ticket)?;
+		let prepared = match lease
 			.as_ref()
+			.map(|lease| lease.tier_standing(slab, &generation, Some(applied)))
+		{
+			Some(crate::consensus::TierStanding::Superseded) => {
+				drop(lease);
+				return self.finish_superseded_tier_op(&ticket, applied).await;
+			}
+			// Unknown now: the rule refuses without the preparation, and fences what it must.
+			Some(crate::consensus::TierStanding::Unknown) => None,
+			Some(crate::consensus::TierStanding::Current) | None => Some(prepared),
+		};
+		let delivered = self
+			.apply_prepared_tier_delivery(pointer, Some(applied), prepared, lease.as_ref())
+			.await;
+		drop(lease);
+		match delivered {
+			Ok(()) => self.hand_off_op_if_complete(&ticket).await,
+			Err(error) if is_tier_publication_superseded(&error) => {
+				self.finish_superseded_tier_op(&ticket, applied).await
+			}
+			Err(error) => Err(error),
+		}
+	}
+
+	/// A recovered operation is acted on only while Applied for its current owner, in the
+	/// lease's one state; with no source, its committer's word stands.
+	fn require_applied_for_current_owner(
+		lease: Option<&crate::consensus::TierSnapshotLease>,
+		ticket: &OpTicket,
+	) -> std::io::Result<()> {
+		if lease
 			.is_some_and(|lease| !lease.op_applied_for_current_owner(ticket.key(), ticket.digest()))
 		{
 			return Err(fenced(format!(
@@ -1823,24 +1892,101 @@ impl SlabManager {
 				ticket.key().op_seq
 			)));
 		}
-		match ticket.command() {
-			SlabCommand::Tier(_) => {
-				let Some((pointer, prepared)) = prepared else {
-					return Err(Error::other("a tier operation prepared nothing"));
-				};
-				self.apply_prepared_tier_delivery(pointer, Some(applied), prepared)
-					.await?;
-			}
-			SlabCommand::Retire(op) => {
-				self.retire_tiered_slab_committed(op.slab.local_id(), Some(applied))
-					.await?;
-			}
-			other => {
-				return Err(Error::other(format!("not a tier operation: {other:?}")));
-			}
+		Ok(())
+	}
+
+	/// ADR 0704: a superseded Tier operation's slab is reconciled to the committed state (the
+	/// existing authority reconcile, its pointer read from the lease it holds), then the
+	/// operation hands off as superseded once this store holds that state.
+	async fn finish_superseded_tier_op(
+		&self,
+		ticket: &OpTicket,
+		applied: u64,
+	) -> std::io::Result<()> {
+		let SlabCommand::Tier(op) = ticket.command() else {
+			return Ok(());
+		};
+		let slab_id = op.tier.slab.local_id();
+		let owner = self.owner_ref()?;
+		self.reconcile_tier_slab_at_snapshot_epoch(
+			slab_id,
+			self.capture_snapshot_epoch(),
+			|lease| {
+				let lease = lease.ok_or_else(|| {
+					Error::new(
+						ErrorKind::WouldBlock,
+						"a superseded tier operation reconciles under the canonical lease",
+					)
+				})?;
+				Ok(lease
+					.committed_tier(owner.slab(slab_id))
+					.as_ref()
+					.map(TieredSlabPointer::from_ring))
+			},
+		)
+		.await?;
+		self.hand_off_superseded_tier_op(ticket, applied).await
+	}
+
+	/// ADR 0704: hand off a Tier operation the committed state superseded after it applied,
+	/// once this store holds that committed state. Under one fresh lease: the operation is
+	/// Applied for the current owner, its generation is superseded as of its own applied index,
+	/// and the local store has converged (the committed generation published, with no deferral
+	/// or pending authority for the slab, or no pointer under a retirement in force). Anything
+	/// else leaves its intent, and a later pass retries. It touches nothing of the newer
+	/// generation: no completion, deferral or fence of it.
+	pub(super) async fn hand_off_superseded_tier_op(
+		&self,
+		ticket: &OpTicket,
+		applied: u64,
+	) -> std::io::Result<()> {
+		let index = self.require_op_index()?;
+		// As `hand_off_op_if_complete`: current-owner evidence does not restore missing cleanup
+		// evidence, and this covers the sticky owner fence. The intent stays.
+		if self.require_cleanup_authority().is_err() {
+			return Ok(());
 		}
-		drop(lease);
-		self.hand_off_op_if_complete(&ticket).await
+		let SlabCommand::Tier(op) = ticket.command() else {
+			return Ok(());
+		};
+		let Some(lease) = self.canonical_tier_lease().await? else {
+			return Ok(());
+		};
+		if !lease.op_applied_for_current_owner(ticket.key(), ticket.digest()) {
+			return Ok(());
+		}
+		let slab_id = op.tier.slab.local_id();
+		let slab = self.owner_ref()?.slab(slab_id);
+		if lease.tier_standing(slab, &TierGeneration::from(&op.tier), Some(applied))
+			!= crate::consensus::TierStanding::Superseded
+		{
+			return Ok(());
+		}
+		let local = self.tier_pointer(slab_id).await;
+		let converged = match lease.committed_tier(slab) {
+			Some(committed) => {
+				local.as_ref().map(TierGeneration::from) == Some(TierGeneration::from(&committed))
+					&& self.unapplied_tier_pointers.get(&slab_id).is_none()
+					&& !self.tier_authority.pending.contains_key(&slab_id)
+					// ADR 0704: a certified Y only at its exact ring postimage.
+					&& self.local_postimage_is_exact(&committed)
+			}
+			// ADR 0704: a retirement only at its exact empty postimage, with no authority
+			// still outstanding for the slab.
+			None => {
+				lease.retirement_in_force(slab)
+					&& local.is_none()
+					&& self.local_retirement_is_exact(slab_id)
+					&& self.unapplied_tier_pointers.get(&slab_id).is_none()
+					&& !self.tier_authority.pending.contains_key(&slab_id)
+			}
+		};
+		if !converged {
+			return Ok(());
+		}
+		index
+			.hand_off_op_under(ticket.key(), ticket.digest(), Box::new(Some(lease)))
+			.await
 	}
 
 	/// Rejected, by the ring's word. A tier's candidate becomes durable in the handoff, and

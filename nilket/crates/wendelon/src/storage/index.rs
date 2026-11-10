@@ -47,6 +47,7 @@ const LSM_INSTALL_INTENTS_TABLE: TableDefinition<u64, &[u8]> =
 	TableDefinition::new("lsm_install_intents_v1");
 const META_LSM_INSTALL_INTENTS_INITIALIZED: &str = "lsm_install_intents_initialized_v1";
 const META_LSM_CERTIFICATES_INITIALIZED: &str = "lsm_certified_selections_initialized_v1";
+const META_TIER_CERTIFICATES_INITIALIZED: &str = "tier_certified_selections_initialized_v1";
 
 /// ADR 0097 decision 4: durable evidence of deterministic maintenance failures.
 ///
@@ -501,6 +502,13 @@ const META_LAST_CONTROL_LOG_INDEX: &str = "last_control_log_index";
 pub(crate) mod certified_base;
 mod lsm_certificate;
 pub(crate) use lsm_certificate::{LsmCertificate, intent_binding};
+mod tier_certificate;
+pub(crate) use op_state::CertificateRequirement;
+#[cfg_attr(not(test), allow(unused_imports))]
+pub(crate) use tier_certificate::{
+	CertifiedTierAllocation, CertifiedTierOrphan, CertifiedTierWork, TierCertificateBindsAnotherOp,
+	TierCertifiedPostimage, TierCertifiedSelection, TierSelectionEvidence,
+};
 /// The store's incarnation, written once by fresh initialization and never
 /// rewritten. Its absence on open means the store predates slab identity.
 mod op_state;
@@ -1198,338 +1206,362 @@ impl PersistentLocalIndex {
 		// initialization or a refused bind drops the raw database inside this
 		// closure, while the permit still holds the owner open.
 		let bind_owner = owner.clone();
-		let opened = spawn_blocking_owned_io(owner, move || {
-			let staging = initializing_index_path(&path);
-			let db = if initialize_new {
-				// An explicit fresh initialization can never open or replace an
-				// existing authority file: it is built under a staging name and
-				// linked into place without clobbering (below). A staging file
-				// left by a crash was never linked, so it is not authority.
-				if path.exists() {
-					return Err(Error::new(
-						ErrorKind::AlreadyExists,
-						format!("storage index already exists: {}", path.display()),
-					));
-				}
-				match std::fs::remove_file(&staging) {
-					Ok(()) => {}
-					Err(error) if error.kind() == ErrorKind::NotFound => {}
-					Err(error) => return Err(error),
-				}
-				let file = std::fs::OpenOptions::new()
-					.read(true)
-					.write(true)
-					.create_new(true)
-					.open(&staging)?;
-				Database::builder().create_file(file).map_err(redb_to_io)?
-			} else {
-				Database::open(&path).map_err(|error| match error {
-					redb::DatabaseError::DatabaseAlreadyOpen => {
-						Error::new(ErrorKind::WouldBlock, error)
+		let opened =
+			spawn_blocking_owned_io(owner, move || {
+				let staging = initializing_index_path(&path);
+				let db = if initialize_new {
+					// An explicit fresh initialization can never open or replace an
+					// existing authority file: it is built under a staging name and
+					// linked into place without clobbering (below). A staging file
+					// left by a crash was never linked, so it is not authority.
+					if path.exists() {
+						return Err(Error::new(
+							ErrorKind::AlreadyExists,
+							format!("storage index already exists: {}", path.display()),
+						));
 					}
-					other => redb_to_io(other),
-				})?
-			};
-			let write_txn = db.begin_write().map_err(redb_to_io)?;
-			{
-				let _table = write_txn.open_table(RECORDS_TABLE).map_err(redb_to_io)?;
-			}
-			{
-				let _table = write_txn
-					.open_table(TIERED_SLABS_TABLE)
-					.map_err(redb_to_io)?;
-			}
-			{
-				let _table = write_txn
-					.open_table(SECONDARY_INDEX_SEGMENTS_TABLE)
-					.map_err(redb_to_io)?;
-			}
-			{
-				let _table = write_txn.open_table(LSM_RUNS_TABLE).map_err(redb_to_io)?;
-				let _table = write_txn
-					.open_table(DEFERRED_RETIREMENTS_TABLE)
-					.map_err(redb_to_io)?;
-			}
-			{
-				let _table = write_txn.open_table(META_TABLE).map_err(redb_to_io)?;
-			}
-			// Keep the rest of the index usable when cleanup history alone is missing.
-			let cleanup_ok = {
-				let mut meta = write_txn.open_table(META_TABLE).map_err(redb_to_io)?;
-				let initialized = meta
-					.get(META_SNAPSHOT_CLEANUP_INITIALIZED)
-					.map_err(redb_to_io)?
-					.is_some();
-				let present = write_txn
-					.list_tables()
-					.map_err(redb_to_io)?
-					.any(|table| table.name() == SNAPSHOT_CLEANUP_INTENTS_TABLE.name());
-				if initialized && !present {
-					meta.insert(META_CLEANUP_HISTORY_INCOMPLETE, &1u64)
-						.map_err(redb_to_io)?;
-				}
-				if !initialized {
-					let _table = write_txn
-						.open_table(SNAPSHOT_CLEANUP_INTENTS_TABLE)
-						.map_err(redb_to_io)?;
-					meta.insert(META_SNAPSHOT_CLEANUP_INITIALIZED, &1u64)
-						.map_err(redb_to_io)?;
-				}
-				!initialized || present
-			};
-			{
-				let mut meta = write_txn.open_table(META_TABLE).map_err(redb_to_io)?;
-				let initialized = meta
-					.get(META_SNAPSHOT_RETIREMENTS_INITIALIZED)
-					.map_err(redb_to_io)?
-					.is_some();
-				let tables = write_txn
-					.list_tables()
-					.map_err(redb_to_io)?
-					.map(|table| table.name().to_owned())
-					.collect::<HashSet<_>>();
-				let present = tables.contains(SNAPSHOT_RETIREMENTS_TABLE.name())
-					&& tables.contains(SNAPSHOT_RETIREMENT_STATE_TABLE.name());
-				if initialized && !present {
-					return Err(Error::new(
-						ErrorKind::InvalidData,
-						"snapshot retirement authority is missing",
-					));
-				}
-				if !initialized {
-					let _table = write_txn
-						.open_table(SNAPSHOT_RETIREMENTS_TABLE)
-						.map_err(redb_to_io)?;
-					let _state = write_txn
-						.open_table(SNAPSHOT_RETIREMENT_STATE_TABLE)
-						.map_err(redb_to_io)?;
-					meta.insert(META_SNAPSHOT_RETIREMENTS_INITIALIZED, &1u64)
-						.map_err(redb_to_io)?;
-				}
-			}
-			{
-				let mut meta = write_txn.open_table(META_TABLE).map_err(redb_to_io)?;
-				let initialized = meta
-					.get(META_METADATA_PENDING_INITIALIZED)
-					.map_err(redb_to_io)?
-					.is_some();
-				let present = write_txn
-					.list_tables()
-					.map_err(redb_to_io)?
-					.any(|table| table.name() == METADATA_PENDING_TABLE.name());
-				if initialized && !present {
-					return Err(Error::new(
-						ErrorKind::InvalidData,
-						"pending metadata authority is missing",
-					));
-				}
-				if !initialized {
-					let _table = write_txn
-						.open_table(METADATA_PENDING_TABLE)
-						.map_err(redb_to_io)?;
-					meta.insert(META_METADATA_PENDING_INITIALIZED, &1u64)
-						.map_err(redb_to_io)?;
-				}
-			}
-			// ADR 0699 S3b: parent intents are created on first use; once
-			// initialized, a missing table refuses the open.
-			parent_intents::check_parent_intent_authority(&write_txn)?;
-			// Create only on first upgrade. A missing previously initialized table
-			// is lost authority, not evidence that no submission is outstanding.
-			{
-				let mut meta = write_txn.open_table(META_TABLE).map_err(redb_to_io)?;
-				let initialized = meta
-					.get(META_LSM_INSTALL_INTENTS_INITIALIZED)
-					.map_err(redb_to_io)?
-					.is_some();
-				let present = write_txn
-					.list_tables()
-					.map_err(redb_to_io)?
-					.any(|table| table.name() == LSM_INSTALL_INTENTS_TABLE.name());
-				if initialized && !present {
-					return Err(std::io::Error::new(
-						std::io::ErrorKind::InvalidData,
-						"LSM install intent authority is missing",
-					));
-				}
-				if !initialized {
-					let _table = write_txn
-						.open_table(LSM_INSTALL_INTENTS_TABLE)
-						.map_err(redb_to_io)?;
-					meta.insert(META_LSM_INSTALL_INTENTS_INITIALIZED, &1u64)
-						.map_err(redb_to_io)?;
-				}
-			}
-			// ADR 0703: the same for certified installs' certificates.
-			{
-				let mut meta = write_txn.open_table(META_TABLE).map_err(redb_to_io)?;
-				let initialized = meta
-					.get(META_LSM_CERTIFICATES_INITIALIZED)
-					.map_err(redb_to_io)?
-					.is_some();
-				let present = write_txn
-					.list_tables()
-					.map_err(redb_to_io)?
-					.any(|table| table.name() == lsm_certificate::LSM_CERTIFICATES_TABLE.name());
-				if initialized && !present {
-					return Err(std::io::Error::new(
-						std::io::ErrorKind::InvalidData,
-						"LSM certificate authority is missing",
-					));
-				}
-				if !initialized {
-					let _table = write_txn
-						.open_table(lsm_certificate::LSM_CERTIFICATES_TABLE)
-						.map_err(redb_to_io)?;
-					meta.insert(META_LSM_CERTIFICATES_INITIALIZED, &1u64)
-						.map_err(redb_to_io)?;
-				}
-			}
-			// ADR 0097: create the receipt table ONLY on a store that has never had
-			// one, and record that fact durably in the same transaction. On a store
-			// whose marker is set, a missing table means history was lost, and the
-			// caller is told so rather than handed an empty one.
-			let receipts_ok = {
-				let mut meta = write_txn.open_table(META_TABLE).map_err(redb_to_io)?;
-				let initialized = meta
-					.get(META_MAINTENANCE_RECEIPTS_INITIALIZED)
-					.map_err(redb_to_io)?
-					.is_some();
-				let table_present = write_txn
-					.list_tables()
-					.map_err(redb_to_io)?
-					.any(|handle| handle.name() == MAINTENANCE_RECEIPTS_TABLE.name());
-				match (initialized, table_present) {
-					(true, true) => true,
-					(true, false) => false,
-					(false, _) => {
-						let _table = write_txn
-							.open_table(MAINTENANCE_RECEIPTS_TABLE)
-							.map_err(redb_to_io)?;
-						meta.insert(META_MAINTENANCE_RECEIPTS_INITIALIZED, &1u64)
-							.map_err(redb_to_io)?;
-						true
+					match std::fs::remove_file(&staging) {
+						Ok(()) => {}
+						Err(error) if error.kind() == ErrorKind::NotFound => {}
+						Err(error) => return Err(error),
 					}
-				}
-			};
-			// One-shot v1 → v2 migration. Every v1 row becomes a v2
-			// row with `is_encrypted = false`; the rewrite sweeper
-			// will then GET, encrypt, and stamp the truth back. v1
-			// is left in place but unused — operators can drop it
-			// in a later release once every cluster has cycled.
-			let mut migrated_keys: Vec<u64> = Vec::new();
-			{
-				let v1 = write_txn
-					.open_table(TIERED_SLABS_TABLE_V1)
-					.map_err(redb_to_io)?;
-				let mut v2 = write_txn
-					.open_table(TIERED_SLABS_TABLE)
-					.map_err(redb_to_io)?;
-				for entry in v1.iter().map_err(redb_to_io)? {
-					let (slab_id_key, value) = entry.map_err(redb_to_io)?;
-					let slab_id = SlabId::new(slab_id_key.value());
-					if v2.get(&slab_id.get()).map_err(redb_to_io)?.is_some() {
-						continue;
-					}
-					let pointer = decode_tiered_pointer_v1(slab_id, value.value())?;
-					let encoded = encode_tiered_pointer(&pointer);
-					v2.insert(&slab_id.get(), encoded.as_slice())
-						.map_err(redb_to_io)?;
-					migrated_keys.push(slab_id.get());
-				}
-			}
-			if !migrated_keys.is_empty() {
-				let mut v1 = write_txn
-					.open_table(TIERED_SLABS_TABLE_V1)
-					.map_err(redb_to_io)?;
-				for key in migrated_keys {
-					let _ = v1.remove(&key).map_err(redb_to_io)?;
-				}
-			}
-			let initial_gaps = {
-				let meta = write_txn.open_table(META_TABLE).map_err(redb_to_io)?;
-				let value = meta
-					.get(META_CLEANUP_AUTHORITY_GAPS)
-					.map_err(redb_to_io)?
-					.map(|v| v.value())
-					.unwrap_or(0);
-				value
-			};
-			let history_incomplete = {
-				let meta = write_txn.open_table(META_TABLE).map_err(redb_to_io)?;
-				let missing = meta
-					.get(META_CLEANUP_HISTORY_INCOMPLETE)
-					.map_err(redb_to_io)?
-					.is_some();
-				missing
-			};
-			let incarnation = {
-				let mut meta = write_txn.open_table(META_TABLE).map_err(redb_to_io)?;
-				if initialize_new {
-					let incarnation = StoreIncarnation::fresh();
-					meta.insert(
-						META_STORE_INCARNATION_HIGH,
-						&((incarnation.get() >> 64) as u64),
-					)
-					.map_err(redb_to_io)?;
-					meta.insert(META_STORE_INCARNATION_LOW, &(incarnation.get() as u64))
-						.map_err(redb_to_io)?;
-					meta.insert(
-						META_SLAB_ID_HIGH_WATER,
-						&initial_high_water.unwrap_or_default(),
-					)
-					.map_err(redb_to_io)?;
-					incarnation
+					let file = std::fs::OpenOptions::new()
+						.read(true)
+						.write(true)
+						.create_new(true)
+						.open(&staging)?;
+					Database::builder().create_file(file).map_err(redb_to_io)?
 				} else {
-					let read = |key| {
-						meta.get(key)
-							.map_err(redb_to_io)
-							.map(|value| value.map(|value| value.value()))
-					};
-					let (Some(high), Some(low), Some(_)) = (
-						read(META_STORE_INCARNATION_HIGH)?,
-						read(META_STORE_INCARNATION_LOW)?,
-						read(META_SLAB_ID_HIGH_WATER)?,
-					) else {
-						return Err(store_identity_missing());
-					};
-					let incarnation =
-						StoreIncarnation::from_raw((u128::from(high) << 64) | u128::from(low));
-					if incarnation.get() == 0 {
-						return Err(store_identity_missing());
+					Database::open(&path).map_err(|error| match error {
+						redb::DatabaseError::DatabaseAlreadyOpen => {
+							Error::new(ErrorKind::WouldBlock, error)
+						}
+						other => redb_to_io(other),
+					})?
+				};
+				let write_txn = db.begin_write().map_err(redb_to_io)?;
+				{
+					let _table = write_txn.open_table(RECORDS_TABLE).map_err(redb_to_io)?;
+				}
+				{
+					let _table = write_txn
+						.open_table(TIERED_SLABS_TABLE)
+						.map_err(redb_to_io)?;
+				}
+				{
+					let _table = write_txn
+						.open_table(SECONDARY_INDEX_SEGMENTS_TABLE)
+						.map_err(redb_to_io)?;
+				}
+				{
+					let _table = write_txn.open_table(LSM_RUNS_TABLE).map_err(redb_to_io)?;
+					let _table = write_txn
+						.open_table(DEFERRED_RETIREMENTS_TABLE)
+						.map_err(redb_to_io)?;
+				}
+				{
+					let _table = write_txn.open_table(META_TABLE).map_err(redb_to_io)?;
+				}
+				// Keep the rest of the index usable when cleanup history alone is missing.
+				let cleanup_ok = {
+					let mut meta = write_txn.open_table(META_TABLE).map_err(redb_to_io)?;
+					let initialized = meta
+						.get(META_SNAPSHOT_CLEANUP_INITIALIZED)
+						.map_err(redb_to_io)?
+						.is_some();
+					let present = write_txn
+						.list_tables()
+						.map_err(redb_to_io)?
+						.any(|table| table.name() == SNAPSHOT_CLEANUP_INTENTS_TABLE.name());
+					if initialized && !present {
+						meta.insert(META_CLEANUP_HISTORY_INCOMPLETE, &1u64)
+							.map_err(redb_to_io)?;
 					}
-					incarnation
+					if !initialized {
+						let _table = write_txn
+							.open_table(SNAPSHOT_CLEANUP_INTENTS_TABLE)
+							.map_err(redb_to_io)?;
+						meta.insert(META_SNAPSHOT_CLEANUP_INITIALIZED, &1u64)
+							.map_err(redb_to_io)?;
+					}
+					!initialized || present
+				};
+				{
+					let mut meta = write_txn.open_table(META_TABLE).map_err(redb_to_io)?;
+					let initialized = meta
+						.get(META_SNAPSHOT_RETIREMENTS_INITIALIZED)
+						.map_err(redb_to_io)?
+						.is_some();
+					let tables = write_txn
+						.list_tables()
+						.map_err(redb_to_io)?
+						.map(|table| table.name().to_owned())
+						.collect::<HashSet<_>>();
+					let present = tables.contains(SNAPSHOT_RETIREMENTS_TABLE.name())
+						&& tables.contains(SNAPSHOT_RETIREMENT_STATE_TABLE.name());
+					if initialized && !present {
+						return Err(Error::new(
+							ErrorKind::InvalidData,
+							"snapshot retirement authority is missing",
+						));
+					}
+					if !initialized {
+						let _table = write_txn
+							.open_table(SNAPSHOT_RETIREMENTS_TABLE)
+							.map_err(redb_to_io)?;
+						let _state = write_txn
+							.open_table(SNAPSHOT_RETIREMENT_STATE_TABLE)
+							.map_err(redb_to_io)?;
+						meta.insert(META_SNAPSHOT_RETIREMENTS_INITIALIZED, &1u64)
+							.map_err(redb_to_io)?;
+					}
 				}
-			};
-			if initialize_new {
-				op_state::initialize_op_state(&write_txn)?;
-			} else {
-				op_state::validate_op_state(&write_txn)?;
-			}
-			write_txn.commit().map_err(redb_to_io)?;
-			if initialize_new {
-				// hard_link refuses an existing target, so this never replaces
-				// an index that appeared meanwhile.
-				std::fs::hard_link(&staging, &path)?;
-				std::fs::remove_file(&staging)?;
-				if let Some(parent) = path.parent() {
-					std::fs::File::open(parent)?.sync_all()?;
+				{
+					let mut meta = write_txn.open_table(META_TABLE).map_err(redb_to_io)?;
+					let initialized = meta
+						.get(META_METADATA_PENDING_INITIALIZED)
+						.map_err(redb_to_io)?
+						.is_some();
+					let present = write_txn
+						.list_tables()
+						.map_err(redb_to_io)?
+						.any(|table| table.name() == METADATA_PENDING_TABLE.name());
+					if initialized && !present {
+						return Err(Error::new(
+							ErrorKind::InvalidData,
+							"pending metadata authority is missing",
+						));
+					}
+					if !initialized {
+						let _table = write_txn
+							.open_table(METADATA_PENDING_TABLE)
+							.map_err(redb_to_io)?;
+						meta.insert(META_METADATA_PENDING_INITIALIZED, &1u64)
+							.map_err(redb_to_io)?;
+					}
 				}
-			}
-			let db = crate::storage::owned_redb::OwnedRedb::new(db, "storage index");
-			if let Some(owner) = bind_owner {
-				db.bind_owner(owner)?;
-			}
-			Ok((
-				db,
-				receipts_ok,
-				cleanup_ok,
-				initial_gaps,
-				history_incomplete,
-				incarnation,
-			))
-		})
-		.await?;
+				// ADR 0699 S3b: parent intents are created on first use; once
+				// initialized, a missing table refuses the open.
+				parent_intents::check_parent_intent_authority(&write_txn)?;
+				// Create only on first upgrade. A missing previously initialized table
+				// is lost authority, not evidence that no submission is outstanding.
+				{
+					let mut meta = write_txn.open_table(META_TABLE).map_err(redb_to_io)?;
+					let initialized = meta
+						.get(META_LSM_INSTALL_INTENTS_INITIALIZED)
+						.map_err(redb_to_io)?
+						.is_some();
+					let present = write_txn
+						.list_tables()
+						.map_err(redb_to_io)?
+						.any(|table| table.name() == LSM_INSTALL_INTENTS_TABLE.name());
+					if initialized && !present {
+						return Err(std::io::Error::new(
+							std::io::ErrorKind::InvalidData,
+							"LSM install intent authority is missing",
+						));
+					}
+					if !initialized {
+						let _table = write_txn
+							.open_table(LSM_INSTALL_INTENTS_TABLE)
+							.map_err(redb_to_io)?;
+						meta.insert(META_LSM_INSTALL_INTENTS_INITIALIZED, &1u64)
+							.map_err(redb_to_io)?;
+					}
+				}
+				// ADR 0703: the same for certified installs' certificates.
+				{
+					let mut meta = write_txn.open_table(META_TABLE).map_err(redb_to_io)?;
+					let initialized = meta
+						.get(META_LSM_CERTIFICATES_INITIALIZED)
+						.map_err(redb_to_io)?
+						.is_some();
+					let present = write_txn.list_tables().map_err(redb_to_io)?.any(|table| {
+						table.name() == lsm_certificate::LSM_CERTIFICATES_TABLE.name()
+					});
+					if initialized && !present {
+						return Err(std::io::Error::new(
+							std::io::ErrorKind::InvalidData,
+							"LSM certificate authority is missing",
+						));
+					}
+					if !initialized {
+						let _table = write_txn
+							.open_table(lsm_certificate::LSM_CERTIFICATES_TABLE)
+							.map_err(redb_to_io)?;
+						meta.insert(META_LSM_CERTIFICATES_INITIALIZED, &1u64)
+							.map_err(redb_to_io)?;
+					}
+				}
+				// ADR 0704: the same for certified tiered operations' certificates.
+				{
+					let mut meta = write_txn.open_table(META_TABLE).map_err(redb_to_io)?;
+					let initialized = meta
+						.get(META_TIER_CERTIFICATES_INITIALIZED)
+						.map_err(redb_to_io)?
+						.is_some();
+					let present = write_txn.list_tables().map_err(redb_to_io)?.any(|table| {
+						table.name() == tier_certificate::TIER_CERTIFICATES_TABLE.name()
+					});
+					if initialized && !present {
+						return Err(std::io::Error::new(
+							std::io::ErrorKind::InvalidData,
+							"tier certificate authority is missing",
+						));
+					}
+					if !initialized {
+						let _table = write_txn
+							.open_table(tier_certificate::TIER_CERTIFICATES_TABLE)
+							.map_err(redb_to_io)?;
+						meta.insert(META_TIER_CERTIFICATES_INITIALIZED, &1u64)
+							.map_err(redb_to_io)?;
+					}
+				}
+				// ADR 0097: create the receipt table ONLY on a store that has never had
+				// one, and record that fact durably in the same transaction. On a store
+				// whose marker is set, a missing table means history was lost, and the
+				// caller is told so rather than handed an empty one.
+				let receipts_ok = {
+					let mut meta = write_txn.open_table(META_TABLE).map_err(redb_to_io)?;
+					let initialized = meta
+						.get(META_MAINTENANCE_RECEIPTS_INITIALIZED)
+						.map_err(redb_to_io)?
+						.is_some();
+					let table_present = write_txn
+						.list_tables()
+						.map_err(redb_to_io)?
+						.any(|handle| handle.name() == MAINTENANCE_RECEIPTS_TABLE.name());
+					match (initialized, table_present) {
+						(true, true) => true,
+						(true, false) => false,
+						(false, _) => {
+							let _table = write_txn
+								.open_table(MAINTENANCE_RECEIPTS_TABLE)
+								.map_err(redb_to_io)?;
+							meta.insert(META_MAINTENANCE_RECEIPTS_INITIALIZED, &1u64)
+								.map_err(redb_to_io)?;
+							true
+						}
+					}
+				};
+				// One-shot v1 → v2 migration. Every v1 row becomes a v2
+				// row with `is_encrypted = false`; the rewrite sweeper
+				// will then GET, encrypt, and stamp the truth back. v1
+				// is left in place but unused — operators can drop it
+				// in a later release once every cluster has cycled.
+				let mut migrated_keys: Vec<u64> = Vec::new();
+				{
+					let v1 = write_txn
+						.open_table(TIERED_SLABS_TABLE_V1)
+						.map_err(redb_to_io)?;
+					let mut v2 = write_txn
+						.open_table(TIERED_SLABS_TABLE)
+						.map_err(redb_to_io)?;
+					for entry in v1.iter().map_err(redb_to_io)? {
+						let (slab_id_key, value) = entry.map_err(redb_to_io)?;
+						let slab_id = SlabId::new(slab_id_key.value());
+						if v2.get(&slab_id.get()).map_err(redb_to_io)?.is_some() {
+							continue;
+						}
+						let pointer = decode_tiered_pointer_v1(slab_id, value.value())?;
+						let encoded = encode_tiered_pointer(&pointer);
+						v2.insert(&slab_id.get(), encoded.as_slice())
+							.map_err(redb_to_io)?;
+						migrated_keys.push(slab_id.get());
+					}
+				}
+				if !migrated_keys.is_empty() {
+					let mut v1 = write_txn
+						.open_table(TIERED_SLABS_TABLE_V1)
+						.map_err(redb_to_io)?;
+					for key in migrated_keys {
+						let _ = v1.remove(&key).map_err(redb_to_io)?;
+					}
+				}
+				let initial_gaps = {
+					let meta = write_txn.open_table(META_TABLE).map_err(redb_to_io)?;
+					let value = meta
+						.get(META_CLEANUP_AUTHORITY_GAPS)
+						.map_err(redb_to_io)?
+						.map(|v| v.value())
+						.unwrap_or(0);
+					value
+				};
+				let history_incomplete = {
+					let meta = write_txn.open_table(META_TABLE).map_err(redb_to_io)?;
+					let missing = meta
+						.get(META_CLEANUP_HISTORY_INCOMPLETE)
+						.map_err(redb_to_io)?
+						.is_some();
+					missing
+				};
+				let incarnation = {
+					let mut meta = write_txn.open_table(META_TABLE).map_err(redb_to_io)?;
+					if initialize_new {
+						let incarnation = StoreIncarnation::fresh();
+						meta.insert(
+							META_STORE_INCARNATION_HIGH,
+							&((incarnation.get() >> 64) as u64),
+						)
+						.map_err(redb_to_io)?;
+						meta.insert(META_STORE_INCARNATION_LOW, &(incarnation.get() as u64))
+							.map_err(redb_to_io)?;
+						meta.insert(
+							META_SLAB_ID_HIGH_WATER,
+							&initial_high_water.unwrap_or_default(),
+						)
+						.map_err(redb_to_io)?;
+						incarnation
+					} else {
+						let read = |key| {
+							meta.get(key)
+								.map_err(redb_to_io)
+								.map(|value| value.map(|value| value.value()))
+						};
+						let (Some(high), Some(low), Some(_)) = (
+							read(META_STORE_INCARNATION_HIGH)?,
+							read(META_STORE_INCARNATION_LOW)?,
+							read(META_SLAB_ID_HIGH_WATER)?,
+						) else {
+							return Err(store_identity_missing());
+						};
+						let incarnation =
+							StoreIncarnation::from_raw((u128::from(high) << 64) | u128::from(low));
+						if incarnation.get() == 0 {
+							return Err(store_identity_missing());
+						}
+						incarnation
+					}
+				};
+				if initialize_new {
+					op_state::initialize_op_state(&write_txn)?;
+				} else {
+					op_state::validate_op_state(&write_txn)?;
+				}
+				write_txn.commit().map_err(redb_to_io)?;
+				if initialize_new {
+					// hard_link refuses an existing target, so this never replaces
+					// an index that appeared meanwhile.
+					std::fs::hard_link(&staging, &path)?;
+					std::fs::remove_file(&staging)?;
+					if let Some(parent) = path.parent() {
+						std::fs::File::open(parent)?.sync_all()?;
+					}
+				}
+				let db = crate::storage::owned_redb::OwnedRedb::new(db, "storage index");
+				if let Some(owner) = bind_owner {
+					db.bind_owner(owner)?;
+				}
+				Ok((
+					db,
+					receipts_ok,
+					cleanup_ok,
+					initial_gaps,
+					history_incomplete,
+					incarnation,
+				))
+			})
+			.await?;
 		let (db, receipts_ok, cleanup_ok, initial_gaps, history_incomplete, incarnation) = opened;
 		if history_incomplete {
 			crate::metrics::global()

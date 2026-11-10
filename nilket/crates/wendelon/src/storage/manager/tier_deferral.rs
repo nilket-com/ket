@@ -10,6 +10,8 @@
 //! replay runs that callback again through the function it used.
 use std::io::{Error, ErrorKind};
 
+use super::tiered_io::{needs_tier_preparation, tier_delivery_moved};
+
 use super::*;
 
 /// Why a committed apply was fenced.
@@ -30,6 +32,13 @@ pub(super) enum FenceCause {
 	/// Replay or snapshot staging registered the pointer, or a metadata
 	/// observation fenced it, for verification to publish.
 	Staged,
+	/// ADR 0704: the committed state proved the publication neither current nor
+	/// superseded. A replay re-runs it once it is current.
+	CommittedStanding,
+	/// ADR 0704: a certified generation or retirement whose local evidence (its
+	/// certificate, source, drop or postimage) does not prove it. Not replayable:
+	/// it installs and retires nothing until newer committed state resolves it.
+	CertifiedEvidence,
 	/// Another fence of the publication path.
 	Unclassified,
 }
@@ -45,6 +54,7 @@ impl FenceCause {
 				| Self::NoScratch
 				| Self::L2Unavailable
 				| Self::LsmScope
+				| Self::CommittedStanding
 		)
 	}
 
@@ -240,12 +250,31 @@ impl SlabManager {
 		}
 	}
 
+	/// ADR 0704: record `deferral` only where the slab has none. An unknown standing never
+	/// replaces another state's deferral; any deferral already fences the store's reads.
+	pub(super) fn record_tier_deferral_if_vacant(&self, slab_id: SlabId, deferral: TierDeferral) {
+		let replayable = deferral.replayable_index().is_some();
+		let inserted = match self.unapplied_tier_pointers.entry(slab_id) {
+			dashmap::mapref::entry::Entry::Vacant(entry) => {
+				entry.insert(deferral);
+				true
+			}
+			dashmap::mapref::entry::Entry::Occupied(_) => false,
+		};
+		if inserted && replayable {
+			self.tier_authority.start();
+			self.tier_authority.notify_changed();
+		}
+	}
+
 	pub(crate) fn bind_canonical_tier_source(&self, source: crate::consensus::TierSnapshotSource) {
 		let _ = self.canonical_tier_source.set(source);
 	}
 
 	/// The committed pointer for `slab_id`, read without waiting: `None`
-	/// when no source is bound or the state machine is busy.
+	/// when no source is bound or the state machine is busy. ADR 0704: production
+	/// reads it from a held lease (`lease_tier_pointer`).
+	#[cfg(test)]
 	pub(super) fn try_canonical_tier_pointer(
 		&self,
 		slab_id: SlabId,
@@ -267,14 +296,45 @@ impl SlabManager {
 		Some(tier.as_ref().map(super::tier_tokens::tiered_slab_pointer))
 	}
 
-	/// Whether the committed pointer for `pointer`'s slab is `pointer`. With
-	/// no bound source (a manager outside a state machine) the caller's own
-	/// revalidation is the only check; a busy state machine is no.
-	pub(super) fn canonical_tier_pointer_is(&self, pointer: &TieredSlabPointer) -> bool {
-		match self.canonical_tier_source.get() {
+	/// This store's own committed pointer for `slab_id` in the state `lease` holds, classified
+	/// as `try_canonical_tier_pointer` classifies it; `None` when the store is not current.
+	pub(super) fn lease_tier_pointer(
+		&self,
+		lease: &crate::consensus::TierSnapshotLease,
+		slab_id: SlabId,
+	) -> Option<Option<TieredSlabPointer>> {
+		let owner = self.owner_ref().ok()?;
+		let registry = lease
+			.incarnations()
+			.get(&owner.node())
+			.cloned()
+			.unwrap_or_default();
+		if !matches!(
+			self.classify_own_node(&registry, super::slab_ids::OwnerEvidence::Current),
+			super::slab_ids::Ownership::Own(_)
+		) {
+			return None;
+		}
+		Some(
+			lease
+				.committed_tier(owner.slab(slab_id))
+				.as_ref()
+				.map(super::tier_tokens::tiered_slab_pointer),
+		)
+	}
+
+	/// Whether the committed pointer for `pointer`'s slab is `pointer`, in the state the
+	/// caller's `lease` holds (ADR 0704: never a second read). With no lease (no bound source:
+	/// a manager outside a state machine) the caller's own revalidation is the only check.
+	pub(super) fn canonical_tier_pointer_is(
+		&self,
+		lease: Option<&crate::consensus::TierSnapshotLease>,
+		pointer: &TieredSlabPointer,
+	) -> bool {
+		match lease {
 			None => true,
-			Some(_) => self
-				.try_canonical_tier_pointer(pointer.slab_id)
+			Some(lease) => self
+				.lease_tier_pointer(lease, pointer.slab_id)
 				.is_some_and(|committed| committed.as_ref() == Some(pointer)),
 		}
 	}
@@ -292,11 +352,20 @@ impl SlabManager {
 	/// - the slab is retired in this process: keep the fence;
 	/// - otherwise re-run the callback, which publishes and clears the
 	///   deferral, or re-defers with its new cause.
+	///
+	/// ADR 0704: `lease` is the caller's, taken before the slab lock, and `prepared` is what
+	/// it prepared, with no authority held, for the pointer it names. A preparation that
+	/// failed for exactly the deferred pointer ends here as the callback would have ended.
 	pub(super) async fn replay_tier_deferral_under_publication_lock(
 		&self,
 		slab_id: SlabId,
 		committed: Option<&TieredSlabPointer>,
 		epoch: u64,
+		lease: Option<&crate::consensus::TierSnapshotLease>,
+		prepared: Option<(
+			TieredSlabPointer,
+			std::io::Result<super::tiered_io::PreparedTierDelivery>,
+		)>,
 	) -> TierReplay {
 		let Some(deferral) = self
 			.unapplied_tier_pointers
@@ -323,18 +392,26 @@ impl SlabManager {
 		if self.retired_tier_slabs.contains(&slab_id) {
 			return TierReplay::KeptFenced;
 		}
-		#[cfg(test)]
-		{
-			let hold = self.replay_probe.before_replay_apply.lock().unwrap().take();
-			if let Some((entered, release)) = hold {
-				entered.add_permits(1);
-				if let Ok(permit) = release.acquire().await {
-					permit.forget();
+		let prepared = match prepared {
+			Some((pointer, prepared)) if pointer == deferral.pointer => match prepared {
+				Ok(prepared) => Some(prepared),
+				Err(error) => {
+					self.defer_unprepared_tier_delivery(&deferral.pointer, &error, index)
+						.await;
+					return TierReplay::Replayed(Err(error));
 				}
-			}
-		}
+			},
+			_ => None,
+		};
 		let result = self
-			.apply_tier_slab_under_publication_lock_as(deferral.pointer, Some(index), epoch, true)
+			.apply_tier_slab_under_publication_lock_as(
+				deferral.pointer,
+				Some(index),
+				epoch,
+				true,
+				lease,
+				prepared,
+			)
 			.await;
 		if result.is_ok() {
 			self.tier_authority.notify_changed();
@@ -383,8 +460,8 @@ pub(super) struct ReplayProbe {
 	/// held before the attempt and freed during it (as a consumed token is).
 	pub(super) free_during_attempt:
 		std::sync::Mutex<Option<(SlabId, super::tier_budget::BudgetReservation)>>,
-	/// Hold the next replay after its canonical check passed, under its tier
-	/// publication lock, just before it re-runs the callback.
+	/// Hold the next worker replay attempt before it takes the canonical lease
+	/// (ADR 0704: it holds no lease, slab lock or object fetch while held).
 	pub(super) before_replay_apply:
 		std::sync::Mutex<Option<(Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>>,
 	/// Hold the worker after an attempt's outcome, before its schedule.
@@ -437,20 +514,13 @@ impl SlabManager {
 					continue;
 				}
 			}
-			let lock = self.tier_publication_lock(slab_id);
-			let _tier_guard = lock.lock().await;
-			let before = self
-				.unapplied_tier_pointers
-				.get(&slab_id)
-				.map(|entry| entry.value().clone());
-			let epoch = self.capture_snapshot_epoch();
 			round.attempted += 1;
 			#[cfg(test)]
 			self.replay_probe
 				.attempts
 				.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
 			let watermark = self.tier_budget.release_epoch();
-			let outcome = super::tier_budget::within_replay_attempt(async {
+			let (before, outcome) = super::tier_budget::within_replay_attempt(async {
 				#[cfg(test)]
 				{
 					let mut slot = self.replay_probe.free_during_attempt.lock().unwrap();
@@ -458,17 +528,71 @@ impl SlabManager {
 						drop(slot.take());
 					}
 				}
-				match self.try_canonical_tier_pointer(slab_id) {
-					Some(committed) => {
-						self.replay_tier_deferral_under_publication_lock(
-							slab_id,
-							committed.as_ref(),
-							epoch,
-						)
-						.await
+				#[cfg(test)]
+				{
+					let hold = self.replay_probe.before_replay_apply.lock().unwrap().take();
+					if let Some((entered, release)) = hold {
+						entered.add_permits(1);
+						if let Ok(permit) = release.acquire().await {
+							permit.forget();
+						}
 					}
-					None => TierReplay::Unchanged,
 				}
+				// ADR 0704: the lease, then the slab lock, and the replay judged in the lease's
+				// state. Object storage only on demand, with both released, then once more.
+				let mut prepared = None;
+				let mut first_before = None;
+				for attempt in 0..2 {
+					let (before, outcome) = {
+						let lease = match self.canonical_tier_lease().await {
+							Ok(Some(lease)) => lease,
+							Ok(None) | Err(_) => {
+								let current = self
+									.unapplied_tier_pointers
+									.get(&slab_id)
+									.map(|entry| entry.value().clone());
+								return (first_before.unwrap_or(current), TierReplay::Unchanged);
+							}
+						};
+						let lock = self.tier_publication_lock(slab_id);
+						let _tier_guard = lock.lock().await;
+						let before = self
+							.unapplied_tier_pointers
+							.get(&slab_id)
+							.map(|entry| entry.value().clone());
+						let epoch = self.capture_snapshot_epoch();
+						let outcome = match self.lease_tier_pointer(&lease, slab_id) {
+							Some(committed) => {
+								self.replay_tier_deferral_under_publication_lock(
+									slab_id,
+									committed.as_ref(),
+									epoch,
+									Some(&lease),
+									prepared.take(),
+								)
+								.await
+							}
+							None => TierReplay::Unchanged,
+						};
+						(before, outcome)
+					};
+					let first = first_before.get_or_insert(before.clone()).clone();
+					match outcome {
+						TierReplay::Replayed(Err(error)) if needs_tier_preparation(&error) => {
+							let Some(deferral) = before.filter(|_| attempt == 0) else {
+								return (
+									first,
+									TierReplay::Replayed(Err(tier_delivery_moved(slab_id))),
+								);
+							};
+							let ready =
+								self.prepare_tier_delivery_observed(&deferral.pointer).await;
+							prepared = Some((deferral.pointer, ready));
+						}
+						outcome => return (first, outcome),
+					}
+				}
+				unreachable!("the second attempt always returns")
 			})
 			.await;
 			#[cfg(test)]

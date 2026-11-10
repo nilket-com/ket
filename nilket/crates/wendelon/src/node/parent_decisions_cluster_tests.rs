@@ -104,6 +104,14 @@ struct Cluster {
 
 impl Cluster {
 	async fn start() -> Self {
+		Self::start_with(|_, _| None).await
+	}
+
+	/// `start`, each member's configuration adjusted by `configure`, which may
+	/// return a directory the cluster keeps alive with it.
+	async fn start_with(
+		configure: impl Fn(u32, &mut NodeBootstrapConfig) -> Option<crate::test_support::TestDir>,
+	) -> Self {
 		let network = Arc::new(SimulatedTransportNetwork::default());
 		let mut cluster = Self {
 			nodes: Vec::new(),
@@ -112,7 +120,10 @@ impl Cluster {
 			configs: std::collections::BTreeMap::new(),
 		};
 		for id in NODES {
-			let (dir, cfg) = member(id);
+			let (dir, mut cfg) = member(id);
+			if let Some(extra) = configure(id, &mut cfg) {
+				cluster._dirs.push(extra);
+			}
 			cluster.configs.insert(id, cfg);
 			cluster._dirs.push(dir);
 			cluster.reopen(id).await;
@@ -288,7 +299,14 @@ fn rows(descriptor: &TableSchemaDescriptor, ids: &[i64]) -> RecordBatch {
 /// A started cluster with every signer bound, every node leasing and the
 /// table created; returns it, the leader and the descriptor.
 async fn ready() -> (Cluster, u32, TableSchemaDescriptor) {
-	let cluster = Cluster::start().await;
+	ready_with(Cluster::start()).await
+}
+
+/// `ready` over a cluster started by `start`.
+async fn ready_with(
+	start: impl std::future::Future<Output = Cluster>,
+) -> (Cluster, u32, TableSchemaDescriptor) {
+	let cluster = start.await;
 	let leader = cluster.leader().await;
 	let descriptor = descriptor();
 	cluster
@@ -4024,6 +4042,461 @@ async fn certified_lsm_elides_the_obsolete_versions_on_the_leader() {
 		"ADR 0703 leader {leader}: {} obsolete versions elided as {elided} rows by {jobs} certified LSM jobs",
 		obsolete.len()
 	);
+	for node in cluster.nodes {
+		let _ = tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown()).await;
+	}
+}
+
+/// ADR 0704, CONTROLLED CLOCK (a finite workflow, not a capacity test): every
+/// member tiers to its own LocalFs object store. On the leader, whose cleanup is
+/// paused while the data is laid out, three tiered slabs hold: S1 an obsolete
+/// version of row 1, row 3 (never overwritten) and an obsolete version of row 4
+/// that also keeps a second, local copy; S2 only an obsolete version of row 2;
+/// S3 the winners. After generation 1 the leader's own leader-gated step (the
+/// LSM service tick) rewrites S1 to exactly row 3 under a certified Tier and
+/// retires S2 under a certified Retire; S3 has nothing to reclaim. Reads stay
+/// exact everywhere, before, after and after a same-store restart of the
+/// leader; debt retires except row 4's, whose local copy stays; the replaced
+/// source objects are reported as retained and stay in the object store;
+/// followers' tiered state is untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn certified_tier_cleanup_rewrites_and_retires_the_leaders_tiered_slabs() {
+	use crate::storage::core::StorageEngine;
+	use crate::storage::l2::ObjectStore;
+	use std::sync::atomic::Ordering::Release;
+	let (mut cluster, leader, descriptor) = ready_with(Cluster::start_with(|id, cfg| {
+		let root = crate::test_support::TestDir::new(&format!("certified-tier-l2-{id}"));
+		cfg.l2 = Some(crate::storage::ObjectStoreConfig::LocalFs {
+			root: root.to_path_buf(),
+		});
+		cfg.tiering.scan_interval = std::time::Duration::from_millis(200);
+		Some(root)
+	}))
+	.await;
+	let l2_of = |cluster: &Cluster, id: u32| match cluster.configs[&id].l2.as_ref().unwrap() {
+		crate::storage::ObjectStoreConfig::LocalFs { root } => {
+			crate::storage::l2::LocalFsObjectStore::new(root).unwrap()
+		}
+		other => panic!("{other:?}"),
+	};
+	let server = cluster.node(leader).data_server.clone();
+	let pause = server.decision_peer_for_test().pause_cleanup.clone();
+	pause.store(true, Release);
+	let slab = cluster.node(leader).slab.clone();
+	let now = std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.unwrap()
+		.as_millis() as u64;
+	let mut expected = Expected::new();
+	let write = async |rows: &[(i64, &str)], what: &str| {
+		assert_committed(
+			&write_through(
+				&cluster,
+				leader,
+				write_meta(&descriptor, rows.len(), uuid_v7()),
+				named_rows(&descriptor, rows),
+			)
+			.await,
+			what,
+		);
+	};
+	// Row 3 is its own write (its own HLC): a survivor written in one parent
+	// with a reclaimed row of the same length would take that row's exact
+	// location in the replacement, which the tier layout refuses as a
+	// collision (reported with this stage, not exercised here).
+	write(&[(1, "a"), (4, "a")], "S1's obsolete rows").await;
+	write(&[(3, "x")], "S1's survivor").await;
+	let s1 = slab.force_seal_active_for_test().await;
+	write(&[(2, "a")], "S2").await;
+	let s2 = slab.force_seal_active_for_test().await;
+	write(&[(1, "b"), (2, "b"), (4, "b")], "S3 (the winners)").await;
+	let s3 = slab.force_seal_active_for_test().await;
+	for (id, value) in [(1, "b"), (2, "b"), (3, "x"), (4, "b")] {
+		expected.insert(id, value.into());
+	}
+	let row_of = |id: i64| {
+		server
+			.row_identity_and_locality_for_test(
+				TenantId::ZERO,
+				&descriptor,
+				&named_rows(&descriptor, &[(id, "x")]),
+			)
+			.0
+	};
+	let (k1, k2, k3, k4) = (row_of(1), row_of(2), row_of(3), row_of(4));
+	let versions = |key| owned_versions(&cluster, leader, key);
+	let (v1, v2, v3, v4) = (
+		versions(k1).await,
+		versions(k2).await,
+		versions(k3).await,
+		versions(k4).await,
+	);
+	assert_eq!(
+		(v1.len(), v2.len(), v3.len(), v4.len()),
+		(2, 2, 1, 2),
+		"every version owned"
+	);
+	// The leader's sweeper tiers its three sealed slabs; their local files go.
+	let deadline = tokio::time::Instant::now() + BOUND;
+	for id in [s1, s2, s3] {
+		while slab.tier_pointer(id).await.is_none() {
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"slab {id:?} never tiered"
+			);
+			tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+		}
+		assert!(!slab.sealed_slab_ids().await.contains(&id), "no local copy");
+	}
+	// Row 4's obsolete version also keeps a second indexed copy, local.
+	let location = slab.version_locations(TenantId::ZERO, k4, v4[0]).unwrap()[0];
+	let frame = slab.read(location).await.unwrap();
+	let locality = server
+		.row_identity_and_locality_for_test(
+			TenantId::ZERO,
+			&descriptor,
+			&named_rows(&descriptor, &[(4, "x")]),
+		)
+		.1;
+	slab.append_durable_with_locality(TenantId::ZERO, k4, locality, v4[0], &frame)
+		.await
+		.unwrap();
+	assert_eq!(
+		slab.version_locations(TenantId::ZERO, k4, v4[0])
+			.unwrap()
+			.len(),
+		2
+	);
+	let sources = [
+		slab.tier_pointer(s1).await.unwrap(),
+		slab.tier_pointer(s2).await.unwrap(),
+	];
+	let s3_pointer = slab.tier_pointer(s3).await.unwrap();
+	let leader_l2 = l2_of(&cluster, leader);
+	let mut source_bytes = 0;
+	for source in &sources {
+		source_bytes += leader_l2.get(&source.l2_uri).await.unwrap().len() as u64;
+	}
+	let followers: Vec<u32> = NODES.into_iter().filter(|node| *node != leader).collect();
+	let mut follower_tiers = std::collections::BTreeMap::new();
+	for follower in &followers {
+		follower_tiers.insert(
+			*follower,
+			cluster.node(*follower).slab.list_tiered_slabs().await,
+		);
+	}
+	jump_floor(&cluster, now + 60_000).await;
+	until_active(&cluster, 1).await;
+	expect_everywhere(
+		&cluster,
+		&descriptor,
+		&expected,
+		"before the certified step",
+	)
+	.await;
+	let index = slab.persistent_index().unwrap();
+	let debt = |index: Arc<crate::storage::index::PersistentLocalIndex>| async move {
+		let mut debt: Vec<_> = index
+			.debt_page(None, 100)
+			.await
+			.unwrap()
+			.into_iter()
+			.map(|(key, _)| (crate::schema::Identity::new(key.key_identity), key.hlc))
+			.collect();
+		debt.sort();
+		debt
+	};
+	let mut obsolete = vec![(k1, v1[0]), (k2, v2[0]), (k4, v4[0])];
+	obsolete.sort();
+	assert_eq!(
+		debt(index.clone()).await,
+		obsolete,
+		"premise: the leader's debt"
+	);
+	assert_eq!(slab.certified_retained_objects_for_test().count, 0);
+	// The leader's own leader-gated step runs, from its LSM service's tick.
+	pause.store(false, Release);
+	let copies = |key, hlc| {
+		slab.version_locations(TenantId::ZERO, key, hlc)
+			.unwrap()
+			.len()
+	};
+	let deadline = tokio::time::Instant::now() + BOUND;
+	loop {
+		let rewritten = slab
+			.tier_pointer(s1)
+			.await
+			.is_some_and(|pointer| pointer.l2_uri.contains("certified/"));
+		let retired = slab.tier_pointer(s2).await.is_none();
+		if rewritten && retired && copies(k1, v1[0]) == 0 && copies(k2, v2[0]) == 0 {
+			break;
+		}
+		if tokio::time::Instant::now() >= deadline {
+			// What the step answers now, for the failure's cause.
+			let committer = crate::storage::RaftCommitter::new(cluster.node(leader).raft.clone())
+				.with_state_machine(cluster.node(leader).state_machine.clone());
+			let answer = server.certified_tier_step(&committer).await;
+			panic!("S1 rewritten {rewritten}, S2 retired {retired}; the step answers {answer:?}");
+		}
+		tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+	}
+	// S1 is exactly row 3, under the ring's certified provenance; S2 is gone
+	// from the ring; S3 is the same generation.
+	let owner = slab.owner_ref().unwrap();
+	let state = &cluster.node(leader).state_machine;
+	let committed = state
+		.tiered_slab(owner.slab(s1))
+		.await
+		.expect("S1 committed");
+	let provenance = committed.certified.clone().expect("certified provenance");
+	assert_eq!(
+		provenance.source,
+		crate::consensus::slab_ops::TierGeneration::from(&sources[0])
+	);
+	let durable = index.load_snapshot().await.unwrap();
+	let s1_rows: Vec<_> = durable
+		.record_rows
+		.iter()
+		.filter(|row| row.location.slab_id == s1)
+		.map(|row| (row.key_identity, row.location.hlc))
+		.collect();
+	assert_eq!(s1_rows, vec![(k3, v3[0])], "the exact survivor set");
+	assert_eq!(
+		crate::storage::index::lsm_rows_digest(
+			durable
+				.record_rows
+				.iter()
+				.filter(|row| row.location.slab_id == s1)
+				.copied()
+		),
+		provenance.postimage_rows_digest
+	);
+	assert_eq!(state.tiered_slab(owner.slab(s2)).await, None, "S2 retired");
+	assert_eq!(slab.tier_pointer(s3).await, Some(s3_pointer.clone()));
+	assert_eq!((copies(k4, v4[0]), copies(k3, v3[0])), (1, 1));
+	for (key, versions) in [(k1, &v1), (k2, &v2), (k4, &v4)] {
+		assert_eq!(copies(key, versions[1]), 1, "a winner stays");
+	}
+	expect_everywhere(&cluster, &descriptor, &expected, "after the certified step").await;
+	// Debt retires where no indexed copy is left; row 4's local copy keeps its.
+	let deadline = tokio::time::Instant::now() + BOUND;
+	loop {
+		let left = debt(index.clone()).await;
+		if left == vec![(k4, v4[0])] {
+			break;
+		}
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"the leader's debt is {left:?}"
+		);
+		tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+	}
+	// The replaced sources: retained, reported, never deleted.
+	let retained = slab.certified_retained_objects_for_test();
+	let mut uris = retained.uris.clone();
+	uris.sort();
+	let mut source_uris: Vec<_> = sources.iter().map(|source| source.l2_uri.clone()).collect();
+	source_uris.sort();
+	assert_eq!(
+		(retained.count, retained.bytes, uris.clone()),
+		(2, source_bytes, source_uris)
+	);
+	for uri in &uris {
+		leader_l2.get(uri).await.expect("a retained object stays");
+		assert!(
+			!slab
+				.list_tiered_slabs()
+				.await
+				.iter()
+				.any(|pointer| &pointer.l2_uri == uri),
+			"never indexed again"
+		);
+	}
+	eprintln!(
+		"ADR 0704 leader {leader}: certified rewrite of {s1:?} and retirement of {s2:?}; retained {} objects, {} bytes",
+		retained.count, retained.bytes
+	);
+	// Followers: tiered state untouched, no certified work.
+	for follower in &followers {
+		let node = cluster.node(*follower);
+		assert_eq!(
+			node.slab.list_tiered_slabs().await,
+			follower_tiers[follower],
+			"at {follower}"
+		);
+		assert_eq!(node.slab.certified_retained_objects_for_test().count, 0);
+		assert!(
+			node.slab
+				.require_op_index()
+				.unwrap()
+				.load_op_intents()
+				.await
+				.unwrap()
+				.iter()
+				.all(|op| op.certificate_requirement()
+					== crate::storage::index::CertificateRequirement::None),
+			"at {follower}"
+		);
+	}
+	drop(index);
+	drop(slab);
+	drop(server);
+	// A same-store restart of the leader: reads stay exact, the rewrite and the
+	// retirement stand, and the retained objects are still in the object store.
+	cluster.stop(leader, false).await;
+	cluster.reopen(leader).await;
+	until_settled(&cluster, &descriptor).await;
+	assert_eq!(
+		cluster.read_once_validated(leader, &descriptor).await,
+		expected,
+		"after the leader's restart"
+	);
+	expect_everywhere(&cluster, &descriptor, &expected, "after the restart").await;
+	let restarted = cluster.node(leader).slab.clone();
+	restarted.wait_tier_authority_ready().await.unwrap();
+	assert_eq!(
+		restarted
+			.tier_pointer(s1)
+			.await
+			.map(|pointer| pointer.l2_uri),
+		committed_uri(&committed)
+	);
+	assert_eq!(restarted.tier_pointer(s2).await, None);
+	assert_eq!(
+		restarted
+			.version_locations(TenantId::ZERO, k1, v1[0])
+			.unwrap()
+			.len() + restarted
+			.version_locations(TenantId::ZERO, k2, v2[0])
+			.unwrap()
+			.len(),
+		0,
+		"no resurrection"
+	);
+	let leader_l2 = l2_of(&cluster, leader);
+	for uri in &uris {
+		leader_l2
+			.get(uri)
+			.await
+			.expect("a retained object stays after the restart");
+	}
+	for node in cluster.nodes {
+		let _ = tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown()).await;
+	}
+}
+
+fn committed_uri(tier: &crate::consensus::TieredSlab) -> Option<String> {
+	Some(tier.l2_uri.clone())
+}
+
+/// DC-195 (registered; a separate ADR fixes it), CONTROLLED CLOCK: the original
+/// workflow shape, row 3 written in the same parent as row 1 with a value of the
+/// same length. The certified rewrite of S1 would put survivor row 3 at row 1's
+/// exact old location, and the leader's step is refused with a layout collision
+/// before any upload or proposal: nothing is uploaded, allocated or proposed,
+/// the old view stands and reads are exact. Asserts today's behaviour.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_certified_rewrite_whose_survivor_takes_a_pruned_rows_location_is_refused() {
+	use crate::storage::l2::ObjectStore;
+	use std::sync::atomic::Ordering::Release;
+	let (cluster, leader, descriptor) = ready_with(Cluster::start_with(|id, cfg| {
+		let root = crate::test_support::TestDir::new(&format!("dc195-certified-l2-{id}"));
+		cfg.l2 = Some(crate::storage::ObjectStoreConfig::LocalFs {
+			root: root.to_path_buf(),
+		});
+		cfg.tiering.scan_interval = std::time::Duration::from_millis(200);
+		Some(root)
+	}))
+	.await;
+	let leader_l2 = match cluster.configs[&leader].l2.as_ref().unwrap() {
+		crate::storage::ObjectStoreConfig::LocalFs { root } => {
+			crate::storage::l2::LocalFsObjectStore::new(root).unwrap()
+		}
+		other => panic!("{other:?}"),
+	};
+	let server = cluster.node(leader).data_server.clone();
+	let pause = server.decision_peer_for_test().pause_cleanup.clone();
+	pause.store(true, Release);
+	let slab = cluster.node(leader).slab.clone();
+	let now = std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.unwrap()
+		.as_millis() as u64;
+	// The original workflow shape: S1 is one parent write of rows 1, 3 and 4
+	// (rows 1 and 4 to be obsoleted, row 3 to survive); S2 row 2; S3 the winners.
+	let mut seal = Vec::new();
+	for (rows, what) in [
+		(&[(1, "a"), (3, "x"), (4, "a")][..], "S1"),
+		(&[(2, "a")][..], "S2"),
+		(&[(1, "b"), (2, "b"), (4, "b")][..], "S3 (the winners)"),
+	] {
+		assert_committed(
+			&write_through(
+				&cluster,
+				leader,
+				write_meta(&descriptor, rows.len(), uuid_v7()),
+				named_rows(&descriptor, rows),
+			)
+			.await,
+			what,
+		);
+		seal.push(slab.force_seal_active_for_test().await);
+	}
+	let mut expected = Expected::new();
+	for (id, value) in [(1, "b"), (2, "b"), (3, "x"), (4, "b")] {
+		expected.insert(id, value.into());
+	}
+	let s1 = seal[0];
+	let deadline = tokio::time::Instant::now() + BOUND;
+	for id in &seal {
+		while slab.tier_pointer(*id).await.is_none() {
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"{id:?} never tiered"
+			);
+			tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+		}
+	}
+	let source = slab.tier_pointer(s1).await.unwrap();
+	jump_floor(&cluster, now + 60_000).await;
+	until_active(&cluster, 1).await;
+	expect_everywhere(&cluster, &descriptor, &expected, "before the step").await;
+	pause.store(false, Release);
+	let committer = crate::storage::RaftCommitter::new(cluster.node(leader).raft.clone())
+		.with_state_machine(cluster.node(leader).state_machine.clone());
+	let deadline = tokio::time::Instant::now() + BOUND;
+	let refusal = loop {
+		match server.certified_tier_step(&committer).await {
+			Err(error) => break error,
+			Ok(step) => {
+				assert!(
+					tokio::time::Instant::now() < deadline,
+					"never refused; last step {step:?}"
+				);
+				tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+			}
+		}
+	};
+	assert_eq!(
+		crate::storage::manager::stale_location(&refusal).map(|stale| stale.reason),
+		Some(crate::storage::manager::StaleLocationReason::LayoutCollision),
+		"{refusal}"
+	);
+	assert!(
+		leader_l2.list("certified/").await.unwrap().is_empty(),
+		"nothing uploaded"
+	);
+	assert!(
+		slab.require_op_index()
+			.unwrap()
+			.load_op_intents()
+			.await
+			.unwrap()
+			.is_empty(),
+		"nothing allocated or proposed"
+	);
+	assert_eq!(slab.tier_pointer(s1).await, Some(source), "the old view");
+	expect_everywhere(&cluster, &descriptor, &expected, "after the refusal").await;
 	for node in cluster.nodes {
 		let _ = tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown()).await;
 	}

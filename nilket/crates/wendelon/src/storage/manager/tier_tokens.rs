@@ -578,6 +578,7 @@ mod tests {
 				stats_block_hash128: None,
 				tombstone_metadata: crate::schema::TombstoneMetadata::None,
 				supersession_metadata: crate::schema::SupersessionMetadata::None,
+				certified: None,
 			},
 			token: Some(token),
 		}

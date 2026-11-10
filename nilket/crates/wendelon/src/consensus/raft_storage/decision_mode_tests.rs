@@ -217,6 +217,10 @@ async fn a_new_mode_store_writes_its_own_format_and_reopens() {
 
 use crate::consensus::decisions::tests as fixture;
 
+const PARENT_DECISIONS_V16_MANIFEST: &str =
+	include_str!("../../../tests/fixtures/consensus_body/parent_decisions_v16.txt");
+/// ADR 0701 to ADR 0703's format-14 bodies, retained: no certified tier provenance.
+/// ADR 0704 changed no decision or lease body, so every format-14 body is unchanged.
 const PARENT_DECISIONS_V14_MANIFEST: &str =
 	include_str!("../../../tests/fixtures/consensus_body/parent_decisions_v14.txt");
 /// S5a to ADR 0700's format-13 bodies, retained: no batched lease renewals.
@@ -238,7 +242,63 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 fn manifest() -> BTreeMap<String, String> {
-	parse(PARENT_DECISIONS_V14_MANIFEST)
+	parse(PARENT_DECISIONS_V16_MANIFEST)
+}
+
+/// ADR 0704: the certified Tier and Retire pinned in the format-16 corpus, each
+/// with provenance naming its own operation and source, as apply requires.
+fn golden_certified_ops() -> [(&'static str, WendelonRequest); 2] {
+	use crate::consensus::slab_ops::{
+		CertifiedProvenance, CertifiedRetirement, OpKey, RetireOp, SlabCommand, SlabOp, TierOp,
+	};
+	let owner = super::body_format_corpus::canonical_owner();
+	let source = super::body_format_corpus::canonical_source_generation();
+	let slab = owner.slab(crate::schema::SlabId::new(3));
+	let tier = TieredSlab {
+		slab,
+		l2_uri: "l2://slab/3/certified".to_string(),
+		payload_hash: [0x33; 32],
+		is_encrypted: false,
+		tenant_id: None,
+		tenant_kek_id: None,
+		stats_format_version: None,
+		stats_block_len: None,
+		stats_block_hash128: None,
+		tombstone_metadata: crate::schema::TombstoneMetadata::default(),
+		supersession_metadata: crate::schema::SupersessionMetadata::default(),
+		certified: Some(CertifiedProvenance {
+			op: OpKey { owner, op_seq: 1 },
+			source: source.clone(),
+			postimage_rows_digest: [0x55; 32],
+		}),
+	};
+	[
+		(
+			"certified_tier_op",
+			WendelonRequest::SlabOp(SlabOp {
+				op_seq: 1,
+				command: SlabCommand::Tier(TierOp {
+					tier,
+					replaces: Some(source.clone()),
+				}),
+			}),
+		),
+		(
+			"certified_retire_op",
+			WendelonRequest::SlabOp(SlabOp {
+				op_seq: 2,
+				command: SlabCommand::Retire(RetireOp {
+					slab,
+					expected: source.clone(),
+					certified: Some(CertifiedRetirement {
+						op: OpKey { owner, op_seq: 2 },
+						slab,
+						source,
+					}),
+				}),
+			}),
+		),
+	]
 }
 
 /// ADR 0701: the batch pinned in the format-14 corpus, two leases of one holder.
@@ -280,7 +340,7 @@ fn entry(index: u64, request: WendelonRequest) -> Entry<WendelonTypeConfig> {
 }
 
 #[test]
-fn the_format_14_bodies_match_their_goldens_and_round_trip() {
+fn the_format_16_bodies_match_their_goldens_and_round_trip() {
 	let stored = manifest();
 	let state = golden_state();
 	let body = encode_state_body(DecisionMode::ParentDecisions, &state).unwrap();
@@ -307,6 +367,12 @@ fn the_format_14_bodies_match_their_goldens_and_round_trip() {
 		"acquire_leases_0".to_owned(),
 		hex(&postcard::to_stdvec(&golden_lease_batch()).unwrap()),
 	));
+	for (name, request) in golden_certified_ops() {
+		actual.push((
+			name.to_owned(),
+			hex(&postcard::to_stdvec(&request).unwrap()),
+		));
+	}
 	let moved: Vec<String> = actual
 		.iter()
 		.filter(|(name, hex)| stored.get(name) != Some(hex))
@@ -314,7 +380,7 @@ fn the_format_14_bodies_match_their_goldens_and_round_trip() {
 		.collect();
 	assert!(
 		moved.is_empty(),
-		"format-14 bodies moved or are missing; expected lines:\n{}",
+		"format-16 bodies moved or are missing; expected lines:\n{}",
 		moved.join("\n")
 	);
 	assert_eq!(stored.len(), actual.len());
@@ -334,7 +400,14 @@ fn the_format_14_bodies_match_their_goldens_and_round_trip() {
 	for (name, hex) in &retained {
 		assert_eq!(stored.get(name), Some(hex), "{name}");
 	}
-	assert_eq!(stored.len(), retained.len() + 1);
+	// ADR 0704 changed no decision or lease body: every format-14 body is
+	// unchanged, and only the two certified slab bodies are new.
+	let retained_v14 = parse(PARENT_DECISIONS_V14_MANIFEST);
+	for (name, hex) in &retained_v14 {
+		assert_eq!(stored.get(name), Some(hex), "{name}");
+	}
+	assert_eq!(stored.len(), retained_v14.len() + 2);
+	assert_eq!(retained_v14.len(), retained.len() + 1);
 }
 
 #[test]
@@ -407,10 +480,11 @@ async fn a_decision_record_is_written_only_at_format_10_and_replays() {
 #[tokio::test]
 async fn s1_s2_and_s3_development_artifacts_are_refused_by_both_authorities() {
 	// S1 wrote format 9; S2 wrote format 10 with no signer registry and
-	// stand-in signatures; S3 wrote format 11, whose claims carry no operation.
-	// None is converted: each is refused before replay or decode, files
-	// unchanged.
-	for retired in [9u8, 10, 11, 12] {
+	// stand-in signatures; S3 wrote format 11, whose claims carry no operation;
+	// S4b wrote 12, S5a to ADR 0700 13 and ADR 0701 to ADR 0703 14. None is
+	// converted: each is refused before replay or decode, files unchanged. ADR
+	// 0704 gave Today 15, not 9, so no authority ever reuses a retired number.
+	for retired in [9u8, 10, 11, 12, 13, 14] {
 		let dir = crate::test_support::TestDir::new(&format!("decision-retired-wal-{retired}"));
 		let page = serialize_entry_page_as(&blank(1), retired).unwrap();
 		let wal = write_segment(&dir, &[page]);

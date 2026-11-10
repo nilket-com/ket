@@ -9722,8 +9722,12 @@ fn adr078_manager_source_concatenates_submodules() {
 			"backing_install.rs",
 			// ADR 0699 S5b: the certified cleanup rewrite.
 			"certified_cleanup.rs",
+			// ADR 0704: how every publication path classifies a certified generation.
+			"certified_delivery.rs",
 			// ADR 0703: LSM compaction that elides one certified selection.
 			"certified_lsm.rs",
+			// ADR 0704: the admission and open-time fence of certified tiered cleanup.
+			"certified_tier.rs",
 			"compaction.rs",
 			"counter_visibility.rs",
 			// ADR 0696 (0692 §7): disposal evidence for typed Superseded after disposal.
@@ -10250,16 +10254,18 @@ fn adr0093_snapshot_v2_and_v3_fixtures_are_both_guarded() {
 		.unwrap();
 	let v5 = fs::read_to_string(manifest_dir.join("tests/fixtures/consensus_body/snapshot_v5.txt"))
 		.unwrap();
-	assert!(core.contains("pub const SNAPSHOT_FORMAT_VERSION: u8 = 8;"));
+	assert!(core.contains("pub const SNAPSHOT_FORMAT_VERSION: u8 = 15;"));
 	assert!(!manifest_dir.join("src/consensus/snapshot_body.rs").exists());
 	for required in [
 		"SNAPSHOT_V2_MANIFEST",
 		"SNAPSHOT_V3_MANIFEST",
 		"SNAPSHOT_V4_MANIFEST",
 		"SNAPSHOT_V5_MANIFEST",
-		"SNAPSHOT_V8_MANIFEST",
-		"adr0697_every_pre_v8_snapshot_body_is_refused_before_decode",
-		"adr0697_current_wal_v8_and_snapshot_v8_match_stored_goldens",
+		// ADR 0704: v8 is retained as a refusal input; v15 is current.
+		"SNAPSHOT_V8_OUTGOING_MANIFEST",
+		"SNAPSHOT_V15_MANIFEST",
+		"adr0704_every_pre_v15_snapshot_body_is_refused_before_decode",
+		"adr0704_current_wal_v15_and_snapshot_v15_match_stored_goldens",
 	] {
 		assert!(
 			raft.contains(required),
@@ -10291,7 +10297,7 @@ fn adr0094_write_cap_and_legacy_replay_have_one_authority() {
 	let client = fs::read_to_string(manifest_dir.join("src/client/core.rs")).unwrap();
 	let schema = fs::read_to_string(manifest_dir.join("src/schema/core.rs")).unwrap();
 	let raft = fs::read_to_string(manifest_dir.join("src/consensus/raft_storage.rs")).unwrap();
-	assert!(schema.contains("pub const WAL_FORMAT_VERSION: u8 = 8;"));
+	assert!(schema.contains("pub const WAL_FORMAT_VERSION: u8 = 15;"));
 	assert_eq!(core.matches("pub const MAX_SECTION_BYTES:").count(), 1);
 	assert_eq!(
 		client
@@ -10982,7 +10988,13 @@ fn tier_recovery_snapshots_have_only_the_reviewed_private_callers() {
 	for (name, expected) in [
 		(
 			"record_rows_for_slab_for_recovery",
-			vec![("manager.rs", 2), ("manager/tiered_io.rs", 2)],
+			vec![
+				("manager.rs", 2),
+				("manager/tiered_io.rs", 2),
+				// ADR 0704: the local rows a certified classification compares with its
+				// certificate and the ring's postimage, under the publication's lease.
+				("manager/certified_delivery.rs", 1),
+			],
 		),
 		(
 			// ADR 0696 (0692 §7): the bounded snapshot behind every tier
@@ -11054,7 +11066,16 @@ fn tier_recovery_snapshots_have_only_the_reviewed_private_callers() {
 	let tiered = fs::read_to_string(root.join("manager/tiered_io.rs")).unwrap();
 	let entry = manager_method_body(&tiered, "retire_tiered_slab_committed");
 	assert!(entry.contains("retire_tiered_slab_with_epoch(slab_id, last_control_log_index, None)"));
-	let retirement = manager_method_body(&tiered, "retire_tiered_slab_with_epoch");
+	// ADR 0704: the lease precedes the slab lock. `retire_tiered_slab_with_epoch` takes the
+	// lease; `retire_tiered_slab_leased`, which recovery calls under its own lease, takes the
+	// slab lock and is the reviewed caller of the locked retirement.
+	let leased_entry = manager_method_body(&tiered, "retire_tiered_slab_with_epoch");
+	assert!(
+		leased_entry.find("canonical_tier_lease().await").unwrap()
+			< leased_entry.find("retire_tiered_slab_leased(").unwrap()
+	);
+	assert!(!leased_entry.contains("retire_tiered_slab_under_publication_lock("));
+	let retirement = manager_method_body(&tiered, "retire_tiered_slab_leased");
 	assert!(retirement.contains("tier_lock.lock().await"));
 	assert!(retirement.contains("retire_tiered_slab_under_publication_lock("));
 	let retirement_locked =
@@ -11062,23 +11083,32 @@ fn tier_recovery_snapshots_have_only_the_reviewed_private_callers() {
 	assert!(retirement_locked.contains(
 		"require_private_retirement_authority(slab_id, last_control_log_index.is_some())?"
 	));
-	let reconcile = manager_method_body(&tiered, "reconcile_tier_slab_at_snapshot_epoch<F, Fut>");
+	// ADR 0704: the reconcile reads authority from the lease it took before the slab lock; its
+	// locked half is the reviewed caller of the locked retirement.
+	let reconcile = manager_method_body(&tiered, "reconcile_tier_slab_at_snapshot_epoch<F>");
+	assert!(
+		reconcile.find("canonical_tier_lease().await").unwrap()
+			< reconcile.find("tier_lock.lock().await").unwrap()
+	);
 	assert!(
 		reconcile.find("tier_lock.lock().await").unwrap()
-			< reconcile.find("authoritative().await").unwrap()
+			< reconcile.find("authoritative(lease.as_ref())").unwrap()
 	);
+	assert!(
+		reconcile.find("authoritative(lease.as_ref())").unwrap()
+			< reconcile
+				.find(".reconcile_tier_slab_under_publication_lock(")
+				.unwrap()
+	);
+	let reconcile_locked =
+		manager_method_body(&tiered, "reconcile_tier_slab_under_publication_lock");
 	assert!(
 		retirement.find("tier_lock.lock().await").unwrap()
 			< retirement
 				.find("retire_tiered_slab_under_publication_lock(")
 				.unwrap()
 	);
-	assert!(
-		reconcile.find("tier_lock.lock().await").unwrap()
-			< reconcile
-				.find("retire_tiered_slab_under_publication_lock(")
-				.unwrap()
-	);
+	assert!(!reconcile.contains("retire_tiered_slab_under_publication_lock("));
 	assert_eq!(
 		retirement
 			.matches("retire_tiered_slab_under_publication_lock(")
@@ -11086,7 +11116,7 @@ fn tier_recovery_snapshots_have_only_the_reviewed_private_callers() {
 		1
 	);
 	assert_eq!(
-		reconcile
+		reconcile_locked
 			.matches("retire_tiered_slab_under_publication_lock(")
 			.count(),
 		1
@@ -11372,9 +11402,109 @@ fn snapshot_lease_scopes_exclude_remote_io_and_backoff() {
 			PathBuf::from("src/storage/manager/op_recovery.rs"),
 			PathBuf::from("src/storage/manager/reservations.rs"),
 			PathBuf::from("src/storage/manager/tier_authority.rs"),
+			// ADR 0704: `canonical_tier_lease`, the one acquisition behind every publication or
+			// retirement of committed tier state (census below).
+			PathBuf::from("src/storage/manager/tiered_io.rs"),
 			PathBuf::from("src/storage/sweeper.rs")
 		]
 	);
+	// ADR 0704: every publication or retirement of committed tier state takes the canonical
+	// lease before the slab's publication lock, through the one acquisition above, and never
+	// awaits object I/O under it. A publication that needs object storage signals instead; its
+	// entry point releases the lease and the lock, prepares, and tries once more.
+	let tiered_io = fs::read_to_string(root.join("src/storage/manager/tiered_io.rs")).unwrap();
+	let deferral = fs::read_to_string(root.join("src/storage/manager/tier_deferral.rs")).unwrap();
+	assert_eq!(tiered_io.matches("source.read().await").count(), 1);
+	assert!(
+		manager_method_body(&tiered_io, "canonical_tier_lease").contains("source.read().await")
+	);
+	let mut lease_callers = Vec::new();
+	walk_dir(&root.join("src"), &mut |path| {
+		if path.extension().is_some_and(|ext| ext == "rs")
+			&& path.file_name().is_none_or(|name| name != "tests.rs")
+		{
+			let source = fs::read_to_string(path).unwrap();
+			let count = source.matches("canonical_tier_lease()").count();
+			if count != 0 {
+				lease_callers.push((path.strip_prefix(root).unwrap().to_path_buf(), count));
+			}
+		}
+	});
+	lease_callers.sort();
+	assert_eq!(
+		lease_callers,
+		vec![
+			// ADR 0704: the certified tier step's one read of committed state
+			// (`committed_certified_tier`), held for no I/O and no lock.
+			(PathBuf::from("src/storage/manager/certified_tier.rs"), 1),
+			// The recovered Tier and Retire deliveries and the superseded handoff.
+			(PathBuf::from("src/storage/manager/op_recovery.rs"), 4),
+			// ADR 0704: verification with no deferred-snapshot retry judges each pending
+			// generation, and then the Ready transition, under the bound canonical state.
+			(PathBuf::from("src/storage/manager/tier_authority.rs"), 2),
+			// The authority worker's replay.
+			(PathBuf::from("src/storage/manager/tier_deferral.rs"), 1),
+			// Reconcile, the observer and local publication (and its failed preparation's
+			// settlement under fresh authority), retirement, held retirements, and (ADR
+			// 0704) held snapshot retirement marks, which the lease classifies.
+			(PathBuf::from("src/storage/manager/tiered_io.rs"), 6),
+		]
+	);
+	for (source, name) in [
+		(&tiered_io, "reconcile_tier_slab_at_snapshot_epoch<F>"),
+		(&tiered_io, "apply_tier_slab_with_epoch"),
+		(&deferral, "replay_tier_deferrals"),
+	] {
+		let body = manager_method_body(source, name);
+		assert!(
+			body.find("canonical_tier_lease()").unwrap()
+				< body.find("tier_publication_lock(").unwrap(),
+			"{name}: the lease precedes the slab lock"
+		);
+		assert!(
+			body.find("needs_tier_preparation(").unwrap()
+				< body.find("prepare_tier_delivery_observed(").unwrap(),
+			"{name}: object storage only on the leased attempt's signal"
+		);
+	}
+	for name in [
+		"retire_tiered_slab_with_epoch",
+		"retry_deferred_retirements",
+	] {
+		let body = manager_method_body(&tiered_io, name);
+		assert!(body.contains("canonical_tier_lease()"), "{name}");
+		assert!(!body.contains("prepare_tier_delivery"), "{name}");
+	}
+	// The leased publication judges the canonical standing first, before any staging,
+	// deferral or other authority change it could cause, then signals for preparation; it
+	// never fetches.
+	let leased = manager_method_body(
+		&tiered_io,
+		"apply_tier_slab_under_publication_lock_prepared",
+	);
+	assert!(leased.contains("tier_publication_needs_preparation("));
+	let standing = leased.find("self.tier_standing_of(").unwrap();
+	for later in [
+		"cleanup_claim(",
+		"record_tier_deferral(",
+		"stage_tier_authority_under_publication_lock(",
+		"update_pending_tier_authority(",
+		"bump_slab_publication_revision(",
+		"publish_committed_tier_pointer(",
+	] {
+		assert!(
+			standing < leased.find(later).unwrap(),
+			"{later} before the standing"
+		);
+	}
+	for forbidden in [
+		"prepare_tier_delivery",
+		"build_tiered_row_refresh_plan",
+		"tiered_object_from_l2",
+		"ObjectStore",
+	] {
+		assert!(!leased.contains(forbidden), "{forbidden} under the lease");
+	}
 	// The operation handoff's lease spans local state and one redb commit only.
 	let op_hooks = fs::read_to_string(root.join("src/storage/manager/op_hooks.rs")).unwrap();
 	assert_eq!(op_hooks.matches("source.read().await").count(), 1);
@@ -11406,11 +11536,19 @@ fn snapshot_lease_scopes_exclude_remote_io_and_backoff() {
 	}
 	// An abandoned install's stages too.
 	let recovery = fs::read_to_string(root.join("src/storage/manager/op_recovery.rs")).unwrap();
-	assert_eq!(recovery.matches("source.read().await").count(), 4);
+	// ADR 0704: the tier delivery's lease moved to `canonical_tier_lease` (census above).
+	assert_eq!(recovery.matches("source.read().await").count(), 3);
+	// ADR 0704: a recovered Tier operation is classified under the lease before it prepares.
+	let deliver = manager_method_body(&recovery, "deliver_applied_tier_op");
+	assert!(
+		deliver.find("tier_standing(").unwrap() < deliver.find("prepare_tier_delivery(").unwrap()
+	);
 	for stage in [
 		"undo_abandoned_install",
 		"finish_applied_install",
 		"hand_off_rejected_tier_op",
+		// ADR 0704: the superseded handoff's lease spans local state and one redb commit.
+		"hand_off_superseded_tier_op",
 	] {
 		let body = manager_method_body(&recovery, stage);
 		for remote in [
@@ -11445,6 +11583,7 @@ fn snapshot_lease_scopes_exclude_remote_io_and_backoff() {
 		("tier_authority.rs", "src/storage/manager/tier_authority.rs"),
 		("tier_plan.rs", "src/storage/manager/tier_plan.rs"),
 		("tiered_io.rs", "src/storage/manager/tiered_io.rs"),
+		("certified_tier.rs", "src/storage/manager/certified_tier.rs"),
 	] {
 		let source = fs::read_to_string(root.join(path)).unwrap();
 		point_reads.push((
@@ -11455,14 +11594,18 @@ fn snapshot_lease_scopes_exclude_remote_io_and_backoff() {
 	assert_eq!(
 		point_reads,
 		[
-			("manager.rs", 2),
+			// ADR 0704 moved the tiered replacement build (one read per physical
+			// frame) from the root to retention_reclaim.rs.
+			("manager.rs", 1),
 			("encoding_compute.rs", 2),
-			("retention_reclaim.rs", 2),
+			("retention_reclaim.rs", 3),
 			("secondary_index_segments.rs", 0),
 			("stats_facts.rs", 0),
 			("tier_authority.rs", 1),
 			("tier_plan.rs", 2),
 			("tiered_io.rs", 2),
+			// ADR 0704: the certified tier claim reads each physical frame once.
+			("certified_tier.rs", 1),
 		],
 		"a new point read: if it is in a loop over a slab's entries, group by frame instead"
 	);

@@ -23,6 +23,7 @@ fn tier_command(slab: u64) -> SlabCommand {
 			stats_block_hash128: None,
 			tombstone_metadata: TombstoneMetadata::None,
 			supersession_metadata: SupersessionMetadata::None,
+			certified: None,
 		},
 		replaces: None,
 	})
@@ -35,6 +36,7 @@ fn retire_command(slab: u64) -> SlabCommand {
 	SlabCommand::Retire(RetireOp {
 		slab: op.tier.slab,
 		expected: TierGeneration::from(&op.tier),
+		certified: None,
 	})
 }
 
@@ -979,4 +981,424 @@ async fn a_rejected_install_transfers_every_output_or_none() {
 			})
 		);
 	}
+}
+
+// ADR 0704 §3: the certified tier operation's intent and certificate.
+
+fn certified_rewrite(slab: u64) -> (CertifiedTierWork, TierSelectionEvidence) {
+	let SlabCommand::Tier(source) = tier_command(slab) else {
+		unreachable!()
+	};
+	let mut tier = source.tier.clone();
+	tier.l2_uri = format!("l2://{slab}/certified");
+	tier.payload_hash = [2; 32];
+	(
+		CertifiedTierWork::Rewrite {
+			tier,
+			postimage_rows_digest: [7; 32],
+		},
+		selection_evidence(TierGeneration::from(&source.tier), 0),
+	)
+}
+
+fn certified_retire(slab: u64) -> (CertifiedTierWork, TierSelectionEvidence) {
+	let SlabCommand::Tier(source) = tier_command(slab) else {
+		unreachable!()
+	};
+	(
+		CertifiedTierWork::Retire {
+			slab: source.tier.slab,
+		},
+		selection_evidence(TierGeneration::from(&source.tier), 0),
+	)
+}
+
+fn selection_evidence(source: TierGeneration, active_gid: u64) -> TierSelectionEvidence {
+	TierSelectionEvidence {
+		job_fingerprint: [3; 32],
+		active_gid,
+		source_generation: source,
+		source_rows_digest: [4; 32],
+		drop_digest: [5; 32],
+		drop_rows_digest: [6; 32],
+		drop_count: 2,
+	}
+}
+
+async fn allocate_certified(
+	index: &PersistentLocalIndex,
+	(work, evidence): (CertifiedTierWork, TierSelectionEvidence),
+) -> OpTicket {
+	match index
+		.allocate_certified_tier_op(work, evidence)
+		.await
+		.unwrap()
+	{
+		CertifiedTierAllocation::Allocated(allocation) => {
+			assert!(allocation.later.is_empty() && allocation.linked.is_none());
+			allocation.first
+		}
+		CertifiedTierAllocation::GenerationMoved => panic!("the generation did not move"),
+	}
+}
+
+#[tokio::test]
+async fn a_certified_tier_allocation_writes_its_required_intent_and_certificate_in_one_transaction()
+{
+	let (_dir, path, index) = fresh().await;
+	// A cut commit leaves neither row and consumes no sequence.
+	index.cut_next_op_txn(OpTxnCut::BeforeCommit);
+	let (work, evidence) = certified_rewrite(1);
+	assert!(
+		index
+			.allocate_certified_tier_op(work, evidence)
+			.await
+			.is_err()
+	);
+	assert_eq!(index.load_op_intents().await.unwrap(), Vec::new());
+	assert_eq!(index.tier_certificate(1).await.unwrap(), None);
+	assert_eq!(index.next_op_seq_for_test().await.unwrap(), 1);
+
+	let (work, evidence) = certified_rewrite(1);
+	let ticket = allocate_certified(&index, (work.clone(), evidence.clone())).await;
+	let key = ticket.key();
+	assert_eq!(key.op_seq, 1);
+	assert_eq!(key.owner, owner());
+	assert_eq!(
+		ticket.certificate_requirement(),
+		CertificateRequirement::Required
+	);
+	// The provenance names the allocated key and the selection's source.
+	let SlabCommand::Tier(op) = ticket.command() else {
+		panic!("a rewrite proposes a Tier");
+	};
+	let provenance = op.tier.certified.clone().expect("provenance");
+	assert_eq!(provenance.op, key);
+	assert_eq!(provenance.source, evidence.source_generation);
+	assert_eq!(provenance.postimage_rows_digest, [7; 32]);
+	assert_eq!(op.replaces, Some(evidence.source_generation.clone()));
+	assert_eq!(ticket.digest(), ticket.command().digest());
+	// The digest covers the provenance: another key or source is another digest.
+	for edit in [0, 1, 2] {
+		let mut changed = op.clone();
+		let certified = changed.tier.certified.as_mut().unwrap();
+		match edit {
+			0 => certified.op.op_seq += 1,
+			1 => certified.source.payload_hash[0] ^= 1,
+			_ => certified.postimage_rows_digest[0] ^= 1,
+		}
+		assert_ne!(
+			SlabCommand::Tier(changed).digest(),
+			ticket.digest(),
+			"edit {edit}"
+		);
+	}
+	let certificate = index
+		.tier_certificate(1)
+		.await
+		.unwrap()
+		.expect("its certificate");
+	assert_eq!(certificate.op_binding, ticket.digest());
+	assert_eq!(
+		certificate.postimage,
+		TierCertifiedPostimage::Rewrite {
+			postimage_rows_digest: [7; 32]
+		}
+	);
+	assert_eq!(
+		(
+			certificate.job_fingerprint,
+			certificate.active_gid,
+			&certificate.source_generation,
+			certificate.source_rows_digest,
+			certificate.drop_digest,
+			certificate.drop_rows_digest,
+			certificate.drop_count,
+		),
+		(
+			evidence.job_fingerprint,
+			evidence.active_gid,
+			&evidence.source_generation,
+			evidence.source_rows_digest,
+			evidence.drop_digest,
+			evidence.drop_rows_digest,
+			evidence.drop_count,
+		)
+	);
+	// A Retire is bound the same way, with no postimage.
+	let retire = allocate_certified(&index, certified_retire(2)).await;
+	let SlabCommand::Retire(op) = retire.command() else {
+		panic!("an all-obsolete job proposes a Retire");
+	};
+	let retirement = op.certified.clone().expect("provenance");
+	assert_eq!(retirement.op, retire.key());
+	assert_eq!(retirement.slab, op.slab);
+	assert_eq!(retirement.source, op.expected);
+	let certificate = index
+		.tier_certificate(retire.key().op_seq)
+		.await
+		.unwrap()
+		.expect("its certificate");
+	assert_eq!(certificate.op_binding, retire.digest());
+	assert_eq!(certificate.postimage, TierCertifiedPostimage::Retire);
+	drop(index);
+
+	// Durable as one: a reopen finds both intents Required and nothing orphaned.
+	let index = reopen(&path).await.unwrap();
+	assert_eq!(
+		index.load_op_intents().await.unwrap(),
+		vec![LoadedOp::Submittable(ticket), LoadedOp::Submittable(retire)]
+	);
+	assert_eq!(
+		index.op_certificate_requirement(1).await.unwrap(),
+		Some(CertificateRequirement::Required)
+	);
+	assert_eq!(index.certified_tier_orphans().await.unwrap(), Vec::new());
+}
+
+#[tokio::test]
+async fn a_certified_tier_allocation_under_a_moved_generation_writes_nothing() {
+	use super::certified_base::{Activation, BaseEntry, StagedCandidate, chunk_sums};
+	let (_dir, _path, index) = fresh().await;
+	// Decided under generation 0; generation 1 activates before allocation.
+	let (work, evidence) = certified_rewrite(1);
+	assert_eq!(evidence.active_gid, 0);
+	let entry = BaseEntry {
+		tenant: crate::schema::TenantId::new(1),
+		table: crate::schema::TableObjectId::new([3; 16]),
+		key_identity: [1; 32],
+		hlc: crate::schema::HybridTimestamp {
+			physical_ms: 20,
+			logical: 0,
+			node_id: 0,
+		},
+		row_digest: [0x20; 32],
+		tombstone: false,
+		position: 0,
+	};
+	let candidate = StagedCandidate {
+		gid: 1,
+		target_digest: [1; 32],
+		predecessor_gid: 0,
+		chunks: chunk_sums(&[entry]),
+	};
+	index
+		.stage_base(candidate.clone(), vec![entry])
+		.await
+		.unwrap()
+		.unwrap();
+	index
+		.activate_base(Activation {
+			gid: 1,
+			target_digest: candidate.target_digest,
+			predecessor_gid: 0,
+			chunks: candidate.chunks,
+			t: 0,
+		})
+		.await
+		.unwrap()
+		.unwrap();
+	assert!(matches!(
+		index
+			.allocate_certified_tier_op(work.clone(), evidence.clone())
+			.await
+			.unwrap(),
+		CertifiedTierAllocation::GenerationMoved
+	));
+	assert_eq!(index.load_op_intents().await.unwrap(), Vec::new());
+	assert_eq!(index.tier_certificate(1).await.unwrap(), None);
+	assert_eq!(
+		index.next_op_seq_for_test().await.unwrap(),
+		1,
+		"no sequence"
+	);
+	assert_eq!(index.oldest_op_holder().await.unwrap(), None);
+	// The same job decided under the current generation allocates sequence 1.
+	let evidence = TierSelectionEvidence {
+		active_gid: 1,
+		..evidence
+	};
+	assert_eq!(
+		allocate_certified(&index, (work, evidence))
+			.await
+			.key()
+			.op_seq,
+		1
+	);
+}
+
+#[tokio::test]
+async fn the_hand_off_clears_a_certified_tier_certificate_by_exact_binding() {
+	let (_dir, path, index) = fresh().await;
+	let rewrite = allocate_certified(&index, certified_rewrite(1)).await;
+	let retire = allocate_certified(&index, certified_retire(2)).await;
+	let rejected = allocate_certified(&index, certified_rewrite(3)).await;
+	index
+		.hand_off_op(rewrite.key(), rewrite.digest(), None)
+		.await
+		.unwrap();
+	assert_eq!(index.tier_certificate(1).await.unwrap(), None);
+	assert!(
+		index.tier_certificate(2).await.unwrap().is_some(),
+		"only its own"
+	);
+	index
+		.hand_off_op(retire.key(), retire.digest(), None)
+		.await
+		.unwrap();
+	assert_eq!(index.tier_certificate(2).await.unwrap(), None);
+	// A rejected certified rewrite's hand-off clears it the same way.
+	index.hand_off_rejected_tier(&rejected).await.unwrap();
+	assert_eq!(index.tier_certificate(3).await.unwrap(), None);
+	assert_eq!(
+		index.load_rejected_tier_candidates().await.unwrap().len(),
+		1
+	);
+	assert_eq!(
+		index.load_ack_pending().await.unwrap(),
+		vec![(1, false), (2, false), (3, false)]
+	);
+	drop(index);
+	let index = reopen(&path).await.unwrap();
+	assert_eq!(index.certified_tier_orphans().await.unwrap(), Vec::new());
+}
+
+#[tokio::test]
+async fn a_tier_certificate_binding_another_op_refuses_the_hand_off_whole() {
+	let (_dir, _path, index) = fresh().await;
+	let ticket = allocate_certified(&index, certified_rewrite(1)).await;
+	let mut certificate = index.tier_certificate(1).await.unwrap().unwrap();
+	certificate.op_binding[0] ^= 1;
+	let tampered = PersistentLocalIndex::encode_tier_certificate_for_test(&certificate);
+	index
+		.put_tier_certificate_raw_for_test(1, Some(tampered.clone()))
+		.await;
+	let error = index
+		.hand_off_op(ticket.key(), ticket.digest(), None)
+		.await
+		.expect_err("refused");
+	assert!(
+		error
+			.get_ref()
+			.is_some_and(|inner| inner.is::<TierCertificateBindsAnotherOp>()),
+		"{error}"
+	);
+	// Nothing removed: the intent, the certificate as written, no AckPending.
+	assert_eq!(
+		index.load_op_intents().await.unwrap(),
+		vec![LoadedOp::Submittable(ticket.clone())]
+	);
+	assert_eq!(index.tier_certificate(1).await.unwrap(), Some(certificate));
+	assert_eq!(index.load_ack_pending().await.unwrap(), vec![]);
+	// The rejected-tier hand-off is refused the same way.
+	assert!(
+		index
+			.hand_off_rejected_tier(&ticket)
+			.await
+			.expect_err("refused")
+			.get_ref()
+			.is_some_and(|inner| inner.is::<TierCertificateBindsAnotherOp>())
+	);
+	assert_eq!(index.load_rejected_tier_candidates().await.unwrap(), vec![]);
+	assert_eq!(index.load_op_intents().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn an_ordinary_allocation_records_no_certificate_requirement() {
+	let (_dir, path, index) = fresh().await;
+	let ticket = allocate_one(&index, 1).await;
+	assert_eq!(
+		ticket.certificate_requirement(),
+		CertificateRequirement::None
+	);
+	assert_eq!(index.tier_certificate(1).await.unwrap(), None);
+	// A command carrying provenance is never allocated without its certificate.
+	let rewrite = allocate_certified(&index, certified_rewrite(2)).await;
+	let error = index
+		.allocate_ops(vec![rewrite.command().clone()], None)
+		.await
+		.expect_err("refused");
+	assert_eq!(error.kind(), ErrorKind::InvalidInput, "{error}");
+	assert_eq!(index.next_op_seq_for_test().await.unwrap(), 3);
+	index
+		.hand_off_op(ticket.key(), ticket.digest(), None)
+		.await
+		.unwrap();
+	drop(index);
+	let index = reopen(&path).await.unwrap();
+	assert_eq!(
+		index.op_certificate_requirement(2).await.unwrap(),
+		Some(CertificateRequirement::Required)
+	);
+	assert_eq!(index.op_certificate_requirement(1).await.unwrap(), None);
+	assert_eq!(index.certified_tier_orphans().await.unwrap(), Vec::new());
+}
+
+/// Every shape of disagreement between an intent and a certificate, found in
+/// one read.
+#[tokio::test]
+async fn each_tier_certificate_orphan_shape_is_found() {
+	use CertifiedTierOrphan::*;
+	let (_dir, path, index) = fresh().await;
+	// 1: a Required intent whose certificate is gone.
+	allocate_certified(&index, certified_rewrite(1)).await;
+	index.put_tier_certificate_raw_for_test(1, None).await;
+	// 2: a certificate binding another op.
+	allocate_certified(&index, certified_rewrite(2)).await;
+	let mut wrong = index.tier_certificate(2).await.unwrap().unwrap();
+	wrong.source_generation.payload_hash[0] ^= 1;
+	index
+		.put_tier_certificate_raw_for_test(
+			2,
+			Some(PersistentLocalIndex::encode_tier_certificate_for_test(
+				&wrong,
+			)),
+		)
+		.await;
+	// 3: a certificate beside an ordinary intent.
+	allocate_one(&index, 3).await;
+	index
+		.put_tier_certificate_raw_for_test(
+			3,
+			Some(PersistentLocalIndex::encode_tier_certificate_for_test(
+				&wrong,
+			)),
+		)
+		.await;
+	// 4: an undecodable certificate of a Required intent.
+	allocate_certified(&index, certified_retire(4)).await;
+	index
+		.put_tier_certificate_raw_for_test(4, Some(b"not a certificate".to_vec()))
+		.await;
+	// 5: a Required intent whose command lost its provenance requirement.
+	allocate_certified(&index, certified_retire(5)).await;
+	index
+		.force_op_row_for_test(5, |intent| {
+			intent.certificate = CertificateRequirement::None
+		})
+		.await
+		.unwrap();
+	// 6: a certificate whose intent is gone.
+	index
+		.put_tier_certificate_raw_for_test(
+			99,
+			Some(PersistentLocalIndex::encode_tier_certificate_for_test(
+				&wrong,
+			)),
+		)
+		.await;
+	let expected = vec![
+		UndecodableCertificate { op_seq: 4 },
+		IntentWithoutCertificate { op_seq: 1 },
+		CertificateBindsAnotherOp { op_seq: 2 },
+		CertificateOfUncertifiedIntent { op_seq: 3 },
+		RequirementMismatch { op_seq: 5 },
+		CertificateOfUncertifiedIntent { op_seq: 5 },
+		CertificateWithoutIntent { op_seq: 99 },
+	];
+	assert_eq!(index.certified_tier_orphans().await.unwrap(), expected);
+	drop(index);
+	// Open succeeds; the orphans stand, nothing is cleared.
+	let index = reopen(&path).await.unwrap();
+	assert_eq!(index.certified_tier_orphans().await.unwrap(), expected);
 }

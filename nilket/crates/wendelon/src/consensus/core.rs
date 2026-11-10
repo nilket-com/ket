@@ -148,6 +148,10 @@ pub struct TieredSlab {
 	/// short-circuit visibility.
 	#[serde(default)]
 	pub supersession_metadata: SupersessionMetadata,
+	/// ADR 0704: the ring provenance of a certified rewrite, `None` for every
+	/// ordinary generation. It classifies; it is not part of the object's
+	/// identity (`TierGeneration`). Encoded in place: the formats were bumped.
+	pub certified: Option<crate::consensus::slab_ops::CertifiedProvenance>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

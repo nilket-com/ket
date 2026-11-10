@@ -631,22 +631,66 @@ impl SlabManager {
 
 	/// Re-read control authority after acquiring the same slab lock as log
 	/// observers. The discovery snapshot only selects work; it cannot authorize
-	/// a pointer replacement or retirement. The callback drops its SM read guard
-	/// before any filesystem work. Return whether local state changed and the
+	/// a pointer replacement or retirement. Return whether local state changed and the
 	/// retired pointer whose existing cleanup path must be completed.
-	pub(crate) async fn reconcile_tier_slab_at_snapshot_epoch<F, Fut>(
+	///
+	/// ADR 0704: the lease, then the slab lock; `authoritative` reads the committed pointer
+	/// from that lease when a canonical source is bound. A publication that needs object
+	/// storage releases both, prepares, and tries once more with what it prepared.
+	pub(crate) async fn reconcile_tier_slab_at_snapshot_epoch<F>(
 		&self,
 		slab_id: SlabId,
 		observed_epoch: u64,
 		authoritative: F,
 	) -> std::io::Result<(bool, Option<TieredSlabPointer>)>
 	where
-		F: FnOnce() -> Fut,
-		Fut: std::future::Future<Output = std::io::Result<Option<TieredSlabPointer>>>,
+		F: Fn(
+			Option<&crate::consensus::TierSnapshotLease>,
+		) -> std::io::Result<Option<TieredSlabPointer>>,
 	{
-		let tier_lock = self.tier_publication_lock(slab_id);
-		let _tier_guard = tier_lock.lock().await;
-		let pointer = authoritative().await?;
+		let mut prepared = None;
+		for attempt in 0..2 {
+			let (pointer, result) = {
+				let lease = self.canonical_tier_lease().await?;
+				let tier_lock = self.tier_publication_lock(slab_id);
+				let _tier_guard = tier_lock.lock().await;
+				let pointer = authoritative(lease.as_ref())?;
+				let result = self
+					.reconcile_tier_slab_under_publication_lock(
+						slab_id,
+						observed_epoch,
+						pointer.clone(),
+						lease.as_ref(),
+						prepared.take(),
+					)
+					.await;
+				(pointer, result)
+			};
+			match (result, pointer) {
+				(Err(error), Some(pointer)) if needs_tier_preparation(&error) && attempt == 0 => {
+					// Object storage with no authority held.
+					let ready = self.prepare_tier_delivery_observed(&pointer).await;
+					prepared = Some((pointer, ready));
+				}
+				(Err(error), Some(pointer)) if needs_tier_preparation(&error) => {
+					return Err(tier_delivery_moved(pointer.slab_id));
+				}
+				(result, _) => return result,
+			}
+		}
+		unreachable!("the second attempt always returns")
+	}
+
+	/// `reconcile_tier_slab_at_snapshot_epoch` under the caller's lease and slab lock, for the
+	/// committed `pointer` read from that lease.
+	async fn reconcile_tier_slab_under_publication_lock(
+		&self,
+		slab_id: SlabId,
+		observed_epoch: u64,
+		pointer: Option<TieredSlabPointer>,
+		lease: Option<&crate::consensus::TierSnapshotLease>,
+		prepared: Option<(TieredSlabPointer, std::io::Result<PreparedTierDelivery>)>,
+	) -> std::io::Result<(bool, Option<TieredSlabPointer>)> {
 		let local = self.tier_pointer(slab_id).await;
 		let matching_deferral = pointer.as_ref().is_some_and(|pointer| {
 			self.unapplied_tier_pointers
@@ -676,6 +720,8 @@ impl SlabManager {
 							slab_id,
 							Some(&pointer),
 							observed_epoch,
+							lease,
+							prepared,
 						)
 						.await
 					{
@@ -686,18 +732,46 @@ impl SlabManager {
 						| TierReplay::KeptFenced => Ok((false, None)),
 					};
 				}
-				self.apply_tier_slab_under_publication_lock(pointer, None, observed_epoch)
-					.await?;
+				let prepared = match prepared {
+					Some((prepared_for, Ok(prepared))) if prepared_for == pointer => Some(prepared),
+					Some((prepared_for, Err(error))) if prepared_for == pointer => {
+						return Err(error);
+					}
+					_ => None,
+				};
+				self.apply_tier_slab_under_publication_lock(
+					pointer,
+					None,
+					observed_epoch,
+					lease,
+					prepared,
+				)
+				.await?;
 				Ok((true, None))
 			}
 			None => {
 				let Some(old) = local else {
 					return Ok((false, None));
 				};
+				// ADR 0704: no pointer alone is not terminal; nothing is recorded or retired
+				// unless a retirement is in force, and an unprovable local generation is fenced.
+				if let Some(lease) = self.require_tier_lease(slab_id, lease)? {
+					let owner = self.owner_ref()?;
+					if !lease.retirement_in_force(owner.slab(slab_id)) {
+						self.fence_unproven_local_tier(lease, slab_id).await?;
+						return Err(committed_standing_unknown(slab_id));
+					}
+				}
 				self.record_retained_pointer_transition(&old, None, true)
 					.await?;
 				let changed = self
-					.retire_tiered_slab_under_publication_lock(slab_id, None, observed_epoch, false)
+					.retire_tiered_slab_under_publication_lock(
+						slab_id,
+						None,
+						observed_epoch,
+						false,
+						lease,
+					)
 					.await?;
 				Ok((changed, changed.then_some(old)))
 			}
@@ -727,10 +801,58 @@ impl SlabManager {
 		// fired the tier observer, so a second application of an identical
 		// pointer must not rebuild row state or mutate relocated reads again.
 		let control_epoch = observed_epoch.unwrap_or_else(|| self.capture_snapshot_epoch());
-		let tier_lock = self.tier_publication_lock(pointer.slab_id);
-		let _tier_guard = tier_lock.lock().await;
-		self.apply_tier_slab_under_publication_lock(pointer, last_control_log_index, control_epoch)
-			.await
+		// ADR 0704: the lease, then the slab lock. Object storage only on demand, with both
+		// released, and then one more attempt with what was prepared.
+		let mut prepared = None;
+		for attempt in 0..2 {
+			let result = {
+				let lease = self.canonical_tier_lease().await?;
+				let tier_lock = self.tier_publication_lock(pointer.slab_id);
+				let _tier_guard = tier_lock.lock().await;
+				self.apply_tier_slab_under_publication_lock(
+					pointer.clone(),
+					last_control_log_index,
+					control_epoch,
+					lease.as_ref(),
+					prepared.take(),
+				)
+				.await
+			};
+			match result {
+				Err(error) if needs_tier_preparation(&error) && attempt == 0 => {
+					#[cfg(test)]
+					let injected = self.tier_prepare_fail_hold_for_test().await;
+					#[cfg(not(test))]
+					let injected: Option<Error> = None;
+					let ready = match injected {
+						Some(error) => Err(self.observed_publication_error(pointer.slab_id, error)),
+						None => self.prepare_tier_delivery_observed(&pointer).await,
+					};
+					match ready {
+						Ok(ready) => prepared = Some(ready),
+						Err(error) => {
+							// Settled under fresh authority, never from outside it.
+							let lease = self.canonical_tier_lease().await?;
+							let tier_lock = self.tier_publication_lock(pointer.slab_id);
+							let _tier_guard = tier_lock.lock().await;
+							self.settle_unprepared_tier_delivery(
+								&pointer,
+								last_control_log_index,
+								&error,
+								lease.as_ref(),
+							)
+							.await?;
+							return Err(error);
+						}
+					}
+				}
+				Err(error) if needs_tier_preparation(&error) => {
+					return Err(tier_delivery_moved(pointer.slab_id));
+				}
+				result => return result,
+			}
+		}
+		unreachable!("the second attempt always returns")
 	}
 
 	/// What delivering a committed pointer needs from object storage, gathered with no
@@ -773,16 +895,185 @@ impl SlabManager {
 		} else {
 			None
 		};
-		Ok(PreparedTierDelivery { old_pointer, plan })
+		Ok(PreparedTierDelivery {
+			pointer: pointer.clone(),
+			old_pointer,
+			plan,
+		})
+	}
+
+	/// `prepare_tier_delivery`, its failure classified as a publication's would be
+	/// (`observed_publication_error`), so a fence keeps its replayable cause.
+	pub(super) async fn prepare_tier_delivery_observed(
+		&self,
+		pointer: &TieredSlabPointer,
+	) -> std::io::Result<PreparedTierDelivery> {
+		self.prepare_tier_delivery(pointer)
+			.await
+			.map_err(|error| self.observed_publication_error(pointer.slab_id, error))
+	}
+
+	/// ADR 0704: a committed delivery whose preparation failed ends as its publication would
+	/// have: deferred with that failure under its callback's index, unless exactly this pointer
+	/// is already published.
+	pub(super) async fn defer_unprepared_tier_delivery(
+		&self,
+		pointer: &TieredSlabPointer,
+		error: &Error,
+		provenance: u64,
+	) {
+		if self.tier_pointer(pointer.slab_id).await.as_ref() == Some(pointer) {
+			return;
+		}
+		self.record_tier_deferral(
+			pointer.slab_id,
+			TierDeferral {
+				pointer: pointer.clone(),
+				outcome: DeferralOutcome::of(error),
+				provenance: Some(provenance),
+			},
+		);
+	}
+
+	/// The canonical lease, when a canonical source is bound: the first lock of every tier
+	/// publication or retirement (ADR 0704). Never taken while holding a slab lock or a lease.
+	pub(super) async fn canonical_tier_lease(
+		&self,
+	) -> std::io::Result<Option<crate::consensus::TierSnapshotLease>> {
+		match self.canonical_tier_source.get() {
+			Some(source) => Ok(Some(source.read().await?)),
+			None => Ok(None),
+		}
+	}
+
+	/// The lease a publication or retirement checks against: `None` only with no source bound.
+	fn require_tier_lease<'a>(
+		&self,
+		slab_id: SlabId,
+		lease: Option<&'a crate::consensus::TierSnapshotLease>,
+	) -> std::io::Result<Option<&'a crate::consensus::TierSnapshotLease>> {
+		match (self.canonical_tier_source.get(), lease) {
+			(Some(_), None) => Err(tier_publication_unleased(slab_id)),
+			(_, lease) => Ok(lease),
+		}
+	}
+
+	/// ADR 0704: the committed state in `lease` proves nothing about `slab_id`, and does not
+	/// name the generation this store holds locally. That generation must never serve, and is
+	/// never retired here: it is fenced for reads with a typed `CommittedStanding` deferral of
+	/// exactly the local pointer. It carries no callback index: no callback proven to have
+	/// applied that generation is known here, and another generation's index would let a
+	/// snapshot covering it clear this fence. It clears only through the reconcile, with fresh
+	/// authority: a publication once the local generation is current, or a retirement in force.
+	/// Never replaces another deferral (any deferral already fences reads). Returns whether the
+	/// local generation is unproven. The caller holds the lease and the slab lock.
+	async fn fence_unproven_local_tier(
+		&self,
+		lease: &crate::consensus::TierSnapshotLease,
+		slab_id: SlabId,
+	) -> std::io::Result<bool> {
+		let Some(local) = self.tier_pointer(slab_id).await else {
+			return Ok(false);
+		};
+		let owner = self.owner_ref()?;
+		if lease
+			.committed_tier(owner.slab(slab_id))
+			.is_some_and(|committed| {
+				crate::consensus::slab_ops::TierGeneration::from(&committed)
+					== crate::consensus::slab_ops::TierGeneration::from(&local)
+			}) {
+			return Ok(false);
+		}
+		self.record_tier_deferral_if_vacant(
+			slab_id,
+			TierDeferral::fenced(local, FenceCause::CommittedStanding, None),
+		);
+		Ok(true)
+	}
+
+	/// Where publishing `pointer` stands in the lease's state, for the callback at `applied_at`.
+	fn tier_standing_of(
+		&self,
+		lease: &crate::consensus::TierSnapshotLease,
+		pointer: &TieredSlabPointer,
+		applied_at: Option<u64>,
+	) -> std::io::Result<crate::consensus::TierStanding> {
+		let owner = self.owner_ref()?;
+		Ok(lease.tier_standing(
+			owner.slab(pointer.slab_id),
+			&crate::consensus::slab_ops::TierGeneration::from(pointer),
+			applied_at,
+		))
+	}
+
+	/// ADR 0704: an unknown standing stages nothing as committed authority. An unproven local
+	/// generation is fenced; otherwise a committed callback's own pointer is deferred,
+	/// replayable. Neither replaces another state's deferral. The caller holds the lease and
+	/// the slab lock.
+	async fn record_unknown_tier_standing(
+		&self,
+		lease: &crate::consensus::TierSnapshotLease,
+		pointer: &TieredSlabPointer,
+		last_control_log_index: Option<u64>,
+	) -> std::io::Result<()> {
+		let fenced_local = self
+			.fence_unproven_local_tier(lease, pointer.slab_id)
+			.await?;
+		if !fenced_local && last_control_log_index.is_some() {
+			self.record_tier_deferral_if_vacant(
+				pointer.slab_id,
+				TierDeferral::fenced(
+					pointer.clone(),
+					FenceCause::CommittedStanding,
+					last_control_log_index,
+				),
+			);
+		}
+		Ok(())
+	}
+
+	/// ADR 0704: a preparation that failed with no authority held is settled under a fresh
+	/// lease and the slab lock, reclassified there: superseded adds nothing; unknown is handled
+	/// as any unknown standing; current defers as a failed publication would. The caller holds
+	/// the lease and the slab lock.
+	async fn settle_unprepared_tier_delivery(
+		&self,
+		pointer: &TieredSlabPointer,
+		last_control_log_index: Option<u64>,
+		error: &Error,
+		lease: Option<&crate::consensus::TierSnapshotLease>,
+	) -> std::io::Result<()> {
+		// A callback an installed snapshot covers defers nothing, as under the lock.
+		if self.observer_is_superseded(last_control_log_index) {
+			return Ok(());
+		}
+		if let Some(lease) = self.require_tier_lease(pointer.slab_id, lease)? {
+			match self.tier_standing_of(lease, pointer, last_control_log_index)? {
+				crate::consensus::TierStanding::Current => {}
+				crate::consensus::TierStanding::Superseded => return Ok(()),
+				crate::consensus::TierStanding::Unknown => {
+					return self
+						.record_unknown_tier_standing(lease, pointer, last_control_log_index)
+						.await;
+				}
+			}
+		}
+		if let Some(index) = last_control_log_index {
+			self.defer_unprepared_tier_delivery(pointer, error, index)
+				.await;
+		}
+		Ok(())
 	}
 
 	/// Publish `pointer` from what was prepared. Local files and redb only: if the published
-	/// generation moved since it was prepared, this refuses rather than going to fetch.
+	/// generation moved since it was prepared, this refuses rather than going to fetch. The
+	/// caller holds `lease`, taken before this takes the slab lock (ADR 0704).
 	pub(super) async fn apply_prepared_tier_delivery(
 		&self,
 		pointer: TieredSlabPointer,
 		last_control_log_index: Option<u64>,
-		prepared: PreparedTierDelivery,
+		prepared: Option<PreparedTierDelivery>,
+		lease: Option<&crate::consensus::TierSnapshotLease>,
 	) -> std::io::Result<()> {
 		let control_epoch = self.capture_snapshot_epoch();
 		let tier_lock = self.tier_publication_lock(pointer.slab_id);
@@ -792,23 +1083,29 @@ impl SlabManager {
 			last_control_log_index,
 			control_epoch,
 			false,
-			Some(prepared),
+			prepared,
+			lease,
 		)
 		.await
 	}
 
-	/// Caller owns this slab's tier publication lock, including authority comparison.
+	/// Caller owns this slab's tier publication lock, including authority comparison, and
+	/// `lease`, taken before that lock.
 	async fn apply_tier_slab_under_publication_lock(
 		&self,
 		pointer: TieredSlabPointer,
 		last_control_log_index: Option<u64>,
 		control_epoch: u64,
+		lease: Option<&crate::consensus::TierSnapshotLease>,
+		prepared: Option<PreparedTierDelivery>,
 	) -> std::io::Result<()> {
 		self.apply_tier_slab_under_publication_lock_as(
 			pointer,
 			last_control_log_index,
 			control_epoch,
 			false,
+			lease,
+			prepared,
 		)
 		.await
 	}
@@ -824,17 +1121,22 @@ impl SlabManager {
 		last_control_log_index: Option<u64>,
 		control_epoch: u64,
 		replay: bool,
+		lease: Option<&crate::consensus::TierSnapshotLease>,
+		prepared: Option<PreparedTierDelivery>,
 	) -> std::io::Result<()> {
 		self.apply_tier_slab_under_publication_lock_prepared(
 			pointer,
 			last_control_log_index,
 			control_epoch,
 			replay,
-			None,
+			prepared,
+			lease,
 		)
 		.await
 	}
 
+	/// ADR 0704: with a canonical source bound, `lease` is the caller's, taken before the slab
+	/// lock, and the publication installs `pointer` only while it is the committed generation.
 	async fn apply_tier_slab_under_publication_lock_prepared(
 		&self,
 		pointer: TieredSlabPointer,
@@ -842,12 +1144,52 @@ impl SlabManager {
 		control_epoch: u64,
 		replay: bool,
 		prepared: Option<PreparedTierDelivery>,
+		lease: Option<&crate::consensus::TierSnapshotLease>,
 	) -> std::io::Result<()> {
 		if last_control_log_index.is_none() {
 			self.require_cleanup_authority()?;
 		}
+		let lease = self.require_tier_lease(pointer.slab_id, lease)?;
 		if let Some(error) = self.tier_authority.integrity_error() {
 			return Err(error);
+		}
+		// ADR 0704: with a lease, the canonical standing is judged first, before any staging,
+		// deferral, replacement or other authority change this callback could cause. Only a
+		// current generation reaches the branches below. A callback an installed snapshot
+		// covers refuses first, as it does again under the gate.
+		let mut certified = super::certified_delivery::CertifiedPublication::Ordinary;
+		if let Some(lease) = lease {
+			if self.observer_is_superseded(last_control_log_index) {
+				return Ok(());
+			}
+			match self.tier_standing_of(lease, &pointer, last_control_log_index)? {
+				crate::consensus::TierStanding::Current => {}
+				crate::consensus::TierStanding::Superseded => {
+					// Nothing installed, staged or deferred: the newer state's own delivery,
+					// or a reconcile, installs it.
+					return Err(tier_publication_superseded(pointer.slab_id));
+				}
+				crate::consensus::TierStanding::Unknown => {
+					self.record_unknown_tier_standing(lease, &pointer, last_control_log_index)
+						.await?;
+					return Err(committed_standing_unknown(pointer.slab_id));
+				}
+			}
+			// ADR 0704: a current generation's class, from the ring's provenance.
+			certified = match self.classify_certified_publication(lease, &pointer).await? {
+				Ok(class) => class,
+				Err(fault) => {
+					return Err(self.fence_certified_publication(
+						&pointer,
+						fault,
+						last_control_log_index,
+					));
+				}
+			};
+		} else {
+			// ADR 0704: the no-source fallback refuses certified work it can see.
+			self.refuse_certified_work_without_source(pointer.slab_id)
+				.await?;
 		}
 		let _cleanup_guard = self.cleanup_claim(pointer.slab_id).lock_owned().await;
 		#[cfg(test)]
@@ -888,13 +1230,16 @@ impl SlabManager {
 				StaleLocationReason::Fenced,
 			));
 		}
-		if replay && !self.canonical_tier_pointer_is(&pointer) {
+		if replay && !self.canonical_tier_pointer_is(lease, &pointer) {
 			// A newer committed state owns the slab; its own callback resolves it.
 			return Err(stale_location_error(
 				pointer.slab_id,
 				StaleLocationReason::Fenced,
 			));
 		}
+		// ADR 0704: a certified generation staged or registered here as pending authority
+		// publishes only through verification, which applies the whole certified rule
+		// under the canonical lease it holds (`verify_certified_generation`).
 		if self.snapshot_install_in_flight() {
 			let own_dirty = self
 				.pending_index_publications
@@ -1003,6 +1348,11 @@ impl SlabManager {
 			}
 			return result;
 		}
+		// ADR 0704: object storage is never read under the lease: the entry point prepares with
+		// the lease and the slab lock released, then calls again. The standing was judged above.
+		if lease.is_some() && prepared.is_none() {
+			return Err(tier_publication_needs_preparation(pointer.slab_id));
+		}
 		let old_pointer = {
 			let state = self.state.lock().await;
 			state
@@ -1017,6 +1367,18 @@ impl SlabManager {
 			&& let DeferralOutcome::Refused(reason) = entry.value().outcome
 		{
 			return Err(stale_location_error(pointer.slab_id, reason));
+		}
+		// ADR 0704: a first certified publication deletes exactly its certificate's drop and
+		// inserts exactly the ring's postimage, or installs nothing.
+		if let super::certified_delivery::CertifiedPublication::Publish(expected) = &certified {
+			let rows = prepared.as_ref().and_then(PreparedTierDelivery::plan_rows);
+			if let Err(fault) = self.verify_certified_rows(expected, rows).await? {
+				return Err(self.fence_certified_publication(
+					&pointer,
+					fault,
+					last_control_log_index,
+				));
+			}
 		}
 		let already_published = old_pointer.as_ref() == Some(&pointer);
 		let result = match self.require_private_tier_apply_authority(pointer.slab_id) {
@@ -1045,6 +1407,8 @@ impl SlabManager {
 				self.unapplied_tier_pointers.remove(&pointer.slab_id);
 			}
 			Err(_) if already_published => {}
+			// ADR 0704: not a permanent refusal; the reconcile or the next pass retries it.
+			Err(error) if is_tier_delivery_moved(error) => {}
 			Err(error) => {
 				self.record_tier_deferral(
 					pointer.slab_id,
@@ -1189,11 +1553,11 @@ impl SlabManager {
 		let needs_plan = self.tier_delivery_needs_row_plan(&pointer, old_pointer.as_ref());
 		let refresh_plan = match prepared {
 			Some(prepared) => {
-				if prepared.old_pointer != old_pointer || prepared.plan.is_some() != needs_plan {
-					return Err(Error::new(
-						ErrorKind::WouldBlock,
-						"the published tier generation moved since this delivery was prepared",
-					));
+				if prepared.pointer != pointer
+					|| prepared.old_pointer != old_pointer
+					|| prepared.plan.is_some() != needs_plan
+				{
+					return Err(tier_delivery_moved(pointer.slab_id));
 				}
 				prepared.plan
 			}
@@ -1381,6 +1745,28 @@ impl SlabManager {
 			self.require_cleanup_authority()?;
 		}
 		let control_epoch = observed_epoch.unwrap_or_else(|| self.capture_snapshot_epoch());
+		let lease = self.canonical_tier_lease().await?;
+		self.retire_tiered_slab_leased(
+			slab_id,
+			last_control_log_index,
+			control_epoch,
+			lease.as_ref(),
+		)
+		.await
+	}
+
+	/// A retirement whose caller already holds `lease` (ADR 0704: the lease, then the slab
+	/// lock). Recovery delivers a decided Retire this way, under the lease it checked.
+	pub(super) async fn retire_tiered_slab_leased(
+		&self,
+		slab_id: SlabId,
+		last_control_log_index: Option<u64>,
+		control_epoch: u64,
+		lease: Option<&crate::consensus::TierSnapshotLease>,
+	) -> std::io::Result<bool> {
+		if last_control_log_index.is_none() {
+			self.require_cleanup_authority()?;
+		}
 		let tier_lock = self.tier_publication_lock(slab_id);
 		let _tier_guard = tier_lock.lock().await;
 		self.retire_tiered_slab_under_publication_lock(
@@ -1388,6 +1774,7 @@ impl SlabManager {
 			last_control_log_index,
 			control_epoch,
 			false,
+			lease,
 		)
 		.await
 	}
@@ -1405,7 +1792,15 @@ impl SlabManager {
 			if self.lsm_install_holds_slab(mark.pointer.slab_id) {
 				continue;
 			}
-			if let Err(error) = self.apply_snapshot_retirement(mark).await {
+			// ADR 0704: the lease, then the slab lock; it classifies the mark.
+			let lease = match self.canonical_tier_lease().await {
+				Ok(lease) => lease,
+				Err(error) => {
+					first_error.get_or_insert(error);
+					continue;
+				}
+			};
+			if let Err(error) = self.apply_snapshot_retirement(mark, lease.as_ref()).await {
 				first_error.get_or_insert(error);
 			}
 		}
@@ -1414,6 +1809,14 @@ impl SlabManager {
 			if self.lsm_install_holds_slab(slab_id) {
 				continue;
 			}
+			// ADR 0704: the lease, then the slab lock.
+			let lease = match self.canonical_tier_lease().await {
+				Ok(lease) => lease,
+				Err(error) => {
+					first_error.get_or_insert(error);
+					continue;
+				}
+			};
 			let tier_lock = self.tier_publication_lock(slab_id);
 			let _tier_guard = tier_lock.lock().await;
 			match index.deferred_retirement_is_owed(row.clone()).await {
@@ -1451,6 +1854,7 @@ impl SlabManager {
 					Some(row.log_index),
 					epoch,
 					true,
+					lease.as_ref(),
 				)
 				.await
 			{
@@ -1461,16 +1865,36 @@ impl SlabManager {
 		first_error.map_or(Ok(()), Err)
 	}
 
-	/// Caller owns this slab's tier publication lock, including authority comparison.
+	/// Caller owns this slab's tier publication lock, including authority comparison, and
+	/// `lease`, taken before that lock. ADR 0704: with a canonical source bound, it retires
+	/// only while a retirement is in force in the lease's state; otherwise nothing is retired
+	/// or recorded, and it refuses typed.
 	async fn retire_tiered_slab_under_publication_lock(
 		&self,
 		slab_id: SlabId,
 		last_control_log_index: Option<u64>,
 		control_epoch: u64,
 		deferred_row: bool,
+		lease: Option<&crate::consensus::TierSnapshotLease>,
 	) -> std::io::Result<bool> {
 		if last_control_log_index.is_none() {
 			self.require_cleanup_authority()?;
+		}
+		if let Some(lease) = self.require_tier_lease(slab_id, lease)? {
+			let owner = self.owner_ref()?;
+			if !lease.retirement_in_force(owner.slab(slab_id)) {
+				self.fence_unproven_local_tier(lease, slab_id).await?;
+				return Err(committed_standing_unknown(slab_id));
+			}
+			// ADR 0704: deletion authority only from a certified retirement's exact evidence.
+			if let Err(fault) = self.classify_certified_retirement(lease, slab_id).await? {
+				return Err(self
+					.fence_certified_retirement(slab_id, fault, last_control_log_index)
+					.await);
+			}
+		} else {
+			// ADR 0704: the no-source fallback refuses certified work it can see.
+			self.refuse_certified_work_without_source(slab_id).await?;
 		}
 		let _cleanup_guard = self.cleanup_claim(slab_id).lock_owned().await;
 		let gate = match tokio::time::timeout(
@@ -1694,9 +2118,13 @@ impl SlabManager {
 	}
 
 	/// Apply a snapshot-authorized retirement, or leave it for a newer snapshot.
+	/// ADR 0704: `lease`, when the caller holds one, is the coherent state the mark came
+	/// from (the installed snapshot, or the canonical state for a held mark); it is taken
+	/// before this slab's lock.
 	pub(super) async fn apply_snapshot_retirement(
 		&self,
 		mark: crate::storage::index::SnapshotRetirementMark,
+		lease: Option<&crate::consensus::TierSnapshotLease>,
 	) -> std::io::Result<bool> {
 		let slab_id = mark.pointer.slab_id;
 		let tier_lock = self.tier_publication_lock(slab_id);
@@ -1753,6 +2181,14 @@ impl SlabManager {
 						.provenance
 						.is_some_and(|index| mark.snapshot_index.is_none_or(|mark| index > mark))
 			}) {
+			return Ok(false);
+		}
+		// ADR 0704: a slab the ring removed while this store holds it. Deletion authority
+		// only from an exact certified retirement in the coherent state; without one, a
+		// marked store keeps a non-empty preimage fenced, and the mark stays owed.
+		if let Err(fault) = self.classify_snapshot_retirement(lease, slab_id).await? {
+			self.fence_certified_retirement(slab_id, fault, mark.snapshot_index)
+				.await;
 			return Ok(false);
 		}
 		let rows = self.record_rows_for_tier_retirement(slab_id);
@@ -2969,6 +3405,128 @@ pub(super) fn tier_refresh_prepare_bytes(old: usize, new: usize) -> Option<u64> 
 
 /// What a tier delivery fetched before it held any authority.
 pub(super) struct PreparedTierDelivery {
+	/// The pointer this was prepared for: it publishes nothing else.
+	pointer: TieredSlabPointer,
 	old_pointer: Option<TieredSlabPointer>,
 	plan: Option<TieredRowRefreshPlan>,
+}
+
+impl PreparedTierDelivery {
+	/// ADR 0704: the rows its publication would delete and insert (old, new), if it moves any.
+	pub(super) fn plan_rows(&self) -> Option<(&[PersistentRecordRow], &[PersistentRecordRow])> {
+		self.plan
+			.as_ref()
+			.map(|plan| (plan.old_rows.as_slice(), plan.new_rows.as_slice()))
+	}
+}
+
+/// ADR 0704: the committed state proved this tier publication superseded: a newer generation,
+/// or a retirement in force, was written after its own command applied. Nothing was installed
+/// and nothing was deferred; the newer state's own delivery installs it.
+#[derive(Debug)]
+pub(crate) struct TierPublicationSuperseded(SlabId);
+
+impl std::fmt::Display for TierPublicationSuperseded {
+	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(
+			formatter,
+			"tier publication for slab {} is superseded by the committed state",
+			self.0.get()
+		)
+	}
+}
+
+impl std::error::Error for TierPublicationSuperseded {}
+
+fn tier_publication_superseded(slab_id: SlabId) -> Error {
+	Error::new(ErrorKind::WouldBlock, TierPublicationSuperseded(slab_id))
+}
+
+/// Whether `error` is a [`TierPublicationSuperseded`] refusal.
+pub(crate) fn is_tier_publication_superseded(error: &Error) -> bool {
+	error
+		.get_ref()
+		.is_some_and(|inner| inner.is::<TierPublicationSuperseded>())
+}
+
+/// ADR 0704: a publication under the canonical lease reached the point where it needs what
+/// object storage holds. It installed nothing and recorded nothing: its entry point releases
+/// the slab lock and the lease, prepares, and tries once more with what it prepared.
+#[derive(Debug)]
+pub(super) struct TierPublicationNeedsPreparation(SlabId);
+
+impl std::fmt::Display for TierPublicationNeedsPreparation {
+	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(
+			formatter,
+			"tier publication for slab {} needs preparation outside the canonical lease",
+			self.0.get()
+		)
+	}
+}
+
+impl std::error::Error for TierPublicationNeedsPreparation {}
+
+fn tier_publication_needs_preparation(slab_id: SlabId) -> Error {
+	Error::new(
+		ErrorKind::WouldBlock,
+		TierPublicationNeedsPreparation(slab_id),
+	)
+}
+
+/// Whether `error` is a [`TierPublicationNeedsPreparation`] signal.
+pub(super) fn needs_tier_preparation(error: &Error) -> bool {
+	error
+		.get_ref()
+		.is_some_and(|inner| inner.is::<TierPublicationNeedsPreparation>())
+}
+
+/// ADR 0704: what a delivery prepared is not for the generation it would now replace (the
+/// published generation moved), or it still lacked a preparation after its one retry. Not a
+/// permanent refusal: nothing is deferred, and the reconcile or the next pass retries.
+#[derive(Debug)]
+pub(super) struct TierDeliveryMoved(SlabId);
+
+impl std::fmt::Display for TierDeliveryMoved {
+	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(
+			formatter,
+			"the published tier generation of slab {} moved since this delivery was prepared",
+			self.0.get()
+		)
+	}
+}
+
+impl std::error::Error for TierDeliveryMoved {}
+
+pub(super) fn tier_delivery_moved(slab_id: SlabId) -> Error {
+	Error::new(ErrorKind::WouldBlock, TierDeliveryMoved(slab_id))
+}
+
+fn is_tier_delivery_moved(error: &Error) -> bool {
+	error
+		.get_ref()
+		.is_some_and(|inner| inner.is::<TierDeliveryMoved>())
+}
+
+/// ADR 0704: the committed state proves this publication or retirement neither current (in
+/// force) nor superseded. Nothing is installed or retired; a `Fenced` refusal with its cause.
+fn committed_standing_unknown(slab_id: SlabId) -> Error {
+	fenced_error(
+		ErrorKind::WouldBlock,
+		slab_id,
+		FenceCause::CommittedStanding,
+	)
+}
+
+/// ADR 0704: a canonical source is bound, so committed tier state is installed or retired only
+/// under its lease. A caller that passed none is refused, loudly, whatever it would have done.
+fn tier_publication_unleased(slab_id: SlabId) -> Error {
+	Error::new(
+		ErrorKind::WouldBlock,
+		format!(
+			"tier publication for slab {} needs the canonical lease its source is bound to",
+			slab_id.get()
+		),
+	)
 }

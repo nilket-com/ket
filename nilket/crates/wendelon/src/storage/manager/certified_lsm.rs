@@ -40,6 +40,37 @@ pub struct CertifiedSelection {
 }
 
 impl CertifiedSelection {
+	/// ADR 0704: the same rule over one tiered slab's records, bound to that
+	/// job and its source rows digest (held where an LSM job holds its inputs').
+	pub(crate) fn decide_tiered(
+		job: &super::certified_tier::TierCertifiedJob,
+		facts: &CoherentFacts,
+		evidence: &[ContentEvidence],
+	) -> std::io::Result<Self> {
+		if facts.candidates() != job.versions().as_slice() {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				"the facts were not read for this job's versions",
+			));
+		}
+		Ok(Self {
+			members: decide_members(job.entries(), job.frame_tables(), facts, evidence),
+			active_gid: facts.active_gid(),
+			job_fingerprint: job.fingerprint(),
+			input_rows_digest: job.source_rows_digest(),
+		})
+	}
+
+	/// The durable rows digest the selection was decided over.
+	pub(crate) fn input_rows_digest(&self) -> [u8; 32] {
+		self.input_rows_digest
+	}
+
+	/// The member table of a durable row's version, if the selection names it.
+	pub(crate) fn member_table_of_row(&self, row: &PersistentRecordRow) -> Option<TableObjectId> {
+		self.members.get(&row_member_key(row)).copied()
+	}
+
 	/// Whether the selection names this record's version.
 	pub(crate) fn selects(&self, record: &VersionEntry) -> bool {
 		self.members.contains_key(&member_key(record))
@@ -81,17 +112,26 @@ pub(crate) enum FrameTable {
 /// The table `frame` stamps for row `row`. Only a frame that is not multi-row,
 /// or carries no table column, is untyped; a decoding error is malformed.
 pub(crate) fn frame_table_of(frame: &[u8], row: RecordRowIndex) -> FrameTable {
+	frame_tables_of(frame, &[row])[0]
+}
+
+/// ADR 0704: [`frame_table_of`] for each of `rows`, decoding the frame once.
+pub(crate) fn frame_tables_of(frame: &[u8], rows: &[RecordRowIndex]) -> Vec<FrameTable> {
+	let every = |table: FrameTable| vec![table; rows.len()];
 	match storage_multirow_index_entries_from_frame(frame) {
-		Ok(None) => FrameTable::Untyped,
+		Ok(None) => every(FrameTable::Untyped),
 		Ok(Some(_)) => match decode_record_batch(frame) {
-			Ok(batch) => match storage_row_table_object_id_at(&batch, row) {
-				Ok(Some(table)) => FrameTable::Stamped(table),
-				Ok(None) => FrameTable::Untyped,
-				Err(_) => FrameTable::Malformed,
-			},
-			Err(_) => FrameTable::Malformed,
+			Ok(batch) => rows
+				.iter()
+				.map(|row| match storage_row_table_object_id_at(&batch, *row) {
+					Ok(Some(table)) => FrameTable::Stamped(table),
+					Ok(None) => FrameTable::Untyped,
+					Err(_) => FrameTable::Malformed,
+				})
+				.collect(),
+			Err(_) => every(FrameTable::Malformed),
 		},
-		Err(_) => FrameTable::Malformed,
+		Err(_) => every(FrameTable::Malformed),
 	}
 }
 
@@ -137,7 +177,7 @@ fn member_key(entry: &VersionEntry) -> CertifiedMemberKey {
 	)
 }
 
-fn row_member_key(row: &PersistentRecordRow) -> CertifiedMemberKey {
+pub(super) fn row_member_key(row: &PersistentRecordRow) -> CertifiedMemberKey {
 	(
 		row.tenant_id,
 		row.key_identity,
@@ -233,13 +273,21 @@ pub(super) async fn residual_tables(
 }
 
 /// Recovery: the residual input rows are exactly the certificate's drop.
+/// The canonical drop of residual rows, each with its durable debt record's
+/// table; `None` when one has no established table.
+pub(super) fn residual_drop(
+	residual: &[PersistentRecordRow],
+	tables: &BTreeMap<VersionRef, TableObjectId>,
+) -> Option<DropSummary> {
+	canonical_drop(residual, |row| tables.get(&row_version_ref(row)).copied()).ok()
+}
+
 pub(super) fn residual_matches_certificate(
 	residual: &[PersistentRecordRow],
 	tables: &BTreeMap<VersionRef, TableObjectId>,
 	certificate: &LsmCertificate,
 ) -> Result<(), &'static str> {
-	let table_of = |row: &PersistentRecordRow| tables.get(&row_version_ref(row)).copied();
-	let Ok(summary) = canonical_drop(residual, table_of) else {
+	let Some(summary) = residual_drop(residual, tables) else {
 		return Err("a dropped row has no durable identity");
 	};
 	if summary.drop_digest != certificate.drop_digest
@@ -288,8 +336,9 @@ impl CertifiedSelection {
 
 /// The members of a selection, from the entries of a job (with their frame
 /// tables), facts read for exactly their versions, and content evidence. See
-/// [`CertifiedSelection::decide`] for the rule.
-fn decide_members(
+/// [`CertifiedSelection::decide`] for the rule. ADR 0704 applies it unchanged
+/// to a tiered slab's records.
+pub(super) fn decide_members(
 	entries: &[VersionEntry],
 	frame_tables: &[FrameTable],
 	facts: &CoherentFacts,
@@ -648,6 +697,19 @@ impl SlabManager {
 		plan.elision = PlanElision::Certified(Arc::new(selection));
 		self.run_claimed_lsm_via_control_ring(worker, plan, committer, Some(context))
 			.await
+	}
+}
+
+#[cfg(test)]
+impl CertifiedSelection {
+	/// Test-only: a selection naming exactly `members`.
+	pub(crate) fn for_test(members: BTreeMap<CertifiedMemberKey, TableObjectId>) -> Self {
+		Self {
+			members,
+			active_gid: 0,
+			job_fingerprint: [0; 32],
+			input_rows_digest: [0; 32],
+		}
 	}
 }
 

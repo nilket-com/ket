@@ -3124,11 +3124,78 @@ pub struct TierSnapshotSource(std::sync::Weak<RwLock<SmInner>>);
 
 pub(crate) struct TierSnapshotLease(tokio::sync::OwnedRwLockReadGuard<SmInner>);
 
+/// ADR 0704: `TierSnapshotLease::certified_retirement` over one coherent state.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn certified_retirement_in(
+	state: &SmState,
+	owner: OwnerRef,
+	slab: SlabRef,
+) -> std::io::Result<Option<crate::consensus::slab_ops::CertifiedRetirement>> {
+	use crate::consensus::slab_ops::RecordedOutcome;
+	let current = state
+		.incarnations
+		.get(&owner.node())
+		.is_some_and(|registry| registry.current == Some(owner.incarnation()));
+	if !current || slab.owner() != owner {
+		return Ok(None);
+	}
+	let Some(table) = state.op_tables.get(&owner) else {
+		return Ok(None);
+	};
+	let mut matches = table.outcomes.iter().filter_map(|(op_seq, entry)| {
+		let retirement = entry.retirement.as_ref()?;
+		let own = retirement.op.owner == owner && retirement.op.op_seq == *op_seq;
+		(own && retirement.slab == slab && matches!(entry.outcome, RecordedOutcome::Applied { .. }))
+			.then(|| retirement.clone())
+	});
+	let found = matches.next();
+	if matches.next().is_some() {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			InconsistentCertifiedRetirement { slab },
+		));
+	}
+	Ok(found)
+}
+
+/// ADR 0704: more than one retained certified retirement names one slab. Never
+/// resolved by choosing one: the caller refuses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// ADR 0704 stage 2b's certified delivery reads it; stage 2a pins it with controls.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct InconsistentCertifiedRetirement {
+	pub(crate) slab: SlabRef,
+}
+
+impl std::fmt::Display for InconsistentCertifiedRetirement {
+	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(
+			formatter,
+			"several retained certified retirements name {:?}",
+			self.slab
+		)
+	}
+}
+
+impl std::error::Error for InconsistentCertifiedRetirement {}
+
+/// ADR 0704: how a tier publication stands against the committed state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TierStanding {
+	/// The committed generation is exactly the one being published.
+	Current,
+	/// Proved replaced or retired after the publication's own command applied.
+	Superseded,
+	/// Neither: not provable from this state. Nothing is installed or handed off.
+	Unknown,
+}
+
 impl TierSnapshotSource {
 	/// The committed tier record for `slab`, with its owner node's registry
 	/// from the same state, without waiting: `WouldBlock` when the state
 	/// machine is busy, so a caller holding observer-side locks never waits
-	/// on the apply loop.
+	/// on the apply loop. ADR 0704: production reads it from a held lease.
+	#[cfg(test)]
 	pub(crate) fn try_tiered_slab(
 		&self,
 		slab: SlabRef,
@@ -3179,8 +3246,113 @@ impl TierSnapshotLease {
 	pub(crate) fn revision(&self) -> u64 {
 		self.0.tier_revision
 	}
+	/// ADR 0704: where installing tier generation `want` for `slab` stands in
+	/// this one coherent state. `applied_at` is the log index at which the
+	/// command that set `want` applied (an observer's event, or a recovered op's
+	/// recorded `Applied` index for its current owner). That command set the
+	/// pointer to `want`, and apply is deterministic, so a different committed
+	/// generation, or no pointer with the slab permanently removed, was written
+	/// after it: superseded. Anything else that is not current is unknown.
+	pub(crate) fn tier_standing(
+		&self,
+		slab: SlabRef,
+		want: &crate::consensus::slab_ops::TierGeneration,
+		applied_at: Option<u64>,
+	) -> TierStanding {
+		let state = &self.0.state;
+		let committed = state
+			.tiered_slabs
+			.get(&slab)
+			.map(crate::consensus::slab_ops::TierGeneration::from);
+		if committed.as_ref() == Some(want) {
+			return TierStanding::Current;
+		}
+		let applied_before = applied_at
+			.zip(state.last_applied_log_id.map(|id| id.index))
+			.is_some_and(|(at, last)| at <= last);
+		if applied_before && (committed.is_some() || self.slab_removed(slab)) {
+			TierStanding::Superseded
+		} else {
+			TierStanding::Unknown
+		}
+	}
+
+	/// ADR 0704: a retirement of `slab` is in force: no committed pointer, and
+	/// the slab permanently removed. No pointer alone is not terminal.
+	pub(crate) fn retirement_in_force(&self, slab: SlabRef) -> bool {
+		!self.0.state.tiered_slabs.contains_key(&slab) && self.slab_removed(slab)
+	}
+
+	/// The committed tier record of `slab` in this state.
+	pub(crate) fn committed_tier(&self, slab: SlabRef) -> Option<TieredSlab> {
+		self.0.state.tiered_slabs.get(&slab).cloned()
+	}
+
+	/// ADR 0704: the committed generation's certified provenance for `slab`, if its
+	/// pointer is a certified rewrite's. `None` for no pointer or an ordinary one.
+	// ADR 0704 stage 2b's certified delivery reads it; stage 2a pins it with controls.
+	#[cfg_attr(not(test), allow(dead_code))]
+	pub(crate) fn committed_provenance(
+		&self,
+		slab: SlabRef,
+	) -> Option<crate::consensus::slab_ops::CertifiedProvenance> {
+		self.0
+			.state
+			.tiered_slabs
+			.get(&slab)
+			.and_then(|tier| tier.certified.clone())
+	}
+
+	/// ADR 0704: the certified retirement of `slab` that `owner` still retains, from
+	/// a bounded scan of its retained outcomes. Only an `Applied` entry of the exact
+	/// owner, while it is its node's current incarnation, naming exactly this slab,
+	/// matches; a rejected or conflicting entry never does. Several matches are
+	/// inconsistent and refuse, typed, rather than select one.
+	// ADR 0704 stage 2b's certified delivery reads it; stage 2a pins it with controls.
+	#[cfg_attr(not(test), allow(dead_code))]
+	pub(crate) fn certified_retirement(
+		&self,
+		owner: OwnerRef,
+		slab: SlabRef,
+	) -> std::io::Result<Option<crate::consensus::slab_ops::CertifiedRetirement>> {
+		certified_retirement_in(&self.0.state, owner, slab)
+	}
+
+	fn slab_removed(&self, slab: SlabRef) -> bool {
+		self.0
+			.state
+			.slab_terminal
+			.get(&slab.owner())
+			.is_some_and(|terminal| terminal.removed.contains(slab.local_id()))
+	}
+
 	pub(crate) fn tiers(&self) -> Vec<TieredSlab> {
 		self.0.state.tiered_slabs.values().cloned().collect()
+	}
+
+	/// ADR 0704: the digest `key` was decided Applied under, while its outcome is
+	/// retained. `None` when it is absent, pruned or not Applied.
+	pub(crate) fn applied_op_digest(
+		&self,
+		key: crate::consensus::slab_ops::OpKey,
+	) -> Option<[u8; 32]> {
+		use crate::consensus::slab_ops::RecordedOutcome;
+		self.0
+			.state
+			.op_tables
+			.get(&key.owner)
+			.and_then(|table| table.outcomes.get(&key.op_seq))
+			.filter(|entry| matches!(entry.outcome, RecordedOutcome::Applied { .. }))
+			.map(|entry| entry.digest)
+	}
+
+	/// ADR 0704: whether `owner` is its node's current incarnation in this state.
+	pub(crate) fn owner_is_current(&self, owner: OwnerRef) -> bool {
+		self.0
+			.state
+			.incarnations
+			.get(&owner.node())
+			.is_some_and(|registry| registry.current == Some(owner.incarnation()))
 	}
 	/// Whether `key` is decided Applied under `digest` and its owner is still its
 	/// node's current incarnation, from this one coherent state (ADR 0697 §5.5).
@@ -4530,9 +4702,29 @@ impl WendelonStateMachine {
 	}
 
 	#[cfg(test)]
+	/// Removes `slab`'s committed pointer and ends its identity, as a ring Retire leaves it
+	/// (ADR 0704 reads this as a retirement in force).
 	pub async fn retire_tiered_slab_for_test(&self, slab: SlabRef) {
+		self.remove_tiered_slab_for_test(slab, true).await;
+	}
+
+	#[cfg(test)]
+	/// Removes `slab`'s committed pointer without ending its identity, as no ring command
+	/// does: a state that proves a tier publication neither current nor superseded (ADR 0704).
+	pub async fn drop_tiered_slab_pointer_for_test(&self, slab: SlabRef) {
+		self.remove_tiered_slab_for_test(slab, false).await;
+	}
+
+	#[cfg(test)]
+	/// The one seeding writer behind both removals above.
+	async fn remove_tiered_slab_for_test(&self, slab: SlabRef, end_identity: bool) {
 		let mut guard = self.inner.write().await;
 		guard.state.tiered_slabs.remove(&slab);
+		if end_identity {
+			let terminal = guard.state.slab_terminal.entry(slab.owner()).or_default();
+			terminal.claimed.remove(&slab.local_id());
+			terminal.removed.insert(slab.local_id());
+		}
 	}
 }
 
@@ -13941,7 +14133,8 @@ mod recovery_tests {
 		let (wal, vote, snapshot) = artifact_paths(&dir);
 		let page = wal_page_with_format_version(
 			serialize_entry_page(&lease_entry(1, 0, 9, 1)).unwrap(),
-			9,
+			// No build has written 17: Today writes 15, ParentDecisions 16.
+			17,
 		);
 		write_wal_pages(&wal, &[page]);
 
@@ -13951,7 +14144,7 @@ mod recovery_tests {
 			Err(error) => error.to_string(),
 		};
 		assert!(
-			error.contains('9'),
+			error.contains("17"),
 			"the refusal names the version: {error}"
 		);
 		assert!(
@@ -19774,6 +19967,7 @@ mod tiered_slab_tests {
 		SlabCommand::Retire(RetireOp {
 			slab,
 			expected: TierGeneration::from(&tier(slab)),
+			certified: None,
 		})
 	}
 
@@ -19812,6 +20006,7 @@ mod tiered_slab_tests {
 			stats_block_hash128: None,
 			tombstone_metadata: TombstoneMetadata::None,
 			supersession_metadata: SupersessionMetadata::None,
+			certified: None,
 		}
 	}
 
@@ -20178,6 +20373,7 @@ mod tenant_kek_tests {
 				stats_block_hash128: None,
 				tombstone_metadata: TombstoneMetadata::None,
 				supersession_metadata: SupersessionMetadata::None,
+				certified: None,
 			},
 		);
 
@@ -20276,11 +20472,11 @@ mod tenant_kek_tests {
 
 	#[test]
 	fn adr0085_snapshot_from_a_newer_build_is_refused_by_name() {
-		let bytes = snapshot_bytes_with_format_version(&SmState::default(), 9);
+		let bytes = snapshot_bytes_with_format_version(&SmState::default(), 17);
 		let error = decode_snapshot_reader(bytes.as_slice())
 			.expect_err("a version this build does not know must be refused");
 		assert!(
-			error.contains('9'),
+			error.contains("17"),
 			"the refusal names the version: {error}"
 		);
 		assert!(
@@ -20317,6 +20513,20 @@ pub(crate) mod body_format_corpus {
 			1,
 			StoreIncarnation::from_raw(0x0697_0697_0697_0697_0697_0697_0697_0697),
 		)
+	}
+
+	/// The generation a certified corpus body replaced or retired (ADR 0704).
+	pub(crate) fn canonical_source_generation() -> crate::consensus::slab_ops::TierGeneration {
+		crate::consensus::slab_ops::TierGeneration {
+			l2_uri: "l2://slab/2".to_string(),
+			payload_hash: [0x22; 32],
+			is_encrypted: false,
+			tenant_id: None,
+			tenant_kek_id: None,
+			stats_format_version: None,
+			stats_block_len: None,
+			stats_block_hash128: None,
+		}
 	}
 	use crate::crypto::WrappedTenantKek;
 	use crate::integration::compute::{DropOperationId, SchemaGeneration};
@@ -20772,8 +20982,17 @@ pub(crate) mod body_format_corpus {
 								stats_block_hash128: None,
 								tombstone_metadata: TombstoneMetadata::default(),
 								supersession_metadata: SupersessionMetadata::default(),
+								// ADR 0704: the corpus pins a certified Tier's provenance.
+								certified: Some(crate::consensus::slab_ops::CertifiedProvenance {
+									op: crate::consensus::slab_ops::OpKey {
+										owner: canonical_owner(),
+										op_seq: 1,
+									},
+									source: canonical_source_generation(),
+									postimage_rows_digest: [0x55; 32],
+								}),
 							},
-							replaces: None,
+							replaces: Some(canonical_source_generation()),
 						},
 					),
 				}),
@@ -20895,6 +21114,13 @@ pub(crate) mod body_format_corpus {
 								index: 9,
 							},
 							acked: true,
+							// ADR 0704: the corpus pins an applied certified
+							// retirement's retained link.
+							retirement: Some(crate::consensus::slab_ops::CertifiedRetirement {
+								op: crate::consensus::slab_ops::OpKey { owner, op_seq: 4 },
+								slab: owner.slab(SlabId::new(80)),
+								source: body_format_corpus::canonical_source_generation(),
+							}),
 						},
 					),
 					(
@@ -20906,6 +21132,7 @@ pub(crate) mod body_format_corpus {
 								index: 10,
 							},
 							acked: false,
+							retirement: None,
 						},
 					),
 				]),
@@ -20923,6 +21150,12 @@ pub(crate) mod body_format_corpus {
 			stats_block_hash128: None,
 			tombstone_metadata: TombstoneMetadata::default(),
 			supersession_metadata: SupersessionMetadata::default(),
+			// ADR 0704: the corpus pins a committed certified generation.
+			certified: Some(crate::consensus::slab_ops::CertifiedProvenance {
+				op: crate::consensus::slab_ops::OpKey { owner, op_seq: 3 },
+				source: body_format_corpus::canonical_source_generation(),
+				postimage_rows_digest: [0x56; 32],
+			}),
 		};
 		state.tiered_slabs.insert(tier.slab, tier);
 		state
@@ -21035,25 +21268,31 @@ pub(crate) mod body_format_corpus {
 		include_str!("../../tests/fixtures/consensus_body/wal_v7_entries.txt");
 	const SNAPSHOT_V7_OUTGOING_MANIFEST: &str =
 		include_str!("../../tests/fixtures/consensus_body/snapshot_v7.txt");
-	const WAL_V8_MANIFEST: &str =
+	// ADR 0697's v8 bodies, retained only as refusal inputs since ADR 0704 (no
+	// certified tier provenance).
+	const WAL_V8_OUTGOING_MANIFEST: &str =
 		include_str!("../../tests/fixtures/consensus_body/wal_v8_entries.txt");
-	const SNAPSHOT_V8_MANIFEST: &str =
+	const SNAPSHOT_V8_OUTGOING_MANIFEST: &str =
 		include_str!("../../tests/fixtures/consensus_body/snapshot_v8.txt");
+	const WAL_V15_MANIFEST: &str =
+		include_str!("../../tests/fixtures/consensus_body/wal_v15_entries.txt");
+	const SNAPSHOT_V15_MANIFEST: &str =
+		include_str!("../../tests/fixtures/consensus_body/snapshot_v15.txt");
 
 	#[test]
-	fn adr0697_current_wal_v8_and_snapshot_v8_match_stored_goldens() {
-		let stored_wal = parse_manifest(WAL_V8_MANIFEST);
+	fn adr0704_current_wal_v15_and_snapshot_v15_match_stored_goldens() {
+		let stored_wal = parse_manifest(WAL_V15_MANIFEST);
 		let corpus = wal_corpus();
 		assert_eq!(stored_wal.len(), corpus.len());
 		for (name, bytes) in corpus {
 			assert_eq!(
 				hex(&bytes),
 				hex(&stored_wal[name]),
-				"WAL v8 body moved for {name}; bump the format and add a refusal fixture"
+				"WAL v15 body moved for {name}; bump the format and add a refusal fixture"
 			);
 		}
 
-		let stored_snapshot = parse_manifest(SNAPSHOT_V8_MANIFEST);
+		let stored_snapshot = parse_manifest(SNAPSHOT_V15_MANIFEST);
 		let state = canonical_current_sm_state();
 		assert_eq!(
 			hex(&postcard::to_stdvec(&state).unwrap()),
@@ -21064,7 +21303,7 @@ pub(crate) mod body_format_corpus {
 		assert!(!state.tiered_slabs.is_empty() && !state.incarnations.is_empty());
 	}
 
-	/// Every stored pre-v8 body, by the version it was written at.
+	/// Every stored pre-v15 body, by the version it was written at.
 	fn historical_bodies(manifests: &[(u8, &'static str)]) -> Vec<(u8, String, Vec<u8>)> {
 		manifests
 			.iter()
@@ -21076,10 +21315,10 @@ pub(crate) mod body_format_corpus {
 			.collect()
 	}
 
-	/// ADR 0697: a snapshot written at any earlier version, including before
-	/// format versioning, is refused before its body is decoded.
+	/// ADR 0697, ADR 0704: a snapshot written at any earlier version, including
+	/// before format versioning, is refused before its body is decoded.
 	#[test]
-	fn adr0697_every_pre_v8_snapshot_body_is_refused_before_decode() {
+	fn adr0704_every_pre_v15_snapshot_body_is_refused_before_decode() {
 		let bodies = historical_bodies(&[
 			(0, V1_SNAPSHOT_MANIFEST),
 			(1, V1_SNAPSHOT_MANIFEST),
@@ -21089,6 +21328,7 @@ pub(crate) mod body_format_corpus {
 			(5, SNAPSHOT_V5_MANIFEST),
 			(6, SNAPSHOT_V6_OUTGOING_MANIFEST),
 			(7, SNAPSHOT_V7_OUTGOING_MANIFEST),
+			(8, SNAPSHOT_V8_OUTGOING_MANIFEST),
 		]);
 		assert!(bodies.len() >= 6);
 		for (version, name, body) in bodies {
@@ -21132,10 +21372,10 @@ pub(crate) mod body_format_corpus {
 		assert_eq!(root2[0], 26, "Root2Command keeps its wire position");
 	}
 
-	/// ADR 0697: a WAL record written at any earlier version, including before
-	/// format versioning, is refused before its payload is decoded.
+	/// ADR 0697, ADR 0704: a WAL record written at any earlier version, including
+	/// before format versioning, is refused before its payload is decoded.
 	#[test]
-	fn adr0697_every_pre_v8_wal_body_is_refused_before_decode() {
+	fn adr0704_every_pre_v15_wal_body_is_refused_before_decode() {
 		let bodies = historical_bodies(&[
 			(0, WAL_V4_MANIFEST),
 			(1, V1_WAL_MANIFEST),
@@ -21145,6 +21385,7 @@ pub(crate) mod body_format_corpus {
 			(5, WAL_V5_OUTGOING_MANIFEST),
 			(6, WAL_V6_OUTGOING_MANIFEST),
 			(7, WAL_V7_OUTGOING_MANIFEST),
+			(8, WAL_V8_OUTGOING_MANIFEST),
 		]);
 		assert!(bodies.len() >= 6);
 		let fixed_size = std::mem::size_of::<RaftLogEntryFixed>();
@@ -21200,7 +21441,7 @@ pub(crate) mod body_format_corpus {
 		for (name, bytes) in wal_corpus() {
 			wal.push_str(&format!("{name}={}\n", hex(&bytes)));
 		}
-		std::fs::write(dir.join("wal_v8_entries.txt"), wal).unwrap();
+		std::fs::write(dir.join("wal_v15_entries.txt"), wal).unwrap();
 		let mut mutations = String::new();
 		for (name, mutation) in canonical_mutations() {
 			mutations.push_str(&format!(
@@ -21220,7 +21461,7 @@ pub(crate) mod body_format_corpus {
 			hex(&postcard::to_stdvec(&state).unwrap()),
 			hex(&postcard::to_stdvec(&entry).unwrap())
 		);
-		std::fs::write(dir.join("snapshot_v8.txt"), snapshot).unwrap();
+		std::fs::write(dir.join("snapshot_v15.txt"), snapshot).unwrap();
 		println!("manifests written to {}", dir.display());
 	}
 }

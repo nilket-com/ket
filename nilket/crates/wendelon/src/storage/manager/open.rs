@@ -518,6 +518,12 @@ impl SlabManager {
 				"LSM certificates without their install intents; certified LSM stays fenced"
 			);
 		}
+		// ADR 0704: the same for certified tiered operations, every shape of
+		// disagreement between an intent and its certificate.
+		let certified_tier_fence = certified_tier::certified_tier_fence_at_open(
+			persistent_index.as_deref().filter(|_| snapshot.is_some()),
+		)
+		.await;
 		// ADR 0099: the durable rows double as slab recovery's boundary
 		// oracle. A row exists only for a record that was fdatasynced and
 		// then acknowledged, so its offset is a place the walk may resume
@@ -1126,6 +1132,8 @@ impl SlabManager {
 			conflicted_locations: DashSet::new(),
 			versions_contained: AtomicBool::new(contained),
 			certified_lsm_fenced: AtomicBool::new(!orphan_lsm_certificates.is_empty()),
+			certified_tier_fence,
+			certified_tier_cursor: std::sync::atomic::AtomicU64::new(0),
 			unverified_tier_slabs: DashSet::new(),
 			tier_authority: tier_authority::TierAuthority::new(),
 			installed_snapshot_index: std::sync::RwLock::new(None),

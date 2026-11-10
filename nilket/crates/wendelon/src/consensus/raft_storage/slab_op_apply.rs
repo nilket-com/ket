@@ -5,9 +5,9 @@
 
 use super::*;
 use crate::consensus::slab_ops::{
-	AckOutcomes, AckReceipt, BurnOp, CancelOp, ClaimOp, CompleteOp, GcRemove, OPS_WINDOW_W,
-	OpEntry, OpKey, OpOutcome, OpReceipt, OpResponse, OwnerTerminal, RecordedOutcome, RetireOp,
-	SlabCommand, SlabOp, SlabRejection, TierGeneration, TierOp,
+	AckOutcomes, AckReceipt, BurnOp, CancelOp, CertifiedRetirement, ClaimOp, CompleteOp, GcRemove,
+	OPS_WINDOW_W, OpEntry, OpKey, OpOutcome, OpReceipt, OpResponse, OwnerTerminal, RecordedOutcome,
+	RetireOp, SlabCommand, SlabOp, SlabRejection, TierGeneration, TierOp,
 };
 use crate::schema::CompactionJobId;
 
@@ -99,8 +99,59 @@ fn require_claim_held(
 	Err(Box::new(SlabRejection::NotClaimedBy { current }))
 }
 
+/// ADR 0704: certified provenance must name its own operation, the generation its
+/// command replaces or retires, and (for a retirement) its own slab. A proposer's
+/// link to another operation is never trusted. In ParentDecisions mode (the state
+/// carries decisions) a retirement must carry its provenance; Today is unchanged.
+fn validate_provenance(
+	state: &SmState,
+	key: OpKey,
+	command: &SlabCommand,
+) -> Result<(), Box<SlabRejection>> {
+	match command {
+		SlabCommand::Tier(TierOp { tier, replaces }) => match &tier.certified {
+			None => Ok(()),
+			Some(provenance) => {
+				if provenance.op != key
+					|| provenance.op.owner != tier.slab.owner()
+					|| replaces.as_ref() != Some(&provenance.source)
+				{
+					return Err(Box::new(SlabRejection::ProvenanceMismatch));
+				}
+				Ok(())
+			}
+		},
+		SlabCommand::Retire(RetireOp {
+			slab,
+			expected,
+			certified,
+		}) => match certified {
+			None if state.decisions.is_some() => {
+				Err(Box::new(SlabRejection::CertificationRequired))
+			}
+			None => Ok(()),
+			Some(provenance) => {
+				if provenance.op != key
+					|| provenance.op.owner != slab.owner()
+					|| provenance.slab != *slab
+					|| provenance.source != *expected
+				{
+					return Err(Box::new(SlabRejection::ProvenanceMismatch));
+				}
+				Ok(())
+			}
+		},
+		_ => Ok(()),
+	}
+}
+
 /// The reachable validators, before any side effect and any mutation.
-fn validate_command(state: &SmState, command: &SlabCommand) -> Result<(), Box<SlabRejection>> {
+fn validate_command(
+	state: &SmState,
+	key: OpKey,
+	command: &SlabCommand,
+) -> Result<(), Box<SlabRejection>> {
+	validate_provenance(state, key, command)?;
 	match command {
 		SlabCommand::Tier(TierOp { tier, replaces }) => {
 			require_not_terminal(state, tier.slab)?;
@@ -113,7 +164,7 @@ fn validate_command(state: &SmState, command: &SlabCommand) -> Result<(), Box<Sl
 			}
 			Ok(())
 		}
-		SlabCommand::Retire(RetireOp { slab, expected }) => {
+		SlabCommand::Retire(RetireOp { slab, expected, .. }) => {
 			let Some(current) = state.tiered_slabs.get(slab).map(TierGeneration::from) else {
 				return Err(Box::new(SlabRejection::NotTiered));
 			};
@@ -228,25 +279,41 @@ pub(super) fn apply_slab_op(
 		Admission::Answer(response) => return (response, None),
 		Admission::New(registry) => registry,
 	};
-	let (outcome, event) = match validate_command(state, &op.command) {
+	let (outcome, event, retirement) = match validate_command(state, key, &op.command) {
 		Err(reason) => (
 			RecordedOutcome::Rejected {
 				reason: *reason,
 				index,
 			},
 			None,
+			None,
 		),
-		Ok(()) => (
-			RecordedOutcome::Applied { index },
-			apply_valid_command(state, op.op_seq, op.command, registry),
-		),
+		Ok(()) => {
+			// ADR 0704: an applied certified retirement's validated link, kept only in
+			// its own outcome entry.
+			let retirement = match &op.command {
+				SlabCommand::Retire(RetireOp { certified, .. }) => certified.clone(),
+				_ => None,
+			};
+			(
+				RecordedOutcome::Applied { index },
+				apply_valid_command(state, op.op_seq, op.command, registry),
+				retirement,
+			)
+		}
 	};
-	record_outcome(state, key, digest, outcome.clone());
+	record_outcome(state, key, digest, outcome.clone(), retirement);
 	(receipt(key, digest, OpOutcome::Recorded(outcome)), event)
 }
 
 /// The only insertion into a table: rule 6, inside the window.
-fn record_outcome(state: &mut SmState, key: OpKey, digest: [u8; 32], outcome: RecordedOutcome) {
+fn record_outcome(
+	state: &mut SmState,
+	key: OpKey,
+	digest: [u8; 32],
+	outcome: RecordedOutcome,
+	retirement: Option<CertifiedRetirement>,
+) {
 	state
 		.op_tables
 		.entry(key.owner)
@@ -258,6 +325,7 @@ fn record_outcome(state: &mut SmState, key: OpKey, digest: [u8; 32], outcome: Re
 				digest,
 				outcome,
 				acked: false,
+				retirement,
 			},
 		);
 }
@@ -276,7 +344,7 @@ pub(super) fn apply_cancel_op(
 				reason: SlabRejection::Cancelled,
 				index,
 			};
-			record_outcome(state, key, target_digest, outcome.clone());
+			record_outcome(state, key, target_digest, outcome.clone(), None);
 			receipt(key, target_digest, OpOutcome::Recorded(outcome))
 		}
 	}
@@ -324,7 +392,7 @@ pub(super) fn op_retirement(
 		op_seq: op.op_seq,
 	};
 	match admit_op(state, key, op.command.digest(), leader_node) {
-		Admission::New(registry) if validate_command(state, &op.command).is_ok() => {
+		Admission::New(registry) if validate_command(state, key, &op.command).is_ok() => {
 			Some((*slab, registry))
 		}
 		_ => None,
@@ -394,11 +462,26 @@ pub(super) fn validate_op_tables(state: &SmState) -> Result<(), String> {
 				"snapshot op table for {owner:?} names an owner its incarnation registry does not"
 			));
 		}
-		for seq in table.outcomes.keys() {
+		for (seq, entry) in &table.outcomes {
 			if *seq <= table.acked_through || table.outside_window(*seq) {
 				return Err(format!(
 					"snapshot op table for {owner:?} holds seq {seq} outside its window from {}",
 					table.acked_through
+				));
+			}
+			// ADR 0704: a retirement link belongs to its own Applied entry, of its own slab's
+			// owner, and to nothing else.
+			if let Some(retirement) = &entry.retirement
+				&& (retirement.op
+					!= (OpKey {
+						owner: *owner,
+						op_seq: *seq,
+					}) || retirement.slab.owner() != *owner
+					|| !matches!(entry.outcome, RecordedOutcome::Applied { .. }))
+			{
+				return Err(format!(
+					"snapshot op table for {owner:?} holds a retirement link at seq {seq} that is \
+					 not its own applied operation's"
 				));
 			}
 		}
