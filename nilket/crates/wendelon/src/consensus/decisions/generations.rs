@@ -277,19 +277,26 @@ pub(super) fn commit_generation(
 		chunks,
 		committed_at: log_index,
 	};
-	let mut freed = 0u64;
-	for rsv in bodies {
-		let body = decisions.bodies.remove(&rsv).expect("covered");
-		freed += body.claim_bytes;
-	}
-	for dec in noops {
-		let noop = decisions.noops.remove(&dec).expect("covered");
-		freed += noop.bytes;
-	}
-	decisions.retained_claim_bytes = decisions
+	// The bytes the cut frees, summed and subtracted with checks before anything
+	// is removed, so this refusal, like every other, leaves the state unchanged.
+	let freed = bodies
+		.iter()
+		.map(|rsv| decisions.bodies[rsv].claim_bytes)
+		.chain(noops.iter().map(|dec| decisions.noops[dec].bytes))
+		.try_fold(0u64, |sum, bytes| sum.checked_add(bytes))
+		.ok_or(CounterOverflow)?;
+	let retained = decisions
 		.retained_claim_bytes
 		.checked_sub(freed)
 		.ok_or(CounterOverflow)?;
+	// Every check passed: commit.
+	for rsv in bodies {
+		decisions.bodies.remove(&rsv);
+	}
+	for dec in noops {
+		decisions.noops.remove(&dec);
+	}
+	decisions.retained_claim_bytes = retained;
 	decisions.generations.current = Some(certificate);
 	decisions.generations.pending = None;
 	Ok(DecisionResult::GenerationCommitted { gid })

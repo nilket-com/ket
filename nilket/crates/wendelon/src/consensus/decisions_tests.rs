@@ -2622,6 +2622,55 @@ fn a_generation_commits_only_on_every_members_agreeing_report_and_erases_its_cut
 	decisions.validate().unwrap();
 }
 
+/// A generation commit refused for its byte accounting leaves the decision
+/// state exactly as it was: the freed bytes are checked before anything is
+/// removed. The retained-bytes invariant is broken on purpose here, the only
+/// way to reach that refusal; with it restored, the same commit then succeeds.
+#[test]
+fn a_generation_commit_refused_for_its_byte_accounting_changes_nothing() {
+	let (mut state, rsv, dec) = accepted_retired();
+	let bytes = decisions(&state).retained_claim_bytes;
+	assert!(bytes > 0);
+	let proposed = target(&state, 1, dec, 0);
+	let members = proposed.members.clone();
+	assert_eq!(
+		decide(
+			&mut state,
+			DecisionCommand::ProposeTarget { target: proposed }
+		),
+		DecisionResult::TargetRecorded { gid: 1 }
+	);
+	for member in &members {
+		let report = report_of(&state, *member, 3);
+		assert!(matches!(
+			decide(&mut state, report),
+			DecisionResult::ReportRecorded { .. }
+		));
+	}
+	// Fewer retained bytes than the cut frees: the subtraction cannot hold.
+	state.decisions.as_mut().unwrap().retained_claim_bytes = bytes - 1;
+	let before = decisions(&state).clone();
+	assert_eq!(
+		decide(&mut state, DecisionCommand::CommitGeneration { gid: 1 }),
+		refused(DecisionRefusal::CounterOverflow)
+	);
+	assert_eq!(
+		decisions(&state),
+		&before,
+		"the refusal removed nothing and committed nothing"
+	);
+	assert!(decisions(&state).body(rsv).is_some(), "the cut is intact");
+	// The invariant restored, the same commit erases the cut.
+	state.decisions.as_mut().unwrap().retained_claim_bytes = bytes;
+	assert_eq!(
+		decide(&mut state, DecisionCommand::CommitGeneration { gid: 1 }),
+		DecisionResult::GenerationCommitted { gid: 1 }
+	);
+	assert!(decisions(&state).body(rsv).is_none(), "the cut is erased");
+	assert_eq!(decisions(&state).retained_claim_bytes, 0);
+	decisions(&state).validate().unwrap();
+}
+
 #[test]
 fn a_reserved_parent_or_an_unretired_key_blocks_the_cut() {
 	// Reserved: blocks.
