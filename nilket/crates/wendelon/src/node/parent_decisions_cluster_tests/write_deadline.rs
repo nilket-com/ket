@@ -19,7 +19,7 @@ const ANSWER_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// One end of an in-memory stream. With `writes_fail` every write and the
 /// finish fail, as towards a peer that has gone; reads are unaffected.
-struct PipeStream {
+pub(super) struct PipeStream {
 	inner: tokio::io::DuplexStream,
 	writes_fail: bool,
 }
@@ -136,15 +136,15 @@ fn sender_to(node: u32) -> crate::network::server::RequestContext {
 
 /// One table write on a stream into `node`'s published service: the client's
 /// end, and the task that runs the service's handling of the stream.
-struct StreamedWrite {
-	client: PipeStream,
-	handler: tokio::task::JoinHandle<std::io::Result<()>>,
+pub(super) struct StreamedWrite {
+	pub(super) client: PipeStream,
+	pub(super) handler: tokio::task::JoinHandle<std::io::Result<()>>,
 }
 
 impl StreamedWrite {
 	/// Sends `meta` and `batch` to `node`. With `responses_fail` the server's
 	/// end cannot write.
-	async fn send(
+	pub(super) async fn send(
 		cluster: &Cluster,
 		node: u32,
 		meta: TableWriteRequestMeta,
@@ -174,7 +174,10 @@ impl StreamedWrite {
 	}
 
 	/// The one response frame, then the end of the stream.
-	async fn response(&mut self, pool: &Arc<BufPool>) -> std::io::Result<TableWriteResponseMeta> {
+	pub(super) async fn response(
+		&mut self,
+		pool: &Arc<BufPool>,
+	) -> std::io::Result<TableWriteResponseMeta> {
 		read_response(&mut self.client, pool).await
 	}
 }
@@ -218,7 +221,7 @@ fn assert_deadline_answer(response: &TableWriteResponseMeta, what: &str) {
 
 /// Releases a held coordinator when dropped, so no failure path leaves it
 /// parked.
-struct ReleaseOnDrop(Arc<tokio::sync::Notify>);
+pub(super) struct ReleaseOnDrop(pub(super) Arc<tokio::sync::Notify>);
 impl Drop for ReleaseOnDrop {
 	fn drop(&mut self) {
 		self.0.notify_one();
@@ -226,14 +229,14 @@ impl Drop for ReleaseOnDrop {
 }
 
 /// Waits for a pause to be reached.
-async fn until_reached(what: &str, reached: &tokio::sync::Notify) {
+pub(super) async fn until_reached(what: &str, reached: &tokio::sync::Notify) {
 	tokio::time::timeout(BOUND, reached.notified())
 		.await
 		.unwrap_or_else(|_| panic!("{what}: the pause was never reached"));
 }
 
 /// The handler's own end, bounded.
-async fn handler_end(what: &str, write: &mut StreamedWrite) -> std::io::Result<()> {
+pub(super) async fn handler_end(what: &str, write: &mut StreamedWrite) -> std::io::Result<()> {
 	tokio::time::timeout(BOUND, &mut write.handler)
 		.await
 		.unwrap_or_else(|_| panic!("{what}: the handler never returned"))
@@ -329,7 +332,7 @@ async fn answer_while_held(
 		.unwrap()
 }
 
-async fn shut_down(cluster: Cluster) {
+pub(super) async fn shut_down(cluster: Cluster) {
 	for node in cluster.nodes {
 		let _ = tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown()).await;
 	}

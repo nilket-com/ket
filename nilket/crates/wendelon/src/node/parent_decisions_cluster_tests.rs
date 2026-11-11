@@ -6570,3 +6570,6 @@ async fn a_write_with_a_remote_holder_answered_in_time_commits_on_its_first_atte
 
 #[path = "parent_decisions_cluster_tests/write_deadline.rs"]
 mod write_deadline;
+
+#[path = "parent_decisions_cluster_tests/attempt_exhaustion.rs"]
+mod attempt_exhaustion;

@@ -199,9 +199,14 @@ enum WriteAnswer {
 	/// Committed: OK, or a replay of a commit whose answer was lost. Only this is an
 	/// acknowledgement.
 	Acknowledged,
-	/// Known not to have committed: the client's quick retries ran out, or the service
-	/// recorded the write as refused. A client that still wants the row sends a new write.
+	/// Known not to have committed: the service recorded the write as refused. A client that
+	/// still wants the row sends a new write.
 	SendAgain,
+	/// The client's quick retries ran out, whatever knowledge that call's summary carries.
+	/// A call summarizes only its own attempts: an earlier call of the same write id may have
+	/// left a write that can still commit. So a client that still wants the row asks again
+	/// with the same write id, and the service's record of that id decides.
+	AskAgain,
 	/// Anything else is an answer the client cannot act on.
 	Other,
 }
@@ -212,10 +217,14 @@ fn write_answer(write: &WriteResponseMeta) -> WriteAnswer {
 		&& (status == WriteStatus::OK || status == WriteStatus::DUPLICATE)
 	{
 		WriteAnswer::Acknowledged
-	} else if knowledge == MutationCommitKnowledge::KNOWN_NOT_COMMITTED
-		&& (status == WriteStatus::OK || status == WriteStatus::WRITE_ATTEMPTS_EXHAUSTED)
+	} else if knowledge == MutationCommitKnowledge::KNOWN_NOT_COMMITTED && status == WriteStatus::OK
 	{
 		WriteAnswer::SendAgain
+	} else if status == WriteStatus::WRITE_ATTEMPTS_EXHAUSTED
+		&& (knowledge == MutationCommitKnowledge::INDETERMINATE
+			|| knowledge == MutationCommitKnowledge::KNOWN_NOT_COMMITTED)
+	{
+		WriteAnswer::AskAgain
 	} else {
 		WriteAnswer::Other
 	}
@@ -249,7 +258,7 @@ fn only_a_committed_answer_acknowledges_a_row() {
 			WriteStatus::WRITE_ATTEMPTS_EXHAUSTED,
 			K::KNOWN_NOT_COMMITTED
 		),
-		WriteAnswer::SendAgain
+		WriteAnswer::AskAgain
 	);
 	assert_eq!(
 		answer(WriteStatus::OK, K::INDETERMINATE),
@@ -261,7 +270,7 @@ fn only_a_committed_answer_acknowledges_a_row() {
 	);
 	assert_eq!(
 		answer(WriteStatus::WRITE_ATTEMPTS_EXHAUSTED, K::INDETERMINATE),
-		WriteAnswer::Other
+		WriteAnswer::AskAgain
 	);
 	assert_eq!(
 		answer(WriteStatus::WRITE_STALLED, K::INDETERMINATE),
@@ -469,8 +478,9 @@ impl Cluster {
 
 	/// One acknowledged write through the running nodes' service. A row is expected only once
 	/// it is acknowledged. A transport failure while the cluster settles retries the same id and
-	/// write id within the poll bound, as a retrying client does. A write known not to have
-	/// committed goes again as a new write of the same row. Any other answer but OK fails.
+	/// write id within the poll bound, as a retrying client does. So does an exhausted answer,
+	/// whatever knowledge it carries. A write the service recorded as refused goes again as a
+	/// new write of the same row. Any other answer but OK fails.
 	async fn write_one(&mut self, what: &str) {
 		self.next_id += 1;
 		let id = self.next_id;
@@ -494,13 +504,17 @@ impl Cluster {
 					self.newest_ack = self.newest_ack.max(result.response.write.commit_hlc);
 					return;
 				}
-				// Nothing committed. The service keeps that answer for this write id, so a client
-				// that still wants the row sends a new write.
+				// The service recorded this write id as refused. A client that still wants the row
+				// sends a new write.
 				Ok(result) if write_answer(&result.response.write) == WriteAnswer::SendAgain => {
 					last = format!("{:?}", result.response);
 					self.writes_sent_again += 1;
 					self.next_write_sequence += 1;
 					sequence = self.next_write_sequence;
+				}
+				// The retries ran out. The same write id goes again, and its record decides.
+				Ok(result) if write_answer(&result.response.write) == WriteAnswer::AskAgain => {
+					last = format!("{:?}", result.response);
 				}
 				// The client has spent its retries on what can be retried, so this is an answer.
 				Ok(result) => panic!("{what}: row {id} was refused: {:?}", result.response),

@@ -319,7 +319,8 @@ impl WendelonDataServer {
 	/// `early` its deadline answer is returned then. A cooperative bound on
 	/// the coordinator's answer, plus scheduling slack: not a real-time
 	/// guarantee, and not a bound on what the handler does with an ordinary
-	/// result afterwards (the last-attempt outcome record is outside it).
+	/// result afterwards (the last-attempt rule, which in this mode passes the
+	/// result on unchanged and records nothing, is outside it).
 	pub(super) async fn coordinate_table_write(
 		&self,
 		meta: TableWriteRequestMeta,

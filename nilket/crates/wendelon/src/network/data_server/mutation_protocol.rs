@@ -127,11 +127,29 @@ impl WendelonDataServer {
 		}
 	}
 
+	/// The last-attempt rule of a table write. Every answer of a table write
+	/// that may be retryable passes through here, whichever entry produced it
+	/// (the admission refusal, a coordinated write's early answer, the write's
+	/// own result), so the mode distinction is made here and nowhere else.
+	///
+	/// Today: a retryable answer to a last attempt (`attempts_remaining == 1`)
+	/// is rewritten to WRITE_ATTEMPTS_EXHAUSTED and recorded as the operation's
+	/// durable outcome.
+	///
+	/// ParentDecisions: the answer goes out as it is, on the last attempt as on
+	/// any other, and nothing is recorded. The parent record is the only
+	/// durable outcome of a table write there, and a lookup is its replay; this
+	/// node cannot tell from a redirect or an admission refusal whether the
+	/// identity is reserved elsewhere. Exhaustion is the caller's summary of
+	/// the answers it received, never a fact this node stores.
 	pub(super) async fn finalize_table_write_attempt(
 		&self,
 		meta: TableWriteRequestMeta,
 		mut response: TableWriteResponseMeta,
 	) -> std::io::Result<TableWriteResponseMeta> {
+		if self.decision_mode != crate::consensus::decision_mode::DecisionMode::Today {
+			return Ok(response);
+		}
 		if meta.attempts_remaining() != 1 || !retryable_mutation_status(response.write.status) {
 			return Ok(response);
 		}
@@ -706,5 +724,20 @@ impl WendelonDataServer {
 			arrow_payload: None,
 			trailing,
 		}
+	}
+}
+
+#[cfg(test)]
+impl WendelonDataServer {
+	/// Test-only: the outcome this node has durably stored for a mutation,
+	/// read as it stands (no resolution, no expiry bookkeeping).
+	pub(crate) fn stored_mutation_outcome_for_test(
+		&self,
+		write_id: crate::schema::ClientWriteId,
+		tenant_id: TenantId,
+	) -> Option<WriteResponseMeta> {
+		self.mutation_outcomes
+			.stored_outcome_for_test(write_id, tenant_id)
+			.map(|outcome| outcome.response().unwrap())
 	}
 }

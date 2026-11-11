@@ -307,7 +307,7 @@ impl MutationOutcomeStore {
 
 #[cfg(test)]
 impl MutationOutcomeStore {
-	fn stored_outcome_for_test(
+	pub(crate) fn stored_outcome_for_test(
 		&self,
 		write_id: ClientWriteId,
 		tenant_id: TenantId,
