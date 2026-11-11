@@ -222,7 +222,10 @@ mod write_replication;
 #[cfg(test)]
 use write_replication::append_bifurcated_table_children_durable;
 use write_replication::append_table_children_tracking_effects;
-use write_replication::{DurableQuorumTracker, PendingFinalizationClaims, WriteOutcome};
+use write_replication::{
+	AttemptRetention, DurableQuorumTracker, NothingSubmitted, PendingFinalizationClaims,
+	TableAttemptAnswer, WriteOutcome,
+};
 mod descriptor_migration;
 mod query_clocks;
 use query_clocks::{
@@ -8849,9 +8852,12 @@ impl WendelonDataServer {
 		mut clocks: WriteClocks,
 		permit: OwnedSemaphorePermit,
 		mutation_drain: MutationDrainGuard,
-	) -> std::io::Result<(WriteResponseMeta, Option<FinalizationMarker>)> {
+	) -> std::io::Result<TableAttemptAnswer> {
 		self.observe_table_write(&meta, async {
 
+		// Held until this attempt first dispatches work; only while it is held can an answer be a
+		// refusal before submission. Every other answer keeps the caller's existing retention.
+		let nothing_submitted = NothingSubmitted::at_attempt_start();
 		let mut synthetic = table_write_synthetic_meta(
 			&meta,
 			bifurcated.parent_key_identity,
@@ -8859,7 +8865,7 @@ impl WendelonDataServer {
 		);
 		let key = Self::idempotency_key_for(meta.tenant_id, meta.parent_write_id);
 		if let Some(replayed) = self.durable_mutation_replay(&meta).await? {
-			return Ok(replayed);
+			return Ok(TableAttemptAnswer::preserving(replayed));
 		}
 		let mut mutation_permit = Some(permit);
 		// Admission and batch construction happen before this helper. They are finite but
@@ -8880,7 +8886,7 @@ impl WendelonDataServer {
 				delete_counts,
 			)
 			.await?;
-			return Ok((response, None));
+			return Ok(TableAttemptAnswer::preserving((response, None)));
 		}
 
 		let lease_gate_is_primary_for_all_groups = if self.lease_gate_enabled {
@@ -8895,9 +8901,10 @@ impl WendelonDataServer {
 			true
 		};
 		if self.lease_gate_enabled && !lease_gate_is_primary_for_all_groups {
-			return Ok(self.counted_write_result(
-				error_response(&synthetic, WriteStatus::NOT_LEADER, self.local_node),
-				None,
+			return Ok(self.refused_before_submission(
+				&nothing_submitted,
+				&synthetic,
+				WriteStatus::NOT_LEADER,
 			));
 		}
 
@@ -8905,9 +8912,10 @@ impl WendelonDataServer {
 			.ensure_orphan_witnesses_recovered_for_leadership()
 			.await?
 		{
-			return Ok(self.counted_write_result(
-				error_response(&synthetic, WriteStatus::NOT_LEADER, self.local_node),
-				None,
+			return Ok(self.refused_before_submission(
+				&nothing_submitted,
+				&synthetic,
+				WriteStatus::NOT_LEADER,
 			));
 		}
 
@@ -8919,12 +8927,16 @@ impl WendelonDataServer {
 			let outcome = self.recoverable_pending_outcome_for_record(&record);
 			self.idempotency
 				.insert(key, CachedWriteOutcome::new(outcome));
-			return self.replay_write_outcome(meta.tenant_id, outcome).await;
+			return self
+				.replay_write_outcome(meta.tenant_id, outcome)
+				.await
+				.map(TableAttemptAnswer::preserving);
 		}
 
 		if self.lease_gate_enabled
 			&& let Some(answer) = self
 				.admit_at_table_lease_gate(
+					&nothing_submitted,
 					&meta,
 					&synthetic,
 					&bifurcated.children,
@@ -8960,10 +8972,7 @@ impl WendelonDataServer {
 		{
 			Ok(reservation) => reservation,
 			Err(status) => {
-				return Ok(self.counted_write_result(
-					error_response(&synthetic, status, self.local_node),
-					None,
-				));
+				return Ok(self.refused_before_submission(&nothing_submitted, &synthetic, status));
 			}
 		};
 		let migrations_snapshot = self.state_machine.state_snapshot().await.migrations.clone();
@@ -8974,10 +8983,11 @@ impl WendelonDataServer {
 			})?;
 
 		if groups.is_empty() {
-			return Ok(self.counted_write_result(
+			// Not shown to be transient: it keeps the caller's existing retention.
+			return Ok(TableAttemptAnswer::preserving(self.counted_write_result(
 				error_response(&synthetic, WriteStatus::INTERNAL_ERROR, self.local_node),
 				None,
-			));
+			)));
 		}
 		let mut quorum_trackers = groups
 			.iter()
@@ -8996,6 +9006,9 @@ impl WendelonDataServer {
 			.filter(|(_index, group)| group.replicas.iter().any(|n| n.id == self.local_node.id))
 			.map(|(index, group)| (index, group.children.clone()))
 			.collect::<Vec<_>>();
+		// The submission boundary: the local durable append and the replica legs are spawned
+		// below. No later answer of this attempt can be a refusal before submission.
+		nothing_submitted.begin_submission();
 		let (mut local_durable_task, mut local_progress_rx): (
 			Option<JoinHandle<std::io::Result<()>>>,
 			Option<mpsc::UnboundedReceiver<usize>>,
@@ -9080,7 +9093,7 @@ impl WendelonDataServer {
 						delete_counts,
 					)
 						.await?;
-					return Ok((response, None));
+					return Ok(TableAttemptAnswer::preserving((response, None)));
 				}
 				local_progress = async {
 					match local_progress_rx.as_mut() {
@@ -9110,14 +9123,18 @@ impl WendelonDataServer {
 								format!("local table durable append returned error: {err}"),
 							)
 							.await;
-							return Ok(self.fenced_write_response(&synthetic).await);
+							return Ok(TableAttemptAnswer::preserving(
+								self.fenced_write_response(&synthetic).await,
+							));
 						}
 						Some(Err(err)) => {
 							self.trip_local_persistence_distrust(format!(
 								"local table durable append task failed: {err}"
 							))
 							.await;
-							return Ok(self.fenced_write_response(&synthetic).await);
+							return Ok(TableAttemptAnswer::preserving(
+								self.fenced_write_response(&synthetic).await,
+							));
 						}
 						None => continue,
 					}
@@ -9143,10 +9160,10 @@ impl WendelonDataServer {
 			.iter()
 			.all(DurableQuorumTracker::is_satisfied)
 		{
-			return Ok(self.counted_write_result(
+			return Ok(TableAttemptAnswer::preserving(self.counted_write_result(
 				error_response(&synthetic, WriteStatus::INTERNAL_ERROR, self.local_node),
 				None,
-			));
+			)));
 		}
 		metrics().observe_durable_quorum_latency(durable_quorum_started.elapsed());
 
@@ -9201,7 +9218,7 @@ impl WendelonDataServer {
 						"table pending finalization intent persistence failed after durable quorum: {err}"
 					))
 					.await;
-					return committed;
+					return committed.map(TableAttemptAnswer::preserving);
 				}
 				Err(finalize_err) => {
 					self.cdc_evict_pending_finalization(pending.id).await;
@@ -9216,7 +9233,9 @@ impl WendelonDataServer {
 						"table pending finalization intent persistence failed after durable quorum: {err}; immediate finalization failed: {finalize_err}"
 					))
 					.await;
-					return Ok(self.fenced_write_response(&synthetic).await);
+					return Ok(TableAttemptAnswer::preserving(
+						self.fenced_write_response(&synthetic).await,
+					));
 				}
 			}
 		} else {
@@ -9236,7 +9255,7 @@ impl WendelonDataServer {
 			self.cdc_pending_live_entries.insert(pending.id, cdc_staged);
 		}
 
-		match self.resolve_pending_finalization(&pending).await {
+		let finalized = match self.resolve_pending_finalization(&pending).await {
 			Ok(resolution) => self
 				.complete_pending_finalization(&pending, resolution, delete_counts)
 				.await
@@ -9262,7 +9281,8 @@ impl WendelonDataServer {
 				self.pending_finalization_wakeup.notify_one();
 				Ok(self.counted_write_result(response, None))
 			}
-		}
+		};
+		finalized.map(TableAttemptAnswer::preserving)
 
 		}).await
 	}
@@ -9595,7 +9615,8 @@ impl WendelonDataServer {
 					mutation_permit,
 					mutation_drain,
 				)
-				.await?;
+				.await?
+				.discarding_retention();
 			if matches!(
 				write.status,
 				WriteStatus::OK | WriteStatus::FINALIZATION_PENDING
@@ -10153,7 +10174,7 @@ impl WendelonDataServer {
 					None,
 				));
 			};
-			let (write, trailing) = self
+			let (write, trailing, retention) = self
 				.write_table_bifurcated(
 					synthetic_meta,
 					bifurcated,
@@ -10167,7 +10188,8 @@ impl WendelonDataServer {
 					mutation_permit,
 					mutation_drain,
 				)
-				.await?;
+				.await?
+				.into_parts();
 			let response = table_delete_rows_response(
 				write,
 				deleted_count,
@@ -10184,16 +10206,23 @@ impl WendelonDataServer {
 					u64::from(not_found_count),
 				);
 			}
-			self.table_delete_idempotency
-				.insert(key, CachedTableDeleteOutcome { response, trailing });
-			self.record_mutation_outcome(
-				meta.parent_write_id,
-				meta.tenant_id,
-				write,
-				trailing,
-				Some([deleted_count, already_deleted_count, not_found_count]),
-			)
-			.await?;
+			match retention {
+				// Nothing was submitted and nothing is kept: a retry of this identity runs its
+				// clocks and gates again and plans its counts again.
+				AttemptRetention::RefusedBeforeSubmission => {}
+				AttemptRetention::PreserveExistingRetention => {
+					self.table_delete_idempotency
+						.insert(key, CachedTableDeleteOutcome { response, trailing });
+					self.record_mutation_outcome(
+						meta.parent_write_id,
+						meta.tenant_id,
+						write,
+						trailing,
+						Some([deleted_count, already_deleted_count, not_found_count]),
+					)
+					.await?;
+				}
+			}
 			Ok((response, trailing))
 		})
 		.await

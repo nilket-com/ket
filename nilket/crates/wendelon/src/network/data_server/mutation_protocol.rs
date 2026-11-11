@@ -740,4 +740,16 @@ impl WendelonDataServer {
 			.stored_outcome_for_test(write_id, tenant_id)
 			.map(|outcome| outcome.response().unwrap())
 	}
+
+	/// Test-only: the answer this server's in-memory table-delete cache holds for a mutation,
+	/// read as it stands.
+	pub(crate) fn cached_table_delete_outcome_for_test(
+		&self,
+		write_id: crate::schema::ClientWriteId,
+		tenant_id: TenantId,
+	) -> Option<TableDeleteRowsResponseMeta> {
+		self.table_delete_idempotency
+			.get(&Self::idempotency_key_for(tenant_id, write_id))
+			.map(|cached| cached.response)
+	}
 }

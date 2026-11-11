@@ -19190,8 +19190,8 @@ mod lease_wait {
 	use super::*;
 	use crate::metrics::{LeaseGateWaitOutcome, LeaseGateWaitReason};
 	use crate::network::data_server::write_replication::{
-		LEASE_GATE_WAIT, LeaseGateWaitEnd, LeaseGateWaitHooks, lease_gate_deadline,
-		wait_for_lease_gate,
+		AttemptRetention, LEASE_GATE_WAIT, LeaseGateWaitEnd, LeaseGateWaitHooks, NothingSubmitted,
+		lease_gate_deadline, wait_for_lease_gate,
 	};
 	use crate::network::ring::{RingRouter, RingState};
 	use crate::network::transport::MembershipEpoch;
@@ -19995,6 +19995,7 @@ mod lease_wait {
 					WriteClocks::new(Duration::from_secs(30), caller_expired.then_some(now));
 				let (outcome, answer) = server
 					.readmit_after_lease_gate_wait(
+						&NothingSubmitted::at_attempt_start(),
 						&meta,
 						&table_write_synthetic_meta(&meta, Identity::ZERO, 0),
 						&children,
@@ -20005,7 +20006,7 @@ mod lease_wait {
 					)
 					.await
 					.unwrap();
-				let answer = answer.expect("an answer, not an admission").0;
+				let answer = answer.expect("an answer, not an admission").into_parts().0;
 				let stored = recorded_outcome(node, &meta).await;
 				(outcome, answer, stored)
 			}
@@ -20288,6 +20289,699 @@ mod lease_wait {
 			completed_waits(&node),
 			vec![(LeaseGateWaitReason::Expired, LeaseGateWaitOutcome::Admitted)]
 		);
+		shutdown_lease_node(node).await;
+	}
+
+	/// The delete request as the wire delivers it: the frame handler, its admission and its
+	/// last-attempt rule.
+	async fn wire_table_delete(
+		node: &WendelonNode,
+		meta: &TableDeleteRowsRequestMeta,
+		row_key_ids: &[Identity],
+	) -> TableDeleteRowsResponseMeta {
+		let mut ids = arrow::array::FixedSizeBinaryBuilder::with_capacity(row_key_ids.len(), 32);
+		for row_key_id in row_key_ids {
+			ids.append_value(row_key_id.as_bytes()).unwrap();
+		}
+		let batch = RecordBatch::try_new(
+			Arc::new(table_delete_rows_schema()),
+			vec![Arc::new(ids.finish())],
+		)
+		.unwrap();
+		let meta_bytes = bytemuck::bytes_of(meta).to_vec();
+		let payload = encode_batch(&batch).unwrap();
+		let frame = HrftFrame {
+			header: FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: MsgType::TABLE_DELETE_REQ.0,
+				flags: 0,
+				stream_id: 73,
+				meta_len: meta_bytes.len() as u32,
+				arrow_len: payload.len() as u32,
+				trailing_len: 0,
+			},
+			meta: crate::network::pool::PooledBuf::orphan(meta_bytes),
+			arrow_payload: Some(crate::network::pool::PooledBuf::orphan(payload)),
+			trailing: None,
+		};
+		let context = RequestContext {
+			remote: Some(node.local_node),
+			actor: actor(ActorRole::Operator, None),
+		};
+		let response = tokio::time::timeout(
+			STEP_BOUND,
+			DataRingServer::handle_data_frame(node.data_server.as_ref(), context, frame),
+		)
+		.await
+		.expect("the delete answers")
+		.expect("the stream carries an answer")
+		.expect("a response frame");
+		bytemuck::pod_read_unaligned(
+			&response.meta[..std::mem::size_of::<TableDeleteRowsResponseMeta>()],
+		)
+	}
+
+	/// A one-row delete of `id` under its own identity. Every delete here carries the same client
+	/// HLC and epoch, so all of them put the same question to the lease gate.
+	fn dc210_delete_of(
+		descriptor: &TableSchemaDescriptor,
+		id: i64,
+		sequence_no: u64,
+		attempts_remaining: u8,
+	) -> (TableDeleteRowsRequestMeta, Vec<Identity>) {
+		let mut meta: TableDeleteRowsRequestMeta = bytemuck::Zeroable::zeroed();
+		meta.parent_write_id = crate::schema::ClientWriteId {
+			client_uuid: [0x71; 16],
+			sequence_no,
+			idempotency_ttl_ms: 300_000,
+			_pad: 0,
+		};
+		meta.client_hlc = hlc(20, 0, 713);
+		meta.expected_epoch = 1;
+		meta.tenant_id = tenant();
+		meta.table_object_id = descriptor.table_object_id;
+		meta.schema_generation = descriptor.schema_generation;
+		meta.row_count = 1;
+		meta.durability = DurabilityLevel::QUORUM;
+		meta.set_attempts_remaining(attempts_remaining);
+		(meta, vec![row_key(descriptor, id)])
+	}
+
+	fn dc210_row_is_live(node: &WendelonNode, descriptor: &TableSchemaDescriptor, id: i64) -> bool {
+		node.slab
+			.lookup(tenant(), row_key(descriptor, id))
+			.unwrap()
+			.is_some_and(|location| !location.is_tombstone)
+	}
+
+	fn dc210_write_answer(write: &WriteResponseMeta) -> String {
+		let name = match write.status {
+			s if s == WriteStatus::OK => "OK",
+			s if s == WriteStatus::DUPLICATE => "DUPLICATE",
+			s if s == WriteStatus::LEASE_EXPIRED => "LEASE_EXPIRED",
+			s if s == WriteStatus::WRITE_ATTEMPTS_EXHAUSTED => "WRITE_ATTEMPTS_EXHAUSTED",
+			_ => "other",
+		};
+		format!(
+			"status={name}({}) knowledge={} stop_reason={}",
+			write.status.0,
+			write.mutation_commit_knowledge().0,
+			write.mutation_stop_reason().0
+		)
+	}
+
+	fn dc210_answer(response: &TableDeleteRowsResponseMeta) -> String {
+		format!(
+			"{} counts[deleted,already_deleted,not_found]=[{},{},{}] reject_code={}",
+			dc210_write_answer(&response.write),
+			response.deleted_count,
+			response.already_deleted_count,
+			response.not_found_count,
+			response.reject_code
+		)
+	}
+
+	fn dc210_gate_passes(node: &WendelonNode) -> usize {
+		node.data_server
+			.lease_gate_wait_hooks
+			.gate_passes
+			.lock()
+			.unwrap()
+			.len()
+	}
+
+	/// Rows 7 and 8 are written and live; then a delete of row 7, on an attempt that is not its
+	/// last, meets an expired lease, waits out the (shortened) bound of the lease gate and is
+	/// refused LEASE_EXPIRED with nothing deleted. Returns that request and its answer.
+	async fn dc210_a_delete_refused_at_the_lease_gate(
+		node: &WendelonNode,
+		descriptor: &TableSchemaDescriptor,
+	) -> (
+		TableDeleteRowsRequestMeta,
+		Vec<Identity>,
+		TableDeleteRowsResponseMeta,
+	) {
+		for (id, sequence_no) in [(7_i64, 210_100_u64), (8, 210_101)] {
+			let (meta, batch) = write_of(descriptor, id, sequence_no);
+			let (written, _) = node.data_server.table_write(meta, batch).await.unwrap();
+			assert_eq!(written.write.status, WriteStatus::OK);
+			assert!(
+				dc210_row_is_live(node, descriptor, id),
+				"row {id} is readable"
+			);
+		}
+		println!("DC210 rows 7 and 8 written and readable");
+
+		// The delete has the bounded wait of the lease gate too; shorten it, and let it run out.
+		set_cap(node, Duration::from_millis(400));
+		let (meta, row_key_ids) = dc210_delete_of(descriptor, 7, 210_001, 3);
+		assert_eq!(meta.attempts_remaining(), 3, "not a last attempt");
+		expire_cached_leases(node, meta.client_hlc);
+		let first = wire_table_delete(node, &meta, &row_key_ids).await;
+		println!(
+			"DC210 FIRST attempt (attempts_remaining=3): {}",
+			dc210_answer(&first)
+		);
+		println!("DC210 FIRST waits at the gate: {:?}", completed_waits(node));
+		println!(
+			"DC210 after FIRST: row 7 still readable={}",
+			dc210_row_is_live(node, descriptor, 7)
+		);
+		let stored = node
+			.data_server
+			.stored_mutation_outcome_for_test(meta.parent_write_id, meta.tenant_id);
+		println!(
+			"DC210 after FIRST: durable mutation outcome stored for this identity: {}",
+			stored
+				.as_ref()
+				.map_or_else(|| "none".to_owned(), dc210_write_answer)
+		);
+		assert_eq!(
+			first.write.status,
+			WriteStatus::LEASE_EXPIRED,
+			"the fixture: a transient refusal before anything was submitted: {first:?}"
+		);
+		assert_eq!(first.reject_code, PbcRejectCode::NONE.0);
+		assert_eq!(
+			completed_waits(node),
+			vec![(
+				LeaseGateWaitReason::Expired,
+				LeaseGateWaitOutcome::RefusedAtCap
+			)],
+			"the refusal came from the lease gate, at its bound"
+		);
+		assert!(
+			dc210_row_is_live(node, descriptor, 7),
+			"the refused attempt deleted nothing"
+		);
+		dc210_assert_nothing_is_kept(node, &meta);
+		(meta, row_key_ids, first)
+	}
+
+	/// Neither layer that could answer a retry holds anything for this identity: not the in-memory
+	/// delete cache and not the durable mutation-outcome store, each read as it stands.
+	fn dc210_assert_nothing_is_kept(node: &WendelonNode, meta: &TableDeleteRowsRequestMeta) {
+		let cached = node
+			.data_server
+			.cached_table_delete_outcome_for_test(meta.parent_write_id, meta.tenant_id);
+		assert!(
+			cached.is_none(),
+			"the in-memory delete cache holds an answer for a delete that submitted nothing: {cached:?}"
+		);
+		let stored = node
+			.data_server
+			.stored_mutation_outcome_for_test(meta.parent_write_id, meta.tenant_id);
+		assert!(
+			stored.is_none(),
+			"the durable store holds an outcome for a delete that submitted nothing: {stored:?}"
+		);
+	}
+
+	/// What both layers hold for this identity, in the order (in-memory cache, durable store).
+	fn dc210_kept(
+		node: &WendelonNode,
+		meta: &TableDeleteRowsRequestMeta,
+	) -> (
+		Option<TableDeleteRowsResponseMeta>,
+		Option<WriteResponseMeta>,
+	) {
+		(
+			node.data_server
+				.cached_table_delete_outcome_for_test(meta.parent_write_id, meta.tenant_id),
+			node.data_server
+				.stored_mutation_outcome_for_test(meta.parent_write_id, meta.tenant_id),
+		)
+	}
+
+	async fn dc210_reopen(dir: &crate::test_support::TestDir) -> WendelonNode {
+		let reopened = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			713,
+			dir.to_path_buf(),
+			"127.0.0.1:0".into(),
+		))
+		.await
+		.unwrap();
+		let deadline = tokio::time::Instant::now() + STEP_BOUND;
+		while reopened.raft.current_leader().await != Some(reopened.local_node.id) {
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"timed out waiting for the reopened leader"
+			);
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+		assert!(renew(&reopened).await >= 1, "the reopened node has a lease");
+		reopened
+	}
+
+	/// Proof that the lease is back: another delete, with a fresh identity and the same client HLC
+	/// and epoch, passes the gate without waiting and deletes its row.
+	async fn dc210_a_fresh_delete_is_admitted(
+		node: &WendelonNode,
+		descriptor: &TableSchemaDescriptor,
+	) {
+		let waits_before = completed_waits(node).len();
+		let (control, control_ids) = dc210_delete_of(descriptor, 8, 210_002, 3);
+		let answer = wire_table_delete(node, &control, &control_ids).await;
+		println!(
+			"DC210 PREREQUISITE RESTORED: a fresh-identity delete of row 8 at the same client HLC \
+			 and epoch: {}; row 8 still readable={}; new waits at the gate={}",
+			dc210_answer(&answer),
+			dc210_row_is_live(node, descriptor, 8),
+			completed_waits(node).len() - waits_before
+		);
+		assert_eq!(answer.write.status, WriteStatus::OK, "{answer:?}");
+		assert_eq!(
+			[
+				answer.deleted_count,
+				answer.already_deleted_count,
+				answer.not_found_count
+			],
+			[1, 0, 0]
+		);
+		assert!(!dc210_row_is_live(node, descriptor, 8));
+		assert_eq!(completed_waits(node).len(), waits_before, "it never waited");
+	}
+
+	/// What a correct system does with a retry, under the same identity, of a delete that was
+	/// refused before anything was submitted, once the lease is back: it deletes the row.
+	fn dc210_assert_the_retry_deleted(
+		node: &WendelonNode,
+		descriptor: &TableSchemaDescriptor,
+		first: &TableDeleteRowsResponseMeta,
+		second: &TableDeleteRowsResponseMeta,
+	) {
+		println!(
+			"DC210 SECOND attempt (attempts_remaining=2, same identity): {}",
+			dc210_answer(second)
+		);
+		println!(
+			"DC210 SECOND is byte-identical to FIRST={}",
+			bytemuck::bytes_of(first) == bytemuck::bytes_of(second)
+		);
+		println!(
+			"DC210 after SECOND: row 7 still readable={}",
+			dc210_row_is_live(node, descriptor, 7)
+		);
+		assert_eq!(
+			second.write.status,
+			WriteStatus::OK,
+			"DC-210: the lease is back, yet the retry of the same identity was answered {}; the \
+			 first attempt was answered {}",
+			dc210_answer(second),
+			dc210_answer(first)
+		);
+		assert_eq!(
+			[
+				second.deleted_count,
+				second.already_deleted_count,
+				second.not_found_count
+			],
+			[1, 0, 0]
+		);
+		assert!(
+			!dc210_row_is_live(node, descriptor, 7),
+			"the retried delete deleted its row"
+		);
+	}
+
+	/// The commit HLC of row `id`'s tombstone. A second tombstone would carry a later one.
+	fn dc210_tombstone_hlc(
+		node: &WendelonNode,
+		descriptor: &TableSchemaDescriptor,
+		id: i64,
+	) -> HybridTimestamp {
+		let location = node
+			.slab
+			.lookup(tenant(), row_key(descriptor, id))
+			.unwrap()
+			.expect("the row has a location");
+		assert!(location.is_tombstone, "row {id} is deleted");
+		location.hlc
+	}
+
+	fn dc210_counts(response: &TableDeleteRowsResponseMeta) -> [u32; 3] {
+		[
+			response.deleted_count,
+			response.already_deleted_count,
+			response.not_found_count,
+		]
+	}
+
+	/// DC-210, same process. A delete refused LEASE_EXPIRED on an attempt that is not its last has
+	/// submitted nothing, and neither the in-memory delete cache nor the durable store keeps
+	/// anything for it. Once the lease is back, its retry under the same identity runs the gate and
+	/// deletes the row. The committed delete is then kept, and a further attempt is answered from
+	/// memory with the first answer and writes no second tombstone.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+	async fn a_table_delete_refused_at_the_lease_gate_succeeds_when_retried_after_renewal() {
+		let (_dir, node, descriptor) = lease_wait_node("dc210-delete-retry").await;
+		let (meta, row_key_ids, first) =
+			dc210_a_delete_refused_at_the_lease_gate(&node, &descriptor).await;
+
+		assert!(renew(&node).await >= 1, "a valid renewal arrives");
+		dc210_a_fresh_delete_is_admitted(&node, &descriptor).await;
+		dc210_assert_nothing_is_kept(&node, &meta);
+
+		let mut retry = meta;
+		retry.set_attempts_remaining(2);
+		let gate_passes_before = dc210_gate_passes(&node);
+		let second = wire_table_delete(&node, &retry, &row_key_ids).await;
+		let retry_gate_passes = dc210_gate_passes(&node) - gate_passes_before;
+		println!(
+			"DC210 SECOND passes of the lease gate={retry_gate_passes} (0 means it was answered \
+			 before the gate)"
+		);
+		dc210_assert_the_retry_deleted(&node, &descriptor, &first, &second);
+		assert!(retry_gate_passes >= 1, "the retry ran the lease gate again");
+
+		// The committed delete is kept by both layers, and replays as itself from memory.
+		let (cached, stored) = dc210_kept(&node, &meta);
+		assert_eq!(
+			cached.map(|cached| bytemuck::bytes_of(&cached).to_vec()),
+			Some(bytemuck::bytes_of(&second).to_vec()),
+			"the in-memory delete cache holds the committed answer"
+		);
+		assert_eq!(
+			stored.map(|stored| stored.mutation_commit_knowledge()),
+			Some(MutationCommitKnowledge::COMMITTED),
+			"the durable store holds the committed outcome"
+		);
+		let tombstone = dc210_tombstone_hlc(&node, &descriptor, 7);
+		assert_eq!(tombstone, second.write.commit_hlc);
+		let gate_passes_before = dc210_gate_passes(&node);
+		let third = wire_table_delete(&node, &retry, &row_key_ids).await;
+		println!(
+			"DC210 THIRD attempt (replay from memory): {}",
+			dc210_answer(&third)
+		);
+		assert_eq!(
+			bytemuck::bytes_of(&third),
+			bytemuck::bytes_of(&second),
+			"a committed delete replays its first answer and its first counts"
+		);
+		assert_eq!(
+			dc210_gate_passes(&node),
+			gate_passes_before,
+			"a replay runs no gate"
+		);
+		assert_eq!(
+			dc210_tombstone_hlc(&node, &descriptor, 7),
+			tombstone,
+			"the replay wrote no second tombstone"
+		);
+		shutdown_lease_node(node).await;
+	}
+
+	/// DC-210, across a restart: the companion of the test above. The in-memory cache does not
+	/// survive a restart, so the durable store alone could answer the retry here, and it holds
+	/// nothing for the refused identity. After the retry has deleted the row and the node has
+	/// restarted once more, the durable record alone answers a further attempt: DUPLICATE with the
+	/// first counts, and no second tombstone, where a new plan would count the row as already
+	/// deleted.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+	async fn a_table_delete_refused_at_the_lease_gate_succeeds_when_retried_after_a_restart() {
+		let (dir, node, descriptor) = lease_wait_node("dc210-delete-retry-reopen").await;
+		let (meta, row_key_ids, first) =
+			dc210_a_delete_refused_at_the_lease_gate(&node, &descriptor).await;
+		shutdown_lease_node(node).await;
+
+		let reopened = dc210_reopen(&dir).await;
+		let stored = reopened
+			.data_server
+			.stored_mutation_outcome_for_test(meta.parent_write_id, meta.tenant_id);
+		println!(
+			"DC210 REOPENED: durable mutation outcome stored for this identity: {}; row 7 still \
+			 readable={}",
+			stored
+				.as_ref()
+				.map_or_else(|| "none".to_owned(), dc210_write_answer),
+			dc210_row_is_live(&reopened, &descriptor, 7)
+		);
+		dc210_assert_nothing_is_kept(&reopened, &meta);
+		assert!(dc210_row_is_live(&reopened, &descriptor, 7));
+		dc210_a_fresh_delete_is_admitted(&reopened, &descriptor).await;
+
+		let mut retry = meta;
+		retry.set_attempts_remaining(2);
+		let second = wire_table_delete(&reopened, &retry, &row_key_ids).await;
+		dc210_assert_the_retry_deleted(&reopened, &descriptor, &first, &second);
+		let tombstone = dc210_tombstone_hlc(&reopened, &descriptor, 7);
+		assert_eq!(tombstone, second.write.commit_hlc);
+		shutdown_lease_node(reopened).await;
+
+		// A new process: its delete cache is empty, and the durable record answers alone.
+		let again = dc210_reopen(&dir).await;
+		let (cached, stored) = dc210_kept(&again, &meta);
+		assert!(
+			cached.is_none(),
+			"a new process starts with an empty delete cache"
+		);
+		assert_eq!(
+			stored.map(|stored| stored.mutation_commit_knowledge()),
+			Some(MutationCommitKnowledge::COMMITTED),
+			"the committed delete is in the durable store"
+		);
+		let gate_passes_before = dc210_gate_passes(&again);
+		let third = wire_table_delete(&again, &retry, &row_key_ids).await;
+		println!(
+			"DC210 THIRD attempt (durable replay after a second restart): {}",
+			dc210_answer(&third)
+		);
+		assert_eq!(third.write.status, WriteStatus::DUPLICATE, "{third:?}");
+		assert_eq!(
+			dc210_counts(&third),
+			[1, 0, 0],
+			"the first counts are replayed"
+		);
+		assert_eq!(third.write.commit_hlc, second.write.commit_hlc);
+		assert_eq!(
+			dc210_gate_passes(&again),
+			gate_passes_before,
+			"a replay runs no gate"
+		);
+		assert_eq!(
+			dc210_tombstone_hlc(&again, &descriptor, 7),
+			tombstone,
+			"the replay wrote no second tombstone"
+		);
+		// What a new plan answers for the same row now: the replay above was not one.
+		let (replanned, replanned_ids) = dc210_delete_of(&descriptor, 7, 210_003, 3);
+		let replanned = wire_table_delete(&again, &replanned, &replanned_ids).await;
+		assert_eq!(replanned.write.status, WriteStatus::OK, "{replanned:?}");
+		assert_eq!(dc210_counts(&replanned), [0, 1, 0]);
+		assert_eq!(dc210_tombstone_hlc(&again, &descriptor, 7), tombstone);
+		shutdown_lease_node(again).await;
+	}
+
+	/// The exit of the lease gate marks only its own refusal as made before submission. An outcome
+	/// already recorded for the operation, a pending finalization of it, and the expiry of the
+	/// caller's clocks leave through the same exit and keep the caller's existing retention,
+	/// whatever their status: a recorded LEASE_EXPIRED is replayed with the status of the gate's
+	/// own refusal and is still not one.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+	async fn the_lease_gate_exit_marks_only_its_own_refusal_as_refused_before_submission() {
+		let (_dir, owned_node, descriptor) = lease_wait_node("dc210-exit-retention").await;
+		let node = &owned_node;
+		let server = &node.data_server;
+		// The seeded pending record below must stay as seeded.
+		node.handles.pending_finalization_reconciler.abort();
+		let stopped = tokio::time::Instant::now() + STEP_BOUND;
+		while !node.handles.pending_finalization_reconciler.is_finished() {
+			assert!(
+				tokio::time::Instant::now() < stopped,
+				"the reconciler did not stop"
+			);
+			tokio::time::sleep(Duration::from_millis(1)).await;
+		}
+		let nothing_submitted = NothingSubmitted::at_attempt_start();
+		let live = || WriteClocks::new(Duration::from_secs(30), None);
+		let exit = |meta: TableWriteRequestMeta, clocks: WriteClocks| {
+			let nothing_submitted = &nothing_submitted;
+			async move {
+				let (outcome, answer) = server
+					.lease_gate_exit_unadmitted(
+						nothing_submitted,
+						&meta,
+						&table_write_synthetic_meta(&meta, Identity::ZERO, 0),
+						clocks,
+						Some([1, 0, 0]),
+						WriteStatus::LEASE_EXPIRED,
+						LeaseGateWaitOutcome::RefusedAtCap,
+					)
+					.await
+					.unwrap();
+				let (response, _, retention) = answer.expect("the exit answers").into_parts();
+				(outcome, response.status, retention)
+			}
+		};
+
+		// The gate's own refusal: nothing recorded, nothing pending, clocks alive.
+		let (refused, _) = write_of(&descriptor, 7, 210_200);
+		assert_eq!(
+			exit(refused, live()).await,
+			(
+				LeaseGateWaitOutcome::RefusedAtCap,
+				WriteStatus::LEASE_EXPIRED,
+				AttemptRetention::RefusedBeforeSubmission
+			)
+		);
+		assert_ne!(
+			recorded_outcome(node, &refused).await.resolution,
+			MutationResolutionStatus::PRESENT,
+			"the refusal records nothing itself"
+		);
+
+		// The caller's clocks have expired: the recorded expiry.
+		let (expired, _) = write_of(&descriptor, 7, 210_201);
+		let already = WriteClocks::new(Duration::from_secs(30), Some(tokio::time::Instant::now()));
+		assert_eq!(
+			exit(expired, already).await,
+			(
+				LeaseGateWaitOutcome::ClocksExpired,
+				WriteStatus::WRITE_DEADLINE_EXCEEDED,
+				AttemptRetention::PreserveExistingRetention
+			)
+		);
+		assert_eq!(
+			recorded_outcome(node, &expired).await.write.status,
+			WriteStatus::WRITE_DEADLINE_EXCEEDED
+		);
+
+		// A pending finalization of the identity: the pending replay.
+		let (pending, _) = write_of(&descriptor, 7, 210_202);
+		let record = crate::network::pending_finalizations::PendingFinalizationRecord::new(
+			pending.parent_write_id,
+			true,
+			crate::consensus::TenantFinalization {
+				tenant_id: pending.tenant_id,
+				key_identity: Identity::new([0xA4; 32]),
+				charged_bytes: 777,
+				record_count: 1,
+				marker: FinalizationMarker {
+					log_index: 991,
+					term: 9,
+					epoch: 1,
+					commit_hlc: hlc(998, 7, 91),
+					payload_hash: [0xFA; 32],
+					e_safe_index: 991,
+					durability: DurabilityLevel::QUORUM,
+					_pad: [0; 7],
+				},
+			},
+		);
+		server
+			.pending_finalizations
+			.upsert(record.clone())
+			.await
+			.unwrap();
+		// The replay either leaves the record pending or reconciles it; which one is the
+		// fixture's business. Either way it is a replay of the operation, never a refusal.
+		let (outcome, status, retention) = exit(pending, live()).await;
+		println!(
+			"DC210 pending replay out of the gate exit: status={}",
+			status.0
+		);
+		assert_eq!(outcome, LeaseGateWaitOutcome::Replayed);
+		assert!(
+			status == WriteStatus::FINALIZATION_PENDING || status == WriteStatus::DUPLICATE,
+			"a pending replay answers pending or reconciled: {status:?}"
+		);
+		assert_eq!(retention, AttemptRetention::PreserveExistingRetention);
+		// Reconciled, the record is gone already.
+		let _ = server.pending_finalizations.remove(record.id).await;
+
+		// An outcome recorded for the identity, carrying the very status of the gate's refusal.
+		let (recorded, _) = write_of(&descriptor, 7, 210_203);
+		let sticky = crate::network::data_server::error_response(
+			&table_write_synthetic_meta(&recorded, Identity::ZERO, 0),
+			WriteStatus::LEASE_EXPIRED,
+			node.local_node,
+		);
+		server
+			.record_mutation_outcome(
+				recorded.parent_write_id,
+				recorded.tenant_id,
+				sticky,
+				None,
+				Some([1, 0, 0]),
+			)
+			.await
+			.unwrap();
+		assert_eq!(
+			exit(recorded, live()).await,
+			(
+				LeaseGateWaitOutcome::Replayed,
+				WriteStatus::LEASE_EXPIRED,
+				AttemptRetention::PreserveExistingRetention
+			),
+			"a recorded outcome is replayed, not refused, whatever its status"
+		);
+		shutdown_lease_node(owned_node).await;
+	}
+
+	/// Preserved behaviour, for the delete itself: a delete whose caller's deadline ends its wait
+	/// at the lease gate is answered with the recorded expiry, and both layers keep it, as before.
+	/// A retry under the same identity after the lease is back is answered with it and runs no
+	/// gate.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+	async fn a_table_delete_ended_by_its_callers_deadline_at_the_gate_keeps_its_expiry() {
+		let (_dir, node, descriptor) = lease_wait_node("dc210-delete-deadline-kept").await;
+		let (written, batch) = write_of(&descriptor, 7, 210_300);
+		let (written, _) = node.data_server.table_write(written, batch).await.unwrap();
+		assert_eq!(written.write.status, WriteStatus::OK);
+
+		set_cap(&node, WIDE_CAP);
+		let (mut meta, row_key_ids) = dc210_delete_of(&descriptor, 7, 210_301, 3);
+		meta.deadline_remaining_millis = 3_000;
+		expire_cached_leases(&node, meta.client_hlc);
+		let first = wire_table_delete(&node, &meta, &row_key_ids).await;
+		assert_eq!(
+			first.write.status,
+			WriteStatus::WRITE_DEADLINE_EXCEEDED,
+			"{first:?}"
+		);
+		assert_eq!(
+			first.write.mutation_commit_knowledge(),
+			MutationCommitKnowledge::KNOWN_NOT_COMMITTED
+		);
+		assert_eq!(
+			completed_waits(&node),
+			vec![(
+				LeaseGateWaitReason::Expired,
+				LeaseGateWaitOutcome::ClocksExpired
+			)],
+			"the caller's clocks ended the wait at the gate"
+		);
+		let (cached, stored) = dc210_kept(&node, &meta);
+		assert_eq!(
+			cached.map(|cached| bytemuck::bytes_of(&cached).to_vec()),
+			Some(bytemuck::bytes_of(&first).to_vec()),
+			"the in-memory delete cache keeps the expiry"
+		);
+		assert_eq!(
+			stored.map(|stored| stored.status),
+			Some(WriteStatus::WRITE_DEADLINE_EXCEEDED),
+			"the durable store keeps the expiry"
+		);
+
+		assert!(renew(&node).await >= 1, "a valid renewal arrives");
+		let mut retry = meta;
+		retry.set_attempts_remaining(2);
+		retry.deadline_remaining_millis = 0;
+		let gate_passes_before = dc210_gate_passes(&node);
+		let second = wire_table_delete(&node, &retry, &row_key_ids).await;
+		assert_eq!(
+			bytemuck::bytes_of(&second),
+			bytemuck::bytes_of(&first),
+			"the retry is answered with the recorded expiry"
+		);
+		assert_eq!(
+			dc210_gate_passes(&node),
+			gate_passes_before,
+			"a replay runs no gate"
+		);
+		assert!(dc210_row_is_live(&node, &descriptor, 7));
 		shutdown_lease_node(node).await;
 	}
 

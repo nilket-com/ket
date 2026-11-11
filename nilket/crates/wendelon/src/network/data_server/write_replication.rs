@@ -937,7 +937,96 @@ where
 	}
 }
 
-type LeaseGateAnswer = (WriteResponseMeta, Option<FinalizationMarker>);
+/// What one attempt of a Today table write or delete answers, with what its caller may keep of it.
+///
+/// A module of its own so that the fields are private to it. A refusal before submission can be
+/// made only by `TableAttemptAnswer::refused_before_submission`, which builds the refusal itself and
+/// needs the attempt's `NothingSubmitted`; nothing can move it onto another response afterwards,
+/// and nothing can derive it from a status.
+mod table_attempt {
+	use crate::network::data_server::error_response;
+	use crate::schema::{
+		FinalizationMarker, NodeId, WriteRequestMeta, WriteResponseMeta, WriteStatus,
+	};
+
+	/// Proof that an attempt has not yet submitted any of its work: no durable append started and
+	/// no replica leg sent. Made once, where the attempt begins, and given up where it first
+	/// dispatches work. Neither `Clone` nor `Copy`: once given up, no refusal can be made from it.
+	pub(in crate::network::data_server) struct NothingSubmitted(());
+
+	impl NothingSubmitted {
+		pub(in crate::network::data_server) fn at_attempt_start() -> Self {
+			Self(())
+		}
+
+		/// The attempt dispatches its first work now.
+		pub(in crate::network::data_server) fn begin_submission(self) {}
+	}
+
+	/// Whether a caller that keeps outcomes of its own under the operation's identity keeps this
+	/// answer.
+	#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+	pub(in crate::network::data_server) enum AttemptRetention {
+		/// A refusal made before this attempt submitted any work. Nothing of the attempt exists to
+		/// be replayed, and what it lacked may be back: a retry of the identity runs its gates again.
+		RefusedBeforeSubmission,
+		/// Every other answer: a replay, a recorded expiry, and whatever is answered once work may
+		/// have been submitted. The caller keeps what it kept before.
+		PreserveExistingRetention,
+	}
+
+	#[derive(Clone, Copy, Debug)]
+	pub(in crate::network::data_server) struct TableAttemptAnswer {
+		response: WriteResponseMeta,
+		trailing: Option<FinalizationMarker>,
+		retention: AttemptRetention,
+	}
+
+	impl TableAttemptAnswer {
+		/// The refusal `status`, made while nothing has been submitted.
+		pub(in crate::network::data_server) fn refused_before_submission(
+			_nothing_submitted: &NothingSubmitted,
+			synthetic: &WriteRequestMeta,
+			status: WriteStatus,
+			leader_hint: NodeId,
+		) -> Self {
+			Self {
+				response: error_response(synthetic, status, leader_hint),
+				trailing: None,
+				retention: AttemptRetention::RefusedBeforeSubmission,
+			}
+		}
+
+		/// Any other answer, as it stands.
+		pub(in crate::network::data_server) fn preserving(
+			(response, trailing): (WriteResponseMeta, Option<FinalizationMarker>),
+		) -> Self {
+			Self {
+				response,
+				trailing,
+				retention: AttemptRetention::PreserveExistingRetention,
+			}
+		}
+
+		pub(in crate::network::data_server) fn into_parts(
+			self,
+		) -> (
+			WriteResponseMeta,
+			Option<FinalizationMarker>,
+			AttemptRetention,
+		) {
+			(self.response, self.trailing, self.retention)
+		}
+
+		/// For a caller that keeps no outcome of its own.
+		pub(in crate::network::data_server) fn discarding_retention(
+			self,
+		) -> (WriteResponseMeta, Option<FinalizationMarker>) {
+			(self.response, self.trailing)
+		}
+	}
+}
+pub(super) use table_attempt::{AttemptRetention, NothingSubmitted, TableAttemptAnswer};
 
 impl WendelonDataServer {
 	/// The leader the lease gate judges a lease's issuer by.
@@ -1040,12 +1129,32 @@ impl WendelonDataServer {
 		LEASE_GATE_WAIT
 	}
 
-	fn lease_gate_refusal(
+	/// A refusal of this attempt while it has submitted nothing, counted like every other answer.
+	/// The one place such an answer is made, for the shared helper and for the lease gate.
+	pub(super) fn refused_before_submission(
 		&self,
+		nothing_submitted: &NothingSubmitted,
 		synthetic: &WriteRequestMeta,
 		status: WriteStatus,
-	) -> LeaseGateAnswer {
-		self.counted_write_result(error_response(synthetic, status, self.local_node), None)
+	) -> TableAttemptAnswer {
+		metrics().observe_write_outcome(status);
+		TableAttemptAnswer::refused_before_submission(
+			nothing_submitted,
+			synthetic,
+			status,
+			self.local_node,
+		)
+	}
+
+	/// The gate's own refusal. The gate precedes all of the attempt's work, and the caller's
+	/// `NothingSubmitted` says so.
+	fn lease_gate_refusal(
+		&self,
+		nothing_submitted: &NothingSubmitted,
+		synthetic: &WriteRequestMeta,
+		status: WriteStatus,
+	) -> TableAttemptAnswer {
+		self.refused_before_submission(nothing_submitted, synthetic, status)
 	}
 
 	/// The write's own clocks ended it before any durable work: the outcome of the pre-durable
@@ -1056,7 +1165,7 @@ impl WendelonDataServer {
 		synthetic: &WriteRequestMeta,
 		expiry: super::write_clocks::WriteExpiry,
 		delete_counts: Option<[u32; 3]>,
-	) -> std::io::Result<LeaseGateAnswer> {
+	) -> std::io::Result<TableAttemptAnswer> {
 		let response = mutation_expiry_response(
 			synthetic,
 			expiry,
@@ -1070,14 +1179,15 @@ impl WendelonDataServer {
 			delete_counts,
 		)
 		.await?;
-		Ok((response, None))
+		// A recorded outcome of the operation, not a refusal of this attempt.
+		Ok(TableAttemptAnswer::preserving((response, None)))
 	}
 
 	/// The pending-finalization replay of `write_table_bifurcated`, for a write that waited.
 	async fn lease_gate_pending_replay(
 		&self,
 		meta: &TableWriteRequestMeta,
-	) -> std::io::Result<Option<LeaseGateAnswer>> {
+	) -> std::io::Result<Option<TableAttemptAnswer>> {
 		let Some(record) = self
 			.pending_finalizations
 			.find_by_write_id(meta.tenant_id, meta.parent_write_id)
@@ -1092,7 +1202,7 @@ impl WendelonDataServer {
 		);
 		self.replay_write_outcome(meta.tenant_id, outcome)
 			.await
-			.map(Some)
+			.map(|replayed| Some(TableAttemptAnswer::preserving(replayed)))
 	}
 
 	/// The one exit of every write that waited at the lease gate and is not admitted. `status` and
@@ -1105,17 +1215,24 @@ impl WendelonDataServer {
 	/// 2. if the write's own clocks have expired, theirs is the outcome, at a tie with the cap
 	///    too, recorded as the pre-durable clock check records it;
 	/// 3. otherwise the refusal stands.
-	async fn lease_gate_exit_unadmitted(
+	///
+	/// Only step 3 is a refusal before submission. Steps 1 and 2 answer with an outcome of the
+	/// operation, whatever its status, and keep the caller's existing retention.
+	pub(super) async fn lease_gate_exit_unadmitted(
 		&self,
+		nothing_submitted: &NothingSubmitted,
 		meta: &TableWriteRequestMeta,
 		synthetic: &WriteRequestMeta,
 		clocks: WriteClocks,
 		delete_counts: Option<[u32; 3]>,
 		status: WriteStatus,
 		outcome: LeaseGateWaitOutcome,
-	) -> std::io::Result<(LeaseGateWaitOutcome, Option<LeaseGateAnswer>)> {
+	) -> std::io::Result<(LeaseGateWaitOutcome, Option<TableAttemptAnswer>)> {
 		if let Some(replayed) = self.durable_mutation_replay(meta).await? {
-			return Ok((LeaseGateWaitOutcome::Replayed, Some(replayed)));
+			return Ok((
+				LeaseGateWaitOutcome::Replayed,
+				Some(TableAttemptAnswer::preserving(replayed)),
+			));
 		}
 		if let Some(replayed) = self.lease_gate_pending_replay(meta).await? {
 			return Ok((LeaseGateWaitOutcome::Replayed, Some(replayed)));
@@ -1129,7 +1246,10 @@ impl WendelonDataServer {
 				),
 			));
 		}
-		Ok((outcome, Some(self.lease_gate_refusal(synthetic, status))))
+		Ok((
+			outcome,
+			Some(self.lease_gate_refusal(nothing_submitted, synthetic, status)),
+		))
 	}
 
 	/// The lease gate of a Today table write or delete. `None` admits; `Some` is the answer to
@@ -1142,12 +1262,13 @@ impl WendelonDataServer {
 	/// `readmit_after_lease_gate_wait`.
 	pub(super) async fn admit_at_table_lease_gate(
 		&self,
+		nothing_submitted: &NothingSubmitted,
 		meta: &TableWriteRequestMeta,
 		synthetic: &WriteRequestMeta,
 		children: &[BifurcatedTableChildWrite],
 		clocks: WriteClocks,
 		delete_counts: Option<[u32; 3]>,
-	) -> std::io::Result<Option<LeaseGateAnswer>> {
+	) -> std::io::Result<Option<TableAttemptAnswer>> {
 		let reason = match self
 			.table_children_lease_gate(children, meta.expected_epoch, meta.client_hlc)
 			.await
@@ -1155,6 +1276,7 @@ impl WendelonDataServer {
 			LeaseGateResult::Valid => return Ok(None),
 			LeaseGateResult::InvalidSignature => {
 				return Ok(Some(self.lease_gate_refusal(
+					nothing_submitted,
 					synthetic,
 					WriteStatus::INVALID_LEASE_SIGNATURE,
 				)));
@@ -1173,11 +1295,20 @@ impl WendelonDataServer {
 		)
 		.await;
 		let unadmitted = |status, outcome| {
-			self.lease_gate_exit_unadmitted(meta, synthetic, clocks, delete_counts, status, outcome)
+			self.lease_gate_exit_unadmitted(
+				nothing_submitted,
+				meta,
+				synthetic,
+				clocks,
+				delete_counts,
+				status,
+				outcome,
+			)
 		};
 		let ended = match end {
 			LeaseGateWaitEnd::Recovered => {
 				self.readmit_after_lease_gate_wait(
+					nothing_submitted,
 					meta,
 					synthetic,
 					children,
@@ -1243,20 +1374,32 @@ impl WendelonDataServer {
 	/// here is preceded by the replays and by the caller's clocks.
 	pub(super) async fn readmit_after_lease_gate_wait(
 		&self,
+		nothing_submitted: &NothingSubmitted,
 		meta: &TableWriteRequestMeta,
 		synthetic: &WriteRequestMeta,
 		children: &[BifurcatedTableChildWrite],
 		clocks: WriteClocks,
 		delete_counts: Option<[u32; 3]>,
 		deadline: tokio::time::Instant,
-	) -> std::io::Result<(LeaseGateWaitOutcome, Option<LeaseGateAnswer>)> {
+	) -> std::io::Result<(LeaseGateWaitOutcome, Option<TableAttemptAnswer>)> {
 		let unadmitted = |status, outcome| {
-			self.lease_gate_exit_unadmitted(meta, synthetic, clocks, delete_counts, status, outcome)
+			self.lease_gate_exit_unadmitted(
+				nothing_submitted,
+				meta,
+				synthetic,
+				clocks,
+				delete_counts,
+				status,
+				outcome,
+			)
 		};
 		let refused_on_recheck =
 			|status| unadmitted(status, LeaseGateWaitOutcome::RefusedOnRecheck);
 		if let Some(replayed) = self.durable_mutation_replay(meta).await? {
-			return Ok((LeaseGateWaitOutcome::Replayed, Some(replayed)));
+			return Ok((
+				LeaseGateWaitOutcome::Replayed,
+				Some(TableAttemptAnswer::preserving(replayed)),
+			));
 		}
 		if meta.expected_epoch < self.admission_snapshot().current_epoch {
 			return refused_on_recheck(WriteStatus::EPOCH_STALE).await;
