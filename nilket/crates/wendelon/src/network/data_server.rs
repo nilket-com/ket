@@ -224,7 +224,7 @@ use write_replication::append_bifurcated_table_children_durable;
 use write_replication::append_table_children_tracking_effects;
 use write_replication::{
 	AttemptRetention, DurableQuorumTracker, NothingSubmitted, PendingFinalizationClaims,
-	TableAttemptAnswer, WriteOutcome,
+	TableAttemptAnswer, TablePlacement, WriteOutcome,
 };
 mod descriptor_migration;
 mod query_clocks;
@@ -8843,7 +8843,7 @@ impl WendelonDataServer {
 		&self,
 		meta: TableWriteRequestMeta,
 		mut bifurcated: BifurcatedTableWrite,
-		mut groups: Vec<TableReplicaGroup>,
+		groups_at_entry: Vec<TableReplicaGroup>,
 		descriptor: &TableSchemaDescriptor,
 		commit_hlc: HybridTimestamp,
 		is_append_only: bool,
@@ -8889,18 +8889,9 @@ impl WendelonDataServer {
 			return Ok(TableAttemptAnswer::preserving((response, None)));
 		}
 
-		let lease_gate_is_primary_for_all_groups = if self.lease_gate_enabled {
-			groups.iter().all(|group| {
-				group
-					.replicas
-					.first()
-					.map(|n| n.id == self.local_node.id)
-					.unwrap_or(false)
-			})
-		} else {
-			true
-		};
-		if self.lease_gate_enabled && !lease_gate_is_primary_for_all_groups {
+		// An early refusal, before the orphan-witness recovery that leadership needs. The work is
+		// not placed on these groups: it is placed on the ones computed and checked below.
+		if self.lease_gate_enabled && !self.first_in_every_group(&groups_at_entry) {
 			return Ok(self.refused_before_submission(
 				&nothing_submitted,
 				&synthetic,
@@ -8976,19 +8967,30 @@ impl WendelonDataServer {
 			}
 		};
 		let migrations_snapshot = self.state_machine.state_snapshot().await.migrations.clone();
-		groups = self
-			.table_batch_replica_groups(&bifurcated.children, &migrations_snapshot)
+		// The groups the work is placed on are computed and checked here, in one step, and
+		// nothing is awaited or computed again between this and the submission boundary below.
+		let placement = match self
+			.place_table_attempt(&nothing_submitted, &bifurcated.children, &migrations_snapshot)
 			.ok_or_else(|| {
 				Error::new(ErrorKind::InvalidData, "table replica group restamp failed")
-			})?;
-
-		if groups.is_empty() {
-			// Not shown to be transient: it keeps the caller's existing retention.
-			return Ok(TableAttemptAnswer::preserving(self.counted_write_result(
-				error_response(&synthetic, WriteStatus::INTERNAL_ERROR, self.local_node),
-				None,
-			)));
-		}
+			})? {
+			TablePlacement::Admitted(placement) => placement,
+			TablePlacement::NoGroups => {
+				// Not shown to be transient: it keeps the caller's existing retention.
+				return Ok(TableAttemptAnswer::preserving(self.counted_write_result(
+					error_response(&synthetic, WriteStatus::INTERNAL_ERROR, self.local_node),
+					None,
+				)));
+			}
+			TablePlacement::NotFirst => {
+				return Ok(self.refused_before_submission(
+					&nothing_submitted,
+					&synthetic,
+					WriteStatus::NOT_LEADER,
+				));
+			}
+		};
+		let groups = placement.groups();
 		let mut quorum_trackers = groups
 			.iter()
 			.map(|group| {

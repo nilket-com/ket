@@ -944,7 +944,10 @@ where
 /// needs the attempt's `NothingSubmitted`; nothing can move it onto another response afterwards,
 /// and nothing can derive it from a status.
 mod table_attempt {
-	use crate::network::data_server::error_response;
+	use crate::consensus::MigrationLedgerEntry;
+	use crate::network::data_server::{
+		BifurcatedTableChildWrite, TableReplicaGroup, WendelonDataServer, error_response,
+	};
 	use crate::schema::{
 		FinalizationMarker, NodeId, WriteRequestMeta, WriteResponseMeta, WriteStatus,
 	};
@@ -961,6 +964,68 @@ mod table_attempt {
 
 		/// The attempt dispatches its first work now.
 		pub(in crate::network::data_server) fn begin_submission(self) {}
+	}
+
+	/// The replica groups an attempt's work is placed on: the groups that were computed and put
+	/// to this node's configured placement check in one step. Only `place_table_attempt` makes
+	/// one, and its groups cannot be replaced afterwards, so the quorum, the local append and the
+	/// replica legs built from it are built from checked groups. It says that these groups passed
+	/// the local check when they were computed. It does not say that the node is primary when the
+	/// lease gate is off, where that check is not configured, nor that the routing view is still
+	/// the same once the work is under way.
+	pub(in crate::network::data_server) struct LocallyAdmittedPlacement {
+		groups: Vec<TableReplicaGroup>,
+	}
+
+	impl LocallyAdmittedPlacement {
+		pub(in crate::network::data_server) fn groups(&self) -> &[TableReplicaGroup] {
+			&self.groups
+		}
+	}
+
+	/// How placing an attempt's work ended.
+	pub(in crate::network::data_server) enum TablePlacement {
+		/// At least one group, and the configured check passed on every one.
+		Admitted(LocallyAdmittedPlacement),
+		/// The computation gave no group at all. Never admitted, whatever the check.
+		NoGroups,
+		/// The lease gate is on and this node is not first in every group.
+		NotFirst,
+	}
+
+	impl WendelonDataServer {
+		/// Whether this node is first in every one of `groups`: the lease gate's primacy check.
+		pub(in crate::network::data_server) fn first_in_every_group(
+			&self,
+			groups: &[TableReplicaGroup],
+		) -> bool {
+			groups.iter().all(|group| {
+				group
+					.replicas
+					.first()
+					.is_some_and(|primary| primary.id == self.local_node.id)
+			})
+		}
+
+		/// Computes the groups this attempt's work is placed on and checks them, while nothing
+		/// has been submitted. Synchronous: the caller begins its submission from the result with
+		/// nothing awaited and nothing computed again in between. `None` is a computation that
+		/// failed.
+		pub(in crate::network::data_server) fn place_table_attempt(
+			&self,
+			_nothing_submitted: &NothingSubmitted,
+			children: &[BifurcatedTableChildWrite],
+			migrations: &std::collections::HashMap<u64, MigrationLedgerEntry>,
+		) -> Option<TablePlacement> {
+			let groups = self.table_batch_replica_groups(children, migrations)?;
+			Some(if groups.is_empty() {
+				TablePlacement::NoGroups
+			} else if self.lease_gate_enabled && !self.first_in_every_group(&groups) {
+				TablePlacement::NotFirst
+			} else {
+				TablePlacement::Admitted(LocallyAdmittedPlacement { groups })
+			})
+		}
 	}
 
 	/// Whether a caller that keeps outcomes of its own under the operation's identity keeps this
@@ -1026,7 +1091,9 @@ mod table_attempt {
 		}
 	}
 }
-pub(super) use table_attempt::{AttemptRetention, NothingSubmitted, TableAttemptAnswer};
+pub(super) use table_attempt::{
+	AttemptRetention, NothingSubmitted, TableAttemptAnswer, TablePlacement,
+};
 
 impl WendelonDataServer {
 	/// The leader the lease gate judges a lease's issuer by.
@@ -1408,13 +1475,7 @@ impl WendelonDataServer {
 		let Some(groups) = self.table_batch_replica_groups(children, &migrations) else {
 			return refused_on_recheck(WriteStatus::INTERNAL_ERROR).await;
 		};
-		let primary_for_all = groups.iter().all(|group| {
-			group
-				.replicas
-				.first()
-				.is_some_and(|primary| primary.id == self.local_node.id)
-		});
-		if !primary_for_all {
+		if !self.first_in_every_group(&groups) {
 			return refused_on_recheck(WriteStatus::NOT_LEADER).await;
 		}
 		if !self

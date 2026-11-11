@@ -1702,6 +1702,19 @@ struct OrphanWitnessFixture {
 }
 
 async fn build_orphan_witness_fixture(tag: &str) -> OrphanWitnessFixture {
+	build_two_node_fixture(tag, false, |leader, follower| {
+		Arc::new(FixedReplicaRouter::new(vec![leader, follower]))
+	})
+	.await
+}
+
+/// Two real nodes joined by the loopback transport, each with a data server over `router`. The
+/// leader's data server is the one under test; the follower's serves the leader's replica legs.
+async fn build_two_node_fixture(
+	tag: &str,
+	leader_lease_gate: bool,
+	router: impl FnOnce(NodeId, NodeId) -> Arc<dyn ReplicaRouter>,
+) -> OrphanWitnessFixture {
 	let leader_node_dir = bootstrap_tempdir(&format!("{tag}-leader"));
 	let leader_node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		26,
@@ -1771,10 +1784,7 @@ async fn build_orphan_witness_fixture(tag: &str) -> OrphanWitnessFixture {
 		providers.insert(TransportTier::QuicIoUring, loopback_provider.clone());
 		TransportProviderFactory::new(tiers, providers, resolver.clone(), epoch_rx.clone())
 	};
-	let router: Arc<dyn ReplicaRouter> = Arc::new(FixedReplicaRouter::new(vec![
-		leader_node.local_node,
-		follower_node.local_node,
-	]));
+	let router = router(leader_node.local_node, follower_node.local_node);
 
 	let leader = Arc::new(
 		WendelonDataServer::new(
@@ -1788,7 +1798,8 @@ async fn build_orphan_witness_fixture(tag: &str) -> OrphanWitnessFixture {
 			build_factory(),
 			pool.clone(),
 		)
-		.unwrap(),
+		.unwrap()
+		.with_lease_gate(leader_lease_gate),
 	);
 	let follower = Arc::new(
 		WendelonDataServer::new(
@@ -21318,5 +21329,424 @@ mod lease_wait {
 		);
 		assert_eq!(stall_only.expired(), None, "the cap alone has run out");
 		assert_eq!(LEASE_GATE_WAIT, Duration::from_secs(2));
+	}
+}
+
+/// The groups a Today table write or delete is placed on are the groups its primacy was checked
+/// on. Two real nodes on the loopback transport; the peer serves the replica legs for real. The
+/// router's view changes at a chosen placement lookup and then stays: a controlled change of the
+/// routing view between the caller's group computation and the one the work is placed under, not
+/// a membership or migration transition end to end.
+mod checked_placement {
+	use super::*;
+	use std::sync::atomic::{AtomicUsize, Ordering};
+
+	const STEP_BOUND: Duration = Duration::from_secs(60);
+
+	#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+	enum View {
+		/// The coordinator is first, the peer second.
+		CoordinatorFirst,
+		/// The peer is first, the coordinator second.
+		PeerFirst,
+	}
+
+	/// Answers `CoordinatorFirst` for every placement lookup before the switch point and
+	/// `PeerFirst` from it on, and records the view each lookup was given.
+	struct SwitchingRouter {
+		coordinator: NodeId,
+		peer: NodeId,
+		lookups: AtomicUsize,
+		peer_first_from: AtomicUsize,
+		seen: std::sync::Mutex<Vec<View>>,
+	}
+
+	impl SwitchingRouter {
+		fn new(coordinator: NodeId, peer: NodeId) -> Self {
+			Self {
+				coordinator,
+				peer,
+				lookups: AtomicUsize::new(0),
+				peer_first_from: AtomicUsize::new(usize::MAX),
+				seen: std::sync::Mutex::new(Vec::new()),
+			}
+		}
+
+		/// The next lookup still sees the coordinator first; every one after it sees the peer.
+		fn switch_after_the_next_lookup(&self) {
+			self.peer_first_from
+				.store(self.lookups.load(Ordering::SeqCst) + 1, Ordering::SeqCst);
+		}
+
+		/// The views given since the last call.
+		fn take_seen(&self) -> Vec<View> {
+			std::mem::take(&mut *self.seen.lock().unwrap())
+		}
+
+		fn look_up(&self) -> Vec<NodeId> {
+			let lookup = self.lookups.fetch_add(1, Ordering::SeqCst);
+			let view = if lookup >= self.peer_first_from.load(Ordering::SeqCst) {
+				View::PeerFirst
+			} else {
+				View::CoordinatorFirst
+			};
+			self.seen.lock().unwrap().push(view);
+			match view {
+				View::CoordinatorFirst => vec![self.coordinator, self.peer],
+				View::PeerFirst => vec![self.peer, self.coordinator],
+			}
+		}
+	}
+
+	impl ReplicaRouter for SwitchingRouter {
+		fn replicas_for_locality(&self, _locality: Locality) -> Vec<NodeId> {
+			self.look_up()
+		}
+
+		fn replication_factor(&self) -> usize {
+			2
+		}
+
+		fn replicas_for_placement(&self, _key: crate::schema::table::PlacementKey) -> Vec<NodeId> {
+			self.look_up()
+		}
+	}
+
+	struct Fixture {
+		nodes: OrphanWitnessFixture,
+		router: Arc<SwitchingRouter>,
+		descriptor: TableSchemaDescriptor,
+	}
+
+	impl Fixture {
+		async fn shutdown(self) {
+			shutdown_lease_node(self.nodes.leader_node).await;
+			shutdown_lease_node(self.nodes.follower_node).await;
+		}
+	}
+
+	/// The coordinator's data server runs with the lease gate as given and, in its cache, a signed
+	/// lease of its own over every locality at the requests' epoch, valid for their client clocks.
+	async fn fixture(tag: &str, lease_gate: bool) -> Fixture {
+		let mut made = None;
+		let nodes = build_two_node_fixture(tag, lease_gate, |coordinator, peer| {
+			let router = Arc::new(SwitchingRouter::new(coordinator, peer));
+			made = Some(router.clone());
+			router
+		})
+		.await;
+		let router = made.expect("the fixture built its router");
+		let descriptor = typed_table_descriptor();
+		for node in [&nodes.leader_node, &nodes.follower_node] {
+			node.raft
+				.client_write(WendelonRequest::SchemaUpdate(typed_table_schema_update(
+					&descriptor,
+				)))
+				.await
+				.unwrap();
+		}
+		let coordinator = nodes.leader_node.local_node;
+		assert_eq!(nodes.leader.lease_gate_enabled, lease_gate);
+		nodes
+			.leader
+			.cache_granted_lease(nodes.leader.make_signed_lease(
+				1,
+				coordinator,
+				0,
+				u64::MAX,
+				hlc(0, 0, coordinator.id),
+				hlc(u64::MAX / 2, 0, coordinator.id),
+			));
+		router.take_seen();
+		Fixture {
+			nodes,
+			router,
+			descriptor,
+		}
+	}
+
+	fn write_of(
+		descriptor: &TableSchemaDescriptor,
+		id: i64,
+		sequence_no: u64,
+	) -> (TableWriteRequestMeta, RecordBatch) {
+		let batch = typed_table_batch(vec![id]);
+		let mut meta = typed_table_meta(descriptor, batch.num_rows());
+		meta.parent_write_id.sequence_no = sequence_no;
+		meta.set_attempts_remaining(3);
+		assert_eq!(meta.expected_epoch, 1, "the cached lease's epoch");
+		(meta, batch)
+	}
+
+	fn delete_of(
+		descriptor: &TableSchemaDescriptor,
+		id: i64,
+		sequence_no: u64,
+	) -> (TableDeleteRowsRequestMeta, Vec<Identity>) {
+		let mut meta: TableDeleteRowsRequestMeta = bytemuck::Zeroable::zeroed();
+		meta.parent_write_id = crate::schema::ClientWriteId {
+			client_uuid: [0x72; 16],
+			sequence_no,
+			idempotency_ttl_ms: 300_000,
+			_pad: 0,
+		};
+		meta.client_hlc = hlc(20, 0, 1);
+		meta.expected_epoch = 1;
+		meta.tenant_id = tenant();
+		meta.table_object_id = descriptor.table_object_id;
+		meta.schema_generation = descriptor.schema_generation;
+		meta.row_count = 1;
+		meta.durability = DurabilityLevel::QUORUM;
+		meta.set_attempts_remaining(3);
+		(meta, vec![row_key(descriptor, id)])
+	}
+
+	fn row_key(descriptor: &TableSchemaDescriptor, id: i64) -> Identity {
+		table_row_identity(tenant(), descriptor.table_object_id, &id.to_le_bytes())
+	}
+
+	fn operator(fixture: &Fixture) -> RequestContext {
+		RequestContext {
+			remote: Some(fixture.nodes.leader_node.local_node),
+			actor: actor(ActorRole::Operator, None),
+		}
+	}
+
+	/// The write as the wire delivers it to the coordinator's data server.
+	async fn wire_table_write(
+		fixture: &Fixture,
+		meta: &TableWriteRequestMeta,
+		batch: &RecordBatch,
+	) -> TableWriteResponseMeta {
+		let frame = table_write_frame_for_test(meta, batch);
+		let response = tokio::time::timeout(
+			STEP_BOUND,
+			DataRingServer::handle_data_frame(
+				fixture.nodes.leader.as_ref(),
+				operator(fixture),
+				frame,
+			),
+		)
+		.await
+		.expect("the write answers")
+		.expect("the stream carries an answer")
+		.expect("a response frame");
+		bytemuck::pod_read_unaligned(
+			&response.meta[..std::mem::size_of::<TableWriteResponseMeta>()],
+		)
+	}
+
+	/// The delete as the wire delivers it to the coordinator's data server.
+	async fn wire_table_delete(
+		fixture: &Fixture,
+		meta: &TableDeleteRowsRequestMeta,
+		row_key_ids: &[Identity],
+	) -> TableDeleteRowsResponseMeta {
+		let mut ids = arrow::array::FixedSizeBinaryBuilder::with_capacity(row_key_ids.len(), 32);
+		for row_key_id in row_key_ids {
+			ids.append_value(row_key_id.as_bytes()).unwrap();
+		}
+		let batch = RecordBatch::try_new(
+			Arc::new(table_delete_rows_schema()),
+			vec![Arc::new(ids.finish())],
+		)
+		.unwrap();
+		let meta_bytes = bytemuck::bytes_of(meta).to_vec();
+		let payload = encode_batch(&batch).unwrap();
+		let frame = HrftFrame {
+			header: FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: MsgType::TABLE_DELETE_REQ.0,
+				flags: 0,
+				stream_id: 73,
+				meta_len: meta_bytes.len() as u32,
+				arrow_len: payload.len() as u32,
+				trailing_len: 0,
+			},
+			meta: crate::network::pool::PooledBuf::orphan(meta_bytes),
+			arrow_payload: Some(crate::network::pool::PooledBuf::orphan(payload)),
+			trailing: None,
+		};
+		let response = tokio::time::timeout(
+			STEP_BOUND,
+			DataRingServer::handle_data_frame(
+				fixture.nodes.leader.as_ref(),
+				operator(fixture),
+				frame,
+			),
+		)
+		.await
+		.expect("the delete answers")
+		.expect("the stream carries an answer")
+		.expect("a response frame");
+		bytemuck::pod_read_unaligned(
+			&response.meta[..std::mem::size_of::<TableDeleteRowsResponseMeta>()],
+		)
+	}
+
+	/// What each real store holds for the row, in the order (coordinator, peer): `None` for no
+	/// record, otherwise whether the record is live.
+	fn row_on_each_store(fixture: &Fixture, id: i64) -> (Option<bool>, Option<bool>) {
+		let on = |node: &WendelonNode| {
+			node.slab
+				.lookup(tenant(), row_key(&fixture.descriptor, id))
+				.unwrap()
+				.map(|location| !location.is_tombstone)
+		};
+		(
+			on(&fixture.nodes.leader_node),
+			on(&fixture.nodes.follower_node),
+		)
+	}
+
+	/// Neither node holds pending work for the identity and the coordinator holds no outcome.
+	async fn assert_nothing_is_kept(fixture: &Fixture, write_id: crate::schema::ClientWriteId) {
+		let stored = fixture
+			.nodes
+			.leader
+			.stored_mutation_outcome_for_test(write_id, tenant());
+		assert!(stored.is_none(), "a durable outcome is kept: {stored:?}");
+		for (name, server) in [
+			("coordinator", &fixture.nodes.leader),
+			("peer", &fixture.nodes.follower),
+		] {
+			let pending = server
+				.pending_finalizations
+				.find_by_write_id(tenant(), write_id)
+				.await
+				.unwrap();
+			assert!(
+				pending.is_none(),
+				"the {name} holds pending work for a refused attempt"
+			);
+		}
+	}
+
+	/// The control. Under one stable view, with the gate on and a valid lease, a write is accepted
+	/// and is durable on both stores. It also fixes what the other tests rely on: one write makes
+	/// exactly two placement lookups, the caller's and the one its work is placed under.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+	async fn a_write_under_one_stable_view_is_accepted_on_both_stores() {
+		let fixture = fixture("checked-placement-control", true).await;
+		let (meta, batch) = write_of(&fixture.descriptor, 7, 211_001);
+		let written = wire_table_write(&fixture, &meta, &batch).await;
+		assert_eq!(written.write.status, WriteStatus::OK, "{written:?}");
+		assert_eq!(
+			written.write.mutation_commit_knowledge(),
+			MutationCommitKnowledge::COMMITTED
+		);
+		assert_eq!(
+			fixture.router.take_seen(),
+			vec![View::CoordinatorFirst, View::CoordinatorFirst]
+		);
+		assert_eq!(row_on_each_store(&fixture, 7), (Some(true), Some(true)));
+		fixture.shutdown().await;
+	}
+
+	/// The routing view changes after the write's primacy was checked and before its work is
+	/// placed: the coordinator is first in the checked groups and second in the placed ones. The
+	/// write is refused before it submits anything, and nothing of it exists on either store.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+	async fn a_write_whose_placement_changed_after_its_primacy_check_is_refused_unsubmitted() {
+		let fixture = fixture("checked-placement-write", true).await;
+		assert!(fixture.nodes.leader.lease_gate_enabled);
+		let (meta, batch) = write_of(&fixture.descriptor, 7, 211_100);
+		assert_eq!(meta.attempts_remaining(), 3, "not a last attempt");
+		fixture.router.switch_after_the_next_lookup();
+		let answered = wire_table_write(&fixture, &meta, &batch).await;
+		let seen = fixture.router.take_seen();
+		let rows = row_on_each_store(&fixture, 7);
+		println!(
+			"DC211 answer: status={:?} knowledge={:?}; placement lookups: {seen:?}; row (coordinator, peer): {rows:?}",
+			answered.write.status,
+			answered.write.mutation_commit_knowledge(),
+		);
+		assert_eq!(
+			seen,
+			vec![View::CoordinatorFirst, View::PeerFirst],
+			"the fixture: primary in the checked groups, not primary in the placed ones"
+		);
+		if answered.write.status == WriteStatus::OK {
+			println!(
+				"DC211 ACCEPTED under a placement whose primacy was never checked: knowledge={:?}, durable on coordinator={:?}, on peer={:?}",
+				answered.write.mutation_commit_knowledge(),
+				rows.0,
+				rows.1,
+			);
+		}
+		assert_eq!(
+			answered.write.status,
+			WriteStatus::NOT_LEADER,
+			"a write placed on groups this node is not first in is refused: {answered:?}"
+		);
+		assert_eq!(
+			answered.write.mutation_commit_knowledge(),
+			MutationCommitKnowledge::UNSPECIFIED,
+			"the plain refusal every NOT_LEADER before submission is"
+		);
+		assert_eq!(rows, (None, None), "nothing was submitted");
+		assert_nothing_is_kept(&fixture, meta.parent_write_id).await;
+		fixture.shutdown().await;
+	}
+
+	/// The delete shares the placement of the write. A row exists on both stores; the view changes
+	/// after the delete's primacy check: refused before submission, the row intact on both stores,
+	/// and no answer kept in the delete cache or the durable store.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+	async fn a_delete_whose_placement_changed_after_its_primacy_check_is_refused_unsubmitted() {
+		let fixture = fixture("checked-placement-delete", true).await;
+		let (write, batch) = write_of(&fixture.descriptor, 7, 211_200);
+		let written = wire_table_write(&fixture, &write, &batch).await;
+		assert_eq!(written.write.status, WriteStatus::OK, "{written:?}");
+		assert_eq!(row_on_each_store(&fixture, 7), (Some(true), Some(true)));
+		fixture.router.take_seen();
+
+		let (meta, row_key_ids) = delete_of(&fixture.descriptor, 7, 211_201);
+		fixture.router.switch_after_the_next_lookup();
+		let answered = wire_table_delete(&fixture, &meta, &row_key_ids).await;
+		let seen = fixture.router.take_seen();
+		let rows = row_on_each_store(&fixture, 7);
+		println!(
+			"DC211 delete answer: status={:?} knowledge={:?}; placement lookups: {seen:?}; row live (coordinator, peer): {rows:?}",
+			answered.write.status,
+			answered.write.mutation_commit_knowledge(),
+		);
+		assert_eq!(
+			seen,
+			vec![View::CoordinatorFirst, View::PeerFirst],
+			"the fixture: primary in the checked groups, not primary in the placed ones"
+		);
+		assert_eq!(
+			answered.write.status,
+			WriteStatus::NOT_LEADER,
+			"a delete placed on groups this node is not first in is refused: {answered:?}"
+		);
+		assert_eq!(rows, (Some(true), Some(true)), "the row is intact");
+		let cached = fixture
+			.nodes
+			.leader
+			.cached_table_delete_outcome_for_test(meta.parent_write_id, meta.tenant_id);
+		assert!(cached.is_none(), "the delete cache kept {cached:?}");
+		assert_nothing_is_kept(&fixture, meta.parent_write_id).await;
+		fixture.shutdown().await;
+	}
+
+	/// With the lease gate off the primacy check is not configured, as before: the same change of
+	/// view does not refuse the write.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+	async fn with_the_lease_gate_off_a_changed_placement_does_not_refuse() {
+		let fixture = fixture("checked-placement-gate-off", false).await;
+		assert!(!fixture.nodes.leader.lease_gate_enabled);
+		let (meta, batch) = write_of(&fixture.descriptor, 7, 211_300);
+		fixture.router.switch_after_the_next_lookup();
+		let written = wire_table_write(&fixture, &meta, &batch).await;
+		assert_eq!(
+			fixture.router.take_seen(),
+			vec![View::CoordinatorFirst, View::PeerFirst]
+		);
+		assert_eq!(written.write.status, WriteStatus::OK, "{written:?}");
+		assert_eq!(row_on_each_store(&fixture, 7), (Some(true), Some(true)));
+		fixture.shutdown().await;
 	}
 }
