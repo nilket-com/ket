@@ -2064,6 +2064,102 @@ impl PendingFinalizationReplayPath {
 	}
 }
 
+/// Why a table write's lease gate found no authority when its wait began.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LeaseGateWaitReason {
+	/// No cached lease matches the holder, the epoch and the range.
+	NoLease,
+	/// A matching lease is cached, and none of them is unexpired for the write.
+	Expired,
+	/// No current leader to judge the lease's issuer by.
+	NoLeader,
+}
+
+impl LeaseGateWaitReason {
+	const ALL: [Self; 3] = [Self::NoLease, Self::Expired, Self::NoLeader];
+
+	fn as_str(self) -> &'static str {
+		match self {
+			Self::NoLease => "no_lease",
+			Self::Expired => "expired",
+			Self::NoLeader => "no_leader",
+		}
+	}
+}
+
+/// How one completed wait at the lease gate ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LeaseGateWaitOutcome {
+	/// A valid lease arrived and every recheck passed.
+	Admitted,
+	/// The wait's cap ended it.
+	RefusedAtCap,
+	/// A lease whose issuer or signature does not stand ended it.
+	RefusedInvalidLease,
+	/// The write's own clocks ended it.
+	ClocksExpired,
+	/// A valid lease arrived, and the recheck of authority refused the write.
+	RefusedOnRecheck,
+	/// An outcome recorded for the same write while it waited was returned.
+	Replayed,
+	/// The leader watch closed.
+	WatchClosed,
+}
+
+impl LeaseGateWaitOutcome {
+	const ALL: [Self; 7] = [
+		Self::Admitted,
+		Self::RefusedAtCap,
+		Self::RefusedInvalidLease,
+		Self::ClocksExpired,
+		Self::RefusedOnRecheck,
+		Self::Replayed,
+		Self::WatchClosed,
+	];
+
+	fn as_str(self) -> &'static str {
+		match self {
+			Self::Admitted => "admitted",
+			Self::RefusedAtCap => "refused_at_cap",
+			Self::RefusedInvalidLease => "refused_invalid_lease",
+			Self::ClocksExpired => "clocks_expired",
+			Self::RefusedOnRecheck => "refused_on_recheck",
+			Self::Replayed => "replayed",
+			Self::WatchClosed => "watch_closed",
+		}
+	}
+}
+
+/// One counter per reason and outcome: a fixed 21 series.
+#[derive(Default)]
+struct LeaseGateWaitCounters {
+	waits: [[Counter; LeaseGateWaitOutcome::ALL.len()]; LeaseGateWaitReason::ALL.len()],
+}
+
+impl LeaseGateWaitCounters {
+	fn counter(&self, reason: LeaseGateWaitReason, outcome: LeaseGateWaitOutcome) -> &Counter {
+		&self.waits[reason as usize][outcome as usize]
+	}
+
+	fn render(&self, out: &mut String) {
+		render_counter_family_header(
+			out,
+			"wendelon_data_ring_lease_gate_waits_total",
+			"Completed table-write waits at the lease gate, by the reason seen at entry and the outcome.",
+		);
+		for reason in LeaseGateWaitReason::ALL {
+			for outcome in LeaseGateWaitOutcome::ALL {
+				render_counter_with_labels(
+					out,
+					"wendelon_data_ring_lease_gate_waits_total",
+					&[("reason", reason.as_str()), ("outcome", outcome.as_str())],
+					self.counter(reason, outcome).get(),
+				);
+			}
+		}
+	}
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MigrationProxyReadOutcome {
 	Hit,
@@ -2731,6 +2827,7 @@ pub struct MetricsRegistry {
 	pub data_ring_lease_denials_total: Counter,
 	pub data_ring_lease_errors_total: Counter,
 	pub data_ring_lease_cache_entries: Gauge,
+	data_ring_lease_gate_waits: LeaseGateWaitCounters,
 	/// Orphan-witness recovery barrier evaluations that could not confirm local
 	/// Raft leadership.
 	pub data_ring_orphan_witness_recovery_leadership_unconfirmed_total: Counter,
@@ -3093,6 +3190,7 @@ impl Default for MetricsRegistry {
 			data_ring_lease_denials_total: Counter::default(),
 			data_ring_lease_errors_total: Counter::default(),
 			data_ring_lease_cache_entries: Gauge::default(),
+			data_ring_lease_gate_waits: LeaseGateWaitCounters::default(),
 			data_ring_orphan_witness_recovery_leadership_unconfirmed_total: Counter::default(),
 			data_ring_pending_finalization_backlog: Gauge::default(),
 			data_ring_pending_finalization_replay: PendingFinalizationReplayCounters::default(),
@@ -3472,6 +3570,27 @@ impl MetricsRegistry {
 
 	pub fn set_pending_finalization_backlog(&self, value: u64) {
 		self.data_ring_pending_finalization_backlog.set(value);
+	}
+
+	/// One completed wait at the lease gate, counted once whatever the number of wakes.
+	pub fn observe_lease_gate_wait(
+		&self,
+		reason: LeaseGateWaitReason,
+		outcome: LeaseGateWaitOutcome,
+	) {
+		self.data_ring_lease_gate_waits
+			.counter(reason, outcome)
+			.inc();
+	}
+
+	pub fn lease_gate_waits(
+		&self,
+		reason: LeaseGateWaitReason,
+		outcome: LeaseGateWaitOutcome,
+	) -> u64 {
+		self.data_ring_lease_gate_waits
+			.counter(reason, outcome)
+			.get()
 	}
 
 	pub fn observe_orphan_witness_recovery_leadership_unconfirmed(&self) {
@@ -5079,6 +5198,7 @@ impl MetricsRegistry {
 			"Lease descriptors currently cached by the local Data Ring.",
 			self.data_ring_lease_cache_entries.get(),
 		);
+		self.data_ring_lease_gate_waits.render(&mut out);
 		render_gauge(
 			&mut out,
 			"wendelon_data_ring_pending_finalization_backlog",

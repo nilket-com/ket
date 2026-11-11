@@ -220,6 +220,7 @@ gauge cannot provide a truthful per-run receipt under overlapping DROP work.
 | `wendelon_data_ring_lease_denials_total` | counter | none | Lease refresh denials |
 | `wendelon_data_ring_lease_errors_total` | counter | none | Lease refresh failures |
 | `wendelon_data_ring_lease_cache_entries` | gauge | none | Cached lease descriptors |
+| `wendelon_data_ring_lease_gate_waits_total` | counter | `reason`, `outcome` | Completed Today table-write and table-delete waits at the lease gate, one per wait whatever the number of wakes. `reason` is what the gate found missing when the wait began (`no_lease`, `expired`, `no_leader`); `outcome` is how it ended (`admitted`, `refused_at_cap`, `refused_invalid_lease`, `clocks_expired`, `refused_on_recheck`, `replayed`, `watch_closed`). A fixed 21 series |
 | `wendelon_network_compression_batches_total` | counter | `codec`, `path`, `result` | Fresh wire-side Arrow IPC encode attempts by codec, bounded path, and result |
 | `wendelon_network_compression_encoded_bytes_total` | counter | `codec`, `path` | Encoded Arrow IPC bytes emitted by fresh wire encoders |
 | `wendelon_network_compression_encode_micros` | histogram | `codec`, `path` | Fresh wire-side Arrow IPC encode duration in microseconds |

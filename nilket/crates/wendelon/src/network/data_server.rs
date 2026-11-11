@@ -826,6 +826,8 @@ pub struct WendelonDataServer {
 	local_observation_gate: Arc<StdMutex<Option<(Arc<Notify>, Arc<Notify>)>>>,
 	#[cfg(test)]
 	orphan_witness_recovery_leadership_override: Arc<StdMutex<Option<bool>>>,
+	#[cfg(test)]
+	lease_gate_wait_hooks: Arc<write_replication::LeaseGateWaitHooks>,
 	/// Shared node-wide HLC driver. The leader merges client HLCs
 	/// into this monotonic authority before stamping writes.
 	hlc: Arc<HybridLogicalClockDriver>,
@@ -844,6 +846,9 @@ pub struct WendelonDataServer {
 	/// / RF) leases, so a linear scan is cheap and overlap-free
 	/// by construction (the state machine rejects overlaps on grant).
 	leases: Arc<RwLock<Vec<LeaseDescriptor>>>,
+	/// Counts the grants `cache_granted_lease` has cached. A write waiting at the
+	/// lease gate wakes on it.
+	lease_grants: watch::Sender<u64>,
 	/// When `Some`, every inbound write / LINEARIZABLE read is
 	/// fenced against the lease cache. `None` (the default) leaves
 	/// the gate disabled so existing single-node tests and the
@@ -1120,7 +1125,7 @@ impl ActiveTableQueryRegistry {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LeaseGateResult {
 	Valid,
-	Missing,
+	Missing(crate::metrics::LeaseGateWaitReason),
 	InvalidSignature,
 }
 
@@ -1231,9 +1236,12 @@ impl Clone for WendelonDataServer {
 			orphan_witness_recovery_leadership_override: self
 				.orphan_witness_recovery_leadership_override
 				.clone(),
+			#[cfg(test)]
+			lease_gate_wait_hooks: self.lease_gate_wait_hooks.clone(),
 			hlc: self.hlc.clone(),
 			tracker: self.tracker.clone(),
 			leases: self.leases.clone(),
+			lease_grants: self.lease_grants.clone(),
 			lease_gate_enabled: self.lease_gate_enabled,
 			decision_mode: self.decision_mode,
 			decisions: self.decisions.clone(),
@@ -2283,9 +2291,12 @@ impl WendelonDataServer {
 			local_observation_gate: Arc::new(StdMutex::new(None)),
 			#[cfg(test)]
 			orphan_witness_recovery_leadership_override: Arc::new(StdMutex::new(None)),
+			#[cfg(test)]
+			lease_gate_wait_hooks: Default::default(),
 			hlc,
 			tracker: None,
 			leases: Arc::new(RwLock::new(Vec::new())),
+			lease_grants: watch::Sender::new(0),
 			lease_gate_enabled: false,
 			decision_mode: Default::default(),
 			decisions: Default::default(),
@@ -3515,53 +3526,6 @@ impl WendelonDataServer {
 		recover_rwlock_write(&self.leases, "lease_cache").push(lease);
 	}
 
-	async fn lease_gate_result(
-		&self,
-		locality: Locality,
-		epoch: u64,
-		now: HybridTimestamp,
-	) -> LeaseGateResult {
-		let lease = {
-			let guard = recover_rwlock_read(&self.leases, "lease_cache");
-			guard
-				.iter()
-				.find(|l| {
-					l.holder.id == self.local_node.id
-						&& l.epoch == epoch
-						&& l.range_start <= locality.get()
-						&& locality.get() <= l.range_end
-						&& now < l.lease_expiry
-				})
-				.copied()
-		};
-
-		let Some(lease) = lease else {
-			return LeaseGateResult::Missing;
-		};
-
-		let Some(current_leader) = self.raft.current_leader().await else {
-			return LeaseGateResult::Missing;
-		};
-		if lease.issuer.id != current_leader {
-			return LeaseGateResult::InvalidSignature;
-		}
-		match self.lease_authority.verify_lease(&lease) {
-			Ok(()) => LeaseGateResult::Valid,
-			Err(err) => {
-				tracing::error!(
-					holder = lease.holder.id,
-					issuer = lease.issuer.id,
-					epoch = lease.epoch,
-					range_start = lease.range_start,
-					range_end = lease.range_end,
-					error = %err,
-					"lease signature verification failed at data-ring gate"
-				);
-				LeaseGateResult::InvalidSignature
-			}
-		}
-	}
-
 	fn cache_granted_lease(&self, lease: LeaseDescriptor) {
 		let mut guard = recover_rwlock_write(&self.leases, "lease_cache");
 		if let Some(slot) = guard
@@ -3575,6 +3539,9 @@ impl WendelonDataServer {
 		metrics()
 			.data_ring_lease_cache_entries
 			.set(guard.len() as u64);
+		drop(guard);
+		self.lease_grants
+			.send_modify(|grants| *grants = grants.wrapping_add(1));
 	}
 
 	async fn request_remote_lease(
@@ -8631,7 +8598,7 @@ impl WendelonDataServer {
 				.await
 			{
 				LeaseGateResult::Valid => {}
-				LeaseGateResult::Missing => {
+				LeaseGateResult::Missing(_) => {
 					return Ok(self.counted_write_result(
 						error_response(&meta, WriteStatus::LEASE_EXPIRED, self.local_node),
 						None,
@@ -8998,31 +8965,18 @@ impl WendelonDataServer {
 			return self.replay_write_outcome(meta.tenant_id, outcome).await;
 		}
 
-		if self.lease_gate_enabled {
-			for child in &bifurcated.children {
-				match self
-					.lease_gate_result(child.locality, meta.expected_epoch, meta.client_hlc)
-					.await
-				{
-					LeaseGateResult::Valid => {}
-					LeaseGateResult::Missing => {
-						return Ok(self.counted_write_result(
-							error_response(&synthetic, WriteStatus::LEASE_EXPIRED, self.local_node),
-							None,
-						));
-					}
-					LeaseGateResult::InvalidSignature => {
-						return Ok(self.counted_write_result(
-							error_response(
-								&synthetic,
-								WriteStatus::INVALID_LEASE_SIGNATURE,
-								self.local_node,
-							),
-							None,
-						));
-					}
-				}
-			}
+		if self.lease_gate_enabled
+			&& let Some(answer) = self
+				.admit_at_table_lease_gate(
+					&meta,
+					&synthetic,
+					&bifurcated.children,
+					clocks,
+					delete_counts,
+				)
+				.await?
+		{
+			return Ok(answer);
 		}
 
 		// `commit_hlc` was stamped by the caller (see ADR 045 plumbing
@@ -10453,7 +10407,7 @@ impl DataRing for WendelonDataServer {
 				.await
 			{
 				LeaseGateResult::Valid => {}
-				LeaseGateResult::Missing => {
+				LeaseGateResult::Missing(_) => {
 					return Ok((
 						error_read_response(&meta, ReadStatus::LEASE_EXPIRED, self.local_node),
 						None,

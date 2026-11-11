@@ -9,9 +9,9 @@ pub use registry::TierMeasurementSource;
 pub use registry::isolated_for_test;
 pub use registry::{
 	CdcMetricSource, CdcSubscriptionMetricResult, Counter, Gauge, IoUringClass,
-	LsmCompactionResult, LsmDigestInvariantKind, MetricsRegistry, MigrationProxyReadOutcome,
-	NetworkCompressionPath, PbcRuntime, PendingFinalizationReplayPath,
-	STORAGE_DISAGREEING_SLAB_FILE_REASONS, STORAGE_REHYDRATION_SKIP_REASONS,
-	TableRetentionMetricPolicy, TierAuthorityRetryClass, TierPublicationFenceReason,
-	TierRewriteRefusalReason, global,
+	LeaseGateWaitOutcome, LeaseGateWaitReason, LsmCompactionResult, LsmDigestInvariantKind,
+	MetricsRegistry, MigrationProxyReadOutcome, NetworkCompressionPath, PbcRuntime,
+	PendingFinalizationReplayPath, STORAGE_DISAGREEING_SLAB_FILE_REASONS,
+	STORAGE_REHYDRATION_SKIP_REASONS, TableRetentionMetricPolicy, TierAuthorityRetryClass,
+	TierPublicationFenceReason, TierRewriteRefusalReason, global,
 };

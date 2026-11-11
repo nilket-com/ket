@@ -19182,3 +19182,1447 @@ async fn each_today_lease_request_is_stamped_when_it_is_made() {
 	}
 	assert_eq!(starts, vec![start, start + 50, start + 100]);
 }
+
+/// A Today table write waits, bounded, at its lease gate for a lease that is temporarily
+/// unavailable. Every fixture is one real node with its lease manager stopped, so the test alone
+/// decides when a renewal arrives.
+mod lease_wait {
+	use super::*;
+	use crate::metrics::{LeaseGateWaitOutcome, LeaseGateWaitReason};
+	use crate::network::data_server::write_replication::{
+		LEASE_GATE_WAIT, LeaseGateWaitEnd, LeaseGateWaitHooks, lease_gate_deadline,
+		wait_for_lease_gate,
+	};
+	use crate::network::ring::{RingRouter, RingState};
+	use crate::network::transport::MembershipEpoch;
+
+	/// A hang detector for a step that should take milliseconds, never a latency assertion.
+	const STEP_BOUND: Duration = Duration::from_secs(60);
+
+	async fn lease_wait_node(
+		label: &str,
+	) -> (
+		crate::test_support::TestDir,
+		WendelonNode,
+		TableSchemaDescriptor,
+	) {
+		let dir = bootstrap_tempdir(label);
+		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			713,
+			dir.to_path_buf(),
+			"127.0.0.1:0".into(),
+		))
+		.await
+		.unwrap();
+		let deadline = tokio::time::Instant::now() + STEP_BOUND;
+		while node.raft.current_leader().await != Some(node.local_node.id) {
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"timed out waiting for leader"
+			);
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+		// Renewal is the test's to give: stop the manager and wait out a pass in flight.
+		node.handles.lease_manager.abort();
+		while !node.handles.lease_manager.is_finished() {
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"the lease manager did not stop"
+			);
+			tokio::time::sleep(Duration::from_millis(1)).await;
+		}
+		assert!(renew(&node).await >= 1, "the fixture starts with a lease");
+		let descriptor = typed_table_descriptor();
+		node.raft
+			.client_write(WendelonRequest::SchemaUpdate(typed_table_schema_update(
+				&descriptor,
+			)))
+			.await
+			.unwrap();
+		(dir, node, descriptor)
+	}
+
+	/// One real renewal pass: a grant committed through Raft and cached by the production writer.
+	async fn renew(node: &WendelonNode) -> usize {
+		node.data_server
+			.refresh_leases_once(&node.ring, &*node.clock, 60_000)
+			.await
+	}
+
+	/// Every cached lease now ends at `at`: expired for a write whose client HLC is `at` or later.
+	fn expire_cached_leases(node: &WendelonNode, at: HybridTimestamp) {
+		let cache = node.data_server.lease_cache();
+		let mut leases = cache.write().unwrap();
+		assert!(!leases.is_empty(), "a lease to expire");
+		for lease in leases.iter_mut() {
+			lease.lease_expiry = at;
+		}
+	}
+
+	/// The request as the wire delivers it: the frame handler, its admission and its last-attempt rule.
+	fn wire_table_write(
+		node: &WendelonNode,
+		meta: &TableWriteRequestMeta,
+		batch: &RecordBatch,
+	) -> JoinHandle<TableWriteResponseMeta> {
+		let frame = table_write_frame_for_test(meta, batch);
+		let context = RequestContext {
+			remote: Some(node.local_node),
+			actor: actor(ActorRole::Operator, None),
+		};
+		let server = node.data_server.clone();
+		tokio::spawn(async move {
+			let response = DataRingServer::handle_data_frame(server.as_ref(), context, frame)
+				.await
+				.expect("the stream carries an answer")
+				.expect("a response frame");
+			*bytemuck::from_bytes(&response.meta[..std::mem::size_of::<TableWriteResponseMeta>()])
+		})
+	}
+
+	/// Waits until the write sleeps at its gate with both wake sources armed, or until it answered
+	/// without ever waiting, in which case its answer is returned.
+	async fn waiter_installed_or_answer<T>(
+		node: &WendelonNode,
+		write: &mut JoinHandle<T>,
+	) -> Option<T> {
+		sleeps_past_or_answer(node, write, 0).await
+	}
+
+	fn sleeps(node: &WendelonNode) -> u64 {
+		*node.data_server.lease_gate_wait_hooks.installed.borrow()
+	}
+
+	/// As `waiter_installed_or_answer`, for a fixture that has seen `earlier` sleeps already.
+	async fn sleeps_past_or_answer<T>(
+		node: &WendelonNode,
+		write: &mut JoinHandle<T>,
+		earlier: u64,
+	) -> Option<T> {
+		let mut installed = node.data_server.lease_gate_wait_hooks.installed.subscribe();
+		tokio::time::timeout(STEP_BOUND, async {
+			tokio::select! {
+				biased;
+				answer = &mut *write => Some(answer.unwrap()),
+				seen = installed.wait_for(|count| *count > earlier) => {
+					seen.expect("the hooks outlive the write");
+					None
+				}
+			}
+		})
+		.await
+		.expect("the write neither waited nor answered")
+	}
+
+	/// The write sleeps at its gate once more than `earlier` times; an answer instead is a failure.
+	async fn sleeps_past<T: std::fmt::Debug>(
+		node: &WendelonNode,
+		write: &mut JoinHandle<T>,
+		earlier: u64,
+	) {
+		let answer = sleeps_past_or_answer(node, write, earlier).await;
+		assert!(answer.is_none(), "it answered without waiting: {answer:?}");
+	}
+
+	fn set_cap(node: &WendelonNode, cap: Duration) {
+		*node.data_server.lease_gate_wait_hooks.cap.lock().unwrap() = Some(cap);
+	}
+
+	/// A cap no fixture step comes near, for a wait the test itself ends.
+	const WIDE_CAP: Duration = Duration::from_secs(25);
+
+	fn completed_waits(node: &WendelonNode) -> Vec<(LeaseGateWaitReason, LeaseGateWaitOutcome)> {
+		node.data_server
+			.lease_gate_wait_hooks
+			.completed
+			.lock()
+			.unwrap()
+			.clone()
+	}
+
+	fn row_exists(node: &WendelonNode, descriptor: &TableSchemaDescriptor, id: i64) -> bool {
+		node.slab
+			.lookup(tenant(), row_key(descriptor, id))
+			.unwrap()
+			.is_some()
+	}
+
+	fn write_of(
+		descriptor: &TableSchemaDescriptor,
+		id: i64,
+		sequence_no: u64,
+	) -> (TableWriteRequestMeta, RecordBatch) {
+		let batch = typed_table_batch(vec![id]);
+		let mut meta = typed_table_meta(descriptor, batch.num_rows());
+		meta.parent_write_id.sequence_no = sequence_no;
+		(meta, batch)
+	}
+
+	/// The node's own routing, built again from its membership: what a renewal pass reads when the
+	/// test has put another ring in the node's router.
+	fn routing_as_it_was(node: &WendelonNode) -> RingRouter {
+		let membership = node.data_server.factory.membership_snapshot();
+		let ring = RingRouter::new(RingState::build(&membership, 1));
+		assert_eq!(
+			ring.primary_ranges_for(node.local_node),
+			node.ring.primary_ranges_for(node.local_node)
+		);
+		ring
+	}
+
+	/// The real routing input of the primacy check now names another node primary for everything.
+	fn move_primacy_away(node: &WendelonNode) {
+		let membership = node.data_server.factory.membership_snapshot();
+		let capabilities = membership.peers[&node.local_node].clone();
+		let elsewhere = MembershipEpoch {
+			epoch: membership.epoch,
+			peers: std::collections::HashMap::from([(
+				NodeId {
+					id: 9_999,
+					_reserved: 0,
+				},
+				capabilities,
+			)]),
+		};
+		node.ring.install(RingState::build(&elsewhere, 1));
+		assert!(node.ring.primary_ranges_for(node.local_node).is_empty());
+	}
+
+	fn row_key(descriptor: &TableSchemaDescriptor, id: i64) -> Identity {
+		table_row_identity(tenant(), descriptor.table_object_id, &id.to_le_bytes())
+	}
+
+	async fn recorded_outcome(
+		node: &WendelonNode,
+		meta: &TableWriteRequestMeta,
+	) -> MutationOutcomeResponseMeta {
+		node.data_server
+			.resolve_mutation_outcome(MutationOutcomeRequestMeta {
+				operation_id: meta.parent_write_id,
+				tenant_id: meta.tenant_id,
+			})
+			.await
+			.unwrap()
+	}
+
+	/// The contract's RED. A write on its last attempt meets a lease that has expired; a valid renewal
+	/// arrives inside the bound; that same attempt commits, once.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+	async fn a_table_write_waits_out_an_expired_lease_and_commits_once() {
+		let (_dir, node, descriptor) = lease_wait_node("lease-wait-expiry-recovers").await;
+		let batch = typed_table_batch(vec![7]);
+		let mut meta = typed_table_meta(&descriptor, batch.num_rows());
+		meta.parent_write_id.sequence_no = 713_001;
+		meta.set_attempts_remaining(1);
+		expire_cached_leases(&node, meta.client_hlc);
+		let bytes_before = node.slab.local_l1_bytes().await;
+
+		let mut write = wire_table_write(&node, &meta, &batch);
+		let written = match waiter_installed_or_answer(&node, &mut write).await {
+			Some(answered_without_waiting) => answered_without_waiting,
+			None => {
+				assert!(
+					node.slab
+						.lookup(tenant(), row_key(&descriptor, 7))
+						.unwrap()
+						.is_none(),
+					"nothing is written while the lease is unavailable"
+				);
+				assert!(renew(&node).await >= 1, "a valid renewal arrives");
+				tokio::time::timeout(STEP_BOUND, write)
+					.await
+					.expect("the renewal wakes the write")
+					.unwrap()
+			}
+		};
+		assert_eq!(
+			written.write.status,
+			WriteStatus::OK,
+			"the attempt that met an expired lease commits once its renewal arrives: {written:?}"
+		);
+		assert_eq!(
+			written.write.mutation_commit_knowledge(),
+			MutationCommitKnowledge::COMMITTED
+		);
+		let location = node
+			.slab
+			.lookup(tenant(), row_key(&descriptor, 7))
+			.unwrap()
+			.expect("the row is written");
+		assert!(!location.is_tombstone);
+		let bytes_after = node.slab.local_l1_bytes().await;
+		assert!(bytes_after > bytes_before);
+		let recorded = recorded_outcome(&node, &meta).await;
+		assert_eq!(recorded.resolution, MutationResolutionStatus::PRESENT);
+		assert_eq!(recorded.write.status, WriteStatus::OK);
+		assert_eq!(
+			recorded.write.mutation_commit_knowledge(),
+			MutationCommitKnowledge::COMMITTED
+		);
+
+		// The same identity again answers from its record and appends nothing.
+		let replayed = tokio::time::timeout(STEP_BOUND, wire_table_write(&node, &meta, &batch))
+			.await
+			.expect("a replay answers")
+			.unwrap();
+		assert!(
+			matches!(
+				replayed.write.status,
+				WriteStatus::OK | WriteStatus::DUPLICATE
+			),
+			"{replayed:?}"
+		);
+		assert_eq!(replayed.write.commit_hlc, written.write.commit_hlc);
+		assert_eq!(node.slab.local_l1_bytes().await, bytes_after);
+		shutdown_lease_node(node).await;
+	}
+
+	fn make_unavailable(node: &WendelonNode, reason: LeaseGateWaitReason, at: HybridTimestamp) {
+		match reason {
+			LeaseGateWaitReason::Expired => expire_cached_leases(node, at),
+			LeaseGateWaitReason::NoLease => node.data_server.lease_cache().write().unwrap().clear(),
+			LeaseGateWaitReason::NoLeader => {
+				// The leader override drives the gate's leader branch and nothing else.
+				node.data_server
+					.lease_gate_wait_hooks
+					.forced_leader
+					.send_replace(Some(None));
+			}
+		}
+	}
+
+	async fn make_available(node: &WendelonNode, reason: LeaseGateWaitReason) {
+		match reason {
+			LeaseGateWaitReason::Expired | LeaseGateWaitReason::NoLease => {
+				assert!(renew(node).await >= 1, "a valid renewal arrives");
+			}
+			LeaseGateWaitReason::NoLeader => {
+				node.data_server
+					.lease_gate_wait_hooks
+					.forced_leader
+					.send_replace(None);
+			}
+		}
+	}
+
+	/// Each producer of `Missing`, exercised on purpose: it recovers inside the bound in the same
+	/// attempt, and with no authority arriving it is refused at the bound with nothing written.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+	async fn each_reason_recovers_inside_the_bound_and_is_refused_at_it() {
+		let (_dir, node, descriptor) = lease_wait_node("lease-wait-reasons").await;
+		for (index, reason) in [
+			LeaseGateWaitReason::Expired,
+			LeaseGateWaitReason::NoLease,
+			LeaseGateWaitReason::NoLeader,
+		]
+		.into_iter()
+		.enumerate()
+		{
+			let recovering_row = 100 + index as i64;
+			let refused_row = 200 + index as i64;
+
+			// Recovery.
+			set_cap(&node, WIDE_CAP);
+			let (mut meta, batch) = write_of(&descriptor, recovering_row, 713_100 + index as u64);
+			meta.set_attempts_remaining(1);
+			make_unavailable(&node, reason, meta.client_hlc);
+			let earlier = sleeps(&node);
+			let mut write = wire_table_write(&node, &meta, &batch);
+			sleeps_past(&node, &mut write, earlier).await;
+			assert!(
+				!row_exists(&node, &descriptor, recovering_row),
+				"{reason:?}"
+			);
+			make_available(&node, reason).await;
+			let written = tokio::time::timeout(STEP_BOUND, write)
+				.await
+				.expect("the wake ends the wait")
+				.unwrap();
+			assert_eq!(
+				written.write.status,
+				WriteStatus::OK,
+				"{reason:?}: {written:?}"
+			);
+			assert!(row_exists(&node, &descriptor, recovering_row), "{reason:?}");
+			assert_eq!(
+				completed_waits(&node).last(),
+				Some(&(reason, LeaseGateWaitOutcome::Admitted)),
+				"one count for the wait, by the reason seen at entry"
+			);
+
+			// Refusal: no valid authority arrives.
+			set_cap(&node, Duration::from_millis(400));
+			let (mut meta, batch) = write_of(&descriptor, refused_row, 713_200 + index as u64);
+			meta.set_attempts_remaining(1);
+			make_unavailable(&node, reason, meta.client_hlc);
+			let waits_before = completed_waits(&node).len();
+			let counted_before =
+				metrics().lease_gate_waits(reason, LeaseGateWaitOutcome::RefusedAtCap);
+			let earlier = sleeps(&node);
+			let refused = tokio::time::timeout(STEP_BOUND, wire_table_write(&node, &meta, &batch))
+				.await
+				.expect("the bound ends the wait")
+				.unwrap();
+			assert!(sleeps(&node) > earlier, "{reason:?}: it waited first");
+			assert_eq!(
+				refused.write.status,
+				WriteStatus::WRITE_ATTEMPTS_EXHAUSTED,
+				"{reason:?}: the existing last-attempt rule over LEASE_EXPIRED: {refused:?}"
+			);
+			assert_eq!(
+				refused.write.mutation_commit_knowledge(),
+				MutationCommitKnowledge::KNOWN_NOT_COMMITTED
+			);
+			assert_eq!(
+				refused.write.mutation_stop_reason(),
+				MutationStopReason::ATTEMPT_EXHAUSTION
+			);
+			let recorded = recorded_outcome(&node, &meta).await;
+			assert_eq!(recorded.resolution, MutationResolutionStatus::PRESENT);
+			assert_eq!(
+				recorded.write.mutation_commit_knowledge(),
+				MutationCommitKnowledge::KNOWN_NOT_COMMITTED
+			);
+			assert!(!row_exists(&node, &descriptor, refused_row), "{reason:?}");
+			let waits = completed_waits(&node);
+			assert_eq!(
+				waits.len(),
+				waits_before + 1,
+				"once per completed wait: {waits:?}"
+			);
+			assert_eq!(
+				waits.last(),
+				Some(&(reason, LeaseGateWaitOutcome::RefusedAtCap))
+			);
+			assert!(
+				metrics().lease_gate_waits(reason, LeaseGateWaitOutcome::RefusedAtCap)
+					> counted_before,
+				"{reason:?}: the reported counter moved"
+			);
+			make_available(&node, reason).await;
+		}
+		shutdown_lease_node(node).await;
+	}
+
+	/// The gate names why it found no authority, and selection is as before: an unexpired covering
+	/// entry is taken even when an expired covering entry sits ahead of it.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+	async fn the_gate_names_its_miss_and_a_valid_entry_wins_over_an_expired_one() {
+		let (_dir, node, _descriptor) = lease_wait_node("lease-wait-gate-reasons").await;
+		let server = &node.data_server;
+		let now = hlc(1, 0, 1);
+		let gate = || server.lease_gate_result(Locality::ZERO, 1, now);
+		let cache = server.lease_cache();
+		let valid = {
+			let leases = cache.read().unwrap();
+			*leases
+				.iter()
+				.find(|lease| lease.range_start == 0)
+				.expect("a lease covering locality zero")
+		};
+		let expired = LeaseDescriptor {
+			lease_expiry: now,
+			..valid
+		};
+		let other_epoch = LeaseDescriptor { epoch: 99, ..valid };
+		let set = |leases: Vec<LeaseDescriptor>| *cache.write().unwrap() = leases;
+
+		assert_eq!(gate().await, LeaseGateResult::Valid);
+		set(vec![expired, valid]);
+		assert_eq!(
+			gate().await,
+			LeaseGateResult::Valid,
+			"valid wins over expired"
+		);
+		set(vec![expired]);
+		assert_eq!(
+			gate().await,
+			LeaseGateResult::Missing(LeaseGateWaitReason::Expired)
+		);
+		set(vec![other_epoch]);
+		assert_eq!(
+			gate().await,
+			LeaseGateResult::Missing(LeaseGateWaitReason::NoLease)
+		);
+		set(Vec::new());
+		assert_eq!(
+			gate().await,
+			LeaseGateResult::Missing(LeaseGateWaitReason::NoLease)
+		);
+		set(vec![valid]);
+		let forced = &server.lease_gate_wait_hooks.forced_leader;
+		forced.send_replace(Some(None));
+		assert_eq!(
+			gate().await,
+			LeaseGateResult::Missing(LeaseGateWaitReason::NoLeader)
+		);
+		forced.send_replace(Some(Some(9_999)));
+		assert_eq!(gate().await, LeaseGateResult::InvalidSignature);
+		forced.send_replace(None);
+		assert_eq!(gate().await, LeaseGateResult::Valid);
+		shutdown_lease_node(node).await;
+	}
+
+	/// The write's own clocks end inside the cap: the existing typed deadline outcome, recorded,
+	/// never LEASE_EXPIRED and never attempt exhaustion, and nothing admitted.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+	async fn a_caller_deadline_inside_the_bound_ends_the_wait_with_its_own_outcome() {
+		let (_dir, node, descriptor) = lease_wait_node("lease-wait-caller-deadline").await;
+		set_cap(&node, WIDE_CAP);
+		let (mut meta, batch) = write_of(&descriptor, 7, 713_300);
+		meta.set_attempts_remaining(1);
+		meta.deadline_remaining_millis = 3_000;
+		expire_cached_leases(&node, meta.client_hlc);
+		let mut write = wire_table_write(&node, &meta, &batch);
+		sleeps_past(&node, &mut write, 0).await;
+		let expired = tokio::time::timeout(STEP_BOUND, write)
+			.await
+			.expect("the caller's deadline ends the wait")
+			.unwrap();
+		assert_eq!(
+			expired.write.status,
+			WriteStatus::WRITE_DEADLINE_EXCEEDED,
+			"{expired:?}"
+		);
+		assert_eq!(
+			expired.write.mutation_stop_reason(),
+			MutationStopReason::DEADLINE
+		);
+		assert_eq!(
+			expired.write.mutation_commit_knowledge(),
+			MutationCommitKnowledge::KNOWN_NOT_COMMITTED
+		);
+		let recorded = recorded_outcome(&node, &meta).await;
+		assert_eq!(recorded.resolution, MutationResolutionStatus::PRESENT);
+		assert_eq!(recorded.write.status, WriteStatus::WRITE_DEADLINE_EXCEEDED);
+		assert_eq!(
+			recorded.write.mutation_commit_knowledge(),
+			MutationCommitKnowledge::KNOWN_NOT_COMMITTED
+		);
+		assert!(!row_exists(&node, &descriptor, 7));
+		assert_eq!(
+			completed_waits(&node),
+			vec![(
+				LeaseGateWaitReason::Expired,
+				LeaseGateWaitOutcome::ClocksExpired
+			)]
+		);
+		shutdown_lease_node(node).await;
+	}
+
+	/// The node stops being primary while the write waits. The renewal that wakes it is real, and
+	/// the routing input the primacy check reads is the one changed: NOT_LEADER, nothing admitted.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+	async fn primacy_lost_during_the_wait_is_refused_after_it() {
+		let (_dir, node, descriptor) = lease_wait_node("lease-wait-primacy-lost").await;
+		set_cap(&node, WIDE_CAP);
+		let (meta, batch) = write_of(&descriptor, 7, 713_400);
+		expire_cached_leases(&node, meta.client_hlc);
+		let mut write = wire_table_write(&node, &meta, &batch);
+		sleeps_past(&node, &mut write, 0).await;
+		let routing = routing_as_it_was(&node);
+		move_primacy_away(&node);
+		let granted = node
+			.data_server
+			.refresh_leases_once(&routing, &*node.clock, 60_000)
+			.await;
+		assert!(granted >= 1, "a valid lease is cached again");
+		let refused = tokio::time::timeout(STEP_BOUND, write)
+			.await
+			.expect("the renewal wakes the write")
+			.unwrap();
+		assert_eq!(refused.write.status, WriteStatus::NOT_LEADER, "{refused:?}");
+		assert!(!row_exists(&node, &descriptor, 7));
+		assert_eq!(
+			completed_waits(&node),
+			vec![(
+				LeaseGateWaitReason::Expired,
+				LeaseGateWaitOutcome::RefusedOnRecheck
+			)]
+		);
+		shutdown_lease_node(node).await;
+	}
+
+	/// The admission epoch moves past the request's while the write waits. Readmission reads it
+	/// again: EPOCH_STALE, nothing admitted, though the lease that woke the write is valid for it.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+	async fn an_epoch_that_advances_during_the_wait_is_stale_after_it() {
+		let (_dir, node, descriptor) = lease_wait_node("lease-wait-stale-epoch").await;
+		set_cap(&node, WIDE_CAP);
+		let server = &node.data_server;
+		let (meta, batch) = write_of(&descriptor, 7, 713_450);
+		assert!(meta.expected_epoch >= server.admission_snapshot().current_epoch);
+		expire_cached_leases(&node, meta.client_hlc);
+		let mut write = wire_table_write(&node, &meta, &batch);
+		sleeps_past(&node, &mut write, 0).await;
+		node.state_machine
+			.seed_e_safe_for_test(meta.expected_epoch + 4, hlc(1, 0, 1))
+			.await;
+		assert!(meta.expected_epoch < server.admission_snapshot().current_epoch);
+		// A lease for the request's own epoch, cached by the production writer of a grant.
+		server.cache_granted_lease(server.make_signed_lease(
+			meta.expected_epoch,
+			node.local_node,
+			0,
+			u64::MAX,
+			hlc(0, 0, node.local_node.id),
+			hlc(u64::MAX / 2, 0, node.local_node.id),
+		));
+		let refused = tokio::time::timeout(STEP_BOUND, write)
+			.await
+			.expect("the grant wakes the write")
+			.unwrap();
+		assert_eq!(
+			refused.write.status,
+			WriteStatus::EPOCH_STALE,
+			"{refused:?}"
+		);
+		assert!(!row_exists(&node, &descriptor, 7));
+		assert_eq!(
+			completed_waits(&node),
+			vec![(
+				LeaseGateWaitReason::Expired,
+				LeaseGateWaitOutcome::RefusedOnRecheck
+			)]
+		);
+		shutdown_lease_node(node).await;
+	}
+
+	/// An outcome recorded for the same write while it waited is returned as recorded. Primacy is
+	/// moved away as well, so a readmission that validated authority first would answer NOT_LEADER
+	/// over the record.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+	async fn an_outcome_recorded_during_the_wait_is_returned_not_replaced() {
+		let (_dir, node, descriptor) = lease_wait_node("lease-wait-replay-first").await;
+		set_cap(&node, WIDE_CAP);
+		let (meta, batch) = write_of(&descriptor, 7, 713_500);
+		expire_cached_leases(&node, meta.client_hlc);
+		let mut write = wire_table_write(&node, &meta, &batch);
+		sleeps_past(&node, &mut write, 0).await;
+
+		let unresolved = mutation_expiry_response(
+			&table_write_synthetic_meta(&meta, Identity::ZERO, 0),
+			crate::network::data_server::write_clocks::WriteExpiry {
+				status: WriteStatus::WRITE_STALLED,
+				reason: MutationStopReason::NO_PROGRESS,
+			},
+			MutationCommitKnowledge::INDETERMINATE,
+		);
+		node.data_server
+			.record_mutation_outcome(meta.parent_write_id, meta.tenant_id, unresolved, None, None)
+			.await
+			.unwrap();
+		let routing = routing_as_it_was(&node);
+		move_primacy_away(&node);
+		let granted = node
+			.data_server
+			.refresh_leases_once(&routing, &*node.clock, 60_000)
+			.await;
+		assert!(granted >= 1, "a valid lease is cached again");
+
+		let answered = tokio::time::timeout(STEP_BOUND, write)
+			.await
+			.expect("the renewal wakes the write")
+			.unwrap();
+		assert_eq!(
+			answered.write.status,
+			WriteStatus::WRITE_STALLED,
+			"{answered:?}"
+		);
+		assert_eq!(
+			answered.write.mutation_commit_knowledge(),
+			MutationCommitKnowledge::INDETERMINATE,
+			"the earlier attempt's uncertainty is kept"
+		);
+		assert!(!row_exists(&node, &descriptor, 7));
+		assert_eq!(
+			completed_waits(&node),
+			vec![(LeaseGateWaitReason::Expired, LeaseGateWaitOutcome::Replayed)]
+		);
+		shutdown_lease_node(node).await;
+	}
+
+	/// How a wait that is given no valid lease ends.
+	#[derive(Clone, Copy, Debug)]
+	enum UnadmittedExit {
+		Cap,
+		CallerDeadline,
+		InvalidLease,
+	}
+
+	/// The same precedence on the exits that admit nothing. An INDETERMINATE outcome is recorded
+	/// for the write while its waiter is installed, and no renewal is given. Whether the cap, the
+	/// caller's deadline or an invalid lease then ends the wait, the answer is the recorded outcome
+	/// and the stored outcome is still the recorded one: no refusal, no clock expiry and no
+	/// last-attempt exhaustion is recorded over it.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+	async fn an_outcome_recorded_during_the_wait_survives_every_exit_that_admits_nothing() {
+		let (_dir, node, descriptor) = lease_wait_node("lease-wait-replay-every-exit").await;
+		let hooks = &node.data_server.lease_gate_wait_hooks;
+		for (index, exit) in [
+			UnadmittedExit::Cap,
+			UnadmittedExit::CallerDeadline,
+			UnadmittedExit::InvalidLease,
+		]
+		.into_iter()
+		.enumerate()
+		{
+			let row = 300 + index as i64;
+			let (mut meta, batch) = write_of(&descriptor, row, 713_550 + index as u64);
+			// The last attempt: a retryable refusal would be recorded as exhaustion.
+			meta.set_attempts_remaining(1);
+			match exit {
+				UnadmittedExit::Cap => {
+					set_cap(&node, Duration::from_millis(400));
+					expire_cached_leases(&node, meta.client_hlc);
+				}
+				UnadmittedExit::CallerDeadline => {
+					set_cap(&node, WIDE_CAP);
+					meta.deadline_remaining_millis = 3_000;
+					expire_cached_leases(&node, meta.client_hlc);
+				}
+				UnadmittedExit::InvalidLease => {
+					set_cap(&node, WIDE_CAP);
+					assert!(renew(&node).await >= 1);
+					hooks.forced_leader.send_replace(Some(None));
+				}
+			}
+			// The waiter is held just short of its sleep, so the record lands while it is
+			// installed however long the bound is.
+			let release = Arc::new(Notify::new());
+			*hooks.hold_before_sleep.lock().unwrap() = Some(release.clone());
+			let earlier = sleeps(&node);
+			let waits_before = completed_waits(&node).len();
+			let mut write = wire_table_write(&node, &meta, &batch);
+			sleeps_past(&node, &mut write, earlier).await;
+
+			let unresolved = mutation_expiry_response(
+				&table_write_synthetic_meta(&meta, Identity::ZERO, 0),
+				crate::network::data_server::write_clocks::WriteExpiry {
+					status: WriteStatus::WRITE_STALLED,
+					reason: MutationStopReason::NO_PROGRESS,
+				},
+				MutationCommitKnowledge::INDETERMINATE,
+			);
+			node.data_server
+				.record_mutation_outcome(
+					meta.parent_write_id,
+					meta.tenant_id,
+					unresolved,
+					None,
+					None,
+				)
+				.await
+				.unwrap();
+			*hooks.hold_before_sleep.lock().unwrap() = None;
+			release.notify_one();
+			if matches!(exit, UnadmittedExit::InvalidLease) {
+				hooks.forced_leader.send_replace(Some(Some(9_999)));
+			}
+
+			let answered = tokio::time::timeout(STEP_BOUND, write)
+				.await
+				.expect("the wait ends")
+				.unwrap();
+			assert_eq!(
+				answered.write.status,
+				WriteStatus::WRITE_STALLED,
+				"{exit:?}: {answered:?}"
+			);
+			assert_eq!(
+				answered.write.mutation_commit_knowledge(),
+				MutationCommitKnowledge::INDETERMINATE,
+				"{exit:?}: the answer keeps the recorded uncertainty"
+			);
+			let stored = recorded_outcome(&node, &meta).await;
+			assert_eq!(stored.resolution, MutationResolutionStatus::PRESENT);
+			assert_eq!(
+				stored.write.status,
+				WriteStatus::WRITE_STALLED,
+				"{exit:?}: {stored:?}"
+			);
+			assert_eq!(
+				stored.write.mutation_commit_knowledge(),
+				MutationCommitKnowledge::INDETERMINATE,
+				"{exit:?}: nothing was recorded over it"
+			);
+			assert_eq!(
+				stored.write.mutation_stop_reason(),
+				MutationStopReason::NO_PROGRESS
+			);
+			assert!(!row_exists(&node, &descriptor, row), "{exit:?}");
+			let waits = completed_waits(&node);
+			assert_eq!(waits.len(), waits_before + 1, "{exit:?}: {waits:?}");
+			assert_eq!(
+				waits.last().map(|(_, outcome)| *outcome),
+				Some(LeaseGateWaitOutcome::Replayed),
+				"{exit:?}"
+			);
+			hooks.forced_leader.send_replace(None);
+			assert!(renew(&node).await >= 1);
+		}
+		shutdown_lease_node(node).await;
+	}
+
+	/// Readmission judges a deadline that has come before whatever its recheck found. With the
+	/// caller's clocks expired, a stale epoch, lost primacy, and a final pass that answers Missing
+	/// or InvalidSignature at once all end in the clocks' outcome, recorded. With only the cap
+	/// passed, a final pass that is not Valid is the cap's refusal.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+	async fn readmission_judges_an_elapsed_deadline_before_any_refusal_it_computed() {
+		let (_dir, owned_node, descriptor) = lease_wait_node("lease-wait-readmit-deadline").await;
+		let node = &owned_node;
+		let server = &node.data_server;
+		let forced = &server.lease_gate_wait_hooks.forced_leader;
+		let descriptor = &descriptor;
+		let readmit = |sequence_no: u64, caller_expired: bool| {
+			async move {
+				let (meta, batch) = write_of(descriptor, 7, sequence_no);
+				let children = server
+					.bifurcate_primary_key_table_write(
+						&meta,
+						&batch,
+						descriptor,
+						WriterNodeId::from_node_id(node.local_node),
+						meta.client_hlc,
+					)
+					.expect("the write bifurcates")
+					.bifurcated
+					.children;
+				assert!(!children.is_empty());
+				let now = tokio::time::Instant::now();
+				let clocks =
+					WriteClocks::new(Duration::from_secs(30), caller_expired.then_some(now));
+				let (outcome, answer) = server
+					.readmit_after_lease_gate_wait(
+						&meta,
+						&table_write_synthetic_meta(&meta, Identity::ZERO, 0),
+						&children,
+						clocks,
+						None,
+						// The wait's deadline has come already.
+						now,
+					)
+					.await
+					.unwrap();
+				let answer = answer.expect("an answer, not an admission").0;
+				let stored = recorded_outcome(node, &meta).await;
+				(outcome, answer, stored)
+			}
+		};
+		let assert_clocks = |label: &str,
+		                     (outcome, answer, stored): (
+			LeaseGateWaitOutcome,
+			WriteResponseMeta,
+			MutationOutcomeResponseMeta,
+		)| {
+			assert_eq!(outcome, LeaseGateWaitOutcome::ClocksExpired, "{label}");
+			assert_eq!(
+				answer.status,
+				WriteStatus::WRITE_DEADLINE_EXCEEDED,
+				"{label}: {answer:?}"
+			);
+			assert_eq!(
+				answer.mutation_commit_knowledge(),
+				MutationCommitKnowledge::KNOWN_NOT_COMMITTED,
+				"{label}"
+			);
+			assert_eq!(
+				stored.resolution,
+				MutationResolutionStatus::PRESENT,
+				"{label}"
+			);
+			assert_eq!(
+				stored.write.status,
+				WriteStatus::WRITE_DEADLINE_EXCEEDED,
+				"{label}"
+			);
+		};
+		let assert_cap = |label: &str,
+		                  (outcome, answer, stored): (
+			LeaseGateWaitOutcome,
+			WriteResponseMeta,
+			MutationOutcomeResponseMeta,
+		)| {
+			assert_eq!(outcome, LeaseGateWaitOutcome::RefusedAtCap, "{label}");
+			assert_eq!(
+				answer.status,
+				WriteStatus::LEASE_EXPIRED,
+				"{label}: {answer:?}"
+			);
+			assert_ne!(
+				stored.resolution,
+				MutationResolutionStatus::PRESENT,
+				"{label}: a refusal at the gate records nothing itself"
+			);
+		};
+
+		// The final pass answers Missing at once.
+		server.lease_cache().write().unwrap().clear();
+		assert_clocks("missing, caller expired", readmit(713_650, true).await);
+		assert_cap("missing, cap only", readmit(713_651, false).await);
+
+		// The final pass answers InvalidSignature at once.
+		assert!(renew(node).await >= 1);
+		forced.send_replace(Some(Some(9_999)));
+		assert_clocks("invalid, caller expired", readmit(713_652, true).await);
+		assert_cap("invalid, cap only", readmit(713_653, false).await);
+		forced.send_replace(None);
+
+		// Primacy is lost, then the epoch is stale as well: each refusal yields to the clocks.
+		move_primacy_away(node);
+		assert_clocks("primacy, caller expired", readmit(713_654, true).await);
+		node.state_machine
+			.seed_e_safe_for_test(5, hlc(1, 0, 1))
+			.await;
+		assert_clocks("epoch, caller expired", readmit(713_655, true).await);
+		shutdown_lease_node(owned_node).await;
+	}
+
+	/// Two children under two leases. A grant that covers one child wakes the write and admits
+	/// nothing, a grant for another epoch likewise, and when the second child is covered the final
+	/// pass reads every child before the write proceeds.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+	async fn a_grant_for_one_child_does_not_admit_and_the_final_pass_reads_every_child() {
+		let (_dir, node, descriptor) = lease_wait_node("lease-wait-two-children").await;
+		set_cap(&node, WIDE_CAP);
+		let server = &node.data_server;
+		let locality_of = |id: i64| {
+			let (meta, batch) = write_of(&descriptor, id, 1);
+			validate_table_write_request_batch(
+				&meta,
+				&batch,
+				&descriptor,
+				WriterNodeId::from_node_id(node.local_node),
+				meta.client_hlc,
+			)
+			.unwrap()
+			.localities[0]
+				.get()
+		};
+		let first = locality_of(1);
+		let (second_id, second) = (2_i64..1_000)
+			.map(|id| (id, locality_of(id)))
+			.find(|(_, locality)| *locality != first)
+			.expect("two rows in two localities");
+		let split = first.min(second);
+		let batch = typed_table_batch(vec![1, second_id]);
+		let mut meta = typed_table_meta(&descriptor, batch.num_rows());
+		meta.parent_write_id.sequence_no = 713_600;
+		let lease = |epoch: u64, range_start: u64, range_end: u64| {
+			server.make_signed_lease(
+				epoch,
+				node.local_node,
+				range_start,
+				range_end,
+				hlc(0, 0, node.local_node.id),
+				hlc(u64::MAX / 2, 0, node.local_node.id),
+			)
+		};
+
+		server.lease_cache().write().unwrap().clear();
+		let mut write = wire_table_write(&node, &meta, &batch);
+		sleeps_past(&node, &mut write, 0).await;
+		// The production writer of a grant, which is what raises the wake.
+		server.cache_granted_lease(lease(1, 0, split));
+		sleeps_past(&node, &mut write, 1).await;
+		server.cache_granted_lease(lease(99, split + 1, u64::MAX));
+		sleeps_past(&node, &mut write, 2).await;
+		assert!(!row_exists(&node, &descriptor, 1) && !row_exists(&node, &descriptor, second_id));
+		server.cache_granted_lease(lease(1, split + 1, u64::MAX));
+		let written = tokio::time::timeout(STEP_BOUND, write)
+			.await
+			.expect("the covering grant wakes the write")
+			.unwrap();
+		assert_eq!(written.write.status, WriteStatus::OK, "{written:?}");
+		assert!(row_exists(&node, &descriptor, 1) && row_exists(&node, &descriptor, second_id));
+		let passes = server
+			.lease_gate_wait_hooks
+			.gate_passes
+			.lock()
+			.unwrap()
+			.clone();
+		assert!(passes.len() >= 5, "{passes:?}");
+		let (earlier, final_two) = passes.split_at(passes.len() - 2);
+		assert_eq!(
+			final_two,
+			[2, 2],
+			"the pass that ended the wait and the final pass each read both children: {passes:?}"
+		);
+		assert!(
+			earlier.iter().all(|valid| *valid < 2),
+			"no earlier pass found both children covered: {passes:?}"
+		);
+		assert_eq!(
+			completed_waits(&node),
+			vec![(LeaseGateWaitReason::NoLease, LeaseGateWaitOutcome::Admitted)]
+		);
+		shutdown_lease_node(node).await;
+	}
+
+	/// The leader branch only, through the leader override: while a write waits for a leader,
+	/// another leader than its lease's issuer appears. That is refused at once, not waited on.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+	async fn another_leader_than_the_issuer_is_refused_at_once() {
+		let (_dir, node, descriptor) = lease_wait_node("lease-wait-other-leader").await;
+		set_cap(&node, WIDE_CAP);
+		let (meta, batch) = write_of(&descriptor, 7, 713_700);
+		let forced = &node.data_server.lease_gate_wait_hooks.forced_leader;
+		forced.send_replace(Some(None));
+		let mut write = wire_table_write(&node, &meta, &batch);
+		sleeps_past(&node, &mut write, 0).await;
+		forced.send_replace(Some(Some(9_999)));
+		let refused = tokio::time::timeout(STEP_BOUND, write)
+			.await
+			.expect("the change of leader wakes the write")
+			.unwrap();
+		assert_eq!(
+			refused.write.status,
+			WriteStatus::INVALID_LEASE_SIGNATURE,
+			"{refused:?}"
+		);
+		assert!(!row_exists(&node, &descriptor, 7));
+		assert_eq!(
+			completed_waits(&node),
+			vec![(
+				LeaseGateWaitReason::NoLeader,
+				LeaseGateWaitOutcome::RefusedInvalidLease
+			)]
+		);
+		shutdown_lease_node(node).await;
+	}
+
+	/// A table delete shares the wait: it recovers in the same attempt, and its result and three
+	/// counts are those of a delete that never waited.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+	async fn a_table_delete_waits_out_an_expired_lease_with_its_usual_result() {
+		let (_dir, node, descriptor) = lease_wait_node("lease-wait-delete").await;
+		set_cap(&node, WIDE_CAP);
+		for (id, sequence_no) in [(7_i64, 713_800_u64), (8, 713_801)] {
+			let (meta, batch) = write_of(&descriptor, id, sequence_no);
+			let (written, _) = node.data_server.table_write(meta, batch).await.unwrap();
+			assert_eq!(written.write.status, WriteStatus::OK);
+		}
+		let delete_of = |id: i64, sequence_no: u64| {
+			let mut meta: TableDeleteRowsRequestMeta = bytemuck::Zeroable::zeroed();
+			meta.parent_write_id = crate::schema::ClientWriteId {
+				client_uuid: [0x71; 16],
+				sequence_no,
+				idempotency_ttl_ms: 30_000,
+				_pad: 0,
+			};
+			meta.client_hlc = hlc(20, 0, 713);
+			meta.expected_epoch = 1;
+			meta.tenant_id = tenant();
+			meta.table_object_id = descriptor.table_object_id;
+			meta.schema_generation = descriptor.schema_generation;
+			meta.row_count = 2;
+			meta.durability = DurabilityLevel::QUORUM;
+			let never_written = Identity::new([sequence_no as u8; 32]);
+			(meta, vec![row_key(&descriptor, id), never_written])
+		};
+
+		let (meta, row_key_ids) = delete_of(7, 1);
+		let (unwaited, _) = node
+			.data_server
+			.table_delete(meta, row_key_ids)
+			.await
+			.unwrap();
+		assert_eq!(unwaited.write.status, WriteStatus::OK, "{unwaited:?}");
+		assert!(
+			completed_waits(&node).is_empty(),
+			"the control never waited"
+		);
+
+		let (meta, row_key_ids) = delete_of(8, 2);
+		expire_cached_leases(&node, meta.client_hlc);
+		let mut delete = tokio::spawn({
+			let server = node.data_server.clone();
+			async move { server.table_delete(meta, row_key_ids).await.unwrap().0 }
+		});
+		sleeps_past(&node, &mut delete, 0).await;
+		assert!(
+			!node
+				.slab
+				.lookup(tenant(), row_key(&descriptor, 8))
+				.unwrap()
+				.unwrap()
+				.is_tombstone,
+			"nothing is deleted while the lease is unavailable"
+		);
+		assert!(renew(&node).await >= 1, "a valid renewal arrives");
+		let waited = tokio::time::timeout(STEP_BOUND, delete)
+			.await
+			.expect("the renewal wakes the delete")
+			.unwrap();
+		assert_eq!(waited.write.status, unwaited.write.status, "{waited:?}");
+		assert_eq!(waited.reject_code, unwaited.reject_code);
+		assert_eq!(
+			[
+				waited.deleted_count,
+				waited.already_deleted_count,
+				waited.not_found_count
+			],
+			[
+				unwaited.deleted_count,
+				unwaited.already_deleted_count,
+				unwaited.not_found_count
+			]
+		);
+		assert_eq!(
+			[
+				waited.deleted_count,
+				waited.already_deleted_count,
+				waited.not_found_count
+			],
+			[1, 0, 1]
+		);
+		assert!(
+			node.slab
+				.lookup(tenant(), row_key(&descriptor, 8))
+				.unwrap()
+				.unwrap()
+				.is_tombstone
+		);
+		assert_eq!(
+			completed_waits(&node),
+			vec![(LeaseGateWaitReason::Expired, LeaseGateWaitOutcome::Admitted)]
+		);
+		shutdown_lease_node(node).await;
+	}
+
+	/// With a lease and a leader in place nothing waits: one pass of the gate, no waiter, no count.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+	async fn a_write_with_a_valid_lease_never_waits() {
+		let (_dir, node, descriptor) = lease_wait_node("lease-wait-ordinary").await;
+		let (meta, batch) = write_of(&descriptor, 7, 713_900);
+		let written = tokio::time::timeout(STEP_BOUND, wire_table_write(&node, &meta, &batch))
+			.await
+			.expect("an ordinary write answers")
+			.unwrap();
+		assert_eq!(written.write.status, WriteStatus::OK, "{written:?}");
+		assert!(row_exists(&node, &descriptor, 7));
+		assert_eq!(sleeps(&node), 0, "no waiter was installed");
+		assert!(completed_waits(&node).is_empty());
+		assert_eq!(
+			*node
+				.data_server
+				.lease_gate_wait_hooks
+				.gate_passes
+				.lock()
+				.unwrap(),
+			vec![1],
+			"one pass over the one child"
+		);
+		shutdown_lease_node(node).await;
+	}
+
+	// The wait itself, with no node: virtual time, so every instant below is exact.
+
+	struct WaitUnderTest {
+		grants: watch::Sender<u64>,
+		/// The leader and one unrelated metric, as the Raft metrics watch carries both.
+		leader: Option<watch::Sender<(Option<u32>, u64)>>,
+		gate: Arc<StdMutex<LeaseGateResult>>,
+		evaluations: Arc<AtomicU64>,
+		hooks: Arc<LeaseGateWaitHooks>,
+		started: tokio::time::Instant,
+		wait: JoinHandle<(LeaseGateWaitEnd, tokio::time::Instant)>,
+	}
+
+	const MISSING: LeaseGateResult = LeaseGateResult::Missing(LeaseGateWaitReason::NoLease);
+
+	fn wait_under_test(cap: Duration, hold_before_sleep: Option<Arc<Notify>>) -> WaitUnderTest {
+		wait_with_slow_gate(cap, hold_before_sleep, Duration::ZERO)
+	}
+
+	/// As `wait_under_test`, with every evaluation of the gate taking `evaluation_takes`.
+	fn wait_with_slow_gate(
+		cap: Duration,
+		hold_before_sleep: Option<Arc<Notify>>,
+		evaluation_takes: Duration,
+	) -> WaitUnderTest {
+		let grants = watch::Sender::new(0_u64);
+		let leader = watch::Sender::new((Some(1_u32), 0_u64));
+		let gate = Arc::new(StdMutex::new(MISSING));
+		let evaluations = Arc::new(AtomicU64::new(0));
+		let hooks = Arc::new(LeaseGateWaitHooks::default());
+		*hooks.hold_before_sleep.lock().unwrap() = hold_before_sleep;
+		let started = tokio::time::Instant::now();
+		let wait = tokio::spawn({
+			let mut grants = grants.subscribe();
+			let mut leader = leader.subscribe();
+			let (gate, evaluations, hooks) = (gate.clone(), evaluations.clone(), hooks.clone());
+			async move {
+				let end = wait_for_lease_gate(
+					&mut grants,
+					&mut leader,
+					|metrics| metrics.0,
+					started + cap,
+					|| {
+						evaluations.fetch_add(1, Ordering::SeqCst);
+						let gate = gate.clone();
+						async move {
+							if !evaluation_takes.is_zero() {
+								tokio::time::sleep(evaluation_takes).await;
+							}
+							*gate.lock().unwrap()
+						}
+					},
+					&hooks,
+				)
+				.await;
+				(end, tokio::time::Instant::now())
+			}
+		});
+		WaitUnderTest {
+			grants,
+			leader: Some(leader),
+			gate,
+			evaluations,
+			hooks,
+			started,
+			wait,
+		}
+	}
+
+	impl WaitUnderTest {
+		async fn sleeps(&self, at_least: u64) {
+			self.hooks
+				.installed
+				.subscribe()
+				.wait_for(|count| *count >= at_least)
+				.await
+				.unwrap();
+		}
+	}
+
+	/// A grant, or a change of leader, that lands after the gate was read and before the sleep
+	/// begins is not lost: the sleep ends at once, with no time passing.
+	#[tokio::test(start_paused = true)]
+	async fn a_wake_between_the_evaluation_and_the_sleep_ends_the_sleep_at_once() {
+		for by_grant in [true, false] {
+			let release = Arc::new(Notify::new());
+			let under_test = wait_under_test(LEASE_GATE_WAIT, Some(release.clone()));
+			// The waiter has read the gate and is held just short of its sleep.
+			under_test.sleeps(1).await;
+			*under_test.gate.lock().unwrap() = LeaseGateResult::Valid;
+			if by_grant {
+				under_test.grants.send_modify(|grants| *grants += 1);
+			} else {
+				under_test
+					.leader
+					.as_ref()
+					.unwrap()
+					.send_replace((Some(2), 0));
+			}
+			*under_test.hooks.hold_before_sleep.lock().unwrap() = None;
+			release.notify_one();
+			let (end, ended) = under_test.wait.await.unwrap();
+			assert_eq!(end, LeaseGateWaitEnd::Recovered, "by_grant={by_grant}");
+			assert_eq!(
+				ended, under_test.started,
+				"by_grant={by_grant}: a lost wake would sleep to the cap"
+			);
+		}
+	}
+
+	/// One absolute deadline. Wakes that do not help, a grant and a change of leader, neither end
+	/// the wait nor move its end: the refusal comes at the original deadline exactly.
+	#[tokio::test(start_paused = true)]
+	async fn wakes_that_do_not_help_leave_the_original_deadline_in_place() {
+		let under_test = wait_under_test(LEASE_GATE_WAIT, None);
+		under_test.sleeps(1).await;
+		tokio::time::sleep(Duration::from_millis(500)).await;
+		under_test.grants.send_modify(|grants| *grants += 1);
+		under_test.sleeps(2).await;
+		tokio::time::sleep(Duration::from_millis(1_000)).await;
+		under_test
+			.leader
+			.as_ref()
+			.unwrap()
+			.send_replace((Some(2), 0));
+		under_test.sleeps(3).await;
+		let (end, ended) = under_test.wait.await.unwrap();
+		assert_eq!(end, LeaseGateWaitEnd::AtDeadline);
+		assert_eq!(ended, under_test.started + LEASE_GATE_WAIT);
+		assert_eq!(
+			under_test.evaluations.load(Ordering::SeqCst),
+			3,
+			"one evaluation per wake, none by polling"
+		);
+	}
+
+	/// Raft metrics that move with the leader unchanged cause no evaluation, neither while the gate
+	/// is being read nor during a sleep. The write waits; a grant and a real change of leader each
+	/// still wake it, once.
+	#[tokio::test(start_paused = true)]
+	async fn metrics_that_move_without_the_leader_cause_no_evaluation() {
+		let evaluation_takes = Duration::from_millis(100);
+		let under_test = wait_with_slow_gate(LEASE_GATE_WAIT, None, evaluation_takes);
+		let leader = under_test.leader.as_ref().unwrap();
+		let churn = |metric: u64| leader.send_modify(|metrics| metrics.1 = metric);
+		let evaluations = || under_test.evaluations.load(Ordering::SeqCst);
+
+		// While the first evaluation is in flight.
+		tokio::time::sleep(evaluation_takes / 2).await;
+		assert_eq!(evaluations(), 1);
+		for metric in 1..=5 {
+			churn(metric);
+			tokio::task::yield_now().await;
+		}
+		under_test.sleeps(1).await;
+		assert_eq!(
+			evaluations(),
+			1,
+			"churn during the evaluation read the gate again"
+		);
+		assert_eq!(
+			tokio::time::Instant::now(),
+			under_test.started + evaluation_takes
+		);
+
+		// While it sleeps.
+		for metric in 6..=10 {
+			churn(metric);
+			tokio::time::sleep(Duration::from_millis(50)).await;
+		}
+		assert_eq!(
+			evaluations(),
+			1,
+			"churn during the sleep read the gate again"
+		);
+		assert_eq!(
+			*under_test.hooks.installed.borrow(),
+			1,
+			"it is still asleep"
+		);
+		assert!(!under_test.wait.is_finished());
+
+		// A grant still wakes it, with churn in flight during that evaluation too.
+		under_test.grants.send_modify(|grants| *grants += 1);
+		tokio::time::sleep(evaluation_takes / 2).await;
+		churn(11);
+		under_test.sleeps(2).await;
+		assert_eq!(evaluations(), 2);
+
+		// So does a change of the leader itself.
+		*under_test.gate.lock().unwrap() = LeaseGateResult::Valid;
+		leader.send_modify(|metrics| *metrics = (Some(2), 12));
+		let (end, ended) = under_test.wait.await.unwrap();
+		assert_eq!(end, LeaseGateWaitEnd::Recovered);
+		assert_eq!(under_test.evaluations.load(Ordering::SeqCst), 3);
+		assert!(ended < under_test.started + LEASE_GATE_WAIT);
+	}
+
+	/// A change of leader while the gate is being read is not lost: the gate is read again at
+	/// once, with no sleep between.
+	#[tokio::test(start_paused = true)]
+	async fn a_leader_that_changes_during_the_evaluation_is_evaluated_again_at_once() {
+		let evaluation_takes = Duration::from_millis(100);
+		let under_test = wait_with_slow_gate(LEASE_GATE_WAIT, None, evaluation_takes);
+		tokio::time::sleep(evaluation_takes / 2).await;
+		under_test
+			.leader
+			.as_ref()
+			.unwrap()
+			.send_replace((Some(2), 0));
+		under_test.sleeps(1).await;
+		assert_eq!(under_test.evaluations.load(Ordering::SeqCst), 2);
+		assert_eq!(
+			tokio::time::Instant::now(),
+			under_test.started + evaluation_takes * 2
+		);
+		under_test.wait.abort();
+	}
+
+	/// A closed leader watch refuses at once and is never armed again, during a sleep or before it.
+	#[tokio::test(start_paused = true)]
+	async fn a_closed_leader_watch_refuses_and_never_spins() {
+		let mut asleep = wait_under_test(LEASE_GATE_WAIT, None);
+		asleep.sleeps(1).await;
+		drop(asleep.leader.take());
+		let (end, ended) = asleep.wait.await.unwrap();
+		assert_eq!(end, LeaseGateWaitEnd::WatchClosed);
+		assert_eq!(ended, asleep.started);
+		assert_eq!(asleep.evaluations.load(Ordering::SeqCst), 1);
+
+		let release = Arc::new(Notify::new());
+		let mut held = wait_under_test(LEASE_GATE_WAIT, Some(release.clone()));
+		held.sleeps(1).await;
+		drop(held.leader.take());
+		release.notify_one();
+		let (end, ended) = held.wait.await.unwrap();
+		assert_eq!(end, LeaseGateWaitEnd::WatchClosed);
+		assert_eq!(ended, held.started);
+		assert_eq!(held.evaluations.load(Ordering::SeqCst), 1);
+
+		let mut closed_before = wait_under_test(LEASE_GATE_WAIT, None);
+		drop(closed_before.leader.take());
+		let (end, ended) = closed_before.wait.await.unwrap();
+		assert_eq!(end, LeaseGateWaitEnd::WatchClosed);
+		assert_eq!(ended, closed_before.started);
+		assert_eq!(closed_before.evaluations.load(Ordering::SeqCst), 1);
+	}
+
+	/// The deadline covers the gate's evaluation too: one still pending at the deadline is the
+	/// refusal, and a `Valid` that arrives exactly at the deadline does not win.
+	#[tokio::test(start_paused = true)]
+	async fn an_evaluation_is_under_the_deadline_and_a_result_at_it_does_not_win() {
+		for evaluation_takes in [LEASE_GATE_WAIT * 2, LEASE_GATE_WAIT] {
+			let grants = watch::Sender::new(0_u64);
+			let leader = watch::Sender::new(Some(1_u32));
+			let hooks = LeaseGateWaitHooks::default();
+			let started = tokio::time::Instant::now();
+			let end = wait_for_lease_gate(
+				&mut grants.subscribe(),
+				&mut leader.subscribe(),
+				|leader| *leader,
+				started + LEASE_GATE_WAIT,
+				|| async move {
+					tokio::time::sleep(evaluation_takes).await;
+					LeaseGateResult::Valid
+				},
+				&hooks,
+			)
+			.await;
+			assert_eq!(end, LeaseGateWaitEnd::AtDeadline, "{evaluation_takes:?}");
+			assert_eq!(
+				tokio::time::Instant::now(),
+				started + LEASE_GATE_WAIT,
+				"{evaluation_takes:?}"
+			);
+		}
+	}
+
+	/// The deadline is the cap, shortened by the write's own clocks and never lengthened by them.
+	/// At a tie the clocks have expired when the deadline comes, and their outcome is the one read.
+	#[tokio::test(start_paused = true)]
+	async fn the_deadline_is_the_cap_shortened_by_the_writes_own_clocks() {
+		let now = tokio::time::Instant::now();
+		let stall_only = WriteClocks::new(Duration::from_secs(30), None);
+		assert_eq!(
+			lease_gate_deadline(LEASE_GATE_WAIT, stall_only),
+			now + LEASE_GATE_WAIT
+		);
+		let sooner = WriteClocks::new(
+			Duration::from_secs(30),
+			Some(now + Duration::from_millis(500)),
+		);
+		assert_eq!(
+			lease_gate_deadline(LEASE_GATE_WAIT, sooner),
+			now + Duration::from_millis(500)
+		);
+		let tie = WriteClocks::new(Duration::from_secs(30), Some(now + LEASE_GATE_WAIT));
+		let deadline = lease_gate_deadline(LEASE_GATE_WAIT, tie);
+		assert_eq!(deadline, now + LEASE_GATE_WAIT);
+		assert_eq!(tie.expired(), None);
+		tokio::time::sleep_until(deadline).await;
+		assert_eq!(
+			tie.expired().map(|expiry| expiry.status),
+			Some(WriteStatus::WRITE_DEADLINE_EXCEEDED)
+		);
+		assert_eq!(stall_only.expired(), None, "the cap alone has run out");
+		assert_eq!(LEASE_GATE_WAIT, Duration::from_secs(2));
+	}
+}
