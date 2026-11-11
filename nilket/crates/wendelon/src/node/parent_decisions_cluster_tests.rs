@@ -6567,3 +6567,6 @@ async fn a_write_with_a_remote_holder_answered_in_time_commits_on_its_first_atte
 		let _ = tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown()).await;
 	}
 }
+
+#[path = "parent_decisions_cluster_tests/write_deadline.rs"]
+mod write_deadline;

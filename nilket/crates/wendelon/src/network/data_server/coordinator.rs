@@ -10,6 +10,9 @@
 //! COMMITTED and only a recorded Refused answers KNOWN_NOT_COMMITTED.
 
 use super::child_writes::{ChildWriteMeta, child_request_meta, child_versions};
+use super::write_deadline::{
+	AttemptGate, EarlyAnswer, EarlyTableWriteAnswer, OwnedAttempt, answer_by_deadline,
+};
 use super::*;
 use crate::consensus::decisions::{
 	ChildAckBody, ChildClaim, Claim, DecisionResult, LineageRef, Lookup, ParentKey,
@@ -77,6 +80,9 @@ pub(crate) enum Settled {
 	Indeterminate(WriteStatus),
 	/// Refused for this identity; retrying it as-is cannot help.
 	Refused(WriteStatus),
+	/// The caller's deadline is the answer. Never known-not-committed: this
+	/// attempt or an earlier one of the same identity may have reserved.
+	Deadline,
 }
 
 /// Builds a claim for a fresh parent, or says why this node cannot. Rows are
@@ -201,6 +207,16 @@ pub(super) fn build_claim(
 	})
 }
 
+/// A write attempt's proposal of a Reserve or a Finalize, which only an attempt
+/// that claimed its gate may make.
+async fn propose_owned(
+	proposals: &crate::network::decision_proposals::DecisionProposals,
+	_owned: &OwnedAttempt,
+	decision: ForwardedDecision,
+) -> ProposalResponse {
+	proposals.propose(decision).await
+}
+
 /// The rows of each child of a retained claim, by the child ranges.
 pub(super) fn rows_of_claim(claim: &Claim, positions: &[u64]) -> Option<Vec<Vec<u32>>> {
 	let mut rows = vec![Vec::new(); claim.children.len()];
@@ -229,6 +245,11 @@ impl WendelonDataServer {
 		meta: &TableWriteRequestMeta,
 		settled: Settled,
 	) -> TableWriteResponseMeta {
+		let stop = if settled == Settled::Deadline {
+			MutationStopReason::DEADLINE
+		} else {
+			MutationStopReason::NONE
+		};
 		let (status, knowledge, log_index, commit_hlc, hint) = match settled {
 			Settled::Committed { dec, commit_hlc } => (
 				WriteStatus::OK,
@@ -258,6 +279,13 @@ impl WendelonDataServer {
 				meta.client_hlc,
 				self.local_node,
 			),
+			Settled::Deadline => (
+				WriteStatus::WRITE_DEADLINE_EXCEEDED,
+				MutationCommitKnowledge::INDETERMINATE,
+				0,
+				meta.client_hlc,
+				self.local_node,
+			),
 		};
 		table_write_response(
 			self.counted_write_response(
@@ -273,25 +301,63 @@ impl WendelonDataServer {
 					has_finalization: 0,
 					_pad2: [0; 7],
 				}
-				.with_mutation_outcome(knowledge, MutationStopReason::NONE),
+				.with_mutation_outcome(knowledge, stop),
 			),
 			PbcRejectCode::NONE,
 		)
 	}
 
 	/// The table write of a ParentDecisions node.
+	///
+	/// A caller's deadline is one absolute budget, fixed here once and never
+	/// renewed, with every lookup inside it. By it the coordinator has its
+	/// answer: its own result, or WRITE_DEADLINE_EXCEEDED, INDETERMINATE, stop
+	/// reason DEADLINE. That answer is never recorded and is no abort. An
+	/// attempt that had not yet claimed its gate is dropped, having submitted
+	/// nothing. One that had is given to `early` and still polled here to its
+	/// end, so this call returns only when the coordination has ended; with no
+	/// `early` its deadline answer is returned then. A cooperative bound on
+	/// the coordinator's answer, plus scheduling slack: not a real-time
+	/// guarantee, and not a bound on what the handler does with an ordinary
+	/// result afterwards (the last-attempt outcome record is outside it).
 	pub(super) async fn coordinate_table_write(
 		&self,
 		meta: TableWriteRequestMeta,
 		batch: RecordBatch,
+		early: Option<EarlyAnswer>,
 	) -> std::io::Result<(TableWriteResponseMeta, Option<FinalizationMarker>)> {
 		let namespace = ParentNamespace::Table(meta.table_object_id);
 		if meta.table_object_id == crate::schema::TableObjectId::DEFAULT_KV {
 			let settled = Settled::Refused(WriteStatus::INTERNAL_ERROR);
 			return Ok((self.settled_response(&meta, settled), None));
 		}
-		let settled = self.coordinate(namespace, &meta, &batch).await;
-		Ok((self.settled_response(&meta, settled), None))
+		let gate = AttemptGate::until(caller_deadline_from_remaining_millis(
+			meta.deadline_remaining_millis,
+		));
+		let mut given = None;
+		let settled = answer_by_deadline(
+			&gate,
+			self.coordinate(namespace, &meta, &batch, &gate),
+			|| {
+				let response = self.settled_response(&meta, Settled::Deadline);
+				if let Some(early) = early {
+					early.give(EarlyTableWriteAnswer {
+						request: meta,
+						response,
+					});
+				}
+				given = Some(response);
+			},
+		)
+		.await;
+		let response = match (settled, given) {
+			(Some(settled), _) => self.settled_response(&meta, settled),
+			// Already answered, and counted once: the coordination's own result
+			// is not a second answer.
+			(None, Some(given)) => given,
+			(None, None) => self.settled_response(&meta, Settled::Deadline),
+		};
+		Ok((response, None))
 	}
 
 	/// ADR 0699 S4b: a single-key KV write of a ParentDecisions node, as a
@@ -328,17 +394,30 @@ impl WendelonDataServer {
 			return refused(WriteStatus::INTERNAL_ERROR);
 		};
 		table_meta.row_count = row_count;
+		// A KV write carries no deadline on the wire.
 		let settled = self
-			.coordinate(ParentNamespace::Kv, &table_meta, &payload)
+			.coordinate(
+				ParentNamespace::Kv,
+				&table_meta,
+				&payload,
+				&AttemptGate::unbounded(),
+			)
 			.await;
 		self.settled_response(&table_meta, settled).write
 	}
 
+	/// One attempt. `gate` is claimed at the attempt's two boundary points and
+	/// nowhere else: immediately before the Reserve proposal is first polled,
+	/// and immediately before a recorded Reserved parent is resumed. Nothing
+	/// before a claim submits a Reserve, a child or a Finalize (it reads, and
+	/// merges the commit clock); a refused claim ends the attempt with the
+	/// deadline's answer, having proposed and resumed nothing.
 	async fn coordinate(
 		&self,
 		namespace: ParentNamespace,
 		meta: &TableWriteRequestMeta,
 		batch: &RecordBatch,
+		gate: &AttemptGate,
 	) -> Settled {
 		let stalled = Settled::Indeterminate(WriteStatus::WRITE_STALLED);
 		let (Some(proposals), Some(signer)) = (
@@ -395,8 +474,10 @@ impl WendelonDataServer {
 		// authority before it; after any Reserve answer, look up again and act
 		// only on the recorded claim, never on a locally built one.
 		let mut reserved_once = false;
+		// This attempt's claim of its gate, once it has one.
+		let mut owned: Option<OwnedAttempt> = None;
 		let positions = &positions;
-		let (claim, rsv, child_rows) = loop {
+		let (claim, rsv, child_rows, owned) = loop {
 			let lookup = proposals
 				.lookup(LookupRequest {
 					key,
@@ -453,7 +534,13 @@ impl WendelonDataServer {
 						let Some(rows) = rows_of_claim(&record.claim, positions) else {
 							return Settled::Refused(WriteStatus::WRITE_KEY_CONFLICT);
 						};
-						break (record.claim, record.rsv, rows);
+						// The resume boundary: the last reads are done and nothing is
+						// awaited between this claim and the resumed work. An attempt
+						// that reserved above already owns its gate.
+						let Some(owned) = owned.take().or_else(|| gate.claim()) else {
+							return Settled::Deadline;
+						};
+						break (record.claim, record.rsv, rows, owned);
 					}
 				},
 				LookupResponse::Found(Lookup::Absent { eligible: true }) if !reserved_once => {
@@ -486,15 +573,20 @@ impl WendelonDataServer {
 							return settled;
 						}
 					};
-					let reserved = proposals
-						.propose(ForwardedDecision::Reserve {
-							claim: crate::consensus::decisions::evidence::sign(
-								&signer.key,
-								built,
-								signer.signer,
-							),
-						})
-						.await;
+					let reserve = ForwardedDecision::Reserve {
+						claim: crate::consensus::decisions::evidence::sign(
+							&signer.key,
+							built,
+							signer.signer,
+						),
+					};
+					// The Reserve boundary: nothing is awaited between this claim
+					// and the proposal's first poll.
+					let Some(claimed) = gate.claim() else {
+						return Settled::Deadline;
+					};
+					let reserved = propose_owned(&proposals, &claimed, reserve).await;
+					owned = Some(claimed);
 					match reserved {
 						// A fresh reservation, a duplicate of a racing one, or one already
 						// terminal: in every case the record, read again, decides.
@@ -543,13 +635,16 @@ impl WendelonDataServer {
 		self.decisions
 			.pause_at(super::child_writes::PauseStage::BeforeFinalize)
 			.await;
-		let finalized = proposals
-			.propose(ForwardedDecision::Finalize {
+		let finalized = propose_owned(
+			&proposals,
+			&owned,
+			ForwardedDecision::Finalize {
 				key: claim.key,
 				request_digest: claim.request_digest,
 				acks,
-			})
-			.await;
+			},
+		)
+		.await;
 		match finalized {
 			ProposalResponse::Applied {
 				outcome:
@@ -725,6 +820,26 @@ impl WendelonDataServer {
 		)
 		.unwrap();
 		(admission.key_identities[0], admission.localities[0])
+	}
+
+	/// One table write attempt under a caller's deadline with nothing racing
+	/// it: what the attempt's own claim points decide when the clock is past
+	/// the deadline and no timer has run.
+	pub(crate) async fn coordinate_until_for_test(
+		&self,
+		meta: TableWriteRequestMeta,
+		batch: RecordBatch,
+		deadline: std::time::Instant,
+	) -> TableWriteResponseMeta {
+		let settled = self
+			.coordinate(
+				ParentNamespace::Table(meta.table_object_id),
+				&meta,
+				&batch,
+				&AttemptGate::until(Some(deadline)),
+			)
+			.await;
+		self.settled_response(&meta, settled)
 	}
 
 	/// The node's table write, for in-crate cluster controls.

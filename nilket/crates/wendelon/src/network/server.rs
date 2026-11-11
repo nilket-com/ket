@@ -994,6 +994,53 @@ impl HrftService for UnroutedService {
 	}
 }
 
+/// Test-only: one inbound connection served by the production accept loop,
+/// with the admission it was given: what a control outside this module needs
+/// to see that a stream's handler still holds its stream permit.
+#[cfg(test)]
+pub(crate) struct ServedConnectionForTest {
+	admission: AdmissionController,
+	_task: tokio::task::JoinHandle<std::io::Result<()>>,
+}
+
+#[cfg(test)]
+impl ServedConnectionForTest {
+	/// Serves `connection` with `service` under `lifecycle` and `config`, as
+	/// a listener does once a connection is admitted.
+	pub(crate) fn serve(
+		connection: Arc<dyn TransportConnection>,
+		service: Arc<LifecycleService>,
+		pool: Arc<BufPool>,
+		lifecycle: ServerLifecycle,
+		config: ServerAdmissionConfig,
+	) -> Self {
+		let admission = AdmissionController::new(config);
+		let connection_admission = admission
+			.try_acquire_connection_for_peer(None)
+			.expect("a fresh controller admits one connection");
+		let task = tokio::spawn(handle_connection(
+			connection,
+			service,
+			pool,
+			lifecycle,
+			admission.clone(),
+			connection_admission,
+		));
+		Self {
+			admission,
+			_task: task,
+		}
+	}
+
+	/// Stream-task permits taken now.
+	pub(crate) fn stream_tasks_admitted(&self) -> usize {
+		self.admission
+			.config
+			.max_concurrent_stream_tasks
+			.saturating_sub(self.admission.stream_task_slots.available_permits())
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::{

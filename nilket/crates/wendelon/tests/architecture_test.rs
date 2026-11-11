@@ -9489,6 +9489,11 @@ fn adr077_data_server_source_concatenates_submodules() {
 			"streaming.rs",
 			"table_query.rs",
 			"write_clocks.rs",
+			// ADR 0714: the gate between a coordinated table write attempt and its
+			// caller's deadline, and the early answer a stream handler joins with
+			// the remainder. One question (who wins, the attempt or the deadline),
+			// so one module.
+			"write_deadline.rs",
 			"write_replication.rs",
 		],
 		"ADR 077 production source manifest changed; update this guard deliberately \

@@ -231,6 +231,7 @@ use query_clocks::{
 mod query_encode;
 use query_encode::encode_query_stream_batches_with_deadline;
 mod write_clocks;
+mod write_deadline;
 use write_clocks::{WriteClocks, acquire_mutation_work_permit, bound_orphan_witness_pull};
 mod mutation_protocol;
 use mutation_protocol::{TableAdmissionError, mutation_expiry_response};
@@ -6931,57 +6932,10 @@ impl DataRingServer for WendelonDataServer {
 				};
 				self.handle_write(&context.actor, frame).await.map(Some)
 			}
-			MsgType::TABLE_WRITE_REQ => {
-				if frame.meta.len() < std::mem::size_of::<TableWriteRequestMeta>() {
-					return Err(Error::new(
-						ErrorKind::InvalidData,
-						"TABLE_WRITE_REQ meta too small",
-					));
-				}
-				let meta: TableWriteRequestMeta = *bytemuck::from_bytes(
-					&frame.meta[..std::mem::size_of::<TableWriteRequestMeta>()],
-				);
-				if self
-					.authorize_actor_for_data(
-						&context.actor,
-						Some(meta.tenant_id),
-						DataOperation::Write,
-					)
-					.is_err()
-				{
-					let resp = self.table_write_error_response(
-						&meta,
-						WriteStatus::AUTHORIZATION_FAILED,
-						PbcRejectCode::NONE,
-					);
-					return Ok(Some(self.build_table_write_response_frame(
-						frame.header.stream_id,
-						resp,
-						None,
-					)));
-				}
-				let _admission = match self
-					.try_admit_table_write_request(&context.actor, Some(meta.tenant_id))?
-				{
-					Ok(admission) => admission,
-					Err(_) => {
-						let resp = self.table_write_error_response(
-							&meta,
-							WriteStatus::BACKPRESSURED,
-							PbcRejectCode::NONE,
-						);
-						let resp = self.finalize_table_write_attempt(meta, resp).await?;
-						return Ok(Some(self.build_table_write_response_frame(
-							frame.header.stream_id,
-							resp,
-							None,
-						)));
-					}
-				};
-				self.handle_table_write(&context.actor, frame)
-					.await
-					.map(Some)
-			}
+			MsgType::TABLE_WRITE_REQ => self
+				.serve_table_write(&context, frame, None)
+				.await
+				.map(Some),
 			MsgType::TABLE_DELETE_REQ => {
 				if frame.meta.len() < std::mem::size_of::<TableDeleteRowsRequestMeta>() {
 					return Err(Error::new(
@@ -7822,6 +7776,9 @@ impl DataRingServer for WendelonDataServer {
 					}
 				};
 				self.handle_stream_finalization_stream(frame, stream).await
+			}
+			MsgType::TABLE_WRITE_REQ => {
+				self.serve_table_write_stream(&context, frame, stream).await
 			}
 			other => Err(Error::new(
 				ErrorKind::Unsupported,
@@ -9310,15 +9267,29 @@ impl WendelonDataServer {
 		}).await
 	}
 
+	#[cfg(test)]
 	async fn table_write(
 		&self,
 		meta: TableWriteRequestMeta,
 		payload: RecordBatch,
 	) -> std::io::Result<(TableWriteResponseMeta, Option<FinalizationMarker>)> {
+		self.table_write_answering(meta, payload, None).await
+	}
+
+	/// `table_write`, with somewhere to give the answer if it is ready before
+	/// the write's work has ended. Only a ParentDecisions node's coordinated
+	/// write ever does; otherwise `early` is unused and the returned response
+	/// is the only one.
+	async fn table_write_answering(
+		&self,
+		meta: TableWriteRequestMeta,
+		payload: RecordBatch,
+		early: Option<write_deadline::EarlyAnswer>,
+	) -> std::io::Result<(TableWriteResponseMeta, Option<FinalizationMarker>)> {
 		self.observe_table_write(&meta, async {
 			metrics().data_ring_write_requests_total.inc();
 			if self.decision_mode != crate::consensus::decision_mode::DecisionMode::Today {
-				return self.coordinate_table_write(meta, payload).await;
+				return self.coordinate_table_write(meta, payload, early).await;
 			}
 			if meta.proxy_hop >= 2 {
 				return Ok((

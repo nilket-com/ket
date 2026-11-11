@@ -1,3 +1,4 @@
+use super::write_deadline::EarlyAnswer;
 use super::*;
 use crate::metrics::{LeaseGateWaitOutcome, LeaseGateWaitReason};
 
@@ -99,6 +100,22 @@ impl PendingFinalizationClaims {
 	}
 }
 
+/// Writes the one response frame and finishes the stream's write side.
+async fn respond_and_finish(
+	stream: &mut dyn TransportStream,
+	response: HrftFrame,
+) -> std::io::Result<()> {
+	write_frame(
+		stream,
+		&response.header,
+		&response.meta,
+		response.arrow_payload.as_deref(),
+		response.trailing.as_deref(),
+	)
+	.await?;
+	stream.finish().await
+}
+
 impl WendelonDataServer {
 	pub(super) async fn handle_write(
 		&self,
@@ -132,10 +149,101 @@ impl WendelonDataServer {
 		))
 	}
 
+	/// A table write request, to its response frame: the tenant
+	/// authorization, the request admission, the payload decoding, the write
+	/// and the last-attempt rule. `early` is where the write gives its answer
+	/// if that is ready before its work has ended; the frame returned here is
+	/// then no second answer. Without `early` the one answer is the returned
+	/// frame, which this call holds until the work has ended.
+	pub(super) async fn serve_table_write(
+		&self,
+		context: &RequestContext,
+		frame: HrftFrame,
+		early: Option<EarlyAnswer>,
+	) -> std::io::Result<HrftFrame> {
+		if frame.meta.len() < std::mem::size_of::<TableWriteRequestMeta>() {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"TABLE_WRITE_REQ meta too small",
+			));
+		}
+		let meta: TableWriteRequestMeta =
+			*bytemuck::from_bytes(&frame.meta[..std::mem::size_of::<TableWriteRequestMeta>()]);
+		if self
+			.authorize_actor_for_data(&context.actor, Some(meta.tenant_id), DataOperation::Write)
+			.is_err()
+		{
+			let resp = self.table_write_error_response(
+				&meta,
+				WriteStatus::AUTHORIZATION_FAILED,
+				PbcRejectCode::NONE,
+			);
+			return Ok(self.build_table_write_response_frame(frame.header.stream_id, resp, None));
+		}
+		let _admission =
+			match self.try_admit_table_write_request(&context.actor, Some(meta.tenant_id))? {
+				Ok(admission) => admission,
+				Err(_) => {
+					let resp = self.table_write_error_response(
+						&meta,
+						WriteStatus::BACKPRESSURED,
+						PbcRejectCode::NONE,
+					);
+					let resp = self.finalize_table_write_attempt(meta, resp).await?;
+					return Ok(self.build_table_write_response_frame(
+						frame.header.stream_id,
+						resp,
+						None,
+					));
+				}
+			};
+		self.handle_table_write(&context.actor, frame, early).await
+	}
+
+	/// A table write on its own stream. The response is written, and the
+	/// stream finished, as soon as the write has an answer. An answer given
+	/// before the write's work has ended (a coordinated write's deadline) does
+	/// not end that work: this same call goes on polling the same write to its
+	/// end, and returns only then. So whatever tracks this call as in-flight
+	/// work, and whatever admission it holds, covers the remainder too.
+	///
+	/// The response and the remainder are joined, never raced: a response that
+	/// cannot be written or finished (the caller has gone, or is not reading)
+	/// neither stops nor drops the write.
+	pub(super) async fn serve_table_write_stream(
+		&self,
+		context: &RequestContext,
+		frame: HrftFrame,
+		mut stream: Box<dyn TransportStream>,
+	) -> std::io::Result<()> {
+		let stream_id = frame.header.stream_id;
+		let (early, mut given) = EarlyAnswer::channel();
+		let write = self.serve_table_write(context, frame, Some(early));
+		tokio::pin!(write);
+		let answer = tokio::select! {
+			biased;
+			// The write ended with its answer: the only response.
+			done = &mut write => {
+				return respond_and_finish(&mut *stream, done?).await;
+			}
+			Ok(answer) = &mut given => answer,
+		};
+		let respond = async {
+			let response = self
+				.finalize_table_write_attempt(answer.request, answer.response)
+				.await?;
+			let frame = self.build_table_write_response_frame(stream_id, response, None);
+			respond_and_finish(&mut *stream, frame).await
+		};
+		let (responded, remainder) = tokio::join!(respond, write);
+		// The remainder's own frame is not a second answer.
+		responded.and(remainder.map(drop))
+	}
 	pub(super) async fn handle_table_write(
 		&self,
 		_actor: &ActorIdentity,
 		frame: HrftFrame,
+		early: Option<EarlyAnswer>,
 	) -> std::io::Result<HrftFrame> {
 		let (meta, payload) = self.decode_table_write_request_frame(&frame)?;
 		let span = tracing::info_span!(
@@ -150,7 +258,10 @@ impl WendelonDataServer {
 			durability = meta.durability.0,
 			write_sequence = meta.parent_write_id.sequence_no,
 		);
-		let (resp, trailing) = self.table_write(meta, payload).instrument(span).await?;
+		let (resp, trailing) = self
+			.table_write_answering(meta, payload, early)
+			.instrument(span)
+			.await?;
 		let resp = self.finalize_table_write_attempt(meta, resp).await?;
 		Ok(self.build_table_write_response_frame(frame.header.stream_id, resp, trailing))
 	}

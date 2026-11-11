@@ -234,6 +234,9 @@ impl HrftService for MsgRouter {
 			|| header.msg_type == MsgType::STREAM_FIN_REQ.0
 			|| header.msg_type == MsgType::QUERY_REQ.0
 			|| header.msg_type == MsgType::TABLE_QUERY_REQ.0
+			// A table write owns its stream so that its handler can write the
+			// response while it goes on polling the same write to its end.
+			|| header.msg_type == MsgType::TABLE_WRITE_REQ.0
 		{
 			return match &self.data {
 				Some(h) => h.handle_data_stream(context, header, stream, pool).await,
