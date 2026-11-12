@@ -729,6 +729,10 @@ async fn the_public_client_is_not_told_known_not_committed_for_a_parent_another_
 /// its `attempts_remaining` is noted. No server code runs.
 struct ScriptedTableWrites {
 	node: u32,
+	/// The node each answer hints.
+	hint: u32,
+	/// The parent write id of each request received.
+	write_ids: std::sync::Mutex<Vec<crate::schema::ClientWriteId>>,
 	answers: std::sync::Mutex<VecDeque<(WriteStatus, MutationCommitKnowledge)>>,
 	attempts_remaining: std::sync::Mutex<Vec<u8>>,
 }
@@ -747,6 +751,7 @@ impl HrftService for ScriptedTableWrites {
 			.lock()
 			.unwrap()
 			.push(request.attempts_remaining());
+		self.write_ids.lock().unwrap().push(request.parent_write_id);
 		let (status, knowledge) = self
 			.answers
 			.lock()
@@ -758,7 +763,7 @@ impl HrftService for ScriptedTableWrites {
 		write.epoch = request.expected_epoch;
 		write.commit_hlc = request.client_hlc;
 		write.leader_hint = crate::schema::NodeId {
-			id: self.node,
+			id: self.hint,
 			_reserved: 0,
 		};
 		write.echoed_write_id = request.parent_write_id;
@@ -793,6 +798,8 @@ async fn client_call_against(
 	let enter = NODES[0];
 	let scripted = Arc::new(ScriptedTableWrites {
 		node: enter,
+		hint: enter,
+		write_ids: std::sync::Mutex::new(Vec::new()),
 		answers: std::sync::Mutex::new(script.iter().copied().collect()),
 		attempts_remaining: std::sync::Mutex::new(Vec::new()),
 	});
@@ -885,4 +892,79 @@ async fn a_fresh_identity_answered_backpressured_on_every_attempt_is_reported_kn
 		NODES[0],
 		"a fresh identity, every attempt backpressured",
 	);
+}
+
+/// One possible route by which the public client dials a stopped node, built on purpose (ADR
+/// 0718's checkpoint trace). It is not that checkpoint's history, which its log does not hold.
+/// Node 1 is running and answers NOT_LEADER hinting node 3; node 3 is not on the simulated
+/// network, as a stopped node is not. The client goes to node 1 first, follows the hint, and its
+/// own connect fails. That failure is returned at once: no other attempt, no other replica.
+///
+/// The simulated transport reports the failed dial as `NotFound`. The QUIC transport reports a
+/// failed connect as `ConnectionRefused` (`network/quic_transport.rs`), so the kind pinned here
+/// is the simulator's.
+///
+/// The caller's request is what carries the parent write id. A second call with the same
+/// request, on a client that has no memory of the hint, reaches node 1 with the same id.
+#[tokio::test]
+async fn a_hint_to_a_stopped_node_fails_the_clients_call_on_its_own_connect() {
+	let (enter, stopped) = (NODES[0], NODES[2]);
+	let not_leader = (
+		WriteStatus::NOT_LEADER,
+		MutationCommitKnowledge::UNSPECIFIED,
+	);
+	let scripted = Arc::new(ScriptedTableWrites {
+		node: enter,
+		hint: stopped,
+		write_ids: std::sync::Mutex::new(Vec::new()),
+		answers: std::sync::Mutex::new([not_leader; 2].into_iter().collect()),
+		attempts_remaining: std::sync::Mutex::new(Vec::new()),
+	});
+	let network = Arc::new(SimulatedTransportNetwork::default());
+	for node in NODES {
+		if node != stopped {
+			network.publish(
+				crate::schema::NodeId {
+					id: node,
+					_reserved: 0,
+				},
+				&address(node),
+				scripted.clone(),
+			);
+		}
+	}
+	let descriptor = descriptor();
+	let uuid = uuid_v7();
+	let wanted = write_meta(&descriptor, 1, uuid).parent_write_id;
+	for call in 1..=2_usize {
+		// A new client each call, as the three-node workflow makes one per attempt.
+		let client = client_entering_at(1, &network, 99, enter);
+		let error = tokio::time::timeout(
+			BOUND,
+			client.table_write(TableWriteRequest {
+				meta: write_meta(&descriptor, 1, uuid),
+				payload: rows(&descriptor, &[1]),
+				descriptor: descriptor.clone(),
+				deadline: None,
+			}),
+		)
+		.await
+		.expect("the call returns")
+		.expect_err("the client's connect to the stopped node fails the call");
+		assert_eq!(error.kind(), std::io::ErrorKind::NotFound, "{error}");
+		assert_eq!(
+			error.to_string(),
+			format!(
+				"connect via QuicIoUring to {} failed: simulated transport target {stopped} is not published",
+				address(stopped)
+			),
+		);
+		// One request reached node 1 in this call, its first attempt of three; nothing else was sent.
+		assert_eq!(
+			*scripted.attempts_remaining.lock().unwrap(),
+			vec![3; call],
+			"call {call}"
+		);
+		assert_eq!(*scripted.write_ids.lock().unwrap(), vec![wanted; call]);
+	}
 }

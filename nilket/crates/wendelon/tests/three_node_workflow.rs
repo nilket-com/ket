@@ -17,10 +17,13 @@
 //! not covered here.
 //!
 //! What this does not cover. Transport is the in-process simulated network, not a production
-//! network. The object store is a local directory, not S3 or RustFS. A stop here is a graceful
+//! network. The object store is a local directory in the default test; the `--ignored` variant puts it
+//! on a real RustFS server, still one process and one simulated network. A stop here is a graceful
 //! shutdown on the same directory, not a power loss. Backup and restore, Root2, scale, memory and
 //! chaos are elsewhere or nowhere.
 
+#[path = "support/rustfs_env.rs"]
+mod rustfs_env;
 #[path = "support/control_ring.rs"]
 mod support;
 
@@ -62,7 +65,7 @@ use wendelon::schema::{
 };
 use wendelon::storage::core::StorageEngine;
 use wendelon::storage::manager::RehydrationPolicy;
-use wendelon::storage::{ObjectStoreConfig, SweeperConfig};
+use wendelon::storage::{ObjectStore, ObjectStoreConfig, SweeperConfig};
 
 const NODES: [u32; 3] = [1, 2, 3];
 
@@ -95,6 +98,8 @@ struct Cluster {
 	/// The newest acknowledged commit, which every later read must have caught up to.
 	newest_ack: HybridTimestamp,
 	polls_end: tokio::time::Instant,
+	/// The nodes' shared object store, opened by the test through the same configuration.
+	objects: Arc<dyn ObjectStore>,
 }
 
 /// A slab one node tiered and reclaimed, and a row it holds.
@@ -124,6 +129,22 @@ fn read_failure(error: std::io::Error) -> ReadFailure {
 	}
 }
 
+/// The client's own dial, refused by the simulated transport because the peer is one this fixture
+/// stopped. Exactly that: the kind and the whole message the transport factory and the simulated
+/// network produce for that node's address. A stopped node is not published; the QUIC transport
+/// reports the same event as `ConnectionRefused`, which `read_failure` already retries. Anything
+/// else `NotFound`, the same refusal for a running node, or a different target stays final.
+fn dial_to_a_stopped_peer(error: &std::io::Error, stopped: &[u32]) -> bool {
+	error.kind() == std::io::ErrorKind::NotFound
+		&& stopped.iter().any(|node_id| {
+			error.to_string()
+				== format!(
+					"connect via QuicIoUring to {} failed: simulated transport target {node_id} is not published",
+					address(*node_id)
+				)
+		})
+}
+
 fn address(node_id: u32) -> String {
 	format!("loopback://node-{node_id}")
 }
@@ -138,7 +159,7 @@ fn provider(node_id: u32, registry: Arc<support::LoopbackRegistry>) -> Arc<dyn T
 	)
 }
 
-fn member_config(node_id: u32, l2_root: &Path) -> (support::TestDir, NodeBootstrapConfig) {
+fn member_config(node_id: u32, l2: &ObjectStoreConfig) -> (support::TestDir, NodeBootstrapConfig) {
 	let dir = support::tempdir(&format!("three-node-{node_id}"));
 	let mut cfg = NodeBootstrapConfig::dev(node_id, dir.to_path_buf(), address(node_id))
 		.with_parent_decisions_for_disposable_store();
@@ -164,9 +185,7 @@ fn member_config(node_id: u32, l2_root: &Path) -> (support::TestDir, NodeBootstr
 		);
 	}
 	cfg.slab_max_bytes = 8 * 1024;
-	cfg.l2 = Some(ObjectStoreConfig::LocalFs {
-		root: l2_root.to_path_buf(),
-	});
+	cfg.l2 = Some(l2.clone());
 	// A slab stays off local disk once reclaimed, so a read of it cannot be served from a copy.
 	cfg.rehydration = RehydrationPolicy {
 		promote_after_l2_reads: 0,
@@ -518,6 +537,10 @@ impl Cluster {
 				}
 				// The client has spent its retries on what can be retried, so this is an answer.
 				Ok(result) => panic!("{what}: row {id} was refused: {:?}", result.response),
+				// The same row and the same write id go again: `sequence` is not advanced.
+				Err(error) if dial_to_a_stopped_peer(&error, &self.stopped_ids()) => {
+					last = error.to_string();
+				}
 				Err(error) => match read_failure(error) {
 					ReadFailure::Transient(error) => last = error,
 					ReadFailure::Refused(error) => {
@@ -702,12 +725,11 @@ impl Cluster {
 					continue;
 				};
 				for pointer in node.slab.list_tiered_slabs().await {
-					let object = PathBuf::from(pointer.l2_uri.trim_start_matches("file://"));
 					let local = member
 						.cfg
 						.data_dir
 						.join(format!("slab_{:016x}.wnd", pointer.slab_id));
-					if !object.exists() || local.exists() {
+					if !self.object_is_there(&pointer.l2_uri).await || local.exists() {
 						continue;
 					}
 					for id in self.expected.keys() {
@@ -729,6 +751,101 @@ impl Cluster {
 			self.write_one("tiering").await;
 			tokio::time::sleep(Duration::from_millis(5)).await;
 		}
+	}
+
+	/// The object answers a head through the store, and for a file store the file is there too.
+	/// Existence only: what the object holds is shown by the queries, not by this.
+	async fn object_is_there(&self, uri: &str) -> bool {
+		let on_disk = uri
+			.strip_prefix("file://")
+			.is_none_or(|path| Path::new(path).exists());
+		on_disk && self.objects.head(uri).await.is_ok()
+	}
+
+	/// The reclaiming node's data directory holds no payload file for the slab, and the object's
+	/// bytes come back whole from the store. The other files left there are printed, not judged.
+	async fn assert_payload_is_only_in_the_object(&self, tiered: &TieredRow) {
+		assert!(!tiered.local.exists(), "the slab payload is on local disk");
+		let head = self.objects.head(&tiered.l2_uri).await.unwrap();
+		let bytes = self.objects.get(&tiered.l2_uri).await.unwrap();
+		assert!(head.size_bytes > 0 && bytes.len() as u64 == head.size_bytes);
+		let slab_name = format!("{:016x}", tiered.slab_id);
+		let data_dir = &self.member(tiered.node_id).cfg.data_dir;
+		let mut left = Vec::new();
+		for entry in std::fs::read_dir(data_dir).unwrap() {
+			let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+			if name.contains(&slab_name) {
+				left.push(name);
+			}
+		}
+		eprintln!(
+			"workflow: slab {slab_name} object {} is {} bytes; local files naming it: {left:?}",
+			tiered.l2_uri, head.size_bytes
+		);
+		assert!(
+			left.iter().all(|name| !name.ends_with(".wnd")),
+			"a payload file for the slab is still local: {left:?}"
+		);
+	}
+
+	/// A reopened node refuses its tiered locations until it has checked them against their
+	/// objects. Wait while the lookup of this row is refused as fenced on this slab, and only
+	/// that, within the polls' shared bound; say how long it took. Any other error, or a payload
+	/// file back on disk, fails at once. What the lookup then returns is judged by the caller.
+	async fn wait_while_the_reopened_slab_is_fenced(&self, tiered: &TieredRow) {
+		use wendelon::storage::manager::{StaleLocation, StaleLocationReason, stale_location};
+		let node = self.node(tiered.node_id);
+		let started = tokio::time::Instant::now();
+		let mut pause = Duration::from_millis(10);
+		loop {
+			assert!(!tiered.local.exists(), "the slab payload is on local disk");
+			let error = match node
+				.slab
+				.lookup(TenantId::ZERO, self.row_identity(tiered.row))
+			{
+				Ok(_) => break,
+				Err(error) => error,
+			};
+			let fenced = StaleLocation {
+				slab_id: tiered.slab_id,
+				reason: StaleLocationReason::Fenced,
+			};
+			assert_eq!(
+				stale_location(&error),
+				Some(fenced),
+				"locating the tiered row after reopening: {error:?}"
+			);
+			assert!(
+				tokio::time::Instant::now() + pause < self.polls_end,
+				"node {} still refuses slab {:?} as fenced {:?} after reopening: {error:?}",
+				tiered.node_id,
+				tiered.slab_id,
+				started.elapsed()
+			);
+			tokio::time::sleep(pause).await;
+			pause = (pause * 2).min(Duration::from_millis(200));
+		}
+		eprintln!(
+			"workflow: node {} stopped refusing its tiered slab as fenced {:?} after reopening",
+			tiered.node_id,
+			started.elapsed()
+		);
+	}
+
+	/// The nodes this fixture has stopped and not reopened.
+	fn stopped_ids(&self) -> Vec<u32> {
+		self.members
+			.iter()
+			.filter(|member| member.node.is_none())
+			.map(|member| member.cfg.node_id)
+			.collect()
+	}
+
+	fn member(&self, node_id: u32) -> &Member {
+		self.members
+			.iter()
+			.find(|member| member.cfg.node_id == node_id)
+			.unwrap()
 	}
 
 	fn row_identity(&self, id: i64) -> wendelon::schema::Identity {
@@ -807,9 +924,9 @@ impl Cluster {
 	}
 }
 
-async fn workflow(stage: Arc<std::sync::Mutex<String>>) {
+async fn workflow(stage: Arc<std::sync::Mutex<String>>, l2: ObjectStoreConfig) {
 	let enter = |now: &str| *stage.lock().unwrap() = now.to_owned();
-	let l2 = support::tempdir("three-node-l2");
+	let objects = l2.build().unwrap();
 
 	enter("bootstrap");
 	let registry = support::shared_loopback_registry();
@@ -837,6 +954,7 @@ async fn workflow(stage: Arc<std::sync::Mutex<String>>) {
 		writes_sent_again: 0,
 		newest_ack: bytemuck::Zeroable::zeroed(),
 		polls_end: tokio::time::Instant::now() + POLL_BOUND,
+		objects,
 	};
 	let first_leader = cluster.wait_for_leader("bootstrap").await;
 	cluster.wait_for_voters().await;
@@ -882,8 +1000,30 @@ async fn workflow(stage: Arc<std::sync::Mutex<String>>) {
 		"workflow: node {} tiered and reclaimed the slab of row {}",
 		tiered.node_id, tiered.row
 	);
+	cluster.assert_payload_is_only_in_the_object(&tiered).await;
 	cluster.assert_row_served_from_the_object(&tiered).await;
 	cluster.assert_exact_everywhere("after tiering").await;
+
+	enter("tiering node restart");
+	let incarnation = cluster.registered_incarnation(tiered.node_id).await;
+	cluster.stop(tiered.node_id).await;
+	cluster.reopen(tiered.node_id).await;
+	assert_eq!(
+		cluster.registered_incarnation(tiered.node_id).await,
+		incarnation,
+		"the same store came back"
+	);
+	cluster
+		.wait_for_leader("after the tiering node restart")
+		.await;
+	cluster
+		.wait_while_the_reopened_slab_is_fenced(&tiered)
+		.await;
+	cluster.assert_payload_is_only_in_the_object(&tiered).await;
+	cluster.assert_row_served_from_the_object(&tiered).await;
+	cluster
+		.assert_exact_everywhere("after the tiering node restart")
+		.await;
 
 	enter("follower restart");
 	let leader = cluster.wait_for_leader("before the follower restart").await;
@@ -942,8 +1082,83 @@ async fn workflow(stage: Arc<std::sync::Mutex<String>>) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn three_nodes_keep_every_acknowledged_row_through_tiering_restart_and_failover() {
+	let l2 = support::tempdir("three-node-l2");
+	run_bounded(ObjectStoreConfig::LocalFs {
+		root: l2.to_path_buf(),
+	})
+	.await;
+}
+
+/// The same workflow with the three nodes' object store on a real RustFS server over HTTP. The
+/// nodes still talk to each other over the in-process simulated network, in one process. External:
+/// see `support/rustfs_env.rs`; run with
+/// `cargo test -p wendelon --test three_node_workflow -- --ignored`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "external: needs a running RustFS (support/rustfs_env.rs); run with --ignored"]
+async fn three_nodes_keep_every_acknowledged_row_with_their_objects_on_rustfs() {
+	let remote = rustfs_env::remote_config("three-node-workflow");
+	// Fail here, by name, when the server does not answer or refuses the credentials.
+	let probe = ObjectStoreConfig::Remote(remote.clone()).build().unwrap();
+	let uri = probe
+		.put("probe", b"reachable")
+		.await
+		.expect("RustFS did not accept a put: endpoint, bucket or credentials");
+	assert_eq!(probe.get(&uri).await.unwrap(), b"reachable");
+	probe.delete(&uri).await.unwrap();
+	run_bounded(ObjectStoreConfig::Remote(remote)).await;
+}
+
+#[test]
+fn only_the_exact_dial_to_a_stopped_peer_is_retried() {
+	use std::io::{Error, ErrorKind};
+	let dial = |node_id: u32| {
+		format!(
+			"connect via QuicIoUring to {} failed: simulated transport target {node_id} is not published",
+			address(node_id)
+		)
+	};
+	let stopped = [3];
+	assert!(dial_to_a_stopped_peer(
+		&Error::new(ErrorKind::NotFound, dial(3)),
+		&stopped
+	));
+	let stays_final = [
+		// Something else that is not found: an object, a row, a replica.
+		Error::new(ErrorKind::NotFound, "object not found"),
+		Error::new(
+			ErrorKind::NotFound,
+			"no replica available for the requested key range",
+		),
+		// The same refusal for a node the fixture did not stop.
+		Error::new(ErrorKind::NotFound, dial(2)),
+		// A message that only mentions the stopped node, or wraps the refusal.
+		Error::new(ErrorKind::NotFound, "node-3"),
+		Error::new(ErrorKind::NotFound, format!("query failed: {}", dial(3))),
+		Error::new(ErrorKind::NotFound, format!("{} (retry)", dial(3))),
+		// The stopped node's address with another target, and the reverse.
+		Error::new(
+			ErrorKind::NotFound,
+			format!(
+				"connect via QuicIoUring to {} failed: simulated transport target 2 is not published",
+				address(3)
+			),
+		),
+		// The right message under another kind.
+		Error::new(ErrorKind::Other, dial(3)),
+		Error::new(ErrorKind::AddrNotAvailable, dial(3)),
+	];
+	for error in &stays_final {
+		assert!(!dial_to_a_stopped_peer(error, &stopped), "{error:?}");
+	}
+	assert!(!dial_to_a_stopped_peer(
+		&Error::new(ErrorKind::NotFound, dial(3)),
+		&[]
+	));
+}
+
+async fn run_bounded(l2: ObjectStoreConfig) {
 	let stage = Arc::new(std::sync::Mutex::new("start".to_owned()));
-	let finished = tokio::time::timeout(WORKFLOW_BOUND, workflow(stage.clone())).await;
+	let finished = tokio::time::timeout(WORKFLOW_BOUND, workflow(stage.clone(), l2)).await;
 	assert!(
 		finished.is_ok(),
 		"the workflow did not finish within {WORKFLOW_BOUND:?}, in: {}",

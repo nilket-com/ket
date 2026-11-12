@@ -43,12 +43,86 @@ pub fn load_node_bootstrap_config(path: impl AsRef<Path>) -> std::io::Result<Nod
 	let path = path.as_ref();
 	let text = std::fs::read_to_string(path)?;
 	let raw: RawConfig = toml::from_str(&text).map_err(|err| {
+		// Position only. The parser's message and its rendering of the source can both repeat
+		// what the file holds: a wrongly typed value, an unknown key's name, the whole line.
+		// Any of those may be a secret written in the wrong place.
+		let place = err.span().map_or_else(
+			|| "at a position the parser did not report".to_owned(),
+			|span| {
+				let before = &text[..span.start.min(text.len())];
+				let line = before.matches('\n').count() + 1;
+				let column = before.rsplit('\n').next().map_or(0, |tail| tail.chars().count()) + 1;
+				format!("at line {line}, column {column}")
+			},
+		);
+		let absent = absent_required_keys(&text);
+		let absent = if absent.is_empty() {
+			String::new()
+		} else {
+			format!("; required and absent: {}", absent.join(", "))
+		};
 		Error::new(
 			ErrorKind::InvalidData,
-			format!("failed to parse {}: {err}", path.display()),
+			format!(
+				"failed to parse {} {place}: a key there is unknown, missing or of the wrong type (the parser's own message is withheld because it can repeat configured values){absent}",
+				path.display()
+			),
 		)
 	})?;
 	raw.into_bootstrap_config(path)
+}
+
+/// The keys every configuration must hold, and those an object-store section must hold once it
+/// is there. The names are this list's own, so naming an absent one repeats nothing from the file.
+const REQUIRED_KEYS: &[&str] = &[
+	"node",
+	"node.node_id",
+	"node.advertise_address",
+	"storage",
+	"storage.data_dir",
+	"identity",
+];
+const REQUIRED_OBJECT_STORE_KEYS: &[&str] = &[
+	"provider",
+	"endpoint",
+	"bucket",
+	"region",
+	"addressing",
+	"access_key_id_file",
+	"secret_access_key_file",
+];
+
+fn absent_required_keys(text: &str) -> Vec<String> {
+	let Ok(table) = text.parse::<toml::Table>() else {
+		return Vec::new();
+	};
+	let lookup = |path: &str| {
+		let mut parts = path.split('.');
+		let mut value = table.get(parts.next()?)?;
+		for part in parts {
+			value = value.as_table()?.get(part)?;
+		}
+		Some(value)
+	};
+	let mut absent = Vec::new();
+	for key in REQUIRED_KEYS {
+		// A child of an absent parent is covered by naming the parent.
+		let parent_there = key
+			.rsplit_once('.')
+			.is_none_or(|(parent, _)| lookup(parent).is_some());
+		if parent_there && lookup(key).is_none() {
+			absent.push((*key).to_owned());
+		}
+	}
+	if lookup("storage.object_store").is_some() {
+		for key in REQUIRED_OBJECT_STORE_KEYS {
+			let path = format!("storage.object_store.{key}");
+			if lookup(&path).is_none() {
+				absent.push(path);
+			}
+		}
+	}
+	absent
 }
 
 /// Render a concrete starter `wendelon.toml` from the checked-in
@@ -195,6 +269,7 @@ struct RawNodeConfig {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawStorageConfig {
 	data_dir: PathBuf,
 	#[serde(default = "default_slab_max_bytes")]
@@ -221,6 +296,155 @@ struct RawStorageConfig {
 	l2_encoding_fetch: RawL2EncodingFetchConfig,
 	#[serde(default)]
 	encoding_compute: RawEncodingComputeConfig,
+	#[serde(default)]
+	object_store: Option<RawObjectStoreConfig>,
+	#[serde(default)]
+	tiering: Option<RawTieringConfig>,
+}
+
+/// `[storage.object_store]`: the remote store sealed slabs tier to. Absent, the node has no
+/// object store and tiers nothing. Present, every field is checked here without contacting the
+/// store; whether the endpoint answers and the keys are accepted is learned only when the node
+/// first uses it.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawObjectStoreConfig {
+	provider: String,
+	endpoint: String,
+	bucket: String,
+	region: String,
+	#[serde(default)]
+	prefix: String,
+	addressing: String,
+	access_key_id_file: PathBuf,
+	secret_access_key_file: PathBuf,
+}
+
+impl RawObjectStoreConfig {
+	fn into_runtime_config(
+		self,
+		source_path: &Path,
+	) -> std::io::Result<crate::storage::ObjectStoreConfig> {
+		use crate::storage::{
+			ObjectStoreConfig, RemoteObjectStoreConfig, RemoteObjectStoreProvider,
+			S3CompatibleProviderConfig,
+		};
+		// No message here repeats a configured value: an endpoint or a key file may hold a
+		// secret that was put in the wrong place.
+		let invalid = |field: &str, why: &str| {
+			Error::new(
+				ErrorKind::InvalidInput,
+				format!("storage.object_store.{field} {why}"),
+			)
+		};
+		if self.provider != "s3-compatible" {
+			return Err(invalid("provider", "must be \"s3-compatible\""));
+		}
+		let url = reqwest::Url::parse(&self.endpoint)
+			.map_err(|_| invalid("endpoint", "is not an absolute http or https URL"))?;
+		if !matches!(url.scheme(), "http" | "https") {
+			return Err(invalid("endpoint", "must use http or https"));
+		}
+		if url.host_str().is_none_or(str::is_empty) {
+			return Err(invalid("endpoint", "has no host"));
+		}
+		if !url.username().is_empty() || url.password().is_some() {
+			return Err(invalid(
+				"endpoint",
+				"must not carry credentials; use the key files",
+			));
+		}
+		if url.query().is_some() || url.fragment().is_some() {
+			return Err(invalid("endpoint", "must not carry a query or a fragment"));
+		}
+		if !matches!(url.path(), "" | "/") {
+			return Err(invalid(
+				"endpoint",
+				"must not carry a path; use prefix for a location inside the bucket",
+			));
+		}
+		let endpoint = url.origin().ascii_serialization();
+		for (field, value) in [("bucket", &self.bucket), ("region", &self.region)] {
+			if value.is_empty() || value.chars().any(char::is_whitespace) {
+				return Err(invalid(field, "must be set and hold no whitespace"));
+			}
+		}
+		let virtual_host_style = match self.addressing.as_str() {
+			"path" => false,
+			"virtual-host" => true,
+			_ => {
+				return Err(invalid(
+					"addressing",
+					"must be \"path\" or \"virtual-host\"",
+				));
+			}
+		};
+		let prefix_is_plain = self.prefix.split('/').all(|part| {
+			!part.is_empty()
+				&& part != "."
+				&& part != ".."
+				&& !part.chars().any(|c| c.is_whitespace() || c == '\\')
+		});
+		if !self.prefix.is_empty() && !prefix_is_plain {
+			return Err(invalid(
+				"prefix",
+				"must be plain path segments separated by single slashes",
+			));
+		}
+		let key = |field: &str, file: &Path| -> std::io::Result<String> {
+			let path = absolutize_from_config_dir(source_path, file);
+			let text = std::fs::read_to_string(&path).map_err(|err| {
+				Error::new(
+					err.kind(),
+					format!(
+						"storage.object_store.{field}: cannot read {}: {}",
+						path.display(),
+						err.kind()
+					),
+				)
+			})?;
+			let value = text.trim();
+			if value.is_empty() || value.chars().any(char::is_whitespace) {
+				return Err(Error::new(
+					ErrorKind::InvalidInput,
+					format!(
+						"storage.object_store.{field}: {} must hold one key and nothing else",
+						path.display()
+					),
+				));
+			}
+			Ok(value.to_owned())
+		};
+		let access_key_id = key("access_key_id_file", &self.access_key_id_file)?;
+		let secret_access_key = key("secret_access_key_file", &self.secret_access_key_file)?;
+		Ok(ObjectStoreConfig::Remote(RemoteObjectStoreConfig {
+			bucket: self.bucket,
+			root: self.prefix,
+			provider: RemoteObjectStoreProvider::S3Compatible(S3CompatibleProviderConfig {
+				endpoint,
+				region: self.region,
+				access_key_id: Some(access_key_id),
+				secret_access_key: Some(secret_access_key),
+				session_token: None,
+				allow_anonymous: false,
+				virtual_host_style,
+			}),
+		}))
+	}
+}
+
+/// `[storage.tiering]`: when the sweeper looks and what it takes. Read only with an object store.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTieringConfig {
+	#[serde(default = "default_tiering_scan_interval_millis")]
+	scan_interval_millis: u64,
+	#[serde(default)]
+	min_slab_bytes: u64,
+}
+
+fn default_tiering_scan_interval_millis() -> u64 {
+	5_000
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -990,6 +1214,29 @@ impl RawConfig {
 		};
 
 		let slab_max_bytes = self.storage.slab_max_bytes;
+		let mut tiering = crate::storage::SweeperConfig::default();
+		if let Some(raw) = &self.storage.tiering {
+			if self.storage.object_store.is_none() {
+				return Err(Error::new(
+					ErrorKind::InvalidInput,
+					"storage.tiering is set without storage.object_store",
+				));
+			}
+			if raw.scan_interval_millis == 0 {
+				return Err(Error::new(
+					ErrorKind::InvalidInput,
+					"storage.tiering.scan_interval_millis must be greater than zero",
+				));
+			}
+			tiering.scan_interval = Duration::from_millis(raw.scan_interval_millis);
+			tiering.min_slab_bytes = raw.min_slab_bytes;
+		}
+		let l2 = self
+			.storage
+			.object_store
+			.take()
+			.map(|raw| raw.into_runtime_config(source_path))
+			.transpose()?;
 		let control_retention =
 			crate::consensus::ControlRetention::parse(self.storage.control_retention.as_deref())
 				.map_err(|err| Error::new(ErrorKind::InvalidData, err))?;
@@ -1033,8 +1280,8 @@ impl RawConfig {
 			audit_root_signing_secret,
 			trusted_audit_root_keys,
 			cluster,
-			l2: None,
-			tiering: crate::storage::SweeperConfig::default(),
+			l2,
+			tiering,
 			lsm_compaction_paused: self.storage.lsm_compaction_paused,
 			control_retention,
 			decision_mode: Default::default(),

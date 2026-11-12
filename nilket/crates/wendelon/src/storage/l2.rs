@@ -163,7 +163,7 @@ pub enum RemoteObjectStoreProvider {
 	GoogleCloudStorage(GoogleCloudStorageProviderConfig),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct S3CompatibleProviderConfig {
 	pub endpoint: String,
 	pub region: String,
@@ -176,14 +176,14 @@ pub struct S3CompatibleProviderConfig {
 	pub virtual_host_style: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct BackblazeB2ProviderConfig {
 	pub bucket_id: String,
 	pub application_key_id: String,
 	pub application_key: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct GoogleCloudStorageProviderConfig {
 	pub endpoint: Option<String>,
 	pub credential: Option<String>,
@@ -191,6 +191,69 @@ pub struct GoogleCloudStorageProviderConfig {
 	pub service_account: Option<String>,
 	pub token: Option<String>,
 	pub allow_anonymous: bool,
+}
+
+/// What a credential field prints as: whether it is set, never what it holds.
+fn redacted(set: bool) -> &'static str {
+	if set { "<redacted>" } else { "<unset>" }
+}
+
+impl std::fmt::Debug for S3CompatibleProviderConfig {
+	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		formatter
+			.debug_struct("S3CompatibleProviderConfig")
+			.field("endpoint", &self.endpoint)
+			.field("region", &self.region)
+			.field(
+				"access_key_id",
+				&format_args!("{}", redacted(self.access_key_id.is_some())),
+			)
+			.field(
+				"secret_access_key",
+				&format_args!("{}", redacted(self.secret_access_key.is_some())),
+			)
+			.field(
+				"session_token",
+				&format_args!("{}", redacted(self.session_token.is_some())),
+			)
+			.field("allow_anonymous", &self.allow_anonymous)
+			.field("virtual_host_style", &self.virtual_host_style)
+			.finish()
+	}
+}
+
+impl std::fmt::Debug for BackblazeB2ProviderConfig {
+	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		formatter
+			.debug_struct("BackblazeB2ProviderConfig")
+			.field("bucket_id", &self.bucket_id)
+			.field("application_key_id", &format_args!("{}", redacted(true)))
+			.field("application_key", &format_args!("{}", redacted(true)))
+			.finish()
+	}
+}
+
+impl std::fmt::Debug for GoogleCloudStorageProviderConfig {
+	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		formatter
+			.debug_struct("GoogleCloudStorageProviderConfig")
+			.field("endpoint", &self.endpoint)
+			.field(
+				"credential",
+				&format_args!("{}", redacted(self.credential.is_some())),
+			)
+			.field(
+				"credential_path",
+				&format_args!("{}", redacted(self.credential_path.is_some())),
+			)
+			.field(
+				"service_account",
+				&format_args!("{}", redacted(self.service_account.is_some())),
+			)
+			.field("token", &format_args!("{}", redacted(self.token.is_some())))
+			.field("allow_anonymous", &self.allow_anonymous)
+			.finish()
+	}
 }
 
 impl RemoteObjectStoreConfig {

@@ -211,9 +211,15 @@ fn obsolete_rf_tuning_key_is_rejected_instead_of_silently_defaulting() {
 	let body = render_example_config().replace("replication_factor = 1", "rf = 3");
 	let config_path = write_config(&root, &body);
 	let err = load_node_bootstrap_config(&config_path).unwrap_err();
+	// A parse failure names the place, not the key or its value (ADR 0718).
+	let line =
+		body.lines()
+			.position(|line| line.starts_with("rf = 3"))
+			.unwrap() + 1;
 	let message = err.to_string();
+	assert_eq!(err.kind(), ErrorKind::InvalidData);
 	assert!(
-		message.contains("unknown field `rf`") && message.contains("replication_factor"),
+		message.contains(&format!("at line {line}, column 1:")),
 		"unexpected error: {err}"
 	);
 }
