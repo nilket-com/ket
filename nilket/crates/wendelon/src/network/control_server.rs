@@ -127,6 +127,31 @@ pub const CONTROL_REASON_INVALID_TOKEN: u8 = 7;
 pub const CONTROL_REASON_INCOMPATIBLE_VERSION: u8 = 8;
 pub const CONTROL_REASON_AUTHORIZATION_FAILED: u8 = 9;
 pub const CONTROL_REASON_NOT_FOUND: u8 = 10;
+/// ADR 0720: the cluster has admitted a write, so its membership is fixed.
+pub const CONTROL_REASON_MEMBERSHIP_SEALED: u8 = 11;
+
+/// ADR 0720: the typed cause of a refusal made because the membership is sealed,
+/// so a handler maps it to its own reason code without reading message text.
+#[derive(Debug)]
+pub(crate) struct MembershipSealed(String);
+
+impl std::fmt::Display for MembershipSealed {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(f, "MembershipSealed: {}", self.0)
+	}
+}
+
+impl std::error::Error for MembershipSealed {}
+
+fn membership_sealed(detail: impl Into<String>) -> Error {
+	Error::new(ErrorKind::PermissionDenied, MembershipSealed(detail.into()))
+}
+
+fn is_membership_sealed(error: &Error) -> bool {
+	error
+		.get_ref()
+		.is_some_and(|cause| cause.is::<MembershipSealed>())
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ControlOperation {
@@ -4420,6 +4445,13 @@ impl WendelonControlServer {
 										negotiated_protocol: None,
 									}
 								}
+								Err(err) if is_membership_sealed(&err) => JoinClusterResponseWire {
+									accepted: false,
+									reason_code: CONTROL_REASON_MEMBERSHIP_SEALED,
+									leader_hint: Some(self.local_node.id),
+									local_protocol: self.protocol,
+									negotiated_protocol: None,
+								},
 								Err(err) if err.kind() == ErrorKind::NotConnected => {
 									JoinClusterResponseWire {
 										accepted: false,
@@ -4505,7 +4537,15 @@ impl WendelonControlServer {
 			}))
 			.await
 		{
-			Ok(_) => {}
+			// ADR 0720: an advance the state machine refused did not happen.
+			Ok(response) => {
+				if let WendelonResponse::Error(refusal) = response.data {
+					// The reducer's only refusal of an advance is the seal.
+					return Err(membership_sealed(
+						refusal.trim_start_matches("MembershipSealed: "),
+					));
+				}
+			}
 			Err(openraft::error::RaftError::APIError(
 				openraft::error::ClientWriteError::ForwardToLeader(forward),
 			)) => {
@@ -5154,6 +5194,44 @@ impl WendelonControlServer {
 		}
 		self.decision_mode
 			.check_joiner(NodeCapabilitySet::from_u8(req.capability_bits))?;
+		// ADR 0720: once a write has been admitted the membership is fixed. A
+		// join is then answered from applied state alone and starts no
+		// membership entry: a member repeating its completed join succeeds, and
+		// anything else is refused. This is a courtesy that keeps entries out of
+		// the log; the fence is in the reducer, which a race here cannot pass.
+		if self.decision_mode == crate::consensus::decision_mode::DecisionMode::ParentDecisions {
+			if let Err(err) = self.raft.ensure_linearizable().await {
+				if !self.is_leader().await {
+					return Err(not_leader_error(self.leader_hint().await));
+				}
+				return Err(Error::new(
+					ErrorKind::NotConnected,
+					format!("JOIN freshness fence failed: {err}"),
+				));
+			}
+			let _reconcile = self.reconcile_lock.lock().await;
+			let sealed = self
+				.state_machine
+				.read_state(|state| {
+					state
+						.decisions
+						.as_ref()
+						.is_some_and(|decisions| decisions.sealed().is_some())
+				})
+				.await;
+			if sealed {
+				let (membership, latest_epoch) =
+					self.state_machine.join_completion_snapshot().await;
+				let visible = self.epoch_rx.borrow().clone();
+				return validate_completed_member_join(
+					req,
+					self.protocol,
+					&membership,
+					latest_epoch.as_ref(),
+					&visible,
+				);
+			}
+		}
 		#[cfg(feature = "test-support")]
 		if let Some(gate) = &self.join_promotion_gate {
 			gate.record_mutation_path(req.node_id);
@@ -6028,6 +6106,56 @@ fn validate_completed_self_join(
 		|| peer.capability_bits != req.capability_bits
 	{
 		return Err(mismatch());
+	}
+	Ok(())
+}
+
+/// ADR 0720: a join request to a sealed cluster succeeds only as the repeat of a
+/// completed join. The applied membership must be uniform with no learner, its
+/// voters exactly the latest epoch's peers, that epoch the published one, and the
+/// requester a member whose address, tiers, roles and capabilities are the ones
+/// on record. A non-member, a changed property or an incomplete view is refused.
+fn validate_completed_member_join(
+	req: &JoinClusterRequestWire,
+	protocol: ProtocolVersionWindow,
+	membership: &openraft::StoredMembership<u32, BasicNode>,
+	latest_epoch: Option<&(u64, EpochConfig)>,
+	visible: &MembershipEpoch,
+) -> std::io::Result<()> {
+	let sealed = || {
+		membership_sealed(
+			"a write has been admitted, so membership is fixed; only a member's identical \
+			 completed join is answered",
+		)
+	};
+	wire::negotiate_protocol(protocol, req.protocol)?;
+	let configs = membership.membership().get_joint_config();
+	let voters: BTreeSet<u32> = membership.membership().voter_ids().collect();
+	let nodes: BTreeSet<u32> = membership.membership().nodes().map(|(id, _)| *id).collect();
+	let (epoch_key, durable) = latest_epoch.ok_or_else(sealed)?;
+	let peers: BTreeSet<u32> = durable.peers.values().map(|peer| peer.node_id.id).collect();
+	if membership.log_id().is_none()
+		|| configs.len() != 1
+		|| nodes != voters
+		|| peers != voters
+		|| *epoch_key != durable.epoch
+		|| *durable != epoch_config_from_membership(visible)
+		|| membership
+			.membership()
+			.get_node(&req.node_id)
+			.map(|node| node.addr.as_str())
+			!= Some(req.advertise_address.as_str())
+	{
+		return Err(sealed());
+	}
+	let peer = durable.peers.get(&req.node_id).ok_or_else(sealed)?;
+	if peer.node_id.id != req.node_id
+		|| peer.address != req.advertise_address
+		|| peer.tier_bits != req.tier_bits
+		|| peer.role_bits != req.role_bits
+		|| peer.capability_bits != req.capability_bits
+	{
+		return Err(sealed());
 	}
 	Ok(())
 }

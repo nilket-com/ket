@@ -6573,3 +6573,122 @@ mod write_deadline;
 
 #[path = "parent_decisions_cluster_tests/attempt_exhaustion.rs"]
 mod attempt_exhaustion;
+
+// ============================================================
+//  ADR 0720: MEMBERSHIP IS FIXED ONCE A WRITE IS ADMITTED
+// ============================================================
+
+/// After the first admitted write a fourth node's join starts no membership
+/// entry: the cluster keeps exactly its three voters and no learner, the seal
+/// names them, and writes go on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_join_after_the_first_write_is_refused_and_adds_no_member() {
+	let (cluster, leader, descriptor) = ready().await;
+	let sealed_before = cluster
+		.node(leader)
+		.state_machine
+		.read_state(|state| state.decisions.as_ref().unwrap().sealed().cloned())
+		.await;
+	assert!(sealed_before.is_none(), "nothing is sealed before a write");
+	assert_committed(
+		&write_through(
+			&cluster,
+			leader,
+			write_meta(&descriptor, 1, uuid_v7()),
+			named_rows(&descriptor, &[(1, "a")]),
+		)
+		.await,
+		"the first write",
+	);
+	let members = |node: &WendelonNode| {
+		let metrics = node.raft.metrics().borrow().clone();
+		let membership = metrics.membership_config.membership().clone();
+		(
+			// The membership entry's own log id: an identical entry appended
+			// later would change it, where the voters and nodes would not.
+			*metrics.membership_config.log_id(),
+			membership.voter_ids().collect::<Vec<u32>>(),
+			membership.nodes().map(|(id, _)| *id).collect::<Vec<u32>>(),
+			membership.get_joint_config().len(),
+		)
+	};
+	let before = members(cluster.node(leader));
+	assert!(before.0.is_some(), "the membership is an applied entry");
+	assert_eq!(
+		(&before.1, &before.2, before.3),
+		(&NODES.to_vec(), &NODES.to_vec(), 1)
+	);
+
+	const LATE: u32 = 44;
+	let (_late_dir, mut cfg) = member(LATE);
+	cfg.trusted_lease_signers.insert(
+		LATE,
+		lease_verifying_key_bytes(dev_lease_signing_secret(LATE)),
+	);
+	cfg.trusted_transfer_signers.insert(
+		LATE,
+		transfer_verifying_key_bytes(dev_transfer_signing_secret(LATE)),
+	);
+	let provider: Arc<dyn crate::network::transport::TransportProvider> =
+		Arc::new(SimulatedTransportProvider::new(
+			crate::schema::NodeId {
+				id: LATE,
+				_reserved: 0,
+			},
+			cluster.network.clone(),
+			crate::network::pool::BufPool::new(64, 1024 * 1024),
+			TransportTier::QuicIoUring,
+		));
+	// The joiner retries for five seconds and then reports the last answer it
+	// was given. It must report within the bound, and report this refusal: a
+	// timeout is a failure, not a refusal.
+	let joined = tokio::time::timeout(
+		std::time::Duration::from_secs(8),
+		WendelonNode::bootstrap_with_provider(cfg, provider),
+	)
+	.await
+	.expect("the joiner reported nothing within its bound");
+	let error = match joined {
+		Ok(_) => panic!("a node joined a sealed cluster"),
+		Err(error) => error,
+	};
+	assert_eq!(
+		error.kind(),
+		std::io::ErrorKind::PermissionDenied,
+		"refused for another reason: {error}"
+	);
+	assert!(
+		error.to_string().contains(&format!(
+			"reason_code={}",
+			crate::network::control_server::CONTROL_REASON_MEMBERSHIP_SEALED
+		)),
+		"refused for another reason: {error}"
+	);
+	// No membership entry was started: the same entry, by log id, on every member.
+	for id in NODES {
+		assert_eq!(members(cluster.node(id)), before, "node {id}");
+	}
+	let sealed = cluster
+		.node(leader)
+		.state_machine
+		.read_state(|state| state.decisions.as_ref().unwrap().sealed().cloned())
+		.await
+		.expect("the first write sealed");
+	assert_eq!(
+		sealed.placement().iter().copied().collect::<Vec<_>>(),
+		NODES.map(|id| (id, true)).to_vec()
+	);
+	assert_committed(
+		&write_through(
+			&cluster,
+			leader,
+			write_meta(&descriptor, 1, uuid_v7()),
+			named_rows(&descriptor, &[(2, "b")]),
+		)
+		.await,
+		"a write after the refused join",
+	);
+	for node in cluster.nodes {
+		let _ = tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown()).await;
+	}
+}

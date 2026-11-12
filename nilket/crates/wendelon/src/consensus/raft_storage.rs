@@ -6622,9 +6622,15 @@ fn apply_request_at_log_index(
 			None => (WendelonResponse::Success, None),
 		},
 		WendelonRequest::AdvanceEpoch(record) => {
-			apply_advance_epoch(state, record);
-			crate::consensus::decisions::prune_lineages(state);
-			(WendelonResponse::Success, None)
+			// ADR 0720: refused whole, before any epoch is recorded or lineage pruned.
+			match crate::consensus::decisions::admit_epoch_advance(state, &record) {
+				Ok(()) => {
+					apply_advance_epoch(state, record);
+					crate::consensus::decisions::prune_lineages(state);
+					(WendelonResponse::Success, None)
+				}
+				Err(refusal) => (WendelonResponse::Error(refusal.to_string()), None),
+			}
 		}
 		WendelonRequest::SchemaUpdate(bytes) => match apply_schema_update(state, &bytes) {
 			Ok(()) => (WendelonResponse::Success, None),

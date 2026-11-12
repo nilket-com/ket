@@ -21,7 +21,7 @@ use crate::schema::{
 /// older binaries do not read it, and for them that record is the boundary.
 const MODE_MARKER: &str = "PARENT_DECISIONS";
 const MODE_MARKER_TMP: &str = ".PARENT_DECISIONS.tmp";
-const MODE_MARKER_BYTES: &[u8] = b"parent-decisions-v8\n";
+const MODE_MARKER_BYTES: &[u8] = b"parent-decisions-v9\n";
 /// S1's development marker. Its stores hold format-9 records, whose bodies were
 /// today's; no conversion exists, so both authorities refuse it as malformed.
 #[cfg(test)]
@@ -52,16 +52,23 @@ const RETIRED_MARKER_BYTES_V6: &[u8] = b"parent-decisions-v6\n";
 /// stays readable by its own binary.
 #[cfg(test)]
 const RETIRED_MARKER_BYTES_V7: &[u8] = b"parent-decisions-v7\n";
+/// ADR 0704 to ADR 0719's marker, for stores holding format-16 records, whose
+/// decision state records no sealed membership (ADR 0720). Such a store may have
+/// admitted writes that it no longer holds a record of, so it is refused whole,
+/// never read as unsealed; it stays readable by its own binary.
+#[cfg(test)]
+const RETIRED_MARKER_BYTES_V8: &[u8] = b"parent-decisions-v8\n";
 
 /// Today's HRFT envelope version, which every other frame uses.
 pub(crate) const RAFT_FRAME_VERSION_TODAY: u8 = 1;
 /// The envelope version of Raft frames between `ParentDecisions` nodes. Older
 /// binaries refuse it when reading the frame. Version 2 was S1's development
 /// envelope, 3 was S2's, 4 was S3's, 5 was S4b's, 6 was S5a to ADR 0700's
-/// (no batched lease renewals) and 7 was ADR 0701 to ADR 0703's (no certified
-/// tier provenance, ADR 0704); their peers decode other encodings, so every
-/// build refuses them.
-pub(crate) const RAFT_FRAME_VERSION_PARENT_DECISIONS: u8 = 8;
+/// (no batched lease renewals), 7 was ADR 0701 to ADR 0703's (no certified
+/// tier provenance, ADR 0704) and 8 was ADR 0704 to ADR 0719's (no sealed
+/// membership, ADR 0720); their peers decode other encodings, so every build
+/// refuses them.
+pub(crate) const RAFT_FRAME_VERSION_PARENT_DECISIONS: u8 = 9;
 
 /// The Raft request and response types, the only frames that may carry the
 /// `ParentDecisions` envelope.
@@ -337,11 +344,11 @@ mod tests {
 		assert!(mode.wal_format() > WAL_FORMAT_VERSION);
 		assert_eq!(
 			(mode.wal_format(), mode.snapshot_format()),
-			(16, 16),
-			"S1's 9, S2's 10, S3's 11, S4b's 12, S5a to ADR 0700's 13 and ADR 0701 to ADR \
-			 0703's 14 are retired; 15 is Today's"
+			(17, 17),
+			"S1's 9, S2's 10, S3's 11, S4b's 12, S5a to ADR 0700's 13, ADR 0701 to ADR \
+			 0703's 14 and ADR 0704 to ADR 0719's 16 are retired; 15 is Today's"
 		);
-		assert_eq!(mode.raft_frame_version(), 8);
+		assert_eq!(mode.raft_frame_version(), 9);
 		assert!(mode.snapshot_format() > SNAPSHOT_FORMAT_VERSION);
 		assert_ne!(mode.raft_frame_version(), 1);
 		assert!(mode.refuses_service());
@@ -351,11 +358,13 @@ mod tests {
 	fn a_frame_or_joiner_from_the_other_authority_is_refused_both_ways() {
 		let (today, new) = (DecisionMode::Today, DecisionMode::ParentDecisions);
 		today.check_raft_frame(1).unwrap();
-		new.check_raft_frame(8).unwrap();
+		new.check_raft_frame(9).unwrap();
 		// ADR 0701: an ADR 0700 peer's version-6 frames are refused before decode;
-		// ADR 0704: so are an ADR 0701 to ADR 0703 peer's version-7 frames.
+		// ADR 0704: so are an ADR 0701 to ADR 0703 peer's version-7 frames; ADR
+		// 0720: so are an ADR 0704 to ADR 0719 peer's version-8 frames.
 		assert!(new.check_raft_frame(6).is_err());
 		assert!(new.check_raft_frame(7).is_err());
+		assert!(new.check_raft_frame(8).is_err());
 		for retired in [2, 3, 4, 5] {
 			assert!(
 				new.check_raft_frame(retired).is_err(),
@@ -364,7 +373,7 @@ mod tests {
 			assert!(today.check_raft_frame(retired).is_err());
 		}
 		assert_eq!(
-			today.check_raft_frame(8).unwrap_err().kind(),
+			today.check_raft_frame(9).unwrap_err().kind(),
 			ErrorKind::PermissionDenied
 		);
 		assert_eq!(
@@ -397,18 +406,18 @@ mod tests {
 		use crate::network::wire::validate_frame_version;
 		use crate::schema::MsgType;
 		validate_frame_version(1, MsgType::READ_RESP.0).unwrap();
-		validate_frame_version(8, MsgType::VOTE_REQ.0).unwrap();
-		validate_frame_version(8, MsgType::APPEND_ENTRIES_RESP.0).unwrap();
-		assert!(validate_frame_version(8, MsgType::READ_RESP.0).is_err());
-		assert!(validate_frame_version(8, MsgType::TABLE_WRITE_REQ.0).is_err());
-		assert!(validate_frame_version(8, MsgType::LEASES_REQ.0).is_err());
-		for retired in [2, 3, 4, 5, 6, 7] {
+		validate_frame_version(9, MsgType::VOTE_REQ.0).unwrap();
+		validate_frame_version(9, MsgType::APPEND_ENTRIES_RESP.0).unwrap();
+		assert!(validate_frame_version(9, MsgType::READ_RESP.0).is_err());
+		assert!(validate_frame_version(9, MsgType::TABLE_WRITE_REQ.0).is_err());
+		assert!(validate_frame_version(9, MsgType::LEASES_REQ.0).is_err());
+		for retired in [2, 3, 4, 5, 6, 7, 8] {
 			assert!(
 				validate_frame_version(retired, MsgType::VOTE_REQ.0).is_err(),
 				"retired envelope {retired}"
 			);
 		}
-		assert!(validate_frame_version(9, MsgType::VOTE_REQ.0).is_err());
+		assert!(validate_frame_version(10, MsgType::VOTE_REQ.0).is_err());
 	}
 
 	#[test]
@@ -417,15 +426,16 @@ mod tests {
 		let (today, new) = (DecisionMode::Today, DecisionMode::ParentDecisions);
 		let vote = MsgType::VOTE_RESP.0;
 		today.check_raft_response(1, vote, vote).unwrap();
-		new.check_raft_response(8, vote, vote).unwrap();
+		new.check_raft_response(9, vote, vote).unwrap();
 		assert!(new.check_raft_response(6, vote, vote).is_err());
 		assert!(new.check_raft_response(7, vote, vote).is_err());
-		assert!(today.check_raft_response(8, vote, vote).is_err());
+		assert!(new.check_raft_response(8, vote, vote).is_err());
+		assert!(today.check_raft_response(9, vote, vote).is_err());
 		for retired in [1, 2, 3, 4, 5] {
 			assert!(new.check_raft_response(retired, vote, vote).is_err());
 		}
 		assert!(
-			new.check_raft_response(8, MsgType::APPEND_ENTRIES_RESP.0, vote)
+			new.check_raft_response(9, MsgType::APPEND_ENTRIES_RESP.0, vote)
 				.is_err()
 		);
 	}
@@ -494,6 +504,7 @@ mod tests {
 			("adr0700-v5", 8),
 			("adr0702-v6", 9),
 			("adr0703-v7", 10),
+			("adr0719-v8", 11),
 			("directory", 2),
 			("symlink", 3),
 		] {
@@ -501,7 +512,7 @@ mod tests {
 			let marker = dir.join(MODE_MARKER);
 			match make {
 				0 => fs::write(&marker, b"").unwrap(),
-				1 => fs::write(&marker, b"parent-decisions-v9\n").unwrap(),
+				1 => fs::write(&marker, b"parent-decisions-v10\n").unwrap(),
 				4 => fs::write(&marker, RETIRED_MARKER_BYTES_V1).unwrap(),
 				5 => fs::write(&marker, RETIRED_MARKER_BYTES_V2).unwrap(),
 				6 => fs::write(&marker, RETIRED_MARKER_BYTES_V3).unwrap(),
@@ -509,6 +520,7 @@ mod tests {
 				8 => fs::write(&marker, RETIRED_MARKER_BYTES_V5).unwrap(),
 				9 => fs::write(&marker, RETIRED_MARKER_BYTES_V6).unwrap(),
 				10 => fs::write(&marker, RETIRED_MARKER_BYTES_V7).unwrap(),
+				11 => fs::write(&marker, RETIRED_MARKER_BYTES_V8).unwrap(),
 				2 => fs::create_dir(&marker).unwrap(),
 				_ => {
 					fs::write(dir.join("target"), MODE_MARKER_BYTES).unwrap();

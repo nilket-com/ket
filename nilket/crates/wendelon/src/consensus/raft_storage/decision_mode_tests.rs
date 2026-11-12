@@ -217,6 +217,11 @@ async fn a_new_mode_store_writes_its_own_format_and_reopens() {
 
 use crate::consensus::decisions::tests as fixture;
 
+const PARENT_DECISIONS_V17_MANIFEST: &str =
+	include_str!("../../../tests/fixtures/consensus_body/parent_decisions_v17.txt");
+/// ADR 0704 to ADR 0719's format-16 bodies, retained: a decision state with no
+/// sealed membership. ADR 0720 changed no command body, so every format-16 body
+/// but the decision state is unchanged.
 const PARENT_DECISIONS_V16_MANIFEST: &str =
 	include_str!("../../../tests/fixtures/consensus_body/parent_decisions_v16.txt");
 /// ADR 0701 to ADR 0703's format-14 bodies, retained: no certified tier provenance.
@@ -242,7 +247,7 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 fn manifest() -> BTreeMap<String, String> {
-	parse(PARENT_DECISIONS_V16_MANIFEST)
+	parse(PARENT_DECISIONS_V17_MANIFEST)
 }
 
 /// ADR 0704: the certified Tier and Retire pinned in the format-16 corpus, each
@@ -340,7 +345,7 @@ fn entry(index: u64, request: WendelonRequest) -> Entry<WendelonTypeConfig> {
 }
 
 #[test]
-fn the_format_16_bodies_match_their_goldens_and_round_trip() {
+fn the_format_17_bodies_match_their_goldens_and_round_trip() {
 	let stored = manifest();
 	let state = golden_state();
 	let body = encode_state_body(DecisionMode::ParentDecisions, &state).unwrap();
@@ -380,7 +385,7 @@ fn the_format_16_bodies_match_their_goldens_and_round_trip() {
 		.collect();
 	assert!(
 		moved.is_empty(),
-		"format-16 bodies moved or are missing; expected lines:\n{}",
+		"format-17 bodies moved or are missing; expected lines:\n{}",
 		moved.join("\n")
 	);
 	assert_eq!(stored.len(), actual.len());
@@ -390,21 +395,41 @@ fn the_format_16_bodies_match_their_goldens_and_round_trip() {
 	assert_eq!(decoded.leases, state.leases);
 	assert_eq!(decoded.epoch_history, state.epoch_history);
 	let decisions = decoded.decisions.as_ref().unwrap();
+	// ADR 0720: the golden history admitted writes, so its state is sealed, and
+	// only the decision state differs from the format-16 corpus: by exactly the
+	// appended seal.
+	assert!(decisions.sealed().is_some());
+	let retained_v16 = parse(PARENT_DECISIONS_V16_MANIFEST);
+	assert_eq!(stored.len(), retained_v16.len());
+	for (name, hex) in &retained_v16 {
+		if name == "decisions_golden_history" {
+			let now = &stored[name];
+			assert!(now.starts_with(hex.as_str()) && now.len() > hex.len());
+		} else {
+			assert_eq!(stored.get(name), Some(hex), "{name}");
+		}
+	}
 	assert_eq!(decisions.retained_bodies(), 2);
 	assert_eq!(decisions.retry_keys(), 1);
 	assert!(decisions.floor_ms() > 0 && decisions.next_generation() > 2);
 	// Today cannot read it as its own body.
 	assert!(decode_state_body(DecisionMode::Today, &body).is_err());
 	// ADR 0701 appended a variant: every retained format-13 body is unchanged.
+	// (The decision state itself is compared with format 16 above: ADR 0720
+	// appended the seal to it.)
 	let retained = parse(PARENT_DECISIONS_V13_MANIFEST);
 	for (name, hex) in &retained {
-		assert_eq!(stored.get(name), Some(hex), "{name}");
+		if name != "decisions_golden_history" {
+			assert_eq!(stored.get(name), Some(hex), "{name}");
+		}
 	}
 	// ADR 0704 changed no decision or lease body: every format-14 body is
 	// unchanged, and only the two certified slab bodies are new.
 	let retained_v14 = parse(PARENT_DECISIONS_V14_MANIFEST);
 	for (name, hex) in &retained_v14 {
-		assert_eq!(stored.get(name), Some(hex), "{name}");
+		if name != "decisions_golden_history" {
+			assert_eq!(stored.get(name), Some(hex), "{name}");
+		}
 	}
 	assert_eq!(stored.len(), retained_v14.len() + 2);
 	assert_eq!(retained_v14.len(), retained.len() + 1);
@@ -484,7 +509,8 @@ async fn s1_s2_and_s3_development_artifacts_are_refused_by_both_authorities() {
 	// S4b wrote 12, S5a to ADR 0700 13 and ADR 0701 to ADR 0703 14. None is
 	// converted: each is refused before replay or decode, files unchanged. ADR
 	// 0704 gave Today 15, not 9, so no authority ever reuses a retired number.
-	for retired in [9u8, 10, 11, 12, 13, 14] {
+	// ADR 0720 retired 16, whose decision state records no sealed membership.
+	for retired in [9u8, 10, 11, 12, 13, 14, 16] {
 		let dir = crate::test_support::TestDir::new(&format!("decision-retired-wal-{retired}"));
 		let page = serialize_entry_page_as(&blank(1), retired).unwrap();
 		let wal = write_segment(&dir, &[page]);

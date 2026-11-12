@@ -3646,6 +3646,9 @@ async fn request_join_via_seeds(
 							crate::network::control_server::CONTROL_REASON_INVALID_CONFIG => {
 								ErrorKind::InvalidInput
 							}
+							crate::network::control_server::CONTROL_REASON_MEMBERSHIP_SEALED => {
+								ErrorKind::PermissionDenied
+							}
 							_ => ErrorKind::Other,
 						},
 						format!(

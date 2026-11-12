@@ -205,3 +205,163 @@ fn completed_self_join_rejects_missing_epoch_visible_lag_and_full_config_diverge
 		"full config must match, not just self peer"
 	);
 }
+
+// ADR 0720: a join request to a sealed cluster.
+
+fn sealed_fixture() -> (
+	JoinClusterRequestWire,
+	StoredMembership<u32, BasicNode>,
+	(u64, EpochConfig),
+	MembershipEpoch,
+) {
+	let address = |id: u32| format!("loopback://sealed-{id}");
+	let request = JoinClusterRequestWire {
+		node_id: 2,
+		advertise_address: address(2),
+		tier_bits: 2,
+		role_bits: 3,
+		capability_bits: 3,
+		protocol: ProtocolVersionWindow::default(),
+	};
+	let membership = StoredMembership::new(
+		Some(LogId::new(CommittedLeaderId::new(1, 1), 9)),
+		Membership::new(
+			vec![BTreeSet::from([1, 2, 3])],
+			BTreeMap::from([1, 2, 3].map(|id| (id, BasicNode { addr: address(id) }))),
+		),
+	);
+	let epoch = EpochConfig {
+		epoch: 3,
+		peers: BTreeMap::from([1, 2, 3].map(|id| {
+			(
+				id,
+				EpochPeer {
+					node_id: NodeId { id, _reserved: 0 },
+					address: address(id),
+					tier_bits: 2,
+					role_bits: 3,
+					capability_bits: 3,
+				},
+			)
+		})),
+	};
+	let visible = membership_from_epoch_config(&epoch);
+	(request, membership, (3, epoch), visible)
+}
+
+#[test]
+fn a_sealed_cluster_answers_only_a_members_identical_completed_join() {
+	let (request, membership, epoch, visible) = sealed_fixture();
+	let check = |r: &JoinClusterRequestWire| {
+		validate_completed_member_join(
+			r,
+			ProtocolVersionWindow::default(),
+			&membership,
+			Some(&epoch),
+			&visible,
+		)
+	};
+	check(&request).unwrap();
+
+	let mut refused = Vec::new();
+	let mut stranger = request.clone();
+	stranger.node_id = 4;
+	stranger.advertise_address = "loopback://sealed-4".into();
+	refused.push(("a non-member", stranger));
+	let mut moved = request.clone();
+	moved.advertise_address = "loopback://elsewhere".into();
+	refused.push(("a changed address", moved));
+	let mut tiers = request.clone();
+	tiers.tier_bits = 1;
+	refused.push(("changed tiers", tiers));
+	let mut roles = request.clone();
+	roles.role_bits = 2;
+	refused.push(("changed roles", roles));
+	let mut capabilities = request.clone();
+	capabilities.capability_bits = 1;
+	refused.push(("changed capabilities", capabilities));
+	for (what, r) in &refused {
+		let error = check(r).unwrap_err();
+		assert_eq!(error.kind(), ErrorKind::PermissionDenied, "{what}");
+		assert!(error.to_string().starts_with("MembershipSealed"), "{what}");
+	}
+}
+
+#[test]
+fn a_sealed_join_is_refused_while_the_membership_view_is_incomplete() {
+	let (request, membership, epoch, visible) = sealed_fixture();
+	let nodes = |ids: &[u32]| -> BTreeMap<u32, BasicNode> {
+		ids.iter()
+			.map(|id| {
+				(
+					*id,
+					BasicNode {
+						addr: format!("loopback://sealed-{id}"),
+					},
+				)
+			})
+			.collect()
+	};
+	let at = Some(LogId::new(CommittedLeaderId::new(1, 1), 9));
+	let joint = StoredMembership::new(
+		at,
+		Membership::new(
+			vec![BTreeSet::from([1, 2, 3]), BTreeSet::from([1, 2, 3, 4])],
+			nodes(&[1, 2, 3, 4]),
+		),
+	);
+	let learner = StoredMembership::new(
+		at,
+		Membership::new(vec![BTreeSet::from([1, 2, 3])], nodes(&[1, 2, 3, 4])),
+	);
+	let stray = StoredMembership::new(
+		at,
+		Membership::new(vec![BTreeSet::from([1, 2, 3, 4])], nodes(&[1, 2, 3, 4])),
+	);
+	let unapplied = StoredMembership::new(
+		None,
+		Membership::new(vec![BTreeSet::from([1, 2, 3])], nodes(&[1, 2, 3])),
+	);
+	for (what, m) in [
+		("a joint configuration", &joint),
+		("a learner", &learner),
+		("a stray voter", &stray),
+		("no applied membership", &unapplied),
+	] {
+		assert!(
+			validate_completed_member_join(
+				&request,
+				ProtocolVersionWindow::default(),
+				m,
+				Some(&epoch),
+				&visible,
+			)
+			.is_err(),
+			"{what}"
+		);
+	}
+	// The published epoch is behind the durable one: publication is incomplete.
+	let mut stale = epoch.1.clone();
+	stale.epoch = 2;
+	let stale_visible = membership_from_epoch_config(&stale);
+	assert!(
+		validate_completed_member_join(
+			&request,
+			ProtocolVersionWindow::default(),
+			&membership,
+			Some(&epoch),
+			&stale_visible,
+		)
+		.is_err()
+	);
+	assert!(
+		validate_completed_member_join(
+			&request,
+			ProtocolVersionWindow::default(),
+			&membership,
+			None,
+			&visible,
+		)
+		.is_err()
+	);
+}

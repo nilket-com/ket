@@ -17,13 +17,14 @@
 //! non-test build every signed command is refused as `Unverifiable`: the
 //! signature scheme arrives with admission (S3).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::consensus::StoreIncarnation;
 use crate::consensus::raft_storage::SmState;
+use crate::consensus::{EpochConfig, StoreIncarnation};
 use crate::network::ring::{RingState, membership_from_epoch_config};
+use crate::network::transport::{NodeRole, NodeRoleSet};
 use crate::schema::{
 	COUNTER_ATTEMPT_HORIZON_MS, COUNTER_INCARNATION_LIFETIME_MS, HybridTimestamp, Identity,
 	LeaseDescriptor, NodeId, ReleaseLeaseRequestMeta, TableObjectId, TenantId, uuid_v7_unix_millis,
@@ -468,6 +469,87 @@ pub enum DecisionRefusal {
 	/// ADR 0700: a new claim's commit HLC is more than
 	/// [`DECISION_COMMIT_HLC_LEAD_MS`] ahead of the leader's stamp.
 	CommitFromFuture,
+	/// ADR 0720: no write has been admitted yet and the cluster is not formed:
+	/// the applied Raft membership is joint, has a learner, or its voters are
+	/// not the latest epoch's peers. Nothing is admitted and nothing is sealed.
+	FormationIncomplete,
+	/// ADR 0720: the membership sealed by the first admitted write is not the
+	/// one in effect. No new parent is admitted.
+	MembershipSealed,
+}
+
+/// ADR 0720: what the first admitted write fixed. `placement` is every peer of
+/// the serving epoch with whether it holds the Data role, which is all a ring is
+/// built from; the voters at that moment were exactly those peers.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SealedMembership {
+	placement: BTreeSet<(u32, bool)>,
+}
+
+impl SealedMembership {
+	pub fn placement(&self) -> &BTreeSet<(u32, bool)> {
+		&self.placement
+	}
+}
+
+/// What a ring is built from: each peer and whether it holds the Data role.
+/// Addresses, tiers, capabilities and the epoch number place nothing.
+pub(crate) fn placement_of(config: &EpochConfig) -> BTreeSet<(u32, bool)> {
+	config
+		.peers
+		.values()
+		.map(|peer| {
+			(
+				peer.node_id.id,
+				NodeRoleSet::from_u8(peer.role_bits).contains(NodeRole::Data),
+			)
+		})
+		.collect()
+}
+
+/// The placement of a formed cluster, or `None` while it is forming: the applied
+/// Raft membership must be uniform, hold no learner, and have exactly the latest
+/// epoch's peers as its voters.
+pub(crate) fn formed_placement(state: &SmState) -> Option<BTreeSet<(u32, bool)>> {
+	let membership = state.last_membership.membership();
+	if membership.get_joint_config().len() != 1 {
+		return None;
+	}
+	let voters: BTreeSet<u32> = membership.voter_ids().collect();
+	let nodes: BTreeSet<u32> = membership.nodes().map(|(id, _)| *id).collect();
+	let (_, config) = state.epoch_history.last_key_value()?;
+	let peers: BTreeSet<u32> = config.peers.values().map(|peer| peer.node_id.id).collect();
+	if voters.is_empty() || nodes != voters || peers != voters {
+		return None;
+	}
+	Some(placement_of(config))
+}
+
+/// ADR 0720: whether an epoch advance may apply. Once a write has been admitted,
+/// every configuration the advance would introduce must place exactly as the
+/// sealed one does. A configuration already on record is not rewritten by the
+/// advance, so it is not judged here.
+pub(crate) fn admit_epoch_advance(
+	state: &SmState,
+	record: &crate::consensus::AdvanceEpochRecord,
+) -> Result<(), &'static str> {
+	let Some(sealed) = state
+		.decisions
+		.as_ref()
+		.and_then(|decisions| decisions.sealed.as_ref())
+	else {
+		return Ok(());
+	};
+	for config in [&record.from, &record.to] {
+		if !state.epoch_history.contains_key(&config.epoch)
+			&& placement_of(config) != sealed.placement
+		{
+			return Err(
+				"MembershipSealed: an epoch advance may not change placement once a write has been admitted",
+			);
+		}
+	}
+	Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -579,6 +661,10 @@ pub struct DecisionState {
 	noops: BTreeMap<u64, NoopRecord>,
 	/// ADR 0699 S5a: the current certificate and the pending target.
 	generations: Generations,
+	/// ADR 0720: set by the first admitted Reserve, never cleared and never
+	/// pruned, so a store whose records have all been retired still knows that
+	/// writes began and under which membership.
+	sealed: Option<SealedMembership>,
 }
 
 impl Default for DecisionState {
@@ -595,6 +681,7 @@ impl Default for DecisionState {
 			signers: BTreeMap::new(),
 			noops: BTreeMap::new(),
 			generations: Generations::default(),
+			sealed: None,
 		}
 	}
 }
@@ -614,6 +701,9 @@ impl DecisionState {
 	}
 	pub fn generations(&self) -> &Generations {
 		&self.generations
+	}
+	pub fn sealed(&self) -> Option<&SealedMembership> {
+		self.sealed.as_ref()
 	}
 	pub fn retained_bodies(&self) -> usize {
 		self.bodies.len()
@@ -651,6 +741,23 @@ impl DecisionState {
 	}
 
 	pub(crate) fn validate(&self) -> Result<(), String> {
+		// ADR 0720: a record exists only after an admitted write, and that write
+		// sealed. A state holding records and no seal was not written by this build.
+		match &self.sealed {
+			None if !self.bodies.is_empty() => {
+				return Err("decisions: parent records exist and no membership is sealed".into());
+			}
+			Some(sealed) if sealed.placement.is_empty() => {
+				return Err("decisions: the sealed membership is empty".into());
+			}
+			Some(sealed) => {
+				let mut nodes = std::collections::BTreeSet::new();
+				if !sealed.placement.iter().all(|(node, _)| nodes.insert(*node)) {
+					return Err("decisions: the sealed membership names a node twice".into());
+				}
+			}
+			None => {}
+		}
 		let mut seen_keys = std::collections::BTreeMap::new();
 		for ((node, _), key) in &self.signers {
 			if ed25519_dalek::VerifyingKey::from_bytes(key).is_err() {
@@ -1235,7 +1342,20 @@ fn reserve(
 	if decisions.bodies.contains_key(&reservation) {
 		return Err(DecisionRefusal::LogIndexOutOfOrder);
 	}
+	// ADR 0720: the last check, so a claim refused for any other reason never
+	// seals. The first admitted write fixes the membership it was admitted
+	// under; every later one is admitted only under that membership.
+	let formed = formed_placement(state);
+	let seal = match (&decisions.sealed, formed) {
+		(None, None) => return Err(DecisionRefusal::FormationIncomplete),
+		(None, Some(placement)) => Some(SealedMembership { placement }),
+		(Some(sealed), Some(placement)) if sealed.placement == placement => None,
+		(Some(_), _) => return Err(DecisionRefusal::MembershipSealed),
+	};
 	// Every check passed: commit.
+	if seal.is_some() {
+		decisions.sealed = seal;
+	}
 	decisions.clock_ms = clock_ms;
 	decisions.retained_claim_bytes = retained;
 	decisions.live += 1;

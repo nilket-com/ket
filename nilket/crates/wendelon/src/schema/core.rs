@@ -2492,9 +2492,9 @@ pub const PRE_VERSIONING_FORMAT: u8 = 0;
 /// Every earlier version is refused, not upconverted.
 pub const SNAPSHOT_FORMAT_VERSION: u8 = 15;
 /// Snapshot format of a `ParentDecisions` store; see `consensus::decision_mode`.
-/// ADR 0704: 16 (14 was ADR 0701 to ADR 0703's, before certified provenance; 15 is
-/// Today's).
-pub const SNAPSHOT_FORMAT_VERSION_PARENT_DECISIONS: u8 = 16;
+/// ADR 0720: 17, whose decision state carries the sealed membership (16 was ADR
+/// 0704 to ADR 0719's; 14 was ADR 0701 to ADR 0703's; 15 is Today's).
+pub const SNAPSHOT_FORMAT_VERSION_PARENT_DECISIONS: u8 = 17;
 
 /// Shape of the Control Ring WAL record bodies this build writes, including the
 /// `postcard(Entry<..>)` payload of a log record. ADR 0697 version 6 carries
@@ -2504,9 +2504,10 @@ pub const SNAPSHOT_FORMAT_VERSION_PARENT_DECISIONS: u8 = 16;
 /// is refused, not upconverted.
 pub const WAL_FORMAT_VERSION: u8 = 15;
 /// Control-log format of a `ParentDecisions` store; see `consensus::decision_mode`.
-/// ADR 0704: 16 (14 was ADR 0701 to ADR 0703's, before certified provenance; 15 is
-/// Today's).
-pub const WAL_FORMAT_VERSION_PARENT_DECISIONS: u8 = 16;
+/// ADR 0720: 17, written only by stores that seal their membership at the first
+/// admitted write (16 was ADR 0704 to ADR 0719's; 14 was ADR 0701 to ADR 0703's;
+/// 15 is Today's).
+pub const WAL_FORMAT_VERSION_PARENT_DECISIONS: u8 = 17;
 
 // Static assertions to ensure all our size calculations remain exactly correct
 const _: () = assert!(std::mem::size_of::<HybridTimestamp>() == 16);

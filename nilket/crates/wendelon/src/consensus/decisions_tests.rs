@@ -72,6 +72,45 @@ fn hts(ms: u64) -> HybridTimestamp {
 	}
 }
 
+/// A uniform applied membership whose voters are `voters`, with no learner.
+pub(crate) fn formed_membership(
+	voters: &[u32],
+) -> openraft::StoredMembership<u32, openraft::BasicNode> {
+	membership_of(&[voters], &[])
+}
+
+/// An applied membership with the given voter configurations (more than one is
+/// a joint configuration) and learners.
+pub(crate) fn membership_of(
+	configs: &[&[u32]],
+	learners: &[u32],
+) -> openraft::StoredMembership<u32, openraft::BasicNode> {
+	let configs: Vec<std::collections::BTreeSet<u32>> = configs
+		.iter()
+		.map(|config| config.iter().copied().collect())
+		.collect();
+	let nodes: std::collections::BTreeMap<u32, openraft::BasicNode> = configs
+		.iter()
+		.flatten()
+		.chain(learners)
+		.map(|id| {
+			(
+				*id,
+				openraft::BasicNode {
+					addr: format!("127.0.0.1:{}", 7000 + id),
+				},
+			)
+		})
+		.collect();
+	openraft::StoredMembership::new(
+		Some(openraft::LogId::new(
+			openraft::CommittedLeaderId::new(1, 1),
+			1,
+		)),
+		openraft::Membership::new(configs, nodes),
+	)
+}
+
 pub(crate) fn epoch_config(epoch: u64) -> EpochConfig {
 	let peers = [1, 2, 3]
 		.into_iter()
@@ -102,6 +141,8 @@ pub(crate) fn base(rf: u32) -> SmState {
 		..SmState::default()
 	};
 	state.epoch_history.insert(EPOCH, epoch_config(EPOCH));
+	// ADR 0720: a formed cluster: the voters are the epoch's peers.
+	state.last_membership = formed_membership(&[1, 2, 3]);
 	state.tenants.insert(
 		TENANT,
 		TenantRecord {
@@ -2915,4 +2956,300 @@ fn an_oversized_lease_batch_is_refused_from_its_length() {
 	let huge = postcard::to_stdvec(&1_000_000_000u32).unwrap();
 	assert!(postcard::from_bytes::<LeaseBatch>(&huge).is_err());
 	assert!(postcard::from_bytes::<LeaseGrantResults>(&huge).is_err());
+}
+
+// ============================================================
+//  ADR 0720: MEMBERSHIP IS SEALED BY THE FIRST ADMITTED WRITE
+// ============================================================
+
+fn epoch_with(epoch: u64, peers: &[(u32, u8)]) -> EpochConfig {
+	let mut config = epoch_config(epoch);
+	config.peers = peers
+		.iter()
+		.map(|(id, role_bits)| {
+			let mut peer = epoch_config(epoch).peers[&1].clone();
+			peer.node_id = node(*id);
+			peer.address = format!("127.0.0.1:{}", 7000 + id);
+			peer.role_bits = *role_bits;
+			(*id, peer)
+		})
+		.collect();
+	config
+}
+
+fn advance(state: &mut SmState, from: EpochConfig, to: EpochConfig) -> WendelonResponse {
+	apply_next(
+		state,
+		WendelonRequest::AdvanceEpoch(AdvanceEpochRecord { from, to }),
+	)
+}
+
+fn sealed_placement(state: &SmState) -> Option<Vec<(u32, bool)>> {
+	decisions(state)
+		.sealed()
+		.map(|sealed| sealed.placement().iter().copied().collect())
+}
+
+#[test]
+fn the_first_admitted_reserve_seals_and_a_refused_one_does_not() {
+	let mut state = base(3);
+	grant_all(&mut state);
+	assert_eq!(sealed_placement(&state), None);
+
+	// Refused for its own reasons: nothing is sealed, nothing is counted.
+	let before = decisions(&state).clone();
+	let mut not_v7 = claim(key(T0, 1), children(&state, 1), 0);
+	not_v7.key.client_uuid[6] = 0x40;
+	assert_eq!(
+		reserve(&mut state, &not_v7, T0),
+		refused(DecisionRefusal::InvalidIdentity)
+	);
+	assert_eq!(decisions(&state), &before);
+
+	let first = claim(key(T0, 2), children(&state, 1), 0);
+	assert!(matches!(
+		reserve(&mut state, &first, T0),
+		DecisionResult::Reserved { .. }
+	));
+	assert_eq!(
+		sealed_placement(&state),
+		Some(vec![(1, true), (2, true), (3, true)])
+	);
+	decisions(&state).validate().unwrap();
+}
+
+#[test]
+fn an_unformed_cluster_admits_nothing_and_seals_nothing() {
+	for (what, membership, epoch) in [
+		(
+			"a joint configuration",
+			membership_of(&[&[1, 2, 3], &[1, 2, 3, 4]], &[]),
+			epoch_config(EPOCH),
+		),
+		(
+			"a learner",
+			membership_of(&[&[1, 2, 3]], &[4]),
+			epoch_config(EPOCH),
+		),
+		(
+			"a voter the epoch does not name",
+			formed_membership(&[1, 2, 3, 4]),
+			epoch_config(EPOCH),
+		),
+		(
+			"an epoch peer that is not a voter",
+			formed_membership(&[1, 2]),
+			epoch_config(EPOCH),
+		),
+		(
+			"no applied membership",
+			openraft::StoredMembership::default(),
+			epoch_config(EPOCH),
+		),
+	] {
+		let mut state = base(3);
+		state.epoch_history.insert(EPOCH, epoch);
+		grant_all(&mut state);
+		state.last_membership = membership;
+		let before = decisions(&state).clone();
+		let claim = claim(key(T0, 1), children(&state, 1), 0);
+		assert_eq!(
+			reserve(&mut state, &claim, T0),
+			refused(DecisionRefusal::FormationIncomplete),
+			"{what}"
+		);
+		assert_eq!(decisions(&state), &before, "{what}");
+		// Once formed, the same claim is admitted and seals.
+		state.last_membership = formed_membership(&[1, 2, 3]);
+		assert!(
+			matches!(
+				reserve(&mut state, &claim, T0),
+				DecisionResult::Reserved { .. }
+			),
+			"{what}"
+		);
+		assert!(decisions(&state).sealed().is_some(), "{what}");
+	}
+}
+
+#[test]
+fn a_sealed_store_refuses_an_epoch_that_changes_placement_and_changes_nothing() {
+	let (mut state, _claim, _reservation) = reserved_parent(1);
+	let sealed = [(1, 1u8), (2, 1), (3, 1)];
+	let cases = [
+		(
+			"a fourth peer",
+			epoch_config(EPOCH),
+			epoch_with(EPOCH + 1, &[(1, 1), (2, 1), (3, 1), (4, 1)]),
+		),
+		(
+			"a removed peer",
+			epoch_config(EPOCH),
+			epoch_with(EPOCH + 1, &[(1, 1), (2, 1)]),
+		),
+		(
+			"a peer that lost the Data role",
+			epoch_config(EPOCH),
+			epoch_with(EPOCH + 1, &[(1, 1), (2, 1), (3, 2)]),
+		),
+		(
+			// Both ends are recorded with or_insert, so an unrecorded `from` at the
+			// higher epoch would become the serving configuration.
+			"an incompatible from at the higher epoch",
+			epoch_with(EPOCH + 2, &[(1, 1), (2, 1), (3, 1), (4, 1)]),
+			epoch_with(EPOCH + 1, &sealed),
+		),
+	];
+	for (what, from, to) in cases {
+		let (epochs, lineages, decisions_before) = (
+			state.epoch_history.clone(),
+			decisions(&state).lineages.clone(),
+			decisions(&state).clone(),
+		);
+		assert!(!lineages.is_empty());
+		let response = advance(&mut state, from, to);
+		assert!(
+			matches!(&response, WendelonResponse::Error(why) if why.starts_with("MembershipSealed")),
+			"{what}: {response:?}"
+		);
+		assert_eq!(state.epoch_history, epochs, "{what}");
+		assert_eq!(decisions(&state), &decisions_before, "{what}");
+	}
+}
+
+#[test]
+fn a_sealed_store_takes_a_same_placement_epoch_and_writes_resume_after_regrant() {
+	let (mut state, _claim, _reservation) = reserved_parent(1);
+	// Same peers and roles; an address and a capability changed.
+	let mut next = epoch_config(EPOCH + 1);
+	next.peers.get_mut(&2).unwrap().address = "127.0.0.1:9999".into();
+	next.peers.get_mut(&3).unwrap().capability_bits = 0b1100;
+	assert_eq!(
+		advance(&mut state, epoch_config(EPOCH), next),
+		WendelonResponse::Success
+	);
+	assert_eq!(state.epoch_history.len(), 2);
+	assert!(
+		decisions(&state).lineages.is_empty(),
+		"lineages are regranted"
+	);
+	for (holder, range) in universe() {
+		let mut regrant = lease(holder, range, 0, 1_000);
+		regrant.epoch = EPOCH + 1;
+		grant(&mut state, regrant);
+	}
+	let second = claim(key(T0, 2), children(&state, 1), 0);
+	assert!(matches!(
+		reserve(&mut state, &second, T0),
+		DecisionResult::Reserved { .. }
+	));
+}
+
+#[test]
+fn a_voter_change_after_the_seal_fences_new_parents_and_nothing_else() {
+	let (mut state, first, reservation) = reserved_parent(1);
+	let second = claim(key(T0, 2), children(&state, 1), 0);
+	assert!(matches!(
+		reserve(&mut state, &second, T0),
+		DecisionResult::Reserved { .. }
+	));
+	let sealed = decisions(&state).sealed().cloned();
+
+	for (what, membership) in [
+		("a stray voter", formed_membership(&[1, 2, 3, 4])),
+		(
+			"a joint configuration",
+			membership_of(&[&[1, 2, 3], &[1, 2, 3, 4]], &[]),
+		),
+		("a learner", membership_of(&[&[1, 2, 3]], &[4])),
+		("a lost voter", formed_membership(&[1, 2])),
+	] {
+		state.last_membership = membership;
+		let before = decisions(&state).clone();
+		let third = claim(key(T0, 3), children(&state, 1), 0);
+		assert_eq!(
+			reserve(&mut state, &third, T0),
+			refused(DecisionRefusal::MembershipSealed),
+			"{what}"
+		);
+		assert_eq!(decisions(&state), &before, "{what}");
+		// A recorded parent still answers as recorded: the fence never hides an
+		// outcome from its retry.
+		assert_eq!(
+			reserve(&mut state, &first, T0),
+			DecisionResult::Reserved { reservation },
+			"{what}"
+		);
+	}
+
+	// With the stray voter still applied, parents reserved earlier finish: one
+	// is finalized by its acknowledgements and one is aborted.
+	state.last_membership = formed_membership(&[1, 2, 3, 4]);
+	assert!(matches!(
+		finalize(&mut state, &first, quorum_acks(&first, reservation)),
+		DecisionResult::Terminal {
+			status: ParentStatus::Accepted { .. },
+			..
+		}
+	));
+	let DecisionResult::Reserved {
+		reservation: second_reservation,
+	} = reserve(&mut state, &second, T0)
+	else {
+		panic!("the second parent is on record");
+	};
+	assert!(matches!(
+		abort(&mut state, &second, second_reservation),
+		DecisionResult::Terminal { .. }
+	));
+	assert_eq!(decisions(&state).sealed().cloned(), sealed);
+
+	// The sealed membership back in effect: parents are admitted again.
+	state.last_membership = formed_membership(&[1, 2, 3]);
+	let fourth = claim(key(T0, 4), children(&state, 1), 0);
+	assert!(matches!(
+		reserve(&mut state, &fourth, T0),
+		DecisionResult::Reserved { .. }
+	));
+}
+
+#[test]
+fn the_seal_outlives_every_record_and_a_snapshot_cannot_drop_it() {
+	let golden = golden_decisions();
+	golden.validate().unwrap();
+	assert!(golden.sealed().is_some());
+	let bytes = postcard::to_stdvec(&golden).unwrap();
+	let decoded: DecisionState = postcard::from_bytes(&bytes).unwrap();
+	assert_eq!(decoded.sealed(), golden.sealed());
+
+	// Records without a seal were not written by this build.
+	let mut unsealed = golden.clone();
+	unsealed.sealed = None;
+	assert!(
+		unsealed
+			.validate()
+			.unwrap_err()
+			.contains("no membership is sealed")
+	);
+	let mut empty = golden.clone();
+	empty.sealed.as_mut().unwrap().placement.clear();
+	assert!(empty.validate().unwrap_err().contains("is empty"));
+
+	// Every record retired: the seal is all that says writes began.
+	let mut pruned = golden.clone();
+	pruned.bodies.clear();
+	pruned.keys.clear();
+	pruned.noops.clear();
+	pruned.live = 0;
+	pruned.retained_claim_bytes = 0;
+	pruned.validate().unwrap();
+	let mut state = base(3);
+	state.decisions = Some(pruned);
+	grant_all(&mut state);
+	state.last_membership = formed_membership(&[1, 2, 3, 4]);
+	let claim = claim(key(T0 + 10_000_000, 9), children(&state, 1), 0);
+	assert_eq!(
+		reserve(&mut state, &claim, T0 + 10_000_000),
+		refused(DecisionRefusal::MembershipSealed)
+	);
 }
