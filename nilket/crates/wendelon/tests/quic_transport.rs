@@ -1484,3 +1484,117 @@ async fn adr629_p1_outgoing_client_preserves_server_trust_and_identity_rejection
 		);
 	}
 }
+
+// ============================================================
+//  ADR 0722: a closing endpoint waits a bounded grace for its connections
+// ============================================================
+
+/// A datagram relay between a client and a server: the two see an ordinary path
+/// through an address that is neither's own.
+struct RelayedPath {
+	address: std::net::SocketAddr,
+	task: tokio::task::JoinHandle<()>,
+}
+
+async fn relayed_path_to(server: std::net::SocketAddr) -> RelayedPath {
+	let front = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+	let back = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+	let address = front.local_addr().unwrap();
+	let task = tokio::spawn({
+		async move {
+			let mut client = None;
+			let (mut from_client, mut from_server) = (vec![0u8; 65_536], vec![0u8; 65_536]);
+			loop {
+				tokio::select! {
+					received = front.recv_from(&mut from_client) => {
+						let Ok((len, from)) = received else { return };
+						client = Some(from);
+						let _ = back.send_to(&from_client[..len], server).await;
+					}
+					received = back.recv_from(&mut from_server) => {
+						let Ok((len, _)) = received else { return };
+						if let Some(client) = client {
+							let _ = front.send_to(&from_server[..len], client).await;
+						}
+					}
+				}
+			}
+		}
+	});
+	RelayedPath { address, task }
+}
+
+/// A server endpoint holding one established connection from a client that reached
+/// it through a relay.
+async fn server_with_one_connection_through(
+	tag: &str,
+) -> (
+	quinn::Endpoint,
+	quinn::Connection,
+	quinn::Endpoint,
+	quinn::Connection,
+	RelayedPath,
+	test_dir::TestDir,
+) {
+	let root = fresh_dir(tag);
+	let pki = tls_pki::write_test_pki(&root.join("pki"));
+	let server_material =
+		TlsMaterial::load(&pki.server_cert, &pki.server_key, &pki.ca_cert).unwrap();
+	let client_material =
+		TlsMaterial::load(&pki.data_client_cert, &pki.data_client_key, &pki.ca_cert).unwrap();
+	let mut transport = quinn::TransportConfig::default();
+	transport.max_idle_timeout(Some(
+		std::time::Duration::from_secs(60)
+			.try_into()
+			.expect("representable idle timeout"),
+	));
+	transport.keep_alive_interval(Some(std::time::Duration::from_millis(100)));
+	let transport = Arc::new(transport);
+	let mut server_cfg = server_config(&server_material).unwrap();
+	server_cfg.transport_config(Arc::clone(&transport));
+	let server = quinn::Endpoint::server(server_cfg, "127.0.0.1:0".parse().unwrap()).unwrap();
+	let path = relayed_path_to(server.local_addr().unwrap()).await;
+	let mut client_cfg = client_config(&client_material).unwrap();
+	client_cfg.transport_config(transport);
+	let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+	client.set_default_client_config(client_cfg);
+	let accepting = tokio::spawn({
+		let server = server.clone();
+		async move {
+			server
+				.accept()
+				.await
+				.expect("incoming")
+				.await
+				.expect("accept")
+		}
+	});
+	let outgoing = client
+		.connect(
+			path.address,
+			&canonical_node_dns_name(1, tls_pki::CLUSTER_DOMAIN),
+		)
+		.expect("connect")
+		.await
+		.expect("handshake");
+	let accepted = accepting.await.unwrap();
+	(server, accepted, client, outgoing, path, root)
+}
+
+/// With its peer reachable, a closing endpoint's connections finish closing well
+/// inside the grace, and the helper says so.
+#[tokio::test]
+async fn adr0722_a_reachable_peer_lets_the_endpoint_close_inside_the_grace() {
+	use wendelon::node::{QUIC_ENDPOINT_CLOSE_GRACE, close_quic_endpoint_within};
+	let (server, _accepted, _client, _outgoing, path, _root) =
+		server_with_one_connection_through("adr0722-reachable").await;
+	assert_eq!(server.open_connections(), 1);
+	let started = std::time::Instant::now();
+	assert!(close_quic_endpoint_within(&server, QUIC_ENDPOINT_CLOSE_GRACE).await);
+	assert!(
+		started.elapsed() < QUIC_ENDPOINT_CLOSE_GRACE,
+		"closed in {:?}",
+		started.elapsed()
+	);
+	path.task.abort();
+}

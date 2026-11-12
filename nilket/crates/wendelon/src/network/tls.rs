@@ -604,7 +604,15 @@ fn quinn_server_config_from_rustls(
 /// * presents this node's cert+key as the client identity,
 /// * advertises only [`HRFT_ALPN`].
 pub fn client_config(material: &TlsMaterial) -> std::io::Result<quinn::ClientConfig> {
-	let rustls_cfg = rustls_client_config(material)?;
+	quic_client_config_from_rustls(rustls_client_config(material)?)
+}
+
+/// The one place a QUIC client configuration is built from a TLS configuration, so
+/// every one carries the Wendelon transport policy (ADR 0093). [`client_config`] is
+/// this over a node's TLS material.
+pub(crate) fn quic_client_config_from_rustls(
+	rustls_cfg: rustls::ClientConfig,
+) -> std::io::Result<quinn::ClientConfig> {
 	let quic_cfg = QuicClientConfig::try_from(rustls_cfg)
 		.map_err(|e| Error::new(ErrorKind::InvalidInput, format!("QuicClientConfig: {e}")))?;
 	let mut config = quinn::ClientConfig::new(Arc::new(quic_cfg));

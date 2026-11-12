@@ -1029,6 +1029,27 @@ async fn await_background_task(handle: JoinHandle<()>, label: &str) -> std::io::
 	}
 }
 
+/// ADR 0722: how long a closing QUIC endpoint is given to finish closing and
+/// draining its connections before shutdown goes on. An administrative shutdown
+/// policy, not a value derived from any network: the wait is only the chance for
+/// peers to learn of the close, and a peer that has gone gives none.
+pub const QUIC_ENDPOINT_CLOSE_GRACE: Duration = Duration::from_secs(2);
+
+/// Closes `endpoint` and waits, at most `grace`, for its connections to finish
+/// closing and draining. Returns whether they did. The close is issued first and
+/// unconditionally; only the wait is bounded.
+///
+/// What it guarantees is the bound on this wait. It does not say that local work
+/// is quiescent (the caller establishes that before closing) and it does not
+/// release other references to the endpoint; a connection still draining is left
+/// to the endpoint's own timers or to process exit.
+pub async fn close_quic_endpoint_within(endpoint: &quinn::Endpoint, grace: Duration) -> bool {
+	endpoint.close(0u32.into(), b"shutdown");
+	tokio::time::timeout(grace, endpoint.wait_idle())
+		.await
+		.is_ok()
+}
+
 pub struct QuicServerHandle {
 	endpoint: quinn::Endpoint,
 	lifecycle: ServerLifecycle,
@@ -1050,8 +1071,20 @@ impl QuicServerHandle {
 				format!("QUIC server task failed during shutdown: {err}"),
 			)),
 		};
-		self.endpoint.close(0u32.into(), b"shutdown");
-		self.endpoint.wait_idle().await;
+		// ADR 0722: the server task has ended (normally, after its own quiescence
+		// wait, or with an error that `result` carries). The endpoint's
+		// connections get a bounded grace to close and drain; an
+		// unreachable peer must not hold this node's close. Running out of grace
+		// changes nothing about `result`: an earlier failure is still returned,
+		// and success is still only the server task's.
+		if !close_quic_endpoint_within(&self.endpoint, QUIC_ENDPOINT_CLOSE_GRACE).await {
+			tracing::warn!(
+				grace_ms = QUIC_ENDPOINT_CLOSE_GRACE.as_millis() as u64,
+				open_connections = self.endpoint.open_connections(),
+				"QUIC endpoint connections were still closing after the shutdown grace; \
+				 continuing with the close"
+			);
+		}
 		result
 	}
 }
@@ -4048,6 +4081,79 @@ impl TransportProvider for NoDialTransportProvider {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	/// A client configuration a connection attempt accepts: no trust roots, since
+	/// no handshake is ever completed with it. Built through the TLS choke point,
+	/// like every QUIC configuration (ADR 0093).
+	fn valid_quic_client_config() -> quinn::ClientConfig {
+		let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+			rustls::crypto::ring::default_provider(),
+		))
+		.with_protocol_versions(&[&rustls::version::TLS13])
+		.unwrap()
+		.with_root_certificates(rustls::RootCertStore::empty())
+		.with_no_client_auth();
+		crate::network::tls::quic_client_config_from_rustls(tls).unwrap()
+	}
+
+	/// ADR 0722: the grace on the endpoint's close changes nothing about what the
+	/// server task returned. An earlier failure is still the handle's answer, and
+	/// success is only ever the server task's own.
+	#[tokio::test]
+	async fn a_quic_server_handles_close_returns_what_its_server_task_returned() {
+		// Control: on an open endpoint the same attempt is accepted, so the refusal
+		// asserted below is the closed endpoint's.
+		let open = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+		assert!(
+			open.connect_with(
+				valid_quic_client_config(),
+				"127.0.0.1:9".parse().unwrap(),
+				"node-1.cluster.local",
+			)
+			.is_ok()
+		);
+		drop(open);
+		for failed in [true, false] {
+			let endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+			let handle = QuicServerHandle {
+				endpoint: endpoint.clone(),
+				lifecycle: ServerLifecycle::new(),
+				task: tokio::spawn(async move {
+					if failed {
+						Err(Error::other("the accept loop failed earlier"))
+					} else {
+						Ok(())
+					}
+				}),
+			};
+			let closed = tokio::time::timeout(
+				QUIC_ENDPOINT_CLOSE_GRACE + Duration::from_secs(1),
+				handle.shutdown(),
+			)
+			.await
+			.expect("the close is bounded");
+			match closed {
+				Err(error) => {
+					assert!(failed, "{error}");
+					assert!(error.to_string().contains("the accept loop failed earlier"));
+				}
+				Ok(()) => assert!(!failed),
+			}
+			// The endpoint was closed: a connection attempt with a valid client
+			// configuration is refused as the endpoint stopping. (Without a client
+			// configuration the attempt would be refused for that reason first,
+			// on an open endpoint too, and show nothing.)
+			assert!(matches!(
+				endpoint.connect_with(
+					valid_quic_client_config(),
+					"127.0.0.1:9".parse().unwrap(),
+					"node-1.cluster.local",
+				),
+				Err(quinn::ConnectError::EndpointStopping)
+			));
+		}
+	}
+
 	use crate::consensus::TieredSlab;
 	use crate::consensus::WendelonRequest;
 	use crate::consensus::monitor::{
