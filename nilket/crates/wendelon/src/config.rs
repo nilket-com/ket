@@ -10,6 +10,7 @@ use crate::crypto::{
 use crate::metrics::telemetry::{
 	TRACE_SAMPLING_RATE_DENOMINATOR, TraceExportConfig, TraceExportProtocol,
 };
+use crate::network::data_server::QueryStallBound;
 use crate::network::{
 	ServerAdmissionConfig, audit_root_verifying_key_bytes, lease_verifying_key_bytes,
 	transfer_verifying_key_bytes,
@@ -784,6 +785,8 @@ struct RawTuningConfig {
 	#[serde(default)]
 	data_ring_lease_ttl_millis: Option<u64>,
 	#[serde(default)]
+	query_stall_bound_millis: Option<u64>,
+	#[serde(default)]
 	max_inbound_connections: Option<usize>,
 	#[serde(default)]
 	max_inbound_connections_per_ip: Option<usize>,
@@ -802,6 +805,7 @@ impl Default for RawTuningConfig {
 			storage_shutdown_timeout_seconds: None,
 			cdc_locality_heartbeat_interval_millis: None,
 			data_ring_lease_ttl_millis: None,
+			query_stall_bound_millis: None,
 			max_inbound_connections: None,
 			max_inbound_connections_per_ip: None,
 			max_inbound_streams_per_connection: None,
@@ -1121,6 +1125,18 @@ impl RawConfig {
 				"tuning.data_ring_lease_ttl_millis must be between 3 and 4294967295",
 			));
 		}
+		let query_stall_bound = match self.tuning.query_stall_bound_millis {
+			None => QueryStallBound::DEFAULT,
+			Some(millis) => QueryStallBound::from_millis(millis).map_err(|_| {
+				Error::new(
+					ErrorKind::InvalidInput,
+					format!(
+						"tuning.query_stall_bound_millis must be between 1 and {}",
+						QueryStallBound::MAX_MILLIS
+					),
+				)
+			})?,
+		};
 		let transport_admission = ServerAdmissionConfig {
 			max_inbound_connections: self
 				.tuning
@@ -1271,6 +1287,7 @@ impl RawConfig {
 				cdc_locality_heartbeat_interval_millis,
 			),
 			data_ring_lease_ttl: Duration::from_millis(data_ring_lease_ttl_millis),
+			query_stall_bound,
 			advertise_address,
 			lease_signing_secret,
 			allow_dev_keys: self.identity.allow_dev_keys,

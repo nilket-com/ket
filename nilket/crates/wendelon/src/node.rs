@@ -75,7 +75,8 @@ use crate::network::core::{HRFT_MAGIC, read_frame, write_frame};
 use crate::network::data_server::{
 	DEFAULT_SECONDARY_INDEX_ACTIVE_BUFFER_BYTES, DEFAULT_TENANT_CACHE_REFRESH_INTERVAL,
 	DROP_RECLAIM_SWEEP_INTERVAL, MIGRATION_SWEEP_FAILURE_BACKOFF, MIGRATION_SWEEP_INTERVAL,
-	MIGRATION_SWEEP_MAX_PER_PASS, PENDING_FINALIZATION_RETRY_INTERVAL, WendelonDataServer,
+	MIGRATION_SWEEP_MAX_PER_PASS, PENDING_FINALIZATION_RETRY_INTERVAL, QueryStallBound,
+	WendelonDataServer,
 };
 use crate::network::factory::TransportProviderFactory;
 use crate::network::lease_signing::{
@@ -216,6 +217,9 @@ pub struct NodeBootstrapConfig {
 	#[cfg(feature = "test-support")]
 	pub join_promotion_gate:
 		Option<crate::network::control_server::join_test_support::JoinPromotionGate>,
+	/// The no-progress bound of every query this node executes: how long one unit of
+	/// a query's work may run before the query is refused as stalled.
+	pub query_stall_bound: QueryStallBound,
 	/// ADR 079 cadence for unconditional CDC locality progress markers.
 	pub cdc_locality_heartbeat_interval: Duration,
 	/// ADR 080 HLC fencing window for Data Ring range leases. The
@@ -361,6 +365,7 @@ impl NodeBootstrapConfig {
 			slab_file_ops: None,
 			#[cfg(feature = "test-support")]
 			join_promotion_gate: None,
+			query_stall_bound: QueryStallBound::DEFAULT,
 			cdc_locality_heartbeat_interval: Duration::from_millis(
 				DEFAULT_CDC_LOCALITY_HEARTBEAT_INTERVAL_MILLIS,
 			),
@@ -2299,6 +2304,7 @@ impl WendelonNode {
 			.with_audit_sink(audit_sink.clone())
 			.with_lease_authority(lease_authority.clone())
 			.with_mvcc_retention_policy(cfg.mvcc_retention_policy)
+			.with_query_stall_bound(cfg.query_stall_bound)
 			.with_counter_retention(cfg.counter_retention)?
 			.with_tracker(tracker.clone())
 			.with_lease_gate(true)

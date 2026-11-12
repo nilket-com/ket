@@ -228,6 +228,7 @@ use write_replication::{
 };
 mod descriptor_migration;
 mod query_clocks;
+pub use query_clocks::QueryStallBound;
 use query_clocks::{
 	QueryClocks, caller_deadline_from_budget_millis, caller_deadline_from_remaining_millis,
 };
@@ -734,6 +735,8 @@ pub struct WendelonDataServer {
 	audit_sink: Arc<dyn AuditSink>,
 	/// ADR 013 retention policy for MVCC history.
 	mvcc_retention_policy: MvccRetentionPolicy,
+	/// The no-progress bound of every query this node executes.
+	query_stall_bound: QueryStallBound,
 	/// Resolves a routing locality to the replica set that should hold
 	/// it. Injected so the projection source (Unified Hash Ring
 	/// snapshot, static dev topology, test mock) is the caller's
@@ -1211,6 +1214,7 @@ impl Clone for WendelonDataServer {
 			clock: self.clock.clone(),
 			audit_sink: self.audit_sink.clone(),
 			mvcc_retention_policy: self.mvcc_retention_policy,
+			query_stall_bound: self.query_stall_bound,
 			router: self.router.clone(),
 			factory: self.factory.clone(),
 			pool: self.pool.clone(),
@@ -2262,6 +2266,7 @@ impl WendelonDataServer {
 			clock,
 			audit_sink: Arc::new(NoopAuditSink),
 			mvcc_retention_policy: MvccRetentionPolicy::Disabled,
+			query_stall_bound: QueryStallBound::DEFAULT,
 			router,
 			factory,
 			pool,
@@ -2399,6 +2404,11 @@ impl WendelonDataServer {
 
 	pub fn with_mvcc_retention_policy(mut self, retention_policy: MvccRetentionPolicy) -> Self {
 		self.mvcc_retention_policy = retention_policy;
+		self
+	}
+
+	pub fn with_query_stall_bound(mut self, stall_bound: QueryStallBound) -> Self {
+		self.query_stall_bound = stall_bound;
 		self
 	}
 
@@ -5770,7 +5780,7 @@ impl WendelonDataServer {
 			self.local_node,
 			meta,
 			bytecode,
-			QueryExecutionBudget::default(),
+			QueryExecutionBudget::server_default(self.query_stall_bound),
 			self.mvcc_retention_floor_hlc(),
 		)
 		.await
@@ -6056,7 +6066,7 @@ impl WendelonDataServer {
 					&range_meta,
 					&program,
 					&ranges,
-					table_query_execution_budget(meta),
+					table_query_execution_budget(meta, self.query_stall_bound),
 					row_limit,
 					&descriptor,
 					&projected_execution,
@@ -6107,7 +6117,7 @@ impl WendelonDataServer {
 			&range_meta,
 			&program,
 			&ranges,
-			table_query_execution_budget(meta),
+			table_query_execution_budget(meta, self.query_stall_bound),
 			row_limit,
 			Some(&descriptor),
 			projected_execution,
@@ -6243,7 +6253,7 @@ impl WendelonDataServer {
 			&prepared.range_meta,
 			&prepared.program,
 			&prepared.ranges,
-			aggregate_query_budget(&request.budgets),
+			aggregate_query_budget(&request.budgets, self.query_stall_bound),
 			None,
 			Some(&prepared.descriptor),
 			projected_execution,
@@ -11501,12 +11511,16 @@ struct QueryExecutionBudget {
 	caller_deadline: Option<Instant>,
 }
 
-impl Default for QueryExecutionBudget {
-	fn default() -> Self {
+impl QueryExecutionBudget {
+	/// The budget of a query that sent none of its own, on a node with this stall
+	/// bound. There is deliberately no `Default`: the bound is the executing node's
+	/// setting, and a constructor that could omit it would let an entry path keep a
+	/// number of its own.
+	fn server_default(stall_bound: QueryStallBound) -> Self {
 		Self {
 			max_locations: 4_096,
 			max_rows: 65_536,
-			max_wall_time: Duration::from_millis(250),
+			max_wall_time: stall_bound.get(),
 			stats_pruning_enabled: true,
 			caller_totals: false,
 			caller_deadline: None,
@@ -11518,11 +11532,14 @@ impl Default for QueryExecutionBudget {
 /// plus the caller's deadline derived locally from the remaining duration on the
 /// wire (zero = absent). Deriving a monotonic instant HERE is what keeps cross-host
 /// wall clocks out of the protocol.
-fn table_query_execution_budget(meta: &TableQueryRequestMeta) -> QueryExecutionBudget {
+fn table_query_execution_budget(
+	meta: &TableQueryRequestMeta,
+	stall_bound: QueryStallBound,
+) -> QueryExecutionBudget {
 	let caller_deadline = caller_deadline_from_remaining_millis(meta.deadline_remaining_millis);
 	QueryExecutionBudget {
 		caller_deadline,
-		..QueryExecutionBudget::default()
+		..QueryExecutionBudget::server_default(stall_bound)
 	}
 }
 
@@ -14043,7 +14060,9 @@ pub(crate) async fn execute_query_plan(
 		local_node,
 		meta,
 		bytecode,
-		QueryExecutionBudget::default(),
+		// No production caller: this helper drives the plan in tests, on the default
+		// bound. A server's queries take its own setting.
+		QueryExecutionBudget::server_default(QueryStallBound::DEFAULT),
 		None,
 	)
 	.await
@@ -14094,7 +14113,9 @@ fn query_plan_error(
 		response: query_error_meta(meta, status, local_node),
 		batches: Vec::new(),
 		aggregate_responses: Vec::new(),
-		clocks: QueryClocks::new(Duration::from_millis(250), None),
+		// A refusal is terminal: nothing executes under this clock, so it carries the
+		// default bound, not the node's setting.
+		clocks: QueryClocks::new(QueryStallBound::DEFAULT.get(), None),
 		stats_explain: QueryStatsExplainCounters::default(),
 		scan_decode_audit: ScanDecodeAudit::default(),
 		secondary_index_access_plan: None,
@@ -14850,8 +14871,10 @@ fn aggregate_csb_column_entry<'a>(
 	Ok(Some(entry))
 }
 
-fn aggregate_query_budget(budgets: &AggregateBudgets) -> QueryExecutionBudget {
-	let default = QueryExecutionBudget::default();
+fn aggregate_query_budget(
+	budgets: &AggregateBudgets,
+	stall_bound: QueryStallBound,
+) -> QueryExecutionBudget {
 	// Aggregate budgets are caller-transmitted, so their totals genuinely cap the
 	// query (ADR 541: only a caller budget may impose a total cap), and the caller's
 	// wall budget is an absolute deadline — not a clamp on the stall bound.
@@ -14861,7 +14884,7 @@ fn aggregate_query_budget(budgets: &AggregateBudgets) -> QueryExecutionBudget {
 	QueryExecutionBudget {
 		max_locations,
 		max_rows,
-		max_wall_time: default.max_wall_time,
+		max_wall_time: stall_bound.get(),
 		stats_pruning_enabled: true,
 		caller_totals: true,
 		caller_deadline,

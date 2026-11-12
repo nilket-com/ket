@@ -9,6 +9,52 @@ use std::time::{Duration, Instant};
 use super::QueryExecutionBudget;
 use crate::schema::ReadStatus;
 
+/// A node's query no-progress bound: how long one unit of a query's work (a location's
+/// whole read, a batch, an encode quantum) may run before the query is refused as
+/// stalled. It is a deployment setting of the node that executes the query; a caller
+/// cannot raise it, and a caller's nearer deadline still wins.
+///
+/// The supported range is administrative: zero is refused because it is not "off", and
+/// the upper limit keeps the value a bound a stuck operation actually reaches. Neither
+/// end is a derived safety threshold or a store latency promise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueryStallBound(Duration);
+
+impl QueryStallBound {
+	pub const DEFAULT_MILLIS: u64 = 250;
+	pub const MAX_MILLIS: u64 = 600_000;
+	pub const DEFAULT: Self = Self(Duration::from_millis(Self::DEFAULT_MILLIS));
+
+	pub fn from_millis(millis: u64) -> std::io::Result<Self> {
+		if millis == 0 {
+			return Err(std::io::Error::new(
+				std::io::ErrorKind::InvalidInput,
+				"the query stall bound must be greater than zero",
+			));
+		}
+		if millis > Self::MAX_MILLIS {
+			return Err(std::io::Error::new(
+				std::io::ErrorKind::InvalidInput,
+				format!(
+					"the query stall bound must be at most {} milliseconds",
+					Self::MAX_MILLIS
+				),
+			));
+		}
+		Ok(Self(Duration::from_millis(millis)))
+	}
+
+	pub fn get(self) -> Duration {
+		self.0
+	}
+}
+
+impl Default for QueryStallBound {
+	fn default() -> Self {
+		Self::DEFAULT
+	}
+}
+
 /// ADR 541's two clocks, enforced concurrently with distinct expiry statuses.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct QueryClocks {

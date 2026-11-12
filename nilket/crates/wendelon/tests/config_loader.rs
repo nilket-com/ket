@@ -2238,3 +2238,94 @@ fn example_signing_keys_are_fresh_independent_and_dev_keys_stay_disabled() {
 		);
 	}
 }
+
+fn stall_bound_config(tag: &str, line: &str) -> (test_dir::TestDir, PathBuf) {
+	let root = fresh_dir(tag);
+	std::fs::create_dir_all(root.join("data")).unwrap();
+	let rendered = render_example_config();
+	assert!(rendered.contains("query_stall_bound_millis = 250\n"));
+	let body = rendered.replace("query_stall_bound_millis = 250\n", line);
+	let config_path = write_config(&root, &body);
+	(root, config_path)
+}
+
+#[test]
+fn the_query_stall_bound_defaults_to_250_ms_and_loads_within_its_range() {
+	for (tag, line, expected) in [
+		(
+			"stall-bound-example",
+			"query_stall_bound_millis = 250\n",
+			250,
+		),
+		("stall-bound-absent", "", 250),
+		("stall-bound-least", "query_stall_bound_millis = 1\n", 1),
+		(
+			"stall-bound-most",
+			"query_stall_bound_millis = 600000\n",
+			600_000,
+		),
+		(
+			"stall-bound-chosen",
+			"query_stall_bound_millis = 1500\n",
+			1_500,
+		),
+	] {
+		let (_root, config_path) = stall_bound_config(tag, line);
+		let cfg = load_node_bootstrap_config(&config_path).unwrap();
+		assert_eq!(
+			cfg.query_stall_bound.get(),
+			std::time::Duration::from_millis(expected),
+			"{tag}"
+		);
+	}
+}
+
+#[test]
+fn a_query_stall_bound_outside_its_range_is_refused_by_name() {
+	for (tag, value) in [("stall-bound-zero", 0u64), ("stall-bound-over", 600_001)] {
+		let (_root, config_path) =
+			stall_bound_config(tag, &format!("query_stall_bound_millis = {value}\n"));
+		let err = load_node_bootstrap_config(&config_path).unwrap_err();
+		assert_eq!(err.kind(), ErrorKind::InvalidInput, "{tag}");
+		assert!(
+			err.to_string()
+				.contains("tuning.query_stall_bound_millis must be between 1 and 600000"),
+			"unexpected error for {tag}: {err}"
+		);
+	}
+}
+
+#[test]
+fn a_mistyped_or_non_integer_query_stall_bound_fails_by_position_only() {
+	for (tag, line) in [
+		("stall-bound-typo", "query_stall_bound_milis = 400\n"),
+		(
+			"stall-bound-text",
+			"query_stall_bound_millis = \"sentinel-9c1f\"\n",
+		),
+		(
+			"stall-bound-negative",
+			"query_stall_bound_millis = -48151623\n",
+		),
+	] {
+		let (_root, config_path) = stall_bound_config(tag, line);
+		let body = std::fs::read_to_string(&config_path).unwrap();
+		let at = body
+			.lines()
+			.position(|candidate| candidate == line.trim_end())
+			.unwrap() + 1;
+		let err = load_node_bootstrap_config(&config_path).unwrap_err();
+		let message = err.to_string();
+		assert_eq!(err.kind(), ErrorKind::InvalidData, "{tag}");
+		assert!(
+			message.contains(&format!("at line {at}, column ")),
+			"unexpected error for {tag}: {err}"
+		);
+		for withheld in ["milis", "sentinel-9c1f", "48151623"] {
+			assert!(
+				!message.contains(withheld),
+				"{tag} echoed {withheld}: {err}"
+			);
+		}
+	}
+}

@@ -2414,7 +2414,7 @@ async fn query_as_of_older_than_retention_window_returns_retention_expired() {
 		n(1),
 		&meta,
 		&[],
-		QueryExecutionBudget::default(),
+		QueryExecutionBudget::server_default(QueryStallBound::DEFAULT),
 		Some(hlc(80, 0, 1)),
 	)
 	.await
@@ -2440,7 +2440,7 @@ async fn latest_query_filters_locations_below_logical_retention_floor() {
 			start: Locality::ZERO,
 			end: Locality::MAX,
 		}],
-		QueryExecutionBudget::default(),
+		QueryExecutionBudget::server_default(QueryStallBound::DEFAULT),
 		None,
 		None,
 		QueryProjectedExecution::Disabled,
@@ -2471,7 +2471,7 @@ async fn table_query_row_limit_bounds_successful_output() {
 			start: Locality::ZERO,
 			end: Locality::MAX,
 		}],
-		QueryExecutionBudget::default(),
+		QueryExecutionBudget::server_default(QueryStallBound::DEFAULT),
 		Some(2),
 		None,
 		QueryProjectedExecution::Disabled,
@@ -2517,7 +2517,7 @@ async fn table_query_resp_streams_with_terminal_metadata() {
 			start: Locality::ZERO,
 			end: Locality::MAX,
 		}],
-		QueryExecutionBudget::default(),
+		QueryExecutionBudget::server_default(QueryStallBound::DEFAULT),
 		None,
 		None,
 		QueryProjectedExecution::Disabled,
@@ -2821,7 +2821,7 @@ async fn cancelled_consumer_stops_before_all_row_groups_scanned() {
 		&meta,
 		&program,
 		&ranges,
-		QueryExecutionBudget::default(),
+		QueryExecutionBudget::server_default(QueryStallBound::DEFAULT),
 		None,
 		Some(&descriptor),
 		QueryProjectedExecution::Pbc {
@@ -2864,7 +2864,7 @@ async fn cancelled_consumer_stops_before_all_row_groups_scanned() {
 		&meta,
 		&program,
 		&ranges,
-		QueryExecutionBudget::default(),
+		QueryExecutionBudget::server_default(QueryStallBound::DEFAULT),
 		None,
 		Some(&descriptor),
 		QueryProjectedExecution::Pbc {
@@ -2912,7 +2912,7 @@ async fn whole_record_cancelled_consumer_stops_before_all_locations_scanned() {
 		&meta,
 		&program,
 		&ranges,
-		QueryExecutionBudget::default(),
+		QueryExecutionBudget::server_default(QueryStallBound::DEFAULT),
 		None,
 		Some(&descriptor),
 		QueryProjectedExecution::Disabled,
@@ -2947,7 +2947,7 @@ async fn whole_record_cancelled_consumer_stops_before_all_locations_scanned() {
 		&meta,
 		&program,
 		&ranges,
-		QueryExecutionBudget::default(),
+		QueryExecutionBudget::server_default(QueryStallBound::DEFAULT),
 		None,
 		Some(&descriptor),
 		QueryProjectedExecution::Disabled,
@@ -2975,7 +2975,7 @@ async fn collect_select_star_limit_3_stops_whole_record_scan_before_full_scan() 
 		&meta,
 		&program,
 		&ranges,
-		QueryExecutionBudget::default(),
+		QueryExecutionBudget::server_default(QueryStallBound::DEFAULT),
 		None,
 		Some(&descriptor),
 		QueryProjectedExecution::Disabled,
@@ -3000,7 +3000,7 @@ async fn collect_select_star_limit_3_stops_whole_record_scan_before_full_scan() 
 		&meta,
 		&program,
 		&ranges,
-		QueryExecutionBudget::default(),
+		QueryExecutionBudget::server_default(QueryStallBound::DEFAULT),
 		Some(3),
 		Some(&descriptor),
 		QueryProjectedExecution::Disabled,
@@ -3050,7 +3050,7 @@ async fn stream_select_star_consume_one_batch_then_drop_stops_whole_record_scan(
 		&meta,
 		&program,
 		&ranges,
-		QueryExecutionBudget::default(),
+		QueryExecutionBudget::server_default(QueryStallBound::DEFAULT),
 		None,
 		Some(&descriptor),
 		QueryProjectedExecution::Disabled,
@@ -3085,7 +3085,7 @@ async fn stream_select_star_consume_one_batch_then_drop_stops_whole_record_scan(
 		&meta,
 		&program,
 		&ranges,
-		QueryExecutionBudget::default(),
+		QueryExecutionBudget::server_default(QueryStallBound::DEFAULT),
 		None,
 		Some(&descriptor),
 		QueryProjectedExecution::Disabled,
@@ -3114,7 +3114,7 @@ async fn whole_record_emitted_batch_matches_descriptor_schema() {
 		&meta,
 		&program,
 		&ranges,
-		QueryExecutionBudget::default(),
+		QueryExecutionBudget::server_default(QueryStallBound::DEFAULT),
 		Some(3),
 		Some(&descriptor),
 		QueryProjectedExecution::Disabled,
@@ -3146,7 +3146,7 @@ async fn whole_record_descriptorless_path_remains_behavior_compatible() {
 			start: Locality::ZERO,
 			end: Locality::MAX,
 		}],
-		QueryExecutionBudget::default(),
+		QueryExecutionBudget::server_default(QueryStallBound::DEFAULT),
 		None,
 		None,
 		QueryProjectedExecution::Disabled,
@@ -3196,7 +3196,7 @@ async fn bare_limit_three_bounds_remote_scan_without_row_limit_pushdown() {
 		&meta,
 		&program,
 		&ranges,
-		QueryExecutionBudget::default(),
+		QueryExecutionBudget::server_default(QueryStallBound::DEFAULT),
 		None, // row_limit pushdown disabled
 		Some(&descriptor),
 		QueryProjectedExecution::Pbc {
@@ -3239,7 +3239,7 @@ async fn bare_limit_three_bounds_remote_scan_without_row_limit_pushdown() {
 		&meta,
 		&program,
 		&ranges,
-		QueryExecutionBudget::default(),
+		QueryExecutionBudget::server_default(QueryStallBound::DEFAULT),
 		None, // still no row_limit pushdown
 		Some(&descriptor),
 		QueryProjectedExecution::Pbc {
@@ -3288,7 +3288,7 @@ async fn terminal_metadata_totals_match_legacy_materialized_response() {
 		&meta,
 		&program,
 		&ranges,
-		QueryExecutionBudget::default(),
+		QueryExecutionBudget::server_default(QueryStallBound::DEFAULT),
 		None,
 		None,
 		QueryProjectedExecution::Disabled,
@@ -3312,7 +3312,7 @@ async fn terminal_metadata_totals_match_legacy_materialized_response() {
 		&meta,
 		&program,
 		&ranges,
-		QueryExecutionBudget::default(),
+		QueryExecutionBudget::server_default(QueryStallBound::DEFAULT),
 		None,
 		None,
 		QueryProjectedExecution::Disabled,
@@ -4395,7 +4395,7 @@ async fn table_query_skips_tiered_slab_when_column_stats_cannot_match() {
 		&meta,
 		&program,
 		&ranges,
-		QueryExecutionBudget::default(),
+		QueryExecutionBudget::server_default(QueryStallBound::DEFAULT),
 		None,
 		Some(&descriptor),
 		QueryProjectedExecution::Disabled,
@@ -4450,7 +4450,7 @@ async fn table_query_skips_tiered_slab_when_column_stats_cannot_match() {
 		&meta,
 		&program,
 		&ranges,
-		QueryExecutionBudget::default(),
+		QueryExecutionBudget::server_default(QueryStallBound::DEFAULT),
 		None,
 		Some(&descriptor),
 		QueryProjectedExecution::Disabled,
@@ -4511,7 +4511,7 @@ async fn query_request_flag_disables_table_stats_pruning() {
 			start: Locality::ZERO,
 			end: Locality::MAX,
 		}],
-		QueryExecutionBudget::default(),
+		QueryExecutionBudget::server_default(QueryStallBound::DEFAULT),
 		None,
 		Some(&descriptor),
 		QueryProjectedExecution::Disabled,
@@ -4577,7 +4577,7 @@ async fn table_stats_admit_slab_then_pbc_filters_rows() {
 			start: Locality::ZERO,
 			end: Locality::MAX,
 		}],
-		QueryExecutionBudget::default(),
+		QueryExecutionBudget::server_default(QueryStallBound::DEFAULT),
 		None,
 		Some(&descriptor),
 		QueryProjectedExecution::Pbc {
@@ -4946,7 +4946,7 @@ async fn append_only_row_tombstones_are_hidden_from_full_and_projected_queries()
 			start: Locality::ZERO,
 			end: Locality::MAX,
 		}],
-		QueryExecutionBudget::default(),
+		QueryExecutionBudget::server_default(QueryStallBound::DEFAULT),
 		None,
 		Some(&descriptor),
 		QueryProjectedExecution::Disabled,
@@ -4972,7 +4972,7 @@ async fn append_only_row_tombstones_are_hidden_from_full_and_projected_queries()
 			start: Locality::ZERO,
 			end: Locality::MAX,
 		}],
-		QueryExecutionBudget::default(),
+		QueryExecutionBudget::server_default(QueryStallBound::DEFAULT),
 		None,
 		Some(&descriptor),
 		QueryProjectedExecution::Disabled,
@@ -5010,7 +5010,7 @@ async fn append_only_row_tombstones_are_hidden_from_full_and_projected_queries()
 			start: Locality::ZERO,
 			end: Locality::MAX,
 		}],
-		QueryExecutionBudget::default(),
+		QueryExecutionBudget::server_default(QueryStallBound::DEFAULT),
 		None,
 		Some(&descriptor),
 		QueryProjectedExecution::Pbc {
@@ -5102,7 +5102,7 @@ async fn append_only_row_tombstones_are_hidden_from_projected_aggregate_inputs()
 		&prepared.range_meta,
 		&prepared.program,
 		&prepared.ranges,
-		aggregate_query_budget(&request.budgets),
+		aggregate_query_budget(&request.budgets, QueryStallBound::DEFAULT),
 		None,
 		Some(&descriptor),
 		projected_execution,
@@ -5154,7 +5154,7 @@ async fn table_stats_absence_falls_through_to_full_scan() {
 			start: Locality::ZERO,
 			end: Locality::MAX,
 		}],
-		QueryExecutionBudget::default(),
+		QueryExecutionBudget::server_default(QueryStallBound::DEFAULT),
 		None,
 		Some(&descriptor),
 		QueryProjectedExecution::Disabled,
@@ -5216,7 +5216,7 @@ async fn unsupported_stats_predicate_falls_through_to_full_scan() {
 			start: Locality::ZERO,
 			end: Locality::MAX,
 		}],
-		QueryExecutionBudget::default(),
+		QueryExecutionBudget::server_default(QueryStallBound::DEFAULT),
 		None,
 		Some(&descriptor),
 		QueryProjectedExecution::Disabled,
@@ -14912,7 +14912,7 @@ async fn full_scan_completes_far_beyond_the_former_lifetime_cap() {
 		.await;
 	}
 	let sm = WendelonStateMachine::new();
-	let defaults = QueryExecutionBudget::default();
+	let defaults = QueryExecutionBudget::server_default(QueryStallBound::DEFAULT);
 	assert!(
 		25_000 > defaults.max_locations,
 		"premise: the scan exceeds the default location cap"
@@ -14968,7 +14968,7 @@ async fn full_scan_completes_far_beyond_the_former_lifetime_cap() {
 #[test]
 fn the_default_query_stall_bound_is_250_ms() {
 	assert_eq!(
-		QueryExecutionBudget::default().max_wall_time,
+		QueryExecutionBudget::server_default(QueryStallBound::DEFAULT).max_wall_time,
 		Duration::from_millis(250)
 	);
 }
@@ -14992,7 +14992,7 @@ async fn caller_deadline_is_absolute_and_attributable() {
 	let sm = WendelonStateMachine::new();
 	let expired = QueryExecutionBudget {
 		caller_deadline: Some(Instant::now() - Duration::from_millis(1)),
-		..QueryExecutionBudget::default()
+		..QueryExecutionBudget::server_default(QueryStallBound::DEFAULT)
 	};
 	let (resp, arrow) = execute_query_plan_with_budget_and_retention_floor(
 		&mgr,
@@ -15010,7 +15010,7 @@ async fn caller_deadline_is_absolute_and_attributable() {
 
 	let generous = QueryExecutionBudget {
 		caller_deadline: Some(Instant::now() + Duration::from_secs(3600)),
-		..QueryExecutionBudget::default()
+		..QueryExecutionBudget::server_default(QueryStallBound::DEFAULT)
 	};
 	let (resp, _arrow) = execute_query_plan_with_budget_and_retention_floor(
 		&mgr,
@@ -15095,7 +15095,7 @@ async fn no_match_full_scan_progresses_per_examined_location() {
 		// would end the scan before it examined them all.
 		QueryExecutionBudget {
 			max_wall_time: Duration::from_secs(3600),
-			..QueryExecutionBudget::default()
+			..QueryExecutionBudget::server_default(QueryStallBound::DEFAULT)
 		},
 		None,
 	)
@@ -15132,7 +15132,7 @@ async fn work_caps_bind_totals_only_for_caller_budgets() {
 		max_locations: 4,
 		max_rows: 8,
 		caller_totals: false,
-		..QueryExecutionBudget::default()
+		..QueryExecutionBudget::server_default(QueryStallBound::DEFAULT)
 	};
 	let (resp, _arrow) = execute_query_plan_with_budget_and_retention_floor(
 		&mgr,
@@ -15153,7 +15153,7 @@ async fn work_caps_bind_totals_only_for_caller_budgets() {
 		max_locations: 4,
 		max_rows: 8,
 		caller_totals: true,
-		..QueryExecutionBudget::default()
+		..QueryExecutionBudget::server_default(QueryStallBound::DEFAULT)
 	};
 	let (resp, arrow) = execute_query_plan_with_budget_and_retention_floor(
 		&mgr,
@@ -15288,7 +15288,7 @@ async fn stats_pruned_full_scan_progresses_per_examined_location() {
 		&meta,
 		&program,
 		&ranges,
-		QueryExecutionBudget::default(),
+		QueryExecutionBudget::server_default(QueryStallBound::DEFAULT),
 		None,
 		Some(&descriptor),
 		QueryProjectedExecution::Disabled,
@@ -15352,7 +15352,7 @@ fn zero_aggregate_wall_budget_expires_rather_than_uncaps() {
 		..AggregateBudgets::default()
 	};
 
-	let budget = aggregate_query_budget(&budgets);
+	let budget = aggregate_query_budget(&budgets, QueryStallBound::DEFAULT);
 
 	let deadline = budget
 		.caller_deadline
@@ -15366,7 +15366,7 @@ fn zero_aggregate_wall_budget_expires_rather_than_uncaps() {
 	assert!(deadline <= Instant::now());
 
 	// The unlimited sentinel still means unlimited.
-	let unlimited = aggregate_query_budget(&AggregateBudgets::default());
+	let unlimited = aggregate_query_budget(&AggregateBudgets::default(), QueryStallBound::DEFAULT);
 	assert_eq!(unlimited.caller_deadline, None);
 }
 
@@ -15837,7 +15837,7 @@ async fn adr0579_row_limit_bounds_producer_work_to_exactly_the_limit() {
 		&meta,
 		&program,
 		&ranges,
-		QueryExecutionBudget::default(),
+		QueryExecutionBudget::server_default(QueryStallBound::DEFAULT),
 		None,
 		Some(&descriptor),
 		QueryProjectedExecution::Disabled,
@@ -15870,7 +15870,7 @@ async fn adr0579_row_limit_bounds_producer_work_to_exactly_the_limit() {
 		&meta,
 		&program,
 		&ranges,
-		QueryExecutionBudget::default(),
+		QueryExecutionBudget::server_default(QueryStallBound::DEFAULT),
 		Some(LIMIT),
 		Some(&descriptor),
 		QueryProjectedExecution::Disabled,
@@ -16457,7 +16457,7 @@ mod adr0090_mixed_scan {
 			&meta,
 			&program,
 			&ranges,
-			QueryExecutionBudget::default(),
+			QueryExecutionBudget::server_default(QueryStallBound::DEFAULT),
 			None,
 			Some(&descriptor),
 			QueryProjectedExecution::Disabled,
@@ -16875,7 +16875,7 @@ mod adr0090_membership_transition {
 			&meta,
 			&program,
 			&ranges,
-			QueryExecutionBudget::default(),
+			QueryExecutionBudget::server_default(QueryStallBound::DEFAULT),
 			None,
 			Some(&descriptor),
 			QueryProjectedExecution::Disabled,
@@ -16932,7 +16932,7 @@ async fn adr0090_probe_delete_of_one_table_then_scan_of_another() {
 		&meta,
 		&program,
 		&ranges,
-		QueryExecutionBudget::default(),
+		QueryExecutionBudget::server_default(QueryStallBound::DEFAULT),
 		None,
 		Some(&new_table),
 		QueryProjectedExecution::Disabled,
@@ -17427,7 +17427,7 @@ mod adr0089_scan_coalescing {
 			&meta,
 			&program,
 			&ranges,
-			QueryExecutionBudget::default(),
+			QueryExecutionBudget::server_default(QueryStallBound::DEFAULT),
 			row_limit,
 			Some(&descriptor),
 			QueryProjectedExecution::Disabled,
@@ -21748,5 +21748,416 @@ mod checked_placement {
 		assert_eq!(written.write.status, WriteStatus::OK, "{written:?}");
 		assert_eq!(row_on_each_store(&fixture, 7), (Some(true), Some(true)));
 		fixture.shutdown().await;
+	}
+}
+
+mod query_stall_bound {
+	use super::*;
+	use std::sync::atomic::{AtomicU64, Ordering};
+
+	const NEVER: u64 = u64::MAX;
+
+	/// A store that delays each read request by a switchable amount (or never answers)
+	/// and records, in tokio time, when each began and whether it returned.
+	struct DelayingStore {
+		inner: MockObjectStore,
+		delay_millis: AtomicU64,
+		origin: tokio::time::Instant,
+		log: std::sync::Mutex<Vec<(&'static str, u128, Option<u128>)>>,
+	}
+
+	impl DelayingStore {
+		async fn request<T>(
+			&self,
+			op: &'static str,
+			answer: impl std::future::Future<Output = std::io::Result<T>>,
+		) -> std::io::Result<T> {
+			let slot = {
+				let mut log = self.log.lock().unwrap();
+				log.push((op, self.origin.elapsed().as_millis(), None));
+				log.len() - 1
+			};
+			match self.delay_millis.load(Ordering::SeqCst) {
+				0 => {}
+				NEVER => std::future::pending::<()>().await,
+				delay => tokio::time::sleep(Duration::from_millis(delay)).await,
+			}
+			let answered = answer.await;
+			self.log.lock().unwrap()[slot].2 = Some(self.origin.elapsed().as_millis());
+			answered
+		}
+
+		fn take_log(&self) -> Vec<(&'static str, u128, Option<u128>)> {
+			std::mem::take(&mut *self.log.lock().unwrap())
+		}
+	}
+
+	#[async_trait::async_trait]
+	impl ObjectStore for DelayingStore {
+		async fn put(&self, key: &str, bytes: &[u8]) -> std::io::Result<String> {
+			self.inner.put(key, bytes).await
+		}
+		fn planned_upload_uri(&self, key: &str) -> std::io::Result<String> {
+			self.inner.planned_upload_uri(key)
+		}
+		async fn head(&self, uri: &str) -> std::io::Result<crate::storage::l2::ObjectMetadata> {
+			self.request("head", self.inner.head(uri)).await
+		}
+		async fn get_range(
+			&self,
+			uri: &str,
+			range: std::ops::Range<u64>,
+		) -> std::io::Result<bytes::Bytes> {
+			self.request("get_range", self.inner.get_range(uri, range))
+				.await
+		}
+		async fn get_bytes(&self, uri: &str) -> std::io::Result<bytes::Bytes> {
+			self.request("get_bytes", self.inner.get_bytes(uri)).await
+		}
+		async fn list(
+			&self,
+			prefix: &str,
+		) -> std::io::Result<Vec<crate::storage::l2::ObjectMetadata>> {
+			self.inner.list(prefix).await
+		}
+		async fn delete(&self, uri: &str) -> std::io::Result<()> {
+			self.inner.delete(uri).await
+		}
+	}
+
+	struct Phase {
+		status: ReadStatus,
+		rows: usize,
+		elapsed: Duration,
+		log: Vec<(&'static str, u128, Option<u128>)>,
+	}
+
+	impl Phase {
+		/// How long each answered request took. A paused-clock sleep of `n` ms is
+		/// observed as `n` or `n + 1` ms: the timer wheel has one-millisecond slots.
+		fn answered(&self) -> Vec<u128> {
+			self.log
+				.iter()
+				.filter_map(|(_, began, returned)| returned.map(|returned| returned - began))
+				.collect()
+		}
+
+		fn outstanding(&self) -> usize {
+			self.log
+				.iter()
+				.filter(|(_, _, returned)| returned.is_none())
+				.count()
+		}
+	}
+
+	/// Two single-row frames in one encrypted tiered slab whose every read byte comes
+	/// from the delaying store. In this fixture one whole-record read is four requests
+	/// in sequence: head, tail window, additional metadata, record ciphertext.
+	///
+	/// What this demonstrates is narrow: the no-progress bound is raced against one
+	/// location's whole read, so requests that are each well under the bound can sum
+	/// past it. The delays run on tokio's paused clock, which bounds the awaited read;
+	/// it does not advance `std::time::Instant`, so the between-unit `expired()` poll is
+	/// not what these phases exercise.
+	#[tokio::test]
+	async fn the_stall_bound_covers_a_locations_whole_read_and_is_the_nodes_setting() {
+		let l2 = Arc::new(DelayingStore {
+			inner: MockObjectStore::default(),
+			delay_millis: AtomicU64::new(0),
+			origin: tokio::time::Instant::now(),
+			log: std::sync::Mutex::new(Vec::new()),
+		});
+		let (_mgr_dir, mgr) = make_manager_with_l2(l2.clone()).await;
+		let descriptor = typed_table_descriptor();
+		let batch = typed_table_batch(vec![1, 2]);
+		let mut write_meta: TableWriteRequestMeta = bytemuck::Zeroable::zeroed();
+		write_meta.tenant_id = tenant();
+		write_meta.table_object_id = descriptor.table_object_id;
+		write_meta.schema_generation = descriptor.schema_generation;
+		write_meta.row_count = encode_table_write_row_count(batch.num_rows()).unwrap();
+		let admission = validate_table_write_request_batch(
+			&write_meta,
+			&batch,
+			&descriptor,
+			WriterNodeId::ZERO,
+			write_meta.client_hlc,
+		)
+		.expect("typed rows should validate");
+		for row in 0..batch.num_rows() {
+			let frame = encode_batch(&batch.slice(row, 1)).unwrap();
+			mgr.append_durable_with_locality(
+				tenant(),
+				admission.key_identities[row],
+				admission.localities[row],
+				hlc(10 + row as u64, 0, 1),
+				&frame,
+			)
+			.await
+			.unwrap();
+		}
+		let slab_id = mgr.force_seal_active_for_test().await;
+		let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
+		let mut catalog = TableSchemaCatalog::default();
+		catalog.upsert(tenant(), descriptor.clone()).unwrap();
+		let encrypted = mgr
+			.encrypt_tiered_object_blob_with_table_stats(slab_id, &raw, &catalog)
+			.unwrap();
+		let locator = encrypted.stats_locator.expect("stats locator");
+		let l2_uri = l2
+			.put(&format!("stall-bound-{slab_id}.wnd"), &encrypted.bytes)
+			.await
+			.unwrap();
+		mgr.apply_tier_slab(TieredSlabPointer {
+			slab_id,
+			l2_uri,
+			payload_hash: payload_digest(&encrypted.bytes),
+			is_encrypted: true,
+			tenant_id: Some(encrypted.tenant_id),
+			tenant_kek_id: Some(encrypted.tenant_kek_id),
+			stats_format_version: Some(locator.stats_format_version),
+			stats_block_len: Some(locator.stats_block_len),
+			stats_block_hash128: Some(locator.stats_block_hash128),
+			tombstone_metadata: TombstoneMetadata::None,
+			supersession_metadata: SupersessionMetadata::None,
+		})
+		.await
+		.unwrap();
+
+		let program = pbc::Program::compile(&[]).unwrap();
+		let meta = base_meta();
+		let ranges = [QueryScanRange {
+			start: Locality::ZERO,
+			end: Locality::MAX,
+		}];
+		let default_bound = QueryStallBound::DEFAULT;
+		assert_eq!(default_bound.get(), Duration::from_millis(250));
+		let larger_bound = QueryStallBound::from_millis(1_000).unwrap();
+
+		// Setup, tiering and the first query run in real time with no delay; that query
+		// also fills the per-slab stats cache, so later phases issue record reads only.
+		// The scripted delay is enabled, on the paused clock, only around each later
+		// query, and those queries touch no local file.
+		let run = async |delay_millis: u64, budget: QueryExecutionBudget| {
+			if delay_millis > 0 {
+				tokio::time::pause();
+			}
+			l2.take_log();
+			l2.delay_millis.store(delay_millis, Ordering::SeqCst);
+			let started = tokio::time::Instant::now();
+			let plan = plan_query_execution_for_ranges_with_program(
+				&mgr,
+				n(1),
+				&meta,
+				&program,
+				&ranges,
+				budget,
+				None,
+				Some(&descriptor),
+				QueryProjectedExecution::Disabled,
+				RowIdentityProjection::None,
+				None,
+			)
+			.await
+			.unwrap();
+			let elapsed = started.elapsed();
+			l2.delay_millis.store(0, Ordering::SeqCst);
+			if delay_millis > 0 {
+				tokio::time::resume();
+			}
+			Phase {
+				status: plan.response.status,
+				rows: plan.batches.iter().map(RecordBatch::num_rows).sum(),
+				elapsed,
+				log: l2.take_log(),
+			}
+		};
+
+		let control = run(0, QueryExecutionBudget::server_default(default_bound)).await;
+		assert_eq!((control.status, control.rows), (ReadStatus::OK, 2));
+		assert_eq!(control.log.len(), 12, "a stats miss and two record reads");
+
+		// 40 ms per request under the default bound: four requests, about 164 ms per
+		// location, comfortably inside 250 ms. Completing a location marks progress,
+		// so the query as a whole runs past the bound and is still served.
+		let quick = run(40, QueryExecutionBudget::server_default(default_bound)).await;
+		assert_eq!((quick.status, quick.rows), (ReadStatus::OK, 2));
+		assert_eq!(quick.log.len(), 8);
+		assert!(quick.answered().iter().all(|took| (40..=41).contains(took)));
+		assert!(quick.elapsed > default_bound.get());
+
+		// 100 ms per request under the default bound: no request is slow, and the
+		// location's read is refused as stalled at the bound with its third request
+		// outstanding.
+		let slow = run(100, QueryExecutionBudget::server_default(default_bound)).await;
+		assert_eq!((slow.status, slow.rows), (ReadStatus::QUERY_STALLED, 0));
+		assert_eq!(slow.log.len(), 3, "{:?}", slow.log);
+		assert_eq!(slow.outstanding(), 1);
+		assert!(
+			slow.answered()
+				.iter()
+				.all(|took| (100..=101).contains(took))
+		);
+		assert!(
+			slow.elapsed >= default_bound.get()
+				&& slow.elapsed < default_bound.get() + Duration::from_millis(5)
+		);
+
+		// The same store under a node whose setting is 1,000 ms: about 404 ms per
+		// location, served.
+		let allowed = run(100, QueryExecutionBudget::server_default(larger_bound)).await;
+		assert_eq!((allowed.status, allowed.rows), (ReadStatus::OK, 2));
+		assert_eq!(allowed.log.len(), 8);
+
+		// A larger setting is still a bound: a request that never answers is refused
+		// as stalled when it is reached.
+		let stuck = run(NEVER, QueryExecutionBudget::server_default(larger_bound)).await;
+		assert_eq!((stuck.status, stuck.rows), (ReadStatus::QUERY_STALLED, 0));
+		assert_eq!((stuck.log.len(), stuck.outstanding()), (1, 1));
+		assert!(
+			stuck.elapsed >= larger_bound.get()
+				&& stuck.elapsed < larger_bound.get() + Duration::from_millis(5)
+		);
+
+		// A caller deadline nearer than the bound wins and is the status reported. The
+		// deadline is a real instant 150 ms ahead, taken just before the query; the
+		// read's timeout is that remaining time, run on the paused clock. (Were this
+		// host to lose 150 ms of real time first, the same status would come from the
+		// between-unit poll instead.)
+		let deadline = QueryExecutionBudget {
+			caller_deadline: Some(Instant::now() + Duration::from_millis(150)),
+			..QueryExecutionBudget::server_default(larger_bound)
+		};
+		let cut = run(100, deadline).await;
+		assert_eq!(
+			(cut.status, cut.rows),
+			(ReadStatus::QUERY_DEADLINE_EXCEEDED, 0)
+		);
+		assert!(cut.elapsed <= Duration::from_millis(151));
+	}
+
+	#[test]
+	fn the_supported_range_is_one_to_six_hundred_thousand_milliseconds() {
+		assert_eq!(
+			QueryStallBound::from_millis(1).unwrap().get(),
+			Duration::from_millis(1)
+		);
+		assert_eq!(
+			QueryStallBound::from_millis(600_000).unwrap().get(),
+			Duration::from_secs(600)
+		);
+		assert_eq!(
+			QueryStallBound::from_millis(0).unwrap_err().kind(),
+			ErrorKind::InvalidInput
+		);
+		assert_eq!(
+			QueryStallBound::from_millis(600_001).unwrap_err().kind(),
+			ErrorKind::InvalidInput
+		);
+		assert_eq!(QueryStallBound::default(), QueryStallBound::DEFAULT);
+	}
+
+	#[test]
+	fn a_callers_budget_or_deadline_never_replaces_the_nodes_stall_bound() {
+		let bound = QueryStallBound::from_millis(777).unwrap();
+		let descriptor = typed_table_descriptor();
+		let mut meta = table_query_meta_for_test(&descriptor, hlc(1, 0, 1), 0);
+		meta.deadline_remaining_millis = 5;
+		let table = table_query_execution_budget(&meta, bound);
+		assert_eq!(table.max_wall_time, bound.get());
+		assert!(table.caller_deadline.is_some());
+		assert!(!table.caller_totals);
+
+		let aggregate = aggregate_query_budget(
+			&AggregateBudgets {
+				max_locations: LocationCount::new(16),
+				max_rows: RowCount::new(16),
+				max_wall_time_millis: DurationMillis::new(60_000),
+				max_partial_state_bytes: ByteCount::new(4_096),
+			},
+			bound,
+		);
+		// The caller's wall budget is its deadline, never the stall bound.
+		assert_eq!(aggregate.max_wall_time, bound.get());
+		assert!(aggregate.caller_deadline.is_some());
+		assert!(aggregate.caller_totals);
+	}
+
+	/// The production bootstrap carries the configured value into the server, and the
+	/// server's own handlers execute under it.
+	#[tokio::test]
+	async fn a_bootstrapped_nodes_query_handlers_run_under_its_configured_stall_bound() {
+		let bound = QueryStallBound::from_millis(777).unwrap();
+		let dir = bootstrap_tempdir("query-stall-bound-routes");
+		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig {
+			query_stall_bound: bound,
+			..NodeBootstrapConfig::dev(57, dir.to_path_buf(), "127.0.0.1:0".into())
+		})
+		.await
+		.unwrap();
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+		loop {
+			if node.raft.current_leader().await == Some(node.local_node.id) {
+				break;
+			}
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"timed out waiting for leader"
+			);
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+		node.data_server
+			.refresh_leases_once(&node.ring, &*node.clock, 60_000)
+			.await;
+		let descriptor = typed_table_descriptor();
+		node.raft
+			.client_write(WendelonRequest::SchemaUpdate(typed_table_schema_update(
+				&descriptor,
+			)))
+			.await
+			.unwrap();
+		let rows = typed_table_batch_with_names(vec![(1, "one"), (2, "two")]);
+		let mut write_meta = typed_table_meta(&descriptor, rows.num_rows());
+		write_meta.parent_write_id.sequence_no = 570;
+		let (written, _) = node
+			.data_server
+			.table_write(write_meta, rows)
+			.await
+			.unwrap();
+		assert_eq!(written.write.status, WriteStatus::OK);
+
+		// The table query handler.
+		let table_meta = table_query_meta_for_test(&descriptor, written.write.commit_hlc, 0);
+		let table = node
+			.data_server
+			.prepare_table_query_execution_plan_with_migration(
+				&table_meta,
+				&[],
+				DecodedRuntimeFilter::Absent,
+			)
+			.await
+			.unwrap();
+		assert_eq!(table.response.status, ReadStatus::OK);
+		assert_eq!(table.clocks.stall_bound, bound.get());
+
+		// The key-range query handler.
+		let range_meta = QueryRequestMeta {
+			expected_epoch: 1,
+			as_of_hlc: written.write.commit_hlc,
+			..base_meta()
+		};
+		let range = node
+			.data_server
+			.prepare_query_execution_plan_with_migration(&range_meta, &[])
+			.await
+			.unwrap();
+		assert_eq!(range.response.status, ReadStatus::OK);
+		assert_eq!(range.clocks.stall_bound, bound.get());
+
+		// A node built without the setting keeps the default.
+		assert_eq!(
+			NodeBootstrapConfig::dev(58, dir.to_path_buf(), "127.0.0.1:0".into()).query_stall_bound,
+			QueryStallBound::DEFAULT
+		);
+		node.shutdown().await.unwrap();
 	}
 }

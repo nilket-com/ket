@@ -101,6 +101,11 @@ slab_io_depth = {{SLAB_IO_DEPTH}}
 cdc_locality_heartbeat_interval_millis = {{CDC_LOCALITY_HEARTBEAT_INTERVAL_MILLIS}}
 # ADR 080: HLC fencing window; renewal cadence is derived as TTL / 3.
 data_ring_lease_ttl_millis = {{DATA_RING_LEASE_TTL_MILLIS}}
+# ADR 0719: how long one unit of a query's work (for example one location's whole
+# read, which for a tiered row is several object-store requests) may run before this
+# node refuses the query as stalled. 1 to 600000; absent means 250. A caller's own
+# deadline still applies when it is nearer.
+query_stall_bound_millis = 250
 
 [identity]
 # Generated signing keys use fresh OS randomness; deterministic dev keys are refused.

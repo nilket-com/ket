@@ -8217,7 +8217,10 @@ fn adr116_table_query_row_limit_is_fixed_meta_not_sidecar_budget() {
 	assert!(data_server.contains("fn table_query_row_limit"));
 	assert!(data_server.contains("fn take_output_batch"));
 	assert!(data_server.contains("table_query_row_limit(meta)"));
-	assert!(data_server.contains("QueryExecutionBudget::default()"));
+	// ADR 0719: the budget has no `Default`; its defaulting constructor takes the
+	// executing node's stall bound.
+	assert!(data_server.contains("QueryExecutionBudget::server_default("));
+	assert!(!data_server.contains("QueryExecutionBudget::default()"));
 	assert!(!schema.contains("TableQueryRequestMetaExtension"));
 	assert!(!schema.contains("TableQueryRequestMetaV1"));
 }

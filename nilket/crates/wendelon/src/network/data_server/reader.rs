@@ -709,7 +709,7 @@ impl WendelonDataServer {
 		let refuse = |why: &str| ReadRefusal::Final(why.into()).plan(&range_meta, local);
 		// The caller's deadline, derived once: the cut, the proof, any repair and
 		// the execution all spend the same one.
-		let budget = table_query_execution_budget(meta);
+		let budget = table_query_execution_budget(meta, self.query_stall_bound);
 		let bound = StatementBound {
 			deadline: budget.caller_deadline,
 			cancellation: cancellation_token,
