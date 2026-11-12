@@ -16,6 +16,17 @@ advertise_address = "{{ADVERTISE_ADDRESS}}"
 
 [cluster]
 mode = "bootstrap"
+# ADR 0721: which write-decision authority a FRESH store is created under.
+# A store keeps the authority it was created with; the other is refused.
+#   "today" (the default): the existing path.
+#   "parent-decisions": requires identity.decision_signing_secret and
+#     identity.trusted_decision_signers, time.mvcc_retention_window_secs = 0,
+#     and [transport.tls] to join. It is a fresh, disposable checkpoint, NOT a
+#     durable deployment: no backup, no member replacement, no resizing (its
+#     membership is fixed at the first admitted write, so form the cluster and
+#     check its membership before writing), and a limited surface: table writes,
+#     single-row deletes, streamed LINEARIZABLE table queries and single-key KV.
+# decision_authority = "today"
 
 [storage]
 # Resolved relative to the config file location.
@@ -113,6 +124,12 @@ allow_dev_keys = false
 lease_signing_secret = "{{LEASE_SIGNING_SECRET}}"
 transfer_signing_secret = "{{TRANSFER_SIGNING_SECRET}}"
 audit_root_signing_secret = "{{AUDIT_ROOT_SIGNING_SECRET}}"
+# ADR 0721: only with cluster.decision_authority = "parent-decisions", and then
+# required. 64 hex characters; a key of its own, not reused from another role.
+# Every node lists every node's verifying key under
+# [identity.trusted_decision_signers], like the maps below. A node's bound key
+# is never replaced: a node configured with another key later does not start.
+# decision_signing_secret = "..."
 
 [identity.trusted_lease_signers]
 "{{NODE_ID}}" = "{{LEASE_VERIFYING_KEY}}"

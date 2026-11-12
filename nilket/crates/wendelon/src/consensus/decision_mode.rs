@@ -1,11 +1,17 @@
 //! Which write-decision authority a store and its cluster run under.
 //!
-//! `Today` is the existing path: bytes, frames and behaviour are unchanged.
-//! `ParentDecisions` is a development-only mode for fresh stores. It has its own
-//! control-log and snapshot format versions and its own Raft frame version, so
-//! a binary or peer on the other authority refuses at a boundary it already
-//! enforces, before state is applied. Until the whole protocol exists the mode
-//! refuses ordinary service, and nothing outside this crate can select it.
+//! `Today` is the default path: bytes, frames and behaviour are unchanged.
+//! `ParentDecisions` is selected for a fresh store, by a daemon's configuration
+//! (`cluster.decision_authority`, ADR 0721) or programmatically, and a store
+//! keeps the authority it was created under. It has its own control-log and
+//! snapshot format versions and its own envelope version for Raft frames and
+//! forwarded decision proposals, so a binary or peer on the other authority
+//! refuses at a boundary before state is applied.
+//!
+//! It is a fresh, disposable checkpoint, not a durable deployment: it has no
+//! backup, no member replacement and no resizing (its membership is fixed at
+//! the first admitted write, ADR 0720), and it serves a limited surface. Real
+//! signing keys do not change that.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Error, ErrorKind, Read, Write};
@@ -65,13 +71,26 @@ pub(crate) const RAFT_FRAME_VERSION_TODAY: u8 = 1;
 /// binaries refuse it when reading the frame. Version 2 was S1's development
 /// envelope, 3 was S2's, 4 was S3's, 5 was S4b's, 6 was S5a to ADR 0700's
 /// (no batched lease renewals), 7 was ADR 0701 to ADR 0703's (no certified
-/// tier provenance, ADR 0704) and 8 was ADR 0704 to ADR 0719's (no sealed
-/// membership, ADR 0720); their peers decode other encodings, so every build
-/// refuses them.
-pub(crate) const RAFT_FRAME_VERSION_PARENT_DECISIONS: u8 = 9;
+/// tier provenance, ADR 0704), 8 was ADR 0704 to ADR 0719's (no sealed
+/// membership, ADR 0720) and 9 was ADR 0720's (a forwarded signer binding
+/// without the sender's key, and forwarded proposals outside this envelope,
+/// ADR 0721); their peers decode other encodings, so every build refuses them.
+pub(crate) const RAFT_FRAME_VERSION_PARENT_DECISIONS: u8 = 10;
 
-/// The Raft request and response types, the only frames that may carry the
-/// `ParentDecisions` envelope.
+/// ADR 0721: the frames that may carry the `ParentDecisions` envelope: the Raft
+/// frames and a forwarded decision proposal with its answer. This classifies an
+/// envelope family for the frame reader; it dispatches nothing, and a decision
+/// proposal is never handled as a Raft frame. The frame reader is the same in
+/// both modes, so which version a node accepts on these types is decided by
+/// the mode-aware handler and client, before any body is decoded.
+pub(crate) fn carries_decision_envelope(msg_type: u8) -> bool {
+	use crate::schema::MsgType;
+	is_raft_frame(msg_type)
+		|| msg_type == MsgType::DECISION_PROPOSE_REQ.0
+		|| msg_type == MsgType::DECISION_PROPOSE_RESP.0
+}
+
+/// The Raft request and response types.
 pub(crate) fn is_raft_frame(msg_type: u8) -> bool {
 	use crate::schema::MsgType;
 	[
@@ -176,8 +195,8 @@ impl DecisionMode {
 		))
 	}
 
-	/// True while this mode must refuse ordinary service. The protocol is not
-	/// complete, so no build of this crate enables it yet.
+	/// True for the mode whose data server serves only its own surfaces: every
+	/// message type outside them is refused `ParentDecisionsIncomplete`.
 	pub(crate) const fn refuses_service(self) -> bool {
 		matches!(self, Self::ParentDecisions)
 	}
@@ -348,7 +367,7 @@ mod tests {
 			"S1's 9, S2's 10, S3's 11, S4b's 12, S5a to ADR 0700's 13, ADR 0701 to ADR \
 			 0703's 14 and ADR 0704 to ADR 0719's 16 are retired; 15 is Today's"
 		);
-		assert_eq!(mode.raft_frame_version(), 9);
+		assert_eq!(mode.raft_frame_version(), 10);
 		assert!(mode.snapshot_format() > SNAPSHOT_FORMAT_VERSION);
 		assert_ne!(mode.raft_frame_version(), 1);
 		assert!(mode.refuses_service());
@@ -358,13 +377,15 @@ mod tests {
 	fn a_frame_or_joiner_from_the_other_authority_is_refused_both_ways() {
 		let (today, new) = (DecisionMode::Today, DecisionMode::ParentDecisions);
 		today.check_raft_frame(1).unwrap();
-		new.check_raft_frame(9).unwrap();
+		new.check_raft_frame(10).unwrap();
 		// ADR 0701: an ADR 0700 peer's version-6 frames are refused before decode;
 		// ADR 0704: so are an ADR 0701 to ADR 0703 peer's version-7 frames; ADR
 		// 0720: so are an ADR 0704 to ADR 0719 peer's version-8 frames.
 		assert!(new.check_raft_frame(6).is_err());
 		assert!(new.check_raft_frame(7).is_err());
 		assert!(new.check_raft_frame(8).is_err());
+		// ADR 0721: and an ADR 0720 peer's version-9 frames.
+		assert!(new.check_raft_frame(9).is_err());
 		for retired in [2, 3, 4, 5] {
 			assert!(
 				new.check_raft_frame(retired).is_err(),
@@ -373,7 +394,7 @@ mod tests {
 			assert!(today.check_raft_frame(retired).is_err());
 		}
 		assert_eq!(
-			today.check_raft_frame(9).unwrap_err().kind(),
+			today.check_raft_frame(10).unwrap_err().kind(),
 			ErrorKind::PermissionDenied
 		);
 		assert_eq!(
@@ -406,18 +427,31 @@ mod tests {
 		use crate::network::wire::validate_frame_version;
 		use crate::schema::MsgType;
 		validate_frame_version(1, MsgType::READ_RESP.0).unwrap();
-		validate_frame_version(9, MsgType::VOTE_REQ.0).unwrap();
-		validate_frame_version(9, MsgType::APPEND_ENTRIES_RESP.0).unwrap();
-		assert!(validate_frame_version(9, MsgType::READ_RESP.0).is_err());
-		assert!(validate_frame_version(9, MsgType::TABLE_WRITE_REQ.0).is_err());
-		assert!(validate_frame_version(9, MsgType::LEASES_REQ.0).is_err());
-		for retired in [2, 3, 4, 5, 6, 7, 8] {
+		validate_frame_version(10, MsgType::VOTE_REQ.0).unwrap();
+		validate_frame_version(10, MsgType::APPEND_ENTRIES_RESP.0).unwrap();
+		// ADR 0721: a forwarded decision proposal and its answer carry it too.
+		validate_frame_version(10, MsgType::DECISION_PROPOSE_REQ.0).unwrap();
+		validate_frame_version(10, MsgType::DECISION_PROPOSE_RESP.0).unwrap();
+		assert!(validate_frame_version(10, MsgType::READ_RESP.0).is_err());
+		assert!(validate_frame_version(10, MsgType::TABLE_WRITE_REQ.0).is_err());
+		assert!(validate_frame_version(10, MsgType::LEASES_REQ.0).is_err());
+		assert!(validate_frame_version(10, MsgType::DECISION_LOOKUP_REQ.0).is_err());
+		assert!(validate_frame_version(10, MsgType::DECISION_CUT_REQ.0).is_err());
+		for retired in [2, 3, 4, 5, 6, 7, 8, 9] {
+			assert!(
+				validate_frame_version(retired, MsgType::DECISION_PROPOSE_REQ.0).is_err(),
+				"retired envelope {retired} on a forwarded proposal"
+			);
 			assert!(
 				validate_frame_version(retired, MsgType::VOTE_REQ.0).is_err(),
 				"retired envelope {retired}"
 			);
 		}
-		assert!(validate_frame_version(10, MsgType::VOTE_REQ.0).is_err());
+		assert!(validate_frame_version(11, MsgType::VOTE_REQ.0).is_err());
+		// The classifier is an envelope family, not Raft dispatch.
+		assert!(!is_raft_frame(MsgType::DECISION_PROPOSE_REQ.0));
+		assert!(carries_decision_envelope(MsgType::DECISION_PROPOSE_REQ.0));
+		assert!(!carries_decision_envelope(MsgType::DECISION_LOOKUP_REQ.0));
 	}
 
 	#[test]
@@ -426,16 +460,17 @@ mod tests {
 		let (today, new) = (DecisionMode::Today, DecisionMode::ParentDecisions);
 		let vote = MsgType::VOTE_RESP.0;
 		today.check_raft_response(1, vote, vote).unwrap();
-		new.check_raft_response(9, vote, vote).unwrap();
+		new.check_raft_response(10, vote, vote).unwrap();
 		assert!(new.check_raft_response(6, vote, vote).is_err());
 		assert!(new.check_raft_response(7, vote, vote).is_err());
 		assert!(new.check_raft_response(8, vote, vote).is_err());
-		assert!(today.check_raft_response(9, vote, vote).is_err());
+		assert!(new.check_raft_response(9, vote, vote).is_err());
+		assert!(today.check_raft_response(10, vote, vote).is_err());
 		for retired in [1, 2, 3, 4, 5] {
 			assert!(new.check_raft_response(retired, vote, vote).is_err());
 		}
 		assert!(
-			new.check_raft_response(9, MsgType::APPEND_ENTRIES_RESP.0, vote)
+			new.check_raft_response(10, MsgType::APPEND_ENTRIES_RESP.0, vote)
 				.is_err()
 		);
 	}

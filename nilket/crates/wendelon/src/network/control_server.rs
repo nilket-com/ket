@@ -4720,6 +4720,11 @@ impl WendelonControlServer {
 		use crate::network::decision_proposals::{
 			ProposalRefusal, ProposalResponse, ProposeRequest, decode_bounded,
 		};
+		// ADR 0721: the frame's version is judged against this node's mode before
+		// the body is decoded. A ParentDecisions node takes only its own envelope;
+		// a Today node takes only the one HRFT version (and then answers
+		// `ModeToday`, as before). The frame reader accepts either on this type.
+		self.decision_mode.check_raft_frame(frame.header.version)?;
 		let response = match &self.decision_proposals {
 			None => ProposalResponse::Refused(ProposalRefusal::ModeToday),
 			Some(proposals) => match decode_bounded::<ProposeRequest>(frame.meta.as_ref()) {
@@ -4738,7 +4743,7 @@ impl WendelonControlServer {
 		Ok(HrftFrame {
 			header: FrameHeader {
 				magic: HRFT_MAGIC,
-				version: 1,
+				version: self.decision_mode.raft_frame_version(),
 				msg_type: MsgType::DECISION_PROPOSE_RESP.0,
 				flags: 0,
 				stream_id: frame.header.stream_id,

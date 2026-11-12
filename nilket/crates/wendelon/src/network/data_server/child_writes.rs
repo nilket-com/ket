@@ -1339,24 +1339,36 @@ impl WendelonDataServer {
 		if !self.decision_mode.refuses_service() {
 			return None;
 		}
-		let Some(signer) = self.decisions.signer.as_ref().map(|signer| signer.signer) else {
+		let Some((signer, local_key)) = self
+			.decisions
+			.signer
+			.as_ref()
+			.map(|signer| (signer.signer, signer.key.verifying_key().to_bytes()))
+		else {
 			return Some("DecisionSignerMissing".into());
 		};
 		let leases = self.lease_source()().await;
 		self.state_machine
 			.read_state(move |state| {
+				use crate::consensus::decisions::LocalSignerBinding;
 				let Some(decisions) = state.decisions.as_ref() else {
 					return Some("DecisionStateMissing".to_string());
 				};
-				let current = state
-					.incarnations
-					.get(&signer.node)
-					.and_then(|registry| registry.current);
-				if current != Some(signer.incarnation) {
-					return Some("IncarnationNotCurrent".into());
-				}
-				if decisions.signer_key(signer).is_none() {
-					return Some("DecisionSignerUnbound".into());
+				// ADR 0721: a bound key that is not the one this store signs
+				// with is its own reason. This is a diagnosis, not the fence:
+				// evidence signed with another key is refused where it is
+				// verified.
+				match crate::consensus::decisions::local_signer_binding(state, signer, local_key) {
+					LocalSignerBinding::NotCurrent => {
+						return Some("IncarnationNotCurrent".into());
+					}
+					LocalSignerBinding::Unbound => {
+						return Some("DecisionSignerUnbound".into());
+					}
+					LocalSignerBinding::Mismatch => {
+						return Some("DecisionSignerMismatch".into());
+					}
+					LocalSignerBinding::Bound => {}
 				}
 				let Some((_, config)) = state.epoch_history.last_key_value() else {
 					return Some("NoEpoch".into());

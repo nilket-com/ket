@@ -92,11 +92,12 @@ pub fn validate_frame_version(version: u8, msg_type: u8) -> std::io::Result<()> 
 	if version == HRFT_ENVELOPE_VERSION {
 		return Ok(());
 	}
-	// Raft frames between `ParentDecisions` nodes carry their own version, and only
-	// those frames may. Which version a node accepts is the Raft handler's and the
-	// Raft client's decision; every other frame stays at the one version.
+	// Raft frames and forwarded decision proposals between `ParentDecisions` nodes
+	// carry their own version, and only those frames may. This reader does not
+	// know the node's mode: which version a node accepts on them is its handler's
+	// and its client's decision. Every other frame stays at the one version.
 	if version == crate::consensus::decision_mode::RAFT_FRAME_VERSION_PARENT_DECISIONS
-		&& crate::consensus::decision_mode::is_raft_frame(msg_type)
+		&& crate::consensus::decision_mode::carries_decision_envelope(msg_type)
 	{
 		return Ok(());
 	}

@@ -159,10 +159,46 @@ fn provider(node_id: u32, registry: Arc<support::LoopbackRegistry>) -> Arc<dyn T
 	)
 }
 
-fn member_config(node_id: u32, l2: &ObjectStoreConfig) -> (support::TestDir, NodeBootstrapConfig) {
+/// Which decision-signing keys the members run with.
+#[derive(Clone, Copy)]
+enum DecisionKeys {
+	/// Unset: the development keys.
+	Development,
+	/// ADR 0721: a secret of each node's own, with every node's verifying key named, as a
+	/// configuration file supplies them.
+	OfTheirOwn,
+}
+
+fn own_decision_secret(node_id: u32) -> [u8; 32] {
+	let mut secret = [0xD0; 32];
+	secret[..4].copy_from_slice(&node_id.to_le_bytes());
+	secret
+}
+
+fn member_config(
+	node_id: u32,
+	l2: &ObjectStoreConfig,
+	keys: DecisionKeys,
+) -> (support::TestDir, NodeBootstrapConfig) {
 	let dir = support::tempdir(&format!("three-node-{node_id}"));
 	let mut cfg = NodeBootstrapConfig::dev(node_id, dir.to_path_buf(), address(node_id))
 		.with_parent_decisions_for_disposable_store();
+	if let DecisionKeys::OfTheirOwn = keys {
+		cfg = cfg.with_decision_keys(
+			own_decision_secret(node_id),
+			NODES
+				.into_iter()
+				.map(|id| {
+					(
+						id,
+						wendelon::consensus::decisions::decision_verifying_key_bytes(
+							own_decision_secret(id),
+						),
+					)
+				})
+				.collect(),
+		);
+	}
 	cfg.rf = NODES.len();
 	cfg.cluster = if node_id == NODES[0] {
 		ClusterBootstrapConfig::Bootstrap
@@ -924,7 +960,7 @@ impl Cluster {
 	}
 }
 
-async fn workflow(stage: Arc<std::sync::Mutex<String>>, l2: ObjectStoreConfig) {
+async fn workflow(stage: Arc<std::sync::Mutex<String>>, l2: ObjectStoreConfig, keys: DecisionKeys) {
 	let enter = |now: &str| *stage.lock().unwrap() = now.to_owned();
 	let objects = l2.build().unwrap();
 
@@ -932,7 +968,7 @@ async fn workflow(stage: Arc<std::sync::Mutex<String>>, l2: ObjectStoreConfig) {
 	let registry = support::shared_loopback_registry();
 	let mut members = Vec::new();
 	for node_id in NODES {
-		let (dir, cfg) = member_config(node_id, &l2);
+		let (dir, cfg) = member_config(node_id, &l2, keys);
 		let node =
 			WendelonNode::bootstrap_with_provider(cfg.clone(), provider(node_id, registry.clone()))
 				.await
@@ -1083,9 +1119,26 @@ async fn workflow(stage: Arc<std::sync::Mutex<String>>, l2: ObjectStoreConfig) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn three_nodes_keep_every_acknowledged_row_through_tiering_restart_and_failover() {
 	let l2 = support::tempdir("three-node-l2");
-	run_bounded(ObjectStoreConfig::LocalFs {
-		root: l2.to_path_buf(),
-	})
+	run_bounded(
+		ObjectStoreConfig::LocalFs {
+			root: l2.to_path_buf(),
+		},
+		DecisionKeys::Development,
+	)
+	.await;
+}
+
+/// ADR 0721: the same workflow with each node signing decisions with a secret of its own and
+/// every node's verifying key named explicitly, instead of the development keys.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn three_nodes_keep_every_acknowledged_row_with_decision_keys_of_their_own() {
+	let l2 = support::tempdir("three-node-l2-own-keys");
+	run_bounded(
+		ObjectStoreConfig::LocalFs {
+			root: l2.to_path_buf(),
+		},
+		DecisionKeys::OfTheirOwn,
+	)
 	.await;
 }
 
@@ -1105,7 +1158,7 @@ async fn three_nodes_keep_every_acknowledged_row_with_their_objects_on_rustfs() 
 		.expect("RustFS did not accept a put: endpoint, bucket or credentials");
 	assert_eq!(probe.get(&uri).await.unwrap(), b"reachable");
 	probe.delete(&uri).await.unwrap();
-	run_bounded(ObjectStoreConfig::Remote(remote)).await;
+	run_bounded(ObjectStoreConfig::Remote(remote), DecisionKeys::Development).await;
 }
 
 #[test]
@@ -1156,9 +1209,9 @@ fn only_the_exact_dial_to_a_stopped_peer_is_retried() {
 	));
 }
 
-async fn run_bounded(l2: ObjectStoreConfig) {
+async fn run_bounded(l2: ObjectStoreConfig, keys: DecisionKeys) {
 	let stage = Arc::new(std::sync::Mutex::new("start".to_owned()));
-	let finished = tokio::time::timeout(WORKFLOW_BOUND, workflow(stage.clone(), l2)).await;
+	let finished = tokio::time::timeout(WORKFLOW_BOUND, workflow(stage.clone(), l2, keys)).await;
 	assert!(
 		finished.is_ok(),
 		"the workflow did not finish within {WORKFLOW_BOUND:?}, in: {}",

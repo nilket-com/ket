@@ -12271,9 +12271,21 @@ fn parent_decisions_have_no_producer_and_one_codec() {
 	);
 	let forwarded = brace_body(&proposals, "pub enum ForwardedDecision");
 	assert!(!forwarded.contains("stamp") && !forwarded.contains("floor"));
+	// ADR 0721: a binding names the incarnation and the key the sender signs with.
+	// The leader still supplies the sender and binds its own trust-map entry, and
+	// only when the sender's key equals it.
 	assert!(
-		forwarded.contains("BindSigner {\n\t\tincarnation: StoreIncarnation,\n\t},"),
-		"a binding names only the incarnation: the leader supplies the sender and its key"
+		forwarded
+			.contains("BindSigner {\n\t\tincarnation: StoreIncarnation,\n\t\tkey: [u8; 32],\n\t},"),
+		"a binding names the incarnation and the sender's key"
+	);
+	assert!(
+		proposals.contains(".get(&sender)\n\t\t\t\t.ok_or(ProposalRefusal::UnknownSignerKey)?;")
+	);
+	assert!(
+		proposals.contains(
+			"if key != senders {\n\t\t\t\treturn Err(ProposalRefusal::SignerKeyDisagrees);"
+		)
 	);
 
 	let decisions = fs::read_to_string(src.join("consensus/decisions.rs")).unwrap();

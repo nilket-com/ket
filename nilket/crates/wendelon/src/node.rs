@@ -180,6 +180,17 @@ pub struct ObservabilityConfig {
 	pub traces: Option<TraceExportConfig>,
 }
 
+/// ADR 0721: a decision-signing secret as configuration carries it. Its `Debug`
+/// prints no byte of it, so the configuration can be printed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DecisionSigningSecret(pub(crate) [u8; 32]);
+
+impl std::fmt::Debug for DecisionSigningSecret {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str("<redacted>")
+	}
+}
+
 /// Caller-supplied parameters for [`WendelonNode::bootstrap`].
 /// Loaded from TOML in production (`plans/ops/configuration.md`) or
 /// constructed programmatically in tests.
@@ -263,14 +274,14 @@ pub struct NodeBootstrapConfig {
 	/// `Full` retains the Control log from genesis. See
 	/// [`crate::consensus::retention`].
 	pub control_retention: ControlRetention,
-	/// Not a setting: selected only through
+	/// Selected by `cluster.decision_authority` in a configuration file or by
 	/// [`NodeBootstrapConfig::with_parent_decisions_for_disposable_store`], for
-	/// disposable stores. See `consensus::decision_mode`.
+	/// fresh disposable stores. See `consensus::decision_mode`.
 	pub(crate) decision_mode: crate::consensus::decision_mode::DecisionMode,
 	/// ADR 0699 S3a: this node's decision-signing secret and every node's
-	/// verifying key, ParentDecisions only. Not settings either: unset, both are
-	/// the development keys, which that mode requires.
-	pub(crate) decision_signing_secret: Option<[u8; 32]>,
+	/// verifying key, ParentDecisions only. A configuration file names both
+	/// (ADR 0721); unset, both are the development keys.
+	pub(crate) decision_signing_secret: Option<DecisionSigningSecret>,
 	pub(crate) trusted_decision_signers: BTreeMap<u32, [u8; 32]>,
 	/// Node-local maintenance switch for physical MVCC retention reclaim.
 	/// Skips ONLY the reclaim pass inside the migration sweeper: migrations
@@ -554,7 +565,8 @@ impl NodeBootstrapConfig {
 			) {
 			return Err(Error::new(
 				ErrorKind::InvalidInput,
-				"ParentDecisions mode refuses a node MVCC retention window",
+				"ParentDecisions mode refuses a node MVCC retention window: set \
+				 time.mvcc_retention_window_secs = 0",
 			));
 		}
 		self.counter_retention.validate()?;
@@ -786,12 +798,31 @@ pub struct WendelonNode {
 /// dropping a raw Tokio JoinHandle alone detaches its task.
 impl NodeBootstrapConfig {
 	/// ADR 0700: selects the ParentDecisions authority for a fresh disposable
-	/// development store. Bootstrap refuses it unless development keys are
-	/// allowed (a disposable or test profile), refuses an existing store of the
-	/// other mode, and a store keeps the mode it was created with. The default
-	/// stays today's authority.
+	/// store, as `cluster.decision_authority = "parent-decisions"` does from a
+	/// file (ADR 0721). Unset decision keys are the development keys, which
+	/// bootstrap accepts only under `allow_dev_keys`. Bootstrap refuses an
+	/// existing store of the other mode, and a store keeps the mode it was
+	/// created with. The default stays today's authority.
 	pub fn with_parent_decisions_for_disposable_store(mut self) -> Self {
 		self.decision_mode = crate::consensus::decision_mode::DecisionMode::ParentDecisions;
+		self
+	}
+
+	/// Whether this configuration creates or opens a ParentDecisions store.
+	pub fn selects_parent_decisions(&self) -> bool {
+		self.decision_mode == crate::consensus::decision_mode::DecisionMode::ParentDecisions
+	}
+
+	/// ADR 0721: explicit decision keys for a ParentDecisions store, as a
+	/// configuration file supplies them: this node's signing secret and every
+	/// node's verifying key.
+	pub fn with_decision_keys(
+		mut self,
+		secret: [u8; 32],
+		trusted: BTreeMap<u32, [u8; 32]>,
+	) -> Self {
+		self.decision_signing_secret = Some(DecisionSigningSecret(secret));
+		self.trusted_decision_signers = trusted;
 		self
 	}
 }
@@ -1822,13 +1853,10 @@ impl WendelonNode {
 		revocation_tx: watch::Sender<Arc<RevocationSnapshot>>,
 		scope: &mut startup::StartupScope,
 	) -> std::io::Result<startup::NodeParts> {
-		if cfg.decision_mode != crate::consensus::decision_mode::DecisionMode::Today
-			&& !cfg.allow_dev_keys
-		{
-			return Err(Error::new(
-				ErrorKind::InvalidInput,
-				"the ParentDecisions authority is for disposable development stores only",
-			));
+		// ADR 0721: the mode no longer needs `allow_dev_keys` as such; its keys
+		// do when they are development keys (`identity::resolve_decision_keys`).
+		if cfg.decision_mode == crate::consensus::decision_mode::DecisionMode::ParentDecisions {
+			identity::resolve_decision_keys(&cfg)?;
 		}
 		cfg.decision_mode.admit_store(&cfg.data_dir)?;
 		#[cfg(test)]
@@ -2308,14 +2336,33 @@ impl WendelonNode {
 			== crate::consensus::decision_mode::DecisionMode::ParentDecisions
 		{
 			let (secret, _) = identity::resolve_decision_keys(&cfg)?;
+			let key = ed25519_dalek::SigningKey::from_bytes(&secret);
+			let signer = crate::consensus::decisions::Signer {
+				node: local_node.id,
+				incarnation: slab.owner_ref()?.incarnation(),
+			};
+			// ADR 0721: replayed state already proves the configured key is not
+			// the one bound to this store. Nothing it signs would verify, and a
+			// binding is never replaced, so it does not start. A binding it has
+			// not replayed yet is reported by readiness when it arrives.
+			let local_key = key.verifying_key().to_bytes();
+			let binding = state_machine
+				.read_state(move |state| {
+					crate::consensus::decisions::local_signer_binding(state, signer, local_key)
+				})
+				.await;
+			if binding == crate::consensus::decisions::LocalSignerBinding::Mismatch {
+				return Err(Error::new(
+					ErrorKind::InvalidInput,
+					format!(
+						"decision signing key refused: node {} is configured with a key other \
+						 than the one bound to this store",
+						local_node.id
+					),
+				));
+			}
 			Some(Arc::new(
-				crate::network::data_server::child_writes::DecisionSigner {
-					key: ed25519_dalek::SigningKey::from_bytes(&secret),
-					signer: crate::consensus::decisions::Signer {
-						node: local_node.id,
-						incarnation: slab.owner_ref()?.incarnation(),
-					},
-				},
+				crate::network::data_server::child_writes::DecisionSigner { key, signer },
 			))
 		} else {
 			None

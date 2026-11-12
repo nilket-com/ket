@@ -553,3 +553,95 @@ fn identity_dev_recognition_includes_ids_only_in_audit_map_for_every_role() {
 		}
 	}
 }
+
+// ADR 0721: the decision role.
+
+fn decision_config() -> NodeBootstrapConfig {
+	use crate::consensus::decisions::decision_verifying_key_bytes;
+	let secret = [51; 32];
+	config()
+		.with_parent_decisions_for_disposable_store()
+		.with_decision_keys(
+			secret,
+			BTreeMap::from([(7, decision_verifying_key_bytes(secret))]),
+		)
+}
+
+fn decision_refusal(cfg: &NodeBootstrapConfig) -> String {
+	let error = resolve_decision_keys(cfg).unwrap_err();
+	assert_eq!(error.kind(), ErrorKind::InvalidInput);
+	error.to_string()
+}
+
+#[test]
+fn decision_keys_of_their_own_pass_without_dev_keys() {
+	let cfg = decision_config();
+	assert!(!cfg.allow_dev_keys);
+	let (secret, trusted) = resolve_decision_keys(&cfg).unwrap();
+	assert_eq!(secret, [51; 32]);
+	assert_eq!(trusted.len(), 1);
+	// Nothing of the secret is printed with the configuration.
+	let printed = format!("{cfg:?}");
+	assert!(printed.contains("decision_signing_secret: Some(<redacted>)"));
+	assert!(!printed.contains(&format!("{:?}", [51u8; 32])));
+}
+
+#[test]
+fn development_decision_keys_need_allow_dev_keys() {
+	use crate::consensus::decisions::{decision_verifying_key_bytes, dev_decision_signing_secret};
+	// Unset keys are the development keys.
+	let mut unset = config().with_parent_decisions_for_disposable_store();
+	assert!(decision_refusal(&unset).contains("needs identity.allow_dev_keys"));
+	unset.allow_dev_keys = true;
+	resolve_decision_keys(&unset).unwrap();
+	// A real local key beside a peer's development key is refused too.
+	let mut mixed = decision_config();
+	mixed.trusted_decision_signers.insert(
+		8,
+		decision_verifying_key_bytes(dev_decision_signing_secret(8)),
+	);
+	assert!(decision_refusal(&mixed).contains("needs identity.allow_dev_keys"));
+}
+
+#[test]
+fn a_decision_key_is_its_nodes_own_and_no_other_roles() {
+	use crate::consensus::decisions::decision_verifying_key_bytes;
+	let mut absent = decision_config();
+	absent.trusted_decision_signers.clear();
+	absent
+		.trusted_decision_signers
+		.insert(8, decision_verifying_key_bytes([52; 32]));
+	assert!(decision_refusal(&absent).contains("the local key is missing"));
+
+	let mut differs = decision_config();
+	differs
+		.trusted_decision_signers
+		.insert(7, decision_verifying_key_bytes([52; 32]));
+	assert!(decision_refusal(&differs).contains("the local key is missing"));
+
+	let mut reused = decision_config();
+	reused.decision_signing_secret = Some(crate::node::DecisionSigningSecret(
+		reused.lease_signing_secret,
+	));
+	reused
+		.trusted_decision_signers
+		.insert(7, decision_verifying_key_bytes(reused.lease_signing_secret));
+	assert!(decision_refusal(&reused).contains("reused from another role"));
+
+	let mut twice = decision_config();
+	twice
+		.trusted_decision_signers
+		.insert(8, decision_verifying_key_bytes([51; 32]));
+	assert!(decision_refusal(&twice).contains("names two nodes"));
+	for refusal in [
+		decision_refusal(&absent),
+		decision_refusal(&differs),
+		decision_refusal(&reused),
+		decision_refusal(&twice),
+	] {
+		assert!(
+			!refusal.contains("51, 51") && !refusal.contains("3333"),
+			"{refusal}"
+		);
+	}
+}

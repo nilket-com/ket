@@ -2297,7 +2297,8 @@ fn new_wire_variants_are_appended_after_the_existing_tags() {
 	let tag = |bytes: Vec<u8>| bytes[0];
 	assert_eq!(
 		tag(postcard::to_stdvec(&ForwardedDecision::BindSigner {
-			incarnation: inc(1)
+			incarnation: inc(1),
+			key: [0; 32],
 		})
 		.unwrap()),
 		4
@@ -3251,5 +3252,50 @@ fn the_seal_outlives_every_record_and_a_snapshot_cannot_drop_it() {
 	assert_eq!(
 		reserve(&mut state, &claim, T0 + 10_000_000),
 		refused(DecisionRefusal::MembershipSealed)
+	);
+}
+
+// ============================================================
+//  ADR 0721: THE KEY A STORE SIGNS WITH AGAINST ITS BINDING
+// ============================================================
+
+#[test]
+fn a_local_signer_is_not_current_unbound_bound_or_mismatched() {
+	let mut state = base(3);
+	let mine = signer(1);
+	let key = decision_verifying_key_bytes(dev_decision_signing_secret(1));
+	let other = decision_verifying_key_bytes(dev_decision_signing_secret(9));
+	assert_eq!(
+		local_signer_binding(&state, mine, key),
+		LocalSignerBinding::Bound
+	);
+	assert_eq!(
+		local_signer_binding(&state, mine, other),
+		LocalSignerBinding::Mismatch
+	);
+	state
+		.decisions
+		.as_mut()
+		.unwrap()
+		.signers
+		.remove(&(1, inc(1)));
+	assert_eq!(
+		local_signer_binding(&state, mine, key),
+		LocalSignerBinding::Unbound
+	);
+	// A store that is not its node's current incarnation is judged on nothing
+	// else, whatever key is bound for the incarnation that is.
+	let stale = Signer {
+		node: 1,
+		incarnation: StoreIncarnation::from_raw(4_242),
+	};
+	assert_eq!(
+		local_signer_binding(&state, stale, key),
+		LocalSignerBinding::NotCurrent
+	);
+	state.incarnations.remove(&1);
+	assert_eq!(
+		local_signer_binding(&state, mine, key),
+		LocalSignerBinding::NotCurrent
 	);
 }

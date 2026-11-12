@@ -54,8 +54,12 @@ pub enum ForwardedDecision {
 		abort: Signed<AbortBody>,
 	},
 	/// Bind the sender's store incarnation to the sender's configured key.
+	/// ADR 0721: `key` is the verifying key of the secret the sender signs
+	/// with. The leader binds its own trust-map entry for the sender, and only
+	/// if the two are equal: `key` never replaces that lookup.
 	BindSigner {
 		incarnation: StoreIncarnation,
+		key: [u8; 32],
 	},
 	/// First registration of the sender's store incarnation, or its exact
 	/// retry. Replacing an established incarnation is not expressible: this
@@ -124,6 +128,10 @@ pub enum ProposalRefusal {
 	UnknownSignerKey,
 	/// The frame is oversized or does not decode.
 	Malformed,
+	/// ADR 0721: the key the sender signs with is not the one this leader is
+	/// configured to trust for it. Nothing is bound, so correcting a
+	/// configuration can still bind the right key.
+	SignerKeyDisagrees,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -441,10 +449,16 @@ pub(crate) fn admission(
 			}
 			return Ok(Admitted::Unstamped(Unstamped::RecordNoop { noop }));
 		}
-		ForwardedDecision::BindSigner { incarnation } => {
+		ForwardedDecision::BindSigner {
+			incarnation,
+			key: senders,
+		} => {
 			let key = *trusted_keys
 				.get(&sender)
 				.ok_or(ProposalRefusal::UnknownSignerKey)?;
+			if key != senders {
+				return Err(ProposalRefusal::SignerKeyDisagrees);
+			}
 			DecisionCommand::BindSigner {
 				signer: Signer {
 					node: sender,
@@ -737,6 +751,7 @@ impl DecisionProposals {
 			leader,
 			MsgType::DECISION_PROPOSE_REQ,
 			MsgType::DECISION_PROPOSE_RESP,
+			self.mode.raft_frame_version(),
 			&ProposeRequest {
 				sent_ms: self.clock.now_ms(),
 				request: request.clone(),
@@ -803,6 +818,7 @@ impl DecisionProposals {
 					leader,
 					MsgType::DECISION_LOOKUP_REQ,
 					MsgType::DECISION_LOOKUP_RESP,
+					crate::schema::HRFT_ENVELOPE_VERSION,
 					&request,
 				)
 				.await
@@ -837,6 +853,7 @@ impl DecisionProposals {
 					leader,
 					MsgType::DECISION_CUT_REQ,
 					MsgType::DECISION_CUT_RESP,
+					crate::schema::HRFT_ENVELOPE_VERSION,
 					&CutRequest {
 						sent_ms: self.now_ms(),
 					},
@@ -877,6 +894,11 @@ impl DecisionProposals {
 		leader: u32,
 		request_type: MsgType,
 		response_type: MsgType,
+		// The frame version of this request and its answer. Each message
+		// family has its own: forwarded proposals carry the ParentDecisions
+		// envelope (ADR 0721), every other request here stays at the one
+		// HRFT version.
+		version: u8,
 		request: &Q,
 	) -> std::io::Result<R> {
 		let deadline = tokio::time::Instant::now() + DECISION_RPC_DEADLINE;
@@ -899,7 +921,7 @@ impl DecisionProposals {
 			let mut stream = conn.open_bi().await?;
 			let header = FrameHeader {
 				magic: HRFT_MAGIC,
-				version: 1,
+				version,
 				msg_type: request_type.0,
 				flags: 0,
 				stream_id: stream.stream_id() as u32,
@@ -910,15 +932,7 @@ impl DecisionProposals {
 			write_frame(&mut *stream, &header, &meta, None, None).await?;
 			stream.finish().await?;
 			let frame = read_frame(&mut *stream, &self.pool).await?;
-			if frame.header.msg_type != response_type.0 {
-				return Err(Error::new(
-					ErrorKind::InvalidData,
-					format!(
-						"unexpected decision response 0x{:02x}",
-						frame.header.msg_type
-					),
-				));
-			}
+			check_response_frame(&frame.header, response_type, version)?;
 			decode_bounded(frame.meta.as_ref())
 		};
 		tokio::time::timeout_at(deadline, attempt)
@@ -1126,7 +1140,10 @@ impl<'a> MaintenanceProposals<'a> {
 				(current, bound)
 			})
 			.await;
-		let request = maintenance_step(current, bound, incarnation)?;
+		// The key this node signs with: bootstrap checked that its secret's
+		// verifying key is its own entry in its trust map.
+		let key = *proposals.trusted_keys.get(&local)?;
+		let request = maintenance_step(current, bound, incarnation, key)?;
 		// Replay basis. RegisterIncarnation is derived only while the applied
 		// registry has no current incarnation for this node: an exact replay
 		// returns Success with no change (`consensus/raft_storage.rs:5434-5440`),
@@ -1158,13 +1175,34 @@ pub(crate) fn maintenance_step(
 	current: Option<StoreIncarnation>,
 	bound: bool,
 	incarnation: StoreIncarnation,
+	key: [u8; 32],
 ) -> Option<ForwardedDecision> {
 	match current {
 		None => Some(ForwardedDecision::RegisterIncarnation { incarnation }),
 		Some(current) if current != incarnation => None,
-		Some(_) if !bound => Some(ForwardedDecision::BindSigner { incarnation }),
+		Some(_) if !bound => Some(ForwardedDecision::BindSigner { incarnation, key }),
 		Some(_) => None,
 	}
+}
+
+/// ADR 0721: an answer's type and frame version are judged before its body is
+/// decoded, so an error frame or an answer in another encoding is never parsed
+/// as this response.
+pub(crate) fn check_response_frame(
+	header: &FrameHeader,
+	response_type: MsgType,
+	version: u8,
+) -> std::io::Result<()> {
+	if header.msg_type != response_type.0 || header.version != version {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!(
+				"unexpected decision response 0x{:02x} at frame version {}",
+				header.msg_type, header.version
+			),
+		));
+	}
+	Ok(())
 }
 
 pub(crate) fn decode_bounded<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> std::io::Result<T> {

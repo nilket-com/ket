@@ -4,6 +4,9 @@ use super::*;
 use crate::consensus::decisions::tests as fixture;
 use crate::consensus::raft_storage::apply_at_leader_for_test;
 
+/// A stand-in for the key a store signs with, where the step only carries it.
+const KEY: [u8; 32] = [0x5A; 32];
+
 fn trusted() -> BTreeMap<u32, [u8; 32]> {
 	(1..=3)
 		.map(|id| {
@@ -37,6 +40,7 @@ fn today_admits_nothing() {
 	let mode = DecisionMode::Today;
 	let request = ForwardedDecision::BindSigner {
 		incarnation: fixture::inc(1),
+		key: trusted()[&1],
 	};
 	assert_eq!(
 		admit(mode, 1, request, &trusted(), healthy),
@@ -137,6 +141,7 @@ fn only_reserve_and_record_noop_bear_time_and_both_need_the_gate() {
 			1,
 			ForwardedDecision::BindSigner {
 				incarnation: fixture::inc(1),
+				key: trusted()[&1],
 			},
 		),
 		(
@@ -166,6 +171,7 @@ fn a_binding_names_only_the_sender_and_its_configured_key() {
 	let mode = DecisionMode::ParentDecisions;
 	let request = ForwardedDecision::BindSigner {
 		incarnation: fixture::inc(2),
+		key: trusted()[&2],
 	};
 	let Ok(WendelonRequest::Decision(DecisionCommand::BindSigner { signer, key })) =
 		admit(mode, 2, request.clone(), &trusted(), || {
@@ -229,7 +235,10 @@ fn a_follower_registers_once_through_the_leader_and_is_never_replaced() {
 		admit(
 			mode,
 			2,
-			ForwardedDecision::BindSigner { incarnation },
+			ForwardedDecision::BindSigner {
+				incarnation,
+				key: trusted()[&2],
+			},
 			&trusted(),
 			healthy,
 		)
@@ -252,17 +261,20 @@ fn maintenance_registers_binds_or_leaves_another_store_alone() {
 	let mine = fixture::inc(2);
 	let other = StoreIncarnation::from_raw(8_000);
 	assert_eq!(
-		maintenance_step(None, false, mine),
+		maintenance_step(None, false, mine, KEY),
 		Some(ForwardedDecision::RegisterIncarnation { incarnation: mine })
 	);
 	assert_eq!(
-		maintenance_step(Some(mine), false, mine),
-		Some(ForwardedDecision::BindSigner { incarnation: mine })
+		maintenance_step(Some(mine), false, mine, KEY),
+		Some(ForwardedDecision::BindSigner {
+			incarnation: mine,
+			key: KEY,
+		})
 	);
-	assert_eq!(maintenance_step(Some(mine), true, mine), None);
+	assert_eq!(maintenance_step(Some(mine), true, mine, KEY), None);
 	// A different established store at this node id is never retired from here.
-	assert_eq!(maintenance_step(Some(other), false, mine), None);
-	assert_eq!(maintenance_step(Some(other), true, mine), None);
+	assert_eq!(maintenance_step(Some(other), false, mine, KEY), None);
+	assert_eq!(maintenance_step(Some(other), true, mine, KEY), None);
 }
 
 #[test]
@@ -398,6 +410,7 @@ fn an_oversized_or_malformed_frame_is_refused_before_decode() {
 	assert!(decode_bounded::<ForwardedDecision>(&[0xFF, 0xFF, 0xFF]).is_err());
 	let request = ForwardedDecision::BindSigner {
 		incarnation: fixture::inc(1),
+		key: trusted()[&1],
 	};
 	let bytes = postcard::to_stdvec(&request).unwrap();
 	assert_eq!(
@@ -686,4 +699,67 @@ async fn without_a_stop_the_answer_is_returned() {
 			leader_hint: Some(7)
 		})
 	));
+}
+
+// ADR 0721
+
+#[test]
+fn a_binding_whose_key_disagrees_with_the_leaders_map_binds_nothing() {
+	let mode = DecisionMode::ParentDecisions;
+	let disagreeing = ForwardedDecision::BindSigner {
+		incarnation: fixture::inc(2),
+		key: trusted()[&3],
+	};
+	assert_eq!(
+		admit(mode, 2, disagreeing, &trusted(), || panic!(
+			"a binding reads no clock"
+		)),
+		Err(ProposalRefusal::SignerKeyDisagrees)
+	);
+	// The sender's key never stands in for the leader's own entry: a sender the
+	// leader has no key for is refused whatever key it sends.
+	let unknown = ForwardedDecision::BindSigner {
+		incarnation: fixture::inc(2),
+		key: trusted()[&2],
+	};
+	assert_eq!(
+		admit(mode, 9, unknown, &trusted(), healthy),
+		Err(ProposalRefusal::UnknownSignerKey)
+	);
+	// The refusal is appended to the wire enum after the existing ones.
+	assert_eq!(
+		postcard::to_stdvec(&ProposalRefusal::SignerKeyDisagrees).unwrap(),
+		vec![5]
+	);
+	assert_eq!(
+		postcard::to_stdvec(&ProposalRefusal::Malformed).unwrap(),
+		vec![4]
+	);
+}
+
+#[test]
+fn an_answer_is_judged_by_type_and_frame_version_before_its_body() {
+	let header = |msg_type: MsgType, version: u8| FrameHeader {
+		magic: HRFT_MAGIC,
+		version,
+		msg_type: msg_type.0,
+		flags: 0,
+		stream_id: 0,
+		meta_len: 0,
+		arrow_len: 0,
+		trailing_len: 0,
+	};
+	let envelope = DecisionMode::ParentDecisions.raft_frame_version();
+	let (propose, lookup) = (
+		MsgType::DECISION_PROPOSE_RESP,
+		MsgType::DECISION_LOOKUP_RESP,
+	);
+	check_response_frame(&header(propose, envelope), propose, envelope).unwrap();
+	// An ADR 0720 leader's answer, a Today-versioned answer and an error frame.
+	assert!(check_response_frame(&header(propose, 9), propose, envelope).is_err());
+	assert!(check_response_frame(&header(propose, 1), propose, envelope).is_err());
+	assert!(check_response_frame(&header(lookup, envelope), propose, envelope).is_err());
+	// Lookups keep the one HRFT version in both directions.
+	check_response_frame(&header(lookup, 1), lookup, 1).unwrap();
+	assert!(check_response_frame(&header(lookup, envelope), lookup, 1).is_err());
 }

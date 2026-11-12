@@ -20,3 +20,7 @@ wendelon = { path = "../..", default-features = false }
 
 [dev-dependencies]
 bytemuck = "1.15"
+# ADR 0721: the real-process smoke signals its daemons and issues its certificates.
+libc = "0.2"
+serde_json = "1.0"
+tls-pki = { path = "../../../tls-pki" }

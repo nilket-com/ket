@@ -869,7 +869,9 @@ impl RawCounterConfig {
 	}
 }
 
-#[derive(Debug, Deserialize)]
+/// Hand-written `Debug`: this struct holds signing secrets as text.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawIdentityConfig {
 	/// Explicit dev-only authorization; absence always refuses recognized dev keys.
 	#[serde(default)]
@@ -880,14 +882,40 @@ struct RawIdentityConfig {
 	trusted_transfer_signers: BTreeMap<String, String>,
 	audit_root_signing_secret: String,
 	trusted_audit_root_keys: BTreeMap<String, String>,
+	/// ADR 0721: required when `cluster.decision_authority` is
+	/// `parent-decisions`, refused otherwise.
+	#[serde(default)]
+	decision_signing_secret: Option<String>,
+	#[serde(default)]
+	trusted_decision_signers: Option<BTreeMap<String, String>>,
+}
+
+impl std::fmt::Debug for RawIdentityConfig {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("RawIdentityConfig")
+			.field("allow_dev_keys", &self.allow_dev_keys)
+			.finish_non_exhaustive()
+	}
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawClusterConfig {
 	#[serde(default)]
 	mode: RawClusterMode,
 	#[serde(default)]
 	seed_nodes: Vec<RawSeedNode>,
+	/// ADR 0721: which write-decision authority a fresh store is created under.
+	#[serde(default)]
+	decision_authority: RawDecisionAuthority,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum RawDecisionAuthority {
+	#[default]
+	Today,
+	ParentDecisions,
 }
 
 #[derive(Debug, Deserialize)]
@@ -915,6 +943,7 @@ impl Default for RawClusterConfig {
 		Self {
 			mode: RawClusterMode::Bootstrap,
 			seed_nodes: Vec::new(),
+			decision_authority: RawDecisionAuthority::Today,
 		}
 	}
 }
@@ -1179,6 +1208,41 @@ impl RawConfig {
 		)?;
 		let trusted_audit_root_keys =
 			parse_trusted_audit_root_keys(&self.identity.trusted_audit_root_keys)?;
+		// ADR 0721: a store selected into ParentDecisions from the file names its
+		// decision keys in the file; nothing is defaulted. A Today store carries none.
+		let (decision_mode, decision_signing_secret, trusted_decision_signers) = match (
+			self.cluster.decision_authority,
+			&self.identity.decision_signing_secret,
+			&self.identity.trusted_decision_signers,
+		) {
+			(RawDecisionAuthority::Today, None, None) => (
+				crate::consensus::decision_mode::DecisionMode::Today,
+				None,
+				BTreeMap::new(),
+			),
+			(RawDecisionAuthority::Today, _, _) => {
+				return Err(Error::new(
+					ErrorKind::InvalidInput,
+					"identity.decision_signing_secret and identity.trusted_decision_signers \
+					 are only for cluster.decision_authority = \"parent-decisions\"",
+				));
+			}
+			(RawDecisionAuthority::ParentDecisions, Some(secret), Some(trusted)) => (
+				crate::consensus::decision_mode::DecisionMode::ParentDecisions,
+				Some(crate::node::DecisionSigningSecret(parse_key_material(
+					"identity.decision_signing_secret",
+					secret,
+				)?)),
+				parse_trusted_signers("identity.trusted_decision_signers", trusted)?,
+			),
+			(RawDecisionAuthority::ParentDecisions, _, _) => {
+				return Err(Error::new(
+					ErrorKind::InvalidInput,
+					"cluster.decision_authority = \"parent-decisions\" requires \
+					 identity.decision_signing_secret and identity.trusted_decision_signers",
+				));
+			}
+		};
 		let cluster = match self.cluster.mode {
 			RawClusterMode::Bootstrap => ClusterBootstrapConfig::Bootstrap,
 			RawClusterMode::Join => ClusterBootstrapConfig::Join {
@@ -1301,9 +1365,9 @@ impl RawConfig {
 			tiering,
 			lsm_compaction_paused: self.storage.lsm_compaction_paused,
 			control_retention,
-			decision_mode: Default::default(),
-			decision_signing_secret: None,
-			trusted_decision_signers: BTreeMap::new(),
+			decision_mode,
+			decision_signing_secret,
+			trusted_decision_signers,
 			mvcc_retention_paused: self.storage.mvcc_retention_paused,
 			rehydration: crate::storage::manager::RehydrationPolicy::default(),
 			l2_column_fetch,

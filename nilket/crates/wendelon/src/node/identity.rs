@@ -196,6 +196,7 @@ pub(crate) fn resolve_decision_keys(
 	use crate::consensus::decisions::{decision_verifying_key_bytes, dev_decision_signing_secret};
 	let secret = cfg
 		.decision_signing_secret
+		.map(|secret| secret.0)
 		.unwrap_or_else(|| dev_decision_signing_secret(cfg.node_id));
 	let trusted = if cfg.trusted_decision_signers.is_empty() {
 		std::iter::once(cfg.node_id)
@@ -242,6 +243,19 @@ pub(crate) fn resolve_decision_keys(
 		}
 		if !seen.insert(*key) {
 			return refuse("one verifying key names two nodes");
+		}
+	}
+	// ADR 0721: as for the other roles, a recognised development key (publicly
+	// derivable from a node id) is accepted only under `allow_dev_keys`. This
+	// replaces the blanket rule that the mode itself needed `allow_dev_keys`.
+	if !cfg.allow_dev_keys {
+		let recognized: BTreeSet<[u8; 32]> = std::iter::once(cfg.node_id)
+			.chain(trusted.keys().copied())
+			.chain(cfg.trusted_lease_signers.keys().copied())
+			.map(|id| decision_verifying_key_bytes(dev_decision_signing_secret(id)))
+			.collect();
+		if trusted.values().any(|key| recognized.contains(key)) {
+			return refuse("a recognised development key needs identity.allow_dev_keys");
 		}
 	}
 	Ok((secret, trusted))

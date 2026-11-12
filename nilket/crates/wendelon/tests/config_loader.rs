@@ -2329,3 +2329,214 @@ fn a_mistyped_or_non_integer_query_stall_bound_fails_by_position_only() {
 		}
 	}
 }
+
+// ADR 0721: a daemon's configuration selects the ParentDecisions authority.
+
+fn hex32(bytes: [u8; 32]) -> String {
+	bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// The rendered example (fresh non-development keys, `allow_dev_keys = false`)
+/// selecting ParentDecisions, with `cluster`, `identity` and trailing text added.
+fn parent_decisions_config(
+	tag: &str,
+	cluster: &str,
+	identity: &str,
+	tail: &str,
+) -> (test_dir::TestDir, PathBuf) {
+	let root = fresh_dir(tag);
+	std::fs::create_dir_all(root.join("data")).unwrap();
+	let rendered = render_example_config();
+	assert!(rendered.contains("mode = \"bootstrap\"\n"));
+	assert!(rendered.contains("allow_dev_keys = false\n"));
+	let body = rendered
+		.replace(
+			"mode = \"bootstrap\"\n",
+			&format!("mode = \"bootstrap\"\n{cluster}"),
+		)
+		.replace(
+			"allow_dev_keys = false\n",
+			&format!("allow_dev_keys = false\n{identity}"),
+		) + tail;
+	let config_path = write_config(&root, &body);
+	(root, config_path)
+}
+
+const DECISION_SECRET: [u8; 32] = [0x6B; 32];
+
+fn decision_identity() -> (String, String) {
+	let verifying = wendelon::consensus::decisions::decision_verifying_key_bytes(DECISION_SECRET);
+	(
+		format!("decision_signing_secret = \"{}\"\n", hex32(DECISION_SECRET)),
+		format!(
+			"\n[time]\nmvcc_retention_window_secs = 0\n\n[identity.trusted_decision_signers]\n\"1\" = \"{}\"\n",
+			hex32(verifying)
+		),
+	)
+}
+
+#[test]
+fn the_decision_authority_defaults_to_today_and_is_selected_with_its_own_keys() {
+	let root = fresh_dir("authority-default");
+	std::fs::create_dir_all(root.join("data")).unwrap();
+	let default =
+		load_node_bootstrap_config(&write_config(&root, &render_example_config())).unwrap();
+	assert!(!default.selects_parent_decisions());
+
+	let (secret, tail) = decision_identity();
+	let (_root, path) = parent_decisions_config(
+		"authority-selected",
+		"decision_authority = \"parent-decisions\"\n",
+		&secret,
+		&tail,
+	);
+	let cfg = load_node_bootstrap_config(&path).unwrap();
+	assert!(cfg.selects_parent_decisions());
+	assert!(!cfg.allow_dev_keys);
+	// The configuration prints without its decision secret.
+	let printed = format!("{cfg:?}");
+	assert!(printed.contains("decision_signing_secret: Some(<redacted>)"));
+	assert!(!printed.contains(&format!("{DECISION_SECRET:?}")));
+	assert!(!printed.contains(&hex32(DECISION_SECRET)));
+
+	let (_root, explicit) = parent_decisions_config(
+		"authority-today",
+		"decision_authority = \"today\"\n",
+		"",
+		"",
+	);
+	assert!(
+		!load_node_bootstrap_config(&explicit)
+			.unwrap()
+			.selects_parent_decisions()
+	);
+}
+
+#[test]
+fn a_selected_authority_without_its_keys_or_keys_without_it_are_refused() {
+	let (secret, tail) = decision_identity();
+	for (tag, cluster, identity, tail, expected) in [
+		(
+			"authority-no-keys",
+			"decision_authority = \"parent-decisions\"\n",
+			String::new(),
+			"\n[time]\nmvcc_retention_window_secs = 0\n".to_owned(),
+			"requires identity.decision_signing_secret and identity.trusted_decision_signers",
+		),
+		(
+			"authority-no-secret",
+			"decision_authority = \"parent-decisions\"\n",
+			String::new(),
+			tail.clone(),
+			"requires identity.decision_signing_secret and identity.trusted_decision_signers",
+		),
+		(
+			"authority-no-map",
+			"decision_authority = \"parent-decisions\"\n",
+			secret.clone(),
+			"\n[time]\nmvcc_retention_window_secs = 0\n".to_owned(),
+			"requires identity.decision_signing_secret and identity.trusted_decision_signers",
+		),
+		(
+			"keys-without-authority",
+			"",
+			secret.clone(),
+			tail.clone(),
+			"are only for cluster.decision_authority = \"parent-decisions\"",
+		),
+	] {
+		let (_root, path) = parent_decisions_config(tag, cluster, &identity, &tail);
+		let error = load_node_bootstrap_config(&path).unwrap_err();
+		let message = error.to_string();
+		assert_eq!(error.kind(), ErrorKind::InvalidInput, "{tag}: {message}");
+		assert!(message.contains(expected), "{tag}: {message}");
+		assert!(!message.contains(&hex32(DECISION_SECRET)), "{tag}");
+	}
+}
+
+#[test]
+fn a_parent_decisions_store_refuses_development_keys_a_retention_window_and_a_bad_key() {
+	let (secret, tail) = decision_identity();
+	// A recognised development key in the decision map.
+	let dev = wendelon::consensus::decisions::decision_verifying_key_bytes(
+		wendelon::consensus::decisions::dev_decision_signing_secret(2),
+	);
+	let (_root, path) = parent_decisions_config(
+		"authority-dev-key",
+		"decision_authority = \"parent-decisions\"\n",
+		&secret,
+		&format!("{tail}\"2\" = \"{}\"\n", hex32(dev)),
+	);
+	let error = load_node_bootstrap_config(&path).unwrap_err();
+	assert!(
+		error.to_string().contains("needs identity.allow_dev_keys"),
+		"{error}"
+	);
+
+	// The default seven-day MVCC window.
+	let no_window = tail.replace("[time]\nmvcc_retention_window_secs = 0\n", "");
+	let (_root, path) = parent_decisions_config(
+		"authority-window",
+		"decision_authority = \"parent-decisions\"\n",
+		&secret,
+		&no_window,
+	);
+	let error = load_node_bootstrap_config(&path).unwrap_err();
+	assert!(
+		error
+			.to_string()
+			.contains("set time.mvcc_retention_window_secs = 0"),
+		"{error}"
+	);
+
+	// A secret that is not 64 hex characters: named by field, never echoed.
+	let (_root, path) = parent_decisions_config(
+		"authority-short-secret",
+		"decision_authority = \"parent-decisions\"\n",
+		"decision_signing_secret = \"c0ffee-sentinel-7d2a\"\n",
+		&tail,
+	);
+	let error = load_node_bootstrap_config(&path).unwrap_err();
+	let message = error.to_string();
+	assert!(
+		message.contains("identity.decision_signing_secret must be 64 hex characters"),
+		"{message}"
+	);
+	assert!(!message.contains("c0ffee-sentinel-7d2a"), "{message}");
+}
+
+#[test]
+fn an_unknown_identity_or_cluster_key_fails_by_position_only() {
+	let (secret, tail) = decision_identity();
+	for (tag, cluster, identity, withheld) in [
+		(
+			"identity-typo",
+			"decision_authority = \"parent-decisions\"\n".to_owned(),
+			secret.replace("decision_signing_secret", "decision_signing_secrte"),
+			"secrte",
+		),
+		(
+			"cluster-typo",
+			"decision_authorty = \"parent-decisions\"\n".to_owned(),
+			secret.clone(),
+			"authorty",
+		),
+		(
+			"cluster-unknown-authority",
+			"decision_authority = \"parent-decisons\"\n".to_owned(),
+			secret.clone(),
+			"decisons",
+		),
+	] {
+		let (_root, path) = parent_decisions_config(tag, &cluster, &identity, &tail);
+		let error = load_node_bootstrap_config(&path).unwrap_err();
+		let message = error.to_string();
+		assert_eq!(error.kind(), ErrorKind::InvalidData, "{tag}: {message}");
+		assert!(message.contains(" at line "), "{tag}: {message}");
+		assert!(!message.contains(withheld), "{tag}: {message}");
+		assert!(
+			!message.contains(&hex32(DECISION_SECRET)),
+			"{tag}: {message}"
+		);
+	}
+}

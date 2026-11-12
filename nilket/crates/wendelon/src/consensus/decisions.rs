@@ -271,8 +271,9 @@ impl Claim {
 /// A node's development decision-signing secret.
 ///
 /// # Security
-/// Publicly derivable. The `ParentDecisions` mode is development-only and
-/// requires dev keys; production key custody is a production-required item.
+/// Publicly derivable. Accepted only under `identity.allow_dev_keys`
+/// (ADR 0721); a daemon names real decision keys in its configuration. Key
+/// rotation and custody beyond a configured secret remain open.
 pub fn dev_decision_signing_secret(node_id: u32) -> [u8; 32] {
 	crate::hash::sha256::digest(format!("wendelon-dev-decision-signing-key-{node_id}").as_bytes())
 }
@@ -476,6 +477,44 @@ pub enum DecisionRefusal {
 	/// ADR 0720: the membership sealed by the first admitted write is not the
 	/// one in effect. No new parent is admitted.
 	MembershipSealed,
+}
+
+/// ADR 0721: how the key a store signs with stands against the replicated
+/// binding of its incarnation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LocalSignerBinding {
+	/// The store's incarnation is not its node's current one: nothing is
+	/// judged about its key.
+	NotCurrent,
+	/// Current, and no key is bound yet.
+	Unbound,
+	/// Current, and the bound key is the one the store signs with.
+	Bound,
+	/// Current, and another key is bound. Everything this store signs is
+	/// refused by [`evidence::verify`]; bindings are immutable, so only the
+	/// right secret repairs it.
+	Mismatch,
+}
+
+/// Compares `local_key`, the verifying key of the secret `signer` signs with,
+/// with what applied state binds for that exact incarnation.
+pub(crate) fn local_signer_binding(
+	state: &SmState,
+	signer: Signer,
+	local_key: [u8; 32],
+) -> LocalSignerBinding {
+	if current_incarnation(state, signer.node) != Some(signer.incarnation) {
+		return LocalSignerBinding::NotCurrent;
+	}
+	match state
+		.decisions
+		.as_ref()
+		.and_then(|decisions| decisions.signer_key(signer))
+	{
+		None => LocalSignerBinding::Unbound,
+		Some(bound) if bound == local_key => LocalSignerBinding::Bound,
+		Some(_) => LocalSignerBinding::Mismatch,
+	}
 }
 
 /// ADR 0720: what the first admitted write fixed. `placement` is every peer of
