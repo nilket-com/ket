@@ -6998,5 +6998,8 @@ mod startup_ownership_tests;
 mod root_enrollment_tests;
 
 #[cfg(test)]
+mod tenant_kek_publication_tests;
+
+#[cfg(test)]
 #[path = "node/parent_decisions_cluster_tests.rs"]
 mod parent_decisions_cluster_tests;

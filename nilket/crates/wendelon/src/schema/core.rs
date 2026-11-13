@@ -2491,15 +2491,18 @@ pub const PRE_VERSIONING_FORMAT: u8 = 0;
 /// development and ADR 0701 to ADR 0703 versions, so a version is never reused).
 /// Every earlier version is refused, not upconverted. ADR 0726 version 19 adds
 /// the root check to state and its id to tenant creation (16 to 18 were
-/// `ParentDecisions` versions).
-pub const SNAPSHOT_FORMAT_VERSION: u8 = 19;
+/// `ParentDecisions` versions). ADR 0728 version 21: a recorded slab outcome may
+/// be one of two new rejections, and a tier publication naming an absent tenant
+/// KEK is no longer accepted (19 was ADR 0726's; 20 was `ParentDecisions`').
+pub const SNAPSHOT_FORMAT_VERSION: u8 = 21;
 /// Snapshot format of a `ParentDecisions` store; see `consensus::decision_mode`.
 /// ADR 0725: 18, the state of a log whose slab operations are owner-signed; it
 /// travels with the control-log format (17 was ADR 0720 to ADR 0724's, whose
 /// decision state carries the sealed membership; 16 was ADR 0704 to ADR 0719's;
 /// 14 was ADR 0701 to ADR 0703's; 15 was Today's). ADR 0726: 20, whose state
-/// carries the cluster's root check (18 was ADR 0725's; 19 is Today's).
-pub const SNAPSHOT_FORMAT_VERSION_PARENT_DECISIONS: u8 = 20;
+/// carries the cluster's root check (18 was ADR 0725's; 19 was Today's). ADR
+/// 0728: 22, as Today's 21 (20 was ADR 0726 to ADR 0727's).
+pub const SNAPSHOT_FORMAT_VERSION_PARENT_DECISIONS: u8 = 22;
 
 /// Shape of the Control Ring WAL record bodies this build writes, including the
 /// `postcard(Entry<..>)` payload of a log record. ADR 0697 version 6 carries
@@ -2508,8 +2511,12 @@ pub const SNAPSHOT_FORMAT_VERSION_PARENT_DECISIONS: u8 = 20;
 /// `ParentDecisions` versions, so a version is never reused). Every earlier version
 /// is refused, not upconverted. ADR 0726 version 19 carries the root check
 /// request and the root check id on tenant creation and tenant KEK install (16
-/// to 18 were `ParentDecisions` versions).
-pub const WAL_FORMAT_VERSION: u8 = 19;
+/// to 18 were `ParentDecisions` versions). ADR 0728 version 21: the record
+/// bodies are unchanged, their replay is not. A tier publication naming a
+/// tenant KEK absent at its decision is now rejected, so a version-19 log,
+/// which may hold one that applied, is refused whole, never replayed under the
+/// new rule (20 was `ParentDecisions`').
+pub const WAL_FORMAT_VERSION: u8 = 21;
 /// Control-log format of a `ParentDecisions` store; see `consensus::decision_mode`.
 /// ADR 0725: 18, whose slab operations are owner-signed (`OwnerOp`) and whose
 /// bare slab operations are refused at apply. A format-17 log may hold bare
@@ -2519,8 +2526,9 @@ pub const WAL_FORMAT_VERSION: u8 = 19;
 /// was ADR 0701 to ADR 0703's; 15 was Today's). ADR 0726: 20, which carries the
 /// root check request and the root check id on tenant creation and tenant KEK
 /// install; an older log could hold tenant KEKs no root check preceded, so it
-/// is refused whole (18 was ADR 0725's; 19 is Today's).
-pub const WAL_FORMAT_VERSION_PARENT_DECISIONS: u8 = 20;
+/// is refused whole (18 was ADR 0725's; 19 was Today's). ADR 0728: 22, for
+/// Today's reason at 21 (20 was ADR 0726 to ADR 0727's).
+pub const WAL_FORMAT_VERSION_PARENT_DECISIONS: u8 = 22;
 
 // Static assertions to ensure all our size calculations remain exactly correct
 const _: () = assert!(std::mem::size_of::<HybridTimestamp>() == 16);

@@ -409,3 +409,66 @@ fn a_followers_window_advances_past_w_by_its_own_acknowledgements() {
 	));
 	assert_eq!(state.tiered_slabs.len() as u64, OPS_WINDOW_W + 3);
 }
+
+/// ADR 0728: the key-presence rule is the shared Tier validator's, so a
+/// follower's owner-signed first publication is held to it in this mode too.
+#[test]
+fn a_followers_signed_encrypted_publication_needs_its_tenant_kek_present() {
+	use crate::crypto::{TenantKeyset, WrappedTenantKek};
+	use crate::schema::{TenantId, TenantKekId};
+	let tenant_id = TenantId::ZERO;
+	let retained = TenantKekId::try_from(6).unwrap();
+	let retired = TenantKekId::try_from(5).unwrap();
+	let mut state = fixture::base(3);
+	let mut keyset = TenantKeyset::default();
+	keyset.active_tenant_kek_id = Some(TenantKekId::try_from(7).unwrap());
+	for id in [6, 7] {
+		keyset.keys.insert(
+			TenantKekId::try_from(id).unwrap(),
+			WrappedTenantKek {
+				wrapped_key: vec![id as u8; 40],
+			},
+		);
+	}
+	state.tenant_keysets.insert(tenant_id, keyset);
+	let encrypted = |op_seq, slab, tenant_kek_id| {
+		let mut op = first_publication(owner(FOLLOWER), op_seq, slab);
+		let SlabCommand::Tier(TierOp { tier, .. }) = &mut op.command else {
+			unreachable!()
+		};
+		tier.is_encrypted = true;
+		tier.tenant_id = Some(tenant_id);
+		tier.tenant_kek_id = Some(tenant_kek_id);
+		op
+	};
+
+	let before = state.tiered_slabs.clone();
+	let response = apply(
+		&mut state,
+		signed(FOLLOWER, encrypted(1, 7, retired)),
+		LEADER,
+	);
+	assert!(
+		matches!(
+			recorded(&response),
+			RecordedOutcome::Rejected {
+				reason: SlabRejection::TenantKekAbsent {
+					tenant_id: rejected_tenant,
+					tenant_kek_id,
+				},
+				..
+			} if rejected_tenant == tenant_id && tenant_kek_id == retired
+		),
+		"{response:?}"
+	);
+	assert_eq!(state.tiered_slabs, before);
+
+	// Control: a retained, inactive version is present, and its pointer applies.
+	let response = apply(
+		&mut state,
+		signed(FOLLOWER, encrypted(2, 8, retained)),
+		LEADER,
+	);
+	assert!(is_applied(&response), "{response:?}");
+	assert_eq!(state.tiered_slabs.len(), before.len() + 1);
+}

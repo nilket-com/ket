@@ -130,6 +130,15 @@ async fn follower(tag: &str) -> Follower {
 		..Default::default()
 	})
 	.await;
+	// The ring holds the store's tenant keysets: an encrypted pointer is accepted
+	// only for a present version (ADR 0728).
+	sm.seed_tenant_keysets_for_test(
+		manager
+			.retained_cleanup_test_crypto()
+			.tenant_keysets_snapshot()
+			.unwrap(),
+	)
+	.await;
 	let ring = Arc::new(Ring {
 		sm: sm.clone(),
 		leader: owner.node() + 1,

@@ -153,8 +153,10 @@ fn dormant_authority_has_no_production_provider_or_activation() {
 	let core = fs::read_to_string(root.join("src/schema/core.rs")).unwrap();
 	// ADR 0726 bumped both to 19 (the root check; 9 to 14 and 16 to 18 were
 	// ParentDecisions versions, 15 was ADR 0704's).
-	assert!(core.contains("SNAPSHOT_FORMAT_VERSION: u8 = 19"));
-	assert!(core.contains("WAL_FORMAT_VERSION: u8 = 19"));
+	// ADR 0728 bumped both to 21 (a tier publication names a present tenant KEK;
+	// 20 was ParentDecisions').
+	assert!(core.contains("SNAPSHOT_FORMAT_VERSION: u8 = 21"));
+	assert!(core.contains("WAL_FORMAT_VERSION: u8 = 21"));
 	// The one admitted outside caller is the offline, read-only compromise audit CLI (ADR 0101
 	// C-S6): exactly one mention, its canonical import of the single audit entry point.
 	let audit_cli = root.join("src/cli/root2_audit.rs");

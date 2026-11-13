@@ -4716,6 +4716,19 @@ impl WendelonStateMachine {
 	}
 
 	#[cfg(test)]
+	/// Seeds tenant keysets as committed, as tenant creation and rotation leave
+	/// them: an encrypted pointer is accepted only for a present version (ADR 0728).
+	pub async fn seed_tenant_keysets_for_test(
+		&self,
+		keysets: impl IntoIterator<Item = (crate::schema::TenantId, TenantKeyset)>,
+	) {
+		let mut guard = self.inner.write().await;
+		for (tenant_id, keyset) in keysets {
+			guard.state.tenant_keysets.insert(tenant_id, keyset);
+		}
+	}
+
+	#[cfg(test)]
 	pub async fn seed_migrated_range_tombstone_for_test(
 		&self,
 		tombstone: crate::consensus::MigratedRangeTombstone,
@@ -14326,8 +14339,8 @@ mod recovery_tests {
 		let (wal, vote, snapshot) = artifact_paths(&dir);
 		let page = wal_page_with_format_version(
 			serialize_entry_page(&lease_entry(1, 0, 9, 1)).unwrap(),
-			// No build has written 21: Today writes 19, ParentDecisions 20.
-			21,
+			// No build has written 23: Today writes 21, ParentDecisions 22.
+			23,
 		);
 		write_wal_pages(&wal, &[page]);
 
@@ -14337,7 +14350,7 @@ mod recovery_tests {
 			Err(error) => error.to_string(),
 		};
 		assert!(
-			error.contains("21"),
+			error.contains("23"),
 			"the refusal names the version: {error}"
 		);
 		assert!(
@@ -14376,6 +14389,35 @@ mod recovery_tests {
 			error.to_string().contains("UnsupportedControlFormat"),
 			"{error}"
 		);
+	}
+
+	/// ADR 0728: a log written under the earlier tier rule may hold a
+	/// publication that applied and would now be rejected, so it is refused whole,
+	/// never replayed. 19 was Today's format; 20 was ParentDecisions' and is not
+	/// this mode's either.
+	#[tokio::test]
+	async fn a_wal_record_of_the_earlier_tier_rule_is_refused_at_open() {
+		for earlier in [19, 20] {
+			let dir = tempdir("wal-earlier-tier-rule");
+			let (wal, vote, snapshot) = artifact_paths(&dir);
+			write_vote_file(&vote, Vote::new_committed(3, 7));
+			write_wal_pages(
+				&wal,
+				&[wal_page_with_format_version(
+					serialize_entry_page(&lease_entry(1, 0, 99, 7)).unwrap(),
+					earlier,
+				)],
+			);
+			let io = crate::storage::io_uring::spawn_io_thread(64).unwrap();
+			let error = WendelonLogStore::open(&wal, &vote, &snapshot, io)
+				.await
+				.err()
+				.unwrap_or_else(|| panic!("a format-{earlier} WAL record must not replay"));
+			assert!(
+				error.to_string().contains("UnsupportedControlFormat"),
+				"{earlier}: {error}"
+			);
+		}
 	}
 
 	#[tokio::test]
@@ -20413,7 +20455,9 @@ mod tiered_slab_tests {
 			slab,
 			l2_uri: "memory://tier/slab_0000000000000007.wnd".into(),
 			payload_hash: [0xAB; 32],
-			is_encrypted: true,
+			// Plaintext: these tests are the operation protocol's, not key custody's
+			// (an encrypted pointer must name a present tenant KEK, ADR 0728).
+			is_encrypted: false,
 			tenant_id: None,
 			tenant_kek_id: None,
 			stats_format_version: None,
@@ -21042,6 +21086,367 @@ mod tenant_kek_tests {
 		assert!(keyset.keys.contains_key(&active_id));
 	}
 
+	/// An encrypted pointer for `slab` whose object was sealed under `tenant_kek_id`.
+	fn encrypted_tier(
+		slab: SlabRef,
+		tenant_id: TenantId,
+		tenant_kek_id: TenantKekId,
+	) -> TieredSlab {
+		TieredSlab {
+			slab,
+			l2_uri: "s3://bucket/slab-41".to_string(),
+			payload_hash: [9; 32],
+			is_encrypted: true,
+			tenant_id: Some(tenant_id),
+			tenant_kek_id: Some(tenant_kek_id),
+			stats_format_version: None,
+			stats_block_len: None,
+			stats_block_hash128: None,
+			tombstone_metadata: TombstoneMetadata::None,
+			supersession_metadata: SupersessionMetadata::None,
+			certified: None,
+		}
+	}
+
+	/// A state with a registered owner, an active tenant and a keyset holding a
+	/// retained historical version beside the active one; and one of the owner's slabs.
+	fn rotated_state(historical_id: TenantKekId, active_id: TenantKekId) -> (SmState, SlabRef) {
+		let owner = OwnerRef::for_test(1, 0x41);
+		let mut state = SmState::default();
+		let (resp, _) = apply_request(
+			&mut state,
+			WendelonRequest::RegisterIncarnation(RegisterIncarnation {
+				node: owner.node(),
+				incarnation: owner.incarnation(),
+				supersedes: None,
+			}),
+		);
+		assert_eq!(resp, WendelonResponse::Success);
+		seed_active_tenant(&mut state, TenantId::ZERO);
+		seed_two_version_keyset(&mut state, TenantId::ZERO, historical_id, active_id);
+		(state, owner.slab(SlabId::new(41)))
+	}
+
+	fn first_publication(tier: TieredSlab) -> WendelonRequest {
+		WendelonRequest::SlabOp(crate::consensus::slab_ops::SlabOp {
+			op_seq: 1,
+			command: crate::consensus::slab_ops::SlabCommand::Tier(
+				crate::consensus::slab_ops::TierOp {
+					tier,
+					replaces: None,
+				},
+			),
+		})
+	}
+
+	fn recorded(response: &WendelonResponse) -> &crate::consensus::slab_ops::RecordedOutcome {
+		match response {
+			WendelonResponse::Op(crate::consensus::slab_ops::OpResponse::Receipt(receipt)) => {
+				match &receipt.outcome {
+					crate::consensus::slab_ops::OpOutcome::Recorded(outcome) => outcome,
+					other => panic!("expected a recorded outcome, got {other:?}"),
+				}
+			}
+			other => panic!("expected a receipt, got {other:?}"),
+		}
+	}
+
+	/// DC-231: an upload sealed under a version that is then retired must not
+	/// become the slab's authoritative pointer.
+	#[test]
+	fn a_publication_decided_after_its_tenant_kek_retired_installs_no_pointer() {
+		let historical_id = TenantKekId::try_from(6).unwrap();
+		let active_id = TenantKekId::try_from(7).unwrap();
+		let (mut state, slab) = rotated_state(historical_id, active_id);
+
+		let (resp, _) = apply_request(
+			&mut state,
+			WendelonRequest::RetireTenantKekVersion(RetireTenantKekVersion {
+				tenant_id: TenantId::ZERO,
+				tenant_kek_id: historical_id,
+			}),
+		);
+		assert_eq!(resp, WendelonResponse::Success);
+
+		let (resp, event) = apply_request(
+			&mut state,
+			first_publication(encrypted_tier(slab, TenantId::ZERO, historical_id)),
+		);
+		assert_eq!(
+			recorded(&resp),
+			&crate::consensus::slab_ops::RecordedOutcome::Rejected {
+				reason: crate::consensus::slab_ops::SlabRejection::TenantKekAbsent {
+					tenant_id: TenantId::ZERO,
+					tenant_kek_id: historical_id,
+				},
+				index: 0,
+			},
+			"a pointer naming a retired tenant KEK"
+		);
+		assert!(event.is_none());
+		assert!(!state.tiered_slabs.contains_key(&slab));
+
+		// The same operation again learns its recorded rejection, not a new verdict,
+		// even once the version is back in the keyset.
+		state
+			.tenant_keysets
+			.get_mut(&TenantId::ZERO)
+			.unwrap()
+			.keys
+			.insert(
+				historical_id,
+				WrappedTenantKek {
+					wrapped_key: vec![1; 40],
+				},
+			);
+		let (again, event) = apply_request(
+			&mut state,
+			first_publication(encrypted_tier(slab, TenantId::ZERO, historical_id)),
+		);
+		assert_eq!(again, resp);
+		assert!(event.is_none());
+		assert!(!state.tiered_slabs.contains_key(&slab));
+	}
+
+	/// An encrypted pointer must say which key opens it, and that key must be in
+	/// its tenant's keyset; a plaintext pointer names none.
+	#[test]
+	fn an_encrypted_publication_without_a_present_key_reference_is_rejected() {
+		use crate::consensus::slab_ops::{RecordedOutcome, SlabRejection};
+		let historical_id = TenantKekId::try_from(6).unwrap();
+		let active_id = TenantKekId::try_from(7).unwrap();
+		let unknown_id = TenantKekId::try_from(8).unwrap();
+		let other_tenant = TenantId::new(9);
+		let absent = |tenant_id, tenant_kek_id| SlabRejection::TenantKekAbsent {
+			tenant_id,
+			tenant_kek_id,
+		};
+		for (name, edit, reason) in [
+			(
+				"no tenant",
+				(|tier: &mut TieredSlab| tier.tenant_id = None) as fn(&mut TieredSlab),
+				Some(SlabRejection::EncryptedKeyReferenceMissing),
+			),
+			(
+				"no key id",
+				|tier: &mut TieredSlab| tier.tenant_kek_id = None,
+				Some(SlabRejection::EncryptedKeyReferenceMissing),
+			),
+			(
+				"neither",
+				|tier: &mut TieredSlab| {
+					tier.tenant_id = None;
+					tier.tenant_kek_id = None;
+				},
+				Some(SlabRejection::EncryptedKeyReferenceMissing),
+			),
+			(
+				"a key never installed",
+				|tier: &mut TieredSlab| tier.tenant_kek_id = TenantKekId::try_from(8).ok(),
+				Some(absent(TenantId::ZERO, unknown_id)),
+			),
+			(
+				"a tenant with no keyset",
+				|tier: &mut TieredSlab| tier.tenant_id = Some(TenantId::new(9)),
+				Some(absent(other_tenant, historical_id)),
+			),
+			(
+				"plaintext, naming nothing",
+				|tier: &mut TieredSlab| {
+					tier.is_encrypted = false;
+					tier.tenant_id = None;
+					tier.tenant_kek_id = None;
+				},
+				None,
+			),
+		] {
+			let (mut state, slab) = rotated_state(historical_id, active_id);
+			let mut tier = encrypted_tier(slab, TenantId::ZERO, historical_id);
+			edit(&mut tier);
+			let (resp, event) = apply_request(&mut state, first_publication(tier));
+			match reason {
+				Some(reason) => {
+					assert_eq!(
+						recorded(&resp),
+						&RecordedOutcome::Rejected { reason, index: 0 },
+						"{name}"
+					);
+					assert!(event.is_none(), "{name}");
+					assert!(!state.tiered_slabs.contains_key(&slab), "{name}");
+				}
+				None => {
+					assert_eq!(
+						recorded(&resp),
+						&RecordedOutcome::Applied { index: 0 },
+						"{name}"
+					);
+					assert!(state.tiered_slabs.contains_key(&slab), "{name}");
+				}
+			}
+		}
+	}
+
+	/// A replacement and a refresh of a pointer pass on the key their own pointer
+	/// holds; a replacement naming an absent key is rejected and the old pointer stays.
+	#[test]
+	fn a_replacing_publication_is_held_to_the_same_key_presence() {
+		use crate::consensus::slab_ops::{
+			RecordedOutcome, SlabCommand, SlabOp, SlabRejection, TierGeneration, TierOp,
+		};
+		let historical_id = TenantKekId::try_from(6).unwrap();
+		let active_id = TenantKekId::try_from(7).unwrap();
+		let unknown_id = TenantKekId::try_from(8).unwrap();
+		let (mut state, slab) = rotated_state(historical_id, active_id);
+		let first = encrypted_tier(slab, TenantId::ZERO, historical_id);
+		let (resp, _) = apply_request(&mut state, first_publication(first.clone()));
+		assert!(matches!(recorded(&resp), RecordedOutcome::Applied { .. }));
+		let replacing = |op_seq, tier: TieredSlab, replaces: &TieredSlab| {
+			WendelonRequest::SlabOp(SlabOp {
+				op_seq,
+				command: SlabCommand::Tier(TierOp {
+					tier,
+					replaces: Some(TierGeneration::from(replaces)),
+				}),
+			})
+		};
+
+		// A metadata refresh of the same generation.
+		let mut refreshed = first.clone();
+		refreshed.supersession_metadata = SupersessionMetadata::Untracked;
+		assert_ne!(refreshed, first);
+		let (resp, _) = apply_request(&mut state, replacing(2, refreshed.clone(), &first));
+		assert!(matches!(recorded(&resp), RecordedOutcome::Applied { .. }));
+
+		// A successor under a key that is not in the keyset.
+		let mut orphan = encrypted_tier(slab, TenantId::ZERO, unknown_id);
+		orphan.l2_uri = "s3://bucket/slab-41-orphan".to_string();
+		let (resp, event) = apply_request(&mut state, replacing(3, orphan, &refreshed));
+		assert_eq!(
+			recorded(&resp),
+			&RecordedOutcome::Rejected {
+				reason: SlabRejection::TenantKekAbsent {
+					tenant_id: TenantId::ZERO,
+					tenant_kek_id: unknown_id,
+				},
+				index: 0,
+			}
+		);
+		assert!(event.is_none());
+		assert_eq!(state.tiered_slabs[&slab], refreshed);
+
+		// A successor re-wrapped to the active key; the old version is then free.
+		let mut rewrapped = encrypted_tier(slab, TenantId::ZERO, active_id);
+		rewrapped.l2_uri = "s3://bucket/slab-41-rewrapped".to_string();
+		let (resp, _) = apply_request(&mut state, replacing(4, rewrapped.clone(), &refreshed));
+		assert!(matches!(recorded(&resp), RecordedOutcome::Applied { .. }));
+		let (resp, _) = apply_request(
+			&mut state,
+			WendelonRequest::RetireTenantKekVersion(RetireTenantKekVersion {
+				tenant_id: TenantId::ZERO,
+				tenant_kek_id: historical_id,
+			}),
+		);
+		assert_eq!(resp, WendelonResponse::Success);
+		assert_eq!(state.tiered_slabs[&slab], rewrapped);
+	}
+
+	/// Control: the guard judges the operation being decided. An applied
+	/// publication keeps its recorded answer after its pointer was retired and
+	/// its key version legitimately went.
+	#[test]
+	fn an_applied_publication_keeps_its_answer_after_its_pointer_and_key_have_gone() {
+		use crate::consensus::slab_ops::{
+			RecordedOutcome, RetireOp, SlabCommand, SlabOp, TierGeneration,
+		};
+		let historical_id = TenantKekId::try_from(6).unwrap();
+		let active_id = TenantKekId::try_from(7).unwrap();
+		let (mut state, slab) = rotated_state(historical_id, active_id);
+		let tier = encrypted_tier(slab, TenantId::ZERO, historical_id);
+		let (first, _) = apply_request(&mut state, first_publication(tier.clone()));
+		assert!(matches!(recorded(&first), RecordedOutcome::Applied { .. }));
+		let (resp, _) = apply_request(
+			&mut state,
+			WendelonRequest::SlabOp(SlabOp {
+				op_seq: 2,
+				command: SlabCommand::Retire(RetireOp {
+					slab,
+					expected: TierGeneration::from(&tier),
+					certified: None,
+				}),
+			}),
+		);
+		assert!(matches!(recorded(&resp), RecordedOutcome::Applied { .. }));
+		let (resp, _) = apply_request(
+			&mut state,
+			WendelonRequest::RetireTenantKekVersion(RetireTenantKekVersion {
+				tenant_id: TenantId::ZERO,
+				tenant_kek_id: historical_id,
+			}),
+		);
+		assert_eq!(resp, WendelonResponse::Success);
+
+		let (again, event) = apply_request(&mut state, first_publication(tier));
+		assert_eq!(again, first);
+		assert!(event.is_none());
+		assert!(!state.tiered_slabs.contains_key(&slab));
+	}
+
+	/// Control: decided the other way round, the pointer stands and holds its key.
+	#[test]
+	fn a_publication_decided_before_retirement_holds_its_tenant_kek() {
+		let historical_id = TenantKekId::try_from(6).unwrap();
+		let active_id = TenantKekId::try_from(7).unwrap();
+		let (mut state, slab) = rotated_state(historical_id, active_id);
+
+		let (resp, _) = apply_request(
+			&mut state,
+			first_publication(encrypted_tier(slab, TenantId::ZERO, historical_id)),
+		);
+		assert!(matches!(
+			recorded(&resp),
+			crate::consensus::slab_ops::RecordedOutcome::Applied { .. }
+		));
+
+		let (resp, _) = apply_request(
+			&mut state,
+			WendelonRequest::RetireTenantKekVersion(RetireTenantKekVersion {
+				tenant_id: TenantId::ZERO,
+				tenant_kek_id: historical_id,
+			}),
+		);
+		match resp {
+			WendelonResponse::Error(message) => {
+				assert!(message.contains("is still referenced by 1 tiered slabs"));
+			}
+			other => panic!("expected referenced tenant KEK rejection, got {other:?}"),
+		}
+		assert!(
+			state.tenant_keysets[&TenantId::ZERO]
+				.keys
+				.contains_key(&historical_id)
+		);
+		assert!(state.tiered_slabs.contains_key(&slab));
+	}
+
+	/// Control: rotation alone does not forbid a publication under the retained version.
+	#[test]
+	fn a_publication_under_a_retained_inactive_tenant_kek_applies() {
+		let historical_id = TenantKekId::try_from(6).unwrap();
+		let active_id = TenantKekId::try_from(7).unwrap();
+		let (mut state, slab) = rotated_state(historical_id, active_id);
+
+		let (resp, event) = apply_request(
+			&mut state,
+			first_publication(encrypted_tier(slab, TenantId::ZERO, historical_id)),
+		);
+		assert!(matches!(
+			recorded(&resp),
+			crate::consensus::slab_ops::RecordedOutcome::Applied { .. }
+		));
+		assert!(event.is_some());
+		assert_eq!(state.tiered_slabs[&slab].tenant_kek_id, Some(historical_id));
+	}
+
 	/// Rewrite an encoded snapshot's format version, leaving the body and its
 	/// digest untouched. The artifact stays byte-valid; only its declared shape
 	/// changes, which is exactly the condition the gate must judge.
@@ -21087,13 +21492,26 @@ mod tenant_kek_tests {
 		);
 	}
 
+	/// ADR 0728: a snapshot of the earlier tier rule (19 Today's, 20
+	/// ParentDecisions') is refused, not read.
+	#[test]
+	fn a_snapshot_of_the_earlier_tier_rule_is_refused() {
+		for earlier in [19, 20] {
+			let bytes = snapshot_bytes_with_format_version(&SmState::default(), earlier);
+			let error = decode_snapshot_reader(bytes.as_slice())
+				.expect_err("an earlier snapshot format must be refused");
+			assert!(error.contains(&earlier.to_string()), "{earlier}: {error}");
+			assert!(!error.contains("hash mismatch"), "{earlier}: {error}");
+		}
+	}
+
 	#[test]
 	fn adr0085_snapshot_from_a_newer_build_is_refused_by_name() {
-		let bytes = snapshot_bytes_with_format_version(&SmState::default(), 21);
+		let bytes = snapshot_bytes_with_format_version(&SmState::default(), 23);
 		let error = decode_snapshot_reader(bytes.as_slice())
 			.expect_err("a version this build does not know must be refused");
 		assert!(
-			error.contains("21"),
+			error.contains("23"),
 			"the refusal names the version: {error}"
 		);
 		assert!(
@@ -21898,25 +22316,25 @@ pub(crate) mod body_format_corpus {
 		include_str!("../../tests/fixtures/consensus_body/wal_v8_entries.txt");
 	const SNAPSHOT_V8_OUTGOING_MANIFEST: &str =
 		include_str!("../../tests/fixtures/consensus_body/snapshot_v8.txt");
-	const WAL_V19_MANIFEST: &str =
-		include_str!("../../tests/fixtures/consensus_body/wal_v19_entries.txt");
-	const SNAPSHOT_V19_MANIFEST: &str =
-		include_str!("../../tests/fixtures/consensus_body/snapshot_v19.txt");
+	const WAL_V21_MANIFEST: &str =
+		include_str!("../../tests/fixtures/consensus_body/wal_v21_entries.txt");
+	const SNAPSHOT_V21_MANIFEST: &str =
+		include_str!("../../tests/fixtures/consensus_body/snapshot_v21.txt");
 
 	#[test]
-	fn current_wal_v19_and_snapshot_v19_match_stored_goldens() {
-		let stored_wal = parse_manifest(WAL_V19_MANIFEST);
+	fn current_wal_v21_and_snapshot_v21_match_stored_goldens() {
+		let stored_wal = parse_manifest(WAL_V21_MANIFEST);
 		let corpus = wal_corpus();
 		assert_eq!(stored_wal.len(), corpus.len());
 		for (name, bytes) in corpus {
 			assert_eq!(
 				hex(&bytes),
 				hex(&stored_wal[name]),
-				"WAL v19 body moved for {name}; bump the format and add a refusal fixture"
+				"WAL v21 body moved for {name}; bump the format and add a refusal fixture"
 			);
 		}
 
-		let stored_snapshot = parse_manifest(SNAPSHOT_V19_MANIFEST);
+		let stored_snapshot = parse_manifest(SNAPSHOT_V21_MANIFEST);
 		let state = canonical_current_sm_state();
 		assert_eq!(
 			hex(&postcard::to_stdvec(&state).unwrap()),
@@ -22065,7 +22483,7 @@ pub(crate) mod body_format_corpus {
 		for (name, bytes) in wal_corpus() {
 			wal.push_str(&format!("{name}={}\n", hex(&bytes)));
 		}
-		std::fs::write(dir.join("wal_v19_entries.txt"), wal).unwrap();
+		std::fs::write(dir.join("wal_v21_entries.txt"), wal).unwrap();
 		let mut mutations = String::new();
 		for (name, mutation) in canonical_mutations() {
 			mutations.push_str(&format!(
@@ -22085,7 +22503,7 @@ pub(crate) mod body_format_corpus {
 			hex(&postcard::to_stdvec(&state).unwrap()),
 			hex(&postcard::to_stdvec(&entry).unwrap())
 		);
-		std::fs::write(dir.join("snapshot_v19.txt"), snapshot).unwrap();
+		std::fs::write(dir.join("snapshot_v21.txt"), snapshot).unwrap();
 		println!("manifests written to {}", dir.display());
 	}
 }

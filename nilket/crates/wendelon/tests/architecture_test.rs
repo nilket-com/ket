@@ -10265,18 +10265,18 @@ fn adr0093_snapshot_v2_and_v3_fixtures_are_both_guarded() {
 		.unwrap();
 	let v5 = fs::read_to_string(manifest_dir.join("tests/fixtures/consensus_body/snapshot_v5.txt"))
 		.unwrap();
-	assert!(core.contains("pub const SNAPSHOT_FORMAT_VERSION: u8 = 19;"));
+	assert!(core.contains("pub const SNAPSHOT_FORMAT_VERSION: u8 = 21;"));
 	assert!(!manifest_dir.join("src/consensus/snapshot_body.rs").exists());
 	for required in [
 		"SNAPSHOT_V2_MANIFEST",
 		"SNAPSHOT_V3_MANIFEST",
 		"SNAPSHOT_V4_MANIFEST",
 		"SNAPSHOT_V5_MANIFEST",
-		// ADR 0704: v8 is retained as a refusal input. ADR 0726: v19 is current.
+		// ADR 0704: v8 is retained as a refusal input. ADR 0726: v19 was current; ADR 0728: v21 is.
 		"SNAPSHOT_V8_OUTGOING_MANIFEST",
-		"SNAPSHOT_V19_MANIFEST",
+		"SNAPSHOT_V21_MANIFEST",
 		"adr0704_every_pre_v15_snapshot_body_is_refused_before_decode",
-		"current_wal_v19_and_snapshot_v19_match_stored_goldens",
+		"current_wal_v21_and_snapshot_v21_match_stored_goldens",
 	] {
 		assert!(
 			raft.contains(required),
@@ -10308,7 +10308,7 @@ fn adr0094_write_cap_and_legacy_replay_have_one_authority() {
 	let client = fs::read_to_string(manifest_dir.join("src/client/core.rs")).unwrap();
 	let schema = fs::read_to_string(manifest_dir.join("src/schema/core.rs")).unwrap();
 	let raft = fs::read_to_string(manifest_dir.join("src/consensus/raft_storage.rs")).unwrap();
-	assert!(schema.contains("pub const WAL_FORMAT_VERSION: u8 = 19;"));
+	assert!(schema.contains("pub const WAL_FORMAT_VERSION: u8 = 21;"));
 	assert_eq!(core.matches("pub const MAX_SECTION_BYTES:").count(), 1);
 	assert_eq!(
 		client
@@ -11774,8 +11774,9 @@ fn snapshot_lease_writers_do_not_await_local_publication_locks() {
 		.split("fn apply_entry_to_state(")
 		.next()
 		.unwrap();
-	// Eight cfg(test) seeding helpers plus the two production writers.
-	assert_eq!(sm.matches("self.inner.write().await").count(), 10);
+	// Nine cfg(test) seeding helpers (ADR 0728 added the tenant keysets') plus
+	// the two production writers.
+	assert_eq!(sm.matches("self.inner.write().await").count(), 11);
 	let apply = sm
 		.split("let pending_checkpoint = {\n\t\t\tlet mut guard = self.inner.write().await;")
 		.nth(1)

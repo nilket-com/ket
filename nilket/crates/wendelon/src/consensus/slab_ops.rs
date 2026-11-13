@@ -417,6 +417,15 @@ pub enum SlabRejection {
 	ProvenanceMismatch,
 	/// ADR 0704: in ParentDecisions mode a retirement must carry its certified provenance.
 	CertificationRequired,
+	/// ADR 0728: an encrypted pointer whose tenant KEK is not in the tenant's
+	/// keyset at this decision: retired, or never installed. The object cannot be
+	/// opened, so the pointer is not installed and the local copy stays.
+	TenantKekAbsent {
+		tenant_id: TenantId,
+		tenant_kek_id: TenantKekId,
+	},
+	/// ADR 0728: an encrypted pointer that names no tenant or no tenant KEK.
+	EncryptedKeyReferenceMissing,
 }
 
 /// A decision as the state machine recorded it, at its original index.

@@ -3456,6 +3456,15 @@ mod tests {
 		manager: &SlabManager,
 		pointer: &TieredSlabPointer,
 	) {
+		// The ring holds the store's tenant keysets, as creation and rotation
+		// commit them: a later encrypted pointer must name a present version.
+		sm.seed_tenant_keysets_for_test(
+			manager
+				.retained_cleanup_test_crypto()
+				.tenant_keysets_snapshot()
+				.unwrap(),
+		)
+		.await;
 		sm.seed_tiered_slab_for_test(TieredSlab {
 			slab: manager.owner_ref().unwrap().slab(pointer.slab_id),
 			l2_uri: pointer.l2_uri.clone(),

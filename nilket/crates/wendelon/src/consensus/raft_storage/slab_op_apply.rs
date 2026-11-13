@@ -99,6 +99,36 @@ fn require_claim_held(
 	Err(Box::new(SlabRejection::NotClaimedBy { current }))
 }
 
+/// ADR 0728: an encrypted pointer accepted at this decision names a tenant KEK
+/// that is in its tenant's keyset in this same state. Presence, not activeness:
+/// a rotated version that has not been retired still opens its objects. This
+/// decision and a version's retirement are ordered by the one reducer: a pointer
+/// accepted first holds its version against retirement by the reference count,
+/// and a retirement decided first makes the pointer's operation a rejection.
+/// It judges the operation being decided and nothing recorded earlier.
+fn require_tenant_kek_present(
+	state: &SmState,
+	tier: &TieredSlab,
+) -> Result<(), Box<SlabRejection>> {
+	if !tier.is_encrypted {
+		return Ok(());
+	}
+	let (Some(tenant_id), Some(tenant_kek_id)) = (tier.tenant_id, tier.tenant_kek_id) else {
+		return Err(Box::new(SlabRejection::EncryptedKeyReferenceMissing));
+	};
+	let present = state
+		.tenant_keysets
+		.get(&tenant_id)
+		.is_some_and(|keyset| keyset.keys.contains_key(&tenant_kek_id));
+	if !present {
+		return Err(Box::new(SlabRejection::TenantKekAbsent {
+			tenant_id,
+			tenant_kek_id,
+		}));
+	}
+	Ok(())
+}
+
 /// ADR 0704: certified provenance must name its own operation, the generation its
 /// command replaces or retires, and (for a retirement) its own slab. A proposer's
 /// link to another operation is never trusted. In ParentDecisions mode (the state
@@ -162,7 +192,7 @@ fn validate_command(
 					current,
 				}));
 			}
-			Ok(())
+			require_tenant_kek_present(state, tier)
 		}
 		SlabCommand::Retire(RetireOp { slab, expected, .. }) => {
 			let Some(current) = state.tiered_slabs.get(slab).map(TierGeneration::from) else {
