@@ -1949,12 +1949,40 @@ impl WendelonNode {
 		let l2_for_sweeper = l2.clone();
 		#[cfg(test)]
 		scope.checkpoint(&cfg, "io_workers").await?;
+		// ADR 0726: only a genuinely fresh forming store may generate a root
+		// KEK. Every other open reads the enrolled artifact and never mints one.
+		let control_is_fresh =
+			log_store.bootstrap_mode().await == DurableBootstrapMode::FreshBootstrap;
+		let forming = control_is_fresh
+			&& storage_init_fresh
+			&& matches!(cfg.cluster, ClusterBootstrapConfig::Bootstrap);
+		let root_kek_mode = if forming {
+			crate::crypto::RootKekBootstrapMode::GenerateOrCreate
+		} else {
+			crate::crypto::RootKekBootstrapMode::EnrollExisting
+		};
+		let root_kek = cfg
+			.root_kek_provider
+			.build_with_owner(&cfg.data_dir, &owner, root_kek_mode)
+			.map_err(|error| {
+				if forming || error.kind() != ErrorKind::NotFound {
+					return error;
+				}
+				let reason = if control_is_fresh {
+					"RootKekNotEnrolled: a joining member needs the cluster's root KEK artifact in its data directory before its first start"
+				} else {
+					"RootKekMissing: this store's root KEK artifact is gone; a root KEK is never regenerated for an established store"
+				};
+				Error::new(ErrorKind::NotFound, format!("{reason} ({error})"))
+			})?;
 		let crypto = Arc::new(CryptoManager::new_with_cache_config_and_owner(
-			cfg.root_kek_provider
-				.build_with_owner(&cfg.data_dir, &owner)?,
+			root_kek,
 			cfg.crypto_cache,
 			owner.clone(),
 		));
+		// The root KEK artifact exists; the storage index does not yet.
+		#[cfg(test)]
+		scope.checkpoint(&cfg, "root_kek").await?;
 		#[cfg(not(feature = "test-support"))]
 		let slab: Arc<SlabManager> = {
 			let config = SlabManagerConfig {
@@ -2110,9 +2138,35 @@ impl WendelonNode {
 			} else {
 				RestoreValidationStatus::Complete
 			});
-		// Safe because Raft has not been constructed yet, so no tenant-KEK
-		// observer callback can race this authoritative bootstrap snapshot.
-		crypto.replace_keysets_from_authoritative_snapshot(&recovered_state.tenant_keysets)?;
+		// Safe because Raft has not been constructed yet, so no key-authority
+		// callback can race this authoritative bootstrap state. ADR 0726: the
+		// recovered root check is verified here; a root that does not
+		// reproduce it refuses startup, and keys without a check are never
+		// given one by inference.
+		if recovered_state.root_check.is_none()
+			&& (!recovered_state.tenants.is_empty() || !recovered_state.tenant_keysets.is_empty())
+		{
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"RootCheckMissing: recovered state holds tenants or tenant KEKs but no root check",
+			));
+		}
+		let recovered_index = recovered_state.last_applied_log_id.map_or(0, |id| id.index);
+		crypto.fence_before_publication(
+			recovered_state
+				.root_check
+				.as_ref()
+				.map(crate::crypto::RootCheck::id),
+			recovered_index,
+		);
+		crypto.sync_key_authority(&crate::crypto::KeyAuthority {
+			applied_index: recovered_index,
+			root_check: recovered_state.root_check.clone(),
+			keysets: recovered_state.tenant_keysets.clone(),
+		})?;
+		if let crate::crypto::RootBindingStatus::Mismatch(id) = crypto.root_binding_status() {
+			return Err(crate::crypto::RootBindingRefusal::Mismatch.into_startup_error(id));
+		}
 		// ADR 0697: only this store's own committed pointers are its tier
 		// evidence. A view that is not authoritative for this store (a
 		// superseded or unexplained identity, already fenced) stages nothing
@@ -2636,6 +2690,31 @@ impl WendelonNode {
 		if bootstrap_mode == DurableBootstrapMode::FreshBootstrap
 			&& matches!(cfg.cluster, ClusterBootstrapConfig::Bootstrap)
 		{
+			// ADR 0726: initial formation. The root check commits before the
+			// default tenant's KEK; the seeding below calls the same routine and
+			// finds it present. A restart anywhere in here continues through the
+			// default-tenant task.
+			#[cfg(test)]
+			scope.checkpoint(&cfg, "root_check").await?;
+			match establish_root_check_if_forming(
+				&raft,
+				&state_machine,
+				crypto.as_ref(),
+				local_node,
+			)
+			.await?
+			{
+				RootCheckFormation::Established | RootCheckFormation::AlreadyPresent => {}
+				RootCheckFormation::Retry => {
+					return Err(Error::new(
+						ErrorKind::Other,
+						"lost local leadership while establishing the root check during fresh bootstrap",
+					));
+				}
+				RootCheckFormation::NotForming(reason) => return Err(Error::other(reason)),
+			}
+			#[cfg(test)]
+			scope.checkpoint(&cfg, "root_check_established").await?;
 			match seed_default_tenant_kek_if_missing(
 				&raft,
 				&state_machine,
@@ -3106,6 +3185,7 @@ impl WendelonNode {
 			audit_materialization: self.audit_materialization.clone(),
 			restore_validation: self.restore_validation.clone(),
 			retention: self.retention.clone(),
+			crypto: self.crypto.clone(),
 		}
 	}
 
@@ -3131,6 +3211,7 @@ pub struct NodeReadinessView {
 	audit_materialization: Arc<AuditMaterializationTracker>,
 	restore_validation: watch::Receiver<RestoreValidationStatus>,
 	retention: Arc<RetentionGuard>,
+	crypto: Arc<CryptoManager>,
 }
 
 #[async_trait]
@@ -3163,6 +3244,21 @@ impl ReadinessReporter for NodeReadinessView {
 			.or(decision_reason)
 			.or_else(|| self.data_server.tier_authority_readiness_reason())
 			.or_else(|| self.restore_validation.borrow().degraded_reason())
+			// ADR 0726: Ready needs a root verified against the cluster's check.
+			// This reports; the binding itself is what refuses key work.
+			.or_else(|| match self.crypto.root_binding_status() {
+				crate::crypto::RootBindingStatus::Verified(_) => None,
+				crate::crypto::RootBindingStatus::Pending => {
+					Some(if self.crypto.key_authority_delivery_failed() {
+						"KeyAuthoritySyncFailed".to_string()
+					} else {
+						"RootCheckPending".to_string()
+					})
+				}
+				crate::crypto::RootBindingStatus::Mismatch(_) => {
+					Some("RootKekMismatch".to_string())
+				}
+			})
 			.or_else(|| {
 				(audit_materialization_lag_entries > 0).then(|| "AuditLagExceeded".to_string())
 			});
@@ -3566,9 +3662,11 @@ fn build_create_tenant_request(
 			quota_bytes,
 			replication_factor,
 			tenant_keyset: keyset.clone(),
+			under_root: crypto.verified_root_check_id()?,
 		});
 	}
 	let rotation = crypto.prepare_rotation(tenant_id)?;
+	let under_root = rotation.under_root;
 	let mut tenant_keyset = crate::crypto::TenantKeyset::default();
 	tenant_keyset.active_tenant_kek_id = Some(rotation.tenant_kek_id);
 	tenant_keyset.keys.insert(
@@ -3582,7 +3680,92 @@ fn build_create_tenant_request(
 		quota_bytes,
 		replication_factor,
 		tenant_keyset,
+		under_root,
 	})
+}
+
+/// What `establish_root_check_if_forming` found (ADR 0726).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RootCheckFormation {
+	/// This call committed the cluster's root check.
+	Established,
+	/// A root check is already in applied state.
+	AlreadyPresent,
+	/// This node is not the sole member of a forming cluster; nothing was
+	/// proposed.
+	NotForming(&'static str),
+	/// Not the committed leader right now.
+	Retry,
+}
+
+/// The only constructor of `EstablishRootCheck` (ADR 0726). It acts for
+/// initial formation and for a formation interrupted before the check
+/// committed, and only on what applied state shows after a linearizable
+/// barrier on the local leader: no check, no tenant, no keyset, exactly one
+/// voter (this node), no learner, and only the genesis epoch. Configuration
+/// grants nothing; a joiner or a recovered multi-member cluster never
+/// establishes.
+pub(crate) async fn establish_root_check_if_forming(
+	raft: &WendelonRaft,
+	state_machine: &WendelonStateMachine,
+	crypto: &CryptoManager,
+	local_node: NodeId,
+) -> std::io::Result<RootCheckFormation> {
+	if raft.current_leader().await != Some(local_node.id) {
+		return Ok(RootCheckFormation::Retry);
+	}
+	if raft.ensure_linearizable().await.is_err() {
+		return Ok(RootCheckFormation::Retry);
+	}
+	// Read in place: the state is large, and this future is nested in the
+	// startup future, so no copy of it is held across an await.
+	let local = local_node.id;
+	let standing = state_machine
+		.read_state(move |state| {
+			if state.root_check.is_some() {
+				return Some(RootCheckFormation::AlreadyPresent);
+			}
+			if !state.tenants.is_empty() || !state.tenant_keysets.is_empty() {
+				return Some(RootCheckFormation::NotForming(
+					"RootCheckMissing: tenants or tenant KEKs exist without a root check",
+				));
+			}
+			let membership = state.last_membership.membership();
+			let voters: BTreeSet<u32> = membership.voter_ids().collect();
+			if voters.len() != 1 || !voters.contains(&local) || membership.nodes().count() != 1 {
+				return Some(RootCheckFormation::NotForming(
+					"RootCheckMissing: a multi-member cluster has no root check",
+				));
+			}
+			// No epoch of this cluster ever held another member: no join was admitted.
+			if state
+				.epoch_history
+				.values()
+				.any(|epoch| epoch.peers.keys().any(|peer| *peer != local))
+			{
+				return Some(RootCheckFormation::NotForming(
+					"RootCheckMissing: another member was admitted before a root check existed",
+				));
+			}
+			None
+		})
+		.await;
+	if let Some(standing) = standing {
+		return Ok(standing);
+	}
+	let candidate = crypto.candidate_root_check()?;
+	let request = crate::consensus::WendelonRequest::EstablishRootCheck(candidate);
+	let response = raft
+		.client_write(request)
+		.await
+		.map_err(|error| Error::other(format!("establish root check: {error}")))?;
+	match response.data {
+		crate::consensus::WendelonResponse::Success => Ok(RootCheckFormation::Established),
+		crate::consensus::WendelonResponse::Error(message) => Err(Error::other(message)),
+		other => Err(Error::other(format!(
+			"establish root check: unexpected response {other:?}"
+		))),
+	}
 }
 
 async fn seed_default_tenant_kek_if_missing(
@@ -3599,6 +3782,16 @@ async fn seed_default_tenant_kek_if_missing(
 	if raft.current_leader().await != Some(local_node.id) {
 		return Ok(DefaultTenantKekSeedState::Retry);
 	}
+	// ADR 0726: formation, or its continuation after a restart, establishes
+	// the root check before the first tenant KEK. Every other case leaves it
+	// alone; the create below is then refused by the state machine or by the
+	// local binding, and this task keeps reporting why.
+	match establish_root_check_if_forming(raft, state_machine, crypto, local_node).await? {
+		RootCheckFormation::Established | RootCheckFormation::AlreadyPresent => {}
+		RootCheckFormation::Retry => return Ok(DefaultTenantKekSeedState::Retry),
+		RootCheckFormation::NotForming(reason) => return Err(Error::other(reason)),
+	}
+	let snapshot = state_machine.state_snapshot().await;
 	let create = build_create_tenant_request(
 		&snapshot,
 		crypto,
@@ -3721,7 +3914,8 @@ async fn request_join_via_seeds(
 				Ok(resp) => {
 					last_err = Some(Error::new(
 						match resp.reason_code {
-							crate::network::control_server::CONTROL_REASON_NOT_LEADER => {
+							crate::network::control_server::CONTROL_REASON_NOT_LEADER
+							| crate::network::control_server::CONTROL_REASON_FORMATION_INCOMPLETE => {
 								ErrorKind::NotConnected
 							}
 							crate::network::control_server::CONTROL_REASON_INCOMPATIBLE_VERSION => {
@@ -5806,7 +6000,9 @@ mod tests {
 		.expect("authority attempt must reach an explicit outcome");
 		assert!(
 			verification.is_ok(),
-			"validated bootstrap completes the committed retirement"
+			"validated bootstrap completes the committed retirement: {verification:?} ({:?}; root {:?})",
+			recovered.slab.tier_authority_readiness_reason(),
+			recovered.crypto.root_binding_status()
 		);
 		recovered
 			.slab
@@ -6797,6 +6993,9 @@ mod dormant_response_tests {
 
 #[cfg(test)]
 mod startup_ownership_tests;
+
+#[cfg(test)]
+mod root_enrollment_tests;
 
 #[cfg(test)]
 #[path = "node/parent_decisions_cluster_tests.rs"]

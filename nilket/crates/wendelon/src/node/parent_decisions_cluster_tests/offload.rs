@@ -22,14 +22,10 @@ async fn offload_cluster(
 ) {
 	let root = crate::test_support::TestDir::new(&format!("offload-l2-{tag}"));
 	let path = root.to_path_buf();
-	// One fresh development root KEK for this cluster's three members, enrolled
-	// before each first opens. A tenant KEK is replicated wrapped under the
-	// installing node's root, so members with independently generated roots
-	// cannot unwrap it and cannot encrypt an object to offload. These tests
-	// supply that capability; the product neither provisions nor checks it.
-	let common_root = crate::crypto::common_dev_root_for_test::CommonDevRoot::fresh();
+	// The members share one root KEK by the enrollment procedure of ADR 0726,
+	// which `Cluster::start_with` performs: the forming member's root artifact
+	// is copied into each joiner's data directory before it first starts.
 	let (cluster, leader, descriptor) = ready_with(Cluster::start_with(move |_, cfg| {
-		common_root.enroll(&cfg.data_dir);
 		cfg.l2 = Some(crate::storage::ObjectStoreConfig::LocalFs { root: path.clone() });
 		cfg.tiering.scan_interval = std::time::Duration::from_millis(200);
 		cfg.tiering.op_driver_interval = std::time::Duration::from_millis(200);
@@ -511,4 +507,176 @@ async fn a_restarted_follower_completes_the_offload_committed_while_it_was_down(
 		frames
 	);
 	expect_everywhere(&cluster, &descriptor, &expected, "after the restart").await;
+}
+
+/// Every regular file under `root`, recursively.
+fn objects_under(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+	let mut files = Vec::new();
+	let mut pending = vec![root.to_path_buf()];
+	while let Some(dir) = pending.pop() {
+		for entry in std::fs::read_dir(&dir).unwrap() {
+			let path = entry.unwrap().path();
+			if path.is_dir() {
+				pending.push(path);
+			} else {
+				files.push(path);
+			}
+		}
+	}
+	files
+}
+
+/// ADR 0726: a member that joins with a root KEK of its own (not the forming
+/// member's artifact) is told so by the cluster's root check. It keeps
+/// replicating and voting, reports `RootKekMismatch`, uploads nothing, keeps
+/// its slab on local disk, and refuses an encrypted read, while the two
+/// members that share the cluster's root offload.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_member_with_another_root_keeps_its_vote_and_does_no_key_work() {
+	let stranger = NODES[2];
+	let root = crate::test_support::TestDir::new("offload-l2-stranger");
+	let path = root.to_path_buf();
+	let (cluster, leader, descriptor) = ready_with(Cluster::start_with(move |id, cfg| {
+		if id == stranger {
+			// A separately generated development root, as a node that was never
+			// given the cluster's artifact would have. Synthetic, per test.
+			crate::crypto::test_support::place_fresh_dev_root_artifact(&cfg.data_dir).unwrap();
+		}
+		cfg.l2 = Some(crate::storage::ObjectStoreConfig::LocalFs { root: path.clone() });
+		cfg.tiering.scan_interval = std::time::Duration::from_millis(200);
+		cfg.tiering.op_driver_interval = std::time::Duration::from_millis(200);
+		None
+	}))
+	.await;
+	assert_ne!(leader, stranger, "the forming member leads this fixture");
+	let check = cluster
+		.node(leader)
+		.state_machine
+		.read_state(|state| state.root_check.clone())
+		.await
+		.expect("the cluster's root check");
+	for node in NODES {
+		let status = cluster.node(node).crypto.root_binding_status();
+		if node == stranger {
+			assert_eq!(
+				status,
+				crate::crypto::RootBindingStatus::Mismatch(check.id())
+			);
+		} else {
+			assert_eq!(
+				status,
+				crate::crypto::RootBindingStatus::Verified(check.id())
+			);
+		}
+	}
+	use crate::metrics::observability::ReadinessReporter;
+	assert_eq!(
+		cluster
+			.node(stranger)
+			.readiness_reporter()
+			.snapshot()
+			.await
+			.degraded_reason
+			.as_deref(),
+		Some("RootKekMismatch")
+	);
+
+	let expected = write_rows(
+		&cluster,
+		leader,
+		&descriptor,
+		&[(1, "a"), (2, "b"), (3, "c")],
+	)
+	.await;
+	let mut sealed = std::collections::BTreeMap::new();
+	for node in NODES {
+		sealed.insert(
+			node,
+			cluster.node(node).slab.force_seal_active_for_test().await,
+		);
+	}
+	let mut uris = Vec::new();
+	for node in NODES.into_iter().filter(|node| *node != stranger) {
+		until_offloaded(
+			&cluster,
+			node,
+			sealed[&node],
+			"a member of the cluster's root",
+		)
+		.await;
+		uris.push(committed_object(&cluster, &root, node, sealed[&node]).await);
+	}
+	// Many sweeper passes of the stranger later, it has uploaded nothing and
+	// still holds its slab.
+	tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+	let slab = &cluster.node(stranger).slab;
+	assert!(slab.slab_file_exists_for_test(sealed[&stranger]));
+	assert!(slab.tier_pointer(sealed[&stranger]).await.is_none());
+	assert_eq!(
+		objects_under(&root.to_path_buf()).len(),
+		2,
+		"only the two members of the cluster's root uploaded"
+	);
+	// It cannot read a member's object either.
+	let bytes = store(&root).get(&uris[0]).await.unwrap();
+	let error = cluster
+		.node(stranger)
+		.crypto
+		.decrypt_tiered_slab(sealed[&NODES[0]], &bytes)
+		.expect_err("the stranger's root opens nothing of the cluster's");
+	assert_eq!(
+		crate::crypto::RootBindingRefusal::of(&error),
+		Some(crate::crypto::RootBindingRefusal::Mismatch)
+	);
+	// Every path that would propose a tenant KEK stops at the local binding,
+	// before anything is proposed.
+	let keysets_before = cluster
+		.node(leader)
+		.state_machine
+		.read_state(|state| state.tenant_keysets.clone())
+		.await;
+	for error in [
+		cluster
+			.node(stranger)
+			.crypto
+			.prepare_rotation(TenantId::ZERO)
+			.map(|_| ())
+			.unwrap_err(),
+		cluster
+			.node(stranger)
+			.rotate_tenant_kek(TenantId::ZERO)
+			.await
+			.map(|_| ())
+			.unwrap_err(),
+		cluster
+			.node(stranger)
+			.create_tenant(TenantId::new(91), 1 << 20, 3)
+			.await
+			.unwrap_err(),
+	] {
+		assert_eq!(
+			crate::crypto::RootBindingRefusal::of(&error),
+			Some(crate::crypto::RootBindingRefusal::Mismatch),
+			"{error}"
+		);
+	}
+	assert_eq!(
+		cluster
+			.node(leader)
+			.state_machine
+			.read_state(|state| state.tenant_keysets.clone())
+			.await,
+		keysets_before
+	);
+	// It still replicates and votes: it is a voter, and it applies a later write.
+	let voters: std::collections::BTreeSet<u32> = cluster
+		.node(leader)
+		.state_machine
+		.read_state(|state| state.last_membership.membership().voter_ids().collect())
+		.await;
+	assert!(voters.contains(&stranger));
+	let more = write_rows(&cluster, leader, &descriptor, &[(4, "d")]).await;
+	let mut all = expected;
+	all.extend(more);
+	expect_everywhere(&cluster, &descriptor, &all, "with a mismatching member").await;
 }

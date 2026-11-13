@@ -472,6 +472,14 @@ fn capture_ring_signature(node: &WendelonNode) -> Vec<(u64, u64, Vec<u32>)> {
 		.collect()
 }
 
+/// ADR 0726 enrollment: each joiner is given the forming member's root KEK
+/// artifact before its first start.
+fn enroll(forming: &Path, joiners: &[&Path]) {
+	for joiner in joiners {
+		wendelon::crypto::test_support::enroll_root_artifact(forming, joiner).unwrap();
+	}
+}
+
 async fn bootstrap_partial_sequence(tag: &str, join_order: [u32; 2]) -> BootstrapOutcome {
 	let registry = support::shared_loopback_registry();
 	let all_nodes = [1u32, 2, 3];
@@ -501,6 +509,7 @@ async fn bootstrap_partial_sequence(tag: &str, join_order: [u32; 2]) -> Bootstra
 					&[(1, node1_addr.as_str())],
 				);
 				joiner_dirs.push(cfg_dir);
+				enroll(&_scratch_1.to_path_buf(), &[&cfg.data_dir]);
 				node2 = Some(
 					WendelonNode::bootstrap_with_provider(cfg, provider_for(2, registry.clone()))
 						.await
@@ -517,6 +526,7 @@ async fn bootstrap_partial_sequence(tag: &str, join_order: [u32; 2]) -> Bootstra
 					&[(1, node1_addr.as_str())],
 				);
 				joiner_dirs.push(cfg_dir);
+				enroll(&_scratch_1.to_path_buf(), &[&cfg.data_dir]);
 				node3 = Some(
 					WendelonNode::bootstrap_with_provider(cfg, provider_for(3, registry.clone()))
 						.await
@@ -587,6 +597,19 @@ async fn cluster_forms_from_config_and_join_seed_can_be_a_peer() {
 	)
 	.await
 	.unwrap();
+	enroll(
+		&load_node_bootstrap_config(&node1_cfg_path)
+			.unwrap()
+			.data_dir,
+		&[
+			&load_node_bootstrap_config(&node2_cfg_path)
+				.unwrap()
+				.data_dir,
+			&load_node_bootstrap_config(&node3_cfg_path)
+				.unwrap()
+				.data_dir,
+		],
+	);
 	let node2 = WendelonNode::bootstrap_with_provider(
 		load_node_bootstrap_config(&node2_cfg_path).unwrap(),
 		provider_for(2, registry.clone()),
@@ -632,6 +655,14 @@ async fn explicit_join_is_idempotent_and_recovery_rejoins_cleanly() {
 	.await
 	.unwrap();
 	let node2_provider = provider_for(2, registry.clone());
+	enroll(
+		&load_node_bootstrap_config(&node1_cfg_path)
+			.unwrap()
+			.data_dir,
+		&[&load_node_bootstrap_config(&node2_cfg_path)
+			.unwrap()
+			.data_dir],
+	);
 	let node2 = WendelonNode::bootstrap_with_provider(
 		load_node_bootstrap_config(&node2_cfg_path).unwrap(),
 		node2_provider.clone(),
@@ -700,6 +731,10 @@ async fn restored_replacement_node_rejoins_live_cluster_and_catches_up() {
 		WendelonNode::bootstrap_with_provider(node1_cfg.clone(), provider_for(1, registry.clone()))
 			.await
 			.unwrap();
+	enroll(
+		&node1_cfg.data_dir,
+		&[&node2_cfg.data_dir, &node3_cfg.data_dir],
+	);
 	let node2 =
 		WendelonNode::bootstrap_with_provider(node2_cfg.clone(), provider_for(2, registry.clone()))
 			.await
@@ -747,6 +782,8 @@ async fn restored_replacement_node_rejoins_live_cluster_and_catches_up() {
 		&trusted,
 		&[(1, node1_addr.as_str())],
 	);
+	// A replacement needs the cluster's root KEK like any other member.
+	enroll(&node1_cfg.data_dir, &[&replacement_cfg.data_dir]);
 	let restored = WendelonNode::restore_replacement_from_cluster_backup_with_provider(
 		&backup,
 		3,
@@ -811,6 +848,10 @@ async fn leader_failover_recovery_replays_post_failover_commits() {
 		WendelonNode::bootstrap_with_provider(node1_cfg.clone(), provider_for(1, registry.clone()))
 			.await
 			.unwrap();
+	enroll(
+		&node1_cfg.data_dir,
+		&[&node2_cfg.data_dir, &node3_cfg.data_dir],
+	);
 	let node2 = WendelonNode::bootstrap_with_provider(node2_cfg, provider_for(2, registry.clone()))
 		.await
 		.unwrap();
@@ -913,6 +954,7 @@ async fn observe_join_handoff(
 	let node1 = WendelonNode::bootstrap_with_provider(cfg1, provider_for(1, registry.clone()))
 		.await
 		.unwrap();
+	enroll(&dir1.to_path_buf(), &[&cfg2.data_dir, &cfg3.data_dir]);
 	let node2 = WendelonNode::bootstrap_with_provider(cfg2, provider_for(2, registry.clone()))
 		.await
 		.unwrap();
@@ -1291,6 +1333,9 @@ async fn completed_self_join_cannot_ack_on_an_isolated_removed_former_leader() {
 		);
 		cfg.join_promotion_gate = Some(gate.clone());
 		dirs.push(dir);
+		if id != 1 {
+			enroll(&dirs[0].to_path_buf(), &[&cfg.data_dir]);
+		}
 		nodes.push(
 			WendelonNode::bootstrap_with_provider(cfg, provider_for(id, registry.clone()))
 				.await

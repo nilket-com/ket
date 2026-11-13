@@ -10265,18 +10265,18 @@ fn adr0093_snapshot_v2_and_v3_fixtures_are_both_guarded() {
 		.unwrap();
 	let v5 = fs::read_to_string(manifest_dir.join("tests/fixtures/consensus_body/snapshot_v5.txt"))
 		.unwrap();
-	assert!(core.contains("pub const SNAPSHOT_FORMAT_VERSION: u8 = 15;"));
+	assert!(core.contains("pub const SNAPSHOT_FORMAT_VERSION: u8 = 19;"));
 	assert!(!manifest_dir.join("src/consensus/snapshot_body.rs").exists());
 	for required in [
 		"SNAPSHOT_V2_MANIFEST",
 		"SNAPSHOT_V3_MANIFEST",
 		"SNAPSHOT_V4_MANIFEST",
 		"SNAPSHOT_V5_MANIFEST",
-		// ADR 0704: v8 is retained as a refusal input; v15 is current.
+		// ADR 0704: v8 is retained as a refusal input. ADR 0726: v19 is current.
 		"SNAPSHOT_V8_OUTGOING_MANIFEST",
-		"SNAPSHOT_V15_MANIFEST",
+		"SNAPSHOT_V19_MANIFEST",
 		"adr0704_every_pre_v15_snapshot_body_is_refused_before_decode",
-		"adr0704_current_wal_v15_and_snapshot_v15_match_stored_goldens",
+		"current_wal_v19_and_snapshot_v19_match_stored_goldens",
 	] {
 		assert!(
 			raft.contains(required),
@@ -10308,7 +10308,7 @@ fn adr0094_write_cap_and_legacy_replay_have_one_authority() {
 	let client = fs::read_to_string(manifest_dir.join("src/client/core.rs")).unwrap();
 	let schema = fs::read_to_string(manifest_dir.join("src/schema/core.rs")).unwrap();
 	let raft = fs::read_to_string(manifest_dir.join("src/consensus/raft_storage.rs")).unwrap();
-	assert!(schema.contains("pub const WAL_FORMAT_VERSION: u8 = 15;"));
+	assert!(schema.contains("pub const WAL_FORMAT_VERSION: u8 = 19;"));
 	assert_eq!(core.matches("pub const MAX_SECTION_BYTES:").count(), 1);
 	assert_eq!(
 		client
@@ -12286,6 +12286,125 @@ fn owner_operations_have_one_producer_one_signer_and_one_verifier() {
 		owner_ops
 			.contains("Self::Tier(TierOp { tier, replaces: None }) if tier.certified.is_none()")
 	);
+}
+
+/// ADR 0726: the root check has one constructor; no key is reachable outside
+/// the verified binding; a changed root is fenced before its state is
+/// published; and no read plan outlives its read.
+#[test]
+fn the_root_check_has_one_constructor_and_keys_live_only_in_the_verified_binding() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let src = root.join("src");
+	let mut establishers = std::collections::BTreeMap::new();
+	let mut provider_calls = Vec::new();
+	let mut self_binders = Vec::new();
+	let mut stored_plans = Vec::new();
+	walk_dir(&src, &mut |path| {
+		let name = path.file_name().unwrap().to_string_lossy().into_owned();
+		if path.extension().is_none_or(|ext| ext != "rs") || name.ends_with("tests.rs") {
+			return;
+		}
+		let source = fs::read_to_string(path).unwrap();
+		let production = source.split("#[cfg(test)]\nmod tests").next().unwrap();
+		let built = production
+			.matches("WendelonRequest::EstablishRootCheck(")
+			.count();
+		if built > 0 && name != "raft_storage.rs" {
+			establishers.insert(name.clone(), built);
+		}
+		if name == "crypto.rs" {
+			return;
+		}
+		if production.contains(".wrap_tenant_kek(") || production.contains(".unwrap_tenant_kek(") {
+			provider_calls.push(name.clone());
+		}
+		if production.contains("bind_to_own_candidate_without_cluster(") {
+			self_binders.push(name.clone());
+		}
+		for line in production.lines() {
+			let line = line.trim();
+			let is_plan = [
+				"TieredMultiRangeReadPlan",
+				"TieredRangeReadPlan",
+				"TieredStatsBlockReadPlan",
+			]
+			.iter()
+			.any(|plan| line.contains(plan));
+			// A field declaration: `name: Type,` with no borrow, call or return.
+			if is_plan
+				&& line.ends_with(',')
+				&& line.contains(": ")
+				&& !line.contains('&')
+				&& !line.contains('(')
+				&& !line.contains("->")
+			{
+				stored_plans.push(format!("{name}: {line}"));
+			}
+		}
+	});
+	// The state machine matches the request; only formation builds it, once.
+	assert_eq!(
+		establishers,
+		std::collections::BTreeMap::from([
+			("committed.rs".to_owned(), 1),
+			("node.rs".to_owned(), 1),
+		])
+	);
+	let node = fs::read_to_string(src.join("node.rs")).unwrap();
+	assert_eq!(
+		node.matches("WendelonRequest::EstablishRootCheck(candidate)")
+			.count(),
+		1
+	);
+	assert!(
+		source_region(
+			&node,
+			"pub(crate) async fn establish_root_check_if_forming(",
+			"async fn seed_default_tenant_kek_if_missing(",
+		)
+		.contains("WendelonRequest::EstablishRootCheck(candidate)")
+	);
+	assert!(provider_calls.is_empty(), "{provider_calls:?}");
+	assert!(self_binders.is_empty(), "{self_binders:?}");
+	assert!(stored_plans.is_empty(), "{stored_plans:?}");
+
+	let crypto = fs::read_to_string(src.join("crypto.rs")).unwrap();
+	let production = crypto
+		.split("#[cfg(test)]\nmod root_binding_tests;")
+		.next()
+		.unwrap();
+	// The provider is called by the binding (wrap and self-check of a new
+	// tenant KEK, unwrap of a stored one) and by the root check, nowhere else.
+	assert_eq!(production.matches(".wrap_tenant_kek(").count(), 2);
+	assert_eq!(production.matches(".unwrap_tenant_kek(").count(), 3);
+	let manager = brace_body(production, "pub struct CryptoManager");
+	for field in ["keysets", "tenant_kek_cache", "slab_dek_cache"] {
+		assert!(
+			!manager.contains(field),
+			"the manager holds `{field}` outside a binding"
+		);
+	}
+	let bound = brace_body(production, "struct Bound");
+	for field in [
+		"keysets:",
+		"tenant_kek_cache:",
+		"slab_dek_cache:",
+		"provider:",
+	] {
+		assert!(bound.contains(field), "the binding lacks `{field}`");
+	}
+	// The unverified surface: the candidate takes no key and returns a check.
+	assert!(
+		production
+			.contains("pub(crate) fn candidate_root_check(&self) -> std::io::Result<RootCheck> {")
+	);
+
+	// The fence runs under the state guard, before the installed state replaces
+	// the live one.
+	let raft = fs::read_to_string(src.join("consensus/raft_storage.rs")).unwrap();
+	let install = source_region(&raft, "async fn install_snapshot(", "guard.state = state;");
+	assert!(install.contains("observer.fence_before_publication("));
+	assert_eq!(raft.matches("guard.state = state;").count(), 1);
 }
 
 /// ADR 0699 S2: decision commands have no producer outside tests, signatures

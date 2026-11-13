@@ -706,7 +706,9 @@ fn snapshot_frame(meta: Vec<u8>) -> HrftFrame {
 	HrftFrame {
 		header: FrameHeader {
 			magic: HRFT_MAGIC,
-			version: 1,
+			// A Today Raft frame carries Today's Raft version (ADR 0726), so the
+			// refusal observed below is the retention guard's and not the envelope's.
+			version: crate::consensus::decision_mode::DecisionMode::Today.raft_frame_version(),
 			msg_type: MsgType::INSTALL_SNAPSHOT_REQ.0,
 			flags: 0,
 			stream_id: 0,

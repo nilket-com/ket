@@ -322,6 +322,13 @@ async fn whole_node_loss_restore_bootstraps_in_recovery_mode_and_serves_recovere
 	tokio::time::sleep(Duration::from_millis(25)).await;
 
 	let restore_dir = tempdir("restore");
+	// A restore target needs the source cluster's root KEK (ADR 0726): the
+	// backup carries wrapped tenant keys and no root.
+	wendelon::crypto::test_support::enroll_root_artifact(
+		&source_dir.to_path_buf(),
+		&restore_dir.to_path_buf(),
+	)
+	.unwrap();
 	let restored = WendelonNode::restore_from_cluster_backup(
 		&control,
 		NodeBootstrapConfig::dev(52, restore_dir.to_path_buf(), "127.0.0.1:0".into()),

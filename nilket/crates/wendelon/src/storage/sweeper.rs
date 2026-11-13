@@ -1473,6 +1473,20 @@ impl SlabSweeper {
 			}
 			return Err(error);
 		}
+		// ADR 0726: a local narrowing only. An object encrypted under a binding
+		// that has since been replaced is not submitted. This is not a fence
+		// across the commit and says nothing about tenant-key lifetime.
+		if !self
+			.slab
+			.crypto_binding_still_current(encrypted.binding_serial)
+		{
+			if let Err(cleanup_error) = self.delete_object_if_present(&l2_uri).await {
+				tracing::warn!(error = %cleanup_error, "failed to remove unsubmitted tier upload");
+			}
+			return Err(std::io::Error::other(TierCommitNotSubmitted(
+				"the root binding this object was encrypted under is no longer current".into(),
+			)));
+		}
 		if let Err(error) = propose_tier_slab(&self.slab, self.raft.as_ref(), tier, None).await {
 			let not_applied = error
 				.get_ref()
@@ -1713,6 +1727,22 @@ impl SlabSweeper {
 			supersession_metadata: pointer.supersession_metadata,
 			certified: None,
 		};
+		if !self
+			.slab
+			.crypto_binding_still_current(encrypted.binding_serial)
+		{
+			let error = std::io::Error::other(TierCommitNotSubmitted(
+				"the root binding this object was encrypted under is no longer current".into(),
+			));
+			self.cleanup_uploaded_object_after_failed_commit(
+				pointer.slab_id,
+				&new_uri,
+				encrypted.bytes.len() as u64,
+				&error,
+			)
+			.await?;
+			return Err(error);
+		}
 		self.slab
 			.prepare_tier_candidate_proposal(pointer.slab_id, &new_uri)
 			.await?;
@@ -1977,6 +2007,22 @@ impl SlabSweeper {
 			supersession_metadata: pointer.supersession_metadata,
 			certified: None,
 		};
+		if !self
+			.slab
+			.crypto_binding_still_current(encrypted.binding_serial)
+		{
+			let error = std::io::Error::other(TierCommitNotSubmitted(
+				"the root binding this object was encrypted under is no longer current".into(),
+			));
+			self.cleanup_uploaded_object_after_failed_commit(
+				pointer.slab_id,
+				&new_uri,
+				encrypted.bytes.len() as u64,
+				&error,
+			)
+			.await?;
+			return Err(error);
+		}
 		self.slab
 			.prepare_tier_candidate_proposal(pointer.slab_id, &new_uri)
 			.await?;

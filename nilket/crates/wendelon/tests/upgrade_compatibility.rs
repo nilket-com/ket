@@ -306,6 +306,12 @@ async fn supported_protocol_window_negotiates_and_joined_node_communicates() {
 			address: "loopback://node-1".into(),
 		}],
 	};
+	// ADR 0726 enrollment: the joiner is given the forming member's root KEK.
+	wendelon::crypto::test_support::enroll_root_artifact(
+		&_scratch_1.to_path_buf(),
+		&join_cfg.data_dir,
+	)
+	.unwrap();
 	let joiner = WendelonNode::bootstrap_with_provider(join_cfg, provider_for(2, registry.clone()))
 		.await
 		.unwrap();
@@ -377,6 +383,12 @@ async fn incompatible_protocol_window_fails_fast_and_explicitly() {
 			address: "loopback://node-1".into(),
 		}],
 	};
+	// ADR 0726 enrollment: the joiner is given the forming member's root KEK.
+	wendelon::crypto::test_support::enroll_root_artifact(
+		&_scratch_2.to_path_buf(),
+		&join_cfg.data_dir,
+	)
+	.unwrap();
 	let err =
 		match WendelonNode::bootstrap_with_provider(join_cfg, provider_for(2, registry.clone()))
 			.await
@@ -430,6 +442,11 @@ async fn rolling_restart_with_compatible_protocol_window_preserves_control_write
 		}
 		Err(err) => panic!("bootstrap node1 failed: {err}"),
 	};
+	// ADR 0726 enrollment: each joiner is given the forming member's root KEK.
+	for joiner in [&node2_v1, &node3_v1] {
+		wendelon::crypto::test_support::enroll_root_artifact(&node1_v2.data_dir, &joiner.data_dir)
+			.unwrap();
+	}
 	let node2 = bootstrap_node(node2_v1, provider_for(2, registry.clone()))
 		.await
 		.unwrap();

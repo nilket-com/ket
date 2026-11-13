@@ -105,6 +105,12 @@ async fn two_node_cluster_forms_over_simulated_transport() {
 		&[1, 2],
 		&[(1, node1_addr)],
 	);
+	// ADR 0726 enrollment: the joiner is given the forming member's root KEK.
+	wendelon::crypto::test_support::enroll_root_artifact(
+		&_scratch_1.to_path_buf(),
+		&cfg_2.data_dir,
+	)
+	.unwrap();
 	let node2 = WendelonNode::bootstrap_with_provider(cfg_2, provider(2, network.clone()))
 		.await
 		.unwrap();

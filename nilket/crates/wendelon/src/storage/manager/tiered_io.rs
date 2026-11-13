@@ -657,6 +657,12 @@ impl SlabManager {
 			.encrypt_tiered_slab_object(slab_id, &metadata, plaintext_blob.bytes())
 	}
 
+	/// ADR 0726: whether an object encrypted under binding `serial` would be
+	/// encrypted under the same binding now.
+	pub(crate) fn crypto_binding_still_current(&self, serial: u64) -> bool {
+		self.config.crypto.still_current(serial)
+	}
+
 	/// A byte-preserving successor of `plaintext`'s object (a DEK rewrap), with
 	/// column stats: the same plaintext and logical offsets under the same
 	/// layout, so the same base (ADR 0705 §3).

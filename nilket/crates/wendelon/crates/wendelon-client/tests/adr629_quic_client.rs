@@ -99,6 +99,12 @@ async fn adr629_p1_production_client_authenticates_a_discovered_data_route() {
 		&pki.ca_cert,
 		&pki.ops_ca_cert,
 	);
+	// ADR 0726 enrollment: the joiner is given the forming member's root KEK.
+	wendelon::crypto::test_support::enroll_root_artifact(
+		&_scratch_1.to_path_buf(),
+		&cfg_2.data_dir,
+	)
+	.unwrap();
 	let node2 = WendelonNode::bootstrap(cfg_2).await.unwrap();
 	let mut config = ClientConfig::new(
 		"0.0.0.0:0".parse().unwrap(),

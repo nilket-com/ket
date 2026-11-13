@@ -618,6 +618,8 @@ pub struct CreateTenant {
 	pub quota_bytes: u64,
 	pub replication_factor: u32,
 	pub tenant_keyset: TenantKeyset,
+	/// ADR 0726: the root check the keyset's tenant KEKs were wrapped under.
+	pub under_root: crate::crypto::RootCheckId,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -771,6 +773,9 @@ pub enum WendelonRequest {
 	/// ADR 0725: one slab operation signed by its owner. `ParentDecisions`
 	/// only, where it replaces the bare `SlabOp`, `CancelOp` and `AckOutcomes`.
 	OwnerOp(crate::consensus::owner_ops::SignedOwnerOp),
+	/// ADR 0726: the cluster's write-once root compatibility check. Both
+	/// modes. Admitted once, before any tenant or tenant KEK exists.
+	EstablishRootCheck(crate::crypto::RootCheck),
 }
 
 /// ADR 0701: at most [`crate::schema::MAX_LEASES_PER_BATCH`] leases. Decoding
@@ -880,7 +885,7 @@ impl WendelonRequest {
 	/// variant moves no existing golden bytes, so the corpus alone cannot see
 	/// it — the count and this list can. Adding a variant here means the WAL
 	/// format version must move with it.
-	pub const ALL_VARIANT_NAMES: [&'static str; 28] = [
+	pub const ALL_VARIANT_NAMES: [&'static str; 29] = [
 		"finalize",
 		"acquire_lease",
 		"release_lease",
@@ -909,6 +914,9 @@ impl WendelonRequest {
 		"slab_op",
 		"cancel_op",
 		"ack_outcomes",
+		// ADR 0726: both formats carry it; its wire tag follows the
+		// `ParentDecisions`-only variants below (tags are append-only).
+		"establish_root_check",
 	];
 
 	/// Variants only the `ParentDecisions` WAL format (10) carries, appended
@@ -946,6 +954,7 @@ impl WendelonRequest {
 			Self::ResumeTenant(_) => "resume_tenant",
 			Self::DeleteTenant(_) => "delete_tenant",
 			Self::InstallTenantKekVersion(_) => "install_tenant_kek_version",
+			Self::EstablishRootCheck(_) => "establish_root_check",
 			Self::RetireTenantKekVersion(_) => "retire_tenant_kek_version",
 			Self::RevokeActorKey(_) => "revoke_actor_key",
 			Self::SetTableRetentionPolicy(_) => "set_table_retention_policy",

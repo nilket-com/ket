@@ -905,6 +905,12 @@ async fn transport_tls_bootstrap_uses_real_quic_join_path() {
 		&pki.ca_cert,
 		&pki.ops_ca_cert,
 	);
+	// ADR 0726 enrollment: the joiner is given the forming member's root KEK.
+	wendelon::crypto::test_support::enroll_root_artifact(
+		&_scratch_2.to_path_buf(),
+		&cfg_3.data_dir,
+	)
+	.unwrap();
 	let node2 = WendelonNode::bootstrap(cfg_3).await.unwrap();
 
 	let node1_epoch = node1.epoch_tx.borrow().clone();

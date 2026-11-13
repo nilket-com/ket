@@ -129,6 +129,8 @@ pub const CONTROL_REASON_AUTHORIZATION_FAILED: u8 = 9;
 pub const CONTROL_REASON_NOT_FOUND: u8 = 10;
 /// ADR 0720: the cluster has admitted a write, so its membership is fixed.
 pub const CONTROL_REASON_MEMBERSHIP_SEALED: u8 = 11;
+/// ADR 0726: the cluster has not established its root check yet. Retryable.
+pub const CONTROL_REASON_FORMATION_INCOMPLETE: u8 = 12;
 
 /// ADR 0720: the typed cause of a refusal made because the membership is sealed,
 /// so a handler maps it to its own reason code without reading message text.
@@ -1745,9 +1747,11 @@ impl WendelonControlServer {
 				quota_bytes,
 				replication_factor,
 				tenant_keyset: keyset.clone(),
+				under_root: self.crypto.verified_root_check_id()?,
 			});
 		}
 		let rotation = self.crypto.prepare_rotation(tenant_id)?;
+		let under_root = rotation.under_root;
 		let mut tenant_keyset = crate::crypto::TenantKeyset::default();
 		tenant_keyset.active_tenant_kek_id = Some(rotation.tenant_kek_id);
 		tenant_keyset.keys.insert(
@@ -1761,6 +1765,7 @@ impl WendelonControlServer {
 			quota_bytes,
 			replication_factor,
 			tenant_keyset,
+			under_root,
 		})
 	}
 
@@ -4411,6 +4416,28 @@ impl WendelonControlServer {
 							negotiated_protocol: None,
 						}
 					}
+					// ADR 0726: no member joins before the cluster's root check
+					// exists, so a join can never race formation. Retryable.
+					Ok(())
+						if self.is_leader().await
+							&& self
+								.state_machine
+								.state_snapshot()
+								.await
+								.root_check
+								.is_none() =>
+					{
+						#[cfg(feature = "test-support")]
+						self.record_join_observation(&req, "refused: root check not established")
+							.await;
+						JoinClusterResponseWire {
+							accepted: false,
+							reason_code: CONTROL_REASON_FORMATION_INCOMPLETE,
+							leader_hint: Some(self.local_node.id),
+							local_protocol: self.protocol,
+							negotiated_protocol: None,
+						}
+					}
 					Ok(()) if self.is_leader().await => {
 						match wire::negotiate_protocol(self.protocol, req.protocol) {
 							Ok(negotiated_protocol) => match self.accept_join(&req).await {
@@ -6418,6 +6445,12 @@ mod tests {
 			NodeBootstrapConfig::dev(node_id, dir, format!("127.0.0.1:{}", 30_000 + node_id));
 		config.lsm_compaction_paused = true;
 		config.mvcc_retention_paused = true;
+		// These fixtures seed storage before the node's first start, so the
+		// directory is not a fresh forming store and generates no root KEK
+		// (ADR 0726): one is placed, once.
+		if !config.data_dir.join(".wendelon/dev-root-kek.bin").exists() {
+			crate::crypto::test_support::place_fresh_dev_root_artifact(&config.data_dir).unwrap();
+		}
 		WendelonNode::bootstrap_single_node(config).await.unwrap()
 	}
 

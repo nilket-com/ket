@@ -468,6 +468,13 @@ impl ChaosCluster {
 
 		let node1 =
 			Self::bootstrap_node(node1_cfg.clone(), provider_for(1, registry.clone())).await?;
+		// ADR 0726 enrollment: each joiner is given the forming member's root KEK.
+		for joiner in [&node2_cfg, &node3_cfg] {
+			wendelon::crypto::test_support::enroll_root_artifact(
+				&node1_cfg.data_dir,
+				&joiner.data_dir,
+			)?;
+		}
 		let node2 =
 			Self::bootstrap_node(node2_cfg.clone(), provider_for(2, registry.clone())).await?;
 		let node3 =

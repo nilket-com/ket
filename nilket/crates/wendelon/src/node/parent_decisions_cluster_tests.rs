@@ -124,6 +124,16 @@ impl Cluster {
 			if let Some(extra) = configure(id, &mut cfg) {
 				cluster._dirs.push(extra);
 			}
+			// ADR 0726 enrollment: a joiner is given the forming member's root
+			// KEK artifact before its first start.
+			// A test that gives a member a root of its own places it first.
+			if id != NODES[0] && !cfg.data_dir.join(".wendelon/dev-root-kek.bin").exists() {
+				crate::crypto::test_support::enroll_root_artifact(
+					&cluster.configs[&NODES[0]].data_dir,
+					&cfg.data_dir,
+				)
+				.unwrap();
+			}
 			cluster.configs.insert(id, cfg);
 			cluster._dirs.push(dir);
 			cluster.reopen(id).await;
@@ -6583,6 +6593,10 @@ mod attempt_exhaustion;
 #[path = "parent_decisions_cluster_tests/offload.rs"]
 mod offload;
 
+/// ADR 0726: joins and the root check.
+#[path = "parent_decisions_cluster_tests/root_check.rs"]
+mod root_check;
+
 // ============================================================
 //  ADR 0720: MEMBERSHIP IS FIXED ONCE A WRITE IS ADMITTED
 // ============================================================
@@ -6648,6 +6662,13 @@ async fn a_join_after_the_first_write_is_refused_and_adds_no_member() {
 			crate::network::pool::BufPool::new(64, 1024 * 1024),
 			TransportTier::QuicIoUring,
 		));
+	// The late joiner has the cluster's root KEK (ADR 0726), so what refuses
+	// it is the sealed membership and nothing earlier.
+	crate::crypto::test_support::enroll_root_artifact(
+		&cluster.configs[&NODES[0]].data_dir,
+		&cfg.data_dir,
+	)
+	.unwrap();
 	// The joiner retries for five seconds and then reports the last answer it
 	// was given. It must report within the bound, and report this refusal: a
 	// timeout is a failure, not a refusal.

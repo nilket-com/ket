@@ -122,6 +122,9 @@ async fn observe_failed_startup(cancel: bool, park_cleanup: bool) {
 		probe.1 = Some(Arc::new(Notify::new()));
 	}
 	cfg.startup_probe = Some(probe.clone());
+	// A joiner starts only with a root KEK in place (ADR 0726); this one is
+	// never admitted anywhere, so any root will do.
+	crate::crypto::test_support::place_fresh_dev_root_artifact(&dir.to_path_buf()).unwrap();
 	let provider = Arc::new(JoinProvider {
 		parked: cancel,
 		entered: Notify::new(),
@@ -622,6 +625,23 @@ struct FaultSnapshot {
 	lifecycle: Option<ServerLifecycle>,
 }
 impl StartupFault {
+	/// A fault that parks startup at `site` for as long as the task lives.
+	pub(crate) fn parked_at(site: &'static str) -> Self {
+		Self {
+			site,
+			mode: FaultMode::Cancel,
+			snapshot: Arc::default(),
+			entered: Arc::new(Notify::new()),
+			last_site: Arc::default(),
+			bound_tcp: Arc::default(),
+		}
+	}
+
+	/// Completes once startup has reached the fault's site.
+	pub(crate) async fn entered(&self) {
+		self.entered.notified().await;
+	}
+
 	pub(super) async fn reached(
 		&self,
 		site: &'static str,
@@ -654,6 +674,7 @@ impl StartupFault {
 const PREFIX_SITES: &[&str] = &[
 	"pool",
 	"io_workers",
+	"root_kek",
 	"set_checkpoint_emitter",
 	"set_audit_chain_root_rollup",
 	"adopt_factory",
@@ -682,8 +703,55 @@ const PREFIX_SITES: &[&str] = &[
 	"set_restore_validation",
 	"before_cluster",
 	"epoch_reconcile",
+	"root_check",
+	"root_check_established",
 	"tenant_seed",
 ];
+
+/// ADR 0726: however the first start was interrupted, the restarted forming
+/// node ends with one authoritative root check, the value its own root
+/// produces, its root verified against it, and the default tenant's KEK
+/// installed under it.
+async fn formation_completes(node: &WendelonNode, site: &str, mode: FaultMode) {
+	let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+	loop {
+		let state = node.state_machine.state_snapshot().await;
+		let seeded = state.tenants.contains_key(&crate::schema::TenantId::ZERO);
+		let status = node.crypto.root_binding_status();
+		if seeded && matches!(status, crate::crypto::RootBindingStatus::Verified(_)) {
+			let check = state
+				.root_check
+				.clone()
+				.unwrap_or_else(|| panic!("{site} {mode:?}: a tenant without a root check"));
+			assert_eq!(
+				check,
+				node.crypto.candidate_root_check().unwrap(),
+				"{site} {mode:?}: the root check is not this root's"
+			);
+			assert_eq!(
+				status,
+				crate::crypto::RootBindingStatus::Verified(check.id()),
+				"{site} {mode:?}"
+			);
+			let keyset = &state.tenant_keysets[&crate::schema::TenantId::ZERO];
+			assert!(keyset.active_tenant_kek_id.is_some(), "{site} {mode:?}");
+			assert_eq!(
+				node.crypto
+					.active_tenant_kek_id(crate::schema::TenantId::ZERO)
+					.unwrap(),
+				keyset.active_tenant_kek_id.unwrap(),
+				"{site} {mode:?}: the local binding lacks the committed keyset"
+			);
+			return;
+		}
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"{site} {mode:?}: formation did not complete: check={} seeded={seeded} status={status:?}",
+			state.root_check.is_some()
+		);
+		tokio::time::sleep(Duration::from_millis(25)).await;
+	}
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pd25_every_adopted_prefix_err_cancel_panic_releases_real_tls_socket_and_reboots() {
@@ -815,6 +883,7 @@ async fn pd25_every_adopted_prefix_err_cancel_panic_releases_real_tls_socket_and
 			let reopened = WendelonNode::bootstrap(healthy.clone())
 				.await
 				.unwrap_or_else(|e| panic!("{site} {mode:?} reboot: {e}"));
+			formation_completes(&reopened, site, mode).await;
 			if site == "io_workers" {
 				use crate::storage::StorageEngine;
 				// The first boot stopped before the storage index existed. The
@@ -864,7 +933,9 @@ async fn pd25_every_adopted_prefix_err_cancel_panic_releases_real_tls_socket_and
 			}
 			if matches!(
 				site,
-				"epoch_reconcile" | "tenant_seed" | "set_pending_finalization_reconciler"
+				"epoch_reconcile"
+					| "root_check" | "root_check_established"
+					| "tenant_seed" | "set_pending_finalization_reconciler"
 			) {
 				assert!(
 					reopened.recovered_after_unclean_shutdown(),
@@ -1343,6 +1414,12 @@ async fn pd25_partial_restore_refusal_never_certifies_clean_and_reboot_validates
 	for mode in [FaultMode::Error, FaultMode::Cancel, FaultMode::Panic] {
 		let dir = crate::test_support::TestDir::new("pd25-restore-partial");
 		let healthy = NodeBootstrapConfig::dev(1, dir.to_path_buf(), "127.0.0.1:0".into());
+		// A restore target needs the source cluster's root KEK (ADR 0726).
+		crate::crypto::test_support::enroll_root_artifact(
+			&source_dir.to_path_buf(),
+			&dir.to_path_buf(),
+		)
+		.unwrap();
 		let fault = StartupFault {
 			site: "after_control_restore",
 			mode,
@@ -1470,6 +1547,12 @@ async fn a1_partial_populated_restore_plain_reboot_refuses_missing_slabs() {
 	for mode in [FaultMode::Cancel] {
 		let dir = crate::test_support::TestDir::new("a1-populated-restore-partial");
 		let healthy = NodeBootstrapConfig::dev(1, dir.to_path_buf(), "127.0.0.1:0".into());
+		// A restore target needs the source cluster's root KEK (ADR 0726).
+		crate::crypto::test_support::enroll_root_artifact(
+			&source_dir.to_path_buf(),
+			&dir.to_path_buf(),
+		)
+		.unwrap();
 		let fault = StartupFault {
 			site: "after_control_restore",
 			mode,
@@ -1920,6 +2003,12 @@ async fn a1_partial_populated_restore_resumes_through_production_entry_point() {
 		let mode = FaultMode::Cancel;
 		let dir = crate::test_support::TestDir::new("a1-populated-restore-partial");
 		let healthy = NodeBootstrapConfig::dev(1, dir.to_path_buf(), "127.0.0.1:0".into());
+		// A restore target needs the source cluster's root KEK (ADR 0726).
+		crate::crypto::test_support::enroll_root_artifact(
+			&source_dir.to_path_buf(),
+			&dir.to_path_buf(),
+		)
+		.unwrap();
 		let fault = StartupFault {
 			site: "after_control_restore",
 			mode,
@@ -2101,6 +2190,12 @@ async fn a13_live_backup_pause_after_wal_read_keeps_a_restorable_control_cut() {
 		.await
 		.unwrap();
 	let target = crate::test_support::TestDir::new("a13-live-backup-target");
+	// A restore target needs the source cluster's root KEK (ADR 0726).
+	crate::crypto::test_support::enroll_root_artifact(
+		&source_dir.to_path_buf(),
+		&target.to_path_buf(),
+	)
+	.unwrap();
 	let restored = WendelonNode::restore_from_cluster_backup(
 		&backup,
 		NodeBootstrapConfig::dev(1, target.to_path_buf(), "127.0.0.1:0".into()),

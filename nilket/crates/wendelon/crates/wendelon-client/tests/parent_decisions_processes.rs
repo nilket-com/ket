@@ -578,10 +578,13 @@ async fn three_daemons_from_configuration_files_form_a_parent_decisions_cluster_
 	let ports: Vec<u16> = NODES.iter().map(|_| reserve_shared_port()).collect();
 	let seed = format!("127.0.0.1:{}", ports[0]);
 	let mut members = Vec::new();
+	// ADR 0726: one root KEK per cluster. Every member is given the same unlock
+	// secret; the sealed root itself is copied from the forming member below.
+	let unlock_secret = random32();
 	for ((id, secret), port) in NODES.iter().zip(&secrets).zip(&ports) {
 		let dir = root.join(format!("node-{id}"));
 		std::fs::create_dir_all(dir.join("data")).unwrap();
-		write_private(&dir.join("kek-unlock"), &random32());
+		write_private(&dir.join("kek-unlock"), &unlock_secret);
 		let (health, ready, metrics) = (reserve_tcp_port(), reserve_tcp_port(), reserve_tcp_port());
 		let cluster = if *id == NODES[0] {
 			"mode = \"bootstrap\"".to_owned()
@@ -667,7 +670,35 @@ metrics = "127.0.0.1:{metrics}"
 		children: Vec::new(),
 	};
 	// Form the cluster before any write: ADR 0720 fixes the membership at the first one.
+	// The enrollment procedure of ADR 0726, as an operator performs it: start the
+	// forming member, copy its sealed root KEK file, owner-only, to the same path in
+	// each other member's empty data directory, then start those members in join mode.
 	daemons.start(&members[0]);
+	let sealed_root = Path::new(".wendelon").join("local-sealed-root-kek.bin");
+	let forming_root = root
+		.join(format!("node-{}", NODES[0]))
+		.join("data")
+		.join(&sealed_root);
+	let sealed = loop {
+		// The file is created and written in one step; a complete one is 104 bytes.
+		match std::fs::read(&forming_root) {
+			Ok(bytes) if bytes.len() == 104 => break bytes,
+			_ => {}
+		}
+		assert!(
+			step(deadline) > Duration::ZERO,
+			"the forming member never wrote its sealed root KEK"
+		);
+		std::thread::sleep(Duration::from_millis(50));
+	};
+	for id in &NODES[1..] {
+		let target = root
+			.join(format!("node-{id}"))
+			.join("data")
+			.join(&sealed_root);
+		std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+		write_private(&target, &sealed);
+	}
 	daemons.start(&members[1]);
 	daemons.start(&members[2]);
 	for member in &members {

@@ -101,6 +101,13 @@ pub fn validate_frame_version(version: u8, msg_type: u8) -> std::io::Result<()> 
 	{
 		return Ok(());
 	}
+	// ADR 0726: Today's Raft frames carry a version of their own, and only
+	// Raft frames may.
+	if version == crate::consensus::decision_mode::RAFT_FRAME_VERSION_TODAY
+		&& crate::consensus::decision_mode::is_raft_frame(msg_type)
+	{
+		return Ok(());
+	}
 	Err(Error::new(
 		ErrorKind::InvalidData,
 		format!(

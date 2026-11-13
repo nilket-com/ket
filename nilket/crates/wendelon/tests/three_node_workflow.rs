@@ -973,6 +973,16 @@ async fn formed_cluster(
 	let mut members = Vec::new();
 	for node_id in NODES {
 		let (dir, cfg) = member_config(node_id, l2, keys);
+		// ADR 0726 enrollment: a joiner is given the forming member's root KEK
+		// artifact before its first start.
+		if let Some(forming) = members.first() {
+			let forming: &Member = forming;
+			wendelon::crypto::test_support::enroll_root_artifact(
+				&forming.cfg.data_dir,
+				&cfg.data_dir,
+			)
+			.unwrap();
+		}
 		let node =
 			WendelonNode::bootstrap_with_provider(cfg.clone(), provider(node_id, registry.clone()))
 				.await
@@ -1299,6 +1309,16 @@ async fn the_fixtures_row_placement_is_recorded() {
 	let mut members = Vec::new();
 	for node_id in NODES {
 		let (dir, cfg) = member_config(node_id, &l2, DecisionKeys::Development);
+		// ADR 0726 enrollment: a joiner is given the forming member's root KEK
+		// artifact before its first start.
+		if let Some(forming) = members.first() {
+			let forming: &Member = forming;
+			wendelon::crypto::test_support::enroll_root_artifact(
+				&forming.cfg.data_dir,
+				&cfg.data_dir,
+			)
+			.unwrap();
+		}
 		let node =
 			WendelonNode::bootstrap_with_provider(cfg.clone(), provider(node_id, registry.clone()))
 				.await

@@ -31,7 +31,8 @@ use std::ops::Range;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
@@ -858,10 +859,14 @@ impl RootKekProviderConfig {
 		self.initialize(RootKekProviderInit::generate_or_create(data_dir))
 	}
 
+	/// Opens the provider for `data_dir`. Only a genuinely fresh forming store
+	/// passes `GenerateOrCreate`; every other open is `EnrollExisting`, which
+	/// reads the artifact and never generates one (ADR 0726).
 	pub(crate) fn build_with_owner(
 		&self,
 		data_dir: &Path,
 		owner: &DataDirectoryOwner,
+		bootstrap_mode: RootKekBootstrapMode,
 	) -> std::io::Result<Arc<dyn RootKekProvider>> {
 		owner.ensure_contains(data_dir)?;
 		match self {
@@ -873,9 +878,11 @@ impl RootKekProviderConfig {
 			Self::AwsKms(_) => owner.ensure_contains(aws_kms_root_kek_path(data_dir))?,
 			Self::Pkcs11(_) => {}
 		}
-		let mut init = RootKekProviderInit::generate_or_create(data_dir);
-		init.owner = Some(owner);
-		self.initialize(init)
+		self.initialize(RootKekProviderInit {
+			data_dir,
+			bootstrap_mode,
+			owner: Some(owner),
+		})
 	}
 
 	pub(crate) fn initialize(
@@ -946,6 +953,211 @@ impl CryptoCacheConfig {
 	}
 }
 
+/// Version of the replicated root check (ADR 0726).
+pub const ROOT_CHECK_VERSION: u16 = 1;
+/// AES-KWP output length for the 32-byte check plaintext.
+pub const ROOT_CHECK_WRAPPED_BYTES: usize = 40;
+/// The fixed public plaintext every root wraps to produce its check value.
+const ROOT_CHECK_PLAINTEXT_V1: [u8; 32] = *b"wendelon root check plaintext v1";
+
+/// First 16 bytes of SHA-256 over the big-endian version and the wrapped bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct RootCheckId([u8; 16]);
+
+impl RootCheckId {
+	pub fn as_bytes(&self) -> &[u8; 16] {
+		&self.0
+	}
+
+	#[cfg(test)]
+	pub(crate) fn for_test(fill: u8) -> Self {
+		Self([fill; 16])
+	}
+}
+
+impl std::fmt::Display for RootCheckId {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		for byte in self.0 {
+			write!(f, "{byte:02x}")?;
+		}
+		Ok(())
+	}
+}
+
+/// The cluster's write-once root compatibility check: the AES-KWP wrap of one
+/// fixed public constant under the root KEK. A compatibility check value, not
+/// cluster identity, proof of custody, or proof about any tenant KEK.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RootCheck {
+	pub version: u16,
+	#[serde(with = "serde_bytes")]
+	pub wrapped: Vec<u8>,
+}
+
+impl RootCheck {
+	/// Version first, then the fixed size. Nothing else is read before this.
+	pub fn validate(&self) -> Result<(), &'static str> {
+		if self.version != ROOT_CHECK_VERSION {
+			return Err("unsupported root check version");
+		}
+		if self.wrapped.len() != ROOT_CHECK_WRAPPED_BYTES {
+			return Err("root check has the wrong length");
+		}
+		Ok(())
+	}
+
+	pub fn id(&self) -> RootCheckId {
+		let mut input = Vec::with_capacity(2 + self.wrapped.len());
+		input.extend_from_slice(&self.version.to_be_bytes());
+		input.extend_from_slice(&self.wrapped);
+		let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, &input);
+		let mut id = [0_u8; 16];
+		id.copy_from_slice(&digest.as_ref()[..16]);
+		RootCheckId(id)
+	}
+}
+
+/// A well-formed root check for reducer tests that use no real provider.
+#[cfg(test)]
+pub(crate) fn test_root_check() -> RootCheck {
+	RootCheck {
+		version: ROOT_CHECK_VERSION,
+		wrapped: vec![0xC3; ROOT_CHECK_WRAPPED_BYTES],
+	}
+}
+
+/// The final artifact file name of every implemented root KEK provider that
+/// this build can open.
+#[cfg(any(test, not(feature = "fips")))]
+const ROOT_KEK_ARTIFACT_FILES: &[&str] = &[
+	DEV_INSECURE_ROOT_KEK_FILE,
+	LOCAL_SEALED_ROOT_KEK_FILE,
+	AWS_KMS_ROOT_KEK_FILE,
+];
+#[cfg(not(any(test, not(feature = "fips"))))]
+const ROOT_KEK_ARTIFACT_FILES: &[&str] = &[LOCAL_SEALED_ROOT_KEK_FILE, AWS_KMS_ROOT_KEK_FILE];
+
+/// ADR 0726: whether `path` is the root KEK directory of a data directory,
+/// empty or holding nothing but the implemented providers' own root artifact
+/// files. Enrollment places exactly that before a member's first start, and a
+/// forming node writes it before anything else, so the setup censuses treat
+/// it as neutral, as they treat `LOCK`. The one classifier for all of them.
+///
+/// Neutral only: it is not recovery evidence, authorizes no store identity,
+/// allocator position, incarnation, keyset or membership, and says nothing
+/// about the artifact's content, which the provider still opens and the
+/// cluster's root check still verifies. A symlinked directory or file, a
+/// nested directory or any other entry is not this, and errors propagate.
+pub(crate) fn is_root_kek_artifact_dir(path: &Path) -> std::io::Result<bool> {
+	// Every provider keeps its artifact in the same directory.
+	const _: () = assert!(
+		LOCAL_SEALED_ROOT_KEK_DIR.len() == AWS_KMS_ROOT_KEK_DIR.len()
+			&& LOCAL_SEALED_ROOT_KEK_DIR.len() == ".wendelon".len()
+	);
+	if path.file_name().and_then(|name| name.to_str()) != Some(LOCAL_SEALED_ROOT_KEK_DIR) {
+		return Ok(false);
+	}
+	if !std::fs::symlink_metadata(path)?.is_dir() {
+		return Ok(false);
+	}
+	for entry in std::fs::read_dir(path)? {
+		let entry = entry?;
+		let name = entry.file_name();
+		let known = ROOT_KEK_ARTIFACT_FILES
+			.iter()
+			.any(|file| name.to_str() == Some(file));
+		if !known || !std::fs::symlink_metadata(entry.path())?.is_file() {
+			return Ok(false);
+		}
+	}
+	Ok(true)
+}
+
+fn compute_root_check(provider: &dyn RootKekProvider) -> std::io::Result<RootCheck> {
+	let plaintext =
+		KeyMaterialBytes::copy_from_slice(&ROOT_CHECK_PLAINTEXT_V1, "root check plaintext")?;
+	let check = RootCheck {
+		version: ROOT_CHECK_VERSION,
+		wrapped: provider.wrap_tenant_kek(&plaintext)?,
+	};
+	check.validate().map_err(Error::other)?;
+	Ok(check)
+}
+
+/// Whether `provider` reproduces `check`: the same wrapped bytes, and the
+/// check unwraps to the prescribed plaintext. `Ok(false)` is a definitive
+/// mismatch; an unsupported or malformed check is an error.
+fn verify_root_check(provider: &dyn RootKekProvider, check: &RootCheck) -> std::io::Result<bool> {
+	check
+		.validate()
+		.map_err(|reason| Error::new(ErrorKind::InvalidData, reason))?;
+	let candidate = compute_root_check(provider)?;
+	if candidate.wrapped != check.wrapped {
+		return Ok(false);
+	}
+	match provider.unwrap_tenant_kek(&check.wrapped) {
+		Ok(plaintext) => Ok(plaintext.as_ref() == ROOT_CHECK_PLAINTEXT_V1),
+		Err(_) => Ok(false),
+	}
+}
+
+#[cfg(test)]
+pub(crate) mod binding_test_hooks {
+	use super::CryptoManager;
+	use std::sync::Mutex;
+
+	type Hook = Box<dyn Fn(&CryptoManager) + Send>;
+	static BEFORE_VERIFIED_INSTALL: Mutex<Vec<(usize, Hook)>> = Mutex::new(Vec::new());
+
+	/// Runs `hook` once, between the unverified fence and the verified
+	/// install of the next delivery on `manager`.
+	pub(crate) fn on_next_verified_install(manager: &CryptoManager, hook: Hook) {
+		BEFORE_VERIFIED_INSTALL
+			.lock()
+			.unwrap()
+			.push((manager.cell_key(), hook));
+	}
+
+	type Once = Box<dyn FnOnce() + Send>;
+	static BETWEEN_UNWRAP_AND_INSERT: Mutex<Vec<(u64, Once)>> = Mutex::new(Vec::new());
+
+	/// Runs `hook` once, in the next tenant-KEK unwrap under the binding
+	/// `serial`, after the unwrap and before the cache insert.
+	pub(crate) fn on_next_unwrap_before_insert(serial: u64, hook: Once) {
+		BETWEEN_UNWRAP_AND_INSERT
+			.lock()
+			.unwrap()
+			.push((serial, hook));
+	}
+
+	pub(super) fn between_unwrap_and_insert(serial: u64) {
+		let hook = {
+			let mut hooks = BETWEEN_UNWRAP_AND_INSERT.lock().unwrap();
+			hooks
+				.iter()
+				.position(|(s, _)| *s == serial)
+				.map(|i| hooks.remove(i).1)
+		};
+		if let Some(hook) = hook {
+			hook();
+		}
+	}
+
+	pub(super) fn before_verified_install(manager: &CryptoManager) {
+		let key = manager.cell_key();
+		let hook = {
+			let mut hooks = BEFORE_VERIFIED_INSTALL.lock().unwrap();
+			hooks
+				.iter()
+				.position(|(k, _)| *k == key)
+				.map(|i| hooks.remove(i).1)
+		};
+		if let Some(hook) = hook {
+			hook(manager);
+		}
+	}
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WrappedTenantKek {
 	#[serde(with = "serde_bytes")]
@@ -991,6 +1203,8 @@ pub struct InstallTenantKekVersion {
 	pub tenant_kek_id: TenantKekId,
 	#[serde(with = "serde_bytes")]
 	pub wrapped_tenant_kek: Vec<u8>,
+	/// The root check the proposer verified its root against before wrapping.
+	pub under_root: RootCheckId,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1010,6 +1224,8 @@ pub struct EncryptedTieredSlab {
 	pub slab_format_version: u32,
 	pub stats_locator: Option<TieredStatsBlockLocator>,
 	pub has_row_tombstone_records: bool,
+	/// The binding this object was encrypted under; see `still_current`.
+	pub binding_serial: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1465,11 +1681,108 @@ impl TieredStatsBlockReadPlan {
 #[derive(Clone)]
 pub struct CryptoManager {
 	_directory_owner: Option<DataDirectoryOwner>,
-	root_kek: Arc<dyn RootKekProvider>,
-	keysets: Arc<Mutex<HashMap<TenantId, TenantKeyset>>>,
-	tenant_kek_cache: Arc<Mutex<KeyCache<(TenantId, TenantKekId), LockedKeyMaterial>>>,
-	slab_dek_cache: Arc<Mutex<KeyCache<SlabDekCacheKey, PreparedSlabDek>>>,
+	/// The loaded root provider. Reached only to produce the candidate root
+	/// check, to verify against an authoritative one, and to build a binding.
+	provider: Arc<dyn RootKekProvider>,
+	cache_config: CryptoCacheConfig,
+	cell: Arc<RwLock<BindingCell>>,
+	/// Bindings displaced by a fence, destroyed outside the publication
+	/// critical section.
+	displaced: Arc<Mutex<Vec<Arc<Bound>>>>,
+	/// Whether the last key authority delivery returned an error. Reported
+	/// by readiness; the fence, not this flag, is what protects.
+	last_delivery_failed: Arc<std::sync::atomic::AtomicBool>,
 	audit_context: Arc<Mutex<Option<CryptoAuditContext>>>,
+}
+
+/// The one place a root binding lives. Every key, cached or not, is reached
+/// through the `Arc<Bound>` this cell hands out (ADR 0726).
+struct BindingCell {
+	/// Applied index of the last accepted authority delivery.
+	accepted_index: Option<u64>,
+	/// No delivery below this index may install a binding.
+	fenced_index: u64,
+	state: BindingState,
+}
+
+enum BindingState {
+	/// A loaded provider that no authoritative root check has been compared
+	/// with. Holds no keysets and no caches.
+	Unverified,
+	Verified(Arc<Bound>),
+	/// The loaded provider does not reproduce the authoritative root check.
+	Mismatch(RootCheckId),
+}
+
+/// A root verified against one authoritative root check, with everything that
+/// may be used under it: the tenant keysets and both key caches.
+struct Bound {
+	id: RootCheckId,
+	serial: u64,
+	provider: Arc<dyn RootKekProvider>,
+	keysets: Mutex<HashMap<TenantId, TenantKeyset>>,
+	tenant_kek_cache: Mutex<KeyCache<(TenantId, TenantKekId), LockedKeyMaterial>>,
+	slab_dek_cache: Mutex<KeyCache<SlabDekCacheKey, PreparedSlabDek>>,
+}
+
+static BOUND_SERIAL: AtomicU64 = AtomicU64::new(1);
+
+/// Why a crypto operation was not admitted. Carried as the inner error of
+/// the `std::io::Error` the operation returns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum RootBindingRefusal {
+	/// No authoritative root check has been verified yet (pending).
+	#[error(
+		"RootNotVerified: this node has not verified its root KEK against the cluster root check"
+	)]
+	NotVerified,
+	/// The loaded root KEK does not reproduce the cluster root check.
+	#[error("RootKekMismatch: this node's root KEK is not the cluster's root KEK")]
+	Mismatch,
+}
+
+impl RootBindingRefusal {
+	/// Pending is "not yet": a caller that retries on availability errors
+	/// retries, as it did when a tenant KEK had not arrived. A mismatch is
+	/// definitive and is never retried into.
+	fn into_io(self) -> Error {
+		let kind = match self {
+			Self::NotVerified => ErrorKind::WouldBlock,
+			Self::Mismatch => ErrorKind::PermissionDenied,
+		};
+		Error::new(kind, self)
+	}
+
+	pub(crate) fn into_startup_error(self, id: RootCheckId) -> Error {
+		Error::new(
+			ErrorKind::PermissionDenied,
+			format!("{self} (cluster root check {id}); startup refused"),
+		)
+	}
+
+	pub fn of(error: &Error) -> Option<Self> {
+		error
+			.get_ref()
+			.and_then(|inner| inner.downcast_ref::<Self>())
+			.copied()
+	}
+}
+
+/// What a node knows about its root KEK against the cluster root check.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RootBindingStatus {
+	Pending,
+	Verified(RootCheckId),
+	Mismatch(RootCheckId),
+}
+
+/// The root check and the tenant keysets of one applied state, delivered
+/// together.
+#[derive(Clone, Debug)]
+pub struct KeyAuthority {
+	pub applied_index: u64,
+	pub root_check: Option<RootCheck>,
+	pub keysets: HashMap<TenantId, TenantKeyset>,
 }
 
 #[derive(Clone)]
@@ -1498,18 +1811,15 @@ impl CryptoManager {
 	) -> Self {
 		Self {
 			_directory_owner: None,
-			root_kek,
-			keysets: Arc::new(Mutex::new(HashMap::new())),
-			tenant_kek_cache: Arc::new(Mutex::new(KeyCache::new(
-				cache_config.tenant_kek_cache_max_entries,
-				DEFAULT_TENANT_KEK_IDLE_TTL,
-				Some(DEFAULT_TENANT_KEK_ABSOLUTE_TTL),
-			))),
-			slab_dek_cache: Arc::new(Mutex::new(KeyCache::new(
-				cache_config.slab_dek_cache_max_entries,
-				DEFAULT_SLAB_DEK_IDLE_TTL,
-				None,
-			))),
+			provider: root_kek,
+			cache_config,
+			cell: Arc::new(RwLock::new(BindingCell {
+				accepted_index: None,
+				fenced_index: 0,
+				state: BindingState::Unverified,
+			})),
+			displaced: Arc::new(Mutex::new(Vec::new())),
+			last_delivery_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
 			audit_context: Arc::new(Mutex::new(None)),
 		}
 	}
@@ -1524,14 +1834,19 @@ impl CryptoManager {
 		manager
 	}
 
-	/// Dev/test-only helper. Production bootstrap must select a root
-	/// KEK provider explicitly through `NodeBootstrapConfig`.
+	/// Dev/test-only helper: an ephemeral root bound to its own candidate
+	/// check. Production bootstrap selects a provider through
+	/// `NodeBootstrapConfig` and verifies against the replicated check.
 	#[cfg(test)]
 	pub(crate) fn new_dev() -> Self {
-		Self::new(Arc::new(
+		let manager = Self::new(Arc::new(
 			DevRootKekProvider::new_ephemeral_for_tests()
 				.expect("dev root KEK provider must build"),
-		))
+		));
+		manager
+			.bind_to_own_candidate_without_cluster()
+			.expect("a dev root binds to its own candidate");
+		manager
 	}
 
 	pub fn selected_cipher_label(&self) -> &'static str {
@@ -1543,11 +1858,11 @@ impl CryptoManager {
 	}
 
 	pub fn root_kek_provider_label(&self) -> &'static str {
-		self.root_kek.label()
+		self.provider.label()
 	}
 
 	pub fn root_kek_provider_health(&self) -> std::io::Result<RootKekProviderHealth> {
-		self.root_kek.health()
+		self.provider.health()
 	}
 
 	pub fn mlock_status_label(&self) -> &'static str {
@@ -1563,29 +1878,216 @@ impl CryptoManager {
 		Ok(())
 	}
 
-	/// Destructively replace the local in-memory keysets from an
-	/// authoritative Raft-backed snapshot. Callers must only use this
-	/// before Raft can emit tenant-KEK observer callbacks, or from an
-	/// observer callback that already owns the committed snapshot being
-	/// applied.
+	/// The candidate root check of the loaded provider: the wrap of the fixed
+	/// public constant. The only key operation an unverified manager offers.
+	/// It takes no key argument and yields no binding.
+	pub(crate) fn candidate_root_check(&self) -> std::io::Result<RootCheck> {
+		compute_root_check(self.provider.as_ref())
+	}
+
+	#[cfg(test)]
+	fn cell_key(&self) -> usize {
+		Arc::as_ptr(&self.cell) as usize
+	}
+
+	/// Takes the current binding, or refuses. Every key use starts here.
+	fn admit(&self) -> std::io::Result<Arc<Bound>> {
+		let cell = self
+			.cell
+			.read()
+			.map_err(|_| RootBindingRefusal::NotVerified.into_io())?;
+		match &cell.state {
+			BindingState::Verified(bound) => Ok(bound.clone()),
+			BindingState::Unverified => Err(RootBindingRefusal::NotVerified.into_io()),
+			BindingState::Mismatch(_) => Err(RootBindingRefusal::Mismatch.into_io()),
+		}
+	}
+
+	pub fn key_authority_delivery_failed(&self) -> bool {
+		self.last_delivery_failed.load(Ordering::Relaxed)
+	}
+
+	pub fn root_binding_status(&self) -> RootBindingStatus {
+		let Ok(cell) = self.cell.read() else {
+			return RootBindingStatus::Pending;
+		};
+		match &cell.state {
+			BindingState::Unverified => RootBindingStatus::Pending,
+			BindingState::Verified(bound) => RootBindingStatus::Verified(bound.id),
+			BindingState::Mismatch(id) => RootBindingStatus::Mismatch(*id),
+		}
+	}
+
+	/// The id of the root check this node's root is verified against.
+	pub fn verified_root_check_id(&self) -> std::io::Result<RootCheckId> {
+		Ok(self.admit()?.id)
+	}
+
+	/// Whether `serial` names the binding a new operation would get now. A
+	/// local narrowing before an upload submits its pointer; it proves
+	/// nothing about what commits afterwards.
+	pub fn still_current(&self, serial: u64) -> bool {
+		self.admit().is_ok_and(|bound| bound.serial == serial)
+	}
+
+	/// Called by the state machine, under its state guard, before a state
+	/// whose root check is `next` becomes visible. Removes a verified binding
+	/// of any other id so no new operation can take it. No I/O, no await; the
+	/// displaced binding is destroyed later, outside this critical section.
+	pub(crate) fn fence_before_publication(&self, next: Option<RootCheckId>, index: u64) {
+		let mut cell = match self.cell.write() {
+			Ok(cell) => cell,
+			// A poisoned cell already refuses every admission; still fence.
+			Err(poisoned) => poisoned.into_inner(),
+		};
+		cell.fenced_index = cell.fenced_index.max(index);
+		let keep = match (&cell.state, next) {
+			(BindingState::Verified(bound), Some(next)) => bound.id == next,
+			(BindingState::Verified(_), None) => false,
+			_ => true,
+		};
+		if keep {
+			return;
+		}
+		let old = std::mem::replace(&mut cell.state, BindingState::Unverified);
+		drop(cell);
+		if let BindingState::Verified(bound) = old {
+			match self.displaced.lock() {
+				Ok(mut displaced) => displaced.push(bound),
+				// Leak rather than destroy key material under the state guard.
+				Err(_) => std::mem::forget(bound),
+			}
+		}
+	}
+
+	/// Installs the root check and the keysets of one applied state. The cell
+	/// is unverified before a new or different check is compared, and every
+	/// error leaves it so.
+	pub(crate) fn sync_key_authority(&self, authority: &KeyAuthority) -> std::io::Result<()> {
+		let graveyard = self
+			.displaced
+			.lock()
+			.map(|mut displaced| std::mem::take(&mut *displaced))
+			.unwrap_or_default();
+		drop(graveyard);
+		let index = authority.applied_index;
+		let (check, old) = {
+			let mut cell = self
+				.cell
+				.write()
+				.map_err(|_| Error::other("crypto root binding cell poisoned"))?;
+			if index < cell.fenced_index || cell.accepted_index.is_some_and(|a| index <= a) {
+				return Ok(());
+			}
+			cell.accepted_index = Some(index);
+			let Some(check) = authority.root_check.as_ref() else {
+				let old = std::mem::replace(&mut cell.state, BindingState::Unverified);
+				drop(cell);
+				drop(old);
+				return Ok(());
+			};
+			let id = check.id();
+			if let BindingState::Verified(bound) = &cell.state
+				&& bound.id == id
+			{
+				let next = Arc::new(Bound::new(
+					id,
+					self.provider.clone(),
+					authority.keysets.clone(),
+					self.cache_config,
+				));
+				let old = std::mem::replace(&mut cell.state, BindingState::Verified(next));
+				drop(cell);
+				drop(old);
+				return Ok(());
+			}
+			let old = std::mem::replace(&mut cell.state, BindingState::Unverified);
+			(check.clone(), old)
+		};
+		drop(old);
+		#[cfg(test)]
+		binding_test_hooks::before_verified_install(self);
+		let id = check.id();
+		let verdict = verify_root_check(self.provider.as_ref(), &check);
+		let mut cell = self
+			.cell
+			.write()
+			.map_err(|_| Error::other("crypto root binding cell poisoned"))?;
+		if cell.accepted_index != Some(index) || cell.fenced_index > index {
+			return Ok(());
+		}
+		match verdict {
+			Ok(true) => {
+				cell.state = BindingState::Verified(Arc::new(Bound::new(
+					id,
+					self.provider.clone(),
+					authority.keysets.clone(),
+					self.cache_config,
+				)));
+				Ok(())
+			}
+			Ok(false) => {
+				cell.state = BindingState::Mismatch(id);
+				Ok(())
+			}
+			Err(error) => Err(error),
+		}
+	}
+
+	/// Binds the loaded root to its own candidate check with no cluster and
+	/// no replicated state. For fixtures that use a crypto manager with no
+	/// node around it; a node verifies against the replicated check instead.
+	///
+	/// Private: only this module's fixture factories reach it. A node's
+	/// manager is admitted by committed key authority and by nothing else.
+	fn bind_to_own_candidate_without_cluster(&self) -> std::io::Result<()> {
+		let keysets = match self.admit() {
+			Ok(bound) => bound.lock_keysets()?.clone(),
+			Err(_) => HashMap::new(),
+		};
+		self.deliver_without_cluster(Some(self.candidate_root_check()?), keysets)
+	}
+
+	fn deliver_without_cluster(
+		&self,
+		root_check: Option<RootCheck>,
+		keysets: HashMap<TenantId, TenantKeyset>,
+	) -> std::io::Result<()> {
+		let applied_index = {
+			let cell = self
+				.cell
+				.read()
+				.map_err(|_| Error::other("crypto root binding cell poisoned"))?;
+			cell.accepted_index
+				.map_or(0, |a| a + 1)
+				.max(cell.fenced_index)
+		};
+		self.sync_key_authority(&KeyAuthority {
+			applied_index,
+			root_check,
+			keysets,
+		})
+	}
+
+	/// Test-only: replaces the keysets under this manager's own candidate
+	/// check, as a keyset-only authority delivery would.
+	#[cfg(test)]
 	pub(crate) fn replace_keysets_from_authoritative_snapshot(
 		&self,
 		snapshot: &HashMap<TenantId, TenantKeyset>,
 	) -> std::io::Result<()> {
-		let mut guard = self.lock_keysets()?;
-		*guard = snapshot.clone();
-		drop(guard);
-		self.invalidate_all_caches()
+		self.deliver_without_cluster(Some(self.candidate_root_check()?), snapshot.clone())
 	}
 
 	pub fn tenant_keysets_snapshot(&self) -> std::io::Result<HashMap<TenantId, TenantKeyset>> {
-		Ok(self.lock_keysets()?.clone())
+		Ok(self.admit()?.lock_keysets()?.clone())
 	}
 
-	/// Test-only helper that seeds local in-memory keysets without a
-	/// Raft commit. Production code must never call this path.
+	/// Fixture helper that seeds local in-memory keysets without a Raft
+	/// commit. Production code must never call this path.
 	pub(crate) fn install_local_only_for_tests(&self, tenant_id: TenantId) -> std::io::Result<()> {
-		let exists = self
+		let bound = self.admit()?;
+		let exists = bound
 			.lock_keysets()?
 			.get(&tenant_id)
 			.map(|keyset| !keyset.keys.is_empty())
@@ -1593,77 +2095,28 @@ impl CryptoManager {
 		if exists {
 			return Ok(());
 		}
-		let rotation = self.prepare_rotation(tenant_id)?;
-		self.apply_rotation(&rotation)
+		let rotation = bound.prepare_rotation(tenant_id)?;
+		bound.apply_rotation(&rotation)
 	}
 
+	/// A fresh tenant KEK wrapped under the verified root, with the id of
+	/// the root check it was wrapped under.
 	pub fn prepare_rotation(
 		&self,
 		tenant_id: TenantId,
 	) -> std::io::Result<InstallTenantKekVersion> {
-		let tenant_kek = random_256_bit_key()?;
-		let tenant_kek_id = self.mint_unused_tenant_kek_id(tenant_id)?;
-		let wrapped_tenant_kek = self.root_kek.wrap_tenant_kek(&tenant_kek)?;
-		let unwrapped_tenant_kek = self.root_kek.unwrap_tenant_kek(&wrapped_tenant_kek)?;
-		if unwrapped_tenant_kek.as_ref() != tenant_kek.as_ref() {
-			return Err(Error::other(
-				"root KEK provider returned mismatched tenant KEK bytes after wrap/unwrap self-check",
-			));
-		}
-		Ok(InstallTenantKekVersion {
-			tenant_id,
-			tenant_kek_id,
-			wrapped_tenant_kek,
-		})
+		self.admit()?.prepare_rotation(tenant_id)
 	}
 
-	fn mint_unused_tenant_kek_id(&self, tenant_id: TenantId) -> std::io::Result<TenantKekId> {
-		let guard = self.lock_keysets()?;
-		let existing = guard.get(&tenant_id).map(|keyset| &keyset.keys);
-		for _ in 0..32 {
-			let candidate = random_tenant_kek_id("tenant_kek_id")?;
-			if existing
-				.map(|keys| !keys.contains_key(&candidate))
-				.unwrap_or(true)
-			{
-				return Ok(candidate);
-			}
-		}
-		Err(Error::other(format!(
-			"failed to mint an unused tenant KEK id for tenant {} after 32 attempts",
-			tenant_id.get()
-		)))
-	}
-
+	/// Test-only: applies a rotation to the current binding's keysets.
+	#[cfg(test)]
 	pub(crate) fn apply_rotation(&self, rotation: &InstallTenantKekVersion) -> std::io::Result<()> {
-		let mut guard = self.lock_keysets()?;
-		let entry = guard.entry(rotation.tenant_id).or_default();
-		match entry.keys.entry(rotation.tenant_kek_id) {
-			std::collections::btree_map::Entry::Occupied(existing) => {
-				if existing.get().wrapped_key != rotation.wrapped_tenant_kek {
-					return Err(Error::new(
-						ErrorKind::AlreadyExists,
-						format!(
-							"tenant {} tenant_kek_id {} already exists with different wrapped key bytes",
-							rotation.tenant_id.get(),
-							rotation.tenant_kek_id
-						),
-					));
-				}
-			}
-			std::collections::btree_map::Entry::Vacant(slot) => {
-				slot.insert(WrappedTenantKek {
-					wrapped_key: rotation.wrapped_tenant_kek.clone(),
-				});
-			}
-		}
-		entry.active_tenant_kek_id = Some(rotation.tenant_kek_id);
-		drop(guard);
-		self.invalidate_tenant(rotation.tenant_id)
+		self.admit()?.apply_rotation(rotation)
 	}
 
 	pub fn active_tenant_kek_id(&self, tenant_id: TenantId) -> std::io::Result<TenantKekId> {
-		let guard = self.lock_keysets()?;
+		let bound = self.admit()?;
+		let guard = bound.lock_keysets()?;
 		let keyset = guard.get(&tenant_id).ok_or_else(|| {
 			Error::new(
 				ErrorKind::NotFound,
@@ -1687,7 +2140,8 @@ impl CryptoManager {
 		metadata: &TieredSlabObjectMetadata,
 		plaintext: &[u8],
 	) -> std::io::Result<EncryptedTieredSlab> {
-		let (tenant_kek_id, tenant_kek) = self.get_active_tenant_kek(metadata.tenant_id)?;
+		let bound = self.admit()?;
+		let (tenant_kek_id, tenant_kek) = bound.get_active_tenant_kek(metadata.tenant_id)?;
 		let wrapped_slab_dek = SlabDek::fresh_for(slab_id)?.wrap(&tenant_kek)?;
 		let cipher_id = selected_cipher_id();
 		// ADR 039 forbids writer-side lazy CSB attachment: no stats means a
@@ -1808,7 +2262,7 @@ impl CryptoManager {
 		out.extend_from_slice(&ADR_TIERED_SLAB_MAGIC_TAIL);
 
 		{
-			let mut slab_cache = self.lock_slab_dek_cache()?;
+			let mut slab_cache = bound.lock_slab_dek_cache()?;
 			slab_cache.insert(
 				slab_dek_cache_key(
 					metadata.tenant_id,
@@ -1831,6 +2285,7 @@ impl CryptoManager {
 			slab_format_version,
 			stats_locator,
 			has_row_tombstone_records: metadata.has_row_tombstone_records,
+			binding_serial: bound.serial,
 		})
 	}
 
@@ -1839,6 +2294,7 @@ impl CryptoManager {
 		expected_slab_id: SlabId,
 		blob: &[u8],
 	) -> std::io::Result<DecryptedTieredSlab> {
+		let bound = self.admit()?;
 		let parsed = match parse_encrypted_footer(blob) {
 			Ok(parsed) => parsed,
 			Err(error) => {
@@ -1869,7 +2325,7 @@ impl CryptoManager {
 			self.emit_decrypt_rejected(expected_slab_id, Some(footer), "footer_parse", &error);
 			return Err(error);
 		}
-		let tenant_kek = match self.get_tenant_kek(parsed.tenant_id, parsed.tenant_kek_id) {
+		let tenant_kek = match bound.get_tenant_kek(parsed.tenant_id, parsed.tenant_kek_id) {
 			Ok(tenant_kek) => tenant_kek,
 			Err(error) => {
 				self.emit_decrypt_rejected(
@@ -1894,7 +2350,7 @@ impl CryptoManager {
 				return Err(error);
 			}
 		};
-		let slab_dek = match self.resolve_prepared_slab_dek(
+		let slab_dek = match bound.resolve_prepared_slab_dek(
 			parsed.tenant_id,
 			parsed.tenant_kek_id,
 			parsed.slab_id,
@@ -1943,6 +2399,7 @@ impl CryptoManager {
 		blob: &[u8],
 		schema_generation: u64,
 	) -> std::io::Result<Option<DecryptedTieredStatsBlock>> {
+		let bound = self.admit()?;
 		let start = Instant::now();
 		let result = (|| {
 			let parsed = parse_encrypted_footer(blob)?;
@@ -1967,9 +2424,9 @@ impl CryptoManager {
 			let Some(locator) = parsed.stats_locator else {
 				return Ok(None);
 			};
-			let tenant_kek = self.get_tenant_kek(parsed.tenant_id, parsed.tenant_kek_id)?;
+			let tenant_kek = bound.get_tenant_kek(parsed.tenant_id, parsed.tenant_kek_id)?;
 			verify_parsed_surface_hmac(&tenant_kek, &parsed)?;
-			let slab_dek = self.resolve_prepared_slab_dek(
+			let slab_dek = bound.resolve_prepared_slab_dek(
 				parsed.tenant_id,
 				parsed.tenant_kek_id,
 				parsed.slab_id,
@@ -2042,6 +2499,7 @@ impl CryptoManager {
 		tail_window: &[u8],
 		additional_metadata: Option<&[u8]>,
 	) -> std::io::Result<Option<TieredStatsBlockReadPlan>> {
+		let bound = self.admit()?;
 		let parsed = match parse_encrypted_footer_from_tail_window(object_size_bytes, tail_window) {
 			Ok(parsed) => parsed,
 			Err(error) => {
@@ -2085,7 +2543,7 @@ impl CryptoManager {
 				"ADR 039 stats locator present without object range",
 			));
 		};
-		let tenant_kek = match self.get_tenant_kek(parsed.tenant_id, parsed.tenant_kek_id) {
+		let tenant_kek = match bound.get_tenant_kek(parsed.tenant_id, parsed.tenant_kek_id) {
 			Ok(tenant_kek) => tenant_kek,
 			Err(error) => {
 				self.emit_decrypt_rejected(
@@ -2103,7 +2561,7 @@ impl CryptoManager {
 			self.emit_decrypt_rejected(expected_slab_id, Some(footer), "hmac", &error);
 			return Err(error);
 		}
-		let prepared_slab_dek = match self.resolve_prepared_slab_dek(
+		let prepared_slab_dek = match bound.resolve_prepared_slab_dek(
 			parsed.tenant_id,
 			parsed.tenant_kek_id,
 			parsed.slab_id,
@@ -2141,6 +2599,7 @@ impl CryptoManager {
 		additional_metadata: Option<&[u8]>,
 		record: LogicalExtent,
 	) -> std::io::Result<TieredRangePlanningContext> {
+		let bound = self.admit()?;
 		let parsed = match parse_encrypted_footer_from_tail_window(object_size_bytes, tail_window) {
 			Ok(parsed) => parsed,
 			Err(error) => {
@@ -2171,7 +2630,7 @@ impl CryptoManager {
 			self.emit_decrypt_rejected(expected_slab_id, Some(footer), "footer_parse", &error);
 			return Err(error);
 		}
-		let tenant_kek = match self.get_tenant_kek(parsed.tenant_id, parsed.tenant_kek_id) {
+		let tenant_kek = match bound.get_tenant_kek(parsed.tenant_id, parsed.tenant_kek_id) {
 			Ok(tenant_kek) => tenant_kek,
 			Err(error) => {
 				self.emit_decrypt_rejected(
@@ -2203,7 +2662,7 @@ impl CryptoManager {
 			self.emit_decrypt_rejected(expected_slab_id, Some(footer), "range_plan", &error);
 			return Err(error);
 		}
-		let prepared_slab_dek = match self.resolve_prepared_slab_dek(
+		let prepared_slab_dek = match bound.resolve_prepared_slab_dek(
 			parsed.tenant_id,
 			parsed.tenant_kek_id,
 			parsed.slab_id,
@@ -2363,6 +2822,176 @@ impl CryptoManager {
 		Ok(Some(parsed.footer_summary()))
 	}
 
+	fn lock_audit_context(
+		&self,
+	) -> std::io::Result<std::sync::MutexGuard<'_, Option<CryptoAuditContext>>> {
+		self.audit_context
+			.lock()
+			.map_err(|_| Error::other("crypto audit context mutex poisoned"))
+	}
+
+	fn emit_decrypt_rejected(
+		&self,
+		expected_slab_id: SlabId,
+		footer: Option<FooterSummary>,
+		stage: &'static str,
+		error: &std::io::Error,
+	) {
+		let context = match self.lock_audit_context() {
+			Ok(guard) => guard.clone(),
+			Err(lock_error) => {
+				crate::metrics::global()
+					.crypto_decrypt_audit_emit_failures_total
+					.inc();
+				tracing::error!(
+					error = %lock_error,
+					"crypto decrypt rejection could not acquire audit context"
+				);
+				return;
+			}
+		};
+		let Some(context) = context else {
+			return;
+		};
+		let message = match footer {
+			Some(footer) => format!(
+				"failure_stage={} expected_slab_id={} footer_slab_id={} tenant_id={} tenant_kek_id={} cipher_id={} chunk_count={} error={}",
+				stage,
+				expected_slab_id,
+				footer.slab_id,
+				footer.tenant_id.get(),
+				footer.tenant_kek_id.get(),
+				footer.cipher_id.to_wire(),
+				footer.chunk_count,
+				error
+			),
+			None => format!(
+				"failure_stage={} expected_slab_id={} error={}",
+				stage, expected_slab_id, error
+			),
+		};
+		let mut audit = AuditEvent::new(
+			AuditAuthority::NodeLocal,
+			AuditOperation::CryptoDecryptRejected,
+			context.node_id,
+			message,
+		)
+		.with_outcome(AuditOutcome::Error)
+		.with_parameter("failure_stage", stage)
+		.with_parameter("expected_slab_id", expected_slab_id.get())
+		.with_parameter("error", error.to_string());
+		if let Some(footer) = footer {
+			audit = audit
+				.with_parameter("footer_slab_id", footer.slab_id.get())
+				.with_parameter("tenant_id", footer.tenant_id.get())
+				.with_parameter("tenant_kek_id", footer.tenant_kek_id.get())
+				.with_parameter("cipher_id", footer.cipher_id.to_wire() as u64)
+				.with_parameter("chunk_count", footer.chunk_count as u64);
+		}
+		if let Err(emit_error) = context.sink.emit(audit) {
+			// Decrypt rejections are the forensic signal for a tampered slab.
+			// A sink-write failure (full disk, fs remounted ro, fsync error)
+			// drops a security event that ADR 025 expects to be durable, so
+			// surface it as an error and bump a metric an alert can fire on.
+			crate::metrics::global()
+				.crypto_decrypt_audit_emit_failures_total
+				.inc();
+			tracing::error!(
+				error = %emit_error,
+				"crypto decrypt rejection audit emission failed"
+			);
+		}
+	}
+}
+
+impl Bound {
+	fn new(
+		id: RootCheckId,
+		provider: Arc<dyn RootKekProvider>,
+		keysets: HashMap<TenantId, TenantKeyset>,
+		cache_config: CryptoCacheConfig,
+	) -> Self {
+		Self {
+			id,
+			serial: BOUND_SERIAL.fetch_add(1, Ordering::Relaxed),
+			provider,
+			keysets: Mutex::new(keysets),
+			tenant_kek_cache: Mutex::new(KeyCache::new(
+				cache_config.tenant_kek_cache_max_entries,
+				DEFAULT_TENANT_KEK_IDLE_TTL,
+				Some(DEFAULT_TENANT_KEK_ABSOLUTE_TTL),
+			)),
+			slab_dek_cache: Mutex::new(KeyCache::new(
+				cache_config.slab_dek_cache_max_entries,
+				DEFAULT_SLAB_DEK_IDLE_TTL,
+				None,
+			)),
+		}
+	}
+
+	fn prepare_rotation(&self, tenant_id: TenantId) -> std::io::Result<InstallTenantKekVersion> {
+		let tenant_kek = random_256_bit_key()?;
+		let tenant_kek_id = self.mint_unused_tenant_kek_id(tenant_id)?;
+		let wrapped_tenant_kek = self.provider.wrap_tenant_kek(&tenant_kek)?;
+		let unwrapped_tenant_kek = self.provider.unwrap_tenant_kek(&wrapped_tenant_kek)?;
+		if unwrapped_tenant_kek.as_ref() != tenant_kek.as_ref() {
+			return Err(Error::other(
+				"root KEK provider returned mismatched tenant KEK bytes after wrap/unwrap self-check",
+			));
+		}
+		Ok(InstallTenantKekVersion {
+			tenant_id,
+			tenant_kek_id,
+			wrapped_tenant_kek,
+			under_root: self.id,
+		})
+	}
+
+	fn mint_unused_tenant_kek_id(&self, tenant_id: TenantId) -> std::io::Result<TenantKekId> {
+		let guard = self.lock_keysets()?;
+		let existing = guard.get(&tenant_id).map(|keyset| &keyset.keys);
+		for _ in 0..32 {
+			let candidate = random_tenant_kek_id("tenant_kek_id")?;
+			if existing
+				.map(|keys| !keys.contains_key(&candidate))
+				.unwrap_or(true)
+			{
+				return Ok(candidate);
+			}
+		}
+		Err(Error::other(format!(
+			"failed to mint an unused tenant KEK id for tenant {} after 32 attempts",
+			tenant_id.get()
+		)))
+	}
+
+	fn apply_rotation(&self, rotation: &InstallTenantKekVersion) -> std::io::Result<()> {
+		let mut guard = self.lock_keysets()?;
+		let entry = guard.entry(rotation.tenant_id).or_default();
+		match entry.keys.entry(rotation.tenant_kek_id) {
+			std::collections::btree_map::Entry::Occupied(existing) => {
+				if existing.get().wrapped_key != rotation.wrapped_tenant_kek {
+					return Err(Error::new(
+						ErrorKind::AlreadyExists,
+						format!(
+							"tenant {} tenant_kek_id {} already exists with different wrapped key bytes",
+							rotation.tenant_id.get(),
+							rotation.tenant_kek_id
+						),
+					));
+				}
+			}
+			std::collections::btree_map::Entry::Vacant(slot) => {
+				slot.insert(WrappedTenantKek {
+					wrapped_key: rotation.wrapped_tenant_kek.clone(),
+				});
+			}
+		}
+		entry.active_tenant_kek_id = Some(rotation.tenant_kek_id);
+		drop(guard);
+		self.invalidate_tenant(rotation.tenant_id)
+	}
+
 	fn resolve_prepared_slab_dek(
 		&self,
 		tenant_id: TenantId,
@@ -2492,20 +3121,16 @@ impl CryptoManager {
 		}
 		metrics().tenant_kek_cache_misses_total.inc();
 
-		let unwrapped = self.root_kek.unwrap_tenant_kek(&wrapped.wrapped_key)?;
+		let unwrapped = self.provider.unwrap_tenant_kek(&wrapped.wrapped_key)?;
 		let locked = Arc::new(LockedKeyMaterial::new(unwrapped)?);
+		#[cfg(test)]
+		binding_test_hooks::between_unwrap_and_insert(self.serial);
 		let mut cache = self.lock_tenant_kek_cache()?;
 		if let Some(key) = cache.get(&(tenant_id, tenant_kek_id)) {
 			return Ok(key);
 		}
 		cache.insert((tenant_id, tenant_kek_id), locked.clone());
 		Ok(locked)
-	}
-
-	fn invalidate_all_caches(&self) -> std::io::Result<()> {
-		self.lock_tenant_kek_cache()?.clear();
-		self.lock_slab_dek_cache()?.clear();
-		Ok(())
 	}
 
 	fn invalidate_tenant(&self, tenant_id: TenantId) -> std::io::Result<()> {
@@ -2541,104 +3166,19 @@ impl CryptoManager {
 			.lock()
 			.map_err(|_| Error::other("slab DEK cache mutex poisoned"))
 	}
-
-	fn lock_audit_context(
-		&self,
-	) -> std::io::Result<std::sync::MutexGuard<'_, Option<CryptoAuditContext>>> {
-		self.audit_context
-			.lock()
-			.map_err(|_| Error::other("crypto audit context mutex poisoned"))
-	}
-
-	fn emit_decrypt_rejected(
-		&self,
-		expected_slab_id: SlabId,
-		footer: Option<FooterSummary>,
-		stage: &'static str,
-		error: &std::io::Error,
-	) {
-		let context = match self.lock_audit_context() {
-			Ok(guard) => guard.clone(),
-			Err(lock_error) => {
-				crate::metrics::global()
-					.crypto_decrypt_audit_emit_failures_total
-					.inc();
-				tracing::error!(
-					error = %lock_error,
-					"crypto decrypt rejection could not acquire audit context"
-				);
-				return;
-			}
-		};
-		let Some(context) = context else {
-			return;
-		};
-		let message = match footer {
-			Some(footer) => format!(
-				"failure_stage={} expected_slab_id={} footer_slab_id={} tenant_id={} tenant_kek_id={} cipher_id={} chunk_count={} error={}",
-				stage,
-				expected_slab_id,
-				footer.slab_id,
-				footer.tenant_id.get(),
-				footer.tenant_kek_id.get(),
-				footer.cipher_id.to_wire(),
-				footer.chunk_count,
-				error
-			),
-			None => format!(
-				"failure_stage={} expected_slab_id={} error={}",
-				stage, expected_slab_id, error
-			),
-		};
-		let mut audit = AuditEvent::new(
-			AuditAuthority::NodeLocal,
-			AuditOperation::CryptoDecryptRejected,
-			context.node_id,
-			message,
-		)
-		.with_outcome(AuditOutcome::Error)
-		.with_parameter("failure_stage", stage)
-		.with_parameter("expected_slab_id", expected_slab_id.get())
-		.with_parameter("error", error.to_string());
-		if let Some(footer) = footer {
-			audit = audit
-				.with_parameter("footer_slab_id", footer.slab_id.get())
-				.with_parameter("tenant_id", footer.tenant_id.get())
-				.with_parameter("tenant_kek_id", footer.tenant_kek_id.get())
-				.with_parameter("cipher_id", footer.cipher_id.to_wire() as u64)
-				.with_parameter("chunk_count", footer.chunk_count as u64);
-		}
-		if let Err(emit_error) = context.sink.emit(audit) {
-			// Decrypt rejections are the forensic signal for a tampered slab.
-			// A sink-write failure (full disk, fs remounted ro, fsync error)
-			// drops a security event that ADR 025 expects to be durable, so
-			// surface it as an error and bump a metric an alert can fire on.
-			crate::metrics::global()
-				.crypto_decrypt_audit_emit_failures_total
-				.inc();
-			tracing::error!(
-				error = %emit_error,
-				"crypto decrypt rejection audit emission failed"
-			);
-		}
-	}
 }
 
 #[async_trait]
 impl crate::consensus::TenantKekObserver for CryptoManager {
-	async fn on_tenant_kek_rotated(
-		&self,
-		rotation: &InstallTenantKekVersion,
-		_applied_log_index: u64,
-	) -> std::io::Result<()> {
-		self.apply_rotation(rotation)
+	fn fence_before_publication(&self, next: Option<RootCheckId>, index: u64) {
+		CryptoManager::fence_before_publication(self, next, index);
 	}
 
-	async fn sync_tenant_keysets(
-		&self,
-		snapshot: &HashMap<TenantId, TenantKeyset>,
-	) -> std::io::Result<()> {
-		self.replace_keysets_from_authoritative_snapshot(snapshot)
+	async fn sync_key_authority(&self, authority: &KeyAuthority) -> std::io::Result<()> {
+		let result = CryptoManager::sync_key_authority(self, authority);
+		self.last_delivery_failed
+			.store(result.is_err(), Ordering::Relaxed);
+		result
 	}
 }
 
@@ -2678,15 +3218,63 @@ pub mod test_support {
 
 	pub fn seeded_dev_crypto_manager(tenant_id: TenantId) -> std::io::Result<CryptoManager> {
 		let crypto = CryptoManager::new(Arc::new(DevRootKekProvider::new_ephemeral_for_tests()?));
+		crypto.bind_to_own_candidate_without_cluster()?;
 		crypto.install_local_only_for_tests(tenant_id)?;
 		Ok(crypto)
 	}
 
+	/// Places a freshly generated development root KEK in `data_dir`, as an
+	/// operator supplying a root of their own would, or as a member that was
+	/// never given its cluster's root would have. Synthetic, per call.
+	#[cfg(any(test, not(feature = "fips")))]
+	pub fn place_fresh_dev_root_artifact(data_dir: &Path) -> std::io::Result<()> {
+		persist_new_dev_insecure_root_kek(
+			&dev_insecure_root_kek_path(data_dir),
+			&KeyMaterialBytes::random()?,
+		)
+	}
+
+	/// The enrollment procedure of ADR 0726 as a fixture performs it: copy the
+	/// forming member's sealed root artifact, owner-only, to the same path in
+	/// another member's data directory before that member first starts. Copies
+	/// whichever provider artifact exists; the unlock capability is the
+	/// caller's to supply.
+	pub fn enroll_root_artifact(forming: &Path, member: &Path) -> std::io::Result<()> {
+		let mut copied = false;
+		for file in ROOT_KEK_ARTIFACT_FILES {
+			let dir = LOCAL_SEALED_ROOT_KEK_DIR;
+			let source = forming.join(dir).join(file);
+			if !source.exists() {
+				continue;
+			}
+			let target_dir = member.join(dir);
+			std::fs::create_dir_all(&target_dir)?;
+			let target = target_dir.join(file);
+			std::fs::copy(&source, &target)?;
+			#[cfg(unix)]
+			{
+				use std::os::unix::fs::PermissionsExt;
+				std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600))?;
+			}
+			copied = true;
+		}
+		if copied {
+			Ok(())
+		} else {
+			Err(Error::new(
+				ErrorKind::NotFound,
+				format!("no root KEK artifact under {}", forming.display()),
+			))
+		}
+	}
+
 	#[cfg(any(test, not(feature = "fips")))]
 	pub fn persistent_dev_crypto_manager(data_dir: &Path) -> std::io::Result<CryptoManager> {
-		Ok(CryptoManager::new(Arc::new(
-			DevRootKekProvider::from_dev_insecure_dir(data_dir)?,
-		)))
+		let crypto = CryptoManager::new(Arc::new(DevRootKekProvider::from_dev_insecure_dir(
+			data_dir,
+		)?));
+		crypto.bind_to_own_candidate_without_cluster()?;
+		Ok(crypto)
 	}
 }
 
@@ -5254,47 +5842,6 @@ struct DevRootKekProvider {
 	key: LockedKeyMaterial,
 }
 
-/// Test-only (ADR 0725): one fresh development root KEK for the members of one
-/// test cluster, so the tenant KEK one of them installs can be unwrapped by
-/// each. A member is enrolled by its fresh data directory before it first
-/// opens; its provider then creates its root from this material instead of a
-/// random one, through the ordinary persist path. Nothing else is shared: store
-/// identities, signing keys, logs and indexes stay each node's own. The product
-/// neither provisions nor checks such a common root for real daemon members.
-#[cfg(test)]
-pub(crate) mod common_dev_root_for_test {
-	use super::KeyMaterialBytes;
-	use std::collections::HashMap;
-	use std::path::{Path, PathBuf};
-	use std::sync::Mutex;
-
-	static ENROLLED: Mutex<Option<HashMap<PathBuf, KeyMaterialBytes>>> = Mutex::new(None);
-
-	/// A fresh root for one test cluster. It has no accessor and no `Debug`.
-	pub(crate) struct CommonDevRoot(KeyMaterialBytes);
-
-	impl CommonDevRoot {
-		pub(crate) fn fresh() -> Self {
-			Self(KeyMaterialBytes::random().expect("random key material"))
-		}
-
-		/// Enrolls the member whose fresh data directory is `data_dir`.
-		pub(crate) fn enroll(&self, data_dir: &Path) {
-			let copy = KeyMaterialBytes::copy_from_slice(self.0.as_ref(), "dev root KEK")
-				.expect("a root KEK copies");
-			ENROLLED
-				.lock()
-				.unwrap()
-				.get_or_insert_with(HashMap::new)
-				.insert(data_dir.to_path_buf(), copy);
-		}
-	}
-
-	pub(super) fn take(data_dir: &Path) -> Option<KeyMaterialBytes> {
-		ENROLLED.lock().unwrap().as_mut()?.remove(data_dir)
-	}
-}
-
 impl DevRootKekProvider {
 	#[cfg(any(test, not(feature = "fips")))]
 	fn from_dev_insecure_dir(data_dir: &Path) -> std::io::Result<Self> {
@@ -5308,13 +5855,7 @@ impl DevRootKekProvider {
 			RootKekBootstrapMode::GenerateOrCreate => match read_dev_insecure_root_kek(&path) {
 				Ok(key) => key,
 				Err(error) if error.kind() == ErrorKind::NotFound => {
-					#[cfg(not(test))]
 					let key = KeyMaterialBytes::random()?;
-					#[cfg(test)]
-					let key = match common_dev_root_for_test::take(init.data_dir) {
-						Some(enrolled) => enrolled,
-						None => KeyMaterialBytes::random()?,
-					};
 					let persist = {
 						let _permit = init
 							.owner
@@ -5829,6 +6370,7 @@ where
 		}
 	}
 
+	#[cfg(test)]
 	fn clear(&mut self) {
 		self.entries.clear();
 	}
@@ -5904,6 +6446,9 @@ where
 			.map(|(key, _)| key.clone())
 	}
 }
+
+#[cfg(test)]
+mod root_binding_tests;
 
 #[cfg(test)]
 mod tests {
@@ -7081,7 +7626,11 @@ mod tests {
 			TenantId::new(decode_adr022_u64_slot(&footer[24..40], "tenant_id").unwrap());
 		let kek_id =
 			TenantKekId::try_from(decode_adr022_u64_slot(&footer[64..96], "kek").unwrap()).unwrap();
-		let tenant_kek = crypto.get_tenant_kek(tenant_id, kek_id).unwrap();
+		let tenant_kek = crypto
+			.admit()
+			.unwrap()
+			.get_tenant_kek(tenant_id, kek_id)
+			.unwrap();
 		let header = &out[ADR_TIERED_SLAB_MAGIC_HEAD.len()
 			..ADR_TIERED_SLAB_MAGIC_HEAD.len() + ADR_TIERED_SLAB_HEADER_BYTES];
 		let footer = &out[footer_start..tail_offset];

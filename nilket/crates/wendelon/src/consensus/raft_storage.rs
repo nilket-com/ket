@@ -64,7 +64,7 @@ use crate::consensus::{
 	TenantFinalization, TenantLifecycleState, TenantRecord, TieredSlab, UpdateTenantQuota,
 	WendelonRequest, WendelonResponse, WendelonTypeConfig,
 };
-use crate::crypto::{InstallTenantKekVersion, RetireTenantKekVersion, TenantKeyset};
+use crate::crypto::{RetireTenantKekVersion, TenantKeyset};
 use crate::integration::compute::{
 	LOGICAL_TYPE_INTERNAL_NAMESPACE, LogicalTypeCatalog, SchemaMutationKind, SchemaObjectKind,
 	SchemaUpdateEnvelope, decode_logical_type_definition_create, decode_schema_update_envelope_v1,
@@ -146,7 +146,8 @@ const REC_SNAPSHOT_INSTALL: u8 = 2;
 #[allow(dead_code)]
 const REC_CHECKPOINT: u8 = 3;
 const FINALIZATION_BROADCAST_CAPACITY: usize = 1024;
-pub(crate) const CONTROL_RING_BACKUP_FORMAT_VERSION: u16 = 1;
+/// ADR 0726: 2, whose state carries the root check. Version 1 is refused.
+pub(crate) const CONTROL_RING_BACKUP_FORMAT_VERSION: u16 = 2;
 const DEFAULT_WAL_SEGMENT_BYTES: u64 = 128 * 1024 * 1024;
 const WAL_SEGMENT_SUFFIX: &str = ".seg";
 const WAL_SEGMENT_STAGING_SUFFIX: &str = ".staging";
@@ -2979,6 +2980,10 @@ pub struct SmState {
 	/// [`decode_state_body`], and today's encoder refuses a state holding it.
 	#[serde(skip)]
 	pub decisions: Option<crate::consensus::decisions::DecisionState>,
+	/// ADR 0726: the cluster's write-once root compatibility check. Keep
+	/// trailing.
+	#[serde(default)]
+	pub root_check: Option<crate::crypto::RootCheck>,
 }
 
 impl SmState {
@@ -3586,15 +3591,14 @@ pub trait TierObserver: Send + Sync {
 
 #[async_trait::async_trait]
 pub trait TenantKekObserver: Send + Sync {
-	async fn on_tenant_kek_rotated(
-		&self,
-		rotation: &InstallTenantKekVersion,
-		applied_log_index: u64,
-	) -> std::io::Result<()>;
+	/// ADR 0726: called under the state guard before a state whose root check
+	/// is `next` becomes visible. Synchronous; no I/O.
+	fn fence_before_publication(&self, next: Option<crate::crypto::RootCheckId>, index: u64);
 
-	async fn sync_tenant_keysets(
+	/// The root check and tenant keysets of one applied state, together.
+	async fn sync_key_authority(
 		&self,
-		snapshot: &HashMap<crate::schema::TenantId, TenantKeyset>,
+		authority: &crate::crypto::KeyAuthority,
 	) -> std::io::Result<()>;
 }
 
@@ -3663,6 +3667,11 @@ struct SnapshotRuntime {
 	#[cfg(test)]
 	install_after_publication_hold:
 		Arc<std::sync::Mutex<Option<(Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>>>,
+	/// Test-only, this state machine's own: runs once, right after the next
+	/// installed snapshot's state is published and before its key authority
+	/// is delivered (ADR 0726).
+	#[cfg(test)]
+	after_state_publication: Arc<std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>>,
 }
 
 impl SnapshotRuntime {
@@ -3680,6 +3689,8 @@ impl SnapshotRuntime {
 			deferred_purge,
 			#[cfg(test)]
 			install_after_publication_hold: Arc::new(std::sync::Mutex::new(None)),
+			#[cfg(test)]
+			after_state_publication: Arc::new(std::sync::Mutex::new(None)),
 		}
 	}
 
@@ -4234,6 +4245,18 @@ impl WendelonStateMachine {
 		self.inner.write().await.state = state;
 	}
 
+	/// Runs `hook` once on this state machine: right after its next installed
+	/// snapshot's state is published and before that state's key authority is
+	/// delivered. No other state machine's installation runs it.
+	#[cfg(test)]
+	pub(crate) fn on_next_state_publication_for_test(&self, hook: Box<dyn FnOnce() + Send>) {
+		*self
+			.snapshot_runtime
+			.after_state_publication
+			.lock()
+			.unwrap() = Some(hook);
+	}
+
 	#[cfg(test)]
 	pub(crate) fn pause_snapshot_after_publication_for_test(
 		&self,
@@ -4759,10 +4782,7 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 		// other entries in the batch.
 		let mut pending_audit_events: Vec<AuditEvent> = Vec::new();
 		let mut pending_tier_events: Vec<(TierObserverEvent, u64)> = Vec::new();
-		let mut pending_tenant_kek_events: Vec<(InstallTenantKekVersion, u64)> = Vec::new();
-		let mut pending_tenant_kek_snapshot: Option<
-			HashMap<crate::schema::TenantId, TenantKeyset>,
-		> = None;
+		let mut pending_key_authority: Option<crate::crypto::KeyAuthority> = None;
 		let mut pending_finalizations: Vec<FinalizationMarker> = Vec::new();
 		let mut pending_drop_settlements: Vec<TableDropSettlementRequest> = Vec::new();
 		let pending_checkpoint = {
@@ -4789,23 +4809,19 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 					}
 					_ => None,
 				};
-				let tenant_kek_rotation = match &entry.payload {
-					EntryPayload::Normal(WendelonRequest::InstallTenantKekVersion(rotation)) => {
-						Some(rotation.clone())
-					}
-					_ => None,
-				};
-				let has_tenant_kek_rotation = tenant_kek_rotation.is_some();
-				let mut requires_tenant_kek_snapshot_sync = matches!(
+				let establishes_root_check = matches!(
 					&entry.payload,
-					EntryPayload::Normal(WendelonRequest::CreateTenant(_))
+					EntryPayload::Normal(WendelonRequest::EstablishRootCheck(_))
 				);
-				if matches!(
-					&entry.payload,
-					EntryPayload::Normal(WendelonRequest::RetireTenantKekVersion(_))
-				) {
-					requires_tenant_kek_snapshot_sync = true;
-				}
+				let changes_key_authority = establishes_root_check
+					|| matches!(
+						&entry.payload,
+						EntryPayload::Normal(
+							WendelonRequest::CreateTenant(_)
+								| WendelonRequest::InstallTenantKekVersion(_)
+								| WendelonRequest::RetireTenantKekVersion(_)
+						)
+					);
 				let retention_audit_context = retention_audit_context(&guard.state, &entry);
 				let schema_audit_context = schema_audit_context(&guard.state, &entry);
 				let mut index_schema_audit_context =
@@ -4842,19 +4858,27 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 					})?;
 					pending_tier_events.push((t, entry.log_id.index));
 				}
-				if let Some(rotation) = tenant_kek_rotation {
-					if applied_successfully {
-						pending_tenant_kek_events.push((rotation, entry.log_id.index));
-					}
-				}
-				// CreateTenant and destructive tenant-KEK retirement update
-				// the authoritative keyset without an incremental observer
-				// callback. Rotation also snapshots here so local crypto can
-				// converge even if incremental apply missed a commit.
-				if (requires_tenant_kek_snapshot_sync || has_tenant_kek_rotation)
+				// ADR 0726: fence before this batch's state becomes visible, then
+				// deliver the root check and the keysets of one state together.
+				if establishes_root_check
 					&& applied_successfully
+					&& let Some(observer) = self.tenant_kek_observer.as_ref()
 				{
-					pending_tenant_kek_snapshot = Some(guard.state.tenant_keysets.clone());
+					observer.fence_before_publication(
+						guard
+							.state
+							.root_check
+							.as_ref()
+							.map(crate::crypto::RootCheck::id),
+						entry.log_id.index,
+					);
+				}
+				if changes_key_authority && applied_successfully {
+					pending_key_authority = Some(crate::crypto::KeyAuthority {
+						applied_index: entry.log_id.index,
+						root_check: guard.state.root_check.clone(),
+						keysets: guard.state.tenant_keysets.clone(),
+					});
 				}
 				if let Some(materializer) = self.audit_materializer.as_ref() {
 					if let Some(event) = raft_audit_event_with_context(
@@ -4928,29 +4952,17 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 				}
 			}
 		}
-		if let Some(observer) = self.tenant_kek_observer.as_ref() {
-			for (rotation, applied_log_index) in &pending_tenant_kek_events {
-				if let Err(err) = observer
-					.on_tenant_kek_rotated(rotation, *applied_log_index)
-					.await
-				{
-					tracing::warn!(
-						tenant_id = rotation.tenant_id.get(),
-						tenant_kek_id = rotation.tenant_kek_id.get(),
-						error = %err,
-						"tenant KEK observer incremental apply failed; reconciling from committed keyset snapshot"
-					);
-				}
-			}
-			if let Some(snapshot) = pending_tenant_kek_snapshot.as_ref() {
-				if let Err(err) = observer.sync_tenant_keysets(snapshot).await {
-					tracing::warn!(
-						tenants = snapshot.len(),
-						error = %err,
-						"tenant KEK observer snapshot sync failed; local crypto caches may remain stale until the next rotation or restart"
-					);
-				}
-			}
+		if let (Some(observer), Some(authority)) = (
+			self.tenant_kek_observer.as_ref(),
+			pending_key_authority.as_ref(),
+		) && let Err(err) = observer.sync_key_authority(authority).await
+		{
+			// The receiver fenced itself before it could fail (ADR 0726).
+			tracing::error!(
+				applied_index = authority.applied_index,
+				error = %err,
+				"key authority delivery failed; this node's crypto stays fenced"
+			);
 		}
 		for marker in pending_finalizations {
 			let _ = self.finalization_events.send(marker);
@@ -5178,6 +5190,7 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 				}
 			}
 		}
+		let installed_key_authority: Option<crate::crypto::KeyAuthority>;
 		let pending_checkpoint = {
 			let mut guard = self.inner.write().await;
 			state.last_applied_log_id = meta.last_log_id;
@@ -5225,6 +5238,20 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 				return Err(write_err(Error::other("canonical tier revision exhausted")));
 			};
 			guard.tier_revision = next_revision;
+			// ADR 0726: an old verified binding of another root is removed
+			// before the installed authority becomes visible.
+			let snapshot_index = meta.last_log_id.map_or(0, |id| id.index);
+			if let Some(observer) = self.tenant_kek_observer.as_ref() {
+				observer.fence_before_publication(
+					state.root_check.as_ref().map(crate::crypto::RootCheck::id),
+					snapshot_index,
+				);
+			}
+			installed_key_authority = Some(crate::crypto::KeyAuthority {
+				applied_index: snapshot_index,
+				root_check: state.root_check.clone(),
+				keysets: state.tenant_keysets.clone(),
+			});
 			guard.state = state;
 			guard.snapshot = Some(HeldSnapshot {
 				meta: meta.clone(),
@@ -5237,6 +5264,29 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 				.set_drop_reclaim_debts(guard.state.table_drop_reclaim_debts.len());
 			checkpoint_observation_from_state(&guard.state, true)
 		};
+		#[cfg(test)]
+		{
+			let hook = self
+				.snapshot_runtime
+				.after_state_publication
+				.lock()
+				.unwrap()
+				.take();
+			if let Some(hook) = hook {
+				hook();
+			}
+		}
+		if let (Some(observer), Some(authority)) = (
+			self.tenant_kek_observer.as_ref(),
+			installed_key_authority.as_ref(),
+		) && let Err(err) = observer.sync_key_authority(authority).await
+		{
+			tracing::error!(
+				applied_index = authority.applied_index,
+				error = %err,
+				"key authority delivery after snapshot install failed; this node's crypto stays fenced"
+			);
+		}
 		if let Some(observer) = self.tier_observer.as_ref() {
 			if let Err(err) = observer
 				.on_tier_snapshot_installed(
@@ -6843,6 +6893,9 @@ fn apply_request_at_log_index(
 			slab_op_apply::apply_ack_outcomes(state, ack, leader_node),
 			None,
 		),
+		WendelonRequest::EstablishRootCheck(check) => {
+			(apply_establish_root_check(state, check), None)
+		}
 		WendelonRequest::CreateTenant(create) => (apply_create_tenant(state, create), None),
 		WendelonRequest::UpdateTenantQuota(update) => {
 			(apply_update_tenant_quota(state, update), None)
@@ -6880,6 +6933,9 @@ fn apply_request_at_log_index(
 					)),
 					None,
 				);
+			}
+			if let Err(refusal) = require_root_check(state, rotation.under_root) {
+				return (refusal, None);
 			}
 			let keyset = state.tenant_keysets.entry(rotation.tenant_id).or_default();
 			match keyset.keys.entry(rotation.tenant_kek_id) {
@@ -6932,7 +6988,55 @@ fn apply_request_at_log_index(
 	}
 }
 
+/// ADR 0726: a tenant KEK enters state only under the established root check
+/// its proposer verified against. An id comparison; apply reaches no provider.
+fn require_root_check(
+	state: &SmState,
+	under_root: crate::crypto::RootCheckId,
+) -> Result<(), WendelonResponse> {
+	match state.root_check.as_ref().map(crate::crypto::RootCheck::id) {
+		None => Err(WendelonResponse::Error(
+			"RootCheckMissing: no root check is established; a tenant KEK cannot precede it".into(),
+		)),
+		Some(established) if established != under_root => Err(WendelonResponse::Error(format!(
+			"RootCheckMismatch: the tenant KEK was wrapped under root check {under_root}, the cluster's is {established}"
+		))),
+		Some(_) => Ok(()),
+	}
+}
+
+/// ADR 0726: write-once. An identical value is a no-op; a check is never laid
+/// over tenants or keysets it did not precede.
+fn apply_establish_root_check(
+	state: &mut SmState,
+	check: crate::crypto::RootCheck,
+) -> WendelonResponse {
+	if let Err(reason) = check.validate() {
+		return WendelonResponse::Error(format!("RootCheckInvalid: {reason}"));
+	}
+	match &state.root_check {
+		Some(existing) if *existing == check => WendelonResponse::Success,
+		Some(existing) => WendelonResponse::Error(format!(
+			"RootCheckConflict: root check {} is established; {} is refused",
+			existing.id(),
+			check.id()
+		)),
+		None if !state.tenants.is_empty() || !state.tenant_keysets.is_empty() => {
+			WendelonResponse::Error(
+				"RootCheckAfterKeys: tenants or tenant KEKs exist without a root check".into(),
+			)
+		}
+		None => {
+			state.root_check = Some(check);
+			WendelonResponse::Success
+		}
+	}
+}
+
 fn apply_create_tenant(state: &mut SmState, create: CreateTenant) -> WendelonResponse {
+	if let Err(refusal) = require_root_check(state, create.under_root) {
+		return refusal;
+	}
 	if create.replication_factor == 0 {
 		return WendelonResponse::Error(format!(
 			"tenant {} replication_factor must be greater than zero",
@@ -10159,6 +10263,7 @@ fn serialize_entry_page_as(
 			LogEntryKind::APPEND,
 			batch.leases().first().map(|lease| lease.epoch).unwrap_or(0),
 		),
+		EntryPayload::Normal(WendelonRequest::EstablishRootCheck(_)) => (LogEntryKind::APPEND, 0),
 		EntryPayload::Normal(WendelonRequest::CreateTenant(_)) => (LogEntryKind::APPEND, 0),
 		EntryPayload::Normal(WendelonRequest::UpdateTenantQuota(_)) => (LogEntryKind::APPEND, 0),
 		EntryPayload::Normal(WendelonRequest::SuspendTenant(_)) => (LogEntryKind::APPEND, 0),
@@ -11041,11 +11146,13 @@ mod schema_state_tests {
 			quota_bytes: u64::MAX,
 			replication_factor: 1,
 			tenant_keyset,
+			under_root: crate::crypto::test_root_check().id(),
 		}
 	}
 
 	fn state_with_descriptor(descriptor: &TableSchemaDescriptor) -> SmState {
 		let mut state = SmState::default();
+		state.root_check = Some(crate::crypto::test_root_check());
 		assert_eq!(
 			apply_create_tenant(&mut state, create_tenant()),
 			WendelonResponse::Success
@@ -13599,7 +13706,6 @@ mod recovery_tests {
 	use arrow::datatypes::{DataType, Field, Schema};
 	use openraft::Vote;
 	use openraft::storage::{RaftLogStorageExt, RaftSnapshotBuilder, RaftStateMachine};
-	use std::collections::HashMap;
 	use std::fs::OpenOptions;
 	use std::io::Write;
 	use std::path::PathBuf;
@@ -14090,7 +14196,7 @@ mod recovery_tests {
 
 	fn create_tenant_for_rotation(
 		tenant_id: TenantId,
-		rotation: &InstallTenantKekVersion,
+		rotation: &crate::crypto::InstallTenantKekVersion,
 	) -> CreateTenant {
 		let mut tenant_keyset = crate::crypto::TenantKeyset::default();
 		tenant_keyset.active_tenant_kek_id = Some(rotation.tenant_kek_id);
@@ -14105,6 +14211,7 @@ mod recovery_tests {
 			quota_bytes: u64::MAX,
 			replication_factor: 1,
 			tenant_keyset,
+			under_root: rotation.under_root,
 		}
 	}
 
@@ -14219,8 +14326,8 @@ mod recovery_tests {
 		let (wal, vote, snapshot) = artifact_paths(&dir);
 		let page = wal_page_with_format_version(
 			serialize_entry_page(&lease_entry(1, 0, 9, 1)).unwrap(),
-			// No build has written 17: Today writes 15, ParentDecisions 16.
-			17,
+			// No build has written 21: Today writes 19, ParentDecisions 20.
+			21,
 		);
 		write_wal_pages(&wal, &[page]);
 
@@ -14230,7 +14337,7 @@ mod recovery_tests {
 			Err(error) => error.to_string(),
 		};
 		assert!(
-			error.contains("17"),
+			error.contains("21"),
 			"the refusal names the version: {error}"
 		);
 		assert!(
@@ -14688,6 +14795,200 @@ mod recovery_tests {
 		let state = reopened_sm.state_snapshot().await;
 		assert_eq!(state.last_applied_log_id, Some(log_id(1, 1)));
 		assert!(state.leases.contains_key(&0));
+	}
+
+	/// ADR 0726, T-R1b variant 3. At a barrier placed right after an installed
+	/// snapshot's state is published and before its key authority is
+	/// delivered, a new operation is already refused when the snapshot's root
+	/// check is another one or absent, and is still admitted when it is the
+	/// same one.
+	#[tokio::test]
+	async fn a_snapshot_of_another_root_fences_before_its_state_is_visible() {
+		use crate::crypto::{RootBindingRefusal, RootBindingStatus};
+		#[derive(Clone, Copy, Debug, PartialEq)]
+		enum Snapshot {
+			SameRoot,
+			OtherRoot,
+			NoCheck,
+		}
+		for case in [Snapshot::SameRoot, Snapshot::OtherRoot, Snapshot::NoCheck] {
+			// The target node's crypto: verified, with a tenant KEK and a slab.
+			let local = Arc::new(crate::crypto::CryptoManager::new_dev());
+			let local_check = local.candidate_root_check().unwrap();
+			let rotation = local.prepare_rotation(TenantId::ZERO).unwrap();
+			local.apply_rotation(&rotation).unwrap();
+			let encrypted = local
+				.encrypt_tiered_slab_object(
+					SlabId::new(42),
+					&crate::crypto::TieredSlabObjectMetadata {
+						tenant_id: TenantId::ZERO,
+						created_hlc: 0,
+						chunk_size_bytes: crate::crypto::SLAB_ENCRYPTION_DEFAULT_CHUNK_SIZE,
+						logical_base: 0,
+						offset_index: vec![crate::crypto::TieredOffsetIndexEntry {
+							key_locator: crate::schema::IdentityPrefix::ZERO,
+							byte_offset: 0,
+							byte_length: 5,
+							flags: 0,
+						}],
+						column_stats_block: None,
+						has_row_tombstone_records: false,
+					},
+					b"bytes",
+				)
+				.unwrap();
+			local
+				.decrypt_tiered_slab(SlabId::new(42), &encrypted.bytes)
+				.unwrap();
+
+			// The source log the snapshot is built from.
+			let other = crate::crypto::CryptoManager::new_dev();
+			let source_dir = tempdir("snapshot-root-source");
+			let mut source_store = open_store(&source_dir).await;
+			let mut source_sm = source_store.recovered_state_machine().await.unwrap();
+			let requests = match case {
+				Snapshot::SameRoot => vec![
+					WendelonRequest::EstablishRootCheck(local_check.clone()),
+					WendelonRequest::CreateTenant(create_tenant_for_rotation(
+						TenantId::ZERO,
+						&rotation,
+					)),
+				],
+				Snapshot::OtherRoot => vec![
+					WendelonRequest::EstablishRootCheck(other.candidate_root_check().unwrap()),
+					WendelonRequest::CreateTenant(create_tenant_for_rotation(
+						TenantId::ZERO,
+						&other.prepare_rotation(TenantId::ZERO).unwrap(),
+					)),
+				],
+				Snapshot::NoCheck => vec![],
+			};
+			let mut index = 0;
+			for request in requests {
+				index += 1;
+				append_and_apply(
+					&mut source_store,
+					&mut source_sm,
+					Entry {
+						log_id: log_id(1, index),
+						payload: EntryPayload::Normal(request),
+					},
+				)
+				.await;
+			}
+			append_and_apply(
+				&mut source_store,
+				&mut source_sm,
+				lease_entry(index + 1, 0, 9, 3),
+			)
+			.await;
+			let mut builder =
+				<WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::get_snapshot_builder(
+					&mut source_sm,
+				)
+				.await;
+			let built = builder.build_snapshot().await.unwrap();
+
+			let target_dir = tempdir("snapshot-root-target");
+			let target_store = open_store(&target_dir).await;
+			let mut target_sm = target_store
+				.recovered_state_machine()
+				.await
+				.unwrap()
+				.with_tenant_kek_observer(local.clone());
+			// What a NEW operation meets at the barrier.
+			let seen: Arc<Mutex<Option<(RootBindingStatus, Option<RootBindingRefusal>)>>> =
+				Arc::default();
+			{
+				let (local, seen, bytes) = (local.clone(), seen.clone(), encrypted.bytes.clone());
+				target_sm.on_next_state_publication_for_test(Box::new(move || {
+					let read = local.decrypt_tiered_slab(SlabId::new(42), &bytes);
+					*seen.lock().unwrap() = Some((
+						local.root_binding_status(),
+						read.err().and_then(|error| RootBindingRefusal::of(&error)),
+					));
+				}));
+			}
+			// The barrier is the target's own: another state machine installing
+			// a snapshot first neither runs nor consumes it.
+			{
+				let mut bystander_builder = <WendelonStateMachine as RaftStateMachine<
+					WendelonTypeConfig,
+				>>::get_snapshot_builder(&mut source_sm)
+				.await;
+				let bystander_snapshot = bystander_builder.build_snapshot().await.unwrap();
+				let bystander_dir = tempdir("snapshot-root-bystander");
+				let bystander_store = open_store(&bystander_dir).await;
+				let mut bystander_sm = bystander_store.recovered_state_machine().await.unwrap();
+				<WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::install_snapshot(
+					&mut bystander_sm,
+					&bystander_snapshot.meta.clone(),
+					bystander_snapshot.snapshot,
+				)
+				.await
+				.unwrap();
+				assert!(
+					seen.lock().unwrap().is_none(),
+					"{case:?}: another state machine's snapshot ran this one's barrier"
+				);
+			}
+			let meta = built.meta.clone();
+			<WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::install_snapshot(
+				&mut target_sm,
+				&meta,
+				built.snapshot,
+			)
+			.await
+			.unwrap();
+
+			let at_barrier = seen.lock().unwrap().take().expect("the barrier ran");
+			let after = local.root_binding_status();
+			let read_after = local
+				.decrypt_tiered_slab(SlabId::new(42), &encrypted.bytes)
+				.err()
+				.and_then(|error| RootBindingRefusal::of(&error));
+			match case {
+				Snapshot::SameRoot => {
+					assert_eq!(
+						at_barrier,
+						(RootBindingStatus::Verified(local_check.id()), None),
+						"{case:?}"
+					);
+					assert_eq!(after, RootBindingStatus::Verified(local_check.id()));
+					assert_eq!(read_after, None);
+					// The delivered keysets are the snapshot's.
+					assert_eq!(
+						local.active_tenant_kek_id(TenantId::ZERO).unwrap(),
+						rotation.tenant_kek_id
+					);
+				}
+				Snapshot::OtherRoot => {
+					assert_eq!(
+						at_barrier,
+						(
+							RootBindingStatus::Pending,
+							Some(RootBindingRefusal::NotVerified)
+						),
+						"{case:?}: the old binding was still usable after publication"
+					);
+					let installed = target_sm.state_snapshot().await.root_check.unwrap();
+					assert_eq!(after, RootBindingStatus::Mismatch(installed.id()));
+					assert_eq!(read_after, Some(RootBindingRefusal::Mismatch));
+				}
+				Snapshot::NoCheck => {
+					assert_eq!(
+						at_barrier,
+						(
+							RootBindingStatus::Pending,
+							Some(RootBindingRefusal::NotVerified)
+						),
+						"{case:?}: the old binding was still usable after publication"
+					);
+					assert_eq!(after, RootBindingStatus::Pending);
+					assert_eq!(read_after, Some(RootBindingRefusal::NotVerified));
+				}
+			}
+		}
 	}
 
 	#[tokio::test]
@@ -15181,11 +15482,22 @@ mod recovery_tests {
 			.unwrap();
 		let second = crypto.prepare_rotation(TenantId::ZERO).unwrap();
 
+		// ADR 0726: the root check precedes the tenant KEKs wrapped under it.
+		let check = crypto.candidate_root_check().unwrap();
 		append_and_apply(
 			&mut store,
 			&mut sm,
 			Entry {
 				log_id: log_id(1, 1),
+				payload: EntryPayload::Normal(WendelonRequest::EstablishRootCheck(check.clone())),
+			},
+		)
+		.await;
+		append_and_apply(
+			&mut store,
+			&mut sm,
+			Entry {
+				log_id: log_id(1, 2),
 				payload: EntryPayload::Normal(WendelonRequest::CreateTenant(
 					create_tenant_for_rotation(TenantId::ZERO, &first),
 				)),
@@ -15196,7 +15508,7 @@ mod recovery_tests {
 			&mut store,
 			&mut sm,
 			Entry {
-				log_id: log_id(1, 2),
+				log_id: log_id(1, 3),
 				payload: EntryPayload::Normal(WendelonRequest::InstallTenantKekVersion(
 					second.clone(),
 				)),
@@ -15214,6 +15526,11 @@ mod recovery_tests {
 		let reopened = open_store(&dir).await;
 		let reopened_sm = reopened.recovered_state_machine().await.unwrap();
 		let state = reopened_sm.state_snapshot().await;
+		assert_eq!(
+			state.root_check.as_ref(),
+			Some(&check),
+			"the root check must survive snapshot reopen"
+		);
 		let keyset = state
 			.tenant_keysets
 			.get(&TenantId::ZERO)
@@ -15236,38 +15553,40 @@ mod recovery_tests {
 	}
 
 	#[derive(Default)]
-	struct FlakyTenantKekObserver {
-		rotations: Mutex<Vec<(TenantId, crate::schema::TenantKekId)>>,
-		synced: Mutex<Option<HashMap<TenantId, TenantKeyset>>>,
+	struct RecordingKeyAuthorityObserver {
+		fences: Mutex<Vec<(Option<crate::crypto::RootCheckId>, u64)>>,
+		deliveries: Mutex<Vec<crate::crypto::KeyAuthority>>,
+		fail_deliveries: bool,
 	}
 
 	#[async_trait::async_trait]
-	impl TenantKekObserver for FlakyTenantKekObserver {
-		async fn on_tenant_kek_rotated(
-			&self,
-			rotation: &InstallTenantKekVersion,
-			_applied_log_index: u64,
-		) -> std::io::Result<()> {
-			self.rotations
-				.lock()
-				.unwrap()
-				.push((rotation.tenant_id, rotation.tenant_kek_id));
-			Err(Error::other("injected tenant KEK observer failure"))
+	impl TenantKekObserver for RecordingKeyAuthorityObserver {
+		fn fence_before_publication(&self, next: Option<crate::crypto::RootCheckId>, index: u64) {
+			self.fences.lock().unwrap().push((next, index));
 		}
 
-		async fn sync_tenant_keysets(
+		async fn sync_key_authority(
 			&self,
-			snapshot: &HashMap<TenantId, TenantKeyset>,
+			authority: &crate::crypto::KeyAuthority,
 		) -> std::io::Result<()> {
-			*self.synced.lock().unwrap() = Some(snapshot.clone());
+			self.deliveries.lock().unwrap().push(authority.clone());
+			if self.fail_deliveries {
+				return Err(Error::other("injected key authority observer failure"));
+			}
 			Ok(())
 		}
 	}
 
+	/// ADR 0726: every batch that changes the root check or a keyset delivers
+	/// both from one applied state, the establishing entry fences first, and a
+	/// failing observer does not stop apply.
 	#[tokio::test]
-	async fn tenant_kek_observer_failure_reconciles_from_snapshot_sync() {
-		let dir = tempdir("tenant-kek-observer-sync");
-		let observer = Arc::new(FlakyTenantKekObserver::default());
+	async fn key_authority_is_delivered_whole_and_the_establishing_entry_fences_first() {
+		let dir = tempdir("key-authority-delivery");
+		let observer = Arc::new(RecordingKeyAuthorityObserver {
+			fail_deliveries: true,
+			..Default::default()
+		});
 		let mut store = open_store(&dir).await;
 		let mut sm = store
 			.recovered_state_machine()
@@ -15275,44 +15594,53 @@ mod recovery_tests {
 			.unwrap()
 			.with_tenant_kek_observer(observer.clone());
 		let crypto = crate::crypto::CryptoManager::new_dev();
+		let check = crypto.candidate_root_check().unwrap();
 		let seed = crypto.prepare_rotation(TenantId::ZERO).unwrap();
 		let rotation = crypto.prepare_rotation(TenantId::ZERO).unwrap();
 
-		append_and_apply(
-			&mut store,
-			&mut sm,
-			Entry {
-				log_id: log_id(1, 1),
-				payload: EntryPayload::Normal(WendelonRequest::CreateTenant(
-					create_tenant_for_rotation(TenantId::ZERO, &seed),
-				)),
-			},
-		)
-		.await;
-		append_and_apply(
-			&mut store,
-			&mut sm,
-			Entry {
-				log_id: log_id(1, 2),
-				payload: EntryPayload::Normal(WendelonRequest::InstallTenantKekVersion(
-					rotation.clone(),
-				)),
-			},
-		)
-		.await;
+		for (index, request) in [
+			WendelonRequest::EstablishRootCheck(check.clone()),
+			WendelonRequest::CreateTenant(create_tenant_for_rotation(TenantId::ZERO, &seed)),
+			WendelonRequest::InstallTenantKekVersion(rotation.clone()),
+		]
+		.into_iter()
+		.enumerate()
+		{
+			append_and_apply(
+				&mut store,
+				&mut sm,
+				Entry {
+					log_id: log_id(1, index as u64 + 1),
+					payload: EntryPayload::Normal(request),
+				},
+			)
+			.await;
+		}
 
 		assert_eq!(
-			observer.rotations.lock().unwrap().as_slice(),
-			&[(TenantId::ZERO, rotation.tenant_kek_id)]
+			observer.fences.lock().unwrap().as_slice(),
+			&[(Some(check.id()), 1)]
 		);
-		let synced = observer
-			.synced
-			.lock()
-			.unwrap()
-			.clone()
-			.expect("snapshot sync must run after observer failure");
+		let deliveries = observer.deliveries.lock().unwrap().clone();
 		assert_eq!(
-			synced.get(&TenantId::ZERO).unwrap().active_tenant_kek_id,
+			deliveries
+				.iter()
+				.map(|d| d.applied_index)
+				.collect::<Vec<_>>(),
+			vec![1, 2, 3]
+		);
+		assert!(
+			deliveries
+				.iter()
+				.all(|d| d.root_check.as_ref() == Some(&check))
+		);
+		assert!(deliveries[0].keysets.is_empty());
+		assert_eq!(
+			deliveries[2]
+				.keysets
+				.get(&TenantId::ZERO)
+				.unwrap()
+				.active_tenant_kek_id,
 			Some(rotation.tenant_kek_id)
 		);
 	}
@@ -20287,6 +20615,10 @@ mod tenant_kek_tests {
 	use crate::schema::{SlabId, TenantId, TenantKekId};
 
 	fn seed_active_tenant(state: &mut SmState, tenant_id: TenantId) {
+		// A tenant exists only after the root check (ADR 0726).
+		state
+			.root_check
+			.get_or_insert_with(crate::crypto::test_root_check);
 		state.tenants.insert(
 			tenant_id,
 			TenantRecord {
@@ -20322,19 +20654,213 @@ mod tenant_kek_tests {
 		state.tenant_keysets.insert(tenant_id, keyset);
 	}
 
+	/// Everything ADR 0726's transitions may touch, in a comparable form.
+	fn key_state(
+		state: &SmState,
+	) -> (
+		Option<crate::crypto::RootCheck>,
+		BTreeMap<TenantId, TenantKeyset>,
+		BTreeSet<TenantId>,
+	) {
+		(
+			state.root_check.clone(),
+			state
+				.tenant_keysets
+				.iter()
+				.map(|(id, keyset)| (*id, keyset.clone()))
+				.collect(),
+			state.tenants.keys().copied().collect(),
+		)
+	}
+
+	fn error_of(response: WendelonResponse) -> String {
+		match response {
+			WendelonResponse::Error(message) => message,
+			other => panic!("expected a refusal, got {other:?}"),
+		}
+	}
+
+	fn one_key_keyset(id: u64, fill: u8) -> TenantKeyset {
+		let id = TenantKekId::try_from(id).unwrap();
+		let mut keyset = TenantKeyset::default();
+		keyset.active_tenant_kek_id = Some(id);
+		keyset.keys.insert(
+			id,
+			WrappedTenantKek {
+				wrapped_key: vec![fill; 40],
+			},
+		);
+		keyset
+	}
+
+	/// ADR 0726, in both authority modes: the root check is stored once, an
+	/// identical value is a no-op, another value conflicts, and it is never
+	/// laid over tenants or keysets that it did not precede.
+	#[test]
+	fn the_root_check_is_write_once_and_never_laid_over_existing_keys() {
+		let check = crate::crypto::test_root_check();
+		let other = crate::crypto::RootCheck {
+			version: crate::crypto::ROOT_CHECK_VERSION,
+			wrapped: vec![0x3C; crate::crypto::ROOT_CHECK_WRAPPED_BYTES],
+		};
+		for parent_decisions in [false, true] {
+			let fresh = || {
+				let mut state = SmState::default();
+				if parent_decisions {
+					state.decisions = Some(Default::default());
+				}
+				state
+			};
+			let mut state = fresh();
+			let establish = |state: &mut SmState, check: &crate::crypto::RootCheck| {
+				apply_request(state, WendelonRequest::EstablishRootCheck(check.clone())).0
+			};
+			assert_eq!(establish(&mut state, &check), WendelonResponse::Success);
+			assert_eq!(state.root_check.as_ref(), Some(&check));
+			// A retried establishment of the same value changes nothing.
+			let before = state.clone();
+			assert_eq!(establish(&mut state, &check), WendelonResponse::Success);
+			assert_eq!(key_state(&state), key_state(&before));
+			assert!(error_of(establish(&mut state, &other)).starts_with("RootCheckConflict"));
+			assert_eq!(key_state(&state), key_state(&before));
+
+			// Version and size are checked before anything else.
+			for bad in [
+				crate::crypto::RootCheck {
+					version: 2,
+					wrapped: check.wrapped.clone(),
+				},
+				crate::crypto::RootCheck {
+					version: 1,
+					wrapped: vec![0xC3; 39],
+				},
+			] {
+				let mut state = fresh();
+				assert!(error_of(establish(&mut state, &bad)).starts_with("RootCheckInvalid"));
+				assert_eq!(state.root_check, None);
+			}
+
+			// A tenant, or a keyset alone, without a check: no check is inferred.
+			let mut with_tenant = fresh();
+			with_tenant.tenants.insert(
+				TenantId::ZERO,
+				TenantRecord {
+					tenant_id: TenantId::ZERO,
+					state: TenantLifecycleState::Active,
+					quota_bytes: u64::MAX,
+					used_bytes: 0,
+					replication_factor: 1,
+				},
+			);
+			let mut with_keyset = fresh();
+			with_keyset
+				.tenant_keysets
+				.insert(TenantId::ZERO, one_key_keyset(1, 1));
+			for mut state in [with_tenant, with_keyset] {
+				let before = state.clone();
+				assert!(error_of(establish(&mut state, &check)).starts_with("RootCheckAfterKeys"));
+				assert_eq!(key_state(&state), key_state(&before));
+			}
+		}
+	}
+
+	/// ADR 0726: no tenant KEK enters state before a root check, or under the
+	/// id of another one, by tenant creation or by rotation.
+	#[test]
+	fn no_tenant_kek_enters_state_without_its_root_check() {
+		let check = crate::crypto::test_root_check();
+		let foreign = crate::crypto::RootCheckId::for_test(0xEE);
+		assert_ne!(check.id(), foreign);
+		let tenant_id = TenantId::new(5);
+		let create = |under_root| {
+			WendelonRequest::CreateTenant(CreateTenant {
+				tenant_id,
+				quota_bytes: 1024,
+				replication_factor: 1,
+				tenant_keyset: one_key_keyset(1, 1),
+				under_root,
+			})
+		};
+		let install = |under_root| {
+			WendelonRequest::InstallTenantKekVersion(crate::crypto::InstallTenantKekVersion {
+				tenant_id,
+				tenant_kek_id: TenantKekId::try_from(2).unwrap(),
+				wrapped_tenant_kek: vec![2; 40],
+				under_root,
+			})
+		};
+
+		// No check at all.
+		let mut state = SmState::default();
+		let before = state.clone();
+		assert!(
+			error_of(apply_request(&mut state, create(check.id())).0)
+				.starts_with("RootCheckMissing")
+		);
+		assert_eq!(key_state(&state), key_state(&before));
+
+		assert_eq!(
+			apply_request(
+				&mut state,
+				WendelonRequest::EstablishRootCheck(check.clone())
+			)
+			.0,
+			WendelonResponse::Success
+		);
+		// Another root check's id.
+		let before = state.clone();
+		assert!(
+			error_of(apply_request(&mut state, create(foreign)).0).starts_with("RootCheckMismatch")
+		);
+		assert_eq!(key_state(&state), key_state(&before));
+		// The established one.
+		assert_eq!(
+			apply_request(&mut state, create(check.id())).0,
+			WendelonResponse::Success
+		);
+		assert!(state.tenant_keysets.contains_key(&tenant_id));
+
+		let before = state.clone();
+		assert!(
+			error_of(apply_request(&mut state, install(foreign)).0)
+				.starts_with("RootCheckMismatch")
+		);
+		assert_eq!(key_state(&state), key_state(&before));
+		assert_eq!(
+			apply_request(&mut state, install(check.id())).0,
+			WendelonResponse::Success
+		);
+		assert_eq!(
+			state.tenant_keysets[&tenant_id].active_tenant_kek_id,
+			Some(TenantKekId::try_from(2).unwrap())
+		);
+
+		// A tenant whose check has gone (unreachable through apply) installs nothing.
+		let mut orphan = state.clone();
+		orphan.root_check = None;
+		let before = orphan.clone();
+		assert!(
+			error_of(apply_request(&mut orphan, install(check.id())).0)
+				.starts_with("RootCheckMissing")
+		);
+		assert_eq!(key_state(&orphan), key_state(&before));
+	}
+
 	#[test]
 	fn rotate_tenant_kek_rejects_conflicting_duplicate_ids() {
 		let mut state = SmState::default();
 		seed_active_tenant(&mut state, TenantId::ZERO);
-		let first = InstallTenantKekVersion {
+		let first = crate::crypto::InstallTenantKekVersion {
 			tenant_id: TenantId::ZERO,
 			tenant_kek_id: TenantKekId::try_from(7).unwrap(),
 			wrapped_tenant_kek: vec![1; 40],
+			under_root: crate::crypto::test_root_check().id(),
 		};
-		let second = InstallTenantKekVersion {
+		let second = crate::crypto::InstallTenantKekVersion {
 			tenant_id: TenantId::ZERO,
 			tenant_kek_id: TenantKekId::try_from(7).unwrap(),
 			wrapped_tenant_kek: vec![2; 40],
+			under_root: crate::crypto::test_root_check().id(),
 		};
 
 		let (resp, _) = apply_request(
@@ -20391,6 +20917,9 @@ mod tenant_kek_tests {
 		request_keyset.active_tenant_kek_id = Some(active_id);
 		request_keyset.keys.insert(active_id, active.clone());
 
+		state
+			.root_check
+			.get_or_insert_with(crate::crypto::test_root_check);
 		let (resp, _) = apply_request(
 			&mut state,
 			WendelonRequest::CreateTenant(CreateTenant {
@@ -20398,6 +20927,7 @@ mod tenant_kek_tests {
 				quota_bytes: 1024,
 				replication_factor: 3,
 				tenant_keyset: request_keyset,
+				under_root: crate::crypto::test_root_check().id(),
 			}),
 		);
 		assert_eq!(resp, WendelonResponse::Success);
@@ -20559,11 +21089,11 @@ mod tenant_kek_tests {
 
 	#[test]
 	fn adr0085_snapshot_from_a_newer_build_is_refused_by_name() {
-		let bytes = snapshot_bytes_with_format_version(&SmState::default(), 17);
+		let bytes = snapshot_bytes_with_format_version(&SmState::default(), 21);
 		let error = decode_snapshot_reader(bytes.as_slice())
 			.expect_err("a version this build does not know must be refused");
 		assert!(
-			error.contains("17"),
+			error.contains("21"),
 			"the refusal names the version: {error}"
 		);
 		assert!(
@@ -20923,6 +21453,7 @@ pub(crate) mod body_format_corpus {
 					quota_bytes: u64::MAX,
 					replication_factor: 1,
 					tenant_keyset: canonical_tenant_keyset(),
+					under_root: crate::crypto::test_root_check().id(),
 				}),
 			),
 			(
@@ -20937,10 +21468,11 @@ pub(crate) mod body_format_corpus {
 			("delete_tenant", WendelonRequest::DeleteTenant(tenant_id)),
 			(
 				"install_tenant_kek_version",
-				WendelonRequest::InstallTenantKekVersion(InstallTenantKekVersion {
+				WendelonRequest::InstallTenantKekVersion(crate::crypto::InstallTenantKekVersion {
 					tenant_id,
 					tenant_kek_id: TenantKekId::try_from(2).unwrap(),
 					wrapped_tenant_kek: vec![0xAB; 40],
+					under_root: crate::crypto::test_root_check().id(),
 				}),
 			),
 			(
@@ -21101,6 +21633,10 @@ pub(crate) mod body_format_corpus {
 					seqs: vec![1, 2],
 				}),
 			),
+			(
+				"establish_root_check",
+				WendelonRequest::EstablishRootCheck(crate::crypto::test_root_check()),
+			),
 		]
 	}
 
@@ -21136,6 +21672,7 @@ pub(crate) mod body_format_corpus {
 
 	fn canonical_current_sm_state() -> SmState {
 		let mut state = canonical_sm_state();
+		state.root_check = Some(crate::crypto::test_root_check());
 		let operation_id = DropOperationId {
 			tenant_id: TenantId::new(7),
 			table_object_id: TableObjectId::new([0xD3; 16]),
@@ -21361,25 +21898,25 @@ pub(crate) mod body_format_corpus {
 		include_str!("../../tests/fixtures/consensus_body/wal_v8_entries.txt");
 	const SNAPSHOT_V8_OUTGOING_MANIFEST: &str =
 		include_str!("../../tests/fixtures/consensus_body/snapshot_v8.txt");
-	const WAL_V15_MANIFEST: &str =
-		include_str!("../../tests/fixtures/consensus_body/wal_v15_entries.txt");
-	const SNAPSHOT_V15_MANIFEST: &str =
-		include_str!("../../tests/fixtures/consensus_body/snapshot_v15.txt");
+	const WAL_V19_MANIFEST: &str =
+		include_str!("../../tests/fixtures/consensus_body/wal_v19_entries.txt");
+	const SNAPSHOT_V19_MANIFEST: &str =
+		include_str!("../../tests/fixtures/consensus_body/snapshot_v19.txt");
 
 	#[test]
-	fn adr0704_current_wal_v15_and_snapshot_v15_match_stored_goldens() {
-		let stored_wal = parse_manifest(WAL_V15_MANIFEST);
+	fn current_wal_v19_and_snapshot_v19_match_stored_goldens() {
+		let stored_wal = parse_manifest(WAL_V19_MANIFEST);
 		let corpus = wal_corpus();
 		assert_eq!(stored_wal.len(), corpus.len());
 		for (name, bytes) in corpus {
 			assert_eq!(
 				hex(&bytes),
 				hex(&stored_wal[name]),
-				"WAL v15 body moved for {name}; bump the format and add a refusal fixture"
+				"WAL v19 body moved for {name}; bump the format and add a refusal fixture"
 			);
 		}
 
-		let stored_snapshot = parse_manifest(SNAPSHOT_V15_MANIFEST);
+		let stored_snapshot = parse_manifest(SNAPSHOT_V19_MANIFEST);
 		let state = canonical_current_sm_state();
 		assert_eq!(
 			hex(&postcard::to_stdvec(&state).unwrap()),
@@ -21528,7 +22065,7 @@ pub(crate) mod body_format_corpus {
 		for (name, bytes) in wal_corpus() {
 			wal.push_str(&format!("{name}={}\n", hex(&bytes)));
 		}
-		std::fs::write(dir.join("wal_v15_entries.txt"), wal).unwrap();
+		std::fs::write(dir.join("wal_v19_entries.txt"), wal).unwrap();
 		let mut mutations = String::new();
 		for (name, mutation) in canonical_mutations() {
 			mutations.push_str(&format!(
@@ -21548,7 +22085,7 @@ pub(crate) mod body_format_corpus {
 			hex(&postcard::to_stdvec(&state).unwrap()),
 			hex(&postcard::to_stdvec(&entry).unwrap())
 		);
-		std::fs::write(dir.join("snapshot_v15.txt"), snapshot).unwrap();
+		std::fs::write(dir.join("snapshot_v19.txt"), snapshot).unwrap();
 		println!("manifests written to {}", dir.display());
 	}
 }

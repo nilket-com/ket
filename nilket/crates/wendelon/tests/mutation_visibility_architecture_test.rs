@@ -151,10 +151,10 @@ fn dormant_authority_has_no_production_provider_or_activation() {
 	// The live formats are pinned at their current versions; this substrate adds no
 	// boot/WAL/reader wiring.
 	let core = fs::read_to_string(root.join("src/schema/core.rs")).unwrap();
-	// ADR 0704 bumped both to 15 (certified tier provenance; 9 to 14 were
-	// ParentDecisions versions).
-	assert!(core.contains("SNAPSHOT_FORMAT_VERSION: u8 = 15"));
-	assert!(core.contains("WAL_FORMAT_VERSION: u8 = 15"));
+	// ADR 0726 bumped both to 19 (the root check; 9 to 14 and 16 to 18 were
+	// ParentDecisions versions, 15 was ADR 0704's).
+	assert!(core.contains("SNAPSHOT_FORMAT_VERSION: u8 = 19"));
+	assert!(core.contains("WAL_FORMAT_VERSION: u8 = 19"));
 	// The one admitted outside caller is the offline, read-only compromise audit CLI (ADR 0101
 	// C-S6): exactly one mention, its canonical import of the single audit entry point.
 	let audit_cli = root.join("src/cli/root2_audit.rs");
@@ -5933,9 +5933,10 @@ fn root2_carrier_is_bounded_private_held_and_response_mappings_are_explicit() {
 		syn::parse_file(&fs::read_to_string(src.join("consensus/core.rs")).unwrap()).unwrap();
 	// ADR 0697 appends after Root2Command and Root2Dormant, whose wire positions
 	// stay pinned; each list's last variant is the newest append (ADR 0699 S2;
-	// ADR 0725 appended the owner-signed slab operation to the requests).
+	// ADR 0725 appended the owner-signed slab operation to the requests, ADR
+	// 0726 the root check).
 	for (name, last) in [
-		("WendelonRequest", "OwnerOp"),
+		("WendelonRequest", "EstablishRootCheck"),
 		("WendelonResponse", "LeaseResults"),
 	] {
 		let e = core

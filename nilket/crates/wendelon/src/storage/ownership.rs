@@ -936,8 +936,13 @@ fn write_clean_shutdown_record(dir: &Path) -> std::io::Result<()> {
 
 fn directory_is_fresh(dir: &Path) -> std::io::Result<bool> {
 	for entry in fs::read_dir(dir)? {
-		let name = entry?.file_name();
-		if name != "LOCK" && name != ".CLEAN_SHUTDOWN.tmp" {
+		let entry = entry?;
+		let name = entry.file_name();
+		if name != "LOCK"
+			&& name != ".CLEAN_SHUTDOWN.tmp"
+			// ADR 0726: an enrolled root KEK directory is setup, not a store.
+			&& !crate::crypto::is_root_kek_artifact_dir(&entry.path())?
+		{
 			return Ok(false);
 		}
 	}

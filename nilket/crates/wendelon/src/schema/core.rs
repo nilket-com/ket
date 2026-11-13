@@ -2489,30 +2489,38 @@ pub const PRE_VERSIONING_FORMAT: u8 = 0;
 /// registry; ADR 0704 version 15 adds certified provenance to tier pointers and a
 /// retained retirement link to op outcomes (9 to 14 were `ParentDecisions`
 /// development and ADR 0701 to ADR 0703 versions, so a version is never reused).
-/// Every earlier version is refused, not upconverted.
-pub const SNAPSHOT_FORMAT_VERSION: u8 = 15;
+/// Every earlier version is refused, not upconverted. ADR 0726 version 19 adds
+/// the root check to state and its id to tenant creation (16 to 18 were
+/// `ParentDecisions` versions).
+pub const SNAPSHOT_FORMAT_VERSION: u8 = 19;
 /// Snapshot format of a `ParentDecisions` store; see `consensus::decision_mode`.
 /// ADR 0725: 18, the state of a log whose slab operations are owner-signed; it
 /// travels with the control-log format (17 was ADR 0720 to ADR 0724's, whose
 /// decision state carries the sealed membership; 16 was ADR 0704 to ADR 0719's;
-/// 14 was ADR 0701 to ADR 0703's; 15 is Today's).
-pub const SNAPSHOT_FORMAT_VERSION_PARENT_DECISIONS: u8 = 18;
+/// 14 was ADR 0701 to ADR 0703's; 15 was Today's). ADR 0726: 20, whose state
+/// carries the cluster's root check (18 was ADR 0725's; 19 is Today's).
+pub const SNAPSHOT_FORMAT_VERSION_PARENT_DECISIONS: u8 = 20;
 
 /// Shape of the Control Ring WAL record bodies this build writes, including the
 /// `postcard(Entry<..>)` payload of a log record. ADR 0697 version 6 carries
 /// owner-qualified slab commands and incarnation registration; ADR 0704 version 15
 /// carries certified provenance on Tier and Retire commands (9 to 14 were
 /// `ParentDecisions` versions, so a version is never reused). Every earlier version
-/// is refused, not upconverted.
-pub const WAL_FORMAT_VERSION: u8 = 15;
+/// is refused, not upconverted. ADR 0726 version 19 carries the root check
+/// request and the root check id on tenant creation and tenant KEK install (16
+/// to 18 were `ParentDecisions` versions).
+pub const WAL_FORMAT_VERSION: u8 = 19;
 /// Control-log format of a `ParentDecisions` store; see `consensus::decision_mode`.
 /// ADR 0725: 18, whose slab operations are owner-signed (`OwnerOp`) and whose
 /// bare slab operations are refused at apply. A format-17 log may hold bare
 /// operations that applied, so it is refused whole, never replayed under the
 /// new rule (17 was ADR 0720 to ADR 0724's, written by stores that seal their
 /// membership at the first admitted write; 16 was ADR 0704 to ADR 0719's; 14
-/// was ADR 0701 to ADR 0703's; 15 is Today's).
-pub const WAL_FORMAT_VERSION_PARENT_DECISIONS: u8 = 18;
+/// was ADR 0701 to ADR 0703's; 15 was Today's). ADR 0726: 20, which carries the
+/// root check request and the root check id on tenant creation and tenant KEK
+/// install; an older log could hold tenant KEKs no root check preceded, so it
+/// is refused whole (18 was ADR 0725's; 19 is Today's).
+pub const WAL_FORMAT_VERSION_PARENT_DECISIONS: u8 = 20;
 
 // Static assertions to ensure all our size calculations remain exactly correct
 const _: () = assert!(std::mem::size_of::<HybridTimestamp>() == 16);

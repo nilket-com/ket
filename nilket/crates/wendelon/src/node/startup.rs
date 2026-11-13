@@ -290,6 +290,12 @@ pub(super) async fn interrupted_first_creation(
 		let Some(name) = name.to_str() else {
 			return Ok(false);
 		};
+		// ADR 0726: the root KEK directory, which a forming node writes before
+		// its storage index and enrollment places before a first start, may sit
+		// beside the bootstrap artifacts. Nothing else that is not a file may.
+		if crate::crypto::is_root_kek_artifact_dir(&entry.path())? {
+			continue;
+		}
 		if !entry.file_type()?.is_file() || !interrupted_bootstrap_artifact(name) {
 			return Ok(false);
 		}
@@ -1536,6 +1542,25 @@ mod tests {
 			"pristine Control and bootstrap artifacts only: {:?}",
 			listing()
 		);
+		// ADR 0726: the root KEK directory a forming node writes first, or
+		// enrollment places, may sit beside them. It stays in place for every
+		// refusal below, so a root file never masks real evidence.
+		let root_dir = dir.join(".wendelon");
+		std::fs::create_dir(&root_dir).unwrap();
+		assert!(interrupted_first_creation(&owner, &control).await.unwrap());
+		std::fs::write(root_dir.join("local-sealed-root-kek.bin"), b"sealed").unwrap();
+		assert!(
+			interrupted_first_creation(&owner, &control).await.unwrap(),
+			"a root KEK artifact directory is neutral: {:?}",
+			listing()
+		);
+		assert!(!fresh_storage_initialization_allowed(&dir).unwrap());
+		std::fs::write(root_dir.join("other"), b"x").unwrap();
+		assert!(
+			!interrupted_first_creation(&owner, &control).await.unwrap(),
+			"anything else in the root KEK directory is not"
+		);
+		std::fs::remove_file(root_dir.join("other")).unwrap();
 		for (name, what) in [
 			("slab_0000000000000000.wnd", "slab evidence"),
 			(
@@ -1774,8 +1799,14 @@ mod tests {
 /// replaces this temporary same-boot predicate when the stacks join.
 pub(super) fn fresh_storage_initialization_allowed(dir: &std::path::Path) -> std::io::Result<bool> {
 	for entry in std::fs::read_dir(dir)? {
-		let name = entry?.file_name();
-		if name != "LOCK" && name != "CLEAN_SHUTDOWN" && name != ".CLEAN_SHUTDOWN.tmp" {
+		let entry = entry?;
+		let name = entry.file_name();
+		if name != "LOCK"
+			&& name != "CLEAN_SHUTDOWN"
+			&& name != ".CLEAN_SHUTDOWN.tmp"
+			// ADR 0726: an enrolled root KEK directory is setup, not a store.
+			&& !crate::crypto::is_root_kek_artifact_dir(&entry.path())?
+		{
 			return Ok(false);
 		}
 	}
