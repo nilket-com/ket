@@ -104,6 +104,31 @@ test and the failure, reproduce it under load, and then fix the product or the
 test's isolation, or record the measured rate and why it is accepted. Never
 call it a flake without that evidence.
 
+## Daemon stacks and the real-process test
+
+`nilket/scripts/cargo-cgroup` gives every test thread a 64 MiB minimum stack
+(`RUST_MIN_STACK`), and a runtime built inside a test inherits it for its
+workers. A daemon's runtime workers have the default stack, 2 MiB. A request
+path that needs more passes every in-process test and aborts the daemon: ADR
+0725 was delivered that way, with a green suite, and the forming node of a real
+three-node cluster died on its first table write (DC-232, ADR 0727).
+
+Two checks exist for this, and a large-stack green run replaces neither:
+
+1. `wendelon --test three_node_workflow table_writes_are_served_within_a_daemons_worker_stack`
+   runs in the ordinary lane. It serves table writes on a runtime whose workers
+   are set to the daemon's stack explicitly, so the harness's minimum does not
+   apply. Never raise its stack constant to make it pass.
+2. `wendelon-client --test parent_decisions_processes` starts three real
+   `nilket wendelon` daemons. It is `#[ignore]`d (it spawns processes and binds
+   ports) and needs `WENDELON_SMOKE_NILKET_BIN`; run it alone, under an owner
+   that can end the whole run, as its module text says. **Run it once, on the
+   exact tree to be delivered, and record its result in the delivery, for any
+   change to the daemon's runtime construction, startup or shutdown, transport
+   or connection handling, or the request-serving path** (`cli.rs`, `node.rs`
+   and `node/`, `network/`). A change to documentation or to tests alone does
+   not need it.
+
 ## Startup latency
 
 `ci/startup-latency-check.sh` runs the libaryon engine startup test and the

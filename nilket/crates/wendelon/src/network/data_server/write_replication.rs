@@ -197,7 +197,8 @@ impl WendelonDataServer {
 					));
 				}
 			};
-		self.handle_table_write(&context.actor, frame, early).await
+		// ADR 0727: on the heap (see `serve_table_write_stream`).
+		Box::pin(self.handle_table_write(&context.actor, frame, early)).await
 	}
 
 	/// A table write on its own stream. The response is written, and the
@@ -218,8 +219,10 @@ impl WendelonDataServer {
 	) -> std::io::Result<()> {
 		let stream_id = frame.header.stream_id;
 		let (early, mut given) = EarlyAnswer::channel();
-		let write = self.serve_table_write(context, frame, Some(early));
-		tokio::pin!(write);
+		// ADR 0727: pinned on the heap rather than in this frame. The same
+		// future is still polled to its end by this call, joined with the
+		// response and never detached.
+		let mut write = Box::pin(self.serve_table_write(context, frame, Some(early)));
 		let answer = tokio::select! {
 			biased;
 			// The write ended with its answer: the only response.
@@ -258,10 +261,12 @@ impl WendelonDataServer {
 			durability = meta.durability.0,
 			write_sequence = meta.parent_write_id.sequence_no,
 		);
-		let (resp, trailing) = self
-			.table_write_answering(meta, payload, early)
-			.instrument(span)
-			.await?;
+		// ADR 0727: on the heap (see `serve_table_write_stream`).
+		let (resp, trailing) = Box::pin(
+			self.table_write_answering(meta, payload, early)
+				.instrument(span),
+		)
+		.await?;
 		let resp = self.finalize_table_write_attempt(meta, resp).await?;
 		Ok(self.build_table_write_response_frame(frame.header.stream_id, resp, trailing))
 	}

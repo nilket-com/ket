@@ -7799,7 +7799,9 @@ impl DataRingServer for WendelonDataServer {
 				self.handle_stream_finalization_stream(frame, stream).await
 			}
 			MsgType::TABLE_WRITE_REQ => {
-				self.serve_table_write_stream(&context, frame, stream).await
+				// ADR 0727: held on the heap, so this dispatch frame does not
+				// hold the whole table-write future by value.
+				Box::pin(self.serve_table_write_stream(&context, frame, stream)).await
 			}
 			other => Err(Error::new(
 				ErrorKind::Unsupported,
@@ -9329,7 +9331,8 @@ impl WendelonDataServer {
 		self.observe_table_write(&meta, async {
 			metrics().data_ring_write_requests_total.inc();
 			if self.decision_mode != crate::consensus::decision_mode::DecisionMode::Today {
-				return self.coordinate_table_write(meta, payload, early).await;
+				// ADR 0727: on the heap, inside the same observed work.
+				return Box::pin(self.coordinate_table_write(meta, payload, early)).await;
 			}
 			if meta.proxy_hop >= 2 {
 				return Ok((

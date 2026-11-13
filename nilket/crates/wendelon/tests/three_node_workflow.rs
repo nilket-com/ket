@@ -960,15 +960,19 @@ impl Cluster {
 	}
 }
 
-async fn workflow(stage: Arc<std::sync::Mutex<String>>, l2: ObjectStoreConfig, keys: DecisionKeys) {
-	let enter = |now: &str| *stage.lock().unwrap() = now.to_owned();
+/// Three members, a leader, every voter ready, and the workflow's table created.
+async fn formed_cluster(
+	enter: &dyn Fn(&str),
+	l2: &ObjectStoreConfig,
+	keys: DecisionKeys,
+) -> Cluster {
 	let objects = l2.build().unwrap();
 
 	enter("bootstrap");
 	let registry = support::shared_loopback_registry();
 	let mut members = Vec::new();
 	for node_id in NODES {
-		let (dir, cfg) = member_config(node_id, &l2, keys);
+		let (dir, cfg) = member_config(node_id, l2, keys);
 		let node =
 			WendelonNode::bootstrap_with_provider(cfg.clone(), provider(node_id, registry.clone()))
 				.await
@@ -979,7 +983,7 @@ async fn workflow(stage: Arc<std::sync::Mutex<String>>, l2: ObjectStoreConfig, k
 			node: Some(node),
 		});
 	}
-	let mut cluster = Cluster {
+	let cluster = Cluster {
 		registry,
 		members,
 		descriptor: table_descriptor(),
@@ -1023,6 +1027,12 @@ async fn workflow(stage: Arc<std::sync::Mutex<String>>, l2: ObjectStoreConfig, k
 		))
 		.await
 		.unwrap();
+	cluster
+}
+
+async fn workflow(stage: Arc<std::sync::Mutex<String>>, l2: ObjectStoreConfig, keys: DecisionKeys) {
+	let enter = |now: &str| *stage.lock().unwrap() = now.to_owned();
+	let mut cluster = formed_cluster(&enter, &l2, keys).await;
 
 	enter("first writes and reads");
 	for _ in 0..8 {
@@ -1126,6 +1136,58 @@ async fn three_nodes_keep_every_acknowledged_row_through_tiering_restart_and_fai
 		DecisionKeys::Development,
 	)
 	.await;
+}
+
+/// A real daemon's runtime workers have this stack: the default of a thread
+/// the runtime spawns. The test harness gives every thread far more.
+const DAEMON_WORKER_STACK_BYTES: usize = 2 * 1024 * 1024;
+
+/// ADR 0727 (DC-232). Table writes are served, committed and read back
+/// exactly while the server side runs on workers with a daemon's stack. The
+/// runtime sets that size itself, so the harness's larger minimum stack does
+/// not apply to its workers; the fixture's own futures stay on the test
+/// thread, whose stack is the harness's. Every request goes through the
+/// client, the transport and each node's connection task, as in the workflow.
+/// A write that needs more than a worker's stack aborts the process.
+#[test]
+fn table_writes_are_served_within_a_daemons_worker_stack() {
+	let l2 = support::tempdir("three-node-worker-stack-l2");
+	let l2 = ObjectStoreConfig::LocalFs {
+		root: l2.to_path_buf(),
+	};
+	let runtime = tokio::runtime::Builder::new_multi_thread()
+		.worker_threads(8)
+		.thread_stack_size(DAEMON_WORKER_STACK_BYTES)
+		.enable_all()
+		.build()
+		.unwrap();
+	let stage = Arc::new(std::sync::Mutex::new("start".to_owned()));
+	let finished = runtime.block_on(async {
+		let stage = stage.clone();
+		tokio::time::timeout(WORKFLOW_BOUND, async move {
+			let enter = |now: &str| *stage.lock().unwrap() = now.to_owned();
+			let mut cluster = formed_cluster(&enter, &l2, DecisionKeys::Development).await;
+			enter("writes on daemon-sized workers");
+			for _ in 0..8 {
+				cluster.write_one("worker stack").await;
+			}
+			cluster
+				.assert_exact_everywhere("writes on daemon-sized workers")
+				.await;
+			// An orderly close of every member, as the workflow ends: runtime
+			// teardown aborting their tasks is not that.
+			enter("shutdown");
+			for node_id in cluster.live_ids() {
+				cluster.stop(node_id).await;
+			}
+		})
+		.await
+	});
+	assert!(
+		finished.is_ok(),
+		"not finished within {WORKFLOW_BOUND:?}, in: {}",
+		stage.lock().unwrap(),
+	);
 }
 
 /// ADR 0721: the same workflow with each node signing decisions with a secret of its own and

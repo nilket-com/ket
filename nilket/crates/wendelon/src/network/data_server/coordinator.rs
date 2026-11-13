@@ -338,7 +338,8 @@ impl WendelonDataServer {
 		let mut given = None;
 		let settled = answer_by_deadline(
 			&gate,
-			self.coordinate(namespace, &meta, &batch, &gate),
+			// ADR 0727: on the heap; the deadline wrapper polls the same future.
+			Box::pin(self.coordinate(namespace, &meta, &batch, &gate)),
 			|| {
 				let response = self.settled_response(&meta, Settled::Deadline);
 				if let Some(early) = early {
