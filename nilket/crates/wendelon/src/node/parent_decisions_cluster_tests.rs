@@ -4094,6 +4094,22 @@ async fn certified_lsm_elides_the_obsolete_versions_on_the_leader() {
 /// followers' tiered state is untouched.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn certified_tier_cleanup_rewrites_and_retires_the_leaders_tiered_slabs() {
+	certified_tier_cleanup_workflow(false).await;
+}
+
+/// The same workflow, with the leader's first certified step that the ring
+/// accepts ended by an error right after acceptance (the `AfterAcceptance`
+/// cut): the step returns its error to the serial tick, nothing after it in
+/// the proposer runs, and the accepted work is completed by the apply observer
+/// and the operation driver. Retention and its durable records, reads, debt and
+/// the restart are held to the same assertions as the uncut workflow. One
+/// injected error at one point: not every fallible exit, and not a process crash.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn certified_tier_cleanup_recovers_a_step_that_errs_after_acceptance() {
+	certified_tier_cleanup_workflow(true).await;
+}
+
+async fn certified_tier_cleanup_workflow(cut_after_acceptance: bool) {
 	use crate::storage::core::StorageEngine;
 	use crate::storage::l2::ObjectStore;
 	use std::sync::atomic::Ordering::Release;
@@ -4206,9 +4222,10 @@ async fn certified_tier_cleanup_rewrites_and_retires_the_leaders_tiered_slabs() 
 	];
 	let s3_pointer = slab.tier_pointer(s3).await.unwrap();
 	let leader_l2 = l2_of(&cluster, leader);
-	let mut source_bytes = 0;
+	// The source objects, byte for byte, as they are before the certified step.
+	let mut source_objects = Vec::new();
 	for source in &sources {
-		source_bytes += leader_l2.get(&source.l2_uri).await.unwrap().len() as u64;
+		source_objects.push(leader_l2.get(&source.l2_uri).await.unwrap());
 	}
 	let followers: Vec<u32> = NODES.into_iter().filter(|node| *node != leader).collect();
 	let mut follower_tiers = std::collections::BTreeMap::new();
@@ -4247,6 +4264,11 @@ async fn certified_tier_cleanup_rewrites_and_retires_the_leaders_tiered_slabs() 
 		"premise: the leader's debt"
 	);
 	assert_eq!(slab.certified_retained_objects_for_test().count, 0);
+	if cut_after_acceptance {
+		slab.cut_next_certified_tier_step(
+			crate::storage::manager::certified_tier::CertifiedTierCut::AfterAcceptance,
+		);
+	}
 	// The leader's own leader-gated step runs, from its LSM service's tick.
 	pause.store(false, Release);
 	let copies = |key, hlc| {
@@ -4326,30 +4348,93 @@ async fn certified_tier_cleanup_rewrites_and_retires_the_leaders_tiered_slabs() 
 		);
 		tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 	}
-	// The replaced sources: retained, reported, never deleted.
-	let retained = slab.certified_retained_objects_for_test();
-	let mut uris = retained.uris.clone();
-	uris.sort();
-	let mut source_uris: Vec<_> = sources.iter().map(|source| source.l2_uri.clone()).collect();
-	source_uris.sort();
-	assert_eq!(
-		(retained.count, retained.bytes, uris.clone()),
-		(2, source_bytes, source_uris)
-	);
-	for uri in &uris {
-		leader_l2.get(uri).await.expect("a retained object stays");
+	// The replaced sources are retained and never deleted. The contract is the
+	// store's own: a durable retained-object record per source, in its published
+	// state, and no operation left open. The rewrite's record is published after
+	// its operation is handed off, so the wait is on the records themselves.
+	use crate::storage::index::RetainedObjectIntentState::{
+		ReplacementPublished, RetirementPublished,
+	};
+	let replacement_uri = slab.tier_pointer(s1).await.unwrap().l2_uri;
+	let published = [(s1, ReplacementPublished), (s2, RetirementPublished)];
+	let deadline = tokio::time::Instant::now() + BOUND;
+	let records = loop {
+		let intents = index.load_snapshot_cleanup_intents().await.unwrap();
+		let open_ops = slab
+			.require_op_index()
+			.unwrap()
+			.load_op_intents()
+			.await
+			.unwrap();
+		let records: Vec<_> = sources
+			.iter()
+			.zip(published)
+			.map(|(source, (id, _))| {
+				intents
+					.iter()
+					.find(|(slab_id, uri, _)| *slab_id == id && uri == &source.l2_uri)
+					.map(|(_, _, intent)| intent.clone())
+			})
+			.collect();
+		let settled = records.iter().zip(published).all(|(record, (_, state))| {
+			record.as_ref().is_some_and(|intent| intent.state == state)
+		});
+		if settled && open_ops.is_empty() {
+			break records;
+		}
 		assert!(
-			!slab
-				.list_tiered_slabs()
+			tokio::time::Instant::now() < deadline,
+			"the retained records are {records:?}; open operations {open_ops:?}"
+		);
+		tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+	};
+	let (s1_record, s2_record) = (records[0].clone().unwrap(), records[1].clone().unwrap());
+	assert_eq!(
+		(s1_record.bytes, s2_record.bytes),
+		(
+			Some(source_objects[0].len() as u64),
+			Some(source_objects[1].len() as u64)
+		)
+	);
+	assert_eq!(s1_record.replacement_uri.as_ref(), Some(&replacement_uri));
+	assert!(s1_record.published_replacements.contains(&replacement_uri));
+	assert_eq!(s2_record.replacement_uri, None);
+	let tiered_now = slab.list_tiered_slabs().await;
+	for (source, object) in sources.iter().zip(&source_objects) {
+		assert_eq!(
+			&leader_l2
+				.get(&source.l2_uri)
 				.await
+				.expect("a retained object stays"),
+			object,
+			"the retained object is the source, byte for byte"
+		);
+		assert!(
+			!tiered_now
 				.iter()
-				.any(|pointer| &pointer.l2_uri == uri),
+				.any(|pointer| pointer.l2_uri == source.l2_uri),
 			"never indexed again"
 		);
 	}
+	// What the proposer itself reported: never anything but the sources. It is
+	// not the retention record and claims no completeness, cut or not: nothing
+	// here orders a proposer's own note before this sample.
+	let reported = slab.certified_retained_objects_for_test();
+	for uri in &reported.uris {
+		assert!(sources.iter().any(|source| &source.l2_uri == uri), "{uri}");
+	}
+	if cut_after_acceptance {
+		assert_eq!(
+			slab.certified_tier_cut_pending_for_test(),
+			None,
+			"the armed cut was consumed"
+		);
+	}
 	eprintln!(
-		"ADR 0704 leader {leader}: certified rewrite of {s1:?} and retirement of {s2:?}; retained {} objects, {} bytes",
-		retained.count, retained.bytes
+		"ADR 0704 leader {leader}: certified rewrite of {s1:?} and retirement of {s2:?}; \
+		 2 retained records, {} bytes; the proposer reported {}",
+		source_objects[0].len() + source_objects[1].len(),
+		reported.count
 	);
 	// Followers: tiered state untouched, no certified work.
 	for follower in &followers {
@@ -4409,11 +4494,23 @@ async fn certified_tier_cleanup_rewrites_and_retires_the_leaders_tiered_slabs() 
 		"no resurrection"
 	);
 	let leader_l2 = l2_of(&cluster, leader);
-	for uri in &uris {
-		leader_l2
-			.get(uri)
-			.await
-			.expect("a retained object stays after the restart");
+	for (source, object) in sources.iter().zip(&source_objects) {
+		assert_eq!(
+			&leader_l2
+				.get(&source.l2_uri)
+				.await
+				.expect("a retained object stays after the restart"),
+			object,
+			"byte for byte after the restart"
+		);
+		assert!(
+			!restarted
+				.list_tiered_slabs()
+				.await
+				.iter()
+				.any(|pointer| pointer.l2_uri == source.l2_uri),
+			"never indexed again after the restart"
+		);
 	}
 	for node in cluster.nodes {
 		let _ = tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown()).await;

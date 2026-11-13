@@ -175,6 +175,15 @@ impl SlabManager {
 			.unwrap() = Some(cut);
 	}
 
+	/// Test-only: the cut still armed, if no step has reached it.
+	pub(crate) fn certified_tier_cut_pending_for_test(&self) -> Option<CertifiedTierCut> {
+		*self
+			.continuity_test_holds
+			.certified_tier_cut
+			.lock()
+			.unwrap()
+	}
+
 	fn certified_tier_cut(&self, at: CertifiedTierCut) -> std::io::Result<()> {
 		let mut cut = self
 			.continuity_test_holds

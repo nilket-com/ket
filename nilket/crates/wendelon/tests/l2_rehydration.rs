@@ -50,8 +50,94 @@ fn tenant() -> TenantId {
 	TenantId::ZERO
 }
 
-fn test_crypto() -> Arc<CryptoManager> {
-	Arc::new(test_support::seeded_dev_crypto_manager(tenant()).unwrap())
+/// The store's crypto manager and the candidate root check of its root.
+struct FixtureKeys {
+	crypto: Arc<CryptoManager>,
+	root_check: wendelon::crypto::RootCheck,
+}
+
+fn fixture_keys() -> FixtureKeys {
+	let (crypto, root_check) =
+		test_support::seeded_dev_crypto_manager_with_root_check(tenant()).unwrap();
+	FixtureKeys {
+		crypto: Arc::new(crypto),
+		root_check,
+	}
+}
+
+/// The ring holds what a formed cluster's log holds before any tier pointer:
+/// the root check, then the tenant with the store's own keyset. Committed with
+/// the product requests at log indices 1 and 2, each answered `Success`. An
+/// encrypted tier pointer is accepted only for a key version present in the
+/// deciding state (ADR 0728).
+async fn commit_fixture_keys(sm: &mut WendelonStateMachine, keys: &FixtureKeys) {
+	let keyset = keys
+		.crypto
+		.tenant_keysets_snapshot()
+		.unwrap()
+		.remove(&tenant())
+		.expect("the fixture's tenant has a keyset");
+	let requests = [
+		WendelonRequest::EstablishRootCheck(keys.root_check.clone()),
+		WendelonRequest::CreateTenant(wendelon::consensus::CreateTenant {
+			tenant_id: tenant(),
+			quota_bytes: u64::MAX,
+			replication_factor: 1,
+			tenant_keyset: keyset,
+			under_root: keys.root_check.id(),
+		}),
+	];
+	for (index, request) in (1_u64..).zip(requests) {
+		let responses = <WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::apply(
+			sm,
+			vec![Entry::<WendelonTypeConfig> {
+				log_id: LogId::new(CommittedLeaderId::new(1, 0), index),
+				payload: EntryPayload::Normal(request),
+			}],
+		)
+		.await
+		.unwrap();
+		assert_eq!(
+			responses,
+			vec![wendelon::consensus::WendelonResponse::Success],
+			"fixture key setup at index {index}"
+		);
+	}
+}
+
+/// The first log index after `commit_fixture_keys`.
+const FIRST_OP_INDEX: u64 = 3;
+
+/// What the ring decided for `ticket`, read from the operation's own receipt:
+/// its key, its digest and its recorded outcome. Anything else is an error,
+/// never an invented success.
+fn decided(
+	ticket: &wendelon::storage::OpTicket,
+	response: Option<wendelon::consensus::WendelonResponse>,
+) -> std::io::Result<wendelon::storage::VerifiedReceipt> {
+	use wendelon::consensus::slab_ops::{OpOutcome, OpResponse, RecordedOutcome};
+	match response {
+		Some(wendelon::consensus::WendelonResponse::Op(OpResponse::Receipt(receipt)))
+			if receipt.key == ticket.key() && receipt.digest == ticket.digest() =>
+		{
+			match receipt.outcome {
+				OpOutcome::Recorded(RecordedOutcome::Applied { index }) => {
+					Ok(wendelon::storage::VerifiedReceipt::Applied { index })
+				}
+				OpOutcome::Recorded(RecordedOutcome::Rejected { reason, index }) => {
+					Ok(wendelon::storage::VerifiedReceipt::Rejected { reason, index })
+				}
+				other => Err(std::io::Error::other(format!(
+					"test op {:?} has no recorded outcome: {other:?}",
+					ticket.key()
+				))),
+			}
+		}
+		other => Err(std::io::Error::other(format!(
+			"unexpected response to test op {:?}: {other:?}",
+			ticket.key()
+		))),
+	}
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -160,7 +246,7 @@ impl DirectApplyCommitter {
 		Self {
 			observer,
 			sm: Arc::new(AsyncMutex::new(state_machine)),
-			next_index: AtomicU64::new(1),
+			next_index: AtomicU64::new(FIRST_OP_INDEX),
 		}
 	}
 }
@@ -181,12 +267,17 @@ impl TierCommitter for DirectApplyCommitter {
 			})),
 		};
 		let mut sm = self.sm.lock().await;
-		<WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::apply(
+		let mut responses = <WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::apply(
 			&mut *sm,
 			vec![registration(owner, index), entry],
 		)
 		.await
 		.map_err(|err| std::io::Error::other(format!("test op commit failed: {err}")))?;
+		// The observer hears only what the ring applied.
+		let receipt = decided(ticket, responses.pop())?;
+		if !matches!(receipt, wendelon::storage::VerifiedReceipt::Applied { .. }) {
+			return Ok(receipt);
+		}
 		match ticket.command() {
 			wendelon::consensus::SlabCommand::Tier(op) => {
 				self.observer
@@ -200,7 +291,7 @@ impl TierCommitter for DirectApplyCommitter {
 			}
 			_ => {}
 		}
-		Ok(wendelon::storage::VerifiedReceipt::Applied { index: index + 1 })
+		Ok(receipt)
 	}
 }
 
@@ -217,6 +308,7 @@ async fn build_tiered_manager(
 ) {
 	let l1_dir = fresh_dir("l1");
 	let l2_dir = fresh_dir("l2");
+	let keys = fixture_keys();
 	let io = spawn_io_thread(64).unwrap();
 	let l2_inner: Arc<dyn ObjectStore> =
 		Arc::new(LocalFsObjectStore::new(l2_dir.to_path_buf()).unwrap());
@@ -237,7 +329,7 @@ async fn build_tiered_manager(
 		l2_encoding_fetch: Default::default(),
 		encoding_compute: Default::default(),
 		group_commit: wendelon::storage::GroupCommitConfig::default(),
-		crypto: test_crypto(),
+		crypto: keys.crypto.clone(),
 	})
 	.await
 	.unwrap();
@@ -262,7 +354,8 @@ async fn build_tiered_manager(
 	let original = manager.read(location).await.expect("pre-tier read ok");
 
 	let observer: Arc<dyn TierObserver> = Arc::new(ManagerTierObserver::new(manager.clone()));
-	let state_machine = WendelonStateMachine::new();
+	let mut state_machine = WendelonStateMachine::new();
+	commit_fixture_keys(&mut state_machine, &keys).await;
 	let committer: Arc<dyn TierCommitter> =
 		Arc::new(DirectApplyCommitter::new(observer, state_machine.clone()));
 	let sweeper = SlabSweeper::new(

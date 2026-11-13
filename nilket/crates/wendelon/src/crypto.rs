@@ -3223,6 +3223,19 @@ pub mod test_support {
 		Ok(crypto)
 	}
 
+	/// `seeded_dev_crypto_manager`, with the candidate root check of the root it
+	/// was just made under. For a fixture outside this crate that commits that
+	/// check and the manager's own keysets to its state machine with the product
+	/// requests, as a formed cluster's log holds them. Fixture data at creation:
+	/// it binds nothing and verifies nothing beyond what the first function does.
+	pub fn seeded_dev_crypto_manager_with_root_check(
+		tenant_id: TenantId,
+	) -> std::io::Result<(CryptoManager, RootCheck)> {
+		let crypto = seeded_dev_crypto_manager(tenant_id)?;
+		let check = crypto.candidate_root_check()?;
+		Ok((crypto, check))
+	}
+
 	/// Places a freshly generated development root KEK in `data_dir`, as an
 	/// operator supplying a root of their own would, or as a member that was
 	/// never given its cluster's root would have. Synthetic, per call.

@@ -44,8 +44,94 @@ fn tenant() -> TenantId {
 	TenantId::ZERO
 }
 
-fn test_crypto() -> Arc<CryptoManager> {
-	Arc::new(test_support::seeded_dev_crypto_manager(tenant()).unwrap())
+/// The store's crypto manager and the candidate root check of its root.
+struct FixtureKeys {
+	crypto: Arc<CryptoManager>,
+	root_check: wendelon::crypto::RootCheck,
+}
+
+fn fixture_keys() -> FixtureKeys {
+	let (crypto, root_check) =
+		test_support::seeded_dev_crypto_manager_with_root_check(tenant()).unwrap();
+	FixtureKeys {
+		crypto: Arc::new(crypto),
+		root_check,
+	}
+}
+
+/// The ring holds what a formed cluster's log holds before any tier pointer:
+/// the root check, then the tenant with the store's own keyset. Committed with
+/// the product requests at log indices 1 and 2, each answered `Success`. An
+/// encrypted tier pointer is accepted only for a key version present in the
+/// deciding state (ADR 0728).
+async fn commit_fixture_keys(sm: &mut WendelonStateMachine, keys: &FixtureKeys) {
+	let keyset = keys
+		.crypto
+		.tenant_keysets_snapshot()
+		.unwrap()
+		.remove(&tenant())
+		.expect("the fixture's tenant has a keyset");
+	let requests = [
+		WendelonRequest::EstablishRootCheck(keys.root_check.clone()),
+		WendelonRequest::CreateTenant(wendelon::consensus::CreateTenant {
+			tenant_id: tenant(),
+			quota_bytes: u64::MAX,
+			replication_factor: 1,
+			tenant_keyset: keyset,
+			under_root: keys.root_check.id(),
+		}),
+	];
+	for (index, request) in (1_u64..).zip(requests) {
+		let responses = <WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::apply(
+			sm,
+			vec![Entry::<WendelonTypeConfig> {
+				log_id: LogId::new(CommittedLeaderId::new(1, 0), index),
+				payload: EntryPayload::Normal(request),
+			}],
+		)
+		.await
+		.unwrap();
+		assert_eq!(
+			responses,
+			vec![wendelon::consensus::WendelonResponse::Success],
+			"fixture key setup at index {index}"
+		);
+	}
+}
+
+/// The first log index after `commit_fixture_keys`.
+const FIRST_OP_INDEX: u64 = 3;
+
+/// What the ring decided for `ticket`, read from the operation's own receipt:
+/// its key, its digest and its recorded outcome. Anything else is an error,
+/// never an invented success.
+fn decided(
+	ticket: &wendelon::storage::OpTicket,
+	response: Option<wendelon::consensus::WendelonResponse>,
+) -> std::io::Result<wendelon::storage::VerifiedReceipt> {
+	use wendelon::consensus::slab_ops::{OpOutcome, OpResponse, RecordedOutcome};
+	match response {
+		Some(wendelon::consensus::WendelonResponse::Op(OpResponse::Receipt(receipt)))
+			if receipt.key == ticket.key() && receipt.digest == ticket.digest() =>
+		{
+			match receipt.outcome {
+				OpOutcome::Recorded(RecordedOutcome::Applied { index }) => {
+					Ok(wendelon::storage::VerifiedReceipt::Applied { index })
+				}
+				OpOutcome::Recorded(RecordedOutcome::Rejected { reason, index }) => {
+					Ok(wendelon::storage::VerifiedReceipt::Rejected { reason, index })
+				}
+				other => Err(std::io::Error::other(format!(
+					"test op {:?} has no recorded outcome: {other:?}",
+					ticket.key()
+				))),
+			}
+		}
+		other => Err(std::io::Error::other(format!(
+			"unexpected response to test op {:?}: {other:?}",
+			ticket.key()
+		))),
+	}
 }
 
 fn compat_config(endpoint: String, root: &str) -> RemoteObjectStoreConfig {
@@ -88,7 +174,7 @@ impl AppliedStateMachineCommitter {
 	fn new(sm: WendelonStateMachine) -> Self {
 		Self {
 			sm: Arc::new(AsyncMutex::new(sm)),
-			next_index: AtomicU64::new(1),
+			next_index: AtomicU64::new(FIRST_OP_INDEX),
 		}
 	}
 }
@@ -109,13 +195,13 @@ impl TierCommitter for AppliedStateMachineCommitter {
 			})),
 		};
 		let mut sm = self.sm.lock().await;
-		<WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::apply(
+		let mut responses = <WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::apply(
 			&mut *sm,
 			vec![registration(owner, index), entry],
 		)
 		.await
 		.map_err(|err| Error::other(format!("test op commit failed: {err}")))?;
-		Ok(wendelon::storage::VerifiedReceipt::Applied { index: index + 1 })
+		decided(ticket, responses.pop())
 	}
 }
 
@@ -525,7 +611,8 @@ async fn handle_request(
 
 async fn build_manager_with_sealed_slabs(
 	l2: Option<Arc<dyn ObjectStore>>,
-) -> (test_dir::TestDir, Arc<SlabManager>) {
+) -> (test_dir::TestDir, Arc<SlabManager>, FixtureKeys) {
+	let keys = fixture_keys();
 	use wendelon::storage::StorageEngine;
 
 	let dir = fresh_dir("l1");
@@ -546,7 +633,7 @@ async fn build_manager_with_sealed_slabs(
 			l2_encoding_fetch: Default::default(),
 			encoding_compute: Default::default(),
 			group_commit: wendelon::storage::GroupCommitConfig::default(),
-			crypto: test_crypto(),
+			crypto: keys.crypto.clone(),
 		},
 		wendelon::storage::ownership::DataDirectoryOwner::acquire_existing(&dir).unwrap(),
 	)
@@ -567,7 +654,7 @@ async fn build_manager_with_sealed_slabs(
 		.append(tenant(), id(3), hlc(), b"hello-3")
 		.await
 		.unwrap();
-	(dir, manager)
+	(dir, manager, keys)
 }
 
 #[tokio::test]
@@ -643,10 +730,11 @@ async fn sweeper_persists_remote_uri_shape_in_tier_metadata() {
 	let server = FakeCompatStoreServer::start().await;
 	let remote: Arc<dyn ObjectStore> =
 		Arc::new(RemoteObjectStore::new(compat_config(server.endpoint.clone(), "tiered")).unwrap());
-	let (_dir, manager) = build_manager_with_sealed_slabs(Some(remote.clone())).await;
+	let (_dir, manager, keys) = build_manager_with_sealed_slabs(Some(remote.clone())).await;
 
 	let observer: Arc<dyn TierObserver> = Arc::new(ManagerTierObserver::new(manager.clone()));
-	let state_machine = WendelonStateMachine::new().with_tier_observer(observer);
+	let mut state_machine = WendelonStateMachine::new().with_tier_observer(observer);
+	commit_fixture_keys(&mut state_machine, &keys).await;
 	let committer: Arc<dyn TierCommitter> =
 		Arc::new(AppliedStateMachineCommitter::new(state_machine.clone()));
 

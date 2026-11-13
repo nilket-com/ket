@@ -19271,6 +19271,7 @@ async fn install_over_tiered_input(cut: lsm_driver::ControlLsmInstallCut) -> Tie
 			.unwrap();
 	let cluster = control_cluster_observing(&[(1, &mgr)]).await;
 	register_owner(&cluster.nodes[0], &mgr).await;
+	seed_ring_keysets(&cluster.state_machines, &[&mgr]).await;
 	let plain = Arc::new(op_committer(&cluster, 1));
 	let key = id(0xb18701);
 	mgr.append_durable(tenant(), key, hlc(1), b"dc187")
@@ -38598,6 +38599,7 @@ async fn real_sm_fenced_pointer_for_a_retired_slab_stays_typed_fenced_while_cano
 	source
 		.seed_registration_for_test(manager.owner_ref().unwrap())
 		.await;
+	seed_ring_keysets(std::slice::from_ref(&source), &[&manager]).await;
 	RaftStateMachine::apply(
 		&mut source,
 		[Entry {
@@ -38617,6 +38619,7 @@ async fn real_sm_fenced_pointer_for_a_retired_slab_stays_typed_fenced_while_cano
 	target
 		.seed_tiered_slab_for_test(b10_tier(&manager, &old))
 		.await;
+	seed_ring_keysets(std::slice::from_ref(&target), &[&manager]).await;
 
 	// An in-flight append makes the snapshot's reconciliation defer.
 	let active = Arc::clone(&manager.state.lock().await.active);
@@ -40069,6 +40072,7 @@ async fn b1t_real_follower_debt_completes_after_leadership_change() {
 				mgr.clone(),
 			)));
 		}
+		seed_ring_keysets(std::slice::from_ref(&sm), &[&mgr]).await;
 		let raft = WendelonRaft::new(node_id, config.clone(), network.clone(), log.clone(), sm)
 			.await
 			.unwrap();
@@ -41270,6 +41274,7 @@ async fn b6_replacement_tier_log_entry_finishes_complete_replay_authority() {
 	// cold restore; the restore refusals and DC-162 remain that boundary.
 	sm.seed_registration_for_test(target.owner_ref().unwrap())
 		.await;
+	seed_ring_keysets(std::slice::from_ref(&sm), &[&target]).await;
 	RaftStateMachine::apply(
 		&mut sm,
 		[Entry {
@@ -41372,6 +41377,7 @@ async fn b6c_complete_replay_resumes_matching_lsm_deferral() {
 	// cold restore; the restore refusals and DC-162 remain that boundary.
 	sm.seed_registration_for_test(target.owner_ref().unwrap())
 		.await;
+	seed_ring_keysets(std::slice::from_ref(&sm), &[&target]).await;
 	RaftStateMachine::apply(
 		&mut sm,
 		[Entry {
@@ -41488,6 +41494,7 @@ async fn b6c_complete_replay_preserves_structural_refusal() {
 	// cold restore; the restore refusals and DC-162 remain that boundary.
 	sm.seed_registration_for_test(target.owner_ref().unwrap())
 		.await;
+	seed_ring_keysets(std::slice::from_ref(&sm), &[&target]).await;
 	RaftStateMachine::apply(
 		&mut sm,
 		[Entry {
@@ -41601,6 +41608,7 @@ async fn b6c_nonempty_replay_crash_before_marker_clear_rechecks_on_reopen() {
 	// cold restore; the restore refusals and DC-162 remain that boundary.
 	sm.seed_registration_for_test(target.owner_ref().unwrap())
 		.await;
+	seed_ring_keysets(std::slice::from_ref(&sm), &[&target]).await;
 	RaftStateMachine::apply(
 		&mut sm,
 		[Entry {
@@ -43098,6 +43106,7 @@ async fn b10_append_fixture() -> B10AppendFixture {
 		.unwrap()
 		.forget();
 	let mut canonical = WendelonStateMachine::new();
+	seed_ring_keysets(std::slice::from_ref(&canonical), &[&source]).await;
 	let locality = Locality::from(key).get();
 	RaftStateMachine::apply(
 		&mut canonical,
@@ -44050,6 +44059,7 @@ async fn b11_completed_control_install_recovers_after_crash_before_intent_clear(
 			.unwrap();
 	let cluster = control_cluster_observing(&[(1, &manager)]).await;
 	register_owner(&cluster.nodes[0], &manager).await;
+	seed_ring_keysets(&cluster.state_machines, &[&manager]).await;
 	let plain = Arc::new(op_committer(&cluster, 1));
 	let keys = seed_lsm_relocation_fixture(&manager).await;
 	let worker = LsmCompactionWorker::new(LsmConfig::default(), manager.slab_pin_table()).unwrap();
@@ -46985,6 +46995,7 @@ async fn worker_replay_fixture_over(
 	target
 		.seed_tiered_slab_for_test(b10_tier(&manager, &old))
 		.await;
+	seed_ring_keysets(std::slice::from_ref(&target), &[&manager]).await;
 	(dirs, manager, l2, target, old, key)
 }
 
@@ -47305,6 +47316,7 @@ async fn a_successful_replay_freeing_held_capacity_wakes_another_budget_fenced_r
 	target
 		.seed_tiered_slab_for_test(b10_tier(&manager, &b_old))
 		.await;
+	seed_ring_keysets(std::slice::from_ref(&target), &[&manager]).await;
 	manager.apply_tier_slab(b_old.clone()).await.unwrap();
 	let replacement = |old: &TieredSlabPointer, name: &'static str| {
 		let l2 = l2.clone();
@@ -48311,6 +48323,79 @@ struct ControlCluster {
 	_dirs: Vec<crate::test_support::TestDir>,
 }
 
+/// The ring holds the tenant keysets of the stores it serves, as tenant creation
+/// and rotation commit them: an encrypted tier pointer is accepted only for a
+/// key version present in the deciding state (ADR 0728). Seeded into every
+/// applying state machine directly, so no log index moves; a state rebuilt from
+/// its log alone does not have it (see `commit_ring_keysets`).
+///
+/// Several stores with crypto managers of their own are a fixture convenience,
+/// not one cluster's key authority: their versions form a synthetic presence
+/// inventory per tenant. A version id two stores share must be the same bytes,
+/// and the inventory names an active version only if every store names the same
+/// one. It demonstrates nothing about shared-root custody or key delivery.
+async fn seed_ring_keysets(
+	state_machines: &[crate::consensus::WendelonStateMachine],
+	managers: &[&SlabManager],
+) {
+	let mut keysets: BTreeMap<TenantId, crate::crypto::TenantKeyset> = BTreeMap::new();
+	let mut actives: BTreeMap<TenantId, BTreeSet<Option<TenantKekId>>> = BTreeMap::new();
+	for manager in managers {
+		let crypto = manager.retained_cleanup_test_crypto();
+		for (tenant_id, keyset) in crypto.tenant_keysets_snapshot().unwrap() {
+			actives
+				.entry(tenant_id)
+				.or_default()
+				.insert(keyset.active_tenant_kek_id);
+			let merged = keysets.entry(tenant_id).or_default();
+			for (id, wrapped) in keyset.keys {
+				if let Some(held) = merged.keys.get(&id) {
+					assert_eq!(held, &wrapped, "two stores disagree on tenant KEK {id:?}");
+				}
+				merged.keys.insert(id, wrapped);
+			}
+		}
+	}
+	for (tenant_id, keyset) in &mut keysets {
+		let named = &actives[tenant_id];
+		keyset.active_tenant_kek_id = if named.len() == 1 {
+			*named.iter().next().unwrap()
+		} else {
+			None
+		};
+	}
+	for sm in state_machines {
+		sm.seed_tenant_keysets_for_test(keysets.clone()).await;
+	}
+}
+
+/// The same prerequisite, committed through the ring with the product requests
+/// (the root check, then the tenant with the store's own keyset), for a fixture
+/// whose state is later rebuilt from its log.
+async fn commit_ring_keysets(raft: &crate::consensus::WendelonRaft, manager: &SlabManager) {
+	use crate::consensus::{CreateTenant, WendelonRequest, WendelonResponse};
+	let crypto = manager.retained_cleanup_test_crypto();
+	let check = crypto.candidate_root_check().unwrap();
+	let established = raft
+		.client_write(WendelonRequest::EstablishRootCheck(check.clone()))
+		.await
+		.unwrap();
+	assert_eq!(established.data, WendelonResponse::Success);
+	for (tenant_id, tenant_keyset) in crypto.tenant_keysets_snapshot().unwrap() {
+		let created = raft
+			.client_write(WendelonRequest::CreateTenant(CreateTenant {
+				tenant_id,
+				quota_bytes: u64::MAX,
+				replication_factor: 1,
+				tenant_keyset,
+				under_root: check.id(),
+			}))
+			.await
+			.unwrap();
+		assert_eq!(created.data, WendelonResponse::Success);
+	}
+}
+
 async fn control_cluster(observer: u32, manager: &Arc<SlabManager>) -> ControlCluster {
 	use crate::consensus::{WendelonLogStore, WendelonRaft};
 	let network = b1t_network::Network::default();
@@ -48361,6 +48446,7 @@ async fn control_cluster(observer: u32, manager: &Arc<SlabManager>) -> ControlCl
 			.await
 			.unwrap();
 	}
+	seed_ring_keysets(&state_machines, &[manager]).await;
 	ControlCluster {
 		nodes,
 		state_machines,
@@ -48748,6 +48834,10 @@ async fn single_voter(
 		.current_leader(1, "the single voter leads")
 		.await
 		.unwrap();
+	if initialize {
+		// In the log, so a restart's replay decides the same tier operations.
+		commit_ring_keysets(&raft, manager).await;
+	}
 	(raft, log, network)
 }
 
@@ -49064,6 +49154,8 @@ async fn control_cluster_observing(observers: &[(u32, &Arc<SlabManager>)]) -> Co
 			.await
 			.unwrap();
 	}
+	let managers: Vec<&SlabManager> = observers.iter().map(|(_, manager)| &***manager).collect();
+	seed_ring_keysets(&state_machines, &managers).await;
 	ControlCluster {
 		nodes,
 		state_machines,
@@ -49088,6 +49180,7 @@ async fn dc161_gc_after_leadership_loss_leaves_no_unresolvable_intent() {
 	// check and its compaction client_write itself is what the lost
 	// leadership refuses.
 	register_owner(&cluster.nodes[0], &manager).await;
+	seed_ring_keysets(&cluster.state_machines, &[&manager]).await;
 	cluster.elect(2).await;
 	// The role check passed at the tick gate and again before allocation; the
 	// role is lost in the window after it.
@@ -50090,6 +50183,7 @@ async fn committer_maps_a_refused_slab_command_to_a_non_outcome_on_every_path() 
 	let cluster = control_cluster_observing(&[(2, &mgr)]).await;
 	cluster.elect(2).await;
 	register_owner(&cluster.nodes[1], &mgr).await;
+	seed_ring_keysets(&cluster.state_machines, &[&mgr]).await;
 	cluster.elect(1).await;
 	let owner = mgr.owner_ref().unwrap();
 	let leader_sm = cluster.state_machines[0].clone();
@@ -50725,6 +50819,7 @@ async fn a_superseded_owners_receipt_grants_no_local_effect() {
 	let cluster = control_cluster_observing(&[(1, &mgr)]).await;
 	let committer = Arc::new(op_committer(&cluster, 1));
 	register_owner(&cluster.nodes[0], &mgr).await;
+	seed_ring_keysets(&cluster.state_machines, &[&mgr]).await;
 	let owner = mgr.owner_ref().unwrap();
 	let index = mgr.require_op_index().unwrap();
 	let ticket = index
@@ -50885,6 +50980,7 @@ async fn a_reopen_with_an_undecided_tier_op_fences_until_its_cancel_resolves_it(
 	let cluster = control_cluster_observing(&[(1, &mgr)]).await;
 	let committer = Arc::new(op_committer(&cluster, 1));
 	register_owner(&cluster.nodes[0], &mgr).await;
+	seed_ring_keysets(&cluster.state_machines, &[&mgr]).await;
 	mgr.require_op_index()
 		.unwrap()
 		.allocate_ops(
@@ -51317,6 +51413,7 @@ async fn a_rewrite_planned_from_a_cannot_overwrite_a_newer_b() {
 	let (_dirs, mgr, l2, target, schemas, old) = unpublished_drop_fixture().await;
 	let cluster = control_cluster_observing(&[(1, &mgr)]).await;
 	register_owner(&cluster.nodes[0], &mgr).await;
+	seed_ring_keysets(&cluster.state_machines, &[&mgr]).await;
 	let committed = cluster.nodes[0]
 		.client_write(mgr.tier_request_for_test(b10_tier(&mgr, &old)).await)
 		.await
@@ -51395,6 +51492,7 @@ async fn a_rejected_retirement_leaves_the_newer_generation_and_its_cleanup_marke
 	let (_dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
 	let cluster = control_cluster_observing(&[(1, &mgr)]).await;
 	register_owner(&cluster.nodes[0], &mgr).await;
+	seed_ring_keysets(&cluster.state_machines, &[&mgr]).await;
 	let committed = cluster.nodes[0]
 		.client_write(mgr.tier_request_for_test(b10_tier(&mgr, &old)).await)
 		.await
@@ -51682,6 +51780,7 @@ async fn dc157_ring_fixture(
 	let pointer = tiered_pointer_from_blob(&mgr, slab_id, uri, &encrypted.bytes);
 	let cluster = control_cluster_observing(&[(1, &mgr)]).await;
 	register_owner(&cluster.nodes[0], &mgr).await;
+	seed_ring_keysets(&cluster.state_machines, &[&mgr]).await;
 	(dirs, mgr, cluster, slab_id, pointer)
 }
 
@@ -52596,6 +52695,7 @@ async fn a_ring_store_refuses_local_gc_and_its_no_survivor_release_waits_for_the
 	mgr.ensure_live_lsm_run_for_maintenance(slab_id, 1024);
 	let cluster = control_cluster_observing(&[(1, &mgr)]).await;
 	register_owner(&cluster.nodes[0], &mgr).await;
+	seed_ring_keysets(&cluster.state_machines, &[&mgr]).await;
 	let refused = mgr
 		.sweep_lsm_delete_pending_once(&new_gc(&mgr))
 		.await
@@ -53056,6 +53156,7 @@ async fn a_rejected_claim_handoff_reads_its_authority_canonically_before_any_fen
 	mgr.bind_control_node(1).unwrap();
 	mgr.bind_canonical_tier_source(cluster.state_machines[0].tier_snapshot_source_for_test());
 	register_owner(&cluster.nodes[0], &mgr).await;
+	seed_ring_keysets(&cluster.state_machines, &[&mgr]).await;
 
 	let entered = Arc::new(tokio::sync::Semaphore::new(0));
 	let release = Arc::new(tokio::sync::Semaphore::new(0));
@@ -53160,6 +53261,7 @@ async fn ring_store_for_reservations(
 	let (dir, mgr) = fresh_manager().await;
 	let cluster = control_cluster_observing(&[(1, &mgr)]).await;
 	register_owner(&cluster.nodes[0], &mgr).await;
+	seed_ring_keysets(&cluster.state_machines, &[&mgr]).await;
 	let committer = Arc::new(op_committer(&cluster, 1));
 	let driver = op_driver(&cluster, &mgr, committer.clone());
 	(dir, mgr, cluster, committer, driver)
@@ -53754,6 +53856,7 @@ async fn a_close_during_disposal_fails_closed_and_the_reopen_is_fenced() {
 		let (slab_id, _key) = seed_small_retired_gc_slab(&mgr).await;
 		let cluster = control_cluster_observing(&[(1, &mgr)]).await;
 		register_owner(&cluster.nodes[0], &mgr).await;
+		seed_ring_keysets(&cluster.state_machines, &[&mgr]).await;
 		let committer = WatchesRemoval::new(&cluster, &mgr, &dir);
 		let entered = Arc::new(tokio::sync::Semaphore::new(0));
 		let release = Arc::new(tokio::sync::Semaphore::new(0));
@@ -53837,6 +53940,7 @@ async fn a_reopen_after_a_rejected_install_neither_adopts_nor_deletes_its_output
 			.unwrap();
 	let cluster = control_cluster_observing(&[(1, &mgr)]).await;
 	register_owner(&cluster.nodes[0], &mgr).await;
+	seed_ring_keysets(&cluster.state_machines, &[&mgr]).await;
 	let committer = Arc::new(op_committer(&cluster, 1));
 	let (_input, plan) = seeded_compaction_plan(&mgr).await;
 	let worker = LsmCompactionWorker::new(LsmConfig::default(), mgr.slab_pin_table()).unwrap();
@@ -53895,6 +53999,7 @@ async fn a_reopen_after_a_rejected_install_neither_adopts_nor_deletes_its_output
 	// Its T1 still finishes it, from where it waits, on the reopened store.
 	let cluster = control_cluster_observing(&[(1, &reopened)]).await;
 	register_owner(&cluster.nodes[0], &reopened).await;
+	seed_ring_keysets(&cluster.state_machines, &[&reopened]).await;
 	let committer = Arc::new(op_committer(&cluster, 1));
 	let driver = op_driver(&cluster, &reopened, committer);
 	drive_until_gone(&driver, index, output, None).await;
@@ -54218,6 +54323,7 @@ async fn a_crash_between_relocation_and_handoff_retains_the_bytes_and_refuses() 
 			.unwrap();
 	let cluster = control_cluster_observing(&[(1, &mgr)]).await;
 	register_owner(&cluster.nodes[0], &mgr).await;
+	seed_ring_keysets(&cluster.state_machines, &[&mgr]).await;
 	let (_input, plan) = seeded_compaction_plan(&mgr).await;
 	let worker = LsmCompactionWorker::new(LsmConfig::default(), mgr.slab_pin_table()).unwrap();
 	let rejecting = RejectsThenCuts(Arc::new(op_committer(&cluster, 1)), mgr.clone());
@@ -54266,6 +54372,7 @@ async fn a_crash_between_relocation_and_handoff_retains_the_bytes_and_refuses() 
 	);
 	let cluster = control_cluster_observing(&[(1, &reopened)]).await;
 	register_owner(&cluster.nodes[0], &reopened).await;
+	seed_ring_keysets(&cluster.state_machines, &[&reopened]).await;
 	let plain = Arc::new(op_committer(&cluster, 1));
 	reopened.drive_reserved_ids(plain.as_ref()).await.unwrap();
 	assert!(
@@ -55088,6 +55195,7 @@ async fn a_marks_recovery_survives_the_reopen_that_resets_revisions() {
 	}
 	let cluster = control_cluster_observing(&[(1, &mgr)]).await;
 	register_owner(&cluster.nodes[0], &mgr).await;
+	seed_ring_keysets(&cluster.state_machines, &[&mgr]).await;
 	cluster.elect(2).await;
 	let refused = crate::storage::RaftCommitter::new(cluster.nodes[0].clone())
 		.with_state_machine(cluster.state_machines[0].clone())
@@ -55111,6 +55219,7 @@ async fn a_marks_recovery_survives_the_reopen_that_resets_revisions() {
 		.unwrap();
 	let cluster = control_cluster_observing(&[(1, &reopened)]).await;
 	register_owner(&cluster.nodes[0], &reopened).await;
+	seed_ring_keysets(&cluster.state_machines, &[&reopened]).await;
 	let plain = Arc::new(op_committer(&cluster, 1));
 	let driver = op_driver(&cluster, &reopened, plain.clone());
 	drive_until_quiet(&driver, &reopened, false, plain.as_ref()).await;
@@ -55149,6 +55258,7 @@ async fn an_applied_marks_recovery_survives_the_reopen_that_resets_revisions() {
 	drop(lock);
 	let cluster = control_cluster_observing(&[(1, &mgr)]).await;
 	register_owner(&cluster.nodes[0], &mgr).await;
+	seed_ring_keysets(&cluster.state_machines, &[&mgr]).await;
 	let plain = Arc::new(op_committer(&cluster, 1));
 	let losing = LosesMarkResponse(plain.clone());
 	let _ = mgr
@@ -55456,6 +55566,7 @@ async fn reopen_gc_at(stop: GcStop) -> ReopenedGc {
 	let (slab_id, _key) = seed_small_retired_gc_slab(&mgr).await;
 	let cluster = control_cluster_observing(&[(1, &mgr)]).await;
 	register_owner(&cluster.nodes[0], &mgr).await;
+	seed_ring_keysets(&cluster.state_machines, &[&mgr]).await;
 	let plain = Arc::new(op_committer(&cluster, 1));
 	let index = mgr.require_op_index().unwrap();
 	let past_complete = matches!(
@@ -56054,6 +56165,7 @@ async fn a_recovery_pass_leaves_a_live_sweeps_removal_alone() {
 	let (slab_id, _key) = seed_small_retired_gc_slab(&mgr).await;
 	let cluster = control_cluster_observing(&[(1, &mgr)]).await;
 	register_owner(&cluster.nodes[0], &mgr).await;
+	seed_ring_keysets(&cluster.state_machines, &[&mgr]).await;
 	let plain = Arc::new(op_committer(&cluster, 1));
 	let (entered, release) = hold_gc_disposal_entry(&mgr);
 	let sweep = {
@@ -56231,6 +56343,7 @@ async fn a_retired_run_is_collected_after_a_reopen() {
 	let (slab_id, key) = seed_small_retired_gc_slab(&mgr).await;
 	let cluster = control_cluster_observing(&[(1, &mgr)]).await;
 	register_owner(&cluster.nodes[0], &mgr).await;
+	seed_ring_keysets(&cluster.state_machines, &[&mgr]).await;
 	let plain = Arc::new(op_committer(&cluster, 1));
 	owner.close(Duration::from_secs(5)).await.unwrap();
 	let gc = reopen_on_ring(dir, cluster, slab_id, plain).await;
@@ -56253,6 +56366,7 @@ async fn a_mark_recovered_across_a_reopen_goes_on_to_collect_its_run() {
 	let (slab_id, key) = seed_small_retired_gc_slab(&mgr).await;
 	let cluster = control_cluster_observing(&[(1, &mgr)]).await;
 	register_owner(&cluster.nodes[0], &mgr).await;
+	seed_ring_keysets(&cluster.state_machines, &[&mgr]).await;
 	let plain = Arc::new(op_committer(&cluster, 1));
 	let losing = LosesMarkResponse(plain.clone());
 	let _ = mgr
@@ -56705,6 +56819,7 @@ async fn a_recovery_pass_leaves_a_live_sweep_past_its_run_drop() {
 	let (slab_id, _key) = seed_small_retired_gc_slab(&mgr).await;
 	let cluster = control_cluster_observing(&[(1, &mgr)]).await;
 	register_owner(&cluster.nodes[0], &mgr).await;
+	seed_ring_keysets(&cluster.state_machines, &[&mgr]).await;
 	let plain = Arc::new(op_committer(&cluster, 1));
 	let entered = Arc::new(tokio::sync::Semaphore::new(0));
 	let release = Arc::new(tokio::sync::Semaphore::new(0));
@@ -57016,6 +57131,7 @@ async fn a_stale_intent_is_refused_before_a_marks_postimage() {
 	let (slab_id, _key) = seed_small_retired_gc_slab(&mgr).await;
 	let cluster = control_cluster_observing(&[(1, &mgr)]).await;
 	register_owner(&cluster.nodes[0], &mgr).await;
+	seed_ring_keysets(&cluster.state_machines, &[&mgr]).await;
 	let plain = Arc::new(op_committer(&cluster, 1));
 	let losing = LosesMarkResponse(plain.clone());
 	let _ = mgr
@@ -57159,6 +57275,7 @@ async fn reopen_install_seeded_on_ring(
 			.unwrap();
 	let cluster = control_cluster_observing(&[(1, &manager)]).await;
 	register_owner(&cluster.nodes[0], &manager).await;
+	seed_ring_keysets(&cluster.state_machines, &[&manager]).await;
 	let plain = Arc::new(op_committer(&cluster, 1));
 	let keys = [id(0xb11b01), id(0xb11b02)];
 	let [first, second] = seed(&manager, &plain, keys).await;
@@ -57350,6 +57467,7 @@ async fn resolving_the_last_intent_finishes_what_its_open_deferred() {
 	let (slab_id, _key) = seed_small_retired_gc_slab(&mgr).await;
 	let cluster = control_cluster_observing(&[(1, &mgr)]).await;
 	register_owner(&cluster.nodes[0], &mgr).await;
+	seed_ring_keysets(&cluster.state_machines, &[&mgr]).await;
 	let plain = Arc::new(op_committer(&cluster, 1));
 	let losing = LosesMarkResponse(plain.clone());
 	let _ = mgr
@@ -58007,6 +58125,7 @@ impl LsmJobStore {
 				.unwrap();
 		let cluster = control_cluster_observing(&[(1, &manager)]).await;
 		register_owner(&cluster.nodes[0], &manager).await;
+		seed_ring_keysets(&cluster.state_machines, &[&manager]).await;
 		let plain = Arc::new(op_committer(&cluster, 1));
 		let worker =
 			LsmCompactionWorker::new(LsmConfig::default(), manager.slab_pin_table()).unwrap();
@@ -58564,6 +58683,7 @@ async fn a_recovered_gc_finishes_its_deferred_open_and_restores_an_unmirrored_re
 	let (slab_id, _key) = seed_small_retired_gc_slab(&mgr).await;
 	let cluster = control_cluster_observing(&[(1, &mgr)]).await;
 	register_owner(&cluster.nodes[0], &mgr).await;
+	seed_ring_keysets(&cluster.state_machines, &[&mgr]).await;
 	let plain = Arc::new(op_committer(&cluster, 1));
 	let key = id(0xabcd01);
 	mgr.append_durable(tenant(), key, hlc(7000), b"unmirrored")
@@ -59127,6 +59247,7 @@ async fn reopen_tier_op(
 	let cluster = control_cluster_observing(&[]).await;
 	mgr.bind_control_node(1).unwrap();
 	register_owner(&cluster.nodes[0], &mgr).await;
+	seed_ring_keysets(&cluster.state_machines, &[&mgr]).await;
 	let plain = Arc::new(op_committer(&cluster, 1));
 	let index = mgr.require_op_index().unwrap();
 	let owner = mgr.owner_ref().unwrap();
@@ -59575,6 +59696,7 @@ async fn run_install_of_seeded_inputs(
 			.unwrap();
 	let cluster = control_cluster_observing(&[(1, &manager)]).await;
 	register_owner(&cluster.nodes[0], &manager).await;
+	seed_ring_keysets(&cluster.state_machines, &[&manager]).await;
 	let plain = op_committer(&cluster, 1);
 	let [first, second] = seed(&manager, [id(0xb11b01), id(0xb11b02)]).await;
 	let snapshot = manager.compaction_manifest_snapshot();
@@ -59672,6 +59794,7 @@ async fn an_install_over_a_recorded_conflict_is_refused_before_its_intent() {
 	let second = manager.force_seal_active_for_test().await;
 	let cluster = control_cluster_observing(&[(1, &manager)]).await;
 	register_owner(&cluster.nodes[0], &manager).await;
+	seed_ring_keysets(&cluster.state_machines, &[&manager]).await;
 	let plain = op_committer(&cluster, 1);
 	let snapshot = manager.compaction_manifest_snapshot();
 	let plan = CompactionPlan {
@@ -59984,6 +60107,7 @@ async fn reopen_covered_install_at(cut: lsm_driver::ControlLsmInstallCut) -> Cov
 		.expect("premise: the input's sidecar");
 	let cluster = control_cluster_observing(&[(1, &manager)]).await;
 	register_owner(&cluster.nodes[0], &manager).await;
+	seed_ring_keysets(&cluster.state_machines, &[&manager]).await;
 	let plain = Arc::new(op_committer(&cluster, 1));
 	let snapshot = manager.compaction_manifest_snapshot();
 	let plan = CompactionPlan {
@@ -60684,6 +60808,7 @@ async fn a_late_rename_holds_recovery_off_and_no_final_name_survives() {
 			.unwrap();
 	let cluster = control_cluster_observing(&[(1, &manager)]).await;
 	register_owner(&cluster.nodes[0], &manager).await;
+	seed_ring_keysets(&cluster.state_machines, &[&manager]).await;
 	let plain = Arc::new(op_committer(&cluster, 1));
 	let keys = [id(0xb11b01), id(0xb11b02)];
 	manager
@@ -61060,6 +61185,7 @@ async fn an_applied_replacement_tier_op_installs_its_generation_after_a_reopen()
 	let cluster = control_cluster_observing(&[]).await;
 	mgr.bind_control_node(1).unwrap();
 	register_owner(&cluster.nodes[0], &mgr).await;
+	seed_ring_keysets(&cluster.state_machines, &[&mgr]).await;
 	let plain = Arc::new(op_committer(&cluster, 1));
 	let index = mgr.require_op_index().unwrap();
 	let first = index
@@ -61169,6 +61295,7 @@ async fn reopenable_reservation_store(
 			.unwrap();
 	let cluster = control_cluster_observing(&[(1, &mgr)]).await;
 	register_owner(&cluster.nodes[0], &mgr).await;
+	seed_ring_keysets(&cluster.state_machines, &[&mgr]).await;
 	let plain = Arc::new(op_committer(&cluster, 1));
 	(dir, mgr, owner, cluster, plain)
 }
@@ -61905,6 +62032,7 @@ async fn reopen_zero_output_install_at(
 			.unwrap();
 	let cluster = control_cluster_observing(&[(1, &manager)]).await;
 	register_owner(&cluster.nodes[0], &manager).await;
+	seed_ring_keysets(&cluster.state_machines, &[&manager]).await;
 	let plain = Arc::new(op_committer(&cluster, 1));
 	let table_id = TableObjectId::new([0xd1; 16]);
 	let descriptor = append_only_retention_descriptor(table_id);
@@ -64083,6 +64211,7 @@ async fn certified_lsm_store(tag: &str) -> CertifiedLsmStore {
 	mgr.contain_version_reclamation();
 	let cluster = control_cluster_observing(&[(1, &mgr)]).await;
 	register_owner(&cluster.nodes[0], &mgr).await;
+	seed_ring_keysets(&cluster.state_machines, &[&mgr]).await;
 	let plain = Arc::new(op_committer(&cluster, 1));
 	let table = secondary_index_table_descriptor_for_test();
 	let keys = [1, 2, 3, 4, 5].map(|id| certified_lsm_identity(&table, id));
@@ -65139,6 +65268,7 @@ async fn certified_tier_store_located(
 		cluster
 	};
 	register_owner(&cluster.nodes[0], &mgr).await;
+	seed_ring_keysets(&cluster.state_machines, &[&mgr]).await;
 	if !observing {
 		mgr.bind_canonical_tier_source(cluster.state_machines[0].tier_snapshot_source_for_test());
 	}
@@ -66919,6 +67049,7 @@ async fn a_superseded_tier_op_over_a_removed_slab_hands_off_only_at_its_empty_po
 	let cluster = control_cluster_observing(&[]).await;
 	mgr.bind_control_node(1).unwrap();
 	register_owner(&cluster.nodes[0], &mgr).await;
+	seed_ring_keysets(&cluster.state_machines, &[&mgr]).await;
 	mgr.bind_canonical_tier_source(cluster.state_machines[0].tier_snapshot_source_for_test());
 	let plain = Arc::new(op_committer(&cluster, 1));
 	let index = mgr.require_op_index().unwrap();
@@ -67916,6 +68047,7 @@ async fn verification_never_publishes_a_pending_generation_the_canonical_state_d
 		let cluster = control_cluster_observing(&[]).await;
 		mgr.bind_control_node(1).unwrap();
 		register_owner(&cluster.nodes[0], &mgr).await;
+		seed_ring_keysets(&cluster.state_machines, &[&mgr]).await;
 		mgr.bind_canonical_tier_source(cluster.state_machines[0].tier_snapshot_source_for_test());
 		let plain = Arc::new(op_committer(&cluster, 1));
 		let index = mgr.require_op_index().unwrap();
@@ -68203,6 +68335,7 @@ async fn older_applied_tier_op_over_newer(restart: bool) {
 	let cluster = control_cluster_observing(&[]).await;
 	mgr.bind_control_node(1).unwrap();
 	register_owner(&cluster.nodes[0], &mgr).await;
+	seed_ring_keysets(&cluster.state_machines, &[&mgr]).await;
 	mgr.bind_canonical_tier_source(cluster.state_machines[0].tier_snapshot_source_for_test());
 	let plain = Arc::new(op_committer(&cluster, 1));
 	let index = mgr.require_op_index().unwrap();
@@ -68324,6 +68457,7 @@ async fn two_applied_tier_generations(install_newer: bool) -> TwoAppliedGenerati
 	let cluster = control_cluster_observing(&[]).await;
 	mgr.bind_control_node(1).unwrap();
 	register_owner(&cluster.nodes[0], &mgr).await;
+	seed_ring_keysets(&cluster.state_machines, &[&mgr]).await;
 	mgr.bind_canonical_tier_source(cluster.state_machines[0].tier_snapshot_source_for_test());
 	let plain = Arc::new(op_committer(&cluster, 1));
 	let index = mgr.require_op_index().unwrap();
@@ -68503,6 +68637,7 @@ async fn an_unknown_committed_standing_installs_nothing_and_hands_nothing_off() 
 	let cluster = control_cluster_observing(&[]).await;
 	mgr.bind_control_node(1).unwrap();
 	register_owner(&cluster.nodes[0], &mgr).await;
+	seed_ring_keysets(&cluster.state_machines, &[&mgr]).await;
 	mgr.bind_canonical_tier_source(cluster.state_machines[0].tier_snapshot_source_for_test());
 	let plain = Arc::new(op_committer(&cluster, 1));
 	let index = mgr.require_op_index().unwrap();
@@ -68738,6 +68873,7 @@ async fn a_failed_preparation_settles_under_fresh_authority_and_keeps_newer_defe
 	let cluster = control_cluster_observing(&[]).await;
 	mgr.bind_control_node(1).unwrap();
 	register_owner(&cluster.nodes[0], &mgr).await;
+	seed_ring_keysets(&cluster.state_machines, &[&mgr]).await;
 	mgr.bind_canonical_tier_source(cluster.state_machines[0].tier_snapshot_source_for_test());
 	let plain = Arc::new(op_committer(&cluster, 1));
 	let index = mgr.require_op_index().unwrap();
@@ -68916,6 +69052,7 @@ async fn a_contained_store_refuses_an_uncertified_retirement_before_allocation()
 	let cluster = control_cluster_observing(&[]).await;
 	mgr.bind_control_node(1).unwrap();
 	register_owner(&cluster.nodes[0], &mgr).await;
+	seed_ring_keysets(&cluster.state_machines, &[&mgr]).await;
 	let plain = op_committer(&cluster, 1);
 	mgr.contain_version_reclamation();
 	let error = crate::storage::sweeper::propose_tier_retirement(
