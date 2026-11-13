@@ -1514,6 +1514,31 @@ impl SlabManager {
 				{
 					return Ok(());
 				}
+				// ADR 0725: a first-tier candidate whose outcome was unknown and whose
+				// operation then ended Rejected can never become this slab's pointer,
+				// so waiting for it to go live would fence the slab for good. Its
+				// durable rejected-candidate row resolves the ambiguity instead. Only
+				// an Unresolved record qualifies (never one recorded as not submitted),
+				// only with that row, and nothing is deleted from the object store.
+				if uri == replacement
+					&& intent.state == RetainedObjectIntentState::Unresolved
+					&& self.unapplied_tier_pointer(slab_id).is_none()
+					&& self
+						.tier_pointer(slab_id)
+						.await
+						.as_ref()
+						.map(|p| p.l2_uri.as_str())
+						!= Some(replacement)
+					&& let Some(index) = self.persistent_index.as_ref()
+					&& index
+						.remove_standalone_rejected_provisional(slab_id, uri.clone())
+						.await?
+				{
+					self.unresolved_tier_cleanup.update(|intents| {
+						intents.snapshot.remove(&(slab_id, uri));
+					});
+					return Ok(());
+				}
 				if self.unapplied_tier_pointer(slab_id).is_some()
 					|| self
 						.tier_pointer(slab_id)

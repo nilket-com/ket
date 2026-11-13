@@ -1386,6 +1386,14 @@ impl WendelonDataServer {
 			}
 			DropReclaimPhase::TieredL2 => {
 				let committer = crate::storage::RaftCommitter::new(self.raft.clone());
+				// ADR 0725: a ParentDecisions store signs its slab operations, and
+				// reads its registration before allocating one. Today is unchanged.
+				let committer = match self.owner_authority() {
+					Some(authority) => committer
+						.with_state_machine(self.state_machine.clone())
+						.with_owner_authority(Some(authority)),
+					None => committer,
+				};
 				let report = self
 					.slab
 					.reclaim_table_drop_tiered_storage_slice(

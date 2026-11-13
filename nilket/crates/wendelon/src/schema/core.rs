@@ -2492,9 +2492,11 @@ pub const PRE_VERSIONING_FORMAT: u8 = 0;
 /// Every earlier version is refused, not upconverted.
 pub const SNAPSHOT_FORMAT_VERSION: u8 = 15;
 /// Snapshot format of a `ParentDecisions` store; see `consensus::decision_mode`.
-/// ADR 0720: 17, whose decision state carries the sealed membership (16 was ADR
-/// 0704 to ADR 0719's; 14 was ADR 0701 to ADR 0703's; 15 is Today's).
-pub const SNAPSHOT_FORMAT_VERSION_PARENT_DECISIONS: u8 = 17;
+/// ADR 0725: 18, the state of a log whose slab operations are owner-signed; it
+/// travels with the control-log format (17 was ADR 0720 to ADR 0724's, whose
+/// decision state carries the sealed membership; 16 was ADR 0704 to ADR 0719's;
+/// 14 was ADR 0701 to ADR 0703's; 15 is Today's).
+pub const SNAPSHOT_FORMAT_VERSION_PARENT_DECISIONS: u8 = 18;
 
 /// Shape of the Control Ring WAL record bodies this build writes, including the
 /// `postcard(Entry<..>)` payload of a log record. ADR 0697 version 6 carries
@@ -2504,10 +2506,13 @@ pub const SNAPSHOT_FORMAT_VERSION_PARENT_DECISIONS: u8 = 17;
 /// is refused, not upconverted.
 pub const WAL_FORMAT_VERSION: u8 = 15;
 /// Control-log format of a `ParentDecisions` store; see `consensus::decision_mode`.
-/// ADR 0720: 17, written only by stores that seal their membership at the first
-/// admitted write (16 was ADR 0704 to ADR 0719's; 14 was ADR 0701 to ADR 0703's;
-/// 15 is Today's).
-pub const WAL_FORMAT_VERSION_PARENT_DECISIONS: u8 = 17;
+/// ADR 0725: 18, whose slab operations are owner-signed (`OwnerOp`) and whose
+/// bare slab operations are refused at apply. A format-17 log may hold bare
+/// operations that applied, so it is refused whole, never replayed under the
+/// new rule (17 was ADR 0720 to ADR 0724's, written by stores that seal their
+/// membership at the first admitted write; 16 was ADR 0704 to ADR 0719's; 14
+/// was ADR 0701 to ADR 0703's; 15 is Today's).
+pub const WAL_FORMAT_VERSION_PARENT_DECISIONS: u8 = 18;
 
 // Static assertions to ensure all our size calculations remain exactly correct
 const _: () = assert!(std::mem::size_of::<HybridTimestamp>() == 16);

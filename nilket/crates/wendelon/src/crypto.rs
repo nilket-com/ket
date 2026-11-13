@@ -5254,6 +5254,47 @@ struct DevRootKekProvider {
 	key: LockedKeyMaterial,
 }
 
+/// Test-only (ADR 0725): one fresh development root KEK for the members of one
+/// test cluster, so the tenant KEK one of them installs can be unwrapped by
+/// each. A member is enrolled by its fresh data directory before it first
+/// opens; its provider then creates its root from this material instead of a
+/// random one, through the ordinary persist path. Nothing else is shared: store
+/// identities, signing keys, logs and indexes stay each node's own. The product
+/// neither provisions nor checks such a common root for real daemon members.
+#[cfg(test)]
+pub(crate) mod common_dev_root_for_test {
+	use super::KeyMaterialBytes;
+	use std::collections::HashMap;
+	use std::path::{Path, PathBuf};
+	use std::sync::Mutex;
+
+	static ENROLLED: Mutex<Option<HashMap<PathBuf, KeyMaterialBytes>>> = Mutex::new(None);
+
+	/// A fresh root for one test cluster. It has no accessor and no `Debug`.
+	pub(crate) struct CommonDevRoot(KeyMaterialBytes);
+
+	impl CommonDevRoot {
+		pub(crate) fn fresh() -> Self {
+			Self(KeyMaterialBytes::random().expect("random key material"))
+		}
+
+		/// Enrolls the member whose fresh data directory is `data_dir`.
+		pub(crate) fn enroll(&self, data_dir: &Path) {
+			let copy = KeyMaterialBytes::copy_from_slice(self.0.as_ref(), "dev root KEK")
+				.expect("a root KEK copies");
+			ENROLLED
+				.lock()
+				.unwrap()
+				.get_or_insert_with(HashMap::new)
+				.insert(data_dir.to_path_buf(), copy);
+		}
+	}
+
+	pub(super) fn take(data_dir: &Path) -> Option<KeyMaterialBytes> {
+		ENROLLED.lock().unwrap().as_mut()?.remove(data_dir)
+	}
+}
+
 impl DevRootKekProvider {
 	#[cfg(any(test, not(feature = "fips")))]
 	fn from_dev_insecure_dir(data_dir: &Path) -> std::io::Result<Self> {
@@ -5267,7 +5308,13 @@ impl DevRootKekProvider {
 			RootKekBootstrapMode::GenerateOrCreate => match read_dev_insecure_root_kek(&path) {
 				Ok(key) => key,
 				Err(error) if error.kind() == ErrorKind::NotFound => {
+					#[cfg(not(test))]
 					let key = KeyMaterialBytes::random()?;
+					#[cfg(test)]
+					let key = match common_dev_root_for_test::take(init.data_dir) {
+						Some(enrolled) => enrolled,
+						None => KeyMaterialBytes::random()?,
+					};
 					let persist = {
 						let _permit = init
 							.owner

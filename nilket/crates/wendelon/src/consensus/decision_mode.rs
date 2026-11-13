@@ -27,7 +27,7 @@ use crate::schema::{
 /// older binaries do not read it, and for them that record is the boundary.
 const MODE_MARKER: &str = "PARENT_DECISIONS";
 const MODE_MARKER_TMP: &str = ".PARENT_DECISIONS.tmp";
-const MODE_MARKER_BYTES: &[u8] = b"parent-decisions-v9\n";
+const MODE_MARKER_BYTES: &[u8] = b"parent-decisions-v10\n";
 /// S1's development marker. Its stores hold format-9 records, whose bodies were
 /// today's; no conversion exists, so both authorities refuse it as malformed.
 #[cfg(test)]
@@ -64,6 +64,12 @@ const RETIRED_MARKER_BYTES_V7: &[u8] = b"parent-decisions-v7\n";
 /// never read as unsealed; it stays readable by its own binary.
 #[cfg(test)]
 const RETIRED_MARKER_BYTES_V8: &[u8] = b"parent-decisions-v8\n";
+/// ADR 0720 to ADR 0724's marker, for stores holding format-17 records, whose
+/// slab operations are bare (ADR 0725 takes only owner-signed ones). Such a log
+/// would replay to another state under the new rule, so it is refused whole; it
+/// stays readable by its own binary.
+#[cfg(test)]
+const RETIRED_MARKER_BYTES_V9: &[u8] = b"parent-decisions-v9\n";
 
 /// Today's HRFT envelope version, which every other frame uses.
 pub(crate) const RAFT_FRAME_VERSION_TODAY: u8 = 1;
@@ -74,8 +80,10 @@ pub(crate) const RAFT_FRAME_VERSION_TODAY: u8 = 1;
 /// tier provenance, ADR 0704), 8 was ADR 0704 to ADR 0719's (no sealed
 /// membership, ADR 0720) and 9 was ADR 0720's (a forwarded signer binding
 /// without the sender's key, and forwarded proposals outside this envelope,
-/// ADR 0721); their peers decode other encodings, so every build refuses them.
-pub(crate) const RAFT_FRAME_VERSION_PARENT_DECISIONS: u8 = 10;
+/// ADR 0721) and 10 was ADR 0721 to ADR 0724's (bare slab operations, and no
+/// forwarded owner operation, ADR 0725); their peers decode other encodings,
+/// so every build refuses them.
+pub(crate) const RAFT_FRAME_VERSION_PARENT_DECISIONS: u8 = 11;
 
 /// ADR 0721: the frames that may carry the `ParentDecisions` envelope: the Raft
 /// frames and a forwarded decision proposal with its answer. This classifies an
@@ -363,11 +371,12 @@ mod tests {
 		assert!(mode.wal_format() > WAL_FORMAT_VERSION);
 		assert_eq!(
 			(mode.wal_format(), mode.snapshot_format()),
-			(17, 17),
+			(18, 18),
 			"S1's 9, S2's 10, S3's 11, S4b's 12, S5a to ADR 0700's 13, ADR 0701 to ADR \
-			 0703's 14 and ADR 0704 to ADR 0719's 16 are retired; 15 is Today's"
+			 0703's 14, ADR 0704 to ADR 0719's 16 and ADR 0720 to ADR 0724's 17 are \
+			 retired; 15 is Today's"
 		);
-		assert_eq!(mode.raft_frame_version(), 10);
+		assert_eq!(mode.raft_frame_version(), 11);
 		assert!(mode.snapshot_format() > SNAPSHOT_FORMAT_VERSION);
 		assert_ne!(mode.raft_frame_version(), 1);
 		assert!(mode.refuses_service());
@@ -377,7 +386,7 @@ mod tests {
 	fn a_frame_or_joiner_from_the_other_authority_is_refused_both_ways() {
 		let (today, new) = (DecisionMode::Today, DecisionMode::ParentDecisions);
 		today.check_raft_frame(1).unwrap();
-		new.check_raft_frame(10).unwrap();
+		new.check_raft_frame(11).unwrap();
 		// ADR 0701: an ADR 0700 peer's version-6 frames are refused before decode;
 		// ADR 0704: so are an ADR 0701 to ADR 0703 peer's version-7 frames; ADR
 		// 0720: so are an ADR 0704 to ADR 0719 peer's version-8 frames.
@@ -386,6 +395,8 @@ mod tests {
 		assert!(new.check_raft_frame(8).is_err());
 		// ADR 0721: and an ADR 0720 peer's version-9 frames.
 		assert!(new.check_raft_frame(9).is_err());
+		// ADR 0725: and an ADR 0721 to ADR 0724 peer's version-10 frames.
+		assert!(new.check_raft_frame(10).is_err());
 		for retired in [2, 3, 4, 5] {
 			assert!(
 				new.check_raft_frame(retired).is_err(),
@@ -394,7 +405,7 @@ mod tests {
 			assert!(today.check_raft_frame(retired).is_err());
 		}
 		assert_eq!(
-			today.check_raft_frame(10).unwrap_err().kind(),
+			today.check_raft_frame(11).unwrap_err().kind(),
 			ErrorKind::PermissionDenied
 		);
 		assert_eq!(
@@ -427,17 +438,17 @@ mod tests {
 		use crate::network::wire::validate_frame_version;
 		use crate::schema::MsgType;
 		validate_frame_version(1, MsgType::READ_RESP.0).unwrap();
-		validate_frame_version(10, MsgType::VOTE_REQ.0).unwrap();
-		validate_frame_version(10, MsgType::APPEND_ENTRIES_RESP.0).unwrap();
+		validate_frame_version(11, MsgType::VOTE_REQ.0).unwrap();
+		validate_frame_version(11, MsgType::APPEND_ENTRIES_RESP.0).unwrap();
 		// ADR 0721: a forwarded decision proposal and its answer carry it too.
-		validate_frame_version(10, MsgType::DECISION_PROPOSE_REQ.0).unwrap();
-		validate_frame_version(10, MsgType::DECISION_PROPOSE_RESP.0).unwrap();
-		assert!(validate_frame_version(10, MsgType::READ_RESP.0).is_err());
-		assert!(validate_frame_version(10, MsgType::TABLE_WRITE_REQ.0).is_err());
-		assert!(validate_frame_version(10, MsgType::LEASES_REQ.0).is_err());
-		assert!(validate_frame_version(10, MsgType::DECISION_LOOKUP_REQ.0).is_err());
-		assert!(validate_frame_version(10, MsgType::DECISION_CUT_REQ.0).is_err());
-		for retired in [2, 3, 4, 5, 6, 7, 8, 9] {
+		validate_frame_version(11, MsgType::DECISION_PROPOSE_REQ.0).unwrap();
+		validate_frame_version(11, MsgType::DECISION_PROPOSE_RESP.0).unwrap();
+		assert!(validate_frame_version(11, MsgType::READ_RESP.0).is_err());
+		assert!(validate_frame_version(11, MsgType::TABLE_WRITE_REQ.0).is_err());
+		assert!(validate_frame_version(11, MsgType::LEASES_REQ.0).is_err());
+		assert!(validate_frame_version(11, MsgType::DECISION_LOOKUP_REQ.0).is_err());
+		assert!(validate_frame_version(11, MsgType::DECISION_CUT_REQ.0).is_err());
+		for retired in [2, 3, 4, 5, 6, 7, 8, 9, 10] {
 			assert!(
 				validate_frame_version(retired, MsgType::DECISION_PROPOSE_REQ.0).is_err(),
 				"retired envelope {retired} on a forwarded proposal"
@@ -447,7 +458,7 @@ mod tests {
 				"retired envelope {retired}"
 			);
 		}
-		assert!(validate_frame_version(11, MsgType::VOTE_REQ.0).is_err());
+		assert!(validate_frame_version(12, MsgType::VOTE_REQ.0).is_err());
 		// The classifier is an envelope family, not Raft dispatch.
 		assert!(!is_raft_frame(MsgType::DECISION_PROPOSE_REQ.0));
 		assert!(carries_decision_envelope(MsgType::DECISION_PROPOSE_REQ.0));
@@ -460,17 +471,18 @@ mod tests {
 		let (today, new) = (DecisionMode::Today, DecisionMode::ParentDecisions);
 		let vote = MsgType::VOTE_RESP.0;
 		today.check_raft_response(1, vote, vote).unwrap();
-		new.check_raft_response(10, vote, vote).unwrap();
+		new.check_raft_response(11, vote, vote).unwrap();
 		assert!(new.check_raft_response(6, vote, vote).is_err());
 		assert!(new.check_raft_response(7, vote, vote).is_err());
 		assert!(new.check_raft_response(8, vote, vote).is_err());
 		assert!(new.check_raft_response(9, vote, vote).is_err());
-		assert!(today.check_raft_response(10, vote, vote).is_err());
+		assert!(new.check_raft_response(10, vote, vote).is_err());
+		assert!(today.check_raft_response(11, vote, vote).is_err());
 		for retired in [1, 2, 3, 4, 5] {
 			assert!(new.check_raft_response(retired, vote, vote).is_err());
 		}
 		assert!(
-			new.check_raft_response(10, MsgType::APPEND_ENTRIES_RESP.0, vote)
+			new.check_raft_response(11, MsgType::APPEND_ENTRIES_RESP.0, vote)
 				.is_err()
 		);
 	}
@@ -540,6 +552,7 @@ mod tests {
 			("adr0702-v6", 9),
 			("adr0703-v7", 10),
 			("adr0719-v8", 11),
+			("adr0724-v9", 12),
 			("directory", 2),
 			("symlink", 3),
 		] {
@@ -547,7 +560,7 @@ mod tests {
 			let marker = dir.join(MODE_MARKER);
 			match make {
 				0 => fs::write(&marker, b"").unwrap(),
-				1 => fs::write(&marker, b"parent-decisions-v10\n").unwrap(),
+				1 => fs::write(&marker, b"parent-decisions-v11\n").unwrap(),
 				4 => fs::write(&marker, RETIRED_MARKER_BYTES_V1).unwrap(),
 				5 => fs::write(&marker, RETIRED_MARKER_BYTES_V2).unwrap(),
 				6 => fs::write(&marker, RETIRED_MARKER_BYTES_V3).unwrap(),
@@ -556,6 +569,7 @@ mod tests {
 				9 => fs::write(&marker, RETIRED_MARKER_BYTES_V6).unwrap(),
 				10 => fs::write(&marker, RETIRED_MARKER_BYTES_V7).unwrap(),
 				11 => fs::write(&marker, RETIRED_MARKER_BYTES_V8).unwrap(),
+				12 => fs::write(&marker, RETIRED_MARKER_BYTES_V9).unwrap(),
 				2 => fs::create_dir(&marker).unwrap(),
 				_ => {
 					fs::write(dir.join("target"), MODE_MARKER_BYTES).unwrap();

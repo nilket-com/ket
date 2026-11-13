@@ -25,9 +25,21 @@ impl OpDriver {
 		// §6 step 4: a follower resolves nothing. With unresolved rows it says so; a
 		// clean follower is not made unready by being a follower.
 		if !self.committer.should_propose() {
-			let unresolved = !index.load_op_intents().await?.is_empty();
-			self.slab.note_awaiting_leadership(unresolved);
-			return Ok(());
+			// ADR 0725: a follower that may offload resolves, hands off and
+			// acknowledges its own first publications. Every other intent still
+			// waits for leadership, and is still reported as waiting.
+			let intents = index.load_op_intents().await?;
+			let leader_only = intents.iter().any(|loaded| match loaded {
+				LoadedOp::Submittable(ticket) => !ticket.command().is_first_publication(),
+				LoadedOp::Reserved(_) => true,
+			});
+			if !self.committer.may_offload() {
+				self.slab
+					.note_awaiting_leadership(leader_only || !intents.is_empty());
+				return Ok(());
+			}
+			self.slab.note_awaiting_leadership(leader_only);
+			return self.drive_offload_once().await;
 		}
 		self.slab.note_awaiting_leadership(false);
 		let owner = self.slab.owner_ref()?;
@@ -129,6 +141,57 @@ impl OpDriver {
 				state = ?holder.state,
 				"oldest operation holding the window"
 			);
+		}
+		unresolved.map_or(Ok(()), Err)
+	}
+
+	/// ADR 0725: a follower's pass. Of the operations a leader's pass drives it
+	/// takes only first publications: it resolves an abandoned one, hands off
+	/// what is durably complete, and acknowledges. Marks, removals, installs,
+	/// claims and reserved ids are untouched and keep waiting for leadership.
+	async fn drive_offload_once(&self) -> std::io::Result<()> {
+		let index = self.slab.require_op_index()?;
+		let owner = self.slab.owner_ref()?;
+		let mut unresolved = None;
+		if let Err(error) = self
+			.slab
+			.recover_abandoned_first_publications(self.committer.as_ref())
+			.await
+		{
+			unresolved.get_or_insert(error);
+		}
+		for loaded in index.load_op_intents().await? {
+			if let LoadedOp::Submittable(ticket) = loaded
+				&& ticket.command().is_first_publication()
+			{
+				self.slab
+					.hand_off_unowned_op_if_complete(ticket.key())
+					.await?;
+			}
+		}
+		// The reopen fence lifts as on the leader: only when no tier or retire
+		// intent of any kind is left, so a leader-only one keeps it raised.
+		self.slab.release_resolved_op_fence().await?;
+		let pending = index.load_ack_pending().await?;
+		let unacked: Vec<u64> = pending
+			.iter()
+			.filter(|(_, acked)| !acked)
+			.map(|(seq, _)| *seq)
+			.take(OPS_WINDOW_W as usize)
+			.collect();
+		if !unacked.is_empty() {
+			let receipt = self.committer.ack_outcomes(owner, unacked.clone()).await?;
+			if !crate::storage::sweeper::ack_receipt_answers(&receipt, owner, &unacked) {
+				return Err(std::io::Error::other(format!(
+					"an Ack receipt does not answer {owner:?}'s batch: {receipt:?}"
+				)));
+			}
+			index.mark_ops_acked(receipt.accepted).await?;
+		}
+		if !pending.is_empty()
+			&& let Some(prefix) = self.committer.op_prefix(owner).await?
+		{
+			index.advance_known_acked_through(prefix).await?;
 		}
 		unresolved.map_or(Ok(()), Err)
 	}

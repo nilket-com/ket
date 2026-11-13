@@ -1226,6 +1226,17 @@ impl WendelonDataServer {
 		self
 	}
 
+	/// ADR 0725: what this store signs and sends its own slab operations with,
+	/// in ParentDecisions mode. `None` under today's authority.
+	pub(crate) fn owner_authority(&self) -> Option<crate::storage::OwnerAuthority> {
+		let signer = self.decisions.signer.as_ref()?;
+		let proposals = self.decisions.proposals.clone()?;
+		Some(crate::storage::OwnerAuthority::new(
+			signer.key.clone(),
+			proposals,
+		))
+	}
+
 	/// Test-only: the node's decision proposals.
 	#[cfg(test)]
 	pub(crate) fn decision_proposals_for_test(

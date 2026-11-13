@@ -3991,8 +3991,10 @@ async fn certified_lsm_elides_the_obsolete_versions_on_the_leader() {
 		slab.slab_pin_table(),
 	)
 	.unwrap();
+	// ADR 0725: as the node's own committer is built, with its owner authority.
 	let committer = crate::storage::RaftCommitter::new(cluster.node(leader).raft.clone())
-		.with_state_machine(cluster.node(leader).state_machine.clone());
+		.with_state_machine(cluster.node(leader).state_machine.clone())
+		.with_owner_authority(cluster.node(leader).data_server.owner_authority());
 	let at = HybridTimestamp {
 		physical_ms: now + 120_000,
 		logical: 0,
@@ -4254,8 +4256,10 @@ async fn certified_tier_cleanup_rewrites_and_retires_the_leaders_tiered_slabs() 
 		}
 		if tokio::time::Instant::now() >= deadline {
 			// What the step answers now, for the failure's cause.
+			// ADR 0725: as the node's own committer is built, with its owner authority.
 			let committer = crate::storage::RaftCommitter::new(cluster.node(leader).raft.clone())
-				.with_state_machine(cluster.node(leader).state_machine.clone());
+				.with_state_machine(cluster.node(leader).state_machine.clone())
+				.with_owner_authority(cluster.node(leader).data_server.owner_authority());
 			let answer = server.certified_tier_step(&committer).await;
 			panic!("S1 rewritten {rewritten}, S2 retired {retired}; the step answers {answer:?}");
 		}
@@ -4508,8 +4512,10 @@ async fn a_certified_rewrite_never_reissues_a_pruned_rows_location() {
 	jump_floor(&cluster, now + 60_000).await;
 	until_active(&cluster, 1).await;
 	expect_everywhere(&cluster, &descriptor, &expected, "before the step").await;
+	// ADR 0725: as the node's own committer is built, with its owner authority.
 	let committer = crate::storage::RaftCommitter::new(cluster.node(leader).raft.clone())
-		.with_state_machine(cluster.node(leader).state_machine.clone());
+		.with_state_machine(cluster.node(leader).state_machine.clone())
+		.with_owner_authority(cluster.node(leader).data_server.owner_authority());
 	let source_end = slab
 		.tier_object_layout_for_test(&source)
 		.await
@@ -6573,6 +6579,9 @@ mod write_deadline;
 
 #[path = "parent_decisions_cluster_tests/attempt_exhaustion.rs"]
 mod attempt_exhaustion;
+
+#[path = "parent_decisions_cluster_tests/offload.rs"]
+mod offload;
 
 // ============================================================
 //  ADR 0720: MEMBERSHIP IS FIXED ONCE A WRITE IS ADMITTED

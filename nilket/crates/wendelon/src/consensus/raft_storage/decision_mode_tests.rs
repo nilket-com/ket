@@ -217,6 +217,11 @@ async fn a_new_mode_store_writes_its_own_format_and_reopens() {
 
 use crate::consensus::decisions::tests as fixture;
 
+const PARENT_DECISIONS_V18_MANIFEST: &str =
+	include_str!("../../../tests/fixtures/consensus_body/parent_decisions_v18.txt");
+/// ADR 0720 to ADR 0724's format-17 bodies, retained. ADR 0725 only appended a
+/// variant, so every format-17 body is unchanged; what changed is how a bare
+/// slab operation applies.
 const PARENT_DECISIONS_V17_MANIFEST: &str =
 	include_str!("../../../tests/fixtures/consensus_body/parent_decisions_v17.txt");
 /// ADR 0704 to ADR 0719's format-16 bodies, retained: a decision state with no
@@ -247,7 +252,67 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 fn manifest() -> BTreeMap<String, String> {
-	parse(PARENT_DECISIONS_V17_MANIFEST)
+	parse(PARENT_DECISIONS_V18_MANIFEST)
+}
+
+/// ADR 0725: the three owner-signed operation kinds pinned in the format-18
+/// corpus, each signed by its owner's key (Ed25519 signatures are deterministic).
+fn golden_owner_ops() -> [(&'static str, WendelonRequest); 3] {
+	use crate::consensus::owner_ops::SignedOwnerOp;
+	use crate::consensus::slab_ops::{CancelOp, OpKey};
+	let signer = fixture::signer(1);
+	let owner = crate::consensus::OwnerRef::new(signer.node, signer.incarnation);
+	let key = fixture::test_key(1);
+	let (_, WendelonRequest::SlabOp(tier)) = golden_first_publication(owner) else {
+		unreachable!("the golden first publication is a slab operation")
+	};
+	let cancel = CancelOp {
+		key: OpKey { owner, op_seq: 7 },
+		target_digest: tier.command.digest(),
+	};
+	[
+		(
+			"owner_op_submit",
+			WendelonRequest::OwnerOp(SignedOwnerOp::submit_for_test(&key, tier)),
+		),
+		(
+			"owner_op_cancel",
+			WendelonRequest::OwnerOp(SignedOwnerOp::cancel_for_test(&key, cancel)),
+		),
+		(
+			"owner_op_ack",
+			WendelonRequest::OwnerOp(SignedOwnerOp::ack(&key, owner, vec![7, 9])),
+		),
+	]
+}
+
+/// A slab's first, uncertified tier pointer as operation 7 of `owner`.
+fn golden_first_publication(owner: crate::consensus::OwnerRef) -> (u64, WendelonRequest) {
+	use crate::consensus::slab_ops::{SlabCommand, SlabOp, TierOp};
+	let tier = TieredSlab {
+		slab: owner.slab(crate::schema::SlabId::new(7)),
+		l2_uri: "l2://slab/7/first".to_string(),
+		payload_hash: [0x77; 32],
+		is_encrypted: false,
+		tenant_id: None,
+		tenant_kek_id: None,
+		stats_format_version: None,
+		stats_block_len: None,
+		stats_block_hash128: None,
+		tombstone_metadata: crate::schema::TombstoneMetadata::default(),
+		supersession_metadata: crate::schema::SupersessionMetadata::default(),
+		certified: None,
+	};
+	(
+		7,
+		WendelonRequest::SlabOp(SlabOp {
+			op_seq: 7,
+			command: SlabCommand::Tier(TierOp {
+				tier,
+				replaces: None,
+			}),
+		}),
+	)
 }
 
 /// ADR 0704: the certified Tier and Retire pinned in the format-16 corpus, each
@@ -345,7 +410,7 @@ fn entry(index: u64, request: WendelonRequest) -> Entry<WendelonTypeConfig> {
 }
 
 #[test]
-fn the_format_17_bodies_match_their_goldens_and_round_trip() {
+fn the_format_18_bodies_match_their_goldens_and_round_trip() {
 	let stored = manifest();
 	let state = golden_state();
 	let body = encode_state_body(DecisionMode::ParentDecisions, &state).unwrap();
@@ -378,6 +443,12 @@ fn the_format_17_bodies_match_their_goldens_and_round_trip() {
 			hex(&postcard::to_stdvec(&request).unwrap()),
 		));
 	}
+	for (name, request) in golden_owner_ops() {
+		actual.push((
+			name.to_owned(),
+			hex(&postcard::to_stdvec(&request).unwrap()),
+		));
+	}
 	let moved: Vec<String> = actual
 		.iter()
 		.filter(|(name, hex)| stored.get(name) != Some(hex))
@@ -385,7 +456,7 @@ fn the_format_17_bodies_match_their_goldens_and_round_trip() {
 		.collect();
 	assert!(
 		moved.is_empty(),
-		"format-17 bodies moved or are missing; expected lines:\n{}",
+		"format-18 bodies moved or are missing; expected lines:\n{}",
 		moved.join("\n")
 	);
 	assert_eq!(stored.len(), actual.len());
@@ -399,8 +470,15 @@ fn the_format_17_bodies_match_their_goldens_and_round_trip() {
 	// only the decision state differs from the format-16 corpus: by exactly the
 	// appended seal.
 	assert!(decisions.sealed().is_some());
+	// ADR 0725: every format-17 body is unchanged, and only the three
+	// owner-signed operations are new.
+	let retained_v17 = parse(PARENT_DECISIONS_V17_MANIFEST);
+	for (name, hex) in &retained_v17 {
+		assert_eq!(stored.get(name), Some(hex), "{name}");
+	}
+	assert_eq!(stored.len(), retained_v17.len() + 3);
 	let retained_v16 = parse(PARENT_DECISIONS_V16_MANIFEST);
-	assert_eq!(stored.len(), retained_v16.len());
+	assert_eq!(retained_v17.len(), retained_v16.len());
 	for (name, hex) in &retained_v16 {
 		if name == "decisions_golden_history" {
 			let now = &stored[name];
@@ -431,7 +509,7 @@ fn the_format_17_bodies_match_their_goldens_and_round_trip() {
 			assert_eq!(stored.get(name), Some(hex), "{name}");
 		}
 	}
-	assert_eq!(stored.len(), retained_v14.len() + 2);
+	assert_eq!(retained_v17.len(), retained_v14.len() + 2);
 	assert_eq!(retained_v14.len(), retained.len() + 1);
 }
 
@@ -510,7 +588,8 @@ async fn s1_s2_and_s3_development_artifacts_are_refused_by_both_authorities() {
 	// converted: each is refused before replay or decode, files unchanged. ADR
 	// 0704 gave Today 15, not 9, so no authority ever reuses a retired number.
 	// ADR 0720 retired 16, whose decision state records no sealed membership.
-	for retired in [9u8, 10, 11, 12, 13, 14, 16] {
+	// ADR 0725 retired 17, whose logs may hold bare slab operations that applied.
+	for retired in [9u8, 10, 11, 12, 13, 14, 16, 17] {
 		let dir = crate::test_support::TestDir::new(&format!("decision-retired-wal-{retired}"));
 		let page = serialize_entry_page_as(&blank(1), retired).unwrap();
 		let wal = write_segment(&dir, &[page]);

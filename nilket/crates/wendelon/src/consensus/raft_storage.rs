@@ -4776,12 +4776,10 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 				}
 				// Owner admission runs before the pre-hook: a retirement the
 				// state machine will refuse must have no local effect.
-				if let EntryPayload::Normal(WendelonRequest::SlabOp(op)) = &entry.payload
-					&& let Some((slab, registry)) = slab_op_apply::op_retirement(
-						&guard.state,
-						op,
-						entry.log_id.leader_id.node_id,
-					) && let Some(observer) = self.tier_observer.as_ref()
+				if let EntryPayload::Normal(request) = &entry.payload
+					&& let Some((slab, registry)) =
+						admitted_retirement(&guard.state, request, entry.log_id.leader_id.node_id)
+					&& let Some(observer) = self.tier_observer.as_ref()
 				{
 					observer.before_slab_retired(slab, &registry, entry.log_id.index);
 				}
@@ -5387,8 +5385,49 @@ fn validate_slab_identity_state(state: &SmState) -> Result<(), String> {
 	Ok(())
 }
 
+/// The retirement `request` will apply, for the pre-apply hook: exactly the
+/// admission apply itself runs. ADR 0725: in a `ParentDecisions` store that is
+/// a verified owner operation, and a bare one retires nothing.
+fn admitted_retirement(
+	state: &SmState,
+	request: &WendelonRequest,
+	leader_node: u32,
+) -> Option<(SlabRef, IncarnationRegistry)> {
+	match request {
+		WendelonRequest::SlabOp(op) if state.decisions.is_none() => {
+			slab_op_apply::op_retirement(state, op, leader_node)
+		}
+		WendelonRequest::OwnerOp(signed) => {
+			let verified = verify_owner_op(state, signed).ok()?;
+			let admitting = verified.admitting_leader(leader_node);
+			match verified.into_op() {
+				crate::consensus::owner_ops::OwnerOp::Submit(op) => {
+					slab_op_apply::op_retirement(state, &op, admitting)
+				}
+				_ => None,
+			}
+		}
+		_ => None,
+	}
+}
+
+/// ADR 0725: the verified form of an owner-signed operation, or its refusal.
+/// A store on today's authority has no signer registry and refuses it whole.
+fn verify_owner_op(
+	state: &SmState,
+	signed: &crate::consensus::owner_ops::SignedOwnerOp,
+) -> Result<crate::consensus::owner_ops::VerifiedOwnerOp, SlabRefusal> {
+	let decisions = state
+		.decisions
+		.as_ref()
+		.ok_or(SlabRefusal::OwnerOpNotInMode)?;
+	crate::consensus::owner_ops::verify(decisions, signed)
+}
+
 /// ADR 0697: a slab command is admitted only from its owner node's leader
 /// entry, for that node's current incarnation. Checked before any effect.
+/// ADR 0725: for a verified owner operation the caller passes
+/// `VerifiedOwnerOp::admitting_leader`, never the entry's leader directly.
 fn admit_slab_owner(
 	state: &SmState,
 	owner: OwnerRef,
@@ -5752,16 +5791,19 @@ fn raft_audit_event_with_context(
 		WendelonRequest::RetiredTierSlab(never)
 		| WendelonRequest::RetiredRetireTieredSlab(never)
 		| WendelonRequest::RetiredCompactionCommit(never) => match *never {},
-		WendelonRequest::CancelOp(_) | WendelonRequest::AckOutcomes(_) => None,
-		WendelonRequest::SlabOp(op)
-			if !matches!(op.command, crate::consensus::slab_ops::SlabCommand::Compaction(_)) =>
-		{
-			None
-		}
-		WendelonRequest::SlabOp(crate::consensus::slab_ops::SlabOp {
-			command: crate::consensus::slab_ops::SlabCommand::Compaction(commit),
-			..
-		}) => {
+		WendelonRequest::CancelOp(_)
+		| WendelonRequest::AckOutcomes(_)
+		| WendelonRequest::SlabOp(_)
+		| WendelonRequest::OwnerOp(_) => {
+			// Only a compaction commit is audited, bare or owner-signed (ADR 0725).
+			let command = match req {
+				WendelonRequest::SlabOp(op) => Some(&op.command),
+				WendelonRequest::OwnerOp(signed) => signed.claimed_command(),
+				_ => None,
+			};
+			let Some(crate::consensus::slab_ops::SlabCommand::Compaction(commit)) = command else {
+				return None;
+			};
 			let op = if is_err {
 				AuditOperation::LsmInvariantViolation
 			} else {
@@ -6757,6 +6799,39 @@ fn apply_request_at_log_index(
 			)),
 			None,
 		),
+		// ADR 0725: a `ParentDecisions` store takes a slab operation only as its
+		// owner's signed one. A bare operation gains nothing from that mode's
+		// follower surface: it is refused before any lookup.
+		WendelonRequest::SlabOp(_)
+		| WendelonRequest::CancelOp(_)
+		| WendelonRequest::AckOutcomes(_)
+			if state.decisions.is_some() =>
+		{
+			(
+				WendelonResponse::Refused(SlabRefusal::OwnerOpUnsigned),
+				None,
+			)
+		}
+		WendelonRequest::OwnerOp(signed) => {
+			let verified = match verify_owner_op(state, &signed) {
+				Ok(verified) => verified,
+				Err(refusal) => return (WendelonResponse::Refused(refusal), None),
+			};
+			let admitting = verified.admitting_leader(leader_node);
+			match verified.into_op() {
+				crate::consensus::owner_ops::OwnerOp::Submit(op) => {
+					slab_op_apply::apply_slab_op(state, op, entry_log_index, admitting)
+				}
+				crate::consensus::owner_ops::OwnerOp::Cancel(cancel) => (
+					slab_op_apply::apply_cancel_op(state, cancel, entry_log_index, admitting),
+					None,
+				),
+				crate::consensus::owner_ops::OwnerOp::Ack(ack) => (
+					slab_op_apply::apply_ack_outcomes(state, ack, admitting),
+					None,
+				),
+			}
+		}
 		WendelonRequest::SlabOp(op) => {
 			slab_op_apply::apply_slab_op(state, op, entry_log_index, leader_node)
 		}
@@ -10079,6 +10154,7 @@ fn serialize_entry_page_as(
 		EntryPayload::Normal(WendelonRequest::CancelOp(_)) => (LogEntryKind::APPEND, 0),
 		EntryPayload::Normal(WendelonRequest::AckOutcomes(_)) => (LogEntryKind::APPEND, 0),
 		EntryPayload::Normal(WendelonRequest::Decision(_)) => (LogEntryKind::APPEND, 0),
+		EntryPayload::Normal(WendelonRequest::OwnerOp(_)) => (LogEntryKind::APPEND, 0),
 		EntryPayload::Normal(WendelonRequest::AcquireLeases(batch)) => (
 			LogEntryKind::APPEND,
 			batch.leases().first().map(|lease| lease.epoch).unwrap_or(0),
@@ -10663,6 +10739,10 @@ fn _unused_request_type_witness(_r: WendelonRequest, _s: WendelonResponse) {}
 #[cfg(test)]
 #[path = "raft_storage/decision_mode_tests.rs"]
 mod decision_mode_tests;
+
+#[cfg(test)]
+#[path = "raft_storage/owner_op_tests.rs"]
+mod owner_op_tests;
 
 #[cfg(test)]
 mod schema_state_tests {

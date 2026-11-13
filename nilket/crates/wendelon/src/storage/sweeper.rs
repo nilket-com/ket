@@ -196,6 +196,16 @@ pub trait TierCommitter: Send + Sync {
 		true
 	}
 
+	/// ADR 0725: whether this node may attempt to offload its own cold slabs
+	/// now: publish a sealed slab's first tier pointer, and recover, cancel and
+	/// acknowledge such operations. It is asked only by the sweeper's fresh
+	/// tiering and the operation driver. Every other autonomous slab operation
+	/// keeps asking [`Self::should_propose`]. A scheduling hint like it, never
+	/// authority.
+	fn may_offload(&self) -> bool {
+		self.should_propose()
+	}
+
 	/// Everything that must hold before a sequence is allocated for `owner`
 	/// (ADR 0697 §6): an operation allocated and then refused for a reason
 	/// known in advance would only hold its owner's window.
@@ -206,6 +216,10 @@ pub trait TierCommitter: Send + Sync {
 	/// Submit one operation and return its verified receipt. Returns only after
 	/// the local state machine applied the entry. A refusal, an anomaly and an
 	/// unknown outcome are errors; each retains the intent and grants no cleanup.
+	/// A receipt says what the ring decided and that this node applied through
+	/// that entry. It does not say the local effect is durable: an apply
+	/// observer's failure is logged, not returned, so handoff, acknowledgement
+	/// and cleanup stay with `SlabManager::hand_off_op_if_complete`.
 	async fn submit_op(&self, ticket: &OpTicket) -> std::io::Result<VerifiedReceipt>;
 
 	/// Close an operation by its original digest (ADR 0697 §5.4). The answer is
@@ -669,9 +683,33 @@ pub struct RaftCommitter {
 	/// The local state machine, to verify the proposer's incarnation is
 	/// current before each slab proposal (ADR 0697).
 	registry: Option<WendelonStateMachine>,
+	/// ADR 0725: set for a `ParentDecisions` store, whose slab operations are
+	/// owner-signed and may be appended by another node's leader.
+	owner_authority: Option<OwnerAuthority>,
 	#[cfg(test)]
 	submit_without_role_check: bool,
 }
+
+/// ADR 0725: what a `ParentDecisions` store signs and sends its own slab
+/// operations with.
+#[derive(Clone)]
+pub struct OwnerAuthority {
+	key: ed25519_dalek::SigningKey,
+	channel: Arc<dyn crate::consensus::owner_ops::OwnerOpChannel>,
+}
+
+impl OwnerAuthority {
+	pub(crate) fn new(
+		key: ed25519_dalek::SigningKey,
+		channel: Arc<dyn crate::consensus::owner_ops::OwnerOpChannel>,
+	) -> Self {
+		Self { key, channel }
+	}
+}
+
+/// ADR 0725: the bound on one owner operation, from proposing it to this node
+/// having applied it, and on one read barrier. Past it the outcome is unknown.
+pub(crate) const OWNER_OP_ATTEMPT_BOUND: Duration = Duration::from_secs(10);
 
 /// The state machine refused a slab command without applying or recording
 /// anything (ADR 0697). Not an outcome: it grants no cleanup authority, marks
@@ -708,9 +746,131 @@ impl RaftCommitter {
 		Self {
 			raft,
 			registry: None,
+			owner_authority: None,
 			#[cfg(test)]
 			submit_without_role_check: false,
 		}
+	}
+
+	/// ADR 0725: sign every slab operation as its owner and send it through
+	/// `authority`'s channel. Required for a `ParentDecisions` store, whose
+	/// state machine refuses a bare slab operation.
+	pub fn with_owner_authority(mut self, authority: Option<OwnerAuthority>) -> Self {
+		self.owner_authority = authority;
+		self
+	}
+
+	/// ADR 0725: `owner` is registered as its node's current incarnation and
+	/// its decision key is bound. A `ParentDecisions` node's maintenance does
+	/// both through the proposal path; this only reads, so an operation is not
+	/// allocated for an owner whose signature could not verify yet.
+	async fn require_registered_and_bound(
+		&self,
+		owner: crate::consensus::OwnerRef,
+	) -> std::io::Result<()> {
+		let Some(state_machine) = &self.registry else {
+			return Err(std::io::Error::new(
+				std::io::ErrorKind::WouldBlock,
+				TierCommitNotSubmitted("this committer has no state machine to read".into()),
+			));
+		};
+		let (current, bound) = state_machine
+			.read_state(move |state| {
+				let current = state
+					.incarnations
+					.get(&owner.node())
+					.and_then(|registry| registry.current);
+				let bound = state.decisions.as_ref().is_some_and(|decisions| {
+					decisions
+						.signer_key(crate::consensus::decisions::Signer {
+							node: owner.node(),
+							incarnation: owner.incarnation(),
+						})
+						.is_some()
+				});
+				(current, bound)
+			})
+			.await;
+		if current.is_some_and(|current| current != owner.incarnation()) {
+			return Err(slab_refused(
+				crate::consensus::SlabRefusal::NotCurrentOwner { owner, current },
+			));
+		}
+		if current.is_none() || !bound {
+			return Err(std::io::Error::new(
+				std::io::ErrorKind::WouldBlock,
+				TierCommitNotSubmitted(
+					"this store's incarnation is not yet registered with its signing key bound"
+						.into(),
+				),
+			));
+		}
+		Ok(())
+	}
+
+	/// ADR 0725: one signed operation, from proposing it to this node having
+	/// applied it, under one bound. Only a proven pre-submission refusal says
+	/// nothing was submitted; a timeout, a transport error and a late apply are
+	/// unknown outcomes.
+	async fn owner_round(
+		authority: &OwnerAuthority,
+		signed: crate::consensus::owner_ops::SignedOwnerOp,
+	) -> std::io::Result<crate::consensus::owner_ops::OwnerOpAnswer> {
+		use crate::consensus::owner_ops::OwnerOpOutcome;
+		let unknown = |message: String| {
+			std::io::Error::new(
+				std::io::ErrorKind::WouldBlock,
+				format!("operation outcome ambiguous: {message}"),
+			)
+		};
+		let deadline = Instant::now() + OWNER_OP_ATTEMPT_BOUND;
+		let outcome = tokio::time::timeout_at(deadline, authority.channel.propose_owner_op(signed))
+			.await
+			.map_err(|_| unknown("the proposal did not answer within its bound".into()))?;
+		match outcome {
+			OwnerOpOutcome::Applied { answer, log_index } => {
+				let left = deadline.saturating_duration_since(Instant::now());
+				authority
+					.channel
+					.wait_applied(log_index, left)
+					.await
+					.map_err(|error| {
+						unknown(format!(
+							"committed at {log_index}, not applied here within the bound: {error}"
+						))
+					})?;
+				Ok(answer)
+			}
+			OwnerOpOutcome::NotSubmitted(message) => Err(std::io::Error::new(
+				std::io::ErrorKind::WouldBlock,
+				TierCommitNotSubmitted(message),
+			)),
+			OwnerOpOutcome::Unknown(message) => Err(unknown(message)),
+		}
+	}
+
+	/// A linearizable barrier this node has applied through: its own when it
+	/// has no owner authority, and the leader's cut otherwise (ADR 0725), so a
+	/// follower can read its own operations' decisions.
+	async fn barrier(&self, what: &str) -> std::io::Result<()> {
+		let Some(authority) = &self.owner_authority else {
+			return self
+				.raft
+				.ensure_linearizable()
+				.await
+				.map(|_| ())
+				.map_err(|e| std::io::Error::other(format!("{what} barrier failed: {e}")));
+		};
+		let deadline = Instant::now() + OWNER_OP_ATTEMPT_BOUND;
+		let index = tokio::time::timeout_at(deadline, authority.channel.read_cut())
+			.await
+			.map_err(|_| std::io::Error::other(format!("{what} barrier timed out")))?
+			.map_err(|e| std::io::Error::other(format!("{what} barrier failed: {e}")))?;
+		authority
+			.channel
+			.wait_applied(index, deadline.saturating_duration_since(Instant::now()))
+			.await
+			.map_err(|e| std::io::Error::other(format!("{what} barrier not applied here: {e}")))
 	}
 
 	/// Models the role check passing and the role being lost right after.
@@ -808,7 +968,21 @@ impl TierCommitter for RaftCommitter {
 		self.raft.metrics().borrow().state == openraft::ServerState::Leader
 	}
 
+	fn may_offload(&self) -> bool {
+		self.should_propose()
+			|| self
+				.owner_authority
+				.as_ref()
+				.is_some_and(|authority| authority.channel.leader_known())
+	}
+
 	async fn preflight(&self, owner: crate::consensus::OwnerRef) -> std::io::Result<()> {
+		if self.owner_authority.is_some() {
+			// ADR 0725: the role is not checked here, since an owner that follows
+			// may offload. What a follower may not submit is refused in `submit_op`,
+			// before it is sent, and by the state machine.
+			return self.require_registered_and_bound(owner).await;
+		}
 		self.require_submission_role()?;
 		self.ensure_registered(owner).await
 	}
@@ -816,6 +990,23 @@ impl TierCommitter for RaftCommitter {
 	async fn submit_op(&self, ticket: &OpTicket) -> std::io::Result<VerifiedReceipt> {
 		use crate::consensus::WendelonResponse;
 		use crate::consensus::slab_ops::{OpResponse, SlabOp};
+		if let Some(authority) = &self.owner_authority {
+			use crate::consensus::owner_ops::{OwnerOpAnswer, SignedOwnerOp};
+			// Only a first publication may come from a follower; anything else
+			// would be refused at apply, so it is not sent.
+			if !ticket.command().is_first_publication() {
+				self.require_submission_role()?;
+			}
+			let signed = SignedOwnerOp::submit(&authority.key, ticket);
+			return match Self::owner_round(authority, signed).await? {
+				OwnerOpAnswer::Receipt(receipt) => verify_receipt(ticket, receipt),
+				OwnerOpAnswer::Refused(refusal) => Err(slab_refused(refusal)),
+				other => Err(op_anomaly(format!(
+					"unexpected answer to op {:?}: {other:?}",
+					ticket.key()
+				))),
+			};
+		}
 		// Every mapping lives here, once. The local role can change after the
 		// preflight; a Forward from here on is an unknown outcome.
 		match self
@@ -852,6 +1043,18 @@ impl TierCommitter for RaftCommitter {
 	async fn cancel_op(&self, ticket: &OpTicket) -> std::io::Result<VerifiedReceipt> {
 		use crate::consensus::WendelonResponse;
 		use crate::consensus::slab_ops::{CancelOp, OpResponse};
+		if let Some(authority) = &self.owner_authority {
+			use crate::consensus::owner_ops::{OwnerOpAnswer, SignedOwnerOp};
+			let signed = SignedOwnerOp::cancel(&authority.key, ticket);
+			return match Self::owner_round(authority, signed).await? {
+				OwnerOpAnswer::Receipt(receipt) => verify_receipt(ticket, receipt),
+				OwnerOpAnswer::Refused(refusal) => Err(slab_refused(refusal)),
+				other => Err(op_anomaly(format!(
+					"unexpected answer to a Cancel of {:?}: {other:?}",
+					ticket.key()
+				))),
+			};
+		}
 		let response = self
 			.raft
 			.client_write(WendelonRequest::CancelOp(CancelOp {
@@ -877,6 +1080,19 @@ impl TierCommitter for RaftCommitter {
 	) -> std::io::Result<crate::consensus::slab_ops::AckReceipt> {
 		use crate::consensus::WendelonResponse;
 		use crate::consensus::slab_ops::{AckOutcomes, OpResponse};
+		if let Some(authority) = &self.owner_authority {
+			use crate::consensus::owner_ops::{OwnerOpAnswer, SignedOwnerOp};
+			let signed = SignedOwnerOp::ack(&authority.key, owner, seqs.clone());
+			return match Self::owner_round(authority, signed).await? {
+				OwnerOpAnswer::Ack(receipt) if ack_receipt_answers(&receipt, owner, &seqs) => {
+					Ok(receipt)
+				}
+				OwnerOpAnswer::Refused(refusal) => Err(slab_refused(refusal)),
+				other => Err(op_anomaly(format!(
+					"unexpected answer to an Ack for {owner:?}: {other:?}"
+				))),
+			};
+		}
 		let response = self
 			.raft
 			.client_write(WendelonRequest::AckOutcomes(AckOutcomes {
@@ -902,10 +1118,7 @@ impl TierCommitter for RaftCommitter {
 		let Some(state_machine) = &self.registry else {
 			return Ok(None);
 		};
-		self.raft
-			.ensure_linearizable()
-			.await
-			.map_err(|e| std::io::Error::other(format!("op prefix barrier failed: {e}")))?;
+		self.barrier("op prefix").await?;
 		Ok(Some(state_machine.op_acked_through(owner).await))
 	}
 
@@ -921,10 +1134,7 @@ impl TierCommitter for RaftCommitter {
 				"this committer has no state machine to read",
 			));
 		};
-		self.raft
-			.ensure_linearizable()
-			.await
-			.map_err(|e| std::io::Error::other(format!("op view barrier failed: {e}")))?;
+		self.barrier("op view").await?;
 		Ok(state_machine.op_view(key, digest, slabs).await)
 	}
 
@@ -940,10 +1150,7 @@ impl TierCommitter for RaftCommitter {
 				"this committer has no state machine to read",
 			));
 		};
-		self.raft
-			.ensure_linearizable()
-			.await
-			.map_err(|e| std::io::Error::other(format!("catalog barrier failed: {e}")))?;
+		self.barrier("catalog").await?;
 		let state = state_machine.state_snapshot().await;
 		Ok((state.table_schemas, state.secondary_indexes))
 	}
@@ -1039,20 +1246,25 @@ impl SlabSweeper {
 		{
 			tracing::warn!(error = %error, "retained cleanup intent is awaiting publication");
 		}
-		// Followers still mirror committed state above, but do not initiate
-		// new tier/retention commands or pay for uploads they cannot publish.
-		if !self.raft.should_propose() {
+		// Followers still mirror committed state above. ADR 0725: a follower
+		// that may offload also publishes its own sealed slabs and drops its
+		// rehydrated copies, which proposes nothing; every other pass below
+		// stays with the leader.
+		let leads = self.raft.should_propose();
+		if !leads && !self.raft.may_offload() {
 			metrics()
 				.storage_tiering_failures_total
 				.add(report.failed as u64);
 			return Ok(report);
 		}
-		let supersession_backfill = self
-			.backfill_supersession_metadata_once(SUPERSESSION_METADATA_BACKFILL_MAX_PER_PASS)
-			.await?;
-		report.supersession_metadata_backfilled_tiered = supersession_backfill.backfilled;
-		report.supersession_metadata_backfill_failures = supersession_backfill.failed;
-		report.failed += supersession_backfill.failed;
+		if leads {
+			let supersession_backfill = self
+				.backfill_supersession_metadata_once(SUPERSESSION_METADATA_BACKFILL_MAX_PER_PASS)
+				.await?;
+			report.supersession_metadata_backfilled_tiered = supersession_backfill.backfilled;
+			report.supersession_metadata_backfill_failures = supersession_backfill.failed;
+			report.failed += supersession_backfill.failed;
+		}
 		let candidates = self.slab.list_sealed_slabs().await;
 		for candidate in candidates {
 			if candidate.size_bytes < self.config.min_slab_bytes {
@@ -1076,6 +1288,9 @@ impl SlabSweeper {
 					report.failed += 1;
 				}
 			}
+		}
+		if !leads {
+			return self.finish_offload_only_pass(report).await;
 		}
 		let rewritten = self
 			.rewrite_plaintext_tiered_slabs_once(self.config.max_plaintext_rewrites_per_pass)
@@ -1143,6 +1358,37 @@ impl SlabSweeper {
 		metrics()
 			.storage_migration_reclaimed_bytes_total
 			.add(report.reclaimed_bytes);
+		Ok(report)
+	}
+
+	/// ADR 0725: the end of a follower's pass. It drops its rehydrated copies
+	/// (local only) and reports; it runs none of the leader's rewrite, re-wrap,
+	/// retention or reclaim passes.
+	async fn finish_offload_only_pass(
+		&self,
+		mut report: SweepReport,
+	) -> std::io::Result<SweepReport> {
+		let rehydrated = self.reclaim_rehydrated_slabs_once().await?;
+		report.rehydrated_reclaimed = rehydrated.reclaimed;
+		report.skipped_rehydration_guard = rehydrated.skipped_guard;
+		metrics()
+			.storage_tiered_slabs_total
+			.add(report.tiered as u64);
+		metrics()
+			.storage_tiering_failures_total
+			.add(report.failed as u64);
+		metrics()
+			.storage_tiering_skipped_small_total
+			.add(report.skipped_too_small as u64);
+		metrics()
+			.storage_tiering_skipped_already_tiered_total
+			.add(report.skipped_already_tiered as u64);
+		metrics()
+			.storage_rehydration_guard_skips_total
+			.add(report.skipped_rehydration_guard as u64);
+		metrics()
+			.storage_rehydrated_reclaims_total
+			.add(report.rehydrated_reclaimed as u64);
 		Ok(report)
 	}
 
@@ -2742,6 +2988,44 @@ use crate::consensus::TierObserver;
 /// machine's [`TierObserver`]. Holds an `Arc<SlabManager>` so the
 /// SM apply loop can fire filesystem work without owning the
 /// manager's lifetime.
+/// Test-only (ADR 0725): makes one store's next own-slab tier observer call
+/// fail, as a local filesystem error would: the pointer is committed and the
+/// local effect is left to reconciliation. Keyed by owner, so tests that run
+/// in parallel never see each other's.
+#[cfg(test)]
+pub(crate) mod tier_apply_failure {
+	use crate::consensus::OwnerRef;
+	use std::collections::HashSet;
+	use std::sync::Mutex;
+
+	static ARMED: Mutex<Option<HashSet<OwnerRef>>> = Mutex::new(None);
+
+	pub(crate) fn arm(owner: OwnerRef) {
+		ARMED
+			.lock()
+			.unwrap()
+			.get_or_insert_with(HashSet::new)
+			.insert(owner);
+	}
+
+	/// Whether `owner` was armed; taking it disarms it.
+	pub(crate) fn take(owner: OwnerRef) -> bool {
+		ARMED
+			.lock()
+			.unwrap()
+			.as_mut()
+			.is_some_and(|armed| armed.remove(&owner))
+	}
+
+	pub(crate) fn is_armed(owner: OwnerRef) -> bool {
+		ARMED
+			.lock()
+			.unwrap()
+			.as_ref()
+			.is_some_and(|armed| armed.contains(&owner))
+	}
+}
+
 pub struct ManagerTierObserver {
 	slab: Arc<SlabManager>,
 	snapshot_source: std::sync::OnceLock<crate::consensus::TierSnapshotSource>,
@@ -2867,6 +3151,12 @@ impl TierObserver for ManagerTierObserver {
 		) {
 			return Ok(());
 		}
+		#[cfg(test)]
+		if tier_apply_failure::take(tier.slab.owner()) {
+			return Err(std::io::Error::other(
+				"test: this store's tier apply observer failed once",
+			));
+		}
 		match self
 			.slab
 			.apply_tier_slab_committed(TieredSlabPointer::from_ring(tier), Some(applied_log_index))
@@ -2983,6 +3273,8 @@ impl TierObserver for ManagerTierObserver {
 
 #[cfg(test)]
 mod tests {
+	mod offload_tests;
+
 	use super::*;
 	use crate::audit::InMemoryAuditSink;
 	use crate::consensus::monitor::PhysicalClock;

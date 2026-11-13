@@ -1490,20 +1490,54 @@ fn in_parent_decisions_mode_only_a_certified_retirement_applies() {
 		certified: None,
 	});
 
+	// ADR 0725: in this mode a slab operation is its owner's by signature, so
+	// the owner binds its key and each operation is applied signed, appended by
+	// the owner's own node as before.
+	let signing = ed25519_dalek::SigningKey::from_bytes(&[0x0A; 32]);
 	let mut mode = registered(0xA);
 	mode.decisions = Some(Default::default());
-	assert_applied(apply_op(&mut mode, 1, first_tier(own, 1), 10));
+	let bound = apply_request_at_log_index(
+		&mut mode,
+		WendelonRequest::Decision(crate::consensus::decisions::DecisionCommand::BindSigner {
+			signer: crate::consensus::decisions::Signer {
+				node: NODE,
+				incarnation: own.incarnation(),
+			},
+			key: signing.verifying_key().to_bytes(),
+		}),
+		9,
+		NODE,
+	)
+	.0;
+	assert_eq!(
+		bound,
+		WendelonResponse::Decision(crate::consensus::decisions::DecisionResult::SignerBound)
+	);
+	let signed = |state: &mut SmState, op_seq: u64, command: SlabCommand, index: u64| {
+		apply_request_at_log_index(
+			state,
+			WendelonRequest::OwnerOp(crate::consensus::owner_ops::SignedOwnerOp::submit_for_test(
+				&signing,
+				SlabOp { op_seq, command },
+			)),
+			index,
+			NODE,
+		)
+	};
+	assert_applied(signed(&mut mode, 1, first_tier(own, 1), 10));
 	assert_rejected(
-		apply_op(&mut mode, 2, ordinary.clone(), 11),
+		signed(&mut mode, 2, ordinary.clone(), 11),
 		SlabRejection::CertificationRequired,
 	);
 	assert!(mode.tiered_slabs.contains_key(&own.slab(SlabId::new(1))));
-	assert_applied(apply_op(
-		&mut mode,
-		3,
-		certified_retire(own, 1, source.clone(), key(own, 3), 1, source),
-		12,
-	));
+	// The same certified retirement, bare, is refused before it is looked at.
+	let certified = certified_retire(own, 1, source.clone(), key(own, 3), 1, source);
+	assert_eq!(
+		apply_op(&mut mode, 3, certified.clone(), 12).0,
+		WendelonResponse::Refused(SlabRefusal::OwnerOpUnsigned)
+	);
+	assert!(mode.tiered_slabs.contains_key(&own.slab(SlabId::new(1))));
+	assert_applied(signed(&mut mode, 3, certified, 12));
 	assert!(!mode.tiered_slabs.contains_key(&own.slab(SlabId::new(1))));
 
 	let mut today = registered(0xA);

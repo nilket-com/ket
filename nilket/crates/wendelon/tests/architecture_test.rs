@@ -12217,6 +12217,77 @@ fn a_ring_command_or_state_never_names_a_bare_slab_id() {
 	);
 }
 
+/// ADR 0725: an owner-signed slab operation enters the log only through the
+/// leader's admission, is signed only by the committer from a ticket or an
+/// acknowledgement batch, and has an effect only after `verify_owner_op`.
+#[test]
+fn owner_operations_have_one_producer_one_signer_and_one_verifier() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let src = root.join("src");
+	let mut requests = std::collections::BTreeMap::new();
+	let mut signers = std::collections::BTreeMap::new();
+	walk_dir(&src, &mut |path| {
+		let name = path.file_name().unwrap().to_string_lossy().into_owned();
+		if path.extension().is_none_or(|ext| ext != "rs") || name.ends_with("tests.rs") {
+			return;
+		}
+		let source = fs::read_to_string(path).unwrap();
+		let production = source.split("#[cfg(test)]\nmod tests").next().unwrap();
+		let built = production.matches("WendelonRequest::OwnerOp(").count();
+		if built > 0 {
+			requests.insert(name.clone(), built);
+		}
+		let signed = ["submit(", "cancel(", "ack("]
+			.iter()
+			.map(|kind| {
+				production
+					.matches(&format!("SignedOwnerOp::{kind}"))
+					.count()
+			})
+			.collect::<Vec<_>>();
+		if signed.iter().any(|count| *count > 0) {
+			signers.insert(name, signed);
+		}
+	});
+	assert_eq!(
+		requests,
+		std::collections::BTreeMap::from([
+			("committed.rs".to_owned(), 1),
+			("decision_proposals.rs".to_owned(), 1),
+			("raft_storage.rs".to_owned(), 5),
+		]),
+		"owner operations are matched in apply and built only by admission"
+	);
+	let proposals = fs::read_to_string(src.join("network/decision_proposals.rs")).unwrap();
+	assert!(proposals.contains("return Ok(Admitted::Ready(WendelonRequest::OwnerOp(op)));"));
+	assert!(proposals.contains("if op.claimed_owner().node() != sender {"));
+	assert_eq!(
+		signers,
+		std::collections::BTreeMap::from([("sweeper.rs".to_owned(), vec![1, 1, 1])]),
+		"only the committer signs, once per kind"
+	);
+	// Apply reaches a signed operation's content only through the verifier, and
+	// a bare slab operation is refused in a ParentDecisions state before it.
+	let raft = fs::read_to_string(src.join("consensus/raft_storage.rs")).unwrap();
+	assert_eq!(raft.matches("verify_owner_op(state, ").count(), 2);
+	assert_eq!(raft.matches(".into_op()").count(), 2);
+	assert_eq!(raft.matches("owner_ops::verify(").count(), 1);
+	let apply = source_region(
+		&raft,
+		"fn apply_request_at_log_index(",
+		"WendelonRequest::SlabOp(op) => {",
+	);
+	assert!(apply.contains("WendelonResponse::Refused(SlabRefusal::OwnerOpUnsigned)"));
+	assert!(apply.contains("if state.decisions.is_some() =>"));
+	// The follower surface is decided in one place.
+	let owner_ops = fs::read_to_string(src.join("consensus/owner_ops.rs")).unwrap();
+	assert_eq!(owner_ops.matches("is_first_publication()").count(), 1);
+	assert!(
+		owner_ops
+			.contains("Self::Tier(TierOp { tier, replaces: None }) if tier.certified.is_none()")
+	);
+}
+
 /// ADR 0699 S2: decision commands have no producer outside tests, signatures
 /// verify nothing outside tests, and every snapshot body passes through the two
 /// mode-explicit codec functions.

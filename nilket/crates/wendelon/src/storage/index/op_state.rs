@@ -2481,6 +2481,96 @@ impl PersistentLocalIndex {
 		.await
 	}
 
+	/// ADR 0725: remove a first-tier candidate's standalone ambiguity record
+	/// because its operation ended Rejected. The authority is the durable
+	/// rejected-candidate row for exactly this slab and URI, read in the same
+	/// transaction: `hand_off_rejected_tier` writes it only for an operation with
+	/// a terminal Rejected decision (from its verified receipt at submission, or
+	/// from the ring's record at recovery), and it outlives the acknowledgement
+	/// that prunes the receipt. A rejected candidate's URI can
+	/// never become the slab's pointer, so the record could otherwise never
+	/// resolve and would fence the slab for good. `true` means the ambiguity is
+	/// durably resolved on that evidence, whether this call removed the record
+	/// or an earlier one did. Without the rejected-candidate row nothing changes
+	/// and `false` is returned: an outcome still unknown stays fenced. A record
+	/// of another kind is left alone, `false`. The object is not deleted and the
+	/// candidate row stays. The row is matched by slab and URI: every upload
+	/// attempt writes a fresh URI, which is what makes that enough here.
+	pub(crate) async fn remove_standalone_rejected_provisional(
+		&self,
+		slab_id: SlabId,
+		uri: String,
+	) -> std::io::Result<bool> {
+		self.require_cleanup_authority()?;
+		let mut key = slab_id.get().to_be_bytes().to_vec();
+		key.extend_from_slice(uri.as_bytes());
+		let prefix = slab_id.get().to_be_bytes();
+		let _write = self.write_lock.lock().await;
+		self.db
+			.run(move |db| {
+				let tx = db.begin_write().map_err(redb_to_io)?;
+				{
+					let rejected = tx
+						.open_table(REJECTED_TIER_CANDIDATES_TABLE)
+						.map_err(redb_to_io)?;
+					let mut recorded = false;
+					for row in rejected.iter().map_err(redb_to_io)? {
+						let (_, bytes) = row.map_err(redb_to_io)?;
+						let candidate: RejectedTierCandidate =
+							postcard::from_bytes(bytes.value()).map_err(Error::other)?;
+						if candidate.slab_id == slab_id && candidate.l2_uri == uri {
+							recorded = true;
+							break;
+						}
+					}
+					if !recorded {
+						return Ok(false);
+					}
+					let mut table = tx
+						.open_table(SNAPSHOT_CLEANUP_INTENTS_TABLE)
+						.map_err(redb_to_io)?;
+					for row in table.iter().map_err(redb_to_io)? {
+						let (other_key, value) = row.map_err(redb_to_io)?;
+						if other_key.value().starts_with(&prefix)
+							&& other_key.value() != key.as_slice()
+						{
+							let record: RetainedObjectIntent = postcard::from_bytes(value.value())
+								.map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+							if record.replacement_uri.as_deref() == Some(uri.as_str()) {
+								return Err(Error::new(
+									ErrorKind::WouldBlock,
+									"provisional belongs to an old-object intent",
+								));
+							}
+						}
+					}
+					let prior = table
+						.get(key.as_slice())
+						.map_err(redb_to_io)?
+						.map(|v| {
+							postcard::from_bytes::<RetainedObjectIntent>(v.value())
+								.map_err(|e| Error::new(ErrorKind::InvalidData, e))
+						})
+						.transpose()?;
+					// The record already gone, on this evidence, is this removal
+					// already made: a caller that lost its answer after the commit
+					// must be able to converge its cache.
+					let Some(prior) = prior else {
+						return Ok(true);
+					};
+					if prior.state != RetainedObjectIntentState::Unresolved
+						|| prior.replacement_uri.as_deref() != Some(uri.as_str())
+					{
+						return Ok(false);
+					}
+					table.remove(key.as_slice()).map_err(redb_to_io)?;
+				}
+				tx.commit().map_err(redb_to_io)?;
+				Ok(true)
+			})
+			.await
+	}
+
 	/// Every rejected tier candidate still accounted for.
 	pub(crate) async fn load_rejected_tier_candidates(
 		&self,

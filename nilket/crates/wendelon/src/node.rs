@@ -2715,8 +2715,12 @@ impl WendelonNode {
 			));
 		#[cfg(test)]
 		scope.checkpoint(&cfg, "set_eviction_watchdog").await?;
-		let raft_committer: Arc<dyn TierCommitter> =
-			Arc::new(RaftCommitter::new(raft.clone()).with_state_machine(state_machine.clone()));
+		let raft_committer: Arc<dyn TierCommitter> = Arc::new(
+			RaftCommitter::new(raft.clone())
+				.with_state_machine(state_machine.clone())
+				// ADR 0725: a ParentDecisions store signs its slab operations.
+				.with_owner_authority(data_server.owner_authority()),
+		);
 		let lsm_worker = LsmCompactionWorker::new(LsmConfig::default(), slab.slab_pin_table())?;
 		let lsm_driver = Arc::new(
 			LeaderGatedLsmCompactionDriver::new(

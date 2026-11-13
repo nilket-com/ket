@@ -1218,3 +1218,87 @@ async fn run_bounded(l2: ObjectStoreConfig, keys: DecisionKeys) {
 		stage.lock().unwrap(),
 	);
 }
+
+/// DC-224 record: where this fixture places the rows its workflow writes. It
+/// starts the same three members, writes nothing, and prints each row's
+/// locality with the ring's primary and replicas for it, computed by the
+/// client's own admission (`validate_table_write_request_batch`). The workflow
+/// stops nodes without removing them from the ring, so this placement is the
+/// one a write meets after a failover. An observation of placement only: it is
+/// not a record of what any node answered in an earlier execution.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn the_fixtures_row_placement_is_recorded() {
+	let l2_dir = support::tempdir("three-node-placement-l2");
+	let l2 = ObjectStoreConfig::LocalFs {
+		root: l2_dir.to_path_buf(),
+	};
+	let objects = l2.build().unwrap();
+	let registry = support::shared_loopback_registry();
+	let mut members = Vec::new();
+	for node_id in NODES {
+		let (dir, cfg) = member_config(node_id, &l2, DecisionKeys::Development);
+		let node =
+			WendelonNode::bootstrap_with_provider(cfg.clone(), provider(node_id, registry.clone()))
+				.await
+				.unwrap();
+		members.push(Member {
+			_dir: dir,
+			cfg,
+			node: Some(node),
+		});
+	}
+	let mut cluster = Cluster {
+		registry,
+		members,
+		descriptor: table_descriptor(),
+		expected: Rows::new(),
+		next_id: 0,
+		client_uuid: client_uuid_v7(),
+		next_write_sequence: 0,
+		writes_sent_again: 0,
+		newest_ack: bytemuck::Zeroable::zeroed(),
+		polls_end: tokio::time::Instant::now() + POLL_BOUND,
+		objects,
+	};
+	let leader = cluster.wait_for_leader("bootstrap").await;
+	cluster.wait_for_voters().await;
+	cluster.wait_for_ready().await;
+	let epoch = cluster.node(leader).ring.current_epoch();
+	for id in 1..=12i64 {
+		let name = format!("failed-over-{id}-{}", "x".repeat(256));
+		let request = cluster.request_for(id, &name, epoch, 1);
+		let admission = wendelon::schema::validate_table_write_request_batch(
+			&request.meta,
+			&request.payload,
+			&request.descriptor,
+			wendelon::schema::WriterNodeId::ZERO,
+			request.meta.client_hlc,
+		)
+		.unwrap();
+		let locality = admission.localities[0];
+		let mut placements = Vec::new();
+		for node_id in NODES {
+			let ring = &cluster.node(node_id).ring;
+			placements.push((
+				ring.owner_of_locality(locality).map(|node| node.id),
+				ring.replicas_for_locality(locality)
+					.into_iter()
+					.map(|node| node.id)
+					.collect::<Vec<_>>(),
+			));
+		}
+		assert!(
+			placements.windows(2).all(|pair| pair[0] == pair[1]),
+			"the three rings agree on row {id}: {placements:?}"
+		);
+		eprintln!(
+			"placement: row {id} locality {:#018x} primary {:?} replicas {:?} (ring epoch {epoch})",
+			locality.get(),
+			placements[0].0,
+			placements[0].1
+		);
+	}
+	for node_id in NODES {
+		cluster.stop(node_id).await;
+	}
+}

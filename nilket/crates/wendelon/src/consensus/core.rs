@@ -321,6 +321,17 @@ pub enum SlabRefusal {
 	},
 	/// An acknowledgement batch larger than the window.
 	AckBatchTooLarge { len: u64 },
+	/// ADR 0725: an owner-signed operation applied to a store that runs
+	/// today's authority, which has no signer registry to verify it against.
+	OwnerOpNotInMode,
+	/// ADR 0725: a bare slab operation applied to a `ParentDecisions` store,
+	/// where an operation is its owner's only by its owner's signature.
+	OwnerOpUnsigned,
+	/// ADR 0725: the signature does not verify against the key bound to the
+	/// owner's incarnation, or no key is bound to it.
+	OwnerOpUnverifiable { owner: OwnerRef },
+	/// ADR 0725: the operation is attributed to a signer other than its owner.
+	OwnerOpSignerMismatch { owner: OwnerRef },
 }
 
 /// The unified Node ID type used across Wendelon.
@@ -757,6 +768,9 @@ pub enum WendelonRequest {
 	/// ADR 0701: one holder's lease renewals in one entry, each applied in
 	/// declared order exactly as an `AcquireLease`. `ParentDecisions` only.
 	AcquireLeases(LeaseBatch),
+	/// ADR 0725: one slab operation signed by its owner. `ParentDecisions`
+	/// only, where it replaces the bare `SlabOp`, `CancelOp` and `AckOutcomes`.
+	OwnerOp(crate::consensus::owner_ops::SignedOwnerOp),
 }
 
 /// ADR 0701: at most [`crate::schema::MAX_LEASES_PER_BATCH`] leases. Decoding
@@ -900,11 +914,15 @@ impl WendelonRequest {
 	/// Variants only the `ParentDecisions` WAL format (10) carries, appended
 	/// after [`Self::ALL_VARIANT_NAMES`]. Today's format 8 refuses them on write
 	/// and on read, so its body set is exactly the list above.
-	pub const PARENT_DECISIONS_VARIANT_NAMES: [&'static str; 2] = ["decision", "acquire_leases"];
+	pub const PARENT_DECISIONS_VARIANT_NAMES: [&'static str; 3] =
+		["decision", "acquire_leases", "owner_op"];
 
 	/// True for a variant today's WAL format must never carry.
 	pub fn is_parent_decisions_only(&self) -> bool {
-		matches!(self, Self::Decision(_) | Self::AcquireLeases(_))
+		matches!(
+			self,
+			Self::Decision(_) | Self::AcquireLeases(_) | Self::OwnerOp(_)
+		)
 	}
 
 	/// Total by construction: a new variant fails this match at compile time,
@@ -945,6 +963,7 @@ impl WendelonRequest {
 			Self::AckOutcomes(_) => "ack_outcomes",
 			Self::Decision(_) => "decision",
 			Self::AcquireLeases(_) => "acquire_leases",
+			Self::OwnerOp(_) => "owner_op",
 		}
 	}
 }

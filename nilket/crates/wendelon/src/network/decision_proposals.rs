@@ -21,6 +21,7 @@ use crate::consensus::decisions::{
 	Signed, Signer,
 };
 use crate::consensus::monitor::{MAX_OFFSET_MS, PhysicalClock};
+use crate::consensus::owner_ops::{OwnerOpAnswer, OwnerOpChannel, OwnerOpOutcome};
 use crate::consensus::raft_storage::{SmState, WendelonStateMachine};
 use crate::consensus::{
 	RegisterIncarnation, StoreIncarnation, WendelonRaft, WendelonRequest, WendelonResponse,
@@ -75,6 +76,10 @@ pub enum ForwardedDecision {
 	Report {
 		report: Signed<crate::consensus::decisions::ReportBody>,
 	},
+	/// ADR 0725: one slab operation signed by the sender as its owner. The
+	/// leader checks only that the owner's node is the sender; the state machine
+	/// verifies the signature and decides.
+	OwnerOp(crate::consensus::owner_ops::SignedOwnerOp),
 }
 
 /// ADR 0700: a time-bearing command before the leader stamps it. It becomes a
@@ -156,6 +161,18 @@ pub enum ProposalResponse {
 	Refused(ProposalRefusal),
 	/// The proposal may or may not have committed; ask again.
 	Indeterminate(String),
+	/// ADR 0725: an owner operation committed and applied at `log_index`, with
+	/// the state machine's own answer.
+	OwnerApplied {
+		answer: OwnerOpAnswer,
+		log_index: u64,
+	},
+	/// ADR 0725: an owner operation this node did not hand to the log: it
+	/// does not lead, and found that out before proposing. Any error after the
+	/// proposal was handed over is `Indeterminate` instead.
+	OwnerNotSubmitted {
+		leader_hint: Option<u32>,
+	},
 }
 
 /// A node's lookup of a parent's recorded decision, by key and request digest.
@@ -467,6 +484,14 @@ pub(crate) fn admission(
 				key,
 			}
 		}
+		// ADR 0725: the owner's node must be the sender. Nothing else is judged
+		// here: the signature, the incarnation and the command are apply's.
+		ForwardedDecision::OwnerOp(op) => {
+			if op.claimed_owner().node() != sender {
+				return Err(ProposalRefusal::NotTheSender);
+			}
+			return Ok(Admitted::Ready(WendelonRequest::OwnerOp(op)));
+		}
 		ForwardedDecision::RegisterIncarnation { incarnation } => {
 			return Ok(Admitted::Ready(WendelonRequest::RegisterIncarnation(
 				RegisterIncarnation {
@@ -674,6 +699,9 @@ impl DecisionProposals {
 		sender: u32,
 		request: ForwardedDecision,
 	) -> ProposalResponse {
+		if let ForwardedDecision::OwnerOp(_) = &request {
+			return self.propose_owner_op_as(sender, request).await;
+		}
 		let leader = self.raft.current_leader().await;
 		if leader != Some(self.local.id) {
 			return ProposalResponse::NotLeader {
@@ -725,6 +753,88 @@ impl DecisionProposals {
 				},
 				_ => ProposalResponse::Indeterminate(error.to_string()),
 			},
+		}
+	}
+
+	/// ADR 0725, leader side: admit and propose an owner operation. Only the
+	/// answers given before `client_write` is called say it was not submitted.
+	async fn propose_owner_op_as(
+		&self,
+		sender: u32,
+		request: ForwardedDecision,
+	) -> ProposalResponse {
+		let leader = self.raft.current_leader().await;
+		if leader != Some(self.local.id) {
+			return ProposalResponse::OwnerNotSubmitted {
+				leader_hint: leader,
+			};
+		}
+		let command = match admission(self.mode, sender, request, &self.trusted_keys) {
+			Ok(Admitted::Ready(command)) => command,
+			Ok(Admitted::Unstamped(_)) => {
+				return ProposalResponse::Refused(ProposalRefusal::Malformed);
+			}
+			Err(refusal) => return ProposalResponse::Refused(refusal),
+		};
+		use crate::consensus::slab_ops::OpResponse;
+		match self.raft.client_write(command).await {
+			Ok(response) => {
+				let answer = match response.data {
+					WendelonResponse::Op(OpResponse::Receipt(receipt)) => {
+						OwnerOpAnswer::Receipt(receipt)
+					}
+					WendelonResponse::Op(OpResponse::Ack(receipt)) => OwnerOpAnswer::Ack(receipt),
+					WendelonResponse::Refused(refusal) => OwnerOpAnswer::Refused(refusal),
+					other => {
+						return ProposalResponse::Indeterminate(format!(
+							"unexpected response to an owner operation: {other:?}"
+						));
+					}
+				};
+				ProposalResponse::OwnerApplied {
+					answer,
+					log_index: response.log_id.index,
+				}
+			}
+			// The proposal was handed over: whatever the error says about the
+			// role now, it does not prove nothing was appended.
+			Err(error) => ProposalResponse::Indeterminate(error.to_string()),
+		}
+	}
+
+	/// ADR 0725, owner side: propose this node's own signed operation, locally
+	/// when it leads and through the leader otherwise. A known leader is only
+	/// where to send it. The caller bounds the whole attempt.
+	async fn propose_own_op(
+		&self,
+		op: crate::consensus::owner_ops::SignedOwnerOp,
+	) -> OwnerOpOutcome {
+		let request = ForwardedDecision::OwnerOp(op);
+		let response = match self.raft.current_leader().await {
+			Some(leader) if leader == self.local.id => {
+				self.propose_as(self.local.id, request).await
+			}
+			Some(leader) => match self.forward(leader, &request).await {
+				Ok(response) => response,
+				Err(error) => return OwnerOpOutcome::Unknown(error.to_string()),
+			},
+			None => return OwnerOpOutcome::NotSubmitted("no leader is known".into()),
+		};
+		match response {
+			ProposalResponse::OwnerApplied { answer, log_index } => {
+				OwnerOpOutcome::Applied { answer, log_index }
+			}
+			ProposalResponse::OwnerNotSubmitted { leader_hint } => OwnerOpOutcome::NotSubmitted(
+				format!("the node asked does not lead (hint {leader_hint:?})"),
+			),
+			// An admission refusal: decided before anything was proposed.
+			ProposalResponse::Refused(refusal) => {
+				OwnerOpOutcome::NotSubmitted(format!("refused at admission: {refusal:?}"))
+			}
+			ProposalResponse::Indeterminate(message) => OwnerOpOutcome::Unknown(message),
+			other => OwnerOpOutcome::Unknown(format!(
+				"unexpected response to an owner operation: {other:?}"
+			)),
 		}
 	}
 
@@ -1218,3 +1328,31 @@ pub(crate) fn decode_bounded<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> st
 #[cfg(test)]
 #[path = "decision_proposals_tests.rs"]
 mod tests;
+
+#[async_trait::async_trait]
+impl OwnerOpChannel for DecisionProposals {
+	async fn propose_owner_op(
+		&self,
+		op: crate::consensus::owner_ops::SignedOwnerOp,
+	) -> OwnerOpOutcome {
+		self.propose_own_op(op).await
+	}
+
+	async fn read_cut(&self) -> std::io::Result<u64> {
+		match self.cut().await {
+			CutResponse::Cut(index) => Ok(index),
+			other => Err(Error::new(
+				ErrorKind::WouldBlock,
+				format!("no linearizable cut: {other:?}"),
+			)),
+		}
+	}
+
+	async fn wait_applied(&self, index: u64, bound: std::time::Duration) -> std::io::Result<()> {
+		DecisionProposals::wait_applied(self, index, bound).await
+	}
+
+	fn leader_known(&self) -> bool {
+		self.raft.metrics().borrow().current_leader.is_some()
+	}
+}

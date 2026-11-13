@@ -9,6 +9,7 @@ pub mod decisions;
 pub(crate) mod drop_reclaim;
 pub mod hlc;
 pub mod monitor;
+pub mod owner_ops;
 pub mod raft_network;
 pub mod raft_server;
 pub mod raft_storage;

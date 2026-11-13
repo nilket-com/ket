@@ -171,6 +171,7 @@ fn request_class(request: &WendelonRequest) -> (EntryClass2, Option<CarrierComma
 		| WendelonRequest::AckOutcomes(_)
 		| WendelonRequest::Decision(_)
 		| WendelonRequest::AcquireLeases(_)
+		| WendelonRequest::OwnerOp(_)
 		| WendelonRequest::SeedMigration(_)
 		| WendelonRequest::MigrationComplete(_)
 		| WendelonRequest::CreateTenant(_)

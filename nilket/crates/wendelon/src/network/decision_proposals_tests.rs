@@ -35,6 +35,48 @@ fn reserve_request(state: &SmState) -> (ForwardedDecision, u32) {
 	)
 }
 
+/// ADR 0725: the leader admits an owner operation only from its owner's node,
+/// and judges nothing else: the signature and the command are apply's.
+#[test]
+fn an_owner_operation_is_admitted_only_from_its_owners_node() {
+	use crate::consensus::owner_ops::SignedOwnerOp;
+	let signer = fixture::signer(2);
+	let owner = crate::consensus::OwnerRef::new(signer.node, signer.incarnation);
+	let op = SignedOwnerOp::ack(&fixture::test_key(2), owner, vec![1]);
+	let request = || ForwardedDecision::OwnerOp(op.clone());
+	let mode = DecisionMode::ParentDecisions;
+	assert_eq!(
+		admit(mode, 2, request(), &trusted(), healthy),
+		Ok(WendelonRequest::OwnerOp(op.clone()))
+	);
+	for sender in [1, 3] {
+		assert_eq!(
+			admit(mode, sender, request(), &trusted(), healthy),
+			Err(ProposalRefusal::NotTheSender),
+			"sender {sender}"
+		);
+	}
+	assert_eq!(
+		admit(DecisionMode::Today, 2, request(), &trusted(), healthy),
+		Err(ProposalRefusal::ModeToday)
+	);
+	// Admitted for a sender whose signature will not verify: apply refuses it.
+	let forged = SignedOwnerOp::ack(&fixture::test_key(3), owner, vec![1]);
+	let admitted = admit(
+		mode,
+		2,
+		ForwardedDecision::OwnerOp(forged),
+		&trusted(),
+		healthy,
+	)
+	.unwrap();
+	let mut state = fixture::base(3);
+	assert_eq!(
+		apply_at_leader_for_test(&mut state, admitted, 1, 1),
+		WendelonResponse::Refused(crate::consensus::SlabRefusal::OwnerOpUnverifiable { owner })
+	);
+}
+
 #[test]
 fn today_admits_nothing() {
 	let mode = DecisionMode::Today;

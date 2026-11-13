@@ -1691,6 +1691,26 @@ impl SlabManager {
 		self: &Arc<Self>,
 		committer: &dyn crate::storage::TierCommitter,
 	) -> std::io::Result<()> {
+		self.recover_abandoned_tier_ops_where(committer, |_| true)
+			.await
+	}
+
+	/// ADR 0725: the same recovery for a follower, which may resolve only a
+	/// slab's first, uncertified publication. Replacements and retirements keep
+	/// their intents until this node leads.
+	pub(crate) async fn recover_abandoned_first_publications(
+		self: &Arc<Self>,
+		committer: &dyn crate::storage::TierCommitter,
+	) -> std::io::Result<()> {
+		self.recover_abandoned_tier_ops_where(committer, SlabCommand::is_first_publication)
+			.await
+	}
+
+	async fn recover_abandoned_tier_ops_where(
+		self: &Arc<Self>,
+		committer: &dyn crate::storage::TierCommitter,
+		selected: impl Fn(&SlabCommand) -> bool,
+	) -> std::io::Result<()> {
 		let index = self.require_op_index()?;
 		let mut first_error = None;
 		for loaded in index.load_op_intents().await? {
@@ -1700,7 +1720,8 @@ impl SlabManager {
 			if !matches!(
 				ticket.command(),
 				SlabCommand::Tier(_) | SlabCommand::Retire(_)
-			) {
+			) || !selected(ticket.command())
+			{
 				continue;
 			}
 			if let Err(error) = self.recover_abandoned_tier_op(ticket, committer).await {
