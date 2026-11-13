@@ -3996,6 +3996,9 @@ impl WendelonControlServer {
 				"LEASES_REQ is served only under ParentDecisions",
 			));
 		}
+		// ADR 0729: the mode's envelope, before the body is decoded. The generic
+		// reader also admits envelope 1 for this type; this check does not.
+		self.decision_mode.check_raft_frame(frame.header.version)?;
 		let (header, ranges): (AcquireLeasesRequestHeader, Vec<LeaseRangeWire>) =
 			decode_lease_batch(&frame.meta, |header: &AcquireLeasesRequestHeader| {
 				header.count
@@ -4017,15 +4020,27 @@ impl WendelonControlServer {
 				ttl_ms: header.ttl_ms,
 				_pad: 0,
 			};
+			let Ok(expected) = range.expected() else {
+				return self.leases_response(&frame, LeaseStatus::DENIED_INVALID_TARGET, &[]);
+			};
 			if !starts.insert(range.range_start)
 				|| self
-					.validate_acquire_lease_target(remote, &single)
+					.validate_lease_batch_target(remote, &single, expected)
 					.await
 					.is_err()
 			{
 				return self.leases_response(&frame, LeaseStatus::DENIED_INVALID_TARGET, &[]);
 			}
 		}
+		// ADR 0729: this leader's stamp for the entry it builds, through the
+		// decision clock's gate. No stamp, no entry.
+		let stamp_ms = match &self.decision_proposals {
+			Some(proposals) => match proposals.decision_clock_now().await {
+				Ok(stamp_ms) => stamp_ms,
+				Err(_) => return self.leases_response(&frame, LeaseStatus::INTERNAL_ERROR, &[]),
+			},
+			None => return self.leases_response(&frame, LeaseStatus::INTERNAL_ERROR, &[]),
+		};
 		let ttl_ms = header.ttl_ms.clamp(1, self.lease_ttl_cap_ms);
 		let leases: Vec<LeaseDescriptor> = ranges
 			.iter()
@@ -4050,7 +4065,15 @@ impl WendelonControlServer {
 				})
 			})
 			.collect();
-		let batch = crate::consensus::LeaseBatch::new(leases.clone())
+		let grants = leases
+			.iter()
+			.zip(&ranges)
+			.map(|(lease, range)| crate::consensus::LeaseBatchGrant {
+				lease: *lease,
+				expected_generation: range.expected().unwrap_or(None),
+			})
+			.collect();
+		let batch = crate::consensus::LeaseBatch::new(stamp_ms, grants)
 			.ok_or_else(|| Error::new(ErrorKind::InvalidData, "lease batch over its bound"))?;
 		let status = match self
 			.raft
@@ -4118,7 +4141,8 @@ impl WendelonControlServer {
 		Ok(HrftFrame {
 			header: FrameHeader {
 				magic: HRFT_MAGIC,
-				version: 1,
+				// ADR 0729: the mode's envelope, as the request carried.
+				version: self.decision_mode.raft_frame_version(),
 				msg_type: MsgType::LEASES_RESP.0,
 				flags: 0,
 				stream_id: frame.header.stream_id,
@@ -4929,6 +4953,45 @@ impl WendelonControlServer {
 			arrow_payload: None,
 			trailing: None,
 		})
+	}
+
+	/// ADR 0729: a batch's range is one whose lineage the requester holds at
+	/// the generation it names, or, where no lineage exists and it names none,
+	/// one of its ring primary ranges. From applied state; the reducer checks
+	/// the same again in log order.
+	async fn validate_lease_batch_target(
+		&self,
+		remote: NodeId,
+		req: &AcquireLeaseRequestMeta,
+		expected: Option<u64>,
+	) -> std::io::Result<()> {
+		let denied = |why: &str| Error::new(ErrorKind::PermissionDenied, why.to_string());
+		if remote != req.holder {
+			return Err(denied("lease holder is not the remote caller"));
+		}
+		let (range_start, range_end, holder) = (req.range_start, req.range_end, req.holder);
+		let lineage = self
+			.state_machine
+			.read_state(move |state| {
+				state
+					.decisions
+					.as_ref()
+					.and_then(|decisions| decisions.lineages().get(&range_start).copied())
+			})
+			.await;
+		match (lineage, expected) {
+			(Some(lineage), Some(generation))
+				if lineage.range_end == range_end
+					&& lineage.holder == holder
+					&& lineage.generation == generation =>
+			{
+				Ok(())
+			}
+			(None, None) => self.validate_acquire_lease_target(remote, req).await,
+			_ => Err(denied(
+				"lease range is not the caller's lineage or primary range",
+			)),
+		}
 	}
 
 	async fn validate_acquire_lease_target(

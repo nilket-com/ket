@@ -18961,6 +18961,8 @@ fn a_lease_batch_on_the_wire_needs_an_exact_bounded_length() {
 			out.extend_from_slice(bytemuck::bytes_of(&LeaseRangeWire {
 				range_start: n * 10,
 				range_end: n * 10 + 9,
+				expected_generation: 0,
+				has_generation: 0,
 			}));
 		}
 		out
@@ -18981,7 +18983,7 @@ fn a_lease_batch_on_the_wire_needs_an_exact_bounded_length() {
 	);
 	assert_eq!(
 		lease_batch_bytes::<AcquireLeasesRequestHeader, LeaseRangeWire>(MAX_LEASES_PER_BATCH),
-		Some(40 + 16 * MAX_LEASES_PER_BATCH)
+		Some(40 + 32 * MAX_LEASES_PER_BATCH)
 	);
 	assert_eq!(
 		lease_batch_bytes::<AcquireLeasesRequestHeader, LeaseRangeWire>(usize::MAX),
@@ -19007,6 +19009,11 @@ async fn only_a_whole_valid_leases_response_is_cached() {
 	let server = &node.data_server;
 	let leader = node.local_node;
 	let chunk = [(0u64, 9u64), (10, 19)];
+	// ADR 0729: as the requester sends them, naming no lineage generation.
+	let targets: Vec<(u64, u64, Option<u64>)> = chunk
+		.iter()
+		.map(|(start, end)| (*start, *end, None))
+		.collect();
 	let signed = |range: (u64, u64)| {
 		server.make_signed_lease(
 			7,
@@ -19041,7 +19048,7 @@ async fn only_a_whole_valid_leases_response_is_cached() {
 		out.extend_from_slice(bytemuck::cast_slice(results));
 		out
 	};
-	let accept = |meta: &[u8]| server.accept_leases_response(meta, leader, &chunk, 7);
+	let accept = |meta: &[u8]| server.accept_leases_response(meta, leader, &targets, 7);
 
 	// A complete response with an ordered denial: only the granted lease.
 	let granted = accept(&response(

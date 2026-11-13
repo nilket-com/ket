@@ -275,3 +275,112 @@ fn a_built_claim_is_one_the_reducer_reserves_and_its_rows_reassemble() {
 		"{result:?}"
 	);
 }
+
+/// ADR 0729: a redirect is for the request's own range. A holder with several
+/// ranges is hinted for the one whose lease is live and not for the one whose
+/// lease lapsed or is gone; a lease of another holder over the range, or of
+/// another epoch, routes nowhere.
+#[test]
+fn a_redirect_follows_the_lease_of_the_requests_own_range_not_the_holders_others() {
+	let mut state = fixture::base(3);
+	fixture::grant_all(&mut state);
+	// Two ranges of one holder.
+	let universe = fixture::universe();
+	let holder = universe[0].0;
+	let ranges: Vec<(u64, u64)> = universe
+		.iter()
+		.filter(|(id, _)| *id == holder)
+		.map(|(_, range)| *range)
+		.take(2)
+		.collect();
+	let (target, other) = (ranges[0], ranges[1]);
+	let node = |id: u32| NodeId { id, _reserved: 0 };
+	// The fixture's leases run from 0 to 1_000.
+	let live = 1_000 + crate::consensus::decisions::TAKEOVER_GRACE_MS;
+	for position in [target.0, target.1, other.0, other.1] {
+		assert_eq!(
+			route_to_range_holder(&state, position, live),
+			Some(node(holder))
+		);
+		assert_eq!(
+			route_to_range_holder(&state, position, live + 1),
+			None,
+			"lapsed"
+		);
+	}
+	// The other range renewed, the target not: only the other is routed.
+	let mut renewed = state.leases[&other.0];
+	renewed.lease_expiry.physical_ms = 50_000;
+	state.leases.insert(other.0, renewed);
+	assert_eq!(route_to_range_holder(&state, target.0, 10_000), None);
+	assert_eq!(
+		route_to_range_holder(&state, other.0, 10_000),
+		Some(node(holder))
+	);
+	// No lease on record for the target at all.
+	state.leases.remove(&target.0);
+	assert_eq!(route_to_range_holder(&state, target.0, 0), None);
+	assert_eq!(
+		route_to_range_holder(&state, other.1, 10_000),
+		Some(node(holder))
+	);
+	// A lease over the target by someone else, or of another epoch.
+	let mut foreign = renewed;
+	foreign.range_start = target.0;
+	foreign.range_end = target.1;
+	foreign.holder = node(if holder == 1 { 2 } else { 1 });
+	state.leases.insert(target.0, foreign);
+	assert_eq!(route_to_range_holder(&state, target.0, 10_000), None);
+	let mut stale_epoch = foreign;
+	stale_epoch.holder = node(holder);
+	stale_epoch.epoch += 1;
+	state.leases.insert(target.0, stale_epoch);
+	assert_eq!(route_to_range_holder(&state, target.0, 10_000), None);
+	// A position no lineage covers.
+	let mut uncovered = fixture::base(3);
+	assert_eq!(route_to_range_holder(&uncovered, target.0, 0), None);
+	uncovered.decisions = None;
+	assert_eq!(route_to_range_holder(&uncovered, target.0, 0), None);
+}
+
+/// ADR 0729: a Reserved parent is routed to its recorded coordinator only while
+/// that coordinator's recorded lineage is open and leased. Once the lineage
+/// has closed, no node is hinted: not the old coordinator, and not the new
+/// holder, which can only resolve the parent, never drive it.
+#[test]
+fn a_reserved_parent_is_not_routed_to_a_coordinator_whose_lineage_closed() {
+	let (mut state, claim, _rsv) = fixture::reserved_parent(1);
+	let child = claim.children[usize::from(claim.coordinator)].clone();
+	let start = child.lineage.range_start;
+	let end = state.decisions.as_ref().unwrap().lineages()[&start].range_end;
+	let node = |id: u32| NodeId { id, _reserved: 0 };
+	// Open and leased (the fixture's leases run to 1_000).
+	assert_eq!(
+		route_to_recorded_coordinator(&state, child.lineage, child.holder, 500),
+		Some(node(child.holder.node))
+	);
+	// Open, its lease lapsed: nobody.
+	assert_eq!(
+		route_to_recorded_coordinator(&state, child.lineage, child.holder, 1_000_000),
+		None
+	);
+	// Closed by the holder's regrant after a gap: the same node holds the range
+	// at a new generation with a live lease, and the recorded lineage is closed.
+	let regrant = fixture::grant_request(
+		&state,
+		fixture::lease(child.holder.node, (start, end), 2_000, 9_000),
+	);
+	fixture::apply_next(&mut state, regrant);
+	let current = state.decisions.as_ref().unwrap().lineages()[&start];
+	assert_ne!(current.generation, child.lineage.generation);
+	assert_eq!(
+		route_to_range_holder(&state, start, 5_000),
+		Some(node(child.holder.node)),
+		"a fresh request for the range is routed"
+	);
+	assert_eq!(
+		route_to_recorded_coordinator(&state, child.lineage, child.holder, 5_000),
+		None,
+		"the Reserved parent is not"
+	);
+}

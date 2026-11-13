@@ -85,6 +85,97 @@ pub(crate) enum Settled {
 	Deadline,
 }
 
+/// ADR 0729: whether the lineage at `range_start` has an applied lease of its
+/// own: exactly its range, its holder, the current epoch, and not past its
+/// expiry by the takeover grace at `now_ms`. A lease of the same holder over
+/// another range says nothing about this one.
+fn lineage_leased(
+	state: &SmState,
+	range_start: u64,
+	lineage: &crate::consensus::decisions::Lineage,
+	now_ms: u64,
+) -> bool {
+	let epoch = state
+		.epoch_history
+		.last_key_value()
+		.map(|(epoch, _)| *epoch);
+	state.leases.get(&range_start).is_some_and(|lease| {
+		lease.range_end == lineage.range_end
+			&& lease.holder == lineage.holder
+			&& Some(lease.epoch) == epoch
+			&& Some(lineage.epoch) == epoch
+			&& lease
+				.lease_expiry
+				.physical_ms
+				.saturating_add(crate::consensus::decisions::TAKEOVER_GRACE_MS)
+				>= now_ms
+	})
+}
+
+/// ADR 0729: the node a request for `position` may be redirected to: the
+/// holder of the lineage covering it, while that lineage is leased. A routing
+/// judgement from applied state and the caller's clock; it decides nothing.
+pub(super) fn route_to_range_holder(state: &SmState, position: u64, now_ms: u64) -> Option<NodeId> {
+	let (start, lineage) = state
+		.decisions
+		.as_ref()?
+		.lineages()
+		.range(..=position)
+		.next_back()
+		.filter(|(_, lineage)| position <= lineage.range_end)?;
+	lineage_leased(state, *start, lineage, now_ms).then_some(lineage.holder)
+}
+
+/// ADR 0729: the recorded coordinator of a Reserved parent, while its recorded
+/// lineage is still open for it and leased. Once that lineage has closed the
+/// parent can only be refused, by the node that now holds the range; until
+/// that is recorded the answer is a stall, never a hint to the old coordinator.
+pub(super) fn route_to_recorded_coordinator(
+	state: &SmState,
+	lineage: LineageRef,
+	coordinator: Signer,
+	now_ms: u64,
+) -> Option<NodeId> {
+	if !crate::consensus::decisions::lineage_is_open(state, lineage, coordinator) {
+		return None;
+	}
+	let current = state
+		.decisions
+		.as_ref()?
+		.lineages()
+		.get(&lineage.range_start)?;
+	lineage_leased(state, lineage.range_start, current, now_ms).then_some(current.holder)
+}
+
+/// ADR 0729: the greatest floor among the lineages covering `positions`.
+pub(super) fn tenure_floor(state: &SmState, positions: &[u64]) -> u64 {
+	let Some(decisions) = state.decisions.as_ref() else {
+		return 0;
+	};
+	positions
+		.iter()
+		.filter_map(|position| {
+			decisions
+				.lineages()
+				.range(..=*position)
+				.next_back()
+				.filter(|(_, lineage)| *position <= lineage.range_end)
+				.map(|(_, lineage)| lineage.floor_ms)
+		})
+		.max()
+		.unwrap_or(0)
+}
+
+/// ADR 0729: the later of the caller's HLC and the first instant above
+/// `floor_ms`, for merging into the coordinator's clock.
+pub(super) fn above_floor(client_hlc: HybridTimestamp, floor_ms: u64) -> HybridTimestamp {
+	client_hlc.max(HybridTimestamp {
+		physical_ms: floor_ms.saturating_add(1),
+		logical: 0,
+		node_id: 0,
+	})
+}
+
 /// Builds a claim for a fresh parent, or says why this node cannot. Rows are
 /// grouped by the replica segment holding their position, each group a child
 /// of its lineage. Which rows each child carries is `rows_of_claim`'s to say.
@@ -236,6 +327,33 @@ pub(super) fn rows_of_claim(claim: &Claim, positions: &[u64]) -> Option<Vec<Vec<
 }
 
 impl WendelonDataServer {
+	/// ADR 0729: where a fresh request whose first row is at `position` may be
+	/// sent now, from this node's applied state and clock; `None` answers a
+	/// retryable stall that names no node.
+	pub(super) async fn route_for_position(&self, position: u64) -> Option<NodeId> {
+		let now_ms = self.clock.now_ms();
+		self.state_machine
+			.read_state(move |state| route_to_range_holder(state, position, now_ms))
+			.await
+	}
+
+	/// ADR 0729: where a Reserved parent's request may be sent now: its
+	/// recorded coordinator, only while that coordinator's recorded lineage is
+	/// open and leased. `None` answers a retryable stall: the parent is not
+	/// reported refused before its recorded refusal, and nothing is rewritten.
+	pub(super) async fn route_for_recorded_coordinator(
+		&self,
+		lineage: LineageRef,
+		coordinator: Signer,
+	) -> Option<NodeId> {
+		let now_ms = self.clock.now_ms();
+		self.state_machine
+			.read_state(move |state| {
+				route_to_recorded_coordinator(state, lineage, coordinator, now_ms)
+			})
+			.await
+	}
+
 	pub(super) fn merge_commit_hlc(&self, client_hlc: HybridTimestamp) -> HybridTimestamp {
 		self.hlc.merge(client_hlc)
 	}
@@ -509,14 +627,18 @@ impl WendelonDataServer {
 							return stalled;
 						};
 						if coordinator.node != signer.signer.node {
-							diag!(
-								"resume: redirect to recorded coordinator {}",
-								coordinator.node
-							);
-							return Settled::Redirect(NodeId {
-								id: coordinator.node,
-								_reserved: 0,
-							});
+							// ADR 0729: only while its recorded lineage is open and
+							// leased; otherwise a stall until the refusal is recorded.
+							return match self
+								.route_for_recorded_coordinator(lineage, coordinator)
+								.await
+							{
+								Some(route) => {
+									diag!("resume: redirect to recorded coordinator {}", route.id);
+									Settled::Redirect(route)
+								}
+								None => stalled,
+							};
 						}
 						let open = self
 							.state_machine
@@ -550,7 +672,15 @@ impl WendelonDataServer {
 					self.decisions
 						.pause_at(super::child_writes::PauseStage::AfterAbsent)
 						.await;
-					let commit_hlc = self.merge_commit_hlc(meta.client_hlc);
+					// ADR 0729: above the floor of every lineage the claim binds, so
+					// its versions order after everything reserved before those
+					// generations began. Read from applied state before stamping.
+					let floor_positions = positions.to_vec();
+					let floor_ms = self
+						.state_machine
+						.read_state(move |state| tenure_floor(state, &floor_positions))
+						.await;
+					let commit_hlc = self.merge_commit_hlc(above_floor(meta.client_hlc, floor_ms));
 					let local = signer.signer;
 					let claim_descriptor = descriptor.clone();
 					let built = self
@@ -570,6 +700,33 @@ impl WendelonDataServer {
 						.await;
 					let built = match built {
 						Ok(built) => built,
+						// ADR 0729: no hint to a holder whose applied lease has
+						// lapsed; the range's authority is unavailable until it
+						// renews or a replica takes over. Retryable, names no node.
+						Err(Settled::Redirect(holder)) => {
+							// Re-read for this request's own range: the lineage may
+							// have moved since `build_claim` read it.
+							let Some(first) = positions.first().copied() else {
+								return stalled;
+							};
+							return match self.route_for_position(first).await {
+								Some(route) => {
+									diag!(
+										"build_claim: redirect to {} (was {})",
+										route.id,
+										holder.id
+									);
+									Settled::Redirect(route)
+								}
+								None => {
+									diag!(
+										"build_claim: range authority at {} unavailable",
+										holder.id
+									);
+									stalled
+								}
+							};
+						}
 						Err(settled) => {
 							diag!("build_claim: {settled:?}");
 							return settled;
@@ -744,6 +901,19 @@ impl WendelonDataServer {
 		descriptor: &TableSchemaDescriptor,
 		batch: &RecordBatch,
 	) -> Option<u32> {
+		self.lineage_for_test(tenant, descriptor, batch)
+			.await
+			.map(|(_, lineage)| lineage.holder.id)
+	}
+
+	/// The lineage at a batch's first row's position and its range start, from
+	/// this node's applied state, with no write.
+	pub(crate) async fn lineage_for_test(
+		&self,
+		tenant: TenantId,
+		descriptor: &TableSchemaDescriptor,
+		batch: &RecordBatch,
+	) -> Option<(u64, crate::consensus::decisions::Lineage)> {
 		let hlc = self.merge_commit_hlc(HybridTimestamp {
 			physical_ms: 0,
 			logical: 0,
@@ -781,7 +951,7 @@ impl WendelonDataServer {
 					.range(..=position)
 					.next_back()
 					.filter(|(_, lineage)| position <= lineage.range_end)
-					.map(|(_, lineage)| lineage.holder.id)
+					.map(|(start, lineage)| (*start, *lineage))
 			})
 			.await
 	}

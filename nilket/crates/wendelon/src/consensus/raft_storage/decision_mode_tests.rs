@@ -217,6 +217,12 @@ async fn a_new_mode_store_writes_its_own_format_and_reopens() {
 
 use crate::consensus::decisions::tests as fixture;
 
+const PARENT_DECISIONS_V23_MANIFEST: &str =
+	include_str!("../../../tests/fixtures/consensus_body/parent_decisions_v23.txt");
+/// ADR 0725 to ADR 0728's format-18 bodies, retained (formats 20 and 22 moved
+/// no body of this corpus). ADR 0729 changed two: the decision state, whose
+/// lineages gained fields, and the lease batch, which gained its stamp and a
+/// generation per grant. Every other body is unchanged.
 const PARENT_DECISIONS_V18_MANIFEST: &str =
 	include_str!("../../../tests/fixtures/consensus_body/parent_decisions_v18.txt");
 /// ADR 0720 to ADR 0724's format-17 bodies, retained. ADR 0725 only appended a
@@ -252,7 +258,7 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 fn manifest() -> BTreeMap<String, String> {
-	parse(PARENT_DECISIONS_V18_MANIFEST)
+	parse(PARENT_DECISIONS_V23_MANIFEST)
 }
 
 /// ADR 0725: the three owner-signed operation kinds pinned in the format-18
@@ -376,10 +382,19 @@ fn golden_lease_batch() -> WendelonRequest {
 	let (holder, range) = fixture::universe()[0];
 	let next = (range.1 + 1, range.1 + 1_000);
 	WendelonRequest::AcquireLeases(
-		crate::consensus::LeaseBatch::new(vec![
-			fixture::lease(holder, range, 0, 1_000),
-			fixture::lease(holder, next, 500, 2_000),
-		])
+		crate::consensus::LeaseBatch::new(
+			1_700_000_000_000,
+			vec![
+				crate::consensus::LeaseBatchGrant {
+					lease: fixture::lease(holder, range, 0, 1_000),
+					expected_generation: Some(3),
+				},
+				crate::consensus::LeaseBatchGrant {
+					lease: fixture::lease(holder, next, 500, 2_000),
+					expected_generation: None,
+				},
+			],
+		)
 		.unwrap(),
 	)
 }
@@ -410,7 +425,7 @@ fn entry(index: u64, request: WendelonRequest) -> Entry<WendelonTypeConfig> {
 }
 
 #[test]
-fn the_format_18_bodies_match_their_goldens_and_round_trip() {
+fn the_format_23_bodies_match_their_goldens_and_round_trip() {
 	let stored = manifest();
 	let state = golden_state();
 	let body = encode_state_body(DecisionMode::ParentDecisions, &state).unwrap();
@@ -426,7 +441,12 @@ fn the_format_18_bodies_match_their_goldens_and_round_trip() {
 	let decisions = fixture::golden_history()
 		.into_iter()
 		.map(|(_, request)| request)
-		.filter(|request| request.is_parent_decisions_only());
+		// ADR 0729: the history's grants are lease batches now. Their body is
+		// pinned once, as `acquire_leases_0`; `decision_N` stays the Nth decision.
+		.filter(|request| {
+			request.is_parent_decisions_only()
+				&& !matches!(request, WendelonRequest::AcquireLeases(_))
+		});
 	for (n, request) in decisions.enumerate() {
 		actual.push((
 			format!("decision_{n}"),
@@ -456,7 +476,7 @@ fn the_format_18_bodies_match_their_goldens_and_round_trip() {
 		.collect();
 	assert!(
 		moved.is_empty(),
-		"format-18 bodies moved or are missing; expected lines:\n{}",
+		"format-23 bodies moved or are missing; expected lines:\n{}",
 		moved.join("\n")
 	);
 	assert_eq!(stored.len(), actual.len());
@@ -470,21 +490,36 @@ fn the_format_18_bodies_match_their_goldens_and_round_trip() {
 	// only the decision state differs from the format-16 corpus: by exactly the
 	// appended seal.
 	assert!(decisions.sealed().is_some());
-	// ADR 0725: every format-17 body is unchanged, and only the three
-	// owner-signed operations are new.
+	// ADR 0729: against the format-18 corpus, exactly two bodies moved: the
+	// decision state (lineage fields) and the lease batch (its stamp, and a
+	// generation per grant). Every decision, certified and owner-signed body
+	// is unchanged, byte for byte.
+	const MOVED: [&str; 2] = ["decisions_golden_history", "acquire_leases_0"];
+	let retained_v18 = parse(PARENT_DECISIONS_V18_MANIFEST);
+	assert_eq!(stored.len(), retained_v18.len());
+	for (name, hex) in &retained_v18 {
+		if MOVED.contains(&name.as_str()) {
+			assert_ne!(stored.get(name), Some(hex), "{name}");
+		} else {
+			assert_eq!(stored.get(name), Some(hex), "{name}");
+		}
+	}
+	// ADR 0725: every format-17 body is unchanged in format 18, and only the
+	// three owner-signed operations are new there.
 	let retained_v17 = parse(PARENT_DECISIONS_V17_MANIFEST);
 	for (name, hex) in &retained_v17 {
-		assert_eq!(stored.get(name), Some(hex), "{name}");
+		assert_eq!(retained_v18.get(name), Some(hex), "{name}");
 	}
-	assert_eq!(stored.len(), retained_v17.len() + 3);
+	assert_eq!(retained_v18.len(), retained_v17.len() + 3);
+	// ADR 0720 appended the seal to the decision state and changed nothing else.
 	let retained_v16 = parse(PARENT_DECISIONS_V16_MANIFEST);
 	assert_eq!(retained_v17.len(), retained_v16.len());
 	for (name, hex) in &retained_v16 {
 		if name == "decisions_golden_history" {
-			let now = &stored[name];
-			assert!(now.starts_with(hex.as_str()) && now.len() > hex.len());
+			let later = &retained_v17[name];
+			assert!(later.starts_with(hex.as_str()) && later.len() > hex.len());
 		} else {
-			assert_eq!(stored.get(name), Some(hex), "{name}");
+			assert_eq!(retained_v17.get(name), Some(hex), "{name}");
 		}
 	}
 	assert_eq!(decisions.retained_bodies(), 2);
@@ -497,7 +532,7 @@ fn the_format_18_bodies_match_their_goldens_and_round_trip() {
 	// appended the seal to it.)
 	let retained = parse(PARENT_DECISIONS_V13_MANIFEST);
 	for (name, hex) in &retained {
-		if name != "decisions_golden_history" {
+		if !MOVED.contains(&name.as_str()) {
 			assert_eq!(stored.get(name), Some(hex), "{name}");
 		}
 	}
@@ -505,7 +540,7 @@ fn the_format_18_bodies_match_their_goldens_and_round_trip() {
 	// unchanged, and only the two certified slab bodies are new.
 	let retained_v14 = parse(PARENT_DECISIONS_V14_MANIFEST);
 	for (name, hex) in &retained_v14 {
-		if name != "decisions_golden_history" {
+		if !MOVED.contains(&name.as_str()) {
 			assert_eq!(stored.get(name), Some(hex), "{name}");
 		}
 	}

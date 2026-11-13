@@ -157,6 +157,28 @@ pub trait TopologySource: Send + Sync {
 	) -> std::io::Result<ClusterStatusWire> {
 		self.fetch().await
 	}
+
+	/// ADR 0729: `fetch_from_candidates` for a caller that must move on: each
+	/// candidate is asked for at most `per_candidate` and never past
+	/// `deadline`, and no node in `excluded` is asked at all, whatever list it
+	/// would otherwise come from (a source's own bootstrap peers included). An
+	/// empty `candidates` means "the source's own peers", still minus
+	/// `excluded`; it never restores an excluded node. Returns the snapshot or
+	/// the last error, and the candidates that failed or did not answer in
+	/// their time.
+	///
+	/// The default cannot bound or steer a source it knows nothing about: it
+	/// asks as before and names no candidate. Its caller bounds the whole call
+	/// by its own deadline.
+	async fn fetch_from_candidates_within(
+		&self,
+		candidates: &[NodeId],
+		_excluded: &[NodeId],
+		_per_candidate: std::time::Duration,
+		_deadline: Option<std::time::Instant>,
+	) -> (std::io::Result<ClusterStatusWire>, Vec<NodeId>) {
+		(self.fetch_from_candidates(candidates).await, Vec::new())
+	}
 }
 
 // ============================================================
@@ -305,6 +327,62 @@ impl TopologySource for ControlRingTopologySource {
 				"no bootstrap peers configured for topology refresh",
 			)
 		}))
+	}
+
+	async fn fetch_from_candidates_within(
+		&self,
+		candidates: &[NodeId],
+		excluded: &[NodeId],
+		per_candidate: std::time::Duration,
+		deadline: Option<std::time::Instant>,
+	) -> (std::io::Result<ClusterStatusWire>, Vec<NodeId>) {
+		let mut last_err: Option<Error> = None;
+		let mut unanswered = Vec::new();
+		// The bootstrap peers `candidate_order` appends are held to the
+		// exclusions like any other candidate.
+		let permitted = self
+			.candidate_order(candidates)
+			.into_iter()
+			.filter(|peer| !excluded.iter().any(|node| node.id == peer.id));
+		for peer in permitted {
+			let limit = match deadline {
+				Some(deadline) => {
+					let left = deadline.saturating_duration_since(std::time::Instant::now());
+					if left.is_zero() {
+						last_err = Some(Error::new(
+							ErrorKind::TimedOut,
+							"the caller's deadline was reached during a topology refresh",
+						));
+						break;
+					}
+					left.min(per_candidate)
+				}
+				None => per_candidate,
+			};
+			match tokio::time::timeout(limit, self.fetch_from(peer)).await {
+				Ok(Ok(snapshot)) => return (Ok(snapshot), unanswered),
+				Ok(Err(error)) => {
+					unanswered.push(peer);
+					last_err = Some(error);
+				}
+				Err(_) => {
+					unanswered.push(peer);
+					last_err = Some(Error::new(
+						ErrorKind::TimedOut,
+						format!("node {} did not answer a topology refresh in time", peer.id),
+					));
+				}
+			}
+		}
+		(
+			Err(last_err.unwrap_or_else(|| {
+				Error::new(
+					ErrorKind::NotFound,
+					"no permitted peer for a topology refresh",
+				)
+			})),
+			unanswered,
+		)
 	}
 }
 

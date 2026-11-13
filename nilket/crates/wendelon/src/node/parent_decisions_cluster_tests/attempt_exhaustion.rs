@@ -894,20 +894,20 @@ async fn a_fresh_identity_answered_backpressured_on_every_attempt_is_reported_kn
 	);
 }
 
-/// One possible route by which the public client dials a stopped node, built on purpose (ADR
-/// 0718's checkpoint trace). It is not that checkpoint's history, which its log does not hold.
+/// One possible route by which the public client is sent to a stopped node, built on purpose
+/// (ADR 0718's checkpoint trace). It is not that checkpoint's history, which its log does not hold.
 /// Node 1 is running and answers NOT_LEADER hinting node 3; node 3 is not on the simulated
-/// network, as a stopped node is not. The client goes to node 1 first, follows the hint, and its
-/// own connect fails. That failure is returned at once: no other attempt, no other replica.
+/// network, as a stopped node is not. The client goes to node 1 first and follows the hint.
 ///
-/// The simulated transport reports the failed dial as `NotFound`. The QUIC transport reports a
-/// failed connect as `ConnectionRefused` (`network/quic_transport.rs`), so the kind pinned here
-/// is the simulator's.
-///
-/// The caller's request is what carries the parent write id. A second call with the same
-/// request, on a client that has no memory of the hint, reaches node 1 with the same id.
+/// Until ADR 0729 the client's own connect to node 3 failed the call at once: no other attempt,
+/// no other replica. Now a hinted node that cannot be reached is not the call's failure: nothing
+/// was sent to it, it is not asked again by this call, and the next attempt asks node 1 again
+/// under the same identity. Node 1 still redirects, so the call ends when its attempts do:
+/// exhausted, and known not committed by this call, since every answer it got was a redirect
+/// carrying no commit knowledge. (The simulated transport refuses the dial at once; a dial that
+/// never completes is `client_route`'s subject.)
 #[tokio::test]
-async fn a_hint_to_a_stopped_node_fails_the_clients_call_on_its_own_connect() {
+async fn a_hint_to_a_stopped_node_is_skipped_and_the_call_ends_with_its_attempts() {
 	let (enter, stopped) = (NODES[0], NODES[2]);
 	let not_leader = (
 		WriteStatus::NOT_LEADER,
@@ -917,7 +917,7 @@ async fn a_hint_to_a_stopped_node_fails_the_clients_call_on_its_own_connect() {
 		node: enter,
 		hint: stopped,
 		write_ids: std::sync::Mutex::new(Vec::new()),
-		answers: std::sync::Mutex::new([not_leader; 2].into_iter().collect()),
+		answers: std::sync::Mutex::new([not_leader; 4].into_iter().collect()),
 		attempts_remaining: std::sync::Mutex::new(Vec::new()),
 	});
 	let network = Arc::new(SimulatedTransportNetwork::default());
@@ -939,7 +939,7 @@ async fn a_hint_to_a_stopped_node_fails_the_clients_call_on_its_own_connect() {
 	for call in 1..=2_usize {
 		// A new client each call, as the three-node workflow makes one per attempt.
 		let client = client_entering_at(1, &network, 99, enter);
-		let error = tokio::time::timeout(
+		let answer = tokio::time::timeout(
 			BOUND,
 			client.table_write(TableWriteRequest {
 				meta: write_meta(&descriptor, 1, uuid),
@@ -950,21 +950,30 @@ async fn a_hint_to_a_stopped_node_fails_the_clients_call_on_its_own_connect() {
 		)
 		.await
 		.expect("the call returns")
-		.expect_err("the client's connect to the stopped node fails the call");
-		assert_eq!(error.kind(), std::io::ErrorKind::NotFound, "{error}");
+		.expect("an unreachable hinted node is not the call's error")
+		.response
+		.write;
 		assert_eq!(
-			error.to_string(),
-			format!(
-				"connect via QuicIoUring to {} failed: simulated transport target {stopped} is not published",
-				address(stopped)
+			(
+				status_name(answer.status),
+				knowledge_name(answer.mutation_commit_knowledge()),
+				stop_name(answer.mutation_stop_reason()),
 			),
+			(
+				status_name(WriteStatus::WRITE_ATTEMPTS_EXHAUSTED),
+				knowledge_name(MutationCommitKnowledge::KNOWN_NOT_COMMITTED),
+				stop_name(MutationStopReason::ATTEMPT_EXHAUSTION),
+			),
+			"call {call}: {}",
+			answer_text(&answer)
 		);
-		// One request reached node 1 in this call, its first attempt of three; nothing else was sent.
+		// Per call: the first attempt reached node 1, the second was the hinted node's refused
+		// connect, the third reached node 1 again. The same identity each time.
 		assert_eq!(
 			*scripted.attempts_remaining.lock().unwrap(),
-			vec![3; call],
+			[3, 1].repeat(call),
 			"call {call}"
 		);
-		assert_eq!(*scripted.write_ids.lock().unwrap(), vec![wanted; call]);
+		assert_eq!(*scripted.write_ids.lock().unwrap(), vec![wanted; 2 * call]);
 	}
 }

@@ -127,6 +127,156 @@ fn remaining_duration_millis(deadline: Option<Instant>) -> u64 {
 		.max(1)
 }
 
+/// ADR 0729: how long a mutation waits for one node before anything is sent
+/// to it, at each step that asks it (its turn in a topology refresh, the
+/// connect and stream open of an attempt), however the node was chosen: a
+/// hint, the remembered leader, or a replica from the topology. A policy for
+/// moving on to a node that answers; not failure detection, and never longer
+/// than the caller's deadline allows.
+pub(crate) const MUTATION_CANDIDATE_BUDGET: Duration = Duration::from_secs(1);
+
+fn deadline_passed(deadline: Option<Instant>) -> bool {
+	deadline.is_some_and(|deadline| Instant::now() >= deadline)
+}
+
+/// Which bound ended a step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Bound {
+	/// The step's own budget, with the caller's deadline still ahead.
+	Budget,
+	/// The caller's deadline.
+	Deadline,
+}
+
+/// ADR 0729: `step`, cut at the caller's deadline and, when given, at
+/// `budget`, whichever is first. With neither it runs as before. The step is
+/// dropped where it stood; nothing is detached.
+async fn bounded<T>(
+	deadline: Option<Instant>,
+	budget: Option<Duration>,
+	step: impl std::future::Future<Output = T>,
+) -> Result<T, Bound> {
+	let left = deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
+	let limit = match (left, budget) {
+		(None, None) => return Ok(step.await),
+		(Some(left), None) => left,
+		(None, Some(budget)) => budget,
+		(Some(left), Some(budget)) => left.min(budget),
+	};
+	match tokio::time::timeout(limit, step).await {
+		Ok(done) => Ok(done),
+		Err(_) if deadline_passed(deadline) => Err(Bound::Deadline),
+		Err(_) => Err(Bound::Budget),
+	}
+}
+
+/// A mutation attempt's stream, or why there is none.
+enum MutationStream {
+	Open(Box<dyn TransportStream>),
+	/// The node did not give a stream in its budget, or refused, with why.
+	/// Nothing was sent to it.
+	Unreachable(Error),
+	/// The caller's deadline, before anything was sent.
+	Deadline,
+}
+
+/// ADR 0729: what one mutation call has learned about where to ask.
+#[derive(Default)]
+struct MutationRoute {
+	/// The node the last answer hinted, unless it has not answered in this call.
+	hint: Option<NodeId>,
+	/// Nodes whose own mutation connect did not give a stream in this call,
+	/// however each was chosen. None is asked again by it, for an attempt or
+	/// for a refresh.
+	avoided: Vec<NodeId>,
+	/// Why the last such node gave no stream: the call's error when no node is
+	/// left to ask.
+	unreachable: Option<Error>,
+	/// Nodes that did not answer a topology refresh in this call. None is
+	/// asked for a refresh again by it. This says nothing about a mutation:
+	/// such a node is still tried, within its own budget.
+	refresh_unanswered: Vec<NodeId>,
+	/// An answered attempt left its outcome open (unchanged meaning). A node
+	/// that was never reached does not set it and cannot clear it.
+	unresolved: bool,
+}
+
+impl MutationRoute {
+	fn avoids(&self, node: NodeId) -> bool {
+		self.avoided.iter().any(|avoided| avoided.id == node.id)
+	}
+
+	fn avoid(&mut self, node: NodeId) {
+		if !self.avoids(node) {
+			self.avoided.push(node);
+		}
+		if self.hint.is_some_and(|hint| hint.id == node.id) {
+			self.hint = None;
+		}
+	}
+
+	/// The nodes a refresh of this call does not ask: both lists.
+	fn refresh_excluded(&self) -> Vec<NodeId> {
+		let mut excluded = self.avoided.clone();
+		for node in &self.refresh_unanswered {
+			if !excluded.iter().any(|known| known.id == node.id) {
+				excluded.push(*node);
+			}
+		}
+		excluded
+	}
+
+	/// The call's local stop at its deadline. `in_flight` (the deadline came
+	/// while an attempt that may have been sent was unanswered) is why the
+	/// call stopped; it does not change what is reported. See
+	/// [`local_mutation_stop`].
+	fn deadline_stop(
+		&self,
+		write_id: crate::schema::ClientWriteId,
+		_in_flight: bool,
+	) -> WriteResponseMeta {
+		local_mutation_stop(
+			write_id,
+			WriteStatus::WRITE_DEADLINE_EXCEEDED,
+			crate::schema::MutationStopReason::DEADLINE,
+		)
+	}
+
+	/// The call's stop when its last attempt was spent on a node that gave no
+	/// stream.
+	fn exhausted_stop(&self, write_id: crate::schema::ClientWriteId) -> WriteResponseMeta {
+		local_mutation_stop(
+			write_id,
+			WriteStatus::WRITE_ATTEMPTS_EXHAUSTED,
+			crate::schema::MutationStopReason::ATTEMPT_EXHAUSTION,
+		)
+	}
+}
+
+/// A stop this client decides itself, with no server answer to carry it: the
+/// operation's own identity echoed, and its outcome INDETERMINATE, always.
+///
+/// A call knows only its own attempts. The identity may be a caller's own
+/// (`WriteOptions::operation_id`), already submitted by an earlier call whose
+/// answer was lost, and accepted or still to be: a call that never reached a
+/// node has no evidence about that, so it must not say "known not committed".
+/// Precision is given up even for an identity that is in fact fresh. (The
+/// older path, exhaustion decided from this call's ANSWERED attempts, keeps
+/// its rule and its recorded cross-call limitation, DC-215.)
+fn local_mutation_stop(
+	write_id: crate::schema::ClientWriteId,
+	status: WriteStatus,
+	reason: crate::schema::MutationStopReason,
+) -> WriteResponseMeta {
+	let mut write: WriteResponseMeta = bytemuck::Zeroable::zeroed();
+	write.status = status;
+	write.echoed_write_id = write_id;
+	write.with_mutation_outcome(
+		crate::schema::MutationCommitKnowledge::INDETERMINATE,
+		reason,
+	)
+}
+
 fn prepare_mutation_attempt_deadline(
 	remaining_field: &mut u64,
 	original_deadline: Option<Instant>,
@@ -711,9 +861,21 @@ impl WendelonClient {
 				"TABLE_WRITE_REQ must contain at least one row",
 			));
 		};
-		let mut preferred_target = None;
-		let mut unresolved = false;
+		// ADR 0729: one caller deadline over the whole call, a finite budget for
+		// each node's connect, and a per-call list of nodes that gave no stream.
+		// See `MutationRoute`.
+		let (deadline, write_id) = (request.deadline, request.meta.parent_write_id);
+		let stopped = |write: WriteResponseMeta| TableWriteResult {
+			response: TableWriteResponseMeta {
+				write,
+				reject_code: PbcRejectCode::NONE.0,
+				_pad: [0; 6],
+			},
+			finalization: None,
+		};
+		let mut route = MutationRoute::default();
 		for attempt in 0..DATA_RETRY_BUDGET {
+			let last = attempt + 1 == DATA_RETRY_BUDGET;
 			request.meta.set_attempts_remaining(
 				u8::try_from(DATA_RETRY_BUDGET - attempt).expect("retry budget fits u8"),
 			);
@@ -721,8 +883,33 @@ impl WendelonClient {
 				&mut request.meta.deadline_remaining_millis,
 				request.deadline,
 			);
-			let target = preferred_target.unwrap_or(self.target_for_locality(key_locality)?);
-			let mut result = self.table_write_once(target, &request).await?;
+			if deadline_passed(deadline) {
+				return Ok(stopped(route.deadline_stop(write_id, false)));
+			}
+			let target = self.mutation_target(key_locality, &mut route)?;
+			let stream = match self.open_mutation_stream(target, deadline).await {
+				MutationStream::Open(stream) => stream,
+				MutationStream::Deadline => {
+					return Ok(stopped(route.deadline_stop(write_id, false)));
+				}
+				// Nothing of this attempt was sent. The attempt is spent; the next
+				// asks where the call would go without this node.
+				MutationStream::Unreachable(error) => {
+					route.avoid(target);
+					route.unreachable = Some(error);
+					if last {
+						return Ok(stopped(route.exhausted_stop(write_id)));
+					}
+					continue;
+				}
+			};
+			// From here this attempt may have been submitted: a local deadline
+			// says nothing about its outcome.
+			let mut result =
+				match bounded(deadline, None, self.table_write_send(stream, &request)).await {
+					Ok(result) => result?,
+					Err(_) => return Ok(stopped(route.deadline_stop(write_id, true))),
+				};
 			self.observe_write_response(&result.response.write);
 			if result.response.reject_code != PbcRejectCode::NONE.0 {
 				return Ok(result);
@@ -730,9 +917,9 @@ impl WendelonClient {
 			let Some(retry) = retry_write_response(&result.response.write) else {
 				return Ok(result);
 			};
-			unresolved |= attempt_unresolved(&result.response.write);
-			if attempt + 1 == DATA_RETRY_BUDGET {
-				let knowledge = exhausted_knowledge(unresolved);
+			route.unresolved |= attempt_unresolved(&result.response.write);
+			if last {
+				let knowledge = exhausted_knowledge(route.unresolved);
 				result.response.write.status = WriteStatus::WRITE_ATTEMPTS_EXHAUSTED;
 				result.response.write = result.response.write.with_mutation_outcome(
 					knowledge,
@@ -740,8 +927,12 @@ impl WendelonClient {
 				);
 				return Ok(result);
 			}
-			self.prepare_retry(Some(key_locality), retry).await?;
-			preferred_target = retry.preferred_target;
+			if !self
+				.prepare_mutation_retry(Some(key_locality), retry, deadline, &mut route)
+				.await?
+			{
+				return Ok(stopped(route.deadline_stop(write_id, false)));
+			}
 		}
 		unreachable!("bounded retry loop must return within budget")
 	}
@@ -756,9 +947,19 @@ impl WendelonClient {
 		validate_table_delete_request(&request)?;
 		let route_locality =
 			table_query_route_locality(request.meta.tenant_id, &request.descriptor)?;
-		let mut preferred_target = None;
-		let mut unresolved = false;
+		// ADR 0729: as `table_write`.
+		let (deadline, write_id) = (request.deadline, request.meta.parent_write_id);
+		let stopped = |write: WriteResponseMeta| {
+			let mut response: TableDeleteRowsResponseMeta = bytemuck::Zeroable::zeroed();
+			response.write = write;
+			TableDeleteRowsResult {
+				response,
+				finalization: None,
+			}
+		};
+		let mut route = MutationRoute::default();
 		for attempt in 0..DATA_RETRY_BUDGET {
+			let last = attempt + 1 == DATA_RETRY_BUDGET;
 			request.meta.set_attempts_remaining(
 				u8::try_from(DATA_RETRY_BUDGET - attempt).expect("retry budget fits u8"),
 			);
@@ -766,8 +967,29 @@ impl WendelonClient {
 				&mut request.meta.deadline_remaining_millis,
 				request.deadline,
 			);
-			let target = preferred_target.unwrap_or(self.target_for_locality(route_locality)?);
-			let mut result = self.table_delete_once(target, &request).await?;
+			if deadline_passed(deadline) {
+				return Ok(stopped(route.deadline_stop(write_id, false)));
+			}
+			let target = self.mutation_target(route_locality, &mut route)?;
+			let stream = match self.open_mutation_stream(target, deadline).await {
+				MutationStream::Open(stream) => stream,
+				MutationStream::Deadline => {
+					return Ok(stopped(route.deadline_stop(write_id, false)));
+				}
+				MutationStream::Unreachable(error) => {
+					route.avoid(target);
+					route.unreachable = Some(error);
+					if last {
+						return Ok(stopped(route.exhausted_stop(write_id)));
+					}
+					continue;
+				}
+			};
+			let mut result =
+				match bounded(deadline, None, self.table_delete_send(stream, &request)).await {
+					Ok(result) => result?,
+					Err(_) => return Ok(stopped(route.deadline_stop(write_id, true))),
+				};
 			self.observe_write_response(&result.response.write);
 			if result.response.reject_code != PbcRejectCode::NONE.0 {
 				return Ok(result);
@@ -775,9 +997,9 @@ impl WendelonClient {
 			let Some(retry) = retry_write_response(&result.response.write) else {
 				return Ok(result);
 			};
-			unresolved |= attempt_unresolved(&result.response.write);
-			if attempt + 1 == DATA_RETRY_BUDGET {
-				let knowledge = exhausted_knowledge(unresolved);
+			route.unresolved |= attempt_unresolved(&result.response.write);
+			if last {
+				let knowledge = exhausted_knowledge(route.unresolved);
 				result.response.write.status = WriteStatus::WRITE_ATTEMPTS_EXHAUSTED;
 				result.response.write = result.response.write.with_mutation_outcome(
 					knowledge,
@@ -785,8 +1007,12 @@ impl WendelonClient {
 				);
 				return Ok(result);
 			}
-			self.prepare_retry(Some(route_locality), retry).await?;
-			preferred_target = retry.preferred_target;
+			if !self
+				.prepare_mutation_retry(Some(route_locality), retry, deadline, &mut route)
+				.await?
+			{
+				return Ok(stopped(route.deadline_stop(write_id, false)));
+			}
 		}
 		unreachable!("bounded retry loop must return within budget")
 	}
@@ -1837,13 +2063,133 @@ impl WendelonClient {
 		decode_counter_read_response_frame(frame)
 	}
 
-	async fn table_write_once(
+	/// ADR 0729: a mutation attempt's stream to `target`, before anything is
+	/// sent. Every target gets the same finite budget, however it was chosen,
+	/// and its failure or silence is not the call's: the call asks elsewhere.
+	/// Cut at the caller's deadline.
+	async fn open_mutation_stream(
 		&self,
 		target: NodeId,
+		deadline: Option<Instant>,
+	) -> MutationStream {
+		let open = async {
+			let conn = self.factory.get_connection(target).await?;
+			conn.open_bi().await
+		};
+		match bounded(deadline, Some(MUTATION_CANDIDATE_BUDGET), open).await {
+			Ok(Ok(stream)) => MutationStream::Open(stream),
+			Ok(Err(error)) => MutationStream::Unreachable(error),
+			Err(Bound::Budget) => MutationStream::Unreachable(Error::new(
+				ErrorKind::TimedOut,
+				format!(
+					"node {} gave no stream for a mutation within its budget",
+					target.id
+				),
+			)),
+			Err(Bound::Deadline) => MutationStream::Deadline,
+		}
+	}
+
+	/// ADR 0729: where a mutation's next attempt goes: the hinted node unless it
+	/// gave no stream earlier in this call, else the remembered leader when it
+	/// is one of the row's replicas, else the first replica, skipping every
+	/// node that gave no stream. With none left, the call's error is why the
+	/// last one gave none.
+	fn mutation_target(
+		&self,
+		locality: Locality,
+		route: &mut MutationRoute,
+	) -> std::io::Result<NodeId> {
+		if let Some(hint) = route.hint {
+			return Ok(hint);
+		}
+		let replicas = self.replicas_for_locality(locality);
+		if replicas.is_empty() {
+			return Err(Error::new(
+				ErrorKind::NotFound,
+				"no replica available for the requested key range",
+			));
+		}
+		if let Some(leader) = self.leader() {
+			if replicas.iter().any(|node| node.id == leader.id) && !route.avoids(leader) {
+				return Ok(leader);
+			}
+		}
+		if let Some(node) = replicas.into_iter().find(|node| !route.avoids(*node)) {
+			return Ok(node);
+		}
+		Err(route.unreachable.take().unwrap_or_else(|| {
+			Error::new(
+				ErrorKind::NotConnected,
+				"no replica of the requested key range answered in this call",
+			)
+		}))
+	}
+
+	/// ADR 0729: `prepare_retry` for a mutation: the topology refresh asks each
+	/// candidate for a finite time and skips the nodes that already did not
+	/// answer one, the backoff does not outlast the caller's deadline, and the
+	/// next hint is taken unless that node's own mutation connect failed in this
+	/// call: a node that only failed the refresh is still tried. `false` when
+	/// the caller's deadline was reached.
+	async fn prepare_mutation_retry(
+		&self,
+		locality: Option<Locality>,
+		retry: RetryDirective,
+		deadline: Option<Instant>,
+		route: &mut MutationRoute,
+	) -> std::io::Result<bool> {
+		if retry.refresh_topology {
+			let excluded = route.refresh_excluded();
+			let candidates: Vec<NodeId> = self
+				.retry_candidates(locality, retry.preferred_target)
+				.into_iter()
+				.filter(|node| !excluded.iter().any(|known| known.id == node.id))
+				.collect();
+			let refresh = self.topology_source.fetch_from_candidates_within(
+				&candidates,
+				&excluded,
+				MUTATION_CANDIDATE_BUDGET,
+				deadline,
+			);
+			// The outer bound holds for a source that cannot bound itself.
+			let Ok((snapshot, unanswered)) = bounded(deadline, None, refresh).await else {
+				return Ok(false);
+			};
+			// A node that did not answer the refresh is not asked for one
+			// again. It may still take the mutation.
+			for node in unanswered {
+				if !route
+					.refresh_unanswered
+					.iter()
+					.any(|known| known.id == node.id)
+				{
+					route.refresh_unanswered.push(node);
+				}
+			}
+			match snapshot {
+				Ok(snapshot) => self.apply_snapshot(&snapshot),
+				Err(error) if retry.preferred_target.is_none() => return Err(error),
+				Err(_) => {}
+			}
+		}
+		if let Some(backoff) = retry.backoff {
+			if bounded(deadline, None, tokio::time::sleep(backoff))
+				.await
+				.is_err()
+			{
+				return Ok(false);
+			}
+		}
+		route.hint = retry.preferred_target.filter(|node| !route.avoids(*node));
+		Ok(!deadline_passed(deadline))
+	}
+
+	async fn table_write_send(
+		&self,
+		mut stream: Box<dyn TransportStream>,
 		request: &TableWriteRequest,
 	) -> std::io::Result<TableWriteResult> {
-		let conn = self.factory.get_connection(target).await?;
-		let mut stream = conn.open_bi().await?;
 		let arrow =
 			encode_table_write_arrow_section(&request.payload).map_err(std::io::Error::from)?;
 		let header = FrameHeader {
@@ -1872,13 +2218,11 @@ impl WendelonClient {
 		decode_table_write_response_frame(frame)
 	}
 
-	async fn table_delete_once(
+	async fn table_delete_send(
 		&self,
-		target: NodeId,
+		mut stream: Box<dyn TransportStream>,
 		request: &TableDeleteRowsRequest,
 	) -> std::io::Result<TableDeleteRowsResult> {
-		let conn = self.factory.get_connection(target).await?;
-		let mut stream = conn.open_bi().await?;
 		let payload = table_delete_rows_batch(&request.row_key_ids)?;
 		let arrow = encode_batch(&payload)?;
 		let header = FrameHeader {

@@ -825,9 +825,14 @@ impl Cluster {
 	}
 
 	/// A reopened node refuses its tiered locations until it has checked them against their
-	/// objects. Wait while the lookup of this row is refused as fenced on this slab, and only
-	/// that, within the polls' shared bound; say how long it took. Any other error, or a payload
-	/// file back on disk, fails at once. What the lookup then returns is judged by the caller.
+	/// objects. Wait while the lookup of this row is refused as fenced, and only that, within the
+	/// polls' shared bound; say how long it took. Any other error or reason, or a payload file
+	/// back on disk, fails at once. What the lookup then returns is judged by the caller.
+	///
+	/// The refusal is the store's, not the row's: the slab id it carries is the smallest slab of
+	/// the node whose tier pointer is still staged or unapplied, or zero when none is listed, and
+	/// is not the slab of the row asked for. It is not compared with this row's slab. Where the
+	/// row is, and what backs it, is asserted after the wait.
 	async fn wait_while_the_reopened_slab_is_fenced(&self, tiered: &TieredRow) {
 		use wendelon::storage::manager::{StaleLocation, StaleLocationReason, stale_location};
 		let node = self.node(tiered.node_id);
@@ -842,13 +847,14 @@ impl Cluster {
 				Ok(_) => break,
 				Err(error) => error,
 			};
-			let fenced = StaleLocation {
-				slab_id: tiered.slab_id,
-				reason: StaleLocationReason::Fenced,
-			};
-			assert_eq!(
-				stale_location(&error),
-				Some(fenced),
+			assert!(
+				matches!(
+					stale_location(&error),
+					Some(StaleLocation {
+						reason: StaleLocationReason::Fenced,
+						..
+					})
+				),
 				"locating the tiered row after reopening: {error:?}"
 			);
 			assert!(

@@ -80,6 +80,14 @@
     "withdraw_noop": true
   },
   {
+    "file": "crates/wendelon/src/node/parent_decisions_cluster_tests/client_route.rs",
+    "implementation": "PendingAt",
+    "retains_publication": false,
+    "withdrawal": "delegates to the wrapped simulated provider; publishes nothing itself",
+    "overrides_publish": false,
+    "withdraw_noop": false
+  },
+  {
     "file": "crates/wendelon/src/node/startup_ownership_tests.rs",
     "implementation": "BlockingWithdrawal",
     "retains_publication": false,

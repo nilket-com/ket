@@ -29,8 +29,24 @@
 //!   client's own, inside that call, under one operation identity. Its `Ok` is not treated as
 //!   proof of a committed acknowledgement: the public receipt does not expose the server's
 //!   commit knowledge. What this test relies on is the exact read-back of the row afterwards.
-//! - Every client call is made once. Any error, at any step, fails the test: nothing is asked
-//!   again from here, so no transport, authorisation or decode failure can be retried into a pass.
+//! - Every client call is made once, with one exception, the takeover stage's one write (below).
+//!   Everywhere else any error, at any step, fails the test: nothing is asked again, so no
+//!   transport, authorisation or decode failure can be retried into a pass.
+//!
+//! - ADR 0729, the last stage: a range's coordinating node is stopped and a write to that range
+//!   is answered by another. Which node coordinates a range is read from an actual committed
+//!   write: the receipt's commit HLC carries the node id of the coordinator that stamped it,
+//!   which is the holder of the row's range at that commit. Rows are written until one is
+//!   coordinated by a node that is not the control leader; that process is stopped in an
+//!   orderly way; the SAME row id (so the same range) is written again through the two live
+//!   processes, and its receipt must name a live node. This stage alone repeats a call: the
+//!   public client returns a stall as an error, so the one write is offered again, with the
+//!   SAME operation identity, until its one explicit bound. It is one logical operation. Only
+//!   the answers `offers_the_same_operation_again` names are offered again (a failed
+//!   connection, a redirect, this operation's own stall or exhausted attempts); any other
+//!   answer, and the bound itself, ends the test. What it shows: with a non-leader
+//!   range holder stopped, real processes move that range's authority and commit a write to it.
+//!   What it does not: a leader failure, a partition, or how long the takeover takes in general.
 //!
 //! Not covered: an object store, tiering, a leader failure, more than one host.
 
@@ -51,8 +67,8 @@ use wendelon::schema::{
 	TableSchemaDescriptor, TenantId,
 };
 use wendelon_client::{
-	BootstrapPeer, Client, ClientConfig, TableQueryOptions, TableSchemaUpdateRequest, TlsPaths,
-	WriteOptions,
+	BootstrapPeer, Client, ClientConfig, ClientError, TableQueryOptions, TableSchemaUpdateRequest,
+	TlsPaths, WriteOptions,
 };
 
 const NODES: [u32; 3] = [1, 2, 3];
@@ -504,13 +520,246 @@ async fn client_through(
 		.unwrap_or_else(|error| panic!("the client through node {}: {error:?}", member.id))
 }
 
-/// The one row, read with ONE LINEARIZABLE streamed table query, bounded by its own deadline
-/// and by the wait around it. Any error fails the test; nothing is asked again.
+/// The one row of the first stages.
 async fn expect_the_row(
 	client: &Client,
 	descriptor: &TableSchemaDescriptor,
 	deadline: Instant,
 	what: &str,
+) {
+	expect_rows(
+		client,
+		descriptor,
+		deadline,
+		what,
+		&[(7, "seven".to_owned())],
+	)
+	.await;
+}
+
+fn one_row(id: i64, name: &str) -> RecordBatch {
+	RecordBatch::try_new(
+		Arc::new(Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("name", DataType::LargeUtf8, true),
+		])),
+		vec![
+			Arc::new(Int64Array::from(vec![id])),
+			Arc::new(LargeStringArray::from(vec![name])),
+		],
+	)
+	.unwrap()
+}
+
+/// A fresh caller-minted operation identity, as the client mints its own.
+fn operation_id() -> wendelon::schema::ClientWriteId {
+	wendelon::schema::ClientWriteId {
+		client_uuid: *uuid::Uuid::now_v7().as_bytes(),
+		sequence_no: 0,
+		idempotency_ttl_ms: 60_000,
+		_pad: 0,
+	}
+}
+
+/// ADR 0729, the takeover stage only: whether an answer to its one write means the range's
+/// authority is unavailable for now, so the SAME operation may be offered again within its
+/// one bound. Exactly: a failed connection to a node (the stopped one), a redirect, the
+/// server's own stall of this operation, or the client's attempts for this operation running
+/// out. Everything else ends the test: an expired or conflicting operation, an internal
+/// error, a deadline, bad data or arguments, authorization, an answer about another operation.
+fn offers_the_same_operation_again(
+	error: &ClientError,
+	identity: wendelon::schema::ClientWriteId,
+) -> bool {
+	use std::io::ErrorKind;
+	use wendelon::schema::{MutationStopReason, WriteStatus};
+	match error {
+		ClientError::Io(io) => matches!(
+			io.kind(),
+			ErrorKind::ConnectionRefused
+				| ErrorKind::ConnectionReset
+				| ErrorKind::ConnectionAborted
+				| ErrorKind::NotConnected
+		),
+		ClientError::WriteFailed { status } => *status == WriteStatus::NOT_LEADER,
+		ClientError::MutationStopped {
+			operation_id,
+			status,
+			reason,
+			..
+		} => {
+			operation_id.client_uuid == identity.client_uuid
+				&& operation_id.sequence_no == identity.sequence_no
+				&& ((*status == WriteStatus::WRITE_STALLED && *reason == MutationStopReason::NONE)
+					|| (*status == WriteStatus::WRITE_ATTEMPTS_EXHAUSTED
+						&& *reason == MutationStopReason::ATTEMPT_EXHAUSTION))
+		}
+		_ => false,
+	}
+}
+
+/// The retry rule's cases, by name. Runs in a default pass: it spawns nothing.
+#[test]
+fn the_takeover_stage_offers_its_operation_again_only_for_an_unavailable_range() {
+	use std::io::{Error, ErrorKind};
+	use wendelon::schema::{MutationCommitKnowledge, MutationStopReason, WriteStatus};
+	let identity = operation_id();
+	let other = operation_id();
+	assert_ne!(identity.client_uuid, other.client_uuid);
+	let stopped = |operation_id, status, reason, knowledge| ClientError::MutationStopped {
+		operation_id,
+		status,
+		reason,
+		knowledge,
+	};
+	let io = |kind: ErrorKind| ClientError::Io(Error::new(kind, "test"));
+	let unknown = MutationCommitKnowledge::INDETERMINATE;
+	let not_committed = MutationCommitKnowledge::KNOWN_NOT_COMMITTED;
+	let cases: Vec<(&str, ClientError, bool)> = vec![
+		("connection refused", io(ErrorKind::ConnectionRefused), true),
+		("connection reset", io(ErrorKind::ConnectionReset), true),
+		("connection aborted", io(ErrorKind::ConnectionAborted), true),
+		("not connected", io(ErrorKind::NotConnected), true),
+		("invalid data", io(ErrorKind::InvalidData), false),
+		("invalid input", io(ErrorKind::InvalidInput), false),
+		("timed out", io(ErrorKind::TimedOut), false),
+		("unexpected eof", io(ErrorKind::UnexpectedEof), false),
+		("permission denied", io(ErrorKind::PermissionDenied), false),
+		("other", io(ErrorKind::Other), false),
+		(
+			"a redirect",
+			ClientError::WriteFailed {
+				status: WriteStatus::NOT_LEADER,
+			},
+			true,
+		),
+		(
+			"an internal error",
+			ClientError::WriteFailed {
+				status: WriteStatus::INTERNAL_ERROR,
+			},
+			false,
+		),
+		(
+			"a key conflict",
+			ClientError::WriteFailed {
+				status: WriteStatus::WRITE_KEY_CONFLICT,
+			},
+			false,
+		),
+		(
+			"a stall surfaced as a bare failure",
+			ClientError::WriteFailed {
+				status: WriteStatus::WRITE_STALLED,
+			},
+			false,
+		),
+		(
+			"this operation stalled, outcome indeterminate",
+			stopped(
+				identity,
+				WriteStatus::WRITE_STALLED,
+				MutationStopReason::NONE,
+				unknown,
+			),
+			true,
+		),
+		(
+			"this operation stalled, known not committed",
+			stopped(
+				identity,
+				WriteStatus::WRITE_STALLED,
+				MutationStopReason::NONE,
+				not_committed,
+			),
+			true,
+		),
+		(
+			"this operation's attempts ran out",
+			stopped(
+				identity,
+				WriteStatus::WRITE_ATTEMPTS_EXHAUSTED,
+				MutationStopReason::ATTEMPT_EXHAUSTION,
+				unknown,
+			),
+			true,
+		),
+		(
+			"a stall of another operation",
+			stopped(
+				other,
+				WriteStatus::WRITE_STALLED,
+				MutationStopReason::NONE,
+				unknown,
+			),
+			false,
+		),
+		(
+			"a stall that was the caller's deadline",
+			stopped(
+				identity,
+				WriteStatus::WRITE_STALLED,
+				MutationStopReason::DEADLINE,
+				unknown,
+			),
+			false,
+		),
+		(
+			"attempts exhausted with another reason",
+			stopped(
+				identity,
+				WriteStatus::WRITE_ATTEMPTS_EXHAUSTED,
+				MutationStopReason::NONE,
+				unknown,
+			),
+			false,
+		),
+		(
+			"this operation expired",
+			stopped(
+				identity,
+				WriteStatus::WRITE_OPERATION_EXPIRED,
+				MutationStopReason::NONE,
+				unknown,
+			),
+			false,
+		),
+		(
+			"this operation's deadline",
+			stopped(
+				identity,
+				WriteStatus::WRITE_DEADLINE_EXCEEDED,
+				MutationStopReason::DEADLINE,
+				unknown,
+			),
+			false,
+		),
+		("authorization", ClientError::AuthorizationFailed, false),
+		(
+			"quota",
+			ClientError::QuotaExceeded {
+				tenant_id: TenantId::new(TENANT),
+			},
+			false,
+		),
+	];
+	for (name, error, expected) in cases {
+		assert_eq!(
+			offers_the_same_operation_again(&error, identity),
+			expected,
+			"{name}: {error:?}"
+		);
+	}
+}
+
+/// Exactly `expected`, read with ONE LINEARIZABLE streamed table query, bounded by its own
+/// deadline and by the wait around it. Any error fails the test; nothing is asked again.
+async fn expect_rows(
+	client: &Client,
+	descriptor: &TableSchemaDescriptor,
+	deadline: Instant,
+	what: &str,
+	expected: &[(i64, String)],
 ) {
 	let bound = step(deadline);
 	let options = TableQueryOptions {
@@ -538,7 +787,10 @@ async fn expect_the_row(
 			rows.push((ids.value(row), names.value(row).to_owned()));
 		}
 	}
-	assert_eq!(rows, vec![(7, "seven".to_owned())], "{what}");
+	rows.sort();
+	let mut expected = expected.to_vec();
+	expected.sort();
+	assert_eq!(rows, expected, "{what}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -738,17 +990,7 @@ metrics = "127.0.0.1:{metrics}"
 	.expect("the schema update had no answer within its bound")
 	.unwrap_or_else(|error| panic!("the schema update: {error:?}"));
 
-	let row = RecordBatch::try_new(
-		Arc::new(Schema::new(vec![
-			Field::new("id", DataType::Int64, false),
-			Field::new("name", DataType::LargeUtf8, true),
-		])),
-		vec![
-			Arc::new(Int64Array::from(vec![7])),
-			Arc::new(LargeStringArray::from(vec!["seven"])),
-		],
-	)
-	.unwrap();
+	let row = one_row(7, "seven");
 	// The application's client: the storage credential, confined to its tenant.
 	let client = client_through(&members[0], &pki, Credential::Storage, deadline).await;
 	// ONE call. Its retries, if any, are the client's own under one operation identity; an
@@ -816,6 +1058,150 @@ metrics = "127.0.0.1:{metrics}"
 			&descriptor,
 			deadline,
 			&format!("after the restart, discovered through node {}", member.id),
+		)
+		.await;
+	}
+
+	// ADR 0729: a range's coordinating node is stopped, and a write to that range commits.
+	// The control leader as the running nodes name it now.
+	let inspection = inspect(&members[0], &pki);
+	assert!(inspection.ready, "node 1 is not ready: {}", inspection.raw);
+	let leader = inspection
+		.leader()
+		.unwrap_or_else(|| panic!("node 1 names no leader among the three: {}", inspection.raw));
+	// Rows written, each ONE call, until one is coordinated by a node that is not the leader:
+	// the coordinator stamps the commit HLC, and it is the holder of the row's range.
+	let mut expected = vec![(7_i64, "seven".to_owned())];
+	let mut target = None;
+	for id in 100_i64..116 {
+		let bound = step(deadline);
+		let receipt = tokio::time::timeout(
+			bound,
+			client.table_write(
+				TenantId::new(TENANT),
+				&descriptor,
+				one_row(id, "before"),
+				WriteOptions {
+					deadline: Some(Instant::now() + bound),
+					..WriteOptions::default()
+				},
+			),
+		)
+		.await
+		.unwrap_or_else(|_| panic!("the probe write of row {id} had no answer within its bound"))
+		.unwrap_or_else(|error| panic!("the probe write of row {id}: {error:?}"));
+		expected.push((id, "before".to_owned()));
+		let holder = receipt.commit_hlc.node_id;
+		assert!(NODES.contains(&holder), "row {id} was stamped by {holder}");
+		if holder != leader {
+			target = Some((id, holder));
+			break;
+		}
+	}
+	let (row_id, holder) =
+		target.expect("none of sixteen rows is coordinated by a node other than the leader");
+	eprintln!("smoke: leader {leader}; row {row_id} is coordinated by node {holder}; stopping it");
+	let stopped = members
+		.iter()
+		.find(|member| member.id == holder)
+		.expect("the holder is a member");
+	daemons.stop(holder, deadline);
+	let live: Vec<&Member> = members
+		.iter()
+		.filter(|member| member.id != holder)
+		.collect();
+	// The same row id, so the same range, through a live process: one operation identity,
+	// offered again only while the answer is a stall or a failed connection, until its bound.
+	let through = client_through(live[0], &pki, Credential::Storage, deadline).await;
+	let identity = operation_id();
+	let write_bound = Instant::now() + step(deadline);
+	let started = Instant::now();
+	let (receipt, attempts) = {
+		let mut attempts = 0_u32;
+		loop {
+			attempts += 1;
+			let left = write_bound.saturating_duration_since(Instant::now());
+			assert!(
+				!left.is_zero(),
+				"row {row_id} did not commit within its bound with node {holder} stopped \
+				 ({attempts} attempts)"
+			);
+			let answer = tokio::time::timeout(
+				left,
+				through.table_write(
+					TenantId::new(TENANT),
+					&descriptor,
+					one_row(row_id, "after"),
+					WriteOptions {
+						deadline: Some(Instant::now() + left),
+						operation_id: Some(identity),
+						..WriteOptions::default()
+					},
+				),
+			)
+			.await
+			.unwrap_or_else(|_| {
+				panic!("row {row_id} had no answer within its bound with node {holder} stopped")
+			});
+			match answer {
+				Ok(receipt) => break (receipt, attempts),
+				// The range's authority is not available yet, or the client was sent to the
+				// stopped node: the same operation is offered again. Nothing else is.
+				Err(error) if offers_the_same_operation_again(&error, identity) => {
+					eprintln!("smoke: attempt {attempts} of row {row_id}: {error}");
+					tokio::time::sleep(Duration::from_millis(250)).await;
+				}
+				Err(error) => panic!("the write of row {row_id}: {error:?}"),
+			}
+		}
+	};
+	let successor = receipt.commit_hlc.node_id;
+	eprintln!(
+		"smoke: row {row_id} committed under node {successor} after {attempts} attempts in {:?}",
+		started.elapsed()
+	);
+	assert!(
+		successor != holder && NODES.contains(&successor),
+		"row {row_id} was stamped by {successor} with node {holder} stopped"
+	);
+	expected.retain(|(id, _)| *id != row_id);
+	expected.push((row_id, "after".to_owned()));
+	for member in &live {
+		let through = client_through(member, &pki, Credential::Storage, deadline).await;
+		expect_rows(
+			&through,
+			&descriptor,
+			deadline,
+			&format!(
+				"with node {holder} stopped, discovered through node {}",
+				member.id
+			),
+			&expected,
+		)
+		.await;
+	}
+	// The stopped node returns, from the same file; every node is ready and reads the same.
+	daemons.start(stopped);
+	for member in &members {
+		wait_ready(
+			member,
+			&pki,
+			&mut daemons,
+			deadline,
+			"after the range holder's return",
+		);
+	}
+	for member in &members {
+		let through = client_through(member, &pki, Credential::Storage, deadline).await;
+		expect_rows(
+			&through,
+			&descriptor,
+			deadline,
+			&format!(
+				"after the holder's return, discovered through node {}",
+				member.id
+			),
+			&expected,
 		)
 		.await;
 	}

@@ -331,10 +331,15 @@ impl WendelonDataServer {
 							// Only the recorded coordinator drives it (S3c rule).
 							let only = &record.claim.children[0];
 							if only.holder.node != signer.signer.node {
-								return DeleteSettled::Redirect(NodeId {
-									id: only.holder.node,
-									_reserved: 0,
-								});
+								// ADR 0729: only while its recorded lineage is open
+								// and leased; otherwise a stall.
+								return match self
+									.route_for_recorded_coordinator(only.lineage, only.holder)
+									.await
+								{
+									Some(route) => DeleteSettled::Redirect(route),
+									None => stalled,
+								};
 							}
 							let (lineage, holder) = (only.lineage, only.holder);
 							let open = self
@@ -373,7 +378,14 @@ impl WendelonDataServer {
 					if lineage.holder.id != signer.signer.node
 						|| lineage.incarnation != signer.signer.incarnation
 					{
-						return DeleteSettled::Redirect(lineage.holder);
+						// ADR 0729: the holder of this row's range, only while that
+						// range is leased; re-read, since the lineage may have moved.
+						return match self.route_for_position(position).await {
+							Some(route) if route.id != signer.signer.node => {
+								DeleteSettled::Redirect(route)
+							}
+							_ => stalled,
+						};
 					}
 					// The one evaluation both a tombstone and a noop come from.
 					let selection = match bounded(
@@ -396,9 +408,12 @@ impl WendelonDataServer {
 					};
 					let proposal = match selection.outcome {
 						DeleteOutcome::Deleted { winner_hlc, .. } => {
-							let Some(commit_hlc) =
-								tombstone_hlc(&self.hlc, winner_hlc, meta.client_hlc)
-							else {
+							// ADR 0729: and above the lineage's floor.
+							let Some(commit_hlc) = tombstone_hlc(
+								&self.hlc,
+								winner_hlc,
+								super::coordinator::above_floor(meta.client_hlc, lineage.floor_ms),
+							) else {
 								return stalled;
 							};
 							let plan = self

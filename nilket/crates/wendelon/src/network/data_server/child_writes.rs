@@ -978,6 +978,14 @@ pub(crate) struct DecisionPeer {
 	/// so a held certified LSM job is the only work on its slabs.
 	#[cfg(test)]
 	pub(crate) pause_local_cleanup: Arc<std::sync::atomic::AtomicBool>,
+	/// Test-only (ADR 0729): this store asks for no leases, as a holder that is
+	/// running and cut off from the leader would not get any.
+	#[cfg(test)]
+	pub(crate) pause_lease_refresh: Arc<std::sync::atomic::AtomicBool>,
+	/// Test-only (ADR 0729): this store proposes no takeover, as a candidate
+	/// that cannot act.
+	#[cfg(test)]
+	pub(crate) pause_takeover: Arc<std::sync::atomic::AtomicBool>,
 	/// Test-only: a KV key read as if at another position, the seam for a
 	/// different key at the same position.
 	#[cfg(test)]
@@ -1137,6 +1145,10 @@ impl Default for DecisionPeer {
 			pause_cleanup: Default::default(),
 			#[cfg(test)]
 			pause_local_cleanup: Default::default(),
+			#[cfg(test)]
+			pause_lease_refresh: Default::default(),
+			#[cfg(test)]
+			pause_takeover: Default::default(),
 			#[cfg(test)]
 			kv_position_override: Default::default(),
 		}
@@ -1392,18 +1404,35 @@ impl WendelonDataServer {
 					id: signer.node,
 					_reserved: 0,
 				};
-				for (start, end) in ring.primary_ranges_for(node) {
-					let held = decisions.lineages().get(&start).is_some_and(|lineage| {
-						lineage.range_end == end
-							&& lineage.holder.id == signer.node
-							&& lineage.incarnation == signer.incarnation
-							&& lineage.epoch == config.epoch
-					});
-					let leased = leases.iter().any(|(low, high, epoch)| {
+				let leased = |start: u64, end: u64| {
+					leases.iter().any(|(low, high, epoch)| {
 						*epoch == config.epoch && *low <= start && end <= *high
-					});
-					if !held || !leased {
-						return Some("PrimaryRangeNotLeased".into());
+					})
+				};
+				// ADR 0729: every range this store holds must be leased. A
+				// primary range with no lineage yet is not ready; one another
+				// node holds is that node's to lease.
+				for (start, end) in ring.primary_ranges_for(node) {
+					match decisions.lineages().get(&start) {
+						None => return Some("PrimaryRangeNotLeased".into()),
+						Some(lineage) if lineage.holder.id != signer.node => {}
+						Some(lineage) => {
+							let held = lineage.range_end == end
+								&& lineage.incarnation == signer.incarnation
+								&& lineage.epoch == config.epoch;
+							if !held || !leased(start, end) {
+								return Some("PrimaryRangeNotLeased".into());
+							}
+						}
+					}
+				}
+				for (start, lineage) in decisions.lineages() {
+					if lineage.holder.id == signer.node
+						&& (lineage.incarnation != signer.incarnation
+							|| lineage.epoch != config.epoch
+							|| !leased(*start, lineage.range_end))
+					{
+						return Some("HeldRangeNotLeased".into());
 					}
 				}
 				None

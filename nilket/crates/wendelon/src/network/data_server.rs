@@ -3818,8 +3818,11 @@ impl WendelonDataServer {
 		// per pass; Today renews one range at a time. Every request is stamped
 		// when it is made, never from a reading reused across a wait.
 		if self.parent_decisions() {
+			// ADR 0729: the ranges whose lineage this node holds, each named by
+			// its generation, plus its primary ranges that have no lineage.
+			let targets = self.decision_lease_targets(ranges).await;
 			return self
-				.renew_leases_batched(&ranges, epoch, clock, ttl_ms, current_leader)
+				.renew_leases_batched(&targets, epoch, clock, ttl_ms, current_leader)
 				.await;
 		}
 		let mut granted = 0usize;

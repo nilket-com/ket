@@ -6708,11 +6708,26 @@ fn apply_request_at_log_index(
 			}
 			(WendelonResponse::Success, None)
 		}
-		WendelonRequest::AcquireLease(lease) => (apply_lease_grant(state, lease), None),
+		// ADR 0729: under ParentDecisions a grant names its lineage generation,
+		// which only the batch carries; the single grant is denied there.
+		WendelonRequest::AcquireLease(lease) => (
+			if state.decisions.is_some() {
+				WendelonResponse::LeaseDenied
+			} else {
+				apply_lease_grant(state, lease, None)
+			},
+			None,
+		),
 		// ADR 0701: one holder's renewals, ParentDecisions only. An invalid
 		// envelope applies nothing; a valid one applies each lease in declared
 		// order exactly as an `AcquireLease`, so a later denial undoes nothing.
 		WendelonRequest::AcquireLeases(batch) => (apply_lease_batch(state, &batch), None),
+		// ADR 0729: a release names no lineage generation, so under
+		// ParentDecisions it could end a later tenure than the one it was sent
+		// in. Denied there, before any effect; nothing in production sends it.
+		WendelonRequest::ReleaseLease(_) if state.decisions.is_some() => {
+			(WendelonResponse::LeaseDenied, None)
+		}
 		WendelonRequest::ReleaseLease(release) => match state.leases.get(&release.range_start) {
 			Some(existing)
 				if existing.range_end == release.range_end
@@ -7054,6 +7069,26 @@ fn apply_create_tenant(state: &mut SmState, create: CreateTenant) -> WendelonRes
 		return WendelonResponse::Error(format!(
 			"tenant {} replication_factor must be greater than zero",
 			create.tenant_id.get()
+		));
+	}
+	// ADR 0729: while a range's authority is held off its ring primary, a
+	// tenant whose replicas would not be every data member is refused: its
+	// writes to that range could name no admissible holder, and nothing would
+	// return the authority. Before any tenant or keyset state changes.
+	if state.decisions.is_some()
+		&& crate::consensus::decisions::any_lineage_off_primary(state)
+		&& state
+			.epoch_history
+			.last_key_value()
+			.is_some_and(|(_, config)| {
+				(create.replication_factor as usize)
+					< crate::consensus::decisions::data_members(config).len()
+			}) {
+		return WendelonResponse::Error(format!(
+			"tenant {} replication_factor {} is below the data member count while a range's \
+			 authority is held off its primary",
+			create.tenant_id.get(),
+			create.replication_factor
 		));
 	}
 	if state.tenants.contains_key(&create.tenant_id) {
@@ -10274,7 +10309,11 @@ fn serialize_entry_page_as(
 		EntryPayload::Normal(WendelonRequest::OwnerOp(_)) => (LogEntryKind::APPEND, 0),
 		EntryPayload::Normal(WendelonRequest::AcquireLeases(batch)) => (
 			LogEntryKind::APPEND,
-			batch.leases().first().map(|lease| lease.epoch).unwrap_or(0),
+			batch
+				.grants()
+				.first()
+				.map(|grant| grant.lease.epoch)
+				.unwrap_or(0),
 		),
 		EntryPayload::Normal(WendelonRequest::EstablishRootCheck(_)) => (LogEntryKind::APPEND, 0),
 		EntryPayload::Normal(WendelonRequest::CreateTenant(_)) => (LogEntryKind::APPEND, 0),
@@ -10549,9 +10588,12 @@ async fn decode_snapshot_file_with_identity(
 
 /// One lease grant: the single grant's rules, shared by `AcquireLease` and
 /// each lease of an `AcquireLeases` (ADR 0701).
+/// `tenure` is the ParentDecisions batch's expectation and stamp for this
+/// grant (ADR 0729); `None` under Today.
 fn apply_lease_grant(
 	state: &mut SmState,
 	lease: crate::schema::LeaseDescriptor,
+	tenure: Option<(Option<u64>, u64)>,
 ) -> WendelonResponse {
 	// Range must be well-formed. A reversed window would
 	// otherwise overlap nothing in the existing map, so a
@@ -10561,7 +10603,15 @@ fn apply_lease_grant(
 	}
 	// ADR 0699 S2: the fixed range universe and its lineages.
 	let effect = if state.decisions.is_some() {
-		match crate::consensus::decisions::admit_lease_grant(state, &lease) {
+		let Some((expected_generation, stamp_ms)) = tenure else {
+			return WendelonResponse::LeaseDenied;
+		};
+		match crate::consensus::decisions::admit_lease_grant(
+			state,
+			&lease,
+			expected_generation,
+			stamp_ms,
+		) {
 			Ok(effect) => Some(effect),
 			Err(()) => return WendelonResponse::LeaseDenied,
 		}
@@ -10607,10 +10657,10 @@ fn apply_lease_grant(
 /// ADR 0701: why a lease batch is refused whole, or `None` when every lease may
 /// be applied: one holder and one epoch, no duplicate range start, every range
 /// well-formed. Emptiness is checked by the caller.
-fn lease_batch_malformed(leases: &[crate::schema::LeaseDescriptor]) -> Option<&'static str> {
-	let first = leases.first()?;
+fn lease_batch_malformed(grants: &[crate::consensus::LeaseBatchGrant]) -> Option<&'static str> {
+	let first = &grants.first()?.lease;
 	let mut starts = std::collections::BTreeSet::new();
-	for lease in leases {
+	for lease in grants.iter().map(|grant| &grant.lease) {
 		if lease.holder != first.holder || lease.epoch != first.epoch {
 			return Some("leases of more than one holder or epoch");
 		}
@@ -10633,18 +10683,23 @@ fn apply_lease_batch(
 	if state.decisions.is_none() {
 		return WendelonResponse::Error("a lease batch is refused under Today".into());
 	}
-	let leases = batch.leases();
-	if leases.is_empty() {
+	let grants = batch.grants();
+	if grants.is_empty() {
 		return WendelonResponse::Error("lease batch malformed: empty".into());
 	}
-	if let Some(why) = lease_batch_malformed(leases) {
+	if let Some(why) = lease_batch_malformed(grants) {
 		return WendelonResponse::Error(format!("lease batch malformed: {why}"));
 	}
-	let results = leases
+	let stamp_ms = batch.stamp_ms();
+	let results = grants
 		.iter()
-		.map(|lease| crate::consensus::LeaseGrantResult {
-			range_start: lease.range_start,
-			granted: apply_lease_grant(state, *lease) == WendelonResponse::Success,
+		.map(|grant| crate::consensus::LeaseGrantResult {
+			range_start: grant.lease.range_start,
+			granted: apply_lease_grant(
+				state,
+				grant.lease,
+				Some((grant.expected_generation, stamp_ms)),
+			) == WendelonResponse::Success,
 		})
 		.collect();
 	WendelonResponse::LeaseResults(crate::consensus::LeaseGrantResults::from_applied(results))

@@ -782,29 +782,63 @@ pub enum WendelonRequest {
 /// refuses a longer sequence from its length, before allocating it; the
 /// envelope's other rules (one holder and epoch, no duplicate start, well-formed
 /// ranges, not empty) are checked whole at apply.
+///
+/// ADR 0729: the batch carries the replicated leader stamp of the entry it is
+/// built into, used only where a grant begins a lineage generation, and each
+/// grant names the generation of the lineage it expects to hold.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LeaseBatch(Vec<crate::schema::LeaseDescriptor>);
+pub struct LeaseBatch {
+	stamp_ms: u64,
+	grants: Vec<LeaseBatchGrant>,
+}
+
+/// ADR 0729: one grant of a batch. `expected_generation` is the generation of
+/// the range's lineage as the requester saw it, `None` where it saw none. A
+/// grant whose expectation is not the applied state's is denied, so a delayed
+/// request cannot act on a later tenure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeaseBatchGrant {
+	pub lease: crate::schema::LeaseDescriptor,
+	pub expected_generation: Option<u64>,
+}
 
 impl LeaseBatch {
 	/// `None` above the cap.
-	pub fn new(leases: Vec<crate::schema::LeaseDescriptor>) -> Option<Self> {
-		(leases.len() <= crate::schema::MAX_LEASES_PER_BATCH).then_some(Self(leases))
+	pub fn new(stamp_ms: u64, grants: Vec<LeaseBatchGrant>) -> Option<Self> {
+		(grants.len() <= crate::schema::MAX_LEASES_PER_BATCH).then_some(Self { stamp_ms, grants })
 	}
 
-	pub fn leases(&self) -> &[crate::schema::LeaseDescriptor] {
-		&self.0
+	pub fn stamp_ms(&self) -> u64 {
+		self.stamp_ms
+	}
+
+	pub fn grants(&self) -> &[LeaseBatchGrant] {
+		&self.grants
 	}
 }
 
 impl Serialize for LeaseBatch {
 	fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-		serializer.collect_seq(&self.0)
+		struct Grants<'a>(&'a [LeaseBatchGrant]);
+		impl Serialize for Grants<'_> {
+			fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+				serializer.collect_seq(self.0)
+			}
+		}
+		(self.stamp_ms, Grants(&self.grants)).serialize(serializer)
 	}
 }
 
 impl<'de> Deserialize<'de> for LeaseBatch {
 	fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-		deserialize_bounded_seq(deserializer, crate::schema::MAX_LEASES_PER_BATCH).map(Self)
+		struct Grants(Vec<LeaseBatchGrant>);
+		impl<'de> Deserialize<'de> for Grants {
+			fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+				deserialize_bounded_seq(deserializer, crate::schema::MAX_LEASES_PER_BATCH).map(Self)
+			}
+		}
+		let (stamp_ms, Grants(grants)) = <(u64, Grants)>::deserialize(deserializer)?;
+		Ok(Self { stamp_ms, grants })
 	}
 }
 

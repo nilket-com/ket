@@ -2478,6 +2478,7 @@ impl WendelonNode {
 		if let Some(proposals) = decision_proposals {
 			let incarnation = slab.owner_ref()?.incarnation();
 			let data_server = data_server.clone();
+			let decision_lease_ttl = cfg.data_ring_lease_ttl;
 			let mut stop = data_server.decision_maintenance_stop();
 			scope
 				.handles()
@@ -2511,6 +2512,11 @@ impl WendelonNode {
 						proposals.clock_probe_step(&mut probe).await;
 						let _ = maintenance.ensure_signer_once(incarnation).await;
 						let _ = maintenance.advance_floor_once().await;
+						// ADR 0729: take the ranges of a holder that stopped
+						// renewing, then resolve what it left reserved.
+						let _ = data_server
+							.takeover_step(&maintenance, decision_lease_ttl)
+							.await;
 						let _ = maintenance
 							.resolve_closed_once(DECISION_RESOLVE_BATCH)
 							.await;

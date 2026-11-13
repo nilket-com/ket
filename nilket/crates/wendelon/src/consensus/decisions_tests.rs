@@ -216,8 +216,67 @@ pub(crate) fn peek_index() -> u64 {
 	NEXT_INDEX.with(|next| next.get())
 }
 
+/// ADR 0729: the batch a holder's lease pass would build for `leases` from
+/// this state: each grant names the generation of the lineage the state holds
+/// for its range (`None` where it holds none), stamped `stamp_ms`.
+pub(crate) fn lease_batch_at(
+	state: &SmState,
+	stamp_ms: u64,
+	leases: Vec<LeaseDescriptor>,
+) -> WendelonRequest {
+	let grants = leases
+		.into_iter()
+		.map(|lease| crate::consensus::LeaseBatchGrant {
+			lease,
+			expected_generation: state
+				.decisions
+				.as_ref()
+				.and_then(|decisions| decisions.lineages().get(&lease.range_start))
+				.map(|lineage| lineage.generation),
+		})
+		.collect();
+	WendelonRequest::AcquireLeases(crate::consensus::LeaseBatch::new(stamp_ms, grants).unwrap())
+}
+
+/// One grant, as this mode carries it (ADR 0729): a batch of one, answered as
+/// the single grant used to be.
+pub(crate) fn grant_request(state: &SmState, lease: LeaseDescriptor) -> WendelonRequest {
+	lease_batch_at(state, 0, vec![lease])
+}
+
+fn granted(response: WendelonResponse) -> WendelonResponse {
+	match response {
+		WendelonResponse::LeaseResults(results) if results.results().len() == 1 => {
+			if results.results()[0].granted {
+				WendelonResponse::Success
+			} else {
+				WendelonResponse::LeaseDenied
+			}
+		}
+		other => other,
+	}
+}
+
 fn grant(state: &mut SmState, lease: LeaseDescriptor) -> WendelonResponse {
-	apply_next(state, WendelonRequest::AcquireLease(lease))
+	// Today keeps the single grant; this mode carries a grant in its batch.
+	if state.decisions.is_none() {
+		return apply_next(state, WendelonRequest::AcquireLease(lease));
+	}
+	let request = grant_request(state, lease);
+	granted(apply_next(state, request))
+}
+
+/// Closes `range`'s generation the way this mode does without a takeover: its
+/// holder's regrant after its lease lapsed opens a new one (ADR 0729 keeps
+/// that boundary; `ReleaseLease` is denied in the mode).
+fn close_by_gap_regrant(state: &mut SmState, holder: u32, range: (u64, u64)) {
+	let expiry = state.leases[&range.0].lease_expiry.physical_ms;
+	let before = decisions(state).lineages[&range.0].generation;
+	assert_eq!(
+		grant(state, lease(holder, range, expiry + 1, expiry + 1_000)),
+		WendelonResponse::Success
+	);
+	assert_ne!(decisions(state).lineages[&range.0].generation, before);
 }
 
 /// Grants every range of the universe to its primary.
@@ -254,11 +313,8 @@ pub(crate) fn golden_history() -> Vec<(u64, WendelonRequest)> {
 	let mut scratch = base(3);
 	let mut entries = Vec::new();
 	for (holder, range) in universe() {
-		run(
-			&mut scratch,
-			&mut entries,
-			WendelonRequest::AcquireLease(lease(holder, range, 0, 1_000)),
-		);
+		let request = grant_request(&scratch, lease(holder, range, 0, 1_000));
+		run(&mut scratch, &mut entries, request);
 	}
 	let kids = children(&scratch, 2);
 	let mut kept = Vec::new();
@@ -270,6 +326,9 @@ pub(crate) fn golden_history() -> Vec<(u64, WendelonRequest)> {
 			kept.push((holder, range));
 			continue;
 		}
+		// ADR 0729: denied in this mode, with no effect. Kept in the history
+		// so every later entry keeps its log index, and with them every
+		// recorded claim and acknowledgement its bytes.
 		run(
 			&mut scratch,
 			&mut entries,
@@ -293,11 +352,8 @@ pub(crate) fn golden_history() -> Vec<(u64, WendelonRequest)> {
 	);
 	// An unrelated renewal between the Reserve and its decision.
 	let (holder, range) = kept[0];
-	run(
-		&mut scratch,
-		&mut entries,
-		WendelonRequest::AcquireLease(lease(holder, range, 500, 2_000)),
-	);
+	let request = grant_request(&scratch, lease(holder, range, 500, 2_000));
+	run(&mut scratch, &mut entries, request);
 	let commands = [
 		DecisionCommand::Finalize {
 			key: accepted.key,
@@ -327,7 +383,8 @@ pub(crate) fn golden_history() -> Vec<(u64, WendelonRequest)> {
 			decisions.retained_bodies(),
 			decisions.retry_keys()
 		),
-		(2, 2, 1)
+		// ADR 0729: every range keeps its lineage; a release is denied.
+		(universe().len(), 2, 1)
 	);
 	assert_eq!(
 		decisions.body(rsv).unwrap().status,
@@ -370,14 +427,16 @@ pub(crate) fn key(issued_ms: u64, sequence_no: u64) -> ParentKey {
 
 /// A child for a whole replica segment whose replicas are exactly `rf` nodes.
 fn segment_child(state: &SmState, segment: &ReplicaSegment, content: u8) -> ChildClaim {
-	let holder = segment.replicas[0].id;
 	let (range_start, lineage) = decisions(state)
 		.lineages
 		.range(..=segment.start)
 		.next_back()
 		.map(|(start, lineage)| (*start, *lineage))
 		.unwrap();
-	assert!(segment.end <= lineage.range_end && lineage.holder.id == holder);
+	// ADR 0729: the holder is the lineage's, which is the segment's first
+	// replica until a takeover moves it.
+	let holder = lineage.holder.id;
+	assert!(segment.end <= lineage.range_end);
 	ChildClaim {
 		range_start: segment.start,
 		range_end: segment.end,
@@ -395,16 +454,15 @@ fn segment_child(state: &SmState, segment: &ReplicaSegment, content: u8) -> Chil
 /// The first `n` replica segments whose primaries differ from one another.
 pub(crate) fn children(state: &SmState, n: usize) -> Vec<ChildClaim> {
 	let mut out: Vec<ChildClaim> = Vec::new();
+	let mut primaries: Vec<u32> = Vec::new();
 	for segment in ring(3).replica_segments() {
 		if out.len() == n {
 			break;
 		}
-		if out
-			.iter()
-			.any(|child| child.holder.node == segment.replicas[0].id)
-		{
+		if primaries.contains(&segment.replicas[0].id) {
 			continue;
 		}
+		primaries.push(segment.replicas[0].id);
 		out.push(segment_child(state, &segment, out.len() as u8 + 1));
 	}
 	assert_eq!(out.len(), n);
@@ -696,8 +754,11 @@ fn the_applied_lease_source_follows_the_record_not_the_issuer() {
 	));
 }
 
+/// ADR 0729: a release names no lineage generation, so this mode denies it
+/// whoever sends it and changes nothing. A generation ends without a takeover
+/// only by its holder's regrant after a gap, or a prune.
 #[test]
-fn a_release_ends_its_lineage_and_an_absent_or_mismatched_release_changes_nothing() {
+fn a_release_is_denied_in_the_mode_and_a_gap_regrant_is_what_closes_a_generation() {
 	let mut state = base(3);
 	let (holder, range) = universe()[0];
 	grant(&mut state, lease(holder, range, 0, 1_000));
@@ -711,28 +772,18 @@ fn a_release_ends_its_lineage_and_an_absent_or_mismatched_release_changes_nothin
 	};
 	let before = state.clone();
 	let other = if holder == 1 { 2 } else { 1 };
-	assert_eq!(
-		apply_next(&mut state, release(other, EPOCH)),
-		WendelonResponse::LeaseDenied
-	);
-	assert_eq!(decisions(&state), decisions(&before));
-	assert_eq!(
-		apply_next(&mut state, release(holder, EPOCH)),
-		WendelonResponse::Success
-	);
-	assert!(decisions(&state).lineages.is_empty());
-	let generation = decisions(&state).next_generation;
-	for _ in 0..3 {
+	for (who, epoch) in [(other, EPOCH), (holder, EPOCH), (holder, EPOCH + 1)] {
 		assert_eq!(
-			apply_next(&mut state, release(holder, EPOCH)),
-			WendelonResponse::Success
+			apply_next(&mut state, release(who, epoch)),
+			WendelonResponse::LeaseDenied
 		);
+		assert_eq!(decisions(&state), decisions(&before));
+		assert_eq!(state.leases, before.leases);
 	}
-	assert_eq!(
-		decisions(&state).next_generation,
-		generation,
-		"no generation is manufactured"
-	);
+	let generation = decisions(&state).next_generation;
+	close_by_gap_regrant(&mut state, holder, range);
+	assert_eq!(decisions(&state).lineages.len(), 1);
+	assert_eq!(decisions(&state).next_generation, generation + 1);
 }
 
 #[test]
@@ -789,13 +840,8 @@ fn twenty_thousand_regrants_keep_one_lineage_per_range() {
 	let generation = decisions(&state).next_generation;
 	for round in 0..5_000u64 {
 		for (holder, range) in &ranges {
-			let release = WendelonRequest::ReleaseLease(ReleaseLeaseRequestMeta {
-				range_start: range.0,
-				range_end: range.1,
-				epoch: EPOCH,
-				holder: node(*holder),
-			});
-			assert_eq!(apply_next(&mut state, release), WendelonResponse::Success);
+			// Each regrant starts after the last lease ended: a gap, so a new
+			// generation (ADR 0729 keeps this boundary).
 			let start = 2_000 + round * 10;
 			assert_eq!(
 				grant(&mut state, lease(*holder, *range, start, start + 5)),
@@ -903,14 +949,10 @@ fn a_new_claims_commit_hlc_may_lead_the_stamp_only_by_the_gate_bound() {
 	);
 	let child = edge.children[0].clone();
 	let range_end = decisions(&state).lineages[&child.lineage.range_start].range_end;
-	apply_next(
+	close_by_gap_regrant(
 		&mut state,
-		WendelonRequest::ReleaseLease(ReleaseLeaseRequestMeta {
-			range_start: child.lineage.range_start,
-			range_end,
-			epoch: EPOCH,
-			holder: node(child.holder.node),
-		}),
+		child.holder.node,
+		(child.lineage.range_start, range_end),
 	);
 	assert_eq!(
 		reserve(&mut state, &edge, T0 - 1),
@@ -1249,14 +1291,10 @@ fn a_closed_lineage_refuses_the_parent_before_any_evidence_counts() {
 	let (mut state, claim, rsv) = reserved_parent(1);
 	let child = claim.children[1].clone();
 	let lineage = decisions(&state).lineages[&child.lineage.range_start];
-	apply_next(
+	close_by_gap_regrant(
 		&mut state,
-		WendelonRequest::ReleaseLease(ReleaseLeaseRequestMeta {
-			range_start: child.lineage.range_start,
-			range_end: lineage.range_end,
-			epoch: EPOCH,
-			holder: node(child.holder.node),
-		}),
+		child.holder.node,
+		(child.lineage.range_start, lineage.range_end),
 	);
 	// Re-granting the same range to the same holder does not reopen it (no ABA).
 	grant(
@@ -1902,14 +1940,10 @@ fn only_the_coordinator_ranges_holder_drives_resolve_of_a_closed_parent() {
 		.unwrap()
 		.clone();
 	let end = decisions(&state).lineages[&child.lineage.range_start].range_end;
-	apply_next(
+	close_by_gap_regrant(
 		&mut state,
-		WendelonRequest::ReleaseLease(ReleaseLeaseRequestMeta {
-			range_start: child.lineage.range_start,
-			range_end: end,
-			epoch: EPOCH,
-			holder: node(child.holder.node),
-		}),
+		child.holder.node,
+		(child.lineage.range_start, end),
 	);
 	assert_eq!(
 		resolvable_by(&state, coordinator, 8),
@@ -2740,8 +2774,8 @@ fn a_reserved_parent_or_an_unretired_key_blocks_the_cut() {
 //  ADR 0701: A HOLDER'S BATCHED LEASE RENEWAL
 // ============================================================
 
-fn lease_batch(leases: Vec<LeaseDescriptor>) -> WendelonRequest {
-	WendelonRequest::AcquireLeases(crate::consensus::LeaseBatch::new(leases).unwrap())
+fn lease_batch(state: &SmState, leases: Vec<LeaseDescriptor>) -> WendelonRequest {
+	lease_batch_at(state, 0, leases)
 }
 
 fn batch_results(response: WendelonResponse) -> Vec<(u64, bool)> {
@@ -2768,11 +2802,12 @@ fn batch_matches_singles(
 	let singles: Vec<(u64, bool)> = leases
 		.iter()
 		.map(|lease| {
-			let response = apply_next(&mut one, WendelonRequest::AcquireLease(*lease));
+			let response = grant(&mut one, *lease);
 			(lease.range_start, response == WendelonResponse::Success)
 		})
 		.collect();
-	let batched = batch_results(apply_next(&mut many, lease_batch(leases)));
+	let request = lease_batch(&many, leases);
+	let batched = batch_results(apply_next(&mut many, request));
 	assert_eq!(batched, singles);
 	assert_eq!(one.leases, many.leases);
 	assert_eq!(decisions(&one).lineages, decisions(&many).lineages);
@@ -2871,7 +2906,10 @@ fn a_gapped_lease_batch_leaves_the_old_parent_to_be_refused_at_finalize() {
 	);
 	gapped.issuer = node(2);
 	assert_eq!(
-		batch_results(apply_next(&mut state, lease_batch(vec![gapped]))),
+		batch_results({
+			let request = lease_batch(&state, vec![gapped]);
+			apply_next(&mut state, request)
+		}),
 		vec![(child.lineage.range_start, true)]
 	);
 	assert_eq!(
@@ -2917,7 +2955,8 @@ fn a_malformed_lease_batch_or_one_under_today_applies_nothing() {
 	] {
 		let mut state = base(3);
 		let (leases_before, decisions_before) = (state.leases.clone(), decisions(&state).clone());
-		let response = apply_next(&mut state, lease_batch(leases));
+		let request = lease_batch(&state, leases);
+		let response = apply_next(&mut state, request);
 		assert!(
 			matches!(&response, WendelonResponse::Error(message) if message.starts_with("lease batch malformed")),
 			"{why}: {response:?}"
@@ -2926,7 +2965,8 @@ fn a_malformed_lease_batch_or_one_under_today_applies_nothing() {
 		assert_eq!(decisions(&state), &decisions_before, "{why}");
 	}
 	let mut today = SmState::default();
-	let response = apply_next(&mut today, lease_batch(vec![good]));
+	let request = lease_batch(&today, vec![good]);
+	let response = apply_next(&mut today, request);
 	assert!(
 		matches!(response, WendelonResponse::Error(_)),
 		"{response:?}"
@@ -2941,17 +2981,18 @@ fn an_oversized_lease_batch_is_refused_from_its_length() {
 	use crate::consensus::{LeaseBatch, LeaseGrantResults};
 	use crate::schema::MAX_LEASES_PER_BATCH;
 	let one = lease(universe()[0].0, universe()[0].1, 0, 1_000);
-	let at_cap = postcard::to_stdvec(&vec![one; MAX_LEASES_PER_BATCH]).unwrap();
-	assert_eq!(
-		postcard::from_bytes::<LeaseBatch>(&at_cap)
-			.unwrap()
-			.leases()
-			.len(),
-		MAX_LEASES_PER_BATCH
-	);
-	let over = postcard::to_stdvec(&vec![one; MAX_LEASES_PER_BATCH + 1]).unwrap();
+	let one = crate::consensus::LeaseBatchGrant {
+		lease: one,
+		expected_generation: None,
+	};
+	// The wire shape: the stamp, then the bounded sequence of grants.
+	let at_cap = postcard::to_stdvec(&(7_u64, vec![one; MAX_LEASES_PER_BATCH])).unwrap();
+	let decoded = postcard::from_bytes::<LeaseBatch>(&at_cap).unwrap();
+	assert_eq!(decoded.grants().len(), MAX_LEASES_PER_BATCH);
+	assert_eq!(decoded.stamp_ms(), 7);
+	let over = postcard::to_stdvec(&(7_u64, vec![one; MAX_LEASES_PER_BATCH + 1])).unwrap();
 	assert!(postcard::from_bytes::<LeaseBatch>(&over).is_err());
-	assert!(LeaseBatch::new(vec![one; MAX_LEASES_PER_BATCH + 1]).is_none());
+	assert!(LeaseBatch::new(7, vec![one; MAX_LEASES_PER_BATCH + 1]).is_none());
 	// A declared length of a billion with no elements behind it is refused
 	// from the length alone.
 	let huge = postcard::to_stdvec(&1_000_000_000u32).unwrap();
@@ -3139,9 +3180,25 @@ fn a_sealed_store_takes_a_same_placement_epoch_and_writes_resume_after_regrant()
 		regrant.epoch = EPOCH + 1;
 		grant(&mut state, regrant);
 	}
-	let second = claim(key(T0, 2), children(&state, 1), 0);
+	// ADR 0729: the regranted lineages began after the first write, so their
+	// floor is above its stamp: a claim at that stamp is refused, one above
+	// the floor is reserved.
+	let floor = decisions(&state)
+		.lineages
+		.values()
+		.map(|lineage| lineage.floor_ms)
+		.max()
+		.unwrap();
+	assert_eq!(floor, T0 + DECISION_COMMIT_HLC_LEAD_MS);
+	let below = claim(key(T0, 2), children(&state, 1), 0);
+	assert_eq!(
+		reserve(&mut state, &below, T0),
+		refused(DecisionRefusal::BelowTenureFloor)
+	);
+	let mut second = claim(key(T0, 3), children(&state, 1), 0);
+	second.commit_hlc = hts(floor + 1);
 	assert!(matches!(
-		reserve(&mut state, &second, T0),
+		reserve(&mut state, &second, T0 + 1),
 		DecisionResult::Reserved { .. }
 	));
 }
@@ -3248,7 +3305,9 @@ fn the_seal_outlives_every_record_and_a_snapshot_cannot_drop_it() {
 	state.decisions = Some(pruned);
 	grant_all(&mut state);
 	state.last_membership = formed_membership(&[1, 2, 3, 4]);
-	let claim = claim(key(T0 + 10_000_000, 9), children(&state, 1), 0);
+	// Above the regranted lineages' floors (ADR 0729), so the seal is what refuses.
+	let mut claim = claim(key(T0 + 10_000_000, 9), children(&state, 1), 0);
+	claim.commit_hlc = hts(T0 + 10_000_000);
 	assert_eq!(
 		reserve(&mut state, &claim, T0 + 10_000_000),
 		refused(DecisionRefusal::MembershipSealed)
@@ -3298,4 +3357,595 @@ fn a_local_signer_is_not_current_unbound_bound_or_mismatched() {
 		local_signer_binding(&state, mine, key),
 		LocalSignerBinding::NotCurrent
 	);
+}
+
+// ============================================================
+//  ADR 0729: A RANGE'S AUTHORITY MOVES TO A REPLICA
+// ============================================================
+
+fn takeover(
+	state: &mut SmState,
+	range_start: u64,
+	generation: u64,
+	successor: u32,
+	stamp_ms: u64,
+) -> DecisionResult {
+	decide(
+		state,
+		DecisionCommand::TakeOverLineage {
+			takeover: sign_for_test(
+				TakeOverBody {
+					range_start,
+					generation,
+					successor: signer(successor),
+				},
+				signer(successor),
+			),
+			stamp_ms,
+		},
+	)
+}
+
+/// A sealed store with one reserved parent, the range of its coordinator
+/// child, that range's holder, and its lease renewed to expire at
+/// `T0 + 10_000` (so it is unexpired against the ring clock, which the
+/// Reserve set to `T0`).
+fn sealed_with_a_live_lease() -> (SmState, Claim, u64, (u64, u64), u32) {
+	let (mut state, claim, rsv) = reserved_parent(1);
+	let child = claim.children[usize::from(claim.coordinator)].clone();
+	let start = child.lineage.range_start;
+	let end = decisions(&state).lineages[&start].range_end;
+	let holder = child.holder.node;
+	assert_eq!(
+		grant(&mut state, lease(holder, (start, end), 500, T0 + 10_000)),
+		WendelonResponse::Success,
+		"a renewal"
+	);
+	assert_eq!(decisions(&state).clock_ms(), T0);
+	(state, claim, rsv, (start, end), holder)
+}
+
+const LAPSED: u64 = T0 + 10_000 + TAKEOVER_GRACE_MS + 1;
+
+#[test]
+fn a_takeover_needs_a_lapsed_lease_the_current_generation_and_an_eligible_successor() {
+	let (mut state, _claim, _rsv, range, holder) = sealed_with_a_live_lease();
+	let generation = decisions(&state).lineages[&range.0].generation;
+	let successor = (1..=3).find(|id| *id != holder).unwrap();
+	let third = (1..=3)
+		.find(|id| *id != holder && *id != successor)
+		.unwrap();
+	let before = state.clone();
+	let unchanged = |state: &SmState, what: &str| {
+		assert_eq!(decisions(state), decisions(&before), "{what}");
+		assert_eq!(state.leases, before.leases, "{what}");
+	};
+	// The lease has not lapsed on the ring clock: at its expiry, and through
+	// the grace.
+	for stamp in [T0, T0 + 10_000, T0 + 10_000 + TAKEOVER_GRACE_MS] {
+		assert_eq!(
+			takeover(&mut state, range.0, generation, successor, stamp),
+			refused(DecisionRefusal::TakeoverNotLapsed),
+			"{stamp}"
+		);
+		unchanged(&state, "not lapsed");
+	}
+	// Past the grace: another generation, no such lineage, the holder itself.
+	assert_eq!(
+		takeover(&mut state, range.0, generation + 1, successor, LAPSED),
+		refused(DecisionRefusal::TakeoverStale)
+	);
+	assert_eq!(
+		takeover(&mut state, range.0 + 1, generation, successor, LAPSED),
+		refused(DecisionRefusal::TakeoverStale)
+	);
+	assert_eq!(
+		takeover(&mut state, range.0, generation, holder, LAPSED),
+		refused(DecisionRefusal::TakeoverIneligible)
+	);
+	unchanged(&state, "stale or ineligible");
+	// A successor at an incarnation that is not its node's current one.
+	let mut replaced = state.clone();
+	replace_incarnation(&mut replaced, successor, StoreIncarnation::from_raw(0xDEAD));
+	let replaced_before = replaced.clone();
+	assert_eq!(
+		takeover(&mut replaced, range.0, generation, successor, LAPSED),
+		refused(DecisionRefusal::SignerNotCurrent)
+	);
+	assert_eq!(
+		decisions(&replaced).lineages,
+		decisions(&replaced_before).lineages
+	);
+	// Some tenant's replicas are not every data member: unsupported.
+	let mut narrow = state.clone();
+	narrow.tenants.get_mut(&TENANT).unwrap().replication_factor = 2;
+	assert_eq!(
+		takeover(&mut narrow, range.0, generation, successor, LAPSED),
+		refused(DecisionRefusal::UnsupportedShape)
+	);
+	// A membership that is not the sealed one.
+	let mut moved = state.clone();
+	moved.last_membership = formed_membership(&[1, 2, 3, 4]);
+	assert_eq!(
+		takeover(&mut moved, range.0, generation, successor, LAPSED),
+		refused(DecisionRefusal::MembershipSealed)
+	);
+	// No write admitted yet: nothing is sealed, nothing is taken over.
+	let mut unsealed = base(3);
+	grant_all(&mut unsealed);
+	let (first_holder, first_range) = universe()[0];
+	let other = (1..=3).find(|id| *id != first_holder).unwrap();
+	let unsealed_generation = decisions(&unsealed).lineages[&first_range.0].generation;
+	assert_eq!(
+		takeover(
+			&mut unsealed,
+			first_range.0,
+			unsealed_generation,
+			other,
+			LAPSED
+		),
+		refused(DecisionRefusal::FormationIncomplete)
+	);
+
+	// Admitted: the lineage is the successor's at a new generation, with a
+	// floor above everything the ring clock has seen, protected, awaiting its
+	// first grant; the old holder's lease record is gone; the clock is the stamp.
+	let next = decisions(&state).next_generation;
+	assert_eq!(
+		takeover(&mut state, range.0, generation, successor, LAPSED),
+		DecisionResult::TookOver {
+			range_start: range.0,
+			generation: next
+		}
+	);
+	let lineage = decisions(&state).lineages[&range.0];
+	assert_eq!(
+		lineage,
+		Lineage {
+			range_end: range.1,
+			epoch: EPOCH,
+			holder: node(successor),
+			incarnation: inc(successor),
+			generation: next,
+			floor_ms: LAPSED + DECISION_COMMIT_HLC_LEAD_MS,
+			// The lapsed lease ran from 500 to T0 + 10_000: clamped to the maximum.
+			protected_until_ms: LAPSED + TAKEOVER_PROTECT_MAX_MS,
+			first_grant_pending: true,
+		}
+	);
+	assert_eq!(decisions(&state).next_generation, next + 1);
+	assert_eq!(decisions(&state).clock_ms(), LAPSED);
+	assert!(!state.leases.contains_key(&range.0));
+	assert_eq!(
+		decisions(&state).lineages.len(),
+		decisions(&before).lineages.len()
+	);
+
+	// The consumed generation cannot be taken again; the new one is protected.
+	assert_eq!(
+		takeover(&mut state, range.0, generation, third, LAPSED + 1),
+		refused(DecisionRefusal::TakeoverStale)
+	);
+	assert_eq!(
+		takeover(&mut state, range.0, next, third, lineage.protected_until_ms),
+		refused(DecisionRefusal::TakeoverNotLapsed)
+	);
+	// The successor never got a grant: past its protection the range moves again.
+	let again = decisions(&state).next_generation;
+	assert_eq!(
+		takeover(
+			&mut state,
+			range.0,
+			next,
+			third,
+			lineage.protected_until_ms + 1
+		),
+		DecisionResult::TookOver {
+			range_start: range.0,
+			generation: again
+		}
+	);
+	let lineage = decisions(&state).lineages[&range.0];
+	assert_eq!(lineage.holder, node(third));
+	// No lease was on record this time: the default protection.
+	assert_eq!(
+		lineage.protected_until_ms,
+		decisions(&state).clock_ms() + TAKEOVER_PROTECT_DEFAULT_MS
+	);
+}
+
+#[test]
+fn after_a_takeover_only_the_successor_is_granted_and_its_first_grant_keeps_the_generation() {
+	let (mut state, _claim, _rsv, range, holder) = sealed_with_a_live_lease();
+	let old = decisions(&state).lineages[&range.0].generation;
+	let successor = (1..=3).find(|id| *id != holder).unwrap();
+	takeover(&mut state, range.0, old, successor, LAPSED);
+	let taken = decisions(&state).lineages[&range.0];
+	let batch = |state: &mut SmState, who: u32, expected: Option<u64>, start: u64, expiry: u64| {
+		let grants = vec![crate::consensus::LeaseBatchGrant {
+			lease: lease(who, range, start, expiry),
+			expected_generation: expected,
+		}];
+		granted(apply_next(
+			state,
+			WendelonRequest::AcquireLeases(
+				crate::consensus::LeaseBatch::new(LAPSED + 5_000, grants).unwrap(),
+			),
+		))
+	};
+	let before = state.clone();
+	// The old holder, whatever generation it names; the successor naming the
+	// generation it replaced, or none; the single grant; a release.
+	for (who, expected) in [
+		(holder, Some(old)),
+		(holder, Some(taken.generation)),
+		(holder, None),
+		(successor, Some(old)),
+		(successor, None),
+	] {
+		assert_eq!(
+			batch(&mut state, who, expected, LAPSED, LAPSED + 3_000),
+			WendelonResponse::LeaseDenied,
+			"{who} {expected:?}"
+		);
+		assert_eq!(decisions(&state), decisions(&before), "{who} {expected:?}");
+		assert_eq!(state.leases, before.leases);
+	}
+	assert_eq!(
+		apply_next(
+			&mut state,
+			WendelonRequest::AcquireLease(lease(successor, range, LAPSED, LAPSED + 3_000))
+		),
+		WendelonResponse::LeaseDenied,
+		"the single grant names no generation"
+	);
+	assert_eq!(decisions(&state), decisions(&before));
+
+	// The successor's first grant: the takeover's generation and floor stand.
+	assert_eq!(
+		batch(
+			&mut state,
+			successor,
+			Some(taken.generation),
+			LAPSED,
+			LAPSED + 3_000
+		),
+		WendelonResponse::Success
+	);
+	let first = decisions(&state).lineages[&range.0];
+	assert_eq!(
+		first,
+		Lineage {
+			first_grant_pending: false,
+			..taken
+		}
+	);
+	assert_eq!(state.leases[&range.0].holder, node(successor));
+	// A renewal continues it.
+	assert_eq!(
+		batch(
+			&mut state,
+			successor,
+			Some(taken.generation),
+			LAPSED + 1_000,
+			LAPSED + 4_000
+		),
+		WendelonResponse::Success
+	);
+	assert_eq!(decisions(&state).lineages[&range.0], first);
+	// A regrant after a gap opens a new generation for the same holder, with a
+	// floor from the ring clock and the batch's stamp.
+	let clock = decisions(&state).clock_ms();
+	assert_eq!(
+		batch(
+			&mut state,
+			successor,
+			Some(taken.generation),
+			LAPSED + 4_001,
+			LAPSED + 7_000
+		),
+		WendelonResponse::Success
+	);
+	let regranted = decisions(&state).lineages[&range.0];
+	assert_eq!(regranted.holder, node(successor));
+	assert_eq!(regranted.generation, taken.generation + 1);
+	assert_eq!(decisions(&state).clock_ms(), clock.max(LAPSED + 5_000));
+	assert_eq!(
+		regranted.floor_ms,
+		clock.max(LAPSED + 5_000) + DECISION_COMMIT_HLC_LEAD_MS
+	);
+	assert_eq!(regranted.protected_until_ms, 0);
+	// A delayed request of the earlier tenure cannot act on this one.
+	let settled = state.clone();
+	assert_eq!(
+		batch(
+			&mut state,
+			successor,
+			Some(taken.generation),
+			LAPSED + 5_000,
+			LAPSED + 9_000
+		),
+		WendelonResponse::LeaseDenied
+	);
+	assert_eq!(decisions(&state), decisions(&settled));
+	assert_eq!(state.leases, settled.leases);
+}
+
+#[test]
+fn a_renewal_applied_first_refuses_the_takeover_and_a_takeover_applied_first_denies_the_renewal() {
+	let (state, _claim, _rsv, range, holder) = sealed_with_a_live_lease();
+	let generation = decisions(&state).lineages[&range.0].generation;
+	let successor = (1..=3).find(|id| *id != holder).unwrap();
+	let renewal = lease(holder, range, T0 + 9_000, LAPSED + 3_000);
+
+	let mut renewal_first = state.clone();
+	assert_eq!(
+		grant(&mut renewal_first, renewal),
+		WendelonResponse::Success
+	);
+	assert_eq!(
+		takeover(&mut renewal_first, range.0, generation, successor, LAPSED),
+		refused(DecisionRefusal::TakeoverNotLapsed)
+	);
+	assert_eq!(
+		decisions(&renewal_first).lineages[&range.0].holder,
+		node(holder)
+	);
+
+	let mut takeover_first = state.clone();
+	// The renewal as its holder built it, naming the generation it held.
+	let late = WendelonRequest::AcquireLeases(
+		crate::consensus::LeaseBatch::new(
+			LAPSED,
+			vec![crate::consensus::LeaseBatchGrant {
+				lease: renewal,
+				expected_generation: Some(generation),
+			}],
+		)
+		.unwrap(),
+	);
+	assert!(matches!(
+		takeover(&mut takeover_first, range.0, generation, successor, LAPSED),
+		DecisionResult::TookOver { .. }
+	));
+	let taken = takeover_first.clone();
+	assert_eq!(
+		granted(apply_next(&mut takeover_first, late)),
+		WendelonResponse::LeaseDenied
+	);
+	assert_eq!(decisions(&takeover_first), decisions(&taken));
+	assert_eq!(takeover_first.leases, taken.leases);
+}
+
+#[test]
+fn a_takeover_refuses_what_was_reserved_under_the_old_generation_and_keeps_what_was_accepted() {
+	// Accepted before the takeover: its outcome stands.
+	let (mut state, accepted, accepted_rsv, range, holder) = sealed_with_a_live_lease();
+	let accepted_status = finalize(&mut state, &accepted, quorum_acks(&accepted, accepted_rsv));
+	assert!(matches!(
+		accepted_status,
+		DecisionResult::Terminal {
+			status: ParentStatus::Accepted { .. },
+			..
+		}
+	));
+	// Reserved, with every acknowledgement gathered, not yet finalized. Its
+	// stamp does not move the ring clock past the lease.
+	let mut pending = claim(key(T0, 2), children(&state, 2), 0);
+	pending.commit_hlc = hts(T0 + 1);
+	let DecisionResult::Reserved { reservation } = reserve(&mut state, &pending, T0 + 1) else {
+		panic!("reserve");
+	};
+	let coordinator = pending.children[0].clone();
+	assert_eq!(coordinator.lineage.range_start, range.0, "the same range");
+	let generation = decisions(&state).lineages[&range.0].generation;
+	let successor = (1..=3).find(|id| *id != holder).unwrap();
+	let third = (1..=3)
+		.find(|id| *id != holder && *id != successor)
+		.unwrap();
+	assert!(resolvable_by(&state, successor, 8).is_empty());
+	assert!(matches!(
+		takeover(&mut state, range.0, generation, successor, LAPSED),
+		DecisionResult::TookOver { .. }
+	));
+
+	// The accepted parent answers as recorded to every command.
+	assert_eq!(
+		finalize(&mut state, &accepted, quorum_acks(&accepted, accepted_rsv)),
+		accepted_status
+	);
+	assert_eq!(resolve(&mut state, &accepted), accepted_status);
+	assert_eq!(abort(&mut state, &accepted, accepted_rsv), accepted_status);
+	assert_eq!(reserve(&mut state, &accepted, LAPSED), accepted_status);
+
+	// The pending one: only the node now holding its coordinator's range
+	// drives its resolution, and whatever evidence arrives it is refused, once.
+	assert_eq!(
+		resolvable_by(&state, successor, 8),
+		vec![(pending.key, pending.request_digest)]
+	);
+	assert!(resolvable_by(&state, holder, 8).is_empty());
+	assert!(resolvable_by(&state, third, 8).is_empty());
+	let closed = finalize(&mut state, &pending, quorum_acks(&pending, reservation));
+	assert!(
+		matches!(
+			closed,
+			DecisionResult::Terminal {
+				status: ParentStatus::Refused {
+					cause: RefusalCause::LineageClosed,
+					..
+				},
+				..
+			}
+		),
+		"{closed:?}"
+	);
+	assert_eq!(resolve(&mut state, &pending), closed);
+	assert_eq!(reserve(&mut state, &pending, LAPSED), closed);
+	assert!(resolvable_by(&state, successor, 8).is_empty());
+
+	// A new claim by the old holder for the range it lost is refused.
+	let mut stale = claim(key(T0, 3), vec![coordinator], 0);
+	stale.commit_hlc = hts(LAPSED + DECISION_COMMIT_HLC_LEAD_MS + 1);
+	assert_eq!(
+		reserve(&mut state, &stale, LAPSED + 1),
+		refused(DecisionRefusal::LineageClosed)
+	);
+}
+
+#[test]
+fn a_successors_claim_is_reserved_only_above_its_generations_floor() {
+	let (mut state, _claim, _rsv, range, holder) = sealed_with_a_live_lease();
+	let generation = decisions(&state).lineages[&range.0].generation;
+	let successor = (1..=3).find(|id| *id != holder).unwrap();
+	takeover(&mut state, range.0, generation, successor, LAPSED);
+	let lineage = decisions(&state).lineages[&range.0];
+	// The successor is not its segment's first replica; it holds the lineage
+	// and is in the plan, which is what Reserve requires.
+	let kids = children(&state, 2);
+	let own: Vec<ChildClaim> = kids
+		.iter()
+		.filter(|child| child.lineage.range_start == range.0)
+		.cloned()
+		.collect();
+	assert_eq!(own.len(), 1);
+	assert_eq!(own[0].holder, signer(successor));
+	assert_eq!(own[0].lineage.generation, lineage.generation);
+	// A leader whose clock is behind the ring's: the stamp does not lower the
+	// floor, and a claim at or below it is refused whatever its logical part.
+	for (n, physical_ms) in [T0, LAPSED, lineage.floor_ms].into_iter().enumerate() {
+		let mut below = claim(key(T0, 10 + n as u64), own.clone(), 0);
+		below.commit_hlc = HybridTimestamp {
+			physical_ms,
+			logical: u32::MAX,
+			node_id: u32::MAX,
+		};
+		let before = state.clone();
+		assert_eq!(
+			reserve(&mut state, &below, lineage.floor_ms),
+			refused(DecisionRefusal::BelowTenureFloor),
+			"{physical_ms}"
+		);
+		assert_eq!(decisions(&state), decisions(&before));
+	}
+	// Above the floor, with a stamp that permits it.
+	let mut above = claim(key(T0, 20), own.clone(), 0);
+	above.commit_hlc = hts(lineage.floor_ms + 1);
+	assert_eq!(
+		reserve(&mut state, &above, LAPSED),
+		refused(DecisionRefusal::CommitFromFuture),
+		"the stamp must pass the earlier high-water first"
+	);
+	assert!(matches!(
+		reserve(&mut state, &above, LAPSED + 1),
+		DecisionResult::Reserved { .. }
+	));
+	// A claim spanning the taken range and another must clear both floors;
+	// the other range's floor is its first grant's.
+	let other_floor = kids
+		.iter()
+		.filter(|child| child.lineage.range_start != range.0)
+		.map(|child| decisions(&state).lineages[&child.lineage.range_start].floor_ms)
+		.max()
+		.unwrap();
+	assert!(other_floor < lineage.floor_ms);
+	let mut spanning = claim(key(T0, 21), kids.clone(), 0);
+	spanning.commit_hlc = hts(other_floor + 1);
+	assert_eq!(
+		reserve(&mut state, &spanning, LAPSED + 1),
+		refused(DecisionRefusal::BelowTenureFloor)
+	);
+}
+
+#[test]
+fn takeover_arithmetic_overflow_is_a_refusal_and_the_state_round_trips() {
+	let (mut state, _claim, _rsv, range, holder) = sealed_with_a_live_lease();
+	let generation = decisions(&state).lineages[&range.0].generation;
+	let successor = (1..=3).find(|id| *id != holder).unwrap();
+	let before = state.clone();
+	assert_eq!(
+		takeover(&mut state, range.0, generation, successor, u64::MAX),
+		refused(DecisionRefusal::CounterOverflow)
+	);
+	assert_eq!(decisions(&state), decisions(&before));
+	assert_eq!(state.leases, before.leases);
+	let mut exhausted = state.clone();
+	exhausted.decisions.as_mut().unwrap().next_generation = u64::MAX;
+	let exhausted_before = exhausted.clone();
+	assert_eq!(
+		takeover(&mut exhausted, range.0, generation, successor, LAPSED),
+		refused(DecisionRefusal::CounterOverflow)
+	);
+	assert_eq!(decisions(&exhausted), decisions(&exhausted_before));
+
+	takeover(&mut state, range.0, generation, successor, LAPSED);
+	let bytes = postcard::to_stdvec(decisions(&state)).unwrap();
+	let decoded: DecisionState = postcard::from_bytes(&bytes).unwrap();
+	assert_eq!(&decoded, decisions(&state));
+	decoded.validate().unwrap();
+	let lineage = decoded.lineages[&range.0];
+	assert!(lineage.first_grant_pending && lineage.floor_ms > 0 && lineage.protected_until_ms > 0);
+}
+
+#[test]
+fn a_tenant_with_fewer_replicas_than_data_members_is_refused_while_authority_is_off_its_primary() {
+	let (mut state, _claim, _rsv, range, holder) = sealed_with_a_live_lease();
+	let check = crate::crypto::test_root_check();
+	state.root_check = Some(check.clone());
+	let create = |tenant: u64, replication_factor: u32| {
+		WendelonRequest::CreateTenant(crate::consensus::CreateTenant {
+			tenant_id: TenantId::new(tenant),
+			quota_bytes: 1 << 20,
+			replication_factor,
+			tenant_keyset: {
+				let id = crate::schema::TenantKekId::try_from(7).unwrap();
+				let mut keyset = crate::crypto::TenantKeyset::default();
+				keyset.active_tenant_kek_id = Some(id);
+				keyset.keys.insert(
+					id,
+					crate::crypto::WrappedTenantKek {
+						wrapped_key: vec![1; 40],
+					},
+				);
+				keyset
+			},
+			under_root: check.id(),
+		})
+	};
+	// Every lineage is on its primary: the factor is not judged here.
+	assert!(!any_lineage_off_primary(&state));
+	assert_eq!(
+		apply_next(&mut state, create(100, 2)),
+		WendelonResponse::Success
+	);
+	state.tenants.remove(&TenantId::new(100));
+	state.tenant_keysets.remove(&TenantId::new(100));
+
+	let generation = decisions(&state).lineages[&range.0].generation;
+	let successor = (1..=3).find(|id| *id != holder).unwrap();
+	assert!(matches!(
+		takeover(&mut state, range.0, generation, successor, LAPSED),
+		DecisionResult::TookOver { .. }
+	));
+	assert!(any_lineage_off_primary(&state));
+	let before = state.clone();
+	for factor in [1, 2] {
+		assert!(
+			matches!(
+				apply_next(&mut state, create(101, factor)),
+				WendelonResponse::Error(_)
+			),
+			"{factor}"
+		);
+		assert_eq!(state.tenants, before.tenants);
+		assert_eq!(state.tenant_keysets, before.tenant_keysets);
+	}
+	// At or above the data member count the replicas are every data member.
+	for (tenant, factor) in [(102, 3), (103, 5)] {
+		assert_eq!(
+			apply_next(&mut state, create(tenant, factor)),
+			WendelonResponse::Success,
+			"{factor}"
+		);
+	}
 }

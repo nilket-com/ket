@@ -80,6 +80,10 @@ pub enum ForwardedDecision {
 	/// leader checks only that the owner's node is the sender; the state machine
 	/// verifies the signature and decides.
 	OwnerOp(crate::consensus::owner_ops::SignedOwnerOp),
+	/// ADR 0729: a replica asks for a lapsed holder's range, for itself.
+	TakeOverLineage {
+		takeover: Signed<crate::consensus::decisions::TakeOverBody>,
+	},
 }
 
 /// ADR 0700: a time-bearing command before the leader stamps it. It becomes a
@@ -93,6 +97,10 @@ pub(crate) enum Unstamped {
 	RecordNoop {
 		noop: Signed<crate::consensus::decisions::NoopBody>,
 	},
+	/// ADR 0729.
+	TakeOverLineage {
+		takeover: Signed<crate::consensus::decisions::TakeOverBody>,
+	},
 }
 
 impl Unstamped {
@@ -100,6 +108,9 @@ impl Unstamped {
 		WendelonRequest::Decision(match self {
 			Self::Reserve { claim } => DecisionCommand::Reserve { claim, stamp_ms },
 			Self::RecordNoop { noop } => DecisionCommand::RecordNoop { noop, stamp_ms },
+			Self::TakeOverLineage { takeover } => {
+				DecisionCommand::TakeOverLineage { takeover, stamp_ms }
+			}
 		})
 	}
 }
@@ -466,6 +477,13 @@ pub(crate) fn admission(
 			}
 			return Ok(Admitted::Unstamped(Unstamped::RecordNoop { noop }));
 		}
+		// ADR 0729: only the successor asks for itself; the stamp is the leader's.
+		ForwardedDecision::TakeOverLineage { takeover } => {
+			if takeover.body.successor.node != sender {
+				return Err(ProposalRefusal::NotTheSender);
+			}
+			return Ok(Admitted::Unstamped(Unstamped::TakeOverLineage { takeover }));
+		}
 		ForwardedDecision::BindSigner {
 			incarnation,
 			key: senders,
@@ -652,8 +670,9 @@ impl DecisionProposals {
 		}
 	}
 
-	/// ADR 0700: the decision clock now, through the gate.
-	async fn decision_clock_now(&self) -> Result<u64, ProposalRefusal> {
+	/// ADR 0700: the decision clock now, through the gate. ADR 0729: also the
+	/// stamp a leader puts on a lease batch it builds.
+	pub(crate) async fn decision_clock_now(&self) -> Result<u64, ProposalRefusal> {
 		let voters = self.state_machine.read_state(current_voters).await;
 		clock_gate(
 			self.clock.now_ms(),
@@ -1217,6 +1236,64 @@ impl<'a> MaintenanceProposals<'a> {
 			}
 		}
 		proposed
+	}
+
+	/// ADR 0729: proposes a takeover of each range this store should now take:
+	/// held by another node, lapsed as this store's applied state and clock see
+	/// it, and past this store's stagger. The reducer decides; a refusal (not
+	/// lapsed on the ring clock, a consumed generation) is the normal answer to
+	/// a proposal that lost. Counts takeovers applied.
+	pub(crate) async fn take_over_lapsed_once(
+		&self,
+		key: &ed25519_dalek::SigningKey,
+		signer: crate::consensus::decisions::Signer,
+		stagger_ms: u64,
+		limit: usize,
+	) -> usize {
+		let proposals = self.proposals;
+		if proposals.mode != DecisionMode::ParentDecisions {
+			return 0;
+		}
+		let now_ms = proposals.clock.now_ms();
+		let candidates = proposals
+			.state_machine
+			.read_state(move |state| {
+				crate::consensus::decisions::takeover_candidates(
+					state,
+					signer.node,
+					now_ms,
+					stagger_ms,
+					limit,
+				)
+			})
+			.await;
+		let mut taken = 0;
+		for (range_start, generation) in candidates {
+			let takeover = crate::consensus::decisions::evidence::sign(
+				key,
+				crate::consensus::decisions::TakeOverBody {
+					range_start,
+					generation,
+					successor: signer,
+				},
+				signer,
+			);
+			match self
+				.propose(ForwardedDecision::TakeOverLineage { takeover })
+				.await
+			{
+				MaintenanceProposalResult::Stopped => break,
+				MaintenanceProposalResult::Response(ProposalResponse::Applied {
+					outcome:
+						ProposalOutcome::Decision(
+							crate::consensus::decisions::DecisionResult::TookOver { .. },
+						),
+					..
+				}) => taken += 1,
+				MaintenanceProposalResult::Response(_) => {}
+			}
+		}
+		taken
 	}
 
 	/// Registers this store's incarnation, then binds its decision key, each

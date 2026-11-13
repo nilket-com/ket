@@ -103,7 +103,40 @@ pub struct Lineage {
 	pub holder: NodeId,
 	pub incarnation: StoreIncarnation,
 	pub generation: u64,
+	/// ADR 0729: a version-producing claim under this generation carries a
+	/// commit HLC whose physical time is above this. Set when the generation
+	/// begins, from the ring clock, so its versions order after every version
+	/// reserved before it began.
+	pub floor_ms: u64,
+	/// ADR 0729: no takeover of this generation is admitted until the ring
+	/// clock is past this. Zero unless a takeover began the generation.
+	pub protected_until_ms: u64,
+	/// ADR 0729: set by a takeover and cleared by the successor's first grant,
+	/// which continues this generation without an earlier lease on record.
+	pub first_grant_pending: bool,
 }
+
+/// ADR 0729: a replica's request to take a range's coordinating authority from
+/// a holder whose lease lapsed. Signed by the successor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TakeOverBody {
+	pub range_start: u64,
+	/// The generation being replaced: consumed by the first event that ends it.
+	pub generation: u64,
+	pub successor: Signer,
+}
+
+/// ADR 0729: how long past a lease's own expiry, on the ring clock, before its
+/// range may be taken over. A margin, not a bound: a lease's start is the
+/// requester's clock reading, which nothing gates (only its TTL is clamped), so
+/// a future-dated lease delays eligibility by however far ahead it was dated.
+pub const TAKEOVER_GRACE_MS: u64 = 2 * crate::consensus::monitor::MAX_OFFSET_MS;
+/// ADR 0729: a successor's protection when no lease was on record to size it.
+pub const TAKEOVER_PROTECT_DEFAULT_MS: u64 = 3_000;
+/// ADR 0729: bounds on a successor's protection, whatever the lapsed lease's
+/// own duration was.
+pub const TAKEOVER_PROTECT_MIN_MS: u64 = 1_000;
+pub const TAKEOVER_PROTECT_MAX_MS: u64 = 60_000;
 
 /// The lineage a claim is bound to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -378,6 +411,12 @@ pub enum DecisionCommand {
 	CommitGeneration {
 		gid: u64,
 	},
+	/// ADR 0729: moves a range's coordinating authority to a replica once its
+	/// holder's lease lapsed on the ring clock. Signed by the successor.
+	TakeOverLineage {
+		takeover: Signed<TakeOverBody>,
+		stamp_ms: u64,
+	},
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -477,6 +516,21 @@ pub enum DecisionRefusal {
 	/// ADR 0720: the membership sealed by the first admitted write is not the
 	/// one in effect. No new parent is admitted.
 	MembershipSealed,
+	/// ADR 0729: a version-producing claim whose commit HLC is not above the
+	/// floor of a lineage it binds. Retryable with a later commit HLC.
+	BelowTenureFloor,
+	/// ADR 0729: a takeover naming a lineage that does not exist or a
+	/// generation that is no longer the range's.
+	TakeoverStale,
+	/// ADR 0729: the holder's lease has not lapsed on the ring clock, or the
+	/// generation is still protected.
+	TakeoverNotLapsed,
+	/// ADR 0729: the successor is the holder, not a current data member, or
+	/// not a replica of every segment the range spans.
+	TakeoverIneligible,
+	/// ADR 0729: some tenant's replication factor is below the number of data
+	/// members, so a range's replicas are not all data members.
+	UnsupportedShape,
 }
 
 /// ADR 0721: how the key a store signs with stands against the replicated
@@ -623,6 +677,11 @@ pub enum DecisionResult {
 	},
 	GenerationCommitted {
 		gid: u64,
+	},
+	/// ADR 0729: the range's lineage is now the successor's, at `generation`.
+	TookOver {
+		range_start: u64,
+		generation: u64,
 	},
 }
 
@@ -1003,17 +1062,56 @@ fn any_lineage_closed(state: &SmState, decisions: &DecisionState, claim: &Claim)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum GrantEffect {
 	Renewal,
+	/// ADR 0729: a successor's first grant after its takeover. The generation
+	/// the takeover installed continues.
+	FirstGrant,
 	NewLineage {
 		generation: u64,
 		incarnation: StoreIncarnation,
+		/// ADR 0729: the ring clock this entry sets, and the floor it installs.
+		clock_ms: u64,
+		floor_ms: u64,
 	},
+}
+
+/// ADR 0729: the data members of a configuration.
+pub(crate) fn data_members(config: &EpochConfig) -> BTreeSet<u32> {
+	placement_of(config)
+		.into_iter()
+		.filter_map(|(node, data)| data.then_some(node))
+		.collect()
+}
+
+/// ADR 0729: whether any lineage is held by a node other than its range's
+/// ring primary.
+pub(crate) fn any_lineage_off_primary(state: &SmState) -> bool {
+	let Some(decisions) = state.decisions.as_ref() else {
+		return false;
+	};
+	let Some((_, config)) = state.epoch_history.last_key_value() else {
+		return false;
+	};
+	let ring = RingState::build(&membership_from_epoch_config(config), 1);
+	decisions.lineages.iter().any(|(start, lineage)| {
+		!ring
+			.primary_ranges_for(lineage.holder)
+			.contains(&(*start, lineage.range_end))
+	})
 }
 
 /// Admission of a lease grant under this mode, before today's overlap rule
 /// runs. `Err` means `LeaseDenied` with nothing changed.
+///
+/// ADR 0729: a grant names the generation it expects (`None`: no lineage) and
+/// is one of a renewal, a successor's first grant, a regrant after a gap (a
+/// new generation for the same holder), or the ring primary's first grant
+/// where no lineage exists. `stamp_ms` is the batch's replicated leader stamp;
+/// it is used only where a generation begins.
 pub(crate) fn admit_lease_grant(
 	state: &SmState,
 	lease: &LeaseDescriptor,
+	expected_generation: Option<u64>,
+	stamp_ms: u64,
 ) -> Result<GrantEffect, ()> {
 	let decisions = state.decisions.as_ref().ok_or(())?;
 	let (_, config) = state.epoch_history.last_key_value().ok_or(())?;
@@ -1021,42 +1119,62 @@ pub(crate) fn admit_lease_grant(
 		return Err(());
 	}
 	let incarnation = current_incarnation(state, lease.holder.id).ok_or(())?;
-	// The range universe: exactly one of the holder's merged primary ranges in
-	// the current ring. The primary does not depend on the replication factor.
-	let ring = RingState::build(&membership_from_epoch_config(config), 1);
-	if !ring
-		.primary_ranges_for(lease.holder)
-		.contains(&(lease.range_start, lease.range_end))
-	{
-		return Err(());
-	}
-	let continuing = state.leases.get(&lease.range_start).filter(|existing| {
-		existing.range_end == lease.range_end
-			&& existing.holder == lease.holder
-			&& existing.epoch == lease.epoch
-			&& existing.lease_expiry > lease.lease_start
-	});
-	let lineage = decisions
-		.lineages
-		.get(&lease.range_start)
-		.filter(|lineage| {
-			lineage.range_end == lease.range_end
-				&& lineage.holder == lease.holder
-				&& lineage.epoch == lease.epoch
-				&& lineage.incarnation == incarnation
-		});
-	if let (Some(existing), Some(_)) = (continuing, lineage) {
-		// A renewal never shortens the grant it continues.
-		if lease.lease_expiry < existing.lease_expiry {
-			return Err(());
+	match decisions.lineages.get(&lease.range_start) {
+		Some(lineage) => {
+			if lineage.range_end != lease.range_end
+				|| lineage.holder != lease.holder
+				|| lineage.epoch != lease.epoch
+				|| lineage.incarnation != incarnation
+				|| expected_generation != Some(lineage.generation)
+			{
+				return Err(());
+			}
+			let continuing = state.leases.get(&lease.range_start).filter(|existing| {
+				existing.range_end == lease.range_end
+					&& existing.holder == lease.holder
+					&& existing.epoch == lease.epoch
+					&& existing.lease_expiry > lease.lease_start
+			});
+			if let Some(existing) = continuing {
+				// A renewal never shortens the grant it continues.
+				if lease.lease_expiry < existing.lease_expiry {
+					return Err(());
+				}
+				return Ok(GrantEffect::Renewal);
+			}
+			if lineage.first_grant_pending {
+				return Ok(GrantEffect::FirstGrant);
+			}
+			// A regrant after a gap: a new generation for the same holder, so
+			// what it left reserved under the old one closes.
 		}
-		return Ok(GrantEffect::Renewal);
+		None => {
+			if expected_generation.is_some() {
+				return Err(());
+			}
+			// The range universe: exactly one of the holder's merged primary
+			// ranges in the current ring. The primary does not depend on the
+			// replication factor.
+			let ring = RingState::build(&membership_from_epoch_config(config), 1);
+			if !ring
+				.primary_ranges_for(lease.holder)
+				.contains(&(lease.range_start, lease.range_end))
+			{
+				return Err(());
+			}
+		}
 	}
 	let generation = decisions.next_generation;
 	generation.checked_add(1).ok_or(())?;
+	let clock_ms = decisions.clock_ms.max(stamp_ms);
+	let floor_ms = clock_ms
+		.checked_add(DECISION_COMMIT_HLC_LEAD_MS)
+		.ok_or(())?;
 	Ok(GrantEffect::NewLineage {
 		generation,
 		incarnation,
+		clock_ms,
+		floor_ms,
 	})
 }
 
@@ -1065,23 +1183,211 @@ pub(crate) fn record_grant(state: &mut SmState, lease: &LeaseDescriptor, effect:
 	let Some(decisions) = state.decisions.as_mut() else {
 		return;
 	};
-	if let GrantEffect::NewLineage {
-		generation,
-		incarnation,
-	} = effect
-	{
-		decisions.next_generation = generation + 1;
-		decisions.lineages.insert(
-			lease.range_start,
-			Lineage {
-				range_end: lease.range_end,
-				epoch: lease.epoch,
-				holder: lease.holder,
-				incarnation,
-				generation,
-			},
-		);
+	match effect {
+		GrantEffect::Renewal => {}
+		GrantEffect::FirstGrant => {
+			if let Some(lineage) = decisions.lineages.get_mut(&lease.range_start) {
+				lineage.first_grant_pending = false;
+			}
+		}
+		GrantEffect::NewLineage {
+			generation,
+			incarnation,
+			clock_ms,
+			floor_ms,
+		} => {
+			decisions.next_generation = generation + 1;
+			decisions.clock_ms = clock_ms;
+			decisions.lineages.insert(
+				lease.range_start,
+				Lineage {
+					range_end: lease.range_end,
+					epoch: lease.epoch,
+					holder: lease.holder,
+					incarnation,
+					generation,
+					floor_ms,
+					protected_until_ms: 0,
+					first_grant_pending: false,
+				},
+			);
+		}
 	}
+}
+
+/// ADR 0729: the ranges `node` should now propose to take over, as its own
+/// applied state and clock see them: held by another node, lapsed, and past
+/// this node's place in the order of the range's replicas after the holder
+/// (`stagger_ms` per place). A proposal policy only: it can delay this node, it
+/// cannot veto it, and the reducer alone admits a takeover. Bounded by `limit`.
+pub(crate) fn takeover_candidates(
+	state: &SmState,
+	node: u32,
+	now_ms: u64,
+	stagger_ms: u64,
+	limit: usize,
+) -> Vec<(u64, u64)> {
+	let Some(decisions) = state.decisions.as_ref() else {
+		return Vec::new();
+	};
+	let Some((_, config)) = state.epoch_history.last_key_value() else {
+		return Vec::new();
+	};
+	let data = data_members(config);
+	if decisions.sealed.is_none() || !data.contains(&node) {
+		return Vec::new();
+	}
+	let ring = RingState::build(&membership_from_epoch_config(config), data.len());
+	let segments = ring.replica_segments();
+	decisions
+		.lineages
+		.iter()
+		.filter(|(_, lineage)| lineage.holder.id != node && lineage.epoch == config.epoch)
+		.filter_map(|(start, lineage)| {
+			let segment = segments
+				.iter()
+				.find(|segment| segment.start <= lineage.range_end && *start <= segment.end)?;
+			let place = segment
+				.replicas
+				.iter()
+				.filter(|replica| replica.id != lineage.holder.id)
+				.position(|replica| replica.id == node)? as u64;
+			let lapsed_after = match state.leases.get(start) {
+				Some(lease) => lease
+					.lease_expiry
+					.physical_ms
+					.checked_add(TAKEOVER_GRACE_MS)?
+					.max(lineage.protected_until_ms),
+				None => lineage.protected_until_ms,
+			};
+			let due = lapsed_after.checked_add(place.checked_mul(stagger_ms)?)?;
+			(now_ms > due).then_some((*start, lineage.generation))
+		})
+		.take(limit)
+		.collect()
+}
+
+/// ADR 0729: moves a range's lineage to `successor` at a new generation.
+fn take_over(
+	state: &SmState,
+	decisions: &mut DecisionState,
+	signed: &Signed<TakeOverBody>,
+	stamp_ms: u64,
+) -> Result<DecisionResult, DecisionRefusal> {
+	use DecisionRefusal::*;
+	let verified = evidence::verify(decisions, signed)?;
+	let body = *verified.body();
+	let lineage = *decisions
+		.lineages
+		.get(&body.range_start)
+		.ok_or(TakeoverStale)?;
+	let (_, config) = state.epoch_history.last_key_value().ok_or(TakeoverStale)?;
+	if lineage.generation != body.generation || lineage.epoch != config.epoch {
+		return Err(TakeoverStale);
+	}
+	if lineage.holder.id == body.successor.node {
+		return Err(TakeoverIneligible);
+	}
+	// The sealed placement, in effect: a takeover moves authority, never data.
+	let sealed = decisions.sealed.as_ref().ok_or(FormationIncomplete)?;
+	if formed_placement(state).as_ref() != Some(&sealed.placement) {
+		return Err(MembershipSealed);
+	}
+	if state.migrations.values().any(|migration| {
+		migration.state != crate::consensus::MigrationState::Completed
+			&& migration.range_start <= lineage.range_end
+			&& body.range_start <= migration.range_end
+	}) {
+		return Err(MigrationActive);
+	}
+	if current_incarnation(state, body.successor.node) != Some(body.successor.incarnation) {
+		return Err(SignerNotCurrent);
+	}
+	// The supported shape: every segment's replicas are all the data members.
+	let data = data_members(config);
+	if !data.contains(&body.successor.node) {
+		return Err(TakeoverIneligible);
+	}
+	if state
+		.tenants
+		.values()
+		.any(|tenant| (tenant.replication_factor as usize) < data.len())
+	{
+		return Err(UnsupportedShape);
+	}
+	let ring = RingState::build(&membership_from_epoch_config(config), data.len());
+	let mut intersecting = 0usize;
+	for segment in ring.replica_segments() {
+		if segment.end < body.range_start || lineage.range_end < segment.start {
+			continue;
+		}
+		intersecting += 1;
+		if !segment
+			.replicas
+			.iter()
+			.any(|node| node.id == body.successor.node)
+		{
+			return Err(TakeoverIneligible);
+		}
+	}
+	if intersecting == 0 {
+		return Err(TakeoverIneligible);
+	}
+	// The lapse, on the ring's own clock. It is the trigger; the fence is the
+	// generation this entry closes.
+	let now = decisions.clock_ms.max(stamp_ms);
+	if now <= lineage.protected_until_ms {
+		return Err(TakeoverNotLapsed);
+	}
+	let lease = state.leases.get(&body.range_start);
+	if let Some(lease) = lease {
+		let lapsed_after = lease
+			.lease_expiry
+			.physical_ms
+			.checked_add(TAKEOVER_GRACE_MS)
+			.ok_or(CounterOverflow)?;
+		if lapsed_after >= now {
+			return Err(TakeoverNotLapsed);
+		}
+	}
+	let protect_ms = lease
+		.map(|lease| {
+			lease
+				.lease_expiry
+				.physical_ms
+				.saturating_sub(lease.lease_start.physical_ms)
+		})
+		.unwrap_or(TAKEOVER_PROTECT_DEFAULT_MS)
+		.clamp(TAKEOVER_PROTECT_MIN_MS, TAKEOVER_PROTECT_MAX_MS);
+	let floor_ms = now
+		.checked_add(DECISION_COMMIT_HLC_LEAD_MS)
+		.ok_or(CounterOverflow)?;
+	let protected_until_ms = now.checked_add(protect_ms).ok_or(CounterOverflow)?;
+	let generation = decisions.next_generation;
+	let next_generation = generation.checked_add(1).ok_or(CounterOverflow)?;
+	// Every check passed: commit.
+	decisions.clock_ms = now;
+	decisions.next_generation = next_generation;
+	decisions.lineages.insert(
+		body.range_start,
+		Lineage {
+			range_end: lineage.range_end,
+			epoch: lineage.epoch,
+			holder: NodeId {
+				id: body.successor.node,
+				_reserved: 0,
+			},
+			incarnation: body.successor.incarnation,
+			generation,
+			floor_ms,
+			protected_until_ms,
+			first_grant_pending: true,
+		},
+	);
+	Ok(DecisionResult::TookOver {
+		range_start: body.range_start,
+		generation,
+	})
 }
 
 /// Records a matching release: its lineage ends.
@@ -1174,6 +1480,13 @@ pub(crate) mod evidence {
 		}
 	}
 
+	impl Evidence for super::TakeOverBody {
+		const DOMAIN: &'static str = "wendelon parent decision lineage takeover v1";
+		fn bound_signer(&self) -> Option<Signer> {
+			Some(self.successor)
+		}
+	}
+
 	impl Evidence for AbortBody {
 		const DOMAIN: &'static str = "wendelon parent decision abort v1";
 		fn bound_signer(&self) -> Option<Signer> {
@@ -1249,6 +1562,10 @@ pub(crate) fn apply(
 	};
 	let result = reduce(state, &mut decisions, command, log_index);
 	state.decisions = Some(decisions);
+	// ADR 0729: the old holder's applied lease goes with its generation.
+	if let DecisionResult::TookOver { range_start, .. } = result {
+		state.leases.remove(&range_start);
+	}
 	result
 }
 
@@ -1285,6 +1602,9 @@ fn reduce(
 		DecisionCommand::Report { report } => generations::record_report(state, decisions, &report),
 		DecisionCommand::CommitGeneration { gid } => {
 			generations::commit_generation(state, decisions, gid, log_index)
+		}
+		DecisionCommand::TakeOverLineage { takeover, stamp_ms } => {
+			take_over(state, decisions, &takeover, stamp_ms)
 		}
 	};
 	outcome.unwrap_or_else(DecisionResult::Refused)
@@ -1666,6 +1986,11 @@ fn validate_claim(
 		{
 			return Err(LineageClosed);
 		}
+		// ADR 0729: a version of this generation orders after every version
+		// reserved before the generation began.
+		if claim.commit_hlc.physical_ms <= lineage.floor_ms {
+			return Err(BelowTenureFloor);
+		}
 		let mut planned: Vec<u32> = Vec::with_capacity(child.plan.len());
 		for member in &child.plan {
 			if current_incarnation(state, member.node) != Some(member.incarnation) {
@@ -1683,9 +2008,8 @@ fn validate_claim(
 				continue;
 			}
 			intersecting += 1;
-			if segment.replicas.first().map(|node| node.id) != Some(child.holder.node) {
-				return Err(PlanMismatch);
-			}
+			// ADR 0729: the holder is the lineage's, checked above, and in the
+			// plan; it need not be the segment's first replica.
 			let mut replicas: Vec<u32> = segment.replicas.iter().map(|node| node.id).collect();
 			replicas.sort_unstable();
 			if replicas != planned {

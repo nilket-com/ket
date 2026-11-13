@@ -12455,9 +12455,11 @@ fn parent_decisions_have_no_producer_and_one_codec() {
 	);
 	assert!(stamp.contains("DecisionCommand::Reserve { claim, stamp_ms }"));
 	assert!(stamp.contains("DecisionCommand::RecordNoop { noop, stamp_ms }"));
+	// ADR 0729: a takeover is time-bearing too, stamped in the same place.
+	assert!(stamp.contains("DecisionCommand::TakeOverLineage { takeover, stamp_ms }"));
 	assert_eq!(
 		proposals.matches("stamp_ms }").count(),
-		2,
+		3,
 		"stamped only in `stamp`"
 	);
 	let forwarded = brace_body(&proposals, "pub enum ForwardedDecision");

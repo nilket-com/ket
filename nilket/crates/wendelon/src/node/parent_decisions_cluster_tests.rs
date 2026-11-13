@@ -402,8 +402,11 @@ async fn until_settled(cluster: &Cluster, descriptor: &TableSchemaDescriptor) {
 								})
 						})
 					});
+				// ADR 0729: a node that was down past its lease may have had its
+				// ranges taken and holds none on return; every range still has
+				// a holder at its current incarnation.
 				bound
-					&& covered && leased.len() == NODES.len()
+					&& covered && !leased.is_empty()
 					&& state.tenants.contains_key(&TenantId::ZERO)
 					&& state
 						.table_schemas
@@ -3768,8 +3771,24 @@ async fn a_lease_batch_request_passes_the_single_grant_checks_for_every_range() 
 		.duration_since(std::time::UNIX_EPOCH)
 		.unwrap()
 		.as_millis() as u64;
+	// ADR 0729: a request names the generation of each lineage as applied.
+	let generations: std::collections::BTreeMap<u64, u64> = cluster
+		.node(leader)
+		.state_machine
+		.read_state(|state| {
+			state
+				.decisions
+				.as_ref()
+				.unwrap()
+				.lineages()
+				.iter()
+				.map(|(start, lineage)| (*start, lineage.generation))
+				.collect()
+		})
+		.await;
 	let send = |caller: u32, holder: u32, ranges: Vec<(u64, u64)>| {
 		let router = cluster.node(leader).router.clone();
+		let generations = generations.clone();
 		async move {
 			let header = AcquireLeasesRequestHeader {
 				epoch,
@@ -3784,15 +3803,19 @@ async fn a_lease_batch_request_passes_the_single_grant_checks_for_every_range() 
 			};
 			let mut meta = bytemuck::bytes_of(&header).to_vec();
 			for (range_start, range_end) in &ranges {
+				let expected = generations.get(range_start);
 				meta.extend_from_slice(bytemuck::bytes_of(&LeaseRangeWire {
 					range_start: *range_start,
 					range_end: *range_end,
+					expected_generation: expected.copied().unwrap_or(0),
+					has_generation: u64::from(expected.is_some()),
 				}));
 			}
 			let frame = crate::network::core::HrftFrame {
 				header: crate::schema::FrameHeader {
 					magic: crate::network::core::HRFT_MAGIC,
-					version: 1,
+					version: crate::consensus::decision_mode::DecisionMode::ParentDecisions
+						.raft_frame_version(),
 					msg_type: crate::schema::MsgType::LEASES_REQ.0,
 					flags: 0,
 					stream_id: 1,
@@ -6693,6 +6716,14 @@ mod offload;
 /// ADR 0726: joins and the root check.
 #[path = "parent_decisions_cluster_tests/root_check.rs"]
 mod root_check;
+
+/// DC-224: a range whose primary is stopped (a characterization of the limit).
+#[path = "parent_decisions_cluster_tests/primary_down.rs"]
+mod primary_down;
+
+/// ADR 0729: the public client when a hinted node does not answer.
+#[path = "parent_decisions_cluster_tests/client_route.rs"]
+mod client_route;
 
 // ============================================================
 //  ADR 0720: MEMBERSHIP IS FIXED ONCE A WRITE IS ADMITTED

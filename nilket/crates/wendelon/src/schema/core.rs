@@ -475,6 +475,24 @@ pub struct AcquireLeasesRequestHeader {
 pub struct LeaseRangeWire {
 	pub range_start: u64, //  8
 	pub range_end: u64,   //  8
+	/// ADR 0729: the generation of the range's lineage as the requester holds
+	/// it; meaningful only when `has_generation` is 1.
+	pub expected_generation: u64, //  8
+	/// 1 when the requester holds a lineage for the range, 0 when it saw none.
+	/// Any other value is malformed.
+	pub has_generation: u64, //  8
+}
+
+impl LeaseRangeWire {
+	/// ADR 0729: the generation this range's request expects, or `Err` for a
+	/// malformed flag.
+	pub fn expected(&self) -> Result<Option<u64>, ()> {
+		match (self.has_generation, self.expected_generation) {
+			(0, 0) => Ok(None),
+			(1, generation) => Ok(Some(generation)),
+			_ => Err(()),
+		}
+	}
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
@@ -2502,7 +2520,11 @@ pub const SNAPSHOT_FORMAT_VERSION: u8 = 21;
 /// 14 was ADR 0701 to ADR 0703's; 15 was Today's). ADR 0726: 20, whose state
 /// carries the cluster's root check (18 was ADR 0725's; 19 was Today's). ADR
 /// 0728: 22, as Today's 21 (20 was ADR 0726 to ADR 0727's).
-pub const SNAPSHOT_FORMAT_VERSION_PARENT_DECISIONS: u8 = 22;
+///
+/// ADR 0729: 23, whose lineages carry a floor, a protection and a pending
+/// first grant, and whose decisions include a lineage takeover (22 was ADR
+/// 0728's; 21 is Today's).
+pub const SNAPSHOT_FORMAT_VERSION_PARENT_DECISIONS: u8 = 23;
 
 /// Shape of the Control Ring WAL record bodies this build writes, including the
 /// `postcard(Entry<..>)` payload of a log record. ADR 0697 version 6 carries
@@ -2528,7 +2550,12 @@ pub const WAL_FORMAT_VERSION: u8 = 21;
 /// install; an older log could hold tenant KEKs no root check preceded, so it
 /// is refused whole (18 was ADR 0725's; 19 was Today's). ADR 0728: 22, for
 /// Today's reason at 21 (20 was ADR 0726 to ADR 0727's).
-pub const WAL_FORMAT_VERSION_PARENT_DECISIONS: u8 = 22;
+///
+/// ADR 0729: 23. The lease batch carries a stamp and a generation per grant, a
+/// takeover is a decision, and grants, releases and claims are admitted by new
+/// rules; an earlier log is refused whole, never replayed under them (22 was
+/// ADR 0728's; 21 is Today's).
+pub const WAL_FORMAT_VERSION_PARENT_DECISIONS: u8 = 23;
 
 // Static assertions to ensure all our size calculations remain exactly correct
 const _: () = assert!(std::mem::size_of::<HybridTimestamp>() == 16);
@@ -2542,7 +2569,7 @@ const _: () = assert!(std::mem::size_of::<LeaseStatus>() == 1);
 const _: () = assert!(std::mem::size_of::<AcquireLeaseRequestMeta>() == 56);
 const _: () = assert!(std::mem::size_of::<AcquireLeaseResponseMeta>() == 8);
 const _: () = assert!(std::mem::size_of::<AcquireLeasesRequestHeader>() == 40);
-const _: () = assert!(std::mem::size_of::<LeaseRangeWire>() == 16);
+const _: () = assert!(std::mem::size_of::<LeaseRangeWire>() == 32);
 const _: () = assert!(std::mem::size_of::<AcquireLeasesResponseHeader>() == 8);
 const _: () = assert!(std::mem::size_of::<LeaseResultWire>() == 160);
 const _: () = assert!(std::mem::size_of::<TableDescriptorGetRequestMeta>() == 264);
