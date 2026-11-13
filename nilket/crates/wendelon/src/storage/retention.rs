@@ -70,6 +70,20 @@ pub fn cluster_retention_floor(
 	Some(retention_floor_from_window_ms(now_ms, window_ms))
 }
 
+/// Whether any record of any table can have a retention floor under these policies.
+///
+/// A floor comes from exactly two places: the cluster's window (for a table that inherits
+/// it, and for every primary-key table) or a table's own fixed window. With the cluster
+/// policy disabled and no table carrying a fixed window, [`cluster_retention_floor`] is
+/// `None` and [`effective_table_retention`] is `None` for every table, present in the catalog
+/// or not, so retention can prune nothing and no version can lag a floor.
+pub fn any_retention_floor_possible(
+	cluster_policy: MvccRetentionPolicy,
+	table_lifecycle: &crate::schema::TableLifecycleCatalog,
+) -> bool {
+	cluster_policy.window().is_some() || table_lifecycle.has_fixed_window()
+}
+
 pub fn effective_table_retention(
 	cluster_policy: &MvccRetentionPolicy,
 	table_policy: Option<&TableRetentionPolicy>,
@@ -141,6 +155,68 @@ mod tests {
 			logical: 0,
 			node_id: 0,
 		}
+	}
+
+	#[test]
+	fn a_retention_floor_is_possible_only_with_a_cluster_or_a_table_window() {
+		use super::any_retention_floor_possible;
+		use crate::schema::{
+			MIN_RETENTION_WINDOW_MS, PolicyGeneration, TableLifecycleCatalog, TableObjectId,
+			TenantId,
+		};
+		let tenant = TenantId::new(1);
+		let table = |n: u8| TableObjectId::new([n; 16]);
+		let window = TableRetentionPolicy::FixedWindow(
+			RetentionWindowMillis::try_new(MIN_RETENTION_WINDOW_MS).unwrap(),
+		);
+		let disabled = MvccRetentionPolicy::Disabled;
+		let cluster_window = MvccRetentionPolicy::FixedWindow(Duration::from_secs(30));
+
+		// No table at all, and tables that inherit or switch retention off: no floor anywhere.
+		let mut catalog = TableLifecycleCatalog::default();
+		assert!(!any_retention_floor_possible(disabled, &catalog));
+		catalog.ensure_inherit_cluster(tenant, table(1), hlc(1));
+		catalog
+			.set_next_generation(
+				tenant,
+				table(2),
+				PolicyGeneration::ZERO,
+				TableRetentionPolicy::Disabled,
+				hlc(2),
+			)
+			.unwrap();
+		assert!(!any_retention_floor_possible(disabled, &catalog));
+		for policy in [
+			TableRetentionPolicy::InheritCluster,
+			TableRetentionPolicy::Disabled,
+		] {
+			assert_eq!(
+				effective_table_retention(&disabled, Some(&policy), 100_000).floor,
+				None
+			);
+		}
+		assert_eq!(
+			effective_table_retention(&disabled, None, 100_000).floor,
+			None
+		);
+
+		// The cluster's window gives every one of those tables a floor.
+		assert!(any_retention_floor_possible(cluster_window, &catalog));
+		assert!(any_retention_floor_possible(
+			cluster_window,
+			&TableLifecycleCatalog::default()
+		));
+
+		// One table with a window of its own is enough, with the cluster policy disabled.
+		catalog
+			.set_next_generation(tenant, table(3), PolicyGeneration::ZERO, window, hlc(3))
+			.unwrap();
+		assert!(any_retention_floor_possible(disabled, &catalog));
+		assert!(
+			effective_table_retention(&disabled, Some(&window), 100_000)
+				.floor
+				.is_some()
+		);
 	}
 
 	#[test]

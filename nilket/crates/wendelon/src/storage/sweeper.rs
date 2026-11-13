@@ -1818,6 +1818,19 @@ impl SlabSweeper {
 		if max_slabs == 0 {
 			return Ok(report);
 		}
+		// Preparing a slab fetches and decodes its whole object before it can tell that
+		// nothing is prunable. When no retention floor can exist for any table (the cluster
+		// policy is disabled and no table has a window of its own), that is known without
+		// reading anything, so the pass visits no slab. Any other combination keeps the
+		// full pass: this skips only what the committed catalog and the node's policy prove
+		// inactive, never what a slab's own metadata suggests.
+		let table_lifecycle = self.state_machine.state_snapshot().await.table_lifecycle;
+		if !crate::storage::retention::any_retention_floor_possible(
+			self.mvcc_retention_policy,
+			&table_lifecycle,
+		) {
+			return Ok(report);
+		}
 		let now_ms = self.clock.now_ms();
 		let audit_floor = self
 			.mvcc_retention_floor_hlc_at(now_ms)
@@ -7027,6 +7040,313 @@ mod tests {
 		}
 		assert_eq!(after, before, "counter values and origins stay exact");
 	}
+	/// Counts every request a sweeper makes to its object store.
+	struct RequestCountingStore {
+		inner: Arc<dyn ObjectStore>,
+		/// Fetches of object bytes: whole objects and ranges.
+		fetches: std::sync::atomic::AtomicUsize,
+		/// Every other request: head, put, list, delete.
+		others: std::sync::atomic::AtomicUsize,
+	}
+	impl RequestCountingStore {
+		fn counts(&self) -> (usize, usize) {
+			(
+				self.fetches.load(std::sync::atomic::Ordering::Acquire),
+				self.others.load(std::sync::atomic::Ordering::Acquire),
+			)
+		}
+		fn other(&self) {
+			self.others
+				.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+		}
+	}
+	#[async_trait]
+	impl ObjectStore for RequestCountingStore {
+		async fn put(&self, key: &str, bytes: &[u8]) -> std::io::Result<String> {
+			self.other();
+			self.inner.put(key, bytes).await
+		}
+		fn planned_upload_uri(&self, key: &str) -> std::io::Result<String> {
+			self.inner.planned_upload_uri(key)
+		}
+		async fn head(&self, uri: &str) -> std::io::Result<crate::storage::l2::ObjectMetadata> {
+			self.other();
+			self.inner.head(uri).await
+		}
+		async fn get_range(
+			&self,
+			uri: &str,
+			range: std::ops::Range<u64>,
+		) -> std::io::Result<bytes::Bytes> {
+			self.fetches
+				.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+			self.inner.get_range(uri, range).await
+		}
+		async fn get_bytes(&self, uri: &str) -> std::io::Result<bytes::Bytes> {
+			self.fetches
+				.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+			self.inner.get_bytes(uri).await
+		}
+		async fn list(
+			&self,
+			prefix: &str,
+		) -> std::io::Result<Vec<crate::storage::l2::ObjectMetadata>> {
+			self.other();
+			self.inner.list(prefix).await
+		}
+		async fn delete(&self, uri: &str) -> std::io::Result<()> {
+			self.other();
+			self.inner.delete(uri).await
+		}
+	}
+
+	/// One tiered slab holding a version 50 s old, with two newer versions of the key in the
+	/// active slab, and a sweeper over a counting store. The store is counted from here on:
+	/// the tiering itself was done before the counter was put in front.
+	struct RetentionPassFixture {
+		manager: Arc<SlabManager>,
+		sm: WendelonStateMachine,
+		sweeper: SlabSweeper,
+		store: Arc<RequestCountingStore>,
+		key: crate::schema::Identity,
+		now_ms: u64,
+		_dirs: (crate::test_support::TestDir, crate::test_support::TestDir),
+	}
+
+	async fn retention_pass_fixture(
+		tag: &str,
+		cluster_window: Option<Duration>,
+	) -> RetentionPassFixture {
+		use crate::storage::core::StorageEngine;
+
+		let now_ms = SystemTime::now()
+			.duration_since(UNIX_EPOCH)
+			.unwrap()
+			.as_millis() as u64;
+		let l1_dir = fresh_dir(&format!("{tag}-l1"));
+		let l2_root = fresh_dir(&format!("{tag}-l2"));
+		let plain: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
+		let store = Arc::new(RequestCountingStore {
+			inner: plain.clone(),
+			fetches: Default::default(),
+			others: Default::default(),
+		});
+		let l2: Arc<dyn ObjectStore> = store.clone();
+		let io = spawn_io_thread(64).unwrap();
+		let manager = SlabManager::initialize_new_store(SlabManagerConfig {
+			tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
+			dir: l1_dir.to_path_buf(),
+			max_slab_bytes: 1 << 20,
+			io,
+			l2: Some(l2.clone()),
+			rehydration: crate::storage::manager::RehydrationPolicy::default(),
+			l2_column_fetch: Default::default(),
+			row_group_writer: Default::default(),
+			l2_row_group_fetch: Default::default(),
+			encoding_writer: Default::default(),
+			l2_chunk_layout: Default::default(),
+			l2_encoding_fetch: Default::default(),
+			encoding_compute: Default::default(),
+			group_commit: crate::storage::GroupCommitConfig::default(),
+			crypto: test_crypto(),
+		})
+		.await
+		.unwrap();
+		let key = id(17);
+		manager
+			.append(
+				tenant(),
+				key,
+				hlc_at(now_ms.saturating_sub(50_000)),
+				b"v-old",
+			)
+			.await
+			.unwrap();
+		let sealed_id = manager.force_seal_active_for_test().await;
+		let raw = manager.read_sealed_raw(sealed_id).await.unwrap();
+		let encrypted = manager.encrypt_tiered_object_blob(sealed_id, &raw).unwrap();
+		let uri = plain
+			.put(&format!("tier/slab_{sealed_id:016x}.wnd"), &encrypted.bytes)
+			.await
+			.unwrap();
+		let pointer = TieredSlabPointer {
+			slab_id: sealed_id,
+			l2_uri: uri,
+			payload_hash: crate::hash::content::digest(&encrypted.bytes),
+			is_encrypted: true,
+			tenant_id: Some(tenant()),
+			tenant_kek_id: Some(
+				manager
+					.encrypted_tiered_footer_summary(&encrypted.bytes)
+					.unwrap()
+					.unwrap()
+					.tenant_kek_id,
+			),
+			stats_format_version: encrypted
+				.stats_locator
+				.map(|locator| locator.stats_format_version),
+			stats_block_len: encrypted
+				.stats_locator
+				.map(|locator| locator.stats_block_len),
+			stats_block_hash128: encrypted
+				.stats_locator
+				.map(|locator| locator.stats_block_hash128),
+			tombstone_metadata: TombstoneMetadata::None,
+			supersession_metadata: SupersessionMetadata::None,
+		};
+		manager.apply_tier_slab(pointer.clone()).await.unwrap();
+		for (age_ms, value) in [(20_000, b"v-anchor".as_slice()), (5_000, b"v-latest")] {
+			manager
+				.append(tenant(), key, hlc_at(now_ms.saturating_sub(age_ms)), value)
+				.await
+				.unwrap();
+		}
+		let sm = WendelonStateMachine::new();
+		seed_state_machine_pointer(&sm, &manager, &pointer).await;
+		let observer: Arc<dyn TierObserver> = Arc::new(ManagerTierObserver::new(manager.clone()));
+		let committer: Arc<dyn TierCommitter> =
+			Arc::new(DirectApplyCommitter::ok(sm.clone(), observer));
+		let sweeper = SlabSweeper::new(
+			manager.clone(),
+			l2,
+			committer,
+			sm.clone(),
+			SweeperConfig {
+				scan_interval: Duration::from_millis(10),
+				op_driver_interval: Duration::from_millis(500),
+				min_slab_bytes: 0,
+				max_upload_bytes_per_sec: None,
+				key_prefix: "tier/".into(),
+				max_plaintext_rewrites_per_pass: 1,
+				max_dek_rewraps_per_pass: 1,
+			},
+		)
+		.with_clock(Arc::new(FixedClock { now_ms }))
+		.with_mvcc_retention_window(cluster_window);
+		// Everything above is setup. Only the retention passes below are counted.
+		store.fetches.store(0, std::sync::atomic::Ordering::Release);
+		store.others.store(0, std::sync::atomic::Ordering::Release);
+		RetentionPassFixture {
+			manager,
+			sm,
+			sweeper,
+			store,
+			key,
+			now_ms,
+			_dirs: (l1_dir, l2_root),
+		}
+	}
+
+	/// With retention off for the cluster and no table carrying a window, no version can be
+	/// pruned, and the retention pass shows it by asking the object store for nothing: not one
+	/// request across three passes over a tiered slab. Only the retention step runs here, so
+	/// the zero is that step's own; upload verification, re-wrap and rehydration are not in it.
+	#[tokio::test]
+	async fn a_retention_pass_with_no_possible_floor_asks_the_object_store_for_nothing() {
+		use crate::storage::core::StorageEngine;
+		let fixture = retention_pass_fixture("retention-idle", None).await;
+		assert_eq!(fixture.manager.list_tiered_slabs().await.len(), 1);
+		for pass in 0..3 {
+			let report = fixture
+				.sweeper
+				.rewrite_tiered_slabs_for_retention_once(RETENTION_TIERED_REWRITE_MAX_PER_PASS)
+				.await
+				.unwrap();
+			assert_eq!(report.rewritten, 0, "pass {pass}");
+			assert_eq!(report.pruned_versions, 0, "pass {pass}");
+			assert_eq!(report.failed, 0, "pass {pass}");
+			assert_eq!(
+				fixture.store.counts(),
+				(0, 0),
+				"pass {pass}: (fetches, other requests) to the object store"
+			);
+		}
+		// Nothing was pruned: the old version is still what an old read sees.
+		let old = fixture
+			.manager
+			.lookup_as_of(
+				tenant(),
+				fixture.key,
+				hlc_at(fixture.now_ms.saturating_sub(30_000)),
+			)
+			.unwrap()
+			.expect("the tiered version is still indexed");
+		assert_eq!(fixture.manager.read(old).await.unwrap(), b"v-old");
+		assert_eq!(fixture.manager.list_tiered_slabs().await.len(), 1);
+	}
+
+	/// The control: the same slab and the same pass with a cluster window. The pass fetches
+	/// the object and prunes the version the window no longer covers.
+	#[tokio::test]
+	async fn a_retention_pass_under_a_cluster_window_still_fetches_and_prunes() {
+		use crate::storage::core::StorageEngine;
+		let fixture =
+			retention_pass_fixture("retention-window", Some(Duration::from_secs(15))).await;
+		let report = fixture
+			.sweeper
+			.rewrite_tiered_slabs_for_retention_once(RETENTION_TIERED_REWRITE_MAX_PER_PASS)
+			.await
+			.unwrap();
+		assert_eq!(report.rewritten, 1);
+		assert_eq!(report.pruned_versions, 1);
+		assert!(
+			fixture.store.counts().0 >= 1,
+			"the pass fetched the tiered object"
+		);
+		assert!(
+			fixture
+				.manager
+				.lookup_as_of(
+					tenant(),
+					fixture.key,
+					hlc_at(fixture.now_ms.saturating_sub(30_000))
+				)
+				.unwrap()
+				.is_none(),
+			"the version older than the floor is gone"
+		);
+	}
+
+	/// A table's own window keeps the full pass with the cluster policy disabled: the committed
+	/// catalog names one table with a fixed window, so a floor is possible and every tiered
+	/// slab is read as before. (This slab holds no row of that table; nothing is pruned.)
+	#[tokio::test]
+	async fn a_table_window_keeps_the_full_retention_pass_when_the_cluster_policy_is_off() {
+		use crate::schema::{
+			MIN_RETENTION_WINDOW_MS, PolicyGeneration, RetentionWindowMillis, TableObjectId,
+			TableRetentionPolicy,
+		};
+		let fixture = retention_pass_fixture("retention-table-window", None).await;
+		let mut state = fixture.sm.state_snapshot().await;
+		state
+			.table_lifecycle
+			.set_next_generation(
+				tenant(),
+				TableObjectId::new([7; 16]),
+				PolicyGeneration::ZERO,
+				TableRetentionPolicy::FixedWindow(
+					RetentionWindowMillis::try_new(MIN_RETENTION_WINDOW_MS).unwrap(),
+				),
+				hlc_at(fixture.now_ms),
+			)
+			.unwrap();
+		fixture
+			.sm
+			.seed_complete_snapshot_state_for_test(state)
+			.await;
+		let report = fixture
+			.sweeper
+			.rewrite_tiered_slabs_for_retention_once(RETENTION_TIERED_REWRITE_MAX_PER_PASS)
+			.await
+			.unwrap();
+		assert_eq!(report.rewritten, 0);
+		assert_eq!(report.pruned_versions, 0);
+		assert!(
+			fixture.store.counts().0 >= 1,
+			"with a table window in the catalog the pass still reads the tiered object"
+		);
+	}
+
 	struct B1CountingStore {
 		inner: Arc<dyn ObjectStore>,
 		puts: std::sync::atomic::AtomicUsize,

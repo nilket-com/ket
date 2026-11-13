@@ -378,6 +378,14 @@ impl TableLifecycleCatalog {
 		self.by_id.is_empty()
 	}
 
+	/// Whether any table carries a retention window of its own. Only such a table can have a
+	/// retention floor when the cluster policy is disabled.
+	pub fn has_fixed_window(&self) -> bool {
+		self.by_id
+			.values()
+			.any(|policy| matches!(policy.retention, TableRetentionPolicy::FixedWindow(_)))
+	}
+
 	pub fn policy_counts(&self) -> TableLifecyclePolicyCounts {
 		let mut counts = TableLifecyclePolicyCounts::default();
 		for policy in self.by_id.values() {
