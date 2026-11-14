@@ -551,6 +551,20 @@ pub enum ClientError {
 		reason: wendelon::schema::MutationStopReason,
 		knowledge: wendelon::schema::MutationCommitKnowledge,
 	},
+	/// ADR 0732: the node's answer contradicts itself or says too little to act on: a
+	/// success status without a commit, or a refusal status without known non-commit.
+	/// `status` and `knowledge` are exactly what was received. The operation's outcome
+	/// is UNKNOWN: this is neither a commit nor a non-commit, and never a reason to
+	/// issue the operation again under a fresh identity. Ask for the recorded outcome,
+	/// or repeat the same identity and request.
+	#[error(
+		"mutation {operation_id:?} was answered inconsistently (status {status:?} with durable knowledge {knowledge:?}): its outcome is unknown"
+	)]
+	MutationAnswerInconsistent {
+		operation_id: ClientWriteId,
+		status: WriteStatus,
+		knowledge: wendelon::schema::MutationCommitKnowledge,
+	},
 	#[error(
 		"table write rejected: {} (0x{:04X})",
 		.reject_code.name(),
@@ -587,6 +601,7 @@ impl ClientError {
 			Self::AuthorizationFailed => StorageStatusKind::AuthorizationFailed,
 			Self::WriteFailed { status } => map_write_status_for_compute(*status),
 			Self::MutationStopped { .. } => StorageStatusKind::TerminalStorageError,
+			Self::MutationAnswerInconsistent { .. } => StorageStatusKind::TerminalStorageError,
 			Self::TableWriteRejected { .. } => StorageStatusKind::TerminalStorageError,
 			Self::TableDescriptorEvolved { .. } => StorageStatusKind::TerminalStorageError,
 			Self::TableReferenceIntegrityFailed { .. } => StorageStatusKind::TerminalStorageError,
@@ -595,6 +610,36 @@ impl ClientError {
 			Self::ReadFailed { status } => map_read_status_for_compute(*status),
 			Self::QueryFailed { status } => map_read_status_for_compute(*status),
 		}
+	}
+}
+
+/// ADR 0732: the one place a mutation answer becomes a success. `Ok(Some(duplicate))`
+/// only for `OK`/`DUPLICATE` WITH `COMMITTED`; every receipt is built from that and from
+/// nothing else. A recorded refusal (the `WRITE_REFUSED` status, or the success-labelled
+/// pair nodes sent before it existed) is `MutationStopped` naming this operation with
+/// the knowledge the node sent; a contradictory pair is `MutationAnswerInconsistent`.
+/// `Ok(None)`: an ordinary non-success status, for the caller's own mapping.
+fn committed_answer(
+	operation_id: ClientWriteId,
+	status: WriteStatus,
+	reason: wendelon::schema::MutationStopReason,
+	knowledge: wendelon::schema::MutationCommitKnowledge,
+) -> Result<Option<bool>, ClientError> {
+	use wendelon::schema::MutationAnswer;
+	match wendelon::schema::mutation_answer(status, knowledge) {
+		MutationAnswer::Committed { duplicate } => Ok(Some(duplicate)),
+		MutationAnswer::Refused => Err(ClientError::MutationStopped {
+			operation_id,
+			status: WriteStatus::WRITE_REFUSED,
+			reason,
+			knowledge,
+		}),
+		MutationAnswer::Inconsistent => Err(ClientError::MutationAnswerInconsistent {
+			operation_id,
+			status,
+			knowledge,
+		}),
+		MutationAnswer::Other => Ok(None),
 	}
 }
 
@@ -1438,10 +1483,16 @@ impl Client {
 			payload: kv_batch(key, value)?,
 		};
 		let result = self.inner.write(request).await?;
+		let committed = committed_answer(
+			result.response.echoed_write_id,
+			result.response.status,
+			result.response.mutation_stop_reason(),
+			result.response.mutation_commit_knowledge(),
+		)?;
 		match result.response.status {
-			s if s == WriteStatus::OK || s == WriteStatus::DUPLICATE => Ok(WriteReceipt {
+			_ if committed.is_some() => Ok(WriteReceipt {
 				identity,
-				duplicate: result.response.status == WriteStatus::DUPLICATE,
+				duplicate: committed == Some(true),
 				requested_durability: options.durability,
 				log_index: result.response.log_index,
 				term: result.response.term,
@@ -1523,9 +1574,15 @@ impl Client {
 				});
 			}
 		};
+		let committed = committed_answer(
+			result.response.echoed_write_id,
+			result.response.status,
+			result.response.mutation_stop_reason(),
+			result.response.mutation_commit_knowledge(),
+		)?;
 		match result.response.status {
 			// Defence in depth: a receipt must describe this add's own delta.
-			s if (s == WriteStatus::OK || s == WriteStatus::DUPLICATE)
+			_ if committed.is_some()
 				&& result
 					.response
 					.current_value
@@ -1536,11 +1593,11 @@ impl Client {
 					status: WriteStatus::INTERNAL_ERROR,
 				})
 			}
-			s if s == WriteStatus::OK || s == WriteStatus::DUPLICATE => Ok(CounterAddReceipt {
+			_ if committed.is_some() => Ok(CounterAddReceipt {
 				identity,
 				previous_value: result.response.previous_value,
 				current_value: result.response.current_value,
-				duplicate: result.response.status == WriteStatus::DUPLICATE,
+				duplicate: committed == Some(true),
 				requested_durability: options.durability,
 			}),
 			s if s == WriteStatus::QUOTA_EXCEEDED => Err(ClientError::QuotaExceeded { tenant_id }),
@@ -1637,12 +1694,18 @@ impl Client {
 			});
 		}
 		let response = result.response.write;
+		let committed = committed_answer(
+			response.echoed_write_id,
+			response.status,
+			response.mutation_stop_reason(),
+			response.mutation_commit_knowledge(),
+		)?;
 		match response.status {
-			s if s == WriteStatus::OK || s == WriteStatus::DUPLICATE => Ok(TableWriteReceipt {
+			_ if committed.is_some() => Ok(TableWriteReceipt {
 				table_object_id: descriptor.table_object_id,
 				schema_generation: descriptor.schema_generation,
 				rows,
-				duplicate: response.status == WriteStatus::DUPLICATE,
+				duplicate: committed == Some(true),
 				requested_durability: options.durability,
 				log_index: response.log_index,
 				term: response.term,
@@ -1714,24 +1777,28 @@ impl Client {
 			});
 		}
 		let response = result.response.write;
+		let committed = committed_answer(
+			response.echoed_write_id,
+			response.status,
+			response.mutation_stop_reason(),
+			response.mutation_commit_knowledge(),
+		)?;
 		match response.status {
-			s if s == WriteStatus::OK || s == WriteStatus::DUPLICATE => {
-				Ok(TableDeleteRowsReceipt {
-					table_object_id: descriptor.table_object_id,
-					schema_generation: descriptor.schema_generation,
-					requested,
-					deleted_count: result.response.deleted_count,
-					already_deleted_count: result.response.already_deleted_count,
-					not_found_count: result.response.not_found_count,
-					duplicate: response.status == WriteStatus::DUPLICATE,
-					requested_durability: options.durability,
-					log_index: response.log_index,
-					term: response.term,
-					epoch: response.epoch,
-					commit_hlc: response.commit_hlc,
-					finalization: result.finalization,
-				})
-			}
+			_ if committed.is_some() => Ok(TableDeleteRowsReceipt {
+				table_object_id: descriptor.table_object_id,
+				schema_generation: descriptor.schema_generation,
+				requested,
+				deleted_count: result.response.deleted_count,
+				already_deleted_count: result.response.already_deleted_count,
+				not_found_count: result.response.not_found_count,
+				duplicate: committed == Some(true),
+				requested_durability: options.durability,
+				log_index: response.log_index,
+				term: response.term,
+				epoch: response.epoch,
+				commit_hlc: response.commit_hlc,
+				finalization: result.finalization,
+			}),
 			s if s == WriteStatus::QUOTA_EXCEEDED => Err(ClientError::QuotaExceeded { tenant_id }),
 			s if s == WriteStatus::TENANT_SUSPENDED => {
 				Err(ClientError::TenantSuspended { tenant_id })

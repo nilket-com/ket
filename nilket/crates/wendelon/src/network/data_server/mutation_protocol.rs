@@ -173,11 +173,18 @@ impl WendelonDataServer {
 		Ok(response)
 	}
 
+	/// The last-attempt rule of a table delete: the write's rule, mode distinction
+	/// included (ADR 0732). A ParentDecisions node cannot tell from a retryable answer
+	/// whether the identity is reserved elsewhere, so the answer goes out as it is and
+	/// nothing is recorded; it never turns "unknown" into "known not committed".
 	pub(super) async fn finalize_table_delete_attempt(
 		&self,
 		meta: TableDeleteRowsRequestMeta,
 		mut response: TableDeleteRowsResponseMeta,
 	) -> std::io::Result<TableDeleteRowsResponseMeta> {
+		if self.decision_mode != crate::consensus::decision_mode::DecisionMode::Today {
+			return Ok(response);
+		}
 		if meta.attempts_remaining() != 1 || !retryable_mutation_status(response.write.status) {
 			return Ok(response);
 		}
@@ -487,6 +494,25 @@ impl WendelonDataServer {
 		Ok((meta, row_key_ids))
 	}
 
+	/// The write answer as it may go on the wire (ADR 0732): see
+	/// [`crate::schema::wire_mutation_pair`]. Every public mutation answer's frame
+	/// builder passes its answer through here.
+	pub(super) fn wire_write_answer(resp: WriteResponseMeta) -> WriteResponseMeta {
+		let (status, knowledge, replaced) =
+			crate::schema::wire_mutation_pair(resp.status, resp.mutation_commit_knowledge());
+		if !replaced {
+			return resp;
+		}
+		tracing::error!(
+			status = resp.status.as_str(),
+			knowledge = resp.mutation_commit_knowledge().0,
+			"a mutation answer claimed success without a commit; answering internal error"
+		);
+		let mut resp = resp;
+		resp.status = status;
+		resp.with_mutation_outcome(knowledge, resp.mutation_stop_reason())
+	}
+
 	pub(super) fn build_write_response_frame(
 		&self,
 		msg_type: MsgType,
@@ -494,6 +520,11 @@ impl WendelonDataServer {
 		resp: WriteResponseMeta,
 		trailing: Option<FinalizationMarker>,
 	) -> HrftFrame {
+		let resp = if msg_type == MsgType::WRITE_RESP {
+			Self::wire_write_answer(resp)
+		} else {
+			resp
+		};
 		let mut meta_buf = self.pool.acquire();
 		meta_buf
 			.as_mut_vec()
@@ -525,9 +556,10 @@ impl WendelonDataServer {
 	pub(super) fn build_table_write_response_frame(
 		&self,
 		stream_id: u32,
-		resp: TableWriteResponseMeta,
+		mut resp: TableWriteResponseMeta,
 		trailing: Option<FinalizationMarker>,
 	) -> HrftFrame {
+		resp.write = Self::wire_write_answer(resp.write);
 		let mut meta_buf = self.pool.acquire();
 		meta_buf
 			.as_mut_vec()
@@ -559,9 +591,10 @@ impl WendelonDataServer {
 	pub(super) fn build_table_delete_response_frame(
 		&self,
 		stream_id: u32,
-		resp: TableDeleteRowsResponseMeta,
+		mut resp: TableDeleteRowsResponseMeta,
 		trailing: Option<FinalizationMarker>,
 	) -> HrftFrame {
+		resp.write = Self::wire_write_answer(resp.write);
 		let mut meta_buf = self.pool.acquire();
 		meta_buf
 			.as_mut_vec()

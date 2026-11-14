@@ -65,6 +65,24 @@ pub fn response(
 	response
 }
 
+/// The answer of a node whose add committed (`OK`) or replayed a committed add
+/// (`DUPLICATE`): that status with knowledge `COMMITTED`, as the node stamps it.
+pub fn committed_response(
+	request: &CounterAddRequestMeta,
+	status: wendelon::schema::WriteStatus,
+	previous_value: u64,
+	current_value: u64,
+) -> CounterAddResponseMeta {
+	assert!(
+		status == wendelon::schema::WriteStatus::OK
+			|| status == wendelon::schema::WriteStatus::DUPLICATE
+	);
+	response(request, status, previous_value, current_value).with_mutation_outcome(
+		wendelon::schema::MutationCommitKnowledge::COMMITTED,
+		wendelon::schema::MutationStopReason::NONE,
+	)
+}
+
 /// The write id a captured request carried.
 pub fn write_id(request: &CounterAddRequestMeta) -> ClientWriteId {
 	request.write_id

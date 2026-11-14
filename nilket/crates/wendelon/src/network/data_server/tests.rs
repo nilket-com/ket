@@ -5675,6 +5675,47 @@ async fn post_dispatch_expiry_resolves_and_replays_as_one_indeterminate_operatio
 	shutdown_lease_node(reopened).await;
 }
 
+/// Today-mode control for the delete's last-attempt rule: a retryable answer to a last
+/// attempt is rewritten to exhaustion, known not committed, and recorded.
+#[tokio::test]
+async fn a_today_deletes_last_retryable_answer_is_rewritten_to_exhaustion_and_recorded() {
+	let dir = bootstrap_tempdir("table-delete-attempt-exhaustion");
+	let cfg = NodeBootstrapConfig::dev(41, dir.to_path_buf(), "127.0.0.1:0".into());
+	let node = WendelonNode::bootstrap_single_node(cfg).await.unwrap();
+	let descriptor = typed_table_descriptor();
+	let mut meta: TableDeleteRowsRequestMeta = bytemuck::Zeroable::zeroed();
+	meta.parent_write_id = typed_table_meta(&descriptor, 1).parent_write_id;
+	meta.tenant_id = typed_table_meta(&descriptor, 1).tenant_id;
+	meta.table_object_id = descriptor.table_object_id;
+	meta.schema_generation = descriptor.schema_generation;
+	meta.row_count = 1;
+	meta.set_attempts_remaining(1);
+	let (built, sent) = node
+		.data_server
+		.finalized_delete_answer_for_test(
+			meta,
+			WriteStatus::BACKPRESSURED,
+			MutationCommitKnowledge::INDETERMINATE,
+		)
+		.await;
+	assert_eq!(built.write.status, WriteStatus::BACKPRESSURED);
+	assert_eq!(sent.write.status, WriteStatus::WRITE_ATTEMPTS_EXHAUSTED);
+	assert_eq!(
+		sent.write.mutation_stop_reason(),
+		MutationStopReason::ATTEMPT_EXHAUSTION
+	);
+	assert_eq!(
+		sent.write.mutation_commit_knowledge(),
+		MutationCommitKnowledge::KNOWN_NOT_COMMITTED
+	);
+	let stored = node
+		.data_server
+		.stored_mutation_outcome_for_test(meta.parent_write_id, meta.tenant_id)
+		.expect("the exhausted outcome is recorded");
+	assert_eq!(stored.status, WriteStatus::WRITE_ATTEMPTS_EXHAUSTED);
+	shutdown_lease_node(node).await;
+}
+
 #[tokio::test]
 async fn final_attempt_exhaustion_is_a_durable_two_axis_outcome() {
 	let dir = bootstrap_tempdir("table-write-attempt-exhaustion-reopen");

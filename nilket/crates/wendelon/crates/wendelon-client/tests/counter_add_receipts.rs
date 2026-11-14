@@ -8,7 +8,7 @@ mod counter_transport;
 
 use std::sync::Arc;
 
-use counter_transport::{CounterWire, inner_client, response};
+use counter_transport::{CounterWire, committed_response, inner_client, response};
 use wendelon::integration::compute::{StorageStatusKind, map_write_status_for_compute};
 use wendelon::schema::{MutationCommitKnowledge, MutationStopReason, TenantId, WriteStatus};
 use wendelon_client::{Client, ClientError, WriteOptions};
@@ -25,14 +25,119 @@ async fn add_answered(
 	Result<wendelon_client::CounterAddReceipt, ClientError>,
 	usize,
 ) {
+	// A node that answers OK or DUPLICATE has committed the add and says so.
 	let wire = CounterWire::answering(Arc::new(move |request| {
-		Some(response(request, status, previous, current))
+		Some(
+			if status == WriteStatus::OK || status == WriteStatus::DUPLICATE {
+				committed_response(request, status, previous, current)
+			} else {
+				response(request, status, previous, current)
+			},
+		)
 	}));
 	let client = Client::from_inner(inner_client(&wire));
 	let result = client
 		.counter_fetch_add(TenantId::new(7), b"counter", delta, WriteOptions::default())
 		.await;
 	(result, wire.requests().len())
+}
+
+/// One add of 5 answered with exactly `status` and `knowledge` and a delta of 5.
+async fn add_answered_with(
+	status: WriteStatus,
+	knowledge: MutationCommitKnowledge,
+) -> (
+	Result<wendelon_client::CounterAddReceipt, ClientError>,
+	CounterWire,
+) {
+	let wire = CounterWire::answering(Arc::new(move |request| {
+		Some(
+			response(request, status, 10, 15)
+				.with_mutation_outcome(knowledge, MutationStopReason::NONE),
+		)
+	}));
+	let client = Client::from_inner(inner_client(&wire));
+	let result = client
+		.counter_fetch_add(TenantId::new(7), b"counter", 5, WriteOptions::default())
+		.await;
+	(result, wire)
+}
+
+/// ADR 0732: a counter receipt needs a committed answer, like every other receipt. A
+/// success status without a commit, and a refusal status without known non-commit, are
+/// answers whose outcome is unknown; a recorded refusal names the add and its knowledge.
+#[tokio::test]
+async fn a_counter_receipt_needs_a_committed_answer() {
+	for status in [WriteStatus::OK, WriteStatus::DUPLICATE] {
+		let (result, wire) = add_answered_with(status, MutationCommitKnowledge::COMMITTED).await;
+		let receipt = result.unwrap_or_else(|error| panic!("{status:?}: {error:?}"));
+		assert_eq!(receipt.duplicate, status == WriteStatus::DUPLICATE);
+		assert_eq!(wire.requests().len(), 1);
+	}
+	let unknown = MutationCommitKnowledge(9);
+	for (status, knowledge) in [
+		(WriteStatus::OK, MutationCommitKnowledge::UNSPECIFIED),
+		(WriteStatus::OK, MutationCommitKnowledge::INDETERMINATE),
+		(WriteStatus::DUPLICATE, MutationCommitKnowledge::UNSPECIFIED),
+		(WriteStatus::DUPLICATE, unknown),
+		(
+			WriteStatus::WRITE_REFUSED,
+			MutationCommitKnowledge::COMMITTED,
+		),
+		(
+			WriteStatus::WRITE_REFUSED,
+			MutationCommitKnowledge::INDETERMINATE,
+		),
+		(
+			WriteStatus::WRITE_REFUSED,
+			MutationCommitKnowledge::UNSPECIFIED,
+		),
+		(WriteStatus::WRITE_REFUSED, unknown),
+	] {
+		let (result, wire) = add_answered_with(status, knowledge).await;
+		let sent = counter_transport::write_id(&wire.requests()[0]);
+		match result {
+			Err(ClientError::MutationAnswerInconsistent {
+				operation_id,
+				status: got_status,
+				knowledge: got_knowledge,
+			}) => {
+				assert_eq!((got_status, got_knowledge), (status, knowledge));
+				assert_eq!(operation_id, sent);
+			}
+			other => panic!("{status:?} with {knowledge:?}: {other:?}"),
+		}
+		assert_eq!(
+			wire.requests().len(),
+			1,
+			"{status:?} with {knowledge:?}: no retry"
+		);
+	}
+	for status in [
+		WriteStatus::WRITE_REFUSED,
+		WriteStatus::OK,
+		WriteStatus::DUPLICATE,
+	] {
+		let (result, wire) =
+			add_answered_with(status, MutationCommitKnowledge::KNOWN_NOT_COMMITTED).await;
+		let sent = counter_transport::write_id(&wire.requests()[0]);
+		match result {
+			Err(ClientError::MutationStopped {
+				operation_id,
+				status: WriteStatus::WRITE_REFUSED,
+				knowledge: MutationCommitKnowledge::KNOWN_NOT_COMMITTED,
+				..
+			}) => assert_eq!(operation_id, sent),
+			other => panic!("{status:?} known not committed: {other:?}"),
+		}
+		assert_eq!(wire.requests().len(), 1);
+	}
+	assert_eq!(WriteStatus::WRITE_REFUSED.0, 26);
+	assert_eq!(WriteStatus::WRITE_REFUSED.as_str(), "write_refused");
+	assert_eq!(
+		map_write_status_for_compute(WriteStatus::WRITE_REFUSED),
+		StorageStatusKind::TerminalStorageError
+	);
 }
 
 #[tokio::test]

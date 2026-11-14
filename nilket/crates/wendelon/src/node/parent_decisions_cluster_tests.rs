@@ -1109,8 +1109,14 @@ async fn every_node_reads_exactly_what_is_accepted_at_its_cut() {
 	release.notify_one();
 	let answer = pending.await.unwrap();
 	assert_eq!(
-		answer.write.mutation_commit_knowledge(),
-		MutationCommitKnowledge::KNOWN_NOT_COMMITTED,
+		(
+			answer.write.status,
+			answer.write.mutation_commit_knowledge()
+		),
+		(
+			WriteStatus::WRITE_REFUSED,
+			MutationCommitKnowledge::KNOWN_NOT_COMMITTED
+		),
 		"{answer:?}"
 	);
 	expect_everywhere(&cluster, &descriptor, &expected, "after the refusal").await;
@@ -1488,8 +1494,14 @@ async fn the_selected_version_routes_by_its_own_locality() {
 	release.notify_one();
 	let answer = pending.await.unwrap();
 	assert_eq!(
-		answer.write.mutation_commit_knowledge(),
-		MutationCommitKnowledge::KNOWN_NOT_COMMITTED,
+		(
+			answer.write.status,
+			answer.write.mutation_commit_knowledge()
+		),
+		(
+			WriteStatus::WRITE_REFUSED,
+			MutationCommitKnowledge::KNOWN_NOT_COMMITTED
+		),
 		"{answer:?}"
 	);
 
@@ -1659,9 +1671,14 @@ async fn one_kv_key_is_written_at_its_primary_and_read_exactly_everywhere() {
 	abort(&cluster, &reserved).await;
 	kv_expect_everywhere(&cluster, b"alpha", Some(b"one"), "newer Refused").await;
 	release.notify_one();
+	let refused = pending.await.unwrap();
 	assert_eq!(
-		pending.await.unwrap().mutation_commit_knowledge(),
-		MutationCommitKnowledge::KNOWN_NOT_COMMITTED
+		(refused.status, refused.mutation_commit_knowledge()),
+		(
+			WriteStatus::WRITE_REFUSED,
+			MutationCommitKnowledge::KNOWN_NOT_COMMITTED
+		),
+		"a refused key-value write: {refused:?}"
 	);
 
 	// Another key at the same position never answers for this one.
@@ -3633,7 +3650,7 @@ async fn a_new_leader_with_one_voter_down_still_decides() {
 			named_rows(&descriptor, &[(2, "b")]),
 		)
 		.await;
-		if response.write.status == WriteStatus::OK
+		if response.write.status == WriteStatus::WRITE_REFUSED
 			&& response.write.mutation_commit_knowledge()
 				== MutationCommitKnowledge::KNOWN_NOT_COMMITTED
 			&& tokio::time::Instant::now() < deadline

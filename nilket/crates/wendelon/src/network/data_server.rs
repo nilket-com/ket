@@ -6767,8 +6767,19 @@ impl WendelonDataServer {
 	fn build_counter_add_response_frame(
 		&self,
 		stream_id: u32,
-		resp: CounterAddResponseMeta,
+		mut resp: CounterAddResponseMeta,
 	) -> HrftFrame {
+		// ADR 0732: no success without a commit on the wire.
+		let (status, knowledge, replaced) =
+			crate::schema::wire_mutation_pair(resp.status, resp.mutation_commit_knowledge());
+		if replaced {
+			tracing::error!(
+				status = resp.status.as_str(),
+				"a counter add answer claimed success without a commit; answering internal error"
+			);
+			resp.status = status;
+			resp = resp.with_mutation_outcome(knowledge, resp.mutation_stop_reason());
+		}
 		let mut meta_buf = self.pool.acquire();
 		meta_buf
 			.as_mut_vec()

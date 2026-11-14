@@ -183,7 +183,7 @@ impl WendelonDataServer {
 				)
 			}
 			DeleteSettled::KnownNotCommitted => (
-				WriteStatus::OK,
+				WriteStatus::WRITE_REFUSED,
 				MutationCommitKnowledge::KNOWN_NOT_COMMITTED,
 				0,
 				meta.client_hlc,
@@ -706,6 +706,25 @@ impl WendelonDataServer {
 			.await
 			.unwrap()
 			.0
+	}
+
+	/// Test-only: the last-attempt rule applied to a delete answer this node built for
+	/// `status`, as its handler applies it before the answer goes out.
+	pub(crate) async fn finalized_delete_answer_for_test(
+		&self,
+		meta: TableDeleteRowsRequestMeta,
+		status: WriteStatus,
+		knowledge: MutationCommitKnowledge,
+	) -> (TableDeleteRowsResponseMeta, TableDeleteRowsResponseMeta) {
+		let mut built = self.table_delete_error_response(&meta, status, PbcRejectCode::NONE);
+		built.write = built
+			.write
+			.with_mutation_outcome(knowledge, crate::schema::MutationStopReason::NONE);
+		let sent = self
+			.finalize_table_delete_attempt(meta, built)
+			.await
+			.unwrap();
+		(built, sent)
 	}
 
 	/// Test-only: rewind this node's HLC, as a coordinator whose clock is behind.

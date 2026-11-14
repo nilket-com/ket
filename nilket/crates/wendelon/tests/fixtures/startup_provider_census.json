@@ -16,6 +16,14 @@
     "withdraw_noop": true
   },
   {
+    "file": "crates/wendelon/crates/wendelon-client/tests/mutation_transport/mod.rs",
+    "implementation": "WireProvider",
+    "retains_publication": false,
+    "withdrawal": "explicit no retained publication",
+    "overrides_publish": false,
+    "withdraw_noop": true
+  },
+  {
     "file": "crates/wendelon/src/client/core.rs",
     "implementation": "ScriptedDescriptorGetProvider",
     "retains_publication": false,

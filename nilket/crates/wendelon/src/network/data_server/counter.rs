@@ -366,6 +366,10 @@ impl WendelonDataServer {
 				} else {
 					WriteStatus::OK
 				};
+				// ADR 0732: this is the add's commit point. `fetch_add_fenced` returns
+				// `Applied` only after the finalization witness is durable, from where
+				// "the add WILL complete" (storage/counter.rs, `admitted_add`), and
+				// `Replayed` only from the durable record of an add that reached it.
 				self.counter_add_response(
 					&meta,
 					status,
@@ -373,6 +377,7 @@ impl WendelonDataServer {
 					outcome.current,
 					Self::zero_counter_hlc(),
 				)
+				.with_mutation_outcome(MutationCommitKnowledge::COMMITTED, MutationStopReason::NONE)
 			}
 			// All rejects fail closed — the leader mutated nothing (D5/D6). A write-key
 			// conflict carries zero values, never the recorded add's outcome. An

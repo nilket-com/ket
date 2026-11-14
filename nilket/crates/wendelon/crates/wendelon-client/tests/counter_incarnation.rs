@@ -18,7 +18,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use counter_transport::{CounterWire, inner_client, response};
+use counter_transport::{CounterWire, committed_response, inner_client, response};
 use wendelon::schema::{
 	ClientWriteId, MutationCommitKnowledge, MutationStopReason, TenantId, WriteStatus,
 	uuid_v7_unix_millis,
@@ -77,7 +77,12 @@ impl ClientClock for SteppedClock {
 
 fn ok_wire() -> CounterWire {
 	CounterWire::answering(Arc::new(|request| {
-		Some(response(request, WriteStatus::OK, 0, request.delta))
+		Some(committed_response(
+			request,
+			WriteStatus::OK,
+			0,
+			request.delta,
+		))
 	}))
 }
 
@@ -258,7 +263,12 @@ fn expiring_wire(clock: Arc<SteppedClock>) -> CounterWire {
 					),
 			)
 		} else {
-			Some(response(request, WriteStatus::OK, 0, request.delta))
+			Some(committed_response(
+				request,
+				WriteStatus::OK,
+				0,
+				request.delta,
+			))
 		}
 	}))
 }

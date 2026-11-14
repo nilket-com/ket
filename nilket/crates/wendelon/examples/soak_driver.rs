@@ -563,6 +563,9 @@ fn error_label(err: &ClientError) -> String {
 		ClientError::MutationStopped { status, .. } => {
 			format!("mutation_stopped_{}", status.as_str())
 		}
+		ClientError::MutationAnswerInconsistent { status, .. } => {
+			format!("mutation_answer_inconsistent_{}", status.as_str())
+		}
 		ClientError::ReadFailed { status } => format!("read_status_{status:?}"),
 		ClientError::QueryFailed { status } => format!("query_status_{}", status.as_str()),
 		ClientError::Io(err) => format!("io_{}", err.kind()),

@@ -6,8 +6,9 @@
 //! from its original claim or answered from its recorded status, and only an
 //! absent, eligible key gets a new claim. A new claim is stamped, signed and
 //! reserved through the leader; each child's holder then writes and
-//! acknowledges it; and Finalize decides. Only a recorded Accepted answers
-//! COMMITTED and only a recorded Refused answers KNOWN_NOT_COMMITTED.
+//! acknowledges it; and Finalize decides. Only a recorded Accepted answers OK and
+//! COMMITTED, and only a recorded Refused answers WRITE_REFUSED and
+//! KNOWN_NOT_COMMITTED (ADR 0732): a refusal is never labelled success.
 
 use super::child_writes::{ChildWriteMeta, child_request_meta, child_versions};
 use super::write_deadline::{
@@ -377,7 +378,7 @@ impl WendelonDataServer {
 				self.local_node,
 			),
 			Settled::KnownNotCommitted => (
-				WriteStatus::OK,
+				WriteStatus::WRITE_REFUSED,
 				MutationCommitKnowledge::KNOWN_NOT_COMMITTED,
 				0,
 				meta.client_hlc,

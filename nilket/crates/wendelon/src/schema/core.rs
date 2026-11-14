@@ -1232,6 +1232,9 @@ impl WriteStatus {
 	/// in the future than the server's clock-skew allowance. Nothing was applied,
 	/// and the same write id is refused again. Not retryable as-is.
 	pub const WRITE_IDENTITY_INVALID: Self = Self(25);
+	/// ADR 0732: this operation's recorded outcome is a refusal; it did not commit and
+	/// will not under this identity. Always with knowledge `KNOWN_NOT_COMMITTED`.
+	pub const WRITE_REFUSED: Self = Self(26);
 
 	pub const fn as_str(self) -> &'static str {
 		match self {
@@ -1261,6 +1264,7 @@ impl WriteStatus {
 			Self::WRITE_OPERATION_UNKNOWN => "write_operation_unknown",
 			Self::WRITE_KEY_CONFLICT => "write_key_conflict",
 			Self::WRITE_IDENTITY_INVALID => "write_identity_invalid",
+			Self::WRITE_REFUSED => "write_refused",
 			_ => "unknown",
 		}
 	}
@@ -1278,6 +1282,66 @@ impl MutationCommitKnowledge {
 	pub const COMMITTED: Self = Self(1);
 	pub const KNOWN_NOT_COMMITTED: Self = Self(2);
 	pub const INDETERMINATE: Self = Self(3);
+}
+
+/// What a mutation answer says, read from its status AND its commit knowledge together
+/// (ADR 0732). A status alone never means success.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MutationAnswer {
+	/// `OK` or `DUPLICATE` with `COMMITTED`: the only success.
+	Committed { duplicate: bool },
+	/// The operation's recorded outcome is a refusal: `WRITE_REFUSED` with
+	/// `KNOWN_NOT_COMMITTED`, or the pair nodes sent before that status existed,
+	/// `OK`/`DUPLICATE` with `KNOWN_NOT_COMMITTED`.
+	Refused,
+	/// A pair that contradicts itself or says too little: `OK`/`DUPLICATE` without a
+	/// commit, or `WRITE_REFUSED` without known non-commit. The outcome is unknown.
+	Inconsistent,
+	/// Any other status: not a success and not a recorded refusal; read as before.
+	Other,
+}
+
+/// The one reading of a mutation answer's (status, knowledge) pair. Node and client both
+/// use it: a node sends `OK`/`DUPLICATE` only where this says `Committed`, and a client
+/// builds a receipt only from `Committed`.
+pub const fn mutation_answer(
+	status: WriteStatus,
+	knowledge: MutationCommitKnowledge,
+) -> MutationAnswer {
+	let success = status.0 == WriteStatus::OK.0 || status.0 == WriteStatus::DUPLICATE.0;
+	let refused = status.0 == WriteStatus::WRITE_REFUSED.0;
+	if !success && !refused {
+		return MutationAnswer::Other;
+	}
+	if knowledge.0 == MutationCommitKnowledge::KNOWN_NOT_COMMITTED.0 {
+		return MutationAnswer::Refused;
+	}
+	if success && knowledge.0 == MutationCommitKnowledge::COMMITTED.0 {
+		return MutationAnswer::Committed {
+			duplicate: status.0 == WriteStatus::DUPLICATE.0,
+		};
+	}
+	MutationAnswer::Inconsistent
+}
+
+/// The (status, knowledge) pair a node may put on the wire for a mutation answer: unchanged
+/// unless it claims success without a commit, which no producer may do (ADR 0732). Such a
+/// pair is a defect in the node; it goes out as `INTERNAL_ERROR` with the outcome unknown,
+/// never as the success it was not shown to be. Returns whether it was replaced.
+pub const fn wire_mutation_pair(
+	status: WriteStatus,
+	knowledge: MutationCommitKnowledge,
+) -> (WriteStatus, MutationCommitKnowledge, bool) {
+	let success = status.0 == WriteStatus::OK.0 || status.0 == WriteStatus::DUPLICATE.0;
+	if success && knowledge.0 != MutationCommitKnowledge::COMMITTED.0 {
+		(
+			WriteStatus::INTERNAL_ERROR,
+			MutationCommitKnowledge::INDETERMINATE,
+			true,
+		)
+	} else {
+		(status, knowledge, false)
+	}
 }
 
 /// ADR 542's orthogonal stop-cause axis.

@@ -147,6 +147,7 @@ impl From<wendelon_client::ClientError> for StorageError {
 			},
 			source @ ClientError::WriteFailed { .. }
 			| source @ ClientError::MutationStopped { .. }
+			| source @ ClientError::MutationAnswerInconsistent { .. }
 			| source @ ClientError::SchemaUpdateRejected { .. }
 			| source @ ClientError::Admin(_) => Self::Client { source },
 		}

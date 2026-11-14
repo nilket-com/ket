@@ -496,8 +496,11 @@ async fn a_takeover_refuses_a_cut_off_holders_reserved_write_and_keeps_its_accep
 	// The same identity answers that refusal, at the successor too.
 	let again = write_through(&cluster, after.holder.id, reserved_meta, reserved_batch).await;
 	assert_eq!(
-		again.write.mutation_commit_knowledge(),
-		MutationCommitKnowledge::KNOWN_NOT_COMMITTED,
+		(again.write.status, again.write.mutation_commit_knowledge()),
+		(
+			WriteStatus::WRITE_REFUSED,
+			MutationCommitKnowledge::KNOWN_NOT_COMMITTED
+		),
 		"{again:?}"
 	);
 	assert_eq!(

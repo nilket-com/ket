@@ -54,6 +54,7 @@ fn status_name(status: WriteStatus) -> String {
 		s if s == WriteStatus::BACKPRESSURED => "BACKPRESSURED".to_owned(),
 		s if s == WriteStatus::WRITE_STALLED => "WRITE_STALLED".to_owned(),
 		s if s == WriteStatus::WRITE_ATTEMPTS_EXHAUSTED => "WRITE_ATTEMPTS_EXHAUSTED".to_owned(),
+		s if s == WriteStatus::WRITE_REFUSED => "WRITE_REFUSED".to_owned(),
 		other => format!("{other:?}"),
 	}
 }
@@ -313,9 +314,10 @@ async fn a_last_attempt_redirected_with_no_record_stays_indeterminate_and_reserv
 }
 
 /// Control: the authoritative definite negative. A recorded Refused parent
-/// answers OK + KNOWN_NOT_COMMITTED from the record, at its coordinator and at
-/// another node, whatever `attempts_remaining` says, and stores no mutation
-/// outcome: the record is the outcome.
+/// answers WRITE_REFUSED + KNOWN_NOT_COMMITTED from the record (ADR 0732: never a
+/// success status), at its coordinator and at another node, whatever
+/// `attempts_remaining` says, and stores no mutation outcome: the record is the
+/// outcome.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_recorded_refused_parent_answers_known_not_committed_whatever_attempts_remain() {
 	let (cluster, leader, descriptor) = ready().await;
@@ -350,8 +352,14 @@ async fn a_recorded_refused_parent_answers_known_not_committed_whatever_attempts
 			.unwrap();
 	handler_end("the original", &mut original).await.unwrap();
 	assert_eq!(
-		original_answer.write.mutation_commit_knowledge(),
-		MutationCommitKnowledge::KNOWN_NOT_COMMITTED,
+		(
+			original_answer.write.status,
+			original_answer.write.mutation_commit_knowledge()
+		),
+		(
+			WriteStatus::WRITE_REFUSED,
+			MutationCommitKnowledge::KNOWN_NOT_COMMITTED
+		),
 		"the original, released after the abort: {}",
 		answer_text(&original_answer.write)
 	);
@@ -366,7 +374,7 @@ async fn a_recorded_refused_parent_answers_known_not_committed_whatever_attempts
 		eprintln!("DC212 refused: {what}: answered {}", answer_text(&answer));
 		assert_answer(
 			&answer,
-			WriteStatus::OK,
+			WriteStatus::WRITE_REFUSED,
 			MutationCommitKnowledge::KNOWN_NOT_COMMITTED,
 			MutationStopReason::NONE,
 			node,
@@ -976,4 +984,137 @@ async fn a_hint_to_a_stopped_node_is_skipped_and_the_call_ends_with_its_attempts
 		);
 		assert_eq!(*scripted.write_ids.lock().unwrap(), vec![wanted; 2 * call]);
 	}
+}
+
+/// A delete whose parent the decision log recorded as Refused is not answered as a
+/// success: at its coordinator, released after the refusal, and asked again at another
+/// node, the answer says it is known not to have committed and counts nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_recorded_refused_delete_is_never_answered_as_success() {
+	let (cluster, leader, descriptor) = ready().await;
+	let (id, primary) = row_off_the_leader(&cluster, leader, &descriptor, 1).await;
+	let other = leader;
+	assert_committed(
+		&write_through(
+			&cluster,
+			primary,
+			write_meta(&descriptor, 1, uuid_v7()),
+			rows(&descriptor, &[id]),
+		)
+		.await,
+		"the row the delete names",
+	);
+	let row = cluster
+		.node(primary)
+		.data_server
+		.row_identity_and_locality_for_test(TenantId::ZERO, &descriptor, &rows(&descriptor, &[id]))
+		.0;
+	let meta = delete_meta(&descriptor);
+	let key = ParentKey {
+		tenant: TenantId::ZERO,
+		namespace: ParentNamespace::Table(descriptor.table_object_id),
+		client_uuid: meta.parent_write_id.client_uuid,
+		sequence_no: meta.parent_write_id.sequence_no,
+	};
+
+	// Reserved, then refused by its coordinator's own signed abort.
+	let server = cluster.node(primary).data_server.clone();
+	let (reached, release) = server.pause_coordinator_for_test(PauseStage::BeforeFinalize);
+	let held = ReleaseOnDrop(release);
+	let original = tokio::spawn({
+		let server = server.clone();
+		async move { server.table_delete_for_test(meta, vec![row]).await }
+	});
+	until_reached("the delete before Finalize", &reached).await;
+	let reserved = record_of(&cluster, key).await.unwrap();
+	assert_eq!(reserved.status, ParentStatus::Reserved);
+	abort(&cluster, &reserved).await;
+	let refused = record_of(&cluster, key).await.unwrap();
+	assert!(
+		matches!(refused.status, ParentStatus::Refused { .. }),
+		"{refused:?}"
+	);
+	drop(held);
+	let original = tokio::time::timeout(BOUND, original)
+		.await
+		.expect("the delete answers")
+		.unwrap();
+	let asked_again = delete_through(&cluster, other, meta, vec![row]).await;
+	for (what, answer) in [
+		("the original, released after the abort", original),
+		("asked again at another node", asked_again),
+	] {
+		eprintln!(
+			"DC238 refused delete: {what}: answered {}",
+			answer_text(&answer.write)
+		);
+		assert_eq!(
+			answer.write.mutation_commit_knowledge(),
+			MutationCommitKnowledge::KNOWN_NOT_COMMITTED,
+			"{what}"
+		);
+		assert_eq!(
+			answer.write.status,
+			WriteStatus::WRITE_REFUSED,
+			"{what}: a recorded refusal is not labelled success: {}",
+			answer_text(&answer.write)
+		);
+		assert_eq!(
+			answer.write.echoed_write_id.client_uuid, meta.parent_write_id.client_uuid,
+			"{what}"
+		);
+		assert_eq!(
+			[
+				answer.deleted_count,
+				answer.already_deleted_count,
+				answer.not_found_count
+			],
+			[0, 0, 0],
+			"{what}"
+		);
+	}
+	shut_down(cluster).await;
+}
+
+/// A ParentDecisions node cannot tell from a retryable answer whether a delete's identity
+/// is reserved elsewhere. The answer to a delete's LAST attempt therefore goes out as it
+/// was built, with the knowledge it had, and the node stores no outcome of its own; it
+/// does not turn "unknown" into "known not committed".
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_deletes_last_retryable_answer_goes_out_unchanged_and_is_not_recorded() {
+	let (cluster, leader, descriptor) = ready().await;
+	let server = cluster.node(leader).data_server.clone();
+	for status in [
+		WriteStatus::NOT_LEADER,
+		WriteStatus::BACKPRESSURED,
+		WriteStatus::LEASE_EXPIRED,
+	] {
+		let mut meta = delete_meta(&descriptor);
+		meta.set_attempts_remaining(1);
+		let (built, sent) = server
+			.finalized_delete_answer_for_test(meta, status, MutationCommitKnowledge::INDETERMINATE)
+			.await;
+		eprintln!(
+			"DC238 delete last attempt: built {} sent {}",
+			answer_text(&built.write),
+			answer_text(&sent.write)
+		);
+		assert_eq!(
+			bytemuck::bytes_of(&sent),
+			bytemuck::bytes_of(&built),
+			"{status:?}: the answer was rewritten to {}",
+			answer_text(&sent.write)
+		);
+		for node in NODES {
+			assert!(
+				cluster
+					.node(node)
+					.data_server
+					.stored_mutation_outcome_for_test(meta.parent_write_id, meta.tenant_id)
+					.is_none(),
+				"{status:?}: node {node} stored a local outcome for a ParentDecisions delete"
+			);
+		}
+	}
+	shut_down(cluster).await;
 }

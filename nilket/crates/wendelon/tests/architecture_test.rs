@@ -12879,3 +12879,54 @@ fn consensus_timing_fields_are_written_only_by_the_timing_profile() {
 	let retention = fs::read_to_string(src.join("consensus/retention.rs")).unwrap();
 	assert!(retention.contains("let base = timing.apply(Config {"));
 }
+
+/// ADR 0732: a mutation answer is a success only as (OK or DUPLICATE, COMMITTED). The SDK
+/// builds each receipt in one place, behind the one function that reads the pair; the
+/// node sends a recorded refusal under its own status and passes every public mutation
+/// answer through the wire rule.
+#[test]
+fn a_mutation_receipt_is_built_only_from_a_committed_answer() {
+	let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let sdk = fs::read_to_string(manifest.join("crates/wendelon-client/src/lib.rs")).unwrap();
+	for status in ["WriteStatus::OK", "WriteStatus::DUPLICATE"] {
+		assert!(
+			!sdk.contains(status),
+			"the SDK reads a success status directly: {status}"
+		);
+	}
+	assert_eq!(sdk.matches("wendelon::schema::mutation_answer(").count(), 1);
+	assert_eq!(sdk.matches("= committed_answer(").count(), 4);
+	for receipt in [
+		"WriteReceipt {",
+		"CounterAddReceipt {",
+		"TableWriteReceipt {",
+		"TableDeleteRowsReceipt {",
+	] {
+		let built = format!("Ok({receipt}");
+		assert_eq!(sdk.matches(&built).count(), 1, "{receipt}");
+		let before = sdk.split(&built).next().unwrap();
+		let arm = before.rsplit("match ").next().unwrap();
+		assert!(
+			arm.contains("_ if committed.is_some()"),
+			"{receipt} is built outside the committed arm"
+		);
+	}
+	let src = manifest.join("src");
+	let coordinator = fs::read_to_string(src.join("network/data_server/coordinator.rs")).unwrap();
+	assert!(coordinator.contains(
+		"Settled::KnownNotCommitted => (\n\t\t\t\tWriteStatus::WRITE_REFUSED,\n\t\t\t\tMutationCommitKnowledge::KNOWN_NOT_COMMITTED,"
+	));
+	let deletes = fs::read_to_string(src.join("network/data_server/deletes.rs")).unwrap();
+	assert!(deletes.contains(
+		"DeleteSettled::KnownNotCommitted => (\n\t\t\t\tWriteStatus::WRITE_REFUSED,\n\t\t\t\tMutationCommitKnowledge::KNOWN_NOT_COMMITTED,"
+	));
+	let protocol =
+		fs::read_to_string(src.join("network/data_server/mutation_protocol.rs")).unwrap();
+	assert_eq!(protocol.matches("Self::wire_write_answer(").count(), 3);
+	let server = fs::read_to_string(src.join("network/data_server.rs")).unwrap();
+	assert_eq!(
+		server.matches("crate::schema::wire_mutation_pair(").count(),
+		1,
+		"the counter add answer's frame builder"
+	);
+}
