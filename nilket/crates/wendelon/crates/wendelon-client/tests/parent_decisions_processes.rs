@@ -1727,6 +1727,968 @@ async fn three_daemons_from_configuration_files_form_a_parent_decisions_cluster_
 	std::fs::remove_dir_all(&root).unwrap();
 }
 
+// ============================================================
+//  THE WHOLE-PROCESS PAUSE AND RECOVERY WORKFLOW
+// ============================================================
+
+/// Rows written and acknowledged before the pause, one operation each.
+const PAUSE_ROWS_BEFORE: i64 = 8;
+/// How long all three daemons stay stopped, from the last confirmed stop: longer than the
+/// range lease (3 s) plus the takeover grace (1 s) plus the default election horizon, so
+/// every lease lapses and every election timer passes while nothing runs.
+const PAUSE_LENGTH: Duration = Duration::from_secs(8);
+/// Each stop and each resume is confirmed from the kernel's process state within this.
+const PAUSE_CONFIRM_BOUND: Duration = Duration::from_secs(2);
+/// The caller deadline of the one offer made while the daemons are stopped.
+const PAUSED_OFFER_DEADLINE: Duration = Duration::from_secs(3);
+/// From immediately before the first SIGCONT: every node Ready, every outstanding operation
+/// settled and the fresh operation committed. One shared budget; nothing is called after it.
+const RECOVERY_BOUND: Duration = Duration::from_secs(60);
+/// The caller deadline of one call inside the recovery budget, clipped to what is left of it.
+const RECOVERY_CALL_BOUND: Duration = Duration::from_secs(5);
+/// One operation is offered at most this many times in all.
+const MAX_OFFERS_PER_OPERATION: u32 = 12;
+/// New operations after a definite refusal: at most this many in the run, one per refusal.
+const MAX_NEW_OPERATIONS: usize = 2;
+/// A new operation's row key is its logical row plus this, so no upsert can make one
+/// operation's commit look like another's.
+const NEW_OPERATION_KEY_OFFSET: i64 = 100;
+
+/// A daemon this test spawned, by pid AND kernel start time: a pid alone can be reused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OwnedProcess {
+	node: u32,
+	pid: u32,
+	started: u64,
+}
+
+/// A process's kernel state letter and start time (`/proc/<pid>/stat` fields 3 and 22), or
+/// why they could not be read. The command name may hold spaces and parentheses: fields are
+/// counted after the LAST `)`.
+fn process_state(pid: u32) -> Result<(char, u64), String> {
+	let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+		.map_err(|error| format!("pid {pid}: stat not readable: {error}"))?;
+	let rest = stat
+		.rsplit_once(')')
+		.map(|(_, rest)| rest)
+		.ok_or_else(|| format!("pid {pid}: stat has no command name"))?;
+	let fields: Vec<&str> = rest.split_whitespace().collect();
+	let state = fields
+		.first()
+		.and_then(|state| state.chars().next())
+		.ok_or_else(|| format!("pid {pid}: stat has no state"))?;
+	let started = fields
+		.get(19)
+		.and_then(|started| started.parse().ok())
+		.ok_or_else(|| format!("pid {pid}: stat has no start time"))?;
+	Ok((state, started))
+}
+
+impl OwnedProcess {
+	/// The state of THIS process: an error if it is gone, unreadable, or another process now
+	/// has its pid.
+	fn state(&self) -> Result<char, String> {
+		let (state, started) = process_state(self.pid)?;
+		if started != self.started {
+			return Err(format!(
+				"node {}: pid {} now belongs to another process (start time {started}, was {})",
+				self.node, self.pid, self.started
+			));
+		}
+		Ok(state)
+	}
+
+	/// Signals this process only while it is still the one recorded.
+	fn signal(&self, signal_number: libc::c_int) -> Result<(), String> {
+		self.state()?;
+		if signal(self.pid, signal_number) {
+			Ok(())
+		} else {
+			Err(format!(
+				"node {}: pid {} could not be signalled",
+				self.node, self.pid
+			))
+		}
+	}
+}
+
+impl Daemons {
+	/// The local daemons as owned processes. Local processes only.
+	fn owned(&self) -> Vec<OwnedProcess> {
+		assert!(
+			node_control().is_none(),
+			"the pause workflow runs local processes only"
+		);
+		self.children
+			.iter()
+			.map(|(node, child)| {
+				let pid = child.id();
+				let (_, started) = process_state(pid).unwrap_or_else(|why| panic!("{why}"));
+				OwnedProcess {
+					node: *node,
+					pid,
+					started,
+				}
+			})
+			.collect()
+	}
+}
+
+/// Created BEFORE the first SIGSTOP and alive to the end of the test: on every way out,
+/// a panic included, each recorded daemon that is still the same process is sent SIGCONT, so
+/// none is left stopped for the teardown that follows (`Daemons`' own drop, declared earlier
+/// and so dropped later, then ends them). Resuming a running process does nothing.
+struct ResumeOnExit(Vec<OwnedProcess>);
+
+impl Drop for ResumeOnExit {
+	fn drop(&mut self) {
+		for process in &self.0 {
+			if let Err(why) = process.signal(libc::SIGCONT) {
+				eprintln!("smoke: pause: not resumed at exit: {why}");
+			}
+		}
+	}
+}
+
+/// Stops every process and confirms each is stopped (state `T`). Returns when the first
+/// signal was sent and when the last stop was confirmed.
+fn pause_all(processes: &[OwnedProcess]) -> Result<(Instant, Instant), String> {
+	let first_signal = Instant::now();
+	for process in processes {
+		process.signal(libc::SIGSTOP)?;
+	}
+	let bound = Instant::now() + PAUSE_CONFIRM_BOUND;
+	for process in processes {
+		loop {
+			let state = process.state()?;
+			// The bound first: a stop seen after it is not a confirmed stop.
+			if Instant::now() > bound {
+				return Err(format!(
+					"node {}: pid {} not confirmed stopped within {PAUSE_CONFIRM_BOUND:?} (state {state})",
+					process.node, process.pid
+				));
+			}
+			if state == 'T' {
+				break;
+			}
+			std::thread::sleep(Duration::from_millis(10));
+		}
+	}
+	Ok((first_signal, Instant::now()))
+}
+
+/// Resumes every process and confirms each is the same process, alive and no longer
+/// stopped. A zombie, a dead or missing process, a reused pid or an unreadable state is a
+/// failure, never "resumed". This says a process can be scheduled; it says nothing about
+/// service. Returns when the last one was confirmed.
+fn resume_all(processes: &[OwnedProcess]) -> Result<Instant, String> {
+	for process in processes {
+		process.signal(libc::SIGCONT)?;
+	}
+	let bound = Instant::now() + PAUSE_CONFIRM_BOUND;
+	for process in processes {
+		loop {
+			let state = process.state()?;
+			// The bound first: a running state seen after it is not a confirmed resume.
+			if Instant::now() > bound {
+				return Err(format!(
+					"node {}: pid {} not confirmed running within {PAUSE_CONFIRM_BOUND:?} (state {state})",
+					process.node, process.pid
+				));
+			}
+			match state {
+				'R' | 'S' | 'D' | 'I' => break,
+				'T' | 't' => std::thread::sleep(Duration::from_millis(10)),
+				state => {
+					return Err(format!(
+						"node {}: pid {} is not running after SIGCONT (state {state})",
+						process.node, process.pid
+					));
+				}
+			}
+		}
+	}
+	Ok(Instant::now())
+}
+
+/// What one answer means for its operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Disposition {
+	/// A receipt: committed.
+	Committed,
+	/// The recorded refusal: `WRITE_REFUSED` with `KNOWN_NOT_COMMITTED`, naming this operation.
+	Refused,
+	/// Nothing is known: the SAME operation may be offered again, within its bounds.
+	Unknown,
+}
+
+/// One logical write: one identity and one row for its whole life. `key` is unique to the
+/// operation and the row's name says which operation it is.
+struct PauseOperation {
+	logical_row: i64,
+	key: i64,
+	name: String,
+	identity: wendelon::schema::ClientWriteId,
+	offers: u32,
+	disposition: Disposition,
+}
+
+impl PauseOperation {
+	fn new(logical_row: i64, ordinal: u32) -> Self {
+		let key = if ordinal == 1 {
+			logical_row
+		} else {
+			logical_row + NEW_OPERATION_KEY_OFFSET
+		};
+		Self {
+			logical_row,
+			key,
+			name: format!("row{key}-op{ordinal}"),
+			identity: operation_id(),
+			offers: 0,
+			disposition: Disposition::Unknown,
+		}
+	}
+}
+
+/// The reading of one answer, by its status AND its commit knowledge. It does not use the
+/// older retry rule above, which reads no knowledge.
+///
+/// - Committed: a receipt of exactly one row.
+/// - Refused: `MutationStopped` naming THIS operation, `WRITE_REFUSED` with
+///   `KNOWN_NOT_COMMITTED`: the recorded refusal.
+/// - Unknown (the SAME operation may be offered again): no answer inside the call's bound;
+///   a failed connection; a redirect (`NOT_LEADER`, which carries no knowledge to the
+///   caller); and `MutationStopped` naming THIS operation as: `WRITE_STALLED` (reason NONE)
+///   with `INDETERMINATE`; `WRITE_DEADLINE_EXCEEDED` (reason DEADLINE) with `INDETERMINATE`; or the client's
+///   own summary `WRITE_ATTEMPTS_EXHAUSTED` (reason ATTEMPT_EXHAUSTION) with `INDETERMINATE`
+///   or with `KNOWN_NOT_COMMITTED`. That last pair says no attempt of this CALL was left
+///   unresolved; it is not the recorded refusal and is never read as one.
+/// - Everything else is an error that ends the test and is never retried into a pass: a
+///   stop that claims `COMMITTED`, an unspecified or unknown knowledge on a stop, an answer
+///   about another operation, an inconsistent answer, a conflict, an expiry, an internal
+///   error, a receipt for another row count.
+fn pause_disposition(
+	answer: &Option<Result<wendelon_client::TableWriteReceipt, ClientError>>,
+	identity: wendelon::schema::ClientWriteId,
+) -> Result<Disposition, String> {
+	use std::io::ErrorKind;
+	use wendelon::schema::{MutationCommitKnowledge as Knowledge, MutationStopReason, WriteStatus};
+	match answer {
+		None => Ok(Disposition::Unknown),
+		Some(Ok(receipt)) if receipt.rows == 1 => Ok(Disposition::Committed),
+		Some(Ok(receipt)) => Err(format!("a receipt for {} rows", receipt.rows)),
+		Some(Err(ClientError::Io(io)))
+			if matches!(
+				io.kind(),
+				ErrorKind::ConnectionRefused
+					| ErrorKind::ConnectionReset
+					| ErrorKind::ConnectionAborted
+					| ErrorKind::NotConnected
+			) =>
+		{
+			Ok(Disposition::Unknown)
+		}
+		Some(Err(ClientError::WriteFailed { status })) if *status == WriteStatus::NOT_LEADER => {
+			Ok(Disposition::Unknown)
+		}
+		Some(Err(ClientError::MutationStopped {
+			operation_id,
+			status,
+			reason,
+			knowledge,
+		})) if operation_id.client_uuid == identity.client_uuid
+			&& operation_id.sequence_no == identity.sequence_no =>
+		{
+			let (status, reason, knowledge) = (*status, *reason, *knowledge);
+			if status == WriteStatus::WRITE_REFUSED && knowledge == Knowledge::KNOWN_NOT_COMMITTED {
+				Ok(Disposition::Refused)
+			} else if (status == WriteStatus::WRITE_STALLED
+				&& reason == MutationStopReason::NONE
+				&& knowledge == Knowledge::INDETERMINATE)
+				|| (status == WriteStatus::WRITE_DEADLINE_EXCEEDED
+					&& reason == MutationStopReason::DEADLINE
+					&& knowledge == Knowledge::INDETERMINATE)
+				|| (status == WriteStatus::WRITE_ATTEMPTS_EXHAUSTED
+					&& reason == MutationStopReason::ATTEMPT_EXHAUSTION
+					&& (knowledge == Knowledge::INDETERMINATE
+						|| knowledge == Knowledge::KNOWN_NOT_COMMITTED))
+			{
+				Ok(Disposition::Unknown)
+			} else {
+				Err(format!(
+					"a stop this workflow does not allow: status {status:?}, reason {reason:?}, knowledge {knowledge:?}"
+				))
+			}
+		}
+		Some(Err(error)) => Err(format!("{error:?}")),
+	}
+}
+
+/// How long after a call's caller deadline this test's controller may first SEE that the
+/// deadline passed. It is an allowance for observing a notification, declared once: it
+/// changes no caller deadline, admits no late outcome and allows no call after a shared mark.
+const DEADLINE_NOTICE_ALLOWANCE: Duration = Duration::from_millis(250);
+
+/// Whether `answer` is nothing more than word that the caller deadline passed with the
+/// operation unresolved: no client answer at all (the wrapper's timeout), or THIS
+/// operation's `WRITE_DEADLINE_EXCEEDED` with reason DEADLINE and `INDETERMINATE`.
+fn is_deadline_notice(
+	answer: &Option<Result<wendelon_client::TableWriteReceipt, ClientError>>,
+	identity: wendelon::schema::ClientWriteId,
+) -> bool {
+	use wendelon::schema::{MutationCommitKnowledge, MutationStopReason, WriteStatus};
+	match answer {
+		None => true,
+		Some(Err(ClientError::MutationStopped {
+			operation_id,
+			status,
+			reason,
+			knowledge,
+		})) => {
+			operation_id.client_uuid == identity.client_uuid
+				&& operation_id.sequence_no == identity.sequence_no
+				&& *status == WriteStatus::WRITE_DEADLINE_EXCEEDED
+				&& *reason == MutationStopReason::DEADLINE
+				&& *knowledge == MutationCommitKnowledge::INDETERMINATE
+		}
+		_ => false,
+	}
+}
+
+/// THE acceptance rule of one offer, used on the offer path and by the control below. The
+/// answer is read first (identity, status, reason, knowledge: `pause_disposition`); then
+/// time:
+/// - any answer that says something about the operation (a receipt, the refusal, a stall, a
+///   redirect, an exhaustion, a connection error) is accepted only if it was observed at or
+///   before the call's caller deadline. A timeout wrapper is cooperative, so the clock is
+///   read after the answer; a late one fails, whatever it says;
+/// - word that the deadline passed (`is_deadline_notice`) is accepted only as Unknown,
+///   including an early notification, when observed no later than the deadline plus
+///   `DEADLINE_NOTICE_ALLOWANCE`; later than that fails too.
+fn accepted_disposition(
+	answer: &Option<Result<wendelon_client::TableWriteReceipt, ClientError>>,
+	identity: wendelon::schema::ClientWriteId,
+	answered: Instant,
+	call_deadline: Instant,
+) -> Result<Disposition, String> {
+	let disposition = pause_disposition(answer, identity)?;
+	let notice = is_deadline_notice(answer, identity);
+	let limit = if notice {
+		call_deadline + DEADLINE_NOTICE_ALLOWANCE
+	} else {
+		call_deadline
+	};
+	if answered <= limit {
+		Ok(disposition)
+	} else if notice {
+		Err(format!(
+			"word of the deadline came {:?} after it, beyond the {DEADLINE_NOTICE_ALLOWANCE:?} this controller allows for observing it",
+			answered - call_deadline
+		))
+	} else {
+		Err(format!(
+			"a completed answer {:?} after its caller deadline",
+			answered - call_deadline
+		))
+	}
+}
+
+/// The two rules above, by case. Runs in a default pass: it spawns nothing.
+#[test]
+fn the_pause_workflow_reads_an_answer_by_status_knowledge_and_time() {
+	use wendelon::schema::{MutationCommitKnowledge as Knowledge, MutationStopReason, WriteStatus};
+	let identity = operation_id();
+	let stopped = |status, reason, knowledge| {
+		Some(Err(ClientError::MutationStopped {
+			operation_id: identity,
+			status,
+			reason,
+			knowledge,
+		}))
+	};
+	let read = |answer| pause_disposition(&answer, identity);
+	let (none, exhausted) = (
+		MutationStopReason::NONE,
+		MutationStopReason::ATTEMPT_EXHAUSTION,
+	);
+	assert_eq!(read(None), Ok(Disposition::Unknown));
+	assert_eq!(
+		read(stopped(
+			WriteStatus::WRITE_REFUSED,
+			none,
+			Knowledge::KNOWN_NOT_COMMITTED
+		)),
+		Ok(Disposition::Refused)
+	);
+	for allowed in [
+		stopped(WriteStatus::WRITE_STALLED, none, Knowledge::INDETERMINATE),
+		stopped(
+			WriteStatus::WRITE_DEADLINE_EXCEEDED,
+			MutationStopReason::DEADLINE,
+			Knowledge::INDETERMINATE,
+		),
+		stopped(
+			WriteStatus::WRITE_ATTEMPTS_EXHAUSTED,
+			exhausted,
+			Knowledge::INDETERMINATE,
+		),
+		stopped(
+			WriteStatus::WRITE_ATTEMPTS_EXHAUSTED,
+			exhausted,
+			Knowledge::KNOWN_NOT_COMMITTED,
+		),
+		Some(Err(ClientError::WriteFailed {
+			status: WriteStatus::NOT_LEADER,
+		})),
+		Some(Err(ClientError::Io(std::io::Error::from(
+			std::io::ErrorKind::ConnectionRefused,
+		)))),
+	] {
+		assert_eq!(read(allowed), Ok(Disposition::Unknown));
+	}
+	// Contradictory or silent knowledge on a stop is never "unknown, offer again".
+	for refused in [
+		stopped(WriteStatus::WRITE_STALLED, none, Knowledge::COMMITTED),
+		stopped(WriteStatus::WRITE_STALLED, none, Knowledge::UNSPECIFIED),
+		stopped(
+			WriteStatus::WRITE_STALLED,
+			none,
+			Knowledge::KNOWN_NOT_COMMITTED,
+		),
+		stopped(WriteStatus::WRITE_STALLED, none, Knowledge(9)),
+		stopped(
+			WriteStatus::WRITE_ATTEMPTS_EXHAUSTED,
+			exhausted,
+			Knowledge::COMMITTED,
+		),
+		stopped(
+			WriteStatus::WRITE_ATTEMPTS_EXHAUSTED,
+			exhausted,
+			Knowledge::UNSPECIFIED,
+		),
+		stopped(
+			WriteStatus::WRITE_ATTEMPTS_EXHAUSTED,
+			none,
+			Knowledge::INDETERMINATE,
+		),
+		stopped(
+			WriteStatus::WRITE_DEADLINE_EXCEEDED,
+			MutationStopReason::DEADLINE,
+			Knowledge::COMMITTED,
+		),
+		stopped(WriteStatus::WRITE_REFUSED, none, Knowledge::INDETERMINATE),
+		stopped(WriteStatus::WRITE_REFUSED, none, Knowledge::COMMITTED),
+		stopped(
+			WriteStatus::WRITE_OPERATION_EXPIRED,
+			none,
+			Knowledge::INDETERMINATE,
+		),
+		Some(Err(ClientError::MutationAnswerInconsistent {
+			operation_id: identity,
+			status: WriteStatus::OK,
+			knowledge: Knowledge::UNSPECIFIED,
+		})),
+		Some(Err(ClientError::WriteFailed {
+			status: WriteStatus::INTERNAL_ERROR,
+		})),
+		Some(Err(ClientError::Io(std::io::Error::from(
+			std::io::ErrorKind::InvalidData,
+		)))),
+	] {
+		assert!(read(refused).is_err());
+	}
+	// An answer about another operation is never this operation's answer.
+	let mut other = identity;
+	other.sequence_no += 1;
+	assert!(
+		read(Some(Err(ClientError::MutationStopped {
+			operation_id: other,
+			status: WriteStatus::WRITE_REFUSED,
+			reason: none,
+			knowledge: Knowledge::KNOWN_NOT_COMMITTED,
+		})))
+		.is_err()
+	);
+	// A deadline report with another reason is not the deadline report.
+	assert!(
+		read(stopped(
+			WriteStatus::WRITE_DEADLINE_EXCEEDED,
+			none,
+			Knowledge::INDETERMINATE
+		))
+		.is_err()
+	);
+
+	// Time. An outcome is accepted only at or before the caller deadline; word that the
+	// deadline passed may be observed up to the allowance after it, and is only ever Unknown.
+	let deadline = Instant::now() + Duration::from_secs(1);
+	let ms = Duration::from_millis;
+	let at = |answer, answered| accepted_disposition(&answer, identity, answered, deadline);
+	let receipt = || {
+		Some(Ok(wendelon_client::TableWriteReceipt {
+			table_object_id: descriptor().table_object_id,
+			schema_generation: 1,
+			rows: 1,
+			duplicate: false,
+			requested_durability: WriteOptions::default().durability,
+			log_index: 0,
+			term: 0,
+			epoch: 0,
+			commit_hlc: wendelon::schema::HybridTimestamp {
+				physical_ms: 0,
+				logical: 0,
+				node_id: 0,
+			},
+			finalization: None,
+		}))
+	};
+	let refusal = || {
+		stopped(
+			WriteStatus::WRITE_REFUSED,
+			none,
+			Knowledge::KNOWN_NOT_COMMITTED,
+		)
+	};
+	let notice = || {
+		stopped(
+			WriteStatus::WRITE_DEADLINE_EXCEEDED,
+			MutationStopReason::DEADLINE,
+			Knowledge::INDETERMINATE,
+		)
+	};
+	assert_eq!(at(receipt(), deadline), Ok(Disposition::Committed));
+	assert_eq!(at(receipt(), deadline - ms(1)), Ok(Disposition::Committed));
+	assert!(at(receipt(), deadline + ms(1)).is_err());
+	assert_eq!(at(refusal(), deadline), Ok(Disposition::Refused));
+	assert!(at(refusal(), deadline + ms(1)).is_err());
+	assert!(
+		at(
+			stopped(WriteStatus::WRITE_STALLED, none, Knowledge::INDETERMINATE),
+			deadline + ms(1)
+		)
+		.is_err()
+	);
+	for (late, accepted) in [(0, true), (1, true), (250, true), (251, false)] {
+		assert_eq!(
+			at(notice(), deadline + ms(late)).is_ok(),
+			accepted,
+			"the client's deadline report {late} ms after the deadline"
+		);
+		assert_eq!(
+			at(None, deadline + ms(late)).is_ok(),
+			accepted,
+			"no client answer, seen {late} ms after the deadline"
+		);
+	}
+	assert_eq!(at(notice(), deadline - ms(5)), Ok(Disposition::Unknown));
+	assert_eq!(at(notice(), deadline + ms(250)), Ok(Disposition::Unknown));
+	// The allowance is not for another operation's report, nor for a contradictory one.
+	assert!(
+		at(
+			Some(Err(ClientError::MutationStopped {
+				operation_id: other,
+				status: WriteStatus::WRITE_DEADLINE_EXCEEDED,
+				reason: MutationStopReason::DEADLINE,
+				knowledge: Knowledge::INDETERMINATE,
+			})),
+			deadline + ms(1)
+		)
+		.is_err()
+	);
+	assert!(
+		at(
+			stopped(
+				WriteStatus::WRITE_DEADLINE_EXCEEDED,
+				MutationStopReason::DEADLINE,
+				Knowledge::COMMITTED
+			),
+			deadline + ms(1)
+		)
+		.is_err()
+	);
+}
+
+/// ONE offer of an operation, journaled. The call has ONE absolute deadline: now plus
+/// `call_bound`, clipped to `limit` (the shared recovery mark, or the test's own bound). With
+/// nothing left before `limit`, or the operation's offers used up, no call is made and `false`
+/// is returned. The same instant is the client and wrapper deadline. The notice allowance
+/// bounds when the controller observes a timeout; the wrapper does not consume it by waiting
+/// longer. Whether the answer is accepted is `accepted_disposition`'s rule alone. The
+/// operation's disposition is updated only from an accepted answer; an operation is never
+/// offered once it is Committed or Refused.
+async fn offer(
+	client: &Client,
+	descriptor: &TableSchemaDescriptor,
+	operation: &mut PauseOperation,
+	call_bound: Duration,
+	limit: Instant,
+	clock: Instant,
+	stage: &str,
+) -> bool {
+	assert_eq!(
+		operation.disposition,
+		Disposition::Unknown,
+		"a settled operation was offered again"
+	);
+	let asked = Instant::now();
+	let call_deadline = (asked + call_bound).min(limit);
+	if call_deadline <= asked || operation.offers >= MAX_OFFERS_PER_OPERATION {
+		return false;
+	}
+	operation.offers += 1;
+	let answer = tokio::time::timeout_at(
+		tokio::time::Instant::from_std(call_deadline),
+		client.table_write(
+			TenantId::new(TENANT),
+			descriptor,
+			one_row(operation.key, &operation.name),
+			WriteOptions {
+				deadline: Some(call_deadline),
+				operation_id: Some(operation.identity),
+				..WriteOptions::default()
+			},
+		),
+	)
+	.await
+	.ok();
+	let answered = Instant::now();
+	let read = accepted_disposition(&answer, operation.identity, answered, call_deadline);
+	eprintln!(
+		"smoke: JOURNAL {stage}: logical row {} key {} name {} identity {:02x?}/{} offer {} asked at {:+.3} s answered after {:?} (caller deadline {:?} after it was asked; observed {:+.3} ms relative to that deadline): {} => {}",
+		operation.logical_row,
+		operation.key,
+		operation.name,
+		&operation.identity.client_uuid,
+		operation.identity.sequence_no,
+		operation.offers,
+		asked.saturating_duration_since(clock).as_secs_f64()
+			- clock.saturating_duration_since(asked).as_secs_f64(),
+		answered - asked,
+		call_deadline - asked,
+		(answered
+			.saturating_duration_since(call_deadline)
+			.as_secs_f64()
+			- call_deadline
+				.saturating_duration_since(answered)
+				.as_secs_f64())
+			* 1000.0,
+		match &answer {
+			None => "NO ANSWER from the client within the caller deadline (unresolved)".to_owned(),
+			Some(Ok(receipt)) => format!("{receipt:?}"),
+			Some(Err(error)) => format!("{error:?}"),
+		},
+		match &read {
+			Ok(disposition) => format!("{disposition:?}"),
+			Err(why) => format!("NOT ACCEPTED: {why}"),
+		}
+	);
+	operation.disposition = read.unwrap_or_else(|why| {
+		panic!(
+			"{stage}: the offer of {} had an answer this workflow does not accept: {why}",
+			operation.name
+		)
+	});
+	true
+}
+
+/// Offers one operation until it is Committed or Refused. `false`: it is still unknown and
+/// no further call fits before `mark`, or its offers are used up.
+async fn settle(
+	client: &Client,
+	descriptor: &TableSchemaDescriptor,
+	operation: &mut PauseOperation,
+	mark: Instant,
+	clock: Instant,
+	stage: &str,
+) -> bool {
+	while operation.disposition == Disposition::Unknown {
+		if !offer(
+			client,
+			descriptor,
+			operation,
+			RECOVERY_CALL_BOUND,
+			mark,
+			clock,
+			stage,
+		)
+		.await
+		{
+			return false;
+		}
+		if operation.disposition == Disposition::Unknown {
+			tokio::time::sleep(
+				Duration::from_millis(250).min(mark.saturating_duration_since(Instant::now())),
+			)
+			.await;
+		}
+	}
+	true
+}
+
+/// Three real daemons at every default, with NO object store, are all stopped at once for
+/// `PAUSE_LENGTH` and released; they are never restarted and nothing is cleared.
+///
+/// What it is: a whole-process scheduling pause (SIGSTOP, SIGCONT) of every daemon. It is not
+/// an injected disk stall and not a network partition. It exercises no tiering, no object
+/// store and no remote read: it cannot stand for the object-store workflow above.
+///
+/// What a pass claims, in three parts kept apart in the log:
+/// 1. DURING the pause, the one offer made got an allowed answer inside its own deadline.
+/// 2. AFTER the release, inside ONE budget of `RECOVERY_BOUND` that starts immediately before
+///    the first SIGCONT: every node reported Ready; every operation left unknown was settled
+///    by offering the SAME operation again (a receipt, or the recorded refusal); a refused
+///    operation was followed by at most one new operation with a new identity and a new row
+///    key; and one fresh operation, begun after the release, got a receipt.
+/// 3. THEN one exact read, under its own bound: the table holds exactly the rows whose
+///    operation got a receipt, each with its own text; no refused-only row and no row of
+///    another origin. And each daemon is the same process as before the pause.
+///
+/// What it does not claim: that writes are available during a pause; any internal
+/// transition (the oracle is what the caller was told and what a complete read returned);
+/// anything about a slower network, a stalled disk or a longer pause. A failed write BEFORE
+/// the pause is a failure of the product at rest, reported as such.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "spawns three daemons and stops them with signals; run alone under an external owner (see the module text)"]
+async fn three_daemons_resume_service_without_restart_after_all_are_paused() {
+	let deadline = Instant::now() + TEST_BOUND;
+	let Formed {
+		root,
+		pki,
+		members,
+		mut daemons,
+		descriptor,
+	} = form(deadline, None).await;
+	let client = client_through(&members[0], &pki, Credential::Storage, deadline).await;
+	let processes = daemons.owned();
+	eprintln!("smoke: pause: owned daemons {processes:?}");
+	let mut operations: Vec<PauseOperation> = Vec::new();
+	let before_everything = Instant::now();
+
+	// Before the pause: each row once, each must be acknowledged.
+	for row in 1..=PAUSE_ROWS_BEFORE {
+		let mut operation = PauseOperation::new(row, 1);
+		offer(
+			&client,
+			&descriptor,
+			&mut operation,
+			RECOVERY_CALL_BOUND,
+			deadline,
+			before_everything,
+			"before the pause",
+		)
+		.await;
+		assert_eq!(
+			operation.disposition,
+			Disposition::Committed,
+			"BASELINE, before any pause: the write of {} was not acknowledged by its one call",
+			operation.name
+		);
+		operations.push(operation);
+	}
+
+	// The pause. The guard exists before the first stop and outlives every step below.
+	let resume_on_exit = ResumeOnExit(processes.clone());
+	let (stop_sent, stopped) = pause_all(&processes).unwrap_or_else(|why| panic!("pause: {why}"));
+	eprintln!(
+		"smoke: PAUSE: all three stopped; first signal to last confirmation {:?}",
+		stopped - stop_sent
+	);
+
+	// DURING: one offer, its own deadline, journaled and read like any other.
+	let mut during = PauseOperation::new(PAUSE_ROWS_BEFORE + 1, 1);
+	offer(
+		&client,
+		&descriptor,
+		&mut during,
+		PAUSED_OFFER_DEADLINE,
+		deadline,
+		before_everything,
+		"during the pause",
+	)
+	.await;
+	eprintln!(
+		"smoke: RESULT 1 (during the pause): the offer of {} ended {:?}",
+		during.name, during.disposition
+	);
+	operations.push(during);
+	tokio::time::sleep((stopped + PAUSE_LENGTH).saturating_duration_since(Instant::now())).await;
+	for process in &processes {
+		let state = process.state().unwrap_or_else(|why| panic!("pause: {why}"));
+		assert_eq!(state, 'T', "node {} did not stay stopped", process.node);
+	}
+
+	// The release. The recovery budget starts BEFORE the first SIGCONT.
+	let release = Instant::now();
+	let mark = release + RECOVERY_BOUND;
+	let running = resume_all(&processes).unwrap_or_else(|why| panic!("release: {why}"));
+	eprintln!(
+		"smoke: RELEASE: every daemon stopped for at least {:?} (last stop confirmed to first SIGCONT); all three confirmed runnable {:?} after the release began. Recovery bound {RECOVERY_BOUND:?} from the release",
+		release - stopped,
+		running - release
+	);
+
+	// (a) Every node Ready, inside the budget.
+	for member in &members {
+		wait_ready(member, &pki, &mut daemons, mark, "after the release");
+	}
+	let all_ready = Instant::now();
+	assert!(all_ready <= mark, "readiness came after the recovery bound");
+	eprintln!(
+		"smoke: RECOVERY: every node Ready {:?} after the release",
+		all_ready - release
+	);
+
+	// (b), (c) Settle what is outstanding; a refusal may be followed by ONE new operation.
+	let mut new_operations = 0_usize;
+	let mut index = 0;
+	while index < operations.len() {
+		if !settle(
+			&client,
+			&descriptor,
+			&mut operations[index],
+			mark,
+			release,
+			"settling after the release",
+		)
+		.await
+		{
+			panic!(
+				"UNRESOLVED at the recovery bound: {} after {} offers",
+				operations[index].name, operations[index].offers
+			);
+		}
+		if operations[index].disposition == Disposition::Refused
+			&& operations[index].key == operations[index].logical_row
+			&& new_operations < MAX_NEW_OPERATIONS
+		{
+			new_operations += 1;
+			let replacement = PauseOperation::new(operations[index].logical_row, 2);
+			eprintln!(
+				"smoke: NEW OPERATION {} of {MAX_NEW_OPERATIONS} at most: {} follows the refused {}",
+				new_operations, replacement.name, operations[index].name
+			);
+			operations.push(replacement);
+		}
+		index += 1;
+	}
+
+	// (d) Fresh progress: an operation begun after the release must get a receipt. A fresh
+	// operation that is refused may, like any other, be followed by one new operation while
+	// the run's allowance lasts; only a receipt counts as progress.
+	let mut ordinal = 1;
+	let fresh_committed = loop {
+		let mut fresh = PauseOperation::new(PAUSE_ROWS_BEFORE + 2, ordinal);
+		let settled = settle(
+			&client,
+			&descriptor,
+			&mut fresh,
+			mark,
+			release,
+			"the fresh operation",
+		)
+		.await;
+		let (name, disposition) = (fresh.name.clone(), fresh.disposition);
+		operations.push(fresh);
+		assert!(
+			settled,
+			"NO FRESH PROGRESS inside the recovery bound: {name} is unresolved"
+		);
+		if disposition == Disposition::Committed {
+			break name;
+		}
+		assert!(
+			ordinal == 1 && new_operations < MAX_NEW_OPERATIONS,
+			"NO FRESH PROGRESS: {name} was refused and no new operation is left"
+		);
+		new_operations += 1;
+		ordinal = 2;
+		eprintln!(
+			"smoke: NEW OPERATION {new_operations} of {MAX_NEW_OPERATIONS} at most: after the refused {name}"
+		);
+	};
+	eprintln!("smoke: RECOVERY: fresh progress: {fresh_committed} committed");
+	let progressed = Instant::now();
+	assert!(progressed <= mark, "progress came after the recovery bound");
+	let count = |disposition| {
+		operations
+			.iter()
+			.filter(|operation| operation.disposition == disposition)
+			.count()
+	};
+	assert_eq!(count(Disposition::Unknown), 0, "an operation is unresolved");
+	eprintln!(
+		"smoke: RESULT 2 (after the release): Ready after {:?}, everything settled and a fresh write committed after {:?}; operations {}: committed {}, refused {}, new operations after a refusal {new_operations}",
+		all_ready - release,
+		progressed - release,
+		operations.len(),
+		count(Disposition::Committed),
+		count(Disposition::Refused),
+	);
+
+	// THEN one exact read: exactly the committed operations' rows, with their own text.
+	let expected: Vec<(i64, String)> = operations
+		.iter()
+		.filter(|operation| operation.disposition == Disposition::Committed)
+		.map(|operation| (operation.key, operation.name.clone()))
+		.collect();
+	let read_asked = Instant::now();
+	expect_rows(
+		&client,
+		&descriptor,
+		deadline,
+		"the one exact read after everything was settled",
+		&expected,
+	)
+	.await;
+	eprintln!(
+		"smoke: FINAL READ: exactly the {} committed rows, {:?} after it was asked, {:?} after the release",
+		expected.len(),
+		read_asked.elapsed(),
+		release.elapsed()
+	);
+
+	// No restart: the same processes, alive, and none has exited.
+	for process in &processes {
+		let state = process
+			.state()
+			.unwrap_or_else(|why| panic!("no-restart check: {why}"));
+		assert!(
+			matches!(state, 'R' | 'S' | 'D' | 'I'),
+			"node {} is in state {state} at the end",
+			process.node
+		);
+	}
+	if let Some(exited) = daemons.exited() {
+		panic!("no-restart check: {exited}");
+	}
+	assert_eq!(
+		daemons.owned(),
+		processes,
+		"a daemon is not the process it was"
+	);
+	eprintln!(
+		"smoke: RESULT 3 (overall): PASS: acknowledged rows read exactly, refusals true to the read, fresh progress inside the bound, the same three processes throughout"
+	);
+
+	drop(resume_on_exit);
+	for id in NODES {
+		daemons.stop(id, deadline);
+	}
+	assert!(Instant::now() < deadline, "the test overran its bound");
+	// A pass keeps its daemon logs with the record, as the object-store workflow does.
+	if let Ok(record) = std::env::var("WENDELON_SMOKE_RECORD_DIR") {
+		for member in &members {
+			std::fs::copy(
+				&member.log,
+				Path::new(&record).join(format!("node-{}.daemon.log", member.id)),
+			)
+			.unwrap();
+		}
+	}
+	std::fs::remove_dir_all(&root).unwrap();
+}
+
 /// The node and the slab an object's key names:
 /// `…/<node id, 8 hex digits>-<incarnation>/slab_<slab id, 16 hex digits>_<unique>.wnd`.
 fn owner_and_slab(key: &str) -> Option<(u32, &str)> {
