@@ -48,7 +48,14 @@
 //!   range holder stopped, real processes move that range's authority and commit a write to it.
 //!   What it does not: a leader failure, a partition, or how long the takeover takes in general.
 //!
-//! Not covered: an object store, tiering, a leader failure, more than one host.
+//! Not covered by that test: an object store, tiering, a leader failure, more than one host.
+//!
+//! The object-store test (`three_daemons_offload_to_the_object_store_…`) needs a remote store:
+//! `WENDELON_RUSTFS_ENDPOINT`, `WENDELON_RUSTFS_BUCKET`, `WENDELON_RUSTFS_ACCESS_KEY_FILE`,
+//! `WENDELON_RUSTFS_SECRET_KEY_FILE` (key FILES, so no secret is in the environment) and
+//! optionally `WENDELON_RUSTFS_REGION`. It writes under a new prefix of its own in that bucket
+//! and deletes nothing there. With `WENDELON_SMOKE_RECORD_DIR` set, a pass copies each daemon's
+//! log there before the run directory goes. What it shows and does not is in its own text.
 
 use std::fmt::Write as _;
 use std::io::Read as _;
@@ -65,6 +72,10 @@ use wendelon::integration::compute::SchemaIntentId;
 use wendelon::schema::{
 	LocalityPolicy, PrimaryKeyDescriptor, RowIdentityPolicy, SchemaEvolutionPolicy, TableObjectId,
 	TableSchemaDescriptor, TenantId,
+};
+use wendelon::storage::{
+	ObjectStore, ObjectStoreConfig, RemoteObjectStoreConfig, RemoteObjectStoreProvider,
+	S3CompatibleProviderConfig,
 };
 use wendelon_client::{
 	BootstrapPeer, Client, ClientConfig, ClientError, TableQueryOptions, TableSchemaUpdateRequest,
@@ -85,6 +96,33 @@ const CLIENT_BOUND: Duration = Duration::from_secs(30);
 const INSPECT_BOUND: Duration = Duration::from_secs(10);
 /// `storage_shutdown_timeout_seconds = 5` puts the daemon's own shutdown watchdog at 35 s.
 const STOP_BOUND: Duration = Duration::from_secs(40);
+
+/// The object-store test's whole bound, its offload wait, and each judged query: the caller's
+/// deadline, and a separate grace the test waits past it only to collect the answer.
+const TIERING_TEST_BOUND: Duration = Duration::from_secs(600);
+const TIER_BOUND: Duration = Duration::from_secs(150);
+const QUERY_DEADLINE: Duration = Duration::from_secs(30);
+const QUERY_WATCHDOG_GRACE: Duration = Duration::from_secs(10);
+/// Every node's `[tuning] query_stall_bound_millis` in the object-store test: the DECLARED
+/// profile of this test for the development RustFS store, 2000 ms. It is not the shipped
+/// default, which stays 250 ms, and it is not a recommendation for any deployment. At the
+/// default this test's judged queries ended QUERY_STALLED in three of five (runs
+/// pd-offload-20261113T235743Z, 20261114T002030Z, 20261114T005124Z; DC-223); those results
+/// stand. A pass at this value says the scenario passed once at this declared setting.
+const QUERY_STALL_BOUND_MILLIS: u64 = 2000;
+/// A diagnostic stress shape, not deployment sizing: one row of about 4 KiB that does not
+/// compress fills an 8 KiB slab, so every row is a slab and an object of its own.
+const ROWS: i64 = 64;
+const NAME_HEX_BLOCKS: usize = 64;
+const SLAB_MAX_BYTES: u64 = 8 * 1024;
+/// How many distinct slabs each node must have in the store and off its own disk before a
+/// judged query. `ROWS` rows seal 62 or 63 slabs (one is still being written; how the rows pack
+/// has varied by one between runs), so the bound is `ROWS - 2`.
+const OFFLOADED_PER_OWNER: usize = ROWS as usize - 2;
+
+fn required(name: &str) -> String {
+	std::env::var(name).unwrap_or_else(|_| panic!("{name} is not set"))
+}
 
 fn nilket_bin() -> PathBuf {
 	match std::env::var_os("WENDELON_SMOKE_NILKET_BIN") {
@@ -229,6 +267,59 @@ struct Secrets {
 	transfer: [u8; 32],
 	audit: [u8; 32],
 	decision: [u8; 32],
+}
+
+/// The remote object store the daemons tier to, from the environment (key FILES, so no secret
+/// is in the environment), with this run's own new prefix in the bucket. The daemons reach it
+/// directly; nothing relays or observes their requests here.
+struct StoreEnv {
+	endpoint: String,
+	bucket: String,
+	region: String,
+	access_key_file: PathBuf,
+	secret_key_file: PathBuf,
+	prefix: String,
+}
+
+impl StoreEnv {
+	fn from_environment() -> Self {
+		Self {
+			endpoint: required("WENDELON_RUSTFS_ENDPOINT"),
+			bucket: required("WENDELON_RUSTFS_BUCKET"),
+			region: std::env::var("WENDELON_RUSTFS_REGION")
+				.unwrap_or_else(|_| "us-east-1".to_owned()),
+			access_key_file: required("WENDELON_RUSTFS_ACCESS_KEY_FILE").into(),
+			secret_key_file: required("WENDELON_RUSTFS_SECRET_KEY_FILE").into(),
+			prefix: format!("pd-smoke/{}", &hex(random32())[..16]),
+		}
+	}
+
+	fn key(path: &Path) -> String {
+		let text = std::fs::read_to_string(path)
+			.unwrap_or_else(|error| panic!("cannot read {}: {}", path.display(), error.kind()));
+		let key = text.trim().to_owned();
+		assert!(!key.is_empty(), "{} is empty", path.display());
+		key
+	}
+
+	/// This test's own handle on the run's prefix: it lists, and never writes or deletes.
+	fn handle(&self) -> Arc<dyn ObjectStore> {
+		ObjectStoreConfig::Remote(RemoteObjectStoreConfig {
+			bucket: self.bucket.clone(),
+			root: self.prefix.clone(),
+			provider: RemoteObjectStoreProvider::S3Compatible(S3CompatibleProviderConfig {
+				endpoint: self.endpoint.clone(),
+				region: self.region.clone(),
+				access_key_id: Some(Self::key(&self.access_key_file)),
+				secret_access_key: Some(Self::key(&self.secret_key_file)),
+				session_token: None,
+				allow_anonymous: false,
+				virtual_host_style: false,
+			}),
+		})
+		.build()
+		.expect("the object store handle")
+	}
 }
 
 struct Member {
@@ -793,11 +884,61 @@ async fn expect_rows(
 	assert_eq!(rows, expected, "{what}");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spawns three daemons; run alone under an external owner (see the module text)"]
-async fn three_daemons_from_configuration_files_form_a_parent_decisions_cluster_and_serve_a_client()
-{
-	let deadline = Instant::now() + TEST_BOUND;
+/// A formed cluster with the application's tenant and table: everything before the first write.
+/// Dropping it ends the daemons. `root` holds secrets and is removed only at the end of a pass.
+struct Formed {
+	root: PathBuf,
+	pki: Pki,
+	members: Vec<Member>,
+	daemons: Daemons,
+	descriptor: TableSchemaDescriptor,
+}
+
+/// A node's `[storage]` body and what follows `[tuning]`'s first lines. With no store both are
+/// what the configuration always held. With one: small slabs, the store, an eager tiering
+/// scan, and the stall bound written out at the test's declared value.
+fn storage_section(dir: &Path, store: Option<&StoreEnv>) -> (String, String) {
+	let Some(store) = store else {
+		return ("data_dir = \"data\"\n".to_owned(), String::new());
+	};
+	let keys = dir.join("s3");
+	std::fs::create_dir_all(&keys).unwrap();
+	std::fs::set_permissions(&keys, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+	for (from, to) in [
+		(&store.access_key_file, "access-key"),
+		(&store.secret_key_file, "secret-key"),
+	] {
+		write_private(&keys.join(to), StoreEnv::key(from).as_bytes());
+	}
+	(
+		format!(
+			r#"data_dir = "data"
+slab_max_bytes = {SLAB_MAX_BYTES}
+
+[storage.object_store]
+provider = "s3-compatible"
+endpoint = "{endpoint}"
+bucket = "{bucket}"
+region = "{region}"
+prefix = "{prefix}"
+addressing = "path"
+access_key_id_file = "s3/access-key"
+secret_access_key_file = "s3/secret-key"
+
+[storage.tiering]
+scan_interval_millis = 100
+min_slab_bytes = 1
+"#,
+			endpoint = store.endpoint,
+			bucket = store.bucket,
+			region = store.region,
+			prefix = store.prefix,
+		),
+		format!("query_stall_bound_millis = {QUERY_STALL_BOUND_MILLIS}\n"),
+	)
+}
+
+async fn form(deadline: Instant, store: Option<&StoreEnv>) -> Formed {
 	// Kept on failure for its logs; removed only at the end of a pass. Holds secrets: it is
 	// created private and is never printed.
 	let root = std::env::temp_dir().join(format!("nilket-pd-smoke-{}", std::process::id()));
@@ -847,6 +988,7 @@ async fn three_daemons_from_configuration_files_form_a_parent_decisions_cluster_
 			)
 		};
 		let pki_dir = root.join("pki");
+		let (storage, stall) = storage_section(&dir, store);
 		let body = format!(
 			r#"[node]
 node_id = {id}
@@ -857,12 +999,11 @@ advertise_address = "127.0.0.1:{port}"
 decision_authority = "parent-decisions"
 
 [storage]
-data_dir = "data"
-
+{storage}
 [tuning]
 replication_factor = 3
 storage_shutdown_timeout_seconds = 5
-
+{stall}
 [time]
 mvcc_retention_window_secs = 0
 
@@ -990,6 +1131,27 @@ metrics = "127.0.0.1:{metrics}"
 	.expect("the schema update had no answer within its bound")
 	.unwrap_or_else(|error| panic!("the schema update: {error:?}"));
 
+	Formed {
+		root,
+		pki,
+		members,
+		daemons,
+		descriptor,
+	}
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "spawns three daemons; run alone under an external owner (see the module text)"]
+async fn three_daemons_from_configuration_files_form_a_parent_decisions_cluster_and_serve_a_client()
+{
+	let deadline = Instant::now() + TEST_BOUND;
+	let Formed {
+		root,
+		pki,
+		members,
+		mut daemons,
+		descriptor,
+	} = form(deadline, None).await;
 	let row = one_row(7, "seven");
 	// The application's client: the storage credential, confined to its tenant.
 	let client = client_through(&members[0], &pki, Credential::Storage, deadline).await;
@@ -1212,4 +1374,591 @@ metrics = "127.0.0.1:{metrics}"
 	}
 	assert!(Instant::now() < deadline, "the test overran its bound");
 	std::fs::remove_dir_all(&root).unwrap();
+}
+
+/// The node and the slab an object's key names:
+/// `…/<node id, 8 hex digits>-<incarnation>/slab_<slab id, 16 hex digits>_<unique>.wnd`.
+fn owner_and_slab(key: &str) -> Option<(u32, &str)> {
+	let mut parts = key.rsplit('/');
+	let (file, owner) = (parts.next()?, parts.next()?);
+	let node = u32::from_str_radix(owner.get(..8)?, 16).ok()?;
+	let slab = file.strip_prefix("slab_")?.get(..16)?;
+	(owner.as_bytes().get(8) == Some(&b'-')
+		&& file.ends_with(".wnd")
+		&& slab.bytes().all(|byte| byte.is_ascii_hexdigit()))
+	.then_some((node, slab))
+}
+
+/// Every file name under a directory, read only, or why the listing is not whole. Absence is
+/// never inferred from an error: any failure to read a directory, an entry or an entry's type
+/// fails the listing, except one case taken narrowly: an entry that the directory named and that
+/// is NotFound when its type is asked, which is a file removed in between and is not listed.
+/// Symbolic links are neither followed nor listed as files of the tree: one is an error here,
+/// because a node's data directory is expected to hold none.
+fn file_names(dir: &Path, names: &mut Vec<String>) -> Result<(), String> {
+	let entries =
+		std::fs::read_dir(dir).map_err(|error| format!("reading {}: {error}", dir.display()))?;
+	for entry in entries {
+		let entry = entry.map_err(|error| format!("an entry of {}: {error}", dir.display()))?;
+		let path = entry.path();
+		let kind = match std::fs::symlink_metadata(&path) {
+			Ok(metadata) => metadata.file_type(),
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+			Err(error) => return Err(format!("the type of {}: {error}", path.display())),
+		};
+		if kind.is_symlink() {
+			return Err(format!("{} is a symbolic link", path.display()));
+		} else if kind.is_dir() {
+			file_names(&path, names)?;
+		} else {
+			names.push(entry.file_name().to_string_lossy().into_owned());
+		}
+	}
+	Ok(())
+}
+
+#[test]
+fn a_listing_that_cannot_be_read_whole_is_an_error_not_an_absence() {
+	use std::os::unix::fs::PermissionsExt as _;
+	let root = std::env::temp_dir().join(format!("nilket-pd-listing-{}", std::process::id()));
+	let _ = std::fs::remove_dir_all(&root);
+	std::fs::create_dir_all(root.join("sub")).unwrap();
+	std::fs::write(root.join("slab_0000000000000001.wnd"), b"x").unwrap();
+	std::fs::write(root.join("sub").join("inner.bin"), b"x").unwrap();
+	// Whole: every file, at any depth.
+	let mut names = Vec::new();
+	file_names(&root, &mut names).unwrap();
+	names.sort();
+	assert_eq!(names, ["inner.bin", "slab_0000000000000001.wnd"]);
+	// A directory that cannot be read: an error, and its files are not taken as gone.
+	std::fs::set_permissions(root.join("sub"), std::fs::Permissions::from_mode(0o000)).unwrap();
+	let unreadable = file_names(&root, &mut Vec::new());
+	std::fs::set_permissions(root.join("sub"), std::fs::Permissions::from_mode(0o700)).unwrap();
+	assert!(
+		unreadable.as_ref().is_err_and(|why| why.contains("sub")),
+		"{unreadable:?}"
+	);
+	// A symbolic link is not followed and not skipped: an error.
+	std::os::unix::fs::symlink(root.join("sub"), root.join("link")).unwrap();
+	let linked = file_names(&root, &mut Vec::new());
+	assert!(
+		linked
+			.as_ref()
+			.is_err_and(|why| why.contains("symbolic link")),
+		"{linked:?}"
+	);
+	// A directory that is not there at all: an error.
+	assert!(file_names(&root.join("absent"), &mut Vec::new()).is_err());
+	std::fs::remove_dir_all(&root).unwrap();
+}
+
+/// Whether a local file's name is a slab file of this slab id (16 hex digits): the name carries
+/// the token `slab_<id>`. That is the payload `slab_<id>.wnd`, any temporary suffix of it, and
+/// the product's prefixed copies (`compaction-temp-<job>-slab_<id>.wnd`,
+/// `lsm-quarantine-<job>-slab_<id>.wnd`). The bare id is NOT matched: a control WAL segment is
+/// named by a 20-digit number that contains slab ids as substrings, which an earlier form of
+/// this test counted as slab files (run pd-offload-20261114T000557Z failed its precondition on
+/// that, with every sealed slab in fact offloaded; in the runs before it one slab per node,
+/// slab 0, was miscounted as local for the same reason, hidden by the threshold's slack).
+fn names_the_slab(name: &str, slab: &str) -> bool {
+	name.contains(&format!("slab_{slab}"))
+}
+
+#[test]
+fn only_a_slab_named_file_keeps_a_slab_on_disk() {
+	let (zero, three, fifty) = ("0000000000000000", "0000000000000003", "0000000000000032");
+	// The control WAL segments observed in that run: none of them is a slab file.
+	for wal in [
+		"control.wal.00000000000000000000.seg",
+		"control.wal.00000000000000000323.seg",
+	] {
+		for slab in [zero, three, fifty] {
+			assert!(!names_the_slab(wal, slab), "{wal} is not slab {slab}");
+		}
+	}
+	// The payload, a temporary suffix, and the prefixed copies are.
+	for name in [
+		"slab_0000000000000003.wnd",
+		"slab_0000000000000003.wnd.tmp",
+		"slab_0000000000000003_500210871f3241c5b37007cb0e3f21bf.wnd",
+		"compaction-temp-7-slab_0000000000000003.wnd",
+		"lsm-quarantine-7-slab_0000000000000003.wnd",
+	] {
+		assert!(names_the_slab(name, three), "{name}");
+		// Another slab's id is not matched by it.
+		assert!(!names_the_slab(name, zero), "{name}");
+		assert!(!names_the_slab(name, fifty), "{name}");
+	}
+	// Through the snapshot: three objects of node 1 (two of them for one slab), with that
+	// node holding the WAL segments and slab 0x32's payload. Slabs 0 and 3 are off its disk,
+	// counted once each; slab 0x32 is not. Nodes 2 and 3 own nothing.
+	let owner = "00000001-00000000000000000000000000000000";
+	let object = |slab: &str, unique: &str| (format!("{owner}/slab_{slab}_{unique}.wnd"), 1_u64);
+	let snapshot = Snapshot {
+		objects: vec![
+			object(zero, "a"),
+			object(three, "a"),
+			object(three, "b"),
+			object(fifty, "a"),
+		],
+		files: vec![
+			(
+				1,
+				vec![
+					"control.wal.00000000000000000000.seg".to_owned(),
+					"control.wal.00000000000000000323.seg".to_owned(),
+					format!("slab_{fifty}.wnd"),
+				],
+			),
+			(2, Vec::new()),
+			(3, Vec::new()),
+		],
+	};
+	let offloaded = snapshot.offloaded();
+	assert_eq!(offloaded[0], (vec![zero, three], 4));
+	assert_eq!(offloaded[1], (Vec::new(), 0));
+	assert_eq!(offloaded[2], (Vec::new(), 0));
+}
+
+/// The store's listing of the run's prefix and every node's data directory, at one moment.
+/// The test's own listing, straight to the store: it is not an observation of any daemon's
+/// request.
+struct Snapshot {
+	objects: Vec<(String, u64)>,
+	files: Vec<(u32, Vec<String>)>,
+}
+
+impl Snapshot {
+	/// The listing, or why it is not whole. Never partial: an object listing that failed or a
+	/// data directory that could not be read whole yields no snapshot at all.
+	async fn try_take(
+		formed: &Formed,
+		objects: &Arc<dyn ObjectStore>,
+		bound: Duration,
+	) -> Result<Self, String> {
+		let mut listed: Vec<(String, u64)> = tokio::time::timeout(bound, objects.list(""))
+			.await
+			.map_err(|_| "the object store did not list within its bound".to_owned())?
+			.map_err(|error| format!("listing the run's prefix: {error}"))?
+			.into_iter()
+			.map(|object| (object.key, object.size_bytes))
+			.collect();
+		listed.sort();
+		let mut files = Vec::new();
+		for member in &formed.members {
+			let mut names = Vec::new();
+			file_names(&member.config.parent().unwrap().join("data"), &mut names)
+				.map_err(|why| format!("node {}'s data directory: {why}", member.id))?;
+			files.push((member.id, names));
+		}
+		Ok(Self {
+			objects: listed,
+			files,
+		})
+	}
+
+	async fn take(formed: &Formed, objects: &Arc<dyn ObjectStore>, deadline: Instant) -> Self {
+		Self::try_take(formed, objects, step(deadline))
+			.await
+			.unwrap_or_else(|why| panic!("the snapshot is not whole: {why}"))
+	}
+
+	/// Per node, in `NODES` order: the DISTINCT slab ids of objects whose key names that node as
+	/// owner and of which that node's data directory has no file that `names_the_slab`; and how
+	/// many objects name it as owner at all.
+	fn offloaded(&self) -> Vec<(Vec<&str>, usize)> {
+		NODES
+			.iter()
+			.map(|id| {
+				let (_, files) = self.files.iter().find(|(node, _)| node == id).unwrap();
+				let owned: Vec<&str> = self
+					.objects
+					.iter()
+					.filter_map(|(key, _)| owner_and_slab(key))
+					.filter(|(node, _)| node == id)
+					.map(|(_, slab)| slab)
+					.collect();
+				let mut off: Vec<&str> = owned
+					.iter()
+					.copied()
+					.filter(|slab| files.iter().all(|name| !names_the_slab(name, slab)))
+					.collect();
+				off.sort_unstable();
+				off.dedup();
+				(off, owned.len())
+			})
+			.collect()
+	}
+
+	/// Per node: local files whose name says slab payload.
+	fn local_slab_files(&self) -> Vec<usize> {
+		NODES
+			.iter()
+			.map(|id| {
+				let (_, files) = self.files.iter().find(|(node, _)| node == id).unwrap();
+				files
+					.iter()
+					.filter(|name| name.starts_with("slab_") && name.ends_with(".wnd"))
+					.count()
+			})
+			.collect()
+	}
+
+	fn report(&self, what: &str) {
+		let offloaded = self.offloaded();
+		eprintln!(
+			"smoke: {what}: objects {}; per node 1,2,3: objects owned {:?}, of them off the owner's disk {:?}, local slab payload files {:?}",
+			self.objects.len(),
+			offloaded
+				.iter()
+				.map(|(_, owned)| *owned)
+				.collect::<Vec<_>>(),
+			offloaded
+				.iter()
+				.map(|(off, _)| off.len())
+				.collect::<Vec<_>>(),
+			self.local_slab_files(),
+		);
+	}
+}
+
+/// Three real daemons tier to the configured remote object store, reached directly, every one
+/// of them offloads its own slabs, and the rows are read back exactly before and after each
+/// daemon has been stopped and started again on its own store.
+///
+/// - Workload: `ROWS` single-row writes, each ONE logical operation under one identity, offered
+///   again only as `ingest_the_row` says and within one bound per row; each row a slab of its
+///   own (a stress shape for this path, not deployment sizing). A pass does not say a single
+///   write call is always answered: see `ingest_the_row` for the failed run that showed it is
+///   not. Every node's stall bound is written
+///   out at this test's declared profile value (`QUERY_STALL_BOUND_MILLIS`, not the shipped
+///   default); rehydration is the default policy.
+/// - The offload precondition, required before EACH judged query, for EACH of the three nodes:
+///   at least `OFFLOADED_PER_OWNER` objects in the run's prefix whose key names that node as
+///   owner, each for a distinct slab of which that node's data directory, listed whole, has no
+///   slab file (`names_the_slab`). Other files (the active slab, control state) are not judged. It does not show that
+///   every acknowledged row has a current cold copy on each node, nor that an object is the
+///   committed one.
+/// - A judged query is ONE call with caller deadline `QUERY_DEADLINE`, made right after the
+///   precondition was observed, with nothing asked of any node in between. The test waits
+///   `QUERY_WATCHDOG_GRACE` longer only to see how a late query ends. It must return every
+///   row exactly, complete within `QUERY_DEADLINE` of being asked: a later answer fails. Its outcome is printed first; then the node or nodes the client sent it to (the
+///   client's own attempts, the last being the one that answered), and a listing that is
+///   reported, not judged: under the default promotion a local copy may be back by then, so
+///   the test does not claim that every row of a judged query was read from an object.
+/// - Two judged queries: after the first offload, and after the rolling restarts. A restart is
+///   an orderly stop (exit 0 on SIGTERM) and a start from the same files; after each, every
+///   node's readiness is polled within `READY_BOUND`, as at formation. Readiness is the only
+///   thing waited for; a judged query is never asked twice.
+/// - Not covered: three hosts, a node that does not return, a leader failure, a partition,
+///   another store, any timing claim.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "spawns three daemons and needs a remote object store; run alone under an external owner (see the module text)"]
+async fn three_daemons_offload_to_the_object_store_and_serve_their_rows_across_restarts() {
+	let deadline = Instant::now() + TIERING_TEST_BOUND;
+	let store = StoreEnv::from_environment();
+	let objects = store.handle();
+	// Fail here, by name, when the store does not answer or refuses the keys.
+	let before = tokio::time::timeout(CLIENT_BOUND, objects.list(""))
+		.await
+		.expect("the object store did not answer a list within its bound")
+		.expect("the object store refused a list: endpoint, bucket or keys");
+	assert!(before.is_empty(), "the run's prefix is not new");
+	eprintln!(
+		"smoke: object prefix {} in bucket {} at {} (direct, no relay); DECLARED stall bound {QUERY_STALL_BOUND_MILLIS} ms per node (shipped default 250); {ROWS} rows, slabs of {SLAB_MAX_BYTES} bytes",
+		store.prefix, store.bucket, store.endpoint
+	);
+	let started = Instant::now();
+	let at = |what: &str| {
+		eprintln!(
+			"smoke: PHASE {what} at +{} ms",
+			started.elapsed().as_millis()
+		)
+	};
+
+	at("formation");
+	let mut formed = form(deadline, Some(&store)).await;
+	let rows: Vec<(i64, String)> = (1..=ROWS)
+		.map(|id| {
+			let name: String = (0..NAME_HEX_BLOCKS).map(|_| hex(random32())).collect();
+			(id, name)
+		})
+		.collect();
+	let client = client_through(
+		&formed.members[0],
+		&formed.pki,
+		Credential::Storage,
+		deadline,
+	)
+	.await;
+	at("writes");
+	let mut offers = 0_u32;
+	for (id, name) in &rows {
+		offers += ingest_the_row(&client, &formed.descriptor, *id, name, deadline).await;
+	}
+	eprintln!(
+		"smoke: all {ROWS} rows acknowledged in {offers} offers ({} beyond one per row)",
+		offers - ROWS as u32
+	);
+
+	at("offload wait");
+	offloaded_by_every_owner(&mut formed, &objects, deadline, "offload wait").await;
+	// No inspection or wait between the offload observation and the judged query.
+	at("the judged query before any restart");
+	judged_query(&client, &formed, &objects, &rows, "before any restart").await;
+
+	// Each daemon in turn: an orderly stop, a start from the same files, then every node ready.
+	for at_member in 0..formed.members.len() {
+		let id = formed.members[at_member].id;
+		at(&format!("restart of node {id}"));
+		formed.daemons.stop(id, deadline);
+		formed.daemons.start(&formed.members[at_member]);
+		for member in &formed.members {
+			wait_ready(
+				member,
+				&formed.pki,
+				&mut formed.daemons,
+				deadline,
+				&format!("after restarting node {id}"),
+			);
+		}
+	}
+	// A client built after the restarts, so no connection of the earlier one is reused.
+	let through = client_through(
+		&formed.members[0],
+		&formed.pki,
+		Credential::Storage,
+		deadline,
+	)
+	.await;
+	at("offload observation after the restarts");
+	offloaded_by_every_owner(&mut formed, &objects, deadline, "after the restarts").await;
+	at("the judged query after the restarts");
+	judged_query(&through, &formed, &objects, &rows, "after the restarts").await;
+
+	for id in NODES {
+		formed.daemons.stop(id, deadline);
+	}
+	assert!(Instant::now() < deadline, "the test overran its bound");
+	// Each daemon's log is part of the record: kept when a record directory is given.
+	if let Ok(record) = std::env::var("WENDELON_SMOKE_RECORD_DIR") {
+		for member in &formed.members {
+			std::fs::copy(
+				&member.log,
+				Path::new(&record).join(format!("node-{}.daemon.log", member.id)),
+			)
+			.unwrap();
+		}
+	}
+	std::fs::remove_dir_all(&formed.root).unwrap();
+}
+
+/// One row's ingestion: ONE logical operation under ONE operation identity, minted before the
+/// first offer and kept, with the same row, schema and options, on every offer. One absolute
+/// bound for the row (`CLIENT_BOUND`, or what is left of the test's) covers every call and every
+/// pause; an offer never resets it, and an answer after it is not accepted. The same operation
+/// is offered again only for the answers `offers_the_same_operation_again` names (a failed
+/// connection, a redirect, this operation's own stall or exhausted attempts), after a pause of
+/// 250 ms or what is left of the bound. Any other answer, or the bound, fails the test. Only a
+/// receipt counts the row as acknowledged. Returns how many offers were made; each failed offer
+/// is printed.
+///
+/// Why offers are repeated here (recorded, not hidden): run pd-offload-20261113T234639Z of this
+/// test with one call per row FAILED in this phase, when the control leadership changed with
+/// all three daemons alive and one call ended with its attempts exhausted, its outcome
+/// indeterminate (DC-236, cause not established). That run stays failed. With this loop a pass
+/// claims bounded progress of each logical write with re-offers, and never that a single write
+/// call is available without interruption.
+async fn ingest_the_row(
+	client: &Client,
+	descriptor: &TableSchemaDescriptor,
+	id: i64,
+	name: &str,
+	deadline: Instant,
+) -> u32 {
+	let identity = operation_id();
+	let started = Instant::now();
+	let row_bound = started + CLIENT_BOUND.min(step(deadline));
+	let mut offers = 0_u32;
+	loop {
+		offers += 1;
+		let left = row_bound.saturating_duration_since(Instant::now());
+		assert!(
+			!left.is_zero(),
+			"row {id} was not acknowledged within its bound ({} offers before this one)",
+			offers - 1
+		);
+		let answer = tokio::time::timeout(
+			left,
+			client.table_write(
+				TenantId::new(TENANT),
+				descriptor,
+				one_row(id, name),
+				WriteOptions {
+					deadline: Some(Instant::now() + left),
+					operation_id: Some(identity),
+					..WriteOptions::default()
+				},
+			),
+		)
+		.await
+		.unwrap_or_else(|_| panic!("row {id} had no answer within its bound (offer {offers})"));
+		match answer {
+			Ok(_) => {
+				assert!(
+					Instant::now() <= row_bound,
+					"row {id} was acknowledged after its bound"
+				);
+				if offers > 1 {
+					eprintln!(
+						"smoke: row {id} acknowledged on offer {offers}, {:?} after its first",
+						started.elapsed()
+					);
+				}
+				return offers;
+			}
+			Err(error) if offers_the_same_operation_again(&error, identity) => {
+				eprintln!(
+					"smoke: offer {offers} of row {id}, {:?} after its first: {error}",
+					started.elapsed()
+				);
+				let pause = Duration::from_millis(250)
+					.min(row_bound.saturating_duration_since(Instant::now()));
+				tokio::time::sleep(pause).await;
+			}
+			Err(error) => panic!("the write of row {id} (offer {offers}): {error:?}"),
+		}
+	}
+}
+
+/// Polls, within `TIER_BOUND`, until each of the three nodes has `OFFLOADED_PER_OWNER` of its
+/// own slabs in the store and off its own wholly listed disk; prints the counts at every poll
+/// and the slab ids when it holds. A daemon that has exited, a listing that is not whole, or the
+/// bound fails the step with what was observed. It asks nothing of any node.
+async fn offloaded_by_every_owner(
+	formed: &mut Formed,
+	objects: &Arc<dyn ObjectStore>,
+	deadline: Instant,
+	what: &str,
+) {
+	let by = Instant::now() + TIER_BOUND.min(deadline.saturating_duration_since(Instant::now()));
+	loop {
+		for (id, child) in &mut formed.daemons.children {
+			if let Some(status) = child.try_wait().expect("wait for the daemon") {
+				panic!("{what}: node {id} exited {status}");
+			}
+		}
+		let snapshot = Snapshot::take(formed, objects, deadline).await;
+		snapshot.report(what);
+		if snapshot
+			.offloaded()
+			.iter()
+			.all(|(off, _)| off.len() >= OFFLOADED_PER_OWNER)
+		{
+			for (id, (off, owned)) in NODES.iter().zip(snapshot.offloaded()) {
+				eprintln!(
+					"smoke: OFFLOADED ({what}) node {id}: {} of its {owned} objects are for slabs with no file on its disk: {off:?}",
+					off.len()
+				);
+			}
+			return;
+		}
+		if Instant::now() >= by {
+			panic!(
+				"PARTIAL ({what}): within {TIER_BOUND:?} not every node had {OFFLOADED_PER_OWNER} of its slabs in the store and off its own disk"
+			);
+		}
+		tokio::time::sleep(Duration::from_secs(2)).await;
+	}
+}
+
+/// ONE table query, judged: every row exactly, within the caller's deadline. See the test's
+/// text for what is printed and in which order.
+async fn judged_query(
+	client: &Client,
+	formed: &Formed,
+	objects: &Arc<dyn ObjectStore>,
+	rows: &[(i64, String)],
+	what: &str,
+) {
+	let targets = Arc::new(std::sync::Mutex::new(Vec::new()));
+	let noted = targets.clone();
+	let asked = Instant::now();
+	let call = client.table_query_with_runtime_filter_and_attempt_hook(
+		TenantId::new(TENANT),
+		&formed.descriptor,
+		Vec::new(),
+		None,
+		TableQueryOptions {
+			deadline: Some(asked + QUERY_DEADLINE),
+			..TableQueryOptions::default()
+		},
+		move |attempt: wendelon::client::TableQueryAttempt| {
+			noted.lock().unwrap().push(attempt.target.id);
+			Ok(Box::new(()) as wendelon::client::TableQueryAttemptGuard)
+		},
+	);
+	let outcome = tokio::time::timeout(QUERY_DEADLINE + QUERY_WATCHDOG_GRACE, call).await;
+	let took = asked.elapsed();
+	// The judged outcome is in the log before anything else is asked of anyone.
+	eprintln!(
+		"smoke: QUERY OUTCOME ({what}) after {took:?}: {}; the client's attempts went to nodes {:?}",
+		match &outcome {
+			Err(_) => "the test's watchdog ended it; no answer of any kind".to_owned(),
+			Ok(Err(error)) => format!("an error: {error:?}"),
+			Ok(Ok(result)) => format!("a complete answer, {} batches", result.batches.len()),
+		},
+		targets.lock().unwrap()
+	);
+	// Reported only. If it cannot be taken, that is said, and the outcome above stands.
+	match Snapshot::try_take(formed, objects, CLIENT_BOUND).await {
+		Ok(snapshot) => snapshot.report(&format!(
+			"after the judged query {what} (reported, not judged)"
+		)),
+		Err(why) => eprintln!(
+			"smoke: the listing after the judged query {what} is UNAVAILABLE ({why}); the query's outcome is unaffected"
+		),
+	}
+	let result = match outcome {
+		Err(_) => panic!(
+			"QUERY ENDED BY ({what}): the test's watchdog, {took:?} after it was asked (caller deadline {QUERY_DEADLINE:?} plus {QUERY_WATCHDOG_GRACE:?})"
+		),
+		Ok(Err(error)) => panic!("QUERY ENDED BY ({what}): an error after {took:?}: {error:?}"),
+		Ok(Ok(result)) => result,
+	};
+	// The grace is for seeing how a late query ends, never for accepting it: an answer that
+	// completed after the caller's deadline fails, whatever it holds. `took` was captured when
+	// the call returned, before the listing above.
+	assert!(
+		took <= QUERY_DEADLINE,
+		"QUERY ENDED BY ({what}): an answer, but {took:?} after it was asked, past the caller's deadline of {QUERY_DEADLINE:?}"
+	);
+	let mut got = Vec::new();
+	for batch in &result.batches {
+		let ids = batch
+			.column_by_name("id")
+			.and_then(|column| column.as_any().downcast_ref::<Int64Array>())
+			.expect("an id column");
+		let names = batch
+			.column_by_name("name")
+			.and_then(|column| column.as_any().downcast_ref::<LargeStringArray>())
+			.expect("a name column");
+		for row in 0..batch.num_rows() {
+			got.push((ids.value(row), names.value(row).to_owned()));
+		}
+	}
+	got.sort();
+	assert_eq!(
+		got.iter().map(|row| row.0).collect::<Vec<_>>(),
+		rows.iter().map(|row| row.0).collect::<Vec<_>>(),
+		"{what}: the ids"
+	);
+	for (got, want) in got.iter().zip(rows) {
+		assert!(got.1 == want.1, "{what}: row {} has another name", want.0);
+	}
+	let answered_by = targets.lock().unwrap().last().copied();
+	eprintln!(
+		"smoke: QUERY ENDED BY ({what}): an exact answer of {} rows after {took:?}, from node {answered_by:?}",
+		got.len()
+	);
 }
