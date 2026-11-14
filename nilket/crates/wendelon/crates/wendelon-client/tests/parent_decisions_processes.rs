@@ -2451,6 +2451,75 @@ async fn settle(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "spawns three daemons and stops them with signals; run alone under an external owner (see the module text)"]
 async fn three_daemons_resume_service_without_restart_after_all_are_paused() {
+	pause_recovery_workflow(Paused::All).await;
+}
+
+/// The same workflow, with one difference: only the daemons that are NOT the leader observed
+/// at selection are stopped; that one process keeps running for the whole interval.
+///
+/// The leader is read from all three nodes' readiness answers, which must name the same
+/// node; nothing assumes which node that is. Reading three answers is not an atomic fact:
+/// leadership may change between the reads and the first SIGSTOP, and after it. "The leader"
+/// below always means the leader observed at selection.
+///
+/// With two of three voters stopped there is no quorum. The running node can receive a
+/// request but cannot be assumed to decide anything, and it may stop being leader; a change
+/// of leadership across the pause is reported, not judged. This is a scheduling pause that
+/// removes the quorum. It is not a stalled disk and not a partition, and it guarantees
+/// neither a takeover nor a refusal: when no refusal occurs, those branches of the oracle
+/// were not exercised, and the log says so. The running process is checked to be the same
+/// live, unstopped process at both ends of the interval, which does not show that it had
+/// the processor throughout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "spawns three daemons and stops two with signals; run alone under an external owner (see the module text)"]
+async fn three_daemons_resume_service_without_restart_after_the_followers_are_paused() {
+	pause_recovery_workflow(Paused::AllButTheObservedLeader).await;
+}
+
+/// Which daemons the workflow stops.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Paused {
+	All,
+	AllButTheObservedLeader,
+}
+
+/// What each node's readiness answer names as leader, read once each, now.
+fn leader_views(members: &[Member], pki: &Pki, limit: Instant) -> Vec<(u32, Option<u32>)> {
+	members
+		.iter()
+		.map(|member| {
+			assert!(
+				Instant::now() < limit,
+				"the leader-view bound passed before inspection"
+			);
+			let view = inspect(member, pki).leader();
+			assert!(
+				Instant::now() <= limit,
+				"a leader view came after its bound"
+			);
+			(member.id, view)
+		})
+		.collect()
+}
+
+/// The node all three readiness answers name as leader, read again until they agree or
+/// `limit` passes. No agreement inside the limit ends the test before any signal.
+fn observed_leader(members: &[Member], pki: &Pki, limit: Instant) -> u32 {
+	loop {
+		let views = leader_views(members, pki, limit);
+		let named: Vec<u32> = views.iter().filter_map(|(_, leader)| *leader).collect();
+		assert!(
+			Instant::now() < limit,
+			"CONTROL, before any signal: leader selection exceeded its bound: {views:?}"
+		);
+		if named.len() == members.len() && named.iter().all(|leader| *leader == named[0]) {
+			return named[0];
+		}
+		std::thread::sleep(Duration::from_millis(100));
+	}
+}
+
+async fn pause_recovery_workflow(which: Paused) {
 	let deadline = Instant::now() + TEST_BOUND;
 	let Formed {
 		root,
@@ -2487,11 +2556,55 @@ async fn three_daemons_resume_service_without_restart_after_all_are_paused() {
 		operations.push(operation);
 	}
 
-	// The pause. The guard exists before the first stop and outlives every step below.
+	// Which daemons are stopped. For the followers' case the leader is the one all three
+	// nodes name now; it is an observation at selection, not a promise about the interval.
+	let (paused, running): (Vec<OwnedProcess>, Vec<OwnedProcess>) = match which {
+		Paused::All => (processes.clone(), Vec::new()),
+		Paused::AllButTheObservedLeader => {
+			let selected_at = Instant::now();
+			let leader = observed_leader(
+				&members,
+				&pki,
+				selected_at + READY_BOUND.min(step(deadline)),
+			);
+			let (running, paused): (Vec<OwnedProcess>, Vec<OwnedProcess>) = processes
+				.iter()
+				.copied()
+				.partition(|process| process.node == leader);
+			assert_eq!((running.len(), paused.len()), (1, NODES.len() - 1));
+			eprintln!(
+				"smoke: SELECTION: all three nodes named node {leader} as leader, {:?} after the baseline writes; left running: {running:?}; to be stopped: {paused:?}",
+				selected_at.duration_since(before_everything)
+			);
+			(paused, running)
+		}
+	};
+	// A process left running must be the same process, alive and not stopped.
+	let check_running = |when: &str| {
+		for process in &running {
+			let state = process
+				.state()
+				.unwrap_or_else(|why| panic!("{when}: {why}"));
+			assert!(
+				matches!(state, 'R' | 'S' | 'D' | 'I'),
+				"{when}: node {}, left running, is in state {state}",
+				process.node
+			);
+		}
+	};
+
+	// The pause. The guard exists before the first stop, covers every daemon, and outlives
+	// every step below.
 	let resume_on_exit = ResumeOnExit(processes.clone());
-	let (stop_sent, stopped) = pause_all(&processes).unwrap_or_else(|why| panic!("pause: {why}"));
+	let (stop_sent, stopped) = pause_all(&paused).unwrap_or_else(|why| panic!("pause: {why}"));
+	check_running("at the start of the pause");
 	eprintln!(
-		"smoke: PAUSE: all three stopped; first signal to last confirmation {:?}",
+		"smoke: PAUSE: {} of three stopped (nodes {:?}); first signal to last confirmation {:?}",
+		paused.len(),
+		paused
+			.iter()
+			.map(|process| process.node)
+			.collect::<Vec<_>>(),
 		stopped - stop_sent
 	);
 
@@ -2513,19 +2626,20 @@ async fn three_daemons_resume_service_without_restart_after_all_are_paused() {
 	);
 	operations.push(during);
 	tokio::time::sleep((stopped + PAUSE_LENGTH).saturating_duration_since(Instant::now())).await;
-	for process in &processes {
+	for process in &paused {
 		let state = process.state().unwrap_or_else(|why| panic!("pause: {why}"));
 		assert_eq!(state, 'T', "node {} did not stay stopped", process.node);
 	}
+	check_running("at the end of the pause");
 
 	// The release. The recovery budget starts BEFORE the first SIGCONT.
 	let release = Instant::now();
 	let mark = release + RECOVERY_BOUND;
-	let running = resume_all(&processes).unwrap_or_else(|why| panic!("release: {why}"));
+	let runnable = resume_all(&paused).unwrap_or_else(|why| panic!("release: {why}"));
 	eprintln!(
-		"smoke: RELEASE: every daemon stopped for at least {:?} (last stop confirmed to first SIGCONT); all three confirmed runnable {:?} after the release began. Recovery bound {RECOVERY_BOUND:?} from the release",
+		"smoke: RELEASE: each stopped daemon was stopped for at least {:?} (last stop confirmed to first SIGCONT); all of them confirmed runnable {:?} after the release began. Recovery bound {RECOVERY_BOUND:?} from the release",
 		release - stopped,
-		running - release
+		runnable - release
 	);
 
 	// (a) Every node Ready, inside the budget.
@@ -2538,6 +2652,16 @@ async fn three_daemons_resume_service_without_restart_after_all_are_paused() {
 		"smoke: RECOVERY: every node Ready {:?} after the release",
 		all_ready - release
 	);
+	// Extra role observations belong only to the new subset case. The landed all-paused
+	// case keeps its original call sequence and recovery budget.
+	if which == Paused::AllButTheObservedLeader {
+		let views = leader_views(&members, &pki, mark);
+		eprintln!("smoke: RECOVERY: leader named by each node once all were Ready: {views:?}");
+		assert!(
+			Instant::now() <= mark,
+			"the leader views came after the recovery bound"
+		);
+	}
 
 	// (b), (c) Settle what is outstanding; a refusal may be followed by ONE new operation.
 	let mut new_operations = 0_usize;
@@ -2618,12 +2742,17 @@ async fn three_daemons_resume_service_without_restart_after_all_are_paused() {
 	};
 	assert_eq!(count(Disposition::Unknown), 0, "an operation is unresolved");
 	eprintln!(
-		"smoke: RESULT 2 (after the release): Ready after {:?}, everything settled and a fresh write committed after {:?}; operations {}: committed {}, refused {}, new operations after a refusal {new_operations}",
+		"smoke: RESULT 2 (after the release): Ready after {:?}, everything settled and a fresh write committed after {:?}; operations {}: committed {}, refused {}, new operations after a refusal {new_operations}{}",
 		all_ready - release,
 		progressed - release,
 		operations.len(),
 		count(Disposition::Committed),
 		count(Disposition::Refused),
+		if count(Disposition::Refused) == 0 {
+			"; NO refusal occurred: the refusal and new-operation branches were NOT exercised"
+		} else {
+			""
+		}
 	);
 
 	// THEN one exact read: exactly the committed operations' rows, with their own text.
