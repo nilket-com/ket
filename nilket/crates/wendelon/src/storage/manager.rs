@@ -4491,6 +4491,17 @@ fn build_locality_index(key_localities: &DashMap<TenantKey, Locality>) -> Tenant
 	locality_index
 }
 
+/// Test seam for `tiered_io::covered_by_tail`.
+#[cfg(test)]
+pub(crate) fn covered_by_tail_for_test(
+	tail_start: u64,
+	object_size: u64,
+	tail_len: usize,
+	range: &std::ops::Range<u64>,
+) -> Option<std::ops::Range<usize>> {
+	tiered_io::covered_by_tail(tail_start, object_size, tail_len, range)
+}
+
 pub(crate) const AWAITING_CLUSTER_MARKER: &str = "TIER_AUTHORITY_AWAITING_CLUSTER";
 
 #[cfg(test)]

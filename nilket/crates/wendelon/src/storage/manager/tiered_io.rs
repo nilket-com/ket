@@ -3255,12 +3255,37 @@ impl SlabManager {
 			LogicalExtent::of(&location),
 		)?;
 		let footer = plan.footer();
-		let ciphertext = l2
-			.get_range(&pointer.l2_uri, plan.ciphertext_range_in_object())
-			.await?;
+		// ADR 0730: the ciphertext the plan asks for may already be in hand. The
+		// tail window was fetched as `tail_start..size`; when it came back at
+		// exactly that length and the plan's whole ciphertext range lies inside
+		// it, those bytes are the same bytes a further range request of this
+		// object would return, so they are decrypted from the window and no
+		// request is made. Otherwise the range is fetched as before.
+		let ciphertext_range = plan.ciphertext_range_in_object();
+		let ciphertext = match covered_by_tail(
+			tail_start,
+			metadata.size_bytes,
+			tail_window.len(),
+			&ciphertext_range,
+		) {
+			Some(within) => tail_window.slice(within),
+			None => l2.get_range(&pointer.l2_uri, ciphertext_range).await?,
+		};
 		let record_bytes = plan.decrypt(ciphertext.as_ref())?;
 		validate_tiered_record_header_tenant(&record_bytes, footer.tenant_id, pointer.slab_id)?;
 		record_and_header_from_record_bytes(&record_bytes)
+	}
+
+	/// Test seam: one encrypted record read from `l2`, with its header.
+	#[cfg(test)]
+	pub(crate) async fn read_encrypted_record_and_header_for_test(
+		&self,
+		l2: &dyn ObjectStore,
+		pointer: &TieredSlabPointer,
+		location: RecordLocation,
+	) -> std::io::Result<(SlabRecordHeader, Vec<u8>)> {
+		self.read_encrypted_record_and_header_from_l2(l2, pointer, location)
+			.await
 	}
 
 	pub(super) async fn note_l2_read(&self, slab_id: SlabId) -> bool {
@@ -3639,4 +3664,28 @@ fn tier_publication_unleased(slab_id: SlabId) -> Error {
 			slab_id.get()
 		),
 	)
+}
+
+/// ADR 0730: where `range` (object offsets) lies inside a tail window that was
+/// requested as `tail_start..object_size` and came back `tail_len` bytes long,
+/// as offsets into that window. `None` unless the window has exactly the
+/// requested length and holds the whole non-empty range: a response of any
+/// other length is never mapped to object offsets, and a range that starts
+/// before the window or is inverted is not covered. Checked arithmetic only.
+pub(super) fn covered_by_tail(
+	tail_start: u64,
+	object_size: u64,
+	tail_len: usize,
+	range: &std::ops::Range<u64>,
+) -> Option<std::ops::Range<usize>> {
+	let requested = object_size.checked_sub(tail_start)?;
+	if u64::try_from(tail_len).ok()? != requested {
+		return None;
+	}
+	if range.start >= range.end || range.start < tail_start || range.end > object_size {
+		return None;
+	}
+	let start = usize::try_from(range.start.checked_sub(tail_start)?).ok()?;
+	let end = usize::try_from(range.end.checked_sub(tail_start)?).ok()?;
+	(end <= tail_len).then_some(start..end)
 }

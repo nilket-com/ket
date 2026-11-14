@@ -1865,12 +1865,20 @@ async fn make_manager() -> (crate::test_support::TestDir, Arc<SlabManager>) {
 async fn make_manager_with_l2(
 	l2: Arc<dyn ObjectStore>,
 ) -> (crate::test_support::TestDir, Arc<SlabManager>) {
+	make_manager_with_l2_tail(l2, 256 + 16).await
+}
+
+/// `make_manager_with_l2` with the tail read window given.
+async fn make_manager_with_l2_tail(
+	l2: Arc<dyn ObjectStore>,
+	tail_read_window_bytes: u64,
+) -> (crate::test_support::TestDir, Arc<SlabManager>) {
 	let scratch = fresh_dir("query-l2");
 	let dir = scratch.to_path_buf();
 	let io = spawn_io_thread(64).unwrap();
 	let mut rehydration = crate::storage::manager::RehydrationPolicy::default();
 	rehydration.promote_after_l2_reads = 0;
-	rehydration.tail_read_window_bytes = 256 + 16;
+	rehydration.tail_read_window_bytes = tail_read_window_bytes;
 	(
 		scratch,
 		SlabManager::initialize_new_store(SlabManagerConfig {
@@ -21755,6 +21763,506 @@ mod checked_placement {
 		assert_eq!(written.write.status, WriteStatus::OK, "{written:?}");
 		assert_eq!(row_on_each_store(&fixture, 7), (Some(true), Some(true)));
 		fixture.shutdown().await;
+	}
+}
+
+/// ADR 0730: a tiered record read reuses the ciphertext it already fetched in the
+/// tail window instead of asking for it again.
+mod covered_tail_reuse {
+	use super::*;
+	use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+
+	const DEFAULT_TAIL: u64 = 64 * 1024;
+
+	#[derive(Clone, Debug, PartialEq, Eq)]
+	enum Request {
+		Head,
+		Range(u64, u64),
+		Whole,
+	}
+
+	/// What the store does to the answer of a TAIL request (a range that ends at the
+	/// object's end). Every other answer is the object's own bytes.
+	const HONEST: u8 = 0;
+	/// One byte longer than asked (a leading byte added): the footer still parses.
+	const LONGER: u8 = 1;
+	/// One byte shorter than asked (the first byte dropped): a shorter suffix.
+	const SHORTER: u8 = 2;
+	/// The last byte of the object flipped.
+	const FOOTER_FLIPPED: u8 = 3;
+	/// The last four bytes missing.
+	const FOOTER_CUT: u8 = 4;
+	/// The byte at object offset `flip_at` flipped.
+	const BYTE_FLIPPED: u8 = 5;
+
+	struct ScriptedStore {
+		inner: MockObjectStore,
+		delay_millis: AtomicU64,
+		tail: AtomicU8,
+		flip_at: AtomicU64,
+		log: std::sync::Mutex<Vec<Request>>,
+	}
+
+	impl ScriptedStore {
+		fn new() -> Arc<Self> {
+			Arc::new(Self {
+				inner: MockObjectStore::default(),
+				delay_millis: AtomicU64::new(0),
+				tail: AtomicU8::new(HONEST),
+				flip_at: AtomicU64::new(0),
+				log: Default::default(),
+			})
+		}
+
+		fn take_log(&self) -> Vec<Request> {
+			std::mem::take(&mut *self.log.lock().unwrap())
+		}
+
+		async fn requested(&self, request: Request) {
+			self.log.lock().unwrap().push(request);
+			let delay = self.delay_millis.load(Ordering::SeqCst);
+			if delay > 0 {
+				tokio::time::sleep(Duration::from_millis(delay)).await;
+			}
+		}
+	}
+
+	#[async_trait::async_trait]
+	impl ObjectStore for ScriptedStore {
+		async fn put(&self, key: &str, bytes: &[u8]) -> std::io::Result<String> {
+			self.inner.put(key, bytes).await
+		}
+		fn planned_upload_uri(&self, key: &str) -> std::io::Result<String> {
+			self.inner.planned_upload_uri(key)
+		}
+		async fn head(&self, uri: &str) -> std::io::Result<crate::storage::l2::ObjectMetadata> {
+			self.requested(Request::Head).await;
+			self.inner.head(uri).await
+		}
+		async fn get_range(
+			&self,
+			uri: &str,
+			range: std::ops::Range<u64>,
+		) -> std::io::Result<bytes::Bytes> {
+			self.requested(Request::Range(range.start, range.end)).await;
+			let size = self.inner.head(uri).await?.size_bytes;
+			let honest = self.inner.get_range(uri, range.clone()).await?;
+			let mode = self.tail.load(Ordering::SeqCst);
+			if range.end != size || mode == HONEST {
+				return Ok(honest);
+			}
+			let mut bytes = honest.to_vec();
+			match mode {
+				LONGER => bytes.insert(0, 0),
+				SHORTER => {
+					bytes.remove(0);
+				}
+				FOOTER_FLIPPED => *bytes.last_mut().unwrap() ^= 0x01,
+				FOOTER_CUT => bytes.truncate(bytes.len() - 4),
+				BYTE_FLIPPED => {
+					let at = self.flip_at.load(Ordering::SeqCst);
+					assert!(
+						range.start <= at && at < range.end,
+						"the byte is in the tail"
+					);
+					bytes[(at - range.start) as usize] ^= 0x01;
+				}
+				_ => unreachable!(),
+			}
+			Ok(bytes::Bytes::from(bytes))
+		}
+		async fn get_bytes(&self, uri: &str) -> std::io::Result<bytes::Bytes> {
+			self.requested(Request::Whole).await;
+			self.inner.get_bytes(uri).await
+		}
+		async fn list(
+			&self,
+			prefix: &str,
+		) -> std::io::Result<Vec<crate::storage::l2::ObjectMetadata>> {
+			self.inner.list(prefix).await
+		}
+		async fn delete(&self, uri: &str) -> std::io::Result<()> {
+			self.inner.delete(uri).await
+		}
+	}
+
+	struct Tiered {
+		_dir: crate::test_support::TestDir,
+		mgr: Arc<SlabManager>,
+		descriptor: TableSchemaDescriptor,
+		pointer: TieredSlabPointer,
+		size: u64,
+		/// Each row's location and the frame that was appended for it.
+		rows: Vec<(RecordLocation, Vec<u8>)>,
+	}
+
+	/// One encrypted tiered slab of single-row frames, every read byte from `l2`.
+	async fn tiered(l2: &Arc<ScriptedStore>, tail: u64, rows: Vec<(i64, &str)>) -> Tiered {
+		let (dir, mgr) = make_manager_with_l2_tail(l2.clone(), tail).await;
+		let descriptor = typed_table_descriptor();
+		let batch = typed_table_batch_with_names(rows);
+		let mut write_meta: TableWriteRequestMeta = bytemuck::Zeroable::zeroed();
+		write_meta.tenant_id = tenant();
+		write_meta.table_object_id = descriptor.table_object_id;
+		write_meta.schema_generation = descriptor.schema_generation;
+		write_meta.row_count = encode_table_write_row_count(batch.num_rows()).unwrap();
+		let admission = validate_table_write_request_batch(
+			&write_meta,
+			&batch,
+			&descriptor,
+			WriterNodeId::ZERO,
+			write_meta.client_hlc,
+		)
+		.expect("typed rows should validate");
+		let mut frames = Vec::new();
+		for row in 0..batch.num_rows() {
+			let frame = encode_batch(&batch.slice(row, 1)).unwrap();
+			mgr.append_durable_with_locality(
+				tenant(),
+				admission.key_identities[row],
+				admission.localities[row],
+				hlc(10 + row as u64, 0, 1),
+				&frame,
+			)
+			.await
+			.unwrap();
+			frames.push(frame);
+		}
+		let slab_id = mgr.force_seal_active_for_test().await;
+		let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
+		let mut catalog = TableSchemaCatalog::default();
+		catalog.upsert(tenant(), descriptor.clone()).unwrap();
+		let encrypted = mgr
+			.encrypt_tiered_object_blob_with_table_stats(slab_id, &raw, &catalog)
+			.unwrap();
+		let locator = encrypted.stats_locator.expect("stats locator");
+		let size = encrypted.bytes.len() as u64;
+		let l2_uri = l2
+			.put(&format!("covered-tail-{slab_id}.wnd"), &encrypted.bytes)
+			.await
+			.unwrap();
+		let pointer = TieredSlabPointer {
+			slab_id,
+			l2_uri,
+			payload_hash: payload_digest(&encrypted.bytes),
+			is_encrypted: true,
+			tenant_id: Some(encrypted.tenant_id),
+			tenant_kek_id: Some(encrypted.tenant_kek_id),
+			stats_format_version: Some(locator.stats_format_version),
+			stats_block_len: Some(locator.stats_block_len),
+			stats_block_hash128: Some(locator.stats_block_hash128),
+			tombstone_metadata: TombstoneMetadata::None,
+			supersession_metadata: SupersessionMetadata::None,
+		};
+		mgr.apply_tier_slab(pointer.clone()).await.unwrap();
+		let rows = admission
+			.key_identities
+			.iter()
+			.zip(frames)
+			.map(|(key, frame)| {
+				let location = mgr.lookup(tenant(), *key).unwrap().expect("a tiered row");
+				(location, frame)
+			})
+			.collect();
+		l2.take_log();
+		Tiered {
+			_dir: dir,
+			mgr,
+			descriptor,
+			pointer,
+			size,
+			rows,
+		}
+	}
+
+	/// One record read straight from the store, with what the store was asked.
+	async fn read(
+		l2: &Arc<ScriptedStore>,
+		tiered: &Tiered,
+		row: usize,
+	) -> (
+		std::io::Result<(crate::schema::SlabRecordHeader, Vec<u8>)>,
+		Vec<Request>,
+	) {
+		l2.take_log();
+		let result = tiered
+			.mgr
+			.read_encrypted_record_and_header_for_test(
+				l2.as_ref(),
+				&tiered.pointer,
+				tiered.rows[row].0,
+			)
+			.await;
+		(result, l2.take_log())
+	}
+
+	/// An object smaller than the tail window: the tail IS the object, so the record's
+	/// ciphertext is in hand after two requests, and no third is made. The bytes are the
+	/// appended frame. The header is the one the unchanged three-and-more request path
+	/// returns for the same rows in a store whose tail window does not hold the record.
+	#[tokio::test]
+	async fn a_record_in_an_object_smaller_than_the_tail_window_is_read_in_two_requests() {
+		let l2 = ScriptedStore::new();
+		let rows = vec![(1, "codex"), (2, "claude")];
+		let tiered_small = tiered(&l2, DEFAULT_TAIL, rows.clone()).await;
+		assert!(tiered_small.size < DEFAULT_TAIL);
+		// The control: the same rows where the tail window is 272 bytes.
+		let other = ScriptedStore::new();
+		let uncovered = tiered(&other, 256 + 16, rows).await;
+		for row in 0..tiered_small.rows.len() {
+			let (covered, asked) = read(&l2, &tiered_small, row).await;
+			let (header, frame) = covered.unwrap();
+			assert_eq!(
+				asked,
+				[Request::Head, Request::Range(0, tiered_small.size)],
+				"row {row}"
+			);
+			assert_eq!(
+				frame, tiered_small.rows[row].1,
+				"row {row}: the appended frame"
+			);
+
+			let (fetched, asked) = read(&other, &uncovered, row).await;
+			let (fetched_header, fetched_frame) = fetched.unwrap();
+			assert_eq!(
+				asked.len(),
+				4,
+				"row {row}: head, tail, index, ciphertext: {asked:?}"
+			);
+			let Request::Range(_, end) = asked[3] else {
+				panic!("row {row}: {asked:?}");
+			};
+			assert!(
+				end < uncovered.size - (256 + 16),
+				"row {row}: outside the tail"
+			);
+			assert_eq!(fetched_frame, frame, "row {row}: the bytes");
+			assert_eq!(
+				format!("{fetched_header:?}"),
+				format!("{header:?}"),
+				"row {row}: the header"
+			);
+		}
+	}
+
+	/// A tail answer of the wrong length is never reused: a read that succeeds on one
+	/// made the ciphertext request. What the existing parse and plan make of such an
+	/// answer is unchanged and is not asserted beyond that. A footer that is cut or
+	/// altered is refused. A ciphertext byte altered inside a reused tail is refused by
+	/// the same authentication, with no further request to paper over it.
+	#[tokio::test]
+	async fn a_wrong_length_tail_is_not_reused_and_altered_bytes_are_refused() {
+		let l2 = ScriptedStore::new();
+		let tiered = tiered(&l2, DEFAULT_TAIL, vec![(1, "codex"), (2, "claude")]).await;
+		let (honest, asked) = read(&l2, &tiered, 0).await;
+		let (_, frame) = honest.unwrap();
+		assert_eq!(asked.len(), 2);
+
+		for mode in [SHORTER, LONGER] {
+			l2.tail.store(mode, Ordering::SeqCst);
+			let (answer, asked) = read(&l2, &tiered, 0).await;
+			if let Ok((_, bytes)) = answer {
+				assert_eq!(
+					asked.len(),
+					3,
+					"mode {mode}: served without the request: {asked:?}"
+				);
+				assert_eq!(bytes, frame, "mode {mode}");
+			}
+		}
+		for mode in [FOOTER_FLIPPED, FOOTER_CUT] {
+			l2.tail.store(mode, Ordering::SeqCst);
+			let (refused, asked) = read(&l2, &tiered, 0).await;
+			assert!(refused.is_err(), "mode {mode}: {asked:?}");
+		}
+
+		// A byte in the middle of the object: inside the record ciphertext, far from the
+		// leading header and the trailing index and footer.
+		l2.flip_at.store(tiered.size / 2, Ordering::SeqCst);
+		l2.tail.store(BYTE_FLIPPED, Ordering::SeqCst);
+		let (tampered, asked) = read(&l2, &tiered, 0).await;
+		l2.tail.store(HONEST, Ordering::SeqCst);
+		assert!(tampered.is_err(), "an altered ciphertext byte was accepted");
+		assert_eq!(
+			asked,
+			[Request::Head, Request::Range(0, tiered.size)],
+			"the altered tail was the read's only source"
+		);
+		// And the honest object is still served.
+		let (again, _) = read(&l2, &tiered, 0).await;
+		assert_eq!(again.unwrap().1, frame);
+	}
+
+	/// An object larger than the tail window (the default one). A record whose
+	/// ciphertext lies wholly in the tail is read in two requests; any other makes the
+	/// ciphertext request as before, for a range that is not inside the tail. Both kinds
+	/// occur, the two-request rows are the ones stored last, and every read returns its
+	/// appended frame. (A two-request read's range is not visible to this test; what
+	/// range counts as covered is the subject of the mapping test below.)
+	#[tokio::test]
+	async fn in_a_larger_object_only_a_range_outside_the_tail_is_requested() {
+		let l2 = ScriptedStore::new();
+		// Sixteen such rows fill one 64 KiB encryption chunk; a hundred leave a short last
+		// chunk, which the tail window holds whole together with the index and footer.
+		let names: Vec<String> = (0..100_u32)
+			.map(|row| {
+				// Text that does not compress away: a different run of digits per row.
+				(0..300_u32)
+					.map(|at| {
+						format!(
+							"{:08x}",
+							row.wrapping_mul(2_654_435_761)
+								.wrapping_add(at.wrapping_mul(40_503))
+						)
+					})
+					.collect()
+			})
+			.collect();
+		let rows: Vec<(i64, &str)> = names
+			.iter()
+			.enumerate()
+			.map(|(row, name)| (row as i64 + 1, name.as_str()))
+			.collect();
+		let tiered = tiered(&l2, DEFAULT_TAIL, rows).await;
+		assert!(
+			tiered.size > DEFAULT_TAIL * 2,
+			"the object is {} bytes",
+			tiered.size
+		);
+		let tail_start = tiered.size - DEFAULT_TAIL;
+		let (mut covered, mut outside) = (Vec::new(), Vec::new());
+		for row in 0..tiered.rows.len() {
+			let (answer, asked) = read(&l2, &tiered, row).await;
+			let (_, frame) = answer.unwrap();
+			assert_eq!(frame, tiered.rows[row].1, "row {row}: the appended frame");
+			assert_eq!(
+				asked[..2],
+				[Request::Head, Request::Range(tail_start, tiered.size)],
+				"row {row}"
+			);
+			match asked[2..] {
+				[] => covered.push(tiered.rows[row].0.offset),
+				[Request::Range(start, end)] => {
+					assert!(
+						start < tail_start && start < end && end <= tiered.size,
+						"row {row}: {start}..{end} was requested though the tail from {tail_start} holds it"
+					);
+					outside.push(tiered.rows[row].0.offset);
+				}
+				_ => panic!("row {row}: {asked:?}"),
+			}
+		}
+		assert!(
+			!covered.is_empty() && !outside.is_empty(),
+			"covered {}, outside {}",
+			covered.len(),
+			outside.len()
+		);
+		assert!(
+			covered.iter().min() > outside.iter().max(),
+			"the two-request rows are the last stored"
+		);
+	}
+
+	/// The request chain the real store showed, in miniature and on tokio's paused
+	/// clock: 100 ms per request under the unchanged 250 ms bound, an object smaller
+	/// than the tail window. A record read is two requests, 200 ms, and the query is
+	/// served; with the third request it was 300 ms and the location's read stalled.
+	#[tokio::test]
+	async fn a_covered_record_read_at_100_ms_a_request_is_served_under_the_default_bound() {
+		let l2 = ScriptedStore::new();
+		let tiered = tiered(&l2, DEFAULT_TAIL, vec![(1, "codex"), (2, "claude")]).await;
+		let program = pbc::Program::compile(&[]).unwrap();
+		let meta = base_meta();
+		let ranges = [QueryScanRange {
+			start: Locality::ZERO,
+			end: Locality::MAX,
+		}];
+		let bound = QueryStallBound::DEFAULT;
+		assert_eq!(bound.get(), Duration::from_millis(250));
+		let run = async |delay_millis: u64| {
+			if delay_millis > 0 {
+				tokio::time::pause();
+			}
+			l2.take_log();
+			l2.delay_millis.store(delay_millis, Ordering::SeqCst);
+			let started = tokio::time::Instant::now();
+			let plan = plan_query_execution_for_ranges_with_program(
+				&tiered.mgr,
+				n(1),
+				&meta,
+				&program,
+				&ranges,
+				QueryExecutionBudget::server_default(bound),
+				None,
+				Some(&tiered.descriptor),
+				QueryProjectedExecution::Disabled,
+				RowIdentityProjection::None,
+				None,
+			)
+			.await
+			.unwrap();
+			let elapsed = started.elapsed();
+			l2.delay_millis.store(0, Ordering::SeqCst);
+			if delay_millis > 0 {
+				tokio::time::resume();
+			}
+			(
+				plan.response.status,
+				plan.batches
+					.iter()
+					.map(RecordBatch::num_rows)
+					.sum::<usize>(),
+				elapsed,
+				l2.take_log(),
+			)
+		};
+		// Undelayed, in real time: this also fills the slab's stats cache, so the
+		// delayed query makes record reads only. Its request count is not judged here.
+		let (status, rows, _, _) = run(0).await;
+		assert_eq!((status, rows), (ReadStatus::OK, 2));
+
+		let (status, rows, elapsed, asked) = run(100).await;
+		assert_eq!((status, rows), (ReadStatus::OK, 2), "{asked:?}");
+		assert_eq!(
+			asked,
+			[
+				Request::Head,
+				Request::Range(0, tiered.size),
+				Request::Head,
+				Request::Range(0, tiered.size),
+			]
+		);
+		assert!(
+			elapsed >= Duration::from_millis(400) && elapsed < Duration::from_millis(410),
+			"{elapsed:?}"
+		);
+	}
+
+	/// The mapping from object offsets to the tail window, on its own.
+	#[test]
+	fn a_range_is_covered_only_by_a_whole_tail_that_holds_all_of_it() {
+		use crate::storage::manager::covered_by_tail_for_test as covered;
+		// The whole object as its own tail.
+		assert_eq!(covered(0, 8_894, 8_894, &(72..8_280)), Some(72..8_280));
+		// A tail of a larger object: offsets are relative to its start.
+		assert_eq!(covered(1_000, 5_096, 4_096, &(1_000..1_010)), Some(0..10));
+		assert_eq!(
+			covered(1_000, 5_096, 4_096, &(5_000..5_096)),
+			Some(4_000..4_096)
+		);
+		// Starting before the tail, ending past the object, empty, or inverted.
+		assert_eq!(covered(1_000, 5_096, 4_096, &(999..1_010)), None);
+		assert_eq!(covered(1_000, 5_096, 4_096, &(5_000..5_097)), None);
+		assert_eq!(covered(1_000, 5_096, 4_096, &(2_000..2_000)), None);
+		#[allow(clippy::reversed_empty_ranges)]
+		let inverted = 3_000..2_000;
+		assert_eq!(covered(1_000, 5_096, 4_096, &inverted), None);
+		// A window of any other length than was asked for.
+		assert_eq!(covered(1_000, 5_096, 4_095, &(1_000..1_010)), None);
+		assert_eq!(covered(1_000, 5_096, 4_097, &(1_000..1_010)), None);
+		// A tail start past the object.
+		assert_eq!(covered(6_000, 5_096, 0, &(6_000..6_001)), None);
 	}
 }
 
