@@ -330,15 +330,234 @@ struct Member {
 	log: PathBuf,
 }
 
-/// This run's daemons. Dropping it kills every process group it started that is still alive,
-/// so a panic leaves nothing behind. It cannot act if this process is killed: the external
-/// owner covers that.
+/// Other hosts: with `WENDELON_SMOKE_NODE_CONTROL=<executable>` this test starts no daemon
+/// itself. Each node's directory (its configuration, certificates, keys and empty data
+/// directory, with nothing in its configuration pointing outside it) is handed to the
+/// executable once, and every later per-node action goes through it, each call bounded here
+/// and killed past its bound: `prepare <id> <dir>`, `start <id>`, `stop <id> <seconds>` (exit 0 only for
+/// an orderly stop with status 0 within that many seconds), `state <id>` (stdout `running`, or anything else),
+/// `inspect <id>` (`nilket wendelon inspect --json` on that host), `inventory <id>` (one
+/// `<bytes><TAB><path>` line per file of the node's data directory, then `END<TAB><count>`;
+/// it must fail on a symbolic link or on anything it cannot read), `sealed-root <id>` (the
+/// forming node's sealed root KEK file, raw), `cleanup <id>` (ends the node's owner if it is
+/// still there; removes no file). `WENDELON_SMOKE_NODE_ADDRESSES`
+/// (`1=host:port,2=host:port,3=host:port`) gives the advertised addresses; each node's
+/// health, ready and metrics listeners are on its own loopback at that port plus 10, 11, 12.
+fn node_control() -> Option<PathBuf> {
+	std::env::var_os("WENDELON_SMOKE_NODE_CONTROL")
+		.filter(|path| !path.is_empty())
+		.map(PathBuf::from)
+}
+
+/// A node-control call's bound, beyond whatever the action itself is given.
+const CONTROL_BOUND: Duration = Duration::from_secs(30);
+
+/// One node-control call: whether it succeeded, its stdout, and exit, stdout and stderr as
+/// text for a failure message. ONE bound covers the command, everything it started, and the
+/// reading of both its streams: the command runs in a process group of its own; at the bound
+/// the whole group is killed; a stream that is still open after that (or that could not be
+/// read) fails the call, and nothing waits for it. Success needs exit 0 AND both streams read
+/// to their end within the bound, so a cut-off output is never taken for a whole one.
+fn node_control_call(
+	control: &Path,
+	verb: &str,
+	id: u32,
+	argument: Option<&std::ffi::OsStr>,
+	bound: Duration,
+) -> (bool, Vec<u8>, String) {
+	let mut command = Command::new(control);
+	command.arg(verb).arg(id.to_string());
+	if let Some(argument) = argument {
+		command.arg(argument);
+	}
+	let mut child = command
+		.stdin(Stdio::null())
+		.stdout(Stdio::piped())
+		.stderr(Stdio::piped())
+		.process_group(0)
+		.spawn()
+		.unwrap_or_else(|error| panic!("run node-control {verb} {id}: {error}"));
+	let group = child.id();
+	// Each stream is read to its end on a thread of its own, which reports once.
+	let reader = |pipe: Option<Box<dyn std::io::Read + Send>>| {
+		let (sender, receiver) = std::sync::mpsc::channel();
+		std::thread::spawn(move || {
+			let mut bytes = Vec::new();
+			let read = match pipe {
+				Some(mut pipe) => pipe.read_to_end(&mut bytes).map(|_| bytes),
+				None => Ok(bytes),
+			};
+			let _ = sender.send(read);
+		});
+		receiver
+	};
+	let stdout = reader(child.stdout.take().map(|pipe| Box::new(pipe) as _));
+	let stderr = reader(child.stderr.take().map(|pipe| Box::new(pipe) as _));
+	let end = Instant::now() + bound;
+	let status = loop {
+		match child.try_wait().expect("wait for node-control") {
+			Some(status) => break Some(status),
+			None if Instant::now() >= end => break None,
+			None => std::thread::sleep(Duration::from_millis(20)),
+		}
+	};
+	// The streams, within what is left of the same bound. A descendant that keeps one open
+	// past it is killed with the group; a stream still open after that is abandoned, failed.
+	let left = |end: Instant| end.saturating_duration_since(Instant::now());
+	let mut out = stdout.recv_timeout(left(end));
+	let mut err = stderr.recv_timeout(left(end));
+	let cut = status.is_none() || out.is_err() || err.is_err();
+	if cut {
+		kill_group(group);
+		let _ = child.wait();
+		let grace = Instant::now() + Duration::from_secs(2);
+		if out.is_err() {
+			out = stdout.recv_timeout(left(grace));
+		}
+		if err.is_err() {
+			err = stderr.recv_timeout(left(grace));
+		}
+	}
+	let text =
+		|read: &Result<std::io::Result<Vec<u8>>, std::sync::mpsc::RecvTimeoutError>| match read {
+			Ok(Ok(bytes)) => String::from_utf8_lossy(bytes).trim().to_owned(),
+			Ok(Err(error)) => format!("<read failed: {error}>"),
+			Err(_) => "<still open after the bound and the kill>".to_owned(),
+		};
+	let raw = format!(
+		"node-control {verb} {id}: exit {status:?}{}; stdout: {}; stderr: {}",
+		if cut { " (CUT at its bound)" } else { "" },
+		text(&out),
+		text(&err)
+	);
+	let whole = !cut && matches!(err, Ok(Ok(_)));
+	match out {
+		Ok(Ok(bytes)) if whole && status.is_some_and(|status| status.success()) => {
+			(true, bytes, raw)
+		}
+		Ok(Ok(bytes)) => (false, bytes, raw),
+		_ => (false, Vec::new(), raw),
+	}
+}
+
+#[test]
+fn a_node_control_call_is_bounded_with_everything_it_started() {
+	use std::os::unix::fs::PermissionsExt as _;
+	let dir = std::env::temp_dir().join(format!("nilket-pd-control-{}", std::process::id()));
+	let _ = std::fs::remove_dir_all(&dir);
+	std::fs::create_dir_all(&dir).unwrap();
+	let script = |name: &str, body: &str| {
+		let path = dir.join(name);
+		std::fs::write(&path, format!("#!/bin/bash\n{body}\n")).unwrap();
+		std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+		path
+	};
+	// Whole: exit 0 and its output.
+	let (ok, stdout, raw) = node_control_call(
+		&script("whole", "echo \"$1 $2 $3\""),
+		"verb",
+		7,
+		Some(std::ffi::OsStr::new("extra")),
+		Duration::from_secs(5),
+	);
+	assert!(ok, "{raw}");
+	assert_eq!(stdout, b"verb 7 extra\n");
+	// A non-zero exit is a failure with its output kept for the message.
+	let (ok, _, raw) = node_control_call(
+		&script("fails", "echo said; exit 3"),
+		"verb",
+		7,
+		None,
+		Duration::from_secs(5),
+	);
+	assert!(!ok && raw.contains("said"), "{raw}");
+	// The command exits at once and leaves a descendant holding its output open for far
+	// longer than the bound: the call ends at the bound, failed, and does not wait for it.
+	let started = Instant::now();
+	let (ok, _, raw) = node_control_call(
+		&script("lingers", "echo early; sleep 30 &\nexit 0"),
+		"verb",
+		7,
+		None,
+		Duration::from_millis(500),
+	);
+	let took = started.elapsed();
+	assert!(!ok, "a cut-off stream was taken for a whole one: {raw}");
+	assert!(raw.contains("CUT at its bound"), "{raw}");
+	assert!(
+		took < Duration::from_secs(5),
+		"the call outlived its bound: {took:?}"
+	);
+	// The command itself never ends: killed at the bound.
+	let started = Instant::now();
+	let (ok, _, raw) = node_control_call(
+		&script("hangs", "sleep 30"),
+		"verb",
+		7,
+		None,
+		Duration::from_millis(300),
+	);
+	assert!(!ok && raw.contains("exit None"), "{raw}");
+	assert!(started.elapsed() < Duration::from_secs(5));
+	std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// This run's daemons: children of this test, or daemons on other hosts behind the node-control
+/// executable. Dropping it kills every local process group still alive and asks each host to
+/// end its node's owner, so a panic leaves no daemon behind. It cannot act if this process is
+/// killed: the external owners (here, and on each host) cover that.
 struct Daemons {
 	children: Vec<(u32, Child)>,
+	/// Other hosts only: the nodes handed to their host, and those started and not stopped.
+	prepared: Vec<u32>,
+	hosted: Vec<u32>,
 }
 
 impl Daemons {
+	/// Other hosts only: the host receives the node's directory, once.
+	fn prepare(&mut self, member: &Member) {
+		let Some(control) = node_control() else {
+			return;
+		};
+		self.prepared.push(member.id);
+		let dir = member.config.parent().unwrap();
+		let (ok, _, raw) = node_control_call(
+			&control,
+			"prepare",
+			member.id,
+			Some(dir.as_os_str()),
+			CONTROL_BOUND,
+		);
+		assert!(ok, "{raw}");
+	}
+
+	/// A daemon that should be running and is not, with what is known of why.
+	fn exited(&mut self) -> Option<String> {
+		if let Some(control) = node_control() {
+			for id in &self.hosted {
+				let (ok, stdout, raw) =
+					node_control_call(&control, "state", *id, None, CONTROL_BOUND);
+				if !ok || String::from_utf8_lossy(&stdout).trim() != "running" {
+					return Some(format!("node {id} is not running: {raw}"));
+				}
+			}
+			return None;
+		}
+		for (id, child) in &mut self.children {
+			if let Some(status) = child.try_wait().expect("poll a daemon") {
+				return Some(format!("node {id} exited {status}"));
+			}
+		}
+		None
+	}
+
 	fn start(&mut self, member: &Member) {
+		if let Some(control) = node_control() {
+			let (ok, _, raw) = node_control_call(&control, "start", member.id, None, CONTROL_BOUND);
+			assert!(ok, "{raw}");
+			self.hosted.push(member.id);
+			return;
+		}
 		let log = std::fs::OpenOptions::new()
 			.create(true)
 			.append(true)
@@ -359,6 +578,28 @@ impl Daemons {
 	/// An orderly stop of one node: SIGTERM, then its exit within the bound with status 0. A
 	/// node that has to be killed, or exits non-zero, fails the step.
 	fn stop(&mut self, id: u32, deadline: Instant) {
+		if let Some(control) = node_control() {
+			let at = self
+				.hosted
+				.iter()
+				.position(|node| *node == id)
+				.unwrap_or_else(|| panic!("node {id} is not running"));
+			self.hosted.remove(at);
+			// The stop's own budget is what is left of STOP_BOUND, in whole seconds, and the
+			// host is told it: a node that ends later than that has not stopped in order.
+			let left = STOP_BOUND.min(deadline.saturating_duration_since(Instant::now()));
+			let budget = left.as_secs().max(1).to_string();
+			let (ok, _, raw) = node_control_call(
+				&control,
+				"stop",
+				id,
+				Some(std::ffi::OsStr::new(&budget)),
+				left + CONTROL_BOUND,
+			);
+			eprintln!("smoke: {raw}");
+			assert!(ok, "node {id} did not stop in order on SIGTERM: {raw}");
+			return;
+		}
 		let at = self
 			.children
 			.iter()
@@ -387,6 +628,15 @@ impl Daemons {
 
 impl Drop for Daemons {
 	fn drop(&mut self) {
+		if let Some(control) = node_control() {
+			// Every node handed to a host, started or not: its owner is ended there.
+			for id in &self.prepared {
+				let (ok, _, raw) = node_control_call(&control, "cleanup", *id, None, CONTROL_BOUND);
+				if !ok {
+					eprintln!("smoke: CLEANUP NOT CONFIRMED: {raw}");
+				}
+			}
+		}
 		for (_, child) in &mut self.children {
 			if child.try_wait().ok().flatten().is_none() {
 				kill_group(child.id());
@@ -431,6 +681,20 @@ fn node_id_of(text: &str) -> Option<u32> {
 /// `nilket wendelon inspect --json` against one node's ready listener, as an operator. The
 /// child is killed if it has not exited within its bound, and then counts as not ready.
 fn inspect(member: &Member, pki: &Pki) -> Inspection {
+	if let Some(control) = node_control() {
+		let (ok, stdout, raw) = node_control_call(
+			&control,
+			"inspect",
+			member.id,
+			None,
+			INSPECT_BOUND + CONTROL_BOUND,
+		);
+		return Inspection {
+			ready: ok,
+			body: serde_json::from_slice(&stdout).ok(),
+			raw,
+		};
+	}
 	let mut child = Command::new(nilket_bin())
 		.args([
 			"wendelon",
@@ -487,13 +751,8 @@ fn wait_ready(member: &Member, pki: &Pki, daemons: &mut Daemons, deadline: Insta
 	let bound =
 		Instant::now() + READY_BOUND.min(deadline.saturating_duration_since(Instant::now()));
 	loop {
-		for (id, child) in &mut daemons.children {
-			if let Some(status) = child.try_wait().expect("poll a daemon") {
-				panic!(
-					"{what}: node {id} exited {status} while waiting for node {}",
-					member.id
-				);
-			}
+		if let Some(exited) = daemons.exited() {
+			panic!("{what}: {exited} while waiting for node {}", member.id);
 		}
 		let inspection = inspect(member, pki);
 		if inspection.ready && inspection.node_ids("cluster_members") == Some(NODES.to_vec()) {
@@ -592,8 +851,13 @@ async fn client_through(
 		Credential::Operator => (pki.operator_cert.clone(), pki.operator_key.clone()),
 		Credential::Storage => (pki.storage_cert.clone(), pki.storage_key.clone()),
 	};
+	// Loopback beside local daemons; any address when the daemons are on other hosts.
+	let bind = match node_control() {
+		Some(_) => "0.0.0.0:0",
+		None => "127.0.0.1:0",
+	};
 	let mut config = ClientConfig::new(
-		"127.0.0.1:0".parse().unwrap(),
+		bind.parse().unwrap(),
 		vec![BootstrapPeer {
 			node_id: member.id,
 			address: member.address.clone(),
@@ -968,17 +1232,53 @@ async fn form(deadline: Instant, store: Option<&StoreEnv>) -> Formed {
 			writeln!(map, "\"{id}\" = \"{}\"", hex(key)).unwrap();
 		}
 	}
-	let ports: Vec<u16> = NODES.iter().map(|_| reserve_shared_port()).collect();
-	let seed = format!("127.0.0.1:{}", ports[0]);
+	// Each node's advertised address and its health, ready and metrics listeners: reserved on
+	// loopback here, or given for other hosts (the three listeners then on the node's own
+	// loopback, beside its port).
+	let placed: Vec<(String, [String; 3])> = match node_control() {
+		None => NODES
+			.iter()
+			.map(|_| {
+				(
+					format!("127.0.0.1:{}", reserve_shared_port()),
+					[(); 3].map(|()| format!("127.0.0.1:{}", reserve_tcp_port())),
+				)
+			})
+			.collect(),
+		Some(_) => {
+			let given = required("WENDELON_SMOKE_NODE_ADDRESSES");
+			NODES
+				.iter()
+				.map(|id| {
+					let address = given
+						.split(',')
+						.filter_map(|pair| pair.split_once('='))
+						.find(|(node, _)| node.trim().parse() == Ok(*id))
+						.map(|(_, address)| address.trim().to_owned())
+						.unwrap_or_else(|| {
+							panic!("WENDELON_SMOKE_NODE_ADDRESSES names no node {id}")
+						});
+					let socket: std::net::SocketAddr = address.parse().unwrap_or_else(|_| {
+						panic!("node {id}: {address} is not an address and a port")
+					});
+					let side =
+						[10, 11, 12].map(|offset| format!("127.0.0.1:{}", socket.port() + offset));
+					(address, side)
+				})
+				.collect()
+		}
+	};
+	let seed = placed[0].0.clone();
 	let mut members = Vec::new();
 	// ADR 0726: one root KEK per cluster. Every member is given the same unlock
 	// secret; the sealed root itself is copied from the forming member below.
 	let unlock_secret = random32();
-	for ((id, secret), port) in NODES.iter().zip(&secrets).zip(&ports) {
+	for ((id, secret), (address, [health, ready, metrics])) in
+		NODES.iter().zip(&secrets).zip(&placed)
+	{
 		let dir = root.join(format!("node-{id}"));
 		std::fs::create_dir_all(dir.join("data")).unwrap();
 		write_private(&dir.join("kek-unlock"), &unlock_secret);
-		let (health, ready, metrics) = (reserve_tcp_port(), reserve_tcp_port(), reserve_tcp_port());
 		let cluster = if *id == NODES[0] {
 			"mode = \"bootstrap\"".to_owned()
 		} else {
@@ -987,12 +1287,49 @@ async fn form(deadline: Instant, store: Option<&StoreEnv>) -> Formed {
 				NODES[0]
 			)
 		};
-		let pki_dir = root.join("pki");
+		// Beside local daemons the certificates stay in the run's one directory. For another
+		// host the node's directory carries its own copies, named by relative paths: its
+		// certificate and key, both CAs, and the operator's certificate and key, with which
+		// that host runs `inspect` against the node's loopback ready listener.
+		let (pki_dir, node_ca, operator_ca) = match node_control() {
+			None => (
+				root.join("pki").display().to_string(),
+				pki.node_ca.display().to_string(),
+				pki.operator_ca.display().to_string(),
+			),
+			Some(_) => {
+				let tls = dir.join("tls");
+				std::fs::create_dir_all(&tls).unwrap();
+				std::fs::set_permissions(&tls, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+					.unwrap();
+				let from = root.join("pki");
+				for (name, private) in [
+					(format!("node-{id}.crt"), false),
+					(format!("node-{id}.key"), true),
+					("node-ca.crt".to_owned(), false),
+					("operator-ca.crt".to_owned(), false),
+					("operator.crt".to_owned(), false),
+					("operator.key".to_owned(), true),
+				] {
+					let bytes = std::fs::read(from.join(&name)).unwrap();
+					if private {
+						write_private(&tls.join(&name), &bytes);
+					} else {
+						std::fs::write(tls.join(&name), &bytes).unwrap();
+					}
+				}
+				(
+					"tls".to_owned(),
+					"tls/node-ca.crt".to_owned(),
+					"tls/operator-ca.crt".to_owned(),
+				)
+			}
+		};
 		let (storage, stall) = storage_section(&dir, store);
 		let body = format!(
 			r#"[node]
 node_id = {id}
-advertise_address = "127.0.0.1:{port}"
+advertise_address = "{address}"
 
 [cluster]
 {cluster}
@@ -1033,9 +1370,9 @@ operator_ca_path = "{operator_ca}"
 cluster_domain = "{DOMAIN}"
 
 [observability.listeners]
-health = "127.0.0.1:{health}"
-ready = "127.0.0.1:{ready}"
-metrics = "127.0.0.1:{metrics}"
+health = "{health}"
+ready = "{ready}"
+metrics = "{metrics}"
 "#,
 			lease = hex(secret.lease),
 			transfer = hex(secret.transfer),
@@ -1045,27 +1382,31 @@ metrics = "127.0.0.1:{metrics}"
 			trusted_transfer = trusted[1],
 			trusted_audit = trusted[2],
 			trusted_decision = trusted[3],
-			pki = pki_dir.display(),
-			node_ca = pki.node_ca.display(),
-			operator_ca = pki.operator_ca.display(),
+			pki = pki_dir,
 		);
 		write_private(&dir.join("wendelon.toml"), body.as_bytes());
 		members.push(Member {
 			id: *id,
 			config: dir.join("wendelon.toml"),
-			address: format!("127.0.0.1:{port}"),
-			ready: format!("127.0.0.1:{ready}"),
+			address: address.clone(),
+			ready: ready.clone(),
 			log: dir.join("daemon.log"),
 		});
 	}
 
 	let mut daemons = Daemons {
 		children: Vec::new(),
+		prepared: Vec::new(),
+		hosted: Vec::new(),
 	};
 	// Form the cluster before any write: ADR 0720 fixes the membership at the first one.
 	// The enrollment procedure of ADR 0726, as an operator performs it: start the
 	// forming member, copy its sealed root KEK file, owner-only, to the same path in
 	// each other member's empty data directory, then start those members in join mode.
+	// On other hosts the same procedure: the forming member's directory goes to its host and
+	// is started; its sealed root is read back from that host; the joiners' directories
+	// receive it here and only then go to their hosts.
+	daemons.prepare(&members[0]);
 	daemons.start(&members[0]);
 	let sealed_root = Path::new(".wendelon").join("local-sealed-root-kek.bin");
 	let forming_root = root
@@ -1074,8 +1415,16 @@ metrics = "127.0.0.1:{metrics}"
 		.join(&sealed_root);
 	let sealed = loop {
 		// The file is created and written in one step; a complete one is 104 bytes.
-		match std::fs::read(&forming_root) {
-			Ok(bytes) if bytes.len() == 104 => break bytes,
+		let read = match node_control() {
+			None => std::fs::read(&forming_root).ok(),
+			Some(control) => {
+				let (ok, bytes, _) =
+					node_control_call(&control, "sealed-root", NODES[0], None, CONTROL_BOUND);
+				ok.then_some(bytes)
+			}
+		};
+		match read {
+			Some(bytes) if bytes.len() == 104 => break bytes,
 			_ => {}
 		}
 		assert!(
@@ -1092,6 +1441,8 @@ metrics = "127.0.0.1:{metrics}"
 		std::fs::create_dir_all(target.parent().unwrap()).unwrap();
 		write_private(&target, &sealed);
 	}
+	daemons.prepare(&members[1]);
+	daemons.prepare(&members[2]);
 	daemons.start(&members[1]);
 	daemons.start(&members[2]);
 	for member in &members {
@@ -1520,6 +1871,62 @@ fn only_a_slab_named_file_keeps_a_slab_on_disk() {
 	assert_eq!(offloaded[2], (Vec::new(), 0));
 }
 
+/// The file names of a host's inventory: one `<bytes><TAB><path>` line per file, then a last
+/// line `END<TAB><count>` with the number of file lines. A line of any other shape, a missing
+/// or wrong END line, or anything after it is an error: an output that was cut short, or a
+/// listing its producer could not finish, proves nothing absent.
+fn inventory_names(text: &str) -> Result<Vec<String>, String> {
+	let mut lines: Vec<&str> = text.lines().collect();
+	let end = lines.pop().ok_or("no END line")?;
+	let count: usize = end
+		.strip_prefix("END\t")
+		.and_then(|count| count.parse().ok())
+		.ok_or_else(|| format!("the last line is not END with a count: {end:?}"))?;
+	if count != lines.len() {
+		return Err(format!("END names {count} files, {} listed", lines.len()));
+	}
+	lines
+		.into_iter()
+		.map(|line| {
+			let (bytes, path) = line
+				.split_once('\t')
+				.ok_or_else(|| format!("a line without a tab: {line:?}"))?;
+			bytes
+				.parse::<u64>()
+				.map_err(|_| format!("a line without a size: {line:?}"))?;
+			let name = path.rsplit('/').next().unwrap_or(path);
+			if name.is_empty() {
+				return Err(format!("a line without a file name: {line:?}"));
+			}
+			Ok(name.to_owned())
+		})
+		.collect()
+}
+
+#[test]
+fn a_hosts_inventory_is_read_whole_or_not_at_all() {
+	assert_eq!(
+		inventory_names(
+			"8192\tslab_000000000000003e.wnd\n104\t.wendelon/local-sealed-root-kek.bin\nEND\t2\n"
+		),
+		Ok(vec![
+			"slab_000000000000003e.wnd".to_owned(),
+			"local-sealed-root-kek.bin".to_owned()
+		])
+	);
+	assert_eq!(inventory_names("END\t0\n"), Ok(Vec::new()));
+	// Cut short: no END, or fewer lines than END names, or more.
+	assert!(inventory_names("").is_err());
+	assert!(inventory_names("8192\tslab_0000000000000001.wnd\n").is_err());
+	assert!(inventory_names("8192\tslab_0000000000000001.wnd\nEND\t2\n").is_err());
+	assert!(inventory_names("8192\ta\n8192\tb\nEND\t1\n").is_err());
+	// Other shapes.
+	assert!(inventory_names("8192 slab_0000000000000001.wnd\nEND\t1\n").is_err());
+	assert!(inventory_names("many\tslab_0000000000000001.wnd\nEND\t1\n").is_err());
+	assert!(inventory_names("12\tdir/\nEND\t1\n").is_err());
+	assert!(inventory_names("L\tslab_0000000000000001.wnd\nEND\t1\n").is_err());
+}
+
 /// The store's listing of the run's prefix and every node's data directory, at one moment.
 /// The test's own listing, straight to the store: it is not an observation of any daemon's
 /// request.
@@ -1547,8 +1954,23 @@ impl Snapshot {
 		let mut files = Vec::new();
 		for member in &formed.members {
 			let mut names = Vec::new();
-			file_names(&member.config.parent().unwrap().join("data"), &mut names)
-				.map_err(|why| format!("node {}'s data directory: {why}", member.id))?;
+			match node_control() {
+				None => file_names(&member.config.parent().unwrap().join("data"), &mut names)
+					.map_err(|why| format!("node {}'s data directory: {why}", member.id))?,
+				// The host's own whole listing of the node's data directory, or no snapshot:
+				// a call that fails, or a line that is not `<bytes><TAB><path>`, is an error.
+				Some(control) => {
+					let (ok, stdout, raw) =
+						node_control_call(&control, "inventory", member.id, None, CONTROL_BOUND);
+					if !ok {
+						return Err(format!("node {}'s data directory: {raw}", member.id));
+					}
+					let text = String::from_utf8(stdout)
+						.map_err(|_| format!("node {}'s inventory is not text", member.id))?;
+					names = inventory_names(&text)
+						.map_err(|why| format!("node {}'s inventory: {why}", member.id))?;
+				}
+			}
 			files.push((member.id, names));
 		}
 		Ok(Self {
@@ -1741,7 +2163,8 @@ async fn three_daemons_offload_to_the_object_store_and_serve_their_rows_across_r
 	}
 	assert!(Instant::now() < deadline, "the test overran its bound");
 	// Each daemon's log is part of the record: kept when a record directory is given.
-	if let Ok(record) = std::env::var("WENDELON_SMOKE_RECORD_DIR") {
+	// On other hosts the logs are on those hosts; whoever launched the run collects them.
+	if let (Ok(record), None) = (std::env::var("WENDELON_SMOKE_RECORD_DIR"), node_control()) {
 		for member in &formed.members {
 			std::fs::copy(
 				&member.log,
@@ -1843,10 +2266,8 @@ async fn offloaded_by_every_owner(
 ) {
 	let by = Instant::now() + TIER_BOUND.min(deadline.saturating_duration_since(Instant::now()));
 	loop {
-		for (id, child) in &mut formed.daemons.children {
-			if let Some(status) = child.try_wait().expect("wait for the daemon") {
-				panic!("{what}: node {id} exited {status}");
-			}
+		if let Some(exited) = formed.daemons.exited() {
+			panic!("{what}: {exited}");
 		}
 		let snapshot = Snapshot::take(formed, objects, deadline).await;
 		snapshot.report(what);
