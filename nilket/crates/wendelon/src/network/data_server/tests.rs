@@ -19231,10 +19231,12 @@ async fn each_today_lease_request_is_stamped_when_it_is_made() {
 	let (low, high) = node.ring.snapshot().primary_ranges_for(node.local_node)[0];
 	let mut starts = Vec::new();
 	for _ in 0..3 {
-		assert!(
+		let pass = crate::network::data_server::lease_pass::RenewalPass::begin(3_000);
+		assert_eq!(
 			node.data_server
-				.renew_lease_range(low, high, epoch, &clock, 3_000, leader)
-				.await
+				.renew_lease_range(low, high, epoch, &clock, 3_000, leader, &pass)
+				.await,
+			lease_pass::RangeRenewal::Granted
 		);
 		let applied = node
 			.state_machine
@@ -19248,6 +19250,94 @@ async fn each_today_lease_request_is_stamped_when_it_is_made() {
 		starts.push(applied.unwrap());
 	}
 	assert_eq!(starts, vec![start, start + 50, start + 100]);
+}
+
+/// ADR 0734, Today: a renewal pass has one budget and leaves a continuation when it ends by
+/// it. One real node that leads itself, its own lease manager stopped, so the test alone
+/// runs passes.
+#[tokio::test]
+async fn a_today_renewal_pass_is_bounded_and_continues_from_its_cursor() {
+	let dir = bootstrap_tempdir("today-renewal-budget");
+	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+		16,
+		dir.to_path_buf(),
+		"127.0.0.1:0".into(),
+	))
+	.await
+	.unwrap();
+	let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+	while node.raft.current_leader().await != Some(node.local_node.id) {
+		assert!(tokio::time::Instant::now() < deadline, "no leader");
+		tokio::time::sleep(Duration::from_millis(20)).await;
+	}
+	node.handles.lease_manager.abort();
+	let server = &node.data_server;
+	let mut ranges = node.ring.snapshot().primary_ranges_for(node.local_node);
+	ranges.sort_unstable();
+	assert!(!ranges.is_empty());
+	let last = ranges[ranges.len() - 1].0;
+	let epoch = node.ring.snapshot().epoch();
+	let leader = node.raft.current_leader().await;
+	let starts_cached = |server: &WendelonDataServer| {
+		let mut starts: Vec<(u64, u64)> = server
+			.cached_leases_for_test()
+			.iter()
+			.map(|lease| (lease.range_start, lease.lease_start.physical_ms))
+			.collect();
+		starts.sort_unstable();
+		starts
+	};
+
+	// A whole pass inside its budget: every range granted, no continuation left, even from
+	// a cursor naming a range this node does not hold.
+	server.set_lease_renewal_cursor_for_test(last.checked_add(1));
+	let granted = server
+		.refresh_leases_once(&node.ring, &*node.clock, 60_000)
+		.await;
+	assert_eq!(granted, ranges.len());
+	assert_eq!(server.lease_renewal_cursor_for_test(), None);
+	let cached = starts_cached(server);
+	assert_eq!(cached.len(), ranges.len());
+
+	// No budget at all: the pass ends before it has read anything it may act on. Nothing is
+	// attempted, nothing cached or cleared, and the continuation it found is kept.
+	server.set_lease_renewal_cursor_for_test(Some(last));
+	let granted = server
+		.refresh_leases_once(&node.ring, &*node.clock, 0)
+		.await;
+	assert_eq!(granted, 0);
+	assert_eq!(server.lease_renewal_cursor_for_test(), Some(last));
+	assert_eq!(starts_cached(server), cached);
+
+	// One range under a budget already spent: its own commit is not waited for, the answer
+	// is "unanswered" (not a denial), and nothing new is cached from it.
+	let spent = crate::network::data_server::lease_pass::RenewalPass::begin(0);
+	let (low, high) = ranges[0];
+	let outcome = server
+		.renew_lease_range(low, high, epoch, &*node.clock, 60_000, leader, &spent)
+		.await;
+	assert!(
+		matches!(outcome, lease_pass::RangeRenewal::Unanswered(_)),
+		"{outcome:?}"
+	);
+	assert_eq!(starts_cached(server), cached);
+
+	// The next pass, with its budget, begins at the cursor and renews every range; the
+	// request dropped above, whatever became of it, changes nothing it needs.
+	let granted = server
+		.refresh_leases_once(&node.ring, &*node.clock, 60_000)
+		.await;
+	assert_eq!(granted, ranges.len());
+	assert_eq!(server.lease_renewal_cursor_for_test(), None);
+	let renewed = starts_cached(server);
+	assert_eq!(renewed.len(), ranges.len());
+	assert!(
+		renewed
+			.iter()
+			.zip(&cached)
+			.all(|(after, before)| after.0 == before.0 && after.1 >= before.1),
+		"a renewal never moves a lease's start back: {cached:?} then {renewed:?}"
+	);
 }
 
 /// A Today table write waits, bounded, at its lease gate for a lease that is temporarily

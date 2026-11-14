@@ -10,7 +10,7 @@ use crate::schema::{
 
 /// ADR 0729: a range this node asks a lease for, and the generation of the
 /// lineage it holds there (`None`: its own primary range, with no lineage).
-pub(super) type LeaseTarget = (u64, u64, Option<u64>);
+pub(crate) type LeaseTarget = (u64, u64, Option<u64>);
 
 impl WendelonDataServer {
 	/// ADR 0729: what this node asks leases for, from applied state: every
@@ -86,6 +86,11 @@ impl WendelonDataServer {
 	/// One pass's renewals, a chunk at a time. Each chunk is stamped from the
 	/// clock when it is built, never from a reading reused across a wait. Only a
 	/// fully validated response updates the cache.
+	///
+	/// ADR 0734: the chunks are cut from this pass's walk, which begins where the
+	/// last pass left off; each chunk's wait runs under `pass`, and one that is
+	/// not answered inside the budget ends the pass with the chunks after it left
+	/// for the next. Leases cached from earlier chunks stay.
 	pub(super) async fn renew_leases_batched(
 		&self,
 		ranges: &[LeaseTarget],
@@ -93,6 +98,7 @@ impl WendelonDataServer {
 		clock: &dyn PhysicalClock,
 		ttl_ms: u32,
 		current_leader: Option<u32>,
+		pass: &lease_pass::RenewalPass,
 	) -> usize {
 		let Some(leader) = current_leader else {
 			return 0;
@@ -105,18 +111,35 @@ impl WendelonDataServer {
 		{
 			return 0;
 		}
+		let walk = lease_pass::walk_from(ranges, |target| target.0, self.lease_renewal_cursor());
+		let starts: Vec<u64> = walk.iter().map(|target| target.0).collect();
 		let mut granted = 0usize;
-		for chunk in ranges.chunks(MAX_LEASES_PER_BATCH) {
+		let mut attempted = 0usize;
+		for chunk in walk.chunks(MAX_LEASES_PER_BATCH) {
+			if pass.expired() {
+				self.end_renewal_pass_at(&starts, lease_pass::Stopped::Before(attempted));
+				self.renewal_pass_expired(
+					pass,
+					epoch,
+					"before the next batch",
+					walk.len() - attempted,
+				);
+				return granted;
+			}
+			let unit = attempted;
+			attempted += chunk.len();
 			let requested_hlc = HybridTimestamp {
 				physical_ms: clock.now_ms(),
 				logical: 0,
 				node_id: self.local_node.id,
 			};
-			let outcome = if leader == self.local_node.id {
-				self.propose_own_leases(chunk, epoch, requested_hlc, ttl_ms)
+			// The clock is read after the answer and before anything is cached: an
+			// answer that completes after the deadline is not accepted.
+			let answered = if leader == self.local_node.id {
+				pass.bounded(self.propose_own_leases(chunk, epoch, requested_hlc, ttl_ms))
 					.await
 			} else {
-				self.request_remote_leases(
+				pass.bounded(self.request_remote_leases(
 					NodeId {
 						id: leader,
 						_reserved: 0,
@@ -125,8 +148,24 @@ impl WendelonDataServer {
 					epoch,
 					requested_hlc,
 					ttl_ms,
-				)
+				))
 				.await
+			};
+			let Some(outcome) = answered else {
+				self.end_renewal_pass_at(
+					&starts,
+					lease_pass::Stopped::Unanswered {
+						unit,
+						next: attempted,
+					},
+				);
+				let waited_on = if leader == self.local_node.id {
+					"its own commit of a batch of grants".to_owned()
+				} else {
+					format!("the control leader, node {leader}")
+				};
+				self.renewal_pass_expired(pass, epoch, &waited_on, walk.len() - attempted);
+				return granted;
 			};
 			match outcome {
 				Ok(leases) => {
@@ -147,7 +186,29 @@ impl WendelonDataServer {
 				}
 			}
 		}
+		self.set_lease_renewal_cursor(None);
 		granted
+	}
+
+	/// Test seam: this node's renewal targets from the applied state.
+	#[cfg(test)]
+	pub(crate) async fn decision_lease_targets_for_test(&self) -> Vec<LeaseTarget> {
+		self.decision_lease_targets(Vec::new()).await
+	}
+
+	/// Test seam: the batched renewals of one pass, under a budget the test supplies.
+	#[cfg(test)]
+	pub(crate) async fn renew_leases_batched_for_test(
+		&self,
+		targets: &[LeaseTarget],
+		epoch: u64,
+		clock: &dyn PhysicalClock,
+		ttl_ms: u32,
+		current_leader: Option<u32>,
+		pass: &lease_pass::RenewalPass,
+	) -> usize {
+		self.renew_leases_batched(targets, epoch, clock, ttl_ms, current_leader, pass)
+			.await
 	}
 
 	/// The leader's own chunk: signed and proposed as one entry.
@@ -193,6 +254,14 @@ impl WendelonDataServer {
 			.client_write(WendelonRequest::AcquireLeases(batch))
 			.await
 			.map_err(|error| Error::other(format!("AcquireLeases commit failed: {error}")))?;
+		#[cfg(test)]
+		{
+			let gate = self.decisions.hold_lease_answer.lock().unwrap().clone();
+			if let Some((applied, release)) = gate {
+				applied.notify_one();
+				release.notified().await;
+			}
+		}
 		let WendelonResponse::LeaseResults(results) = response.data else {
 			return Err(Error::other(format!(
 				"AcquireLeases was not applied: {:?}",

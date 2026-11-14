@@ -94,7 +94,7 @@ async fn candidates_after(
 }
 
 /// The control leader the running nodes agree on, which must not be `not`.
-async fn agreed_leader_other_than(cluster: &Cluster, not: u32) -> u32 {
+pub(super) async fn agreed_leader_other_than(cluster: &Cluster, not: u32) -> u32 {
 	let deadline = tokio::time::Instant::now() + BOUND;
 	loop {
 		let mut seen = std::collections::BTreeSet::new();

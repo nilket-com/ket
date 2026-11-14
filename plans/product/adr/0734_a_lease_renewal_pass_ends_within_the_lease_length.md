@@ -1,6 +1,6 @@
 # ADR 0734: a lease renewal pass ends within the lease length
 
-Status: accepted for implementation, 2026-11-14. Not delivered; the plan stays off main until its reviewed implementation follows. Defect DC-237, which this narrows and does not close.
+Status: accepted for delivery, 2026-11-14, under the candidate-specific owning-scenario exception recorded below. Defect DC-237 remains open.
 
 ## Why
 - A node's lease manager runs one renewal pass at a time: `run_lease_refresh_schedule` awaits a pass before it can take another timer or epoch wake. A pass reads the control leader once (`refresh_leases_once`) and then, range by range (Today) or batch by batch (ParentDecisions), either asks that leader (`request_remote_leases`, and Today's per-range request: connection, stream open, write, finish, read) or, when it is the leader, commits the grant itself (`client_write`). None of those waits has a deadline.
@@ -45,3 +45,12 @@ Cost: product delta under about 100 lines (network/data_server.rs, lease_batch.r
 
 ## Stop points
 Plan review → implementation with the corrected RED first → source review → the whole-crate run and the one three-host execution → delivery ruling.
+
+## Delivery evidence and exception (2026-11-14)
+- Focused controls: 51/51 passed, including renewal after the held old-leader route, cursor progress, no poll with an expired budget, and an actually applied grant whose answer was withheld without updating the cache. These are controlled mechanism results, not attribution of the real-host failure.
+- One whole-crate/client checkpoint on the reviewed implementation 4ad0a0d07 passed 4724/4724 (27 skipped), default concurrency, test temporary files on tmpfs and build target on disk; the Toron test-build check succeeded. This is one sample. The final delivery adds only this ADR record to that reviewed implementation, with no product/test source change; no gate was repeated for the record.
+- The required three-host serving-node-loss execution at declared consensus base 250 ms and query stall bound 2000 ms was FAILED overall. Record: `pd-3host-offload-20261114T230920Z-58c898e5`; seal `8e68a8c9fe31e5780b0b3aaf6792ba63d595f6139bc47b1dbbba868fcb3c690e`. It used the reviewed implementation with only the previously reviewed survivability test composed on top.
+- Before the kill, all 64 writes were acknowledged on their first offer, all three owners met the aggregate offload check, and the exact query passed. The serving node, named control leader by all three before the kill, was confirmed ended by SIGKILL.
+- The outage stage PASSED once: the original new-row operation committed on its first offer at 12.029 s after confirmed kill, both survivors were Ready at 13.299 s, and an exact read of all 65 acknowledged rows completed at 13.555 s through node 3, with the killed node still down and survivors unchanged. No refusal, replacement or re-offer occurred. This is one stage observation, not a rate, validated latency envelope or causal before/after comparison.
+- The return stage FAILED: the killed node restarted on its own files but did not become Ready within 60 s (`CertifiedBaseUnvalidated`, no leader in the last readiness answer). The final read was not reached. Its returning-node log/election/replication behavior and recovery-integrity warning remain unattributed; acknowledged-data loss was not demonstrated.
+- Codex authorized delivery of this exact reviewed bounded-renewal change with the full owning scenario explicitly carried as FAILED. This is a candidate-specific exception, not an acceptance pass or a general exception for later changes. The survivability test stays local pending a complete scenario pass. All earlier failures remain recorded; DC-237, section 8 memory (FAILED and unwaived), member replacement and backup/restore remain open. Raw logs, keys and run artifacts stay outside git.

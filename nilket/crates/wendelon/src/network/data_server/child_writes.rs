@@ -988,6 +988,12 @@ pub(crate) struct DecisionPeer {
 	/// that cannot act.
 	#[cfg(test)]
 	pub(crate) pause_takeover: Arc<std::sync::atomic::AtomicBool>,
+	/// Test-only (ADR 0734): when set, this store's own lease batch, once it HAS been
+	/// committed and applied, signals the first notifier and then waits on the second before
+	/// it returns its answer: a grant that applied with its answer withheld.
+	#[cfg(test)]
+	pub(crate) hold_lease_answer:
+		Arc<std::sync::Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>>,
 	/// Test-only: a KV key read as if at another position, the seam for a
 	/// different key at the same position.
 	#[cfg(test)]
@@ -1151,6 +1157,8 @@ impl Default for DecisionPeer {
 			pause_lease_refresh: Default::default(),
 			#[cfg(test)]
 			pause_takeover: Default::default(),
+			#[cfg(test)]
+			hold_lease_answer: Default::default(),
 			#[cfg(test)]
 			kv_position_override: Default::default(),
 		}

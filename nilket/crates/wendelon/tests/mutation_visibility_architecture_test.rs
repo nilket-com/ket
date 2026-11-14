@@ -5982,7 +5982,9 @@ fn root2_carrier_is_bounded_private_held_and_response_mappings_are_explicit() {
 	for (path, count) in [
 		("node.rs", 2),
 		("network/control_server.rs", 11),
-		("network/data_server.rs", 2),
+		("network/data_server.rs", 1),
+		// ADR 0734 moved the per-range lease renewal, with its arm, here.
+		("network/data_server/lease_pass.rs", 1),
 	] {
 		let source = fs::read_to_string(src.join(path)).unwrap();
 		assert_eq!(

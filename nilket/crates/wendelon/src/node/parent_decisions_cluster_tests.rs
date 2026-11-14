@@ -6731,6 +6731,8 @@ mod attempt_exhaustion;
 mod offload;
 
 /// ADR 0733: the remote requests of one query.
+#[path = "parent_decisions_cluster_tests/lease_renewal.rs"]
+mod lease_renewal;
 #[path = "parent_decisions_cluster_tests/query_tails.rs"]
 mod query_tails;
 

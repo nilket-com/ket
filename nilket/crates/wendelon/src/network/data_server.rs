@@ -242,6 +242,7 @@ use mutation_protocol::{TableAdmissionError, mutation_expiry_response};
 mod streaming;
 // ADR 0701: a ParentDecisions holder's batched lease renewal.
 mod lease_batch;
+pub(crate) mod lease_pass;
 use counter::{CounterParticipantFactory, CounterReplicaNetworkTransport};
 use descriptor_migration::MigrationRegistry;
 
@@ -853,6 +854,9 @@ pub struct WendelonDataServer {
 	/// / RF) leases, so a linear scan is cheap and overlap-free
 	/// by construction (the state machine rejects overlaps on grant).
 	leases: Arc<RwLock<Vec<LeaseDescriptor>>>,
+	/// ADR 0734: where the next renewal pass begins, when the last one ended by its budget:
+	/// a range start. Advisory: read and written whole, never held across a wait.
+	lease_renewal_cursor: Arc<StdMutex<Option<u64>>>,
 	/// Counts the grants `cache_granted_lease` has cached. A write waiting at the
 	/// lease gate wakes on it.
 	lease_grants: watch::Sender<u64>,
@@ -1249,6 +1253,7 @@ impl Clone for WendelonDataServer {
 			hlc: self.hlc.clone(),
 			tracker: self.tracker.clone(),
 			leases: self.leases.clone(),
+			lease_renewal_cursor: self.lease_renewal_cursor.clone(),
 			lease_grants: self.lease_grants.clone(),
 			lease_gate_enabled: self.lease_gate_enabled,
 			decision_mode: self.decision_mode,
@@ -2313,6 +2318,7 @@ impl WendelonDataServer {
 			hlc,
 			tracker: None,
 			leases: Arc::new(RwLock::new(Vec::new())),
+			lease_renewal_cursor: Arc::new(StdMutex::new(None)),
 			lease_grants: watch::Sender::new(0),
 			lease_gate_enabled: false,
 			decision_mode: Default::default(),
@@ -3801,6 +3807,8 @@ impl WendelonDataServer {
 		ttl_ms: u32,
 	) -> usize {
 		metrics().data_ring_lease_refresh_passes_total.inc();
+		// ADR 0734: one budget for everything this pass waits on.
+		let pass = lease_pass::RenewalPass::begin(ttl_ms);
 		let snapshot = ring.snapshot();
 		let epoch = snapshot.epoch();
 		let ranges = snapshot.primary_ranges_for(self.local_node);
@@ -3813,145 +3821,28 @@ impl WendelonDataServer {
 				.set(guard.len() as u64);
 		}
 
-		let current_leader = self.raft.current_leader().await;
+		// Expiry before any target is attempted leaves the continuation as it was.
+		let Some(current_leader) = pass.bounded(self.raft.current_leader()).await else {
+			self.renewal_pass_expired(&pass, epoch, "reading the control leader", ranges.len());
+			return 0;
+		};
 		// ADR 0701: ParentDecisions renews a holder's ranges in one bounded entry
 		// per pass; Today renews one range at a time. Every request is stamped
 		// when it is made, never from a reading reused across a wait.
 		if self.parent_decisions() {
 			// ADR 0729: the ranges whose lineage this node holds, each named by
 			// its generation, plus its primary ranges that have no lineage.
-			let targets = self.decision_lease_targets(ranges).await;
+			let held = ranges.len();
+			let Some(targets) = pass.bounded(self.decision_lease_targets(ranges)).await else {
+				self.renewal_pass_expired(&pass, epoch, "reading the applied lineages", held);
+				return 0;
+			};
 			return self
-				.renew_leases_batched(&targets, epoch, clock, ttl_ms, current_leader)
+				.renew_leases_batched(&targets, epoch, clock, ttl_ms, current_leader, &pass)
 				.await;
 		}
-		let mut granted = 0usize;
-		for (range_start, range_end) in ranges {
-			if self
-				.renew_lease_range(range_start, range_end, epoch, clock, ttl_ms, current_leader)
-				.await
-			{
-				granted += 1;
-			}
-		}
-		granted
-	}
-
-	/// One range's lease renewal, stamped from the clock when it is requested.
-	async fn renew_lease_range(
-		&self,
-		range_start: u64,
-		range_end: u64,
-		epoch: u64,
-		clock: &dyn PhysicalClock,
-		ttl_ms: u32,
-		current_leader: Option<u32>,
-	) -> bool {
-		let now_ms = clock.now_ms();
-		let now_hlc = HybridTimestamp {
-			physical_ms: now_ms,
-			logical: 0,
-			node_id: self.local_node.id,
-		};
-		let expiry_hlc = HybridTimestamp {
-			physical_ms: now_ms.saturating_add(ttl_ms as u64),
-			logical: 0,
-			node_id: self.local_node.id,
-		};
-		let request = AcquireLeaseRequestMeta {
-			range_start,
-			range_end,
-			epoch,
-			holder: self.local_node,
-			requested_hlc: now_hlc,
-			ttl_ms,
-			_pad: 0,
-		};
-		let outcome = if current_leader == Some(self.local_node.id) {
-			let lease = self.make_signed_lease(
-				epoch,
-				self.local_node,
-				range_start,
-				range_end,
-				now_hlc,
-				expiry_hlc,
-			);
-			match self
-				.raft
-				.client_write(WendelonRequest::AcquireLease(lease))
-				.await
-			{
-				Ok(resp) => match resp.data {
-					WendelonResponse::Success => Ok(LeaseAcquireOutcome::Granted(lease)),
-					WendelonResponse::LeaseDenied => {
-						Ok(LeaseAcquireOutcome::Denied(LeaseStatus::DENIED_OVERLAP))
-					}
-					WendelonResponse::Error(message) => Err(Error::new(
-						ErrorKind::Other,
-						format!("lease manager: state machine rejected AcquireLease: {message}"),
-					)),
-					WendelonResponse::Refused(refusal) => Err(Error::other(format!(
-						"unexpected slab refusal for a non-slab command: {refusal:?}"
-					))),
-					unexpected @ (WendelonResponse::Op(_)
-					| WendelonResponse::Decision(_)
-					| WendelonResponse::LeaseResults(_)) => Err(Error::other(format!(
-						"unexpected response to this command: {unexpected:?}"
-					))),
-					WendelonResponse::Root2Dormant => Err(Error::other("Root2 carrier is dormant")),
-				},
-				Err(err) => Err(Error::new(
-					ErrorKind::Other,
-					format!("lease manager: local AcquireLease commit failed: {err}"),
-				)),
-			}
-		} else if let Some(leader_id) = current_leader {
-			self.request_remote_lease(
-				NodeId {
-					id: leader_id,
-					_reserved: 0,
-				},
-				request,
-			)
+		self.renew_ranges(ranges, epoch, clock, ttl_ms, current_leader, &pass)
 			.await
-		} else {
-			return false;
-		};
-		match outcome {
-			Ok(LeaseAcquireOutcome::Granted(lease)) => {
-				if Some(lease.issuer.id) == current_leader
-					&& self.lease_authority.verify_lease(&lease).is_ok()
-				{
-					self.cache_granted_lease(lease);
-					metrics().data_ring_lease_grants_total.inc();
-					return true;
-				} else {
-					tracing::warn!(
-						range_start,
-						range_end,
-						epoch,
-						"lease manager: leader returned an invalidly signed lease"
-					);
-				}
-			}
-			Ok(LeaseAcquireOutcome::Denied(_status)) => {
-				metrics().data_ring_lease_denials_total.inc();
-				// Another holder (or a stale-epoch request)
-				// blocks us — skip, keep the old entry if any.
-				// The next tick retries.
-			}
-			Err(e) => {
-				metrics().data_ring_lease_errors_total.inc();
-				tracing::warn!(
-					range_start,
-					range_end,
-					epoch,
-					error = %e,
-					"lease manager: client_write failed; will retry next tick"
-				);
-			}
-		}
-		false
 	}
 
 	/// Spawn the lease manager background task. Fires on every
