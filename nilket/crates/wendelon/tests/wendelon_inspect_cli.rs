@@ -98,6 +98,7 @@ fn ready_snapshot() -> ReadinessSnapshot {
 		fips_mode: cfg!(feature = "fips"),
 		fips_self_test_last_ts: cfg!(feature = "fips").then_some(1_710_000_000),
 		control_retention: RetentionStatus::compacting(),
+		consensus_timing: wendelon::consensus::ConsensusTimingStatus::default_profile(),
 	}
 }
 
@@ -191,6 +192,15 @@ async fn wendelon_inspect_json_mode_preserves_ready_body() {
 		"{stdout}"
 	);
 	assert!(stdout.contains("\"degraded_reason\":null"), "{stdout}");
+	// The node's effective consensus timing profile is part of the forwarded body.
+	let body: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+	assert_eq!(
+		body["consensus_timing"],
+		serde_json::json!({
+			"base_millis": 50, "heartbeat_millis": 50, "election_min_millis": 150,
+			"election_max_millis": 300, "snapshot_chunk_millis": 200
+		})
+	);
 
 	shutdown(handles).await;
 }

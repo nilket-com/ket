@@ -2198,6 +2198,52 @@ fn out_of_range_counter_retention_is_refused_at_startup() {
 	load_node_bootstrap_config(write_config(&root, &body)).unwrap();
 }
 
+/// `tuning.consensus_timing_base_millis`: absent is the default profile, an accepted value
+/// is carried, and a value outside 10..=1000 refuses the configuration with the range named.
+#[test]
+fn the_consensus_timing_base_loads_defaults_and_is_refused_outside_its_range() {
+	let with_base = |tag: &str, line: &str| {
+		let root = fresh_dir(tag);
+		std::fs::create_dir_all(root.join("data")).unwrap();
+		let example = render_example_config();
+		let marker = "consensus_timing_base_millis = 50";
+		assert_eq!(example.matches(marker).count(), 1);
+		let body = example.replace(marker, line);
+		let loaded = load_node_bootstrap_config(write_config(&root, &body));
+		(root, loaded)
+	};
+	let (_root, absent) = with_base("consensus-timing-absent", "");
+	assert_eq!(absent.unwrap().consensus_timing.base_millis(), 50);
+	let (_root, example) = with_base(
+		"consensus-timing-example",
+		"consensus_timing_base_millis = 50",
+	);
+	assert_eq!(
+		example.unwrap().consensus_timing,
+		wendelon::consensus::ConsensusTiming::default()
+	);
+	for accepted in [10_u64, 250, 1000] {
+		let (_root, loaded) = with_base(
+			&format!("consensus-timing-{accepted}"),
+			&format!("consensus_timing_base_millis = {accepted}"),
+		);
+		assert_eq!(loaded.unwrap().consensus_timing.base_millis(), accepted);
+	}
+	for refused in ["0", "9", "1001", "9223372036854775807"] {
+		let (_root, loaded) = with_base(
+			&format!("consensus-timing-refused-{refused}"),
+			&format!("consensus_timing_base_millis = {refused}"),
+		);
+		let err = loaded.unwrap_err();
+		assert_eq!(err.kind(), ErrorKind::InvalidInput, "{refused}: {err}");
+		assert!(
+			err.to_string()
+				.contains("tuning.consensus_timing_base_millis must be between 10 and 1000"),
+			"{refused}: {err}"
+		);
+	}
+}
+
 #[test]
 fn example_signing_keys_are_fresh_independent_and_dev_keys_stay_disabled() {
 	let scratch = fresh_dir("fresh-example-signing-keys");

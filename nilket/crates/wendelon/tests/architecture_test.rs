@@ -12845,3 +12845,37 @@ fn decision_maintenance_proposes_only_through_its_stop_aware_path() {
 		"the stopped result is local, never serialized: {derive}"
 	);
 }
+
+/// ADR 0731: openraft's timing fields are named in one production file, the timing profile,
+/// and the node builds its Raft instance from the one function that applies it.
+#[test]
+fn consensus_timing_fields_are_written_only_by_the_timing_profile() {
+	let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let mut offenders = Vec::new();
+	walk_dir(&src, &mut |path| {
+		if path.extension().is_none_or(|extension| extension != "rs")
+			|| path.ends_with("consensus/timing.rs")
+		{
+			return;
+		}
+		let source = fs::read_to_string(path).unwrap();
+		let identifiers = rust_identifiers_from_source(&path.display().to_string(), &source);
+		for field in [
+			"heartbeat_interval",
+			"election_timeout_min",
+			"election_timeout_max",
+			"install_snapshot_timeout",
+		] {
+			if has_rust_identifier(&identifiers, field) {
+				offenders.push(format!("{}: {field}", path.display()));
+			}
+		}
+	});
+	assert!(offenders.is_empty(), "{offenders:#?}");
+	let node = fs::read_to_string(src.join("node.rs")).unwrap();
+	assert!(node.contains("let raft_config = control_raft_config(&cfg)?;"));
+	assert!(node.contains("let consensus_timing = cfg.consensus_timing.status_of(&raft_config);"));
+	assert_eq!(node.matches(".openraft_config(").count(), 1);
+	let retention = fs::read_to_string(src.join("consensus/retention.rs")).unwrap();
+	assert!(retention.contains("let base = timing.apply(Config {"));
+}

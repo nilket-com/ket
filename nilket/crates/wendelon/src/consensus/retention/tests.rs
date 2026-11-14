@@ -135,7 +135,11 @@ async fn start(dir: &Path, mode: ControlRetention) -> std::io::Result<Single> {
 		Arc::new(NoDialTransportProvider),
 		BufPool::new(8, 1 << 20),
 	);
-	let config = Arc::new(mode.openraft_config("wendelon").validate().unwrap());
+	let config = Arc::new(
+		mode.openraft_config("wendelon", Default::default())
+			.validate()
+			.unwrap(),
+	);
 	let observed = state_machine.clone();
 	let raft = WendelonRaft::new(1, config, network, store.clone(), state_machine)
 		.await
@@ -269,7 +273,7 @@ fn default_retention_is_todays_openraft_config() {
 	.validate()
 	.unwrap();
 	let compacting = ControlRetention::Compacting
-		.openraft_config("wendelon")
+		.openraft_config("wendelon", Default::default())
 		.validate()
 		.unwrap();
 	assert_eq!(format!("{compacting:?}"), format!("{today:?}"));
@@ -317,13 +321,13 @@ fn default_retention_is_todays_openraft_config() {
 #[test]
 fn full_retention_sets_only_never_and_max_keep() {
 	let full = ControlRetention::Full
-		.openraft_config("wendelon")
+		.openraft_config("wendelon", Default::default())
 		.validate()
 		.unwrap();
 	assert!(matches!(full.snapshot_policy, SnapshotPolicy::Never));
 	assert_eq!(full.max_in_snapshot_log_to_keep, u64::MAX);
 	let compacting = ControlRetention::Compacting
-		.openraft_config("wendelon")
+		.openraft_config("wendelon", Default::default())
 		.validate()
 		.unwrap();
 	assert!(!matches!(compacting.snapshot_policy, SnapshotPolicy::Never));
@@ -932,6 +936,7 @@ async fn retention_status_is_additive_and_shared() {
 		fips_mode: false,
 		fips_self_test_last_ts: None,
 		control_retention,
+		consensus_timing: crate::consensus::ConsensusTimingStatus::default_profile(),
 	};
 	let json = |snapshot: &ReadinessSnapshot| {
 		let mut value: serde_json::Value = serde_json::from_str(&snapshot.to_json()).unwrap();
@@ -955,6 +960,10 @@ async fn retention_status_is_additive_and_shared() {
 			"control_retention": {
 				"configured": "compacting", "history": "not_checked", "violation": null,
 				"refusals": refusals_zero
+			},
+			"consensus_timing": {
+				"base_millis": 50, "heartbeat_millis": 50, "election_min_millis": 150,
+				"election_max_millis": 300, "snapshot_chunk_millis": 200
 			}
 		})
 	);

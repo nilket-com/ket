@@ -63,6 +63,8 @@ pub struct ReadinessSnapshot {
 	/// Control log retention: configured mode, startup history check and
 	/// any latched refusal, reported separately.
 	pub control_retention: RetentionStatus,
+	/// The timing the control Raft instance was built with.
+	pub consensus_timing: crate::consensus::ConsensusTimingStatus,
 }
 
 #[async_trait]
@@ -593,6 +595,7 @@ impl ReadinessSnapshot {
 				.unwrap_or(Value::Null),
 		);
 		body.insert("control_retention".into(), self.control_retention.to_json());
+		body.insert("consensus_timing".into(), self.consensus_timing.to_json());
 		#[cfg(feature = "fips")]
 		{
 			body.insert("fips_mode".into(), Value::Bool(self.fips_mode));

@@ -40052,7 +40052,7 @@ async fn b1t_real_follower_debt_completes_after_leadership_change() {
 	let network = b1t_network::Network::default();
 	let config = Arc::new(
 		crate::consensus::retention::ControlRetention::default()
-			.openraft_config("wendelon")
+			.openraft_config("wendelon", Default::default())
 			.validate()
 			.unwrap(),
 	);
@@ -48401,7 +48401,7 @@ async fn control_cluster(observer: u32, manager: &Arc<SlabManager>) -> ControlCl
 	let network = b1t_network::Network::default();
 	let config = Arc::new(
 		crate::consensus::retention::ControlRetention::default()
-			.openraft_config("wendelon")
+			.openraft_config("wendelon", Default::default())
 			.validate()
 			.unwrap(),
 	);
@@ -48802,7 +48802,7 @@ async fn single_voter(
 	let network = b1t_network::Network::default();
 	let config = Arc::new(
 		crate::consensus::retention::ControlRetention::default()
-			.openraft_config("wendelon")
+			.openraft_config("wendelon", Default::default())
 			.validate()
 			.unwrap(),
 	);
@@ -48963,7 +48963,7 @@ async fn a_node_restarted_while_fenced_converges_to_its_committed_pointer() {
 	let network = b1t_network::Network::default();
 	let config = Arc::new(
 		crate::consensus::retention::ControlRetention::default()
-			.openraft_config("wendelon")
+			.openraft_config("wendelon", Default::default())
 			.validate()
 			.unwrap(),
 	);
@@ -49109,7 +49109,7 @@ async fn control_cluster_observing(observers: &[(u32, &Arc<SlabManager>)]) -> Co
 	let network = b1t_network::Network::default();
 	let config = Arc::new(
 		crate::consensus::retention::ControlRetention::default()
-			.openraft_config("wendelon")
+			.openraft_config("wendelon", Default::default())
 			.validate()
 			.unwrap(),
 	);

@@ -7754,7 +7754,7 @@ mod tests {
 		);
 		let config = Arc::new(
 			crate::consensus::retention::ControlRetention::default()
-				.openraft_config("wendelon")
+				.openraft_config("wendelon", Default::default())
 				.validate()
 				.unwrap(),
 		);

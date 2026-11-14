@@ -1318,6 +1318,7 @@ pub(super) struct NodeParts {
 	pub(super) audit_materialization: Arc<AuditMaterializationTracker>,
 	pub(super) restore_validation: watch::Receiver<RestoreValidationStatus>,
 	pub(super) retention: Arc<RetentionGuard>,
+	pub(super) consensus_timing: crate::consensus::ConsensusTimingStatus,
 	pub(super) clock_drift_events: watch::Receiver<Option<ClockDriftEvent>>,
 }
 impl NodeParts {
@@ -1356,6 +1357,7 @@ impl NodeParts {
 			audit_materialization: self.audit_materialization,
 			restore_validation: self.restore_validation,
 			retention: self.retention,
+			consensus_timing: self.consensus_timing,
 			clock_drift_events: self.clock_drift_events,
 		}
 	}

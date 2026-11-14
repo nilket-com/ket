@@ -787,6 +787,8 @@ struct RawTuningConfig {
 	#[serde(default)]
 	query_stall_bound_millis: Option<u64>,
 	#[serde(default)]
+	consensus_timing_base_millis: Option<u64>,
+	#[serde(default)]
 	max_inbound_connections: Option<usize>,
 	#[serde(default)]
 	max_inbound_connections_per_ip: Option<usize>,
@@ -806,6 +808,7 @@ impl Default for RawTuningConfig {
 			cdc_locality_heartbeat_interval_millis: None,
 			data_ring_lease_ttl_millis: None,
 			query_stall_bound_millis: None,
+			consensus_timing_base_millis: None,
 			max_inbound_connections: None,
 			max_inbound_connections_per_ip: None,
 			max_inbound_streams_per_connection: None,
@@ -1166,6 +1169,21 @@ impl RawConfig {
 				)
 			})?,
 		};
+		let consensus_timing = match self.tuning.consensus_timing_base_millis {
+			None => crate::consensus::ConsensusTiming::default(),
+			Some(millis) => {
+				crate::consensus::ConsensusTiming::from_base_millis(millis).map_err(|_| {
+					Error::new(
+						ErrorKind::InvalidInput,
+						format!(
+							"tuning.consensus_timing_base_millis must be between {} and {}",
+							crate::consensus::ConsensusTiming::MIN_BASE_MILLIS,
+							crate::consensus::ConsensusTiming::MAX_BASE_MILLIS
+						),
+					)
+				})?
+			}
+		};
 		let transport_admission = ServerAdmissionConfig {
 			max_inbound_connections: self
 				.tuning
@@ -1365,6 +1383,7 @@ impl RawConfig {
 			tiering,
 			lsm_compaction_paused: self.storage.lsm_compaction_paused,
 			control_retention,
+			consensus_timing,
 			decision_mode,
 			decision_signing_secret,
 			trusted_decision_signers,

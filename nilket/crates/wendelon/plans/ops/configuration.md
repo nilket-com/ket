@@ -181,6 +181,67 @@ object store, network or data shape needs its own evidence for its own value. Th
 configuration loader does not check this setting against the storage configuration:
 nothing refuses a node that tiers to a remote store at the default.
 
+### Consensus timing profile
+
+`[tuning] consensus_timing_base_millis` declares how patient the control group's
+consensus is (ADR 0731). Default 50; accepted range 10 to 1000; a value outside it
+refuses startup. It is set per node and should be the same on every node: nothing
+checks that, and a node with a smaller value than the others times out first and
+disturbs them. Each node's readiness answer (`nilket wendelon inspect --json`) shows
+its own profile under `consensus_timing`; one node's answer says nothing about the
+others.
+
+Every consensus timing value is derived from this one number:
+
+| Value | Derived as | At the default (50) |
+|---|---|---|
+| heartbeat, and the nominal timeout of each replication call and of each call of a read's leadership confirmation | base | 50 ms |
+| election timeout, and the nominal timeout of a vote request (the lower edge) | 3 to 6 times base | 150 to 300 ms |
+| nominal timeout of one snapshot chunk | 4 times base, never under 200 ms | 200 ms |
+
+These are nominal values, not guarantees. A timeout covers a whole call (reaching the
+peer, the peer's storage and processing, scheduling on both sides), not a network
+round trip, and a call that completes late may still be accepted.
+
+What a larger base trades, as arithmetic from the ratios and not as a bound on
+detecting a failure or restoring service (electing, replicating and applying take
+further time):
+
+| base | a follower that had a leader starts an election after silence of about | a node that knows of a longer log waits a further |
+|---|---|---|
+| 50 | 0.45 to 0.68 s | 0.6 s |
+| 250 | 2.25 to 3.4 s | 3 s |
+| 500 | 4.5 to 6.75 s | 6 s |
+| 1000 | 9 to 13.5 s | 12 s |
+
+A larger base gives up on slow replies later and deposes a live leader less readily;
+it also hears from an idle leader less often and replaces a lost one later. No value
+gives both. For any value there are networks whose replies arrive later than it, and
+on those the group may fail to keep or to re-establish a leader.
+
+Other timers do not follow this setting and keep their values:
+
+- The range lease (`data_ring_lease_ttl_millis`, default 3000) is renewed through
+  consensus. When a leader change lasts longer than the lease has left, leases lapse:
+  the node reports ranges not leased and is not ready until they are renewed, and
+  other replicas may become eligible to take a range over. A longer lease avoids that
+  and also delays takeover after a real failure. It is a separate trade to assess
+  together with the base; no pairing is recommended here.
+- Forwarded decisions, cuts and lookups have fixed deadlines of 5 to 10 seconds and
+  answer that the outcome is not known when they pass; during a long leader change
+  more of them do.
+- The client library makes three attempts tens of milliseconds apart and then reports
+  the attempts exhausted. On a slow profile that happens well before a new leader
+  exists; a caller that must ride through a leader change retries itself, inside its
+  own deadline. An answer that the attempts are exhausted or that the outcome is not
+  known does not say the operation did not commit. Such a retry repeats the same
+  operation with the same identity and the same request, within the identity's
+  validity and the caller's deadline, and never starts a fresh identity only because
+  the answer was uncertain. When the outcome cannot be resolved that way, the caller
+  reports it as unknown; it does not report that nothing was written.
+
+No profile other than the default has been tested.
+
 ### Running under systemd
 
 Run Wendelon so the service manager owns its whole process tree and waits out its

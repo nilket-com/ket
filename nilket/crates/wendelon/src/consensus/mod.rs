@@ -15,6 +15,7 @@ pub mod raft_server;
 pub mod raft_storage;
 pub mod retention;
 pub mod slab_ops;
+pub mod timing;
 // ADR 0092 versioned-replay shadows: replay machinery, never an API. Only the
 // decode dispatch in `raft_storage` and the format-fixture controls may name
 // these modules.
@@ -27,3 +28,4 @@ pub use raft_server::*;
 pub use raft_storage::*;
 pub use retention::{ControlRetention, RetentionGuard, RetentionStatus};
 pub use slab_ops::*;
+pub use timing::{ConsensusTiming, ConsensusTimingStatus};

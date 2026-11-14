@@ -44,15 +44,20 @@ impl ControlRetention {
 		}
 	}
 
-	/// The openraft configuration for this mode, before `validate()`.
-	/// `Compacting` is exactly the configuration used before this setting
-	/// existed; `Full` changes only the snapshot policy and the in-snapshot
-	/// retention bound.
-	pub fn openraft_config(self, cluster_name: &str) -> Config {
-		let base = Config {
+	/// The openraft configuration for this mode and timing profile, before
+	/// `validate()`. `Compacting` on the default profile is exactly the
+	/// configuration used before either setting existed; `Full` changes only the
+	/// snapshot policy and the in-snapshot retention bound. The timing fields
+	/// come from `timing` and from nowhere else.
+	pub fn openraft_config(
+		self,
+		cluster_name: &str,
+		timing: crate::consensus::ConsensusTiming,
+	) -> Config {
+		let base = timing.apply(Config {
 			cluster_name: cluster_name.into(),
 			..Default::default()
-		};
+		});
 		match self {
 			Self::Compacting => base,
 			Self::Full => Config {

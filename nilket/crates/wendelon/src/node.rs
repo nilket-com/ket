@@ -274,6 +274,9 @@ pub struct NodeBootstrapConfig {
 	/// `Full` retains the Control log from genesis. See
 	/// [`crate::consensus::retention`].
 	pub control_retention: ControlRetention,
+	/// The control group's consensus timing profile: `tuning.consensus_timing_base_millis`,
+	/// or the default. See [`crate::consensus::timing`].
+	pub consensus_timing: crate::consensus::ConsensusTiming,
 	/// Selected by `cluster.decision_authority` in a configuration file or by
 	/// [`NodeBootstrapConfig::with_parent_decisions_for_disposable_store`], for
 	/// fresh disposable stores. See `consensus::decision_mode`.
@@ -396,6 +399,7 @@ impl NodeBootstrapConfig {
 			tiering: SweeperConfig::default(),
 			lsm_compaction_paused: false,
 			control_retention: ControlRetention::Compacting,
+			consensus_timing: Default::default(),
 			decision_mode: Default::default(),
 			decision_signing_secret: None,
 			trusted_decision_signers: BTreeMap::new(),
@@ -789,6 +793,7 @@ pub struct WendelonNode {
 	pub audit_materialization: Arc<AuditMaterializationTracker>,
 	restore_validation: watch::Receiver<RestoreValidationStatus>,
 	retention: Arc<RetentionGuard>,
+	consensus_timing: crate::consensus::ConsensusTimingStatus,
 	clock_drift_events: watch::Receiver<Option<ClockDriftEvent>>,
 	transport_servers: Vec<NodeTransportServer>,
 	pub handles: NodeHandles,
@@ -2300,17 +2305,8 @@ impl WendelonNode {
 
 		// 9. openraft engine. `validate()` pins heartbeat / election
 		//    timeouts against `Config`'s sanity checks.
-		let raft_config = Arc::new(
-			cfg.control_retention
-				.openraft_config("wendelon")
-				.validate()
-				.map_err(|e| {
-					Error::new(
-						ErrorKind::InvalidInput,
-						format!("openraft config invalid: {e}"),
-					)
-				})?,
-		);
+		let raft_config = control_raft_config(&cfg)?;
+		let consensus_timing = cfg.consensus_timing.status_of(&raft_config);
 		#[cfg(feature = "test-support")]
 		let test_automatic_elections = raft_config.enable_elect;
 		let raft = WendelonRaft::new(
@@ -3046,6 +3042,7 @@ impl WendelonNode {
 			audit_materialization,
 			restore_validation: restore_validation_rx,
 			retention,
+			consensus_timing,
 			clock_drift_events: clock_drift_rx,
 		};
 		Ok(parts)
@@ -3191,6 +3188,7 @@ impl WendelonNode {
 			audit_materialization: self.audit_materialization.clone(),
 			restore_validation: self.restore_validation.clone(),
 			retention: self.retention.clone(),
+			consensus_timing: self.consensus_timing,
 			crypto: self.crypto.clone(),
 		}
 	}
@@ -3217,6 +3215,7 @@ pub struct NodeReadinessView {
 	audit_materialization: Arc<AuditMaterializationTracker>,
 	restore_validation: watch::Receiver<RestoreValidationStatus>,
 	retention: Arc<RetentionGuard>,
+	consensus_timing: crate::consensus::ConsensusTimingStatus,
 	crypto: Arc<CryptoManager>,
 }
 
@@ -3279,8 +3278,26 @@ impl ReadinessReporter for NodeReadinessView {
 			fips_mode: fips_build_state.fips_mode,
 			fips_self_test_last_ts: fips_build_state.self_test_last_ts,
 			control_retention: self.retention.status(),
+			consensus_timing: self.consensus_timing,
 		}
 	}
+}
+
+/// The configuration this node's control Raft instance is built with: the retention mode's
+/// policy and the timing profile, validated by openraft. The one place it is made.
+pub(crate) fn control_raft_config(
+	cfg: &NodeBootstrapConfig,
+) -> std::io::Result<Arc<openraft::Config>> {
+	cfg.control_retention
+		.openraft_config("wendelon", cfg.consensus_timing)
+		.validate()
+		.map(Arc::new)
+		.map_err(|e| {
+			Error::new(
+				ErrorKind::InvalidInput,
+				format!("openraft config invalid: {e}"),
+			)
+		})
 }
 
 /// `serve` is generic over `S: HrftService`; wrapping an `Arc<dyn>`
@@ -4332,6 +4349,47 @@ impl TransportProvider for NoDialTransportProvider {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	/// The configuration the node hands to its Raft instance carries the declared timing
+	/// profile, and the default profile is openraft's own timing. `control_raft_config` is
+	/// what `bootstrap` passes to `WendelonRaft::new`, so this is the seam, not a second
+	/// derivation.
+	#[test]
+	fn the_declared_timing_base_reaches_the_configuration_raft_is_built_with() {
+		use crate::consensus::{ConsensusTiming, ConsensusTimingStatus};
+		let mut cfg = NodeBootstrapConfig::dev(1, PathBuf::from("unused"), "127.0.0.1:0".into());
+		let default = control_raft_config(&cfg).unwrap();
+		assert_eq!(
+			cfg.consensus_timing.status_of(&default),
+			ConsensusTimingStatus::default_profile()
+		);
+		for retention in [ControlRetention::Compacting, ControlRetention::Full] {
+			cfg.control_retention = retention;
+			cfg.consensus_timing = ConsensusTiming::from_base_millis(250).unwrap();
+			let declared = control_raft_config(&cfg).unwrap();
+			assert_eq!(
+				cfg.consensus_timing.status_of(&declared),
+				ConsensusTimingStatus {
+					base_millis: 250,
+					heartbeat_millis: 250,
+					election_min_millis: 750,
+					election_max_millis: 1500,
+					snapshot_chunk_millis: 1000,
+				},
+				"{retention:?}"
+			);
+			// Nothing else differs from the same mode on the default profile.
+			cfg.consensus_timing = ConsensusTiming::default();
+			let same_mode = control_raft_config(&cfg).unwrap();
+			assert_eq!(
+				format!(
+					"{:?}",
+					ConsensusTiming::default().apply((*declared).clone())
+				),
+				format!("{same_mode:?}")
+			);
+		}
+	}
 
 	/// A client configuration a connection attempt accepts: no trust roots, since
 	/// no handshake is ever completed with it. Built through the TLS choke point,

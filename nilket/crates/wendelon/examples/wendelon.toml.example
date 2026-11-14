@@ -117,6 +117,12 @@ data_ring_lease_ttl_millis = {{DATA_RING_LEASE_TTL_MILLIS}}
 # node refuses the query as stalled. 1 to 600000; absent means 250. A caller's own
 # deadline still applies when it is nearer.
 query_stall_bound_millis = 250
+# ADR 0731: the control group's consensus timing profile, in milliseconds. Heartbeat
+# and the nominal timeout of each replication call are this value, the election
+# timeout 3 to 6 times it, a snapshot chunk's timeout 4 times it and never under 200.
+# 10 to 1000; absent means 50. Set it alike on every node. A larger value is more
+# patient with slow replies and slower to replace a lost leader.
+consensus_timing_base_millis = 50
 
 [identity]
 # Generated signing keys use fresh OS randomness; deterministic dev keys are refused.
