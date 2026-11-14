@@ -3474,3 +3474,580 @@ async fn judged_query(
 		got.len()
 	);
 }
+
+// ============================================================
+//  THE OBJECT-STORE WORKFLOW THAT GOES ON AFTER A REFUSED WRITE
+// ============================================================
+
+/// A replacement operation's row key is its logical row plus this times its ordinal, so no
+/// upsert can make one operation's commit look like another's.
+const REPLACEMENT_KEY_STEP: i64 = 1000;
+/// New operations after definite refusals: at most this many for one logical row.
+const MAX_REPLACEMENTS_PER_ROW: u32 = 2;
+/// And at most this many in the whole run.
+const MAX_REPLACEMENTS: u32 = 8;
+/// A recorded refusal is confirmed by asking the same operation again, at most this many times.
+const REFUSAL_PROBES: u32 = 3;
+
+/// The row key of logical row `row`'s operation number `ordinal` (0: the original).
+fn replacement_key(row: i64, ordinal: u32) -> i64 {
+	row + REPLACEMENT_KEY_STEP * i64::from(ordinal)
+}
+
+#[test]
+fn a_replacement_never_shares_a_key_with_any_other_operation() {
+	let mut keys = std::collections::BTreeSet::new();
+	for row in 1..=ROWS {
+		for ordinal in 0..=MAX_REPLACEMENTS_PER_ROW {
+			assert!(keys.insert(replacement_key(row, ordinal)));
+		}
+	}
+	assert_eq!(replacement_key(7, 0), 7);
+	assert!(ROWS < REPLACEMENT_KEY_STEP);
+}
+
+/// Every operation of the run, in the order it was begun. Its summary is printed when it is
+/// dropped, on a pass and on a panic alike; each offer is printed as it happens.
+struct Journal {
+	clock: Instant,
+	operations: Vec<PauseOperation>,
+	/// Asks of an already refused operation, kept apart from offers.
+	probes: Vec<u32>,
+	first_refusal: Option<Instant>,
+	refusals: u32,
+	replacements: u32,
+}
+
+impl Journal {
+	fn begin(&mut self, logical_row: i64, ordinal: u32) -> usize {
+		self.operations.push(PauseOperation {
+			logical_row,
+			key: replacement_key(logical_row, ordinal),
+			name: (0..NAME_HEX_BLOCKS).map(|_| hex(random32())).collect(),
+			identity: operation_id(),
+			offers: 0,
+			disposition: Disposition::Unknown,
+		});
+		self.probes.push(0);
+		self.operations.len() - 1
+	}
+
+	/// The rows a complete read must return: exactly the acknowledged operations', by key.
+	fn acknowledged(&self) -> Vec<(i64, String)> {
+		let mut rows: Vec<(i64, String)> = self
+			.operations
+			.iter()
+			.filter(|operation| operation.disposition == Disposition::Committed)
+			.map(|operation| (operation.key, operation.name.clone()))
+			.collect();
+		rows.sort();
+		rows
+	}
+
+	fn count(&self, disposition: Disposition) -> usize {
+		self.operations
+			.iter()
+			.filter(|operation| operation.disposition == disposition)
+			.count()
+	}
+}
+
+impl Drop for Journal {
+	fn drop(&mut self) {
+		eprintln!(
+			"smoke: JOURNAL SUMMARY: operations {}: acknowledged {}, refused {}, UNRESOLVED {}; originals {}, replacements {}; first definitive refusal {}",
+			self.operations.len(),
+			self.count(Disposition::Committed),
+			self.count(Disposition::Refused),
+			self.count(Disposition::Unknown),
+			self.operations.len() - self.replacements as usize,
+			self.replacements,
+			match self.first_refusal {
+				Some(at) => format!("at +{:.3} s", (at - self.clock).as_secs_f64()),
+				None => "NONE".to_owned(),
+			}
+		);
+		for (operation, probes) in self.operations.iter().zip(&self.probes) {
+			if operation.disposition != Disposition::Committed || operation.offers > 1 {
+				eprintln!(
+					"smoke: JOURNAL SUMMARY: logical row {} key {} name {}… identity {:02x?}: {:?} after {} offers and {probes} asks after its refusal",
+					operation.logical_row,
+					operation.key,
+					&operation.name[..16],
+					&operation.identity.client_uuid,
+					operation.disposition,
+					operation.offers
+				);
+			}
+		}
+	}
+}
+
+/// ONE call for one operation, the same identity and the same row every time, printed before
+/// it is made and again when it has ended. `call_deadline` is the client's deadline and the
+/// wrapper's. Returns the reading of the answer by status, knowledge and time
+/// (`accepted_disposition`): a late answer, another operation's answer, a contradictory
+/// knowledge or any status this workflow does not allow is an `Err`, never "unknown".
+/// Also returns the answer-observation instant captured before formatting or logging it.
+async fn journalled_call(
+	client: &Client,
+	descriptor: &TableSchemaDescriptor,
+	operation: &PauseOperation,
+	what: &str,
+	number: u32,
+	call_deadline: Instant,
+	clock: Instant,
+) -> (Result<Disposition, String>, Instant) {
+	let asked = Instant::now();
+	eprintln!(
+		"smoke: JOURNAL SUBMIT {what} {number}: logical row {} key {} name {}… identity {:02x?}/{} at +{:.3} s, caller deadline {:?} from now",
+		operation.logical_row,
+		operation.key,
+		&operation.name[..16],
+		&operation.identity.client_uuid,
+		operation.identity.sequence_no,
+		(asked - clock).as_secs_f64(),
+		call_deadline.saturating_duration_since(asked)
+	);
+	let answer = tokio::time::timeout_at(
+		tokio::time::Instant::from_std(call_deadline),
+		client.table_write(
+			TenantId::new(TENANT),
+			descriptor,
+			one_row(operation.key, &operation.name),
+			WriteOptions {
+				deadline: Some(call_deadline),
+				operation_id: Some(operation.identity),
+				..WriteOptions::default()
+			},
+		),
+	)
+	.await
+	.ok();
+	let answered = Instant::now();
+	let read = accepted_disposition(&answer, operation.identity, answered, call_deadline);
+	eprintln!(
+		"smoke: JOURNAL ANSWER {what} {number}: key {} after {:?} ({:+.3} ms relative to its caller deadline): {} => {}",
+		operation.key,
+		answered - asked,
+		(answered
+			.saturating_duration_since(call_deadline)
+			.as_secs_f64()
+			- call_deadline
+				.saturating_duration_since(answered)
+				.as_secs_f64())
+			* 1000.0,
+		match &answer {
+			None => "NO ANSWER from the client within the caller deadline (unresolved)".to_owned(),
+			Some(Ok(receipt)) => format!("{receipt:?}"),
+			Some(Err(error)) => format!("{error:?}"),
+		},
+		match &read {
+			Ok(disposition) => format!("{disposition:?}"),
+			Err(why) => format!("NOT ACCEPTED: {why}"),
+		}
+	);
+	(read, answered)
+}
+
+/// Offers operation `at` until it is acknowledged or refused, under ONE absolute bound for the
+/// operation (every call's deadline is that bound, as in the owning workflow's ingestion; an
+/// offer never resets it). While its outcome is unknown nothing else is issued for its row.
+/// Unknown at the bound, or an answer that is not accepted, fails the test. Returns when the
+/// definitive answer was observed.
+async fn settle_one(
+	client: &Client,
+	descriptor: &TableSchemaDescriptor,
+	journal: &mut Journal,
+	at: usize,
+	what: &str,
+	bound: Instant,
+) -> Instant {
+	loop {
+		let operation = &journal.operations[at];
+		assert!(
+			Instant::now() < bound,
+			"{what}: logical row {} key {} is UNRESOLVED at its bound after {} offers",
+			operation.logical_row,
+			operation.key,
+			operation.offers
+		);
+		let number = operation.offers + 1;
+		let (read, observed) = journalled_call(
+			client,
+			descriptor,
+			operation,
+			what,
+			number,
+			bound,
+			journal.clock,
+		)
+		.await;
+		let operation = &mut journal.operations[at];
+		operation.offers = number;
+		operation.disposition = match read {
+			Ok(disposition) => disposition,
+			Err(why) => panic!(
+				"{what}: the offer of logical row {} key {} had an answer this workflow does not accept: {why}",
+				operation.logical_row, operation.key
+			),
+		};
+		if operation.disposition != Disposition::Unknown {
+			return observed;
+		}
+		tokio::time::sleep(
+			Duration::from_millis(250).min(bound.saturating_duration_since(Instant::now())),
+		)
+		.await;
+	}
+}
+
+/// Asks a REFUSED operation again, same identity and row, and requires the same recorded
+/// refusal. The operation stays Refused whatever happens here: an unknown answer (a failed
+/// connection, a redirect, a stall, a deadline) proves nothing about the record and is asked
+/// again, at most `REFUSAL_PROBES` times and never past `limit`; a receipt, or any answer not
+/// accepted, contradicts the record and fails. Not confirmed within those asks: a failure of
+/// this check, reported as that. It grants no new operation and no new budget.
+async fn confirm_refusal(
+	client: &Client,
+	descriptor: &TableSchemaDescriptor,
+	journal: &mut Journal,
+	at: usize,
+	limit: Instant,
+) {
+	assert_eq!(journal.operations[at].disposition, Disposition::Refused);
+	for probe in 1..=REFUSAL_PROBES {
+		let call_deadline = (Instant::now() + RECOVERY_CALL_BOUND).min(limit);
+		assert!(
+			Instant::now() < call_deadline,
+			"the refusal of key {} was not confirmed before the limit ({} asks)",
+			journal.operations[at].key,
+			probe - 1
+		);
+		journal.probes[at] = probe;
+		let (read, _) = journalled_call(
+			client,
+			descriptor,
+			&journal.operations[at],
+			"ask of a refused operation",
+			probe,
+			call_deadline,
+			journal.clock,
+		)
+		.await;
+		match read {
+			Ok(Disposition::Refused) => return,
+			Ok(Disposition::Unknown) => {
+				tokio::time::sleep(
+					Duration::from_millis(250).min(limit.saturating_duration_since(Instant::now())),
+				)
+				.await;
+			}
+			Ok(Disposition::Committed) => panic!(
+				"a REFUSED operation (key {}) was answered with a receipt when asked again",
+				journal.operations[at].key
+			),
+			Err(why) => panic!(
+				"a REFUSED operation (key {}) asked again: {why}",
+				journal.operations[at].key
+			),
+		}
+	}
+	panic!(
+		"the refusal of key {} was not confirmed in {REFUSAL_PROBES} asks",
+		journal.operations[at].key
+	);
+}
+
+/// The daemons are the processes recorded before ingestion, alive, and none has exited.
+fn same_processes(formed: &mut Formed, processes: &[OwnedProcess], what: &str) {
+	for process in processes {
+		let state = process
+			.state()
+			.unwrap_or_else(|why| panic!("{what}: no-restart check: {why}"));
+		assert!(
+			matches!(state, 'R' | 'S' | 'D' | 'I'),
+			"{what}: node {} is in state {state}",
+			process.node
+		);
+	}
+	if let Some(exited) = formed.daemons.exited() {
+		panic!("{what}: no-restart check: {exited}");
+	}
+	assert_eq!(
+		formed.daemons.owned(),
+		processes,
+		"{what}: a daemon is not the process it was"
+	);
+}
+
+/// The owning object-store workflow above, with ONE difference: a write that is truthfully
+/// refused does not end it. It is a separate scenario with a separate question (does the
+/// cluster serve again, by itself, after a recorded refusal) and never stands for the owning
+/// test, whose rule (the first refusal fails) and whose records are unchanged.
+///
+/// Fixture and settings are the owning test's: three real daemons, the remote object store,
+/// default consensus and leases, the declared stall bound, the same rows, slabs and bounds. No
+/// fault is injected and rows are offered one after another.
+///
+/// Operations. Each logical row's ORIGINAL operation keeps one identity and one row and is
+/// offered again only while its outcome is unknown, inside its one `CLIENT_BOUND`; answers are
+/// read by status, commit knowledge and time (`accepted_disposition`). Only the recorded
+/// refusal (`WRITE_REFUSED` with `KNOWN_NOT_COMMITTED`) permits a REPLACEMENT: a new identity
+/// under a new row key (`replacement_key`) and a new name, at most `MAX_REPLACEMENTS_PER_ROW`
+/// for a row and `MAX_REPLACEMENTS` in the run. A refused operation stays refused in the
+/// journal; it is asked again only to confirm that (`confirm_refusal`).
+///
+/// The checkpoint. ONE budget of `RECOVERY_BOUND` starts when the caller first observes a
+/// definitive refusal and is never restarted. It is the caller's clock, not a claim about when
+/// any stall ended. Inside it, with the same three processes, no restart, no signal and nothing
+/// cleared: the refusal is confirmed; a replacement for that row is acknowledged (a new commit
+/// after the refusal); every node reports Ready; and one exact read returns exactly the rows
+/// acknowledged so far. Every call in it ends no later than that mark. Later refusals are
+/// handled under the caps and each operation's ordinary bound, with no second budget.
+///
+/// Then the owning test's stages, reported apart from the checkpoint: the offload wait, the
+/// judged query, three rolling restarts, the offload observation and the judged query again,
+/// each against exactly the acknowledged rows. The object counts are aggregate observations:
+/// an object written for a refused operation can be among them, so they do not say which
+/// acknowledged row is cold.
+///
+/// If no refusal occurs the run reports its other results and says the checkpoint was NOT
+/// exercised. It claims no rate, no cause of any stall and nothing for the owning test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "spawns three daemons and needs a remote object store; run alone under an external owner (see the module text)"]
+async fn three_daemons_offload_to_the_object_store_and_recover_after_a_refused_write() {
+	let deadline = Instant::now() + TIERING_TEST_BOUND;
+	let store = StoreEnv::from_environment();
+	let objects = store.handle();
+	let before = tokio::time::timeout(CLIENT_BOUND, objects.list(""))
+		.await
+		.expect("the object store did not answer a list within its bound")
+		.expect("the object store refused a list: endpoint, bucket or keys");
+	assert!(before.is_empty(), "the run's prefix is not new");
+	eprintln!(
+		"smoke: RECOVERY-AWARE workflow (not the owning acceptance): object prefix {} in bucket {} at {} (direct, no relay); DECLARED stall bound {QUERY_STALL_BOUND_MILLIS} ms per node (shipped default 250); {ROWS} logical rows, slabs of {SLAB_MAX_BYTES} bytes; checkpoint {RECOVERY_BOUND:?} from the first definitive refusal; replacements at most {MAX_REPLACEMENTS_PER_ROW} a row, {MAX_REPLACEMENTS} in all",
+		store.prefix, store.bucket, store.endpoint
+	);
+	let started = Instant::now();
+	let at = |what: &str| {
+		eprintln!(
+			"smoke: PHASE {what} at +{} ms",
+			started.elapsed().as_millis()
+		)
+	};
+
+	at("formation");
+	let mut formed = form(deadline, Some(&store)).await;
+	let client = client_through(
+		&formed.members[0],
+		&formed.pki,
+		Credential::Storage,
+		deadline,
+	)
+	.await;
+	// Recorded before any write: the checkpoint and the read before the restarts require
+	// these same processes.
+	let processes = formed.daemons.owned();
+	eprintln!("smoke: the daemons before ingestion: {processes:?}");
+	let mut journal = Journal {
+		clock: started,
+		operations: Vec::new(),
+		probes: Vec::new(),
+		first_refusal: None,
+		refusals: 0,
+		replacements: 0,
+	};
+
+	at("writes");
+	for row in 1..=ROWS {
+		let mut ordinal = 0_u32;
+		loop {
+			let index = journal.begin(row, ordinal);
+			let what = if ordinal == 0 {
+				"original offer"
+			} else {
+				"replacement offer"
+			};
+			let bound = Instant::now() + CLIENT_BOUND.min(step(deadline));
+			let observed = settle_one(
+				&client,
+				&formed.descriptor,
+				&mut journal,
+				index,
+				what,
+				bound,
+			)
+			.await;
+			if journal.operations[index].disposition == Disposition::Committed {
+				break;
+			}
+			// The recorded refusal of this operation.
+			journal.refusals += 1;
+			assert!(
+				ordinal < MAX_REPLACEMENTS_PER_ROW && journal.replacements < MAX_REPLACEMENTS,
+				"logical row {row}: refused, and no replacement is left (this row {ordinal} of {MAX_REPLACEMENTS_PER_ROW}, the run {} of {MAX_REPLACEMENTS})",
+				journal.replacements
+			);
+			ordinal += 1;
+			journal.replacements += 1;
+			if journal.first_refusal.is_some() {
+				// A later refusal: confirmed under the ordinary bound; no second checkpoint.
+				let limit = Instant::now() + CLIENT_BOUND.min(step(deadline));
+				confirm_refusal(&client, &formed.descriptor, &mut journal, index, limit).await;
+				continue;
+			}
+
+			// THE CHECKPOINT: one mark, from the first definitive refusal the caller saw.
+			journal.first_refusal = Some(observed);
+			let mark = (observed + RECOVERY_BOUND).min(deadline);
+			at(&format!(
+				"CHECKPOINT after the first definitive refusal (logical row {row}); one budget of {RECOVERY_BOUND:?} from when it was observed"
+			));
+			same_processes(&mut formed, &processes, "at the first refusal");
+			confirm_refusal(&client, &formed.descriptor, &mut journal, index, mark).await;
+			let confirmed = Instant::now();
+			// A new operation for this row, begun after the refusal: it, or its own
+			// replacement under the same caps, must be acknowledged before the mark.
+			let committed = loop {
+				let next = journal.begin(row, ordinal);
+				let bound = (Instant::now() + CLIENT_BOUND).min(mark);
+				settle_one(
+					&client,
+					&formed.descriptor,
+					&mut journal,
+					next,
+					"replacement offer (checkpoint)",
+					bound,
+				)
+				.await;
+				if journal.operations[next].disposition == Disposition::Committed {
+					break Instant::now();
+				}
+				journal.refusals += 1;
+				assert!(
+					ordinal < MAX_REPLACEMENTS_PER_ROW && journal.replacements < MAX_REPLACEMENTS,
+					"CHECKPOINT: the replacement for logical row {row} was refused and none is left"
+				);
+				ordinal += 1;
+				journal.replacements += 1;
+				confirm_refusal(&client, &formed.descriptor, &mut journal, next, mark).await;
+			};
+			assert!(
+				committed <= mark,
+				"CHECKPOINT: the new commit came after the mark"
+			);
+			for member in &formed.members {
+				wait_ready(
+					member,
+					&formed.pki,
+					&mut formed.daemons,
+					mark,
+					"CHECKPOINT readiness",
+				);
+			}
+			let ready = Instant::now();
+			assert!(ready <= mark, "CHECKPOINT: readiness came after the mark");
+			assert_eq!(
+				journal.count(Disposition::Unknown),
+				0,
+				"CHECKPOINT: an operation is unresolved"
+			);
+			let expected = journal.acknowledged();
+			assert!(
+				Instant::now() < mark,
+				"CHECKPOINT: no time left for the exact read"
+			);
+			expect_rows(
+				&client,
+				&formed.descriptor,
+				mark,
+				"CHECKPOINT: the exact read of every acknowledged row",
+				&expected,
+			)
+			.await;
+			let read = Instant::now();
+			assert!(
+				read <= mark,
+				"CHECKPOINT: the exact read completed after the mark"
+			);
+			same_processes(&mut formed, &processes, "at the end of the checkpoint");
+			eprintln!(
+				"smoke: CHECKPOINT RESULT: PASS inside {RECOVERY_BOUND:?} of the first definitive refusal: refusal confirmed after {:?}, a new operation acknowledged after {:?}, every node Ready after {:?}, exactly the {} acknowledged rows read after {:?}; the same three processes, no restart",
+				confirmed - observed,
+				committed - observed,
+				ready - observed,
+				expected.len(),
+				read - observed
+			);
+			break;
+		}
+	}
+	let rows = journal.acknowledged();
+	assert_eq!(
+		rows.len(),
+		ROWS as usize,
+		"one acknowledged operation per logical row"
+	);
+	eprintln!(
+		"smoke: all {ROWS} logical rows acknowledged; operations {}, definitive refusals {}, replacements {}{}",
+		journal.operations.len(),
+		journal.refusals,
+		journal.replacements,
+		if journal.refusals == 0 {
+			"; NO refusal occurred: the checkpoint and replacement branches were NOT exercised"
+		} else {
+			""
+		}
+	);
+
+	at("offload wait");
+	offloaded_by_every_owner(&mut formed, &objects, deadline, "offload wait").await;
+	at("the judged query before any restart");
+	judged_query(&client, &formed, &objects, &rows, "before any restart").await;
+	// Everything above was served by the processes recorded before ingestion.
+	same_processes(&mut formed, &processes, "before the first restart");
+	eprintln!("smoke: the same three processes served everything up to here; restarts begin now");
+
+	for at_member in 0..formed.members.len() {
+		let id = formed.members[at_member].id;
+		at(&format!("restart of node {id}"));
+		formed.daemons.stop(id, deadline);
+		formed.daemons.start(&formed.members[at_member]);
+		for member in &formed.members {
+			wait_ready(
+				member,
+				&formed.pki,
+				&mut formed.daemons,
+				deadline,
+				&format!("after restarting node {id}"),
+			);
+		}
+	}
+	let through = client_through(
+		&formed.members[0],
+		&formed.pki,
+		Credential::Storage,
+		deadline,
+	)
+	.await;
+	at("offload observation after the restarts");
+	offloaded_by_every_owner(&mut formed, &objects, deadline, "after the restarts").await;
+	at("the judged query after the restarts");
+	judged_query(&through, &formed, &objects, &rows, "after the restarts").await;
+
+	for id in NODES {
+		formed.daemons.stop(id, deadline);
+	}
+	assert!(Instant::now() < deadline, "the test overran its bound");
+	if let (Ok(record), None) = (std::env::var("WENDELON_SMOKE_RECORD_DIR"), node_control()) {
+		for member in &formed.members {
+			std::fs::copy(
+				&member.log,
+				Path::new(&record).join(format!("node-{}.daemon.log", member.id)),
+			)
+			.unwrap();
+		}
+	}
+	std::fs::remove_dir_all(&formed.root).unwrap();
+}
