@@ -216,6 +216,7 @@ impl WendelonDataServer {
 						tenant,
 						Identity::new(version.key_identity),
 						version.hlc,
+						None,
 					)
 					.await
 					.map_err(storage)?;

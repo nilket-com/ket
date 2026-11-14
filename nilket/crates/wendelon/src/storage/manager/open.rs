@@ -1127,6 +1127,8 @@ impl SlabManager {
 				.collect(),
 			slab_rewrite_claims: DashMap::new(),
 			tiered_stats_cache: DashMap::new(),
+			#[cfg(test)]
+			last_query_tails: std::sync::Mutex::new(std::sync::Weak::new()),
 			tier_publication_locks: DashMap::new(),
 			cleanup_claims: DashMap::new(),
 			conflicted_locations: DashSet::new(),

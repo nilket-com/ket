@@ -22280,6 +22280,301 @@ mod covered_tail_reuse {
 		);
 	}
 
+	// ADR 0733: the same reads on behalf of a query that holds fetched tails.
+
+	/// One record read for a query holding `tails`, through `pointer`, with what the
+	/// store was asked.
+	async fn read_reusing(
+		l2: &Arc<ScriptedStore>,
+		tiered: &Tiered,
+		pointer: &TieredSlabPointer,
+		row: usize,
+		tails: &crate::storage::manager::QueryTails,
+	) -> (
+		std::io::Result<(crate::schema::SlabRecordHeader, Vec<u8>)>,
+		Vec<Request>,
+	) {
+		l2.take_log();
+		let result = tiered
+			.mgr
+			.read_encrypted_record_and_header_reusing_for_test(
+				l2.as_ref(),
+				pointer,
+				tiered.rows[row].0,
+				tails,
+			)
+			.await;
+		(result, l2.take_log())
+	}
+
+	/// The first read of an object fetches its size and tail and the holder keeps them;
+	/// every later read of the query, record or statistics, asks the store nothing. A
+	/// store whose answers changed after that first fetch is not asked again, so the
+	/// change is not seen: that is the reuse.
+	#[tokio::test]
+	async fn a_held_tail_serves_later_records_and_the_statistics_with_no_request() {
+		let l2 = ScriptedStore::new();
+		let tiered = tiered(&l2, DEFAULT_TAIL, vec![(1, "codex"), (2, "claude")]).await;
+		let tails = tiered.mgr.query_tails();
+		let (first, asked) = read_reusing(&l2, &tiered, &tiered.pointer, 0, &tails).await;
+		assert_eq!(first.unwrap().1, tiered.rows[0].1);
+		assert_eq!(asked, [Request::Head, Request::Range(0, tiered.size)]);
+		assert_eq!(tails.held_for_test().0, 1);
+
+		l2.flip_at.store(tiered.size / 2, Ordering::SeqCst);
+		l2.tail.store(BYTE_FLIPPED, Ordering::SeqCst);
+		for row in [1, 0] {
+			let (again, asked) = read_reusing(&l2, &tiered, &tiered.pointer, row, &tails).await;
+			assert_eq!(again.unwrap().1, tiered.rows[row].1, "row {row}");
+			assert_eq!(asked, [], "row {row}");
+		}
+		let stats = tiered
+			.mgr
+			.load_tiered_column_stats_block(&tiered.pointer, &tiered.descriptor, Some(&tails))
+			.await
+			.unwrap();
+		assert!(stats.is_some(), "the statistics block applies");
+		assert_eq!(l2.take_log(), []);
+		assert_eq!(tails.held_for_test().0, 1);
+	}
+
+	/// The statistics range comes from the tail only for a query's holder, and only
+	/// when the tail holds all of it. With a holder and an object inside the tail
+	/// window: size and tail, and no third request. With no holder the same load makes
+	/// its range request as before. With a holder and a tail window that does not hold
+	/// the range, the range is requested.
+	#[tokio::test]
+	async fn the_statistics_range_is_taken_from_a_held_tail_only_when_the_tail_holds_it() {
+		let rows = vec![(1, "codex"), (2, "claude")];
+		let l2 = ScriptedStore::new();
+		let held = tiered(&l2, DEFAULT_TAIL, rows.clone()).await;
+		let tails = held.mgr.query_tails();
+		let stats = held
+			.mgr
+			.load_tiered_column_stats_block(&held.pointer, &held.descriptor, Some(&tails))
+			.await
+			.unwrap();
+		assert!(stats.is_some());
+		assert_eq!(l2.take_log(), [Request::Head, Request::Range(0, held.size)]);
+		// The record read that follows in the query asks nothing.
+		let (record, asked) = read_reusing(&l2, &held, &held.pointer, 0, &tails).await;
+		assert_eq!(record.unwrap().1, held.rows[0].1);
+		assert_eq!(asked, []);
+
+		// No holder: unchanged, the contained range is still requested.
+		let plain = ScriptedStore::new();
+		let unheld = tiered(&plain, DEFAULT_TAIL, rows.clone()).await;
+		let stats = unheld
+			.mgr
+			.load_tiered_column_stats_block(&unheld.pointer, &unheld.descriptor, None)
+			.await
+			.unwrap();
+		assert!(stats.is_some());
+		let asked = plain.take_log();
+		assert_eq!(
+			asked[..2],
+			[Request::Head, Request::Range(0, unheld.size)],
+			"{asked:?}"
+		);
+		let [Request::Range(start, end)] = asked[2..] else {
+			panic!("one statistics range request: {asked:?}");
+		};
+		assert!(start < end && end <= unheld.size);
+
+		// A holder whose tail does not hold the range: the range is requested.
+		let narrow = ScriptedStore::new();
+		let window = 256 + 16;
+		let outside = tiered(&narrow, window, rows).await;
+		let tails = outside.mgr.query_tails();
+		let stats = outside
+			.mgr
+			.load_tiered_column_stats_block(&outside.pointer, &outside.descriptor, Some(&tails))
+			.await
+			.unwrap();
+		assert!(stats.is_some());
+		let asked = narrow.take_log();
+		let tail_start = outside.size - window;
+		assert_eq!(
+			asked[..2],
+			[Request::Head, Request::Range(tail_start, outside.size)],
+			"{asked:?}"
+		);
+		let Some(Request::Range(start, _)) = asked[2..].last() else {
+			panic!("a statistics range request: {asked:?}");
+		};
+		assert!(*start < tail_start, "{asked:?}");
+		assert_eq!(tails.held_for_test().0, 1);
+	}
+
+	/// A tail answer of the wrong length is not admitted: the read does what a read
+	/// with no holder does with it, and the next honest fetch is admitted and served.
+	#[tokio::test]
+	async fn a_tail_of_the_wrong_length_is_not_held_and_the_read_goes_on_as_before() {
+		let l2 = ScriptedStore::new();
+		let tiered = tiered(&l2, DEFAULT_TAIL, vec![(1, "codex"), (2, "claude")]).await;
+		for mode in [SHORTER, LONGER, FOOTER_CUT] {
+			let tails = tiered.mgr.query_tails();
+			l2.tail.store(mode, Ordering::SeqCst);
+			let (with, asked_with) = read_reusing(&l2, &tiered, &tiered.pointer, 0, &tails).await;
+			assert_eq!(tails.held_for_test(), (0, 0), "mode {mode}");
+			let (without, asked_without) = read(&l2, &tiered, 0).await;
+			assert_eq!(asked_with, asked_without, "mode {mode}");
+			assert_eq!(
+				with.map(|(_, frame)| frame)
+					.map_err(|error| error.to_string()),
+				without
+					.map(|(_, frame)| frame)
+					.map_err(|error| error.to_string()),
+				"mode {mode}"
+			);
+			l2.tail.store(HONEST, Ordering::SeqCst);
+			let (honest, asked) = read_reusing(&l2, &tiered, &tiered.pointer, 0, &tails).await;
+			assert_eq!(honest.unwrap().1, tiered.rows[0].1, "mode {mode}");
+			assert_eq!(asked, [Request::Head, Request::Range(0, tiered.size)]);
+			assert_eq!(tails.held_for_test().0, 1, "mode {mode}");
+		}
+	}
+
+	/// A tail of the right length with an altered footer or an altered ciphertext byte
+	/// is held as fetched, and every read that uses it is refused by the same checks
+	/// that refuse it when fetched: holding bytes verifies nothing. The store is not
+	/// asked again within that query; a new query reads the honest object.
+	#[tokio::test]
+	async fn altered_bytes_in_a_held_tail_are_refused_on_every_reuse() {
+		let l2 = ScriptedStore::new();
+		let tiered = tiered(&l2, DEFAULT_TAIL, vec![(1, "codex"), (2, "claude")]).await;
+		l2.flip_at.store(tiered.size / 2, Ordering::SeqCst);
+		for mode in [FOOTER_FLIPPED, BYTE_FLIPPED] {
+			let tails = tiered.mgr.query_tails();
+			l2.tail.store(mode, Ordering::SeqCst);
+			let (fetched, asked) = read_reusing(&l2, &tiered, &tiered.pointer, 0, &tails).await;
+			let fetched = fetched.expect_err("the altered tail was accepted when fetched");
+			assert_eq!(asked, [Request::Head, Request::Range(0, tiered.size)]);
+			assert_eq!(tails.held_for_test().0, 1, "mode {mode}");
+			l2.tail.store(HONEST, Ordering::SeqCst);
+			let (reused, asked) = read_reusing(&l2, &tiered, &tiered.pointer, 0, &tails).await;
+			let reused = reused.expect_err("the altered tail was accepted when reused");
+			assert_eq!(asked, [], "mode {mode}");
+			assert_eq!(reused.to_string(), fetched.to_string(), "mode {mode}");
+			let (fresh, _) =
+				read_reusing(&l2, &tiered, &tiered.pointer, 0, &tiered.mgr.query_tails()).await;
+			assert_eq!(fresh.unwrap().1, tiered.rows[0].1, "mode {mode}");
+		}
+	}
+
+	/// The same object bytes published under a second URI, as a republished slab is.
+	async fn republished(l2: &Arc<ScriptedStore>, tiered: &Tiered) -> TieredSlabPointer {
+		let bytes = l2.inner.get_bytes(&tiered.pointer.l2_uri).await.unwrap();
+		let l2_uri = l2
+			.put(
+				&format!("covered-tail-again-{}.wnd", tiered.pointer.slab_id),
+				&bytes,
+			)
+			.await
+			.unwrap();
+		TieredSlabPointer {
+			l2_uri,
+			..tiered.pointer.clone()
+		}
+	}
+
+	/// A tail is held for its URI. A read whose pointer names another URI, as after
+	/// a republication between the proof and the execution, misses and fetches.
+	#[tokio::test]
+	async fn an_object_under_a_new_uri_is_fetched_though_the_old_one_is_held() {
+		let l2 = ScriptedStore::new();
+		let tiered = tiered(&l2, DEFAULT_TAIL, vec![(1, "codex"), (2, "claude")]).await;
+		let again = republished(&l2, &tiered).await;
+		let tails = tiered.mgr.query_tails();
+		let (proved, _) = read_reusing(&l2, &tiered, &tiered.pointer, 0, &tails).await;
+		proved.unwrap();
+		let (executed, asked) = read_reusing(&l2, &tiered, &again, 0, &tails).await;
+		assert_eq!(executed.unwrap().1, tiered.rows[0].1);
+		assert_eq!(asked, [Request::Head, Request::Range(0, tiered.size)]);
+		assert_eq!(tails.held_for_test().0, 2);
+	}
+
+	/// A holder that is full, or whose budget one tail would pass, admits nothing more
+	/// and evicts nothing: the reads it cannot serve make the requests they make with
+	/// no holder and return the same bytes, and the reads it can serve still ask nothing.
+	#[tokio::test]
+	async fn past_its_limits_a_holder_changes_no_answer_and_the_reads_fetch_as_before() {
+		let l2 = ScriptedStore::new();
+		let tiered = tiered(&l2, DEFAULT_TAIL, vec![(1, "codex"), (2, "claude")]).await;
+		let again = republished(&l2, &tiered).await;
+		let fetched = [Request::Head, Request::Range(0, tiered.size)];
+
+		let one = tiered.mgr.query_tails_with_limits_for_test(1, usize::MAX);
+		let (first, asked) = read_reusing(&l2, &tiered, &tiered.pointer, 0, &one).await;
+		assert_eq!(first.unwrap().1, tiered.rows[0].1);
+		assert_eq!(asked, fetched);
+		let held = one.held_for_test();
+		assert_eq!(held.0, 1);
+		for row in [0, 1] {
+			let (beyond, asked) = read_reusing(&l2, &tiered, &again, row, &one).await;
+			assert_eq!(beyond.unwrap().1, tiered.rows[row].1, "row {row}");
+			assert_eq!(asked, fetched, "row {row}");
+			assert_eq!(one.held_for_test(), held, "row {row}");
+		}
+		let (served, asked) = read_reusing(&l2, &tiered, &tiered.pointer, 1, &one).await;
+		assert_eq!(served.unwrap().1, tiered.rows[1].1);
+		assert_eq!(asked, []);
+
+		// A budget smaller than this tail's charge.
+		let short = tiered
+			.mgr
+			.query_tails_with_limits_for_test(16, tiered.size as usize);
+		for row in [0, 1] {
+			let (read, asked) = read_reusing(&l2, &tiered, &tiered.pointer, row, &short).await;
+			assert_eq!(read.unwrap().1, tiered.rows[row].1, "row {row}");
+			assert_eq!(asked, fetched, "row {row}");
+			assert_eq!(short.held_for_test(), (0, 0), "row {row}");
+		}
+	}
+
+	/// The tenant's key removed between two reads of a query: the second read fails as
+	/// it fails with no holder, though the bytes it would decrypt are held.
+	#[tokio::test]
+	async fn a_held_tail_does_not_stand_in_for_a_removed_key() {
+		let l2 = ScriptedStore::new();
+		let tiered = tiered(&l2, DEFAULT_TAIL, vec![(1, "codex"), (2, "claude")]).await;
+		let tails = tiered.mgr.query_tails();
+		let (proved, _) = read_reusing(&l2, &tiered, &tiered.pointer, 0, &tails).await;
+		proved.unwrap();
+		tiered
+			.mgr
+			.crypto_for_test()
+			.replace_keysets_from_authoritative_snapshot(&std::collections::HashMap::new())
+			.unwrap();
+		let (held, asked) = read_reusing(&l2, &tiered, &tiered.pointer, 0, &tails).await;
+		let held = held.expect_err("read with the tenant's key removed");
+		assert_eq!(asked, [], "the bytes were held");
+		let (fetched, asked) = read(&l2, &tiered, 0).await;
+		let fetched = fetched.expect_err("read with the tenant's key removed, no holder");
+		assert_eq!(asked, [Request::Head, Request::Range(0, tiered.size)]);
+		assert_eq!(
+			(held.kind(), held.to_string()),
+			(fetched.kind(), fetched.to_string())
+		);
+	}
+
+	/// A holder made by another manager is not this manager's: nothing is taken from
+	/// it and nothing is put in it.
+	#[tokio::test]
+	async fn another_managers_holder_is_ignored() {
+		let other_store = ScriptedStore::new();
+		let other = tiered(&other_store, DEFAULT_TAIL, vec![(1, "codex")]).await;
+		let foreign = other.mgr.query_tails();
+		let l2 = ScriptedStore::new();
+		let tiered = tiered(&l2, DEFAULT_TAIL, vec![(1, "codex"), (2, "claude")]).await;
+		for row in [0, 1, 0] {
+			let (read, asked) = read_reusing(&l2, &tiered, &tiered.pointer, row, &foreign).await;
+			assert_eq!(read.unwrap().1, tiered.rows[row].1, "row {row}");
+			assert_eq!(asked, [Request::Head, Request::Range(0, tiered.size)]);
+			assert_eq!(foreign.held_for_test(), (0, 0), "row {row}");
+		}
+	}
+
 	/// The mapping from object offsets to the tail window, on its own.
 	#[test]
 	fn a_range_is_covered_only_by_a_whole_tail_that_holds_all_of_it() {

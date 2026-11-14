@@ -620,6 +620,7 @@ pub(super) async fn verify_owned_rows(
 				intent.tenant,
 				Identity::new(version.key_identity),
 				version.hlc,
+				None,
 			)
 			.await
 			.map_err(|error| unverified(error.to_string()))?;
@@ -836,6 +837,7 @@ pub(super) async fn persist_locked(
 						plan.intent.tenant,
 						Identity::new(version.key_identity),
 						version.hlc,
+						None,
 					)
 					.await
 					.map_err(storage)?;

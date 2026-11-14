@@ -210,7 +210,7 @@ impl WendelonDataServer {
 			.ok()?;
 		let rows = self
 			.slab
-			.stored_rows_at_version(key.tenant, identity, key.hlc)
+			.stored_rows_at_version(key.tenant, identity, key.hlc, None)
 			.await
 			.ok()?;
 		if rows.len() != locations.len() {

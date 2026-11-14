@@ -24,13 +24,18 @@ use crate::consensus::decision_mode::DecisionMode;
 use crate::consensus::decisions::{ParentNamespace, ParentStatus, Signer};
 use crate::network::decision_proposals::CutResponse;
 use crate::storage::index::parent_intents::{OwnedVersion, ParentIntentState};
+use crate::storage::manager::QueryTails;
 
 /// Where the executor's per-range rows come from: today's base scan, or rows
 /// this reader selected and proved.
 #[derive(Clone, Copy)]
 pub(super) enum ScanSource<'a> {
 	Base,
-	Proved(&'a [Vec<(Identity, Locality, RecordLocation)>]),
+	/// The proved rows, and the tails the query's proof already fetched.
+	Proved(
+		&'a [Vec<(Identity, Locality, RecordLocation)>],
+		&'a QueryTails,
+	),
 }
 
 /// How long a reader waits for its cut to be applied here.
@@ -540,7 +545,8 @@ impl WendelonDataServer {
 			child: None,
 			conflict: false,
 		};
-		self.proved_location(tenant, descriptor, key, &winner).await
+		self.proved_location(tenant, descriptor, key, &winner, None)
+			.await
 	}
 
 	/// The winner's stored location here, every copy checked against the
@@ -551,6 +557,7 @@ impl WendelonDataServer {
 		descriptor: &TableSchemaDescriptor,
 		key: Identity,
 		winner: &Winner,
+		tails: Option<&QueryTails>,
 	) -> Result<Option<(Locality, RecordLocation)>, ReadRefusal> {
 		let transient = |error: std::io::Error| ReadRefusal::Transient(error.to_string());
 		let locations = self
@@ -566,7 +573,7 @@ impl WendelonDataServer {
 		}
 		let stored = self
 			.slab
-			.stored_rows_at_version(tenant, key, winner.hlc)
+			.stored_rows_at_version(tenant, key, winner.hlc, tails)
 			.await
 			.map_err(transient)?;
 		for row in &stored {
@@ -595,6 +602,7 @@ impl WendelonDataServer {
 		k: u64,
 		local: Signer,
 		max_versions: u64,
+		tails: &QueryTails,
 	) -> Result<Vec<Vec<(Identity, Locality, RecordLocation)>>, ReadRefusal> {
 		let table = descriptor.table_object_id;
 		let children = self
@@ -652,7 +660,7 @@ impl WendelonDataServer {
 		let mut repaired = std::collections::BTreeSet::new();
 		for (key, winner) in &winners {
 			let mut proved = self
-				.proved_location(tenant, descriptor, *key, winner)
+				.proved_location(tenant, descriptor, *key, winner, Some(tails))
 				.await?;
 			if proved.is_none()
 				&& let Some(at) = winner.child
@@ -668,7 +676,7 @@ impl WendelonDataServer {
 						))
 					})?;
 				proved = self
-					.proved_location(tenant, descriptor, *key, winner)
+					.proved_location(tenant, descriptor, *key, winner, Some(tails))
 					.await?;
 			}
 			let Some((locality, location)) = proved else {
@@ -906,8 +914,20 @@ impl WendelonDataServer {
 		} else {
 			budget.max_rows.min(CHECKPOINT_MAX_VERSIONS)
 		};
+		// One holder for this statement, in this frame: the proof and the
+		// execution below borrow it, nothing else receives it, and it is
+		// dropped when this function returns or its future is dropped.
+		let tails = self.slab.query_tails();
 		let proved = bound
-			.run(self.prove_rows(tenant, &descriptor, &ranges, k, signer.signer, max_versions))
+			.run(self.prove_rows(
+				tenant,
+				&descriptor,
+				&ranges,
+				k,
+				signer.signer,
+				max_versions,
+				&tails,
+			))
 			.await;
 		let rows = match proved.and_then(|proved| proved) {
 			Ok(rows) => rows,
@@ -936,7 +956,7 @@ impl WendelonDataServer {
 			effective_retention.floor,
 			Some(cancellation_token),
 			Some(writer),
-			ScanSource::Proved(&rows),
+			ScanSource::Proved(&rows, &tails),
 		)
 		.await?;
 		// No success after the statement ended, an empty answer included.
@@ -980,7 +1000,7 @@ impl WendelonDataServer {
 			);
 		}
 		Ok(self
-			.proved_location(tenant, descriptor, row, winner)
+			.proved_location(tenant, descriptor, row, winner, None)
 			.await?
 			.is_some_and(|(_, location)| !location.is_tombstone))
 	}
@@ -1293,7 +1313,7 @@ impl WendelonDataServer {
 			return unsupported("two parents hold the key at an equal full HLC");
 		}
 		let mut proved = match self
-			.proved_location(tenant, &descriptor, identity, &winner)
+			.proved_location(tenant, &descriptor, identity, &winner, None)
 			.await
 		{
 			Ok(proved) => proved,
@@ -1313,7 +1333,7 @@ impl WendelonDataServer {
 				return respond(ReadStatus::BACKPRESSURED);
 			}
 			proved = match self
-				.proved_location(tenant, &descriptor, identity, &winner)
+				.proved_location(tenant, &descriptor, identity, &winner, None)
 				.await
 			{
 				Ok(proved) => proved,
@@ -1331,7 +1351,7 @@ impl WendelonDataServer {
 		}
 		let stored = match self
 			.slab
-			.stored_rows_at_version(tenant, identity, winner.hlc)
+			.stored_rows_at_version(tenant, identity, winner.hlc, None)
 			.await
 		{
 			Ok(stored) if !stored.is_empty() => stored,

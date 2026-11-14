@@ -7253,7 +7253,7 @@ async fn stats_advisory_absence_skips_stats_fetch() {
 	};
 
 	let stats = mgr
-		.load_tiered_column_stats_block(&pointer, &descriptor)
+		.load_tiered_column_stats_block(&pointer, &descriptor, None)
 		.await
 		.unwrap();
 
@@ -7364,7 +7364,7 @@ async fn stats_advisory_drift_fails_closed_to_unavailable() {
 	let drift_before = metrics().pbc_slab_stats_pointer_drift_total.get();
 
 	let stats = mgr
-		.load_tiered_column_stats_block(&pointer, &descriptor)
+		.load_tiered_column_stats_block(&pointer, &descriptor, None)
 		.await
 		.unwrap();
 

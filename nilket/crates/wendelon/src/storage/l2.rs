@@ -115,6 +115,121 @@ pub trait ObjectStore: Send + Sync {
 	async fn delete(&self, uri: &str) -> std::io::Result<()>;
 }
 
+/// Test-only: a log of the read requests made to a node's LocalFs object store. A test
+/// registers a root BEFORE the nodes that use it are built; every store then built over
+/// that root by `ObjectStoreConfig::build_with_owner` records each `head`, `get_range`
+/// and whole-object read, with its URI, and delegates everything unchanged.
+#[cfg(test)]
+pub(crate) mod request_log {
+	use super::*;
+
+	#[derive(Clone, Debug, PartialEq, Eq)]
+	pub(crate) enum Request {
+		Head(String),
+		Range(String, u64, u64),
+		Whole(String),
+	}
+
+	pub(crate) struct RequestLog(Mutex<Vec<Request>>, tokio::sync::watch::Sender<bool>);
+
+	impl Default for RequestLog {
+		fn default() -> Self {
+			Self(Mutex::default(), tokio::sync::watch::Sender::new(false))
+		}
+	}
+
+	impl RequestLog {
+		/// While held, every read request waits, after it is logged, until released.
+		pub(crate) fn hold_reads(&self, hold: bool) {
+			self.1.send_replace(hold);
+		}
+
+		async fn pass(&self) {
+			let _ = self.1.subscribe().wait_for(|held| !*held).await;
+		}
+
+		fn note(&self, request: Request) {
+			self.0.lock().unwrap().push(request);
+		}
+
+		/// The requests logged since the last call, in order.
+		pub(crate) fn take(&self) -> Vec<Request> {
+			std::mem::take(&mut *self.0.lock().unwrap())
+		}
+	}
+
+	static REGISTERED: Mutex<Vec<(PathBuf, Arc<RequestLog>)>> = Mutex::new(Vec::new());
+
+	pub(crate) fn log_requests_under(root: &Path) -> Arc<RequestLog> {
+		let log = Arc::new(RequestLog::default());
+		REGISTERED
+			.lock()
+			.unwrap()
+			.push((root.to_path_buf(), log.clone()));
+		log
+	}
+
+	pub(super) fn wrapped(root: &Path, store: Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore> {
+		let registered = REGISTERED.lock().unwrap();
+		match registered.iter().find(|(path, _)| path == root) {
+			Some((_, log)) => Arc::new(Logging {
+				inner: store,
+				log: log.clone(),
+			}),
+			None => store,
+		}
+	}
+
+	struct Logging {
+		inner: Arc<dyn ObjectStore>,
+		log: Arc<RequestLog>,
+	}
+
+	#[async_trait]
+	impl ObjectStore for Logging {
+		async fn put(&self, key: &str, bytes: &[u8]) -> std::io::Result<String> {
+			self.inner.put(key, bytes).await
+		}
+
+		fn planned_upload_uri(&self, key: &str) -> std::io::Result<String> {
+			self.inner.planned_upload_uri(key)
+		}
+
+		async fn head(&self, uri: &str) -> std::io::Result<ObjectMetadata> {
+			self.log.note(Request::Head(uri.to_owned()));
+			self.log.pass().await;
+			self.inner.head(uri).await
+		}
+
+		async fn get_range(&self, uri: &str, range: Range<u64>) -> std::io::Result<Bytes> {
+			self.log
+				.note(Request::Range(uri.to_owned(), range.start, range.end));
+			self.log.pass().await;
+			self.inner.get_range(uri, range).await
+		}
+
+		async fn get_bytes(&self, uri: &str) -> std::io::Result<Bytes> {
+			self.log.note(Request::Whole(uri.to_owned()));
+			self.log.pass().await;
+			self.inner.get_bytes(uri).await
+		}
+
+		async fn get(&self, uri: &str) -> std::io::Result<Vec<u8>> {
+			self.log.note(Request::Whole(uri.to_owned()));
+			self.log.pass().await;
+			self.inner.get(uri).await
+		}
+
+		async fn list(&self, prefix: &str) -> std::io::Result<Vec<ObjectMetadata>> {
+			self.inner.list(prefix).await
+		}
+
+		async fn delete(&self, uri: &str) -> std::io::Result<()> {
+			self.inner.delete(uri).await
+		}
+	}
+}
+
 /// Configured L2 backend for a node.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ObjectStoreConfig {
@@ -128,10 +243,15 @@ impl ObjectStoreConfig {
 		owner: crate::storage::ownership::DataDirectoryOwner,
 	) -> std::io::Result<Arc<dyn ObjectStore>> {
 		match self {
-			Self::LocalFs { root } => Ok(Arc::new(LocalFsObjectStore::new_with_file_ops(
-				root.clone(),
-				Arc::new(BlockingFileOps::with_owner(owner)),
-			)?)),
+			Self::LocalFs { root } => {
+				let store: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new_with_file_ops(
+					root.clone(),
+					Arc::new(BlockingFileOps::with_owner(owner)),
+				)?);
+				#[cfg(test)]
+				let store = request_log::wrapped(root, store);
+				Ok(store)
+			}
 			Self::Remote(config) => Ok(Arc::new(RemoteObjectStore::new(config.clone())?)),
 		}
 	}

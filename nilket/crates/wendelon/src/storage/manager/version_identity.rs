@@ -762,10 +762,11 @@ impl SlabManager {
 		tenant_id: TenantId,
 		key_identity: Identity,
 		hlc: HybridTimestamp,
+		tails: Option<&QueryTails>,
 	) -> std::io::Result<Vec<RecordBatch>> {
 		let mut rows = Vec::new();
 		for location in self.same_hlc_locations(tenant_id, key_identity, hlc)? {
-			let stored = self.read(location).await?;
+			let stored = self.read_reusing(location, tails).await?;
 			let batch = decode_record_batch(&stored)?;
 			let row = location.record_row_index.get() as usize;
 			if row >= batch.num_rows() {

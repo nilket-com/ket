@@ -6730,6 +6730,10 @@ mod attempt_exhaustion;
 #[path = "parent_decisions_cluster_tests/offload.rs"]
 mod offload;
 
+/// ADR 0733: the remote requests of one query.
+#[path = "parent_decisions_cluster_tests/query_tails.rs"]
+mod query_tails;
+
 /// ADR 0726: joins and the root check.
 #[path = "parent_decisions_cluster_tests/root_check.rs"]
 mod root_check;

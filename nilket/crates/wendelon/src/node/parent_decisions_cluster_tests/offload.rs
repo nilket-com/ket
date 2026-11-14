@@ -61,7 +61,7 @@ fn terms(cluster: &Cluster) -> Vec<(u32, u64, Option<u32>)> {
 		.collect()
 }
 
-async fn write_rows(
+pub(super) async fn write_rows(
 	cluster: &Cluster,
 	leader: u32,
 	descriptor: &TableSchemaDescriptor,
@@ -117,7 +117,7 @@ async fn frames_at(
 /// every poll the slab is on local disk or has a committed pointer, never
 /// neither. Checked before any read of the tiered slab, so a file that a later
 /// rehydration writes back is not mistaken for one never reclaimed.
-async fn until_offloaded(cluster: &Cluster, node: u32, id: SlabId, what: &str) {
+pub(super) async fn until_offloaded(cluster: &Cluster, node: u32, id: SlabId, what: &str) {
 	let slab = &cluster.node(node).slab;
 	let deadline = tokio::time::Instant::now() + BOUND;
 	loop {
@@ -140,7 +140,7 @@ async fn until_offloaded(cluster: &Cluster, node: u32, id: SlabId, what: &str) {
 }
 
 /// Waits until `node`'s tier authority reports ready.
-async fn until_ready(cluster: &Cluster, node: u32, what: &str) {
+pub(super) async fn until_ready(cluster: &Cluster, node: u32, what: &str) {
 	let slab = &cluster.node(node).slab;
 	let deadline = tokio::time::Instant::now() + BOUND;
 	loop {

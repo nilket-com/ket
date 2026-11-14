@@ -249,8 +249,10 @@ pub use slab_file_quarantine::{
 };
 #[cfg(test)]
 mod pause_hooks;
+mod query_tails;
 #[cfg(test)]
 pub(crate) use pause_hooks::LsmPublicationForTest;
+pub(crate) use query_tails::QueryTails;
 use tiered_io::{
 	RehydratedCopy, SlabBacking, TierObjectEvidence, decode_tiered_blob,
 	descriptor_matches_tiered_row, extract_record_from_blob, fetch_tiered_ciphertext_runs,
@@ -806,6 +808,9 @@ pub struct SlabManager {
 	/// locator identity. This avoids repeated L2 range reads and
 	/// AEAD decrypts for WFRM query bursts over the same cold slab.
 	tiered_stats_cache: DashMap<TieredStatsCacheKey, ParsedColumnStatsBlock>,
+	/// Test observation: the holder the latest query made.
+	#[cfg(test)]
+	last_query_tails: std::sync::Mutex<std::sync::Weak<QueryTails>>,
 	/// Per-slab tier publication locks (tier publication and retirement only).
 	tier_publication_locks: DashMap<SlabId, Arc<tokio::sync::Mutex<()>>>,
 	/// Serializes legacy cleanup with new unresolved records for a slab.
@@ -2583,6 +2588,7 @@ impl SlabManager {
 		&self,
 		pointer: &TieredSlabPointer,
 		descriptor: &TableSchemaDescriptor,
+		tails: Option<&QueryTails>,
 	) -> std::io::Result<Option<ParsedColumnStatsBlock>> {
 		self.require_tier_read_scope(&[pointer.slab_id])?;
 		metrics().pbc_slab_stats_consulted_total.inc();
@@ -2599,16 +2605,14 @@ impl SlabManager {
 			return Ok(None);
 		};
 		metrics().pbc_slab_stats_cache_misses_total.inc();
-		let metadata = l2.head(&pointer.l2_uri).await?;
-		let tail_start = metadata
-			.size_bytes
-			.saturating_sub(self.config.rehydration.tail_read_window_bytes);
-		let tail_window = l2
-			.get_range(&pointer.l2_uri, tail_start..metadata.size_bytes)
+		let tail = self
+			.object_tail(l2.as_ref(), &pointer.l2_uri, tails)
 			.await?;
+		let object_size = tail.size;
+		let tail_window = &tail.bytes;
 		let additional_metadata_range = match self.config.crypto.additional_tiered_metadata_range(
 			pointer.slab_id,
-			metadata.size_bytes,
+			object_size,
 			tail_window.as_ref(),
 		) {
 			Ok(range) => range,
@@ -2623,7 +2627,7 @@ impl SlabManager {
 		};
 		let Some(plan) = self.config.crypto.plan_tiered_stats_block_read(
 			pointer.slab_id,
-			metadata.size_bytes,
+			object_size,
 			tail_window.as_ref(),
 			additional_metadata.as_deref(),
 		)?
@@ -2639,9 +2643,20 @@ impl SlabManager {
 			metrics().pbc_slab_stats_pointer_drift_total.inc();
 			return Ok(None);
 		}
-		let stats_ciphertext = l2
-			.get_range(&pointer.l2_uri, plan.stats_range_in_object())
-			.await?;
+		// Only a tail the query's holder holds stands in for a range request:
+		// its extent was checked at admission, and the containment rule maps
+		// the statistics range into it or not at all. Every other caller
+		// fetches the range as before.
+		let stats_range = plan.stats_range_in_object();
+		let within_held_tail = if tail.held {
+			tiered_io::covered_by_tail(tail.start, object_size, tail_window.len(), &stats_range)
+		} else {
+			None
+		};
+		let stats_ciphertext = match within_held_tail {
+			Some(within) => tail_window.slice(within),
+			None => l2.get_range(&pointer.l2_uri, stats_range).await?,
+		};
 		let stats = plan.decrypt(stats_ciphertext.as_ref(), descriptor.schema_generation)?;
 		let parsed = parse_column_stats_block(&stats.plaintext)?;
 		let parsed_identity = ColumnStatsDescriptorIdentity::from_header(&parsed.header);

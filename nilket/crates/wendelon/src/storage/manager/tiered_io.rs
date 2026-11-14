@@ -3144,6 +3144,7 @@ impl SlabManager {
 		&self,
 		pointer: &TieredSlabPointer,
 		location: RecordLocation,
+		tails: Option<&QueryTails>,
 	) -> std::io::Result<(SlabRecordHeader, Vec<u8>)> {
 		let l2 = self.config.l2.as_ref().ok_or_else(|| {
 			Error::new(
@@ -3156,7 +3157,7 @@ impl SlabManager {
 		})?;
 		let mut plaintext_for_rehydration = None;
 		let (header, frame) = if pointer.is_encrypted {
-			self.read_encrypted_record_and_header_from_l2(l2.as_ref(), pointer, location)
+			self.read_encrypted_record_and_header_from_l2(l2.as_ref(), pointer, location, tails)
 				.await?
 		} else {
 			let plaintext = self
@@ -3220,7 +3221,7 @@ impl SlabManager {
 		pointer: &TieredSlabPointer,
 		location: RecordLocation,
 	) -> std::io::Result<Vec<u8>> {
-		self.read_encrypted_record_and_header_from_l2(l2, pointer, location)
+		self.read_encrypted_record_and_header_from_l2(l2, pointer, location, None)
 			.await
 			.map(|(_, frame)| frame)
 	}
@@ -3230,17 +3231,17 @@ impl SlabManager {
 		l2: &dyn ObjectStore,
 		pointer: &TieredSlabPointer,
 		location: RecordLocation,
+		tails: Option<&QueryTails>,
 	) -> std::io::Result<(SlabRecordHeader, Vec<u8>)> {
-		let metadata = l2.head(&pointer.l2_uri).await?;
-		let tail_start = metadata
-			.size_bytes
-			.saturating_sub(self.config.rehydration.tail_read_window_bytes);
-		let tail_window = l2
-			.get_range(&pointer.l2_uri, tail_start..metadata.size_bytes)
-			.await?;
+		let ObjectTail {
+			size: object_size,
+			start: tail_start,
+			bytes: tail_window,
+			held: _,
+		} = self.object_tail(l2, &pointer.l2_uri, tails).await?;
 		let additional_metadata_range = self.config.crypto.additional_tiered_metadata_range(
 			pointer.slab_id,
-			metadata.size_bytes,
+			object_size,
 			tail_window.as_ref(),
 		)?;
 		let additional_metadata = match additional_metadata_range {
@@ -3249,7 +3250,7 @@ impl SlabManager {
 		};
 		let plan = self.config.crypto.plan_tiered_range_read(
 			pointer.slab_id,
-			metadata.size_bytes,
+			object_size,
 			tail_window.as_ref(),
 			additional_metadata.as_deref(),
 			LogicalExtent::of(&location),
@@ -3264,7 +3265,7 @@ impl SlabManager {
 		let ciphertext_range = plan.ciphertext_range_in_object();
 		let ciphertext = match covered_by_tail(
 			tail_start,
-			metadata.size_bytes,
+			object_size,
 			tail_window.len(),
 			&ciphertext_range,
 		) {
@@ -3284,8 +3285,54 @@ impl SlabManager {
 		pointer: &TieredSlabPointer,
 		location: RecordLocation,
 	) -> std::io::Result<(SlabRecordHeader, Vec<u8>)> {
-		self.read_encrypted_record_and_header_from_l2(l2, pointer, location)
+		self.read_encrypted_record_and_header_from_l2(l2, pointer, location, None)
 			.await
+	}
+
+	/// Test seam: the same read on behalf of a query that holds `tails`.
+	#[cfg(test)]
+	pub(crate) async fn read_encrypted_record_and_header_reusing_for_test(
+		&self,
+		l2: &dyn ObjectStore,
+		pointer: &TieredSlabPointer,
+		location: RecordLocation,
+		tails: &QueryTails,
+	) -> std::io::Result<(SlabRecordHeader, Vec<u8>)> {
+		self.read_encrypted_record_and_header_from_l2(l2, pointer, location, Some(tails))
+			.await
+	}
+
+	/// The size and the tail window of the object at `uri`. A query's holder
+	/// answers for an object it already holds, with no request; otherwise the
+	/// size and the tail are fetched as ever and offered to the holder.
+	/// `held` says the returned tail is the holder's entry for `uri`.
+	pub(super) async fn object_tail(
+		&self,
+		l2: &dyn ObjectStore,
+		uri: &str,
+		tails: Option<&QueryTails>,
+	) -> std::io::Result<ObjectTail> {
+		if let Some(held) = tails.and_then(|tails| tails.get(l2, uri)) {
+			return Ok(ObjectTail {
+				size: held.size,
+				start: held.start,
+				bytes: held.bytes,
+				held: true,
+			});
+		}
+		let metadata = l2.head(uri).await?;
+		let start = metadata
+			.size_bytes
+			.saturating_sub(self.config.rehydration.tail_read_window_bytes);
+		let bytes = l2.get_range(uri, start..metadata.size_bytes).await?;
+		let held =
+			tails.is_some_and(|tails| tails.offer(l2, uri, metadata.size_bytes, start, &bytes));
+		Ok(ObjectTail {
+			size: metadata.size_bytes,
+			start,
+			bytes,
+			held,
+		})
 	}
 
 	pub(super) async fn note_l2_read(&self, slab_id: SlabId) -> bool {
@@ -3664,6 +3711,16 @@ fn tier_publication_unleased(slab_id: SlabId) -> Error {
 			slab_id.get()
 		),
 	)
+}
+
+/// An object's size and its tail window `start..size`, as fetched or as held
+/// by the query's [`QueryTails`].
+pub(super) struct ObjectTail {
+	pub(super) size: u64,
+	pub(super) start: u64,
+	pub(super) bytes: Bytes,
+	/// The tail is the holder's entry: its extent is exactly `start..size`.
+	pub(super) held: bool,
 }
 
 /// ADR 0730: where `range` (object offsets) lies inside a tail window that was

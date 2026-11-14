@@ -6406,7 +6406,7 @@ impl WendelonDataServer {
 			}
 			let stats = match self
 				.slab
-				.load_tiered_column_stats_block(&pointer, &prepared.descriptor)
+				.load_tiered_column_stats_block(&pointer, &prepared.descriptor, None)
 				.await?
 			{
 				Some(stats) => stats,
@@ -12141,6 +12141,7 @@ async fn table_stats_may_match_location(
 	program: &pbc::Program,
 	cache: &mut QueryStatsPruneCache,
 	location: RecordLocation,
+	tails: Option<&crate::storage::manager::QueryTails>,
 ) -> std::io::Result<bool> {
 	let Some(descriptor) = table_descriptor else {
 		return Ok(true);
@@ -12160,7 +12161,7 @@ async fn table_stats_may_match_location(
 	};
 	let decrypt_failed_before = metrics().pbc_slab_stats_decrypt_failed_total.get();
 	let stats = match slab
-		.load_tiered_column_stats_block(&pointer, descriptor)
+		.load_tiered_column_stats_block(&pointer, descriptor, tails)
 		.await
 	{
 		Ok(Some(stats)) => stats,
@@ -12692,6 +12693,7 @@ async fn plan_table_query_execution_by_secondary_index(
 						program,
 						&mut stats_prune_cache,
 						location,
+						None,
 					))
 					.await
 				{
@@ -13382,9 +13384,10 @@ async fn plan_query_execution_for_ranges_with_program_maybe_cancelled(
 		}
 	}
 	// ADR 0699 S4: proved rows, one list per range, in range order.
-	let mut proved = match source {
-		reader::ScanSource::Base => None,
-		reader::ScanSource::Proved(rows) => Some(rows.iter()),
+	// ADR 0733: with them, the tails the proof fetched; a base scan has none.
+	let (mut proved, tails) = match source {
+		reader::ScanSource::Base => (None, None),
+		reader::ScanSource::Proved(rows, tails) => (Some(rows.iter()), Some(tails)),
 	};
 	'ranges: for range in ranges {
 		if row_limit_satisfied(rows, row_limit) {
@@ -13454,6 +13457,7 @@ async fn plan_query_execution_for_ranges_with_program_maybe_cancelled(
 						program,
 						&mut stats_prune_cache,
 						location,
+						tails,
 					))
 					.await
 				{
@@ -13645,7 +13649,7 @@ async fn plan_query_execution_for_ranges_with_program_maybe_cancelled(
 				Some(batch) => (batch, false),
 				None => {
 					let phase_started = phase_trace.started();
-					let bytes = match clocks.bound(slab.read(location)).await {
+					let bytes = match clocks.bound(slab.read_reusing(location, tails)).await {
 						Ok(bytes) => bytes?,
 						Err(expired) => {
 							return Ok(query_plan_error(meta, expired, local_node));

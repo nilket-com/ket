@@ -1039,7 +1039,12 @@ async fn a_partial_append_survives_a_real_reopen_and_finishes_only_what_is_missi
 	.unwrap();
 	for version in &planned.intent.manifest {
 		let copies = slab
-			.stored_rows_at_version(TENANT, Identity::new(version.key_identity), version.hlc)
+			.stored_rows_at_version(
+				TENANT,
+				Identity::new(version.key_identity),
+				version.hlc,
+				None,
+			)
 			.await
 			.unwrap();
 		assert_eq!(copies.len(), 1, "exactly one copy of each version");

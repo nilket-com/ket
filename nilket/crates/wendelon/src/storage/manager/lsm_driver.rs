@@ -3719,7 +3719,19 @@ impl SlabManager {
 		location: RecordLocation,
 		missing_origin: PublishedReferenceOrigin,
 	) -> std::io::Result<Vec<u8>> {
-		self.read_expected_version(location, missing_origin, None)
+		self.read_expected_version(location, missing_origin, None, None)
+			.await
+	}
+
+	/// A client read of `location` on behalf of a query that holds `tails`:
+	/// [`SlabStore::read`], except that a remote object's size and tail come
+	/// from the holder when it has them.
+	pub(crate) async fn read_reusing(
+		&self,
+		location: RecordLocation,
+		tails: Option<&QueryTails>,
+	) -> std::io::Result<Vec<u8>> {
+		self.read_expected_version(location, PublishedReferenceOrigin::Read, None, tails)
 			.await
 	}
 
@@ -3736,6 +3748,7 @@ impl SlabManager {
 			location,
 			PublishedReferenceOrigin::Read,
 			Some((tenant_id, key_identity)),
+			None,
 		)
 		.await
 	}
@@ -3748,8 +3761,9 @@ impl SlabManager {
 		location: RecordLocation,
 		missing_origin: PublishedReferenceOrigin,
 		named: Option<(TenantId, Identity)>,
+		tails: Option<&QueryTails>,
 	) -> std::io::Result<Vec<u8>> {
-		self.read_expected_version_with_header(location, missing_origin, named)
+		self.read_expected_version_with_header(location, missing_origin, named, tails)
 			.await
 			.map(|(_, frame)| frame)
 	}
@@ -3785,9 +3799,10 @@ impl SlabManager {
 		location: RecordLocation,
 		missing_origin: PublishedReferenceOrigin,
 		named: Option<(TenantId, Identity)>,
+		tails: Option<&QueryTails>,
 	) -> std::io::Result<(SlabRecordHeader, Vec<u8>)> {
 		let first = self
-			.read_expected_version_once(location, missing_origin, named)
+			.read_expected_version_once(location, missing_origin, named, tails)
 			.await;
 		let (Err(error), Some((tenant_id, key_identity))) = (&first, named) else {
 			return first;
@@ -3804,7 +3819,7 @@ impl SlabManager {
 			// The index names the same stale location: the answer is final.
 			return first;
 		}
-		self.read_expected_version_once(current, missing_origin, named)
+		self.read_expected_version_once(current, missing_origin, named, tails)
 			.await
 	}
 
@@ -3813,6 +3828,7 @@ impl SlabManager {
 		location: RecordLocation,
 		missing_origin: PublishedReferenceOrigin,
 		named: Option<(TenantId, Identity)>,
+		tails: Option<&QueryTails>,
 	) -> std::io::Result<(SlabRecordHeader, Vec<u8>)> {
 		// A generation's object can be deleted after a later publication while
 		// a read that selected it is in flight; resolve once more from the
@@ -3860,7 +3876,7 @@ impl SlabManager {
 				}
 				SlabBacking::L2(pointer) => {
 					let started = Instant::now();
-					let result = self.read_from_l2(&pointer, target).await;
+					let result = self.read_from_l2(&pointer, target, tails).await;
 					metrics()
 						.l2_range_read_latency_seconds
 						.observe_duration(started.elapsed());

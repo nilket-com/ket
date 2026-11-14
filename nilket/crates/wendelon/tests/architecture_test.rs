@@ -9760,6 +9760,8 @@ fn adr078_manager_source_concatenates_submodules() {
 			// out of the bounded root.
 			"pause_hooks.rs",
 			"publication_accounting.rs",
+			// ADR 0733: one query's fetched remote object tails.
+			"query_tails.rs",
 			// ADR 0696 (0692 §7): charged cross-slab redirects of maintenance rewrites.
 			"redirect_store.rs",
 			// ADR 0692: per-key relocation and atomic empty-key removal.

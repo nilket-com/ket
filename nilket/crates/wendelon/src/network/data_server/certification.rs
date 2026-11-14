@@ -221,7 +221,7 @@ impl WendelonDataServer {
 			.ok_or("a certified entry's table is unknown")?;
 		let stored = self
 			.slab
-			.stored_rows_at_version(entry.tenant, key, entry.hlc)
+			.stored_rows_at_version(entry.tenant, key, entry.hlc, None)
 			.await
 			.map_err(|error| error.to_string())?;
 		if stored.is_empty() {
