@@ -129,6 +129,13 @@ Two checks exist for this, and a large-stack green run replaces neither:
    and `node/`, `network/`). A change to documentation or to tests alone does
    not need it.
 
+The same binary holds the object-store workflow
+(`three_daemons_offload_to_the_object_store_and_serve_their_rows_across_restarts`),
+which needs a remote store and runs at a declared `query_stall_bound_millis`; with
+`WENDELON_SMOKE_NODE_CONTROL` it places each daemon on a host of its own. The setting
+and what it has been tested with are in
+`nilket/crates/wendelon/plans/ops/configuration.md`, "Query no-progress interval".
+
 ## Startup latency
 
 `ci/startup-latency-check.sh` runs the libaryon engine startup test and the

@@ -133,6 +133,54 @@ for the chosen file/span and recording the migration-of-trust note. No key is in
 records, configuration role fallback or epochs. Logs are never rewritten by verification.
 Custody, rotation, runtime configuration and redeployment are separate operator work.
 
+### Query no-progress interval
+
+`[tuning] query_stall_bound_millis` is how long one awaited unit of a query may go
+without completing before the node answers `QUERY_STALLED`. Default 250; accepted
+range 1 to 600000; set per node (ADR 541, ADR 0719). A unit is, for example, one
+record's whole read from wherever it is stored, or one slab's statistics load. When a
+record is in a remote object store, that one read is several requests made one after
+another (the object's size, its tail, sometimes its index, then the record's bytes;
+ADR 0730 removed the last when the tail already holds them), and they all count
+against the one interval.
+
+It is not a deadline for the query: a query of many units runs for as long as its
+units keep completing. The caller's own deadline is separate and, when it is nearer,
+it is what ends the query. A larger interval means only that a read which has truly
+stopped is reported that much later. No value guarantees that every request to a
+store is answered in time.
+
+#### Working profile for the development RustFS store
+
+Agreed 2026-11-14 as the working day-one profile for nodes that tier to the
+development RustFS store. Put it in the configuration of every node of the cluster:
+
+```toml
+[tuning]
+query_stall_bound_millis = 2000
+```
+
+What it has been tested with, and no more:
+
+- The real-daemon workflow `three_daemons_offload_to_the_object_store_and_serve_their_rows_across_restarts`
+  (`wendelon-client/tests/parent_decisions_processes.rs`): three nodes in the
+  ParentDecisions mode, 64 single-row writes into 8 KiB slabs (a stress shape, nearly
+  one object per row, not deployment sizing), every node offloading its slabs to
+  RustFS over a LAN, an exact read of all rows, each node stopped and started again
+  in turn, and an exact read again.
+- It passed once with the three daemons on one host and once with one daemon on each
+  of three hosts. One execution each: not a rate.
+- At the default 250 the same workflow's reads ended `QUERY_STALLED` in three of five
+  judged queries. Those results stand; the general default is unchanged; 2000 ms is
+  the working RustFS profile documented here.
+
+Limits: both reads in each passing run were served by one node; nothing was measured
+about how close any read came to the interval; a crash, a partition, a node that does
+not return and any other store or workload are not covered. A deployment with another
+object store, network or data shape needs its own evidence for its own value. The
+configuration loader does not check this setting against the storage configuration:
+nothing refuses a node that tiers to a remote store at the default.
+
 ### Running under systemd
 
 Run Wendelon so the service manager owns its whole process tree and waits out its
