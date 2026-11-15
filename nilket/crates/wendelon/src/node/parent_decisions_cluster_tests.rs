@@ -6732,6 +6732,8 @@ async fn a_write_with_a_remote_holder_answered_in_time_commits_on_its_first_atte
 mod backup_hold;
 #[path = "parent_decisions_cluster_tests/backup_restore.rs"]
 mod backup_restore;
+#[path = "parent_decisions_cluster_tests/raft_admission_tests.rs"]
+mod raft_admission;
 #[path = "parent_decisions_cluster_tests/write_deadline.rs"]
 mod write_deadline;
 

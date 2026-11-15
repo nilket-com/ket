@@ -27,6 +27,7 @@ use crate::network::core::{HRFT_MAGIC, HrftFrame};
 use crate::network::pool::BufPool;
 use crate::network::router::RaftInternalServer;
 use crate::network::server::RequestContext;
+use crate::network::tls::ActorRole;
 use crate::network::wire;
 use crate::schema::{FrameHeader, MsgType, NodeId};
 use async_trait::async_trait;
@@ -158,11 +159,51 @@ impl WendelonRaftInternalServer {
 	}
 }
 
+/// ADR 0103 (wendelon): a Raft request is admitted only from an unscoped cluster node, and
+/// only when the request names that node as its candidate or leader (`claimed`). Called
+/// after decoding and before any effect of the request.
+fn admit_raft_sender(
+	context: &RequestContext,
+	kind: &'static str,
+	claimed: u32,
+) -> std::io::Result<()> {
+	let actor = &context.actor;
+	let authenticated = match (actor.role, &actor.tenant_id, actor.node_id, context.remote) {
+		(ActorRole::DataNode, None, Some(node), Some(remote)) if node == remote => node.id,
+		_ => {
+			tracing::warn!(
+				kind,
+				claimed,
+				role = %actor.role,
+				tenant_scoped = actor.tenant_id.is_some(),
+				"Raft request refused: the caller is not an unscoped cluster node"
+			);
+			return Err(Error::new(
+				ErrorKind::PermissionDenied,
+				format!("{kind} refused: the caller is not an unscoped cluster node"),
+			));
+		}
+	};
+	if claimed != authenticated {
+		tracing::warn!(
+			kind,
+			claimed,
+			authenticated,
+			"Raft request refused: it names another node as its sender"
+		);
+		return Err(Error::new(
+			ErrorKind::PermissionDenied,
+			format!("{kind} from node {authenticated} names node {claimed} as its sender"),
+		));
+	}
+	Ok(())
+}
+
 #[async_trait]
 impl RaftInternalServer for WendelonRaftInternalServer {
 	async fn handle_raft_frame(
 		&self,
-		_context: RequestContext,
+		context: RequestContext,
 		frame: HrftFrame,
 	) -> std::io::Result<Option<HrftFrame>> {
 		self.decision_mode.check_raft_frame(frame.header.version)?;
@@ -178,6 +219,7 @@ impl RaftInternalServer for WendelonRaftInternalServer {
 		let (resp_type, body) = match msg_type {
 			MsgType::APPEND_ENTRIES_REQ => {
 				let req: AppendEntriesRequest<WendelonTypeConfig> = wire::decode(&frame.meta)?;
+				admit_raft_sender(&context, "AppendEntries", req.vote.leader_id.node_id)?;
 				// Harvest peer HLCs from any `Finalize` entries
 				// before the request moves into openraft. Every
 				// FinalizationMarker carries the leader's commit
@@ -209,6 +251,7 @@ impl RaftInternalServer for WendelonRaftInternalServer {
 			}
 			MsgType::VOTE_REQ => {
 				let req: VoteRequest<u32> = wire::decode(&frame.meta)?;
+				admit_raft_sender(&context, "Vote", req.vote.leader_id.node_id)?;
 				let envelope: Result<VoteResponse<u32>, RaftError<u32>> = self.raft.vote(req).await;
 				(
 					MsgType::VOTE_RESP,
@@ -217,6 +260,7 @@ impl RaftInternalServer for WendelonRaftInternalServer {
 			}
 			MsgType::INSTALL_SNAPSHOT_REQ => {
 				let req: InstallSnapshotRequest<WendelonTypeConfig> = wire::decode(&frame.meta)?;
+				admit_raft_sender(&context, "InstallSnapshot", req.vote.leader_id.node_id)?;
 				let envelope: Result<
 					InstallSnapshotResponse<u32>,
 					RaftError<u32, InstallSnapshotError>,
@@ -251,5 +295,75 @@ impl RaftInternalServer for WendelonRaftInternalServer {
 			arrow_payload: None,
 			trailing: None,
 		}))
+	}
+}
+
+#[cfg(test)]
+mod admission_tests {
+	use super::*;
+	use crate::network::tls::ActorIdentity;
+
+	fn node(id: u32) -> NodeId {
+		NodeId { id, _reserved: 0 }
+	}
+
+	/// The handler's own check, without the router: the context's remote, the actor's
+	/// node, its tenant scope and the claimed sender must all agree.
+	#[test]
+	fn the_handler_admits_only_an_unscoped_node_naming_itself() {
+		let context = |remote: Option<u32>, actor: ActorIdentity| RequestContext {
+			remote: remote.map(node),
+			actor,
+		};
+		assert!(
+			admit_raft_sender(
+				&context(Some(2), ActorIdentity::data_node(node(2))),
+				"Vote",
+				2
+			)
+			.is_ok()
+		);
+		// The claimed sender is another node.
+		assert!(
+			admit_raft_sender(
+				&context(Some(2), ActorIdentity::data_node(node(2))),
+				"Vote",
+				3
+			)
+			.is_err()
+		);
+		// The actor and the remote disagree (the router normally refuses this first).
+		assert!(
+			admit_raft_sender(
+				&context(Some(2), ActorIdentity::data_node(node(3))),
+				"Vote",
+				3
+			)
+			.is_err()
+		);
+		assert!(
+			admit_raft_sender(&context(None, ActorIdentity::data_node(node(2))), "Vote", 2)
+				.is_err()
+		);
+		// A tenant-scoped data node naming itself.
+		let scoped = ActorIdentity::new(
+			ActorRole::DataNode,
+			Some(node(2)),
+			Some("1".to_owned()),
+			vec!["cluster".to_owned()],
+			b"scoped".to_vec(),
+		)
+		.unwrap();
+		assert!(admit_raft_sender(&context(Some(2), scoped), "AppendEntries", 2).is_err());
+		// Not a data node at all.
+		let operator = ActorIdentity::new(
+			ActorRole::Operator,
+			None,
+			None,
+			Vec::new(),
+			b"operator".to_vec(),
+		)
+		.unwrap();
+		assert!(admit_raft_sender(&context(Some(2), operator), "InstallSnapshot", 2).is_err());
 	}
 }
