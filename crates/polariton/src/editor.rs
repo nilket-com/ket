@@ -5,6 +5,8 @@
 //! renders the focused pane's projection: syntax, gutter, cursor, selection,
 //! diagnostics, folds, engine-owned wrap rows and scrolling, and the minimap.
 
+#[path = "editor/markdown_table.rs"]
+mod markdown_table;
 #[path = "editor/notebook_surface.rs"]
 mod notebook_surface;
 
@@ -26,7 +28,8 @@ use crate::session_persistence::{
 use iced::keyboard::{self, Key};
 use iced::mouse;
 use iced::widget::{
-	Space, button, canvas, column, container, mouse_area, rich_text, row, span, stack, text,
+	Space, button, canvas, column, container, mouse_area, responsive, rich_text, row, span, stack,
+	text,
 };
 use iced::{Background, Color, Element, Event, Length, Subscription, Task, Theme, event, time};
 use libaryon::core::{CursorPosition, DocLine, PaneRect, Rgb, ViewId};
@@ -6124,16 +6127,31 @@ fn markdown_inline_surface<'a>(
 	colors: MarkdownPreviewColors,
 	foreground: Rgb,
 ) -> Element<'a, EditorMsg> {
-	let spans = inline
+	rich_text(markdown_inline_spans(
+		inline,
+		colors,
+		foreground,
+		iced::Font::DEFAULT,
+	))
+	.size(MARKDOWN_BODY_SIZE)
+	.line_height(iced::Pixels(MARKDOWN_BODY_LINE_HEIGHT))
+	.into()
+}
+
+/// The styled spans of one inline run: prose in `prose_font`, inline code in
+/// the editor's monospace face, with weight and slant from the run's style.
+fn markdown_inline_spans<'a>(
+	inline: &'a MarkdownInlineText,
+	colors: MarkdownPreviewColors,
+	foreground: Rgb,
+	prose_font: iced::Font,
+) -> Vec<iced::widget::text::Span<'a, EditorMsg, iced::Font>> {
+	inline
 		.spans()
 		.iter()
 		.map(|inline_span| {
 			let style = inline_span.style;
-			let mut font = if style.code {
-				EDITOR_FONT
-			} else {
-				iced::Font::DEFAULT
-			};
+			let mut font = if style.code { EDITOR_FONT } else { prose_font };
 			if style.strong {
 				font.weight = iced::font::Weight::Bold;
 			}
@@ -6149,30 +6167,67 @@ fn markdown_inline_surface<'a>(
 				.font(font)
 				.color(color(span_color))
 		})
-		.collect::<Vec<_>>();
-	rich_text(spans)
-		.size(MARKDOWN_BODY_SIZE)
-		.line_height(iced::Pixels(MARKDOWN_BODY_LINE_HEIGHT))
-		.into()
+		.collect()
 }
 
+/// A table cell's text: prose in the bundled Polariton Plot Sans, so its width
+/// can be estimated (polariton ADR 0001); a word wider than its column breaks.
+fn markdown_table_cell_text<'a>(
+	cell: &'a MarkdownInlineText,
+	colors: MarkdownPreviewColors,
+	foreground: Rgb,
+) -> Element<'a, EditorMsg> {
+	rich_text(markdown_inline_spans(
+		cell,
+		colors,
+		foreground,
+		crate::fonts::PLOT_TEXT_FONT,
+	))
+	.size(MARKDOWN_BODY_SIZE)
+	.line_height(iced::Pixels(MARKDOWN_BODY_LINE_HEIGHT))
+	.wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+	.into()
+}
+
+/// A table sized to its pane: column widths are chosen from the cells'
+/// content for the width `responsive` reports, and recomputed on resize.
 fn markdown_table_surface<'a>(
 	rows: &'a [Vec<MarkdownInlineText>],
 	colors: MarkdownPreviewColors,
 ) -> Element<'a, EditorMsg> {
-	let mut laid_out: Vec<Element<'_, EditorMsg>> = Vec::with_capacity(rows.len());
+	responsive(move |size| markdown_table_rows(rows, colors, size.width))
+		.height(Length::Shrink)
+		.into()
+}
+
+fn markdown_table_rows<'a>(
+	rows: &'a [Vec<MarkdownInlineText>],
+	colors: MarkdownPreviewColors,
+	pane_width: f32,
+) -> Element<'a, EditorMsg> {
+	let pixels = markdown_table::table_column_pixels(rows, pane_width, MARKDOWN_BODY_SIZE);
+	let padding = markdown_table::TABLE_CELL_PADDING_X;
+	let mut laid_out: Vec<Element<'_, EditorMsg>> = Vec::with_capacity(rows.len() + 1);
 	for (index, cells) in rows.iter().enumerate() {
 		let foreground = if index == 0 {
 			colors.heading
 		} else {
 			colors.body
 		};
-		let row_cells = cells
+		// One width vector for every row, a missing cell included, keeps the
+		// columns aligned.
+		let row_cells = pixels
+			.text
 			.iter()
-			.map(|cell| {
-				container(markdown_inline_surface(cell, colors, foreground))
-					.padding([2, 8])
-					.width(Length::Fill)
+			.enumerate()
+			.map(|(column, &text_px)| {
+				let content = match cells.get(column) {
+					Some(cell) => markdown_table_cell_text(cell, colors, foreground),
+					None => Space::new().into(),
+				};
+				container(content)
+					.padding([2, padding as u16])
+					.width(Length::Fixed((text_px + 2 * padding) as f32))
 					.into()
 			})
 			.collect::<Vec<Element<'_, EditorMsg>>>();
