@@ -579,6 +579,9 @@ pub enum DecisionRefusal {
 	InstanceSpaceExhausted,
 	MembershipNotUniform,
 	ReplacementIncomplete,
+	/// ADR 0105 (wendelon): the slot is between its replacement's Done and its
+	/// activation; it takes no new lease, lineage or coordination.
+	SlotBeingReplaced,
 }
 
 /// ADR 0721: how the key a store signs with stands against the replicated
@@ -1396,6 +1399,10 @@ fn take_over(
 	use DecisionRefusal::*;
 	let verified = evidence::verify(decisions, signed)?;
 	let body = *verified.body();
+	// ADR 0105 (wendelon): a slot being replaced takes no lineage.
+	if decisions.instances.preparing(body.successor.node) {
+		return Err(SlotBeingReplaced);
+	}
 	let lineage = *decisions
 		.lineages
 		.get(&body.range_start)
@@ -1524,6 +1531,102 @@ pub(crate) fn record_release(state: &mut SmState, release: &ReleaseLeaseRequestM
 		}) {
 		decisions.lineages.remove(&release.range_start);
 	}
+}
+
+/// ADR 0105 (wendelon): a Done replacement's new store becomes its slot's
+/// current incarnation. `Ok(Some(registry))` is a first promotion's new
+/// registry; `Ok(None)` the recorded promotion's exact retry, which changes
+/// nothing and is a historical answer only. Every refusal changes nothing.
+pub(crate) fn promote_incarnation(
+	state: &mut SmState,
+	request: crate::consensus::PromoteIncarnation,
+) -> Result<Option<crate::consensus::IncarnationRegistry>, crate::consensus::SlabRefusal> {
+	use crate::consensus::SlabRefusal;
+	let Some(decisions) = state.decisions.as_ref() else {
+		return Err(SlabRefusal::ReplacementNotDone);
+	};
+	if decisions.instances.promotion_authority(&request)?.is_some() {
+		return Ok(None);
+	}
+	// A first promotion needs the replacement's instance to serve its slot now:
+	// not retired, a voter in every configuration of the applied membership
+	// (the uniform swap away from it commits before the Done that retires it),
+	// and not the old instance of an open replacement.
+	let r_new = request.r_new;
+	let serving = !decisions.instances.is_retired(r_new)
+		&& state
+			.last_membership
+			.membership()
+			.get_joint_config()
+			.iter()
+			.all(|config| config.contains(&r_new))
+		&& decisions
+			.instances
+			.open_replacement()
+			.is_none_or(|(_, open)| open.r_old != r_new);
+	if !serving {
+		return Err(SlabRefusal::PromotionStale);
+	}
+	let node = request.node;
+	let registry = state.incarnations.get(&node).cloned().unwrap_or_default();
+	if registry.current != Some(request.expected) {
+		return Err(SlabRefusal::StaleSupersede {
+			node,
+			current: registry.current,
+		});
+	}
+	if request.incarnation == request.expected
+		|| registry.retired.contains(&request.incarnation)
+		|| registry
+			.accepted
+			.iter()
+			.any(|(incarnation, _)| *incarnation == request.incarnation)
+	{
+		return Err(SlabRefusal::RetiredIncarnation {
+			node,
+			incarnation: request.incarnation,
+		});
+	}
+	// P1: takeover moves the old store's lineages first; nothing is pruned here.
+	let held = decisions
+		.lineages
+		.values()
+		.filter(|lineage| lineage.holder.id == node && lineage.incarnation == request.expected)
+		.count();
+	if held > 0 {
+		return Err(SlabRefusal::LineagesStillHeld {
+			count: u32::try_from(held).unwrap_or(u32::MAX),
+		});
+	}
+	let registry = state.incarnations.entry(node).or_default();
+	registry.current = Some(request.incarnation);
+	registry.retired.insert(request.expected);
+	registry
+		.accepted
+		.insert((request.incarnation, Some(request.expected)));
+	let registry = registry.clone();
+	state
+		.decisions
+		.as_mut()
+		.expect("checked above")
+		.instances
+		.record_promotion(
+			request.token,
+			instances::Promotion {
+				expected: request.expected,
+				incarnation: request.incarnation,
+			},
+		);
+	Ok(Some(registry))
+}
+
+/// ADR 0105 (wendelon): whether `slot` is between its replacement's Done and
+/// its activation, when it takes no new lease, lineage or coordination.
+pub(crate) fn slot_preparing(state: &SmState, slot: u32) -> bool {
+	state
+		.decisions
+		.as_ref()
+		.is_some_and(|decisions| decisions.instances.preparing(slot))
 }
 
 /// Removes every lineage of another epoch or of a superseded incarnation.
@@ -1812,6 +1915,14 @@ fn reserve(
 	// own answer; only an eligible new reservation is refused, recording nothing.
 	if decisions.hold.is_some() {
 		return Err(DecisionRefusal::BackupHold);
+	}
+	// ADR 0105 (wendelon): a slot being replaced coordinates nothing new.
+	let coordinator = claim
+		.children
+		.get(usize::from(claim.coordinator))
+		.map(|child| child.holder.node);
+	if coordinator.is_some_and(|node| decisions.instances.preparing(node)) {
+		return Err(DecisionRefusal::SlotBeingReplaced);
 	}
 	commit_hlc_not_ahead(claim, stamp_ms)?;
 	validate_claim(state, decisions, claim)?;

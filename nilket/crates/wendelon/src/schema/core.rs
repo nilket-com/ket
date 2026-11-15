@@ -2600,7 +2600,10 @@ pub const SNAPSHOT_FORMAT_VERSION: u8 = 21;
 ///
 /// Wendelon ADR 0104: 25, whose decision state carries the Raft instance
 /// records (24 was ADR 0736 to wendelon ADR 0103's).
-pub const SNAPSHOT_FORMAT_VERSION_PARENT_DECISIONS: u8 = 25;
+///
+/// Wendelon ADR 0105: 26, whose replacement records carry their promotion (25
+/// was wendelon ADR 0104's).
+pub const SNAPSHOT_FORMAT_VERSION_PARENT_DECISIONS: u8 = 26;
 
 /// Shape of the Control Ring WAL record bodies this build writes, including the
 /// `postcard(Entry<..>)` payload of a log record. ADR 0697 version 6 carries
@@ -2639,7 +2642,11 @@ pub const WAL_FORMAT_VERSION: u8 = 21;
 /// Wendelon ADR 0104: 25. The decisions include the instance grants and the
 /// replacement, and an entry's author is applied as its slot; an earlier log
 /// is refused whole (24 was ADR 0736 to wendelon ADR 0103's).
-pub const WAL_FORMAT_VERSION_PARENT_DECISIONS: u8 = 25;
+///
+/// Wendelon ADR 0105: 26. A Done replacement's promotion is an entry, and a
+/// slot being replaced takes no lease, takeover or coordination at apply; an
+/// earlier log is refused whole (25 was wendelon ADR 0104's).
+pub const WAL_FORMAT_VERSION_PARENT_DECISIONS: u8 = 26;
 
 // Static assertions to ensure all our size calculations remain exactly correct
 const _: () = assert!(std::mem::size_of::<HybridTimestamp>() == 16);

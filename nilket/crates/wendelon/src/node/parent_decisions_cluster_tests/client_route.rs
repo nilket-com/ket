@@ -919,3 +919,58 @@ async fn a_bounded_refresh_never_asks_an_excluded_node_even_from_its_bootstrap_p
 	);
 	assert_eq!(fixture.provider.dials.load(Ordering::SeqCst), 1);
 }
+
+/// ADR 0105 (wendelon), DC-246: a control-only member's answer to a table write
+/// (`NOT_LEADER`, no hint, outcome `INDETERMINATE`) is one the client already
+/// handles: it sends the same identity again within its attempts, and the
+/// commit that answers it is the call's answer. (The scripted service is shared
+/// by every node, so which node the retry reached is not observed here.)
+#[tokio::test]
+async fn a_not_serving_answer_sends_the_same_identity_again() {
+	let not_serving = Answer::Reply(
+		WriteStatus::NOT_LEADER,
+		MutationCommitKnowledge::INDETERMINATE,
+		0,
+	);
+	let fixture = fixture(&[not_serving, OK], 0);
+	let client = client_over(&fixture, static_topology());
+	let (answer, write_id, _) = call(&client, Some(Duration::from_secs(8))).await;
+	let answer = answer.unwrap();
+	assert_eq!(answer.status, WriteStatus::OK, "{answer:?}");
+	assert_eq!(answer.echoed_write_id, write_id);
+	assert_eq!(
+		*fixture.entry.write_ids.lock().unwrap(),
+		vec![write_id, write_id],
+		"the same identity, twice"
+	);
+}
+
+/// ADR 0105 (wendelon), DC-246: when every attempt is answered so, the call
+/// ends with the client's own typed exhaustion, the outcome unknown; never an
+/// unclassified transport error or a receipt.
+#[tokio::test]
+async fn not_serving_answers_to_every_attempt_end_in_typed_exhaustion() {
+	let not_serving = Answer::Reply(
+		WriteStatus::NOT_LEADER,
+		MutationCommitKnowledge::INDETERMINATE,
+		0,
+	);
+	let fixture = fixture(&[not_serving; crate::client::DATA_RETRY_BUDGET], 0);
+	let client = client_over(&fixture, static_topology());
+	let (answer, write_id, _) = call(&client, Some(Duration::from_secs(8))).await;
+	let answer = answer.expect("a typed answer, not a transport error");
+	assert_eq!(
+		answer.status,
+		WriteStatus::WRITE_ATTEMPTS_EXHAUSTED,
+		"{answer:?}"
+	);
+	assert_eq!(
+		answer.mutation_commit_knowledge(),
+		MutationCommitKnowledge::INDETERMINATE
+	);
+	assert_eq!(answer.echoed_write_id, write_id);
+	assert_eq!(
+		fixture.entry.write_ids.lock().unwrap().len(),
+		crate::client::DATA_RETRY_BUDGET
+	);
+}

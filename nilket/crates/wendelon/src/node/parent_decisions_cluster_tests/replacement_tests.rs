@@ -520,3 +520,576 @@ async fn a_fresh_store_forms_only_with_a_formation_intent() {
 		.unwrap();
 	drop(dir);
 }
+
+/// The applied registry and signer of slot `slot` at the leader.
+async fn slot_store(
+	cluster: &Cluster,
+	slot: u32,
+	incarnation: crate::consensus::StoreIncarnation,
+) -> (Option<crate::consensus::StoreIncarnation>, Option<[u8; 32]>) {
+	let leader = cluster.leader().await;
+	cluster
+		.node(leader)
+		.state_machine
+		.read_state(move |state| {
+			let current = state
+				.incarnations
+				.get(&slot)
+				.and_then(|registry| registry.current);
+			let bound = state.decisions.as_ref().and_then(|decisions| {
+				decisions.signer_key(crate::consensus::decisions::Signer {
+					node: slot,
+					incarnation,
+				})
+			});
+			(current, bound)
+		})
+		.await
+}
+
+/// ADR 0105 (wendelon): after Done, a control-only replacement admits its own
+/// store J as its slot's current incarnation and binds J to the slot's
+/// configured key, and stays control-only. J is read from its store's own
+/// index (feasibility F1), the same J across restarts before promotion, after
+/// it and after binding. The returning old process, still on the old store,
+/// serves no read. The survivors stay exact. A store lost after promotion is
+/// refused, never minted again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_replacement_admits_its_store_binds_its_key_and_stays_control_only() {
+	use crate::node::replacement_preparation::{Stage, halt_for_test};
+	let (mut cluster, leader, descriptor) = ready().await;
+	let lost = *NODES[1..].iter().find(|id| **id != leader).unwrap();
+	let survivors: Vec<u32> = NODES.into_iter().filter(|id| *id != lost).collect();
+	let mut expected = write_rows(&cluster, leader, &descriptor, &[(1, "a")]).await;
+	cluster.stop(lost, true).await;
+	let cfg = cluster.configs[&lost].clone();
+	let old_disk = crate::test_support::TestDir::new("promotion-old-disk");
+	copy_dir(&cfg.data_dir, &old_disk.to_path_buf());
+	lose_disk(&cfg.data_dir);
+	let (old_incarnation, _) = slot_store(
+		&cluster,
+		lost,
+		crate::consensus::StoreIncarnation::from_raw(0),
+	)
+	.await;
+	let old_incarnation = old_incarnation.expect("the lost slot's store is registered");
+	assert!(matches!(
+		decide(
+			&cluster,
+			DecisionCommand::BeginReplacement {
+				token: TOKEN,
+				slot: lost,
+			}
+		)
+		.await,
+		DecisionResult::ReplacementRecorded { .. }
+	));
+	crate::node::provision_replacement_token(&cfg.data_dir, TOKEN).unwrap();
+	let start = || ControlOnlyNode::bootstrap_with_provider(cfg.clone(), provider(&cluster, lost));
+
+	// Halted before promotion: J is created once, after Done, and kept.
+	halt_for_test(&cfg.data_dir, Some(Stage::Promote));
+	let control = start().await.unwrap();
+	let index = crate::storage::index::persistent_index_path(&cfg.data_dir);
+	let deadline = tokio::time::Instant::now() + BOUND;
+	while !index.exists() {
+		assert!(tokio::time::Instant::now() < deadline, "J never created");
+		tokio::time::sleep(TICK).await;
+	}
+	assert_eq!(
+		replacement_phase(&cluster).await,
+		Some(ReplacementPhase::Done {
+			r_new: ALLOCATED_BASE
+		}),
+		"J is created only after Done"
+	);
+	let j = control.store_incarnation(false).await.unwrap();
+	assert_ne!(j, old_incarnation);
+	control.shutdown().await.unwrap();
+	let control = start().await.unwrap();
+	assert_eq!(control.identity.role, Role::ControlOnly);
+	assert_eq!(control.store_incarnation(false).await.unwrap(), j);
+	assert_eq!(
+		slot_store(&cluster, lost, j).await,
+		(Some(old_incarnation), None)
+	);
+
+	// Promoted (once takeover moved the old store's lineages), halted before
+	// binding; a restart there keeps J and the promotion.
+	halt_for_test(&cfg.data_dir, Some(Stage::Bind));
+	let deadline = tokio::time::Instant::now() + BOUND;
+	while slot_store(&cluster, lost, j).await.0 != Some(j) {
+		assert!(tokio::time::Instant::now() < deadline, "never promoted");
+		tokio::time::sleep(TICK).await;
+	}
+	let leader = cluster.leader().await;
+	let state = cluster.node(leader).state_machine.state_snapshot().await;
+	let decisions = state.decisions.as_ref().unwrap();
+	assert!(
+		decisions
+			.lineages()
+			.values()
+			.all(|lineage| lineage.holder.id != lost),
+		"no lineage is held at the replaced slot"
+	);
+	assert!(state.incarnations[&lost].retired.contains(&old_incarnation));
+	assert_eq!(
+		decisions.instances().replacement(TOKEN).unwrap().promoted,
+		Some(crate::consensus::decisions::instances::Promotion {
+			expected: old_incarnation,
+			incarnation: j,
+		})
+	);
+	assert!(
+		decisions
+			.signer_key(crate::consensus::decisions::Signer {
+				node: lost,
+				incarnation: old_incarnation,
+			})
+			.is_some(),
+		"the old store's binding is kept"
+	);
+	// Certification counts the slot as its new store, which reports nothing
+	// yet: no certificate is committed without it (gate 3 owes its data).
+	let members = crate::consensus::decisions::generations::current_members(&state).unwrap();
+	assert!(members.contains(&crate::consensus::decisions::Signer {
+		node: lost,
+		incarnation: j,
+	}));
+	assert!(
+		members
+			.iter()
+			.all(|member| member.incarnation != old_incarnation)
+	);
+	let certified = decisions.generations().current_gid();
+	control.shutdown().await.unwrap();
+	let control = start().await.unwrap();
+	assert_eq!(control.store_incarnation(false).await.unwrap(), j);
+	assert_eq!(slot_store(&cluster, lost, j).await, (Some(j), None));
+
+	// Bound with the slot's configured key; preparation then ends.
+	halt_for_test(&cfg.data_dir, None);
+	let (secret, _) = crate::node::identity::resolve_decision_keys(&cfg).unwrap();
+	let key = ed25519_dalek::SigningKey::from_bytes(&secret)
+		.verifying_key()
+		.to_bytes();
+	let deadline = tokio::time::Instant::now() + BOUND;
+	while slot_store(&cluster, lost, j).await != (Some(j), Some(key))
+		|| !control.preparation_ended()
+	{
+		assert!(tokio::time::Instant::now() < deadline, "never bound");
+		tokio::time::sleep(TICK).await;
+	}
+	until_caught_up(&cluster, &control, "prepared").await;
+	assert_ne!(cluster.leader().await, ALLOCATED_BASE, "it never leads");
+	control.shutdown().await.unwrap();
+	let control = start().await.unwrap();
+	assert_eq!(control.identity.role, Role::ControlOnly);
+	assert_eq!(control.store_incarnation(false).await.unwrap(), j);
+	control.shutdown().await.unwrap();
+	assert!(
+		WendelonNode::bootstrap_with_provider(cfg.clone(), provider(&cluster, lost))
+			.await
+			.err()
+			.expect("refused")
+			.to_string()
+			.contains("RaftRoleMismatch"),
+		"never a full member before its activation"
+	);
+
+	// The old process returns on the old store: it takes no lease and serves
+	// no read; the survivors stay exact.
+	let mut old_cfg = cfg.clone();
+	old_cfg.data_dir = old_disk.to_path_buf();
+	let old = WendelonNode::bootstrap_with_provider(old_cfg, provider(&cluster, lost))
+		.await
+		.unwrap();
+	let leader = cluster.leader().await;
+	expected.extend(write_rows(&cluster, leader, &descriptor, &[(2, "b")]).await);
+	let answer = old
+		.data_server
+		.table_query_for_test(query_meta(&cluster, leader, &descriptor))
+		.await
+		.unwrap();
+	assert_ne!(
+		answer.status,
+		Some(crate::schema::ReadStatus::OK),
+		"the old store serves no read: {answer:?}"
+	);
+	let leader = cluster.leader().await;
+	assert!(
+		cluster
+			.node(leader)
+			.state_machine
+			.state_snapshot()
+			.await
+			.decisions
+			.unwrap()
+			.lineages()
+			.values()
+			.all(|lineage| lineage.holder.id != lost),
+		"the old process acquired no lineage"
+	);
+	for node in &survivors {
+		expect_at(
+			&cluster,
+			*node,
+			&descriptor,
+			&expected,
+			"with the old store back",
+		)
+		.await;
+	}
+	let leader = cluster.leader().await;
+	assert_eq!(
+		cluster
+			.node(leader)
+			.state_machine
+			.state_snapshot()
+			.await
+			.decisions
+			.unwrap()
+			.generations()
+			.current_gid(),
+		certified,
+		"no certificate without the replacement's report"
+	);
+	cluster.network.unpublish(crate::schema::NodeId {
+		id: lost,
+		_reserved: 0,
+	});
+	let _ = tokio::time::timeout(std::time::Duration::from_secs(30), old.shutdown()).await;
+
+	// The store lost after promotion is refused and never minted again.
+	std::fs::remove_file(&index).unwrap();
+	let control = start().await.unwrap();
+	let deadline = tokio::time::Instant::now() + BOUND;
+	while !control.preparation_ended() {
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"preparation never stopped"
+		);
+		tokio::time::sleep(TICK).await;
+	}
+	assert!(!index.exists(), "no store is minted after promotion");
+	let refused = control.store_incarnation(false).await.unwrap_err();
+	assert!(
+		refused.to_string().contains("ReplacementStoreLost"),
+		"{refused}"
+	);
+	control.shutdown().await.unwrap();
+	for node in std::mem::take(&mut cluster.nodes) {
+		let _ = tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown()).await;
+	}
+}
+
+/// R2: a definitive refusal ends preparation and nothing is proposed again.
+/// The first replacement reaches Done but has not promoted when a second
+/// replacement of the same slot is opened against its instance; that instance
+/// then restarts and proposes its first promotion once: refused as stale,
+/// preparation ends, and the registry and its record are unchanged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_stale_promotion_is_refused_once_and_never_proposed_again() {
+	use crate::node::replacement_preparation::{Stage, halt_for_test};
+	let (mut cluster, leader, _descriptor) = ready().await;
+	let lost = *NODES[1..].iter().find(|id| **id != leader).unwrap();
+	cluster.stop(lost, true).await;
+	let cfg = cluster.configs[&lost].clone();
+	lose_disk(&cfg.data_dir);
+	let (old_incarnation, _) = slot_store(
+		&cluster,
+		lost,
+		crate::consensus::StoreIncarnation::from_raw(0),
+	)
+	.await;
+	assert!(matches!(
+		decide(
+			&cluster,
+			DecisionCommand::BeginReplacement {
+				token: TOKEN,
+				slot: lost,
+			}
+		)
+		.await,
+		DecisionResult::ReplacementRecorded { .. }
+	));
+	crate::node::provision_replacement_token(&cfg.data_dir, TOKEN).unwrap();
+	halt_for_test(&cfg.data_dir, Some(Stage::Promote));
+	let start = || ControlOnlyNode::bootstrap_with_provider(cfg.clone(), provider(&cluster, lost));
+	let control = start().await.unwrap();
+	let deadline = tokio::time::Instant::now() + BOUND;
+	while replacement_phase(&cluster).await
+		!= Some(ReplacementPhase::Done {
+			r_new: ALLOCATED_BASE,
+		}) {
+		assert!(tokio::time::Instant::now() < deadline, "never Done");
+		tokio::time::sleep(TICK).await;
+	}
+	control.shutdown().await.unwrap();
+
+	// A second replacement is opened against the first one's instance.
+	assert!(matches!(
+		decide(
+			&cluster,
+			DecisionCommand::BeginReplacement {
+				token: TOKEN + 1,
+				slot: lost,
+			}
+		)
+		.await,
+		DecisionResult::ReplacementRecorded {
+			r_old: ALLOCATED_BASE,
+			..
+		}
+	));
+	halt_for_test(&cfg.data_dir, None);
+	let control = start().await.unwrap();
+	let deadline = tokio::time::Instant::now() + BOUND;
+	while !control.preparation_ended() {
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"preparation never stopped after {} proposals",
+			control.preparation_proposals_for_test()
+		);
+		tokio::time::sleep(TICK).await;
+	}
+	tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+	assert_eq!(
+		control.preparation_proposals_for_test(),
+		1,
+		"one proposal, no retry"
+	);
+	let leader = cluster.leader().await;
+	let state = cluster.node(leader).state_machine.state_snapshot().await;
+	assert_eq!(state.incarnations[&lost].current, old_incarnation);
+	assert_eq!(
+		state
+			.decisions
+			.as_ref()
+			.unwrap()
+			.instances()
+			.replacement(TOKEN)
+			.unwrap()
+			.promoted,
+		None
+	);
+	control.shutdown().await.unwrap();
+	for node in std::mem::take(&mut cluster.nodes) {
+		let _ = tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown()).await;
+	}
+}
+
+/// One request frame from survivor `from` to the control-only member of slot
+/// `to`, and its answer, or the error that ended the stream.
+async fn exchange_with(
+	cluster: &Cluster,
+	from: u32,
+	to: u32,
+	msg_type: crate::schema::MsgType,
+	meta: &[u8],
+) -> std::io::Result<crate::network::core::HrftFrame> {
+	use crate::network::core::{HRFT_MAGIC, read_frame, write_frame};
+	let provider = provider(cluster, from);
+	let connection = provider
+		.connect(
+			crate::schema::NodeId {
+				id: to,
+				_reserved: 0,
+			},
+			&address(to),
+		)
+		.await?;
+	let mut stream = connection.open_bi().await?;
+	let header = crate::schema::FrameHeader {
+		magic: HRFT_MAGIC,
+		version: 1,
+		msg_type: msg_type.0,
+		flags: 0,
+		stream_id: stream.stream_id() as u32,
+		meta_len: meta.len() as u32,
+		arrow_len: 0,
+		trailing_len: 0,
+	};
+	write_frame(&mut *stream, &header, meta, None, None).await?;
+	stream.finish().await?;
+	let pool = crate::network::pool::BufPool::new(4, 1024 * 1024);
+	tokio::time::timeout(BOUND, read_frame(&mut *stream, &pool))
+		.await
+		.map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "no answer"))?
+}
+
+/// ADR 0105 (wendelon), DC-246: a data-plane request that reaches a
+/// control-only member gets its family's typed refusal, not a dropped stream:
+/// a client's table write and query are told NOT_LEADER with no hint (the
+/// write's outcome unknown, its identity echoed, no position, clock or
+/// finalization); a survivor's child replicate and child fetch are refused
+/// with no acknowledgement or rows; a survivor's pending-witness pull is
+/// answered INTERNAL_ERROR with no witnesses, never OK with none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_control_only_member_refuses_each_data_request_in_its_own_answer() {
+	use crate::node::replacement_preparation::{Stage, halt_for_test};
+	use crate::schema::{
+		MsgType, MutationAnswer, MutationCommitKnowledge, PendingWitnessPullRequestMeta,
+		PendingWitnessPullResponseMeta, PendingWitnessPullStatus, QueryResponseMeta, ReadStatus,
+		TableWriteResponseMeta, WriteStatus, mutation_answer,
+	};
+	let (mut cluster, leader, descriptor) = ready().await;
+	let lost = *NODES[1..].iter().find(|id| **id != leader).unwrap();
+	cluster.stop(lost, true).await;
+	let cfg = cluster.configs[&lost].clone();
+	lose_disk(&cfg.data_dir);
+	assert!(matches!(
+		decide(
+			&cluster,
+			DecisionCommand::BeginReplacement {
+				token: TOKEN,
+				slot: lost,
+			}
+		)
+		.await,
+		DecisionResult::ReplacementRecorded { .. }
+	));
+	crate::node::provision_replacement_token(&cfg.data_dir, TOKEN).unwrap();
+	halt_for_test(&cfg.data_dir, Some(Stage::Promote));
+	let control = ControlOnlyNode::bootstrap_with_provider(cfg.clone(), provider(&cluster, lost))
+		.await
+		.unwrap();
+	let deadline = tokio::time::Instant::now() + BOUND;
+	while replacement_phase(&cluster).await
+		!= Some(ReplacementPhase::Done {
+			r_new: ALLOCATED_BASE,
+		}) {
+		assert!(tokio::time::Instant::now() < deadline, "never Done");
+		tokio::time::sleep(TICK).await;
+	}
+	let survivor = cluster.leader().await;
+	let before = cluster.node(survivor).state_machine.state_snapshot().await;
+
+	// A table write: NOT_LEADER, no hint, the outcome unknown, its id echoed.
+	let write = write_meta(&descriptor, 1, uuid_v7());
+	let answer = exchange_with(
+		&cluster,
+		survivor,
+		lost,
+		MsgType::TABLE_WRITE_REQ,
+		bytemuck::bytes_of(&write),
+	)
+	.await
+	.expect("a table write is answered");
+	assert_eq!(answer.header.msg_type, MsgType::TABLE_WRITE_RESP.0);
+	assert_eq!(answer.header.trailing_len, 0, "no finalization");
+	let written: TableWriteResponseMeta =
+		*bytemuck::from_bytes(&answer.meta[..std::mem::size_of::<TableWriteResponseMeta>()]);
+	let response = written.write;
+	assert_eq!(response.status, WriteStatus::NOT_LEADER);
+	assert_eq!(
+		response.mutation_commit_knowledge(),
+		MutationCommitKnowledge::INDETERMINATE
+	);
+	assert_eq!(
+		mutation_answer(response.status, response.mutation_commit_knowledge()),
+		MutationAnswer::Other
+	);
+	assert_eq!(response.leader_hint.id, 0, "no hint");
+	assert_eq!(response.echoed_write_id, write.parent_write_id);
+	assert_eq!((response.log_index, response.term), (0, 0));
+	assert_eq!(response.commit_hlc.physical_ms, 0, "no commit clock");
+	assert_eq!(response.has_finalization, 0);
+
+	// A table query: NOT_LEADER, no hint, no rows, the stream ended.
+	let query = query_meta(&cluster, survivor, &descriptor);
+	let answer = exchange_with(
+		&cluster,
+		survivor,
+		lost,
+		MsgType::TABLE_QUERY_REQ,
+		bytemuck::bytes_of(&query),
+	)
+	.await
+	.expect("a table query is answered");
+	assert_eq!(answer.header.msg_type, MsgType::TABLE_QUERY_RESP.0);
+	let read: QueryResponseMeta =
+		*bytemuck::from_bytes(&answer.meta[..std::mem::size_of::<QueryResponseMeta>()]);
+	assert_eq!(read.status, ReadStatus::NOT_LEADER);
+	assert_eq!((read.leader_hint.id, read.rows, read.arrow_len), (0, 0, 0));
+	assert!(answer.arrow_payload.is_none());
+
+	// A child replicate and a child fetch: refused, no acknowledgement or rows.
+	for (request, response) in [
+		(
+			MsgType::TABLE_CHILD_REPLICATE_REQ,
+			MsgType::TABLE_CHILD_REPLICATE_RESP,
+		),
+		(
+			MsgType::TABLE_CHILD_WRITE_REQ,
+			MsgType::TABLE_CHILD_WRITE_RESP,
+		),
+	] {
+		let answer = exchange_with(&cluster, survivor, lost, request, b"child")
+			.await
+			.expect("a child request is answered");
+		assert_eq!(answer.header.msg_type, response.0);
+		assert!(matches!(
+			postcard::from_bytes::<crate::network::data_server::child_writes::ChildWriteResponse>(
+				&answer.meta
+			)
+			.unwrap(),
+			crate::network::data_server::child_writes::ChildWriteResponse::Refused(_)
+		));
+	}
+	let answer = exchange_with(
+		&cluster,
+		survivor,
+		lost,
+		MsgType::TABLE_CHILD_FETCH_REQ,
+		b"fetch",
+	)
+	.await
+	.expect("a child fetch is answered");
+	assert_eq!(answer.header.msg_type, MsgType::TABLE_CHILD_FETCH_RESP.0);
+	assert!(answer.arrow_payload.is_none(), "no rows");
+	assert!(
+		answer.meta.as_ref()
+			!= postcard::to_stdvec(&crate::network::data_server::repair::ChildFetchResponse::Rows)
+				.unwrap()
+				.as_slice()
+	);
+
+	// A pending-witness pull: INTERNAL_ERROR with no witnesses, never OK.
+	let pull = PendingWitnessPullRequestMeta {
+		requester: crate::schema::NodeId {
+			id: survivor,
+			_reserved: 0,
+		},
+		request_epoch: cluster.node(survivor).ring.current_epoch(),
+	};
+	let answer = exchange_with(
+		&cluster,
+		survivor,
+		lost,
+		MsgType::PENDING_WITNESS_REQ,
+		bytemuck::bytes_of(&pull),
+	)
+	.await
+	.expect("a pending-witness pull is answered");
+	assert_eq!(answer.header.msg_type, MsgType::PENDING_WITNESS_RESP.0);
+	let witnesses: PendingWitnessPullResponseMeta = *bytemuck::from_bytes(
+		&answer.meta[..std::mem::size_of::<PendingWitnessPullResponseMeta>()],
+	);
+	assert_eq!(witnesses.status, PendingWitnessPullStatus::INTERNAL_ERROR);
+	assert_eq!(witnesses.witness_count, 0);
+	assert!(answer.arrow_payload.is_none());
+
+	// Nothing was decided on the member's behalf.
+	let after = cluster.node(survivor).state_machine.state_snapshot().await;
+	assert_eq!(
+		after.decisions.as_ref().unwrap().instances(),
+		before.decisions.as_ref().unwrap().instances()
+	);
+	assert_eq!(control.identity.role, Role::ControlOnly);
+	control.shutdown().await.unwrap();
+	halt_for_test(&cfg.data_dir, None);
+	for node in std::mem::take(&mut cluster.nodes) {
+		let _ = tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown()).await;
+	}
+}

@@ -1272,6 +1272,8 @@ struct Formed {
 	members: Vec<Member>,
 	daemons: Daemons,
 	descriptor: TableSchemaDescriptor,
+	/// Each member's configured decision verifying key, in `NODES` order.
+	decision_keys: Vec<[u8; 32]>,
 }
 
 /// A node's `[storage]` body and what follows `[tuning]`'s first lines. With no store both are
@@ -1444,6 +1446,10 @@ async fn form_cluster(
 			audit: random32(),
 			decision: random32(),
 		})
+		.collect();
+	let decision_keys: Vec<[u8; 32]> = secrets
+		.iter()
+		.map(|secret| wendelon::consensus::decisions::decision_verifying_key_bytes(secret.decision))
 		.collect();
 	let mut trusted = [String::new(), String::new(), String::new(), String::new()];
 	for (id, secret) in NODES.iter().zip(&secrets) {
@@ -1685,6 +1691,7 @@ metrics = "{metrics}"
 			members,
 			daemons,
 			descriptor,
+			decision_keys,
 		};
 	}
 	// The operator creates the application's tenant with the cluster's replication factor,
@@ -1725,6 +1732,7 @@ metrics = "{metrics}"
 		members,
 		daemons,
 		descriptor,
+		decision_keys,
 	}
 }
 
@@ -1739,6 +1747,7 @@ async fn three_daemons_from_configuration_files_form_a_parent_decisions_cluster_
 		members,
 		mut daemons,
 		descriptor,
+		..
 	} = form(deadline, None).await;
 	let row = one_row(7, "seven");
 	// The application's client: the storage credential, confined to its tenant.
@@ -2764,6 +2773,7 @@ async fn pause_recovery_workflow(which: Paused) {
 		members,
 		mut daemons,
 		descriptor,
+		..
 	} = form(deadline, None).await;
 	let client = client_through(&members[0], &pki, Credential::Storage, deadline).await;
 	let processes = daemons.owned();
@@ -5087,6 +5097,7 @@ async fn three_daemons_back_up_cold_rows_and_restore_into_a_fresh_cluster_that_t
 		members: source_members,
 		daemons: source_daemons,
 		descriptor,
+		..
 	} = source;
 	// Ends the source's owners through node-control; nothing of it is deleted.
 	drop(source_daemons);
@@ -5250,6 +5261,10 @@ const REFUSED_START_BOUND: Duration = Duration::from_secs(60);
 const OFFERED_WRITE_BOUND: Duration = Duration::from_secs(30);
 /// How long the old instance runs before the facts taken while it runs.
 const OLD_INSTANCE_RUN: Duration = Duration::from_secs(5);
+/// Wendelon ADR 0105: from done until the status shows the replacement's store promoted and
+/// its key bound. The promotion waits for the lost slot's lineages to move by takeover (lease
+/// expiry, then a staggered takeover), so this bound is larger than one lease.
+const PREPARED_BOUND: Duration = Duration::from_secs(120);
 /// One routed Raft probe's bound: dial, request and answer.
 const PROBE_BOUND: Duration = Duration::from_secs(10);
 /// The first allocated Raft instance: the one a cluster's first replacement is granted.
@@ -5271,6 +5286,10 @@ struct Reported {
 	slot: u32,
 	r_old: u32,
 	phase: ReportedPhase,
+	/// Wendelon ADR 0105: the promoted store, printed only after `done`.
+	promoted: Option<u128>,
+	/// Wendelon ADR 0105: the decision key bound to that store, printed only after it.
+	bound_key: Option<[u8; 32]>,
 }
 
 /// A decimal number of digits only.
@@ -5292,9 +5311,18 @@ fn parse_report(line: &str) -> Option<Reported> {
 	let (token, rest) = rest.split_once(": slot ")?;
 	let (slot, rest) = rest.split_once(" replacing instance ")?;
 	let (r_old, phase) = rest.split_once(": ")?;
+	let (phase, promoted, bound_key) = match phase.split_once("; promoted store ") {
+		Some((phase, rest)) => match rest.split_once("; bound key ") {
+			Some((store, key)) => (phase, Some(token_of(store)?), Some(key_of(key)?)),
+			None => (phase, Some(token_of(rest)?), None),
+		},
+		None => (phase, None, None),
+	};
 	let phase = match phase.split_once(' ') {
-		None if phase == "begun" => ReportedPhase::Begun,
-		Some(("reserved", instance)) => ReportedPhase::Reserved(number(instance)?),
+		None if phase == "begun" && promoted.is_none() => ReportedPhase::Begun,
+		Some(("reserved", instance)) if promoted.is_none() => {
+			ReportedPhase::Reserved(number(instance)?)
+		}
 		Some(("done", instance)) => ReportedPhase::Done(number(instance)?),
 		_ => return None,
 	};
@@ -5303,7 +5331,25 @@ fn parse_report(line: &str) -> Option<Reported> {
 		slot: number(slot)?,
 		r_old: number(r_old)?,
 		phase,
+		promoted,
+		bound_key,
 	})
+}
+
+/// Exactly 64 lowercase hex digits: a 32-byte key.
+fn key_of(text: &str) -> Option<[u8; 32]> {
+	if text.len() != 64
+		|| !text
+			.bytes()
+			.all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+	{
+		return None;
+	}
+	let mut key = [0_u8; 32];
+	for (index, byte) in key.iter_mut().enumerate() {
+		*byte = u8::from_str_radix(&text[2 * index..2 * index + 2], 16).ok()?;
+	}
+	Some(key)
 }
 
 /// The token `begin` prints before it sends anything:
@@ -5326,6 +5372,8 @@ fn a_replacement_report_is_read_whole_or_not_at_all() {
 			slot: 3,
 			r_old: 3,
 			phase,
+			promoted: None,
+			bound_key: None,
 		})
 	};
 	assert_eq!(
@@ -5340,7 +5388,40 @@ fn a_replacement_report_is_read_whole_or_not_at_all() {
 		parse_report(&report("done 2147483648")),
 		reported(ReportedPhase::Done(FIRST_ALLOCATED))
 	);
+	// Wendelon ADR 0105: a promoted store follows `done`, and only `done`.
+	let store = "00000000000000000000000000000105";
+	assert_eq!(
+		parse_report(&report(&format!("done 2147483648; promoted store {store}"))),
+		Some(Reported {
+			promoted: Some(0x0105),
+			..reported(ReportedPhase::Done(FIRST_ALLOCATED)).unwrap()
+		})
+	);
+	let key = "ab".repeat(32);
+	assert_eq!(
+		parse_report(&report(&format!(
+			"done 2147483648; promoted store {store}; bound key {key}"
+		))),
+		Some(Reported {
+			promoted: Some(0x0105),
+			bound_key: Some([0xab; 32]),
+			..reported(ReportedPhase::Done(FIRST_ALLOCATED)).unwrap()
+		})
+	);
 	for refused in [
+		report(&format!("done 2147483648; bound key {key}")),
+		report(&format!(
+			"done 2147483648; promoted store {store}; bound key {}",
+			&key[1..]
+		)),
+		report(&format!(
+			"done 2147483648; promoted store {store}; bound key {}",
+			key.to_uppercase()
+		)),
+		report(&format!("begun; promoted store {store}")),
+		report(&format!("reserved 2147483648; promoted store {store}")),
+		report("done 2147483648; promoted store 105"),
+		report(&format!("done 2147483648; promoted store {store} ")),
 		report("done"),
 		report("done +2147483648"),
 		report("done 2147483648 "),
@@ -5382,6 +5463,17 @@ fn replacement_status(
 	connection: &[std::ffi::OsString],
 	deadline: Instant,
 ) -> Option<ReportedPhase> {
+	replacement_report(step, token, slot, connection, deadline).map(|reported| reported.phase)
+}
+
+/// The whole status report of `token`, as `replacement_status` reads it.
+fn replacement_report(
+	step: &str,
+	token: u128,
+	slot: u32,
+	connection: &[std::ffi::OsString],
+	deadline: Instant,
+) -> Option<Reported> {
 	let mut arguments: Vec<std::ffi::OsString> = vec![
 		"status".into(),
 		"--token".into(),
@@ -5404,7 +5496,7 @@ fn replacement_status(
 		"{step}: another replacement: {}",
 		ran.text()
 	);
-	Some(reported.phase)
+	Some(reported)
 }
 
 /// ONE logical write of row `row_id` under one operation identity through `through`, offered
@@ -5503,18 +5595,26 @@ async fn expect_at_survivors(
 ///   reads report `done <first allocated instance>` within `DONE_BOUND`;
 /// - the survivors take new writes (ranges the lost slot held move by ADR 0729's takeover) and
 ///   read every acknowledged row exactly;
+/// - wendelon ADR 0105: within `PREPARED_BOUND` of done, the operator's status reports the
+///   replacement's own store promoted and the slot's configured decision key bound to it (the
+///   key compared with the one this test configured; the test binds nothing itself); stopped,
+///   its store's vote page names the first allocated instance, control-only; restarted, the
+///   status names the same store and key;
 /// - the old instance comes back on its old disk at the slot's address while the replacement's
 ///   process is stopped in order, and must keep running (its process identity is read). A
 ///   survivor sends it authenticated, correctly formed Raft votes as itself, each bounded and
 ///   on a fresh connection. The one addressed to the old instance is answered, the one addressed
 ///   to the replacement is refused with no answer, and the old instance answers again after it.
+///   Wendelon ADR 0105: one table query sent straight to the slot (the old process), with no
+///   redirect followed and nothing asked again, is not answered OK, between two to a survivor
+///   that are.
 ///   Then a survivor still names a survivor as leader, a new write commits, and reads stay exact.
 ///   The old process's ready answer and the refusals counted in its log are printed as a record;
 ///   neither is an oracle;
 /// - the replacement's process returns: still done, writes commit, reads exact; every process
 ///   stops in order with status 0.
 ///
-/// Not claimed: the replacement's data readiness (gates 2 to 4: it serves no data), more than
+/// Not claimed: the replacement's data readiness (gates 3 and 4: it serves no data), more than
 /// one host, a leader's loss, or the replacement's catch-up seen from outside.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "spawns three daemons, kills one and replaces it through the operator's commands; run alone under an external owner (see the module text)"]
@@ -5531,6 +5631,7 @@ async fn three_daemons_replace_a_lost_follower_with_a_control_only_instance() {
 		members,
 		mut daemons,
 		descriptor,
+		decision_keys,
 	} = form(deadline, None).await;
 	let storage = client_through(&members[0], &pki, Credential::Storage, deadline).await;
 	let mut expected = Vec::new();
@@ -5628,6 +5729,8 @@ async fn three_daemons_replace_a_lost_follower_with_a_control_only_instance() {
 			slot: lost.id,
 			r_old: lost.id,
 			phase: ReportedPhase::Begun,
+			promoted: None,
+			bound_key: None,
 		}),
 		"replace begin: {}",
 		began.text()
@@ -5698,6 +5801,79 @@ async fn three_daemons_replace_a_lost_follower_with_a_control_only_instance() {
 		"after done",
 	)
 	.await;
+
+	// Wendelon ADR 0105: the replacement admits its own store and binds its slot's configured
+	// key, both read from the operator's status (neither is written by this test); and it is
+	// still control-only on disk after a restart.
+	let configured = decision_keys[NODES.iter().position(|id| *id == lost.id).unwrap()];
+	let prepared_from = Instant::now();
+	let prepared_by = deadline.min(prepared_from + PREPARED_BOUND);
+	let mut reads = 0_u32;
+	let store = loop {
+		reads += 1;
+		let reported = replacement_report(
+			&format!("replace-prepared-{reads}"),
+			token,
+			lost.id,
+			&connection,
+			prepared_by,
+		);
+		if let Some(Reported {
+			phase: ReportedPhase::Done(FIRST_ALLOCATED),
+			promoted: Some(store),
+			bound_key: Some(key),
+			..
+		}) = reported
+		{
+			assert_eq!(
+				key, configured,
+				"the bound key is the slot's configured one"
+			);
+			break store;
+		}
+		if let Some(why) = daemons.exited() {
+			panic!("before the replacement was prepared: {why}");
+		}
+		assert!(
+			Instant::now() < prepared_by,
+			"the replacement was not prepared within {PREPARED_BOUND:?} ({reads} status reads, \
+			 last {reported:?})"
+		);
+		tokio::time::sleep(Duration::from_secs(1)).await;
+	};
+	eprintln!(
+		"smoke: replacement promoted store {store:032x} and bound its configured key {:?} after \
+		 done ({reads} status reads)",
+		prepared_from.elapsed()
+	);
+	daemons.stop(lost.id, deadline);
+	assert_eq!(
+		wendelon::consensus::stored_raft_role_for_test(&data).unwrap(),
+		Some((FIRST_ALLOCATED, true)),
+		"the replacement's store is control-only on disk after its preparation"
+	);
+	daemons.start(lost);
+	tokio::time::sleep(Duration::from_secs(2)).await;
+	if let Some(why) = daemons.exited() {
+		panic!("after the prepared replacement's restart: {why}");
+	}
+	let restarted = replacement_report(
+		"replace-status-restarted",
+		token,
+		lost.id,
+		&connection,
+		deadline,
+	)
+	.expect("a status after the restart");
+	assert_eq!(
+		(restarted.phase, restarted.promoted, restarted.bound_key),
+		(
+			ReportedPhase::Done(FIRST_ALLOCATED),
+			Some(store),
+			Some(configured)
+		),
+		"the same store and key after the restart"
+	);
 
 	// The old instance returns on its old disk at the slot's address: the replacement's
 	// process stops in order, and the same configuration but for its data directory starts.
@@ -5780,6 +5956,63 @@ async fn three_daemons_replace_a_lost_follower_with_a_control_only_instance() {
 	assert!(!after.vote_granted, "a term-0 vote was granted: {after:?}");
 	if let Some(why) = daemons.exited() {
 		panic!("after the probes: {why}");
+	}
+	// Wendelon ADR 0105: the old process serves no read. One LINEARIZABLE table query is sent
+	// straight to the slot's address, where only the old process runs now (its identity is read
+	// above), with no redirect followed and nothing asked again; the same query to a survivor
+	// answers OK before and after it, so a refusal is the old process's and not the query's.
+	let reader = client_through(survivors[0], &pki, Credential::Storage, deadline).await;
+	let direct = |target: u32| {
+		let inner = reader.inner().clone();
+		let mut meta: wendelon::schema::TableQueryRequestMeta = bytemuck::Zeroable::zeroed();
+		meta.expected_epoch = inner.epoch();
+		meta.tenant_id = TenantId::new(TENANT);
+		meta.table_object_id = descriptor.table_object_id;
+		meta.schema_generation = descriptor.schema_generation;
+		meta.physical_descriptor_fingerprint =
+			*descriptor.physical_descriptor_fingerprint.as_bytes();
+		meta.consistency = wendelon::schema::Consistency::LINEARIZABLE;
+		meta.row_identity_projection = wendelon::client::RowIdentityProjection::None.as_u8();
+		meta.deadline_remaining_millis = PROBE_BOUND.as_millis() as u64;
+		let request = wendelon::client::TableQueryRequest {
+			meta,
+			descriptor: descriptor.clone(),
+			pbc: Vec::new(),
+			runtime_filter: None,
+			row_identity: wendelon::client::RowIdentityProjection::None,
+		};
+		async move {
+			tokio::time::timeout(
+				PROBE_BOUND,
+				inner.table_query_at_for_test(
+					wendelon::schema::NodeId {
+						id: target,
+						_reserved: 0,
+					},
+					request,
+				),
+			)
+			.await
+		}
+	};
+	let survivor_before = direct(survivors[0].id).await;
+	assert!(
+		matches!(survivor_before, Ok(Ok(true))),
+		"a survivor did not answer the direct read: {survivor_before:?}"
+	);
+	let at_old = direct(lost.id).await;
+	assert!(
+		!matches!(at_old, Ok(Ok(true))),
+		"the old process answered a read OK"
+	);
+	eprintln!("smoke: a read sent straight to the old process: {at_old:?}");
+	let survivor_after = direct(survivors[0].id).await;
+	assert!(
+		matches!(survivor_after, Ok(Ok(true))),
+		"a survivor did not answer the direct read after: {survivor_after:?}"
+	);
+	if let Some(why) = daemons.exited() {
+		panic!("after the read probes: {why}");
 	}
 	let view = inspect(survivors[0], &pki);
 	assert!(

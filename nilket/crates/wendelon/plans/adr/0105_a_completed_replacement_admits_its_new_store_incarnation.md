@@ -130,7 +130,7 @@ One execution, through the reviewed launcher.
 - After Done, slot N is fenced from leases, takeovers and coordination until gate 4. Its data stays unavailable, as under 0104.
 - A layout whose takeover is `UnsupportedShape` cannot promote.
 - J's store index exists on the replacement before it holds any data.
-- I's objects stay in the object store, unreferenced by any reader, until a later reclaim.
+- I's objects are kept in the object store, and so are their pointer, claim, generation and history references; none is dropped or reclaimed here (correction after source review: kept, not established as unreferenced).
 
 ## Not decided here
 - Gates 3 and 4.
@@ -139,3 +139,39 @@ One execution, through the reviewed launcher.
 - Cancel or abandon.
 - Address change.
 - DC-243 step 2.
+
+## As built
+- **Request and reducer.** `WendelonRequest::PromoteIncarnation` (appended), `ForwardedDecision::PromoteIncarnation` (the node is the sender), and `decisions::promote_incarnation`. The token, instance, birth and slot checks are `InstanceState::promotion_authority`. The registry rules, then P1 (counting lineages at (N, expected)), are applied before any change. The registry observer event is emitted as for a registration. Refusals are new `SlabRefusal` variants: `ReplacementNotDone`, `PromotionNotAuthorized` (another slot, instance or birth before any promotion), `PromotionConflict` and `LineagesStillHeld { count }`. `StaleSupersede` and `RetiredIncarnation` are reused.
+- **Record.** `Replacement.promoted: Option<Promotion { expected, incarnation }>`.
+- **Fence.** `InstanceState::preparing(slot)`: a Done replacement of the slot whose r_new is not retired. It is checked:
+  - in `apply_lease_grant`, before admission (grant, renewal and regrant, single or batched: `LeaseDenied`);
+  - in `take_over`, after the signature (`SlotBeingReplaced`);
+  - in `reserve`, after the recorded-parent answer and the backup hold (`SlotBeingReplaced`).
+
+  `Finalize`, `Resolve`, `Abort` and `RecordNoop` are unchanged.
+- **Containment (D4 amended).** Besides its Raft handler, a control-only member's router holds one typed rejection handler for data-plane requests (see the DC-246 correction below). It serves, stores and acknowledges nothing.
+- **Preparation.** `node::replacement_preparation::Preparation`, one task per control-only node, ticking every 200 ms. It forwards each proposal straight to the leader's address in the applied membership, within the decision exchange deadline (5 s). It builds no transport factory, epoch watch or `DecisionProposals`. A refusal or failure is logged and the next tick reads applied state again. A fail-closed condition (store lost, unexplained or not the promoted one, or a key mismatch) ends the task; the member keeps its Raft obligations. The key is the verifying key of the slot's configured `decision_signing_secret`.
+- **Feasibility F1** (one execution, 3.146 s). An owned redb is released only at the owner's close, so the index is opened once and held for the node's lifetime. A second open in the same process waited on its own handle; that run hung until it was killed.
+- **Report.** `ReplacementReportWire.promoted`. `replace status` prints `done <r_new>; promoted store <32 hex>`.
+- **Formats.** PD WAL/snapshot 26, marker v16 (v15 retired), PD Raft frame 19 (a version-18 peer would grant a preparing slot's leases), golden `parent_decisions_v26.txt` (no body moved; `promote_incarnation` and `promoted_replacement` added).
+- **RED.** The seven reducer controls ran against a stub that refused every promotion: six failed as designed, and the unchanged-registration control passed. The in-process process test was written after the preparation code; it has no RED of its own.
+- **Corrections after source review** (Codex 01a1e11e):
+  - **R1.** A first promotion also needs r_new to serve its slot at apply time: it is not retired, it is a voter in every configuration of the applied membership, and it is not the old instance of an open replacement. Otherwise `PromotionStale`. An exact retry of a recorded promotion still answers its historical success first. RED: the stale first promotion succeeded; GREEN after the check.
+  - **R2.** The leader keeps a promotion's refusal as `ProposalOutcome::Promotion { refused }`; ordinary registration keeps its `Incarnation { accepted }` answer. The preparation task re-proposes its first promotion unchanged (the same intent) on a wait or an unknown outcome: no leader, indeterminate, an unhealthy leader clock, `LineagesStillHeld`, `StaleSupersede`, or a success not yet applied here. It ends on any other refusal. RED: a stale replacement re-proposed 296 times in 60 s; GREEN: one proposal, then stop.
+- **DC-246 correction (Codex 01a1e13f).** The owning run pd-replace-20261115T215756Z FAILED before any gate-2 assertion. The control-only member dropped a client's `TABLE_WRITE_REQ` unanswered, because its router had no data handler, and the client saw `early eof`. The control-only router now installs `network::data_server::not_serving::NotServing`, a rejection-only `DataRingServer`. It holds no store and runs no duty, and answers each family in its own schema:
+  - **Table write and delete:** `NOT_LEADER`, outcome `INDETERMINATE`, no hint, the write id echoed, no position, commit clock or finalization.
+  - **Table query:** `NOT_LEADER`, no hint, no rows, stream end.
+  - **Child write and replicate:** `ChildWriteResponse::Refused`.
+  - **Child fetch:** `ChildFetchResponse::Refused`.
+  - **Pending witness:** `INTERNAL_ERROR`, no witnesses, as a degraded node answers. Its caller reads any non-OK as a failed pull, not an empty inventory.
+  - **Anything else, or a malformed request:** an error, as before.
+
+  Node-to-node families still require an authenticated data node. So ControlOnly now holds a typed rejection handler, but still no data-serving node.
+  - RED: the in-process control's table write got `early eof`.
+  - GREEN: every family is answered as above.
+  - The client's existing handling of that write answer: the same identity is sent again; when every attempt gets it, the client ends with its own `WRITE_ATTEMPTS_EXHAUSTED` + `INDETERMINATE`.
+- **Daemon oracle hooks** (`test-support` only, called by no product code):
+  - `Client::table_query_at_for_test`: one table query to exactly one node;
+  - `stored_raft_role_for_test`: a stopped store's instance and role, from its vote page.
+
+  The status report also carries the key bound to the promoted store (`; bound key <64 hex>`).

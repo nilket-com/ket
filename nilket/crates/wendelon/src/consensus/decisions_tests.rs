@@ -4669,3 +4669,359 @@ fn writes_stay_admitted_through_a_replacement_but_its_joint_entry() {
 		"admitted after the swap"
 	);
 }
+
+// ============================================================
+//  ADR 0105 (wendelon): A COMPLETED REPLACEMENT ADMITS ITS NEW STORE
+// ============================================================
+
+use crate::consensus::decisions::instances::Promotion;
+use crate::consensus::{PromoteIncarnation, SlabRefusal};
+
+const BIRTH: u8 = 7;
+
+fn store_j() -> StoreIncarnation {
+	StoreIncarnation::from_raw(0x0105_0000_0001)
+}
+
+/// `state` with slot 3's replacement, under `token`, by the next allocated
+/// instance granted to `birth`, carried to Done: the swap is the applied
+/// membership and the old instance is retired.
+fn complete(state: &mut SmState, token: u128, birth: u8) -> u32 {
+	assert!(matches!(
+		decide(state, DecisionCommand::BeginReplacement { token, slot: 3 }),
+		DecisionResult::ReplacementRecorded {
+			phase: ReplacementPhase::Begun,
+			..
+		}
+	));
+	let DecisionResult::InstanceGranted { instance } = grant_replacement(state, birth, 3, token)
+	else {
+		panic!("grant");
+	};
+	let survivors: Vec<u32> = state
+		.last_membership
+		.membership()
+		.voter_ids()
+		.filter(|voter| slot_of(state, *voter) != Ok(3))
+		.chain([instance])
+		.collect();
+	state.last_membership = formed_membership(&survivors);
+	assert_eq!(
+		decide(state, DecisionCommand::CompleteReplacement { token }),
+		DecisionResult::ReplacementCompleted { r_new: instance }
+	);
+	instance
+}
+
+fn done() -> SmState {
+	let mut state = base(3);
+	assert_eq!(complete(&mut state, TOKEN, BIRTH), ALLOCATED_BASE);
+	state
+}
+
+fn promotion(
+	sender: u32,
+	token: u128,
+	r_new: u32,
+	birth: u8,
+	expected: StoreIncarnation,
+	incarnation: StoreIncarnation,
+) -> WendelonRequest {
+	WendelonRequest::PromoteIncarnation(PromoteIncarnation {
+		node: sender,
+		token,
+		r_new,
+		birth: [birth; 16],
+		expected,
+		incarnation,
+	})
+}
+
+fn promote(state: &mut SmState) -> WendelonResponse {
+	apply_next(
+		state,
+		promotion(3, TOKEN, ALLOCATED_BASE, BIRTH, inc(3), store_j()),
+	)
+}
+
+fn refused_unchanged(state: &mut SmState, request: WendelonRequest, refusal: SlabRefusal) {
+	let before = state.clone();
+	assert_eq!(
+		apply_next(state, request),
+		WendelonResponse::Refused(refusal)
+	);
+	assert_eq!(state.incarnations, before.incarnations);
+	assert_eq!(state.decisions, before.decisions);
+}
+
+#[test]
+fn a_promotion_needs_a_done_replacement_bound_to_its_grant() {
+	// Reserved, not Done.
+	let mut state = reserved();
+	refused_unchanged(
+		&mut state,
+		promotion(3, TOKEN, ALLOCATED_BASE, BIRTH, inc(3), store_j()),
+		SlabRefusal::ReplacementNotDone,
+	);
+	// No such replacement.
+	let mut state = done();
+	refused_unchanged(
+		&mut state,
+		promotion(3, TOKEN + 1, ALLOCATED_BASE, BIRTH, inc(3), store_j()),
+		SlabRefusal::ReplacementNotDone,
+	);
+	// Another birth, another instance, another slot's sender.
+	for request in [
+		promotion(3, TOKEN, ALLOCATED_BASE, BIRTH + 1, inc(3), store_j()),
+		promotion(3, TOKEN, ALLOCATED_BASE + 1, BIRTH, inc(3), store_j()),
+		promotion(2, TOKEN, ALLOCATED_BASE, BIRTH, inc(2), store_j()),
+	] {
+		refused_unchanged(&mut state, request, SlabRefusal::PromotionNotAuthorized);
+	}
+	assert_eq!(promote(&mut state), WendelonResponse::Success);
+}
+
+#[test]
+fn a_promotion_is_recorded_once_and_its_exact_retry_changes_nothing() {
+	let mut state = done();
+	assert_eq!(promote(&mut state), WendelonResponse::Success);
+	let registry = &state.incarnations[&3];
+	assert_eq!(registry.current, Some(store_j()));
+	assert!(registry.retired.contains(&inc(3)));
+	assert!(registry.accepted.contains(&(store_j(), Some(inc(3)))));
+	assert_eq!(
+		decisions(&state)
+			.instances()
+			.replacement(TOKEN)
+			.unwrap()
+			.promoted,
+		Some(Promotion {
+			expected: inc(3),
+			incarnation: store_j(),
+		})
+	);
+	let before = state.clone();
+	assert_eq!(promote(&mut state), WendelonResponse::Success);
+	assert_eq!(state.incarnations, before.incarnations);
+	assert_eq!(state.decisions, before.decisions);
+	// Another tuple cannot reuse the authorization.
+	let other = StoreIncarnation::from_raw(0x0105_0000_0002);
+	for request in [
+		promotion(3, TOKEN, ALLOCATED_BASE, BIRTH, inc(3), other),
+		promotion(3, TOKEN, ALLOCATED_BASE, BIRTH, store_j(), other),
+	] {
+		refused_unchanged(&mut state, request, SlabRefusal::PromotionConflict);
+	}
+
+	// A later replacement supersedes J; the first promotion's exact retry is
+	// its historical answer and moves nothing back.
+	let r_next = complete(&mut state, TOKEN + 1, BIRTH + 1);
+	assert_eq!(
+		apply_next(
+			&mut state,
+			promotion(3, TOKEN + 1, r_next, BIRTH + 1, store_j(), other)
+		),
+		WendelonResponse::Success
+	);
+	let before = state.clone();
+	assert_eq!(promote(&mut state), WendelonResponse::Success);
+	assert_eq!(state.incarnations, before.incarnations);
+	assert_eq!(state.incarnations[&3].current, Some(other));
+}
+
+#[test]
+fn a_promotion_needs_the_current_incarnation_and_a_new_one() {
+	let mut state = done();
+	refused_unchanged(
+		&mut state,
+		promotion(3, TOKEN, ALLOCATED_BASE, BIRTH, inc(9), store_j()),
+		SlabRefusal::StaleSupersede {
+			node: 3,
+			current: Some(inc(3)),
+		},
+	);
+	refused_unchanged(
+		&mut state,
+		promotion(3, TOKEN, ALLOCATED_BASE, BIRTH, inc(3), inc(3)),
+		SlabRefusal::RetiredIncarnation {
+			node: 3,
+			incarnation: inc(3),
+		},
+	);
+}
+
+/// P1: a lineage still held at the old store is moved by takeover first; the
+/// promotion never drops it.
+#[test]
+fn a_promotion_waits_while_the_old_store_holds_a_lineage() {
+	let mut state = base(3);
+	grant_all(&mut state);
+	complete(&mut state, TOKEN, BIRTH);
+	let held = decisions(&state)
+		.lineages
+		.values()
+		.filter(|lineage| lineage.holder.id == 3)
+		.count() as u32;
+	assert!(held > 0);
+	refused_unchanged(
+		&mut state,
+		promotion(3, TOKEN, ALLOCATED_BASE, BIRTH, inc(3), store_j()),
+		SlabRefusal::LineagesStillHeld { count: held },
+	);
+}
+
+#[test]
+fn the_ordinary_registration_rules_are_unchanged_by_a_replacement() {
+	let mut state = done();
+	for supersedes in [None, Some(inc(3))] {
+		refused_unchanged(
+			&mut state,
+			WendelonRequest::RegisterIncarnation(crate::consensus::RegisterIncarnation {
+				node: 3,
+				incarnation: store_j(),
+				supersedes,
+			}),
+			SlabRefusal::StaleSupersede {
+				node: 3,
+				current: Some(inc(3)),
+			},
+		);
+	}
+}
+
+/// D3: from Done until activation the replaced slot takes no lease, takeover
+/// or coordination; the survivors' authority and the resolution of earlier
+/// work are unaffected.
+#[test]
+fn a_replaced_slot_takes_no_lease_takeover_or_coordination() {
+	let (mut state, earlier, reservation) = reserved_parent(1);
+	complete(&mut state, TOKEN, BIRTH);
+	let mut theirs = None;
+	for (holder, range) in universe() {
+		let response = grant(&mut state, lease(holder, range, 0, 2_000));
+		if holder == 3 {
+			assert_eq!(response, WendelonResponse::LeaseDenied, "renewal by slot 3");
+		} else {
+			assert_eq!(response, WendelonResponse::Success, "renewal by {holder}");
+			theirs = Some((holder, range));
+		}
+	}
+	let (holder, (start, _)) = theirs.unwrap();
+	let generation = decisions(&state).lineages[&start].generation;
+	let before = state.clone();
+	assert_eq!(
+		takeover(&mut state, start, generation, 3, 1_000_000),
+		refused(DecisionRefusal::SlotBeingReplaced)
+	);
+	assert_eq!(state.decisions, before.decisions);
+	assert_ne!(holder, 3);
+
+	let children = children(&state, 3);
+	let coordinator = children
+		.iter()
+		.position(|child| child.holder.node == 3)
+		.expect("slot 3 holds a child") as u16;
+	let ours = claim(key(T0, 9), children, coordinator);
+	assert_eq!(
+		reserve(&mut state, &ours, T0),
+		refused(DecisionRefusal::SlotBeingReplaced)
+	);
+	// Earlier work still resolves.
+	assert_ne!(
+		abort(&mut state, &earlier, reservation),
+		refused(DecisionRefusal::SlotBeingReplaced)
+	);
+}
+
+#[test]
+fn the_old_stores_history_still_verifies_and_the_new_store_binds() {
+	let mut state = done();
+	let body = TakeOverBody {
+		range_start: 0,
+		generation: 1,
+		successor: signer(3),
+	};
+	let old = sign_for_test(body, signer(3));
+	assert_eq!(promote(&mut state), WendelonResponse::Success);
+	assert!(evidence::verify(decisions(&state), &old).is_ok());
+	let key = decision_verifying_key_bytes(dev_decision_signing_secret(3));
+	assert_eq!(
+		bind(
+			&mut state,
+			Signer {
+				node: 3,
+				incarnation: store_j(),
+			},
+			key
+		),
+		DecisionResult::SignerBound
+	);
+	assert!(evidence::verify(decisions(&state), &old).is_ok());
+}
+
+/// R1: a Done token that never promoted loses its first promotion once its
+/// instance stops serving the slot: while a later replacement is open against
+/// it, once that swap's uniform membership excludes it (before Done retires
+/// it), after that Done, and after that replacement's own promotion. Nothing
+/// changes; an already recorded promotion's exact retry stays its historical
+/// answer (`a_promotion_is_recorded_once_and_its_exact_retry_changes_nothing`).
+#[test]
+fn a_superseded_replacement_cannot_make_its_first_promotion() {
+	let mut state = done();
+	let stale = promotion(3, TOKEN, ALLOCATED_BASE, BIRTH, inc(3), store_j());
+	let next = TOKEN + 1;
+	// A later replacement of the same slot is open against the first instance.
+	assert!(matches!(
+		decide(
+			&mut state,
+			DecisionCommand::BeginReplacement {
+				token: next,
+				slot: 3
+			}
+		),
+		DecisionResult::ReplacementRecorded {
+			r_old: ALLOCATED_BASE,
+			phase: ReplacementPhase::Begun,
+			..
+		}
+	));
+	refused_unchanged(&mut state, stale.clone(), SlabRefusal::PromotionStale);
+	let DecisionResult::InstanceGranted { instance: r_next } =
+		grant_replacement(&mut state, BIRTH + 1, 3, next)
+	else {
+		panic!("grant");
+	};
+	refused_unchanged(&mut state, stale.clone(), SlabRefusal::PromotionStale);
+	// The joint swap still names it, but the replacement against it is open.
+	state.last_membership = membership_of(&[&[1, 2, ALLOCATED_BASE], &[1, 2, r_next]], &[]);
+	refused_unchanged(&mut state, stale.clone(), SlabRefusal::PromotionStale);
+	// The uniform swap excludes it before Done retires it.
+	state.last_membership = formed_membership(&[1, 2, r_next]);
+	refused_unchanged(&mut state, stale.clone(), SlabRefusal::PromotionStale);
+	assert_eq!(
+		decide(
+			&mut state,
+			DecisionCommand::CompleteReplacement { token: next }
+		),
+		DecisionResult::ReplacementCompleted { r_new: r_next }
+	);
+	refused_unchanged(&mut state, stale.clone(), SlabRefusal::PromotionStale);
+	let other = StoreIncarnation::from_raw(0x0105_0000_0002);
+	assert_eq!(
+		apply_next(
+			&mut state,
+			promotion(3, next, r_next, BIRTH + 1, inc(3), other)
+		),
+		WendelonResponse::Success
+	);
+	refused_unchanged(&mut state, stale.clone(), SlabRefusal::PromotionStale);
+	assert_eq!(state.incarnations[&3].current, Some(other));
+	assert_eq!(
+		decisions(&state)
+			.instances()
+			.replacement(TOKEN)
+			.unwrap()
+			.promoted,
+		None
+	);
+}

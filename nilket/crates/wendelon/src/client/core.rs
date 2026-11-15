@@ -2725,6 +2725,26 @@ impl WendelonClient {
 		decode_logical_type_list_response_frame(frame)
 	}
 
+	/// Test-support only (wendelon ADR 0105): ONE `TABLE_QUERY_REQ` to exactly
+	/// `target`, no redirect followed and nothing asked again. `Ok(true)` when
+	/// that node answered OK; `Ok(false)` when it redirected; an error when it
+	/// refused or did not answer. Not a product API.
+	#[cfg(feature = "test-support")]
+	pub async fn table_query_at_for_test(
+		&self,
+		target: NodeId,
+		mut request: TableQueryRequest,
+	) -> std::io::Result<bool> {
+		if request.meta.request_id.is_zero() {
+			request.meta.request_id = TableQueryRequestId::random();
+		}
+		validate_table_query_request(&request)?;
+		match self.table_query_once(target, &request, None).await? {
+			QueryOutcome::Ok(_) => Ok(true),
+			QueryOutcome::Redirect(_) => Ok(false),
+		}
+	}
+
 	async fn table_query_once(
 		&self,
 		target: NodeId,

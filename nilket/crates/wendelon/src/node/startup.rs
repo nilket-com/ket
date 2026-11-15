@@ -303,7 +303,7 @@ pub(super) async fn interrupted_first_creation(
 	Ok(true)
 }
 
-fn interrupted_bootstrap_artifact(name: &str) -> bool {
+pub(super) fn interrupted_bootstrap_artifact(name: &str) -> bool {
 	let wal_segment = name
 		.strip_prefix("control.wal.")
 		.and_then(|rest| rest.strip_suffix(".seg"))

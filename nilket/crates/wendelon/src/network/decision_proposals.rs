@@ -84,6 +84,16 @@ pub enum ForwardedDecision {
 	TakeOverLineage {
 		takeover: Signed<crate::consensus::decisions::TakeOverBody>,
 	},
+	/// ADR 0105 (wendelon): a Done replacement admits its new store as the
+	/// sender's current incarnation. The node is always the sender; the state
+	/// machine judges the token, instance, birth and registry.
+	PromoteIncarnation {
+		token: u128,
+		r_new: u32,
+		birth: crate::consensus::decisions::instances::Birth,
+		expected: StoreIncarnation,
+		incarnation: StoreIncarnation,
+	},
 }
 
 /// ADR 0700: a time-bearing command before the leader stamps it. It becomes a
@@ -159,6 +169,11 @@ pub enum ProposalOutcome {
 	/// Whether the incarnation registration was applied.
 	Incarnation {
 		accepted: bool,
+	},
+	/// ADR 0105 (wendelon): a promotion's answer, with its refusal kept so the
+	/// replacement tells a wait from a definitive refusal.
+	Promotion {
+		refused: Option<crate::consensus::SlabRefusal>,
 	},
 }
 
@@ -527,6 +542,24 @@ pub(crate) fn admission(
 				},
 			)));
 		}
+		ForwardedDecision::PromoteIncarnation {
+			token,
+			r_new,
+			birth,
+			expected,
+			incarnation,
+		} => {
+			return Ok(Admitted::Ready(WendelonRequest::PromoteIncarnation(
+				crate::consensus::PromoteIncarnation {
+					node: sender,
+					token,
+					r_new,
+					birth,
+					expected,
+					incarnation,
+				},
+			)));
+		}
 	};
 	Ok(Admitted::Ready(WendelonRequest::Decision(command)))
 }
@@ -785,7 +818,23 @@ impl DecisionProposals {
 	}
 
 	async fn commit(&self, command: WendelonRequest) -> ProposalResponse {
+		let promotion = matches!(command, WendelonRequest::PromoteIncarnation(_));
 		match self.raft.client_write(command).await {
+			Ok(response) if promotion => match response.data {
+				WendelonResponse::Success => ProposalResponse::Applied {
+					outcome: ProposalOutcome::Promotion { refused: None },
+					log_index: response.log_id.index,
+				},
+				WendelonResponse::Refused(refusal) => ProposalResponse::Applied {
+					outcome: ProposalOutcome::Promotion {
+						refused: Some(refusal),
+					},
+					log_index: response.log_id.index,
+				},
+				other => ProposalResponse::Indeterminate(format!(
+					"unexpected response to a promotion: {other:?}"
+				)),
+			},
 			Ok(response) => match outcome_of(response.data) {
 				Ok(outcome) => ProposalResponse::Applied {
 					outcome,

@@ -761,6 +761,10 @@ pub struct ReplacementReportWire {
 	pub slot: u32,
 	pub r_old: u32,
 	pub phase: crate::consensus::decisions::instances::ReplacementPhase,
+	/// ADR 0105 (wendelon): the replacement's store, once promoted.
+	pub promoted: Option<crate::consensus::StoreIncarnation>,
+	/// ADR 0105 (wendelon): the decision key bound to the promoted store.
+	pub bound_key: Option<[u8; 32]>,
 }
 
 /// ADR 0736: a TENANT_ADMIN_RESP body as the response, then the backup
@@ -3390,7 +3394,13 @@ impl WendelonControlServer {
 					..
 				} => (
 					true,
-					Some(ReplacementReportWire { slot, r_old, phase }),
+					Some(ReplacementReportWire {
+						slot,
+						r_old,
+						phase,
+						promoted: None,
+						bound_key: None,
+					}),
 					None,
 				),
 				ProposalResponse::Applied {
@@ -4183,6 +4193,13 @@ impl WendelonControlServer {
 							slot: record.slot,
 							r_old: record.r_old,
 							phase: record.phase,
+							promoted: record.promoted.map(|promotion| promotion.incarnation),
+							bound_key: record.promoted.and_then(|promotion| {
+								decisions.signer_key(crate::consensus::decisions::Signer {
+									node: record.slot,
+									incarnation: promotion.incarnation,
+								})
+							}),
 						})
 					})
 					.await;

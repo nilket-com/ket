@@ -210,7 +210,7 @@ mod certification;
 mod cleanup;
 mod deletes;
 pub(crate) mod reader;
-mod repair;
+pub(crate) mod repair;
 mod table_query;
 use table_query::{
 	QueryProjectedExecution, RowGroupFetchAuditCounters, TableQueryResponseStreamWriter,
@@ -227,6 +227,8 @@ use write_replication::{
 	TableAttemptAnswer, TablePlacement, WriteOutcome,
 };
 mod descriptor_migration;
+/// ADR 0105 (wendelon): the typed refusals of a member that serves no data.
+pub(crate) mod not_serving;
 mod query_clocks;
 pub use query_clocks::QueryStallBound;
 use query_clocks::{

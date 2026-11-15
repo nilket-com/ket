@@ -112,6 +112,16 @@ pub struct Replacement {
 	/// from it, never from the current configuration.
 	pub pre_voters: BTreeSet<u32>,
 	pub phase: ReplacementPhase,
+	/// ADR 0105 (wendelon): the one promotion this Done replacement made.
+	pub promoted: Option<Promotion>,
+}
+
+/// ADR 0105 (wendelon): a replacement's new store `incarnation`, admitted as
+/// its slot's current one in place of `expected`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Promotion {
+	pub expected: crate::consensus::StoreIncarnation,
+	pub incarnation: crate::consensus::StoreIncarnation,
 }
 
 impl Replacement {
@@ -155,6 +165,61 @@ impl InstanceState {
 			.find(|(_, replacement)| !matches!(replacement.phase, ReplacementPhase::Done { .. }))
 			.map(|(token, replacement)| (*token, replacement))
 	}
+	/// ADR 0105 (wendelon): slot `slot` is between a Done replacement and that
+	/// replacement's activation (gate 4, which does not exist yet): its live
+	/// instance is the replacement's, which may prepare and nothing else.
+	pub fn preparing(&self, slot: u32) -> bool {
+		self.replacements.values().any(|replacement| {
+			replacement.slot == slot
+				&& matches!(replacement.phase, ReplacementPhase::Done { r_new } if !self.retired.contains(&r_new))
+		})
+	}
+
+	/// ADR 0105 (wendelon): what `request` may do under its token. `Ok(None)`
+	/// admits a first promotion; `Ok(Some(_))` is the recorded one, which the
+	/// request repeats exactly. The registry and lineage rules are the
+	/// caller's.
+	pub(crate) fn promotion_authority(
+		&self,
+		request: &crate::consensus::PromoteIncarnation,
+	) -> Result<Option<Promotion>, crate::consensus::SlabRefusal> {
+		use crate::consensus::SlabRefusal::*;
+		let replacement = self
+			.replacements
+			.get(&request.token)
+			.ok_or(ReplacementNotDone)?;
+		let ReplacementPhase::Done { r_new } = replacement.phase else {
+			return Err(ReplacementNotDone);
+		};
+		let granted = self.instances.get(&r_new);
+		if replacement.slot != request.node
+			|| r_new != request.r_new
+			|| granted.map(|record| (record.birth, record.kind))
+				!= Some((
+					request.birth,
+					GrantKind::Replacement {
+						token: request.token,
+					},
+				)) {
+			return Err(PromotionNotAuthorized);
+		}
+		let asked = Promotion {
+			expected: request.expected,
+			incarnation: request.incarnation,
+		};
+		match replacement.promoted {
+			None => Ok(None),
+			Some(recorded) if recorded == asked => Ok(Some(recorded)),
+			Some(_) => Err(PromotionConflict),
+		}
+	}
+
+	pub(crate) fn record_promotion(&mut self, token: u128, promotion: Promotion) {
+		if let Some(replacement) = self.replacements.get_mut(&token) {
+			replacement.promoted = Some(promotion);
+		}
+	}
+
 	/// The instance reserved by an open replacement, if any.
 	pub fn reserved_instance(&self) -> Option<u32> {
 		match self.open_replacement()?.1.phase {
@@ -370,6 +435,7 @@ pub(super) fn begin_replacement(
 		r_old,
 		pre_voters,
 		phase: ReplacementPhase::Begun,
+		promoted: None,
 	};
 	let result = recorded(&replacement);
 	decisions.instances.replacements.insert(token, replacement);

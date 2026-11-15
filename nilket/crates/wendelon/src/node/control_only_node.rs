@@ -22,6 +22,9 @@ pub struct ControlOnlyNode {
 	servers: Vec<NodeTransportServer>,
 	checkpoint_emitter: tokio::task::JoinHandle<()>,
 	owner: DataDirectoryOwner,
+	/// ADR 0105 (wendelon): the replacement's preparation and its task.
+	preparation: Arc<super::replacement_preparation::Preparation>,
+	preparing: tokio::task::JoinHandle<()>,
 	shutdown_bound: std::time::Duration,
 }
 
@@ -123,9 +126,15 @@ impl ControlOnlyNode {
 			WendelonRaftInternalServer::new(raft.clone(), pool.clone(), retention)
 				.with_decision_mode(cfg.decision_mode),
 		);
+		// ADR 0105 (wendelon): a data-plane request that reaches this member
+		// gets its family's typed refusal, never a dropped stream; nothing here
+		// serves, stores or acknowledges data.
 		let router = Arc::new(
 			MsgRouterBuilder::default()
 				.with_raft_internal(raft_server)
+				.with_data_ring(Arc::new(
+					crate::network::data_server::not_serving::NotServing::new(pool.clone()),
+				))
 				.build(),
 		);
 		let lifecycle = ServerLifecycle::new();
@@ -149,6 +158,24 @@ impl ControlOnlyNode {
 				)
 			})
 			.collect();
+		// ADR 0105 (wendelon): after Done, admit this store and bind its key.
+		let (secret, _) = identity::resolve_decision_keys(&cfg)?;
+		let key = ed25519_dalek::SigningKey::from_bytes(&secret)
+			.verifying_key()
+			.to_bytes();
+		let preparation = Arc::new(super::replacement_preparation::Preparation::new(
+			cfg.node_id,
+			identity.instance,
+			cfg.decision_mode,
+			raft.clone(),
+			state_machine.clone(),
+			provider.clone(),
+			pool.clone(),
+			owner.clone(),
+			cfg.data_dir.clone(),
+			key,
+		));
+		let preparing = tokio::spawn(preparation.clone().run());
 		tracing::info!(
 			slot = cfg.node_id,
 			instance = identity.instance,
@@ -164,12 +191,38 @@ impl ControlOnlyNode {
 			servers,
 			checkpoint_emitter,
 			owner,
+			preparation,
+			preparing,
 			shutdown_bound: cfg.storage_shutdown_timeout,
 		})
 	}
 
+	/// ADR 0105 (wendelon): this member's data incarnation J, from its own
+	/// store index (see `Preparation::store_incarnation`).
+	#[cfg(test)]
+	pub(crate) async fn store_incarnation(
+		&self,
+		may_create: bool,
+	) -> std::io::Result<crate::consensus::StoreIncarnation> {
+		self.preparation.store_incarnation(may_create).await
+	}
+
+	/// Test-only: the preparation proposals this node sent.
+	#[cfg(test)]
+	pub(crate) fn preparation_proposals_for_test(&self) -> u64 {
+		self.preparation.sent_for_test()
+	}
+
+	/// Whether preparation has finished (promoted and bound) or stopped.
+	pub fn preparation_ended(&self) -> bool {
+		self.preparing.is_finished()
+	}
+
 	/// Stops serving, shuts Raft down and closes the data directory.
 	pub async fn shutdown(self) -> std::io::Result<()> {
+		self.preparing.abort();
+		let _ = self.preparing.await;
+		self.preparation.release().await;
 		self.lifecycle.begin_drain();
 		for server in &self.servers {
 			server.begin_drain();
@@ -182,6 +235,7 @@ impl ControlOnlyNode {
 		let _ = self.checkpoint_emitter.await;
 		drop(self.provider);
 		drop(self.state_machine);
+		drop(self.preparation);
 		raft?;
 		self.owner.close(self.shutdown_bound).await
 	}

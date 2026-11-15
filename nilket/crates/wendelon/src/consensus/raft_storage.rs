@@ -7063,6 +7063,18 @@ fn apply_request_at_log_index(
 			crate::consensus::decisions::prune_lineages(state);
 			applied
 		}
+		// ADR 0105 (wendelon): a Done replacement's new store, bound to its
+		// token, instance and birth; the generic registration rules above stay.
+		WendelonRequest::PromoteIncarnation(request) => {
+			match crate::consensus::decisions::promote_incarnation(state, request) {
+				Ok(Some(registry)) => (
+					WendelonResponse::Success,
+					Some(TierObserverEvent::Registry(request.node, registry)),
+				),
+				Ok(None) => (WendelonResponse::Success, None),
+				Err(refusal) => (WendelonResponse::Refused(refusal), None),
+			}
+		}
 		WendelonRequest::Decision(command) => (
 			WendelonResponse::Decision(crate::consensus::decisions::apply(
 				state,
@@ -9539,6 +9551,19 @@ pub(crate) fn peek_identity(
 	Ok(page.identity)
 }
 
+/// Test-support only (wendelon ADR 0105): the Raft instance and whether it is
+/// control-only, read from a stopped store's vote page without opening the
+/// store. Not a product API.
+#[cfg(feature = "test-support")]
+pub fn stored_raft_role_for_test(data_dir: &Path) -> std::io::Result<Option<(u32, bool)>> {
+	Ok(peek_identity(&data_dir.join("vote.wnd"))?.map(|identity| {
+		(
+			identity.instance,
+			identity.role == crate::consensus::decisions::instances::Role::ControlOnly,
+		)
+	}))
+}
+
 /// ADR 0104 (wendelon): a ParentDecisions store's birth and identity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PageHead {
@@ -10663,6 +10688,7 @@ fn serialize_entry_page_as(
 			| WendelonRequest::RetiredCompactionCommit(never),
 		) => match *never {},
 		EntryPayload::Normal(WendelonRequest::RegisterIncarnation(_)) => (LogEntryKind::APPEND, 0),
+		EntryPayload::Normal(WendelonRequest::PromoteIncarnation(_)) => (LogEntryKind::APPEND, 0),
 		EntryPayload::Normal(WendelonRequest::SlabOp(_)) => (LogEntryKind::APPEND, 0),
 		EntryPayload::Normal(WendelonRequest::CancelOp(_)) => (LogEntryKind::APPEND, 0),
 		EntryPayload::Normal(WendelonRequest::AckOutcomes(_)) => (LogEntryKind::APPEND, 0),
@@ -10967,6 +10993,11 @@ fn apply_lease_grant(
 		let Some((expected_generation, stamp_ms)) = tenure else {
 			return WendelonResponse::LeaseDenied;
 		};
+		// ADR 0105 (wendelon): a slot being replaced takes no grant, renewal or
+		// regrant until its activation.
+		if crate::consensus::decisions::slot_preparing(state, lease.holder.id) {
+			return WendelonResponse::LeaseDenied;
+		}
 		match crate::consensus::decisions::admit_lease_grant(
 			state,
 			&lease,

@@ -219,6 +219,10 @@ async fn a_new_mode_store_writes_its_own_format_and_reopens() {
 
 use crate::consensus::decisions::tests as fixture;
 
+const PARENT_DECISIONS_V26_MANIFEST: &str =
+	include_str!("../../../tests/fixtures/consensus_body/parent_decisions_v26.txt");
+/// Wendelon ADR 0104's format-25 bodies, retained. Wendelon ADR 0105 moved
+/// none: it added the promotion request and the promoted replacement record.
 const PARENT_DECISIONS_V25_MANIFEST: &str =
 	include_str!("../../../tests/fixtures/consensus_body/parent_decisions_v25.txt");
 /// ADR 0736 to ADR 0103's format-24 bodies, retained. ADR 0104 (wendelon) changed
@@ -269,7 +273,7 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 fn manifest() -> BTreeMap<String, String> {
-	parse(PARENT_DECISIONS_V25_MANIFEST)
+	parse(PARENT_DECISIONS_V26_MANIFEST)
 }
 
 /// ADR 0725: the three owner-signed operation kinds pinned in the format-18
@@ -436,7 +440,7 @@ fn entry(index: u64, request: WendelonRequest) -> Entry<WendelonTypeConfig> {
 }
 
 #[test]
-fn the_format_25_bodies_match_their_goldens_and_round_trip() {
+fn the_format_26_bodies_match_their_goldens_and_round_trip() {
 	let stored = manifest();
 	let state = golden_state();
 	let body = encode_state_body(DecisionMode::ParentDecisions, &state).unwrap();
@@ -532,6 +536,37 @@ fn the_format_25_bodies_match_their_goldens_and_round_trip() {
 			hex(&postcard::to_stdvec(&WendelonRequest::Decision(command)).unwrap()),
 		));
 	}
+	// Wendelon ADR 0105: the promotion request and a promoted replacement.
+	let promotion = crate::consensus::PromoteIncarnation {
+		node: 105,
+		token: 0x0105_0105_0105_0105_0105_0105_0105_0105,
+		r_new: crate::consensus::decisions::instances::ALLOCATED_BASE,
+		birth: [0x05; 16],
+		expected: crate::consensus::StoreIncarnation::from_raw(0x0104),
+		incarnation: crate::consensus::StoreIncarnation::from_raw(0x0105),
+	};
+	actual.push((
+		"promote_incarnation".to_owned(),
+		hex(&postcard::to_stdvec(&WendelonRequest::PromoteIncarnation(promotion)).unwrap()),
+	));
+	actual.push((
+		"promoted_replacement".to_owned(),
+		hex(
+			&postcard::to_stdvec(&crate::consensus::decisions::instances::Replacement {
+				slot: 105,
+				r_old: 105,
+				pre_voters: [1, 2, 105].into_iter().collect(),
+				phase: crate::consensus::decisions::instances::ReplacementPhase::Done {
+					r_new: crate::consensus::decisions::instances::ALLOCATED_BASE,
+				},
+				promoted: Some(crate::consensus::decisions::instances::Promotion {
+					expected: promotion.expected,
+					incarnation: promotion.incarnation,
+				}),
+			})
+			.unwrap(),
+		),
+	));
 	let moved: Vec<String> = actual
 		.iter()
 		.filter(|(name, hex)| stored.get(name) != Some(hex))
@@ -539,7 +574,7 @@ fn the_format_25_bodies_match_their_goldens_and_round_trip() {
 		.collect();
 	assert!(
 		moved.is_empty(),
-		"format-25 bodies moved or are missing; expected lines:\n{}",
+		"format-26 bodies moved or are missing; expected lines:\n{}",
 		moved.join("\n")
 	);
 	assert_eq!(stored.len(), actual.len());
@@ -553,17 +588,24 @@ fn the_format_25_bodies_match_their_goldens_and_round_trip() {
 	// only the decision state differs from the format-16 corpus: by exactly the
 	// appended seal.
 	assert!(decisions.sealed().is_some());
+	// Wendelon ADR 0105: against the format-25 corpus no body moved; the
+	// promotion request and a promoted replacement record were added.
+	let retained_v25 = parse(PARENT_DECISIONS_V25_MANIFEST);
+	assert_eq!(stored.len(), retained_v25.len() + 2);
+	for (name, hex) in &retained_v25 {
+		assert_eq!(stored.get(name), Some(hex), "{name}");
+	}
 	// ADR 0104 (wendelon): against the format-24 corpus exactly one body moved,
 	// the decision state (the Raft instance records), and the three instance
 	// commands were added. Every other body is unchanged, byte for byte.
 	const MOVED_0104: [&str; 1] = ["decisions_golden_history"];
 	let retained_v24 = parse(PARENT_DECISIONS_V24_MANIFEST);
-	assert_eq!(stored.len(), retained_v24.len() + 3);
+	assert_eq!(retained_v25.len(), retained_v24.len() + 3);
 	for (name, hex) in &retained_v24 {
 		if MOVED_0104.contains(&name.as_str()) {
-			assert_ne!(stored.get(name), Some(hex), "{name}");
+			assert_ne!(retained_v25.get(name), Some(hex), "{name}");
 		} else {
-			assert_eq!(stored.get(name), Some(hex), "{name}");
+			assert_eq!(retained_v25.get(name), Some(hex), "{name}");
 		}
 	}
 	// ADR 0736: against the format-23 corpus exactly one body moved, the

@@ -29,6 +29,7 @@
 mod control_only_node;
 mod identity;
 mod instance_startup;
+mod replacement_preparation;
 pub use control_only_node::ControlOnlyNode;
 pub(crate) use instance_startup::starts_control_only;
 mod startup;

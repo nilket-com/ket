@@ -292,6 +292,19 @@ pub struct RegisterIncarnation {
 	pub supersedes: Option<StoreIncarnation>,
 }
 
+/// ADR 0105 (wendelon): a Done replacement's request to make its new store
+/// `incarnation` slot `node`'s current one, superseding `expected`. Bound to
+/// the replacement's token, its Raft instance and that instance's birth.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromoteIncarnation {
+	pub node: u32,
+	pub token: u128,
+	pub r_new: u32,
+	pub birth: crate::consensus::decisions::instances::Birth,
+	pub expected: StoreIncarnation,
+	pub incarnation: StoreIncarnation,
+}
+
 /// Why the state machine refused a slab command without applying or
 /// recording anything. A refusal is not an outcome: it grants no cleanup
 /// authority and does not prove an earlier attempt never applied.
@@ -332,6 +345,20 @@ pub enum SlabRefusal {
 	OwnerOpUnverifiable { owner: OwnerRef },
 	/// ADR 0725: the operation is attributed to a signer other than its owner.
 	OwnerOpSignerMismatch { owner: OwnerRef },
+	/// ADR 0105 (wendelon): no Done replacement under this token.
+	ReplacementNotDone,
+	/// ADR 0105 (wendelon): the token's record names another slot, instance
+	/// or birth than the request.
+	PromotionNotAuthorized,
+	/// ADR 0105 (wendelon): the token already promoted another tuple.
+	PromotionConflict,
+	/// ADR 0105 (wendelon): lineages still held at the old store; takeover
+	/// moves them first.
+	LineagesStillHeld { count: u32 },
+	/// ADR 0105 (wendelon): the replacement's instance no longer serves its
+	/// slot (retired, out of a voter configuration, or being replaced), so its
+	/// token may not make a first promotion.
+	PromotionStale,
 }
 
 /// The unified Node ID type used across Wendelon.
@@ -776,6 +803,9 @@ pub enum WendelonRequest {
 	/// ADR 0726: the cluster's write-once root compatibility check. Both
 	/// modes. Admitted once, before any tenant or tenant KEK exists.
 	EstablishRootCheck(crate::crypto::RootCheck),
+	/// ADR 0105 (wendelon): a Done replacement's new store becomes its slot's
+	/// current incarnation. `ParentDecisions` only.
+	PromoteIncarnation(PromoteIncarnation),
 }
 
 /// ADR 0701: at most [`crate::schema::MAX_LEASES_PER_BATCH`] leases. Decoding
@@ -963,7 +993,10 @@ impl WendelonRequest {
 	pub fn is_parent_decisions_only(&self) -> bool {
 		matches!(
 			self,
-			Self::Decision(_) | Self::AcquireLeases(_) | Self::OwnerOp(_)
+			Self::Decision(_)
+				| Self::AcquireLeases(_)
+				| Self::OwnerOp(_)
+				| Self::PromoteIncarnation(_)
 		)
 	}
 
@@ -989,6 +1022,7 @@ impl WendelonRequest {
 			Self::DeleteTenant(_) => "delete_tenant",
 			Self::InstallTenantKekVersion(_) => "install_tenant_kek_version",
 			Self::EstablishRootCheck(_) => "establish_root_check",
+			Self::PromoteIncarnation(_) => "promote_incarnation",
 			Self::RetireTenantKekVersion(_) => "retire_tenant_kek_version",
 			Self::RevokeActorKey(_) => "revoke_actor_key",
 			Self::SetTableRetentionPolicy(_) => "set_table_retention_policy",

@@ -94,8 +94,21 @@ fn report(token: u128, replacement: &ReplacementReportWire) -> String {
 		ReplacementPhase::Reserved { r_new } => format!("reserved {r_new}"),
 		ReplacementPhase::Done { r_new } => format!("done {r_new}"),
 	};
+	// ADR 0105 (wendelon): the promoted store, once there is one.
+	let promoted = replacement
+		.promoted
+		.map(|store| format!("; promoted store {:032x}", store.get()))
+		.unwrap_or_default();
+	let bound = replacement
+		.bound_key
+		.filter(|_| replacement.promoted.is_some())
+		.map(|key| {
+			let hex: String = key.iter().map(|byte| format!("{byte:02x}")).collect();
+			format!("; bound key {hex}")
+		})
+		.unwrap_or_default();
 	format!(
-		"replacement {token:032x}: slot {} replacing instance {}: {phase}",
+		"replacement {token:032x}: slot {} replacing instance {}: {phase}{promoted}{bound}",
 		replacement.slot, replacement.r_old
 	)
 }
@@ -463,6 +476,8 @@ mod tests {
 							slot,
 							r_old: slot,
 							phase: ReplacementPhase::Begun,
+							promoted: None,
+							bound_key: None,
 						},
 					))
 				}
@@ -691,6 +706,8 @@ mod tests {
 					slot: SLOT,
 					r_old: SLOT,
 					phase,
+					promoted: None,
+					bound_key: None,
 				},
 			)
 		};
@@ -703,6 +720,20 @@ mod tests {
 		assert_eq!(
 			line(ReplacementPhase::Done { r_new: 1 << 31 }),
 			format!("{prefix}done 2147483648")
+		);
+		// ADR 0105 (wendelon): a promoted store follows its phase.
+		assert_eq!(
+			report(
+				TOKEN,
+				&ReplacementReportWire {
+					slot: SLOT,
+					r_old: SLOT,
+					phase: ReplacementPhase::Done { r_new: 1 << 31 },
+					promoted: Some(crate::consensus::StoreIncarnation::from_raw(0x0105)),
+					bound_key: None,
+				},
+			),
+			format!("{prefix}done 2147483648; promoted store 00000000000000000000000000000105")
 		);
 	}
 
@@ -731,6 +762,8 @@ mod tests {
 				phase: ReplacementPhase::Done {
 					r_new: crate::consensus::decisions::instances::ALLOCATED_BASE,
 				},
+				promoted: Some(crate::consensus::StoreIncarnation::from_raw(0x0105)),
+				bound_key: None,
 			}),
 		};
 		let mut answer = plain.clone();
