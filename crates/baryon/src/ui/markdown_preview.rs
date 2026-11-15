@@ -12,6 +12,9 @@ use libaryon::svp::markdown_blocks::{
 	parse_markdown_blocks, source_line_count, source_line_for_byte,
 };
 use libaryon::svp::markdown_highlight::{MarkdownConstruct, markdown_construct_color};
+use libaryon::svp::markdown_table_layout::{
+	MarkdownInlineWord, inline_line_count, inline_words, table_column_widths, wrap_inline_words,
+};
 use libaryon::svp::rust_highlight::CATEGORY_COUNT;
 use libaryon::uast::projection::MarkdownPreviewSnapshot;
 use ratatui::{Frame, buffer::Buffer, layout::Rect, style::Style};
@@ -1210,8 +1213,9 @@ fn measure_table(
 		return y;
 	}
 	// Without wrap, cells clip, so table height is independent of column
-	// widths. With wrap, a row is as tall as its tallest wrapped cell, laid out
-	// by the same `wrapped_table_row` that draw_table draws.
+	// widths. With wrap, a row is as tall as its tallest wrapped cell, counted
+	// by `inline_line_count`, which breaks exactly as the `wrapped_table_row`
+	// that draw_table draws.
 	let column_widths = if wrap {
 		table_column_widths(rows, table_available_chars(width, x, metrics)).0
 	} else {
@@ -1219,7 +1223,15 @@ fn measure_table(
 	};
 	for (row_idx, row) in rows.iter().enumerate() {
 		let lines = if wrap {
-			table_row_line_count(&wrapped_table_row(row, &column_widths))
+			column_widths
+				.iter()
+				.enumerate()
+				.filter_map(|(column, &width)| {
+					row.get(column).map(|cell| inline_line_count(cell, width))
+				})
+				.max()
+				.unwrap_or(0)
+				.max(1)
 		} else {
 			1
 		};
@@ -1255,91 +1267,6 @@ fn wrapped_table_row(
 /// A wrapped row is as tall as its tallest cell, and never less than one line.
 fn table_row_line_count(cells: &[Vec<Vec<MarkdownInlineWord>>]) -> usize {
 	cells.iter().map(Vec::len).max().unwrap_or(0).max(1)
-}
-
-fn table_column_widths(
-	rows: &[Vec<MarkdownInlineText>],
-	available_chars: usize,
-) -> (Vec<usize>, usize) {
-	const MIN_CELL_WIDTH: usize = 4;
-
-	let columns = rows.iter().map(|row| row.len()).max().unwrap_or(0);
-	if columns == 0 {
-		return (Vec::new(), 0);
-	}
-	let available_chars = available_chars.max(1);
-	let gutter: usize = if columns == 1 {
-		0
-	} else if available_chars >= columns.saturating_add((columns - 1).saturating_mul(2)) {
-		2
-	} else if available_chars >= columns.saturating_add(columns - 1) {
-		1
-	} else {
-		0
-	};
-	let content_space = available_chars
-		.saturating_sub(gutter.saturating_mul(columns.saturating_sub(1)))
-		.max(columns);
-	let min_width = MIN_CELL_WIDTH.min(content_space / columns).max(1);
-	// A single outlier should influence the table without consuming nearly all
-	// of it. Extra space is distributed separately after measuring demand.
-	let demand_cap = content_space.div_ceil(2).max(min_width);
-	let desired = (0..columns)
-		.map(|column| {
-			rows.iter()
-				.filter_map(|row| row.get(column))
-				.map(MarkdownInlineText::char_count)
-				.max()
-				.unwrap_or(0)
-				.max(min_width)
-				.min(demand_cap)
-		})
-		.collect::<Vec<_>>();
-	let desired_total = desired.iter().copied().sum::<usize>();
-
-	if desired_total <= content_space {
-		let mut widths = desired.clone();
-		let extra = content_space - desired_total;
-		let shared = extra / columns;
-		for width in &mut widths {
-			*width = width.saturating_add(shared);
-		}
-		let mut order = (0..columns).collect::<Vec<_>>();
-		order.sort_unstable_by_key(|&column| std::cmp::Reverse(desired[column]));
-		for &column in order.iter().take(extra % columns) {
-			widths[column] = widths[column].saturating_add(1);
-		}
-		return (widths, gutter);
-	}
-
-	let mut widths = vec![min_width; columns];
-	let remaining = content_space.saturating_sub(min_width.saturating_mul(columns));
-	let weights = desired
-		.iter()
-		.map(|width| width.saturating_sub(min_width))
-		.collect::<Vec<_>>();
-	let weight_total = weights.iter().copied().sum::<usize>();
-	if remaining == 0 || weight_total == 0 {
-		return (widths, gutter);
-	}
-
-	let mut assigned = 0usize;
-	let mut remainders = Vec::with_capacity(columns);
-	for (column, &weight) in weights.iter().enumerate() {
-		let scaled = (remaining as u128) * (weight as u128);
-		let share = (scaled / weight_total as u128) as usize;
-		widths[column] = widths[column].saturating_add(share);
-		assigned = assigned.saturating_add(share);
-		remainders.push((scaled % weight_total as u128, desired[column], column));
-	}
-	remainders.sort_unstable_by_key(|&(remainder, demand, _)| {
-		(std::cmp::Reverse(remainder), std::cmp::Reverse(demand))
-	});
-	for &(_, _, column) in remainders.iter().take(remaining.saturating_sub(assigned)) {
-		widths[column] = widths[column].saturating_add(1);
-	}
-
-	(widths, gutter)
 }
 
 fn measure_wrapped_inline_text(
@@ -1888,93 +1815,6 @@ fn table_row_background(row_idx: usize, palette: &MarkdownPreviewPalette) -> Opt
 		index if index % 2 == 0 => Some(palette.table_row_alt),
 		_ => None,
 	}
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct MarkdownInlineWord {
-	style: MarkdownInlineStyle,
-	text: String,
-	leading_space: bool,
-}
-
-fn inline_words(text: &MarkdownInlineText) -> Vec<MarkdownInlineWord> {
-	let mut words = Vec::new();
-	let mut pending_space = false;
-	for span in text.spans() {
-		let mut word = String::new();
-		for ch in span.text.chars() {
-			if ch.is_whitespace() {
-				if !word.is_empty() {
-					words.push(MarkdownInlineWord {
-						style: span.style,
-						text: std::mem::take(&mut word),
-						leading_space: pending_space && !words.is_empty(),
-					});
-				}
-				pending_space = !words.is_empty();
-				continue;
-			}
-			word.push(ch);
-		}
-		if !word.is_empty() {
-			words.push(MarkdownInlineWord {
-				style: span.style,
-				text: word,
-				leading_space: pending_space && !words.is_empty(),
-			});
-			pending_space = false;
-		}
-	}
-	words
-}
-
-/// Flows inline words into lines of at most `max_chars` characters; a word
-/// longer than a line breaks on character boundaries. This is the line
-/// breaking [`draw_wrapped_inline_text`] applies to prose, returned as data so
-/// a table can measure a wrapped cell with the same lines it draws.
-fn wrap_inline_words(text: &MarkdownInlineText, max_chars: usize) -> Vec<Vec<MarkdownInlineWord>> {
-	let max_chars = max_chars.max(1);
-	let mut lines = Vec::new();
-	let mut line = Vec::new();
-	let mut line_len = 0usize;
-	for word in inline_words(text) {
-		let style = word.style;
-		let mut remaining = word.text;
-		let mut leading_space = word.leading_space;
-		while !remaining.is_empty() {
-			let remaining_len = remaining.chars().count();
-			let space_len = usize::from(leading_space && line_len > 0);
-			if line_len > 0 && line_len + space_len + remaining_len > max_chars {
-				lines.push(std::mem::take(&mut line));
-				line_len = 0;
-				leading_space = false;
-				continue;
-			}
-			// An empty line takes the whole width; a non-empty one reached
-			// here only because the word fits after it.
-			if remaining_len <= max_chars.saturating_sub(line_len + space_len) {
-				line_len += space_len + remaining_len;
-				line.push(MarkdownInlineWord {
-					style,
-					text: remaining,
-					leading_space: space_len > 0,
-				});
-				break;
-			}
-			line.push(MarkdownInlineWord {
-				style,
-				text: take_chars(&remaining, max_chars),
-				leading_space: false,
-			});
-			lines.push(std::mem::take(&mut line));
-			remaining = skip_chars(&remaining, max_chars);
-			leading_space = false;
-		}
-	}
-	if !line.is_empty() {
-		lines.push(line);
-	}
-	lines
 }
 
 fn clipped_inline_chars(text: &MarkdownInlineText, max_chars: usize) -> MarkdownInlineText {
@@ -2575,12 +2415,6 @@ mod tests {
 	use libaryon::core::DocLine;
 	use libaryon::svp::rust_highlight::TokenCategory;
 
-	fn inline_text(text: &str) -> MarkdownInlineText {
-		let mut inline = MarkdownInlineText::new();
-		inline.push(MarkdownInlineStyle::TEXT, text);
-		inline
-	}
-
 	fn row_plain_text(row: &[MarkdownInlineText]) -> Vec<String> {
 		row.iter().map(MarkdownInlineText::plain_text).collect()
 	}
@@ -2629,77 +2463,6 @@ mod tests {
 			blocks
 				.iter()
 				.all(|block| block.source_range().start < block.source_range().end)
-		);
-	}
-
-	#[test]
-	fn table_columns_allocate_width_from_content_demand() {
-		let rows = vec![
-			vec![inline_text("ID"), inline_text("Description")],
-			vec![
-				inline_text("1"),
-				inline_text("This column needs substantially more room than the ID"),
-			],
-		];
-		let (widths, gutter) = table_column_widths(&rows, 60);
-
-		assert_eq!(gutter, 2);
-		assert_eq!(widths.iter().sum::<usize>() + gutter, 60);
-		assert!(widths[1] >= widths[0].saturating_mul(2));
-		assert!(widths[0] >= 4);
-	}
-
-	#[test]
-	fn table_columns_stay_balanced_for_similar_content() {
-		let rows = vec![vec![inline_text("left"), inline_text("rght")]];
-		let (widths, gutter) = table_column_widths(&rows, 60);
-
-		assert_eq!(widths, vec![29, 29]);
-		assert_eq!(gutter, 2);
-	}
-
-	#[test]
-	fn table_columns_bound_outliers_and_compress_to_available_width() {
-		let rows = vec![vec![
-			inline_text("customer key"),
-			inline_text("order status"),
-			inline_text("ship date"),
-			inline_text(&"comment ".repeat(100)),
-		]];
-		let (widths, gutter) = table_column_widths(&rows, 80);
-
-		assert_eq!(widths.iter().sum::<usize>() + gutter * 3, 80);
-		assert!(widths.iter().all(|width| *width >= 4));
-		assert!(widths[3] > widths[0]);
-		assert!(widths[0] > 4, "the outlier must not starve other columns");
-	}
-
-	#[test]
-	fn inline_words_preserve_adjacent_span_boundaries_without_extra_spaces() {
-		let mut text = MarkdownInlineText::new();
-		text.push(MarkdownInlineStyle::TEXT, "a");
-		text.push(MarkdownInlineStyle::CODE, "b");
-		text.push(MarkdownInlineStyle::TEXT, " c");
-
-		assert_eq!(
-			inline_words(&text),
-			vec![
-				MarkdownInlineWord {
-					style: MarkdownInlineStyle::TEXT,
-					text: "a".to_string(),
-					leading_space: false,
-				},
-				MarkdownInlineWord {
-					style: MarkdownInlineStyle::CODE,
-					text: "b".to_string(),
-					leading_space: false,
-				},
-				MarkdownInlineWord {
-					style: MarkdownInlineStyle::TEXT,
-					text: "c".to_string(),
-					leading_space: true,
-				}
-			]
 		);
 	}
 
@@ -3565,24 +3328,6 @@ mod tests {
 		rows.into_iter().map(Cow::into_owned).collect()
 	}
 
-	fn line_texts(lines: &[Vec<MarkdownInlineWord>]) -> Vec<String> {
-		lines
-			.iter()
-			.map(|line| {
-				line.iter()
-					.enumerate()
-					.map(|(idx, word)| {
-						if idx > 0 && word.leading_space {
-							format!(" {}", word.text)
-						} else {
-							word.text.clone()
-						}
-					})
-					.collect::<String>()
-			})
-			.collect()
-	}
-
 	#[test]
 	fn code_line_without_wrap_is_one_verbatim_row() {
 		let line = "\tlet total = alpha + beta + gamma + delta; // long";
@@ -3633,22 +3378,6 @@ mod tests {
 			row_texts(code_line_rows("  ab", 1, true)),
 			vec![" ", " ", "a", "b"]
 		);
-	}
-
-	#[test]
-	fn wrapped_inline_words_flow_and_break_unbreakable_words() {
-		let mut text = MarkdownInlineText::new();
-		text.push(MarkdownInlineStyle::TEXT, "alpha beta ");
-		text.push(MarkdownInlineStyle::CODE, "gammadeltaepsilon");
-		let lines = wrap_inline_words(&text, 10);
-		assert_eq!(
-			line_texts(&lines),
-			vec!["alpha beta", "gammadelta", "epsilon"]
-		);
-		assert_eq!(lines[1][0].style, MarkdownInlineStyle::CODE);
-		assert!(wrap_inline_words(&MarkdownInlineText::new(), 10).is_empty());
-		// A one-character column still progresses one character per line.
-		assert_eq!(line_texts(&wrap_inline_words(&text, 0)).len(), 26);
 	}
 
 	#[test]
