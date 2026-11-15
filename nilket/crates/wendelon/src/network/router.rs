@@ -297,6 +297,8 @@ fn is_control_extension_request(msg_type: u8) -> bool {
 		MsgType::DECISION_CUT_REQ,
 		// ADR 0701. Node-required, like the single lease request.
 		MsgType::LEASES_REQ,
+		// ADR 0104 (wendelon). Node-required: a fresh store's first identity.
+		MsgType::INSTANCE_GRANT_REQ,
 	]
 	.iter()
 	.any(|candidate| candidate.0 == msg_type)
@@ -320,6 +322,7 @@ fn is_extension_response(msg_type: u8) -> bool {
 		MsgType::DECISION_LOOKUP_RESP,
 		MsgType::DECISION_CUT_RESP,
 		MsgType::LEASES_RESP,
+		MsgType::INSTANCE_GRANT_RESP,
 	]
 	.iter()
 	.any(|candidate| candidate.0 == msg_type)

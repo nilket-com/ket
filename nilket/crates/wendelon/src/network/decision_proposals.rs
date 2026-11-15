@@ -148,6 +148,9 @@ pub enum ProposalRefusal {
 	/// configured to trust for it. Nothing is bound, so correcting a
 	/// configuration can still bind the right key.
 	SignerKeyDisagrees,
+	/// ADR 0104 (wendelon): the slot to replace is the leader's own; a lost
+	/// voter is replaced from another member.
+	ReplacesLeader,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -354,7 +357,12 @@ pub(crate) fn current_voters(state: &SmState) -> Option<std::collections::BTreeS
 	if membership.get_joint_config().len() != 1 {
 		return None;
 	}
-	Some(membership.voter_ids().collect())
+	// ADR 0104 (wendelon): clock samples are keyed by the sender's slot, so the
+	// gate counts voters by slot; an unmapped instance makes no answer.
+	membership
+		.voter_ids()
+		.map(|voter| crate::consensus::decisions::instances::slot_of(state, voter).ok())
+		.collect()
 }
 
 /// ADR 0700: the leader's decision clock gate. With `n` current voters (the
@@ -653,6 +661,17 @@ impl DecisionProposals {
 		}
 	}
 
+	/// ADR 0104 (wendelon): the current leader as a dialable slot; this node's
+	/// own slot only when the leader is this very Raft instance.
+	pub(crate) async fn leader_slot(&self) -> Option<u32> {
+		crate::consensus::decisions::instances::leader_slot(
+			&self.raft,
+			&self.state_machine,
+			self.local.id,
+		)
+		.await
+	}
+
 	/// Test-only (ADR 0707): queues a hold of the leader's handling of a
 	/// forwarded proposal (see [`ForwardedHold`]).
 	#[cfg(test)]
@@ -702,7 +721,7 @@ impl DecisionProposals {
 		if self.mode != DecisionMode::ParentDecisions {
 			return;
 		}
-		let Some(leader) = self.raft.current_leader().await else {
+		let Some(leader) = self.leader_slot().await else {
 			return;
 		};
 		if leader == self.local.id {
@@ -729,7 +748,7 @@ impl DecisionProposals {
 		if let ForwardedDecision::OwnerOp(_) = &request {
 			return self.propose_owner_op_as(sender, request).await;
 		}
-		let leader = self.raft.current_leader().await;
+		let leader = self.leader_slot().await;
 		if leader != Some(self.local.id) {
 			return ProposalResponse::NotLeader {
 				leader_hint: leader,
@@ -747,7 +766,7 @@ impl DecisionProposals {
 					&self.clock_samples.arrived,
 					deadline,
 					|| self.decision_clock_now(),
-					|| async { self.raft.current_leader().await == Some(self.local.id) },
+					|| async { self.leader_slot().await == Some(self.local.id) },
 				)
 				.await
 				{
@@ -755,7 +774,7 @@ impl DecisionProposals {
 					ClockWait::Refused(refusal) => return ProposalResponse::Refused(refusal),
 					ClockWait::NotLeader => {
 						return ProposalResponse::NotLeader {
-							leader_hint: self.raft.current_leader().await,
+							leader_hint: self.leader_slot().await,
 						};
 					}
 				}
@@ -774,7 +793,7 @@ impl DecisionProposals {
 				},
 				Err(message) => ProposalResponse::Indeterminate(message),
 			},
-			Err(error) => match self.raft.current_leader().await {
+			Err(error) => match self.leader_slot().await {
 				leader if leader != Some(self.local.id) => ProposalResponse::NotLeader {
 					leader_hint: leader,
 				},
@@ -790,7 +809,7 @@ impl DecisionProposals {
 		sender: u32,
 		request: ForwardedDecision,
 	) -> ProposalResponse {
-		let leader = self.raft.current_leader().await;
+		let leader = self.leader_slot().await;
 		if leader != Some(self.local.id) {
 			return ProposalResponse::OwnerNotSubmitted {
 				leader_hint: leader,
@@ -837,7 +856,7 @@ impl DecisionProposals {
 		op: crate::consensus::owner_ops::SignedOwnerOp,
 	) -> OwnerOpOutcome {
 		let request = ForwardedDecision::OwnerOp(op);
-		let response = match self.raft.current_leader().await {
+		let response = match self.leader_slot().await {
 			Some(leader) if leader == self.local.id => {
 				self.propose_as(self.local.id, request).await
 			}
@@ -867,7 +886,7 @@ impl DecisionProposals {
 
 	/// Sender side: propose locally when leader, otherwise forward.
 	pub(crate) async fn propose(&self, request: ForwardedDecision) -> ProposalResponse {
-		match self.raft.current_leader().await {
+		match self.leader_slot().await {
 			Some(leader) if leader == self.local.id => {
 				self.propose_as(self.local.id, request).await
 			}
@@ -919,7 +938,7 @@ impl DecisionProposals {
 		if self.mode != DecisionMode::ParentDecisions {
 			return LookupResponse::Refused(ProposalRefusal::ModeToday);
 		}
-		let leader = self.raft.current_leader().await;
+		let leader = self.leader_slot().await;
 		if leader != Some(self.local.id) {
 			return LookupResponse::NotLeader {
 				leader_hint: leader,
@@ -948,7 +967,7 @@ impl DecisionProposals {
 
 	/// Sender side: look up locally when leader, otherwise ask the leader.
 	pub(crate) async fn lookup(&self, request: LookupRequest) -> LookupResponse {
-		match self.raft.current_leader().await {
+		match self.leader_slot().await {
 			Some(leader) if leader == self.local.id => self.lookup_as_leader(request).await,
 			Some(leader) => self
 				.round_trip(
@@ -985,7 +1004,7 @@ impl DecisionProposals {
 		if self.mode != DecisionMode::ParentDecisions {
 			return CutResponse::Refused(ProposalRefusal::ModeToday);
 		}
-		let leader = self.raft.current_leader().await;
+		let leader = self.leader_slot().await;
 		if leader != Some(self.local.id) {
 			return CutResponse::NotLeader {
 				leader_hint: leader,
@@ -999,7 +1018,7 @@ impl DecisionProposals {
 
 	/// Reader side: the cut from the leader, locally when leader.
 	pub(crate) async fn cut(&self) -> CutResponse {
-		match self.raft.current_leader().await {
+		match self.leader_slot().await {
 			Some(leader) if leader == self.local.id => self.cut_as_leader().await,
 			Some(leader) => self
 				.round_trip(
@@ -1175,7 +1194,7 @@ impl<'a> MaintenanceProposals<'a> {
 	pub(crate) async fn generation_step(&self) -> Option<MaintenanceProposalResult> {
 		let proposals = self.proposals;
 		if proposals.mode != DecisionMode::ParentDecisions
-			|| proposals.raft.current_leader().await != Some(proposals.local.id)
+			|| proposals.leader_slot().await != Some(proposals.local.id)
 		{
 			return None;
 		}
@@ -1205,7 +1224,7 @@ impl<'a> MaintenanceProposals<'a> {
 	pub(crate) async fn advance_floor_once(&self) -> Option<MaintenanceProposalResult> {
 		let proposals = self.proposals;
 		if proposals.mode != DecisionMode::ParentDecisions
-			|| proposals.raft.current_leader().await != Some(proposals.local.id)
+			|| proposals.leader_slot().await != Some(proposals.local.id)
 		{
 			return None;
 		}
@@ -1455,5 +1474,273 @@ impl OwnerOpChannel for DecisionProposals {
 
 	fn leader_known(&self) -> bool {
 		self.raft.metrics().borrow().current_leader.is_some()
+	}
+}
+
+// ============================================================
+//  ADR 0104 (wendelon): A FRESH STORE'S FIRST IDENTITY
+// ============================================================
+
+/// A fresh Raft store, born `birth`, asks for its first identity for `slot`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstanceGrantRequest {
+	pub birth: crate::consensus::decisions::instances::Birth,
+	pub slot: u32,
+	pub kind: crate::consensus::decisions::instances::GrantKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InstanceGrantResponse {
+	/// The identity granted to this birth, now or earlier.
+	Granted {
+		instance: u32,
+	},
+	/// Ask the leader: its slot and address, when known.
+	NotLeader {
+		leader: Option<(u32, String)>,
+	},
+	/// The reducer refused; nothing was granted.
+	Refused(crate::consensus::decisions::DecisionRefusal),
+	/// The request names another slot than its connection authenticates.
+	Unauthorized,
+	ModeToday,
+	/// The proposal may or may not have committed; ask again with the same birth.
+	Indeterminate(String),
+}
+
+impl DecisionProposals {
+	/// Leader side of a grant. The slot must be the one the connection
+	/// authenticates; the reducer decides everything else.
+	pub(crate) async fn grant_instance(
+		&self,
+		authenticated_slot: u32,
+		request: InstanceGrantRequest,
+	) -> InstanceGrantResponse {
+		if self.mode != DecisionMode::ParentDecisions {
+			return InstanceGrantResponse::ModeToday;
+		}
+		if request.slot != authenticated_slot {
+			return InstanceGrantResponse::Unauthorized;
+		}
+		if self.leader_slot().await != Some(self.local.id) {
+			return InstanceGrantResponse::NotLeader {
+				leader: self.leader_address().await,
+			};
+		}
+		let command = WendelonRequest::Decision(DecisionCommand::GrantInstance {
+			birth: request.birth,
+			slot: request.slot,
+			kind: request.kind,
+		});
+		match self.commit(command).await {
+			ProposalResponse::Applied {
+				outcome: ProposalOutcome::Decision(DecisionResult::InstanceGranted { instance }),
+				..
+			} => InstanceGrantResponse::Granted { instance },
+			ProposalResponse::Applied {
+				outcome: ProposalOutcome::Decision(DecisionResult::Refused(refusal)),
+				..
+			} => InstanceGrantResponse::Refused(refusal),
+			ProposalResponse::NotLeader { .. } => InstanceGrantResponse::NotLeader {
+				leader: self.leader_address().await,
+			},
+			ProposalResponse::Indeterminate(message) => {
+				InstanceGrantResponse::Indeterminate(message)
+			}
+			other => InstanceGrantResponse::Indeterminate(format!(
+				"unexpected answer to a grant: {other:?}"
+			)),
+		}
+	}
+
+	/// ADR 0104 (wendelon): the leader opens a replacement. The slot to
+	/// replace is never its own.
+	pub(crate) async fn propose_begin_replacement(
+		&self,
+		token: u128,
+		slot: u32,
+	) -> ProposalResponse {
+		if self.mode != DecisionMode::ParentDecisions {
+			return ProposalResponse::Refused(ProposalRefusal::ModeToday);
+		}
+		if slot == self.local.id {
+			return ProposalResponse::Refused(ProposalRefusal::ReplacesLeader);
+		}
+		self.commit(WendelonRequest::Decision(
+			DecisionCommand::BeginReplacement { token, slot },
+		))
+		.await
+	}
+
+	/// The current leader's slot and its address in the applied membership.
+	async fn leader_address(&self) -> Option<(u32, String)> {
+		let leader = self.raft.current_leader().await?;
+		self.state_machine
+			.read_state(|state| {
+				let slot = crate::consensus::decisions::instances::slot_of(state, leader).ok()?;
+				let node = state.last_membership.membership().get_node(&leader)?;
+				Some((slot, node.addr.clone()))
+			})
+			.await
+	}
+}
+
+/// ADR 0104 (wendelon): what one step of the replacement controller did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ReplacementStep {
+	/// Not the leader, no open replacement, or it waits for its grant.
+	Idle,
+	AddedLearner {
+		r_new: u32,
+	},
+	Waiting(&'static str),
+	Swapped {
+		r_new: u32,
+	},
+	Completed {
+		r_new: u32,
+	},
+	/// The membership is not one this replacement's states allow; nothing is
+	/// proposed over it.
+	Foreign(String),
+	Failed(String),
+}
+
+/// One membership call's bound: the controller retries on its next step.
+const MEMBERSHIP_CALL_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+
+impl MaintenanceProposals<'_> {
+	/// ADR 0104 (wendelon), leader only: reconciles the open replacement from
+	/// the applied state and does at most one thing: add the reserved instance
+	/// as a learner, promote it by one swap once it has caught up to the entry
+	/// that added it, resume a joint configuration to the recorded target, or
+	/// record Done. A membership change appended and not yet applied settles
+	/// nothing, so the controller waits for it.
+	pub(crate) async fn replacement_step(&self) -> ReplacementStep {
+		use crate::consensus::decisions::instances::ReplacementPhase;
+		let proposals = self.proposals;
+		if proposals.mode != DecisionMode::ParentDecisions
+			|| proposals.leader_slot().await != Some(proposals.local.id)
+		{
+			return ReplacementStep::Idle;
+		}
+		let view = proposals
+			.state_machine
+			.read_state(|state| {
+				let decisions = state.decisions.as_ref()?;
+				let (token, replacement) = decisions.instances().open_replacement()?;
+				let ReplacementPhase::Reserved { r_new } = replacement.phase else {
+					return None;
+				};
+				let membership = state.last_membership.membership();
+				let configs: Vec<std::collections::BTreeSet<u32>> =
+					membership.get_joint_config().clone();
+				let nodes: std::collections::BTreeSet<u32> =
+					membership.nodes().map(|(id, _)| *id).collect();
+				let address = membership
+					.get_node(&replacement.r_old)
+					.map(|node| node.addr.clone());
+				Some((
+					token,
+					replacement.clone(),
+					r_new,
+					configs,
+					nodes,
+					address,
+					state.last_membership.log_id().map(|id| id.index),
+				))
+			})
+			.await;
+		let Some((token, replacement, r_new, configs, nodes, address, applied)) = view else {
+			return ReplacementStep::Idle;
+		};
+		let effective = proposals
+			.raft
+			.metrics()
+			.borrow()
+			.membership_config
+			.log_id()
+			.map(|id| id.index);
+		if effective != applied {
+			return ReplacementStep::Waiting("a membership change is not applied yet");
+		}
+		let target = replacement.target(r_new);
+		match configs.as_slice() {
+			[uniform] if *uniform == target && !nodes.contains(&replacement.r_old) => {
+				match self
+					.commit(WendelonRequest::Decision(
+						DecisionCommand::CompleteReplacement { token },
+					))
+					.await
+				{
+					MaintenanceProposalResult::Response(ProposalResponse::Applied {
+						outcome:
+							ProposalOutcome::Decision(DecisionResult::ReplacementCompleted { r_new }),
+						..
+					}) => ReplacementStep::Completed { r_new },
+					other => ReplacementStep::Failed(format!("recording Done: {other:?}")),
+				}
+			}
+			[uniform] if *uniform == replacement.pre_voters => {
+				if !nodes.contains(&r_new) {
+					let Some(addr) = address else {
+						return ReplacementStep::Failed(
+							"the replaced instance has no address in the membership".into(),
+						);
+					};
+					return match tokio::time::timeout(
+						MEMBERSHIP_CALL_BOUND,
+						proposals
+							.raft
+							.add_learner(r_new, openraft::BasicNode { addr }, false),
+					)
+					.await
+					{
+						Ok(Ok(_)) => ReplacementStep::AddedLearner { r_new },
+						Ok(Err(error)) => ReplacementStep::Failed(error.to_string()),
+						Err(_) => ReplacementStep::Waiting("adding the learner"),
+					};
+				}
+				// The learner's entry is the applied membership: it must hold
+				// that entry before it is promoted.
+				let added = applied.unwrap_or(0);
+				let matched = proposals
+					.raft
+					.metrics()
+					.borrow()
+					.replication
+					.as_ref()
+					.and_then(|replication| replication.get(&r_new).cloned().flatten())
+					.map(|id| id.index);
+				if matched.is_none_or(|index| index < added) {
+					return ReplacementStep::Waiting("the reserved instance is catching up");
+				}
+				self.swap(target, r_new).await
+			}
+			[old, new] if *old == replacement.pre_voters && *new == target => {
+				self.swap(target, r_new).await
+			}
+			_ => ReplacementStep::Foreign(format!(
+				"applied membership {configs:?} (nodes {nodes:?}) is not a state of replacement {token:#x}"
+			)),
+		}
+	}
+
+	/// The one swap, from the recorded pre-change voters or from their joint
+	/// configuration, to the recorded target; the old instance is removed,
+	/// never kept as a learner.
+	async fn swap(&self, target: std::collections::BTreeSet<u32>, r_new: u32) -> ReplacementStep {
+		match tokio::time::timeout(
+			MEMBERSHIP_CALL_BOUND,
+			self.proposals
+				.raft
+				.change_membership(openraft::ChangeMembers::ReplaceAllVoters(target), false),
+		)
+		.await
+		{
+			Ok(Ok(_)) => ReplacementStep::Swapped { r_new },
+			Ok(Err(error)) => ReplacementStep::Failed(error.to_string()),
+			Err(_) => ReplacementStep::Waiting("the swap"),
+		}
 	}
 }

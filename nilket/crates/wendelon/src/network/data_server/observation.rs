@@ -152,7 +152,7 @@ impl WendelonDataServer {
 			.collect();
 		self.slab.retain_table_drop_scan_operations(&active);
 
-		let nonleader = self.raft.current_leader().await != Some(self.local_node.id);
+		let nonleader = self.leader_slot().await != Some(self.local_node.id);
 		let identities = debts
 			.iter()
 			.filter(|debt| debt.participants.contains(self.local_node))

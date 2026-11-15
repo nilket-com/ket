@@ -94,6 +94,29 @@ pub struct WendelonRaftNetworkFactory {
 	pool: Arc<BufPool>,
 	/// Raft frames carry this authority's envelope version.
 	decision_mode: DecisionMode,
+	/// ADR 0104 (wendelon): this process's instance and slot, and the applied
+	/// state that maps a target instance to its slot. Required by a
+	/// `ParentDecisions` call; without it the call fails closed.
+	routing: Option<InstanceRouting>,
+}
+
+/// ADR 0104 (wendelon): the routing of a `ParentDecisions` Raft request. The
+/// receiver admits it only from the authenticated slot naming itself, and
+/// applies it only when it is the target instance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub(crate) struct RaftRoute {
+	pub sender_instance: u32,
+	pub sender_slot: u32,
+	pub target_instance: u32,
+}
+
+/// ADR 0104 (wendelon): what a `ParentDecisions` client needs to address an
+/// instance.
+#[derive(Clone)]
+pub(crate) struct InstanceRouting {
+	pub local_instance: u32,
+	pub local_slot: u32,
+	pub state: crate::consensus::raft_storage::WendelonStateMachine,
 }
 
 impl WendelonRaftNetworkFactory {
@@ -102,11 +125,17 @@ impl WendelonRaftNetworkFactory {
 			provider,
 			pool,
 			decision_mode: DecisionMode::Today,
+			routing: None,
 		}
 	}
 
 	pub(crate) fn with_decision_mode(mut self, decision_mode: DecisionMode) -> Self {
 		self.decision_mode = decision_mode;
+		self
+	}
+
+	pub(crate) fn with_instance_routing(mut self, routing: InstanceRouting) -> Self {
+		self.routing = Some(routing);
 		self
 	}
 }
@@ -123,6 +152,7 @@ impl RaftNetworkFactory<WendelonTypeConfig> for WendelonRaftNetworkFactory {
 			connection: None,
 			suspect: false,
 			decision_mode: self.decision_mode,
+			routing: self.routing.clone(),
 		}
 	}
 }
@@ -157,16 +187,46 @@ pub struct WendelonRaftNetwork {
 	/// can first wait and cleared only by a decoded response, so a dropped call leaves it set.
 	suspect: bool,
 	decision_mode: DecisionMode,
+	routing: Option<InstanceRouting>,
 }
 
 impl WendelonRaftNetwork {
+	/// The slot this client dials: Today's target is its own slot; a
+	/// `ParentDecisions` target is mapped through the applied state, and an
+	/// allocated instance with no record yet is unreachable, never guessed.
+	async fn target_slot(&self) -> std::io::Result<u32> {
+		match (self.decision_mode, &self.routing) {
+			(DecisionMode::Today, _) => Ok(self.target),
+			(_, None) => Err(Error::new(
+				ErrorKind::InvalidInput,
+				"a ParentDecisions Raft client has no instance routing",
+			)),
+			// Below the allocated range an instance is its own slot.
+			(_, Some(_))
+				if self.target < crate::consensus::decisions::instances::ALLOCATED_BASE =>
+			{
+				Ok(self.target)
+			}
+			(_, Some(routing)) => {
+				let target = self.target;
+				routing
+					.state
+					.read_state(|state| {
+						crate::consensus::decisions::instances::slot_of(state, target)
+					})
+					.await
+					.map_err(|unknown| Error::new(ErrorKind::NotFound, unknown.to_string()))
+			}
+		}
+	}
+
 	/// Return a usable connection, dialing if the cache is empty or
 	/// the previous session has closed. `Arc<dyn TransportConnection>`
 	/// clones are cheap — returning one by value avoids tangling
 	/// the caller in the borrow of `self.connection`.
 	async fn ensure_connection(&mut self) -> std::io::Result<Arc<dyn TransportConnection>> {
 		let target_id = NodeId {
-			id: self.target,
+			id: self.target_slot().await?,
 			_reserved: 0,
 		};
 		// ADR 0735: a session the last call got no answer on is selected by neither layer.
@@ -206,7 +266,25 @@ impl WendelonRaftNetwork {
 		let conn = self.ensure_connection().await?;
 		let mut stream = conn.open_bi().await?;
 
-		let body = wire::encode_into(&self.pool, req)?;
+		// ADR 0104 (wendelon): a ParentDecisions request carries its route ahead
+		// of its body.
+		let body = match (self.decision_mode, &self.routing) {
+			(DecisionMode::Today, _) => wire::encode_into(&self.pool, req)?,
+			(_, Some(routing)) => {
+				let route = RaftRoute {
+					sender_instance: routing.local_instance,
+					sender_slot: routing.local_slot,
+					target_instance: self.target,
+				};
+				wire::encode_into(&self.pool, &(route, req))?
+			}
+			(_, None) => {
+				return Err(Error::new(
+					ErrorKind::InvalidInput,
+					"a ParentDecisions Raft client has no instance routing",
+				));
+			}
+		};
 		let header = FrameHeader {
 			magic: HRFT_MAGIC,
 			version: self.decision_mode.raft_frame_version(),
@@ -291,6 +369,91 @@ impl RaftNetwork<WendelonTypeConfig> for WendelonRaftNetwork {
 			.map_err(unreachable)?;
 		envelope.map_err(|e| RPCError::RemoteError(RemoteError::new(target, e)))
 	}
+}
+
+// ============================================================
+//  ADR 0104 (wendelon), TEST SUPPORT: ONE ROUTED VOTE
+// ============================================================
+
+/// Test support for the real-process workflow, compiled only with the
+/// `test-support` feature: ONE ParentDecisions Vote request, on a fresh mutual-TLS
+/// connection, from `sender_slot` (as itself: instance `sender_slot`, presenting
+/// its node certificate) to the node at `address` dialled as slot `target_slot`,
+/// addressed to Raft instance `target_instance`.
+///
+/// The vote is term 0 with no log, below any vote a member holds, so a node
+/// that admits it answers with its own vote and grants nothing. Its answer is
+/// the node's decoded `Vote` response. A node whose instance is not
+/// `target_instance` drops the stream unanswered, which is an error here. Not a
+/// diagnostics API: nothing in the product calls it.
+#[cfg(feature = "test-support")]
+pub async fn routed_vote_for_test(
+	cert_path: &std::path::Path,
+	key_path: &std::path::Path,
+	ca_path: &std::path::Path,
+	cluster_domain: &str,
+	target_slot: u32,
+	address: &str,
+	sender_slot: u32,
+	target_instance: u32,
+) -> std::io::Result<Result<VoteResponse<u32>, RaftError<u32>>> {
+	use crate::network::quic_transport::{
+		QuicTransportProvider, canonical_server_name_resolver, client_endpoint_from_tls,
+	};
+	let material = crate::network::tls::TlsMaterial::load(cert_path, key_path, ca_path)?;
+	let endpoint = Arc::new(client_endpoint_from_tls(
+		&material,
+		"0.0.0.0:0".parse().unwrap(),
+	)?);
+	let provider = QuicTransportProvider::with_cluster_domain(
+		endpoint,
+		canonical_server_name_resolver(cluster_domain.to_owned()),
+		cluster_domain.to_owned(),
+	);
+	let conn = provider
+		.connect(
+			NodeId {
+				id: target_slot,
+				_reserved: 0,
+			},
+			address,
+		)
+		.await?;
+	let mut stream = conn.open_bi().await?;
+	let route = RaftRoute {
+		sender_instance: sender_slot,
+		sender_slot,
+		target_instance,
+	};
+	let request = VoteRequest::<u32> {
+		vote: openraft::Vote::new(0, sender_slot),
+		last_log_id: None,
+	};
+	let body = wire::encode(&(route, request))?;
+	let mode = DecisionMode::ParentDecisions;
+	let header = FrameHeader {
+		magic: HRFT_MAGIC,
+		version: mode.raft_frame_version(),
+		msg_type: MsgType::VOTE_REQ.0,
+		flags: 0,
+		stream_id: 0,
+		meta_len: body.len() as u32,
+		arrow_len: 0,
+		trailing_len: 0,
+	};
+	write_frame(&mut *stream, &header, &body, None, None).await?;
+	stream
+		.finish()
+		.await
+		.map_err(|error| Error::new(ErrorKind::BrokenPipe, error))?;
+	let pool = BufPool::new(4, 1024 * 1024);
+	let answer = read_frame(&mut *stream, &pool).await?;
+	mode.check_raft_response(
+		answer.header.version,
+		answer.header.msg_type,
+		MsgType::VOTE_RESP.0,
+	)?;
+	wire::decode(&answer.meta)
 }
 
 // ============================================================

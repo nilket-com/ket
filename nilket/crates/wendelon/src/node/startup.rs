@@ -314,6 +314,8 @@ fn interrupted_bootstrap_artifact(name: &str) -> bool {
 			"LOCK"
 				| "CLEAN_SHUTDOWN"
 				| ".CLEAN_SHUTDOWN.tmp"
+				| "FORMATION_INTENT"
+				| "REPLACEMENT_TOKEN"
 				| "control.wal"
 				| "vote.wnd" | "snapshot.wnd"
 				| ".snapshot.wnd.build.tmp"
@@ -1806,6 +1808,9 @@ pub(super) fn fresh_storage_initialization_allowed(dir: &std::path::Path) -> std
 		if name != "LOCK"
 			&& name != "CLEAN_SHUTDOWN"
 			&& name != ".CLEAN_SHUTDOWN.tmp"
+			// ADR 0104 (wendelon): provisioning, not a store.
+			&& name != super::instance_startup::FORMATION_INTENT
+			&& name != super::instance_startup::REPLACEMENT_TOKEN
 			// ADR 0726: an enrolled root KEK directory is setup, not a store.
 			&& !crate::crypto::is_root_kek_artifact_dir(&entry.path())?
 		{

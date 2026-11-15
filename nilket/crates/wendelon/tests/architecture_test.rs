@@ -12444,7 +12444,9 @@ fn parent_decisions_have_no_producer_and_one_codec() {
 			// ADR 0700: a time-bearing command is built only by `Unstamped::stamp`.
 			// ADR 0736: the backup hold's begin and release, from a typed
 			// proposal the administrative route hands the leader.
-			("decision_proposals.rs", 5),
+			// Wendelon ADR 0104: the leader's instance grant, the replacement
+			// it opens for the administrative route, and its controller's Done.
+			("decision_proposals.rs", 8),
 			("raft_storage.rs", 2),
 		]),
 		"decisions are matched in apply and built only by the leader's proposal path"

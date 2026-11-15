@@ -183,6 +183,10 @@ fn member_config(
 	let dir = support::tempdir(&format!("three-node-{node_id}"));
 	let mut cfg = NodeBootstrapConfig::dev(node_id, dir.to_path_buf(), address(node_id))
 		.with_parent_decisions_for_disposable_store();
+	// ADR 0104 (wendelon): the forming member's one permission to form.
+	if node_id == NODES[0] {
+		wendelon::node::provision_formation_intent(&cfg.data_dir).unwrap();
+	}
 	if let DecisionKeys::OfTheirOwn = keys {
 		cfg = cfg.with_decision_keys(
 			own_decision_secret(node_id),

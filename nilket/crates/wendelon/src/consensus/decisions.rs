@@ -427,6 +427,24 @@ pub enum DecisionCommand {
 		id: u128,
 		entered_at: u64,
 	},
+	/// ADR 0104 (wendelon): the first identity of the Raft store born `birth`,
+	/// for `slot`. The leader proposes it only for the slot authenticated on
+	/// the connection.
+	GrantInstance {
+		birth: instances::Birth,
+		slot: u32,
+		kind: instances::GrantKind,
+	},
+	/// ADR 0104 (wendelon): opens the replacement `token` of `slot`'s voter.
+	BeginReplacement {
+		token: u128,
+		slot: u32,
+	},
+	/// ADR 0104 (wendelon): records Done once the applied membership is the
+	/// replacement's target; retires the old instance.
+	CompleteReplacement {
+		token: u128,
+	},
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -548,6 +566,19 @@ pub enum DecisionRefusal {
 	/// ADR 0736: a new reservation while a backup hold is held; nothing was
 	/// reserved.
 	BackupHold,
+	/// ADR 0104 (wendelon): grants and replacements.
+	SlotOutOfRange,
+	SlotServed,
+	SlotGranted,
+	SlotNotVoter,
+	InstanceRetired,
+	ReplacementOpen,
+	UnknownReplacement,
+	GrantIntentMismatch,
+	GrantedToAnotherBirth,
+	InstanceSpaceExhausted,
+	MembershipNotUniform,
+	ReplacementIncomplete,
 }
 
 /// ADR 0721: how the key a store signs with stands against the replicated
@@ -618,18 +649,49 @@ pub(crate) fn placement_of(config: &EpochConfig) -> BTreeSet<(u32, bool)> {
 }
 
 /// The placement of a formed cluster, or `None` while it is forming: the applied
-/// Raft membership must be uniform, hold no learner, and have exactly the latest
-/// epoch's peers as its voters.
+/// Raft membership must be uniform, hold no learner but a replacement's reserved
+/// instance, and have exactly the latest epoch's peers as its voters' slots.
+#[cfg(test)]
 pub(crate) fn formed_placement(state: &SmState) -> Option<BTreeSet<(u32, bool)>> {
+	placement_under(state, state.decisions.as_ref())
+}
+
+/// `formed_placement`, with the decision state given: the reducer holds it
+/// apart from `state` while it applies a command.
+fn placement_under(
+	state: &SmState,
+	decisions: Option<&DecisionState>,
+) -> Option<BTreeSet<(u32, bool)>> {
 	let membership = state.last_membership.membership();
 	if membership.get_joint_config().len() != 1 {
 		return None;
 	}
+	// ADR 0104 (wendelon): voters are Raft instances; placement compares slots.
+	let slot = |instance: u32| match decisions {
+		None => Some(instance),
+		Some(decisions) => instances::slot_in(decisions, instance).ok(),
+	};
 	let voters: BTreeSet<u32> = membership.voter_ids().collect();
-	let nodes: BTreeSet<u32> = membership.nodes().map(|(id, _)| *id).collect();
+	let voter_slots: BTreeSet<u32> = voters
+		.iter()
+		.map(|voter| slot(*voter))
+		.collect::<Option<_>>()?;
+	if voter_slots.len() != voters.len() {
+		return None;
+	}
+	// The only tolerated learner is the instance an open replacement reserved,
+	// on a slot that already votes.
+	let reserved = decisions.and_then(|decisions| decisions.instances().reserved_instance());
+	for (node, _) in membership.nodes() {
+		if !voters.contains(node)
+			&& (Some(*node) != reserved || !voter_slots.contains(&slot(*node)?))
+		{
+			return None;
+		}
+	}
 	let (_, config) = state.epoch_history.last_key_value()?;
 	let peers: BTreeSet<u32> = config.peers.values().map(|peer| peer.node_id.id).collect();
-	if voters.is_empty() || nodes != voters || peers != voters {
+	if voters.is_empty() || peers != voter_slots {
 		return None;
 	}
 	Some(placement_of(config))
@@ -707,6 +769,20 @@ pub enum DecisionResult {
 	},
 	/// ADR 0736: the hold named by its exact token has ended.
 	HoldReleased,
+	/// ADR 0104 (wendelon): the instance granted to the asking birth.
+	InstanceGranted {
+		instance: u32,
+	},
+	/// ADR 0104 (wendelon): the replacement's record (now or earlier).
+	ReplacementRecorded {
+		slot: u32,
+		r_old: u32,
+		phase: instances::ReplacementPhase,
+	},
+	/// ADR 0104 (wendelon): the replacement is Done (now or earlier).
+	ReplacementCompleted {
+		r_new: u32,
+	},
 }
 
 /// What a retry of `key` with `request_digest` learns. Pure over state.
@@ -789,6 +865,8 @@ pub struct DecisionState {
 	sealed: Option<SealedMembership>,
 	/// ADR 0736: the backup hold, by its token (`id`, `entered_at`).
 	hold: Option<(u128, u64)>,
+	/// ADR 0104 (wendelon): granted Raft instances and replacements.
+	instances: instances::InstanceState,
 }
 
 impl Default for DecisionState {
@@ -807,6 +885,7 @@ impl Default for DecisionState {
 			generations: Generations::default(),
 			sealed: None,
 			hold: None,
+			instances: instances::InstanceState::default(),
 		}
 	}
 }
@@ -815,6 +894,11 @@ impl DecisionState {
 	/// ADR 0736: the backup hold's token, if one is held.
 	pub fn backup_hold(&self) -> Option<(u128, u64)> {
 		self.hold
+	}
+
+	/// ADR 0104 (wendelon): granted Raft instances and replacements.
+	pub fn instances(&self) -> &instances::InstanceState {
+		&self.instances
 	}
 
 	pub fn lineages(&self) -> &BTreeMap<u64, Lineage> {
@@ -871,6 +955,9 @@ impl DecisionState {
 	}
 
 	pub(crate) fn validate(&self) -> Result<(), String> {
+		self.instances
+			.validate()
+			.map_err(|error| format!("decisions: instances: {error}"))?;
 		// ADR 0720: a record exists only after an admitted write, and that write
 		// sealed. A state holding records and no seal was not written by this build.
 		match &self.sealed {
@@ -1322,7 +1409,7 @@ fn take_over(
 	}
 	// The sealed placement, in effect: a takeover moves authority, never data.
 	let sealed = decisions.sealed.as_ref().ok_or(FormationIncomplete)?;
-	if formed_placement(state).as_ref() != Some(&sealed.placement) {
+	if placement_under(state, Some(&*decisions)).as_ref() != Some(&sealed.placement) {
 		return Err(MembershipSealed);
 	}
 	if state.migrations.values().any(|migration| {
@@ -1642,6 +1729,15 @@ fn reduce(
 		DecisionCommand::ReleaseBackupHold { id, entered_at } => {
 			release_backup_hold(decisions, id, entered_at)
 		}
+		DecisionCommand::GrantInstance { birth, slot, kind } => {
+			instances::grant(state, decisions, birth, slot, kind)
+		}
+		DecisionCommand::BeginReplacement { token, slot } => {
+			instances::begin_replacement(state, decisions, token, slot)
+		}
+		DecisionCommand::CompleteReplacement { token } => {
+			instances::complete_replacement(state, decisions, token)
+		}
 	};
 	outcome.unwrap_or_else(DecisionResult::Refused)
 }
@@ -1746,7 +1842,7 @@ fn reserve(
 	// ADR 0720: the last check, so a claim refused for any other reason never
 	// seals. The first admitted write fixes the membership it was admitted
 	// under; every later one is admitted only under that membership.
-	let formed = formed_placement(state);
+	let formed = placement_under(state, Some(&*decisions));
 	let seal = match (&decisions.sealed, formed) {
 		(None, None) => return Err(DecisionRefusal::FormationIncomplete),
 		(None, Some(placement)) => Some(SealedMembership { placement }),
@@ -2422,4 +2518,5 @@ pub(crate) struct DecisionSnapshot {
 pub(crate) mod tests;
 
 pub mod generations;
+pub mod instances;
 pub use generations::{Certificate, ChunkSum, Generations, ReportBody, Target};

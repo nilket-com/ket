@@ -233,4 +233,54 @@ mod tests {
 		trailing.push(0);
 		assert!(decode_tenant_admin_answer(&trailing).is_err());
 	}
+
+	/// The backup extension exactly as ADR 0736 shipped it: the old wire.
+	#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+	struct ShippedBackupExtension {
+		hold: Option<(u128, u64)>,
+		roster: Option<Result<crate::logical_backup::roster::BackupRoster, RosterRefusal>>,
+	}
+
+	/// Backup answers did not change with ADR 0104 (wendelon): the extension
+	/// encodes to the shipped bytes, an answer in the shipped shape decodes
+	/// today, and today's answer decodes in the shipped shape with nothing
+	/// left over, for an answer with nothing held, a hold, and a roster.
+	#[test]
+	fn backup_answers_keep_their_shipped_wire_both_ways() {
+		let cases: [(Option<(u128, u64)>, fn() -> Option<_>); 3] = [
+			(None, || None),
+			(Some((0x736, 9)), || None),
+			(None, || Some(Err(RosterRefusal::KvDataPresent))),
+		];
+		for (hold, roster) in cases {
+			let today = BackupAdminExtensionWire {
+				hold,
+				roster: roster(),
+			};
+			let shipped = ShippedBackupExtension {
+				hold,
+				roster: roster(),
+			};
+			let today_bytes = crate::network::wire::encode(&today).unwrap();
+			assert_eq!(
+				today_bytes,
+				crate::network::wire::encode(&shipped).unwrap(),
+				"{today:?}"
+			);
+
+			let mut answer = crate::network::wire::encode(&response()).unwrap();
+			answer.extend_from_slice(&today_bytes);
+			assert_eq!(
+				decode_tenant_admin_answer(&answer).unwrap(),
+				(response(), today),
+				"a shipped-shape answer, decoded today"
+			);
+			let (decoded, rest) =
+				postcard::take_from_bytes::<TenantAdminResponseWire>(&answer).unwrap();
+			let (extension, rest) =
+				postcard::take_from_bytes::<ShippedBackupExtension>(rest).unwrap();
+			assert!(rest.is_empty(), "nothing after the shipped extension");
+			assert_eq!((decoded, extension), (response(), shipped));
+		}
+	}
 }

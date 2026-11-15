@@ -1505,6 +1505,9 @@ async fn form_cluster(
 		std::fs::create_dir_all(dir.join("data")).unwrap();
 		write_private(&dir.join("kek-unlock"), &unlock_secret);
 		let cluster = if *id == NODES[0] {
+			// ADR 0104 (wendelon): the one permission to form, provisioned beside
+			// the forming member's fresh store and consumed at its first start.
+			std::fs::write(dir.join("data").join("FORMATION_INTENT"), b"").unwrap();
 			"mode = \"bootstrap\"".to_owned()
 		} else {
 			format!(
@@ -4916,9 +4919,21 @@ fn bounded_run(program: &Path, arguments: &[std::ffi::OsString], end: Instant) -
 /// OUTCOME <step> <ok|failed|timed-out> …`, so a record whose owner died mid-command shows a
 /// begun step without an outcome.
 fn backup_command(step: &str, arguments: &[std::ffi::OsString], deadline: Instant) -> Ran {
-	let end = deadline.min(Instant::now() + BACKUP_COMMAND_BOUND);
+	operator_command("backup", step, arguments, BACKUP_COMMAND_BOUND, deadline)
+}
+
+/// One `nilket wendelon <command> <arguments>` run, printed and bounded as `backup_command`
+/// describes, under min(`deadline`, its start + `bound`).
+fn operator_command(
+	command: &str,
+	step: &str,
+	arguments: &[std::ffi::OsString],
+	bound: Duration,
+	deadline: Instant,
+) -> Ran {
+	let end = deadline.min(Instant::now() + bound);
 	eprintln!("smoke: COMMAND BEGIN {step}");
-	let mut full = vec![std::ffi::OsString::from("wendelon"), "backup".into()];
+	let mut full = vec![std::ffi::OsString::from("wendelon"), command.into()];
 	full.extend_from_slice(arguments);
 	let ran = bounded_run(&nilket_bin(), &full, end);
 	let outcome = if ran.succeeded() {
@@ -5217,4 +5232,646 @@ fn a_backup_command_counts_only_when_its_exit_and_whole_output_arrive_in_time() 
 	let failed = run("echo no >&2; exit 1", Duration::from_secs(5));
 	assert!(!failed.succeeded() && failed.within && failed.code == Some(1));
 	assert!(!failed.timed_out);
+}
+
+// ============================================================
+//  ADR 0104 (wendelon): A LOST FOLLOWER IS REPLACED BY A CONTROL-ONLY INSTANCE
+// ============================================================
+
+/// The whole workflow's bound.
+const REPLACEMENT_TEST_BOUND: Duration = Duration::from_secs(420);
+/// One `nilket wendelon replace` command's bound; its own exchange is bounded at 30 s.
+const REPLACE_COMMAND_BOUND: Duration = Duration::from_secs(45);
+/// From the replacement's start until the operator's status read reports it done.
+const DONE_BOUND: Duration = Duration::from_secs(120);
+/// How long a full start on a blank store may take to exit refused.
+const REFUSED_START_BOUND: Duration = Duration::from_secs(60);
+/// One logical write's bound, its takeover wait included (ADR 0729: lease 3 s plus grace).
+const OFFERED_WRITE_BOUND: Duration = Duration::from_secs(30);
+/// How long the old instance runs before the facts taken while it runs.
+const OLD_INSTANCE_RUN: Duration = Duration::from_secs(5);
+/// One routed Raft probe's bound: dial, request and answer.
+const PROBE_BOUND: Duration = Duration::from_secs(10);
+/// The first allocated Raft instance: the one a cluster's first replacement is granted.
+const FIRST_ALLOCATED: u32 = 1 << 31;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReportedPhase {
+	Begun,
+	Reserved(u32),
+	Done(u32),
+}
+
+/// One report line of `nilket wendelon replace begin|status`, read whole:
+/// `replacement <32 hex digits>: slot <n> replacing instance <n>: <phase>`, the phase `begun`,
+/// `reserved <n>` or `done <n>`. Anything else is not a report.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Reported {
+	token: u128,
+	slot: u32,
+	r_old: u32,
+	phase: ReportedPhase,
+}
+
+/// A decimal number of digits only.
+fn number(text: &str) -> Option<u32> {
+	(!text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit()))
+		.then(|| text.parse().ok())
+		.flatten()
+}
+
+/// A token of exactly 32 hexadecimal digits.
+fn token_of(text: &str) -> Option<u128> {
+	(text.len() == 32 && text.bytes().all(|byte| byte.is_ascii_hexdigit()))
+		.then(|| u128::from_str_radix(text, 16).ok())
+		.flatten()
+}
+
+fn parse_report(line: &str) -> Option<Reported> {
+	let rest = line.strip_prefix("replacement ")?;
+	let (token, rest) = rest.split_once(": slot ")?;
+	let (slot, rest) = rest.split_once(" replacing instance ")?;
+	let (r_old, phase) = rest.split_once(": ")?;
+	let phase = match phase.split_once(' ') {
+		None if phase == "begun" => ReportedPhase::Begun,
+		Some(("reserved", instance)) => ReportedPhase::Reserved(number(instance)?),
+		Some(("done", instance)) => ReportedPhase::Done(number(instance)?),
+		_ => return None,
+	};
+	Some(Reported {
+		token: token_of(token)?,
+		slot: number(slot)?,
+		r_old: number(r_old)?,
+		phase,
+	})
+}
+
+/// The token `begin` prints before it sends anything:
+/// `replacement token <32 hex digits> for slot <n>; …`.
+fn announced_token(line: &str, slot: u32) -> Option<u128> {
+	let rest = line.strip_prefix("replacement token ")?;
+	let (token, rest) = rest.split_once(" for slot ")?;
+	let (named, _) = rest.split_once(';')?;
+	(number(named)? == slot).then_some(())?;
+	token_of(token)
+}
+
+#[test]
+fn a_replacement_report_is_read_whole_or_not_at_all() {
+	let token = "0104000000000000000000000000aa00";
+	let report = |phase: &str| format!("replacement {token}: slot 3 replacing instance 3: {phase}");
+	let reported = |phase| {
+		Some(Reported {
+			token: 0x0104000000000000000000000000aa00,
+			slot: 3,
+			r_old: 3,
+			phase,
+		})
+	};
+	assert_eq!(
+		parse_report(&report("begun")),
+		reported(ReportedPhase::Begun)
+	);
+	assert_eq!(
+		parse_report(&report("reserved 2147483648")),
+		reported(ReportedPhase::Reserved(FIRST_ALLOCATED))
+	);
+	assert_eq!(
+		parse_report(&report("done 2147483648")),
+		reported(ReportedPhase::Done(FIRST_ALLOCATED))
+	);
+	for refused in [
+		report("done"),
+		report("done +2147483648"),
+		report("done 2147483648 "),
+		report("Done { r_new: 2147483648 }"),
+		report("finished 1"),
+		format!("replacement {token}0: slot 3 replacing instance 3: begun"),
+		format!(
+			"replacement {}: slot 3 replacing instance 3: begun",
+			&token[1..]
+		),
+		format!("replacement {token}: slot 3 replacing instance: begun"),
+		String::new(),
+	] {
+		assert_eq!(parse_report(&refused), None, "{refused:?}");
+	}
+	let announced = format!("replacement token {token} for slot 3; retry with …");
+	assert_eq!(
+		announced_token(&announced, 3),
+		Some(0x0104000000000000000000000000aa00)
+	);
+	assert_eq!(announced_token(&announced, 2), None);
+	assert_eq!(
+		announced_token(&format!("replacement token {token}"), 3),
+		None
+	);
+}
+
+/// One `nilket wendelon replace <arguments>` run.
+fn replace_command(step: &str, arguments: &[std::ffi::OsString], deadline: Instant) -> Ran {
+	operator_command("replace", step, arguments, REPLACE_COMMAND_BOUND, deadline)
+}
+
+/// The operator's status read of `token`, parsed: `None` when the command did not succeed in
+/// its bound or printed anything but one report line for this token and `slot`.
+fn replacement_status(
+	step: &str,
+	token: u128,
+	slot: u32,
+	connection: &[std::ffi::OsString],
+	deadline: Instant,
+) -> Option<ReportedPhase> {
+	let mut arguments: Vec<std::ffi::OsString> = vec![
+		"status".into(),
+		"--token".into(),
+		format!("{token:032x}").into(),
+	];
+	arguments.extend_from_slice(connection);
+	let ran = replace_command(step, &arguments, deadline);
+	if !ran.succeeded() {
+		return None;
+	}
+	let lines: Vec<&str> = ran.stdout.lines().collect();
+	let [line] = lines.as_slice() else {
+		panic!("{step}: not one report line: {}", ran.text());
+	};
+	let reported =
+		parse_report(line).unwrap_or_else(|| panic!("{step}: not a report: {}", ran.text()));
+	assert_eq!(
+		(reported.token, reported.slot, reported.r_old),
+		(token, slot, slot),
+		"{step}: another replacement: {}",
+		ran.text()
+	);
+	Some(reported.phase)
+}
+
+/// ONE logical write of row `row_id` under one operation identity through `through`, offered
+/// again only for the answers `offers_the_same_operation_again` names, within
+/// `OFFERED_WRITE_BOUND`: a range whose holder is gone is taken over first (ADR 0729). Its
+/// receipt's coordinator, a member that is not `gone`.
+async fn commit_offering_again(
+	through: &Client,
+	descriptor: &TableSchemaDescriptor,
+	row_id: i64,
+	name: &str,
+	gone: u32,
+	what: &str,
+) -> u32 {
+	let identity = operation_id();
+	let end = Instant::now() + OFFERED_WRITE_BOUND;
+	let started = Instant::now();
+	let mut attempts = 0_u32;
+	loop {
+		attempts += 1;
+		let left = end.saturating_duration_since(Instant::now());
+		assert!(
+			!left.is_zero(),
+			"{what}: row {row_id} did not commit within {OFFERED_WRITE_BOUND:?} ({attempts} attempts)"
+		);
+		let answer = tokio::time::timeout(
+			left,
+			through.table_write(
+				TenantId::new(TENANT),
+				descriptor,
+				one_row(row_id, name),
+				WriteOptions {
+					deadline: Some(Instant::now() + left),
+					operation_id: Some(identity),
+					..WriteOptions::default()
+				},
+			),
+		)
+		.await
+		.unwrap_or_else(|_| panic!("{what}: row {row_id} had no answer within its bound"));
+		match answer {
+			Ok(receipt) => {
+				let coordinator = receipt.commit_hlc.node_id;
+				eprintln!(
+					"smoke: {what}: row {row_id} committed under node {coordinator} after \
+					 {attempts} attempts in {:?}",
+					started.elapsed()
+				);
+				assert!(
+					NODES.contains(&coordinator) && coordinator != gone,
+					"{what}: row {row_id} was stamped by {coordinator}"
+				);
+				return coordinator;
+			}
+			Err(error) if offers_the_same_operation_again(&error, identity) => {
+				eprintln!("smoke: {what}: attempt {attempts} of row {row_id}: {error}");
+				tokio::time::sleep(Duration::from_millis(250)).await;
+			}
+			Err(error) => panic!("{what}: the write of row {row_id}: {error:?}"),
+		}
+	}
+}
+
+/// Every survivor's view: the expected rows exactly, through a client discovered from each.
+async fn expect_at_survivors(
+	survivors: &[&Member],
+	pki: &Pki,
+	descriptor: &TableSchemaDescriptor,
+	deadline: Instant,
+	expected: &[(i64, String)],
+	what: &str,
+) {
+	for member in survivors {
+		let through = client_through(member, pki, Credential::Storage, deadline).await;
+		expect_rows(
+			&through,
+			descriptor,
+			deadline,
+			&format!("{what}, discovered through node {}", member.id),
+			expected,
+		)
+		.await;
+	}
+}
+
+/// ADR 0104 (wendelon), member replacement gate 1, with real processes on ONE host.
+///
+/// A three-daemon cluster takes rows; a follower is killed (SIGKILL, confirmed) and its disk is
+/// lost: its data directory is moved aside whole, never deleted, and an empty one takes its
+/// place. Then, each judged from typed or parsed facts only:
+/// - a blank store given the cluster's sealed root, as a joiner is, cannot start as the lost
+///   voter: the full start exits non-zero within its bound, refused `SlotGranted`;
+/// - the operator's `replace begin` through a survivor prints the token before it sends
+///   anything and reports the replacement `begun`; `replace provision` writes the token;
+/// - the node's unchanged configuration starts it control-only, and the operator's status
+///   reads report `done <first allocated instance>` within `DONE_BOUND`;
+/// - the survivors take new writes (ranges the lost slot held move by ADR 0729's takeover) and
+///   read every acknowledged row exactly;
+/// - the old instance comes back on its old disk at the slot's address while the replacement's
+///   process is stopped in order, and must keep running (its process identity is read). A
+///   survivor sends it authenticated, correctly formed Raft votes as itself, each bounded and
+///   on a fresh connection. The one addressed to the old instance is answered, the one addressed
+///   to the replacement is refused with no answer, and the old instance answers again after it.
+///   Then a survivor still names a survivor as leader, a new write commits, and reads stay exact.
+///   The old process's ready answer and the refusals counted in its log are printed as a record;
+///   neither is an oracle;
+/// - the replacement's process returns: still done, writes commit, reads exact; every process
+///   stops in order with status 0.
+///
+/// Not claimed: the replacement's data readiness (gates 2 to 4: it serves no data), more than
+/// one host, a leader's loss, or the replacement's catch-up seen from outside.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "spawns three daemons, kills one and replaces it through the operator's commands; run alone under an external owner (see the module text)"]
+async fn three_daemons_replace_a_lost_follower_with_a_control_only_instance() {
+	assert!(
+		node_control().is_none(),
+		"this workflow runs its three daemons on one host"
+	);
+	let deadline = Instant::now() + REPLACEMENT_TEST_BOUND;
+	let started = Instant::now();
+	let Formed {
+		root,
+		pki,
+		members,
+		mut daemons,
+		descriptor,
+	} = form(deadline, None).await;
+	let storage = client_through(&members[0], &pki, Credential::Storage, deadline).await;
+	let mut expected = Vec::new();
+	for id in 1_i64..=4 {
+		// ONE call each: an error is this step's result.
+		let bound = step(deadline);
+		tokio::time::timeout(
+			bound,
+			storage.table_write(
+				TenantId::new(TENANT),
+				&descriptor,
+				one_row(id, "before"),
+				WriteOptions {
+					deadline: Some(Instant::now() + bound),
+					..WriteOptions::default()
+				},
+			),
+		)
+		.await
+		.unwrap_or_else(|_| panic!("the write of row {id} had no answer within its bound"))
+		.unwrap_or_else(|error| panic!("the write of row {id}: {error:?}"));
+		expected.push((id, "before".to_owned()));
+	}
+
+	// The lost member is a follower, chosen positively from node 1's view of the leader.
+	let inspection = inspect(&members[0], &pki);
+	assert!(inspection.ready, "node 1 is not ready: {}", inspection.raw);
+	let leader = inspection
+		.leader()
+		.unwrap_or_else(|| panic!("node 1 names no leader among the three: {}", inspection.raw));
+	let lost = members
+		.iter()
+		.rev()
+		.find(|member| member.id != leader)
+		.expect("a node that is not the leader");
+	let survivors: Vec<&Member> = members
+		.iter()
+		.filter(|member| member.id != lost.id)
+		.collect();
+	eprintln!("smoke: leader {leader}; node {} loses its disk", lost.id);
+	eprintln!("smoke: {}", daemons.crash(lost.id));
+	daemons.still_down(lost.id);
+	let node_dir = lost.config.parent().unwrap().to_path_buf();
+	let data = node_dir.join("data");
+	let old_data = node_dir.join("old-data");
+	std::fs::rename(&data, &old_data).unwrap();
+	std::fs::create_dir(&data).unwrap();
+
+	// A blank store is not the lost voter, even with the cluster's sealed root as a joiner
+	// has it. Its directory is then moved aside too, kept.
+	let sealed_root = Path::new(".wendelon").join("local-sealed-root-kek.bin");
+	let sealed = std::fs::read(old_data.join(&sealed_root)).unwrap();
+	std::fs::create_dir_all(data.join(".wendelon")).unwrap();
+	write_private(&data.join(&sealed_root), &sealed);
+	let blank = bounded_run(
+		&nilket_bin(),
+		&["wendelon".into(), lost.config.clone().into_os_string()],
+		deadline.min(Instant::now() + REFUSED_START_BOUND),
+	);
+	eprintln!("smoke: blank full start: {}", blank.text());
+	assert!(
+		blank.within && blank.code.is_some_and(|code| code != 0),
+		"a blank store was not refused as the lost voter: {}",
+		blank.text()
+	);
+	assert!(
+		blank.stderr.contains("InstanceGrantRefused: SlotGranted"),
+		"the blank start was refused for another reason: {}",
+		blank.text()
+	);
+	std::fs::rename(&data, node_dir.join("blank-start-data")).unwrap();
+	std::fs::create_dir(&data).unwrap();
+
+	// The operator opens the replacement through a survivor and provisions its token.
+	let connection = operator_connection(survivors[0], &pki);
+	let mut arguments: Vec<std::ffi::OsString> =
+		vec!["begin".into(), "--slot".into(), lost.id.to_string().into()];
+	arguments.extend(connection.iter().cloned());
+	let began = replace_command("replace-begin", &arguments, deadline);
+	assert!(began.succeeded(), "replace begin: {}", began.text());
+	let lines: Vec<&str> = began.stdout.lines().collect();
+	let [announced, report] = lines.as_slice() else {
+		panic!(
+			"replace begin printed {} lines: {}",
+			lines.len(),
+			began.text()
+		);
+	};
+	let token = announced_token(announced, lost.id)
+		.unwrap_or_else(|| panic!("replace begin announced no token first: {}", began.text()));
+	assert_eq!(
+		parse_report(report),
+		Some(Reported {
+			token,
+			slot: lost.id,
+			r_old: lost.id,
+			phase: ReportedPhase::Begun,
+		}),
+		"replace begin: {}",
+		began.text()
+	);
+	let provisioned = replace_command(
+		"replace-provision",
+		&[
+			"provision".into(),
+			"--data-dir".into(),
+			data.clone().into_os_string(),
+			"--token".into(),
+			format!("{token:032x}").into(),
+		],
+		deadline,
+	);
+	assert!(
+		provisioned.succeeded(),
+		"replace provision: {}",
+		provisioned.text()
+	);
+
+	// The node's unchanged configuration starts it, control-only, and the leader's controller
+	// adds, promotes and records it.
+	let replacement_started = Instant::now();
+	daemons.start(lost);
+	let done_by = deadline.min(Instant::now() + DONE_BOUND);
+	let mut reads = 0_u32;
+	let done = loop {
+		reads += 1;
+		let phase = replacement_status(
+			&format!("replace-status-{reads}"),
+			token,
+			lost.id,
+			&connection,
+			done_by,
+		);
+		if let Some(ReportedPhase::Done(instance)) = phase {
+			break instance;
+		}
+		if let Some(why) = daemons.exited() {
+			panic!("before done: {why}");
+		}
+		assert!(
+			Instant::now() < done_by,
+			"the replacement was not done within {DONE_BOUND:?} ({reads} status reads, last \
+			 {phase:?})"
+		);
+		tokio::time::sleep(Duration::from_secs(1)).await;
+	};
+	eprintln!(
+		"smoke: replacement done as instance {done} {:?} after its start ({reads} status reads)",
+		replacement_started.elapsed()
+	);
+	assert_eq!(done, FIRST_ALLOCATED);
+
+	// The survivors keep every acknowledged row and take new writes.
+	let through = client_through(survivors[0], &pki, Credential::Storage, deadline).await;
+	for id in 5_i64..=8 {
+		commit_offering_again(&through, &descriptor, id, "replaced", lost.id, "after done").await;
+		expected.push((id, "replaced".to_owned()));
+	}
+	expect_at_survivors(
+		&survivors,
+		&pki,
+		&descriptor,
+		deadline,
+		&expected,
+		"after done",
+	)
+	.await;
+
+	// The old instance returns on its old disk at the slot's address: the replacement's
+	// process stops in order, and the same configuration but for its data directory starts.
+	daemons.stop(lost.id, deadline);
+	let text = std::fs::read_to_string(&lost.config).unwrap();
+	assert_eq!(text.matches("data_dir = \"data\"\n").count(), 1);
+	let old = Member {
+		id: lost.id,
+		config: node_dir.join("wendelon-old.toml"),
+		address: lost.address.clone(),
+		ready: lost.ready.clone(),
+		log: node_dir.join("old-daemon.log"),
+	};
+	write_private(
+		&old.config,
+		text.replace("data_dir = \"data\"\n", "data_dir = \"old-data\"\n")
+			.as_bytes(),
+	);
+	daemons.start(&old);
+	tokio::time::sleep(OLD_INSTANCE_RUN).await;
+	if let Some(why) = daemons.exited() {
+		panic!("with the old instance back: {why}");
+	}
+	eprintln!(
+		"smoke: the old instance runs as {}",
+		daemons.identity(old.id)
+	);
+	// The exclusion itself, at that live process: an authenticated, correctly formed Raft
+	// request from a survivor (its own node certificate, as itself) addressed to the old
+	// instance is answered; the same request addressed to the replacement is refused, with
+	// no answer; and the old instance answers again after it, so the refusal is the target's
+	// and not a lost process or route. Each on a fresh connection, each bounded.
+	let sender = survivors[0].id;
+	let probe = |target_instance: u32| {
+		let pki_dir = root.join("pki");
+		let address = old.address.clone();
+		let node_ca = pki.node_ca.clone();
+		let slot = old.id;
+		async move {
+			tokio::time::timeout(
+				PROBE_BOUND,
+				wendelon::consensus::raft_network::routed_vote_for_test(
+					&pki_dir.join(format!("node-{sender}.crt")),
+					&pki_dir.join(format!("node-{sender}.key")),
+					&node_ca,
+					DOMAIN,
+					slot,
+					&address,
+					sender,
+					target_instance,
+				),
+			)
+			.await
+		}
+	};
+	let answered = |what: &str, outcome| match outcome {
+		Ok(Ok(Ok(response))) => response,
+		other => {
+			panic!("{what}: the old instance did not answer a request addressed to it: {other:?}")
+		}
+	};
+	let before = answered("before", probe(lost.id).await);
+	assert!(
+		!before.vote_granted,
+		"a term-0 vote was granted: {before:?}"
+	);
+	eprintln!(
+		"smoke: the old instance answered as itself with its vote {:?}",
+		before.vote
+	);
+	match probe(FIRST_ALLOCATED).await {
+		Ok(Err(refused)) => eprintln!(
+			"smoke: a request addressed to the replacement was refused at the old instance: {refused}"
+		),
+		other => panic!(
+			"a request addressed to the replacement was not refused at the old instance: {other:?}"
+		),
+	}
+	let after = answered("after", probe(lost.id).await);
+	assert!(!after.vote_granted, "a term-0 vote was granted: {after:?}");
+	if let Some(why) = daemons.exited() {
+		panic!("after the probes: {why}");
+	}
+	let view = inspect(survivors[0], &pki);
+	assert!(
+		view.ready,
+		"a survivor is not ready with the old instance back: {}",
+		view.raw
+	);
+	let named = view
+		.leader()
+		.unwrap_or_else(|| panic!("a survivor names no leader: {}", view.raw));
+	assert!(
+		survivors.iter().any(|member| member.id == named),
+		"with the old instance back, the leader is {named}"
+	);
+	commit_offering_again(
+		&through,
+		&descriptor,
+		9,
+		"old-back",
+		lost.id,
+		"with the old instance",
+	)
+	.await;
+	expected.push((9, "old-back".to_owned()));
+	expect_at_survivors(
+		&survivors,
+		&pki,
+		&descriptor,
+		deadline,
+		&expected,
+		"with the old instance back",
+	)
+	.await;
+	let old_view = inspect(&old, &pki);
+	eprintln!(
+		"smoke: RECORD: the old instance's ready answer: {} ({})",
+		old_view.ready, old_view.raw
+	);
+	daemons.stop(old.id, deadline);
+	let refused = std::fs::read_to_string(&old.log)
+		.map(|log| {
+			log.matches("it is addressed to another instance of this slot")
+				.count()
+		})
+		.unwrap_or(0);
+	eprintln!(
+		"smoke: RECORD: requests addressed to another instance refused by the old process: \
+		 {refused}"
+	);
+
+	// The replacement's process returns from its unchanged file: still done; writes commit.
+	daemons.start(lost);
+	tokio::time::sleep(Duration::from_secs(2)).await;
+	assert_eq!(
+		replacement_status(
+			"replace-status-returned",
+			token,
+			lost.id,
+			&connection,
+			deadline
+		),
+		Some(ReportedPhase::Done(FIRST_ALLOCATED))
+	);
+	commit_offering_again(
+		&through,
+		&descriptor,
+		10,
+		"returned",
+		lost.id,
+		"after the return",
+	)
+	.await;
+	expected.push((10, "returned".to_owned()));
+	expect_at_survivors(
+		&survivors,
+		&pki,
+		&descriptor,
+		deadline,
+		&expected,
+		"after the replacement's return",
+	)
+	.await;
+
+	// Orderly stop of every process. A forced kill fails the test.
+	daemons.stop(lost.id, deadline);
+	for member in &survivors {
+		daemons.stop(member.id, deadline);
+	}
+	eprintln!(
+		"smoke: replacement workflow passed in {:?}",
+		started.elapsed()
+	);
+	assert!(Instant::now() < deadline, "the test overran its bound");
+	std::fs::remove_dir_all(&root).unwrap();
 }

@@ -2415,6 +2415,22 @@ impl WendelonClient {
 		self.tenant_admin_exchange(request).await
 	}
 
+	/// ADR 0104 (wendelon): a replacement request (`BeginReplacement`,
+	/// `GetReplacement`), whose answer carries the replacement extension.
+	pub async fn replacement_admin(
+		&self,
+		request: &TenantAdminRequestWire,
+	) -> std::io::Result<(
+		TenantAdminResponseWire,
+		crate::network::control_server::ReplacementAdminExtensionWire,
+	)> {
+		self.extended_admin_exchange(
+			request,
+			crate::network::control_server::decode_replacement_admin_answer,
+		)
+		.await
+	}
+
 	async fn tenant_admin_exchange(
 		&self,
 		request: &TenantAdminRequestWire,
@@ -2422,6 +2438,18 @@ impl WendelonClient {
 		TenantAdminResponseWire,
 		crate::network::control_server::BackupAdminExtensionWire,
 	)> {
+		self.extended_admin_exchange(
+			request,
+			crate::network::control_server::decode_tenant_admin_answer,
+		)
+		.await
+	}
+
+	async fn extended_admin_exchange<E>(
+		&self,
+		request: &TenantAdminRequestWire,
+		decode: fn(&[u8]) -> std::io::Result<(TenantAdminResponseWire, E)>,
+	) -> std::io::Result<(TenantAdminResponseWire, E)> {
 		let payload = crate::network::wire::encode(request)?;
 		let mut preferred_target = self.leader();
 		for attempt in 0..DATA_RETRY_BUDGET {
@@ -2437,7 +2465,7 @@ impl WendelonClient {
 					})?
 				}
 			};
-			let (response, extension) = self.tenant_admin_once(target, &payload).await?;
+			let (response, extension) = self.tenant_admin_once(target, &payload, decode).await?;
 			if let Some(leader) = response.leader_hint {
 				*self.leader.write().unwrap() = Some(NodeId {
 					id: leader,
@@ -2458,14 +2486,12 @@ impl WendelonClient {
 		unreachable!("bounded retry loop must return within budget")
 	}
 
-	async fn tenant_admin_once(
+	async fn tenant_admin_once<E>(
 		&self,
 		target: NodeId,
 		payload: &[u8],
-	) -> std::io::Result<(
-		TenantAdminResponseWire,
-		crate::network::control_server::BackupAdminExtensionWire,
-	)> {
+		decode: fn(&[u8]) -> std::io::Result<(TenantAdminResponseWire, E)>,
+	) -> std::io::Result<(TenantAdminResponseWire, E)> {
 		let conn = self.factory.get_connection(target).await?;
 		let mut stream = conn.open_bi().await?;
 		let header = FrameHeader {
@@ -2493,7 +2519,7 @@ impl WendelonClient {
 				"invalid TENANT_ADMIN_RESP frame",
 			));
 		}
-		crate::network::control_server::decode_tenant_admin_answer(&frame.meta)
+		decode(&frame.meta)
 	}
 
 	async fn schema_update_once(

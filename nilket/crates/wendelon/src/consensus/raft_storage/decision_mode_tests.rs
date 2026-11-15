@@ -193,6 +193,8 @@ async fn a_new_mode_store_writes_its_own_format_and_reopens() {
 	let new = DecisionMode::ParentDecisions;
 	let dir = crate::test_support::TestDir::new("decision-mode-log");
 	let mut store = open_store(&dir, new).await.unwrap();
+	// ADR 0104 (wendelon): log state is written only under an identity.
+	store.write_identity(IDENTITY).await.unwrap();
 	store
 		.blocking_append(vec![blank(0), blank(1)])
 		.await
@@ -217,6 +219,11 @@ async fn a_new_mode_store_writes_its_own_format_and_reopens() {
 
 use crate::consensus::decisions::tests as fixture;
 
+const PARENT_DECISIONS_V25_MANIFEST: &str =
+	include_str!("../../../tests/fixtures/consensus_body/parent_decisions_v25.txt");
+/// ADR 0736 to ADR 0103's format-24 bodies, retained. ADR 0104 (wendelon) changed
+/// one: the decision state, which gained the Raft instance records; and added
+/// the three instance commands.
 const PARENT_DECISIONS_V24_MANIFEST: &str =
 	include_str!("../../../tests/fixtures/consensus_body/parent_decisions_v24.txt");
 /// ADR 0729 to ADR 0735's format-23 bodies, retained. ADR 0736 changed one: the
@@ -262,7 +269,7 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 fn manifest() -> BTreeMap<String, String> {
-	parse(PARENT_DECISIONS_V24_MANIFEST)
+	parse(PARENT_DECISIONS_V25_MANIFEST)
 }
 
 /// ADR 0725: the three owner-signed operation kinds pinned in the format-18
@@ -429,7 +436,7 @@ fn entry(index: u64, request: WendelonRequest) -> Entry<WendelonTypeConfig> {
 }
 
 #[test]
-fn the_format_24_bodies_match_their_goldens_and_round_trip() {
+fn the_format_25_bodies_match_their_goldens_and_round_trip() {
 	let stored = manifest();
 	let state = golden_state();
 	let body = encode_state_body(DecisionMode::ParentDecisions, &state).unwrap();
@@ -494,6 +501,37 @@ fn the_format_24_bodies_match_their_goldens_and_round_trip() {
 			hex(&postcard::to_stdvec(&WendelonRequest::Decision(command)).unwrap()),
 		));
 	}
+	// ADR 0104 (wendelon): the three instance commands.
+	for (name, command) in [
+		(
+			"grant_instance",
+			crate::consensus::decisions::DecisionCommand::GrantInstance {
+				birth: [0x04; 16],
+				slot: 104,
+				kind: crate::consensus::decisions::instances::GrantKind::Replacement {
+					token: 0x0104_0104_0104_0104_0104_0104_0104_0104,
+				},
+			},
+		),
+		(
+			"begin_replacement",
+			crate::consensus::decisions::DecisionCommand::BeginReplacement {
+				token: 0x0104_0104_0104_0104_0104_0104_0104_0104,
+				slot: 104,
+			},
+		),
+		(
+			"complete_replacement",
+			crate::consensus::decisions::DecisionCommand::CompleteReplacement {
+				token: 0x0104_0104_0104_0104_0104_0104_0104_0104,
+			},
+		),
+	] {
+		actual.push((
+			name.to_owned(),
+			hex(&postcard::to_stdvec(&WendelonRequest::Decision(command)).unwrap()),
+		));
+	}
 	let moved: Vec<String> = actual
 		.iter()
 		.filter(|(name, hex)| stored.get(name) != Some(hex))
@@ -501,7 +539,7 @@ fn the_format_24_bodies_match_their_goldens_and_round_trip() {
 		.collect();
 	assert!(
 		moved.is_empty(),
-		"format-24 bodies moved or are missing; expected lines:\n{}",
+		"format-25 bodies moved or are missing; expected lines:\n{}",
 		moved.join("\n")
 	);
 	assert_eq!(stored.len(), actual.len());
@@ -515,17 +553,30 @@ fn the_format_24_bodies_match_their_goldens_and_round_trip() {
 	// only the decision state differs from the format-16 corpus: by exactly the
 	// appended seal.
 	assert!(decisions.sealed().is_some());
+	// ADR 0104 (wendelon): against the format-24 corpus exactly one body moved,
+	// the decision state (the Raft instance records), and the three instance
+	// commands were added. Every other body is unchanged, byte for byte.
+	const MOVED_0104: [&str; 1] = ["decisions_golden_history"];
+	let retained_v24 = parse(PARENT_DECISIONS_V24_MANIFEST);
+	assert_eq!(stored.len(), retained_v24.len() + 3);
+	for (name, hex) in &retained_v24 {
+		if MOVED_0104.contains(&name.as_str()) {
+			assert_ne!(stored.get(name), Some(hex), "{name}");
+		} else {
+			assert_eq!(stored.get(name), Some(hex), "{name}");
+		}
+	}
 	// ADR 0736: against the format-23 corpus exactly one body moved, the
 	// decision state (the backup hold), and the two hold commands were added.
 	// Every other body is unchanged, byte for byte.
 	const MOVED: [&str; 1] = ["decisions_golden_history"];
 	let retained_v23 = parse(PARENT_DECISIONS_V23_MANIFEST);
-	assert_eq!(stored.len(), retained_v23.len() + 2);
+	assert_eq!(retained_v24.len(), retained_v23.len() + 2);
 	for (name, hex) in &retained_v23 {
 		if MOVED.contains(&name.as_str()) {
-			assert_ne!(stored.get(name), Some(hex), "{name}");
+			assert_ne!(retained_v24.get(name), Some(hex), "{name}");
 		} else {
-			assert_eq!(stored.get(name), Some(hex), "{name}");
+			assert_eq!(retained_v24.get(name), Some(hex), "{name}");
 		}
 	}
 	// ADR 0729: against the format-18 corpus, exactly two bodies moved: the
@@ -742,7 +793,7 @@ fn recovery_keeps_the_reserve_and_first_decision_log_indices() {
 	let replay = |entries: &[Entry<WendelonTypeConfig>]| {
 		let mut state = fixture::base(3);
 		for entry in entries {
-			apply_entry_to_state(&mut state, entry);
+			apply_entry_to_state(&mut state, entry).unwrap();
 		}
 		state
 	};
@@ -826,7 +877,7 @@ fn recovery_keeps_the_reserve_and_first_decision_log_indices() {
 	let bytes = encode_state_body(new, &cut_state).unwrap();
 	let mut resumed = decode_state_body(new, &bytes).unwrap();
 	for entry in &after {
-		apply_entry_to_state(&mut resumed, entry);
+		apply_entry_to_state(&mut resumed, entry).unwrap();
 	}
 	assert_eq!(resumed.decisions, state.decisions);
 
@@ -977,4 +1028,366 @@ fn table_retention_is_frozen_under_parent_decisions() {
 		matches!(&response, WendelonResponse::Error(why) if why.contains("CTAS is refused")),
 		"{response:?}"
 	);
+}
+
+// ============================================================
+//  ADR 0104 (wendelon): BIRTH, IDENTITY AND VOTE IN ONE PAGE
+// ============================================================
+
+use crate::consensus::decisions::instances::{Origin, RaftIdentity, Role};
+use openraft::storage::RaftLogStorage;
+
+const IDENTITY: RaftIdentity = RaftIdentity {
+	instance: 7,
+	origin: Origin::Join,
+	role: Role::Full,
+};
+
+fn refused_as(result: std::io::Result<WendelonLogStore>, reason: &str) {
+	match result {
+		Ok(_) => panic!("the open was not refused ({reason})"),
+		Err(error) => {
+			assert_eq!(error.kind(), ErrorKind::InvalidData, "{error}");
+			assert!(error.to_string().starts_with(reason), "{error}");
+		}
+	}
+}
+
+#[tokio::test]
+async fn a_new_store_is_born_once_and_stays_fresh_until_its_identity() {
+	let dir = TempDir::new("adr0104-born");
+	let new = DecisionMode::ParentDecisions;
+	let store = open_store(&dir, new).await.unwrap();
+	let birth = store.birth().await.expect("born at its first open");
+	assert_eq!(store.identity().await, None);
+	assert!(store.is_pristine().await);
+	assert_eq!(
+		store.bootstrap_mode().await,
+		DurableBootstrapMode::FreshBootstrap
+	);
+	drop(store);
+	// A born store reopens with the same birth, still fresh.
+	let store = open_store(&dir, new).await.unwrap();
+	assert_eq!(store.birth().await, Some(birth));
+	assert_eq!(
+		store.bootstrap_mode().await,
+		DurableBootstrapMode::FreshBootstrap
+	);
+	// Today has no page.
+	let today = TempDir::new("adr0104-today");
+	assert_eq!(
+		open_store(&today, DecisionMode::Today)
+			.await
+			.unwrap()
+			.birth()
+			.await,
+		None
+	);
+}
+
+#[tokio::test]
+async fn the_identity_is_written_once_and_kept_with_every_vote() {
+	let dir = TempDir::new("adr0104-identity");
+	let new = DecisionMode::ParentDecisions;
+	let store = open_store(&dir, new).await.unwrap();
+	let birth = store.birth().await.unwrap();
+	store.write_identity(IDENTITY).await.unwrap();
+	store.write_identity(IDENTITY).await.unwrap();
+	let other = RaftIdentity {
+		instance: 8,
+		..IDENTITY
+	};
+	assert_eq!(
+		store.write_identity(other).await.unwrap_err().kind(),
+		ErrorKind::AlreadyExists
+	);
+	// Identified, with nothing Raft-durable yet: still fresh, under this identity.
+	assert!(store.is_pristine().await);
+	drop(store);
+	let mut store = open_store(&dir, new).await.unwrap();
+	assert_eq!(store.identity().await, Some(IDENTITY));
+	assert_eq!(
+		store.bootstrap_mode().await,
+		DurableBootstrapMode::FreshBootstrap
+	);
+	let vote = Vote::new(3, 7);
+	store.save_vote(&vote).await.unwrap();
+	store.blocking_append(vec![blank(0)]).await.unwrap();
+	drop(store);
+	let mut store = open_store(&dir, new).await.unwrap();
+	assert_eq!(store.birth().await, Some(birth));
+	assert_eq!(store.identity().await, Some(IDENTITY));
+	assert_eq!(store.read_vote().await.unwrap(), Some(vote));
+	assert_eq!(store.bootstrap_mode().await, DurableBootstrapMode::Recovery);
+}
+
+#[tokio::test]
+async fn an_identified_store_with_an_empty_log_keeps_its_vote_and_is_not_fresh() {
+	let dir = TempDir::new("adr0104-identified-empty");
+	let new = DecisionMode::ParentDecisions;
+	let mut store = open_store(&dir, new).await.unwrap();
+	store.write_identity(IDENTITY).await.unwrap();
+	let vote = Vote::new(2, 9);
+	store.save_vote(&vote).await.unwrap();
+	drop(store);
+	let mut store = open_store(&dir, new).await.unwrap();
+	assert_eq!(store.read_vote().await.unwrap(), Some(vote));
+	assert_eq!(store.identity().await, Some(IDENTITY));
+	assert_eq!(store.bootstrap_mode().await, DurableBootstrapMode::Recovery);
+	assert!(!store.is_pristine().await);
+}
+
+#[tokio::test]
+async fn known_loss_of_either_half_fails_closed_and_changes_nothing() {
+	let new = DecisionMode::ParentDecisions;
+	// The identity page survives its control log.
+	let dir = TempDir::new("adr0104-no-log");
+	let store = open_store(&dir, new).await.unwrap();
+	store.write_identity(IDENTITY).await.unwrap();
+	drop(store);
+	for segment in discover_all_wal_segments(
+		&crate::storage::BlockingFileOps,
+		&dir.to_path_buf().join("control.wal"),
+	)
+	.await
+	.unwrap()
+	{
+		std::fs::remove_file(segment.path).unwrap();
+	}
+	let before = file_bytes(&dir);
+	refused_as(open_store(&dir, new).await, "RaftLogMissing");
+	assert_eq!(file_bytes(&dir), before);
+
+	// Control state survives its identity page.
+	let dir = TempDir::new("adr0104-no-page");
+	let mut store = open_store(&dir, new).await.unwrap();
+	store.write_identity(IDENTITY).await.unwrap();
+	store
+		.blocking_append(vec![blank(0), blank(1)])
+		.await
+		.unwrap();
+	drop(store);
+	std::fs::remove_file(dir.to_path_buf().join("vote.wnd")).unwrap();
+	let before = file_bytes(&dir);
+	refused_as(open_store(&dir, new).await, "RaftIdentityMissing");
+	assert_eq!(file_bytes(&dir), before);
+
+	// A holder alone (a crash before the birth page) is a fresh store.
+	let dir = TempDir::new("adr0104-holder-only");
+	drop(open_store(&dir, new).await.unwrap());
+	std::fs::remove_file(dir.to_path_buf().join("vote.wnd")).unwrap();
+	let store = open_store(&dir, new).await.unwrap();
+	assert!(store.is_pristine().await);
+	assert!(store.birth().await.is_some());
+}
+
+// ============================================================
+//  ADR 0104 (wendelon), control 9: APPLIED BY SLOT, RAW LOG IDS
+// ============================================================
+
+use crate::consensus::decisions::instances::ALLOCATED_BASE;
+use crate::schema::secondary_index::SecondaryIndexState;
+use crate::schema::{IndexObjectId, NodeId};
+use openraft::storage::RaftStateMachine;
+
+const APPLIED: u64 = 10;
+/// An allocated instance with no record.
+const UNRECORDED: u32 = ALLOCATED_BASE + 1;
+
+/// Slot 3 is being replaced by `ALLOCATED_BASE`, which the state records; one
+/// index has its backfill from slots 1, 2 and 3 and is still building, under
+/// voters that also named a fourth.
+fn replacing() -> (SmState, IndexObjectId) {
+	let mut state = fixture::reserved();
+	let index = crate::schema::SecondaryIndexDescriptor::for_table_column(
+		IndexObjectId::new([0x9f; 16]),
+		"by_v",
+		&fixture::fixture_table(),
+		"v",
+	)
+	.unwrap();
+	let id = index.index_object_id;
+	let schemas = state.table_schemas.clone();
+	state
+		.secondary_indexes
+		.create(fixture::TENANT, index, &schemas)
+		.unwrap();
+	for voter in 1..=3 {
+		state
+			.secondary_indexes
+			.mark_backfill_complete(
+				fixture::TENANT,
+				id,
+				NodeId {
+					id: voter,
+					_reserved: 0,
+				},
+				&[1, 2, 3, 4].into_iter().collect(),
+			)
+			.unwrap();
+	}
+	state.last_applied_log_id = Some(LogId::new(openraft::CommittedLeaderId::new(1, 1), APPLIED));
+	assert!(!ready(&state, id));
+	(state, id)
+}
+
+fn ready(state: &SmState, id: IndexObjectId) -> bool {
+	state
+		.secondary_indexes
+		.for_tenant(fixture::TENANT)
+		.iter()
+		.any(|row| row.descriptor.index_object_id == id && row.state == SecondaryIndexState::Ready)
+}
+
+/// A membership entry, appended by slot 1 in a later term than `authored`'s,
+/// whose voters are 1, 2 and `third`.
+fn membership(index: u64, third: u32) -> Entry<WendelonTypeConfig> {
+	let voters: BTreeSet<u32> = [1, 2, third].into_iter().collect();
+	let nodes: BTreeMap<u32, openraft::BasicNode> = voters
+		.iter()
+		.map(|id| {
+			(
+				*id,
+				openraft::BasicNode {
+					addr: format!("127.0.0.1:{}", 7000 + u64::from(*id)),
+				},
+			)
+		})
+		.collect();
+	Entry {
+		log_id: LogId::new(openraft::CommittedLeaderId::new(3, 1), index),
+		payload: EntryPayload::Membership(openraft::Membership::new(vec![voters], nodes)),
+	}
+}
+
+/// An entry appended by `author`: slot 1's registration, which
+/// ParentDecisions judges by the node it names, whoever appends it.
+fn authored(index: u64, author: u32) -> Entry<WendelonTypeConfig> {
+	Entry {
+		log_id: LogId::new(openraft::CommittedLeaderId::new(2, author), index),
+		payload: EntryPayload::Normal(WendelonRequest::RegisterIncarnation(
+			crate::consensus::RegisterIncarnation {
+				node: 1,
+				incarnation: fixture::inc(1),
+				supersedes: None,
+			},
+		)),
+	}
+}
+
+/// Recovery's replay of `entries` over a snapshot of `state`.
+fn recovered(state: SmState, entries: Vec<Entry<WendelonTypeConfig>>) -> std::io::Result<SmInner> {
+	let last = state.last_applied_log_id;
+	let commit = entries.last().map_or(APPLIED, |entry| entry.log_id.index);
+	recover_sm_inner(
+		DecisionMode::ParentDecisions,
+		Some(LoadedSnapshot {
+			last_included: last,
+			held: HeldSnapshot {
+				meta: openraft::SnapshotMeta {
+					last_log_id: last,
+					last_membership: state.last_membership.clone(),
+					snapshot_id: "adr0104-control-9".into(),
+				},
+				path: PathBuf::new(),
+			},
+			state,
+			artifact_hash: [0; 32],
+			artifact_bytes: 0,
+		}),
+		entries,
+		Some(RecoveryCheckpoint {
+			commit_index: commit,
+			e_safe_index: commit,
+		}),
+	)
+}
+
+/// A live state machine holding `state`.
+async fn live(state: SmState) -> WendelonStateMachine {
+	let machine = WendelonStateMachine::new();
+	machine.seed_complete_snapshot_state_for_test(state).await;
+	machine
+}
+
+/// An entry appended by a recorded allocated instance, and a membership naming
+/// it, are applied as its slot at replay and at live apply alike: the index
+/// whose backfill slots 1, 2 and 3 completed is promoted by voters 1, 2 and the
+/// replacement. The log ids and the membership keep the raw instance.
+#[tokio::test]
+async fn a_recorded_instance_is_applied_as_its_slot_with_its_raw_log_id_kept() {
+	let (state, index) = replacing();
+	let entries = vec![
+		authored(APPLIED + 1, ALLOCATED_BASE),
+		membership(APPLIED + 2, ALLOCATED_BASE),
+	];
+	let raw_voters: BTreeSet<u32> = [1, 2, ALLOCATED_BASE].into_iter().collect();
+
+	let replayed = recovered(state.clone(), entries.clone()).unwrap().state;
+	let mut machine = live(state.clone()).await;
+	RaftStateMachine::apply(&mut machine, entries.clone())
+		.await
+		.unwrap();
+	let applied = machine.state_snapshot().await;
+	for (what, result) in [("replay", &replayed), ("live apply", &applied)] {
+		assert_eq!(
+			result.last_applied_log_id,
+			Some(entries[1].log_id),
+			"{what}"
+		);
+		assert_eq!(
+			result.last_membership.log_id(),
+			&Some(entries[1].log_id),
+			"{what}"
+		);
+		assert_eq!(
+			result
+				.last_membership
+				.membership()
+				.voter_ids()
+				.collect::<BTreeSet<_>>(),
+			raw_voters,
+			"{what}: the membership keeps the raw instance"
+		);
+		assert!(ready(result, index), "{what}: voters counted by slot");
+	}
+	// The discriminating case: a third voter that is not slot 3 promotes nothing.
+	let other = recovered(state, vec![membership(APPLIED + 1, 4)]).unwrap();
+	assert!(!ready(&other.state, index));
+}
+
+/// An allocated instance with no record, as an entry's author or as a voter,
+/// stops replay (the open fails) and live apply (a state machine error), and
+/// changes nothing.
+#[tokio::test]
+async fn an_unrecorded_instance_stops_replay_and_live_apply_and_changes_nothing() {
+	let (state, index) = replacing();
+	for entry in [
+		authored(APPLIED + 1, UNRECORDED),
+		membership(APPLIED + 1, UNRECORDED),
+	] {
+		let error = recovered(state.clone(), vec![entry.clone()])
+			.err()
+			.expect("replay stops");
+		assert_eq!(error.kind(), ErrorKind::InvalidData, "{error}");
+		assert!(
+			error
+				.to_string()
+				.contains(&format!("Raft instance {UNRECORDED} has no recorded slot")),
+			"{error}"
+		);
+		let mut machine = live(state.clone()).await;
+		let error = RaftStateMachine::apply(&mut machine, vec![entry])
+			.await
+			.err()
+			.expect("live apply stops");
+		assert!(
+			error.to_string().contains("has no recorded slot"),
+			"{error}"
+		);
+		let after = machine.state_snapshot().await;
+		assert_eq!(after.last_applied_log_id, state.last_applied_log_id);
+		assert_eq!(after.last_membership, state.last_membership);
+		assert!(!ready(&after, index));
+	}
 }

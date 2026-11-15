@@ -11,6 +11,7 @@
 //! reviews/member-replacement-20261115/DC243-RED-AND-FIX-DESIGN-12.md.
 
 use super::*;
+use crate::consensus::raft_network::RaftRoute;
 use crate::network::core::{HRFT_MAGIC, read_frame, write_frame};
 use crate::network::tls::{ActorIdentity, ActorRole};
 use crate::network::transport::TransportProvider;
@@ -19,8 +20,23 @@ use openraft::raft::{AppendEntriesRequest, InstallSnapshotRequest, VoteRequest};
 
 const TIER: TransportTier = TransportTier::QuicIoUring;
 
-/// The three Raft request kinds, each naming `sender` as its candidate or leader, at term 0.
-fn requests(sender: u32) -> Vec<(MsgType, Vec<u8>)> {
+/// ADR 0104 (wendelon): a ParentDecisions request's body is its route, then the request.
+fn routed<T: serde::Serialize>(route: RaftRoute, request: &T) -> Vec<u8> {
+	crate::network::wire::encode(&(route, request)).unwrap()
+}
+
+/// A route from `slot`'s instance of the same id to `target`'s.
+fn route(slot: u32, target: u32) -> RaftRoute {
+	RaftRoute {
+		sender_instance: slot,
+		sender_slot: slot,
+		target_instance: target,
+	}
+}
+
+/// The three Raft request kinds under `route`, each naming `sender` as its candidate or
+/// leader, at term 0.
+fn requests(route: RaftRoute, sender: u32) -> Vec<(MsgType, Vec<u8>)> {
 	let vote = openraft::Vote::new(0, sender);
 	let append: AppendEntriesRequest<crate::consensus::WendelonTypeConfig> = AppendEntriesRequest {
 		vote,
@@ -43,16 +59,10 @@ fn requests(sender: u32) -> Vec<(MsgType, Vec<u8>)> {
 	vec![
 		(
 			MsgType::VOTE_REQ,
-			crate::network::wire::encode(&VoteRequest::new(vote, None)).unwrap(),
+			routed(route, &VoteRequest::<u32>::new(vote, None)),
 		),
-		(
-			MsgType::APPEND_ENTRIES_REQ,
-			crate::network::wire::encode(&append).unwrap(),
-		),
-		(
-			MsgType::INSTALL_SNAPSHOT_REQ,
-			crate::network::wire::encode(&snapshot).unwrap(),
-		),
+		(MsgType::APPEND_ENTRIES_REQ, routed(route, &append)),
+		(MsgType::INSTALL_SNAPSHOT_REQ, routed(route, &snapshot)),
 	]
 }
 
@@ -141,7 +151,7 @@ async fn only_a_cluster_node_naming_itself_reaches_the_raft_handler() {
 		.find(|id| **id != target && **id != other)
 		.unwrap();
 	let mut admitted = Vec::new();
-	for (msg_type, meta) in requests(other) {
+	for (msg_type, meta) in requests(route(other, target), other) {
 		// A tenant-scoped storage identity naming a member as the sender.
 		let answer = offer(
 			&cluster,
@@ -180,7 +190,7 @@ async fn only_a_cluster_node_naming_itself_reaches_the_raft_handler() {
 	}
 	// Control: a cluster node naming itself reaches the handler (a protocol refusal of
 	// term 0 is an answer, not an authorization failure).
-	for (msg_type, meta) in requests(other) {
+	for (msg_type, meta) in requests(route(other, target), other) {
 		let answer = offer(&cluster, other, None, target, msg_type, &meta).await;
 		eprintln!("DC243 node-{other}-as-itself {msg_type:?} -> {answer:?}");
 		assert!(
@@ -232,7 +242,7 @@ async fn a_refused_append_entries_leaves_no_hlc_trace() {
 		entries: vec![entry],
 		leader_commit: None,
 	};
-	let meta = crate::network::wire::encode(&append).unwrap();
+	let meta = routed(route(other, target), &append);
 	let marked = crate::schema::NodeId {
 		id: MARKED,
 		_reserved: 0,
@@ -270,4 +280,62 @@ async fn a_refused_append_entries_leaves_no_hlc_trace() {
 		Some(4242),
 		"the admitted request's entry is harvested"
 	);
+}
+
+/// ADR 0104 (wendelon): a request is applied only by the instance it is addressed to, from
+/// the authenticated slot whose instance its vote names; membership is not consulted, so a
+/// sender this receiver has never heard of is still answered. A refusal ends the stream
+/// promptly, with no response frame.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_request_reaches_only_its_target_instance_from_the_instance_its_vote_names() {
+	use crate::consensus::decisions::instances::ALLOCATED_BASE;
+	let (cluster, leader, _descriptor) = ready().await;
+	let target = *NODES.iter().find(|id| **id != leader).unwrap();
+	let other = *NODES.iter().find(|id| **id != target).unwrap();
+	let cases: [(&str, RaftRoute, u32, bool); 4] = [
+		(
+			"addressed to another instance of the target's slot",
+			RaftRoute {
+				target_instance: ALLOCATED_BASE,
+				..route(other, target)
+			},
+			other,
+			false,
+		),
+		(
+			"its route names another instance than its vote",
+			RaftRoute {
+				sender_instance: ALLOCATED_BASE,
+				..route(other, target)
+			},
+			other,
+			false,
+		),
+		(
+			"an instance this receiver never heard of, from its authenticated slot",
+			RaftRoute {
+				sender_instance: ALLOCATED_BASE,
+				..route(other, target)
+			},
+			ALLOCATED_BASE,
+			true,
+		),
+		("the control: as itself", route(other, target), other, true),
+	];
+	for (what, route, vote, answered) in cases {
+		for (msg_type, meta) in requests(route, vote) {
+			let started = std::time::Instant::now();
+			let answer = offer(&cluster, other, None, target, msg_type, &meta).await;
+			assert_eq!(
+				answer.is_some(),
+				answered,
+				"{what}: {msg_type:?} -> {answer:?}"
+			);
+			assert!(
+				started.elapsed() < std::time::Duration::from_secs(1),
+				"{what}: {msg_type:?} took {:?}",
+				started.elapsed()
+			);
+		}
+	}
 }

@@ -55,6 +55,10 @@ fn member(id: u32) -> (crate::test_support::TestDir, NodeBootstrapConfig) {
 		);
 	}
 	cfg.decision_mode = crate::consensus::decision_mode::DecisionMode::ParentDecisions;
+	// ADR 0104 (wendelon): the forming member's one permission to form.
+	if id == NODES[0] {
+		crate::node::provision_formation_intent(&cfg.data_dir).unwrap();
+	}
 	(dir, cfg)
 }
 
@@ -6760,6 +6764,13 @@ mod primary_down;
 /// ADR 0729: the public client when a hinted node does not answer.
 #[path = "parent_decisions_cluster_tests/client_route.rs"]
 mod client_route;
+
+/// ADR 0104 (wendelon): a control-only member without a slab manager.
+#[path = "parent_decisions_cluster_tests/control_only.rs"]
+mod control_only;
+/// ADR 0104 (wendelon): a lost voter replaced by a new Raft instance.
+#[path = "parent_decisions_cluster_tests/replacement_tests.rs"]
+mod replacement;
 
 // ============================================================
 //  ADR 0720: MEMBERSHIP IS FIXED ONCE A WRITE IS ADMITTED

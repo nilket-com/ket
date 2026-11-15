@@ -1284,6 +1284,17 @@ impl Clone for WendelonDataServer {
 }
 
 impl WendelonDataServer {
+	/// ADR 0104 (wendelon): the current leader as a dialable slot; this node's
+	/// own slot only when the leader is this very Raft instance.
+	pub(crate) async fn leader_slot(&self) -> Option<u32> {
+		crate::consensus::decisions::instances::leader_slot(
+			&self.raft,
+			&self.state_machine,
+			self.local_node.id,
+		)
+		.await
+	}
+
 	fn admission_snapshot(&self) -> Arc<AdmissionSnapshot> {
 		self.admission_snapshot_rx.borrow().clone()
 	}
@@ -1302,7 +1313,7 @@ impl WendelonDataServer {
 				),
 			));
 		}
-		if self.raft.current_leader().await != Some(request.coordinator.id) {
+		if self.leader_slot().await != Some(request.coordinator.id) {
 			return Err(Error::new(
 				ErrorKind::PermissionDenied,
 				"drop reclaim slice coordinator is not the current Raft leader",
@@ -1445,7 +1456,7 @@ impl WendelonDataServer {
 		progress.examined_total = progress
 			.examined_total
 			.saturating_add(u64::try_from(examined).unwrap_or(u64::MAX));
-		if self.raft.current_leader().await != Some(request.coordinator.id) {
+		if self.leader_slot().await != Some(request.coordinator.id) {
 			return Err(Error::new(
 				ErrorKind::PermissionDenied,
 				"drop reclaim leadership changed before progress persistence",
@@ -2523,8 +2534,7 @@ impl WendelonDataServer {
 		meta: &WriteRequestMeta,
 	) -> (WriteResponseMeta, Option<FinalizationMarker>) {
 		let leader_hint = self
-			.raft
-			.current_leader()
+			.leader_slot()
 			.await
 			.map(|id| NodeId { id, _reserved: 0 })
 			.unwrap_or(self.local_node);
@@ -2987,7 +2997,7 @@ impl WendelonDataServer {
 				"a legacy pending finalization is not executed under ParentDecisions",
 			));
 		}
-		if self.raft.current_leader().await != Some(self.local_node.id) {
+		if self.leader_slot().await != Some(self.local_node.id) {
 			return Err(Error::new(
 				ErrorKind::WouldBlock,
 				"pending finalization is waiting for local leadership",
@@ -3140,8 +3150,7 @@ impl WendelonDataServer {
 					return Err(Error::other("pending replay tenant invariant violated"));
 				}
 				if let Some(leader_hint) = self
-					.raft
-					.current_leader()
+					.leader_slot()
 					.await
 					.map(|id| NodeId { id, _reserved: 0 })
 				{
@@ -3168,8 +3177,7 @@ impl WendelonDataServer {
 							"duplicate replay failed to reconcile pending finalization; returning retryable pending status"
 						);
 						if let Some(leader_hint) = self
-							.raft
-							.current_leader()
+							.leader_slot()
 							.await
 							.map(|id| NodeId { id, _reserved: 0 })
 						{
@@ -3345,7 +3353,7 @@ impl WendelonDataServer {
 
 	pub(crate) async fn reconcile_drop_reclaim_once(&self) -> std::io::Result<bool> {
 		self.refresh_table_drop_l2_deferral_gauge().await?;
-		if self.raft.current_leader().await != Some(self.local_node.id) {
+		if self.leader_slot().await != Some(self.local_node.id) {
 			return Ok(false);
 		}
 		let state = self.state_machine.state_snapshot().await;
@@ -3372,7 +3380,7 @@ impl WendelonDataServer {
 		};
 		let mut all_done = true;
 		for participant in debt.participants.iter() {
-			if self.raft.current_leader().await != Some(self.local_node.id) {
+			if self.leader_slot().await != Some(self.local_node.id) {
 				return Err(Error::new(
 					ErrorKind::PermissionDenied,
 					"drop reclaim leadership changed during participant collection",
@@ -3822,7 +3830,7 @@ impl WendelonDataServer {
 		}
 
 		// Expiry before any target is attempted leaves the continuation as it was.
-		let Some(current_leader) = pass.bounded(self.raft.current_leader()).await else {
+		let Some(current_leader) = pass.bounded(self.leader_slot()).await else {
 			self.renewal_pass_expired(&pass, epoch, "reading the control leader", ranges.len());
 			return 0;
 		};
@@ -8171,7 +8179,7 @@ impl WendelonDataServer {
 				"a CDC heartbeat is not produced under ParentDecisions",
 			));
 		}
-		if self.raft.current_leader().await != Some(self.local_node.id) {
+		if self.leader_slot().await != Some(self.local_node.id) {
 			return Ok(());
 		}
 		let commit_hlc = self.merge_commit_hlc(HybridTimestamp {
@@ -9762,7 +9770,7 @@ impl WendelonDataServer {
 				));
 			}
 
-			let current_leader = self.raft.current_leader().await;
+			let current_leader = self.leader_slot().await;
 			if current_leader != Some(self.local_node.id) {
 				let mut response = self.table_delete_error_response(
 					&meta,

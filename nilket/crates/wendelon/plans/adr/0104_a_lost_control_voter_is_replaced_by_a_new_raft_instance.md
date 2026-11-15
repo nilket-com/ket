@@ -204,3 +204,58 @@ The PD vote page (`vote.wnd`, one O_DIRECT page, rewritten in place, fdatasync b
 - Cancel or abandon.
 - Address change.
 - DC-243 step 2.
+
+## As built
+- **Where it lives.**
+  - `consensus/decisions/instances.rs`: ids, allocator, records, the grant, begin and complete reducers, `slot_of`, `leader_slot`.
+  - The PD vote page in `raft_storage.rs` (`StoredPage`, `check_identity_page`, `write_identity`, `peek_identity`).
+  - The route in `raft_network.rs` (`RaftRoute`, `InstanceRouting`) and its admission in `raft_server.rs` (`admit_routed`).
+  - `node/instance_startup.rs` (provisioning files, `establish_identity`, the grant client).
+  - `node/control_only_node.rs` (`ControlOnlyNode`; the daemon dispatches a control-only directory to it).
+  - `MaintenanceProposals::replacement_step`, the controller in `decision_proposals.rs`, run in the leader's decision maintenance.
+  - The administrative route (`BeginReplacement`, `GetReplacement`; `AdministrativeAction::ReplaceMember`) and `nilket wendelon replace begin|status|provision`.
+- **Freshness.** An identity alone does not end a store's freshness: `FreshBootstrap` still means "no vote and no log state".
+  - The identity write sits just before the Raft object is built, after the existing interrupted-first-creation recovery, which needs a pristine control store.
+  - An identified store with no Raft-durable state resumes under its recorded identity and is never granted another.
+  - A vote with an empty log is Recovery, with its page untouched.
+- **Promotion threshold.** It is derived, not recorded: while the reserved learner is present, the applied membership's log id is the entry that added it. A sealed store has no other membership change. There is no `add_index` field.
+- **Grant route.** A grant is never forwarded: the leader authenticates the slot of whoever dials it. The fresh store asks its seeds, and a non-leader answers with the leader's slot and address.
+- **PD join.** It requires the recorded Join grant of its slot.
+- **Leadership checks.** "Am I the leader" compares the leader instance with the Raft object's own id. A leader hint is the leader's slot. Another instance of this node's own slot is no known leader. The readiness snapshot still reports the leader's raw instance.
+  - A leader below 2^31 is its own slot, so its lookup reads no replicated state. Only an allocated instance takes the state machine's read lock, so the request paths' many leader lookups do not compete for it with the lease renewal pass.
+- **Application authority.**
+  - Applied entries are judged by their author's slot. The WAL header keeps the raw instance.
+  - Secondary-index readiness, the secondary-index replica set and the decision clock gate count voters by slot.
+  - Joins and the control-ring backup manifest keep Raft ids.
+- **Placement inside the reducer.** The reducer holds the decision state apart from the state machine while it applies. Placement inside it (takeover, reserve) therefore takes the decision state explicitly. Without that, every takeover and reservation was refused `MembershipSealed` from the learner's arrival on (found by the in-process replacement test; covered by a reducer-path control).
+- **Limits found while building.**
+  - A control-only member sends no decision clock samples. A decision is admitted only while the leader holds fresh samples from enough other full voters. With one full survivor and the replacement alone, decisions are refused `ClockUnhealthy` until a second full member returns.
+  - Ranges the lost slot coordinated move by the existing takeover once its leases lapse. The replacement holds none.
+- **The administrative answers.**
+  - Backup answers keep the extension ADR 0736 shipped, byte for byte, in both directions.
+  - A replacement answer (`BeginReplacement`, `GetReplacement`) carries a separate `ReplacementAdminExtensionWire`. It is decoded only by a caller that sent a replacement request (`decode_replacement_admin_answer`).
+- **Bounded grant.**
+  - A fresh store's grant request has one absolute deadline (10 s) over every attempt, with its dial, request and answer. Each attempt is also cut at 3 s, so a silent seed does not keep the others from being asked.
+  - An answer completing after the deadline, a grant included, is not taken.
+  - Running out of time is an unknown outcome, never a refusal. The store keeps its birth, and its next start asks again under it, which the leader answers with the instance already granted to that birth.
+- **The operator's command.**
+  - `replace begin` writes and flushes the token, and the commands that name the replacement again, before it sends anything. A token it cannot write is not submitted.
+  - Each `begin` or `status` exchange is bounded at 30 s, connection setup included. Only a definite refusal is reported as one; anything else is an unknown outcome that names the retry (`begin` with the same token is answered with the recorded replacement) and the status read.
+  - The report line has a fixed form: `replacement <token>: slot <n> replacing instance <n>: begun | reserved <n> | done <n>`.
+- **Controls added after source review.**
+  - A swap stopped after its joint configuration resumes to its target. The leader is cut off and its next append fails as it applies the joint entry, so no log holds the uniform step. The leader returns, and its controller completes the swap and records Done.
+  - At replay and at live apply, an entry by a recorded allocated instance is applied as its slot with its raw log id kept, and an unrecorded one stops both and changes nothing.
+  - The grant and command bounds are exercised over the real client, against a dial that never completes, a request never answered, and an answer after the deadline.
+- **Concurrency record, DC-244 (open, parallel-only, unattributed).**
+  - In the in-process ParentDecisions cluster module under its default parallelism, two takeover-type tests failed only while this ADR's added tests ran beside them:
+    - `primary_down::a_replica_takes_the_range_of_a_stopped_primary_and_its_write_commits`: whole-lib run, then 1 of 3 loaded module runs; 5 of 5 alone passed;
+    - `a_held_replica_leaves_a_quorum_that_commits_after_its_deadline`: its first attempt was durably `WRITE_REFUSED`; 1 of 5 loaded runs.
+  - The selections, on bigfoot:
+
+    | Tree | Tests | Failed runs |
+    |---|---|---|
+    | base 71f4d345c | 103 | 0 of 5 |
+    | candidate, with this ADR's tests | 107 | 2 of 8 |
+    | candidate, the same 103 tests as base | 103 | 0 of 5 |
+
+  - That 0 of 5 does not exonerate the added concurrent work. The cause is not established, the lock-free leader lookup is not claimed as its fix, and the defect stays open.

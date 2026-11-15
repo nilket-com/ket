@@ -439,6 +439,10 @@ struct LogStoreInner {
 	/// Cached vote. Written to `vote_file` on `save_vote`; surfaced
 	/// verbatim by `read_vote`.
 	vote: Option<Vote<u32>>,
+	/// ADR 0104 (wendelon): a ParentDecisions store's birth and identity,
+	/// written in the same page as its vote. `None` for Today and for the
+	/// in-memory store.
+	page: Option<PageHead>,
 	/// Filesystem paths for the durable Control Ring artifacts.
 	/// Absent for the in-memory test store.
 	artifact_paths: Option<ControlArtifactPaths>,
@@ -569,9 +573,20 @@ pub struct WendelonLogStore {
 	#[cfg(test)]
 	backup_after_wal_read_hold:
 		Arc<std::sync::Mutex<Option<(Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>>>,
+	/// Test-only: while set, every append fails and poisons this store, as a
+	/// failed WAL write does.
+	#[cfg(test)]
+	fail_appends: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl WendelonLogStore {
+	/// Test-only: the switch that makes every later append of this store (and
+	/// of its clones) fail, poisoning it, as a failed WAL write does.
+	#[cfg(test)]
+	pub(crate) fn fail_appends_for_test(&self) -> Arc<std::sync::atomic::AtomicBool> {
+		self.fail_appends.clone()
+	}
+
 	#[cfg(test)]
 	pub(crate) fn pause_backup_after_wal_read_for_test(
 		&self,
@@ -593,6 +608,7 @@ impl WendelonLogStore {
 				last_log_id: None,
 				last_purged: None,
 				vote: None,
+				page: None,
 				artifact_paths: None,
 				recovered_snapshot: None,
 				recovery_checkpoint: None,
@@ -614,6 +630,8 @@ impl WendelonLogStore {
 			_directory_owner: None,
 			#[cfg(test)]
 			backup_after_wal_read_hold: Default::default(),
+			#[cfg(test)]
+			fail_appends: Default::default(),
 			recovered_artifact_hash: None,
 		}
 	}
@@ -829,7 +847,6 @@ impl WendelonLogStore {
 			)
 			.map_err(RetentionStartError::into_io)?;
 		}
-		let vote = load_vote_state(file_ops.as_ref(), vote_path).await?;
 		let snapshot =
 			load_snapshot_artifact(file_ops.as_ref(), snapshot_path, options.decision_mode).await?;
 		let replay = replay_wal(
@@ -839,17 +856,33 @@ impl WendelonLogStore {
 			options.decision_mode,
 		)
 		.await?;
+		// After the log's own authority check, so the other authority's store is
+		// refused by its records before its vote page is read.
+		let (vote, page) =
+			load_vote_state(file_ops.as_ref(), vote_path, options.decision_mode).await?;
 		let mut replay = replay;
-		if options.decision_mode != DecisionMode::Today
-			&& !artifacts.vote
-			&& !artifacts.snapshot
-			&& replay.entries.is_empty()
-			&& replay.last_purged.is_none()
-			&& replay
+		let log_state = artifacts.snapshot
+			|| !replay.entries.is_empty()
+			|| replay.last_purged.is_some()
+			|| replay
 				.checkpoint
-				.is_none_or(|checkpoint| checkpoint.commit_index == 0)
-		{
-			bootstrap_mode = DurableBootstrapMode::FreshBootstrap;
+				.is_some_and(|checkpoint| checkpoint.commit_index != 0);
+		// ADR 0104 (wendelon): a ParentDecisions store's identity lives in its
+		// vote page, which its holder precedes. Known loss fails closed; a store
+		// whose page holds no identity yet (born) is still fresh.
+		if options.decision_mode != DecisionMode::Today {
+			check_identity_page(
+				page.as_ref(),
+				vote.as_ref(),
+				artifacts.wal,
+				log_state,
+				vote_path,
+			)?;
+			// Fresh while nothing Raft-durable exists: no vote and no log state. An
+			// identity alone does not end freshness; it fixes who resumes.
+			if vote.is_none() && !log_state {
+				bootstrap_mode = DurableBootstrapMode::FreshBootstrap;
+			}
 		}
 		let recovery_committed =
 			resolve_recovered_committed(snapshot.as_ref(), &replay.entries, replay.checkpoint)?;
@@ -933,6 +966,20 @@ impl WendelonLogStore {
 			options.decision_mode.bind_store(data_dir)?;
 		}
 		let vote_file = open_control_artifact(file_ops.as_ref(), vote_path).await?;
+		// ADR 0104 (wendelon): a ParentDecisions store is born here, after its
+		// holder and marker: the first page write is its birth.
+		let page = match (options.decision_mode, page) {
+			(DecisionMode::Today, _) => None,
+			(_, Some(page)) => Some(page),
+			(_, None) => {
+				let page = PageHead {
+					birth: new_birth()?,
+					identity: None,
+				};
+				write_page(file_ops.as_ref(), &vote_file, &page, None).await?;
+				Some(page)
+			}
+		};
 		let wal_cursor = replay
 			.wal_segments
 			.last()
@@ -951,6 +998,7 @@ impl WendelonLogStore {
 				last_log_id: replay.last_log_id,
 				last_purged: replay.last_purged,
 				vote,
+				page,
 				artifact_paths: Some(artifact_paths),
 				recovered_snapshot: snapshot,
 				recovery_checkpoint: replay.checkpoint,
@@ -974,6 +1022,8 @@ impl WendelonLogStore {
 			_directory_owner: owner,
 			#[cfg(test)]
 			backup_after_wal_read_hold: Default::default(),
+			#[cfg(test)]
+			fail_appends: Default::default(),
 		};
 		metrics().set_control_wal_store_poisoned(false);
 		// Log the validated durable snapshot covers, kept by a purge that ran before it was
@@ -1113,6 +1163,56 @@ impl WendelonLogStore {
 		self.inner.read().await.recovery_checkpoint
 	}
 
+	/// ADR 0104 (wendelon): this ParentDecisions store's birth; `None` for
+	/// Today and the in-memory store.
+	pub(crate) async fn birth(&self) -> Option<crate::consensus::decisions::instances::Birth> {
+		self.inner.read().await.page.map(|page| page.birth)
+	}
+
+	/// ADR 0104 (wendelon): this ParentDecisions store's durable identity.
+	pub(crate) async fn identity(
+		&self,
+	) -> Option<crate::consensus::decisions::instances::RaftIdentity> {
+		self.inner.read().await.page.and_then(|page| page.identity)
+	}
+
+	/// ADR 0104 (wendelon): the store's first durable identity write, before any
+	/// Raft object exists for it. Written once: the same identity again is a
+	/// no-op, another is refused. The page's vote is kept as it is.
+	pub(crate) async fn write_identity(
+		&self,
+		identity: crate::consensus::decisions::instances::RaftIdentity,
+	) -> std::io::Result<()> {
+		let mut guard = self.inner.write().await;
+		let Some(page) = guard.page else {
+			return Err(Error::new(
+				ErrorKind::Unsupported,
+				"only a durable ParentDecisions store holds an identity",
+			));
+		};
+		match page.identity {
+			Some(existing) if existing == identity => return Ok(()),
+			Some(existing) => {
+				return Err(Error::new(
+					ErrorKind::AlreadyExists,
+					format!("this store's identity is {existing:?}; it is never rewritten"),
+				));
+			}
+			None => {}
+		}
+		let (Some(file_ops), Some(vote_file)) = (guard.file_ops.clone(), guard.vote_file.clone())
+		else {
+			return Err(Error::other("the store has no vote page"));
+		};
+		let next = PageHead {
+			birth: page.birth,
+			identity: Some(identity),
+		};
+		write_page(file_ops.as_ref(), &vote_file, &next, guard.vote).await?;
+		guard.page = Some(next);
+		Ok(())
+	}
+
 	/// True only when nothing has ever been made durable here: no vote, no
 	/// retained or purged log position, no entry, no snapshot, no checkpoint
 	/// and no committed pointer. Empty artifacts that a bootstrap created and
@@ -1123,6 +1223,8 @@ impl WendelonLogStore {
 		// carries no state; a store holding only it is still pristine.
 		let holder_only = self.decision_mode != DecisionMode::Today
 			&& inner.recovery_checkpoint == Some(RecoveryCheckpoint::default());
+		// ADR 0104 (wendelon): an identity alone made no Raft obligation durable;
+		// the store resumes under it and is never granted another.
 		inner.vote.is_none()
 			&& inner.last_log_id.is_none()
 			&& inner.last_purged.is_none()
@@ -1773,16 +1875,23 @@ impl RaftLogStorage<WendelonTypeConfig> for WendelonLogStore {
 	}
 
 	async fn save_vote(&mut self, vote: &Vote<u32>) -> Result<(), StorageError<u32>> {
-		let (file_ops, vote_file) = {
+		let (file_ops, vote_file, page) = {
 			let mut guard = self.inner.write().await;
 			guard.vote = Some(*vote);
-			(guard.file_ops.clone(), guard.vote_file.clone())
+			(guard.file_ops.clone(), guard.vote_file.clone(), guard.page)
 		};
 
 		let (Some(file_ops), Some(vote_file)) = (file_ops, vote_file) else {
 			// In-memory mode — caller accepted non-durable vote.
 			return Ok(());
 		};
+		// ADR 0104 (wendelon): a ParentDecisions vote is rewritten together with
+		// the store's birth and identity, in one page.
+		if let Some(page) = page {
+			return write_page(file_ops.as_ref(), &vote_file, &page, Some(*vote))
+				.await
+				.map_err(|e| StorageIOError::write_vote(AnyError::new(&e)).into());
+		}
 
 		let mut buf = AlignedBuf::new(DIRECT_IO_ALIGN);
 		let encoded_len = postcard::experimental::serialized_size(vote).map_err(|e| {
@@ -1888,6 +1997,18 @@ impl RaftLogStorage<WendelonTypeConfig> for WendelonLogStore {
 		}
 
 		let _gate = self.wal_gate.lock().await;
+		#[cfg(test)]
+		if self.fail_appends.load(std::sync::atomic::Ordering::SeqCst) {
+			let err = self
+				.poison(
+					"append",
+					"test-fault",
+					Error::other("an append failed for the test"),
+				)
+				.await;
+			callback.log_io_completed(Err(Error::new(err.kind(), err.to_string())));
+			return Err(StorageIOError::write_logs(AnyError::new(&err)).into());
+		}
 		let (
 			file_ops,
 			artifact_paths,
@@ -3672,6 +3793,11 @@ struct SnapshotRuntime {
 	/// is delivered (ADR 0726).
 	#[cfg(test)]
 	after_state_publication: Arc<std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>>,
+	/// Test-only, this state machine's own: runs once, with the entry's log
+	/// id, right after live apply of the next joint membership and before the
+	/// apply answers, so before the leader proposes the uniform step.
+	#[cfg(test)]
+	after_joint_membership: Arc<std::sync::Mutex<Option<Box<dyn FnOnce(LogId<u32>) + Send>>>>,
 }
 
 impl SnapshotRuntime {
@@ -3691,6 +3817,8 @@ impl SnapshotRuntime {
 			install_after_publication_hold: Arc::new(std::sync::Mutex::new(None)),
 			#[cfg(test)]
 			after_state_publication: Arc::new(std::sync::Mutex::new(None)),
+			#[cfg(test)]
+			after_joint_membership: Arc::new(std::sync::Mutex::new(None)),
 		}
 	}
 
@@ -4181,7 +4309,8 @@ fn recover_sm_inner(
 		if entry.log_id.index > apply_upto {
 			break;
 		}
-		apply_entry_to_state(&mut inner.state, &entry);
+		apply_entry_to_state(&mut inner.state, &entry)
+			.map_err(|unknown| Error::new(ErrorKind::InvalidData, unknown.to_string()))?;
 		inner.state.last_applied_log_id = Some(match inner.state.last_applied_log_id {
 			Some(prev) if prev > entry.log_id => prev,
 			_ => entry.log_id,
@@ -4248,6 +4377,17 @@ impl WendelonStateMachine {
 	/// Runs `hook` once on this state machine: right after its next installed
 	/// snapshot's state is published and before that state's key authority is
 	/// delivered. No other state machine's installation runs it.
+	/// Runs `hook` once, with the entry's log id, right after this state
+	/// machine's live apply of its next joint membership entry, before that
+	/// apply answers.
+	#[cfg(test)]
+	pub(crate) fn on_next_joint_membership_for_test(
+		&self,
+		hook: Box<dyn FnOnce(LogId<u32>) + Send>,
+	) {
+		*self.snapshot_runtime.after_joint_membership.lock().unwrap() = Some(hook);
+	}
+
 	#[cfg(test)]
 	pub(crate) fn on_next_state_publication_for_test(&self, hook: Box<dyn FnOnce() + Send>) {
 		*self
@@ -4807,11 +4947,21 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 					))
 					.into());
 				}
+				// ADR 0104 (wendelon): application authority is the author's slot,
+				// mapped at apply time. An allocated author with no record cannot be
+				// interpreted: the store stops here, it never guesses.
+				let author = crate::consensus::decisions::instances::slot_of(
+					&guard.state,
+					entry.log_id.leader_id.node_id,
+				)
+				.map_err(|unknown| {
+					StorageIOError::write_state_machine(AnyError::error(unknown.to_string()))
+				})?;
 				// Owner admission runs before the pre-hook: a retirement the
 				// state machine will refuse must have no local effect.
 				if let EntryPayload::Normal(request) = &entry.payload
 					&& let Some((slab, registry)) =
-						admitted_retirement(&guard.state, request, entry.log_id.leader_id.node_id)
+						admitted_retirement(&guard.state, request, author)
 					&& let Some(observer) = self.tier_observer.as_ref()
 				{
 					observer.before_slab_retired(slab, &registry, entry.log_id.index);
@@ -4839,7 +4989,22 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 				let schema_audit_context = schema_audit_context(&guard.state, &entry);
 				let mut index_schema_audit_context =
 					index_schema_audit_context(&guard.state, &entry);
-				let (resp, tier) = apply_entry_to_state(&mut guard.state, &entry);
+				let (resp, tier) =
+					apply_entry_to_state(&mut guard.state, &entry).map_err(|unknown| {
+						StorageIOError::write_state_machine(AnyError::error(unknown.to_string()))
+					})?;
+				#[cfg(test)]
+				if let EntryPayload::Membership(membership) = &entry.payload
+					&& membership.get_joint_config().len() > 1
+					&& let Some(hook) = self
+						.snapshot_runtime
+						.after_joint_membership
+						.lock()
+						.unwrap()
+						.take()
+				{
+					hook(entry.log_id);
+				}
 				// Live apply is the total Control Ring substrate numerator.
 				// Recovery and snapshot installation use separate paths and
 				// must not manufacture process-lifetime work (ADR 080).
@@ -5583,21 +5748,31 @@ fn apply_register_incarnation(
 /// lock. Tier observers do filesystem work (unlinking the L1 file);
 /// keeping them off the lock prevents any cross-node staleness on a
 /// busy apply batch.
+/// ADR 0104 (wendelon): the raw Raft identity stays in the log id; what the
+/// state machine applies is judged by slot. An allocated instance with no
+/// record is `UnknownInstance`, which stops apply and replay.
 fn apply_entry_to_state(
 	state: &mut SmState,
 	entry: &Entry<WendelonTypeConfig>,
-) -> (WendelonResponse, Option<TierObserverEvent>) {
-	match &entry.payload {
+) -> Result<
+	(WendelonResponse, Option<TierObserverEvent>),
+	crate::consensus::decisions::instances::UnknownInstance,
+> {
+	use crate::consensus::decisions::instances::slot_of;
+	Ok(match &entry.payload {
 		EntryPayload::Blank => (WendelonResponse::Success, None),
-		EntryPayload::Normal(req) => apply_request_at_log_index(
-			state,
-			req.clone(),
-			entry.log_id.index,
-			entry.log_id.leader_id.node_id,
-		),
+		EntryPayload::Normal(req) => {
+			let author = slot_of(state, entry.log_id.leader_id.node_id)?;
+			apply_request_at_log_index(state, req.clone(), entry.log_id.index, author)
+		}
 		EntryPayload::Membership(membership) => {
+			// Readiness counts slots: receipts are slot-keyed, and a replacement
+			// leaves the voters' slots unchanged.
+			let voters = membership
+				.voter_ids()
+				.map(|voter| slot_of(state, voter))
+				.collect::<Result<BTreeSet<_>, _>>()?;
 			state.last_membership = StoredMembership::new(Some(entry.log_id), membership.clone());
-			let voters = membership.voter_ids().collect::<BTreeSet<_>>();
 			for (tenant_id, table_object_id, index_object_id) in state
 				.secondary_indexes
 				.reconcile_backfill_readiness(&voters)
@@ -5612,7 +5787,7 @@ fn apply_entry_to_state(
 			}
 			(WendelonResponse::Success, None)
 		}
-	}
+	})
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -8319,7 +8494,12 @@ fn secondary_index_state_label(state: SecondaryIndexState) -> &'static str {
 }
 
 fn current_voter_ids(state: &SmState, fallback_replica_id: u32) -> BTreeSet<u32> {
-	let mut voters: BTreeSet<u32> = state.last_membership.voter_ids().collect();
+	// ADR 0104 (wendelon): replicas are slots.
+	let mut voters: BTreeSet<u32> = state
+		.last_membership
+		.voter_ids()
+		.filter_map(|voter| crate::consensus::decisions::instances::slot_of(state, voter).ok())
+		.collect();
 	if voters.is_empty() {
 		voters.insert(fallback_replica_id);
 	}
@@ -9269,10 +9449,11 @@ async fn read_wal_backup_bytes(
 async fn load_vote_state(
 	file_ops: &dyn AsyncFileOps,
 	vote_path: &Path,
-) -> std::io::Result<Option<Vote<u32>>> {
+	decision_mode: DecisionMode,
+) -> std::io::Result<(Option<Vote<u32>>, Option<PageHead>)> {
 	let bytes = read_optional_artifact(file_ops, vote_path).await?;
 	if bytes.is_empty() {
-		return Ok(None);
+		return Ok((None, None));
 	}
 	if bytes.len() < 4 {
 		return Err(Error::new(
@@ -9285,7 +9466,7 @@ async fn load_vote_state(
 	}
 	let encoded_len = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
 	if encoded_len == 0 {
-		return Ok(None);
+		return Ok((None, None));
 	}
 	if 4 + encoded_len > bytes.len() {
 		return Err(Error::new(
@@ -9298,14 +9479,149 @@ async fn load_vote_state(
 			),
 		));
 	}
-	postcard::from_bytes(&bytes[4..4 + encoded_len])
-		.map(Some)
-		.map_err(|err| {
-			Error::new(
-				ErrorKind::InvalidData,
-				format!("vote artifact {} decode failed: {err}", vote_path.display()),
-			)
-		})
+	let body = &bytes[4..4 + encoded_len];
+	let decode_error = |err: postcard::Error| {
+		Error::new(
+			ErrorKind::InvalidData,
+			format!("vote artifact {} decode failed: {err}", vote_path.display()),
+		)
+	};
+	match decision_mode {
+		DecisionMode::Today => postcard::from_bytes(body)
+			.map(|vote| (Some(vote), None))
+			.map_err(decode_error),
+		_ => {
+			let page: StoredPage = postcard::from_bytes(body).map_err(decode_error)?;
+			Ok((
+				page.vote,
+				Some(PageHead {
+					birth: page.birth,
+					identity: page.identity,
+				}),
+			))
+		}
+	}
+}
+
+/// ADR 0104 (wendelon): the identity a ParentDecisions vote page records,
+/// read without opening the store, so a process knows what it may start as
+/// before it writes anything. An absent or empty page records none.
+pub(crate) fn peek_identity(
+	vote_path: &Path,
+) -> std::io::Result<Option<crate::consensus::decisions::instances::RaftIdentity>> {
+	let bytes = match std::fs::read(vote_path) {
+		Ok(bytes) => bytes,
+		Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+		Err(error) => return Err(error),
+	};
+	if bytes.len() < 4 {
+		return Ok(None);
+	}
+	let encoded_len = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
+	if encoded_len == 0 {
+		return Ok(None);
+	}
+	let body = bytes.get(4..4 + encoded_len).ok_or_else(|| {
+		Error::new(
+			ErrorKind::InvalidData,
+			format!(
+				"vote page {} is shorter than it declares",
+				vote_path.display()
+			),
+		)
+	})?;
+	let page: StoredPage = postcard::from_bytes(body).map_err(|err| {
+		Error::new(
+			ErrorKind::InvalidData,
+			format!("vote page {} decode failed: {err}", vote_path.display()),
+		)
+	})?;
+	Ok(page.identity)
+}
+
+/// ADR 0104 (wendelon): a ParentDecisions store's birth and identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PageHead {
+	birth: crate::consensus::decisions::instances::Birth,
+	identity: Option<crate::consensus::decisions::instances::RaftIdentity>,
+}
+
+/// ADR 0104 (wendelon): the ParentDecisions vote page.
+#[derive(Serialize, Deserialize)]
+struct StoredPage {
+	birth: crate::consensus::decisions::instances::Birth,
+	identity: Option<crate::consensus::decisions::instances::RaftIdentity>,
+	vote: Option<Vote<u32>>,
+}
+
+/// 128 bits from the operating system; no fallback.
+fn new_birth() -> std::io::Result<crate::consensus::decisions::instances::Birth> {
+	use rand::TryRng;
+	let mut birth = [0u8; 16];
+	rand::rngs::SysRng
+		.try_fill_bytes(&mut birth)
+		.map_err(|err| Error::other(format!("no OS randomness for a Raft store's birth: {err}")))?;
+	Ok(birth)
+}
+
+/// Writes the whole ParentDecisions page and syncs it.
+async fn write_page(
+	file_ops: &dyn AsyncFileOps,
+	vote_file: &FileHandle,
+	page: &PageHead,
+	vote: Option<Vote<u32>>,
+) -> std::io::Result<()> {
+	let stored = StoredPage {
+		birth: page.birth,
+		identity: page.identity,
+		vote,
+	};
+	let encoded = postcard::to_stdvec(&stored).map_err(Error::other)?;
+	if encoded.len() + 4 > DIRECT_IO_ALIGN {
+		return Err(Error::other(
+			"encoded vote page exceeds single O_DIRECT page",
+		));
+	}
+	let mut buf = AlignedBuf::new(DIRECT_IO_ALIGN);
+	buf.as_mut_slice()[..4].copy_from_slice(&(encoded.len() as u32).to_le_bytes());
+	buf.as_mut_slice()[4..4 + encoded.len()].copy_from_slice(&encoded);
+	let (written, _buf) = file_ops.write_at(vote_file, 0, buf).await?;
+	if written != DIRECT_IO_ALIGN {
+		return Err(Error::other(format!(
+			"short vote page write: expected {DIRECT_IO_ALIGN} bytes, got {written}"
+		)));
+	}
+	file_ops.fdatasync(vote_file).await
+}
+
+/// ADR 0104 (wendelon): the open-time refusals of a ParentDecisions store's
+/// identity page. Known loss is invalid, never fresh.
+fn check_identity_page(
+	page: Option<&PageHead>,
+	vote: Option<&Vote<u32>>,
+	holder: bool,
+	log_state: bool,
+	vote_path: &Path,
+) -> std::io::Result<()> {
+	let invalid = |what: &str| {
+		Error::new(
+			ErrorKind::InvalidData,
+			format!("{what} ({})", vote_path.display()),
+		)
+	};
+	match page {
+		None if log_state => Err(invalid(
+			"RaftIdentityMissing: this store holds control state but no identity page; its identity is never re-derived",
+		)),
+		None => Ok(()),
+		Some(_) if !holder => Err(invalid(
+			"RaftLogMissing: this store's identity page survives without its control log, which precedes it",
+		)),
+		Some(page) if page.identity.is_none() && (log_state || vote.is_some()) => Err(invalid(
+			"RaftIdentityMissing: this store holds control state or a vote but its page holds no identity",
+		)),
+		Some(_) => Ok(()),
+	}
 }
 
 async fn load_snapshot_artifact(
@@ -13431,7 +13747,9 @@ mod schema_state_tests {
 		);
 		let replay_entry = apply(13, WendelonRequest::TableDropSettlement(settlement));
 		assert_eq!(
-			apply_entry_to_state(&mut replay_state, &replay_entry).0,
+			apply_entry_to_state(&mut replay_state, &replay_entry)
+				.unwrap()
+				.0,
 			WendelonResponse::Success
 		);
 		assert_eq!(registry.drop_reclaim_settlements_for_test(), 1);

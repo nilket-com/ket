@@ -26,8 +26,15 @@
 //!   tasks; [`WendelonNode::shutdown`] aborts and joins them once
 //!   request drain has completed.
 
+mod control_only_node;
 mod identity;
+mod instance_startup;
+pub use control_only_node::ControlOnlyNode;
+pub(crate) use instance_startup::starts_control_only;
 mod startup;
+pub use instance_startup::{
+	FORMATION_INTENT, REPLACEMENT_TOKEN, provision_formation_intent, provision_replacement_token,
+};
 #[cfg(feature = "test-support")]
 mod test_support;
 pub use identity::{IdentityKeyError, IdentityKeyRole};
@@ -1263,6 +1270,14 @@ impl WendelonNode {
 		transport: startup::TransportChoice,
 		restore: startup::RestoreChoice<'_>,
 	) -> std::io::Result<Self> {
+		// ADR 0104 (wendelon): a control-only store never starts as a full
+		// node; nothing here may open its data path.
+		if instance_startup::starts_control_only(&cfg)? {
+			return Err(Error::new(
+				ErrorKind::PermissionDenied,
+				"RaftRoleMismatch: this data directory starts only control-only (ControlOnlyNode)",
+			));
+		}
 		let mut scope = startup::StartupScope::begin(owner, cfg.storage_shutdown_timeout).await?;
 		#[cfg(test)]
 		if let Some(deadline) = cfg
@@ -1316,66 +1331,12 @@ impl WendelonNode {
 		scope: &mut startup::StartupScope,
 	) -> std::io::Result<startup::NodeParts> {
 		let (revocation_tx, _) = watch::channel(Arc::new(RevocationSnapshot::default()));
-		if let Some(tls) = cfg.transport_tls.clone() {
-			let material = TlsMaterial::load(&tls.cert_path, &tls.key_path, &tls.node_ca_path)?;
-			let trust_roots = Arc::new(ActorTrustRoots::load(
-				&tls.node_ca_path,
-				&tls.operator_ca_path,
-			)?);
-			let bind_addr = resolve_socket_addr(&cfg.advertise_address)?;
-			let cluster_domain = tls.cluster_domain.clone();
-			let server_name = canonical_server_name_resolver(&cluster_domain);
-			let quic_endpoint = endpoint_from_tls_with_peer_roots(
-				&material,
-				trust_roots.combined_roots(),
-				bind_addr,
-			)?;
-			let tcp_listener = TcpListener::bind(&cfg.advertise_address).await?;
-			let tcp_acceptor = TlsAcceptor::from(Arc::new(rustls_server_config_with_peer_roots(
-				&material,
-				trust_roots.combined_roots(),
-				vec![crate::network::tls::HRFT_ALPN.to_vec()],
-			)?));
-			let mut providers: HashMap<TransportTier, Arc<dyn TransportProvider>> = HashMap::new();
-			providers.insert(
-				TransportTier::QuicIoUring,
-				Arc::new(
-					QuicTransportProvider::with_cluster_domain(
-						Arc::new(quic_endpoint.clone()),
-						server_name.clone(),
-						&cluster_domain,
-					)
-					.with_revocations(revocation_tx.subscribe()),
-				),
-			);
-			providers.insert(
-				TransportTier::TcpTls,
-				Arc::new(
-					TcpTlsTransportProvider::with_cluster_domain(
-						rustls_client_config(&material)?,
-						server_name,
-						&cluster_domain,
-					)
-					.with_revocations(revocation_tx.subscribe()),
-				),
-			);
+		if let Some((providers, listeners)) = configured_transport(&cfg, &revocation_tx).await? {
 			return Self::construct(
 				cfg,
 				socket_transport_tiers(),
 				providers,
-				vec![
-					BootstrapListener::Quic {
-						endpoint: quic_endpoint,
-						cluster_domain: cluster_domain.clone(),
-						trust_roots: trust_roots.clone(),
-					},
-					BootstrapListener::TcpTls {
-						listener: tcp_listener,
-						acceptor: tcp_acceptor,
-						cluster_domain,
-						trust_roots,
-					},
-				],
+				listeners,
 				revocation_tx,
 				scope,
 			)
@@ -1663,6 +1624,18 @@ impl WendelonNode {
 	}
 
 	pub async fn remove_member_for_replacement(&self, removed_node_id: u32) -> std::io::Result<()> {
+		// ADR 0104 (wendelon): under ParentDecisions a voter is replaced only by a
+		// new Raft instance, never by removing its slot from the placement.
+		if self
+			.state_machine
+			.read_state(|state| state.decisions.is_some())
+			.await
+		{
+			return Err(Error::new(
+				ErrorKind::Unsupported,
+				"ParentDecisions replaces a voter with a new Raft instance; slot removal is refused",
+			));
+		}
 		if removed_node_id == 0 || removed_node_id == self.local_node.id {
 			return Err(Error::new(
 				ErrorKind::InvalidInput,
@@ -2300,8 +2273,22 @@ impl WendelonNode {
 		//    tier-negotiating dialer as the rest of the node, so
 		//    consensus traffic participates in the same QUIC/TCP
 		//    fallback behavior as join and data/control RPCs.
-		let raft_network = WendelonRaftNetworkFactory::new(dial_provider.clone(), pool.clone())
+		// ADR 0104 (wendelon): this store's Raft identity, durable before any
+		// Raft object exists. A fresh ParentDecisions store obtains it here.
+		let identity =
+			instance_startup::establish_identity(&cfg, &log_store, &dial_provider, &pool, false)
+				.await?;
+		let mut raft_network = WendelonRaftNetworkFactory::new(dial_provider.clone(), pool.clone())
 			.with_decision_mode(cfg.decision_mode);
+		if cfg.decision_mode == crate::consensus::decision_mode::DecisionMode::ParentDecisions {
+			raft_network = raft_network.with_instance_routing(
+				crate::consensus::raft_network::InstanceRouting {
+					local_instance: identity.instance,
+					local_slot: cfg.node_id,
+					state: state_machine.clone(),
+				},
+			);
+		}
 
 		// 9. openraft engine. `validate()` pins heartbeat / election
 		//    timeouts against `Config`'s sanity checks.
@@ -2310,7 +2297,7 @@ impl WendelonNode {
 		#[cfg(feature = "test-support")]
 		let test_automatic_elections = raft_config.enable_elect;
 		let raft = WendelonRaft::new(
-			cfg.node_id,
+			identity.instance,
 			raft_config,
 			raft_network,
 			log_store.clone(),
@@ -2523,6 +2510,14 @@ impl WendelonNode {
 						// Validation (activation of a committed staged candidate
 						// first) precedes any new build or report.
 						let _ = maintenance.generation_step().await;
+						// ADR 0104 (wendelon): the replacement controller, leader only.
+						let step = maintenance.replacement_step().await;
+						if !matches!(
+							step,
+							crate::network::decision_proposals::ReplacementStep::Idle
+						) {
+							tracing::info!(?step, "member replacement");
+						}
 						let _ = data_server.validate_certified_base().await;
 						let _ = data_server.certification_step(&maintenance).await;
 						// ADR 0699 S5b: one bounded cleanup step and one debt
@@ -3271,6 +3266,8 @@ impl ReadinessReporter for NodeReadinessView {
 		ReadinessSnapshot {
 			node_id: self.local_node.id,
 			epoch: epoch.epoch,
+			// ADR 0104 (wendelon): the leader's Raft instance, as reported; a
+			// routing hint is a slot and comes from the servers.
 			leader_id: self.raft.current_leader().await,
 			cluster_members: members,
 			drain_state,
@@ -3535,10 +3532,129 @@ fn resolve_socket_addr(address: &str) -> std::io::Result<SocketAddr> {
 	})
 }
 
+/// Serves `service` on one bootstrap listener (the control-only member's).
+fn spawn_listener(
+	listener: BootstrapListener,
+	service: Arc<dyn HrftService>,
+	pool: Arc<BufPool>,
+	lifecycle: ServerLifecycle,
+	admission: ServerAdmissionConfig,
+	revocations: watch::Receiver<Arc<RevocationSnapshot>>,
+) -> NodeTransportServer {
+	match listener {
+		BootstrapListener::Quic {
+			endpoint,
+			cluster_domain,
+			trust_roots,
+		} => NodeTransportServer::Quic(spawn_quic_server(
+			endpoint,
+			service,
+			pool,
+			lifecycle,
+			admission,
+			cluster_domain,
+			revocations,
+			trust_roots,
+		)),
+		BootstrapListener::TcpTls {
+			listener,
+			acceptor,
+			cluster_domain,
+			trust_roots,
+		} => NodeTransportServer::TcpTls(spawn_tcp_tls_server(
+			listener,
+			acceptor,
+			service,
+			pool,
+			lifecycle,
+			admission,
+			cluster_domain,
+			revocations,
+			trust_roots,
+		)),
+	}
+}
+
+/// The configured TLS transport: the providers this node dials with and the
+/// listeners it serves on. `None` without `transport_tls`.
+#[allow(clippy::type_complexity)]
+async fn configured_transport(
+	cfg: &NodeBootstrapConfig,
+	revocation_tx: &watch::Sender<Arc<RevocationSnapshot>>,
+) -> std::io::Result<
+	Option<(
+		HashMap<TransportTier, Arc<dyn TransportProvider>>,
+		Vec<BootstrapListener>,
+	)>,
+> {
+	let Some(tls) = cfg.transport_tls.clone() else {
+		return Ok(None);
+	};
+	let material = TlsMaterial::load(&tls.cert_path, &tls.key_path, &tls.node_ca_path)?;
+	let trust_roots = Arc::new(ActorTrustRoots::load(
+		&tls.node_ca_path,
+		&tls.operator_ca_path,
+	)?);
+	let bind_addr = resolve_socket_addr(&cfg.advertise_address)?;
+	let cluster_domain = tls.cluster_domain.clone();
+	let server_name = canonical_server_name_resolver(&cluster_domain);
+	let quic_endpoint =
+		endpoint_from_tls_with_peer_roots(&material, trust_roots.combined_roots(), bind_addr)?;
+	let tcp_listener = TcpListener::bind(&cfg.advertise_address).await?;
+	let tcp_acceptor = TlsAcceptor::from(Arc::new(rustls_server_config_with_peer_roots(
+		&material,
+		trust_roots.combined_roots(),
+		vec![crate::network::tls::HRFT_ALPN.to_vec()],
+	)?));
+	let mut providers: HashMap<TransportTier, Arc<dyn TransportProvider>> = HashMap::new();
+	providers.insert(
+		TransportTier::QuicIoUring,
+		Arc::new(
+			QuicTransportProvider::with_cluster_domain(
+				Arc::new(quic_endpoint.clone()),
+				server_name.clone(),
+				&cluster_domain,
+			)
+			.with_revocations(revocation_tx.subscribe()),
+		),
+	);
+	providers.insert(
+		TransportTier::TcpTls,
+		Arc::new(
+			TcpTlsTransportProvider::with_cluster_domain(
+				rustls_client_config(&material)?,
+				server_name,
+				&cluster_domain,
+			)
+			.with_revocations(revocation_tx.subscribe()),
+		),
+	);
+	let listeners = vec![
+		BootstrapListener::Quic {
+			endpoint: quic_endpoint,
+			cluster_domain: cluster_domain.clone(),
+			trust_roots: trust_roots.clone(),
+		},
+		BootstrapListener::TcpTls {
+			listener: tcp_listener,
+			acceptor: tcp_acceptor,
+			cluster_domain,
+			trust_roots,
+		},
+	];
+	Ok(Some((providers, listeners)))
+}
+
+/// ADR 0104 (wendelon): this process's Raft instance, the id its Raft object
+/// was constructed with. Leadership is compared against it, never the slot.
+fn local_instance(raft: &WendelonRaft) -> u32 {
+	raft.metrics().borrow().id
+}
+
 async fn wait_for_local_leader(raft: &WendelonRaft, local_node: NodeId) -> std::io::Result<()> {
 	let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
 	loop {
-		if raft.current_leader().await == Some(local_node.id) {
+		if raft.current_leader().await == Some(local_instance(raft)) {
 			return Ok(());
 		}
 		if tokio::time::Instant::now() >= deadline {
@@ -3735,7 +3851,7 @@ pub(crate) async fn establish_root_check_if_forming(
 	crypto: &CryptoManager,
 	local_node: NodeId,
 ) -> std::io::Result<RootCheckFormation> {
-	if raft.current_leader().await != Some(local_node.id) {
+	if raft.current_leader().await != Some(local_instance(raft)) {
 		return Ok(RootCheckFormation::Retry);
 	}
 	if raft.ensure_linearizable().await.is_err() {
@@ -3803,7 +3919,7 @@ async fn seed_default_tenant_kek_if_missing(
 	if snapshot.tenants.contains_key(&TenantId::ZERO) {
 		return Ok(DefaultTenantKekSeedState::Complete);
 	}
-	if raft.current_leader().await != Some(local_node.id) {
+	if raft.current_leader().await != Some(local_instance(raft)) {
 		return Ok(DefaultTenantKekSeedState::Retry);
 	}
 	// ADR 0726: formation, or its continuation after a restart, establishes
@@ -3825,7 +3941,7 @@ async fn seed_default_tenant_kek_if_missing(
 	)?;
 	match commit_create_tenant(raft, create, "failed to seed default tenant").await {
 		Ok(()) => Ok(DefaultTenantKekSeedState::Complete),
-		Err(err) if raft.current_leader().await != Some(local_node.id) => {
+		Err(err) if raft.current_leader().await != Some(local_instance(raft)) => {
 			let _ = err;
 			Ok(DefaultTenantKekSeedState::Retry)
 		}
@@ -4161,25 +4277,25 @@ fn spawn_secondary_index_lifecycle_driver(
 /// [`LeaderStatus`] trait the eviction watchdog consumes.
 pub struct RaftLeaderStatus {
 	raft: WendelonRaft,
-	local_id: u32,
 }
 
 impl RaftLeaderStatus {
-	pub fn new(raft: WendelonRaft, local_node: NodeId) -> Self {
-		Self {
-			raft,
-			local_id: local_node.id,
-		}
+	/// ADR 0104 (wendelon): leadership is the Raft instance's own; the node id
+	/// is no longer consulted.
+	pub fn new(raft: WendelonRaft, _local_node: NodeId) -> Self {
+		Self { raft }
 	}
 }
 
 #[async_trait]
 impl LeaderStatus for RaftLeaderStatus {
 	async fn is_leader(&self) -> bool {
+		// ADR 0104 (wendelon): leadership is this Raft instance's own.
+		let local_instance = local_instance(&self.raft);
 		self.raft
 			.current_leader()
 			.await
-			.map(|id| id == self.local_id)
+			.map(|id| id == local_instance)
 			.unwrap_or(false)
 	}
 }
@@ -4575,6 +4691,7 @@ mod tests {
 		let dir = tempdir("node-parent-decisions");
 		let mut cfg = NodeBootstrapConfig::dev(7004, dir.to_path_buf(), "127.0.0.1:0".into());
 		cfg.decision_mode = DecisionMode::ParentDecisions;
+		crate::node::provision_formation_intent(&cfg.data_dir).unwrap();
 
 		let node = WendelonNode::bootstrap_single_node(cfg.clone())
 			.await
@@ -4706,6 +4823,7 @@ mod tests {
 		assert!(!dir.join("vote.wnd").exists(), "the refusal wrote nothing");
 
 		cfg.decision_mode = DecisionMode::ParentDecisions;
+		crate::node::provision_formation_intent(&cfg.data_dir).unwrap();
 		let node = WendelonNode::bootstrap_single_node(cfg.clone())
 			.await
 			.unwrap();

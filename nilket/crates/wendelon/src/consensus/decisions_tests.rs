@@ -97,7 +97,7 @@ pub(crate) fn membership_of(
 			(
 				*id,
 				openraft::BasicNode {
-					addr: format!("127.0.0.1:{}", 7000 + id),
+					addr: format!("127.0.0.1:{}", 7000 + u64::from(*id)),
 				},
 			)
 		})
@@ -4318,4 +4318,354 @@ fn each_unsupported_shape_refuses_the_roster_by_name() {
 			.unwrap();
 	}
 	assert_eq!(roster(&state, held).unwrap().indexes, vec![(TENANT, index)]);
+}
+
+// ============================================================
+//  ADR 0104 (wendelon): RAFT INSTANCES, GRANTS AND REPLACEMENT
+// ============================================================
+
+use crate::consensus::decisions::instances::{
+	ALLOCATED_BASE, GrantKind, ReplacementPhase, slot_of,
+};
+
+const TOKEN: u128 = 0x0104;
+
+fn grant_join(state: &mut SmState, birth: u8, slot: u32) -> DecisionResult {
+	decide(
+		state,
+		DecisionCommand::GrantInstance {
+			birth: [birth; 16],
+			slot,
+			kind: GrantKind::Join,
+		},
+	)
+}
+
+fn grant_replacement(state: &mut SmState, birth: u8, slot: u32, token: u128) -> DecisionResult {
+	decide(
+		state,
+		DecisionCommand::GrantInstance {
+			birth: [birth; 16],
+			slot,
+			kind: GrantKind::Replacement { token },
+		},
+	)
+}
+
+fn refusal_of(result: DecisionResult) -> DecisionRefusal {
+	match result {
+		DecisionResult::Refused(refusal) => refusal,
+		other => panic!("expected a refusal, got {other:?}"),
+	}
+}
+
+/// A state whose slot 3 is being replaced by `ALLOCATED_BASE`, granted to
+/// birth 7.
+pub(crate) fn reserved() -> SmState {
+	let mut state = base(3);
+	assert_eq!(
+		decide(
+			&mut state,
+			DecisionCommand::BeginReplacement {
+				token: TOKEN,
+				slot: 3
+			}
+		),
+		DecisionResult::ReplacementRecorded {
+			slot: 3,
+			r_old: 3,
+			phase: ReplacementPhase::Begun,
+		}
+	);
+	assert_eq!(
+		grant_replacement(&mut state, 7, 3, TOKEN),
+		DecisionResult::InstanceGranted {
+			instance: ALLOCATED_BASE
+		}
+	);
+	state
+}
+
+#[test]
+fn a_join_grant_is_serialized_by_birth_and_intent() {
+	let mut state = base(3);
+	// A slot no instance serves, for the first birth that asks.
+	assert_eq!(
+		grant_join(&mut state, 1, 4),
+		DecisionResult::InstanceGranted { instance: 4 }
+	);
+	// The same store asking again for the same thing gets the same answer.
+	assert_eq!(
+		grant_join(&mut state, 1, 4),
+		DecisionResult::InstanceGranted { instance: 4 }
+	);
+	// A concurrent fresh store for the same slot is refused.
+	assert_eq!(
+		refusal_of(grant_join(&mut state, 2, 4)),
+		DecisionRefusal::SlotGranted
+	);
+	// The same birth with another intent is not a grant for it.
+	assert_eq!(
+		refusal_of(grant_join(&mut state, 1, 5)),
+		DecisionRefusal::GrantIntentMismatch
+	);
+	// A served slot, and slots outside the ParentDecisions range.
+	assert_eq!(
+		refusal_of(grant_join(&mut state, 3, 1)),
+		DecisionRefusal::SlotServed
+	);
+	for slot in [0, ALLOCATED_BASE, u32::MAX] {
+		assert_eq!(
+			refusal_of(grant_join(&mut state, 4, slot)),
+			DecisionRefusal::SlotOutOfRange,
+			"{slot}"
+		);
+	}
+}
+
+#[test]
+fn a_replacement_identity_is_never_handed_to_another_birth() {
+	let mut state = reserved();
+	// The same birth retries (lost response, crash before its identity write).
+	assert_eq!(
+		grant_replacement(&mut state, 7, 3, TOKEN),
+		DecisionResult::InstanceGranted {
+			instance: ALLOCATED_BASE
+		}
+	);
+	// The store's Raft artifacts are lost: the blank store is born again, and
+	// the token and data directory alone do not take the identity back.
+	assert_eq!(
+		refusal_of(grant_replacement(&mut state, 8, 3, TOKEN)),
+		DecisionRefusal::GrantedToAnotherBirth
+	);
+	assert_eq!(
+		refusal_of(grant_replacement(&mut state, 7, 2, TOKEN)),
+		DecisionRefusal::GrantIntentMismatch
+	);
+	assert_eq!(
+		refusal_of(grant_replacement(&mut state, 9, 3, TOKEN + 1)),
+		DecisionRefusal::UnknownReplacement
+	);
+	// No second replacement while one is open, and no ordinary join of its slot.
+	assert_eq!(
+		refusal_of(decide(
+			&mut state,
+			DecisionCommand::BeginReplacement {
+				token: TOKEN + 1,
+				slot: 2
+			}
+		)),
+		DecisionRefusal::ReplacementOpen
+	);
+	assert_eq!(
+		refusal_of(grant_join(&mut state, 9, 3)),
+		DecisionRefusal::ReplacementOpen
+	);
+	// The reserved instance maps to its slot; another allocated id maps nowhere.
+	assert_eq!(slot_of(&state, ALLOCATED_BASE), Ok(3));
+	assert!(slot_of(&state, ALLOCATED_BASE + 1).is_err());
+}
+
+#[test]
+fn begin_names_exactly_one_voter_of_a_uniform_membership() {
+	let mut state = base(3);
+	assert_eq!(
+		refusal_of(decide(
+			&mut state,
+			DecisionCommand::BeginReplacement {
+				token: TOKEN,
+				slot: 9
+			}
+		)),
+		DecisionRefusal::SlotNotVoter
+	);
+	state.last_membership = membership_of(&[&[1, 2, 3], &[1, 2]], &[]);
+	assert_eq!(
+		refusal_of(decide(
+			&mut state,
+			DecisionCommand::BeginReplacement {
+				token: TOKEN,
+				slot: 3
+			}
+		)),
+		DecisionRefusal::MembershipNotUniform
+	);
+	state.last_membership = membership_of(&[&[1, 2, 3]], &[4]);
+	assert_eq!(
+		refusal_of(decide(
+			&mut state,
+			DecisionCommand::BeginReplacement {
+				token: TOKEN,
+				slot: 3
+			}
+		)),
+		DecisionRefusal::MembershipNotUniform
+	);
+}
+
+#[test]
+fn placement_compares_slots_and_tolerates_only_the_reserved_learner() {
+	let mut state = reserved();
+	let sealed = formed_placement(&base(3)).unwrap();
+	// The reserved learner on slot 3 leaves the placement as it was.
+	state.last_membership = membership_of(&[&[1, 2, 3]], &[ALLOCATED_BASE]);
+	assert_eq!(formed_placement(&state).as_ref(), Some(&sealed));
+	// Any other learner is a change in progress.
+	state.last_membership = membership_of(&[&[1, 2, 3]], &[4]);
+	assert_eq!(formed_placement(&state), None);
+	// The joint entry keeps its refusal.
+	state.last_membership = membership_of(&[&[1, 2, 3], &[1, 2, ALLOCATED_BASE]], &[]);
+	assert_eq!(formed_placement(&state), None);
+	// After the swap the voters' slots are the peers again.
+	state.last_membership = formed_membership(&[1, 2, ALLOCATED_BASE]);
+	assert_eq!(formed_placement(&state).as_ref(), Some(&sealed));
+	// Two instances of one slot never vote together.
+	state.last_membership = formed_membership(&[1, 2, 3, ALLOCATED_BASE]);
+	assert_eq!(formed_placement(&state), None);
+}
+
+#[test]
+fn done_is_derived_from_the_applied_target_and_retires_the_old_instance() {
+	let mut state = reserved();
+	let complete =
+		|state: &mut SmState| decide(state, DecisionCommand::CompleteReplacement { token: TOKEN });
+	// Learner, joint, and a target that still keeps the old instance as a node.
+	for membership in [
+		membership_of(&[&[1, 2, 3]], &[ALLOCATED_BASE]),
+		membership_of(&[&[1, 2, 3], &[1, 2, ALLOCATED_BASE]], &[]),
+		membership_of(&[&[1, 2, ALLOCATED_BASE]], &[3]),
+	] {
+		state.last_membership = membership;
+		assert_eq!(
+			refusal_of(complete(&mut state)),
+			DecisionRefusal::ReplacementIncomplete
+		);
+	}
+	state.last_membership = formed_membership(&[1, 2, ALLOCATED_BASE]);
+	let done = DecisionResult::ReplacementCompleted {
+		r_new: ALLOCATED_BASE,
+	};
+	assert_eq!(complete(&mut state), done);
+	// Replays after Done answer the Done record; nothing starts again.
+	assert_eq!(complete(&mut state), done);
+	assert_eq!(
+		decide(
+			&mut state,
+			DecisionCommand::BeginReplacement {
+				token: TOKEN,
+				slot: 3
+			}
+		),
+		DecisionResult::ReplacementRecorded {
+			slot: 3,
+			r_old: 3,
+			phase: ReplacementPhase::Done {
+				r_new: ALLOCATED_BASE
+			},
+		}
+	);
+	assert_eq!(
+		grant_replacement(&mut state, 7, 3, TOKEN),
+		DecisionResult::InstanceGranted {
+			instance: ALLOCATED_BASE
+		}
+	);
+	assert_eq!(
+		refusal_of(grant_replacement(&mut state, 8, 3, TOKEN)),
+		DecisionRefusal::GrantedToAnotherBirth
+	);
+	// The retired instance never returns, even through an ordinary join.
+	assert!(decisions(&state).instances().is_retired(3));
+	assert_eq!(
+		refusal_of(grant_join(&mut state, 9, 3)),
+		DecisionRefusal::InstanceRetired
+	);
+	decisions(&state).validate().unwrap();
+}
+
+#[test]
+fn the_instance_space_is_exhausted_after_its_last_id_and_never_wraps() {
+	let mut state = base(3);
+	crate::consensus::decisions::instances::exhaust_allocator_for_test(
+		state.decisions.as_mut().unwrap(),
+		u32::MAX,
+	);
+	decide(
+		&mut state,
+		DecisionCommand::BeginReplacement {
+			token: TOKEN,
+			slot: 3,
+		},
+	);
+	assert_eq!(
+		grant_replacement(&mut state, 7, 3, TOKEN),
+		DecisionResult::InstanceGranted { instance: u32::MAX }
+	);
+	state.last_membership = formed_membership(&[1, 2, u32::MAX]);
+	decide(
+		&mut state,
+		DecisionCommand::CompleteReplacement { token: TOKEN },
+	);
+	decide(
+		&mut state,
+		DecisionCommand::BeginReplacement {
+			token: TOKEN + 1,
+			slot: 2,
+		},
+	);
+	assert_eq!(
+		refusal_of(grant_replacement(&mut state, 8, 2, TOKEN + 1)),
+		DecisionRefusal::InstanceSpaceExhausted
+	);
+}
+
+#[test]
+fn today_keeps_its_whole_node_id_domain() {
+	let state = SmState::default();
+	assert_eq!(slot_of(&state, ALLOCATED_BASE | 5), Ok(ALLOCATED_BASE | 5));
+	assert_eq!(slot_of(&state, u32::MAX), Ok(u32::MAX));
+}
+
+/// Through the reducer, whose decision state is held apart from the state
+/// machine while it applies: a write is admitted under the sealed placement
+/// while the reserved learner catches up and after the swap, and refused only
+/// during the joint entry.
+#[test]
+fn writes_stay_admitted_through_a_replacement_but_its_joint_entry() {
+	let (mut state, _, _) = reserved_parent(1);
+	// The replacement of slot 3, reserved for `ALLOCATED_BASE`.
+	decide(
+		&mut state,
+		DecisionCommand::BeginReplacement {
+			token: TOKEN,
+			slot: 3,
+		},
+	);
+	assert_eq!(
+		grant_replacement(&mut state, 7, 3, TOKEN),
+		DecisionResult::InstanceGranted {
+			instance: ALLOCATED_BASE
+		}
+	);
+	let write = |state: &mut SmState, sequence_no: u64| {
+		let claim = claim(key(T0, sequence_no), children(state, 2), 0);
+		reserve(state, &claim, T0)
+	};
+	state.last_membership = membership_of(&[&[1, 2, 3]], &[ALLOCATED_BASE]);
+	assert!(
+		matches!(write(&mut state, 2), DecisionResult::Reserved { .. }),
+		"admitted while the learner catches up"
+	);
+	state.last_membership = membership_of(&[&[1, 2, 3], &[1, 2, ALLOCATED_BASE]], &[]);
+	assert_eq!(
+		refusal_of(write(&mut state, 3)),
+		DecisionRefusal::MembershipSealed,
+		"the joint entry keeps its refusal"
+	);
+	state.last_membership = formed_membership(&[1, 2, ALLOCATED_BASE]);
+	assert!(
+		matches!(write(&mut state, 4), DecisionResult::Reserved { .. }),
+		"admitted after the swap"
+	);
 }

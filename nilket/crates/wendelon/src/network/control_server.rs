@@ -678,6 +678,16 @@ pub enum TenantAdminRequestWire {
 		id: u128,
 		entered_at: u64,
 	},
+	/// ADR 0104 (wendelon): open the replacement `token` of `slot`'s lost voter
+	/// (or read it back on a retry).
+	BeginReplacement {
+		token: u128,
+		slot: u32,
+	},
+	/// ADR 0104 (wendelon): the replacement `token`'s applied record.
+	GetReplacement {
+		token: u128,
+	},
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -734,20 +744,52 @@ pub struct BackupAdminExtensionWire {
 	>,
 }
 
+/// ADR 0104 (wendelon): appended after the [`TenantAdminResponseWire`] of an
+/// answer to a replacement request (`BeginReplacement`, `GetReplacement`), and
+/// only there; backup answers keep [`BackupAdminExtensionWire`] unchanged. Only
+/// a caller that sent a replacement request decodes it, with
+/// [`decode_replacement_admin_answer`].
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplacementAdminExtensionWire {
+	/// The replacement's record, when the cluster holds one under the token.
+	pub replacement: Option<ReplacementReportWire>,
+}
+
+/// ADR 0104 (wendelon): a replacement as the cluster recorded it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplacementReportWire {
+	pub slot: u32,
+	pub r_old: u32,
+	pub phase: crate::consensus::decisions::instances::ReplacementPhase,
+}
+
 /// ADR 0736: a TENANT_ADMIN_RESP body as the response, then the backup
 /// extension when one follows (an answer to a backup request; a rejection has
 /// none). Bytes after the extension are refused.
 pub fn decode_tenant_admin_answer(
 	bytes: &[u8],
 ) -> std::io::Result<(TenantAdminResponseWire, BackupAdminExtensionWire)> {
+	decode_extended_admin_answer(bytes)
+}
+
+/// ADR 0104 (wendelon): an answer to a replacement request: the response, then
+/// the replacement extension when one follows (a rejection has none).
+pub fn decode_replacement_admin_answer(
+	bytes: &[u8],
+) -> std::io::Result<(TenantAdminResponseWire, ReplacementAdminExtensionWire)> {
+	decode_extended_admin_answer(bytes)
+}
+
+fn decode_extended_admin_answer<E: serde::de::DeserializeOwned + Default>(
+	bytes: &[u8],
+) -> std::io::Result<(TenantAdminResponseWire, E)> {
 	let invalid = |error: postcard::Error| Error::new(ErrorKind::InvalidData, error);
 	let (response, rest) =
 		postcard::take_from_bytes::<TenantAdminResponseWire>(bytes).map_err(invalid)?;
 	if rest.is_empty() {
-		return Ok((response, BackupAdminExtensionWire::default()));
+		return Ok((response, E::default()));
 	}
-	let (extension, rest) =
-		postcard::take_from_bytes::<BackupAdminExtensionWire>(rest).map_err(invalid)?;
+	let (extension, rest) = postcard::take_from_bytes::<E>(rest).map_err(invalid)?;
 	if !rest.is_empty() {
 		return Err(Error::new(
 			ErrorKind::InvalidData,
@@ -834,6 +876,17 @@ fn control_operation_permission(operation: ControlOperation) -> ActorPermission 
 }
 
 impl WendelonControlServer {
+	/// ADR 0104 (wendelon): the current leader as a dialable slot; this node's
+	/// own slot only when the leader is this very Raft instance.
+	pub(crate) async fn leader_slot(&self) -> Option<u32> {
+		crate::consensus::decisions::instances::leader_slot(
+			&self.raft,
+			&self.state_machine,
+			self.local_node.id,
+		)
+		.await
+	}
+
 	/// Fixture teardown only; observers retain a Weak control server until bootstrap ends.
 	#[cfg(test)]
 	pub(crate) async fn shutdown_startup_fixture_raft(&self) -> std::io::Result<()> {
@@ -936,7 +989,7 @@ impl WendelonControlServer {
 	async fn record_join_observation(&self, req: &JoinClusterRequestWire, stage: &str) {
 		if let Some(gate) = &self.join_promotion_gate {
 			let snapshot = self.state_machine.state_snapshot().await;
-			gate.record(format!("receiver={} request={req:?} stage={stage} leader={:?} membership={:?} epoch_history={:?} visible_epoch={:?}", self.local_node.id, self.raft.current_leader().await, snapshot.last_membership, snapshot.epoch_history, self.epoch_rx.borrow().clone()));
+			gate.record(format!("receiver={} request={req:?} stage={stage} leader={:?} membership={:?} epoch_history={:?} visible_epoch={:?}", self.local_node.id, self.leader_slot().await, snapshot.last_membership, snapshot.epoch_history, self.epoch_rx.borrow().clone()));
 		}
 	}
 
@@ -1070,12 +1123,13 @@ impl WendelonControlServer {
 		})
 	}
 
-	/// ADR 0736: a TENANT_ADMIN_RESP whose body is `resp` followed by `extension`.
-	fn build_backup_admin_frame(
+	/// ADR 0736: a TENANT_ADMIN_RESP whose body is `resp` followed by `extension`
+	/// (the backup extension, or ADR 0104's replacement extension).
+	fn build_backup_admin_frame<E: Serialize>(
 		&self,
 		stream_id: u32,
 		resp: &TenantAdminResponseWire,
-		extension: &BackupAdminExtensionWire,
+		extension: &E,
 	) -> std::io::Result<HrftFrame> {
 		let mut frame = self.build_tenant_admin_frame(stream_id, resp)?;
 		frame
@@ -3306,6 +3360,79 @@ impl WendelonControlServer {
 	/// ADR 0736: proposes a backup hold command and answers with its token, or with
 	/// the reducer's refusal (a conflict names nothing: the operator reads the
 	/// current hold with `GetBackupHold`).
+	/// ADR 0104 (wendelon): the leader opens the replacement; the answer carries
+	/// its record, now or as recorded earlier under the same token.
+	async fn submit_begin_replacement(
+		&self,
+		frame: &HrftFrame,
+		token: u128,
+		slot: u32,
+	) -> std::io::Result<HrftFrame> {
+		use crate::consensus::decisions::DecisionResult;
+		use crate::network::decision_proposals::{ProposalOutcome, ProposalResponse};
+		let Some(proposals) = self.decision_proposals.as_ref() else {
+			return self.tenant_admin_rejection(
+				frame,
+				CONTROL_REASON_INVALID_TARGET,
+				"member replacement exists only under ParentDecisions".to_owned(),
+				None,
+			);
+		};
+		let (accepted, replacement, message) =
+			match proposals.propose_begin_replacement(token, slot).await {
+				ProposalResponse::Applied {
+					outcome:
+						ProposalOutcome::Decision(DecisionResult::ReplacementRecorded {
+							slot,
+							r_old,
+							phase,
+						}),
+					..
+				} => (
+					true,
+					Some(ReplacementReportWire { slot, r_old, phase }),
+					None,
+				),
+				ProposalResponse::Applied {
+					outcome: ProposalOutcome::Decision(DecisionResult::Refused(refusal)),
+					..
+				} => (false, None, Some(format!("{refusal:?}"))),
+				ProposalResponse::NotLeader { leader_hint } => {
+					return self.tenant_admin_rejection(
+						frame,
+						CONTROL_REASON_NOT_LEADER,
+						"not the leader".to_owned(),
+						leader_hint.map(|id| NodeId { id, _reserved: 0 }),
+					);
+				}
+				other => {
+					let message = format!("{other:?}");
+					return self.tenant_admin_rejection(
+						frame,
+						Self::tenant_admin_error_reason(&message),
+						message,
+						None,
+					);
+				}
+			};
+		self.build_backup_admin_frame(
+			frame.header.stream_id,
+			&TenantAdminResponseWire {
+				accepted,
+				reason_code: if accepted {
+					CONTROL_REASON_GRANTED
+				} else {
+					CONTROL_REASON_INVALID_TARGET
+				},
+				leader_hint: Some(self.local_node.id),
+				tenant: None,
+				tenants: Vec::new(),
+				message,
+			},
+			&ReplacementAdminExtensionWire { replacement },
+		)
+	}
+
 	async fn submit_backup_hold_command(
 		&self,
 		frame: &HrftFrame,
@@ -4020,6 +4147,61 @@ impl WendelonControlServer {
 					},
 				)
 				.await
+			}
+			TenantAdminRequestWire::BeginReplacement { token, slot } => {
+				if let Err(error) = require_administrative_action(
+					&context.actor,
+					AdministrativeAction::ReplaceMember,
+				) {
+					return self.tenant_admin_rejection(
+						&frame,
+						CONTROL_REASON_AUTHORIZATION_FAILED,
+						error.to_string(),
+						None,
+					);
+				}
+				self.submit_begin_replacement(&frame, token, slot).await
+			}
+			TenantAdminRequestWire::GetReplacement { token } => {
+				if let Err(error) = require_administrative_action(
+					&context.actor,
+					AdministrativeAction::ReplaceMember,
+				) {
+					return self.tenant_admin_rejection(
+						&frame,
+						CONTROL_REASON_AUTHORIZATION_FAILED,
+						error.to_string(),
+						None,
+					);
+				}
+				let replacement = self
+					.state_machine
+					.read_state(|state| {
+						let decisions = state.decisions.as_ref()?;
+						let record = decisions.instances().replacement(token)?;
+						Some(ReplacementReportWire {
+							slot: record.slot,
+							r_old: record.r_old,
+							phase: record.phase,
+						})
+					})
+					.await;
+				self.build_backup_admin_frame(
+					frame.header.stream_id,
+					&TenantAdminResponseWire {
+						accepted: replacement.is_some(),
+						reason_code: if replacement.is_some() {
+							CONTROL_REASON_GRANTED
+						} else {
+							CONTROL_REASON_INVALID_TARGET
+						},
+						leader_hint: Some(self.local_node.id),
+						tenant: None,
+						tenants: Vec::new(),
+						message: None,
+					},
+					&ReplacementAdminExtensionWire { replacement },
+				)
 			}
 			TenantAdminRequestWire::GetBackupHold => {
 				if let Err(error) =
@@ -4769,6 +4951,21 @@ impl WendelonControlServer {
 							negotiated_protocol: None,
 						}
 					}
+					// ADR 0104 (wendelon): a ParentDecisions join is admitted only
+					// for a slot whose Join grant the cluster recorded, issued to
+					// the joining store's own birth.
+					Ok(()) if self.is_leader().await && !self.join_granted(req.node_id).await => {
+						#[cfg(feature = "test-support")]
+						self.record_join_observation(&req, "refused: no join grant")
+							.await;
+						JoinClusterResponseWire {
+							accepted: false,
+							reason_code: CONTROL_REASON_INVALID_CONFIG,
+							leader_hint: Some(self.local_node.id),
+							local_protocol: self.protocol,
+							negotiated_protocol: None,
+						}
+					}
 					Ok(()) if self.is_leader().await => {
 						match wire::negotiate_protocol(self.protocol, req.protocol) {
 							Ok(negotiated_protocol) => match self.accept_join(&req).await {
@@ -5037,7 +5234,7 @@ impl WendelonControlServer {
 
 		ClusterStatusWire {
 			epoch: membership.epoch,
-			leader: self.raft.current_leader().await,
+			leader: self.leader_slot().await,
 			replication_factor: self.replication_factor,
 			peers,
 		}
@@ -5061,11 +5258,11 @@ impl WendelonControlServer {
 	}
 
 	async fn leader_hint(&self) -> Option<u32> {
-		self.raft.current_leader().await
+		self.leader_slot().await
 	}
 
 	async fn is_leader(&self) -> bool {
-		self.raft.current_leader().await == Some(self.local_node.id)
+		self.leader_slot().await == Some(self.local_node.id)
 	}
 
 	/// ADR 0699 S3a: admit and propose for the authenticated sender, or say why
@@ -5155,6 +5352,51 @@ impl WendelonControlServer {
 	}
 
 	/// ADR 0699 S4: a reader's linearizable cut, answered only by the leader.
+	/// ADR 0104 (wendelon): a fresh store's first identity. Only an unscoped
+	/// cluster node naming itself may ask, and only for its own slot.
+	async fn handle_instance_grant(
+		&self,
+		context: &RequestContext,
+		remote: NodeId,
+		frame: HrftFrame,
+	) -> std::io::Result<HrftFrame> {
+		use crate::network::decision_proposals::{
+			InstanceGrantRequest, InstanceGrantResponse, decode_bounded,
+		};
+		let actor = &context.actor;
+		let unscoped_self = actor.role == crate::network::tls::ActorRole::DataNode
+			&& actor.tenant_id.is_none()
+			&& actor.node_id == Some(remote);
+		let response = match (&self.decision_proposals, unscoped_self) {
+			(None, _) => InstanceGrantResponse::ModeToday,
+			(Some(_), false) => InstanceGrantResponse::Unauthorized,
+			(Some(proposals), true) => {
+				match decode_bounded::<InstanceGrantRequest>(frame.meta.as_ref()) {
+					Ok(request) => proposals.grant_instance(remote.id, request).await,
+					Err(error) => InstanceGrantResponse::Indeterminate(error.to_string()),
+				}
+			}
+		};
+		let bytes = postcard::to_stdvec(&response).map_err(Error::other)?;
+		let mut meta = self.pool.acquire();
+		meta.as_mut_vec().extend_from_slice(&bytes);
+		Ok(HrftFrame {
+			header: FrameHeader {
+				magic: HRFT_MAGIC,
+				version: crate::schema::HRFT_ENVELOPE_VERSION,
+				msg_type: MsgType::INSTANCE_GRANT_RESP.0,
+				flags: 0,
+				stream_id: frame.header.stream_id,
+				meta_len: meta.len() as u32,
+				arrow_len: 0,
+				trailing_len: 0,
+			},
+			meta,
+			arrow_payload: None,
+			trailing: None,
+		})
+	}
+
 	async fn handle_decision_cut(
 		&self,
 		remote: NodeId,
@@ -5466,7 +5708,7 @@ impl WendelonControlServer {
 			));
 		}
 		if self.local_node == token.from_leader
-			&& self.raft.current_leader().await != Some(token.from_leader.id)
+			&& self.leader_slot().await != Some(token.from_leader.id)
 		{
 			return Err(Error::new(
 				ErrorKind::PermissionDenied,
@@ -5525,6 +5767,20 @@ impl WendelonControlServer {
 			));
 		}
 		wire::decode(&resp.meta)
+	}
+
+	/// ADR 0104 (wendelon): whether the cluster recorded a Join grant for this
+	/// slot. Today has no grants and admits joins as before.
+	async fn join_granted(&self, slot: u32) -> bool {
+		self.state_machine
+			.read_state(|state| match &state.decisions {
+				None => true,
+				Some(decisions) => decisions.instances().record(slot).is_some_and(|record| {
+					record.slot == slot
+						&& record.kind == crate::consensus::decisions::instances::GrantKind::Join
+				}),
+			})
+			.await
 	}
 
 	fn validate_join_request(&self, req: &JoinClusterRequestWire) -> std::io::Result<()> {
@@ -5785,7 +6041,7 @@ impl WendelonControlServer {
 			.map_err(|err| Error::new(ErrorKind::Other, format!("trigger_elect failed: {err}")))?;
 		let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
 		loop {
-			if self.raft.current_leader().await == Some(self.local_node.id) {
+			if self.leader_slot().await == Some(self.local_node.id) {
 				return Ok(());
 			}
 			if tokio::time::Instant::now() >= deadline {
@@ -5837,6 +6093,11 @@ impl ControlRingServer for WendelonControlServer {
 				self.authorize_control_operation(&context, ControlOperation::DecisionPropose)?;
 				let remote = context.require_authenticated_node("DECISION_CUT_REQ")?;
 				self.handle_decision_cut(remote, frame).await?
+			}
+			MsgType::INSTANCE_GRANT_REQ => {
+				self.authorize_control_operation(&context, ControlOperation::Join)?;
+				let remote = context.require_authenticated_node("INSTANCE_GRANT_REQ")?;
+				self.handle_instance_grant(&context, remote, frame).await?
 			}
 			MsgType::DECISION_LOOKUP_REQ => {
 				self.authorize_control_operation(&context, ControlOperation::DecisionPropose)?;

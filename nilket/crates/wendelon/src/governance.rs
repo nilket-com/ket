@@ -64,6 +64,8 @@ pub enum AdministrativeAction {
 	CrossCaPromotion,
 	/// ADR 0736: begin, release or read the backup hold.
 	BackupHold,
+	/// ADR 0104 (wendelon): begin or read the replacement of a lost voter.
+	ReplaceMember,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,6 +136,7 @@ pub fn require_administrative_action(
 		AdministrativeAction::TransferLeadership
 		| AdministrativeAction::AdvanceEpoch
 		| AdministrativeAction::JoinCluster
+		| AdministrativeAction::ReplaceMember
 		| AdministrativeAction::CrossCaPromotion => {
 			authorize_actor(actor, ActorPermission::ClusterControl)
 		}

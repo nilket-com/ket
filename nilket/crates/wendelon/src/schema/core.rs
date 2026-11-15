@@ -945,6 +945,10 @@ impl MsgType {
 	/// ADR 0701: one holder's batched lease renewal (ParentDecisions).
 	pub const LEASES_REQ: Self = Self(0x6A);
 	pub const LEASES_RESP: Self = Self(0x6B);
+	/// ADR 0104 (wendelon): a fresh Raft store asks the leader for its first
+	/// identity, for the slot its connection authenticates.
+	pub const INSTANCE_GRANT_REQ: Self = Self(0x6C);
+	pub const INSTANCE_GRANT_RESP: Self = Self(0x6D);
 
 	// raft internal (openraft RaftNetwork)
 	pub const APPEND_ENTRIES_REQ: Self = Self(0x20);
@@ -1060,6 +1064,8 @@ impl MsgType {
 		Self::TABLE_CHILD_FETCH_RESP,
 		Self::LEASES_REQ,
 		Self::LEASES_RESP,
+		Self::INSTANCE_GRANT_REQ,
+		Self::INSTANCE_GRANT_RESP,
 		Self::APPEND_ENTRIES_REQ,
 		Self::APPEND_ENTRIES_RESP,
 		Self::INSTALL_SNAPSHOT_REQ,
@@ -2591,7 +2597,10 @@ pub const SNAPSHOT_FORMAT_VERSION: u8 = 21;
 ///
 /// ADR 0736: 24, whose decision state carries the backup hold (23 was ADR 0729
 /// to ADR 0735's).
-pub const SNAPSHOT_FORMAT_VERSION_PARENT_DECISIONS: u8 = 24;
+///
+/// Wendelon ADR 0104: 25, whose decision state carries the Raft instance
+/// records (24 was ADR 0736 to wendelon ADR 0103's).
+pub const SNAPSHOT_FORMAT_VERSION_PARENT_DECISIONS: u8 = 25;
 
 /// Shape of the Control Ring WAL record bodies this build writes, including the
 /// `postcard(Entry<..>)` payload of a log record. ADR 0697 version 6 carries
@@ -2626,7 +2635,11 @@ pub const WAL_FORMAT_VERSION: u8 = 21;
 /// ADR 0736: 24. The decisions include the backup hold, which refuses new
 /// reservations and the mode's logical mutations at apply; an earlier log is
 /// refused whole (23 was ADR 0729 to ADR 0735's).
-pub const WAL_FORMAT_VERSION_PARENT_DECISIONS: u8 = 24;
+///
+/// Wendelon ADR 0104: 25. The decisions include the instance grants and the
+/// replacement, and an entry's author is applied as its slot; an earlier log
+/// is refused whole (24 was ADR 0736 to wendelon ADR 0103's).
+pub const WAL_FORMAT_VERSION_PARENT_DECISIONS: u8 = 25;
 
 // Static assertions to ensure all our size calculations remain exactly correct
 const _: () = assert!(std::mem::size_of::<HybridTimestamp>() == 16);

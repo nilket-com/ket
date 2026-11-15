@@ -66,11 +66,16 @@ pub struct WendelonRaftInternalServer {
 	retention: Arc<RetentionGuard>,
 	/// A frame from a peer on another decision authority is refused before decode.
 	decision_mode: crate::consensus::decision_mode::DecisionMode,
+	/// ADR 0104 (wendelon): this process's durable Raft instance, the only
+	/// target a `ParentDecisions` request is applied to.
+	local_instance: u32,
 }
 
 impl WendelonRaftInternalServer {
 	pub fn new(raft: WendelonRaft, pool: Arc<BufPool>, retention: Arc<RetentionGuard>) -> Self {
+		let local_instance = raft.metrics().borrow().id;
 		Self {
+			local_instance,
 			raft,
 			pool,
 			tracker: None,
@@ -199,6 +204,78 @@ fn admit_raft_sender(
 	Ok(())
 }
 
+/// ADR 0104 (wendelon): a `ParentDecisions` request is admitted from the
+/// unscoped node of the slot it names (ADR 0103's rule, by slot), only when its
+/// route names the request's own candidate or leader instance, and is applied
+/// only by the instance it targets. Membership is not consulted, so a lagging
+/// receiver still admits the replication that repairs its view.
+fn admit_routed(
+	context: &RequestContext,
+	kind: &'static str,
+	route: &crate::consensus::raft_network::RaftRoute,
+	claimed_instance: u32,
+	local_instance: u32,
+) -> std::io::Result<()> {
+	admit_raft_sender(context, kind, route.sender_slot)?;
+	if route.sender_instance != claimed_instance {
+		tracing::warn!(
+			kind,
+			sender_instance = route.sender_instance,
+			claimed_instance,
+			"Raft request refused: its route names another instance than its vote"
+		);
+		return Err(Error::new(
+			ErrorKind::PermissionDenied,
+			format!(
+				"{kind} routed from instance {} names instance {claimed_instance} as its sender",
+				route.sender_instance
+			),
+		));
+	}
+	if route.target_instance != local_instance {
+		tracing::warn!(
+			kind,
+			target_instance = route.target_instance,
+			local_instance,
+			"Raft request refused: it is addressed to another instance of this slot"
+		);
+		return Err(Error::new(
+			ErrorKind::NotFound,
+			format!(
+				"{kind} addressed to instance {} reached instance {local_instance}",
+				route.target_instance
+			),
+		));
+	}
+	Ok(())
+}
+
+impl WendelonRaftInternalServer {
+	/// Decodes a request and admits it before any effect: Today by ADR 0103,
+	/// `ParentDecisions` by its route.
+	fn admitted<Req: serde::de::DeserializeOwned>(
+		&self,
+		context: &RequestContext,
+		kind: &'static str,
+		meta: &[u8],
+		claimed: impl FnOnce(&Req) -> u32,
+	) -> std::io::Result<Req> {
+		match self.decision_mode {
+			crate::consensus::decision_mode::DecisionMode::Today => {
+				let req: Req = wire::decode(meta)?;
+				admit_raft_sender(context, kind, claimed(&req))?;
+				Ok(req)
+			}
+			_ => {
+				let (route, req): (crate::consensus::raft_network::RaftRoute, Req) =
+					wire::decode(meta)?;
+				admit_routed(context, kind, &route, claimed(&req), self.local_instance)?;
+				Ok(req)
+			}
+		}
+	}
+}
+
 #[async_trait]
 impl RaftInternalServer for WendelonRaftInternalServer {
 	async fn handle_raft_frame(
@@ -218,8 +295,12 @@ impl RaftInternalServer for WendelonRaftInternalServer {
 		}
 		let (resp_type, body) = match msg_type {
 			MsgType::APPEND_ENTRIES_REQ => {
-				let req: AppendEntriesRequest<WendelonTypeConfig> = wire::decode(&frame.meta)?;
-				admit_raft_sender(&context, "AppendEntries", req.vote.leader_id.node_id)?;
+				let req: AppendEntriesRequest<WendelonTypeConfig> = self.admitted(
+					&context,
+					"AppendEntries",
+					&frame.meta,
+					|req: &AppendEntriesRequest<WendelonTypeConfig>| req.vote.leader_id.node_id,
+				)?;
 				// Harvest peer HLCs from any `Finalize` entries
 				// before the request moves into openraft. Every
 				// FinalizationMarker carries the leader's commit
@@ -250,8 +331,10 @@ impl RaftInternalServer for WendelonRaftInternalServer {
 				)
 			}
 			MsgType::VOTE_REQ => {
-				let req: VoteRequest<u32> = wire::decode(&frame.meta)?;
-				admit_raft_sender(&context, "Vote", req.vote.leader_id.node_id)?;
+				let req: VoteRequest<u32> =
+					self.admitted(&context, "Vote", &frame.meta, |req: &VoteRequest<u32>| {
+						req.vote.leader_id.node_id
+					})?;
 				let envelope: Result<VoteResponse<u32>, RaftError<u32>> = self.raft.vote(req).await;
 				(
 					MsgType::VOTE_RESP,
@@ -259,8 +342,12 @@ impl RaftInternalServer for WendelonRaftInternalServer {
 				)
 			}
 			MsgType::INSTALL_SNAPSHOT_REQ => {
-				let req: InstallSnapshotRequest<WendelonTypeConfig> = wire::decode(&frame.meta)?;
-				admit_raft_sender(&context, "InstallSnapshot", req.vote.leader_id.node_id)?;
+				let req: InstallSnapshotRequest<WendelonTypeConfig> = self.admitted(
+					&context,
+					"InstallSnapshot",
+					&frame.meta,
+					|req: &InstallSnapshotRequest<WendelonTypeConfig>| req.vote.leader_id.node_id,
+				)?;
 				let envelope: Result<
 					InstallSnapshotResponse<u32>,
 					RaftError<u32, InstallSnapshotError>,

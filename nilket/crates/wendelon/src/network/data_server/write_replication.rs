@@ -1107,7 +1107,7 @@ impl WendelonDataServer {
 		if let Some(forced) = *self.lease_gate_wait_hooks.forced_leader.borrow() {
 			return forced;
 		}
-		self.raft.current_leader().await
+		self.leader_slot().await
 	}
 
 	pub(super) async fn lease_gate_result(
