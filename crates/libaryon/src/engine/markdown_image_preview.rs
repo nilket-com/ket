@@ -447,12 +447,14 @@ pub(crate) fn scroll_target_view(session: &EditorSession) -> Option<ViewId> {
 
 pub(crate) fn markdown_image_preview_snapshot(
 	buffer: &MarkdownPreviewBuffer,
+	wrap_enabled: bool,
 ) -> MarkdownPreviewSnapshot {
 	let state = &buffer.state;
 	MarkdownPreviewSnapshot {
 		source_buffer_id: state.source_buffer_id,
 		source_view_id: state.source_view_id,
 		serif: state.serif,
+		wrap_enabled,
 		source_path: state.source_path.clone(),
 		source_text: state.source_text.clone(),
 		code_highlights: state.source_highlights.clone(),

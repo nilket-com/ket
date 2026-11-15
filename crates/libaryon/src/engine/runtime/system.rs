@@ -7365,6 +7365,75 @@ mod tests {
 	}
 
 	#[test]
+	fn markdown_preview_wrap_setting_reaches_snapshot_independently_of_source() {
+		let scratch_path = temp_test_path("markdown-preview-wrap-setting").with_extension("md");
+		std::fs::write(&scratch_path, "# Title\n\n```text\na long code line\n```\n")
+			.expect("write markdown");
+		let (tx_cmd, rx_view, handle) = spawn_test_engine_with_markdown(None);
+		let _loaded = send_cmd_and_recv(
+			&tx_cmd,
+			&rx_view,
+			EditorCommand::LoadFile(scratch_path.to_string_lossy().into_owned()),
+		);
+		let _default_wrap = send_cmd_and_recv(&tx_cmd, &rx_view, EditorCommand::PersistWrap(false));
+		let _source_wrap = send_cmd_and_recv(&tx_cmd, &rx_view, EditorCommand::SetWrap(true));
+		let opened = send_cmd_and_recv(
+			&tx_cmd,
+			&rx_view,
+			EditorCommand::MarkdownPreview { serif: false },
+		);
+		let initial_preview = opened
+			.panes
+			.iter()
+			.find(|pane| pane.markdown_preview.is_some())
+			.expect("preview pane");
+		assert!(
+			!initial_preview
+				.markdown_preview
+				.as_ref()
+				.expect("snapshot")
+				.wrap_enabled,
+			"new previews inherit persistent wrap, independently of source-local wrap"
+		);
+		let preview_id = initial_preview.pane_id;
+		let _focused = send_cmd_and_recv(&tx_cmd, &rx_view, EditorCommand::FocusPane(preview_id));
+		for (command, expected) in [
+			(EditorCommand::SetWrap(true), true),
+			(EditorCommand::SetWrap(false), false),
+			(EditorCommand::ToggleWrap, true),
+			(EditorCommand::PersistWrap(false), false),
+		] {
+			let rendered = send_cmd_and_recv(&tx_cmd, &rx_view, command);
+			let preview = rendered
+				.panes
+				.iter()
+				.find(|pane| pane.pane_id == preview_id)
+				.expect("preview pane");
+			assert_eq!(preview.wrap_enabled, expected);
+			assert_eq!(
+				preview
+					.markdown_preview
+					.as_ref()
+					.expect("snapshot")
+					.wrap_enabled,
+				expected
+			);
+			let source = rendered
+				.panes
+				.iter()
+				.find(|pane| pane.pane_id != preview_id)
+				.expect("source pane");
+			assert!(
+				source.wrap_enabled,
+				"preview wrap must not change the source setting"
+			);
+		}
+		tx_cmd.send(EditorCommand::Quit).expect("quit");
+		handle.join().expect("engine thread");
+		let _ = std::fs::remove_file(scratch_path);
+	}
+
+	#[test]
 	fn markdown_preview_refreshes_after_source_edits() {
 		let scratch_path = temp_test_path("markdown-preview-refresh").with_extension("md");
 		std::fs::write(&scratch_path, "# Title\n").expect("write markdown");

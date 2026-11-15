@@ -795,7 +795,12 @@ fn render_pane_viewport(
 				Vec::new(),
 				None,
 				Vec::new(),
-				Some(super::markdown_image_preview::markdown_image_preview_snapshot(document)),
+				Some(
+					super::markdown_image_preview::markdown_image_preview_snapshot(
+						document,
+						preview_view.state.wrap_enabled,
+					),
+				),
 				preview_view.state.current_theme.syntax_colors,
 				Vec::new(),
 				Vec::new(),

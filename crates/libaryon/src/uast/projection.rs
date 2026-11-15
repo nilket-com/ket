@@ -336,6 +336,8 @@ pub struct MarkdownPreviewSnapshot {
 	pub source_buffer_id: BufferId,
 	pub source_view_id: ViewId,
 	pub serif: bool,
+	/// The preview pane's local wrap setting, independent of its source pane.
+	pub wrap_enabled: bool,
 	pub source_path: Option<String>,
 	pub source_text: String,
 	/// Unresolved source-coordinate categories. Frontends map these through

@@ -18,6 +18,7 @@ use ratatui::{Frame, buffer::Buffer, layout::Rect, style::Style};
 use ratatui_image::{Image, Resize, picker::Picker, protocol::Protocol};
 use regex_automata::{meta::Regex, util::syntax};
 use std::{
+	borrow::Cow,
 	collections::HashMap,
 	collections::hash_map::DefaultHasher,
 	hash::{Hash, Hasher},
@@ -498,6 +499,17 @@ fn render_markdown_preview_image_with_renderer(
 		} else {
 			FontRole::Sans
 		},
+		code_advance: font_w.get(),
+	};
+	// Only wrapped layout depends on the true mono advance; without wrap the
+	// preview keeps its cell-width column arithmetic, pixel for pixel.
+	let metrics = if snapshot.wrap_enabled {
+		FontMetrics {
+			code_advance: measured_code_advance(text_renderer, &metrics),
+			..metrics
+		}
+	} else {
+		metrics
 	};
 	let padding_x = font_w.get().max(6);
 	let padding_y = PixelHeight::new((font_h.get() / 2).max(4));
@@ -512,6 +524,7 @@ fn render_markdown_preview_image_with_renderer(
 		padding_y,
 		snapshot.source_scroll_line.get(),
 		snapshot.source_viewport_line_count,
+		snapshot.wrap_enabled,
 	);
 	let palette = MarkdownPreviewPalette::from_theme(
 		theme_colors,
@@ -535,6 +548,7 @@ fn render_markdown_preview_image_with_renderer(
 			&metrics,
 			&palette,
 			text_renderer,
+			snapshot.wrap_enabled,
 		);
 	}
 
@@ -561,6 +575,7 @@ fn build_preview_layout(
 	padding_y: PixelHeight,
 	source_scroll_line: u64,
 	source_viewport_line_count: u32,
+	wrap: bool,
 ) -> PreviewLayout {
 	let mut y = padding_y;
 	let mut layouts = Vec::with_capacity(blocks.len());
@@ -572,6 +587,7 @@ fn build_preview_layout(
 			y.get(),
 			block,
 			metrics,
+			wrap,
 		));
 		layouts.push(BlockLayout { y_start, y_end: y });
 	}
@@ -632,6 +648,13 @@ struct FontMetrics {
 	body_scale_x: u32,
 	body_scale_y: u32,
 	body_role: FontRole,
+	/// Whole pixels one monospace glyph is allowed to advance the pen by,
+	/// measured from the loaded font ([`measured_code_advance`]). Column
+	/// arithmetic for code rows and table cells uses this, not `cell_w`: a mono
+	/// face at 0.86 of the cell height usually advances a fraction of a pixel
+	/// more than a terminal cell, which over a hundred columns is several
+	/// glyphs.
+	code_advance: u32,
 }
 
 struct PreviewCanvas<'a> {
@@ -948,6 +971,7 @@ fn measure_markdown_block(
 	y: u32,
 	block: &MarkdownBlock,
 	metrics: &FontMetrics,
+	wrap: bool,
 ) -> u32 {
 	match block {
 		MarkdownBlock::Heading { level, text, .. } => {
@@ -958,7 +982,7 @@ fn measure_markdown_block(
 				.saturating_add(metrics.cell_h.get() / 3)
 		}
 		MarkdownBlock::CodeBlock { info, text, .. } => {
-			measure_code_block(width, x, y, info.as_deref(), text, metrics)
+			measure_code_block(width, x, y, info.as_deref(), text, metrics, wrap)
 		}
 		MarkdownBlock::Quote { text, .. } => {
 			let body_x = x.saturating_add(metrics.cell_w.get());
@@ -985,9 +1009,9 @@ fn measure_markdown_block(
 		MarkdownBlock::Rule { .. } => y
 			.saturating_add(metrics.cell_h.get() / 2)
 			.saturating_add(metrics.cell_h.get()),
-		MarkdownBlock::Table { rows, .. } => measure_table(width, x, y, rows, metrics),
+		MarkdownBlock::Table { rows, .. } => measure_table(width, x, y, rows, metrics, wrap),
 		MarkdownBlock::Html { text, .. } => {
-			measure_code_block(width, x, y, Some("html"), text, metrics)
+			measure_code_block(width, x, y, Some("html"), text, metrics, wrap)
 		}
 	}
 }
@@ -1016,6 +1040,7 @@ fn measure_code_block(
 	info: Option<&str>,
 	text: &str,
 	metrics: &FontMetrics,
+	wrap: bool,
 ) -> u32 {
 	if let Some(info) = info.filter(|info| !info.trim().is_empty()) {
 		let label = format!("[{}]", info.trim());
@@ -1027,13 +1052,138 @@ fn measure_code_block(
 			TextSpec::body(metrics, MUTED_RGBA),
 		);
 	}
-	for _ in text.lines() {
-		y = measure_code_line(y, metrics);
+	let columns = code_row_columns(width, x, metrics);
+	for line in text.lines() {
+		for _ in code_line_rows(line, columns, wrap) {
+			y = measure_code_line(y, metrics);
+		}
 	}
 	if text.is_empty() {
 		y = measure_code_line(y, metrics);
 	}
 	y.saturating_add(metrics.cell_h.get() / 3)
+}
+
+/// Columns of a tab stop when a wrapped code line is laid out.
+const CODE_TAB_STOP: usize = 4;
+
+fn code_block_pad_x(metrics: &FontMetrics) -> u32 {
+	(metrics.cell_w.get() / 2).max(4)
+}
+
+/// The widest advance of a printable ASCII glyph (space included: spaces are
+/// drawn as their own fragments) across the four monospace
+/// faces (regular, bold, italic, bold italic: table cells carry emphasis),
+/// rounded UP to whole pixels; `glyph_w` when no font is loaded (the bitmap
+/// fallback advances exactly that).
+///
+/// Rounding once, up, is what makes the bound hold for drawn text, not just
+/// for one continuous run: [`draw_inline_words`] draws every word and every
+/// space with its own [`draw_text`], each returning its width rounded up, so
+/// a fragment of `k` glyphs is at most `ceil(k * a) <= k * ceil(a)` wide and a
+/// line of `n` glyphs in any number of fragments is at most `n * ceil(a)`.
+fn measured_code_advance(text_renderer: &TextRenderer, metrics: &FontMetrics) -> u32 {
+	let code = TextSpec::code(metrics, TEXT_RGBA);
+	[(false, false), (true, false), (false, true), (true, true)]
+		.into_iter()
+		.map(|(bold, italic)| TextSpec {
+			bold,
+			italic,
+			..code
+		})
+		.map(|spec| match text_renderer.font_for(spec) {
+			Some((font, _)) => (' '..='~')
+				.map(|ch| font.metrics(ch, spec.px_size).advance_width)
+				.fold(1.0f32, f32::max)
+				.ceil() as u32,
+			None => spec.glyph_w(),
+		})
+		.max()
+		.unwrap_or(1)
+		.max(1)
+}
+
+/// Whole code glyphs that fit in `px` pixels; at least one.
+fn code_columns_in(px: u32, metrics: &FontMetrics) -> usize {
+	(px / metrics.code_advance.max(1)).max(1) as usize
+}
+
+/// The x offset of the code column `column` from a row's left edge. Text of
+/// the columns before it, however it was split into fragments, ends at or
+/// before this offset.
+fn code_column_x(column: usize, metrics: &FontMetrics) -> u32 {
+	(column as u32).saturating_mul(metrics.code_advance.max(1))
+}
+
+/// How many code glyphs fit on one code-block row whose block starts at `x`.
+///
+/// The row's text starts one pad inside the block, and the block's right edge
+/// is `width - x / 2` (see [`draw_code_line`]); half a pad of breathing room is
+/// kept before that edge so a full row never touches it.
+fn code_row_columns(width: u32, x: u32, metrics: &FontMetrics) -> usize {
+	let pad_x = code_block_pad_x(metrics);
+	let text_left = x.saturating_add(pad_x);
+	let text_right = width.saturating_sub(x / 2).saturating_sub(pad_x / 2);
+	code_columns_in(text_right.saturating_sub(text_left), metrics)
+}
+
+/// The rows one source line of a code (or HTML) block occupies.
+///
+/// This is the single splitter both [`measure_code_block`] and
+/// [`draw_code_block`] use, so a block's measured height always equals the
+/// height it draws: the preview's scroll anchor depends on that.
+///
+/// Without wrap the line is one row, drawn verbatim and clipped at the pane
+/// edge, exactly as before wrap existed. With wrap, tabs expand to stops of
+/// [`CODE_TAB_STOP`] columns (a tab has no width of its own to count) and the
+/// line breaks on character boundaries every `columns` characters; code is
+/// whitespace-significant, so nothing is trimmed or re-flowed at word
+/// boundaries. Continuation rows repeat the line's leading indentation, capped
+/// at half a row, so a wrapped statement stays visibly inside its line. Every
+/// row consumes at least one character, so the split always terminates.
+fn code_line_rows(line: &str, columns: usize, wrap: bool) -> Vec<Cow<'_, str>> {
+	if !wrap {
+		return vec![Cow::Borrowed(line)];
+	}
+	let columns = columns.max(1);
+	let expanded = expand_code_tabs(line);
+	let chars = expanded.chars().collect::<Vec<_>>();
+	if chars.len() <= columns {
+		return vec![expanded];
+	}
+	let indent = chars.iter().take_while(|&&ch| ch == ' ').count();
+	let hang = indent.min(columns / 2);
+	let continuation = columns - hang;
+	let mut rows = vec![Cow::Owned(chars[..columns].iter().collect::<String>())];
+	let mut start = columns;
+	while start < chars.len() {
+		let end = start.saturating_add(continuation).min(chars.len());
+		let mut row = String::with_capacity(hang + (end - start));
+		row.extend(std::iter::repeat_n(' ', hang));
+		row.extend(&chars[start..end]);
+		rows.push(Cow::Owned(row));
+		start = end;
+	}
+	rows
+}
+
+fn expand_code_tabs(line: &str) -> Cow<'_, str> {
+	if !line.contains('\t') {
+		return Cow::Borrowed(line);
+	}
+	let mut expanded = String::with_capacity(line.len() + CODE_TAB_STOP);
+	let mut column = 0usize;
+	for ch in line.chars() {
+		if ch == '\t' {
+			let spaces = CODE_TAB_STOP - column % CODE_TAB_STOP;
+			expanded.extend(std::iter::repeat_n(' ', spaces));
+			column += spaces;
+		} else {
+			expanded.push(ch);
+			column += 1;
+		}
+	}
+	Cow::Owned(expanded)
 }
 
 fn measure_code_line(y: u32, metrics: &FontMetrics) -> u32 {
@@ -1044,11 +1194,12 @@ fn measure_code_line(y: u32, metrics: &FontMetrics) -> u32 {
 }
 
 fn measure_table(
-	_width: u32,
-	_x: u32,
+	width: u32,
+	x: u32,
 	mut y: u32,
 	rows: &[Vec<MarkdownInlineText>],
 	metrics: &FontMetrics,
+	wrap: bool,
 ) -> u32 {
 	if rows.is_empty() {
 		return y;
@@ -1058,14 +1209,52 @@ fn measure_table(
 	if columns == 0 {
 		return y;
 	}
-	// Cells clip instead of wrapping, so table height is independent of column widths.
-	for row_idx in 0..rows.len() {
-		y = y.saturating_add(spec.line_h());
+	// Without wrap, cells clip, so table height is independent of column
+	// widths. With wrap, a row is as tall as its tallest wrapped cell, laid out
+	// by the same `wrapped_table_row` that draw_table draws.
+	let column_widths = if wrap {
+		table_column_widths(rows, table_available_chars(width, x, metrics)).0
+	} else {
+		Vec::new()
+	};
+	for (row_idx, row) in rows.iter().enumerate() {
+		let lines = if wrap {
+			table_row_line_count(&wrapped_table_row(row, &column_widths))
+		} else {
+			1
+		};
+		y = y.saturating_add(spec.line_h().saturating_mul(lines as u32));
 		if row_idx == 0 {
 			y = y.saturating_add(metrics.cell_h.get() / 4);
 		}
 	}
 	y.saturating_add(metrics.cell_h.get() / 2)
+}
+
+fn table_available_chars(width: u32, x: u32, metrics: &FontMetrics) -> usize {
+	code_columns_in(width.saturating_sub(x), metrics)
+}
+
+/// A wrapped table row: for each column, the lines its cell's text occupies
+/// inside that column's width. An empty or missing cell has no lines.
+fn wrapped_table_row(
+	row: &[MarkdownInlineText],
+	column_widths: &[usize],
+) -> Vec<Vec<Vec<MarkdownInlineWord>>> {
+	column_widths
+		.iter()
+		.enumerate()
+		.map(|(col, &cell_width)| {
+			row.get(col)
+				.map(|cell| wrap_inline_words(cell, cell_width))
+				.unwrap_or_default()
+		})
+		.collect()
+}
+
+/// A wrapped row is as tall as its tallest cell, and never less than one line.
+fn table_row_line_count(cells: &[Vec<Vec<MarkdownInlineWord>>]) -> usize {
+	cells.iter().map(Vec::len).max().unwrap_or(0).max(1)
 }
 
 fn table_column_widths(
@@ -1248,6 +1437,7 @@ fn draw_markdown_block(
 	metrics: &FontMetrics,
 	palette: &MarkdownPreviewPalette,
 	text_renderer: &TextRenderer,
+	wrap: bool,
 ) -> u32 {
 	match block {
 		MarkdownBlock::Heading { level, text, .. } => {
@@ -1272,6 +1462,7 @@ fn draw_markdown_block(
 			metrics,
 			palette,
 			text_renderer,
+			wrap,
 		),
 		MarkdownBlock::Quote { text, .. } => {
 			draw_quote(canvas, x, y, text, metrics, palette, text_renderer)
@@ -1301,7 +1492,7 @@ fn draw_markdown_block(
 			y.saturating_add(metrics.cell_h.get())
 		}
 		MarkdownBlock::Table { rows, .. } => {
-			draw_table(canvas, x, y, rows, metrics, palette, text_renderer)
+			draw_table(canvas, x, y, rows, metrics, palette, text_renderer, wrap)
 		}
 		MarkdownBlock::Html { text, .. } => draw_code_block(
 			canvas,
@@ -1312,6 +1503,7 @@ fn draw_markdown_block(
 			metrics,
 			palette,
 			text_renderer,
+			wrap,
 		),
 	}
 }
@@ -1536,6 +1728,7 @@ fn draw_code_block(
 	metrics: &FontMetrics,
 	palette: &MarkdownPreviewPalette,
 	text_renderer: &TextRenderer,
+	wrap: bool,
 ) -> u32 {
 	if let Some(info) = info.filter(|info| !info.trim().is_empty()) {
 		let label = format!("[{}]", info.trim());
@@ -1548,8 +1741,11 @@ fn draw_code_block(
 			text_renderer,
 		);
 	}
+	let columns = code_row_columns(canvas.width(), x, metrics);
 	for line in text.lines() {
-		y = draw_code_line(canvas, x, y, line, metrics, palette, text_renderer);
+		for row in code_line_rows(line, columns, wrap) {
+			y = draw_code_line(canvas, x, y, &row, metrics, palette, text_renderer);
+		}
 	}
 	if text.is_empty() {
 		y = draw_code_line(canvas, x, y, "", metrics, palette, text_renderer);
@@ -1567,7 +1763,7 @@ fn draw_code_line(
 	text_renderer: &TextRenderer,
 ) -> u32 {
 	let spec = TextSpec::code(metrics, palette.code_block);
-	let block_pad_x = (metrics.cell_w.get() / 2).max(4);
+	let block_pad_x = code_block_pad_x(metrics);
 	let block_pad_y = (metrics.cell_h.get() / 5).max(2);
 	let block_top = y.saturating_sub(block_pad_y / 2);
 	let block_bottom = y.saturating_add(spec.glyph_h()).saturating_add(block_pad_y);
@@ -1598,6 +1794,7 @@ fn draw_table(
 	metrics: &FontMetrics,
 	palette: &MarkdownPreviewPalette,
 	text_renderer: &TextRenderer,
+	wrap: bool,
 ) -> u32 {
 	if rows.is_empty() {
 		return y;
@@ -1609,15 +1806,13 @@ fn draw_table(
 	if columns == 0 {
 		return y;
 	}
-	let available_chars = canvas
-		.width()
-		.saturating_sub(x)
-		.saturating_div(spec.glyph_w().max(1))
-		.max(1) as usize;
+	let available_chars = table_available_chars(canvas.width(), x, metrics);
 	let (column_widths, gutter_chars) = table_column_widths(rows, available_chars);
 	for (row_idx, row) in rows.iter().enumerate() {
+		let wrapped = wrap.then(|| wrapped_table_row(row, &column_widths));
+		let lines = wrapped.as_deref().map_or(1, table_row_line_count);
 		let row_top = y;
-		let row_bottom = y.saturating_add(spec.line_h());
+		let row_bottom = y.saturating_add(spec.line_h().saturating_mul(lines as u32));
 		if let Some(background) = table_row_background(row_idx, palette) {
 			fill_rect(
 				canvas,
@@ -1632,21 +1827,38 @@ fn draw_table(
 				background,
 			);
 		}
+		let cell_spec = if row_idx == 0 { header_spec } else { spec };
 		let mut cell_offset = 0usize;
 		for (col, &cell_width) in column_widths.iter().enumerate() {
-			let empty_cell = MarkdownInlineText::new();
-			let cell_text = row.get(col).unwrap_or(&empty_cell);
-			let clipped = clipped_inline_chars(cell_text, cell_width);
-			let cell_x = x.saturating_add(cell_offset as u32 * spec.glyph_w());
-			draw_inline_text(
-				text_renderer,
-				canvas,
-				cell_x,
-				y,
-				&clipped,
-				if row_idx == 0 { header_spec } else { spec },
-				inline_code_spec,
-			);
+			let cell_x = x.saturating_add(code_column_x(cell_offset, metrics));
+			if let Some(wrapped) = wrapped.as_ref() {
+				let mut line_y = y;
+				for line in &wrapped[col] {
+					draw_inline_words(
+						text_renderer,
+						canvas,
+						cell_x,
+						line_y,
+						line,
+						cell_spec,
+						inline_code_spec,
+					);
+					line_y = line_y.saturating_add(spec.line_h());
+				}
+			} else {
+				let empty_cell = MarkdownInlineText::new();
+				let cell_text = row.get(col).unwrap_or(&empty_cell);
+				let clipped = clipped_inline_chars(cell_text, cell_width);
+				draw_inline_text(
+					text_renderer,
+					canvas,
+					cell_x,
+					y,
+					&clipped,
+					cell_spec,
+					inline_code_spec,
+				);
+			}
 			cell_offset = cell_offset
 				.saturating_add(cell_width)
 				.saturating_add(gutter_chars);
@@ -1714,6 +1926,55 @@ fn inline_words(text: &MarkdownInlineText) -> Vec<MarkdownInlineWord> {
 		}
 	}
 	words
+}
+
+/// Flows inline words into lines of at most `max_chars` characters; a word
+/// longer than a line breaks on character boundaries. This is the line
+/// breaking [`draw_wrapped_inline_text`] applies to prose, returned as data so
+/// a table can measure a wrapped cell with the same lines it draws.
+fn wrap_inline_words(text: &MarkdownInlineText, max_chars: usize) -> Vec<Vec<MarkdownInlineWord>> {
+	let max_chars = max_chars.max(1);
+	let mut lines = Vec::new();
+	let mut line = Vec::new();
+	let mut line_len = 0usize;
+	for word in inline_words(text) {
+		let style = word.style;
+		let mut remaining = word.text;
+		let mut leading_space = word.leading_space;
+		while !remaining.is_empty() {
+			let remaining_len = remaining.chars().count();
+			let space_len = usize::from(leading_space && line_len > 0);
+			if line_len > 0 && line_len + space_len + remaining_len > max_chars {
+				lines.push(std::mem::take(&mut line));
+				line_len = 0;
+				leading_space = false;
+				continue;
+			}
+			// An empty line takes the whole width; a non-empty one reached
+			// here only because the word fits after it.
+			if remaining_len <= max_chars.saturating_sub(line_len + space_len) {
+				line_len += space_len + remaining_len;
+				line.push(MarkdownInlineWord {
+					style,
+					text: remaining,
+					leading_space: space_len > 0,
+				});
+				break;
+			}
+			line.push(MarkdownInlineWord {
+				style,
+				text: take_chars(&remaining, max_chars),
+				leading_space: false,
+			});
+			lines.push(std::mem::take(&mut line));
+			remaining = skip_chars(&remaining, max_chars);
+			leading_space = false;
+		}
+	}
+	if !line.is_empty() {
+		lines.push(line);
+	}
+	lines
 }
 
 fn clipped_inline_chars(text: &MarkdownInlineText, max_chars: usize) -> MarkdownInlineText {
@@ -2549,6 +2810,7 @@ mod tests {
 			body_scale_x: 1,
 			body_scale_y: 2,
 			body_role: FontRole::Sans,
+			code_advance: 8,
 		};
 		let body = TextSpec::body(&metrics, TEXT_RGBA);
 		let code = TextSpec::code(&metrics, CODE_TEXT_RGBA);
@@ -2590,6 +2852,7 @@ mod tests {
 			body_scale_x: 1,
 			body_scale_y: 2,
 			body_role: FontRole::Sans,
+			code_advance: 8,
 		};
 		let body = TextSpec::body(&metrics, TEXT_RGBA);
 		let code = TextSpec::code(&metrics, CODE_TEXT_RGBA);
@@ -2649,6 +2912,7 @@ mod tests {
 			body_scale_x: 1,
 			body_scale_y: 2,
 			body_role: FontRole::Sans,
+			code_advance: 8,
 		};
 		let spec = TextSpec::body(&metrics, TEXT_RGBA);
 
@@ -2672,6 +2936,7 @@ mod tests {
 			body_scale_x: 1,
 			body_scale_y: 2,
 			body_role: FontRole::Sans,
+			code_advance: 8,
 		};
 		let layout = build_preview_layout(
 			&source,
@@ -2683,6 +2948,7 @@ mod tests {
 			PixelHeight::new(8),
 			18,
 			8,
+			true,
 		);
 		let code_idx = blocks
 			.iter()
@@ -2708,6 +2974,7 @@ mod tests {
 			body_scale_x: 1,
 			body_scale_y: 2,
 			body_role: FontRole::Sans,
+			code_advance: 8,
 		};
 		let width = PixelWidth::new(320);
 		let height = PixelHeight::new(128);
@@ -2722,6 +2989,7 @@ mod tests {
 			padding_y,
 			source_line_count(&source).saturating_sub(12),
 			12,
+			true,
 		);
 		let document_height = layout
 			.blocks
@@ -2744,6 +3012,7 @@ mod tests {
 			source_buffer_id: BufferId::new(1),
 			source_view_id: ViewId::new(1),
 			serif: false,
+			wrap_enabled: true,
 			source_path: Some("README.md".to_string()),
 			source_text: "# Title\n\n- item\n\n```rust\nfn main() {}\n```\n".to_string(),
 			code_highlights: Vec::new(),
@@ -2772,6 +3041,7 @@ mod tests {
 			source_buffer_id: BufferId::new(1),
 			source_view_id: ViewId::new(1),
 			serif: false,
+			wrap_enabled: true,
 			source_path: Some("README.md".to_string()),
 			source_text: "Alpha needle omega\n\n- another NEEDLE\n".to_string(),
 			code_highlights: Vec::new(),
@@ -2884,6 +3154,7 @@ mod tests {
 			source_buffer_id: BufferId::new(1),
 			source_view_id: ViewId::new(1),
 			serif: false,
+			wrap_enabled: true,
 			source_path: Some("README.md".to_string()),
 			source_text: "plain body text\n".to_string(),
 			code_highlights: Vec::new(),
@@ -3025,6 +3296,7 @@ mod tests {
 			source_buffer_id: BufferId::new(1),
 			source_view_id: ViewId::new(1),
 			serif: false,
+			wrap_enabled: true,
 			source_path: None,
 			source_text: String::new(),
 			code_highlights: Vec::new(),
@@ -3084,6 +3356,7 @@ mod tests {
 			body_scale_x: 1,
 			body_scale_y: 2,
 			body_role: FontRole::Serif,
+			code_advance: 8,
 		};
 
 		assert!(matches!(
@@ -3115,6 +3388,7 @@ mod tests {
 			source_buffer_id: BufferId::new(1),
 			source_view_id: ViewId::new(1),
 			serif: false,
+			wrap_enabled: true,
 			source_path: Some("results.md".to_string()),
 			source_text: "| Key | Value |\n| --- | --- |\n| first | 1 |\n| second | 2 |\n"
 				.to_string(),
@@ -3145,6 +3419,7 @@ mod tests {
 			source_buffer_id: BufferId::new(1),
 			source_view_id: ViewId::new(1),
 			serif: false,
+			wrap_enabled: true,
 			source_path: Some("README.md".to_string()),
 			source_text: "plain body text\n".to_string(),
 			code_highlights: Vec::new(),
@@ -3191,6 +3466,7 @@ mod tests {
 			source_buffer_id: BufferId::new(1),
 			source_view_id: ViewId::new(1),
 			serif: false,
+			wrap_enabled: true,
 			source_path: Some("README.md".to_string()),
 			source_text: "- item `code`\n1. next\n".to_string(),
 			code_highlights: Vec::new(),
@@ -3233,5 +3509,276 @@ mod tests {
 				&& pixel[0] > pixel[1].saturating_add(8)
 				&& pixel[2] > pixel[1].saturating_add(8)
 		}));
+	}
+
+	fn wrap_test_metrics() -> FontMetrics {
+		FontMetrics {
+			cell_w: PixelWidth::new(8),
+			cell_h: PixelHeight::new(16),
+			body_scale_x: 1,
+			body_scale_y: 2,
+			body_role: FontRole::Sans,
+			code_advance: 8,
+		}
+	}
+
+	/// Draws one block at (8, 8) on a canvas tall enough that nothing is cut
+	/// off at the visible bottom, and returns the y the block ends at.
+	fn drawn_block_end(block: &MarkdownBlock, width: u32, wrap: bool) -> u32 {
+		let metrics = wrap_test_metrics();
+		let palette = MarkdownPreviewPalette::from_theme(
+			&[None; CATEGORY_COUNT],
+			UiPalette::default().preview_text,
+			UiPalette::default().accent,
+		);
+		let mut image = RgbaImage::from_pixel(width, 8192, BG_RGBA);
+		let mut canvas = PreviewCanvas::new(&mut image, PixelY::new(0), None);
+		draw_markdown_block(
+			&mut canvas,
+			8,
+			8,
+			block,
+			&metrics,
+			&palette,
+			&TextRenderer::load(),
+			wrap,
+		)
+	}
+
+	fn wrap_test_snapshot(source_text: &str, wrap_enabled: bool) -> MarkdownPreviewSnapshot {
+		MarkdownPreviewSnapshot {
+			source_buffer_id: BufferId::new(1),
+			source_view_id: ViewId::new(1),
+			serif: false,
+			wrap_enabled,
+			source_path: Some("notes.md".to_string()),
+			source_text: source_text.to_string(),
+			code_highlights: Vec::new(),
+			theme_colors: [None; CATEGORY_COUNT],
+			cells: Vec::new(),
+			source_scroll_line: DocLine::ZERO,
+			source_viewport_line_count: 24,
+		}
+	}
+
+	fn row_texts(rows: Vec<Cow<'_, str>>) -> Vec<String> {
+		rows.into_iter().map(Cow::into_owned).collect()
+	}
+
+	fn line_texts(lines: &[Vec<MarkdownInlineWord>]) -> Vec<String> {
+		lines
+			.iter()
+			.map(|line| {
+				line.iter()
+					.enumerate()
+					.map(|(idx, word)| {
+						if idx > 0 && word.leading_space {
+							format!(" {}", word.text)
+						} else {
+							word.text.clone()
+						}
+					})
+					.collect::<String>()
+			})
+			.collect()
+	}
+
+	#[test]
+	fn code_line_without_wrap_is_one_verbatim_row() {
+		let line = "\tlet total = alpha + beta + gamma + delta; // long";
+		assert_eq!(row_texts(code_line_rows(line, 8, false)), vec![line]);
+	}
+
+	#[test]
+	fn wrapped_code_line_breaks_on_char_boundaries_and_keeps_its_indent() {
+		assert_eq!(
+			row_texts(code_line_rows("    abcdefghij", 8, true)),
+			vec!["    abcd", "    efgh", "    ij"]
+		);
+		// The indentation a continuation repeats is capped at half a row, so
+		// a deeply indented line still advances.
+		assert_eq!(
+			row_texts(code_line_rows("          abcdef", 8, true)),
+			vec!["        ", "      ab", "    cdef"]
+		);
+		// A line that fits is one row, unchanged.
+		assert_eq!(row_texts(code_line_rows("fits", 8, true)), vec!["fits"]);
+	}
+
+	#[test]
+	fn wrapped_code_line_expands_tabs_to_four_column_stops() {
+		assert_eq!(row_texts(code_line_rows("\tx", 80, true)), vec!["    x"]);
+		assert_eq!(row_texts(code_line_rows("ab\tc", 80, true)), vec!["ab  c"]);
+		assert_eq!(
+			row_texts(code_line_rows("\tabcdef", 6, true)),
+			vec!["    ab", "   cde", "   f"]
+		);
+	}
+
+	#[test]
+	fn wrapped_code_line_splits_multibyte_text_by_character() {
+		assert_eq!(
+			row_texts(code_line_rows("ééééé", 2, true)),
+			vec!["éé", "éé", "é"]
+		);
+	}
+
+	#[test]
+	fn wrapped_code_line_terminates_at_degenerate_widths() {
+		assert_eq!(
+			row_texts(code_line_rows("abc", 0, true)),
+			vec!["a", "b", "c"]
+		);
+		assert_eq!(
+			row_texts(code_line_rows("  ab", 1, true)),
+			vec![" ", " ", "a", "b"]
+		);
+	}
+
+	#[test]
+	fn wrapped_inline_words_flow_and_break_unbreakable_words() {
+		let mut text = MarkdownInlineText::new();
+		text.push(MarkdownInlineStyle::TEXT, "alpha beta ");
+		text.push(MarkdownInlineStyle::CODE, "gammadeltaepsilon");
+		let lines = wrap_inline_words(&text, 10);
+		assert_eq!(
+			line_texts(&lines),
+			vec!["alpha beta", "gammadelta", "epsilon"]
+		);
+		assert_eq!(lines[1][0].style, MarkdownInlineStyle::CODE);
+		assert!(wrap_inline_words(&MarkdownInlineText::new(), 10).is_empty());
+		// A one-character column still progresses one character per line.
+		assert_eq!(line_texts(&wrap_inline_words(&text, 0)).len(), 26);
+	}
+
+	#[test]
+	fn measured_height_equals_drawn_height_for_wrapped_and_clipped_blocks() {
+		let long = "x".repeat(300);
+		let source = format!(
+			"```sql\nselect {long}\n\tfrom t\n```\n\n<div>{long}</div>\n\n| Key | Value |\n| --- | --- |\n| first | {long} |\n| second | short |\n"
+		);
+		let blocks = parse_markdown_blocks(&source);
+		assert!(
+			blocks
+				.iter()
+				.any(|block| matches!(block, MarkdownBlock::CodeBlock { .. }))
+		);
+		assert!(
+			blocks
+				.iter()
+				.any(|block| matches!(block, MarkdownBlock::Table { .. }))
+		);
+		let metrics = wrap_test_metrics();
+		let width = 320;
+		for block in &blocks {
+			let mut heights = Vec::new();
+			for wrap in [false, true] {
+				let measured = measure_markdown_block(width, 8, 8, block, &metrics, wrap);
+				let drawn = drawn_block_end(block, width, wrap);
+				assert_eq!(measured, drawn, "wrap={wrap} block={block:?}");
+				heights.push(measured);
+			}
+			assert!(
+				heights[1] > heights[0],
+				"a block with a 300-character line grows when wrapped: {block:?}"
+			);
+		}
+	}
+
+	#[test]
+	fn wrap_setting_changes_the_rendered_preview_and_its_fingerprint() {
+		let source = format!("```text\n{}\n```\n", "wrapped ".repeat(40));
+		let area = Rect {
+			x: 0,
+			y: 0,
+			width: 40,
+			height: 24,
+		};
+		let clipped =
+			render_markdown_preview_image(&wrap_test_snapshot(&source, false), area, (8, 16))
+				.to_rgba8();
+		let wrapped =
+			render_markdown_preview_image(&wrap_test_snapshot(&source, true), area, (8, 16))
+				.to_rgba8();
+		assert_ne!(clipped, wrapped);
+
+		// Code-block background rows: the wrapped line occupies more of them.
+		let code_rows = |image: &RgbaImage| {
+			(0..image.height())
+				.filter(|&y| image.get_pixel(image.width() / 2, y) == &CODE_BG_RGBA)
+				.count()
+		};
+		assert!(code_rows(&wrapped) > code_rows(&clipped));
+
+		let search = PreviewSearchConfig {
+			pattern: None,
+			case_insensitive: false,
+			highlight: libaryon::core::SEARCH_MATCH_BG,
+		};
+		let fingerprint = |wrap| {
+			preview_request_fingerprint(
+				&wrap_test_snapshot(&source, wrap),
+				area,
+				(8, 16),
+				&[None; CATEGORY_COUNT],
+				&search,
+				UiPalette::default(),
+			)
+		};
+		assert_ne!(fingerprint(false), fingerprint(true));
+	}
+
+	#[test]
+	fn code_columns_fit_the_loaded_mono_font_advance() {
+		let text_renderer = TextRenderer::load();
+		let mut metrics = wrap_test_metrics();
+		metrics.code_advance = measured_code_advance(&text_renderer, &metrics);
+		assert!(metrics.code_advance >= 1);
+		let width = 640;
+		let x = 8;
+		let pad_x = code_block_pad_x(&metrics);
+		let text_px = width - x / 2 - pad_x / 2 - (x + pad_x);
+		let columns = code_row_columns(width, x, &metrics);
+		let code = TextSpec::code(&metrics, TEXT_RGBA);
+		let faces =
+			[(false, false), (true, false), (false, true), (true, true)].map(|(bold, italic)| {
+				TextSpec {
+					bold,
+					italic,
+					..code
+				}
+			});
+		for spec in faces {
+			// The worst case for per-fragment rounding: one-glyph words with a
+			// space between each, every fragment measured (and drawn) alone,
+			// as draw_inline_words draws them.
+			for n in 1..=columns {
+				let fragments = (0..n)
+					.map(|idx| if idx % 2 == 0 { "W" } else { " " })
+					.map(|fragment| measure_text_width(&text_renderer, fragment, spec))
+					.sum::<u32>();
+				assert!(
+					fragments <= code_column_x(n, &metrics),
+					"{n} one-glyph fragments fit their {n} columns"
+				);
+			}
+			for sample in ['M', 'W', '0', '_', 'i'] {
+				let row = sample.to_string().repeat(columns);
+				assert!(
+					measure_text_width(&text_renderer, &row, spec) <= text_px,
+					"a full row of {columns} {sample:?} fits {text_px}px (advance {})",
+					metrics.code_advance
+				);
+				// Table cells start at code_column_x, which never lies inside
+				// the text of the cells before it.
+				for n in 1..=columns {
+					let prefix = sample.to_string().repeat(n);
+					assert!(
+						measure_text_width(&text_renderer, &prefix, spec)
+							<= code_column_x(n, &metrics)
+					);
+				}
+			}
+		}
 	}
 }
