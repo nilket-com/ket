@@ -48,6 +48,7 @@ pub mod hash;
 #[doc(hidden)]
 pub mod idle_soak;
 pub mod integration;
+pub mod logical_backup;
 pub mod metrics;
 pub mod network;
 pub mod node;

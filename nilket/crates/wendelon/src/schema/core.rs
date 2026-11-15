@@ -2588,7 +2588,10 @@ pub const SNAPSHOT_FORMAT_VERSION: u8 = 21;
 /// ADR 0729: 23, whose lineages carry a floor, a protection and a pending
 /// first grant, and whose decisions include a lineage takeover (22 was ADR
 /// 0728's; 21 is Today's).
-pub const SNAPSHOT_FORMAT_VERSION_PARENT_DECISIONS: u8 = 23;
+///
+/// ADR 0736: 24, whose decision state carries the backup hold (23 was ADR 0729
+/// to ADR 0735's).
+pub const SNAPSHOT_FORMAT_VERSION_PARENT_DECISIONS: u8 = 24;
 
 /// Shape of the Control Ring WAL record bodies this build writes, including the
 /// `postcard(Entry<..>)` payload of a log record. ADR 0697 version 6 carries
@@ -2619,7 +2622,11 @@ pub const WAL_FORMAT_VERSION: u8 = 21;
 /// takeover is a decision, and grants, releases and claims are admitted by new
 /// rules; an earlier log is refused whole, never replayed under them (22 was
 /// ADR 0728's; 21 is Today's).
-pub const WAL_FORMAT_VERSION_PARENT_DECISIONS: u8 = 23;
+///
+/// ADR 0736: 24. The decisions include the backup hold, which refuses new
+/// reservations and the mode's logical mutations at apply; an earlier log is
+/// refused whole (23 was ADR 0729 to ADR 0735's).
+pub const WAL_FORMAT_VERSION_PARENT_DECISIONS: u8 = 24;
 
 // Static assertions to ensure all our size calculations remain exactly correct
 const _: () = assert!(std::mem::size_of::<HybridTimestamp>() == 16);

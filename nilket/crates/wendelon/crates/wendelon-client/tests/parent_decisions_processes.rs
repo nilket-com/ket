@@ -353,6 +353,10 @@ fn node_control() -> Option<PathBuf> {
 		.map(PathBuf::from)
 }
 
+/// Which cluster's nodes node-control acts on: empty for the first (`node-<id>`), or a name
+/// for a second cluster formed in the same run after the first is gone (`PD_CLUSTER`).
+static NODE_CONTROL_CLUSTER: std::sync::Mutex<&'static str> = std::sync::Mutex::new("");
+
 /// A node-control call's bound, beyond whatever the action itself is given.
 const CONTROL_BOUND: Duration = Duration::from_secs(30);
 
@@ -371,6 +375,12 @@ fn node_control_call(
 ) -> (bool, Vec<u8>, String) {
 	let mut command = Command::new(control);
 	command.arg(verb).arg(id.to_string());
+	let cluster = *NODE_CONTROL_CLUSTER
+		.lock()
+		.unwrap_or_else(std::sync::PoisonError::into_inner);
+	if !cluster.is_empty() {
+		command.env("PD_CLUSTER", cluster);
+	}
 	if let Some(argument) = argument {
 		command.arg(argument);
 	}
@@ -1267,9 +1277,19 @@ struct Formed {
 /// A node's `[storage]` body and what follows `[tuning]`'s first lines. With no store both are
 /// what the configuration always held. With one: small slabs, the store, an eager tiering
 /// scan, and the stall bound written out at the test's declared value.
-fn storage_section(dir: &Path, store: Option<&StoreEnv>) -> (String, String) {
+fn storage_section(dir: &Path, store: Option<&StoreEnv>, declared: bool) -> (String, String) {
+	// The declared profile (stall bound, and the consensus base when one is declared) is
+	// written with a store, or without one when the caller asks (`declared`); with neither,
+	// the configuration states no profile and the product defaults apply.
+	let tuning = format!(
+		"query_stall_bound_millis = {QUERY_STALL_BOUND_MILLIS}\n{}",
+		declared_consensus_base()
+			.map(|base| format!("consensus_timing_base_millis = {base}\n"))
+			.unwrap_or_default()
+	);
 	let Some(store) = store else {
-		return ("data_dir = \"data\"\n".to_owned(), String::new());
+		let tuning = if declared { tuning } else { String::new() };
+		return ("data_dir = \"data\"\n".to_owned(), tuning);
 	};
 	let keys = dir.join("s3");
 	std::fs::create_dir_all(&keys).unwrap();
@@ -1304,12 +1324,7 @@ min_slab_bytes = 1
 			region = store.region,
 			prefix = store.prefix,
 		),
-		format!(
-			"query_stall_bound_millis = {QUERY_STALL_BOUND_MILLIS}\n{}",
-			declared_consensus_base()
-				.map(|base| format!("consensus_timing_base_millis = {base}\n"))
-				.unwrap_or_default()
-		),
+		tuning,
 	)
 }
 
@@ -1399,9 +1414,23 @@ fn report_consensus_timing(member: &Member, inspection: &Inspection, what: &str)
 }
 
 async fn form(deadline: Instant, store: Option<&StoreEnv>) -> Formed {
+	form_cluster(deadline, store, "", true, false).await
+}
+
+/// `form`, with the run directory's name suffixed by `label` (a second cluster in the same
+/// process), with the tenant and its table created only when `establish` is set (a cluster
+/// formed without them holds only what formation creates), and with the run's declared
+/// profile written even without a store when `declared_without_store` is set.
+async fn form_cluster(
+	deadline: Instant,
+	store: Option<&StoreEnv>,
+	label: &str,
+	establish: bool,
+	declared_without_store: bool,
+) -> Formed {
 	// Kept on failure for its logs; removed only at the end of a pass. Holds secrets: it is
 	// created private and is never printed.
-	let root = std::env::temp_dir().join(format!("nilket-pd-smoke-{}", std::process::id()));
+	let root = std::env::temp_dir().join(format!("nilket-pd-smoke-{}{label}", std::process::id()));
 	std::fs::create_dir_all(&root).unwrap();
 	std::fs::set_permissions(&root, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
 	eprintln!("smoke: run directory {}", root.display());
@@ -1521,7 +1550,7 @@ async fn form(deadline: Instant, store: Option<&StoreEnv>) -> Formed {
 				)
 			}
 		};
-		let (storage, stall) = storage_section(&dir, store);
+		let (storage, stall) = storage_section(&dir, store, declared_without_store);
 		let body = format!(
 			r#"[node]
 node_id = {id}
@@ -1645,6 +1674,16 @@ metrics = "{metrics}"
 		wait_ready(member, &pki, &mut daemons, deadline, "formation");
 	}
 
+	let descriptor = descriptor();
+	if !establish {
+		return Formed {
+			root,
+			pki,
+			members,
+			daemons,
+			descriptor,
+		};
+	}
 	// The operator creates the application's tenant with the cluster's replication factor,
 	// through the public command, once. A failure is this step's result.
 	assert!(step(deadline) > Duration::ZERO);
@@ -1663,7 +1702,6 @@ metrics = "{metrics}"
 		assert!(found, "tenant get through node {}: {output}", member.id);
 	}
 
-	let descriptor = descriptor();
 	// The operator's client administers: it submits the schema update and nothing else.
 	let operator = client_through(&members[0], &pki, Credential::Operator, deadline).await;
 	tokio::time::timeout(
@@ -4759,4 +4797,424 @@ async fn three_daemons_offload_to_the_object_store_and_recover_after_a_refused_w
 		}
 	}
 	std::fs::remove_dir_all(&formed.root).unwrap();
+}
+
+// ============================================================
+//  ADR 0736: BACK UP COLD ROWS, LOSE THE INSTALLATION, RESTORE INTO A FRESH CLUSTER
+// ============================================================
+
+/// The whole workflow's bound: two formations, the offload, the backup and the restore.
+const BACKUP_TEST_BOUND: Duration = Duration::from_secs(1200);
+/// One `nilket wendelon backup` command's bound (its scrypt costs 128 MiB and seconds).
+const BACKUP_COMMAND_BOUND: Duration = Duration::from_secs(300);
+
+/// One command's run under ONE absolute deadline that covers its execution and its complete
+/// output: both pipes are drained on threads of their own while it runs, and the result counts
+/// only when the exit status AND both streams' ends were observed before the deadline. Past it,
+/// the command's process group is killed and the run is a failure, whatever arrived.
+struct Ran {
+	/// Exit status and both streams whole, all before the deadline.
+	within: bool,
+	/// The exit code, when the process exited (before or after the deadline).
+	code: Option<i32>,
+	/// The deadline ended the run.
+	timed_out: bool,
+	stdout: String,
+	stderr: String,
+}
+
+impl Ran {
+	fn succeeded(&self) -> bool {
+		self.within && self.code == Some(0)
+	}
+
+	fn text(&self) -> String {
+		format!(
+			"exit {:?}{}; stdout: {}; stderr: {}",
+			self.code,
+			if self.timed_out {
+				" (CUT at its deadline)"
+			} else if !self.within {
+				" (output not whole)"
+			} else {
+				""
+			},
+			self.stdout.trim(),
+			self.stderr.trim()
+		)
+	}
+}
+
+fn bounded_run(program: &Path, arguments: &[std::ffi::OsString], end: Instant) -> Ran {
+	let mut child = Command::new(program)
+		.args(arguments)
+		.stdin(Stdio::null())
+		.stdout(Stdio::piped())
+		.stderr(Stdio::piped())
+		.process_group(0)
+		.spawn()
+		.unwrap_or_else(|error| panic!("run {}: {error}", program.display()));
+	let group = child.id();
+	let reader = |pipe: Option<Box<dyn std::io::Read + Send>>| {
+		let (sender, receiver) = std::sync::mpsc::channel();
+		std::thread::spawn(move || {
+			let mut bytes = Vec::new();
+			let read = match pipe {
+				Some(mut pipe) => pipe.read_to_end(&mut bytes).map(|_| bytes),
+				None => Ok(bytes),
+			};
+			let _ = sender.send(read);
+		});
+		receiver
+	};
+	let stdout = reader(child.stdout.take().map(|pipe| Box::new(pipe) as _));
+	let stderr = reader(child.stderr.take().map(|pipe| Box::new(pipe) as _));
+	let status = loop {
+		match child.try_wait().expect("wait for the command") {
+			Some(status) => break Some(status),
+			None if Instant::now() >= end => break None,
+			None => std::thread::sleep(Duration::from_millis(20)),
+		}
+	};
+	let left = |end: Instant| end.saturating_duration_since(Instant::now());
+	let mut out = stdout.recv_timeout(left(end));
+	let mut err = stderr.recv_timeout(left(end));
+	// Observed in time only if everything arrived and the deadline had not passed by then.
+	let whole_in_time = status.is_some()
+		&& matches!(out, Ok(Ok(_)))
+		&& matches!(err, Ok(Ok(_)))
+		&& Instant::now() <= end;
+	if !whole_in_time {
+		kill_group(group);
+		let _ = child.wait();
+		let grace = Instant::now() + Duration::from_secs(2);
+		if out.is_err() {
+			out = stdout.recv_timeout(left(grace));
+		}
+		if err.is_err() {
+			err = stderr.recv_timeout(left(grace));
+		}
+	}
+	let text =
+		|read: &Result<std::io::Result<Vec<u8>>, std::sync::mpsc::RecvTimeoutError>| match read {
+			Ok(Ok(bytes)) => String::from_utf8_lossy(bytes).into_owned(),
+			Ok(Err(error)) => format!("<read failed: {error}>"),
+			Err(_) => "<still open after the deadline and the kill>".to_owned(),
+		};
+	Ran {
+		within: whole_in_time,
+		code: status.and_then(|status| status.code()),
+		timed_out: status.is_none() || Instant::now() > end && !whole_in_time,
+		stdout: text(&out),
+		stderr: text(&err),
+	}
+}
+
+/// One `nilket wendelon backup <arguments>` run as an operator would, as the step `step`
+/// (unique within the test), under min(`deadline`, its start + `BACKUP_COMMAND_BOUND`). Its
+/// begin and its outcome are printed as `smoke: COMMAND BEGIN <step>` and `smoke: COMMAND
+/// OUTCOME <step> <ok|failed|timed-out> …`, so a record whose owner died mid-command shows a
+/// begun step without an outcome.
+fn backup_command(step: &str, arguments: &[std::ffi::OsString], deadline: Instant) -> Ran {
+	let end = deadline.min(Instant::now() + BACKUP_COMMAND_BOUND);
+	eprintln!("smoke: COMMAND BEGIN {step}");
+	let mut full = vec![std::ffi::OsString::from("wendelon"), "backup".into()];
+	full.extend_from_slice(arguments);
+	let ran = bounded_run(&nilket_bin(), &full, end);
+	let outcome = if ran.succeeded() {
+		"ok"
+	} else if ran.timed_out {
+		"timed-out"
+	} else {
+		"failed"
+	};
+	eprintln!("smoke: COMMAND OUTCOME {step} {outcome} {}", ran.text());
+	ran
+}
+
+/// The operator's connection options through `member`, presenting `pki`'s operator certificate.
+fn operator_connection(member: &Member, pki: &Pki) -> Vec<std::ffi::OsString> {
+	operator_connection_as(member, &pki.node_ca, &pki.operator_cert, &pki.operator_key)
+}
+
+/// Connection options through `member`, verifying it with `server_ca` and presenting `cert`.
+fn operator_connection_as(
+	member: &Member,
+	server_ca: &Path,
+	cert: &Path,
+	key: &Path,
+) -> Vec<std::ffi::OsString> {
+	vec![
+		"--bootstrap".into(),
+		format!("{}@{}", member.id, member.address).into(),
+		"--cert".into(),
+		cert.into(),
+		"--key".into(),
+		key.into(),
+		"--ca".into(),
+		server_ca.into(),
+		"--cluster-domain".into(),
+		DOMAIN.into(),
+	]
+}
+
+/// `--storage 1=<cert>,<key>`: `pki`'s tenant-1 storage certificate.
+fn storage_option(pki: &Pki) -> Vec<std::ffi::OsString> {
+	let mut value = std::ffi::OsString::from(format!("{TENANT}="));
+	value.push(&pki.storage_cert);
+	value.push(",");
+	value.push(&pki.storage_key);
+	vec!["--storage".into(), value]
+}
+
+/// ADR 0736's owning workflow. A three-node cluster with a remote object store takes `ROWS`
+/// rows from the application's tenant-1 storage client, and every node offloads its cold slabs
+/// to the store, so the backup reads rows that live in the store. The operator exports with
+/// `nilket wendelon backup export` (the operator's certificate for the hold and the roster,
+/// the tenant's issued storage certificate for its rows), verifies the artifact, and finds no
+/// hold left. The installation is then lost: every node is stopped and left as it is (its
+/// directories and its object prefix are kept, never deleted). A second cluster is formed on
+/// the same hosts and port with NEW certificate authorities (an isolated trust domain: the
+/// first cluster's operator is refused there), new node secrets and a new root key, and NO
+/// object store: daemon configuration supports an S3-compatible store or none, the source's
+/// store and keys are never given to it, and its own data stays on its nodes' disks. That is
+/// the narrower claim this run makes about the target: a restore into a fresh cluster with
+/// local storage, not into a tiered one. `nilket wendelon backup restore` verifies the
+/// artifact before it contacts the target, refuses a target that is not fresh, establishes
+/// tenant 1 and the table through the public routes, imports the rows through the target's
+/// own issued tenant-1 storage certificate, and verifies every table's count and digest under
+/// a hold. Then, through the target's storage client: every row exactly, ONE new write under a
+/// fresh operation identity and its exact read-back, and no hold left.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "spawns two three-daemon clusters in turn and needs a remote object store; run alone under an external owner (see the module text)"]
+async fn three_daemons_back_up_cold_rows_and_restore_into_a_fresh_cluster_that_takes_new_writes() {
+	let deadline = Instant::now() + BACKUP_TEST_BOUND;
+	let store = StoreEnv::from_environment();
+	let objects = store.handle();
+	let before = tokio::time::timeout(CLIENT_BOUND, objects.list(""))
+		.await
+		.expect("the object store did not answer a list within its bound")
+		.expect("the object store refused a list: endpoint, bucket or keys");
+	assert!(before.is_empty(), "the run's prefix is not new");
+	let started = Instant::now();
+	let at = |what: &str| {
+		eprintln!(
+			"smoke: PHASE {what} at +{} ms",
+			started.elapsed().as_millis()
+		)
+	};
+
+	at("source formation");
+	let mut source = form(deadline, Some(&store)).await;
+	let mut rows: Vec<(i64, String)> = (1..=ROWS)
+		.map(|id| {
+			let name: String = (0..NAME_HEX_BLOCKS).map(|_| hex(random32())).collect();
+			(id, name)
+		})
+		.collect();
+	let client = client_through(
+		&source.members[0],
+		&source.pki,
+		Credential::Storage,
+		deadline,
+	)
+	.await;
+	at("source writes");
+	for (id, name) in &rows {
+		ingest_the_row(&client, &source.descriptor, *id, name, deadline).await;
+	}
+	at("offload wait");
+	offloaded_by_every_owner(&mut source, &objects, deadline, "before the backup").await;
+
+	at("export");
+	let artifact = source.root.join("backup");
+	let passphrase = source.root.join("backup-passphrase");
+	write_private(&passphrase, hex(random32()).as_bytes());
+	let mut export: Vec<std::ffi::OsString> = vec![
+		"export".into(),
+		"--to".into(),
+		artifact.clone().into(),
+		"--passphrase-file".into(),
+		passphrase.clone().into(),
+	];
+	export.extend(operator_connection(&source.members[0], &source.pki));
+	export.extend(storage_option(&source.pki));
+	let ran = backup_command("export", &export, deadline);
+	assert!(ran.succeeded(), "the export: {}", ran.text());
+	let ran = backup_command(
+		"verify",
+		&[
+			"verify".into(),
+			artifact.clone().into(),
+			"--passphrase-file".into(),
+			passphrase.clone().into(),
+		],
+		deadline,
+	);
+	assert!(ran.succeeded(), "the verification: {}", ran.text());
+	let mut status: Vec<std::ffi::OsString> = vec!["hold-status".into()];
+	status.extend(operator_connection(&source.members[0], &source.pki));
+	let ran = backup_command("source-hold-after-export", &status, deadline);
+	assert!(
+		ran.succeeded() && ran.stdout.contains("no backup hold is held"),
+		"the source's hold after the export: {}",
+		ran.text()
+	);
+
+	at("the installation is lost");
+	drop(client);
+	for id in NODES {
+		source.daemons.stop(id, deadline);
+	}
+	let Formed {
+		root: source_root,
+		pki: source_pki,
+		members: source_members,
+		daemons: source_daemons,
+		descriptor,
+	} = source;
+	// Ends the source's owners through node-control; nothing of it is deleted.
+	drop(source_daemons);
+
+	at("target formation");
+	*NODE_CONTROL_CLUSTER
+		.lock()
+		.unwrap_or_else(std::sync::PoisonError::into_inner) = "target";
+	// The target states the run's declared profile, as the source did with its store.
+	let mut target = form_cluster(deadline, None, "-target", false, true).await;
+	assert_ne!(
+		std::fs::read(&target.pki.node_ca).unwrap(),
+		std::fs::read(&source_pki.node_ca).unwrap(),
+		"the target has its own node CA"
+	);
+	at("restore");
+	let mut restore: Vec<std::ffi::OsString> = vec![
+		"restore".into(),
+		artifact.clone().into(),
+		"--passphrase-file".into(),
+		passphrase.clone().into(),
+	];
+	restore.extend(operator_connection(&target.members[0], &target.pki));
+	restore.extend(storage_option(&target.pki));
+	let ran = backup_command("restore", &restore, deadline);
+	assert!(ran.succeeded(), "the restore: {}", ran.text());
+
+	at("the restored rows and a new write");
+	let client = client_through(
+		&target.members[0],
+		&target.pki,
+		Credential::Storage,
+		deadline,
+	)
+	.await;
+	expect_rows(&client, &descriptor, deadline, "after the restore", &rows).await;
+	let fresh = (ROWS + 1, hex(random32()));
+	ingest_the_row(&client, &descriptor, fresh.0, &fresh.1, deadline).await;
+	rows.push(fresh);
+	expect_rows(&client, &descriptor, deadline, "after a new write", &rows).await;
+	let mut status: Vec<std::ffi::OsString> = vec!["hold-status".into()];
+	status.extend(operator_connection(&target.members[0], &target.pki));
+	let ran = backup_command("target-hold-after-restore", &status, deadline);
+	assert!(
+		ran.succeeded() && ran.stdout.contains("no backup hold is held"),
+		"the target's hold after the restore: {}",
+		ran.text()
+	);
+
+	// An isolated trust domain: controlled NEGATIVE SMOKE coverage, checked after the restore
+	// so it cannot hide the restore's evidence. The SOURCE operator's certificate and key are
+	// the deliberately changed input: presented at the target's endpoint, verifying the target
+	// server with the TARGET CA, between two calls of the target's own operator at the same
+	// endpoint and CA, both required to succeed. The foreign attempt must fail within its
+	// command budget, with complete output and runtime exit 1 (not a usage error, not cut).
+	// This does not show which check refused it: the TLS or authorization cause is unobserved,
+	// and a transient transport failure affecting only that connection is not excluded. Its
+	// full outcome text is recorded and asserted on nothing.
+	let mut own: Vec<std::ffi::OsString> = vec!["hold-status".into()];
+	own.extend(operator_connection(&target.members[0], &target.pki));
+	let ran = backup_command("target-operator-admitted-before", &own, deadline);
+	assert!(
+		ran.succeeded() && ran.stdout.contains("no backup hold is held"),
+		"the target's own operator before the foreign attempt: {}",
+		ran.text()
+	);
+	let mut foreign: Vec<std::ffi::OsString> = vec!["hold-status".into()];
+	foreign.extend(operator_connection_as(
+		&target.members[0],
+		&target.pki.node_ca,
+		&source_pki.operator_cert,
+		&source_pki.operator_key,
+	));
+	let refused = backup_command("source-operator-refused-at-target", &foreign, deadline);
+	let ran = backup_command("target-operator-admitted-after", &own, deadline);
+	assert!(
+		ran.succeeded() && ran.stdout.contains("no backup hold is held"),
+		"the target's own operator after the foreign attempt: {}",
+		ran.text()
+	);
+	assert!(
+		!refused.succeeded(),
+		"the source's operator was admitted by the target: {}",
+		refused.text()
+	);
+	assert!(
+		refused.within && !refused.timed_out && refused.code == Some(1),
+		"the source operator's attempt did not end as a refused command: {}",
+		refused.text()
+	);
+
+	drop(client);
+	for id in NODES {
+		target.daemons.stop(id, deadline);
+	}
+	assert!(Instant::now() < deadline, "the test overran its bound");
+	if let (Ok(record), None) = (std::env::var("WENDELON_SMOKE_RECORD_DIR"), node_control()) {
+		for (label, members) in [("source", &source_members), ("target", &target.members)] {
+			for member in members {
+				std::fs::copy(
+					&member.log,
+					Path::new(&record).join(format!("{label}-node-{}.daemon.log", member.id)),
+				)
+				.unwrap();
+			}
+		}
+	}
+	std::fs::remove_dir_all(&source_root).unwrap();
+	std::fs::remove_dir_all(&target.root).unwrap();
+}
+
+/// The bounded command runner counts a run only when its exit and both whole streams arrive
+/// before the deadline: a quick success counts; a late finisher, a command whose descendant
+/// holds its output open, and a failing exit do not.
+#[test]
+fn a_backup_command_counts_only_when_its_exit_and_whole_output_arrive_in_time() {
+	let sh = Path::new("/bin/sh");
+	let run = |script: &str, within: Duration| {
+		bounded_run(sh, &["-c".into(), script.into()], Instant::now() + within)
+	};
+	let quick = run("echo ok; echo note >&2", Duration::from_secs(5));
+	assert!(quick.succeeded(), "{}", quick.text());
+	assert_eq!(
+		(quick.stdout.as_str(), quick.stderr.as_str()),
+		("ok\n", "note\n")
+	);
+
+	let started = Instant::now();
+	let late = run("sleep 3; echo late", Duration::from_millis(500));
+	assert!(!late.succeeded() && late.timed_out, "{}", late.text());
+	assert!(
+		started.elapsed() < Duration::from_secs(3),
+		"the late command was ended at its deadline"
+	);
+
+	// The shell exits at once; a descendant keeps stdout open past the deadline.
+	let held = run(
+		"(sleep 3; echo held) & echo started",
+		Duration::from_millis(500),
+	);
+	assert!(!held.succeeded() && !held.within, "{}", held.text());
+
+	let failed = run("echo no >&2; exit 1", Duration::from_secs(5));
+	assert!(!failed.succeeded() && failed.within && failed.code == Some(1));
+	assert!(!failed.timed_out);
 }

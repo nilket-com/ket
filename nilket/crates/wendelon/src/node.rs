@@ -2467,7 +2467,8 @@ impl WendelonNode {
 		.with_lease_authority(lease_authority.clone())
 		.with_transfer_authority(transfer_authority.clone())
 		.with_storage_manager(slab.clone())
-		.with_decision_proposals(decision_proposals.clone());
+		.with_decision_proposals(decision_proposals.clone())
+		.with_kv_presence(data_server.kv_presence());
 		#[cfg(feature = "test-support")]
 		let control_server = control_server.with_join_promotion_gate(cfg.join_promotion_gate.clone());
 		let control_server = Arc::new(control_server);

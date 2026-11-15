@@ -62,6 +62,8 @@ pub enum AdministrativeAction {
 	JoinCluster,
 	BreakGlassAccess,
 	CrossCaPromotion,
+	/// ADR 0736: begin, release or read the backup hold.
+	BackupHold,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,6 +137,14 @@ pub fn require_administrative_action(
 		| AdministrativeAction::CrossCaPromotion => {
 			authorize_actor(actor, ActorPermission::ClusterControl)
 		}
+		// ADR 0736: the roles that may back up (and the operator and break-glass).
+		AdministrativeAction::BackupHold => match actor.role {
+			ActorRole::Operator | ActorRole::BackupAdmin | ActorRole::BreakGlassAdmin => Ok(()),
+			_ => Err(Error::new(
+				ErrorKind::PermissionDenied,
+				format!("actor role {} is not allowed for {action:?}", actor.role),
+			)),
+		},
 		AdministrativeAction::TenantDelete | AdministrativeAction::BreakGlassAccess
 			if actor.break_glass
 				&& actor.role == ActorRole::BreakGlassAdmin

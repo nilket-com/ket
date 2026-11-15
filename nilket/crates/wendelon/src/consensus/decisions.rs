@@ -417,6 +417,16 @@ pub enum DecisionCommand {
 		takeover: Signed<TakeOverBody>,
 		stamp_ms: u64,
 	},
+	/// ADR 0736: enters the backup hold `id`, or returns the current token when
+	/// `id` already holds it. Another hold present is a conflict.
+	BeginBackupHold {
+		id: u128,
+	},
+	/// ADR 0736: ends the hold whose token is exactly (`id`, `entered_at`).
+	ReleaseBackupHold {
+		id: u128,
+		entered_at: u64,
+	},
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -531,6 +541,13 @@ pub enum DecisionRefusal {
 	/// ADR 0729: some tenant's replication factor is below the number of data
 	/// members, so a range's replicas are not all data members.
 	UnsupportedShape,
+	/// ADR 0736: another backup hold is held.
+	HoldConflict,
+	/// ADR 0736: no hold has exactly this token.
+	HoldMismatch,
+	/// ADR 0736: a new reservation while a backup hold is held; nothing was
+	/// reserved.
+	BackupHold,
 }
 
 /// ADR 0721: how the key a store signs with stands against the replicated
@@ -683,6 +700,13 @@ pub enum DecisionResult {
 		range_start: u64,
 		generation: u64,
 	},
+	/// ADR 0736: the backup hold's token (now or earlier).
+	HoldEntered {
+		id: u128,
+		entered_at: u64,
+	},
+	/// ADR 0736: the hold named by its exact token has ended.
+	HoldReleased,
 }
 
 /// What a retry of `key` with `request_digest` learns. Pure over state.
@@ -763,6 +787,8 @@ pub struct DecisionState {
 	/// pruned, so a store whose records have all been retired still knows that
 	/// writes began and under which membership.
 	sealed: Option<SealedMembership>,
+	/// ADR 0736: the backup hold, by its token (`id`, `entered_at`).
+	hold: Option<(u128, u64)>,
 }
 
 impl Default for DecisionState {
@@ -780,11 +806,17 @@ impl Default for DecisionState {
 			noops: BTreeMap::new(),
 			generations: Generations::default(),
 			sealed: None,
+			hold: None,
 		}
 	}
 }
 
 impl DecisionState {
+	/// ADR 0736: the backup hold's token, if one is held.
+	pub fn backup_hold(&self) -> Option<(u128, u64)> {
+		self.hold
+	}
+
 	pub fn lineages(&self) -> &BTreeMap<u64, Lineage> {
 		&self.lineages
 	}
@@ -1606,6 +1638,10 @@ fn reduce(
 		DecisionCommand::TakeOverLineage { takeover, stamp_ms } => {
 			take_over(state, decisions, &takeover, stamp_ms)
 		}
+		DecisionCommand::BeginBackupHold { id } => begin_backup_hold(decisions, id, log_index),
+		DecisionCommand::ReleaseBackupHold { id, entered_at } => {
+			release_backup_hold(decisions, id, entered_at)
+		}
 	};
 	outcome.unwrap_or_else(DecisionResult::Refused)
 }
@@ -1675,6 +1711,12 @@ fn reserve(
 	let verified = evidence::verify(decisions, signed)?;
 	let claim = verified.body();
 	let clock_ms = fresh_clock(decisions, &claim.key, stamp_ms)?;
+	// ADR 0736: after the recorded-parent replay above and the identity and
+	// retirement checks, so a recorded, retired or malformed identity keeps its
+	// own answer; only an eligible new reservation is refused, recording nothing.
+	if decisions.hold.is_some() {
+		return Err(DecisionRefusal::BackupHold);
+	}
 	commit_hlc_not_ahead(claim, stamp_ms)?;
 	validate_claim(state, decisions, claim)?;
 	if let Operation::Delete { selection, .. } = &claim.operation {
@@ -2227,6 +2269,40 @@ fn bind_signer(
 
 /// E3: retires terminal retry keys issued at or before the new floor. Bodies,
 /// Refused ones included, stay until certified reclamation (S5).
+/// ADR 0736: enters the hold, or returns the current token for the same id.
+fn begin_backup_hold(
+	decisions: &mut DecisionState,
+	id: u128,
+	log_index: u64,
+) -> Result<DecisionResult, DecisionRefusal> {
+	match decisions.hold {
+		Some((held, entered_at)) if held == id => {
+			Ok(DecisionResult::HoldEntered { id, entered_at })
+		}
+		Some(_) => Err(DecisionRefusal::HoldConflict),
+		None => {
+			decisions.hold = Some((id, log_index));
+			Ok(DecisionResult::HoldEntered {
+				id,
+				entered_at: log_index,
+			})
+		}
+	}
+}
+
+/// ADR 0736: ends the hold only when both parts of its token match.
+fn release_backup_hold(
+	decisions: &mut DecisionState,
+	id: u128,
+	entered_at: u64,
+) -> Result<DecisionResult, DecisionRefusal> {
+	if decisions.hold != Some((id, entered_at)) {
+		return Err(DecisionRefusal::HoldMismatch);
+	}
+	decisions.hold = None;
+	Ok(DecisionResult::HoldReleased)
+}
+
 fn advance_floor(
 	decisions: &mut DecisionState,
 	floor_ms: u64,

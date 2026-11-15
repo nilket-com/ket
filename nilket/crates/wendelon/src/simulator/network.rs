@@ -377,6 +377,8 @@ pub struct SimulatedTransportConnection {
 	pool: Arc<BufPool>,
 	tier: TransportTier,
 	actor: ActorIdentity,
+	/// What the served side sees as this caller; `None`: the dialing node.
+	caller: Option<ActorIdentity>,
 }
 
 #[async_trait]
@@ -396,6 +398,10 @@ impl TransportConnection for SimulatedTransportConnection {
 		let (client_side, server_side) = tokio::io::duplex(64 * 1024);
 		let pool = self.pool.clone();
 		let remote = self.local;
+		let actor = self
+			.caller
+			.clone()
+			.unwrap_or_else(|| ActorIdentity::data_node(remote));
 		tokio::spawn(async move {
 			let _ = service
 				.handle_stream(
@@ -403,7 +409,7 @@ impl TransportConnection for SimulatedTransportConnection {
 					pool,
 					RequestContext {
 						remote: Some(remote),
-						actor: ActorIdentity::data_node(remote),
+						actor,
 					},
 				)
 				.await;
@@ -437,6 +443,7 @@ pub struct SimulatedTransportProvider {
 	network: Arc<SimulatedTransportNetwork>,
 	pool: Arc<BufPool>,
 	tier: TransportTier,
+	caller: Option<ActorIdentity>,
 }
 
 impl SimulatedTransportProvider {
@@ -451,7 +458,16 @@ impl SimulatedTransportProvider {
 			network,
 			pool,
 			tier,
+			caller: None,
 		}
+	}
+
+	/// Every server this provider's connections reach sees `actor` as the
+	/// caller, as a client with that certificate would be seen (a test
+	/// operator tool), instead of the dialing data node.
+	pub fn with_caller(mut self, actor: ActorIdentity) -> Self {
+		self.caller = Some(actor);
+		self
 	}
 }
 
@@ -511,6 +527,7 @@ impl TransportProvider for SimulatedTransportProvider {
 			pool: self.pool.clone(),
 			tier: self.tier,
 			actor: ActorIdentity::data_node(target),
+			caller: self.caller.clone(),
 		}))
 	}
 

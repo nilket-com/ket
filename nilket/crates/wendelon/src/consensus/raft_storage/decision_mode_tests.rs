@@ -217,6 +217,10 @@ async fn a_new_mode_store_writes_its_own_format_and_reopens() {
 
 use crate::consensus::decisions::tests as fixture;
 
+const PARENT_DECISIONS_V24_MANIFEST: &str =
+	include_str!("../../../tests/fixtures/consensus_body/parent_decisions_v24.txt");
+/// ADR 0729 to ADR 0735's format-23 bodies, retained. ADR 0736 changed one: the
+/// decision state, which gained the backup hold; and added the two hold commands.
 const PARENT_DECISIONS_V23_MANIFEST: &str =
 	include_str!("../../../tests/fixtures/consensus_body/parent_decisions_v23.txt");
 /// ADR 0725 to ADR 0728's format-18 bodies, retained (formats 20 and 22 moved
@@ -258,7 +262,7 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 fn manifest() -> BTreeMap<String, String> {
-	parse(PARENT_DECISIONS_V23_MANIFEST)
+	parse(PARENT_DECISIONS_V24_MANIFEST)
 }
 
 /// ADR 0725: the three owner-signed operation kinds pinned in the format-18
@@ -425,7 +429,7 @@ fn entry(index: u64, request: WendelonRequest) -> Entry<WendelonTypeConfig> {
 }
 
 #[test]
-fn the_format_23_bodies_match_their_goldens_and_round_trip() {
+fn the_format_24_bodies_match_their_goldens_and_round_trip() {
 	let stored = manifest();
 	let state = golden_state();
 	let body = encode_state_body(DecisionMode::ParentDecisions, &state).unwrap();
@@ -469,6 +473,27 @@ fn the_format_23_bodies_match_their_goldens_and_round_trip() {
 			hex(&postcard::to_stdvec(&request).unwrap()),
 		));
 	}
+	// ADR 0736: the two backup hold commands.
+	for (name, command) in [
+		(
+			"begin_backup_hold",
+			crate::consensus::decisions::DecisionCommand::BeginBackupHold {
+				id: 0x0736_0736_0736_0736_0736_0736_0736_0736,
+			},
+		),
+		(
+			"release_backup_hold",
+			crate::consensus::decisions::DecisionCommand::ReleaseBackupHold {
+				id: 0x0736_0736_0736_0736_0736_0736_0736_0736,
+				entered_at: 736,
+			},
+		),
+	] {
+		actual.push((
+			name.to_owned(),
+			hex(&postcard::to_stdvec(&WendelonRequest::Decision(command)).unwrap()),
+		));
+	}
 	let moved: Vec<String> = actual
 		.iter()
 		.filter(|(name, hex)| stored.get(name) != Some(hex))
@@ -476,7 +501,7 @@ fn the_format_23_bodies_match_their_goldens_and_round_trip() {
 		.collect();
 	assert!(
 		moved.is_empty(),
-		"format-23 bodies moved or are missing; expected lines:\n{}",
+		"format-24 bodies moved or are missing; expected lines:\n{}",
 		moved.join("\n")
 	);
 	assert_eq!(stored.len(), actual.len());
@@ -490,18 +515,31 @@ fn the_format_23_bodies_match_their_goldens_and_round_trip() {
 	// only the decision state differs from the format-16 corpus: by exactly the
 	// appended seal.
 	assert!(decisions.sealed().is_some());
-	// ADR 0729: against the format-18 corpus, exactly two bodies moved: the
-	// decision state (lineage fields) and the lease batch (its stamp, and a
-	// generation per grant). Every decision, certified and owner-signed body
-	// is unchanged, byte for byte.
-	const MOVED: [&str; 2] = ["decisions_golden_history", "acquire_leases_0"];
-	let retained_v18 = parse(PARENT_DECISIONS_V18_MANIFEST);
-	assert_eq!(stored.len(), retained_v18.len());
-	for (name, hex) in &retained_v18 {
+	// ADR 0736: against the format-23 corpus exactly one body moved, the
+	// decision state (the backup hold), and the two hold commands were added.
+	// Every other body is unchanged, byte for byte.
+	const MOVED: [&str; 1] = ["decisions_golden_history"];
+	let retained_v23 = parse(PARENT_DECISIONS_V23_MANIFEST);
+	assert_eq!(stored.len(), retained_v23.len() + 2);
+	for (name, hex) in &retained_v23 {
 		if MOVED.contains(&name.as_str()) {
 			assert_ne!(stored.get(name), Some(hex), "{name}");
 		} else {
 			assert_eq!(stored.get(name), Some(hex), "{name}");
+		}
+	}
+	// ADR 0729: against the format-18 corpus, exactly two bodies moved: the
+	// decision state (lineage fields) and the lease batch (its stamp, and a
+	// generation per grant). Every decision, certified and owner-signed body
+	// is unchanged, byte for byte.
+	const MOVED_0729: [&str; 2] = ["decisions_golden_history", "acquire_leases_0"];
+	let retained_v18 = parse(PARENT_DECISIONS_V18_MANIFEST);
+	assert_eq!(retained_v23.len(), retained_v18.len());
+	for (name, hex) in &retained_v18 {
+		if MOVED_0729.contains(&name.as_str()) {
+			assert_ne!(retained_v23.get(name), Some(hex), "{name}");
+		} else {
+			assert_eq!(retained_v23.get(name), Some(hex), "{name}");
 		}
 	}
 	// ADR 0725: every format-17 body is unchanged in format 18, and only the
@@ -532,16 +570,16 @@ fn the_format_23_bodies_match_their_goldens_and_round_trip() {
 	// appended the seal to it.)
 	let retained = parse(PARENT_DECISIONS_V13_MANIFEST);
 	for (name, hex) in &retained {
-		if !MOVED.contains(&name.as_str()) {
-			assert_eq!(stored.get(name), Some(hex), "{name}");
+		if !MOVED_0729.contains(&name.as_str()) {
+			assert_eq!(retained_v23.get(name), Some(hex), "{name}");
 		}
 	}
 	// ADR 0704 changed no decision or lease body: every format-14 body is
 	// unchanged, and only the two certified slab bodies are new.
 	let retained_v14 = parse(PARENT_DECISIONS_V14_MANIFEST);
 	for (name, hex) in &retained_v14 {
-		if !MOVED.contains(&name.as_str()) {
-			assert_eq!(stored.get(name), Some(hex), "{name}");
+		if !MOVED_0729.contains(&name.as_str()) {
+			assert_eq!(retained_v23.get(name), Some(hex), "{name}");
 		}
 	}
 	assert_eq!(retained_v17.len(), retained_v14.len() + 2);

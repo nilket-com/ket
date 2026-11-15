@@ -2398,6 +2398,30 @@ impl WendelonClient {
 		&self,
 		request: &TenantAdminRequestWire,
 	) -> std::io::Result<TenantAdminResponseWire> {
+		self.tenant_admin_exchange(request)
+			.await
+			.map(|(response, _)| response)
+	}
+
+	/// ADR 0736: a backup request (hold, roster), whose granted answer carries
+	/// the backup extension after the ordinary response.
+	pub async fn backup_admin(
+		&self,
+		request: &TenantAdminRequestWire,
+	) -> std::io::Result<(
+		TenantAdminResponseWire,
+		crate::network::control_server::BackupAdminExtensionWire,
+	)> {
+		self.tenant_admin_exchange(request).await
+	}
+
+	async fn tenant_admin_exchange(
+		&self,
+		request: &TenantAdminRequestWire,
+	) -> std::io::Result<(
+		TenantAdminResponseWire,
+		crate::network::control_server::BackupAdminExtensionWire,
+	)> {
 		let payload = crate::network::wire::encode(request)?;
 		let mut preferred_target = self.leader();
 		for attempt in 0..DATA_RETRY_BUDGET {
@@ -2413,7 +2437,7 @@ impl WendelonClient {
 					})?
 				}
 			};
-			let response = self.tenant_admin_once(target, &payload).await?;
+			let (response, extension) = self.tenant_admin_once(target, &payload).await?;
 			if let Some(leader) = response.leader_hint {
 				*self.leader.write().unwrap() = Some(NodeId {
 					id: leader,
@@ -2429,7 +2453,7 @@ impl WendelonClient {
 				preferred_target = retry.preferred_target.or_else(|| self.leader());
 				continue;
 			}
-			return tenant_admin_outcome(response);
+			return tenant_admin_outcome(response).map(|response| (response, extension));
 		}
 		unreachable!("bounded retry loop must return within budget")
 	}
@@ -2438,7 +2462,10 @@ impl WendelonClient {
 		&self,
 		target: NodeId,
 		payload: &[u8],
-	) -> std::io::Result<TenantAdminResponseWire> {
+	) -> std::io::Result<(
+		TenantAdminResponseWire,
+		crate::network::control_server::BackupAdminExtensionWire,
+	)> {
 		let conn = self.factory.get_connection(target).await?;
 		let mut stream = conn.open_bi().await?;
 		let header = FrameHeader {
@@ -2466,7 +2493,7 @@ impl WendelonClient {
 				"invalid TENANT_ADMIN_RESP frame",
 			));
 		}
-		crate::network::wire::decode(&frame.meta)
+		crate::network::control_server::decode_tenant_admin_answer(&frame.meta)
 	}
 
 	async fn schema_update_once(
@@ -2895,6 +2922,10 @@ pub struct StreamingQueryResult {
 	expected_msg_type: MsgType,
 	meta_mode: StreamingQueryMetaMode,
 	_table_query_attempt_guard: Option<TableQueryAttemptGuard>,
+	/// ADR 0736: the status of the terminal response this stream actually
+	/// received (its metadata, or a single-frame answer's), `None` until one
+	/// arrived. A stream that ended without one never reports success here.
+	terminal_status: Option<ReadStatus>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3082,6 +3113,7 @@ impl StreamingQueryResult {
 			self.epoch = ack.epoch;
 			self.rows = ack.rows;
 			self.stream = None;
+			self.terminal_status = Some(ack.status);
 			return match ack.status {
 				s if s == ReadStatus::OK || s == ReadStatus::KEY_NOT_FOUND => {
 					match frame.arrow_payload.as_ref() {
@@ -3113,6 +3145,11 @@ impl StreamingQueryResult {
 			self.stream = None;
 		}
 		Ok(batch)
+	}
+
+	/// ADR 0736: the terminal status this stream received, if it received one.
+	pub fn terminal_status(&self) -> Option<ReadStatus> {
+		self.terminal_status
 	}
 
 	pub async fn drain_all(&mut self) -> std::io::Result<Vec<RecordBatch>> {
@@ -3547,6 +3584,7 @@ fn decode_initial_query_response(
 				expected_msg_type,
 				meta_mode,
 				_table_query_attempt_guard: attempt_guard,
+				terminal_status: is_end.then_some(ReadStatus::OK),
 			}))
 		}
 		_ if retry.is_some() => Ok(QueryOutcome::Redirect(retry.expect("retry checked above"))),
@@ -3560,6 +3598,7 @@ fn decode_initial_query_response(
 			expected_msg_type,
 			meta_mode,
 			_table_query_attempt_guard: attempt_guard,
+			terminal_status: Some(ReadStatus::KEY_NOT_FOUND),
 		})),
 		other => Err(query_failure_error_with_integrity(other, integrity_failure)),
 	}
@@ -5888,6 +5927,7 @@ mod tests {
 			expected_msg_type: MsgType::TABLE_QUERY_RESP,
 			meta_mode: StreamingQueryMetaMode::TerminalMetadata,
 			_table_query_attempt_guard: None,
+			terminal_status: None,
 		};
 
 		assert!(result.next_batch().await.unwrap().is_some());

@@ -2764,6 +2764,11 @@ impl TableSchemaCatalog {
 		Ok(descriptor)
 	}
 
+	/// ADR 0736: every tenant with a descriptor, provisional ones included.
+	pub fn tenant_ids(&self) -> BTreeSet<TenantId> {
+		self.by_id.keys().map(|key| key.tenant_id).collect()
+	}
+
 	pub fn is_provisional(&self, tenant_id: TenantId, table_object_id: TableObjectId) -> bool {
 		self.provisional_by_id
 			.contains(&(tenant_id, table_object_id))

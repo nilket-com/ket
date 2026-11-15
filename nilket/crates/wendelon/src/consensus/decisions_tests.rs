@@ -3949,3 +3949,373 @@ fn a_tenant_with_fewer_replicas_than_data_members_is_refused_while_authority_is_
 		);
 	}
 }
+
+// ============================================================
+//  ADR 0736: THE BACKUP HOLD
+// ============================================================
+
+fn begin_hold(state: &mut SmState, id: u128) -> DecisionResult {
+	decide(state, DecisionCommand::BeginBackupHold { id })
+}
+
+fn release_hold(state: &mut SmState, id: u128, entered_at: u64) -> DecisionResult {
+	decide(state, DecisionCommand::ReleaseBackupHold { id, entered_at })
+}
+
+fn token(result: DecisionResult) -> (u128, u64) {
+	match result {
+		DecisionResult::HoldEntered { id, entered_at } => (id, entered_at),
+		other => panic!("not a hold token: {other:?}"),
+	}
+}
+
+/// Begin returns a token; a retry with the same id returns the SAME token; another id is
+/// refused naming the current hold. Release needs the exact token: an earlier hold's delayed
+/// release, with the same id but its own entry index, cannot clear a later hold.
+#[test]
+fn a_hold_is_entered_once_and_released_only_by_its_exact_token() {
+	let mut state = base(3);
+	let first = token(begin_hold(&mut state, 7));
+	assert_eq!(decisions(&state).backup_hold(), Some(first));
+	assert_eq!(
+		token(begin_hold(&mut state, 7)),
+		first,
+		"a retry keeps the token"
+	);
+	assert_eq!(
+		begin_hold(&mut state, 8),
+		refused(DecisionRefusal::HoldConflict)
+	);
+	assert_eq!(
+		release_hold(&mut state, 8, first.1),
+		refused(DecisionRefusal::HoldMismatch)
+	);
+	assert_eq!(
+		release_hold(&mut state, 7, first.1 + 1),
+		refused(DecisionRefusal::HoldMismatch)
+	);
+	assert_eq!(decisions(&state).backup_hold(), Some(first));
+	assert_eq!(
+		release_hold(&mut state, first.0, first.1),
+		DecisionResult::HoldReleased
+	);
+	assert_eq!(decisions(&state).backup_hold(), None);
+	// The same id held again later is a different hold.
+	let second = token(begin_hold(&mut state, 7));
+	assert_ne!(second.1, first.1);
+	assert_eq!(
+		release_hold(&mut state, first.0, first.1),
+		refused(DecisionRefusal::HoldMismatch),
+		"the earlier hold's delayed release does not clear the later one"
+	);
+	assert_eq!(decisions(&state).backup_hold(), Some(second));
+	// With nothing held a release is a mismatch too, and changes nothing.
+	assert_eq!(
+		release_hold(&mut state, second.0, second.1),
+		DecisionResult::HoldReleased
+	);
+	assert_eq!(
+		release_hold(&mut state, second.0, second.1),
+		refused(DecisionRefusal::HoldMismatch)
+	);
+}
+
+/// While held: a recorded parent still answers as recorded; a retired identity still answers
+/// OutcomeUnavailable; only an eligible new reservation is refused BackupHold, and an
+/// admitted parent still finalizes to its actual result.
+#[test]
+fn a_hold_refuses_only_new_eligible_reservations() {
+	let mut state = base(3);
+	grant_all(&mut state);
+	let admitted = claim(key(T0, 1), children(&state, 1), 0);
+	let DecisionResult::Reserved { reservation } = reserve(&mut state, &admitted, T0) else {
+		panic!("reserved");
+	};
+	let held = token(begin_hold(&mut state, 1));
+	// Replay of the admitted parent: its recorded answer.
+	assert_eq!(
+		reserve(&mut state, &admitted, T0),
+		DecisionResult::Reserved { reservation }
+	);
+	// A new eligible parent: refused, nothing recorded.
+	let new = claim(key(T0 + 10, 2), children(&state, 1), 0);
+	assert_eq!(
+		reserve(&mut state, &new, T0 + 10),
+		refused(DecisionRefusal::BackupHold)
+	);
+	assert_eq!(
+		answer(decisions(&state), &new.key, &new.request_digest),
+		Answer::New
+	);
+	// The admitted parent reaches its actual terminal result under the hold.
+	assert!(matches!(
+		finalize(&mut state, &admitted, quorum_acks(&admitted, reservation)),
+		DecisionResult::Terminal {
+			status: ParentStatus::Accepted { .. },
+			..
+		}
+	));
+	// A retired identity keeps its own answer; the hold does not relabel it.
+	let later = T0 + DECISION_EXPIRY_MS + 1_000;
+	let cutoff = later - DECISION_EXPIRY_MS;
+	let old = claim(key(cutoff, 3), children(&state, 1), 0);
+	assert_eq!(
+		reserve(&mut state, &old, later),
+		refused(DecisionRefusal::OutcomeUnavailable)
+	);
+	// After release the new parent is admitted.
+	assert_eq!(
+		release_hold(&mut state, held.0, held.1),
+		DecisionResult::HoldReleased
+	);
+	let after = claim(key(later, 4), children(&state, 1), 0);
+	assert!(matches!(
+		reserve(&mut state, &after, later),
+		DecisionResult::Reserved { .. }
+	));
+}
+
+/// While held, the logical mutations this mode admits are refused at apply and change
+/// nothing; after release the same command applies.
+#[test]
+fn a_hold_refuses_tenant_and_key_mutations_at_apply() {
+	let mut state = base(3);
+	let held = token(begin_hold(&mut state, 9));
+	let tenant = crate::schema::TenantId::ZERO;
+	let quota_before = state.tenants.get(&tenant).map(|record| record.quota_bytes);
+	for request in [
+		WendelonRequest::UpdateTenantQuota(crate::consensus::UpdateTenantQuota {
+			tenant_id: tenant,
+			quota_bytes: 1,
+		}),
+		WendelonRequest::SuspendTenant(tenant),
+		WendelonRequest::ResumeTenant(tenant),
+	] {
+		assert_eq!(
+			apply_next(&mut state, request.clone()),
+			WendelonResponse::Error(crate::consensus::raft_storage::BACKUP_HOLD_REFUSAL.into()),
+			"{request:?}"
+		);
+	}
+	assert_eq!(
+		state.tenants.get(&tenant).map(|record| record.quota_bytes),
+		quota_before
+	);
+	assert_eq!(
+		release_hold(&mut state, held.0, held.1),
+		DecisionResult::HoldReleased
+	);
+	assert_ne!(
+		apply_next(&mut state, WendelonRequest::SuspendTenant(tenant)),
+		WendelonResponse::Error(crate::consensus::raft_storage::BACKUP_HOLD_REFUSAL.into())
+	);
+}
+
+// ============================================================
+//  BACKUP ROSTER (ADR 0736)
+// ============================================================
+
+/// A state with the fixture table in the catalog, as a table create leaves it.
+fn with_fixture_table(state: &mut SmState) {
+	state
+		.table_schemas
+		.upsert(TENANT, fixture_table())
+		.expect("upsert");
+	state
+		.table_lifecycle
+		.ensure_inherit_cluster(TENANT, TABLE, hts(0));
+}
+
+fn roster(
+	state: &SmState,
+	token: (u128, u64),
+) -> Result<crate::logical_backup::roster::BackupRoster, crate::logical_backup::roster::RosterRefusal>
+{
+	crate::logical_backup::roster::roster_at(state, token)
+}
+
+/// No roster without the exact hold; a reserved parent is waited for (its
+/// finalize is admitted under the hold); once settled, the roster names every
+/// tenant setting and the latest table descriptor with its exact policy, at the
+/// applied index.
+#[test]
+fn the_roster_is_given_only_under_the_exact_hold_and_at_a_settled_cut() {
+	use crate::logical_backup::roster::RosterRefusal;
+	let (mut state, claim, reservation) = reserved_parent(1);
+	with_fixture_table(&mut state);
+	assert_eq!(
+		roster(&state, (9, 1)),
+		Err(RosterRefusal::HoldMismatch { current: None })
+	);
+	let held = token(begin_hold(&mut state, 9));
+	assert_eq!(
+		roster(&state, (9, held.1 + 1)),
+		Err(RosterRefusal::HoldMismatch {
+			current: Some(held)
+		})
+	);
+	let answer = roster(&state, held);
+	assert!(
+		matches!(answer, Err(RosterRefusal::Unsettled { .. })),
+		"{answer:?}"
+	);
+	let acks = quorum_acks(&claim, reservation);
+	assert!(matches!(
+		finalize(&mut state, &claim, acks),
+		DecisionResult::Terminal {
+			status: ParentStatus::Accepted { .. },
+			..
+		}
+	));
+	let roster = roster(&state, held).expect("settled");
+	assert_eq!(roster.hold, held);
+	assert_eq!(
+		roster.cut,
+		state.last_applied_log_id.map_or(0, |id| id.index)
+	);
+	assert_eq!(
+		roster.tenants,
+		vec![crate::logical_backup::roster::RosterTenant {
+			tenant_id: TENANT,
+			quota_bytes: u64::MAX,
+			replication_factor: 3,
+		}]
+	);
+	assert_eq!(roster.tables.len(), 1);
+	assert_eq!(roster.tables[0].descriptor, fixture_table());
+	assert_eq!(
+		roster.tables[0].retention,
+		crate::schema::TableRetentionPolicy::InheritCluster
+	);
+	assert!(roster.logical_types.is_empty() && roster.indexes.is_empty());
+}
+
+/// Each shape the restore cannot reproduce, or the hold keeps from settling,
+/// refuses the roster by name; an index still building is waited for.
+#[test]
+fn each_unsupported_shape_refuses_the_roster_by_name() {
+	use crate::logical_backup::roster::RosterRefusal;
+	use crate::schema::{IndexObjectId, RetentionWindowMillis, TableRetentionPolicy};
+	let settled = || {
+		let mut state = base(3);
+		grant_all(&mut state);
+		with_fixture_table(&mut state);
+		let held = token(begin_hold(&mut state, 9));
+		assert!(roster(&state, held).is_ok());
+		(state, held)
+	};
+
+	// A KV parent, whatever its status.
+	let mut state = base(3);
+	grant_all(&mut state);
+	let one = point_child(&state, position_of(1));
+	let kv = Claim {
+		first_row_position: one.range_start,
+		..claim(
+			ParentKey {
+				namespace: ParentNamespace::Kv,
+				..key(T0, 1)
+			},
+			vec![one],
+			0,
+		)
+	};
+	assert!(matches!(
+		reserve(&mut state, &kv, T0),
+		DecisionResult::Reserved { .. }
+	));
+	let held = token(begin_hold(&mut state, 9));
+	assert_eq!(roster(&state, held), Err(RosterRefusal::KvDataPresent));
+
+	// A tenant not live: its resume is refused under the hold.
+	let (mut state, held) = settled();
+	state.tenants.get_mut(&TENANT).unwrap().state = TenantLifecycleState::Suspended;
+	assert!(matches!(
+		roster(&state, held),
+		Err(RosterRefusal::LifecycleNotSettled { .. })
+	));
+
+	// A retention floor; a policy no route reproduces.
+	let (mut state, held) = settled();
+	let window = RetentionWindowMillis::try_new(crate::schema::MIN_RETENTION_WINDOW_MS).unwrap();
+	for (policy, expected) in [
+		(
+			TableRetentionPolicy::FixedWindow(window),
+			Err(RosterRefusal::RetentionActive {
+				tenant_id: TENANT,
+				table_object_id: TABLE,
+			}),
+		),
+		(
+			TableRetentionPolicy::Disabled,
+			Err(RosterRefusal::SettingNotReproducible {
+				what: "table retention policy Some(Disabled)".into(),
+			}),
+		),
+	] {
+		let generation = state.table_lifecycle.current_generation(TENANT, TABLE);
+		state
+			.table_lifecycle
+			.set_next_generation(TENANT, TABLE, generation, policy, hts(0))
+			.unwrap();
+		assert_eq!(roster(&state, held), expected);
+	}
+
+	// A table of a tenant that is not on the roster.
+	let (mut state, held) = settled();
+	let stray = {
+		use arrow::datatypes::{DataType, Field, Schema};
+		crate::schema::TableSchemaDescriptor::new_with_layout(
+			crate::schema::TableObjectId::new([0x1f; 16]),
+			1,
+			"fixture",
+			"stray",
+			&Schema::new(vec![Field::new("id", DataType::Int64, false)]),
+			crate::schema::RowIdentityPolicy::PrimaryKey(
+				crate::schema::PrimaryKeyDescriptor::single("id"),
+			),
+			crate::schema::LocalityPolicy::IdentityProjection,
+			crate::schema::RecordLayoutPolicy::SingleRow,
+			crate::schema::SchemaEvolutionPolicy::AdditiveOnly,
+		)
+		.unwrap()
+	};
+	state
+		.table_schemas
+		.upsert(crate::schema::TenantId(99), stray)
+		.unwrap();
+	assert!(matches!(
+		roster(&state, held),
+		Err(RosterRefusal::LifecycleNotSettled { .. })
+	));
+
+	// An index still building is waited for; once ready it is on the roster.
+	let (mut state, held) = settled();
+	let index = crate::schema::SecondaryIndexDescriptor::for_table_column(
+		IndexObjectId::new([0x2f; 16]),
+		"by_v",
+		&fixture_table(),
+		"v",
+	)
+	.unwrap();
+	state
+		.secondary_indexes
+		.create(TENANT, index.clone(), &state.table_schemas.clone())
+		.unwrap();
+	assert!(matches!(
+		roster(&state, held),
+		Err(RosterRefusal::Unsettled { .. })
+	));
+	for voter in 1..=3 {
+		state
+			.secondary_indexes
+			.mark_backfill_complete(
+				TENANT,
+				index.index_object_id,
+				node(voter),
+				&[1, 2, 3].into_iter().collect(),
+			)
+			.unwrap();
+	}
+	assert_eq!(roster(&state, held).unwrap().indexes, vec![(TENANT, index)]);
+}

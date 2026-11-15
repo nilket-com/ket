@@ -237,6 +237,90 @@ impl ReadAuthority {
 	}
 }
 
+/// ADR 0736: this store's half of the backup's KV check, built once and used
+/// by the leader's roster answer.
+#[derive(Clone)]
+pub(crate) struct KvPresence {
+	/// The read authority with its cut left to each check.
+	template: ReadAuthority,
+	proposals: Arc<crate::network::decision_proposals::DecisionProposals>,
+}
+
+impl KvPresence {
+	/// Whether any KV version is retained or certified, read as the reader
+	/// pairs its two sources: retained bodies in namespace Kv (any status) and
+	/// certified-base entries of the KV table (tombstones included), between
+	/// two checks of one read authority at one cut. `Err` is "did not
+	/// conclude", never "no KV": a generation that moved bodies into a newer
+	/// base between the two reads fails the second check.
+	pub(crate) async fn kv_present(&self) -> Result<bool, String> {
+		let k = match self.proposals.cut().await {
+			CutResponse::Cut(k) => k,
+			other => return Err(format!("no cut: {other:?}")),
+		};
+		self.proposals
+			.wait_applied(k, CUT_BOUND)
+			.await
+			.map_err(|error| error.to_string())?;
+		let authority = ReadAuthority {
+			k,
+			..self.template.clone()
+		};
+		authority.check().await?;
+		let in_bodies = authority
+			.state_machine
+			.read_state(|state| {
+				state.decisions.as_ref().map(|decisions| {
+					decisions
+						.bodies()
+						.values()
+						.any(|body| body.claim.key.namespace == ParentNamespace::Kv)
+				})
+			})
+			.await
+			.ok_or("no decision state")?;
+		let index = authority
+			.index
+			.clone()
+			.ok_or("this store has no certified base")?;
+		let in_base = index
+			.base_entries(false)
+			.await
+			.map_err(|error| error.to_string())?
+			.iter()
+			.any(|entry| entry.table == crate::schema::TableObjectId::DEFAULT_KV);
+		authority.check().await?;
+		Ok(in_bodies || in_base)
+	}
+}
+
+impl WendelonDataServer {
+	/// ADR 0736: this store's KV check, in ParentDecisions with a signer.
+	pub(crate) fn kv_presence(&self) -> Option<KvPresence> {
+		let (Some(proposals), Some(signer)) = (
+			self.decisions.proposals.clone(),
+			self.decisions.signer.clone(),
+		) else {
+			return None;
+		};
+		Some(KvPresence {
+			template: ReadAuthority {
+				slab: self.slab.clone(),
+				state_machine: self.state_machine.clone(),
+				distrust: self.local_persistence_distrust_reason.clone(),
+				signer: signer.signer,
+				k: 0,
+				index: self.slab.persistent_index(),
+				behind: self.decisions.behind_boundary.clone(),
+				validated: self.decisions.base_validated.clone(),
+				#[cfg(test)]
+				checks_left: self.decisions.read_checks_left.clone(),
+			},
+			proposals,
+		})
+	}
+}
+
 /// One child of a parent Accepted at K.
 #[derive(Clone, Debug)]
 pub(super) struct AcceptedChild {
@@ -1466,6 +1550,16 @@ impl WendelonDataServer {
 		&self,
 		meta: TableQueryRequestMeta,
 	) -> std::io::Result<TestQueryAnswer> {
+		self.table_query_as_for_test(meta, ActorIdentity::data_node(self.local_node))
+			.await
+	}
+
+	/// `table_query_for_test`, as the caller `actor`.
+	pub(crate) async fn table_query_as_for_test(
+		&self,
+		meta: TableQueryRequestMeta,
+		actor: ActorIdentity,
+	) -> std::io::Result<TestQueryAnswer> {
 		use tokio::io::AsyncWriteExt;
 		let (mut client, server) = tokio::io::duplex(64 << 20);
 		let header = FrameHeader {
@@ -1481,7 +1575,7 @@ impl WendelonDataServer {
 		client.write_all(bytemuck::bytes_of(&meta)).await?;
 		let context = RequestContext {
 			remote: Some(self.local_node),
-			actor: ActorIdentity::data_node(self.local_node),
+			actor,
 		};
 		let serving = self.handle_data_stream(
 			context,

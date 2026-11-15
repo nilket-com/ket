@@ -662,6 +662,22 @@ pub enum TenantAdminRequestWire {
 		expected_policy_generation: PolicyGeneration,
 		new_policy: TableRetentionPolicy,
 	},
+	/// ADR 0736: enter the backup hold `id` (or learn its token on a retry).
+	BeginBackupHold {
+		id: u128,
+	},
+	/// ADR 0736: end the hold whose token is exactly (`id`, `entered_at`).
+	ReleaseBackupHold {
+		id: u128,
+		entered_at: u64,
+	},
+	/// ADR 0736: the current hold's token, if any.
+	GetBackupHold,
+	/// ADR 0736: the roster at a settled cut under the hold (`id`, `entered_at`).
+	BackupRoster {
+		id: u128,
+		entered_at: u64,
+	},
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -699,6 +715,46 @@ pub struct TenantAdminResponseWire {
 	pub tenants: Vec<TenantAdminTenantWire>,
 	#[serde(default)]
 	pub message: Option<String>,
+}
+
+/// ADR 0736: appended after the [`TenantAdminResponseWire`] of an answer to a
+/// backup request, and only there. The response itself keeps its shape for
+/// every request; a decoder of the response alone ignores what follows it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackupAdminExtensionWire {
+	/// The backup hold's token (`id`, `entered_at`), when one is held.
+	pub hold: Option<(u128, u64)>,
+	/// A roster request's answer: the roster at a settled cut under the named
+	/// hold, or the named reason there is none.
+	pub roster: Option<
+		Result<
+			crate::logical_backup::roster::BackupRoster,
+			crate::logical_backup::roster::RosterRefusal,
+		>,
+	>,
+}
+
+/// ADR 0736: a TENANT_ADMIN_RESP body as the response, then the backup
+/// extension when one follows (an answer to a backup request; a rejection has
+/// none). Bytes after the extension are refused.
+pub fn decode_tenant_admin_answer(
+	bytes: &[u8],
+) -> std::io::Result<(TenantAdminResponseWire, BackupAdminExtensionWire)> {
+	let invalid = |error: postcard::Error| Error::new(ErrorKind::InvalidData, error);
+	let (response, rest) =
+		postcard::take_from_bytes::<TenantAdminResponseWire>(bytes).map_err(invalid)?;
+	if rest.is_empty() {
+		return Ok((response, BackupAdminExtensionWire::default()));
+	}
+	let (extension, rest) =
+		postcard::take_from_bytes::<BackupAdminExtensionWire>(rest).map_err(invalid)?;
+	if !rest.is_empty() {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"bytes after the tenant administration answer",
+		));
+	}
+	Ok((response, extension))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -753,6 +809,8 @@ pub struct WendelonControlServer {
 	reconcile_lock: Mutex<()>,
 	/// ADR 0699 S3a: the leader side of decision proposals; ParentDecisions only.
 	decision_proposals: Option<Arc<crate::network::decision_proposals::DecisionProposals>>,
+	/// ADR 0736: this node's store-side KV check for the backup roster.
+	kv_presence: Option<crate::network::data_server::reader::KvPresence>,
 	#[cfg(feature = "test-support")]
 	join_promotion_gate: Option<join_test_support::JoinPromotionGate>,
 }
@@ -814,6 +872,7 @@ impl WendelonControlServer {
 			protocol: ProtocolVersionWindow::default(),
 			reconcile_lock: Mutex::new(()),
 			decision_proposals: None,
+			kv_presence: None,
 			#[cfg(feature = "test-support")]
 			join_promotion_gate: None,
 		}
@@ -824,6 +883,15 @@ impl WendelonControlServer {
 		proposals: Option<Arc<crate::network::decision_proposals::DecisionProposals>>,
 	) -> Self {
 		self.decision_proposals = proposals;
+		self
+	}
+
+	/// ADR 0736: the store-side KV check this node's roster answer runs.
+	pub(crate) fn with_kv_presence(
+		mut self,
+		kv_presence: Option<crate::network::data_server::reader::KvPresence>,
+	) -> Self {
+		self.kv_presence = kv_presence;
 		self
 	}
 
@@ -1000,6 +1068,22 @@ impl WendelonControlServer {
 			arrow_payload: None,
 			trailing: None,
 		})
+	}
+
+	/// ADR 0736: a TENANT_ADMIN_RESP whose body is `resp` followed by `extension`.
+	fn build_backup_admin_frame(
+		&self,
+		stream_id: u32,
+		resp: &TenantAdminResponseWire,
+		extension: &BackupAdminExtensionWire,
+	) -> std::io::Result<HrftFrame> {
+		let mut frame = self.build_tenant_admin_frame(stream_id, resp)?;
+		frame
+			.meta
+			.as_mut_vec()
+			.extend_from_slice(&wire::encode(extension)?);
+		frame.header.meta_len = frame.meta.len() as u32;
+		Ok(frame)
 	}
 
 	fn build_revocation_admin_frame(
@@ -3182,6 +3266,114 @@ impl WendelonControlServer {
 		}
 	}
 
+	/// ADR 0736: the roster at a linearizable, settled cut under the hold
+	/// `token`, then this store's KV check. `Err` is "not answered here" (not
+	/// the leader, or no linearizable read): the caller redirects or retries.
+	async fn backup_roster(
+		&self,
+		token: (u128, u64),
+	) -> Result<
+		Result<
+			crate::logical_backup::roster::BackupRoster,
+			crate::logical_backup::roster::RosterRefusal,
+		>,
+		String,
+	> {
+		use crate::logical_backup::roster::{RosterRefusal, roster_at};
+		self.raft
+			.ensure_linearizable()
+			.await
+			.map_err(|error| error.to_string())?;
+		let roster = self
+			.state_machine
+			.read_state(move |state| roster_at(state, token))
+			.await;
+		let Ok(roster) = roster else {
+			return Ok(roster);
+		};
+		Ok(match &self.kv_presence {
+			None => Err(RosterRefusal::KvCheckInconclusive {
+				why: "this node has no store-side KV check".into(),
+			}),
+			Some(check) => match check.kv_present().await {
+				Ok(false) => Ok(roster),
+				Ok(true) => Err(RosterRefusal::KvDataPresent),
+				Err(why) => Err(RosterRefusal::KvCheckInconclusive { why }),
+			},
+		})
+	}
+
+	/// ADR 0736: proposes a backup hold command and answers with its token, or with
+	/// the reducer's refusal (a conflict names nothing: the operator reads the
+	/// current hold with `GetBackupHold`).
+	async fn submit_backup_hold_command(
+		&self,
+		frame: &HrftFrame,
+		hold: crate::network::decision_proposals::BackupHoldProposal,
+	) -> std::io::Result<HrftFrame> {
+		use crate::consensus::decisions::DecisionResult;
+		use crate::network::decision_proposals::{ProposalOutcome, ProposalResponse};
+		let Some(proposals) = self.decision_proposals.as_ref() else {
+			return self.tenant_admin_rejection(
+				frame,
+				CONTROL_REASON_INVALID_TARGET,
+				"the backup hold exists only under ParentDecisions".to_owned(),
+				None,
+			);
+		};
+		let (accepted, backup_hold, message) = match proposals.propose_backup_hold(hold).await {
+			ProposalResponse::Applied {
+				outcome: ProposalOutcome::Decision(result),
+				..
+			} => match result {
+				DecisionResult::HoldEntered { id, entered_at } => {
+					(true, Some((id, entered_at)), None)
+				}
+				DecisionResult::HoldReleased => (true, None, None),
+				DecisionResult::Refused(refusal) => (false, None, Some(format!("{refusal:?}"))),
+				other => (false, None, Some(format!("unexpected answer: {other:?}"))),
+			},
+			ProposalResponse::NotLeader { leader_hint } => {
+				return self.tenant_admin_rejection(
+					frame,
+					CONTROL_REASON_NOT_LEADER,
+					"not the leader".to_owned(),
+					leader_hint.map(|id| NodeId { id, _reserved: 0 }),
+				);
+			}
+			other => {
+				let message = format!("{other:?}");
+				return self.tenant_admin_rejection(
+					frame,
+					Self::tenant_admin_error_reason(&message),
+					message,
+					None,
+				);
+			}
+		};
+		self.build_backup_admin_frame(
+			frame.header.stream_id,
+			&TenantAdminResponseWire {
+				accepted,
+				// A hold conflict or a token mismatch: the target is not the
+				// hold the caller named.
+				reason_code: if accepted {
+					CONTROL_REASON_GRANTED
+				} else {
+					CONTROL_REASON_INVALID_TARGET
+				},
+				leader_hint: Some(self.local_node.id),
+				tenant: None,
+				tenants: Vec::new(),
+				message,
+			},
+			&BackupAdminExtensionWire {
+				hold: backup_hold,
+				roster: None,
+			},
+		)
+	}
+
 	async fn submit_tenant_admin_mutation(
 		&self,
 		frame: &HrftFrame,
@@ -3791,6 +3983,121 @@ impl WendelonControlServer {
 						message: None,
 					},
 				)
+			}
+			TenantAdminRequestWire::BeginBackupHold { id } => {
+				if let Err(error) =
+					require_administrative_action(&context.actor, AdministrativeAction::BackupHold)
+				{
+					return self.tenant_admin_rejection(
+						&frame,
+						CONTROL_REASON_AUTHORIZATION_FAILED,
+						error.to_string(),
+						None,
+					);
+				}
+				self.submit_backup_hold_command(
+					&frame,
+					crate::network::decision_proposals::BackupHoldProposal::Begin { id },
+				)
+				.await
+			}
+			TenantAdminRequestWire::ReleaseBackupHold { id, entered_at } => {
+				if let Err(error) =
+					require_administrative_action(&context.actor, AdministrativeAction::BackupHold)
+				{
+					return self.tenant_admin_rejection(
+						&frame,
+						CONTROL_REASON_AUTHORIZATION_FAILED,
+						error.to_string(),
+						None,
+					);
+				}
+				self.submit_backup_hold_command(
+					&frame,
+					crate::network::decision_proposals::BackupHoldProposal::Release {
+						id,
+						entered_at,
+					},
+				)
+				.await
+			}
+			TenantAdminRequestWire::GetBackupHold => {
+				if let Err(error) =
+					require_administrative_action(&context.actor, AdministrativeAction::BackupHold)
+				{
+					return self.tenant_admin_rejection(
+						&frame,
+						CONTROL_REASON_AUTHORIZATION_FAILED,
+						error.to_string(),
+						None,
+					);
+				}
+				// A linearizable read, so a hold just entered or released is seen.
+				if let Err(error) = self.raft.ensure_linearizable().await {
+					return self.tenant_admin_rejection(
+						&frame,
+						Self::tenant_admin_error_reason(&error.to_string()),
+						error.to_string(),
+						None,
+					);
+				}
+				let hold = self
+					.state_machine
+					.read_state(|state| {
+						state
+							.decisions
+							.as_ref()
+							.and_then(|decisions| decisions.backup_hold())
+					})
+					.await;
+				self.build_backup_admin_frame(
+					frame.header.stream_id,
+					&TenantAdminResponseWire {
+						accepted: true,
+						reason_code: CONTROL_REASON_GRANTED,
+						leader_hint: Some(self.local_node.id),
+						tenant: None,
+						tenants: Vec::new(),
+						message: None,
+					},
+					&BackupAdminExtensionWire { hold, roster: None },
+				)
+			}
+			TenantAdminRequestWire::BackupRoster { id, entered_at } => {
+				if let Err(error) =
+					require_administrative_action(&context.actor, AdministrativeAction::BackupHold)
+				{
+					return self.tenant_admin_rejection(
+						&frame,
+						CONTROL_REASON_AUTHORIZATION_FAILED,
+						error.to_string(),
+						None,
+					);
+				}
+				let answer = self.backup_roster((id, entered_at)).await;
+				match answer {
+					Ok(answer) => self.build_backup_admin_frame(
+						frame.header.stream_id,
+						&TenantAdminResponseWire {
+							accepted: true,
+							reason_code: CONTROL_REASON_GRANTED,
+							leader_hint: Some(self.local_node.id),
+							tenant: None,
+							tenants: Vec::new(),
+							message: None,
+						},
+						&BackupAdminExtensionWire {
+							hold: None,
+							roster: Some(answer),
+						},
+					),
+					Err(error) => self.tenant_admin_rejection(
+						&frame,
+						Self::tenant_admin_error_reason(&error),
+						error,
+						None,
+					),
+				}
 			}
 			TenantAdminRequestWire::List => {
 				let snapshot = self.state_machine.state_snapshot().await;

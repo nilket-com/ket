@@ -6752,6 +6752,25 @@ fn apply_request_at_log_index(
 				Err(refusal) => (WendelonResponse::Error(refusal.to_string()), None),
 			}
 		}
+		// ADR 0736: while a backup hold is held, the logical mutations this mode
+		// admits are refused at apply, so one proposed before the hold cannot
+		// publish after it. An index's backfill or drop completion still applies:
+		// it finishes work admitted earlier.
+		WendelonRequest::SchemaUpdate(bytes)
+			if backup_held(state) && !is_index_lifecycle_completion(&bytes) =>
+		{
+			(backup_hold_refusal(), None)
+		}
+		WendelonRequest::CreateTenant(_)
+		| WendelonRequest::UpdateTenantQuota(_)
+		| WendelonRequest::SuspendTenant(_)
+		| WendelonRequest::ResumeTenant(_)
+		| WendelonRequest::InstallTenantKekVersion(_)
+		| WendelonRequest::RetireTenantKekVersion(_)
+			if backup_held(state) =>
+		{
+			(backup_hold_refusal(), None)
+		}
 		WendelonRequest::SchemaUpdate(bytes) => match apply_schema_update(state, &bytes) {
 			Ok(()) => (WendelonResponse::Success, None),
 			Err(err) => (WendelonResponse::Error(err), None),
@@ -7152,6 +7171,32 @@ fn apply_update_tenant_quota(state: &mut SmState, update: UpdateTenantQuota) -> 
 	}
 	record.quota_bytes = update.quota_bytes;
 	WendelonResponse::Success
+}
+
+/// ADR 0736: whether a backup hold is held.
+fn backup_held(state: &SmState) -> bool {
+	state
+		.decisions
+		.as_ref()
+		.is_some_and(|decisions| decisions.backup_hold().is_some())
+}
+
+/// ADR 0736: the typed refusal of a held logical mutation.
+pub(crate) const BACKUP_HOLD_REFUSAL: &str = "BackupHold: refused while a backup hold is held";
+
+fn backup_hold_refusal() -> WendelonResponse {
+	WendelonResponse::Error(BACKUP_HOLD_REFUSAL.into())
+}
+
+/// ADR 0736: an index backfill or drop completion, which a hold lets through. An
+/// envelope that does not decode is not one (it is refused like any other).
+fn is_index_lifecycle_completion(bytes: &[u8]) -> bool {
+	decode_schema_update_envelope_v1(bytes).is_ok_and(|envelope| {
+		matches!(
+			envelope.mutation,
+			SchemaMutationKind::IndexBackfillComplete | SchemaMutationKind::IndexDropGcComplete
+		)
+	})
 }
 
 fn apply_schema_update(state: &mut SmState, bytes: &[u8]) -> Result<(), String> {

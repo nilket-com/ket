@@ -716,6 +716,11 @@ impl LogicalTypeCatalog {
 			.collect()
 	}
 
+	/// ADR 0736: every tenant with a definition.
+	pub fn tenant_ids(&self) -> std::collections::BTreeSet<TenantId> {
+		self.by_id.keys().map(|key| key.tenant_id).collect()
+	}
+
 	fn next_id_for_tenant(&self, tenant_id: TenantId) -> std::io::Result<u32> {
 		let start = LogicalTypeIdCatalogKey {
 			tenant_id,

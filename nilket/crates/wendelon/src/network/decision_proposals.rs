@@ -546,6 +546,14 @@ fn outcome_of(response: WendelonResponse) -> Result<ProposalOutcome, String> {
 	}
 }
 
+/// ADR 0736: the only decision commands the administrative route may have the
+/// leader propose.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BackupHoldProposal {
+	Begin { id: u128 },
+	Release { id: u128, entered_at: u64 },
+}
+
 /// One node's view of the proposal path: the leader side for forwarded
 /// requests, the sender side for its own, and the leader's floor task.
 pub struct DecisionProposals {
@@ -954,6 +962,22 @@ impl DecisionProposals {
 				.unwrap_or_else(|error| LookupResponse::Indeterminate(error.to_string())),
 			None => LookupResponse::NotLeader { leader_hint: None },
 		}
+	}
+
+	/// ADR 0736, leader side: proposes the backup hold's begin or release. Not
+	/// time-bearing and not forwarded: the operator's request reaches the leader
+	/// through the authenticated administrative route. The reducer decides.
+	pub(crate) async fn propose_backup_hold(&self, hold: BackupHoldProposal) -> ProposalResponse {
+		if self.mode != DecisionMode::ParentDecisions {
+			return ProposalResponse::Refused(ProposalRefusal::ModeToday);
+		}
+		let command = match hold {
+			BackupHoldProposal::Begin { id } => DecisionCommand::BeginBackupHold { id },
+			BackupHoldProposal::Release { id, entered_at } => {
+				DecisionCommand::ReleaseBackupHold { id, entered_at }
+			}
+		};
+		self.commit(WendelonRequest::Decision(command)).await
 	}
 
 	/// Leader side of a cut: a linearizable read barrier, then its read index.

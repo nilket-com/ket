@@ -12442,7 +12442,9 @@ fn parent_decisions_have_no_producer_and_one_codec() {
 			("committed.rs", 1),
 			// ADR 0699 S5a: the leader's generation step proposes too.
 			// ADR 0700: a time-bearing command is built only by `Unstamped::stamp`.
-			("decision_proposals.rs", 4),
+			// ADR 0736: the backup hold's begin and release, from a typed
+			// proposal the administrative route hands the leader.
+			("decision_proposals.rs", 5),
 			("raft_storage.rs", 2),
 		]),
 		"decisions are matched in apply and built only by the leader's proposal path"

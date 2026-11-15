@@ -26,6 +26,7 @@ use crate::network::{ActorTrustRoots, TlsMaterial, rustls_server_config_with_pee
 use crate::node::{NodeBootstrapConfig, WendelonNode};
 use ::observability::http as observability_http;
 
+mod backup;
 mod index;
 // Offline Root2 compromise audit; the root2 tests drive its executor over real WAL fixtures.
 pub(crate) mod root2_audit;
@@ -165,6 +166,7 @@ where
 		[cmd, rest @ ..] if cmd == "inspect" => run_inspect(rest),
 		[cmd, rest @ ..] if cmd == "index" => index::run(rest),
 		[cmd, rest @ ..] if cmd == "tenant" => tenant::run(rest),
+		[cmd, rest @ ..] if cmd == "backup" => backup::run(rest),
 		[flag, path] if flag == "--write-example-config" => match write_example_config(path) {
 			Ok(()) => {
 				eprintln!("wendelon: wrote starter config to {path}");
@@ -188,7 +190,7 @@ fn print_usage(program: &str) {
 		eprintln!("This binary is deprecated; use `nilket wendelon` instead.");
 	}
 	eprintln!(
-		"usage:\n  {program} <path/to/wendelon.toml>\n  {program} inspect [--endpoint <addr>] [--server-name <name>] [--cert <path>] [--key <path>] [--ca <path>] [--json]\n  {program} index create --bootstrap <node-id>@<addr> --cert <path> --key <path> --ca <path> --tenant <id> --namespace <name> --table <name> --name <name> --column <name> [--id <uuid>]\n  {program} index drop --bootstrap <node-id>@<addr> --cert <path> --key <path> --ca <path> --tenant <id> --id <uuid>\n  {program} index status --bootstrap <node-id>@<addr> --cert <path> --key <path> --ca <path> --tenant <id> [--json]\n  {program} tenant create --bootstrap <node-id>@<addr> --cert <path> --key <path> --ca <path> --tenant <id> [--quota-bytes <n>] [--replication-factor <n>] [--json]\n  {program} tenant get --bootstrap <node-id>@<addr> --cert <path> --key <path> --ca <path> --tenant <id> [--json]\n  {program} tenant list --bootstrap <node-id>@<addr> --cert <path> --key <path> --ca <path> [--json]\n  {program} audit verify <path/to/audit.ndjson> [--trusted-audit-roots <file>]\n  {program} audit root2 <data-dir> --trusted-manifest <file> (--role <admin|governance|recovery> --epoch <n>)... | --key <file> [--suspect-only]\n  {program} --print-example-config\n  {program} --write-example-config <path/to/wendelon.toml>"
+		"usage:\n  {program} <path/to/wendelon.toml>\n  {program} inspect [--endpoint <addr>] [--server-name <name>] [--cert <path>] [--key <path>] [--ca <path>] [--json]\n  {program} index create --bootstrap <node-id>@<addr> --cert <path> --key <path> --ca <path> --tenant <id> --namespace <name> --table <name> --name <name> --column <name> [--id <uuid>]\n  {program} index drop --bootstrap <node-id>@<addr> --cert <path> --key <path> --ca <path> --tenant <id> --id <uuid>\n  {program} index status --bootstrap <node-id>@<addr> --cert <path> --key <path> --ca <path> --tenant <id> [--json]\n  {program} tenant create --bootstrap <node-id>@<addr> --cert <path> --key <path> --ca <path> --tenant <id> [--quota-bytes <n>] [--replication-factor <n>] [--json]\n  {program} tenant get --bootstrap <node-id>@<addr> --cert <path> --key <path> --ca <path> --tenant <id> [--json]\n  {program} tenant list --bootstrap <node-id>@<addr> --cert <path> --key <path> --ca <path> [--json]\n  {program} backup export --to <new-dir> --bootstrap <node-id>@<addr> --cert <path> --key <path> --ca <path> --storage <tenant>=<cert>,<key>... --passphrase-file <path>\n  {program} backup verify <dir> --passphrase-file <path>\n  {program} backup restore <dir> --bootstrap <node-id>@<addr> --cert <path> --key <path> --ca <path> --storage <tenant>=<cert>,<key>... --passphrase-file <path>\n  {program} backup release --id <hex> --entered-at <index> --bootstrap <node-id>@<addr> --cert <path> --key <path> --ca <path>\n  {program} backup hold-status --bootstrap <node-id>@<addr> --cert <path> --key <path> --ca <path>\n  {program} audit verify <path/to/audit.ndjson> [--trusted-audit-roots <file>]\n  {program} audit root2 <data-dir> --trusted-manifest <file> (--role <admin|governance|recovery> --epoch <n>)... | --key <file> [--suspect-only]\n  {program} --print-example-config\n  {program} --write-example-config <path/to/wendelon.toml>"
 	);
 }
 

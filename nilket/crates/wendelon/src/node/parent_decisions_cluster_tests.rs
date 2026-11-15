@@ -350,7 +350,12 @@ async fn ready_with(
 /// moves lineages to the new incarnation; a write before that may meet a
 /// closed lineage and be refused, which is a correct answer, not a fixture.
 async fn until_settled(cluster: &Cluster, descriptor: &TableSchemaDescriptor) {
-	let table = descriptor.table_object_id;
+	until_ready(cluster, Some(descriptor.table_object_id)).await;
+}
+
+/// `until_settled`, for `table` if one is named; with none, a formed cluster
+/// whose catalog may be empty.
+async fn until_ready(cluster: &Cluster, table: Option<TableObjectId>) {
 	cluster
 		.until(
 			"three signers, a fully leased ring and the schema",
@@ -408,10 +413,12 @@ async fn until_settled(cluster: &Cluster, descriptor: &TableSchemaDescriptor) {
 				bound
 					&& covered && !leased.is_empty()
 					&& state.tenants.contains_key(&TenantId::ZERO)
-					&& state
-						.table_schemas
-						.latest_by_id(TenantId::ZERO, table)
-						.is_some()
+					&& table.is_none_or(|table| {
+						state
+							.table_schemas
+							.latest_by_id(TenantId::ZERO, table)
+							.is_some()
+					})
 			},
 		)
 		.await;
@@ -6721,6 +6728,10 @@ async fn a_write_with_a_remote_holder_answered_in_time_commits_on_its_first_atte
 	}
 }
 
+#[path = "parent_decisions_cluster_tests/backup_hold_tests.rs"]
+mod backup_hold;
+#[path = "parent_decisions_cluster_tests/backup_restore.rs"]
+mod backup_restore;
 #[path = "parent_decisions_cluster_tests/write_deadline.rs"]
 mod write_deadline;
 
