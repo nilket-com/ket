@@ -386,6 +386,18 @@ impl TransportProvider for TransportProviderFactory {
 	) -> std::io::Result<Arc<dyn TransportConnection>> {
 		self.get_connection_to(target, address).await
 	}
+
+	/// ADR 0735: removes the cached session for `target` only when it is `session` itself.
+	/// A newer session another caller installed is left in place; nothing is closed.
+	fn discard(&self, target: NodeId, session: &Arc<dyn TransportConnection>) {
+		let mut cache = self.connections.lock().unwrap();
+		if cache
+			.get(&target)
+			.is_some_and(|cached| Arc::ptr_eq(cached, session))
+		{
+			cache.remove(&target);
+		}
+	}
 }
 
 // ============================================================

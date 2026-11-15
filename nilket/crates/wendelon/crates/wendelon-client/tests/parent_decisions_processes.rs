@@ -339,7 +339,11 @@ struct Member {
 /// `inspect <id>` (`nilket wendelon inspect --json` on that host), `inventory <id>` (one
 /// `<bytes><TAB><path>` line per file of the node's data directory, then `END<TAB><count>`;
 /// it must fail on a symbolic link or on anything it cannot read), `sealed-root <id>` (the
-/// forming node's sealed root KEK file, raw), `cleanup <id>` (ends the node's owner if it is
+/// forming node's sealed root KEK file, raw), `crash <id>` (SIGKILL of the node's daemon;
+/// exit 0 only when it was running and ended from that signal, its status on stdout),
+/// `identity <id>` (`pid <main pid> started <when>` of the node's running daemon; fails when
+/// it is not running),
+/// `cleanup <id>` (ends the node's owner if it is
 /// still there; removes no file). `WENDELON_SMOKE_NODE_ADDRESSES`
 /// (`1=host:port,2=host:port,3=host:port`) gives the advertised addresses; each node's
 /// health, ready and metrics listeners are on its own loopback at that port plus 10, 11, 12.
@@ -529,6 +533,107 @@ impl Daemons {
 			CONTROL_BOUND,
 		);
 		assert!(ok, "{raw}");
+	}
+
+	/// An ABRUPT stop of one node: SIGKILL, with no SIGTERM and no drain, and the proof that it
+	/// ended from that signal, as text. Anything else fails the step: a node that was not
+	/// running, a signal that could not be sent, a node that did not end, or one that ended any
+	/// other way (a normal exit is not a crash). Its files are untouched. Only after the
+	/// confirmed stop is the node taken out of those expected to run; it stays among the nodes
+	/// handed to a host, so its owner is still ended at cleanup.
+	fn crash(&mut self, id: u32) -> String {
+		if let Some(control) = node_control() {
+			let at = self
+				.hosted
+				.iter()
+				.position(|node| *node == id)
+				.unwrap_or_else(|| panic!("node {id} is not running"));
+			let (ok, stdout, raw) = node_control_call(&control, "crash", id, None, CONTROL_BOUND);
+			assert!(ok, "node {id} was not confirmed killed by SIGKILL: {raw}");
+			self.hosted.remove(at);
+			return String::from_utf8_lossy(&stdout).trim().to_owned();
+		}
+		let at = self
+			.children
+			.iter()
+			.position(|(node, _)| *node == id)
+			.unwrap_or_else(|| panic!("node {id} is not running"));
+		let running = self.children[at].1.try_wait().expect("poll the daemon");
+		assert!(
+			running.is_none(),
+			"node {id} had already exited ({running:?}): nothing to crash"
+		);
+		let pid = self.children[at].1.id();
+		// The 10 s run from before the signal is sent.
+		let bound = Instant::now() + Duration::from_secs(10);
+		assert!(signal(pid, libc::SIGKILL), "SIGKILL to node {id}");
+		let status = loop {
+			// The observation and the time it was made: an end seen after the bound is late,
+			// whatever its status.
+			let seen = self.children[at].1.try_wait().expect("wait for the daemon");
+			let late = Instant::now() >= bound;
+			match seen {
+				Some(status) if !late => break status,
+				Some(status) => {
+					panic!("node {id} was seen ended only after 10 s of SIGKILL ({status})")
+				}
+				None if late => panic!("node {id} did not end within 10 s of SIGKILL"),
+				None => std::thread::sleep(Duration::from_millis(20)),
+			}
+		};
+		assert_eq!(
+			std::os::unix::process::ExitStatusExt::signal(&status),
+			Some(libc::SIGKILL),
+			"node {id} ended, but not from SIGKILL: {status}"
+		);
+		let (_, mut child) = self.children.remove(at);
+		// Whatever else was in its process group.
+		kill_group(child.id());
+		let _ = child.wait();
+		format!("node {id} ended by signal 9 ({status})")
+	}
+
+	/// A crashed node is still not running. Other hosts: its unit is asked; anything but a
+	/// confirmed not-running answer fails. Here the child was reaped by `crash`.
+	fn still_down(&self, id: u32) {
+		assert!(
+			!self.hosted.contains(&id) && self.children.iter().all(|(node, _)| *node != id),
+			"node {id} is among the running"
+		);
+		if let Some(control) = node_control() {
+			let (ok, stdout, raw) = node_control_call(&control, "state", id, None, CONTROL_BOUND);
+			let state = String::from_utf8_lossy(&stdout);
+			assert!(
+				ok && (state.starts_with("absent") || state.starts_with("ended")),
+				"node {id} is not confirmed down: {raw}"
+			);
+		}
+	}
+
+	/// Which process a running node's daemon is, as text that changes if it is ever another
+	/// one: here its pid and kernel start time; on another host what `identity <id>` prints
+	/// (the unit's main pid and the time it was started). A node that is not running, or whose
+	/// identity cannot be read, fails the step.
+	fn identity(&self, id: u32) -> String {
+		if let Some(control) = node_control() {
+			assert!(self.hosted.contains(&id), "node {id} is not running");
+			let (ok, stdout, raw) =
+				node_control_call(&control, "identity", id, None, CONTROL_BOUND);
+			let text = String::from_utf8_lossy(&stdout).trim().to_owned();
+			assert!(
+				ok && text.starts_with("pid "),
+				"node {id}: its process identity could not be read: {raw}"
+			);
+			return text;
+		}
+		let child = self
+			.children
+			.iter()
+			.find(|(node, _)| *node == id)
+			.unwrap_or_else(|| panic!("node {id} is not running"));
+		let pid = child.1.id();
+		let (_, started) = process_state(pid).unwrap_or_else(|why| panic!("node {id}: {why}"));
+		format!("pid {pid} started {started}")
 	}
 
 	/// A daemon that should be running and is not, with what is known of why.
@@ -756,6 +861,7 @@ fn wait_ready(member: &Member, pki: &Pki, daemons: &mut Daemons, deadline: Insta
 		}
 		let inspection = inspect(member, pki);
 		if inspection.ready && inspection.node_ids("cluster_members") == Some(NODES.to_vec()) {
+			report_consensus_timing(member, &inspection, what);
 			return;
 		}
 		assert!(
@@ -1198,8 +1304,98 @@ min_slab_bytes = 1
 			region = store.region,
 			prefix = store.prefix,
 		),
-		format!("query_stall_bound_millis = {QUERY_STALL_BOUND_MILLIS}\n"),
+		format!(
+			"query_stall_bound_millis = {QUERY_STALL_BOUND_MILLIS}\n{}",
+			declared_consensus_base()
+				.map(|base| format!("consensus_timing_base_millis = {base}\n"))
+				.unwrap_or_default()
+		),
 	)
+}
+
+/// A consensus timing base declared for every node of an object-store test by
+/// `WENDELON_SMOKE_CONSENSUS_TIMING_BASE_MILLIS`. Unset: the key is not written, every node
+/// runs the default profile and nothing here prints or checks anything. Set to anything that
+/// is not a base the product accepts: the test stops, so a mistyped value is never taken for
+/// the default.
+fn declared_consensus_base() -> Option<u64> {
+	consensus_base_of(std::env::var_os("WENDELON_SMOKE_CONSENSUS_TIMING_BASE_MILLIS").as_deref())
+		.unwrap_or_else(|why| panic!("WENDELON_SMOKE_CONSENSUS_TIMING_BASE_MILLIS: {why}"))
+}
+
+/// The declared base in `value`: `None` when nothing is declared; an error for text that is
+/// not Unicode, not a whole number, or outside the range the product accepts.
+fn consensus_base_of(value: Option<&std::ffi::OsStr>) -> Result<Option<u64>, String> {
+	let Some(value) = value else {
+		return Ok(None);
+	};
+	let text = value
+		.to_str()
+		.ok_or_else(|| format!("not Unicode: {value:?}"))?;
+	let base: u64 = text
+		.parse()
+		.map_err(|_| format!("not a whole number of milliseconds: {text:?}"))?;
+	wendelon::consensus::timing::ConsensusTiming::from_base_millis(base)
+		.map_err(|_| format!("{base} is outside the range the product accepts"))?;
+	Ok(Some(base))
+}
+
+#[test]
+fn a_declared_consensus_base_is_taken_whole_or_refused() {
+	use std::ffi::OsStr;
+	use std::os::unix::ffi::OsStrExt;
+	assert_eq!(consensus_base_of(None), Ok(None));
+	assert_eq!(consensus_base_of(Some(OsStr::new("250"))), Ok(Some(250)));
+	assert_eq!(consensus_base_of(Some(OsStr::new("10"))), Ok(Some(10)));
+	assert_eq!(consensus_base_of(Some(OsStr::new("1000"))), Ok(Some(1000)));
+	for refused in [
+		"",
+		" 250",
+		"250 ",
+		"250ms",
+		"-1",
+		"2.5",
+		"0",
+		"9",
+		"1001",
+		"99999999999999999999",
+	] {
+		assert!(
+			consensus_base_of(Some(OsStr::new(refused))).is_err(),
+			"{refused:?} was taken"
+		);
+	}
+	assert!(consensus_base_of(Some(OsStr::from_bytes(b"25\xff"))).is_err());
+}
+
+/// With a profile declared: the profile this node reports is printed and must be the declared
+/// base and the values derived from it (ADR 0731). With none declared this does nothing.
+fn report_consensus_timing(member: &Member, inspection: &Inspection, what: &str) {
+	let Some(base) = declared_consensus_base() else {
+		return;
+	};
+	let timing = inspection
+		.body
+		.as_ref()
+		.and_then(|body| body.get("consensus_timing"))
+		.cloned()
+		.unwrap_or(serde_json::Value::Null);
+	eprintln!(
+		"smoke: node {} consensus_timing ({what}): {timing}",
+		member.id
+	);
+	assert_eq!(
+		timing,
+		serde_json::json!({
+			"base_millis": base,
+			"heartbeat_millis": base,
+			"election_min_millis": 3 * base,
+			"election_max_millis": 6 * base,
+			"snapshot_chunk_millis": (4 * base).max(200),
+		}),
+		"{what}: node {} does not report the declared consensus profile",
+		member.id
+	);
 }
 
 async fn form(deadline: Instant, store: Option<&StoreEnv>) -> Formed {
@@ -3385,14 +3581,15 @@ async fn offloaded_by_every_owner(
 }
 
 /// ONE table query, judged: every row exactly, within the caller's deadline. See the test's
-/// text for what is printed and in which order.
+/// text for what is printed and in which order. Returns the node the client's last attempt
+/// went to, which is the node whose answer was returned.
 async fn judged_query(
 	client: &Client,
 	formed: &Formed,
 	objects: &Arc<dyn ObjectStore>,
 	rows: &[(i64, String)],
 	what: &str,
-) {
+) -> u32 {
 	let targets = Arc::new(std::sync::Mutex::new(Vec::new()));
 	let noted = targets.clone();
 	let asked = Instant::now();
@@ -3473,6 +3670,518 @@ async fn judged_query(
 		"smoke: QUERY ENDED BY ({what}): an exact answer of {} rows after {took:?}, from node {answered_by:?}",
 		got.len()
 	);
+	answered_by.expect("the answered call made an attempt")
+}
+
+/// A stand-in child for the crash bookkeeping checks: a process in a group of its own.
+#[cfg(test)]
+fn stand_in_child(command: &str) -> Child {
+	Command::new("/bin/sh")
+		.args(["-c", command])
+		.stdin(Stdio::null())
+		.stdout(Stdio::null())
+		.stderr(Stdio::null())
+		.process_group(0)
+		.spawn()
+		.unwrap()
+}
+
+#[test]
+fn a_crash_is_confirmed_as_an_end_from_sigkill_and_only_then_is_the_node_down() {
+	let mut daemons = Daemons {
+		children: vec![
+			(2, stand_in_child("sleep 30")),
+			(3, stand_in_child("sleep 30")),
+		],
+		prepared: Vec::new(),
+		hosted: Vec::new(),
+	};
+	let proof = daemons.crash(2);
+	assert!(proof.contains("signal 9"), "{proof}");
+	daemons.still_down(2);
+	// The other node is still expected to run, and does.
+	assert_eq!(daemons.children.len(), 1);
+	assert_eq!(daemons.exited(), None);
+}
+
+#[test]
+#[should_panic(expected = "had already exited")]
+fn a_node_that_had_already_exited_cannot_be_counted_as_crashed() {
+	let mut child = stand_in_child("exit 0");
+	// It has ended by itself before any signal is sent.
+	let bound = Instant::now() + Duration::from_secs(5);
+	while child.try_wait().unwrap().is_none() {
+		assert!(Instant::now() < bound);
+		std::thread::sleep(Duration::from_millis(10));
+	}
+	let mut daemons = Daemons {
+		children: vec![(2, child)],
+		prepared: Vec::new(),
+		hosted: Vec::new(),
+	};
+	daemons.crash(2);
+}
+
+#[test]
+#[should_panic(expected = "is among the running")]
+fn a_running_node_is_not_reported_down() {
+	let daemons = Daemons {
+		children: vec![(2, stand_in_child("sleep 30"))],
+		prepared: Vec::new(),
+		hosted: Vec::new(),
+	};
+	daemons.still_down(2);
+}
+
+/// ONE logical row to an acknowledgement, by the recovery-aware rules of the workflow below
+/// (`settle_one`, `confirm_refusal`, the journal and its caps, which count over the whole
+/// run): the original under key `row`; after each recorded refusal, confirmed, one replacement
+/// under a new key. Every call ends no later than `limit`; an operation's own bound is
+/// `CLIENT_BOUND` or what is left before `limit`. No clock starts at a refusal here. Returns
+/// when the acknowledgement was observed.
+async fn ingest_logical_row(
+	client: &Client,
+	descriptor: &TableSchemaDescriptor,
+	journal: &mut Journal,
+	row: i64,
+	limit: Instant,
+	stage: &str,
+) -> Instant {
+	let mut ordinal = 0_u32;
+	loop {
+		let index = journal.begin(row, ordinal);
+		let what = if ordinal == 0 {
+			format!("{stage}: original offer")
+		} else {
+			format!("{stage}: replacement offer")
+		};
+		let bound = (Instant::now() + CLIENT_BOUND).min(limit);
+		let observed = settle_one(client, descriptor, journal, index, &what, bound).await;
+		if journal.operations[index].disposition == Disposition::Committed {
+			return observed;
+		}
+		journal.refusals += 1;
+		journal.first_refusal.get_or_insert(observed);
+		assert!(
+			ordinal < MAX_REPLACEMENTS_PER_ROW && journal.replacements < MAX_REPLACEMENTS,
+			"{stage}: logical row {row}: refused, and no replacement is left (this row {ordinal} of {MAX_REPLACEMENTS_PER_ROW}, the run {} of {MAX_REPLACEMENTS})",
+			journal.replacements
+		);
+		ordinal += 1;
+		journal.replacements += 1;
+		let confirm_by = (Instant::now() + CLIENT_BOUND).min(limit);
+		confirm_refusal(client, descriptor, journal, index, confirm_by).await;
+	}
+}
+
+/// ONE table query that must return exactly `rows`, ended no later than `limit` (and no later
+/// than `QUERY_DEADLINE` from when it is asked). Nothing else is asked of anyone inside it.
+/// Returns the node whose answer was returned and the instant the call completed.
+async fn exact_query_within(
+	client: &Client,
+	descriptor: &TableSchemaDescriptor,
+	rows: &[(i64, String)],
+	limit: Instant,
+	what: &str,
+) -> (u32, Instant) {
+	let asked = Instant::now();
+	let call_deadline = (asked + QUERY_DEADLINE).min(limit);
+	assert!(
+		asked < call_deadline,
+		"{what}: no time is left for the query"
+	);
+	let targets = Arc::new(std::sync::Mutex::new(Vec::new()));
+	let noted = targets.clone();
+	let outcome = tokio::time::timeout_at(
+		tokio::time::Instant::from_std(call_deadline),
+		client.table_query_with_runtime_filter_and_attempt_hook(
+			TenantId::new(TENANT),
+			descriptor,
+			Vec::new(),
+			None,
+			TableQueryOptions {
+				deadline: Some(call_deadline),
+				..TableQueryOptions::default()
+			},
+			move |attempt: wendelon::client::TableQueryAttempt| {
+				noted.lock().unwrap().push(attempt.target.id);
+				Ok(Box::new(()) as wendelon::client::TableQueryAttemptGuard)
+			},
+		),
+	)
+	.await;
+	let completed = Instant::now();
+	eprintln!(
+		"smoke: QUERY OUTCOME ({what}) after {:?} (caller deadline {:?} from when it was asked): {}; the client's attempts went to nodes {:?}",
+		completed - asked,
+		call_deadline - asked,
+		match &outcome {
+			Err(_) => "no answer of any kind by its deadline".to_owned(),
+			Ok(Err(error)) => format!("an error: {error:?}"),
+			Ok(Ok(result)) => format!("a complete answer, {} batches", result.batches.len()),
+		},
+		targets.lock().unwrap()
+	);
+	let result = match outcome {
+		Err(_) => panic!("{what}: the query had no answer by its deadline"),
+		Ok(Err(error)) => panic!("{what}: the query: {error:?}"),
+		Ok(Ok(result)) => result,
+	};
+	assert!(
+		completed <= call_deadline,
+		"{what}: the answer completed after its deadline"
+	);
+	let mut got = Vec::new();
+	for batch in &result.batches {
+		let ids = batch
+			.column_by_name("id")
+			.and_then(|column| column.as_any().downcast_ref::<Int64Array>())
+			.expect("an id column");
+		let names = batch
+			.column_by_name("name")
+			.and_then(|column| column.as_any().downcast_ref::<LargeStringArray>())
+			.expect("a name column");
+		for row in 0..batch.num_rows() {
+			got.push((ids.value(row), names.value(row).to_owned()));
+		}
+	}
+	got.sort();
+	let mut want = rows.to_vec();
+	want.sort();
+	assert_eq!(
+		got.iter().map(|row| row.0).collect::<Vec<_>>(),
+		want.iter().map(|row| row.0).collect::<Vec<_>>(),
+		"{what}: the keys"
+	);
+	for (got, want) in got.iter().zip(&want) {
+		assert!(got.1 == want.1, "{what}: key {} has another name", want.0);
+	}
+	let answered_by = targets
+		.lock()
+		.unwrap()
+		.last()
+		.copied()
+		.expect("the answered call made an attempt");
+	(answered_by, completed)
+}
+
+/// Three real daemons with a remote object store; the node that served a read is KILLED; the
+/// two that remain acknowledge a new logical row and answer an exact read; the killed node
+/// returns on its own files and the cluster answers a read of everything acknowledged.
+///
+/// Profile. Whatever `WENDELON_SMOKE_CONSENSUS_TIMING_BASE_MILLIS` declares is written to
+/// every node and each node's reported profile must equal it whenever the node is Ready, the
+/// returned node included. Leases and every other timer are the product's; the query stall
+/// bound is this file's declared one. A declared base is a profile for a fixture: it promises
+/// no latency and no lease survives a leader's death because of it.
+///
+/// Writes, before the kill and after it, follow the recovery-aware workflow's rules with ONE
+/// journal and its caps for the whole run: an unknown outcome keeps its identity and row; only
+/// the recorded refusal, confirmed, permits a replacement under a new key; a refusal is
+/// terminal. A truthful refusal is therefore allowed at any point, the outage included.
+///
+/// - Formation, the `ROWS` logical rows, the all-owner offload precondition and the first
+///   judged query are the object-store workflow's. A failure there is a failure of that
+///   workflow at this profile, not an observation of survival.
+/// - S is the node that first query's answer came from. What each node names as control leader
+///   is printed just before the kill; S is NOT required to be it, and when it is not, a pass
+///   says nothing about losing the control leader.
+/// - The kill is SIGKILL of S's daemon, confirmed as an end from that signal. No file of S is
+///   touched, nothing is reconfigured and the members stay the original three.
+/// - THE OUTAGE MARK: `RECOVERY_BOUND` from the instant the kill was CONFIRMED (the instant it
+///   was requested is printed too), clipped to the test's bound. It never moves: not for a
+///   refusal, a replacement, a redirect, a readiness answer or a change of leader. Inside it,
+///   with S down and the two survivors the same processes as before the kill: a client through
+///   a survivor; logical row `ROWS + 1` acknowledged (a new commit); both survivors Ready; and
+///   ONE exact query of every acknowledged row, answered by a survivor. Every call ends no
+///   later than the mark and nothing that completes after it counts. The object listing that
+///   follows is reported outside the mark.
+/// - S is then started from its own files. All three Ready, the survivors still the same
+///   processes, then ONE judged query through a client bootstrapped at S: every acknowledged
+///   row, exactly. The node that answered is printed; it need not be S.
+/// - Not covered: a write known to be in the dead node's range, a node that does not return,
+///   two nodes down, a partition, a loss of power (a killed process keeps what the kernel
+///   had), replacement, backup and restore, any rate, any validated network envelope.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "spawns three daemons and needs a remote object store; run alone under an external owner (see the module text)"]
+async fn three_daemons_keep_serving_when_the_serving_node_is_killed_and_it_returns() {
+	let deadline = Instant::now() + TIERING_TEST_BOUND;
+	let store = StoreEnv::from_environment();
+	let objects = store.handle();
+	let before = tokio::time::timeout(CLIENT_BOUND, objects.list(""))
+		.await
+		.expect("the object store did not answer a list within its bound")
+		.expect("the object store refused a list: endpoint, bucket or keys");
+	assert!(before.is_empty(), "the run's prefix is not new");
+	eprintln!(
+		"smoke: SERVING-NODE LOSS workflow: object prefix {} in bucket {} at {} (direct, no relay); DECLARED consensus timing base {} on every node; DECLARED stall bound {QUERY_STALL_BOUND_MILLIS} ms per node (shipped default 250); {ROWS} logical rows before the kill and one after, slabs of {SLAB_MAX_BYTES} bytes; outage mark {RECOVERY_BOUND:?} from the confirmed kill; replacements at most {MAX_REPLACEMENTS_PER_ROW} a row, {MAX_REPLACEMENTS} in all",
+		store.prefix,
+		store.bucket,
+		store.endpoint,
+		match declared_consensus_base() {
+			Some(base) => format!("{base} ms"),
+			None => "NOT declared (the product's default)".to_owned(),
+		}
+	);
+	let started = Instant::now();
+	let at = |what: &str| {
+		eprintln!(
+			"smoke: PHASE {what} at +{} ms",
+			started.elapsed().as_millis()
+		)
+	};
+
+	at("formation");
+	let mut formed = form(deadline, Some(&store)).await;
+	let client = client_through(
+		&formed.members[0],
+		&formed.pki,
+		Credential::Storage,
+		deadline,
+	)
+	.await;
+	let mut journal = Journal {
+		clock: started,
+		operations: Vec::new(),
+		probes: Vec::new(),
+		first_refusal: None,
+		refusals: 0,
+		replacements: 0,
+	};
+	at("writes");
+	for row in 1..=ROWS {
+		ingest_logical_row(
+			&client,
+			&formed.descriptor,
+			&mut journal,
+			row,
+			deadline,
+			"before the kill",
+		)
+		.await;
+	}
+	eprintln!(
+		"smoke: all {ROWS} logical rows acknowledged before the kill; operations {}, definitive refusals {}, replacements {}",
+		journal.operations.len(),
+		journal.refusals,
+		journal.replacements
+	);
+	at("offload wait");
+	offloaded_by_every_owner(&mut formed, &objects, deadline, "offload wait").await;
+	at("the judged query before the kill");
+	let rows = journal.acknowledged();
+	let serving = judged_query(&client, &formed, &objects, &rows, "before the kill").await;
+	assert!(
+		NODES.contains(&serving),
+		"the query was answered by {serving}, which is no node of this cluster"
+	);
+
+	// What each node names as control leader, now. An observation, not a condition.
+	let mut named_leader = Vec::new();
+	for member in &formed.members {
+		let inspection = inspect(member, &formed.pki);
+		eprintln!(
+			"smoke: before the kill node {} names control leader {:?} (ready {})",
+			member.id,
+			inspection.leader(),
+			inspection.ready
+		);
+		named_leader.push(inspection.leader());
+	}
+	let was_leader = named_leader.iter().all(|leader| *leader == Some(serving));
+	eprintln!(
+		"smoke: the node to be killed, {serving}, {} named control leader by all three just before the kill{}",
+		if was_leader { "WAS" } else { "was NOT" },
+		if was_leader {
+			""
+		} else {
+			": this run does not exercise the loss of the control leader"
+		}
+	);
+	let survivors: Vec<usize> = (0..formed.members.len())
+		.filter(|at| formed.members[*at].id != serving)
+		.collect();
+	let returned = (0..formed.members.len())
+		.find(|at| formed.members[*at].id == serving)
+		.expect("the serving node is a member");
+	// The survivors as processes, before the kill: they must be these to the end.
+	let surviving: Vec<(u32, String)> = survivors
+		.iter()
+		.map(|at| {
+			let id = formed.members[*at].id;
+			(id, formed.daemons.identity(id))
+		})
+		.collect();
+	eprintln!("smoke: the survivors before the kill: {surviving:?}");
+	let same_survivors = |daemons: &mut Daemons, what: &str| {
+		if let Some(exited) = daemons.exited() {
+			panic!("{what}: {exited}");
+		}
+		for (id, identity) in &surviving {
+			assert_eq!(
+				&daemons.identity(*id),
+				identity,
+				"{what}: node {id} is not the process it was before the kill"
+			);
+		}
+	};
+
+	at(&format!("kill of node {serving}"));
+	let kill_requested = Instant::now();
+	let proof = formed.daemons.crash(serving);
+	let kill_confirmed = Instant::now();
+	let mark = (kill_confirmed + RECOVERY_BOUND).min(deadline);
+	eprintln!(
+		"smoke: KILL of serving node {serving}: {proof}; requested at +{} ms, confirmed {:?} later; ONE outage mark {RECOVERY_BOUND:?} after the confirmation",
+		(kill_requested - started).as_millis(),
+		kill_confirmed - kill_requested
+	);
+
+	// Everything from here to OUTAGE RESULT ends no later than the mark.
+	at("the new logical row with the node down");
+	let through = client_through(
+		&formed.members[survivors[0]],
+		&formed.pki,
+		Credential::Storage,
+		mark,
+	)
+	.await;
+	assert!(
+		Instant::now() <= mark,
+		"OUTAGE: the client through a survivor came after the mark"
+	);
+	let committed = ingest_logical_row(
+		&through,
+		&formed.descriptor,
+		&mut journal,
+		ROWS + 1,
+		mark,
+		"with the node down",
+	)
+	.await;
+	assert!(
+		committed <= mark,
+		"OUTAGE: the new commit came after the mark"
+	);
+	formed.daemons.still_down(serving);
+	at("the survivors' readiness");
+	for at in &survivors {
+		wait_ready(
+			&formed.members[*at],
+			&formed.pki,
+			&mut formed.daemons,
+			mark,
+			"OUTAGE readiness",
+		);
+	}
+	let ready = Instant::now();
+	assert!(ready <= mark, "OUTAGE: readiness came after the mark");
+	assert_eq!(
+		journal.count(Disposition::Unknown),
+		0,
+		"OUTAGE: an operation is unresolved"
+	);
+	// Named a judged query so that the record's completeness rule counts it with its outcome.
+	at("the judged query with the node down");
+	let rows = journal.acknowledged();
+	let (answered, read) = exact_query_within(
+		&through,
+		&formed.descriptor,
+		&rows,
+		mark,
+		"OUTAGE: every acknowledged row, with the node down",
+	)
+	.await;
+	assert!(
+		read <= mark,
+		"OUTAGE: the exact query completed after the mark"
+	);
+	assert!(
+		answered != serving && NODES.contains(&answered),
+		"OUTAGE: the query was answered by node {answered}"
+	);
+	formed.daemons.still_down(serving);
+	same_survivors(&mut formed.daemons, "at the end of the outage checks");
+	eprintln!(
+		"smoke: OUTAGE RESULT: PASS inside {RECOVERY_BOUND:?} of the confirmed kill of node {serving}: logical row {} acknowledged after {:?}, both survivors Ready after {:?}, exactly the {} acknowledged rows read from node {answered} after {:?}; node {serving} down throughout, the survivors the same processes; definitive refusals so far {}, replacements {}",
+		ROWS + 1,
+		committed - kill_confirmed,
+		ready - kill_confirmed,
+		rows.len(),
+		read - kill_confirmed,
+		journal.refusals,
+		journal.replacements
+	);
+	// Reported only, and outside the mark.
+	for at in &survivors {
+		let inspection = inspect(&formed.members[*at], &formed.pki);
+		eprintln!(
+			"smoke: with node {serving} down node {} names control leader {:?} (ready {})",
+			formed.members[*at].id,
+			inspection.leader(),
+			inspection.ready
+		);
+	}
+	match Snapshot::try_take(&formed, &objects, CLIENT_BOUND).await {
+		Ok(snapshot) => snapshot.report("with the node down (reported, not judged)"),
+		Err(why) => eprintln!(
+			"smoke: the listing with the node down is UNAVAILABLE ({why}); the outage result is unaffected"
+		),
+	}
+
+	// The node returns on its own files.
+	at(&format!("return of node {serving}"));
+	formed.daemons.start(&formed.members[returned]);
+	for member in &formed.members {
+		wait_ready(
+			member,
+			&formed.pki,
+			&mut formed.daemons,
+			deadline,
+			"after the killed node's return",
+		);
+	}
+	same_survivors(&mut formed.daemons, "after the killed node's return");
+	let back = client_through(
+		&formed.members[returned],
+		&formed.pki,
+		Credential::Storage,
+		deadline,
+	)
+	.await;
+	at("the judged query after the return");
+	let answered = judged_query(&back, &formed, &objects, &rows, "after the return").await;
+	eprintln!(
+		"smoke: after node {serving} returned, a client bootstrapped at it was answered by node {answered}{}",
+		if answered == serving {
+			""
+		} else {
+			": a cluster read after the return, not a read served by the returned node"
+		}
+	);
+	eprintln!(
+		"smoke: OVERALL: PASS: the serving node {serving} ({}the control leader named before the kill) was killed and returned; {} operations, {} acknowledged, {} refused, {} replacements",
+		if was_leader { "" } else { "NOT " },
+		journal.operations.len(),
+		journal.count(Disposition::Committed),
+		journal.count(Disposition::Refused),
+		journal.replacements
+	);
+
+	for id in NODES {
+		formed.daemons.stop(id, deadline);
+	}
+	assert!(Instant::now() < deadline, "the test overran its bound");
+	if let (Ok(record), None) = (std::env::var("WENDELON_SMOKE_RECORD_DIR"), node_control()) {
+		for member in &formed.members {
+			std::fs::copy(
+				&member.log,
+				Path::new(&record).join(format!("node-{}.daemon.log", member.id)),
+			)
+			.unwrap();
+		}
+	}
+	std::fs::remove_dir_all(&formed.root).unwrap();
 }
 
 // ============================================================

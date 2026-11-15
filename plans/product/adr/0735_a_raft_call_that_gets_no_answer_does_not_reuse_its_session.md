@@ -1,6 +1,6 @@
 # ADR 0735: a Raft call that gets no answer does not reuse its session
 
-Status: accepted for implementation, 2026-11-14. Not delivered; the plan stays off main until its reviewed implementation follows. Defect DC-237, which this narrows and does not close.
+Status: accepted for normal delivery with the passing evidence below (2026-11-15 UTC). No owning-scenario exception is required; DC-237 retains the earlier failed runs and remaining observations.
 
 ## Why
 - A node's Raft client for a peer (`WendelonRaftNetwork`) keeps one session to it and reuses it for every call unless the session reports itself closed. Beneath it, the dial provider production gives it is the shared `TransportProviderFactory`, which has a cache of its own and likewise hands back a cached session unless it reports closed. Nothing a failed or cancelled call does clears either cache.
@@ -52,3 +52,13 @@ Cost: product delta about 40 lines (consensus/raft_network.rs, network/transport
 
 ## Stop points
 Plan review → implementation (the retained RED first) → source review → the whole-crate run and the one three-host execution → delivery ruling.
+
+## Delivery evidence (2026-11-15 UTC)
+- Focused checks passed 22/22 and architecture checks 254/254. The unchanged two-cache RED now answers on a new session, while healthy and valid Raft-error replies retain reuse, and stale-session discard preserves a newer session. This is controlled mechanism evidence, not exact attribution of a previous real-host failure.
+- One whole-crate/client checkpoint on reviewed implementation 8c15a4b29 passed 4730/4730 (27 skipped), default concurrency, test temporary files on tmpfs and build target on disk; the Toron test-build check succeeded. One sample. The survivability harness was then composed without changing any other source, as signed 407efe807 (tree 11070054311b90b76f6111d6550f30f29f5d19f2).
+- The ONE three-host serving-node-loss/same-store-return execution PASSED whole: `pd-3host-offload-20261115T001536Z-f9b326c3`, seal `937bffabfbfacad00dd9ec53a3726a5ad19467f77496fb64ef6f5eece6fd31e7`. One daemon each on slim/bigfoot/optiplex, direct development RustFS, on-disk node directories, declared consensus base 250 ms and query stall bound 2000 ms; normal lease/timer settings otherwise. It establishes neither a rate nor a validated network or cross-provider envelope, nor behavior at the 50 ms default.
+- Before the kill: 64 first-offer acknowledgements, aggregate all-owner offload of 63/63/63 slabs with no owner-local file, exact 64-row query through node 1. Node 1, named control leader by all three, was confirmed ended by SIGKILL.
+- Outage: one identity for logical row 65, six offers while outcome remained unknown, then committed at 14.445 s after confirmed kill; no refusal/replacement. Both survivors were Ready at 15.573 s and an exact read of all 65 acknowledged rows completed through node 3 at 15.794 s. The killed node remained down and the surviving processes were unchanged.
+- Return: node 1 restarted on its own files; all three became Ready about 8.6 s later, including the declared-profile check on node 1. The final exact 65-row query used a client bootstrapped at node 1 but was answered by node 3; it does not prove the returned node served that query or holds every missed row. All orderly stops and cleanup completed; the test passed in 99.63 s.
+- The previously reviewed survivability test is delivered with this implementation, with exactly the file bytes exercised in 407efe807. The final delivery differs from that exercised composition only in this ADR record; product sources remain those of the passing checkpoint. No checkpoint or daemon run was repeated for this record amendment. Earlier failures remain FAILED; no delivery exception is used for this pair.
+- Remaining observations: the returned node again logged a recovery-integrity warning (`fenced_table_count=0`) and transient `ClockUnhealthy`; these remain unexplained despite Ready and the successful cluster read. Later object listings showed local payload files on node 3 again, with read promotion a hypothesis, not verified. Section 8 memory remains FAILED/unwaived; member replacement, backup/restore and the uncorrected data-plane session exposure remain open. Raw logs, keys and run artifacts stay outside git.

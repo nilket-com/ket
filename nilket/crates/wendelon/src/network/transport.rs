@@ -229,6 +229,13 @@ pub trait TransportProvider: Send + Sync {
 		address: &str,
 	) -> std::io::Result<Arc<dyn TransportConnection>>;
 
+	/// ADR 0735: stop handing out exactly `session` for `target`, because a call on it got no
+	/// answer. A provider that caches sessions MUST implement this so that, once it returns,
+	/// `connect` no longer yields `session` for `target`; it must never remove a different
+	/// (newer) session, close `session`, or disturb streams already open on it. The default
+	/// does nothing and is right only for a provider that caches no sessions.
+	fn discard(&self, _target: NodeId, _session: &Arc<dyn TransportConnection>) {}
+
 	/// Withdraw only this exact service registration. Success certifies that no
 	/// matching registration remains; never remove a newer service for the node.
 	/// Non-retaining providers explicitly implement a no-op. No default can

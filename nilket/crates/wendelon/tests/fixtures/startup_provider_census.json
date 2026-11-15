@@ -40,6 +40,14 @@
     "withdraw_noop": true
   },
   {
+    "file": "crates/wendelon/src/consensus/raft_network.rs",
+    "implementation": "Scripted",
+    "retains_publication": false,
+    "withdrawal": "explicit no retained publication",
+    "overrides_publish": false,
+    "withdraw_noop": true
+  },
+  {
     "file": "crates/wendelon/src/network/data_server/tests.rs",
     "implementation": "LoopbackProvider",
     "retains_publication": false,
