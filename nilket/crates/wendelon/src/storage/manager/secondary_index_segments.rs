@@ -294,6 +294,36 @@ impl SlabManager {
 		if self.secondary_index_declaration_cuts.contains(&key) {
 			return Ok(self.active_slab_id().await);
 		}
+		// DC-248: an empty active slab holds no row a buffer could miss, so the cut
+		// is made on it without rotating. Rotating would seal an empty slab, and a
+		// later open drops an empty slab file while its index segment remains, which
+		// fences the table. Proved sibling buffers stay; any other buffer is discarded.
+		let empty_active = {
+			let state = self.state.lock().await;
+			(state.active.write_cursor() == 0).then(|| state.active.slab_id())
+		};
+		if let Some(active_id) = empty_active {
+			for sibling in table_indexes {
+				let sibling_key = SecondaryIndexCoverageKey::from(
+					SecondaryIndexIdentity::from_descriptor(tenant_id, sibling),
+				);
+				if !self.secondary_index_declaration_cuts.contains(&sibling_key)
+					&& let Some(mut tracker) = self.secondary_index_coverage.get_mut(&sibling_key)
+				{
+					let _ = tracker.take_active_buffer();
+				}
+			}
+			for sibling in table_indexes {
+				self.ensure_secondary_index_coverage(tenant_id, sibling, max_buffer_bytes)
+					.await?;
+				self.secondary_index_declaration_cuts
+					.insert(SecondaryIndexCoverageKey::from(
+						SecondaryIndexIdentity::from_descriptor(tenant_id, sibling),
+					));
+			}
+			self.secondary_index_declaration_cuts.insert(key);
+			return Ok(active_id);
+		}
 		// Preserve already-established indexes before rotating their source slab.
 		// A buffer with no process-local cut proof may be only a suffix (notably
 		// after restart), so discard it and let full-slab backfill repair coverage.
@@ -738,12 +768,43 @@ impl SlabManager {
 					.map(|buffer| buffer.source_slab_id() != next_source_slab_id)
 			})
 			.unwrap_or(false);
-		if should_seal {
-			self.seal_secondary_index_active_buffer(tenant_id, descriptor)
-				.await
-		} else {
-			Ok(None)
+		if !should_seal {
+			return Ok(None);
 		}
+		// DC-248: only a buffer begun under this process's declaration cut is known to
+		// start at its slab's first admitted row. Any other buffer may be a suffix
+		// (open keeps the highest slab active), and persisting it would count the
+		// whole slab as covered. Discard it, as the cut itself does: with no segment
+		// the slab stays in the query's scan tail and a durable gap that backfill
+		// rebuilds from the full slab. A discard is not a failure.
+		if !self.secondary_index_declaration_cuts.contains(&key) {
+			let discarded = self
+				.secondary_index_coverage
+				.get_mut(&key)
+				.and_then(|mut tracker| tracker.take_active_buffer());
+			if let Some(buffer) = discarded {
+				tracing::debug!(
+					tenant_id = tenant_id.get(),
+					source_slab_id = buffer.source_slab_id().get(),
+					"secondary index buffer without this process's declaration cut discarded at rotation; the slab is left to backfill"
+				);
+			}
+			return Ok(None);
+		}
+		self.seal_secondary_index_active_buffer(tenant_id, descriptor)
+			.await
+	}
+
+	/// Whether this process has established the declaration cut for this index.
+	pub fn secondary_index_declaration_cut_established(
+		&self,
+		tenant_id: TenantId,
+		descriptor: &SecondaryIndexDescriptor,
+	) -> bool {
+		self.secondary_index_declaration_cuts
+			.contains(&SecondaryIndexCoverageKey::from(
+				SecondaryIndexIdentity::from_descriptor(tenant_id, descriptor),
+			))
 	}
 
 	pub async fn backfill_secondary_index_source_slab(

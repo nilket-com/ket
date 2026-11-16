@@ -4396,7 +4396,11 @@ async fn run_secondary_index_lifecycle_tick(
 					continue;
 				};
 				let has_receipt = row.has_backfill_completion(local_node);
-				if !has_receipt {
+				// DC-248: every process makes its own cut, receipt or not; a buffer
+				// sealed without one could be a suffix of a slab open kept active.
+				if !has_receipt
+					|| !slab.secondary_index_declaration_cut_established(tenant_id, &row.descriptor)
+				{
 					slab.establish_secondary_index_declaration_cut(
 						tenant_id,
 						&row.descriptor,

@@ -6860,6 +6860,17 @@ async fn table_write_seals_secondary_index_active_buffer_after_slab_rotation() {
 		))
 		.await
 		.unwrap();
+	// DC-248: a buffer seals at rotation only under this process's declaration cut,
+	// which the lifecycle makes; this test stops the lifecycle, so it makes the cut.
+	node.slab
+		.establish_secondary_index_declaration_cut(
+			tenant(),
+			&index,
+			std::slice::from_ref(&index),
+			4096,
+		)
+		.await
+		.unwrap();
 
 	let first_slab_id = node.slab.active_slab_id().await;
 	let first_batch = typed_table_batch_with_names(vec![(1, "first")]);
@@ -7151,6 +7162,364 @@ async fn table_query_secondary_index_execution_returns_sidecar_rows() {
 	assert_eq!(ids.value(0), 1);
 	assert_eq!(names.value(0), "target");
 
+	shutdown_lease_node(node).await;
+}
+
+async fn index_red_node_ready(cfg: &NodeBootstrapConfig) -> WendelonNode {
+	index_red_node(cfg, false).await
+}
+
+async fn index_red_node(cfg: &NodeBootstrapConfig, lifecycle: bool) -> WendelonNode {
+	let node = WendelonNode::bootstrap_single_node(cfg.clone())
+		.await
+		.unwrap();
+	if !lifecycle {
+		stop_secondary_index_lifecycle(&node).await;
+	}
+	let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+	loop {
+		if node.raft.current_leader().await == Some(node.local_node.id) {
+			break;
+		}
+		assert!(tokio::time::Instant::now() < deadline, "leader timeout");
+		tokio::time::sleep(Duration::from_millis(20)).await;
+	}
+	node.data_server
+		.refresh_leases_once(&node.ring, &*node.clock, 60_000)
+		.await;
+	node
+}
+
+async fn index_red_write(
+	node: &WendelonNode,
+	descriptor: &TableSchemaDescriptor,
+	sequence_no: u64,
+	rows: Vec<(i64, &str)>,
+) -> HybridTimestamp {
+	let batch = typed_table_batch_with_names(rows);
+	let mut meta = typed_table_meta(descriptor, batch.num_rows());
+	meta.parent_write_id.sequence_no = sequence_no;
+	let table = meta.table_object_id;
+	let (response, _) = node.data_server.table_write(meta, batch).await.unwrap();
+	assert_eq!(
+		response.write.status,
+		WriteStatus::OK,
+		"write {sequence_no}: table integrity failure {:?}",
+		node.slab.table_integrity_failure(tenant(), table)
+	);
+	response.write.commit_hlc
+}
+
+/// The rows an indexed `name = 'target'` query answers, or its refusal.
+async fn index_red_query(
+	node: &WendelonNode,
+	descriptor: &TableSchemaDescriptor,
+	as_of: HybridTimestamp,
+) -> Result<BTreeSet<i64>, String> {
+	let program = name_eq_program("target");
+	let meta = table_query_meta_for_test(descriptor, as_of, program.len());
+	let plan = node
+		.data_server
+		.prepare_table_query_execution_plan_with_migration(
+			&meta,
+			&program,
+			DecodedRuntimeFilter::Absent,
+		)
+		.await
+		.map_err(|error| format!("refused: {error}"))?;
+	if plan.response.status != ReadStatus::OK {
+		return Err(format!("status {:?}", plan.response.status));
+	}
+	assert!(
+		plan.secondary_index_access_plan.is_some(),
+		"the query must take the secondary-index path"
+	);
+	let mut ids = BTreeSet::new();
+	for batch in &plan.batches {
+		let column = batch
+			.column_by_name("id")
+			.unwrap()
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.unwrap();
+		ids.extend(column.iter().flatten());
+	}
+	Ok(ids)
+}
+
+/// DC-248 (RED): open keeps the highest slab active, so after a restart a write
+/// starts an active index buffer part-way through a slab that already holds rows.
+/// When the slab rotates, that suffix is sealed as the slab's segment, the slab
+/// counts as covered and leaves the query's scan tail, and an indexed query that
+/// must return a row written before the restart either returns it or refuses.
+#[tokio::test]
+async fn an_indexed_query_after_a_restart_keeps_the_reopened_slabs_earlier_rows() {
+	let dir = bootstrap_tempdir("dc248-indexed-query-after-restart");
+	let cfg = NodeBootstrapConfig::dev(57, dir.to_path_buf(), "127.0.0.1:0".into());
+	let node = index_red_node_ready(&cfg).await;
+	let descriptor = typed_table_descriptor();
+	node.raft
+		.client_write(WendelonRequest::SchemaUpdate(typed_table_schema_update(
+			&descriptor,
+		)))
+		.await
+		.unwrap();
+	// A row before the index exists, so the declaration cut seals a slab with data.
+	index_red_write(&node, &descriptor, 899, vec![(10, "seed")]).await;
+	let index = name_secondary_index_descriptor(&descriptor);
+	node.raft
+		.client_write(WendelonRequest::SchemaUpdate(
+			secondary_index_schema_update(&index),
+		))
+		.await
+		.unwrap();
+	// What the lifecycle does for a new index: a declaration cut, historical
+	// backfill, then the receipt that makes it Ready.
+	node.slab
+		.establish_secondary_index_declaration_cut(
+			tenant(),
+			&index,
+			std::slice::from_ref(&index),
+			4096,
+		)
+		.await
+		.unwrap();
+	let backfill = node
+		.slab
+		.run_secondary_index_backfill_once(tenant(), &descriptor, &index, 8, 4096)
+		.await
+		.unwrap();
+	assert!(backfill.historical_complete);
+	node.raft
+		.client_write(WendelonRequest::SchemaUpdate(
+			secondary_index_backfill_complete_schema_update(&index, node.local_node),
+		))
+		.await
+		.unwrap();
+
+	// The prefix: row 1 lands in the active slab S before the restart.
+	let slab_s = node.slab.active_slab_id().await;
+	let first = index_red_write(&node, &descriptor, 900, vec![(1, "target")]).await;
+	assert_eq!(node.slab.active_slab_id().await, slab_s);
+	assert_eq!(
+		index_red_query(&node, &descriptor, first).await,
+		Ok(BTreeSet::from([1])),
+		"precondition: row 1 is answered before the restart"
+	);
+	shutdown_lease_node(node).await;
+	tokio::time::sleep(Duration::from_millis(25)).await;
+
+	// The reopen keeps S active; the suffix (row 2) starts a buffer part-way into S.
+	let node = index_red_node_ready(&cfg).await;
+	assert_eq!(
+		node.slab.active_slab_id().await,
+		slab_s,
+		"precondition: open keeps the highest slab active"
+	);
+	let second = index_red_write(&node, &descriptor, 901, vec![(2, "target")]).await;
+	// While S is active, the full active-tail scan answers both rows.
+	assert_eq!(
+		index_red_query(&node, &descriptor, second).await,
+		Ok(BTreeSet::from([1, 2])),
+		"the active-tail scan answers the reopened slab's rows"
+	);
+	// Rotation: S seals, and the next write moves the index buffer off S.
+	node.slab.force_seal_active_for_test().await;
+	let last = index_red_write(&node, &descriptor, 902, vec![(3, "other")]).await;
+	assert_ne!(node.slab.active_slab_id().await, slab_s);
+
+	let segment_entries = node
+		.slab
+		.list_secondary_index_segments(
+			tenant(),
+			index.table_object_id,
+			index.index_object_id,
+			index.logical_schema_fingerprint,
+		)
+		.into_iter()
+		.filter(|info| info.source_slab_id == slab_s)
+		.map(|info| info.entry_count)
+		.collect::<Vec<_>>();
+	let gaps = node
+		.slab
+		.secondary_index_durable_coverage_gaps(tenant(), &index)
+		.await;
+	let tail = node
+		.slab
+		.secondary_index_tail_source_slabs(tenant(), &index)
+		.await;
+	eprintln!(
+		"dc248: S={} segments for S (entry counts) {segment_entries:?}, durable gaps {gaps:?}, scan tail {tail:?}",
+		slab_s.get()
+	);
+	let answered = index_red_query(&node, &descriptor, last).await;
+	eprintln!("dc248: query after rotation answered {answered:?}");
+	assert!(
+		matches!(&answered, Ok(ids) if *ids == BTreeSet::from([1, 2])) || answered.is_err(),
+		"an indexed query after a restart and a rotation dropped a row written before the restart: {answered:?}"
+	);
+
+	// What the lifecycle's tick does in this process: its own cut, then backfill of
+	// S from the full slab. The answer is then complete.
+	node.slab
+		.establish_secondary_index_declaration_cut(
+			tenant(),
+			&index,
+			std::slice::from_ref(&index),
+			4096,
+		)
+		.await
+		.unwrap();
+	let backfill = node
+		.slab
+		.run_secondary_index_backfill_once(tenant(), &descriptor, &index, 8, 4096)
+		.await
+		.unwrap();
+	assert!(backfill.historical_complete);
+	assert_eq!(
+		index_red_query(&node, &descriptor, last).await,
+		Ok(BTreeSet::from([1, 2])),
+		"after the cut and backfill the reopened slab's rows are answered"
+	);
+	// The cut left an empty active slab; give it a row before the restart.
+	index_red_write(&node, &descriptor, 905, vec![(6, "other")]).await;
+	shutdown_lease_node(node).await;
+	tokio::time::sleep(Duration::from_millis(25)).await;
+
+	// The real lifecycle in a new process: it makes its own cut although this node
+	// holds the receipt, so a buffer begun after it seals as a complete segment.
+	let node = index_red_node(&cfg, true).await;
+	let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+	while !node
+		.slab
+		.secondary_index_declaration_cut_established(tenant(), &index)
+	{
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"the lifecycle made no declaration cut in a process whose node holds the receipt"
+		);
+		tokio::time::sleep(Duration::from_millis(20)).await;
+	}
+	let after_cut = node.slab.active_slab_id().await;
+	index_red_write(&node, &descriptor, 903, vec![(4, "target")]).await;
+	node.slab.force_seal_active_for_test().await;
+	let latest = index_red_write(&node, &descriptor, 904, vec![(5, "other")]).await;
+	let proved = node
+		.slab
+		.list_secondary_index_segments(
+			tenant(),
+			index.table_object_id,
+			index.index_object_id,
+			index.logical_schema_fingerprint,
+		)
+		.into_iter()
+		.find(|info| info.source_slab_id == after_cut)
+		.map(|info| info.entry_count);
+	assert_eq!(
+		proved,
+		Some(1),
+		"a buffer begun under this process's cut seals as the slab's segment"
+	);
+	assert_eq!(
+		index_red_query(&node, &descriptor, latest).await,
+		Ok(BTreeSet::from([1, 2, 4]))
+	);
+	shutdown_lease_node(node).await;
+	tokio::time::sleep(Duration::from_millis(25)).await;
+
+	// The same after another restart: what was persisted is complete.
+	let node = index_red_node_ready(&cfg).await;
+	assert_eq!(
+		index_red_query(&node, &descriptor, latest).await,
+		Ok(BTreeSet::from([1, 2, 4])),
+		"after another restart the indexed answer is complete"
+	);
+	shutdown_lease_node(node).await;
+}
+
+/// DC-248 companion: a declaration cut on an empty active slab (an index declared
+/// then, or the lifecycle's cut in a process restarted idle) must not seal and index
+/// an empty slab whose file a later open drops, which fences the table
+/// (`PublishedReferenceIntegrityFailure`, `SecondaryIndexSourceSlab`; observed on
+/// main in the DC-248 RED fixture, and after idle restarts with the per-process cut).
+#[tokio::test]
+async fn an_indexed_table_stays_writable_across_idle_restarts() {
+	let dir = bootstrap_tempdir("dc248-idle-restarts");
+	let cfg = NodeBootstrapConfig::dev(58, dir.to_path_buf(), "127.0.0.1:0".into());
+	let node = index_red_node(&cfg, true).await;
+	let descriptor = typed_table_descriptor();
+	node.raft
+		.client_write(WendelonRequest::SchemaUpdate(typed_table_schema_update(
+			&descriptor,
+		)))
+		.await
+		.unwrap();
+	// The index is declared while the active slab is empty (the case observed on
+	// main in the DC-248 RED fixture), and row 1 follows under its cut.
+	let index = name_secondary_index_descriptor(&descriptor);
+	node.raft
+		.client_write(WendelonRequest::SchemaUpdate(
+			secondary_index_schema_update(&index),
+		))
+		.await
+		.unwrap();
+	let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+	loop {
+		let ready = node
+			.state_machine
+			.state_snapshot()
+			.await
+			.secondary_indexes
+			.rows()
+			.into_iter()
+			.any(|(_, row)| {
+				row.descriptor.index_object_id == index.index_object_id
+					&& row.state == SecondaryIndexState::Ready
+			});
+		if ready {
+			break;
+		}
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"the index never became Ready"
+		);
+		tokio::time::sleep(Duration::from_millis(50)).await;
+	}
+	index_red_write(&node, &descriptor, 910, vec![(1, "target")]).await;
+	shutdown_lease_node(node).await;
+	tokio::time::sleep(Duration::from_millis(25)).await;
+
+	// Two idle processes: each lifecycle makes its cut and backfills, no writes.
+	for round in 0..2 {
+		let node = index_red_node(&cfg, true).await;
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+		loop {
+			let cut = node
+				.slab
+				.secondary_index_declaration_cut_established(tenant(), &index);
+			let gaps = node
+				.slab
+				.secondary_index_durable_coverage_gaps(tenant(), &index)
+				.await;
+			if cut && gaps.is_empty() {
+				break;
+			}
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"round {round}: no cut and complete coverage (cut {cut}, gaps {gaps:?})"
+			);
+			tokio::time::sleep(Duration::from_millis(50)).await;
+		}
+		shutdown_lease_node(node).await;
+		tokio::time::sleep(Duration::from_millis(25)).await;
+	}
+
+	let node = index_red_node_ready(&cfg).await;
+	let last = index_red_write(&node, &descriptor, 911, vec![(2, "target")]).await;
+	assert_eq!(
+		index_red_query(&node, &descriptor, last).await,
+		Ok(BTreeSet::from([1, 2]))
+	);
 	shutdown_lease_node(node).await;
 }
 
