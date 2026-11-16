@@ -70,6 +70,12 @@ pub struct RecoveredRowsForTest {
 	/// manifests and the installed certified base (each version once), read
 	/// from the slab and projected to the table's columns, one batch per copy.
 	pub rows: Vec<arrow::record_batch::RecordBatch>,
+	/// ADR 0107 (wendelon): the store's active certified generation.
+	pub active_gid: u64,
+	/// ADR 0107 (wendelon): the rows the active certified base holds (row
+	/// entries of the table only), read from the slab and projected, whether or
+	/// not a Complete child also holds the version.
+	pub base_rows: Vec<arrow::record_batch::RecordBatch>,
 }
 
 #[cfg(feature = "test-support")]
@@ -150,6 +156,8 @@ pub(crate) async fn recovered_rows_in(
 		}
 		// The installed certified base: each row entry's stored copies, each
 		// compared with the entry's content digest.
+		let active_gid = index.base_meta().await?.active_gid;
+		let mut base_rows = Vec::new();
 		let mut after = None;
 		loop {
 			let page = index.base_page(after, 1024).await?;
@@ -162,9 +170,10 @@ pub(crate) async fn recovered_rows_in(
 					continue;
 				}
 				let key = (entry.key_identity, entry.hlc);
-				if rows.contains_key(&key) {
-					continue;
-				}
+				// A version a Complete child also holds is listed once, from
+				// the child; its base copies are still verified and kept in
+				// `base_rows`.
+				let from_child = rows.contains_key(&key);
 				let stored = slab
 					.stored_rows_at_version(
 						entry.tenant,
@@ -188,12 +197,15 @@ pub(crate) async fn recovered_rows_in(
 							entry.key_identity
 						));
 					}
-					rows.entry(key).or_insert_with(Vec::new).push(
+					let projected =
 						crate::network::data_server::child_writes::stored_row_projected(
 							descriptor, &row,
 						)
-						.map_err(std::io::Error::other)?,
-					);
+						.map_err(std::io::Error::other)?;
+					base_rows.push(projected.clone());
+					if !from_child {
+						rows.entry(key).or_insert_with(Vec::new).push(projected);
+					}
 				}
 			}
 		}
@@ -204,6 +216,8 @@ pub(crate) async fn recovered_rows_in(
 			complete_children: complete.len(),
 			unverified,
 			rows: rows.into_values().flatten().collect(),
+			active_gid,
+			base_rows,
 		})
 	}
 	.await;

@@ -84,6 +84,12 @@ pub(crate) struct Preparation {
 static HALTS: std::sync::Mutex<std::collections::BTreeMap<PathBuf, Stage>> =
 	std::sync::Mutex::new(std::collections::BTreeMap::new());
 
+/// Test-only (ADR 0107): how many more of a node's report answers are lost
+/// after the report was sent, by data directory, as a dropped reply would.
+#[cfg(test)]
+pub(crate) static LOSE_REPORT_ANSWERS: std::sync::Mutex<std::collections::BTreeMap<PathBuf, u32>> =
+	std::sync::Mutex::new(std::collections::BTreeMap::new());
+
 #[cfg(test)]
 pub(crate) fn halt_for_test(data_dir: &std::path::Path, stage: Option<Stage>) {
 	let mut halts = HALTS.lock().unwrap();
@@ -222,7 +228,8 @@ impl Preparation {
 			slab,
 			locks: Arc::new(crate::network::data_server::child_writes::ParentLocks::new()),
 			key: ed25519_dalek::SigningKey::from_bytes(&self.secret),
-			validated: std::sync::atomic::AtomicBool::new(false),
+			progress: Default::default(),
+			retention: self.cfg.mvcc_retention_policy,
 		};
 		loop {
 			if self.stopping.load(std::sync::atomic::Ordering::SeqCst) {
@@ -245,6 +252,26 @@ impl Preparation {
 						tracing::debug!(slot = self.slot, %why, "recovery pending");
 					}
 					Ok(Progress::Recorded) => {}
+					// ADR 0107 (wendelon): a report's answer never stops
+					// recovery. Applied state decides on the next step: a
+					// recorded report is skipped, a superseded target is
+					// replaced, and only lost authority stops (checked every
+					// step).
+					Ok(Progress::Report(request)) => {
+						let answer = self.forward(&request).await;
+						#[cfg(test)]
+						let answer = {
+							let mut lose = LOSE_REPORT_ANSWERS.lock().unwrap();
+							match lose.get_mut(&self.data_dir) {
+								Some(left) if *left > 0 => {
+									*left -= 1;
+									Err(Error::other("test: the report's answer is lost"))
+								}
+								_ => answer,
+							}
+						};
+						tracing::debug!(slot = self.slot, ?answer, "report forwarded");
+					}
 					Err(error) => {
 						tracing::error!(slot = self.slot, %error, "recovery stopped");
 						return;

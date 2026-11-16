@@ -268,13 +268,16 @@ impl WendelonDataServer {
 		ordinal: u16,
 		schema_generation: u64,
 	) -> Result<(), ChildRefusal> {
-		let signer = self
-			.decisions
-			.signer
-			.clone()
-			.ok_or(ChildRefusal::ModeToday)?;
+		let context = self.repair_context().ok_or(ChildRefusal::ModeToday)?;
+		repair_child_in(&context, rsv, ordinal, schema_generation).await
+	}
+
+	/// What this server's repairs use: its signer, store, locks and its
+	/// factory's connections. `None` without a signer (Today mode).
+	pub(super) fn repair_context(&self) -> Option<RepairContext> {
+		let signer = self.decisions.signer.clone()?;
 		let factory = self.factory.clone();
-		let context = RepairContext {
+		Some(RepairContext {
 			local: signer.signer,
 			signer,
 			state_machine: self.state_machine.clone(),
@@ -292,8 +295,7 @@ impl WendelonDataServer {
 						.await
 				})
 			}),
-		};
-		repair_child_in(&context, rsv, ordinal, schema_generation).await
+		})
 	}
 }
 

@@ -81,6 +81,20 @@ pub(crate) async fn open_recovery_storage(
 	SlabManager::open_with_owner(config, owner.clone()).await
 }
 
+/// Test-only (ADR 0107): store directories whose committed candidate stays
+/// staged, the crash row between Commit applied and local activation.
+#[cfg(test)]
+pub(crate) static HOLD_ACTIVATION: std::sync::Mutex<std::collections::BTreeSet<PathBuf>> =
+	std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// Test-only (ADR 0107, Codex 01a1e309 R1): one step of the store in this
+/// directory pauses after its applied view was read, before activation:
+/// `reached` is notified, then the step waits for `release`. One-shot.
+#[cfg(test)]
+pub(crate) static PAUSE_AFTER_VIEW: std::sync::Mutex<
+	std::collections::BTreeMap<PathBuf, (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
 /// ADR 0106 (wendelon): what one recovery step found.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Progress {
@@ -90,6 +104,10 @@ pub(crate) enum Progress {
 	Ready(Box<crate::network::decision_proposals::ForwardedDecision>),
 	/// The recovery is recorded (now or earlier) and the delta is current.
 	Recorded,
+	/// ADR 0107 (wendelon): recorded, delta current, and this store's signed
+	/// report of its durably staged candidate, to be forwarded. Its answer
+	/// never stops recovery: a later step reconciles from applied state.
+	Report(Box<crate::network::decision_proposals::ForwardedDecision>),
 }
 
 /// ADR 0106 (wendelon): the promoted replacement's recovery, run by its
@@ -104,8 +122,12 @@ pub(crate) struct RecoveryDriver {
 	pub(crate) slab: Arc<SlabManager>,
 	pub(crate) locks: Arc<crate::network::data_server::child_writes::ParentLocks>,
 	pub(crate) key: ed25519_dalek::SigningKey,
-	/// This start validated its stored data (once per start, not per tick).
-	pub(crate) validated: std::sync::atomic::AtomicBool,
+	/// ADR 0107 (wendelon): this store's certification progress in this
+	/// process (created once per task, never per step). `validated`: this
+	/// process validated the store's data at its active generation.
+	pub(crate) progress: crate::network::data_server::certification::CertificationProgress,
+	/// The configured cluster retention policy (the frozen-policy check).
+	pub(crate) retention: crate::storage::retention::MvccRetentionPolicy,
 }
 
 /// The applied facts one step works from.
@@ -235,9 +257,8 @@ impl RecoveryDriver {
 		};
 		if let Some(recorded) = view.recorded {
 			// The record is historical. The statement saved here must be exactly
-			// it; without certification participation (ADR 0107) the current
-			// certificate must still be the recorded one; and at each start the
-			// stored data is validated again before recovery counts as complete
+			// it; and at each start the stored data is validated again, at the
+			// store's active generation, before recovery counts as complete
 			// (missing children are repaired; a damaged base fails closed).
 			let reconciled = saved.is_some_and(|saved| {
 				(saved.token, saved.r_new, saved.birth, saved.store)
@@ -250,26 +271,7 @@ impl RecoveryDriver {
 					"RecoveryConflict: the recorded statement is not the one saved here",
 				));
 			}
-			let current = view
-				.certificate
-				.as_ref()
-				.map(|certificate| (certificate.gid, Some(certificate.target_digest)))
-				.unwrap_or((0, None));
-			if current != (recorded.gid, recorded.target_digest) {
-				return Err(Error::other(
-					"RecoveryUnsupported: the certificate moved after the record; taking part in certification is ADR 0107",
-				));
-			}
-			if !self.validated.load(std::sync::atomic::Ordering::SeqCst) {
-				if let Progress::Pending(why) = self.repair_owed(&view, 0, recorded.k).await? {
-					return Ok(Progress::Pending(why));
-				}
-				self.validate(&index, recorded.gid, view.certificate.as_ref(), recorded.k)
-					.await?;
-				self.validated
-					.store(true, std::sync::atomic::Ordering::SeqCst);
-			}
-			return self.repair_owed(&view, recorded.k, u64::MAX).await;
+			return self.after_record(&view, &index, recorded).await;
 		}
 		// Before any record the certificate cannot move (this store's report is
 		// owed to every commit), so G is fixed.
@@ -292,7 +294,8 @@ impl RecoveryDriver {
 		}
 		self.validate(&index, gid, view.certificate.as_ref(), k)
 			.await?;
-		self.validated
+		self.progress
+			.validated
 			.store(true, std::sync::atomic::Ordering::SeqCst);
 		let submission = crate::storage::index::certified_base::RecoverySubmission {
 			token: view.token,
@@ -331,6 +334,139 @@ impl RecoveryDriver {
 		)))
 	}
 
+	/// What this store's repairs and its candidate build use: its own signer
+	/// (slot at the promoted store) and the other members as sources.
+	fn repair_context(&self, view: &View) -> crate::network::data_server::repair::RepairContext {
+		let local = crate::consensus::decisions::Signer {
+			node: self.slot,
+			incarnation: view.store,
+		};
+		crate::network::data_server::repair::RepairContext {
+			local,
+			signer: Arc::new(crate::network::data_server::child_writes::DecisionSigner {
+				key: self.key.clone(),
+				signer: local,
+			}),
+			state_machine: self.state_machine.clone(),
+			slab: self.slab.clone(),
+			locks: self.locks.clone(),
+			pool: self.pool.clone(),
+			connect: self.connect(),
+		}
+	}
+
+	/// ADR 0107 (wendelon) C4: one step after the exact reconciliation of the
+	/// historical record, in this order, alike while running and after a
+	/// reopen:
+	/// 1. a certificate committed past this store's active base is activated
+	///    from this store's own staged candidate first (its report was owed to
+	///    that commit); no other state is accepted, and nothing is reset;
+	/// 2. unless this process validated the store at its active generation:
+	///    the owed children through the record's K are repaired, then the
+	///    stored base is validated against the CURRENT certificate and every
+	///    retained owed child through K is verified;
+	/// 3. the delta after K is repaired;
+	/// 4. only with the delta current, the pending target's candidate is
+	///    built, staged and its report signed.
+	async fn after_record(
+		&self,
+		view: &View,
+		index: &crate::storage::index::PersistentLocalIndex,
+		recorded: crate::consensus::decisions::instances::Recovery,
+	) -> std::io::Result<Progress> {
+		use crate::network::data_server::certification::{
+			CandidateBuild, StoreCertification, under_permit,
+		};
+		use std::sync::atomic::Ordering;
+		#[cfg(test)]
+		{
+			let paused = PAUSE_AFTER_VIEW
+				.lock()
+				.unwrap()
+				.remove(self.slab.data_dir());
+			if let Some((reached, release)) = paused {
+				reached.notify_one();
+				release.notified().await;
+			}
+		}
+		let repair = self.repair_context(view);
+		let certification = StoreCertification {
+			slab: &self.slab,
+			state_machine: &self.state_machine,
+			progress: &self.progress,
+			build: Some(CandidateBuild {
+				repair: &repair,
+				retention: self.retention,
+				now_ms: std::time::SystemTime::now()
+					.duration_since(std::time::UNIX_EPOCH)
+					.map_or(0, |now| now.as_millis() as u64),
+				// C5: prove inherited winners from this store's own data before
+				// signing for them.
+				reprove_inherited: true,
+				#[cfg(test)]
+				peer: None,
+			}),
+			#[cfg(test)]
+			hold_activation: HOLD_ACTIVATION
+				.lock()
+				.unwrap()
+				.contains(self.slab.data_dir()),
+		};
+		under_permit(&self.slab, certification.activate_committed()).await?;
+		if self.progress.behind.load(Ordering::Acquire) {
+			return Err(Error::other(
+				"RecoveryBehind: a committed generation has no matching staged candidate here",
+			));
+		}
+		// Codex 01a1e309 R1: the certificate is read again AFTER activation (the
+		// view's may be older; activation read its own), so activation, the
+		// active-base comparison and validation use one coherent certificate.
+		// A mismatch then means a certificate committed after activation's own
+		// read: not a store fault (missing or mismatched staging set `behind`
+		// above, and that stays a stop); the next step activates it.
+		let certificate = self
+			.state_machine
+			.read_state(|state| {
+				state
+					.decisions
+					.as_ref()
+					.and_then(|decisions| decisions.generations().current.clone())
+			})
+			.await;
+		let current = certificate
+			.as_ref()
+			.map_or(0, |certificate| certificate.gid);
+		let active = index.base_meta().await?.active_gid;
+		if active != current {
+			#[cfg(test)]
+			if certification.hold_activation {
+				return Ok(Progress::Pending("activation held (test)".into()));
+			}
+			return Ok(Progress::Pending(format!(
+				"the certificate moved to gid {current} after this step's activation (active {active})"
+			)));
+		}
+		if !self.progress.validated.load(Ordering::SeqCst) {
+			if let Progress::Pending(why) = self.repair_owed(view, 0, recorded.k).await? {
+				return Ok(Progress::Pending(why));
+			}
+			self.validate(index, current, certificate.as_ref(), recorded.k)
+				.await?;
+			self.progress.validated.store(true, Ordering::SeqCst);
+		}
+		if let Progress::Pending(why) = self.repair_owed(view, recorded.k, u64::MAX).await? {
+			return Ok(Progress::Pending(why));
+		}
+		Ok(
+			match under_permit(&self.slab, certification.prepare_report()).await? {
+				Some(report) => Progress::Report(Box::new(
+					crate::network::decision_proposals::ForwardedDecision::Report { report },
+				)),
+				None => Progress::Recorded,
+			},
+		)
+	}
+
 	/// Every child the store owes with `after < dec <= through`, by decision
 	/// position: an Accepted parent's child whose plan names this slot at an
 	/// ancestor-or-self of the store.
@@ -354,24 +490,7 @@ impl RecoveryDriver {
 			.slab
 			.persistent_index()
 			.ok_or_else(|| Error::other("the recovery's store has no index"))?;
-		let context = crate::network::data_server::repair::RepairContext {
-			local: crate::consensus::decisions::Signer {
-				node: self.slot,
-				incarnation: view.store,
-			},
-			signer: Arc::new(crate::network::data_server::child_writes::DecisionSigner {
-				key: self.key.clone(),
-				signer: crate::consensus::decisions::Signer {
-					node: self.slot,
-					incarnation: view.store,
-				},
-			}),
-			state_machine: self.state_machine.clone(),
-			slab: self.slab.clone(),
-			locks: self.locks.clone(),
-			pool: self.pool.clone(),
-			connect: self.connect(),
-		};
+		let context = self.repair_context(view);
 		let mut missing = 0;
 		for child in self.owed(after, through).await {
 			let held = index

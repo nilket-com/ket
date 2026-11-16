@@ -488,7 +488,7 @@ fn kv_identity_and_position(
 }
 
 /// Whether a child's local copy is usable, needs repair, or contradicts the record.
-enum LocalChild {
+pub(super) enum LocalChild {
 	Ready(Vec<OwnedVersion>),
 	Missing,
 }
@@ -525,6 +525,102 @@ fn base_winner(entry: &crate::storage::index::certified_base::BaseEntry) -> Winn
 	}
 }
 
+/// One version's stored location in `slab`, every copy checked against
+/// `row_digest` (a tombstone by its typed locations). `None` when it is absent
+/// or differs. Shared with the store-level certification core (ADR 0107,
+/// wendelon).
+pub(super) async fn proved_location_in(
+	slab: &SlabManager,
+	tenant: TenantId,
+	descriptor: &TableSchemaDescriptor,
+	key: Identity,
+	hlc: HybridTimestamp,
+	row_digest: [u8; 32],
+	tails: Option<&QueryTails>,
+) -> Result<Option<(Locality, RecordLocation)>, ReadRefusal> {
+	let transient = |error: std::io::Error| ReadRefusal::Transient(error.to_string());
+	let locations = slab
+		.version_locations(tenant, key, hlc)
+		.map_err(transient)?;
+	let Some(first) = locations.first().copied() else {
+		return Ok(None);
+	};
+	if locations.iter().all(|location| location.is_tombstone) {
+		// Suppressed: never placed in a range.
+		return Ok(Some((Locality::from(key), first)));
+	}
+	let stored = slab
+		.stored_rows_at_version(tenant, key, hlc, tails)
+		.await
+		.map_err(transient)?;
+	for row in &stored {
+		match stored_row_digest(descriptor, row) {
+			Ok(digest) if digest == row_digest => {}
+			_ => return Ok(None),
+		}
+	}
+	let Some(row) = stored.first() else {
+		return Ok(None);
+	};
+	Ok(Some((
+		version_locality(tenant, descriptor, key, hlc, row)?,
+		first,
+	)))
+}
+
+/// The child's complete local intent in `index`, checked against the recorded
+/// child. Shared with the store-level certification core (ADR 0107,
+/// wendelon).
+pub(super) async fn local_child_in(
+	index: &crate::storage::index::PersistentLocalIndex,
+	table: TableObjectId,
+	tenant: TenantId,
+	child: &AcceptedChild,
+) -> Result<LocalChild, ReadRefusal> {
+	let storage = |error: std::io::Error| ReadRefusal::Transient(error.to_string());
+	let Some(intent) = index
+		.parent_intent(child.rsv, child.ordinal)
+		.await
+		.map_err(storage)?
+	else {
+		return Ok(LocalChild::Missing);
+	};
+	if intent.state != ParentIntentState::Complete {
+		return Ok(LocalChild::Missing);
+	}
+	let manifest = &intent.manifest;
+	let canonical = manifest.windows(2).all(|pair| pair[0] < pair[1]);
+	if intent.tenant != tenant
+		|| intent.claim_digest != child.claim_digest
+		|| intent.content != child.content
+		|| manifest.len() != child.rows as usize
+		|| !canonical
+		|| super::child_writes::manifest_content(manifest) != child.content
+		|| manifest
+			.iter()
+			.any(|version| version.table != table || version.hlc != child.commit_hlc)
+	{
+		return Err(ReadRefusal::Final(format!(
+			"the complete intent of ({}, {}) disagrees with its recorded child",
+			child.rsv, child.ordinal
+		)));
+	}
+	for version in manifest {
+		if index
+			.version_owner(tenant, *version)
+			.await
+			.map_err(storage)?
+			!= Some((child.rsv, child.ordinal))
+		{
+			return Err(ReadRefusal::Final(format!(
+				"a version of ({}, {}) is not owned by it",
+				child.rsv, child.ordinal
+			)));
+		}
+	}
+	Ok(LocalChild::Ready(intent.manifest))
+}
+
 impl WendelonDataServer {
 	/// The child's complete local intent, checked against the recorded child.
 	async fn local_child(
@@ -534,48 +630,7 @@ impl WendelonDataServer {
 		tenant: TenantId,
 		child: &AcceptedChild,
 	) -> Result<LocalChild, ReadRefusal> {
-		let storage = |error: std::io::Error| ReadRefusal::Transient(error.to_string());
-		let Some(intent) = index
-			.parent_intent(child.rsv, child.ordinal)
-			.await
-			.map_err(storage)?
-		else {
-			return Ok(LocalChild::Missing);
-		};
-		if intent.state != ParentIntentState::Complete {
-			return Ok(LocalChild::Missing);
-		}
-		let manifest = &intent.manifest;
-		let canonical = manifest.windows(2).all(|pair| pair[0] < pair[1]);
-		if intent.tenant != tenant
-			|| intent.claim_digest != child.claim_digest
-			|| intent.content != child.content
-			|| manifest.len() != child.rows as usize
-			|| !canonical
-			|| super::child_writes::manifest_content(manifest) != child.content
-			|| manifest
-				.iter()
-				.any(|version| version.table != table || version.hlc != child.commit_hlc)
-		{
-			return Err(ReadRefusal::Final(format!(
-				"the complete intent of ({}, {}) disagrees with its recorded child",
-				child.rsv, child.ordinal
-			)));
-		}
-		for version in manifest {
-			if index
-				.version_owner(tenant, *version)
-				.await
-				.map_err(storage)?
-				!= Some((child.rsv, child.ordinal))
-			{
-				return Err(ReadRefusal::Final(format!(
-					"a version of ({}, {}) is not owned by it",
-					child.rsv, child.ordinal
-				)));
-			}
-		}
-		Ok(LocalChild::Ready(intent.manifest))
+		local_child_in(index, table, tenant, child).await
 	}
 
 	/// The child's manifest, repairing the child once if the local copy is
@@ -612,27 +667,6 @@ impl WendelonDataServer {
 		}
 	}
 
-	/// One version's stored location here, every copy checked against its
-	/// recorded content (a tombstone by its typed locations). `None` when it is
-	/// absent or differs. The certified-base build proves its survivors with it.
-	pub(super) async fn proved_version(
-		&self,
-		tenant: TenantId,
-		descriptor: &TableSchemaDescriptor,
-		key: Identity,
-		hlc: HybridTimestamp,
-		row_digest: [u8; 32],
-	) -> Result<Option<(Locality, RecordLocation)>, ReadRefusal> {
-		let winner = Winner {
-			hlc,
-			row_digest,
-			child: None,
-			conflict: false,
-		};
-		self.proved_location(tenant, descriptor, key, &winner, None)
-			.await
-	}
-
 	/// The winner's stored location here, every copy checked against the
 	/// manifest's content. `None` when it is absent or differs.
 	async fn proved_location(
@@ -643,36 +677,16 @@ impl WendelonDataServer {
 		winner: &Winner,
 		tails: Option<&QueryTails>,
 	) -> Result<Option<(Locality, RecordLocation)>, ReadRefusal> {
-		let transient = |error: std::io::Error| ReadRefusal::Transient(error.to_string());
-		let locations = self
-			.slab
-			.version_locations(tenant, key, winner.hlc)
-			.map_err(transient)?;
-		let Some(first) = locations.first().copied() else {
-			return Ok(None);
-		};
-		if locations.iter().all(|location| location.is_tombstone) {
-			// Suppressed: never placed in a range.
-			return Ok(Some((Locality::from(key), first)));
-		}
-		let stored = self
-			.slab
-			.stored_rows_at_version(tenant, key, winner.hlc, tails)
-			.await
-			.map_err(transient)?;
-		for row in &stored {
-			match stored_row_digest(descriptor, row) {
-				Ok(digest) if digest == winner.row_digest => {}
-				_ => return Ok(None),
-			}
-		}
-		let Some(row) = stored.first() else {
-			return Ok(None);
-		};
-		Ok(Some((
-			version_locality(tenant, descriptor, key, winner.hlc, row)?,
-			first,
-		)))
+		proved_location_in(
+			&self.slab,
+			tenant,
+			descriptor,
+			key,
+			winner.hlc,
+			winner.row_digest,
+			tails,
+		)
+		.await
 	}
 
 	/// The statement's answer set: each key's newest Accepted version at K,

@@ -5250,7 +5250,9 @@ fn a_backup_command_counts_only_when_its_exit_and_whole_output_arrive_in_time() 
 // ============================================================
 
 /// The whole workflow's bound.
-const REPLACEMENT_TEST_BOUND: Duration = Duration::from_secs(420);
+/// Wendelon ADR 0107 adds one wait of at most `DECISION_EXPIRY + CERTIFY_MARGIN` for a covering
+/// certificate, and one more stop, read, restart and delta read.
+const REPLACEMENT_TEST_BOUND: Duration = Duration::from_secs(5_400);
 /// One `nilket wendelon replace` command's bound; its own exchange is bounded at 30 s.
 const REPLACE_COMMAND_BOUND: Duration = Duration::from_secs(45);
 /// From the replacement's start until the operator's status read reports it done.
@@ -5273,6 +5275,16 @@ const INSPECTION_BOUND: Duration = Duration::from_secs(60);
 /// Wendelon ADR 0106: the declared wait, with the restarted replacement running, before its
 /// delta is read.
 const DELTA_WAIT: Duration = Duration::from_secs(30);
+/// Wendelon ADR 0107: how long after its identity was issued a write's key stays presentable
+/// (`DECISION_EXPIRY_MS`: 3,600,000 + 300,000 + 60,000 ms). A certified generation can cover
+/// a write only after the floor has retired its key, so no earlier certificate covers it.
+const DECISION_EXPIRY: Duration = Duration::from_secs(3_960);
+/// Wendelon ADR 0107: beyond `DECISION_EXPIRY`, the declared time for the floor to pass the
+/// last selected key (the leader steps its floor and generations every 500 ms), a target, every
+/// member's report, the commit and its observation.
+const CERTIFY_MARGIN: Duration = Duration::from_secs(600);
+/// Wendelon ADR 0107: one bounded status read per this interval while the certificate is awaited.
+const CERTIFY_OBSERVE_EVERY: Duration = Duration::from_secs(60);
 
 /// Wendelon ADR 0106: reads the stopped replacement's store once, within `by` (checked before
 /// the result is accepted). On a timeout the read is left to finish and close on its own; it is
@@ -5322,8 +5334,23 @@ fn expect_recovered(
 		"{what}: children fail the stored-row verification: {:?}",
 		found.unverified
 	);
+	let held = held_rows(&found.rows);
+	let mut wanted = expected.to_vec();
+	wanted.sort();
+	assert_eq!(
+		held, wanted,
+		"{what}: the rows read from the replacement's slab"
+	);
+	eprintln!(
+		"smoke: {what}: {} Complete children verified; {} rows read from the slab exactly",
+		found.complete_children,
+		held.len()
+	);
+}
+/// The (id, name) rows of `batches`, sorted.
+fn held_rows(batches: &[RecordBatch]) -> Vec<(i64, String)> {
 	let mut held = Vec::new();
-	for batch in &found.rows {
+	for batch in batches {
 		let ids = batch
 			.column_by_name("id")
 			.and_then(|column| column.as_any().downcast_ref::<Int64Array>())
@@ -5337,18 +5364,9 @@ fn expect_recovered(
 		}
 	}
 	held.sort();
-	let mut wanted = expected.to_vec();
-	wanted.sort();
-	assert_eq!(
-		held, wanted,
-		"{what}: the rows read from the replacement's slab"
-	);
-	eprintln!(
-		"smoke: {what}: {} Complete children verified; {} rows read from the slab exactly",
-		found.complete_children,
-		held.len()
-	);
+	held
 }
+
 /// One routed Raft probe's bound: dial, request and answer.
 const PROBE_BOUND: Duration = Duration::from_secs(10);
 /// The first allocated Raft instance: the one a cluster's first replacement is granted.
@@ -5376,6 +5394,9 @@ struct Reported {
 	bound_key: Option<[u8; 32]>,
 	/// Wendelon ADR 0106: the recorded recovery's (gid, cut), printed only after the key.
 	recovered: Option<(u64, u64)>,
+	/// Wendelon ADR 0107: the cluster's current certificate (gid, cut), printed only after the
+	/// recovery.
+	certified: Option<(u64, u64)>,
 }
 
 /// A decimal number of digits only.
@@ -5397,12 +5418,19 @@ fn parse_report(line: &str) -> Option<Reported> {
 	let (token, rest) = rest.split_once(": slot ")?;
 	let (slot, rest) = rest.split_once(" replacing instance ")?;
 	let (r_old, phase) = rest.split_once(": ")?;
-	let (phase, recovered) = match phase.split_once("; recovered gid ") {
+	let (phase, recovered, certified) = match phase.split_once("; recovered gid ") {
 		Some((phase, rest)) => {
+			let (rest, certified) = match rest.split_once("; certified gid ") {
+				Some((rest, certified)) => {
+					let (gid, t) = certified.split_once(" through ")?;
+					(rest, Some((count(gid)?, count(t)?)))
+				}
+				None => (rest, None),
+			};
 			let (gid, k) = rest.split_once(" through ")?;
-			(phase, Some((count(gid)?, count(k)?)))
+			(phase, Some((count(gid)?, count(k)?)), certified)
 		}
-		None => (phase, None),
+		None => (phase, None, None),
 	};
 	let (phase, promoted, bound_key) = match phase.split_once("; promoted store ") {
 		Some((phase, rest)) => match rest.split_once("; bound key ") {
@@ -5430,6 +5458,7 @@ fn parse_report(line: &str) -> Option<Reported> {
 		promoted,
 		bound_key,
 		recovered,
+		certified,
 	})
 }
 
@@ -5479,6 +5508,7 @@ fn a_replacement_report_is_read_whole_or_not_at_all() {
 			promoted: None,
 			bound_key: None,
 			recovered: None,
+			certified: None,
 		})
 	};
 	assert_eq!(
@@ -5524,7 +5554,32 @@ fn a_replacement_report_is_read_whole_or_not_at_all() {
 			..reported(ReportedPhase::Done(FIRST_ALLOCATED)).unwrap()
 		})
 	);
+	// Wendelon ADR 0107: the current certificate follows the recovery, never alone.
+	assert_eq!(
+		parse_report(&report(&format!(
+			"done 2147483648; promoted store {store}; bound key {key}; recovered gid 2 through 41; \
+			 certified gid 3 through 90"
+		))),
+		Some(Reported {
+			promoted: Some(0x0105),
+			bound_key: Some([0xab; 32]),
+			recovered: Some((2, 41)),
+			certified: Some((3, 90)),
+			..reported(ReportedPhase::Done(FIRST_ALLOCATED)).unwrap()
+		})
+	);
 	for refused in [
+		report(&format!(
+			"done 2147483648; promoted store {store}; bound key {key}; certified gid 3 through 90"
+		)),
+		report(&format!(
+			"done 2147483648; promoted store {store}; bound key {key}; recovered gid 2 through 41; \
+			 certified gid 3 through"
+		)),
+		report(&format!(
+			"done 2147483648; promoted store {store}; bound key {key}; recovered gid 2 through 41; \
+			 certified gid 3"
+		)),
 		report(&format!(
 			"done 2147483648; promoted store {store}; recovered gid 2 through 41"
 		)),
@@ -5624,7 +5679,7 @@ fn replacement_report(
 /// ONE logical write of row `row_id` under one operation identity through `through`, offered
 /// again only for the answers `offers_the_same_operation_again` names, within
 /// `OFFERED_WRITE_BOUND`: a range whose holder is gone is taken over first (ADR 0729). Its
-/// receipt's coordinator, a member that is not `gone`.
+/// receipt's coordinator, a member that is not `gone`, and its receipt's decision index.
 async fn commit_offering_again(
 	through: &Client,
 	descriptor: &TableSchemaDescriptor,
@@ -5632,7 +5687,7 @@ async fn commit_offering_again(
 	name: &str,
 	gone: u32,
 	what: &str,
-) -> u32 {
+) -> (u32, u64) {
 	let identity = operation_id();
 	let end = Instant::now() + OFFERED_WRITE_BOUND;
 	let started = Instant::now();
@@ -5671,7 +5726,7 @@ async fn commit_offering_again(
 					NODES.contains(&coordinator) && coordinator != gone,
 					"{what}: row {row_id} was stamped by {coordinator}"
 				);
-				return coordinator;
+				return (coordinator, receipt.log_index);
 			}
 			Err(error) if offers_the_same_operation_again(&error, identity) => {
 				eprintln!("smoke: {what}: attempt {attempts} of row {row_id}: {error}");
@@ -5733,6 +5788,14 @@ async fn expect_at_survivors(
 ///   restarted, the status still reports it, and after one declared `DELTA_WAIT` with that
 ///   process running, one stop and one read show the row written after the restart held the
 ///   same way (the delta is repaired only after that start's validation);
+/// - wendelon ADR 0107: restarted, it takes part in certification. Within one absolute
+///   deadline, `DECISION_EXPIRY + CERTIFY_MARGIN` after the last selected write (a certificate
+///   can cover a write only once its key retired), the operator's status reports a certificate
+///   past the recorded gid whose cut reaches every selected write's receipt decision index
+///   (rows 1-8, and 11, whose child names the promoted store), with the record unchanged. After
+///   one declared wait, stopped and read once, its store is active at that certificate and
+///   holds every selected row as a certified base entry; restarted once, a row written then is
+///   held the same way, the record still unchanged;
 /// - the old instance comes back on its old disk at the slot's address while the replacement's
 ///   process is stopped in order, and must keep running (its process identity is read). A
 ///   survivor sends it authenticated, correctly formed Raft votes as itself, each bounded and
@@ -5747,8 +5810,9 @@ async fn expect_at_survivors(
 /// - the replacement's process returns: still done, writes commit, reads exact; every process
 ///   stops in order with status 0.
 ///
-/// Not claimed: the replacement's data readiness (gates 3 and 4: it serves no data), more than
-/// one host, a leader's loss, or the replacement's catch-up seen from outside.
+/// Not claimed: the replacement's data readiness (gate 4: it serves no data), more than one
+/// host, a leader's loss, the replacement's catch-up seen from outside, or a time to
+/// certification (the wait is a declared bound, not a measurement).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "spawns three daemons, kills one and replaces it through the operator's commands; run alone under an external owner (see the module text)"]
 async fn three_daemons_replace_a_lost_follower_with_a_control_only_instance() {
@@ -5768,10 +5832,13 @@ async fn three_daemons_replace_a_lost_follower_with_a_control_only_instance() {
 	} = form(deadline, None).await;
 	let storage = client_through(&members[0], &pki, Credential::Storage, deadline).await;
 	let mut expected = Vec::new();
+	// Wendelon ADR 0107: the writes a later certificate must cover, with their receipts'
+	// decision indexes.
+	let mut selected: Vec<(i64, u64)> = Vec::new();
 	for id in 1_i64..=4 {
 		// ONE call each: an error is this step's result.
 		let bound = step(deadline);
-		tokio::time::timeout(
+		let receipt = tokio::time::timeout(
 			bound,
 			storage.table_write(
 				TenantId::new(TENANT),
@@ -5787,6 +5854,7 @@ async fn three_daemons_replace_a_lost_follower_with_a_control_only_instance() {
 		.unwrap_or_else(|_| panic!("the write of row {id} had no answer within its bound"))
 		.unwrap_or_else(|error| panic!("the write of row {id}: {error:?}"));
 		expected.push((id, "before".to_owned()));
+		selected.push((id, receipt.log_index));
 	}
 
 	// The lost member is a follower, chosen positively from node 1's view of the leader.
@@ -5869,6 +5937,7 @@ async fn three_daemons_replace_a_lost_follower_with_a_control_only_instance() {
 			promoted: None,
 			bound_key: None,
 			recovered: None,
+			certified: None,
 		}),
 		"replace begin: {}",
 		began.text()
@@ -5927,8 +5996,11 @@ async fn three_daemons_replace_a_lost_follower_with_a_control_only_instance() {
 	// The survivors keep every acknowledged row and take new writes.
 	let through = client_through(survivors[0], &pki, Credential::Storage, deadline).await;
 	for id in 5_i64..=8 {
-		commit_offering_again(&through, &descriptor, id, "replaced", lost.id, "after done").await;
+		let (_, dec) =
+			commit_offering_again(&through, &descriptor, id, "replaced", lost.id, "after done")
+				.await;
 		expected.push((id, "replaced".to_owned()));
+		selected.push((id, dec));
 	}
 	expect_at_survivors(
 		&survivors,
@@ -6079,7 +6151,7 @@ async fn three_daemons_replace_a_lost_follower_with_a_control_only_instance() {
 	// with that single process running, then one stop and one stopped-store read, all within
 	// one absolute bound checked before the result is accepted: its row must be held. The
 	// process is not restarted to help it.
-	commit_offering_again(
+	let (_, dec) = commit_offering_again(
 		&through,
 		&descriptor,
 		11,
@@ -6088,8 +6160,12 @@ async fn three_daemons_replace_a_lost_follower_with_a_control_only_instance() {
 		"after the restart",
 	)
 	.await;
-	// Id 11: the steps below write 9 ("old-back") and 10, so this row never collides.
+	// Wendelon ADR 0107: the expiry reference, taken after row 11's commit and so after its
+	// identity was issued: no selected key outlives it by more than `DECISION_EXPIRY`.
+	let selected_at = Instant::now();
+	// Id 11: the steps below write 9 ("old-back"), 10 and 12, so this row never collides.
 	expected.push((11, "restarted".to_owned()));
+	selected.push((11, dec));
 	let observe_by = deadline.min(Instant::now() + DELTA_WAIT + INSPECTION_BOUND);
 	tokio::time::sleep(DELTA_WAIT).await;
 	if let Some(why) = daemons.exited() {
@@ -6102,6 +6178,151 @@ async fn three_daemons_replace_a_lost_follower_with_a_control_only_instance() {
 		(token, store, recovered),
 		&expected,
 		"the row written after the restart, held by the restarted process",
+	);
+
+	// Wendelon ADR 0107: the replacement takes part in certification. A target covers a write
+	// only once the floor has retired its key, `DECISION_EXPIRY` after its identity was issued.
+	// The selected writes are rows 1-4 (before the loss: their children name the lost store),
+	// 5-8 (after done) and 11 (after the restart: its child names the promoted store). Their
+	// receipts' greatest decision index is the cut a covering certificate must reach. One
+	// absolute deadline (`selected_at + DECISION_EXPIRY + CERTIFY_MARGIN`, within the test's
+	// own), one bounded status read per `CERTIFY_OBSERVE_EVERY`, no renewal and no repeat; a
+	// process exit or a changed record ends it.
+	daemons.start(lost);
+	let needed = selected
+		.iter()
+		.map(|(_, dec)| *dec)
+		.max()
+		.expect("selected writes");
+	let covered_by = deadline.min(selected_at + DECISION_EXPIRY + CERTIFY_MARGIN);
+	eprintln!(
+		"smoke: awaiting a certificate past gid {} through cut {needed} (selected {selected:?}) \
+		 until {:?} from now",
+		recovered.0,
+		covered_by.saturating_duration_since(Instant::now())
+	);
+	let mut reads = 0_u32;
+	let certified = loop {
+		reads += 1;
+		let reported = replacement_report(
+			&format!("replace-certified-{reads}"),
+			token,
+			lost.id,
+			&connection,
+			covered_by,
+		);
+		if let Some(Reported {
+			recovered: Some(seen),
+			certified,
+			..
+		}) = reported
+		{
+			assert_eq!(seen, recovered, "the recorded recovery never changes");
+			if let Some((gid, t)) = certified
+				&& gid > recovered.0
+				&& t >= needed
+			{
+				break (gid, t);
+			}
+		}
+		if let Some(why) = daemons.exited() {
+			panic!("while a covering certificate was awaited: {why}");
+		}
+		assert!(
+			Instant::now() < covered_by,
+			"no certificate covered cut {needed} by its deadline ({reads} status reads, last \
+			 {reported:?})"
+		);
+		tokio::time::sleep(
+			CERTIFY_OBSERVE_EVERY.min(covered_by.saturating_duration_since(Instant::now())),
+		)
+		.await;
+	};
+	eprintln!(
+		"smoke: certificate gid {} through {} covers cut {needed}, {:?} after the expiry \
+		 reference ({reads} status reads)",
+		certified.0,
+		certified.1,
+		selected_at.elapsed()
+	);
+	// Its own activation: one declared wait with the process running, then one stop and one
+	// read within one absolute bound. Its store is active at the covering certificate, every
+	// selected row is held as a certified base entry, and the rows read are exactly the
+	// acknowledged ones with the same saved statement.
+	let observe_by = deadline.min(Instant::now() + DELTA_WAIT + INSPECTION_BOUND);
+	tokio::time::sleep(DELTA_WAIT).await;
+	if let Some(why) = daemons.exited() {
+		panic!("before the certified replacement's store was read: {why}");
+	}
+	daemons.stop(lost.id, observe_by);
+	let found = inspect_recovered(&lost.config, &descriptor, observe_by).await;
+	assert_eq!(
+		found.active_gid, certified.0,
+		"the replacement's store is active at the covering certificate"
+	);
+	let base = held_rows(&found.base_rows);
+	for (id, _) in &selected {
+		let row = expected
+			.iter()
+			.find(|(written, _)| written == id)
+			.expect("a selected row was acknowledged");
+		assert!(
+			base.contains(row),
+			"row {id} is not held as a certified base entry: {base:?}"
+		);
+	}
+	expect_recovered(
+		&found,
+		(token, store, recovered),
+		&expected,
+		"active at the covering certificate",
+	);
+	// Restarted once: the record is unchanged, and a write after the commit is held as delta.
+	daemons.start(lost);
+	tokio::time::sleep(Duration::from_secs(2)).await;
+	if let Some(why) = daemons.exited() {
+		panic!("after the certified replacement's restart: {why}");
+	}
+	commit_offering_again(
+		&through,
+		&descriptor,
+		12,
+		"certified",
+		lost.id,
+		"after the covering certificate",
+	)
+	.await;
+	expected.push((12, "certified".to_owned()));
+	let observe_by = deadline.min(Instant::now() + DELTA_WAIT + INSPECTION_BOUND);
+	tokio::time::sleep(DELTA_WAIT).await;
+	if let Some(why) = daemons.exited() {
+		panic!("before the certified replacement's delta was read: {why}");
+	}
+	let after = replacement_report(
+		"replace-status-certified",
+		token,
+		lost.id,
+		&connection,
+		observe_by,
+	)
+	.expect("a status after the covering certificate");
+	assert_eq!(
+		after.recovered,
+		Some(recovered),
+		"the recorded recovery never changes"
+	);
+	daemons.stop(lost.id, observe_by);
+	let found = inspect_recovered(&lost.config, &descriptor, observe_by).await;
+	assert!(
+		found.active_gid >= certified.0,
+		"the replacement's store went back from gid {}",
+		certified.0
+	);
+	expect_recovered(
+		&found,
+		(token, store, recovered),
+		&expected,
+		"the row written after the covering certificate, held after a restart",
 	);
 
 	// The old instance returns on its old disk at the slot's address: the replacement's

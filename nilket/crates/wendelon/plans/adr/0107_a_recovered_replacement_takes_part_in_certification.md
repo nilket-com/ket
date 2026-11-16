@@ -87,3 +87,44 @@ No format change: the report, the record and the store metadata are unchanged. A
 
 ## Not decided here
 Gate 4 (serving activation, role change, election, lease/HLC bindings, index rebuild and receipts); DC-247 (a replacement's stop leaves no clean-shutdown record; nothing here marks ownership recovery complete); reclaim of I's objects; repeated replacement and source availability beyond ADR 0106 D4; a streaming candidate build.
+
+## As built
+- **Core** (`network/data_server/certification.rs`):
+  - `StoreCertification {slab, state_machine, progress, build}` with `activate_committed` and `prepare_report` (build, stage or restage, sign from the staged metadata; `None` when there is nothing to report);
+  - `CertificationProgress {built_gid, validated, behind}` and `CandidateBuild {repair, retention, now_ms, reprove_inherited}`;
+  - a free `under_permit`.
+- **The data server** delegates:
+  - its progress is its existing flags (the ones its reads and cleanup gate on);
+  - `reprove_inherited: false`;
+  - its test seams are kept (`CertificationStep`, `CertificationBeforeReport`, `ReaderBeforeRepair` through `CandidateBuild::peer`, `hold_activation`);
+  - it reports through `maintenance.report` as before.
+- **Shared proofs.** `reader::local_child_in` and `reader::proved_location_in` are free functions; the data server's methods delegate. `proved_version` was removed (only the build used it). `repair::repair_context()` builds the repair context once for both repair and certification.
+- **C2.** One ancestry rule in `prepare_report` for every store (`in_recorded_ancestry`). For a store never replaced it equals the old exact-membership check.
+- **Driver** (`node/replacement_recovery.rs`):
+  - `RecoveryDriver.progress`, created once per preparation task, and `.retention`, the configured policy;
+  - `after_record` runs C4's order: activate, then `RecoveryBehind` unless active at the current certificate, then validate once per process at the current certificate through the record's K, the delta, and `prepare_report` with `reprove_inherited: true`;
+  - **Codex 01a1e309 R1:** after activation, the certificate is read again, so activation, the active-base comparison and validation use one coherent certificate. A view read before a concurrent commit used to turn that commit's correct activation into a permanent `RecoveryBehind` stop. A certificate that moved after activation's own read is now `Pending`, activated on the next step; missing or mismatched staging still sets `behind` and stops. The control `a_generation_committed_during_a_recovery_step_is_activated_and_recovery_continues` (one-shot seam `PAUSE_AFTER_VIEW`) was RED on 45fd4dbc8 and is GREEN with the fix;
+  - `Progress::Report`: the preparation forwards it and never stops on its answer;
+  - `RecoveryUnsupported` is removed.
+- **Status.** `ReplacementReportWire.certified` carries the current certificate (gid, cut). `replace status` prints `; certified gid C through T` after the recorded recovery only. The admin answer's extension gains this field in place (pre-release), as ADR 0106's `recovered` did; there are no other format changes.
+- **Test support.**
+  - `RecoveredRowsForTest.active_gid` and `.base_rows`. Every base row entry is now verified, including one a Complete child also holds.
+  - Seams `HOLD_ACTIVATION` (by store directory) and `LOSE_REPORT_ANSWERS` (by data directory).
+- **Architecture census:** `after_record` is a lifecycle-permit site owned by the spawned preparation task (`SpawnedTask`).
+- **Controls:**
+  - `a_recovered_replacement_reports_and_its_generations_commit` covers controls 1, 2, 4, 5 (before and after activation), 6 and the reader oracle;
+  - `a_replacement_with_a_damaged_inherited_row_does_not_report` covers 3;
+  - `a_replacement_without_its_committed_staging_stops_without_a_reset` covers 7;
+  - existing certification tests cover 9;
+  - control 8 (a superseded target's report) is not separately exercised: the answer is never classified (`Progress::Report`), and control 4 covers a lost answer;
+  - control 10 is the extended daemon workflow (its certification phase awaits a certificate whose cut reaches every selected receipt's decision index).
+- **Mutants**, each RED on its control:
+  - M1, the exact plan check: no commit;
+  - M2, no inherited reproof: the damaged replacement reports;
+  - M3, never report (main's behaviour): no commit;
+  - M4, the old `RecoveryUnsupported` order: the first live commit is never activated.
+- **Fixture finding.** The controlled clock's floor jumps move the ring clock about `E` ahead, so a range taken over after the loss begins with a tenure floor that far ahead, and a claim there is refused `CommitFromFuture`. The tests choose rows in ranges whose floor is current (`write_current`). In production the floor is the stamp minus `E`, which keeps the ring clock at physical time.
+- **Limits.**
+  - J runs no certified cleanup (ADR 0699 S5b): what cleanup would remove stays on J's store until gate 4.
+  - The candidate build holds the candidate's entries in memory, as the data server's does.
+  - After an unclean start, activating a candidate not built in this run requires base recovery, as for the data server; DC-247 is unchanged.

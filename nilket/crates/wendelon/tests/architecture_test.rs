@@ -12600,6 +12600,15 @@ const LIFECYCLE_PERMIT_CENSUS: &[(&str, &str, LifecyclePermitOwner)] = &[
 		"install_lsm_output_files",
 		LifecyclePermitOwner::SpawnedTask,
 	),
+	// ADR 0107 (wendelon): a recovered replacement's activation and report,
+	// owned by its spawned preparation task, which `ControlOnlyNode::shutdown`
+	// stops cooperatively between steps and awaits (never aborted) before the
+	// directory owner closes.
+	(
+		"node/replacement_recovery.rs",
+		"after_record",
+		LifecyclePermitOwner::SpawnedTask,
+	),
 	(
 		"storage/manager/op_recovery.rs",
 		"recover_abandoned_install",

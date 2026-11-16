@@ -2061,3 +2061,725 @@ async fn a_promoted_replacement_recovers_its_slots_base_and_children() {
 		let _ = tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown()).await;
 	}
 }
+
+/// ADR 0107 (wendelon): the leader's current certificate, if any.
+async fn current_certificate(
+	cluster: &Cluster,
+) -> Option<crate::consensus::decisions::generations::Certificate> {
+	let leader = cluster.leader().await;
+	cluster
+		.node(leader)
+		.state_machine
+		.read_state(|state| state.decisions.as_ref()?.generations().current.clone())
+		.await
+}
+
+/// ADR 0107 (wendelon): waits until a certificate past `gid` is committed.
+async fn until_certified_past(
+	cluster: &Cluster,
+	gid: u64,
+	control: &ControlOnlyNode,
+) -> crate::consensus::decisions::generations::Certificate {
+	let deadline = tokio::time::Instant::now() + BOUND * 2;
+	loop {
+		if let Some(certificate) = current_certificate(cluster).await
+			&& certificate.gid > gid
+		{
+			return certificate;
+		}
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"no certificate past gid {gid}; preparation ended {}",
+			control.preparation_ended()
+		);
+		tokio::time::sleep(TICK).await;
+	}
+}
+
+/// ADR 0107 (wendelon): waits until the replacement's store is active at
+/// `certificate`, with its chunks.
+async fn until_replacement_active(
+	slab: &SlabManager,
+	certificate: &crate::consensus::decisions::generations::Certificate,
+) {
+	let index = slab.persistent_index().unwrap();
+	let deadline = tokio::time::Instant::now() + BOUND;
+	loop {
+		let meta = index.base_meta().await.unwrap();
+		if meta.active_gid == certificate.gid {
+			assert_eq!(meta.active_chunks, certificate.chunks);
+			return;
+		}
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"the replacement never activated gid {} (active {})",
+			certificate.gid,
+			meta.active_gid
+		);
+		tokio::time::sleep(TICK).await;
+	}
+}
+
+/// ADR 0107 (wendelon): the pending target's gid and its reporters, if any.
+async fn pending_reports(cluster: &Cluster) -> Option<(u64, Vec<u32>)> {
+	let leader = cluster.leader().await;
+	cluster
+		.node(leader)
+		.state_machine
+		.read_state(|state| {
+			let pending = state.decisions.as_ref()?.generations().pending.as_ref()?;
+			Some((
+				pending.target.gid,
+				pending.reports.keys().copied().collect(),
+			))
+		})
+		.await
+}
+
+/// ADR 0107 (wendelon): waits until the replacement holds every Accepted child
+/// naming its slot as a Complete intent of the recorded content.
+async fn until_children_held(cluster: &Cluster, slab: &SlabManager, slot: u32) {
+	let index = slab.persistent_index().unwrap();
+	let deadline = tokio::time::Instant::now() + BOUND;
+	loop {
+		let mut missing = 0;
+		for (rsv, ordinal, content) in children_naming(cluster, slot).await {
+			let held = index
+				.parent_intent(rsv, ordinal)
+				.await
+				.unwrap()
+				.is_some_and(|intent| {
+					intent.state
+						== crate::storage::index::parent_intents::ParentIntentState::Complete
+						&& intent.content == content
+				});
+			missing += usize::from(!held);
+		}
+		if missing == 0 {
+			return;
+		}
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"{missing} children naming slot {slot} never held"
+		);
+		tokio::time::sleep(TICK).await;
+	}
+}
+
+/// ADR 0107 (wendelon): a lost follower replaced, promoted and (unless the
+/// caller blocks it) recording its recovery. The certified base at gid 1 holds
+/// rows 1 and 2; row 3 is written before the loss and stays uncertified.
+struct Replaced {
+	cluster: Cluster,
+	descriptor: TableSchemaDescriptor,
+	lost: u32,
+	cfg: NodeBootstrapConfig,
+	now: u64,
+}
+
+async fn replaced_after_gid_one(block_recovery: bool) -> (Replaced, ControlOnlyNode) {
+	let (mut cluster, leader, descriptor) = ready().await;
+	let lost = *NODES[1..].iter().find(|id| **id != leader).unwrap();
+	let now = std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.unwrap()
+		.as_millis() as u64;
+	write_at(&cluster, &descriptor, now, &[(1, "a"), (2, "b")]).await;
+	jump_floor(&cluster, now + 60_000).await;
+	until_active(&cluster, 1).await;
+	write_at(&cluster, &descriptor, now + 60_001, &[(3, "c")]).await;
+	cluster.stop(lost, true).await;
+	let cfg = cluster.configs[&lost].clone();
+	lose_disk(&cfg.data_dir);
+	crate::crypto::test_support::enroll_root_artifact(
+		&cluster.configs[&NODES[0]].data_dir,
+		&cfg.data_dir,
+	)
+	.unwrap();
+	assert!(matches!(
+		decide(
+			&cluster,
+			DecisionCommand::BeginReplacement {
+				token: TOKEN,
+				slot: lost,
+			}
+		)
+		.await,
+		DecisionResult::ReplacementRecorded { .. }
+	));
+	crate::node::provision_replacement_token(&cfg.data_dir, TOKEN).unwrap();
+	if block_recovery {
+		// Every survivor serves a fabricated extra entry: no source's base
+		// verifies, so recovery stays pending and records nothing.
+		for source in NODES.iter().filter(|id| **id != lost) {
+			crate::network::data_server::base_fetch::TAMPERED_SOURCES
+				.lock()
+				.unwrap()
+				.insert(
+					cluster.configs[source].data_dir.clone(),
+					crate::network::data_server::base_fetch::Tamper::ExtraEntry,
+				);
+		}
+	}
+	let control = ControlOnlyNode::bootstrap_with_provider(cfg.clone(), provider(&cluster, lost))
+		.await
+		.unwrap();
+	(
+		Replaced {
+			cluster,
+			descriptor,
+			lost,
+			cfg,
+			now,
+		},
+		control,
+	)
+}
+
+/// A committed write at `at` (its identity issued then), entering at the leader.
+async fn write_at(
+	cluster: &Cluster,
+	descriptor: &TableSchemaDescriptor,
+	at: u64,
+	rows: &[(i64, &str)],
+) {
+	let meta = write_meta(descriptor, rows.len(), uuid_v7_at(at));
+	let leader = cluster.leader().await;
+	assert_committed(
+		&write_through(cluster, leader, meta, named_rows(descriptor, rows)).await,
+		"a write",
+	);
+}
+
+/// ADR 0107 (wendelon): a committed one-row write at `at`, with the first id
+/// from `from` whose range's tenure floor is not ahead of the real clock. The
+/// controlled clock's floor jumps move the ring clock about `E` ahead, so a
+/// range taken over after the loss begins with a floor that far ahead, and a
+/// claim there would be refused `CommitFromFuture` (its commit HLC must be
+/// above the floor and within `DECISION_COMMIT_HLC_LEAD_MS` of the stamp): a
+/// fixture artifact, avoided by choosing the row.
+async fn write_current(
+	cluster: &Cluster,
+	descriptor: &TableSchemaDescriptor,
+	at: u64,
+	from: i64,
+	name: &'static str,
+) -> (i64, String) {
+	let leader = cluster.leader().await;
+	for id in from..from + 256 {
+		let (_, lineage) = cluster
+			.node(leader)
+			.data_server
+			.lineage_for_test(
+				TenantId::ZERO,
+				descriptor,
+				&named_rows(descriptor, &[(id, name)]),
+			)
+			.await
+			.expect("a sealed placement");
+		let real = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.unwrap()
+			.as_millis() as u64;
+		if lineage.floor_ms <= real {
+			write_at(cluster, descriptor, at, &[(id, name)]).await;
+			return (id, name.to_owned());
+		}
+	}
+	panic!("no row from {from} in a range with a current floor");
+}
+
+async fn until_recorded(
+	cluster: &Cluster,
+	control: &ControlOnlyNode,
+) -> crate::consensus::decisions::instances::Recovery {
+	let deadline = tokio::time::Instant::now() + BOUND * 2;
+	loop {
+		if let Some(recorded) = recovery_record(cluster).await {
+			return recorded;
+		}
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"never recorded; prepared {}, preparation ended {}",
+			control.prepared(),
+			control.preparation_ended()
+		);
+		tokio::time::sleep(TICK).await;
+	}
+}
+
+/// ADR 0107 (wendelon) controls 1, 2, 4, 5 and 6: a recovered replacement
+/// takes part in certification.
+/// - Before its recovery is recorded, a target naming the promoted store gets
+///   the survivors' reports but none from it, and nothing commits.
+/// - Once recorded, it reports its own staged candidate (its first answer
+///   lost), the target covering children that name the lost store and the
+///   promoted one commits, the covered records are erased, and it activates.
+/// - A second generation commits after that activation.
+/// - Stopped after a commit before activating, it reopens, activates from its
+///   staging and validates at the current certificate; stopped after
+///   activating, it reopens and continues. The historical record never changes.
+/// - Its stopped store reads back exactly the acknowledged rows.
+///
+/// Write identities stay within two minutes of the start: a coordinator's
+/// commit HLC follows them, and a claim leading the leader's stamp by more
+/// than `DECISION_COMMIT_HLC_LEAD_MS` is refused `CommitFromFuture`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_recovered_replacement_reports_and_its_generations_commit() {
+	let (
+		Replaced {
+			mut cluster,
+			descriptor,
+			lost,
+			cfg,
+			now,
+		},
+		control,
+	) = replaced_after_gid_one(true).await;
+	let deadline = tokio::time::Instant::now() + BOUND;
+	while !control.prepared() {
+		assert!(tokio::time::Instant::now() < deadline, "never promoted");
+		tokio::time::sleep(TICK).await;
+	}
+	let mut written: Vec<(i64, String)> = [(1, "a"), (2, "b"), (3, "c")]
+		.into_iter()
+		.map(|(id, name)| (id, name.to_owned()))
+		.collect();
+	// A child naming the promoted store.
+	written.push(write_current(&cluster, &descriptor, now + 60_002, 100, "d").await);
+	jump_floor(&cluster, now + 75_000).await;
+	// Control 2: the survivors report the target; the unrecorded replacement
+	// does not, so nothing commits.
+	let deadline = tokio::time::Instant::now() + BOUND;
+	loop {
+		if let Some((_, reporters)) = pending_reports(&cluster).await
+			&& reporters.len() == NODES.len() - 1
+		{
+			assert!(!reporters.contains(&lost));
+			break;
+		}
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"the survivors never reported: {:?}",
+			pending_reports(&cluster).await
+		);
+		tokio::time::sleep(TICK).await;
+	}
+	tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+	assert!(recovery_record(&cluster).await.is_none());
+	assert_eq!(current_certificate(&cluster).await.unwrap().gid, 1);
+	assert!(
+		!pending_reports(&cluster).await.unwrap().1.contains(&lost),
+		"no report before the record"
+	);
+
+	// Recovery is unblocked; the first answer to its report is lost (control 4).
+	crate::network::data_server::base_fetch::TAMPERED_SOURCES
+		.lock()
+		.unwrap()
+		.clear();
+	crate::node::replacement_preparation::LOSE_REPORT_ANSWERS
+		.lock()
+		.unwrap()
+		.insert(cfg.data_dir.clone(), 1);
+	let recorded = until_recorded(&cluster, &control).await;
+	assert_eq!(recorded.gid, 1);
+	// Control 1: the target covering both children commits on its own report.
+	let second = until_certified_past(&cluster, 1, &control).await;
+	assert_eq!(
+		crate::node::replacement_preparation::LOSE_REPORT_ANSWERS
+			.lock()
+			.unwrap()
+			.get(&cfg.data_dir),
+		Some(&0),
+		"a report answer was lost"
+	);
+	let slab = control.recovery_storage().await.unwrap();
+	until_replacement_active(&slab, &second).await;
+	assert!(
+		children_naming(&cluster, lost).await.is_empty(),
+		"the covered children's records are erased"
+	);
+	// Control 6: a second generation.
+	written.push(write_current(&cluster, &descriptor, now + 75_001, 200, "e").await);
+	jump_floor(&cluster, now + 90_000).await;
+	let third = until_certified_past(&cluster, second.gid, &control).await;
+	until_replacement_active(&slab, &third).await;
+
+	// Control 5: a commit, then a stop before activation.
+	let held = slab.data_dir().to_path_buf();
+	crate::node::replacement_recovery::HOLD_ACTIVATION
+		.lock()
+		.unwrap()
+		.insert(held.clone());
+	written.push(write_current(&cluster, &descriptor, now + 90_001, 300, "f").await);
+	jump_floor(&cluster, now + 105_000).await;
+	let fourth = until_certified_past(&cluster, third.gid, &control).await;
+	tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+	assert_eq!(
+		slab.persistent_index()
+			.unwrap()
+			.base_meta()
+			.await
+			.unwrap()
+			.active_gid,
+		third.gid,
+		"activation held"
+	);
+	drop(slab);
+	control.shutdown().await.unwrap();
+	crate::node::replacement_recovery::HOLD_ACTIVATION
+		.lock()
+		.unwrap()
+		.remove(&held);
+	let start = || ControlOnlyNode::bootstrap_with_provider(cfg.clone(), provider(&cluster, lost));
+	let control = start().await.unwrap();
+	let slab = control.recovery_storage().await.unwrap();
+	until_replacement_active(&slab, &fourth).await;
+	written.push(write_current(&cluster, &descriptor, now + 105_001, 400, "g").await);
+	until_children_held(&cluster, &slab, lost).await;
+	assert!(!control.preparation_ended(), "it keeps recovering");
+	assert_eq!(recovery_record(&cluster).await, Some(recorded));
+	drop(slab);
+	control.shutdown().await.unwrap();
+
+	// A stop after activation: it reopens and continues.
+	let control = start().await.unwrap();
+	let slab = control.recovery_storage().await.unwrap();
+	tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+	assert!(!control.preparation_ended(), "it keeps recovering");
+	assert_eq!(
+		slab.persistent_index()
+			.unwrap()
+			.base_meta()
+			.await
+			.unwrap()
+			.active_gid,
+		fourth.gid
+	);
+	assert_eq!(recovery_record(&cluster).await, Some(recorded));
+	assert_eq!(control.identity.role, Role::ControlOnly);
+	assert_ne!(cluster.leader().await, ALLOCATED_BASE, "it never leads");
+	drop(slab);
+	control.shutdown().await.unwrap();
+
+	// Its stopped store reads back exactly the acknowledged rows.
+	let found = crate::node::recovered_rows_in(&cfg, &descriptor)
+		.await
+		.unwrap();
+	assert!(found.unverified.is_empty(), "{:?}", found.unverified);
+	assert_eq!(
+		found.saved.map(|saved| (saved.3, saved.4)),
+		Some((recorded.gid, recorded.k))
+	);
+	let mut held_rows = Vec::new();
+	for batch in &found.rows {
+		let ids = batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.unwrap();
+		let names = batch
+			.column(1)
+			.as_any()
+			.downcast_ref::<StringArray>()
+			.unwrap();
+		for row in 0..batch.num_rows() {
+			held_rows.push((ids.value(row), names.value(row).to_owned()));
+		}
+	}
+	held_rows.sort();
+	written.sort();
+	assert_eq!(held_rows, written);
+	for node in std::mem::take(&mut cluster.nodes) {
+		let _ = tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown()).await;
+	}
+}
+
+/// ADR 0107 (wendelon) control 3: after its start validation, one row the
+/// replacement inherited from its recovered base is damaged in its slab file.
+/// It proves inherited winners from its own data before signing, so it reports
+/// nothing for the next target: nothing commits and nothing is erased.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_replacement_with_a_damaged_inherited_row_does_not_report() {
+	let (
+		Replaced {
+			mut cluster,
+			descriptor,
+			lost,
+			cfg: _,
+			now,
+		},
+		control,
+	) = replaced_after_gid_one(false).await;
+	let recorded = until_recorded(&cluster, &control).await;
+	assert_eq!(recorded.gid, 1);
+	let slab = control.recovery_storage().await.unwrap();
+	until_children_held(&cluster, &slab, lost).await;
+	let index = slab.persistent_index().unwrap();
+	let entries = index.base_entries(false).await.unwrap();
+	assert_eq!(entries.len(), 2, "rows 1 and 2 are inherited");
+	let entry = entries[0];
+	let location = slab
+		.version_locations(
+			entry.tenant,
+			crate::schema::Identity::new(entry.key_identity),
+			entry.hlc,
+		)
+		.unwrap()[0];
+	{
+		use std::io::{Read, Seek, SeekFrom, Write};
+		let path = slab
+			.data_dir()
+			.join(format!("slab_{:016x}.wnd", location.slab_id));
+		let mut file = std::fs::OpenOptions::new()
+			.read(true)
+			.write(true)
+			.open(&path)
+			.unwrap();
+		let at = location.offset + u64::from(location.length) / 2;
+		let mut byte = [0_u8];
+		file.seek(SeekFrom::Start(at)).unwrap();
+		file.read_exact(&mut byte).unwrap();
+		file.seek(SeekFrom::Start(at)).unwrap();
+		file.write_all(&[byte[0] ^ 0xFF]).unwrap();
+		file.sync_all().unwrap();
+	}
+	// The damage is visible to the store's own proof.
+	assert!(
+		crate::network::data_server::certification::entry_is_stored(
+			&slab,
+			&control.state_machine,
+			&entry,
+		)
+		.await
+		.is_err(),
+		"the damaged row still proves"
+	);
+	write_current(&cluster, &descriptor, now + 60_002, 100, "d").await;
+	until_children_held(&cluster, &slab, lost).await;
+	jump_floor(&cluster, now + 120_000).await;
+	let deadline = tokio::time::Instant::now() + BOUND;
+	loop {
+		if let Some((_, reporters)) = pending_reports(&cluster).await
+			&& reporters.len() == NODES.len() - 1
+		{
+			break;
+		}
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"the survivors never reported: {:?}",
+			pending_reports(&cluster).await
+		);
+		tokio::time::sleep(TICK).await;
+	}
+	tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+	assert!(
+		!pending_reports(&cluster).await.unwrap().1.contains(&lost),
+		"the damaged replacement reported"
+	);
+	assert_eq!(current_certificate(&cluster).await.unwrap().gid, 1);
+	assert!(
+		!children_naming(&cluster, lost).await.is_empty(),
+		"nothing is erased"
+	);
+	assert_eq!(index.base_meta().await.unwrap().active_gid, 1);
+	drop(index);
+	drop(slab);
+	control.shutdown().await.unwrap();
+	for node in std::mem::take(&mut cluster.nodes) {
+		let _ = tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown()).await;
+	}
+}
+
+/// ADR 0107 (wendelon) control 7: a generation commits on the replacement's
+/// report, and before it activates, its staged evidence is damaged. Activation
+/// finds no matching candidate: the replacement is behind the boundary and its
+/// recovery stops, with its active base unchanged (no reset or copy).
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_replacement_without_its_committed_staging_stops_without_a_reset() {
+	let (
+		Replaced {
+			mut cluster,
+			descriptor,
+			lost,
+			cfg: _,
+			now,
+		},
+		control,
+	) = replaced_after_gid_one(false).await;
+	until_recorded(&cluster, &control).await;
+	let slab = control.recovery_storage().await.unwrap();
+	let held = slab.data_dir().to_path_buf();
+	crate::node::replacement_recovery::HOLD_ACTIVATION
+		.lock()
+		.unwrap()
+		.insert(held.clone());
+	write_current(&cluster, &descriptor, now + 60_002, 100, "d").await;
+	until_children_held(&cluster, &slab, lost).await;
+	jump_floor(&cluster, now + 120_000).await;
+	until_certified_past(&cluster, 1, &control).await;
+	let index = slab.persistent_index().unwrap();
+	assert_eq!(index.base_meta().await.unwrap().active_gid, 1);
+	index.drop_staged_row_for_test().await.unwrap();
+	crate::node::replacement_recovery::HOLD_ACTIVATION
+		.lock()
+		.unwrap()
+		.remove(&held);
+	let deadline = tokio::time::Instant::now() + BOUND;
+	while !control.preparation_ended() {
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"a replacement behind the boundary kept recovering"
+		);
+		tokio::time::sleep(TICK).await;
+	}
+	assert_eq!(index.base_meta().await.unwrap().active_gid, 1, "no reset");
+	assert_eq!(control.identity.role, Role::ControlOnly);
+	drop(index);
+	drop(slab);
+	control.shutdown().await.unwrap();
+	for node in std::mem::take(&mut cluster.nodes) {
+		let _ = tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown()).await;
+	}
+}
+
+/// ADR 0107 (wendelon), Codex 01a1e309 R1: a generation committed while a
+/// recovery step is under way. The step reads its view at gid 1; the next
+/// generation then commits on the replacement's own (already staged and
+/// reported) candidate; the step resumes, activates that exact candidate and
+/// continues: no stop, no reset, the record unchanged, a later write held, and
+/// the stopped store reads back exactly the acknowledged rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_generation_committed_during_a_recovery_step_is_activated_and_recovery_continues() {
+	let (
+		Replaced {
+			mut cluster,
+			descriptor,
+			lost,
+			cfg,
+			now,
+		},
+		control,
+	) = replaced_after_gid_one(false).await;
+	let recorded = until_recorded(&cluster, &control).await;
+	let slab = control.recovery_storage().await.unwrap();
+	until_children_held(&cluster, &slab, lost).await;
+	let mut written: Vec<(i64, String)> = [(1, "a"), (2, "b"), (3, "c")]
+		.into_iter()
+		.map(|(id, name)| (id, name.to_owned()))
+		.collect();
+	// The follower survivor's report is held, so the target cannot commit
+	// until the test releases it; the leader's own maintenance keeps running.
+	let leader = cluster.leader().await;
+	let held = *NODES
+		.iter()
+		.find(|id| **id != lost && **id != leader)
+		.unwrap();
+	let (held_reached, held_release) = cluster.node(held).data_server.pause_coordinator_for_test(
+		crate::network::data_server::child_writes::PauseStage::CertificationBeforeReport,
+	);
+	written.push(write_current(&cluster, &descriptor, now + 60_002, 100, "d").await);
+	until_children_held(&cluster, &slab, lost).await;
+	jump_floor(&cluster, now + 75_000).await;
+	tokio::time::timeout(BOUND, held_reached.notified())
+		.await
+		.expect("the follower survivor's report is held after staging");
+	// The replacement reports its staged candidate.
+	let deadline = tokio::time::Instant::now() + BOUND;
+	while !pending_reports(&cluster)
+		.await
+		.is_some_and(|(_, reporters)| reporters.contains(&lost))
+	{
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"the replacement never reported: {:?}",
+			pending_reports(&cluster).await
+		);
+		tokio::time::sleep(TICK).await;
+	}
+	// Its next step pauses after reading its view, at gid 1.
+	let (step_reached, step_release) = (
+		Arc::new(tokio::sync::Notify::new()),
+		Arc::new(tokio::sync::Notify::new()),
+	);
+	crate::node::replacement_recovery::PAUSE_AFTER_VIEW
+		.lock()
+		.unwrap()
+		.insert(
+			slab.data_dir().to_path_buf(),
+			(step_reached.clone(), step_release.clone()),
+		);
+	tokio::time::timeout(BOUND, step_reached.notified())
+		.await
+		.expect("a recovery step reached its pause");
+	assert_eq!(current_certificate(&cluster).await.unwrap().gid, 1);
+	// The successor commits while that step is paused, and the replacement's
+	// own state applies it.
+	held_release.notify_one();
+	let second = until_certified_past(&cluster, 1, &control).await;
+	let deadline = tokio::time::Instant::now() + BOUND;
+	while control
+		.state_machine
+		.read_state(|state| {
+			state
+				.decisions
+				.as_ref()
+				.unwrap()
+				.generations()
+				.current_gid()
+		})
+		.await < second.gid
+	{
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"the replacement never applied the commit"
+		);
+		tokio::time::sleep(TICK).await;
+	}
+	step_release.notify_one();
+	until_replacement_active(&slab, &second).await;
+	tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+	assert!(
+		!control.preparation_ended(),
+		"a concurrent commit stopped a healthy recovery"
+	);
+	assert_eq!(recovery_record(&cluster).await, Some(recorded));
+	// Recovery continues: a later write is held.
+	written.push(write_current(&cluster, &descriptor, now + 75_001, 200, "e").await);
+	until_children_held(&cluster, &slab, lost).await;
+	assert!(!control.preparation_ended());
+	drop(slab);
+	control.shutdown().await.unwrap();
+	let found = crate::node::recovered_rows_in(&cfg, &descriptor)
+		.await
+		.unwrap();
+	assert!(found.unverified.is_empty(), "{:?}", found.unverified);
+	assert_eq!(found.active_gid, second.gid);
+	assert_eq!(
+		found.saved.map(|saved| (saved.3, saved.4)),
+		Some((recorded.gid, recorded.k))
+	);
+	let mut held_rows = Vec::new();
+	for batch in &found.rows {
+		let ids = batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.unwrap();
+		let names = batch
+			.column(1)
+			.as_any()
+			.downcast_ref::<StringArray>()
+			.unwrap();
+		for row in 0..batch.num_rows() {
+			held_rows.push((ids.value(row), names.value(row).to_owned()));
+		}
+	}
+	held_rows.sort();
+	written.sort();
+	assert_eq!(held_rows, written);
+	for node in std::mem::take(&mut cluster.nodes) {
+		let _ = tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown()).await;
+	}
+}

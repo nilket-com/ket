@@ -92,15 +92,17 @@ impl WendelonDataServer {
 		&self,
 		work: impl std::future::Future<Output = std::io::Result<T>>,
 	) -> std::io::Result<T> {
-		let permit = match self.slab.directory_owner() {
-			Some(owner) => Some(owner.lifecycle_permit()?),
-			None => None,
-		};
-		let result = work.await;
-		if let Some(permit) = permit {
-			permit.complete();
+		under_permit(&self.slab, work).await
+	}
+
+	/// This server's certification progress: the same flags its reads and
+	/// cleanup gate on.
+	fn certification_progress(&self) -> CertificationProgress {
+		CertificationProgress {
+			built_gid: self.decisions.built_gid.clone(),
+			validated: self.decisions.base_validated.clone(),
+			behind: self.decisions.behind_boundary.clone(),
 		}
-		result
 	}
 
 	/// ADR 0699 S5a: validates the certified base before this start serves
@@ -202,6 +204,137 @@ impl WendelonDataServer {
 	/// Activates the committed generation's staged candidate, if it is not
 	/// active yet. A missing or mismatched candidate is behind the boundary.
 	async fn activate_committed(&self) -> std::io::Result<()> {
+		let progress = self.certification_progress();
+		StoreCertification {
+			slab: &self.slab,
+			state_machine: &self.state_machine,
+			progress: &progress,
+			build: None,
+			#[cfg(test)]
+			hold_activation: self
+				.decisions
+				.hold_activation
+				.load(std::sync::atomic::Ordering::Acquire),
+		}
+		.activate_committed()
+		.await
+	}
+
+	/// Builds, stages and reports the pending target's candidate. Only a
+	/// candidate whose every survivor is proved stored here is staged, and a
+	/// report is signed only from the durable staged metadata.
+	async fn certify_pending(&self, maintenance: &MaintenanceProposals<'_>) -> std::io::Result<()> {
+		let Some(repair) = self.repair_context() else {
+			return Ok(());
+		};
+		let progress = self.certification_progress();
+		let report = StoreCertification {
+			slab: &self.slab,
+			state_machine: &self.state_machine,
+			progress: &progress,
+			build: Some(CandidateBuild {
+				repair: &repair,
+				retention: self.mvcc_retention_policy,
+				now_ms: self.clock.now_ms(),
+				// The data server relies on this start's base validation for
+				// the winners it inherits (ADR 0107 C5 keeps that unchanged).
+				reprove_inherited: false,
+				#[cfg(test)]
+				peer: Some(&self.decisions),
+			}),
+			#[cfg(test)]
+			hold_activation: false,
+		}
+		.prepare_report()
+		.await?;
+		let Some(report) = report else {
+			return Ok(());
+		};
+		#[cfg(test)]
+		self.decisions
+			.pause_at(super::child_writes::PauseStage::CertificationBeforeReport)
+			.await;
+		// Replay basis: skipped above while applied state holds this node's
+		// report, and signed from the durable staged metadata. An identical copy
+		// returns ReportRecorded and inserts nothing; one after the target was
+		// replaced or committed is refused StaleGeneration, and a different body
+		// from the same reporter ReportMismatch
+		// (`consensus/decisions/generations.rs:201-216`). A stopped wait does not
+		// certify that the report failed: at reopen only the exact stored
+		// candidate is restaged (`storage/index/certified_base.rs:464-466`) and a
+		// different one for the same gid is refused (`certified_base.rs:410-415`),
+		// so a report proposed again equals the committed one.
+		let _ = maintenance.report(report).await;
+		Ok(())
+	}
+}
+
+/// Runs `work` under the store owner's lifecycle permit, completing it only
+/// when `work` returns (an interrupted step leaves it incomplete).
+pub(crate) async fn under_permit<T>(
+	slab: &SlabManager,
+	work: impl std::future::Future<Output = std::io::Result<T>>,
+) -> std::io::Result<T> {
+	let permit = match slab.directory_owner() {
+		Some(owner) => Some(owner.lifecycle_permit()?),
+		None => None,
+	};
+	let result = work.await;
+	if let Some(permit) = permit {
+		permit.complete();
+	}
+	result
+}
+
+/// ADR 0107 (wendelon): one store's certification progress in this process.
+/// Created once per store and process (the data server's own flags, or a
+/// recovering replacement's task), never per step.
+#[derive(Clone, Default)]
+pub(crate) struct CertificationProgress {
+	/// The generation whose staged candidate this run built, or rebuilt and
+	/// matched, with its proofs (0: none). Activating any other candidate does
+	/// not inherit this run's validation.
+	pub(crate) built_gid: Arc<std::sync::atomic::AtomicU64>,
+	/// The store's data validated at its active generation in this run.
+	pub(crate) validated: Arc<std::sync::atomic::AtomicBool>,
+	/// A committed generation has no matching staged candidate here.
+	pub(crate) behind: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// ADR 0107 (wendelon): what building a candidate needs beyond the store.
+pub(crate) struct CandidateBuild<'a> {
+	/// The store's signer, its repairs' sources and its locks.
+	pub(crate) repair: &'a super::repair::RepairContext,
+	pub(crate) retention: crate::storage::retention::MvccRetentionPolicy,
+	pub(crate) now_ms: u64,
+	/// Prove the winners inherited from the active base too, once per new
+	/// candidate (a recovered replacement, ADR 0107 C5).
+	pub(crate) reprove_inherited: bool,
+	/// Test-only: the data server's pause seams.
+	#[cfg(test)]
+	pub(crate) peer: Option<&'a super::child_writes::DecisionPeer>,
+}
+
+/// ADR 0699 S5a, ADR 0107 (wendelon): a store's part in certified generations,
+/// shared by the data server and a recovering replacement: activate the
+/// committed candidate; build, stage and sign the report of the pending one.
+pub(crate) struct StoreCertification<'a> {
+	pub(crate) slab: &'a Arc<SlabManager>,
+	pub(crate) state_machine: &'a crate::consensus::raft_storage::WendelonStateMachine,
+	pub(crate) progress: &'a CertificationProgress,
+	/// `None`: activation only.
+	pub(crate) build: Option<CandidateBuild<'a>>,
+	/// Test-only: leave a committed generation staged, the crash row between
+	/// Commit applied and local activation.
+	#[cfg(test)]
+	pub(crate) hold_activation: bool,
+}
+
+impl StoreCertification<'_> {
+	/// Activates the committed generation's staged candidate, if it is not
+	/// active yet. A missing or mismatched candidate is behind the boundary.
+	pub(crate) async fn activate_committed(&self) -> std::io::Result<()> {
+		use std::sync::atomic::Ordering;
 		let Some(index) = self.slab.persistent_index() else {
 			return Ok(());
 		};
@@ -218,11 +351,7 @@ impl WendelonDataServer {
 			return Ok(());
 		};
 		#[cfg(test)]
-		if self
-			.decisions
-			.hold_activation
-			.load(std::sync::atomic::Ordering::Acquire)
-		{
+		if self.hold_activation {
 			return Ok(());
 		}
 		if index.base_meta().await?.active_gid == cert.gid {
@@ -232,11 +361,8 @@ impl WendelonDataServer {
 		// before this start) inherits no validation: reads and readiness close
 		// before it is installed, and after an unclean start its proof is owed
 		// again before any close may record the directory clean.
-		use std::sync::atomic::Ordering;
-		if self.decisions.built_gid.load(Ordering::Acquire) != cert.gid {
-			self.decisions
-				.base_validated
-				.store(false, Ordering::Release);
+		if self.progress.built_gid.load(Ordering::Acquire) != cert.gid {
+			self.progress.validated.store(false, Ordering::Release);
 			if let Some(owner) = self.slab.directory_owner()
 				&& !owner.previous_shutdown_clean()
 			{
@@ -255,24 +381,27 @@ impl WendelonDataServer {
 		{
 			Ok(()) => {}
 			Err(ActivateRefusal::NoMatchingCandidate | ActivateRefusal::StagedRowsMismatch) => {
-				self.decisions
-					.behind_boundary
-					.store(true, std::sync::atomic::Ordering::Release);
+				self.progress.behind.store(true, Ordering::Release);
 			}
 		}
 		Ok(())
 	}
 
-	/// Builds, stages and reports the pending target's candidate. Only a
-	/// candidate whose every survivor is proved stored here is staged, and a
-	/// report is signed only from the durable staged metadata.
-	async fn certify_pending(&self, maintenance: &MaintenanceProposals<'_>) -> std::io::Result<()> {
-		let Some(signer) = self.decisions.signer.clone() else {
-			return Ok(());
+	/// Builds and durably stages the pending target's candidate, then signs
+	/// its report from the staged metadata. `None` when there is nothing to
+	/// report: no pending target, a base not at its predecessor, a candidate
+	/// not proved, or this store's report already applied. Only a candidate
+	/// whose every survivor is proved stored here is staged.
+	pub(crate) async fn prepare_report(
+		&self,
+	) -> std::io::Result<Option<crate::consensus::decisions::Signed<ReportBody>>> {
+		let Some(build) = self.build.as_ref() else {
+			return Ok(None);
 		};
 		let Some(index) = self.slab.persistent_index() else {
-			return Ok(());
+			return Ok(None);
 		};
+		let signer = build.repair.signer.clone();
 		let local = signer.signer;
 		let work = self
 			.state_machine
@@ -299,7 +428,21 @@ impl WendelonDataServer {
 							.map_or(u64::MAX, |descriptor| descriptor.schema_generation)
 					};
 					for (ordinal, child) in body.claim.children.iter().enumerate() {
-						if !child.plan.contains(&local) {
+						// ADR 0107 C2: a plan member counts for this store iff it
+						// names this slot at an incarnation in this store's
+						// recorded ancestry (only itself, for a store never
+						// replaced). Copy eligibility only: the store still holds,
+						// proves and signs for its own copy.
+						let names_this_store = child.plan.iter().any(|member| {
+							member.node == local.node
+								&& crate::consensus::decisions::in_recorded_ancestry(
+									state,
+									local.node,
+									local.incarnation,
+									member.incarnation,
+								)
+						});
+						if !names_this_store {
 							// This store holds no copy of the closed set.
 							return None;
 						}
@@ -322,14 +465,14 @@ impl WendelonDataServer {
 			})
 			.await;
 		let Some(Work { pending, children }) = work else {
-			return Ok(());
+			return Ok(None);
 		};
 		let meta = index.base_meta().await?;
 		if meta.active_gid != pending.target.predecessor_gid {
-			return Ok(());
+			return Ok(None);
 		}
 		let gid = pending.target.gid;
-		let built = &self.decisions.built_gid;
+		let built = &self.progress.built_gid;
 		match meta.staged.as_ref() {
 			Some(staged) if staged.gid == gid => {
 				// A candidate recovered from before this start: rebuilt with this
@@ -338,11 +481,11 @@ impl WendelonDataServer {
 				// mismatch fails closed: nothing is overwritten and nothing is
 				// reported. This holds whether or not its report is recorded.
 				if built.load(std::sync::atomic::Ordering::Acquire) != gid {
-					let entries = match self.build_candidate(&index, &children).await {
+					let entries = match self.build_candidate(build, &index, &children).await {
 						Ok(entries) => entries,
 						Err(refusal) => {
 							tracing::debug!(reason = %refusal.describe(), "a recovered candidate base is not proved");
-							return Ok(());
+							return Ok(None);
 						}
 					};
 					if let Err(refusal) = index.restage_base(staged.clone(), entries).await? {
@@ -351,17 +494,17 @@ impl WendelonDataServer {
 							gid,
 							"a recovered candidate base does not match its staged evidence"
 						);
-						return Ok(());
+						return Ok(None);
 					}
 					built.store(gid, std::sync::atomic::Ordering::Release);
 				}
 			}
 			_ => {
-				let entries = match self.build_candidate(&index, &children).await {
+				let entries = match self.build_candidate(build, &index, &children).await {
 					Ok(entries) => entries,
 					Err(refusal) => {
 						tracing::debug!(reason = %refusal.describe(), "no candidate base for the pending generation");
-						return Ok(());
+						return Ok(None);
 					}
 				};
 				let candidate = StagedCandidate {
@@ -371,22 +514,22 @@ impl WendelonDataServer {
 					chunks: chunk_sums(&entries),
 				};
 				if index.stage_base(candidate, entries).await?.is_err() {
-					return Ok(());
+					return Ok(None);
 				}
 				built.store(gid, std::sync::atomic::Ordering::Release);
 			}
 		}
 		// Report only what is durably staged.
 		if pending.reports.contains_key(&local.node) {
-			return Ok(());
+			return Ok(None);
 		}
 		let meta = index.base_meta().await?;
 		let Some(staged) = meta.staged.filter(|staged| {
 			staged.gid == pending.target.gid && staged.target_digest == pending.digest
 		}) else {
-			return Ok(());
+			return Ok(None);
 		};
-		let report = crate::consensus::decisions::evidence::sign(
+		Ok(Some(crate::consensus::decisions::evidence::sign(
 			&signer.key,
 			ReportBody {
 				gid: staged.gid,
@@ -395,23 +538,45 @@ impl WendelonDataServer {
 				chunks: staged.chunks,
 			},
 			local,
-		);
+		)))
+	}
+
+	/// The child's manifest, repairing the child once if the local copy is
+	/// missing or incomplete.
+	async fn proved_manifest(
+		&self,
+		build: &CandidateBuild<'_>,
+		index: &crate::storage::index::PersistentLocalIndex,
+		table: TableObjectId,
+		tenant: TenantId,
+		generation: u64,
+		child: &super::reader::AcceptedChild,
+	) -> Result<Vec<crate::storage::index::parent_intents::OwnedVersion>, super::reader::ReadRefusal>
+	{
+		use super::reader::{LocalChild, ReadRefusal, local_child_in};
+		if let LocalChild::Ready(manifest) = local_child_in(index, table, tenant, child).await? {
+			return Ok(manifest);
+		}
 		#[cfg(test)]
-		self.decisions
-			.pause_at(super::child_writes::PauseStage::CertificationBeforeReport)
-			.await;
-		// Replay basis: skipped above while applied state holds this node's
-		// report, and signed from the durable staged metadata. An identical copy
-		// returns ReportRecorded and inserts nothing; one after the target was
-		// replaced or committed is refused StaleGeneration, and a different body
-		// from the same reporter ReportMismatch
-		// (`consensus/decisions/generations.rs:201-216`). A stopped wait does not
-		// certify that the report failed: at reopen only the exact stored
-		// candidate is restaged (`storage/index/certified_base.rs:464-466`) and a
-		// different one for the same gid is refused (`certified_base.rs:410-415`),
-		// so a report proposed again equals the committed one.
-		let _ = maintenance.report(report).await;
-		Ok(())
+		if let Some(peer) = build.peer {
+			peer.pause_at(super::child_writes::PauseStage::ReaderBeforeRepair)
+				.await;
+		}
+		super::repair::repair_child_in(build.repair, child.rsv, child.ordinal, generation)
+			.await
+			.map_err(|refusal| {
+				ReadRefusal::Transient(format!(
+					"({}, {}) could not be repaired: {refusal:?}",
+					child.rsv, child.ordinal
+				))
+			})?;
+		match local_child_in(index, table, tenant, child).await? {
+			LocalChild::Ready(manifest) => Ok(manifest),
+			LocalChild::Missing => Err(ReadRefusal::Transient(format!(
+				"({}, {}) is still incomplete after repair",
+				child.rsv, child.ordinal
+			))),
+		}
 	}
 
 	/// The candidate base: the active base, superseded per key by the newest
@@ -422,10 +587,13 @@ impl WendelonDataServer {
 	/// - Each winning version from a child must be stored here with its
 	///   content, or as typed tombstone locations, repaired once and proved
 	///   again.
+	/// - With `reprove_inherited`, each winner inherited from the active base
+	///   is proved stored here with its content too (ADR 0107 C5).
 	/// - Every table in the candidate, inherited ones included, must keep the
 	///   frozen policy.
 	async fn build_candidate(
 		&self,
+		build: &CandidateBuild<'_>,
 		index: &crate::storage::index::PersistentLocalIndex,
 		children: &[ClosedChild],
 	) -> Result<Vec<BaseEntry>, BuildRefusal> {
@@ -457,7 +625,7 @@ impl WendelonDataServer {
 				.await
 				.ok_or(BuildRefusal::NotInPlan)?;
 			let manifest = self
-				.proved_manifest(index, table, tenant, generation, &child.recorded)
+				.proved_manifest(build, index, table, tenant, generation, &child.recorded)
 				.await
 				.map_err(unproved)?;
 			for version in &manifest {
@@ -496,10 +664,13 @@ impl WendelonDataServer {
 			.map(|(tenant, table, _)| (*tenant, *table))
 			.collect();
 		for (tenant, table) in tables {
-			if self
-				.table_effective_retention_from_state(&state, tenant, table)
-				.floor
-				.is_some()
+			if crate::storage::retention::effective_table_retention(
+				&build.retention,
+				state.table_lifecycle.retention_policy(tenant, table),
+				build.now_ms,
+			)
+			.floor
+			.is_some()
 			{
 				return Err(BuildRefusal::Policy);
 			}
@@ -508,23 +679,40 @@ impl WendelonDataServer {
 		let mut repaired = std::collections::BTreeSet::new();
 		for (entry, source) in winners.values_mut() {
 			let Some(at) = *source else {
+				// ADR 0107 C5: a recovered replacement proves what it inherits
+				// from its own stored data before it signs for it.
+				if build.reprove_inherited {
+					entry_is_stored(self.slab, self.state_machine, entry)
+						.await
+						.map_err(BuildRefusal::Incomplete)?;
+				}
 				continue;
 			};
 			let child = &children[at];
 			let descriptor = &descriptors[&(entry.tenant, entry.table)];
 			let key = Identity::new(entry.key_identity);
-			let mut proved = self
-				.proved_version(entry.tenant, descriptor, key, entry.hlc, entry.row_digest)
-				.await
-				.map_err(unproved)?;
+			let prove = || {
+				super::reader::proved_location_in(
+					self.slab,
+					entry.tenant,
+					descriptor,
+					key,
+					entry.hlc,
+					entry.row_digest,
+					None,
+				)
+			};
+			let mut proved = prove().await.map_err(unproved)?;
 			if proved.is_none() && repaired.insert(at) {
-				self.repair_child(child.recorded.rsv, child.recorded.ordinal, child.generation)
-					.await
-					.map_err(|refusal| BuildRefusal::Incomplete(format!("{refusal:?}")))?;
-				proved = self
-					.proved_version(entry.tenant, descriptor, key, entry.hlc, entry.row_digest)
-					.await
-					.map_err(unproved)?;
+				super::repair::repair_child_in(
+					build.repair,
+					child.recorded.rsv,
+					child.recorded.ordinal,
+					child.generation,
+				)
+				.await
+				.map_err(|refusal| BuildRefusal::Incomplete(format!("{refusal:?}")))?;
+				proved = prove().await.map_err(unproved)?;
 			}
 			let Some((locality, location)) = proved else {
 				return Err(BuildRefusal::Incomplete(

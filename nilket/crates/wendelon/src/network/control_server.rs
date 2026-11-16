@@ -767,6 +767,9 @@ pub struct ReplacementReportWire {
 	pub bound_key: Option<[u8; 32]>,
 	/// ADR 0106 (wendelon): the recorded recovery's (gid, applied cut).
 	pub recovered: Option<(u64, u64)>,
+	/// ADR 0107 (wendelon): the cluster's current certificate (gid, cut), read
+	/// with the record: whether certification moved past the recovery.
+	pub certified: Option<(u64, u64)>,
 }
 
 /// ADR 0736: a TENANT_ADMIN_RESP body as the response, then the backup
@@ -3403,6 +3406,7 @@ impl WendelonControlServer {
 						promoted: None,
 						bound_key: None,
 						recovered: None,
+						certified: None,
 					}),
 					None,
 				),
@@ -4204,6 +4208,11 @@ impl WendelonControlServer {
 								})
 							}),
 							recovered: record.recovered.map(|recovery| (recovery.gid, recovery.k)),
+							certified: decisions
+								.generations()
+								.current
+								.as_ref()
+								.map(|certificate| (certificate.gid, certificate.t)),
 						})
 					})
 					.await;

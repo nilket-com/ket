@@ -113,8 +113,15 @@ fn report(token: u128, replacement: &ReplacementReportWire) -> String {
 			format!("; bound key {hex}")
 		})
 		.unwrap_or_default();
+	// ADR 0107 (wendelon): the cluster's current certificate, after the recorded
+	// recovery only.
+	let certified = replacement
+		.certified
+		.filter(|_| !recovered.is_empty())
+		.map(|(gid, t)| format!("; certified gid {gid} through {t}"))
+		.unwrap_or_default();
 	format!(
-		"replacement {token:032x}: slot {} replacing instance {}: {phase}{promoted}{bound}{recovered}",
+		"replacement {token:032x}: slot {} replacing instance {}: {phase}{promoted}{bound}{recovered}{certified}",
 		replacement.slot, replacement.r_old
 	)
 }
@@ -485,6 +492,7 @@ mod tests {
 							promoted: None,
 							bound_key: None,
 							recovered: None,
+							certified: None,
 						},
 					))
 				}
@@ -716,6 +724,7 @@ mod tests {
 					promoted: None,
 					bound_key: None,
 					recovered: None,
+					certified: None,
 				},
 			)
 		};
@@ -740,9 +749,39 @@ mod tests {
 					promoted: Some(crate::consensus::StoreIncarnation::from_raw(0x0105)),
 					bound_key: None,
 					recovered: None,
+					certified: None,
 				},
 			),
 			format!("{prefix}done 2147483648; promoted store 00000000000000000000000000000105")
+		);
+		// ADR 0106, ADR 0107 (wendelon): the recorded recovery follows the bound
+		// key, and the current certificate follows the recovery, never alone.
+		let done = |recovered, certified| {
+			report(
+				TOKEN,
+				&ReplacementReportWire {
+					slot: SLOT,
+					r_old: SLOT,
+					phase: ReplacementPhase::Done { r_new: 1 << 31 },
+					promoted: Some(crate::consensus::StoreIncarnation::from_raw(0x0105)),
+					bound_key: Some([0xab; 32]),
+					recovered,
+					certified,
+				},
+			)
+		};
+		let bound = format!(
+			"{prefix}done 2147483648; promoted store 00000000000000000000000000000105; bound key {}",
+			"ab".repeat(32)
+		);
+		assert_eq!(done(None, Some((3, 90))), bound);
+		assert_eq!(
+			done(Some((2, 41)), None),
+			format!("{bound}; recovered gid 2 through 41")
+		);
+		assert_eq!(
+			done(Some((2, 41)), Some((3, 90))),
+			format!("{bound}; recovered gid 2 through 41; certified gid 3 through 90")
 		);
 	}
 
@@ -774,6 +813,7 @@ mod tests {
 				promoted: Some(crate::consensus::StoreIncarnation::from_raw(0x0105)),
 				bound_key: None,
 				recovered: None,
+				certified: None,
 			}),
 		};
 		let mut answer = plain.clone();
