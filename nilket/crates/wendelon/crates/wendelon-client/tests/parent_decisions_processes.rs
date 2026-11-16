@@ -466,16 +466,67 @@ fn node_control_call_with(
 	}
 }
 
+/// DC-253: the node-control stand-ins this test runs are files of the repository
+/// (`tests/node_control_fixtures`, executable in git), never written while tests run. A script
+/// written at run time can be held open for writing by another test thread's child between its
+/// fork and its exec, and Linux refuses to execute a file open for writing (`ETXTBSY`); see
+/// `a_script_held_open_for_writing_cannot_be_executed`.
+fn node_control_fixture(name: &str) -> PathBuf {
+	PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+		.join("tests/node_control_fixtures")
+		.join(name)
+}
+
+/// DC-253, the mechanism only: executing a file while a descriptor holds it open for writing is
+/// refused with `ETXTBSY` on this kernel. It shows the refusal from a writable descriptor; it is
+/// not proof of which fork held one in the failures recorded for the test below.
+#[test]
+fn a_script_held_open_for_writing_cannot_be_executed() {
+	use std::io::Write as _;
+	use std::os::unix::fs::OpenOptionsExt as _;
+	let dir = std::env::temp_dir().join(format!(
+		"nilket-pd-etxtbsy-{}-{}",
+		std::process::id(),
+		uuid::Uuid::new_v4().simple()
+	));
+	std::fs::create_dir(&dir).unwrap();
+	let path = dir.join("held");
+	let mut held = std::fs::OpenOptions::new()
+		.write(true)
+		.create_new(true)
+		.mode(0o700)
+		.open(&path)
+		.unwrap();
+	held.write_all(b"#!/bin/bash\nexit 0\n").unwrap();
+	held.flush().unwrap();
+	let refused = Command::new(&path)
+		.stdin(Stdio::null())
+		.stdout(Stdio::null())
+		.stderr(Stdio::null())
+		.spawn()
+		.map(|mut child| {
+			let _ = child.kill();
+			let _ = child.wait();
+		})
+		.expect_err("a file open for writing was executed");
+	drop(held);
+	assert_eq!(refused.raw_os_error(), Some(26), "not ETXTBSY: {refused}");
+	// No second execution of this file: another thread's child may still hold the descriptor
+	// just dropped, which is the hazard itself.
+	std::fs::remove_dir_all(&dir).unwrap();
+}
+
 #[test]
 fn a_node_control_call_is_bounded_with_everything_it_started() {
-	use std::os::unix::fs::PermissionsExt as _;
-	let dir = std::env::temp_dir().join(format!("nilket-pd-control-{}", std::process::id()));
-	let _ = std::fs::remove_dir_all(&dir);
-	std::fs::create_dir_all(&dir).unwrap();
 	let script = |name: &str, body: &str| {
-		let path = dir.join(name);
-		std::fs::write(&path, format!("#!/bin/bash\n{body}\n")).unwrap();
-		std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+		let path = node_control_fixture(name);
+		// The fixture is the stand-in this assertion names, as committed.
+		assert_eq!(
+			std::fs::read_to_string(&path).unwrap(),
+			format!("#!/bin/bash\n{body}\n"),
+			"{}",
+			path.display()
+		);
 		path
 	};
 	// Whole: exit 0 and its output.
@@ -525,7 +576,6 @@ fn a_node_control_call_is_bounded_with_everything_it_started() {
 	);
 	assert!(!ok && raw.contains("exit None"), "{raw}");
 	assert!(started.elapsed() < Duration::from_secs(5));
-	std::fs::remove_dir_all(&dir).unwrap();
 }
 
 /// This run's daemons: children of this test, or daemons on other hosts behind the node-control

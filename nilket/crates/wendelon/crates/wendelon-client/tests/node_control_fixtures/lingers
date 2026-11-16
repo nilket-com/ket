@@ -1,0 +1,3 @@
+#!/bin/bash
+echo early; sleep 30 &
+exit 0
