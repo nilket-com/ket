@@ -8467,7 +8467,7 @@ async fn a_service_manager_restarts_an_activated_replacement_as_full() {
 	assert!(records.is_dir(), "{} is not a directory", records.display());
 	let deadline = Instant::now() + REPLACEMENT_TEST_BOUND;
 	let Formed {
-		root: _root,
+		root,
 		pki,
 		members,
 		mut daemons,
@@ -8750,6 +8750,9 @@ async fn a_service_manager_restarts_an_activated_replacement_as_full() {
 		"the workflow outlived its bound {REPLACEMENT_TEST_BOUND:?}"
 	);
 	eprintln!("smoke: the service-restart workflow passed");
+	// Only after a pass, as the one-host workflow does: a failure keeps the run's directory
+	// for its logs (its service records are in the record directory either way).
+	std::fs::remove_dir_all(&root).unwrap();
 }
 
 /// Three hosts (Codex 01a1e487, 01a1e48d): a replica that has offloaded its cold slabs to the
