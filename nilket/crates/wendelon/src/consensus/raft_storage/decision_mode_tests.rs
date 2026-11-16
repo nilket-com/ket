@@ -1058,9 +1058,9 @@ fn recovery_keeps_the_reserve_and_first_decision_log_indices() {
 
 	// Recovery starts each authority from its own state shape.
 	let blanks: Vec<_> = (1..=3).map(blank).collect();
-	let inner = recover_sm_inner(new, None, blanks.clone(), checkpoint(3)).unwrap();
+	let inner = recover_sm_inner(new, None, blanks.clone(), checkpoint(3), false).unwrap();
 	assert_eq!(inner.state.decisions, Some(Default::default()));
-	let inner = recover_sm_inner(DecisionMode::Today, None, blanks, checkpoint(3)).unwrap();
+	let inner = recover_sm_inner(DecisionMode::Today, None, blanks, checkpoint(3), false).unwrap();
 	assert!(inner.state.decisions.is_none());
 }
 
@@ -1475,6 +1475,7 @@ fn recovered(state: SmState, entries: Vec<Entry<WendelonTypeConfig>>) -> std::io
 			commit_index: commit,
 			e_safe_index: commit,
 		}),
+		false,
 	)
 }
 

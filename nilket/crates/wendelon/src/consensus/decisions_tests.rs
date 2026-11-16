@@ -5586,6 +5586,30 @@ fn index_receipts_are_bound_to_the_current_store_and_to_their_phase() {
 	);
 }
 
+/// DC-257: an applied state in which slot 3's replacement instance has its CURRENT start
+/// authority (recovered, then activated), with that authority's identity, birth and store,
+/// for the storage-level handoff regression. Built only through the reducers.
+pub(crate) fn activated_replacement_for_test() -> (
+	SmState,
+	crate::consensus::decisions::instances::RaftIdentity,
+	crate::consensus::decisions::instances::Birth,
+	StoreIncarnation,
+) {
+	use crate::consensus::decisions::instances::{Origin, RaftIdentity, Role};
+	let (mut state, k) = recovered();
+	let through = peek_index() - 1;
+	assert!(matches!(
+		activate(&mut state, activation_body(k, through, 0)),
+		DecisionResult::ActivationRecorded { .. }
+	));
+	let identity = RaftIdentity {
+		instance: ALLOCATED_BASE,
+		origin: Origin::Replacement,
+		role: Role::Full,
+	};
+	(state, identity, [BIRTH; 16], store_j())
+}
+
 /// ADR 0108 control 3 (D3): a replacement's store starts Full only under its
 /// CURRENT activation: not before it, not for another birth or store, and not
 /// once a later replacement opened against its instance.

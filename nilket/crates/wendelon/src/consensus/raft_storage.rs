@@ -446,8 +446,12 @@ struct LogStoreInner {
 	/// Filesystem paths for the durable Control Ring artifacts.
 	/// Absent for the in-memory test store.
 	artifact_paths: Option<ControlArtifactPaths>,
-	/// Snapshot loaded during durable recovery, if present.
+	/// Snapshot loaded during durable recovery, if present. Written only at open: a snapshot
+	/// published later in this lifetime is found through `publication` (ADR 0109).
 	recovered_snapshot: Option<LoadedSnapshot>,
+	/// Whether open's replay began in the legacy single-file WAL, which may start at any
+	/// index. A rebuild with no snapshot applies the same start rule as open (ADR 0109).
+	legacy_start: bool,
 	/// Recovered checkpoint counters from the WAL.
 	recovery_checkpoint: Option<RecoveryCheckpoint>,
 	/// Durable committed pointer recovered from the WAL checkpoint
@@ -573,6 +577,11 @@ pub struct WendelonLogStore {
 	#[cfg(test)]
 	backup_after_wal_read_hold:
 		Arc<std::sync::Mutex<Option<(Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>>>,
+	/// Test-only (ADR 0109): a one-shot hold in `recovered_state_machine` after its first
+	/// publication observation, so a control can move or fail the publication in between.
+	#[cfg(test)]
+	rebuild_after_observation_hold:
+		Arc<std::sync::Mutex<Option<(Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>>>,
 	/// Test-only: while set, every append fails and poisons this store, as a
 	/// failed WAL write does.
 	#[cfg(test)]
@@ -585,6 +594,19 @@ impl WendelonLogStore {
 	#[cfg(test)]
 	pub(crate) fn fail_appends_for_test(&self) -> Arc<std::sync::atomic::AtomicBool> {
 		self.fail_appends.clone()
+	}
+
+	/// Arms the one-shot hold after a rebuild's first publication observation: `entered` gets a
+	/// permit when the rebuild is held; it continues when `release` gets one.
+	#[cfg(test)]
+	pub(crate) fn pause_rebuild_after_observation_for_test(
+		&self,
+	) -> (Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>) {
+		let entered = Arc::new(tokio::sync::Semaphore::new(0));
+		let release = Arc::new(tokio::sync::Semaphore::new(0));
+		*self.rebuild_after_observation_hold.lock().unwrap() =
+			Some((entered.clone(), release.clone()));
+		(entered, release)
 	}
 
 	#[cfg(test)]
@@ -611,6 +633,7 @@ impl WendelonLogStore {
 				page: None,
 				artifact_paths: None,
 				recovered_snapshot: None,
+				legacy_start: false,
 				recovery_checkpoint: None,
 				recovery_committed: None,
 				bootstrap_mode: DurableBootstrapMode::FreshBootstrap,
@@ -630,6 +653,8 @@ impl WendelonLogStore {
 			_directory_owner: None,
 			#[cfg(test)]
 			backup_after_wal_read_hold: Default::default(),
+			#[cfg(test)]
+			rebuild_after_observation_hold: Default::default(),
 			#[cfg(test)]
 			fail_appends: Default::default(),
 			recovered_artifact_hash: None,
@@ -1001,6 +1026,7 @@ impl WendelonLogStore {
 				page,
 				artifact_paths: Some(artifact_paths),
 				recovered_snapshot: snapshot,
+				legacy_start: replay.legacy_start,
 				recovery_checkpoint: replay.checkpoint,
 				recovery_committed,
 				bootstrap_mode,
@@ -1022,6 +1048,8 @@ impl WendelonLogStore {
 			_directory_owner: owner,
 			#[cfg(test)]
 			backup_after_wal_read_hold: Default::default(),
+			#[cfg(test)]
+			rebuild_after_observation_hold: Default::default(),
 			#[cfg(test)]
 			fail_appends: Default::default(),
 		};
@@ -1616,8 +1644,85 @@ impl WendelonLogStore {
 				.all(|(previous, index)| previous.checked_add(1) == Some(*index))
 	}
 
+	/// The state machine recovered from this store's durable state: its CURRENT snapshot
+	/// base and the committed tail above it (ADR 0109). The base is the published artifact,
+	/// which may be newer than the one loaded at open (a snapshot installed, or built and
+	/// purged, in this lifetime). The inputs are captured between two observations of the
+	/// same healthy publication; a change between them refuses instead of mixing eras. No
+	/// lock is held while another is taken: `inner` and the publication lock (a leaf) are
+	/// each taken, read and released in turn.
 	pub async fn recovered_state_machine(&self) -> std::io::Result<WendelonStateMachine> {
-		let (snapshot, entries, checkpoint, snapshot_runtime) = {
+		// 1. What open loaded, and where the artifact lives (`inner`, released).
+		let (cached, location) = {
+			let guard = self.inner.read().await;
+			(
+				guard
+					.recovered_snapshot
+					.as_ref()
+					.map(|loaded| loaded.last_included),
+				match (&guard.file_ops, &guard.artifact_paths) {
+					(Some(file_ops), Some(paths)) => {
+						Some((file_ops.clone(), paths.snapshot.clone()))
+					}
+					_ => None,
+				},
+			)
+		};
+		// 2. The publication, healthy: its failure fence is checked even when the cached base
+		//    is current. When the cached base is not the published artifact, the artifact is
+		//    opened and read under the publication lock, as every reader of `current` is.
+		let (observed, current) = {
+			let publication = self.publication.state.lock().await;
+			let observed = SnapshotPublication::healthy(&publication)?;
+			let current = match (observed, cached) {
+				(PublishedSnapshot::NoArtifact, None) => None,
+				(PublishedSnapshot::NoArtifact, Some(_)) => {
+					return Err(Error::new(
+						ErrorKind::InvalidData,
+						"no published snapshot, but open loaded one",
+					));
+				}
+				(PublishedSnapshot::Artifact(id), Some(loaded)) if loaded == id => None,
+				(PublishedSnapshot::Artifact(id), _) => {
+					let Some((file_ops, path)) = &location else {
+						return Err(Error::new(
+							ErrorKind::Unsupported,
+							"a published snapshot without a durable artifact path",
+						));
+					};
+					let loaded =
+						load_snapshot_artifact(file_ops.as_ref(), path, self.decision_mode)
+							.await?
+							.ok_or_else(|| {
+								Error::new(
+									ErrorKind::InvalidData,
+									format!("the published snapshot {id:?} has no artifact"),
+								)
+							})?;
+					if loaded.last_included != id {
+						return Err(Error::new(
+							ErrorKind::InvalidData,
+							format!(
+								"the snapshot artifact holds {:?}, publication says {id:?}",
+								loaded.last_included
+							),
+						));
+					}
+					Some(loaded)
+				}
+			};
+			(observed, current)
+		};
+		#[cfg(test)]
+		{
+			let hold = self.rebuild_after_observation_hold.lock().unwrap().take();
+			if let Some((entered, release)) = hold {
+				entered.add_permits(1);
+				release.acquire().await.unwrap().forget();
+			}
+		}
+		// 3. The tail, checkpoint and cached base (`inner`, released).
+		let (cached_snapshot, entries, checkpoint, legacy_start, snapshot_runtime) = {
 			let guard = self.inner.read().await;
 			let snapshot_runtime = match (&guard.file_ops, &guard.artifact_paths) {
 				(Some(file_ops), Some(paths)) => SnapshotRuntime {
@@ -1635,11 +1740,35 @@ impl WendelonLogStore {
 				guard.recovered_snapshot.clone(),
 				guard.entries.values().map(clone_entry).collect::<Vec<_>>(),
 				guard.recovery_checkpoint,
+				guard.legacy_start,
 				snapshot_runtime,
 			)
 		};
-		let mut state_machine =
-			WendelonStateMachine::from_recovery(snapshot, entries, checkpoint, snapshot_runtime)?;
+		// 4. The same healthy publication again; any change in between refuses.
+		{
+			let publication = self.publication.state.lock().await;
+			let again = SnapshotPublication::healthy(&publication)?;
+			if again != observed {
+				return Err(Error::new(
+					ErrorKind::Interrupted,
+					format!(
+						"snapshot publication moved during recovery ({observed:?} -> {again:?}); \
+						 nothing was rebuilt"
+					),
+				));
+			}
+		}
+		let snapshot = match current {
+			Some(loaded) => Some(loaded),
+			None => cached_snapshot,
+		};
+		let mut state_machine = WendelonStateMachine::from_recovery(
+			snapshot,
+			entries,
+			checkpoint,
+			legacy_start,
+			snapshot_runtime,
+		)?;
 		if let (Some((hash, input_applied)), Some(owner)) =
 			(self.recovered_artifact_hash, &self._directory_owner)
 		{
@@ -4313,11 +4442,22 @@ struct SmInner {
 	snapshot_seq: u64,
 }
 
+/// The state recovered from `snapshot` and the committed tail `entries` (ADR 0109):
+/// - entries at or below the snapshot boundary are already in it and are skipped (a runtime
+///   log may still retain a covered prefix);
+/// - above it, replay is contiguous: the first replayed entry is the boundary's successor (with
+///   no snapshot: index 0 or 1, or any index for a legacy single-file start, as open requires),
+///   each next entry follows the last, and replay reaches the checkpoint's commit index;
+/// - nothing past the checkpoint is applied, and with no checkpoint only the snapshot counts.
+///
+/// A gap, a tail that stops short of the checkpoint, or a checkpoint behind the snapshot is
+/// refused: never a state with its base missing.
 fn recover_sm_inner(
 	decision_mode: DecisionMode,
 	snapshot: Option<LoadedSnapshot>,
 	entries: Vec<Entry<WendelonTypeConfig>>,
 	checkpoint: Option<RecoveryCheckpoint>,
+	legacy_start: bool,
 ) -> std::io::Result<SmInner> {
 	let mut inner = SmInner::default();
 	if decision_mode == DecisionMode::ParentDecisions {
@@ -4357,9 +4497,44 @@ fn recover_sm_inner(
 		snapshot_boundary.unwrap_or(0)
 	};
 
+	let gap = |why: String| Error::new(ErrorKind::InvalidData, format!("recovery replay: {why}"));
+	// What the next replayed entry must be. A terminal index has no successor: it is
+	// `Exhausted`, never the genesis case, and only an entry that would follow it refuses.
+	#[derive(Clone, Copy, Debug)]
+	enum Next {
+		/// No snapshot and nothing replayed yet: open's start rule applies.
+		Genesis,
+		At(u64),
+		Exhausted,
+	}
+	let successor = |index: u64| index.checked_add(1).map_or(Next::Exhausted, Next::At);
+	let mut expected = snapshot_boundary.map_or(Next::Genesis, successor);
+	let mut last_replayed = snapshot_boundary;
 	for entry in entries {
-		if entry.log_id.index > apply_upto {
+		let index = entry.log_id.index;
+		if snapshot_boundary.is_some_and(|boundary| index <= boundary) {
+			continue;
+		}
+		if index > apply_upto {
 			break;
+		}
+		match expected {
+			Next::At(expected) if index != expected => {
+				return Err(gap(format!(
+					"entry {index} where {expected} was due (snapshot boundary {snapshot_boundary:?})"
+				)));
+			}
+			Next::Exhausted => {
+				return Err(gap(format!(
+					"entry {index} follows the terminal index (last replayed {last_replayed:?})"
+				)));
+			}
+			Next::Genesis if !(legacy_start || index <= 1) => {
+				return Err(gap(format!(
+					"the first entry is {index}, with no snapshot below it"
+				)));
+			}
+			_ => {}
 		}
 		apply_entry_to_state(&mut inner.state, &entry)
 			.map_err(|unknown| Error::new(ErrorKind::InvalidData, unknown.to_string()))?;
@@ -4367,6 +4542,14 @@ fn recover_sm_inner(
 			Some(prev) if prev > entry.log_id => prev,
 			_ => entry.log_id,
 		});
+		expected = successor(index);
+		last_replayed = Some(index);
+	}
+	// Replay reaches the checkpoint: a commit index above the base names a retained entry.
+	if apply_upto > snapshot_boundary.unwrap_or(0) && last_replayed != Some(apply_upto) {
+		return Err(gap(format!(
+			"replay stopped at {last_replayed:?}, short of the checkpoint's commit index {apply_upto}"
+		)));
 	}
 
 	Ok(inner)
@@ -4493,15 +4676,24 @@ impl WendelonStateMachine {
 		snapshot: Option<LoadedSnapshot>,
 		entries: Vec<Entry<WendelonTypeConfig>>,
 		checkpoint: Option<RecoveryCheckpoint>,
+		legacy_start: bool,
 		snapshot_runtime: SnapshotRuntime,
 	) -> std::io::Result<Self> {
-		Self::from_recovery_with_metrics(snapshot, entries, checkpoint, snapshot_runtime, metrics())
+		Self::from_recovery_with_metrics(
+			snapshot,
+			entries,
+			checkpoint,
+			legacy_start,
+			snapshot_runtime,
+			metrics(),
+		)
 	}
 
 	fn from_recovery_with_metrics(
 		snapshot: Option<LoadedSnapshot>,
 		entries: Vec<Entry<WendelonTypeConfig>>,
 		checkpoint: Option<RecoveryCheckpoint>,
+		legacy_start: bool,
 		snapshot_runtime: SnapshotRuntime,
 		observability_metrics: &'static MetricsRegistry,
 	) -> std::io::Result<Self> {
@@ -4511,6 +4703,7 @@ impl WendelonStateMachine {
 			snapshot,
 			entries,
 			checkpoint,
+			legacy_start,
 		)?;
 
 		let admission_snapshot = watch::channel(admission_snapshot_from_state(&inner.state)).0;
@@ -9849,6 +10042,7 @@ fn replay_exported_control_state(wal: &[u8], snapshot_bytes: &[u8]) -> std::io::
 		snapshot,
 		replay.entries.into_values().collect(),
 		replay.checkpoint,
+		true,
 	)?
 	.state)
 }
@@ -15608,6 +15802,574 @@ mod recovery_tests {
 		assert!(state.leases.contains_key(&0));
 	}
 
+	/// DC-257 (Codex 01a1e65d): what `recovered_state_machine` rebuilds from a log store
+	/// that is still open: (applied index, whether each lease range is present), or the
+	/// rebuild's error. The coordinates are printed for the record.
+	async fn rebuilt_view(
+		store: &WendelonLogStore,
+		ranges: &[u64],
+		what: &str,
+	) -> Result<(Option<LogId<u32>>, Vec<bool>), String> {
+		let rebuilt = match store.recovered_state_machine().await {
+			Ok(machine) => {
+				let state = machine.state_snapshot().await;
+				Ok((
+					state.last_applied_log_id,
+					ranges
+						.iter()
+						.map(|start| state.leases.contains_key(start))
+						.collect(),
+				))
+			}
+			Err(error) => Err(error.to_string()),
+		};
+		eprintln!("DC-257 {what}: same-lifetime rebuild = {rebuilt:?}");
+		rebuilt
+	}
+
+	/// DC-257: the recovery checkpoint `hand_over`'s `flush_now` writes before its rebuild,
+	/// from the live state's applied index, through the store's real checkpoint write.
+	async fn checkpoint_as_hand_over(store: &WendelonLogStore, machine: &WendelonStateMachine) {
+		let state = machine.state_snapshot().await;
+		let observation = checkpoint_observation_from_state(&state, true)
+			.expect("an applied index to checkpoint");
+		eprintln!("DC-257 checkpoint written: {:?}", observation.checkpoint);
+		store.write_recovery_checkpoint(observation).await.unwrap();
+	}
+
+	/// DC-257 control: with NO snapshot in this lifetime, the same checkpoint-then-rebuild
+	/// recovers the whole applied state. It isolates the snapshot as the cause of the REDs.
+	#[tokio::test]
+	async fn without_a_snapshot_a_same_lifetime_recovery_rebuild_recovers_the_applied_state() {
+		let dir = tempdir("dc257-no-snapshot");
+		let mut store = open_store(&dir).await;
+		let mut sm = store.recovered_state_machine().await.unwrap();
+		for (index, start) in [(1, 0), (2, 10), (3, 20)] {
+			append_and_apply(&mut store, &mut sm, lease_entry(index, start, start + 9, 3)).await;
+		}
+		checkpoint_as_hand_over(&store, &sm).await;
+		assert_eq!(
+			rebuilt_view(&store, &[0, 10, 20], "no snapshot").await,
+			Ok((Some(log_id(1, 3)), vec![true, true, true]))
+		);
+	}
+
+	/// DC-257 RED (Codex 01a1e65d): a snapshot INSTALLED in this lifetime (the real install
+	/// path, a validated durable artifact) must survive a recovery rebuild from the SAME,
+	/// still-open log store, as it survives a reopen. The installed prefix's applied index
+	/// and state are required of both.
+	#[tokio::test]
+	async fn a_snapshot_installed_in_this_lifetime_survives_a_same_lifetime_recovery_rebuild() {
+		let source_dir = tempdir("dc257-install-source");
+		let mut source_store = open_store(&source_dir).await;
+		let mut source_sm = source_store.recovered_state_machine().await.unwrap();
+		append_and_apply(&mut source_store, &mut source_sm, lease_entry(1, 0, 9, 3)).await;
+		let mut builder =
+			<WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::get_snapshot_builder(
+				&mut source_sm,
+			)
+			.await;
+		let built = builder.build_snapshot().await.unwrap();
+
+		let target_dir = tempdir("dc257-install-target");
+		let target_store = open_store(&target_dir).await;
+		let mut target_sm = target_store.recovered_state_machine().await.unwrap();
+		<WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::install_snapshot(
+			&mut target_sm,
+			&built.meta,
+			built.snapshot,
+		)
+		.await
+		.unwrap();
+		// A tail after the installed boundary, as the replacement had.
+		let mut target_store = target_store;
+		append_and_apply(&mut target_store, &mut target_sm, lease_entry(2, 10, 19, 3)).await;
+		let live = target_sm.state_snapshot().await;
+		eprintln!(
+			"DC-257 install: snapshot boundary {:?}; live applied {:?}; live leases {:?}",
+			built.meta.last_log_id,
+			live.last_applied_log_id,
+			[0, 10].map(|start| live.leases.contains_key(&start))
+		);
+		assert_eq!(live.last_applied_log_id, Some(log_id(1, 2)));
+		assert!(live.leases.contains_key(&0) && live.leases.contains_key(&10));
+		checkpoint_as_hand_over(&target_store, &target_sm).await;
+
+		let rebuilt = rebuilt_view(&target_store, &[0, 10], "install").await;
+
+		// The reopen control, checked first so both are reported.
+		drop(target_sm);
+		drop(target_store);
+		let reopened = open_store(&target_dir).await;
+		let state = reopened
+			.recovered_state_machine()
+			.await
+			.unwrap()
+			.state_snapshot()
+			.await;
+		eprintln!(
+			"DC-257 install: reopened applied {:?}, leases present {:?}",
+			state.last_applied_log_id,
+			[0, 10].map(|start| state.leases.contains_key(&start))
+		);
+		assert_eq!(state.last_applied_log_id, Some(log_id(1, 2)));
+		assert!(state.leases.contains_key(&0) && state.leases.contains_key(&10));
+		assert_eq!(
+			rebuilt,
+			Ok((Some(log_id(1, 2)), vec![true, true])),
+			"the same-lifetime rebuild lost the installed snapshot"
+		);
+	}
+
+	/// DC-257 control (Codex 01a1e65d): the other publication origin. A snapshot BUILT and
+	/// published in this lifetime by the real builder, then a purge it covers, must survive a
+	/// recovery rebuild from the same, still-open log store, as it survives a reopen.
+	#[tokio::test]
+	async fn a_snapshot_built_and_purged_in_this_lifetime_survives_a_same_lifetime_recovery_rebuild()
+	 {
+		let dir = tempdir("dc257-build-purge");
+		let mut store = open_store(&dir).await;
+		let mut sm = store.recovered_state_machine().await.unwrap();
+		for (index, start) in [(1, 0), (2, 10), (3, 20)] {
+			append_and_apply(&mut store, &mut sm, lease_entry(index, start, start + 9, 3)).await;
+		}
+		let mut builder =
+			<WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::get_snapshot_builder(
+				&mut sm,
+			)
+			.await;
+		let built = builder.build_snapshot().await.unwrap();
+		let purged = store.purge(log_id(1, 2)).await;
+		eprintln!(
+			"DC-257 build+purge: snapshot boundary {:?}; purge through 2: {purged:?}",
+			built.meta.last_log_id
+		);
+		purged.unwrap();
+		checkpoint_as_hand_over(&store, &sm).await;
+		let rebuilt = rebuilt_view(&store, &[0, 10, 20], "build+purge").await;
+		drop(sm);
+		drop(store);
+		let reopened = open_store(&dir).await;
+		let state = reopened
+			.recovered_state_machine()
+			.await
+			.unwrap()
+			.state_snapshot()
+			.await;
+		eprintln!(
+			"DC-257 build+purge: reopened applied {:?}, leases present {:?}",
+			state.last_applied_log_id,
+			[0, 10, 20].map(|start| state.leases.contains_key(&start))
+		);
+		assert_eq!(state.last_applied_log_id, Some(log_id(1, 3)));
+		assert!(
+			[0, 10, 20]
+				.iter()
+				.all(|start| state.leases.contains_key(start))
+		);
+		assert_eq!(
+			rebuilt,
+			Ok((Some(log_id(1, 3)), vec![true, true, true])),
+			"the same-lifetime rebuild lost the published snapshot's prefix"
+		);
+	}
+
+	async fn open_parent_decisions_store(dir: &Path) -> WendelonLogStore {
+		let (wal, vote, snapshot) = artifact_paths(dir);
+		WendelonLogStore::open_with_file_ops_and_options(
+			&wal,
+			&vote,
+			&snapshot,
+			Arc::new(BlockingFileOps),
+			WalOptions {
+				decision_mode: DecisionMode::ParentDecisions,
+				..WalOptions::default()
+			},
+		)
+		.await
+		.unwrap()
+	}
+
+	/// DC-257 regression (Codex 01a1e65d): a replacement whose CURRENT start authority
+	/// (grant, Done replacement, promotion, activation, bound store; built by the reducers)
+	/// reaches its ParentDecisions store as a snapshot INSTALLED in this lifetime. The live
+	/// state and a reopen both pass `replacement_start_authority`, the check `hand_over` runs;
+	/// so must the state `hand_over` rebuilds with `recovered_state_machine` from the same,
+	/// still-open store after its checkpoint.
+	#[tokio::test]
+	async fn a_replacements_start_authority_installed_this_lifetime_survives_the_handoffs_rebuild()
+	{
+		use crate::consensus::decisions::replacement_start_authority;
+		let (mut authority, identity, birth, store) =
+			crate::consensus::decisions::tests::activated_replacement_for_test();
+		replacement_start_authority(&authority, identity, birth, store)
+			.expect("premise: the fixture's authority is current");
+		let boundary = authority
+			.last_applied_log_id
+			.map_or(1, |applied| applied.index)
+			.max(1);
+		authority.last_applied_log_id = Some(log_id(1, boundary));
+
+		// The source: a ParentDecisions state machine seeded with that state; the real builder.
+		let source_dir = tempdir("dc257-authority-source");
+		let source_store = open_parent_decisions_store(&source_dir).await;
+		let mut source_sm = source_store.recovered_state_machine().await.unwrap();
+		source_sm.inner.write().await.state = authority;
+		let mut builder =
+			<WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::get_snapshot_builder(
+				&mut source_sm,
+			)
+			.await;
+		let built = builder.build_snapshot().await.unwrap();
+
+		// The replacement's store: the real install path, then hand_over's checkpoint.
+		let target_dir = tempdir("dc257-authority-target");
+		let target_store = open_parent_decisions_store(&target_dir).await;
+		// A replacement's store holds its ControlOnly identity before any Raft object exists
+		// for it (`instance_startup.rs`), as here.
+		target_store
+			.write_identity(crate::consensus::decisions::instances::RaftIdentity {
+				role: crate::consensus::decisions::instances::Role::ControlOnly,
+				..identity
+			})
+			.await
+			.unwrap();
+		let mut target_sm = target_store.recovered_state_machine().await.unwrap();
+		<WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::install_snapshot(
+			&mut target_sm,
+			&built.meta,
+			built.snapshot,
+		)
+		.await
+		.unwrap();
+		let live = target_sm.state_snapshot().await;
+		let live_authority = replacement_start_authority(&live, identity, birth, store);
+		checkpoint_as_hand_over(&target_store, &target_sm).await;
+		let rebuilt = target_store
+			.recovered_state_machine()
+			.await
+			.unwrap()
+			.state_snapshot()
+			.await;
+		let rebuilt_authority = replacement_start_authority(&rebuilt, identity, birth, store);
+		drop(target_sm);
+		drop(target_store);
+		let reopened = open_parent_decisions_store(&target_dir)
+			.await
+			.recovered_state_machine()
+			.await
+			.unwrap()
+			.state_snapshot()
+			.await;
+		let reopened_authority = replacement_start_authority(&reopened, identity, birth, store);
+		eprintln!(
+			"DC-257 authority: snapshot boundary {:?}; live {:?} at {:?}; same-lifetime rebuild \
+			 {:?} at {:?}; reopened {:?} at {:?}",
+			built.meta.last_log_id,
+			live_authority,
+			live.last_applied_log_id,
+			rebuilt_authority,
+			rebuilt.last_applied_log_id,
+			reopened_authority,
+			reopened.last_applied_log_id
+		);
+		assert_eq!(live_authority, Ok(()));
+		assert_eq!(reopened_authority, Ok(()));
+		assert_eq!(
+			rebuilt_authority,
+			Ok(()),
+			"the handoff's same-lifetime rebuild lost the installed start authority"
+		);
+	}
+
+	/// ADR 0109: a loaded snapshot of `state` at `last`, for direct replay controls.
+	fn loaded_at(state: SmState, last: Option<LogId<u32>>) -> LoadedSnapshot {
+		LoadedSnapshot {
+			last_included: last,
+			held: HeldSnapshot {
+				meta: SnapshotMeta {
+					last_log_id: last,
+					last_membership: state.last_membership.clone(),
+					snapshot_id: "adr0109".into(),
+				},
+				path: PathBuf::new(),
+			},
+			state,
+			artifact_hash: [0; 32],
+			artifact_bytes: 0,
+		}
+	}
+
+	/// ADR 0109: the state a snapshot at index 2 holds (leases 0 and 10, applied 2).
+	fn state_through_two() -> SmState {
+		let mut state = SmState::default();
+		for entry in [lease_entry(1, 0, 9, 3), lease_entry(2, 10, 19, 3)] {
+			apply_entry_to_state(&mut state, &entry).unwrap();
+			state.last_applied_log_id = Some(entry.log_id);
+		}
+		state
+	}
+
+	fn checkpoint_at(commit_index: u64) -> Option<RecoveryCheckpoint> {
+		Some(RecoveryCheckpoint {
+			commit_index,
+			e_safe_index: 0,
+		})
+	}
+
+	/// ADR 0109 replay controls over `recover_sm_inner`, the rule every recovery shares:
+	/// - a covered retained entry is skipped, not replayed over the snapshot (the covered
+	///   entry here carries a range the snapshot lacks, so a replay would show);
+	/// - the suffix replays contiguously through the checkpoint, and nothing past it applies;
+	/// - a boundary gap, an interior gap and a tail short of the checkpoint each refuse;
+	/// - a snapshot alone recovers, with or without a checkpoint at its boundary; a checkpoint
+	///   behind the snapshot refuses;
+	/// - with no snapshot the start rule is open's: index 0 or 1, or any for a legacy start.
+	#[test]
+	fn recovery_replays_only_a_contiguous_suffix_through_the_checkpoint() {
+		use DecisionMode::Today;
+		let base = || Some(loaded_at(state_through_two(), Some(log_id(1, 2))));
+		let replay = |entries: Vec<Entry<WendelonTypeConfig>>, checkpoint, legacy| {
+			recover_sm_inner(Today, base(), entries, checkpoint, legacy)
+		};
+		// A covered prefix is retained (indices 1, 2), the second one differing from what
+		// the snapshot holds: it must not be applied.
+		let covered = lease_entry(2, 50, 59, 3);
+		let suffix = |through: u64| (3..=through).map(|i| lease_entry(i, 100 * i, 100 * i + 9, 3));
+		let mut entries = vec![lease_entry(1, 0, 9, 3), covered];
+		entries.extend(suffix(5));
+		let inner = replay(entries.clone(), checkpoint_at(4), false).unwrap();
+		assert_eq!(inner.state.last_applied_log_id, Some(log_id(1, 4)));
+		assert!(
+			!inner.state.leases.contains_key(&50),
+			"a covered entry was replayed"
+		);
+		assert!(inner.state.leases.contains_key(&0) && inner.state.leases.contains_key(&10));
+		assert!(inner.state.leases.contains_key(&300) && inner.state.leases.contains_key(&400));
+		assert!(
+			!inner.state.leases.contains_key(&500),
+			"an entry past the checkpoint applied"
+		);
+		// A boundary gap (no 3), an interior gap (no 4), a tail short of the checkpoint.
+		let without = |missing: u64| {
+			suffix(5)
+				.filter(move |entry| entry.log_id.index != missing)
+				.collect::<Vec<_>>()
+		};
+		for (entries, why) in [
+			(without(3), "boundary gap"),
+			(without(4), "interior gap"),
+			(suffix(4).collect(), "short of the checkpoint"),
+		] {
+			let refused = replay(entries, checkpoint_at(5), false);
+			assert!(
+				refused
+					.as_ref()
+					.is_err_and(|error| error.to_string().contains("recovery replay")),
+				"{why}: {:?}",
+				refused.map(|inner| inner.state.last_applied_log_id)
+			);
+		}
+		// A snapshot alone: no tail, a checkpoint at its boundary or none.
+		for checkpoint in [checkpoint_at(2), None] {
+			let inner = replay(Vec::new(), checkpoint, false).unwrap();
+			assert_eq!(inner.state.last_applied_log_id, Some(log_id(1, 2)));
+			assert!(inner.state.leases.contains_key(&10));
+		}
+		// No checkpoint: the tail is not applied, only the snapshot counts.
+		let inner = replay(suffix(5).collect(), None, false).unwrap();
+		assert_eq!(inner.state.last_applied_log_id, Some(log_id(1, 2)));
+		// A checkpoint behind the snapshot is refused.
+		assert!(replay(Vec::new(), checkpoint_at(1), false).is_err());
+		// No snapshot: open's start rule.
+		let from = |first: u64| {
+			(first..=first + 1)
+				.map(|i| lease_entry(i, 10 * i, 10 * i + 9, 3))
+				.collect::<Vec<_>>()
+		};
+		let none =
+			|entries, legacy| recover_sm_inner(Today, None, entries, checkpoint_at(8), legacy);
+		assert!(
+			none(from(7), false).is_err(),
+			"a mid-log start without a snapshot"
+		);
+		assert_eq!(
+			none(from(7), true).unwrap().state.last_applied_log_id,
+			Some(log_id(1, 8)),
+			"a legacy single-file start may begin anywhere"
+		);
+		let genesis = recover_sm_inner(
+			Today,
+			None,
+			(1..=3)
+				.map(|i| lease_entry(i, 10 * i, 10 * i + 9, 3))
+				.collect(),
+			checkpoint_at(3),
+			false,
+		)
+		.unwrap();
+		assert_eq!(genesis.state.last_applied_log_id, Some(log_id(1, 3)));
+		// An empty-state artifact (Artifact(None)) is a base too: a tail from 1 replays.
+		let empty = recover_sm_inner(
+			Today,
+			Some(loaded_at(SmState::default(), None)),
+			(1..=2)
+				.map(|i| lease_entry(i, 10 * i, 10 * i + 9, 3))
+				.collect(),
+			checkpoint_at(2),
+			false,
+		)
+		.unwrap();
+		assert_eq!(empty.state.last_applied_log_id, Some(log_id(1, 2)));
+	}
+
+	/// ADR 0109 (Codex 01a1e681 R1): the terminal index needs no successor. A snapshot-only
+	/// base at `u64::MAX` and a legacy replay ending at `u64::MAX` recover; an entry supplied
+	/// after it refuses instead of wrapping, and never re-enters the genesis exemption.
+	#[test]
+	fn recovery_at_the_terminal_index_needs_no_successor() {
+		use DecisionMode::Today;
+		let terminal = log_id(1, u64::MAX);
+		let blank = |index| Entry::<WendelonTypeConfig> {
+			log_id: log_id(1, index),
+			payload: EntryPayload::Blank,
+		};
+		let mut state = SmState::default();
+		state.last_applied_log_id = Some(terminal);
+		let inner = recover_sm_inner(
+			Today,
+			Some(loaded_at(state, Some(terminal))),
+			Vec::new(),
+			checkpoint_at(u64::MAX),
+			false,
+		)
+		.unwrap();
+		assert_eq!(inner.state.last_applied_log_id, Some(terminal));
+		let inner = recover_sm_inner(
+			Today,
+			None,
+			vec![blank(u64::MAX)],
+			checkpoint_at(u64::MAX),
+			true,
+		)
+		.unwrap();
+		assert_eq!(inner.state.last_applied_log_id, Some(terminal));
+		let wrapped = recover_sm_inner(
+			Today,
+			None,
+			vec![blank(u64::MAX), blank(0)],
+			checkpoint_at(u64::MAX),
+			true,
+		);
+		assert!(
+			wrapped
+				.as_ref()
+				.is_err_and(|error| error.to_string().contains("terminal index")),
+			"{:?}",
+			wrapped.map(|inner| inner.state.last_applied_log_id)
+		);
+	}
+
+	/// ADR 0109: a publication that moves between the rebuild's two observations refuses
+	/// the rebuild (driven by the test hold, not timing); the next rebuild takes the new base.
+	#[tokio::test]
+	async fn a_rebuild_refuses_a_publication_that_moves_while_it_reads() {
+		let dir = tempdir("adr0109-moved");
+		let mut store = open_store(&dir).await;
+		let mut sm = store.recovered_state_machine().await.unwrap();
+		append_and_apply(&mut store, &mut sm, lease_entry(1, 0, 9, 3)).await;
+		let mut builder =
+			<WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::get_snapshot_builder(
+				&mut sm,
+			)
+			.await;
+		builder.build_snapshot().await.unwrap();
+		append_and_apply(&mut store, &mut sm, lease_entry(2, 10, 19, 3)).await;
+		checkpoint_as_hand_over(&store, &sm).await;
+		let (entered, release) = store.pause_rebuild_after_observation_for_test();
+		let rebuilding = {
+			let store = store.clone();
+			tokio::spawn(async move { store.recovered_state_machine().await.map(|_| ()) })
+		};
+		entered.acquire().await.unwrap().forget();
+		// A newer snapshot is published while the rebuild is held.
+		let mut builder =
+			<WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::get_snapshot_builder(
+				&mut sm,
+			)
+			.await;
+		builder.build_snapshot().await.unwrap();
+		release.add_permits(1);
+		let refused = rebuilding.await.unwrap();
+		assert!(
+			refused
+				.as_ref()
+				.is_err_and(|error| error.kind() == ErrorKind::Interrupted),
+			"{refused:?}"
+		);
+		let state = store
+			.recovered_state_machine()
+			.await
+			.unwrap()
+			.state_snapshot()
+			.await;
+		assert_eq!(state.last_applied_log_id, Some(log_id(1, 2)));
+		assert!(state.leases.contains_key(&0) && state.leases.contains_key(&10));
+	}
+
+	/// ADR 0109: a failed publication refuses the rebuild even when the base open loaded is
+	/// otherwise usable, and a failure set while a rebuild reads refuses that rebuild too.
+	#[tokio::test]
+	async fn a_rebuild_refuses_a_failed_publication_even_with_a_usable_cached_base() {
+		let dir = tempdir("adr0109-failed");
+		{
+			let mut store = open_store(&dir).await;
+			let mut sm = store.recovered_state_machine().await.unwrap();
+			append_and_apply(&mut store, &mut sm, lease_entry(1, 0, 9, 3)).await;
+			let mut builder =
+				<WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::get_snapshot_builder(
+					&mut sm,
+				)
+				.await;
+			builder.build_snapshot().await.unwrap();
+		}
+		let store = open_store(&dir).await;
+		let usable = store
+			.recovered_state_machine()
+			.await
+			.unwrap()
+			.state_snapshot()
+			.await;
+		assert_eq!(
+			usable.last_applied_log_id,
+			Some(log_id(1, 1)),
+			"premise: the cached base"
+		);
+		let durable = *store.publication.state.lock().await;
+		let PublicationState::Healthy(durable) = durable else {
+			panic!("premise: healthy");
+		};
+		*store.publication.state.lock().await = PublicationState::Failed {
+			durable,
+			step: "adr0109 control",
+		};
+		assert!(store.recovered_state_machine().await.is_err());
+		// Healthy again, then failed while a rebuild is held between its observations.
+		*store.publication.state.lock().await = PublicationState::Healthy(durable);
+		let (entered, release) = store.pause_rebuild_after_observation_for_test();
+		let rebuilding = {
+			let store = store.clone();
+			tokio::spawn(async move { store.recovered_state_machine().await.map(|_| ()) })
+		};
+		entered.acquire().await.unwrap().forget();
+		*store.publication.state.lock().await = PublicationState::Failed {
+			durable,
+			step: "adr0109 control",
+		};
+		release.add_permits(1);
+		assert!(rebuilding.await.unwrap().is_err());
+	}
+
 	#[tokio::test]
 	async fn install_snapshot_rejects_full_identity_mismatch_before_publication() {
 		let source_dir = tempdir("snapshot-install-identity-source");
@@ -15820,6 +16582,7 @@ mod recovery_tests {
 			loaded,
 			entries,
 			checkpoint,
+			false,
 			SnapshotRuntime::ephemeral(),
 			recovery_metrics,
 		)
