@@ -9471,6 +9471,8 @@ fn adr077_data_server_source_concatenates_submodules() {
 			// ADR 542's durable outcome/replay wire is one named protocol seam;
 			// keep its framing and resolution state out of the bounded root.
 			"mutation_protocol.rs",
+			// Wendelon ADR 0105: a control-only member's typed refusals.
+			"not_serving.rs",
 			// ADR 629 keeps ownership registration and its test barriers out of the root.
 			"observation.rs",
 			// Data-directory ownership plumbing (store binding to the node's owner

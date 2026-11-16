@@ -1,4 +1,4 @@
-//! ADR 0105 (wendelon): the data-plane answers of a member that serves no data.
+//! ADR 0105 (wendelon): the data request answers of a member that serves no data.
 //!
 //! A control-only replacement (ADR 0104) holds no data, signs no client work and
 //! takes no lease. A request that reaches it anyway (a client routed to its

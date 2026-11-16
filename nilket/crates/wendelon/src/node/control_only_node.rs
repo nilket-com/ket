@@ -126,7 +126,7 @@ impl ControlOnlyNode {
 			WendelonRaftInternalServer::new(raft.clone(), pool.clone(), retention)
 				.with_decision_mode(cfg.decision_mode),
 		);
-		// ADR 0105 (wendelon): a data-plane request that reaches this member
+		// ADR 0105 (wendelon): a data request that reaches this member
 		// gets its family's typed refusal, never a dropped stream; nothing here
 		// serves, stores or acknowledges data.
 		let router = Arc::new(

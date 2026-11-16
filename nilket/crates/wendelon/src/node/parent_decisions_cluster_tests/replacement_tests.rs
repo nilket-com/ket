@@ -918,7 +918,7 @@ async fn exchange_with(
 		.map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "no answer"))?
 }
 
-/// ADR 0105 (wendelon), DC-246: a data-plane request that reaches a
+/// ADR 0105 (wendelon), DC-246: a data request that reaches a
 /// control-only member gets its family's typed refusal, not a dropped stream:
 /// a client's table write and query are told NOT_LEADER with no hint (the
 /// write's outcome unknown, its identity echoed, no position, clock or
