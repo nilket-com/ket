@@ -1118,6 +1118,24 @@ impl DecisionProposals {
 		}
 	}
 
+	/// DST stage 1 (Codex 01a1e61e): the recorded clock samples with their monotonic ages, as
+	/// the gate reads them. Read only: nothing here records, refreshes or removes a sample.
+	#[cfg(test)]
+	pub(crate) fn clock_samples_for_test(&self) -> Vec<(u32, u64, std::time::Duration)> {
+		self.clock_samples.aged()
+	}
+
+	/// DST stage 1 (Codex 01a1e607, 01a1e61e): the test-directed sampling entry. It is
+	/// [`Self::cut`] itself, the ordinary authenticated CUT whose `sent_ms` the leader records,
+	/// sent at a time the test chooses instead of after [`CLOCK_PROBE_INTERVAL`] of silence: a
+	/// recorded scheduling difference from [`Self::clock_probe_step`], nothing else. It sets
+	/// `last_sent` exactly as every round trip does; it never resets the cooldown or edits a
+	/// sample, and it is awaited, unlike the probe's detached task.
+	#[cfg(test)]
+	pub(crate) async fn test_directed_sample(&self) -> CutResponse {
+		self.cut().await
+	}
+
 	/// Waits, bounded, until this node has applied `index`.
 	pub(crate) async fn wait_applied(
 		&self,

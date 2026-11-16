@@ -138,6 +138,8 @@ pub(crate) struct RecoveryDriver {
 	pub(crate) progress: crate::network::data_server::certification::CertificationProgress,
 	/// The configured cluster retention policy (the frozen-policy check).
 	pub(crate) retention: crate::storage::retention::MvccRetentionPolicy,
+	/// The node's wall clock (`SystemClock` in production; the cluster's in a test).
+	pub(crate) clock: Arc<dyn crate::consensus::monitor::PhysicalClock>,
 }
 
 /// The applied facts one step works from.
@@ -408,9 +410,7 @@ impl RecoveryDriver {
 			build: Some(CandidateBuild {
 				repair: &repair,
 				retention: self.retention,
-				now_ms: std::time::SystemTime::now()
-					.duration_since(std::time::UNIX_EPOCH)
-					.map_or(0, |now| now.as_millis() as u64),
+				now_ms: self.clock.now_ms(),
 				// C5: prove inherited winners from this store's own data before
 				// signing for them.
 				reprove_inherited: true,

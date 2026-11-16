@@ -6788,6 +6788,10 @@ mod control_only;
 #[path = "parent_decisions_cluster_tests/replacement_tests.rs"]
 mod replacement;
 
+/// DST stage 1: the wall-time advancer and its protocol controls.
+#[path = "parent_decisions_cluster_tests/time_advance.rs"]
+mod time_advance;
+
 // ============================================================
 //  ADR 0720: MEMBERSHIP IS FIXED ONCE A WRITE IS ADMITTED
 // ============================================================
@@ -6912,4 +6916,158 @@ async fn a_join_after_the_first_write_is_refused_and_adds_no_member() {
 	for node in cluster.nodes {
 		let _ = tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown()).await;
 	}
+}
+
+/// DST stage 1 (Codex 01a1e607, 01a1e616 R2): a ParentDecisions cluster carrying one
+/// cluster's test time. Every member's existing maintenance owner and lease owner answer a
+/// requested pass (the same owner runs it; the answer is a pass begun after the request).
+/// A member closed with a maintenance request outstanding closes in order within its bound,
+/// and answers nothing after the close returned. Its lease owner has no stop branch: it ends
+/// when node shutdown aborts and joins it, so a lease request made after the close is never
+/// answered. Every remaining member shuts down in order within its bound, and only then is
+/// the cluster's abort latch checked, so an abort during shutdown is caught too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_clusters_pass_wakes_are_answered_by_their_own_owners_and_none_after_a_close() {
+	let time = crate::node::test_time::TestTime::new();
+	let mut cluster = {
+		let time = time.clone();
+		Cluster::start_with(move |_, cfg| {
+			cfg.test_time = Some(time.clone());
+			None
+		})
+		.await
+	};
+	let _ = cluster.leader().await;
+	let by = || tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+	for id in NODES {
+		let wakes = time.wakes(id);
+		let maintenance = wakes.maintenance.request();
+		let leases = wakes.leases.request();
+		wakes
+			.maintenance
+			.completed(maintenance, by())
+			.await
+			.unwrap_or_else(|why| panic!("node {id} maintenance: {why}"));
+		wakes
+			.leases
+			.completed(leases, by())
+			.await
+			.unwrap_or_else(|why| panic!("node {id} leases: {why}"));
+	}
+	let closing = NODES[2];
+	let wakes = time.wakes(closing);
+	let ticket = wakes.maintenance.request();
+	tokio::time::timeout(std::time::Duration::from_secs(60), cluster.close(closing))
+		.await
+		.expect("a requested pass never holds a close");
+	let answered_at_close = wakes.maintenance.answered(ticket);
+	let lease_after_close = wakes.leases.request();
+	assert!(
+		wakes
+			.leases
+			.completed(
+				lease_after_close,
+				tokio::time::Instant::now() + std::time::Duration::from_millis(500)
+			)
+			.await
+			.is_err(),
+		"a closed node's lease owner answered a request"
+	);
+	assert_eq!(
+		wakes.maintenance.answered(ticket),
+		answered_at_close,
+		"no pass is answered after the close returned"
+	);
+	for node in cluster.nodes.drain(..) {
+		let id = node.local_node.id;
+		tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown())
+			.await
+			.unwrap_or_else(|_| panic!("node {id} did not shut down within its bound"))
+			.unwrap_or_else(|error| panic!("node {id} shutdown: {error}"));
+	}
+	assert!(
+		time.abort.latched().is_empty(),
+		"{:?}",
+		time.abort.latched()
+	);
+}
+
+/// DST stage 1 (Codex 01a1e616 R2): with a stop and a wake BOTH ready at the maintenance
+/// owner's next `select!`, the stop wins. The owner is held right after a finished pass (the
+/// first request answered); the production stop signal is sent and seen; a second request is
+/// made; the owner is released: its task ends and the second request stays unanswered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_ready_stop_wins_over_a_ready_wake_at_the_maintenance_owner() {
+	let time = crate::node::test_time::TestTime::new();
+	let mut cluster = {
+		let time = time.clone();
+		Cluster::start_with(move |_, cfg| {
+			cfg.test_time = Some(time.clone());
+			None
+		})
+		.await
+	};
+	let _ = cluster.leader().await;
+	let id = NODES[2];
+	let wakes = time.wakes(id);
+	let (entered, release) = wakes.maintenance.hold_after_next_pass();
+	let first = wakes.maintenance.request();
+	tokio::time::timeout(std::time::Duration::from_secs(30), entered.acquire())
+		.await
+		.expect("the owner reached the hold after a pass")
+		.unwrap()
+		.forget();
+	assert!(
+		wakes.maintenance.answered(first),
+		"the held pass answered the first request"
+	);
+	let at = cluster
+		.nodes
+		.iter()
+		.position(|node| node.local_node.id == id)
+		.unwrap();
+	let mut stop = cluster.nodes[at].data_server.decision_maintenance_stop();
+	cluster.nodes[at].data_server.stop_decision_maintenance();
+	tokio::time::timeout(
+		std::time::Duration::from_secs(5),
+		stop.wait_for(|stopped| *stopped),
+	)
+	.await
+	.expect("the stop is visible")
+	.unwrap();
+	let second = wakes.maintenance.request();
+	release.add_permits(1);
+	let task_ended = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+		while !cluster.nodes[at]
+			.handles
+			.decision_maintenance
+			.as_ref()
+			.expect("the maintenance owner")
+			.is_finished()
+		{
+			tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+		}
+	})
+	.await;
+	assert!(
+		task_ended.is_ok(),
+		"the owner did not end after a ready stop"
+	);
+	assert!(
+		!wakes.maintenance.answered(second),
+		"a ready wake ran instead of the stop"
+	);
+	assert_eq!(wakes.maintenance.outstanding(), 1);
+	for node in cluster.nodes.drain(..) {
+		let id = node.local_node.id;
+		tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown())
+			.await
+			.unwrap_or_else(|_| panic!("node {id} did not shut down within its bound"))
+			.unwrap_or_else(|error| panic!("node {id} shutdown: {error}"));
+	}
+	assert!(
+		time.abort.latched().is_empty(),
+		"{:?}",
+		time.abort.latched()
+	);
 }

@@ -31,6 +31,8 @@ mod identity;
 mod instance_startup;
 mod replacement_preparation;
 pub(crate) mod replacement_recovery;
+#[cfg(test)]
+pub(crate) mod test_time;
 pub use control_only_node::ControlOnlyNode;
 
 /// Test-support only (wendelon ADR 0106): a stopped store's saved recovery
@@ -403,6 +405,10 @@ pub struct NodeBootstrapConfig {
 	pub(crate) startup_probe: Option<startup_ownership_tests::StartupProbe>,
 	#[cfg(test)]
 	pub(crate) startup_fault: Option<startup_ownership_tests::StartupFault>,
+	/// DST stage 1: the in-process cluster's wall clock, abort latch and pass wakes, shared by
+	/// every node and lifetime of that cluster. Tests only: production has no such field.
+	#[cfg(test)]
+	pub(crate) test_time: Option<test_time::TestTime>,
 	/// Numeric node id — also the openraft peer id. Must be unique
 	/// across the cluster; single-node genesis picks any u32.
 	pub node_id: u32,
@@ -569,6 +575,8 @@ impl NodeBootstrapConfig {
 			startup_probe: None,
 			#[cfg(test)]
 			startup_fault: None,
+			#[cfg(test)]
+			test_time: None,
 			node_id,
 			data_dir,
 			slab_max_bytes: 64 * 1024 * 1024,
@@ -1436,6 +1444,93 @@ impl DataRingLeaseTiming {
 		self.renew_interval
 	}
 }
+
+/// The node's wall clock: `SystemClock`, or in an in-process test the cluster's shared clock
+/// (DST stage 1). Every lifetime of a node reads it from the same configuration.
+pub(crate) fn node_clock(cfg: &NodeBootstrapConfig) -> Arc<dyn PhysicalClock> {
+	#[cfg(test)]
+	if let Some(time) = &cfg.test_time {
+		return time.clock.clone();
+	}
+	let _ = cfg;
+	Arc::new(SystemClock)
+}
+
+/// The node's abort: `ProcessAbort`, or in an in-process test the cluster's latch, which
+/// records and panics instead of ending the test process (DST stage 1).
+fn node_abort(cfg: &NodeBootstrapConfig) -> Arc<dyn AbortHandle> {
+	#[cfg(test)]
+	if let Some(time) = &cfg.test_time {
+		return time.abort.clone();
+	}
+	let _ = cfg;
+	Arc::new(ProcessAbort)
+}
+
+/// DST stage 1: a test's request for one more pass of an existing owner's work, consumed by
+/// that owner; nothing in a production build.
+#[cfg(test)]
+pub(crate) type PassWakeHandle = Option<Arc<test_time::PassWake>>;
+#[cfg(not(test))]
+pub(crate) type PassWakeHandle = ();
+
+#[cfg(test)]
+fn node_wakes(cfg: &NodeBootstrapConfig) -> (PassWakeHandle, PassWakeHandle) {
+	match &cfg.test_time {
+		Some(time) => {
+			let wakes = time.wakes(cfg.node_id);
+			(Some(wakes.maintenance.clone()), Some(wakes.leases.clone()))
+		}
+		None => (None, None),
+	}
+}
+#[cfg(not(test))]
+fn node_wakes(_: &NodeBootstrapConfig) -> (PassWakeHandle, PassWakeHandle) {
+	((), ())
+}
+
+/// Resolves when a pass is requested; never, in a production build.
+#[cfg(test)]
+pub(crate) async fn pass_requested(wake: &PassWakeHandle) {
+	match wake {
+		Some(wake) => wake.requested().await,
+		None => std::future::pending().await,
+	}
+}
+#[cfg(not(test))]
+pub(crate) async fn pass_requested(_: &PassWakeHandle) {
+	std::future::pending().await
+}
+
+/// What a pass answers, read when it begins.
+#[cfg(test)]
+pub(crate) fn pass_begin(wake: &PassWakeHandle) -> u64 {
+	wake.as_ref().map_or(0, |wake| wake.begin())
+}
+#[cfg(not(test))]
+pub(crate) fn pass_begin(_: &PassWakeHandle) -> u64 {
+	0
+}
+
+/// A pass begun with `begun` has ended.
+#[cfg(test)]
+pub(crate) fn pass_finish(wake: &PassWakeHandle, begun: u64) {
+	if let Some(wake) = wake {
+		wake.finish(begun);
+	}
+}
+#[cfg(not(test))]
+pub(crate) fn pass_finish(_: &PassWakeHandle, _: u64) {}
+
+/// After a finished pass: a test's armed hold, once; nothing in production.
+#[cfg(test)]
+async fn pass_after(wake: &PassWakeHandle) {
+	if let Some(wake) = wake {
+		wake.after_pass().await;
+	}
+}
+#[cfg(not(test))]
+async fn pass_after(_: &PassWakeHandle) {}
 
 // ============================================================
 //  BOOTSTRAP
@@ -2381,7 +2476,8 @@ impl WendelonNode {
 		// 6. Liveness tracker shared by the data-ring, the Raft
 		//    internal server, the drift monitor, and the eviction
 		//    watchdog.
-		let clock: Arc<dyn PhysicalClock> = Arc::new(SystemClock);
+		let clock: Arc<dyn PhysicalClock> = node_clock(&cfg);
+		let (maintenance_wake, lease_wake) = node_wakes(&cfg);
 		let hlc = Arc::new(HybridLogicalClockDriver::new(local_node, clock.clone()));
 		let tracker = Arc::new(NodeTracker::new(local_node, clock.clone()));
 		let audit_materialization = Arc::new(AuditMaterializationTracker::new());
@@ -2536,7 +2632,7 @@ impl WendelonNode {
 		scope.checkpoint(&cfg, "set_ring_updater").await?;
 
 		// 11. Drift monitor.
-		let abort: Arc<dyn AbortHandle> = Arc::new(ProcessAbort);
+		let abort: Arc<dyn AbortHandle> = node_abort(&cfg);
 		let drift_subscriber = Arc::new(FanoutClockDriftSubscriber::new(vec![
 			Arc::new(WatchClockDriftSubscriber::new(clock_drift_tx)),
 			Arc::new(AuditClockDriftSubscriber::new(audit_sink.clone())),
@@ -2702,11 +2798,15 @@ impl WendelonNode {
 							biased;
 							_ = stop.wait_for(|stopping| *stopping) => true,
 							_ = ticker.tick() => false,
+							// DST stage 1: a test's request for one more pass (never, in
+							// production); stop still wins.
+							_ = pass_requested(&maintenance_wake) => false,
 						};
 						if stopping {
 							probe.stop().await;
 							return;
 						}
+						let begun = pass_begin(&maintenance_wake);
 						// ADR 0700: keep this follower's clock sample fresh at
 						// the leader, whatever its readiness or the gate says.
 						proposals.clock_probe_step(&mut probe).await;
@@ -2740,6 +2840,8 @@ impl WendelonNode {
 						// sweep page, once the base is validated.
 						let _ = data_server.certified_cleanup_step().await;
 						let _ = data_server.debt_sweep_step().await;
+						pass_finish(&maintenance_wake, begun);
+						pass_after(&maintenance_wake).await;
 					}
 				}));
 		}
@@ -3081,12 +3183,13 @@ impl WendelonNode {
 		//     the write/read gates installed above can admit traffic.
 		scope
 			.handles()
-			.set_lease_manager(data_server.clone().spawn_lease_manager(
+			.set_lease_manager(data_server.clone().spawn_lease_manager_with_wake(
 				ring.clone(),
 				clock.clone(),
 				epoch_rx.clone(),
 				lease_timing.renew_interval(),
 				lease_timing.ttl_millis(),
+				lease_wake,
 			));
 		#[cfg(test)]
 		scope.checkpoint(&cfg, "set_lease_manager").await?;

@@ -602,3 +602,411 @@ async fn a_failed_preparation_task_ends_the_handoff_without_a_rewrite() {
 	);
 	assert_eq!(page_role(&cfg), Role::ControlOnly);
 }
+
+/// DST stage 1 pilot (Codex 01a1e607, 01a1e616, 01a1e61e, 01a1e637): the activation handoff
+/// above with the PRODUCTION decision expiry passed in real protocol, not by a floor shortcut.
+/// One cluster's test time (one forward-only wall clock, one abort latch) reaches every
+/// lifetime: the three Full nodes, the ControlOnly replacement (its preparation, recovery and
+/// certification path) and its Full starts. The wall clock moves only through
+/// `time_advance`'s restored steps (lease TTL, skew bound and E unchanged):
+///
+/// 1. rows 1 and 2, then wall time to their issue + E + 5 s: the floor passes them and
+///    generation 1 certifies;
+/// 2. row 3, the follower lost with its disk, a replacement begun, the ControlOnly instance
+///    promoted and its recovery recorded at (G, K), its activation gate CLOSED;
+/// 3. row 4 (the designated post-base write, its reservations recorded), then wall time to
+///    its issue + E + 5 s with the two survivors Full and the replacement owner-less;
+/// 4. still gated, a certificate past G whose observed target lists the replacement's
+///    current slot and incarnation, whose replacement report was applied between target and
+///    commit, and whose cut covers and erased row 4's reservations; no activation meanwhile;
+/// 5. the gate opens: the replacement activates at that certificate or an observed
+///    successor (the current one), as its recovered store, through a cut no lower than K;
+/// 6. it hands over, starts Full on the same directory and clock, serves exactly rows 1–4,
+///    and does again after a Full restart;
+/// 7. every node shuts down Ok, and only then is the latch read.
+///
+/// ONE absolute real deadline, [`PILOT_DEADLINE`], judges the whole scenario, setup to the
+/// last shutdown: every await is bounded by it and a success observed after it is refused.
+/// After a failure, cleanup is bounded separately, inside the owner's remaining cap.
+///
+/// Coverage limits: the handoff is the in-process `hand_over` and a Full `reopen`, not a
+/// daemon exiting 75 under a supervisor (the real-daemon and systemd records cover that, at
+/// their own trees); writes enter through the in-process `write_at` with identities minted on
+/// the shared wall clock, not through a public SDK client; the drift monitor gets no samples
+/// in this mode, so its absence of an abort is no drift coverage. Ignored: it runs once,
+/// under its launch ruling.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "DST stage 1 pilot: one execution under its launch ruling"]
+async fn dst_pilot_an_activation_after_the_production_expiry_on_an_advanced_clock() {
+	let real = std::time::Instant::now();
+	let deadline = tokio::time::Instant::now() + PILOT_DEADLINE;
+	let time = crate::node::test_time::TestTime::new();
+	let mut cluster = None;
+	let mut control = None;
+	let mut records = (
+		super::super::time_advance::Record::default(),
+		super::super::time_advance::Record::default(),
+	);
+	// The owning unit's cgroup, captured during the execution (Codex 01a1e648).
+	eprintln!(
+		"DST pilot cgroup: {}",
+		std::fs::read_to_string("/proc/self/cgroup")
+			.unwrap_or_else(|error| format!("unreadable: {error}"))
+	);
+	let mut gate = None;
+	let outcome = dst_pilot(
+		&time,
+		deadline,
+		&mut cluster,
+		&mut control,
+		&mut gate,
+		&mut records,
+	)
+	.await;
+	eprintln!(
+		"DST pilot: {:?} real; phase 1 {:?}; phase 2 {:?}",
+		real.elapsed(),
+		records.0,
+		records.1
+	);
+	if let Err(why) = outcome {
+		// Bounded cleanup after a failure, inside the owner's remaining cap; every outcome is
+		// recorded. The test-owned gate entry is removed.
+		if let Some(dir) = gate {
+			ACTIVATION_ENABLED.lock().unwrap().remove(&dir);
+			eprintln!("DST pilot cleanup: activation gate entry removed");
+		}
+		if let Some(control) = control {
+			let outcome = tokio::time::timeout(PILOT_CLEANUP, control.shutdown()).await;
+			eprintln!("DST pilot cleanup: the ControlOnly shutdown: {outcome:?}");
+		}
+		if let Some(cluster) = cluster {
+			for node in cluster.nodes {
+				let id = node.local_node.id;
+				let outcome = tokio::time::timeout(PILOT_CLEANUP, node.shutdown()).await;
+				eprintln!("DST pilot cleanup: node {id}'s shutdown: {outcome:?}");
+			}
+		}
+		panic!(
+			"DST pilot failed: {why}; latched {:?}",
+			time.abort.latched()
+		);
+	}
+	eprintln!(
+		"DST pilot passed within its deadline: {:?} real, explicit wall {} ms in {} steps, wall span {} ms",
+		real.elapsed(),
+		records.0.wall_advanced_ms + records.1.wall_advanced_ms,
+		records.0.steps + records.1.steps,
+		records.0.wall_span_ms + records.1.wall_span_ms
+	);
+}
+
+/// The pilot's one workflow deadline, setup to the last shutdown.
+const PILOT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(780);
+/// Each cleanup shutdown's bound after a failure (the owner caps the whole run at 900 s).
+const PILOT_CLEANUP: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// The reservations of the parent bodies in `leader`'s applied decision state.
+async fn body_reservations(cluster: &Cluster, leader: u32) -> std::collections::BTreeSet<u64> {
+	cluster
+		.node(leader)
+		.state_machine
+		.read_state(|state| {
+			state
+				.decisions
+				.as_ref()
+				.map(|decisions| decisions.bodies().keys().copied().collect())
+				.unwrap_or_default()
+		})
+		.await
+}
+
+fn check(holds: bool, what: impl FnOnce() -> String) -> Result<(), String> {
+	if holds { Ok(()) } else { Err(what()) }
+}
+
+async fn dst_pilot(
+	time: &crate::node::test_time::TestTime,
+	deadline: tokio::time::Instant,
+	cluster_slot: &mut Option<Cluster>,
+	control_slot: &mut Option<ControlOnlyNode>,
+	gate_slot: &mut Option<std::path::PathBuf>,
+	records: &mut (
+		super::super::time_advance::Record,
+		super::super::time_advance::Record,
+	),
+) -> Result<(), String> {
+	use super::super::time_advance::{self, advance_to, within};
+	use crate::consensus::decisions::DECISION_EXPIRY_MS;
+	let (cluster, leader, descriptor) = within(
+		deadline,
+		"cluster start",
+		ready_with({
+			let time = time.clone();
+			Cluster::start_with(move |_, cfg| {
+				cfg.test_time = Some(time.clone());
+				None
+			})
+		}),
+	)
+	.await?;
+	let cluster = cluster_slot.insert(cluster);
+	let lost = *NODES[1..].iter().find(|id| **id != leader).unwrap();
+	let issued = time.clock.now_ms();
+	within(
+		deadline,
+		"rows 1 and 2",
+		write_at(cluster, &descriptor, issued, &[(1, "a"), (2, "b")]),
+	)
+	.await?;
+	let all: std::collections::BTreeSet<u32> = NODES.into_iter().collect();
+	advance_to(
+		cluster,
+		time,
+		&all,
+		issued + DECISION_EXPIRY_MS + 5_000,
+		deadline,
+		&mut records.0,
+	)
+	.await
+	.map_err(|why| format!("phase 1: {why}"))?;
+	within(deadline, "generation 1", until_active(cluster, 1)).await?;
+	let issued = time.clock.now_ms();
+	within(
+		deadline,
+		"row 3",
+		write_at(cluster, &descriptor, issued, &[(3, "c")]),
+	)
+	.await?;
+	within(deadline, "the loss", cluster.stop(lost, true)).await?;
+	let cfg = cluster.configs[&lost].clone();
+	check(cfg.test_time.as_ref() == Some(time), || {
+		"the replacement does not share the cluster's time".to_owned()
+	})?;
+	lose_disk(&cfg.data_dir);
+	crate::crypto::test_support::enroll_root_artifact(
+		&cluster.configs[&NODES[0]].data_dir,
+		&cfg.data_dir,
+	)
+	.map_err(|error| format!("enrolment: {error}"))?;
+	let begun = within(
+		deadline,
+		"BeginReplacement",
+		decide(
+			cluster,
+			DecisionCommand::BeginReplacement {
+				token: TOKEN,
+				slot: lost,
+			},
+		),
+	)
+	.await?;
+	check(
+		matches!(begun, DecisionResult::ReplacementRecorded { .. }),
+		|| format!("BeginReplacement: {begun:?}"),
+	)?;
+	crate::node::provision_replacement_token(&cfg.data_dir, TOKEN)
+		.map_err(|error| format!("token: {error}"))?;
+	let started = within(
+		deadline,
+		"the ControlOnly start",
+		ControlOnlyNode::bootstrap_with_provider(cfg.clone(), provider(cluster, lost)),
+	)
+	.await?
+	.map_err(|error| format!("the ControlOnly start: {error}"))?;
+	let control = control_slot.insert(started);
+	// The activation gate stays CLOSED through recovery and the second expiry (Codex
+	// 01a1e648): a later generation must first certify with the replacement reporting.
+	let recorded = within(
+		deadline,
+		"the recovery record",
+		until_recorded(cluster, control),
+	)
+	.await?;
+	let store = within(deadline, "the recovery storage", control.recovery_storage())
+		.await?
+		.map_err(|error| format!("the recovery storage: {error}"))?
+		.persistent_index()
+		.ok_or("the recovery storage has no index")?
+		.store_incarnation();
+	let replacement = crate::consensus::decisions::Signer {
+		node: lost,
+		incarnation: store,
+	};
+	// The designated post-base write: its reservations, from the leader's applied bodies.
+	let leader = within(deadline, "the leader", cluster.leader()).await?;
+	records.1.scanned_through = within(deadline, "the view", time_advance::view(cluster, leader))
+		.await?
+		.applied;
+	let before = within(deadline, "the bodies", body_reservations(cluster, leader)).await?;
+	let issued = time.clock.now_ms();
+	within(
+		deadline,
+		"row 4",
+		write_at(cluster, &descriptor, issued, &[(4, "d")]),
+	)
+	.await?;
+	let after = within(deadline, "the bodies", body_reservations(cluster, leader)).await?;
+	let designated: Vec<u64> = after.difference(&before).copied().collect();
+	check(!designated.is_empty(), || {
+		"row 4 reserved no body".to_owned()
+	})?;
+	let survivors: std::collections::BTreeSet<u32> =
+		NODES.into_iter().filter(|id| *id != lost).collect();
+	advance_to(
+		cluster,
+		time,
+		&survivors,
+		issued + DECISION_EXPIRY_MS + 5_000,
+		deadline,
+		&mut records.1,
+	)
+	.await
+	.map_err(|why| format!("phase 2: {why}"))?;
+	// Still gated: wait for a certificate past the recovery's base, scanning every applied
+	// generation event, with no replacement activation recorded meanwhile.
+	let certificate = loop {
+		let leader = within(deadline, "the leader", cluster.leader()).await?;
+		let applied = within(deadline, "the view", time_advance::view(cluster, leader))
+			.await?
+			.applied;
+		time_advance::scan_generations(cluster, leader, &mut records.1, deadline, applied).await?;
+		let activated = within(
+			deadline,
+			"the activation record",
+			activation_record(cluster),
+		)
+		.await?;
+		check(activated.is_none(), || {
+			format!("a replacement activation while gated: {activated:?}")
+		})?;
+		let current = within(deadline, "the certificate", current_certificate(cluster)).await?;
+		// The covering certificate with its exact commit scanned (Codex 01a1e655 R1); an
+		// intermediate one, or a commit past the scan's mark, means keep polling, gated.
+		let scanned: Vec<_> = records
+			.1
+			.generations
+			.iter()
+			.map(|(event, _, _)| event.clone())
+			.collect();
+		if time_advance::covering_certificate_ready(
+			&scanned,
+			current.as_ref(),
+			recorded.gid,
+			&designated,
+		) {
+			break current.expect("a ready certificate");
+		}
+		check(tokio::time::Instant::now() < deadline, || {
+			format!(
+				"no certificate past gid {} covering {designated:?} with its commit scanned before \
+				 the deadline (current {current:?})",
+				recorded.gid
+			)
+		})?;
+		tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+	};
+	let events: Vec<_> = records
+		.1
+		.generations
+		.iter()
+		.map(|(event, _, _)| event.clone())
+		.collect();
+	let (target_at, report_at, commit_at) =
+		time_advance::certified_with(&events, &certificate, replacement, &designated)?;
+	let erased = within(deadline, "the bodies", body_reservations(cluster, leader)).await?;
+	check(designated.iter().all(|rsv| !erased.contains(rsv)), || {
+		format!("designated reservations {designated:?} not erased by the commit")
+	})?;
+	let seen = records
+		.1
+		.generations
+		.iter()
+		.find(|(event, _, _)| {
+			matches!(event, time_advance::GenerationEvent::Commit { gid, index }
+				if *gid == certificate.gid && *index == certificate.committed_at)
+		})
+		.map(|(_, steps, at)| (*steps, *at));
+	eprintln!(
+		"DST pilot certificate: gid {} t {} committed_at {} (target {target_at}, replacement report {report_at}, commit {commit_at}); replacement {replacement:?}; designated {designated:?}; recovery G {} K {}; seen after phase-2 step {:?} (steps, real since its scan began)",
+		certificate.gid, certificate.t, certificate.committed_at, recorded.gid, recorded.k, seen
+	);
+	// Now the gate opens; the activation must be at that certificate or an observed successor.
+	*gate_slot = Some(cfg.data_dir.clone());
+	ACTIVATION_ENABLED
+		.lock()
+		.unwrap()
+		.insert(cfg.data_dir.clone());
+	within(deadline, "the activation", until_activated(control)).await?;
+	let activation = within(
+		deadline,
+		"the activation record",
+		activation_record(cluster),
+	)
+	.await?
+	.ok_or("no activation record")?;
+	let current = within(deadline, "the certificate", current_certificate(cluster))
+		.await?
+		.map(|certificate| certificate.gid);
+	check(activation.incarnation == store, || {
+		format!(
+			"activated {:?}, recovered {store:?}",
+			activation.incarnation
+		)
+	})?;
+	check(activation.through >= recorded.k, || {
+		format!(
+			"activation through {} below K {}",
+			activation.through, recorded.k
+		)
+	})?;
+	check(activation.certified >= certificate.gid, || {
+		format!(
+			"activation at gid {}, before the evidenced certificate {}",
+			activation.certified, certificate.gid
+		)
+	})?;
+	check(Some(activation.certified) == current, || {
+		format!(
+			"activation at {}, current {current:?}",
+			activation.certified
+		)
+	})?;
+	ACTIVATION_ENABLED.lock().unwrap().remove(&cfg.data_dir);
+	*gate_slot = None;
+	let control = control_slot.take().expect("the ControlOnly instance");
+	within(deadline, "the handoff", control.hand_over())
+		.await?
+		.map_err(|error| format!("the handoff: {error}"))?;
+	check(page_role(&cfg) == Role::Full, || {
+		"the page is not Full".to_owned()
+	})?;
+	let expected = rows(&[(1, "a"), (2, "b"), (3, "c"), (4, "d")]);
+	for start in ["the Full start", "the Full restart"] {
+		if start == "the Full restart" {
+			within(deadline, "the Full stop", cluster.stop(lost, false)).await?;
+		}
+		within(deadline, start, cluster.reopen(lost)).await?;
+		within(deadline, start, until_ready_as(cluster, lost, store)).await?;
+		let read = within(
+			deadline,
+			start,
+			cluster.read_once_validated(lost, &descriptor),
+		)
+		.await?;
+		check(read == expected, || format!("{start}: read {read:?}"))?;
+	}
+	let cluster = cluster_slot.take().expect("the cluster");
+	for node in cluster.nodes {
+		let id = node.local_node.id;
+		within(deadline, &format!("node {id}'s shutdown"), node.shutdown())
+			.await?
+			.map_err(|error| format!("node {id}'s shutdown: {error}"))?;
+	}
+	let latched = time.abort.latched();
+	check(latched.is_empty(), || {
+		format!("the abort latched: {latched:?}")
+	})?;
+	// The whole judged scenario, observed within its one deadline.
+	within(deadline, "the pilot", async {}).await
+}

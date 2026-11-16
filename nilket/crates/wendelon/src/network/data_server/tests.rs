@@ -92,7 +92,7 @@ async fn lease_refresh_schedule_seeds_once_then_waits_for_the_derived_deadline()
 	let refreshes = Arc::new(AtomicU64::new(0));
 	let observed = refreshes.clone();
 	let task = tokio::spawn(async move {
-		run_lease_refresh_schedule(&mut epoch_rx, Duration::from_secs(10), || {
+		lease_refresh_schedule_without_wake(&mut epoch_rx, Duration::from_secs(10), || {
 			let observed = observed.clone();
 			async move {
 				observed.fetch_add(1, Ordering::SeqCst);
@@ -117,7 +117,7 @@ async fn lease_refresh_schedule_epoch_change_supersedes_the_old_timer_deadline()
 	let refreshes = Arc::new(AtomicU64::new(0));
 	let observed = refreshes.clone();
 	let task = tokio::spawn(async move {
-		run_lease_refresh_schedule(&mut epoch_rx, Duration::from_secs(10), || {
+		lease_refresh_schedule_without_wake(&mut epoch_rx, Duration::from_secs(10), || {
 			let observed = observed.clone();
 			async move {
 				observed.fetch_add(1, Ordering::SeqCst);
@@ -147,7 +147,7 @@ async fn lease_refresh_schedule_delays_missed_ticks_and_stops_when_watch_closes(
 	let refreshes = Arc::new(AtomicU64::new(0));
 	let observed = refreshes.clone();
 	let task = tokio::spawn(async move {
-		run_lease_refresh_schedule(&mut epoch_rx, Duration::from_secs(10), || {
+		lease_refresh_schedule_without_wake(&mut epoch_rx, Duration::from_secs(10), || {
 			let observed = observed.clone();
 			async move {
 				observed.fetch_add(1, Ordering::SeqCst);

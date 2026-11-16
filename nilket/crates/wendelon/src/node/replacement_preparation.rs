@@ -241,6 +241,7 @@ impl Preparation {
 			self.pause().await;
 		};
 		let driver = super::replacement_recovery::RecoveryDriver {
+			clock: super::node_clock(&self.cfg),
 			slot: self.slot,
 			instance: self.instance,
 			state_machine: self.state_machine.clone(),
@@ -576,10 +577,10 @@ impl Preparation {
 		.await
 		.ok_or_else(|| Error::other("no leader slot"))?;
 		let meta = postcard::to_stdvec(&ProposeRequest {
-			sent_ms: std::time::SystemTime::now()
-				.duration_since(std::time::UNIX_EPOCH)
-				.map(|now| now.as_millis() as u64)
-				.unwrap_or(0),
+			// The leader records this as this voter's clock sample: read from the node's
+			// clock, as a Full node's proposals are (DST stage 1; `SystemClock` in production,
+			// which also reads 0 before the epoch).
+			sent_ms: super::node_clock(&self.cfg).now_ms(),
 			request: request.clone(),
 		})
 		.map_err(Error::other)?;

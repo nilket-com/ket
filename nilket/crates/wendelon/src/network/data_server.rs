@@ -3870,12 +3870,25 @@ impl WendelonDataServer {
 		self: Arc<Self>,
 		ring: Arc<RingRouter>,
 		clock: Arc<dyn PhysicalClock>,
-		mut epoch_rx: watch::Receiver<Arc<MembershipEpoch>>,
+		epoch_rx: watch::Receiver<Arc<MembershipEpoch>>,
 		tick: Duration,
 		ttl_ms: u32,
 	) -> JoinHandle<()> {
+		self.spawn_lease_manager_with_wake(ring, clock, epoch_rx, tick, ttl_ms, Default::default())
+	}
+
+	/// `spawn_lease_manager`, with a test's pass wake (DST stage 1; nothing in production).
+	pub(crate) fn spawn_lease_manager_with_wake(
+		self: Arc<Self>,
+		ring: Arc<RingRouter>,
+		clock: Arc<dyn PhysicalClock>,
+		mut epoch_rx: watch::Receiver<Arc<MembershipEpoch>>,
+		tick: Duration,
+		ttl_ms: u32,
+		wake: crate::node::PassWakeHandle,
+	) -> JoinHandle<()> {
 		tokio::spawn(async move {
-			run_lease_refresh_schedule(&mut epoch_rx, tick, || {
+			run_lease_refresh_schedule(&mut epoch_rx, tick, &wake, || {
 				let server = self.clone();
 				let ring = ring.clone();
 				let clock = clock.clone();
@@ -6746,9 +6759,28 @@ impl WendelonDataServer {
 	}
 }
 
+/// The schedule with no test wake, for its existing schedule tests. Named apart from the
+/// production schedule so the ADR 080 rule reads the production body.
+#[cfg(test)]
+async fn lease_refresh_schedule_without_wake<F, Fut>(
+	epoch_rx: &mut watch::Receiver<Arc<MembershipEpoch>>,
+	tick: Duration,
+	refresh: F,
+) where
+	F: FnMut() -> Fut,
+	Fut: Future<Output = ()>,
+{
+	run_lease_refresh_schedule(epoch_rx, tick, &Default::default(), refresh).await;
+}
+
+/// The lease refresh schedule; `wake` is a test's request for one more refresh pass (DST
+/// stage 1), consumed here by the same owner, never in a production build. This owner has NO
+/// stop branch: it ends when its epoch watch closes (checked first, biased) or when node
+/// shutdown aborts and joins its handle, so a wake never outlives either (Codex 01a1e616 R2).
 async fn run_lease_refresh_schedule<F, Fut>(
 	epoch_rx: &mut watch::Receiver<Arc<MembershipEpoch>>,
 	tick: Duration,
+	wake: &crate::node::PassWakeHandle,
 	mut refresh: F,
 ) where
 	F: FnMut() -> Fut,
@@ -6757,7 +6789,9 @@ async fn run_lease_refresh_schedule<F, Fut>(
 	// Seed once immediately. `interval()` would also produce an
 	// immediately-ready first tick, duplicating this authoritative
 	// Raft renewal at startup (ADR 080).
+	let begun = crate::node::pass_begin(wake);
 	refresh().await;
+	crate::node::pass_finish(wake, begun);
 	let deadline = tokio::time::sleep(tick);
 	tokio::pin!(deadline);
 	loop {
@@ -6769,8 +6803,11 @@ async fn run_lease_refresh_schedule<F, Fut>(
 				}
 			}
 			_ = &mut deadline => {}
+			_ = crate::node::pass_requested(wake) => {}
 		}
+		let begun = crate::node::pass_begin(wake);
 		refresh().await;
+		crate::node::pass_finish(wake, begun);
 		// A refresh caused by an epoch change supersedes the prior
 		// timer deadline; a delayed runtime likewise schedules from
 		// completion instead of bursting missed renewals.

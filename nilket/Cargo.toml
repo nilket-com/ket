@@ -39,3 +39,14 @@ opt-level = 3
 
 [profile.dev.package.salsa20]
 opt-level = 3
+
+# Test builds verify every granted lease's Ed25519 signature; unoptimised, a follower's renewal
+# pass of ~40 leases spent ~200 ms there (DST stage 1, an inference from diagnostics). These two
+# packages compile optimised in development and test builds, repository-wide (Codex 01a1e637).
+# Debug assertions and overflow checks stay the dev profile's. Code generation for every other
+# package is unchanged.
+[profile.dev.package.ed25519-dalek]
+opt-level = 3
+
+[profile.dev.package.curve25519-dalek]
+opt-level = 3
