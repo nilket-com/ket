@@ -191,6 +191,7 @@ fn reserve_tcp_port() -> u16 {
 		.port()
 }
 
+#[derive(Clone)]
 struct Pki {
 	node_ca: PathBuf,
 	operator_ca: PathBuf,
@@ -322,6 +323,7 @@ impl StoreEnv {
 	}
 }
 
+#[derive(Clone)]
 struct Member {
 	id: u32,
 	config: PathBuf,
@@ -373,6 +375,18 @@ fn node_control_call(
 	argument: Option<&std::ffi::OsStr>,
 	bound: Duration,
 ) -> (bool, Vec<u8>, String) {
+	let arguments: Vec<std::ffi::OsString> = argument.into_iter().map(Into::into).collect();
+	node_control_call_with(control, verb, id, &arguments, bound)
+}
+
+/// `node_control_call` with any number of arguments after the node id.
+fn node_control_call_with(
+	control: &Path,
+	verb: &str,
+	id: u32,
+	arguments: &[std::ffi::OsString],
+	bound: Duration,
+) -> (bool, Vec<u8>, String) {
 	let mut command = Command::new(control);
 	command.arg(verb).arg(id.to_string());
 	let cluster = *NODE_CONTROL_CLUSTER
@@ -381,9 +395,7 @@ fn node_control_call(
 	if !cluster.is_empty() {
 		command.env("PD_CLUSTER", cluster);
 	}
-	if let Some(argument) = argument {
-		command.arg(argument);
-	}
+	command.args(arguments);
 	let mut child = command
 		.stdin(Stdio::null())
 		.stdout(Stdio::piped())
@@ -647,9 +659,20 @@ impl Daemons {
 	}
 
 	/// Wendelon ADR 0108: the exit status of node `id`'s own process if it has ended (reaped,
-	/// and no longer counted as running), or `None` while it runs. One host only.
-	fn ended(&mut self, id: u32) -> Option<std::process::ExitStatus> {
-		assert!(node_control().is_none(), "one host only");
+	/// and no longer counted as running), or `None` while it runs. On other hosts the unit's
+	/// last execution is read once (`exit-status`) and must be `owned`, the execution this test
+	/// started: another one, or a read that is not whole, fails the step.
+	fn ended(&mut self, id: u32, owned: &str) -> Option<std::process::ExitStatus> {
+		if let Some(control) = node_control() {
+			assert!(self.hosted.contains(&id), "node {id} is not running");
+			let (ok, stdout, raw) =
+				node_control_call(&control, "exit-status", id, None, CONTROL_BOUND);
+			assert!(ok, "node {id}: its execution could not be read: {raw}");
+			let status = owned_end(&String::from_utf8_lossy(&stdout), owned)
+				.unwrap_or_else(|why| panic!("node {id}: {why}"))?;
+			self.hosted.retain(|node| *node != id);
+			return Some(status);
+		}
 		let at = self
 			.children
 			.iter()
@@ -660,9 +683,18 @@ impl Daemons {
 		Some(status)
 	}
 
-	/// A daemon other than `id` that should be running and is not. One host only.
+	/// A daemon other than `id` that should be running and is not.
 	fn exited_except(&mut self, id: u32) -> Option<String> {
-		assert!(node_control().is_none(), "one host only");
+		if let Some(control) = node_control() {
+			for node in self.hosted.iter().filter(|node| **node != id) {
+				let (ok, stdout, raw) =
+					node_control_call(&control, "state", *node, None, CONTROL_BOUND);
+				if !ok || String::from_utf8_lossy(&stdout).trim() != "running" {
+					return Some(format!("node {node} is not running: {raw}"));
+				}
+			}
+			return None;
+		}
 		for (node, child) in &mut self.children {
 			if *node == id {
 				continue;
@@ -672,6 +704,141 @@ impl Daemons {
 			}
 		}
 		None
+	}
+
+	/// Starts node `member` and returns the identity of the execution started, read once right
+	/// after the start whether or not it still runs (on other hosts `start` prints it).
+	fn start_identified(&mut self, member: &Member) -> String {
+		if let Some(control) = node_control() {
+			let (ok, stdout, raw) =
+				node_control_call(&control, "start", member.id, None, CONTROL_BOUND);
+			assert!(ok, "{raw}");
+			self.hosted.push(member.id);
+			return parse_identity(String::from_utf8_lossy(&stdout).trim_end_matches('\n'))
+				.unwrap_or_else(|why| panic!("node {}: {why}", member.id));
+		}
+		self.start(member);
+		self.identity(member.id)
+	}
+
+	/// Other hosts only: one call of `verb` for node `id` within the step's absolute deadline
+	/// `by` (Codex 01a1e49d R3): the wrapper gets only the time left before `by`, and an answer
+	/// observed after it is refused, whatever it says.
+	fn hosted_call(
+		&self,
+		verb: &str,
+		id: u32,
+		arguments: &[std::ffi::OsString],
+		by: Instant,
+	) -> (Vec<u8>, String) {
+		let control = node_control().expect("other hosts only");
+		let left = by.saturating_duration_since(Instant::now());
+		assert!(!left.is_zero(), "node {id}: no time left for {verb}");
+		let (ok, stdout, raw) = node_control_call_with(&control, verb, id, arguments, left);
+		answered_within(Instant::now(), by)
+			.unwrap_or_else(|why| panic!("node {id}: {verb} {why}: {raw}"));
+		assert!(ok, "node {id}: {verb}: {raw}");
+		(stdout, raw)
+	}
+
+	/// Other hosts: node `id`'s data directory set aside as `old-data` (kept whole), a new one
+	/// holding only the cluster's sealed root copied on that host; within `CONTROL_BOUND`.
+	fn lose(&self, id: u32, deadline: Instant) {
+		let by = deadline.min(Instant::now() + CONTROL_BOUND);
+		self.hosted_call("lose", id, &[], by);
+	}
+
+	/// Other hosts: the blank start's directory set aside, and a new one as `lose` makes.
+	fn blank_aside(&self, id: u32, deadline: Instant) {
+		let by = deadline.min(Instant::now() + CONTROL_BOUND);
+		self.hosted_call("blank-aside", id, &[], by);
+	}
+
+	/// Other hosts: one start of node `id`'s daemon from its configuration within the step's
+	/// deadline `by`: its unit gets the whole seconds left (at most 60) and the call the time
+	/// left; its output before the result, the result, and the raw call text.
+	fn run_once(&self, id: u32, by: Instant) -> (String, OneOff, String) {
+		let seconds = phase_seconds(by, Instant::now(), 60)
+			.unwrap_or_else(|why| panic!("node {id}: run-once: {why}"));
+		let (stdout, raw) = self.hosted_call("run-once", id, &[seconds.to_string().into()], by);
+		let (before, result) = parse_one_off(&String::from_utf8_lossy(&stdout))
+			.unwrap_or_else(|why| panic!("node {id}: run-once: {why}; the whole call: {raw}"));
+		(before, result, raw)
+	}
+
+	/// Other hosts: `replace provision` into node `id`'s data directory, on its host, within
+	/// the step's deadline `by` (its unit gets the whole seconds left, at most 45).
+	fn provision(&self, id: u32, token: u128, by: Instant) -> String {
+		let seconds = phase_seconds(by, Instant::now(), REPLACE_COMMAND_BOUND.as_secs())
+			.unwrap_or_else(|why| panic!("node {id}: provision: {why}"));
+		let (stdout, raw) = self.hosted_call(
+			"provision",
+			id,
+			&[format!("{token:032x}").into(), seconds.to_string().into()],
+			by,
+		);
+		let (_, result) = parse_one_off(&String::from_utf8_lossy(&stdout))
+			.unwrap_or_else(|why| panic!("node {id}: provision: {why}; the whole call: {raw}"));
+		assert_eq!(result, OneOff::Exit(0), "node {id}: provision: {raw}");
+		raw
+	}
+
+	/// Other hosts: node `id`'s STOPPED store, read in place on its host by this run's pinned
+	/// test binary (`hosted_store_probe`), whole or refused, within `by`.
+	fn probe(&self, id: u32, descriptor: Option<&TableSchemaDescriptor>, by: Instant) -> Probed {
+		let argument = descriptor.map(|descriptor| {
+			base64_of(&serde_json::to_vec(descriptor).expect("the descriptor as JSON"))
+		});
+		let kind = if descriptor.is_some() {
+			"recovered"
+		} else {
+			"role"
+		};
+		let control = node_control().expect("other hosts only");
+		let mut command_arguments = vec![std::ffi::OsString::from(kind)];
+		command_arguments.extend(argument.map(std::ffi::OsString::from));
+		let left = by.saturating_duration_since(Instant::now());
+		assert!(
+			!left.is_zero(),
+			"node {id}: no time left for the store probe"
+		);
+		let (ok, stdout, raw) = node_control_call_with(
+			&control,
+			"store-probe",
+			id,
+			&command_arguments,
+			left.min(PROBE_UNIT_BOUND + CONTROL_BOUND),
+		);
+		answered_within(Instant::now(), by)
+			.unwrap_or_else(|why| panic!("node {id}: the store probe {why}: {raw}"));
+		assert!(ok, "node {id}: store-probe {kind}: {raw}");
+		probe_answer(&stdout, &raw)
+			.unwrap_or_else(|why| panic!("node {id}: store-probe {kind}: {why}"))
+	}
+
+	/// Other hosts: the old instance of node `id` started on its old disk (`old-data`) under
+	/// the node's unit; the identity of that execution.
+	fn start_old(&mut self, id: u32) -> String {
+		let control = node_control().expect("other hosts only");
+		let (ok, stdout, raw) = node_control_call(&control, "start-old", id, None, CONTROL_BOUND);
+		assert!(ok, "node {id}: start-old: {raw}");
+		self.hosted.push(id);
+		parse_identity(String::from_utf8_lossy(&stdout).trim_end_matches('\n'))
+			.unwrap_or_else(|why| panic!("node {id}: {why}"))
+	}
+
+	/// Other hosts: the old instance's log, whole.
+	fn old_log(&self, id: u32) -> String {
+		let control = node_control().expect("other hosts only");
+		let (ok, stdout, raw) = node_control_call(
+			&control,
+			"log",
+			id,
+			Some(std::ffi::OsStr::new("old")),
+			CONTROL_BOUND,
+		);
+		assert!(ok, "node {id}: the old instance's log: {raw}");
+		String::from_utf8_lossy(&stdout).into_owned()
 	}
 
 	/// A daemon that should be running and is not, with what is known of why.
@@ -5312,6 +5479,10 @@ const SERVING_BOUND: Duration = Duration::from_secs(120);
 /// to complete its handoff and exit with the restart-request status.
 const HANDOFF_EXIT_BOUND: Duration = Duration::from_secs(60);
 
+/// Three hosts: the stopped-store probe's own unit bound on the node's host (the controller's
+/// `store-probe`, RuntimeMaxSec 60).
+const PROBE_UNIT_BOUND: Duration = Duration::from_secs(60);
+
 /// Wendelon ADR 0108: the status a ControlOnly process exits with once its handoff completed
 /// (`wendelon::cli::ACTIVATION_RESTART_EXIT`, `EX_TEMPFAIL`), asking its supervisor to start
 /// it again.
@@ -5451,8 +5622,8 @@ impl ReplacementExit {
 		if let Some(why) = daemons.exited_except(self.id) {
 			panic!("{before}: {why}");
 		}
-		let id = self.id;
-		if let Err(why) = self.record(|| daemons.ended(id), Instant::now) {
+		let (id, owned) = (self.id, self.identity.clone());
+		if let Err(why) = self.record(|| daemons.ended(id, &owned), Instant::now) {
 			panic!("{before}: {why}");
 		}
 	}
@@ -5470,6 +5641,416 @@ impl ReplacementExit {
 			.map_err(|why| format!("the ControlOnly process ({}) {why}", self.identity))?;
 		Ok((status, self.identity))
 	}
+}
+
+/// Three-host replacement (Codex 01a1e48d): one hosted execution as `exit-status` reports it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum HostedExecution {
+	Running {
+		identity: String,
+	},
+	/// `code` is the unit's ExecMainCode: 1 an exit (status its code), 2 a signal (status its
+	/// number).
+	Ended {
+		identity: String,
+		code: u8,
+		status: i32,
+		result: String,
+	},
+}
+
+impl HostedExecution {
+	fn identity(&self) -> &str {
+		match self {
+			Self::Running { identity } | Self::Ended { identity, .. } => identity,
+		}
+	}
+
+	/// An ended execution as a process status, only from a coherent unit record (Codex 01a1e49d
+	/// R2): an exit (code 1) with status 0 to 255 and result `exit-code` (or `success` for 0),
+	/// or a signal (code 2) with a signal number 1 to 64 and result `signal` or `core-dump`.
+	/// Anything else (a timeout, an unknown result, a status out of range) is an error, never
+	/// normalized into an exit.
+	fn status(&self) -> Result<Option<std::process::ExitStatus>, String> {
+		use std::os::unix::process::ExitStatusExt;
+		match self {
+			Self::Running { .. } => Ok(None),
+			Self::Ended {
+				code: 1,
+				status,
+				result,
+				..
+			} if (0..=255).contains(status)
+				&& (result == "exit-code" || (*status == 0 && result == "success")) =>
+			{
+				Ok(Some(std::process::ExitStatus::from_raw(status << 8)))
+			}
+			Self::Ended {
+				code: 2,
+				status,
+				result,
+				..
+			} if (1..=64).contains(status) && (result == "signal" || result == "core-dump") => {
+				Ok(Some(std::process::ExitStatus::from_raw(*status)))
+			}
+			Self::Ended {
+				code,
+				status,
+				result,
+				..
+			} => Err(format!(
+				"an incoherent end: code {code} status {status} result {result}"
+			)),
+		}
+	}
+}
+
+/// Standard base64 with padding (the controller decodes it with `base64 -d`).
+fn base64_of(bytes: &[u8]) -> String {
+	const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+	let mut text = String::with_capacity(bytes.len().div_ceil(3) * 4);
+	for chunk in bytes.chunks(3) {
+		let word = (u32::from(chunk[0]) << 16)
+			| (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
+			| u32::from(*chunk.get(2).unwrap_or(&0));
+		for at in 0..4 {
+			if at <= chunk.len() {
+				text.push(ALPHABET[((word >> (18 - 6 * at)) & 63) as usize] as char);
+			} else {
+				text.push('=');
+			}
+		}
+	}
+	text
+}
+
+/// `pid <n> started <t>`, both nonzero whole numbers, and nothing else.
+fn parse_identity(text: &str) -> Result<String, String> {
+	let fields: Vec<&str> = text.split(' ').collect();
+	match fields.as_slice() {
+		["pid", pid, "started", at]
+			if [pid, at]
+				.iter()
+				.all(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()) && **v != "0") =>
+		{
+			Ok(text.to_owned())
+		}
+		_ => Err(format!("not an execution identity: {text:?}")),
+	}
+}
+
+/// The ONE line `exit-status` prints, whole or refused: `running <identity>` or `ended
+/// <identity> code <1|2> status <n> result <word>`. Anything else (another line, a missing or
+/// extra field, a code other than 1 or 2) is refused: a missing status is never an end.
+fn parse_exit_status(stdout: &str) -> Result<HostedExecution, String> {
+	let lines: Vec<&str> = stdout.lines().collect();
+	let [line] = lines.as_slice() else {
+		return Err(format!("not one line: {stdout:?}"));
+	};
+	let fields: Vec<&str> = line.split(' ').collect();
+	match fields.as_slice() {
+		["running", rest @ ..] if rest.len() == 4 => Ok(HostedExecution::Running {
+			identity: parse_identity(&rest.join(" "))?,
+		}),
+		[
+			"ended",
+			p,
+			pid,
+			s,
+			at,
+			"code",
+			code,
+			"status",
+			status,
+			"result",
+			result,
+		] if !result.is_empty() => {
+			let identity = parse_identity(&[*p, pid, s, at].join(" "))?;
+			let code = match *code {
+				"1" => 1,
+				"2" => 2,
+				other => return Err(format!("an unknown end code {other}: {line:?}")),
+			};
+			// Canonical decimal only: digits, no sign, no leading zero, at most three digits.
+			let canonical = !status.is_empty()
+				&& status.len() <= 3
+				&& status.bytes().all(|b| b.is_ascii_digit())
+				&& (*status == "0" || !status.starts_with('0'));
+			let status = canonical
+				.then(|| status.parse::<i32>().ok())
+				.flatten()
+				.ok_or_else(|| format!("not a status: {line:?}"))?;
+			Ok(HostedExecution::Ended {
+				identity,
+				code,
+				status,
+				result: (*result).to_owned(),
+			})
+		}
+		_ => Err(format!("not an execution: {line:?}")),
+	}
+}
+
+/// The end of the execution `owned` from one `exit-status` answer: `None` while it runs, its
+/// status once it ended. Another execution (running or ended) or an answer that is not whole
+/// is an error: it is never taken for the owned one's end.
+fn owned_end(stdout: &str, owned: &str) -> Result<Option<std::process::ExitStatus>, String> {
+	let execution = parse_exit_status(stdout)?;
+	if execution.identity() != owned {
+		return Err(format!(
+			"the unit's execution ({}) is not the one this test started ({owned})",
+			execution.identity()
+		));
+	}
+	execution.status()
+}
+
+/// Three hosts (Codex 01a1e49d R3): the whole seconds a one-off unit may run before the step's
+/// deadline `by`, at most `most`. Less than one whole second left is an error: an expired
+/// budget is never rounded up to start work.
+fn phase_seconds(by: Instant, now: Instant, most: u64) -> Result<u64, String> {
+	let left = by.saturating_duration_since(now).as_secs().min(most);
+	(left >= 1)
+		.then_some(left)
+		.ok_or_else(|| "less than one second is left of its step".to_owned())
+}
+
+/// An answer observed at `observed` counts only when that is not after the step's deadline.
+fn answered_within(observed: Instant, by: Instant) -> Result<(), String> {
+	(observed <= by)
+		.then_some(())
+		.ok_or_else(|| "answered only after its step's deadline".to_owned())
+}
+
+/// How a one-off unit (`run-once`, `provision`, `store-probe`) ended, read from the unit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OneOff {
+	Exit(i32),
+	Signal(i32),
+	Timeout,
+}
+
+/// A one-off's stdout: everything before its ONE `RESULT` line, which must be the last line,
+/// and that result. Refused when there is no such line, more than one, or one not last.
+fn parse_one_off(stdout: &str) -> Result<(String, OneOff), String> {
+	let lines: Vec<&str> = stdout.lines().collect();
+	let results = lines
+		.iter()
+		.filter(|line| line.starts_with("RESULT "))
+		.count();
+	let Some((last, before)) = lines.split_last() else {
+		return Err("no output".to_owned());
+	};
+	if results != 1 || !last.starts_with("RESULT ") {
+		return Err(format!("not exactly one RESULT line, last: {stdout:?}"));
+	}
+	let number = |text: &str| {
+		text.parse::<i32>()
+			.ok()
+			.filter(|n| *n >= 0)
+			.ok_or_else(|| format!("not a number in {last:?}"))
+	};
+	let result = match last.split(' ').collect::<Vec<_>>().as_slice() {
+		["RESULT", "exit", n] => OneOff::Exit(number(n)?),
+		["RESULT", "signal", n] => OneOff::Signal(number(n)?),
+		["RESULT", "timeout"] => OneOff::Timeout,
+		_ => return Err(format!("not a result: {last:?}")),
+	};
+	Ok((before.join("\n"), result))
+}
+
+/// Wendelon ADR 0106/0108, three hosts: what the stopped-store probe read ON the node's host.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Probed {
+	/// `role`: the vote page's (instance, control-only), or none.
+	role: Option<(u32, bool)>,
+	/// `recovered`: what the store holds of its recovery.
+	recovered: Option<RecoveredSummary>,
+}
+
+/// `wendelon::node::RecoveredRowsForTest` as the oracle reads it: the saved statement (token
+/// and store as 32 hex digits), the Complete children, each verification failure and the rows.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecoveredSummary {
+	saved: Option<(String, u32, String, u64, u64)>,
+	complete_children: usize,
+	unverified: Vec<String>,
+	rows: Vec<(i64, String)>,
+	active_gid: u64,
+}
+
+impl RecoveredSummary {
+	fn of(found: &wendelon::node::RecoveredRowsForTest) -> Self {
+		Self {
+			saved: found.saved.map(|(token, instance, store, gid, k)| {
+				(
+					format!("{token:032x}"),
+					instance,
+					format!("{store:032x}"),
+					gid,
+					k,
+				)
+			}),
+			complete_children: found.complete_children,
+			unverified: found.unverified.clone(),
+			rows: held_rows(&found.rows),
+			active_gid: found.active_gid,
+		}
+	}
+}
+
+/// The probe's stdout, whole or refused: exactly one `PROBE <json>` line whose JSON is a
+/// `Probed` with no unknown or missing field, and a `RESULT exit 0` last.
+/// The probe's answer from one call's stdout. Any refusal carries the WHOLE call text `raw`
+/// (the call's status, stdout and stderr): the probe's own panic goes to stderr under
+/// `--nocapture`, and a failure reported from stdout alone lost its cause once (RESULT-03).
+fn probe_answer(stdout: &[u8], raw: &str) -> Result<Probed, String> {
+	parse_probe(&String::from_utf8_lossy(stdout))
+		.map_err(|why| format!("{why}; the whole call: {raw}"))
+}
+
+fn parse_probe(stdout: &str) -> Result<Probed, String> {
+	let (before, result) = parse_one_off(stdout)?;
+	if result != OneOff::Exit(0) {
+		return Err(format!("the probe ended {result:?}: {stdout:?}"));
+	}
+	let probes: Vec<&str> = before
+		.lines()
+		.filter_map(|line| line.strip_prefix("PROBE "))
+		.collect();
+	let [json] = probes.as_slice() else {
+		return Err(format!("not exactly one PROBE line: {stdout:?}"));
+	};
+	// Every field present, null or not: serde would read a missing `Option` as `None`, and a
+	// missing answer is never an absent one.
+	let value: serde_json::Value =
+		serde_json::from_str(json).map_err(|error| format!("the PROBE line: {error}: {json:?}"))?;
+	let exactly = |value: &serde_json::Value, fields: &[&str], what: &str| {
+		let keys: Vec<&str> = value
+			.as_object()
+			.map(|object| object.keys().map(String::as_str).collect())
+			.unwrap_or_default();
+		let mut wanted = fields.to_vec();
+		wanted.sort_unstable();
+		(keys == wanted)
+			.then_some(())
+			.ok_or_else(|| format!("{what} has fields {keys:?}, not {wanted:?}: {json:?}"))
+	};
+	exactly(&value, &["recovered", "role"], "the probe")?;
+	if !value["recovered"].is_null() {
+		exactly(
+			&value["recovered"],
+			&[
+				"active_gid",
+				"complete_children",
+				"rows",
+				"saved",
+				"unverified",
+			],
+			"the recovered probe",
+		)?;
+	}
+	serde_json::from_value(value).map_err(|error| format!("the PROBE line: {error}: {json:?}"))
+}
+
+/// Wendelon ADR 0108, three hosts (Codex 01a1e48d point 6): the old instance's baseline
+/// objects, listed before it returns, are all still listed after it stopped. Only those two
+/// endpoints are observed: a deletion and re-creation in between, or changed bytes, are not.
+/// A missing baseline object fails; objects added in between are the caller's record.
+fn baseline_still_listed(
+	baseline: &std::collections::BTreeSet<String>,
+	after: &[(String, u64)],
+) -> Result<(), String> {
+	let listed: std::collections::BTreeSet<&str> =
+		after.iter().map(|(key, _)| key.as_str()).collect();
+	let missing: Vec<&String> = baseline
+		.iter()
+		.filter(|key| !listed.contains(key.as_str()))
+		.collect();
+	if !missing.is_empty() {
+		return Err(format!("baseline objects no longer listed: {missing:?}"));
+	}
+	Ok(())
+}
+
+/// The run's object keys owned by (`node`, `incarnation`), the incarnation as 32 hex digits.
+fn keys_of_owner(objects: &[(String, u64)], node: u32, incarnation: &str) -> Vec<String> {
+	let owner = format!("{node:08x}-{incarnation}");
+	objects
+		.iter()
+		.filter(|(key, _)| key.rsplit('/').nth(1) == Some(owner.as_str()))
+		.map(|(key, _)| key.clone())
+		.collect()
+}
+
+/// The incarnations (32 hex digits) of `node`'s objects in a listing.
+fn incarnations_of(objects: &[(String, u64)], node: u32) -> std::collections::BTreeSet<String> {
+	let prefix = format!("{node:08x}-");
+	objects
+		.iter()
+		.filter_map(|(key, _)| key.rsplit('/').nth(1))
+		.filter_map(|owner| owner.strip_prefix(prefix.as_str()))
+		.filter(|incarnation| {
+			incarnation.len() == 32 && incarnation.bytes().all(|b| b.is_ascii_hexdigit())
+		})
+		.map(str::to_owned)
+		.collect()
+}
+
+/// Three hosts (Codex 01a1e48d): the stopped-store probe, run ON a node's host by the run's
+/// pinned test binary through the controller's `store-probe` (never by a person, never on a
+/// running node). `PD_PROBE` is `role` or `recovered`; `PD_PROBE_CONFIG` is the node's own
+/// configuration (its data directory and object store, as the node reads them);
+/// `PD_PROBE_DESCRIPTOR` the table's descriptor as JSON for `recovered`. The store is opened in
+/// place as the one-host oracle opens it (`stored_raft_role_for_test`, `recovered_rows_for_test`,
+/// under its own directory owner, closed again) and ONE `PROBE <json>` line is printed. It holds
+/// no key material: statement fields, counts, verification failures and the rows. It is not a
+/// product interface.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "run only by the three-host controller's store-probe, on a stopped node's host"]
+async fn hosted_store_probe() {
+	let kind = required("PD_PROBE");
+	let config = PathBuf::from(std::env::var_os("PD_PROBE_CONFIG").unwrap_or_default());
+	let probed = match kind.as_str() {
+		"role" => {
+			let data_dir = wendelon::config::load_node_bootstrap_config(&config)
+				.unwrap_or_else(|error| panic!("the configuration: {error}"))
+				.data_dir;
+			Probed {
+				role: wendelon::consensus::stored_raft_role_for_test(&data_dir)
+					.unwrap_or_else(|error| panic!("the vote page: {error}")),
+				recovered: None,
+			}
+		}
+		"recovered" => {
+			let descriptor: TableSchemaDescriptor = serde_json::from_slice(
+				&std::fs::read(required("PD_PROBE_DESCRIPTOR"))
+					.unwrap_or_else(|error| panic!("the descriptor: {error}")),
+			)
+			.unwrap_or_else(|error| panic!("the descriptor: {error}"));
+			let found = wendelon::node::recovered_rows_for_test(&config, &descriptor)
+				.await
+				.unwrap_or_else(|error| panic!("the stopped store could not be read: {error}"));
+			Probed {
+				role: None,
+				recovered: Some(RecoveredSummary::of(&found)),
+			}
+		}
+		// The envelope alone, for the control that reads this binary's real libtest output.
+		"envelope" => Probed {
+			role: None,
+			recovered: None,
+		},
+		other => panic!("PD_PROBE is {other:?}, not role or recovered"),
+	};
+	// libtest has already printed `test hosted_store_probe ... ` with no line end (Codex
+	// 01a1e49d R1): the envelope starts a line of its own.
+	println!(
+		"\nPROBE {}",
+		serde_json::to_string(&probed).expect("the probe as JSON")
+	);
 }
 
 /// Wendelon ADR 0108: the (id, name) rows of `batches`, sorted (duplicates kept), refusing a
@@ -5526,6 +6107,318 @@ fn direct_answer_verdict(
 			}
 		}
 	}
+}
+
+/// Three hosts (Codex 01a1e48d point 3): an `exit-status` answer counts only whole and only
+/// for the execution this test started; a 75 seen early, a signal, a missing or partial result
+/// and another execution are told apart. The kept end's timing is `ReplacementExit`'s (above).
+#[test]
+fn a_hosted_end_is_read_whole_and_only_for_the_owned_execution() {
+	let owned = "pid 41 started 900";
+	assert_eq!(owned_end("running pid 41 started 900\n", owned), Ok(None));
+	let early = owned_end(
+		"ended pid 41 started 900 code 1 status 75 result exit-code\n",
+		owned,
+	)
+	.unwrap()
+	.unwrap();
+	assert_eq!(early.code(), Some(ACTIVATION_RESTART_EXIT));
+	assert!(
+		restart_request(
+			early,
+			Instant::now(),
+			Instant::now() + Duration::from_secs(1)
+		)
+		.is_ok()
+	);
+	let killed = owned_end(
+		"ended pid 41 started 900 code 2 status 9 result signal\n",
+		owned,
+	)
+	.unwrap()
+	.unwrap();
+	assert_eq!(
+		(
+			killed.code(),
+			std::os::unix::process::ExitStatusExt::signal(&killed)
+		),
+		(None, Some(9))
+	);
+	assert!(
+		restart_request(
+			killed,
+			Instant::now(),
+			Instant::now() + Duration::from_secs(1)
+		)
+		.is_err()
+	);
+	let other = owned_end(
+		"ended pid 41 started 901 code 1 status 75 result exit-code\n",
+		owned,
+	);
+	assert!(other.unwrap_err().contains("not the one this test started"));
+	assert!(owned_end("running pid 42 started 900\n", owned).is_err());
+	for refused in [
+		"",
+		"ended pid 41 started 900 code 1 status 75\n",
+		"ended pid 41 started 900 code 3 status 75 result exit-code\n",
+		"ended pid 41 started 900 code 1 status x result exit-code\n",
+		"ended pid 41 started 900 code 1 status 75 result exit-code\nrunning pid 41 started 900\n",
+		"ended pid 0 started 900 code 1 status 75 result exit-code\n",
+		"running pid 41 started\n",
+		"unit fields incomplete\n",
+	] {
+		assert!(owned_end(refused, owned).is_err(), "{refused:?}");
+	}
+	assert_eq!(
+		parse_identity("pid 7 started 8"),
+		Ok("pid 7 started 8".to_owned())
+	);
+	for refused in [
+		"pid 7 started",
+		"pid 0 started 8",
+		"pid 7 started 8 x",
+		"pid x started 8",
+	] {
+		assert!(parse_identity(refused).is_err(), "{refused:?}");
+	}
+}
+
+/// Three hosts (Codex 01a1e49d R1): the probe's envelope as THIS binary's real libtest prints
+/// it under the controller's arguments, with the controller's RESULT line after it, is read
+/// whole. No store is opened (`PD_PROBE=envelope`).
+#[test]
+fn the_real_probe_output_is_read_as_one_envelope() {
+	let ran = Command::new(std::env::current_exe().expect("this test binary"))
+		.args([
+			"hosted_store_probe",
+			"--exact",
+			"--ignored",
+			"--nocapture",
+			"--test-threads",
+			"1",
+		])
+		.env("PD_PROBE", "envelope")
+		.env_remove("PD_PROBE_CONFIG")
+		.stdin(Stdio::null())
+		.output()
+		.expect("run this binary's probe");
+	assert!(ran.status.success(), "{ran:?}");
+	let stdout = String::from_utf8(ran.stdout).unwrap();
+	assert!(
+		stdout.contains("test hosted_store_probe ... \nPROBE "),
+		"the layout changed: {stdout:?}"
+	);
+	assert_eq!(
+		parse_probe(&format!("{stdout}RESULT exit 0\n")),
+		Ok(Probed {
+			role: None,
+			recovered: None
+		}),
+		"{stdout:?}"
+	);
+}
+
+/// Three hosts (Codex 01a1e49d R2): only a coherent `exit-code` record with status 75 is a
+/// restart request; an out-of-range or non-canonical status, a timeout or another result with
+/// status 75, and a signal are not.
+#[test]
+fn only_a_coherent_exit_75_is_a_restart_request() {
+	let owned = "pid 41 started 900";
+	let request = |line: &str| -> Result<(), String> {
+		let status = owned_end(line, owned)?.ok_or("still running")?;
+		restart_request(
+			status,
+			Instant::now(),
+			Instant::now() + Duration::from_secs(1),
+		)
+	};
+	assert_eq!(
+		request("ended pid 41 started 900 code 1 status 75 result exit-code\n"),
+		Ok(())
+	);
+	for refused in [
+		"ended pid 41 started 900 code 1 status 331 result exit-code\n",
+		"ended pid 41 started 900 code 1 status 75 result timeout\n",
+		"ended pid 41 started 900 code 1 status 75 result success\n",
+		"ended pid 41 started 900 code 1 status 75 result oom-kill\n",
+		"ended pid 41 started 900 code 1 status 075 result exit-code\n",
+		"ended pid 41 started 900 code 1 status +75 result exit-code\n",
+		"ended pid 41 started 900 code 2 status 75 result signal\n",
+		"ended pid 41 started 900 code 2 status 9 result signal\n",
+		"ended pid 41 started 900 code 2 status 9 result exit-code\n",
+		"ended pid 41 started 900 code 1 status 1 result exit-code\n",
+	] {
+		assert!(request(refused).is_err(), "{refused:?}");
+	}
+	// The ordinary ends stay what they are (not requests): exit 1, exit 0, SIGKILL.
+	let exit1 = owned_end(
+		"ended pid 41 started 900 code 1 status 1 result exit-code\n",
+		owned,
+	)
+	.unwrap()
+	.unwrap();
+	assert_eq!(exit1.code(), Some(1));
+	let exit0 = owned_end(
+		"ended pid 41 started 900 code 1 status 0 result success\n",
+		owned,
+	)
+	.unwrap()
+	.unwrap();
+	assert_eq!(exit0.code(), Some(0));
+	let killed = owned_end(
+		"ended pid 41 started 900 code 2 status 9 result signal\n",
+		owned,
+	)
+	.unwrap()
+	.unwrap();
+	assert_eq!(
+		std::os::unix::process::ExitStatusExt::signal(&killed),
+		Some(9)
+	);
+}
+
+/// Three hosts (Codex 01a1e49d R3): a step's unit gets only the whole seconds left of the
+/// step (never rounded up from less than one), and an answer observed after the step's
+/// deadline is refused.
+#[test]
+fn a_hosted_step_gets_only_its_own_time_and_refuses_a_late_answer() {
+	let now = Instant::now();
+	assert_eq!(
+		phase_seconds(now + Duration::from_millis(10_700), now, 45),
+		Ok(10)
+	);
+	assert_eq!(
+		phase_seconds(now + Duration::from_secs(100), now, 45),
+		Ok(45)
+	);
+	assert!(phase_seconds(now + Duration::from_millis(900), now, 45).is_err());
+	assert!(phase_seconds(now, now, 45).is_err());
+	assert!(phase_seconds(now, now + Duration::from_secs(1), 45).is_err());
+	let by = now + Duration::from_secs(60);
+	assert_eq!(answered_within(by, by), Ok(()));
+	assert!(answered_within(by + Duration::from_millis(1), by).is_err());
+}
+
+/// Three hosts: a one-off's RESULT is its one last line; a probe is one strict PROBE line with
+/// a RESULT exit 0; a timeout is never an exit.
+/// RESULT-03: a failed probe keeps its whole call text, so the panic its process wrote to
+/// stderr is in the refusal. A nonzero RESULT, a missing envelope, a malformed one and a
+/// timeout are each refused with the stderr sentinel, the stdout and the RESULT line.
+#[test]
+fn a_failed_probe_keeps_its_whole_call_diagnostic() {
+	let sentinel = "SENTINEL-the-probe-panicked-here";
+	let cases = [
+		"\nrunning 1 test\ntest hosted_store_probe ... FAILED\n\nRESULT exit 101\n",
+		"\nrunning 1 test\ntest hosted_store_probe ... ok\nRESULT exit 0\n",
+		"\nrunning 1 test\ntest hosted_store_probe ... \nPROBE {\"role\":\nok\nRESULT exit 0\n",
+		"\nrunning 1 test\nRESULT timeout\n",
+	];
+	for stdout in cases {
+		// The call text as node_control_call_with writes it.
+		let raw = format!(
+			"node-control store-probe 3: exit Some(0); stdout: {}; stderr: thread 'hosted_store_probe' panicked: {sentinel}",
+			stdout.trim()
+		);
+		let why = probe_answer(stdout.as_bytes(), &raw).expect_err(stdout);
+		assert!(why.contains(sentinel), "{why}");
+		let result = stdout.trim().lines().last().unwrap();
+		assert!(why.contains(result), "{why}");
+		assert!(why.contains("running 1 test"), "{why}");
+	}
+}
+
+#[test]
+fn a_hosted_one_off_and_probe_are_read_whole_or_refused() {
+	assert_eq!(
+		parse_one_off("refused: x\nRESULT exit 1\n"),
+		Ok(("refused: x".to_owned(), OneOff::Exit(1)))
+	);
+	assert_eq!(
+		parse_one_off("RESULT timeout\n").unwrap().1,
+		OneOff::Timeout
+	);
+	assert_eq!(
+		parse_one_off("RESULT signal 9\n").unwrap().1,
+		OneOff::Signal(9)
+	);
+	for refused in [
+		"",
+		"out\n",
+		"RESULT exit 1\nmore\n",
+		"RESULT exit 1\nRESULT exit 0\n",
+		"RESULT exit\n",
+		"RESULT exit -1\n",
+		"RESULT done\n",
+	] {
+		assert!(parse_one_off(refused).is_err(), "{refused:?}");
+	}
+	let probed = Probed {
+		role: Some((FIRST_ALLOCATED, false)),
+		recovered: None,
+	};
+	let line = format!(
+		"running 1 test\nPROBE {}\ntest hosted_store_probe ... ok\nRESULT exit 0\n",
+		serde_json::to_string(&probed).unwrap()
+	);
+	assert_eq!(parse_probe(&line), Ok(probed.clone()));
+	let json = serde_json::to_string(&probed).unwrap();
+	for refused in [
+		format!("PROBE {json}\nRESULT exit 101\n"),
+		format!("PROBE {json}\nPROBE {json}\nRESULT exit 0\n"),
+		"RESULT exit 0\n".to_owned(),
+		"PROBE {\"role\":null}\nRESULT exit 0\n".to_owned(),
+		"PROBE {\"role\":null,\"recovered\":null,\"extra\":1}\nRESULT exit 0\n".to_owned(),
+		"PROBE {\"role\":null,\"recovered\":{\"complete_children\":0,\"unverified\":[],\"rows\":[],\"active_gid\":0}}\nRESULT exit 0\n".to_owned(),
+		format!("PROBE {json}\nRESULT timeout\n"),
+	] {
+		assert!(parse_probe(&refused).is_err(), "{refused:?}");
+	}
+	assert_eq!(base64_of(b""), "");
+	assert_eq!(base64_of(b"f"), "Zg==");
+	assert_eq!(base64_of(b"fo"), "Zm8=");
+	assert_eq!(base64_of(b"foo"), "Zm9v");
+	assert_eq!(
+		base64_of(b"{\"table_object_id\":7}"),
+		"eyJ0YWJsZV9vYmplY3RfaWQiOjd9"
+	);
+}
+
+/// Three hosts (Codex 01a1e48d point 6): the old instance's baseline objects at two endpoints,
+/// and the owner keys they are found by.
+#[test]
+fn an_old_instances_baseline_objects_are_checked_at_both_endpoints() {
+	let i = "0123456789abcdef0123456789abcdef";
+	let j = "fedcba9876543210fedcba9876543210";
+	let key = |node: u32, incarnation: &str, slab: u32| {
+		(
+			format!("pd-smoke/x/{node:08x}-{incarnation}/slab_{slab:016x}_00.wnd"),
+			1_u64,
+		)
+	};
+	let listing = vec![key(3, i, 1), key(3, i, 2), key(3, j, 3), key(2, i, 1)];
+	assert_eq!(
+		incarnations_of(&listing, 3),
+		[i.to_owned(), j.to_owned()].into_iter().collect()
+	);
+	let baseline: std::collections::BTreeSet<String> =
+		keys_of_owner(&listing, 3, i).into_iter().collect();
+	assert_eq!(baseline.len(), 2);
+	assert_eq!(baseline_still_listed(&baseline, &listing), Ok(()));
+	let mut more = listing.clone();
+	more.push(key(3, i, 9));
+	assert_eq!(baseline_still_listed(&baseline, &more), Ok(()));
+	let fewer = vec![key(3, i, 1), key(3, j, 3)];
+	assert!(
+		baseline_still_listed(&baseline, &fewer)
+			.unwrap_err()
+			.contains("no longer listed")
+	);
+	assert_eq!(keys_of_owner(&listing, 3, j).len(), 1);
+	assert_eq!(
+		owner_and_slab(&key(3, j, 3).0),
+		Some((3, "0000000000000003"))
+	);
 }
 
 /// Wendelon ADR 0108 (Codex 01a1e471 R1, R2): the replacement's expected end. A restart request
@@ -5741,7 +6634,7 @@ async fn inspect_recovered(
 	config: &Path,
 	descriptor: &TableSchemaDescriptor,
 	by: Instant,
-) -> wendelon::node::RecoveredRowsForTest {
+) -> RecoveredSummary {
 	let config = config.to_path_buf();
 	let descriptor = descriptor.clone();
 	let mut read =
@@ -5757,7 +6650,7 @@ async fn inspect_recovered(
 				Instant::now() <= by,
 				"the stopped store was read after its bound"
 			);
-			found
+			RecoveredSummary::of(&found)
 		}
 		Err(_) => panic!("the stopped store was not read within its bound"),
 	}
@@ -5767,14 +6660,20 @@ async fn inspect_recovered(
 /// every Complete child verifies from its stored rows, and the rows read from the slab are
 /// exactly `expected`, one copy each.
 fn expect_recovered(
-	found: &wendelon::node::RecoveredRowsForTest,
+	found: &RecoveredSummary,
 	(token, store, recovered): (u128, u128, (u64, u64)),
 	expected: &[(i64, String)],
 	what: &str,
 ) {
 	assert_eq!(
 		found.saved,
-		Some((token, FIRST_ALLOCATED, store, recovered.0, recovered.1)),
+		Some((
+			format!("{token:032x}"),
+			FIRST_ALLOCATED,
+			format!("{store:032x}"),
+			recovered.0,
+			recovered.1
+		)),
 		"{what}: the statement saved on its store is the recorded one"
 	);
 	assert!(
@@ -5782,7 +6681,7 @@ fn expect_recovered(
 		"{what}: children fail the stored-row verification: {:?}",
 		found.unverified
 	);
-	let held = held_rows(&found.rows);
+	let held = found.rows.clone();
 	let mut wanted = expected.to_vec();
 	wanted.sort();
 	assert_eq!(
@@ -6978,4 +7877,758 @@ async fn three_daemons_replace_a_lost_follower_with_a_control_only_instance() {
 	);
 	assert!(Instant::now() < deadline, "the test overran its bound");
 	std::fs::remove_dir_all(&root).unwrap();
+}
+
+/// Three hosts: the hosted replacement workflow's whole bound (Codex 01a1e48d: 900 s, in a
+/// 1080 s test unit, with node units of 1200 s).
+const REPLACEMENT_HOSTED_TEST_BOUND: Duration = Duration::from_secs(900);
+/// Three hosts: the consensus timing base this workflow requires to be declared and written on
+/// every node (heartbeat 250, election 750-1500, snapshot chunk 1000): the profile of the earlier
+/// three-host runs. It is not a product default.
+const REPLACEMENT_HOSTED_BASE_MILLIS: u64 = 250;
+
+/// The run's whole object listing within `by`, or the step fails: never partial.
+async fn listed(objects: &Arc<dyn ObjectStore>, by: Instant, what: &str) -> Vec<(String, u64)> {
+	let bound = by.saturating_duration_since(Instant::now());
+	let mut listed: Vec<(String, u64)> = tokio::time::timeout(bound, objects.list(""))
+		.await
+		.unwrap_or_else(|_| panic!("{what}: the object store did not list within its bound"))
+		.unwrap_or_else(|error| panic!("{what}: listing the run's prefix: {error}"))
+		.into_iter()
+		.map(|object| (object.key, object.size_bytes))
+		.collect();
+	assert!(
+		Instant::now() <= by,
+		"{what}: the listing came after its bound"
+	);
+	listed.sort();
+	listed
+}
+
+/// Three hosts (Codex 01a1e487, 01a1e48d): a replica that has offloaded its cold slabs to the
+/// remote object store is lost with its disk, and replaced on its own host. One daemon on each
+/// of three hosts (node-control), each tiering directly to the run's own prefix of the
+/// development RustFS; the declared consensus base `REPLACEMENT_HOSTED_BASE_MILLIS` and the
+/// declared stall bound `QUERY_STALL_BOUND_MILLIS` are written on every node and verified.
+///
+/// - S1. `ROWS` rows (each a slab of its own) are acknowledged and every node has
+///   `OFFLOADED_PER_OWNER` of its own slabs in the store and off its own disk.
+/// - S2. A follower (not the leader named by node 1) is killed (SIGKILL, confirmed); its data
+///   directory is set aside whole as `old-data` on its host. Its objects (one incarnation, I) are
+///   listed.
+/// - S3. A blank Full start with the sealed root is refused `InstanceGrantRefused:
+///   SlotGranted` (an exit, not a timeout or signal) within `REFUSED_START_BOUND`.
+/// - S4. begin through a survivor, provision ON the node's host, start; done as the first
+///   allocated instance. The execution started is read at its start (`start` prints it).
+/// - Offload observed before the replacement (Codex 01a1e49d): one sequential, sampled listing
+///   right before that start (the store, then each node's disk in turn; not an atomic snapshot
+///   and not a trace of reads) shows each survivor with at least `OFFLOADED_PER_OWNER` distinct
+///   slab ids of its own in the store and off its own disk; the counts are printed as measured.
+///   Slab ids are not row identities and how rows pack has varied, so no row or count is claimed
+///   to have been read remotely during recovery (a copy may also be promoted after the listing).
+///   What is claimed: that offload was observed, and that the replacement then answers exactly
+///   the acknowledged rows. With no certificate yet (gid 0), those rows are recovered as
+///   accepted children, not as a certified base.
+/// - S5. A tail of 4 rows written after done.
+/// - S6. Promoted store J and bound key; recovery recorded at (G, K); activation through A >= K.
+/// - S7. The ControlOnly execution exits exactly 75 (observed through its unit, compared with the
+///   identity read at its start, its observation timed after the read), within
+///   `HANDOFF_EXIT_BOUND`; its vote page is Full (read on its host); this test, as the declared
+///   supervisor, starts it once; the new execution differs.
+/// - S8. Ready as R/J; a direct query to it, no redirect, answers exactly every acknowledged row.
+/// - S10. A row written now; after `DELTA_WAIT`, a direct query to the RUNNING replacement, no
+///   redirect, answers exactly every acknowledged row, that one included; then it is stopped in
+///   order and, on its host, its vote page is Full. The stopped store's rows are NOT read here
+///   (Codex 01a1e4f2, RESULT-03/ATTRIBUTION-04): once the Full member has tiered, a stopped
+///   store opened without its cluster has no published tier generation and refuses every row
+///   read (`Fenced`), by design. So this run has no independent check of the saved statement,
+///   of Complete-child verification or of one copy per row on disk; those keep only their
+///   one-host scope. The live answer is a logical-row check, not proof of physical uniqueness;
+///   the recorded recovery and activation are checked through `replace status` (S6, S11),
+///   claims of replicated status, not a read of J's disk.
+/// - S11. A Full restart: ready as itself, the direct query exact, the same recovery and activation.
+/// - S9. J tiers as a Full member: within `TIER_BOUND`, an object of (node, J) in the prefix whose
+///   slab J's data directory holds no file of; the direct query is exact again after it.
+/// - S12. The old instance returns on its old disk under the node's unit: a survivor's vote
+///   addressed to it is answered, one addressed to the replacement refused, a direct read is not
+///   OK; writes commit and reads stay exact. I's objects listed after the loss are all listed
+///   right before it starts and right after it stopped (those two endpoints only).
+/// - S13. The replacement returns: still done; a write commits; reads exact; every daemon stops
+///   in order with status 0.
+///
+/// Not claimed: a service manager's restart (this test supervises), a leader's loss, a second
+/// replacement, reclaim of I's objects, any time as a measurement, release readiness.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "three daemons on three hosts with a remote object store; run alone under the three-host launcher"]
+async fn three_hosts_replace_a_lost_offloaded_replica() {
+	assert!(
+		node_control().is_some(),
+		"this workflow runs each daemon on a host of its own (node-control)"
+	);
+	assert_eq!(
+		declared_consensus_base(),
+		Some(REPLACEMENT_HOSTED_BASE_MILLIS),
+		"this workflow runs at its declared consensus base only"
+	);
+	let deadline = Instant::now() + REPLACEMENT_HOSTED_TEST_BOUND;
+	let started = Instant::now();
+	let at = |what: &str| {
+		eprintln!(
+			"smoke: PHASE {what} at +{} ms",
+			started.elapsed().as_millis()
+		)
+	};
+	let store_env = StoreEnv::from_environment();
+	let objects = store_env.handle();
+	let before = listed(&objects, Instant::now() + CLIENT_BOUND, "the new prefix").await;
+	assert!(before.is_empty(), "the run's prefix is not new");
+	eprintln!(
+		"smoke: HOSTED REPLACEMENT workflow: object prefix {} in bucket {} at {} (direct, no relay); DECLARED consensus base {REPLACEMENT_HOSTED_BASE_MILLIS} ms and stall bound {QUERY_STALL_BOUND_MILLIS} ms on every node; {ROWS} rows, slabs of {SLAB_MAX_BYTES} bytes",
+		store_env.prefix, store_env.bucket, store_env.endpoint
+	);
+
+	// S1.
+	at("formation");
+	let mut formed = form(deadline, Some(&store_env)).await;
+	let pki = formed.pki.clone();
+	let descriptor = formed.descriptor.clone();
+	let members: Vec<Member> = formed.members.clone();
+	let decision_keys = formed.decision_keys.clone();
+	let mut expected: Vec<(i64, String)> = (1..=ROWS)
+		.map(|id| {
+			let name: String = (0..NAME_HEX_BLOCKS).map(|_| hex(random32())).collect();
+			(id, name)
+		})
+		.collect();
+	let client = client_through(&members[0], &pki, Credential::Storage, deadline).await;
+	at("writes");
+	let mut offers = 0_u32;
+	for (id, name) in &expected {
+		offers += ingest_the_row(&client, &descriptor, *id, name, deadline).await;
+	}
+	eprintln!(
+		"smoke: all {ROWS} rows acknowledged in {offers} offers ({} beyond one per row)",
+		offers - ROWS as u32
+	);
+	at("offload wait");
+	offloaded_by_every_owner(&mut formed, &objects, deadline, "before the loss").await;
+
+	// S2.
+	at("loss");
+	let inspection = inspect(&members[0], &pki);
+	assert!(inspection.ready, "node 1 is not ready: {}", inspection.raw);
+	let leader = inspection
+		.leader()
+		.unwrap_or_else(|| panic!("node 1 names no leader among the three: {}", inspection.raw));
+	let lost = members
+		.iter()
+		.rev()
+		.find(|member| member.id != leader)
+		.expect("a node that is not the leader");
+	let survivors: Vec<&Member> = members
+		.iter()
+		.filter(|member| member.id != lost.id)
+		.collect();
+	eprintln!("smoke: leader {leader}; node {} loses its disk", lost.id);
+	eprintln!("smoke: {}", formed.daemons.crash(lost.id));
+	formed.daemons.still_down(lost.id);
+	let after_loss = listed(&objects, deadline, "after the loss").await;
+	let lost_incarnations = incarnations_of(&after_loss, lost.id);
+	let [old_incarnation] = lost_incarnations.iter().collect::<Vec<_>>()[..] else {
+		panic!("the lost node's objects name {lost_incarnations:?}, not one incarnation");
+	};
+	let old_incarnation = old_incarnation.clone();
+	let old_objects: std::collections::BTreeSet<String> =
+		keys_of_owner(&after_loss, lost.id, &old_incarnation)
+			.into_iter()
+			.collect();
+	eprintln!(
+		"smoke: the lost node's objects: {} of incarnation {old_incarnation}",
+		old_objects.len()
+	);
+	formed.daemons.lose(lost.id, deadline);
+
+	// S3.
+	at("blank start");
+	let blank_by = deadline.min(Instant::now() + REFUSED_START_BOUND);
+	let (output, result, raw) = formed.daemons.run_once(lost.id, blank_by);
+	eprintln!("smoke: blank full start: {result:?}; {raw}");
+	assert!(
+		matches!(result, OneOff::Exit(code) if code != 0),
+		"a blank store was not refused as the lost voter (an exit, not a timeout or signal): {result:?}: {output}"
+	);
+	assert!(
+		raw.contains("InstanceGrantRefused: SlotGranted"),
+		"the blank start was refused for another reason: {raw}"
+	);
+	formed.daemons.blank_aside(lost.id, deadline);
+
+	// S4.
+	at("replacement");
+	let connection = operator_connection(survivors[0], &pki);
+	let mut arguments: Vec<std::ffi::OsString> =
+		vec!["begin".into(), "--slot".into(), lost.id.to_string().into()];
+	arguments.extend(connection.iter().cloned());
+	let began = replace_command("replace-begin", &arguments, deadline);
+	assert!(began.succeeded(), "replace begin: {}", began.text());
+	let lines: Vec<&str> = began.stdout.lines().collect();
+	let [announced, report] = lines.as_slice() else {
+		panic!(
+			"replace begin printed {} lines: {}",
+			lines.len(),
+			began.text()
+		);
+	};
+	let token = announced_token(announced, lost.id)
+		.unwrap_or_else(|| panic!("replace begin announced no token first: {}", began.text()));
+	assert_eq!(
+		parse_report(report).map(|reported| (reported.token, reported.phase)),
+		Some((token, ReportedPhase::Begun)),
+		"replace begin: {}",
+		began.text()
+	);
+	eprintln!("smoke: COMMAND BEGIN replace-provision");
+	let provision_by = deadline.min(Instant::now() + REPLACE_COMMAND_BOUND);
+	let provisioned = formed.daemons.provision(lost.id, token, provision_by);
+	eprintln!("smoke: COMMAND OUTCOME replace-provision ok {provisioned}");
+
+	// The cold accounting, observed once right before the replacement starts.
+	let cold = Snapshot::take(&formed, &objects, deadline).await;
+	cold.report("before the replacement starts");
+	let offloaded = cold.offloaded();
+	for survivor in &survivors {
+		let at_node = NODES.iter().position(|id| *id == survivor.id).unwrap();
+		let (off, _) = &offloaded[at_node];
+		assert!(
+			off.len() >= OFFLOADED_PER_OWNER,
+			"survivor {} has only {} of its slabs off its disk before the replacement starts",
+			survivor.id,
+			off.len()
+		);
+		eprintln!(
+			"smoke: COLD survivor {}: {} of its own slabs in the store and off its disk: {off:?}",
+			survivor.id,
+			off.len()
+		);
+	}
+	eprintln!(
+		"smoke: COLD: offload observed before the replacement in one sequential, sampled listing (distinct slab ids off each survivor's disk, as printed); no row is claimed read remotely"
+	);
+	let replacement_started = Instant::now();
+	let control_identity = formed.daemons.start_identified(lost);
+	let mut replacement = ReplacementExit::new(lost.id, control_identity);
+	let done_by = deadline.min(Instant::now() + DONE_BOUND);
+	let mut reads = 0_u32;
+	let done = loop {
+		reads += 1;
+		let phase = replacement_status(
+			&format!("replace-status-{reads}"),
+			token,
+			lost.id,
+			&connection,
+			done_by,
+		);
+		if let Some(ReportedPhase::Done(instance)) = phase {
+			break instance;
+		}
+		replacement.poll(&mut formed.daemons, "before done");
+		assert!(
+			Instant::now() < done_by,
+			"the replacement was not done within {DONE_BOUND:?} ({reads} status reads, last {phase:?})"
+		);
+		tokio::time::sleep(Duration::from_secs(1)).await;
+	};
+	eprintln!(
+		"smoke: replacement done as instance {done} {:?} after its start ({reads} status reads)",
+		replacement_started.elapsed()
+	);
+	assert_eq!(done, FIRST_ALLOCATED);
+
+	// S5.
+	at("tail");
+	let through = client_through(survivors[0], &pki, Credential::Storage, deadline).await;
+	for id in ROWS + 1..=ROWS + 4 {
+		commit_offering_again(&through, &descriptor, id, "tail", lost.id, "after done").await;
+		expected.push((id, "tail".to_owned()));
+	}
+
+	// S6.
+	at("recovery");
+	let configured = decision_keys[NODES.iter().position(|id| *id == lost.id).unwrap()];
+	let prepared_by = deadline.min(Instant::now() + PREPARED_BOUND);
+	let mut reads = 0_u32;
+	let store = loop {
+		reads += 1;
+		let reported = replacement_report(
+			&format!("replace-prepared-{reads}"),
+			token,
+			lost.id,
+			&connection,
+			prepared_by,
+		);
+		if let Some(Reported {
+			phase: ReportedPhase::Done(FIRST_ALLOCATED),
+			promoted: Some(store),
+			bound_key: Some(key),
+			..
+		}) = reported
+		{
+			assert_eq!(
+				key, configured,
+				"the bound key is the slot's configured one"
+			);
+			break store;
+		}
+		replacement.poll(&mut formed.daemons, "before the replacement was prepared");
+		assert!(
+			Instant::now() < prepared_by,
+			"the replacement was not prepared within {PREPARED_BOUND:?} ({reads} status reads, last {reported:?})"
+		);
+		tokio::time::sleep(Duration::from_secs(1)).await;
+	};
+	eprintln!("smoke: replacement promoted store {store:032x} and bound its configured key");
+	let recovered_by = deadline.min(Instant::now() + RECOVERED_BOUND);
+	let mut reads = 0_u32;
+	let recovered = loop {
+		reads += 1;
+		let reported = replacement_report(
+			&format!("replace-recovered-{reads}"),
+			token,
+			lost.id,
+			&connection,
+			recovered_by,
+		);
+		if let Some(Reported {
+			recovered: Some(recovered),
+			..
+		}) = reported
+		{
+			break recovered;
+		}
+		replacement.poll(&mut formed.daemons, "before the recovery was recorded");
+		assert!(
+			Instant::now() < recovered_by,
+			"the recovery was not recorded within {RECOVERED_BOUND:?} ({reads} status reads, last {reported:?})"
+		);
+		tokio::time::sleep(Duration::from_secs(1)).await;
+	};
+	eprintln!(
+		"smoke: replacement recorded its recovery {recovered:?} ({reads} status reads){}",
+		if recovered.0 == 0 {
+			"; gid 0: the rows were recovered as accepted children, not a certified base"
+		} else {
+			""
+		}
+	);
+	let activated_from = Instant::now();
+	let activated_by = deadline.min(activated_from + ACTIVATED_BOUND);
+	let mut reads = 0_u32;
+	let (activated_through, activated_gid) = loop {
+		reads += 1;
+		let reported = replacement_report(
+			&format!("replace-activated-{reads}"),
+			token,
+			lost.id,
+			&connection,
+			activated_by,
+		);
+		if let Some(Reported {
+			recovered: Some(seen),
+			activated: Some(activated),
+			..
+		}) = reported
+		{
+			assert_eq!(seen, recovered, "the recorded recovery never changes");
+			break activated;
+		}
+		replacement.poll(&mut formed.daemons, "before the replacement activated");
+		assert!(
+			Instant::now() < activated_by,
+			"the replacement did not activate within {ACTIVATED_BOUND:?} ({reads} status reads, last {reported:?})"
+		);
+		tokio::time::sleep(Duration::from_secs(1)).await;
+	};
+	assert!(
+		activated_through >= recovered.1,
+		"the activation's cut {activated_through} is below the recorded one {}",
+		recovered.1
+	);
+	eprintln!(
+		"smoke: replacement activated through {activated_through} at gid {activated_gid} ({reads} status reads)"
+	);
+
+	// S7.
+	at("handoff");
+	let exit_by = deadline.min(Instant::now() + HANDOFF_EXIT_BOUND);
+	loop {
+		replacement.poll(&mut formed.daemons, "before the replacement's handoff exit");
+		if replacement.seen.is_some() {
+			break;
+		}
+		assert!(
+			Instant::now() < exit_by,
+			"the ControlOnly execution ({}) did not exit within {HANDOFF_EXIT_BOUND:?} of its activation being seen",
+			replacement.identity
+		);
+		tokio::time::sleep(Duration::from_millis(500)).await;
+	}
+	let (status, control_only) = replacement
+		.handed_off(exit_by)
+		.unwrap_or_else(|why| panic!("{why} (bound {HANDOFF_EXIT_BOUND:?})"));
+	let probe_by = deadline.min(Instant::now() + INSPECTION_BOUND);
+	assert_eq!(
+		formed.daemons.probe(lost.id, None, probe_by).role,
+		Some((FIRST_ALLOCATED, false)),
+		"the replacement's store is Full on disk once its ControlOnly execution exited"
+	);
+	eprintln!(
+		"smoke: the ControlOnly execution ({control_only}) exited {status}; its page is Full; started again once, as its supervisor would"
+	);
+	let owned = formed.daemons.start_identified(lost);
+	assert_ne!(owned, control_only, "the Full member is a new execution");
+
+	// S8.
+	at("serving");
+	serving_as(
+		lost,
+		&pki,
+		store,
+		deadline,
+		(&formed.daemons, &owned),
+		"after the handover",
+	)
+	.await;
+	let direct_reader = client_through(survivors[0], &pki, Credential::Storage, deadline).await;
+	direct_query_exact(
+		&direct_reader,
+		&descriptor,
+		lost.id,
+		&expected,
+		deadline,
+		"after the handover",
+	)
+	.await;
+
+	// S10.
+	at("full store");
+	commit_offering_again(
+		&through,
+		&descriptor,
+		ROWS + 5,
+		"full",
+		lost.id,
+		"after the handover",
+	)
+	.await;
+	expected.push((ROWS + 5, "full".to_owned()));
+	let observe_by = deadline.min(Instant::now() + DELTA_WAIT + INSPECTION_BOUND);
+	tokio::time::sleep(DELTA_WAIT).await;
+	if let Some(why) = formed.daemons.exited() {
+		panic!("before the full replacement's store was read: {why}");
+	}
+	direct_query_exact(
+		&direct_reader,
+		&descriptor,
+		lost.id,
+		&expected,
+		observe_by,
+		"the running full replacement, with the row written after the handover",
+	)
+	.await;
+	formed.daemons.stop(lost.id, observe_by);
+	assert_eq!(
+		formed.daemons.probe(lost.id, None, observe_by).role,
+		Some((FIRST_ALLOCATED, false)),
+		"the replacement's store is Full on disk after its handover"
+	);
+
+	// S11.
+	at("full restart");
+	let owned = formed.daemons.start_identified(lost);
+	serving_as(
+		lost,
+		&pki,
+		store,
+		deadline,
+		(&formed.daemons, &owned),
+		"after a full restart",
+	)
+	.await;
+	direct_query_exact(
+		&direct_reader,
+		&descriptor,
+		lost.id,
+		&expected,
+		deadline,
+		"after a full restart",
+	)
+	.await;
+	let restarted = replacement_report(
+		"replace-status-full-restart",
+		token,
+		lost.id,
+		&connection,
+		deadline,
+	)
+	.expect("a status after the full restart");
+	assert_eq!(
+		(restarted.recovered, restarted.activated),
+		(Some(recovered), Some((activated_through, activated_gid))),
+		"the same recovery and activation after the full restart"
+	);
+
+	// S9.
+	at("replacement tiers");
+	let new_incarnation = format!("{store:032x}");
+	let tier_by = deadline.min(Instant::now() + TIER_BOUND);
+	let (tiered_key, tiered_slab) = loop {
+		if let Some(why) = formed.daemons.exited() {
+			panic!("while the replacement tiers: {why}");
+		}
+		let snapshot = Snapshot::take(&formed, &objects, deadline).await;
+		let (_, files) = snapshot
+			.files
+			.iter()
+			.find(|(node, _)| *node == lost.id)
+			.expect("the replacement's listing");
+		let found = keys_of_owner(&snapshot.objects, lost.id, &new_incarnation)
+			.into_iter()
+			.filter_map(|key| {
+				let slab = owner_and_slab(&key)?.1.to_owned();
+				files
+					.iter()
+					.all(|name| !names_the_slab(name, &slab))
+					.then_some((key, slab))
+			})
+			.next();
+		assert!(
+			Instant::now() <= tier_by || found.is_none(),
+			"the replacement's object was observed only after {TIER_BOUND:?}"
+		);
+		if let Some(found) = found {
+			break found;
+		}
+		assert!(
+			Instant::now() < tier_by,
+			"within {TIER_BOUND:?} the replacement (node {}, store {new_incarnation}) had no object of its own whose slab is off its disk",
+			lost.id
+		);
+		tokio::time::sleep(Duration::from_secs(5)).await;
+	};
+	eprintln!(
+		"smoke: TIERED the replacement's own object {tiered_key} (slab {tiered_slab}, no file of it on its disk)"
+	);
+	direct_query_exact(
+		&direct_reader,
+		&descriptor,
+		lost.id,
+		&expected,
+		deadline,
+		"after the replacement tiered",
+	)
+	.await;
+	formed.daemons.stop(lost.id, deadline);
+
+	// S12.
+	at("old instance");
+	let before_old = listed(&objects, deadline, "before the old instance returns").await;
+	baseline_still_listed(&old_objects, &before_old)
+		.unwrap_or_else(|why| panic!("before the old instance returns: {why}"));
+	let old_identity = formed.daemons.start_old(lost.id);
+	tokio::time::sleep(OLD_INSTANCE_RUN).await;
+	if let Some(why) = formed.daemons.exited() {
+		panic!("with the old instance back: {why}");
+	}
+	eprintln!("smoke: the old instance runs as {old_identity}");
+	let sender = survivors[0].id;
+	let pki_dir = formed.root.join("pki");
+	let probe = |target_instance: u32| {
+		let (pki_dir, address, node_ca, slot) = (
+			pki_dir.clone(),
+			lost.address.clone(),
+			pki.node_ca.clone(),
+			lost.id,
+		);
+		async move {
+			tokio::time::timeout(
+				PROBE_BOUND,
+				wendelon::consensus::raft_network::routed_vote_for_test(
+					&pki_dir.join(format!("node-{sender}.crt")),
+					&pki_dir.join(format!("node-{sender}.key")),
+					&node_ca,
+					DOMAIN,
+					slot,
+					&address,
+					sender,
+					target_instance,
+				),
+			)
+			.await
+		}
+	};
+	let answered = |what: &str, outcome| match outcome {
+		Ok(Ok(Ok(response))) => response,
+		other => {
+			panic!("{what}: the old instance did not answer a request addressed to it: {other:?}")
+		}
+	};
+	let before_vote = answered("before", probe(lost.id).await);
+	assert!(
+		!before_vote.vote_granted,
+		"a term-0 vote was granted: {before_vote:?}"
+	);
+	eprintln!(
+		"smoke: the old instance answered as itself with its vote {:?}",
+		before_vote.vote
+	);
+	match probe(FIRST_ALLOCATED).await {
+		Ok(Err(refused)) => eprintln!(
+			"smoke: a request addressed to the replacement was refused at the old instance: {refused}"
+		),
+		other => panic!(
+			"a request addressed to the replacement was not refused at the old instance: {other:?}"
+		),
+	}
+	let after_vote = answered("after", probe(lost.id).await);
+	assert!(
+		!after_vote.vote_granted,
+		"a term-0 vote was granted: {after_vote:?}"
+	);
+	let reader = client_through(survivors[0], &pki, Credential::Storage, deadline).await;
+	let direct = |target: u32| {
+		let inner = reader.inner().clone();
+		let mut meta: wendelon::schema::TableQueryRequestMeta = bytemuck::Zeroable::zeroed();
+		meta.expected_epoch = inner.epoch();
+		meta.tenant_id = TenantId::new(TENANT);
+		meta.table_object_id = descriptor.table_object_id;
+		meta.schema_generation = descriptor.schema_generation;
+		meta.physical_descriptor_fingerprint =
+			*descriptor.physical_descriptor_fingerprint.as_bytes();
+		meta.consistency = wendelon::schema::Consistency::LINEARIZABLE;
+		meta.row_identity_projection = wendelon::client::RowIdentityProjection::None.as_u8();
+		meta.deadline_remaining_millis = PROBE_BOUND.as_millis() as u64;
+		let request = wendelon::client::TableQueryRequest {
+			meta,
+			descriptor: descriptor.clone(),
+			pbc: Vec::new(),
+			runtime_filter: None,
+			row_identity: wendelon::client::RowIdentityProjection::None,
+		};
+		async move {
+			tokio::time::timeout(
+				PROBE_BOUND,
+				inner.table_query_at_for_test(
+					wendelon::schema::NodeId {
+						id: target,
+						_reserved: 0,
+					},
+					request,
+				),
+			)
+			.await
+		}
+	};
+	let survivor_before = direct(survivors[0].id).await;
+	assert!(
+		matches!(survivor_before, Ok(Ok(true))),
+		"a survivor did not answer the direct read: {survivor_before:?}"
+	);
+	let at_old = direct(lost.id).await;
+	assert!(
+		!matches!(at_old, Ok(Ok(true))),
+		"the old process answered a read OK"
+	);
+	eprintln!("smoke: a read sent straight to the old process: {at_old:?}");
+	let survivor_after = direct(survivors[0].id).await;
+	assert!(
+		matches!(survivor_after, Ok(Ok(true))),
+		"a survivor did not answer the direct read after: {survivor_after:?}"
+	);
+	commit_offering_again(
+		&through,
+		&descriptor,
+		ROWS + 6,
+		"old-back",
+		lost.id,
+		"with the old instance",
+	)
+	.await;
+	expected.push((ROWS + 6, "old-back".to_owned()));
+	expect_at_survivors(
+		&survivors,
+		&pki,
+		&descriptor,
+		deadline,
+		&expected,
+		"with the old instance back",
+	)
+	.await;
+	if let Some(why) = formed.daemons.exited() {
+		panic!("with the old instance back, after the probes: {why}");
+	}
+	formed.daemons.stop(lost.id, deadline);
+	let after_old = listed(&objects, deadline, "after the old instance stopped").await;
+	baseline_still_listed(&old_objects, &after_old)
+		.unwrap_or_else(|why| panic!("after the old instance stopped: {why}"));
+	let added: Vec<String> = keys_of_owner(&after_old, lost.id, &old_incarnation)
+		.into_iter()
+		.filter(|key| !old_objects.contains(key))
+		.collect();
+	eprintln!(
+		"smoke: I's {} objects listed after the loss are all listed before the old instance returned and after it stopped; RECORD: objects of I added since the loss: {added:?}",
+		old_objects.len()
+	);
+	let refused = formed
+		.daemons
+		.old_log(lost.id)
+		.matches("it is addressed to another instance of this slot")
+		.count();
+	eprintln!(
+		"smoke: RECORD: requests addressed to another instance refused by the old process: {refused}"
+	);
+
+	// S13.
+	at("return");
+	formed.daemons.start(lost);
+	tokio::time::sleep(Duration::from_secs(2)).await;
+	assert_eq!(
+		replacement_status(
+			"replace-status-returned",
+			token,
+			lost.id,
+			&connection,
+			deadline
+		),
+		Some(ReportedPhase::Done(FIRST_ALLOCATED))
+	);
+	commit_offering_again(
+		&through,
+		&descriptor,
+		ROWS + 7,
+		"returned",
+		lost.id,
+		"after the return",
+	)
+	.await;
+	expected.push((ROWS + 7, "returned".to_owned()));
+	expect_at_survivors(
+		&survivors,
+		&pki,
+		&descriptor,
+		deadline,
+		&expected,
+		"after the replacement's return",
+	)
+	.await;
+	at("stops");
+	formed.daemons.stop(lost.id, deadline);
+	for member in &survivors {
+		formed.daemons.stop(member.id, deadline);
+	}
+	eprintln!(
+		"smoke: hosted replacement workflow passed in {:?}",
+		started.elapsed()
+	);
+	assert!(Instant::now() < deadline, "the test overran its bound");
+	std::fs::remove_dir_all(&formed.root).unwrap();
 }
