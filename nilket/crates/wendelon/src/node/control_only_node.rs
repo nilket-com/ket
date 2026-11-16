@@ -21,6 +21,10 @@ pub struct ControlOnlyNode {
 	lifecycle: ServerLifecycle,
 	servers: Vec<NodeTransportServer>,
 	checkpoint_emitter: tokio::task::JoinHandle<()>,
+	/// ADR 0108 (wendelon): the log store and its checkpoints, for the
+	/// handoff's durable authority check and role rewrite.
+	log_store: WendelonLogStore,
+	checkpoints: Arc<crate::consensus::raft_storage::CheckpointCoordinator>,
 	owner: DataDirectoryOwner,
 	/// ADR 0105 (wendelon): the replacement's preparation and its task.
 	preparation: Arc<super::replacement_preparation::Preparation>,
@@ -101,7 +105,7 @@ impl ControlOnlyNode {
 			.await?
 			.with_checkpoint_observer(checkpoints.clone())
 			.with_external_revocation_snapshot(revocation_tx.clone());
-		let checkpoint_emitter = checkpoints.spawn();
+		let checkpoint_emitter = checkpoints.clone().spawn();
 		let network = WendelonRaftNetworkFactory::new(provider.clone(), pool.clone())
 			.with_decision_mode(cfg.decision_mode)
 			.with_instance_routing(crate::consensus::raft_network::InstanceRouting {
@@ -192,6 +196,8 @@ impl ControlOnlyNode {
 			lifecycle,
 			servers,
 			checkpoint_emitter,
+			log_store: log_store.clone(),
+			checkpoints: checkpoints.clone(),
 			owner,
 			preparation,
 			preparing: std::sync::Mutex::new(Some(preparing)),
@@ -257,6 +263,89 @@ impl ControlOnlyNode {
 		if let Some(task) = task {
 			let _ = task.await;
 		}
+	}
+
+	/// ADR 0108 (wendelon): true once this member's activation is applied
+	/// here; its preparation task has then ended.
+	pub fn activated(&self) -> tokio::sync::watch::Receiver<bool> {
+		self.preparation.activated()
+	}
+
+	/// ADR 0108 (wendelon) D3: closes this ControlOnly member for a Full start
+	/// of the same directory. Every part must close: the preparation (awaited),
+	/// the index, the listeners and servers, Raft, and the checkpoint emitter.
+	/// The latest checkpoint is then written, and the start authority is judged
+	/// on the state recovered from the log store, the source a Full start
+	/// reads; only then is the role rewritten to Full and the owner closed. Any
+	/// failure returns it, with the page unchanged if it came first.
+	pub async fn hand_over(self) -> std::io::Result<()> {
+		// The recovery storage is never bound to a control node, so its store is
+		// read from its own index (the incarnation ADR 0105 minted there), never
+		// through `owner_ref`, whose unbound answer differs by build (owning run
+		// pd-replace-20261116T114842Z: "store is not bound to a control node").
+		let store = self
+			.preparation
+			.recovery_slab()
+			.ok_or_else(|| Error::other("the activated replacement has no recovery storage"))?
+			.persistent_index()
+			.ok_or_else(|| Error::other("the activated replacement's storage has no index"))?
+			.store_incarnation();
+		// Codex 01a1e41e R4: a failed preparation task is not a clean stop, and no
+		// Full start follows a producer whose shutdown is unproven.
+		self.preparation.request_stop();
+		let task = self.preparing.lock().unwrap().take();
+		if let Some(task) = task {
+			task.await
+				.map_err(|error| Error::other(format!("the preparation task failed: {error}")))?;
+		}
+		self.preparation.release().await?;
+		self.lifecycle.begin_drain();
+		for server in &self.servers {
+			server.begin_drain();
+		}
+		self.raft.shutdown().await.map_err(Error::other)?;
+		for server in self.servers {
+			server.shutdown().await?;
+		}
+		// The emitter's cancellation is requested here and is no error; any other
+		// end of that task is.
+		self.checkpoint_emitter.abort();
+		match self.checkpoint_emitter.await {
+			Ok(()) => {}
+			Err(error) if error.is_cancelled() => {}
+			Err(error) => {
+				return Err(Error::other(format!(
+					"the checkpoint emitter failed: {error}"
+				)));
+			}
+		}
+		self.checkpoints.flush_now().await?;
+		let recovered = self
+			.log_store
+			.recovered_state_machine()
+			.await?
+			.state_snapshot()
+			.await;
+		let birth = self
+			.log_store
+			.birth()
+			.await
+			.ok_or_else(|| Error::other("the replacement's store has no birth"))?;
+		crate::consensus::decisions::replacement_start_authority(
+			&recovered,
+			self.identity,
+			birth,
+			store,
+		)
+		.map_err(|why| Error::new(ErrorKind::PermissionDenied, why))?;
+		self.log_store.activate_identity(self.identity).await?;
+		drop(recovered);
+		drop(self.provider);
+		drop(self.state_machine);
+		drop(self.preparation);
+		drop(self.checkpoints);
+		drop(self.log_store);
+		self.owner.close(self.shutdown_bound).await
 	}
 
 	/// Stops serving, shuts Raft down and closes the data directory.

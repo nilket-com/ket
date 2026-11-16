@@ -266,3 +266,28 @@ Restart=on-failure
   restarts it, and the next start finds no clean-shutdown record and runs recovery.
   `nilket local` applies the same grace and reports a supervisor SIGKILL as
   "unclean stop (killed by supervisor)".
+- Exit status 75 (`EX_TEMPFAIL`) is a restart request, not an error (Wendelon ADR
+  0108). A ParentDecisions replacement runs control-only until it activates. It then
+  closes every control-only part, rewrites its role to Full, closes its store and
+  exits 75. Its next start, from the same configuration and directory, is the full
+  member with the same Raft instance and store. That start runs the ordinary full
+  startup, including its start-authority check and recovery after an unclean stop;
+  nothing new is minted. No full start runs in the exiting process.
+  - Under the unit above, `Restart=on-failure` restarts on 75 like any nonzero
+    status, after `RestartSec` (default 100 ms), counted against systemd's start
+    rate limit (`StartLimitIntervalSec`/`StartLimitBurst`, defaults 10 s and 5).
+    A replacement hands over once, so one restart is spent.
+  - An operator stop is not resurrected. A stop signal that arrives during the
+    handoff lets it finish and exits 0, and the next start follows the role on
+    disk. The stop is read once, when the handoff ends; a signal that arrives after
+    that read, before the process is gone, can still leave 75. A stop requested
+    through systemd (`systemctl stop`) is never restarted, whatever the status:
+    an explicit stop suppresses the restart policy.
+  - Started by hand, or by a launcher that does not restart on 75, the replacement
+    exits 75 and stays down until it is started again. Exiting does not restart
+    anything by itself.
+  - `nilket local` runs one node, not a ParentDecisions cluster. It is not a
+    supervisor for a replacement: it treats any Wendelon exit as unexpected and
+    stops.
+  - Tested: the workflow test starts the process again on 75, as the supervisor
+    would. A service manager's restart wiring is not tested.

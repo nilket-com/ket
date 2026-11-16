@@ -237,6 +237,8 @@ impl WendelonDataServer {
 			})
 			.collect();
 		let stamp_ms = self.lease_batch_stamp().await?;
+		// ADR 0108 (wendelon): the holder's own store incarnation, carried.
+		let holder_incarnation = self.slab.owner_ref()?.incarnation();
 		let grants = leases
 			.iter()
 			.zip(chunk)
@@ -244,6 +246,7 @@ impl WendelonDataServer {
 				|(lease, (_, _, expected_generation))| crate::consensus::LeaseBatchGrant {
 					lease: *lease,
 					expected_generation: *expected_generation,
+					holder_incarnation,
 				},
 			)
 			.collect();
@@ -305,6 +308,7 @@ impl WendelonDataServer {
 			requested_hlc,
 			ttl_ms,
 			count: chunk.len() as u32,
+			holder_incarnation: self.slab.owner_ref()?.incarnation().get().to_le_bytes(),
 		};
 		let entries: Vec<LeaseRangeWire> = chunk
 			.iter()

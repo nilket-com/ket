@@ -242,6 +242,50 @@ pub(crate) struct ChildPlan {
 	pub(crate) tombstone: Option<crate::consensus::decisions::DeleteRequest>,
 }
 
+/// Wendelon ADR 0108 D5 (DC-250): a child plan whose secondary-index
+/// descriptors were read under the store's index admission guard. The guard
+/// travels with the plan into its persistence and is released only when the
+/// durable append and its index buffer entries are done, so a declaration cut
+/// never falls between reading the descriptors and writing their entries. It
+/// is taken before any parent lock, never while one is held.
+pub(crate) struct AdmittedPlan {
+	plan: ChildPlan,
+	admission: tokio::sync::OwnedRwLockReadGuard<()>,
+}
+
+impl AdmittedPlan {
+	/// Takes the guard, then reads the plan (with its descriptors) from
+	/// applied state.
+	pub(crate) async fn admit(
+		slab: &SlabManager,
+		state_machine: &WendelonStateMachine,
+		plan: impl FnOnce(&SmState) -> Result<ChildPlan, ChildRefusal>,
+	) -> Result<Self, ChildRefusal> {
+		let admission = slab.acquire_secondary_index_admission_guard().await;
+		let plan = state_machine.read_state(plan).await?;
+		Ok(Self { plan, admission })
+	}
+
+	pub(crate) fn plan(&self) -> &ChildPlan {
+		&self.plan
+	}
+
+	/// Wendelon ADR 0108 D5: the same plan with no index descriptor, for a
+	/// store whose buffers no declaration cut proves (a ControlOnly
+	/// replacement).
+	pub(crate) fn without_index_buffers(mut self) -> Self {
+		self.plan.secondary_indexes.clear();
+		self
+	}
+
+	/// A plan built by a test, admitted under the guard as `admit` would.
+	#[cfg(test)]
+	pub(crate) async fn for_test(slab: &SlabManager, plan: ChildPlan) -> Self {
+		let admission = slab.acquire_secondary_index_admission_guard().await;
+		Self { plan, admission }
+	}
+}
+
 /// The manifest of a child's rows: one version per row in batch order, and
 /// the sorted manifest the claim commits to.
 pub(super) fn child_versions(
@@ -781,7 +825,7 @@ pub(crate) async fn persist_child(
 	slab: Arc<SlabManager>,
 	state_machine: WendelonStateMachine,
 	locks: Arc<ParentLocks>,
-	plan: ChildPlan,
+	plan: AdmittedPlan,
 	authority: ChildAuthority,
 ) -> Result<
 	crate::consensus::decisions::Signed<crate::consensus::decisions::ChildAckBody>,
@@ -801,7 +845,7 @@ pub(super) async fn persist_locked(
 	slab: Arc<SlabManager>,
 	state_machine: WendelonStateMachine,
 	locks: Arc<ParentLocks>,
-	plan: ChildPlan,
+	admitted: AdmittedPlan,
 	authority: ChildAuthority,
 ) -> Result<
 	Option<crate::consensus::decisions::Signed<crate::consensus::decisions::ChildAckBody>>,
@@ -809,8 +853,13 @@ pub(super) async fn persist_locked(
 > {
 	use crate::consensus::decisions::ParentStatus;
 	use crate::storage::index::parent_intents::ParentIntentState::{Complete, Intent, Refused};
+	let AdmittedPlan { plan, admission } = admitted;
+	// Lock order: the index admission guard (taken with the plan), then the
+	// parent lock. Both move into the spawned work, which a cancelled caller
+	// does not stop, so neither is released before that work ends.
 	let guard = locks.lock(plan.intent.rsv).await;
 	let work = tokio::spawn(async move {
+		let _admission = admission;
 		let _guard = guard;
 		let index = slab
 			.persistent_index()
@@ -1626,20 +1675,18 @@ impl WendelonDataServer {
 		self.await_applied(meta.rsv).await?;
 		let leases = (self.lease_source())().await;
 		let local = signer.signer;
-		let plan = self
-			.state_machine
-			.read_state(move |state| {
-				let epoch = state
-					.epoch_history
-					.last_key_value()
-					.map(|(_, config)| config.epoch);
-				plan_child(state, local, sender, role, &meta, batch, |start, end| {
-					leases.iter().any(|(low, high, lease_epoch)| {
-						Some(*lease_epoch) == epoch && *low <= start && end <= *high
-					})
+		let plan = AdmittedPlan::admit(&self.slab, &self.state_machine, move |state| {
+			let epoch = state
+				.epoch_history
+				.last_key_value()
+				.map(|(_, config)| config.epoch);
+			plan_child(state, local, sender, role, &meta, batch, |start, end| {
+				leases.iter().any(|(low, high, lease_epoch)| {
+					Some(*lease_epoch) == epoch && *low <= start && end <= *high
 				})
 			})
-			.await?;
+		})
+		.await?;
 		persist_child(
 			self.slab.clone(),
 			self.state_machine.clone(),

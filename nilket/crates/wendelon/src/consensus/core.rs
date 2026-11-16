@@ -830,6 +830,10 @@ pub struct LeaseBatch {
 pub struct LeaseBatchGrant {
 	pub lease: crate::schema::LeaseDescriptor,
 	pub expected_generation: Option<u64>,
+	/// ADR 0108 (wendelon): the holder's store incarnation, carried by its
+	/// request and never stamped from the slot's current one, so a lingering
+	/// old process of a replaced slot is told apart from the replacement.
+	pub holder_incarnation: StoreIncarnation,
 }
 
 impl LeaseBatch {

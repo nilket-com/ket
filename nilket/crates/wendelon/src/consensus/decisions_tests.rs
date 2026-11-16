@@ -233,6 +233,13 @@ pub(crate) fn lease_batch_at(
 				.as_ref()
 				.and_then(|decisions| decisions.lineages().get(&lease.range_start))
 				.map(|lineage| lineage.generation),
+			// ADR 0108 (wendelon): the holder carries its own store, here the
+			// slot's current one.
+			holder_incarnation: state
+				.incarnations
+				.get(&lease.holder.id)
+				.and_then(|registry| registry.current)
+				.unwrap_or(inc(lease.holder.id)),
 		})
 		.collect();
 	WendelonRequest::AcquireLeases(crate::consensus::LeaseBatch::new(stamp_ms, grants).unwrap())
@@ -2984,6 +2991,7 @@ fn an_oversized_lease_batch_is_refused_from_its_length() {
 	let one = crate::consensus::LeaseBatchGrant {
 		lease: one,
 		expected_generation: None,
+		holder_incarnation: inc(universe()[0].0),
 	};
 	// The wire shape: the stamp, then the bounded sequence of grants.
 	let at_cap = postcard::to_stdvec(&(7_u64, vec![one; MAX_LEASES_PER_BATCH])).unwrap();
@@ -3565,6 +3573,7 @@ fn after_a_takeover_only_the_successor_is_granted_and_its_first_grant_keeps_the_
 		let grants = vec![crate::consensus::LeaseBatchGrant {
 			lease: lease(who, range, start, expiry),
 			expected_generation: expected,
+			holder_incarnation: inc(who),
 		}];
 		granted(apply_next(
 			state,
@@ -3700,6 +3709,7 @@ fn a_renewal_applied_first_refuses_the_takeover_and_a_takeover_applied_first_den
 			vec![crate::consensus::LeaseBatchGrant {
 				lease: renewal,
 				expected_generation: Some(generation),
+				holder_incarnation: inc(renewal.holder.id),
 			}],
 		)
 		.unwrap(),
@@ -5030,8 +5040,11 @@ fn a_superseded_replacement_cannot_make_its_first_promotion() {
 //  ADR 0106 (wendelon): A PROMOTED REPLACEMENT'S RECOVERY RECORD
 // ============================================================
 
+use crate::consensus::decisions::ActivationBody;
 use crate::consensus::decisions::RecoveryBody;
-use crate::consensus::decisions::instances::Recovery;
+use crate::consensus::decisions::instances::{Activation, Recovery};
+use crate::consensus::decisions::{IndexReceiptBody, IndexReceiptPhase, IndexTransition};
+use crate::schema::SecondaryIndexState;
 
 /// `done()` with slot 3's store J promoted and bound to slot 3's key.
 fn promoted() -> SmState {
@@ -5223,6 +5236,533 @@ fn a_recovery_is_signed_by_the_promoted_store_and_refused_once_superseded() {
 		&mut state,
 		recovery_body(0, None, k),
 		DecisionRefusal::RecoveryNotAuthorized,
+	);
+}
+
+/// ADR 0108: `promoted()` with its recovery recorded at genesis, cut `k`.
+fn recovered() -> (SmState, u64) {
+	let mut state = promoted();
+	let k = peek_index() - 1;
+	assert!(matches!(
+		prove(&mut state, recovery_body(0, None, k)),
+		DecisionResult::RecoveryRecorded { .. }
+	));
+	(state, k)
+}
+
+fn activation_body(k: u64, through: u64, certified: u64) -> ActivationBody {
+	ActivationBody {
+		token: TOKEN,
+		slot: 3,
+		r_new: ALLOCATED_BASE,
+		birth: [BIRTH; 16],
+		store: store_j(),
+		recovered_gid: 0,
+		k,
+		through,
+		certified,
+	}
+}
+
+fn activate(state: &mut SmState, body: ActivationBody) -> DecisionResult {
+	let signer = Signer {
+		node: 3,
+		incarnation: body.store,
+	};
+	decide(
+		state,
+		DecisionCommand::ActivateReplacement {
+			proof: sign_for_test(body, signer),
+		},
+	)
+}
+
+fn activation_unchanged(state: &mut SmState, body: ActivationBody, refusal: DecisionRefusal) {
+	let before = state.decisions.clone();
+	assert_eq!(activate(state, body), refused(refusal));
+	assert_eq!(state.decisions, before);
+}
+
+/// ADR 0108 control 1: an activation needs the recorded recovery, its exact
+/// replacement, a cut from the recovery cut to below its entry and a
+/// certificate from the recovery's to the current one; it is recorded once and
+/// ends the slot's preparation.
+#[test]
+fn an_activation_is_recorded_once_for_the_current_recovered_store() {
+	// Promoted but not recovered.
+	let mut state = promoted();
+	let through = peek_index() - 1;
+	activation_unchanged(
+		&mut state,
+		activation_body(through, through, 0),
+		DecisionRefusal::ActivationNotAuthorized,
+	);
+	let (mut state, k) = recovered();
+	assert!(slot_preparing(&state, 3));
+	let through = peek_index() - 1;
+	for body in [
+		ActivationBody {
+			birth: [BIRTH + 1; 16],
+			..activation_body(k, through, 0)
+		},
+		ActivationBody {
+			r_new: ALLOCATED_BASE + 1,
+			..activation_body(k, through, 0)
+		},
+		// Not the recorded recovery.
+		ActivationBody {
+			k: k - 1,
+			..activation_body(k, through, 0)
+		},
+		ActivationBody {
+			recovered_gid: 1,
+			..activation_body(k, through, 0)
+		},
+	] {
+		activation_unchanged(&mut state, body, DecisionRefusal::ActivationNotAuthorized);
+	}
+	// The cut: from the recovery cut, below this entry.
+	activation_unchanged(
+		&mut state,
+		ActivationBody {
+			through: k - 1,
+			..activation_body(k, through, 0)
+		},
+		DecisionRefusal::ActivationCutOutOfRange,
+	);
+	activation_unchanged(
+		&mut state,
+		activation_body(k, peek_index(), 0),
+		DecisionRefusal::ActivationCutOutOfRange,
+	);
+	// The certificate: from the recovery's (genesis) to the current one.
+	activation_unchanged(
+		&mut state,
+		activation_body(k, peek_index() - 1, 1),
+		DecisionRefusal::ActivationCertificateOutOfRange,
+	);
+	certify(&mut state, 2, [0x02; 32]);
+	activation_unchanged(
+		&mut state,
+		activation_body(k, peek_index() - 1, 3),
+		DecisionRefusal::ActivationCertificateOutOfRange,
+	);
+	let through = peek_index() - 1;
+	assert_eq!(
+		activate(&mut state, activation_body(k, through, 2)),
+		DecisionResult::ActivationRecorded {
+			token: TOKEN,
+			through,
+			certified: 2,
+		}
+	);
+	assert_eq!(
+		decisions(&state)
+			.instances()
+			.replacement(TOKEN)
+			.unwrap()
+			.activated,
+		Some(Activation {
+			incarnation: store_j(),
+			through,
+			certified: 2,
+		})
+	);
+	assert!(
+		!slot_preparing(&state, 3),
+		"activation ends the preparation"
+	);
+	// The exact retry is its historical answer, even past the cut bounds;
+	// another activation conflicts.
+	let before = state.decisions.clone();
+	assert_eq!(
+		activate(&mut state, activation_body(k, through, 2)),
+		DecisionResult::ActivationRecorded {
+			token: TOKEN,
+			through,
+			certified: 2,
+		}
+	);
+	assert_eq!(state.decisions, before);
+	activation_unchanged(
+		&mut state,
+		activation_body(k, through, 0),
+		DecisionRefusal::ActivationConflict,
+	);
+}
+
+/// ADR 0108 control 5: a lease request carries its holder's store. The replaced
+/// slot takes none while preparing; after activation the replacement's store is
+/// granted and renews, and the old store, carrying its own, is denied both a
+/// first grant and a renewal of the replacement's lineage.
+#[test]
+fn a_replaced_slots_lease_carries_its_store_and_waits_for_its_activation() {
+	let (mut state, k) = recovered();
+	let range = universe()
+		.into_iter()
+		.find(|(holder, _)| *holder == 3)
+		.unwrap()
+		.1;
+	let ask = |state: &mut SmState, incarnation: StoreIncarnation, expiry: u64| {
+		let expected_generation = decisions(state)
+			.lineages
+			.get(&range.0)
+			.map(|lineage| lineage.generation);
+		let grants = vec![crate::consensus::LeaseBatchGrant {
+			lease: lease(3, range, 0, expiry),
+			expected_generation,
+			holder_incarnation: incarnation,
+		}];
+		granted(apply_next(
+			state,
+			WendelonRequest::AcquireLeases(crate::consensus::LeaseBatch::new(0, grants).unwrap()),
+		))
+	};
+	assert_eq!(
+		ask(&mut state, store_j(), 2_000),
+		WendelonResponse::LeaseDenied,
+		"preparing"
+	);
+	let through = peek_index() - 1;
+	assert!(matches!(
+		activate(&mut state, activation_body(k, through, 0)),
+		DecisionResult::ActivationRecorded { .. }
+	));
+	assert_eq!(
+		ask(&mut state, inc(3), 2_000),
+		WendelonResponse::LeaseDenied,
+		"the old store's first grant"
+	);
+	assert_eq!(ask(&mut state, store_j(), 2_000), WendelonResponse::Success);
+	assert_eq!(decisions(&state).lineages[&range.0].incarnation, store_j());
+	assert_eq!(
+		ask(&mut state, inc(3), 3_000),
+		WendelonResponse::LeaseDenied,
+		"the old store's renewal of the replacement's lineage"
+	);
+	assert_eq!(ask(&mut state, store_j(), 3_000), WendelonResponse::Success);
+}
+
+fn index_receipt(
+	state: &mut SmState,
+	index: crate::schema::IndexObjectId,
+	phase: IndexReceiptPhase,
+	signer: Signer,
+) -> DecisionResult {
+	decide(
+		state,
+		DecisionCommand::IndexReceipt {
+			proof: sign_for_test(
+				IndexReceiptBody {
+					tenant: crate::schema::TenantId::new(7),
+					index,
+					phase,
+					signer,
+				},
+				signer,
+			),
+		},
+	)
+}
+
+fn index_state(
+	state: &SmState,
+	index: crate::schema::IndexObjectId,
+) -> Option<SecondaryIndexState> {
+	state
+		.secondary_indexes
+		.get(crate::schema::TenantId::new(7), index)
+		.map(|row| row.state)
+}
+
+/// ADR 0108 control 9: a store's index receipt is bound to its current store
+/// and to its phase. Readiness needs every slot's current store; a backfill
+/// receipt never counts toward the drop, and only every current store's drop
+/// receipt removes a Dropping index, with its receipts.
+#[test]
+fn index_receipts_are_bound_to_the_current_store_and_to_their_phase() {
+	use IndexReceiptPhase::*;
+	let tenant = crate::schema::TenantId::new(7);
+	let index = crate::schema::IndexObjectId::new([0x61; 16]);
+	let (mut state, k) = recovered();
+	let through = peek_index() - 1;
+	assert!(matches!(
+		activate(&mut state, activation_body(k, through, 0)),
+		DecisionResult::ActivationRecorded { .. }
+	));
+	// An absent index takes no receipt.
+	assert_eq!(
+		index_receipt(&mut state, index, Backfilled, signer(1)),
+		refused(DecisionRefusal::IndexReceiptUnknownIndex)
+	);
+	state
+		.secondary_indexes
+		.insert_for_test(tenant, index, SecondaryIndexState::Building);
+	let j = Signer {
+		node: 3,
+		incarnation: store_j(),
+	};
+	// The old store of slot 3, signing as itself, is not current.
+	let before = state.decisions.clone();
+	assert_eq!(
+		index_receipt(&mut state, index, Backfilled, signer(3)),
+		refused(DecisionRefusal::IndexReceiptNotCurrent)
+	);
+	assert_eq!(state.decisions, before);
+	// A drop receipt for a Building index is the wrong phase.
+	assert_eq!(
+		index_receipt(&mut state, index, DropCollected, signer(1)),
+		refused(DecisionRefusal::IndexReceiptWrongPhase)
+	);
+	for store in [signer(1), signer(2)] {
+		assert_eq!(
+			index_receipt(&mut state, index, Backfilled, store),
+			DecisionResult::IndexReceiptRecorded {
+				tenant,
+				index,
+				transition: None
+			}
+		);
+	}
+	assert_eq!(
+		index_state(&state, index),
+		Some(SecondaryIndexState::Building),
+		"readiness waits for slot 3's current store"
+	);
+	assert_eq!(
+		index_receipt(&mut state, index, Backfilled, j),
+		DecisionResult::IndexReceiptRecorded {
+			tenant,
+			index,
+			transition: Some(IndexTransition::Ready)
+		}
+	);
+	assert_eq!(index_state(&state, index), Some(SecondaryIndexState::Ready));
+	assert!(decisions(&state).holds_index_receipt(tenant, index, Backfilled, j));
+	// Every current store held a backfill receipt; Dropping keeps none of them.
+	state
+		.secondary_indexes
+		.mark_dropping(tenant, index)
+		.unwrap();
+	state
+		.decisions
+		.as_mut()
+		.unwrap()
+		.index_entered_dropping(tenant, index);
+	assert!(!decisions(&state).holds_index_receipt(tenant, index, Backfilled, j));
+	// A late backfill receipt is the wrong phase and never counts for the drop.
+	assert_eq!(
+		index_receipt(&mut state, index, Backfilled, signer(1)),
+		refused(DecisionRefusal::IndexReceiptWrongPhase)
+	);
+	for store in [signer(1), signer(2)] {
+		assert_eq!(
+			index_receipt(&mut state, index, DropCollected, store),
+			DecisionResult::IndexReceiptRecorded {
+				tenant,
+				index,
+				transition: None
+			}
+		);
+	}
+	assert_eq!(
+		index_state(&state, index),
+		Some(SecondaryIndexState::Dropping),
+		"the drop waits for slot 3's current store"
+	);
+	assert_eq!(
+		index_receipt(&mut state, index, DropCollected, j),
+		DecisionResult::IndexReceiptRecorded {
+			tenant,
+			index,
+			transition: Some(IndexTransition::Removed)
+		}
+	);
+	assert_eq!(index_state(&state, index), None);
+	assert!(!decisions(&state).holds_index_receipt(tenant, index, DropCollected, j));
+	assert_eq!(
+		index_receipt(&mut state, index, DropCollected, j),
+		refused(DecisionRefusal::IndexReceiptUnknownIndex)
+	);
+}
+
+/// ADR 0108 control 3 (D3): a replacement's store starts Full only under its
+/// CURRENT activation: not before it, not for another birth or store, and not
+/// once a later replacement opened against its instance.
+#[test]
+fn a_replacement_starts_full_only_under_its_current_activation() {
+	use crate::consensus::decisions::instances::{Origin, RaftIdentity, Role};
+	let identity = RaftIdentity {
+		instance: ALLOCATED_BASE,
+		origin: Origin::Replacement,
+		role: Role::Full,
+	};
+	let birth = [BIRTH; 16];
+	let (mut state, k) = recovered();
+	let refused = |state: &SmState, birth, store| {
+		replacement_start_authority(state, identity, birth, store)
+			.expect_err("not current")
+			.starts_with("ReplacementNotCurrent")
+	};
+	assert!(
+		refused(&state, birth, store_j()),
+		"recovered, not activated"
+	);
+	let through = peek_index() - 1;
+	assert!(matches!(
+		activate(&mut state, activation_body(k, through, 0)),
+		DecisionResult::ActivationRecorded { .. }
+	));
+	replacement_start_authority(&state, identity, birth, store_j()).unwrap();
+	assert!(refused(&state, [BIRTH + 1; 16], store_j()), "another birth");
+	assert!(refused(&state, birth, inc(3)), "another store");
+	assert!(
+		replacement_start_authority(
+			&state,
+			RaftIdentity {
+				instance: ALLOCATED_BASE + 1,
+				..identity
+			},
+			birth,
+			store_j()
+		)
+		.is_err(),
+		"another instance"
+	);
+	// A later replacement opened against this instance supersedes it.
+	assert!(matches!(
+		decide(
+			&mut state,
+			DecisionCommand::BeginReplacement {
+				token: TOKEN + 1,
+				slot: 3
+			}
+		),
+		DecisionResult::ReplacementRecorded {
+			r_old: ALLOCATED_BASE,
+			..
+		}
+	));
+	assert!(refused(&state, birth, store_j()), "superseded");
+}
+
+/// ADR 0108 control 1 (Codex 01a1e41e R1): the recorded activation's answer is
+/// bound to the recovery it names. A signed replay that changes only its cut
+/// `k` or only its recovery gid is refused with state unchanged; the exact
+/// retry keeps its historical answer after the replacement is superseded.
+#[test]
+fn an_activation_retry_names_its_recorded_recovery_exactly() {
+	let (mut state, k) = recovered();
+	let through = peek_index() - 1;
+	assert!(matches!(
+		activate(&mut state, activation_body(k, through, 0)),
+		DecisionResult::ActivationRecorded { .. }
+	));
+	for body in [
+		ActivationBody {
+			k: k - 1,
+			..activation_body(k, through, 0)
+		},
+		ActivationBody {
+			recovered_gid: 1,
+			..activation_body(k, through, 0)
+		},
+	] {
+		activation_unchanged(&mut state, body, DecisionRefusal::ActivationNotAuthorized);
+	}
+	assert!(matches!(
+		decide(
+			&mut state,
+			DecisionCommand::BeginReplacement {
+				token: TOKEN + 1,
+				slot: 3
+			}
+		),
+		DecisionResult::ReplacementRecorded { .. }
+	));
+	let before = state.decisions.clone();
+	assert_eq!(
+		activate(&mut state, activation_body(k, through, 0)),
+		DecisionResult::ActivationRecorded {
+			token: TOKEN,
+			through,
+			certified: 0,
+		},
+		"the exact retry keeps its historical answer"
+	);
+	assert_eq!(state.decisions, before);
+}
+
+/// ADR 0108 control 9 (Codex 01a1e41e R2): a voter of the applied membership
+/// that maps to no slot makes completeness unprovable: every receipt is refused
+/// before it is recorded, and no transition happens on the known voters alone.
+#[test]
+fn an_index_receipt_is_refused_while_a_voter_maps_to_no_slot() {
+	use IndexReceiptPhase::*;
+	let tenant = crate::schema::TenantId::new(7);
+	let index = crate::schema::IndexObjectId::new([0x65; 16]);
+	let (mut state, k) = recovered();
+	let through = peek_index() - 1;
+	assert!(matches!(
+		activate(&mut state, activation_body(k, through, 0)),
+		DecisionResult::ActivationRecorded { .. }
+	));
+	state
+		.secondary_indexes
+		.insert_for_test(tenant, index, SecondaryIndexState::Building);
+	state.last_membership = formed_membership(&[1, 2, ALLOCATED_BASE, ALLOCATED_BASE + 7]);
+	let j = Signer {
+		node: 3,
+		incarnation: store_j(),
+	};
+	for store in [signer(1), signer(2), j] {
+		let before = state.decisions.clone();
+		assert_eq!(
+			index_receipt(&mut state, index, Backfilled, store),
+			refused(DecisionRefusal::IndexReceiptMembershipUnknown)
+		);
+		assert_eq!(state.decisions, before);
+	}
+	assert_eq!(
+		index_state(&state, index),
+		Some(SecondaryIndexState::Building)
+	);
+}
+
+/// ADR 0108 control 1: an activation signed as the old store verifies against
+/// nothing it names; once the replacement is superseded none is recorded.
+#[test]
+fn an_activation_is_signed_by_the_promoted_store_and_refused_once_superseded() {
+	let (mut state, k) = recovered();
+	let through = peek_index() - 1;
+	let forged = sign_for_test(activation_body(k, through, 0), signer(3));
+	let before = state.decisions.clone();
+	assert!(matches!(
+		decide(
+			&mut state,
+			DecisionCommand::ActivateReplacement { proof: forged }
+		),
+		DecisionResult::Refused(_)
+	));
+	assert_eq!(state.decisions, before);
+	assert!(matches!(
+		decide(
+			&mut state,
+			DecisionCommand::BeginReplacement {
+				token: TOKEN + 1,
+				slot: 3
+			}
+		),
+		DecisionResult::ReplacementRecorded {
+			r_old: ALLOCATED_BASE,
+			..
+		}
+	));
+	let through = peek_index() - 1;
+	activation_unchanged(
+		&mut state,
+		activation_body(k, through, 0),
+		DecisionRefusal::ActivationNotAuthorized,
 	);
 }
 

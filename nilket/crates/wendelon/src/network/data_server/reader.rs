@@ -383,7 +383,20 @@ fn accepted_children_in(
 			{
 				continue;
 			}
-			if !child.plan.contains(&local) {
+			// Wendelon ADR 0108: a child counts for this store when its plan names
+			// the slot at an incarnation in the store's recorded ancestry (ADR
+			// 0107 C2): an activated replacement reads the children it recovered
+			// for its predecessors. For a never-replaced store this is `contains`.
+			let named = child.plan.iter().any(|member| {
+				member.node == local.node
+					&& crate::consensus::decisions::in_recorded_ancestry(
+						state,
+						local.node,
+						local.incarnation,
+						member.incarnation,
+					)
+			});
+			if !named {
 				return Err(ReadRefusal::Final(
 					"a child's plan excludes this store; this checkpoint reads only complete local copies"
 						.into(),

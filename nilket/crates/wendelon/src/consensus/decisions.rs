@@ -142,6 +142,59 @@ pub struct RecoveryBody {
 	pub k: u64,
 }
 
+/// ADR 0108 (wendelon): a recovered replacement's activation. Store `store`
+/// at slot `slot`, recorded as recovered at (`recovered_gid`, `k`), held every
+/// child owed to its slot that was applied through `through`, with its active
+/// base at certificate `certified`. Signed by (slot, store).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActivationBody {
+	pub token: u128,
+	pub slot: u32,
+	pub r_new: u32,
+	pub birth: instances::Birth,
+	pub store: StoreIncarnation,
+	pub recovered_gid: u64,
+	pub k: u64,
+	pub through: u64,
+	pub certified: u64,
+}
+
+/// ADR 0108 (wendelon): the secondary-index lifecycle phase a store reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IndexReceiptPhase {
+	/// The store's historical backfill is complete under its own cut.
+	Backfilled,
+	/// The store has collected the Dropping index's local state.
+	DropCollected,
+}
+
+/// ADR 0108 (wendelon): a store's receipt that it completed `phase` for the
+/// index, signed by the store it names; that store must be its slot's current.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexReceiptBody {
+	pub tenant: TenantId,
+	pub index: crate::schema::IndexObjectId,
+	pub phase: IndexReceiptPhase,
+	pub signer: Signer,
+}
+
+/// ADR 0108 (wendelon): an index's receipts, one set per phase, so a backfill
+/// receipt never counts toward the drop.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexReceipts {
+	pub backfilled: BTreeSet<Signer>,
+	pub drop_collected: BTreeSet<Signer>,
+}
+
+/// ADR 0108 (wendelon): the catalog change a receipt completes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IndexTransition {
+	/// Building becomes Ready.
+	Ready,
+	/// The Dropping index is removed.
+	Removed,
+}
+
 /// ADR 0729: how long past a lease's own expiry, on the ring clock, before its
 /// range may be taken over. A margin, not a bound: a lease's start is the
 /// requester's clock reading, which nothing gates (only its TTL is clamped), so
@@ -466,6 +519,15 @@ pub enum DecisionCommand {
 	RecoveryProved {
 		proof: Signed<RecoveryBody>,
 	},
+	/// ADR 0108 (wendelon): the recovered replacement's signed activation,
+	/// recorded once per token; it ends the slot's preparation.
+	ActivateReplacement {
+		proof: Signed<ActivationBody>,
+	},
+	/// ADR 0108 (wendelon): a store's secondary-index receipt.
+	IndexReceipt {
+		proof: Signed<IndexReceiptBody>,
+	},
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -612,6 +674,28 @@ pub enum DecisionRefusal {
 	RecoveryConflict,
 	/// ADR 0106 (wendelon): its cut is not below the entry that records it.
 	RecoveryCutAhead,
+	/// ADR 0108 (wendelon): the activation is not the current recovered
+	/// replacement's (token, slot, instance, birth, store, recorded recovery,
+	/// serving instance).
+	ActivationNotAuthorized,
+	/// ADR 0108 (wendelon): another activation is already recorded for the token.
+	ActivationConflict,
+	/// ADR 0108 (wendelon): its cut is below the recovery cut, or not below the
+	/// entry that records it.
+	ActivationCutOutOfRange,
+	/// ADR 0108 (wendelon): its certificate is below the recorded recovery's or
+	/// above the current one.
+	ActivationCertificateOutOfRange,
+	/// ADR 0108 (wendelon): the receipt's store is not its slot's current one.
+	IndexReceiptNotCurrent,
+	/// ADR 0108 (wendelon): the receipt names no index in the catalog.
+	IndexReceiptUnknownIndex,
+	/// ADR 0108 (wendelon): the receipt's phase is not the index's: Backfilled
+	/// needs Building or Ready, DropCollected needs Dropping.
+	IndexReceiptWrongPhase,
+	/// ADR 0108 (wendelon): a voter of the applied membership maps to no slot,
+	/// so whether every slot's current store reported cannot be proved.
+	IndexReceiptMembershipUnknown,
 }
 
 /// ADR 0721: how the key a store signs with stands against the replicated
@@ -823,6 +907,20 @@ pub enum DecisionResult {
 		gid: u64,
 		k: u64,
 	},
+	/// ADR 0108 (wendelon): the store's index receipt is recorded, and the
+	/// catalog change it completes, if any.
+	IndexReceiptRecorded {
+		tenant: TenantId,
+		index: crate::schema::IndexObjectId,
+		transition: Option<IndexTransition>,
+	},
+	/// ADR 0108 (wendelon): the replacement's activation is recorded (now, or
+	/// earlier with exactly this statement).
+	ActivationRecorded {
+		token: u128,
+		through: u64,
+		certified: u64,
+	},
 }
 
 /// What a retry of `key` with `request_digest` learns. Pure over state.
@@ -907,6 +1005,9 @@ pub struct DecisionState {
 	hold: Option<(u128, u64)>,
 	/// ADR 0104 (wendelon): granted Raft instances and replacements.
 	instances: instances::InstanceState,
+	/// ADR 0108 (wendelon): secondary-index receipts by (tenant, index), per
+	/// phase, keyed by the reporting store.
+	index_receipts: BTreeMap<(TenantId, crate::schema::IndexObjectId), IndexReceipts>,
 }
 
 impl Default for DecisionState {
@@ -926,6 +1027,7 @@ impl Default for DecisionState {
 			sealed: None,
 			hold: None,
 			instances: instances::InstanceState::default(),
+			index_receipts: BTreeMap::new(),
 		}
 	}
 }
@@ -939,6 +1041,35 @@ impl DecisionState {
 	/// ADR 0104 (wendelon): granted Raft instances and replacements.
 	pub fn instances(&self) -> &instances::InstanceState {
 		&self.instances
+	}
+
+	/// ADR 0108 (wendelon): whether `store` holds its `phase` receipt for the
+	/// index.
+	pub fn holds_index_receipt(
+		&self,
+		tenant: TenantId,
+		index: crate::schema::IndexObjectId,
+		phase: IndexReceiptPhase,
+		store: Signer,
+	) -> bool {
+		self.index_receipts
+			.get(&(tenant, index))
+			.is_some_and(|receipts| match phase {
+				IndexReceiptPhase::Backfilled => receipts.backfilled.contains(&store),
+				IndexReceiptPhase::DropCollected => receipts.drop_collected.contains(&store),
+			})
+	}
+
+	/// ADR 0108 (wendelon): an index entering Dropping keeps none of its
+	/// backfill receipts, as the shared catalog clears its own set.
+	pub(crate) fn index_entered_dropping(
+		&mut self,
+		tenant: TenantId,
+		index: crate::schema::IndexObjectId,
+	) {
+		if let Some(receipts) = self.index_receipts.get_mut(&(tenant, index)) {
+			receipts.backfilled.clear();
+		}
 	}
 
 	pub fn lineages(&self) -> &BTreeMap<u64, Lineage> {
@@ -1266,10 +1397,15 @@ pub(crate) fn any_lineage_off_primary(state: &SmState) -> bool {
 /// new generation for the same holder), or the ring primary's first grant
 /// where no lineage exists. `stamp_ms` is the batch's replicated leader stamp;
 /// it is used only where a generation begins.
+///
+/// ADR 0108 (wendelon): the holder's incarnation is the one its request
+/// carries, and it must be the slot's current one; a lingering old process of
+/// a replaced slot, carrying its own, is denied.
 pub(crate) fn admit_lease_grant(
 	state: &SmState,
 	lease: &LeaseDescriptor,
 	expected_generation: Option<u64>,
+	holder_incarnation: StoreIncarnation,
 	stamp_ms: u64,
 ) -> Result<GrantEffect, ()> {
 	let decisions = state.decisions.as_ref().ok_or(())?;
@@ -1277,7 +1413,10 @@ pub(crate) fn admit_lease_grant(
 	if lease.epoch != config.epoch || lease.lease_start >= lease.lease_expiry {
 		return Err(());
 	}
-	let incarnation = current_incarnation(state, lease.holder.id).ok_or(())?;
+	if current_incarnation(state, lease.holder.id) != Some(holder_incarnation) {
+		return Err(());
+	}
+	let incarnation = holder_incarnation;
 	match decisions.lineages.get(&lease.range_start) {
 		Some(lineage) => {
 			if lineage.range_end != lease.range_end
@@ -1793,6 +1932,209 @@ fn record_recovery(
 	Ok(recorded)
 }
 
+/// ADR 0108 (wendelon): records a recovered replacement's signed activation.
+/// As for the recovery statement, the reducer judges fields and authority:
+/// the signer states it only after holding every owed child through its cut.
+/// An exact recorded activation answers its historical success first; a first
+/// one needs the current recovered replacement, a cut from its recovery cut to
+/// below this entry, and a certificate from its recovery's to the current one.
+fn record_activation(
+	state: &SmState,
+	decisions: &mut DecisionState,
+	proof: &Signed<ActivationBody>,
+	log_index: u64,
+) -> Result<DecisionResult, DecisionRefusal> {
+	use DecisionRefusal::*;
+	let body = *evidence::verify(decisions, proof)?.body();
+	let replacement = decisions
+		.instances
+		.replacement(body.token)
+		.ok_or(ActivationNotAuthorized)?;
+	let instances::ReplacementPhase::Done { r_new } = replacement.phase else {
+		return Err(ActivationNotAuthorized);
+	};
+	let granted = decisions
+		.instances
+		.record(r_new)
+		.map(|record| (record.birth, record.kind));
+	if replacement.slot != body.slot
+		|| r_new != body.r_new
+		|| replacement.promoted.map(|promotion| promotion.incarnation) != Some(body.store)
+		|| granted
+			!= Some((
+				body.birth,
+				instances::GrantKind::Replacement { token: body.token },
+			)) {
+		return Err(ActivationNotAuthorized);
+	}
+	// The recovery the activation names is immutable once recorded: an exact
+	// retry must name it too, before any historical answer (Codex 01a1e41e R1).
+	let Some(recovery) = replacement.recovered else {
+		return Err(ActivationNotAuthorized);
+	};
+	if (recovery.gid, recovery.k) != (body.recovered_gid, body.k) {
+		return Err(ActivationNotAuthorized);
+	}
+	let statement = instances::Activation {
+		incarnation: body.store,
+		through: body.through,
+		certified: body.certified,
+	};
+	let recorded = DecisionResult::ActivationRecorded {
+		token: body.token,
+		through: body.through,
+		certified: body.certified,
+	};
+	match replacement.activated {
+		Some(existing) if existing == statement => return Ok(recorded),
+		Some(_) => return Err(ActivationConflict),
+		None => {}
+	}
+	if !instance_serves(state, decisions, r_new)
+		|| current_incarnation(state, body.slot) != Some(body.store)
+	{
+		return Err(ActivationNotAuthorized);
+	}
+	if body.through < body.k || body.through >= log_index {
+		return Err(ActivationCutOutOfRange);
+	}
+	let current = decisions
+		.generations
+		.current
+		.as_ref()
+		.map_or(0, |certificate| certificate.gid);
+	if body.certified < recovery.gid || body.certified > current {
+		return Err(ActivationCertificateOutOfRange);
+	}
+	decisions.instances.record_activation(body.token, statement);
+	Ok(recorded)
+}
+
+/// ADR 0108 (wendelon): records a store's index receipt in its phase's set. The
+/// phase must be the index's, and its store its slot's current one. A
+/// transition counts only its own phase, at every voter slot's current store:
+/// Building becomes Ready on all backfill receipts; a Dropping index is removed,
+/// with its receipts, on all drop receipts. `apply` changes the catalog.
+fn record_index_receipt(
+	state: &SmState,
+	decisions: &mut DecisionState,
+	proof: &Signed<IndexReceiptBody>,
+) -> Result<DecisionResult, DecisionRefusal> {
+	use crate::schema::SecondaryIndexState::*;
+	use DecisionRefusal::*;
+	let body = *evidence::verify(decisions, proof)?.body();
+	if current_incarnation(state, body.signer.node) != Some(body.signer.incarnation) {
+		return Err(IndexReceiptNotCurrent);
+	}
+	let row = state
+		.secondary_indexes
+		.get(body.tenant, body.index)
+		.ok_or(IndexReceiptUnknownIndex)?;
+	match (body.phase, row.state) {
+		(IndexReceiptPhase::Backfilled, Building | Ready)
+		| (IndexReceiptPhase::DropCollected, Dropping) => {}
+		_ => return Err(IndexReceiptWrongPhase),
+	}
+	// The decisions are out of `state` while reducing: slots come from them.
+	// Every voter must map to a slot; an unknown one makes completeness
+	// unprovable, refused before anything is recorded (Codex 01a1e41e R2).
+	let Some(slots) = state
+		.last_membership
+		.voter_ids()
+		.map(|voter| instances::slot_in(decisions, voter).ok())
+		.collect::<Option<Vec<u32>>>()
+	else {
+		return Err(IndexReceiptMembershipUnknown);
+	};
+	let key = (body.tenant, body.index);
+	let receipts = decisions.index_receipts.entry(key).or_default();
+	let set = match body.phase {
+		IndexReceiptPhase::Backfilled => &mut receipts.backfilled,
+		IndexReceiptPhase::DropCollected => &mut receipts.drop_collected,
+	};
+	set.insert(body.signer);
+	let complete = !slots.is_empty()
+		&& slots.iter().all(|&slot| {
+			current_incarnation(state, slot).is_some_and(|incarnation| {
+				set.contains(&Signer {
+					node: slot,
+					incarnation,
+				})
+			})
+		});
+	let transition = match body.phase {
+		IndexReceiptPhase::Backfilled if complete && row.state == Building => {
+			Some(IndexTransition::Ready)
+		}
+		IndexReceiptPhase::DropCollected if complete => {
+			decisions.index_receipts.remove(&key);
+			Some(IndexTransition::Removed)
+		}
+		_ => None,
+	};
+	Ok(DecisionResult::IndexReceiptRecorded {
+		tenant: body.tenant,
+		index: body.index,
+		transition,
+	})
+}
+
+/// ADR 0108 (wendelon) D3: whether a replacement's store may start Full, from
+/// CURRENT applied state, never from a record somewhere in history: its
+/// instance is the r_new of a Done replacement of its slot whose activation and
+/// promotion name `store`; `store` is its slot's current incarnation and bound;
+/// the instance serves (not retired, a voter in every configuration, not the
+/// old instance of an open replacement); its grant's birth is the page's. Any
+/// supersession of the instance or the store refuses. The reducer's answer to
+/// an exact activation retry is a separate, historical matter.
+pub(crate) fn replacement_start_authority(
+	state: &SmState,
+	identity: instances::RaftIdentity,
+	page_birth: instances::Birth,
+	store: StoreIncarnation,
+) -> Result<(), String> {
+	let refuse = |why: &str| Err(format!("ReplacementNotCurrent: {why}"));
+	let Some(decisions) = state.decisions.as_ref() else {
+		return refuse("no decision state");
+	};
+	let Some(record) = decisions.instances.record(identity.instance) else {
+		return refuse("the instance was never granted");
+	};
+	let instances::GrantKind::Replacement { token } = record.kind else {
+		return refuse("the instance was not granted for a replacement");
+	};
+	if record.birth != page_birth {
+		return refuse("the grant's birth is not this store's");
+	}
+	let Some(replacement) = decisions.instances.replacement(token) else {
+		return refuse("no replacement under the grant's token");
+	};
+	if replacement.phase
+		!= (instances::ReplacementPhase::Done {
+			r_new: identity.instance,
+		}) {
+		return refuse("the replacement is not Done for this instance");
+	}
+	if replacement
+		.activated
+		.map(|activation| activation.incarnation)
+		!= Some(store)
+		|| replacement.promoted.map(|promotion| promotion.incarnation) != Some(store)
+	{
+		return refuse("no activation of this store is recorded");
+	}
+	if current_incarnation(state, replacement.slot) != Some(store) {
+		return refuse("this store is no longer its slot's current one");
+	}
+	if !decisions.signers.contains_key(&(replacement.slot, store)) {
+		return refuse("this store's signer is not bound");
+	}
+	if !instance_serves(state, decisions, identity.instance) {
+		return refuse("the instance no longer serves its slot");
+	}
+	Ok(())
+}
+
 /// ADR 0105 (wendelon): whether `slot` is between its replacement's Done and
 /// its activation, when it takes no new lease, lineage or coordination.
 pub(crate) fn slot_preparing(state: &SmState, slot: u32) -> bool {
@@ -1868,6 +2210,23 @@ pub(crate) mod evidence {
 				node: self.slot,
 				incarnation: self.store,
 			})
+		}
+	}
+
+	impl Evidence for super::ActivationBody {
+		const DOMAIN: &'static str = "wendelon replacement activation v1";
+		fn bound_signer(&self) -> Option<Signer> {
+			Some(Signer {
+				node: self.slot,
+				incarnation: self.store,
+			})
+		}
+	}
+
+	impl Evidence for super::IndexReceiptBody {
+		const DOMAIN: &'static str = "wendelon secondary index receipt v1";
+		fn bound_signer(&self) -> Option<Signer> {
+			Some(self.signer)
 		}
 	}
 
@@ -1971,6 +2330,18 @@ pub(crate) fn apply(
 	if let DecisionResult::TookOver { range_start, .. } = result {
 		state.leases.remove(&range_start);
 	}
+	// ADR 0108 (wendelon): the catalog change a receipt completed.
+	if let DecisionResult::IndexReceiptRecorded {
+		tenant,
+		index,
+		transition: Some(transition),
+	} = result
+	{
+		match transition {
+			IndexTransition::Ready => state.secondary_indexes.promote_to_ready(tenant, index),
+			IndexTransition::Removed => state.secondary_indexes.remove_dropped(tenant, index),
+		}
+	}
 	result
 }
 
@@ -2027,6 +2398,10 @@ fn reduce(
 		DecisionCommand::RecoveryProved { proof } => {
 			record_recovery(state, decisions, &proof, log_index)
 		}
+		DecisionCommand::ActivateReplacement { proof } => {
+			record_activation(state, decisions, &proof, log_index)
+		}
+		DecisionCommand::IndexReceipt { proof } => record_index_receipt(state, decisions, &proof),
 	};
 	outcome.unwrap_or_else(DecisionResult::Refused)
 }

@@ -770,6 +770,8 @@ pub struct ReplacementReportWire {
 	/// ADR 0107 (wendelon): the cluster's current certificate (gid, cut), read
 	/// with the record: whether certification moved past the recovery.
 	pub certified: Option<(u64, u64)>,
+	/// ADR 0108 (wendelon): the recorded activation's (cut, certificate gid).
+	pub activated: Option<(u64, u64)>,
 }
 
 /// ADR 0736: a TENANT_ADMIN_RESP body as the response, then the backup
@@ -2223,6 +2225,18 @@ impl WendelonControlServer {
 		} else {
 			None
 		};
+		// Wendelon ADR 0108: under ParentDecisions a store's index receipts are
+		// decision commands bound to its incarnation, never these slot receipts.
+		if lifecycle_replica.is_some()
+			&& self.decision_mode == crate::consensus::decision_mode::DecisionMode::ParentDecisions
+		{
+			return self.schema_update_rejection(
+				&frame,
+				CONTROL_REASON_AUTHORIZATION_FAILED,
+				"secondary-index lifecycle receipts are decision commands under ParentDecisions",
+				None,
+			);
+		}
 		if let Some(complete) = lifecycle_replica {
 			authorize_actor(&context.actor, ActorPermission::InterNodeTransport)?;
 			if context.actor.role != ActorRole::DataNode
@@ -3407,6 +3421,7 @@ impl WendelonControlServer {
 						bound_key: None,
 						recovered: None,
 						certified: None,
+						activated: None,
 					}),
 					None,
 				),
@@ -4213,6 +4228,9 @@ impl WendelonControlServer {
 								.current
 								.as_ref()
 								.map(|certificate| (certificate.gid, certificate.t)),
+							activated: record
+								.activated
+								.map(|activation| (activation.through, activation.certified)),
 						})
 					})
 					.await;
@@ -4528,6 +4546,10 @@ impl WendelonControlServer {
 		if !self.is_leader().await {
 			return self.leases_response(&frame, LeaseStatus::DENIED_NOT_LEADER, &[]);
 		}
+		// ADR 0108 (wendelon): the holder's carried store incarnation.
+		let holder_incarnation = crate::consensus::StoreIncarnation::from_raw(u128::from_le_bytes(
+			header.holder_incarnation,
+		));
 		let mut starts = std::collections::BTreeSet::new();
 		for range in &ranges {
 			let single = AcquireLeaseRequestMeta {
@@ -4544,7 +4566,7 @@ impl WendelonControlServer {
 			};
 			if !starts.insert(range.range_start)
 				|| self
-					.validate_lease_batch_target(remote, &single, expected)
+					.validate_lease_batch_target(remote, &single, expected, holder_incarnation)
 					.await
 					.is_err()
 			{
@@ -4590,6 +4612,7 @@ impl WendelonControlServer {
 			.map(|(lease, range)| crate::consensus::LeaseBatchGrant {
 				lease: *lease,
 				expected_generation: range.expected().unwrap_or(None),
+				holder_incarnation,
 			})
 			.collect();
 		let batch = crate::consensus::LeaseBatch::new(stamp_ms, grants)
@@ -5538,30 +5561,46 @@ impl WendelonControlServer {
 	/// the generation it names, or, where no lineage exists and it names none,
 	/// one of its ring primary ranges. From applied state; the reducer checks
 	/// the same again in log order.
+	///
+	/// Wendelon ADR 0108: the carried store incarnation must be the holder
+	/// slot's current one, and a held lineage's.
 	async fn validate_lease_batch_target(
 		&self,
 		remote: NodeId,
 		req: &AcquireLeaseRequestMeta,
 		expected: Option<u64>,
+		incarnation: crate::consensus::StoreIncarnation,
 	) -> std::io::Result<()> {
 		let denied = |why: &str| Error::new(ErrorKind::PermissionDenied, why.to_string());
 		if remote != req.holder {
 			return Err(denied("lease holder is not the remote caller"));
 		}
 		let (range_start, range_end, holder) = (req.range_start, req.range_end, req.holder);
-		let lineage = self
+		let (lineage, current) = self
 			.state_machine
 			.read_state(move |state| {
-				state
-					.decisions
-					.as_ref()
-					.and_then(|decisions| decisions.lineages().get(&range_start).copied())
+				(
+					state
+						.decisions
+						.as_ref()
+						.and_then(|decisions| decisions.lineages().get(&range_start).copied()),
+					state
+						.incarnations
+						.get(&holder.id)
+						.and_then(|registry| registry.current),
+				)
 			})
 			.await;
+		if current != Some(incarnation) {
+			return Err(denied(
+				"HolderNotCurrent: the lease request's store is not its slot's current one",
+			));
+		}
 		match (lineage, expected) {
 			(Some(lineage), Some(generation))
 				if lineage.range_end == range_end
 					&& lineage.holder == holder
+					&& lineage.incarnation == incarnation
 					&& lineage.generation == generation =>
 			{
 				Ok(())

@@ -116,6 +116,19 @@ pub struct Replacement {
 	pub promoted: Option<Promotion>,
 	/// ADR 0106 (wendelon): the one recovery statement recorded for it.
 	pub recovered: Option<Recovery>,
+	/// ADR 0108 (wendelon): the one activation recorded for it; it ends the
+	/// slot's preparation.
+	pub activated: Option<Activation>,
+}
+
+/// ADR 0108 (wendelon): a recovered replacement's activation: its store, the
+/// applied cut `through` at which it held every child owed to its slot, and
+/// the certificate gid its active base matched at that cut.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Activation {
+	pub incarnation: crate::consensus::StoreIncarnation,
+	pub through: u64,
+	pub certified: u64,
 }
 
 /// ADR 0106 (wendelon): a promoted store's recorded recovery: the certificate
@@ -177,11 +190,12 @@ impl InstanceState {
 			.map(|(token, replacement)| (*token, replacement))
 	}
 	/// ADR 0105 (wendelon): slot `slot` is between a Done replacement and that
-	/// replacement's activation (gate 4, which does not exist yet): its live
-	/// instance is the replacement's, which may prepare and nothing else.
+	/// replacement's activation (ADR 0108): its live instance is the
+	/// replacement's, which may prepare and nothing else.
 	pub fn preparing(&self, slot: u32) -> bool {
 		self.replacements.values().any(|replacement| {
 			replacement.slot == slot
+				&& replacement.activated.is_none()
 				&& matches!(replacement.phase, ReplacementPhase::Done { r_new } if !self.retired.contains(&r_new))
 		})
 	}
@@ -228,6 +242,12 @@ impl InstanceState {
 	pub(crate) fn record_recovery(&mut self, token: u128, recovery: Recovery) {
 		if let Some(replacement) = self.replacements.get_mut(&token) {
 			replacement.recovered = Some(recovery);
+		}
+	}
+
+	pub(crate) fn record_activation(&mut self, token: u128, activation: Activation) {
+		if let Some(replacement) = self.replacements.get_mut(&token) {
+			replacement.activated = Some(activation);
 		}
 	}
 
@@ -454,6 +474,7 @@ pub(super) fn begin_replacement(
 		phase: ReplacementPhase::Begun,
 		promoted: None,
 		recovered: None,
+		activated: None,
 	};
 	let result = recorded(&replacement);
 	decisions.instances.replacements.insert(token, replacement);

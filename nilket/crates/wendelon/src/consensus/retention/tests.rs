@@ -937,6 +937,8 @@ async fn retention_status_is_additive_and_shared() {
 		fips_self_test_last_ts: None,
 		control_retention,
 		consensus_timing: crate::consensus::ConsensusTimingStatus::default_profile(),
+		raft_instance: Some(7),
+		store_incarnation: Some(format!("{:032x}", 0x0108_u128)),
 	};
 	let json = |snapshot: &ReadinessSnapshot| {
 		let mut value: serde_json::Value = serde_json::from_str(&snapshot.to_json()).unwrap();
@@ -964,7 +966,9 @@ async fn retention_status_is_additive_and_shared() {
 			"consensus_timing": {
 				"base_millis": 50, "heartbeat_millis": 50, "election_min_millis": 150,
 				"election_max_millis": 300, "snapshot_chunk_millis": 200
-			}
+			},
+			"raft_instance": 7,
+			"store_incarnation": "00000000000000000000000000000108"
 		})
 	);
 

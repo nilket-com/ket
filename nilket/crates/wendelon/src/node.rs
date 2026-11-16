@@ -2474,6 +2474,21 @@ impl WendelonNode {
 		let identity =
 			instance_startup::establish_identity(&cfg, &log_store, &dial_provider, &pool, false)
 				.await?;
+		// ADR 0108 (wendelon) D3: a replacement's store starts Full only under
+		// its CURRENT activation, judged on the recovered state before any
+		// election-enabled Raft, request publication or duty exists.
+		if identity.origin == crate::consensus::decisions::instances::Origin::Replacement {
+			let birth = log_store.birth().await.ok_or_else(|| {
+				Error::new(ErrorKind::InvalidData, "a replacement's store has no birth")
+			})?;
+			crate::consensus::decisions::replacement_start_authority(
+				&recovered_state,
+				identity,
+				birth,
+				slab.owner_ref()?.incarnation(),
+			)
+			.map_err(|why| Error::new(ErrorKind::PermissionDenied, why))?;
+		}
 		let mut raft_network = WendelonRaftNetworkFactory::new(dial_provider.clone(), pool.clone())
 			.with_decision_mode(cfg.decision_mode);
 		if cfg.decision_mode == crate::consensus::decision_mode::DecisionMode::ParentDecisions {
@@ -2622,7 +2637,7 @@ impl WendelonNode {
 			.with_tracker(tracker.clone())
 			.with_lease_gate(true)
 			.with_decision_mode(cfg.decision_mode)
-			.with_decision_signer(decision_signer)
+			.with_decision_signer(decision_signer.clone())
 			.with_decision_proposals(decision_proposals.clone())
 			.with_directory_owner(owner.clone()),
 		);
@@ -2655,6 +2670,11 @@ impl WendelonNode {
 		#[cfg(feature = "test-support")]
 		let control_server = control_server.with_join_promotion_gate(cfg.join_promotion_gate.clone());
 		let control_server = Arc::new(control_server);
+		// Wendelon ADR 0108: the secondary-index lifecycle's receipt submitter.
+		let index_receipts = decision_proposals
+			.clone()
+			.zip(decision_signer.clone())
+			.map(|(proposals, signer)| IndexReceiptSubmitter { proposals, signer });
 		if let Some(proposals) = decision_proposals {
 			let incarnation = slab.owner_ref()?.incarnation();
 			let data_server = data_server.clone();
@@ -3048,6 +3068,7 @@ impl WendelonNode {
 				state_machine.clone(),
 				control_server.clone(),
 				local_node,
+				index_receipts,
 			));
 		#[cfg(test)]
 		scope
@@ -3382,6 +3403,7 @@ impl WendelonNode {
 			retention: self.retention.clone(),
 			consensus_timing: self.consensus_timing,
 			crypto: self.crypto.clone(),
+			slab: self.slab.clone(),
 		}
 	}
 
@@ -3409,6 +3431,8 @@ pub struct NodeReadinessView {
 	retention: Arc<RetentionGuard>,
 	consensus_timing: crate::consensus::ConsensusTimingStatus,
 	crypto: Arc<CryptoManager>,
+	/// Wendelon ADR 0108: the store this process serves.
+	slab: Arc<SlabManager>,
 }
 
 #[async_trait]
@@ -3473,6 +3497,12 @@ impl ReadinessReporter for NodeReadinessView {
 			fips_self_test_last_ts: fips_build_state.self_test_last_ts,
 			control_retention: self.retention.status(),
 			consensus_timing: self.consensus_timing,
+			raft_instance: Some(self.raft.metrics().borrow().id),
+			store_incarnation: self
+				.slab
+				.owner_ref()
+				.ok()
+				.map(|owner| format!("{:032x}", owner.incarnation().get())),
 		}
 	}
 }
@@ -3703,6 +3733,14 @@ fn advertised_roles() -> NodeRoleSet {
 	NodeRoleSet::empty()
 		.with(NodeRole::Data)
 		.with(NodeRole::Control)
+}
+
+/// Test-only: a store's control artifact paths (WAL, vote page, snapshot).
+#[cfg(test)]
+pub(crate) fn control_artifact_paths_for_test(
+	data_dir: &std::path::Path,
+) -> (PathBuf, PathBuf, PathBuf) {
+	control_artifact_paths(data_dir)
 }
 
 fn control_artifact_paths(data_dir: &std::path::Path) -> (PathBuf, PathBuf, PathBuf) {
@@ -4351,14 +4389,66 @@ fn secondary_index_lifecycle_envelope(
 	))
 }
 
+/// Wendelon ADR 0108: under ParentDecisions a store's secondary-index receipts
+/// are decision commands it signs as its own incarnation.
+#[derive(Clone)]
+struct IndexReceiptSubmitter {
+	proposals: Arc<crate::network::decision_proposals::DecisionProposals>,
+	signer: Arc<crate::network::data_server::child_writes::DecisionSigner>,
+}
+
+impl IndexReceiptSubmitter {
+	async fn submit(
+		&self,
+		tenant: TenantId,
+		index: crate::schema::IndexObjectId,
+		phase: crate::consensus::decisions::IndexReceiptPhase,
+	) {
+		let proof = crate::consensus::decisions::evidence::sign(
+			&self.signer.key,
+			crate::consensus::decisions::IndexReceiptBody {
+				tenant,
+				index,
+				phase,
+				signer: self.signer.signer,
+			},
+			self.signer.signer,
+		);
+		// The answer is not classified: a later tick asks applied state again
+		// and submits once more while the receipt is not held.
+		let _ = self
+			.proposals
+			.propose(crate::network::decision_proposals::ForwardedDecision::IndexReceipt { proof })
+			.await;
+	}
+}
+
 async fn run_secondary_index_lifecycle_tick(
 	slab: &Arc<SlabManager>,
 	state_machine: &WendelonStateMachine,
 	control: &Arc<WendelonControlServer>,
 	local_node: NodeId,
+	receipts: Option<&IndexReceiptSubmitter>,
 ) -> std::io::Result<()> {
+	use crate::consensus::decisions::IndexReceiptPhase;
 	let work = {
 		let state = state_machine.state_snapshot().await;
+		// Wendelon ADR 0108: whether this store holds its receipt for a phase,
+		// by its incarnation under ParentDecisions, by slot under Today.
+		let holds = |tenant_id: TenantId,
+		             row: &crate::schema::SecondaryIndexCatalogRow,
+		             phase: IndexReceiptPhase| match (
+			receipts,
+			state.decisions.as_ref(),
+		) {
+			(Some(receipts), Some(decisions)) => decisions.holds_index_receipt(
+				tenant_id,
+				row.descriptor.index_object_id,
+				phase,
+				receipts.signer.signer,
+			),
+			_ => phase == IndexReceiptPhase::Backfilled && row.has_backfill_completion(local_node),
+		};
 		state
 			.secondary_indexes
 			.rows()
@@ -4379,12 +4469,14 @@ async fn run_secondary_index_lifecycle_tick(
 						.latest_by_id(tenant_id, row.descriptor.table_object_id)
 						.cloned(),
 					table_indexes,
+					holds(tenant_id, row, IndexReceiptPhase::Backfilled),
+					holds(tenant_id, row, IndexReceiptPhase::DropCollected),
 				)
 			})
 			.collect::<Vec<_>>()
 	};
 
-	for (tenant_id, row, table, table_indexes) in work {
+	for (tenant_id, row, table, table_indexes, has_receipt, has_drop_receipt) in work {
 		match row.state {
 			SecondaryIndexState::Building | SecondaryIndexState::Ready => {
 				let Some(table) = table else {
@@ -4395,7 +4487,6 @@ async fn run_secondary_index_lifecycle_tick(
 					);
 					continue;
 				};
-				let has_receipt = row.has_backfill_completion(local_node);
 				// DC-248: every process makes its own cut, receipt or not; a buffer
 				// sealed without one could be a suffix of a slab open kept active.
 				if !has_receipt
@@ -4419,27 +4510,56 @@ async fn run_secondary_index_lifecycle_tick(
 					)
 					.await?;
 				if report.historical_complete && !has_receipt {
-					control
-						.submit_secondary_index_lifecycle(secondary_index_lifecycle_envelope(
-							tenant_id,
-							&row.descriptor,
-							local_node,
-							SchemaMutationKind::IndexBackfillComplete,
-						)?)
-						.await?;
+					match receipts {
+						Some(receipts) => {
+							receipts
+								.submit(
+									tenant_id,
+									row.descriptor.index_object_id,
+									IndexReceiptPhase::Backfilled,
+								)
+								.await
+						}
+						None => {
+							control
+								.submit_secondary_index_lifecycle(
+									secondary_index_lifecycle_envelope(
+										tenant_id,
+										&row.descriptor,
+										local_node,
+										SchemaMutationKind::IndexBackfillComplete,
+									)?,
+								)
+								.await?
+						}
+					}
 				}
 			}
 			SecondaryIndexState::Dropping => {
 				slab.gc_secondary_index_segments_for_dropping_index(tenant_id, &row.descriptor)
 					.await?;
-				control
-					.submit_secondary_index_lifecycle(secondary_index_lifecycle_envelope(
-						tenant_id,
-						&row.descriptor,
-						local_node,
-						SchemaMutationKind::IndexDropGcComplete,
-					)?)
-					.await?;
+				match receipts {
+					Some(receipts) if !has_drop_receipt => {
+						receipts
+							.submit(
+								tenant_id,
+								row.descriptor.index_object_id,
+								IndexReceiptPhase::DropCollected,
+							)
+							.await
+					}
+					Some(_) => {}
+					None => {
+						control
+							.submit_secondary_index_lifecycle(secondary_index_lifecycle_envelope(
+								tenant_id,
+								&row.descriptor,
+								local_node,
+								SchemaMutationKind::IndexDropGcComplete,
+							)?)
+							.await?
+					}
+				}
 			}
 		}
 	}
@@ -4451,12 +4571,18 @@ fn spawn_secondary_index_lifecycle_driver(
 	state_machine: WendelonStateMachine,
 	control: Arc<WendelonControlServer>,
 	local_node: NodeId,
+	receipts: Option<IndexReceiptSubmitter>,
 ) -> JoinHandle<()> {
 	tokio::spawn(async move {
 		loop {
-			if let Err(error) =
-				run_secondary_index_lifecycle_tick(&slab, &state_machine, &control, local_node)
-					.await
+			if let Err(error) = run_secondary_index_lifecycle_tick(
+				&slab,
+				&state_machine,
+				&control,
+				local_node,
+				receipts.as_ref(),
+			)
+			.await
 			{
 				tracing::warn!(
 					node_id = local_node.id,

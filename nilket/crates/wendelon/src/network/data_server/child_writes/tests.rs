@@ -584,7 +584,7 @@ async fn a_reserved_child_completes_once_and_a_retry_adds_no_version() {
 		slab.clone(),
 		machine.clone(),
 		locks.clone(),
-		planned.clone(),
+		admitted(&slab, planned.clone()).await,
 		authority(&r, ChildRole::Holder),
 	)
 	.await
@@ -599,7 +599,7 @@ async fn a_reserved_child_completes_once_and_a_retry_adds_no_version() {
 		slab.clone(),
 		machine,
 		locks,
-		planned.clone(),
+		admitted(&slab, planned.clone()).await,
 		authority(&r, ChildRole::Holder),
 	)
 	.await
@@ -642,7 +642,7 @@ async fn a_partial_append_is_finished_with_only_the_missing_rows() {
 		slab.clone(),
 		machine,
 		locks,
-		planned.clone(),
+		admitted(&slab, planned.clone()).await,
 		authority(&r, ChildRole::Holder),
 	)
 	.await
@@ -686,7 +686,7 @@ async fn a_recorded_refusal_stops_the_writer_and_never_recreates_an_intent() {
 			slab.clone(),
 			machine.clone(),
 			locks.clone(),
-			planned.clone(),
+			admitted(&slab, planned.clone()).await,
 			authority(&r, ChildRole::Holder)
 		)
 		.await,
@@ -707,7 +707,7 @@ async fn a_recorded_refusal_stops_the_writer_and_never_recreates_an_intent() {
 			slab.clone(),
 			machine.clone(),
 			locks.clone(),
-			planned.clone(),
+			admitted(&slab, planned.clone()).await,
 			authority(&r, ChildRole::Holder)
 		)
 		.await,
@@ -722,7 +722,7 @@ async fn a_recorded_refusal_stops_the_writer_and_never_recreates_an_intent() {
 			other.clone(),
 			machine,
 			locks,
-			planned,
+			admitted(&slab, planned).await,
 			authority(&r, ChildRole::Holder)
 		)
 		.await,
@@ -744,7 +744,7 @@ async fn a_writer_waiting_on_the_lock_rechecks_the_decision_inside_it() {
 		slab.clone(),
 		machine.clone(),
 		locks.clone(),
-		planned.clone(),
+		admitted(&slab, planned.clone()).await,
 		authority(&r, ChildRole::Holder),
 	));
 	tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -778,7 +778,7 @@ async fn ownership_is_by_version_and_another_parent_cannot_adopt_it() {
 			slab.clone(),
 			machine(&r.state).await,
 			locks,
-			planned.clone(),
+			admitted(&slab, planned.clone()).await,
 			authority(&r, ChildRole::Holder)
 		)
 		.await,
@@ -807,7 +807,7 @@ async fn accepted_without_a_complete_intent_is_not_acknowledged_and_the_sweep_ma
 			slab.clone(),
 			machine(&accepted).await,
 			locks.clone(),
-			planned.clone(),
+			admitted(&slab, planned.clone()).await,
 			authority(&r, ChildRole::Holder)
 		)
 		.await,
@@ -822,7 +822,7 @@ async fn accepted_without_a_complete_intent_is_not_acknowledged_and_the_sweep_ma
 		other.clone(),
 		reserved_machine.clone(),
 		locks.clone(),
-		planned.clone(),
+		admitted(&slab, planned.clone()).await,
 		authority(&r, ChildRole::Holder),
 	)
 	.await
@@ -853,10 +853,10 @@ async fn the_ack_is_signed_by_the_store_and_verifies_against_the_registry() {
 	let (_dir, slab) = manager().await;
 	let planned = plan(&r, r.holder, r.holder.node, ChildRole::Holder).unwrap();
 	let signed = persist_child(
-		slab,
+		slab.clone(),
 		machine(&r.state).await,
 		Arc::new(ParentLocks::new()),
-		planned.clone(),
+		admitted(&slab, planned.clone()).await,
 		authority(&r, ChildRole::Holder),
 	)
 	.await
@@ -911,7 +911,7 @@ async fn a_complete_intent_missing_a_version_is_never_acknowledged() {
 		slab.clone(),
 		machine(&r.state).await,
 		Arc::new(ParentLocks::new()),
-		planned,
+		admitted(&slab, planned).await,
 		authority(&r, ChildRole::Holder),
 	)
 	.await;
@@ -948,7 +948,7 @@ async fn a_stored_version_with_other_bytes_never_becomes_complete() {
 		slab.clone(),
 		machine(&r.state).await,
 		Arc::new(ParentLocks::new()),
-		planned,
+		admitted(&slab, planned).await,
 		authority(&r, ChildRole::Holder),
 	)
 	.await;
@@ -973,7 +973,7 @@ async fn an_inconsistent_owner_entry_refuses_the_acknowledgement() {
 		slab.clone(),
 		machine.clone(),
 		locks.clone(),
-		planned.clone(),
+		admitted(&slab, planned.clone()).await,
 		authority(&r, ChildRole::Holder),
 	)
 	.await
@@ -984,10 +984,10 @@ async fn an_inconsistent_owner_entry_refuses_the_acknowledgement() {
 		.await
 		.unwrap();
 	let retry = persist_child(
-		slab,
+		slab.clone(),
 		machine,
 		locks,
-		planned,
+		admitted(&slab, planned).await,
 		authority(&r, ChildRole::Holder),
 	)
 	.await;
@@ -1032,7 +1032,7 @@ async fn a_partial_append_survives_a_real_reopen_and_finishes_only_what_is_missi
 		slab.clone(),
 		machine(&r.state).await,
 		Arc::new(ParentLocks::new()),
-		planned.clone(),
+		admitted(&slab, planned.clone()).await,
 		authority(&r, ChildRole::Holder),
 	)
 	.await
@@ -1070,7 +1070,7 @@ async fn a_refusal_seen_before_signing_produces_no_acknowledgement() {
 		slab.clone(),
 		machine.clone(),
 		locks.clone(),
-		planned.clone(),
+		admitted(&slab, planned.clone()).await,
 		paused,
 	));
 	reached.notified().await;
@@ -1105,7 +1105,7 @@ async fn a_holder_lease_that_expires_while_waiting_for_the_lock_stops_the_write(
 		slab.clone(),
 		machine(&r.state).await,
 		locks.clone(),
-		planned.clone(),
+		admitted(&slab, planned.clone()).await,
 		authority_with_leases(&r, ChildRole::Holder, live.clone()),
 	));
 	tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1425,4 +1425,371 @@ async fn a_child_rpc_deadline_covers_the_dial_the_transfer_and_the_reply() {
 		2,
 		"a cancelled dial is never cached: the next send dialed again"
 	);
+}
+
+/// ADR 0108 D5: a plan admitted as production admits one, under the store's
+/// index admission guard.
+async fn admitted(slab: &SlabManager, plan: ChildPlan) -> AdmittedPlan {
+	AdmittedPlan::for_test(slab, plan).await
+}
+
+/// ADR 0108 D5 (DC-250): an index on the fixture table's `v` column.
+fn id_index(r: &Reserved) -> crate::schema::SecondaryIndexDescriptor {
+	let table = r
+		.state
+		.table_schemas
+		.latest_by_id(TENANT, TableObjectId::new([4; 16]))
+		.unwrap();
+	crate::schema::SecondaryIndexDescriptor::for_table_column(
+		crate::schema::IndexObjectId::new([0x62; 16]),
+		"events_v_idx",
+		table,
+		"v",
+	)
+	.unwrap()
+}
+
+/// ADR 0108 D5 (DC-250): the store's index answer for `v = value`: the rows
+/// found, or the lookup's refusal.
+async fn index_lookup(
+	slab: &SlabManager,
+	index: &crate::schema::SecondaryIndexDescriptor,
+	value: &str,
+) -> Result<usize, String> {
+	let encoded_key = crate::storage::secondary_index::encode_secondary_index_key_from_array(
+		&StringArray::from(vec![value]),
+		0,
+		index.key.arrow_type_tag,
+	)
+	.unwrap()
+	.unwrap();
+	let request = crate::storage::TableLookupByIndexRequest::from_descriptor(
+		TENANT,
+		index,
+		crate::storage::IndexQuery::PointEqual { encoded_key },
+		HybridTimestamp {
+			physical_ms: fixture::T0 + 3_600_000,
+			logical: 0,
+			node_id: 1,
+		},
+	);
+	slab.table_lookup_by_index(&request, index, crate::schema::SecondaryIndexState::Ready)
+		.await
+		.map(|report| report.rows.len())
+		.map_err(|error| error.to_string())
+}
+
+/// ADR 0108 D5 (DC-250), window 1: a child planned while no index exists, and
+/// the index's declaration cut asked for before the child is appended. The
+/// answer for its row is that row or a refusal, never a covered slab that omits
+/// it. (On the code before D5 the cut passed and the slab was covered by an
+/// empty segment: dc250-red2.)
+#[tokio::test]
+async fn a_child_planned_before_an_index_is_not_lost_to_its_cut() {
+	let r = reserved(&[(1, "a")], 1);
+	let (_dir, slab) = manager().await;
+	let machine = machine(&r.state).await;
+	let locks = Arc::new(ParentLocks::new());
+	let index = id_index(&r);
+	let table = r.descriptor.clone();
+	// The plan is admitted while no index exists: it carries no descriptor.
+	let planned = AdmittedPlan::admit(&slab, &machine, |state| {
+		plan_child(
+			state,
+			r.holder,
+			r.holder.node,
+			ChildRole::Holder,
+			&r.meta,
+			r.batch.clone(),
+			|_, _| true,
+		)
+	})
+	.await
+	.unwrap();
+	assert!(planned.plan().secondary_indexes.is_empty());
+	let mut indexed = r.state.clone();
+	indexed
+		.secondary_indexes
+		.create(TENANT, index.clone(), &indexed.table_schemas.clone())
+		.unwrap();
+	machine.seed_complete_snapshot_state_for_test(indexed).await;
+	let cut_slab = slab.clone();
+	let cut_index = index.clone();
+	let cut = tokio::spawn(async move {
+		cut_slab
+			.establish_secondary_index_declaration_cut(
+				TENANT,
+				&cut_index,
+				std::slice::from_ref(&cut_index),
+				4096,
+			)
+			.await
+	});
+	tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+	assert!(
+		!cut.is_finished(),
+		"the cut passed a plan whose descriptors were read before it"
+	);
+	persist_child(
+		slab.clone(),
+		machine.clone(),
+		locks.clone(),
+		planned,
+		authority(&r, ChildRole::Holder),
+	)
+	.await
+	.unwrap();
+	cut.await.unwrap().unwrap();
+	// The slab rotates and the buffer the cut proved seals; backfill heals
+	// every slab without a segment, as the lifecycle would.
+	slab.force_seal_active_for_test().await;
+	slab.seal_secondary_index_active_buffer_if_source_changed(
+		TENANT,
+		&index,
+		slab.active_slab_id().await,
+	)
+	.await
+	.unwrap();
+	slab.run_secondary_index_backfill_once(TENANT, &table, &index, 8, 4096)
+		.await
+		.unwrap();
+	let answer = index_lookup(&slab, &index, "a").await;
+	eprintln!(
+		"dc250 window 1: segments {:?}, answer {answer:?}",
+		slab.list_secondary_index_segments(
+			TENANT,
+			index.table_object_id,
+			index.index_object_id,
+			index.logical_schema_fingerprint
+		)
+		.iter()
+		.map(|info| (info.source_slab_id.get(), info.entry_count))
+		.collect::<Vec<_>>()
+	);
+	assert!(
+		matches!(answer, Ok(1) | Err(_)),
+		"the index answered a covered slab without the stored row: {answer:?}"
+	);
+}
+
+/// ADR 0108 D5 (DC-250), window 2: a child whose plan names the index, between
+/// its durable append and its index buffer append when the index's declaration
+/// cut comes. The slab it wrote to also holds an earlier row with no index
+/// entry. Neither row may be lost behind a segment that counts the slab covered.
+/// (On the code before D5 the cut passed, and a one-entry segment covered the
+/// slab without the earlier row: dc250-red3.)
+#[tokio::test]
+async fn a_cut_between_a_childs_append_and_its_index_entry_loses_no_row() {
+	let r = reserved(&[(1, "a")], 1);
+	let (_dir, slab) = manager().await;
+	let index = id_index(&r);
+	let table = r.descriptor.clone();
+	let mut indexed = r.state.clone();
+	indexed
+		.secondary_indexes
+		.create(TENANT, index.clone(), &indexed.table_schemas.clone())
+		.unwrap();
+	let machine = machine(&indexed).await;
+	let locks = Arc::new(ParentLocks::new());
+	// An earlier row of the table in the same slab, stored with no index entry.
+	ingest_recovered_rows(
+		&slab,
+		TENANT,
+		&table,
+		&batch(&table, &[(9, "z")]),
+		HybridTimestamp {
+			physical_ms: fixture::T0 - 1,
+			logical: 0,
+			node_id: 1,
+		},
+	)
+	.await
+	.unwrap();
+	let planned = AdmittedPlan::admit(&slab, &machine, |state| {
+		plan_child(
+			state,
+			r.holder,
+			r.holder.node,
+			ChildRole::Holder,
+			&r.meta,
+			r.batch.clone(),
+			|_, _| true,
+		)
+	})
+	.await
+	.unwrap();
+	assert_eq!(planned.plan().secondary_indexes, vec![index.clone()]);
+	let reached = Arc::new(tokio::sync::Notify::new());
+	let release = Arc::new(tokio::sync::Notify::new());
+	crate::network::data_server::PAUSE_BEFORE_INDEX_BUFFER
+		.lock()
+		.unwrap()
+		.insert(
+			slab.data_dir().to_path_buf(),
+			(reached.clone(), release.clone()),
+		);
+	let writer = tokio::spawn(persist_child(
+		slab.clone(),
+		machine.clone(),
+		locks.clone(),
+		planned,
+		authority(&r, ChildRole::Holder),
+	));
+	reached.notified().await;
+	let cut_slab = slab.clone();
+	let cut_index = index.clone();
+	let cut = tokio::spawn(async move {
+		cut_slab
+			.establish_secondary_index_declaration_cut(
+				TENANT,
+				&cut_index,
+				std::slice::from_ref(&cut_index),
+				4096,
+			)
+			.await
+	});
+	tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+	let cut_passed_the_append = cut.is_finished();
+	assert!(
+		!cut_passed_the_append,
+		"the cut passed a child between its append and its index entry"
+	);
+	release.notify_one();
+	writer.await.unwrap().unwrap();
+	cut.await.unwrap().unwrap();
+	slab.force_seal_active_for_test().await;
+	slab.seal_secondary_index_active_buffer_if_source_changed(
+		TENANT,
+		&index,
+		slab.active_slab_id().await,
+	)
+	.await
+	.unwrap();
+	slab.run_secondary_index_backfill_once(TENANT, &table, &index, 8, 4096)
+		.await
+		.unwrap();
+	let earlier = index_lookup(&slab, &index, "z").await;
+	let child = index_lookup(&slab, &index, "a").await;
+	eprintln!(
+		"dc250 window 2: cut passed the paused append {cut_passed_the_append}, segments {:?}, z {earlier:?}, a {child:?}",
+		slab.list_secondary_index_segments(
+			TENANT,
+			index.table_object_id,
+			index.index_object_id,
+			index.logical_schema_fingerprint
+		)
+		.iter()
+		.map(|info| (info.source_slab_id.get(), info.entry_count))
+		.collect::<Vec<_>>()
+	);
+	for (row, answer) in [("z", &earlier), ("a", &child)] {
+		assert!(
+			matches!(answer, Ok(1) | Err(_)),
+			"the index answered a covered slab without row {row}: {answer:?}"
+		);
+	}
+}
+
+/// ADR 0108 D5 (DC-250): the admission guard lives in the spawned persistence
+/// work. A caller cancelled after that work started does not let a cut in
+/// before the work's index entries are written.
+#[tokio::test]
+async fn a_cancelled_child_write_keeps_the_cut_out_until_its_work_ends() {
+	let r = reserved(&[(1, "a")], 1);
+	let (_dir, slab) = manager().await;
+	let index = id_index(&r);
+	let table = r.descriptor.clone();
+	let mut indexed = r.state.clone();
+	indexed
+		.secondary_indexes
+		.create(TENANT, index.clone(), &indexed.table_schemas.clone())
+		.unwrap();
+	let machine = machine(&indexed).await;
+	let locks = Arc::new(ParentLocks::new());
+	ingest_recovered_rows(
+		&slab,
+		TENANT,
+		&table,
+		&batch(&table, &[(9, "z")]),
+		HybridTimestamp {
+			physical_ms: fixture::T0 - 1,
+			logical: 0,
+			node_id: 1,
+		},
+	)
+	.await
+	.unwrap();
+	let planned = AdmittedPlan::admit(&slab, &machine, |state| {
+		plan_child(
+			state,
+			r.holder,
+			r.holder.node,
+			ChildRole::Holder,
+			&r.meta,
+			r.batch.clone(),
+			|_, _| true,
+		)
+	})
+	.await
+	.unwrap();
+	let reached = Arc::new(tokio::sync::Notify::new());
+	let release = Arc::new(tokio::sync::Notify::new());
+	crate::network::data_server::PAUSE_BEFORE_INDEX_BUFFER
+		.lock()
+		.unwrap()
+		.insert(
+			slab.data_dir().to_path_buf(),
+			(reached.clone(), release.clone()),
+		);
+	let caller = tokio::spawn(persist_child(
+		slab.clone(),
+		machine.clone(),
+		locks.clone(),
+		planned,
+		authority(&r, ChildRole::Holder),
+	));
+	reached.notified().await;
+	caller.abort();
+	assert!(caller.await.unwrap_err().is_cancelled());
+	let cut_slab = slab.clone();
+	let cut_index = index.clone();
+	let cut = tokio::spawn(async move {
+		cut_slab
+			.establish_secondary_index_declaration_cut(
+				TENANT,
+				&cut_index,
+				std::slice::from_ref(&cut_index),
+				4096,
+			)
+			.await
+	});
+	tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+	assert!(
+		!cut.is_finished(),
+		"a cut passed spawned work whose caller was cancelled"
+	);
+	release.notify_one();
+	tokio::time::timeout(std::time::Duration::from_secs(10), cut)
+		.await
+		.expect("the cut follows the spawned work")
+		.unwrap()
+		.unwrap();
+	slab.force_seal_active_for_test().await;
+	slab.seal_secondary_index_active_buffer_if_source_changed(
+		TENANT,
+		&index,
+		slab.active_slab_id().await,
+	)
+	.await
+	.unwrap();
+	slab.run_secondary_index_backfill_once(TENANT, &table, &index, 8, 4096)
+		.await
+		.unwrap();
+	for row in ["z", "a"] {
+		assert_eq!(
+			index_lookup(&slab, &index, row).await,
+			Ok(1),
+			"row {row} after the cancelled write and the cut"
+		);
+	}
 }

@@ -1176,6 +1176,52 @@ impl WendelonLogStore {
 		self.inner.read().await.page.and_then(|page| page.identity)
 	}
 
+	/// ADR 0108 (wendelon) D3: the one role change an identity takes: the
+	/// exact `expected` ControlOnly identity becomes the same identity, Full.
+	/// Under the page's lock, so it is ordered with the vote and birth writers,
+	/// and it keeps the page's birth and latest vote. Any other stored identity
+	/// is refused; the same Full identity again is a no-op.
+	pub(crate) async fn activate_identity(
+		&self,
+		expected: crate::consensus::decisions::instances::RaftIdentity,
+	) -> std::io::Result<()> {
+		use crate::consensus::decisions::instances::Role;
+		let mut guard = self.inner.write().await;
+		let Some(page) = guard.page else {
+			return Err(Error::new(
+				ErrorKind::Unsupported,
+				"only a durable ParentDecisions store holds an identity",
+			));
+		};
+		let full = crate::consensus::decisions::instances::RaftIdentity {
+			role: Role::Full,
+			..expected
+		};
+		match page.identity {
+			Some(existing) if existing == full => return Ok(()),
+			Some(existing) if existing == expected && expected.role == Role::ControlOnly => {}
+			other => {
+				return Err(Error::new(
+					ErrorKind::InvalidData,
+					format!(
+						"this store's identity is {other:?}, not the ControlOnly {expected:?} an activation rewrites"
+					),
+				));
+			}
+		}
+		let (Some(file_ops), Some(vote_file)) = (guard.file_ops.clone(), guard.vote_file.clone())
+		else {
+			return Err(Error::other("the store has no vote page"));
+		};
+		let next = PageHead {
+			birth: page.birth,
+			identity: Some(full),
+		};
+		write_page(file_ops.as_ref(), &vote_file, &next, guard.vote).await?;
+		guard.page = Some(next);
+		Ok(())
+	}
+
 	/// ADR 0104 (wendelon): the store's first durable identity write, before any
 	/// Raft object exists for it. Written once: the same identity again is a
 	/// no-op, another is refused. The page's vote is kept as it is.
@@ -2888,6 +2934,12 @@ impl CheckpointCoordinator {
 				}
 			}
 		})
+	}
+
+	/// ADR 0108 (wendelon): writes the latest observed checkpoint now, so a
+	/// handoff reads its recovered state from a durable cut, not a lagging one.
+	pub(crate) async fn flush_now(&self) -> std::io::Result<()> {
+		self.flush_latest(true).await
 	}
 
 	async fn flush_latest(&self, force: bool) -> std::io::Result<()> {
@@ -8399,6 +8451,10 @@ fn apply_index_schema_update(
 				.secondary_indexes
 				.mark_dropping(envelope.tenant_id, request.index_object_id)
 				.map_err(|err| err.to_string())?;
+			// Wendelon ADR 0108: the ParentDecisions backfill receipts go too.
+			if let Some(decisions) = state.decisions.as_mut() {
+				decisions.index_entered_dropping(envelope.tenant_id, request.index_object_id);
+			}
 			if let Some(row) = existing {
 				metrics().observe_storage_secondary_index_drop(
 					envelope.tenant_id,
@@ -8408,6 +8464,16 @@ fn apply_index_schema_update(
 				);
 			}
 			Ok(())
+		}
+		// Wendelon ADR 0108: under ParentDecisions a store's receipts are decision
+		// commands bound to its incarnation; the slot-keyed mutations are refused.
+		SchemaMutationKind::IndexBackfillComplete | SchemaMutationKind::IndexDropGcComplete
+			if state.decisions.is_some() =>
+		{
+			Err(
+				"secondary index lifecycle receipts are decision commands under ParentDecisions"
+					.to_owned(),
+			)
 		}
 		SchemaMutationKind::IndexBackfillComplete => {
 			let complete = decode_secondary_index_lifecycle_complete(&envelope.payload)
@@ -10975,12 +11041,13 @@ async fn decode_snapshot_file_with_identity(
 
 /// One lease grant: the single grant's rules, shared by `AcquireLease` and
 /// each lease of an `AcquireLeases` (ADR 0701).
-/// `tenure` is the ParentDecisions batch's expectation and stamp for this
-/// grant (ADR 0729); `None` under Today.
+/// `tenure` is the ParentDecisions batch's expectation, the holder's carried
+/// incarnation (wendelon ADR 0108) and the stamp for this grant (ADR 0729);
+/// `None` under Today.
 fn apply_lease_grant(
 	state: &mut SmState,
 	lease: crate::schema::LeaseDescriptor,
-	tenure: Option<(Option<u64>, u64)>,
+	tenure: Option<(Option<u64>, crate::consensus::StoreIncarnation, u64)>,
 ) -> WendelonResponse {
 	// Range must be well-formed. A reversed window would
 	// otherwise overlap nothing in the existing map, so a
@@ -10990,7 +11057,7 @@ fn apply_lease_grant(
 	}
 	// ADR 0699 S2: the fixed range universe and its lineages.
 	let effect = if state.decisions.is_some() {
-		let Some((expected_generation, stamp_ms)) = tenure else {
+		let Some((expected_generation, holder_incarnation, stamp_ms)) = tenure else {
 			return WendelonResponse::LeaseDenied;
 		};
 		// ADR 0105 (wendelon): a slot being replaced takes no grant, renewal or
@@ -11002,6 +11069,7 @@ fn apply_lease_grant(
 			state,
 			&lease,
 			expected_generation,
+			holder_incarnation,
 			stamp_ms,
 		) {
 			Ok(effect) => Some(effect),
@@ -11090,7 +11158,11 @@ fn apply_lease_batch(
 			granted: apply_lease_grant(
 				state,
 				grant.lease,
-				Some((grant.expected_generation, stamp_ms)),
+				Some((
+					grant.expected_generation,
+					grant.holder_incarnation,
+					stamp_ms,
+				)),
 			) == WendelonResponse::Success,
 		})
 		.collect();

@@ -99,6 +99,8 @@ fn ready_snapshot() -> ReadinessSnapshot {
 		fips_self_test_last_ts: cfg!(feature = "fips").then_some(1_710_000_000),
 		control_retention: RetentionStatus::compacting(),
 		consensus_timing: wendelon::consensus::ConsensusTimingStatus::default_profile(),
+		raft_instance: Some(1),
+		store_incarnation: None,
 	}
 }
 

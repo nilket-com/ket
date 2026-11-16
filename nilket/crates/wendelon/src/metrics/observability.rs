@@ -65,6 +65,11 @@ pub struct ReadinessSnapshot {
 	pub control_retention: RetentionStatus,
 	/// The timing the control Raft instance was built with.
 	pub consensus_timing: crate::consensus::ConsensusTimingStatus,
+	/// Wendelon ADR 0108: the Raft instance this process runs and the store
+	/// incarnation it serves (32 hex digits), so an answer names the serving
+	/// store; a slot or a leader hint does not.
+	pub raft_instance: Option<u32>,
+	pub store_incarnation: Option<String>,
 }
 
 #[async_trait]
@@ -596,6 +601,17 @@ impl ReadinessSnapshot {
 		);
 		body.insert("control_retention".into(), self.control_retention.to_json());
 		body.insert("consensus_timing".into(), self.consensus_timing.to_json());
+		body.insert(
+			"raft_instance".into(),
+			self.raft_instance.map(Value::from).unwrap_or(Value::Null),
+		);
+		body.insert(
+			"store_incarnation".into(),
+			self.store_incarnation
+				.clone()
+				.map(Value::String)
+				.unwrap_or(Value::Null),
+		);
 		#[cfg(feature = "fips")]
 		{
 			body.insert("fips_mode".into(), Value::Bool(self.fips_mode));

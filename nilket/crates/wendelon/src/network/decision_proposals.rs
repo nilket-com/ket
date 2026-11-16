@@ -89,6 +89,16 @@ pub enum ForwardedDecision {
 	RecoveryProved {
 		proof: Signed<crate::consensus::decisions::RecoveryBody>,
 	},
+	/// ADR 0108 (wendelon): a recovered replacement's signed activation, for
+	/// the sender's own slot.
+	ActivateReplacement {
+		proof: Signed<crate::consensus::decisions::ActivationBody>,
+	},
+	/// ADR 0108 (wendelon): a store's secondary-index receipt, for the sender's
+	/// own slot.
+	IndexReceipt {
+		proof: Signed<crate::consensus::decisions::IndexReceiptBody>,
+	},
 	/// ADR 0105 (wendelon): a Done replacement admits its new store as the
 	/// sender's current incarnation. The node is always the sender; the state
 	/// machine judges the token, instance, birth and registry.
@@ -552,6 +562,18 @@ pub(crate) fn admission(
 				return Err(ProposalRefusal::NotTheSender);
 			}
 			DecisionCommand::RecoveryProved { proof }
+		}
+		ForwardedDecision::ActivateReplacement { proof } => {
+			if proof.body.slot != sender {
+				return Err(ProposalRefusal::NotTheSender);
+			}
+			DecisionCommand::ActivateReplacement { proof }
+		}
+		ForwardedDecision::IndexReceipt { proof } => {
+			if proof.body.signer.node != sender {
+				return Err(ProposalRefusal::NotTheSender);
+			}
+			DecisionCommand::IndexReceipt { proof }
 		}
 		ForwardedDecision::PromoteIncarnation {
 			token,

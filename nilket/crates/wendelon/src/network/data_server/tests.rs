@@ -19372,6 +19372,7 @@ fn a_lease_batch_on_the_wire_needs_an_exact_bounded_length() {
 		requested_hlc: hlc(1, 0, 1),
 		ttl_ms: 3_000,
 		count,
+		holder_incarnation: [0; 16],
 	};
 	let bytes = |count: u32, entries: usize| {
 		let mut out = bytemuck::bytes_of(&header(count)).to_vec();
@@ -19401,7 +19402,8 @@ fn a_lease_batch_on_the_wire_needs_an_exact_bounded_length() {
 	);
 	assert_eq!(
 		lease_batch_bytes::<AcquireLeasesRequestHeader, LeaseRangeWire>(MAX_LEASES_PER_BATCH),
-		Some(40 + 32 * MAX_LEASES_PER_BATCH)
+		// Wendelon ADR 0108: the header carries the holder's store (56 bytes).
+		Some(56 + 32 * MAX_LEASES_PER_BATCH)
 	);
 	assert_eq!(
 		lease_batch_bytes::<AcquireLeasesRequestHeader, LeaseRangeWire>(usize::MAX),

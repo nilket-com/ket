@@ -63,6 +63,8 @@ pub(crate) struct Preparation {
 	/// ADR 0106 (wendelon): the index was handed over; it is never opened here
 	/// again.
 	handed_over: std::sync::atomic::AtomicBool,
+	/// ADR 0108 (wendelon): set once the activation is applied here.
+	activated: tokio::sync::watch::Sender<bool>,
 	/// ADR 0106 (wendelon): the configuration and decision secret the recovery
 	/// uses, and its restricted storage once opened.
 	cfg: NodeBootstrapConfig,
@@ -83,6 +85,19 @@ pub(crate) struct Preparation {
 #[cfg(test)]
 static HALTS: std::sync::Mutex<std::collections::BTreeMap<PathBuf, Stage>> =
 	std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// ADR 0108 (wendelon) test seam (Codex 01a1e41e R4): the preparation task of
+/// these data directories panics right after it signals its activation.
+#[cfg(test)]
+pub(crate) static PANIC_AFTER_ACTIVATION: std::sync::Mutex<std::collections::BTreeSet<PathBuf>> =
+	std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// ADR 0108 (wendelon) test seam: one-shot, by data directory; holds the
+/// activation, built from its view, before it is forwarded.
+#[cfg(test)]
+pub(crate) static PAUSE_BEFORE_ACTIVATION: std::sync::Mutex<
+	std::collections::BTreeMap<PathBuf, (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
 
 /// Test-only (ADR 0107): how many more of a node's report answers are lost
 /// after the report was sent, by data directory, as a dropped reply would.
@@ -133,6 +148,7 @@ impl Preparation {
 			store: tokio::sync::Mutex::new(None),
 			intent: std::sync::Mutex::new(None),
 			handed_over: std::sync::atomic::AtomicBool::new(false),
+			activated: tokio::sync::watch::channel(false).0,
 			stopping: std::sync::atomic::AtomicBool::new(false),
 			stop: tokio::sync::Notify::new(),
 			#[cfg(test)]
@@ -184,6 +200,12 @@ impl Preparation {
 				_ = self.stop.notified() => {}
 			}
 		}
+	}
+
+	/// ADR 0108 (wendelon): becomes true once this store's activation is in
+	/// its own applied state and the task has ended.
+	pub(crate) fn activated(&self) -> tokio::sync::watch::Receiver<bool> {
+		self.activated.subscribe()
 	}
 
 	/// Whether the store is promoted and bound (gate 2 done by this task).
@@ -243,6 +265,20 @@ impl Preparation {
 				use super::replacement_recovery::Progress;
 				match driver.step().await {
 					Ok(Progress::Ready(request)) => {
+						#[cfg(test)]
+						if matches!(
+							*request,
+							crate::network::decision_proposals::ForwardedDecision::ActivateReplacement { .. }
+						) {
+							let paused = PAUSE_BEFORE_ACTIVATION
+								.lock()
+								.unwrap()
+								.remove(&self.data_dir);
+							if let Some((reached, release)) = paused {
+								reached.notify_one();
+								release.notified().await;
+							}
+						}
 						if let Disposition::Stop(why) = disposition(&self.forward(&request).await) {
 							tracing::error!(slot = self.slot, %why, "recovery stopped: its statement was refused");
 							return;
@@ -252,6 +288,28 @@ impl Preparation {
 						tracing::debug!(slot = self.slot, %why, "recovery pending");
 					}
 					Ok(Progress::Recorded) => {}
+					// ADR 0108 (wendelon): the activation is applied here; this
+					// task ends and the member hands over to a Full one.
+					Ok(Progress::Activated) => {
+						tracing::info!(
+							slot = self.slot,
+							instance = self.instance,
+							"replacement activated: handing over to a full member"
+						);
+						// `send_replace` keeps the value for a receiver that
+						// subscribes later; `send` drops it when none is
+						// subscribed yet.
+						self.activated.send_replace(true);
+						#[cfg(test)]
+						if PANIC_AFTER_ACTIVATION
+							.lock()
+							.unwrap()
+							.contains(&self.data_dir)
+						{
+							panic!("test: the preparation task fails after its activation");
+						}
+						return;
+					}
 					// ADR 0107 (wendelon): a report's answer never stops
 					// recovery. Applied state decides on the next step: a
 					// recorded report is skipped, a superseded target is
@@ -610,6 +668,9 @@ fn disposition(answer: &std::io::Result<ProposalResponse>) -> Disposition {
 			} => Disposition::Stop(format!("{refusal:?}")),
 			ProposalOutcome::Decision(DecisionResult::SignerBound) => Disposition::Again,
 			ProposalOutcome::Decision(DecisionResult::RecoveryRecorded { .. }) => {
+				Disposition::Again
+			}
+			ProposalOutcome::Decision(DecisionResult::ActivationRecorded { .. }) => {
 				Disposition::Again
 			}
 			ProposalOutcome::Decision(DecisionResult::Refused(refusal)) => {

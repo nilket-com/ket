@@ -517,6 +517,68 @@ impl SecondaryIndexCatalog {
 			.collect()
 	}
 
+	/// Wendelon ADR 0108: a catalog row in `state` for reducer tests, without a
+	/// table descriptor.
+	#[cfg(test)]
+	pub(crate) fn insert_for_test(
+		&mut self,
+		tenant_id: TenantId,
+		index_object_id: IndexObjectId,
+		state: SecondaryIndexState,
+	) {
+		let descriptor = SecondaryIndexDescriptor {
+			index_object_id,
+			table_object_id: TableObjectId::new([0x51; 16]),
+			namespace: "public".to_owned(),
+			index_name: format!("index_{:02x}", index_object_id.as_bytes()[0]),
+			table_schema_generation: 1,
+			logical_schema_fingerprint:
+				crate::hash::descriptor_fingerprint::LogicalSchemaFingerprint::from_bytes(
+					[0x51; 32],
+				),
+			key: SecondaryIndexKeyDescriptor {
+				column_name: "age".to_owned(),
+				column_ordinal: 1,
+				arrow_type_tag: IndexArrowTypeTag::Int64,
+				encoding: IndexKeyEncoding::OrderedScalar,
+			},
+		};
+		self.by_id.insert(
+			SecondaryIndexCatalogKey {
+				tenant_id,
+				index_object_id,
+			},
+			SecondaryIndexCatalogRow {
+				descriptor,
+				state,
+				drop_gc_completed_by: BTreeSet::new(),
+			},
+		);
+	}
+
+	/// Wendelon ADR 0108: a ParentDecisions receipt completed this Building
+	/// index; Ready is never demoted and other states are left alone.
+	pub(crate) fn promote_to_ready(&mut self, tenant_id: TenantId, index_object_id: IndexObjectId) {
+		if let Some(row) = self.by_id.get_mut(&SecondaryIndexCatalogKey {
+			tenant_id,
+			index_object_id,
+		}) && row.state == SecondaryIndexState::Building
+		{
+			row.state = SecondaryIndexState::Ready;
+		}
+	}
+
+	/// Wendelon ADR 0108: a ParentDecisions receipt completed this Dropping
+	/// index's collection; only a Dropping row is removed.
+	pub(crate) fn remove_dropped(&mut self, tenant_id: TenantId, index_object_id: IndexObjectId) {
+		if self
+			.get(tenant_id, index_object_id)
+			.is_some_and(|row| row.state == SecondaryIndexState::Dropping)
+		{
+			self.remove_by_key(tenant_id, index_object_id);
+		}
+	}
+
 	pub fn mark_dropping(
 		&mut self,
 		tenant_id: TenantId,

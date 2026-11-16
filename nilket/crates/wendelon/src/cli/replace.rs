@@ -113,6 +113,12 @@ fn report(token: u128, replacement: &ReplacementReportWire) -> String {
 			format!("; bound key {hex}")
 		})
 		.unwrap_or_default();
+	// ADR 0108 (wendelon): the recorded activation, after the recovery only.
+	let activated = replacement
+		.activated
+		.filter(|_| !recovered.is_empty())
+		.map(|(through, gid)| format!("; activated through {through} at gid {gid}"))
+		.unwrap_or_default();
 	// ADR 0107 (wendelon): the cluster's current certificate, after the recorded
 	// recovery only.
 	let certified = replacement
@@ -121,7 +127,7 @@ fn report(token: u128, replacement: &ReplacementReportWire) -> String {
 		.map(|(gid, t)| format!("; certified gid {gid} through {t}"))
 		.unwrap_or_default();
 	format!(
-		"replacement {token:032x}: slot {} replacing instance {}: {phase}{promoted}{bound}{recovered}{certified}",
+		"replacement {token:032x}: slot {} replacing instance {}: {phase}{promoted}{bound}{recovered}{activated}{certified}",
 		replacement.slot, replacement.r_old
 	)
 }
@@ -493,6 +499,7 @@ mod tests {
 							bound_key: None,
 							recovered: None,
 							certified: None,
+							activated: None,
 						},
 					))
 				}
@@ -725,6 +732,7 @@ mod tests {
 					bound_key: None,
 					recovered: None,
 					certified: None,
+					activated: None,
 				},
 			)
 		};
@@ -750,6 +758,7 @@ mod tests {
 					bound_key: None,
 					recovered: None,
 					certified: None,
+					activated: None,
 				},
 			),
 			format!("{prefix}done 2147483648; promoted store 00000000000000000000000000000105")
@@ -767,6 +776,7 @@ mod tests {
 					bound_key: Some([0xab; 32]),
 					recovered,
 					certified,
+					activated: None,
 				},
 			)
 		};
@@ -814,6 +824,7 @@ mod tests {
 				bound_key: None,
 				recovered: None,
 				certified: None,
+				activated: None,
 			}),
 		};
 		let mut answer = plain.clone();

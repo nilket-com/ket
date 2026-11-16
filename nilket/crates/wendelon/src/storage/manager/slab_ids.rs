@@ -121,6 +121,12 @@ impl SlabManager {
 		Ok(())
 	}
 
+	/// Test-only: whether this store is bound to a control node.
+	#[cfg(test)]
+	pub(crate) fn bound_to_control_node_for_test(&self) -> bool {
+		self.control_node.get().is_some()
+	}
+
 	/// This store's owner reference, for every slab command it proposes.
 	pub(crate) fn owner_ref(&self) -> std::io::Result<crate::consensus::OwnerRef> {
 		// Production binds every store at node bootstrap, before any slab

@@ -219,6 +219,13 @@ async fn a_new_mode_store_writes_its_own_format_and_reopens() {
 
 use crate::consensus::decisions::tests as fixture;
 
+const PARENT_DECISIONS_V28_MANIFEST: &str =
+	include_str!("../../../tests/fixtures/consensus_body/parent_decisions_v28.txt");
+/// Wendelon ADR 0106's format-27 bodies, retained. Wendelon ADR 0108 moved three
+/// (the decision state, which gained the index receipts; the lease batch, whose
+/// grants carry the holder's store; the promoted replacement record, which
+/// gained its activation) and added the activation, the index receipt and an
+/// activated replacement record.
 const PARENT_DECISIONS_V27_MANIFEST: &str =
 	include_str!("../../../tests/fixtures/consensus_body/parent_decisions_v27.txt");
 /// Wendelon ADR 0105's format-26 bodies, retained. Wendelon ADR 0106 moved one
@@ -278,7 +285,7 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 fn manifest() -> BTreeMap<String, String> {
-	parse(PARENT_DECISIONS_V27_MANIFEST)
+	parse(PARENT_DECISIONS_V28_MANIFEST)
 }
 
 /// ADR 0725: the three owner-signed operation kinds pinned in the format-18
@@ -408,10 +415,12 @@ fn golden_lease_batch() -> WendelonRequest {
 				crate::consensus::LeaseBatchGrant {
 					lease: fixture::lease(holder, range, 0, 1_000),
 					expected_generation: Some(3),
+					holder_incarnation: fixture::inc(holder),
 				},
 				crate::consensus::LeaseBatchGrant {
 					lease: fixture::lease(holder, next, 500, 2_000),
 					expected_generation: None,
+					holder_incarnation: fixture::inc(holder),
 				},
 			],
 		)
@@ -445,7 +454,7 @@ fn entry(index: u64, request: WendelonRequest) -> Entry<WendelonTypeConfig> {
 }
 
 #[test]
-fn the_format_27_bodies_match_their_goldens_and_round_trip() {
+fn the_format_28_bodies_match_their_goldens_and_round_trip() {
 	let stored = manifest();
 	let state = golden_state();
 	let body = encode_state_body(DecisionMode::ParentDecisions, &state).unwrap();
@@ -569,6 +578,7 @@ fn the_format_27_bodies_match_their_goldens_and_round_trip() {
 					incarnation: promotion.incarnation,
 				}),
 				recovered: None,
+				activated: None,
 			})
 			.unwrap(),
 		),
@@ -593,6 +603,71 @@ fn the_format_27_bodies_match_their_goldens_and_round_trip() {
 		))
 		.unwrap()),
 	));
+	// Wendelon ADR 0108: the signed activation, an index receipt, and a
+	// replacement record with its activation.
+	let activation = crate::consensus::decisions::ActivationBody {
+		token: 0x0108_0108_0108_0108_0108_0108_0108_0108,
+		slot: 1,
+		r_new: crate::consensus::decisions::instances::ALLOCATED_BASE,
+		birth: [0x08; 16],
+		store: crate::consensus::StoreIncarnation::from_raw(0x0108),
+		recovered_gid: 6,
+		k: 106,
+		through: 180,
+		certified: 7,
+	};
+	actual.push((
+		"activate_replacement".to_owned(),
+		hex(&postcard::to_stdvec(&WendelonRequest::Decision(
+			crate::consensus::decisions::DecisionCommand::ActivateReplacement {
+				proof: fixture::sign_for_test(activation, fixture::signer(1)),
+			},
+		))
+		.unwrap()),
+	));
+	let receipt = crate::consensus::decisions::IndexReceiptBody {
+		tenant: crate::schema::TenantId::new(7),
+		index: crate::schema::IndexObjectId::new([0x08; 16]),
+		phase: crate::consensus::decisions::IndexReceiptPhase::Backfilled,
+		signer: fixture::signer(1),
+	};
+	actual.push((
+		"index_receipt".to_owned(),
+		hex(&postcard::to_stdvec(&WendelonRequest::Decision(
+			crate::consensus::decisions::DecisionCommand::IndexReceipt {
+				proof: fixture::sign_for_test(receipt, fixture::signer(1)),
+			},
+		))
+		.unwrap()),
+	));
+	actual.push((
+		"activated_replacement".to_owned(),
+		hex(
+			&postcard::to_stdvec(&crate::consensus::decisions::instances::Replacement {
+				slot: 1,
+				r_old: 1,
+				pre_voters: [1, 2, 3].into_iter().collect(),
+				phase: crate::consensus::decisions::instances::ReplacementPhase::Done {
+					r_new: crate::consensus::decisions::instances::ALLOCATED_BASE,
+				},
+				promoted: Some(crate::consensus::decisions::instances::Promotion {
+					expected: fixture::inc(1),
+					incarnation: crate::consensus::StoreIncarnation::from_raw(0x0108),
+				}),
+				recovered: Some(crate::consensus::decisions::instances::Recovery {
+					gid: 6,
+					target_digest: Some([0x16; 32]),
+					k: 106,
+				}),
+				activated: Some(crate::consensus::decisions::instances::Activation {
+					incarnation: crate::consensus::StoreIncarnation::from_raw(0x0108),
+					through: 180,
+					certified: 7,
+				}),
+			})
+			.unwrap(),
+		),
+	));
 	let moved: Vec<String> = actual
 		.iter()
 		.filter(|(name, hex)| stored.get(name) != Some(hex))
@@ -600,7 +675,7 @@ fn the_format_27_bodies_match_their_goldens_and_round_trip() {
 		.collect();
 	assert!(
 		moved.is_empty(),
-		"format-27 bodies moved or are missing; expected lines:\n{}",
+		"format-28 bodies moved or are missing; expected lines:\n{}",
 		moved.join("\n")
 	);
 	assert_eq!(stored.len(), actual.len());
@@ -614,17 +689,36 @@ fn the_format_27_bodies_match_their_goldens_and_round_trip() {
 	// only the decision state differs from the format-16 corpus: by exactly the
 	// appended seal.
 	assert!(decisions.sealed().is_some());
+	// Wendelon ADR 0108: against the format-27 corpus three bodies moved (the
+	// decision state gained the index receipts, the lease batch's grants carry
+	// the holder's store, the promoted replacement record gained its
+	// activation) and the activation, the index receipt and an activated
+	// replacement record were added.
+	const MOVED_0108: [&str; 3] = [
+		"decisions_golden_history",
+		"acquire_leases_0",
+		"promoted_replacement",
+	];
+	let retained_v27 = parse(PARENT_DECISIONS_V27_MANIFEST);
+	assert_eq!(stored.len(), retained_v27.len() + 3);
+	for (name, hex) in &retained_v27 {
+		if MOVED_0108.contains(&name.as_str()) {
+			assert_ne!(stored.get(name), Some(hex), "{name}");
+		} else {
+			assert_eq!(stored.get(name), Some(hex), "{name}");
+		}
+	}
 	// Wendelon ADR 0106: against the format-26 corpus one body moved (the
 	// promoted replacement record gained its recovery) and the recovery
 	// statement was added.
 	const MOVED_0106: [&str; 1] = ["promoted_replacement"];
 	let retained_v26 = parse(PARENT_DECISIONS_V26_MANIFEST);
-	assert_eq!(stored.len(), retained_v26.len() + 1);
+	assert_eq!(retained_v27.len(), retained_v26.len() + 1);
 	for (name, hex) in &retained_v26 {
 		if MOVED_0106.contains(&name.as_str()) {
-			assert_ne!(stored.get(name), Some(hex), "{name}");
+			assert_ne!(retained_v27.get(name), Some(hex), "{name}");
 		} else {
-			assert_eq!(stored.get(name), Some(hex), "{name}");
+			assert_eq!(retained_v27.get(name), Some(hex), "{name}");
 		}
 	}
 	// Wendelon ADR 0105: against the format-25 corpus no body moved; the

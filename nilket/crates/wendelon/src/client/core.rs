@@ -2745,6 +2745,32 @@ impl WendelonClient {
 		}
 	}
 
+	/// Test-support only (wendelon ADR 0108): as [`Self::table_query_at_for_test`], ONE
+	/// `TABLE_QUERY_REQ` to exactly `target`, no redirect followed and nothing asked again,
+	/// returning the decoded batches of that one answer: `Ok(Some(batches))` when that node
+	/// answered OK, `Ok(None)` when it redirected. Not a product API.
+	#[cfg(feature = "test-support")]
+	pub async fn table_query_rows_at_for_test(
+		&self,
+		target: NodeId,
+		mut request: TableQueryRequest,
+	) -> std::io::Result<Option<Vec<RecordBatch>>> {
+		if request.meta.request_id.is_zero() {
+			request.meta.request_id = TableQueryRequestId::random();
+		}
+		validate_table_query_request(&request)?;
+		match self.table_query_once(target, &request, None).await? {
+			QueryOutcome::Ok(mut result) => {
+				let mut batches = Vec::new();
+				while let Some(batch) = result.next_batch().await? {
+					batches.push(batch);
+				}
+				Ok(Some(batches))
+			}
+			QueryOutcome::Redirect(_) => Ok(None),
+		}
+	}
+
 	async fn table_query_once(
 		&self,
 		target: NodeId,

@@ -703,9 +703,14 @@ async fn start_daemon(config_path: PathBuf) -> DaemonExit {
 	};
 	let shutdown_deadline =
 		crate::shutdown_watchdog::daemon_shutdown_deadline(cfg.storage_shutdown_timeout);
-	// ADR 0104 (wendelon): a replacement's directory starts control-only.
+	// Wendelon ADR 0108: the stop signal is registered once for the daemon's
+	// life, so a stop during a control-only member's handoff reaches the full
+	// start that follows it.
+	let mut stop = spawn_stop_watch();
+	// ADR 0104 (wendelon): a replacement's directory starts control-only; once
+	// activated (wendelon ADR 0108) it hands over to a full start below.
 	match crate::node::starts_control_only(&cfg) {
-		Ok(true) => return run_control_only(cfg, shutdown_deadline).await,
+		Ok(true) => return run_control_only(cfg, shutdown_deadline, stop.clone()).await,
 		Ok(false) => {}
 		Err(e) => {
 			eprintln!("bootstrap failed: {e}");
@@ -793,7 +798,7 @@ async fn start_daemon(config_path: PathBuf) -> DaemonExit {
 		_ => None,
 	};
 
-	wait_for_stop_signal().await;
+	let _ = stop.wait_for(|stopped| *stopped).await;
 	eprintln!("wendelon: draining");
 	// From here the process must exit within the deadline. A shutdown that
 	// cannot prove every writer stopped terminates instead of lingering with the
@@ -844,11 +849,54 @@ impl DaemonExit {
 	}
 }
 
+/// Wendelon ADR 0108: the exit status of a ControlOnly member whose activation
+/// handoff completed (its role rewritten to Full and its data owner closed):
+/// it asks its supervisor to start it again, and that start is Full. Distinct
+/// from success (0), failure (1), configuration errors (2) and an unclean
+/// termination (86); it is `EX_TEMPFAIL`. Under systemd `Restart=on-failure`
+/// a nonzero status restarts the unit; a stop requested through the service
+/// manager is not restarted.
+pub const ACTIVATION_RESTART_EXIT: u8 = 75;
+
+/// Wendelon ADR 0108: how an activated ControlOnly member exits. A completed
+/// handoff requests the supervised restart, unless an operator stop arrived:
+/// a stop stays a stop (exit 0), and the next start, by whoever starts it,
+/// follows the page. A failed handoff is a failure.
+fn activation_exit(handover: &std::io::Result<()>, stopped: bool) -> u8 {
+	match (handover, stopped) {
+		(Err(_), _) => 1,
+		(Ok(()), true) => 0,
+		(Ok(()), false) => ACTIVATION_RESTART_EXIT,
+	}
+}
+
+/// The daemon's stop signal (SIGINT or SIGTERM), registered now and watched
+/// for the rest of its life.
+fn spawn_stop_watch() -> tokio::sync::watch::Receiver<bool> {
+	let (sender, receiver) = tokio::sync::watch::channel(false);
+	tokio::spawn(async move {
+		wait_for_stop_signal().await;
+		let _ = sender.send(true);
+	});
+	receiver
+}
+
 /// ADR 0104 (wendelon): a control-only member runs until its stop signal, then
 /// shuts down within the daemon's bound. It serves Raft only.
+///
+/// Wendelon ADR 0108 D3: or until its activation is in its own applied state.
+/// It then closes every part (preparation, index, servers, Raft, checkpoint
+/// emitter), checks its start authority on its durably recovered state,
+/// rewrites its role to Full and closes its owner, all under the shutdown
+/// watchdog, which stays armed through the handoff and the runtime's bounded
+/// teardown (`run_daemon` disarms it only after that). No Full start runs
+/// in this process: a completed handoff exits `ACTIVATION_RESTART_EXIT` for its
+/// supervisor to start it again (the OS frees its sockets), a stop during the
+/// handoff exits 0, and a failure exits 1.
 async fn run_control_only(
 	cfg: NodeBootstrapConfig,
 	shutdown_deadline: std::time::Duration,
+	mut stop: tokio::sync::watch::Receiver<bool>,
 ) -> DaemonExit {
 	let node = match crate::node::ControlOnlyNode::bootstrap(cfg).await {
 		Ok(node) => node,
@@ -861,14 +909,34 @@ async fn run_control_only(
 		"wendelon: started control-only slot {} as Raft instance {}",
 		node.local_node.id, node.identity.instance
 	);
-	wait_for_stop_signal().await;
+	let mut activated = node.activated();
+	let activation = tokio::select! {
+		_ = stop.wait_for(|stopped| *stopped) => false,
+		result = activated.wait_for(|activated| *activated) => result.is_ok(),
+	};
 	let watchdog = crate::shutdown_watchdog::ShutdownWatchdog::arm(shutdown_deadline);
-	if let Err(e) = node.shutdown().await {
-		eprintln!("control-only shutdown failed: {e}");
-		return DaemonExit::armed(ExitCode::from(1), watchdog);
+	if !activation {
+		if let Err(e) = node.shutdown().await {
+			eprintln!("control-only shutdown failed: {e}");
+			return DaemonExit::armed(ExitCode::from(1), watchdog);
+		}
+		eprintln!("wendelon: shutdown complete");
+		return DaemonExit::armed(ExitCode::SUCCESS, watchdog);
 	}
-	eprintln!("wendelon: shutdown complete");
-	DaemonExit::armed(ExitCode::SUCCESS, watchdog)
+	eprintln!("wendelon: replacement activated; handing over to a full member");
+	let handover = node.hand_over().await;
+	// The stop is read after the handoff ended: a stop that arrived during it
+	// is honoured as a stop.
+	let code = activation_exit(&handover, *stop.borrow());
+	match (&handover, code) {
+		(Err(e), _) => eprintln!("handover failed: {e}"),
+		(Ok(()), 0) => eprintln!("wendelon: stopped during the handover; the next start is full"),
+		(Ok(()), _) => eprintln!(
+			"wendelon: handover complete; exiting {ACTIVATION_RESTART_EXIT} for the supervisor to \
+			 start this member again, as full"
+		),
+	}
+	DaemonExit::armed(ExitCode::from(code), watchdog)
 }
 
 /// A failure after bootstrap still owes the node a bounded shutdown: dropping a
@@ -971,6 +1039,21 @@ async fn shutdown_observability(handles: ObservabilityHandles) -> std::io::Resul
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	/// Wendelon ADR 0108 D3: only a completed handoff with no stop requests the
+	/// supervised restart; a stop stays a stop and a failure stays a failure.
+	#[test]
+	fn an_activated_member_exits_for_its_restart_only_when_its_handoff_completed() {
+		let failed = || Err(std::io::Error::other("handoff failed"));
+		assert_eq!(activation_exit(&Ok(()), false), ACTIVATION_RESTART_EXIT);
+		assert_eq!(activation_exit(&Ok(()), true), 0);
+		assert_eq!(activation_exit(&failed(), false), 1);
+		assert_eq!(activation_exit(&failed(), true), 1);
+		let unclean = crate::storage::ownership::UNCLEAN_SHUTDOWN_EXIT_CODE;
+		for other in [0, 1, 2, unclean] {
+			assert_ne!(i32::from(ACTIVATION_RESTART_EXIT), other);
+		}
+	}
 	use std::net::SocketAddr;
 	use std::path::{Path, PathBuf};
 	use std::process::Command;

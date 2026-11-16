@@ -64,14 +64,16 @@ Children accepted in (A, the activation entry] were refused by NotServing and ar
   `write_identity` stays write-once.
 - **The handoff** (`run_control_only`):
   1. The preparation reports `Activated` when its own applied state holds the activation. `run_control_only` selects between that signal and the stop signal.
-  2. Arm the shutdown watchdog, for the ControlOnly part only.
+  2. Arm the shutdown watchdog. It stays armed through the handoff and the runtime's bounded teardown; `run_daemon`'s existing policy disarms it only after `runtime.shutdown_timeout(10 s)`, before returning the exit code.
   3. Shut ControlOnly down up to, but not including, owner close: the preparation (awaited), the index release, the lifecycle, listeners and servers, `raft.shutdown()`, and the checkpoint emitter (awaited). Each step must succeed.
   4. Re-check: `log_store.recovered_state_machine()` must show `replacement_start_authority` holding. This catches a durable cut that lags; it is not a race with the emitter.
   5. `activate_identity(expected)`.
   6. `owner.close(..)` must succeed.
-  7. Disarm the watchdog, then `WendelonNode::bootstrap(cfg)` and the ordinary full daemon loop.
-  - Any failure at steps 3 to 6 exits nonzero and never boots Full.
-  - A stop signal during steps 2 to 6 completes the ControlOnly shutdown and exits 0. The next start follows the page.
+  7. Exit with the restart-request status `ACTIVATION_RESTART_EXIT` (75, `EX_TEMPFAIL`). It is distinct from success (0), failure (1), configuration errors (2) and an unclean termination (86). No Full start runs in this process. Its supervisor starts it again once it is dead, and the page selects the ordinary Full startup with the same R and J, including the current-authority check and unclean-recovery validation. No incarnation, token or activation statement is minted. (Superseded: a same-process `WendelonNode::bootstrap(cfg)`; see As built, run 3.)
+  - Any failure at steps 3 to 6 exits 1 and never boots Full.
+  - A stop signal before or during steps 2 to 6 completes the ControlOnly shutdown and exits 0, never 75; the stop is read once, after the handoff ended. The next start follows the page.
+  - A stop that arrives after that read but before the exit still sees 75. A service manager does not restart a unit it is stopping, whatever the status (systemd: `systemctl stop`). No self-spawn supervisor is introduced.
+  - The supervisor contract (restart on 75 under `Restart=on-failure`, rate limits, a hand-run process, `nilket local`) is in `plans/ops/configuration.md`, "Running under systemd".
 - **Crash points:**
 
   | Crash | Next start |
@@ -193,7 +195,8 @@ Old-instance exclusion is unchanged, and D4 adds the refusal of leases and recei
 `three_daemons_replace_a_lost_follower_with_a_control_only_instance`, following the product's behaviour:
 1. **Unchanged through recovery:** the loss, the blank refusal, begin, provision, Done, rows 5 to 8, promotion and recovery. Activation follows automatically.
 2. **Observe `activated through A at gid C_A`,** with A ≥ K.
-   - The same owned process (pid and start time) logs the handoff.
+   - The owned ControlOnly process (pid and start time read before the activation) exits, within `HANDOFF_EXIT_BOUND` (60 s), with exactly status 75. Any other status, a signal or a timeout fails, never a reason to restart it and go on.
+   - Reaped, its page is Full. The test, as the declared supervisor, starts it exactly once from the same directory, executable and configuration: an expected supervised handoff, not an operator repair or a test of systemd wiring. The new process identity differs.
    - Readiness shows `raft_instance == 2147483648`, `store_incarnation ==` the promoted J, no degraded reason, and a leader.
    - `leader_hint` is never treated as proof.
 3. **Direct query.** A query sent straight to node 3, with no forwarding, retry or fallback, returns exactly rows 1 to 8, served there.
@@ -222,3 +225,107 @@ Old-instance exclusion is unchanged, and D4 adds the refusal of leases and recei
 - §8 (FAILED, unwaived).
 - DC-244 to DC-247 (DC-247 open).
 - Revalidation of legacy index segments.
+
+## Amended during implementation (census CENSUS-87, Codex 01a1e3af)
+- **D5, ParentDecisions admission order (DC-250).** Child writes and replicas, and child repair (including certification's build and the replacement's owed repair), took no index admission guard. A declaration cut could fall between `plan_child`'s reading of the descriptors and the append, and between the durable append and the buffer append. The fix: the plan is an `AdmittedPlan`, made only by taking the store's admission read guard before the descriptors are read. Its guard moves with the parent lock into the spawned persistence work, so a cancelled caller releases neither before that work ends. Repair takes it after its fetch. Lock order everywhere: the admission guard, then the parent lock.
+- **D4, `Abort`.** Unchanged (Codex): a nonterminal abort must match the historical coordinator, reservation and lineage exactly. When that coordinator is an old I that is no longer current, `lineage_open` is false and the abort concludes `LineageClosed`, the outcome Resolve imposes anyway. It cannot abort a J-owned claim.
+- **D4, clock samples.** Old-process clock samples are filed under slot N in the leader's memory. Recorded only: an availability and clock-admission concern, source-only and unmeasured.
+- **D7.** The per-range argument depends on the ParentDecisions PrimaryKey gate (`child_writes.rs` `row_versions_in_order` refuses AppendOnly, the one cross-key use of a full HLC as an identifier) and on the inactive CDC path. It is not a claim that HLCs are unique across keys or ranges.
+
+## As built
+- **Activation.**
+  - `ActivationBody` and `DecisionCommand::ActivateReplacement` are recorded once by `record_activation`, as `Replacement.activated`. `preparing(slot)` ends at activation.
+  - Refusals: `ActivationNotAuthorized`, `ActivationConflict`, `ActivationCutOutOfRange`, `ActivationCertificateOutOfRange`.
+  - Forwarded as `ForwardedDecision::ActivateReplacement`, for the sender's own slot.
+- **The procedure** (`RecoveryDriver::activation`) runs after the delta repair and any pending report. It takes one state read: applied index A, certificate C_A, the owed set through A, and any recorded activation. C_A must be the active base. Every owed child must be a Complete intent of the recorded content. The result is a signed `ActivateReplacement`, or `Activated` once applied here.
+- **The signal.** The preparation stores its `activated` watch with `send_replace`. A plain `send` dropped the value when no receiver was subscribed yet; an in-process restart that activated before the caller subscribed never saw it.
+- **Start authority.** `decisions::replacement_start_authority` reads current facts only. `construct` calls it for an origin-Replacement identity right after `establish_identity` and before `WendelonRaft::new`, on `recovered_state`.
+- **The page.** `WendelonLogStore::activate_identity(expected)` writes under the page lock, keeping the birth and latest vote.
+- **Checkpoint flush.** `CheckpointCoordinator::flush_now` writes the latest checkpoint before the handoff reads its recovered state.
+- **The handoff.** `ControlOnlyNode::hand_over`, in this order: preparation stop, index release, servers drained and shut, Raft shut down, emitter stopped, checkpoint flushed, authority on `log_store.recovered_state_machine()`, `activate_identity`, owner close.
+- **The CLI.** `run_control_only` returns the daemon's exit. The stop signal is registered once for the daemon's life (`spawn_stop_watch`). `activation_exit` maps the handoff's result and the stop read after it: failure 1, stopped 0, completed 75. The watchdog stays armed through the handoff and the runtime's bounded teardown, as `run_daemon` already treats every daemon exit. (As first built, `ControlOnlyEnd::HandedOver` disarmed it and started Full in the same process; superseded after run 3.)
+- **Serving by ancestry.** The read path (`reader.rs` accepted children) and the repair source (`repair.rs`) count a child by the recorded-ancestry rule (ADR 0107 C2), not by exact plan membership. Without it a Full J could not read the children it recovered for I: the first in-process read was refused "a child's plan excludes this store", QUERY_EXECUTION_FAILED. The write path stays exact.
+- **Leases.** `LeaseBatchGrant.holder_incarnation`; `AcquireLeasesRequestHeader.holder_incarnation`, 16 bytes little-endian, so the header grows from 40 to 56 bytes. `admit_lease_grant` and `validate_lease_batch_target` use the carried store (`HolderNotCurrent`).
+- **Index receipts.**
+  - `DecisionCommand::IndexReceipt`, `IndexReceiptBody`, `IndexReceiptPhase`.
+  - `DecisionState.index_receipts`, holding `IndexReceipts { backfilled, drop_collected }`. Entering Dropping clears the backfill set (`index_entered_dropping`). The catalog changes go through `promote_to_ready` and `remove_dropped` in `decisions::apply`.
+  - Refusals: `IndexReceiptNotCurrent`, `IndexReceiptUnknownIndex`, `IndexReceiptWrongPhase`.
+  - Slots are resolved through `instances::slot_in(decisions, ..)`: inside `reduce`, `state.decisions` is out of `state`, and `slot_of` then misreads a replacement's instance.
+  - The lifecycle signs and proposes receipts under ParentDecisions (`IndexReceiptSubmitter`). The shared mutations are refused under ParentDecisions at admission and at apply.
+- **ControlOnly repair** writes no index buffer (`RepairContext.index_buffers = false`, `AdmittedPlan::without_index_buffers`).
+- **Readiness** JSON gains `raft_instance` and `store_incarnation`. `replace status` gains `; activated through A at gid C`.
+- **Formats.** ParentDecisions WAL/snapshot 28, marker v18 (v17 retired), ParentDecisions Raft frame 21, golden `parent_decisions_v28.txt`. Moved against 27: the decision state, `acquire_leases_0` and `promoted_replacement`. Added: `activate_replacement`, `index_receipt` and `activated_replacement`.
+- **Test seams.**
+  - `ACTIVATION_ENABLED` (in-process replacements activate only where a test enables it; the ADR 0104 to 0107 controls keep their ControlOnly member; the product always activates).
+  - `PAUSE_BEFORE_ACTIVATION`.
+  - `PAUSE_BEFORE_INDEX_BUFFER`.
+  - `AdmittedPlan::for_test`.
+  - `control_artifact_paths_for_test`.
+  - The cluster harness's `leader()` maps a Raft instance to its slot.
+- **Controls.**
+  - Reducer:
+    - `an_activation_is_recorded_once_for_the_current_recovered_store` (1);
+    - `an_activation_is_signed_by_the_promoted_store_and_refused_once_superseded` (1);
+    - `a_replaced_slots_lease_carries_its_store_and_waits_for_its_activation` (5);
+    - `index_receipts_are_bound_to_the_current_store_and_to_their_phase` (9);
+    - `a_replacement_starts_full_only_under_its_current_activation` (3/H3).
+  - Storage, DC-250:
+    - `a_child_planned_before_an_index_is_not_lost_to_its_cut` (window 1);
+    - `a_cut_between_a_childs_append_and_its_index_entry_loses_no_row` (window 2);
+    - `a_cancelled_child_write_keeps_the_cut_out_until_its_work_ends`.
+  - Cluster:
+    - `an_activated_replacement_hands_over_and_serves_as_a_full_member` (1, H2, 6, 10: a generation commits on the Full replacement's report; leadership moves to its instance and the cluster commits);
+    - `a_row_after_the_activation_cut_is_served_and_a_stop_before_the_rewrite_resumes` (2, H1, 6);
+    - `a_superseded_replacement_refuses_its_handoff_and_keeps_its_page` (H3 at the handoff);
+    - `a_parent_decisions_index_is_ready_and_dropped_on_every_current_stores_receipt` (9, cluster);
+    - `a_full_replacement_indexes_its_recovered_rows_under_its_own_receipt` (8).
+- **Mutants:** a lease stamped from current (5 RED); a start check without its current-store and serving checks (3 RED); phase-blind receipts with no clear at Dropping (9 RED); a guard that blocks nothing (DC-250 windows 1 and 2 and cancellation RED); a guard held only by the outer caller (cancellation RED).
+- **Not built as a dedicated control:**
+  - 7: the per-range time ordering is composed of the ADR 0729 floor control (`a_successors_claim_is_reserved_only_above_its_generations_floor`) and promotion's `LineagesStillHeld` (no lineage at (N, I) when J is promoted).
+  - 11: the old instance after activation is covered by the lease reducer control and ADR 0104's Raft exclusion.
+- **The owning scenario.** It is rebased on automatic activation: status, readiness as itself, a direct query, row 11 held, the Full page, a Full restart. ADR 0107's real-time certification phase leaves it. Launcher `replacement-launch.sh` (285639e1…, `RuntimeMaxSec` 480), unchanged.
+- **Limits.**
+  - Index segments persisted before DC-248's fix are not revalidated.
+  - DC-247 stays open: every replacement's first Full start validates fully.
+  - The old instance's clock samples are recorded only.
+  - Rebalancing ranges to J is not done.
+- **Corrections after source review** (Codex 01a1e41e):
+  - **R1.** An activation's recorded answer is bound to its recovery. `record_activation` compares the signed (recovered gid, k) with the recorded recovery before any historical answer, then checks current authority only for a first activation. Control `an_activation_retry_names_its_recorded_recovery_exactly`: a replay changing only k, or only the gid, is refused with state unchanged, and the exact retry keeps its historical answer after supersession. RED on the earlier code.
+  - **R2.** Receipt completeness needs every voter mapped to a slot. An unknown mapping refuses the receipt before anything is recorded (`IndexReceiptMembershipUnknown`). Control `an_index_receipt_is_refused_while_a_voter_maps_to_no_slot`. RED on the earlier code.
+  - **R3.** The real-process oracles:
+    - `direct_query_exact` checks the decoded rows of the ONE direct answer (test-support `table_query_rows_at_for_test`), within `PROBE_BOUND` and the workflow's deadline;
+    - `serving_as` refuses an answer observed after its bound, and requires the owned process identity to be unchanged.
+
+    Unit control `a_direct_answer_passes_only_exact_ok_and_in_time`: OK with a missing row, empty, another value, a redirect, a refusal, no answer, and a match after the bound all fail.
+  - **R4.** The handoff returns an unexpected preparation-task join failure and a checkpoint-emitter end other than its own requested cancellation; no role rewrite or Full start follows. Control `a_failed_preparation_task_ends_the_handoff_without_a_rewrite` (seam `PANIC_AFTER_ACTIVATION`). RED on the earlier code.
+  - **Not exercised by any control:** a real stop signal during the CLI handoff and a close failure in the CLI path (CLI code). Their exit mapping is unit-tested (`an_activated_member_exits_for_its_restart_only_when_its_handoff_completed`). The owning run exercises only the normal CLI handoff.
+- **Correction after the FAILED owning run** pd-replace-20261116T114842Z (seal 5ea4a404…, Codex 01a1e439).
+  - **The failure.** The handoff read J through `owner_ref` on the ControlOnly recovery storage. That storage is never bound to a control node, and `owner_ref` answers an unbound store differently by build: node 1 under `cfg(test)`, an error in the product. The real daemon's handoff failed at once, with no rewrite and no Full start; every in-process handoff had passed.
+  - **The fix.** J is read from the recovery store's own index (`persistent_index().store_incarnation()`). A missing storage or index stays fail-closed, and the durable authority check still compares this J with the recorded activation, the promotion and the current registry. The ControlOnly store is not bound to make `owner_ref` succeed.
+  - **The pin.** The in-process handoff control asserts the recovery storage is unbound before `hand_over`. That pins the fixture precondition; it is not a RED, because the cfg(test) fallback lets the old code pass.
+  - **DC-251** (the fallback itself) stays open.
+- **Correction after the second FAILED owning run** pd-replace-20261116T120229Z (seal 1f6c6202…, Codex 01a1e448, option A). Built as impl 2ab9115c (tree 560552ac, delta r5 9dd07610…), it FAILED the third owning run and is superseded below. It is kept here as history; its code is not in this implementation.
+  - **The failure.** The handoff completed, then the Full start's bind failed with `Address already in use`. The configured transport binds `advertise_address` twice, as a QUIC (UDP) endpoint shared with the outbound provider and as a TCP+TLS listener. Quinn frees the UDP socket only when its driver ends, after the last `Endpoint` handle is gone. Which bind failed, and whether a handle leaked or the start raced the driver, was not established.
+  - **Dropping the transport handles.** `hand_over` now drops every transport-holding handle (the Raft handle, the provider, the preparation, the state machine, the lifecycle) after the shutdowns. It keeps the log store, the checkpoints and the owner.
+  - **The bounded release wait.** Then, before the checkpoint flush, the authority check and the role rewrite, `transport_release::await_transport_release` waits within ONE declared `TRANSPORT_RELEASE_BUDGET` (10 s, inside the shutdown watchdog). It waits until the ACTUAL bound UDP and TCP addresses, captured from the listeners at construction (`bound_transport`), bind again with the bootstrap's semantics (std UDP as Quinn binds; Tokio TCP).
+    - The UDP probe is held until the TCP probe succeeds, then both are released: an observation, not a reservation.
+    - Only "address in use" is observed again; another bind error fails at once.
+    - A success after the deadline is refused.
+    - Expiry names the protocol and address, and leaves the page unchanged.
+    - The Full start's bind stays one attempt, and no reuse option is set.
+    - An in-process (simulated) member bound nothing and owes no release.
+  - **Controls:**
+    - real transport through `configured_transport`: `a_held_quic_provider_keeps_its_udp_address_until_dropped` (a closed endpoint with a provider clone held: UDP refused within the bound; dropped: released and bound again by the real transport);
+    - `a_held_tcp_listener_keeps_its_address_until_dropped`;
+    - `a_release_is_refused_late_and_fails_at_once_on_another_error`;
+    - handoff: `an_address_still_bound_ends_the_handoff_before_the_rewrite` (seam `TEST_BOUND_TRANSPORT`; the page stays ControlOnly).
+- **The third FAILED owning run** pd-replace-20261116T122959Z (seal d487a079…, candidate 2ab9115c), and the supervised restart (Codex 01a1e463, option D).
+  - **The failure.** Raft shut down cleanly. At the end of the QUIC close grace the endpoint still counted one open connection, and the UDP address was still bound at the 10 s release deadline: `TransportRelease: UDP 127.0.0.1:44895 is still in use after the release budget`. The handoff failed closed, with no rewrite and no Full start.
+  - **What is not established:** whether a longer drain would have finished, and which reference or connection held the socket. DC-252 stays open.
+  - **The contract change.** Activation stays automatic, but the ControlOnly process completes its storage handoff and exits 75. A supervisor starts Full once that process is dead (D3 step 7), and process exit frees its sockets. Same-PID continuation is superseded.
+  - **Removed.** The in-process release wait and its controls are removed from the product path, with no unused retry mechanism left behind. The real-QUIC ownership controls are archived in delta r5 (`adr0108-delta-r5.patch`, reviews), not kept as tests of a removed path.
+  - **What process death does not prove.** It solves socket lifetime, not that writers stopped. That stays the cooperative shutdown, the checkpoint flush, the durable authority recheck, the serialized rewrite and the owner close, under the watchdog until exit.
+  - **Controls:**
+    - `an_activated_member_exits_for_its_restart_only_when_its_handoff_completed` (CLI unit: completed 75, stopped 0, failed 1 with or without a stop; 75 distinct from 0, 1, 2 and 86);
+    - `a_replacement_end_counts_only_as_a_restart_request_in_time` (workflow oracle, Codex 01a1e471 R1/R2): from its first start, the replacement's end is reaped once and kept only as 75; it is never polled again; another code, 0 or a signal is refused; a 75 first observed after its bound is refused, its time read after the end is observed, never at the poll's start (Codex 01a1e47a); there is no supervised start before a kept end, and only one after;
+    - the in-process handoff controls, unchanged: H1 resume, H3 superseded refusal, R4 join failure, and the Full start after `hand_over`, which is the next start's ordinary path.

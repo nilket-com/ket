@@ -77,8 +77,9 @@ fn fetch_source_check(
 			.and_then(|registry| registry.current)
 	};
 	// ADR 0106 (wendelon): a requester is eligible as the plan member it is, or
-	// as the current successor of one (its recorded ancestry). The source itself
-	// must be a plan member exactly (below).
+	// as the current successor of one (its recorded ancestry). Wendelon ADR 0108:
+	// the source itself must be its slot's current store, named by the plan at an
+	// incarnation in its recorded ancestry (below).
 	let eligible = |node: u32| {
 		child.plan.iter().any(|member| {
 			member.node == node
@@ -96,7 +97,19 @@ fn fetch_source_check(
 	if requester == local.node || !eligible(requester) {
 		return Err(ChildRefusal::WrongSender);
 	}
-	if current(local.node) != Some(local.incarnation) || !child.plan.contains(&local) {
+	// Wendelon ADR 0108: this store serves a child whose plan names the slot at
+	// an incarnation in its recorded ancestry (ADR 0107 C2), so an activated
+	// replacement is a source for the children it recovered.
+	let named = child.plan.iter().any(|member| {
+		member.node == local.node
+			&& crate::consensus::decisions::in_recorded_ancestry(
+				state,
+				local.node,
+				local.incarnation,
+				member.incarnation,
+			)
+	});
+	if current(local.node) != Some(local.incarnation) || !named {
 		return Err(ChildRefusal::NotInPlan);
 	}
 	let descriptor = super::child_writes::table_descriptor(
@@ -284,6 +297,7 @@ impl WendelonDataServer {
 			slab: self.slab.clone(),
 			locks: self.decisions.locks.clone(),
 			pool: self.pool.clone(),
+			index_buffers: true,
 			connect: Arc::new(move |node| {
 				let factory = factory.clone();
 				Box::pin(async move {
@@ -325,6 +339,10 @@ pub(crate) struct RepairContext {
 	pub(crate) locks: Arc<super::child_writes::ParentLocks>,
 	pub(crate) pool: Arc<BufPool>,
 	pub(crate) connect: Connect,
+	/// Wendelon ADR 0108 D5: whether repaired rows enter this store's index
+	/// buffers. A ControlOnly replacement runs no index lifecycle, so no cut
+	/// proves its buffers: it writes none, and its Full start rebuilds them.
+	pub(crate) index_buffers: bool,
 }
 
 /// Repairs `local`'s copy of an Accepted child from the other members of its
@@ -387,9 +405,11 @@ pub(crate) async fn repair_child_in(
 			claim_digest,
 			schema_generation,
 		};
-		let plan = ctx
-			.state_machine
-			.read_state(move |state| {
+		// Wendelon ADR 0108 D5: the index admission guard is taken after the
+		// fetch and before the plan reads its descriptors; a failed plan drops
+		// it before the next source is asked.
+		let plan =
+			super::child_writes::AdmittedPlan::admit(&ctx.slab, &ctx.state_machine, move |state| {
 				plan_child(
 					state,
 					local,
@@ -402,7 +422,8 @@ pub(crate) async fn repair_child_in(
 			})
 			.await;
 		let plan = match plan {
-			Ok(plan) => plan,
+			Ok(plan) if ctx.index_buffers => plan,
+			Ok(plan) => plan.without_index_buffers(),
 			Err(refusal) => {
 				last = refusal;
 				continue;

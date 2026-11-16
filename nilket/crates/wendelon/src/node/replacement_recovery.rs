@@ -95,6 +95,13 @@ pub(crate) static PAUSE_AFTER_VIEW: std::sync::Mutex<
 	std::collections::BTreeMap<PathBuf, (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
 > = std::sync::Mutex::new(std::collections::BTreeMap::new());
 
+/// ADR 0108 (wendelon) test seam: an in-process replacement activates only
+/// where its test enables it (by store directory), so the ADR 0104 to 0107
+/// controls keep their ControlOnly member; the product always activates.
+#[cfg(test)]
+pub(crate) static ACTIVATION_ENABLED: std::sync::Mutex<std::collections::BTreeSet<PathBuf>> =
+	std::sync::Mutex::new(std::collections::BTreeSet::new());
+
 /// ADR 0106 (wendelon): what one recovery step found.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Progress {
@@ -108,6 +115,9 @@ pub(crate) enum Progress {
 	/// report of its durably staged candidate, to be forwarded. Its answer
 	/// never stops recovery: a later step reconciles from applied state.
 	Report(Box<crate::network::decision_proposals::ForwardedDecision>),
+	/// ADR 0108 (wendelon): this store's activation is in its own applied
+	/// state: the ControlOnly member hands over to a Full one.
+	Activated,
 }
 
 /// ADR 0106 (wendelon): the promoted replacement's recovery, run by its
@@ -352,6 +362,7 @@ impl RecoveryDriver {
 			locks: self.locks.clone(),
 			pool: self.pool.clone(),
 			connect: self.connect(),
+			index_buffers: false,
 		}
 	}
 
@@ -457,14 +468,107 @@ impl RecoveryDriver {
 		if let Progress::Pending(why) = self.repair_owed(view, recorded.k, u64::MAX).await? {
 			return Ok(Progress::Pending(why));
 		}
-		Ok(
-			match under_permit(&self.slab, certification.prepare_report()).await? {
-				Some(report) => Progress::Report(Box::new(
-					crate::network::decision_proposals::ForwardedDecision::Report { report },
-				)),
-				None => Progress::Recorded,
+		if let Some(report) = under_permit(&self.slab, certification.prepare_report()).await? {
+			return Ok(Progress::Report(Box::new(
+				crate::network::decision_proposals::ForwardedDecision::Report { report },
+			)));
+		}
+		self.activation(view, index, recorded).await
+	}
+
+	/// ADR 0108 (wendelon) D1: the activation from ONE view V read at applied
+	/// index A: V's certificate C_A must be this store's active base, and every
+	/// child V owes the slot through A (from V's retained bodies) must be held
+	/// here as a Complete intent of its recorded content. The set is never
+	/// sampled again: anything missing ends the step Pending, and a later step
+	/// reads a new view. An activation already in applied state is `Activated`.
+	async fn activation(
+		&self,
+		view: &View,
+		index: &crate::storage::index::PersistentLocalIndex,
+		recorded: crate::consensus::decisions::instances::Recovery,
+	) -> std::io::Result<Progress> {
+		#[cfg(test)]
+		if !ACTIVATION_ENABLED
+			.lock()
+			.unwrap()
+			.contains(self.slab.data_dir())
+		{
+			return Ok(Progress::Recorded);
+		}
+		let (slot, token) = (self.slot, view.token);
+		let (applied, certified, owed, activated) = self
+			.state_machine
+			.read_state(move |state| {
+				let decisions = state.decisions.as_ref();
+				let applied = state.last_applied_log_id.map_or(0, |id| id.index);
+				let certified = decisions
+					.and_then(|decisions| decisions.generations().current.as_ref())
+					.map_or(0, |certificate| certificate.gid);
+				let activated = decisions
+					.and_then(|decisions| decisions.instances().replacement(token))
+					.and_then(|replacement| replacement.activated);
+				(
+					applied,
+					certified,
+					owed_children(state, slot, 0, applied),
+					activated,
+				)
+			})
+			.await;
+		if let Some(activation) = activated {
+			if activation.incarnation != view.store {
+				return Err(Error::other(
+					"ActivationConflict: another store's activation is recorded for this replacement",
+				));
+			}
+			return Ok(Progress::Activated);
+		}
+		let active = index.base_meta().await?.active_gid;
+		if active != certified {
+			return Ok(Progress::Pending(format!(
+				"activation waits for certificate gid {certified} to be active here (active {active})"
+			)));
+		}
+		for child in &owed {
+			let held = index
+				.parent_intent(child.rsv, child.ordinal)
+				.await?
+				.is_some_and(|intent| {
+					intent.state
+						== crate::storage::index::parent_intents::ParentIntentState::Complete
+						&& intent.claim_digest == child.claim_digest
+						&& intent.content == child.content
+				});
+			if !held {
+				return Ok(Progress::Pending(format!(
+					"activation through {applied} waits for child ({}, {})",
+					child.rsv, child.ordinal
+				)));
+			}
+		}
+		let store = crate::consensus::decisions::Signer {
+			node: slot,
+			incarnation: view.store,
+		};
+		let proof = crate::consensus::decisions::evidence::sign(
+			&self.key,
+			crate::consensus::decisions::ActivationBody {
+				token,
+				slot,
+				r_new: self.instance,
+				birth: view.birth,
+				store: view.store,
+				recovered_gid: recorded.gid,
+				k: recorded.k,
+				through: applied,
+				certified,
 			},
-		)
+			store,
+		);
+		Ok(Progress::Ready(Box::new(
+			crate::network::decision_proposals::ForwardedDecision::ActivateReplacement { proof },
+		)))
 	}
 
 	/// Every child the store owes with `after < dec <= through`, by decision

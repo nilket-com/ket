@@ -246,11 +246,20 @@ impl Cluster {
 			.unwrap()
 	}
 
+	/// The leader's slot. Wendelon ADR 0108: a replacement leads as its own Raft
+	/// instance, which is not its slot; applied state maps one to the other.
 	async fn leader(&self) -> u32 {
 		let deadline = tokio::time::Instant::now() + BOUND;
 		loop {
-			if let Some(leader) = self.nodes[0].raft.current_leader().await {
-				return leader;
+			if let Some(leader) = self.nodes[0].raft.current_leader().await
+				&& let Some(slot) = self.nodes[0]
+					.state_machine
+					.read_state(move |state| {
+						crate::consensus::decisions::instances::slot_of(state, leader).ok()
+					})
+					.await
+			{
+				return slot;
 			}
 			assert!(tokio::time::Instant::now() < deadline, "no leader");
 			tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -3814,9 +3823,15 @@ async fn a_lease_batch_request_passes_the_single_grant_checks_for_every_range() 
 				.collect()
 		})
 		.await;
+	// ADR 0108 (wendelon): each holder carries its own store incarnation.
+	let incarnations: std::collections::BTreeMap<u32, crate::consensus::StoreIncarnation> = NODES
+		.into_iter()
+		.map(|id| (id, cluster.node(id).slab.owner_ref().unwrap().incarnation()))
+		.collect();
 	let send = |caller: u32, holder: u32, ranges: Vec<(u64, u64)>| {
 		let router = cluster.node(leader).router.clone();
 		let generations = generations.clone();
+		let incarnations = incarnations.clone();
 		async move {
 			let header = AcquireLeasesRequestHeader {
 				epoch,
@@ -3828,6 +3843,7 @@ async fn a_lease_batch_request_passes_the_single_grant_checks_for_every_range() 
 				},
 				ttl_ms: 3_000,
 				count: ranges.len() as u32,
+				holder_incarnation: incarnations[&holder].get().to_le_bytes(),
 			};
 			let mut meta = bytemuck::bytes_of(&header).to_vec();
 			for (range_start, range_end) in &ranges {

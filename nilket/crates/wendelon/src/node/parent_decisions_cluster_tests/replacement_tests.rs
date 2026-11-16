@@ -2783,3 +2783,6 @@ async fn a_generation_committed_during_a_recovery_step_is_activated_and_recovery
 		let _ = tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown()).await;
 	}
 }
+
+#[path = "replacement_activation_tests.rs"]
+mod activation;

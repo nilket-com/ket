@@ -15628,6 +15628,31 @@ async fn append_secondary_index_active_buffers_for_single_row(
 	}
 }
 
+/// Wendelon ADR 0108 test seam (DC-250 window 2): one-shot, by store directory;
+/// holds an append after its durable write and before its index buffer append.
+#[cfg(test)]
+pub(crate) static PAUSE_BEFORE_INDEX_BUFFER: std::sync::Mutex<
+	std::collections::BTreeMap<
+		std::path::PathBuf,
+		(
+			std::sync::Arc<tokio::sync::Notify>,
+			std::sync::Arc<tokio::sync::Notify>,
+		),
+	>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+#[cfg(test)]
+async fn pause_before_index_buffer(slab: &SlabManager) {
+	let paused = PAUSE_BEFORE_INDEX_BUFFER
+		.lock()
+		.unwrap()
+		.remove(slab.data_dir());
+	if let Some((reached, release)) = paused {
+		reached.notify_one();
+		release.notified().await;
+	}
+}
+
 async fn append_table_children_durable(
 	slab: &SlabManager,
 	tenant_id: TenantId,
@@ -15646,6 +15671,8 @@ async fn append_table_children_durable(
 					&entries,
 				)
 				.await?;
+			#[cfg(test)]
+			pause_before_index_buffer(slab).await;
 			append_secondary_index_active_buffers_for_storage_batch(
 				slab,
 				tenant_id,
@@ -15665,6 +15692,8 @@ async fn append_table_children_durable(
 					child.frame_bytes.as_slice(),
 				)
 				.await?;
+			#[cfg(test)]
+			pause_before_index_buffer(slab).await;
 			append_secondary_index_active_buffers_for_single_row(
 				slab,
 				tenant_id,
