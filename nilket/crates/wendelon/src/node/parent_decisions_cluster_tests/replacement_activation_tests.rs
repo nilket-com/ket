@@ -113,9 +113,9 @@ async fn an_activated_replacement_hands_over_and_serves_as_a_full_member() {
 		.recovery_storage()
 		.await
 		.unwrap()
-		.owner_ref()
-		.unwrap()
-		.incarnation();
+		.persistent_index()
+		.expect("the recovery storage's index")
+		.store_incarnation();
 	assert_eq!(activation.incarnation, store);
 	assert!(activation.through >= recorded.k);
 	assert_eq!(
@@ -246,9 +246,9 @@ async fn a_row_after_the_activation_cut_is_served_and_a_stop_before_the_rewrite_
 		.recovery_storage()
 		.await
 		.unwrap()
-		.owner_ref()
-		.unwrap()
-		.incarnation();
+		.persistent_index()
+		.expect("the recovery storage's index")
+		.store_incarnation();
 	until_activated(&control).await;
 	control.hand_over().await.unwrap();
 	cluster.reopen(lost).await;
@@ -489,9 +489,9 @@ async fn a_full_replacement_indexes_its_recovered_rows_under_its_own_receipt() {
 		.recovery_storage()
 		.await
 		.unwrap()
-		.owner_ref()
-		.unwrap()
-		.incarnation();
+		.persistent_index()
+		.expect("the recovery storage's index")
+		.store_incarnation();
 	control.hand_over().await.unwrap();
 	cluster.reopen(lost).await;
 	until_ready_as(&cluster, lost, store).await;

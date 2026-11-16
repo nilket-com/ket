@@ -1189,7 +1189,13 @@ async fn a_promoted_replacement_stores_and_reopens_a_recovered_base() {
 		refused.to_string().contains("ReplacementStoreHandedOver"),
 		"{refused}"
 	);
-	assert_eq!(slab.owner_ref().unwrap().incarnation(), j);
+	// DC-251: the promoted store's own index names it; it is not bound to a node here.
+	assert_eq!(
+		slab.persistent_index()
+			.expect("the promoted store's index")
+			.store_incarnation(),
+		j
+	);
 
 	// One row and one typed tombstone, durably, at their exact versions.
 	let tenant = TenantId::ZERO;

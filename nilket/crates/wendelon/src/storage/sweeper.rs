@@ -3319,6 +3319,9 @@ impl TierObserver for ManagerTierObserver {
 
 #[cfg(test)]
 mod tests {
+	// DC-251: each test store here is a node's store; it is bound to node 1 at its
+	// construction (and again at a reopen), as the product binds every store at its
+	// node's start. No owner reference is invented for an unbound store.
 	mod offload_tests;
 
 	use super::*;
@@ -3652,6 +3655,7 @@ mod tests {
 		})
 		.await
 		.unwrap();
+		manager.bind_control_node(1).unwrap();
 		// Each append rotates because the write_cursor crosses
 		// `max_slab_bytes` on the first record.
 		manager
@@ -3742,6 +3746,7 @@ mod tests {
 		})
 		.await
 		.unwrap();
+		manager.bind_control_node(1).unwrap();
 
 		let key = id(0x5050);
 		let locality = Locality::new(0x5050);
@@ -4923,6 +4928,7 @@ mod tests {
 		})
 		.await
 		.unwrap();
+		reopened.bind_control_node(1).unwrap();
 		assert_eq!(reopened.retained_cleanup_test_accounting(), before_reopen);
 	}
 
@@ -5170,6 +5176,7 @@ mod tests {
 		})
 		.await
 		.unwrap();
+		manager.bind_control_node(1).unwrap();
 
 		let old_loc = manager
 			.append(tenant(), id(0x5150), hlc_at(10), b"before-rotation")
@@ -5281,6 +5288,7 @@ mod tests {
 		})
 		.await
 		.unwrap();
+		manager.bind_control_node(1).unwrap();
 		let observer: Arc<dyn TierObserver> = Arc::new(ManagerTierObserver::new(manager.clone()));
 		let sm = WendelonStateMachine::new();
 		let committer: Arc<dyn TierCommitter> =
@@ -5499,6 +5507,7 @@ mod tests {
 		})
 		.await
 		.unwrap();
+		manager.bind_control_node(1).unwrap();
 
 		let old_loc = manager
 			.append(tenant(), id(0x5151), hlc_at(10), b"metadata-backfill")
@@ -5606,6 +5615,7 @@ mod tests {
 		})
 		.await
 		.unwrap();
+		manager.bind_control_node(1).unwrap();
 
 		let key = id(0x4242);
 		let old_hlc = hlc_at(10);
@@ -5757,6 +5767,7 @@ mod tests {
 		})
 		.await
 		.unwrap();
+		manager.bind_control_node(1).unwrap();
 		let key = id(9);
 		let older = hlc_at(now_ms.saturating_sub(50_000));
 		let anchor = hlc_at(now_ms.saturating_sub(20_000));
@@ -5911,6 +5922,7 @@ mod tests {
 		})
 		.await
 		.unwrap();
+		manager.bind_control_node(1).unwrap();
 		let key = id(17);
 		let older = hlc_at(now_ms.saturating_sub(50_000));
 		let anchor = hlc_at(now_ms.saturating_sub(20_000));
@@ -6060,6 +6072,7 @@ mod tests {
 		})
 		.await
 		.unwrap();
+		manager.bind_control_node(1).unwrap();
 		let key = id(27);
 		let duplicate_hlc = hlc_at(now_ms.saturating_sub(50_000));
 		let latest = hlc_at(now_ms.saturating_sub(5_000));
@@ -6193,6 +6206,7 @@ mod tests {
 		})
 		.await
 		.unwrap();
+		manager.bind_control_node(1).unwrap();
 		let key = id(27);
 		let duplicate_hlc = hlc_at(now_ms.saturating_sub(50_000));
 		let latest = hlc_at(now_ms.saturating_sub(5_000));
@@ -6393,6 +6407,7 @@ mod tests {
 			})
 			.await
 			.unwrap();
+		manager.bind_control_node(1).unwrap();
 		let copies_of = |manager: &SlabManager| {
 			let mut copies = manager
 				.scan_all_versions(Locality::ZERO, Locality::MAX, hlc_at(0))
@@ -6551,6 +6566,7 @@ mod tests {
 		})
 		.await
 		.unwrap();
+		manager.bind_control_node(1).unwrap();
 		([l1_dir, l2_root], manager, l2)
 	}
 
@@ -6790,6 +6806,7 @@ mod tests {
 			})
 			.await
 			.unwrap();
+		manager.bind_control_node(1).unwrap();
 		let sm = WendelonStateMachine::new();
 		let pointer =
 			tier_active_slab(&manager, &l2, &sm, "tier/retention-conflicting-once.wnd").await;
@@ -6940,6 +6957,7 @@ mod tests {
 		})
 		.await
 		.unwrap();
+		manager.bind_control_node(1).unwrap();
 		let key = id(33);
 		manager
 			.append(
@@ -7110,6 +7128,7 @@ mod tests {
 		})
 		.await
 		.unwrap();
+		manager.bind_control_node(1).unwrap();
 		let key = id(41);
 		manager
 			.append(tenant(), key, hlc_at(10), b"v-old")
@@ -7228,6 +7247,7 @@ mod tests {
 		})
 		.await
 		.unwrap();
+		manager.bind_control_node(1).unwrap();
 		manager
 			.append(tenant(), id(41), hlc(), b"first-tier")
 			.await
@@ -7310,6 +7330,7 @@ mod tests {
 		})
 		.await
 		.unwrap();
+		manager.bind_control_node(1).unwrap();
 		// Two committed counter frames from two origins at one op id.
 		let key = id(61);
 		let op = HybridTimestamp {
@@ -7499,6 +7520,7 @@ mod tests {
 		})
 		.await
 		.unwrap();
+		manager.bind_control_node(1).unwrap();
 		let key = id(17);
 		manager
 			.append(
@@ -8329,6 +8351,7 @@ mod tests {
 		})
 		.await
 		.unwrap();
+		reopened.bind_control_node(1).unwrap();
 		reopened.wait_tier_authority_ready().await.unwrap();
 		assert!(
 			reopened.refuse_unresolved_cleanup(old.slab_id).is_err(),

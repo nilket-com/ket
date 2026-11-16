@@ -130,11 +130,8 @@ impl SlabManager {
 	/// This store's owner reference, for every slab command it proposes.
 	pub(crate) fn owner_ref(&self) -> std::io::Result<crate::consensus::OwnerRef> {
 		// Production binds every store at node bootstrap, before any slab
-		// command is built. Unit tests that never join a ring name their
-		// store as node 1 until a test binds it explicitly.
-		#[cfg(test)]
-		let node = self.control_node.get().copied().unwrap_or(1);
-		#[cfg(not(test))]
+		// command is built. An unbound store is refused in every build
+		// (DC-251): a test names its store's node by binding it.
 		let node = self.control_node.get().copied().ok_or_else(|| {
 			Error::new(
 				ErrorKind::WouldBlock,

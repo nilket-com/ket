@@ -2326,8 +2326,49 @@ fn empty_compaction_catalogs() -> (TableSchemaCatalog, SecondaryIndexCatalog) {
 	)
 }
 
+/// DC-251: the node a fixture's store serves unless its test names another.
+const FIXTURE_NODE: u32 = 1;
+
+/// DC-251: `manager` as the store of control node `node`, bound explicitly; the
+/// product binds every store at its node's start, and no store is named a node
+/// without it.
+fn serving(manager: Arc<SlabManager>, node: u32) -> Arc<SlabManager> {
+	manager.bind_control_node(node).unwrap();
+	manager
+}
+
+/// DC-251: the node `manager` serves, read as the product reads it (an unbound store names
+/// none). A reopen of the same directory serves that node again, as the product's next start
+/// binds it again; an unbound store reopens unbound.
+fn served_node(manager: &SlabManager) -> Option<u32> {
+	// Codex 01a1e5da R2: only an unbound store names no node; a bound store's owner reference
+	// is required, never read as "unbound" on an unexpected error.
+	manager.control_node_bound().then(|| {
+		manager
+			.owner_ref()
+			.expect("a bound store names its owner")
+			.node()
+	})
+}
+
+/// DC-251: `manager`, a reopen, bound to the node its previous lifetime served, if any.
+fn serving_again(manager: Arc<SlabManager>, node: Option<u32>) -> Arc<SlabManager> {
+	match node {
+		Some(node) => serving(manager, node),
+		None => manager,
+	}
+}
+
+/// A fresh store no node has bound (DC-251: as the product opens one; a test that models a
+/// node uses `fresh_manager_serving`).
 async fn fresh_manager() -> (crate::test_support::TestDir, Arc<SlabManager>) {
 	fresh_manager_with_group_commit(GroupCommitConfig::default()).await
+}
+
+/// DC-251: a fresh store serving `node`, bound at its construction.
+async fn fresh_manager_serving(node: u32) -> (crate::test_support::TestDir, Arc<SlabManager>) {
+	let (dir, manager) = fresh_manager().await;
+	(dir, serving(manager, node))
 }
 
 async fn fresh_manager_with_l2(
@@ -2373,6 +2414,19 @@ async fn fresh_manager_with_wrapped_l2(
 	.await
 	.unwrap();
 	([l1_dir, l2_root], manager, l2)
+}
+
+/// DC-251: `fresh_manager_with_l2`, its store serving `node`.
+async fn fresh_manager_with_l2_serving(
+	tag: &str,
+	node: u32,
+) -> (
+	[crate::test_support::TestDir; 2],
+	Arc<SlabManager>,
+	Arc<dyn ObjectStore>,
+) {
+	let (dirs, manager, l2) = fresh_manager_with_l2(tag).await;
+	(dirs, serving(manager, node), l2)
 }
 
 fn optimizer_fact_region_descriptor() -> TableSchemaDescriptor {
@@ -4280,7 +4334,7 @@ async fn fctr7_lsm_rewrite_refuses_counter_input_before_output_creation() {
 		MaintenanceFailureClass, classify_compaction_failure,
 	};
 
-	let (dir, manager) = fresh_manager().await;
+	let (dir, manager) = fresh_manager_serving(FIXTURE_NODE).await;
 	let key = id(0x5a31);
 	let origin = NodeId {
 		id: 0x5a32,
@@ -4432,6 +4486,7 @@ async fn fctr5a_lsm_compacts_tiered_ordinary_l0_with_local_runs() {
 	})
 	.await
 	.unwrap();
+	manager.bind_control_node(FIXTURE_NODE).unwrap();
 	manager
 		.append_durable(tenant(), id(0x5a50), hlc(10), b"tiered ordinary row")
 		.await
@@ -5727,7 +5782,10 @@ async fn adr0097_lsm_owns_its_inputs_through_publication_and_retention_replans()
 	let dir = fresh_dir("adr0097-ownership-latch");
 	let crypto = test_crypto();
 	let io = spawn_io_thread(64).unwrap();
-	let manager = initialize_manager_at_dir(dir.to_path_buf(), io, crypto).await;
+	let manager = serving(
+		initialize_manager_at_dir(dir.to_path_buf(), io, crypto).await,
+		FIXTURE_NODE,
+	);
 	let table = adr0097_colocated_table_descriptor_for_test();
 
 	append_attributed_multirow_frame_for_test(&manager, &table, &[1, 2], hlc(1_000)).await;
@@ -6182,7 +6240,7 @@ async fn secondary_index_compaction_rebuilds_building_sidecar_and_heals_uncovere
 
 #[tokio::test]
 async fn lsm_compaction_rebuilds_secondary_index_sidecar_with_catalog_context() {
-	let (_manager_dir, manager) = fresh_manager().await;
+	let (_manager_dir, manager) = fresh_manager_serving(FIXTURE_NODE).await;
 	let table = secondary_index_table_descriptor_for_test();
 	let descriptor = secondary_index_descriptor_for_test();
 	let row_identity =
@@ -6362,7 +6420,7 @@ async fn lsm_compaction_commit_failure_does_not_publish_prepared_sidecar() {
 
 #[tokio::test]
 async fn lsm_compaction_rejects_secondary_index_sidecar_without_catalog_context() {
-	let (_manager_dir, manager) = fresh_manager().await;
+	let (_manager_dir, manager) = fresh_manager_serving(FIXTURE_NODE).await;
 	let table = secondary_index_table_descriptor_for_test();
 	let descriptor = secondary_index_descriptor_for_test();
 	append_secondary_index_table_row_for_test(&manager, &table, 7, Some(10), hlc(10)).await;
@@ -6430,7 +6488,7 @@ async fn lsm_compaction_rejects_secondary_index_sidecar_without_catalog_context(
 
 #[tokio::test]
 async fn lsm_compaction_elides_non_visible_primary_key_versions_with_catalog_context() {
-	let (_manager_dir, manager) = fresh_manager().await;
+	let (_manager_dir, manager) = fresh_manager_serving(FIXTURE_NODE).await;
 	let table = secondary_index_table_descriptor_for_test();
 	let row_identity =
 		append_secondary_index_table_row_for_test(&manager, &table, 7, Some(10), hlc(10)).await;
@@ -8037,6 +8095,7 @@ async fn table_drop_reclaim_rewrites_tiered_target_rows() {
 	})
 	.await
 	.unwrap();
+	mgr.bind_control_node(FIXTURE_NODE).unwrap();
 	let target = append_only_retention_descriptor(TableObjectId::new([0x41; 16]));
 	let other =
 		append_only_retention_descriptor_named(TableObjectId::new([0x42; 16]), "tier_other");
@@ -13629,6 +13688,7 @@ async fn lsm_compaction_does_not_retain_empty_active_slabs() {
 	})
 	.await
 	.unwrap();
+	manager.bind_control_node(FIXTURE_NODE).unwrap();
 
 	let worker = LsmCompactionWorker::new(LsmConfig::default(), manager.slab_pin_table()).unwrap();
 	let slab_lengths = || {
@@ -13708,6 +13768,7 @@ async fn lsm_compaction_does_not_retain_empty_active_slabs() {
 	})
 	.await
 	.unwrap();
+	reopened.bind_control_node(FIXTURE_NODE).unwrap();
 	assert!(
 		reopened.lookup(tenant(), id(0x7000)).unwrap().is_some(),
 		"restart must retain rows after empty-slab retirement"
@@ -13823,7 +13884,7 @@ async fn recovery_refuses_before_opening_more_than_the_slab_bound() {
 
 #[tokio::test]
 async fn lsm_compaction_rejects_sidecar_covered_source_runs_without_catalog_context() {
-	let (_manager_dir, manager) = fresh_manager().await;
+	let (_manager_dir, manager) = fresh_manager_serving(FIXTURE_NODE).await;
 	manager
 		.append_durable(tenant(), id(0x55CA), hlc(10), b"sidecar-covered")
 		.await
@@ -13873,7 +13934,7 @@ async fn lsm_compaction_rejects_sidecar_covered_source_runs_without_catalog_cont
 
 #[tokio::test]
 async fn lsm_compaction_copies_whole_multirow_frame_into_output_run() {
-	let (_manager_dir, manager) = fresh_manager().await;
+	let (_manager_dir, manager) = fresh_manager_serving(FIXTURE_NODE).await;
 	let first_key = id(0x6001);
 	let second_key = id(0x6002);
 	let frame = encode_test_multirow_storage_frame(&[
@@ -15396,7 +15457,10 @@ async fn adr0097_rewritten_partial_survivor_frame_survives_install_and_reopen() 
 	let dir = fresh_dir("adr0097-partial-survivor-install");
 	let crypto = test_crypto();
 	let io = spawn_io_thread(64).unwrap();
-	let manager = initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	let manager = serving(
+		initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await,
+		FIXTURE_NODE,
+	);
 	let table = adr0097_colocated_table_descriptor_for_test();
 
 	let identities =
@@ -15483,7 +15547,10 @@ async fn adr0097_rewritten_partial_survivor_frame_survives_install_and_reopen() 
 
 	// Reopen from disk: nothing below is served from in-memory state.
 	drop(manager);
-	let reopened = open_manager_at_dir(dir.to_path_buf(), io, crypto).await;
+	let reopened = serving(
+		open_manager_at_dir(dir.to_path_buf(), io, crypto).await,
+		FIXTURE_NODE,
+	);
 
 	for identity in [k1, k3] {
 		let location = reopened
@@ -16288,7 +16355,10 @@ async fn l0_pressure(manager: &SlabManager) {
 async fn a_compaction_tick_is_policed_and_its_success_is_recorded() {
 	let dir = fresh_dir("adr0097-policed-tick");
 	let io = spawn_io_thread(16).unwrap();
-	let manager = open_policed_manager(dir.to_path_buf(), io, true).await;
+	let manager = serving(
+		open_policed_manager(dir.to_path_buf(), io, true).await,
+		FIXTURE_NODE,
+	);
 	let policy = manager.maintenance_policy();
 	assert!(policy.is_enabled(), "{:?}", policy.diagnostic());
 	l0_pressure(&manager).await;
@@ -16326,7 +16396,10 @@ async fn a_quarantined_plan_is_skipped_by_the_tick_until_requeued() {
 
 	// Learn which plan the picker chooses for this pressure.
 	let touched = {
-		let manager = open_policed_manager(dir.to_path_buf(), io.clone(), true).await;
+		let manager = serving(
+			open_policed_manager(dir.to_path_buf(), io.clone(), true).await,
+			FIXTURE_NODE,
+		);
 		l0_pressure(&manager).await;
 		let worker = LsmCompactionWorker::new(worker_config, manager.slab_pin_table()).unwrap();
 		manager
@@ -16359,7 +16432,10 @@ async fn a_quarantined_plan_is_skipped_by_the_tick_until_requeued() {
 			.unwrap();
 	}
 
-	let manager = open_policed_manager(dir.to_path_buf(), io, false).await;
+	let manager = serving(
+		open_policed_manager(dir.to_path_buf(), io, false).await,
+		FIXTURE_NODE,
+	);
 	let policy = manager.maintenance_policy();
 	assert!(policy.is_enabled(), "{:?}", policy.diagnostic());
 	assert_eq!(policy.report().quarantined().count(), 1);
@@ -17585,7 +17661,7 @@ async fn assert_scan_complete(
 
 #[tokio::test]
 async fn lsm_install_keeps_every_row_visible_to_table_scans() {
-	let (_dir, mgr) = fresh_manager().await;
+	let (_dir, mgr) = fresh_manager_serving(FIXTURE_NODE).await;
 	let keys = seed_lsm_relocation_fixture(&mgr).await;
 	let expected = newest_values(&mgr, &keys).await;
 	let observed = run_paused_lsm_install(&mgr, &keys).await;
@@ -17643,7 +17719,7 @@ async fn assert_point_reads_complete(
 
 #[tokio::test]
 async fn point_reads_find_live_keys_during_lsm_install() {
-	let (_dir, mgr) = fresh_manager().await;
+	let (_dir, mgr) = fresh_manager_serving(FIXTURE_NODE).await;
 	let keys = seed_lsm_relocation_fixture(&mgr).await;
 	let expected = newest_values(&mgr, &keys).await;
 	let observed = run_paused_lsm_install(&mgr, &keys).await;
@@ -17694,7 +17770,7 @@ fn assert_migration_scan_exact(
 
 #[tokio::test]
 async fn migration_scan_returns_each_version_once_during_lsm_install() {
-	let (_dir, mgr) = fresh_manager().await;
+	let (_dir, mgr) = fresh_manager_serving(FIXTURE_NODE).await;
 	let keys = seed_lsm_relocation_fixture(&mgr).await;
 	let before = version_hlcs_by_key(&mgr);
 	let observed = run_paused_lsm_install(&mgr, &keys).await;
@@ -18431,7 +18507,34 @@ async fn seed_tiered_l0_run(
 	TieredSlabPointer,
 	crate::storage::LsmRunSummary,
 ) {
+	seed_tiered_l0_run_on(tag, None).await
+}
+
+/// DC-251: `seed_tiered_l0_run`, its store serving `FIXTURE_NODE`.
+async fn seed_tiered_l0_run_serving(
+	tag: &str,
+) -> (
+	[crate::test_support::TestDir; 2],
+	Arc<SlabManager>,
+	Arc<dyn ObjectStore>,
+	TieredSlabPointer,
+	crate::storage::LsmRunSummary,
+) {
+	seed_tiered_l0_run_on(tag, Some(FIXTURE_NODE)).await
+}
+
+async fn seed_tiered_l0_run_on(
+	tag: &str,
+	node: Option<u32>,
+) -> (
+	[crate::test_support::TestDir; 2],
+	Arc<SlabManager>,
+	Arc<dyn ObjectStore>,
+	TieredSlabPointer,
+	crate::storage::LsmRunSummary,
+) {
 	let (dirs, mgr, l2) = fresh_manager_with_l2(tag).await;
+	let mgr = serving_again(mgr, node);
 	mgr.append_durable(tenant(), id(0xb184), hlc(71), b"value")
 		.await
 		.unwrap();
@@ -19597,7 +19700,7 @@ async fn removing_the_highest_epoch_run_does_not_lower_the_epoch() {
 /// its own runs, so it cannot restore a run removed after a whole-manifest snapshot was taken.
 #[tokio::test]
 async fn an_l0_compaction_lands_after_a_tier_retirement_and_writes_only_its_runs() {
-	let (_dirs, mgr, _l2, pointer, run) = seed_tiered_l0_run("dc184-lands").await;
+	let (_dirs, mgr, _l2, pointer, run) = seed_tiered_l0_run_serving("dc184-lands").await;
 	let retired = pointer.slab_id;
 	assert!(
 		mgr.retire_tiered_slab_committed(retired, Some(10))
@@ -20026,7 +20129,17 @@ fn tiered_pointer_from_blob(
 /// A tiered slab of KV rows where key x has a version below the retention
 /// floor that a rewrite prunes.
 async fn seed_prepared_rewrite_fixture(tag: &str) -> PreparedRewriteFixture {
+	seed_prepared_rewrite_fixture_on(tag, None).await
+}
+
+/// DC-251: `seed_prepared_rewrite_fixture`, its store serving `FIXTURE_NODE`.
+async fn seed_prepared_rewrite_fixture_serving(tag: &str) -> PreparedRewriteFixture {
+	seed_prepared_rewrite_fixture_on(tag, Some(FIXTURE_NODE)).await
+}
+
+async fn seed_prepared_rewrite_fixture_on(tag: &str, node: Option<u32>) -> PreparedRewriteFixture {
 	let (dirs, mgr, l2) = fresh_manager_with_l2(tag).await;
+	let mgr = serving_again(mgr, node);
 	let key_x = id(0x6501);
 	let key_y = id(0x6502);
 	mgr.append(tenant(), key_x, hlc(10), b"x-10").await.unwrap();
@@ -21162,12 +21275,13 @@ async fn try_restart_tier_manager(
 ) -> std::io::Result<Arc<SlabManager>> {
 	mgr.fsync_all_local_slabs().await.unwrap();
 	let crypto = mgr.config.crypto.clone();
+	let node = served_node(&mgr);
 	drop(mgr);
 	let keysets = crypto.tenant_keysets_snapshot().unwrap();
 	crypto
 		.replace_keysets_from_authoritative_snapshot(&keysets)
 		.unwrap();
-	SlabManager::open(SlabManagerConfig {
+	let reopened = SlabManager::open(SlabManagerConfig {
 		tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
 		dir: dirs[0].to_path_buf(),
 		max_slab_bytes: 1 << 20,
@@ -21184,7 +21298,8 @@ async fn try_restart_tier_manager(
 		group_commit: GroupCommitConfig::default(),
 		crypto,
 	})
-	.await
+	.await?;
+	Ok(serving_again(reopened, node))
 }
 
 /// A secondary-index segment over the fixture's live rows, as a backfill of
@@ -22716,7 +22831,8 @@ async fn a_foreign_file_at_a_tiered_slab_path_is_never_indexed() {
 
 #[tokio::test]
 async fn delete_pending_lsm_sources_are_not_indexed_after_restart() {
-	let (dirs, mgr, l2) = fresh_manager_with_l2("lsm-delete-pending-restart").await;
+	let (dirs, mgr, l2) =
+		fresh_manager_with_l2_serving("lsm-delete-pending-restart", FIXTURE_NODE).await;
 	let keys = seed_lsm_relocation_fixture(&mgr).await;
 	let worker = LsmCompactionWorker::new(LsmConfig::default(), mgr.slab_pin_table()).unwrap();
 	mgr.run_lsm_compaction_tick(&worker, hlc(20_000))
@@ -23651,7 +23767,36 @@ impl CommandCommitter for UnpublishedDropCommitter {
 	}
 }
 
+/// The fixture's store, unbound (DC-251: a test that models a node uses
+/// `unpublished_drop_fixture_serving`).
 async fn unpublished_drop_fixture() -> (
+	[crate::test_support::TestDir; 2],
+	Arc<SlabManager>,
+	Arc<dyn ObjectStore>,
+	TableSchemaDescriptor,
+	TableSchemaCatalog,
+	TieredSlabPointer,
+) {
+	unpublished_drop_fixture_on(None).await
+}
+
+/// DC-251: the fixture's store serves `node`, bound at its construction.
+async fn unpublished_drop_fixture_serving(
+	node: u32,
+) -> (
+	[crate::test_support::TestDir; 2],
+	Arc<SlabManager>,
+	Arc<dyn ObjectStore>,
+	TableSchemaDescriptor,
+	TableSchemaCatalog,
+	TieredSlabPointer,
+) {
+	unpublished_drop_fixture_on(Some(node)).await
+}
+
+async fn unpublished_drop_fixture_on(
+	node: Option<u32>,
+) -> (
 	[crate::test_support::TestDir; 2],
 	Arc<SlabManager>,
 	Arc<dyn ObjectStore>,
@@ -23682,6 +23827,9 @@ async fn unpublished_drop_fixture() -> (
 	})
 	.await
 	.unwrap();
+	if let Some(node) = node {
+		mgr.bind_control_node(node).unwrap();
+	}
 	let target = append_only_retention_descriptor(TableObjectId::new([0x41; 16]));
 	let other =
 		append_only_retention_descriptor_named(TableObjectId::new([0x42; 16]), "tier_other");
@@ -23781,7 +23929,8 @@ async fn run_unpublished_drop(
 
 #[tokio::test]
 async fn table_drop_refuses_after_its_committed_pointer_cannot_publish() {
-	let (_dirs, mgr, _l2, target, schemas, old) = unpublished_drop_fixture().await;
+	let (_dirs, mgr, _l2, target, schemas, old) =
+		unpublished_drop_fixture_serving(FIXTURE_NODE).await;
 	let (result, committed) = run_unpublished_drop(&mgr, &target, &schemas, false).await;
 	assert_ne!(old.l2_uri, committed.l2_uri);
 	let error =
@@ -23798,7 +23947,8 @@ async fn table_drop_refuses_after_its_committed_pointer_cannot_publish() {
 
 #[tokio::test]
 async fn sliced_table_drop_refuses_after_its_committed_pointer_cannot_publish() {
-	let (_dirs, mgr, _l2, target, schemas, old) = unpublished_drop_fixture().await;
+	let (_dirs, mgr, _l2, target, schemas, old) =
+		unpublished_drop_fixture_serving(FIXTURE_NODE).await;
 	let (result, committed) = run_unpublished_drop(&mgr, &target, &schemas, true).await;
 	assert_ne!(old.l2_uri, committed.l2_uri);
 	let error = result.expect_err("a slice cannot receipt an unpublished committed replacement");
@@ -23814,7 +23964,8 @@ async fn sliced_table_drop_refuses_after_its_committed_pointer_cannot_publish() 
 
 #[tokio::test]
 async fn table_drop_keeps_the_old_object_byte_exact_after_a_failed_publication() {
-	let (_dirs, mgr, l2, target, schemas, old) = unpublished_drop_fixture().await;
+	let (_dirs, mgr, l2, target, schemas, old) =
+		unpublished_drop_fixture_serving(FIXTURE_NODE).await;
 	let before = l2.get(&old.l2_uri).await.unwrap();
 	let (_result, committed) = run_unpublished_drop(&mgr, &target, &schemas, false).await;
 	assert_eq!(
@@ -23835,7 +23986,8 @@ async fn table_drop_keeps_the_old_object_byte_exact_after_a_failed_publication()
 
 #[tokio::test]
 async fn table_drop_cleanup_refuses_to_delete_either_object_with_an_unpublished_commit() {
-	let (_dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let (_dirs, mgr, l2, _target, _schemas, old) =
+		unpublished_drop_fixture_serving(FIXTURE_NODE).await;
 	let old_bytes = l2.get(&old.l2_uri).await.unwrap();
 	let new_uri = l2
 		.put("tier/unpublished-cleanup-replacement.wnd", &old_bytes)
@@ -24006,7 +24158,8 @@ struct TestLegacyCleanupMarker {
 
 #[tokio::test]
 async fn legacy_replacement_uri_deduplicates_without_adding_bytes() {
-	let (_dirs, mgr, _l2, target, schemas, old) = unpublished_drop_fixture().await;
+	let (_dirs, mgr, _l2, target, schemas, old) =
+		unpublished_drop_fixture_serving(FIXTURE_NODE).await;
 	let proposed = propose_ambiguous_drop(&mgr, &target, &schemas, false, false).await;
 	let marker = TestLegacyCleanupMarker {
 		format_version: 2,
@@ -24035,7 +24188,8 @@ async fn legacy_replacement_uri_deduplicates_without_adding_bytes() {
 }
 
 async fn assert_ambiguous_drop_waits_for_observer(sliced: bool, reopen: bool) {
-	let (dirs, mgr, l2, target, schemas, old) = unpublished_drop_fixture().await;
+	let (dirs, mgr, l2, target, schemas, old) =
+		unpublished_drop_fixture_serving(FIXTURE_NODE).await;
 	let old_bytes = l2.get(&old.l2_uri).await.unwrap();
 	let proposed = propose_ambiguous_drop(&mgr, &target, &schemas, sliced, false).await;
 	let new_bytes = l2
@@ -24110,7 +24264,8 @@ async fn sliced_table_drop_unresolved_intent_survives_reopen_before_a_delayed_ap
 
 #[tokio::test]
 async fn table_drop_lost_response_keeps_the_replacement_and_reconciles_after_apply() {
-	let (_dirs, mgr, l2, target, schemas, old) = unpublished_drop_fixture().await;
+	let (_dirs, mgr, l2, target, schemas, old) =
+		unpublished_drop_fixture_serving(FIXTURE_NODE).await;
 	let proposed = propose_ambiguous_drop(&mgr, &target, &schemas, false, true).await;
 	let new_bytes = l2.get(&proposed.l2_uri).await.unwrap();
 	assert_eq!(mgr.tier_pointer(old.slab_id).await, Some(proposed.clone()));
@@ -24135,7 +24290,8 @@ async fn table_drop_lost_response_keeps_the_replacement_and_reconciles_after_app
 
 #[tokio::test]
 async fn a_truly_failed_table_drop_proposal_stays_unresolved_and_reported() {
-	let (dirs, mgr, l2, target, schemas, old) = unpublished_drop_fixture().await;
+	let (dirs, mgr, l2, target, schemas, old) =
+		unpublished_drop_fixture_serving(FIXTURE_NODE).await;
 	let old_bytes = l2.get(&old.l2_uri).await.unwrap();
 	let proposed = propose_ambiguous_drop(&mgr, &target, &schemas, false, false).await;
 	let new_bytes = l2.get(&proposed.l2_uri).await.unwrap();
@@ -24196,7 +24352,8 @@ async fn table_drop_intent_before_proposal_survives_reopen_without_deleting_eith
 }
 
 async fn assert_drop_reconciles_after_applied_restart(old_deleted: bool) {
-	let (dirs, mgr, l2, target, schemas, old) = unpublished_drop_fixture().await;
+	let (dirs, mgr, l2, target, schemas, old) =
+		unpublished_drop_fixture_serving(FIXTURE_NODE).await;
 	let proposed = propose_ambiguous_drop(&mgr, &target, &schemas, false, true).await;
 	let new_bytes = l2.get(&proposed.l2_uri).await.unwrap();
 	let marker = table_drop_l2_cleanup_path(&mgr.config.dir, old.slab_id);
@@ -24740,7 +24897,21 @@ async fn pending_authority_fixture_with_fault(
 	corruption: Option<bool>,
 	missing: bool,
 ) -> PendingAuthorityFixture {
+	pending_authority_fixture_on(corruption, missing, None).await
+}
+
+/// DC-251: `pending_authority_fixture`, its store serving `FIXTURE_NODE`.
+async fn pending_authority_fixture_serving() -> PendingAuthorityFixture {
+	pending_authority_fixture_on(None, false, Some(FIXTURE_NODE)).await
+}
+
+async fn pending_authority_fixture_on(
+	corruption: Option<bool>,
+	missing: bool,
+	node: Option<u32>,
+) -> PendingAuthorityFixture {
 	let (dirs, mgr, l2) = fresh_manager_with_l2("pending-tier-authority").await;
+	let mgr = serving_again(mgr, node);
 	let present = mgr
 		.append(tenant(), id(0x7f61), hlc(10), b"present")
 		.await
@@ -24838,6 +25009,8 @@ async fn pending_authority_fixture_with_fault(
 	.await
 	.expect("open cannot await the remote authority")
 	.unwrap();
+	// DC-251: the reopen serves the node the first lifetime served, if any.
+	let manager = serving_again(manager, node);
 	PendingAuthorityFixture {
 		dirs,
 		manager,
@@ -26279,7 +26452,7 @@ async fn committed_retirement_during_verification_fences_reads_until_ready() {
 	use openraft::storage::RaftStateMachine;
 	use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
 
-	let f = pending_authority_fixture().await;
+	let f = pending_authority_fixture_serving().await;
 	tokio::time::timeout(Duration::from_secs(5), f.store.entered.notified())
 		.await
 		.expect("verification is paused on the old committed object");
@@ -26458,7 +26631,8 @@ async fn committed_retirement_fences_ready_reads_before_local_retirement() {
 	use openraft::storage::RaftStateMachine;
 	use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
 
-	let (_dirs, mgr, l2) = fresh_manager_with_l2("committed-retire-ready-window").await;
+	let (_dirs, mgr, l2) =
+		fresh_manager_with_l2_serving("committed-retire-ready-window", FIXTURE_NODE).await;
 	let key = id(0x7e61);
 	mgr.append_durable(tenant(), key, hlc(10), b"retiring")
 		.await
@@ -27798,7 +27972,7 @@ async fn an_intent_of_unknown_scope_fences_reads_and_holds_a_retirement() {
 /// durable intent and the discoverable output, and must fence reopen.
 #[tokio::test]
 async fn lsm_crash_after_output_rename_before_proposal_keeps_intent_and_output() {
-	let (dir, mgr) = fresh_manager().await;
+	let (dir, mgr) = fresh_manager_serving(FIXTURE_NODE).await;
 	seed_lsm_relocation_fixture(&mgr).await;
 	let worker = LsmCompactionWorker::new(LsmConfig::default(), mgr.slab_pin_table()).unwrap();
 	let plan = mgr
@@ -27920,7 +28094,7 @@ async fn lsm_definite_refusal_clears_intent_after_removing_outputs() {
 
 #[tokio::test]
 async fn lsm_ambiguous_submission_keeps_intent_and_fences_reopen() {
-	let (dir, mgr) = fresh_manager().await;
+	let (dir, mgr) = fresh_manager_serving(FIXTURE_NODE).await;
 	seed_lsm_relocation_fixture(&mgr).await;
 	let worker = LsmCompactionWorker::new(LsmConfig::default(), mgr.slab_pin_table()).unwrap();
 	let plan = mgr
@@ -27967,7 +28141,7 @@ async fn lsm_ambiguous_submission_keeps_intent_and_fences_reopen() {
 
 #[tokio::test]
 async fn clean_control_lsm_install_clears_its_intent() {
-	let (_dir, mgr) = fresh_manager().await;
+	let (_dir, mgr) = fresh_manager_serving(FIXTURE_NODE).await;
 	let keys = seed_lsm_relocation_fixture(&mgr).await;
 	let worker = LsmCompactionWorker::new(LsmConfig::default(), mgr.slab_pin_table()).unwrap();
 	let plan = mgr
@@ -28012,7 +28186,8 @@ async fn clean_control_lsm_install_clears_its_intent() {
 
 #[tokio::test]
 async fn a_retirement_during_a_control_wait_is_held_and_the_install_completes() {
-	let (dirs, mgr, l2) = fresh_manager_with_l2("lsm-retire-during-commit").await;
+	let (dirs, mgr, l2) =
+		fresh_manager_with_l2_serving("lsm-retire-during-commit", FIXTURE_NODE).await;
 	let key = id(0x9b71);
 	mgr.append_durable(tenant(), key, hlc(231), &[0, 0, 0, 0, 65])
 		.await
@@ -28370,7 +28545,10 @@ async fn local_lsm_cancel_after_rename_quarantines_outputs_and_recovers_inputs()
 	let dir = fresh_dir("dc121-local-intent-recovery");
 	let crypto = test_crypto();
 	let io = spawn_io_thread(64).unwrap();
-	let manager = initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	let manager = serving(
+		initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await,
+		FIXTURE_NODE,
+	);
 	let keys = [id(0xd121), id(0xd122)];
 	manager
 		.append_durable(tenant(), keys[0], hlc(1), b"one")
@@ -28448,7 +28626,10 @@ async fn local_lsm_cancel_after_rename_quarantines_outputs_and_recovers_inputs()
 	install.abort();
 	assert!(install.await.unwrap_err().is_cancelled());
 	drop(manager);
-	let reopened = open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	let reopened = serving(
+		open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await,
+		FIXTURE_NODE,
+	);
 	let versions = reopened
 		.scan_all_versions(Locality::ZERO, Locality::MAX, hlc(0))
 		.unwrap();
@@ -28489,7 +28670,10 @@ async fn local_lsm_cancel_after_rename_quarantines_outputs_and_recovers_inputs()
 			.is_empty()
 	);
 	drop(reopened);
-	let reopened_again = open_manager_at_dir(dir.to_path_buf(), io, crypto).await;
+	let reopened_again = serving(
+		open_manager_at_dir(dir.to_path_buf(), io, crypto).await,
+		FIXTURE_NODE,
+	);
 	for (output, bytes) in &expected_bytes {
 		let name = format!(
 			"lsm-quarantine-{:016x}-slab_{:016x}.wnd",
@@ -28521,7 +28705,10 @@ async fn local_lsm_cancel_after_publication_recovers_committed_outputs() {
 	let dir = fresh_dir("dc121-local-published-recovery");
 	let crypto = test_crypto();
 	let io = spawn_io_thread(64).unwrap();
-	let manager = initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	let manager = serving(
+		initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await,
+		FIXTURE_NODE,
+	);
 	let keys = [id(0xd121), id(0xd122)];
 	manager
 		.append_durable(tenant(), keys[0], hlc(1), b"one")
@@ -28595,7 +28782,10 @@ async fn local_lsm_cancel_after_publication_recovers_committed_outputs() {
 	install.abort();
 	assert!(install.await.unwrap_err().is_cancelled());
 	drop(manager);
-	let reopened = open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	let reopened = serving(
+		open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await,
+		FIXTURE_NODE,
+	);
 	let versions = reopened
 		.scan_all_versions(Locality::ZERO, Locality::MAX, hlc(0))
 		.unwrap();
@@ -28631,7 +28821,10 @@ async fn local_lsm_cancel_after_publication_recovers_committed_outputs() {
 			.is_empty()
 	);
 	drop(reopened);
-	let reopened_again = open_manager_at_dir(dir.to_path_buf(), io, crypto).await;
+	let reopened_again = serving(
+		open_manager_at_dir(dir.to_path_buf(), io, crypto).await,
+		FIXTURE_NODE,
+	);
 	let versions = reopened_again
 		.scan_all_versions(Locality::ZERO, Locality::MAX, hlc(0))
 		.unwrap();
@@ -28651,7 +28844,12 @@ async fn local_lsm_cancel_after_output_publication_finishes_input_retirement() {
 	let dir = fresh_dir("dc121-local-intermediate-recovery");
 	let crypto = test_crypto();
 	let io = spawn_io_thread(64).unwrap();
-	let manager = initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	// DC-251: the first lifetime names its compaction owner, so it serves a node; both
+	// reopens below stay raw (unbound), as the local-only GC they end with requires.
+	let manager = serving(
+		initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await,
+		FIXTURE_NODE,
+	);
 	let keys = [id(0xd121), id(0xd122)];
 	manager
 		.append_durable(tenant(), keys[0], hlc(1), b"one")
@@ -28809,7 +29007,10 @@ async fn local_lsm_changed_input_keeps_intent_and_output_fenced() {
 	let dir = fresh_dir("dc121-local-mismatch");
 	let crypto = test_crypto();
 	let io = spawn_io_thread(64).unwrap();
-	let manager = initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	let manager = serving(
+		initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await,
+		FIXTURE_NODE,
+	);
 	let keys = [id(0xd121), id(0xd122)];
 	manager
 		.append_durable(tenant(), keys[0], hlc(1), b"one")
@@ -28891,7 +29092,10 @@ async fn local_lsm_changed_input_keeps_intent_and_output_fenced() {
 	file.set_len(file.metadata().unwrap().len() + 4096).unwrap();
 	file.sync_all().unwrap();
 	drop(file);
-	let reopened = open_manager_at_dir(dir.to_path_buf(), io, crypto).await;
+	let reopened = serving(
+		open_manager_at_dir(dir.to_path_buf(), io, crypto).await,
+		FIXTURE_NODE,
+	);
 	assert!(
 		reopened.lookup(tenant(), keys[0]).is_err(),
 		"changed input must keep public reads fenced"
@@ -28917,7 +29121,10 @@ async fn local_lsm_failed_before_rename_keeps_temp_for_recovery() {
 	let dir = fresh_dir("dc121-local-temp-failure");
 	let crypto = test_crypto();
 	let io = spawn_io_thread(64).unwrap();
-	let manager = initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	let manager = serving(
+		initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await,
+		FIXTURE_NODE,
+	);
 	let keys = [id(0xd121), id(0xd122)];
 	manager
 		.append_durable(tenant(), keys[0], hlc(1), b"one")
@@ -28977,7 +29184,10 @@ async fn local_lsm_failed_before_rename_keeps_temp_for_recovery() {
 		);
 	}
 	drop(manager);
-	let reopened = open_manager_at_dir(dir.to_path_buf(), io, crypto).await;
+	let reopened = serving(
+		open_manager_at_dir(dir.to_path_buf(), io, crypto).await,
+		FIXTURE_NODE,
+	);
 	assert!(
 		reopened
 			.persistent_index
@@ -29152,7 +29362,10 @@ async fn local_lsm_quarantine_resumes_after_link_before_fsync() {
 	let dir = fresh_dir("dc121-link_before_fsync");
 	let crypto = test_crypto();
 	let io = spawn_io_thread(64).unwrap();
-	let manager = initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	let manager = serving(
+		initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await,
+		FIXTURE_NODE,
+	);
 	let keys = [id(0xd121), id(0xd122)];
 	manager
 		.append_durable(tenant(), keys[0], hlc(1), b"one")
@@ -29239,7 +29452,10 @@ async fn local_lsm_quarantine_resumes_after_link_before_fsync() {
 		std::fs::hard_link(&source, &quarantine).unwrap();
 	}
 	drop(manager);
-	let reopened = open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	let reopened = serving(
+		open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await,
+		FIXTURE_NODE,
+	);
 	let versions = reopened
 		.scan_all_versions(Locality::ZERO, Locality::MAX, hlc(0))
 		.unwrap();
@@ -29280,7 +29496,10 @@ async fn local_lsm_quarantine_resumes_after_link_before_fsync() {
 			.is_empty()
 	);
 	drop(reopened);
-	let reopened_again = open_manager_at_dir(dir.to_path_buf(), io, crypto).await;
+	let reopened_again = serving(
+		open_manager_at_dir(dir.to_path_buf(), io, crypto).await,
+		FIXTURE_NODE,
+	);
 	for (output, bytes) in &expected_bytes {
 		let name = format!(
 			"lsm-quarantine-{:016x}-slab_{:016x}.wnd",
@@ -29312,7 +29531,10 @@ async fn local_lsm_quarantine_resumes_after_link_after_fsync() {
 	let dir = fresh_dir("dc121-link_after_fsync");
 	let crypto = test_crypto();
 	let io = spawn_io_thread(64).unwrap();
-	let manager = initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	let manager = serving(
+		initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await,
+		FIXTURE_NODE,
+	);
 	let keys = [id(0xd121), id(0xd122)];
 	manager
 		.append_durable(tenant(), keys[0], hlc(1), b"one")
@@ -29400,7 +29622,10 @@ async fn local_lsm_quarantine_resumes_after_link_after_fsync() {
 		std::fs::File::open(&*dir).unwrap().sync_all().unwrap();
 	}
 	drop(manager);
-	let reopened = open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	let reopened = serving(
+		open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await,
+		FIXTURE_NODE,
+	);
 	let versions = reopened
 		.scan_all_versions(Locality::ZERO, Locality::MAX, hlc(0))
 		.unwrap();
@@ -29441,7 +29666,10 @@ async fn local_lsm_quarantine_resumes_after_link_after_fsync() {
 			.is_empty()
 	);
 	drop(reopened);
-	let reopened_again = open_manager_at_dir(dir.to_path_buf(), io, crypto).await;
+	let reopened_again = serving(
+		open_manager_at_dir(dir.to_path_buf(), io, crypto).await,
+		FIXTURE_NODE,
+	);
 	for (output, bytes) in &expected_bytes {
 		let name = format!(
 			"lsm-quarantine-{:016x}-slab_{:016x}.wnd",
@@ -29473,7 +29701,10 @@ async fn local_lsm_quarantine_resumes_after_unlink_before_fsync() {
 	let dir = fresh_dir("dc121-unlink_before_fsync");
 	let crypto = test_crypto();
 	let io = spawn_io_thread(64).unwrap();
-	let manager = initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	let manager = serving(
+		initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await,
+		FIXTURE_NODE,
+	);
 	let keys = [id(0xd121), id(0xd122)];
 	manager
 		.append_durable(tenant(), keys[0], hlc(1), b"one")
@@ -29562,7 +29793,10 @@ async fn local_lsm_quarantine_resumes_after_unlink_before_fsync() {
 		std::fs::remove_file(source).unwrap();
 	}
 	drop(manager);
-	let reopened = open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	let reopened = serving(
+		open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await,
+		FIXTURE_NODE,
+	);
 	let versions = reopened
 		.scan_all_versions(Locality::ZERO, Locality::MAX, hlc(0))
 		.unwrap();
@@ -29603,7 +29837,10 @@ async fn local_lsm_quarantine_resumes_after_unlink_before_fsync() {
 			.is_empty()
 	);
 	drop(reopened);
-	let reopened_again = open_manager_at_dir(dir.to_path_buf(), io, crypto).await;
+	let reopened_again = serving(
+		open_manager_at_dir(dir.to_path_buf(), io, crypto).await,
+		FIXTURE_NODE,
+	);
 	for (output, bytes) in &expected_bytes {
 		let name = format!(
 			"lsm-quarantine-{:016x}-slab_{:016x}.wnd",
@@ -29635,7 +29872,10 @@ async fn local_lsm_quarantine_resumes_after_unlink_after_fsync() {
 	let dir = fresh_dir("dc121-unlink_after_fsync");
 	let crypto = test_crypto();
 	let io = spawn_io_thread(64).unwrap();
-	let manager = initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	let manager = serving(
+		initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await,
+		FIXTURE_NODE,
+	);
 	let keys = [id(0xd121), id(0xd122)];
 	manager
 		.append_durable(tenant(), keys[0], hlc(1), b"one")
@@ -29725,7 +29965,10 @@ async fn local_lsm_quarantine_resumes_after_unlink_after_fsync() {
 		std::fs::File::open(&*dir).unwrap().sync_all().unwrap();
 	}
 	drop(manager);
-	let reopened = open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	let reopened = serving(
+		open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await,
+		FIXTURE_NODE,
+	);
 	let versions = reopened
 		.scan_all_versions(Locality::ZERO, Locality::MAX, hlc(0))
 		.unwrap();
@@ -29766,7 +30009,10 @@ async fn local_lsm_quarantine_resumes_after_unlink_after_fsync() {
 			.is_empty()
 	);
 	drop(reopened);
-	let reopened_again = open_manager_at_dir(dir.to_path_buf(), io, crypto).await;
+	let reopened_again = serving(
+		open_manager_at_dir(dir.to_path_buf(), io, crypto).await,
+		FIXTURE_NODE,
+	);
 	for (output, bytes) in &expected_bytes {
 		let name = format!(
 			"lsm-quarantine-{:016x}-slab_{:016x}.wnd",
@@ -29798,7 +30044,10 @@ async fn local_lsm_sidecar_evidence_keeps_intent_and_outputs_fenced() {
 	let dir = fresh_dir("dc122-local-sidecar-evidence");
 	let crypto = test_crypto();
 	let io = spawn_io_thread(64).unwrap();
-	let manager = initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	let manager = serving(
+		initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await,
+		FIXTURE_NODE,
+	);
 	let keys = [id(0xd121), id(0xd122)];
 	manager
 		.append_durable(tenant(), keys[0], hlc(1), b"one")
@@ -29906,7 +30155,10 @@ async fn local_lsm_sidecar_evidence_keeps_intent_and_outputs_fenced() {
 		.await
 		.unwrap();
 	drop(manager);
-	let reopened = open_manager_at_dir(dir.to_path_buf(), io, crypto).await;
+	let reopened = serving(
+		open_manager_at_dir(dir.to_path_buf(), io, crypto).await,
+		FIXTURE_NODE,
+	);
 	assert_eq!(
 		reopened.tier_authority_readiness_reason().as_deref(),
 		Some("TierAuthorityLsmUnresolved")
@@ -29935,7 +30187,10 @@ async fn local_lsm_preflight_refusal_precedes_durable_intent_and_orphan_mark() {
 	let dir = fresh_dir("local-lsm-preflight-before-intent");
 	let crypto = test_crypto();
 	let io = spawn_io_thread(64).unwrap();
-	let manager = initialize_manager_at_dir(dir.to_path_buf(), io, crypto).await;
+	let manager = serving(
+		initialize_manager_at_dir(dir.to_path_buf(), io, crypto).await,
+		FIXTURE_NODE,
+	);
 	let keys = [id(0xd131), id(0xd132)];
 	manager
 		.append_durable(tenant(), keys[0], hlc(1), b"one")
@@ -30050,7 +30305,10 @@ async fn local_lsm_recovery_preserves_unrelated_run_change() {
 	let dir = fresh_dir("dc121-unrelated-run");
 	let crypto = test_crypto();
 	let io = spawn_io_thread(64).unwrap();
-	let manager = initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	let manager = serving(
+		initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await,
+		FIXTURE_NODE,
+	);
 	let keys = [id(0xd121), id(0xd122)];
 	manager
 		.append_durable(tenant(), keys[0], hlc(1), b"one")
@@ -30146,7 +30404,10 @@ async fn local_lsm_recovery_preserves_unrelated_run_change() {
 		.await
 		.unwrap();
 	drop(manager);
-	let reopened = open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	let reopened = serving(
+		open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await,
+		FIXTURE_NODE,
+	);
 	assert_eq!(
 		reopened.compaction_manifest_snapshot().run(other_slab),
 		Some(&unrelated)
@@ -30187,7 +30448,10 @@ async fn local_lsm_recovery_preserves_unrelated_run_change() {
 			.is_empty()
 	);
 	drop(reopened);
-	let reopened_again = open_manager_at_dir(dir.to_path_buf(), io, crypto).await;
+	let reopened_again = serving(
+		open_manager_at_dir(dir.to_path_buf(), io, crypto).await,
+		FIXTURE_NODE,
+	);
 	let versions = reopened_again
 		.scan_all_versions(Locality::ZERO, Locality::MAX, hlc(0))
 		.unwrap();
@@ -30209,7 +30473,10 @@ async fn empty_output_local_lsm_recovers_at_phase(outputs_published: bool) {
 	let dir = fresh_dir("dc121-empty-output");
 	let crypto = test_crypto();
 	let io = spawn_io_thread(64).unwrap();
-	let manager = initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	let manager = serving(
+		initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await,
+		FIXTURE_NODE,
+	);
 	let input = manager.force_seal_active_for_test().await;
 	{
 		let mut manifest =
@@ -30304,7 +30571,10 @@ async fn empty_output_local_lsm_recovers_at_phase(outputs_published: bool) {
 	install.abort();
 	assert!(install.await.unwrap_err().is_cancelled());
 	drop(manager);
-	let reopened = open_manager_at_dir(dir.to_path_buf(), io, crypto).await;
+	let reopened = serving(
+		open_manager_at_dir(dir.to_path_buf(), io, crypto).await,
+		FIXTURE_NODE,
+	);
 	let snapshot = reopened
 		.persistent_index
 		.as_ref()
@@ -30475,7 +30745,10 @@ async fn retention_empty_output_local_lsm_recovers_at_phase(outputs_published: b
 	let dir = fresh_dir("dc123-retention-empty-phase");
 	let crypto = test_crypto();
 	let io = spawn_io_thread(64).unwrap();
-	let manager = initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	let manager = serving(
+		initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await,
+		FIXTURE_NODE,
+	);
 	let table_id = TableObjectId::new([0xd1; 16]);
 	let descriptor = append_only_retention_descriptor(table_id);
 	let key = id(0xd125);
@@ -30580,7 +30853,10 @@ async fn retention_empty_output_local_lsm_recovers_at_phase(outputs_published: b
 	install.abort();
 	assert!(install.await.unwrap_err().is_cancelled());
 	drop(manager);
-	let reopened = open_manager_at_dir(dir.to_path_buf(), io, crypto).await;
+	let reopened = serving(
+		open_manager_at_dir(dir.to_path_buf(), io, crypto).await,
+		FIXTURE_NODE,
+	);
 	assert_eq!(
 		reopened.lookup(tenant(), key).unwrap().is_some(),
 		!outputs_published
@@ -31480,7 +31756,7 @@ async fn single_append_reconciler_retries_after_epoch_changes() {
 
 #[tokio::test]
 async fn successful_lsm_install_never_orphans_its_intent_at_clear() {
-	let (_dir, manager) = fresh_manager().await;
+	let (_dir, manager) = fresh_manager_serving(FIXTURE_NODE).await;
 	let keys = seed_lsm_relocation_fixture(&manager).await;
 	let before_entered = Arc::new(tokio::sync::Semaphore::new(0));
 	let before_release = Arc::new(tokio::sync::Semaphore::new(0));
@@ -31522,7 +31798,7 @@ async fn successful_lsm_install_never_orphans_its_intent_at_clear() {
 
 #[tokio::test]
 async fn stale_lsm_intent_owner_cannot_orphan_same_job_replacement() {
-	let (_dir, manager) = fresh_manager().await;
+	let (_dir, manager) = fresh_manager_serving(FIXTURE_NODE).await;
 	seed_lsm_relocation_fixture(&manager).await;
 	let before_entered = Arc::new(tokio::sync::Semaphore::new(0));
 	let before_release = Arc::new(tokio::sync::Semaphore::new(0));
@@ -31590,7 +31866,10 @@ async fn local_lsm_renamed_outputs_before_publication_never_duplicate_recovered_
 	let dir = fresh_dir("dc121-rename-before-publish");
 	let crypto = test_crypto();
 	let io = spawn_io_thread(64).unwrap();
-	let manager = initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	let manager = serving(
+		initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await,
+		FIXTURE_NODE,
+	);
 	let keys = [id(0xd121), id(0xd122)];
 	manager
 		.append_durable(tenant(), keys[0], hlc(1), b"one")
@@ -31674,7 +31953,10 @@ async fn local_lsm_renamed_outputs_before_publication_never_duplicate_recovered_
 		ErrorKind::WouldBlock
 	);
 	drop(manager);
-	let reopened = open_manager_at_dir(dir.to_path_buf(), io, crypto).await;
+	let reopened = serving(
+		open_manager_at_dir(dir.to_path_buf(), io, crypto).await,
+		FIXTURE_NODE,
+	);
 	let versions = reopened
 		.scan_all_versions(Locality::ZERO, Locality::MAX, hlc(0))
 		.unwrap();
@@ -33055,9 +33337,86 @@ impl CommandCommitter for GcPauseAfterRemoveCommit {
 	}
 }
 
+/// DC-251 (Codex 01a1e5bb, 01a1e5da): mark `slab_id` and reserve its removal as a bound store
+/// does, through the control-path sweep driver held before the removal (`gc_remove_held`), its
+/// commits applied by `DirectLsmCommitter` (a unit fixture, not real consensus; the
+/// `ControlCluster`/`op_committer` tests stay the ring evidence). On a bound store the mark is what reserves the removal; a removal is
+/// never allocated on the spot as an unbound store's would be. Asserts the result: the run is
+/// `DeletePending` and exactly one `GcRemove` reservation names it (other operation rows may
+/// remain).
+async fn mark_and_reserve_gc_removal_on_ring(manager: &Arc<SlabManager>, slab_id: SlabId) {
+	manager
+		.continuity_test_holds
+		.gc_remove_held
+		.store(true, Ordering::Release);
+	let marker = DirectLsmCommitter {
+		manager: manager.clone(),
+	};
+	manager
+		.sweep_lsm_delete_pending_once_via_control_ring(
+			&LsmGcWorker::new(LsmConfig::default(), manager.slab_pin_table()).unwrap(),
+			&marker,
+		)
+		.await
+		.unwrap();
+	drop(marker);
+	manager
+		.continuity_test_holds
+		.gc_remove_held
+		.store(false, Ordering::Release);
+	assert!(
+		matches!(
+			manager
+				.compaction_manifest_snapshot()
+				.run(slab_id)
+				.map(|run| &run.state),
+			Some(SlabState::DeletePending)
+		),
+		"premise: the ring sweep marked the run"
+	);
+	// Codex 01a1e5da R3: the removal of exactly this store's run, by its owner-qualified slab
+	// and the run identity it expects, held as a reservation (not yet submitted); other rows
+	// may remain.
+	let own = manager.owner_ref().unwrap().slab(slab_id);
+	let run = crate::consensus::slab_ops::RunIdentity::of(
+		manager
+			.compaction_manifest_snapshot()
+			.run(slab_id)
+			.expect("the marked run"),
+	);
+	let reserved: Vec<_> = manager
+		.require_op_index()
+		.unwrap()
+		.load_op_intents()
+		.await
+		.unwrap()
+		.into_iter()
+		.filter(|loaded| {
+			matches!(
+				loaded.command(),
+				crate::consensus::slab_ops::SlabCommand::GcRemove(remove) if remove.slab == own
+			)
+		})
+		.collect();
+	let [reservation] = reserved.as_slice() else {
+		panic!("premise: exactly one removal of {own:?} is reserved: {reserved:?}");
+	};
+	assert!(
+		matches!(reservation, LoadedOp::Reserved(_)),
+		"premise: the removal is a reservation, not yet submitted: {reservation:?}"
+	);
+	let crate::consensus::slab_ops::SlabCommand::GcRemove(remove) = reservation.command() else {
+		unreachable!();
+	};
+	assert_eq!(
+		remove.expected_run, run,
+		"premise: the removal expects the marked run"
+	);
+}
+
 #[tokio::test]
 async fn gc_control_revision_mismatch_keeps_file_and_fences_reopen() {
-	let (dir, manager) = fresh_manager().await;
+	let (dir, manager) = fresh_manager_serving(FIXTURE_NODE).await;
 	seed_lsm_relocation_fixture(&manager).await;
 	let worker = LsmCompactionWorker::new(LsmConfig::default(), manager.slab_pin_table()).unwrap();
 	let plan = manager
@@ -33072,31 +33431,7 @@ async fn gc_control_revision_mismatch_keeps_file_and_fences_reopen() {
 		.await
 		.unwrap();
 	drop(direct);
-	let snapshot = manager.compaction_manifest_snapshot();
-	let commit = CompactionCommit::gc_mark_delete_pending(
-		manager.owner_ref().unwrap(),
-		CompactionJobId::new(0xdd01),
-		snapshot.manifest_epoch,
-		vec![target],
-	);
-	manager
-		.apply_lsm_manifest_compaction_commit(&commit)
-		.unwrap();
-	let marked = manager
-		.compaction_manifest_snapshot()
-		.run(target)
-		.unwrap()
-		.clone();
-	manager
-		.persistent_index
-		.as_ref()
-		.unwrap()
-		.apply(PersistentIndexUpdate {
-			put_lsm_runs: vec![marked],
-			..Default::default()
-		})
-		.await
-		.unwrap();
+	mark_and_reserve_gc_removal_on_ring(&manager, target).await;
 	let path = slab_path(&dir, target);
 	assert!(path.exists());
 	let entered = Arc::new(tokio::sync::Semaphore::new(0));
@@ -33203,8 +33538,8 @@ async fn seed_small_retired_gc_slab(manager: &Arc<SlabManager>) -> (SlabId, Iden
 
 #[tokio::test]
 async fn gc_keeps_superseded_sidecar_while_removing_its_current_row() {
-	let (dir, manager) = fresh_manager().await;
-	let (slab_id, key) = seed_small_retired_gc_slab(&manager).await;
+	let (dir, manager, slab_id, key, _old) =
+		small_retired_gc_slab_in_an_unbound_second_lifetime().await;
 	let segment = secondary_index_segment_for_test(slab_id);
 	let old = manager
 		.persist_secondary_index_segment(&segment)
@@ -33244,8 +33579,8 @@ async fn gc_keeps_superseded_sidecar_while_removing_its_current_row() {
 
 #[tokio::test]
 async fn gc_refuses_if_slab_path_no_longer_names_its_owned_handle() {
-	let (dir, manager) = fresh_manager().await;
-	let (slab_id, key) = seed_small_retired_gc_slab(&manager).await;
+	let (dir, manager, slab_id, key, _old) =
+		small_retired_gc_slab_in_an_unbound_second_lifetime().await;
 	let path = slab_path(&dir, slab_id);
 	let original = path.with_extension("saved");
 	std::fs::rename(&path, &original).unwrap();
@@ -33298,8 +33633,33 @@ async fn gc_crash_steps_preserve_or_complete_deletion_on_reopen() {
 			SlabManager::initialize_new_store_with_owner(gc_owned_test_config(&dir), owner)
 				.await
 				.unwrap();
+		// DC-251: the seed's compaction names its owner, so this lifetime serves node 1.
+		manager.bind_control_node(FIXTURE_NODE).unwrap();
 		let (slab_id, _) = seed_small_retired_gc_slab(&manager).await;
 		std::fs::write(dir.join("gc-target"), slab_id.get().to_string()).unwrap();
+		// The ring kind sweeps in this bound lifetime. The local kind sweeps in a second,
+		// never-bound lifetime of the same directory (recipe A): released within a bound,
+		// then reopened raw.
+		let manager = if step.starts_with("control") {
+			manager
+		} else {
+			manager.fsync_all_local_slabs().await.unwrap();
+			let first = Arc::downgrade(&manager);
+			drop(manager);
+			tokio::time::timeout(Duration::from_secs(5), async {
+				while first.upgrade().is_some() {
+					tokio::task::yield_now().await;
+				}
+			})
+			.await
+			.expect("the bound lifetime releases its store before the reopen");
+			let owner = DataDirectoryOwner::acquire_existing(&dir).unwrap();
+			let raw = SlabManager::open_with_owner(gc_owned_test_config(&dir), owner)
+				.await
+				.unwrap();
+			assert!(!raw.control_node_bound());
+			raw
+		};
 		let entered = Arc::new(tokio::sync::Semaphore::new(0));
 		let release = Arc::new(tokio::sync::Semaphore::new(0));
 		let hold = Some((entered.clone(), release));
@@ -33384,6 +33744,11 @@ async fn gc_crash_steps_preserve_or_complete_deletion_on_reopen() {
 			let manager = SlabManager::open_with_owner(gc_owned_test_config(&dir), owner.clone())
 				.await
 				.unwrap();
+			// DC-251: the reopen serves the node its crashed lifetime served (the ring kind's
+			// node 1); the local kind's lifetime was unbound and so is this one.
+			if kind == "control" {
+				manager.bind_control_node(FIXTURE_NODE).unwrap();
+			}
 			let snapshot = manager
 				.persistent_index
 				.as_ref()
@@ -33452,37 +33817,16 @@ async fn gc_crash_steps_preserve_or_complete_deletion_on_reopen() {
 	}
 }
 
+/// The GC target marked for a control-path test. DC-251 (Codex 01a1e5bb): through the control
+/// path's own mark, which reserves its removal, not a hand-applied manifest mark, which reserves
+/// nothing a bound store will remove.
 async fn mark_gc_target_for_control_test(manager: &Arc<SlabManager>, slab_id: SlabId) {
-	let snapshot = manager.compaction_manifest_snapshot();
-	let commit = CompactionCommit::gc_mark_delete_pending(
-		manager.owner_ref().unwrap(),
-		CompactionJobId::new(0xdd21),
-		snapshot.manifest_epoch,
-		vec![slab_id],
-	);
-	manager
-		.apply_lsm_manifest_compaction_commit(&commit)
-		.unwrap();
-	let marked = manager
-		.compaction_manifest_snapshot()
-		.run(slab_id)
-		.unwrap()
-		.clone();
-	manager
-		.persistent_index
-		.as_ref()
-		.unwrap()
-		.apply(PersistentIndexUpdate {
-			put_lsm_runs: vec![marked],
-			..Default::default()
-		})
-		.await
-		.unwrap();
+	mark_and_reserve_gc_removal_on_ring(manager, slab_id).await;
 }
 
 #[tokio::test]
 async fn gc_control_concurrent_tier_apply_refuses_stale_local_removal() {
-	let (dirs, manager, l2) = fresh_manager_with_l2("gc-tier-apply").await;
+	let (dirs, manager, l2) = fresh_manager_with_l2_serving("gc-tier-apply", FIXTURE_NODE).await;
 	let (slab_id, key) = seed_small_retired_gc_slab(&manager).await;
 	let raw = manager.read_sealed_raw(slab_id).await.unwrap();
 	let encrypted = manager.encrypt_tiered_object_blob(slab_id, &raw).unwrap();
@@ -33577,8 +33921,13 @@ async fn gc_control_concurrent_tier_apply_refuses_stale_local_removal() {
 }
 
 #[tokio::test]
+/// A tiered slab WITH a local copy of its current generation (installed by the hot-read
+/// rehydration path before its mark), retired concurrently with its GC disposal. DC-251 (Codex
+/// 01a1e5da R1): a bound store refuses to dispose a claimed slab with no local backing
+/// ("a claimed slab has no local backing; it remains fenced"), so this race is the reachable
+/// tiered-plus-local-copy one, narrower than a remote-only disposal.
 async fn gc_control_concurrent_tier_retirement_refuses_stale_local_removal() {
-	let (dirs, manager, l2) = fresh_manager_with_l2("gc-tier-retire").await;
+	let (dirs, manager, l2) = fresh_manager_with_l2_serving("gc-tier-retire", FIXTURE_NODE).await;
 	let key = id(0xdd31);
 	manager
 		.append_durable(tenant(), key, hlc(10), b"tiered-gc-survivor")
@@ -33593,6 +33942,16 @@ async fn gc_control_concurrent_tier_retirement_refuses_stale_local_removal() {
 		.unwrap();
 	let pointer = tiered_pointer_from_blob(&manager, slab_id, uri, &encrypted.bytes);
 	manager.apply_tier_slab(pointer).await.unwrap();
+	// The local copy of the current generation, through the existing rehydration path, before
+	// the mark captures its input authority.
+	for _ in 0..4 {
+		let location = manager.lookup(tenant(), key).unwrap().unwrap();
+		assert_eq!(manager.read(location).await.unwrap(), b"tiered-gc-survivor");
+	}
+	assert!(
+		manager.is_rehydrated(slab_id).await && slab_path(&manager.config.dir, slab_id).exists(),
+		"premise: repeated L2 reads installed a local copy of the current generation"
+	);
 	let snapshot = manager.compaction_manifest_snapshot();
 	let plan = CompactionPlan {
 		job_id: CompactionJobId::new(0xdd31),
@@ -33620,7 +33979,7 @@ async fn gc_control_concurrent_tier_retirement_refuses_stale_local_removal() {
 		release: release.clone(),
 	});
 	let gc = LsmGcWorker::new(LsmConfig::default(), manager.slab_pin_table()).unwrap();
-	let task = {
+	let mut task = {
 		let manager = manager.clone();
 		let committer = committer.clone();
 		tokio::spawn(async move {
@@ -33629,11 +33988,24 @@ async fn gc_control_concurrent_tier_retirement_refuses_stale_local_removal() {
 				.await
 		})
 	};
-	tokio::time::timeout(Duration::from_secs(60), disposal_entered.acquire())
-		.await
-		.unwrap()
-		.unwrap()
-		.forget();
+	// Codex 01a1e5da R1: the sweep ending before disposal is entered is reported with its
+	// result at once, not waited out; the bound is unchanged.
+	tokio::select! {
+		permit = disposal_entered.acquire() => permit.unwrap().forget(),
+		ended = &mut task => panic!("the sweep ended before disposal was entered: {ended:?}"),
+		_ = tokio::time::sleep(Duration::from_secs(60)) => {
+			task.abort();
+			panic!("disposal was not entered within 60 s and the sweep had not ended");
+		}
+	}
+	assert!(
+		manager.tier_pointer(slab_id).await.is_some(),
+		"premise: the current tier pointer is present at disposal"
+	);
+	assert!(
+		manager.is_rehydrated(slab_id).await && slab_path(&manager.config.dir, slab_id).exists(),
+		"premise: the owned local copy is present at disposal"
+	);
 	assert!(manager.retire_tiered_slab(slab_id).await.unwrap());
 	disposal_release.add_permits(1);
 	assert_eq!(
@@ -33725,7 +34097,8 @@ async fn gc_keeps_retired_slab_with_unmatched_counter_across_reopen() {
 
 #[tokio::test]
 async fn unrelated_tier_refresh_during_gc_proceeds_and_readiness_recovers() {
-	let (dirs, manager, l2) = fresh_manager_with_l2("gc-unrelated-tier").await;
+	let (dirs, manager, l2) =
+		fresh_manager_with_l2_serving("gc-unrelated-tier", FIXTURE_NODE).await;
 	let (gc_slab, gc_key) = seed_small_retired_gc_slab(&manager).await;
 	let tier_key = id(0xdd51);
 	manager
@@ -33812,7 +34185,8 @@ async fn unrelated_tier_refresh_during_gc_proceeds_and_readiness_recovers() {
 
 #[tokio::test]
 async fn unresolved_lsm_outputs_stay_unindexed_and_shared_key_tier_apply_refuses_after_reopen() {
-	let (dirs, manager, l2) = fresh_manager_with_l2("lsm-unresolved-output-shared-key").await;
+	let (dirs, manager, l2) =
+		fresh_manager_with_l2_serving("lsm-unresolved-output-shared-key", FIXTURE_NODE).await;
 	let key = id(0xdd61);
 	let input = manager
 		.append_durable(tenant(), key, hlc(10), b"old")
@@ -33911,7 +34285,8 @@ async fn unresolved_lsm_outputs_stay_unindexed_and_shared_key_tier_apply_refuses
 
 #[tokio::test]
 async fn shared_key_tier_refresh_during_gc_refuses_and_records_pointer() {
-	let (dirs, manager, l2) = fresh_manager_with_l2("gc-shared-key-tier").await;
+	let (dirs, manager, l2) =
+		fresh_manager_with_l2_serving("gc-shared-key-tier", FIXTURE_NODE).await;
 	let (gc_slab, gc_key) = seed_small_retired_gc_slab(&manager).await;
 	let tier_key = gc_key;
 	manager
@@ -33993,7 +34368,8 @@ async fn shared_key_tier_refresh_during_gc_refuses_and_records_pointer() {
 
 #[tokio::test]
 async fn physical_key_missing_from_private_index_still_blocks_tier_refresh() {
-	let (dirs, manager, l2) = fresh_manager_with_l2("gc-unindexed-physical-key").await;
+	let (dirs, manager, l2) =
+		fresh_manager_with_l2_serving("gc-unindexed-physical-key", FIXTURE_NODE).await;
 	let (gc_slab, gc_key) = seed_small_retired_gc_slab(&manager).await;
 	let source = manager
 		.state
@@ -34097,7 +34473,8 @@ async fn install_snapshot_with_tier_set_for_test(include_local_tier: bool) {
 	use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
 	use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
 
-	let (_dirs, manager, l2) = fresh_manager_with_l2("dc112-snapshot-tier-set").await;
+	let (_dirs, manager, l2) =
+		fresh_manager_with_l2_serving("dc112-snapshot-tier-set", FIXTURE_NODE).await;
 	let key = id(0xdc112);
 	manager
 		.append_durable(tenant(), key, hlc(511), b"old-tier")
@@ -34174,7 +34551,8 @@ async fn snapshot_install_fences_and_drains_tier_publication_before_comparison()
 	use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
 	use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
 
-	let (_dirs, manager, l2) = fresh_manager_with_l2("dc112-snapshot-writer").await;
+	let (_dirs, manager, l2) =
+		fresh_manager_with_l2_serving("dc112-snapshot-writer", FIXTURE_NODE).await;
 	let key = id(0xdc113);
 	manager
 		.append_durable(tenant(), key, hlc(512), b"old-tier")
@@ -34240,7 +34618,8 @@ async fn snapshot_index_discards_old_tier_observer_but_accepts_newer_one() {
 	use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
 	use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
 
-	let (_dirs, manager, l2) = fresh_manager_with_l2("dc112-snapshot-index").await;
+	let (_dirs, manager, l2) =
+		fresh_manager_with_l2_serving("dc112-snapshot-index", FIXTURE_NODE).await;
 	let key = id(0xdc114);
 	manager
 		.append_durable(tenant(), key, hlc(513), b"indexed-tier")
@@ -34346,7 +34725,10 @@ async fn awaiting_cluster_marker_fences_reopens_until_complete_snapshot_comparis
 	let dir = fresh_dir("dc112-awaiting-cluster-reopen");
 	let io = spawn_io_thread(64).unwrap();
 	let crypto = test_crypto();
-	let original = initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	let original = serving(
+		initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await,
+		FIXTURE_NODE,
+	);
 	let key = id(0xdc115);
 	original
 		.append_durable(tenant(), key, hlc(514), b"kept")
@@ -34357,7 +34739,10 @@ async fn awaiting_cluster_marker_fences_reopens_until_complete_snapshot_comparis
 	let marker = dir.join("TIER_AUTHORITY_AWAITING_CLUSTER");
 	std::fs::write(&marker, b"awaiting-cluster-v1\n").unwrap();
 	for _ in 0..2 {
-		let reopened = open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+		let reopened = serving(
+			open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await,
+			FIXTURE_NODE,
+		);
 		assert_eq!(
 			reopened.tier_authority_readiness_reason().as_deref(),
 			Some("TierAuthorityAwaitingCluster"),
@@ -34367,7 +34752,10 @@ async fn awaiting_cluster_marker_fences_reopens_until_complete_snapshot_comparis
 		assert!(marker.is_file());
 		drop(reopened);
 	}
-	let manager = open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	let manager = serving(
+		open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await,
+		FIXTURE_NODE,
+	);
 	let mut source = WendelonStateMachine::new();
 	RaftStateMachine::apply(
 		&mut source,
@@ -34392,7 +34780,10 @@ async fn awaiting_cluster_marker_fences_reopens_until_complete_snapshot_comparis
 	assert!(manager.tier_authority_readiness_reason().is_none());
 	drop(target);
 	drop(manager);
-	let reopened = open_manager_at_dir(dir.to_path_buf(), io, crypto).await;
+	let reopened = serving(
+		open_manager_at_dir(dir.to_path_buf(), io, crypto).await,
+		FIXTURE_NODE,
+	);
 	assert!(
 		reopened.tier_authority_readiness_reason().is_none(),
 		"clear must survive reopen"
@@ -34438,6 +34829,7 @@ async fn snapshot_new_tier_is_verified_for_test(awaiting_cluster: bool) {
 	let source_manager = SlabManager::initialize_new_store(config(src_dir.to_path_buf()))
 		.await
 		.unwrap();
+	source_manager.bind_control_node(FIXTURE_NODE).unwrap();
 	let key = id(0xdc116);
 	source_manager
 		.append_durable(tenant(), key, hlc(515), b"new-tier")
@@ -34451,6 +34843,7 @@ async fn snapshot_new_tier_is_verified_for_test(awaiting_cluster: bool) {
 	let target_manager = SlabManager::initialize_new_store(config(dst_dir.to_path_buf()))
 		.await
 		.unwrap();
+	target_manager.bind_control_node(FIXTURE_NODE).unwrap();
 	if awaiting_cluster {
 		assert_eq!(
 			target_manager.tier_authority_readiness_reason().as_deref(),
@@ -34527,7 +34920,7 @@ async fn snapshot_newer_pending_tier_is_verified_before_readiness() {
 	use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
 	use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
 
-	let f = pending_authority_fixture().await;
+	let f = pending_authority_fixture_serving().await;
 	tokio::time::timeout(Duration::from_secs(5), f.store.entered.notified())
 		.await
 		.expect("prior authority verification must be in flight");
@@ -34617,7 +35010,8 @@ async fn snapshot_index_rejects_observer_paused_before_publication_gate() {
 	use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
 	use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
 
-	let (_dirs, manager, l2) = fresh_manager_with_l2("dc112-snapshot-index").await;
+	let (_dirs, manager, l2) =
+		fresh_manager_with_l2_serving("dc112-snapshot-index", FIXTURE_NODE).await;
 	let key = id(0xdc114);
 	manager
 		.append_durable(tenant(), key, hlc(513), b"indexed-tier")
@@ -34729,7 +35123,8 @@ async fn older_retirement_callback_cannot_clear_newer_retirement_marker() {
 	use crate::consensus::TierObserver;
 	use crate::storage::sweeper::ManagerTierObserver;
 
-	let (_dirs, manager, l2) = fresh_manager_with_l2("dc112-retirement-marker-order").await;
+	let (_dirs, manager, l2) =
+		fresh_manager_with_l2_serving("dc112-retirement-marker-order", FIXTURE_NODE).await;
 	let key = id(0xdc117);
 	manager
 		.append_durable(tenant(), key, hlc(516), b"retired")
@@ -34798,7 +35193,10 @@ async fn replacement_crash_after_snapshot_comparison_before_marker_clear_stays_f
 	let crypto = test_crypto();
 	let marker = dir.join("TIER_AUTHORITY_AWAITING_CLUSTER");
 	std::fs::write(&marker, b"awaiting-cluster-v1\n").unwrap();
-	let manager = initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	let manager = serving(
+		initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await,
+		FIXTURE_NODE,
+	);
 	let mut partial = WendelonStateMachine::new()
 		.with_tier_observer(Arc::new(ManagerTierObserver::new(manager.clone())));
 	RaftStateMachine::apply(
@@ -34846,7 +35244,10 @@ async fn replacement_crash_after_snapshot_comparison_before_marker_clear_stays_f
 	install.abort();
 	assert!(install.await.unwrap_err().is_cancelled());
 	drop(manager);
-	let reopened = open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	let reopened = serving(
+		open_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await,
+		FIXTURE_NODE,
+	);
 	assert_eq!(
 		reopened.tier_authority_readiness_reason().as_deref(),
 		Some("TierAuthorityAwaitingCluster")
@@ -34886,7 +35287,8 @@ async fn snapshot_epoch_fences_unindexed_tier_publication_paused_before_gate() {
 	use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
 	use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
 
-	let (_dirs, manager, l2) = fresh_manager_with_l2("dc112-snapshot-index").await;
+	let (_dirs, manager, l2) =
+		fresh_manager_with_l2_serving("dc112-snapshot-index", FIXTURE_NODE).await;
 	let key = id(0xdc114);
 	manager
 		.append_durable(tenant(), key, hlc(513), b"indexed-tier")
@@ -35331,7 +35733,8 @@ async fn ambiguous_replacement_resolves_after_reopen_when_published() {
 
 #[tokio::test]
 async fn published_legacy_marker_does_not_starve_a_one_item_reclaim_slice() {
-	let (_dirs, mgr, l2, target, schemas, old) = unpublished_drop_fixture().await;
+	let (_dirs, mgr, l2, target, schemas, old) =
+		unpublished_drop_fixture_serving(FIXTURE_NODE).await;
 	let object = l2.get(&old.l2_uri).await.unwrap();
 	let a = l2.put("tier/legacy-slice-a.wnd", &object).await.unwrap();
 	let marker = table_drop_l2_cleanup_path(&mgr.config.dir, old.slab_id);
@@ -35428,7 +35831,8 @@ async fn snapshot_supersession_preserves_unknown_size_across_reopen() {
 	use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
 	use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
 
-	let (dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let (dirs, mgr, l2, _target, _schemas, old) =
+		unpublished_drop_fixture_serving(FIXTURE_NODE).await;
 	let object = l2.get(&old.l2_uri).await.unwrap();
 	let historical = l2
 		.put("tier/unknown-size-history.wnd", &object)
@@ -35514,6 +35918,7 @@ async fn snapshot_supersession_preserves_unknown_size_across_reopen() {
 	})
 	.await
 	.unwrap();
+	reopened.bind_control_node(FIXTURE_NODE).unwrap();
 	assert_eq!(reopened.unresolved_tier_cleanup.test_accounting(), expected);
 }
 
@@ -35523,7 +35928,8 @@ async fn snapshot_removal_records_unknown_retained_size() {
 	use crate::storage::sweeper::ManagerTierObserver;
 	use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
 	use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
-	let (_dirs, mgr, _l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let (_dirs, mgr, _l2, _target, _schemas, old) =
+		unpublished_drop_fixture_serving(FIXTURE_NODE).await;
 	let mut source = WendelonStateMachine::new();
 	RaftStateMachine::apply(
 		&mut source,
@@ -35569,7 +35975,8 @@ async fn snapshot_displacing_unverified_pointer_does_not_invent_publication_evid
 	use crate::storage::sweeper::ManagerTierObserver;
 	use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
 	use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
-	let (_dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let (_dirs, mgr, l2, _target, _schemas, old) =
+		unpublished_drop_fixture_serving(FIXTURE_NODE).await;
 	let object = l2.get(&old.l2_uri).await.unwrap();
 	let pending_uri = l2
 		.put("tier/pending-snapshot-displaced.wnd", &object)
@@ -37029,7 +37436,8 @@ async fn snapshot_after_append_observation_refuses_stale_supersession_metadata()
 	use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
 	use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
 
-	let (_dirs, manager, l2) = fresh_manager_with_l2("dc112-append-metadata-epoch").await;
+	let (_dirs, manager, l2) =
+		fresh_manager_with_l2_serving("dc112-append-metadata-epoch", FIXTURE_NODE).await;
 	let key = id(0xdc115);
 	manager
 		.append_durable(tenant(), key, hlc(513), b"old")
@@ -37099,7 +37507,8 @@ async fn snapshot_after_migrated_range_observation_refuses_stale_metadata() {
 	use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
 	use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
 
-	let (_dirs, manager, l2) = fresh_manager_with_l2("dc112-migrated-metadata-epoch").await;
+	let (_dirs, manager, l2) =
+		fresh_manager_with_l2_serving("dc112-migrated-metadata-epoch", FIXTURE_NODE).await;
 	let key = id(0xdc116);
 	manager
 		.append_durable(tenant(), key, hlc(513), b"old")
@@ -37183,7 +37592,8 @@ async fn snapshot_after_multirow_observation_refuses_stale_metadata() {
 	use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
 	use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
 
-	let (_dirs, manager, l2) = fresh_manager_with_l2("dc112-multirow-metadata-epoch").await;
+	let (_dirs, manager, l2) =
+		fresh_manager_with_l2_serving("dc112-multirow-metadata-epoch", FIXTURE_NODE).await;
 	let keys = [id(0xdc117), id(0xdc118)];
 	for key in keys {
 		manager
@@ -37263,7 +37673,8 @@ async fn snapshot_after_multirow_tombstone_observation_refuses_stale_metadata() 
 	use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
 	use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
 
-	let (_dirs, manager, l2) = fresh_manager_with_l2("dc112-multirow-tombstone-epoch").await;
+	let (_dirs, manager, l2) =
+		fresh_manager_with_l2_serving("dc112-multirow-tombstone-epoch", FIXTURE_NODE).await;
 	let keys = [id(0xdc117), id(0xdc118)];
 	for key in keys {
 		manager
@@ -38570,7 +38981,8 @@ async fn real_sm_fenced_pointer_for_a_retired_slab_stays_typed_fenced_while_cano
 	use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
 	use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
 
-	let (_dirs, manager, l2) = fresh_manager_with_l2("s7-real-sm-fenced-replacement").await;
+	let (_dirs, manager, l2) =
+		fresh_manager_with_l2_serving("s7-real-sm-fenced-replacement", FIXTURE_NODE).await;
 	let key = id(0x5e823);
 	manager
 		.append_durable(tenant(), key, hlc(511), b"tiered-row")
@@ -39831,7 +40243,8 @@ impl CommandCommitter for B1tRoleCommitter {
 }
 #[tokio::test]
 async fn b1t_follower_slice_defers_without_upload_and_can_resume() {
-	let (_dirs, mgr, l2, target, schemas, old) = unpublished_drop_fixture().await;
+	let (_dirs, mgr, l2, target, schemas, old) =
+		unpublished_drop_fixture_serving(FIXTURE_NODE).await;
 	let before = l2.list("").await.unwrap();
 	let accounting = mgr.retained_cleanup_test_accounting();
 	let committer = B1tRoleCommitter {
@@ -39915,7 +40328,8 @@ async fn b1t_follower_unsliced_reclaim_does_not_upload() {
 
 #[tokio::test]
 async fn b1t_deferred_debt_is_reconstructed_after_reopen() {
-	let (_dirs, mgr, l2, target, schemas, old) = unpublished_drop_fixture().await;
+	let (_dirs, mgr, l2, target, schemas, old) =
+		unpublished_drop_fixture_serving(FIXTURE_NODE).await;
 	let registry = crate::metrics::isolated_for_test();
 	mgr.bind_table_drop_l2_gauge_for_test(&registry.storage_table_drop_l2_deferred_debts);
 	let committer = B1tRoleCommitter {
@@ -40048,7 +40462,7 @@ mod b1t_network {
 #[tokio::test]
 async fn b1t_real_follower_debt_completes_after_leadership_change() {
 	use crate::consensus::{WendelonLogStore, WendelonRaft};
-	let (_dirs, mgr, l2, target, schemas, old) = unpublished_drop_fixture().await;
+	let (_dirs, mgr, l2, target, schemas, old) = unpublished_drop_fixture_serving(2).await;
 	let network = b1t_network::Network::default();
 	let config = Arc::new(
 		crate::consensus::retention::ControlRetention::default()
@@ -40310,7 +40724,8 @@ async fn b3_fixture() -> (
 	TableSchemaCatalog,
 	TieredSlabPointer,
 ) {
-	let (dirs, mgr, l2, target, schemas, old) = unpublished_drop_fixture().await;
+	let (dirs, mgr, l2, target, schemas, old) =
+		unpublished_drop_fixture_serving(FIXTURE_NODE).await;
 	let _proposed = propose_ambiguous_drop(&mgr, &target, &schemas, false, false).await;
 	assert!(
 		mgr.refuse_unresolved_cleanup(old.slab_id).is_err(),
@@ -40478,7 +40893,7 @@ async fn b3_budget_one_cleanup_scan_rotates_to_the_ready_slab() {
 #[tokio::test]
 async fn b4_committed_retirement_can_finish_before_its_tier_read_verification() {
 	use crate::consensus::TierObserver;
-	let fixture = pending_authority_fixture().await;
+	let fixture = pending_authority_fixture_serving().await;
 	tokio::time::timeout(Duration::from_secs(60), fixture.store.entered.notified())
 		.await
 		.unwrap();
@@ -40635,7 +41050,8 @@ async fn b5_stale_local_retirement_does_not_fence_a_newer_snapshot() {
 #[tokio::test]
 async fn b5_stale_local_retirement_does_not_overwrite_a_committed_log_fence() {
 	use crate::consensus::TierObserver;
-	let (_dirs, mgr, l2, _target, _schemas, pointer) = unpublished_drop_fixture().await;
+	let (_dirs, mgr, l2, _target, _schemas, pointer) =
+		unpublished_drop_fixture_serving(FIXTURE_NODE).await;
 	let object = l2.get(&pointer.l2_uri).await.unwrap();
 	let prior = b5_advance_snapshot(&mgr, &pointer).await;
 	let observer = crate::storage::ManagerTierObserver::new(mgr.clone());
@@ -41234,7 +41650,8 @@ async fn b6_replacement_tier_log_entry_finishes_complete_replay_authority() {
 	use crate::consensus::WendelonStateMachine;
 	use openraft::storage::RaftStateMachine;
 	use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
-	let (_dirs, source, l2) = fresh_manager_with_l2("b6-replacement-source").await;
+	let (_dirs, source, l2) =
+		fresh_manager_with_l2_serving("b6-replacement-source", FIXTURE_NODE).await;
 	let key = id(0xb601);
 	source
 		.append_durable(tenant(), key, hlc(70), b"replacement-tier")
@@ -41263,6 +41680,7 @@ async fn b6_replacement_tier_log_entry_finishes_complete_replay_authority() {
 	})
 	.await
 	.unwrap();
+	target.bind_control_node(FIXTURE_NODE).unwrap();
 	assert!(target.is_awaiting_cluster());
 	assert!(target.lookup(tenant(), key).is_err());
 	let mut sm = WendelonStateMachine::new().with_tier_observer(Arc::new(
@@ -41324,7 +41742,8 @@ async fn b6c_complete_replay_resumes_matching_lsm_deferral() {
 	use crate::consensus::WendelonStateMachine;
 	use openraft::storage::RaftStateMachine;
 	use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
-	let (_dirs, source, l2) = fresh_manager_with_l2("b6-replacement-source").await;
+	let (_dirs, source, l2) =
+		fresh_manager_with_l2_serving("b6-replacement-source", FIXTURE_NODE).await;
 	let key = id(0xb601);
 	source
 		.append_durable(tenant(), key, hlc(70), b"replacement-tier")
@@ -41353,6 +41772,7 @@ async fn b6c_complete_replay_resumes_matching_lsm_deferral() {
 	})
 	.await
 	.unwrap();
+	target.bind_control_node(FIXTURE_NODE).unwrap();
 	assert!(target.is_awaiting_cluster());
 	assert!(target.lookup(tenant(), key).is_err());
 	let job = CompactionJobId::new(0xb6c);
@@ -41441,7 +41861,8 @@ async fn b6c_complete_replay_preserves_structural_refusal() {
 	use crate::consensus::WendelonStateMachine;
 	use openraft::storage::RaftStateMachine;
 	use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
-	let (_dirs, source, l2) = fresh_manager_with_l2("b6-replacement-source").await;
+	let (_dirs, source, l2) =
+		fresh_manager_with_l2_serving("b6-replacement-source", FIXTURE_NODE).await;
 	let key = id(0xb601);
 	source
 		.append_durable(tenant(), key, hlc(70), b"replacement-tier")
@@ -41470,6 +41891,7 @@ async fn b6c_complete_replay_preserves_structural_refusal() {
 	})
 	.await
 	.unwrap();
+	target.bind_control_node(FIXTURE_NODE).unwrap();
 	assert!(target.is_awaiting_cluster());
 	assert!(target.lookup(tenant(), key).is_err());
 	let job = CompactionJobId::new(0xb6c);
@@ -41568,7 +41990,8 @@ async fn b6c_nonempty_replay_crash_before_marker_clear_rechecks_on_reopen() {
 	use crate::consensus::WendelonStateMachine;
 	use openraft::storage::RaftStateMachine;
 	use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
-	let (_dirs, source, l2) = fresh_manager_with_l2("b6-replacement-source").await;
+	let (_dirs, source, l2) =
+		fresh_manager_with_l2_serving("b6-replacement-source", FIXTURE_NODE).await;
 	let key = id(0xb601);
 	source
 		.append_durable(tenant(), key, hlc(70), b"replacement-tier")
@@ -41597,6 +42020,7 @@ async fn b6c_nonempty_replay_crash_before_marker_clear_rechecks_on_reopen() {
 	})
 	.await
 	.unwrap();
+	target.bind_control_node(FIXTURE_NODE).unwrap();
 	assert!(target.is_awaiting_cluster());
 	assert!(target.lookup(tenant(), key).is_err());
 	let mut sm = WendelonStateMachine::new().with_tier_observer(Arc::new(
@@ -41682,6 +42106,7 @@ async fn b6c_nonempty_replay_crash_before_marker_clear_rechecks_on_reopen() {
 	})
 	.await
 	.unwrap();
+	reopened.bind_control_node(FIXTURE_NODE).unwrap();
 	assert!(reopened.is_awaiting_cluster());
 	assert!(reopened.lookup(tenant(), key).is_err());
 	assert!(
@@ -42906,7 +43331,8 @@ async fn b10_snapshot_install_defers_live_append_collision_without_fatal_storage
 	use crate::consensus::{TieredSlab, WendelonStateMachine};
 	use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
 	use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
-	let (_source_dirs, source, l2) = fresh_manager_with_l2("b10-source").await;
+	let (_source_dirs, source, l2) =
+		fresh_manager_with_l2_serving("b10-source", FIXTURE_NODE).await;
 	let key = id(0xb100);
 	source
 		.append_durable(tenant(), key, hlc(70), b"canonical-tier")
@@ -42933,6 +43359,7 @@ async fn b10_snapshot_install_defers_live_append_collision_without_fatal_storage
 	})
 	.await
 	.unwrap();
+	manager.bind_control_node(FIXTURE_NODE).unwrap();
 	let active = Arc::clone(&manager.state.lock().await.active);
 	assert_eq!(active.slab_id(), pointer.slab_id);
 	let (entered, release) = active.hold_next_append_write_for_test();
@@ -43058,7 +43485,8 @@ async fn b10_append_fixture() -> B10AppendFixture {
 	use crate::consensus::{TieredSlab, WendelonStateMachine};
 	use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
 	use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
-	let (_source_dirs, source, l2) = fresh_manager_with_l2("b10-source").await;
+	let (_source_dirs, source, l2) =
+		fresh_manager_with_l2_serving("b10-source", FIXTURE_NODE).await;
 	let key = id(0xb100);
 	source
 		.append_durable(tenant(), key, hlc(70), b"canonical-tier")
@@ -43089,6 +43517,7 @@ async fn b10_append_fixture() -> B10AppendFixture {
 	)
 	.await
 	.unwrap();
+	manager.bind_control_node(FIXTURE_NODE).unwrap();
 	let active = Arc::clone(&manager.state.lock().await.active);
 	assert_eq!(active.slab_id(), pointer.slab_id);
 	let (entered, release) = active.hold_next_append_write_for_test();
@@ -43739,6 +44168,7 @@ async fn b10_quarantine_before_exact_retirement_clear_survives_reopen() {
 	drop(manager);
 	drop(owner);
 	let reopened = SlabManager::open(config).await.unwrap();
+	reopened.bind_control_node(FIXTURE_NODE).unwrap();
 	let mut target = crate::consensus::WendelonStateMachine::new().with_tier_observer(Arc::new(
 		crate::storage::ManagerTierObserver::new(reopened.clone()),
 	));
@@ -43920,6 +44350,7 @@ async fn b10_crash_after_retirement_before_append_drains_uses_durable_staging() 
 	drop(manager);
 	drop(owner);
 	let reopened = SlabManager::open(config).await.unwrap();
+	reopened.bind_control_node(FIXTURE_NODE).unwrap();
 	assert!(
 		reopened
 			.quarantined_slab_files()
@@ -43953,7 +44384,7 @@ async fn b10_crash_after_retirement_before_append_drains_uses_durable_staging() 
 }
 
 async fn b11_staging_lock_control(maintenance: bool) {
-	let (_dir, manager) = fresh_manager().await;
+	let (_dir, manager) = fresh_manager_serving(FIXTURE_NODE).await;
 	seed_lsm_relocation_fixture(&manager).await;
 	let worker = LsmCompactionWorker::new(LsmConfig::default(), manager.slab_pin_table()).unwrap();
 	let plan = manager
@@ -44164,7 +44595,7 @@ async fn b11b_paused_control_install(
 	tokio::task::JoinHandle<Result<crate::storage::CompactionOutcome, CompactionFailure>>,
 	[Identity; 2],
 ) {
-	let (dir, manager) = fresh_manager().await;
+	let (dir, manager) = fresh_manager_serving(FIXTURE_NODE).await;
 	let keys = [id(0xb11b01), id(0xb11b02)];
 	manager
 		.append_durable(tenant(), keys[0], hlc(1), b"b11b-first")
@@ -44520,7 +44951,10 @@ async fn local_lsm_error_after_input_run_materialization_leaves_no_orphan_fence(
 	let dir = fresh_dir("local-lsm-materialized-runs-no-orphan");
 	let crypto = test_crypto();
 	let io = spawn_io_thread(64).unwrap();
-	let manager = initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await;
+	let manager = serving(
+		initialize_manager_at_dir(dir.to_path_buf(), io.clone(), crypto.clone()).await,
+		FIXTURE_NODE,
+	);
 	let keys = [id(0xb12a), id(0xb12b)];
 	manager
 		.append_durable(tenant(), keys[0], hlc(1), b"one")
@@ -44617,7 +45051,10 @@ async fn local_lsm_error_after_input_run_materialization_leaves_no_orphan_fence(
 async fn control_lsm_preflight_refusal_precedes_durable_intent_and_hold() {
 	let dir = fresh_dir("control-lsm-preflight-before-intent");
 	let io = spawn_io_thread(64).unwrap();
-	let manager = initialize_manager_at_dir(dir.to_path_buf(), io, test_crypto()).await;
+	let manager = serving(
+		initialize_manager_at_dir(dir.to_path_buf(), io, test_crypto()).await,
+		FIXTURE_NODE,
+	);
 	let keys = [id(0xb13b01), id(0xb13b02)];
 	manager
 		.append_durable(tenant(), keys[0], hlc(1), b"control-one")
@@ -44751,7 +45188,8 @@ async fn control_lsm_preflight_refusal_precedes_durable_intent_and_hold() {
 
 #[tokio::test]
 async fn control_lsm_refusal_before_rename_clears_its_durable_intent() {
-	let (dirs, manager, l2) = fresh_manager_with_l2("control-lsm-refusal-before-rename").await;
+	let (dirs, manager, l2) =
+		fresh_manager_with_l2_serving("control-lsm-refusal-before-rename", FIXTURE_NODE).await;
 	let keys = [id(0xb12b01), id(0xb12b02)];
 	manager
 		.append_durable(tenant(), keys[0], hlc(1), b"refused-first")
@@ -45781,7 +46219,7 @@ async fn blob_recovery_refuses_an_acknowledged_record_past_the_bytes() {
 /// not the index's offsets for the old one, and serves exactly its survivors.
 #[tokio::test]
 async fn the_recovery_verifier_walks_a_moved_replacement_with_its_own_layout() {
-	let fixture = seed_prepared_rewrite_fixture("verifier-moved-replacement").await;
+	let fixture = seed_prepared_rewrite_fixture_serving("verifier-moved-replacement").await;
 	let mgr = &fixture.mgr;
 	let (bytes, tombstone_metadata, supersession_metadata) =
 		prepare_production_retention_rewrite(mgr, &fixture.pointer).await;
@@ -45997,7 +46435,8 @@ async fn staged_plaintext_that_only_shares_a_prefix_with_the_published_object_re
 	use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
 	use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
 
-	let (_dirs, mgr, l2) = fresh_manager_with_l2("staged-plaintext-prefix").await;
+	let (_dirs, mgr, l2) =
+		fresh_manager_with_l2_serving("staged-plaintext-prefix", FIXTURE_NODE).await;
 	let first = mgr
 		.append(tenant(), id(0x6701), hlc(10), b"one")
 		.await
@@ -46984,6 +47423,7 @@ async fn worker_replay_fixture_over(
 	use crate::consensus::WendelonStateMachine;
 	use crate::storage::sweeper::ManagerTierObserver;
 	let (dirs, manager, l2) = fresh_manager_with_wrapped_l2(tag, wrap).await;
+	let manager = serving(manager, FIXTURE_NODE);
 	let key = id(0x5e900);
 	manager
 		.append_durable(tenant(), key, hlc(900), b"replayed-row")
@@ -47675,6 +48115,72 @@ async fn a_rewrite_without_room_for_its_redirects_skips_them_and_counts_it() {
 
 /// `seed_small_retired_gc_slab`, also returning the stale holder's location:
 /// the row's original location in the now Retired input slab.
+/// DC-251 (Codex 01a1e5bf, recipe A): a small slab retired by a real compaction, in a
+/// SECOND store lifetime that has never been bound, for local-only GC. Two coherent lifetimes,
+/// not the impossible state of an unbound store naming an owner: the first is a library
+/// manager explicitly bound to `FIXTURE_NODE` (its compaction commit names its owner; no ring
+/// takes part, and the binding is no proof of one); it is released, awaited within a bound,
+/// and the same directory reopened RAW with the same configuration and crypto. Its
+/// preconditions are asserted, not fabricated: the second lifetime names no owner; the input
+/// is `Retired` in the reopened manifest (GC marks it `DeletePending` itself); no record row
+/// names it; its backing file is still there; and the survivor reads its bytes from its
+/// current location. Returns the directory, the raw store, the input, the survivor's key and
+/// its original (now stale) location.
+async fn small_retired_gc_slab_in_an_unbound_second_lifetime() -> (
+	crate::test_support::TestDir,
+	Arc<SlabManager>,
+	SlabId,
+	Identity,
+	RecordLocation,
+) {
+	let (dir, bound) = fresh_manager_serving(FIXTURE_NODE).await;
+	let (slab_id, key, old) = seed_small_retired_gc_slab_at(&bound).await;
+	bound.fsync_all_local_slabs().await.unwrap();
+	let io = bound.config.io.clone();
+	let crypto = bound.config.crypto.clone();
+	let first = Arc::downgrade(&bound);
+	drop(bound);
+	tokio::time::timeout(Duration::from_secs(5), async {
+		while first.upgrade().is_some() {
+			tokio::task::yield_now().await;
+		}
+	})
+	.await
+	.expect("the bound lifetime releases its store before the reopen");
+	let raw = open_manager_at_dir(dir.to_path_buf(), io, crypto).await;
+	assert!(!raw.control_node_bound(), "the second lifetime is unbound");
+	assert_eq!(
+		raw.owner_ref()
+			.expect_err("an unbound lifetime named an owner")
+			.kind(),
+		ErrorKind::WouldBlock
+	);
+	assert!(
+		matches!(
+			raw.compaction_manifest_snapshot()
+				.run(slab_id)
+				.map(|run| &run.state),
+			Some(SlabState::Retired { .. })
+		),
+		"the input is retired in the reopened manifest"
+	);
+	assert!(
+		raw.record_rows_for_slab(slab_id).unwrap().is_empty(),
+		"no record row names the retired input"
+	);
+	assert!(
+		crate::storage::manager::slab_path(&dir, slab_id).exists(),
+		"the input's backing is retained before the sweep"
+	);
+	assert_eq!(
+		raw.read(raw.lookup(tenant(), key).unwrap().expect("the survivor"))
+			.await
+			.unwrap(),
+		b"gc-survivor"
+	);
+	(dir, raw, slab_id, key, old)
+}
+
 async fn seed_small_retired_gc_slab_at(
 	manager: &Arc<SlabManager>,
 ) -> (SlabId, Identity, RecordLocation) {
@@ -47730,8 +48236,8 @@ async fn sweep_gc(manager: &Arc<SlabManager>, slab_id: SlabId) {
 /// GC, while the input is only Retired, it is served from the retained slab.
 #[tokio::test]
 async fn a_stale_holder_after_lsm_gc_gets_superseded_and_before_it_is_served() {
-	let (_dir, manager) = fresh_manager().await;
-	let (slab_id, key, old) = seed_small_retired_gc_slab_at(&manager).await;
+	let (_dir, manager, slab_id, key, old) =
+		small_retired_gc_slab_in_an_unbound_second_lifetime().await;
 	assert_eq!(
 		manager.read(old).await.unwrap(),
 		b"gc-survivor",
@@ -47797,8 +48303,8 @@ async fn a_stale_holder_after_maintenance_without_replacement_gets_superseded() 
 /// existing missing-slab failure, never `Superseded`.
 #[tokio::test]
 async fn reinstalling_a_disposed_slab_forgets_its_disposal_evidence() {
-	let (_dir, manager) = fresh_manager().await;
-	let (slab_id, _key, old) = seed_small_retired_gc_slab_at(&manager).await;
+	let (_dir, manager, slab_id, _key, old) =
+		small_retired_gc_slab_in_an_unbound_second_lifetime().await;
 	sweep_gc(&manager, slab_id).await;
 	assert!(is_superseded(&manager.read(old).await), "premise");
 	{
@@ -47817,8 +48323,8 @@ async fn reinstalling_a_disposed_slab_forgets_its_disposal_evidence() {
 /// evidence: a stale holder then gets the existing failure, not `Superseded`.
 #[tokio::test]
 async fn a_snapshot_comparison_after_disposal_clears_its_evidence() {
-	let (_dir, manager) = fresh_manager().await;
-	let (slab_id, _key, old) = seed_small_retired_gc_slab_at(&manager).await;
+	let (_dir, manager, slab_id, _key, old) =
+		small_retired_gc_slab_in_an_unbound_second_lifetime().await;
 	sweep_gc(&manager, slab_id).await;
 	assert!(is_superseded(&manager.read(old).await), "premise");
 	let epoch = manager.begin_tier_snapshot_install().unwrap();
@@ -47842,8 +48348,8 @@ async fn a_snapshot_comparison_after_disposal_clears_its_evidence() {
 /// holder gets the existing failure, never a `Superseded` without evidence.
 #[tokio::test]
 async fn a_disposal_without_room_for_its_evidence_degrades_to_the_existing_failure() {
-	let (_dir, manager) = fresh_manager().await;
-	let (slab_id, _key, old) = seed_small_retired_gc_slab_at(&manager).await;
+	let (_dir, manager, slab_id, _key, old) =
+		small_retired_gc_slab_in_an_unbound_second_lifetime().await;
 	manager
 		.tier_budget
 		.set_limit_for_test(manager.tier_budget.used());
@@ -47862,8 +48368,8 @@ async fn a_disposal_without_room_for_its_evidence_degrades_to_the_existing_failu
 /// enters no evidence: a stale holder never gets `Superseded`.
 #[tokio::test]
 async fn a_gc_abort_while_delete_pending_enters_no_disposal_evidence() {
-	let (dir, manager) = fresh_manager().await;
-	let (slab_id, _key, old) = seed_small_retired_gc_slab_at(&manager).await;
+	let (dir, manager, slab_id, _key, old) =
+		small_retired_gc_slab_in_an_unbound_second_lifetime().await;
 	let path = slab_path(&dir, slab_id);
 	std::fs::rename(&path, path.with_extension("saved")).unwrap();
 	std::fs::write(&path, b"unrelated replacement").unwrap();
@@ -48582,7 +49088,7 @@ async fn elect_among(nodes: &[crate::consensus::WendelonRaft], node: u32) {
 async fn a_followers_apply_funds_itself_fences_on_its_budget_and_publishes_on_release() {
 	use super::tier_budget::TierBudgetKind;
 	use super::tier_deferral::DeferralOutcome;
-	let (_dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let (_dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture_serving(2).await;
 	let cluster = control_cluster(2, &mgr).await;
 	cluster.commit_tier(1, &mgr, &old).await;
 	assert_eq!(mgr.tier_pointer(old.slab_id).await, Some(old.clone()));
@@ -48703,7 +49209,7 @@ async fn a_delayed_apply_after_its_proposers_token_was_released_funds_itself() {
 /// generation advances exactly once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn across_a_leader_change_an_older_replay_never_publishes_over_newer_authority() {
-	let (_dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let (_dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture_serving(2).await;
 	let cluster = control_cluster(2, &mgr).await;
 	cluster.commit_tier(1, &mgr, &old).await;
 	let bytes = l2.get(&old.l2_uri).await.unwrap();
@@ -48870,6 +49376,7 @@ async fn a_node_restarted_while_fenced_converges_to_its_committed_pointer() {
 	))
 	.await
 	.unwrap();
+	mgr.bind_control_node(FIXTURE_NODE).unwrap();
 	let key = id(0x5e930);
 	mgr.append_durable(tenant(), key, hlc(930), b"restart-row")
 		.await
@@ -48916,6 +49423,7 @@ async fn a_node_restarted_while_fenced_converges_to_its_committed_pointer() {
 	let reopened = SlabManager::open(reopen_test_config(&l1_dir, io, l2, crypto))
 		.await
 		.unwrap();
+	reopened.bind_control_node(FIXTURE_NODE).unwrap();
 	let log = WendelonLogStore::open_for_retention_test(&wal_dir, 64 * 4096, None)
 		.await
 		.unwrap();
@@ -49038,6 +49546,9 @@ async fn dc160_tiering_one_data_nodes_slab_leaves_anothers_same_id_slab_untouche
 		.unwrap()
 	};
 	let (a, b) = (open(&dir_a).await, open(&dir_b).await);
+	// DC-251: store a serves node 1 and store b node 2, bound at construction.
+	a.bind_control_node(1).unwrap();
+	b.bind_control_node(2).unwrap();
 	let (key_a, key_b) = (id(0xA160), id(0xB160));
 	a.append_durable(tenant(), key_a, hlc(10), b"node-a-row")
 		.await
@@ -49173,7 +49684,7 @@ async fn control_cluster_observing(observers: &[(u32, &Arc<SlabManager>)]) -> Co
 #[ignore = "superseded history (ADR 0697 §9.1): its no-fence outcome is stronger than the leader-only policy; see the three §9.2 tests, dc161_a_*"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dc161_gc_after_leadership_loss_leaves_no_unresolvable_intent() {
-	let (_dir, manager) = fresh_manager().await;
+	let (_dir, manager) = fresh_manager_serving(FIXTURE_NODE).await;
 	let (slab_id, _key) = seed_small_retired_gc_slab(&manager).await;
 	let cluster = control_cluster_observing(&[(1, &manager)]).await;
 	// Node 1 registered while it led, so the sweep passes the registration
@@ -49489,8 +50000,8 @@ async fn evidence_at_the_maximum_slab_id_is_refused() {
 /// of its run must not change node B's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cross_owner_gc_commit_leaves_another_nodes_same_id_run_untouched() {
-	let (_dir_a, a) = fresh_manager().await;
-	let (_dir_b, b) = fresh_manager().await;
+	let (_dir_a, a) = fresh_manager_serving(FIXTURE_NODE).await;
+	let (_dir_b, b) = fresh_manager_serving(2).await;
 	let (slab_a, _key_a) = seed_small_retired_gc_slab(&a).await;
 	let (slab_b, _key_b) = seed_small_retired_gc_slab(&b).await;
 	assert_eq!(slab_a, slab_b, "premise: equal bare slab ids");
@@ -49570,6 +50081,93 @@ fn owner_test_fence(manager: &SlabManager) -> Option<String> {
 		.tier_authority_readiness_reason()
 		.filter(|reason| reason.contains("Owner") || reason.contains("OwnIdentity"))
 		.map(|reason| reason.to_string())
+}
+
+/// DC-251: a store no node has bound cannot name its slabs, in every build: its owner
+/// reference is refused exactly as the product refuses it, never invented as node 1.
+#[tokio::test]
+async fn an_unbound_store_has_no_owner_reference() {
+	let (_dir, mgr) = fresh_manager().await;
+	assert!(!mgr.bound_to_control_node_for_test());
+	let refused = mgr
+		.owner_ref()
+		.expect_err("an unbound store named an owner");
+	assert_eq!(refused.kind(), ErrorKind::WouldBlock);
+	assert!(
+		refused.to_string().contains("not bound to a control node"),
+		"{refused}"
+	);
+}
+
+/// DC-251: binding names the store's node; the same node binds again, another is refused.
+#[tokio::test]
+async fn a_bound_store_names_its_node_and_refuses_another() {
+	let (_dir, mgr) = fresh_manager().await;
+	mgr.bind_control_node(3).unwrap();
+	let own = mgr.owner_ref().unwrap();
+	assert_eq!(own.node(), 3);
+	assert_eq!(Some(own.incarnation()), mgr.store_incarnation_for_test());
+	mgr.bind_control_node(3).unwrap();
+	let refused = mgr
+		.bind_control_node(1)
+		.expect_err("rebound to another node");
+	assert_eq!(refused.kind(), ErrorKind::InvalidInput);
+	assert_eq!(mgr.owner_ref().unwrap().node(), 3);
+}
+
+/// DC-251: an unbound store cannot explain a ring owner as its own. Classifying one
+/// fences its local authority as `UnexplainedOwnIdentity(StoreNotBound)` and answers
+/// `Unexplained`, even for the node and incarnation the store would have had as node 1.
+#[tokio::test]
+async fn an_unbound_store_fences_on_a_ring_owner_it_cannot_explain() {
+	let (_dir, mgr) = fresh_manager().await;
+	let incarnation = mgr.store_incarnation_for_test().unwrap();
+	let would_be = crate::consensus::OwnerRef::new(1, incarnation);
+	assert_eq!(owner_test_fence(&mgr), None);
+	assert_eq!(
+		mgr.classify_ring_owner(
+			would_be,
+			&owner_test_registry(incarnation, &[]),
+			OwnerEvidence::Current,
+		),
+		Ownership::Unexplained
+	);
+	assert_eq!(
+		owner_test_fence(&mgr).as_deref(),
+		Some("UnexplainedOwnIdentity(StoreNotBound)")
+	);
+}
+
+/// DC-251: an unbound store has no authoritative own tier view, and asking for one fences
+/// it the same way; it never reads the empty view as "nothing of mine is tiered".
+#[tokio::test]
+async fn an_unbound_store_has_no_authoritative_own_tier_view() {
+	let (_dir, mgr) = fresh_manager().await;
+	let incarnation = mgr.store_incarnation_for_test().unwrap();
+	let registries = std::collections::BTreeMap::from([(1, owner_test_registry(incarnation, &[]))]);
+	assert_eq!(mgr.own_tier_view(std::iter::empty(), &registries), None);
+	assert_eq!(
+		owner_test_fence(&mgr).as_deref(),
+		Some("UnexplainedOwnIdentity(StoreNotBound)")
+	);
+}
+
+/// DC-251: an unbound store's own-node verdict fences it, whatever its node's registry says.
+#[tokio::test]
+async fn an_unbound_store_fences_its_own_node_classification() {
+	let (_dir, mgr) = fresh_manager().await;
+	let incarnation = mgr.store_incarnation_for_test().unwrap();
+	assert_eq!(
+		mgr.classify_own_node(
+			&owner_test_registry(incarnation, &[]),
+			OwnerEvidence::Current
+		),
+		Ownership::Unexplained
+	);
+	assert_eq!(
+		owner_test_fence(&mgr).as_deref(),
+		Some("UnexplainedOwnIdentity(StoreNotBound)")
+	);
 }
 
 /// ADR 0697: evidence older than this store's newest authority never mints the
@@ -50179,7 +50777,7 @@ async fn committer_without_a_registry_is_refused_at_registration_in_its_prefligh
 async fn committer_maps_a_refused_slab_command_to_a_non_outcome_on_every_path() {
 	use crate::storage::TierCommitter;
 	use crate::storage::sweeper::{LsmCommitRejected, SlabCommitRefused};
-	let (_dirs, mgr, _l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let (_dirs, mgr, _l2, _target, _schemas, old) = unpublished_drop_fixture_serving(2).await;
 	let cluster = control_cluster_observing(&[(2, &mgr)]).await;
 	cluster.elect(2).await;
 	register_owner(&cluster.nodes[1], &mgr).await;
@@ -50585,7 +51183,7 @@ async fn a_full_window_refuses_new_work_and_the_reserved_gc_removal_still_drains
 	use crate::consensus::slab_ops::OPS_WINDOW_W;
 	use crate::storage::index::{OpHolderState, TerminalBacklog};
 	use std::sync::atomic::Ordering;
-	let (_dir, mgr) = fresh_manager().await;
+	let (_dir, mgr) = fresh_manager_serving(FIXTURE_NODE).await;
 	// An unreserved delete-pending run, ordered before the reserved one.
 	let (unreserved, _) = seed_small_retired_gc_slab(&mgr).await;
 	let (slab_id, _key) = seed_small_retired_gc_slab(&mgr).await;
@@ -50787,7 +51385,7 @@ async fn a_full_window_refuses_new_work_and_the_reserved_gc_removal_still_drains
 /// producer: a follower leaves no row and no local state to resolve.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_follower_allocates_nothing_and_marks_nothing() {
-	let (_dir, mgr) = fresh_manager().await;
+	let (_dir, mgr) = fresh_manager_serving(2).await;
 	let (slab_id, _key) = seed_small_retired_gc_slab(&mgr).await;
 	let cluster = control_cluster_observing(&[(2, &mgr)]).await;
 	let committer = op_committer(&cluster, 2);
@@ -50889,7 +51487,7 @@ async fn a_superseded_owners_receipt_grants_no_local_effect() {
 async fn a_receipt_for_another_operation_or_with_no_decision_is_an_anomaly() {
 	use crate::consensus::slab_ops::{OpOutcome, OpReceipt, RecordedOutcome};
 	use crate::storage::sweeper::{OpReceiptAnomaly, verify_receipt};
-	let (_dir, mgr) = fresh_manager().await;
+	let (_dir, mgr) = fresh_manager_serving(FIXTURE_NODE).await;
 	let owner = mgr.owner_ref().unwrap();
 	let ticket = mgr
 		.require_op_index()
@@ -51114,7 +51712,8 @@ impl crate::consensus::TierObserver for HeldRegistryDelivery {
 async fn a_canonical_supersession_blocks_handoff_while_its_delivery_is_held() {
 	use openraft::storage::RaftStateMachine;
 	use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
-	let (_dirs, mgr, _l2, _target, _schemas, old) = unpublished_drop_fixture().await;
+	let (_dirs, mgr, _l2, _target, _schemas, old) =
+		unpublished_drop_fixture_serving(FIXTURE_NODE).await;
 	let owner = mgr.owner_ref().unwrap();
 	let entered = Arc::new(tokio::sync::Semaphore::new(0));
 	let release = Arc::new(tokio::sync::Semaphore::new(0));
@@ -51295,7 +51894,7 @@ async fn a_supersession_during_a_handoff_waits_for_it() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_reserved_removal_refuses_changed_input_authority_and_ignores_unrelated_epochs() {
 	use std::sync::atomic::Ordering;
-	let (dir, mgr) = fresh_manager().await;
+	let (dir, mgr) = fresh_manager_serving(FIXTURE_NODE).await;
 	let (slab_id, _key) = seed_small_retired_gc_slab(&mgr).await;
 	let cluster = control_cluster_observing(&[(1, &mgr)]).await;
 	let committer = op_committer(&cluster, 1);
@@ -51354,7 +51953,7 @@ async fn a_reserved_removal_refuses_changed_input_authority_and_ignores_unrelate
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_reserved_removal_runs_after_unrelated_epochs_advance() {
 	use std::sync::atomic::Ordering;
-	let (_dir, mgr) = fresh_manager().await;
+	let (_dir, mgr) = fresh_manager_serving(FIXTURE_NODE).await;
 	let (slab_id, _key) = seed_small_retired_gc_slab(&mgr).await;
 	let cluster = control_cluster_observing(&[(1, &mgr)]).await;
 	let committer = op_committer(&cluster, 1);
@@ -51769,7 +52368,7 @@ async fn dc157_ring_fixture(
 	SlabId,
 	TieredSlabPointer,
 ) {
-	let (dirs, mgr, l2) = fresh_manager_with_l2(label).await;
+	let (dirs, mgr, l2) = fresh_manager_with_l2_serving(label, FIXTURE_NODE).await;
 	let (slab_id, _key) = seed_small_retired_gc_slab(&mgr).await;
 	let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
 	let encrypted = mgr.encrypt_tiered_object_blob(slab_id, &raw).unwrap();
@@ -52488,7 +53087,8 @@ async fn a_reopen_past_the_run_drop_keeps_its_explicit_fence() {
 /// refusals have a positive control at the same boundary.
 #[tokio::test]
 async fn a_disjoint_tier_refresh_proceeds_at_the_disposal_boundary() {
-	let (_dirs, manager, l2) = fresh_manager_with_l2("gc-disjoint-entry").await;
+	let (_dirs, manager, l2) =
+		fresh_manager_with_l2_serving("gc-disjoint-entry", FIXTURE_NODE).await;
 	let (gc_slab, _gc_key) = seed_small_retired_gc_slab(&manager).await;
 	let tier_key = id(0xdd71);
 	manager
@@ -53142,7 +53742,7 @@ async fn a_purge_refuses_a_quarantine_entry_that_is_not_the_recorded_file() {
 /// grants nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_rejected_claim_handoff_reads_its_authority_canonically_before_any_fence() {
-	let (dirs, mgr, l2) = fresh_manager_with_l2("t1-claim-lag").await;
+	let (dirs, mgr, l2) = fresh_manager_with_l2_serving("t1-claim-lag", FIXTURE_NODE).await;
 	let (slab_id, _key) = seed_small_retired_gc_slab(&mgr).await;
 	let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
 	let encrypted = mgr.encrypt_tiered_object_blob(slab_id, &raw).unwrap();
@@ -53853,6 +54453,8 @@ async fn a_close_during_disposal_fails_closed_and_the_reopen_is_fenced() {
 			SlabManager::initialize_new_store_with_owner(gc_owned_test_config(&dir), owner.clone())
 				.await
 				.unwrap();
+		// DC-251: this GC store serves node 1 before its seed names a compaction owner.
+		mgr.bind_control_node(FIXTURE_NODE).unwrap();
 		let (slab_id, _key) = seed_small_retired_gc_slab(&mgr).await;
 		let cluster = control_cluster_observing(&[(1, &mgr)]).await;
 		register_owner(&cluster.nodes[0], &mgr).await;
@@ -55185,6 +55787,8 @@ async fn a_marks_recovery_survives_the_reopen_that_resets_revisions() {
 		SlabManager::initialize_new_store_with_owner(gc_owned_test_config(&dir), owner.clone())
 			.await
 			.unwrap();
+	// DC-251: this GC store serves node 1 before its seed names a compaction owner.
+	mgr.bind_control_node(FIXTURE_NODE).unwrap();
 	let (slab_id, _key) = seed_small_retired_gc_slab(&mgr).await;
 	// A revision above zero, recorded in the intent the mark writes.
 	let lock = mgr.tier_publication_lock(slab_id);
@@ -55248,6 +55852,8 @@ async fn an_applied_marks_recovery_survives_the_reopen_that_resets_revisions() {
 		SlabManager::initialize_new_store_with_owner(gc_owned_test_config(&dir), owner.clone())
 			.await
 			.unwrap();
+	// DC-251: this GC store serves node 1 before its seed names a compaction owner.
+	mgr.bind_control_node(FIXTURE_NODE).unwrap();
 	let (slab_id, _key) = seed_small_retired_gc_slab(&mgr).await;
 	let lock = mgr.tier_publication_lock(slab_id);
 	{
@@ -55563,6 +56169,8 @@ async fn reopen_gc_at(stop: GcStop) -> ReopenedGc {
 		SlabManager::initialize_new_store_with_owner(gc_owned_test_config(&dir), owner.clone())
 			.await
 			.unwrap();
+	// DC-251: this GC store serves node 1 before its seed names a compaction owner.
+	mgr.bind_control_node(FIXTURE_NODE).unwrap();
 	let (slab_id, _key) = seed_small_retired_gc_slab(&mgr).await;
 	let cluster = control_cluster_observing(&[(1, &mgr)]).await;
 	register_owner(&cluster.nodes[0], &mgr).await;
@@ -56162,6 +56770,8 @@ async fn a_recovery_pass_leaves_a_live_sweeps_removal_alone() {
 		SlabManager::initialize_new_store_with_owner(gc_owned_test_config(&dir), owner.clone())
 			.await
 			.unwrap();
+	// DC-251: this GC store serves node 1 before its seed names a compaction owner.
+	mgr.bind_control_node(FIXTURE_NODE).unwrap();
 	let (slab_id, _key) = seed_small_retired_gc_slab(&mgr).await;
 	let cluster = control_cluster_observing(&[(1, &mgr)]).await;
 	register_owner(&cluster.nodes[0], &mgr).await;
@@ -56340,6 +56950,8 @@ async fn a_retired_run_is_collected_after_a_reopen() {
 		SlabManager::initialize_new_store_with_owner(gc_owned_test_config(&dir), owner.clone())
 			.await
 			.unwrap();
+	// DC-251: this GC store serves node 1 before its seed names a compaction owner.
+	mgr.bind_control_node(FIXTURE_NODE).unwrap();
 	let (slab_id, key) = seed_small_retired_gc_slab(&mgr).await;
 	let cluster = control_cluster_observing(&[(1, &mgr)]).await;
 	register_owner(&cluster.nodes[0], &mgr).await;
@@ -56363,6 +56975,8 @@ async fn a_mark_recovered_across_a_reopen_goes_on_to_collect_its_run() {
 		SlabManager::initialize_new_store_with_owner(gc_owned_test_config(&dir), owner.clone())
 			.await
 			.unwrap();
+	// DC-251: this GC store serves node 1 before its seed names a compaction owner.
+	mgr.bind_control_node(FIXTURE_NODE).unwrap();
 	let (slab_id, key) = seed_small_retired_gc_slab(&mgr).await;
 	let cluster = control_cluster_observing(&[(1, &mgr)]).await;
 	register_owner(&cluster.nodes[0], &mgr).await;
@@ -56534,6 +57148,8 @@ async fn a_gc_killed_at_each_boundary_resumes_on_a_ring_that_outlived_it() {
 			SlabManager::initialize_new_store_with_owner(gc_owned_test_config(&dir), owner)
 				.await
 				.unwrap();
+		// DC-251: this GC store serves node 1 before its seed names a compaction owner.
+		manager.bind_control_node(FIXTURE_NODE).unwrap();
 		manager.bind_control_node(1).unwrap();
 		let (slab_id, _) = seed_small_retired_gc_slab(&manager).await;
 		write_ring_file(&dir.join("gc-target"), slab_id.get().to_string().as_bytes());
@@ -56816,6 +57432,8 @@ async fn a_recovery_pass_leaves_a_live_sweep_past_its_run_drop() {
 		SlabManager::initialize_new_store_with_owner(gc_owned_test_config(&dir), owner.clone())
 			.await
 			.unwrap();
+	// DC-251: this GC store serves node 1 before its seed names a compaction owner.
+	mgr.bind_control_node(FIXTURE_NODE).unwrap();
 	let (slab_id, _key) = seed_small_retired_gc_slab(&mgr).await;
 	let cluster = control_cluster_observing(&[(1, &mgr)]).await;
 	register_owner(&cluster.nodes[0], &mgr).await;
@@ -57128,6 +57746,8 @@ async fn a_stale_intent_is_refused_before_a_marks_postimage() {
 		SlabManager::initialize_new_store_with_owner(gc_owned_test_config(&dir), owner.clone())
 			.await
 			.unwrap();
+	// DC-251: this GC store serves node 1 before its seed names a compaction owner.
+	mgr.bind_control_node(FIXTURE_NODE).unwrap();
 	let (slab_id, _key) = seed_small_retired_gc_slab(&mgr).await;
 	let cluster = control_cluster_observing(&[(1, &mgr)]).await;
 	register_owner(&cluster.nodes[0], &mgr).await;
@@ -57464,6 +58084,8 @@ async fn resolving_the_last_intent_finishes_what_its_open_deferred() {
 		SlabManager::initialize_new_store_with_owner(gc_owned_test_config(&dir), owner.clone())
 			.await
 			.unwrap();
+	// DC-251: this GC store serves node 1 before its seed names a compaction owner.
+	mgr.bind_control_node(FIXTURE_NODE).unwrap();
 	let (slab_id, _key) = seed_small_retired_gc_slab(&mgr).await;
 	let cluster = control_cluster_observing(&[(1, &mgr)]).await;
 	register_owner(&cluster.nodes[0], &mgr).await;
@@ -57806,12 +58428,14 @@ async fn assert_memory_matches_a_fresh_open(
 	label: impl std::fmt::Debug,
 ) {
 	let recovered = memory_picture(&mgr).await;
+	let node = served_node(&mgr);
 	let _ = owner.close(Duration::from_secs(5)).await;
 	drop(mgr);
 	let next = DataDirectoryOwner::acquire_existing(dir).expect("released");
 	let fresh = SlabManager::open_with_owner(gc_owned_test_config(dir), next.clone())
 		.await
 		.unwrap();
+	let fresh = serving_again(fresh, node);
 	for ((name, recovered), (_, fresh)) in recovered.into_iter().zip(memory_picture(&fresh).await) {
 		assert_eq!(
 			recovered, fresh,
@@ -58680,6 +59304,8 @@ async fn a_recovered_gc_finishes_its_deferred_open_and_restores_an_unmirrored_re
 		SlabManager::initialize_new_store_with_owner(gc_owned_test_config(&dir), owner.clone())
 			.await
 			.unwrap();
+	// DC-251: this GC store serves node 1 before its seed names a compaction owner.
+	mgr.bind_control_node(FIXTURE_NODE).unwrap();
 	let (slab_id, _key) = seed_small_retired_gc_slab(&mgr).await;
 	let cluster = control_cluster_observing(&[(1, &mgr)]).await;
 	register_owner(&cluster.nodes[0], &mgr).await;
@@ -58904,7 +59530,7 @@ async fn a_location_a_durable_row_names_survives_a_deferred_open() {
 /// The producer's half: a swap is refused before any durable intent or submission.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_sidecar_swap_is_refused_before_its_intent_or_submission() {
-	let (_dir, manager) = fresh_manager().await;
+	let (_dir, manager) = fresh_manager_serving(FIXTURE_NODE).await;
 	manager
 		.append_durable(tenant(), id(0x5c01), hlc(1), b"swap")
 		.await
@@ -59236,7 +59862,7 @@ async fn reopen_tier_op(
 		let (dirs, mgr, l2, _target, _schemas, old) = unpublished_drop_fixture().await;
 		(dirs, mgr, l2, old)
 	} else {
-		let (dirs, mgr, l2) = fresh_manager_with_l2("s5-tier-op").await;
+		let (dirs, mgr, l2) = fresh_manager_with_l2_serving("s5-tier-op", FIXTURE_NODE).await;
 		let (slab_id, _key) = seed_small_retired_gc_slab(&mgr).await;
 		let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
 		let encrypted = mgr.encrypt_tiered_object_blob(slab_id, &raw).unwrap();
@@ -63983,6 +64609,7 @@ async fn a_store_of_the_previous_op_state_version_refuses_to_open_and_is_left_in
 	let mgr = SlabManager::open_with_owner(gc_owned_test_config(&dir), next.clone())
 		.await
 		.expect("the current version opens");
+	mgr.bind_control_node(FIXTURE_NODE).unwrap();
 	assert_eq!(
 		mgr.require_op_index()
 			.unwrap()
@@ -64901,6 +65528,7 @@ async fn a_certified_tier_allocation_outside_parent_decisions_mode_is_refused_ty
 		SlabManager::initialize_new_store_with_owner(gc_owned_test_config(&dir), owner.clone())
 			.await
 			.unwrap();
+	mgr.bind_control_node(FIXTURE_NODE).unwrap();
 	assert_eq!(mgr.certified_tier_cleanup_fenced(), None);
 	let (work, evidence) = certified_tier_job(&mgr, 0x7704, 0);
 	let error = mgr
@@ -64957,6 +65585,7 @@ async fn each_tier_certificate_orphan_fences_certified_cleanup_at_a_real_reopen(
 			SlabManager::initialize_new_store_with_owner(gc_owned_test_config(&dir), owner.clone())
 				.await
 				.unwrap();
+		mgr.bind_control_node(FIXTURE_NODE).unwrap();
 		mgr.contain_version_reclamation();
 		let key = id(0x0704);
 		mgr.append_durable(tenant(), key, hlc(1), b"before")
@@ -65030,6 +65659,7 @@ async fn each_tier_certificate_orphan_fences_certified_cleanup_at_a_real_reopen(
 			let mgr = SlabManager::open_with_owner(gc_owned_test_config(&dir), next.clone())
 				.await
 				.unwrap_or_else(|error| panic!("{shape}: the store opens: {error}"));
+			mgr.bind_control_node(FIXTURE_NODE).unwrap();
 			mgr.contain_version_reclamation();
 			(next, mgr)
 		};
@@ -66798,7 +67428,8 @@ async fn a_snapshot_install_removing_a_held_slab_without_certified_retirement_is
 	use crate::consensus::WendelonStateMachine;
 	use openraft::storage::RaftStateMachine;
 	use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
-	let (_dirs, manager, l2) = fresh_manager_with_l2("certified-snapshot-none").await;
+	let (_dirs, manager, l2) =
+		fresh_manager_with_l2_serving("certified-snapshot-none", FIXTURE_NODE).await;
 	manager.contain_version_reclamation();
 	let key = id(0x7601);
 	manager
@@ -66879,7 +67510,8 @@ async fn the_no_source_fallback_refuses_certified_work_and_installs_nothing() {
 		CertifiedTierAllocation, CertifiedTierWork, TierSelectionEvidence,
 	};
 	use crate::storage::manager::certified_delivery::is_certified_work_without_source;
-	let (_dirs, manager, l2) = fresh_manager_with_l2("certified-no-source").await;
+	let (_dirs, manager, l2) =
+		fresh_manager_with_l2_serving("certified-no-source", FIXTURE_NODE).await;
 	manager.contain_version_reclamation();
 	manager
 		.append_durable(tenant(), id(0x7701), hlc(10), b"certified")
