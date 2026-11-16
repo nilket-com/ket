@@ -566,6 +566,14 @@ async fn a_replacement_admits_its_store_binds_its_key_and_stays_control_only() {
 	let old_disk = crate::test_support::TestDir::new("promotion-old-disk");
 	copy_dir(&cfg.data_dir, &old_disk.to_path_buf());
 	lose_disk(&cfg.data_dir);
+	// DC-258: since ADR 0106 a prepared replacement hands its store's index to its
+	// recovery, whose restricted storage needs the cluster's root; the replacement is given
+	// it, as the recovery fixtures do.
+	crate::crypto::test_support::enroll_root_artifact(
+		&cluster.configs[&NODES[0]].data_dir,
+		&cfg.data_dir,
+	)
+	.unwrap();
 	let (old_incarnation, _) = slot_store(
 		&cluster,
 		lost,
@@ -667,8 +675,9 @@ async fn a_replacement_admits_its_store_binds_its_key_and_stays_control_only() {
 	assert_eq!(control.store_incarnation(false).await.unwrap(), j);
 	assert_eq!(slot_store(&cluster, lost, j).await, (Some(j), None));
 
-	// Bound with the slot's configured key; preparation then ends.
-	halt_for_test(&cfg.data_dir, None);
+	// Bound with the slot's configured key; preparation then ends. Its recovery may open
+	// its restricted storage (taking the store's index) but takes no later step here.
+	halt_for_test(&cfg.data_dir, Some(Stage::Recover));
 	let (secret, _) = crate::node::identity::resolve_decision_keys(&cfg).unwrap();
 	let key = ed25519_dalek::SigningKey::from_bytes(&secret)
 		.verifying_key()
@@ -683,8 +692,23 @@ async fn a_replacement_admits_its_store_binds_its_key_and_stays_control_only() {
 	control.shutdown().await.unwrap();
 	let control = start().await.unwrap();
 	assert_eq!(control.identity.role, Role::ControlOnly);
-	assert_eq!(control.store_incarnation(false).await.unwrap(), j);
+	// DC-258: once prepared, the store's index belongs to the recovery, never again to the
+	// preparation: J is read from the recovery storage's own persistent index, once this
+	// lifetime has opened it (bounded).
+	let recovery = tokio::time::timeout(BOUND, control.recovery_storage())
+		.await
+		.expect("the recovery storage within its bound")
+		.unwrap();
+	assert_eq!(
+		recovery
+			.persistent_index()
+			.expect("the recovery storage's index")
+			.store_incarnation(),
+		j
+	);
+	drop(recovery);
 	control.shutdown().await.unwrap();
+	halt_for_test(&cfg.data_dir, None);
 	assert!(
 		WendelonNode::bootstrap_with_provider(cfg.clone(), provider(&cluster, lost))
 			.await
