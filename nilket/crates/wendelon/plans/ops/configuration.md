@@ -289,5 +289,18 @@ Restart=on-failure
   - `nilket local` runs one node, not a ParentDecisions cluster. It is not a
     supervisor for a replacement: it treats any Wendelon exit as unexpected and
     stops.
-  - Tested: the workflow test starts the process again on 75, as the supervisor
-    would. A service manager's restart wiring is not tested.
+  - The handoff's store close leaves no clean-shutdown record on purpose: the
+    control-only run performs none of a full start's recovery validation. The
+    first full start therefore logs "recovering after unclean shutdown" and
+    completes that validation before it reports ready; this is expected. Its later
+    orderly close may write the clean-shutdown record only after its recovery
+    obligations are discharged and while clean-record eligibility remains valid.
+    The control-only close's "recovery did not complete during this run" warning
+    is expected too.
+  - Tested: the workflow tests start the process again on 75, as the supervisor
+    would. One run under the user's systemd with the unit above showed exit 75
+    followed by systemd's own restart into the full member, which then answered
+    exactly the acknowledged rows; an explicit `systemctl stop` ending with status
+    0 was not followed by a restart within a sampled 2 s hold. Not tested: an
+    explicit stop ending with a nonzero status, a stop during the handoff, the
+    start rate limit, a system (not user) service manager, more than one host.
