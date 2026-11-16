@@ -114,6 +114,17 @@ pub struct Replacement {
 	pub phase: ReplacementPhase,
 	/// ADR 0105 (wendelon): the one promotion this Done replacement made.
 	pub promoted: Option<Promotion>,
+	/// ADR 0106 (wendelon): the one recovery statement recorded for it.
+	pub recovered: Option<Recovery>,
+}
+
+/// ADR 0106 (wendelon): a promoted store's recorded recovery: the certificate
+/// (gid, digest; none at genesis) its base matched and its applied cut.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Recovery {
+	pub gid: u64,
+	pub target_digest: Option<[u8; 32]>,
+	pub k: u64,
 }
 
 /// ADR 0105 (wendelon): a replacement's new store `incarnation`, admitted as
@@ -211,6 +222,12 @@ impl InstanceState {
 			None => Ok(None),
 			Some(recorded) if recorded == asked => Ok(Some(recorded)),
 			Some(_) => Err(PromotionConflict),
+		}
+	}
+
+	pub(crate) fn record_recovery(&mut self, token: u128, recovery: Recovery) {
+		if let Some(replacement) = self.replacements.get_mut(&token) {
+			replacement.recovered = Some(recovery);
 		}
 	}
 
@@ -436,6 +453,7 @@ pub(super) fn begin_replacement(
 		pre_voters,
 		phase: ReplacementPhase::Begun,
 		promoted: None,
+		recovered: None,
 	};
 	let result = recorded(&replacement);
 	decisions.instances.replacements.insert(token, replacement);

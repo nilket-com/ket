@@ -5265,6 +5265,90 @@ const OLD_INSTANCE_RUN: Duration = Duration::from_secs(5);
 /// its key bound. The promotion waits for the lost slot's lineages to move by takeover (lease
 /// expiry, then a staggered takeover), so this bound is larger than one lease.
 const PREPARED_BOUND: Duration = Duration::from_secs(120);
+/// Wendelon ADR 0106: from the preparation's end until the status shows its recovery
+/// recorded (the base and owed children copied from the survivors and validated).
+const RECOVERED_BOUND: Duration = Duration::from_secs(120);
+/// Wendelon ADR 0106: one stop and one stopped-store read of the replacement.
+const INSPECTION_BOUND: Duration = Duration::from_secs(60);
+/// Wendelon ADR 0106: the declared wait, with the restarted replacement running, before its
+/// delta is read.
+const DELTA_WAIT: Duration = Duration::from_secs(30);
+
+/// Wendelon ADR 0106: reads the stopped replacement's store once, within `by` (checked before
+/// the result is accepted). On a timeout the read is left to finish and close on its own; it is
+/// never cancelled inside an open.
+async fn inspect_recovered(
+	config: &Path,
+	descriptor: &TableSchemaDescriptor,
+	by: Instant,
+) -> wendelon::node::RecoveredRowsForTest {
+	let config = config.to_path_buf();
+	let descriptor = descriptor.clone();
+	let mut read =
+		tokio::spawn(
+			async move { wendelon::node::recovered_rows_for_test(&config, &descriptor).await },
+		);
+	match tokio::time::timeout(by.saturating_duration_since(Instant::now()), &mut read).await {
+		Ok(joined) => {
+			let found = joined
+				.expect("the stopped-store read")
+				.unwrap_or_else(|error| panic!("the stopped store could not be read: {error}"));
+			assert!(
+				Instant::now() <= by,
+				"the stopped store was read after its bound"
+			);
+			found
+		}
+		Err(_) => panic!("the stopped store was not read within its bound"),
+	}
+}
+
+/// Wendelon ADR 0106: the stopped replacement's saved statement is exactly the recorded one,
+/// every Complete child verifies from its stored rows, and the rows read from the slab are
+/// exactly `expected`, one copy each.
+fn expect_recovered(
+	found: &wendelon::node::RecoveredRowsForTest,
+	(token, store, recovered): (u128, u128, (u64, u64)),
+	expected: &[(i64, String)],
+	what: &str,
+) {
+	assert_eq!(
+		found.saved,
+		Some((token, FIRST_ALLOCATED, store, recovered.0, recovered.1)),
+		"{what}: the statement saved on its store is the recorded one"
+	);
+	assert!(
+		found.unverified.is_empty(),
+		"{what}: children fail the stored-row verification: {:?}",
+		found.unverified
+	);
+	let mut held = Vec::new();
+	for batch in &found.rows {
+		let ids = batch
+			.column_by_name("id")
+			.and_then(|column| column.as_any().downcast_ref::<Int64Array>())
+			.expect("an id column");
+		let names = batch
+			.column_by_name("name")
+			.and_then(|column| column.as_any().downcast_ref::<LargeStringArray>())
+			.expect("a name column");
+		for row in 0..batch.num_rows() {
+			held.push((ids.value(row), names.value(row).to_owned()));
+		}
+	}
+	held.sort();
+	let mut wanted = expected.to_vec();
+	wanted.sort();
+	assert_eq!(
+		held, wanted,
+		"{what}: the rows read from the replacement's slab"
+	);
+	eprintln!(
+		"smoke: {what}: {} Complete children verified; {} rows read from the slab exactly",
+		found.complete_children,
+		held.len()
+	);
+}
 /// One routed Raft probe's bound: dial, request and answer.
 const PROBE_BOUND: Duration = Duration::from_secs(10);
 /// The first allocated Raft instance: the one a cluster's first replacement is granted.
@@ -5290,6 +5374,8 @@ struct Reported {
 	promoted: Option<u128>,
 	/// Wendelon ADR 0105: the decision key bound to that store, printed only after it.
 	bound_key: Option<[u8; 32]>,
+	/// Wendelon ADR 0106: the recorded recovery's (gid, cut), printed only after the key.
+	recovered: Option<(u64, u64)>,
 }
 
 /// A decimal number of digits only.
@@ -5311,6 +5397,13 @@ fn parse_report(line: &str) -> Option<Reported> {
 	let (token, rest) = rest.split_once(": slot ")?;
 	let (slot, rest) = rest.split_once(" replacing instance ")?;
 	let (r_old, phase) = rest.split_once(": ")?;
+	let (phase, recovered) = match phase.split_once("; recovered gid ") {
+		Some((phase, rest)) => {
+			let (gid, k) = rest.split_once(" through ")?;
+			(phase, Some((count(gid)?, count(k)?)))
+		}
+		None => (phase, None),
+	};
 	let (phase, promoted, bound_key) = match phase.split_once("; promoted store ") {
 		Some((phase, rest)) => match rest.split_once("; bound key ") {
 			Some((store, key)) => (phase, Some(token_of(store)?), Some(key_of(key)?)),
@@ -5318,6 +5411,9 @@ fn parse_report(line: &str) -> Option<Reported> {
 		},
 		None => (phase, None, None),
 	};
+	if recovered.is_some() && bound_key.is_none() {
+		return None;
+	}
 	let phase = match phase.split_once(' ') {
 		None if phase == "begun" && promoted.is_none() => ReportedPhase::Begun,
 		Some(("reserved", instance)) if promoted.is_none() => {
@@ -5333,7 +5429,15 @@ fn parse_report(line: &str) -> Option<Reported> {
 		phase,
 		promoted,
 		bound_key,
+		recovered,
 	})
+}
+
+/// A decimal count of digits only (u64).
+fn count(text: &str) -> Option<u64> {
+	(!text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit()))
+		.then(|| text.parse().ok())
+		.flatten()
 }
 
 /// Exactly 64 lowercase hex digits: a 32-byte key.
@@ -5374,6 +5478,7 @@ fn a_replacement_report_is_read_whole_or_not_at_all() {
 			phase,
 			promoted: None,
 			bound_key: None,
+			recovered: None,
 		})
 	};
 	assert_eq!(
@@ -5408,7 +5513,24 @@ fn a_replacement_report_is_read_whole_or_not_at_all() {
 			..reported(ReportedPhase::Done(FIRST_ALLOCATED)).unwrap()
 		})
 	);
+	assert_eq!(
+		parse_report(&report(&format!(
+			"done 2147483648; promoted store {store}; bound key {key}; recovered gid 2 through 41"
+		))),
+		Some(Reported {
+			promoted: Some(0x0105),
+			bound_key: Some([0xab; 32]),
+			recovered: Some((2, 41)),
+			..reported(ReportedPhase::Done(FIRST_ALLOCATED)).unwrap()
+		})
+	);
 	for refused in [
+		report(&format!(
+			"done 2147483648; promoted store {store}; recovered gid 2 through 41"
+		)),
+		report(&format!(
+			"done 2147483648; promoted store {store}; bound key {key}; recovered gid 2 through"
+		)),
 		report(&format!("done 2147483648; bound key {key}")),
 		report(&format!(
 			"done 2147483648; promoted store {store}; bound key {}",
@@ -5600,6 +5722,17 @@ async fn expect_at_survivors(
 ///   key compared with the one this test configured; the test binds nothing itself); stopped,
 ///   its store's vote page names the first allocated instance, control-only; restarted, the
 ///   status names the same store and key;
+/// - wendelon ADR 0106: enrolled under the cluster's root as a joiner is, the replacement
+///   recovers the slot's data from the survivors and the status reports its recovery
+///   recorded within `RECOVERED_BOUND`; after one declared `DELTA_WAIT` with the process
+///   running (writes accepted after the recorded cut are repaired as delta), stopped, its store
+///   (opened as its recovery opens it, under its own directory owner, read once within one
+///   absolute bound of `DELTA_WAIT + INSPECTION_BOUND`) saves exactly the
+///   recorded statement for this token, instance and store, every Complete child verifies from
+///   its stored rows, and the rows read from its slab are exactly the acknowledged ones;
+///   restarted, the status still reports it, and after one declared `DELTA_WAIT` with that
+///   process running, one stop and one read show the row written after the restart held the
+///   same way (the delta is repaired only after that start's validation);
 /// - the old instance comes back on its old disk at the slot's address while the replacement's
 ///   process is stopped in order, and must keep running (its process identity is read). A
 ///   survivor sends it authenticated, correctly formed Raft votes as itself, each bounded and
@@ -5704,6 +5837,10 @@ async fn three_daemons_replace_a_lost_follower_with_a_control_only_instance() {
 	);
 	std::fs::rename(&data, node_dir.join("blank-start-data")).unwrap();
 	std::fs::create_dir(&data).unwrap();
+	// Wendelon ADR 0106: the replacement is enrolled under the cluster's root as a joiner
+	// is (ADR 0726), so it can recover the slot's data.
+	std::fs::create_dir_all(data.join(".wendelon")).unwrap();
+	write_private(&data.join(&sealed_root), &sealed);
 
 	// The operator opens the replacement through a survivor and provisions its token.
 	let connection = operator_connection(survivors[0], &pki);
@@ -5731,6 +5868,7 @@ async fn three_daemons_replace_a_lost_follower_with_a_control_only_instance() {
 			phase: ReportedPhase::Begun,
 			promoted: None,
 			bound_key: None,
+			recovered: None,
 		}),
 		"replace begin: {}",
 		began.text()
@@ -5846,11 +5984,67 @@ async fn three_daemons_replace_a_lost_follower_with_a_control_only_instance() {
 		 done ({reads} status reads)",
 		prepared_from.elapsed()
 	);
-	daemons.stop(lost.id, deadline);
+	// Wendelon ADR 0106: the replacement recovers the slot's data and its recovery is
+	// recorded, read from the operator's status.
+	let recovered_from = Instant::now();
+	let recovered_by = deadline.min(recovered_from + RECOVERED_BOUND);
+	let mut reads = 0_u32;
+	let recovered = loop {
+		reads += 1;
+		let reported = replacement_report(
+			&format!("replace-recovered-{reads}"),
+			token,
+			lost.id,
+			&connection,
+			recovered_by,
+		);
+		if let Some(Reported {
+			recovered: Some(recovered),
+			..
+		}) = reported
+		{
+			break recovered;
+		}
+		if let Some(why) = daemons.exited() {
+			panic!("before the recovery was recorded: {why}");
+		}
+		assert!(
+			Instant::now() < recovered_by,
+			"the recovery was not recorded within {RECOVERED_BOUND:?} ({reads} status reads, \
+			 last {reported:?})"
+		);
+		tokio::time::sleep(Duration::from_secs(1)).await;
+	};
+	eprintln!(
+		"smoke: replacement recorded its recovery {recovered:?}, polled {:?} ({reads} status reads)",
+		recovered_from.elapsed()
+	);
+	// The record promises its cut K, not every acknowledged write: a write accepted after K is a
+	// delta child, repaired after the record (owning run pd-replace-20261116T030142Z: row 8 at
+	// dec 178 > K 147). One predeclared uninterrupted `DELTA_WAIT` with the process running,
+	// then one stop and one read within one absolute bound, requiring every acknowledged row.
+	let observe_by = deadline.min(Instant::now() + DELTA_WAIT + INSPECTION_BOUND);
+	tokio::time::sleep(DELTA_WAIT).await;
+	if let Some(why) = daemons.exited() {
+		panic!("before the recovered replacement's store was read: {why}");
+	}
+	daemons.stop(lost.id, observe_by);
 	assert_eq!(
 		wendelon::consensus::stored_raft_role_for_test(&data).unwrap(),
 		Some((FIRST_ALLOCATED, true)),
 		"the replacement's store is control-only on disk after its preparation"
+	);
+	// Stopped, its store is opened as its recovery opens it (its configuration, under its own
+	// directory owner) and read once within its bound: the statement saved is the recorded one
+	// for exactly this token, instance and store; every Complete child passes the stored-row
+	// verification (owner, physical copy and content digest of each version); and the rows read
+	// from the slab are exactly the acknowledged ones, one copy each.
+	let found = inspect_recovered(&lost.config, &descriptor, observe_by).await;
+	expect_recovered(
+		&found,
+		(token, store, recovered),
+		&expected,
+		"after the record and one declared wait",
 	);
 	daemons.start(lost);
 	tokio::time::sleep(Duration::from_secs(2)).await;
@@ -5866,18 +6060,52 @@ async fn three_daemons_replace_a_lost_follower_with_a_control_only_instance() {
 	)
 	.expect("a status after the restart");
 	assert_eq!(
-		(restarted.phase, restarted.promoted, restarted.bound_key),
+		(
+			restarted.phase,
+			restarted.promoted,
+			restarted.bound_key,
+			restarted.recovered
+		),
 		(
 			ReportedPhase::Done(FIRST_ALLOCATED),
 			Some(store),
-			Some(configured)
+			Some(configured),
+			Some(recovered)
 		),
 		"the same store and key after the restart"
 	);
+	// A write after the restart is repaired by this restarted process only once its stored data
+	// is validated again (a store that fails validation stops recovering). One declared wait
+	// with that single process running, then one stop and one stopped-store read, all within
+	// one absolute bound checked before the result is accepted: its row must be held. The
+	// process is not restarted to help it.
+	commit_offering_again(
+		&through,
+		&descriptor,
+		11,
+		"restarted",
+		lost.id,
+		"after the restart",
+	)
+	.await;
+	// Id 11: the steps below write 9 ("old-back") and 10, so this row never collides.
+	expected.push((11, "restarted".to_owned()));
+	let observe_by = deadline.min(Instant::now() + DELTA_WAIT + INSPECTION_BOUND);
+	tokio::time::sleep(DELTA_WAIT).await;
+	if let Some(why) = daemons.exited() {
+		panic!("before the restarted replacement's delta was read: {why}");
+	}
+	daemons.stop(lost.id, observe_by);
+	let found = inspect_recovered(&lost.config, &descriptor, observe_by).await;
+	expect_recovered(
+		&found,
+		(token, store, recovered),
+		&expected,
+		"the row written after the restart, held by the restarted process",
+	);
 
 	// The old instance returns on its old disk at the slot's address: the replacement's
-	// process stops in order, and the same configuration but for its data directory starts.
-	daemons.stop(lost.id, deadline);
+	// process is stopped in order, and the same configuration but for its data directory starts.
 	let text = std::fs::read_to_string(&lost.config).unwrap();
 	assert_eq!(text.matches("data_dir = \"data\"\n").count(), 1);
 	let old = Member {

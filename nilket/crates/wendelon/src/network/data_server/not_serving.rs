@@ -14,6 +14,7 @@
 //! | `TABLE_QUERY_REQ` | `TABLE_QUERY_RESP` (stream end): `NOT_LEADER`, no hint, no rows |
 //! | `TABLE_CHILD_WRITE_REQ`, `TABLE_CHILD_REPLICATE_REQ` | their response: `ChildWriteResponse::Refused`, no acknowledgement |
 //! | `TABLE_CHILD_FETCH_REQ` | `TABLE_CHILD_FETCH_RESP`: `ChildFetchResponse::Refused`, no rows |
+//! | `TABLE_BASE_FETCH_REQ` | `TABLE_BASE_FETCH_RESP`: `Refused(NotReady)`, no entries or rows (ADR 0106) |
 //! | `PENDING_WITNESS_REQ` | `PENDING_WITNESS_RESP`: `INTERNAL_ERROR`, no witnesses (never `OK` with none: it holds no inventory to establish absence) |
 //! | anything else, or a malformed request | an error: the stream ends unanswered, as before |
 //!
@@ -111,6 +112,14 @@ impl NotServing {
 				let body = postcard::to_stdvec(&ChildFetchResponse::Refused(NOT_SERVING.into()))
 					.map_err(Error::other)?;
 				Ok(self.frame(MsgType::TABLE_CHILD_FETCH_RESP, stream_id, &body, 0))
+			}
+			MsgType::TABLE_BASE_FETCH_REQ => {
+				context.require_authenticated_node("TABLE_BASE_FETCH_REQ")?;
+				let body = postcard::to_stdvec(&super::base_fetch::BaseFetchAnswer::Refused(
+					super::base_fetch::BaseFetchRefusal::NotReady,
+				))
+				.map_err(Error::other)?;
+				Ok(self.frame(MsgType::TABLE_BASE_FETCH_RESP, stream_id, &body, 0))
 			}
 			MsgType::PENDING_WITNESS_REQ => {
 				let _: PendingWitnessPullRequestMeta = fixed(frame, "PENDING_WITNESS_REQ")?;

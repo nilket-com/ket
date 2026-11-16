@@ -99,6 +99,12 @@ fn report(token: u128, replacement: &ReplacementReportWire) -> String {
 		.promoted
 		.map(|store| format!("; promoted store {:032x}", store.get()))
 		.unwrap_or_default();
+	// ADR 0106 (wendelon): the recorded recovery, once there is one.
+	let recovered = replacement
+		.recovered
+		.filter(|_| replacement.bound_key.is_some())
+		.map(|(gid, k)| format!("; recovered gid {gid} through {k}"))
+		.unwrap_or_default();
 	let bound = replacement
 		.bound_key
 		.filter(|_| replacement.promoted.is_some())
@@ -108,7 +114,7 @@ fn report(token: u128, replacement: &ReplacementReportWire) -> String {
 		})
 		.unwrap_or_default();
 	format!(
-		"replacement {token:032x}: slot {} replacing instance {}: {phase}{promoted}{bound}",
+		"replacement {token:032x}: slot {} replacing instance {}: {phase}{promoted}{bound}{recovered}",
 		replacement.slot, replacement.r_old
 	)
 }
@@ -478,6 +484,7 @@ mod tests {
 							phase: ReplacementPhase::Begun,
 							promoted: None,
 							bound_key: None,
+							recovered: None,
 						},
 					))
 				}
@@ -708,6 +715,7 @@ mod tests {
 					phase,
 					promoted: None,
 					bound_key: None,
+					recovered: None,
 				},
 			)
 		};
@@ -731,6 +739,7 @@ mod tests {
 					phase: ReplacementPhase::Done { r_new: 1 << 31 },
 					promoted: Some(crate::consensus::StoreIncarnation::from_raw(0x0105)),
 					bound_key: None,
+					recovered: None,
 				},
 			),
 			format!("{prefix}done 2147483648; promoted store 00000000000000000000000000000105")
@@ -764,6 +773,7 @@ mod tests {
 				},
 				promoted: Some(crate::consensus::StoreIncarnation::from_raw(0x0105)),
 				bound_key: None,
+				recovered: None,
 			}),
 		};
 		let mut answer = plain.clone();

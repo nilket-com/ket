@@ -15,7 +15,7 @@ use crate::consensus::decisions::{DecisionCommand, DecisionResult};
 const TOKEN: u128 = 0x0104_0104_0104_0104;
 const TICK: std::time::Duration = std::time::Duration::from_millis(100);
 
-async fn decide(cluster: &Cluster, command: DecisionCommand) -> DecisionResult {
+pub(super) async fn decide(cluster: &Cluster, command: DecisionCommand) -> DecisionResult {
 	let leader = cluster.leader().await;
 	match cluster
 		.node(leader)
@@ -674,9 +674,7 @@ async fn a_replacement_admits_its_store_binds_its_key_and_stays_control_only() {
 		.verifying_key()
 		.to_bytes();
 	let deadline = tokio::time::Instant::now() + BOUND;
-	while slot_store(&cluster, lost, j).await != (Some(j), Some(key))
-		|| !control.preparation_ended()
-	{
+	while slot_store(&cluster, lost, j).await != (Some(j), Some(key)) || !control.prepared() {
 		assert!(tokio::time::Instant::now() < deadline, "never bound");
 		tokio::time::sleep(TICK).await;
 	}
@@ -1089,6 +1087,976 @@ async fn a_control_only_member_refuses_each_data_request_in_its_own_answer() {
 	assert_eq!(control.identity.role, Role::ControlOnly);
 	control.shutdown().await.unwrap();
 	halt_for_test(&cfg.data_dir, None);
+	for node in std::mem::take(&mut cluster.nodes) {
+		let _ = tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown()).await;
+	}
+}
+
+/// ADR 0106 (wendelon) feasibility F2: a promoted control-only replacement,
+/// with the cluster's root enrolled, takes its store's index over from its
+/// preparation (one handle at a time) into a restricted slab manager under the
+/// owner it already holds; stores a real row and a typed tombstone durably at
+/// their exact identity and HLC; installs a recovered base at a generation
+/// whose predecessor is nonzero, published only when its entries hash to the
+/// certificate's chunks; and after a clean close and reopen the base is active
+/// at that generation and every entry passes `entry_is_stored`. It stays
+/// control-only throughout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_promoted_replacement_stores_and_reopens_a_recovered_base() {
+	use crate::schema::{HybridTimestamp, TenantId};
+	async fn step<T>(what: &str, work: impl std::future::Future<Output = T>) -> T {
+		eprintln!("F2 step begins: {what}");
+		tokio::time::timeout(std::time::Duration::from_secs(60), work)
+			.await
+			.unwrap_or_else(|_| panic!("F2 step hung: {what}"))
+	}
+	use crate::storage::index::certified_base::{
+		BaseEntry, InstallRefusal, StagedCandidate, chunk_sums,
+	};
+	let (mut cluster, leader, descriptor) = ready().await;
+	let lost = *NODES[1..].iter().find(|id| **id != leader).unwrap();
+	// A first write seals the placement; takeover (and so promotion, P1) needs
+	// it.
+	write_rows(&cluster, leader, &descriptor, &[(1, "a")]).await;
+	cluster.stop(lost, true).await;
+	let cfg = cluster.configs[&lost].clone();
+	lose_disk(&cfg.data_dir);
+	crate::crypto::test_support::enroll_root_artifact(
+		&cluster.configs[&NODES[0]].data_dir,
+		&cfg.data_dir,
+	)
+	.unwrap();
+	assert!(matches!(
+		decide(
+			&cluster,
+			DecisionCommand::BeginReplacement {
+				token: TOKEN,
+				slot: lost,
+			}
+		)
+		.await,
+		DecisionResult::ReplacementRecorded { .. }
+	));
+	crate::node::provision_replacement_token(&cfg.data_dir, TOKEN).unwrap();
+	// The storage opens, but no recovery step runs: this test writes the store
+	// itself.
+	crate::node::replacement_preparation::halt_for_test(
+		&cfg.data_dir,
+		Some(crate::node::replacement_preparation::Stage::Recover),
+	);
+	let start = || ControlOnlyNode::bootstrap_with_provider(cfg.clone(), provider(&cluster, lost));
+	let control = step("start", start()).await.unwrap();
+	let deadline = tokio::time::Instant::now() + BOUND;
+	while !control.prepared() {
+		if tokio::time::Instant::now() >= deadline {
+			let leader = cluster.leader().await;
+			let state = cluster.node(leader).state_machine.state_snapshot().await;
+			let decisions = state.decisions.as_ref().unwrap();
+			panic!(
+				"never prepared: phase {:?}; registry {:?}; lineages at the lost slot {}; index {}",
+				replacement_phase(&cluster).await,
+				state.incarnations.get(&lost),
+				decisions
+					.lineages()
+					.values()
+					.filter(|lineage| lineage.holder.id == lost)
+					.count(),
+				crate::storage::index::persistent_index_path(&cfg.data_dir).exists(),
+			);
+		}
+		tokio::time::sleep(TICK).await;
+	}
+	// The preparation hands its index over as soon as it is prepared: J is
+	// read from the applied registry.
+	let j = slot_store(
+		&cluster,
+		lost,
+		crate::consensus::StoreIncarnation::from_raw(0),
+	)
+	.await
+	.0
+	.expect("promoted");
+
+	// The preparation's handle is handed over; an interrupted hand-over is
+	// completed by the next one, and the restricted manager opens the same
+	// promoted store. The preparation never opens it again.
+	let _ = tokio::time::timeout(std::time::Duration::ZERO, control.recovery_storage()).await;
+	let slab = step("recovery storage", control.recovery_storage())
+		.await
+		.unwrap();
+	let refused = control.store_incarnation(false).await.unwrap_err();
+	assert!(
+		refused.to_string().contains("ReplacementStoreHandedOver"),
+		"{refused}"
+	);
+	assert_eq!(slab.owner_ref().unwrap().incarnation(), j);
+
+	// One row and one typed tombstone, durably, at their exact versions.
+	let tenant = TenantId::ZERO;
+	let row_hlc = HybridTimestamp {
+		physical_ms: 1_700_000_000_000,
+		logical: 1,
+		node_id: leader,
+	};
+	let rows = named_rows(&descriptor, &[(901, "recovered")]);
+	crate::network::data_server::child_writes::ingest_recovered_rows(
+		&slab,
+		tenant,
+		&descriptor,
+		&rows,
+		row_hlc,
+	)
+	.await
+	.unwrap();
+	let mut meta = write_meta(&descriptor, 1, uuid_v7());
+	meta.tenant_id = tenant;
+	let [row] = crate::network::data_server::child_writes::child_manifest(
+		&meta,
+		&rows,
+		&descriptor,
+		row_hlc,
+	)
+	.unwrap()[..] else {
+		panic!("one row");
+	};
+	let gone = crate::network::data_server::child_writes::child_manifest(
+		&meta,
+		&named_rows(&descriptor, &[(902, "gone")]),
+		&descriptor,
+		row_hlc,
+	)
+	.unwrap()[0];
+	let tomb_hlc = HybridTimestamp {
+		logical: 2,
+		..row_hlc
+	};
+	let delete = crate::consensus::decisions::DeleteRequest {
+		table: descriptor.table_object_id,
+		schema_generation: descriptor.schema_generation,
+		row: crate::schema::Identity::new(gone.key_identity),
+	};
+	crate::network::data_server::deletes::append_tombstone(
+		&slab,
+		tenant,
+		&descriptor,
+		&delete,
+		tomb_hlc,
+		&[],
+	)
+	.await
+	.unwrap();
+	let position = |key: [u8; 32]| {
+		crate::consensus::decisions::delete_row_position(
+			tenant,
+			&descriptor,
+			crate::schema::Identity::new(key),
+		)
+		.unwrap()
+	};
+	let entries = vec![
+		BaseEntry {
+			tenant,
+			table: descriptor.table_object_id,
+			key_identity: row.key_identity,
+			hlc: row_hlc,
+			row_digest: row.row_digest,
+			tombstone: false,
+			position: position(row.key_identity),
+		},
+		BaseEntry {
+			tenant,
+			table: descriptor.table_object_id,
+			key_identity: gone.key_identity,
+			hlc: tomb_hlc,
+			row_digest: [0; 32],
+			tombstone: true,
+			position: position(gone.key_identity),
+		},
+	];
+	let certificate = StagedCandidate {
+		gid: 5,
+		target_digest: [0x06; 32],
+		predecessor_gid: 4,
+		chunks: chunk_sums(&entries),
+	};
+	let index = slab.persistent_index().unwrap();
+	// Pages staged; a publication whose sums differ is refused and changes
+	// nothing; the matching one publishes at gid 5.
+	for entry in &entries {
+		assert_eq!(
+			index
+				.stage_recovered_page(certificate.clone(), vec![*entry])
+				.await
+				.unwrap(),
+			Ok(())
+		);
+	}
+	let wrong = StagedCandidate {
+		chunks: chunk_sums(&entries[..1]),
+		..certificate.clone()
+	};
+	assert_eq!(
+		index.publish_recovered(wrong).await.unwrap(),
+		Err(InstallRefusal::OtherCertificate)
+	);
+	assert_eq!(index.base_meta().await.unwrap().active_gid, 0);
+	assert_eq!(
+		index.publish_recovered(certificate.clone()).await.unwrap(),
+		Ok(())
+	);
+	assert_eq!(
+		index
+			.stage_recovered_page(certificate.clone(), entries.clone())
+			.await
+			.unwrap(),
+		Err(InstallRefusal::NotPristine),
+		"a published store installs nothing more"
+	);
+	drop(index);
+	drop(slab);
+	assert_eq!(control.identity.role, Role::ControlOnly);
+	step("shutdown", control.shutdown()).await.unwrap();
+
+	// A clean close, then a reopen: active at gid 5, every entry stored.
+	let control = step("start", start()).await.unwrap();
+	assert_eq!(control.identity.role, Role::ControlOnly);
+	let slab = step("recovery storage", control.recovery_storage())
+		.await
+		.unwrap();
+	let index = slab.persistent_index().unwrap();
+	let meta = index.base_meta().await.unwrap();
+	assert_eq!(
+		(meta.active_gid, &meta.active_chunks, meta.staged.is_none()),
+		(5, &certificate.chunks, true)
+	);
+	let mut stored = index.base_entries(false).await.unwrap();
+	stored.sort_by_key(|entry| entry.key_identity);
+	let mut wanted = entries.clone();
+	wanted.sort_by_key(|entry| entry.key_identity);
+	assert_eq!(stored, wanted);
+	for entry in &stored {
+		crate::network::data_server::certification::entry_is_stored(
+			&slab,
+			&control.state_machine,
+			entry,
+		)
+		.await
+		.unwrap_or_else(|why| panic!("{entry:?}: {why}"));
+	}
+	drop(index);
+	drop(slab);
+	step("shutdown", control.shutdown()).await.unwrap();
+	for node in std::mem::take(&mut cluster.nodes) {
+		let _ = tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown()).await;
+	}
+}
+
+/// ADR 0106 (wendelon) R3: a certified base that is empty at a nonzero gid
+/// (generation 1 commits after only a noop, before any row is written) is
+/// installed empty: the
+/// staging is bound to the certificate without receiving an entry, its sums are
+/// the empty ones, and it is published at gid 1. The write after it is owed as
+/// a child and repaired; the recovery is recorded for gid 1.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_promoted_replacement_installs_an_empty_certified_base() {
+	let (mut cluster, leader, descriptor) = ready().await;
+	let lost = *NODES[1..].iter().find(|id| **id != leader).unwrap();
+	let now = std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.unwrap()
+		.as_millis() as u64;
+	// A delete of a row never written is recorded as a noop: placement is
+	// sealed and lineages run, and no base entry exists.
+	let absent = super::delete_through(
+		&cluster,
+		leader,
+		super::delete_meta(&descriptor),
+		vec![
+			cluster
+				.node(leader)
+				.data_server
+				.row_identity_and_locality_for_test(
+					TenantId::ZERO,
+					&descriptor,
+					&named_rows(&descriptor, &[(99, "x")]),
+				)
+				.0,
+		],
+	)
+	.await;
+	assert_eq!(
+		absent.write.status,
+		crate::schema::WriteStatus::OK,
+		"{absent:?}"
+	);
+	let first = now + 60_000;
+	jump_floor(&cluster, first).await;
+	until_active(&cluster, 1).await;
+	let certificate = {
+		let state = cluster.node(leader).state_machine.state_snapshot().await;
+		state
+			.decisions
+			.unwrap()
+			.generations()
+			.current
+			.clone()
+			.unwrap()
+	};
+	let empty = crate::storage::index::certified_base::chunk_sums(std::iter::empty());
+	assert_eq!(
+		(certificate.gid, &certificate.chunks),
+		(1, &empty),
+		"generation 1 certifies an empty base"
+	);
+	// The first write seals the placement (promotion waits for it).
+	let meta = write_meta(&descriptor, 1, uuid_v7_at(first + 1));
+	assert_committed(
+		&write_through(&cluster, leader, meta, named_rows(&descriptor, &[(1, "a")])).await,
+		"a write",
+	);
+
+	cluster.stop(lost, true).await;
+	let cfg = cluster.configs[&lost].clone();
+	lose_disk(&cfg.data_dir);
+	crate::crypto::test_support::enroll_root_artifact(
+		&cluster.configs[&NODES[0]].data_dir,
+		&cfg.data_dir,
+	)
+	.unwrap();
+	assert!(matches!(
+		decide(
+			&cluster,
+			DecisionCommand::BeginReplacement {
+				token: TOKEN,
+				slot: lost,
+			}
+		)
+		.await,
+		DecisionResult::ReplacementRecorded { .. }
+	));
+	crate::node::provision_replacement_token(&cfg.data_dir, TOKEN).unwrap();
+	let control = ControlOnlyNode::bootstrap_with_provider(cfg.clone(), provider(&cluster, lost))
+		.await
+		.unwrap();
+	let deadline = tokio::time::Instant::now() + BOUND * 2;
+	let recorded = loop {
+		if let Some(recorded) = recovery_record(&cluster).await {
+			break recorded;
+		}
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"never recorded; prepared {}, preparation ended {}",
+			control.prepared(),
+			control.preparation_ended()
+		);
+		tokio::time::sleep(TICK).await;
+	};
+	assert_eq!(
+		(recorded.gid, recorded.target_digest),
+		(1, Some(certificate.target_digest))
+	);
+	let slab = control.recovery_storage().await.unwrap();
+	let index = slab.persistent_index().unwrap();
+	let meta = index.base_meta().await.unwrap();
+	assert_eq!((meta.active_gid, &meta.active_chunks), (1, &empty));
+	assert!(index.base_entries(false).await.unwrap().is_empty());
+	let owed = children_naming(&cluster, lost).await;
+	assert!(!owed.is_empty(), "the write's child names the slot");
+	for (rsv, ordinal, content) in &owed {
+		let intent = index.parent_intent(*rsv, *ordinal).await.unwrap();
+		assert!(
+			intent.is_some_and(|intent| intent.state
+				== crate::storage::index::parent_intents::ParentIntentState::Complete
+				&& intent.content == *content),
+			"child ({rsv}, {ordinal}) held"
+		);
+	}
+	assert_eq!(control.identity.role, Role::ControlOnly);
+	drop(index);
+	drop(slab);
+	control.shutdown().await.unwrap();
+	for node in std::mem::take(&mut cluster.nodes) {
+		let _ = tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown()).await;
+	}
+}
+
+/// ADR 0106 (wendelon), Codex 01a1e238 R1: the row pass must cover every
+/// verified entry. The first source asked serves entries whole (they verify) but
+/// answers its row page with only the first entry, claiming the end. That page
+/// is refused before anything is stored or published, the other survivor is
+/// asked from the same cursor, and the base is installed complete: recorded for
+/// the current certificate, active with its sums, every entry stored. Then the
+/// owning workflow's stopped-store reader is checked against this store.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_short_row_pass_is_refused_and_recovery_completes_from_another_source() {
+	let (mut cluster, leader, descriptor) = ready().await;
+	let lost = *NODES[1..].iter().find(|id| **id != leader).unwrap();
+	let now = std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.unwrap()
+		.as_millis() as u64;
+	let meta = write_meta(&descriptor, 3, uuid_v7_at(now));
+	assert_committed(
+		&write_through(
+			&cluster,
+			leader,
+			meta,
+			named_rows(&descriptor, &[(1, "a"), (2, "b"), (3, "c")]),
+		)
+		.await,
+		"a write",
+	);
+	jump_floor(&cluster, now + 60_000).await;
+	until_active(&cluster, 1).await;
+	let certificate = {
+		let state = cluster.node(leader).state_machine.state_snapshot().await;
+		state
+			.decisions
+			.unwrap()
+			.generations()
+			.current
+			.clone()
+			.unwrap()
+	};
+
+	cluster.stop(lost, true).await;
+	let cfg = cluster.configs[&lost].clone();
+	lose_disk(&cfg.data_dir);
+	crate::crypto::test_support::enroll_root_artifact(
+		&cluster.configs[&NODES[0]].data_dir,
+		&cfg.data_dir,
+	)
+	.unwrap();
+	assert!(matches!(
+		decide(
+			&cluster,
+			DecisionCommand::BeginReplacement {
+				token: TOKEN,
+				slot: lost,
+			}
+		)
+		.await,
+		DecisionResult::ReplacementRecorded { .. }
+	));
+	crate::node::provision_replacement_token(&cfg.data_dir, TOKEN).unwrap();
+	let short = *NODES.iter().filter(|id| **id != lost).min().unwrap();
+	crate::network::data_server::base_fetch::TAMPERED_SOURCES
+		.lock()
+		.unwrap()
+		.insert(
+			cluster.configs[&short].data_dir.clone(),
+			crate::network::data_server::base_fetch::Tamper::ShortRows,
+		);
+	let control = ControlOnlyNode::bootstrap_with_provider(cfg.clone(), provider(&cluster, lost))
+		.await
+		.unwrap();
+	let deadline = tokio::time::Instant::now() + BOUND * 2;
+	let recorded = loop {
+		if let Some(recorded) = recovery_record(&cluster).await {
+			break recorded;
+		}
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"never recorded; prepared {}, preparation ended {}",
+			control.prepared(),
+			control.preparation_ended()
+		);
+		tokio::time::sleep(TICK).await;
+	};
+	assert!(
+		crate::network::data_server::base_fetch::TAMPERED_PAGES
+			.load(std::sync::atomic::Ordering::SeqCst)
+			> 0,
+		"the short source answered a row page"
+	);
+	assert_eq!(
+		(recorded.gid, recorded.target_digest),
+		(1, Some(certificate.target_digest))
+	);
+	let slab = control.recovery_storage().await.unwrap();
+	let index = slab.persistent_index().unwrap();
+	let meta = index.base_meta().await.unwrap();
+	assert_eq!(
+		(meta.active_gid, &meta.active_chunks),
+		(1, &certificate.chunks)
+	);
+	let entries = index.base_entries(false).await.unwrap();
+	assert_eq!(entries.len(), 3, "every certified entry installed");
+	for entry in &entries {
+		crate::network::data_server::certification::entry_is_stored(
+			&slab,
+			&control.state_machine,
+			entry,
+		)
+		.await
+		.unwrap_or_else(|why| panic!("{entry:?}: {why}"));
+	}
+	assert_eq!(control.identity.role, Role::ControlOnly);
+	// Where the first row's stored copy lies, for the reader control below.
+	let location = slab
+		.version_locations(
+			entries[0].tenant,
+			crate::schema::Identity::new(entries[0].key_identity),
+			entries[0].hlc,
+		)
+		.unwrap()[0];
+	// The store's slab file naming (`slab_<id as 16 hex digits>.wnd`).
+	let slab_file = slab
+		.data_dir()
+		.join(format!("slab_{:016x}.wnd", location.slab_id));
+	drop(index);
+	drop(slab);
+	control.shutdown().await.unwrap();
+
+	// The owning workflow's stopped-store reader: the rows read back from the
+	// slab are exactly the written ones, every Complete child verifies, and the
+	// saved statement is the recorded one. With one stored copy damaged in the
+	// slab file (its index and manifest references kept) the reader fails.
+	let read_back = |found: &crate::node::RecoveredRowsForTest| {
+		let mut held = Vec::new();
+		for batch in &found.rows {
+			let ids = batch
+				.column(0)
+				.as_any()
+				.downcast_ref::<Int64Array>()
+				.unwrap();
+			let names = batch
+				.column(1)
+				.as_any()
+				.downcast_ref::<StringArray>()
+				.unwrap();
+			for row in 0..batch.num_rows() {
+				held.push((ids.value(row), names.value(row).to_owned()));
+			}
+		}
+		held.sort();
+		held
+	};
+	let written: Vec<(i64, String)> = [(1, "a"), (2, "b"), (3, "c")]
+		.into_iter()
+		.map(|(id, name)| (id, name.to_owned()))
+		.collect();
+	let found = crate::node::recovered_rows_in(&cfg, &descriptor)
+		.await
+		.unwrap();
+	assert!(found.unverified.is_empty(), "{:?}", found.unverified);
+	assert_eq!(
+		found.saved.map(|saved| (saved.3, saved.4)),
+		Some((recorded.gid, recorded.k))
+	);
+	assert_eq!(
+		read_back(&found),
+		written,
+		"complete {} rows {}",
+		found.complete_children,
+		found.rows.len()
+	);
+	{
+		use std::io::{Read, Seek, SeekFrom, Write};
+		let mut file = std::fs::OpenOptions::new()
+			.read(true)
+			.write(true)
+			.open(&slab_file)
+			.unwrap();
+		let at = location.offset + u64::from(location.length) / 2;
+		let mut byte = [0_u8];
+		file.seek(SeekFrom::Start(at)).unwrap();
+		file.read_exact(&mut byte).unwrap();
+		file.seek(SeekFrom::Start(at)).unwrap();
+		file.write_all(&[byte[0] ^ 0xFF]).unwrap();
+		file.sync_all().unwrap();
+	}
+	match crate::node::recovered_rows_in(&cfg, &descriptor).await {
+		Err(_) => {}
+		Ok(found) => assert!(
+			!found.unverified.is_empty() || read_back(&found) != written,
+			"a damaged stored copy passes the reader: {found:?}"
+		),
+	}
+	for node in std::mem::take(&mut cluster.nodes) {
+		let _ = tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown()).await;
+	}
+}
+
+/// The promoted replacement's applied recovery record at the leader, if any.
+async fn recovery_record(
+	cluster: &Cluster,
+) -> Option<crate::consensus::decisions::instances::Recovery> {
+	let leader = cluster.leader().await;
+	cluster
+		.node(leader)
+		.state_machine
+		.read_state(|state| {
+			state
+				.decisions
+				.as_ref()?
+				.instances()
+				.replacement(TOKEN)?
+				.recovered
+		})
+		.await
+}
+
+/// The Accepted children naming `slot` at any incarnation, by (rsv, ordinal),
+/// with their content.
+async fn children_naming(cluster: &Cluster, slot: u32) -> Vec<(u64, u16, [u8; 32])> {
+	let leader = cluster.leader().await;
+	cluster
+		.node(leader)
+		.state_machine
+		.read_state(move |state| {
+			let mut children = Vec::new();
+			for body in state.decisions.as_ref().unwrap().bodies().values() {
+				if !matches!(
+					body.status,
+					crate::consensus::decisions::ParentStatus::Accepted { .. }
+				) {
+					continue;
+				}
+				for (ordinal, child) in body.claim.children.iter().enumerate() {
+					if child.plan.iter().any(|member| member.node == slot) {
+						children.push((body.rsv, ordinal as u16, child.content));
+					}
+				}
+			}
+			children
+		})
+		.await
+}
+
+/// ADR 0106 (wendelon): a promoted replacement recovers its slot's data.
+/// Two generations are certified (the current one's predecessor is nonzero),
+/// a further write stays uncertified, then a follower is lost and replaced.
+/// With the cluster's root enrolled, the replacement's own task fetches the
+/// certified base page by page from the survivors and installs it at the
+/// current gid (its sums equal the certificate's; every entry stored), repairs
+/// every Accepted child naming the slot (none acknowledged by it), and records
+/// its signed recovery statement for the current certificate. A write after
+/// the record is repaired as delta. The member stays control-only throughout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_promoted_replacement_recovers_its_slots_base_and_children() {
+	let (mut cluster, leader, descriptor) = ready().await;
+	let lost = *NODES[1..].iter().find(|id| **id != leader).unwrap();
+	let now = std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.unwrap()
+		.as_millis() as u64;
+	// After a floor jump an operation's identity must be issued after the
+	// floor (its UUIDv7 time).
+	async fn write(
+		cluster: &Cluster,
+		descriptor: &TableSchemaDescriptor,
+		at: u64,
+		rows: &[(i64, &str)],
+	) {
+		let meta = write_meta(descriptor, rows.len(), uuid_v7_at(at));
+		let leader = cluster.leader().await;
+		assert_committed(
+			&write_through(cluster, leader, meta, named_rows(descriptor, rows)).await,
+			"a write",
+		);
+	}
+	write(&cluster, &descriptor, now, &[(1, "a"), (2, "b")]).await;
+	let first = now + 60_000;
+	jump_floor(&cluster, first).await;
+	until_active(&cluster, 1).await;
+	write(&cluster, &descriptor, first + 1, &[(3, "c")]).await;
+	let second = now + 120_000;
+	jump_floor(&cluster, second).await;
+	until_active(&cluster, 2).await;
+	// A write the current certificate does not cover.
+	write(&cluster, &descriptor, second + 1, &[(4, "d")]).await;
+	let certificate = {
+		let state = cluster.node(leader).state_machine.state_snapshot().await;
+		state
+			.decisions
+			.unwrap()
+			.generations()
+			.current
+			.clone()
+			.unwrap()
+	};
+	assert_eq!((certificate.gid, certificate.predecessor_gid), (2, 1));
+
+	cluster.stop(lost, true).await;
+	let cfg = cluster.configs[&lost].clone();
+	lose_disk(&cfg.data_dir);
+	crate::crypto::test_support::enroll_root_artifact(
+		&cluster.configs[&NODES[0]].data_dir,
+		&cfg.data_dir,
+	)
+	.unwrap();
+	assert!(matches!(
+		decide(
+			&cluster,
+			DecisionCommand::BeginReplacement {
+				token: TOKEN,
+				slot: lost,
+			}
+		)
+		.await,
+		DecisionResult::ReplacementRecorded { .. }
+	));
+	crate::node::provision_replacement_token(&cfg.data_dir, TOKEN).unwrap();
+	// R4: the first source the replacement asks serves one fabricated extra
+	// entry on every page. Its entries fail the certificate whole (discarded,
+	// before any row is stored), its row pages are refused, and recovery comes
+	// from the other survivor.
+	let bad = *NODES.iter().filter(|id| **id != lost).min().unwrap();
+	crate::network::data_server::base_fetch::TAMPERED_SOURCES
+		.lock()
+		.unwrap()
+		.insert(
+			cluster.configs[&bad].data_dir.clone(),
+			crate::network::data_server::base_fetch::Tamper::ExtraEntry,
+		);
+	let start = || ControlOnlyNode::bootstrap_with_provider(cfg.clone(), provider(&cluster, lost));
+	let control = start().await.unwrap();
+
+	let deadline = tokio::time::Instant::now() + BOUND * 2;
+	let recorded = loop {
+		if let Some(recorded) = recovery_record(&cluster).await {
+			break recorded;
+		}
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"never recorded; prepared {}, preparation ended {}",
+			control.prepared(),
+			control.preparation_ended()
+		);
+		tokio::time::sleep(TICK).await;
+	};
+	assert_eq!(
+		(recorded.gid, recorded.target_digest),
+		(2, Some(certificate.target_digest)),
+		"the current certificate"
+	);
+	// Read before the source controls below ask the same source directly.
+	let tampered_before_controls = crate::network::data_server::base_fetch::TAMPERED_PAGES
+		.load(std::sync::atomic::Ordering::SeqCst);
+
+	// A survivor serves base pages only to the slot's current replacement, for
+	// the current certificate.
+	{
+		use crate::network::data_server::base_fetch::{
+			BaseFetchAnswer, BaseFetchRefusal, BaseFetchRequest,
+		};
+		let leader = cluster.leader().await;
+		let (birth, store) = {
+			let state = cluster.node(leader).state_machine.state_snapshot().await;
+			let decisions = state.decisions.as_ref().unwrap();
+			(
+				decisions.instances().record(ALLOCATED_BASE).unwrap().birth,
+				state.incarnations[&lost].current.unwrap(),
+			)
+		};
+		let source = *NODES.iter().find(|id| **id != lost).unwrap();
+		let good = BaseFetchRequest {
+			token: TOKEN,
+			r_new: ALLOCATED_BASE,
+			birth,
+			store,
+			gid: 2,
+			target_digest: certificate.target_digest,
+			after: None,
+			max_rows: 4,
+			max_bytes: crate::network::data_server::base_fetch::MAX_PAGE_BYTES,
+			with_rows: true,
+		};
+		let ask = |from: u32, request: BaseFetchRequest| {
+			let cluster = &cluster;
+			async move {
+				let answer = exchange_with(
+					cluster,
+					from,
+					source,
+					crate::schema::MsgType::TABLE_BASE_FETCH_REQ,
+					&postcard::to_stdvec(&request).unwrap(),
+				)
+				.await
+				.expect("a base fetch is answered");
+				postcard::from_bytes::<BaseFetchAnswer>(&answer.meta).unwrap()
+			}
+		};
+		assert!(matches!(
+			ask(lost, good.clone()).await,
+			BaseFetchAnswer::Page { ref entries, .. } if !entries.is_empty()
+		));
+		let other = *NODES
+			.iter()
+			.find(|id| **id != lost && **id != source)
+			.unwrap();
+		for (from, request, refusal) in [
+			(
+				lost,
+				BaseFetchRequest {
+					token: TOKEN + 1,
+					..good.clone()
+				},
+				BaseFetchRefusal::NotAuthorized,
+			),
+			(other, good.clone(), BaseFetchRefusal::NotAuthorized),
+			(
+				lost,
+				BaseFetchRequest {
+					gid: 1,
+					..good.clone()
+				},
+				BaseFetchRefusal::WrongGeneration,
+			),
+			(
+				lost,
+				BaseFetchRequest {
+					max_rows: 0,
+					..good.clone()
+				},
+				BaseFetchRefusal::Malformed,
+			),
+			(
+				lost,
+				BaseFetchRequest {
+					max_bytes: crate::network::data_server::base_fetch::MAX_ROW_PAGE_BYTES + 1,
+					..good.clone()
+				},
+				BaseFetchRefusal::Malformed,
+			),
+			// R1: a first row larger than the page's byte bound is refused, never
+			// sent over it.
+			(
+				lost,
+				BaseFetchRequest {
+					max_bytes: 1,
+					..good.clone()
+				},
+				BaseFetchRefusal::RowTooLarge,
+			),
+		] {
+			assert_eq!(
+				ask(from, request).await,
+				BaseFetchAnswer::Refused(refusal),
+				"from {from}"
+			);
+		}
+	}
+
+	// The base is installed at gid 2 from the survivors and every entry is
+	// stored; every owed child is held, Complete.
+	let slab = control.recovery_storage().await.unwrap();
+	let index = slab.persistent_index().unwrap();
+	let meta = index.base_meta().await.unwrap();
+	assert_eq!(
+		(meta.active_gid, &meta.active_chunks),
+		(2, &certificate.chunks)
+	);
+	let entries = index.base_entries(false).await.unwrap();
+	assert!(!entries.is_empty(), "the certified base has entries");
+	for entry in &entries {
+		crate::network::data_server::certification::entry_is_stored(
+			&slab,
+			&control.state_machine,
+			entry,
+		)
+		.await
+		.unwrap_or_else(|why| panic!("{entry:?}: {why}"));
+	}
+	// The bad source was asked and answered with its extra entry; nothing of
+	// that entry reached this store.
+	assert!(
+		tampered_before_controls > 0,
+		"the tampered source was asked"
+	);
+	let fabricated = slab
+		.version_locations(
+			entries[0].tenant,
+			crate::schema::Identity::new([0xFF; 32]),
+			entries[0].hlc,
+		)
+		.unwrap();
+	assert!(fabricated.is_empty(), "no fabricated version stored");
+	assert!(
+		entries.iter().all(|entry| entry.key_identity != [0xFF; 32]),
+		"no fabricated entry published"
+	);
+	let owed = children_naming(&cluster, lost).await;
+	assert!(
+		!owed.is_empty(),
+		"the uncertified write's child names the slot"
+	);
+	for (rsv, ordinal, content) in &owed {
+		let intent = index.parent_intent(*rsv, *ordinal).await.unwrap();
+		assert!(
+			intent.is_some_and(|intent| intent.state
+				== crate::storage::index::parent_intents::ParentIntentState::Complete
+				&& intent.content == *content),
+			"child ({rsv}, {ordinal}) held"
+		);
+	}
+
+	// A write after the record: its child naming the slot is repaired as delta.
+	write(&cluster, &descriptor, second + 2, &[(5, "e")]).await;
+	let deadline = tokio::time::Instant::now() + BOUND;
+	loop {
+		let mut missing = 0;
+		for (rsv, ordinal, content) in children_naming(&cluster, lost).await {
+			let held = index
+				.parent_intent(rsv, ordinal)
+				.await
+				.unwrap()
+				.is_some_and(|intent| {
+					intent.state
+						== crate::storage::index::parent_intents::ParentIntentState::Complete
+						&& intent.content == content
+				});
+			missing += usize::from(!held);
+		}
+		if missing == 0 {
+			break;
+		}
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"{missing} delta children never repaired"
+		);
+		tokio::time::sleep(TICK).await;
+	}
+	assert_eq!(control.identity.role, Role::ControlOnly);
+	assert_ne!(cluster.leader().await, ALLOCATED_BASE, "it never leads");
+	drop(index);
+	drop(slab);
+	control.shutdown().await.unwrap();
+
+	// A restart after the record (also a lost reply: the record and the
+	// statement saved before sending agree): the stored data is validated
+	// again and recovery continues; the record is unchanged.
+	let control = start().await.unwrap();
+	let slab = control.recovery_storage().await.unwrap();
+	tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+	assert!(
+		!control.preparation_ended(),
+		"a sound store keeps recovering"
+	);
+	assert_eq!(recovery_record(&cluster).await, Some(recorded));
+	// One stored base entry is damaged; at the next start the sums recomputed
+	// from the stored entries differ, and recovery stops: it never counts as
+	// recovered, and nothing changes at the leader.
+	slab.persistent_index()
+		.unwrap()
+		.tamper_base_entry_for_test()
+		.await
+		.unwrap();
+	drop(slab);
+	control.shutdown().await.unwrap();
+	let control = start().await.unwrap();
+	let deadline = tokio::time::Instant::now() + BOUND;
+	while !control.preparation_ended() {
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"a damaged store kept recovering"
+		);
+		tokio::time::sleep(TICK).await;
+	}
+	assert_eq!(recovery_record(&cluster).await, Some(recorded));
+	assert_eq!(control.identity.role, Role::ControlOnly);
+	control.shutdown().await.unwrap();
 	for node in std::mem::take(&mut cluster.nodes) {
 		let _ = tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown()).await;
 	}

@@ -949,6 +949,10 @@ impl MsgType {
 	/// identity, for the slot its connection authenticates.
 	pub const INSTANCE_GRANT_REQ: Self = Self(0x6C);
 	pub const INSTANCE_GRANT_RESP: Self = Self(0x6D);
+	/// ADR 0106 (wendelon): a recovering replacement asks a member for one page
+	/// of the certified base.
+	pub const TABLE_BASE_FETCH_REQ: Self = Self(0x6E);
+	pub const TABLE_BASE_FETCH_RESP: Self = Self(0x6F);
 
 	// raft internal (openraft RaftNetwork)
 	pub const APPEND_ENTRIES_REQ: Self = Self(0x20);
@@ -1066,6 +1070,8 @@ impl MsgType {
 		Self::LEASES_RESP,
 		Self::INSTANCE_GRANT_REQ,
 		Self::INSTANCE_GRANT_RESP,
+		Self::TABLE_BASE_FETCH_REQ,
+		Self::TABLE_BASE_FETCH_RESP,
 		Self::APPEND_ENTRIES_REQ,
 		Self::APPEND_ENTRIES_RESP,
 		Self::INSTALL_SNAPSHOT_REQ,
@@ -2603,7 +2609,10 @@ pub const SNAPSHOT_FORMAT_VERSION: u8 = 21;
 ///
 /// Wendelon ADR 0105: 26, whose replacement records carry their promotion (25
 /// was wendelon ADR 0104's).
-pub const SNAPSHOT_FORMAT_VERSION_PARENT_DECISIONS: u8 = 26;
+///
+/// Wendelon ADR 0106: 27, whose replacement records carry their recovery (26
+/// was wendelon ADR 0105's).
+pub const SNAPSHOT_FORMAT_VERSION_PARENT_DECISIONS: u8 = 27;
 
 /// Shape of the Control Ring WAL record bodies this build writes, including the
 /// `postcard(Entry<..>)` payload of a log record. ADR 0697 version 6 carries
@@ -2646,7 +2655,10 @@ pub const WAL_FORMAT_VERSION: u8 = 21;
 /// Wendelon ADR 0105: 26. A Done replacement's promotion is an entry, and a
 /// slot being replaced takes no lease, takeover or coordination at apply; an
 /// earlier log is refused whole (25 was wendelon ADR 0104's).
-pub const WAL_FORMAT_VERSION_PARENT_DECISIONS: u8 = 26;
+///
+/// Wendelon ADR 0106: 27. A replacement's signed recovery statement is a
+/// decision; an earlier log is refused whole (26 was wendelon ADR 0105's).
+pub const WAL_FORMAT_VERSION_PARENT_DECISIONS: u8 = 27;
 
 // Static assertions to ensure all our size calculations remain exactly correct
 const _: () = assert!(std::mem::size_of::<HybridTimestamp>() == 16);

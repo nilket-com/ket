@@ -24,7 +24,7 @@ pub(super) const PARENT_LOCK_STRIPES: usize = 256;
 pub(crate) struct ParentLocks(Vec<Arc<tokio::sync::Mutex<()>>>);
 
 impl ParentLocks {
-	pub(super) fn new() -> Self {
+	pub(crate) fn new() -> Self {
 		Self(
 			(0..PARENT_LOCK_STRIPES)
 				.map(|_| Arc::new(tokio::sync::Mutex::new(())))
@@ -110,7 +110,9 @@ pub(super) fn writer_of(commit_hlc: HybridTimestamp) -> WriterNodeId {
 }
 
 /// The manifest of a child's rows: one version per row, sorted, no repeats.
-pub(super) fn child_manifest(
+/// ADR 0106 (wendelon): each row's version, in the batch's row order (no
+/// sorting, no duplicate check): what a caller pairing rows with entries needs.
+pub(crate) fn row_versions_in_order(
 	meta: &TableWriteRequestMeta,
 	batch: &RecordBatch,
 	descriptor: &TableSchemaDescriptor,
@@ -145,6 +147,16 @@ pub(super) fn child_manifest(
 			),
 		});
 	}
+	Ok(manifest)
+}
+
+pub(crate) fn child_manifest(
+	meta: &TableWriteRequestMeta,
+	batch: &RecordBatch,
+	descriptor: &TableSchemaDescriptor,
+	commit_hlc: HybridTimestamp,
+) -> Result<Vec<OwnedVersion>, ManifestRefusal> {
+	let mut manifest = row_versions_in_order(meta, batch, descriptor, commit_hlc)?;
 	manifest.sort();
 	if manifest.windows(2).any(|pair| {
 		(pair[0].table, pair[0].key_identity, pair[0].hlc)
@@ -306,7 +318,20 @@ pub(crate) fn plan_child(
 		.incarnations
 		.get(&local.node)
 		.and_then(|registry| registry.current);
-	if current != Some(local.incarnation) || !child.plan.contains(&local) {
+	// ADR 0106 (wendelon): a repair may copy a child naming an ancestor of this
+	// store (its recorded promotion chain); it never acknowledges for it.
+	let named = child.plan.contains(&local)
+		|| (role == ChildRole::Repair
+			&& child.plan.iter().any(|member| {
+				member.node == local.node
+					&& crate::consensus::decisions::in_recorded_ancestry(
+						state,
+						local.node,
+						local.incarnation,
+						member.incarnation,
+					)
+			}));
+	if current != Some(local.incarnation) || !named {
 		return Err(ChildRefusal::NotInPlan);
 	}
 	if role == ChildRole::Holder {
@@ -482,6 +507,41 @@ fn bifurcate_child(
 	.map_err(|error| ChildRefusal::Rows(ManifestRefusal::Admission(error.to_string())))
 }
 
+/// ADR 0106 (wendelon): stores one batch of a recovered base's rows, all at
+/// `hlc`, durably, as a child's rows are stored, but with no intent and no
+/// owner: a certified base row has none once its intent retired. Secondary
+/// index buffers are not written; the replacement rebuilds its indexes.
+pub(crate) async fn ingest_recovered_rows(
+	slab: &SlabManager,
+	tenant: TenantId,
+	descriptor: &TableSchemaDescriptor,
+	batch: &RecordBatch,
+	hlc: HybridTimestamp,
+) -> std::io::Result<()> {
+	let mut request: TableWriteRequestMeta = bytemuck::Zeroable::zeroed();
+	request.client_hlc = hlc;
+	request.tenant_id = tenant;
+	request.table_object_id = descriptor.table_object_id;
+	request.schema_generation = descriptor.schema_generation;
+	request.row_count = crate::schema::table::encode_table_write_row_count(batch.num_rows())?;
+	let invalid = |error: String| std::io::Error::new(std::io::ErrorKind::InvalidData, error);
+	let admission =
+		validate_table_write_request_batch(&request, batch, descriptor, writer_of(hlc), hlc)
+			.map_err(|error| invalid(error.to_string()))?;
+	let full = bifurcate_table_write_with_admission_and_row_group_encoding_and_chunk_layout_config(
+		&request,
+		batch,
+		descriptor,
+		&admission,
+		hlc,
+		slab.row_group_writer_config(),
+		slab.encoding_writer_config(),
+		slab.l2_chunk_layout_config(),
+	)
+	.map_err(|error| invalid(error.to_string()))?;
+	super::append_table_children_durable(slab, tenant, hlc, &to_replica_children(&full), &[]).await
+}
+
 impl ChildPlan {
 	fn ack_hlc(&self) -> HybridTimestamp {
 		self.intent.manifest[0].hlc
@@ -535,7 +595,7 @@ pub(crate) struct ChildAuthority {
 
 /// A stored row's content commitment, from its stored bytes: the row projected
 /// to the descriptor's columns, encoded canonically.
-pub(super) fn stored_row_digest(
+pub(crate) fn stored_row_digest(
 	descriptor: &TableSchemaDescriptor,
 	stored: &RecordBatch,
 ) -> Result<[u8; 32], String> {
@@ -551,7 +611,7 @@ pub(super) fn stored_row_digest(
 
 /// A stored row projected to the descriptor's columns: the user row it was
 /// written as.
-pub(super) fn stored_row_projected(
+pub(crate) fn stored_row_projected(
 	descriptor: &TableSchemaDescriptor,
 	stored: &RecordBatch,
 ) -> Result<RecordBatch, String> {
@@ -576,7 +636,7 @@ pub(super) fn stored_row_projected(
 /// The proof an acknowledgement attests: every manifest version is stored, every
 /// stored copy of it carries the manifest's content, and every version is owned
 /// by this `(rsv, ordinal)`.
-pub(super) async fn verify_owned_rows(
+pub(crate) async fn verify_owned_rows(
 	slab: &SlabManager,
 	index: &crate::storage::index::PersistentLocalIndex,
 	intent: &crate::storage::index::parent_intents::ParentIntent,
@@ -1174,7 +1234,8 @@ impl DecisionPeer {
 	/// other data message (migration, bulk, counters, frames, other mutation
 	/// paths) stays refused.
 	pub(crate) fn opens(&self, msg_type: u8) -> bool {
-		const SERVED: [MsgType; 8] = [
+		const SERVED: [MsgType; 9] = [
+			MsgType::TABLE_BASE_FETCH_REQ,
 			MsgType::TABLE_WRITE_REQ,
 			MsgType::TABLE_CHILD_WRITE_REQ,
 			MsgType::TABLE_CHILD_REPLICATE_REQ,

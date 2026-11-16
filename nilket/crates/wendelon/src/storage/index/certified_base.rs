@@ -25,6 +25,10 @@ pub(super) const BASE_STAGED_TABLE: TableDefinition<&[u8], &[u8]> =
 	TableDefinition::new("base_staged_v1");
 pub(super) const BASE_META_TABLE: TableDefinition<&str, &[u8]> =
 	TableDefinition::new("base_meta_v1");
+/// ADR 0106 (wendelon): a replacement's recovered base pages, staged before
+/// one publication. Separate from the generation's own staging.
+pub(super) const BASE_RECOVERY_TABLE: TableDefinition<&[u8], &[u8]> =
+	TableDefinition::new("base_recovery_v1");
 /// ADR 0699 S5b: positive evidence that a version is obsolete, written only by
 /// the activation that made it so.
 pub(super) const CLEANUP_DEBT_TABLE: TableDefinition<&[u8], &[u8]> =
@@ -189,6 +193,38 @@ impl CoherentFacts {
 	}
 }
 const BASE_META_KEY: &str = "meta";
+/// ADR 0106 (wendelon): the certificate a recovery is installing.
+const BASE_RECOVERY_KEY: &str = "recovery";
+/// ADR 0106 (wendelon): the exact recovery statement, saved before first sent.
+const RECOVERY_SUBMISSION_KEY: &str = "recovery_submission";
+
+/// ADR 0106 (wendelon): a replacement's recovery statement as it will be (or
+/// was) submitted: saved once, before the first send, and never re-sampled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoverySubmission {
+	pub token: u128,
+	pub r_new: u32,
+	pub birth: [u8; 16],
+	pub store: crate::consensus::StoreIncarnation,
+	pub gid: u64,
+	pub target_digest: Option<[u8; 32]>,
+	pub k: u64,
+}
+
+/// ADR 0106 (wendelon): why a recovered base page or publication was refused.
+/// Each refusal changes nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InstallRefusal {
+	/// The store already holds a base, a generation's staging, or active rows:
+	/// only a pristine promoted store installs a recovered base.
+	NotPristine,
+	/// A recovery for another certificate is staged here.
+	OtherCertificate,
+	/// A page names a key already staged with different content.
+	ConflictingEntry,
+	/// The staged entries do not hash to the certificate's chunks.
+	SumsMismatch,
+}
 
 /// A key's certified version.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -204,7 +240,7 @@ pub struct BaseEntry {
 }
 
 impl BaseEntry {
-	fn key(&self) -> [u8; 56] {
+	pub(crate) fn key(&self) -> [u8; 56] {
 		base_key(self.tenant, self.table, &self.key_identity)
 	}
 
@@ -337,6 +373,105 @@ impl PersistentLocalIndex {
 			.await
 	}
 
+	/// ADR 0106 (wendelon): the saved recovery statement, if any.
+	pub(crate) async fn recovery_submission(&self) -> std::io::Result<Option<RecoverySubmission>> {
+		self.db
+			.run(|db| {
+				let tx = db.begin_read().map_err(redb_to_io)?;
+				let table = match tx.open_table(BASE_META_TABLE) {
+					Ok(table) => table,
+					Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+					Err(error) => return Err(redb_to_io(error)),
+				};
+				match table.get(RECOVERY_SUBMISSION_KEY).map_err(redb_to_io)? {
+					None => Ok(None),
+					Some(bytes) => postcard::from_bytes(bytes.value())
+						.map(Some)
+						.map_err(|error| Error::new(ErrorKind::InvalidData, error)),
+				}
+			})
+			.await
+	}
+
+	/// ADR 0106 (wendelon): saves `submission` once. Saving it again is a
+	/// no-op; saving another is refused (`Ok(false)`) and changes nothing.
+	pub(crate) async fn save_recovery_submission(
+		&self,
+		submission: RecoverySubmission,
+	) -> std::io::Result<bool> {
+		let _guard = self.write_lock.lock().await;
+		self.db
+			.run(move |db| {
+				let tx = db.begin_write().map_err(redb_to_io)?;
+				let mut table = tx.open_table(BASE_META_TABLE).map_err(redb_to_io)?;
+				if let Some(bytes) = table.get(RECOVERY_SUBMISSION_KEY).map_err(redb_to_io)? {
+					let saved: RecoverySubmission = postcard::from_bytes(bytes.value())
+						.map_err(|error| Error::new(ErrorKind::InvalidData, error))?;
+					return Ok(saved == submission);
+				}
+				table
+					.insert(RECOVERY_SUBMISSION_KEY, encode(&submission)?.as_slice())
+					.map_err(redb_to_io)?;
+				drop(table);
+				tx.commit().map_err(redb_to_io)?;
+				Ok(true)
+			})
+			.await
+	}
+
+	/// ADR 0106 (wendelon): up to `limit` active entries after `after`, in key
+	/// order: one page of the certified base for a recovering replacement.
+	pub(crate) async fn base_page(
+		&self,
+		after: Option<[u8; 56]>,
+		limit: usize,
+	) -> std::io::Result<Vec<BaseEntry>> {
+		self.entry_page(BASE_ACTIVE_TABLE, after, limit).await
+	}
+
+	/// ADR 0106 (wendelon): up to `limit` staged recovered entries after the
+	/// key `after`, in key order (the order a source's pages walk).
+	pub(crate) async fn recovered_page(
+		&self,
+		after: Option<[u8; 56]>,
+		limit: usize,
+	) -> std::io::Result<Vec<BaseEntry>> {
+		self.entry_page(BASE_RECOVERY_TABLE, after, limit).await
+	}
+
+	async fn entry_page(
+		&self,
+		definition: redb::TableDefinition<'static, &'static [u8], &'static [u8]>,
+		after: Option<[u8; 56]>,
+		limit: usize,
+	) -> std::io::Result<Vec<BaseEntry>> {
+		self.db
+			.run(move |db| {
+				let tx = db.begin_read().map_err(redb_to_io)?;
+				let table = match tx.open_table(definition) {
+					Ok(table) => table,
+					Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+					Err(error) => return Err(redb_to_io(error)),
+				};
+				let rows = match &after {
+					Some(after) => table
+						.range::<&[u8]>((
+							std::ops::Bound::Excluded(after.as_slice()),
+							std::ops::Bound::Unbounded,
+						))
+						.map_err(redb_to_io)?,
+					None => table.iter().map_err(redb_to_io)?,
+				};
+				let mut page = Vec::new();
+				for row in rows.take(limit) {
+					let (_, value) = row.map_err(redb_to_io)?;
+					page.push(decode_entry(value.value())?);
+				}
+				Ok(page)
+			})
+			.await
+	}
+
 	/// Every active entry, or every staged one.
 	pub(crate) async fn base_entries(&self, staged: bool) -> std::io::Result<Vec<BaseEntry>> {
 		self.db
@@ -431,6 +566,229 @@ impl PersistentLocalIndex {
 				meta.staged = Some(candidate);
 				meta_table
 					.insert(BASE_META_KEY, encode(&meta)?.as_slice())
+					.map_err(redb_to_io)?;
+				drop(meta_table);
+				tx.commit().map_err(redb_to_io)?;
+				Ok(Ok(()))
+			})
+			.await
+	}
+
+	/// ADR 0106 (wendelon): stages one verified page of a recovered base for
+	/// `certificate` (its gid, digest, predecessor and chunks), on a pristine
+	/// store only. The page's rows must already be durable in this store's
+	/// slabs. A key staged again with equal content is accepted; with other
+	/// content, refused. The ordinary generation staging is not touched.
+	pub(crate) async fn stage_recovered_page(
+		&self,
+		certificate: StagedCandidate,
+		entries: Vec<BaseEntry>,
+	) -> std::io::Result<Result<(), InstallRefusal>> {
+		let _guard = self.write_lock.lock().await;
+		self.db
+			.run(move |db| {
+				let tx = db.begin_write().map_err(redb_to_io)?;
+				let mut meta_table = tx.open_table(BASE_META_TABLE).map_err(redb_to_io)?;
+				let meta = read_meta(&meta_table)?;
+				let active_empty = tx
+					.open_table(BASE_ACTIVE_TABLE)
+					.map_err(redb_to_io)?
+					.first()
+					.map_err(redb_to_io)?
+					.is_none();
+				if meta.active_gid != 0 || meta.staged.is_some() || !active_empty {
+					return Ok(Err(InstallRefusal::NotPristine));
+				}
+				match meta_table.get(BASE_RECOVERY_KEY).map_err(redb_to_io)? {
+					Some(bytes) => {
+						let staged: StagedCandidate = postcard::from_bytes(bytes.value())
+							.map_err(|error| Error::new(ErrorKind::InvalidData, error))?;
+						if staged != certificate {
+							return Ok(Err(InstallRefusal::OtherCertificate));
+						}
+					}
+					None => {}
+				}
+				let mut recovery = tx.open_table(BASE_RECOVERY_TABLE).map_err(redb_to_io)?;
+				for entry in &entries {
+					let encoded = encode(entry)?;
+					if let Some(previous) = recovery
+						.insert(entry.key().as_slice(), encoded.as_slice())
+						.map_err(redb_to_io)?
+						&& previous.value() != encoded.as_slice()
+					{
+						return Ok(Err(InstallRefusal::ConflictingEntry));
+					}
+				}
+				drop(recovery);
+				meta_table
+					.insert(BASE_RECOVERY_KEY, encode(&certificate)?.as_slice())
+					.map_err(redb_to_io)?;
+				drop(meta_table);
+				tx.commit().map_err(redb_to_io)?;
+				Ok(Ok(()))
+			})
+			.await
+	}
+
+	/// ADR 0106 (wendelon): whether the staged recovered entries for
+	/// `certificate` hash exactly to its chunks (counts included), streamed.
+	pub(crate) async fn recovered_staging_matches(
+		&self,
+		certificate: StagedCandidate,
+	) -> std::io::Result<bool> {
+		self.db
+			.run(move |db| {
+				let tx = db.begin_read().map_err(redb_to_io)?;
+				let meta = match tx.open_table(BASE_META_TABLE) {
+					Ok(table) => table,
+					Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
+					Err(error) => return Err(redb_to_io(error)),
+				};
+				let staged: Option<StagedCandidate> =
+					match meta.get(BASE_RECOVERY_KEY).map_err(redb_to_io)? {
+						Some(bytes) => Some(
+							postcard::from_bytes(bytes.value())
+								.map_err(|error| Error::new(ErrorKind::InvalidData, error))?,
+						),
+						None => None,
+					};
+				if staged.as_ref() != Some(&certificate) {
+					return Ok(false);
+				}
+				let mut sums = crate::consensus::decisions::generations::ChunkAccumulator::new();
+				match tx.open_table(BASE_RECOVERY_TABLE) {
+					Ok(table) => {
+						for row in table.iter().map_err(redb_to_io)? {
+							let (_, value) = row.map_err(redb_to_io)?;
+							let entry = decode_entry(value.value())?;
+							sums.add(entry.chunk(), &entry.preimage());
+						}
+					}
+					Err(redb::TableError::TableDoesNotExist(_)) => {}
+					Err(error) => return Err(redb_to_io(error)),
+				}
+				Ok(sums.finish() == certificate.chunks)
+			})
+			.await
+	}
+
+	/// ADR 0106 (wendelon): discards the staged recovered entries and their
+	/// certificate, on a pristine store only: an untrusted attempt's metadata,
+	/// before any of its rows was stored. Nothing published is touched.
+	pub(crate) async fn discard_recovered_staging(
+		&self,
+	) -> std::io::Result<Result<(), InstallRefusal>> {
+		let _guard = self.write_lock.lock().await;
+		self.db
+			.run(move |db| {
+				let tx = db.begin_write().map_err(redb_to_io)?;
+				let mut meta_table = tx.open_table(BASE_META_TABLE).map_err(redb_to_io)?;
+				let meta = read_meta(&meta_table)?;
+				let active_empty = tx
+					.open_table(BASE_ACTIVE_TABLE)
+					.map_err(redb_to_io)?
+					.first()
+					.map_err(redb_to_io)?
+					.is_none();
+				if meta.active_gid != 0 || meta.staged.is_some() || !active_empty {
+					return Ok(Err(InstallRefusal::NotPristine));
+				}
+				tx.open_table(BASE_RECOVERY_TABLE)
+					.map_err(redb_to_io)?
+					.retain(|_, _| false)
+					.map_err(redb_to_io)?;
+				meta_table.remove(BASE_RECOVERY_KEY).map_err(redb_to_io)?;
+				drop(meta_table);
+				tx.commit().map_err(redb_to_io)?;
+				Ok(Ok(()))
+			})
+			.await
+	}
+
+	/// ADR 0106 (wendelon): publishes the staged recovered base as this store's
+	/// active base at `certificate`'s gid, in one transaction, only if the
+	/// staged entries hash to its chunks (recomputed as they are read, never
+	/// trusted from the pages). The recovery staging is cleared in the same
+	/// transaction. Publishing an already published certificate is answered
+	/// as done.
+	pub(crate) async fn publish_recovered(
+		&self,
+		certificate: StagedCandidate,
+	) -> std::io::Result<Result<(), InstallRefusal>> {
+		let _guard = self.write_lock.lock().await;
+		self.db
+			.run(move |db| {
+				let tx = db.begin_write().map_err(redb_to_io)?;
+				let mut meta_table = tx.open_table(BASE_META_TABLE).map_err(redb_to_io)?;
+				let meta = read_meta(&meta_table)?;
+				if meta.active_gid == certificate.gid
+					&& meta.active_chunks == certificate.chunks
+					&& meta_table
+						.get(BASE_RECOVERY_KEY)
+						.map_err(redb_to_io)?
+						.is_none()
+				{
+					return Ok(Ok(()));
+				}
+				let mut active = tx.open_table(BASE_ACTIVE_TABLE).map_err(redb_to_io)?;
+				if meta.active_gid != 0
+					|| meta.staged.is_some()
+					|| active.first().map_err(redb_to_io)?.is_some()
+				{
+					return Ok(Err(InstallRefusal::NotPristine));
+				}
+				match meta_table.get(BASE_RECOVERY_KEY).map_err(redb_to_io)? {
+					Some(bytes) => {
+						let staged: StagedCandidate = postcard::from_bytes(bytes.value())
+							.map_err(|error| Error::new(ErrorKind::InvalidData, error))?;
+						if staged != certificate {
+							return Ok(Err(InstallRefusal::OtherCertificate));
+						}
+					}
+					None => return Ok(Err(InstallRefusal::OtherCertificate)),
+				}
+				let mut recovery = tx.open_table(BASE_RECOVERY_TABLE).map_err(redb_to_io)?;
+				let mut decode_error = None;
+				let sums =
+					chunk_sums_of(recovery.iter().map_err(redb_to_io)?.filter_map(
+						|row| match row {
+							Ok((_, value)) => match decode_entry(value.value()) {
+								Ok(entry) => Some((entry.chunk(), entry.preimage())),
+								Err(error) => {
+									decode_error.get_or_insert(error);
+									None
+								}
+							},
+							Err(error) => {
+								decode_error.get_or_insert(redb_to_io(error));
+								None
+							}
+						},
+					));
+				if let Some(error) = decode_error {
+					return Err(error);
+				}
+				if sums != certificate.chunks {
+					return Ok(Err(InstallRefusal::SumsMismatch));
+				}
+				for row in recovery.iter().map_err(redb_to_io)? {
+					let (key, value) = row.map_err(redb_to_io)?;
+					active
+						.insert(key.value(), value.value())
+						.map_err(redb_to_io)?;
+				}
+				recovery.retain(|_, _| false).map_err(redb_to_io)?;
+				drop(recovery);
+				drop(active);
+				meta_table.remove(BASE_RECOVERY_KEY).map_err(redb_to_io)?;
+				let published = BaseMeta {
+					active_gid: certificate.gid,
+					active_chunks: certificate.chunks,
+					staged: None,
+				};
+				meta_table
+					.insert(BASE_META_KEY, encode(&published)?.as_slice())
 					.map_err(redb_to_io)?;
 				drop(meta_table);
 				tx.commit().map_err(redb_to_io)?;

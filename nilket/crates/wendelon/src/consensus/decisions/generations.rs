@@ -383,26 +383,51 @@ pub(crate) fn ready_commit(state: &SmState) -> Option<u64> {
 /// preimage)` items, under the certified-base digest domain; empty chunks
 /// included. Storage builds the preimages; only this computes digests.
 pub fn chunk_sums_of(items: impl IntoIterator<Item = (usize, Vec<u8>)>) -> Vec<ChunkSum> {
-	use crate::hash::state_digest::{
-		DOMAIN_CERTIFIED_BASE, StateDigestAccumulator, StateDigestElement,
-	};
-	let mut accumulators: Vec<StateDigestAccumulator> = (0..GENERATION_CHUNKS)
-		.map(|_| StateDigestAccumulator::new())
-		.collect();
-	let mut counts = vec![0u64; GENERATION_CHUNKS];
+	let mut sums = ChunkAccumulator::new();
 	for (chunk, preimage) in items {
-		accumulators[chunk].add_element(StateDigestElement::project(
-			DOMAIN_CERTIFIED_BASE,
-			&preimage,
-		));
-		counts[chunk] += 1;
+		sums.add(chunk, &preimage);
 	}
-	accumulators
-		.into_iter()
-		.zip(counts)
-		.map(|(accumulator, count)| ChunkSum {
-			count,
-			root: accumulator.finish().into_bytes(),
-		})
-		.collect()
+	sums.finish()
+}
+
+/// ADR 0106 (wendelon): `chunk_sums_of` fed one item at a time, so a caller
+/// streaming a base page by page holds only the 256 accumulators.
+pub struct ChunkAccumulator {
+	accumulators: Vec<crate::hash::state_digest::StateDigestAccumulator>,
+	counts: Vec<u64>,
+}
+
+impl ChunkAccumulator {
+	pub fn new() -> Self {
+		Self {
+			accumulators: (0..GENERATION_CHUNKS)
+				.map(|_| crate::hash::state_digest::StateDigestAccumulator::new())
+				.collect(),
+			counts: vec![0; GENERATION_CHUNKS],
+		}
+	}
+
+	pub fn add(&mut self, chunk: usize, preimage: &[u8]) {
+		use crate::hash::state_digest::{DOMAIN_CERTIFIED_BASE, StateDigestElement};
+		self.accumulators[chunk]
+			.add_element(StateDigestElement::project(DOMAIN_CERTIFIED_BASE, preimage));
+		self.counts[chunk] += 1;
+	}
+
+	pub fn finish(self) -> Vec<ChunkSum> {
+		self.accumulators
+			.into_iter()
+			.zip(self.counts)
+			.map(|(accumulator, count)| ChunkSum {
+				count,
+				root: accumulator.finish().into_bytes(),
+			})
+			.collect()
+	}
+}
+
+impl Default for ChunkAccumulator {
+	fn default() -> Self {
+		Self::new()
+	}
 }

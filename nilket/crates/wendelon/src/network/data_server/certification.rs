@@ -196,43 +196,7 @@ impl WendelonDataServer {
 	/// A certified entry's stored copy, with its content, or typed tombstone
 	/// locations.
 	async fn entry_is_stored(&self, entry: &BaseEntry) -> Result<(), String> {
-		let key = Identity::new(entry.key_identity);
-		let locations = self
-			.slab
-			.version_locations(entry.tenant, key, entry.hlc)
-			.map_err(|error| error.to_string())?;
-		if locations.is_empty() {
-			return Err("a certified entry has no stored copy".into());
-		}
-		if entry.tombstone {
-			if !locations.iter().all(|location| location.is_tombstone) {
-				return Err("a certified tombstone is stored as a row".into());
-			}
-			return Ok(());
-		}
-		let (tenant, table) = (entry.tenant, entry.table);
-		let descriptor = self
-			.state_machine
-			.read_state(move |state| {
-				super::child_writes::table_descriptor(state, tenant, table, 0)
-					.or_else(|| state.table_schemas.latest_by_id(tenant, table).cloned())
-			})
-			.await
-			.ok_or("a certified entry's table is unknown")?;
-		let stored = self
-			.slab
-			.stored_rows_at_version(entry.tenant, key, entry.hlc, None)
-			.await
-			.map_err(|error| error.to_string())?;
-		if stored.is_empty() {
-			return Err("a certified entry has no stored row".into());
-		}
-		for row in &stored {
-			if super::child_writes::stored_row_digest(&descriptor, row)? != entry.row_digest {
-				return Err("a certified entry's stored content differs".into());
-			}
-		}
-		Ok(())
+		entry_is_stored(&self.slab, &self.state_machine, entry).await
 	}
 
 	/// Activates the committed generation's staged candidate, if it is not
@@ -581,4 +545,47 @@ impl WendelonDataServer {
 		}
 		Ok(winners.into_values().map(|(entry, _)| entry).collect())
 	}
+}
+
+/// A certified entry's stored copy, with its content, or typed tombstone
+/// locations. Shared with a replacement's recovery (ADR 0106, wendelon).
+pub(crate) async fn entry_is_stored(
+	slab: &SlabManager,
+	state_machine: &crate::consensus::raft_storage::WendelonStateMachine,
+	entry: &BaseEntry,
+) -> Result<(), String> {
+	let key = Identity::new(entry.key_identity);
+	let locations = slab
+		.version_locations(entry.tenant, key, entry.hlc)
+		.map_err(|error| error.to_string())?;
+	if locations.is_empty() {
+		return Err("a certified entry has no stored copy".into());
+	}
+	if entry.tombstone {
+		if !locations.iter().all(|location| location.is_tombstone) {
+			return Err("a certified tombstone is stored as a row".into());
+		}
+		return Ok(());
+	}
+	let (tenant, table) = (entry.tenant, entry.table);
+	let descriptor = state_machine
+		.read_state(move |state| {
+			super::child_writes::table_descriptor(state, tenant, table, 0)
+				.or_else(|| state.table_schemas.latest_by_id(tenant, table).cloned())
+		})
+		.await
+		.ok_or("a certified entry's table is unknown")?;
+	let stored = slab
+		.stored_rows_at_version(entry.tenant, key, entry.hlc, None)
+		.await
+		.map_err(|error| error.to_string())?;
+	if stored.is_empty() {
+		return Err("a certified entry has no stored row".into());
+	}
+	for row in &stored {
+		if super::child_writes::stored_row_digest(&descriptor, row)? != entry.row_digest {
+			return Err("a certified entry's stored content differs".into());
+		}
+	}
+	Ok(())
 }

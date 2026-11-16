@@ -205,10 +205,10 @@ use scan_accounting::{
 	DecodedRecordCache, PostPackingScanPhaseTrace,
 	QUERY_REQUEST_FLAG_SAMPLED_POST_PACKING_PHASE_TRACE, ScanDecodeAudit, ScanPhase,
 };
-mod certification;
+pub(crate) mod certification;
 // ADR 0699 S5b: a store's certified cleanup.
 mod cleanup;
-mod deletes;
+pub(crate) mod deletes;
 pub(crate) mod reader;
 pub(crate) mod repair;
 mod table_query;
@@ -226,6 +226,8 @@ use write_replication::{
 	AttemptRetention, DurableQuorumTracker, NothingSubmitted, PendingFinalizationClaims,
 	TableAttemptAnswer, TablePlacement, WriteOutcome,
 };
+/// ADR 0106 (wendelon): a recovering replacement's certified-base pages.
+pub(crate) mod base_fetch;
 mod descriptor_migration;
 /// ADR 0105 (wendelon): the typed refusals of a member that serves no data.
 pub(crate) mod not_serving;
@@ -6961,6 +6963,11 @@ impl DataRingServer for WendelonDataServer {
 			MsgType::TABLE_CHILD_WRITE_REQ
 			| MsgType::TABLE_CHILD_REPLICATE_REQ
 			| MsgType::TABLE_CHILD_FETCH_REQ => self.dispatch_child_frame(&context, frame).await.map(Some),
+			// ADR 0106 (wendelon): a recovering replacement's base page.
+			MsgType::TABLE_BASE_FETCH_REQ => {
+				let sender = context.require_authenticated_node("TABLE_BASE_FETCH_REQ")?;
+				self.handle_base_fetch(sender.id, frame).await.map(Some)
+			}
 			MsgType::TABLE_REPLICATE_REQ => {
 				if frame.meta.len() < std::mem::size_of::<TableReplicaWriteMeta>() {
 					return Err(Error::new(

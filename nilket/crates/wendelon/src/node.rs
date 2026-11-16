@@ -30,7 +30,188 @@ mod control_only_node;
 mod identity;
 mod instance_startup;
 mod replacement_preparation;
+pub(crate) mod replacement_recovery;
 pub use control_only_node::ControlOnlyNode;
+
+/// Test-support only (wendelon ADR 0106): a stopped store's saved recovery
+/// statement as (gid, applied cut), read under its own directory owner, which is
+/// closed again. Not a product API.
+#[cfg(feature = "test-support")]
+pub async fn stored_recovery_for_test(
+	data_dir: &std::path::Path,
+) -> std::io::Result<Option<(u64, u64)>> {
+	let owner = DataDirectoryOwner::acquire_existing(data_dir)?;
+	let index = crate::storage::index::PersistentLocalIndex::open_with_owner(
+		crate::storage::index::persistent_index_path(data_dir),
+		Some(owner.clone()),
+	)
+	.await?;
+	let saved = index.recovery_submission().await?;
+	drop(index);
+	owner.close(std::time::Duration::from_secs(10)).await?;
+	Ok(saved.map(|saved| (saved.gid, saved.k)))
+}
+/// Wendelon ADR 0106, test support: what a stopped replacement's store holds of
+/// its recovery, read from its physical rows. The store is opened as the
+/// recovery opens it (its configuration, under its own directory owner, the
+/// cluster's root enrolled), then closed again. Not a product API.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone, Debug)]
+pub struct RecoveredRowsForTest {
+	/// The saved statement: (token, instance, store, gid, applied cut).
+	pub saved: Option<(u128, u32, u128, u64, u64)>,
+	/// Children held Complete.
+	pub complete_children: usize,
+	/// Each Complete child that fails the stored-row verification (owner,
+	/// physical copy and content digest of every manifest version), and each
+	/// base row entry with no stored copy or a differing one, with why.
+	pub unverified: Vec<String>,
+	/// Every stored row version of the table, from the Complete children's
+	/// manifests and the installed certified base (each version once), read
+	/// from the slab and projected to the table's columns, one batch per copy.
+	pub rows: Vec<arrow::record_batch::RecordBatch>,
+}
+
+#[cfg(feature = "test-support")]
+pub async fn recovered_rows_for_test(
+	config: &std::path::Path,
+	descriptor: &crate::schema::TableSchemaDescriptor,
+) -> std::io::Result<RecoveredRowsForTest> {
+	let cfg = crate::config::load_node_bootstrap_config(config)?;
+	recovered_rows_in(&cfg, descriptor).await
+}
+
+/// `recovered_rows_for_test` for a loaded configuration.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) async fn recovered_rows_in(
+	cfg: &NodeBootstrapConfig,
+	descriptor: &crate::schema::TableSchemaDescriptor,
+) -> std::io::Result<RecoveredRowsForTest> {
+	use crate::storage::index::parent_intents::ParentIntentState;
+	let owner = DataDirectoryOwner::acquire_existing(&cfg.data_dir)?;
+	let found = async {
+		let slab = replacement_recovery::open_recovery_storage(cfg, &owner).await?;
+		let index = slab
+			.persistent_index()
+			.ok_or_else(|| std::io::Error::other("the store has no index"))?;
+		let saved = index.recovery_submission().await?.map(|saved| {
+			(
+				saved.token,
+				saved.r_new,
+				saved.store.get(),
+				saved.gid,
+				saved.k,
+			)
+		});
+		let complete = index
+			.parent_intents_in(&[ParentIntentState::Complete])
+			.await?;
+		let mut unverified = Vec::new();
+		// One entry per stored version, whether the base or a child holds it.
+		let mut rows = std::collections::BTreeMap::new();
+		for (rsv, ordinal) in &complete {
+			let intent = index
+				.parent_intent(*rsv, *ordinal)
+				.await?
+				.ok_or_else(|| std::io::Error::other("a listed intent is missing"))?;
+			if let Err(why) = crate::network::data_server::child_writes::verify_owned_rows(
+				&slab, &index, &intent, descriptor,
+			)
+			.await
+			{
+				unverified.push(format!("({rsv}, {ordinal}): {why:?}"));
+			}
+			for version in &intent.manifest {
+				if version.table != descriptor.table_object_id
+					|| crate::network::data_server::deletes::is_tombstone_version(
+						descriptor, version,
+					) {
+					continue;
+				}
+				for row in slab
+					.stored_rows_at_version(
+						intent.tenant,
+						crate::schema::Identity::new(version.key_identity),
+						version.hlc,
+						None,
+					)
+					.await?
+				{
+					rows.entry((version.key_identity, version.hlc))
+						.or_insert_with(Vec::new)
+						.push(
+							crate::network::data_server::child_writes::stored_row_projected(
+								descriptor, &row,
+							)
+							.map_err(std::io::Error::other)?,
+						);
+				}
+			}
+		}
+		// The installed certified base: each row entry's stored copies, each
+		// compared with the entry's content digest.
+		let mut after = None;
+		loop {
+			let page = index.base_page(after, 1024).await?;
+			let Some(last) = page.last() else {
+				break;
+			};
+			after = Some(last.key());
+			for entry in &page {
+				if entry.tombstone || entry.table != descriptor.table_object_id {
+					continue;
+				}
+				let key = (entry.key_identity, entry.hlc);
+				if rows.contains_key(&key) {
+					continue;
+				}
+				let stored = slab
+					.stored_rows_at_version(
+						entry.tenant,
+						crate::schema::Identity::new(entry.key_identity),
+						entry.hlc,
+						None,
+					)
+					.await?;
+				if stored.is_empty() {
+					unverified.push(format!("base entry {:?}: not stored", entry.key_identity));
+				}
+				for row in stored {
+					if crate::network::data_server::child_writes::stored_row_digest(
+						descriptor, &row,
+					)
+					.map_err(std::io::Error::other)?
+						!= entry.row_digest
+					{
+						unverified.push(format!(
+							"base entry {:?}: a stored copy differs",
+							entry.key_identity
+						));
+					}
+					rows.entry(key).or_insert_with(Vec::new).push(
+						crate::network::data_server::child_writes::stored_row_projected(
+							descriptor, &row,
+						)
+						.map_err(std::io::Error::other)?,
+					);
+				}
+			}
+		}
+		drop(index);
+		drop(slab);
+		Ok::<_, std::io::Error>(RecoveredRowsForTest {
+			saved,
+			complete_children: complete.len(),
+			unverified,
+			rows: rows.into_values().flatten().collect(),
+		})
+	}
+	.await;
+	let closed = owner.close(std::time::Duration::from_secs(30)).await;
+	let found = found?;
+	closed?;
+	Ok(found)
+}
 pub(crate) use instance_startup::starts_control_only;
 mod startup;
 pub use instance_startup::{

@@ -126,6 +126,22 @@ pub struct TakeOverBody {
 	pub successor: Signer,
 }
 
+/// ADR 0106 (wendelon): a promoted replacement's statement that its store `store`
+/// at slot `slot` holds the certified base at `gid` (`target_digest`; none at
+/// genesis) and every child its recovery owes through the applied cut `k`.
+/// Signed by (slot, store) only after its own stored data was validated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryBody {
+	pub token: u128,
+	pub slot: u32,
+	pub r_new: u32,
+	pub birth: instances::Birth,
+	pub store: StoreIncarnation,
+	pub gid: u64,
+	pub target_digest: Option<[u8; 32]>,
+	pub k: u64,
+}
+
 /// ADR 0729: how long past a lease's own expiry, on the ring clock, before its
 /// range may be taken over. A margin, not a bound: a lease's start is the
 /// requester's clock reading, which nothing gates (only its TTL is clamped), so
@@ -445,6 +461,11 @@ pub enum DecisionCommand {
 	CompleteReplacement {
 		token: u128,
 	},
+	/// ADR 0106 (wendelon): the current promoted replacement's signed recovery
+	/// statement, recorded once per token.
+	RecoveryProved {
+		proof: Signed<RecoveryBody>,
+	},
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -582,6 +603,15 @@ pub enum DecisionRefusal {
 	/// ADR 0105 (wendelon): the slot is between its replacement's Done and its
 	/// activation; it takes no new lease, lineage or coordination.
 	SlotBeingReplaced,
+	/// ADR 0106 (wendelon): the statement is not the current promoted
+	/// replacement's (token, slot, instance, birth, store, serving instance).
+	RecoveryNotAuthorized,
+	/// ADR 0106 (wendelon): it names another certificate than the current one.
+	RecoveryStale,
+	/// ADR 0106 (wendelon): another statement is already recorded for the token.
+	RecoveryConflict,
+	/// ADR 0106 (wendelon): its cut is not below the entry that records it.
+	RecoveryCutAhead,
 }
 
 /// ADR 0721: how the key a store signs with stands against the replicated
@@ -785,6 +815,13 @@ pub enum DecisionResult {
 	/// ADR 0104 (wendelon): the replacement is Done (now or earlier).
 	ReplacementCompleted {
 		r_new: u32,
+	},
+	/// ADR 0106 (wendelon): the replacement's recovery is recorded (now, or
+	/// earlier with exactly this statement).
+	RecoveryRecorded {
+		token: u128,
+		gid: u64,
+		k: u64,
 	},
 }
 
@@ -1552,19 +1589,7 @@ pub(crate) fn promote_incarnation(
 	// not retired, a voter in every configuration of the applied membership
 	// (the uniform swap away from it commits before the Done that retires it),
 	// and not the old instance of an open replacement.
-	let r_new = request.r_new;
-	let serving = !decisions.instances.is_retired(r_new)
-		&& state
-			.last_membership
-			.membership()
-			.get_joint_config()
-			.iter()
-			.all(|config| config.contains(&r_new))
-		&& decisions
-			.instances
-			.open_replacement()
-			.is_none_or(|(_, open)| open.r_old != r_new);
-	if !serving {
+	if !instance_serves(state, decisions, request.r_new) {
 		return Err(SlabRefusal::PromotionStale);
 	}
 	let node = request.node;
@@ -1618,6 +1643,154 @@ pub(crate) fn promote_incarnation(
 			},
 		);
 	Ok(Some(registry))
+}
+
+/// ADR 0106 (wendelon): whether `ancestor` is `store` itself or one of the
+/// stores `store` superseded at `slot`, by the recorded promotion links
+/// `(successor, Some(predecessor))` in the slot's registry. Finite and acyclic:
+/// an incarnation is never accepted twice. It authorizes copying a child that
+/// names an ancestor, never acknowledging or counting for it.
+pub(crate) fn in_recorded_ancestry(
+	state: &SmState,
+	slot: u32,
+	store: StoreIncarnation,
+	ancestor: StoreIncarnation,
+) -> bool {
+	let Some(registry) = state.incarnations.get(&slot) else {
+		return store == ancestor;
+	};
+	let mut at = store;
+	// Bounded by the registry: each step follows one recorded link, and no
+	// incarnation is accepted twice.
+	for _ in 0..=registry.accepted.len() {
+		if at == ancestor {
+			return true;
+		}
+		let Some(previous) = registry
+			.accepted
+			.iter()
+			.find_map(|(successor, predecessor)| (*successor == at).then_some(*predecessor))
+			.flatten()
+		else {
+			return false;
+		};
+		at = previous;
+	}
+	false
+}
+
+/// ADR 0106 (wendelon): whether (`token`, `r_new`, `birth`, `store`) is slot
+/// `slot`'s CURRENT promoted replacement: Done with `r_new` granted to `birth`
+/// under `token`, promoted to `store`, `r_new` still serving and `store` the
+/// slot's current incarnation. An old token, instance or store is not.
+pub(crate) fn current_replacement(
+	state: &SmState,
+	slot: u32,
+	token: u128,
+	r_new: u32,
+	birth: instances::Birth,
+	store: StoreIncarnation,
+) -> bool {
+	let Some(decisions) = state.decisions.as_ref() else {
+		return false;
+	};
+	let Some(replacement) = decisions.instances.replacement(token) else {
+		return false;
+	};
+	replacement.slot == slot
+		&& replacement.phase == instances::ReplacementPhase::Done { r_new }
+		&& replacement.promoted.map(|promotion| promotion.incarnation) == Some(store)
+		&& decisions.instances.record(r_new).is_some_and(|record| {
+			record.birth == birth && record.kind == instances::GrantKind::Replacement { token }
+		}) && instance_serves(state, decisions, r_new)
+		&& current_incarnation(state, slot) == Some(store)
+}
+
+/// ADR 0105/0106 (wendelon): `r_new` serves its slot now: not retired, a voter
+/// in every configuration of the applied membership (the uniform swap away from
+/// it commits before the Done that retires it), and not the old instance of an
+/// open replacement.
+fn instance_serves(state: &SmState, decisions: &DecisionState, r_new: u32) -> bool {
+	!decisions.instances.is_retired(r_new)
+		&& state
+			.last_membership
+			.membership()
+			.get_joint_config()
+			.iter()
+			.all(|config| config.contains(&r_new))
+		&& decisions
+			.instances
+			.open_replacement()
+			.is_none_or(|(_, open)| open.r_old != r_new)
+}
+
+/// ADR 0106 (wendelon): records a promoted replacement's signed recovery
+/// statement. The reducer judges fields and authority, never bytes: the
+/// signer states it only after validating its own stored data. An exact
+/// recorded statement answers its historical success first (certification may
+/// have advanced since); a first one needs the current promoted replacement,
+/// the current certificate and a cut below this entry.
+fn record_recovery(
+	state: &SmState,
+	decisions: &mut DecisionState,
+	proof: &Signed<RecoveryBody>,
+	log_index: u64,
+) -> Result<DecisionResult, DecisionRefusal> {
+	use DecisionRefusal::*;
+	let body = *evidence::verify(decisions, proof)?.body();
+	let replacement = decisions
+		.instances
+		.replacement(body.token)
+		.ok_or(RecoveryNotAuthorized)?;
+	let instances::ReplacementPhase::Done { r_new } = replacement.phase else {
+		return Err(RecoveryNotAuthorized);
+	};
+	let granted = decisions
+		.instances
+		.record(r_new)
+		.map(|record| (record.birth, record.kind));
+	if replacement.slot != body.slot
+		|| r_new != body.r_new
+		|| replacement.promoted.map(|promotion| promotion.incarnation) != Some(body.store)
+		|| granted
+			!= Some((
+				body.birth,
+				instances::GrantKind::Replacement { token: body.token },
+			)) {
+		return Err(RecoveryNotAuthorized);
+	}
+	let statement = instances::Recovery {
+		gid: body.gid,
+		target_digest: body.target_digest,
+		k: body.k,
+	};
+	let recorded = DecisionResult::RecoveryRecorded {
+		token: body.token,
+		gid: body.gid,
+		k: body.k,
+	};
+	match replacement.recovered {
+		Some(existing) if existing == statement => return Ok(recorded),
+		Some(_) => return Err(RecoveryConflict),
+		None => {}
+	}
+	if !instance_serves(state, decisions, r_new)
+		|| current_incarnation(state, body.slot) != Some(body.store)
+	{
+		return Err(RecoveryNotAuthorized);
+	}
+	let current = match &decisions.generations.current {
+		None => (0, None),
+		Some(certificate) => (certificate.gid, Some(certificate.target_digest)),
+	};
+	if (body.gid, body.target_digest) != current {
+		return Err(RecoveryStale);
+	}
+	if body.k >= log_index {
+		return Err(RecoveryCutAhead);
+	}
+	decisions.instances.record_recovery(body.token, statement);
+	Ok(recorded)
 }
 
 /// ADR 0105 (wendelon): whether `slot` is between its replacement's Done and
@@ -1685,6 +1858,16 @@ pub(crate) mod evidence {
 		const DOMAIN: &'static str = "wendelon parent decision child ack v1";
 		fn bound_signer(&self) -> Option<Signer> {
 			Some(self.acker)
+		}
+	}
+
+	impl Evidence for super::RecoveryBody {
+		const DOMAIN: &'static str = "wendelon replacement recovery v1";
+		fn bound_signer(&self) -> Option<Signer> {
+			Some(Signer {
+				node: self.slot,
+				incarnation: self.store,
+			})
 		}
 	}
 
@@ -1840,6 +2023,9 @@ fn reduce(
 		}
 		DecisionCommand::CompleteReplacement { token } => {
 			instances::complete_replacement(state, decisions, token)
+		}
+		DecisionCommand::RecoveryProved { proof } => {
+			record_recovery(state, decisions, &proof, log_index)
 		}
 	};
 	outcome.unwrap_or_else(DecisionResult::Refused)

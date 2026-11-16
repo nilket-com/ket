@@ -5025,3 +5025,341 @@ fn a_superseded_replacement_cannot_make_its_first_promotion() {
 		None
 	);
 }
+
+// ============================================================
+//  ADR 0106 (wendelon): A PROMOTED REPLACEMENT'S RECOVERY RECORD
+// ============================================================
+
+use crate::consensus::decisions::RecoveryBody;
+use crate::consensus::decisions::instances::Recovery;
+
+/// `done()` with slot 3's store J promoted and bound to slot 3's key.
+fn promoted() -> SmState {
+	let mut state = done();
+	assert_eq!(promote(&mut state), WendelonResponse::Success);
+	let key = decision_verifying_key_bytes(dev_decision_signing_secret(3));
+	assert_eq!(
+		bind(
+			&mut state,
+			Signer {
+				node: 3,
+				incarnation: store_j(),
+			},
+			key
+		),
+		DecisionResult::SignerBound
+	);
+	state
+}
+
+fn recovery_body(gid: u64, target_digest: Option<[u8; 32]>, k: u64) -> RecoveryBody {
+	RecoveryBody {
+		token: TOKEN,
+		slot: 3,
+		r_new: ALLOCATED_BASE,
+		birth: [BIRTH; 16],
+		store: store_j(),
+		gid,
+		target_digest,
+		k,
+	}
+}
+
+fn prove(state: &mut SmState, body: RecoveryBody) -> DecisionResult {
+	let signer = Signer {
+		node: 3,
+		incarnation: body.store,
+	};
+	decide(
+		state,
+		DecisionCommand::RecoveryProved {
+			proof: sign_for_test(body, signer),
+		},
+	)
+}
+
+fn certify(state: &mut SmState, gid: u64, digest: [u8; 32]) {
+	state.decisions.as_mut().unwrap().generations.current = Some(generations::Certificate {
+		gid,
+		target_digest: digest,
+		t: 1,
+		predecessor_gid: gid - 1,
+		chunks: crate::storage::index::certified_base::chunk_sums(std::iter::empty()),
+		committed_at: 1,
+	});
+}
+
+fn unchanged(state: &mut SmState, body: RecoveryBody, refusal: DecisionRefusal) {
+	let before = state.decisions.clone();
+	assert_eq!(prove(state, body), refused(refusal));
+	assert_eq!(state.decisions, before);
+}
+
+#[test]
+fn a_recovery_is_recorded_once_for_the_current_promoted_store() {
+	// Done but not promoted: no key is bound to the store, so its statement
+	// verifies against nothing and changes nothing.
+	let mut state = done();
+	let before = state.decisions.clone();
+	assert!(matches!(
+		prove(&mut state, recovery_body(0, None, 1)),
+		DecisionResult::Refused(DecisionRefusal::Unverifiable)
+	));
+	assert_eq!(state.decisions, before);
+	let mut state = promoted();
+	// Another birth, instance or store: not this replacement.
+	for body in [
+		RecoveryBody {
+			birth: [BIRTH + 1; 16],
+			..recovery_body(0, None, 1)
+		},
+		RecoveryBody {
+			r_new: ALLOCATED_BASE + 1,
+			..recovery_body(0, None, 1)
+		},
+	] {
+		unchanged(&mut state, body, DecisionRefusal::RecoveryNotAuthorized);
+	}
+	// Genesis: no certificate, no digest.
+	let k = peek_index() - 1;
+	assert_eq!(
+		prove(&mut state, recovery_body(0, None, k)),
+		DecisionResult::RecoveryRecorded {
+			token: TOKEN,
+			gid: 0,
+			k,
+		}
+	);
+	assert_eq!(
+		decisions(&state)
+			.instances()
+			.replacement(TOKEN)
+			.unwrap()
+			.recovered,
+		Some(Recovery {
+			gid: 0,
+			target_digest: None,
+			k,
+		})
+	);
+	// The exact retry is its historical answer; another statement conflicts.
+	let before = state.decisions.clone();
+	assert_eq!(
+		prove(&mut state, recovery_body(0, None, k)),
+		DecisionResult::RecoveryRecorded {
+			token: TOKEN,
+			gid: 0,
+			k,
+		}
+	);
+	assert_eq!(state.decisions, before);
+	unchanged(
+		&mut state,
+		recovery_body(0, None, k - 1),
+		DecisionRefusal::RecoveryConflict,
+	);
+}
+
+#[test]
+fn a_recovery_names_the_current_certificate_and_a_cut_below_its_entry() {
+	let mut state = promoted();
+	certify(&mut state, 5, [0x05; 32]);
+	let k = peek_index() - 1;
+	for body in [
+		recovery_body(0, None, k),
+		recovery_body(5, Some([0x06; 32]), k),
+		recovery_body(4, Some([0x05; 32]), k),
+		recovery_body(5, None, k),
+	] {
+		unchanged(&mut state, body, DecisionRefusal::RecoveryStale);
+	}
+	unchanged(
+		&mut state,
+		recovery_body(5, Some([0x05; 32]), peek_index()),
+		DecisionRefusal::RecoveryCutAhead,
+	);
+	let k = peek_index() - 1;
+	assert_eq!(
+		prove(&mut state, recovery_body(5, Some([0x05; 32]), k)),
+		DecisionResult::RecoveryRecorded {
+			token: TOKEN,
+			gid: 5,
+			k,
+		}
+	);
+}
+
+#[test]
+fn a_recovery_is_signed_by_the_promoted_store_and_refused_once_superseded() {
+	let mut state = promoted();
+	let k = peek_index() - 1;
+	// Signed as the old store: its key is bound to (3, I), not to this body.
+	let forged = sign_for_test(recovery_body(0, None, k), signer(3));
+	let before = state.decisions.clone();
+	assert!(matches!(
+		decide(
+			&mut state,
+			DecisionCommand::RecoveryProved { proof: forged }
+		),
+		DecisionResult::Refused(_)
+	));
+	assert_eq!(state.decisions, before);
+	// A later replacement is opened against this store's instance.
+	assert!(matches!(
+		decide(
+			&mut state,
+			DecisionCommand::BeginReplacement {
+				token: TOKEN + 1,
+				slot: 3
+			}
+		),
+		DecisionResult::ReplacementRecorded {
+			r_old: ALLOCATED_BASE,
+			..
+		}
+	));
+	let k = peek_index() - 1;
+	unchanged(
+		&mut state,
+		recovery_body(0, None, k),
+		DecisionRefusal::RecoveryNotAuthorized,
+	);
+}
+
+/// R2: the ancestry of the current store at slot 3 after I -> J1 -> J2 holds
+/// J2, J1 and I (a direct-link rule would miss I), and nothing else.
+#[test]
+fn a_stores_recorded_ancestry_follows_every_promotion_back() {
+	let mut state = base(3);
+	let (j1, j2, other) = (
+		StoreIncarnation::from_raw(0x0106_0001),
+		StoreIncarnation::from_raw(0x0106_0002),
+		StoreIncarnation::from_raw(0x0106_0003),
+	);
+	state.incarnations.insert(
+		3,
+		IncarnationRegistry {
+			current: Some(j2),
+			retired: [inc(3), j1].into_iter().collect(),
+			accepted: [(j1, Some(inc(3))), (j2, Some(j1))].into_iter().collect(),
+		},
+	);
+	use crate::consensus::decisions::in_recorded_ancestry;
+	for ancestor in [j2, j1, inc(3)] {
+		assert!(
+			in_recorded_ancestry(&state, 3, j2, ancestor),
+			"{ancestor:?}"
+		);
+	}
+	assert!(!in_recorded_ancestry(&state, 3, j2, other));
+	assert!(
+		!in_recorded_ancestry(&state, 2, j2, inc(3)),
+		"another slot's chain"
+	);
+	assert!(!in_recorded_ancestry(&state, 3, j1, j2), "never forward");
+}
+
+/// ADR 0106 (wendelon): the delta after a recorded cut K is selected by the
+/// decision index. A parent reserved at or below K and accepted above it is
+/// owed after K (a selection by reservation would skip it) and not through K.
+#[test]
+fn a_parent_reserved_before_the_cut_and_accepted_after_it_is_owed_as_delta() {
+	use crate::node::replacement_recovery::owed_children;
+	let mut state = base(3);
+	grant_all(&mut state);
+	let early = claim(key(T0, 1), children(&state, 2), 0);
+	let DecisionResult::Reserved {
+		reservation: rsv_early,
+	} = reserve(&mut state, &early, T0)
+	else {
+		panic!("reserve");
+	};
+	let later = claim(key(T0, 2), children(&state, 2), 0);
+	let DecisionResult::Reserved {
+		reservation: rsv_later,
+	} = reserve(&mut state, &later, T0)
+	else {
+		panic!("reserve");
+	};
+	finalize(&mut state, &later, quorum_acks(&later, rsv_later));
+	let k = decisions(&state).bodies[&rsv_later]
+		.status
+		.dec()
+		.expect("accepted");
+	finalize(&mut state, &early, quorum_acks(&early, rsv_early));
+	let dec_early = decisions(&state).bodies[&rsv_early]
+		.status
+		.dec()
+		.expect("accepted");
+	assert!(
+		rsv_early <= k && dec_early > k,
+		"reserved before K, accepted after"
+	);
+	let slot = early.children[0].plan[0].node;
+	let after: Vec<(u64, u64)> = owed_children(&state, slot, k, u64::MAX)
+		.iter()
+		.map(|child| (child.rsv, child.dec))
+		.collect();
+	assert!(after.iter().all(|(rsv, _)| *rsv == rsv_early), "{after:?}");
+	assert!(
+		!after.is_empty(),
+		"the late-accepted parent is owed after K"
+	);
+	let through: Vec<u64> = owed_children(&state, slot, 0, k)
+		.iter()
+		.map(|child| child.rsv)
+		.collect();
+	assert!(through.contains(&rsv_later) && !through.contains(&rsv_early));
+}
+
+/// ADR 0106 (wendelon): a recorded recovery is not a generation report. With
+/// slot 3's promoted store a current member, a target commits only once that
+/// store reports itself; its recorded RecoveryProved, and the survivors'
+/// reports, do not stand in for it (taking part is ADR 0107).
+#[test]
+fn a_recorded_recovery_does_not_report_for_its_store() {
+	let mut state = promoted();
+	let k = peek_index() - 1;
+	assert!(matches!(
+		prove(&mut state, recovery_body(0, None, k)),
+		DecisionResult::RecoveryRecorded { .. }
+	));
+	let t = peek_index() - 1;
+	assert_eq!(
+		propose(&mut state, 1, t, 0),
+		DecisionResult::TargetRecorded { gid: 1 }
+	);
+	let members = decisions(&state)
+		.generations
+		.pending
+		.clone()
+		.unwrap()
+		.target
+		.members;
+	let j = Signer {
+		node: 3,
+		incarnation: store_j(),
+	};
+	assert!(members.contains(&j), "the promoted store is a member");
+	for member in members.iter().filter(|member| **member != j) {
+		let report = report_of(&state, *member, 3);
+		assert!(matches!(
+			decide(&mut state, report),
+			DecisionResult::ReportRecorded { .. }
+		));
+	}
+	assert_eq!(generations::ready_commit(&state), None);
+	assert_eq!(
+		decide(&mut state, DecisionCommand::CommitGeneration { gid: 1 }),
+		refused(DecisionRefusal::BarrierIncomplete)
+	);
+	let own = report_of(&state, j, 3);
+	assert!(matches!(
+		decide(&mut state, own),
+		DecisionResult::ReportRecorded { .. }
+	));
+	assert!(matches!(
+		decide(&mut state, DecisionCommand::CommitGeneration { gid: 1 }),
+		DecisionResult::GenerationCommitted { .. }
+	));
+}

@@ -188,7 +188,9 @@ impl HrftService for MsgRouter {
 				|| x == MsgType::TABLE_CHILD_REPLICATE_REQ.0
 				|| x == MsgType::TABLE_CHILD_REPLICATE_RESP.0
 				|| x == MsgType::TABLE_CHILD_FETCH_REQ.0
-				|| x == MsgType::TABLE_CHILD_FETCH_RESP.0 =>
+				|| x == MsgType::TABLE_CHILD_FETCH_RESP.0
+				|| x == MsgType::TABLE_BASE_FETCH_REQ.0
+				|| x == MsgType::TABLE_BASE_FETCH_RESP.0 =>
 			{
 				match &self.data {
 					Some(h) => h.handle_data_frame(context, frame).await,

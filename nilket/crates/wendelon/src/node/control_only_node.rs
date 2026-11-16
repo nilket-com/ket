@@ -24,7 +24,7 @@ pub struct ControlOnlyNode {
 	owner: DataDirectoryOwner,
 	/// ADR 0105 (wendelon): the replacement's preparation and its task.
 	preparation: Arc<super::replacement_preparation::Preparation>,
-	preparing: tokio::task::JoinHandle<()>,
+	preparing: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 	shutdown_bound: std::time::Duration,
 }
 
@@ -174,6 +174,8 @@ impl ControlOnlyNode {
 			owner.clone(),
 			cfg.data_dir.clone(),
 			key,
+			cfg.clone(),
+			secret,
 		));
 		let preparing = tokio::spawn(preparation.clone().run());
 		tracing::info!(
@@ -192,7 +194,7 @@ impl ControlOnlyNode {
 			checkpoint_emitter,
 			owner,
 			preparation,
-			preparing,
+			preparing: std::sync::Mutex::new(Some(preparing)),
 			shutdown_bound: cfg.storage_shutdown_timeout,
 		})
 	}
@@ -213,16 +215,55 @@ impl ControlOnlyNode {
 		self.preparation.sent_for_test()
 	}
 
-	/// Whether preparation has finished (promoted and bound) or stopped.
+	/// ADR 0106 (wendelon): the promoted store's restricted storage, opened by
+	/// the preparation task (the one owner of the store's index) once the
+	/// replacement is promoted and bound and the cluster's root is enrolled.
+	/// Test-only: the product reads it only through its own task.
+	#[cfg(test)]
+	pub(crate) async fn recovery_storage(&self) -> std::io::Result<Arc<SlabManager>> {
+		loop {
+			if let Some(slab) = self.preparation.recovery_slab() {
+				return Ok(slab);
+			}
+			if self.preparation_ended() {
+				return Err(Error::other(
+					"the replacement's preparation ended without its storage",
+				));
+			}
+			tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+		}
+	}
+
+	/// Whether this member's store is promoted and bound (gate 2 done).
+	pub fn prepared(&self) -> bool {
+		self.preparation.prepared()
+	}
+
+	/// Whether the preparation task (gate 2, then the recovery) has ended:
+	/// stopped on a refusal or a fault, or shut down.
 	pub fn preparation_ended(&self) -> bool {
-		self.preparing.is_finished()
+		self.preparing
+			.lock()
+			.unwrap()
+			.as_ref()
+			.is_none_or(|task| task.is_finished())
+	}
+
+	/// Stops the preparation task after its current step (never aborted, see
+	/// `recovery_storage`) and waits for it to end.
+	async fn stop_preparation(&self) {
+		self.preparation.request_stop();
+		let task = self.preparing.lock().unwrap().take();
+		if let Some(task) = task {
+			let _ = task.await;
+		}
 	}
 
 	/// Stops serving, shuts Raft down and closes the data directory.
 	pub async fn shutdown(self) -> std::io::Result<()> {
-		self.preparing.abort();
-		let _ = self.preparing.await;
-		self.preparation.release().await;
+		self.stop_preparation().await;
+		// A failed early close leaves the index to the owner's close below.
+		let _ = self.preparation.release().await;
 		self.lifecycle.begin_drain();
 		for server in &self.servers {
 			server.begin_drain();

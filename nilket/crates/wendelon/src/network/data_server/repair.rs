@@ -76,11 +76,22 @@ fn fetch_source_check(
 			.get(&node)
 			.and_then(|registry| registry.current)
 	};
+	// ADR 0106 (wendelon): a requester is eligible as the plan member it is, or
+	// as the current successor of one (its recorded ancestry). The source itself
+	// must be a plan member exactly (below).
 	let eligible = |node: u32| {
-		child
-			.plan
-			.iter()
-			.any(|member| member.node == node && current(node) == Some(member.incarnation))
+		child.plan.iter().any(|member| {
+			member.node == node
+				&& current(node).is_some_and(|current| {
+					current == member.incarnation
+						|| crate::consensus::decisions::in_recorded_ancestry(
+							state,
+							node,
+							current,
+							member.incarnation,
+						)
+				})
+		})
 	};
 	if requester == local.node || !eligible(requester) {
 		return Err(ChildRefusal::WrongSender);
@@ -262,103 +273,164 @@ impl WendelonDataServer {
 			.signer
 			.clone()
 			.ok_or(ChildRefusal::ModeToday)?;
-		let local = signer.signer;
-		let found = self
-			.state_machine
-			.read_state(move |state| {
-				let body = state.decisions.as_ref()?.body(rsv)?;
-				if !matches!(body.status, ParentStatus::Accepted { .. }) {
-					return None;
-				}
-				let child = body.claim.children.get(usize::from(ordinal))?;
-				let mut sources = vec![child.holder.node];
-				sources.extend(child.plan.iter().map(|member| member.node));
-				sources.retain(|node| *node != local.node);
-				let mut seen = std::collections::BTreeSet::new();
-				sources.retain(|node| seen.insert(*node));
-				Some((body.claim_digest, sources))
-			})
-			.await;
-		let Some((claim_digest, sources)) = found else {
-			return Err(ChildRefusal::NotAccepted);
+		let factory = self.factory.clone();
+		let context = RepairContext {
+			local: signer.signer,
+			signer,
+			state_machine: self.state_machine.clone(),
+			slab: self.slab.clone(),
+			locks: self.decisions.locks.clone(),
+			pool: self.pool.clone(),
+			connect: Arc::new(move |node| {
+				let factory = factory.clone();
+				Box::pin(async move {
+					factory
+						.get_connection(NodeId {
+							id: node,
+							_reserved: 0,
+						})
+						.await
+				})
+			}),
 		};
-		let meta = ChildFetchMeta {
+		repair_child_in(&context, rsv, ordinal, schema_generation).await
+	}
+}
+
+/// ADR 0106 (wendelon): how a repair reaches a node by its slot.
+pub(crate) type Connect = Arc<
+	dyn Fn(
+			u32,
+		) -> std::pin::Pin<
+			Box<
+				dyn std::future::Future<
+						Output = std::io::Result<
+							Arc<dyn crate::network::transport::TransportConnection>,
+						>,
+					> + Send,
+			>,
+		> + Send
+		+ Sync,
+>;
+
+/// ADR 0106 (wendelon): what a repair needs, so a recovering control-only
+/// replacement can repair without a data server.
+pub(crate) struct RepairContext {
+	pub(crate) local: crate::consensus::decisions::Signer,
+	pub(crate) signer: Arc<super::child_writes::DecisionSigner>,
+	pub(crate) state_machine: WendelonStateMachine,
+	pub(crate) slab: Arc<SlabManager>,
+	pub(crate) locks: Arc<super::child_writes::ParentLocks>,
+	pub(crate) pool: Arc<BufPool>,
+	pub(crate) connect: Connect,
+}
+
+/// Repairs `local`'s copy of an Accepted child from the other members of its
+/// recorded plan, holder first, one bounded attempt per source. The rows are
+/// checked against the recorded claim and persisted as a repair: no ack.
+pub(crate) async fn repair_child_in(
+	ctx: &RepairContext,
+	rsv: u64,
+	ordinal: u16,
+	schema_generation: u64,
+) -> Result<(), ChildRefusal> {
+	let signer = ctx.signer.clone();
+	let local = ctx.local;
+	let found = ctx
+		.state_machine
+		.read_state(move |state| {
+			let body = state.decisions.as_ref()?.body(rsv)?;
+			if !matches!(body.status, ParentStatus::Accepted { .. }) {
+				return None;
+			}
+			let child = body.claim.children.get(usize::from(ordinal))?;
+			let mut sources = vec![child.holder.node];
+			sources.extend(child.plan.iter().map(|member| member.node));
+			sources.retain(|node| *node != local.node);
+			let mut seen = std::collections::BTreeSet::new();
+			sources.retain(|node| seen.insert(*node));
+			Some((body.claim_digest, sources))
+		})
+		.await;
+	let Some((claim_digest, sources)) = found else {
+		return Err(ChildRefusal::NotAccepted);
+	};
+	let meta = ChildFetchMeta {
+		rsv,
+		ordinal,
+		claim_digest,
+		schema_generation,
+	};
+	let mut last = ChildRefusal::Unverified("no plan member to fetch from".into());
+	for source in sources {
+		let fetched = tokio::time::timeout(
+			SOURCE_BOUND,
+			fetch_child(ctx.connect.clone(), ctx.pool.clone(), source, &meta),
+		)
+		.await;
+		let batch = match fetched {
+			Ok(Ok(batch)) => batch,
+			Ok(Err(refusal)) => {
+				last = refusal;
+				continue;
+			}
+			Err(_) => {
+				last = ChildRefusal::Storage(format!("node {source} did not answer in time"));
+				continue;
+			}
+		};
+		let write = ChildWriteMeta {
 			rsv,
 			ordinal,
 			claim_digest,
 			schema_generation,
 		};
-		let mut last = ChildRefusal::Unverified("no plan member to fetch from".into());
-		for source in sources {
-			let fetched = tokio::time::timeout(
-				SOURCE_BOUND,
-				fetch_child(self.factory.clone(), self.pool.clone(), source, &meta),
-			)
+		let plan = ctx
+			.state_machine
+			.read_state(move |state| {
+				plan_child(
+					state,
+					local,
+					source,
+					ChildRole::Repair,
+					&write,
+					batch,
+					|_, _| false,
+				)
+			})
 			.await;
-			let batch = match fetched {
-				Ok(Ok(batch)) => batch,
-				Ok(Err(refusal)) => {
-					last = refusal;
-					continue;
-				}
-				Err(_) => {
-					last = ChildRefusal::Storage(format!("node {source} did not answer in time"));
-					continue;
-				}
-			};
-			let write = ChildWriteMeta {
-				rsv,
-				ordinal,
-				claim_digest,
-				schema_generation,
-			};
-			let plan = self
-				.state_machine
-				.read_state(move |state| {
-					plan_child(
-						state,
-						local,
-						source,
-						ChildRole::Repair,
-						&write,
-						batch,
-						|_, _| false,
-					)
-				})
-				.await;
-			let plan = match plan {
-				Ok(plan) => plan,
-				Err(refusal) => {
-					last = refusal;
-					continue;
-				}
-			};
-			match persist_locked(
-				self.slab.clone(),
-				self.state_machine.clone(),
-				self.decisions.locks.clone(),
-				plan,
-				ChildAuthority {
-					signer: signer.clone(),
-					role: ChildRole::Repair,
-					leases: None,
-					#[cfg(test)]
-					before_sign: None,
-				},
-			)
-			.await
-			{
-				Ok(_) => return Ok(()),
-				Err(refusal) => last = refusal,
+		let plan = match plan {
+			Ok(plan) => plan,
+			Err(refusal) => {
+				last = refusal;
+				continue;
 			}
+		};
+		match persist_locked(
+			ctx.slab.clone(),
+			ctx.state_machine.clone(),
+			ctx.locks.clone(),
+			plan,
+			ChildAuthority {
+				signer: signer.clone(),
+				role: ChildRole::Repair,
+				leases: None,
+				#[cfg(test)]
+				before_sign: None,
+			},
+		)
+		.await
+		{
+			Ok(_) => return Ok(()),
+			Err(refusal) => last = refusal,
 		}
-		Err(last)
 	}
+	Err(last)
 }
 
 /// Sends one fetch and decodes its bounded answer.
 async fn fetch_child(
-	factory: Arc<TransportProviderFactory>,
+	connect: Connect,
 	pool: Arc<BufPool>,
 	source: u32,
 	meta: &ChildFetchMeta,
@@ -366,13 +438,7 @@ async fn fetch_child(
 	let io = |error: std::io::Error| ChildRefusal::Storage(error.to_string());
 	let bytes =
 		postcard::to_stdvec(meta).map_err(|error| ChildRefusal::Storage(error.to_string()))?;
-	let conn = factory
-		.get_connection(NodeId {
-			id: source,
-			_reserved: 0,
-		})
-		.await
-		.map_err(io)?;
+	let conn = connect(source).await.map_err(io)?;
 	let mut stream = conn.open_bi().await.map_err(io)?;
 	let header = FrameHeader {
 		magic: HRFT_MAGIC,

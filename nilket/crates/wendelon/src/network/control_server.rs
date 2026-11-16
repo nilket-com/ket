@@ -765,6 +765,8 @@ pub struct ReplacementReportWire {
 	pub promoted: Option<crate::consensus::StoreIncarnation>,
 	/// ADR 0105 (wendelon): the decision key bound to the promoted store.
 	pub bound_key: Option<[u8; 32]>,
+	/// ADR 0106 (wendelon): the recorded recovery's (gid, applied cut).
+	pub recovered: Option<(u64, u64)>,
 }
 
 /// ADR 0736: a TENANT_ADMIN_RESP body as the response, then the backup
@@ -3400,6 +3402,7 @@ impl WendelonControlServer {
 						phase,
 						promoted: None,
 						bound_key: None,
+						recovered: None,
 					}),
 					None,
 				),
@@ -4200,6 +4203,7 @@ impl WendelonControlServer {
 									incarnation: promotion.incarnation,
 								})
 							}),
+							recovered: record.recovered.map(|recovery| (recovery.gid, recovery.k)),
 						})
 					})
 					.await;

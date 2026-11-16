@@ -9451,6 +9451,8 @@ fn adr077_data_server_source_concatenates_submodules() {
 		basenames,
 		vec![
 			"data_server.rs",
+			// Wendelon ADR 0106: a recovering replacement's certified-base pages.
+			"base_fetch.rs",
 			// ADR 0699 S5a: a store's part in certified generations.
 			"certification.rs",
 			// ADR 0699 S3b: child writes under the ParentDecisions authority, kept

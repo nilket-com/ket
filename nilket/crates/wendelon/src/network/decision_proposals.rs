@@ -84,6 +84,11 @@ pub enum ForwardedDecision {
 	TakeOverLineage {
 		takeover: Signed<crate::consensus::decisions::TakeOverBody>,
 	},
+	/// ADR 0106 (wendelon): a promoted replacement's signed recovery statement,
+	/// for the sender's own slot.
+	RecoveryProved {
+		proof: Signed<crate::consensus::decisions::RecoveryBody>,
+	},
 	/// ADR 0105 (wendelon): a Done replacement admits its new store as the
 	/// sender's current incarnation. The node is always the sender; the state
 	/// machine judges the token, instance, birth and registry.
@@ -541,6 +546,12 @@ pub(crate) fn admission(
 					supersedes: None,
 				},
 			)));
+		}
+		ForwardedDecision::RecoveryProved { proof } => {
+			if proof.body.slot != sender {
+				return Err(ProposalRefusal::NotTheSender);
+			}
+			DecisionCommand::RecoveryProved { proof }
 		}
 		ForwardedDecision::PromoteIncarnation {
 			token,

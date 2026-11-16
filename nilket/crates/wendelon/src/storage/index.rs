@@ -2716,6 +2716,13 @@ impl PersistentLocalIndex {
 		self.incarnation
 	}
 
+	/// ADR 0106 (wendelon): closes this index before its owner, through the
+	/// owner's own closer (see `OwnedRedb::close_and_join`). A failure leaves
+	/// it open and protected.
+	pub(crate) async fn close(&self) -> std::io::Result<()> {
+		self.db.close_and_join().await
+	}
+
 	/// The committed exclusive bound on issued slab ids.
 	pub(crate) async fn slab_id_high_water(&self) -> std::io::Result<u64> {
 		self.db

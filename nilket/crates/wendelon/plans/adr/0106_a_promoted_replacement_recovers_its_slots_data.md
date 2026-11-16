@@ -124,3 +124,41 @@ The recovery task keeps repairing the delta (children Accepted after K that name
 - Reclaim of I's objects.
 - Successor-source serving.
 - Repeated replacement beyond D4.
+
+## As built
+- **Reducer.**
+  - `DecisionCommand::RecoveryProved { proof: Signed<RecoveryBody> }`, where `RecoveryBody {token, slot, r_new, birth, store, gid, target_digest, k}` is evidence bound to (slot, store).
+  - `record_recovery` checks, in order: the signature; the identity fields; an exact recorded statement, answered as its historical success (another is `RecoveryConflict`); `instance_serves` (shared with ADR 0105's promotion) and the current incarnation; the current certificate, or (0, None) at genesis (`RecoveryStale`); `k < log_index` (`RecoveryCutAhead`).
+  - It records `Replacement.recovered: Option<Recovery {gid, target_digest, k}>`. `ForwardedDecision::RecoveryProved` is admitted only when `body.slot == sender`.
+- **Authority and ancestry.** `decisions::current_replacement` is the D1 check used by the base fetch source. `decisions::in_recorded_ancestry` follows N's `accepted` links. It is used by `plan_child` (Repair role only) and by `fetch_source_check` (requester eligibility). The source itself is still required to be an exact plan member.
+- **Repair.** `repair::RepairContext` plus `repair_child_in`; the data server's `repair_child` delegates to it with its factory connect. A Repair persist never signs (`child_writes.rs`).
+- **Base fetch.** `network/data_server/base_fetch.rs`:
+  - `TABLE_BASE_FETCH_REQ`/`RESP` (0x6E/0x6F), version-1 frames, routed to the data ring, and in the PD served set;
+  - `BaseFetchRequest` carries the full replacement identity;
+  - the source answers through `handle_base_fetch` / `serve_base_page`: D1, the current certificate, the base validated, not behind and active at gid; pages in key order of one (tenant, table), at most 1024 rows, rows projected with `stored_row_projected`;
+  - **byte bound (Codex 01a1e20e R1):** the charge is what is sent, the answer meta plus the encoded Arrow payload; each row is charged by its own encoding. A page carries rows up to the request's `max_bytes` (normally `MAX_PAGE_BYTES`, 4 MiB). A first row that alone exceeds it is refused `RowTooLarge`, never sent; the receiver asks again once at `MAX_ROW_PAGE_BYTES` (= `MAX_CHILD_ROWS_BYTES`, 64 MiB, the bound any stored row already meets on the child path). The source refuses an answer above `max_bytes` plus a 1 MiB meta allowance, and the receiver checks the frame header against the same bound before reading the body. The total answer cap is therefore 5 MiB normally and 65 MiB enlarged (accepted, Codex 01a1e238); it is not a strict 4 MiB page and not a small-node memory result. Above the 64 MiB row payload a refusal blocks recovery, reported;
+  - `with_rows`: phase 1 asks for entries only (a page with rows is refused), phase 2 for rows;
+  - the receiver checks with `check_page`; rows pair with entries **by position** (R2): row i must be entry i's identity and content, so a permutation is refused before anything is stored.
+
+  Pages walk the whole base by key cursor, not chunk by chunk. Completeness is the publication check: streamed per-chunk sums, counts included, must equal the certificate's. NotServing answers the fetch `Refused(NotReady)`.
+- **Install.**
+  - `stage_recovered_page` / `publish_recovered` (`base_recovery_v1`, meta key `recovery`; pristine store only; sums recomputed while reading);
+  - `ingest_recovered_rows` (the child row path without intent or owner, grouped by HLC);
+  - `deletes::append_tombstone` for tombstones.
+
+  **Two phases (R4):** untrusted data never reaches the store's versions.
+  1. From one source, entries only, staged in `base_recovery_v1` and checked whole against the certificate (counts and sums, streamed). A mismatch discards that staging (`discard_recovered_staging`, metadata only, pristine store only) and the next source is tried. The staging is bound to the certificate before any entry arrives, so an **empty base at a nonzero gid** (R3) verifies and publishes against the empty sums.
+  2. Rows, page by page from any source (resumed at the cursor across sources): a page is ingested only when its entries are exactly the next staged entries after the cursor (a contiguous prefix, read from the staging in key order) and each row is its entry's; a last page (or an empty one) must reach the staging's end. A gap, skip or early end is refused before anything is stored, and the next source is asked from the same cursor (Codex 01a1e238 R1). Then the staged base is published.
+
+  A source whose entries differ is never used for rows; nothing it sent is stored.
+- **Saved statement.** `RecoverySubmission` (meta key `recovery_submission`), written once (`save_recovery_submission` refuses another).
+- **Driver.** `node::replacement_recovery::RecoveryDriver`, run by the preparation task after promotion and binding:
+  - it hands its owner-bound index over and opens the restricted `SlabManager` (it waits while `RootKekNotEnrolled`; any other open failure is final);
+  - each step: D1; with no record, install the base at G if G > 0, repair owed children with dec ≤ K, `validate`, save the submission, sign, then `Progress::Ready`, which is forwarded (`RecoveryRecorded` is "again");
+  - with a record: reconcile exactly, require the certificate unchanged (otherwise `RecoveryUnsupported`), revalidate once per start, then repair the delta;
+  - `validate` reads the base in bounded pages (1024 entries) with 256 fixed chunk accumulators (`ChunkAccumulator`), recomputing the sums from the stored entries (never the stored metadata), and runs `entry_is_stored` (a shared free function now) on each entry and `verify_owned_rows` on every owed child;
+  - the delta is selected by decision index (`owed_children`, a pure function): a parent reserved at or below K and accepted above it is owed after K;
+  - test seam `Stage::Recover` (the storage opens, no step runs); `ControlOnlyNode::prepared()`.
+- **Formats.** PD WAL/snapshot 27, marker v17 (v16 retired), PD Raft frame 20, golden `parent_decisions_v27.txt`: `promoted_replacement` moved (it gained `recovered`), and `recovery_proved` added.
+- **F2 lifecycle (Codex 01a1e181, 01a1e1b2):** the owner-bound per-store close through the owner's registered closer, under one async gate, with a failed drop-thread launch restoring the database; a cooperative preparation stop; F2's two parallel-only hangs recorded (F2-CORRECTION-55).
+- **Owning-run oracle (R5, Codex 01a1e238 R2):** test-support `recovered_rows_for_test` (in-process `recovered_rows_in`) opens a stopped replacement's store as its recovery opens it, under its own directory owner, and returns the saved statement, each Complete child failing `verify_owned_rows` (owner, physical copy, content digest), each base row entry with no or a differing stored copy, and every stored row version read from the slab and projected. The workflow requires the exact statement, no failure, and the rows read equal to the acknowledged ones, one copy each; each read runs once within an absolute bound checked before it is accepted, and a timed-out read is never cancelled inside an open. The record promises its cut K, not every acknowledged write (a write accepted after K is repaired as delta afterwards; owning run pd-replace-20261116T030142Z FAILED on exactly that oracle overclaim, row 8 accepted at 178 > K 147). So each read follows one declared 30 s wait with that single process running: once after the record, and once after a restart with a row written then. Then one stop and one read within one absolute bound. No restart-until-held. The next owning run, pd-replace-20261116T031854Z, passed every gate-3 check but FAILED later on a test defect of mine: the post-restart row reused id 9, which the old-instance step writes again; that row is now id 11.

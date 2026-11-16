@@ -750,3 +750,82 @@ async fn a_table_read_without_a_successful_terminal_refuses_the_backup() {
 		assert_eq!(hold_of(&source).await, None, "{ending:?}");
 	}
 }
+
+/// ADR 0106 (wendelon) control 9: a logical backup while a lost member's slot
+/// is replaced by a control-only member. The exporter reads every table through
+/// the ordinary table query; a query attempt that reaches the replacement's
+/// slot is answered NOT_LEADER (NotServing) and the client asks another member.
+/// The export completes with every row, and its artifact verifies.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_backup_completes_while_a_replacement_is_control_only() {
+	use crate::consensus::decisions::instances::ReplacementPhase;
+	use crate::consensus::decisions::{DecisionCommand, DecisionResult};
+	let (mut source, clients, descriptor) = source_with_table().await;
+	for id in 1..=10i64 {
+		write(&clients, &descriptor, &[(id, "a")]).await;
+	}
+	let leader = source.leader().await;
+	let lost = *NODES[1..].iter().find(|id| **id != leader).unwrap();
+	source.stop(lost, true).await;
+	let cfg = source.configs[&lost].clone();
+	std::fs::remove_dir_all(&cfg.data_dir).unwrap();
+	std::fs::create_dir_all(&cfg.data_dir).unwrap();
+	const TOKEN: u128 = 0x0106_0009;
+	assert!(matches!(
+		super::replacement::decide(
+			&source,
+			DecisionCommand::BeginReplacement {
+				token: TOKEN,
+				slot: lost,
+			},
+		)
+		.await,
+		DecisionResult::ReplacementRecorded { .. }
+	));
+	crate::node::provision_replacement_token(&cfg.data_dir, TOKEN).unwrap();
+	let provider: Arc<dyn TransportProvider> = Arc::new(SimulatedTransportProvider::new(
+		crate::schema::NodeId {
+			id: lost,
+			_reserved: 0,
+		},
+		source.network.clone(),
+		crate::network::pool::BufPool::new(64, 1024 * 1024),
+		TIER,
+	));
+	let control = crate::node::ControlOnlyNode::bootstrap_with_provider(cfg.clone(), provider)
+		.await
+		.unwrap();
+	let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+	loop {
+		let leader = source.leader().await;
+		let done = source
+			.node(leader)
+			.state_machine
+			.read_state(|state| {
+				state
+					.decisions
+					.as_ref()
+					.and_then(|decisions| decisions.instances().replacement(TOKEN))
+					.map(|record| matches!(record.phase, ReplacementPhase::Done { .. }))
+			})
+			.await == Some(true);
+		if done {
+			break;
+		}
+		assert!(tokio::time::Instant::now() < deadline, "never Done");
+		tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+	}
+	let root = crate::test_support::TestDir::new("adr0106-backup");
+	let dir = root.to_path_buf().join("backup");
+	let report = export::export(&clients, &dir, PASSPHRASE)
+		.await
+		.unwrap_or_else(|error| panic!("export with a control-only member: {error}"));
+	assert_eq!((report.tables, report.rows), (1, 10), "{report:?}");
+	assert_eq!(hold_of(&source).await, None, "the export released its hold");
+	let verified = restore::verify(&dir, PASSPHRASE).unwrap();
+	assert_eq!(verified.manifest.tables[0].rows, 10);
+	control.shutdown().await.unwrap();
+	for node in std::mem::take(&mut source.nodes) {
+		let _ = tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown()).await;
+	}
+}

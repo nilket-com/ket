@@ -26,6 +26,9 @@ const TICK: std::time::Duration = std::time::Duration::from_millis(200);
 pub(crate) enum Stage {
 	Promote,
 	Bind,
+	/// ADR 0106 (wendelon): the recovery's storage opens, but no recovery step
+	/// runs.
+	Recover,
 }
 
 /// What applied state says remains to do.
@@ -57,6 +60,19 @@ pub(crate) struct Preparation {
 	/// The promotion this task first proposed: proposed again unchanged until
 	/// applied state records a promotion or a refusal is definitive.
 	intent: std::sync::Mutex<Option<ForwardedDecision>>,
+	/// ADR 0106 (wendelon): the index was handed over; it is never opened here
+	/// again.
+	handed_over: std::sync::atomic::AtomicBool,
+	/// ADR 0106 (wendelon): the configuration and decision secret the recovery
+	/// uses, and its restricted storage once opened.
+	cfg: NodeBootstrapConfig,
+	secret: [u8; 32],
+	recovery_slab: std::sync::Mutex<Option<Arc<SlabManager>>>,
+	/// Promoted and bound (gate 2 done here).
+	prepared: std::sync::atomic::AtomicBool,
+	/// ADR 0106 (wendelon): a cooperative stop, taken between steps.
+	stopping: std::sync::atomic::AtomicBool,
+	stop: tokio::sync::Notify,
 	/// Test-only: the proposals this task sent.
 	#[cfg(test)]
 	sent: std::sync::atomic::AtomicU64,
@@ -90,8 +106,14 @@ impl Preparation {
 		owner: DataDirectoryOwner,
 		data_dir: PathBuf,
 		key: [u8; 32],
+		cfg: NodeBootstrapConfig,
+		secret: [u8; 32],
 	) -> Self {
 		Self {
+			cfg,
+			secret,
+			recovery_slab: std::sync::Mutex::new(None),
+			prepared: std::sync::atomic::AtomicBool::new(false),
 			slot,
 			instance,
 			mode,
@@ -104,6 +126,9 @@ impl Preparation {
 			key,
 			store: tokio::sync::Mutex::new(None),
 			intent: std::sync::Mutex::new(None),
+			handed_over: std::sync::atomic::AtomicBool::new(false),
+			stopping: std::sync::atomic::AtomicBool::new(false),
+			stop: tokio::sync::Notify::new(),
 			#[cfg(test)]
 			sent: std::sync::atomic::AtomicU64::new(0),
 		}
@@ -118,6 +143,12 @@ impl Preparation {
 	/// preparation only; the member keeps its Raft obligations.
 	pub(crate) async fn run(self: Arc<Self>) {
 		loop {
+			// ADR 0106 (wendelon): a stop is taken between steps, never inside
+			// one, so an owner-bound open always completes into `store` (an
+			// aborted open would leave its database held by the owner alone).
+			if self.stopping.load(std::sync::atomic::Ordering::SeqCst) {
+				return;
+			}
 			match self.step().await {
 				Ok(true) => {
 					tracing::info!(
@@ -125,6 +156,10 @@ impl Preparation {
 						instance = self.instance,
 						"replacement prepared: its store is current and bound; it stays control-only"
 					);
+					self.prepared
+						.store(true, std::sync::atomic::Ordering::SeqCst);
+					// ADR 0106 (wendelon): the same task recovers the slot's data.
+					self.recover().await;
 					return;
 				}
 				Ok(false) => {}
@@ -138,8 +173,111 @@ impl Preparation {
 					return;
 				}
 			}
-			tokio::time::sleep(TICK).await;
+			tokio::select! {
+				_ = tokio::time::sleep(TICK) => {}
+				_ = self.stop.notified() => {}
+			}
 		}
+	}
+
+	/// Whether the store is promoted and bound (gate 2 done by this task).
+	pub(crate) fn prepared(&self) -> bool {
+		self.prepared.load(std::sync::atomic::Ordering::SeqCst)
+	}
+
+	/// ADR 0106 (wendelon): the recovery's restricted storage, once opened.
+	pub(crate) fn recovery_slab(&self) -> Option<Arc<SlabManager>> {
+		self.recovery_slab.lock().unwrap().clone()
+	}
+
+	/// ADR 0106 (wendelon): hands the index over and opens the restricted
+	/// storage (retried while the cluster's root is not enrolled here), then
+	/// recovers: base, owed children, validation, the saved statement and its
+	/// record, then the delta. Every step rechecks that this store is still its
+	/// slot's current replacement; a definitive refusal ends it.
+	async fn recover(&self) {
+		let slab = loop {
+			if self.stopping.load(std::sync::atomic::Ordering::SeqCst) {
+				return;
+			}
+			match self.open_recovery().await {
+				Ok(slab) => break slab,
+				Err(error) if error.to_string().contains("RootKekNotEnrolled") => {
+					tracing::warn!(slot = self.slot, %error, "recovery waits for the cluster's root");
+				}
+				Err(error) => {
+					tracing::error!(slot = self.slot, %error, "recovery stopped: its storage did not open");
+					return;
+				}
+			}
+			self.pause().await;
+		};
+		let driver = super::replacement_recovery::RecoveryDriver {
+			slot: self.slot,
+			instance: self.instance,
+			state_machine: self.state_machine.clone(),
+			raft: self.raft.clone(),
+			provider: self.provider.clone(),
+			pool: self.pool.clone(),
+			slab,
+			locks: Arc::new(crate::network::data_server::child_writes::ParentLocks::new()),
+			key: ed25519_dalek::SigningKey::from_bytes(&self.secret),
+			validated: std::sync::atomic::AtomicBool::new(false),
+		};
+		loop {
+			if self.stopping.load(std::sync::atomic::Ordering::SeqCst) {
+				return;
+			}
+			#[cfg(test)]
+			let halted = HALTS.lock().unwrap().get(&self.data_dir).copied() == Some(Stage::Recover);
+			#[cfg(not(test))]
+			let halted = false;
+			if !halted {
+				use super::replacement_recovery::Progress;
+				match driver.step().await {
+					Ok(Progress::Ready(request)) => {
+						if let Disposition::Stop(why) = disposition(&self.forward(&request).await) {
+							tracing::error!(slot = self.slot, %why, "recovery stopped: its statement was refused");
+							return;
+						}
+					}
+					Ok(Progress::Pending(why)) => {
+						tracing::debug!(slot = self.slot, %why, "recovery pending");
+					}
+					Ok(Progress::Recorded) => {}
+					Err(error) => {
+						tracing::error!(slot = self.slot, %error, "recovery stopped");
+						return;
+					}
+				}
+			}
+			self.pause().await;
+		}
+	}
+
+	async fn open_recovery(&self) -> std::io::Result<Arc<SlabManager>> {
+		if let Some(slab) = self.recovery_slab() {
+			return Ok(slab);
+		}
+		self.release().await?;
+		let slab =
+			super::replacement_recovery::open_recovery_storage(&self.cfg, &self.owner).await?;
+		*self.recovery_slab.lock().unwrap() = Some(slab.clone());
+		Ok(slab)
+	}
+
+	async fn pause(&self) {
+		tokio::select! {
+			_ = tokio::time::sleep(TICK) => {}
+			_ = self.stop.notified() => {}
+		}
+	}
+
+	/// ADR 0106 (wendelon): asks the task to end after its current step.
+	pub(crate) fn request_stop(&self) {
+		self.stopping
+			.store(true, std::sync::atomic::Ordering::SeqCst);
+		self.stop.notify_one();
 	}
 
 	/// One step: `Ok(true)` once nothing remains.
@@ -275,6 +413,12 @@ impl Preparation {
 		if let Some(index) = store.as_ref() {
 			return Ok(index.store_incarnation());
 		}
+		if self.handed_over.load(std::sync::atomic::Ordering::SeqCst) {
+			return Err(Error::new(
+				ErrorKind::PermissionDenied,
+				"ReplacementStoreHandedOver: the store's index belongs to its recovery now",
+			));
+		}
 		let path = crate::storage::index::persistent_index_path(&self.data_dir);
 		let index = if path.exists() {
 			PersistentLocalIndex::open_with_owner(path, Some(self.owner.clone())).await?
@@ -309,8 +453,19 @@ impl Preparation {
 	}
 
 	/// Releases the store index before the owner closes.
-	pub(crate) async fn release(&self) {
-		self.store.lock().await.take();
+	/// ADR 0106 (wendelon): hands the store's index over. No later step opens
+	/// it again here. It is closed through its owner's closer and forgotten
+	/// only once that close succeeded; a failed or cancelled close keeps it
+	/// held and protected (and a begun drop is joined by the owner's close).
+	pub(crate) async fn release(&self) -> std::io::Result<()> {
+		let mut store = self.store.lock().await;
+		self.handed_over
+			.store(true, std::sync::atomic::Ordering::SeqCst);
+		if let Some(index) = store.as_ref() {
+			index.close().await?;
+		}
+		*store = None;
+		Ok(())
 	}
 
 	/// One proposal to the current leader, at its address in the applied
@@ -427,6 +582,9 @@ fn disposition(answer: &std::io::Result<ProposalResponse>) -> Disposition {
 				refused: Some(refusal),
 			} => Disposition::Stop(format!("{refusal:?}")),
 			ProposalOutcome::Decision(DecisionResult::SignerBound) => Disposition::Again,
+			ProposalOutcome::Decision(DecisionResult::RecoveryRecorded { .. }) => {
+				Disposition::Again
+			}
 			ProposalOutcome::Decision(DecisionResult::Refused(refusal)) => {
 				Disposition::Stop(format!("{refusal:?}"))
 			}
