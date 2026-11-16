@@ -5936,9 +5936,10 @@ fn root2_carrier_is_bounded_private_held_and_response_mappings_are_explicit() {
 	// ADR 0697 appends after Root2Command and Root2Dormant, whose wire positions
 	// stay pinned; each list's last variant is the newest append (ADR 0699 S2;
 	// ADR 0725 appended the owner-signed slab operation to the requests, ADR
-	// 0726 the root check).
+	// 0726 the root check, Wendelon ADR 0105 the replacement's incarnation
+	// promotion).
 	for (name, last) in [
-		("WendelonRequest", "EstablishRootCheck"),
+		("WendelonRequest", "PromoteIncarnation"),
 		("WendelonResponse", "LeaseResults"),
 	] {
 		let e = core
