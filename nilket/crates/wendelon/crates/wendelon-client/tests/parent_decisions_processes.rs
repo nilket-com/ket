@@ -5551,6 +5551,27 @@ async fn serving_as(
 	(daemons, owned): (&Daemons, &str),
 	what: &str,
 ) {
+	serving_as_with(
+		member,
+		pki,
+		store,
+		deadline,
+		(&|| daemons.identity(member.id), owned),
+		what,
+	)
+	.await;
+}
+
+/// `serving_as` with the running process's identity read by `current` (a child, a host's unit
+/// or a service), compared with `owned` after the ready answer.
+async fn serving_as_with(
+	member: &Member,
+	pki: &Pki,
+	store: u128,
+	deadline: Instant,
+	(current, owned): (&dyn Fn() -> String, &str),
+	what: &str,
+) {
 	let started = Instant::now();
 	let by = deadline.min(started + SERVING_BOUND);
 	let wanted = format!("{store:032x}");
@@ -5572,7 +5593,7 @@ async fn serving_as(
 		match accepted_in_time(serving, answered_at, by) {
 			Ok(true) => {
 				assert_eq!(
-					daemons.identity(member.id),
+					current(),
 					owned,
 					"{what}: the ready answer must come from the owned process"
 				);
@@ -7953,6 +7974,782 @@ async fn listed(objects: &Arc<dyn ObjectStore>, by: Instant, what: &str) -> Vec<
 	);
 	listed.sort();
 	listed
+}
+
+/// The service-restart workflow: one end of the service's main process, as the static
+/// `ExecStopPost` recorder (`tests/service_fixtures/exit_record`) wrote it from the variables
+/// systemd sets: `result=<SERVICE_RESULT> code=<EXIT_CODE> status=<EXIT_STATUS>`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ServiceEnd {
+	result: String,
+	code: String,
+	status: String,
+}
+
+impl ServiceEnd {
+	/// The handoff's restart request exactly: the main process exited (not killed, not dumped,
+	/// not timed out) with `ACTIVATION_RESTART_EXIT`, and systemd judged it an exit-code failure.
+	fn is_restart_request(&self) -> bool {
+		self.result == "exit-code"
+			&& self.code == "exited"
+			&& self.status == ACTIVATION_RESTART_EXIT.to_string()
+	}
+
+	/// An orderly end: exited 0, judged a success.
+	fn is_orderly(&self) -> bool {
+		self.result == "success" && self.code == "exited" && self.status == "0"
+	}
+}
+
+/// Every line of the recorder's file, whole or refused: each exactly the three fields in their
+/// order, each value nonempty and without spaces; a missing file is no end yet.
+fn parse_service_ends(text: &str) -> Result<Vec<ServiceEnd>, String> {
+	if !text.is_empty() && !text.ends_with('\n') {
+		return Err(format!("the record does not end a line: {text:?}"));
+	}
+	text.lines()
+		.map(|line| {
+			let fields: Vec<&str> = line.split(' ').collect();
+			let [result, code, status] = fields.as_slice() else {
+				return Err(format!("not three fields: {line:?}"));
+			};
+			let value = |field: &str, key: &str| {
+				field
+					.strip_prefix(key)
+					.filter(|value| !value.is_empty())
+					.map(str::to_owned)
+					.ok_or_else(|| format!("no {key}<value>: {line:?}"))
+			};
+			Ok(ServiceEnd {
+				result: value(result, "result=")?,
+				code: value(code, "code=")?,
+				status: value(status, "status=")?,
+			})
+		})
+		.collect()
+}
+
+/// One `systemctl --user show` of the service, whole or refused.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ServiceState {
+	load: String,
+	active: String,
+	restarts: u32,
+	/// `pid <ExecMainPID> started <ExecMainStartTimestampMonotonic>`, or `None` with no main
+	/// process (pid 0).
+	identity: Option<String>,
+}
+
+fn parse_service_state(text: &str) -> Result<ServiceState, String> {
+	let mut fields = std::collections::BTreeMap::new();
+	for line in text.lines() {
+		let (key, value) = line
+			.split_once('=')
+			.ok_or_else(|| format!("not key=value: {line:?}"))?;
+		if fields.insert(key, value).is_some() {
+			return Err(format!("{key} twice: {text:?}"));
+		}
+	}
+	let wanted = [
+		"ActiveState",
+		"ExecMainPID",
+		"ExecMainStartTimestampMonotonic",
+		"LoadState",
+		"NRestarts",
+	];
+	if fields.keys().copied().collect::<Vec<_>>() != wanted {
+		return Err(format!("not exactly the fields {wanted:?}: {text:?}"));
+	}
+	let number = |key: &str| {
+		let value = fields[key];
+		(!value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+			.then(|| value.parse::<u64>().ok())
+			.flatten()
+			.ok_or_else(|| format!("{key} is not a number: {text:?}"))
+	};
+	let pid = number("ExecMainPID")?;
+	let started = number("ExecMainStartTimestampMonotonic")?;
+	let restarts = u32::try_from(number("NRestarts")?).map_err(|error| error.to_string())?;
+	let identity = match (pid, started) {
+		(0, _) => None,
+		(_, 0) => return Err(format!("a main process with no start time: {text:?}")),
+		(pid, started) => Some(format!("pid {pid} started {started}")),
+	};
+	Ok(ServiceState {
+		load: fields["LoadState"].to_owned(),
+		active: fields["ActiveState"].to_owned(),
+		restarts,
+		identity,
+	})
+}
+
+/// One node run by the user's service manager as the operator's guide documents it ("Running
+/// under systemd": `KillMode=control-group`, `TimeoutStopSec=100`, `Restart=on-failure`, the
+/// restart delay and start limit at their defaults). Beyond that unit, and changing none of its
+/// restart behavior: `BindsTo=` and `After=` the run's owner unit (Codex 01a1e552 R1), so the
+/// owner's end, expected or not, stops it (a stop, never a restart); the static recorder as
+/// `ExecStopPost`, which writes one line per end of the main process; the node's output; the
+/// test's `TMPDIR`. The record and the output are files in the run's record directory
+/// (`PD_SERVICE_RECORD_DIR`, no keys), so the launcher seals them whatever the result. Dropped,
+/// a unit still loaded is stopped and reset.
+struct ServiceNode {
+	unit: String,
+	record: PathBuf,
+}
+
+/// How long one `systemctl` or `systemd-run` call may take.
+const SERVICE_CALL_BOUND: Duration = Duration::from_secs(15);
+/// After the explicit stop, how long the service is watched for a restart: 20 times the
+/// default restart delay of 100 ms.
+const SERVICE_HOLD: Duration = Duration::from_secs(2);
+
+impl ServiceNode {
+	fn start(member: &Member, owner: &str, records: &Path) -> Self {
+		let unit = format!("{owner}-n{}", member.id);
+		let dir = member.config.parent().unwrap();
+		let record = records.join(format!("n{}.ends", member.id));
+		let output = records.join(format!("n{}.log", member.id));
+		let recorder =
+			PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/service_fixtures/exit_record");
+		let property = |text: String| std::ffi::OsString::from(text);
+		let mut arguments: Vec<std::ffi::OsString> = vec![
+			"--user".into(),
+			"--quiet".into(),
+			"--unit".into(),
+			unit.clone().into(),
+			"-p".into(),
+			"KillMode=control-group".into(),
+			"-p".into(),
+			"TimeoutStopSec=100".into(),
+			"-p".into(),
+			"Restart=on-failure".into(),
+			"-p".into(),
+			property(format!("BindsTo={owner}.service")),
+			"-p".into(),
+			property(format!("After={owner}.service")),
+			"-p".into(),
+			property(format!("StandardOutput=append:{}", output.display())),
+			"-p".into(),
+			property(format!("StandardError=append:{}", output.display())),
+			"-p".into(),
+			property(format!(
+				"ExecStopPost={} {}",
+				recorder.display(),
+				record.display()
+			)),
+			property(format!("--working-directory={}", dir.display())),
+			property(format!(
+				"--setenv=TMPDIR={}",
+				std::env::temp_dir().display()
+			)),
+			"--setenv=RUST_BACKTRACE=1".into(),
+			"--".into(),
+		];
+		arguments.push(nilket_bin().into_os_string());
+		arguments.push("wendelon".into());
+		arguments.push(member.config.clone().into_os_string());
+		let ran = bounded_run(
+			Path::new("systemd-run"),
+			&arguments,
+			Instant::now() + SERVICE_CALL_BOUND,
+		);
+		assert!(ran.succeeded(), "start the service {unit}: {}", ran.text());
+		Self { unit, record }
+	}
+
+	fn state(&self) -> ServiceState {
+		self.try_state()
+			.unwrap_or_else(|why| panic!("show {}: {why}", self.unit))
+	}
+
+	fn try_state(&self) -> Result<ServiceState, String> {
+		let ran = bounded_run(
+			Path::new("systemctl"),
+			&[
+				"--user".into(),
+				"show".into(),
+				self.unit.clone().into(),
+				"-p".into(),
+				"LoadState".into(),
+				"-p".into(),
+				"ActiveState".into(),
+				"-p".into(),
+				"NRestarts".into(),
+				"-p".into(),
+				"ExecMainPID".into(),
+				"-p".into(),
+				"ExecMainStartTimestampMonotonic".into(),
+			],
+			Instant::now() + SERVICE_CALL_BOUND,
+		);
+		if !ran.succeeded() {
+			return Err(ran.text());
+		}
+		parse_service_state(&ran.stdout)
+	}
+
+	fn ends(&self) -> Vec<ServiceEnd> {
+		let text = match std::fs::read_to_string(&self.record) {
+			Ok(text) => text,
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+			Err(error) => panic!("the service's end record: {error}"),
+		};
+		parse_service_ends(&text).unwrap_or_else(|why| panic!("the service's end record: {why}"))
+	}
+
+	/// The running execution's identity, from a state with a main process.
+	fn running(&self, what: &str) -> (ServiceState, String) {
+		let state = self.state();
+		match (&state.active[..], &state.identity) {
+			("active", Some(identity)) => {
+				let identity = identity.clone();
+				(state, identity)
+			}
+			_ => panic!(
+				"{what}: the service {} is not running: {state:?}",
+				self.unit
+			),
+		}
+	}
+
+	/// Until its handoff: the first execution is still the one running and has ended no way,
+	/// or it has ended exactly once with the restart request. Anything else fails.
+	/// The state is read BEFORE the record: the recorder writes an end before systemd restarts
+	/// the unit, so a restart seen in the state is always matched by a recorded end.
+	fn hold_first(&self, first: &str, what: &str) {
+		let state = self.state();
+		let ends = self.ends();
+		match ends.as_slice() {
+			[] => {
+				assert!(
+					state.restarts == 0 && state.identity.as_deref() == Some(first),
+					"{what}: the first execution ({first}) is not the one running and nothing \
+					 ended: {state:?}"
+				);
+			}
+			[end] => assert!(
+				end.is_restart_request(),
+				"{what}: the first execution ({first}) ended {end:?}, not with the restart \
+				 request"
+			),
+			more => panic!("{what}: the service ended more than once: {more:?}"),
+		}
+	}
+
+	/// The explicit stop, within `by`: `systemctl --user stop` returns success.
+	fn stop(&self, by: Instant) {
+		let ran = bounded_run(
+			Path::new("systemctl"),
+			&["--user".into(), "stop".into(), self.unit.clone().into()],
+			by,
+		);
+		assert!(ran.succeeded(), "stop {}: {}", self.unit, ran.text());
+	}
+}
+
+impl Drop for ServiceNode {
+	fn drop(&mut self) {
+		// A transient unit that ended in order is already gone: nothing to stop.
+		if let Ok(state) = self.try_state()
+			&& state.load == "not-found"
+		{
+			return;
+		}
+		for verb in ["stop", "reset-failed"] {
+			let ran = bounded_run(
+				Path::new("systemctl"),
+				&["--user".into(), verb.into(), self.unit.clone().into()],
+				Instant::now() + SERVICE_CALL_BOUND + STOP_BOUND,
+			);
+			if verb == "stop" && !ran.succeeded() {
+				eprintln!(
+					"smoke: CLEANUP of {} NOT CONFIRMED: {}",
+					self.unit,
+					ran.text()
+				);
+			}
+		}
+	}
+}
+
+/// Codex 01a1e552 R2: one observation of the service after the first execution's restart
+/// request, made at `observed_at`, judged against the ONE absolute restart-to-ready end `by`.
+/// `Ok(Some(identity))` is the restarted execution: active, with a main process that is not
+/// `first`, exactly one restart, observed within `by`. `Ok(None)` is not yet (not active),
+/// within `by`. Anything observed after `by`, or active as the first execution or after more
+/// than one restart, is refused.
+fn restarted_execution(
+	state: &ServiceState,
+	first: &str,
+	observed_at: Instant,
+	by: Instant,
+) -> Result<Option<String>, String> {
+	let active = match (&state.active[..], &state.identity) {
+		("active", Some(identity)) => Some(identity),
+		_ => None,
+	};
+	match accepted_in_time(active.is_some(), observed_at, by) {
+		Err(late) => Err(format!("the restarted execution {late}: {state:?}")),
+		Ok(false) => Ok(None),
+		Ok(true) => {
+			let identity = active.unwrap();
+			if identity == first {
+				return Err(format!(
+					"active as the first execution ({first}): {state:?}"
+				));
+			}
+			if state.restarts != 1 {
+				return Err(format!("not exactly one automatic restart: {state:?}"));
+			}
+			Ok(Some(identity.clone()))
+		}
+	}
+}
+
+#[test]
+fn a_restarted_execution_is_accepted_only_new_once_restarted_and_in_time() {
+	let by = Instant::now() + Duration::from_secs(60);
+	let state = |active: &str, restarts: u32, identity: Option<&str>| ServiceState {
+		load: "loaded".to_owned(),
+		active: active.to_owned(),
+		restarts,
+		identity: identity.map(str::to_owned),
+	};
+	let first = "pid 1 started 10";
+	let second = "pid 2 started 20";
+	let early = by - Duration::from_secs(1);
+	let late = by + Duration::from_millis(1);
+	assert_eq!(
+		restarted_execution(&state("active", 1, Some(second)), first, early, by),
+		Ok(Some(second.to_owned()))
+	);
+	assert_eq!(
+		restarted_execution(&state("activating", 0, None), first, early, by),
+		Ok(None)
+	);
+	assert_eq!(
+		restarted_execution(&state("deactivating", 0, Some(first)), first, early, by),
+		Ok(None)
+	);
+	for (refused, at) in [
+		(state("active", 1, Some(second)), late),
+		(state("activating", 0, None), late),
+		(state("active", 0, Some(first)), early),
+		(state("active", 1, Some(first)), early),
+		(state("active", 2, Some(second)), early),
+		(state("active", 0, Some(second)), early),
+	] {
+		assert!(
+			restarted_execution(&refused, first, at, by).is_err(),
+			"{refused:?}"
+		);
+	}
+}
+
+/// The service-restart records are read whole or refused, and only an exit with exactly the
+/// restart-request status, judged an exit-code failure, is the handoff's restart request.
+#[test]
+fn a_service_end_is_read_whole_and_only_an_exit_75_is_the_restart_request() {
+	let ends = parse_service_ends(
+		"result=exit-code code=exited status=75\nresult=success code=exited status=0\n",
+	)
+	.unwrap();
+	assert!(ends[0].is_restart_request() && !ends[0].is_orderly());
+	assert!(ends[1].is_orderly() && !ends[1].is_restart_request());
+	assert_eq!(parse_service_ends(""), Ok(Vec::new()));
+	for refused in [
+		"result=exit-code code=exited status=75",
+		"result=exit-code code=exited\n",
+		"result=exit-code code=exited status=75 extra=1\n",
+		"result= code=exited status=75\n",
+		"code=exited result=exit-code status=75\n",
+		"result=exit-code  code=exited status=75\n",
+	] {
+		assert!(parse_service_ends(refused).is_err(), "{refused:?}");
+	}
+	for (line, request) in [
+		("result=exit-code code=exited status=75", true),
+		("result=exit-code code=exited status=1", false),
+		("result=exit-code code=exited status=750", false),
+		("result=timeout code=exited status=75", false),
+		("result=signal code=killed status=TERM", false),
+		("result=core-dump code=dumped status=ABRT", false),
+		("result=exit-code code=killed status=75", false),
+	] {
+		let end = parse_service_ends(&format!("{line}\n")).unwrap();
+		assert_eq!(end[0].is_restart_request(), request, "{line}");
+	}
+	assert!(
+		!parse_service_ends("result=success code=killed status=TERM\n").unwrap()[0].is_orderly()
+	);
+	let shown = "LoadState=loaded\nActiveState=active\nNRestarts=1\nExecMainPID=42\n\
+		ExecMainStartTimestampMonotonic=1000\n";
+	assert_eq!(
+		parse_service_state(shown),
+		Ok(ServiceState {
+			load: "loaded".to_owned(),
+			active: "active".to_owned(),
+			restarts: 1,
+			identity: Some("pid 42 started 1000".to_owned()),
+		})
+	);
+	let gone = "LoadState=not-found\nActiveState=inactive\nNRestarts=0\nExecMainPID=0\n\
+		ExecMainStartTimestampMonotonic=0\n";
+	assert_eq!(parse_service_state(gone).unwrap().identity, None);
+	for refused in [
+		"LoadState=loaded\nActiveState=active\nNRestarts=1\nExecMainPID=42\n",
+		"LoadState=loaded\nActiveState=active\nNRestarts=-1\nExecMainPID=42\n\
+		 ExecMainStartTimestampMonotonic=1000\n",
+		"LoadState=loaded\nActiveState=active\nNRestarts=1\nExecMainPID=42\n\
+		 ExecMainStartTimestampMonotonic=0\n",
+		"LoadState=loaded\nLoadState=loaded\nActiveState=active\nNRestarts=1\nExecMainPID=42\n\
+		 ExecMainStartTimestampMonotonic=1000\n",
+	] {
+		assert!(parse_service_state(refused).is_err(), "{refused:?}");
+	}
+}
+
+/// The service manager restarts an activated replacement as a full member, on one host (Codex
+/// 01a1e541, 01a1e547). The cluster forms and a follower loses its disk as in
+/// `three_daemons_replace_a_lost_follower_with_a_control_only_instance` (its blank-store refusal
+/// is not repeated); the replacement is begun and provisioned through the operator's commands,
+/// and then started not by this test but as a user service with the documented unit
+/// (`ServiceNode`). This test starts it once and never again:
+///
+/// - Precondition: the first execution's identity (main pid and start time) is read at its
+///   start, with no restart and no end recorded (a restart request before that read is not
+///   covered). Until its handoff it stays that execution, or has ended exactly once with the
+///   restart request.
+/// - The replacement is done, its store promoted with the configured key bound, its recovery
+///   recorded and its activation reported (each through `replace status`, replicated status).
+/// - Its first execution ends with exactly the restart request: one end recorded by the
+///   service's own `ExecStopPost` (`result=exit-code code=exited status=75`), within
+///   `HANDOFF_EXIT_BOUND` of the activation being seen.
+/// - The service manager starts it again by itself, all within ONE `SERVING_BOUND` from the
+///   recorded end (each observation judged when it completed): the service is active with
+///   exactly one restart and a new execution (main pid and start time differ from the first's),
+///   and that execution, read again after the answer, answers ready as the first allocated
+///   instance serving the promoted store. One LINEARIZABLE query sent straight to it, with no
+///   redirect followed and nothing asked again, answers exactly every acknowledged row (logical
+///   rows, not physical uniqueness).
+/// - Stopped explicitly (`systemctl --user stop`) within `STOP_BOUND`: its second end is
+///   recorded as orderly (`result=success code=exited status=0`). Sampled every 100 ms for
+///   `SERVICE_HOLD` after the stop returned, and once more at its end, the service is neither
+///   active nor activating, and no third end is recorded: no start was seen after the stop
+///   (sampled checks over a fixed hold, not a continuous observation of every possible start).
+/// - The survivors stop in order with status 0, and the whole workflow ends within
+///   `REPLACEMENT_TEST_BOUND`.
+///
+/// Not claimed: a stop that ends with a nonzero status (this stop exits 0, which
+/// `Restart=on-failure` would not restart anyway, so the documented "an explicit stop is never
+/// restarted, whatever the status" is not exercised); a stop during the handoff; the start rate
+/// limit; a system (not user) service manager; more than one host; an object store; any time as
+/// a measurement; release readiness.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "spawns three daemons, one as a user service; run alone under the service launcher's owner unit (PD_OWNER_UNIT)"]
+async fn a_service_manager_restarts_an_activated_replacement_as_full() {
+	assert!(
+		node_control().is_none(),
+		"this workflow runs its three daemons on one host"
+	);
+	let owner = std::env::var("PD_OWNER_UNIT").expect("PD_OWNER_UNIT names the run's owner unit");
+	assert!(
+		owner.starts_with("pd-")
+			&& owner
+				.bytes()
+				.all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'),
+		"the owner unit {owner:?} is not a run-owned name"
+	);
+	let records = PathBuf::from(
+		std::env::var_os("PD_SERVICE_RECORD_DIR")
+			.expect("PD_SERVICE_RECORD_DIR names the run's record directory"),
+	);
+	assert!(records.is_dir(), "{} is not a directory", records.display());
+	let deadline = Instant::now() + REPLACEMENT_TEST_BOUND;
+	let Formed {
+		root: _root,
+		pki,
+		members,
+		mut daemons,
+		descriptor,
+		decision_keys,
+	} = form(deadline, None).await;
+	let storage = client_through(&members[0], &pki, Credential::Storage, deadline).await;
+	let mut expected = Vec::new();
+	for id in 1_i64..=4 {
+		let bound = step(deadline);
+		tokio::time::timeout(
+			bound,
+			storage.table_write(
+				TenantId::new(TENANT),
+				&descriptor,
+				one_row(id, "before"),
+				WriteOptions {
+					deadline: Some(Instant::now() + bound),
+					..WriteOptions::default()
+				},
+			),
+		)
+		.await
+		.unwrap_or_else(|_| panic!("the write of row {id} had no answer within its bound"))
+		.unwrap_or_else(|error| panic!("the write of row {id}: {error:?}"));
+		expected.push((id, "before".to_owned()));
+	}
+
+	// A follower, chosen positively from node 1's view of the leader, loses its disk.
+	let inspection = inspect(&members[0], &pki);
+	assert!(inspection.ready, "node 1 is not ready: {}", inspection.raw);
+	let leader = inspection
+		.leader()
+		.unwrap_or_else(|| panic!("node 1 names no leader among the three: {}", inspection.raw));
+	let lost = members
+		.iter()
+		.rev()
+		.find(|member| member.id != leader)
+		.expect("a node that is not the leader");
+	let survivors: Vec<&Member> = members
+		.iter()
+		.filter(|member| member.id != lost.id)
+		.collect();
+	eprintln!("smoke: leader {leader}; node {} loses its disk", lost.id);
+	eprintln!("smoke: {}", daemons.crash(lost.id));
+	daemons.still_down(lost.id);
+	let node_dir = lost.config.parent().unwrap().to_path_buf();
+	let data = node_dir.join("data");
+	let old_data = node_dir.join("old-data");
+	std::fs::rename(&data, &old_data).unwrap();
+	std::fs::create_dir(&data).unwrap();
+	// Enrolled under the cluster's root as a joiner is (ADR 0726), so it can recover.
+	let sealed_root = Path::new(".wendelon").join("local-sealed-root-kek.bin");
+	let sealed = std::fs::read(old_data.join(&sealed_root)).unwrap();
+	std::fs::create_dir_all(data.join(".wendelon")).unwrap();
+	write_private(&data.join(&sealed_root), &sealed);
+
+	// The operator opens the replacement through a survivor and provisions its token.
+	let connection = operator_connection(survivors[0], &pki);
+	let mut arguments: Vec<std::ffi::OsString> =
+		vec!["begin".into(), "--slot".into(), lost.id.to_string().into()];
+	arguments.extend(connection.iter().cloned());
+	let began = replace_command("replace-begin", &arguments, deadline);
+	assert!(began.succeeded(), "replace begin: {}", began.text());
+	let first_line = began.stdout.lines().next().unwrap_or_default();
+	let token = announced_token(first_line, lost.id)
+		.unwrap_or_else(|| panic!("replace begin announced no token first: {}", began.text()));
+	let provisioned = replace_command(
+		"replace-provision",
+		&[
+			"provision".into(),
+			"--data-dir".into(),
+			data.clone().into_os_string(),
+			"--token".into(),
+			format!("{token:032x}").into(),
+		],
+		deadline,
+	);
+	assert!(
+		provisioned.succeeded(),
+		"replace provision: {}",
+		provisioned.text()
+	);
+
+	// The service manager runs it from here on.
+	let service = ServiceNode::start(lost, &owner, &records);
+	let (state, first) = service.running("at its start");
+	assert_eq!(
+		(state.restarts, service.ends()),
+		(0, Vec::new()),
+		"the first execution was read before any restart or end"
+	);
+	eprintln!(
+		"smoke: service {} runs the replacement's first execution ({first})",
+		service.unit
+	);
+	let hold = |daemons: &mut Daemons, what: &str| {
+		if let Some(why) = daemons.exited() {
+			panic!("{what}: {why}");
+		}
+		service.hold_first(&first, what);
+	};
+	let done_by = deadline.min(Instant::now() + DONE_BOUND);
+	let mut reads = 0_u32;
+	loop {
+		reads += 1;
+		let phase = replacement_status(
+			&format!("replace-status-{reads}"),
+			token,
+			lost.id,
+			&connection,
+			done_by,
+		);
+		if phase == Some(ReportedPhase::Done(FIRST_ALLOCATED)) {
+			break;
+		}
+		hold(&mut daemons, "before done");
+		assert!(
+			Instant::now() < done_by,
+			"the replacement was not done within {DONE_BOUND:?} ({reads} status reads, last \
+			 {phase:?})"
+		);
+		tokio::time::sleep(Duration::from_secs(1)).await;
+	}
+	eprintln!("smoke: replacement done as instance {FIRST_ALLOCATED} ({reads} status reads)");
+	let configured = decision_keys[NODES.iter().position(|id| *id == lost.id).unwrap()];
+	let mut reads = 0_u32;
+	let reported_by =
+		deadline.min(Instant::now() + PREPARED_BOUND + RECOVERED_BOUND + ACTIVATED_BOUND);
+	let (store, recovered, (activated_through, activated_gid)) = loop {
+		reads += 1;
+		let reported = replacement_report(
+			&format!("replace-activated-{reads}"),
+			token,
+			lost.id,
+			&connection,
+			reported_by,
+		);
+		if let Some(Reported {
+			phase: ReportedPhase::Done(FIRST_ALLOCATED),
+			promoted: Some(store),
+			bound_key: Some(key),
+			recovered: Some(recovered),
+			activated: Some(activated),
+			..
+		}) = reported
+		{
+			assert_eq!(
+				key, configured,
+				"the bound key is the slot's configured one"
+			);
+			break (store, recovered, activated);
+		}
+		hold(&mut daemons, "before the replacement activated");
+		assert!(
+			Instant::now() < reported_by,
+			"the replacement was not promoted, recovered and activated within its bounds \
+			 ({reads} status reads, last {reported:?})"
+		);
+		tokio::time::sleep(Duration::from_secs(1)).await;
+	};
+	assert!(
+		activated_through >= recovered.1,
+		"the activation's cut {activated_through} is below the recorded one {}",
+		recovered.1
+	);
+	eprintln!(
+		"smoke: replacement promoted store {store:032x}, recovered {recovered:?}, activated \
+		 through {activated_through} at gid {activated_gid} ({reads} status reads)"
+	);
+
+	// The first execution ends with exactly the restart request, recorded by the service.
+	let exit_by = deadline.min(Instant::now() + HANDOFF_EXIT_BOUND);
+	loop {
+		hold(&mut daemons, "before the handoff exit");
+		let ends = service.ends();
+		let observed_at = Instant::now();
+		if let [end] = ends.as_slice() {
+			assert!(
+				end.is_restart_request(),
+				"the first execution ended {end:?}"
+			);
+			assert!(
+				accepted_in_time(true, observed_at, exit_by).is_ok(),
+				"the restart request was observed only after its bound {HANDOFF_EXIT_BOUND:?}"
+			);
+			eprintln!("smoke: the first execution ({first}) ended {end:?}");
+			break;
+		}
+		assert!(
+			Instant::now() < exit_by,
+			"the first execution ({first}) did not end within {HANDOFF_EXIT_BOUND:?} of the \
+			 activation being seen"
+		);
+		tokio::time::sleep(Duration::from_millis(200)).await;
+	}
+
+	// The service manager started it again by itself: one restart, a new execution, ready as
+	// the replacement serving its store, and exact at it.
+	// ONE absolute restart-to-ready end (Codex 01a1e552 R2), the workflow's end its cap.
+	let restarted_by = deadline.min(Instant::now() + SERVING_BOUND);
+	let second = loop {
+		let state = service.state();
+		let observed_at = Instant::now();
+		match restarted_execution(&state, &first, observed_at, restarted_by) {
+			Ok(Some(identity)) => break identity,
+			Ok(None) => {}
+			Err(why) => panic!("the service's restart within {SERVING_BOUND:?}: {why}"),
+		}
+		tokio::time::sleep(Duration::from_millis(200)).await;
+	};
+	assert_eq!(
+		service.ends().len(),
+		1,
+		"one end so far, the first execution's"
+	);
+	eprintln!("smoke: the service manager started it again by itself as {second} (restarts 1)");
+	serving_as_with(
+		lost,
+		&pki,
+		store,
+		restarted_by,
+		(&|| service.running("after the restart").1, &second),
+		"after the service's restart",
+	)
+	.await;
+	let direct_reader = client_through(survivors[0], &pki, Credential::Storage, deadline).await;
+	direct_query_exact(
+		&direct_reader,
+		&descriptor,
+		lost.id,
+		&expected,
+		deadline,
+		"after the service's restart",
+	)
+	.await;
+	let (state, still) = service.running("before the explicit stop");
+	assert_eq!(
+		(state.restarts, still.as_str()),
+		(1, second.as_str()),
+		"the same restarted execution answered"
+	);
+
+	// The explicit stop: an orderly end, and no start after it.
+	let stop_by = deadline.min(Instant::now() + STOP_BOUND);
+	service.stop(stop_by);
+	let stopped_at = Instant::now();
+	let ends = service.ends();
+	assert!(
+		ends.len() == 2 && ends[1].is_orderly(),
+		"the explicit stop ended the restarted execution in order: {ends:?}"
+	);
+	while stopped_at.elapsed() < SERVICE_HOLD {
+		let state = service.state();
+		assert!(
+			state.active != "active" && state.active != "activating",
+			"the service started again after an explicit stop: {state:?}"
+		);
+		tokio::time::sleep(Duration::from_millis(100)).await;
+	}
+	let last = service.state();
+	assert!(
+		last.active != "active" && last.active != "activating",
+		"the service started again after an explicit stop: {last:?}"
+	);
+	let ends = service.ends();
+	assert_eq!(ends.len(), 2, "no end after the explicit stop's: {ends:?}");
+	eprintln!(
+		"smoke: stopped explicitly: ended {:?}; no start seen in {SERVICE_HOLD:?} of samples, \
+		 last {last:?}",
+		ends[1]
+	);
+	drop(service);
+	let stops_by = deadline.min(Instant::now() + STOP_BOUND * 2);
+	for survivor in &survivors {
+		daemons.stop(survivor.id, stops_by);
+	}
+	assert!(
+		Instant::now() <= deadline,
+		"the workflow outlived its bound {REPLACEMENT_TEST_BOUND:?}"
+	);
+	eprintln!("smoke: the service-restart workflow passed");
 }
 
 /// Three hosts (Codex 01a1e487, 01a1e48d): a replica that has offloaded its cold slabs to the

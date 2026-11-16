@@ -1,0 +1,4 @@
+#!/bin/sh
+# ExecStopPost of the service-restart workflow: one line per end of the main process, from
+# the variables systemd sets for it, appended to the record named by the one argument.
+printf 'result=%s code=%s status=%s\n' "$SERVICE_RESULT" "$EXIT_CODE" "$EXIT_STATUS" >> "$1"
