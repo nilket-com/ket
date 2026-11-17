@@ -873,6 +873,48 @@ mod tests {
 		}));
 	}
 
+	#[test]
+	fn reactor_merges_fenced_rune_highlights_in_parent_coordinates() {
+		use crate::svp::markdown_provider::MarkdownProvider;
+		use crate::svp::rune_provider::RuneProvider;
+		use crate::svp::rust_highlight::{HighlightSpanIndex, TokenCategory};
+
+		let source = "# Résultats\n\n```rune\nlet answer = workspace.table(\"trips\");\n42\n```\n";
+		let (_commands, _input, tx_internal, requests) = crate::engine::request::channel();
+		let mut registry = LanguageRegistry::new();
+		registry.register(MarkdownProvider);
+		registry.register(RuneProvider);
+		let reactor = SemanticReactor::new(tx_internal, Arc::new(registry));
+		reactor.send(SemanticRequest {
+			buffer_id: BufferId::new(1),
+			content: source.as_bytes().to_vec(),
+			global_offset: DocByte::new(500),
+			file_path: "notebook.md".to_owned(),
+			language_id: LanguageId::from_registered("markdown"),
+			state_id: StateId::new(1),
+			request_id: RequestId::new(1),
+			depth: AnalysisDepth::Full,
+		});
+		// Wait for the worker notification rather than polling on a tight deadline.
+		requests
+			.recv_timeout(Duration::from_secs(10))
+			.expect("semantic event");
+		let response = reactor.try_recv().expect("semantic response");
+		let index = HighlightSpanIndex::new(response.highlights);
+		for (token, category) in [
+			("let", TokenCategory::Keyword),
+			("table", TokenCategory::Method),
+			("\"trips\"", TokenCategory::String),
+			("42", TokenCategory::Number),
+		] {
+			assert_eq!(
+				index.category_at(DocByte::new(500 + source.find(token).unwrap() as u64)),
+				category,
+				"Rune token {token} must override the enclosing Markdown code span"
+			);
+		}
+	}
+
 	/// The Markdown pass classifies a fence body as code; the language inside it
 	/// must still win. Existence of the embedded span is not enough — it has to
 	/// resolve on top of the enclosing one, which is what span order buys.

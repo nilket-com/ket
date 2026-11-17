@@ -15,7 +15,7 @@ use libaryon::svp::markdown_highlight::{MarkdownConstruct, markdown_construct_co
 use libaryon::svp::markdown_table_layout::{
 	MarkdownInlineWord, inline_line_count, inline_words, table_column_widths, wrap_inline_words,
 };
-use libaryon::svp::rust_highlight::CATEGORY_COUNT;
+use libaryon::svp::rust_highlight::{CATEGORY_COUNT, HighlightSpan};
 use libaryon::uast::projection::MarkdownPreviewSnapshot;
 use ratatui::{Frame, buffer::Buffer, layout::Rect, style::Style};
 use ratatui_image::{Image, Resize, picker::Picker, protocol::Protocol};
@@ -25,6 +25,7 @@ use std::{
 	collections::HashMap,
 	collections::hash_map::DefaultHasher,
 	hash::{Hash, Hasher},
+	ops::Range,
 	sync::mpsc,
 	thread,
 };
@@ -536,6 +537,11 @@ fn render_markdown_preview_image_with_renderer(
 	);
 	let visible_bottom = (layout.scroll_px + height_px).boundary_before();
 	let mut canvas = PreviewCanvas::new(&mut image, layout.scroll_px, PreviewSearch::new(search));
+	canvas.code_highlighting = Some(CodeHighlighting {
+		source: &snapshot.source_text,
+		spans: &snapshot.code_highlights,
+		theme_colors,
+	});
 
 	for (block, block_layout) in blocks.iter().zip(layout.blocks.iter()) {
 		if block_layout.y_end <= layout.scroll_px.boundary_before()
@@ -664,6 +670,7 @@ struct PreviewCanvas<'a> {
 	image: &'a mut RgbaImage,
 	scroll_px: PixelY,
 	search: Option<PreviewSearch>,
+	code_highlighting: Option<CodeHighlighting<'a>>,
 }
 
 impl<'a> PreviewCanvas<'a> {
@@ -672,6 +679,7 @@ impl<'a> PreviewCanvas<'a> {
 			image,
 			scroll_px,
 			search,
+			code_highlighting: None,
 		}
 	}
 
@@ -688,6 +696,18 @@ impl<'a> PreviewCanvas<'a> {
 			.boundary_before()
 			.get()
 	}
+}
+
+/// The engine's highlight spans for the previewed document and the theme they
+/// resolve through: the same spans and colors the source pane paints, so a
+/// fenced Rune (or Rust, or SQL) body is colored in the preview exactly as it
+/// is in the document. The engine owns language detection inside fences; the
+/// preview only maps the spans' source bytes onto the lines it draws.
+#[derive(Clone, Copy)]
+struct CodeHighlighting<'a> {
+	source: &'a str,
+	spans: &'a [HighlightSpan],
+	theme_colors: &'a [Option<Rgb>; CATEGORY_COUNT],
 }
 
 /// The four faces of one family. A configured font need not have all of them,
@@ -1148,45 +1168,160 @@ fn code_line_rows(line: &str, columns: usize, wrap: bool) -> Vec<Cow<'_, str>> {
 	if !wrap {
 		return vec![Cow::Borrowed(line)];
 	}
-	let columns = columns.max(1);
-	let expanded = expand_code_tabs(line);
-	let chars = expanded.chars().collect::<Vec<_>>();
-	if chars.len() <= columns {
-		return vec![expanded];
+	code_line_cells(line, columns, wrap)
+		.into_iter()
+		.map(|row| Cow::Owned(row.iter().map(|(ch, _)| ch).collect::<String>()))
+		.collect()
+}
+
+/// One drawn column of a code row: the glyph, and the index of the line's
+/// character it shows. A tab's expansion shows the tab; a continuation row's
+/// hanging indent shows no character of the line, so it carries `None`.
+type CodeCell = (char, Option<usize>);
+
+/// [`code_line_rows`], keeping each glyph's origin in the line so the
+/// highlight color of the character it came from can follow it across tab
+/// expansion and wrapping. The row strings are exactly those of
+/// [`code_line_rows`].
+fn code_line_cells(line: &str, columns: usize, wrap: bool) -> Vec<Vec<CodeCell>> {
+	if !wrap {
+		return vec![
+			line.chars()
+				.enumerate()
+				.map(|(index, ch)| (ch, Some(index)))
+				.collect(),
+		];
 	}
-	let indent = chars.iter().take_while(|&&ch| ch == ' ').count();
+	let columns = columns.max(1);
+	let cells = expand_code_tabs(line);
+	if cells.len() <= columns {
+		return vec![cells];
+	}
+	let indent = cells.iter().take_while(|(ch, _)| *ch == ' ').count();
 	let hang = indent.min(columns / 2);
 	let continuation = columns - hang;
-	let mut rows = vec![Cow::Owned(chars[..columns].iter().collect::<String>())];
+	let mut rows = vec![cells[..columns].to_vec()];
 	let mut start = columns;
-	while start < chars.len() {
-		let end = start.saturating_add(continuation).min(chars.len());
-		let mut row = String::with_capacity(hang + (end - start));
-		row.extend(std::iter::repeat_n(' ', hang));
-		row.extend(&chars[start..end]);
-		rows.push(Cow::Owned(row));
+	while start < cells.len() {
+		let end = start.saturating_add(continuation).min(cells.len());
+		let mut row = Vec::with_capacity(hang + (end - start));
+		row.extend(std::iter::repeat_n((' ', None), hang));
+		row.extend_from_slice(&cells[start..end]);
+		rows.push(row);
 		start = end;
 	}
 	rows
 }
 
-fn expand_code_tabs(line: &str) -> Cow<'_, str> {
-	if !line.contains('\t') {
-		return Cow::Borrowed(line);
-	}
-	let mut expanded = String::with_capacity(line.len() + CODE_TAB_STOP);
+fn expand_code_tabs(line: &str) -> Vec<CodeCell> {
+	let mut expanded = Vec::with_capacity(line.len());
 	let mut column = 0usize;
-	for ch in line.chars() {
+	for (index, ch) in line.chars().enumerate() {
 		if ch == '\t' {
 			let spaces = CODE_TAB_STOP - column % CODE_TAB_STOP;
-			expanded.extend(std::iter::repeat_n(' ', spaces));
+			expanded.extend(std::iter::repeat_n((' ', Some(index)), spaces));
 			column += spaces;
 		} else {
-			expanded.push(ch);
+			expanded.push((ch, Some(index)));
 			column += 1;
 		}
 	}
-	Cow::Owned(expanded)
+	expanded
+}
+
+/// Where each line of a code block's body begins in the source, so the
+/// engine's highlight spans, which are in source coordinates, can color it.
+///
+/// The parser's body has any container indentation or quote marker stripped,
+/// so a body line is located as the suffix of its source line rather than by
+/// counting bytes. A line that is not such a suffix gets `None` and is drawn
+/// in the plain code color: an uncolored line is better than a misaligned one.
+fn code_body_line_starts(source: &str, range: &Range<usize>, body: &str) -> Vec<Option<usize>> {
+	let Some(block) = source.get(range.clone()) else {
+		return Vec::new();
+	};
+	// Same rule as Polariton's `fence_body_start`: a fence's body starts on
+	// the line after its opening; an indented block's body is the block.
+	let body_start = if block.starts_with("```") || block.starts_with("~~~") {
+		match block.find('\n') {
+			Some(newline) => range.start + newline + 1,
+			None => return Vec::new(),
+		}
+	} else {
+		range.start
+	};
+	let mut offset = body_start;
+	let mut source_lines = source[body_start..].split_inclusive('\n');
+	body.lines()
+		.map(|line| {
+			let source_line = source_lines.next()?;
+			let line_start = offset;
+			offset += source_line.len();
+			let content = source_line
+				.strip_suffix('\n')
+				.map_or(source_line, |content| {
+					content.strip_suffix('\r').unwrap_or(content)
+				});
+			content
+				.ends_with(line)
+				.then(|| line_start + content.len() - line.len())
+		})
+		.collect()
+}
+
+/// The color of each character of one body line: the theme color of the last
+/// engine span covering it, as the source pane and Polariton resolve it, or
+/// `default` where no span with a themed category does.
+fn code_line_colors(
+	line: &str,
+	line_start: Option<usize>,
+	highlighting: Option<CodeHighlighting<'_>>,
+	default: Rgba<u8>,
+) -> Vec<Rgba<u8>> {
+	let (Some(line_start), Some(highlighting)) = (line_start, highlighting) else {
+		return vec![default; line.chars().count()];
+	};
+	let start = line_start as u64;
+	let end = start.saturating_add(line.len() as u64);
+	let spans = highlighting
+		.spans
+		.iter()
+		.filter(|span| span.start.get() < end && start < span.end.get())
+		.collect::<Vec<_>>();
+	let mut byte = start;
+	line.chars()
+		.map(|ch| {
+			let color = spans
+				.iter()
+				.rev()
+				.find(|span| span.start.get() <= byte && byte < span.end.get())
+				.and_then(|span| highlighting.theme_colors[span.category as usize])
+				.map_or(default, color_rgba);
+			byte = byte.saturating_add(ch.len_utf8() as u64);
+			color
+		})
+		.collect()
+}
+
+/// A code row's text and its color runs, `(byte in row, color)`, ascending
+/// from 0, one run per change of color.
+fn code_row_runs(
+	row: &[CodeCell],
+	colors: &[Rgba<u8>],
+	default: Rgba<u8>,
+) -> (String, Vec<(usize, Rgba<u8>)>) {
+	let mut text = String::with_capacity(row.len());
+	let mut runs: Vec<(usize, Rgba<u8>)> = Vec::new();
+	for &(ch, origin) in row {
+		let color = origin
+			.and_then(|index| colors.get(index).copied())
+			.unwrap_or(default);
+		if runs.last().is_none_or(|&(_, last)| last != color) {
+			runs.push((text.len(), color));
+		}
+		text.push(ch);
+	}
+	(text, runs)
 }
 
 fn measure_code_line(y: u32, metrics: &FontMetrics) -> u32 {
@@ -1380,12 +1515,18 @@ fn draw_markdown_block(
 			text_renderer,
 		)
 		.saturating_add(metrics.cell_h.get() / 3),
-		MarkdownBlock::CodeBlock { info, text, .. } => draw_code_block(
+		MarkdownBlock::CodeBlock {
+			info,
+			text,
+			source_range,
+			..
+		} => draw_code_block(
 			canvas,
 			x,
 			y,
 			info.as_deref(),
 			text,
+			Some(source_range),
 			metrics,
 			palette,
 			text_renderer,
@@ -1427,6 +1568,7 @@ fn draw_markdown_block(
 			y,
 			Some("html"),
 			text,
+			None,
 			metrics,
 			palette,
 			text_renderer,
@@ -1646,12 +1788,15 @@ fn marker_label(marker: &ListMarker) -> String {
 	}
 }
 
+/// Draw a code block. With a `source_range`, its body is colored by the
+/// engine's highlight spans; without one (raw HTML) it is plain code.
 fn draw_code_block(
 	canvas: &mut PreviewCanvas<'_>,
 	x: u32,
 	mut y: u32,
 	info: Option<&str>,
 	text: &str,
+	source_range: Option<&Range<usize>>,
 	metrics: &FontMetrics,
 	palette: &MarkdownPreviewPalette,
 	text_renderer: &TextRenderer,
@@ -1669,13 +1814,21 @@ fn draw_code_block(
 		);
 	}
 	let columns = code_row_columns(canvas.width(), x, metrics);
-	for line in text.lines() {
-		for row in code_line_rows(line, columns, wrap) {
-			y = draw_code_line(canvas, x, y, &row, metrics, palette, text_renderer);
+	let highlighting = canvas.code_highlighting;
+	let line_starts = source_range
+		.zip(highlighting)
+		.map(|(range, highlighting)| code_body_line_starts(highlighting.source, range, text))
+		.unwrap_or_default();
+	for (index, line) in text.lines().enumerate() {
+		let line_start = line_starts.get(index).copied().flatten();
+		let colors = code_line_colors(line, line_start, highlighting, palette.code_block);
+		for row in code_line_cells(line, columns, wrap) {
+			let (row, runs) = code_row_runs(&row, &colors, palette.code_block);
+			y = draw_code_line(canvas, x, y, &row, &runs, metrics, palette, text_renderer);
 		}
 	}
 	if text.is_empty() {
-		y = draw_code_line(canvas, x, y, "", metrics, palette, text_renderer);
+		y = draw_code_line(canvas, x, y, "", &[], metrics, palette, text_renderer);
 	}
 	y.saturating_add(metrics.cell_h.get() / 3)
 }
@@ -1685,6 +1838,7 @@ fn draw_code_line(
 	x: u32,
 	y: u32,
 	line: &str,
+	runs: &[(usize, Rgba<u8>)],
 	metrics: &FontMetrics,
 	palette: &MarkdownPreviewPalette,
 	text_renderer: &TextRenderer,
@@ -1702,13 +1856,14 @@ fn draw_code_line(
 		block_bottom,
 		palette.code_bg,
 	);
-	draw_text(
+	draw_text_runs(
 		text_renderer,
 		canvas,
 		x.saturating_add(block_pad_x),
 		y.saturating_add(block_pad_y / 2),
 		line,
 		spec,
+		runs,
 	);
 	block_bottom.saturating_add(metrics.cell_h.get() / 5)
 }
@@ -2077,6 +2232,23 @@ fn draw_text(
 	text: &str,
 	spec: TextSpec,
 ) -> u32 {
+	draw_text_runs(text_renderer, canvas, x, y, text, spec, &[])
+}
+
+/// Draw `text` with its color changing at each `(byte, color)` run start
+/// (ascending, on character boundaries); bytes before the first run take
+/// `spec.color`. Search matches are found over the whole text, not per run,
+/// so a match spanning two highlight tokens is still one match, drawn in the
+/// search colors over whatever the runs said.
+fn draw_text_runs(
+	text_renderer: &TextRenderer,
+	canvas: &mut PreviewCanvas<'_>,
+	x: u32,
+	y: u32,
+	text: &str,
+	spec: TextSpec,
+	runs: &[(usize, Rgba<u8>)],
+) -> u32 {
 	let matches = canvas
 		.search
 		.as_ref()
@@ -2089,59 +2261,64 @@ fn draw_text(
 				.collect::<Vec<_>>()
 		})
 		.unwrap_or_default();
-	if matches.is_empty() {
-		return draw_plain_text(text_renderer, canvas, x, y, text, spec);
+	if matches.is_empty() && runs.len() <= 1 && runs.first().is_none_or(|&(byte, _)| byte == 0) {
+		let color = runs.first().map_or(spec.color, |&(_, color)| color);
+		return draw_plain_text(
+			text_renderer,
+			canvas,
+			x,
+			y,
+			text,
+			TextSpec { color, ..spec },
+		);
 	}
 
-	let (background, foreground) = canvas
+	let search_colors = canvas
 		.search
 		.as_ref()
-		.map(|search| (search.background, search.foreground))
-		.expect("search exists when matches were collected");
+		.map(|search| (search.background, search.foreground));
+	let mut cuts = runs
+		.iter()
+		.map(|&(byte, _)| byte)
+		.chain(matches.iter().flat_map(|&(start, end)| [start, end]))
+		.chain([0, text.len()])
+		.filter(|&byte| byte <= text.len())
+		.collect::<Vec<_>>();
+	cuts.sort_unstable();
+	cuts.dedup();
 	let mut cursor = x;
-	let mut byte = 0usize;
-	for (start, end) in matches {
-		if start > byte {
-			cursor = cursor.saturating_add(draw_plain_text(
-				text_renderer,
-				canvas,
-				cursor,
-				y,
-				&text[byte..start],
-				spec,
-			));
-		}
-		let matched = &text[start..end];
-		let width = measure_text_width(text_renderer, matched, spec);
-		fill_rect(
-			canvas,
-			cursor,
-			y,
-			cursor.saturating_add(width),
-			y.saturating_add(spec.glyph_h()),
-			background,
-		);
+	for cut in cuts.windows(2) {
+		let (start, end) = (cut[0], cut[1]);
+		let segment = &text[start..end];
+		let matched = matches
+			.iter()
+			.any(|&(match_start, match_end)| match_start <= start && end <= match_end);
+		let color = match search_colors.filter(|_| matched) {
+			Some((background, foreground)) => {
+				let width = measure_text_width(text_renderer, segment, spec);
+				fill_rect(
+					canvas,
+					cursor,
+					y,
+					cursor.saturating_add(width),
+					y.saturating_add(spec.glyph_h()),
+					background,
+				);
+				foreground
+			}
+			None => runs
+				.iter()
+				.rev()
+				.find(|&&(byte, _)| byte <= start)
+				.map_or(spec.color, |&(_, color)| color),
+		};
 		cursor = cursor.saturating_add(draw_plain_text(
 			text_renderer,
 			canvas,
 			cursor,
 			y,
-			matched,
-			TextSpec {
-				color: foreground,
-				..spec
-			},
-		));
-		byte = end;
-	}
-	if byte < text.len() {
-		cursor = cursor.saturating_add(draw_plain_text(
-			text_renderer,
-			canvas,
-			cursor,
-			y,
-			&text[byte..],
-			spec,
+			segment,
+			TextSpec { color, ..spec },
 		));
 	}
 	cursor.saturating_sub(x)
@@ -2412,7 +2589,7 @@ fn display_char(ch: char) -> char {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use libaryon::core::DocLine;
+	use libaryon::core::{DocByte, DocLine};
 	use libaryon::svp::rust_highlight::TokenCategory;
 
 	fn row_plain_text(row: &[MarkdownInlineText]) -> Vec<String> {
@@ -3509,5 +3686,248 @@ mod tests {
 				}
 			}
 		}
+	}
+
+	/// Every body line of every code block the parser finds in `source`
+	/// maps to a source offset where exactly that line's text sits.
+	fn assert_code_lines_located(source: &str) -> Vec<Vec<usize>> {
+		let mut located = Vec::new();
+		for block in parse_markdown_blocks(source) {
+			let MarkdownBlock::CodeBlock {
+				text, source_range, ..
+			} = block
+			else {
+				continue;
+			};
+			let starts = code_body_line_starts(source, &source_range, &text);
+			assert_eq!(starts.len(), text.lines().count(), "{source:?}");
+			let mut block_starts = Vec::new();
+			for (line, start) in text.lines().zip(starts) {
+				let start = start.unwrap_or_else(|| panic!("{line:?} unlocated in {source:?}"));
+				assert_eq!(&source[start..start + line.len()], line, "{source:?}");
+				block_starts.push(start);
+			}
+			located.push(block_starts);
+		}
+		assert!(!located.is_empty(), "no code block in {source:?}");
+		located
+	}
+
+	#[test]
+	fn code_body_lines_are_located_in_source_through_parser_ranges() {
+		let top = "# Title\n\n```rune\nfn a() {}\nlet b = 1;\n```\n";
+		assert_eq!(
+			assert_code_lines_located(top),
+			vec![vec![top.find("fn a").unwrap(), top.find("let b").unwrap()]]
+		);
+		// A fence indented two spaces inside a list item: the parser strips
+		// the container indent from the body, the source keeps it.
+		let listed = "- item\n\n  ```rune\n  let x = 1;\n    nested();\n  ```\n";
+		assert_eq!(
+			assert_code_lines_located(listed),
+			vec![vec![
+				listed.find("let x").unwrap(),
+				listed.find("  nested").unwrap()
+			]]
+		);
+		let quoted = "> ```rune\n> let q = 2;\n> ```\n";
+		assert_eq!(
+			assert_code_lines_located(quoted),
+			vec![vec![quoted.find("let q").unwrap()]]
+		);
+		let crlf = "text\r\n\r\n```rune\r\nlet a = 1;\r\nlet b = 2;\r\n```\r\n";
+		assert_eq!(
+			assert_code_lines_located(crlf),
+			vec![vec![
+				crlf.find("let a").unwrap(),
+				crlf.find("let b").unwrap()
+			]]
+		);
+		let utf8 = "# Über é\n\n```rune\nlet é = \"ü→∘\";\nfn ƒ() {}\n```\n";
+		assert_eq!(
+			assert_code_lines_located(utf8),
+			vec![vec![
+				utf8.find("let é").unwrap(),
+				utf8.find("fn ƒ").unwrap()
+			]]
+		);
+		let indented = "para\n\n    let x;\n    let y;\n";
+		assert_eq!(
+			assert_code_lines_located(indented),
+			vec![vec![
+				indented.find("let x").unwrap(),
+				indented.find("let y").unwrap()
+			]]
+		);
+	}
+
+	#[test]
+	fn code_line_colors_take_the_last_themed_span_at_each_byte() {
+		let source = "```rune\nlet é = 1;\n```\n";
+		let start = source.find("let").unwrap();
+		let at = |text: &str| DocByte::new(source.find(text).unwrap() as u64);
+		let spans = vec![
+			HighlightSpan::new(at("let"), at(" é"), TokenCategory::Keyword),
+			HighlightSpan::new(at("é"), at(" ="), TokenCategory::Comment),
+			// Later spans win, as on the source pane and in Polariton.
+			HighlightSpan::new(at("é"), at(" ="), TokenCategory::Variable),
+			HighlightSpan::new(at("1"), at(";"), TokenCategory::Number),
+		];
+		let mut theme_colors = [None; CATEGORY_COUNT];
+		theme_colors[TokenCategory::Keyword as usize] = Some(Rgb::new(1, 0, 0));
+		theme_colors[TokenCategory::Comment as usize] = Some(Rgb::new(2, 0, 0));
+		theme_colors[TokenCategory::Variable as usize] = Some(Rgb::new(3, 0, 0));
+		// Number has no theme color: the default shows through.
+		let default = Rgba([9, 9, 9, 255]);
+		let highlighting = CodeHighlighting {
+			source,
+			spans: &spans,
+			theme_colors: &theme_colors,
+		};
+		let colors = code_line_colors("let é = 1;", Some(start), Some(highlighting), default);
+		let reds = colors.iter().map(|color| color.0[0]).collect::<Vec<_>>();
+		assert_eq!(reds, vec![1, 1, 1, 9, 3, 9, 9, 9, 9, 9]);
+		assert_eq!(
+			code_line_colors("let é = 1;", None, Some(highlighting), default),
+			vec![default; 10],
+			"an unlocated line is drawn plain"
+		);
+	}
+
+	#[test]
+	fn code_row_colors_follow_characters_across_tab_expansion_and_wrap() {
+		let line = "\tabcdef";
+		let rows = code_line_cells(line, 6, true);
+		assert_eq!(
+			rows.iter()
+				.map(|row| row.iter().map(|(ch, _)| ch).collect::<String>())
+				.collect::<Vec<_>>(),
+			row_texts(code_line_rows(line, 6, true)),
+			"cells draw exactly the rows layout measured"
+		);
+		let red = |r| Rgba([r, 0, 0, 255]);
+		let colors = (1..=7).map(red).collect::<Vec<_>>();
+		let default = red(0);
+		let (first, first_runs) = code_row_runs(&rows[0], &colors, default);
+		assert_eq!(first, "    ab");
+		assert_eq!(first_runs, vec![(0, red(1)), (4, red(2)), (5, red(3))]);
+		let (second, second_runs) = code_row_runs(&rows[1], &colors, default);
+		assert_eq!(second, "   cde");
+		assert_eq!(
+			second_runs,
+			vec![(0, default), (3, red(4)), (4, red(5)), (5, red(6))],
+			"the hanging indent shows no character, so it is plain"
+		);
+	}
+
+	fn rune_fence_snapshot(code_highlights: Vec<HighlightSpan>) -> MarkdownPreviewSnapshot {
+		MarkdownPreviewSnapshot {
+			source_buffer_id: BufferId::new(1),
+			source_view_id: ViewId::new(1),
+			serif: false,
+			wrap_enabled: true,
+			source_path: Some("notes.md".to_string()),
+			source_text: RUNE_FENCE.to_string(),
+			code_highlights,
+			theme_colors: [None; CATEGORY_COUNT],
+			cells: Vec::new(),
+			source_scroll_line: DocLine::ZERO,
+			source_viewport_line_count: 24,
+		}
+	}
+
+	const RUNE_FENCE: &str = "```rune\nfn fetch_add(counter) {\n    let old = 1;\n}\n```\n";
+
+	fn rune_fence_spans() -> Vec<HighlightSpan> {
+		let at = |text: &str| DocByte::new(RUNE_FENCE.find(text).unwrap() as u64);
+		vec![
+			HighlightSpan::new(at("fn "), at(" fetch"), TokenCategory::Keyword),
+			HighlightSpan::new(at("fetch"), at("(counter"), TokenCategory::Function),
+			HighlightSpan::new(at("let"), at(" old"), TokenCategory::Keyword),
+		]
+	}
+
+	fn rune_theme() -> [Option<Rgb>; CATEGORY_COUNT] {
+		let mut theme_colors = [None; CATEGORY_COUNT];
+		theme_colors[TokenCategory::Keyword as usize] = Some(Rgb::new(0, 255, 0));
+		theme_colors[TokenCategory::Function as usize] = Some(Rgb::new(0, 0, 255));
+		theme_colors
+	}
+
+	fn rune_area() -> Rect {
+		Rect {
+			x: 0,
+			y: 0,
+			width: 80,
+			height: 12,
+		}
+	}
+
+	#[test]
+	fn render_image_colors_fenced_rune_with_engine_highlights() {
+		let greenish = |pixel: &Rgba<u8>| {
+			pixel[1] > pixel[0].saturating_add(64) && pixel[1] > pixel[2].saturating_add(64)
+		};
+		let bluish = |pixel: &Rgba<u8>| {
+			pixel[2] > pixel[0].saturating_add(64) && pixel[2] > pixel[1].saturating_add(64)
+		};
+		let plain = render_markdown_preview_image_with_theme(
+			&rune_fence_snapshot(Vec::new()),
+			rune_area(),
+			(8, 16),
+			&rune_theme(),
+		)
+		.to_rgba8();
+		assert!(
+			!plain.pixels().any(greenish) && !plain.pixels().any(bluish),
+			"without spans the fence is one code color"
+		);
+
+		let highlighted = render_markdown_preview_image_with_theme(
+			&rune_fence_snapshot(rune_fence_spans()),
+			rune_area(),
+			(8, 16),
+			&rune_theme(),
+		)
+		.to_rgba8();
+		assert!(highlighted.pixels().any(greenish), "keywords take Keyword");
+		assert!(
+			highlighted.pixels().any(bluish),
+			"the function takes Function"
+		);
+	}
+
+	#[test]
+	fn render_image_search_match_spans_highlight_tokens() {
+		let search_rgba = Rgba([12, 200, 240, 255]);
+		let search = PreviewSearchConfig {
+			// Spans the Keyword, the space, and the Function tokens.
+			pattern: Some("fn fetch".to_string()),
+			case_insensitive: false,
+			highlight: Rgb::new(12, 200, 240),
+		};
+		let render = |spans| {
+			render_markdown_preview_image_with_search(
+				&rune_fence_snapshot(spans),
+				rune_area(),
+				(8, 16),
+				&rune_theme(),
+				&search,
+			)
+			.to_rgba8()
+		};
+		let match_pixels = |image: &RgbaImage| {
+			image
+				.pixels()
+				.filter(|pixel| **pixel == search_rgba)
+				.count()
+		};
+		let plain = match_pixels(&render(Vec::new()));
+		let highlighted = match_pixels(&render(rune_fence_spans()));
+		assert!(plain > 0);
+		assert!(
+			highlighted * 10 >= plain * 9,
+			"a match across tokens is still one highlighted match: {highlighted} vs {plain}"
+		);
 	}
 }
