@@ -3872,6 +3872,9 @@ impl SlabManager {
 			&old_blob,
 			TierObjectEvidence::Indexed(&self.acknowledged_offsets_in_slab(pointer.slab_id)),
 		)?;
+		// Decoded: only the source object's length is used from here on.
+		let old_bytes = old_blob.len() as u64;
+		drop(old_blob);
 		let source_layout = decoded.layout;
 		let plaintext = Zeroizing::new(decoded.bytes);
 		let plaintext = SlabView::new(&plaintext, source_layout)?;
@@ -3919,27 +3922,21 @@ impl SlabManager {
 				slab_id: pointer.slab_id,
 				old_l2_uri: pointer.l2_uri.clone(),
 				old_generation: crate::consensus::slab_ops::TierGeneration::from(pointer),
-				old_bytes: old_blob.len() as u64,
+				old_bytes,
 				pruned_versions,
 				retention_stats,
-				reclaimed_bytes: old_blob.len() as u64,
+				reclaimed_bytes: old_bytes,
 			}));
 		}
 
 		let replacement = self
-			.build_tiered_replacement(
-				pointer,
-				plaintext,
-				&records,
-				table_schemas,
-				old_blob.len() as u64,
-			)
+			.build_tiered_replacement(pointer, plaintext, &records, table_schemas, old_bytes)
 			.await?;
 		Ok(Some(PreparedTieredRetentionRewrite::Rewrite {
 			slab_id: pointer.slab_id,
 			old_l2_uri: pointer.l2_uri.clone(),
 			old_generation: crate::consensus::slab_ops::TierGeneration::from(pointer),
-			old_bytes: old_blob.len() as u64,
+			old_bytes,
 			payload_hash: replacement.payload_hash,
 			tombstone_metadata: replacement.tombstone_metadata,
 			supersession_metadata: replacement.supersession_metadata,
@@ -3982,6 +3979,9 @@ impl SlabManager {
 			&old_blob,
 			TierObjectEvidence::Indexed(&self.acknowledged_offsets_in_slab(pointer.slab_id)),
 		)?;
+		// Decoded: only the source object's length is used from here on.
+		let old_bytes = old_blob.len() as u64;
+		drop(old_blob);
 		let source_layout = decoded.layout;
 		let plaintext = Zeroizing::new(decoded.bytes);
 		let plaintext = SlabView::new(&plaintext, source_layout)?;
@@ -4016,9 +4016,9 @@ impl SlabManager {
 				slab_id: pointer.slab_id,
 				old_l2_uri: pointer.l2_uri.clone(),
 				old_generation: crate::consensus::slab_ops::TierGeneration::from(pointer),
-				old_bytes: old_blob.len() as u64,
+				old_bytes,
 				reclaimed_records,
-				reclaimed_bytes: old_blob.len() as u64,
+				reclaimed_bytes: old_bytes,
 			}));
 		}
 
@@ -4106,14 +4106,14 @@ impl SlabManager {
 			slab_id: pointer.slab_id,
 			old_l2_uri: pointer.l2_uri.clone(),
 			old_generation: crate::consensus::slab_ops::TierGeneration::from(pointer),
-			old_bytes: old_blob.len() as u64,
+			old_bytes,
 			payload_hash: crate::hash::content::digest(&encrypted.bytes),
 			tombstone_metadata: merge_row_tombstone_metadata(
 				pointer.tombstone_metadata,
 				row_tombstone_metadata,
 			),
 			supersession_metadata: self.slab_supersession_metadata(pointer.slab_id)?,
-			reclaimed_bytes: (old_blob.len() as u64).saturating_sub(encrypted.bytes.len() as u64),
+			reclaimed_bytes: old_bytes.saturating_sub(encrypted.bytes.len() as u64),
 			reclaimed_records,
 			encrypted_bytes: encrypted.bytes,
 		}))

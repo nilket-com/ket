@@ -776,6 +776,8 @@ impl SlabManager {
 		)
 		.await?;
 		let new_uri = l2.put(&key, &replacement.encrypted_bytes).await?;
+		// Uploaded: only its hash, length and metadata are used from here on.
+		drop(replacement.encrypted_bytes);
 		if new_uri != planned_uri {
 			self.persist_ambiguous_upload_intent(slab_id, &new_uri, length)
 				.await?;
@@ -784,24 +786,26 @@ impl SlabManager {
 				"object store returned a different upload URI",
 			));
 		}
-		let fetched = l2.get(&new_uri).await?;
-		if crate::hash::content::digest(&fetched) != replacement.payload_hash {
-			// Never referenced, and retained: no physical delete here.
-			self.record_tier_candidate_not_submitted(slab_id, &new_uri, length)
-				.await?;
-			return Err(Error::new(
-				ErrorKind::InvalidData,
-				format!("certified rewrite of slab {slab_id}: the read-back object differs"),
-			));
-		}
-		let footer = self
-			.encrypted_tiered_footer_summary(&fetched)?
-			.ok_or_else(|| {
-				Error::new(
+		// The read-back is held only for its hash and footer.
+		let footer = {
+			let fetched = l2.get(&new_uri).await?;
+			if crate::hash::content::digest(&fetched) != replacement.payload_hash {
+				// Never referenced, and retained: no physical delete here.
+				self.record_tier_candidate_not_submitted(slab_id, &new_uri, length)
+					.await?;
+				return Err(Error::new(
 					ErrorKind::InvalidData,
-					format!("certified rewrite of slab {slab_id} has no encrypted footer"),
-				)
-			})?;
+					format!("certified rewrite of slab {slab_id}: the read-back object differs"),
+				));
+			}
+			self.encrypted_tiered_footer_summary(&fetched)?
+				.ok_or_else(|| {
+					Error::new(
+						ErrorKind::InvalidData,
+						format!("certified rewrite of slab {slab_id} has no encrypted footer"),
+					)
+				})?
+		};
 		let tier = TieredSlab {
 			slab: job.slab,
 			l2_uri: new_uri.clone(),

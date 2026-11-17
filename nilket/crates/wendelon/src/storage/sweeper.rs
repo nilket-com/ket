@@ -1405,7 +1405,11 @@ impl SlabSweeper {
 		let encrypted = self
 			.encrypt_tiered_object_blob_with_current_stats(info.slab_id, plaintext.as_ref())
 			.await?;
+		// The object carries everything later phases need; the plaintext is
+		// not held across the upload, verification and commit.
+		drop(plaintext);
 		let expected_hash = crate::hash::content::digest(&encrypted.bytes);
+		let encrypted_len = encrypted.bytes.len() as u64;
 
 		// Phase 2: upload to L2, applying the rate limit.
 		self.rate_limit_upload(encrypted.bytes.len()).await;
@@ -1418,13 +1422,14 @@ impl SlabSweeper {
 		metrics()
 			.l2_upload_latency_seconds
 			.observe_duration(upload_started.elapsed());
+		// Uploaded: only its hash and length are used from here on.
+		drop(encrypted.bytes);
 
 		// Phase 3: round-trip verification. A mismatch here means
 		// the object store acked a write but returned a different
 		// blob — we refuse to pivot on corrupt data. The L1 file
 		// is still intact; the sweeper will retry next pass.
-		let fetched = self.object_store.get(&l2_uri).await?;
-		let fetched_hash = crate::hash::content::digest(&fetched);
+		let fetched_hash = crate::hash::content::digest(&self.object_store.get(&l2_uri).await?);
 		if fetched_hash != expected_hash {
 			// Best-effort cleanup of the bad object. Ignoring the
 			// error here is intentional: we already know the
@@ -1505,7 +1510,7 @@ impl SlabSweeper {
 					self.cleanup_uploaded_object_after_failed_commit(
 						info.slab_id,
 						&l2_uri,
-						encrypted.bytes.len() as u64,
+						encrypted_len,
 						&error,
 					)
 					.await?;
@@ -1515,7 +1520,7 @@ impl SlabSweeper {
 				self.cleanup_uploaded_object_after_failed_commit(
 					info.slab_id,
 					&l2_uri,
-					encrypted.bytes.len() as u64,
+					encrypted_len,
 					&error,
 				)
 				.await?;
