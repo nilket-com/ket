@@ -484,12 +484,24 @@ impl SlabManager {
 		}
 		let index_authority_unavailable = snapshot.is_none();
 		let lsm_install_intents = DashMap::new();
+		#[cfg(test)]
+		let mut startup_lsm_seed = Vec::new();
 		if let Some(snapshot) = &snapshot {
 			for intent in &snapshot.lsm_install_intents {
-				lsm_install_intents.insert(
-					intent.commit.job_id,
-					lsm_driver::lsm_intent_scope(intent, true),
-				);
+				let scope = lsm_driver::lsm_intent_scope(intent, true);
+				#[cfg(test)]
+				startup_lsm_seed.push(super::pause_hooks::StartupLsmSeed {
+					job: intent.commit.job_id,
+					kind: intent.kind,
+					phase: intent.phase,
+					ops: intent.ops.clone(),
+					in_flight: scope.in_flight,
+					keys_unknown: scope.keys_unknown,
+					gc_lifecycle: scope.gc_lifecycle,
+					mark_delete_pending: intent.commit.slabs_to_mark_delete_pending.len(),
+					remove: intent.commit.slabs_to_remove.len(),
+				});
+				lsm_install_intents.insert(intent.commit.job_id, scope);
 			}
 		}
 		let lsm_install_unresolved = !lsm_install_intents.is_empty();
@@ -1168,7 +1180,10 @@ impl SlabManager {
 			#[cfg(test)]
 			counter_rollback_hold: std::sync::Mutex::new(None),
 			#[cfg(test)]
-			continuity_test_holds: Default::default(),
+			continuity_test_holds: super::pause_hooks::TestHolds {
+				startup_lsm_seed: std::sync::Mutex::new(startup_lsm_seed),
+				..Default::default()
+			},
 			unresolved_tier_cleanup: Default::default(),
 			deferred_table_drop_l2: Default::default(),
 			cleanup_scan_schedule: Default::default(),

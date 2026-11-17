@@ -251,7 +251,7 @@ pub use slab_file_quarantine::{
 mod pause_hooks;
 mod query_tails;
 #[cfg(test)]
-pub(crate) use pause_hooks::LsmPublicationForTest;
+pub(crate) use pause_hooks::{GcSweepCut, LsmPublicationForTest};
 pub(crate) use query_tails::QueryTails;
 use tiered_io::{
 	RehydratedCopy, SlabBacking, TierObjectEvidence, decode_tiered_blob,

@@ -18943,6 +18943,699 @@ async fn a_node_compacts_real_writes_and_serves_them_after_a_reopen() {
 	);
 }
 
+/// DC-259 (Codex 01a1e6fe): whether a startup seed is a recovered GC-lifecycle step of the
+/// shapes the deterministic reproduction showed the ordinary resolver clears: a Control,
+/// Prepared, GC-lifecycle intent seeded fenced (`!in_flight`, `keys_unknown`), either a mark
+/// (`[mark, removal]`, marking slabs delete-pending, removing none) or a removal (`[removal]`,
+/// removing slabs, marking none). Any other seed is not waited on.
+#[allow(clippy::too_many_arguments)]
+fn supported_startup_gc_shape(
+	kind: crate::storage::index::LsmInstallKind,
+	phase: crate::storage::index::LsmInstallPhase,
+	gc_lifecycle: bool,
+	in_flight: bool,
+	keys_unknown: bool,
+	ops: usize,
+	mark_delete_pending: usize,
+	remove: usize,
+) -> bool {
+	// Only the single-slab steps the reproduction exercised (Codex 01a1e706 B).
+	let mark = ops == 2 && mark_delete_pending == 1 && remove == 0;
+	let removal = ops == 1 && remove == 1 && mark_delete_pending == 0;
+	kind == crate::storage::index::LsmInstallKind::Control
+		&& phase == crate::storage::index::LsmInstallPhase::Prepared
+		&& gc_lifecycle
+		&& !in_flight
+		&& keys_unknown
+		&& (mark || removal)
+}
+
+/// One judgement of the restart's named GC obligations, from one round of reads.
+#[derive(Debug, PartialEq, Eq)]
+enum StartupObligation {
+	Done,
+	Wait,
+	Fail(String),
+}
+
+/// The pure step:
+/// - any fenced (`!in_flight`) scope that is not one of the named seeds is a new
+///   obstruction, a failure;
+/// - while a named job's scope or durable intent remains, readiness may only be
+///   `TierAuthorityLsmUnresolved`;
+/// - with named jobs, `DeferredOpenIncomplete` is waited through even when the `pending`
+///   reading is stale (the reads are sequential); with none it is a failure;
+/// - once they are gone, it may only be `DeferredOpenIncomplete` (open sets it exactly when it
+///   seeded unresolved intents, open.rs:1251-1258; the op driver's same pass completes it,
+///   op_driver.rs:80) or `None`, which is done.
+///
+/// Every other readiness reason is a failure.
+fn startup_gc_obligation_step(
+	named: &[crate::schema::CompactionJobId],
+	scopes: &[(crate::schema::CompactionJobId, bool, bool, bool)],
+	durable_named: &[crate::schema::CompactionJobId],
+	readiness: Option<&str>,
+) -> StartupObligation {
+	if let Some(other) = scopes
+		.iter()
+		.find(|(job, in_flight, ..)| !in_flight && !named.contains(job))
+	{
+		return StartupObligation::Fail(format!(
+			"a fenced scope the restart did not seed: {other:?}"
+		));
+	}
+	let pending = named
+		.iter()
+		.any(|job| scopes.iter().any(|(id, ..)| id == job) || durable_named.contains(job));
+	match (pending, readiness) {
+		(true, Some("TierAuthorityLsmUnresolved")) | (true, None) => StartupObligation::Wait,
+		// The reads are sequential, not atomic: the resolver may clear the named scopes while
+		// the durable snapshot is read, so a stale `pending` can meet the deferred open's
+		// completion (Codex 01a1e706 A). It is waited through, then re-observed.
+		(_, Some("DeferredOpenIncomplete")) if !named.is_empty() => StartupObligation::Wait,
+		(false, None) => StartupObligation::Done,
+		(_, Some(other)) => StartupObligation::Fail(format!(
+			"an obstruction outside the restart's GC obligations: readiness {other:?}, pending {pending}"
+		)),
+	}
+}
+
+/// A completion is accepted only if observed by the deadline.
+fn accepted_by_deadline(
+	observed_at: tokio::time::Instant,
+	deadline: tokio::time::Instant,
+) -> Result<(), String> {
+	if observed_at > deadline {
+		Err(format!(
+			"the startup GC obligations completed, but were observed {:?} after the deadline",
+			observed_at.saturating_duration_since(deadline)
+		))
+	} else {
+		Ok(())
+	}
+}
+
+/// DC-259: before a reopened node's first query, wait (read only, bounded by `deadline`) for
+/// the GC-lifecycle steps the restart left (named from open's immutable seed record) to be
+/// resolved by the ordinary scheduled resolver. An unsupported seed, a new obstruction or the
+/// deadline fails, with what was seen.
+async fn wait_for_startup_gc_obligations(
+	node: &WendelonNode,
+	deadline: tokio::time::Instant,
+) -> Vec<crate::schema::CompactionJobId> {
+	let seeds = node.slab.startup_lsm_seed_for_test();
+	if let Some(unsupported) = seeds.iter().find(|seed| {
+		!supported_startup_gc_shape(
+			seed.kind,
+			seed.phase,
+			seed.gc_lifecycle,
+			seed.in_flight,
+			seed.keys_unknown,
+			seed.ops.len(),
+			seed.mark_delete_pending,
+			seed.remove,
+		)
+	}) {
+		panic!("an unsupported startup seed, not waited on: {unsupported:?}");
+	}
+	let named: Vec<_> = seeds.iter().map(|seed| seed.job).collect();
+	loop {
+		let scopes = node.slab.lsm_install_unresolved_for_test();
+		let durable_named: Vec<_> =
+			tokio::time::timeout_at(deadline, node.slab.durable_index_snapshot_for_test())
+				.await
+				.unwrap_or_else(|_| {
+					panic!("the startup GC obligations {named:?}: no snapshot by the deadline")
+				})
+				.lsm_install_intents
+				.iter()
+				.map(|intent| intent.commit.job_id)
+				.filter(|job| named.contains(job))
+				.collect();
+		let readiness = node.slab.tier_authority_readiness_reason();
+		match startup_gc_obligation_step(&named, &scopes, &durable_named, readiness.as_deref()) {
+			StartupObligation::Done => {
+				accepted_by_deadline(tokio::time::Instant::now(), deadline)
+					.unwrap_or_else(|why| panic!("{why}: {named:?}"));
+				return named;
+			}
+			StartupObligation::Fail(why) => {
+				panic!("the startup GC obligations {named:?}: {why}")
+			}
+			StartupObligation::Wait => {
+				assert!(
+					tokio::time::Instant::now() < deadline,
+					"the startup GC obligations {named:?} were not resolved by the deadline: \
+					 scopes {scopes:?}, durable {durable_named:?}, readiness {readiness:?}"
+				);
+				tokio::time::sleep(Duration::from_millis(100)).await;
+			}
+		}
+	}
+}
+
+/// DC-259 guard controls (Codex 01a1e6fe): the helper waits only on supported, named
+/// recovered GC steps; it fails on a new unseeded obstruction or an unrelated readiness
+/// reason; it accepts the deferred-open completion only after the named jobs; and it refuses
+/// a completion observed after its deadline.
+#[test]
+fn the_startup_gc_wait_accepts_only_named_supported_obligations() {
+	use crate::schema::CompactionJobId;
+	use crate::storage::index::{LsmInstallKind::*, LsmInstallPhase::*};
+	// Supported: a mark and a removal, seeded fenced.
+	assert!(supported_startup_gc_shape(
+		Control, Prepared, true, false, true, 2, 1, 0
+	));
+	assert!(supported_startup_gc_shape(
+		Control, Prepared, true, false, true, 1, 0, 1
+	));
+	// Unsupported: a Local or row-rewrite intent, another phase, a live owner, an unknown
+	// shape.
+	assert!(!supported_startup_gc_shape(
+		Local, Prepared, true, false, true, 2, 1, 0
+	));
+	assert!(!supported_startup_gc_shape(
+		Control, Prepared, false, false, true, 2, 0, 0
+	));
+	assert!(!supported_startup_gc_shape(
+		Control,
+		OutputsPublished,
+		true,
+		false,
+		true,
+		2,
+		1,
+		0
+	));
+	assert!(!supported_startup_gc_shape(
+		Control, Prepared, true, true, true, 2, 1, 0
+	));
+	assert!(!supported_startup_gc_shape(
+		Control, Prepared, true, false, false, 2, 1, 0
+	));
+	assert!(!supported_startup_gc_shape(
+		Control, Prepared, true, false, true, 3, 1, 0
+	));
+	assert!(!supported_startup_gc_shape(
+		Control, Prepared, true, false, true, 2, 1, 1
+	));
+	let (a, b) = (CompactionJobId(1), CompactionJobId(2));
+	let fenced = |job| (job, false, true, true);
+	let live = |job| (job, true, false, true);
+	use StartupObligation::*;
+	// While the named job remains, only its own fence is waited through.
+	assert_eq!(
+		startup_gc_obligation_step(&[a], &[fenced(a)], &[a], Some("TierAuthorityLsmUnresolved")),
+		Wait
+	);
+	// A new fenced job the restart did not seed fails, even while the named one waits.
+	assert!(matches!(
+		startup_gc_obligation_step(
+			&[a],
+			&[fenced(a), fenced(b)],
+			&[a],
+			Some("TierAuthorityLsmUnresolved")
+		),
+		Fail(_)
+	));
+	// A live (in-flight) new job is ordinary work, not an obstruction.
+	assert_eq!(
+		startup_gc_obligation_step(
+			&[a],
+			&[fenced(a), live(b)],
+			&[a],
+			Some("TierAuthorityLsmUnresolved")
+		),
+		Wait
+	);
+	// An unrelated readiness reason fails.
+	assert!(matches!(
+		startup_gc_obligation_step(&[a], &[fenced(a)], &[a], Some("TierAuthorityFenced")),
+		Fail(_)
+	));
+	assert!(matches!(
+		startup_gc_obligation_step(&[a], &[], &[], Some("TierAuthorityFenced")),
+		Fail(_)
+	));
+	// Multi-slab steps were not exercised: refused (Codex 01a1e706 B).
+	assert!(!supported_startup_gc_shape(
+		Control, Prepared, true, false, true, 2, 2, 0
+	));
+	assert!(!supported_startup_gc_shape(
+		Control, Prepared, true, false, true, 1, 0, 2
+	));
+	// A stale `pending` (the scope cleared during the durable read) meeting the deferred open's
+	// completion is waited through and re-observed, not failed (Codex 01a1e706 A).
+	assert_eq!(
+		startup_gc_obligation_step(&[a], &[], &[a], Some("DeferredOpenIncomplete")),
+		Wait
+	);
+	assert_eq!(
+		startup_gc_obligation_step(&[a], &[fenced(a)], &[a], Some("DeferredOpenIncomplete")),
+		Wait
+	);
+	// After the named job is gone, only the deferred open's completion is waited through.
+	assert_eq!(
+		startup_gc_obligation_step(&[a], &[], &[], Some("DeferredOpenIncomplete")),
+		Wait
+	);
+	assert_eq!(startup_gc_obligation_step(&[a], &[], &[], None), Done);
+	// A cleared registered scope with its durable intent still present is not done.
+	assert_eq!(startup_gc_obligation_step(&[a], &[], &[a], None), Wait);
+	// Nothing seeded: done at once, and no deferred-open wait is invented.
+	assert_eq!(startup_gc_obligation_step(&[], &[], &[], None), Done);
+	assert!(matches!(
+		startup_gc_obligation_step(&[], &[], &[], Some("DeferredOpenIncomplete")),
+		Fail(_)
+	));
+	// A completion observed after the deadline is refused.
+	let deadline = tokio::time::Instant::now();
+	assert!(accepted_by_deadline(deadline, deadline).is_ok());
+	assert!(accepted_by_deadline(deadline + Duration::from_millis(1), deadline).is_err());
+}
+
+/// DC-259: `work` bounded by the case's ONE absolute deadline; a result observed after it
+/// is refused even when it was ready at once.
+async fn dc259_within<T>(
+	deadline: tokio::time::Instant,
+	what: &str,
+	work: impl std::future::Future<Output = T>,
+) -> Result<T, String> {
+	let value = tokio::time::timeout_at(deadline, work)
+		.await
+		.map_err(|_| format!("FAILED: {what}: not done by the case deadline"))?;
+	if tokio::time::Instant::now() > deadline {
+		return Err(format!(
+			"FAILED: {what}: done, but observed after the case deadline"
+		));
+	}
+	Ok(value)
+}
+
+/// DC-259 deterministic reproduction (Codex 01a1e6e4, 01a1e6f1; opt-in hook; ONE ruled run).
+/// The node's own GC sweep is held once at `cut` with its intent durably stored; the node is
+/// closed the owning workflow's way (its tasks aborted, the held sweep dropped with its
+/// owner); a fresh node reopens on the same store. The recovered intent is judged from what
+/// open seeded (recorded at open), then must be resolved by the ordinary scheduled resolver,
+/// and every row read exactly, all within ONE absolute deadline over the whole case.
+/// Outcomes: `SETUP` (the cut or a seed is not the required state), `UNRESOLVED` (a valid
+/// seed not resolved within the declared bound), `FAILED` (anything else).
+async fn a_gc_step_cut_at_restart_is_resolved_after_reopen(
+	cut: crate::storage::manager::GcSweepCut,
+) {
+	const BOUND: Duration = Duration::from_secs(240);
+	let deadline = tokio::time::Instant::now() + BOUND;
+	let mut slot = None;
+	let outcome = dc259_case(cut, deadline, &mut slot).await;
+	if let Err(why) = outcome {
+		// The original outcome first; cleanup is bounded on its own.
+		eprintln!("DC-259 {cut:?} {why}");
+		if let Some(node) = slot.take() {
+			let cleanup =
+				tokio::time::timeout(Duration::from_secs(30), shutdown_lease_node(node)).await;
+			eprintln!("DC-259 {cut:?} cleanup after the failure: {cleanup:?}");
+		}
+		panic!("DC-259 {cut:?} {why}");
+	}
+}
+
+async fn dc259_case(
+	cut: crate::storage::manager::GcSweepCut,
+	deadline: tokio::time::Instant,
+	slot: &mut Option<WendelonNode>,
+) -> Result<(), String> {
+	use crate::consensus::slab_ops::{RecordedOutcome, SlabStanding, ViewOutcome};
+	use crate::storage::index::{LoadedOp, LsmInstallKind, LsmInstallPhase, OpProgress};
+	use crate::storage::manager::GcSweepCut;
+	use crate::storage::sweeper::TierCommitter;
+	let setup = |why: String| format!("SETUP: {why}");
+	let dir = bootstrap_tempdir("dc259-gc-cut");
+	let mut cfg = NodeBootstrapConfig::dev(38, dir.to_path_buf(), "127.0.0.1:0".into());
+	cfg.slab_max_bytes = 8 * 1024;
+	let node = dc259_within(
+		deadline,
+		"bootstrap",
+		WendelonNode::bootstrap_single_node(cfg.clone()),
+	)
+	.await?
+	.map_err(|error| format!("FAILED: bootstrap: {error}"))?;
+	let node = slot.insert(node);
+	while dc259_within(deadline, "leadership", node.raft.current_leader()).await?
+		!= Some(node.local_node.id)
+	{
+		dc259_within(
+			deadline,
+			"leadership",
+			tokio::time::sleep(Duration::from_millis(20)),
+		)
+		.await?;
+	}
+	dc259_within(
+		deadline,
+		"lease refresh",
+		node.data_server
+			.refresh_leases_once(&node.ring, &*node.clock, 600_000),
+	)
+	.await?;
+	let descriptor = typed_table_descriptor();
+	dc259_within(
+		deadline,
+		"schema",
+		node.raft
+			.client_write(WendelonRequest::SchemaUpdate(typed_table_schema_update(
+				&descriptor,
+			))),
+	)
+	.await?
+	.map_err(|error| format!("FAILED: schema: {error}"))?;
+	node.slab.record_lsm_publication_evidence_for_test();
+	let (entered, _release) = node.slab.hold_gc_sweep_at_for_test(cut);
+
+	// The node's own compaction and GC run until the sweep holds at the cut.
+	let mut expected = std::collections::BTreeMap::new();
+	let mut as_of = hlc(1, 0, 1);
+	let mut id = 0_i64;
+	while entered.try_acquire().is_err() {
+		id += 1;
+		let name = format!("value-{id}-{}", "x".repeat(256));
+		let batch = typed_table_batch_with_names(vec![(id, name.as_str())]);
+		let mut meta = typed_table_meta(&descriptor, batch.num_rows());
+		meta.parent_write_id.sequence_no = 10_000 + id as u64;
+		let (written, _) = dc259_within(
+			deadline,
+			&format!("write {id} (the sweep has not reached {cut:?})"),
+			node.data_server.table_write(meta, batch),
+		)
+		.await?
+		.map_err(|error| format!("FAILED: write {id}: {error}"))?;
+		if written.write.status != WriteStatus::OK {
+			return Err(format!("FAILED: write {id}: {written:?}"));
+		}
+		as_of = written.write.commit_hlc;
+		expected.insert(id, name);
+		dc259_within(
+			deadline,
+			"write pacing",
+			tokio::time::sleep(Duration::from_millis(5)),
+		)
+		.await?;
+	}
+	let job = node
+		.slab
+		.gc_sweep_held_job_for_test()
+		.ok_or_else(|| setup("the held job was not recorded".into()))?;
+
+	// The live seed, the job held: its durable intent, its ops' local state and the ring's
+	// decision for them, through the real read-only view.
+	let intent = dc259_within(
+		deadline,
+		"the durable snapshot",
+		node.slab.durable_index_snapshot_for_test(),
+	)
+	.await?
+	.lsm_install_intents
+	.into_iter()
+	.find(|intent| intent.commit.job_id == job)
+	.ok_or_else(|| setup(format!("job {job:?} has no durable intent")))?;
+	if intent.kind != LsmInstallKind::Control
+		|| intent.phase != LsmInstallPhase::Prepared
+		|| !intent.commit.is_lsm_gc_lifecycle_commit()
+	{
+		return Err(setup(format!(
+			"job {job:?}: kind {:?} phase {:?} gc_lifecycle {}",
+			intent.kind,
+			intent.phase,
+			intent.commit.is_lsm_gc_lifecycle_commit()
+		)));
+	}
+	let index = node
+		.slab
+		.persistent_index()
+		.ok_or_else(|| setup("no index".into()))?;
+	let loaded = dc259_within(deadline, "the loaded ops", index.load_op_intents())
+		.await?
+		.map_err(|error| format!("FAILED: the loaded ops: {error}"))?;
+	let committer = crate::storage::sweeper::RaftCommitter::new(node.raft.clone())
+		.with_state_machine(node.state_machine.clone());
+	let view_of = |op: &LoadedOp| {
+		let (key, digest, slabs) = (op.key(), op.digest(), op.command().slabs());
+		let committer = &committer;
+		async move { committer.op_view(key, digest, slabs).await }
+	};
+	let find =
+		|key: crate::consensus::slab_ops::OpKey| loaded.iter().find(|op| op.key() == key).cloned();
+	let claimed = |view: &crate::consensus::slab_ops::OpView| {
+		view.slabs
+			.iter()
+			.any(|(_, standing)| *standing == SlabStanding::Claimed(job))
+	};
+	let witness = match cut {
+		GcSweepCut::MarkAllocated | GcSweepCut::MarkApplied => {
+			if intent.ops.len() != 2 || intent.commit.slabs_to_mark_delete_pending.is_empty() {
+				return Err(setup(format!(
+					"a mark needs [mark, removal] ops and a mark-delete-pending slab: {:?} / {:?}",
+					intent.ops, intent.commit.slabs_to_mark_delete_pending
+				)));
+			}
+			let mark = find(intent.ops[0])
+				.ok_or_else(|| setup(format!("the mark {:?} is not a loaded op", intent.ops[0])))?;
+			if !matches!(mark, LoadedOp::Submittable(_)) {
+				return Err(setup(format!(
+					"the mark is not submittable: {:?}",
+					mark.key()
+				)));
+			}
+			let progress = dc259_within(
+				deadline,
+				"the mark's progress",
+				index.op_progress(mark.key().op_seq),
+			)
+			.await?
+			.map_err(|error| format!("FAILED: the mark's progress: {error}"))?;
+			if !matches!(progress, Some(OpProgress::MarkPrepared { .. })) {
+				return Err(setup(format!("the mark's progress is {progress:?}")));
+			}
+			let view = dc259_within(deadline, "the mark's view", view_of(&mark))
+				.await?
+				.map_err(|error| format!("FAILED: the mark's view: {error}"))?;
+			let decided = match (cut, &view.outcome) {
+				(GcSweepCut::MarkAllocated, ViewOutcome::None) => true,
+				(
+					GcSweepCut::MarkApplied,
+					ViewOutcome::Recorded(RecordedOutcome::Applied { .. }),
+				) => claimed(&view),
+				_ => false,
+			};
+			if !decided || !view.owner_current {
+				return Err(setup(format!(
+					"the mark's ring view is not {cut:?}'s: {view:?}"
+				)));
+			}
+			format!("mark {:?} progress MarkPrepared; ring {view:?}", mark.key())
+		}
+		GcSweepCut::RemovalIntentStored => {
+			if intent.ops.len() != 1 || intent.commit.slabs_to_remove.is_empty() {
+				return Err(setup(format!(
+					"a removal needs [removal] and a slab to remove: {:?} / {:?}",
+					intent.ops, intent.commit.slabs_to_remove
+				)));
+			}
+			let removal = find(intent.ops[0]).ok_or_else(|| {
+				setup(format!(
+					"the removal {:?} is not a loaded op",
+					intent.ops[0]
+				))
+			})?;
+			if !matches!(removal, LoadedOp::Reserved(_)) {
+				return Err(setup(format!(
+					"the removal is not reserved: {:?}",
+					removal.key()
+				)));
+			}
+			let progress = dc259_within(
+				deadline,
+				"the removal's progress",
+				index.op_progress(removal.key().op_seq),
+			)
+			.await?
+			.map_err(|error| format!("FAILED: the removal's progress: {error}"))?;
+			if progress.is_some() {
+				return Err(setup(format!("the removal's progress is {progress:?}")));
+			}
+			let view = dc259_within(deadline, "the removal's view", view_of(&removal))
+				.await?
+				.map_err(|error| format!("FAILED: the removal's view: {error}"))?;
+			if view.outcome != ViewOutcome::None || !claimed(&view) || !view.owner_current {
+				return Err(setup(format!(
+					"the removal's ring view is not R0's: {view:?}"
+				)));
+			}
+			format!("removal {:?} progress None; ring {view:?}", removal.key())
+		}
+	};
+	let live_scope = node
+		.slab
+		.lsm_install_unresolved_for_test()
+		.into_iter()
+		.find(|(id, ..)| *id == job);
+	if !matches!(live_scope, Some((_, true, _, true))) {
+		return Err(setup(format!(
+			"the live sweep does not own its scope: {live_scope:?}"
+		)));
+	}
+	eprintln!(
+		"DC-259 {cut:?} live seed job {job:?}: Control/Prepared ops {:?}; {witness}",
+		intent.ops
+	);
+	drop(index);
+	drop(loaded);
+
+	// The owning workflow's restart: tasks aborted, the held sweep dropped with its owner.
+	let node = slot.take().expect("the live node");
+	dc259_within(deadline, "the shutdown", shutdown_lease_node(node)).await?;
+	let reopened = dc259_within(
+		deadline,
+		"the reopen",
+		WendelonNode::bootstrap_single_node(cfg),
+	)
+	.await?
+	.map_err(|error| format!("FAILED: the reopen: {error}"))?;
+	let reopened = slot.insert(reopened);
+	let seeded = reopened
+		.slab
+		.startup_lsm_seed_for_test()
+		.into_iter()
+		.find(|seed| seed.job == job);
+	let seeded_ok = seeded.as_ref().is_some_and(|seed| {
+		seed.kind == LsmInstallKind::Control
+			&& seed.phase == LsmInstallPhase::Prepared
+			&& seed.ops == intent.ops
+			&& !seed.in_flight
+			&& seed.keys_unknown
+			&& seed.gc_lifecycle
+	});
+	if !seeded_ok {
+		return Err(setup(format!(
+			"open did not seed job {job:?} fenced as held: {seeded:?}"
+		)));
+	}
+	eprintln!("DC-259 {cut:?} open seeded: {seeded:?}");
+
+	// The ordinary scheduled resolver, under the same deadline (it may already be done).
+	let reopened_at = tokio::time::Instant::now();
+	while dc259_within(
+		deadline,
+		"leadership after the reopen",
+		reopened.raft.current_leader(),
+	)
+	.await? != Some(reopened.local_node.id)
+	{
+		dc259_within(
+			deadline,
+			"leadership after the reopen",
+			tokio::time::sleep(Duration::from_millis(20)),
+		)
+		.await?;
+	}
+	dc259_within(
+		deadline,
+		"lease refresh after the reopen",
+		reopened
+			.data_server
+			.refresh_leases_once(&reopened.ring, &*reopened.clock, 600_000),
+	)
+	.await?;
+	let mut last = None;
+	loop {
+		let scope = reopened
+			.slab
+			.lsm_install_unresolved_for_test()
+			.into_iter()
+			.find(|(id, ..)| *id == job);
+		let durable =
+			tokio::time::timeout_at(deadline, reopened.slab.durable_index_snapshot_for_test())
+				.await
+				.ok()
+				.map(|snapshot| {
+					snapshot
+						.lsm_install_intents
+						.iter()
+						.any(|intent| intent.commit.job_id == job)
+				});
+		let readiness = reopened.slab.tier_authority_readiness_reason();
+		let now = (scope, durable, readiness.clone());
+		if last.as_ref() != Some(&now) {
+			eprintln!(
+				"DC-259 {cut:?} t={}ms: scope {scope:?} durable {durable:?} readiness {readiness:?}",
+				reopened_at.elapsed().as_millis()
+			);
+			last = Some(now);
+		}
+		if scope.is_none() && durable == Some(false) && readiness.is_none() {
+			if tokio::time::Instant::now() > deadline {
+				return Err("FAILED: resolved, but observed after the case deadline".into());
+			}
+			eprintln!(
+				"DC-259 {cut:?}: job {job:?} resolved {:?} after the reopen",
+				reopened_at.elapsed()
+			);
+			break;
+		}
+		if tokio::time::Instant::now() >= deadline {
+			return Err(format!(
+				"UNRESOLVED: job {job:?} not resolved within the declared bound: scope {scope:?}, \
+				 durable {durable:?}, readiness {readiness:?}; live seed {witness}"
+			));
+		}
+		tokio::time::sleep(Duration::from_millis(100)).await;
+	}
+	let rows = dc259_within(
+		deadline,
+		"the read after resolution",
+		all_rows_through_the_query_path(reopened, &descriptor, as_of),
+	)
+	.await?;
+	if rows != expected {
+		return Err(format!(
+			"FAILED: the read after resolution: {} rows, {} expected",
+			rows.len(),
+			expected.len()
+		));
+	}
+	let reopened = slot.take().expect("the reopened node");
+	dc259_within(
+		deadline,
+		"the final shutdown",
+		shutdown_lease_node(reopened),
+	)
+	.await?;
+	Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dc259_a_gc_mark_cut_before_submission_is_resolved_after_reopen() {
+	a_gc_step_cut_at_restart_is_resolved_after_reopen(
+		crate::storage::manager::GcSweepCut::MarkAllocated,
+	)
+	.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dc259_a_gc_mark_cut_after_it_applied_is_resolved_after_reopen() {
+	a_gc_step_cut_at_restart_is_resolved_after_reopen(
+		crate::storage::manager::GcSweepCut::MarkApplied,
+	)
+	.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dc259_a_gc_removal_cut_with_its_intent_stored_is_resolved_after_reopen() {
+	a_gc_step_cut_at_restart_is_resolved_after_reopen(
+		crate::storage::manager::GcSweepCut::RemovalIntentStored,
+	)
+	.await;
+}
+
 async fn compaction_workflow(stage: std::sync::Arc<std::sync::Mutex<String>>) {
 	let enter = |now: String| *stage.lock().unwrap() = now;
 	let polls_end = tokio::time::Instant::now() + Duration::from_secs(270);
@@ -19155,6 +19848,10 @@ async fn compaction_workflow(stage: std::sync::Arc<std::sync::Mutex<String>>) {
 			"{held:?} of the lineage of {outputs:?}: {run:?}"
 		);
 	}
+	// DC-259: the restart can leave a GC-lifecycle step for the ordinary resolver; the first
+	// query waits only for those named steps, read only, within the workflow's bound.
+	enter("startup GC obligations".to_owned());
+	wait_for_startup_gc_obligations(&reopened, polls_end).await;
 	enter("query after the restart".to_owned());
 	assert_eq!(
 		all_rows_through_the_query_path(&reopened, &descriptor, as_of).await,

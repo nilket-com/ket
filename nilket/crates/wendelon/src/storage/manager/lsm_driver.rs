@@ -593,6 +593,26 @@ impl SlabManager {
 	/// Both visit the shards one at a time with no snapshot, so `is_empty` being true is an answer
 	/// the walk could also have given: an intent standing throughout is seen by both, and one
 	/// inserted behind the cursor by neither. With intents present, the walk runs and allocates.
+	/// DC-259 (test-only, read only): each registered unresolved LSM intent as
+	/// (job, in_flight, keys_unknown, gc_lifecycle).
+	#[cfg(test)]
+	pub(crate) fn lsm_install_unresolved_for_test(
+		&self,
+	) -> Vec<(CompactionJobId, bool, bool, bool)> {
+		self.lsm_install_unresolved
+			.iter()
+			.map(|entry| {
+				let scope = entry.value();
+				(
+					*entry.key(),
+					scope.in_flight,
+					scope.keys_unknown,
+					scope.gc_lifecycle,
+				)
+			})
+			.collect()
+	}
+
 	pub(super) fn has_orphaned_lsm_intents(&self) -> bool {
 		!self.lsm_install_unresolved.is_empty()
 			&& self
@@ -4731,6 +4751,12 @@ impl SlabManager {
 			let intent = allocation
 				.linked
 				.ok_or_else(|| Error::other("an allocated GC operation returns its intent"))?;
+			#[cfg(test)]
+			self.gc_sweep_cut_for_test(
+				super::pause_hooks::GcSweepCut::MarkAllocated,
+				intent.commit.job_id,
+			)
+			.await;
 			if let crate::storage::sweeper::VerifiedReceipt::Rejected { reason, .. } =
 				committer.submit_op(&ticket).await?
 			{
@@ -4757,6 +4783,12 @@ impl SlabManager {
 				_intent_owner.complete();
 				continue;
 			}
+			#[cfg(test)]
+			self.gc_sweep_cut_for_test(
+				super::pause_hooks::GcSweepCut::MarkApplied,
+				intent.commit.job_id,
+			)
+			.await;
 			let (snapshot, allocation_ownership) = tokio::spawn(self.clone().gc_complete_mark(
 				ticket.clone(),
 				removal,
@@ -4885,6 +4917,12 @@ impl SlabManager {
 			let mut intent = intent;
 			intent.ops = vec![reserved.key()];
 			index.put_lsm_install_intent(intent.clone()).await?;
+			#[cfg(test)]
+			self.gc_sweep_cut_for_test(
+				super::pause_hooks::GcSweepCut::RemovalIntentStored,
+				intent.commit.job_id,
+			)
+			.await;
 			// T1's order: local disposal, then Complete, then its purge. No maintenance,
 			// tier or rewrite lock spans the control-ring await. Each local stage is
 			// detached: an aborted sweep cannot release its exclusion or authority

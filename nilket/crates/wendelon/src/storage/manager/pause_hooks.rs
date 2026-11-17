@@ -624,8 +624,49 @@ pub(crate) struct LsmPublicationEvidenceForTest {
 	pub(crate) rows_per_slab: Vec<(SlabId, usize)>,
 }
 
+/// DC-259 (opt-in, test-only): where one GC sweep holds, once, in the sweep's own future, so
+/// a node's task abort drops the hold with the sweep and its intent owner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GcSweepCut {
+	/// M0: the mark and its reserved removal are durably allocated (the intent stored with
+	/// both ops), before the mark is submitted to the ring.
+	MarkAllocated,
+	/// M1: the ring applied the mark, before the spawned completion that hands the intent off.
+	MarkApplied,
+	/// R0: the removal's intent is durably stored, before its file identity is read and its
+	/// detached disposal starts.
+	RemovalIntentStored,
+}
+
+/// DC-259 (test-only): one LSM intent exactly as open seeded it, recorded at open and never
+/// changed, so a test can judge the recovered seed even if the resolver ran first.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StartupLsmSeed {
+	pub(crate) job: crate::schema::CompactionJobId,
+	pub(crate) kind: crate::storage::index::LsmInstallKind,
+	pub(crate) phase: crate::storage::index::LsmInstallPhase,
+	pub(crate) ops: Vec<crate::consensus::slab_ops::OpKey>,
+	pub(crate) in_flight: bool,
+	pub(crate) keys_unknown: bool,
+	pub(crate) gc_lifecycle: bool,
+	/// The commit's shape: how many slabs it marks delete-pending, and how many it removes.
+	pub(crate) mark_delete_pending: usize,
+	pub(crate) remove: usize,
+}
+
 #[derive(Default)]
 pub(super) struct TestHolds {
+	/// DC-259: every LSM intent open seeded, as it seeded it.
+	pub(super) startup_lsm_seed: std::sync::Mutex<Vec<StartupLsmSeed>>,
+	/// DC-259: one armed GC sweep cut, and the job the sweep held there.
+	pub(super) gc_sweep_cut_hold: std::sync::Mutex<
+		Option<(
+			GcSweepCut,
+			Arc<tokio::sync::Semaphore>,
+			Arc<tokio::sync::Semaphore>,
+		)>,
+	>,
+	pub(super) gc_sweep_cut_job: std::sync::Mutex<Option<crate::schema::CompactionJobId>>,
 	pub(super) retirement_snapshot_hold:
 		std::sync::Mutex<Option<(Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>)>>,
 	pub(super) rebuild_snapshot_hold:
@@ -777,6 +818,53 @@ impl SlabManager {
 			return Err(std::io::Error::other("injected: a deferred open failed"));
 		}
 		Ok(())
+	}
+
+	/// DC-259: arms ONE hold at `cut`. `entered` gets a permit when a sweep is held there;
+	/// it continues only when `release` gets one (a node's task abort drops it instead).
+	pub(crate) fn hold_gc_sweep_at_for_test(
+		&self,
+		cut: GcSweepCut,
+	) -> (Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>) {
+		let entered = Arc::new(tokio::sync::Semaphore::new(0));
+		let release = Arc::new(tokio::sync::Semaphore::new(0));
+		*self.continuity_test_holds.gc_sweep_cut_hold.lock().unwrap() =
+			Some((cut, entered.clone(), release.clone()));
+		(entered, release)
+	}
+
+	/// DC-259: every LSM intent this manager's open seeded, as it seeded it.
+	pub(crate) fn startup_lsm_seed_for_test(&self) -> Vec<StartupLsmSeed> {
+		self.continuity_test_holds
+			.startup_lsm_seed
+			.lock()
+			.unwrap()
+			.clone()
+	}
+
+	/// DC-259: the job a sweep was held with, once one was.
+	pub(crate) fn gc_sweep_held_job_for_test(&self) -> Option<crate::schema::CompactionJobId> {
+		*self.continuity_test_holds.gc_sweep_cut_job.lock().unwrap()
+	}
+
+	/// DC-259: holds here once if `cut` is armed; any other cut passes untouched.
+	pub(super) async fn gc_sweep_cut_for_test(
+		&self,
+		cut: GcSweepCut,
+		job: crate::schema::CompactionJobId,
+	) {
+		let hold = {
+			let mut slot = self.continuity_test_holds.gc_sweep_cut_hold.lock().unwrap();
+			match slot.as_ref() {
+				Some((armed, ..)) if *armed == cut => slot.take(),
+				_ => None,
+			}
+		};
+		if let Some((_, entered, release)) = hold {
+			*self.continuity_test_holds.gc_sweep_cut_job.lock().unwrap() = Some(job);
+			entered.add_permits(1);
+			let _ = release.acquire().await;
+		}
 	}
 
 	pub(super) async fn pause_gc_disposal_entry_for_test(&self) {
