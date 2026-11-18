@@ -236,6 +236,55 @@ pub(super) enum SecondaryIndexBackfillOutcome {
 	StaleCandidate { source_slab_id: SlabId },
 }
 
+#[cfg(test)]
+thread_local! {
+	static FIRST_TIER_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// ADR 0111 D1: a first tier's held rewrite claim on its sealed source.
+pub(crate) struct FirstTierClaim {
+	slab_id: SlabId,
+	_guard: OwnedRwLockWriteGuard<()>,
+}
+
+impl FirstTierClaim {
+	/// The slab whose rewrite claim this is.
+	pub(crate) fn slab_id(&self) -> SlabId {
+		self.slab_id
+	}
+}
+
+/// ADR 0111 D1: the source's manifest run is known non-Live; it is never a first tier.
+#[derive(Debug)]
+pub(crate) struct FirstTierSourceRetired;
+impl std::fmt::Display for FirstTierSourceRetired {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str("FirstTierSourceRetired")
+	}
+}
+impl std::error::Error for FirstTierSourceRetired {}
+
+/// ADR 0111 D1: an unresolved first tier of this owner already names the source.
+#[derive(Debug)]
+pub(crate) struct FirstTierAlreadyPending;
+impl std::fmt::Display for FirstTierAlreadyPending {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str("FirstTierAlreadyPending")
+	}
+}
+impl std::error::Error for FirstTierAlreadyPending {}
+
+/// ADR 0111 D2: the outcome of admitting one sealed slab to maintenance under its claim.
+pub(super) enum SealedMaintenanceAdmission {
+	Claimed(MaintenanceClaims, Arc<LocalSlabStore>),
+	/// No longer sealed, or a known non-Live run (ADR 0097).
+	NotEligible,
+	/// An unresolved first tier of this store's owner names the slab.
+	FirstTierPending,
+	/// The op index could not be read to rule a first tier out.
+	Deferred(std::io::Error),
+}
+
 /// ADR 0097: proof that a maintenance job owns the slabs it is about to rewrite.
 ///
 /// Constructed only by `SlabManager::acquire_maintenance_claims`, which sorts and
@@ -2260,15 +2309,62 @@ impl SlabManager {
 	///
 	/// `None` means the id is no longer sealed - the job it waited for retired it -
 	/// and the caller has nothing left to do for that candidate.
+	/// ADR 0111 D2: it is also `None` while an unresolved first tier of this store's owner names
+	/// the slab, or while the op index cannot rule one out; the candidate is not retired now.
 	pub(super) async fn claim_sealed_slab_for_maintenance(
 		&self,
 		slab_id: SlabId,
 	) -> Option<(MaintenanceClaims, Arc<LocalSlabStore>)> {
 		let claims = self.acquire_maintenance_claims(&[slab_id]).await;
+		match self
+			.admit_sealed_slab_for_maintenance(claims, slab_id)
+			.await
+		{
+			SealedMaintenanceAdmission::Claimed(claims, slab) => Some((claims, slab)),
+			SealedMaintenanceAdmission::Deferred(error) => {
+				tracing::debug!(
+					slab_id = slab_id.get(),
+					error = %error,
+					"maintenance deferred: the op index could not rule out a first tier"
+				);
+				None
+			}
+			SealedMaintenanceAdmission::NotEligible
+			| SealedMaintenanceAdmission::FirstTierPending => None,
+		}
+	}
+
+	/// ADR 0111 D2: RetentionPrune's non-blocking claim. `None` means the slab's rewrite claim is
+	/// held (a first tier or another job owns it): the pass skips it before reading.
+	pub(super) fn try_claim_sealed_slab_for_maintenance(
+		&self,
+		slab_id: SlabId,
+	) -> Option<MaintenanceClaims> {
+		let guard = self.slab_rewrite_claim(slab_id).try_write_owned().ok()?;
+		Some(MaintenanceClaims {
+			_guards: vec![guard],
+			slabs: vec![slab_id],
+		})
+	}
+
+	/// ADR 0111 D2: the one admission every sealed-maintenance variant takes, under the slab's
+	/// claim and before any read or effect (the full-prune path's delete-pending pin and
+	/// secondary-index reconciliation included). ADR 0097's revalidation first (no longer sealed,
+	/// or a known non-Live run, is `NotEligible`; a missing legacy run stays eligible), then the
+	/// first-tier fence: while an unresolved first tier of this store's owner names the slab, no
+	/// maintenance retires it. An op index that cannot be read defers (fail closed).
+	pub(super) async fn admit_sealed_slab_for_maintenance(
+		&self,
+		claims: MaintenanceClaims,
+		slab_id: SlabId,
+	) -> SealedMaintenanceAdmission {
 		let current = {
 			let state = self.state.lock().await;
 			state.sealed.get(&slab_id).map(|slab| slab.value().clone())
-		}?;
+		};
+		let Some(current) = current else {
+			return SealedMaintenanceAdmission::NotEligible;
+		};
 		// A NON-Live run means a retired source that a replacement deliberately
 		// left sealed for stale readers until the delete-pending sweep disposes of
 		// it. A missing run is different: defer the legacy adoption until after the
@@ -2280,10 +2376,100 @@ impl SlabManager {
 				.get_run(slab_id)
 				.is_some_and(|run| !run.state.is_live())
 			{
-				return None;
+				return SealedMaintenanceAdmission::NotEligible;
 			}
 		}
-		Some((claims, current))
+		match self.first_tier_pending(&[slab_id]).await {
+			Ok(false) => SealedMaintenanceAdmission::Claimed(claims, current),
+			Ok(true) => {
+				tracing::debug!(
+					slab_id = slab_id.get(),
+					"maintenance deferred: an unresolved first tier names this slab"
+				);
+				SealedMaintenanceAdmission::FirstTierPending
+			}
+			Err(error) => SealedMaintenanceAdmission::Deferred(error),
+		}
+	}
+
+	/// ADR 0111 D1: whether the slab's manifest run is KNOWN non-Live (`Retired` or
+	/// `DeletePending`): a source local maintenance already replaced or retired. A missing
+	/// legacy run is not known non-Live and stays a first-tier candidate.
+	pub(crate) fn sealed_run_known_non_live(&self, slab_id: SlabId) -> bool {
+		recover_rwlock_read(&self.compaction_manifest, "compaction_manifest")
+			.get_run(slab_id)
+			.is_some_and(|run| !run.state.is_live())
+	}
+
+	/// ADR 0111 D1: a first tier's non-blocking claim on its source, held from before it reads
+	/// the slab through its proposal and apply. `None` means another job owns the slab.
+	pub(crate) fn try_claim_first_tier_source(&self, slab_id: SlabId) -> Option<FirstTierClaim> {
+		Some(FirstTierClaim {
+			slab_id,
+			_guard: self.slab_rewrite_claim(slab_id).try_write_owned().ok()?,
+		})
+	}
+
+	/// ADR 0111 D1: re-validate a first-tier source under its claim, before anything is read
+	/// or uploaded (a listing is only a hint): sealed, quiescent and not tiered; its run not
+	/// known non-Live; and no unresolved first tier of this owner already naming it (an
+	/// earlier attempt cancelled before it recorded its cleanup marker included). A refusal
+	/// has read and uploaded nothing.
+	pub(crate) async fn admit_first_tier_source(
+		&self,
+		claim: &FirstTierClaim,
+		slab_id: SlabId,
+	) -> std::io::Result<()> {
+		if claim.slab_id != slab_id {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				"a first-tier claim names another slab",
+			));
+		}
+		{
+			let state = self.state.lock().await;
+			if state.tiered.contains_key(&slab_id)
+				|| !state
+					.sealed
+					.get(&slab_id)
+					.is_some_and(|slab| slab.manager_appends_quiescent())
+			{
+				return Err(Error::new(
+					ErrorKind::WouldBlock,
+					"slab is not a quiescent sealed tier candidate",
+				));
+			}
+		}
+		if self.sealed_run_known_non_live(slab_id) {
+			return Err(Error::new(ErrorKind::WouldBlock, FirstTierSourceRetired));
+		}
+		if self.first_tier_pending(&[slab_id]).await? {
+			return Err(Error::new(ErrorKind::WouldBlock, FirstTierAlreadyPending));
+		}
+		Ok(())
+	}
+
+	/// ADR 0111 D5: whether an unresolved first tier of this store's current owner names one of
+	/// `slabs`. A store with no persistent op index, or not bound to a control node, has no
+	/// first-tier producer (a first tier needs both), so nothing can be pending. A bound store
+	/// whose owner cannot be read is an error, never a silent "no".
+	pub(super) async fn first_tier_pending(&self, slabs: &[SlabId]) -> std::io::Result<bool> {
+		let Some(index) = self.persistent_index.as_deref() else {
+			return Ok(false);
+		};
+		if slabs.is_empty() || !self.control_node_bound() {
+			return Ok(false);
+		}
+		let owner = self.owner_ref()?;
+		#[cfg(test)]
+		FIRST_TIER_READS.with(|reads| reads.set(reads.get() + 1));
+		index.first_tier_row_names(owner, slabs.to_vec()).await
+	}
+
+	/// Test-only: how many op-index first-tier reads this thread has started.
+	#[cfg(test)]
+	pub(crate) fn first_tier_reads_for_test() -> u64 {
+		FIRST_TIER_READS.with(std::cell::Cell::get)
 	}
 
 	/// ADR 0097: take the exclusive rewrite claim on EVERY slab a maintenance job

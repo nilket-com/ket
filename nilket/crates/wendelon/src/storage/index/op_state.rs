@@ -2181,6 +2181,59 @@ impl PersistentLocalIndex {
 
 	/// Every undecided operation, each minting only its original identity: a
 	/// retry never gets a new sequence.
+	/// ADR 0111 D5: whether any recorded op is a FIRST tier (`SlabCommand::Tier` with no
+	/// replaced generation) of one of `slabs` for exactly `owner` (node and incarnation). It
+	/// reads the rows in order, decodes one at a time and stops at the first match: no
+	/// collected vector, no scan per slab. A row that does not decode fails the read, which the
+	/// caller treats as a deferral, never as "no first tier".
+	pub(crate) async fn first_tier_row_names(
+		&self,
+		owner: crate::consensus::OwnerRef,
+		slabs: Vec<SlabId>,
+	) -> std::io::Result<bool> {
+		self.db
+			.run(move |db| {
+				let tx = db.begin_read().map_err(redb_to_io)?;
+				let intents = tx.open_table(OP_INTENTS_TABLE).map_err(redb_to_io)?;
+				for row in intents.iter().map_err(redb_to_io)? {
+					let (op_seq, bytes) = row.map_err(redb_to_io)?;
+					let op_seq = op_seq.value();
+					let intent = decode_intent(op_seq, bytes.value())?;
+					if let SlabCommand::Tier(op) = &intent.command
+						&& op.replaces.is_none()
+						&& op.tier.slab.owner() == owner
+						&& slabs.contains(&op.tier.slab.local_id())
+					{
+						return Ok(true);
+					}
+				}
+				Ok(false)
+			})
+			.await
+	}
+
+	/// Test-only: store bytes that do not decode as an op intent at `op_seq`, so a reader of the
+	/// op table meets a real decode failure.
+	#[cfg(test)]
+	pub(crate) async fn put_undecodable_op_intent_for_test(
+		&self,
+		op_seq: u64,
+	) -> std::io::Result<()> {
+		self.db
+			.run(move |db| {
+				let tx = db.begin_write().map_err(redb_to_io)?;
+				{
+					let mut intents = tx.open_table(OP_INTENTS_TABLE).map_err(redb_to_io)?;
+					intents
+						.insert(op_seq, &[0xff_u8, 0x00, 0x7f][..])
+						.map_err(redb_to_io)?;
+				}
+				tx.commit().map_err(redb_to_io)?;
+				Ok(())
+			})
+			.await
+	}
+
 	pub(crate) async fn load_op_intents(&self) -> std::io::Result<Vec<LoadedOp>> {
 		self.db
 			.run(|db| {

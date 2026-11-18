@@ -238,6 +238,10 @@ pub(crate) enum SuccessDisposition {
 	/// is proven about the set's contents. The reservation is released and
 	/// nothing else is recorded: the next attempt is still the next attempt.
 	Unclaimed,
+	/// ADR 0111 D2: as `Unclaimed` (the reservation is released, nothing else is recorded: no
+	/// success, no cooldown), for a named reason the claim or its first-tier admission gave;
+	/// the attempt counter records that reason and nothing else.
+	UnclaimedFor(MaintenanceAttemptResult),
 }
 
 /// The payload a deterministic failure carries inside an `io::Error`, so the class
@@ -317,6 +321,7 @@ pub(crate) fn classify_compaction_failure(failure: &CompactionFailure) -> Mainte
 	match failure {
 		CompactionFailure::ManifestRace
 		| CompactionFailure::CounterMaintenanceSkipped
+		| CompactionFailure::FirstTierPending
 		| CompactionFailure::BackfillRaceLost => MaintenanceFailureClass::Retryable,
 		CompactionFailure::SidecarDigestMismatch => {
 			MaintenanceFailureClass::Deterministic(DeterministicOrigin::SidecarDigestMismatch)
@@ -5161,6 +5166,10 @@ impl MaintenancePolicyInner {
 						MaintenanceAttemptResult::CompletedWithoutRewrite,
 					);
 				}
+				SuccessDisposition::UnclaimedFor(reason) => {
+					self.record_unclaimed(reservation);
+					metrics.observe_maintenance_attempt(reason);
+				}
 			},
 			Err(error) => {
 				let class = classify(error);
@@ -5660,10 +5669,19 @@ pub enum MaintenanceAttemptResult {
 	SkippedPolicyDisabled,
 	SkippedClockUnavailable,
 	SkippedEmptyWorkSet,
+	/// ADR 0111 D2: an admitted RetentionPrune attempt found the slab's rewrite claim held (a
+	/// first tier or another job owns it) and did nothing; recorded as unclaimed.
+	SkippedClaimBusy,
+	/// ADR 0111 D2: an unresolved first tier of this store's owner names the slab; it is not
+	/// retired while that tier is undecided. Recorded as unclaimed.
+	SkippedFirstTierPending,
+	/// ADR 0111 D5: the op index could not be read to rule a pending first tier out, so the
+	/// slab is deferred (fail closed). Recorded as unclaimed.
+	SkippedFirstTierUnknown,
 }
 
 impl MaintenanceAttemptResult {
-	pub const ALL: [Self; 12] = [
+	pub const ALL: [Self; 15] = [
 		Self::Ok,
 		Self::CompletedWithoutRewrite,
 		Self::Retryable,
@@ -5676,6 +5694,9 @@ impl MaintenanceAttemptResult {
 		Self::SkippedPolicyDisabled,
 		Self::SkippedClockUnavailable,
 		Self::SkippedEmptyWorkSet,
+		Self::SkippedClaimBusy,
+		Self::SkippedFirstTierPending,
+		Self::SkippedFirstTierUnknown,
 	];
 
 	pub const fn label(self) -> &'static str {
@@ -5692,6 +5713,9 @@ impl MaintenanceAttemptResult {
 			Self::SkippedPolicyDisabled => "skipped_policy_disabled",
 			Self::SkippedClockUnavailable => "skipped_clock_unavailable",
 			Self::SkippedEmptyWorkSet => "skipped_empty_work_set",
+			Self::SkippedClaimBusy => "skipped_claim_busy",
+			Self::SkippedFirstTierPending => "skipped_first_tier_pending",
+			Self::SkippedFirstTierUnknown => "skipped_first_tier_unknown",
 		}
 	}
 

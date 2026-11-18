@@ -130,6 +130,7 @@ pub(super) fn lsm_compaction_result_from_failure(err: &CompactionFailure) -> Lsm
 	match err {
 		CompactionFailure::ManifestRace => LsmCompactionResult::ManifestRace,
 		CompactionFailure::CounterMaintenanceSkipped => LsmCompactionResult::Aborted,
+		CompactionFailure::FirstTierPending => LsmCompactionResult::Aborted,
 		CompactionFailure::SidecarDigestMismatch => LsmCompactionResult::SidecarDigestMismatch,
 		CompactionFailure::VisibleDigestInvariance => LsmCompactionResult::VisibleDigestInvariance,
 		CompactionFailure::BackfillRaceLost | CompactionFailure::IoError(_) => {
@@ -2521,6 +2522,29 @@ impl SlabManager {
 	/// plans that are still perfectly valid. What the claim protects is that these
 	/// slabs stop moving; what this checks is that they were still there when it
 	/// started protecting them.
+	/// ADR 0111 D3: every LSM mode (local, ordinary ring, certified) calls this right after
+	/// `revalidate_lsm_plan_after_claims`, under the plan's claims and before it prepares
+	/// outputs, takes the maintenance gate or locks anything. A SEALED input that an unresolved
+	/// first tier of this store's owner names defers the job; tiered inputs are not first-tier
+	/// candidates and are unaffected. The state lock is released before the op-index read; the
+	/// claims, held for the whole job, keep the set stable. A read failure is a deferral.
+	pub(super) async fn refuse_lsm_plan_over_a_pending_first_tier(
+		&self,
+		plan: &CompactionPlan,
+	) -> Result<(), CompactionFailure> {
+		let sealed = {
+			let state = self.state.lock().await;
+			plan.touched_slabs()
+				.into_iter()
+				.filter(|slab| state.sealed.contains_key(slab))
+				.collect::<Vec<_>>()
+		};
+		if self.first_tier_pending(&sealed).await? {
+			return Err(CompactionFailure::FirstTierPending);
+		}
+		Ok(())
+	}
+
 	pub(super) fn revalidate_lsm_plan_after_claims(
 		&self,
 		plan: &CompactionPlan,
@@ -2649,6 +2673,8 @@ impl SlabManager {
 		// picked before the claims existed.
 		let _claims = self.acquire_maintenance_claims(&plan.touched_slabs()).await;
 		self.revalidate_lsm_plan_after_claims(&plan)?;
+		self.refuse_lsm_plan_over_a_pending_first_tier(&plan)
+			.await?;
 		self.refuse_lsm_counter_inputs(&plan).await?;
 		let prepared = self.prepare_lsm_compaction_outputs(worker, &plan).await?;
 		let source_frames = self.read_lsm_single_row_source_frames(&plan).await?;
@@ -2700,6 +2726,8 @@ impl SlabManager {
 		// enough on their own.
 		let _claims = self.acquire_maintenance_claims(&plan.touched_slabs()).await;
 		self.revalidate_lsm_plan_after_claims(&plan)?;
+		self.refuse_lsm_plan_over_a_pending_first_tier(&plan)
+			.await?;
 		self.refuse_lsm_counter_inputs(&plan).await?;
 		self.run_claimed_lsm_via_control_ring(worker, plan, committer, secondary_index_context)
 			.await

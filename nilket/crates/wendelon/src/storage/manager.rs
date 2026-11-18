@@ -300,8 +300,10 @@ use encoding_compute::{
 	indexed_record_fetch_key, take_projected_indexed_rows, visit_encoding_directories,
 };
 pub use secondary_index_segments::SecondaryIndexSegmentInfo;
+pub(crate) use secondary_index_segments::{FirstTierClaim, FirstTierSourceRetired};
 use secondary_index_segments::{
-	SecondaryIndexCompactionContext, secondary_index_coverage_key_from_persistent,
+	SealedMaintenanceAdmission, SecondaryIndexCompactionContext,
+	secondary_index_coverage_key_from_persistent,
 };
 use stats_facts::{TieredStatsCacheKey, tiered_stats_cache_key};
 
@@ -2329,6 +2331,10 @@ impl SlabManager {
 		&self,
 		slab_id: SlabId,
 	) -> std::io::Result<()> {
+		// ADR 0111 D1: a source the manifest knows is non-Live is never submitted.
+		if self.sealed_run_known_non_live(slab_id) {
+			return Err(Error::new(ErrorKind::WouldBlock, FirstTierSourceRetired));
+		}
 		let lock = self.tier_publication_lock(slab_id);
 		let _guard = lock.lock().await;
 		let state = self.state.lock().await;

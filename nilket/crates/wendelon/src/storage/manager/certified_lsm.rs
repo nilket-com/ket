@@ -626,6 +626,8 @@ impl SlabManager {
 		let pins = worker.acquire_plan_pins(&plan)?;
 		let claims = self.acquire_maintenance_claims(&plan.touched_slabs()).await;
 		self.revalidate_lsm_plan_after_claims(&plan)?;
+		self.refuse_lsm_plan_over_a_pending_first_tier(&plan)
+			.await?;
 		self.refuse_lsm_counter_inputs(&plan).await?;
 		{
 			let state = self.state.lock().await;

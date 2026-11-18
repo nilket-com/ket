@@ -118,6 +118,13 @@ pub(super) enum SealedSlabScan {
 	Deferred,
 	/// The scan found nothing to rewrite.
 	Clean,
+	/// ADR 0111 D2: RetentionPrune found the slab's rewrite claim held and did nothing.
+	ClaimBusy,
+	/// ADR 0111 D2: an unresolved first tier of this store's owner names the slab; nothing
+	/// was scanned or retired.
+	FirstTierPending,
+	/// ADR 0111 D2: the op index could not rule a first tier out; nothing was scanned.
+	FirstTierUnknown,
 }
 
 impl SealedSlabScan {
@@ -129,11 +136,29 @@ impl SealedSlabScan {
 		}
 	}
 
+	/// ADR 0111 D2: whether the attempt counts against a pass's slab budget. A busy claim or a
+	/// first-tier refusal did no work and spends none.
+	pub(super) fn spends_budget(self) -> bool {
+		!matches!(
+			self,
+			Self::ClaimBusy | Self::FirstTierPending | Self::FirstTierUnknown
+		)
+	}
+
 	fn disposition(self, compaction: Option<&CompactionOutcome>) -> SuccessDisposition {
 		match (self, compaction) {
 			(_, Some(_)) => SuccessDisposition::Rewrote,
 			(Self::Clean, None) => SuccessDisposition::Neutral,
 			(Self::Unclaimed | Self::Deferred, None) => SuccessDisposition::Unclaimed,
+			(Self::ClaimBusy, None) => SuccessDisposition::UnclaimedFor(
+				crate::storage::maintenance_policy::MaintenanceAttemptResult::SkippedClaimBusy,
+			),
+			(Self::FirstTierPending, None) => SuccessDisposition::UnclaimedFor(
+				crate::storage::maintenance_policy::MaintenanceAttemptResult::SkippedFirstTierPending,
+			),
+			(Self::FirstTierUnknown, None) => SuccessDisposition::UnclaimedFor(
+				crate::storage::maintenance_policy::MaintenanceAttemptResult::SkippedFirstTierUnknown,
+			),
 		}
 	}
 }
@@ -2309,6 +2334,11 @@ impl SlabManager {
 				MaintenanceAttempt::Completed(scan) => scan,
 				MaintenanceAttempt::Failed(err) => return Err(err),
 			};
+			// ADR 0111 D2: an attempt that found the slab's claim busy or a first tier pending did
+			// nothing and spends no slab budget (its one reason was recorded as unclaimed).
+			if !scan.scan.spends_budget() {
+				continue;
+			}
 			attempted_slabs += 1;
 			report.pruned_data_rows = report
 				.pruned_data_rows
@@ -2891,12 +2921,36 @@ impl SlabManager {
 		// longer sealed was retired by the job this one waited for, so there is
 		// nothing left to scan and the pass reports an empty scan rather than a
 		// rewrite of bytes that are gone.
-		let Some((claims, slab)) = self.claim_sealed_slab_for_maintenance(slab_id).await else {
-			return Ok(RetentionSlabScanOutcome {
-				scan: SealedSlabScan::Unclaimed,
+		// ADR 0111 D2: inside the policed attempt (after the failure policy admitted it), the claim
+		// is taken WITHOUT waiting, then the slab is admitted under it: a busy claim, a pending
+		// first tier or an unreadable op index does nothing and reports its one reason.
+		let empty = |scan| {
+			Ok(RetentionSlabScanOutcome {
+				scan,
 				compaction: None,
 				retention_stats: RetentionCompactionStats::default(),
-			});
+			})
+		};
+		let Some(claims) = self.try_claim_sealed_slab_for_maintenance(slab_id) else {
+			return empty(SealedSlabScan::ClaimBusy);
+		};
+		let (claims, slab) = match self
+			.admit_sealed_slab_for_maintenance(claims, slab_id)
+			.await
+		{
+			SealedMaintenanceAdmission::Claimed(claims, slab) => (claims, slab),
+			SealedMaintenanceAdmission::NotEligible => return empty(SealedSlabScan::Unclaimed),
+			SealedMaintenanceAdmission::FirstTierPending => {
+				return empty(SealedSlabScan::FirstTierPending);
+			}
+			SealedMaintenanceAdmission::Deferred(error) => {
+				tracing::debug!(
+					slab_id = slab_id.get(),
+					error = %error,
+					"retention deferred: the op index could not rule out a first tier"
+				);
+				return empty(SealedSlabScan::FirstTierUnknown);
+			}
 		};
 		let mut records: Vec<CompactionRecord> = slab
 			.index

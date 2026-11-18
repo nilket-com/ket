@@ -70053,3 +70053,127 @@ async fn a_based_object_walks_and_reads_as_its_base_zero_upload_at_logical_offse
 		);
 	}
 }
+
+// Fixture hooks (test-only) for the sweeper's retired-source tier tests (ADR 0111).
+impl SlabManager {
+	/// Hold one in-flight append on a sealed slab: the real precondition that makes
+	/// `confirm_tier_candidate_quiescent` refuse (no manifest or index state is touched).
+	pub(crate) async fn hold_sealed_appends_for_test(
+		&self,
+		slab_id: SlabId,
+	) -> std::io::Result<Arc<crate::storage::core::AppendInFlight>> {
+		let state = self.state.lock().await;
+		let slab = state
+			.sealed
+			.get(&slab_id)
+			.map(|slab| slab.value().clone())
+			.ok_or_else(|| Error::new(ErrorKind::NotFound, "not a sealed slab"))?;
+		slab.track_recovered_counter()
+	}
+
+	/// Adopt a sealed legacy slab as a Live L0 run, as maintenance does before it plans.
+	pub(crate) async fn adopt_l0_run_for_test(&self, slab_id: SlabId) {
+		let size = self
+			.list_sealed_slabs()
+			.await
+			.into_iter()
+			.find(|info| info.slab_id == slab_id)
+			.expect("a sealed slab")
+			.size_bytes;
+		self.ensure_live_lsm_run_for_maintenance(slab_id, size);
+	}
+}
+
+/// The certified LSM mode defers while an unresolved first tier of this owner names one of its
+/// sealed inputs: the unit control for that mode's admission right after its post-claim
+/// revalidation. The premise is a first tier whose answer was lost (its op row allocated and
+/// never decided), which is what a tier leaves after an unknown outcome; the job must not
+/// prepare outputs or retire the input.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_certified_lsm_job_defers_while_a_first_tier_of_its_input_is_unresolved() {
+	struct LosesTierAnswer;
+	#[async_trait::async_trait]
+	impl crate::storage::TierCommitter for LosesTierAnswer {
+		async fn submit_op(
+			&self,
+			_ticket: &crate::storage::index::OpTicket,
+		) -> std::io::Result<crate::storage::sweeper::VerifiedReceipt> {
+			Err(std::io::Error::other("test: the Tier answer was lost"))
+		}
+	}
+	let store = certified_lsm_store("certified-first-tier-pending").await;
+	let input = store.inputs[0];
+	let raw = store.mgr.read_sealed_raw(input).await.unwrap();
+	let encrypted = store.mgr.encrypt_tiered_object_blob(input, &raw).unwrap();
+	let pointer = tiered_pointer_from_blob(
+		&store.mgr,
+		input,
+		"certified/lost.wnd".into(),
+		&encrypted.bytes,
+	);
+	let proposed = crate::storage::sweeper::propose_tier_slab(
+		&store.mgr,
+		&LosesTierAnswer,
+		b10_tier(&store.mgr, &pointer),
+		None,
+	)
+	.await;
+	assert!(
+		proposed.is_err(),
+		"premise: the first tier's outcome is unknown"
+	);
+	assert!(
+		store.mgr.first_tier_pending(&[input]).await.unwrap(),
+		"premise: a first-tier row names the input"
+	);
+	let outcome = store.run(None).await;
+	assert!(
+		matches!(outcome, Err(CompactionFailure::FirstTierPending)),
+		"the certified job defers: {outcome:?}"
+	);
+	assert!(
+		!store.mgr.sealed_run_known_non_live(input),
+		"the input was not retired"
+	);
+}
+
+/// The first-tier read fails closed: one op row that does not decode makes the shared read an
+/// error, and the sealed-maintenance admission a deferral, decided under the claim before any
+/// read of the slab or any retirement effect.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unreadable_op_index_defers_sealed_maintenance_admission() {
+	let (_dir, mgr) = fresh_manager_serving(1).await;
+	assert!(
+		mgr.control_node_bound(),
+		"premise: a bound store has a first-tier producer"
+	);
+	mgr.append_durable(tenant(), id(0x7101), hlc(10), b"row")
+		.await
+		.unwrap();
+	let slab = force_seal_active(&mgr).await;
+	assert!(
+		!mgr.first_tier_pending(&[slab]).await.unwrap(),
+		"premise: a readable index with no first tier"
+	);
+	mgr.require_op_index()
+		.unwrap()
+		.put_undecodable_op_intent_for_test(u64::MAX - 7)
+		.await
+		.unwrap();
+	assert!(
+		mgr.first_tier_pending(&[slab]).await.is_err(),
+		"an undecodable row is a read error, never \"no first tier\""
+	);
+	let claims = mgr.acquire_maintenance_claims(&[slab]).await;
+	assert!(
+		matches!(
+			mgr.admit_sealed_slab_for_maintenance(claims, slab).await,
+			SealedMaintenanceAdmission::Deferred(_)
+		),
+		"the admission defers"
+	);
+	assert!(
+		mgr.lookup(tenant(), id(0x7101)).unwrap().is_some(),
+		"nothing was retired"
+	);
+}

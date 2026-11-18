@@ -1277,7 +1277,31 @@ impl SlabSweeper {
 				report.skipped_already_tiered += 1;
 				continue;
 			}
-			match self.tier_one_slab(&candidate).await {
+			// ADR 0111 D1: a source local maintenance already retired is never a first tier;
+			// it is skipped before it is read (a missing legacy run stays a candidate).
+			if self.slab.sealed_run_known_non_live(candidate.slab_id) {
+				report.skipped_retired_source += 1;
+				continue;
+			}
+			let Some(source_claim) = self.slab.try_claim_first_tier_source(candidate.slab_id)
+			else {
+				report.skipped_source_busy += 1;
+				continue;
+			};
+			if let Err(error) = self
+				.slab
+				.admit_first_tier_source(&source_claim, candidate.slab_id)
+				.await
+			{
+				tracing::debug!(
+					slab_id = candidate.slab_id.get(),
+					error = %error,
+					"first tier not admitted this pass"
+				);
+				report.skipped_source_not_admitted += 1;
+				continue;
+			}
+			match self.tier_one_admitted_slab(&candidate, source_claim).await {
 				Ok(()) => report.tiered += 1,
 				Err(e) => {
 					tracing::warn!(
@@ -1393,7 +1417,41 @@ impl SlabSweeper {
 	}
 
 	/// Drive a single slab through the full two-phase pipeline.
+	/// One first tier of `info`'s slab: claim it without waiting (`WouldBlock` when another job
+	/// owns it), re-validate it under the claim, then tier it (ADR 0111 D1).
+	#[cfg(test)]
 	async fn tier_one_slab(&self, info: &SealedSlabInfo) -> std::io::Result<()> {
+		let source_claim = self
+			.slab
+			.try_claim_first_tier_source(info.slab_id)
+			.ok_or_else(|| {
+				std::io::Error::new(
+					std::io::ErrorKind::WouldBlock,
+					"first-tier source is owned by another job",
+				)
+			})?;
+		self.slab
+			.admit_first_tier_source(&source_claim, info.slab_id)
+			.await?;
+		self.tier_one_admitted_slab(info, source_claim).await
+	}
+
+	/// ADR 0111 D1: the first tier of an admitted source. `_source_claim`, the slab's rewrite
+	/// claim, is held from before the read through the proposal and its apply, so no
+	/// maintenance can retire the source while this tier is live.
+	async fn tier_one_admitted_slab(
+		&self,
+		info: &SealedSlabInfo,
+		source_claim: crate::storage::manager::FirstTierClaim,
+	) -> std::io::Result<()> {
+		// The claim held across this tier is the source's own (ADR 0111 D1).
+		if source_claim.slab_id() != info.slab_id {
+			return Err(std::io::Error::new(
+				std::io::ErrorKind::InvalidInput,
+				"a first-tier claim names another slab",
+			));
+		}
+		let _source_claim = source_claim;
 		let _permit = authorize_autonomous_action(AutonomousActionSurface::L2TieringUpload);
 		self.refuse_proposal_over_unpublished_commit(info.slab_id, None)
 			.await?;
@@ -2943,6 +3001,13 @@ pub struct SweepReport {
 	pub failed: usize,
 	pub skipped_too_small: usize,
 	pub skipped_already_tiered: usize,
+	/// ADR 0111 D1: sealed sources whose manifest run is known non-Live (never a first tier).
+	pub skipped_retired_source: usize,
+	/// ADR 0111 D1: sources whose rewrite claim another job held; retried next pass.
+	pub skipped_source_busy: usize,
+	/// ADR 0111 D1: sources refused at re-validation under the claim (not a quiescent sealed
+	/// candidate, retired, an unresolved first tier already naming it, or op index unreadable).
+	pub skipped_source_not_admitted: usize,
 	pub rewritten_plaintext_tiered: usize,
 	pub skipped_already_encrypted_tiered: usize,
 	pub plaintext_rewrite_failures: usize,
@@ -3328,6 +3393,7 @@ mod tests {
 	// construction (and again at a reopen), as the product binds every store at its
 	// node's start. No owner reference is invented for an unbound store.
 	mod offload_tests;
+	mod retired_source_tier_tests;
 
 	use super::*;
 	use crate::audit::InMemoryAuditSink;

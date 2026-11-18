@@ -766,6 +766,10 @@ pub enum CompactionFailure {
 	ManifestRace,
 	#[error("multi-source compaction deferred because a touched slab has counter frames")]
 	CounterMaintenanceSkipped,
+	/// ADR 0111 D3: a sealed input has an unresolved first tier of this store's owner; the job
+	/// defers before it prepares outputs, takes the gate or locks anything.
+	#[error("compaction deferred because a sealed input has an unresolved first tier")]
+	FirstTierPending,
 	#[error("rebuilt secondary-index sidecar digest did not match cold rebuild")]
 	SidecarDigestMismatch,
 	#[error("visible-domain state digest changed across compaction")]
