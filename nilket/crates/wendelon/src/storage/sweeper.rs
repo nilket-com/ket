@@ -7420,6 +7420,8 @@ mod tests {
 		fetches: std::sync::atomic::AtomicUsize,
 		/// Every other request: head, put, list, delete.
 		others: std::sync::atomic::AtomicUsize,
+		/// The URI of every whole-object fetch, in order (the DC-228 control checks it).
+		whole_fetch_uris: std::sync::Mutex<Vec<String>>,
 	}
 	impl RequestCountingStore {
 		fn counts(&self) -> (usize, usize) {
@@ -7458,6 +7460,7 @@ mod tests {
 		async fn get_bytes(&self, uri: &str) -> std::io::Result<bytes::Bytes> {
 			self.fetches
 				.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+			self.whole_fetch_uris.lock().unwrap().push(uri.to_string());
 			self.inner.get_bytes(uri).await
 		}
 		async fn list(
@@ -7503,6 +7506,7 @@ mod tests {
 			inner: plain.clone(),
 			fetches: Default::default(),
 			others: Default::default(),
+			whole_fetch_uris: Default::default(),
 		});
 		let l2: Arc<dyn ObjectStore> = store.clone();
 		let io = spawn_io_thread(64).unwrap();
@@ -7719,6 +7723,246 @@ mod tests {
 			fixture.store.counts().0 >= 1,
 			"with a table window in the catalog the pass still reads the tiered object"
 		);
+	}
+
+	/// DC-228 control fixture (Codex 01a1edd8): one REAL multi-row frame in a published tier
+	/// generation, holding one row of a primary-key table that is below the 15 s cluster floor
+	/// and is the only indexed version of its key, with the table's descriptor in the committed
+	/// catalog. Primary-key retention keeps the newest version below the floor, so the row can
+	/// never be pruned: every visit is an Observe (no mutation) with positive lag. The sweeper's
+	/// clock is fixed, so the floor does not move between passes. Nothing is pruned or removed
+	/// to make the Observe happen.
+	async fn retention_observe_pk_fixture(tag: &str) -> (RetentionPassFixture, TieredSlabPointer) {
+		use crate::storage::manager::{
+			encode_test_append_only_storage_frame, pk_retention_descriptor,
+		};
+		let now_ms = SystemTime::now()
+			.duration_since(UNIX_EPOCH)
+			.unwrap()
+			.as_millis() as u64;
+		let l1_dir = fresh_dir(&format!("{tag}-l1"));
+		let l2_root = fresh_dir(&format!("{tag}-l2"));
+		let plain: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&*l2_root).unwrap());
+		let store = Arc::new(RequestCountingStore {
+			inner: plain.clone(),
+			fetches: Default::default(),
+			others: Default::default(),
+			whole_fetch_uris: Default::default(),
+		});
+		let l2: Arc<dyn ObjectStore> = store.clone();
+		let io = spawn_io_thread(64).unwrap();
+		let manager = SlabManager::initialize_new_store(SlabManagerConfig {
+			tier_history_budget_bytes: crate::storage::DEFAULT_TIER_HISTORY_BUDGET_BYTES,
+			dir: l1_dir.to_path_buf(),
+			max_slab_bytes: 1 << 20,
+			io,
+			l2: Some(l2.clone()),
+			rehydration: crate::storage::manager::RehydrationPolicy::default(),
+			l2_column_fetch: Default::default(),
+			row_group_writer: Default::default(),
+			l2_row_group_fetch: Default::default(),
+			encoding_writer: Default::default(),
+			l2_chunk_layout: Default::default(),
+			l2_encoding_fetch: Default::default(),
+			encoding_compute: Default::default(),
+			group_commit: crate::storage::GroupCommitConfig::default(),
+			crypto: test_crypto(),
+		})
+		.await
+		.unwrap();
+		manager.bind_control_node(1).unwrap();
+		let descriptor = pk_retention_descriptor(crate::schema::TableObjectId::new([0x62; 16]));
+		let mut schemas = crate::schema::table::TableSchemaCatalog::default();
+		schemas.upsert(tenant(), descriptor.clone()).unwrap();
+		let key = id(0x6201);
+		let frame = encode_test_append_only_storage_frame(
+			descriptor.table_object_id,
+			&[(
+				key,
+				Locality::new(62),
+				hlc_at(now_ms.saturating_sub(50_000)),
+				100,
+				false,
+			)],
+		);
+		let entries = crate::storage::core::storage_multirow_index_entries_from_frame(&frame)
+			.unwrap()
+			.expect("one multi-row primary-key entry");
+		assert_eq!(entries.len(), 1, "premise: one row in one multi-row frame");
+		manager
+			.append_durable_multirow_with_locality(tenant(), &frame, &entries)
+			.await
+			.unwrap();
+		let sealed_id = manager.force_seal_active_for_test().await;
+		let raw = manager.read_sealed_raw(sealed_id).await.unwrap();
+		let encrypted = manager
+			.encrypt_tiered_object_blob_with_table_stats(sealed_id, &raw, &schemas)
+			.unwrap();
+		let uri = plain
+			.put(&format!("tier/slab_{sealed_id:016x}.wnd"), &encrypted.bytes)
+			.await
+			.unwrap();
+		let pointer = TieredSlabPointer {
+			slab_id: sealed_id,
+			l2_uri: uri,
+			payload_hash: crate::hash::content::digest(&encrypted.bytes),
+			is_encrypted: true,
+			tenant_id: Some(tenant()),
+			tenant_kek_id: Some(
+				manager
+					.encrypted_tiered_footer_summary(&encrypted.bytes)
+					.unwrap()
+					.unwrap()
+					.tenant_kek_id,
+			),
+			stats_format_version: encrypted
+				.stats_locator
+				.map(|locator| locator.stats_format_version),
+			stats_block_len: encrypted
+				.stats_locator
+				.map(|locator| locator.stats_block_len),
+			stats_block_hash128: encrypted
+				.stats_locator
+				.map(|locator| locator.stats_block_hash128),
+			tombstone_metadata: TombstoneMetadata::None,
+			supersession_metadata: SupersessionMetadata::None,
+		};
+		manager.apply_tier_slab(pointer.clone()).await.unwrap();
+		let sm = WendelonStateMachine::new();
+		seed_state_machine_pointer(&sm, &manager, &pointer).await;
+		let mut state = sm.state_snapshot().await;
+		state.table_schemas.upsert(tenant(), descriptor).unwrap();
+		sm.seed_complete_snapshot_state_for_test(state).await;
+		let observer: Arc<dyn TierObserver> = Arc::new(ManagerTierObserver::new(manager.clone()));
+		let committer: Arc<dyn TierCommitter> =
+			Arc::new(DirectApplyCommitter::ok(sm.clone(), observer));
+		let sweeper = SlabSweeper::new(
+			manager.clone(),
+			l2,
+			committer,
+			sm.clone(),
+			SweeperConfig {
+				scan_interval: Duration::from_millis(10),
+				op_driver_interval: Duration::from_millis(500),
+				min_slab_bytes: 0,
+				max_upload_bytes_per_sec: None,
+				key_prefix: "tier/".into(),
+				max_plaintext_rewrites_per_pass: 1,
+				max_dek_rewraps_per_pass: 1,
+			},
+		)
+		.with_clock(Arc::new(FixedClock { now_ms }))
+		.with_mvcc_retention_window(Some(Duration::from_secs(15)));
+		// Premise, before counting: the version visible now is the one visible at the floor, and
+		// it is below the floor. Only this one row of the key was written, so it is the key's
+		// single indexed version, and primary-key retention keeps it.
+		{
+			use crate::storage::core::StorageEngine;
+			let floor = hlc_at(now_ms.saturating_sub(15_000));
+			let latest = manager
+				.lookup_as_of(tenant(), key, hlc_at(now_ms))
+				.unwrap()
+				.expect("premise: the key is indexed");
+			let at_floor = manager
+				.lookup_as_of(tenant(), key, floor)
+				.unwrap()
+				.expect("premise: the key is indexed at the floor");
+			assert_eq!(
+				latest, at_floor,
+				"premise: no newer version than the old one"
+			);
+			assert!(
+				latest.hlc < floor,
+				"premise: the only version is below the floor"
+			);
+		}
+		store.fetches.store(0, std::sync::atomic::Ordering::Release);
+		store.others.store(0, std::sync::atomic::Ordering::Release);
+		store.whole_fetch_uris.lock().unwrap().clear();
+		(
+			RetentionPassFixture {
+				manager,
+				sm,
+				sweeper,
+				store,
+				key,
+				now_ms,
+				_dirs: (l1_dir, l2_root),
+			},
+			pointer,
+		)
+	}
+
+	/// DC-228 control (Codex 01a1edd8): with a possible floor and nothing prunable, the same,
+	/// unchanged tier generation is fetched whole and decoded again on EVERY pass. Per pass, for
+	/// the one multi-row frame of this ENCRYPTED object: one whole-object GET of the same URI,
+	/// two recovery decodes and one main decode (DC-261 after the equal-evidence reuse): (1) the
+	/// tenant validation in `decode_tiered_blob_keeping_validated_entries`, whose complete entries the
+	/// prepare reuses because its own offset sample equals the validation's; (2)
+	/// `mark_record_group_for_table_retention`'s classification,
+	/// `storage_multirow_index_entries_from_frame`; (main) its `decode_record_batch`. Before the
+	/// reuse it was three and one (r2, RESULT-24); the r1 oracle (2, 1) missed the tenant validation
+	/// and failed on pass 1 (RESULT-23).
+	/// Also per pass: no mutation, nothing pruned, no failure, positive lag in the pass's own
+	/// report; the listed pointer is unchanged. Fixed clock, two passes; only the pass is counted
+	/// (current-thread runtime: the decode counters are thread-local).
+	#[tokio::test(flavor = "current_thread")]
+	async fn an_unchanged_observe_generation_is_fetched_and_decoded_again_on_every_pass() {
+		let (fixture, pointer) = retention_observe_pk_fixture("retention-observe-repeat").await;
+		assert_eq!(fixture.manager.list_tiered_slabs().await.len(), 1);
+		let generation = crate::consensus::slab_ops::TierGeneration::from(&pointer);
+		let mut totals = (0usize, 0usize);
+		for pass in 1..=2 {
+			let recovery = crate::storage::core::RecoveryDecodeCountGuard::start();
+			let main = crate::storage::multirow::DecodeCountGuard::start();
+			let report = fixture
+				.sweeper
+				.rewrite_tiered_slabs_for_retention_once(RETENTION_TIERED_REWRITE_MAX_PER_PASS)
+				.await
+				.unwrap();
+			let (recovery, main) = (recovery.finish(), main.finish());
+			let uris = std::mem::take(&mut *fixture.store.whole_fetch_uris.lock().unwrap());
+			eprintln!(
+				"pass {pass}: GETs {:?}, recovery decodes {recovery}, main decodes {main}, rewritten {}, pruned {}, failed {}, max lag {} s",
+				uris,
+				report.rewritten,
+				report.pruned_versions,
+				report.failed,
+				report.max_lag_seconds
+			);
+			assert_eq!(
+				uris,
+				vec![pointer.l2_uri.clone()],
+				"pass {pass}: one whole GET of the same object"
+			);
+			assert_eq!(
+				fixture.store.counts(),
+				(pass, 0),
+				"pass {pass}: (fetches, other requests) so far"
+			);
+			assert_eq!(
+				(recovery, main),
+				(2, 1),
+				"pass {pass}: (recovery, main) decodes of the one frame"
+			);
+			assert_eq!(report.rewritten, 0, "pass {pass}: no mutation");
+			assert_eq!(report.pruned_versions, 0, "pass {pass}");
+			assert_eq!(report.failed, 0, "pass {pass}");
+			assert!(
+				report.max_lag_seconds > 0,
+				"pass {pass}: the retained row reports lag"
+			);
+			let listed = fixture.manager.list_tiered_slabs().await;
+			assert_eq!(listed.len(), 1);
+			assert_eq!(listed[0].l2_uri, pointer.l2_uri, "pass {pass}: same object");
+			assert_eq!(
+				crate::consensus::slab_ops::TierGeneration::from(&listed[0]),
+				generation,
+				"pass {pass}: unchanged tier generation"
+			);
+			totals = (totals.0 + recovery, totals.1 + main);
+		}
+		assert_eq!(totals, (4, 2), "both passes: (recovery, main) decodes");
 	}
 
 	struct B1CountingStore {

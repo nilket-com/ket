@@ -1844,7 +1844,7 @@ fn encode_test_multirow_storage_frame_with_tombstones(
 	encode_test_batch(&batch)
 }
 
-fn encode_test_append_only_storage_frame(
+pub(crate) fn encode_test_append_only_storage_frame(
 	table_object_id: TableObjectId,
 	rows: &[(Identity, Locality, HybridTimestamp, u64, bool)],
 ) -> Vec<u8> {
@@ -2196,7 +2196,7 @@ fn append_only_retention_descriptor_named(
 	.unwrap()
 }
 
-fn pk_retention_descriptor(table_object_id: TableObjectId) -> TableSchemaDescriptor {
+pub(crate) fn pk_retention_descriptor(table_object_id: TableObjectId) -> TableSchemaDescriptor {
 	let schema = Schema::new(vec![Field::new("value", DataType::UInt64, false)]);
 	TableSchemaDescriptor::new_with_layout(
 		table_object_id,
@@ -12934,6 +12934,250 @@ async fn decode_tiered_blob_rejects_footer_tenant_mismatch_with_payload_tenant()
 		err.to_string().contains("footer tenant"),
 		"unexpected error: {err}"
 	);
+	// Wendelon DC-261 sentinel: the retention decoder that keeps the validated entries refuses
+	// the same mismatched object with the same error, and so returns no entries to reuse.
+	let kept = tiered_io::decode_tiered_blob_keeping_validated_entries(
+		mgr.config.crypto.as_ref(),
+		&pointer,
+		&encrypted.bytes,
+		TierObjectEvidence::Indexed(&BTreeSet::new()),
+	)
+	.err()
+	.expect("the entry-keeping decoder refuses too");
+	assert_eq!(kept.kind(), err.kind());
+	assert_eq!(kept.to_string(), err.to_string());
+}
+
+/// Wendelon DC-261 controls for `retention_planning_entries`, on a dense sealed slab of two
+/// valid multi-row records X and Y (A = both offsets acknowledged). The recovery walk emits every
+/// valid sequential record, including records the sample does not acknowledge, so planning may
+/// reuse the validated result only when its own sample equals A.
+async fn dc261_two_record_slab() -> (
+	crate::test_support::TestDir,
+	Arc<SlabManager>,
+	SlabId,
+	Vec<u8>,
+	BTreeSet<u64>,
+) {
+	let (dir, mgr) = fresh_manager().await;
+	let descriptor = append_only_retention_descriptor(TableObjectId::new([0x61; 16]));
+	for (n, ms) in [(1u64, 10_000u64), (2, 20_000)] {
+		let frame = encode_test_append_only_storage_frame(
+			descriptor.table_object_id,
+			&[(id(0x6100 + n), Locality::new(61), hlc(ms), n, false)],
+		);
+		let entries = storage_multirow_index_entries_from_frame(&frame)
+			.unwrap()
+			.expect("multi-row entries");
+		mgr.append_durable_multirow_with_locality(tenant(), &frame, &entries)
+			.await
+			.unwrap();
+	}
+	let slab_id = force_seal_active(&mgr).await;
+	let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
+	let acknowledged = mgr.acknowledged_offsets_in_slab(slab_id);
+	assert_eq!(
+		acknowledged.len(),
+		2,
+		"premise: two acknowledged records, X and Y"
+	);
+	(dir, mgr, slab_id, raw, acknowledged)
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn dc261_equal_evidence_reuses_the_complete_validated_entries_without_a_decode() {
+	let (_dir, _mgr, slab_id, raw, a) = dc261_two_record_slab().await;
+	let view = SlabView::dense(slab_id, &raw).unwrap();
+	let validated = recover_slab_entries_from_blob(view, &a).unwrap();
+	assert_eq!(validated.len(), 2);
+	let decodes = crate::storage::core::RecoveryDecodeCountGuard::start();
+	let planned =
+		crate::storage::core::retention_planning_entries(view, Some((&a, validated.clone())), &a)
+			.unwrap();
+	assert_eq!(decodes.finish(), 0, "equal evidence: no second recovery");
+	assert_eq!(
+		planned, validated,
+		"the complete validated result, unfiltered"
+	);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn dc261_a_strict_subset_falls_back_and_keeps_the_unacknowledged_valid_record() {
+	let (_dir, _mgr, slab_id, raw, a) = dc261_two_record_slab().await;
+	let view = SlabView::dense(slab_id, &raw).unwrap();
+	let validated = recover_slab_entries_from_blob(view, &a).unwrap();
+	let x = *a.iter().next().unwrap();
+	let b: BTreeSet<u64> = [x].into_iter().collect();
+	// Premise: a fresh walk over B alone still emits BOTH valid records (Y is unacknowledged).
+	let fresh = recover_slab_entries_from_blob(view, &b).unwrap();
+	assert_eq!(
+		fresh.len(),
+		2,
+		"premise: the walk emits the unacknowledged valid record too"
+	);
+	let decodes = crate::storage::core::RecoveryDecodeCountGuard::start();
+	let planned =
+		crate::storage::core::retention_planning_entries(view, Some((&a, validated)), &b).unwrap();
+	assert_eq!(
+		decodes.finish(),
+		2,
+		"unequal evidence: the original walk over B ran"
+	);
+	assert_eq!(planned, fresh, "exactly what fresh recovery over B returns");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn dc261_evidence_that_gains_an_offset_falls_back_and_is_refused_as_before() {
+	let (_dir, _mgr, slab_id, raw, a) = dc261_two_record_slab().await;
+	let view = SlabView::dense(slab_id, &raw).unwrap();
+	let validated = recover_slab_entries_from_blob(view, &a).unwrap();
+	let bogus = a.iter().next().unwrap() + 1;
+	let b: BTreeSet<u64> = a.iter().copied().chain([bogus]).collect();
+	let fresh = recover_slab_entries_from_blob(view, &b)
+		.err()
+		.expect("premise: fresh recovery refuses a non-boundary acknowledged offset");
+	let planned = crate::storage::core::retention_planning_entries(view, Some((&a, validated)), &b)
+		.err()
+		.expect("the planner refuses exactly as fresh recovery does");
+	assert_eq!(planned.kind(), fresh.kind());
+	assert_eq!(planned.to_string(), fresh.to_string());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn dc261_no_validated_entries_walks_the_planning_evidence_as_before() {
+	let (_dir, _mgr, slab_id, raw, a) = dc261_two_record_slab().await;
+	let view = SlabView::dense(slab_id, &raw).unwrap();
+	let fresh = recover_slab_entries_from_blob(view, &a).unwrap();
+	let decodes = crate::storage::core::RecoveryDecodeCountGuard::start();
+	let planned = crate::storage::core::retention_planning_entries(view, None, &a).unwrap();
+	assert_eq!(
+		decodes.finish(),
+		2,
+		"plaintext/replacement: the original walk ran"
+	);
+	assert_eq!(planned, fresh);
+}
+
+/// Wendelon DC-261: the entry-keeping decoder's PLAINTEXT branch, directly. On a plaintext
+/// first-upload object (the sealed slab's own bytes) both wrappers return identical plaintext,
+/// layout and offset evidence, and the new wrapper keeps no entries: a plaintext object has no
+/// tenant recovery, so planning walks its evidence as before (the None-planning control).
+#[tokio::test]
+async fn dc261_the_entry_keeping_decoder_keeps_nothing_for_a_plaintext_object() {
+	let (_dir, mgr, slab_id, raw, a) = dc261_two_record_slab().await;
+	let pointer = TieredSlabPointer {
+		slab_id,
+		l2_uri: format!("memory://tiered/{slab_id:016x}-plaintext"),
+		payload_hash: crate::hash::content::digest(&raw),
+		is_encrypted: false,
+		tenant_id: None,
+		tenant_kek_id: None,
+		stats_format_version: None,
+		stats_block_len: None,
+		stats_block_hash128: None,
+		tombstone_metadata: TombstoneMetadata::None,
+		supersession_metadata: SupersessionMetadata::None,
+	};
+	let original = decode_tiered_blob(
+		mgr.config.crypto.as_ref(),
+		&pointer,
+		&raw,
+		TierObjectEvidence::Indexed(&a),
+	)
+	.unwrap();
+	let (kept, entries) = tiered_io::decode_tiered_blob_keeping_validated_entries(
+		mgr.config.crypto.as_ref(),
+		&pointer,
+		&raw,
+		TierObjectEvidence::Indexed(&a),
+	)
+	.unwrap();
+	assert_eq!(kept.bytes, original.bytes);
+	assert_eq!(kept.layout, original.layout);
+	assert_eq!(kept.record_offsets, original.record_offsets);
+	assert!(
+		entries.is_none(),
+		"a plaintext object keeps no validated entries"
+	);
+}
+
+#[tokio::test]
+async fn dc261_a_damaged_acknowledged_record_is_refused_by_the_entry_keeping_decoder() {
+	let (_dir, mgr, slab_id, raw, a) = dc261_two_record_slab().await;
+	let x = *a.iter().next().unwrap() as usize;
+	let mut damaged = raw.clone();
+	let header = std::mem::size_of::<SlabRecordHeader>();
+	damaged[x + header + 1] ^= 0xFF;
+	assert!(
+		recover_slab_entries_from_blob(SlabView::dense(slab_id, &damaged).unwrap(), &a).is_err(),
+		"premise: recovery refuses the damaged acknowledged record"
+	);
+	// The manager's own tiering encrypt refuses this plaintext already (it recovers the records),
+	// so the authenticated object is built one level down, as the tenant-mismatch test builds its
+	// object: the damaged acknowledged record then reaches the decoders.
+	assert!(
+		mgr.encrypt_tiered_object_blob(slab_id, &damaged).is_err(),
+		"premise: tiering refuses to encrypt a damaged acknowledged record"
+	);
+	let encrypted = mgr
+		.config
+		.crypto
+		.encrypt_tiered_slab_object(
+			slab_id,
+			&TieredSlabObjectMetadata {
+				tenant_id: tenant(),
+				created_hlc: 10,
+				chunk_size_bytes: SLAB_ENCRYPTION_DEFAULT_CHUNK_SIZE,
+				logical_base: 0,
+				offset_index: vec![TieredOffsetIndexEntry {
+					key_locator: IdentityPrefix::ZERO,
+					byte_offset: 0,
+					byte_length: damaged.len().try_into().unwrap(),
+					flags: 0,
+				}],
+				column_stats_block: None,
+				has_row_tombstone_records: false,
+			},
+			&damaged,
+		)
+		.unwrap();
+	let pointer = TieredSlabPointer {
+		slab_id,
+		l2_uri: format!("memory://tiered/{slab_id:016x}"),
+		payload_hash: crate::hash::content::digest(&encrypted.bytes),
+		is_encrypted: true,
+		tenant_id: Some(tenant()),
+		tenant_kek_id: Some(encrypted.tenant_kek_id),
+		stats_format_version: encrypted
+			.stats_locator
+			.map(|locator| locator.stats_format_version),
+		stats_block_len: encrypted
+			.stats_locator
+			.map(|locator| locator.stats_block_len),
+		stats_block_hash128: encrypted
+			.stats_locator
+			.map(|locator| locator.stats_block_hash128),
+		tombstone_metadata: TombstoneMetadata::None,
+		supersession_metadata: SupersessionMetadata::None,
+	};
+	let original = decode_tiered_blob(
+		mgr.config.crypto.as_ref(),
+		&pointer,
+		&encrypted.bytes,
+		TierObjectEvidence::Indexed(&a),
+	)
+	.err()
+	.expect("decoding refuses the damaged acknowledged record");
+	let kept = tiered_io::decode_tiered_blob_keeping_validated_entries(
+		mgr.config.crypto.as_ref(),
+		&pointer,
+		&encrypted.bytes,
+		TierObjectEvidence::Indexed(&a),
+	)
+	.err()
+	.expect("the entry-keeping decoder refuses too");
+	assert_eq!(kept.kind(), original.kind());
+	assert_eq!(kept.to_string(), original.to_string());
 }
 
 #[tokio::test]

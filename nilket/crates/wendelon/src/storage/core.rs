@@ -1936,6 +1936,30 @@ pub(crate) fn recover_slab_entries_from_blob(
 	recover_slab_entries_from_blob_inner(blob, acknowledged, false)
 }
 
+/// Wendelon DC-261: the entries one tiered-retention visit plans from. `validated` holds the
+/// complete entries that the encrypted object's tenant validation recovered from this SAME
+/// plaintext, layout and recovery mode (`recover_slab_entries_from_blob`) over its offsets
+/// (stage-1 evidence A, `TieredPlaintext::record_offsets`); `planning` is the prepare's own later
+/// sample (B). The walk emits every valid sequential record, including records at offsets the
+/// sample does not hold, and uses the sample only to resume after a gap and to refuse a missed
+/// acknowledged boundary, so the result over B cannot be derived from A's by filtering. Only when
+/// B equals A is the complete validated result reused, unfiltered. Any other evidence, in either
+/// direction, drops it first (so no second row-sized vector overlaps it) and walks B afresh,
+/// exactly as before.
+pub(crate) fn retention_planning_entries(
+	plaintext: SlabView<'_>,
+	validated: Option<(&BTreeSet<u64>, Vec<RecoveredSlabEntry>)>,
+	planning: &BTreeSet<u64>,
+) -> std::io::Result<Vec<RecoveredSlabEntry>> {
+	match validated {
+		Some((validated_offsets, entries)) if validated_offsets == planning => Ok(entries),
+		other => {
+			drop(other);
+			recover_slab_entries_from_blob(plaintext, planning)
+		}
+	}
+}
+
 /// Secondary-index discovery only consumes ordinary table rows. A maintenance
 /// replacement may also contain class-preserved counter frames, which have no
 /// table attribution; skip those validated frames while retaining the default
@@ -2492,7 +2516,41 @@ fn has_plausible_arrow_stream_prefix(frame: &[u8]) -> bool {
 	message_len > 0 && message_len <= frame.len().saturating_sub(prefix_len)
 }
 
+#[cfg(test)]
+thread_local! {
+	static SCOPED_RECOVERY_DECODE_COUNT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Test only: counts `decode_recovery_batch` calls on this thread while it is held. The
+/// recovery decoder has its own stream reader and records no metric, so DC-228/DC-261
+/// controls count it here, beside `multirow::DecodeCountGuard` for the main decoder. `!Send`,
+/// like that guard: use it on a current-thread runtime.
+#[cfg(test)]
+pub(crate) struct RecoveryDecodeCountGuard(std::marker::PhantomData<std::rc::Rc<()>>);
+
+#[cfg(test)]
+impl RecoveryDecodeCountGuard {
+	pub(crate) fn start() -> Self {
+		SCOPED_RECOVERY_DECODE_COUNT.with(|count| assert_eq!(count.replace(Some(0)), None));
+		Self(std::marker::PhantomData)
+	}
+
+	pub(crate) fn finish(self) -> usize {
+		SCOPED_RECOVERY_DECODE_COUNT
+			.with(|count| count.replace(None).expect("active recovery decode counter"))
+	}
+}
+
+#[cfg(test)]
+impl Drop for RecoveryDecodeCountGuard {
+	fn drop(&mut self) {
+		SCOPED_RECOVERY_DECODE_COUNT.with(|count| count.set(None));
+	}
+}
+
 fn decode_recovery_batch(frame: &[u8]) -> std::io::Result<arrow::record_batch::RecordBatch> {
+	#[cfg(test)]
+	SCOPED_RECOVERY_DECODE_COUNT.with(|count| count.set(count.get().map(|n| n + 1)));
 	let materialized;
 	let frame =
 		if crate::storage::encoding::materialize::ipc_stream_contains_encoding_directory(frame) {

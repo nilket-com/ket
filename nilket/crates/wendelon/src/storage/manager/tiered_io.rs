@@ -202,6 +202,33 @@ pub(super) fn decode_tiered_blob(
 	blob: &[u8],
 	evidence: TierObjectEvidence<'_>,
 ) -> std::io::Result<TieredPlaintext> {
+	decode_tiered_blob_inner(crypto, pointer, blob, evidence, false).map(|(plain, _)| plain)
+}
+
+/// Wendelon DC-261: `decode_tiered_blob` with the identical checks, which also returns the
+/// entries its encrypted-branch tenant validation recovered, but ONLY for
+/// `TierObjectEvidence::Indexed` evidence: they were recovered from this plaintext and layout over
+/// exactly `TieredPlaintext::record_offsets`, in the default recovery mode, and passed the
+/// tombstone-chain, single-tenant and encoding-directory checks. A plaintext object (no tenant
+/// recovery) and `Replacement` evidence return `None`. The only consumer is the tiered retention
+/// prepare (`retention_planning_entries`); every other caller uses `decode_tiered_blob`.
+pub(super) fn decode_tiered_blob_keeping_validated_entries(
+	crypto: &CryptoManager,
+	pointer: &TieredSlabPointer,
+	blob: &[u8],
+	evidence: TierObjectEvidence<'_>,
+) -> std::io::Result<(TieredPlaintext, Option<Vec<RecoveredSlabEntry>>)> {
+	decode_tiered_blob_inner(crypto, pointer, blob, evidence, true)
+}
+
+fn decode_tiered_blob_inner(
+	crypto: &CryptoManager,
+	pointer: &TieredSlabPointer,
+	blob: &[u8],
+	evidence: TierObjectEvidence<'_>,
+	keep_validated_entries: bool,
+) -> std::io::Result<(TieredPlaintext, Option<Vec<RecoveredSlabEntry>>)> {
+	let indexed = matches!(evidence, TierObjectEvidence::Indexed(_));
 	match crypto.encrypted_footer_summary(blob)? {
 		Some(FooterSummary {
 			slab_id, tenant_id, ..
@@ -225,10 +252,14 @@ pub(super) fn decode_tiered_blob(
 				TierObjectEvidence::Indexed(acknowledged) => acknowledged.clone(),
 				TierObjectEvidence::Replacement => object_offsets,
 			};
-			let payload_tenant_id = single_tenant_id_from_plain_slab(
+			let (payload_tenant_id, validated_entries) = single_tenant_and_entries_from_plain_slab(
 				SlabView::new(&plaintext, layout)?,
 				&record_offsets,
 			)?;
+			// Kept only for the retention prepare, and only with Indexed evidence; otherwise the
+			// entries are dropped here, as the validation always did.
+			let validated_entries =
+				(keep_validated_entries && indexed).then_some(validated_entries);
 			if payload_tenant_id != tenant_id {
 				return Err(Error::new(
 					ErrorKind::InvalidData,
@@ -240,20 +271,26 @@ pub(super) fn decode_tiered_blob(
 					),
 				));
 			}
-			Ok(TieredPlaintext {
-				bytes: plaintext,
-				layout,
-				record_offsets,
-			})
+			Ok((
+				TieredPlaintext {
+					bytes: plaintext,
+					layout,
+					record_offsets,
+				},
+				validated_entries,
+			))
 		}
 		// A plaintext object is only ever a first upload: base 0, its bytes
-		// the sealed slab's.
+		// the sealed slab's. It has no tenant recovery, so nothing to keep.
 		None => match evidence {
-			TierObjectEvidence::Indexed(acknowledged) => Ok(TieredPlaintext {
-				bytes: blob.to_vec(),
-				layout: TierObjectLayout::dense(pointer.slab_id, blob)?,
-				record_offsets: acknowledged.clone(),
-			}),
+			TierObjectEvidence::Indexed(acknowledged) => Ok((
+				TieredPlaintext {
+					bytes: blob.to_vec(),
+					layout: TierObjectLayout::dense(pointer.slab_id, blob)?,
+					record_offsets: acknowledged.clone(),
+				},
+				None,
+			)),
 			TierObjectEvidence::Replacement => Err(Error::new(
 				ErrorKind::InvalidData,
 				format!(
@@ -496,16 +533,27 @@ pub(super) fn descriptor_matches_tiered_row(
 	}
 }
 
+/// The tenant check alone (its callers are tests; the decoders keep the entries, DC-261).
+#[cfg(test)]
 pub(super) fn single_tenant_id_from_plain_slab(
 	blob: SlabView<'_>,
 	acknowledged: &BTreeSet<u64>,
 ) -> std::io::Result<TenantId> {
+	single_tenant_and_entries_from_plain_slab(blob, acknowledged).map(|(tenant_id, _)| tenant_id)
+}
+
+/// `single_tenant_id_from_plain_slab`'s checks, returning the recovered entries too (wendelon
+/// DC-261: the tiered retention prepare may reuse them; see `retention_planning_entries`).
+pub(super) fn single_tenant_and_entries_from_plain_slab(
+	blob: SlabView<'_>,
+	acknowledged: &BTreeSet<u64>,
+) -> std::io::Result<(TenantId, Vec<RecoveredSlabEntry>)> {
 	let entries = recover_slab_entries_from_blob(blob, acknowledged)?;
 	let tenant_id = single_tenant_of_recovered_entries(&entries, blob.slab_id())?;
 	// Object metadata refused a malformed directory while choosing its chunk size; this check
 	// still does, without choosing one.
 	visit_encoding_directories(blob, &entries, |_| {})?;
-	Ok(tenant_id)
+	Ok((tenant_id, entries))
 }
 
 /// The one tenant of these entries. Every entry is checked: a later record can contradict the

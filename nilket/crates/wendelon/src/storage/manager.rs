@@ -253,13 +253,15 @@ mod query_tails;
 #[cfg(test)]
 pub(crate) use pause_hooks::{GcSweepCut, LsmPublicationForTest};
 pub(crate) use query_tails::QueryTails;
+#[cfg(test)]
+use tiered_io::build_tiered_object_metadata;
+#[cfg(test)]
+use tiered_io::single_tenant_id_from_plain_slab;
 use tiered_io::{
 	RehydratedCopy, SlabBacking, TierObjectEvidence, decode_tiered_blob,
 	descriptor_matches_tiered_row, extract_record_from_blob, fetch_tiered_ciphertext_runs,
 	validate_tiered_blob, validate_tiered_record_header_tenant,
 };
-#[cfg(test)]
-use tiered_io::{build_tiered_object_metadata, single_tenant_id_from_plain_slab};
 // ADR 0704: the typed refusal a superseded tier delivery ends with.
 pub(crate) use tiered_io::is_tier_publication_superseded;
 // ADR 0705: a decoded tier object with its layout.
@@ -3866,7 +3868,10 @@ impl SlabManager {
 		validate_tiered_blob(pointer, &old_blob)?;
 		// The rewrite source is the published generation: the index's offsets
 		// are the independent evidence for every acknowledged record in it.
-		let decoded = decode_tiered_blob(
+		// Wendelon DC-261: the decode keeps its encrypted tenant validation's complete entries
+		// (recovered over this evidence, A); planning reuses them only when its own later sample
+		// (B) equals A, and otherwise walks B exactly as before.
+		let (decoded, validated_entries) = tiered_io::decode_tiered_blob_keeping_validated_entries(
 			self.config.crypto.as_ref(),
 			pointer,
 			&old_blob,
@@ -3876,23 +3881,32 @@ impl SlabManager {
 		let old_bytes = old_blob.len() as u64;
 		drop(old_blob);
 		let source_layout = decoded.layout;
+		let validated_offsets = decoded.record_offsets;
 		let plaintext = Zeroizing::new(decoded.bytes);
 		let plaintext = SlabView::new(&plaintext, source_layout)?;
-		let mut records = recover_slab_entries_from_blob(
-			plaintext,
-			&self.acknowledged_offsets_in_slab(pointer.slab_id),
-		)?
-		.into_iter()
-		.map(|entry| CompactionRecord {
-			tenant_id: entry.tenant_id,
-			key_identity: entry.key_identity,
-			routing_locality: self.recovered_entry_routing_locality(&entry),
-			old_location: entry.location,
-			reclaim: false,
-			retention_ambiguous: false,
-			retention_lag_seconds: 0,
-		})
-		.collect::<Vec<_>>();
+		// Both offset sets live only for entry selection, as the baseline's second scan did: they
+		// are dropped here, before the marker and the replacement build.
+		let planned = {
+			let planning_offsets = self.acknowledged_offsets_in_slab(pointer.slab_id);
+			crate::storage::core::retention_planning_entries(
+				plaintext,
+				validated_entries.map(|entries| (&validated_offsets, entries)),
+				&planning_offsets,
+			)?
+		};
+		drop(validated_offsets);
+		let mut records = planned
+			.into_iter()
+			.map(|entry| CompactionRecord {
+				tenant_id: entry.tenant_id,
+				key_identity: entry.key_identity,
+				routing_locality: self.recovered_entry_routing_locality(&entry),
+				old_location: entry.location,
+				reclaim: false,
+				retention_ambiguous: false,
+				retention_lag_seconds: 0,
+			})
+			.collect::<Vec<_>>();
 		self.mark_records_for_table_retention_from_blob(
 			plaintext,
 			&mut records,
@@ -4521,6 +4535,9 @@ pub(crate) const AWAITING_CLUSTER_MARKER: &str = "TIER_AUTHORITY_AWAITING_CLUSTE
 
 #[cfg(test)]
 mod tests;
+/// The sweeper's DC-228 control builds its primary-key retention fixture with these.
+#[cfg(test)]
+pub(crate) use tests::{encode_test_append_only_storage_frame, pk_retention_descriptor};
 
 #[cfg(test)]
 impl SlabManager {
