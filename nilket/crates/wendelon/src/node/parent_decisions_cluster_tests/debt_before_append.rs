@@ -1,35 +1,58 @@
-//! DC-271 regression: ordinary cleanup must not retire a version's debt while
-//! the worker that will append that version can still append it.
+//! DC-271 and DC-272 regressions: ordinary cleanup must never leave a copy that
+//! no debt, owner or base entry names.
 //!
-//! The guard that already exists: `refuse_recorded_intents` runs at the start of
-//! each maintenance pass and takes the reservation stripe of every
-//! Intent/Complete intent, so a store's pass waits for a worker paused after its
-//! begin. That guard acts only at the sweep point. This schedule begins the
-//! intent after a pass's sweep and before the same pass's activation:
-//! 1. an unrelated row is overwritten (its first version becomes eligible debt
-//!    at generation 1) and the store's active slab sealed;
-//! 2. the worker is paused before its begin (decision checked while Reserved);
-//! 3. the store's activation is held; the parent is refused by a valid abort,
+//! `a_worker_begun_after_the_sweep_is_fenced_by_activation` (the DC-271
+//! schedule, under DC-272's stronger ordering):
+//! 1. the worker is paused before its begin (decision checked while Reserved);
+//! 2. the store's activation is held; the parent is refused by a valid abort,
 //!    its key retired, and generation 1 commits;
-//! 4. the store's next pass is paused at its certification step (after its
+//! 3. the store's next pass is paused at its certification step (after its
 //!    refused-intent sweep, before activation);
-//! 5. the worker is released into its begin (the store's installed cut is still
+//! 4. the worker is released into its begin (the store's installed cut is still
 //!    genesis, so DC-269 admits it) and paused again right after;
-//! 6. activation runs in that pass, with cleanup paused: the exact debt is
-//!    recorded; cleanup resumes: the sweep tries the worker's debt while its
-//!    stripe is busy and leaves it, while the unrelated debt is retired;
-//! 7. the worker is released: its late copy is appended under that debt;
-//! 8. the store's active slab is sealed: cleanup erases the copy, then the debt
-//!    retires. No copy remains without debt or owner.
+//! 5. activation is attempted: fenced by the worker's stripe, it waits; the
+//!    local gid and the intent stay;
+//! 6. the worker is released and ends; activation then retires its intent and
+//!    records exact debt for the copy it appended;
+//! 7. sealed, cleanup erases the copy, then the debt retires.
+//!
+//! `a_busy_stripe_skips_its_debt_while_unrelated_debt_progresses` (DC-271's
+//! sweep guard, directly): with a producer stripe held, the sweep skips that
+//! stripe's retired-intent debt and revisits it after release, while unrelated
+//! debt retires meanwhile.
 
 use super::*;
 use crate::network::data_server::child_writes::persist_pause;
+use crate::storage::index::certified_base::{DebtRecord, DebtSource, VersionKey};
+use crate::storage::index::parent_intents::OwnedVersion;
+
+fn named(
+	debt: &[(VersionKey, DebtRecord)],
+	manifest: &[OwnedVersion],
+) -> Vec<(VersionKey, DebtRecord)> {
+	debt.iter()
+		.filter(|(key, _)| {
+			manifest.iter().any(|version| {
+				key.table == version.table
+					&& key.key_identity == version.key_identity
+					&& key.hlc == version.hlc
+			})
+		})
+		.cloned()
+		.collect()
+}
+
+async fn wait_for(what: &str, mut ready: impl AsyncFnMut() -> bool) {
+	let deadline = tokio::time::Instant::now() + BOUND;
+	while !ready().await {
+		assert!(tokio::time::Instant::now() < deadline, "never: {what}");
+		tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+	}
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn a_worker_begun_after_the_sweep_leaves_no_copy_without_debt() {
+async fn a_worker_begun_after_the_sweep_is_fenced_by_activation() {
 	use crate::network::data_server::child_writes::PauseStage;
-	use crate::storage::index::certified_base::{DebtRecord, DebtSource, VersionKey};
-	use crate::storage::index::parent_intents::OwnedVersion;
 	use std::sync::atomic::Ordering::{Acquire, Release};
 	let (cluster, leader, descriptor) = ready().await;
 	let now = std::time::SystemTime::now()
@@ -47,55 +70,8 @@ async fn a_worker_begun_after_the_sweep_leaves_no_copy_without_debt() {
 	let server = cluster.node(store).data_server.clone();
 	let slab = cluster.node(store).slab.clone();
 	let index = slab.persistent_index().unwrap();
-	let all_debt = || {
-		let index = index.clone();
-		async move { index.debt_page(None, 1 << 20).await.unwrap() }
-	};
-	let named = |debt: &[(VersionKey, DebtRecord)], manifest: &[OwnedVersion]| {
-		debt.iter()
-			.filter(|(key, _)| {
-				manifest.iter().any(|version| {
-					key.table == version.table
-						&& key.key_identity == version.key_identity
-						&& key.hlc == version.hlc
-				})
-			})
-			.cloned()
-			.collect::<Vec<_>>()
-	};
-	let owners_of = |manifest: Vec<OwnedVersion>| {
-		let index = index.clone();
-		async move {
-			let mut found = Vec::new();
-			for version in manifest {
-				found.push(index.version_owner(TenantId::ZERO, version).await.unwrap());
-			}
-			found
-		}
-	};
-	let until = |what: &'static str, deadline: std::time::Duration| {
-		let start = tokio::time::Instant::now();
-		move || {
-			assert!(start.elapsed() < deadline, "never: {what}");
-		}
-	};
 
-	// 1. An unrelated row overwritten; its first version is debt at generation 1.
-	for value in ["first", "second"] {
-		assert_committed(
-			&write_through(
-				&cluster,
-				leader,
-				write_meta(&descriptor, 1, uuid_v7()),
-				named_rows(&descriptor, &[(90, value)]),
-			)
-			.await,
-			"an unrelated overwrite",
-		);
-	}
-	slab.force_seal_active_for_test().await;
-
-	// 2. The worker passes its decision check while Reserved, then pauses.
+	// 1. The worker passes its decision check while Reserved, then pauses.
 	let before = persist_pause::arm(&slab, descriptor.table_object_id);
 	let after = persist_pause::arm_after_begin(&slab, descriptor.table_object_id);
 	let meta = write_meta(&descriptor, 1, uuid_v7());
@@ -109,7 +85,7 @@ async fn a_worker_begun_after_the_sweep_leaves_no_copy_without_debt() {
 		.expect("the parent is reserved");
 	let rsv = record.rsv;
 
-	// 3. Activation held here; refused, retired, generation 1 committed.
+	// 2. Activation held here; refused, retired, generation 1 committed.
 	let hold = server.decision_peer_for_test().hold_activation.clone();
 	hold.store(true, Release);
 	abort(&cluster, &record).await;
@@ -137,138 +113,212 @@ async fn a_worker_begun_after_the_sweep_leaves_no_copy_without_debt() {
 		"premise: held here"
 	);
 
-	// 4. This store's next pass pauses at its certification step, after its sweep.
+	// 3. This store's next pass pauses at its certification step, after its sweep.
 	let (step_reached, step_release) =
 		server.pause_coordinator_for_test(PauseStage::CertificationStep);
 	tokio::time::timeout(BOUND, step_reached.notified())
 		.await
 		.expect("the pass reached its certification step");
 
-	// 5. The worker begins (genesis cut here) and pauses right after.
+	// 4. The worker begins (genesis cut here) and pauses right after.
 	before.release.notify_one();
 	tokio::time::timeout(BOUND, after.reached.notified())
 		.await
 		.expect("the worker began its intent");
 	let manifest = after.manifest();
 	assert!(!manifest.is_empty());
-	let begun = index.parent_intent(rsv, 0).await.unwrap();
-	eprintln!(
-		"DC-271 begun after the sweep: rsv={rsv} t={t} store={store} intent={:?} owners={:?} copies={:?} active_gid={}",
-		begun.as_ref().map(|intent| intent.state),
-		owners_of(manifest.clone()).await,
+	assert!(
+		index.parent_intent(rsv, 0).await.unwrap().is_some(),
+		"premise: intent recorded"
+	);
+	assert_eq!(
 		index
 			.owned_version_copies(tenant, manifest.clone())
 			.await
 			.unwrap(),
-		index.base_meta().await.unwrap().active_gid,
+		vec![0; manifest.len()],
+		"premise: nothing appended yet"
 	);
-	assert!(begun.is_some(), "premise: the intent is recorded");
 
-	// 6. Activation in this pass, with cleanup paused to read the exact debt.
+	// 5. Activation is attempted: fenced by the worker's stripe, it waits.
 	let pause = server.decision_peer_for_test().pause_cleanup.clone();
 	pause.store(true, Release);
+	let waits = &server.decision_peer_for_test().locks.fence_waits;
+	let waited_before = waits.load(Acquire);
 	hold.store(false, Release);
 	step_release.notify_one();
-	let check = until("the store activated", BOUND);
-	while index.base_meta().await.unwrap().active_gid < 1 {
-		check();
-		tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-	}
-	let recorded = all_debt().await;
-	let mine = named(&recorded, &manifest);
-	let unrelated = recorded.len() - mine.len();
-	eprintln!(
-		"DC-271 activated: intent={:?} owners={:?} mine={mine:?} unrelated={unrelated}",
-		index
-			.parent_intent(rsv, 0)
-			.await
-			.unwrap()
-			.map(|intent| intent.state),
-		owners_of(manifest.clone()).await,
-	);
+	wait_for("an activation attempt fenced by the worker", async || {
+		waits.load(Acquire) > waited_before
+	})
+	.await;
+	tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 	assert_eq!(
-		mine.len(),
-		manifest.len(),
-		"premise: the exact debt is recorded"
+		index.base_meta().await.unwrap().active_gid,
+		0,
+		"activation waits"
 	);
 	assert!(
-		mine.iter()
-			.all(|(_, record)| record.source == DebtSource::RetiredIntent { rsv, ordinal: 0 }),
-		"{mine:?}"
+		index.parent_intent(rsv, 0).await.unwrap().is_some(),
+		"the intent stays"
 	);
-	assert!(unrelated > 0, "premise: unrelated eligible debt exists");
-	// Cleanup resumes while the worker is paused: the sweep tries the worker's
-	// debt with its stripe busy and leaves it; the unrelated debt retires.
-	let skips = server.decision_peer_for_test().debt_busy_skips.clone();
-	let skipped_before = skips.load(Acquire);
-	pause.store(false, Release);
-	let check = until(
-		"the sweep tried the busy debt and retired the unrelated one",
-		BOUND,
-	);
-	loop {
-		let now_debt = all_debt().await;
-		if skips.load(Acquire) > skipped_before
-			&& now_debt.len() == named(&now_debt, &manifest).len()
-		{
-			break;
-		}
-		check();
-		tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-	}
-	let kept = named(&all_debt().await, &manifest);
-	eprintln!(
-		"DC-271 swept while busy: busy skips {} -> {}, the worker's debt kept={kept:?}, unrelated retired",
-		skipped_before,
-		skips.load(Acquire)
-	);
-	assert_eq!(kept, mine, "the worker's exact debt survives the sweep");
+	eprintln!("DC-272 fenced the DC-271 worker: rsv={rsv} t={t} store={store} active_gid=0");
 
-	// 7. The worker resumes and ends: its late copy lands under that debt.
+	// 6. The worker ends; activation then retires its intent with exact debt
+	//    for the copy it appended.
 	after.release.notify_one();
 	tokio::time::timeout(BOUND, after.ended.notified())
 		.await
-		.expect("the worker's spawned work ended");
+		.expect("the worker's append block ended");
 	let caller = tokio::time::timeout(BOUND, writing)
 		.await
 		.expect("the write ends")
 		.unwrap();
+	eprintln!(
+		"DC-272 worker caller: {:?}",
+		caller.as_ref().map(|(meta, _)| meta.write.status)
+	);
+	wait_for("the store activated generation 1", async || {
+		index.base_meta().await.unwrap().active_gid >= 1
+	})
+	.await;
+	assert!(
+		index.parent_intent(rsv, 0).await.unwrap().is_none(),
+		"the intent retired"
+	);
 	let copies = index
 		.owned_version_copies(tenant, manifest.clone())
 		.await
 		.unwrap();
-	let after_append = named(&all_debt().await, &manifest);
-	eprintln!(
-		"DC-271 worker ended: caller={:?} copies={copies:?} debt={after_append:?}",
-		caller.as_ref().map(|(meta, _)| meta.write.status)
-	);
+	let debt = named(&index.debt_page(None, 1 << 20).await.unwrap(), &manifest);
+	eprintln!("DC-272 after activation: copies={copies:?} debt={debt:?}");
 	assert!(
 		copies.iter().all(|copies| *copies > 0),
-		"the late copy was appended"
+		"the worker's copy was appended"
 	);
-	assert_eq!(after_append, mine, "the debt still names the late copy");
+	assert_eq!(
+		debt.len(),
+		manifest.len(),
+		"every appended version has debt"
+	);
+	assert!(
+		debt.iter()
+			.all(|(_, record)| record.source == DebtSource::RetiredIntent { rsv, ordinal: 0 }),
+		"{debt:?}"
+	);
 
-	// 8. Sealed, cleanup erases the copy, then the debt retires.
+	// 7. Sealed, cleanup erases the copy, then the debt retires.
 	slab.force_seal_active_for_test().await;
-	let check = until("the late copy erased and its debt retired", BOUND);
-	loop {
-		let copies = index
-			.owned_version_copies(tenant, manifest.clone())
-			.await
-			.unwrap();
-		let debt = named(&all_debt().await, &manifest);
-		if copies.iter().all(|copies| *copies == 0) && debt.is_empty() {
-			break;
-		}
-		check();
-		tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-	}
-	eprintln!(
-		"DC-271 reclaimed: copies={:?} debt=[] owners={:?}",
+	pause.store(false, Release);
+	wait_for("the copy erased and its debt retired", async || {
 		index
 			.owned_version_copies(tenant, manifest.clone())
 			.await
-			.unwrap(),
-		owners_of(manifest.clone()).await
+			.unwrap()
+			.iter()
+			.all(|copies| *copies == 0)
+			&& named(&index.debt_page(None, 1 << 20).await.unwrap(), &manifest).is_empty()
+	})
+	.await;
+	for version in &manifest {
+		assert_eq!(index.version_owner(tenant, *version).await.unwrap(), None);
+	}
+	eprintln!("DC-272 reclaimed: copies=0, no debt, no owner");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_busy_stripe_skips_its_debt_while_unrelated_debt_progresses() {
+	use std::sync::atomic::Ordering::{Acquire, Release};
+	let (cluster, leader, descriptor) = ready().await;
+	let now = std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.unwrap()
+		.as_millis() as u64;
+	let tenant = TenantId::ZERO;
+	// Two rows, each overwritten: each first version is retired-intent debt at
+	// generation 1, under its own parent's reservation.
+	let mut firsts = Vec::new();
+	for row in [90, 91] {
+		let first = write_meta(&descriptor, 1, uuid_v7());
+		assert_committed(
+			&write_through(
+				&cluster,
+				leader,
+				first,
+				named_rows(&descriptor, &[(row, "first")]),
+			)
+			.await,
+			"a first version",
+		);
+		firsts.push(
+			record_of(&cluster, key_of(&descriptor, &first))
+				.await
+				.expect("first")
+				.rsv,
+		);
+		assert_committed(
+			&write_through(
+				&cluster,
+				leader,
+				write_meta(&descriptor, 1, uuid_v7()),
+				named_rows(&descriptor, &[(row, "second")]),
+			)
+			.await,
+			"a second version",
+		);
+	}
+	let store = *NODES.iter().find(|id| **id != leader).unwrap();
+	let server = cluster.node(store).data_server.clone();
+	let slab = cluster.node(store).slab.clone();
+	let index = slab.persistent_index().unwrap();
+	let locks = &server.decision_peer_for_test().locks;
+	assert_ne!(
+		firsts[0] % locks.stripe_count() as u64,
+		firsts[1] % locks.stripe_count() as u64,
+		"premise: distinct stripes"
 	);
+	slab.force_seal_active_for_test().await;
+	let pause = server.decision_peer_for_test().pause_cleanup.clone();
+	pause.store(true, Release);
+	jump_floor(&cluster, now + 60_000).await;
+	until_active(&cluster, 1).await;
+	let debt_of = |rsv: u64| {
+		let index = index.clone();
+		async move {
+			index
+				.debt_page(None, 1 << 20)
+				.await
+				.unwrap()
+				.into_iter()
+				.filter(|(_, record)| {
+					record.source == DebtSource::RetiredIntent { rsv, ordinal: 0 }
+				})
+				.count()
+		}
+	};
+	assert!(
+		debt_of(firsts[0]).await > 0 && debt_of(firsts[1]).await > 0,
+		"premise: both debts"
+	);
+	// The first row's producer stripe is held; cleanup resumes.
+	let held = locks.lock_for_test(firsts[0]).await;
+	let skips = server.decision_peer_for_test().debt_busy_skips.clone();
+	let skipped_before = skips.load(Acquire);
+	pause.store(false, Release);
+	wait_for(
+		"the unrelated debt retired while the busy one was skipped",
+		async || debt_of(firsts[1]).await == 0 && skips.load(Acquire) > skipped_before,
+	)
+	.await;
+	assert!(debt_of(firsts[0]).await > 0, "the busy stripe's debt stays");
+	eprintln!(
+		"DC-271 direct: busy skips {skipped_before} -> {}; unrelated retired; busy kept",
+		skips.load(Acquire)
+	);
+	// Released, the sweep revisits it on wrap.
+	drop(held);
+	wait_for("the skipped debt retired after release", async || {
+		debt_of(firsts[0]).await == 0
+	})
+	.await;
+	let _ = tenant;
 }

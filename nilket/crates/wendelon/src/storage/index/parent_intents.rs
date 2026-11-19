@@ -280,6 +280,37 @@ impl PersistentLocalIndex {
 			.await
 	}
 
+	/// DC-272: which of `stripes` reservation stripes hold a recorded intent (in
+	/// any state) with `rsv <= t`. Reads intent keys only; the answer is one flag
+	/// per stripe, never the intents.
+	pub(crate) async fn intent_stripes_through(
+		&self,
+		t: u64,
+		stripes: usize,
+	) -> std::io::Result<Vec<bool>> {
+		self.db
+			.run(move |db| {
+				let mut wanted = vec![false; stripes];
+				if stripes == 0 {
+					return Ok(wanted);
+				}
+				let tx = db.begin_read().map_err(redb_to_io)?;
+				let intents = match tx.open_table(PARENT_INTENTS_TABLE) {
+					Ok(table) => table,
+					Err(redb::TableError::TableDoesNotExist(_)) => return Ok(wanted),
+					Err(error) => return Err(redb_to_io(error)),
+				};
+				let high = intent_key(t, u16::MAX);
+				for row in intents.range(..=high.as_slice()).map_err(redb_to_io)? {
+					let (key, _) = row.map_err(redb_to_io)?;
+					let rsv = u64::from_be_bytes(key.value()[..8].try_into().expect("intent key"));
+					wanted[(rsv % stripes as u64) as usize] = true;
+				}
+				Ok(wanted)
+			})
+			.await
+	}
+
 	/// The intent at `(rsv, ordinal)`, if any.
 	pub(crate) async fn parent_intent(
 		&self,

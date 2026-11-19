@@ -407,6 +407,7 @@ impl RecoveryDriver {
 			slab: &self.slab,
 			state_machine: &self.state_machine,
 			progress: &self.progress,
+			locks: &self.locks,
 			build: Some(CandidateBuild {
 				repair: &repair,
 				retention: self.retention,

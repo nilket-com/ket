@@ -2211,6 +2211,21 @@ struct Replaced {
 }
 
 async fn replaced_after_gid_one(block_recovery: bool) -> (Replaced, ControlOnlyNode) {
+	let (replaced, control, _) = replaced_after_gid_one_probed(block_recovery, false).await;
+	(replaced, control)
+}
+
+/// As [`replaced_after_gid_one`]; with `probe`, the replacement's store is armed
+/// for the DC-272 registry probe after the lost disk is gone and before the
+/// replacement starts, so no earlier store at that path supplies evidence.
+async fn replaced_after_gid_one_probed(
+	block_recovery: bool,
+	probe: bool,
+) -> (
+	Replaced,
+	ControlOnlyNode,
+	Option<crate::network::data_server::child_writes::registry_probe::Probe>,
+) {
 	let (mut cluster, leader, descriptor) = ready().await;
 	let lost = *NODES[1..].iter().find(|id| **id != leader).unwrap();
 	let now = std::time::SystemTime::now()
@@ -2254,6 +2269,8 @@ async fn replaced_after_gid_one(block_recovery: bool) -> (Replaced, ControlOnlyN
 				);
 		}
 	}
+	let armed = probe
+		.then(|| crate::network::data_server::child_writes::registry_probe::arm(&cfg.data_dir));
 	let control = ControlOnlyNode::bootstrap_with_provider(cfg.clone(), provider(&cluster, lost))
 		.await
 		.unwrap();
@@ -2266,6 +2283,7 @@ async fn replaced_after_gid_one(block_recovery: bool) -> (Replaced, ControlOnlyN
 			now,
 		},
 		control,
+		armed,
 	)
 }
 
@@ -2694,7 +2712,9 @@ async fn a_generation_committed_during_a_recovery_step_is_activated_and_recovery
 			now,
 		},
 		control,
-	) = replaced_after_gid_one(false).await;
+		probe,
+	) = replaced_after_gid_one_probed(false, true).await;
+	let probe = probe.expect("armed");
 	let recorded = until_recorded(&cluster, &control).await;
 	let slab = control.recovery_storage().await.unwrap();
 	until_children_held(&cluster, &slab, lost).await;
@@ -2772,6 +2792,28 @@ async fn a_generation_committed_during_a_recovery_step_is_activated_and_recovery
 	}
 	step_release.notify_one();
 	until_replacement_active(&slab, &second).await;
+	// DC-272: since this replacement's boundary, the recovery driver, its
+	// destination persists and its activation fence all used one registry.
+	{
+		let seen = probe.evidence();
+		eprintln!("DC-272 recovery registries: {seen:?}");
+		assert_eq!(seen.drivers, 1, "one recovery driver on this store");
+		assert!(seen.driver.is_some());
+		assert_eq!(
+			seen.before_driver, 0,
+			"nothing before the driver since arming"
+		);
+		assert!(
+			seen.persists_matching > 0,
+			"the recovery persisted children here"
+		);
+		assert!(seen.fences_matching > 0, "the recovery's activation fenced");
+		assert_eq!(
+			(seen.persists_other, seen.fences_other),
+			(0, 0),
+			"no persist or fence used another registry"
+		);
+	}
 	tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 	assert!(
 		!control.preparation_ended(),

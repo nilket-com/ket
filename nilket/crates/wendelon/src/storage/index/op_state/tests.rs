@@ -1188,13 +1188,16 @@ async fn a_certified_tier_allocation_under_a_moved_generation_writes_nothing() {
 		.unwrap()
 		.unwrap();
 	index
-		.activate_base(Activation {
-			gid: 1,
-			target_digest: candidate.target_digest,
-			predecessor_gid: 0,
-			chunks: candidate.chunks,
-			t: 0,
-		})
+		.activate_base(
+			Activation {
+				gid: 1,
+				target_digest: candidate.target_digest,
+				predecessor_gid: 0,
+				chunks: candidate.chunks,
+				t: 0,
+			},
+			crate::network::data_server::child_writes::ProducerFence::uncontended_for_test().await,
+		)
 		.await
 		.unwrap()
 		.unwrap();

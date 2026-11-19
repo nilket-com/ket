@@ -6766,6 +6766,8 @@ mod write_deadline;
 
 #[path = "parent_decisions_cluster_tests/attempt_exhaustion.rs"]
 mod attempt_exhaustion;
+#[path = "parent_decisions_cluster_tests/crossgen.rs"]
+mod crossgen;
 #[path = "parent_decisions_cluster_tests/dc269.rs"]
 mod dc269;
 #[path = "parent_decisions_cluster_tests/debt_before_append.rs"]

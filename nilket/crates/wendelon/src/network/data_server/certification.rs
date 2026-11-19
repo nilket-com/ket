@@ -216,6 +216,7 @@ impl WendelonDataServer {
 			state_machine: &self.state_machine,
 			progress: &progress,
 			build: None,
+			locks: &self.decisions.locks,
 			#[cfg(test)]
 			hold_activation: self
 				.decisions
@@ -238,6 +239,7 @@ impl WendelonDataServer {
 			slab: &self.slab,
 			state_machine: &self.state_machine,
 			progress: &progress,
+			locks: &self.decisions.locks,
 			build: Some(CandidateBuild {
 				repair: &repair,
 				retention: self.mvcc_retention_policy,
@@ -330,11 +332,19 @@ pub(crate) struct StoreCertification<'a> {
 	pub(crate) progress: &'a CertificationProgress,
 	/// `None`: activation only.
 	pub(crate) build: Option<CandidateBuild<'a>>,
+	/// DC-272: the producer registry of this store's child persists (the data
+	/// server's, or the recovery driver's on recovery storage); activation fences
+	/// the producers of the intents it retires through it.
+	pub(crate) locks: &'a super::child_writes::ParentLocks,
 	/// Test-only: leave a committed generation staged, the crash row between
 	/// Commit applied and local activation.
 	#[cfg(test)]
 	pub(crate) hold_activation: bool,
 }
+
+/// DC-272: activations refused for an intent begun after their fence's read,
+/// retried within one step before the step ends with nothing installed.
+const ACTIVATION_FENCE_ATTEMPTS: usize = 3;
 
 impl StoreCertification<'_> {
 	/// Activates the committed generation's staged candidate, if it is not
@@ -344,80 +354,109 @@ impl StoreCertification<'_> {
 		let Some(index) = self.slab.persistent_index() else {
 			return Ok(());
 		};
-		let current = self
-			.state_machine
-			.read_state(|state| {
-				state
-					.decisions
-					.as_ref()
-					.and_then(|decisions| decisions.generations().current.clone())
-			})
-			.await;
-		let Some(cert) = current else {
-			return Ok(());
-		};
-		#[cfg(test)]
-		if self.hold_activation {
-			return Ok(());
-		}
-		// DC-269: an installed generation's cut is checked against (or, when an
-		// earlier build left it unconfirmed, written from) this trusted
-		// certificate; another cut fails closed.
-		use crate::storage::index::certified_base::CutConfirmation;
-		match index
-			.confirm_installed_cut(cert.gid, cert.chunks.clone(), cert.t)
-			.await?
-		{
-			CutConfirmation::NotInstalled => {}
-			CutConfirmation::Upgraded => {
-				tracing::info!(
-					gid = cert.gid,
-					t = cert.t,
-					"the installed base's cut was written from its committed certificate"
-				);
+		// DC-272: an activation refused because an intent was begun after its
+		// fence's read is retried with a fresh certificate and fence; past the
+		// bound, this step ends with nothing installed and the next one retries.
+		let mut unfenced = 0;
+		loop {
+			let current = self
+				.state_machine
+				.read_state(|state| {
+					state
+						.decisions
+						.as_ref()
+						.and_then(|decisions| decisions.generations().current.clone())
+				})
+				.await;
+			let Some(cert) = current else {
+				return Ok(());
+			};
+			#[cfg(test)]
+			if self.hold_activation {
 				return Ok(());
 			}
-			CutConfirmation::Confirmed => return Ok(()),
-			// The committed generation is installed here with other chunks: it is
-			// not this certificate's base, and nothing is confirmed or written.
-			CutConfirmation::OtherBase => {
-				return Err(std::io::Error::new(
-					std::io::ErrorKind::InvalidData,
-					format!(
-						"generation {} is installed with chunks other than its committed certificate's",
-						cert.gid
-					),
-				));
-			}
-		}
-		// A candidate this run did not build and prove (one recovered from
-		// before this start) inherits no validation: reads and readiness close
-		// before it is installed, and after an unclean start its proof is owed
-		// again before any close may record the directory clean.
-		if self.progress.built_gid.load(Ordering::Acquire) != cert.gid {
-			self.progress.validated.store(false, Ordering::Release);
-			if let Some(owner) = self.slab.directory_owner()
-				&& !owner.previous_shutdown_clean()
+			// DC-269: an installed generation's cut is checked against (or, when an
+			// earlier build left it unconfirmed, written from) this trusted
+			// certificate; another cut fails closed.
+			use crate::storage::index::certified_base::CutConfirmation;
+			match index
+				.confirm_installed_cut(cert.gid, cert.chunks.clone(), cert.t)
+				.await?
 			{
-				owner.require_base_recovery();
+				CutConfirmation::NotInstalled => {}
+				CutConfirmation::Upgraded => {
+					tracing::info!(
+						gid = cert.gid,
+						t = cert.t,
+						"the installed base's cut was written from its committed certificate"
+					);
+					return Ok(());
+				}
+				CutConfirmation::Confirmed => return Ok(()),
+				// The committed generation is installed here with other chunks: it is
+				// not this certificate's base, and nothing is confirmed or written.
+				CutConfirmation::OtherBase => {
+					return Err(std::io::Error::new(
+						std::io::ErrorKind::InvalidData,
+						format!(
+							"generation {} is installed with chunks other than its committed certificate's",
+							cert.gid
+						),
+					));
+				}
+			}
+			// A candidate this run did not build and prove (one recovered from
+			// before this start) inherits no validation: reads and readiness close
+			// before it is installed, and after an unclean start its proof is owed
+			// again before any close may record the directory clean.
+			if self.progress.built_gid.load(Ordering::Acquire) != cert.gid {
+				self.progress.validated.store(false, Ordering::Release);
+				if let Some(owner) = self.slab.directory_owner()
+					&& !owner.previous_shutdown_clean()
+				{
+					owner.require_base_recovery();
+				}
+			}
+			// DC-272: the producers of every intent this activation retires are
+			// fenced: their stripes, read from the recorded intents through t and
+			// taken in ascending order before the index write lock, move into the
+			// activation's own transaction.
+			#[cfg(test)]
+			super::child_writes::registry_probe::note(
+				self.slab.data_dir(),
+				super::child_writes::registry_probe::Role::ActivationFence,
+				self.locks,
+			);
+			let wanted = index
+				.intent_stripes_through(cert.t, self.locks.stripe_count())
+				.await?;
+			let fence = self.locks.fence(&wanted).await;
+			match index
+				.activate_base(
+					Activation {
+						gid: cert.gid,
+						target_digest: cert.target_digest,
+						predecessor_gid: cert.predecessor_gid,
+						chunks: cert.chunks.clone(),
+						t: cert.t,
+					},
+					fence,
+				)
+				.await?
+			{
+				Ok(()) => return Ok(()),
+				Err(ActivateRefusal::NoMatchingCandidate | ActivateRefusal::StagedRowsMismatch) => {
+					self.progress.behind.store(true, Ordering::Release);
+					return Ok(());
+				}
+				Err(ActivateRefusal::ProducerUnfenced) => {
+					unfenced += 1;
+					if unfenced >= ACTIVATION_FENCE_ATTEMPTS {
+						return Ok(());
+					}
+				}
 			}
 		}
-		match index
-			.activate_base(Activation {
-				gid: cert.gid,
-				target_digest: cert.target_digest,
-				predecessor_gid: cert.predecessor_gid,
-				chunks: cert.chunks.clone(),
-				t: cert.t,
-			})
-			.await?
-		{
-			Ok(()) => {}
-			Err(ActivateRefusal::NoMatchingCandidate | ActivateRefusal::StagedRowsMismatch) => {
-				self.progress.behind.store(true, Ordering::Release);
-			}
-		}
-		Ok(())
 	}
 
 	/// Builds and durably stages the pending target's candidate, then signs

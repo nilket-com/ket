@@ -292,6 +292,18 @@ impl WendelonDataServer {
 		repair_child_in(&context, rsv, ordinal, schema_generation).await
 	}
 
+	/// Test-only: the production repair of one child on this store, as a
+	/// reader or certification repair invokes it.
+	#[cfg(test)]
+	pub(crate) async fn repair_child_for_test(
+		&self,
+		rsv: u64,
+		ordinal: u16,
+		schema_generation: u64,
+	) -> Result<(), ChildRefusal> {
+		self.repair_child(rsv, ordinal, schema_generation).await
+	}
+
 	/// What this server's repairs use: its signer, store, locks and its
 	/// factory's connections. `None` without a signer (Today mode).
 	pub(super) fn repair_context(&self) -> Option<RepairContext> {

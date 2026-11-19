@@ -20637,33 +20637,34 @@ async fn certified_cleanup_reclaims_only_planned_debt_under_its_generation() {
 		tombstone: false,
 		position: 0,
 	};
-	let activate = |gid: u64| {
-		let index = index.clone();
-		async move {
-			let candidate = StagedCandidate {
-				gid,
-				target_digest: [gid as u8; 32],
-				predecessor_gid: gid - 1,
-				chunks: chunk_sums(&[winner]),
-			};
-			index
-				.stage_base(candidate.clone(), vec![winner])
-				.await
-				.unwrap()
-				.unwrap();
-			index
+	let activate =
+		|gid: u64| {
+			let index = index.clone();
+			async move {
+				let candidate = StagedCandidate {
+					gid,
+					target_digest: [gid as u8; 32],
+					predecessor_gid: gid - 1,
+					chunks: chunk_sums(&[winner]),
+				};
+				index
+					.stage_base(candidate.clone(), vec![winner])
+					.await
+					.unwrap()
+					.unwrap();
+				index
 				.activate_base(Activation {
 					gid,
 					target_digest: candidate.target_digest,
 					predecessor_gid: gid - 1,
 					chunks: candidate.chunks,
 					t: 8,
-				})
+				}, crate::network::data_server::child_writes::ProducerFence::uncontended_for_test().await)
 				.await
 				.unwrap()
 				.unwrap();
-		}
-	};
+			}
+		};
 	activate(1).await;
 	let decide = || async {
 		let job = mgr
@@ -20874,13 +20875,16 @@ async fn cleanup_fixture(tag: &str) -> (CleanupFixture, Arc<SlabManager>) {
 		.unwrap()
 		.unwrap();
 	index
-		.activate_base(Activation {
-			gid: 1,
-			target_digest: candidate.target_digest,
-			predecessor_gid: 0,
-			chunks: candidate.chunks,
-			t: 8,
-		})
+		.activate_base(
+			Activation {
+				gid: 1,
+				target_digest: candidate.target_digest,
+				predecessor_gid: 0,
+				chunks: candidate.chunks,
+				t: 8,
+			},
+			crate::network::data_server::child_writes::ProducerFence::uncontended_for_test().await,
+		)
 		.await
 		.unwrap()
 		.unwrap();
@@ -65059,13 +65063,16 @@ async fn certified_lsm_activate(
 		.unwrap()
 		.unwrap();
 	index
-		.activate_base(Activation {
-			gid,
-			target_digest: candidate.target_digest,
-			predecessor_gid: gid - 1,
-			chunks: candidate.chunks,
-			t: 8,
-		})
+		.activate_base(
+			Activation {
+				gid,
+				target_digest: candidate.target_digest,
+				predecessor_gid: gid - 1,
+				chunks: candidate.chunks,
+				t: 8,
+			},
+			crate::network::data_server::child_writes::ProducerFence::uncontended_for_test().await,
+		)
 		.await
 		.unwrap()
 		.unwrap();

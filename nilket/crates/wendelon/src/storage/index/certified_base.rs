@@ -318,6 +318,10 @@ pub enum ActivateRefusal {
 	/// The staged rows do not hash to the certificate's chunks (damaged or
 	/// changed staged evidence): behind boundary, nothing installed.
 	StagedRowsMismatch,
+	/// DC-272: an intent this activation would retire belongs to a producer
+	/// stripe its fence does not hold (one begun after the fence's read).
+	/// Nothing changed; retryable.
+	ProducerUnfenced,
 }
 
 /// What activation checks the staged candidate against.
@@ -1091,14 +1095,40 @@ impl PersistentLocalIndex {
 	/// on the active predecessor; it replaces the active base; the intents and
 	/// owner entries of every parent reserved at or before `t` are retired.
 	/// Idempotent once the generation is active.
+	///
+	/// DC-272: `fence` holds the producer stripes of the intents this activation
+	/// retires. It moves into the operation that commits or aborts, so those
+	/// stripes stay held until the transaction ends, even if this call's caller
+	/// is cancelled. If any recorded intent at or below `t` belongs to a stripe
+	/// the fence does not hold, nothing changes (`ProducerUnfenced`).
 	pub(crate) async fn activate_base(
 		&self,
 		activation: Activation,
+		fence: crate::network::data_server::child_writes::ProducerFence,
 	) -> std::io::Result<Result<(), ActivateRefusal>> {
 		let _guard = self.write_lock.lock().await;
 		self.db
 			.run(move |db| {
+				let fence = fence;
 				let tx = db.begin_write().map_err(redb_to_io)?;
+				// Every intent this activation could retire has its producer
+				// fenced, or nothing changes. Checked in this transaction.
+				{
+					let intents = tx
+						.open_table(super::parent_intents::PARENT_INTENTS_TABLE)
+						.map_err(redb_to_io)?;
+					for row in intents.iter().map_err(redb_to_io)? {
+						let (key, _) = row.map_err(redb_to_io)?;
+						let rsv =
+							u64::from_be_bytes(key.value()[..8].try_into().expect("intent key"));
+						if rsv > activation.t {
+							break;
+						}
+						if !fence.covers(rsv) {
+							return Ok(Err(ActivateRefusal::ProducerUnfenced));
+						}
+					}
+				}
 				let mut meta_table = tx.open_table(BASE_META_TABLE).map_err(redb_to_io)?;
 				let mut meta = read_meta(&meta_table)?;
 				if meta.active_gid == activation.gid {
@@ -1605,7 +1635,15 @@ mod tests {
 		};
 		let before = index.base_meta().await.unwrap();
 		assert_eq!(
-			index.activate_base(activation.clone()).await.unwrap(),
+			index
+				.activate_base(
+					activation.clone(),
+					crate::network::data_server::child_writes::ProducerFence::uncontended_for_test(
+					)
+					.await
+				)
+				.await
+				.unwrap(),
 			Err(ActivateRefusal::StagedRowsMismatch)
 		);
 		assert_eq!(
@@ -1630,7 +1668,15 @@ mod tests {
 			.unwrap()
 			.unwrap();
 		assert!(index.staged_rows_match().await.unwrap());
-		index.activate_base(activation).await.unwrap().unwrap();
+		index
+			.activate_base(
+				activation,
+				crate::network::data_server::child_writes::ProducerFence::uncontended_for_test()
+					.await,
+			)
+			.await
+			.unwrap()
+			.unwrap();
 		assert_eq!(index.base_entries(false).await.unwrap().len(), 2);
 	}
 
@@ -1688,13 +1734,17 @@ mod tests {
 			.unwrap()
 			.unwrap();
 		index
-			.activate_base(Activation {
-				gid,
-				target_digest: staged.target_digest,
-				predecessor_gid: predecessor,
-				chunks: staged.chunks,
-				t,
-			})
+			.activate_base(
+				Activation {
+					gid,
+					target_digest: staged.target_digest,
+					predecessor_gid: predecessor,
+					chunks: staged.chunks,
+					t,
+				},
+				crate::network::data_server::child_writes::ProducerFence::uncontended_for_test()
+					.await,
+			)
 			.await
 			.unwrap()
 			.unwrap();
@@ -1838,13 +1888,17 @@ mod tests {
 	async fn activate_again(index: &PersistentLocalIndex, gid: u64) {
 		let meta = index.base_meta().await.unwrap();
 		index
-			.activate_base(Activation {
-				gid,
-				target_digest: [gid as u8; 32],
-				predecessor_gid: gid - 1,
-				chunks: meta.active_chunks,
-				t: 8,
-			})
+			.activate_base(
+				Activation {
+					gid,
+					target_digest: [gid as u8; 32],
+					predecessor_gid: gid - 1,
+					chunks: meta.active_chunks,
+					t: 8,
+				},
+				crate::network::data_server::child_writes::ProducerFence::uncontended_for_test()
+					.await,
+			)
 			.await
 			.unwrap()
 			.unwrap();
@@ -1955,7 +2009,12 @@ mod tests {
 		// A certificate the candidate does not match: refused, nothing changes.
 		assert_eq!(
 			index
-				.activate_base(activation(chunk_sums(std::iter::empty())))
+				.activate_base(
+					activation(chunk_sums(std::iter::empty())),
+					crate::network::data_server::child_writes::ProducerFence::uncontended_for_test(
+					)
+					.await
+				)
 				.await
 				.unwrap(),
 			Err(ActivateRefusal::NoMatchingCandidate)
@@ -1963,7 +2022,11 @@ mod tests {
 		assert!(index.parent_intent(5, 0).await.unwrap().is_some());
 		// The matching certificate: active is the candidate; rsv 5 retires.
 		index
-			.activate_base(activation(staged.chunks.clone()))
+			.activate_base(
+				activation(staged.chunks.clone()),
+				crate::network::data_server::child_writes::ProducerFence::uncontended_for_test()
+					.await,
+			)
 			.await
 			.unwrap()
 			.unwrap();
@@ -1976,7 +2039,11 @@ mod tests {
 		assert!(index.parent_intent(9, 0).await.unwrap().is_some());
 		// Idempotent once active.
 		index
-			.activate_base(activation(staged.chunks.clone()))
+			.activate_base(
+				activation(staged.chunks.clone()),
+				crate::network::data_server::child_writes::ProducerFence::uncontended_for_test()
+					.await,
+			)
 			.await
 			.unwrap()
 			.unwrap();
@@ -2060,13 +2127,17 @@ mod tests {
 		);
 		assert_cut(&index, 10, 2, 11).await;
 		let error = index
-			.activate_base(Activation {
-				gid: 1,
-				target_digest: [1; 32],
-				predecessor_gid: 0,
-				chunks: chunk_sums(std::iter::empty()),
-				t: 9,
-			})
+			.activate_base(
+				Activation {
+					gid: 1,
+					target_digest: [1; 32],
+					predecessor_gid: 0,
+					chunks: chunk_sums(std::iter::empty()),
+					t: 9,
+				},
+				crate::network::data_server::child_writes::ProducerFence::uncontended_for_test()
+					.await,
+			)
 			.await
 			.err()
 			.expect("another cut for the installed generation fails closed");
@@ -2265,13 +2336,17 @@ mod tests {
 		let before = index.base_entries(false).await.unwrap();
 		let other = chunk_sums(&[entry(2, 5, 0)]);
 		let error = index
-			.activate_base(Activation {
-				gid: 1,
-				target_digest: [1; 32],
-				predecessor_gid: 0,
-				chunks: other.clone(),
-				t: 6,
-			})
+			.activate_base(
+				Activation {
+					gid: 1,
+					target_digest: [1; 32],
+					predecessor_gid: 0,
+					chunks: other.clone(),
+					t: 6,
+				},
+				crate::network::data_server::child_writes::ProducerFence::uncontended_for_test()
+					.await,
+			)
 			.await
 			.err()
 			.expect("other chunks fail closed");
@@ -2296,13 +2371,17 @@ mod tests {
 		);
 		// The repeat with the certificate's own chunks writes its cut.
 		index
-			.activate_base(Activation {
-				gid: 1,
-				target_digest: [1; 32],
-				predecessor_gid: 0,
-				chunks: chunk_sums(&entries),
-				t: 6,
-			})
+			.activate_base(
+				Activation {
+					gid: 1,
+					target_digest: [1; 32],
+					predecessor_gid: 0,
+					chunks: chunk_sums(&entries),
+					t: 6,
+				},
+				crate::network::data_server::child_writes::ProducerFence::uncontended_for_test()
+					.await,
+			)
 			.await
 			.unwrap()
 			.unwrap();
@@ -2310,5 +2389,76 @@ mod tests {
 			index.installed_cut().await.unwrap(),
 			CutState::Current(InstalledCut { gid: 1, t: 6 })
 		);
+	}
+
+	/// DC-272: an intent begun after the fence's read, on a stripe the fence does
+	/// not hold, refuses the activation with nothing changed (base, staging,
+	/// intents, owners); a fresh read and fence then activate and retire both.
+	#[tokio::test]
+	async fn an_intent_begun_after_the_fence_read_refuses_activation_until_refenced() {
+		use crate::network::data_server::child_writes::ParentLocks;
+		let (_dir, index) = open("producer-fence").await;
+		let locks = ParentLocks::new();
+		let stripes = locks.stripe_count();
+		assert_ne!(3 % stripes, 4 % stripes, "premise: distinct stripes");
+		begin(&index, 3, vec![cut_version(30)]).await;
+		let staged = candidate(1, 0, &[]);
+		index
+			.stage_base(staged.clone(), Vec::new())
+			.await
+			.unwrap()
+			.unwrap();
+		let activation = Activation {
+			gid: 1,
+			target_digest: staged.target_digest,
+			predecessor_gid: 0,
+			chunks: staged.chunks.clone(),
+			t: 10,
+		};
+		let wanted = index.intent_stripes_through(10, stripes).await.unwrap();
+		assert_eq!(wanted.iter().filter(|stripe| **stripe).count(), 1);
+		// Begun after the read, at or below t, on another stripe.
+		begin(&index, 4, vec![cut_version(40)]).await;
+		let fence = locks.fence(&wanted).await;
+		assert_eq!(
+			index
+				.activate_base(activation.clone(), fence)
+				.await
+				.unwrap(),
+			Err(ActivateRefusal::ProducerUnfenced)
+		);
+		let meta = index.base_meta().await.unwrap();
+		assert_eq!(
+			(meta.active_gid, meta.staged.as_ref()),
+			(0, Some(&staged)),
+			"unchanged"
+		);
+		for (rsv, key) in [(3, 30), (4, 40)] {
+			assert!(
+				index.parent_intent(rsv, 0).await.unwrap().is_some(),
+				"intent {rsv} kept"
+			);
+			assert_eq!(
+				index.version_owner(TENANT, cut_version(key)).await.unwrap(),
+				Some((rsv, 0))
+			);
+		}
+		assert_eq!(index.installed_cut().await.unwrap(), CutState::Genesis);
+		// A fresh read and fence cover both.
+		let wanted = index.intent_stripes_through(10, stripes).await.unwrap();
+		assert_eq!(wanted.iter().filter(|stripe| **stripe).count(), 2);
+		let fence = locks.fence(&wanted).await;
+		index
+			.activate_base(activation, fence)
+			.await
+			.unwrap()
+			.unwrap();
+		assert_eq!(index.base_meta().await.unwrap().active_gid, 1);
+		for rsv in [3, 4] {
+			assert!(
+				index.parent_intent(rsv, 0).await.unwrap().is_none(),
+				"intent {rsv} retired"
+			);
+		}
 	}
 }

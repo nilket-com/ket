@@ -21,19 +21,31 @@ pub(super) const PARENT_LOCK_STRIPES: usize = 256;
 /// The lock every step of one parent's child write and its refused cleanup
 /// takes. Guards are owned, so work spawned under a guard keeps it until that
 /// work finishes, even if the request that started it is cancelled.
-pub(crate) struct ParentLocks(Vec<Arc<tokio::sync::Mutex<()>>>);
+pub(crate) struct ParentLocks {
+	stripes: Vec<Arc<tokio::sync::Mutex<()>>>,
+	/// Test-only (DC-272): fences that found a stripe busy and waited for it.
+	#[cfg(test)]
+	pub(crate) fence_waits: std::sync::atomic::AtomicUsize,
+}
 
 impl ParentLocks {
 	pub(crate) fn new() -> Self {
-		Self(
-			(0..PARENT_LOCK_STRIPES)
+		Self {
+			stripes: (0..PARENT_LOCK_STRIPES)
 				.map(|_| Arc::new(tokio::sync::Mutex::new(())))
 				.collect(),
-		)
+			#[cfg(test)]
+			fence_waits: Default::default(),
+		}
 	}
 
 	fn stripe(&self, rsv: u64) -> &Arc<tokio::sync::Mutex<()>> {
-		&self.0[(rsv % PARENT_LOCK_STRIPES as u64) as usize]
+		&self.stripes[(rsv % self.stripes.len() as u64) as usize]
+	}
+
+	/// How many stripes this registry has.
+	pub(crate) fn stripe_count(&self) -> usize {
+		self.stripes.len()
 	}
 
 	pub(super) async fn lock(&self, rsv: u64) -> tokio::sync::OwnedMutexGuard<()> {
@@ -44,6 +56,65 @@ impl ParentLocks {
 	/// else on that stripe) holds it.
 	pub(super) fn try_lock(&self, rsv: u64) -> Option<tokio::sync::OwnedMutexGuard<()>> {
 		self.stripe(rsv).clone().try_lock_owned().ok()
+	}
+
+	/// DC-272: the stripes marked in `wanted` (one flag per stripe), acquired in
+	/// ascending stripe order, waiting for any producer that holds one. Taken
+	/// before, never under, the index write lock.
+	pub(crate) async fn fence(&self, wanted: &[bool]) -> ProducerFence {
+		let mut covered = vec![false; self.stripes.len()];
+		let mut guards = Vec::new();
+		for (stripe, lock) in self.stripes.iter().enumerate() {
+			if !wanted.get(stripe).copied().unwrap_or(false) {
+				continue;
+			}
+			let guard = match lock.clone().try_lock_owned() {
+				Ok(guard) => guard,
+				Err(_) => {
+					#[cfg(test)]
+					self.fence_waits
+						.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+					lock.clone().lock_owned().await
+				}
+			};
+			covered[stripe] = true;
+			guards.push(guard);
+		}
+		ProducerFence {
+			covered,
+			_guards: guards,
+		}
+	}
+
+	/// Test-only: holds `rsv`'s stripe as a producer would.
+	#[cfg(test)]
+	pub(crate) async fn lock_for_test(&self, rsv: u64) -> tokio::sync::OwnedMutexGuard<()> {
+		self.lock(rsv).await
+	}
+}
+
+/// DC-272: the producer stripes an activation holds while it retires intents.
+/// Built only by [`ParentLocks::fence`] (its guards are real); it is moved into
+/// the index operation that commits or aborts, so the stripes stay held until
+/// that operation ends, even if its async caller is cancelled.
+pub(crate) struct ProducerFence {
+	covered: Vec<bool>,
+	_guards: Vec<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl ProducerFence {
+	/// Whether this fence holds `rsv`'s stripe.
+	pub(crate) fn covers(&self, rsv: u64) -> bool {
+		let stripes = self.covered.len() as u64;
+		stripes > 0 && self.covered[(rsv % stripes) as usize]
+	}
+
+	/// Test-only: every stripe of a fresh registry, uncontended.
+	#[cfg(test)]
+	pub(crate) async fn uncontended_for_test() -> Self {
+		let locks = ParentLocks::new();
+		let all = vec![true; locks.stripe_count()];
+		locks.fence(&all).await
 	}
 }
 
@@ -876,6 +947,8 @@ pub(super) async fn persist_locked(
 	// Lock order: the index admission guard (taken with the plan), then the
 	// parent lock. Both move into the spawned work, which a cancelled caller
 	// does not stop, so neither is released before that work ends.
+	#[cfg(test)]
+	registry_probe::note(slab.data_dir(), registry_probe::Role::Persist, &locks);
 	let guard = locks.lock(plan.intent.rsv).await;
 	let work = tokio::spawn(async move {
 		let _admission = admission;
@@ -2125,5 +2198,99 @@ pub(crate) mod persist_pause {
 		probe.reached.notify_one();
 		probe.release.notified().await;
 		Some(EndGuard(probe.ended))
+	}
+}
+
+/// DC-272 (test only): which producer registry the roles used on one armed
+/// store. A test arms a data directory at its replacement boundary and keeps the
+/// returned guard; dropping it deregisters. Calls for unarmed directories
+/// allocate nothing; an armed store's evidence is fixed-size counters.
+#[cfg(test)]
+pub(crate) mod registry_probe {
+	use std::path::{Path, PathBuf};
+	use std::sync::{Arc, Mutex};
+
+	/// What one armed store saw. `driver` is the first recovery driver's
+	/// registry; later roles count as matching it or not.
+	#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+	pub(crate) struct Evidence {
+		pub driver: Option<usize>,
+		pub drivers: usize,
+		pub persists_matching: usize,
+		pub persists_other: usize,
+		pub fences_matching: usize,
+		pub fences_other: usize,
+		/// Persists or fences before any driver was seen.
+		pub before_driver: usize,
+	}
+
+	type Armed = (PathBuf, Arc<Mutex<Evidence>>);
+	static ARMED: Mutex<Vec<Armed>> = Mutex::new(Vec::new());
+
+	/// Deregisters its store when dropped.
+	pub(crate) struct Probe {
+		dir: PathBuf,
+		evidence: Arc<Mutex<Evidence>>,
+	}
+
+	impl Probe {
+		pub(crate) fn evidence(&self) -> Evidence {
+			*self.evidence.lock().unwrap()
+		}
+	}
+
+	impl Drop for Probe {
+		fn drop(&mut self) {
+			ARMED.lock().unwrap().retain(|(dir, evidence)| {
+				!(dir == &self.dir && Arc::ptr_eq(evidence, &self.evidence))
+			});
+		}
+	}
+
+	/// Arms `dir` (and the stores under it) from now on.
+	pub(crate) fn arm(dir: &Path) -> Probe {
+		let evidence = Arc::new(Mutex::new(Evidence::default()));
+		ARMED
+			.lock()
+			.unwrap()
+			.push((dir.to_path_buf(), evidence.clone()));
+		Probe {
+			dir: dir.to_path_buf(),
+			evidence,
+		}
+	}
+
+	pub(crate) enum Role {
+		RecoveryDriver,
+		Persist,
+		ActivationFence,
+	}
+
+	pub(crate) fn note(dir: &Path, role: Role, locks: &super::ParentLocks) {
+		let armed = ARMED.lock().unwrap();
+		let Some((_, evidence)) = armed.iter().find(|(at, _)| dir.starts_with(at)) else {
+			return;
+		};
+		let registry = locks as *const _ as usize;
+		let mut seen = evidence.lock().unwrap();
+		match role {
+			Role::RecoveryDriver => {
+				seen.drivers += 1;
+				seen.driver.get_or_insert(registry);
+			}
+			Role::Persist | Role::ActivationFence => {
+				let Some(driver) = seen.driver else {
+					seen.before_driver += 1;
+					return;
+				};
+				let matching = registry == driver;
+				match (role, matching) {
+					(Role::Persist, true) => seen.persists_matching += 1,
+					(Role::Persist, false) => seen.persists_other += 1,
+					(_, true) => seen.fences_matching += 1,
+					(_, false) => seen.fences_other += 1,
+				}
+			}
+		}
 	}
 }

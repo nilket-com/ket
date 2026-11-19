@@ -254,6 +254,12 @@ impl Preparation {
 			progress: Default::default(),
 			retention: self.cfg.mvcc_retention_policy,
 		};
+		#[cfg(test)]
+		crate::network::data_server::child_writes::registry_probe::note(
+			driver.slab.data_dir(),
+			crate::network::data_server::child_writes::registry_probe::Role::RecoveryDriver,
+			&driver.locks,
+		);
 		loop {
 			if self.stopping.load(std::sync::atomic::Ordering::SeqCst) {
 				return;
