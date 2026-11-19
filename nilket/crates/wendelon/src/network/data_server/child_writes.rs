@@ -39,6 +39,12 @@ impl ParentLocks {
 	pub(super) async fn lock(&self, rsv: u64) -> tokio::sync::OwnedMutexGuard<()> {
 		self.stripe(rsv).clone().lock_owned().await
 	}
+
+	/// DC-271: `rsv`'s stripe now, or `None` while a producer (or anything
+	/// else on that stripe) holds it.
+	pub(super) fn try_lock(&self, rsv: u64) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+		self.stripe(rsv).clone().try_lock_owned().ok()
+	}
 }
 
 /// Why a child's rows cannot form a manifest.
@@ -934,6 +940,15 @@ pub(super) async fn persist_locked(
 				Refused => return Err(ChildRefusal::ParentRefused),
 				Intent | Complete => {}
 			}
+			// DROP design (test only): a pause after a successful begin, before any
+			// append; the guard signals when this spawned work ends.
+			#[cfg(test)]
+			let _ended = persist_pause::after_parent_intent(
+				&slab,
+				plan.descriptor.table_object_id,
+				&plan.intent.manifest,
+			)
+			.await;
 			// Each tombstone is appended once: only when no copy of it is stored.
 			for target in plan.tombstone.iter().flatten() {
 				let stored = slab
@@ -1093,6 +1108,10 @@ pub(crate) struct DecisionPeer {
 	/// Commit applied and local activation.
 	#[cfg(test)]
 	pub(crate) hold_activation: Arc<std::sync::atomic::AtomicBool>,
+	/// Test-only (DC-271): debts the sweep left because their producer's
+	/// reservation stripe was busy.
+	#[cfg(test)]
+	pub(crate) debt_busy_skips: Arc<std::sync::atomic::AtomicUsize>,
 	/// Test-only: base validation fails, as a physical mismatch would.
 	#[cfg(test)]
 	pub(crate) fail_base_validation: Arc<std::sync::atomic::AtomicBool>,
@@ -1273,6 +1292,8 @@ impl Default for DecisionPeer {
 			tamper_fetches: Default::default(),
 			#[cfg(test)]
 			hold_activation: Default::default(),
+			#[cfg(test)]
+			debt_busy_skips: Default::default(),
 			#[cfg(test)]
 			fail_base_validation: Default::default(),
 			#[cfg(test)]
@@ -2039,5 +2060,70 @@ pub(crate) mod persist_pause {
 		probe.reached.notify_one();
 		probe.release.notified().await;
 		Some(probe)
+	}
+
+	/// DROP design (test only): a pause immediately after a successful
+	/// `begin_parent_intent`, before any append. Its guard lives in the spawned
+	/// work and signals `ended` when that work ends, on any path.
+	#[derive(Clone)]
+	pub(crate) struct AfterBegin {
+		pub reached: Arc<Notify>,
+		pub release: Arc<Notify>,
+		pub ended: Arc<Notify>,
+		manifest: Arc<Mutex<Vec<OwnedVersion>>>,
+	}
+
+	impl AfterBegin {
+		/// The versions the paused worker's intent names.
+		pub(crate) fn manifest(&self) -> Vec<OwnedVersion> {
+			self.manifest.lock().unwrap().clone()
+		}
+	}
+
+	pub(crate) struct EndGuard(Arc<Notify>);
+
+	impl Drop for EndGuard {
+		fn drop(&mut self) {
+			self.0.notify_one();
+		}
+	}
+
+	static ARMED_AFTER: Mutex<Vec<(usize, crate::schema::TableObjectId, AfterBegin)>> =
+		Mutex::new(Vec::new());
+
+	/// Arms the pause after a successful begin for `store` and `table`.
+	pub(crate) fn arm_after_begin(
+		store: &crate::storage::manager::SlabManager,
+		table: crate::schema::TableObjectId,
+	) -> AfterBegin {
+		let probe = AfterBegin {
+			reached: Arc::new(Notify::new()),
+			release: Arc::new(Notify::new()),
+			ended: Arc::new(Notify::new()),
+			manifest: Arc::new(Mutex::new(Vec::new())),
+		};
+		ARMED_AFTER
+			.lock()
+			.unwrap()
+			.push((store as *const _ as usize, table, probe.clone()));
+		probe
+	}
+
+	pub(crate) async fn after_parent_intent(
+		store: &crate::storage::manager::SlabManager,
+		table: crate::schema::TableObjectId,
+		manifest: &[OwnedVersion],
+	) -> Option<EndGuard> {
+		let key = store as *const _ as usize;
+		let probe = {
+			let mut all = ARMED_AFTER.lock().unwrap();
+			all.iter()
+				.position(|(at, armed, _)| *at == key && *armed == table)
+				.map(|index| all.remove(index).2)
+		}?;
+		*probe.manifest.lock().unwrap() = manifest.to_vec();
+		probe.reached.notify_one();
+		probe.release.notified().await;
+		Some(EndGuard(probe.ended))
 	}
 }

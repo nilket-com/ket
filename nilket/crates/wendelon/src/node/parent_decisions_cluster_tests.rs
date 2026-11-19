@@ -6768,6 +6768,8 @@ mod write_deadline;
 mod attempt_exhaustion;
 #[path = "parent_decisions_cluster_tests/dc269.rs"]
 mod dc269;
+#[path = "parent_decisions_cluster_tests/debt_before_append.rs"]
+mod debt_before_append;
 #[path = "parent_decisions_cluster_tests/multi_row_delete.rs"]
 mod multi_row_delete;
 #[path = "parent_decisions_cluster_tests/one_voter.rs"]

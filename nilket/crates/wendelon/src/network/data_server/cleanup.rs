@@ -236,8 +236,19 @@ impl WendelonDataServer {
 	/// that have no copy left, no owner and no base entry at their HLC, each
 	/// checked against its exact record in one write transaction. Returns how
 	/// many it retired.
+	///
+	/// DC-271: a retired intent's debt is retired only while this sweep holds
+	/// that reservation's stripe, from before the check through the retirement
+	/// transaction. A producer holds the stripe from before its decision check
+	/// through its last append, so a version it can still append keeps its debt.
+	/// A busy stripe is skipped without waiting; the cursor still advances, and
+	/// the debt is revisited when the sweep wraps.
 	pub(crate) async fn debt_sweep_step(&self) -> std::io::Result<usize> {
 		if !self.may_clean() {
+			return Ok(0);
+		}
+		#[cfg(test)]
+		if self.cleanup_paused_for_test() {
 			return Ok(0);
 		}
 		let Some(index) = self.slab.persistent_index() else {
@@ -247,6 +258,21 @@ impl WendelonDataServer {
 		let page = index.debt_page(after, DEBT_SWEEP_BATCH).await?;
 		let mut retired = 0;
 		for (key, record) in &page {
+			let _producer = match record.source {
+				crate::storage::index::certified_base::DebtSource::RetiredIntent {
+					rsv, ..
+				} => match self.decisions.locks.try_lock(rsv) {
+					Some(guard) => Some(guard),
+					None => {
+						#[cfg(test)]
+						self.decisions
+							.debt_busy_skips
+							.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+						continue;
+					}
+				},
+				crate::storage::index::certified_base::DebtSource::DisplacedBase { .. } => None,
+			};
 			if index.retire_debt(*key, record.clone()).await? {
 				retired += 1;
 			}
