@@ -638,6 +638,9 @@ fn map_wendelon_admin_error_to_storage(
 		wendelon_client::ClientError::Admin(
 			wendelon_client::WendelonAdminError::TableAlreadyDropped { .. },
 		) => StorageError::TableAlreadyDropped { table: table_id },
+		source @ wendelon_client::ClientError::Admin(
+			wendelon_client::WendelonAdminError::UnsupportedUnderParentDecisions,
+		) => StorageError::UnsupportedUnderParentDecisions { source },
 		wendelon_client::ClientError::TableDescriptorEvolved { .. } => {
 			StorageError::DescriptorEvolved { table_id }
 		}
@@ -1366,6 +1369,45 @@ fn append_projection(
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	/// DC-268: the typed ParentDecisions refusal maps to its own non-transient storage
+	/// error; a real transport failure still maps to Unavailable (the control).
+	#[test]
+	fn an_unsupported_drop_is_typed_and_a_transport_failure_stays_unavailable() {
+		let table = TableId(7);
+		let typed = map_wendelon_admin_error_to_storage(
+			table,
+			wendelon_client::ClientError::Admin(
+				wendelon_client::WendelonAdminError::UnsupportedUnderParentDecisions,
+			),
+		);
+		assert!(
+			matches!(typed, StorageError::UnsupportedUnderParentDecisions { .. }),
+			"{typed:?}"
+		);
+		assert_eq!(
+			typed.to_string(),
+			"unsupported under the ParentDecisions decision authority"
+		);
+		let transport = map_wendelon_admin_error_to_storage(
+			table,
+			wendelon_client::ClientError::Admin(wendelon_client::WendelonAdminError::Transport {
+				message: "connection reset".into(),
+			}),
+		);
+		assert!(
+			matches!(transport, StorageError::Unavailable { .. }),
+			"{transport:?}"
+		);
+		let io = map_wendelon_admin_error_to_storage(
+			table,
+			wendelon_client::ClientError::Io(std::io::Error::new(
+				std::io::ErrorKind::ConnectionRefused,
+				"refused",
+			)),
+		);
+		assert!(matches!(io, StorageError::Unavailable { .. }), "{io:?}");
+	}
 
 	use crate::distributed::cancellation::{
 		DownstreamAttemptRegistry, DownstreamCancellationTrigger,

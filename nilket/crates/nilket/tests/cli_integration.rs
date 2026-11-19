@@ -1406,6 +1406,107 @@ fn local_profile_public_mutation_outcomes_resolve_on_both_authorities() {
 		}
 	}
 }
+/// DC-268: a public DROP TABLE on each authority's fresh local profile, on a
+/// synthetic table. Today drops it (the control). ParentDecisions refuses it whole
+/// with a typed, non-transient diagnostic ("unsupported under the ParentDecisions
+/// decision authority", never "storage unavailable"): the rows, the catalog entry
+/// and the name stay, also after a restart.
+#[test]
+#[ignore = "requires Linux io_uring and the fixed local-profile ports"]
+fn local_profile_drop_table_on_both_authorities() {
+	let _serial = LIVE_LOCAL_LOCK.lock().expect("live-profile test lock");
+	let rows = |rendered: &str| rendered_rows(rendered);
+	let both = RenderedRows::of(&["id", "label"], &[("1", "one"), ("2", "two")]);
+	for authority in ["today", "parent-decisions"] {
+		let harness = fresh_dir(&format!("local-profile-drop-{authority}"));
+		let profile = harness.join("profile");
+		let log = harness.join("local.stderr.log");
+		let init = nilket(&[
+			"local",
+			"init",
+			"--data-dir",
+			profile.to_str().expect("utf8 profile path"),
+			"--decision-authority",
+			authority,
+		]);
+		assert!(init.status.success(), "{authority}: {init:?}");
+		let first = LiveLocal::spawn(&profile, &log);
+		let sql = first.ready.sql_endpoint;
+		assert_sql_success(
+			sql,
+			"CREATE TABLE drop_probe (id BIGINT NOT NULL PRIMARY KEY, label TEXT)",
+		);
+		assert_sql_success(
+			sql,
+			"INSERT INTO drop_probe (id, label) VALUES (1, 'one'), (2, 'two')",
+		);
+		let dropped = run_live_sql(sql, "DROP TABLE drop_probe");
+		let stderr = String::from_utf8_lossy(&dropped.stderr).to_string();
+		eprintln!(
+			"DC-268 {authority} drop: exit={:?} stderr={stderr:?}",
+			dropped.status.code()
+		);
+		let catalog = |sql| {
+			rendered_rows(&assert_sql_success(
+				sql,
+				"SELECT table_name FROM information_schema.tables",
+			))
+		};
+		if authority == "today" {
+			assert!(
+				dropped.status.success() && stdout(&dropped) == "OK\n",
+				"{dropped:?}"
+			);
+			let gone = run_live_sql(sql, "SELECT id, label FROM drop_probe ORDER BY id");
+			assert!(!gone.status.success(), "the table is gone: {gone:?}");
+			assert_eq!(catalog(sql).rows.len(), 0);
+		} else {
+			assert!(!dropped.status.success(), "refused: {dropped:?}");
+			assert!(
+				stderr.contains("unsupported under the ParentDecisions decision authority"),
+				"a typed diagnostic: {stderr:?}"
+			);
+			assert!(
+				!stderr.contains("storage unavailable"),
+				"not transient: {stderr:?}"
+			);
+			assert_eq!(
+				rows(&assert_sql_success(
+					sql,
+					"SELECT id, label FROM drop_probe ORDER BY id"
+				)),
+				both
+			);
+			assert_eq!(catalog(sql).rows, vec![vec!["drop_probe".to_owned()]]);
+			let again = run_live_sql(
+				sql,
+				"CREATE TABLE drop_probe (id BIGINT NOT NULL PRIMARY KEY, label TEXT)",
+			);
+			assert!(!again.status.success(), "the name stays bound: {again:?}");
+		}
+		first.stop_gracefully();
+		let second = LiveLocal::spawn(&profile, &log);
+		let sql = second.ready.sql_endpoint;
+		if authority == "today" {
+			let gone = run_live_sql(sql, "SELECT id, label FROM drop_probe ORDER BY id");
+			assert!(
+				!gone.status.success(),
+				"still gone after a restart: {gone:?}"
+			);
+		} else {
+			assert_eq!(
+				rows(&assert_sql_success(
+					sql,
+					"SELECT id, label FROM drop_probe ORDER BY id"
+				)),
+				both
+			);
+			assert_eq!(catalog(sql).rows, vec![vec!["drop_probe".to_owned()]]);
+		}
+		second.stop_gracefully();
+		std::fs::remove_dir_all(harness).expect("remove drop fixture");
+	}
+}
 
 #[test]
 #[ignore = "requires Linux io_uring and the fixed local-profile ports"]

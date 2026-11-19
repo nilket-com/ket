@@ -92,6 +92,12 @@ pub enum StorageError {
 		#[source]
 		source: wendelon_client::ClientError,
 	},
+	/// DC-268: refused under the ParentDecisions decision authority. Not transient.
+	#[error("unsupported under the ParentDecisions decision authority")]
+	UnsupportedUnderParentDecisions {
+		#[source]
+		source: wendelon_client::ClientError,
+	},
 	#[error("storage client error")]
 	Client {
 		#[source]

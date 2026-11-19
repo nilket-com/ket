@@ -1939,6 +1939,7 @@ impl WendelonControlServer {
 			| WendelonAdminError::TableAlreadyDropping { .. }
 			| WendelonAdminError::DependentIndexesPresent { .. } => CONTROL_REASON_INVALID_TARGET,
 			WendelonAdminError::Transport { .. } => CONTROL_REASON_INTERNAL_ERROR,
+			WendelonAdminError::UnsupportedUnderParentDecisions => CONTROL_REASON_INVALID_TARGET,
 		}
 	}
 
@@ -3280,6 +3281,13 @@ impl WendelonControlServer {
 			}
 			fence
 		} else {
+			// DC-268: under ParentDecisions a drop is refused (the replicated refusal of
+			// TableDropPrepare stays the authority). The answer is typed, after every
+			// catalog check above, instead of a replicated error read as transport.
+			if self.decision_mode == crate::consensus::decision_mode::DecisionMode::ParentDecisions
+			{
+				return Err(WendelonAdminError::UnsupportedUnderParentDecisions);
+			}
 			let log_index = self
 				.submit_table_drop_stage(WendelonRequest::TableDropPrepare(
 					TableDropPrepareRequest::current(operation_id, expected_generation),

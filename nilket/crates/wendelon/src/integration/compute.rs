@@ -185,6 +185,10 @@ pub enum WendelonAdminError {
 	Transport {
 		message: String,
 	},
+	/// DC-268: the operation is refused under the ParentDecisions decision authority
+	/// (today: DROP TABLE). Typed, never a transport error, so a caller does not
+	/// retry it. Appended last: every earlier variant keeps its wire discriminant.
+	UnsupportedUnderParentDecisions,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1185,5 +1189,66 @@ mod tests {
 		};
 		assert!(validate_query_session_audit_attribution(&actor, TenantId::new(7)).is_ok());
 		assert!(validate_query_session_audit_attribution(&actor, TenantId::new(8)).is_err());
+	}
+}
+
+#[cfg(test)]
+mod dc268_admin_error_codec_tests {
+	use super::*;
+
+	/// The admin error as a binary built before DC-268 knows it (same order).
+	#[derive(Debug, Deserialize)]
+	#[allow(dead_code)]
+	enum OlderWendelonAdminError {
+		TableMissing {
+			table_object_id: TableObjectId,
+		},
+		GenerationMismatch {
+			expected: SchemaGeneration,
+			committed: SchemaGeneration,
+		},
+		TableAlreadyDropping {
+			table_object_id: TableObjectId,
+			existing_operation_id: DropOperationId,
+		},
+		TableAlreadyDropped {
+			table_object_id: TableObjectId,
+		},
+		DependentIndexesPresent {
+			indexes: Vec<IndexObjectId>,
+		},
+		Transport {
+			message: String,
+		},
+	}
+
+	/// DC-268: the typed refusal round-trips; appended last, it leaves every earlier
+	/// variant's encoding as an older binary decodes it, and an older binary refuses
+	/// the new variant's bytes (a decode error, never another variant).
+	#[test]
+	fn the_unsupported_refusal_is_appended_and_older_decoders_refuse_it() {
+		let typed = WendelonAdminError::UnsupportedUnderParentDecisions;
+		let bytes = postcard::to_stdvec(&typed).unwrap();
+		assert_eq!(
+			postcard::from_bytes::<WendelonAdminError>(&bytes).unwrap(),
+			typed
+		);
+		assert!(postcard::from_bytes::<OlderWendelonAdminError>(&bytes).is_err());
+		let transport = WendelonAdminError::Transport {
+			message: "x".into(),
+		};
+		let bytes = postcard::to_stdvec(&transport).unwrap();
+		assert!(matches!(
+			postcard::from_bytes::<OlderWendelonAdminError>(&bytes).unwrap(),
+			OlderWendelonAdminError::Transport { .. }
+		));
+		let missing = WendelonAdminError::TableMissing {
+			table_object_id: TableObjectId::new([3; 16]),
+		};
+		let bytes = postcard::to_stdvec(&missing).unwrap();
+		assert!(matches!(
+			postcard::from_bytes::<OlderWendelonAdminError>(&bytes).unwrap(),
+			OlderWendelonAdminError::TableMissing { .. }
+		));
 	}
 }

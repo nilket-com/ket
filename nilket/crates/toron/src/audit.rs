@@ -998,6 +998,9 @@ fn storage_error_class(error: &StorageError) -> &'static str {
 		StorageError::QueryFailed { status, .. } => status.as_str(),
 		StorageError::TableReferenceIntegrity { .. } => "table_reference_integrity",
 		StorageError::Client { .. } => "storage_client",
+		StorageError::UnsupportedUnderParentDecisions { .. } => {
+			"unsupported_under_parent_decisions"
+		}
 		StorageError::Arrow(_) => "arrow",
 		StorageError::Internal { .. } => "internal",
 	}
