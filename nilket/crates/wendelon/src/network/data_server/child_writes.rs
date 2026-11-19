@@ -921,12 +921,16 @@ pub(super) async fn persist_locked(
 					return Err(ChildRefusal::OutOfRange);
 				}
 			}
-			match index
-				.begin_parent_intent(plan.intent.clone())
-				.await
-				.map_err(storage)?
-				.map_err(ChildRefusal::Intent)?
-			{
+			// DC-269 (test only): a pause after the last eligibility and authority
+			// checks, immediately before the intent is begun.
+			#[cfg(test)]
+			let probe = persist_pause::before_parent_intent(&slab, plan.descriptor.table_object_id).await;
+			let begun = index.begin_parent_intent(plan.intent.clone()).await;
+			#[cfg(test)]
+			if let Some(probe) = probe {
+				probe.record(&plan.intent.manifest, &begun);
+			}
+			match begun.map_err(storage)?.map_err(ChildRefusal::Intent)? {
 				Refused => return Err(ChildRefusal::ParentRefused),
 				Intent | Complete => {}
 			}
@@ -1954,3 +1958,86 @@ pub(crate) async fn send_child_frame(
 #[cfg(test)]
 #[path = "child_writes/tests.rs"]
 mod tests;
+
+/// DC-269 (test only): a pause inside `persist_locked`, which runs in a spawned
+/// task with no handle on a server's pause queue. A test arms it for one store
+/// (its slab manager) and one table; the first persist there consumes it, waits
+/// for its release, and records what its own `begin_parent_intent` returned.
+#[cfg(test)]
+pub(crate) mod persist_pause {
+	use crate::storage::index::parent_intents::{IntentRefusal, OwnedVersion, ParentIntentState};
+	use std::sync::{Arc, Mutex};
+	use tokio::sync::Notify;
+
+	/// What the paused worker's begin returned, with the versions it named.
+	#[derive(Clone, Debug)]
+	pub(crate) struct Begun {
+		pub manifest: Vec<OwnedVersion>,
+		pub result: Result<Result<ParentIntentState, IntentRefusal>, String>,
+	}
+
+	#[derive(Clone)]
+	pub(crate) struct Probe {
+		pub reached: Arc<Notify>,
+		pub release: Arc<Notify>,
+		pub begun: Arc<Notify>,
+		outcome: Arc<Mutex<Option<Begun>>>,
+	}
+
+	impl Probe {
+		pub(crate) fn record(
+			&self,
+			manifest: &[OwnedVersion],
+			result: &std::io::Result<Result<ParentIntentState, IntentRefusal>>,
+		) {
+			*self.outcome.lock().unwrap() = Some(Begun {
+				manifest: manifest.to_vec(),
+				result: result
+					.as_ref()
+					.map(|r| *r)
+					.map_err(|error| error.to_string()),
+			});
+			self.begun.notify_one();
+		}
+
+		pub(crate) fn outcome(&self) -> Option<Begun> {
+			self.outcome.lock().unwrap().clone()
+		}
+	}
+
+	static ARMED: Mutex<Vec<(usize, crate::schema::TableObjectId, Probe)>> = Mutex::new(Vec::new());
+
+	/// Arms the pause before `begin_parent_intent` for `store` and `table`.
+	pub(crate) fn arm(
+		store: &crate::storage::manager::SlabManager,
+		table: crate::schema::TableObjectId,
+	) -> Probe {
+		let probe = Probe {
+			reached: Arc::new(Notify::new()),
+			release: Arc::new(Notify::new()),
+			begun: Arc::new(Notify::new()),
+			outcome: Arc::new(Mutex::new(None)),
+		};
+		ARMED
+			.lock()
+			.unwrap()
+			.push((store as *const _ as usize, table, probe.clone()));
+		probe
+	}
+
+	pub(crate) async fn before_parent_intent(
+		store: &crate::storage::manager::SlabManager,
+		table: crate::schema::TableObjectId,
+	) -> Option<Probe> {
+		let key = store as *const _ as usize;
+		let probe = {
+			let mut all = ARMED.lock().unwrap();
+			all.iter()
+				.position(|(at, armed, _)| *at == key && *armed == table)
+				.map(|index| all.remove(index).2)
+		}?;
+		probe.reached.notify_one();
+		probe.release.notified().await;
+		Some(probe)
+	}
+}

@@ -650,9 +650,34 @@ impl RecoveryDriver {
 			.slab
 			.persistent_index()
 			.ok_or_else(|| Error::other("the recovery's store has no index"))?;
-		let meta = index.base_meta().await?;
-		if meta.active_gid == certificate.gid && meta.active_chunks == certificate.chunks {
-			return Ok(Progress::Recorded);
+		// DC-269: an already installed base is checked against this trusted
+		// certificate's cut (written from it if unconfirmed); another fails closed.
+		use crate::storage::index::certified_base::CutConfirmation;
+		match index
+			.confirm_installed_cut(certificate.gid, certificate.chunks.clone(), certificate.t)
+			.await?
+		{
+			CutConfirmation::Confirmed => return Ok(Progress::Recorded),
+			CutConfirmation::Upgraded => {
+				tracing::info!(
+					gid = certificate.gid,
+					t = certificate.t,
+					"the recovered base's cut was written from its certificate"
+				);
+				return Ok(Progress::Recorded);
+			}
+			// The certificate's generation is installed with other chunks: not
+			// its base. Nothing is confirmed, written or reinstalled.
+			CutConfirmation::OtherBase => {
+				return Err(Error::new(
+					std::io::ErrorKind::InvalidData,
+					format!(
+						"generation {} is installed with chunks other than its certificate's",
+						certificate.gid
+					),
+				));
+			}
+			CutConfirmation::NotInstalled => {}
 		}
 		let candidate = StagedCandidate {
 			gid: certificate.gid,
@@ -716,7 +741,7 @@ impl RecoveryDriver {
 			}
 			return Ok(Progress::Pending(last));
 		}
-		match index.publish_recovered(candidate).await? {
+		match index.publish_recovered(candidate, certificate.t).await? {
 			Ok(()) => Ok(Progress::Recorded),
 			Err(refusal) => Err(Error::other(format!(
 				"publication of a verified recovery was refused: {refusal:?}"

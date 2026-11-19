@@ -88,6 +88,12 @@ impl WendelonDataServer {
 		.await
 	}
 
+	/// DC-269 (test only): this start's base-validated flag.
+	#[cfg(test)]
+	pub(crate) fn base_validated_for_test(&self) -> Arc<std::sync::atomic::AtomicBool> {
+		self.decisions.base_validated.clone()
+	}
+
 	pub(super) async fn under_permit<T>(
 		&self,
 		work: impl std::future::Future<Output = std::io::Result<T>>,
@@ -354,8 +360,35 @@ impl StoreCertification<'_> {
 		if self.hold_activation {
 			return Ok(());
 		}
-		if index.base_meta().await?.active_gid == cert.gid {
-			return Ok(());
+		// DC-269: an installed generation's cut is checked against (or, when an
+		// earlier build left it unconfirmed, written from) this trusted
+		// certificate; another cut fails closed.
+		use crate::storage::index::certified_base::CutConfirmation;
+		match index
+			.confirm_installed_cut(cert.gid, cert.chunks.clone(), cert.t)
+			.await?
+		{
+			CutConfirmation::NotInstalled => {}
+			CutConfirmation::Upgraded => {
+				tracing::info!(
+					gid = cert.gid,
+					t = cert.t,
+					"the installed base's cut was written from its committed certificate"
+				);
+				return Ok(());
+			}
+			CutConfirmation::Confirmed => return Ok(()),
+			// The committed generation is installed here with other chunks: it is
+			// not this certificate's base, and nothing is confirmed or written.
+			CutConfirmation::OtherBase => {
+				return Err(std::io::Error::new(
+					std::io::ErrorKind::InvalidData,
+					format!(
+						"generation {} is installed with chunks other than its committed certificate's",
+						cert.gid
+					),
+				));
+			}
 		}
 		// A candidate this run did not build and prove (one recovered from
 		// before this start) inherits no validation: reads and readiness close

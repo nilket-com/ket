@@ -1326,12 +1326,15 @@ async fn a_promoted_replacement_stores_and_reopens_a_recovered_base() {
 		..certificate.clone()
 	};
 	assert_eq!(
-		index.publish_recovered(wrong).await.unwrap(),
+		index.publish_recovered(wrong, 5).await.unwrap(),
 		Err(InstallRefusal::OtherCertificate)
 	);
 	assert_eq!(index.base_meta().await.unwrap().active_gid, 0);
 	assert_eq!(
-		index.publish_recovered(certificate.clone()).await.unwrap(),
+		index
+			.publish_recovered(certificate.clone(), 5)
+			.await
+			.unwrap(),
 		Ok(())
 	);
 	assert_eq!(
@@ -2816,3 +2819,167 @@ async fn a_generation_committed_during_a_recovery_step_is_activated_and_recovery
 
 #[path = "replacement_activation_tests.rs"]
 mod activation;
+
+/// DC-269 r2: replacement's already-installed branch checks the installed cut
+/// against the trusted certificate. Generation 1 certifies an empty base (so the
+/// branch's later stored-data validation has nothing to check). With recovery
+/// halted, the promoted store publishes that base with the certificate's gid and
+/// chunks but another cut. Released, recovery fails closed: it stops, records
+/// nothing and overwrites nothing. With the certificate's own cut, a restarted
+/// replacement's already-installed branch records.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn an_installed_recovered_base_with_another_cut_does_not_record() {
+	use crate::node::replacement_preparation::{Stage, halt_for_test};
+	use crate::storage::index::certified_base::{CutState, InstalledCut, StagedCandidate};
+	let (mut cluster, leader, descriptor) = ready().await;
+	let lost = *NODES[1..].iter().find(|id| **id != leader).unwrap();
+	let now = std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.unwrap()
+		.as_millis() as u64;
+	// A delete of a row never written: placement is sealed, no base entry exists.
+	let absent = super::delete_through(
+		&cluster,
+		leader,
+		super::delete_meta(&descriptor),
+		vec![
+			cluster
+				.node(leader)
+				.data_server
+				.row_identity_and_locality_for_test(
+					TenantId::ZERO,
+					&descriptor,
+					&named_rows(&descriptor, &[(99, "x")]),
+				)
+				.0,
+		],
+	)
+	.await;
+	assert_eq!(absent.write.status, WriteStatus::OK, "{absent:?}");
+	let first = now + 60_000;
+	jump_floor(&cluster, first).await;
+	until_active(&cluster, 1).await;
+	let certificate = current_certificate(&cluster).await.expect("generation 1");
+	let empty = crate::storage::index::certified_base::chunk_sums(std::iter::empty());
+	assert_eq!((certificate.gid, &certificate.chunks), (1, &empty));
+	assert!(
+		certificate.t > 1,
+		"premise: a cut below which reservations were erased"
+	);
+	let meta = write_meta(&descriptor, 1, uuid_v7_at(first + 1));
+	assert_committed(
+		&write_through(&cluster, leader, meta, named_rows(&descriptor, &[(1, "a")])).await,
+		"a write",
+	);
+	cluster.stop(lost, true).await;
+	let cfg = cluster.configs[&lost].clone();
+	lose_disk(&cfg.data_dir);
+	crate::crypto::test_support::enroll_root_artifact(
+		&cluster.configs[&NODES[0]].data_dir,
+		&cfg.data_dir,
+	)
+	.unwrap();
+	assert!(matches!(
+		decide(
+			&cluster,
+			DecisionCommand::BeginReplacement {
+				token: TOKEN,
+				slot: lost,
+			}
+		)
+		.await,
+		DecisionResult::ReplacementRecorded { .. }
+	));
+	crate::node::provision_replacement_token(&cfg.data_dir, TOKEN).unwrap();
+	halt_for_test(&cfg.data_dir, Some(Stage::Recover));
+	let control = ControlOnlyNode::bootstrap_with_provider(cfg.clone(), provider(&cluster, lost))
+		.await
+		.unwrap();
+	let deadline = tokio::time::Instant::now() + BOUND;
+	while !control.prepared() {
+		assert!(tokio::time::Instant::now() < deadline, "never promoted");
+		tokio::time::sleep(TICK).await;
+	}
+	let slab = control.recovery_storage().await.unwrap();
+	let index = slab.persistent_index().unwrap();
+	let staged = StagedCandidate {
+		gid: certificate.gid,
+		target_digest: certificate.target_digest,
+		predecessor_gid: certificate.predecessor_gid,
+		chunks: certificate.chunks.clone(),
+	};
+	// Same gid and chunks, another cut.
+	let wrong = certificate.t - 1;
+	assert_eq!(
+		index
+			.stage_recovered_page(staged.clone(), Vec::new())
+			.await
+			.unwrap(),
+		Ok(())
+	);
+	assert_eq!(
+		index.publish_recovered(staged, wrong).await.unwrap(),
+		Ok(())
+	);
+	let installed = CutState::Current(InstalledCut { gid: 1, t: wrong });
+	assert_eq!(index.installed_cut().await.unwrap(), installed);
+	halt_for_test(&cfg.data_dir, None);
+	// The disagreement stops the preparation (fail closed); it does not retry.
+	let deadline = tokio::time::Instant::now() + BOUND;
+	while !control.preparation_ended() {
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"the preparation kept running"
+		);
+		tokio::time::sleep(TICK).await;
+	}
+	assert!(
+		recovery_record(&cluster).await.is_none(),
+		"another cut never records"
+	);
+	assert_eq!(
+		index.installed_cut().await.unwrap(),
+		installed,
+		"nothing was overwritten"
+	);
+	assert!(
+		index.recovery_submission().await.unwrap().is_none(),
+		"nothing was saved"
+	);
+	// Control: with the certificate's own cut, a restarted replacement's
+	// already-installed branch records.
+	index
+		.set_installed_cut_for_test(Some(InstalledCut {
+			gid: 1,
+			t: certificate.t,
+		}))
+		.await
+		.unwrap();
+	drop(index);
+	drop(slab);
+	control.shutdown().await.unwrap();
+	let control = ControlOnlyNode::bootstrap_with_provider(cfg.clone(), provider(&cluster, lost))
+		.await
+		.unwrap();
+	let deadline = tokio::time::Instant::now() + BOUND * 2;
+	let recorded = loop {
+		if let Some(recorded) = recovery_record(&cluster).await {
+			break recorded;
+		}
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"never recorded; prepared {}, preparation ended {}",
+			control.prepared(),
+			control.preparation_ended()
+		);
+		tokio::time::sleep(TICK).await;
+	};
+	assert_eq!(
+		(recorded.gid, recorded.target_digest),
+		(1, Some(certificate.target_digest))
+	);
+	control.shutdown().await.unwrap();
+	for node in std::mem::take(&mut cluster.nodes) {
+		let _ = tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown()).await;
+	}
+}

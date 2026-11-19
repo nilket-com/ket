@@ -193,6 +193,8 @@ impl CoherentFacts {
 	}
 }
 const BASE_META_KEY: &str = "meta";
+/// DC-269: the installed certificate's cut ([`InstalledCut`]).
+const BASE_CUT_KEY: &str = "installed_cut";
 /// ADR 0106 (wendelon): the certificate a recovery is installing.
 const BASE_RECOVERY_KEY: &str = "recovery";
 /// ADR 0106 (wendelon): the exact recovery statement, saved before first sent.
@@ -330,21 +332,139 @@ pub struct Activation {
 	pub t: u64,
 }
 
+/// DC-269: the cut of the certificate whose base is installed here. Every
+/// parent reserved at or before `t` was erased by that certificate, so no intent
+/// may be begun for one. It is written in the same transaction that installs the
+/// base (activation or recovered publication). A base installed without it (by
+/// an earlier build) is unconfirmed: no intent is admitted until a
+/// certificate-aware step confirms or writes it from the trusted certificate of
+/// the installed generation and chunks ([`PersistentLocalIndex::confirm_installed_cut`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstalledCut {
+	pub gid: u64,
+	pub t: u64,
+}
+
+/// DC-269: the installed cut's state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CutState {
+	/// Nothing installed (generation 0): nothing was erased.
+	Genesis,
+	/// The installed generation's own cut.
+	Current(InstalledCut),
+	/// A generation is installed, with no cut or an earlier generation's (an
+	/// earlier build installed it): no intent is admitted until it is confirmed.
+	Unconfirmed,
+}
+
+/// DC-269: what [`PersistentLocalIndex::confirm_installed_cut`] found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CutConfirmation {
+	/// Another generation is installed: nothing was checked or written.
+	NotInstalled,
+	/// The generation is installed with other chunks: nothing was written.
+	OtherBase,
+	/// The installed cut equals the certificate's.
+	Confirmed,
+	/// The unconfirmed cut was written from the certificate.
+	Upgraded,
+}
+
+/// DC-269: the cut's state against `active_gid`. A cut at genesis or for a later
+/// generation than the installed one is damage, refused.
+fn read_cut(
+	table: &impl ReadableTable<&'static str, &'static [u8]>,
+	active_gid: u64,
+) -> std::io::Result<CutState> {
+	let cut: Option<InstalledCut> = match table.get(BASE_CUT_KEY).map_err(redb_to_io)? {
+		None => None,
+		Some(bytes) => Some(
+			postcard::from_bytes(bytes.value())
+				.map_err(|error| Error::new(ErrorKind::InvalidData, error))?,
+		),
+	};
+	match cut {
+		None if active_gid == 0 => Ok(CutState::Genesis),
+		Some(cut) if active_gid != 0 && cut.gid == active_gid => Ok(CutState::Current(cut)),
+		None => Ok(CutState::Unconfirmed),
+		Some(cut) if active_gid != 0 && cut.gid < active_gid => Ok(CutState::Unconfirmed),
+		Some(cut) => Err(Error::new(
+			ErrorKind::InvalidData,
+			format!("the installed base (generation {active_gid}) has the installed cut {cut:?}"),
+		)),
+	}
+}
+
+/// DC-269: the admission read, in the transaction that would begin an intent:
+/// the installed generation alone (the first field of the stored metadata, a
+/// varint) and the small cut row; never the chunk vectors.
+pub(super) fn admission_cut_in(tx: &redb::WriteTransaction) -> std::io::Result<CutState> {
+	let table = tx.open_table(BASE_META_TABLE).map_err(redb_to_io)?;
+	let active_gid = match table.get(BASE_META_KEY).map_err(redb_to_io)? {
+		None => 0,
+		Some(bytes) => {
+			postcard::take_from_bytes::<u64>(bytes.value())
+				.map_err(|error| Error::new(ErrorKind::InvalidData, error))?
+				.0
+		}
+	};
+	read_cut(&table, active_gid)
+}
+
+/// DC-269: records `cut` with the base installed in the same transaction.
+fn write_cut(
+	table: &mut redb::Table<&'static str, &'static [u8]>,
+	cut: InstalledCut,
+) -> std::io::Result<()> {
+	table
+		.insert(BASE_CUT_KEY, encode(&cut)?.as_slice())
+		.map_err(redb_to_io)?;
+	Ok(())
+}
+
+/// DC-269: an installed generation's cut against a trusted `t` for it: equal
+/// confirms; unconfirmed is written; another is refused (fail closed).
+fn settle_cut(
+	table: &mut redb::Table<&'static str, &'static [u8]>,
+	gid: u64,
+	t: u64,
+) -> std::io::Result<CutConfirmation> {
+	match read_cut(table, gid)? {
+		CutState::Current(cut) if cut.t == t => Ok(CutConfirmation::Confirmed),
+		CutState::Current(cut) => Err(Error::new(
+			ErrorKind::InvalidData,
+			format!(
+				"generation {gid} is installed with the installed cut t {}, not the certificate's {t}",
+				cut.t
+			),
+		)),
+		CutState::Unconfirmed => {
+			write_cut(table, InstalledCut { gid, t })?;
+			Ok(CutConfirmation::Upgraded)
+		}
+		CutState::Genesis => Ok(CutConfirmation::NotInstalled),
+	}
+}
+
 /// ADR 0703: the active generation, read in the caller's write transaction.
 pub(super) fn active_gid_in(tx: &redb::WriteTransaction) -> std::io::Result<u64> {
 	Ok(read_meta(&tx.open_table(BASE_META_TABLE).map_err(redb_to_io)?)?.active_gid)
 }
 
+/// The base metadata. DC-269: every read also checks the installed cut against
+/// it, so an inconsistent store fails closed wherever its base is consulted.
 fn read_meta(table: &impl ReadableTable<&'static str, &'static [u8]>) -> std::io::Result<BaseMeta> {
-	match table.get(BASE_META_KEY).map_err(redb_to_io)? {
-		None => Ok(BaseMeta {
+	let meta: BaseMeta = match table.get(BASE_META_KEY).map_err(redb_to_io)? {
+		None => BaseMeta {
 			active_gid: 0,
 			active_chunks: chunk_sums(std::iter::empty()),
 			staged: None,
-		}),
+		},
 		Some(bytes) => postcard::from_bytes(bytes.value())
-			.map_err(|error| Error::new(ErrorKind::InvalidData, error)),
-	}
+			.map_err(|error| Error::new(ErrorKind::InvalidData, error))?,
+	};
+	read_cut(table, meta.active_gid)?;
+	Ok(meta)
 }
 
 fn encode<T: Serialize>(value: &T) -> std::io::Result<Vec<u8>> {
@@ -712,9 +832,12 @@ impl PersistentLocalIndex {
 	/// trusted from the pages). The recovery staging is cleared in the same
 	/// transaction. Publishing an already published certificate is answered
 	/// as done.
+	///
+	/// DC-269: `t` is the trusted certificate's cut, installed with the base.
 	pub(crate) async fn publish_recovered(
 		&self,
 		certificate: StagedCandidate,
+		t: u64,
 	) -> std::io::Result<Result<(), InstallRefusal>> {
 		let _guard = self.write_lock.lock().await;
 		self.db
@@ -729,6 +852,13 @@ impl PersistentLocalIndex {
 						.map_err(redb_to_io)?
 						.is_none()
 				{
+					// DC-269: the installed cut is the certificate's (written if
+					// unconfirmed), or the repeat is refused.
+					if settle_cut(&mut meta_table, meta.active_gid, t)? == CutConfirmation::Upgraded
+					{
+						drop(meta_table);
+						tx.commit().map_err(redb_to_io)?;
+					}
 					return Ok(Ok(()));
 				}
 				let mut active = tx.open_table(BASE_ACTIVE_TABLE).map_err(redb_to_io)?;
@@ -790,9 +920,115 @@ impl PersistentLocalIndex {
 				meta_table
 					.insert(BASE_META_KEY, encode(&published)?.as_slice())
 					.map_err(redb_to_io)?;
+				write_cut(
+					&mut meta_table,
+					InstalledCut {
+						gid: certificate.gid,
+						t,
+					},
+				)?;
 				drop(meta_table);
 				tx.commit().map_err(redb_to_io)?;
 				Ok(Ok(()))
+			})
+			.await
+	}
+
+	/// DC-269: the certificate-aware check of an already installed generation,
+	/// in one transaction. With `gid` and `chunks` installed, the installed cut
+	/// must equal the trusted certificate's `t`: equal confirms, unconfirmed is
+	/// written from it, another fails closed (`InvalidData`). Another installed
+	/// generation, or other chunks, are reported and nothing is written.
+	pub(crate) async fn confirm_installed_cut(
+		&self,
+		gid: u64,
+		chunks: Vec<ChunkSum>,
+		t: u64,
+	) -> std::io::Result<CutConfirmation> {
+		let _guard = self.write_lock.lock().await;
+		self.db
+			.run(move |db| {
+				let tx = db.begin_write().map_err(redb_to_io)?;
+				let mut meta_table = tx.open_table(BASE_META_TABLE).map_err(redb_to_io)?;
+				let meta = read_meta(&meta_table)?;
+				if gid == 0 || meta.active_gid != gid {
+					return Ok(CutConfirmation::NotInstalled);
+				}
+				if meta.active_chunks != chunks {
+					return Ok(CutConfirmation::OtherBase);
+				}
+				let confirmation = settle_cut(&mut meta_table, gid, t)?;
+				if confirmation == CutConfirmation::Upgraded {
+					drop(meta_table);
+					tx.commit().map_err(redb_to_io)?;
+				}
+				Ok(confirmation)
+			})
+			.await
+	}
+
+	/// DC-269 (test only): replaces or removes the installed cut row, as an
+	/// earlier build or damage would leave it.
+	#[cfg(test)]
+	pub(crate) async fn set_installed_cut_for_test(
+		&self,
+		cut: Option<InstalledCut>,
+	) -> std::io::Result<()> {
+		let _guard = self.write_lock.lock().await;
+		self.db
+			.run(move |db| {
+				let tx = db.begin_write().map_err(redb_to_io)?;
+				{
+					let mut table = tx.open_table(BASE_META_TABLE).map_err(redb_to_io)?;
+					match cut {
+						Some(cut) => write_cut(&mut table, cut)?,
+						None => {
+							table.remove(BASE_CUT_KEY).map_err(redb_to_io)?;
+						}
+					}
+				}
+				tx.commit().map_err(redb_to_io)?;
+				Ok(())
+			})
+			.await
+	}
+
+	/// DC-269 (test only): replaces the installed generation's recorded chunks,
+	/// as damage would leave them; the rows are not touched.
+	#[cfg(test)]
+	pub(crate) async fn set_active_chunks_for_test(
+		&self,
+		chunks: Vec<ChunkSum>,
+	) -> std::io::Result<()> {
+		let _guard = self.write_lock.lock().await;
+		self.db
+			.run(move |db| {
+				let tx = db.begin_write().map_err(redb_to_io)?;
+				{
+					let mut table = tx.open_table(BASE_META_TABLE).map_err(redb_to_io)?;
+					let mut meta = read_meta(&table)?;
+					meta.active_chunks = chunks;
+					table
+						.insert(BASE_META_KEY, encode(&meta)?.as_slice())
+						.map_err(redb_to_io)?;
+				}
+				tx.commit().map_err(redb_to_io)?;
+				Ok(())
+			})
+			.await
+	}
+
+	/// DC-269: the installed cut's state, read with the metadata it is checked
+	/// against.
+	pub(crate) async fn installed_cut(&self) -> std::io::Result<CutState> {
+		self.db
+			.run(|db| {
+				let tx = db.begin_read().map_err(redb_to_io)?;
+				match tx.open_table(BASE_META_TABLE) {
+					Ok(table) => read_cut(&table, read_meta(&table)?.active_gid),
+					Err(redb::TableError::TableDoesNotExist(_)) => Ok(CutState::Genesis),
+					Err(error) => Err(redb_to_io(error)),
+				}
 			})
 			.await
 	}
@@ -866,6 +1102,24 @@ impl PersistentLocalIndex {
 				let mut meta_table = tx.open_table(BASE_META_TABLE).map_err(redb_to_io)?;
 				let mut meta = read_meta(&meta_table)?;
 				if meta.active_gid == activation.gid {
+					// DC-269: the repeat is done only for the certificate's own base
+					// and cut: other chunks, or another cut, fail closed and write
+					// nothing; an unconfirmed cut is written from the certificate.
+					if meta.active_chunks != activation.chunks {
+						return Err(Error::new(
+							ErrorKind::InvalidData,
+							format!(
+								"generation {} is installed with chunks other than its certificate's",
+								activation.gid
+							),
+						));
+					}
+					if settle_cut(&mut meta_table, meta.active_gid, activation.t)?
+						== CutConfirmation::Upgraded
+					{
+						drop(meta_table);
+						tx.commit().map_err(redb_to_io)?;
+					}
 					return Ok(Ok(()));
 				}
 				let matches = meta.staged.as_ref().is_some_and(|staged| {
@@ -1025,6 +1279,13 @@ impl PersistentLocalIndex {
 				meta_table
 					.insert(BASE_META_KEY, encode(&meta)?.as_slice())
 					.map_err(redb_to_io)?;
+				write_cut(
+					&mut meta_table,
+					InstalledCut {
+						gid: activation.gid,
+						t: activation.t,
+					},
+				)?;
 				drop(meta_table);
 				tx.commit().map_err(redb_to_io)?;
 				Ok(Ok(()))
@@ -1719,5 +1980,335 @@ mod tests {
 			.await
 			.unwrap()
 			.unwrap();
+	}
+
+	// ---- DC-269: the installed cut ----
+
+	fn cut_version(key: u8) -> OwnedVersion {
+		OwnedVersion {
+			table: TableObjectId::new([3; 16]),
+			key_identity: [key; 32],
+			hlc: HybridTimestamp {
+				physical_ms: 100 + u64::from(key),
+				logical: 0,
+				node_id: 1,
+			},
+			row_digest: [key; 32],
+		}
+	}
+
+	async fn try_begin(
+		index: &PersistentLocalIndex,
+		rsv: u64,
+		key: u8,
+	) -> Result<ParentIntentState, crate::storage::index::parent_intents::IntentRefusal> {
+		index
+			.begin_parent_intent(ParentIntent {
+				tenant: TENANT,
+				rsv,
+				ordinal: 0,
+				claim_digest: [rsv as u8; 32],
+				range_start: 0,
+				range_end: u64::MAX,
+				content: [9; 32],
+				manifest: vec![cut_version(key)],
+				state: ParentIntentState::Intent,
+			})
+			.await
+			.unwrap()
+	}
+
+	/// Refused at and below the cut, with nothing recorded; admitted above it.
+	async fn assert_cut(index: &PersistentLocalIndex, t: u64, key: u8, admit: u64) {
+		assert!(admit > t);
+		use crate::storage::index::parent_intents::IntentRefusal::ErasedByInstalledCut;
+		for rsv in [t - 1, t] {
+			assert_eq!(
+				try_begin(index, rsv, key).await,
+				Err(ErasedByInstalledCut),
+				"rsv {rsv}"
+			);
+			assert!(index.parent_intent(rsv, 0).await.unwrap().is_none());
+		}
+		assert_eq!(
+			index.version_owner(TENANT, cut_version(key)).await.unwrap(),
+			None
+		);
+		assert_eq!(
+			try_begin(index, admit, key).await,
+			Ok(ParentIntentState::Intent)
+		);
+		assert_eq!(
+			index.version_owner(TENANT, cut_version(key)).await.unwrap(),
+			Some((admit, 0))
+		);
+	}
+
+	/// DC-269: an activated generation installs its certificate's cut with the
+	/// base; an intent at or below it is refused, above it admitted; the cut
+	/// survives a real reopen; re-activating the same generation with another cut
+	/// fails closed.
+	#[tokio::test]
+	async fn an_activated_cut_refuses_erased_intents_across_a_reopen() {
+		let (dir, index) = open("installed-cut").await;
+		// Genesis has no cut: any reservation may begin.
+		assert_eq!(try_begin(&index, 3, 1).await, Ok(ParentIntentState::Intent));
+		activate(&index, 1, 0, 10, Vec::new()).await;
+		assert!(
+			index.parent_intent(3, 0).await.unwrap().is_none(),
+			"retired"
+		);
+		assert_cut(&index, 10, 2, 11).await;
+		let error = index
+			.activate_base(Activation {
+				gid: 1,
+				target_digest: [1; 32],
+				predecessor_gid: 0,
+				chunks: chunk_sums(std::iter::empty()),
+				t: 9,
+			})
+			.await
+			.err()
+			.expect("another cut for the installed generation fails closed");
+		assert_eq!(error.kind(), ErrorKind::InvalidData);
+		drop(index);
+		let index = PersistentLocalIndex::open(dir.join("index.redb"))
+			.await
+			.unwrap();
+		assert_cut(&index, 10, 3, 12).await;
+		// The next generation raises the cut.
+		activate(&index, 2, 1, 20, Vec::new()).await;
+		assert_cut(&index, 20, 4, 21).await;
+	}
+
+	/// DC-269: a recovered base is published with the trusted certificate's cut,
+	/// atomically; the repeat with the same cut is done, with another fails
+	/// closed; the cut survives a real reopen.
+	#[tokio::test]
+	async fn a_recovered_base_publishes_its_cut_across_a_reopen() {
+		let (dir, index) = open("recovered-cut").await;
+		let certificate = candidate(4, 3, &[]);
+		assert_eq!(
+			index
+				.stage_recovered_page(certificate.clone(), Vec::new())
+				.await
+				.unwrap(),
+			Ok(())
+		);
+		assert_eq!(
+			index
+				.publish_recovered(certificate.clone(), 7)
+				.await
+				.unwrap(),
+			Ok(())
+		);
+		assert_eq!(index.base_meta().await.unwrap().active_gid, 4);
+		assert_cut(&index, 7, 1, 8).await;
+		assert_eq!(
+			index
+				.publish_recovered(certificate.clone(), 7)
+				.await
+				.unwrap(),
+			Ok(())
+		);
+		let error = index.publish_recovered(certificate, 6).await.err().unwrap();
+		assert_eq!(error.kind(), ErrorKind::InvalidData);
+		drop(index);
+		let index = PersistentLocalIndex::open(dir.join("index.redb"))
+			.await
+			.unwrap();
+		assert_cut(&index, 7, 2, 9).await;
+	}
+
+	/// DC-269: the compatibility boundary. A base installed by an earlier build
+	/// has no cut: the store opens (its clean record and data are untouched), no
+	/// intent is admitted until the trusted certificate of the installed
+	/// generation and chunks confirms the cut, which is then written; other
+	/// chunks or another generation write nothing; a cut other than the
+	/// certificate's fails closed. A stale cut (an earlier generation's, left by an
+	/// earlier build's activation) is unconfirmed the same way.
+	#[tokio::test]
+	async fn an_unconfirmed_installed_cut_admits_nothing_until_its_certificate_confirms_it() {
+		use crate::storage::index::parent_intents::IntentRefusal::{
+			ErasedByInstalledCut, InstalledCutUnconfirmed,
+		};
+		let (dir, mut index) = open("cut-upgrade").await;
+		activate(&index, 1, 0, 5, Vec::new()).await;
+		activate(&index, 2, 1, 9, Vec::new()).await;
+		let chunks = index.base_meta().await.unwrap().active_chunks;
+		for (earlier, left) in [
+			("missing", None),
+			("stale", Some(InstalledCut { gid: 1, t: 5 })),
+		] {
+			index.set_installed_cut_for_test(left).await.unwrap();
+			drop(index);
+			// The earlier build's store opens.
+			let reopened = PersistentLocalIndex::open(dir.join("index.redb"))
+				.await
+				.unwrap();
+			assert_eq!(
+				reopened.installed_cut().await.unwrap(),
+				CutState::Unconfirmed,
+				"{earlier}"
+			);
+			for rsv in [3, 9, 50] {
+				assert_eq!(
+					try_begin(&reopened, rsv, 7).await,
+					Err(InstalledCutUnconfirmed),
+					"{earlier}: rsv {rsv}"
+				);
+				assert!(reopened.parent_intent(rsv, 0).await.unwrap().is_none());
+			}
+			assert_eq!(
+				reopened
+					.version_owner(TENANT, cut_version(7))
+					.await
+					.unwrap(),
+				None
+			);
+			// Another generation or other chunks write nothing.
+			assert_eq!(
+				reopened
+					.confirm_installed_cut(1, chunks.clone(), 5)
+					.await
+					.unwrap(),
+				CutConfirmation::NotInstalled
+			);
+			assert_eq!(
+				reopened
+					.confirm_installed_cut(2, chunk_sums(&[entry(1, 1, 0)]), 9)
+					.await
+					.unwrap(),
+				CutConfirmation::OtherBase
+			);
+			assert_eq!(
+				reopened.installed_cut().await.unwrap(),
+				CutState::Unconfirmed
+			);
+			// The trusted certificate of the installed generation writes it.
+			assert_eq!(
+				reopened
+					.confirm_installed_cut(2, chunks.clone(), 9)
+					.await
+					.unwrap(),
+				CutConfirmation::Upgraded,
+				"{earlier}"
+			);
+			assert_eq!(
+				reopened.installed_cut().await.unwrap(),
+				CutState::Current(InstalledCut { gid: 2, t: 9 })
+			);
+			assert_eq!(try_begin(&reopened, 9, 7).await, Err(ErasedByInstalledCut));
+			assert_eq!(
+				reopened
+					.confirm_installed_cut(2, chunks.clone(), 9)
+					.await
+					.unwrap(),
+				CutConfirmation::Confirmed
+			);
+			// The same generation and chunks with another t fail closed.
+			let error = reopened
+				.confirm_installed_cut(2, chunks.clone(), 8)
+				.await
+				.err()
+				.unwrap();
+			assert_eq!(error.kind(), ErrorKind::InvalidData, "{earlier}");
+			index = reopened;
+		}
+		// A cut for a later generation than the installed one is damage: every
+		// read of the base and every begin fail closed.
+		index
+			.set_installed_cut_for_test(Some(InstalledCut { gid: 3, t: 12 }))
+			.await
+			.unwrap();
+		assert_eq!(
+			index.base_meta().await.err().unwrap().kind(),
+			ErrorKind::InvalidData
+		);
+		assert_eq!(
+			index
+				.begin_parent_intent(ParentIntent {
+					tenant: TENANT,
+					rsv: 40,
+					ordinal: 0,
+					claim_digest: [40; 32],
+					range_start: 0,
+					range_end: u64::MAX,
+					content: [9; 32],
+					manifest: vec![cut_version(8)],
+					state: ParentIntentState::Intent,
+				})
+				.await
+				.err()
+				.unwrap()
+				.kind(),
+			ErrorKind::InvalidData
+		);
+		// Genesis has no cut and admits.
+		let (_genesis_dir, genesis) = open("cut-genesis").await;
+		assert_eq!(genesis.installed_cut().await.unwrap(), CutState::Genesis);
+		assert_eq!(
+			try_begin(&genesis, 1, 1).await,
+			Ok(ParentIntentState::Intent)
+		);
+	}
+
+	/// DC-269 r2: the same generation with other chunks is not the certificate's
+	/// base: the repeat activation fails closed, confirmation reports it, and
+	/// neither changes a row or backfills the cut.
+	#[tokio::test]
+	async fn the_same_generation_with_other_chunks_fails_closed_and_writes_nothing() {
+		let (_dir, index) = open("cut-other-chunks").await;
+		let entries = vec![entry(1, 5, 0)];
+		activate(&index, 1, 0, 6, entries.clone()).await;
+		index.set_installed_cut_for_test(None).await.unwrap();
+		let before = index.base_entries(false).await.unwrap();
+		let other = chunk_sums(&[entry(2, 5, 0)]);
+		let error = index
+			.activate_base(Activation {
+				gid: 1,
+				target_digest: [1; 32],
+				predecessor_gid: 0,
+				chunks: other.clone(),
+				t: 6,
+			})
+			.await
+			.err()
+			.expect("other chunks fail closed");
+		assert_eq!(error.kind(), ErrorKind::InvalidData);
+		assert_eq!(
+			index.confirm_installed_cut(1, other, 6).await.unwrap(),
+			CutConfirmation::OtherBase
+		);
+		assert_eq!(
+			index.base_entries(false).await.unwrap(),
+			before,
+			"rows unchanged"
+		);
+		assert_eq!(
+			index.base_meta().await.unwrap().active_chunks,
+			chunk_sums(&entries)
+		);
+		assert_eq!(
+			index.installed_cut().await.unwrap(),
+			CutState::Unconfirmed,
+			"no backfill"
+		);
+		// The repeat with the certificate's own chunks writes its cut.
+		index
+			.activate_base(Activation {
+				gid: 1,
+				target_digest: [1; 32],
+				predecessor_gid: 0,
+				chunks: chunk_sums(&entries),
+				t: 6,
+			})
+			.await
+			.unwrap()
+			.unwrap();
+		assert_eq!(
+			index.installed_cut().await.unwrap(),
+			CutState::Current(InstalledCut { gid: 1, t: 6 })
+		);
 	}
 }

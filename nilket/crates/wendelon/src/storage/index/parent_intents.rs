@@ -15,6 +15,7 @@
 // Reached through the S3b child-write pipeline, which S3c dispatches.
 #![cfg_attr(not(test), allow(dead_code))]
 
+use super::certified_base::CutState;
 use super::*;
 use serde::{Deserialize, Serialize};
 
@@ -94,6 +95,13 @@ pub enum IntentRefusal {
 	Missing,
 	/// The intent is not in a state that allows this transition.
 	WrongState,
+	/// DC-269: the parent was reserved at or before the installed certificate's
+	/// cut, which erased it: no intent may be begun for it.
+	ErasedByInstalledCut,
+	/// DC-269: a generation is installed without its confirmed cut (an earlier
+	/// build installed it): no intent is begun until a certificate-aware step
+	/// confirms it.
+	InstalledCutUnconfirmed,
 }
 
 fn intent_key(rsv: u64, ordinal: u16) -> [u8; 10] {
@@ -211,6 +219,16 @@ impl PersistentLocalIndex {
 			.run(move |db| {
 				let tx = db.begin_write().map_err(redb_to_io)?;
 				let key = intent_key(intent.rsv, intent.ordinal);
+				// DC-269: checked in the transaction that would record the intent and
+				// its owners, under the write lock activation and publication take.
+				match super::certified_base::admission_cut_in(&tx)? {
+					CutState::Genesis => {}
+					CutState::Current(cut) if intent.rsv > cut.t => {}
+					CutState::Current(_) => return Ok(Err(IntentRefusal::ErasedByInstalledCut)),
+					CutState::Unconfirmed => {
+						return Ok(Err(IntentRefusal::InstalledCutUnconfirmed));
+					}
+				}
 				{
 					let mut meta = tx.open_table(META_TABLE).map_err(redb_to_io)?;
 					meta.insert(META_PARENT_INTENTS_INITIALIZED, &1u64)
