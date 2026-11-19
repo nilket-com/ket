@@ -57,6 +57,17 @@ pub enum StorageError {
 		#[source]
 		source: wendelon_client::ClientError,
 	},
+	/// Wendelon ADR 0112: a delete refusal is reported as a delete.
+	#[error(
+		"table delete rejected: {} (0x{:04X})",
+		.reject_code.name(),
+		.reject_code.0
+	)]
+	TableDeleteRejected {
+		reject_code: PbcRejectCode,
+		#[source]
+		source: wendelon_client::ClientError,
+	},
 	#[error("invalid PBC program: {message}")]
 	InvalidPbcProgram { message: String },
 	#[error("storage permission denied")]
@@ -144,6 +155,10 @@ impl From<wendelon_client::ClientError> for StorageError {
 			ClientError::TableWriteRejected { reject_code } => Self::TableWriteRejected {
 				reject_code,
 				source: ClientError::TableWriteRejected { reject_code },
+			},
+			ClientError::TableDeleteRejected { reject_code } => Self::TableDeleteRejected {
+				reject_code,
+				source: ClientError::TableDeleteRejected { reject_code },
 			},
 			source @ ClientError::WriteFailed { .. }
 			| source @ ClientError::MutationStopped { .. }
@@ -421,6 +436,15 @@ mod tests {
 			} => assert_eq!(status, ReadStatus::RETENTION_EXPIRED),
 			other => panic!("unexpected storage error mapping: {other:?}"),
 		}
+
+		// Wendelon ADR 0112: a delete refusal is reported as a delete.
+		let err = StorageError::from(ClientError::TableDeleteRejected {
+			reject_code: PbcRejectCode::PBC_REJECT_BATCH_TOO_LARGE,
+		});
+		assert_eq!(
+			err.to_string(),
+			"table delete rejected: PBC_REJECT_BATCH_TOO_LARGE (0x3709)"
+		);
 
 		let err = StorageError::from(ClientError::TableWriteRejected {
 			reject_code: PbcRejectCode::PBC_REJECT_SCHEMA_STALE,

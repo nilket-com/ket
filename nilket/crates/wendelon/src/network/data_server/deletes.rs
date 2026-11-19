@@ -1,22 +1,27 @@
-//! ADR 0699 S4b: a single-row delete under ParentDecisions.
+//! ADR 0699 S4b, as wendelon ADR 0112 makes it: one delete statement under
+//! ParentDecisions is one parent decision.
 //!
-//! A delete names exactly one row id of a table whose locality is a function
-//! of the id alone. The holder of that id's position coordinates it. After the
-//! lookup, it evaluates the id at a cut K with the S4 reader: proved winner,
-//! proved tombstone or proved absence; an unproved copy is repaired or the
-//! answer is indeterminate. The selection is frozen in the record:
-//! - a live winner publishes one tombstone for the key at a new HLC strictly
-//!   above the winner's, as a one-child parent (select at K, publish at dec);
-//! - otherwise the coordinator signs a RecordNoop, which linearizes at K.
+//! A statement names 1 to 512 row ids of a table whose locality is a function
+//! of the id alone, in canonical (identity) order. After the lookup, a node that
+//! covers every requested position evaluates every row at ONE cut K with the S4
+//! reader: proved winner, proved tombstone or proved absence; an unproved copy
+//! is repaired or the whole statement is indeterminate. The selection is frozen
+//! in the record, and its signer is the holder of the lowest matched position
+//! (of the lowest requested one if nothing matched):
+//! - live winners publish one tombstone each at one new HLC strictly above
+//!   every selected winner, as the children of one parent (select at K, publish
+//!   at dec), so a reader sees all of them gone or none;
+//! - otherwise the signer records one RecordNoop, which linearizes at K.
 //!
-//! The tombstone suppresses every lower-HLC version of the key, including a
-//! concurrent write ordered below it; the counts describe the frozen selection.
+//! A tombstone suppresses every lower-HLC version of its key, including a
+//! concurrent write ordered below it; the counts describe the frozen selection
+//! at K, not that no other statement deleted the same rows (ADR 0699).
 
 use super::*;
 use crate::consensus::decisions::{
-	ChildClaim, Claim, DeleteOutcome, DeleteRequest, DeleteSelection, LineageRef, Lookup, NoopBody,
-	Operation, ParentKey, ParentNamespace, ParentStatus, Signer, delete_request_digest,
-	delete_row_locality, delete_row_position,
+	ChildClaim, Claim, DeleteOutcome, DeleteRequest, DeleteSelection, LineageRef, Lookup,
+	MAX_DELETE_ROWS, NoopBody, Operation, ParentKey, ParentNamespace, ParentStatus, Signer,
+	TombstoneTarget, delete_request_digest, delete_row_locality, delete_row_position,
 };
 use crate::network::decision_proposals::{
 	CutResponse, ForwardedDecision, LookupRequest, LookupResponse, ProposalOutcome,
@@ -37,14 +42,47 @@ pub(crate) fn tombstone_digest(table: TableObjectId, generation: u64, row: Ident
 	*hasher.finalize().as_bytes()
 }
 
-/// The one version a matched delete publishes.
-pub(crate) fn tombstone_version(request: &DeleteRequest, hlc: HybridTimestamp) -> OwnedVersion {
+/// The version a matched row's tombstone publishes.
+pub(crate) fn tombstone_version(target: &TombstoneTarget, hlc: HybridTimestamp) -> OwnedVersion {
 	OwnedVersion {
-		table: request.table,
-		key_identity: *request.row.as_bytes(),
+		table: target.table,
+		key_identity: *target.row.as_bytes(),
 		hlc,
-		row_digest: tombstone_digest(request.table, request.schema_generation, request.row),
+		row_digest: tombstone_digest(target.table, target.schema_generation, target.row),
 	}
+}
+
+/// Wendelon ADR 0112: one child's rows of a matched delete statement, derived
+/// from the recorded claim alone: the matched rows whose position lies in the
+/// child's range, in identity order. The coordinator builds a child's content
+/// from this and a holder checks its payload against it; `None` for a row with
+/// no position.
+pub(crate) fn child_rows(
+	tenant: TenantId,
+	descriptor: &TableSchemaDescriptor,
+	request: &DeleteRequest,
+	selection: &DeleteSelection,
+	child: &ChildClaim,
+) -> Option<Vec<Identity>> {
+	let mut rows = Vec::new();
+	for (row, _) in selection.matched(request) {
+		let position = delete_row_position(tenant, descriptor, row)?;
+		if child.range_start <= position && position <= child.range_end {
+			rows.push(row);
+		}
+	}
+	Some(rows)
+}
+
+/// The manifest of one child's tombstones at `hlc`, in identity order.
+pub(crate) fn child_manifest(
+	request: &DeleteRequest,
+	rows: &[Identity],
+	hlc: HybridTimestamp,
+) -> Vec<OwnedVersion> {
+	rows.iter()
+		.map(|row| tombstone_version(&request.target(*row), hlc))
+		.collect()
 }
 
 /// Whether a manifest version is a typed tombstone of this descriptor.
@@ -60,51 +98,60 @@ pub(crate) fn is_tombstone_version(
 		)
 }
 
-/// A delete child's payload: one row, the id.
-pub(crate) fn row_id_batch(row: Identity) -> std::io::Result<RecordBatch> {
+/// A delete child's payload: its row ids, in order.
+pub(crate) fn row_id_batch(rows: &[Identity]) -> std::io::Result<RecordBatch> {
 	let schema = Arc::new(arrow::datatypes::Schema::new(vec![
 		arrow::datatypes::Field::new(ROW_ID, arrow::datatypes::DataType::Binary, false),
 	]));
 	RecordBatch::try_new(
 		schema,
-		vec![Arc::new(arrow::array::BinaryArray::from(vec![
-			&row.as_bytes()[..],
-		]))],
+		vec![Arc::new(arrow::array::BinaryArray::from(
+			rows.iter()
+				.map(|row| &row.as_bytes()[..])
+				.collect::<Vec<_>>(),
+		))],
 	)
 	.map_err(|error| Error::new(ErrorKind::InvalidData, error))
 }
 
-/// The id a delete child's payload names.
-pub(crate) fn row_id_of(batch: &RecordBatch) -> Option<Identity> {
+/// The ids a delete child's payload names, in order: at least one, each valid.
+pub(crate) fn row_ids_of(batch: &RecordBatch) -> Option<Vec<Identity>> {
 	let column = batch
 		.column_by_name(ROW_ID)?
 		.as_any()
 		.downcast_ref::<arrow::array::BinaryArray>()?;
-	if batch.num_rows() != 1 || !column.is_valid(0) {
+	if batch.num_rows() == 0 {
 		return None;
 	}
-	let bytes: [u8; 32] = column.value(0).try_into().ok()?;
-	Some(Identity::new(bytes))
+	(0..batch.num_rows())
+		.map(|at| {
+			if !column.is_valid(at) {
+				return None;
+			}
+			let bytes: [u8; 32] = column.value(at).try_into().ok()?;
+			Some(Identity::new(bytes))
+		})
+		.collect()
 }
 
-/// Appends the tombstone of `request.row` at `hlc` through today's tombstone
+/// Appends the tombstone of `target.row` at `hlc` through today's tombstone
 /// packing and the child append path.
 pub(crate) async fn append_tombstone(
 	slab: &SlabManager,
 	tenant: TenantId,
 	descriptor: &TableSchemaDescriptor,
-	request: &DeleteRequest,
+	target: &TombstoneTarget,
 	hlc: HybridTimestamp,
 	secondary_indexes: &[SecondaryIndexDescriptor],
 ) -> std::io::Result<()> {
 	let invalid = |why: &str| Error::new(ErrorKind::InvalidData, why.to_owned());
-	let routing_locality = delete_row_locality(tenant, descriptor, request.row)
+	let routing_locality = delete_row_locality(tenant, descriptor, target.row)
 		.ok_or_else(|| invalid("an unsupported delete shape"))?;
 	let partition =
 		crate::storage::multirow::write_partition_for_row(descriptor, routing_locality)?;
 	let rows = [crate::storage::multirow::MultiRowSourceRow {
 		source_row_index: 0,
-		key_identity: request.row,
+		key_identity: target.row,
 		routing_locality,
 		row_hlc: hlc,
 		is_tombstone: true,
@@ -138,7 +185,8 @@ enum DeleteSettled {
 	Committed {
 		dec: u64,
 		commit_hlc: HybridTimestamp,
-		outcome: DeleteOutcome,
+		/// (deleted, already deleted, not found) of the frozen selection.
+		counts: [u32; 3],
 	},
 	KnownNotCommitted,
 	Redirect(NodeId),
@@ -149,13 +197,38 @@ enum DeleteSettled {
 }
 
 impl WendelonDataServer {
-	/// A single-row delete of a ParentDecisions node.
+	/// A delete statement of a ParentDecisions node (wendelon ADR 0112).
 	pub(super) async fn coordinate_table_delete(
 		&self,
 		meta: TableDeleteRowsRequestMeta,
 		row_key_ids: Vec<Identity>,
 	) -> TableDeleteRowsResponseMeta {
 		let settled = self.coordinate_delete(&meta, &row_key_ids).await;
+		self.delete_answer(&meta, settled)
+	}
+
+	/// Wendelon ADR 0112: the answer to a statement whose DECLARED count is over
+	/// the bound, given before its Arrow payload is decoded: typed, no effect, and
+	/// no identity bound.
+	pub(super) fn delete_statement_too_large(
+		&self,
+		meta: &TableDeleteRowsRequestMeta,
+	) -> TableDeleteRowsResponseMeta {
+		self.delete_answer(
+			meta,
+			DeleteSettled::Refused(
+				WriteStatus::PAYLOAD_TOO_LARGE,
+				PbcRejectCode::PBC_REJECT_BATCH_TOO_LARGE,
+			),
+		)
+	}
+
+	/// The answer a settled delete statement gives.
+	fn delete_answer(
+		&self,
+		meta: &TableDeleteRowsRequestMeta,
+		settled: DeleteSettled,
+	) -> TableDeleteRowsResponseMeta {
 		let stop = if matches!(settled, DeleteSettled::Deadline) {
 			MutationStopReason::DEADLINE
 		} else {
@@ -165,23 +238,16 @@ impl WendelonDataServer {
 			DeleteSettled::Committed {
 				dec,
 				commit_hlc,
-				outcome,
-			} => {
-				let counts = match outcome {
-					DeleteOutcome::Deleted { .. } => [1, 0, 0],
-					DeleteOutcome::AlreadyDeleted { .. } => [0, 1, 0],
-					DeleteOutcome::NotFound => [0, 0, 1],
-				};
-				(
-					WriteStatus::OK,
-					MutationCommitKnowledge::COMMITTED,
-					dec,
-					commit_hlc,
-					self.local_node,
-					counts,
-					PbcRejectCode::NONE,
-				)
-			}
+				counts,
+			} => (
+				WriteStatus::OK,
+				MutationCommitKnowledge::COMMITTED,
+				dec,
+				commit_hlc,
+				self.local_node,
+				counts,
+				PbcRejectCode::NONE,
+			),
 			DeleteSettled::KnownNotCommitted => (
 				WriteStatus::WRITE_REFUSED,
 				MutationCommitKnowledge::KNOWN_NOT_COMMITTED,
@@ -256,12 +322,22 @@ impl WendelonDataServer {
 		// spends it.
 		let deadline = caller_deadline_from_remaining_millis(meta.deadline_remaining_millis);
 		let expired = || deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline);
-		// Exactly one id in this checkpoint.
-		let [row] = row_key_ids else {
+		// Wendelon ADR 0112: the statement's shape, checked before any lookup. A
+		// shape refusal binds nothing to the identity.
+		if row_key_ids.is_empty() || row_key_ids.len() != meta.row_count as usize {
 			return unsupported(PbcRejectCode::PBC_REJECT_ROW_COUNT_MISMATCH);
-		};
-		if meta.row_count != 1 {
-			return unsupported(PbcRejectCode::PBC_REJECT_ROW_COUNT_MISMATCH);
+		}
+		if row_key_ids.len() > MAX_DELETE_ROWS {
+			return DeleteSettled::Refused(
+				WriteStatus::PAYLOAD_TOO_LARGE,
+				PbcRejectCode::PBC_REJECT_BATCH_TOO_LARGE,
+			);
+		}
+		// Canonical at ingress: identity order, no duplicate.
+		let mut rows = row_key_ids.to_vec();
+		rows.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+		if rows.windows(2).any(|pair| pair[0] == pair[1]) {
+			return unsupported(PbcRejectCode::PBC_REJECT_DUPLICATE_PK_IN_BATCH);
 		}
 		let (Some(proposals), Some(signer)) = (
 			self.decisions.proposals.clone(),
@@ -271,11 +347,6 @@ impl WendelonDataServer {
 		};
 		let (tenant, table, generation) =
 			(meta.tenant_id, meta.table_object_id, meta.schema_generation);
-		let request = DeleteRequest {
-			table,
-			schema_generation: generation,
-			row: *row,
-		};
 		let Some(descriptor) = self
 			.state_machine
 			.read_state(move |state| state.table_schemas.get(tenant, table, generation).cloned())
@@ -283,8 +354,17 @@ impl WendelonDataServer {
 		else {
 			return unsupported(PbcRejectCode::NONE);
 		};
-		let Some(position) = delete_row_position(tenant, &descriptor, *row) else {
+		let Some(positions) = rows
+			.iter()
+			.map(|row| delete_row_position(tenant, &descriptor, *row))
+			.collect::<Option<Vec<u64>>>()
+		else {
 			return unsupported(PbcRejectCode::PBC_REJECT_LOCALITY_UNSUPPORTED);
+		};
+		let request = DeleteRequest {
+			table,
+			schema_generation: generation,
+			rows,
 		};
 		let key = ParentKey {
 			tenant,
@@ -295,6 +375,7 @@ impl WendelonDataServer {
 		let digest = delete_request_digest(tenant, &request);
 		let mut proposed = false;
 		let (claim, rsv) = loop {
+			// Recorded decisions replay before any coverage is required.
 			let lookup = proposals
 				.lookup(LookupRequest {
 					key,
@@ -307,11 +388,11 @@ impl WendelonDataServer {
 					return DeleteSettled::Committed {
 						dec: record.dec,
 						commit_hlc: meta.client_hlc,
-						outcome: record.body.selection.outcome,
+						counts: record.body.selection.counts(),
 					};
 				}
 				LookupResponse::Found(Lookup::Recorded { record }) => {
-					let Operation::Delete { selection, .. } = record.claim.operation else {
+					let Operation::Delete { selection, .. } = &record.claim.operation else {
 						return DeleteSettled::Refused(
 							WriteStatus::WRITE_KEY_CONFLICT,
 							PbcRejectCode::NONE,
@@ -322,26 +403,32 @@ impl WendelonDataServer {
 							return DeleteSettled::Committed {
 								dec,
 								commit_hlc: record.claim.commit_hlc,
-								outcome: selection.outcome,
+								counts: selection.counts(),
 							};
 						}
 						ParentStatus::Refused { .. } => return DeleteSettled::KnownNotCommitted,
 						ParentStatus::Noop { .. } => return stalled,
 						ParentStatus::Reserved => {
 							// Only the recorded coordinator drives it (S3c rule).
-							let only = &record.claim.children[0];
-							if only.holder.node != signer.signer.node {
+							let Some(coordinating) = record
+								.claim
+								.children
+								.get(usize::from(record.claim.coordinator))
+							else {
+								return stalled;
+							};
+							let (lineage, holder) = (coordinating.lineage, coordinating.holder);
+							if holder.node != signer.signer.node {
 								// ADR 0729: only while its recorded lineage is open
 								// and leased; otherwise a stall.
 								return match self
-									.route_for_recorded_coordinator(only.lineage, only.holder)
+									.route_for_recorded_coordinator(lineage, holder)
 									.await
 								{
 									Some(route) => DeleteSettled::Redirect(route),
 									None => stalled,
 								};
 							}
-							let (lineage, holder) = (only.lineage, only.holder);
 							let open = self
 								.state_machine
 								.read_state(move |state| {
@@ -358,110 +445,75 @@ impl WendelonDataServer {
 					}
 				}
 				LookupResponse::Found(Lookup::Absent { eligible: true }) if !proposed => {
-					// Only the holder of the row's position coordinates.
-					let holder = self
-						.state_machine
-						.read_state(move |state| {
-							state
-								.decisions
-								.as_ref()?
-								.lineages()
-								.range(..=position)
-								.next_back()
-								.filter(|(_, lineage)| position <= lineage.range_end)
-								.map(|(start, lineage)| (*start, *lineage))
-						})
-						.await;
-					let Some((lineage_start, lineage)) = holder else {
-						return stalled;
-					};
-					if lineage.holder.id != signer.signer.node
-						|| lineage.incarnation != signer.signer.incarnation
+					let proposal = match self
+						.select_and_route(
+							meta,
+							&signer.signer,
+							&descriptor,
+							&request,
+							&positions,
+							deadline,
+						)
+						.await
 					{
-						// ADR 0729: the holder of this row's range, only while that
-						// range is leased; re-read, since the lineage may have moved.
-						return match self.route_for_position(position).await {
-							Some(route) if route.id != signer.signer.node => {
-								DeleteSettled::Redirect(route)
-							}
-							_ => stalled,
-						};
-					}
-					// The one evaluation both a tombstone and a noop come from.
-					let selection = match bounded(
-						deadline,
-						self.evaluate_delete(tenant, &descriptor, *row, position),
-					)
-					.await
-					{
-						Some(Ok(selection)) => selection,
-						Some(Err(())) => return stalled,
-						None => return DeleteSettled::Deadline,
+						Routed::Propose(build) => build,
+						Routed::Settled(settled) => return settled,
 					};
 					// No fresh proposal from an evaluation that outlived its deadline.
 					if expired() {
 						return DeleteSettled::Deadline;
 					}
-					let lineage_ref = LineageRef {
-						range_start: lineage_start,
-						generation: lineage.generation,
-					};
-					let proposal = match selection.outcome {
-						DeleteOutcome::Deleted { winner_hlc, .. } => {
-							// ADR 0729: and above the lineage's floor.
-							let Some(commit_hlc) = tombstone_hlc(
-								&self.hlc,
-								winner_hlc,
-								super::coordinator::above_floor(meta.client_hlc, lineage.floor_ms),
-							) else {
-								return stalled;
-							};
-							let plan = self
-								.state_machine
-								.read_state(move |state| point_plan(state, tenant, position))
-								.await;
-							let Some(plan) = plan else {
-								return stalled;
-							};
-							let version = tombstone_version(&request, commit_hlc);
-							let claim = Claim {
+					let proposal = match proposal {
+						Proposed::Noop {
+							selection,
+							position,
+							lineage,
+						} => ForwardedDecision::RecordNoop {
+							noop: crate::consensus::decisions::evidence::sign(
+								&signer.key,
+								NoopBody {
+									key,
+									request_digest: digest,
+									request: request.clone(),
+									selection,
+									position,
+									coordinator: signer.signer,
+									lineage,
+								},
+								signer.signer,
+							),
+						},
+						Proposed::Claim {
+							selection,
+							commit_hlc,
+							children,
+						} => {
+							let mut claim = Claim {
 								key,
 								request_digest: digest,
 								commit_hlc,
 								coordinator: 0,
-								first_row_position: position,
-								children: vec![ChildClaim {
-									range_start: position,
-									range_end: position,
-									lineage: lineage_ref,
-									holder: signer.signer,
-									plan,
-									rows: 1,
-									content: super::child_writes::manifest_content(&[version]),
-								}],
-								operation: Operation::Delete { request, selection },
+								first_row_position: children[0].range_start,
+								children,
+								operation: Operation::Delete {
+									request: request.clone(),
+									selection,
+								},
 							};
+							// Each child's rows and content, from the claim as recorded.
+							let Some(contents) = claim_child_contents(tenant, &descriptor, &claim)
+							else {
+								return stalled;
+							};
+							for (child, (rows, content)) in claim.children.iter_mut().zip(contents)
+							{
+								child.rows = rows;
+								child.content = content;
+							}
 							ForwardedDecision::Reserve {
 								claim: crate::consensus::decisions::evidence::sign(
 									&signer.key,
 									claim,
-									signer.signer,
-								),
-							}
-						}
-						DeleteOutcome::AlreadyDeleted { .. } | DeleteOutcome::NotFound => {
-							ForwardedDecision::RecordNoop {
-								noop: crate::consensus::decisions::evidence::sign(
-									&signer.key,
-									NoopBody {
-										key,
-										request_digest: digest,
-										request,
-										selection,
-										position,
-										coordinator: signer.signer,
-										lineage: lineage_ref,
-									},
 									signer.signer,
 								),
 							}
@@ -492,14 +544,35 @@ impl WendelonDataServer {
 				_ => return stalled,
 			}
 		};
-		// Publish the tombstone child, then Finalize.
-		let Ok(batch) = row_id_batch(*row) else {
+		// Publish the tombstone children, re-derived from the recorded claim and
+		// never re-evaluated, then Finalize.
+		let Operation::Delete {
+			request: recorded,
+			selection,
+		} = &claim.operation
+		else {
 			return stalled;
 		};
+		let mut batch_rows = Vec::new();
+		let mut indices = Vec::with_capacity(claim.children.len());
+		for child in &claim.children {
+			let Some(rows) = child_rows(tenant, &descriptor, recorded, selection, child) else {
+				return stalled;
+			};
+			indices.push(
+				(batch_rows.len() as u32..(batch_rows.len() + rows.len()) as u32)
+					.collect::<Vec<u32>>(),
+			);
+			batch_rows.extend(rows);
+		}
+		let Ok(batch) = row_id_batch(&batch_rows) else {
+			return stalled;
+		};
+		let counts = selection.counts();
 		// Locked persistence runs in its own task and finishes if this ends.
 		let Some(acks) = bounded(
 			deadline,
-			self.write_children(&claim, rsv, &descriptor, &batch, &[vec![0]]),
+			self.write_children(&claim, rsv, &descriptor, &batch, &indices),
 		)
 		.await
 		else {
@@ -529,16 +602,11 @@ impl WendelonDataServer {
 						..
 					}),
 				..
-			} => {
-				let Operation::Delete { selection, .. } = claim.operation else {
-					return stalled;
-				};
-				DeleteSettled::Committed {
-					dec,
-					commit_hlc: claim.commit_hlc,
-					outcome: selection.outcome,
-				}
-			}
+			} => DeleteSettled::Committed {
+				dec,
+				commit_hlc: claim.commit_hlc,
+				counts,
+			},
 			ProposalResponse::Applied {
 				outcome:
 					ProposalOutcome::Decision(crate::consensus::decisions::DecisionResult::Terminal {
@@ -551,16 +619,172 @@ impl WendelonDataServer {
 		}
 	}
 
-	/// The delete's evaluation at a fresh cut: the S4 reader's proved winner of
-	/// the row (repaired if this store lacks it), a proved tombstone, or proved
-	/// absence over the complete inventory. Anything unproved is an error,
-	/// never NotFound.
+	/// Wendelon ADR 0112 D2, for an unrecorded identity: the one eligibility
+	/// predicate, the same at every entry. From one placement view, the fallback
+	/// holder F holds the lowest requested position; a request F does not cover
+	/// (F is not in the replica plan of every requested position) is unsupported
+	/// before any evaluation. A node that covers the request evaluates it at one
+	/// cut; one that does not sends it to F. After selection the signer S holds the lowest
+	/// matched position (F if none matched): S proposes, another node sends it to
+	/// S if S covers it. Anything else is unsupported, typed, with no proposal.
+	/// A placement change during the evaluation stalls, never proposes.
+	async fn select_and_route(
+		&self,
+		meta: &TableDeleteRowsRequestMeta,
+		local: &Signer,
+		descriptor: &TableSchemaDescriptor,
+		request: &DeleteRequest,
+		positions: &[u64],
+		deadline: Option<std::time::Instant>,
+	) -> Routed {
+		let stalled = Routed::Settled(DeleteSettled::Indeterminate(WriteStatus::WRITE_STALLED));
+		let unsupported = Routed::Settled(DeleteSettled::Refused(
+			WriteStatus::INTERNAL_ERROR,
+			PbcRejectCode::PBC_REJECT_LOCALITY_UNSUPPORTED,
+		));
+		let tenant = meta.tenant_id;
+		let view = {
+			let positions = positions.to_vec();
+			self.state_machine
+				.read_state(move |state| Placement::of(state, tenant, &positions))
+				.await
+		};
+		let Some(view) = view else {
+			return stalled;
+		};
+		let fallback = view.lowest(0..positions.len());
+		// The fallback holder's coverage first, whatever the entry: a statement F
+		// cannot serve is unsupported at every node, before any evaluation.
+		let holder = view.placed[fallback].holder();
+		if !view.covers(&holder) {
+			return unsupported;
+		}
+		// An entry that does not cover the request sends it to F, which does.
+		if !view.covers(local) {
+			return self.redirect_to(positions[fallback]).await;
+		}
+		// The one evaluation both the tombstones and a noop come from.
+		let selection = match bounded(
+			deadline,
+			self.evaluate_delete(tenant, descriptor, &request.rows, positions),
+		)
+		.await
+		{
+			Some(Ok(selection)) => selection,
+			Some(Err(())) => return stalled,
+			None => return Routed::Settled(DeleteSettled::Deadline),
+		};
+		// One coherent view: the placement the evaluation ran under.
+		let again = {
+			let positions = positions.to_vec();
+			self.state_machine
+				.read_state(move |state| Placement::of(state, tenant, &positions))
+				.await
+		};
+		if again.as_ref() != Some(&view) {
+			return stalled;
+		}
+		let matched: Vec<usize> = (0..positions.len())
+			.filter(|at| matches!(selection.outcomes[*at], DeleteOutcome::Deleted { .. }))
+			.collect();
+		let signing = if matched.is_empty() {
+			fallback
+		} else {
+			view.lowest(matched.iter().copied())
+		};
+		let holder = view.placed[signing].holder();
+		if holder != *local {
+			if holder.node != local.node && view.covers(&holder) {
+				return self.redirect_to(positions[signing]).await;
+			}
+			return if holder.node == local.node {
+				stalled
+			} else {
+				unsupported
+			};
+		}
+		if matched.is_empty() {
+			let placed = &view.placed[fallback];
+			return Routed::Propose(Proposed::Noop {
+				selection,
+				position: positions[fallback],
+				lineage: placed.lineage_ref(),
+			});
+		}
+		// The children: runs of matched positions, contiguous in placement order,
+		// inside one lineage, with one replica plan throughout.
+		let mut order = matched;
+		order.sort_unstable_by_key(|at| positions[*at]);
+		let mut children: Vec<(usize, usize)> = Vec::new();
+		for at in order {
+			match children.last_mut() {
+				Some((_, last)) if view.same_child(*last, at) => *last = at,
+				_ => children.push((at, at)),
+			}
+		}
+		if children.len() > crate::consensus::decisions::MAX_CHILDREN {
+			return Routed::Settled(DeleteSettled::Refused(
+				WriteStatus::PAYLOAD_TOO_LARGE,
+				PbcRejectCode::PBC_REJECT_BATCH_TOO_LARGE,
+			));
+		}
+		// ADR 0729: above every child lineage's floor, and strictly above every
+		// selected winner.
+		let floor_ms = children
+			.iter()
+			.map(|(first, _)| view.placed[*first].lineage.floor_ms)
+			.max()
+			.unwrap_or(0);
+		let Some(winner) = selection.max_deleted_winner() else {
+			return stalled;
+		};
+		let Some(commit_hlc) = tombstone_hlc(
+			&self.hlc,
+			winner,
+			super::coordinator::above_floor(meta.client_hlc, floor_ms),
+		) else {
+			return stalled;
+		};
+		let children = children
+			.into_iter()
+			.map(|(first, last)| {
+				let placed = &view.placed[first];
+				ChildClaim {
+					range_start: positions[first],
+					range_end: positions[last],
+					lineage: placed.lineage_ref(),
+					holder: placed.holder(),
+					plan: placed.plan.clone(),
+					rows: 0,
+					content: [0; 32],
+				}
+			})
+			.collect::<Vec<_>>();
+		Routed::Propose(Proposed::Claim {
+			selection,
+			commit_hlc,
+			children,
+		})
+	}
+
+	/// A redirect to the holder of `position`, only while its range is leased.
+	async fn redirect_to(&self, position: u64) -> Routed {
+		Routed::Settled(match self.route_for_position(position).await {
+			Some(route) if route.id != self.local_node.id => DeleteSettled::Redirect(route),
+			_ => DeleteSettled::Indeterminate(WriteStatus::WRITE_STALLED),
+		})
+	}
+
+	/// The statement's evaluation at one fresh cut: for each row, the S4
+	/// reader's proved winner (repaired if this store lacks it), a proved
+	/// tombstone, or proved absence over the complete inventory. Any unproved
+	/// row makes the whole statement an error, never NotFound.
 	async fn evaluate_delete(
 		&self,
 		tenant: TenantId,
 		descriptor: &TableSchemaDescriptor,
-		row: Identity,
-		position: u64,
+		rows: &[Identity],
+		positions: &[u64],
 	) -> Result<DeleteSelection, ()> {
 		let proposals = self.decisions.proposals.clone().ok_or(())?;
 		let CutResponse::Cut(k) = proposals.cut().await else {
@@ -574,12 +798,171 @@ impl WendelonDataServer {
 		self.decisions
 			.pause_at(super::child_writes::PauseStage::DeleteEvaluation)
 			.await;
-		let outcome = self
-			.proved_point(tenant, descriptor, row, position, k)
-			.await
-			.map_err(|_| ())?;
-		Ok(DeleteSelection { cut: k, outcome })
+		let mut outcomes = Vec::with_capacity(rows.len());
+		for (row, position) in rows.iter().zip(positions) {
+			outcomes.push(
+				self.proved_point(tenant, descriptor, *row, *position, k)
+					.await
+					.map_err(|_| ())?,
+			);
+		}
+		Ok(DeleteSelection { cut: k, outcomes })
 	}
+}
+
+/// Where the routing rule ended for a fresh statement.
+enum Routed {
+	Propose(Proposed),
+	Settled(DeleteSettled),
+}
+
+/// What this node, as the statement's signer, proposes.
+enum Proposed {
+	Noop {
+		selection: DeleteSelection,
+		position: u64,
+		lineage: LineageRef,
+	},
+	/// The children's rows and contents are filled from the claim itself.
+	Claim {
+		selection: DeleteSelection,
+		commit_hlc: HybridTimestamp,
+		children: Vec<ChildClaim>,
+	},
+}
+
+/// One requested position's placement: its lineage and its ring segment's
+/// replica plan, each member at its current incarnation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Placed {
+	position: u64,
+	lineage_start: u64,
+	lineage: crate::consensus::decisions::Lineage,
+	segment: usize,
+	plan: Vec<Signer>,
+}
+
+impl Placed {
+	fn holder(&self) -> Signer {
+		Signer {
+			node: self.lineage.holder.id,
+			incarnation: self.lineage.incarnation,
+		}
+	}
+
+	fn lineage_ref(&self) -> LineageRef {
+		LineageRef {
+			range_start: self.lineage_start,
+			generation: self.lineage.generation,
+		}
+	}
+}
+
+/// One coherent placement view of a statement: each requested position's
+/// placement, and every ring segment's replica set (for grouping across
+/// segments).
+#[derive(Debug, PartialEq, Eq)]
+struct Placement {
+	placed: Vec<Placed>,
+	segments: Vec<Vec<u32>>,
+}
+
+impl Placement {
+	fn of(state: &SmState, tenant: TenantId, positions: &[u64]) -> Option<Self> {
+		let (_, config) = state.epoch_history.last_key_value()?;
+		let record = state.tenants.get(&tenant)?;
+		let ring = crate::network::ring::RingState::build(
+			&crate::network::ring::membership_from_epoch_config(config),
+			record.replication_factor as usize,
+		);
+		let all = ring.replica_segments();
+		let lineages = state.decisions.as_ref()?.lineages();
+		let mut placed = Vec::with_capacity(positions.len());
+		for position in positions {
+			let segment = all
+				.iter()
+				.position(|segment| segment.start <= *position && *position <= segment.end)?;
+			let (lineage_start, lineage) = lineages
+				.range(..=*position)
+				.next_back()
+				.filter(|(_, lineage)| *position <= lineage.range_end)
+				.map(|(start, lineage)| (*start, *lineage))?;
+			let plan = all[segment]
+				.replicas
+				.iter()
+				.map(|node| {
+					state
+						.incarnations
+						.get(&node.id)
+						.and_then(|registry| registry.current)
+						.map(|incarnation| Signer {
+							node: node.id,
+							incarnation,
+						})
+				})
+				.collect::<Option<Vec<_>>>()?;
+			placed.push(Placed {
+				position: *position,
+				lineage_start,
+				lineage,
+				segment,
+				plan,
+			});
+		}
+		let segments = all
+			.iter()
+			.map(|segment| segment.replicas.iter().map(|node| node.id).collect())
+			.collect();
+		Some(Self { placed, segments })
+	}
+
+	/// Whether `node` is in the replica plan of every requested position.
+	fn covers(&self, node: &Signer) -> bool {
+		self.placed.iter().all(|placed| placed.plan.contains(node))
+	}
+
+	/// The index, among `at`, of the lowest position.
+	fn lowest(&self, at: impl Iterator<Item = usize>) -> usize {
+		at.min_by_key(|at| self.placed[*at].position)
+			.expect("a statement names a row")
+	}
+
+	/// Whether matched positions `a` then `b` (b next in placement order) fall in
+	/// one child: one lineage, and one replica set over every segment between.
+	fn same_child(&self, a: usize, b: usize) -> bool {
+		let (a, b) = (&self.placed[a], &self.placed[b]);
+		a.lineage_start == b.lineage_start
+			&& a.plan == b.plan
+			&& a.segment <= b.segment
+			&& self.segments[a.segment..=b.segment]
+				.iter()
+				.all(|replicas| *replicas == self.segments[a.segment])
+	}
+}
+
+/// The row count and content of each child of a matched delete claim, from the
+/// claim alone. `None` when a row has no position.
+fn claim_child_contents(
+	tenant: TenantId,
+	descriptor: &TableSchemaDescriptor,
+	claim: &Claim,
+) -> Option<Vec<(u32, [u8; 32])>> {
+	let Operation::Delete { request, selection } = &claim.operation else {
+		return None;
+	};
+	claim
+		.children
+		.iter()
+		.map(|child| {
+			let rows = child_rows(tenant, descriptor, request, selection, child)?;
+			let content = super::child_writes::manifest_content(&child_manifest(
+				request,
+				&rows,
+				claim.commit_hlc,
+			));
+			Some((rows.len() as u32, content))
+		})
+		.collect()
 }
 
 /// `work`, unless the caller's deadline passes first (`None`).
@@ -663,35 +1046,6 @@ mod tests {
 		assert_eq!(bounded(Some(open), async { 7 }).await, Some(7));
 		assert_eq!(bounded(None, async { 7 }).await, Some(7));
 	}
-}
-
-/// The replica plan of the segment holding `position`, holder first, each at
-/// its current incarnation.
-fn point_plan(state: &SmState, tenant: TenantId, position: u64) -> Option<Vec<Signer>> {
-	let (_, config) = state.epoch_history.last_key_value()?;
-	let record = state.tenants.get(&tenant)?;
-	let ring = crate::network::ring::RingState::build(
-		&crate::network::ring::membership_from_epoch_config(config),
-		record.replication_factor as usize,
-	);
-	let segment = ring
-		.replica_segments()
-		.into_iter()
-		.find(|segment| segment.start <= position && position <= segment.end)?;
-	segment
-		.replicas
-		.iter()
-		.map(|node| {
-			state
-				.incarnations
-				.get(&node.id)
-				.and_then(|registry| registry.current)
-				.map(|incarnation| Signer {
-					node: node.id,
-					incarnation,
-				})
-		})
-		.collect()
 }
 
 #[cfg(test)]

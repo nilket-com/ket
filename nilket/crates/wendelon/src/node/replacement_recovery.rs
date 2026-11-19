@@ -905,7 +905,7 @@ impl RecoveryDriver {
 			std::collections::BTreeMap::new();
 		for entry in entries {
 			if entry.tombstone {
-				let delete = crate::consensus::decisions::DeleteRequest {
+				let delete = crate::consensus::decisions::TombstoneTarget {
 					table: descriptor.table_object_id,
 					schema_generation: descriptor.schema_generation,
 					row: crate::schema::Identity::new(entry.key_identity),

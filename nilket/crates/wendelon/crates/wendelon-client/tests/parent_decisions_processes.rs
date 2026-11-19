@@ -2066,6 +2066,120 @@ async fn three_daemons_from_configuration_files_form_a_parent_decisions_cluster_
 		.await;
 	}
 
+	// Wendelon ADR 0112: ONE delete statement of three written rows and one never written,
+	// served on the daemons' own worker stacks: one receipt, exact counts, and the row of
+	// the first stage stays.
+	let mut doomed = Vec::new();
+	for id in [201_i64, 202, 203] {
+		let bound = step(deadline);
+		let written = one_row(id, "doomed");
+		doomed.extend(
+			wendelon::schema::table_row_identities(TenantId::new(TENANT), &descriptor, &written)
+				.expect("the row's identity"),
+		);
+		tokio::time::timeout(
+			bound,
+			client.table_write(
+				TenantId::new(TENANT),
+				&descriptor,
+				written,
+				WriteOptions {
+					deadline: Some(Instant::now() + bound),
+					..WriteOptions::default()
+				},
+			),
+		)
+		.await
+		.unwrap_or_else(|_| panic!("the write of row {id} had no answer within its bound"))
+		.unwrap_or_else(|error| panic!("the write of row {id}: {error:?}"));
+	}
+	doomed.extend(
+		wendelon::schema::table_row_identities(
+			TenantId::new(TENANT),
+			&descriptor,
+			&one_row(299, "never"),
+		)
+		.expect("the absent row's identity"),
+	);
+	let bound = step(deadline);
+	let receipt = tokio::time::timeout(
+		bound,
+		client.table_delete(
+			TenantId::new(TENANT),
+			&descriptor,
+			doomed,
+			WriteOptions {
+				deadline: Some(Instant::now() + bound),
+				..WriteOptions::default()
+			},
+		),
+	)
+	.await
+	.expect("the delete statement had no answer within its bound")
+	.unwrap_or_else(|error| panic!("the delete statement: {error:?}"));
+	assert_eq!(
+		(
+			receipt.deleted_count,
+			receipt.already_deleted_count,
+			receipt.not_found_count
+		),
+		(3, 0, 1),
+		"one statement's counts: {receipt:?}"
+	);
+	for member in &members {
+		let through = client_through(member, &pki, Credential::Storage, deadline).await;
+		expect_the_row(
+			&through,
+			&descriptor,
+			deadline,
+			&format!("after the delete statement, through node {}", member.id),
+		)
+		.await;
+	}
+	// Over the bound: the public client's 513-row statement is refused typed (batch too
+	// large) from its declared count, and the first stage's row, among the 513, stays.
+	let oversized: Vec<_> = (7_i64..520)
+		.flat_map(|id| {
+			wendelon::schema::table_row_identities(
+				TenantId::new(TENANT),
+				&descriptor,
+				&one_row(id, "x"),
+			)
+			.expect("an identity")
+		})
+		.collect();
+	assert_eq!(oversized.len(), 513);
+	let bound = step(deadline);
+	let refused = tokio::time::timeout(
+		bound,
+		client.table_delete(
+			TenantId::new(TENANT),
+			&descriptor,
+			oversized,
+			WriteOptions {
+				deadline: Some(Instant::now() + bound),
+				..WriteOptions::default()
+			},
+		),
+	)
+	.await
+	.expect("the oversized statement had no answer within its bound");
+	assert!(
+		matches!(
+			refused,
+			Err(ClientError::TableDeleteRejected { reject_code })
+				if reject_code == wendelon::schema::PbcRejectCode::PBC_REJECT_BATCH_TOO_LARGE
+		),
+		"a typed refusal: {refused:?}"
+	);
+	expect_the_row(
+		&client,
+		&descriptor,
+		deadline,
+		"after the oversized statement",
+	)
+	.await;
+
 	// ADR 0729: a range's coordinating node is stopped, and a write to that range commits.
 	// The control leader as the running nodes name it now.
 	let inspection = inspect(&members[0], &pki);

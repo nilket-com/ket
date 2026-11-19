@@ -254,21 +254,117 @@ pub enum Operation {
 	},
 }
 
-/// A delete of exactly one row id (ADR 0699 S4b).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// The most row ids one delete statement names (wendelon ADR 0112). A larger
+/// statement is refused whole, never split.
+pub const MAX_DELETE_ROWS: usize = 512;
+
+/// One delete statement (wendelon ADR 0112): 1 to [`MAX_DELETE_ROWS`] row ids,
+/// in canonical order (strictly increasing identity bytes, so no duplicate).
+/// Arrival order is not part of it; the set is.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeleteRequest {
+	pub table: TableObjectId,
+	pub schema_generation: u64,
+	/// Bounded at decode: a longer sequence is refused before it is allocated.
+	#[serde(deserialize_with = "deserialize_delete_rows")]
+	pub rows: Vec<Identity>,
+}
+
+impl DeleteRequest {
+	/// Whether the rows are a canonical statement: 1 to [`MAX_DELETE_ROWS`],
+	/// strictly increasing.
+	pub fn is_canonical(&self) -> bool {
+		(1..=MAX_DELETE_ROWS).contains(&self.rows.len())
+			&& self
+				.rows
+				.windows(2)
+				.all(|pair| pair[0].as_bytes() < pair[1].as_bytes())
+	}
+
+	/// The tombstone target of one of the statement's rows.
+	pub fn target(&self, row: Identity) -> TombstoneTarget {
+		TombstoneTarget {
+			table: self.table,
+			schema_generation: self.schema_generation,
+			row,
+		}
+	}
+}
+
+/// Wendelon ADR 0112: a delete statement's rows, at most [`MAX_DELETE_ROWS`] at
+/// decode. Canonical order and alignment are the reducer's checks.
+fn deserialize_delete_rows<'de, D: serde::Deserializer<'de>>(
+	deserializer: D,
+) -> Result<Vec<Identity>, D::Error> {
+	crate::consensus::core::deserialize_bounded_seq(deserializer, MAX_DELETE_ROWS)
+}
+
+/// A selection's outcomes, at most [`MAX_DELETE_ROWS`] at decode.
+fn deserialize_delete_outcomes<'de, D: serde::Deserializer<'de>>(
+	deserializer: D,
+) -> Result<Vec<DeleteOutcome>, D::Error> {
+	crate::consensus::core::deserialize_bounded_seq(deserializer, MAX_DELETE_ROWS)
+}
+
+/// One row's tombstone: what a delete child publishes per matched row, and what
+/// repair and recovery rebuild.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TombstoneTarget {
 	pub table: TableObjectId,
 	pub schema_generation: u64,
 	pub row: Identity,
 }
 
-/// The delete's selection at its cut, frozen in the record. It is the
-/// coordinator's attested evaluation: the reducer checks its structure, not
-/// the absence or presence it reports.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// The delete's selection at its ONE cut, frozen in the record: one outcome per
+/// requested row, aligned with [`DeleteRequest::rows`]. It is the coordinator's
+/// attested evaluation: the reducer checks its structure, not the absence or
+/// presence it reports.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeleteSelection {
 	pub cut: u64,
-	pub outcome: DeleteOutcome,
+	/// Bounded at decode, as the rows are.
+	#[serde(deserialize_with = "deserialize_delete_outcomes")]
+	pub outcomes: Vec<DeleteOutcome>,
+}
+
+impl DeleteSelection {
+	/// The rows the statement publishes a tombstone for: those whose winner at
+	/// the cut was live, in the request's (identity) order.
+	pub fn matched<'a>(
+		&'a self,
+		request: &'a DeleteRequest,
+	) -> impl Iterator<Item = (Identity, DeleteOutcome)> + 'a {
+		request
+			.rows
+			.iter()
+			.copied()
+			.zip(self.outcomes.iter().copied())
+			.filter(|(_, outcome)| matches!(outcome, DeleteOutcome::Deleted { .. }))
+	}
+
+	/// (deleted, already deleted, not found).
+	pub fn counts(&self) -> [u32; 3] {
+		let mut counts = [0u32; 3];
+		for outcome in &self.outcomes {
+			counts[match outcome {
+				DeleteOutcome::Deleted { .. } => 0,
+				DeleteOutcome::AlreadyDeleted { .. } => 1,
+				DeleteOutcome::NotFound => 2,
+			}] += 1;
+		}
+		counts
+	}
+
+	/// The highest HLC among the live winners the statement deletes.
+	pub fn max_deleted_winner(&self) -> Option<HybridTimestamp> {
+		self.outcomes
+			.iter()
+			.filter_map(|outcome| match outcome {
+				DeleteOutcome::Deleted { winner_hlc, .. } => Some(*winner_hlc),
+				_ => None,
+			})
+			.max()
+	}
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -287,8 +383,9 @@ pub enum DeleteOutcome {
 	NotFound,
 }
 
-/// A delete that published nothing, recorded terminal (RecordNoop). Signed by
-/// the coordinator: the holder of the row's position.
+/// A delete statement that published nothing, recorded terminal (RecordNoop).
+/// Signed by the coordinator: the holder of the statement's lowest requested
+/// position, which is `position`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NoopBody {
 	pub key: ParentKey,
@@ -308,14 +405,18 @@ pub struct NoopRecord {
 	pub bytes: u64,
 }
 
-/// The request digest of a single-row delete: fixed-width fields under its own
-/// derivation domain.
+/// The request digest of a delete statement (wendelon ADR 0112): its count and
+/// every row, in canonical order, under its own derivation domain. Equal for any
+/// arrival order of one set; different for any other set.
 pub fn delete_request_digest(tenant: TenantId, request: &DeleteRequest) -> [u8; 32] {
-	let mut hasher = blake3::Hasher::new_derive_key("wendelon delete request v1");
+	let mut hasher = blake3::Hasher::new_derive_key("wendelon delete request v2");
 	hasher.update(&tenant.get().to_le_bytes());
 	hasher.update(request.table.as_bytes());
 	hasher.update(&request.schema_generation.to_le_bytes());
-	hasher.update(request.row.as_bytes());
+	hasher.update(&(request.rows.len() as u64).to_le_bytes());
+	for row in &request.rows {
+		hasher.update(row.as_bytes());
+	}
 	*hasher.finalize().as_bytes()
 }
 
@@ -1196,7 +1297,14 @@ impl DecisionState {
 				|| noop.body.selection.cut >= *dec
 				|| self.bodies.contains_key(dec)
 				|| postcard::to_stdvec(&noop.body).map(|bytes| bytes.len() as u64) != Ok(noop.bytes)
-				|| matches!(noop.body.selection.outcome, DeleteOutcome::Deleted { .. })
+				|| !noop.body.request.is_canonical()
+				|| noop.body.selection.outcomes.len() != noop.body.request.rows.len()
+				|| noop
+					.body
+					.selection
+					.outcomes
+					.iter()
+					.any(|outcome| matches!(outcome, DeleteOutcome::Deleted { .. }))
 			{
 				return Err("decisions: a noop's coordinates, size or outcome are invalid".into());
 			}
@@ -2587,16 +2695,20 @@ fn fresh_clock(
 	Ok(clock_ms)
 }
 
-/// The table a delete names, checked as a matched delete and a RecordNoop
-/// both require: the namespace is that table, the tenant writes, the table is
-/// admitting at the request's generation with a supported shape. Returns the
-/// row's position.
+/// The table a delete statement names, checked as a matched delete and a
+/// RecordNoop both require: a canonical statement (wendelon ADR 0112), the
+/// namespace is that table, the tenant writes, the table is admitting at the
+/// request's generation with a supported shape. Returns every row's position,
+/// aligned with the request's rows.
 fn delete_target(
 	state: &SmState,
 	key: &ParentKey,
 	request: &DeleteRequest,
-) -> Result<u64, DecisionRefusal> {
+) -> Result<Vec<u64>, DecisionRefusal> {
 	use DecisionRefusal::*;
+	if !request.is_canonical() {
+		return Err(MalformedClaim);
+	}
 	if key.namespace != ParentNamespace::Table(request.table)
 		|| request.table == crate::schema::TableObjectId::DEFAULT_KV
 	{
@@ -2613,7 +2725,11 @@ fn delete_target(
 		.table_schemas
 		.get(key.tenant, request.table, request.schema_generation)
 		.ok_or(TableUnavailable)?;
-	delete_row_position(key.tenant, descriptor, request.row).ok_or(MalformedClaim)
+	request
+		.rows
+		.iter()
+		.map(|row| delete_row_position(key.tenant, descriptor, *row).ok_or(MalformedClaim))
+		.collect()
 }
 
 /// ADR 0699 S4b: records a delete that published nothing. Lookup first, so the
@@ -2636,13 +2752,23 @@ fn record_noop(
 	let verified = evidence::verify(decisions, signed)?;
 	let noop = verified.body();
 	let clock_ms = fresh_clock(decisions, &noop.key, stamp_ms)?;
-	if matches!(noop.selection.outcome, DeleteOutcome::Deleted { .. })
+	if noop.selection.outcomes.len() != noop.request.rows.len()
+		|| noop
+			.selection
+			.outcomes
+			.iter()
+			.any(|outcome| matches!(outcome, DeleteOutcome::Deleted { .. }))
 		|| noop.selection.cut >= log_index
 		|| noop.request_digest != delete_request_digest(noop.key.tenant, &noop.request)
 	{
 		return Err(MalformedClaim);
 	}
-	let position = delete_target(state, &noop.key, &noop.request)?;
+	// Wendelon ADR 0112: the signer holds the statement's lowest requested
+	// position.
+	let position = delete_target(state, &noop.key, &noop.request)?
+		.into_iter()
+		.min()
+		.ok_or(MalformedClaim)?;
 	if position != noop.position {
 		return Err(MalformedClaim);
 	}
@@ -2660,6 +2786,10 @@ fn record_noop(
 	let bytes = postcard::to_stdvec(noop)
 		.map(|bytes| bytes.len() as u64)
 		.map_err(|_| MalformedClaim)?;
+	// Wendelon ADR 0112: a noop is bounded as a claim is.
+	if bytes > MAX_CLAIM_BYTES {
+		return Err(MalformedClaim);
+	}
 	let retained = decisions
 		.retained_claim_bytes
 		.checked_add(bytes)
@@ -2758,24 +2888,50 @@ fn validate_claim(
 		}
 	}
 
-	// ADR 0699 S4b: a matched delete publishes one tombstone at the row's
-	// position, above the version it selected.
+	// Wendelon ADR 0112 (after ADR 0699 S4b): a matched delete statement publishes
+	// one tombstone per row whose winner at the cut was live, above every winner
+	// it selected. Its children partition exactly those rows: each matched
+	// position lies in one child, a child's range runs from its lowest to its
+	// highest matched position and its row count is theirs, and the coordinator
+	// child holds the lowest matched position.
 	if let Operation::Delete { request, selection } = &claim.operation {
-		let DeleteOutcome::Deleted { winner_hlc, .. } = selection.outcome else {
-			return Err(MalformedClaim);
-		};
-		let position = delete_target(state, &claim.key, request)?;
-		let only = &children[0];
-		if children.len() != 1
-			|| claim.coordinator != 0
-			|| only.rows != 1
-			|| only.range_start != position
-			|| only.range_end != position
-			|| claim.first_row_position != position
-			|| claim.commit_hlc <= winner_hlc
+		let positions = delete_target(state, &claim.key, request)?;
+		if selection.outcomes.len() != positions.len()
 			|| claim.request_digest != delete_request_digest(claim.key.tenant, request)
 		{
 			return Err(MalformedClaim);
+		}
+		let matched: Vec<u64> = positions
+			.iter()
+			.zip(&selection.outcomes)
+			.filter(|(_, outcome)| matches!(outcome, DeleteOutcome::Deleted { .. }))
+			.map(|(position, _)| *position)
+			.collect();
+		let Some(max_winner) = selection.max_deleted_winner() else {
+			return Err(MalformedClaim);
+		};
+		if claim.commit_hlc <= max_winner
+			|| matched.iter().min() != Some(&claim.first_row_position)
+			|| claim.coordinator_child().map(|child| child.range_start)
+				!= Some(claim.first_row_position)
+		{
+			return Err(MalformedClaim);
+		}
+		let mut per_child: Vec<(u32, u64, u64)> = vec![(0, u64::MAX, 0); children.len()];
+		for position in &matched {
+			let at = children
+				.iter()
+				.position(|child| child.range_start <= *position && *position <= child.range_end)
+				.ok_or(MalformedClaim)?;
+			let (count, low, high) = &mut per_child[at];
+			*count += 1;
+			*low = (*low).min(*position);
+			*high = (*high).max(*position);
+		}
+		for (child, (count, low, high)) in children.iter().zip(per_child) {
+			if child.rows != count || child.range_start != low || child.range_end != high {
+				return Err(MalformedClaim);
+			}
 		}
 	}
 

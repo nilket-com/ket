@@ -224,13 +224,20 @@ impl WendelonDataServer {
 				})
 				.ok_or_else(|| ChildRefusal::Unverified("no complete intent to serve".into()))?;
 			verify_owned_rows(&slab, &index, &intent, &descriptor).await?;
-			// ADR 0699 S4b: a delete child's payload is its row id; its typed
-			// tombstone was just verified.
-			if let [version] = intent.manifest.as_slice()
-				&& super::deletes::is_tombstone_version(&descriptor, version)
+			// ADR 0699 S4b, wendelon ADR 0112: a delete child's payload is its row ids,
+			// in manifest (identity) order; its typed tombstones were just verified.
+			if !intent.manifest.is_empty()
+				&& intent
+					.manifest
+					.iter()
+					.all(|version| super::deletes::is_tombstone_version(&descriptor, version))
 			{
-				let batch = super::deletes::row_id_batch(Identity::new(version.key_identity))
-					.map_err(storage)?;
+				let rows: Vec<Identity> = intent
+					.manifest
+					.iter()
+					.map(|version| Identity::new(version.key_identity))
+					.collect();
+				let batch = super::deletes::row_id_batch(&rows).map_err(storage)?;
 				return crate::storage::multirow::encode_batch(&batch).map_err(storage);
 			}
 			let mut rows = Vec::with_capacity(intent.manifest.len());

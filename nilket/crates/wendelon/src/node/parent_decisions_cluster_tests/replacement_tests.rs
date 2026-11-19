@@ -1260,7 +1260,7 @@ async fn a_promoted_replacement_stores_and_reopens_a_recovered_base() {
 		logical: 2,
 		..row_hlc
 	};
-	let delete = crate::consensus::decisions::DeleteRequest {
+	let delete = crate::consensus::decisions::TombstoneTarget {
 		table: descriptor.table_object_id,
 		schema_generation: descriptor.schema_generation,
 		row: crate::schema::Identity::new(gone.key_identity),

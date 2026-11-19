@@ -219,6 +219,11 @@ async fn a_new_mode_store_writes_its_own_format_and_reopens() {
 
 use crate::consensus::decisions::tests as fixture;
 
+const PARENT_DECISIONS_V29_MANIFEST: &str =
+	include_str!("../../../tests/fixtures/consensus_body/parent_decisions_v29.txt");
+/// Wendelon ADR 0108 to ADR 0111's format-28 bodies, retained. Wendelon ADR 0112
+/// moved none (the corpus pinned no delete) and added a delete statement's claim
+/// and noop.
 const PARENT_DECISIONS_V28_MANIFEST: &str =
 	include_str!("../../../tests/fixtures/consensus_body/parent_decisions_v28.txt");
 /// Wendelon ADR 0106's format-27 bodies, retained. Wendelon ADR 0108 moved three
@@ -285,7 +290,7 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 fn manifest() -> BTreeMap<String, String> {
-	parse(PARENT_DECISIONS_V28_MANIFEST)
+	parse(PARENT_DECISIONS_V29_MANIFEST)
 }
 
 /// ADR 0725: the three owner-signed operation kinds pinned in the format-18
@@ -454,7 +459,7 @@ fn entry(index: u64, request: WendelonRequest) -> Entry<WendelonTypeConfig> {
 }
 
 #[test]
-fn the_format_28_bodies_match_their_goldens_and_round_trip() {
+fn the_format_29_bodies_match_their_goldens_and_round_trip() {
 	let stored = manifest();
 	let state = golden_state();
 	let body = encode_state_body(DecisionMode::ParentDecisions, &state).unwrap();
@@ -668,6 +673,11 @@ fn the_format_28_bodies_match_their_goldens_and_round_trip() {
 			.unwrap(),
 		),
 	));
+	// Wendelon ADR 0112: a delete statement of three rows (two matched, in two
+	// children; one already deleted) and a noop of two rows.
+	for (name, bytes) in golden_delete_statement() {
+		actual.push((name.to_owned(), hex(&bytes)));
+	}
 	let moved: Vec<String> = actual
 		.iter()
 		.filter(|(name, hex)| stored.get(name) != Some(hex))
@@ -675,7 +685,7 @@ fn the_format_28_bodies_match_their_goldens_and_round_trip() {
 		.collect();
 	assert!(
 		moved.is_empty(),
-		"format-28 bodies moved or are missing; expected lines:\n{}",
+		"format-29 bodies moved or are missing; expected lines:\n{}",
 		moved.join("\n")
 	);
 	assert_eq!(stored.len(), actual.len());
@@ -689,6 +699,17 @@ fn the_format_28_bodies_match_their_goldens_and_round_trip() {
 	// only the decision state differs from the format-16 corpus: by exactly the
 	// appended seal.
 	assert!(decisions.sealed().is_some());
+	// Wendelon ADR 0112: against the format-28 corpus no body moved; a delete
+	// statement's claim and noop were added.
+	const ADDED_0112: [&str; 2] = ["delete_statement_claim", "delete_statement_noop"];
+	let retained_v28 = parse(PARENT_DECISIONS_V28_MANIFEST);
+	assert_eq!(stored.len(), retained_v28.len() + ADDED_0112.len());
+	for (name, hex) in &retained_v28 {
+		assert_eq!(stored.get(name), Some(hex), "{name}");
+	}
+	for name in ADDED_0112 {
+		assert!(stored.contains_key(name), "{name}");
+	}
 	// Wendelon ADR 0108: against the format-27 corpus three bodies moved (the
 	// decision state gained the index receipts, the lease batch's grants carry
 	// the holder's store, the promoted replacement record gained its
@@ -700,12 +721,12 @@ fn the_format_28_bodies_match_their_goldens_and_round_trip() {
 		"promoted_replacement",
 	];
 	let retained_v27 = parse(PARENT_DECISIONS_V27_MANIFEST);
-	assert_eq!(stored.len(), retained_v27.len() + 3);
+	assert_eq!(retained_v28.len(), retained_v27.len() + 3);
 	for (name, hex) in &retained_v27 {
 		if MOVED_0108.contains(&name.as_str()) {
-			assert_ne!(stored.get(name), Some(hex), "{name}");
+			assert_ne!(retained_v28.get(name), Some(hex), "{name}");
 		} else {
-			assert_eq!(stored.get(name), Some(hex), "{name}");
+			assert_eq!(retained_v28.get(name), Some(hex), "{name}");
 		}
 	}
 	// Wendelon ADR 0106: against the format-26 corpus one body moved (the
@@ -1566,4 +1587,117 @@ async fn an_unrecorded_instance_stops_replay_and_live_apply_and_changes_nothing(
 		assert_eq!(after.last_membership, state.last_membership);
 		assert!(!ready(&after, index));
 	}
+}
+
+/// Wendelon ADR 0112: the delete statement bodies pinned in the format-29
+/// corpus: a matched claim of three rows in two children, and a noop of two.
+fn golden_delete_statement() -> [(&'static str, Vec<u8>); 2] {
+	use crate::consensus::decisions::{
+		ChildClaim, Claim, DeleteOutcome, DeleteRequest, DeleteSelection, LineageRef, NoopBody,
+		Operation, ParentKey, ParentNamespace, Signer,
+	};
+	use crate::schema::{HybridTimestamp, Identity, TableObjectId, TenantId};
+	let hlc = |ms: u64| HybridTimestamp {
+		physical_ms: ms,
+		logical: 1,
+		node_id: 2,
+	};
+	let signer = |node: u32| Signer {
+		node,
+		incarnation: crate::consensus::StoreIncarnation::from_raw(0x0112_0000 + u128::from(node)),
+	};
+	let table = TableObjectId::new([0x12; 16]);
+	let key = ParentKey {
+		tenant: TenantId::ZERO,
+		namespace: ParentNamespace::Table(table),
+		client_uuid: [0x01; 16],
+		sequence_no: 112,
+	};
+	let request = DeleteRequest {
+		table,
+		schema_generation: 3,
+		rows: vec![
+			Identity::new([0x10; 32]),
+			Identity::new([0x20; 32]),
+			Identity::new([0x30; 32]),
+		],
+	};
+	let child = |start: u64, holder: u32| ChildClaim {
+		range_start: start,
+		range_end: start,
+		lineage: LineageRef {
+			range_start: start - 7,
+			generation: 4,
+		},
+		holder: signer(holder),
+		plan: vec![
+			signer(holder),
+			signer(holder % 3 + 1),
+			signer((holder + 1) % 3 + 1),
+		],
+		rows: 1,
+		content: [holder as u8; 32],
+	};
+	let claim = Claim {
+		key,
+		request_digest: [0x0c; 32],
+		commit_hlc: hlc(1_700_000_000_112),
+		coordinator: 0,
+		first_row_position: 1_000,
+		children: vec![child(1_000, 1), child(9_000, 2)],
+		operation: Operation::Delete {
+			request: request.clone(),
+			selection: DeleteSelection {
+				cut: 111,
+				outcomes: vec![
+					DeleteOutcome::Deleted {
+						winner_rsv: 50,
+						winner_hlc: hlc(1_700_000_000_050),
+					},
+					DeleteOutcome::AlreadyDeleted {
+						winner_rsv: 60,
+						winner_hlc: hlc(1_700_000_000_060),
+					},
+					DeleteOutcome::Deleted {
+						winner_rsv: 70,
+						winner_hlc: hlc(1_700_000_000_070),
+					},
+				],
+			},
+		},
+	};
+	let noop = NoopBody {
+		key: ParentKey {
+			sequence_no: 113,
+			..key
+		},
+		request_digest: [0x0d; 32],
+		request: DeleteRequest {
+			rows: request.rows[..2].to_vec(),
+			..request
+		},
+		selection: DeleteSelection {
+			cut: 112,
+			outcomes: vec![
+				DeleteOutcome::NotFound,
+				DeleteOutcome::AlreadyDeleted {
+					winner_rsv: 60,
+					winner_hlc: hlc(1_700_000_000_060),
+				},
+			],
+		},
+		position: 1_000,
+		coordinator: signer(1),
+		lineage: LineageRef {
+			range_start: 993,
+			generation: 4,
+		},
+	};
+	[
+		(
+			"delete_statement_claim",
+			postcard::to_stdvec(&claim).unwrap(),
+		),
+		("delete_statement_noop", postcard::to_stdvec(&noop).unwrap()),
+	]
 }

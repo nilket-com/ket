@@ -276,7 +276,20 @@ impl WendelonDataServer {
 		actor: &ActorIdentity,
 		frame: HrftFrame,
 	) -> std::io::Result<HrftFrame> {
-		let (meta, row_key_ids) = self.decode_table_delete_request_frame(&frame)?;
+		let meta = self.decode_table_delete_meta(&frame)?;
+		// Wendelon ADR 0112: under ParentDecisions a statement over the bound is
+		// refused, typed, from its declared count, before its Arrow payload is
+		// decoded or any row id is materialized. Today keeps its own limits.
+		if self.parent_decisions()
+			&& meta.row_count as usize > crate::consensus::decisions::MAX_DELETE_ROWS
+		{
+			self.emit_table_delete_requested_audit(actor, &meta, 0)?;
+			let resp = self.delete_statement_too_large(&meta);
+			let resp = self.finalize_table_delete_attempt(meta, resp).await?;
+			self.emit_table_delete_completion_audit(actor, &meta, &resp, 0)?;
+			return Ok(self.build_table_delete_response_frame(frame.header.stream_id, resp, None));
+		}
+		let row_key_ids = self.decode_table_delete_rows(&meta, &frame)?;
 		let distinct_target_count = row_key_ids.iter().copied().collect::<HashSet<_>>().len();
 		let span = tracing::info_span!(
 			"data_ring.table_delete.request",

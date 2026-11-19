@@ -2012,7 +2012,7 @@ fn delete_request(n: u8) -> DeleteRequest {
 	DeleteRequest {
 		table: TABLE,
 		schema_generation: 1,
-		row: row(n),
+		rows: vec![row(n)],
 	}
 }
 
@@ -2035,10 +2035,10 @@ fn delete_claim(state: &SmState, sequence_no: u64, n: u8, winner_ms: u64) -> Cla
 			request,
 			selection: DeleteSelection {
 				cut: peek_index() - 1,
-				outcome: DeleteOutcome::Deleted {
+				outcomes: vec![DeleteOutcome::Deleted {
 					winner_rsv: 1,
 					winner_hlc: hts(winner_ms),
-				},
+				}],
 			},
 		},
 	}
@@ -2053,7 +2053,7 @@ pub(crate) fn noop_body(state: &SmState, sequence_no: u64, n: u8) -> NoopBody {
 		request,
 		selection: DeleteSelection {
 			cut: peek_index() - 1,
-			outcome: DeleteOutcome::NotFound,
+			outcomes: vec![DeleteOutcome::NotFound],
 		},
 		position: position_of(n),
 		coordinator: child.holder,
@@ -2130,7 +2130,7 @@ fn a_matched_delete_publishes_one_tombstone_strictly_above_its_winner() {
 	wrong_digest.request_digest = [7; 32];
 	let mut not_found = delete_claim(&state, 1, 1, T0 - 1);
 	if let Operation::Delete { selection, .. } = &mut not_found.operation {
-		selection.outcome = DeleteOutcome::NotFound;
+		selection.outcomes = vec![DeleteOutcome::NotFound];
 	}
 	let mut future_cut = delete_claim(&state, 1, 1, T0 - 1);
 	if let Operation::Delete { selection, .. } = &mut future_cut.operation {
@@ -2250,10 +2250,10 @@ fn a_noop_is_refused_without_its_structure_or_its_coordinators_authority() {
 	grant_all(&mut state);
 	let before = decisions(&state).clone();
 	let mut deleted = noop_body(&state, 1, 1);
-	deleted.selection.outcome = DeleteOutcome::Deleted {
+	deleted.selection.outcomes = vec![DeleteOutcome::Deleted {
 		winner_rsv: 1,
 		winner_hlc: hts(T0 - 1),
-	};
+	}];
 	let mut future_cut = noop_body(&state, 1, 1);
 	future_cut.selection.cut = u64::MAX;
 	let mut moved = noop_body(&state, 1, 1);
@@ -5926,4 +5926,412 @@ fn a_recorded_recovery_does_not_report_for_its_store() {
 		decide(&mut state, DecisionCommand::CommitGeneration { gid: 1 }),
 		DecisionResult::GenerationCommitted { .. }
 	));
+}
+
+// ============================================================
+//  Wendelon ADR 0112: one delete statement, one parent
+// ============================================================
+
+/// Row bytes `n` whose positions lie in `count` distinct lineages, in identity
+/// order (`row(n)` is `[n; 32]`, so increasing `n` is canonical).
+fn rows_in_distinct_lineages(state: &SmState, count: usize) -> Vec<u8> {
+	let mut seen = std::collections::BTreeSet::new();
+	let mut found = Vec::new();
+	for n in 1..=u8::MAX {
+		let lineage = point_child(state, position_of(n)).lineage.range_start;
+		if seen.insert(lineage) {
+			found.push(n);
+			if found.len() == count {
+				return found;
+			}
+		}
+	}
+	panic!("the fixture has fewer than {count} lineages");
+}
+
+fn deleted(winner_ms: u64) -> DeleteOutcome {
+	DeleteOutcome::Deleted {
+		winner_rsv: 1,
+		winner_hlc: hts(winner_ms),
+	}
+}
+
+fn already(winner_ms: u64) -> DeleteOutcome {
+	DeleteOutcome::AlreadyDeleted {
+		winner_rsv: 1,
+		winner_hlc: hts(winner_ms),
+	}
+}
+
+/// A delete statement of rows `ns` with `outcomes`: one point child per matched
+/// row (each in its own lineage), ordered by position, the lowest coordinating.
+fn statement_claim(
+	state: &SmState,
+	sequence_no: u64,
+	ns: &[u8],
+	outcomes: Vec<DeleteOutcome>,
+) -> Claim {
+	let request = DeleteRequest {
+		table: TABLE,
+		schema_generation: 1,
+		rows: ns.iter().map(|n| row(*n)).collect(),
+	};
+	let mut matched: Vec<u64> = ns
+		.iter()
+		.zip(&outcomes)
+		.filter(|(_, outcome)| matches!(outcome, DeleteOutcome::Deleted { .. }))
+		.map(|(n, _)| position_of(*n))
+		.collect();
+	matched.sort_unstable();
+	let children: Vec<ChildClaim> = matched.iter().map(|p| point_child(state, *p)).collect();
+	Claim {
+		key: key(T0, sequence_no),
+		request_digest: delete_request_digest(TENANT, &request),
+		commit_hlc: hts(T0),
+		coordinator: 0,
+		first_row_position: matched.first().copied().unwrap_or(0),
+		children,
+		operation: Operation::Delete {
+			request,
+			selection: DeleteSelection {
+				cut: peek_index() - 1,
+				outcomes,
+			},
+		},
+	}
+}
+
+fn set_rows(claim: &mut Claim, rows: Vec<Identity>) {
+	if let Operation::Delete { request, .. } = &mut claim.operation {
+		request.rows = rows;
+		claim.request_digest = delete_request_digest(TENANT, request);
+	}
+}
+
+fn set_outcomes(claim: &mut Claim, outcomes: Vec<DeleteOutcome>) {
+	if let Operation::Delete { selection, .. } = &mut claim.operation {
+		selection.outcomes = outcomes;
+	}
+}
+
+#[test]
+fn a_delete_statement_is_one_parent_whose_children_are_exactly_its_matched_rows() {
+	let mut state = base(3);
+	grant_all(&mut state);
+	let ns = rows_in_distinct_lineages(&state, 3);
+	let before = decisions(&state).clone();
+	let outcomes = vec![deleted(T0 - 3), already(T0 - 2), deleted(T0 - 1)];
+	let good_claim = statement_claim(&state, 1, &ns, outcomes.clone());
+	let good = || good_claim.clone();
+
+	let mut reversed = good();
+	set_rows(&mut reversed, ns.iter().rev().map(|n| row(*n)).collect());
+	let mut duplicate = good();
+	set_rows(&mut duplicate, vec![row(ns[0]), row(ns[0]), row(ns[2])]);
+	let mut empty = good();
+	set_rows(&mut empty, Vec::new());
+	set_outcomes(&mut empty, Vec::new());
+	let mut too_many = good();
+	set_rows(
+		&mut too_many,
+		(0..=MAX_DELETE_ROWS as u16)
+			.map(|i| {
+				let mut bytes = [0u8; 32];
+				bytes[..2].copy_from_slice(&i.to_be_bytes());
+				Identity::new(bytes)
+			})
+			.collect(),
+	);
+	set_outcomes(
+		&mut too_many,
+		vec![DeleteOutcome::NotFound; MAX_DELETE_ROWS + 1],
+	);
+	let mut misaligned = good();
+	set_outcomes(&mut misaligned, outcomes[..2].to_vec());
+	let mut uncovered = good();
+	uncovered.children.pop();
+	let mut unmatched_child = good();
+	set_outcomes(
+		&mut unmatched_child,
+		vec![
+			deleted(T0 - 3),
+			DeleteOutcome::NotFound,
+			DeleteOutcome::NotFound,
+		],
+	);
+	let mut wrong_count = good();
+	wrong_count.children[0].rows = 2;
+	let mut wide = good();
+	wide.children[0].range_end += 1;
+	let mut not_lowest = good();
+	not_lowest.first_row_position = not_lowest.children[1].range_start;
+	let mut other_coordinator = good();
+	other_coordinator.coordinator = 1;
+	let mut below_a_winner = good();
+	set_outcomes(
+		&mut below_a_winner,
+		vec![deleted(T0 - 3), already(T0 - 2), deleted(T0)],
+	);
+	let mut nothing_matched = good();
+	set_outcomes(&mut nothing_matched, vec![DeleteOutcome::NotFound; 3]);
+	for (label, claim) in [
+		("rows not in identity order", reversed),
+		("a duplicate row", duplicate),
+		("no row", empty),
+		("more than 512 rows", too_many),
+		("outcomes not aligned", misaligned),
+		("a matched row in no child", uncovered),
+		("a child with no matched row", unmatched_child),
+		("a child's row count", wrong_count),
+		("a child wider than its rows", wide),
+		("first row not the lowest matched", not_lowest),
+		("the coordinator not the lowest child", other_coordinator),
+		("commit not above every winner", below_a_winner),
+		("a reserve that publishes nothing", nothing_matched),
+	] {
+		assert_eq!(
+			reserve(&mut state, &claim, T0),
+			refused(DecisionRefusal::MalformedClaim),
+			"{label}"
+		);
+	}
+	assert_eq!(decisions(&state), &before);
+	assert!(matches!(
+		reserve(&mut state, &good(), T0),
+		DecisionResult::Reserved { .. }
+	));
+	// The same set under the same key is the same record; another set conflicts.
+	let mut other = good();
+	set_rows(&mut other, vec![row(ns[0]), row(ns[2])]);
+	set_outcomes(&mut other, vec![deleted(T0 - 3), deleted(T0 - 1)]);
+	assert_eq!(
+		reserve(&mut state, &other, T0),
+		refused(DecisionRefusal::Conflict)
+	);
+	decisions(&state).validate().unwrap();
+}
+
+#[test]
+fn a_delete_statement_noop_is_signed_at_its_lowest_requested_position() {
+	let mut state = base(3);
+	grant_all(&mut state);
+	let ns = rows_in_distinct_lineages(&state, 3);
+	let lowest = ns.iter().copied().min_by_key(|n| position_of(*n)).unwrap();
+	let body = |state: &SmState| {
+		let request = DeleteRequest {
+			table: TABLE,
+			schema_generation: 1,
+			rows: ns.iter().map(|n| row(*n)).collect(),
+		};
+		let child = point_child(state, position_of(lowest));
+		NoopBody {
+			key: key(T0, 1),
+			request_digest: delete_request_digest(TENANT, &request),
+			request,
+			selection: DeleteSelection {
+				cut: peek_index() - 1,
+				outcomes: vec![
+					DeleteOutcome::NotFound,
+					already(T0 - 1),
+					DeleteOutcome::NotFound,
+				],
+			},
+			position: position_of(lowest),
+			coordinator: child.holder,
+			lineage: child.lineage,
+		}
+	};
+	let before = decisions(&state).clone();
+	let highest = ns.iter().copied().max_by_key(|n| position_of(*n)).unwrap();
+	let mut not_lowest = body(&state);
+	let child = point_child(&state, position_of(highest));
+	not_lowest.position = position_of(highest);
+	not_lowest.coordinator = child.holder;
+	not_lowest.lineage = child.lineage;
+	let mut matched = body(&state);
+	matched.selection.outcomes[1] = deleted(T0 - 1);
+	let mut misaligned = body(&state);
+	misaligned.selection.outcomes.pop();
+	let mut reversed = body(&state);
+	reversed.request.rows.reverse();
+	reversed.request_digest = delete_request_digest(TENANT, &reversed.request);
+	for (label, noop) in [
+		("signed at another position", not_lowest),
+		("a noop that deleted", matched),
+		("outcomes not aligned", misaligned),
+		("rows not in identity order", reversed),
+	] {
+		assert_eq!(
+			record_noop(&mut state, noop),
+			refused(DecisionRefusal::MalformedClaim),
+			"{label}"
+		);
+	}
+	assert_eq!(decisions(&state), &before);
+	let good = body(&state);
+	assert!(matches!(
+		record_noop(&mut state, good),
+		DecisionResult::Terminal {
+			status: ParentStatus::Noop { .. },
+			..
+		}
+	));
+	decisions(&state).validate().unwrap();
+}
+
+/// The largest statement the bounds admit encodes inside the claim bound: 512
+/// rows with the widest outcomes, 64 children with 16-member plans and the
+/// widest fields; and the largest noop likewise.
+#[test]
+fn the_largest_delete_statement_fits_the_claim_bound() {
+	let wide_hlc = HybridTimestamp {
+		physical_ms: u64::MAX,
+		logical: u32::MAX,
+		node_id: u32::MAX,
+	};
+	let wide_signer = Signer {
+		node: u32::MAX,
+		incarnation: StoreIncarnation::from_raw(u128::MAX),
+	};
+	let rows: Vec<Identity> = (0..MAX_DELETE_ROWS as u16)
+		.map(|i| {
+			let mut bytes = [0xff; 32];
+			bytes[..2].copy_from_slice(&i.to_be_bytes());
+			Identity::new(bytes)
+		})
+		.collect();
+	let request = DeleteRequest {
+		table: TABLE,
+		schema_generation: u64::MAX,
+		rows,
+	};
+	let widest = DeleteOutcome::AlreadyDeleted {
+		winner_rsv: u64::MAX,
+		winner_hlc: wide_hlc,
+	};
+	let selection = DeleteSelection {
+		cut: u64::MAX,
+		outcomes: vec![widest; MAX_DELETE_ROWS],
+	};
+	let child = ChildClaim {
+		range_start: u64::MAX,
+		range_end: u64::MAX,
+		lineage: LineageRef {
+			range_start: u64::MAX,
+			generation: u64::MAX,
+		},
+		holder: wide_signer,
+		plan: vec![wide_signer; MAX_PLAN_MEMBERS],
+		rows: u32::MAX,
+		content: [0xff; 32],
+	};
+	let claim = Claim {
+		key: ParentKey {
+			tenant: TENANT,
+			namespace: ParentNamespace::Table(TABLE),
+			client_uuid: [0xff; 16],
+			sequence_no: u64::MAX,
+		},
+		request_digest: [0xff; 32],
+		commit_hlc: wide_hlc,
+		coordinator: u16::MAX,
+		first_row_position: u64::MAX,
+		children: vec![child; MAX_CHILDREN],
+		operation: Operation::Delete {
+			request: request.clone(),
+			selection: selection.clone(),
+		},
+	};
+	let claim_bytes = postcard::to_stdvec(&claim).unwrap().len() as u64;
+	assert!(claim_bytes <= MAX_CLAIM_BYTES, "claim {claim_bytes}");
+	let noop = NoopBody {
+		key: claim.key,
+		request_digest: [0xff; 32],
+		request,
+		selection,
+		position: u64::MAX,
+		coordinator: wide_signer,
+		lineage: claim.children[0].lineage,
+	};
+	let noop_bytes = postcard::to_stdvec(&noop).unwrap().len() as u64;
+	assert!(noop_bytes <= MAX_CLAIM_BYTES, "noop {noop_bytes}");
+}
+
+/// Wendelon ADR 0112: both delete sequences are bounded at DECODE, so a long
+/// statement is refused before it is materialized, whatever the frame allows: the
+/// legal boundary (512) decodes and one more is refused, for the rows and for the
+/// outcomes, alone and inside a whole claim and noop. 513 NotFound outcomes are
+/// small on the wire; they still never decode.
+#[test]
+fn the_delete_sequences_are_bounded_at_decode() {
+	let rows = |n: usize| -> Vec<Identity> {
+		(0..n as u16)
+			.map(|i| {
+				let mut bytes = [0u8; 32];
+				bytes[..2].copy_from_slice(&i.to_be_bytes());
+				Identity::new(bytes)
+			})
+			.collect()
+	};
+	let request = |n: usize| DeleteRequest {
+		table: TABLE,
+		schema_generation: 1,
+		rows: rows(n),
+	};
+	let selection = |n: usize| DeleteSelection {
+		cut: 7,
+		outcomes: vec![DeleteOutcome::NotFound; n],
+	};
+	for (n, decodes) in [(MAX_DELETE_ROWS, true), (MAX_DELETE_ROWS + 1, false)] {
+		let bytes = postcard::to_stdvec(&request(n)).unwrap();
+		assert_eq!(
+			postcard::from_bytes::<DeleteRequest>(&bytes).is_ok(),
+			decodes,
+			"rows {n}"
+		);
+		let bytes = postcard::to_stdvec(&selection(n)).unwrap();
+		assert_eq!(
+			postcard::from_bytes::<DeleteSelection>(&bytes).is_ok(),
+			decodes,
+			"outcomes {n}"
+		);
+		if !decodes {
+			assert!(
+				bytes.len() < 1024,
+				"513 NotFound outcomes are small on the wire: {}",
+				bytes.len()
+			);
+		}
+		// Inside the bodies a decision carries.
+		let state = {
+			let mut state = base(3);
+			grant_all(&mut state);
+			state
+		};
+		let mut noop = noop_body(&state, 1, 1);
+		noop.request = request(n);
+		noop.selection = selection(n);
+		let bytes = postcard::to_stdvec(&noop).unwrap();
+		assert_eq!(
+			postcard::from_bytes::<NoopBody>(&bytes).is_ok(),
+			decodes,
+			"noop {n}"
+		);
+		let mut claim = delete_claim(&state, 1, 1, T0 - 1);
+		claim.operation = Operation::Delete {
+			request: request(n),
+			selection: selection(n),
+		};
+		let bytes = postcard::to_stdvec(&claim).unwrap();
+		assert_eq!(
+			postcard::from_bytes::<Claim>(&bytes).is_ok(),
+			decodes,
+			"claim {n}"
+		);
+	}
+	// Mixed lengths decode (alignment is the reducer's check, not the decoder's).
+	let mut mixed = selection(MAX_DELETE_ROWS);
+	mixed.outcomes.truncate(3);
+	let bytes = postcard::to_stdvec(&mixed).unwrap();
+	assert!(postcard::from_bytes::<DeleteSelection>(&bytes).is_ok());
 }

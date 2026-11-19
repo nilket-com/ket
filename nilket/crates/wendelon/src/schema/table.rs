@@ -2179,6 +2179,21 @@ pub fn decode_arrow_schema_ipc(bytes: &[u8]) -> std::io::Result<Schema> {
 	Ok(reader.schema().as_ref().clone())
 }
 
+/// The row identities of `batch`'s rows under `descriptor`, derived as admission
+/// derives them. A client names the rows it deletes by these (wendelon ADR 0112).
+pub fn table_row_identities(
+	tenant_id: TenantId,
+	descriptor: &TableSchemaDescriptor,
+	batch: &RecordBatch,
+) -> std::io::Result<Vec<Identity>> {
+	let keys = canonicalize_primary_key_column(batch, descriptor)
+		.map_err(|error| Error::new(ErrorKind::InvalidInput, format!("{error:?}")))?;
+	Ok(keys
+		.iter()
+		.map(|pk| table_row_identity(tenant_id, descriptor.table_object_id, pk))
+		.collect())
+}
+
 pub fn table_row_identity(
 	tenant_id: TenantId,
 	table_object_id: TableObjectId,

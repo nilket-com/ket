@@ -571,6 +571,13 @@ pub enum ClientError {
 		.reject_code.0
 	)]
 	TableWriteRejected { reject_code: PbcRejectCode },
+	/// Wendelon ADR 0112: a delete refused by its shape, reported as a delete.
+	#[error(
+		"table delete rejected: {} (0x{:04X})",
+		.reject_code.name(),
+		.reject_code.0
+	)]
+	TableDeleteRejected { reject_code: PbcRejectCode },
 	#[error("table descriptor evolved during query")]
 	TableDescriptorEvolved {
 		expected: PhysicalDescriptorFingerprint,
@@ -602,7 +609,9 @@ impl ClientError {
 			Self::WriteFailed { status } => map_write_status_for_compute(*status),
 			Self::MutationStopped { .. } => StorageStatusKind::TerminalStorageError,
 			Self::MutationAnswerInconsistent { .. } => StorageStatusKind::TerminalStorageError,
-			Self::TableWriteRejected { .. } => StorageStatusKind::TerminalStorageError,
+			Self::TableWriteRejected { .. } | Self::TableDeleteRejected { .. } => {
+				StorageStatusKind::TerminalStorageError
+			}
 			Self::TableDescriptorEvolved { .. } => StorageStatusKind::TerminalStorageError,
 			Self::TableReferenceIntegrityFailed { .. } => StorageStatusKind::TerminalStorageError,
 			Self::SchemaUpdateRejected { .. } => StorageStatusKind::TerminalStorageError,
@@ -1772,7 +1781,7 @@ impl Client {
 		};
 		let result = self.inner.table_delete(request).await?;
 		if result.response.reject_code != PbcRejectCode::NONE.0 {
-			return Err(ClientError::TableWriteRejected {
+			return Err(ClientError::TableDeleteRejected {
 				reject_code: PbcRejectCode(result.response.reject_code),
 			});
 		}

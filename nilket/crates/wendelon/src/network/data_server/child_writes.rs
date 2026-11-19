@@ -238,8 +238,9 @@ pub(crate) struct ChildPlan {
 	/// Each row's version, in batch order.
 	pub(crate) row_versions: Vec<OwnedVersion>,
 	pub(crate) ack: crate::consensus::decisions::ChildAckBody,
-	/// ADR 0699 S4b: the delete this child publishes a tombstone for.
-	pub(crate) tombstone: Option<crate::consensus::decisions::DeleteRequest>,
+	/// ADR 0699 S4b, wendelon ADR 0112: the rows this delete child publishes a
+	/// tombstone for, in identity order.
+	pub(crate) tombstone: Option<Vec<crate::consensus::decisions::TombstoneTarget>>,
 }
 
 /// Wendelon ADR 0108 D5 (DC-250): a child plan whose secondary-index
@@ -391,17 +392,29 @@ pub(crate) fn plan_child(
 	}
 	let descriptor = table_descriptor(state, claim.key.tenant, table, meta.schema_generation)
 		.ok_or(ChildRefusal::SchemaUnknown)?;
-	// ADR 0699 S4b: a delete child's version is derived from the recorded claim;
-	// its payload only names the row, which must be the claim's.
+	// ADR 0699 S4b, wendelon ADR 0112: a delete child's versions are derived from
+	// the recorded claim; its payload only names its rows, which must be exactly
+	// the claim's matched rows in this child's range, in identity order.
 	let (row_versions, manifest, tombstone) =
-		if let crate::consensus::decisions::Operation::Delete { request, .. } = &claim.operation {
-			if super::deletes::row_id_of(&batch) != Some(request.row)
+		if let crate::consensus::decisions::Operation::Delete { request, selection } =
+			&claim.operation
+		{
+			let rows = super::deletes::child_rows(
+				claim.key.tenant,
+				&descriptor,
+				request,
+				selection,
+				child,
+			)
+			.ok_or(ChildRefusal::ContentMismatch)?;
+			if super::deletes::row_ids_of(&batch).as_ref() != Some(&rows)
 				|| request.schema_generation != meta.schema_generation
 			{
 				return Err(ChildRefusal::ContentMismatch);
 			}
-			let manifest = vec![super::deletes::tombstone_version(request, claim.commit_hlc)];
-			(manifest.clone(), manifest, Some(*request))
+			let manifest = super::deletes::child_manifest(request, &rows, claim.commit_hlc);
+			let targets = rows.iter().map(|row| request.target(*row)).collect();
+			(manifest.clone(), manifest, Some(targets))
 		} else {
 			let request = child_request_meta(
 				&claim.key,
@@ -886,15 +899,17 @@ pub(super) async fn persist_locked(
 		if !complete {
 			holder_authority(&state_machine, &plan, &authority).await?;
 			// Every record lands inside the child range before anything is recorded.
-			if let Some(request) = plan.tombstone {
-				let position = crate::consensus::decisions::delete_row_position(
-					plan.intent.tenant,
-					&plan.descriptor,
-					request.row,
-				);
-				if position != Some(plan.intent.range_start)
-					|| plan.intent.range_start != plan.intent.range_end
-				{
+			if let Some(targets) = &plan.tombstone {
+				if targets.iter().any(|target| {
+					crate::consensus::decisions::delete_row_position(
+						plan.intent.tenant,
+						&plan.descriptor,
+						target.row,
+					)
+					.is_none_or(|position| {
+						position < plan.intent.range_start || position > plan.intent.range_end
+					})
+				}) {
 					return Err(ChildRefusal::OutOfRange);
 				}
 			} else {
@@ -915,17 +930,17 @@ pub(super) async fn persist_locked(
 				Refused => return Err(ChildRefusal::ParentRefused),
 				Intent | Complete => {}
 			}
-			// A tombstone is appended once: only when no copy of it is stored.
-			if let Some(request) = plan.tombstone {
+			// Each tombstone is appended once: only when no copy of it is stored.
+			for target in plan.tombstone.iter().flatten() {
 				let stored = slab
-					.version_locations(plan.intent.tenant, request.row, plan.ack_hlc())
+					.version_locations(plan.intent.tenant, target.row, plan.ack_hlc())
 					.map_err(storage)?;
 				if stored.is_empty() {
 					super::deletes::append_tombstone(
 						&slab,
 						plan.intent.tenant,
 						&plan.descriptor,
-						&request,
+						target,
 						plan.ack_hlc(),
 						&plan.secondary_indexes,
 					)

@@ -912,7 +912,10 @@ impl<'de> Deserialize<'de> for LeaseGrantResults {
 
 /// A sequence of at most `max` elements; a longer declared length is refused
 /// before any element is allocated or read.
-fn deserialize_bounded_seq<'de, D, T>(deserializer: D, max: usize) -> Result<Vec<T>, D::Error>
+pub(crate) fn deserialize_bounded_seq<'de, D, T>(
+	deserializer: D,
+	max: usize,
+) -> Result<Vec<T>, D::Error>
 where
 	D: serde::Deserializer<'de>,
 	T: Deserialize<'de>,

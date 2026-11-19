@@ -2074,7 +2074,9 @@ async fn a_single_row_delete_selects_at_its_cut_and_records_a_noop_when_nothing_
 	}
 	expect_everywhere(&cluster, &descriptor, &expected, "HLC order decides").await;
 
-	// Unsupported: more than one id.
+	// Wendelon ADR 0112: a statement of several ids is one delete (see
+	// multi_row_delete); a declared count that does not match its ids is refused
+	// typed, before any lookup.
 	let two = delete_through(
 		&cluster,
 		leader,
@@ -2083,6 +2085,11 @@ async fn a_single_row_delete_selects_at_its_cut_and_records_a_noop_when_nothing_
 	)
 	.await;
 	assert_eq!(two.write.status, WriteStatus::INTERNAL_ERROR, "{two:?}");
+	assert_eq!(
+		two.reject_code,
+		crate::schema::PbcRejectCode::PBC_REJECT_ROW_COUNT_MISMATCH.0,
+		"{two:?}"
+	);
 
 	// An unproved selected copy with no source is indeterminate, never a noop.
 	let primary = leader_server
@@ -6759,6 +6766,8 @@ mod write_deadline;
 
 #[path = "parent_decisions_cluster_tests/attempt_exhaustion.rs"]
 mod attempt_exhaustion;
+#[path = "parent_decisions_cluster_tests/multi_row_delete.rs"]
+mod multi_row_delete;
 #[path = "parent_decisions_cluster_tests/one_voter.rs"]
 mod one_voter;
 

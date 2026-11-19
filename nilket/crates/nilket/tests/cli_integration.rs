@@ -1181,6 +1181,92 @@ fn local_profile_parent_decisions_init_commits_reads_and_survives_restart() {
 	std::fs::remove_dir_all(harness).expect("remove parent-decisions profile fixture");
 }
 
+/// A multi-row SQL DELETE through the public ParentDecisions path is ONE
+/// statement with one outcome: both matched rows go, the unmatched row stays,
+/// exactly, before and after a restart.
+#[test]
+#[ignore = "requires Linux io_uring and the fixed local-profile ports"]
+fn local_profile_parent_decisions_multi_row_delete_is_one_statement() {
+	let _serial = LIVE_LOCAL_LOCK.lock().expect("live-profile test lock");
+	let harness = fresh_dir("local-profile-parent-decisions-delete");
+	let profile = harness.join("profile");
+	let log = harness.join("local.stderr.log");
+	let init = nilket(&[
+		"local",
+		"init",
+		"--data-dir",
+		profile.to_str().expect("utf8 profile path"),
+		"--decision-authority",
+		"parent-decisions",
+	]);
+	assert!(init.status.success(), "{init:?}");
+
+	let first = LiveLocal::spawn(&profile, &log);
+	let sql = first.ready.sql_endpoint;
+	assert_sql_success(
+		sql,
+		"CREATE TABLE pd_del (id BIGINT NOT NULL PRIMARY KEY, label TEXT)",
+	);
+	assert_eq!(
+		assert_sql_success(
+			sql,
+			"INSERT INTO pd_del (id, label) VALUES (1, 'one'), (2, 'two'), (3, 'three')"
+		),
+		"OK rows=3\n"
+	);
+	let delete = run_live_sql(sql, "DELETE FROM pd_del WHERE id IN (1, 2)");
+	assert!(
+		delete.status.success() && stdout(&delete) == "OK rows=2\n",
+		"one multi-row DELETE statement: {delete:?}"
+	);
+	// A multi-row predicate, and RETURNING whose rows are exactly the receipt's.
+	assert_eq!(
+		assert_sql_success(
+			sql,
+			"INSERT INTO pd_del (id, label) VALUES (4, 'four'), (5, 'five'), (6, 'six'), (7, 'seven')"
+		),
+		"OK rows=4\n"
+	);
+	let predicate = run_live_sql(sql, "DELETE FROM pd_del WHERE id > 3 AND id < 6");
+	assert!(
+		predicate.status.success() && stdout(&predicate) == "OK rows=2\n",
+		"a multi-row predicate: {predicate:?}"
+	);
+	// RETURNING promises the rows, not their order.
+	let mut returned = rendered_rows(&assert_sql_success(
+		sql,
+		"DELETE FROM pd_del WHERE id >= 6 RETURNING id, label",
+	));
+	returned.rows.sort();
+	assert_eq!(
+		returned,
+		RenderedRows::of(&["id", "label"], &[("6", "six"), ("7", "seven")]),
+		"RETURNING names exactly the deleted rows"
+	);
+	let remaining = RenderedRows::of(&["id", "label"], &[("3", "three")]);
+	assert_eq!(
+		rendered_rows(&assert_sql_success(
+			sql,
+			"SELECT id, label FROM pd_del ORDER BY id"
+		)),
+		remaining,
+		"exactly the unmatched row remains"
+	);
+	first.stop_gracefully();
+
+	let second = LiveLocal::spawn(&profile, &log);
+	assert_eq!(
+		rendered_rows(&assert_sql_success(
+			second.ready.sql_endpoint,
+			"SELECT id, label FROM pd_del ORDER BY id"
+		)),
+		remaining,
+		"the same after the restart"
+	);
+	second.stop_gracefully();
+	std::fs::remove_dir_all(harness).expect("remove parent-decisions delete fixture");
+}
+
 #[test]
 #[ignore = "requires Linux io_uring and the fixed local-profile ports"]
 fn local_profile_parent_death_reaps_roles_and_allows_stale_manifest_restart() {

@@ -990,6 +990,7 @@ fn storage_error_class(error: &StorageError) -> &'static str {
 		StorageError::Cancelled => "cancelled",
 		StorageError::ReadBoundUnavailable { .. } => "read_bound_unavailable",
 		StorageError::TableWriteRejected { .. } => "table_write_rejected",
+		StorageError::TableDeleteRejected { .. } => "table_delete_rejected",
 		StorageError::InvalidPbcProgram { .. } => "invalid_pbc_program",
 		StorageError::PermissionDenied { .. } => "permission_denied",
 		StorageError::Unavailable { .. } => "storage_unavailable",

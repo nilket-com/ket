@@ -471,10 +471,11 @@ impl WendelonDataServer {
 		)
 	}
 
-	pub(super) fn decode_table_delete_request_frame(
+	/// A TABLE_DELETE request's meta alone: nothing of its Arrow payload is read.
+	pub(super) fn decode_table_delete_meta(
 		&self,
 		frame: &HrftFrame,
-	) -> std::io::Result<(TableDeleteRowsRequestMeta, Vec<Identity>)> {
+	) -> std::io::Result<TableDeleteRowsRequestMeta> {
 		if frame.meta.len() < std::mem::size_of::<TableDeleteRowsRequestMeta>() {
 			return Err(Error::new(
 				ErrorKind::InvalidData,
@@ -483,6 +484,16 @@ impl WendelonDataServer {
 		}
 		let meta: TableDeleteRowsRequestMeta =
 			*bytemuck::from_bytes(&frame.meta[..std::mem::size_of::<TableDeleteRowsRequestMeta>()]);
+		Ok(meta)
+	}
+
+	/// A TABLE_DELETE request's row ids, after its meta was admitted: the Arrow
+	/// schema and the count are checked against `meta` before any id is collected.
+	pub(super) fn decode_table_delete_rows(
+		&self,
+		meta: &TableDeleteRowsRequestMeta,
+		frame: &HrftFrame,
+	) -> std::io::Result<Vec<Identity>> {
 		let payload_bytes = frame.arrow_payload.as_ref().ok_or_else(|| {
 			Error::new(
 				ErrorKind::InvalidData,
@@ -490,8 +501,7 @@ impl WendelonDataServer {
 			)
 		})?;
 		let payload = crate::network::ipc::wire_decode_batch(payload_bytes)?;
-		let row_key_ids = decode_table_delete_rows_batch(&meta, &payload)?;
-		Ok((meta, row_key_ids))
+		decode_table_delete_rows_batch(meta, &payload)
 	}
 
 	/// The write answer as it may go on the wire (ADR 0732): see

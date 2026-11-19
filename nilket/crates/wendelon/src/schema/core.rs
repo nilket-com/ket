@@ -2614,7 +2614,10 @@ pub const SNAPSHOT_FORMAT_VERSION: u8 = 21;
 ///
 /// Wendelon ADR 0106: 27, whose replacement records carry their recovery (26
 /// was wendelon ADR 0105's).
-pub const SNAPSHOT_FORMAT_VERSION_PARENT_DECISIONS: u8 = 28;
+///
+/// Wendelon ADR 0112: 29, whose delete statements name up to 512 rows (28 was
+/// wendelon ADR 0108 to ADR 0111's).
+pub const SNAPSHOT_FORMAT_VERSION_PARENT_DECISIONS: u8 = 29;
 
 /// Shape of the Control Ring WAL record bodies this build writes, including the
 /// `postcard(Entry<..>)` payload of a log record. ADR 0697 version 6 carries
@@ -2660,7 +2663,11 @@ pub const WAL_FORMAT_VERSION: u8 = 21;
 ///
 /// Wendelon ADR 0106: 27. A replacement's signed recovery statement is a
 /// decision; an earlier log is refused whole (26 was wendelon ADR 0105's).
-pub const WAL_FORMAT_VERSION_PARENT_DECISIONS: u8 = 28;
+///
+/// Wendelon ADR 0112: 29. A delete names a canonical statement of up to 512 rows,
+/// selected at one cut, and its claim and noop carry them; an earlier log is
+/// refused whole (28 was wendelon ADR 0108 to ADR 0111's).
+pub const WAL_FORMAT_VERSION_PARENT_DECISIONS: u8 = 29;
 
 // Static assertions to ensure all our size calculations remain exactly correct
 const _: () = assert!(std::mem::size_of::<HybridTimestamp>() == 16);
