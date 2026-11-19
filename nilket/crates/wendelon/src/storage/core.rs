@@ -2463,6 +2463,10 @@ fn validate_recovered_row_tombstone_marker_shape(
 					| STORAGE_ROW_ROUTING_LOCALITY_COLUMN
 					| STORAGE_ROW_TABLE_OBJECT_ID_COLUMN
 					| STORAGE_ROW_TOMBSTONE_COLUMN
+					// ADR 0090: a partitioned table's tombstone carries its partition, a
+					// storage column like the others (wendelon ADR 0112 found its absence
+					// here: every such tombstone refused the next start).
+					| crate::schema::STORAGE_ROW_PARTITION_COLUMN
 			)
 		})
 		.map(|field| field.name().clone())
@@ -3234,6 +3238,110 @@ mod tests {
 
 		assert_eq!(err.kind(), ErrorKind::InvalidData);
 		assert!(err.to_string().contains("missing __row_table_object_id__"));
+	}
+
+	/// ADR 0090: a partitioned table's tombstone, packed by the real packer and
+	/// persisted, carries `__row_partition__`. A reopened store recovers it as a
+	/// tombstone with its partition, instead of refusing to open.
+	#[tokio::test]
+	async fn recovery_reopens_a_persisted_partitioned_tombstone_written_by_the_packer() {
+		let row = Identity::new([6; 32]);
+		let partition = PartitionId::new(3);
+		let packed = crate::storage::multirow::pack_tombstone_multirow_source_rows_with_policy(
+			crate::schema::MultiRowLayoutDescriptor::default(),
+			&[crate::storage::multirow::MultiRowSourceRow {
+				source_row_index: 0,
+				key_identity: row,
+				routing_locality: Locality::new(70),
+				row_hlc: hlc(10, 0),
+				is_tombstone: true,
+				partition: Some(partition),
+				table_object_id: Some(crate::schema::TableObjectId::new([0x50; 16])),
+			}],
+			crate::schema::RecordBodyCompressionPolicy::Uncompressed,
+		)
+		.unwrap();
+		let [packed] = packed.as_slice() else {
+			panic!("one frame");
+		};
+		let dir = crate::test_support::TestDir::new("wendelon-partitioned-row-tombstone");
+		let path = dir.join("slab_0000000000000000.wnd");
+		let file_ops = Arc::new(BlockingFileOps);
+		let config = || GroupCommitConfig {
+			floor: Duration::ZERO,
+			ceiling: Duration::ZERO,
+			per_write_cost_estimate: Duration::ZERO,
+		};
+		{
+			let store = LocalSlabStore::open(&path, SlabId::ZERO, file_ops.clone(), config())
+				.await
+				.unwrap();
+			store
+				.append(TenantId::new(7), row, hlc(10, 0), &packed.encoded.frame)
+				.await
+				.unwrap();
+			store.fsync().await.unwrap();
+		}
+		let recovered = LocalSlabStore::open(&path, SlabId::ZERO, file_ops, config())
+			.await
+			.expect("a partitioned tombstone does not refuse the store");
+		let location = recovered
+			.lookup(TenantId::new(7), row)
+			.unwrap()
+			.expect("the tombstone");
+		assert!(location.is_tombstone);
+		assert_eq!(location.partition, Some(partition));
+	}
+
+	/// Only the reserved partition column of its own type is a storage column: a
+	/// tombstone whose `__row_partition__` is not UInt64 still refuses recovery.
+	#[tokio::test]
+	async fn recovery_fails_closed_on_a_tombstone_partition_of_another_type() {
+		let mut row_hlc = FixedSizeBinaryBuilder::with_capacity(1, 16);
+		row_hlc.append_value(hlc_bytes(hlc(10, 0))).unwrap();
+		let mut row_id = FixedSizeBinaryBuilder::with_capacity(1, 32);
+		row_id.append_value([7_u8; 32]).unwrap();
+		let mut table = FixedSizeBinaryBuilder::with_capacity(1, 16);
+		table.append_value([0x50_u8; 16]).unwrap();
+		let batch = RecordBatch::try_new(
+			Arc::new(Schema::new(vec![
+				Field::new(STORAGE_ROW_HLC_COLUMN, DataType::FixedSizeBinary(16), false),
+				Field::new(
+					STORAGE_ROW_KEY_ID_COLUMN,
+					DataType::FixedSizeBinary(32),
+					false,
+				),
+				Field::new(STORAGE_ROW_ROUTING_LOCALITY_COLUMN, DataType::UInt64, false),
+				Field::new(
+					STORAGE_ROW_TABLE_OBJECT_ID_COLUMN,
+					DataType::FixedSizeBinary(16),
+					false,
+				),
+				Field::new(STORAGE_ROW_TOMBSTONE_COLUMN, DataType::Boolean, false),
+				Field::new(
+					crate::schema::STORAGE_ROW_PARTITION_COLUMN,
+					DataType::Utf8,
+					false,
+				),
+			])),
+			vec![
+				Arc::new(row_hlc.finish()),
+				Arc::new(row_id.finish()),
+				Arc::new(UInt64Array::from(vec![70_u64])),
+				Arc::new(table.finish()),
+				Arc::new(BooleanArray::from(vec![true])),
+				Arc::new(arrow::array::StringArray::from(vec!["3"])),
+			],
+		)
+		.unwrap();
+		let err =
+			recovery_error_for_single_frame("row-tombstone-partition-type", &encode_batch(&batch))
+				.await;
+		assert_eq!(err.kind(), ErrorKind::InvalidData);
+		assert!(
+			err.to_string().contains("invalid __row_partition__"),
+			"{err}"
+		);
 	}
 
 	#[tokio::test]
