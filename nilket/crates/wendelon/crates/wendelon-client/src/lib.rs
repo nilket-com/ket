@@ -43,12 +43,11 @@ use wendelon::network::transport::{
 use wendelon::network::wire;
 use wendelon::schema::{
 	ClientWriteId, CounterAddRequestMeta, CounterReadRequestMeta, FinalizationMarker, FrameHeader,
-	HybridTimestamp, Identity, MsgType, MutationCommitKnowledge, MutationOperationKind,
-	MutationOutcomePinAction, MutationResolutionStatus, MutationStopReason, NodeId,
-	QUERY_REQUEST_FLAG_DISABLE_STATS_PRUNING, ReadRequestMeta, ReadStatus,
-	TABLE_QUERY_TRACE_FLAG_PRESENT, TABLE_QUERY_TRACE_FLAG_SAMPLED, TableDeleteRowsRequestMeta,
-	TableQueryCancelResponseMeta, TableQueryRequestId, TableQueryRequestMeta,
-	TableWriteRequestMeta, TenantId, WriteRequestMeta, WriteStatus,
+	HybridTimestamp, Identity, MsgType, MutationCommitKnowledge, MutationOutcomePinAction,
+	MutationResolutionStatus, MutationStopReason, NodeId, QUERY_REQUEST_FLAG_DISABLE_STATS_PRUNING,
+	ReadRequestMeta, ReadStatus, TABLE_QUERY_TRACE_FLAG_PRESENT, TABLE_QUERY_TRACE_FLAG_SAMPLED,
+	TableDeleteRowsRequestMeta, TableQueryCancelResponseMeta, TableQueryRequestId,
+	TableQueryRequestMeta, TableWriteRequestMeta, TenantId, WriteRequestMeta, WriteStatus,
 	encode_table_schema_descriptor_v1, encode_table_write_row_count, read_key_schema,
 	write_payload_schema,
 };
@@ -1868,11 +1867,7 @@ impl Client {
 			status: response.write.status,
 			reason: response.write.mutation_stop_reason(),
 			knowledge: response.write.mutation_commit_knowledge(),
-			delete_counts: (response.operation_kind == MutationOperationKind::DELETE).then_some([
-				response.deleted_count,
-				response.already_deleted_count,
-				response.not_found_count,
-			]),
+			delete_counts: response.delete_counts(),
 		})
 	}
 

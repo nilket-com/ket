@@ -452,6 +452,11 @@ impl MutationResolutionStatus {
 	pub const UNKNOWN: Self = Self(0);
 	pub const PRESENT: Self = Self(1);
 	pub const EXPIRED: Self = Self(2);
+	/// Wendelon ADR 0113: the outcome could not be read linearizably now (no leader,
+	/// no cut, not applied in time). Never knowledge: a client treats it as an error.
+	pub const UNAVAILABLE: Self = Self(3);
+	/// Wendelon ADR 0113: the operation identity is not a valid UUIDv7.
+	pub const INVALID_REQUEST: Self = Self(4);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
@@ -461,6 +466,10 @@ pub struct MutationOperationKind(pub u8);
 impl MutationOperationKind {
 	pub const WRITE: Self = Self(0);
 	pub const DELETE: Self = Self(1);
+	/// Wendelon ADR 0113: a delete whose counts are not effects: pending (it may still
+	/// delete) or refused (it deleted nothing). It carries no counts; a client that
+	/// only knows `DELETE` already reports none for it.
+	pub const DELETE_UNCOUNTED: Self = Self(2);
 }
 
 /// ADR 542 resolution request. The descriptor remains client-side for routing;
@@ -504,6 +513,9 @@ impl MutationOutcomePinStatus {
 	pub const APPLIED: Self = Self(0);
 	pub const CAPACITY_EXHAUSTED: Self = Self(1);
 	pub const INVALID_ACTION: Self = Self(2);
+	/// Wendelon ADR 0113: this node's decision authority does not retain outcomes
+	/// by pin (ParentDecisions). Typed, after write authorization.
+	pub const UNSUPPORTED: Self = Self(3);
 }
 
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
@@ -530,6 +542,19 @@ pub struct MutationOutcomeResponseMeta {
 }
 
 const _: () = assert!(std::mem::size_of::<MutationOutcomeResponseMeta>() == 112);
+
+impl MutationOutcomeResponseMeta {
+	/// The delete counts this answer reports, as the public SDK gives them: only a
+	/// counted DELETE has them (a pending or refused one, `DELETE_UNCOUNTED`, has
+	/// none; zeros of a committed delete or noop are counts).
+	pub fn delete_counts(&self) -> Option<[u32; 3]> {
+		(self.operation_kind == MutationOperationKind::DELETE).then_some([
+			self.deleted_count,
+			self.already_deleted_count,
+			self.not_found_count,
+		])
+	}
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeleteRowsRequest {

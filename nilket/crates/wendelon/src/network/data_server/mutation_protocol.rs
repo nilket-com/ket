@@ -18,6 +18,12 @@ impl From<std::io::Error> for TableAdmissionError {
 	}
 }
 
+/// Wendelon ADR 0113: how long a ParentDecisions resolve may spend reading the
+/// leader's cut and applying through it before it answers UNAVAILABLE. Below
+/// the client's whole-resolve budget, so a node's honest UNAVAILABLE arrives in
+/// time to be counted.
+pub(crate) const PD_RESOLVE_READ_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
+
 impl WendelonDataServer {
 	pub(super) async fn handle_mutation_outcome_pin_request(
 		&self,
@@ -32,7 +38,15 @@ impl WendelonDataServer {
 		}
 		let meta: MutationOutcomePinRequestMeta = *bytemuck::from_bytes(&frame.meta);
 		self.authorize_actor_for_data(actor, Some(meta.tenant_id), DataOperation::Write)?;
-		let status = if meta.action == MutationOutcomePinAction::PIN {
+		// Wendelon ADR 0113: ParentDecisions retains outcomes in its replicated
+		// decisions, not by pin; a pin or acknowledge is unsupported, typed. An
+		// unknown action is still invalid.
+		let status = if self.parent_decisions()
+			&& (meta.action == MutationOutcomePinAction::PIN
+				|| meta.action == MutationOutcomePinAction::ACKNOWLEDGE)
+		{
+			MutationOutcomePinStatus::UNSUPPORTED
+		} else if meta.action == MutationOutcomePinAction::PIN {
 			match self
 				.mutation_outcomes
 				.pin(meta.operation_id, meta.tenant_id)
@@ -363,6 +377,9 @@ impl WendelonDataServer {
 		&self,
 		meta: MutationOutcomeRequestMeta,
 	) -> std::io::Result<MutationOutcomeResponseMeta> {
+		if self.parent_decisions() {
+			return Ok(self.resolve_parent_decisions_outcome(meta).await);
+		}
 		match self
 			.mutation_outcomes
 			.resolve(meta.operation_id, meta.tenant_id)
@@ -441,6 +458,161 @@ impl WendelonDataServer {
 					_pad: [0; 2],
 				})
 			}
+		}
+	}
+
+	/// Wendelon ADR 0113: a table operation's outcome under ParentDecisions, read
+	/// linearizably at THIS node: the leader's committed cut (a compact index, the
+	/// existing DECISION_CUT exchange), this node's state applied through it, then the
+	/// applied decisions by the identity alone. Every node so answers the same. A cut
+	/// or apply that does not complete answers UNAVAILABLE: never UNKNOWN, EXPIRED or
+	/// not-committed.
+	async fn resolve_parent_decisions_outcome(
+		&self,
+		meta: MutationOutcomeRequestMeta,
+	) -> MutationOutcomeResponseMeta {
+		use crate::consensus::decisions::TableResolution;
+		let id = meta.operation_id;
+		let answer = |write: WriteResponseMeta,
+		              resolution: MutationResolutionStatus,
+		              delete: bool,
+		              counts: [u32; 3]| MutationOutcomeResponseMeta {
+			write,
+			deleted_count: counts[0],
+			already_deleted_count: counts[1],
+			not_found_count: counts[2],
+			resolution,
+			operation_kind: if delete {
+				MutationOperationKind::DELETE
+			} else {
+				MutationOperationKind::WRITE
+			},
+			_pad: [0; 2],
+		};
+		// A pending or refused delete's selection had no effect (yet, or ever):
+		// its kind says so, and it carries no counts.
+		let uncounted = |mut answer: MutationOutcomeResponseMeta| {
+			if answer.operation_kind == MutationOperationKind::DELETE {
+				answer.operation_kind = MutationOperationKind::DELETE_UNCOUNTED;
+			}
+			answer
+		};
+		let unavailable = || {
+			answer(
+				self.mutation_resolution_response(id, WriteStatus::WRITE_STALLED)
+					.with_mutation_outcome(
+						MutationCommitKnowledge::INDETERMINATE,
+						MutationStopReason::NONE,
+					),
+				MutationResolutionStatus::UNAVAILABLE,
+				false,
+				[0; 3],
+			)
+		};
+		let Some(proposals) = self.decisions.proposals.clone() else {
+			return unavailable();
+		};
+		// ONE budget for the whole read: the cut, the apply through it, and the read
+		// of the applied state under its lock. At the leader its own barrier is
+		// dropped where it stands; at a follower only its wait for the leader's reply
+		// is dropped (the leader's cut runs on to its own end). Two reads at
+		// different instants may answer differently: each is linearizable at its cut.
+		let (tenant, uuid, seq) = (meta.tenant_id, id.client_uuid, id.sequence_no);
+		let read = async {
+			let crate::network::decision_proposals::CutResponse::Cut(k) = proposals.cut().await
+			else {
+				return None;
+			};
+			proposals
+				.wait_applied(k, PD_RESOLVE_READ_BUDGET)
+				.await
+				.ok()?;
+			self.state_machine
+				.read_state(move |state| {
+					state.decisions.as_ref().map(|decisions| {
+						crate::consensus::decisions::resolve_table_operation(
+							decisions, tenant, uuid, seq,
+						)
+					})
+				})
+				.await
+		};
+		let Some(resolution) = tokio::time::timeout(PD_RESOLVE_READ_BUDGET, read)
+			.await
+			.ok()
+			.flatten()
+		else {
+			return unavailable();
+		};
+		let committed = |dec: u64, commit_hlc: HybridTimestamp| {
+			let mut write = self.mutation_resolution_response(id, WriteStatus::OK);
+			write.log_index = dec;
+			write.commit_hlc = commit_hlc;
+			write
+				.with_mutation_outcome(MutationCommitKnowledge::COMMITTED, MutationStopReason::NONE)
+		};
+		let no_hlc = HybridTimestamp {
+			physical_ms: 0,
+			logical: 0,
+			node_id: 0,
+		};
+		match resolution {
+			TableResolution::Accepted {
+				dec,
+				commit_hlc,
+				delete_counts,
+			} => answer(
+				committed(dec, commit_hlc),
+				MutationResolutionStatus::PRESENT,
+				delete_counts.is_some(),
+				delete_counts.unwrap_or([0; 3]),
+			),
+			// A noop carries no commit HLC: none is invented.
+			TableResolution::Noop { dec, counts } => answer(
+				committed(dec, no_hlc),
+				MutationResolutionStatus::PRESENT,
+				true,
+				counts,
+			),
+			// A refused or pending selection had no effect: no counts.
+			TableResolution::Refused { delete } => uncounted(answer(
+				self.mutation_resolution_response(id, WriteStatus::WRITE_REFUSED)
+					.with_mutation_outcome(
+						MutationCommitKnowledge::KNOWN_NOT_COMMITTED,
+						MutationStopReason::NONE,
+					),
+				MutationResolutionStatus::PRESENT,
+				delete,
+				[0; 3],
+			)),
+			TableResolution::Reserved { delete } => uncounted(answer(
+				self.mutation_resolution_response(id, WriteStatus::FINALIZATION_PENDING)
+					.with_mutation_outcome(
+						MutationCommitKnowledge::INDETERMINATE,
+						MutationStopReason::NONE,
+					),
+				MutationResolutionStatus::PRESENT,
+				delete,
+				[0; 3],
+			)),
+			TableResolution::Unknown => answer(
+				self.mutation_resolution_response(id, WriteStatus::WRITE_OPERATION_UNKNOWN),
+				MutationResolutionStatus::UNKNOWN,
+				false,
+				[0; 3],
+			),
+			TableResolution::Expired => answer(
+				self.mutation_resolution_response(id, WriteStatus::WRITE_OPERATION_EXPIRED),
+				MutationResolutionStatus::EXPIRED,
+				false,
+				[0; 3],
+			),
+			TableResolution::InvalidIdentity => answer(
+				self.mutation_resolution_response(id, WriteStatus::WRITE_IDENTITY_INVALID),
+				MutationResolutionStatus::INVALID_REQUEST,
+				false,
+				[0; 3],
+			),
 		}
 	}
 

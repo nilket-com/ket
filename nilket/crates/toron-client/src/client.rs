@@ -340,6 +340,22 @@ impl ToronClient {
 	}
 }
 
+/// Wendelon ADR 0113: `work` with a loopback client, on a runtime of its own, for a
+/// caller that has none (as `blocking_health_loopback`). The client is built inside
+/// the runtime.
+pub fn blocking_with_loopback<T, F, Fut>(endpoint: &str, work: F) -> Result<T, ClientError>
+where
+	F: FnOnce(ToronClient) -> Fut,
+	Fut: std::future::Future<Output = Result<T, ClientError>>,
+{
+	let endpoint = endpoint.to_owned();
+	let runtime = tokio::runtime::Builder::new_current_thread()
+		.enable_all()
+		.build()
+		.map_err(|error| ClientError::Configuration(format!("loopback runtime: {error}")))?;
+	runtime.block_on(async move { work(ToronClient::loopback(endpoint)?).await })
+}
+
 pub fn blocking_health_loopback(endpoint: &str) -> Result<(), ClientError> {
 	let endpoint = endpoint.to_owned();
 	let runtime = tokio::runtime::Builder::new_current_thread()

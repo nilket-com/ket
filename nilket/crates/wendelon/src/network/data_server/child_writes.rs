@@ -1296,9 +1296,13 @@ impl DecisionPeer {
 	/// a single-row delete. Each is then served only in its supported shape (the
 	/// reader, the coordinator and the delete path refuse the rest). Every
 	/// other data message (migration, bulk, counters, frames, other mutation
-	/// paths) stays refused.
+	/// paths) stays refused. Wendelon ADR 0113: a public mutation-outcome resolve
+	/// is served from the replicated decisions, and an outcome pin or acknowledge
+	/// answers a typed unsupported.
 	pub(crate) fn opens(&self, msg_type: u8) -> bool {
-		const SERVED: [MsgType; 9] = [
+		const SERVED: [MsgType; 11] = [
+			MsgType::MUTATION_OUTCOME_REQ,
+			MsgType::MUTATION_OUTCOME_PIN_REQ,
 			MsgType::TABLE_BASE_FETCH_REQ,
 			MsgType::TABLE_WRITE_REQ,
 			MsgType::TABLE_CHILD_WRITE_REQ,

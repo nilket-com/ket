@@ -5009,6 +5009,13 @@ impl WendelonStateMachine {
 		}
 	}
 
+	/// Test-only: holds the applied state's write lock until the returned guard is
+	/// dropped, as a long apply would.
+	#[cfg(test)]
+	pub(crate) async fn hold_state_for_test(&self) -> Box<dyn std::any::Any + Send> {
+		Box::new(self.inner.clone().write_owned().await)
+	}
+
 	/// A read of the applied state under its lock, without cloning it.
 	pub(crate) async fn read_state<R>(&self, read: impl FnOnce(&SmState) -> R) -> R {
 		read(&self.inner.read().await.state)
@@ -11493,13 +11500,15 @@ fn decode_state_body(decision_mode: DecisionMode, body: &[u8]) -> Result<SmState
 	match decision_mode {
 		DecisionMode::Today => whole::<SmState>(body),
 		DecisionMode::ParentDecisions => {
-			let envelope = whole::<crate::consensus::decisions::DecisionSnapshot>(body)?;
+			let mut envelope = whole::<crate::consensus::decisions::DecisionSnapshot>(body)?;
 			if envelope.version != crate::consensus::decisions::DECISION_SNAPSHOT_ENVELOPE_VERSION {
 				return Err(format!(
 					"decision snapshot envelope version {} is not supported",
 					envelope.version
 				));
 			}
+			// Wendelon ADR 0113: the derived index is rebuilt, then checked, on every decode.
+			envelope.decisions.restore_table_operations()?;
 			envelope.decisions.validate()?;
 			let mut state = envelope.sm;
 			state.decisions = Some(envelope.decisions);

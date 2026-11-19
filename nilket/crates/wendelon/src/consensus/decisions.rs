@@ -86,6 +86,11 @@ impl ParentKey {
 	pub fn issued_ms(&self) -> Option<u64> {
 		uuid_v7_unix_millis(self.client_uuid)
 	}
+
+	/// Wendelon ADR 0113: the operation identity, without its namespace.
+	pub fn operation(&self) -> (TenantId, [u8; 16], u64) {
+		(self.tenant, self.client_uuid, self.sequence_no)
+	}
 }
 
 /// A node's store, as admitted by the incarnation registry.
@@ -1109,6 +1114,13 @@ pub struct DecisionState {
 	/// ADR 0108 (wendelon): secondary-index receipts by (tenant, index), per
 	/// phase, keyed by the reporting store.
 	index_receipts: BTreeMap<(TenantId, crate::schema::IndexObjectId), IndexReceipts>,
+	/// Wendelon ADR 0113: the table each retained TABLE key's operation identity
+	/// (tenant, client UUID, sequence) is recorded under. A table operation identity
+	/// is tenant-wide across tables. Derived from `keys`: never serialized, rebuilt
+	/// and checked on every decode, updated with every insert and retirement of a
+	/// table key. KV keys are not in it.
+	#[serde(skip)]
+	table_operations: BTreeMap<(TenantId, [u8; 16], u64), crate::schema::TableObjectId>,
 }
 
 impl Default for DecisionState {
@@ -1129,6 +1141,7 @@ impl Default for DecisionState {
 			hold: None,
 			instances: instances::InstanceState::default(),
 			index_receipts: BTreeMap::new(),
+			table_operations: BTreeMap::new(),
 		}
 	}
 }
@@ -1214,6 +1227,29 @@ impl DecisionState {
 	}
 
 	/// The cutoff at or below which an unrecorded key is no longer presentable.
+	/// Wendelon ADR 0113: rebuilds the table-operation index from the retained keys.
+	/// Two retained table keys with one operation identity under different tables
+	/// refuse: a state that holds them breaks the tenant-wide identity.
+	pub(crate) fn restore_table_operations(&mut self) -> Result<(), String> {
+		self.table_operations = derive_table_operations(&self.keys)?;
+		Ok(())
+	}
+
+	/// The table a retained table operation identity is recorded under.
+	pub fn table_of_operation(
+		&self,
+		operation: (TenantId, [u8; 16], u64),
+	) -> Option<crate::schema::TableObjectId> {
+		self.table_operations.get(&operation).copied()
+	}
+
+	/// Records a newly retained key's table operation identity.
+	fn note_table_operation(&mut self, key: &ParentKey) {
+		if let ParentNamespace::Table(table) = key.namespace {
+			self.table_operations.insert(key.operation(), table);
+		}
+	}
+
 	fn retirement_cutoff(&self) -> u64 {
 		self.floor_ms
 			.max(self.clock_ms.saturating_sub(DECISION_EXPIRY_MS))
@@ -1367,6 +1403,11 @@ impl DecisionState {
 			if lineage.generation >= self.next_generation {
 				return Err("decisions: a lineage at or above next_generation".into());
 			}
+		}
+		// Wendelon ADR 0113, last: the table-operation index is exactly what the keys
+		// imply (a key-level fault is reported by its own check above first).
+		if derive_table_operations(&self.keys)? != self.table_operations {
+			return Err("decisions: the table-operation index does not match the keys".into());
 		}
 		Ok(())
 	}
@@ -2514,12 +2555,41 @@ fn reduce(
 	outcome.unwrap_or_else(DecisionResult::Refused)
 }
 
+/// Wendelon ADR 0113: the table-operation index the retained keys imply. Two
+/// retained table keys with one operation identity under different tables refuse.
+fn derive_table_operations(
+	keys: &BTreeMap<ParentKey, KeyEntry>,
+) -> Result<BTreeMap<(TenantId, [u8; 16], u64), crate::schema::TableObjectId>, String> {
+	let mut operations = BTreeMap::new();
+	for key in keys.keys() {
+		if let ParentNamespace::Table(table) = key.namespace
+			&& operations.insert(key.operation(), table).is_some()
+		{
+			return Err(
+				"decisions: one table operation identity is recorded under two tables".into(),
+			);
+		}
+	}
+	Ok(operations)
+}
+
 /// The record a retry lookup finds, after its request digest matched.
 fn lookup(
 	decisions: &DecisionState,
 	key: &ParentKey,
 	request_digest: &[u8; 32],
 ) -> Result<Option<(u64, ParentStatus)>, DecisionRefusal> {
+	// Wendelon ADR 0113: a table operation identity already recorded under another
+	// table conflicts, whatever this request is: it neither reserves nor answers
+	// with the other table's record.
+	if let ParentNamespace::Table(table) = key.namespace
+		&& decisions
+			.table_operations
+			.get(&key.operation())
+			.is_some_and(|recorded| *recorded != table)
+	{
+		return Err(DecisionRefusal::Conflict);
+	}
 	let Some(entry) = decisions.keys.get(key) else {
 		return Ok(None);
 	};
@@ -2644,6 +2714,7 @@ fn reserve(
 			record: RecordKind::Body,
 		},
 	);
+	decisions.note_table_operation(&claim.key);
 	decisions.bodies.insert(
 		reservation,
 		ParentRecord {
@@ -2808,6 +2879,7 @@ fn record_noop(
 			record: RecordKind::Noop,
 		},
 	);
+	decisions.note_table_operation(&noop.key);
 	decisions.noops.insert(
 		log_index,
 		NoopRecord {
@@ -3255,6 +3327,16 @@ fn advance_floor(
 		};
 		!(terminal && issued <= floor_ms)
 	});
+	// Wendelon ADR 0113: the index follows the keys it is derived from.
+	let keys = &decisions.keys;
+	decisions.table_operations.retain(|operation, table| {
+		keys.contains_key(&ParentKey {
+			tenant: operation.0,
+			namespace: ParentNamespace::Table(*table),
+			client_uuid: operation.1,
+			sequence_no: operation.2,
+		})
+	});
 	Ok(DecisionResult::FloorAdvanced {
 		floor_ms,
 		retired_keys: (before - decisions.keys.len()) as u64,
@@ -3348,3 +3430,80 @@ pub(crate) mod tests;
 pub mod generations;
 pub mod instances;
 pub use generations::{Certificate, ChunkSum, Generations, ReportBody, Target};
+
+/// Wendelon ADR 0113: what the applied decisions say about a TABLE operation
+/// identity, from the identity alone (no namespace, no request): the public
+/// resolve. Key presence comes first; the replicated retirement cutoff decides
+/// only for an identity with no retained key. A KV key never answers here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TableResolution {
+	/// Committed. A delete carries its frozen counts.
+	Accepted {
+		dec: u64,
+		commit_hlc: HybridTimestamp,
+		delete_counts: Option<[u32; 3]>,
+	},
+	/// A delete that published nothing: committed at its noop, with its counts.
+	/// A noop carries no commit HLC.
+	Noop { dec: u64, counts: [u32; 3] },
+	/// Durably refused. Its selection, if any, had no effect.
+	Refused { delete: bool },
+	/// Recorded and not yet decided: pending, whatever the cutoff.
+	Reserved { delete: bool },
+	/// No retained key, and the identity can still be presented.
+	Unknown,
+	/// No retained key, at or below the cutoff: retired, or never seen. No claim
+	/// that it ever committed.
+	Expired,
+	/// Not a UUIDv7.
+	InvalidIdentity,
+}
+
+pub fn resolve_table_operation(
+	decisions: &DecisionState,
+	tenant: TenantId,
+	client_uuid: [u8; 16],
+	sequence_no: u64,
+) -> TableResolution {
+	if let Some(table) = decisions.table_of_operation((tenant, client_uuid, sequence_no)) {
+		let key = ParentKey {
+			tenant,
+			namespace: ParentNamespace::Table(table),
+			client_uuid,
+			sequence_no,
+		};
+		let entry = decisions.keys[&key];
+		match entry.record {
+			RecordKind::Noop => {
+				return TableResolution::Noop {
+					dec: entry.reservation,
+					counts: decisions.noops[&entry.reservation].body.selection.counts(),
+				};
+			}
+			RecordKind::Body => {
+				let body = &decisions.bodies[&entry.reservation];
+				let selection = match &body.claim.operation {
+					Operation::Delete { selection, .. } => Some(selection),
+					_ => None,
+				};
+				let delete = selection.is_some();
+				return match body.status {
+					ParentStatus::Accepted { dec } => TableResolution::Accepted {
+						dec,
+						commit_hlc: body.claim.commit_hlc,
+						delete_counts: selection.map(DeleteSelection::counts),
+					},
+					ParentStatus::Refused { .. } => TableResolution::Refused { delete },
+					ParentStatus::Reserved | ParentStatus::Noop { .. } => {
+						TableResolution::Reserved { delete }
+					}
+				};
+			}
+		}
+	}
+	match crate::schema::uuid_v7_unix_millis(client_uuid) {
+		None => TableResolution::InvalidIdentity,
+		Some(issued) if issued <= decisions.retirement_cutoff() => TableResolution::Expired,
+		Some(_) => TableResolution::Unknown,
+	}
+}

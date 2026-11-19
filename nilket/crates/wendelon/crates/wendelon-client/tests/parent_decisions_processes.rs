@@ -2101,6 +2101,7 @@ async fn three_daemons_from_configuration_files_form_a_parent_decisions_cluster_
 		)
 		.expect("the absent row's identity"),
 	);
+	let delete_id = operation_id();
 	let bound = step(deadline);
 	let receipt = tokio::time::timeout(
 		bound,
@@ -2110,6 +2111,7 @@ async fn three_daemons_from_configuration_files_form_a_parent_decisions_cluster_
 			doomed,
 			WriteOptions {
 				deadline: Some(Instant::now() + bound),
+				operation_id: Some(delete_id),
 				..WriteOptions::default()
 			},
 		),
@@ -2135,6 +2137,43 @@ async fn three_daemons_from_configuration_files_form_a_parent_decisions_cluster_
 			&format!("after the delete statement, through node {}", member.id),
 		)
 		.await;
+		// Wendelon ADR 0113: the statement resolves, through every node, to its
+		// committed receipt; a never-used id to UNKNOWN.
+		let resolved = tokio::time::timeout(
+			step(deadline),
+			through.resolve_table_mutation(TenantId::new(TENANT), delete_id),
+		)
+		.await
+		.expect("the resolve had no answer within its bound")
+		.unwrap_or_else(|error| panic!("resolve through node {}: {error:?}", member.id));
+		assert!(
+			matches!(
+				resolved,
+				wendelon_client::ResolvedMutationOutcome::Present {
+					status: wendelon::schema::WriteStatus::OK,
+					knowledge: wendelon::schema::MutationCommitKnowledge::COMMITTED,
+					delete_counts: Some([3, 0, 1]),
+					..
+				}
+			),
+			"through node {}: {resolved:?}",
+			member.id
+		);
+		let never = tokio::time::timeout(
+			step(deadline),
+			through.resolve_table_mutation(TenantId::new(TENANT), operation_id()),
+		)
+		.await
+		.expect("the resolve had no answer within its bound")
+		.unwrap_or_else(|error| panic!("resolve through node {}: {error:?}", member.id));
+		assert!(
+			matches!(
+				never,
+				wendelon_client::ResolvedMutationOutcome::Unknown { .. }
+			),
+			"through node {}: {never:?}",
+			member.id
+		);
 	}
 	// Over the bound: the public client's 513-row statement is refused typed (batch too
 	// large) from its declared count, and the first stage's row, among the 513, stays.

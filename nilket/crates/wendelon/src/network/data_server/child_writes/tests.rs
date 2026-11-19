@@ -1130,6 +1130,8 @@ fn the_mode_opens_exactly_the_surfaces_it_serves() {
 		MsgType::WRITE_REQ,
 		MsgType::READ_REQ,
 		MsgType::TABLE_DELETE_REQ,
+		MsgType::MUTATION_OUTCOME_REQ,
+		MsgType::MUTATION_OUTCOME_PIN_REQ,
 	] {
 		assert!(peer.opens(msg_type.0), "served: {msg_type:?}");
 	}

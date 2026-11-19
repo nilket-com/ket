@@ -13,7 +13,7 @@ mod protocol;
 pub use boson::{TemporalInterval, TemporalIntervalError};
 pub use client::{
 	ClientError, ClientOperation, QueryResult, RuneQueryResult, ToronClient, ToronClientTls,
-	blocking_health_loopback,
+	blocking_health_loopback, blocking_with_loopback,
 };
 /// ADR 626: the idle timeout under a brand-neutral name, for bounds that must stay below it.
 pub use liveness::TORON_QUIC_MAX_IDLE_TIMEOUT as QUIC_MAX_IDLE_TIMEOUT;

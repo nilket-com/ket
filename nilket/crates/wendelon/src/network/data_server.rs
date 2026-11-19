@@ -242,6 +242,8 @@ mod write_clocks;
 mod write_deadline;
 use write_clocks::{WriteClocks, acquire_mutation_work_permit, bound_orphan_witness_pull};
 mod mutation_protocol;
+#[cfg(test)]
+pub(crate) use mutation_protocol::PD_RESOLVE_READ_BUDGET;
 use mutation_protocol::{TableAdmissionError, mutation_expiry_response};
 mod streaming;
 // ADR 0701: a ParentDecisions holder's batched lease renewal.

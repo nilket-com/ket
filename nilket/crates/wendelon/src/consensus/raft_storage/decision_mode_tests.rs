@@ -219,6 +219,10 @@ async fn a_new_mode_store_writes_its_own_format_and_reopens() {
 
 use crate::consensus::decisions::tests as fixture;
 
+const PARENT_DECISIONS_V30_MANIFEST: &str =
+	include_str!("../../../tests/fixtures/consensus_body/parent_decisions_v30.txt");
+/// Wendelon ADR 0112's format-29 bodies, retained. Wendelon ADR 0113 moved and added
+/// none: its table-operation index is derived, not serialized.
 const PARENT_DECISIONS_V29_MANIFEST: &str =
 	include_str!("../../../tests/fixtures/consensus_body/parent_decisions_v29.txt");
 /// Wendelon ADR 0108 to ADR 0111's format-28 bodies, retained. Wendelon ADR 0112
@@ -290,7 +294,7 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 fn manifest() -> BTreeMap<String, String> {
-	parse(PARENT_DECISIONS_V29_MANIFEST)
+	parse(PARENT_DECISIONS_V30_MANIFEST)
 }
 
 /// ADR 0725: the three owner-signed operation kinds pinned in the format-18
@@ -459,7 +463,7 @@ fn entry(index: u64, request: WendelonRequest) -> Entry<WendelonTypeConfig> {
 }
 
 #[test]
-fn the_format_29_bodies_match_their_goldens_and_round_trip() {
+fn the_format_30_bodies_match_their_goldens_and_round_trip() {
 	let stored = manifest();
 	let state = golden_state();
 	let body = encode_state_body(DecisionMode::ParentDecisions, &state).unwrap();
@@ -685,7 +689,7 @@ fn the_format_29_bodies_match_their_goldens_and_round_trip() {
 		.collect();
 	assert!(
 		moved.is_empty(),
-		"format-29 bodies moved or are missing; expected lines:\n{}",
+		"format-30 bodies moved or are missing; expected lines:\n{}",
 		moved.join("\n")
 	);
 	assert_eq!(stored.len(), actual.len());
@@ -699,6 +703,8 @@ fn the_format_29_bodies_match_their_goldens_and_round_trip() {
 	// only the decision state differs from the format-16 corpus: by exactly the
 	// appended seal.
 	assert!(decisions.sealed().is_some());
+	// Wendelon ADR 0113: the format-29 corpus, byte for byte.
+	assert_eq!(stored, parse(PARENT_DECISIONS_V29_MANIFEST));
 	// Wendelon ADR 0112: against the format-28 corpus no body moved; a delete
 	// statement's claim and noop were added.
 	const ADDED_0112: [&str; 2] = ["delete_statement_claim", "delete_statement_noop"];

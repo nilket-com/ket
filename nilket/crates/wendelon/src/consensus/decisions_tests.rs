@@ -3285,7 +3285,9 @@ fn the_seal_outlives_every_record_and_a_snapshot_cannot_drop_it() {
 	golden.validate().unwrap();
 	assert!(golden.sealed().is_some());
 	let bytes = postcard::to_stdvec(&golden).unwrap();
-	let decoded: DecisionState = postcard::from_bytes(&bytes).unwrap();
+	let mut decoded: DecisionState = postcard::from_bytes(&bytes).unwrap();
+	// Wendelon ADR 0113: as the snapshot reader does, the derived index is rebuilt.
+	decoded.restore_table_operations().unwrap();
 	assert_eq!(decoded.sealed(), golden.sealed());
 
 	// Records without a seal were not written by this build.
@@ -3308,6 +3310,8 @@ fn the_seal_outlives_every_record_and_a_snapshot_cannot_drop_it() {
 	pruned.noops.clear();
 	pruned.live = 0;
 	pruned.retained_claim_bytes = 0;
+	// Wendelon ADR 0113: the derived index follows the keys cleared by hand.
+	pruned.restore_table_operations().unwrap();
 	pruned.validate().unwrap();
 	let mut state = base(3);
 	state.decisions = Some(pruned);
@@ -3890,7 +3894,9 @@ fn takeover_arithmetic_overflow_is_a_refusal_and_the_state_round_trips() {
 
 	takeover(&mut state, range.0, generation, successor, LAPSED);
 	let bytes = postcard::to_stdvec(decisions(&state)).unwrap();
-	let decoded: DecisionState = postcard::from_bytes(&bytes).unwrap();
+	let mut decoded: DecisionState = postcard::from_bytes(&bytes).unwrap();
+	// Wendelon ADR 0113: as the snapshot reader does, the derived index is rebuilt.
+	decoded.restore_table_operations().unwrap();
 	assert_eq!(&decoded, decisions(&state));
 	decoded.validate().unwrap();
 	let lineage = decoded.lineages[&range.0];
@@ -6334,4 +6340,232 @@ fn the_delete_sequences_are_bounded_at_decode() {
 	mixed.outcomes.truncate(3);
 	let bytes = postcard::to_stdvec(&mixed).unwrap();
 	assert!(postcard::from_bytes::<DeleteSelection>(&bytes).is_ok());
+}
+
+// ============================================================
+//  Wendelon ADR 0113: tenant-wide table operation identities
+// ============================================================
+
+fn on_table(key: ParentKey, table: u8) -> ParentKey {
+	ParentKey {
+		namespace: ParentNamespace::Table(crate::schema::TableObjectId::new([table; 16])),
+		..key
+	}
+}
+
+fn table_resolution(state: &SmState, key: &ParentKey) -> TableResolution {
+	resolve_table_operation(
+		decisions(state),
+		key.tenant,
+		key.client_uuid,
+		key.sequence_no,
+	)
+}
+
+/// One table operation identity names one table, tenant-wide: a second table under
+/// it conflicts at Reserve and at RecordNoop, in either order, with no record and
+/// the first table's receipt unchanged. The same table keeps its digest conflict
+/// and its replay. Another tenant, and the KV namespace, are independent.
+#[test]
+fn a_table_operation_identity_names_one_table_per_tenant() {
+	let mut state = base(3);
+	grant_all(&mut state);
+	let a = key(T0, 1);
+	let first = claim(a, children(&state, 1), 0);
+	let DecisionResult::Reserved { reservation } = reserve(&mut state, &first, T0) else {
+		panic!("the first table reserves");
+	};
+	let before = decisions(&state).clone();
+	// Another table, a Reserve: conflict, nothing recorded.
+	let other = Claim {
+		key: on_table(a, 0x42),
+		..first.clone()
+	};
+	assert_eq!(
+		reserve(&mut state, &other, T0),
+		refused(DecisionRefusal::Conflict)
+	);
+	// Another table, a RecordNoop: conflict too.
+	let mut noop = noop_body(&state, 1, 1);
+	noop.key = on_table(a, 0x42);
+	assert_eq!(
+		record_noop(&mut state, noop),
+		refused(DecisionRefusal::Conflict)
+	);
+	assert_eq!(decisions(&state), &before, "neither offer changed anything");
+	assert!(matches!(
+		table_resolution(&state, &a),
+		TableResolution::Reserved { delete: false }
+	));
+	// The same table: replay answers the record; another digest conflicts.
+	assert_eq!(
+		reserve(&mut state, &first, T0),
+		DecisionResult::Reserved { reservation }
+	);
+	let changed = Claim {
+		request_digest: [8; 32],
+		..first.clone()
+	};
+	assert_eq!(
+		reserve(&mut state, &changed, T0),
+		refused(DecisionRefusal::Conflict)
+	);
+	// Another tenant with the same identity on the other table is independent.
+	let elsewhere = ParentKey {
+		tenant: TenantId::new(TENANT.get() + 1),
+		..on_table(a, 0x42)
+	};
+	assert_eq!(
+		resolve_table_operation(
+			decisions(&state),
+			elsewhere.tenant,
+			a.client_uuid,
+			a.sequence_no
+		),
+		TableResolution::Unknown
+	);
+	// The KV namespace never answers a table resolve, and never conflicts with one.
+	let kv_key = ParentKey {
+		namespace: ParentNamespace::Kv,
+		..a
+	};
+	assert_eq!(lookup(decisions(&state), &kv_key, &[9; 32]), Ok(None));
+	decisions(&state).validate().unwrap();
+
+	// The other order: a noop on table B first, then a Reserve on table A.
+	let mut state = base(3);
+	grant_all(&mut state);
+	let noop = noop_body(&state, 2, 1);
+	let noop_key = noop.key;
+	assert!(matches!(
+		record_noop(&mut state, noop),
+		DecisionResult::Terminal { .. }
+	));
+	let later = Claim {
+		key: on_table(noop_key, 0x43),
+		..claim(noop_key, children(&state, 1), 0)
+	};
+	assert_eq!(
+		reserve(&mut state, &later, T0),
+		refused(DecisionRefusal::Conflict)
+	);
+	assert!(matches!(
+		table_resolution(&state, &noop_key),
+		TableResolution::Noop {
+			counts: [0, 0, 1],
+			..
+		}
+	));
+	decisions(&state).validate().unwrap();
+}
+
+/// The resolve reads key presence first, then the replicated cutoff: Reserved
+/// stays pending, Accepted carries its receipt, Refused had no effect, and an
+/// identity with no retained key is UNKNOWN above the cutoff, EXPIRED at or below
+/// it (also once its key retired with its body still retained), and invalid when
+/// not a UUIDv7.
+#[test]
+fn the_table_resolve_reads_key_presence_then_the_cutoff() {
+	let mut state = base(3);
+	grant_all(&mut state);
+	let accepted = claim(key(T0, 1), children(&state, 1), 0);
+	let DecisionResult::Reserved { reservation } = reserve(&mut state, &accepted, T0) else {
+		panic!("reserve");
+	};
+	assert!(matches!(
+		table_resolution(&state, &accepted.key),
+		TableResolution::Reserved { delete: false }
+	));
+	assert!(matches!(
+		finalize(&mut state, &accepted, quorum_acks(&accepted, reservation)),
+		DecisionResult::Terminal { .. }
+	));
+	let TableResolution::Accepted {
+		dec,
+		commit_hlc,
+		delete_counts: None,
+	} = table_resolution(&state, &accepted.key)
+	else {
+		panic!("accepted");
+	};
+	assert!(dec > reservation);
+	assert_eq!(commit_hlc, accepted.commit_hlc);
+
+	let refused_claim = claim(key(T0, 2), children(&state, 1), 0);
+	let DecisionResult::Reserved { reservation } = reserve(&mut state, &refused_claim, T0) else {
+		panic!("reserve");
+	};
+	assert!(matches!(
+		abort(&mut state, &refused_claim, reservation),
+		DecisionResult::Terminal { .. }
+	));
+	assert_eq!(
+		table_resolution(&state, &refused_claim.key),
+		TableResolution::Refused { delete: false }
+	);
+
+	let fresh = key(T0, 3);
+	assert_eq!(table_resolution(&state, &fresh), TableResolution::Unknown);
+	let old = key(1_000, 1);
+	assert_eq!(table_resolution(&state, &old), TableResolution::Expired);
+	let invalid = ParentKey {
+		client_uuid: [0; 16],
+		..fresh
+	};
+	assert_eq!(
+		table_resolution(&state, &invalid),
+		TableResolution::InvalidIdentity
+	);
+
+	// The floor retires the terminal keys, and their index entries with them;
+	// the accepted body stays until a generation, yet the identity is EXPIRED.
+	let bodies = decisions(&state).bodies.len();
+	assert!(matches!(
+		decide(
+			&mut state,
+			DecisionCommand::AdvanceFloor {
+				floor_ms: T0 + 1,
+				stamp_ms: T0 + DECISION_EXPIRY_MS + 10,
+			},
+		),
+		DecisionResult::FloorAdvanced { .. }
+	));
+	assert_eq!(decisions(&state).bodies.len(), bodies, "bodies retained");
+	assert_eq!(
+		table_resolution(&state, &accepted.key),
+		TableResolution::Expired
+	);
+	assert_eq!(
+		decisions(&state).table_of_operation(accepted.key.operation()),
+		None,
+		"the index followed the key"
+	);
+	decisions(&state).validate().unwrap();
+}
+
+/// The index is derived, never serialized: rebuilt on decode and checked, and a
+/// state holding one identity under two tables refuses.
+#[test]
+fn the_table_operation_index_is_rebuilt_on_decode_and_fails_closed() {
+	let mut state = base(3);
+	grant_all(&mut state);
+	let first = claim(key(T0, 1), children(&state, 1), 0);
+	assert!(matches!(
+		reserve(&mut state, &first, T0),
+		DecisionResult::Reserved { .. }
+	));
+	let bytes = postcard::to_stdvec(decisions(&state)).unwrap();
+	let mut decoded: DecisionState = postcard::from_bytes(&bytes).unwrap();
+	assert!(
+		decoded.validate().is_err(),
+		"an undecoded index does not match the keys"
+	);
+	decoded.restore_table_operations().unwrap();
+	decoded.validate().unwrap();
+	assert_eq!(&decoded, decisions(&state));
+	// A tampered state with the same identity under a second table refuses.
+	let entry = decoded.keys[&first.key];
+	decoded.keys.insert(on_table(first.key, 0x42), entry);
+	assert!(decoded.restore_table_operations().is_err());
+	assert!(decoded.validate().is_err());
 }

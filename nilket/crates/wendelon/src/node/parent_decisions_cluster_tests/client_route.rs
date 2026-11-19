@@ -66,6 +66,8 @@ struct Scripted {
 	status_requests: AtomicUsize,
 	/// A status request is counted and then fails; table writes are answered.
 	fail_status: std::sync::atomic::AtomicBool,
+	/// Wendelon ADR 0113: mutation-outcome resolves received, each withheld.
+	resolve_requests: AtomicUsize,
 }
 
 impl Scripted {
@@ -77,6 +79,7 @@ impl Scripted {
 			attempts_remaining: Default::default(),
 			status_requests: AtomicUsize::new(0),
 			fail_status: Default::default(),
+			resolve_requests: AtomicUsize::new(0),
 		})
 	}
 
@@ -116,6 +119,11 @@ impl HrftService for Scripted {
 				MsgType::STATUS_RESP,
 				crate::network::wire::encode(&status_of(self.leader))?,
 			)));
+		}
+		if frame.header.msg_type == MsgType::MUTATION_OUTCOME_REQ.0 {
+			// Wendelon ADR 0113: a node that receives a resolve and never answers.
+			self.resolve_requests.fetch_add(1, Ordering::SeqCst);
+			std::future::pending::<()>().await;
 		}
 		assert_eq!(frame.header.msg_type, MsgType::TABLE_WRITE_REQ.0);
 		let request: TableWriteRequestMeta =
@@ -972,5 +980,38 @@ async fn not_serving_answers_to_every_attempt_end_in_typed_exhaustion() {
 	assert_eq!(
 		fixture.entry.write_ids.lock().unwrap().len(),
 		crate::client::DATA_RETRY_BUDGET
+	);
+}
+
+/// Wendelon ADR 0113: a node that receives the resolve and withholds its answer,
+/// and another whose connect never completes, cannot hold the public resolve: it
+/// ends at its one budget with a TimedOut error and no outcome.
+#[tokio::test(start_paused = true)]
+async fn a_withheld_resolve_answer_ends_the_public_call_at_its_budget_with_no_outcome() {
+	let fixture = fixture(&[], PENDING);
+	let client = client_over(&fixture, static_topology());
+	let started = tokio::time::Instant::now();
+	let answer = client
+		.resolve_mutation_outcome(crate::client::core::MutationOutcomeRequest {
+			tenant_id: TenantId::ZERO,
+			operation_id: crate::schema::ClientWriteId {
+				client_uuid: uuid_v7(),
+				sequence_no: 1,
+				idempotency_ttl_ms: 30_000,
+				_pad: 0,
+			},
+		})
+		.await;
+	let elapsed = started.elapsed();
+	let error = answer.expect_err("no outcome is asserted");
+	assert_eq!(error.kind(), std::io::ErrorKind::TimedOut, "{error}");
+	let budget = crate::client::core::MUTATION_RESOLVE_BUDGET;
+	assert!(
+		elapsed >= budget && elapsed < budget + Duration::from_secs(1),
+		"{elapsed:?}"
+	);
+	assert!(
+		fixture.entry.resolve_requests.load(Ordering::SeqCst) >= 1,
+		"a node received the resolve and withheld its answer"
 	);
 }

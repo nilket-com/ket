@@ -6770,6 +6770,8 @@ mod attempt_exhaustion;
 mod multi_row_delete;
 #[path = "parent_decisions_cluster_tests/one_voter.rs"]
 mod one_voter;
+#[path = "parent_decisions_cluster_tests/resolve.rs"]
+mod resolve;
 
 #[path = "parent_decisions_cluster_tests/offload.rs"]
 mod offload;

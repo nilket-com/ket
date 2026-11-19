@@ -1267,6 +1267,146 @@ fn local_profile_parent_decisions_multi_row_delete_is_one_statement() {
 	std::fs::remove_dir_all(harness).expect("remove parent-decisions delete fixture");
 }
 
+/// Wendelon ADR 0113: the public mutation-outcome contract through the public SQL
+/// client, on each authority's fresh local profile. A committed INSERT and DELETE
+/// resolve as committed (the DELETE with its counts) and a never-used id as
+/// UNKNOWN. Under ParentDecisions a table operation id is tenant-wide: reusing it
+/// on another table is refused and writes nothing there, and the id still resolves
+/// to the first statement. Every answer is recorded before any assertion. Today is
+/// the control (its reuse answer is DC-266, registered separately).
+#[test]
+#[ignore = "requires Linux io_uring and the fixed local-profile ports"]
+fn local_profile_public_mutation_outcomes_resolve_on_both_authorities() {
+	use toron_client::{
+		MutationCommitKnowledge, MutationResolution, QueryId, ResolvedOperationOutcome, ToronClient,
+	};
+	let _serial = LIVE_LOCAL_LOCK.lock().expect("live-profile test lock");
+	let mut observed = Vec::new();
+	for authority in ["today", "parent-decisions"] {
+		let harness = fresh_dir(&format!("local-profile-resolve-{authority}"));
+		let profile = harness.join("profile");
+		let log = harness.join("local.stderr.log");
+		let init = nilket(&[
+			"local",
+			"init",
+			"--data-dir",
+			profile.to_str().expect("utf8 profile path"),
+			"--decision-authority",
+			authority,
+		]);
+		assert!(init.status.success(), "{authority}: {init:?}");
+		let live = LiveLocal::spawn(&profile, &log);
+		let sql = live.ready.sql_endpoint;
+		assert_sql_success(
+			sql,
+			"CREATE TABLE pd_res (id BIGINT NOT NULL PRIMARY KEY, label TEXT)",
+		);
+		assert_sql_success(
+			sql,
+			"CREATE TABLE pd_res_other (id BIGINT NOT NULL PRIMARY KEY, label TEXT)",
+		);
+		let run = toron_client::blocking_with_loopback(&sql.to_string(), |client| async move {
+			let (insert, delete, never) = (QueryId::new(), QueryId::new(), QueryId::new());
+			let wrote = client
+				.execute_with_query_id(
+					insert,
+					"INSERT INTO pd_res (id, label) VALUES (1, 'one'), (2, 'two'), (3, 'three')",
+					"UTC",
+				)
+				.await
+				.map(|_| ());
+			let deleted = client
+				.execute_with_query_id(delete, "DELETE FROM pd_res WHERE id IN (1, 2)", "UTC")
+				.await
+				.map(|_| ());
+			let insert_outcome = client.resolve_mutation(insert).await;
+			let delete_outcome = client.resolve_mutation(delete).await;
+			let never_outcome = client.resolve_mutation(never).await;
+			// The INSERT's id reused on another table, its rows, and the id again.
+			let reused = client
+				.execute_with_query_id(
+					insert,
+					"INSERT INTO pd_res_other (id, label) VALUES (9, 'nine')",
+					"UTC",
+				)
+				.await
+				.map(|_| ());
+			let other_rows = client
+				.execute("SELECT id FROM pd_res_other")
+				.await
+				.map(|result| result.row_count);
+			let after_reuse = client.resolve_mutation(insert).await;
+			Ok((
+				wrote,
+				deleted,
+				insert_outcome,
+				delete_outcome,
+				never_outcome,
+				reused,
+				other_rows,
+				after_reuse,
+			))
+		})
+		.expect("the public client runs");
+		eprintln!("RESOLVE {authority}: {run:?}");
+		observed.push((authority, run));
+		live.stop_gracefully();
+		std::fs::remove_dir_all(harness).expect("remove resolve fixture");
+	}
+	for (authority, (wrote, deleted, insert, delete, never, reused, other_rows, after_reuse)) in
+		observed
+	{
+		assert!(
+			wrote.is_ok() && deleted.is_ok(),
+			"{authority}: {wrote:?} {deleted:?}"
+		);
+		let mutation = |outcome: Result<ResolvedOperationOutcome, toron_client::ClientError>,
+		                what: &str| match outcome {
+			Ok(ResolvedOperationOutcome::Mutation(outcome)) => outcome,
+			other => panic!("{authority}: {what}: {other:?}"),
+		};
+		let insert = mutation(insert, "the committed INSERT resolves");
+		assert_eq!(
+			insert.resolution,
+			MutationResolution::Present,
+			"{authority}"
+		);
+		assert_eq!(
+			insert.commit_knowledge,
+			MutationCommitKnowledge::Committed,
+			"{authority}"
+		);
+		assert_eq!(insert.delete_counts, None, "{authority}");
+		let delete = mutation(delete, "the committed DELETE resolves");
+		assert_eq!(
+			delete.resolution,
+			MutationResolution::Present,
+			"{authority}"
+		);
+		assert_eq!(
+			delete.commit_knowledge,
+			MutationCommitKnowledge::Committed,
+			"{authority}"
+		);
+		assert_eq!(delete.delete_counts, Some([2, 0, 0]), "{authority}");
+		let never = mutation(never, "a never-used id answers");
+		assert_eq!(never.resolution, MutationResolution::Unknown, "{authority}");
+		if authority == "parent-decisions" {
+			assert!(
+				reused.is_err(),
+				"a reused id on another table is refused: {reused:?}"
+			);
+			assert_eq!(
+				other_rows.expect("the other table reads"),
+				0,
+				"and writes nothing there"
+			);
+			let again = mutation(after_reuse, "the id still resolves");
+			assert_eq!(again, insert, "to the first statement");
+		}
+	}
+}
+
 #[test]
 #[ignore = "requires Linux io_uring and the fixed local-profile ports"]
 fn local_profile_parent_death_reaps_roles_and_allows_stale_manifest_restart() {

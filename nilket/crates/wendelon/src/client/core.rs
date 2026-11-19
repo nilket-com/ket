@@ -135,6 +135,12 @@ fn remaining_duration_millis(deadline: Option<Instant>) -> u64 {
 /// than the caller's deadline allows.
 pub(crate) const MUTATION_CANDIDATE_BUDGET: Duration = Duration::from_secs(1);
 
+/// Wendelon ADR 0113: the whole of one public mutation-outcome resolve, every node
+/// asked included (the request carries no caller deadline). A node that withholds
+/// its answer ends the call here with a TimedOut error and no outcome. It covers
+/// three nodes each answering UNAVAILABLE at the server's read budget (3 s).
+pub(crate) const MUTATION_RESOLVE_BUDGET: Duration = Duration::from_secs(10);
+
 fn deadline_passed(deadline: Option<Instant>) -> bool {
 	deadline.is_some_and(|deadline| Instant::now() >= deadline)
 }
@@ -1036,8 +1042,27 @@ impl WendelonClient {
 		let mut expired = None;
 		let mut unknown = None;
 		let mut first_error = None;
+		let deadline = Instant::now() + MUTATION_RESOLVE_BUDGET;
 		for target in targets {
-			match self.resolve_mutation_outcome_once(target, &request).await {
+			let Ok(answered) = bounded(
+				Some(deadline),
+				None,
+				self.resolve_mutation_outcome_once(target, &request),
+			)
+			.await
+			else {
+				// A withheld answer: the budget ends the call. Replies already received
+				// keep their precedence below; absence is never promoted to UNKNOWN.
+				first_error.get_or_insert(Error::new(
+					ErrorKind::TimedOut,
+					format!(
+						"mutation outcome resolve exceeded its budget at node {}",
+						target.id
+					),
+				));
+				break;
+			};
+			match answered {
 				Ok(result) if result.response.resolution == MutationResolutionStatus::PRESENT => {
 					return Ok(result);
 				}
@@ -1046,6 +1071,25 @@ impl WendelonClient {
 				}
 				Ok(result) if result.response.resolution == MutationResolutionStatus::UNKNOWN => {
 					unknown.get_or_insert(result);
+				}
+				// Wendelon ADR 0113: a node that could not read the outcome linearizably
+				// now is an error from that node, never knowledge: it keeps UNKNOWN from
+				// being answered, exactly as a failed request does.
+				Ok(result)
+					if result.response.resolution == MutationResolutionStatus::UNAVAILABLE =>
+				{
+					first_error.get_or_insert(Error::new(
+						ErrorKind::TimedOut,
+						format!("mutation outcome unavailable at node {}", target.id),
+					));
+				}
+				Ok(result)
+					if result.response.resolution == MutationResolutionStatus::INVALID_REQUEST =>
+				{
+					return Err(Error::new(
+						ErrorKind::InvalidInput,
+						"mutation outcome request names an invalid operation identity",
+					));
 				}
 				Ok(result) => {
 					return Err(Error::new(
@@ -1106,6 +1150,9 @@ impl WendelonClient {
 				return Err(Error::new(
 					if response.status == MutationOutcomePinStatus::CAPACITY_EXHAUSTED {
 						ErrorKind::WouldBlock
+					} else if response.status == MutationOutcomePinStatus::UNSUPPORTED {
+						// Wendelon ADR 0113: this authority does not retain by pin.
+						ErrorKind::Unsupported
 					} else {
 						ErrorKind::InvalidInput
 					},
