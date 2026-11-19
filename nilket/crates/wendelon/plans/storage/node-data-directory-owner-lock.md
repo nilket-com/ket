@@ -139,7 +139,7 @@ versus close, timeout retaining LOCK, and cleanup continuing after an error.
 - `ci/README.md`, **Test concurrency**.
 - `WendelonNode::bootstrap_with_transport_stack` and restore wrappers in `src/node.rs`.
 - `NodeHandles::shutdown` in `src/node.rs`.
-- Existing `flock` precedent in `src/storage/mutation_visibility/root2/durable/local_store/adapter.rs` and the L-1 independent-open test in `src/storage/mutation_visibility/root2/provisioning/tests/owner_log.rs`.
+- The L-1 independent-open test in `src/storage/mutation_visibility/root2/provisioning/tests/owner_log.rs`.
 
 ## Amendment — shutdown completeness, hard termination and recovery mode (2026-10-18)
 
@@ -162,9 +162,8 @@ The lock holders below now unlock explicitly (`LOCK_UN`) before closing, includi
 - the data-directory owner;
 - `MarkStore2`;
 - `OwnerDir2`;
-- the Root2 local store, through a `LockedFile` guard, with `LocalAdapter::unlock_now` required of every adapter;
 - nilket's profile lock.
 
 redb and `nilket-local` already unlocked explicitly. This was the root cause of the parallel-only `mark_store` Busy defect candidate.
 
-Regression tests hold a child inside its fork-to-exec window for the data-directory owner, `MarkStore2` and `OwnerDir2`, and each fails without its fix. The local store and the nilket profile lock have the same fix but no dedicated fork-window test. Process-spawning ownership tests still live in their own test binary (`tests/process_ownership.rs`).
+Regression tests hold a child inside its fork-to-exec window for the data-directory owner, `MarkStore2` and `OwnerDir2`, and each fails without its fix. The nilket profile lock has the same fix but no dedicated fork-window test. Process-spawning ownership tests still live in their own test binary (`tests/process_ownership.rs`).

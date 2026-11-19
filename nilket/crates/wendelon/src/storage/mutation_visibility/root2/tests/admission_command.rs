@@ -305,14 +305,6 @@ fn permission_result_codec_and_goldens() {
 	};
 	assert!(outcome.decision.index <= p.index && outcome.identity.generation == g);
 	assert_eq!(outcome.encode().err(), Some(RootError2::Codec));
-	// The local store scan only sees journal records that passed the decode above, and keeps its
-	// own Parent-only refusal.
-	let scan = include_str!("../durable/local_store/scan.rs");
-	assert_eq!(
-		scan.matches("ApplyResult2::Parent { record, .. }) = ApplyResult2::decode(")
-			.count(),
-		2
-	);
 }
 
 #[test]
