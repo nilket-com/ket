@@ -2174,6 +2174,29 @@ async fn three_daemons_from_configuration_files_form_a_parent_decisions_cluster_
 			"through node {}: {never:?}",
 			member.id
 		);
+		// A public table-query cancel reaches each real node's handler and is answered,
+		// typed, never a dropped stream: an id not yet running is ACCEPTED (the existing
+		// early-cancel contract).
+		let cancelled = tokio::time::timeout(
+			step(deadline),
+			through.cancel_table_query_attempt(
+				wendelon::schema::NodeId {
+					id: member.id,
+					_reserved: 0,
+				},
+				TenantId::new(TENANT),
+				wendelon::schema::TableQueryRequestId::new(*uuid::Uuid::now_v7().as_bytes()),
+			),
+		)
+		.await
+		.expect("the cancel had no answer within its bound")
+		.unwrap_or_else(|error| panic!("cancel at node {}: {error:?}", member.id));
+		assert_eq!(
+			cancelled.status,
+			wendelon::schema::TableQueryCancelStatus::ACCEPTED,
+			"at node {}",
+			member.id
+		);
 	}
 	// Over the bound: the public client's 513-row statement is refused typed (batch too
 	// large) from its declared count, and the first stage's row, among the 513, stays.

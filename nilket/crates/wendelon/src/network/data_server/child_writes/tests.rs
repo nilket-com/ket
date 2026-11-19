@@ -1132,6 +1132,7 @@ fn the_mode_opens_exactly_the_surfaces_it_serves() {
 		MsgType::TABLE_DELETE_REQ,
 		MsgType::MUTATION_OUTCOME_REQ,
 		MsgType::MUTATION_OUTCOME_PIN_REQ,
+		MsgType::TABLE_QUERY_CANCEL_REQ,
 	] {
 		assert!(peer.opens(msg_type.0), "served: {msg_type:?}");
 	}

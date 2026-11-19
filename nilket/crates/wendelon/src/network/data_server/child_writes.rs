@@ -1298,9 +1298,11 @@ impl DecisionPeer {
 	/// other data message (migration, bulk, counters, frames, other mutation
 	/// paths) stays refused. Wendelon ADR 0113: a public mutation-outcome resolve
 	/// is served from the replicated decisions, and an outcome pin or acknowledge
-	/// answers a typed unsupported.
+	/// answers a typed unsupported. The cancellation of an in-flight table query is
+	/// served by its existing authorized handler and registry.
 	pub(crate) fn opens(&self, msg_type: u8) -> bool {
-		const SERVED: [MsgType; 11] = [
+		const SERVED: [MsgType; 12] = [
+			MsgType::TABLE_QUERY_CANCEL_REQ,
 			MsgType::MUTATION_OUTCOME_REQ,
 			MsgType::MUTATION_OUTCOME_PIN_REQ,
 			MsgType::TABLE_BASE_FETCH_REQ,
