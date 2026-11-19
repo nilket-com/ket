@@ -722,13 +722,33 @@ impl DataDirectoryOwner {
 	/// Acquire an existing data directory. Configuration validation should run
 	/// before this call so ordinary startup does not create operator paths.
 	pub fn acquire_existing(data_dir: impl AsRef<Path>) -> std::io::Result<Self> {
-		Self::acquire(data_dir.as_ref(), false)
+		Self::acquire(data_dir.as_ref(), false, &|_| Ok(()))
 	}
 
 	/// Acquire a directory for an authorized restore or profile reset entry point.
 	/// This is the only variant that creates the data-directory path.
 	pub fn acquire_or_create(data_dir: impl AsRef<Path>) -> std::io::Result<Self> {
-		Self::acquire(data_dir.as_ref(), true)
+		Self::acquire(data_dir.as_ref(), true, &|_| Ok(()))
+	}
+
+	/// `acquire_existing` for a daemon start: `admit` judges the directory before
+	/// its sentinel is opened (so a refused directory gains no `LOCK`) and again
+	/// under the exclusive lock, before the clean-shutdown record is consumed. A
+	/// refusal therefore changes no byte of the store, and its own binary still
+	/// starts it clean.
+	pub fn acquire_existing_admitted(
+		data_dir: impl AsRef<Path>,
+		admit: impl Fn(&Path) -> std::io::Result<()>,
+	) -> std::io::Result<Self> {
+		Self::acquire(data_dir.as_ref(), false, &admit)
+	}
+
+	/// `acquire_or_create` with the admission of [`Self::acquire_existing_admitted`].
+	pub fn acquire_or_create_admitted(
+		data_dir: impl AsRef<Path>,
+		admit: impl Fn(&Path) -> std::io::Result<()>,
+	) -> std::io::Result<Self> {
+		Self::acquire(data_dir.as_ref(), true, &admit)
 	}
 
 	/// Canonical path held by this owner.
@@ -795,7 +815,11 @@ impl DataDirectoryOwner {
 		Ok(())
 	}
 
-	fn acquire(data_dir: &Path, create: bool) -> std::io::Result<Self> {
+	fn acquire(
+		data_dir: &Path,
+		create: bool,
+		admit: &dyn Fn(&Path) -> std::io::Result<()>,
+	) -> std::io::Result<Self> {
 		if create {
 			fs::create_dir_all(data_dir)?;
 		}
@@ -810,12 +834,16 @@ impl DataDirectoryOwner {
 				),
 			));
 		}
-		acquire_lock(canonical)
+		admit(&canonical)?;
+		acquire_lock(canonical, admit)
 	}
 }
 
 #[cfg(unix)]
-fn acquire_lock(canonical: PathBuf) -> std::io::Result<DataDirectoryOwner> {
+fn acquire_lock(
+	canonical: PathBuf,
+	admit: &dyn Fn(&Path) -> std::io::Result<()>,
+) -> std::io::Result<DataDirectoryOwner> {
 	use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
 	let lock_path = canonical.join("LOCK");
@@ -886,6 +914,9 @@ fn acquire_lock(canonical: PathBuf) -> std::io::Result<DataDirectoryOwner> {
 	// without a LOCK (an older build, or a lock removed by hand) is not fresh.
 	// Held from here: an error below must still unlock explicitly, not by close.
 	let file = HeldFlock(file);
+	// The admission again, now that no other owner can change the directory: a
+	// refusal returns here, unlocking, before the clean-shutdown record is read.
+	admit(&canonical)?;
 	let previous_shutdown_clean =
 		consume_clean_shutdown_record(&canonical)? || directory_is_fresh(&canonical)?;
 	Ok(DataDirectoryOwner {
@@ -964,7 +995,10 @@ fn consume_clean_shutdown_record(dir: &Path) -> std::io::Result<bool> {
 }
 
 #[cfg(not(unix))]
-fn acquire_lock(canonical: PathBuf) -> std::io::Result<DataDirectoryOwner> {
+fn acquire_lock(
+	canonical: PathBuf,
+	_admit: &dyn Fn(&Path) -> std::io::Result<()>,
+) -> std::io::Result<DataDirectoryOwner> {
 	Err(Error::new(
 		ErrorKind::Unsupported,
 		format!(
@@ -1000,6 +1034,57 @@ mod tests {
 		fn drop(&mut self) {
 			let _ = fs::remove_dir_all(&self.0);
 		}
+	}
+
+	/// A refused admission leaves the directory as it was, its clean-shutdown record
+	/// included, and releases the lock; a later admitted start finds the stop clean.
+	/// A refused directory that never held a sentinel gains none.
+	#[tokio::test]
+	async fn a_refused_admission_keeps_the_clean_record_and_the_lock_is_released() {
+		let dir = TestDir::new();
+		let owner = DataDirectoryOwner::acquire_existing(dir.path()).unwrap();
+		owner.close(Duration::from_secs(5)).await.unwrap();
+		let record = dir.path().join(CLEAN_SHUTDOWN_RECORD);
+		assert!(record.exists(), "a clean close");
+		let refuse = |_: &Path| Err(Error::new(ErrorKind::InvalidData, "foreign"));
+		let err = DataDirectoryOwner::acquire_existing_admitted(dir.path(), refuse).unwrap_err();
+		assert_eq!(err.kind(), ErrorKind::InvalidData);
+		assert!(record.exists(), "the refusal kept the clean record");
+		let admitted =
+			DataDirectoryOwner::acquire_existing_admitted(dir.path(), |_| Ok(())).unwrap();
+		assert!(
+			admitted.previous_shutdown_clean(),
+			"the stop is still clean"
+		);
+		assert!(!record.exists(), "an admitted start consumes it");
+		drop(admitted);
+
+		// A directory that changes between the unlocked and the locked judgement is
+		// refused by the locked one, before the record is read.
+		let owner = DataDirectoryOwner::acquire_existing(dir.path()).unwrap();
+		owner.close(Duration::from_secs(5)).await.unwrap();
+		let calls = std::sync::atomic::AtomicUsize::new(0);
+		let changed = |_: &Path| {
+			if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+				Ok(())
+			} else {
+				Err(Error::new(ErrorKind::InvalidData, "changed under the lock"))
+			}
+		};
+		assert!(DataDirectoryOwner::acquire_existing_admitted(dir.path(), changed).is_err());
+		assert_eq!(
+			calls.load(std::sync::atomic::Ordering::SeqCst),
+			2,
+			"judged twice"
+		);
+		assert!(record.exists(), "the locked refusal kept the clean record");
+
+		let bare = TestDir::new();
+		assert!(DataDirectoryOwner::acquire_existing_admitted(bare.path(), refuse).is_err());
+		assert!(
+			!bare.path().join("LOCK").exists(),
+			"no sentinel for a refused directory"
+		);
 	}
 
 	#[test]

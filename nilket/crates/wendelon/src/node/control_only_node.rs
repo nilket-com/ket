@@ -77,7 +77,9 @@ impl ControlOnlyNode {
 				"RaftRoleMismatch: this data directory holds no control-only identity and no replacement token",
 			));
 		}
-		let owner = DataDirectoryOwner::acquire_or_create(&cfg.data_dir)?;
+		let owner = DataDirectoryOwner::acquire_or_create_admitted(&cfg.data_dir, |dir| {
+			cfg.decision_mode.refuse_foreign_marker(dir)
+		})?;
 		let wal_io = spawn_io_thread_named_for_class(
 			cfg.wal_io_depth,
 			"wendelon-io-uring-wal",

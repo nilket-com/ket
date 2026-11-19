@@ -1545,7 +1545,9 @@ impl WendelonNode {
 	/// artifacts.
 	pub async fn bootstrap(cfg: NodeBootstrapConfig) -> std::io::Result<Self> {
 		cfg.validate()?;
-		let owner = DataDirectoryOwner::acquire_existing(&cfg.data_dir)?;
+		let owner = DataDirectoryOwner::acquire_existing_admitted(&cfg.data_dir, |dir| {
+			cfg.decision_mode.refuse_foreign_marker(dir)
+		})?;
 		Self::bootstrap_scoped(
 			cfg,
 			owner,
@@ -1655,7 +1657,9 @@ impl WendelonNode {
 		cfg: NodeBootstrapConfig,
 	) -> std::io::Result<Self> {
 		cfg.validate()?;
-		let owner = DataDirectoryOwner::acquire_or_create(&cfg.data_dir)?;
+		let owner = DataDirectoryOwner::acquire_or_create_admitted(&cfg.data_dir, |dir| {
+			cfg.decision_mode.refuse_foreign_marker(dir)
+		})?;
 		Self::bootstrap_scoped(
 			cfg,
 			owner,
@@ -1671,7 +1675,9 @@ impl WendelonNode {
 		provider: Arc<dyn TransportProvider>,
 	) -> std::io::Result<Self> {
 		cfg.validate()?;
-		let owner = DataDirectoryOwner::acquire_or_create(&cfg.data_dir)?;
+		let owner = DataDirectoryOwner::acquire_or_create_admitted(&cfg.data_dir, |dir| {
+			cfg.decision_mode.refuse_foreign_marker(dir)
+		})?;
 		Self::bootstrap_scoped(
 			cfg,
 			owner,
@@ -1688,7 +1694,9 @@ impl WendelonNode {
 	) -> std::io::Result<Self> {
 		cfg.validate()?;
 		Self::validate_replacement_target(source_node_id, &cfg)?;
-		let owner = DataDirectoryOwner::acquire_or_create(&cfg.data_dir)?;
+		let owner = DataDirectoryOwner::acquire_or_create_admitted(&cfg.data_dir, |dir| {
+			cfg.decision_mode.refuse_foreign_marker(dir)
+		})?;
 		Self::bootstrap_scoped(
 			cfg,
 			owner,
@@ -1706,7 +1714,9 @@ impl WendelonNode {
 	) -> std::io::Result<Self> {
 		cfg.validate()?;
 		Self::validate_replacement_target(source_node_id, &cfg)?;
-		let owner = DataDirectoryOwner::acquire_or_create(&cfg.data_dir)?;
+		let owner = DataDirectoryOwner::acquire_or_create_admitted(&cfg.data_dir, |dir| {
+			cfg.decision_mode.refuse_foreign_marker(dir)
+		})?;
 		Self::bootstrap_scoped(
 			cfg,
 			owner,
@@ -2043,7 +2053,9 @@ impl WendelonNode {
 		provider_tier: TransportTier,
 	) -> std::io::Result<Self> {
 		cfg.validate()?;
-		let owner = DataDirectoryOwner::acquire_existing(&cfg.data_dir)?;
+		let owner = DataDirectoryOwner::acquire_existing_admitted(&cfg.data_dir, |dir| {
+			cfg.decision_mode.refuse_foreign_marker(dir)
+		})?;
 		Self::bootstrap_scoped(
 			cfg,
 			owner,
@@ -5230,6 +5242,50 @@ mod tests {
 				.is_err()
 		);
 		assert!(!dir.join("PARENT_DECISIONS").exists());
+	}
+
+	/// A cleanly stopped store refused at start keeps every byte, its clean-shutdown
+	/// record included: a marker of another version is refused by both authorities,
+	/// and a ParentDecisions store by Today. Its own authority then starts it clean.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+	async fn a_refused_start_keeps_the_store_and_its_clean_record() {
+		use crate::consensus::decision_mode::DecisionMode;
+		let dir = tempdir("node-refused-start-keeps-clean-record");
+		let mut cfg = NodeBootstrapConfig::dev(7008, dir.to_path_buf(), "127.0.0.1:0".into());
+		cfg.decision_mode = DecisionMode::ParentDecisions;
+		crate::node::provision_formation_intent(&cfg.data_dir).unwrap();
+		let node = WendelonNode::bootstrap_single_node(cfg.clone())
+			.await
+			.unwrap();
+		node.shutdown().await.unwrap();
+		let kept = |name: &str| std::fs::read(dir.join(name)).unwrap();
+		let (marker, clean) = (kept("PARENT_DECISIONS"), kept("CLEAN_SHUTDOWN"));
+		let mut today = cfg.clone();
+		today.decision_mode = DecisionMode::Today;
+
+		// Today on a ParentDecisions store.
+		assert!(
+			WendelonNode::bootstrap_single_node(today.clone())
+				.await
+				.is_err()
+		);
+		assert_eq!(kept("PARENT_DECISIONS"), marker);
+		assert_eq!(kept("CLEAN_SHUTDOWN"), clean, "Today kept the clean record");
+
+		// A marker of another version, by either authority.
+		std::fs::write(dir.join("PARENT_DECISIONS"), b"parent-decisions-v17\n").unwrap();
+		let retired = kept("PARENT_DECISIONS");
+		for attempt in [cfg.clone(), today] {
+			assert!(WendelonNode::bootstrap_single_node(attempt).await.is_err());
+			assert_eq!(kept("PARENT_DECISIONS"), retired);
+			assert_eq!(kept("CLEAN_SHUTDOWN"), clean, "the clean record is kept");
+		}
+
+		// Its own binary's marker back: the store starts clean.
+		std::fs::write(dir.join("PARENT_DECISIONS"), &marker).unwrap();
+		let node = WendelonNode::bootstrap_single_node(cfg).await.unwrap();
+		assert!(!node.recovered_after_unclean_shutdown(), "a clean start");
+		node.shutdown().await.unwrap();
 	}
 
 	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -301,6 +301,24 @@ impl DecisionMode {
 	/// store never changes authority. A new-mode store starts with a format-10
 	/// control-log record, written by the log store, before the marker exists, so
 	/// an older binary has a record to refuse at every point after the first write.
+	/// The part of admission a daemon start runs while it takes ownership, before the
+	/// clean-shutdown record is consumed: a marker that is malformed, of another
+	/// version, or the other authority's under Today refuses here, so that refusal
+	/// changes no byte. An absent marker is judged later by [`Self::admit_store`]: a
+	/// store made by init can hold its clean-shutdown record before its first marker.
+	pub(crate) fn refuse_foreign_marker(self, data_dir: &Path) -> std::io::Result<()> {
+		if read_marker(data_dir)? && self == Self::Today {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"store {} belongs to the ParentDecisions authority",
+					data_dir.display()
+				),
+			));
+		}
+		Ok(())
+	}
+
 	pub(crate) fn admit_store(self, data_dir: &Path) -> std::io::Result<()> {
 		let marked = read_marker(data_dir)?;
 		match (self, marked) {
