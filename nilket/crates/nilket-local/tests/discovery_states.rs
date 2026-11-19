@@ -49,6 +49,7 @@ fn write_marker(paths: &ProfilePaths) -> ProfileMarker {
 	let marker = ProfileMarker {
 		format_version: FORMAT_VERSION,
 		profile_uuid: Uuid::new_v4(),
+		decision_authority: None,
 	};
 	fs::write(
 		&paths.marker,

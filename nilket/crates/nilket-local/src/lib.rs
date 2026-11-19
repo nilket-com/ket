@@ -30,6 +30,36 @@ pub const WENDELON_ENDPOINT: &str = "127.0.0.1:7001";
 pub struct ProfileMarker {
 	pub format_version: u32,
 	pub profile_uuid: Uuid,
+	/// The write-decision authority the profile was CREATED for. Absent means no
+	/// recorded authority (Wendelon's default, Today, or a legacy profile); a
+	/// Today marker therefore keeps its exact bytes. Present, it also carries
+	/// the profile's formation stage, so the one fact that decides whether a
+	/// formation intent may be issued lives in the profile's required marker,
+	/// bound to its UUID, and is never inferred from a missing file.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub decision_authority: Option<ProfileDecisionAuthority>,
+}
+
+/// The only non-default authority a local profile can be created for. Today is
+/// the absence of a recorded authority, so it has no value of its own here.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "authority", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum ProfileDecisionAuthority {
+	/// A fresh single-node ParentDecisions store: generated decision key,
+	/// one formation intent, MVCC window 0.
+	ParentDecisions { formation: FormationStage },
+}
+
+/// Where a ParentDecisions profile's one formation stands. Only an explicit
+/// reset returns an `Issued` profile to `Initializing`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum FormationStage {
+	/// Provisioning has not completed: the intent may be provisioned, and the
+	/// daemon is never started.
+	Initializing,
+	/// The intent was issued, durably: it is never issued again.
+	Issued,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -880,6 +910,7 @@ mod tests {
 		let marker = ProfileMarker {
 			format_version: version,
 			profile_uuid: Uuid::nil(),
+			decision_authority: None,
 		};
 		fs::write(&paths.marker, toml::to_string(&marker).unwrap()).unwrap();
 		marker

@@ -1006,6 +1006,181 @@ fn local_profile_dogfood_contract_survives_restart_and_exposes_catalog() {
 	std::fs::remove_dir_all(harness).expect("remove dogfood fixture");
 }
 
+/// A rendered query answer as `nilket toron sql` prints it (an Arrow pretty
+/// table, then `(N rows)`): its header, every row's cells in order, and the
+/// reported count.
+#[derive(Debug, PartialEq, Eq)]
+struct RenderedRows {
+	header: Vec<String>,
+	rows: Vec<Vec<String>>,
+	reported: Option<usize>,
+}
+
+impl RenderedRows {
+	fn of(header: &[&str], rows: &[(&str, &str)]) -> Self {
+		Self {
+			header: header.iter().map(|cell| (*cell).to_owned()).collect(),
+			rows: rows
+				.iter()
+				.map(|(a, b)| vec![(*a).to_owned(), (*b).to_owned()])
+				.collect(),
+			reported: Some(rows.len()),
+		}
+	}
+}
+
+fn rendered_rows(rendered: &str) -> RenderedRows {
+	let mut table = rendered
+		.lines()
+		.map(str::trim)
+		.filter(|line| line.starts_with('|'))
+		.map(|line| {
+			line.trim_matches('|')
+				.split('|')
+				.map(|cell| cell.trim().to_owned())
+				.collect::<Vec<_>>()
+		});
+	let header = table.next().unwrap_or_default();
+	let rows = table.collect();
+	let reported = rendered.lines().rev().find_map(|line| {
+		line.trim()
+			.strip_prefix('(')?
+			.strip_suffix(" rows)")?
+			.parse()
+			.ok()
+	});
+	RenderedRows {
+		header,
+		rows,
+		reported,
+	}
+}
+
+/// The row oracle's own negative controls: swapped labels, a missing row, an
+/// extra row and a wrong count all differ from the expected answer.
+#[test]
+fn the_rendered_row_oracle_rejects_swapped_missing_extra_and_miscounted_rows() {
+	let render = |rows: &[(&str, &str)], count: usize| {
+		let mut text = "+----+-------+\n| id | label |\n+----+-------+\n".to_owned();
+		for (id, label) in rows {
+			text.push_str(&format!("| {id}  | {label}   |\n"));
+		}
+		text.push_str(&format!("+----+-------+\n({count} rows)"));
+		text
+	};
+	let expected = RenderedRows::of(&["id", "label"], &[("1", "one"), ("2", "two")]);
+	assert_eq!(
+		rendered_rows(&render(&[("1", "one"), ("2", "two")], 2)),
+		expected
+	);
+	for (rows, count) in [
+		(&[("1", "two"), ("2", "one")][..], 2),
+		(&[("1", "one")][..], 1),
+		(&[("1", "one"), ("2", "two"), ("3", "three")][..], 3),
+		(&[("1", "one"), ("2", "two")][..], 3),
+		(&[("2", "two"), ("1", "one")][..], 2),
+	] {
+		assert_ne!(
+			rendered_rows(&render(rows, count)),
+			expected,
+			"{rows:?} ({count} rows)"
+		);
+	}
+}
+
+/// The normal public entry point creates a fresh single-node ParentDecisions
+/// profile on request: init, start, a committed primary-key write, an exact
+/// ordered read, a stop, a re-run of init that regenerates nothing and reissues
+/// no formation intent, a restart and the same exact read.
+#[test]
+#[ignore = "requires Linux io_uring and the fixed local-profile ports"]
+fn local_profile_parent_decisions_init_commits_reads_and_survives_restart() {
+	let _serial = LIVE_LOCAL_LOCK.lock().expect("live-profile test lock");
+	let harness = fresh_dir("local-profile-parent-decisions");
+	let profile = harness.join("profile");
+	let log = harness.join("local.stderr.log");
+	let profile_arg = profile.to_str().expect("utf8 profile path");
+	let init = nilket(&[
+		"local",
+		"init",
+		"--data-dir",
+		profile_arg,
+		"--decision-authority",
+		"parent-decisions",
+	]);
+	assert!(init.status.success(), "{init:?}");
+	let config_path = profile.join("config/wendelon.toml");
+	let intent = profile.join("data/wendelon/FORMATION_INTENT");
+	let config = std::fs::read(&config_path).expect("generated wendelon config");
+	assert!(
+		String::from_utf8_lossy(&config).contains("decision_authority = \"parent-decisions\""),
+		"the profile's Wendelon config selects ParentDecisions"
+	);
+	assert!(
+		intent.exists(),
+		"a fresh profile holds its one formation intent"
+	);
+
+	let first = LiveLocal::spawn(&profile, &log);
+	assert!(!intent.exists(), "formation consumed the intent");
+	let sql = first.ready.sql_endpoint;
+	assert_sql_success(
+		sql,
+		"CREATE TABLE pd_rows (id BIGINT NOT NULL PRIMARY KEY, label TEXT)",
+	);
+	assert_eq!(
+		assert_sql_success(
+			sql,
+			"INSERT INTO pd_rows (id, label) VALUES (1, 'one'), (2, 'two')"
+		),
+		"OK rows=2\n",
+		"a committed primary-key write"
+	);
+	let expected = [("1", "one"), ("2", "two")];
+	assert_eq!(
+		rendered_rows(&assert_sql_success(
+			sql,
+			"SELECT id, label FROM pd_rows ORDER BY id"
+		)),
+		RenderedRows::of(&["id", "label"], &expected),
+		"exactly the committed rows, in order"
+	);
+	first.stop_gracefully();
+
+	// Re-running init on the initialized profile regenerates no key and
+	// reissues no formation intent.
+	let rerun = nilket(&[
+		"local",
+		"init",
+		"--data-dir",
+		profile_arg,
+		"--decision-authority",
+		"parent-decisions",
+	]);
+	assert!(rerun.status.success(), "{rerun:?}");
+	// Compared without printing: the config holds the profile's decision key.
+	assert!(
+		std::fs::read(&config_path).expect("retained config") == config,
+		"re-running init changed the retained Wendelon config"
+	);
+	assert!(
+		!intent.exists(),
+		"a consumed formation intent is never reissued"
+	);
+
+	let second = LiveLocal::spawn(&profile, &log);
+	assert_eq!(
+		rendered_rows(&assert_sql_success(
+			second.ready.sql_endpoint,
+			"SELECT id, label FROM pd_rows ORDER BY id"
+		)),
+		RenderedRows::of(&["id", "label"], &expected),
+		"the same rows, in order, after the restart"
+	);
+	second.stop_gracefully();
+	std::fs::remove_dir_all(harness).expect("remove parent-decisions profile fixture");
+}
+
 #[test]
 #[ignore = "requires Linux io_uring and the fixed local-profile ports"]
 fn local_profile_parent_death_reaps_roles_and_allows_stale_manifest_restart() {

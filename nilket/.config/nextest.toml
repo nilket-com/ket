@@ -25,3 +25,19 @@
 # 20 x 60s and reported as a failure, which is information; an unbounded wait is
 # not. Generous enough that genuinely slow tests are unaffected.
 slow-timeout = { period = "60s", terminate-after = 20 }
+
+# The ignored live local-profile tests in nilket's `cli_integration` run the real
+# supervisor, which binds the profile's fixed public endpoints (127.0.0.1:7001,
+# 7742, 7431-7433). Two at once collide: the second refuses at its own preflight
+# ("local creation conflict: Wendelon UDP endpoint 127.0.0.1:7001 is
+# unavailable", observed 2026-11-19 when nextest ran two of them together). Their
+# in-file mutex serializes them only inside one process, and nextest runs each
+# test in a process of its own. This group gives exactly those tests, which must
+# exercise the public fixed ports, cross-process exclusion; every other test,
+# including the rest of `cli_integration`, keeps running in parallel.
+[test-groups]
+live-local-fixed-ports = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'package(nilket) & binary(cli_integration) & (test(=nilket_toron_sql_file_executes_in_order_and_attributes_results) | test(=nilket_toron_sql_file_stops_with_partial_application_diagnostic) | test(=local_profile_dogfood_contract_survives_restart_and_exposes_catalog) | test(=local_profile_parent_decisions_init_commits_reads_and_survives_restart) | test(=local_profile_parent_death_reaps_roles_and_allows_stale_manifest_restart))'
+test-group = 'live-local-fixed-ports'

@@ -286,9 +286,30 @@ Restart=on-failure
   - Started by hand, or by a launcher that does not restart on 75, the replacement
     exits 75 and stays down until it is started again. Exiting does not restart
     anything by itself.
-  - `nilket local` runs one node, not a ParentDecisions cluster. It is not a
-    supervisor for a replacement: it treats any Wendelon exit as unexpected and
-    stops.
+  - `nilket local` runs one node. By default that node is Today's.
+    `nilket local init --decision-authority parent-decisions` (product ADR 0738)
+    instead creates a NEW profile, in an empty `--data-dir`, as a fresh
+    single-node ParentDecisions store:
+    - a generated decision key, and a self-only signer map (not fleet
+      provisioning);
+    - MVCC window 0;
+    - one formation intent.
+
+    The profile marker itself records the formation stage, bound to its UUID:
+    `initializing`, then, once the config, the directories and the intent are
+    synced with their directory entries, `issued` (an atomic rewrite of the
+    marker). The daemon is started only after `issued`.
+
+    After a crash, preparation either resumes a provisioning that never reached
+    a durable `issued`, or refuses. Re-running `init` or `nilket local` never
+    regenerates the key and never issues an intent again. An issued profile
+    whose store (or whole `data/`) is lost refuses to form again; only the
+    explicit `nilket local --reset` returns it to `initializing`, for a new
+    store, key and intent.
+
+    An existing profile keeps the authority it was created for, and an existing
+    store is never adopted or converted. Either way it is not a supervisor for a
+    replacement: it treats any Wendelon exit as unexpected and stops.
   - The handoff's store close leaves no clean-shutdown record on purpose: the
     control-only run performs none of a full start's recovery validation. The
     first full start therefore logs "recovering after unclean shutdown" and

@@ -18,10 +18,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fs2::FileExt;
 use nilket_local::{
-	DevelopmentPki, FORMAT_VERSION, LocalWorkspace, ProfileMarker, ProfilePaths, RuntimeManifest,
-	SQL_ENDPOINT, WENDELON_ENDPOINT, blocking_discover, process_start_token,
-	publish_runtime_manifest, resolve_profile_root, write_create_new,
-	write_profile_development_pki,
+	DevelopmentPki, FORMAT_VERSION, FormationStage, LocalWorkspace, ProfileDecisionAuthority,
+	ProfileMarker, ProfilePaths, RuntimeManifest, SQL_ENDPOINT, WENDELON_ENDPOINT,
+	blocking_discover, process_start_token, publish_runtime_manifest, resolve_profile_root,
+	write_create_new, write_profile_development_pki,
 };
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::{Pid, getpid, getppid};
@@ -69,7 +69,22 @@ pub struct LocalOptions {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalInitOptions {
 	pub data_dir: Option<PathBuf>,
+	/// `--decision-authority`. Absent asks for nothing: a new profile is created
+	/// for Wendelon's default (Today), an existing one keeps what it was created
+	/// for. A request that conflicts with an existing profile fails, unchanged.
+	pub decision_authority: Option<RequestedDecisionAuthority>,
 }
+
+/// An explicit `nilket local init --decision-authority` request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestedDecisionAuthority {
+	Today,
+	/// A fresh single-node ParentDecisions profile: only in a new, empty profile
+	/// root (or one this request created and did not finish).
+	ParentDecisions,
+}
+
+mod parent_decisions;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalReady {
@@ -271,6 +286,14 @@ pub fn init(options: LocalInitOptions) -> ExitCode {
 		Ok(root) => {
 			eprintln!("nilket local init: profile {}", root.display());
 			eprintln!("nilket local init: development-only PKI; not production custody");
+			let marker = fs::read_to_string(root.join("profile.toml"))
+				.ok()
+				.and_then(|text| toml::from_str::<ProfileMarker>(&text).ok());
+			if marker.as_ref().and_then(parent_decisions::stage).is_some() {
+				eprintln!(
+					"nilket local init: ParentDecisions authority: a fresh single-node store; generated decision key, not fleet provisioning"
+				);
+			}
 			ExitCode::SUCCESS
 		}
 		Err(message) => {
@@ -299,7 +322,7 @@ fn init_owned(options: LocalInitOptions) -> Result<PathBuf, String> {
 		Err(error) => return Err(format!("failed to lock {}: {error}", paths.lock.display())),
 	}
 	let lock_file = ProfileLock(lock_file);
-	prepare_profile(&paths)?;
+	prepare_profile_for(&paths, options.decision_authority)?;
 	drop(lock_file);
 	Ok(paths.root)
 }
@@ -307,10 +330,62 @@ fn init_owned(options: LocalInitOptions) -> Result<PathBuf, String> {
 /// The profile artifacts both [`run`] and [`init`] require: marker, development
 /// PKI, and role configs, generated when absent and validated when retained.
 fn prepare_profile(paths: &ProfilePaths) -> Result<(ProfileMarker, DevelopmentPki), String> {
-	let marker = ensure_profile(paths)?;
-	let pki = ensure_artifacts(paths)?;
-	validate_artifacts(paths)?;
+	prepare_profile_for(paths, None)
+}
+
+/// [`prepare_profile`] with an explicit authority request (init only). A
+/// ParentDecisions profile then completes its formation provisioning, once.
+fn prepare_profile_for(
+	paths: &ProfilePaths,
+	requested: Option<RequestedDecisionAuthority>,
+) -> Result<(ProfileMarker, DevelopmentPki), String> {
+	let marker = ensure_profile(paths, requested)?;
+	let Some(formation) = parent_decisions::stage(&marker) else {
+		// Unchanged for every profile created without a ParentDecisions request.
+		let pki = ensure_artifacts(paths, &marker, false)?;
+		validate_artifacts(paths, &marker)?;
+		return Ok((marker, pki));
+	};
+	// ParentDecisions: the state is established, read only, before anything is
+	// generated; a refused profile gets no key, PKI, config, directory or intent.
+	let plan = parent_decisions::plan(paths, formation)?;
+	parent_decisions::ensure_owned_directories(paths)?;
+	let render = matches!(
+		plan,
+		parent_decisions::Plan::Provision {
+			render_config: true
+		}
+	);
+	let pki = ensure_artifacts(paths, &marker, render)?;
+	validate_artifacts(paths, &marker)?;
+	parent_decisions::execute(paths, &marker, plan)?;
 	Ok((marker, pki))
+}
+
+/// A request that conflicts with what an existing profile was created for fails
+/// before anything is written. An existing store is never adopted or converted.
+fn refuse_conflicting_authority(
+	paths: &ProfilePaths,
+	marker: &ProfileMarker,
+	requested: Option<RequestedDecisionAuthority>,
+) -> Result<(), String> {
+	match (marker.decision_authority, requested) {
+		// The marker records no ParentDecisions request: that is not proof of
+		// Today (a legacy profile's config may say otherwise), but the explicit
+		// opt-in only ever creates a NEW profile.
+		(None, Some(RequestedDecisionAuthority::ParentDecisions)) => Err(format!(
+			"profile {} already exists and was not created by a ParentDecisions request; `--decision-authority parent-decisions` creates a new profile only in a new, empty --data-dir; nothing was changed, and an existing store is never adopted or converted",
+			paths.root.display()
+		)),
+		(
+			Some(ProfileDecisionAuthority::ParentDecisions { .. }),
+			Some(RequestedDecisionAuthority::Today),
+		) => Err(format!(
+			"profile {} was created for the ParentDecisions authority and keeps it; nothing was changed",
+			paths.root.display()
+		)),
+		_ => Ok(()),
+	}
 }
 
 fn prepare_root_for_lock(root: &Path) -> Result<(), String> {
@@ -393,7 +468,10 @@ fn open_lock(path: &Path) -> Result<File, String> {
 	Ok(file)
 }
 
-fn ensure_profile(paths: &ProfilePaths) -> Result<ProfileMarker, String> {
+fn ensure_profile(
+	paths: &ProfilePaths,
+	requested: Option<RequestedDecisionAuthority>,
+) -> Result<ProfileMarker, String> {
 	refuse_non_regular_artifact_if_present(&paths.marker, "profile marker")?;
 	if paths.marker.exists() {
 		let marker: ProfileMarker = toml::from_str(
@@ -409,12 +487,19 @@ fn ensure_profile(paths: &ProfilePaths) -> Result<ProfileMarker, String> {
 				FORMAT_VERSION
 			));
 		}
+		refuse_conflicting_authority(paths, &marker, requested)?;
 		return Ok(marker);
 	}
-	let foreign = fs::read_dir(&paths.root)
+	// An entry that cannot be read is an error, never evidence of an empty root.
+	let mut foreign = false;
+	for entry in fs::read_dir(&paths.root)
 		.map_err(|error| format!("read profile root {}: {error}", paths.root.display()))?
-		.filter_map(Result::ok)
-		.any(|entry| entry.file_name() != "local.lock");
+	{
+		let entry = entry.map_err(|error| {
+			format!("read profile root {} entry: {error}", paths.root.display())
+		})?;
+		foreign |= entry.file_name() != "local.lock";
+	}
 	if foreign {
 		return Err(format!(
 			"{} is not an empty directory or a marked Nilket profile",
@@ -424,14 +509,24 @@ fn ensure_profile(paths: &ProfilePaths) -> Result<ProfileMarker, String> {
 	let marker = ProfileMarker {
 		format_version: FORMAT_VERSION,
 		profile_uuid: Uuid::new_v4(),
+		decision_authority: match requested {
+			Some(RequestedDecisionAuthority::ParentDecisions) => {
+				Some(ProfileDecisionAuthority::ParentDecisions {
+					formation: FormationStage::Initializing,
+				})
+			}
+			Some(RequestedDecisionAuthority::Today) | None => None,
+		},
 	};
-	write_create_new(
-		&paths.marker,
-		toml::to_string_pretty(&marker)
-			.map_err(|error| format!("serialize profile marker: {error}"))?
-			.as_bytes(),
-		0o600,
-	)?;
+	let bytes = toml::to_string_pretty(&marker)
+		.map_err(|error| format!("serialize profile marker: {error}"))?;
+	if marker.decision_authority.is_some() {
+		// The recorded authority is the first durable fact of a ParentDecisions
+		// profile: synced, with its directory entry, before any other artifact.
+		parent_decisions::write_durable_new(&paths.marker, bytes.as_bytes(), 0o600)?;
+	} else {
+		write_create_new(&paths.marker, bytes.as_bytes(), 0o600)?;
+	}
 	Ok(marker)
 }
 
@@ -446,7 +541,15 @@ fn refuse_non_regular_artifact_if_present(path: &Path, label: &str) -> Result<()
 	}
 }
 
-fn ensure_artifacts(paths: &ProfilePaths) -> Result<DevelopmentPki, String> {
+/// `render_parent_decisions` is the plan's permission to render a
+/// ParentDecisions profile's Wendelon config, which holds its decision key; it
+/// is false for every other profile and for every ParentDecisions state but
+/// the first provisioning's.
+fn ensure_artifacts(
+	paths: &ProfilePaths,
+	marker: &ProfileMarker,
+	render_parent_decisions: bool,
+) -> Result<DevelopmentPki, String> {
 	for directory in [&paths.config_dir, &paths.wendelon_data, &paths.logs_dir] {
 		fs::DirBuilder::new()
 			.recursive(true)
@@ -458,11 +561,33 @@ fn ensure_artifacts(paths: &ProfilePaths) -> Result<DevelopmentPki, String> {
 	}
 	let pki = write_profile_development_pki(&paths.pki_dir)?;
 	if !paths.wendelon_config.exists() {
-		write_create_new(
-			&paths.wendelon_config,
-			wendelon::config::render_local_profile_config(&paths.wendelon_data, &pki).as_bytes(),
-			0o600,
-		)?;
+		match marker.decision_authority {
+			None => write_create_new(
+				&paths.wendelon_config,
+				wendelon::config::render_local_profile_config(&paths.wendelon_data, &pki)
+					.as_bytes(),
+				0o600,
+			)?,
+			Some(ProfileDecisionAuthority::ParentDecisions { .. }) => {
+				// The plan refused every state but the first provisioning, so a
+				// decision key is generated once and never replaced.
+				if !render_parent_decisions {
+					return Err(format!(
+						"{} is missing and this ParentDecisions profile may not render it again; nothing was changed",
+						paths.wendelon_config.display()
+					));
+				}
+				parent_decisions::write_durable_new(
+					&paths.wendelon_config,
+					wendelon::config::render_parent_decisions_local_profile_config(
+						&paths.wendelon_data,
+						&pki,
+					)
+					.as_bytes(),
+					0o600,
+				)?;
+			}
+		}
 	}
 	if !paths.toron_config.exists() {
 		write_create_new(
@@ -474,13 +599,21 @@ fn ensure_artifacts(paths: &ProfilePaths) -> Result<DevelopmentPki, String> {
 	Ok(pki)
 }
 
-fn validate_artifacts(paths: &ProfilePaths) -> Result<(), String> {
-	wendelon::config::load_node_bootstrap_config(&paths.wendelon_config).map_err(|error| {
-		format!(
-			"invalid retained Wendelon config {}: {error}; repair it or use --reset",
-			paths.wendelon_config.display()
-		)
-	})?;
+fn validate_artifacts(paths: &ProfilePaths, marker: &ProfileMarker) -> Result<(), String> {
+	let wendelon =
+		wendelon::config::load_node_bootstrap_config(&paths.wendelon_config).map_err(|error| {
+			format!(
+				"invalid retained Wendelon config {}: {error}; repair it or use --reset",
+				paths.wendelon_config.display()
+			)
+		})?;
+	// A profile created by a ParentDecisions request keeps that authority, forms
+	// a new cluster and keeps its store in its own data directory. A profile
+	// without that record keeps its previous behaviour: an operator-edited config
+	// is accepted as before, and the daemon's own store checks apply at startup.
+	if parent_decisions::stage(marker).is_some() {
+		parent_decisions::validate_config(paths, &wendelon)?;
+	}
 	toron::config::load_toron_bootstrap_config(&paths.toron_config).map_err(|error| {
 		format!(
 			"invalid retained Toron config {}: {error}; repair it or use --reset",
@@ -513,6 +646,12 @@ fn reset_locked_profile(paths: &ProfilePaths) -> Result<(), String> {
 	if data_root.exists() {
 		refuse_symlink_tree(&data_root)?;
 	}
+	// A ParentDecisions profile's marker republication file is checked before any
+	// destructive step: a reset that could not republish the marker never starts.
+	parent_decisions::regular_present(
+		&paths.root.join(parent_decisions::MARKER_TMP),
+		"profile marker",
+	)?;
 	let _wendelon_owner =
 		DataDirectoryOwner::acquire_or_create(&paths.wendelon_data).map_err(|error| {
 			format!("refusing reset without Wendelon data-directory ownership: {error}")
@@ -527,6 +666,22 @@ fn reset_locked_profile(paths: &ProfilePaths) -> Result<(), String> {
 		}
 	}
 	clear_data_preserving_wendelon_lock(&data_root, &paths.wendelon_data)?;
+	// The store is gone with the data: the explicit reset is the one route by which
+	// an issued ParentDecisions profile returns to `initializing`, to provision a
+	// new store, a new key and a new intent on its next preparation. The marker is
+	// republished atomically with the same UUID. Interrupted before this, the
+	// profile stays `issued` with no store and refuses until the reset is repeated.
+	if parent_decisions::stage(&marker).is_some() {
+		parent_decisions::publish_marker(
+			paths,
+			&ProfileMarker {
+				decision_authority: Some(ProfileDecisionAuthority::ParentDecisions {
+					formation: FormationStage::Initializing,
+				}),
+				..marker
+			},
+		)?;
+	}
 	if paths.runtime.exists() {
 		fs::remove_file(&paths.runtime)
 			.map_err(|error| format!("reset {}: {error}", paths.runtime.display()))?;
@@ -1204,9 +1359,9 @@ mod tests {
 		prepare_root_for_lock(&root).unwrap();
 		let lock = open_lock(&paths.lock).unwrap();
 		lock.lock_exclusive().unwrap();
-		let marker = ensure_profile(&paths).unwrap();
-		let pki = ensure_artifacts(&paths).unwrap();
-		validate_artifacts(&paths).unwrap();
+		let marker = ensure_profile(&paths, None).unwrap();
+		let pki = ensure_artifacts(&paths, &marker, false).unwrap();
+		validate_artifacts(&paths, &marker).unwrap();
 		let wendelon =
 			wendelon::config::load_node_bootstrap_config(&paths.wendelon_config).unwrap();
 		let toron = toron::config::load_toron_bootstrap_config(&paths.toron_config).unwrap();
@@ -1240,7 +1395,7 @@ mod tests {
 			0o600
 		);
 		let retained = fs::read(&paths.toron_config).unwrap();
-		let second = ensure_artifacts(&paths).unwrap();
+		let second = ensure_artifacts(&paths, &marker, false).unwrap();
 		assert_eq!(pki, second);
 		assert_eq!(fs::read(&paths.toron_config).unwrap(), retained);
 		assert_eq!(marker.format_version, FORMAT_VERSION);
@@ -1255,9 +1410,10 @@ mod tests {
 		let paths = ProfilePaths::new(root.clone());
 		let options = LocalInitOptions {
 			data_dir: Some(root.clone()),
+			decision_authority: None,
 		};
 		assert_eq!(init_owned(options.clone()).unwrap(), root);
-		validate_artifacts(&paths).unwrap();
+		validate_artifacts(&paths, &read_marker(&paths)).unwrap();
 		assert!(paths.marker.exists());
 		assert!(
 			!paths.runtime.exists(),
@@ -1295,6 +1451,7 @@ mod tests {
 		holder.lock_exclusive().unwrap();
 		let error = init_owned(LocalInitOptions {
 			data_dir: Some(root.clone()),
+			decision_authority: None,
 		})
 		.unwrap_err();
 		assert!(error.contains("in use by a running deployment"), "{error}");
@@ -1417,8 +1574,8 @@ mod tests {
 		prepare_root_for_lock(&root).unwrap();
 		let lock = open_lock(&paths.lock).unwrap();
 		lock.lock_exclusive().unwrap();
-		ensure_profile(&paths).unwrap();
-		ensure_artifacts(&paths).unwrap();
+		let marker = ensure_profile(&paths, None).unwrap();
+		ensure_artifacts(&paths, &marker, false).unwrap();
 		assert!(paths.marker.is_file());
 		assert!(paths.pki_dir.is_dir());
 		drop(lock);
@@ -1432,8 +1589,8 @@ mod tests {
 		prepare_root_for_lock(&root).unwrap();
 		let lock = open_lock(&paths.lock).unwrap();
 		lock.lock_exclusive().unwrap();
-		ensure_profile(&paths).unwrap();
-		ensure_artifacts(&paths).unwrap();
+		let marker = ensure_profile(&paths, None).unwrap();
+		ensure_artifacts(&paths, &marker, false).unwrap();
 		let inode_before = fs::metadata(&paths.lock).unwrap().ino();
 		let barrier = Arc::new(Barrier::new(2));
 		let contender_barrier = Arc::clone(&barrier);
@@ -1730,7 +1887,7 @@ mod tests {
 		prepare_root_for_lock(&root).unwrap();
 		let lock = open_lock(&paths.lock).unwrap();
 		lock.lock_exclusive().unwrap();
-		let marker = ensure_profile(&paths).unwrap();
+		let marker = ensure_profile(&paths, None).unwrap();
 		let runtime = RuntimeManifest {
 			version: FORMAT_VERSION,
 			profile_uuid: marker.profile_uuid,
@@ -1783,8 +1940,8 @@ mod tests {
 		prepare_root_for_lock(&root).unwrap();
 		let lock = open_lock(&paths.lock).unwrap();
 		lock.lock_exclusive().unwrap();
-		ensure_profile(&paths).unwrap();
-		ensure_artifacts(&paths).unwrap();
+		let marker = ensure_profile(&paths, None).unwrap();
+		ensure_artifacts(&paths, &marker, false).unwrap();
 		let escape = fresh_root("escape");
 		fs::create_dir_all(&escape).unwrap();
 		std::os::unix::fs::symlink(&escape, paths.wendelon_data.join("escape")).unwrap();
@@ -1805,8 +1962,8 @@ mod tests {
 		prepare_root_for_lock(&root).unwrap();
 		let profile_lock = open_lock(&paths.lock).unwrap();
 		profile_lock.lock_exclusive().unwrap();
-		ensure_profile(&paths).unwrap();
-		ensure_artifacts(&paths).unwrap();
+		let marker = ensure_profile(&paths, None).unwrap();
+		ensure_artifacts(&paths, &marker, false).unwrap();
 		fs::write(&paths.wendelon_config, b"config-before-reset").unwrap();
 		fs::write(paths.wendelon_data.join("state.bin"), b"state-before-reset").unwrap();
 		let data_owner = DataDirectoryOwner::acquire_existing(&paths.wendelon_data).unwrap();
@@ -1837,8 +1994,8 @@ mod tests {
 		prepare_root_for_lock(&root).unwrap();
 		let profile_lock = open_lock(&paths.lock).unwrap();
 		profile_lock.lock_exclusive().unwrap();
-		ensure_profile(&paths).unwrap();
-		ensure_artifacts(&paths).unwrap();
+		let marker = ensure_profile(&paths, None).unwrap();
+		ensure_artifacts(&paths, &marker, false).unwrap();
 		fs::write(paths.wendelon_data.join("state.bin"), b"old-state").unwrap();
 		let owner = DataDirectoryOwner::acquire_existing(&paths.wendelon_data).unwrap();
 		let lock_inode = fs::metadata(paths.wendelon_data.join("LOCK"))
@@ -1857,6 +2014,603 @@ mod tests {
 		assert!(!paths.wendelon_data.join("state.bin").exists());
 		assert!(!paths.wendelon_config.exists());
 		drop(profile_lock);
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	// A fresh single-node ParentDecisions profile through `init`: its state is
+	// established before anything is generated; its one formation intent is
+	// issued through a durable `initializing` -> intent -> `issued` transition of
+	// the profile's own marker.
+
+	use parent_decisions::MARKER_TMP;
+
+	fn read_marker(paths: &ProfilePaths) -> ProfileMarker {
+		toml::from_str(&fs::read_to_string(&paths.marker).unwrap()).unwrap()
+	}
+
+	fn formation(paths: &ProfilePaths) -> Option<FormationStage> {
+		parent_decisions::stage(&read_marker(paths))
+	}
+
+	/// Rewrites the marker with `stage`, keeping its UUID (a test stand-in for
+	/// an interruption at that stage).
+	fn set_formation(paths: &ProfilePaths, stage: FormationStage) {
+		let marker = ProfileMarker {
+			decision_authority: Some(ProfileDecisionAuthority::ParentDecisions {
+				formation: stage,
+			}),
+			..read_marker(paths)
+		};
+		fs::write(&paths.marker, toml::to_string_pretty(&marker).unwrap()).unwrap();
+	}
+
+	fn init_with(
+		root: &Path,
+		decision_authority: Option<RequestedDecisionAuthority>,
+	) -> Result<PathBuf, String> {
+		init_owned(LocalInitOptions {
+			data_dir: Some(root.to_path_buf()),
+			decision_authority,
+		})
+	}
+
+	/// The run path's own preparation, under the profile lock.
+	fn prepare_as_run(paths: &ProfilePaths) -> Result<(), String> {
+		let lock = open_lock(&paths.lock).unwrap();
+		lock.lock_exclusive().unwrap();
+		prepare_profile(paths).map(drop)
+	}
+
+	const PD: Option<RequestedDecisionAuthority> =
+		Some(RequestedDecisionAuthority::ParentDecisions);
+
+	/// Every file of the profile, by relative path, with its bytes (and every
+	/// directory, with none): a refused request must leave all of them and add none.
+	fn profile_bytes(root: &Path) -> std::collections::BTreeMap<PathBuf, Option<Vec<u8>>> {
+		fn walk(
+			root: &Path,
+			dir: &Path,
+			out: &mut std::collections::BTreeMap<PathBuf, Option<Vec<u8>>>,
+		) {
+			for entry in fs::read_dir(dir).unwrap() {
+				let path = entry.unwrap().path();
+				let relative = path.strip_prefix(root).unwrap().to_path_buf();
+				let metadata = fs::symlink_metadata(&path).unwrap();
+				if metadata.is_dir() {
+					out.insert(relative, None);
+					walk(root, &path, out);
+				} else if metadata.file_type().is_symlink() {
+					out.insert(
+						relative,
+						Some(
+							fs::read_link(&path)
+								.unwrap()
+								.as_os_str()
+								.as_encoded_bytes()
+								.to_vec(),
+						),
+					);
+				} else {
+					out.insert(relative, Some(fs::read(&path).unwrap()));
+				}
+			}
+		}
+		let mut out = std::collections::BTreeMap::new();
+		walk(root, root, &mut out);
+		out
+	}
+
+	/// Compares two snapshots naming only the paths that differ: the profile holds
+	/// signing secrets, so a mismatch never prints any file's contents.
+	fn assert_unchanged(
+		before: &std::collections::BTreeMap<PathBuf, Option<Vec<u8>>>,
+		after: &std::collections::BTreeMap<PathBuf, Option<Vec<u8>>>,
+		what: &str,
+	) {
+		let differing: Vec<&PathBuf> = before
+			.keys()
+			.chain(after.keys())
+			.filter(|path| before.get(*path) != after.get(*path))
+			.collect();
+		assert!(differing.is_empty(), "{what}: changed paths {differing:?}");
+	}
+
+	fn same_file_bytes(a: &Path, expected: &[u8]) -> bool {
+		fs::read(a).map(|bytes| bytes == expected).unwrap_or(false)
+	}
+
+	fn intent(paths: &ProfilePaths) -> PathBuf {
+		paths.wendelon_data.join(wendelon::node::FORMATION_INTENT)
+	}
+
+	/// A started store, as far as preparation can tell: the intent consumed and
+	/// the store's files present.
+	fn form(paths: &ProfilePaths) {
+		fs::remove_file(intent(paths)).unwrap();
+		fs::write(paths.wendelon_data.join("control.wal.00000001"), b"formed").unwrap();
+	}
+
+	/// Init with and without the flag, and the run path, each refused with
+	/// `needle`; the profile keeps every byte and gains nothing.
+	fn refused_everywhere(root: &Path, paths: &ProfilePaths, needle: &str, what: &str) {
+		let before = profile_bytes(root);
+		for request in [PD, None] {
+			let error = init_with(root, request).unwrap_err();
+			assert!(error.contains(needle), "{what}: {error}");
+			assert_unchanged(&before, &profile_bytes(root), what);
+		}
+		let error = prepare_as_run(paths).unwrap_err();
+		assert!(error.contains(needle), "{what}: {error}");
+		assert_unchanged(&before, &profile_bytes(root), what);
+	}
+
+	#[test]
+	fn a_parent_decisions_init_creates_a_fresh_profile_with_its_own_key_and_one_intent() {
+		let _serial = lock_serial(&PROCESS_AND_LOCK_TEST_LOCK);
+		let root = fresh_root("pd-init");
+		let paths = ProfilePaths::new(root.clone());
+		init_with(&root, PD).unwrap();
+		assert_eq!(formation(&paths), Some(FormationStage::Issued));
+		let config = wendelon::config::load_node_bootstrap_config(&paths.wendelon_config).unwrap();
+		assert!(config.selects_parent_decisions());
+		assert_eq!(
+			config.mvcc_retention_policy,
+			wendelon::storage::MvccRetentionPolicy::Disabled
+		);
+		let text = fs::read_to_string(&paths.wendelon_config).unwrap();
+		assert!(text.contains("decision_authority = \"parent-decisions\""));
+		assert!(
+			text.contains("allow_dev_keys = false"),
+			"never a development key"
+		);
+		assert!(intent(&paths).exists(), "one formation intent");
+		assert!(!paths.root.join(MARKER_TMP).exists());
+		let names: Vec<_> = fs::read_dir(&root)
+			.unwrap()
+			.map(|entry| entry.unwrap().file_name())
+			.collect();
+		assert!(
+			names.iter().all(|name| [
+				"profile.toml",
+				"local.lock",
+				"config",
+				"pki",
+				"data",
+				"logs"
+			]
+			.contains(&name.to_str().unwrap())),
+			"no sentinel beside the marker: {names:?}"
+		);
+		// Two profiles never share a decision key.
+		let other = fresh_root("pd-init-other");
+		init_with(&other, PD).unwrap();
+		let secret = |text: &str| {
+			text.lines()
+				.find(|line| line.starts_with("decision_signing_secret = "))
+				.unwrap()
+				.to_owned()
+		};
+		assert!(
+			secret(&text)
+				!= secret(&fs::read_to_string(other.join("config/wendelon.toml")).unwrap()),
+			"two profiles generated the same decision key"
+		);
+		fs::remove_dir_all(root).unwrap();
+		fs::remove_dir_all(other).unwrap();
+	}
+
+	#[test]
+	fn the_default_init_is_unchanged_today_with_no_decision_material() {
+		let _serial = lock_serial(&PROCESS_AND_LOCK_TEST_LOCK);
+		for (tag, request) in [
+			("today-default", None),
+			("today-explicit", Some(RequestedDecisionAuthority::Today)),
+		] {
+			let root = fresh_root(tag);
+			let paths = ProfilePaths::new(root.clone());
+			init_with(&root, request).unwrap();
+			let marker = fs::read_to_string(&paths.marker).unwrap();
+			assert!(
+				!marker.contains("decision") && !marker.contains("formation"),
+				"a Today marker keeps its exact shape"
+			);
+			let text = fs::read_to_string(&paths.wendelon_config).unwrap();
+			assert!(text.contains("# decision_authority = \"today\""));
+			assert!(
+				!text
+					.lines()
+					.any(|line| line.starts_with("decision_signing_secret")),
+				"no active decision key in a Today config"
+			);
+			assert!(
+				!wendelon::config::load_node_bootstrap_config(&paths.wendelon_config)
+					.unwrap()
+					.selects_parent_decisions()
+			);
+			assert!(!intent(&paths).exists());
+			fs::remove_dir_all(root).unwrap();
+		}
+	}
+
+	#[test]
+	fn rerunning_init_or_run_regenerates_nothing_and_never_reissues_a_consumed_intent() {
+		let _serial = lock_serial(&PROCESS_AND_LOCK_TEST_LOCK);
+		let root = fresh_root("pd-rerun");
+		let paths = ProfilePaths::new(root.clone());
+		init_with(&root, PD).unwrap();
+		let before = profile_bytes(&root);
+		init_with(&root, PD).unwrap();
+		init_with(&root, None).unwrap();
+		prepare_as_run(&paths).unwrap();
+		assert_unchanged(&before, &profile_bytes(&root), "a re-run before formation");
+
+		form(&paths);
+		let formed = profile_bytes(&root);
+		init_with(&root, PD).unwrap();
+		init_with(&root, None).unwrap();
+		prepare_as_run(&paths).unwrap();
+		assert_unchanged(&formed, &profile_bytes(&root), "a re-run after formation");
+		assert!(
+			!intent(&paths).exists(),
+			"a consumed intent is never reissued"
+		);
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	/// Codex's reproduction (UNIT-01 r2): an issued profile whose whole `data/`
+	/// disappeared, with its marker, config and key retained. Init with and
+	/// without the flag, and the run path, all refuse; no intent, no directory.
+	#[test]
+	fn an_issued_profile_whose_data_disappeared_never_receives_a_new_intent() {
+		let _serial = lock_serial(&PROCESS_AND_LOCK_TEST_LOCK);
+		let root = fresh_root("pd-data-gone");
+		let paths = ProfilePaths::new(root.clone());
+		init_with(&root, PD).unwrap();
+		let aside = fresh_root("pd-data-aside");
+		fs::rename(root.join("data"), &aside).unwrap();
+		refused_everywhere(&root, &paths, "never forms again", "data/ moved aside");
+		assert!(
+			!root.join("data").exists(),
+			"no data directory is recreated"
+		);
+		// The same after the store had formed and was then lost.
+		fs::rename(&aside, root.join("data")).unwrap();
+		form(&paths);
+		fs::remove_file(paths.wendelon_data.join("control.wal.00000001")).unwrap();
+		refused_everywhere(&root, &paths, "never forms again", "a formed store lost");
+		fs::remove_dir_all(root.join("data")).unwrap();
+		refused_everywhere(&root, &paths, "never forms again", "the whole data/ lost");
+		assert!(
+			!root.join("data").exists(),
+			"no data directory is recreated"
+		);
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	/// The distinction that matters: a genuinely fresh or still-initializing
+	/// profile provisions, at every interruption point, without regenerating a
+	/// written key.
+	#[test]
+	fn an_interrupted_provisioning_resumes_at_each_stage_without_regenerating_a_key() {
+		let _serial = lock_serial(&PROCESS_AND_LOCK_TEST_LOCK);
+		// (a) The marker only (`initializing`): the first rendering happens now,
+		// decided by the recorded request, not the re-run's flag.
+		let early = fresh_root("pd-int-marker");
+		let early_paths = ProfilePaths::new(early.clone());
+		prepare_root_for_lock(&early).unwrap();
+		{
+			let lock = open_lock(&early_paths.lock).unwrap();
+			lock.lock_exclusive().unwrap();
+			ensure_profile(&early_paths, PD).unwrap();
+		}
+		assert_eq!(formation(&early_paths), Some(FormationStage::Initializing));
+		init_with(&early, None).unwrap();
+		assert!(
+			wendelon::config::load_node_bootstrap_config(&early_paths.wendelon_config)
+				.unwrap()
+				.selects_parent_decisions()
+		);
+		assert_eq!(formation(&early_paths), Some(FormationStage::Issued));
+		assert!(intent(&early_paths).exists());
+
+		// (b) `initializing` with its config, before the intent: the key is kept.
+		let root = fresh_root("pd-int-config");
+		let paths = ProfilePaths::new(root.clone());
+		init_with(&root, PD).unwrap();
+		let config = fs::read(&paths.wendelon_config).unwrap();
+		set_formation(&paths, FormationStage::Initializing);
+		fs::remove_file(intent(&paths)).unwrap();
+		prepare_as_run(&paths).unwrap();
+		assert!(
+			same_file_bytes(&paths.wendelon_config, &config),
+			"the key is kept"
+		);
+		assert!(intent(&paths).exists());
+		assert_eq!(formation(&paths), Some(FormationStage::Issued));
+
+		// (c) `initializing` with the intent: the same intent, then `issued`.
+		set_formation(&paths, FormationStage::Initializing);
+		let inode = fs::metadata(intent(&paths)).unwrap().ino();
+		init_with(&root, PD).unwrap();
+		assert_eq!(
+			fs::metadata(intent(&paths)).unwrap().ino(),
+			inode,
+			"no second intent"
+		);
+		assert_eq!(formation(&paths), Some(FormationStage::Issued));
+
+		// (d) `initializing` with a leftover republication file: it is replaced.
+		set_formation(&paths, FormationStage::Initializing);
+		fs::write(paths.root.join(MARKER_TMP), b"partial").unwrap();
+		init_with(&root, None).unwrap();
+		assert!(!paths.root.join(MARKER_TMP).exists());
+		assert_eq!(formation(&paths), Some(FormationStage::Issued));
+		assert!(same_file_bytes(&paths.wendelon_config, &config));
+		let uuid = read_marker(&paths).profile_uuid;
+
+		// (e) `issued`, intent unconsumed (a run that stopped before its final
+		// syncs): ready, the same marker, nothing regenerated.
+		let before = profile_bytes(&root);
+		prepare_as_run(&paths).unwrap();
+		assert_unchanged(&before, &profile_bytes(&root), "issued, not yet consumed");
+		assert_eq!(
+			read_marker(&paths).profile_uuid,
+			uuid,
+			"the marker keeps its UUID"
+		);
+		fs::remove_dir_all(root).unwrap();
+		fs::remove_dir_all(early).unwrap();
+	}
+
+	#[test]
+	fn an_unprovable_state_is_refused_before_any_key_config_directory_or_intent() {
+		let _serial = lock_serial(&PROCESS_AND_LOCK_TEST_LOCK);
+		// A store beside an `initializing` marker.
+		let root = fresh_root("pd-unprovable");
+		let paths = ProfilePaths::new(root.clone());
+		init_with(&root, PD).unwrap();
+		form(&paths);
+		set_formation(&paths, FormationStage::Initializing);
+		refused_everywhere(
+			&root,
+			&paths,
+			"never completed its provisioning",
+			"store, initializing",
+		);
+
+		// A config lost once the intent exists (initializing) or was issued.
+		let other = fresh_root("pd-unprovable-config");
+		let other_paths = ProfilePaths::new(other.clone());
+		init_with(&other, PD).unwrap();
+		fs::remove_file(&other_paths.wendelon_config).unwrap();
+		refused_everywhere(
+			&other,
+			&other_paths,
+			"never regenerated",
+			"issued, config lost",
+		);
+		assert!(
+			!other_paths.wendelon_config.exists(),
+			"no replacement decision key"
+		);
+		set_formation(&other_paths, FormationStage::Initializing);
+		refused_everywhere(
+			&other,
+			&other_paths,
+			"never regenerated",
+			"initializing with intent, config lost",
+		);
+		assert!(
+			!other_paths.wendelon_config.exists(),
+			"no replacement decision key"
+		);
+
+		// A damaged managed marker: an unknown stage, a missing stage, an unknown
+		// authority, an extra key.
+		let issued = {
+			set_formation(&other_paths, FormationStage::Issued);
+			fs::read_to_string(&other_paths.marker).unwrap()
+		};
+		for damaged in [
+			issued.replace("\"issued\"", "\"done\""),
+			issued.replace("formation = \"issued\"\n", ""),
+			issued.replace("\"parent-decisions\"", "\"other\""),
+			issued.replace(
+				"formation = \"issued\"",
+				"formation = \"issued\"\nextra = 1",
+			),
+		] {
+			fs::write(&other_paths.marker, &damaged).unwrap();
+			refused_everywhere(
+				&other,
+				&other_paths,
+				"malformed",
+				"a damaged managed marker",
+			);
+		}
+		fs::remove_dir_all(root).unwrap();
+		fs::remove_dir_all(other).unwrap();
+	}
+
+	#[test]
+	fn a_symlinked_data_directory_or_a_retargeted_config_never_receives_a_formation_grant() {
+		let _serial = lock_serial(&PROCESS_AND_LOCK_TEST_LOCK);
+		let root = fresh_root("pd-symlink");
+		let paths = ProfilePaths::new(root.clone());
+		let elsewhere = fresh_root("pd-symlink-target");
+		fs::create_dir_all(&elsewhere).unwrap();
+		prepare_root_for_lock(&root).unwrap();
+		{
+			let lock = open_lock(&paths.lock).unwrap();
+			lock.lock_exclusive().unwrap();
+			ensure_profile(&paths, PD).unwrap();
+		}
+		fs::create_dir_all(root.join("data")).unwrap();
+		std::os::unix::fs::symlink(&elsewhere, &paths.wendelon_data).unwrap();
+		let before = profile_bytes(&root);
+		let error = init_with(&root, None).unwrap_err();
+		assert!(error.contains("must be a real directory"), "{error}");
+		assert_unchanged(
+			&before,
+			&profile_bytes(&root),
+			"a symlinked store directory",
+		);
+		assert_eq!(
+			fs::read_dir(&elsewhere).unwrap().count(),
+			0,
+			"no grant in the target"
+		);
+
+		let other = fresh_root("pd-retarget");
+		let other_paths = ProfilePaths::new(other.clone());
+		init_with(&other, PD).unwrap();
+		form(&other_paths);
+		let text = fs::read_to_string(&other_paths.wendelon_config).unwrap();
+		let data_line = text
+			.lines()
+			.find(|line| line.starts_with("data_dir = "))
+			.unwrap()
+			.to_owned();
+		fs::write(
+			&other_paths.wendelon_config,
+			text.replace(
+				&data_line,
+				&format!("data_dir = \"{}\"", elsewhere.display()),
+			),
+		)
+		.unwrap();
+		let before = profile_bytes(&other);
+		let error = init_with(&other, None).unwrap_err();
+		assert!(
+			error.contains("outside the profile's own data directory"),
+			"{error}"
+		);
+		assert_unchanged(&before, &profile_bytes(&other), "a retargeted config");
+		assert_eq!(
+			fs::read_dir(&elsewhere).unwrap().count(),
+			0,
+			"no grant elsewhere"
+		);
+		fs::remove_dir_all(root).unwrap();
+		fs::remove_dir_all(other).unwrap();
+		fs::remove_dir_all(elsewhere).unwrap();
+	}
+
+	#[test]
+	fn an_unreadable_data_directory_is_an_error_never_an_empty_store() {
+		let _serial = lock_serial(&PROCESS_AND_LOCK_TEST_LOCK);
+		if unsafe { libc::geteuid() } == 0 {
+			return; // root reads a mode-000 directory; the control needs an ordinary user
+		}
+		let root = fresh_root("pd-unreadable");
+		let paths = ProfilePaths::new(root.clone());
+		init_with(&root, PD).unwrap();
+		form(&paths);
+		fs::set_permissions(&paths.wendelon_data, fs::Permissions::from_mode(0o000)).unwrap();
+		let error = init_with(&root, None).unwrap_err();
+		fs::set_permissions(&paths.wendelon_data, fs::Permissions::from_mode(0o700)).unwrap();
+		assert!(
+			error.contains("ermission denied"),
+			"an inspection error, not an empty store: {error}"
+		);
+		assert!(
+			!intent(&paths).exists(),
+			"no intent for an unreadable store"
+		);
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[test]
+	fn a_legacy_profile_keeps_its_behaviour_and_is_never_adopted_by_the_opt_in() {
+		let _serial = lock_serial(&PROCESS_AND_LOCK_TEST_LOCK);
+		let root = fresh_root("legacy-pd-config");
+		let paths = ProfilePaths::new(root.clone());
+		init_with(&root, None).unwrap();
+		let pki = write_profile_development_pki(&paths.pki_dir).unwrap();
+		fs::remove_file(&paths.wendelon_config).unwrap();
+		fs::write(
+			&paths.wendelon_config,
+			wendelon::config::render_parent_decisions_local_profile_config(
+				&paths.wendelon_data,
+				&pki,
+			),
+		)
+		.unwrap();
+		fs::write(paths.wendelon_data.join("control.wal.00000001"), b"legacy").unwrap();
+		let before = profile_bytes(&root);
+		init_with(&root, None).unwrap();
+		prepare_as_run(&paths).unwrap();
+		assert_unchanged(&before, &profile_bytes(&root), "a legacy profile, no flag");
+		assert!(!intent(&paths).exists());
+
+		let error = init_with(&root, PD).unwrap_err();
+		assert!(error.contains("never adopted or converted"), "{error}");
+		assert!(
+			!error.contains("--reset"),
+			"a refusal does not prescribe a reset: {error}"
+		);
+		assert_unchanged(
+			&before,
+			&profile_bytes(&root),
+			"a legacy profile, opt-in refused",
+		);
+
+		let pd = fresh_root("conflict-pd");
+		init_with(&pd, PD).unwrap();
+		let before = profile_bytes(&pd);
+		let error = init_with(&pd, Some(RequestedDecisionAuthority::Today)).unwrap_err();
+		assert!(error.contains("keeps it"), "{error}");
+		assert_unchanged(
+			&before,
+			&profile_bytes(&pd),
+			"today requested on a PD profile",
+		);
+		fs::remove_dir_all(root).unwrap();
+		fs::remove_dir_all(pd).unwrap();
+	}
+
+	#[test]
+	fn only_an_explicit_reset_returns_an_issued_profile_to_provisioning() {
+		let _serial = lock_serial(&PROCESS_AND_LOCK_TEST_LOCK);
+		let root = fresh_root("pd-reset");
+		let paths = ProfilePaths::new(root.clone());
+		init_with(&root, PD).unwrap();
+		let uuid = read_marker(&paths).profile_uuid;
+		let first = fs::read(&paths.wendelon_config).unwrap();
+		form(&paths);
+		{
+			let lock = open_lock(&paths.lock).unwrap();
+			lock.lock_exclusive().unwrap();
+			reset_locked_profile(&paths).unwrap();
+			assert_eq!(
+				formation(&paths),
+				Some(FormationStage::Initializing),
+				"the reset returns the profile to provisioning"
+			);
+			prepare_profile(&paths).unwrap();
+		}
+		assert_eq!(read_marker(&paths).profile_uuid, uuid, "the same profile");
+		assert_eq!(formation(&paths), Some(FormationStage::Issued));
+		assert!(
+			!same_file_bytes(&paths.wendelon_config, &first),
+			"a new store, a new key"
+		);
+		assert!(intent(&paths).exists(), "a new store's one intent");
+		assert!(!paths.wendelon_data.join("control.wal.00000001").exists());
+
+		// A republication file that is not a regular file stops the reset before
+		// it deletes anything.
+		form(&paths);
+		fs::create_dir(paths.root.join(MARKER_TMP)).unwrap();
+		let before = profile_bytes(&root);
+		{
+			let lock = open_lock(&paths.lock).unwrap();
+			lock.lock_exclusive().unwrap();
+			let error = reset_locked_profile(&paths).unwrap_err();
+			assert!(error.contains("must be a regular file"), "{error}");
+		}
+		assert_unchanged(&before, &profile_bytes(&root), "a refused reset");
+		assert!(paths.wendelon_data.join("control.wal.00000001").exists());
 		fs::remove_dir_all(root).unwrap();
 	}
 }

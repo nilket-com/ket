@@ -6759,6 +6759,8 @@ mod write_deadline;
 
 #[path = "parent_decisions_cluster_tests/attempt_exhaustion.rs"]
 mod attempt_exhaustion;
+#[path = "parent_decisions_cluster_tests/one_voter.rs"]
+mod one_voter;
 
 #[path = "parent_decisions_cluster_tests/offload.rs"]
 mod offload;
