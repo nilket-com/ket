@@ -3406,6 +3406,15 @@ fn record_table_drop_outcome(state: &mut SmState, outcome: crate::schema::TableD
 	}
 }
 
+/// Wendelon ADR 0116: a ParentDecisions drop settlement's refusal, until a
+/// settlement authority exists.
+pub(crate) const PD_DROP_SETTLEMENT_REFUSED: &str =
+	"table drop settlement is refused under ParentDecisions until a settlement authority exists";
+/// Wendelon ADR 0116: the legacy reclaim completion and finalize's refusal under
+/// ParentDecisions.
+pub(crate) const PD_LEGACY_DROP_TRANSITION_REFUSED: &str =
+	"legacy table drop reclaim completion and finalize are refused under ParentDecisions";
+
 /// Wendelon ADR 0115: a store's construction-time admission of the test-only
 /// ParentDecisions drop semantics. Zero-sized in production builds; a test sets
 /// it in a node's configuration, and the durable open receives it, so it holds
@@ -4784,6 +4793,19 @@ impl WendelonStateMachine {
 	#[cfg(test)]
 	pub(crate) async fn seed_complete_snapshot_state_for_test(&self, state: SmState) {
 		self.inner.write().await.state = state;
+	}
+
+	/// Test-only (wendelon ADR 0116): applies a drop settlement's removals to this
+	/// machine's current state in place, under one write guard, bypassing ADR
+	/// 0116's ParentDecisions refusal at dispatch. It stands in for the
+	/// settlement authority a later ADR defines, for ADR 0115's restage control
+	/// ("simulating settlement") only; no product path reaches it.
+	#[cfg(test)]
+	pub(crate) async fn simulate_drop_settlement_for_test(
+		&self,
+		request: TableDropSettlementRequest,
+	) -> WendelonResponse {
+		apply_table_drop_settlement(&mut self.inner.write().await.state, request)
 	}
 
 	/// Test-only (wendelon ADR 0115): applies `admission` to this machine's
@@ -7414,6 +7436,22 @@ fn apply_request_at_log_index(
 		}
 		WendelonRequest::TableDropPrepare(request) => (
 			apply_table_drop_prepare(state, request, entry_log_index),
+			None,
+		),
+		// Wendelon ADR 0116: a ParentDecisions drop never takes the legacy reclaim
+		// completion or finalize (which would remove its fence and record an outcome
+		// with no tombstone or stamped debt), and is never settled until a settlement
+		// authority exists. Direct proposal, the sweeper and replay all refuse here.
+		WendelonRequest::TableReclaimCompletion(_) | WendelonRequest::TableDropFinalize(_)
+			if state.decisions.is_some() =>
+		{
+			(
+				WendelonResponse::Error(PD_LEGACY_DROP_TRANSITION_REFUSED.into()),
+				None,
+			)
+		}
+		WendelonRequest::TableDropSettlement(_) if state.decisions.is_some() => (
+			WendelonResponse::Error(PD_DROP_SETTLEMENT_REFUSED.into()),
 			None,
 		),
 		WendelonRequest::TableReclaimCompletion(request) => (

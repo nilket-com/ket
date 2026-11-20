@@ -7159,3 +7159,130 @@ fn validation_fails_closed_on_a_finalized_drop_index_that_disagrees() {
 	extra.pd_finalize_indices.insert(f + 1);
 	assert!(crate::consensus::raft_storage::validate_assembled_state(&extra).is_err());
 }
+
+/// Wendelon stage (c), the premature-settlement control: under ParentDecisions
+/// a settlement carrying exactly the stamped participants, finalize index and
+/// epoch is refused at apply with no effect. The tombstone, the reclaim debt,
+/// T's descriptor and the permanent outcome are all kept.
+#[test]
+fn a_parent_decisions_settlement_is_refused_with_no_effect() {
+	let mut state = base(3);
+	grant_all(&mut state);
+	finalize_fixture_drop(&mut state);
+	let debt = state
+		.table_drop_reclaim_debts
+		.get(TENANT, TABLE)
+		.cloned()
+		.expect("premise: the logical finalize stamped reclaim debt");
+	let kept = |state: &SmState| {
+		(
+			state.table_drop_tombstones.get(TENANT, TABLE).copied(),
+			state.table_drop_reclaim_debts.get(TENANT, TABLE).cloned(),
+			state.table_schemas.latest_by_id(TENANT, TABLE).cloned(),
+			state.table_drop_outcomes.get(TENANT, TABLE).copied(),
+		)
+	};
+	let before = kept(&state);
+	assert!(
+		before.0.is_some() && before.2.is_some() && before.3.is_some(),
+		"premise"
+	);
+	let response = apply_next(
+		&mut state,
+		WendelonRequest::TableDropSettlement(crate::consensus::TableDropSettlementRequest {
+			operation_id: debt.operation_id,
+			finalize_log_index: debt.finalize_log_index,
+			ownership_epoch: debt.ownership_epoch,
+			attested_participants: debt.participants.clone(),
+		}),
+	);
+	assert!(
+		matches!(&response, WendelonResponse::Error(why)
+			if why == crate::consensus::raft_storage::PD_DROP_SETTLEMENT_REFUSED),
+		"the intended refusal: {response:?}"
+	);
+	assert_eq!(kept(&state), before, "no effect");
+}
+
+/// Wendelon ADR 0116, the legacy transitions: after an admitted ParentDecisions
+/// Prepare and before LogicalFinalize, the older `TableReclaimCompletion` and
+/// `TableDropFinalize` are refused at the real dispatcher with no effect: the
+/// fence is preserved (no completion index, not removed), and no outcome exists
+/// without its tombstone and stamped debt. The normal LogicalFinalize then still
+/// stamps the tombstone and debt.
+#[test]
+fn legacy_reclaim_completion_and_finalize_are_refused_after_a_parent_decisions_prepare() {
+	let mut state = base(3);
+	grant_all(&mut state);
+	state.pd_drop_prepare_admitted = true;
+	let id = crate::integration::compute::DropOperationId {
+		tenant_id: TENANT,
+		table_object_id: TABLE,
+		schema_generation: crate::integration::compute::SchemaGeneration::new(1),
+	};
+	let fence = peek_index();
+	let prepared = apply_next(
+		&mut state,
+		WendelonRequest::TableDropPrepare(crate::consensus::TableDropPrepareRequest::current(
+			id,
+			id.schema_generation,
+		)),
+	);
+	assert!(
+		matches!(prepared, WendelonResponse::Success),
+		"{prepared:?}"
+	);
+	let snapshot = |state: &SmState| {
+		(
+			state
+				.table_drop_fences
+				.iter()
+				.find(|record| record.operation_id == id)
+				.copied(),
+			state.table_drop_outcomes.get(TENANT, TABLE).copied(),
+			state.table_drop_tombstones.get(TENANT, TABLE).copied(),
+			state.table_drop_reclaim_debts.get(TENANT, TABLE).cloned(),
+			state.table_schemas.latest_by_id(TENANT, TABLE).cloned(),
+		)
+	};
+	let before = snapshot(&state);
+	assert!(before.0.is_some(), "premise: the Prepare fenced the table");
+	let refused = |response: &WendelonResponse| {
+		matches!(response, WendelonResponse::Error(why)
+			if why == crate::consensus::raft_storage::PD_LEGACY_DROP_TRANSITION_REFUSED)
+	};
+	let completion = peek_index();
+	let completed = apply_next(
+		&mut state,
+		WendelonRequest::TableReclaimCompletion(
+			crate::consensus::TableReclaimCompletionRequest::current(id, fence),
+		),
+	);
+	assert!(refused(&completed), "the intended refusal: {completed:?}");
+	let finalized = apply_next(
+		&mut state,
+		WendelonRequest::TableDropFinalize(crate::consensus::TableDropFinalizeRequest::current(
+			id, fence, completion,
+		)),
+	);
+	assert!(refused(&finalized), "the intended refusal: {finalized:?}");
+	assert_eq!(
+		snapshot(&state),
+		before,
+		"no effect: the fence is preserved"
+	);
+
+	let logical = apply_next(
+		&mut state,
+		WendelonRequest::TableDropLogicalFinalize(
+			crate::consensus::TableDropLogicalFinalizeRequest {
+				operation_id: id,
+				fence_log_index: fence,
+			},
+		),
+	);
+	assert!(matches!(logical, WendelonResponse::Success), "{logical:?}");
+	assert!(state.table_drop_tombstones.get(TENANT, TABLE).is_some());
+	assert!(state.table_drop_reclaim_debts.get(TENANT, TABLE).is_some());
+	assert!(state.table_drop_outcomes.get(TENANT, TABLE).is_some());
+}

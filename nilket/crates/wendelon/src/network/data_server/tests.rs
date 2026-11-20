@@ -24170,3 +24170,17 @@ mod query_stall_bound {
 		node.shutdown().await.unwrap();
 	}
 }
+
+impl WendelonDataServer {
+	/// Test-only (wendelon ADR 0116 controls): whether this store recorded legacy
+	/// drop-reclaim progress for `operation_id`, read without starting one.
+	pub(crate) async fn drop_reclaim_recorded_for_test(
+		&self,
+		operation_id: crate::integration::compute::DropOperationId,
+	) -> bool {
+		self.drop_reclaim_progress
+			.recorded_for_test(operation_id)
+			.await
+			.unwrap()
+	}
+}

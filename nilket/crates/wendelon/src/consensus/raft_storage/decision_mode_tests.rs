@@ -2399,3 +2399,74 @@ async fn an_unadmitted_cold_open_refuses_a_policy_two_snapshot_before_any_effect
 	);
 	assert_eq!(recovered.last_applied_log_id.map(|id| id.index), Some(last));
 }
+
+/// Wendelon stage (c), the premature-settlement control through replay: a
+/// committed `TableDropSettlement` in the recovered suffix of a ParentDecisions
+/// store replays as the same refusal. The open succeeds, the applied index
+/// passes the entry, and the tombstone, reclaim debt and descriptor are kept.
+#[test]
+fn a_committed_parent_decisions_settlement_replays_as_a_refusal() {
+	let mut state = fixture::base(3);
+	fixture::grant_all(&mut state);
+	fixture::finalize_drop_of(&mut state, fixture::TABLE);
+	let base_index = fixture::peek_index() - 1;
+	state.last_applied_log_id = Some(LogId::new(
+		openraft::CommittedLeaderId::new(1, 1),
+		base_index,
+	));
+	let debt = state
+		.table_drop_reclaim_debts
+		.get(fixture::TENANT, fixture::TABLE)
+		.cloned()
+		.expect("premise: reclaim debt");
+	let entries = vec![normal_entry(
+		base_index + 1,
+		WendelonRequest::TableDropSettlement(crate::consensus::TableDropSettlementRequest {
+			operation_id: debt.operation_id,
+			finalize_log_index: debt.finalize_log_index,
+			ownership_epoch: debt.ownership_epoch,
+			attested_participants: debt.participants.clone(),
+		}),
+	)];
+	let last = entries[0].log_id;
+	let recovered = recover_sm_inner(
+		DecisionMode::ParentDecisions,
+		admitted(),
+		Some(loaded_snapshot(
+			state,
+			Some(LogId::new(
+				openraft::CommittedLeaderId::new(1, 1),
+				base_index,
+			)),
+		)),
+		entries,
+		Some(RecoveryCheckpoint {
+			commit_index: last.index,
+			e_safe_index: last.index,
+		}),
+		false,
+	)
+	.expect("a refused settlement still opens")
+	.state;
+	// The replay refused it as apply does; its response is not kept, so the
+	// state is the evidence.
+	assert_eq!(recovered.last_applied_log_id, Some(last));
+	assert!(
+		recovered
+			.table_drop_tombstones
+			.get(fixture::TENANT, fixture::TABLE)
+			.is_some()
+	);
+	assert!(
+		recovered
+			.table_drop_reclaim_debts
+			.get(fixture::TENANT, fixture::TABLE)
+			.is_some()
+	);
+	assert!(
+		recovered
+			.table_schemas
+			.latest_by_id(fixture::TENANT, fixture::TABLE)
+			.is_some()
+	);
+}

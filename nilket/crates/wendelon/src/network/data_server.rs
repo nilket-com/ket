@@ -650,6 +650,10 @@ struct DataRequestAdmission {
 // ============================================================
 
 pub(crate) const DROP_RECLAIM_MAX_EXAMINED_PER_SLICE: usize = 32;
+/// Wendelon ADR 0116: the legacy drop reclaim slice's refusal on a
+/// ParentDecisions store.
+pub(crate) const PD_LEGACY_DROP_RECLAIM_REFUSED: &str =
+	"legacy table drop reclaim is refused under ParentDecisions";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct DropReclaimSliceRequest {
@@ -1309,6 +1313,15 @@ impl WendelonDataServer {
 		&self,
 		request: DropReclaimSliceRequest,
 	) -> std::io::Result<DropReclaimSliceResponse> {
+		// Wendelon ADR 0116: legacy physical reclaim never runs on a ParentDecisions
+		// store; refused before any progress is loaded, started or persisted. The
+		// leader's local call and the remote frame handler both enter here.
+		if self.parent_decisions() {
+			return Err(Error::new(
+				ErrorKind::Unsupported,
+				PD_LEGACY_DROP_RECLAIM_REFUSED,
+			));
+		}
 		if request.examined_budget == 0
 			|| request.examined_budget > DROP_RECLAIM_MAX_EXAMINED_PER_SLICE
 		{
@@ -3365,6 +3378,11 @@ impl WendelonDataServer {
 		let state = self.state_machine.state_snapshot().await;
 		if self.roll_forward_one_prepared_drop(&state).await? {
 			return Ok(true);
+		}
+		// Wendelon ADR 0116: under ParentDecisions the pass ends at the roll-forward:
+		// no legacy slice and no settlement proposal.
+		if self.parent_decisions() {
+			return Ok(false);
 		}
 		let mut debts = state
 			.table_drop_reclaim_debts

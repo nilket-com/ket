@@ -15,13 +15,16 @@
 //!
 //! `a_candidate_rebuilt_after_settlement_reproduces_the_one_staged_before`: the
 //! leader and a reporter stage and report the excluding target while the third
-//! member is down; a real replicated settlement then removes T's tombstone,
-//! reclaim debt and descriptors. The reporter stops cleanly and its staged rows
+//! member's certification step is held. Settlement is then simulated on every
+//! member (ADR 0116 refuses a real ParentDecisions settlement until its
+//! authority exists): the settlement apply's own removals of T's tombstone,
+//! reclaim debt and descriptors, in place, made durable on the reporter by a
+//! snapshot. The reporter stops cleanly and its staged rows
 //! are then damaged; on reopen, the recovered-candidate path rebuilds without
 //! them and must reproduce the staged evidence before restoring its rows. (An
 //! unclean reopen at that point cannot validate generation 1's base, which
 //! still holds T's entries, without T's descriptor: stage (c) settles only
-//! after every member activated the excluding generation.) The third
+//! after every member activated the excluding generation.) The held
 //! member then builds for the first time after settlement, and the generation
 //! commits with one base everywhere. A table re-created under T's name with a
 //! fresh id is then included by the next generation, which still excludes T.
@@ -409,11 +412,17 @@ async fn a_candidate_rebuilt_after_settlement_reproduces_the_one_staged_before()
 	} = certified(4).await;
 	let u_before = of(&base_of(&cluster, NODES[0]).await, table_u.table_object_id);
 
-	// The third member is down, so the excluding target cannot commit.
+	// The third member's certification step is held, so the excluding target
+	// cannot commit before it builds.
 	let leader = cluster.leader().await;
 	let followers: Vec<u32> = NODES.into_iter().filter(|node| *node != leader).collect();
-	let (reporter, absent) = (followers[0], followers[1]);
-	cluster.stop(absent, false).await;
+	let (reporter, held) = (followers[0], followers[1]);
+	let (reached, release) = cluster.node(held).data_server.pause_coordinator_for_test(
+		crate::network::data_server::child_writes::PauseStage::CertificationStep,
+	);
+	tokio::time::timeout(BOUND, reached.notified())
+		.await
+		.expect("the held member reached its certification step");
 	let (drop_id, f) = drop_logically(&cluster, &table_t).await;
 	jump_floor(&cluster, now + 120_000).await;
 	cluster
@@ -433,9 +442,12 @@ async fn a_candidate_rebuilt_after_settlement_reproduces_the_one_staged_before()
 			},
 		)
 		.await;
+	until_applied(&cluster, &NODES, f).await;
 
-	// A real replicated settlement removes the tombstone, the reclaim debt and
-	// T's descriptors.
+	// Settlement, simulated (wendelon ADR 0116 refuses a real ParentDecisions
+	// settlement until its authority exists): on every member, the settlement
+	// apply's own removals of the tombstone, the reclaim debt and T's
+	// descriptors, in place under one write guard.
 	let leader = cluster.leader().await;
 	let debt = cluster
 		.node(leader)
@@ -448,26 +460,23 @@ async fn a_candidate_rebuilt_after_settlement_reproduces_the_one_staged_before()
 		})
 		.await
 		.expect("the logical finalize recorded reclaim debt");
-	let settled = cluster
-		.node(leader)
-		.raft
-		.client_write(crate::consensus::WendelonRequest::TableDropSettlement(
-			crate::consensus::TableDropSettlementRequest {
-				operation_id: drop_id,
-				finalize_log_index: debt.finalize_log_index,
-				ownership_epoch: debt.ownership_epoch,
-				attested_participants: debt.participants.clone(),
-			},
-		))
-		.await
-		.unwrap();
-	assert!(
-		matches!(settled.data, crate::consensus::WendelonResponse::Success),
-		"{:?}",
-		settled.data
-	);
-	let at = settled.log_id.index;
-	until_applied(&cluster, &[leader, reporter], at).await;
+	let settlement = crate::consensus::TableDropSettlementRequest {
+		operation_id: drop_id,
+		finalize_log_index: debt.finalize_log_index,
+		ownership_epoch: debt.ownership_epoch,
+		attested_participants: debt.participants.clone(),
+	};
+	for node in NODES {
+		let settled = cluster
+			.node(node)
+			.state_machine
+			.simulate_drop_settlement_for_test(settlement.clone())
+			.await;
+		assert!(
+			matches!(settled, crate::consensus::WendelonResponse::Success),
+			"node {node}: {settled:?}"
+		);
+	}
 	let settled_state = cluster
 		.node(reporter)
 		.state_machine
@@ -491,17 +500,41 @@ async fn a_candidate_rebuilt_after_settlement_reproduces_the_one_staged_before()
 		"tombstone and descriptor gone, the outcome kept"
 	);
 
-	// The reporter stops with its staged rows then damaged. Reopened (still
+	// The reporter's settled state is made durable by a snapshot, so its reopen
+	// recovers it. It then stops with its staged rows damaged. Reopened (still
 	// admitted), its recovered candidate is rebuilt from the settled state and
 	// must reproduce the staged evidence before its rows are restored. The stop
 	// is clean: after an unclean stop, start-up validation must find every
 	// active-base entry stored, which needs T's descriptor while generation 1
 	// (with T's entries) is still active; that is why stage (c) settles only
 	// after every member activated the excluding generation.
+	{
+		let mut sm = cluster.node(reporter).state_machine.clone();
+		let mut builder =
+			<crate::consensus::raft_storage::WendelonStateMachine as openraft::storage::RaftStateMachine<
+				crate::consensus::WendelonTypeConfig,
+			>>::get_snapshot_builder(&mut sm)
+			.await;
+		openraft::storage::RaftSnapshotBuilder::build_snapshot(&mut builder)
+			.await
+			.unwrap();
+	}
 	cluster.stop(reporter, false).await;
 	cluster.damage_staged(reporter).await;
 	cluster.reopen(reporter).await;
 	assert!(!cluster.node(reporter).recovered_after_unclean_shutdown());
+	assert_eq!(
+		cluster
+			.node(reporter)
+			.state_machine
+			.read_state(move |state| state
+				.table_schemas
+				.latest_by_id(drop_id.tenant_id, drop_id.table_object_id)
+				.is_some())
+			.await,
+		false,
+		"premise: the reopened reporter recovered the settled state"
+	);
 	{
 		let index = cluster.node(reporter).slab.persistent_index().unwrap();
 		let deadline = tokio::time::Instant::now() + BOUND;
@@ -514,9 +547,9 @@ async fn a_candidate_rebuilt_after_settlement_reproduces_the_one_staged_before()
 		}
 	}
 
-	// The third member builds for the first time after settlement; its report
+	// The held member builds for the first time after settlement; its report
 	// completes the commit.
-	cluster.reopen(absent).await;
+	release.notify_one();
 	until_settled(&cluster, &table_u).await;
 	until_active(&cluster, 2).await;
 	let (t, quiet) = committed_cut(&cluster).await;
@@ -593,7 +626,7 @@ async fn a_candidate_rebuilt_after_settlement_reproduces_the_one_staged_before()
 	let expected_v: Expected = (1..=2).map(|id| (id, "v".to_string())).collect();
 	expect_everywhere(&cluster, &table_v, &expected_v, "the fresh id").await;
 	eprintln!(
-		"ADR 0115 replicated: {leader}/{reporter} reported before settlement at {at}; {reporter} reproduced its staged candidate on reopen; {absent} built after; generation 2 at t = {t} (F = {f}); generation 3 includes the fresh id"
+		"ADR 0115 replicated: {leader}/{reporter} reported before the simulated settlement; {reporter} reproduced its staged candidate on reopen; {held} built after; generation 2 at t = {t} (F = {f}); generation 3 includes the fresh id"
 	);
 	for node in cluster.nodes {
 		let _ = tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown()).await;
@@ -790,4 +823,161 @@ async fn an_unadmitted_member_neither_stages_nor_reports_an_excluding_target() {
 		"ADR 0115 member refusal: {held} unadmitted held policy-2 target gid {} (t = {}) through 3 steps: no stage, no report, no commit; admitted: committed",
 		pending.target.gid, pending.target.t
 	);
+}
+
+/// Wendelon stage (c), the legacy-slice discriminator: under ParentDecisions the
+/// ADR 0095 reclaim slice is refused at its one entry point
+/// (`run_drop_reclaim_slice`, reached by the leader's local call and by the
+/// remote frame handler) on every node, and no node records legacy progress.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_legacy_reclaim_slice_is_refused_under_parent_decisions() {
+	use crate::network::data_server::{
+		DROP_RECLAIM_MAX_EXAMINED_PER_SLICE, DropReclaimSliceRequest,
+	};
+	let Certified {
+		cluster, table_t, ..
+	} = certified(2).await;
+	let (drop_id, f) = drop_logically(&cluster, &table_t).await;
+	until_applied(&cluster, &NODES, f).await;
+	let leader = cluster.leader().await;
+	let debt = cluster
+		.node(leader)
+		.state_machine
+		.read_state(move |state| {
+			state
+				.table_drop_reclaim_debts
+				.get(drop_id.tenant_id, drop_id.table_object_id)
+				.cloned()
+		})
+		.await
+		.expect("premise: reclaim debt");
+	for node in NODES {
+		let slice = cluster
+			.node(node)
+			.data_server
+			.run_drop_reclaim_slice(DropReclaimSliceRequest {
+				operation_id: debt.operation_id,
+				finalize_log_index: debt.finalize_log_index,
+				ownership_epoch: debt.ownership_epoch,
+				examined_budget: DROP_RECLAIM_MAX_EXAMINED_PER_SLICE,
+				coordinator: node_id(leader),
+			})
+			.await;
+		assert!(
+			slice
+				.as_ref()
+				.is_err_and(|error| error.kind() == std::io::ErrorKind::Unsupported
+					&& error.to_string()
+						== crate::network::data_server::PD_LEGACY_DROP_RECLAIM_REFUSED),
+			"node {node}: the intended refusal: {slice:?}"
+		);
+	}
+	for node in NODES {
+		assert!(
+			!cluster
+				.node(node)
+				.data_server
+				.drop_reclaim_recorded_for_test(drop_id)
+				.await,
+			"node {node}: no legacy reclaim progress"
+		);
+	}
+}
+
+/// Wendelon stage (c), logical-finalize progress: under ParentDecisions a
+/// prepared drop still reaches LogicalFinalize unattended (the sweeper's
+/// roll-forward). After that a reconcile pass does nothing (no legacy slice, no
+/// settlement), and the tombstone, reclaim debt and descriptor stay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_prepared_drop_reaches_logical_finalize_unattended_without_legacy_reclaim() {
+	let Certified {
+		cluster, table_t, ..
+	} = certified(2).await;
+	let drop_id = crate::integration::compute::DropOperationId {
+		tenant_id: TenantId::ZERO,
+		table_object_id: table_t.table_object_id,
+		schema_generation: crate::integration::compute::SchemaGeneration::new(
+			table_t.schema_generation,
+		),
+	};
+	let leader = cluster.leader().await;
+	let prepared = cluster
+		.node(leader)
+		.raft
+		.client_write(crate::consensus::WendelonRequest::TableDropPrepare(
+			crate::consensus::TableDropPrepareRequest::current(drop_id, drop_id.schema_generation),
+		))
+		.await
+		.unwrap();
+	assert!(
+		matches!(prepared.data, crate::consensus::WendelonResponse::Success),
+		"{:?}",
+		prepared.data
+	);
+	// Unattended: nothing but the sweeper proposes the logical finalize.
+	cluster
+		.until(
+			"the prepared drop is logically finalized unattended",
+			move |state| {
+				state
+					.table_drop_outcomes
+					.get(drop_id.tenant_id, drop_id.table_object_id)
+					.is_some()
+			},
+		)
+		.await;
+	// Every member applied the logical finalize before its catalog is read.
+	let leader = cluster.leader().await;
+	let f = cluster
+		.node(leader)
+		.state_machine
+		.read_state(move |state| {
+			state
+				.table_drop_outcomes
+				.get(drop_id.tenant_id, drop_id.table_object_id)
+				.map(|outcome| outcome.finalize_log_index)
+		})
+		.await
+		.expect("the outcome");
+	until_applied(&cluster, &NODES, f).await;
+	let pass = cluster
+		.node(leader)
+		.data_server
+		.reconcile_drop_reclaim_once()
+		.await;
+	assert!(
+		matches!(pass, Ok(false)),
+		"after the roll-forward a reconcile pass has nothing to do: {pass:?}"
+	);
+	for node in NODES {
+		assert!(
+			!cluster
+				.node(node)
+				.data_server
+				.drop_reclaim_recorded_for_test(drop_id)
+				.await,
+			"node {node}: no legacy reclaim progress"
+		);
+		let kept = cluster
+			.node(node)
+			.state_machine
+			.read_state(move |state| {
+				(
+					state
+						.table_drop_tombstones
+						.get(drop_id.tenant_id, drop_id.table_object_id)
+						.is_some(),
+					state
+						.table_drop_reclaim_debts
+						.get(drop_id.tenant_id, drop_id.table_object_id)
+						.is_some(),
+					state
+						.table_schemas
+						.latest_by_id(drop_id.tenant_id, drop_id.table_object_id)
+						.is_some(),
+				)
+			})
+			.await;
+		assert_eq!(kept, (true, true, true), "node {node}: nothing settled");
+	}
 }

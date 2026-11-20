@@ -131,6 +131,23 @@ impl DropReclaimProgressStore {
 		Ok(store)
 	}
 
+	/// Test-only (wendelon ADR 0116 controls): whether this store holds any
+	/// progress record for `operation_id`, read without starting or resetting one.
+	#[cfg(test)]
+	pub(crate) async fn recorded_for_test(
+		&self,
+		operation_id: DropOperationId,
+	) -> std::io::Result<bool> {
+		self.db
+			.run(move |db| {
+				let key = operation_key(operation_id);
+				let txn = db.begin_read().map_err(redb_to_io)?;
+				let table = txn.open_table(PROGRESS).map_err(redb_to_io)?;
+				Ok(table.get(key.as_slice()).map_err(redb_to_io)?.is_some())
+			})
+			.await
+	}
+
 	/// Read-only metric reconstruction; never resets or advances durable work.
 	pub(crate) async fn tiered_debts_for_metrics(
 		&self,
