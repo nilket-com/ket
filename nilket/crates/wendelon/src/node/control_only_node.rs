@@ -96,7 +96,6 @@ impl ControlOnlyNode {
 			retention.clone(),
 			owner.clone(),
 			cfg.decision_mode,
-			cfg.state_admission(),
 		)
 		.await?;
 		let pool = BufPool::new(256, 1024 * 1024);

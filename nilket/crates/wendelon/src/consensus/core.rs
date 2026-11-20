@@ -1072,6 +1072,11 @@ pub enum WendelonResponse {
 	Decision(crate::consensus::decisions::DecisionResult),
 	/// ADR 0701: one result per lease of an applied batch, in declared order.
 	LeaseResults(LeaseGrantResults),
+	/// Wendelon ADR 0118 D5: a ParentDecisions table drop stage refused, with no
+	/// effect, while a backup hold is held. Appended last.
+	BackupHoldBlocksDrop {
+		progress: crate::integration::compute::HeldDropProgress,
+	},
 }
 
 // The Wendelon implementation of the `openraft::RaftTypeConfig` trait.

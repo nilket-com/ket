@@ -1001,6 +1001,8 @@ fn storage_error_class(error: &StorageError) -> &'static str {
 		StorageError::UnsupportedUnderParentDecisions { .. } => {
 			"unsupported_under_parent_decisions"
 		}
+		StorageError::BackupHoldActive { .. } => "backup_hold_active",
+		StorageError::StorageTableMissing { .. } => "storage_table_missing",
 		StorageError::Arrow(_) => "arrow",
 		StorageError::Internal { .. } => "internal",
 	}

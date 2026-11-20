@@ -3332,6 +3332,11 @@ impl WendelonDataServer {
 			WendelonResponse::LeaseDenied => Err(Error::other(format!(
 				"drop reclaim {stage} returned unexpected lease denial"
 			))),
+			// Wendelon ADR 0118 D5: a backup hold blocks the roll-forward; the next
+			// pass retries it after the release.
+			WendelonResponse::BackupHoldBlocksDrop { progress: held } => Err(Error::other(
+				format!("drop reclaim {stage} waits for a backup hold ({held:?})"),
+			)),
 		}
 	}
 	async fn roll_forward_one_prepared_drop(&self, state: &SmState) -> std::io::Result<bool> {

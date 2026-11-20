@@ -124,7 +124,18 @@ fn required(name: &str) -> String {
 	std::env::var(name).unwrap_or_else(|_| panic!("{name} is not set"))
 }
 
+/// Wendelon ADR 0118 D2: the binary spawns use while set (the cross-binary control
+/// forms and exports with the previous build, then restores with this one).
+static BINARY_OVERRIDE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
 fn nilket_bin() -> PathBuf {
+	if let Some(path) = BINARY_OVERRIDE
+		.lock()
+		.unwrap_or_else(std::sync::PoisonError::into_inner)
+		.clone()
+	{
+		return path;
+	}
 	match std::env::var_os("WENDELON_SMOKE_NILKET_BIN") {
 		Some(path) if !path.is_empty() => PathBuf::from(path),
 		_ => panic!("WENDELON_SMOKE_NILKET_BIN is not set: this test needs the nilket binary"),
@@ -5630,6 +5641,136 @@ async fn three_daemons_back_up_cold_rows_and_restore_into_a_fresh_cluster_that_t
 	std::fs::remove_dir_all(&target.root).unwrap();
 }
 
+/// Wendelon ADR 0118 D2, the upgrade route: a cluster formed and written by the
+/// PREVIOUS build's binary (`WENDELON_SMOKE_NILKET_OLD_BIN`, a pre-0118 ParentDecisions
+/// store, which the new binary refuses to open) is exported and verified by that
+/// binary; a fresh cluster formed by the NEW binary restores the artifact, verified
+/// by the new binary first, and serves every row exactly and a new write. The source
+/// is stopped and kept, never converted. Local storage only: no object store is given
+/// to either cluster.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "spawns two three-daemon clusters in turn and needs the previous build's binary; run alone under an external owner (see the module text)"]
+async fn an_old_binarys_export_restores_verified_on_the_new_binary() {
+	let deadline = Instant::now() + BACKUP_TEST_BOUND;
+	let old = PathBuf::from(required("WENDELON_SMOKE_NILKET_OLD_BIN"));
+	*BINARY_OVERRIDE
+		.lock()
+		.unwrap_or_else(std::sync::PoisonError::into_inner) = Some(old);
+	let mut source = form_cluster(deadline, None, "-old", true, false).await;
+	let mut rows: Vec<(i64, String)> = (1..=ROWS).map(|id| (id, hex(random32()))).collect();
+	let client = client_through(
+		&source.members[0],
+		&source.pki,
+		Credential::Storage,
+		deadline,
+	)
+	.await;
+	for (id, name) in &rows {
+		ingest_the_row(&client, &source.descriptor, *id, name, deadline).await;
+	}
+	drop(client);
+	let artifact = source.root.join("backup");
+	let passphrase = source.root.join("backup-passphrase");
+	write_private(&passphrase, hex(random32()).as_bytes());
+	let mut export: Vec<std::ffi::OsString> = vec![
+		"export".into(),
+		"--to".into(),
+		artifact.clone().into(),
+		"--passphrase-file".into(),
+		passphrase.clone().into(),
+	];
+	export.extend(operator_connection(&source.members[0], &source.pki));
+	export.extend(storage_option(&source.pki));
+	let ran = backup_command("old-binary-export", &export, deadline);
+	assert!(ran.succeeded(), "the old binary's export: {}", ran.text());
+	for id in NODES {
+		source.daemons.stop(id, deadline);
+	}
+	let descriptor = source.descriptor.clone();
+
+	*BINARY_OVERRIDE
+		.lock()
+		.unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+	// D2: the new binary's ordinary startup on a disposable copy of a genuine old
+	// node directory (its configuration names its data directory relatively, so
+	// the copy is a separate store) refuses, and leaves every durable byte as it was.
+	let original = source.members[0]
+		.config
+		.parent()
+		.expect("a node directory")
+		.to_path_buf();
+	let copy = source.root.join("old-store-copy");
+	copy_tree(&original, &copy);
+	let config = copy.join(source.members[0].config.file_name().unwrap());
+	let before = durable_bytes(&copy.join("data"));
+	assert!(!before.is_empty(), "premise: the old store holds files");
+	let started = bounded_run(
+		&nilket_bin(),
+		&["wendelon".into(), config.into()],
+		Instant::now() + Duration::from_secs(120),
+	);
+	eprintln!(
+		"ADR 0118 D2: the new binary on an old store: {}",
+		started.text()
+	);
+	assert!(
+		started.within && !started.timed_out && !started.succeeded(),
+		"the new binary refuses the old store: {}",
+		started.text()
+	);
+	assert_eq!(
+		durable_bytes(&copy.join("data")),
+		before,
+		"no durable byte of the old store changed"
+	);
+
+	let ran = backup_command(
+		"new-binary-verify",
+		&[
+			"verify".into(),
+			artifact.clone().into(),
+			"--passphrase-file".into(),
+			passphrase.clone().into(),
+		],
+		deadline,
+	);
+	assert!(
+		ran.succeeded(),
+		"the new binary verifies it: {}",
+		ran.text()
+	);
+	let mut target = form_cluster(deadline, None, "-new-target", false, true).await;
+	let mut restore: Vec<std::ffi::OsString> = vec![
+		"restore".into(),
+		artifact.clone().into(),
+		"--passphrase-file".into(),
+		passphrase.clone().into(),
+	];
+	restore.extend(operator_connection(&target.members[0], &target.pki));
+	restore.extend(storage_option(&target.pki));
+	let ran = backup_command("new-binary-restore", &restore, deadline);
+	assert!(ran.succeeded(), "the new binary's restore: {}", ran.text());
+	let client = client_through(
+		&target.members[0],
+		&target.pki,
+		Credential::Storage,
+		deadline,
+	)
+	.await;
+	expect_rows(&client, &descriptor, deadline, "after the restore", &rows).await;
+	let fresh = (ROWS + 1, hex(random32()));
+	ingest_the_row(&client, &descriptor, fresh.0, &fresh.1, deadline).await;
+	rows.push(fresh);
+	expect_rows(&client, &descriptor, deadline, "after a new write", &rows).await;
+	drop(client);
+	for id in NODES {
+		target.daemons.stop(id, deadline);
+	}
+	assert!(Instant::now() < deadline, "the test overran its bound");
+	std::fs::remove_dir_all(&source.root).unwrap();
+	std::fs::remove_dir_all(&target.root).unwrap();
+}
+
 /// The bounded command runner counts a run only when its exit and both whole streams arrive
 /// before the deadline: a quick success counts; a late finisher, a command whose descendant
 /// holds its output open, and a failing exit do not.
@@ -9657,4 +9798,39 @@ async fn three_hosts_replace_a_lost_offloaded_replica() {
 	);
 	assert!(Instant::now() < deadline, "the test overran its bound");
 	std::fs::remove_dir_all(&formed.root).unwrap();
+}
+
+/// Copies a directory tree, files and directories only.
+fn copy_tree(from: &Path, to: &Path) {
+	std::fs::create_dir_all(to).unwrap();
+	for entry in std::fs::read_dir(from).unwrap() {
+		let entry = entry.unwrap();
+		let target = to.join(entry.file_name());
+		let kind = entry.file_type().unwrap();
+		if kind.is_dir() {
+			copy_tree(&entry.path(), &target);
+		} else if kind.is_file() {
+			std::fs::copy(entry.path(), &target).unwrap();
+		}
+	}
+}
+
+/// Every regular file under `dir`, by relative path, with its bytes.
+fn durable_bytes(dir: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+	let mut files = std::collections::BTreeMap::new();
+	let mut pending = vec![dir.to_path_buf()];
+	while let Some(at) = pending.pop() {
+		for entry in std::fs::read_dir(&at).unwrap() {
+			let path = entry.unwrap().path();
+			if path.is_dir() {
+				pending.push(path);
+			} else if path.is_file() {
+				files.insert(
+					path.strip_prefix(dir).unwrap().to_path_buf(),
+					std::fs::read(&path).unwrap(),
+				);
+			}
+		}
+	}
+	files
 }

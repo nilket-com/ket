@@ -22,10 +22,9 @@ use toron::storage::{
 	DropTableStorageOutcome, DropTableStorageRequest, HlcBound, InMemoryStorageScan,
 	InMemoryTableStorage, StorageAdmin, TenantId,
 };
-use wendelon::integration::compute::{DropOperationId, SchemaGeneration};
 use wendelon::schema::{
 	LocalityPolicy, MultiRowLayoutDescriptor, RecordLayoutPolicy, RowIdentityPolicy,
-	SchemaEvolutionPolicy, TableObjectId, TableSchemaDescriptor, TenantId as WendelonTenantId,
+	SchemaEvolutionPolicy, TableObjectId, TableSchemaDescriptor,
 };
 
 #[test]
@@ -624,47 +623,37 @@ fn wendelon_create_row_identity_policy_is_request_driven_after_adr062() {
 	assert!(!source.contains("RowIdentityPolicy::ByOrdinal"));
 }
 
+/// Wendelon ADR 0118 D6: a Wendelon table's local binding is never removed by
+/// name; it is removed by the binding the statement captured, and a replay of
+/// the same completion is a no-op.
 #[tokio::test]
 async fn wendelon_catalog_drop_table_semantics() {
+	let name = TableRef::with_schema("bench", "orders");
 	let descriptor = mock_descriptor(
-		&TableRef::with_schema("bench", "orders"),
+		&name,
 		schema(&[Field::new("id", DataType::Int32, false)]).as_ref(),
 		table_object_id(TableId(7)),
 	);
-	let table_object_id = descriptor.table_object_id;
-	let schema_generation = descriptor.schema_generation;
 	let catalog = WendelonCatalog::from_descriptors([(TableId(7), descriptor.clone())])
 		.expect("wendelon catalog");
 
-	let known = expect_drop_catalog_err(
-		catalog
-			.drop_table(&TableRef::with_schema("bench", "orders"), true)
-			.await,
-	);
-	assert!(matches!(known, CatalogError::AdminFailed { .. }));
-	assert!(known.to_string().contains("missing finalized DROP marker"));
-
-	let operation_id = DropOperationId {
-		tenant_id: WendelonTenantId::new(1),
-		table_object_id,
-		schema_generation: SchemaGeneration::new(schema_generation),
-	};
-	catalog
-		.descriptor_registry()
-		.mark_finalized_drop(TenantId(1), TableId(7), operation_id)
-		.expect("mark finalized drop");
-	let dropped = catalog
-		.drop_table(&TableRef::with_schema("bench", "orders"), true)
+	let by_name = expect_drop_catalog_err(catalog.drop_table(&name, true).await);
+	assert!(matches!(by_name, CatalogError::AdminFailed { .. }));
+	assert!(by_name.to_string().contains("not removed by name"));
+	let binding = catalog
+		.resolve_table(&name)
 		.await
-		.expect("guarded local descriptor drop")
-		.expect("dropped binding");
-	assert_eq!(dropped.local_table_id, TableId(7));
-	assert!(
-		catalog
-			.resolve_table(&TableRef::with_schema("bench", "orders"))
-			.await
-			.is_err()
-	);
+		.expect("a refused removal by name keeps the binding");
+
+	catalog
+		.complete_table_drop(&binding)
+		.await
+		.expect("completion by the captured binding");
+	assert!(catalog.resolve_table(&name).await.is_err());
+	catalog
+		.complete_table_drop(&binding)
+		.await
+		.expect("a replayed completion is a no-op");
 
 	let missing = catalog
 		.drop_table(&TableRef::new("missing"), true)
@@ -676,6 +665,117 @@ async fn wendelon_catalog_drop_table_semantics() {
 		err,
 		CatalogError::TableNotFound { ref table } if table == "missing"
 	));
+}
+
+/// Wendelon ADR 0118 D6: while the storage DROP of the captured binding is in
+/// flight, the name is rebound to a fresh table (another object, another local
+/// id, as a descriptor refresh after a re-create installs it). The original
+/// DROP finishes after its authoritative storage success, and the fresh binding
+/// stays intact: the completion never resolves the name.
+#[tokio::test]
+async fn a_delayed_drop_completion_across_a_name_reuse_leaves_the_fresh_binding() {
+	let name = TableRef::with_schema("bench", "orders");
+	let fields = schema(&[Field::new("id", DataType::Int32, false)]);
+	let old = mock_descriptor(&name, fields.as_ref(), table_object_id(TableId(7)));
+	let fresh = mock_descriptor(&name, fields.as_ref(), table_object_id(TableId(8)));
+	let catalog =
+		Arc::new(WendelonCatalog::from_descriptors([(TableId(7), old)]).expect("wendelon catalog"));
+	let admin = Arc::new(RebindingStorageAdmin {
+		catalog: catalog.clone(),
+		name: name.clone(),
+		fresh: Some(fresh.clone()),
+	});
+	let coordinator = wendelon_drop_coordinator(catalog.clone(), admin);
+	coordinator
+		.execute_query(
+			&SqlPlanner::new()
+				.plan("DROP TABLE bench.orders")
+				.expect("plan drop"),
+			None,
+		)
+		.await
+		.expect("the original DROP finishes after its storage success");
+	let bound = catalog
+		.resolve_table(&name)
+		.await
+		.expect("the fresh binding stays");
+	assert_eq!(bound.table, fresh.table_object_id, "the fresh object");
+}
+
+/// Wendelon ADR 0118 D6: the captured local entry is gone by the time the
+/// authoritative storage DROP answers (a refresh removed it). The DROP finishes;
+/// nothing else is removed.
+#[tokio::test]
+async fn a_drop_completion_after_its_local_entry_left_finishes() {
+	let name = TableRef::with_schema("bench", "orders");
+	let fields = schema(&[Field::new("id", DataType::Int32, false)]);
+	let old = mock_descriptor(&name, fields.as_ref(), table_object_id(TableId(7)));
+	let other = TableRef::with_schema("bench", "other");
+	let unrelated = mock_descriptor(&other, fields.as_ref(), table_object_id(TableId(9)));
+	let catalog = Arc::new(
+		WendelonCatalog::from_descriptors([(TableId(7), old), (TableId(9), unrelated)])
+			.expect("wendelon catalog"),
+	);
+	let admin = Arc::new(RebindingStorageAdmin {
+		catalog: catalog.clone(),
+		name: name.clone(),
+		fresh: None,
+	});
+	let coordinator = wendelon_drop_coordinator(catalog.clone(), admin);
+	coordinator
+		.execute_query(
+			&SqlPlanner::new()
+				.plan("DROP TABLE bench.orders")
+				.expect("plan drop"),
+			None,
+		)
+		.await
+		.expect("the DROP finishes");
+	assert!(catalog.resolve_table(&name).await.is_err());
+	assert!(
+		catalog.resolve_table(&other).await.is_ok(),
+		"an unrelated binding stays"
+	);
+}
+
+fn wendelon_drop_coordinator(
+	catalog: Arc<WendelonCatalog>,
+	admin: Arc<dyn StorageAdmin>,
+) -> QueryCoordinator {
+	let storage = Arc::new(InMemoryTableStorage::new());
+	QueryCoordinator::with_writer_deleter_and_admin(
+		catalog,
+		Executor::new(storage.clone()),
+		PlannerConfig::default(),
+		storage.clone(),
+		storage,
+		admin,
+	)
+}
+
+/// A storage admin whose DROP answers success after, in flight, the name is
+/// rebound to `fresh` (Some) or the captured local entry is removed (None).
+struct RebindingStorageAdmin {
+	catalog: Arc<WendelonCatalog>,
+	name: TableRef,
+	fresh: Option<TableSchemaDescriptor>,
+}
+
+#[async_trait]
+impl StorageAdmin for RebindingStorageAdmin {
+	async fn drop_table_storage(
+		&self,
+		request: DropTableStorageRequest,
+	) -> Result<DropTableStorageOutcome, StorageError> {
+		let registry = self.catalog.descriptor_registry();
+		registry.invalidate_descriptor_for_tenant(TenantId(1), request.table_id);
+		if let Some(fresh) = &self.fresh {
+			registry
+				.sync_descriptor_for_tenant(TenantId(1), &self.name, fresh.clone())
+				.expect("rebind the name to the fresh table");
+		}
+		Ok(DropTableStorageOutcome::new(1))
+	}
 }
 
 #[tokio::test]
@@ -939,5 +1039,76 @@ impl ToronTransport for FailingTransport {
 		Err(QueryError::Internal {
 			message: "transport should not be used for DROP TABLE".to_string(),
 		})
+	}
+}
+
+/// Wendelon ADR 0118 (r2): a DROP blocked by a backup hold after its Prepare
+/// (Fenced) fails and keeps the binding; the retry, a new statement on the same
+/// name, still names the OLD object, and its success completes the drop.
+#[tokio::test]
+async fn a_hold_blocked_drop_retries_bound_to_the_old_object() {
+	let name = TableRef::with_schema("bench", "orders");
+	let fields = schema(&[Field::new("id", DataType::Int32, false)]);
+	let old = mock_descriptor(&name, fields.as_ref(), table_object_id(TableId(7)));
+	let catalog = Arc::new(
+		WendelonCatalog::from_descriptors([(TableId(7), old.clone())]).expect("wendelon catalog"),
+	);
+	let admin = Arc::new(HoldOnceStorageAdmin {
+		calls: std::sync::Mutex::new(Vec::new()),
+	});
+	let coordinator = wendelon_drop_coordinator(catalog.clone(), admin.clone());
+	let plan = SqlPlanner::new()
+		.plan("DROP TABLE bench.orders")
+		.expect("plan drop");
+	let blocked = coordinator
+		.execute_query(&plan, None)
+		.await
+		.expect_err("blocked by the hold");
+	assert!(
+		matches!(
+			blocked,
+			QueryError::Storage(StorageError::BackupHoldActive { .. })
+		),
+		"{blocked:?}"
+	);
+	assert!(
+		catalog.resolve_table(&name).await.is_ok(),
+		"the binding is kept"
+	);
+	coordinator
+		.execute_query(&plan, None)
+		.await
+		.expect("the retry completes the drop");
+	assert!(catalog.resolve_table(&name).await.is_err());
+	assert_eq!(
+		*admin.calls.lock().unwrap(),
+		vec![old.table_object_id, old.table_object_id],
+		"both attempts name the old object"
+	);
+}
+
+/// A storage admin whose first DROP is blocked by a hold after its Prepare.
+struct HoldOnceStorageAdmin {
+	calls: std::sync::Mutex<Vec<TableObjectId>>,
+}
+
+#[async_trait]
+impl StorageAdmin for HoldOnceStorageAdmin {
+	async fn drop_table_storage(
+		&self,
+		request: DropTableStorageRequest,
+	) -> Result<DropTableStorageOutcome, StorageError> {
+		let mut calls = self.calls.lock().unwrap();
+		calls.push(request.table_object_id);
+		if calls.len() == 1 {
+			let progress = wendelon_client::HeldDropProgress::Fenced;
+			return Err(StorageError::BackupHoldActive {
+				progress,
+				source: wendelon_client::ClientError::Admin(
+					wendelon_client::WendelonAdminError::BackupHoldActive { progress },
+				),
+			});
+		}
+		Ok(DropTableStorageOutcome::new(1))
 	}
 }

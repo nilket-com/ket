@@ -172,7 +172,6 @@ pub(crate) fn adr049_descriptor_registry_keys_refs_and_descriptors_by_tenant() {
 		"by_ref: HashMap<(TenantId, TableRef), TableId>",
 		"by_id: HashMap<(TenantId, TableId), TableBinding>",
 		"descriptors: HashMap<(TenantId, TableId), wendelon_client::TableSchemaDescriptor>",
-		"finalized_drops: HashMap<(TenantId, TableId), DropOperationId>",
 		"register_descriptor_for_tenant",
 	] {
 		assert!(
@@ -191,9 +190,10 @@ pub(crate) fn adr049_create_and_drop_table_use_scoped_tenant() {
 	assert!(catalog.contains("TableSchemaUpdateRequest::create("));
 	assert!(catalog.contains("wendelon_tenant_id(self.tenant_id)"));
 	assert!(catalog.contains("tenant_id: wendelon_tenant_id(self.tenant_id)"));
-	assert!(catalog.contains(".consume_finalized_drop("));
+	assert!(catalog.contains(".complete_finalized_drop(self.tenant_id"));
 	assert!(catalog.contains("self.tenant_id,"));
-	assert!(catalog.contains("remove_table_for_tenant(self.tenant_id"));
+	// Wendelon ADR 0118 D6: the completion removes the tenant-keyed entry.
+	assert!(catalog.contains("state.by_id.remove(&(tenant_id, table));"));
 }
 
 #[test]
@@ -207,7 +207,8 @@ pub(crate) fn adr049_storage_descriptor_lookup_uses_request_tenant() {
 			.count(),
 		3
 	);
-	assert!(storage.contains("mark_finalized_drop(request.tenant_id, request.table_id"));
+	// Wendelon ADR 0118 D6: the binding completes in the catalog, by identity.
+	assert!(!storage.contains("mark_finalized_drop"));
 }
 
 #[test]

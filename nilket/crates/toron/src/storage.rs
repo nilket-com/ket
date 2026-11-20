@@ -581,11 +581,8 @@ impl StorageAdmin for WendelonStorageAdmin {
 			))
 			.await
 			.map_err(|error| map_wendelon_admin_error_to_storage(request.table_id, error))?;
-		self.registry
-			.mark_finalized_drop(request.tenant_id, request.table_id, operation_id)
-			.map_err(|error| StorageError::Internal {
-				message: error.to_string(),
-			})?;
+		// Wendelon ADR 0118 D6: the local binding completes by the captured identity
+		// (`Catalog::complete_table_drop`), never here by the local id alone.
 		Ok(DropTableStorageOutcome::new(1))
 	}
 
@@ -632,15 +629,21 @@ fn map_wendelon_admin_error_to_storage(
 	error: wendelon_client::ClientError,
 ) -> StorageError {
 	match error {
+		// Wendelon ADR 0118 (r2): no descriptor and no recorded outcome. Its own
+		// result: the coordinator takes only success, or the in-memory backend's
+		// TableNotFound, as a completed storage drop.
 		wendelon_client::ClientError::Admin(
 			wendelon_client::WendelonAdminError::TableMissing { .. },
-		) => StorageError::TableNotFound { table: table_id },
+		) => StorageError::StorageTableMissing { table: table_id },
 		wendelon_client::ClientError::Admin(
 			wendelon_client::WendelonAdminError::TableAlreadyDropped { .. },
 		) => StorageError::TableAlreadyDropped { table: table_id },
 		source @ wendelon_client::ClientError::Admin(
 			wendelon_client::WendelonAdminError::UnsupportedUnderParentDecisions,
 		) => StorageError::UnsupportedUnderParentDecisions { source },
+		source @ wendelon_client::ClientError::Admin(
+			wendelon_client::WendelonAdminError::BackupHoldActive { progress },
+		) => StorageError::BackupHoldActive { progress, source },
 		wendelon_client::ClientError::TableDescriptorEvolved { .. } => {
 			StorageError::DescriptorEvolved { table_id }
 		}
@@ -1573,9 +1576,12 @@ mod tests {
 				},
 			),
 		);
+		// Wendelon ADR 0118 (r2): Wendelon's TableMissing (no descriptor and no
+		// recorded outcome) is its own result, never the in-memory backend's
+		// TableNotFound, which a DROP takes as done.
 		assert!(matches!(
 			missing,
-			StorageError::TableNotFound { table } if table == table_id
+			StorageError::StorageTableMissing { table } if table == table_id
 		));
 	}
 

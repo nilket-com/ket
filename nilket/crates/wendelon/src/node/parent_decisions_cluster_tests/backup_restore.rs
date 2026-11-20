@@ -14,6 +14,9 @@ use crate::client::core::TableWriteRequest;
 use crate::client::{
 	ClusterPeerWire, ClusterStatusWire, StaticTopologySource, WendelonClient, WendelonClientConfig,
 };
+use crate::integration::compute::{
+	DropOperationId, TableSchemaDropFields, TableSchemaDropRequest, WendelonAdminError,
+};
 use crate::logical_backup::export::{BackupRefusal, Clients, ExportError};
 use crate::logical_backup::restore::{RestoreError, RestoreRefusal};
 use crate::logical_backup::{export, format, restore};
@@ -309,6 +312,822 @@ async fn a_backup_restores_into_a_fresh_cluster_that_then_takes_new_writes() {
 		restore::verify(&dir, PASSPHRASE),
 		Err(RestoreError::Refused(RestoreRefusal::Artifact { .. }))
 	));
+}
+
+// ============================================================
+//  WENDELON ADR 0118: A DROP SUCCEEDS AT ITS LOGICAL FINALIZE (THE INTERVAL)
+// ============================================================
+//
+// In process, ordinary Full members only (the replacement recovery driver has a
+// separate report route; nothing here is claimed for it). Certification is held
+// on every member (`hold_certification`, also set in each member's start
+// configuration so a reopen keeps it), and so is cleanup. The DROP goes through
+// the control server's drop route (`SCHEMA_DROP_REQ`), the path SQL takes.
+
+/// A tenant-1 table in the `analytics` namespace with the fixture's columns.
+fn interval_table(id: u8, name: &str) -> TableSchemaDescriptor {
+	TableSchemaDescriptor::new_with_layout(
+		TableObjectId::new([id; 16]),
+		SchemaGeneration::new(1).get(),
+		"analytics",
+		name,
+		&Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("v", DataType::Utf8, true),
+		]),
+		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
+		crate::schema::LocalityPolicy::IdentityProjection,
+		RecordLayoutPolicy::SingleRow,
+		SchemaEvolutionPolicy::AdditiveOnly,
+	)
+	.unwrap()
+}
+
+/// Creates `descriptor` through the operator's schema route; every node applies
+/// it before this returns.
+async fn create_table(cluster: &Cluster, clients: &Clients, descriptor: &TableSchemaDescriptor) {
+	clients
+		.admin
+		.submit_schema_update_envelope(&SchemaUpdateEnvelope::compute_client_intent(
+			TENANT,
+			SchemaObjectRef {
+				kind: SchemaObjectKind::Table,
+				namespace: descriptor.namespace.clone(),
+				name: descriptor.table_name.clone(),
+			},
+			SchemaGeneration::ZERO,
+			SchemaGeneration::new(descriptor.schema_generation),
+			SchemaIntentId::new(*descriptor.table_object_id.as_bytes()),
+			SchemaMutationKind::Create,
+			encode_table_schema_descriptor_v1(descriptor).unwrap(),
+		))
+		.await
+		.unwrap();
+	let (table, generation) = (descriptor.table_object_id, descriptor.schema_generation);
+	let by = tokio::time::Instant::now() + BOUND;
+	for id in NODES {
+		while !cluster
+			.node(id)
+			.state_machine
+			.read_state(move |state| state.table_schemas.get(TENANT, table, generation).is_some())
+			.await
+		{
+			assert!(
+				tokio::time::Instant::now() < by,
+				"node {id} never applied the table"
+			);
+			tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+		}
+	}
+}
+
+/// Stamps past a floor jump, one per write, increasing.
+struct Stamps(std::sync::atomic::AtomicU64);
+
+impl Stamps {
+	fn next(&self) -> [u8; 16] {
+		uuid_v7_at(self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
+	}
+}
+
+/// `write`, stamped by `stamps`: the answer, or the client's error.
+async fn write_answer(
+	clients: &Clients,
+	descriptor: &TableSchemaDescriptor,
+	rows: &[(i64, &str)],
+	stamps: &Stamps,
+) -> std::io::Result<MutationAnswer> {
+	let mut meta = write_meta(descriptor, rows.len(), stamps.next());
+	meta.tenant_id = TENANT;
+	let result = clients.data[&TENANT]
+		.table_write(TableWriteRequest {
+			meta,
+			descriptor: descriptor.clone(),
+			payload: named_rows(descriptor, rows),
+			deadline: Some(std::time::Instant::now() + std::time::Duration::from_secs(10)),
+		})
+		.await?;
+	let write = result.response.write;
+	Ok(mutation_answer(
+		write.status,
+		write.mutation_commit_knowledge(),
+	))
+}
+
+async fn write_stamped(
+	clients: &Clients,
+	descriptor: &TableSchemaDescriptor,
+	rows: &[(i64, &str)],
+	stamps: &Stamps,
+) {
+	let answer = write_answer(clients, descriptor, rows, stamps).await;
+	assert!(
+		matches!(answer, Ok(MutationAnswer::Committed { .. })),
+		"{answer:?}"
+	);
+}
+
+/// Whether tenant 1's read of `descriptor` is refused.
+async fn read_refused(clients: &Clients, descriptor: &TableSchemaDescriptor) -> bool {
+	match export::query_table(&clients.data[&TENANT], TENANT, descriptor).await {
+		Err(_) => true,
+		Ok(mut result) => loop {
+			match result.next_batch().await {
+				Err(_) => return true,
+				Ok(None) => return false,
+				Ok(Some(_)) => {}
+			}
+		},
+	}
+}
+
+/// The drop route the control server serves to SQL (`SCHEMA_DROP_REQ`), sent to
+/// the leader: success, or the typed admin error it answered.
+async fn drop_through_control(
+	cluster: &Cluster,
+	clients: &Clients,
+	descriptor: &TableSchemaDescriptor,
+) -> Result<(), WendelonAdminError> {
+	use crate::network::core::{HRFT_MAGIC, read_frame, write_frame};
+	let generation = SchemaGeneration::new(descriptor.schema_generation);
+	let request = TableSchemaDropRequest::current(TableSchemaDropFields {
+		tenant_id: TENANT,
+		table_object_id: descriptor.table_object_id,
+		expected_generation: generation,
+		operation_id: DropOperationId {
+			tenant_id: TENANT,
+			table_object_id: descriptor.table_object_id,
+			schema_generation: generation,
+		},
+	});
+	let payload = crate::network::wire::encode(&request).unwrap();
+	let leader = cluster.leader().await;
+	let connection = clients
+		.admin
+		.factory()
+		.get_connection(crate::schema::NodeId {
+			id: leader,
+			_reserved: 0,
+		})
+		.await
+		.unwrap();
+	let mut stream = connection.open_bi().await.unwrap();
+	let header = crate::schema::FrameHeader {
+		magic: HRFT_MAGIC,
+		version: 1,
+		msg_type: crate::schema::MsgType::SCHEMA_DROP_REQ.0,
+		flags: 0,
+		stream_id: 0,
+		meta_len: payload.len() as u32,
+		arrow_len: 0,
+		trailing_len: 0,
+	};
+	write_frame(&mut *stream, &header, &payload, None, None)
+		.await
+		.unwrap();
+	stream.finish().await.unwrap();
+	let frame = read_frame(&mut *stream, clients.admin.pool())
+		.await
+		.unwrap();
+	assert_eq!(
+		frame.header.msg_type,
+		crate::schema::MsgType::SCHEMA_DROP_RESP.0
+	);
+	let response: crate::network::control_server::TableSchemaDropResponseWire =
+		crate::network::wire::decode(&frame.meta).unwrap();
+	if response.accepted {
+		Ok(())
+	} else {
+		Err(response
+			.admin_error
+			.unwrap_or(WendelonAdminError::Transport {
+				message: response.message.unwrap_or_default(),
+			}))
+	}
+}
+
+/// One member's certified base at a checkpoint: its active generation, its
+/// installed cut (typed), and how many of its base entries belong to the table.
+#[derive(Debug)]
+struct Checkpoint {
+	active: u64,
+	cut: crate::storage::index::certified_base::CutState,
+	old_entries: usize,
+}
+
+async fn base_checkpoint(cluster: &Cluster, node: u32, table: TableObjectId) -> Checkpoint {
+	let index = cluster.node(node).slab.persistent_index().unwrap();
+	Checkpoint {
+		active: index.base_meta().await.unwrap().active_gid,
+		cut: index.installed_cut().await.unwrap(),
+		old_entries: index
+			.base_entries(false)
+			.await
+			.unwrap()
+			.iter()
+			.filter(|entry| entry.table == table)
+			.count(),
+	}
+}
+
+/// Every member's checkpoint, printed under `what`.
+async fn checkpoints(cluster: &Cluster, what: &str, table: TableObjectId) -> Vec<Checkpoint> {
+	let mut all = Vec::new();
+	for node in NODES {
+		let checkpoint = base_checkpoint(cluster, node, table).await;
+		eprintln!("ADR 0118 interval {what}: node {node} {checkpoint:?}");
+		all.push(checkpoint);
+	}
+	all
+}
+
+/// Every member holds G active, G's own installed cut, and old t's two base
+/// entries: the old base is active.
+async fn assert_old_base_active(
+	cluster: &Cluster,
+	what: &str,
+	table: TableObjectId,
+	g: crate::storage::index::certified_base::InstalledCut,
+) {
+	for (node, checkpoint) in NODES.iter().zip(checkpoints(cluster, what, table).await) {
+		assert_eq!(checkpoint.active, g.gid, "{what}: node {node}: G is active");
+		assert_eq!(
+			checkpoint.cut,
+			crate::storage::index::certified_base::CutState::Current(g),
+			"{what}: node {node}: G's installed cut"
+		);
+		assert_eq!(
+			checkpoint.old_entries, 2,
+			"{what}: node {node}: the old base holds old t"
+		);
+	}
+}
+
+/// Every member holds a generation past G whose installed cut covers the
+/// finalize `f`, and no entry of old t.
+async fn assert_excluded(cluster: &Cluster, what: &str, table: TableObjectId, g: u64, f: u64) {
+	for (node, checkpoint) in NODES.iter().zip(checkpoints(cluster, what, table).await) {
+		let crate::storage::index::certified_base::CutState::Current(cut) = checkpoint.cut else {
+			panic!("{what}: node {node}: no current installed cut: {checkpoint:?}");
+		};
+		assert!(checkpoint.active > g, "{what}: node {node}: past G");
+		assert_eq!(
+			cut.gid, checkpoint.active,
+			"{what}: node {node}: the active cut"
+		);
+		assert!(
+			cut.t >= f,
+			"{what}: node {node}: the cut covers the finalize"
+		);
+		assert_eq!(
+			checkpoint.old_entries, 0,
+			"{what}: node {node}: old t is excluded"
+		);
+	}
+}
+
+/// Holds (or releases) certification and cleanup on every member, now and in
+/// its start configuration.
+fn hold_everywhere(cluster: &mut Cluster, certification: bool, cleanup: bool) {
+	for id in NODES {
+		let peer = cluster.node(id).data_server.decision_peer_for_test();
+		peer.hold_certification
+			.store(certification, std::sync::atomic::Ordering::Release);
+		peer.pause_cleanup
+			.store(cleanup, std::sync::atomic::Ordering::Release);
+		let cfg = cluster.configs.get_mut(&id).unwrap();
+		cfg.hold_certification_at_start_for_test = certification;
+		cfg.hold_cleanup_at_start_for_test = cleanup;
+	}
+}
+
+struct Interval {
+	cluster: Cluster,
+	clients: Clients,
+	old: TableSchemaDescriptor,
+	u: TableSchemaDescriptor,
+	fresh: TableSchemaDescriptor,
+	/// The generation active on every member when the DROP succeeded.
+	g: u64,
+	/// G's installed cut, on every member until the excluding generation.
+	g_cut: crate::storage::index::certified_base::InstalledCut,
+	/// The logical finalize's index.
+	f: u64,
+	now: u64,
+	stamps: Stamps,
+	expected_u: Expected,
+	expected_fresh: Expected,
+}
+
+/// Old t and u certified into generation G on every member (old t's rows in
+/// each member's active base), both holds armed on every member, then the DROP
+/// of old t through the control route. At its success every member's active
+/// base is still G and still holds old t's entries. Then a fresh t (another
+/// id, the same name) is created; it and u are written and read exactly, and
+/// the old id is refused.
+async fn dropped_with_the_old_base_active() -> Interval {
+	let (mut cluster, clients, old) = source_with_table().await;
+	let u = interval_table(0x53, "events_u");
+	create_table(&cluster, &clients, &u).await;
+	write(&clients, &old, &[(1, "t1"), (2, "t2")]).await;
+	write(&clients, &u, &[(1, "u1"), (2, "u2")]).await;
+	let now = std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.unwrap()
+		.as_millis() as u64;
+	jump_floor(&cluster, now + 60_000).await;
+	until_active(&cluster, 1).await;
+	let seeded = base_checkpoint(&cluster, NODES[0], old.table_object_id).await;
+	let crate::storage::index::certified_base::CutState::Current(g_cut) = seeded.cut else {
+		panic!("G's installed cut: {seeded:?}");
+	};
+	assert_old_base_active(&cluster, "seeded G", old.table_object_id, g_cut).await;
+	let g = g_cut.gid;
+
+	hold_everywhere(&mut cluster, true, true);
+	drop_through_control(&cluster, &clients, &old)
+		.await
+		.expect("the DROP succeeds at its logical finalize");
+	let leader = cluster.leader().await;
+	let (f, current) = cluster
+		.node(leader)
+		.state_machine
+		.read_state({
+			let table = old.table_object_id;
+			move |state| {
+				(
+					state
+						.table_drop_outcomes
+						.get(TENANT, table)
+						.map(|outcome| outcome.finalize_log_index),
+					state
+						.decisions
+						.as_ref()
+						.unwrap()
+						.generations()
+						.current_gid(),
+				)
+			}
+		})
+		.await;
+	let f = f.expect("the permanent outcome is recorded");
+	assert_eq!(current, g, "no generation committed past G");
+	assert_old_base_active(
+		&cluster,
+		"at the DROP's success",
+		old.table_object_id,
+		g_cut,
+	)
+	.await;
+
+	let stamps = Stamps(std::sync::atomic::AtomicU64::new(now + 60_001));
+	let fresh = interval_table(0x54, &old.table_name);
+	assert_eq!(fresh.namespace, old.namespace);
+	create_table(&cluster, &clients, &fresh).await;
+	write_stamped(&clients, &fresh, &[(10, "f10")], &stamps).await;
+	write_stamped(&clients, &u, &[(3, "u3")], &stamps).await;
+	let expected_fresh: Expected = [(10, "f10".to_string())].into();
+	let expected_u: Expected = [
+		(1, "u1".to_string()),
+		(2, "u2".to_string()),
+		(3, "u3".to_string()),
+	]
+	.into();
+	let interval = Interval {
+		cluster,
+		clients,
+		old,
+		u,
+		fresh,
+		g,
+		g_cut,
+		f,
+		now,
+		stamps,
+		expected_u,
+		expected_fresh,
+	};
+	assert_tables_exact(&interval, "after the DROP").await;
+	interval
+}
+
+/// The fresh t and u read exactly, and the old id is refused for a read and a
+/// write.
+async fn assert_tables_exact(interval: &Interval, what: &str) {
+	assert_eq!(
+		read(&interval.clients, &interval.fresh).await,
+		interval.expected_fresh,
+		"{what}: the fresh t"
+	);
+	assert_eq!(
+		read(&interval.clients, &interval.u).await,
+		interval.expected_u,
+		"{what}: u"
+	);
+	assert!(
+		read_refused(&interval.clients, &interval.old).await,
+		"{what}: a read of the old id is refused"
+	);
+	let old_write = write_answer(
+		&interval.clients,
+		&interval.old,
+		&[(99, "late")],
+		&interval.stamps,
+	)
+	.await;
+	assert!(
+		!matches!(old_write, Ok(MutationAnswer::Committed { .. })),
+		"{what}: a write of the old id is refused: {old_write:?}"
+	);
+}
+
+/// An unclean stop and reopen of every member (each start re-applies its holds:
+/// cleanup always, certification when `certification_held`); returns once every
+/// member validated its base again.
+async fn reopen_every_member_uncleanly(interval: &mut Interval, certification_held: bool) {
+	for id in NODES {
+		interval.cluster.stop(id, true).await;
+	}
+	for id in NODES {
+		interval.cluster.reopen(id).await;
+	}
+	until_ready(&interval.cluster, None).await;
+	let by = tokio::time::Instant::now() + BOUND;
+	for id in NODES {
+		let validated = interval
+			.cluster
+			.node(id)
+			.data_server
+			.base_validated_for_test();
+		while !validated.load(std::sync::atomic::Ordering::Acquire) {
+			assert!(
+				tokio::time::Instant::now() < by,
+				"node {id} never validated its base"
+			);
+			tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+		}
+		let peer = interval
+			.cluster
+			.node(id)
+			.data_server
+			.decision_peer_for_test();
+		assert_eq!(
+			peer.hold_certification
+				.load(std::sync::atomic::Ordering::Acquire),
+			certification_held,
+			"node {id}: the reopen re-applied its certification setting"
+		);
+		assert!(
+			peer.pause_cleanup
+				.load(std::sync::atomic::Ordering::Acquire),
+			"node {id}: the reopen kept the cleanup hold"
+		);
+		let table = interval.old.table_object_id;
+		assert!(
+			interval
+				.cluster
+				.node(id)
+				.state_machine
+				.read_state(move |state| state.table_schemas.latest_by_id(TENANT, table).is_some())
+				.await,
+			"node {id}: the old descriptor is kept"
+		);
+	}
+	interval.clients = clients(&interval.cluster).await;
+}
+
+/// Exports the source and restores it into a fresh cluster: the fresh t and u
+/// with their exact rows, and nothing of the old t.
+async fn assert_export_and_restore(interval: &Interval, what: &str) {
+	let root = crate::test_support::TestDir::new("adr0118-interval-artifact");
+	let dir = root.to_path_buf().join("backup");
+	let report = export::export(&interval.clients, &dir, PASSPHRASE)
+		.await
+		.unwrap_or_else(|error| panic!("{what}: export: {error}"));
+	let rows = (interval.expected_fresh.len() + interval.expected_u.len()) as u64;
+	assert_eq!(
+		(report.tables, report.rows),
+		(2, rows),
+		"{what}: {report:?}"
+	);
+	let verified = restore::verify(&dir, PASSPHRASE).unwrap();
+	let ids: Vec<_> = verified
+		.manifest
+		.roster
+		.tables
+		.iter()
+		.map(|table| table.descriptor.table_object_id)
+		.collect();
+	assert!(
+		!ids.contains(&interval.old.table_object_id),
+		"{what}: no old t"
+	);
+	assert!(
+		ids.contains(&interval.fresh.table_object_id),
+		"{what}: the fresh t"
+	);
+	assert!(ids.contains(&interval.u.table_object_id), "{what}: u");
+
+	let target = Cluster::start().await;
+	until_ready(&target, None).await;
+	let target_clients = self::clients(&target).await;
+	restore::restore(&target_clients, &dir, &verified)
+		.await
+		.unwrap_or_else(|error| panic!("{what}: restore: {error}"));
+	assert_eq!(
+		read(&target_clients, &interval.fresh).await,
+		interval.expected_fresh,
+		"{what}: the restored fresh t"
+	);
+	assert_eq!(
+		read(&target_clients, &interval.u).await,
+		interval.expected_u,
+		"{what}: the restored u"
+	);
+	let leader = target.leader().await;
+	let table = interval.old.table_object_id;
+	assert!(
+		target
+			.node(leader)
+			.state_machine
+			.read_state(move |state| state.table_schemas.latest_by_id(TENANT, table).is_none())
+			.await,
+		"{what}: the restore holds nothing of the old t"
+	);
+}
+
+/// Wendelon ADR 0118, the pre-exclusion interval: the DROP succeeds at its
+/// logical finalize while the old base is active on every member (G holds old
+/// t's entries; no excluding generation commits, certification held). The fresh
+/// t and u are readable and writable exactly and the old id is refused; after
+/// an unclean reopen of every member the old descriptor, its base entries and
+/// the gates are kept; a logical export and restore under held cleanup carries
+/// the fresh t and u exactly and nothing of the old t.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_drop_succeeds_at_its_logical_finalize_with_the_old_base_active() {
+	let mut interval = dropped_with_the_old_base_active().await;
+	reopen_every_member_uncleanly(&mut interval, true).await;
+	assert_old_base_active(
+		&interval.cluster,
+		"after the unclean reopen",
+		interval.old.table_object_id,
+		interval.g_cut,
+	)
+	.await;
+	assert_tables_exact(&interval, "after the unclean reopen").await;
+	assert_old_base_active(
+		&interval.cluster,
+		"before the export",
+		interval.old.table_object_id,
+		interval.g_cut,
+	)
+	.await;
+	assert_export_and_restore(&interval, "pre-exclusion").await;
+	eprintln!(
+		"ADR 0118 pre-exclusion interval: DROP finalized at {} with G = {} active on every member",
+		interval.f, interval.g
+	);
+}
+
+/// Wendelon ADR 0118, the post-exclusion interval: the certification hold is
+/// released, and the excluding generation (cut at or past the finalize) is
+/// observed active on every member with old t's entries gone from each base;
+/// then, cleanup still held, the same checks hold (exact fresh t and u, the old
+/// id refused, an unclean reopen, export and restore). Only the ADR 0117 local
+/// cleanup follows the cleanup release; nothing of tier or L2 is claimed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn after_the_excluding_generation_the_interval_checks_still_hold() {
+	let mut interval = dropped_with_the_old_base_active().await;
+	hold_everywhere(&mut interval.cluster, false, true);
+	jump_floor(&interval.cluster, interval.now + 120_000).await;
+	interval
+		.stamps
+		.0
+		.store(interval.now + 120_001, std::sync::atomic::Ordering::SeqCst);
+	until_active(&interval.cluster, interval.g + 1).await;
+	let leader = interval.cluster.leader().await;
+	let (covering_t, policy) = interval
+		.cluster
+		.node(leader)
+		.state_machine
+		.read_state(|state| {
+			let generations = state.decisions.as_ref().unwrap().generations();
+			(generations.fr(), state.survivor_policy_at(generations.fr()))
+		})
+		.await;
+	assert!(
+		covering_t >= interval.f,
+		"the covering cut is past the finalize"
+	);
+	assert_eq!(policy, 2, "the excluding policy");
+	assert_excluded(
+		&interval.cluster,
+		"after the excluding generation",
+		interval.old.table_object_id,
+		interval.g,
+		interval.f,
+	)
+	.await;
+	assert_tables_exact(&interval, "after the excluding generation").await;
+	reopen_every_member_uncleanly(&mut interval, false).await;
+	assert_tables_exact(&interval, "after the unclean reopen").await;
+	assert_excluded(
+		&interval.cluster,
+		"before the export",
+		interval.old.table_object_id,
+		interval.g,
+		interval.f,
+	)
+	.await;
+	assert_export_and_restore(&interval, "post-exclusion").await;
+}
+
+// ============================================================
+//  WENDELON ADR 0118 (r2): OVERLAPPING ATTEMPTS AT ONE DROP, AND THE HOLD
+// ============================================================
+//
+// Attempt B is held by a one-shot pause right after its control-route snapshot
+// (it saw the table unfenced); attempt A then moves the replicated state on;
+// B is released. B's public answer must follow the replicated state.
+
+/// Attempt A's Prepare, proposed directly; its fence index.
+async fn prepare_through_raft(cluster: &Cluster, descriptor: &TableSchemaDescriptor) -> u64 {
+	let generation = SchemaGeneration::new(descriptor.schema_generation);
+	let operation = DropOperationId {
+		tenant_id: TENANT,
+		table_object_id: descriptor.table_object_id,
+		schema_generation: generation,
+	};
+	let leader = cluster.leader().await;
+	let prepared = cluster
+		.node(leader)
+		.raft
+		.client_write(crate::consensus::WendelonRequest::TableDropPrepare(
+			crate::consensus::TableDropPrepareRequest::current(operation, generation),
+		))
+		.await
+		.unwrap();
+	assert!(
+		matches!(prepared.data, crate::consensus::WendelonResponse::Success),
+		"{:?}",
+		prepared.data
+	);
+	prepared.log_id.index
+}
+
+/// The recorded outcome's fence index for `descriptor`, from the leader.
+async fn recorded_fence(cluster: &Cluster, descriptor: &TableSchemaDescriptor) -> Option<u64> {
+	let leader = cluster.leader().await;
+	let table = descriptor.table_object_id;
+	cluster
+		.node(leader)
+		.state_machine
+		.read_state(move |state| {
+			state
+				.table_drop_tombstones
+				.get(TENANT, table)
+				.map(|tombstone| tombstone.fence_log_index)
+		})
+		.await
+}
+
+/// Attempt B, started and held after its unfenced snapshot.
+async fn held_attempt(
+	cluster: &Arc<Cluster>,
+	clients: &Arc<Clients>,
+	descriptor: &TableSchemaDescriptor,
+) -> (
+	tokio::task::JoinHandle<Result<(), WendelonAdminError>>,
+	Arc<tokio::sync::Notify>,
+) {
+	let (reached, release) =
+		crate::network::control_server::adr0118_test_support::pause_next_drop_after_snapshot(
+			descriptor.table_object_id,
+		);
+	let attempt = tokio::spawn({
+		let (cluster, clients, descriptor) = (cluster.clone(), clients.clone(), descriptor.clone());
+		async move { drop_through_control(&cluster, &clients, &descriptor).await }
+	});
+	tokio::time::timeout(BOUND, reached.notified())
+		.await
+		.expect("attempt B reached its snapshot");
+	(attempt, release)
+}
+
+/// A finishes the whole DROP while B is held: B, released, succeeds (the same
+/// operation's recorded outcome), and the outcome is A's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_held_attempt_succeeds_after_the_other_attempt_finished() {
+	let (cluster, clients, descriptor) = source_with_table().await;
+	let (cluster, clients) = (Arc::new(cluster), Arc::new(clients));
+	let (b, release) = held_attempt(&cluster, &clients, &descriptor).await;
+	drop_through_control(&cluster, &clients, &descriptor)
+		.await
+		.expect("attempt A");
+	let fence = recorded_fence(&cluster, &descriptor).await;
+	release.notify_one();
+	assert_eq!(b.await.unwrap(), Ok(()), "attempt B");
+	assert_eq!(
+		recorded_fence(&cluster, &descriptor).await,
+		fence,
+		"A's outcome"
+	);
+}
+
+/// A only prepares while B is held: B, released, finalizes against A's fence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_held_attempt_finalizes_against_the_other_attempts_fence() {
+	let (cluster, clients, descriptor) = source_with_table().await;
+	let (cluster, clients) = (Arc::new(cluster), Arc::new(clients));
+	let (b, release) = held_attempt(&cluster, &clients, &descriptor).await;
+	let fence = prepare_through_raft(&cluster, &descriptor).await;
+	release.notify_one();
+	assert_eq!(b.await.unwrap(), Ok(()), "attempt B");
+	assert_eq!(
+		recorded_fence(&cluster, &descriptor).await,
+		Some(fence),
+		"finalized against A's fence"
+	);
+}
+
+/// A prepares and a hold is entered while B is held: B answers Fenced (the
+/// table is fenced; never NotBegun). After the release the same DROP completes,
+/// against A's fence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_held_attempt_under_a_later_hold_reports_the_fence() {
+	let (cluster, clients, descriptor) = source_with_table().await;
+	let (cluster, clients) = (Arc::new(cluster), Arc::new(clients));
+	let (b, release) = held_attempt(&cluster, &clients, &descriptor).await;
+	let fence = prepare_through_raft(&cluster, &descriptor).await;
+	let hold = begin_hold_through_raft(&cluster, 18).await;
+	release.notify_one();
+	assert_eq!(
+		b.await.unwrap(),
+		Err(WendelonAdminError::BackupHoldActive {
+			progress: crate::integration::compute::HeldDropProgress::Fenced
+		})
+	);
+	release_hold_through_raft(&cluster, hold).await;
+	drop_through_control(&cluster, &clients, &descriptor)
+		.await
+		.expect("the same DROP after the release");
+	assert_eq!(recorded_fence(&cluster, &descriptor).await, Some(fence));
+}
+
+/// A finishes and a hold is entered while B is held: B succeeds (the drop is
+/// recorded; the hold labels nothing).
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_held_attempt_after_the_outcome_succeeds_under_a_hold() {
+	let (cluster, clients, descriptor) = source_with_table().await;
+	let (cluster, clients) = (Arc::new(cluster), Arc::new(clients));
+	let (b, release) = held_attempt(&cluster, &clients, &descriptor).await;
+	drop_through_control(&cluster, &clients, &descriptor)
+		.await
+		.expect("attempt A");
+	let hold = begin_hold_through_raft(&cluster, 19).await;
+	release.notify_one();
+	assert_eq!(b.await.unwrap(), Ok(()), "attempt B");
+	release_hold_through_raft(&cluster, hold).await;
+}
+
+/// The two plain orderings at the public boundary. Hold first: NotBegun, and no
+/// fence. Prepare first, then the hold: Fenced. After each release the same
+/// DROP completes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn the_public_drop_answer_under_a_hold_follows_its_progress() {
+	let (cluster, clients, descriptor) = source_with_table().await;
+	let hold = begin_hold_through_raft(&cluster, 20).await;
+	assert_eq!(
+		drop_through_control(&cluster, &clients, &descriptor).await,
+		Err(WendelonAdminError::BackupHoldActive {
+			progress: crate::integration::compute::HeldDropProgress::NotBegun
+		})
+	);
+	let leader = cluster.leader().await;
+	let table = descriptor.table_object_id;
+	assert!(
+		cluster
+			.node(leader)
+			.state_machine
+			.read_state(move |state| state.table_drop_fences.get(TENANT, table).is_none())
+			.await,
+		"no fence"
+	);
+	release_hold_through_raft(&cluster, hold).await;
+
+	let fence = prepare_through_raft(&cluster, &descriptor).await;
+	let hold = begin_hold_through_raft(&cluster, 21).await;
+	assert_eq!(
+		drop_through_control(&cluster, &clients, &descriptor).await,
+		Err(WendelonAdminError::BackupHoldActive {
+			progress: crate::integration::compute::HeldDropProgress::Fenced
+		})
+	);
+	release_hold_through_raft(&cluster, hold).await;
+	drop_through_control(&cluster, &clients, &descriptor)
+		.await
+		.expect("the same DROP after the release");
+	assert_eq!(recorded_fence(&cluster, &descriptor).await, Some(fence));
 }
 
 // ============================================================

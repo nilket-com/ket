@@ -5872,10 +5872,10 @@ fn root2_carrier_is_bounded_private_held_and_response_mappings_are_explicit() {
 	// stay pinned; each list's last variant is the newest append (ADR 0699 S2;
 	// ADR 0725 appended the owner-signed slab operation to the requests, ADR
 	// 0726 the root check, Wendelon ADR 0105 the replacement's incarnation
-	// promotion).
+	// promotion; Wendelon ADR 0118 the response's drop hold refusal).
 	for (name, last) in [
 		("WendelonRequest", "PromoteIncarnation"),
-		("WendelonResponse", "LeaseResults"),
+		("WendelonResponse", "BackupHoldBlocksDrop"),
 	] {
 		let e = core
 			.items

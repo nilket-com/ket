@@ -289,6 +289,9 @@ impl WendelonDataServer {
 					WendelonResponse::LeaseDenied => {
 						Ok(LeaseAcquireOutcome::Denied(LeaseStatus::DENIED_OVERLAP))
 					}
+					WendelonResponse::BackupHoldBlocksDrop { .. } => Err(Error::other(
+						"unexpected drop hold refusal for a lease acquisition",
+					)),
 					WendelonResponse::Error(message) => Err(Error::new(
 						ErrorKind::Other,
 						format!("lease manager: state machine rejected AcquireLease: {message}"),

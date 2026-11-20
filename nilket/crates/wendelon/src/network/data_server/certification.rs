@@ -76,6 +76,16 @@ impl WendelonDataServer {
 				.pause_at(super::child_writes::PauseStage::CertificationStep)
 				.await;
 			self.activate_committed().await?;
+			// Test-only (wendelon ADR 0118): a held store activates, but does not
+			// certify.
+			#[cfg(test)]
+			if self
+				.decisions
+				.hold_certification
+				.load(std::sync::atomic::Ordering::Acquire)
+			{
+				return Ok(());
+			}
 			if self
 				.decisions
 				.base_validated

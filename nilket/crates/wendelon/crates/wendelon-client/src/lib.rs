@@ -69,7 +69,7 @@ pub use wendelon::client::{
 };
 pub use wendelon::integration::compute::{
 	COMPUTE_STORAGE_CONTRACT_VERSION, ComputeQuerySessionHandoff, ComputeQuerySessionIssueRequest,
-	ComputeTraceContext, DropOperationId, LOGICAL_TYPE_INTERNAL_NAMESPACE,
+	ComputeTraceContext, DropOperationId, HeldDropProgress, LOGICAL_TYPE_INTERNAL_NAMESPACE,
 	LOGICAL_TYPE_RESERVED_STATIC_MAX_ID, LogicalTypeDefinition, LogicalTypeDefinitionCreate,
 	LogicalTypePhysical, LogicalTypeRefinementComparisonOp, LogicalTypeRefinementPredicate,
 	LogicalTypeRefinementValue, LogicalTypeUnit, SchemaGeneration, SchemaIntentId,

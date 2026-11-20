@@ -128,14 +128,9 @@ pub(crate) fn roster_at(
 			what: format!("migration {} is {:?}", entry.migration_id, entry.state),
 		});
 	}
-	if state.table_drop_fences.iter().next().is_some()
-		|| state.table_drop_tombstones.iter().next().is_some()
-		|| !state.table_drop_reclaim_debts.is_empty()
-	{
-		return Err(RosterRefusal::LifecycleNotSettled {
-			what: "a table drop is in progress".into(),
-		});
-	}
+	// Wendelon ADR 0118 D5: a proved, logically finalized drop is skipped; any
+	// other drop state refuses, as before.
+	let finalized = finalized_drops(state, cut)?;
 	// Nothing outside the tenant roster: every catalog object's tenant is a
 	// live tenant, so iterating tenants below sees every object.
 	let known: BTreeSet<_> = tenants.iter().map(|tenant| tenant.tenant_id).collect();
@@ -175,6 +170,8 @@ pub(crate) fn roster_at(
 			.descriptors_for_tenant(tenant_id)
 			.into_iter()
 			.map(|descriptor| descriptor.table_object_id)
+			// A proved finalized drop's descriptor stays, unbound: it is gone.
+			.filter(|table| !finalized.contains(&(tenant_id, *table)))
 			.collect();
 		if named_ids != live_ids {
 			return Err(RosterRefusal::LifecycleNotSettled {
@@ -268,4 +265,105 @@ pub(crate) fn roster_at(
 		tables,
 		indexes,
 	})
+}
+
+/// Wendelon ADR 0118 D5: the tables whose drop is proved logically finalized at
+/// `cut`. Any fence, and any outcome, tombstone or reclaim debt whose table is not
+/// proved, refuses the roster: each of the three is a candidate.
+fn finalized_drops(
+	state: &SmState,
+	cut: u64,
+) -> Result<BTreeSet<(TenantId, TableObjectId)>, RosterRefusal> {
+	let in_progress = || RosterRefusal::LifecycleNotSettled {
+		what: "a table drop is in progress".into(),
+	};
+	if state.table_drop_fences.iter().next().is_some() {
+		return Err(in_progress());
+	}
+	let keys: BTreeSet<_> = state
+		.table_drop_outcomes
+		.iter()
+		.map(|outcome| outcome.operation_id)
+		.chain(
+			state
+				.table_drop_tombstones
+				.iter()
+				.map(|tombstone| tombstone.operation_id),
+		)
+		.chain(
+			state
+				.table_drop_reclaim_debts
+				.iter()
+				.map(|debt| debt.operation_id),
+		)
+		.map(|operation| (operation.tenant_id, operation.table_object_id))
+		.collect();
+	for &(tenant_id, table_object_id) in &keys {
+		if !proved_finalized(state, tenant_id, table_object_id, cut) {
+			return Err(in_progress());
+		}
+	}
+	Ok(keys)
+}
+
+/// Wendelon ADR 0118 D5: `(tenant, table)`'s drop is logically finalized at or
+/// before `cut`, exactly: its permanent outcome, tombstone and reclaim debt name
+/// one operation (tenant, table and schema generation) and one finalize index,
+/// the tombstone's and the debt's fence index agree, the descriptor at that
+/// generation is present with no name bound to it, and nothing else of the
+/// table remains: no lifecycle record, no materialization certificate, no
+/// secondary index (live or dropping). A fence is checked by the caller.
+fn proved_finalized(
+	state: &SmState,
+	tenant_id: TenantId,
+	table_object_id: TableObjectId,
+	cut: u64,
+) -> bool {
+	let (Some(outcome), Some(tombstone), Some(debt)) = (
+		state.table_drop_outcomes.get(tenant_id, table_object_id),
+		state.table_drop_tombstones.get(tenant_id, table_object_id),
+		state
+			.table_drop_reclaim_debts
+			.get(tenant_id, table_object_id),
+	) else {
+		return false;
+	};
+	let operation = outcome.operation_id;
+	let finalize = outcome.finalize_log_index;
+	let records_agree = operation.tenant_id == tenant_id
+		&& operation.table_object_id == table_object_id
+		&& tombstone.operation_id == operation
+		&& debt.operation_id == operation
+		&& tombstone.finalize_log_index == finalize
+		&& debt.finalize_log_index == finalize
+		&& tombstone.fence_log_index == debt.fence_log_index
+		&& finalize <= cut;
+	let unbound_descriptor = state
+		.table_schemas
+		.latest_by_id(tenant_id, table_object_id)
+		.is_some_and(|descriptor| {
+			descriptor.schema_generation == operation.schema_generation.get()
+				&& state
+					.table_schemas
+					.latest_by_name(
+						tenant_id,
+						descriptor.namespace.as_str(),
+						descriptor.table_name.as_str(),
+					)
+					.is_none_or(|bound| bound.table_object_id != table_object_id)
+		});
+	let nothing_else_remains = state
+		.table_lifecycle
+		.get(tenant_id, table_object_id)
+		.is_none()
+		&& state
+			.materialization_certificates
+			.get(tenant_id, table_object_id)
+			.is_none()
+		&& !state
+			.secondary_indexes
+			.for_tenant(tenant_id)
+			.iter()
+			.any(|row| row.descriptor.table_object_id == table_object_id);
+	records_agree && unbound_descriptor && nothing_else_remains
 }

@@ -189,6 +189,24 @@ pub enum WendelonAdminError {
 	/// (today: DROP TABLE). Typed, never a transport error, so a caller does not
 	/// retry it. Appended last: every earlier variant keeps its wire discriminant.
 	UnsupportedUnderParentDecisions,
+	/// Wendelon ADR 0118 D5: a backup hold blocked the drop; retry after the hold is
+	/// released. `progress` says whether it had any effect: NotBegun (nothing was
+	/// applied) or Fenced (the table is fenced, and the same operation completes
+	/// when it is retried or rolled forward). Appended last.
+	BackupHoldActive {
+		progress: HeldDropProgress,
+	},
+}
+
+/// Wendelon ADR 0118 D5: how far a table drop a backup hold blocked had come,
+/// as a caller acts on it (never an internal stage; ADR 039's boundary).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HeldDropProgress {
+	/// Nothing was applied: the drop had no effect.
+	NotBegun,
+	/// The table is fenced (its Prepare is durable); the drop completes when the
+	/// same operation is retried or rolled forward after the hold.
+	Fenced,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1250,5 +1268,35 @@ mod dc268_admin_error_codec_tests {
 			postcard::from_bytes::<OlderWendelonAdminError>(&bytes).unwrap(),
 			OlderWendelonAdminError::TableMissing { .. }
 		));
+	}
+
+	/// Wendelon ADR 0118 D5: the hold refusal of a drop stage is appended last on
+	/// both enums, so every earlier variant keeps its wire discriminant: the admin
+	/// error's tag is 7 (after DC-268's 6), the replicated response's is 8.
+	#[test]
+	fn the_drop_hold_refusals_are_appended_with_pinned_tags() {
+		for (progress, byte) in [
+			(HeldDropProgress::NotBegun, 0_u8),
+			(HeldDropProgress::Fenced, 1),
+		] {
+			let typed = WendelonAdminError::BackupHoldActive { progress };
+			let bytes = postcard::to_stdvec(&typed).unwrap();
+			assert_eq!(bytes, [7, byte], "{progress:?}");
+			assert_eq!(
+				postcard::from_bytes::<WendelonAdminError>(&bytes).unwrap(),
+				typed
+			);
+			let response = crate::consensus::WendelonResponse::BackupHoldBlocksDrop { progress };
+			assert_eq!(
+				postcard::to_stdvec(&response).unwrap(),
+				[8, byte],
+				"{progress:?}"
+			);
+		}
+		assert_eq!(
+			postcard::to_stdvec(&WendelonAdminError::UnsupportedUnderParentDecisions).unwrap(),
+			[6],
+			"DC-268's tag is unchanged"
+		);
 	}
 }

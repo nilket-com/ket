@@ -1725,6 +1725,10 @@ impl Catalog for HidesTargetOnFirstResolve {
 	) -> Result<Option<TableBinding>, CatalogError> {
 		self.inner.drop_table(name, if_exists).await
 	}
+
+	async fn complete_table_drop(&self, binding: &TableBinding) -> Result<(), CatalogError> {
+		self.inner.complete_table_drop(binding).await
+	}
 }
 
 #[async_trait]
@@ -1857,6 +1861,10 @@ impl Catalog for RacingCatalog {
 		if_exists: bool,
 	) -> Result<Option<TableBinding>, CatalogError> {
 		self.inner.drop_table(name, if_exists).await
+	}
+
+	async fn complete_table_drop(&self, binding: &TableBinding) -> Result<(), CatalogError> {
+		self.inner.complete_table_drop(binding).await
 	}
 }
 
@@ -2192,6 +2200,10 @@ impl Catalog for ExpiredLeaseCatalog {
 		if_exists: bool,
 	) -> Result<Option<TableBinding>, CatalogError> {
 		self.inner.drop_table(name, if_exists).await
+	}
+
+	async fn complete_table_drop(&self, binding: &TableBinding) -> Result<(), CatalogError> {
+		self.inner.complete_table_drop(binding).await
 	}
 }
 

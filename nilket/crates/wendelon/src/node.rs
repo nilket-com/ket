@@ -401,15 +401,15 @@ impl std::fmt::Debug for DecisionSigningSecret {
 /// constructed programmatically in tests.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NodeBootstrapConfig {
-	/// Test-only (wendelon ADR 0115): this node's store admits the test-only
-	/// ParentDecisions drop semantics, from construction (recovery, replay and
-	/// snapshot install). Default off; production has no such field.
-	#[cfg(test)]
-	pub(crate) pd_drop_admitted_for_test: bool,
 	/// Test-only (DC-276 controls): this node starts with certified cleanup and
 	/// the debt sweep held (`pause_cleanup`), before its first maintenance pass.
 	#[cfg(test)]
 	pub(crate) hold_cleanup_at_start_for_test: bool,
+	/// Test-only (wendelon ADR 0118 interval controls): this node starts with
+	/// certification held (`hold_certification`), before its first maintenance
+	/// pass, so a reopen keeps the hold.
+	#[cfg(test)]
+	pub(crate) hold_certification_at_start_for_test: bool,
 	#[cfg(test)]
 	pub(crate) startup_probe: Option<startup_ownership_tests::StartupProbe>,
 	#[cfg(test)]
@@ -621,9 +621,9 @@ impl NodeBootstrapConfig {
 			control_retention: ControlRetention::Compacting,
 			consensus_timing: Default::default(),
 			#[cfg(test)]
-			pd_drop_admitted_for_test: false,
-			#[cfg(test)]
 			hold_cleanup_at_start_for_test: false,
+			#[cfg(test)]
+			hold_certification_at_start_for_test: false,
 			decision_mode: Default::default(),
 			decision_signing_secret: None,
 			trusted_decision_signers: BTreeMap::new(),
@@ -1025,17 +1025,6 @@ pub struct WendelonNode {
 
 /// Background task handles. Explicit shutdown aborts and joins these tasks;
 /// dropping a raw Tokio JoinHandle alone detaches its task.
-impl NodeBootstrapConfig {
-	/// Wendelon ADR 0115: the admission this node's control store is opened
-	/// with (always the default in production builds).
-	pub(crate) fn state_admission(&self) -> crate::consensus::raft_storage::StateAdmission {
-		crate::consensus::raft_storage::StateAdmission {
-			#[cfg(test)]
-			pd_drop: self.pd_drop_admitted_for_test,
-		}
-	}
-}
-
 impl NodeBootstrapConfig {
 	/// ADR 0700: selects the ParentDecisions authority for a fresh disposable
 	/// store, as `cluster.decision_authority = "parent-decisions"` does from a
@@ -2226,7 +2215,6 @@ impl WendelonNode {
 			retention.clone(),
 			owner.clone(),
 			cfg.decision_mode,
-			cfg.state_admission(),
 		)
 		.await?;
 		// Control replay is validated before it can authorize a missing-index rebuild.
@@ -2817,6 +2805,14 @@ impl WendelonNode {
 				data_server
 					.decision_peer_for_test()
 					.pause_cleanup
+					.store(true, std::sync::atomic::Ordering::Release);
+			}
+			// Test-only (wendelon ADR 0118): certification held from start.
+			#[cfg(test)]
+			if cfg.hold_certification_at_start_for_test {
+				data_server
+					.decision_peer_for_test()
+					.hold_certification
 					.store(true, std::sync::atomic::Ordering::Release);
 			}
 			let decision_lease_ttl = cfg.data_ring_lease_ttl;
@@ -4095,6 +4091,9 @@ fn install_tenant_kek_response(response: WendelonResponse, context: &str) -> std
 		crate::consensus::WendelonResponse::LeaseDenied => Err(Error::other(format!(
 			"{context}: unexpected LeaseDenied response from InstallTenantKekVersion"
 		))),
+		crate::consensus::WendelonResponse::BackupHoldBlocksDrop { .. } => Err(Error::other(
+			format!("{context}: unexpected drop hold refusal from InstallTenantKekVersion"),
+		)),
 	}
 }
 
@@ -4138,6 +4137,9 @@ fn tenant_request_response(response: WendelonResponse, context: &str) -> std::io
 		}
 		WendelonResponse::LeaseDenied => Err(Error::other(format!(
 			"{context}: unexpected LeaseDenied response"
+		))),
+		WendelonResponse::BackupHoldBlocksDrop { .. } => Err(Error::other(format!(
+			"{context}: unexpected drop hold refusal"
 		))),
 	}
 }

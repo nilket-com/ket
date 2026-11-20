@@ -38,6 +38,11 @@ pub enum StorageError {
 	TableNotFound { table: TableId },
 	#[error("table was already dropped by a different durable operation: {table:?}")]
 	TableAlreadyDropped { table: TableId },
+	/// Wendelon ADR 0118: storage holds neither the table nor a drop outcome for
+	/// it (Wendelon's `TableMissing`). Never a DROP's success: the local binding
+	/// is kept.
+	#[error("storage holds no table and no drop outcome for {table:?}; the local binding is kept")]
+	StorageTableMissing { table: TableId },
 	#[error("descriptor evolved for {table_id:?} during query planning/execution")]
 	DescriptorEvolved { table_id: TableId },
 	#[error("storage operation cancelled")]
@@ -95,6 +100,15 @@ pub enum StorageError {
 	/// DC-268: refused under the ParentDecisions decision authority. Not transient.
 	#[error("unsupported under the ParentDecisions decision authority")]
 	UnsupportedUnderParentDecisions {
+		#[source]
+		source: wendelon_client::ClientError,
+	},
+	/// Wendelon ADR 0118 D5: a backup hold blocked the table drop. Transient: retry
+	/// after the hold is released. Only NotBegun had no effect; once Fenced, the table
+	/// stays fenced and the same DROP completes on retry.
+	#[error("{}", backup_hold_message(*progress))]
+	BackupHoldActive {
+		progress: wendelon_client::HeldDropProgress,
 		#[source]
 		source: wendelon_client::ClientError,
 	},
@@ -673,5 +687,20 @@ mod adr540_query_status_tests {
 			"peer reset",
 		)));
 		assert_eq!(transport.to_string(), "storage unavailable");
+	}
+}
+
+/// Wendelon ADR 0118 D5: a hold-blocked DROP's message, by its progress. Only a
+/// drop that had not begun is described as having had no effect.
+fn backup_hold_message(progress: wendelon_client::HeldDropProgress) -> &'static str {
+	match progress {
+		wendelon_client::HeldDropProgress::NotBegun => {
+			"a backup hold blocks the table drop before it began; it had no effect: retry after the \
+			 hold is released"
+		}
+		wendelon_client::HeldDropProgress::Fenced => {
+			"a backup hold blocks the table drop after it was prepared; the table stays fenced: retry \
+			 the same DROP after the hold is released to complete it"
+		}
 	}
 }

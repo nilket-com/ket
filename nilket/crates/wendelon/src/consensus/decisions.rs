@@ -641,9 +641,8 @@ pub enum RefusalCause {
 	LineageClosed,
 	Aborted,
 	/// Wendelon ADR 0114 stage (a): concluded by its table's drop Prepare while
-	/// still Reserved. Test-only until a later stage owns its compatibility
-	/// fence: no production build can encode or decode it.
-	#[cfg(test)]
+	/// still Reserved. Production from format 31 (wendelon ADR 0118 D2 is its
+	/// compatibility fence); appended, so every earlier tag is unchanged.
 	TableDropped,
 }
 
@@ -1281,7 +1280,6 @@ impl DecisionState {
 	/// only that table's live bucket. All premises are checked before any change:
 	/// a reservation at or after `log_index` refuses the whole batch, unchanged.
 	/// Terminal parents, other tables, KV and keys are untouched.
-	#[cfg(test)]
 	pub(crate) fn conclude_reserved_for_drop(
 		&mut self,
 		tenant: TenantId,
@@ -1303,8 +1301,8 @@ impl DecisionState {
 		Ok(targets)
 	}
 
-	/// ADR 0114: the Reserved reservations of one table (test inspection).
-	#[cfg(test)]
+	/// ADR 0114: the Reserved reservations of one table (the ParentDecisions
+	/// drop Prepare reads them; wendelon ADR 0118 D1).
 	pub(crate) fn live_of_table(
 		&self,
 		tenant: TenantId,

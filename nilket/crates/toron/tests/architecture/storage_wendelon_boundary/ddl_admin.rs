@@ -951,7 +951,7 @@ pub(crate) fn adr034_coordinators_intercept_drop_table() {
 	.1;
 	assert!(helper.contains("ExecutionPlan::DropTable"));
 	assert!(helper.contains("drop_existing_table_with_storage_admin"));
-	assert!(drop_helper.contains(".drop_table(name, false)"));
+	assert!(drop_helper.contains(".complete_table_drop(&binding)"));
 	assert!(helper.contains("Ok(Vec::new())"));
 }
 

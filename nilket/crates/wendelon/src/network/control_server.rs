@@ -116,6 +116,44 @@ pub mod adr0093_test_support {
 	}
 }
 
+/// Wendelon ADR 0118 (test only): a one-shot pause of the next schema drop of a
+/// table right after its state snapshot, so a test interleaves another attempt
+/// at the same operation deterministically.
+#[cfg(test)]
+pub(crate) mod adr0118_test_support {
+	use crate::schema::TableObjectId;
+	use std::collections::BTreeMap;
+	use std::sync::{Arc, Mutex, OnceLock};
+	use tokio::sync::Notify;
+
+	type Gate = (Arc<Notify>, Arc<Notify>);
+
+	fn gates() -> &'static Mutex<BTreeMap<TableObjectId, Gate>> {
+		static GATES: OnceLock<Mutex<BTreeMap<TableObjectId, Gate>>> = OnceLock::new();
+		GATES.get_or_init(Default::default)
+	}
+
+	/// Arms the pause; returns (reached, release).
+	pub(crate) fn pause_next_drop_after_snapshot(
+		table_object_id: TableObjectId,
+	) -> (Arc<Notify>, Arc<Notify>) {
+		let gate = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+		gates()
+			.lock()
+			.unwrap()
+			.insert(table_object_id, gate.clone());
+		gate
+	}
+
+	pub(super) async fn pause_if_armed(table_object_id: TableObjectId) {
+		let gate = gates().lock().unwrap().remove(&table_object_id);
+		if let Some((reached, release)) = gate {
+			reached.notify_one();
+			release.notified().await;
+		}
+	}
+}
+
 pub const CONTROL_REASON_GRANTED: u8 = 0;
 pub const CONTROL_REASON_NOT_LEADER: u8 = 1;
 pub const CONTROL_REASON_EPOCH_STALE: u8 = 2;
@@ -1052,6 +1090,9 @@ impl WendelonControlServer {
 				WendelonResponse::LeaseDenied => Err(Error::other(
 					"unexpected lease denial for secondary-index lifecycle mutation",
 				)),
+				WendelonResponse::BackupHoldBlocksDrop { .. } => Err(Error::other(
+					"unexpected drop hold refusal for secondary-index lifecycle mutation",
+				)),
 			};
 		}
 		let leader = self
@@ -1321,6 +1362,9 @@ impl WendelonControlServer {
 							)
 					}
 					WendelonResponse::LeaseDenied => {
+						CtasSagaResponse::Rejected(CtasSagaReject::StaleOwner)
+					}
+					WendelonResponse::BackupHoldBlocksDrop { .. } => {
 						CtasSagaResponse::Rejected(CtasSagaReject::StaleOwner)
 					}
 				},
@@ -1940,6 +1984,7 @@ impl WendelonControlServer {
 			| WendelonAdminError::DependentIndexesPresent { .. } => CONTROL_REASON_INVALID_TARGET,
 			WendelonAdminError::Transport { .. } => CONTROL_REASON_INTERNAL_ERROR,
 			WendelonAdminError::UnsupportedUnderParentDecisions => CONTROL_REASON_INVALID_TARGET,
+			WendelonAdminError::BackupHoldActive { .. } => CONTROL_REASON_INVALID_TARGET,
 		}
 	}
 
@@ -2095,6 +2140,12 @@ impl WendelonControlServer {
 					frame,
 					CONTROL_REASON_INTERNAL_ERROR,
 					"unexpected LeaseDenied response from revocation mutation",
+					None,
+				),
+				WendelonResponse::BackupHoldBlocksDrop { .. } => self.revocation_admin_rejection(
+					frame,
+					CONTROL_REASON_INTERNAL_ERROR,
+					"unexpected drop hold refusal from revocation mutation",
 					None,
 				),
 			},
@@ -2360,6 +2411,12 @@ impl WendelonControlServer {
 					&frame,
 					CONTROL_REASON_INTERNAL_ERROR,
 					"unexpected LeaseDenied response from schema update",
+					None,
+				),
+				WendelonResponse::BackupHoldBlocksDrop { .. } => self.schema_update_rejection(
+					&frame,
+					CONTROL_REASON_INTERNAL_ERROR,
+					"unexpected drop hold refusal from schema update",
 					None,
 				),
 			},
@@ -3221,6 +3278,8 @@ impl WendelonControlServer {
 		}
 
 		let snapshot = self.state_machine.state_snapshot().await;
+		#[cfg(test)]
+		adr0118_test_support::pause_if_armed(table_object_id).await;
 		if let Some(outcome) = snapshot.table_drop_outcomes.get(tenant_id, table_object_id) {
 			return if outcome.operation_id == operation_id {
 				Ok(())
@@ -3272,42 +3331,76 @@ impl WendelonControlServer {
 			.table_drop_fences
 			.get(tenant_id, table_object_id)
 			.copied();
-		let fence = if let Some(fence) = existing_fence {
+		let fence_log_index = if let Some(fence) = existing_fence {
 			if fence.operation_id != operation_id {
 				return Err(WendelonAdminError::TableAlreadyDropping {
 					table_object_id,
 					existing_operation_id: fence.operation_id,
 				});
 			}
-			fence
+			fence.fence_log_index
 		} else {
-			// DC-268: under ParentDecisions a drop is refused (the replicated refusal of
-			// TableDropPrepare stays the authority). The answer is typed, after every
-			// catalog check above, instead of a replicated error read as transport.
-			if self.decision_mode == crate::consensus::decision_mode::DecisionMode::ParentDecisions
-			{
-				return Err(WendelonAdminError::UnsupportedUnderParentDecisions);
-			}
-			let log_index = self
+			// Wendelon ADR 0118: under ParentDecisions the Prepare is the replicated
+			// PD Prepare (one rule on every member); the reply follows the logical
+			// finalize, as in Today mode.
+			if let Err(error) = self
 				.submit_table_drop_stage(WendelonRequest::TableDropPrepare(
 					TableDropPrepareRequest::current(operation_id, expected_generation),
 				))
-				.await?;
-			crate::schema::TableDropFence {
-				operation_id,
-				fence_log_index: log_index,
-				reclaim_completion_log_index: None,
+				.await
+			{
+				return self.settled_same_operation(operation_id, error).await;
+			}
+			// Wendelon ADR 0118 (r2): the fence is the one the replicated state holds
+			// (another attempt at this operation may have prepared first), never this
+			// attempt's own entry index.
+			let state = self.state_machine.state_snapshot().await;
+			match drop_progress(&state, operation_id) {
+				DropProgress::Finalized => return Ok(()),
+				DropProgress::Fenced { fence_log_index } => fence_log_index,
+				DropProgress::Foreign {
+					existing_operation_id,
+				} => {
+					return Err(WendelonAdminError::TableAlreadyDropping {
+						table_object_id,
+						existing_operation_id,
+					});
+				}
+				DropProgress::None => {
+					return Err(WendelonAdminError::Transport {
+						message: "the Prepare applied, and no fence or outcome holds the drop"
+							.to_owned(),
+					});
+				}
 			}
 		};
 
-		self.submit_table_drop_stage(WendelonRequest::TableDropLogicalFinalize(
-			TableDropLogicalFinalizeRequest {
-				operation_id,
-				fence_log_index: fence.fence_log_index,
-			},
-		))
-		.await?;
+		if let Err(error) = self
+			.submit_table_drop_stage(WendelonRequest::TableDropLogicalFinalize(
+				TableDropLogicalFinalizeRequest {
+					operation_id,
+					fence_log_index,
+				},
+			))
+			.await
+		{
+			return self.settled_same_operation(operation_id, error).await;
+		}
 		Ok(())
+	}
+
+	/// Wendelon ADR 0118 (r2): a stage refused while another attempt at the same
+	/// operation recorded its outcome: success. Otherwise the stage's error.
+	async fn settled_same_operation(
+		&self,
+		operation_id: crate::integration::compute::DropOperationId,
+		error: WendelonAdminError,
+	) -> Result<(), WendelonAdminError> {
+		let state = self.state_machine.state_snapshot().await;
+		match drop_progress(&state, operation_id) {
+			DropProgress::Finalized => Ok(()),
+			_ => Err(error),
+		}
 	}
 
 	async fn submit_table_drop_stage(
@@ -3341,6 +3434,10 @@ impl WendelonControlServer {
 				WendelonResponse::LeaseDenied => Err(WendelonAdminError::Transport {
 					message: "unexpected LeaseDenied response from schema drop".to_string(),
 				}),
+				// Wendelon ADR 0118 D5: typed and retryable, with the drop's progress.
+				WendelonResponse::BackupHoldBlocksDrop { progress } => {
+					Err(WendelonAdminError::BackupHoldActive { progress })
+				}
 			},
 			Err(err) if !self.is_leader().await => Err(WendelonAdminError::Transport {
 				message: format!("schema drop leadership changed: {err}"),
@@ -3586,6 +3683,12 @@ impl WendelonControlServer {
 					"unexpected LeaseDenied response from tenant mutation",
 					None,
 				),
+				WendelonResponse::BackupHoldBlocksDrop { .. } => self.tenant_admin_rejection(
+					frame,
+					CONTROL_REASON_INTERNAL_ERROR,
+					"unexpected drop hold refusal from tenant mutation",
+					None,
+				),
 			},
 			Err(err) if !self.is_leader().await => self.tenant_admin_rejection(
 				frame,
@@ -3653,6 +3756,12 @@ impl WendelonControlServer {
 					frame,
 					CONTROL_REASON_INTERNAL_ERROR,
 					"unexpected LeaseDenied response from table retention policy update",
+					None,
+				),
+				WendelonResponse::BackupHoldBlocksDrop { .. } => self.tenant_admin_rejection(
+					frame,
+					CONTROL_REASON_INTERNAL_ERROR,
+					"unexpected drop hold refusal from table retention policy update",
 					None,
 				),
 			},
@@ -3762,6 +3871,12 @@ impl WendelonControlServer {
 					frame,
 					CONTROL_REASON_INTERNAL_ERROR,
 					"unexpected LeaseDenied response from InstallTenantKekVersion",
+					None,
+				),
+				WendelonResponse::BackupHoldBlocksDrop { .. } => self.tenant_admin_rejection(
+					frame,
+					CONTROL_REASON_INTERNAL_ERROR,
+					"unexpected drop hold refusal from InstallTenantKekVersion",
 					None,
 				),
 			},
@@ -3879,6 +3994,12 @@ impl WendelonControlServer {
 					frame,
 					CONTROL_REASON_INTERNAL_ERROR,
 					"unexpected LeaseDenied response from RetireTenantKekVersion",
+					None,
+				),
+				WendelonResponse::BackupHoldBlocksDrop { .. } => self.tenant_admin_rejection(
+					frame,
+					CONTROL_REASON_INTERNAL_ERROR,
+					"unexpected drop hold refusal from RetireTenantKekVersion",
 					None,
 				),
 			},
@@ -4515,6 +4636,7 @@ impl WendelonControlServer {
 				}
 				WendelonResponse::LeaseDenied => LeaseStatus::DENIED_OVERLAP,
 				WendelonResponse::Error(_) => LeaseStatus::INTERNAL_ERROR,
+				WendelonResponse::BackupHoldBlocksDrop { .. } => LeaseStatus::INTERNAL_ERROR,
 				WendelonResponse::Refused(_) => LeaseStatus::INTERNAL_ERROR,
 				WendelonResponse::Op(_) => LeaseStatus::INTERNAL_ERROR,
 				WendelonResponse::Decision(_) | WendelonResponse::LeaseResults(_) => {
@@ -4735,6 +4857,7 @@ impl WendelonControlServer {
 				WendelonResponse::Success => LeaseStatus::GRANTED,
 				WendelonResponse::LeaseDenied => LeaseStatus::DENIED_INVALID_TARGET,
 				WendelonResponse::Error(_) => LeaseStatus::INTERNAL_ERROR,
+				WendelonResponse::BackupHoldBlocksDrop { .. } => LeaseStatus::INTERNAL_ERROR,
 				WendelonResponse::Refused(_) => LeaseStatus::INTERNAL_ERROR,
 				WendelonResponse::Op(_) => LeaseStatus::INTERNAL_ERROR,
 				WendelonResponse::Decision(_) | WendelonResponse::LeaseResults(_) => {
@@ -8273,3 +8396,42 @@ mod tests {
 #[cfg(test)]
 #[path = "control_server/completed_join_tests.rs"]
 mod completed_join_tests;
+
+/// Wendelon ADR 0118 (r2): what the replicated state holds for one drop
+/// operation's table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DropProgress {
+	/// This operation's outcome is recorded.
+	Finalized,
+	/// This operation's fence stands, at `fence_log_index`.
+	Fenced { fence_log_index: u64 },
+	/// Another operation holds the table's fence.
+	Foreign {
+		existing_operation_id: crate::integration::compute::DropOperationId,
+	},
+	/// Neither a fence nor this operation's outcome.
+	None,
+}
+
+pub(crate) fn drop_progress(
+	state: &crate::consensus::raft_storage::SmState,
+	operation_id: crate::integration::compute::DropOperationId,
+) -> DropProgress {
+	let (tenant_id, table_object_id) = (operation_id.tenant_id, operation_id.table_object_id);
+	if state
+		.table_drop_outcomes
+		.get(tenant_id, table_object_id)
+		.is_some_and(|outcome| outcome.operation_id == operation_id)
+	{
+		return DropProgress::Finalized;
+	}
+	match state.table_drop_fences.get(tenant_id, table_object_id) {
+		Some(fence) if fence.operation_id == operation_id => DropProgress::Fenced {
+			fence_log_index: fence.fence_log_index,
+		},
+		Some(fence) => DropProgress::Foreign {
+			existing_operation_id: fence.operation_id,
+		},
+		None => DropProgress::None,
+	}
+}

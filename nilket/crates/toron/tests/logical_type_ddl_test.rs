@@ -5129,6 +5129,10 @@ impl Catalog for RefreshingTableDescriptorCatalog {
 		let delegate = self.delegate();
 		delegate.drop_table(name, if_exists).await
 	}
+
+	async fn complete_table_drop(&self, binding: &TableBinding) -> Result<(), CatalogError> {
+		self.delegate().complete_table_drop(binding).await
+	}
 }
 
 struct RegisteringLogicalTypeAdmin {
@@ -5298,5 +5302,9 @@ impl Catalog for RefreshingLogicalTypeCatalog {
 	) -> Result<Option<TableBinding>, CatalogError> {
 		let delegate = self.delegate();
 		delegate.drop_table(name, if_exists).await
+	}
+
+	async fn complete_table_drop(&self, binding: &TableBinding) -> Result<(), CatalogError> {
+		self.delegate().complete_table_drop(binding).await
 	}
 }

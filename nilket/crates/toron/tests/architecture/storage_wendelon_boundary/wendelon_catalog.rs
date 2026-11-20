@@ -207,9 +207,18 @@ pub(crate) fn adr039_wendelon_catalog_drop_table_consumes_finalized_marker() {
 		.1;
 
 	assert!(!drop_body.contains("CatalogError::AdminUnavailable"));
-	assert!(drop_body.contains("DropOperationId"));
-	assert!(drop_body.contains("consume_finalized_drop"));
-	assert!(drop_body.contains("remove_table"));
+	// Wendelon ADR 0118 D6: a removal by name is refused; the binding is removed
+	// only by the identity completion after the storage DROP.
+	assert!(drop_body.contains("CatalogError::AdminFailed"));
+	assert!(!drop_body.contains("remove_table"));
+	let complete_body = brace_blocks_after_marker(impl_block, "async fn complete_table_drop")
+		.into_iter()
+		.next()
+		.expect("WendelonCatalog::complete_table_drop body")
+		.1;
+	assert!(complete_body.contains("DropOperationId"));
+	assert!(complete_body.contains("complete_finalized_drop"));
+	assert!(!complete_body.contains("resolve"));
 	assert!(!drop_body.contains("drop_table_schema"));
 	assert!(drop_body.contains("if_exists"));
 	assert!(drop_body.contains("Ok(None)"));
@@ -350,7 +359,9 @@ pub(crate) fn adr038_drop_table_storage_first_catalog_second() {
 
 	assert!(
 		helper.find(".drop_table_storage").unwrap()
-			< helper.find("catalog.drop_table(name, false)").unwrap()
+			< helper
+				.find("catalog.complete_table_drop(&binding)")
+				.unwrap()
 	);
 }
 
@@ -403,8 +414,8 @@ pub(crate) fn adr039_wendelon_drop_admin_unavailable_lifted() {
 	let drop_body = wendelon_catalog_method_body(&catalog, "async fn drop_table");
 
 	assert!(!drop_body.contains("CatalogError::AdminUnavailable"));
-	assert!(drop_body.contains("consume_finalized_drop"));
-	assert!(drop_body.contains("remove_table"));
+	let complete_body = wendelon_catalog_method_body(&catalog, "async fn complete_table_drop");
+	assert!(complete_body.contains("complete_finalized_drop"));
 }
 
 #[test]
@@ -648,8 +659,10 @@ pub(crate) fn adr038_catalog_drop_table_only_called_from_routing_helper() {
 	.expect("drop_existing_table_with_storage_admin helper")
 	.1;
 
-	assert_eq!(coordinator.matches(".drop_table(").count(), 1);
-	assert!(helper.contains("catalog.drop_table(name, false).await"));
+	// Wendelon ADR 0118 D6: the one completion is by the captured binding.
+	assert_eq!(coordinator.matches(".drop_table(").count(), 0);
+	assert_eq!(coordinator.matches(".complete_table_drop(").count(), 1);
+	assert!(helper.contains("catalog.complete_table_drop(&binding).await"));
 }
 
 #[test]

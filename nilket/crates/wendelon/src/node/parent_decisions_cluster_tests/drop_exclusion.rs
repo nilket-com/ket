@@ -1,5 +1,5 @@
 //! Wendelon ADR 0115, the replicated controls, on in-process three-voter
-//! clusters whose every store is admitted from construction (a reopen keeps it).
+//! ParentDecisions clusters (wendelon ADR 0118 D1: one replicated rule).
 //! Tables T and U are certified into generation 1; then T's drop is prepared and
 //! logically finalized at F.
 //!
@@ -82,14 +82,10 @@ async fn write_rows(
 	}
 }
 
-/// An admitted cluster with `rows` rows in each of T and U, certified into
+/// A ParentDecisions cluster with `rows` rows in each of T and U, certified into
 /// generation 1 (policy 1: no drop yet).
 async fn certified(rows: i64) -> Certified {
-	let (cluster, leader, table_t) = ready_with(Cluster::start_with(|_, cfg| {
-		cfg.pd_drop_admitted_for_test = true;
-		None
-	}))
-	.await;
+	let (cluster, leader, table_t) = ready_with(Cluster::start_with(|_, _| None)).await;
 	let table_u = super::resolve::second_table(&cluster, leader).await;
 	let now = std::time::SystemTime::now()
 		.duration_since(std::time::UNIX_EPOCH)
@@ -501,8 +497,7 @@ async fn a_candidate_rebuilt_after_settlement_reproduces_the_one_staged_before()
 	);
 
 	// The reporter's settled state is made durable by a snapshot, so its reopen
-	// recovers it. It then stops with its staged rows damaged. Reopened (still
-	// admitted), its recovered candidate is rebuilt from the settled state and
+	// recovers it. It then stops with its staged rows damaged. Reopened, its recovered candidate is rebuilt from the settled state and
 	// must reproduce the staged evidence before its rows are restored. The stop
 	// is clean: after an unclean stop, start-up validation must find every
 	// active-base entry stored, which needs T's descriptor while generation 1
@@ -649,30 +644,28 @@ async fn run_steps(cluster: &Cluster, node: u32, steps: usize) {
 	}
 }
 
-/// Applies `admission` to `node`'s current state in place, under its state
+/// Clears `node`'s derived drop index in place, or rebuilds it, under its state
 /// machine's one write guard (so it is serialized with apply, and no entry is
 /// lost or replayed); returns the state as it then reads.
-async fn readmit(
+async fn set_drop_index(
 	cluster: &Cluster,
 	node: u32,
-	admission: crate::consensus::raft_storage::StateAdmission,
+	rebuilt: bool,
 ) -> crate::consensus::raft_storage::SmState {
 	let state_machine = &cluster.node(node).state_machine;
-	state_machine
-		.apply_state_admission_for_test(admission)
-		.await;
+	state_machine.set_pd_drop_index_for_test(rebuilt).await;
 	state_machine.state_snapshot().await
 }
 
 /// Acceptance 7, the member-side refusal: one member holds the excluding target
 /// with every prerequisite (signer, index, validated base, predecessor, a
-/// buildable candidate) but an unadmitted state; it neither stages nor reports
-/// across several full steps and the generation does not commit. The same
-/// member with the same state admitted stages, reports, and the generation
-/// commits.
+/// buildable candidate) but a state whose own policy at the target's cut
+/// disagrees (its derived index cleared; the rule is replicated, so nothing else
+/// can make a member disagree). It neither stages nor reports across several full
+/// steps and the generation does not commit. The same member with its index
+/// rebuilt stages, reports, and the generation commits.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn an_unadmitted_member_neither_stages_nor_reports_an_excluding_target() {
-	use crate::consensus::raft_storage::StateAdmission;
+async fn a_member_whose_policy_disagrees_neither_stages_nor_reports_an_excluding_target() {
 	use crate::network::data_server::child_writes::PauseStage;
 	let Certified {
 		cluster,
@@ -726,7 +719,7 @@ async fn an_unadmitted_member_neither_stages_nor_reports_an_excluding_target() {
 		}
 	};
 
-	// The held member itself applied the pending target (admitted) first.
+	// The held member itself applied the pending target first.
 	let deadline = tokio::time::Instant::now() + BOUND;
 	while !cluster
 		.node(held)
@@ -746,8 +739,8 @@ async fn an_unadmitted_member_neither_stages_nor_reports_an_excluding_target() {
 		);
 		tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 	}
-	// Refusal lane: unadmitted, every prerequisite present.
-	let seeded = readmit(&cluster, held, StateAdmission::default()).await;
+	// Refusal lane: the member's policy disagrees, every prerequisite present.
+	let seeded = set_drop_index(&cluster, held, false).await;
 	let pending = seeded
 		.decisions
 		.as_ref()
@@ -757,7 +750,7 @@ async fn an_unadmitted_member_neither_stages_nor_reports_an_excluding_target() {
 	assert_eq!(
 		seeded.survivor_policy_at(pending.target.t),
 		1,
-		"premise: unadmitted"
+		"premise: the member's policy disagrees"
 	);
 	assert_eq!(
 		index.base_meta().await.unwrap().active_gid,
@@ -782,9 +775,9 @@ async fn an_unadmitted_member_neither_stages_nor_reports_an_excluding_target() {
 			.staged
 			.map(|staged| staged.gid),
 		Some(pending.target.gid),
-		"unadmitted: nothing staged"
+		"disagreeing: nothing staged"
 	);
-	assert!(!reported(&cluster).await, "unadmitted: no report");
+	assert!(!reported(&cluster).await, "disagreeing: no report");
 	assert_eq!(
 		cluster
 			.node(leader)
@@ -797,15 +790,15 @@ async fn an_unadmitted_member_neither_stages_nor_reports_an_excluding_target() {
 				.current_gid())
 			.await,
 		1,
-		"unadmitted: no commit"
+		"disagreeing: no commit"
 	);
 
-	// Positive lane: the same member and state, admitted.
-	readmit(&cluster, held, StateAdmission { pd_drop: true }).await;
+	// Positive lane: the same member, its index rebuilt.
+	set_drop_index(&cluster, held, true).await;
 	until_active(&cluster, 2).await;
 	assert!(
 		index.base_meta().await.unwrap().active_gid >= pending.target.gid,
-		"admitted: staged, reported and activated"
+		"rebuilt: staged, reported and activated"
 	);
 	let base = base_of(&cluster, NODES[0]).await;
 	assert!(
@@ -820,7 +813,7 @@ async fn an_unadmitted_member_neither_stages_nor_reports_an_excluding_target() {
 		);
 	}
 	eprintln!(
-		"ADR 0115 member refusal: {held} unadmitted held policy-2 target gid {} (t = {}) through 3 steps: no stage, no report, no commit; admitted: committed",
+		"ADR 0115 member refusal: {held} with a disagreeing policy held policy-2 target gid {} (t = {}) through 3 steps: no stage, no report, no commit; rebuilt: committed",
 		pending.target.gid, pending.target.t
 	);
 }

@@ -1406,17 +1406,16 @@ fn local_profile_public_mutation_outcomes_resolve_on_both_authorities() {
 		}
 	}
 }
-/// DC-268: a public DROP TABLE on each authority's fresh local profile, on a
-/// synthetic table. Today drops it (the control). ParentDecisions refuses it whole
-/// with a typed, non-transient diagnostic ("unsupported under the ParentDecisions
-/// decision authority", never "storage unavailable"): the rows, the catalog entry
-/// and the name stay, also after a restart.
+/// DC-268, then wendelon ADR 0118: a public DROP TABLE on each authority's fresh
+/// local profile, on a synthetic table. Today drops it (the control, unchanged).
+/// ParentDecisions drops it too, answering at its logical finalize: the table is
+/// gone, an unrelated table keeps its rows, and the name is re-created as a fresh
+/// table that keeps its own rows, also after a restart.
 #[test]
 #[ignore = "requires Linux io_uring and the fixed local-profile ports"]
 fn local_profile_drop_table_on_both_authorities() {
 	let _serial = LIVE_LOCAL_LOCK.lock().expect("live-profile test lock");
 	let rows = |rendered: &str| rendered_rows(rendered);
-	let both = RenderedRows::of(&["id", "label"], &[("1", "one"), ("2", "two")]);
 	for authority in ["today", "parent-decisions"] {
 		let harness = fresh_dir(&format!("local-profile-drop-{authority}"));
 		let profile = harness.join("profile");
@@ -1436,6 +1435,18 @@ fn local_profile_drop_table_on_both_authorities() {
 			sql,
 			"CREATE TABLE drop_probe (id BIGINT NOT NULL PRIMARY KEY, label TEXT)",
 		);
+		let keep = RenderedRows::of(&["id", "label"], &[("7", "seven")]);
+		let fresh = RenderedRows::of(&["id", "label"], &[("3", "three")]);
+		if authority != "today" {
+			assert_sql_success(
+				sql,
+				"CREATE TABLE keep_probe (id BIGINT NOT NULL PRIMARY KEY, label TEXT)",
+			);
+			assert_sql_success(
+				sql,
+				"INSERT INTO keep_probe (id, label) VALUES (7, 'seven')",
+			);
+		}
 		assert_sql_success(
 			sql,
 			"INSERT INTO drop_probe (id, label) VALUES (1, 'one'), (2, 'two')",
@@ -1461,28 +1472,39 @@ fn local_profile_drop_table_on_both_authorities() {
 			assert!(!gone.status.success(), "the table is gone: {gone:?}");
 			assert_eq!(catalog(sql).rows.len(), 0);
 		} else {
-			assert!(!dropped.status.success(), "refused: {dropped:?}");
+			// Wendelon ADR 0118: the ParentDecisions DROP succeeds at its logical
+			// finalize.
 			assert!(
-				stderr.contains("unsupported under the ParentDecisions decision authority"),
-				"a typed diagnostic: {stderr:?}"
+				dropped.status.success() && stdout(&dropped) == "OK\n",
+				"{dropped:?}"
 			);
-			assert!(
-				!stderr.contains("storage unavailable"),
-				"not transient: {stderr:?}"
+			let gone = run_live_sql(sql, "SELECT id, label FROM drop_probe ORDER BY id");
+			assert!(!gone.status.success(), "the table is gone: {gone:?}");
+			assert_eq!(catalog(sql).rows, vec![vec!["keep_probe".to_owned()]]);
+			assert_eq!(
+				rows(&assert_sql_success(
+					sql,
+					"SELECT id, label FROM keep_probe ORDER BY id"
+				)),
+				keep,
+				"the unrelated table keeps its rows"
+			);
+			assert_sql_success(
+				sql,
+				"CREATE TABLE drop_probe (id BIGINT NOT NULL PRIMARY KEY, label TEXT)",
+			);
+			assert_sql_success(
+				sql,
+				"INSERT INTO drop_probe (id, label) VALUES (3, 'three')",
 			);
 			assert_eq!(
 				rows(&assert_sql_success(
 					sql,
 					"SELECT id, label FROM drop_probe ORDER BY id"
 				)),
-				both
+				fresh,
+				"the re-created name holds only its own rows"
 			);
-			assert_eq!(catalog(sql).rows, vec![vec!["drop_probe".to_owned()]]);
-			let again = run_live_sql(
-				sql,
-				"CREATE TABLE drop_probe (id BIGINT NOT NULL PRIMARY KEY, label TEXT)",
-			);
-			assert!(!again.status.success(), "the name stays bound: {again:?}");
 		}
 		first.stop_gracefully();
 		let second = LiveLocal::spawn(&profile, &log);
@@ -1499,9 +1521,22 @@ fn local_profile_drop_table_on_both_authorities() {
 					sql,
 					"SELECT id, label FROM drop_probe ORDER BY id"
 				)),
-				both
+				fresh,
+				"after a restart, the re-created name keeps only its rows"
 			);
-			assert_eq!(catalog(sql).rows, vec![vec!["drop_probe".to_owned()]]);
+			assert_eq!(
+				rows(&assert_sql_success(
+					sql,
+					"SELECT id, label FROM keep_probe ORDER BY id"
+				)),
+				keep
+			);
+			let mut tables = catalog(sql).rows;
+			tables.sort();
+			assert_eq!(
+				tables,
+				vec![vec!["drop_probe".to_owned()], vec!["keep_probe".to_owned()]]
+			);
 		}
 		second.stop_gracefully();
 		std::fs::remove_dir_all(harness).expect("remove drop fixture");

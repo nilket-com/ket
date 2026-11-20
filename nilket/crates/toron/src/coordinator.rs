@@ -2934,7 +2934,9 @@ async fn drop_existing_table_with_storage_admin(
 		Ok(_) | Err(StorageError::TableNotFound { .. }) => {}
 		Err(error) => return Err(QueryError::Storage(error)),
 	}
-	catalog.drop_table(name, false).await?;
+	// Wendelon ADR 0118 D6: the statement completes by the binding it captured,
+	// never by resolving the name again.
+	catalog.complete_table_drop(&binding).await?;
 	Ok(true)
 }
 
@@ -7816,6 +7818,12 @@ mod tests {
 			_name: &TableRef,
 			_if_exists: bool,
 		) -> Result<Option<TableBinding>, CatalogError> {
+			Err(CatalogError::AdminFailed {
+				message: "RefreshingCatalog does not drop tables".to_string(),
+			})
+		}
+
+		async fn complete_table_drop(&self, _binding: &TableBinding) -> Result<(), CatalogError> {
 			Err(CatalogError::AdminFailed {
 				message: "RefreshingCatalog does not drop tables".to_string(),
 			})

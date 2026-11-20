@@ -4206,6 +4206,277 @@ fn the_roster_is_given_only_under_the_exact_hold_and_at_a_settled_cut() {
 	assert!(roster.logical_types.is_empty() && roster.indexes.is_empty());
 }
 
+// ============================================================
+//  WENDELON ADR 0118 D5: THE ROSTER SKIPS A PROVED FINALIZED DROP
+// ============================================================
+
+/// A ParentDecisions state in which TABLE's drop is logically finalized and a
+/// fresh table (another id) is bound to TABLE's former name, under a hold, with
+/// the cut at the applied index. Returns the state, the hold and the fresh id.
+fn finalized_drop_under_hold() -> (SmState, (u128, u64), crate::schema::TableObjectId) {
+	let mut state = base(3);
+	grant_all(&mut state);
+	finalize_drop_of(&mut state, TABLE);
+	let fresh = crate::schema::TableObjectId::new([0x7f; 16]);
+	register_table(
+		&mut state,
+		TENANT,
+		fresh,
+		fixture_table().table_name.as_str(),
+	);
+	state
+		.table_lifecycle
+		.ensure_inherit_cluster(TENANT, fresh, hts(0));
+	let held = token(begin_hold(&mut state, 118));
+	at_cut(&mut state, peek_index() - 1);
+	(state, held, fresh)
+}
+
+fn at_cut(state: &mut SmState, index: u64) {
+	state.last_applied_log_id = Some(openraft::LogId::new(
+		openraft::CommittedLeaderId::new(1, 1),
+		index,
+	));
+}
+
+fn replace_tombstone(
+	state: &mut SmState,
+	edit: impl FnOnce(&mut crate::schema::TableDropTombstone),
+) {
+	let mut tombstone = *state.table_drop_tombstones.get(TENANT, TABLE).unwrap();
+	state
+		.table_drop_tombstones
+		.remove_validated(tombstone.operation_id);
+	edit(&mut tombstone);
+	state.table_drop_tombstones.insert_validated(tombstone);
+}
+
+fn replace_debt(state: &mut SmState, edit: impl FnOnce(&mut crate::schema::TableDropReclaimDebt)) {
+	let mut debt = state
+		.table_drop_reclaim_debts
+		.get(TENANT, TABLE)
+		.unwrap()
+		.clone();
+	state
+		.table_drop_reclaim_debts
+		.remove_validated(debt.operation_id);
+	edit(&mut debt);
+	state.table_drop_reclaim_debts.insert_validated(debt);
+}
+
+/// The proved finalized drop: its outcome, tombstone and debt agree, the
+/// descriptor stays unbound, and nothing else of the table remains. The roster
+/// skips the dropped id and includes the fresh table bound to the same name.
+#[test]
+fn the_roster_skips_a_proved_finalized_drop_and_includes_a_fresh_binding() {
+	let (state, held, fresh) = finalized_drop_under_hold();
+	assert!(
+		state.table_schemas.latest_by_id(TENANT, TABLE).is_some(),
+		"premise: the dropped descriptor stays"
+	);
+	assert!(state.table_drop_tombstones.contains(TENANT, TABLE));
+	assert!(state.table_drop_reclaim_debts.get(TENANT, TABLE).is_some());
+	let roster = roster(&state, held).expect("the roster is given");
+	let ids: Vec<_> = roster
+		.tables
+		.iter()
+		.map(|table| (table.tenant_id, table.descriptor.table_object_id))
+		.collect();
+	assert!(!ids.contains(&(TENANT, TABLE)), "the dropped id is skipped");
+	assert!(
+		ids.contains(&(TENANT, fresh)),
+		"the fresh binding is included"
+	);
+}
+
+/// Every other drop state refuses the roster, with the drop refusal itself:
+/// each mismatch of the exact predicate, and a fence.
+#[test]
+fn every_unproved_drop_state_refuses_the_roster() {
+	use crate::logical_backup::roster::RosterRefusal;
+	let in_progress = Err(RosterRefusal::LifecycleNotSettled {
+		what: "a table drop is in progress".into(),
+	});
+	let (proved, held, _) = finalized_drop_under_hold();
+	let outcome = *proved.table_drop_outcomes.get(TENANT, TABLE).unwrap();
+	type Edit = Box<dyn Fn(&mut SmState)>;
+	let cases: Vec<(&str, Edit)> = vec![
+		(
+			"the tombstone names another operation",
+			Box::new(|state| {
+				replace_tombstone(state, |tombstone| {
+					tombstone.operation_id.schema_generation =
+						crate::integration::compute::SchemaGeneration::new(2);
+				})
+			}),
+		),
+		(
+			"the debt names another finalize index",
+			Box::new(|state| replace_debt(state, |debt| debt.finalize_log_index += 1)),
+		),
+		(
+			"the tombstone names another finalize index",
+			Box::new(|state| {
+				replace_tombstone(state, |tombstone| tombstone.finalize_log_index += 1)
+			}),
+		),
+		(
+			"the tombstone's fence index differs from the debt's",
+			Box::new(|state| replace_tombstone(state, |tombstone| tombstone.fence_log_index += 1)),
+		),
+		(
+			"the records agree at a generation the descriptor does not have",
+			Box::new(move |state| {
+				let generation_two = crate::integration::compute::SchemaGeneration::new(2);
+				state.table_drop_outcomes = Default::default();
+				state
+					.table_drop_outcomes
+					.insert_validated(crate::schema::TableDropOutcome {
+						operation_id: crate::integration::compute::DropOperationId {
+							schema_generation: generation_two,
+							..outcome.operation_id
+						},
+						..outcome
+					});
+				replace_tombstone(state, |tombstone| {
+					tombstone.operation_id.schema_generation = generation_two
+				});
+				replace_debt(state, |debt| {
+					debt.operation_id.schema_generation = generation_two
+				});
+			}),
+		),
+		(
+			"the descriptor is absent",
+			Box::new(|state| {
+				state
+					.table_schemas
+					.retire_unbound_object(TENANT, TABLE)
+					.unwrap()
+			}),
+		),
+		(
+			"the finalize is after the cut",
+			Box::new(move |state| at_cut(state, outcome.finalize_log_index - 1)),
+		),
+		(
+			"a lifecycle record remains",
+			Box::new(|state| {
+				state
+					.table_lifecycle
+					.ensure_inherit_cluster(TENANT, TABLE, hts(0))
+			}),
+		),
+		(
+			"a materialization certificate remains",
+			Box::new(|state| {
+				state
+					.materialization_certificates
+					.admit(TENANT, TABLE, vec![0x18])
+					.unwrap()
+			}),
+		),
+		(
+			"a secondary index references the table",
+			Box::new(|state| {
+				let table = state
+					.table_schemas
+					.latest_by_id(TENANT, TABLE)
+					.unwrap()
+					.clone();
+				let index = crate::schema::SecondaryIndexDescriptor::for_table_column(
+					crate::schema::IndexObjectId::new([0x18; 16]),
+					"by_v",
+					&table,
+					"v",
+				)
+				.unwrap();
+				state
+					.secondary_indexes
+					.create(TENANT, index, &state.table_schemas.clone())
+					.unwrap();
+			}),
+		),
+	];
+	for (what, edit) in &cases {
+		let mut state = proved.clone();
+		edit(&mut state);
+		assert_eq!(roster(&state, held), in_progress, "{what}");
+	}
+	assert!(roster(&proved, held).is_ok(), "premise: the proved state");
+
+	// A fence: a second table's drop is prepared, not finalized (before the
+	// hold; the hold refuses a Prepare).
+	let mut fenced = base(3);
+	grant_all(&mut fenced);
+	finalize_drop_of(&mut fenced, TABLE);
+	let second = crate::schema::TableObjectId::new([0x6e; 16]);
+	register_table(&mut fenced, TENANT, second, "second");
+	let id = crate::integration::compute::DropOperationId {
+		tenant_id: TENANT,
+		table_object_id: second,
+		schema_generation: crate::integration::compute::SchemaGeneration::new(1),
+	};
+	assert!(matches!(
+		apply_next(
+			&mut fenced,
+			WendelonRequest::TableDropPrepare(crate::consensus::TableDropPrepareRequest::current(
+				id,
+				id.schema_generation,
+			)),
+		),
+		WendelonResponse::Success
+	));
+	let held = token(begin_hold(&mut fenced, 119));
+	at_cut(&mut fenced, peek_index() - 1);
+	assert_eq!(roster(&fenced, held), in_progress, "a fence");
+
+	// Wendelon ADR 0118 D5 (r2): an outcome is a candidate too. An outcome with no
+	// tombstone, no debt and no descriptor is an incomplete combination.
+	let mut outcome_only = proved.clone();
+	let operation = outcome.operation_id;
+	outcome_only
+		.table_drop_tombstones
+		.remove_validated(operation);
+	outcome_only
+		.table_drop_reclaim_debts
+		.remove_validated(operation);
+	outcome_only
+		.table_schemas
+		.retire_unbound_object(TENANT, TABLE)
+		.unwrap();
+	assert_eq!(
+		roster(&outcome_only, held_of(&outcome_only)),
+		in_progress,
+		"an outcome alone"
+	);
+	// An outcome for a table whose name is still bound: never listed as live.
+	let mut named = base(3);
+	grant_all(&mut named);
+	named
+		.table_drop_outcomes
+		.insert_validated(crate::schema::TableDropOutcome {
+			operation_id: crate::integration::compute::DropOperationId {
+				tenant_id: TENANT,
+				table_object_id: TABLE,
+				schema_generation: crate::integration::compute::SchemaGeneration::new(1),
+			},
+			finalize_log_index: peek_index(),
+		});
+	let held = token(begin_hold(&mut named, 120));
+	at_cut(&mut named, peek_index() - 1);
+	assert_eq!(
+		roster(&named, held),
+		in_progress,
+		"an outcome with a named descriptor"
+	);
+}
+
+/// The hold a state holds.
+fn held_of(state: &SmState) -> (u128, u64) {
+	decisions(state).backup_hold().expect("a hold")
+}
+
 /// Each shape the restore cannot reproduce, or the hold keeps from settling,
 /// refuses the roster by name; an index still building is waited for.
 #[test]
@@ -6724,7 +6995,6 @@ fn a_drop_prepare_concludes_exactly_its_tables_reserved_parents() {
 	assert_eq!(decisions(&state).live_of_table(TENANT, TABLE), vec![b, c]);
 	let live = decisions(&state).live;
 
-	state.pd_drop_prepare_admitted = true;
 	let at = peek_index();
 	let prepared = apply_next(&mut state, drop_prepare_expecting(1));
 	assert!(
@@ -6806,9 +7076,10 @@ fn a_drop_prepare_concludes_exactly_its_tables_reserved_parents() {
 }
 
 /// A refused Prepare changes nothing: under a backup hold (checked by the
-/// ParentDecisions transition itself), with a generation mismatch, and with the
-/// admission off (the production refusal). Each leaves the fences, the decision
-/// state and the pending parent exactly as they were.
+/// ParentDecisions transition itself) and with a generation mismatch. Each
+/// leaves the fences, the decision state and the pending parent exactly as they
+/// were. (Wendelon ADR 0118 D1 removed the test-admission refusal: every
+/// ParentDecisions state applies the transition.)
 #[test]
 fn a_refused_drop_prepare_changes_nothing() {
 	let mut state = base(3);
@@ -6817,18 +7088,7 @@ fn a_refused_drop_prepare_changes_nothing() {
 	let DecisionResult::Reserved { reservation } = reserve(&mut state, &pending, T0) else {
 		panic!("reserve");
 	};
-	// Admission off: the production refusal.
-	let before = drop_relevant_bytes(&state);
-	let refused_off = apply_next(&mut state, drop_prepare_expecting(1));
-	assert!(
-		matches!(&refused_off, WendelonResponse::Error(why) if why.contains("refused under ParentDecisions")),
-		"{refused_off:?}"
-	);
-	assert_eq!(drop_relevant_bytes(&state), before);
-	assert_eq!(status_of(&state, reservation), ParentStatus::Reserved);
-	assert!(!state.table_drop_blocks_admission(TENANT, TABLE));
-	// Admitted, but the requester expects another generation.
-	state.pd_drop_prepare_admitted = true;
+	// The requester expects another generation.
 	let before = drop_relevant_bytes(&state);
 	let mismatch = apply_next(&mut state, drop_prepare_expecting(2));
 	assert!(
@@ -6837,17 +7097,199 @@ fn a_refused_drop_prepare_changes_nothing() {
 	);
 	assert_eq!(drop_relevant_bytes(&state), before);
 	assert_eq!(status_of(&state, reservation), ParentStatus::Reserved);
-	// Admitted, under a backup hold.
+	// Under a backup hold (wendelon ADR 0118 D5: hold first, a typed refusal of
+	// the Prepare stage).
 	assert!(matches!(
 		decide(&mut state, DecisionCommand::BeginBackupHold { id: 7 }),
 		DecisionResult::HoldEntered { .. }
 	));
 	let before = drop_relevant_bytes(&state);
 	let held = apply_next(&mut state, drop_prepare_expecting(1));
-	assert!(matches!(held, WendelonResponse::Error(_)), "{held:?}");
+	assert_eq!(
+		held,
+		WendelonResponse::BackupHoldBlocksDrop {
+			progress: crate::integration::compute::HeldDropProgress::NotBegun
+		}
+	);
 	assert_eq!(drop_relevant_bytes(&state), before);
 	assert_eq!(status_of(&state, reservation), ParentStatus::Reserved);
 	assert!(!state.table_drop_blocks_admission(TENANT, TABLE));
+}
+
+/// Wendelon ADR 0118 D5, Prepare first, then the hold: the hold's roster read
+/// refuses while the durable fence stands, the LogicalFinalize is refused with
+/// the typed refusal of its stage and changes nothing (the fence and the name
+/// binding stay; no outcome, no tombstone), and after the release the same
+/// operation finalizes.
+#[test]
+fn a_hold_after_the_prepare_blocks_the_logical_finalize_until_its_release() {
+	use crate::logical_backup::roster::RosterRefusal;
+	let mut state = base(3);
+	grant_all(&mut state);
+	let id = crate::integration::compute::DropOperationId {
+		tenant_id: TENANT,
+		table_object_id: TABLE,
+		schema_generation: crate::integration::compute::SchemaGeneration::new(1),
+	};
+	let fence = peek_index();
+	assert_eq!(
+		apply_next(&mut state, drop_prepare_expecting(1)),
+		WendelonResponse::Success
+	);
+	let held = token(begin_hold(&mut state, 8));
+	state.last_applied_log_id = Some(openraft::LogId::new(
+		openraft::CommittedLeaderId::new(1, 1),
+		peek_index() - 1,
+	));
+	assert_eq!(
+		crate::logical_backup::roster::roster_at(&state, held),
+		Err(RosterRefusal::LifecycleNotSettled {
+			what: "a table drop is in progress".into()
+		}),
+		"the hold's roster refuses while the fence stands"
+	);
+	let finalize = || {
+		WendelonRequest::TableDropLogicalFinalize(
+			crate::consensus::TableDropLogicalFinalizeRequest {
+				operation_id: id,
+				fence_log_index: fence,
+			},
+		)
+	};
+	let before = drop_relevant_bytes(&state);
+	let name = fixture_table();
+	assert_eq!(
+		apply_next(&mut state, finalize()),
+		WendelonResponse::BackupHoldBlocksDrop {
+			progress: crate::integration::compute::HeldDropProgress::Fenced
+		}
+	);
+	assert_eq!(drop_relevant_bytes(&state), before, "no effect");
+	assert!(
+		state.table_drop_fences.get(TENANT, TABLE).is_some(),
+		"fenced"
+	);
+	assert!(state.table_drop_outcomes.get(TENANT, TABLE).is_none());
+	assert!(!state.table_drop_tombstones.contains(TENANT, TABLE));
+	assert!(
+		state
+			.table_schemas
+			.latest_by_name(TENANT, name.namespace.as_str(), name.table_name.as_str())
+			.is_some(),
+		"the name stays bound"
+	);
+	assert_eq!(
+		release_hold(&mut state, held.0, held.1),
+		DecisionResult::HoldReleased
+	);
+	assert_eq!(
+		apply_next(&mut state, finalize()),
+		WendelonResponse::Success
+	);
+	assert_eq!(
+		state
+			.table_drop_outcomes
+			.get(TENANT, TABLE)
+			.map(|outcome| outcome.operation_id),
+		Some(id),
+		"the original operation completes after the release"
+	);
+}
+
+/// Wendelon ADR 0118 (r2): under a hold, a drop stage reports the progress the
+/// replicated state holds for its operation, not the attempt's own view. A
+/// second attempt's Prepare after the first attempt's durable fence answers
+/// Fenced (never NotBegun, which says the drop had no effect).
+#[test]
+fn a_second_prepare_under_a_hold_reports_the_first_attempts_fence() {
+	let mut state = base(3);
+	grant_all(&mut state);
+	assert_eq!(
+		apply_next(&mut state, drop_prepare_expecting(1)),
+		WendelonResponse::Success
+	);
+	begin_hold(&mut state, 9);
+	let before = drop_relevant_bytes(&state);
+	assert_eq!(
+		apply_next(&mut state, drop_prepare_expecting(1)),
+		WendelonResponse::BackupHoldBlocksDrop {
+			progress: crate::integration::compute::HeldDropProgress::Fenced
+		}
+	);
+	assert_eq!(drop_relevant_bytes(&state), before, "no effect");
+}
+
+/// Wendelon ADR 0118 (r2): after the operation's outcome is recorded, a late
+/// attempt's stages under a hold carry no hold label (neither stage would
+/// change anything): each gives its ordinary answer, and nothing changes.
+#[test]
+fn a_late_attempt_after_the_outcome_is_never_labelled_by_a_hold() {
+	let mut state = base(3);
+	grant_all(&mut state);
+	let fence = peek_index();
+	finalize_drop_of(&mut state, TABLE);
+	begin_hold(&mut state, 9);
+	let id = crate::integration::compute::DropOperationId {
+		tenant_id: TENANT,
+		table_object_id: TABLE,
+		schema_generation: crate::integration::compute::SchemaGeneration::new(1),
+	};
+	let before = (
+		drop_relevant_bytes(&state),
+		postcard::to_stdvec(&state.table_drop_outcomes).unwrap(),
+	);
+	for request in [
+		drop_prepare_expecting(1),
+		WendelonRequest::TableDropLogicalFinalize(
+			crate::consensus::TableDropLogicalFinalizeRequest {
+				operation_id: id,
+				fence_log_index: fence,
+			},
+		),
+	] {
+		let answer = apply_next(&mut state, request);
+		assert!(
+			!matches!(answer, WendelonResponse::BackupHoldBlocksDrop { .. }),
+			"{answer:?}"
+		);
+	}
+	assert_eq!(
+		(
+			drop_relevant_bytes(&state),
+			postcard::to_stdvec(&state.table_drop_outcomes).unwrap()
+		),
+		before,
+		"no effect"
+	);
+}
+
+/// Wendelon ADR 0118 (r2): another operation's Prepare of a fenced table under a
+/// hold is its ordinary conflict, never NotBegun.
+#[test]
+fn another_operations_prepare_under_a_hold_is_its_conflict() {
+	let mut state = base(3);
+	grant_all(&mut state);
+	assert_eq!(
+		apply_next(&mut state, drop_prepare_expecting(1)),
+		WendelonResponse::Success
+	);
+	begin_hold(&mut state, 9);
+	let before = drop_relevant_bytes(&state);
+	// Another operation identity on the same table (generation 2).
+	let other = crate::integration::compute::DropOperationId {
+		tenant_id: TENANT,
+		table_object_id: TABLE,
+		schema_generation: crate::integration::compute::SchemaGeneration::new(2),
+	};
+	let foreign = apply_next(
+		&mut state,
+		WendelonRequest::TableDropPrepare(crate::consensus::TableDropPrepareRequest::current(
+			other,
+			other.schema_generation,
+		)),
+	);
+	assert!(matches!(foreign, WendelonResponse::Error(_)), "{foreign:?}");
+	assert_eq!(drop_relevant_bytes(&state), before, "no effect");
 }
 
 /// The same Prepare applied again concludes nothing new and changes nothing:
@@ -6861,7 +7303,6 @@ fn a_replayed_drop_prepare_concludes_nothing_new() {
 		panic!("reserve");
 	};
 	let live = decisions(&state).live;
-	state.pd_drop_prepare_admitted = true;
 	let first = apply_next(&mut state, drop_prepare_expecting(1));
 	assert!(matches!(first, WendelonResponse::Success), "{first:?}");
 	let after_first = drop_relevant_bytes(&state);
@@ -6887,7 +7328,6 @@ fn a_replayed_drop_prepare_concludes_nothing_new() {
 /// Admits, prepares and logically finalizes the fixture table's drop; returns
 /// the finalize index F.
 fn finalize_fixture_drop(state: &mut SmState) -> u64 {
-	state.pd_drop_prepare_admitted = true;
 	let fence = peek_index();
 	let prepared = apply_next(state, drop_prepare_expecting(1));
 	assert!(
@@ -6972,9 +7412,8 @@ fn register_table(
 }
 
 /// Prepares and logically finalizes the drop of `table` (generation 1) under
-/// TENANT on an admitted state; returns its finalize index.
+/// TENANT on a ParentDecisions state; returns its finalize index.
 pub(crate) fn finalize_drop_of(state: &mut SmState, table: crate::schema::TableObjectId) -> u64 {
-	state.pd_drop_prepare_admitted = true;
 	let id = crate::integration::compute::DropOperationId {
 		tenant_id: TENANT,
 		table_object_id: table,
@@ -7043,10 +7482,12 @@ fn a_cut_between_two_drops_excludes_only_the_first() {
 	assert!(!state.finalized_drop_in(f2, f2 + 10));
 }
 
-/// The derived index: kept only on an admitted state, by the one insertion
-/// boundary, equal to its rebuild from the catalog; unadmitted it is empty.
+/// The derived index (wendelon ADR 0118 D1): kept on every ParentDecisions
+/// state by the one insertion boundary, equal to its rebuild from the catalog;
+/// a cleared index is restored by the rebuild every load, recovery and install
+/// runs.
 #[test]
-fn the_finalized_drop_index_is_admitted_only_and_matches_its_rebuild() {
+fn the_finalized_drop_index_matches_its_rebuild() {
 	let mut state = base(3);
 	grant_all(&mut state);
 	let f = finalize_drop_of(&mut state, TABLE);
@@ -7059,18 +7500,24 @@ fn the_finalized_drop_index_is_admitted_only_and_matches_its_rebuild() {
 		state.derived_pd_finalize_indices()
 	);
 	crate::consensus::raft_storage::validate_assembled_state(&state).unwrap();
-	// Unadmitted, the same state holds no index and needs no work.
-	crate::consensus::raft_storage::StateAdmission::default().apply_to(&mut state);
-	assert!(state.pd_finalize_indices.is_empty());
-	assert_eq!(state.survivor_policy_at(f), 1);
-	assert!(!state.finalized_drop_in(0, f));
+	// A decoded state carries no index (it is never serialized): cleared, the
+	// state fails validation, and the rebuild restores it.
+	state.pd_finalize_indices.clear();
+	assert!(crate::consensus::raft_storage::validate_assembled_state(&state).is_err());
+	crate::consensus::raft_storage::derive_pd_drop_index(&mut state);
+	assert_eq!(
+		state.pd_finalize_indices,
+		std::collections::BTreeSet::from([f])
+	);
+	crate::consensus::raft_storage::validate_assembled_state(&state).unwrap();
 }
 
-/// Unadmitted, a state holding a finalized drop outcome behaves as production:
-/// the trigger is quiet, policy 1 is required at every cut, and an excluding
-/// target is refused; the same target is accepted on the admitted state.
+/// The derived index carries the rule while the decision state is detached:
+/// a state holding a finalized drop outcome but no rebuilt index is quiet,
+/// requires policy 1 at every cut and refuses an excluding target; rebuilt, the
+/// same state accepts it. The index is never taken from member-local input.
 #[test]
-fn an_unadmitted_state_refuses_an_excluding_target() {
+fn a_state_without_its_rebuilt_index_refuses_an_excluding_target() {
 	let mut admitted = base(3);
 	grant_all(&mut admitted);
 	let f = finalize_fixture_drop(&mut admitted);
@@ -7087,10 +7534,10 @@ fn an_unadmitted_state_refuses_an_excluding_target() {
 	assert!(target.t >= f);
 
 	let mut unadmitted = admitted.clone();
-	crate::consensus::raft_storage::StateAdmission::default().apply_to(&mut unadmitted);
+	unadmitted.pd_finalize_indices.clear();
 	assert!(
 		unadmitted.pd_finalize_indices.is_empty(),
-		"no index unadmitted"
+		"premise: no rebuilt index"
 	);
 	assert_eq!(unadmitted.survivor_policy_at(target.t), 1);
 	assert_eq!(
@@ -7130,14 +7577,14 @@ fn an_unadmitted_state_refuses_an_excluding_target() {
 }
 
 /// A Today state (no decision envelope) holds no finalized-drop index even
-/// when its store is admitted: the admission is ParentDecisions-only.
+/// after the rebuild: the drop rule is ParentDecisions-only.
 #[test]
 fn a_today_state_holds_no_finalized_drop_index() {
 	let mut state = base(3);
 	grant_all(&mut state);
 	let f = finalize_fixture_drop(&mut state);
 	state.decisions = None;
-	crate::consensus::raft_storage::StateAdmission { pd_drop: true }.apply_to(&mut state);
+	crate::consensus::raft_storage::derive_pd_drop_index(&mut state);
 	assert!(state.pd_finalize_indices.is_empty());
 	assert!(!state.pd_drop_admitted());
 	assert_eq!(state.survivor_policy_at(f), 1);
@@ -7214,7 +7661,6 @@ fn a_parent_decisions_settlement_is_refused_with_no_effect() {
 fn legacy_reclaim_completion_and_finalize_are_refused_after_a_parent_decisions_prepare() {
 	let mut state = base(3);
 	grant_all(&mut state);
-	state.pd_drop_prepare_admitted = true;
 	let id = crate::integration::compute::DropOperationId {
 		tenant_id: TENANT,
 		table_object_id: TABLE,

@@ -2365,6 +2365,39 @@ async fn jump_floor(cluster: &Cluster, floor_ms: u64) {
 		.unwrap();
 }
 
+/// Wendelon ADR 0118: enters the backup hold `id` through the leader; its token.
+async fn begin_hold_through_raft(cluster: &Cluster, id: u128) -> (u128, u64) {
+	let leader = cluster.leader().await;
+	let answer = cluster
+		.node(leader)
+		.raft
+		.client_write(crate::consensus::WendelonRequest::Decision(
+			crate::consensus::decisions::DecisionCommand::BeginBackupHold { id },
+		))
+		.await
+		.unwrap()
+		.data;
+	match answer {
+		crate::consensus::WendelonResponse::Decision(
+			crate::consensus::decisions::DecisionResult::HoldEntered { id, entered_at },
+		) => (id, entered_at),
+		other => panic!("hold entry: {other:?}"),
+	}
+}
+
+/// Wendelon ADR 0118: releases the hold `token` through the leader.
+async fn release_hold_through_raft(cluster: &Cluster, (id, entered_at): (u128, u64)) {
+	let leader = cluster.leader().await;
+	cluster
+		.node(leader)
+		.raft
+		.client_write(crate::consensus::WendelonRequest::Decision(
+			crate::consensus::decisions::DecisionCommand::ReleaseBackupHold { id, entered_at },
+		))
+		.await
+		.unwrap();
+}
+
 /// Waits until every node activated generation `gid`.
 async fn until_active(cluster: &Cluster, gid: u64) {
 	cluster

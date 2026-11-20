@@ -1196,6 +1196,11 @@ pub(crate) struct DecisionPeer {
 	/// LSM step are paused, so a test drives certified LSM itself.
 	#[cfg(test)]
 	pub(crate) pause_cleanup: Arc<std::sync::atomic::AtomicBool>,
+	/// Test-only (wendelon ADR 0118 interval controls): this store does not build,
+	/// stage or report a pending generation, so no target can commit while it is
+	/// held; activation of committed generations, writes and reads continue.
+	#[cfg(test)]
+	pub(crate) hold_certification: Arc<std::sync::atomic::AtomicBool>,
 	/// Test-only (ADR 0706): only the local certified cleanup step is paused,
 	/// so a held certified LSM job is the only work on its slabs.
 	#[cfg(test)]
@@ -1373,6 +1378,8 @@ impl Default for DecisionPeer {
 			fail_copy_read_once: Default::default(),
 			#[cfg(test)]
 			pause_cleanup: Default::default(),
+			#[cfg(test)]
+			hold_certification: Default::default(),
 			#[cfg(test)]
 			pause_local_cleanup: Default::default(),
 			#[cfg(test)]

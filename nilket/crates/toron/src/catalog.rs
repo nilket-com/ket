@@ -1254,6 +1254,12 @@ pub trait Catalog: Send + Sync {
 		name: &TableRef,
 		if_exists: bool,
 	) -> Result<Option<TableBinding>, CatalogError>;
+
+	/// Wendelon ADR 0118 D6: completes a DROP whose storage drop is authoritative, by
+	/// the binding the statement captured. Never resolves a name: a missing local
+	/// entry, or one that names another object (a fresh binding), is left as it is
+	/// and the statement finishes.
+	async fn complete_table_drop(&self, binding: &TableBinding) -> Result<(), CatalogError>;
 }
 
 #[async_trait::async_trait]
@@ -2252,6 +2258,25 @@ impl Catalog for MockCatalog {
 			.remove(&(self.tenant_id, binding.table));
 		Ok(Some(binding))
 	}
+
+	async fn complete_table_drop(&self, binding: &TableBinding) -> Result<(), CatalogError> {
+		let mut inner = self.inner.write().expect("MockCatalog lock poisoned");
+		let key = (self.tenant_id, binding.local_table_id);
+		let captured = inner.by_id.get(&key).is_some_and(|current| {
+			current.table == binding.table && current.schema_generation == binding.schema_generation
+		});
+		if captured {
+			inner.by_id.remove(&key);
+			inner
+				.by_ref
+				.retain(|(tenant_id, _), id| *tenant_id != self.tenant_id || *id != key.1);
+			inner.descriptors.remove(&key);
+			inner
+				.materialization_certificates
+				.remove(&(self.tenant_id, binding.table));
+		}
+		Ok(())
+	}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -2434,6 +2459,17 @@ pub struct WendelonDescriptorRegistry {
 	inner: RwLock<WendelonDescriptorState>,
 }
 
+/// Wendelon ADR 0118 D6: what completing a finalized DROP by identity did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FinalizedDropCompletion {
+	/// The captured entry named the dropped object and is removed.
+	Removed,
+	/// No local entry remains under the captured id: nothing to remove.
+	AlreadyAbsent,
+	/// The captured id names another object now: left intact.
+	Rebound,
+}
+
 struct WendelonDescriptorState {
 	by_ref: HashMap<(TenantId, TableRef), TableId>,
 	by_id: HashMap<(TenantId, TableId), TableBinding>,
@@ -2441,7 +2477,6 @@ struct WendelonDescriptorState {
 	provisional:
 		HashMap<(TenantId, TableId), (TableBinding, wendelon_client::TableSchemaDescriptor)>,
 	logical_types: HashMap<TenantId, LogicalTypeRegistry>,
-	finalized_drops: HashMap<(TenantId, TableId), DropOperationId>,
 	next_table_id: u64,
 }
 
@@ -2453,7 +2488,6 @@ impl Default for WendelonDescriptorState {
 			descriptors: HashMap::new(),
 			provisional: HashMap::new(),
 			logical_types: HashMap::new(),
-			finalized_drops: HashMap::new(),
 			next_table_id: 1,
 		}
 	}
@@ -3193,52 +3227,39 @@ impl WendelonDescriptorRegistry {
 		)
 	}
 
-	pub fn mark_finalized_drop(
+	/// Wendelon ADR 0118 D6: completes a DROP whose storage drop is authoritative,
+	/// by its captured identity, under one write lock: the local entry `table` is
+	/// removed only if it still names the dropped object at its generation. It never
+	/// resolves a name. After the authoritative success a missing entry, or one
+	/// that names another object, is left as it is (any fresh binding stays intact)
+	/// and the original DROP finishes. A missing entry is never read as evidence of
+	/// a durable drop: this is called only after the storage drop answered.
+	pub fn complete_finalized_drop(
 		&self,
 		tenant_id: TenantId,
 		table: TableId,
 		operation_id: DropOperationId,
-	) -> Result<(), CatalogError> {
+	) -> FinalizedDropCompletion {
 		let mut state = self
 			.inner
 			.write()
 			.expect("WendelonDescriptorRegistry lock poisoned");
-		if !state.by_id.contains_key(&(tenant_id, table)) {
-			return Err(CatalogError::TableNotFound {
-				table: format!("{table:?}"),
-			});
-		}
-		state
-			.finalized_drops
-			.insert((tenant_id, table), operation_id);
-		Ok(())
-	}
-
-	pub fn consume_finalized_drop(
-		&self,
-		tenant_id: TenantId,
-		table: TableId,
-		operation_id: DropOperationId,
-	) -> Result<(), CatalogError> {
-		let mut state = self
-			.inner
-			.write()
-			.expect("WendelonDescriptorRegistry lock poisoned");
-		match state.finalized_drops.get(&(tenant_id, table)).copied() {
-			Some(existing) if existing == operation_id => {
-				state.finalized_drops.remove(&(tenant_id, table));
-				Ok(())
+		match state.by_id.get(&(tenant_id, table)) {
+			None => FinalizedDropCompletion::AlreadyAbsent,
+			Some(binding)
+				if binding.table != operation_id.table_object_id
+					|| binding.schema_generation != operation_id.schema_generation.get() =>
+			{
+				FinalizedDropCompletion::Rebound
 			}
-			Some(existing) => Err(CatalogError::AdminFailed {
-				message: format!(
-					"finalized DROP marker for {table:?} has operation_id {existing:?}, expected {operation_id:?}",
-				),
-			}),
-			None => Err(CatalogError::AdminFailed {
-				message: format!(
-					"missing finalized DROP marker for {table:?}; Wendelon DROP must complete before local descriptor removal",
-				),
-			}),
+			Some(_) => {
+				state.by_id.remove(&(tenant_id, table));
+				state.by_ref.retain(|(entry_tenant, _), table_id| {
+					*entry_tenant != tenant_id || *table_id != table
+				});
+				state.descriptors.remove(&(tenant_id, table));
+				FinalizedDropCompletion::Removed
+			}
 		}
 	}
 
@@ -3266,7 +3287,6 @@ impl WendelonDescriptorRegistry {
 			.by_ref
 			.retain(|(entry_tenant, _), table_id| *entry_tenant != tenant_id || *table_id != table);
 		state.descriptors.remove(&(tenant_id, table));
-		state.finalized_drops.remove(&(tenant_id, table));
 		Ok(binding)
 	}
 
@@ -3281,7 +3301,6 @@ impl WendelonDescriptorRegistry {
 			.expect("WendelonDescriptorRegistry lock poisoned");
 		let binding = state.by_id.remove(&(tenant_id, table))?;
 		state.descriptors.remove(&(tenant_id, table));
-		state.finalized_drops.remove(&(tenant_id, table));
 		let mut refs = Vec::new();
 		state.by_ref.retain(|(entry_tenant, table_ref), table_id| {
 			let remove = *entry_tenant == tenant_id && *table_id == table;
@@ -4014,33 +4033,45 @@ impl Catalog for WendelonCatalog {
 		})
 	}
 
+	/// Wendelon ADR 0118 D6: a Wendelon table's local binding is removed only by
+	/// [`Catalog::complete_table_drop`], after its storage DROP and by the captured
+	/// identity. A removal by name is refused: it could name a fresh binding.
 	async fn drop_table(
 		&self,
 		name: &TableRef,
 		if_exists: bool,
 	) -> Result<Option<TableBinding>, CatalogError> {
-		let binding = match self.registry.try_resolve_table(self.tenant_id, name) {
-			Some(binding) => binding,
-			None if if_exists => return Ok(None),
-			None => {
-				return Err(CatalogError::TableNotFound {
+		if self
+			.registry
+			.try_resolve_table(self.tenant_id, name)
+			.is_none()
+		{
+			return if if_exists {
+				Ok(None)
+			} else {
+				Err(CatalogError::TableNotFound {
 					table: table_name(name),
-				});
-			}
-		};
+				})
+			};
+		}
+		Err(CatalogError::AdminFailed {
+			message: format!(
+				"a Wendelon table's local binding is removed only after its storage DROP, by the \
+				 captured identity; {} is not removed by name",
+				table_name(name)
+			),
+		})
+	}
+
+	async fn complete_table_drop(&self, binding: &TableBinding) -> Result<(), CatalogError> {
 		let operation_id = DropOperationId {
 			tenant_id: wendelon_tenant_id(self.tenant_id),
 			table_object_id: binding.table,
 			schema_generation: SchemaGeneration::new(binding.schema_generation),
 		};
-		self.registry.consume_finalized_drop(
-			self.tenant_id,
-			binding.local_table_id,
-			operation_id,
-		)?;
 		self.registry
-			.remove_table_for_tenant(self.tenant_id, binding.local_table_id)?;
-		Ok(Some(binding))
+			.complete_finalized_drop(self.tenant_id, binding.local_table_id, operation_id);
+		Ok(())
 	}
 }
 

@@ -219,6 +219,10 @@ async fn a_new_mode_store_writes_its_own_format_and_reopens() {
 
 use crate::consensus::decisions::tests as fixture;
 
+const PARENT_DECISIONS_V31_MANIFEST: &str =
+	include_str!("../../../tests/fixtures/consensus_body/parent_decisions_v31.txt");
+/// Wendelon ADR 0113 to ADR 0117's format-30 bodies, retained. Wendelon ADR 0118
+/// moved and added none: its drop index is derived, not serialized.
 const PARENT_DECISIONS_V30_MANIFEST: &str =
 	include_str!("../../../tests/fixtures/consensus_body/parent_decisions_v30.txt");
 /// Wendelon ADR 0112's format-29 bodies, retained. Wendelon ADR 0113 moved and added
@@ -294,7 +298,7 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 fn manifest() -> BTreeMap<String, String> {
-	parse(PARENT_DECISIONS_V30_MANIFEST)
+	parse(PARENT_DECISIONS_V31_MANIFEST)
 }
 
 /// ADR 0725: the three owner-signed operation kinds pinned in the format-18
@@ -463,7 +467,7 @@ fn entry(index: u64, request: WendelonRequest) -> Entry<WendelonTypeConfig> {
 }
 
 #[test]
-fn the_format_30_bodies_match_their_goldens_and_round_trip() {
+fn the_format_31_bodies_match_their_goldens_and_round_trip() {
 	let stored = manifest();
 	let state = golden_state();
 	let body = encode_state_body(DecisionMode::ParentDecisions, &state).unwrap();
@@ -682,6 +686,18 @@ fn the_format_30_bodies_match_their_goldens_and_round_trip() {
 	for (name, bytes) in golden_delete_statement() {
 		actual.push((name.to_owned(), hex(&bytes)));
 	}
+	// Wendelon ADR 0118 D1: a parent concluded by its table's drop Prepare
+	// (production from this format on).
+	actual.push((
+		"parent_refused_table_dropped".to_owned(),
+		hex(
+			&postcard::to_stdvec(&crate::consensus::decisions::ParentStatus::Refused {
+				cause: crate::consensus::decisions::RefusalCause::TableDropped,
+				dec: 118,
+			})
+			.unwrap(),
+		),
+	));
 	let moved: Vec<String> = actual
 		.iter()
 		.filter(|(name, hex)| stored.get(name) != Some(hex))
@@ -689,7 +705,7 @@ fn the_format_30_bodies_match_their_goldens_and_round_trip() {
 		.collect();
 	assert!(
 		moved.is_empty(),
-		"format-30 bodies moved or are missing; expected lines:\n{}",
+		"format-31 bodies moved or are missing; expected lines:\n{}",
 		moved.join("\n")
 	);
 	assert_eq!(stored.len(), actual.len());
@@ -703,18 +719,30 @@ fn the_format_30_bodies_match_their_goldens_and_round_trip() {
 	// only the decision state differs from the format-16 corpus: by exactly the
 	// appended seal.
 	assert!(decisions.sealed().is_some());
-	// Wendelon ADR 0113: the format-29 corpus, byte for byte.
-	assert_eq!(stored, parse(PARENT_DECISIONS_V29_MANIFEST));
+	// Wendelon ADR 0118: against the format-30 corpus no body moved; a parent
+	// refused by its table's drop was added.
+	const ADDED_0118: [&str; 1] = ["parent_refused_table_dropped"];
+	let retained_v30 = parse(PARENT_DECISIONS_V30_MANIFEST);
+	assert_eq!(stored.len(), retained_v30.len() + ADDED_0118.len());
+	for (name, hex) in &retained_v30 {
+		assert_eq!(stored.get(name), Some(hex), "{name}");
+	}
+	for name in ADDED_0118 {
+		assert!(stored.contains_key(name), "{name}");
+	}
+	// Wendelon ADR 0113: the format-30 corpus is the format-29 corpus, byte for
+	// byte.
+	assert_eq!(retained_v30, parse(PARENT_DECISIONS_V29_MANIFEST));
 	// Wendelon ADR 0112: against the format-28 corpus no body moved; a delete
 	// statement's claim and noop were added.
 	const ADDED_0112: [&str; 2] = ["delete_statement_claim", "delete_statement_noop"];
 	let retained_v28 = parse(PARENT_DECISIONS_V28_MANIFEST);
-	assert_eq!(stored.len(), retained_v28.len() + ADDED_0112.len());
+	assert_eq!(retained_v30.len(), retained_v28.len() + ADDED_0112.len());
 	for (name, hex) in &retained_v28 {
-		assert_eq!(stored.get(name), Some(hex), "{name}");
+		assert_eq!(retained_v30.get(name), Some(hex), "{name}");
 	}
 	for name in ADDED_0112 {
-		assert!(stored.contains_key(name), "{name}");
+		assert!(retained_v30.contains_key(name), "{name}");
 	}
 	// Wendelon ADR 0108: against the format-27 corpus three bodies moved (the
 	// decision state gained the index receipts, the lease batch's grants carry
@@ -1085,25 +1113,9 @@ fn recovery_keeps_the_reserve_and_first_decision_log_indices() {
 
 	// Recovery starts each authority from its own state shape.
 	let blanks: Vec<_> = (1..=3).map(blank).collect();
-	let inner = recover_sm_inner(
-		new,
-		StateAdmission::default(),
-		None,
-		blanks.clone(),
-		checkpoint(3),
-		false,
-	)
-	.unwrap();
+	let inner = recover_sm_inner(new, None, blanks.clone(), checkpoint(3), false).unwrap();
 	assert_eq!(inner.state.decisions, Some(Default::default()));
-	let inner = recover_sm_inner(
-		DecisionMode::Today,
-		StateAdmission::default(),
-		None,
-		blanks,
-		checkpoint(3),
-		false,
-	)
-	.unwrap();
+	let inner = recover_sm_inner(DecisionMode::Today, None, blanks, checkpoint(3), false).unwrap();
 	assert!(inner.state.decisions.is_none());
 }
 
@@ -1159,8 +1171,9 @@ fn a_schema_cannot_take_the_reserved_kv_table_id_under_parent_decisions() {
 }
 
 /// ADR 0699 S5a: the survivor and read policy is frozen in mode. A retention
-/// change, a table drop and a tenant delete are refused at apply and change
-/// nothing; CTAS, a write path outside parent decisions, is refused too.
+/// change and a tenant delete are refused at apply and change nothing; CTAS, a
+/// write path outside parent decisions, is refused too. (Wendelon ADR 0118 D1: a
+/// table drop is the ParentDecisions Prepare now, covered by the drop tests.)
 #[test]
 fn table_retention_is_frozen_under_parent_decisions() {
 	use crate::consensus::SetTableRetentionPolicy;
@@ -1187,27 +1200,6 @@ fn table_retention_is_frozen_under_parent_decisions() {
 	);
 	assert!(
 		matches!(&response, WendelonResponse::Error(why) if why.contains("frozen")),
-		"{response:?}"
-	);
-	assert_eq!(state.table_lifecycle, before);
-
-	// A table drop is refused too, before any drop state is recorded.
-	let drop_id = crate::integration::compute::DropOperationId {
-		tenant_id: fixture::TENANT,
-		table_object_id: fixture::TABLE,
-		schema_generation: crate::integration::compute::SchemaGeneration::new(1),
-	};
-	let (response, _) = apply_request_at_log_index(
-		&mut state,
-		WendelonRequest::TableDropPrepare(crate::consensus::TableDropPrepareRequest::current(
-			drop_id,
-			drop_id.schema_generation,
-		)),
-		2,
-		0,
-	);
-	assert!(
-		matches!(&response, WendelonResponse::Error(why) if why.contains("drops are refused")),
 		"{response:?}"
 	);
 	assert_eq!(state.table_lifecycle, before);
@@ -1499,7 +1491,6 @@ fn recovered(state: SmState, entries: Vec<Entry<WendelonTypeConfig>>) -> std::io
 	let commit = entries.last().map_or(APPLIED, |entry| entry.log_id.index);
 	recover_sm_inner(
 		DecisionMode::ParentDecisions,
-		StateAdmission::default(),
 		Some(LoadedSnapshot {
 			last_included: last,
 			held: HeldSnapshot {
@@ -1752,14 +1743,10 @@ fn a_snapshot_before_the_drop_prepare_rebuilds_the_table_bucket_and_replays_alik
 		};
 		reserved.push(reservation);
 	}
-	// Armed before encoding: a serialized admission would survive the decode.
-	state.pd_drop_prepare_admitted = true;
+	// Wendelon ADR 0118 D1: the decoded state replays the Prepare with no input
+	// beyond its own bytes.
 	let bytes = encode_state_body(DecisionMode::ParentDecisions, &state).unwrap();
 	let mut restored = decode_state_body(DecisionMode::ParentDecisions, &bytes).unwrap();
-	assert!(
-		!restored.pd_drop_prepare_admitted,
-		"the admission is not serialized"
-	);
 	let live = |state: &SmState| {
 		state
 			.decisions
@@ -1785,8 +1772,6 @@ fn a_snapshot_before_the_drop_prepare_rebuilds_the_table_bucket_and_replays_alik
 		))
 	};
 	let at = fixture::peek_index() + 10;
-	// The replay is configured explicitly.
-	restored.pd_drop_prepare_admitted = true;
 	let original = apply_request_at_index_for_test(&mut state, prepare(), at);
 	let replayed = apply_request_at_index_for_test(&mut restored, prepare(), at);
 	assert!(
@@ -1855,28 +1840,7 @@ fn loaded_snapshot(state: SmState, last: Option<LogId<u32>>) -> LoadedSnapshot {
 	}
 }
 
-fn admitted() -> StateAdmission {
-	StateAdmission { pd_drop: true }
-}
-
-/// A ParentDecisions store opened with the test admission.
-async fn open_admitted_store(dir: &TempDir) -> std::io::Result<WendelonLogStore> {
-	WendelonLogStore::open_with_options_and_retention(
-		dir.to_path_buf().join("control.wal"),
-		dir.to_path_buf().join("vote.wnd"),
-		dir.to_path_buf().join("snapshot.wnd"),
-		Arc::new(crate::storage::BlockingFileOps),
-		WalOptions {
-			admission: admitted(),
-			..store_options(DecisionMode::ParentDecisions)
-		},
-		None,
-		None,
-	)
-	.await
-}
-
-/// An admitted fixture state whose drop is finalized, with an excluding
+/// A fixture ParentDecisions state whose drop is finalized, with an excluding
 /// (policy 2) target pending; returns it with its last applied index.
 fn policy_two_pending_state() -> (SmState, u64) {
 	use crate::consensus::decisions::{DECISION_EXPIRY_MS, DecisionCommand};
@@ -1909,23 +1873,31 @@ fn policy_two_pending_state() -> (SmState, u64) {
 	(state, last)
 }
 
-/// A snapshot already holding an accepted policy-2 pending target recovers on
-/// an admitted store and is refused, before any replay, on an unadmitted one. A
-/// pending target whose policy disagrees with the outcomes at its cut is refused
-/// even though its digest is internally correct.
+/// Wendelon ADR 0118 D1: the policy-2 state with its drop outcome removed. Its
+/// pending target's digest is intact, but no outcome at its cut requires policy
+/// 2, so every ParentDecisions store must refuse it.
+fn unjustified_policy_two_state() -> (SmState, u64) {
+	let (mut state, last) = policy_two_pending_state();
+	state.table_drop_outcomes = Default::default();
+	(state, last)
+}
+
+/// A snapshot already holding an accepted policy-2 pending target recovers on a
+/// ParentDecisions store with no admission input (wendelon ADR 0118 D1). A
+/// pending target whose policy disagrees with the outcomes at its cut is refused,
+/// before any replay, even though its digest is internally correct.
 #[test]
-fn a_policy_two_snapshot_recovers_only_under_admission() {
+fn a_policy_two_snapshot_recovers_only_when_its_outcomes_require_it() {
 	let (state, last) = policy_two_pending_state();
 	let at = Some(LogId::new(openraft::CommittedLeaderId::new(1, 1), last));
 	let recovered = recover_sm_inner(
 		DecisionMode::ParentDecisions,
-		admitted(),
 		Some(loaded_snapshot(state.clone(), at)),
 		Vec::new(),
 		None,
 		false,
 	)
-	.expect("an admitted store recovers it");
+	.expect("a ParentDecisions store recovers it");
 	assert_eq!(
 		recovered
 			.state
@@ -1938,25 +1910,11 @@ fn a_policy_two_snapshot_recovers_only_under_admission() {
 			.map(|pending| pending.target.survivor_policy),
 		Some(2)
 	);
-	let refused = recover_sm_inner(
-		DecisionMode::ParentDecisions,
-		StateAdmission::default(),
-		Some(loaded_snapshot(state.clone(), at)),
-		Vec::new(),
-		None,
-		false,
-	)
-	.err()
-	.expect("an unadmitted store refuses it");
-	assert_eq!(refused.kind(), ErrorKind::InvalidData);
-	assert!(refused.to_string().contains("survivor policy"), "{refused}");
 	// The same pending target, its digest intact, without the outcome its cut
-	// relies on: refused even when admitted.
-	let mut mismatched = state;
-	mismatched.table_drop_outcomes = Default::default();
+	// relies on.
+	let (mismatched, _) = unjustified_policy_two_state();
 	let refused = recover_sm_inner(
 		DecisionMode::ParentDecisions,
-		admitted(),
 		Some(loaded_snapshot(mismatched, at)),
 		Vec::new(),
 		None,
@@ -1964,18 +1922,19 @@ fn a_policy_two_snapshot_recovers_only_under_admission() {
 	)
 	.err()
 	.expect("a policy the outcomes do not require is refused");
+	assert_eq!(refused.kind(), ErrorKind::InvalidData);
 	assert!(refused.to_string().contains("survivor policy"), "{refused}");
 }
 
-/// The replay contract under the same admission: a policy-1 snapshot whose
-/// committed suffix first introduces the drop and the policy-2 proposal recovers
-/// to the live state: equal pending target and digest, outcomes and applied index.
+/// The replay contract (wendelon ADR 0118 D1: one rule, no admission input): a
+/// policy-1 snapshot whose committed suffix first introduces the drop and the
+/// policy-2 proposal recovers to the live state: equal pending target and digest,
+/// outcomes, derived index and applied index.
 #[test]
-fn a_suffix_introducing_policy_two_replays_alike_under_the_same_admission() {
+fn a_suffix_introducing_policy_two_replays_alike() {
 	use crate::consensus::decisions::{DECISION_EXPIRY_MS, DecisionCommand};
 	let mut live = fixture::base(3);
 	fixture::grant_all(&mut live);
-	live.pd_drop_prepare_admitted = true;
 	let base_index = fixture::peek_index() - 1;
 	let snapshot = {
 		let mut snapshot = live.clone();
@@ -2030,7 +1989,6 @@ fn a_suffix_introducing_policy_two_replays_alike_under_the_same_admission() {
 	let last = entries.last().unwrap().log_id;
 	let recovered = recover_sm_inner(
 		DecisionMode::ParentDecisions,
-		admitted(),
 		Some(loaded_snapshot(
 			snapshot,
 			Some(LogId::new(
@@ -2045,7 +2003,7 @@ fn a_suffix_introducing_policy_two_replays_alike_under_the_same_admission() {
 		}),
 		false,
 	)
-	.expect("the same admission replays the suffix")
+	.expect("the suffix replays")
 	.state;
 	let pending = |state: &SmState| {
 		state
@@ -2068,17 +2026,19 @@ fn a_suffix_introducing_policy_two_replays_alike_under_the_same_admission() {
 		"outcomes"
 	);
 	assert_eq!(recovered.last_applied_log_id, Some(last), "applied index");
+	assert!(!live.pd_finalize_indices.is_empty(), "premise: an index");
 	assert_eq!(recovered.pd_finalize_indices, live.pd_finalize_indices);
 }
 
-/// The replay contract unadmitted: a committed `ProposeTarget(policy 2)` replays
-/// as a refusal (a valid apply outcome) and the next valid entry applies: the
-/// open succeeds with no pending target and the applied index past both.
+/// The replay contract on a store whose outcomes do not require policy 2: a
+/// committed `ProposeTarget(policy 2)` replays as a refusal (a valid apply
+/// outcome) and the next valid entry applies: the open succeeds with no pending
+/// target and the applied index past both.
 #[test]
-fn a_refused_policy_two_proposal_replays_as_a_refusal_on_an_unadmitted_store() {
+fn a_refused_policy_two_proposal_replays_as_a_refusal_without_its_outcome() {
 	use crate::consensus::decisions::{DECISION_EXPIRY_MS, DecisionCommand};
-	let (admitted_state, _) = policy_two_pending_state();
-	let target = admitted_state
+	let (justified_state, _) = policy_two_pending_state();
+	let target = justified_state
 		.decisions
 		.as_ref()
 		.unwrap()
@@ -2088,10 +2048,11 @@ fn a_refused_policy_two_proposal_replays_as_a_refusal_on_an_unadmitted_store() {
 		.unwrap()
 		.target
 		.clone();
-	let mut unadmitted = fixture::base(3);
-	fixture::grant_all(&mut unadmitted);
+	// No drop outcome: policy 2 is required at no cut.
+	let mut unjustified = fixture::base(3);
+	fixture::grant_all(&mut unjustified);
 	let base_index = fixture::peek_index() - 1;
-	unadmitted.last_applied_log_id = Some(LogId::new(
+	unjustified.last_applied_log_id = Some(LogId::new(
 		openraft::CommittedLeaderId::new(1, 1),
 		base_index,
 	));
@@ -2108,8 +2069,8 @@ fn a_refused_policy_two_proposal_replays_as_a_refusal_on_an_unadmitted_store() {
 			}),
 		),
 	];
-	// The live apply of the same entries on the same unadmitted state.
-	let mut live = unadmitted.clone();
+	// The live apply of the same entries on the same state.
+	let mut live = unjustified.clone();
 	for entry in &entries {
 		let EntryPayload::Normal(request) = &entry.payload else {
 			unreachable!()
@@ -2119,9 +2080,8 @@ fn a_refused_policy_two_proposal_replays_as_a_refusal_on_an_unadmitted_store() {
 	let last = entries.last().unwrap().log_id;
 	let recovered = recover_sm_inner(
 		DecisionMode::ParentDecisions,
-		StateAdmission::default(),
 		Some(loaded_snapshot(
-			unadmitted,
+			unjustified,
 			Some(LogId::new(
 				openraft::CommittedLeaderId::new(1, 1),
 				base_index,
@@ -2159,17 +2119,13 @@ fn a_refused_policy_two_proposal_replays_as_a_refusal_on_an_unadmitted_store() {
 	assert_eq!(recovered.pd_finalize_indices, live.pd_finalize_indices);
 }
 
-/// Install across admission: one policy-2 snapshot, built by an admitted store,
-/// is refused by an unadmitted store's install before publication (no current
-/// snapshot appears, the machine keeps its state) and installed by an admitted
-/// one.
+/// Install under one rule (wendelon ADR 0118 D1): a policy-2 snapshot whose
+/// outcomes do not require policy 2 is refused by a ParentDecisions store's
+/// install before publication (no current snapshot appears, the machine keeps
+/// its state); the valid policy-2 snapshot installs on a ParentDecisions store
+/// with no admission input, and its derived index is rebuilt from its outcomes.
 #[tokio::test]
-async fn a_policy_two_snapshot_installs_only_on_an_admitted_store() {
-	let (state, _) = policy_two_pending_state();
-	let source_dir = TempDir::new("adr0115-install-source");
-	let source_store = open_admitted_store(&source_dir).await.unwrap();
-	let mut source_sm = source_store.recovered_state_machine().await.unwrap();
-	source_sm.seed_complete_snapshot_state_for_test(state).await;
+async fn a_policy_two_snapshot_installs_only_when_its_outcomes_require_it() {
 	let build = |source_sm: &mut WendelonStateMachine| {
 		let source_sm = source_sm.clone();
 		async move {
@@ -2182,13 +2138,27 @@ async fn a_policy_two_snapshot_installs_only_on_an_admitted_store() {
 			builder.build_snapshot().await.unwrap()
 		}
 	};
+	let source = |tag: &'static str, state: SmState| async move {
+		let dir = TempDir::new(tag);
+		let store = open_store(&dir, DecisionMode::ParentDecisions)
+			.await
+			.unwrap();
+		let sm = store.recovered_state_machine().await.unwrap();
+		sm.seed_complete_snapshot_state_for_test(state).await;
+		(dir, store, sm)
+	};
+	let (unjustified, _) = unjustified_policy_two_state();
+	let (_unjustified_dir, _unjustified_store, mut unjustified_sm) =
+		source("adr0118-install-source-unjustified", unjustified).await;
+	let (state, _) = policy_two_pending_state();
+	let (_source_dir, _source_store, mut source_sm) = source("adr0118-install-source", state).await;
 
-	// Unadmitted: refused before publication.
-	let unadmitted_dir = TempDir::new("adr0115-install-unadmitted");
-	let unadmitted_store = open_store(&unadmitted_dir, DecisionMode::ParentDecisions)
+	// Refused before publication.
+	let target_dir = TempDir::new("adr0118-install-refusing");
+	let target_store = open_store(&target_dir, DecisionMode::ParentDecisions)
 		.await
 		.unwrap();
-	let mut unadmitted_sm = unadmitted_store.recovered_state_machine().await.unwrap();
+	let mut target_sm = target_store.recovered_state_machine().await.unwrap();
 	// A durable policy-1 snapshot of its own is current before the install.
 	let own = {
 		let mut own = fixture::base(3);
@@ -2199,49 +2169,46 @@ async fn a_policy_two_snapshot_installs_only_on_an_admitted_store() {
 		));
 		own
 	};
-	unadmitted_sm
-		.seed_complete_snapshot_state_for_test(own)
-		.await;
-	build(&mut unadmitted_sm).await;
-	let before = unadmitted_sm.state_snapshot().await.last_applied_log_id;
-	let current = unadmitted_dir.to_path_buf().join("snapshot.wnd");
+	target_sm.seed_complete_snapshot_state_for_test(own).await;
+	build(&mut target_sm).await;
+	let before = target_sm.state_snapshot().await.last_applied_log_id;
+	let current = target_dir.to_path_buf().join("snapshot.wnd");
 	let current_before = std::fs::read(&current).ok();
 	assert!(
 		current_before.is_some(),
 		"premise: a durable snapshot is current"
 	);
-	let built = build(&mut source_sm).await;
+	let built = build(&mut unjustified_sm).await;
 	let err = <WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::install_snapshot(
-		&mut unadmitted_sm,
+		&mut target_sm,
 		&built.meta,
 		built.snapshot,
 	)
 	.await
-	.expect_err("an unadmitted store refuses the policy-2 snapshot");
+	.expect_err("a policy-2 snapshot its outcomes do not require is refused");
 	assert!(err.to_string().contains("survivor policy"), "{err}");
 	assert_eq!(
 		std::fs::read(&current).ok(),
 		current_before,
 		"nothing published"
 	);
-	assert_eq!(
-		unadmitted_sm.state_snapshot().await.last_applied_log_id,
-		before
-	);
+	assert_eq!(target_sm.state_snapshot().await.last_applied_log_id, before);
 
-	// Admitted: installed.
-	let admitted_dir = TempDir::new("adr0115-install-admitted");
-	let admitted_store = open_admitted_store(&admitted_dir).await.unwrap();
-	let mut admitted_sm = admitted_store.recovered_state_machine().await.unwrap();
+	// Installed, with no admission input.
+	let installing_dir = TempDir::new("adr0118-install-installing");
+	let installing_store = open_store(&installing_dir, DecisionMode::ParentDecisions)
+		.await
+		.unwrap();
+	let mut installing_sm = installing_store.recovered_state_machine().await.unwrap();
 	let built = build(&mut source_sm).await;
 	<WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::install_snapshot(
-		&mut admitted_sm,
+		&mut installing_sm,
 		&built.meta,
 		built.snapshot,
 	)
 	.await
-	.expect("an admitted store installs it");
-	let installed = admitted_sm.state_snapshot().await;
+	.expect("a ParentDecisions store installs it");
+	let installed = installing_sm.state_snapshot().await;
 	assert_eq!(
 		installed
 			.decisions
@@ -2254,17 +2221,19 @@ async fn a_policy_two_snapshot_installs_only_on_an_admitted_store() {
 		Some(2)
 	);
 	assert!(
-		installed.pd_drop_prepare_admitted,
-		"the installed state carries the admission"
+		!installed.pd_finalize_indices.is_empty(),
+		"the derived index is rebuilt at install"
+	);
+	assert_eq!(
+		installed.pd_finalize_indices,
+		installed.derived_pd_finalize_indices()
 	);
 }
 
-/// Opens `dir`'s control store through the constructor the nodes use, with the
-/// given admission.
+/// Opens `dir`'s control store through the constructor the nodes use.
 async fn open_as_node(
 	dir: &TempDir,
 	owner: &DataDirectoryOwner,
-	admission: StateAdmission,
 ) -> std::io::Result<WendelonLogStore> {
 	let io = crate::storage::io_uring::spawn_io_thread(64)
 		.unwrap()
@@ -2277,7 +2246,6 @@ async fn open_as_node(
 		RetentionGuard::new(crate::consensus::ControlRetention::Compacting),
 		owner.clone(),
 		DecisionMode::ParentDecisions,
-		admission,
 	)
 	.await
 }
@@ -2302,31 +2270,19 @@ fn durable_files(dir: &std::path::Path) -> std::collections::BTreeMap<PathBuf, V
 	files
 }
 
-/// The durable cold open, through the constructor the nodes use: a store holds
-/// a policy-2 snapshot and a torn WAL tail the open would truncate. Unadmitted,
-/// the open itself refuses with InvalidData and every durable byte is kept;
-/// admitted, the same input opens, the tail is truncated as usual, and the
-/// recovered state holds the pending policy-2 target.
-#[tokio::test]
-async fn an_unadmitted_cold_open_refuses_a_policy_two_snapshot_before_any_effect() {
-	let (state, last) = policy_two_pending_state();
-	let pending_of = |state: &SmState| {
-		state
-			.decisions
-			.as_ref()
-			.unwrap()
-			.generations()
-			.pending
-			.as_ref()
-			.map(|pending| (pending.target.clone(), pending.digest))
-	};
-	let expected = pending_of(&state);
-	let dir = TempDir::new("adr0115-cold-open");
+/// A durable ParentDecisions store written through the constructor the nodes
+/// use: a snapshot of `state` (applied through `last`), one log entry after it,
+/// and a torn tail on its last WAL segment that an open would truncate. Returns
+/// the directory, its owner, that segment and the segment's untorn bytes.
+async fn torn_store_holding(
+	tag: &'static str,
+	state: SmState,
+	last: u64,
+) -> (TempDir, DataDirectoryOwner, PathBuf, Vec<u8>) {
+	let dir = TempDir::new(tag);
 	let owner = DataDirectoryOwner::acquire_or_create(dir.to_path_buf()).unwrap();
-
-	// A durable policy-2 snapshot, written by an admitted store.
 	{
-		let store = open_as_node(&dir, &owner, admitted()).await.unwrap();
+		let store = open_as_node(&dir, &owner).await.unwrap();
 		store.write_identity(IDENTITY).await.unwrap();
 		// The log the seeded state covers, so the snapshot sits on a real log.
 		let mut store = store;
@@ -2346,7 +2302,6 @@ async fn an_unadmitted_cold_open_refuses_a_policy_two_snapshot_before_any_effect
 		dir.to_path_buf().join("snapshot.wnd").exists(),
 		"premise: a durable snapshot"
 	);
-
 	// A torn tail on the last WAL segment: a partial copy of its first page.
 	let segment = durable_files(&dir.to_path_buf())
 		.into_keys()
@@ -2364,12 +2319,36 @@ async fn an_unadmitted_cold_open_refuses_a_policy_two_snapshot_before_any_effect
 		file.write_all(&whole[..128]).unwrap();
 		file.sync_all().unwrap();
 	}
-	let before = durable_files(&dir.to_path_buf());
+	(dir, owner, segment, whole)
+}
 
-	let refused = open_as_node(&dir, &owner, StateAdmission::default())
+/// The durable cold open, through the constructor the nodes use (wendelon ADR
+/// 0118 D1). A store holding a policy-2 snapshot its outcomes do not require,
+/// and a torn WAL tail the open would truncate, refuses in the open itself with
+/// InvalidData, and every durable byte is kept. The same layout holding the
+/// valid policy-2 snapshot opens with no admission input: the tail is truncated
+/// as usual and the recovered state holds the pending policy-2 target.
+#[tokio::test]
+async fn a_cold_open_refuses_an_unjustified_policy_two_snapshot_before_any_effect() {
+	let pending_of = |state: &SmState| {
+		state
+			.decisions
+			.as_ref()
+			.unwrap()
+			.generations()
+			.pending
+			.as_ref()
+			.map(|pending| (pending.target.clone(), pending.digest))
+	};
+
+	let (unjustified, last) = unjustified_policy_two_state();
+	let (dir, owner, _, _) =
+		torn_store_holding("adr0118-cold-open-unjustified", unjustified, last).await;
+	let before = durable_files(&dir.to_path_buf());
+	let refused = open_as_node(&dir, &owner)
 		.await
 		.err()
-		.expect("the unadmitted open refuses");
+		.expect("the open of an unjustified policy-2 snapshot refuses");
 	assert_eq!(refused.kind(), ErrorKind::InvalidData, "{refused}");
 	assert!(refused.to_string().contains("survivor policy"), "{refused}");
 	assert_eq!(
@@ -2378,9 +2357,13 @@ async fn an_unadmitted_cold_open_refuses_a_policy_two_snapshot_before_any_effect
 		"no durable byte changed: no truncation, holder completion or purge"
 	);
 
-	let store = open_as_node(&dir, &owner, admitted())
+	let (state, last) = policy_two_pending_state();
+	let expected = pending_of(&state);
+	let (dir, owner, segment, whole) =
+		torn_store_holding("adr0118-cold-open-justified", state, last).await;
+	let store = open_as_node(&dir, &owner)
 		.await
-		.expect("the admitted open of the same input");
+		.expect("the open of the valid policy-2 snapshot");
 	assert_eq!(
 		std::fs::metadata(&segment).unwrap().len(),
 		whole.len() as u64,
@@ -2431,7 +2414,6 @@ fn a_committed_parent_decisions_settlement_replays_as_a_refusal() {
 	let last = entries[0].log_id;
 	let recovered = recover_sm_inner(
 		DecisionMode::ParentDecisions,
-		admitted(),
 		Some(loaded_snapshot(
 			state,
 			Some(LogId::new(
@@ -2468,5 +2450,110 @@ fn a_committed_parent_decisions_settlement_replays_as_a_refusal() {
 			.table_schemas
 			.latest_by_id(fixture::TENANT, fixture::TABLE)
 			.is_some()
+	);
+}
+
+/// A table Create envelope for `(tenant, id, name)` (generation 1).
+fn table_create_envelope(
+	tenant: crate::schema::TenantId,
+	id: crate::schema::TableObjectId,
+	name: &str,
+) -> Vec<u8> {
+	use crate::integration::compute::{
+		COMPUTE_STORAGE_CONTRACT_VERSION, SchemaGeneration, SchemaIntentId, SchemaIntentOrigin,
+		SchemaMutationKind, SchemaObjectKind, SchemaObjectRef, SchemaUpdateEnvelope,
+		encode_schema_update_envelope_v1,
+	};
+	let descriptor = crate::schema::TableSchemaDescriptor::new_with_layout(
+		id,
+		1,
+		"ns",
+		name,
+		&arrow::datatypes::Schema::new(vec![arrow::datatypes::Field::new(
+			"id",
+			arrow::datatypes::DataType::Int64,
+			false,
+		)]),
+		crate::schema::RowIdentityPolicy::PrimaryKey(crate::schema::PrimaryKeyDescriptor::single(
+			"id",
+		)),
+		crate::schema::LocalityPolicy::IdentityProjection,
+		crate::schema::RecordLayoutPolicy::SingleRow,
+		crate::schema::SchemaEvolutionPolicy::AdditiveOnly,
+	)
+	.unwrap();
+	encode_schema_update_envelope_v1(&SchemaUpdateEnvelope {
+		contract_version: COMPUTE_STORAGE_CONTRACT_VERSION,
+		origin: SchemaIntentOrigin::ComputeClient,
+		tenant_id: tenant,
+		object: SchemaObjectRef {
+			kind: SchemaObjectKind::Table,
+			namespace: "ns".to_owned(),
+			name: name.to_owned(),
+		},
+		expected_generation: SchemaGeneration::ZERO,
+		requested_generation: SchemaGeneration::new(1),
+		intent_id: SchemaIntentId::new(*id.as_bytes()),
+		mutation: SchemaMutationKind::Create,
+		payload: crate::schema::encode_table_schema_descriptor_v1(&descriptor).unwrap(),
+	})
+	.unwrap()
+}
+
+/// Wendelon ADR 0118 D3: under ParentDecisions a dropped table's id is never
+/// reused. A state holding T's permanent drop outcome with no descriptor for T (as
+/// a settlement would leave it) passes the name- and id-bound Create checks; the
+/// outcome itself refuses the Create, with no effect. A fresh id under the former
+/// name succeeds, and the same id under another tenant is unaffected.
+#[test]
+fn a_create_of_a_dropped_table_id_is_refused_under_parent_decisions() {
+	let dropped = crate::schema::TableObjectId::new([0x7d; 16]);
+	let mut state = fixture::base(3);
+	state
+		.table_drop_outcomes
+		.insert_validated(crate::schema::TableDropOutcome {
+			operation_id: crate::integration::compute::DropOperationId {
+				tenant_id: fixture::TENANT,
+				table_object_id: dropped,
+				schema_generation: crate::integration::compute::SchemaGeneration::new(1),
+			},
+			finalize_log_index: 10,
+		});
+	assert!(
+		state
+			.table_schemas
+			.latest_by_id(fixture::TENANT, dropped)
+			.is_none(),
+		"premise: no descriptor for the dropped id"
+	);
+	let before = state.table_schemas.clone();
+	let refused = apply_schema_update(
+		&mut state,
+		&table_create_envelope(fixture::TENANT, dropped, "former"),
+	);
+	assert_eq!(
+		refused.as_ref().err().map(String::as_str),
+		Some(PD_DROPPED_TABLE_ID_REUSE_REFUSED),
+		"the intended refusal: {refused:?}"
+	);
+	assert_eq!(state.table_schemas, before, "no effect");
+	apply_schema_update(
+		&mut state,
+		&table_create_envelope(
+			fixture::TENANT,
+			crate::schema::TableObjectId::new([0x7e; 16]),
+			"former",
+		),
+	)
+	.expect("a fresh id under the former name");
+	let other_tenant = crate::schema::TenantId(8);
+	let other = apply_schema_update(
+		&mut state,
+		&table_create_envelope(other_tenant, dropped, "former"),
+	);
+	assert_ne!(
+		other.as_ref().err().map(String::as_str),
+		Some(PD_DROPPED_TABLE_ID_REUSE_REFUSED),
+		"another tenant's same id is not refused as a dropped id: {other:?}"
 	);
 }

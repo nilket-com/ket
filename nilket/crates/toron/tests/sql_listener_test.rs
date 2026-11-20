@@ -1572,6 +1572,151 @@ async fn adr0093_severed_drop_response_recovers_across_a_fresh_toron_run() {
 	fixture.shutdown();
 }
 
+/// Wendelon ADR 0118 D6, the retry contract at its identity-bearing entry: the
+/// storage DROP's admin request is retained after a lost reply, Toron restarts
+/// and completes the original statement, the name is re-created as a replacement
+/// table, and the retained request is replayed. The replay is answered from the
+/// durable outcome by identity (success, no effect), and the replacement keeps
+/// exactly its rows. A new SQL DROP by name would be a new statement on the
+/// replacement; only the retained identity replays the original.
+#[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adr0118_a_retained_drop_request_replays_by_identity_after_a_name_reuse() {
+	let fixture = LiveWendelonFixture::start(1618).await;
+	let descriptor = descriptor_with_object_id([0xB8; 16]);
+	let table_object_id = descriptor.table_object_id;
+	install_schema(&fixture.node, LIVE_TENANT, &descriptor).await;
+	write_rows(&fixture.client, LIVE_TENANT, &descriptor, batch()).await;
+
+	let (config_1, _descriptor_dir_1) = toron_config_with_descriptor(descriptor.clone(), true);
+	let daemon =
+		ToronDaemon::start_with_wendelon_client_for_harness(config_1, Arc::clone(&fixture.client))
+			.await
+			.expect("start first Toron run");
+	let endpoint = daemon.handle().sql_endpoint.expect("SQL endpoint");
+	execute_sql(
+		endpoint,
+		"CREATE TABLE adr0118_replay_source AS \
+		 SELECT id, amount, region, ts FROM storage_execution",
+	)
+	.await
+	.expect("a source for the replacement");
+	let _sever = wendelon::network::adr0093_test_support::sever_next_drop_response(table_object_id);
+	execute_sql(endpoint, "DROP TABLE storage_execution")
+		.await
+		.expect_err("premise: the storage reply is lost");
+	let operation_id = wendelon_client::DropOperationId {
+		tenant_id: LIVE_TENANT,
+		table_object_id,
+		schema_generation: wendelon_client::SchemaGeneration::new(descriptor.schema_generation),
+	};
+	// The identity-bearing request, retained across the restart.
+	let retained =
+		wendelon_client::TableSchemaDropRequest::current(wendelon_client::TableSchemaDropFields {
+			tenant_id: LIVE_TENANT,
+			table_object_id,
+			expected_generation: operation_id.schema_generation,
+			operation_id,
+		});
+
+	daemon.shutdown().await.expect("shutdown first Toron run");
+	let (config_2, _descriptor_dir_2) = toron_config_with_descriptor(descriptor, true);
+	let daemon =
+		ToronDaemon::start_with_wendelon_client_for_harness(config_2, Arc::clone(&fixture.client))
+			.await
+			.expect("start recovery Toron run");
+	let endpoint = daemon.handle().sql_endpoint.expect("SQL endpoint");
+	execute_sql(endpoint, "DROP TABLE storage_execution")
+		.await
+		.expect("the originally bound statement completes");
+	execute_sql(
+		endpoint,
+		"CREATE TABLE storage_execution AS \
+		 SELECT id, amount, region, ts FROM adr0118_replay_source",
+	)
+	.await
+	.expect("re-create the name as a replacement");
+	let read = |endpoint| async move {
+		let result = execute_sql(
+			endpoint,
+			"SELECT id, amount, region, ts FROM storage_execution",
+		)
+		.await
+		.expect("read the replacement");
+		let mut rows = projected_rows(&result.batches);
+		rows.sort();
+		rows
+	};
+	let before = read(endpoint).await;
+	assert_eq!(before.len(), 4, "premise: the replacement's rows");
+
+	fixture
+		.client
+		.drop_table_schema(retained)
+		.await
+		.expect("the retained request replays by identity");
+	assert_eq!(
+		read(endpoint).await,
+		before,
+		"the replacement keeps exactly its rows"
+	);
+	let remote = fixture.node.state_machine.state_snapshot().await;
+	assert_eq!(
+		remote
+			.table_drop_outcomes
+			.get(LIVE_TENANT, table_object_id)
+			.map(|outcome| outcome.operation_id),
+		Some(operation_id),
+		"one outcome, the original's"
+	);
+
+	daemon
+		.shutdown()
+		.await
+		.expect("shutdown recovery Toron run");
+	fixture.shutdown();
+}
+
+/// Wendelon ADR 0118 (r2): a locally bound table that Wendelon holds neither as a
+/// table nor as a recorded drop outcome (its admin answer is `TableMissing`) is
+/// never dropped by SQL: the DROP fails, the binding stays (a second DROP fails at
+/// storage again, not at the catalog), and Wendelon records no outcome.
+#[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adr0118_a_table_storage_does_not_hold_is_never_dropped_or_evicted() {
+	let fixture = LiveWendelonFixture::start(1619).await;
+	// Bound locally only: never installed in Wendelon.
+	let descriptor = descriptor_with_object_id([0xB9; 16]);
+	let table_object_id = descriptor.table_object_id;
+	let (config, _descriptor_dir) = toron_config_with_descriptor(descriptor, true);
+	let daemon =
+		ToronDaemon::start_with_wendelon_client_for_harness(config, Arc::clone(&fixture.client))
+			.await
+			.expect("start Toron");
+	let endpoint = daemon.handle().sql_endpoint.expect("SQL endpoint");
+	let first = execute_sql(endpoint, "DROP TABLE storage_execution")
+		.await
+		.expect_err("a table storage does not hold is not dropped");
+	assert_eq!(first.code, SqlErrorCode::StorageError, "{first:?}");
+	let second = execute_sql(endpoint, "DROP TABLE storage_execution")
+		.await
+		.expect_err("the binding is kept: the DROP reaches storage again");
+	assert_eq!(second.code, SqlErrorCode::StorageError, "{second:?}");
+	assert!(
+		fixture
+			.node
+			.state_machine
+			.state_snapshot()
+			.await
+			.table_drop_outcomes
+			.get(LIVE_TENANT, table_object_id)
+			.is_none(),
+		"no outcome is recorded"
+	);
+	daemon.shutdown().await.expect("shutdown Toron");
+	fixture.shutdown();
+}
+
 #[cfg(feature = "test-support")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn adr0093_pre_recovery_materialization_is_readable_after_registry_rebuild() {
