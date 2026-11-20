@@ -11782,9 +11782,10 @@ fn snapshot_lease_writers_do_not_await_local_publication_locks() {
 		.split("fn apply_entry_to_state(")
 		.next()
 		.unwrap();
-	// Nine cfg(test) seeding helpers (ADR 0728 added the tenant keysets') plus
-	// the two production writers.
-	assert_eq!(sm.matches("self.inner.write().await").count(), 11);
+	// Ten cfg(test) seeding helpers (ADR 0728 added the tenant keysets'; wendelon
+	// ADR 0114 stage (a) the drop-prepare admission) plus the two production
+	// writers.
+	assert_eq!(sm.matches("self.inner.write().await").count(), 12);
 	let apply = sm
 		.split("let pending_checkpoint = {\n\t\t\tlet mut guard = self.inner.write().await;")
 		.nth(1)

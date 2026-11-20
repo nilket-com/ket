@@ -6569,3 +6569,313 @@ fn the_table_operation_index_is_rebuilt_on_decode_and_fails_closed() {
 	assert!(decoded.restore_table_operations().is_err());
 	assert!(decoded.validate().is_err());
 }
+
+// ============================================================
+//  WENDELON ADR 0114 STAGE (a): THE DROP PREPARE DECIDES
+// ============================================================
+
+/// The ParentDecisions drop Prepare of the fixture table, generation 1, with
+/// `expected` as the generation the requester expects.
+fn drop_prepare_expecting(expected: u64) -> WendelonRequest {
+	let id = crate::integration::compute::DropOperationId {
+		tenant_id: TENANT,
+		table_object_id: TABLE,
+		schema_generation: crate::integration::compute::SchemaGeneration::new(1),
+	};
+	WendelonRequest::TableDropPrepare(crate::consensus::TableDropPrepareRequest::current(
+		id,
+		crate::integration::compute::SchemaGeneration::new(expected),
+	))
+}
+
+fn status_of(state: &SmState, reservation: u64) -> ParentStatus {
+	decisions(state).bodies[&reservation].status
+}
+
+/// The decision state and the drop fences, as bytes: what "unchanged" compares.
+fn drop_relevant_bytes(state: &SmState) -> (Vec<u8>, Vec<u8>, u32) {
+	(
+		postcard::to_stdvec(decisions(state)).unwrap(),
+		postcard::to_stdvec(&state.table_drop_fences).unwrap(),
+		decisions(state).live,
+	)
+}
+
+/// A KV parent, Reserved: a live parent the table's drop must not touch.
+fn reserved_kv_parent(state: &mut SmState, sequence_no: u64) -> u64 {
+	let one = point_child(state, position_of(1));
+	let kv = Claim {
+		first_row_position: one.range_start,
+		..claim(
+			ParentKey {
+				namespace: ParentNamespace::Kv,
+				..key(T0, sequence_no)
+			},
+			vec![one],
+			0,
+		)
+	};
+	let DecisionResult::Reserved { reservation } = reserve(state, &kv, T0) else {
+		panic!("reserve the KV parent");
+	};
+	reservation
+}
+
+/// One successful Prepare, through the real dispatcher and transition: it
+/// fences the table and, at its own log index, concludes exactly the two
+/// Reserved parents of that table (one with a quorum of valid acknowledgements
+/// already gathered, one abandoned), both `Refused { TableDropped }` with the
+/// same `dec`. An Accepted parent of the table keeps Accepted and its replay;
+/// the Reserved KV parent stays Reserved. A Finalize after the fence replays
+/// the refusal; a fresh Reserve or RecordNoop of the table is refused.
+#[test]
+fn a_drop_prepare_concludes_exactly_its_tables_reserved_parents() {
+	let mut state = base(3);
+	grant_all(&mut state);
+	// Accepted before the drop.
+	let accepted = claim(key(T0, 1), children(&state, 1), 0);
+	let DecisionResult::Reserved { reservation: a } = reserve(&mut state, &accepted, T0) else {
+		panic!("reserve A");
+	};
+	let accepted_acks = quorum_acks(&accepted, a);
+	assert!(matches!(
+		finalize(&mut state, &accepted, accepted_acks.clone()),
+		DecisionResult::Terminal {
+			status: ParentStatus::Accepted { .. },
+			..
+		}
+	));
+	let accepted_status = status_of(&state, a);
+	// Reserved with a quorum of valid acknowledgements gathered, not finalized.
+	let racing = claim(key(T0, 2), children(&state, 1), 0);
+	let DecisionResult::Reserved { reservation: b } = reserve(&mut state, &racing, T0) else {
+		panic!("reserve B");
+	};
+	let racing_acks = quorum_acks(&racing, b);
+	// Reserved and abandoned: its coordinator never sends anything again.
+	let abandoned = claim(key(T0, 3), children(&state, 1), 0);
+	let DecisionResult::Reserved { reservation: c } = reserve(&mut state, &abandoned, T0) else {
+		panic!("reserve C");
+	};
+	let kv = reserved_kv_parent(&mut state, 4);
+	// Witnesses: another table of the same tenant, and the same table id in
+	// another tenant, each with a live Reserved parent.
+	let other_table = crate::schema::TableObjectId::new([0x5e; 16]);
+	let other_tenant = TenantId(8);
+	state
+		.table_schemas
+		.upsert(TENANT, {
+			use arrow::datatypes::{DataType, Field, Schema};
+			crate::schema::TableSchemaDescriptor::new_with_layout(
+				other_table,
+				1,
+				"fixture",
+				"other",
+				&Schema::new(vec![
+					Field::new("id", DataType::Int64, false),
+					Field::new("v", DataType::Utf8, true),
+				]),
+				crate::schema::RowIdentityPolicy::PrimaryKey(
+					crate::schema::PrimaryKeyDescriptor::single("id"),
+				),
+				crate::schema::LocalityPolicy::IdentityProjection,
+				crate::schema::RecordLayoutPolicy::SingleRow,
+				crate::schema::SchemaEvolutionPolicy::AdditiveOnly,
+			)
+			.unwrap()
+		})
+		.unwrap();
+	let mut tenant_record = state.tenants[&TENANT].clone();
+	tenant_record.tenant_id = other_tenant;
+	state.tenants.insert(other_tenant, tenant_record);
+	state
+		.table_schemas
+		.upsert(other_tenant, fixture_table())
+		.unwrap();
+	let witness = |state: &mut SmState, key: ParentKey| {
+		let witness = claim(key, children(state, 1), 0);
+		let DecisionResult::Reserved { reservation } = reserve(state, &witness, T0) else {
+			panic!("reserve a witness");
+		};
+		reservation
+	};
+	let u = witness(
+		&mut state,
+		ParentKey {
+			namespace: ParentNamespace::Table(other_table),
+			..key(T0, 7)
+		},
+	);
+	let x = witness(
+		&mut state,
+		ParentKey {
+			tenant: other_tenant,
+			..key(T0, 8)
+		},
+	);
+	assert_eq!(
+		decisions(&state).live_of_table(TENANT, other_table),
+		vec![u]
+	);
+	assert_eq!(
+		decisions(&state).live_of_table(other_tenant, TABLE),
+		vec![x]
+	);
+	assert_eq!(decisions(&state).live_of_table(TENANT, TABLE), vec![b, c]);
+	let live = decisions(&state).live;
+
+	state.pd_drop_prepare_admitted = true;
+	let at = peek_index();
+	let prepared = apply_next(&mut state, drop_prepare_expecting(1));
+	assert!(
+		matches!(prepared, WendelonResponse::Success),
+		"{prepared:?}"
+	);
+	assert!(
+		state.table_drop_blocks_admission(TENANT, TABLE),
+		"the table is fenced"
+	);
+	let dropped = ParentStatus::Refused {
+		cause: RefusalCause::TableDropped,
+		dec: at,
+	};
+	assert_eq!(status_of(&state, b), dropped, "the racing parent");
+	assert_eq!(
+		status_of(&state, c),
+		dropped,
+		"the abandoned parent, same dec"
+	);
+	assert_eq!(
+		status_of(&state, a),
+		accepted_status,
+		"Accepted stays Accepted"
+	);
+	assert_eq!(
+		status_of(&state, kv),
+		ParentStatus::Reserved,
+		"KV untouched"
+	);
+	assert_eq!(
+		status_of(&state, u),
+		ParentStatus::Reserved,
+		"another table"
+	);
+	assert_eq!(
+		status_of(&state, x),
+		ParentStatus::Reserved,
+		"another tenant"
+	);
+	assert_eq!(
+		decisions(&state).live_of_table(TENANT, other_table),
+		vec![u]
+	);
+	assert_eq!(
+		decisions(&state).live_of_table(other_tenant, TABLE),
+		vec![x]
+	);
+	assert_eq!(decisions(&state).live, live - 2);
+	assert!(decisions(&state).live_of_table(TENANT, TABLE).is_empty());
+	decisions(&state).validate().unwrap();
+
+	// After the fence: the racing Finalize replays the refusal; A replays Accepted.
+	assert_eq!(
+		finalize(&mut state, &racing, racing_acks),
+		DecisionResult::Terminal {
+			reservation: b,
+			status: dropped,
+		}
+	);
+	assert_eq!(
+		finalize(&mut state, &accepted, accepted_acks),
+		DecisionResult::Terminal {
+			reservation: a,
+			status: accepted_status,
+		}
+	);
+	// A fresh Reserve or RecordNoop of the table is refused.
+	let fresh = claim(key(T0, 5), children(&state, 1), 0);
+	assert_eq!(
+		reserve(&mut state, &fresh, T0),
+		refused(DecisionRefusal::TableUnavailable)
+	);
+	let noop = noop_body(&state, 6, 2);
+	assert_eq!(
+		record_noop(&mut state, noop),
+		refused(DecisionRefusal::TableUnavailable)
+	);
+}
+
+/// A refused Prepare changes nothing: under a backup hold (checked by the
+/// ParentDecisions transition itself), with a generation mismatch, and with the
+/// admission off (the production refusal). Each leaves the fences, the decision
+/// state and the pending parent exactly as they were.
+#[test]
+fn a_refused_drop_prepare_changes_nothing() {
+	let mut state = base(3);
+	grant_all(&mut state);
+	let pending = claim(key(T0, 1), children(&state, 1), 0);
+	let DecisionResult::Reserved { reservation } = reserve(&mut state, &pending, T0) else {
+		panic!("reserve");
+	};
+	// Admission off: the production refusal.
+	let before = drop_relevant_bytes(&state);
+	let refused_off = apply_next(&mut state, drop_prepare_expecting(1));
+	assert!(
+		matches!(&refused_off, WendelonResponse::Error(why) if why.contains("refused under ParentDecisions")),
+		"{refused_off:?}"
+	);
+	assert_eq!(drop_relevant_bytes(&state), before);
+	assert_eq!(status_of(&state, reservation), ParentStatus::Reserved);
+	assert!(!state.table_drop_blocks_admission(TENANT, TABLE));
+	// Admitted, but the requester expects another generation.
+	state.pd_drop_prepare_admitted = true;
+	let before = drop_relevant_bytes(&state);
+	let mismatch = apply_next(&mut state, drop_prepare_expecting(2));
+	assert!(
+		matches!(mismatch, WendelonResponse::Error(_)),
+		"{mismatch:?}"
+	);
+	assert_eq!(drop_relevant_bytes(&state), before);
+	assert_eq!(status_of(&state, reservation), ParentStatus::Reserved);
+	// Admitted, under a backup hold.
+	assert!(matches!(
+		decide(&mut state, DecisionCommand::BeginBackupHold { id: 7 }),
+		DecisionResult::HoldEntered { .. }
+	));
+	let before = drop_relevant_bytes(&state);
+	let held = apply_next(&mut state, drop_prepare_expecting(1));
+	assert!(matches!(held, WendelonResponse::Error(_)), "{held:?}");
+	assert_eq!(drop_relevant_bytes(&state), before);
+	assert_eq!(status_of(&state, reservation), ParentStatus::Reserved);
+	assert!(!state.table_drop_blocks_admission(TENANT, TABLE));
+}
+
+/// The same Prepare applied again concludes nothing new and changes nothing:
+/// `live` is decremented once.
+#[test]
+fn a_replayed_drop_prepare_concludes_nothing_new() {
+	let mut state = base(3);
+	grant_all(&mut state);
+	let pending = claim(key(T0, 1), children(&state, 1), 0);
+	let DecisionResult::Reserved { reservation } = reserve(&mut state, &pending, T0) else {
+		panic!("reserve");
+	};
+	let live = decisions(&state).live;
+	state.pd_drop_prepare_admitted = true;
+	let first = apply_next(&mut state, drop_prepare_expecting(1));
+	assert!(matches!(first, WendelonResponse::Success), "{first:?}");
+	let after_first = drop_relevant_bytes(&state);
+	let status = status_of(&state, reservation);
+	let again = apply_next(&mut state, drop_prepare_expecting(1));
+	assert!(
+		matches!(again, WendelonResponse::Success),
+		"the replay succeeds: {again:?}"
+	);
+	assert_eq!(
+		drop_relevant_bytes(&state),
+		after_first,
+		"a replay changes nothing"
+	);
+	assert_eq!(status_of(&state, reservation), status);
+	assert_eq!(decisions(&state).live, live - 1, "decremented once");
+}

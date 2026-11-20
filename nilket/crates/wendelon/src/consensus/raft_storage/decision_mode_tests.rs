@@ -1707,3 +1707,105 @@ fn golden_delete_statement() -> [(&'static str, Vec<u8>); 2] {
 		("delete_statement_noop", postcard::to_stdvec(&noop).unwrap()),
 	]
 }
+
+/// Wendelon ADR 0114 stage (a): a snapshot taken BEFORE the drop Prepare, with
+/// the table's Reserved parents live and the original state ADMITTED, decodes
+/// through the production body codec. The admission is not serialized: the
+/// decoded state does not admit until the test admits it explicitly. The derived
+/// live-by-table bucket is rebuilt and validated. The same Prepare at the same
+/// index then gives the original and the restored states equal decision states
+/// and fences, both valid, with the table's bucket emptied and both parents
+/// `Refused { TableDropped }` at that index.
+#[test]
+fn a_snapshot_before_the_drop_prepare_rebuilds_the_table_bucket_and_replays_alike() {
+	use crate::consensus::decisions::{ParentStatus, RefusalCause};
+	let mut state = fixture::base(3);
+	fixture::grant_all(&mut state);
+	let mut reserved = Vec::new();
+	for sequence_no in [1, 2] {
+		let claim = fixture::claim(
+			fixture::key(fixture::T0, sequence_no),
+			fixture::children(&state, 1),
+			0,
+		);
+		let crate::consensus::decisions::DecisionResult::Reserved { reservation } =
+			fixture::reserve(&mut state, &claim, fixture::T0)
+		else {
+			panic!("reserve");
+		};
+		reserved.push(reservation);
+	}
+	// Armed before encoding: a serialized admission would survive the decode.
+	state.pd_drop_prepare_admitted = true;
+	let bytes = encode_state_body(DecisionMode::ParentDecisions, &state).unwrap();
+	let mut restored = decode_state_body(DecisionMode::ParentDecisions, &bytes).unwrap();
+	assert!(
+		!restored.pd_drop_prepare_admitted,
+		"the admission is not serialized"
+	);
+	let live = |state: &SmState| {
+		state
+			.decisions
+			.as_ref()
+			.unwrap()
+			.live_of_table(fixture::TENANT, fixture::TABLE)
+	};
+	assert_eq!(
+		live(&restored),
+		reserved,
+		"the decoded state rebuilt the bucket"
+	);
+	restored.decisions.as_ref().unwrap().validate().unwrap();
+	let drop_id = crate::integration::compute::DropOperationId {
+		tenant_id: fixture::TENANT,
+		table_object_id: fixture::TABLE,
+		schema_generation: crate::integration::compute::SchemaGeneration::new(1),
+	};
+	let prepare = || {
+		WendelonRequest::TableDropPrepare(crate::consensus::TableDropPrepareRequest::current(
+			drop_id,
+			drop_id.schema_generation,
+		))
+	};
+	let at = fixture::peek_index() + 10;
+	// The replay is configured explicitly.
+	restored.pd_drop_prepare_admitted = true;
+	let original = apply_request_at_index_for_test(&mut state, prepare(), at);
+	let replayed = apply_request_at_index_for_test(&mut restored, prepare(), at);
+	assert!(
+		matches!(original, WendelonResponse::Success),
+		"{original:?}"
+	);
+	assert!(
+		matches!(replayed, WendelonResponse::Success),
+		"{replayed:?}"
+	);
+	for decided in [&state, &restored] {
+		decided.decisions.as_ref().unwrap().validate().unwrap();
+		assert!(live(decided).is_empty(), "the table's bucket is emptied");
+		for reservation in &reserved {
+			assert_eq!(
+				decided
+					.decisions
+					.as_ref()
+					.unwrap()
+					.body(*reservation)
+					.map(|record| record.status),
+				Some(ParentStatus::Refused {
+					cause: RefusalCause::TableDropped,
+					dec: at,
+				})
+			);
+		}
+	}
+	assert_eq!(
+		postcard::to_stdvec(state.decisions.as_ref().unwrap()).unwrap(),
+		postcard::to_stdvec(restored.decisions.as_ref().unwrap()).unwrap(),
+		"the original and the restored decision states are equal"
+	);
+	assert_eq!(
+		postcard::to_stdvec(&state.table_drop_fences).unwrap(),
+		postcard::to_stdvec(&restored.table_drop_fences).unwrap(),
+		"and their fences"
+	);
+}

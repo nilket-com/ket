@@ -640,6 +640,11 @@ pub enum DecisionCommand {
 pub enum RefusalCause {
 	LineageClosed,
 	Aborted,
+	/// Wendelon ADR 0114 stage (a): concluded by its table's drop Prepare while
+	/// still Reserved. Test-only until a later stage owns its compatibility
+	/// fence: no production build can encode or decode it.
+	#[cfg(test)]
+	TableDropped,
 }
 
 /// A parent's status. A terminal status carries `dec`, the Raft log index of
@@ -1121,6 +1126,12 @@ pub struct DecisionState {
 	/// table key. KV keys are not in it.
 	#[serde(skip)]
 	table_operations: BTreeMap<(TenantId, [u8; 16], u64), crate::schema::TableObjectId>,
+	/// Wendelon ADR 0114: the Reserved bodies of each table, by reservation.
+	/// Derived from `bodies`: never serialized, rebuilt and checked on every
+	/// decode, updated at Reserve and at every terminal transition; an emptied
+	/// bucket is removed, so its size is bounded by the live parents.
+	#[serde(skip)]
+	live_by_table: BTreeMap<(TenantId, crate::schema::TableObjectId), BTreeSet<u64>>,
 }
 
 impl Default for DecisionState {
@@ -1142,6 +1153,7 @@ impl Default for DecisionState {
 			instances: instances::InstanceState::default(),
 			index_receipts: BTreeMap::new(),
 			table_operations: BTreeMap::new(),
+			live_by_table: BTreeMap::new(),
 		}
 	}
 }
@@ -1230,9 +1242,78 @@ impl DecisionState {
 	/// Wendelon ADR 0113: rebuilds the table-operation index from the retained keys.
 	/// Two retained table keys with one operation identity under different tables
 	/// refuse: a state that holds them breaks the tenant-wide identity.
+	/// Rebuilds the derived indexes after a decode: ADR 0113's table operations
+	/// and ADR 0114's Reserved bodies by table.
 	pub(crate) fn restore_table_operations(&mut self) -> Result<(), String> {
 		self.table_operations = derive_table_operations(&self.keys)?;
+		self.live_by_table = derive_live_by_table(&self.bodies);
 		Ok(())
+	}
+
+	/// ADR 0114: notes a Reserved table body.
+	fn note_live(&mut self, key: &ParentKey, reservation: u64) {
+		if let ParentNamespace::Table(table) = key.namespace {
+			self.live_by_table
+				.entry((key.tenant, table))
+				.or_default()
+				.insert(reservation);
+		}
+	}
+
+	/// ADR 0114: forgets a body that left Reserved; an emptied bucket is removed.
+	fn forget_live(&mut self, reservation: u64) {
+		let Some(body) = self.bodies.get(&reservation) else {
+			return;
+		};
+		if let ParentNamespace::Table(table) = body.claim.key.namespace {
+			let bucket = (body.claim.key.tenant, table);
+			if let Some(live) = self.live_by_table.get_mut(&bucket) {
+				live.remove(&reservation);
+				if live.is_empty() {
+					self.live_by_table.remove(&bucket);
+				}
+			}
+		}
+	}
+
+	/// ADR 0114 stage (a): concludes every Reserved parent of exactly `table`
+	/// within `tenant` as `Refused { TableDropped }` at `log_index`, visiting
+	/// only that table's live bucket. All premises are checked before any change:
+	/// a reservation at or after `log_index` refuses the whole batch, unchanged.
+	/// Terminal parents, other tables, KV and keys are untouched.
+	#[cfg(test)]
+	pub(crate) fn conclude_reserved_for_drop(
+		&mut self,
+		tenant: TenantId,
+		table: crate::schema::TableObjectId,
+		log_index: u64,
+	) -> Result<Vec<u64>, DecisionRefusal> {
+		let targets: Vec<u64> = self
+			.live_by_table
+			.get(&(tenant, table))
+			.map(|live| live.iter().copied().collect())
+			.unwrap_or_default();
+		if targets.iter().any(|rsv| log_index <= *rsv) {
+			return Err(DecisionRefusal::LogIndexOutOfOrder);
+		}
+		for rsv in &targets {
+			conclude(self, *rsv, Some(RefusalCause::TableDropped), log_index)
+				.expect("every premise was checked before the batch");
+		}
+		Ok(targets)
+	}
+
+	/// ADR 0114: the Reserved reservations of one table (test inspection).
+	#[cfg(test)]
+	pub(crate) fn live_of_table(
+		&self,
+		tenant: TenantId,
+		table: crate::schema::TableObjectId,
+	) -> Vec<u64> {
+		self.live_by_table
+			.get(&(tenant, table))
+			.map(|live| live.iter().copied().collect())
+			.unwrap_or_default()
 	}
 
 	/// The table a retained table operation identity is recorded under.
@@ -1408,6 +1489,9 @@ impl DecisionState {
 		// imply (a key-level fault is reported by its own check above first).
 		if derive_table_operations(&self.keys)? != self.table_operations {
 			return Err("decisions: the table-operation index does not match the keys".into());
+		}
+		if derive_live_by_table(&self.bodies) != self.live_by_table {
+			return Err("decisions: the live-by-table index does not match the bodies".into());
 		}
 		Ok(())
 	}
@@ -2557,6 +2641,24 @@ fn reduce(
 
 /// Wendelon ADR 0113: the table-operation index the retained keys imply. Two
 /// retained table keys with one operation identity under different tables refuse.
+/// ADR 0114: the Reserved table bodies by (tenant, table).
+fn derive_live_by_table(
+	bodies: &BTreeMap<u64, ParentRecord>,
+) -> BTreeMap<(TenantId, crate::schema::TableObjectId), BTreeSet<u64>> {
+	let mut live: BTreeMap<_, BTreeSet<u64>> = BTreeMap::new();
+	for (rsv, body) in bodies {
+		if body.status.is_terminal() {
+			continue;
+		}
+		if let ParentNamespace::Table(table) = body.claim.key.namespace {
+			live.entry((body.claim.key.tenant, table))
+				.or_default()
+				.insert(*rsv);
+		}
+	}
+	live
+}
+
 fn derive_table_operations(
 	keys: &BTreeMap<ParentKey, KeyEntry>,
 ) -> Result<BTreeMap<(TenantId, [u8; 16], u64), crate::schema::TableObjectId>, String> {
@@ -2725,6 +2827,7 @@ fn reserve(
 			status: ParentStatus::Reserved,
 		},
 	);
+	decisions.note_live(&claim.key, reservation);
 	Ok(DecisionResult::Reserved { reservation })
 }
 
@@ -3085,6 +3188,7 @@ fn conclude(
 			dec: log_index,
 		},
 	};
+	decisions.forget_live(reservation);
 	let body = decisions
 		.bodies
 		.get_mut(&reservation)

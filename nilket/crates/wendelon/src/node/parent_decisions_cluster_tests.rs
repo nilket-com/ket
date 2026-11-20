@@ -6772,6 +6772,8 @@ mod crossgen;
 mod dc269;
 #[path = "parent_decisions_cluster_tests/debt_before_append.rs"]
 mod debt_before_append;
+#[path = "parent_decisions_cluster_tests/drop_prepare.rs"]
+mod drop_prepare;
 #[path = "parent_decisions_cluster_tests/multi_row_delete.rs"]
 mod multi_row_delete;
 #[path = "parent_decisions_cluster_tests/one_voter.rs"]

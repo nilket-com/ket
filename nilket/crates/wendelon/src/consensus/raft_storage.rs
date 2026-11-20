@@ -3286,6 +3286,14 @@ pub struct SmState {
 	/// trailing.
 	#[serde(default)]
 	pub root_check: Option<crate::crypto::RootCheck>,
+	/// Test-only (wendelon ADR 0114 stage (a)): this state admits a
+	/// ParentDecisions `TableDropPrepare` through its decision transition. Set
+	/// only on a state a test builds itself; never serialized, so a decoded
+	/// state does not admit until its test sets it again. No state machine sets
+	/// it, so every node and every production build refuses.
+	#[cfg(test)]
+	#[serde(skip)]
+	pub pd_drop_prepare_admitted: bool,
 }
 
 impl SmState {
@@ -4568,6 +4576,11 @@ struct ControlRestoreReplay {
 
 #[derive(Clone)]
 pub struct WendelonStateMachine {
+	/// Test-only (wendelon ADR 0114 stage (a)): this machine admits a
+	/// ParentDecisions drop Prepare. Configured per machine by a test, applied to
+	/// its current state and to any snapshot state it installs; off by default.
+	#[cfg(test)]
+	pd_drop_prepare_admitted: Arc<std::sync::atomic::AtomicBool>,
 	/// Bootstrap-only receipt minted after owner-bound input parsing and replay.
 	restore_replay: Option<ControlRestoreReplay>,
 	inner: Arc<RwLock<SmInner>>,
@@ -4655,6 +4668,8 @@ impl WendelonStateMachine {
 		let (finalization_events, _) = broadcast::channel(FINALIZATION_BROADCAST_CAPACITY);
 		Self {
 			inner: Arc::new(RwLock::new(SmInner::default())),
+			#[cfg(test)]
+			pd_drop_prepare_admitted: Default::default(),
 			mutation_drain: MutationDrainRegistry::fresh_reconciled(),
 			snapshot_runtime: SnapshotRuntime::ephemeral(),
 			admission_snapshot,
@@ -4732,6 +4747,8 @@ impl WendelonStateMachine {
 		observability_metrics.set_drop_reclaim_debts(inner.state.table_drop_reclaim_debts.len());
 		Ok(Self {
 			inner: Arc::new(RwLock::new(inner)),
+			#[cfg(test)]
+			pd_drop_prepare_admitted: Default::default(),
 			mutation_drain,
 			snapshot_runtime,
 			admission_snapshot,
@@ -4799,6 +4816,17 @@ impl WendelonStateMachine {
 
 	/// Attaches the node's Control retention guard. Without one the state
 	/// machine and its snapshot builder behave as `Compacting`.
+	/// Test-only (wendelon ADR 0114 stage (a)): admits a ParentDecisions drop
+	/// Prepare on this machine, for its current state and any snapshot state it
+	/// installs. A test configures every replica of its cluster the same way
+	/// before proposing; a machine rebuilt from its log (a restart) starts off.
+	#[cfg(test)]
+	pub(crate) async fn admit_pd_drop_prepare_for_test(&self) {
+		self.pd_drop_prepare_admitted
+			.store(true, std::sync::atomic::Ordering::Release);
+		self.inner.write().await.state.pd_drop_prepare_admitted = true;
+	}
+
 	pub fn with_retention_guard(mut self, retention: Arc<RetentionGuard>) -> Self {
 		self.retention = Some(retention);
 		self
@@ -5624,6 +5652,14 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 		let pending_checkpoint = {
 			let mut guard = self.inner.write().await;
 			state.last_applied_log_id = meta.last_log_id;
+			// Wendelon ADR 0114 stage (a), test-only: this machine's admission is
+			// configured on the machine, not serialized, so an installed state takes it.
+			#[cfg(test)]
+			{
+				state.pd_drop_prepare_admitted = self
+					.pd_drop_prepare_admitted
+					.load(std::sync::atomic::Ordering::Acquire);
+			}
 			state.last_membership = meta.last_membership.clone();
 			let drained: Result<(), StorageError<u32>> = (|| {
 				for fence in state.table_drop_fences.iter() {
@@ -7203,10 +7239,22 @@ fn apply_request_at_log_index(
 			Err(err) => (WendelonResponse::Error(err), None),
 		},
 		// ADR 0699 S5a: the certified survivor rule assumes no drops in mode.
-		WendelonRequest::TableDropPrepare(_) if state.decisions.is_some() => (
-			WendelonResponse::Error("table drops are refused under ParentDecisions".into()),
-			None,
-		),
+		WendelonRequest::TableDropPrepare(request) if state.decisions.is_some() => {
+			// Wendelon ADR 0114 stage (a): the decision transition exists only
+			// for a state a test admits; every other state refuses, unchanged.
+			#[cfg(test)]
+			if state.pd_drop_prepare_admitted {
+				return (
+					apply_parent_decisions_table_drop_prepare(state, request, entry_log_index),
+					None,
+				);
+			}
+			let _ = request;
+			(
+				WendelonResponse::Error("table drops are refused under ParentDecisions".into()),
+				None,
+			)
+		}
 		WendelonRequest::TableDropPrepare(request) => (
 			apply_table_drop_prepare(state, request, entry_log_index),
 			None,
@@ -8280,6 +8328,48 @@ fn apply_ctas_saga_mutation(state: &mut SmState, mutation: CtasSagaMutation) -> 
 			CtasSagaResponse::Applied(entry.clone())
 		}
 	}
+}
+
+/// Wendelon ADR 0114 stage (a): the ParentDecisions drop Prepare. Every check
+/// that can refuse runs before any change: the backup hold (which the shared
+/// Prepare does not check), the conclusion's premises, then the shared Prepare's
+/// schema, binding, dependent-index, outcome and fence checks. Only a Prepare
+/// that succeeds fences the table and, in the same apply, concludes exactly its
+/// tenant's Reserved parents of that table as `Refused { TableDropped }` at this
+/// log index. A refused Prepare changes nothing; a replay concludes nothing new.
+#[cfg(test)]
+fn apply_parent_decisions_table_drop_prepare(
+	state: &mut SmState,
+	request: TableDropPrepareRequest,
+	entry_log_index: u64,
+) -> WendelonResponse {
+	if backup_held(state) {
+		return backup_hold_refusal();
+	}
+	let operation = request.operation_id();
+	let (tenant, table) = (operation.tenant_id, operation.table_object_id);
+	let premises_hold = state.decisions.as_ref().is_some_and(|decisions| {
+		decisions
+			.live_of_table(tenant, table)
+			.iter()
+			.all(|rsv| *rsv < entry_log_index)
+	});
+	if !premises_hold {
+		return WendelonResponse::Error(
+			"a Reserved parent of the table is not before this Prepare".into(),
+		);
+	}
+	let prepared = apply_table_drop_prepare(state, request, entry_log_index);
+	if !matches!(prepared, WendelonResponse::Success) {
+		return prepared;
+	}
+	state
+		.decisions
+		.as_mut()
+		.expect("checked above")
+		.conclude_reserved_for_drop(tenant, table, entry_log_index)
+		.expect("every premise was checked before the fence");
+	prepared
 }
 
 fn apply_table_drop_prepare(
