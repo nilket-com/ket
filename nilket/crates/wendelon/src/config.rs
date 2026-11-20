@@ -1413,6 +1413,8 @@ impl RawConfig {
 			#[cfg(test)]
 			startup_probe: None,
 			#[cfg(test)]
+			pd_drop_admitted_for_test: false,
+			#[cfg(test)]
 			startup_fault: None,
 			#[cfg(test)]
 			test_time: None,

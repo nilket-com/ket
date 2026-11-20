@@ -21,6 +21,10 @@ pub const GENERATION_CHUNKS: usize = 256;
 /// The survivor rule this mode certifies: newest Accepted version per key,
 /// winning tombstones kept.
 pub const SURVIVOR_POLICY: u8 = 1;
+/// Wendelon ADR 0115: policy 1, except that every (tenant, table) whose drop
+/// outcome was finalized at or before the target's cut is excluded. Carried by a
+/// target iff such an outcome exists; test-admitted only until enablement.
+pub const SURVIVOR_POLICY_EXCLUDING: u8 = 2;
 pub const CHUNK_BITS: u8 = 8;
 
 /// A proposed generation, frozen when recorded.
@@ -169,7 +173,7 @@ pub(super) fn propose_target(
 		|| target.t >= log_index
 		|| target.t <= generations.fr()
 		|| target.chunk_bits != CHUNK_BITS
-		|| target.survivor_policy != SURVIVOR_POLICY
+		|| target.survivor_policy != state.survivor_policy_at(target.t)
 		|| current_members(state).as_ref() != Some(&target.members)
 	{
 		return Err(StaleGeneration);
@@ -352,7 +356,10 @@ pub(crate) fn next_target(state: &SmState, applied: u64) -> Option<Target> {
 			Some(point) => t = point.checked_sub(1)?,
 		}
 	}
-	if decisions.bodies.range(..=t).next().is_none() && decisions.noops.range(..=t).next().is_none()
+	// Something to erase, or (ADR 0115) a finalized drop no certificate excludes yet.
+	if decisions.bodies.range(..=t).next().is_none()
+		&& decisions.noops.range(..=t).next().is_none()
+		&& !state.finalized_drop_in(generations.fr(), t)
 	{
 		return None;
 	}
@@ -362,7 +369,7 @@ pub(crate) fn next_target(state: &SmState, applied: u64) -> Option<Target> {
 		predecessor_gid: generations.current_gid(),
 		members: current_members(state)?,
 		chunk_bits: CHUNK_BITS,
-		survivor_policy: SURVIVOR_POLICY,
+		survivor_policy: state.survivor_policy_at(t),
 	})
 }
 

@@ -401,6 +401,11 @@ impl std::fmt::Debug for DecisionSigningSecret {
 /// constructed programmatically in tests.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NodeBootstrapConfig {
+	/// Test-only (wendelon ADR 0115): this node's store admits the test-only
+	/// ParentDecisions drop semantics, from construction (recovery, replay and
+	/// snapshot install). Default off; production has no such field.
+	#[cfg(test)]
+	pub(crate) pd_drop_admitted_for_test: bool,
 	#[cfg(test)]
 	pub(crate) startup_probe: Option<startup_ownership_tests::StartupProbe>,
 	#[cfg(test)]
@@ -611,6 +616,8 @@ impl NodeBootstrapConfig {
 			lsm_compaction_paused: false,
 			control_retention: ControlRetention::Compacting,
 			consensus_timing: Default::default(),
+			#[cfg(test)]
+			pd_drop_admitted_for_test: false,
 			decision_mode: Default::default(),
 			decision_signing_secret: None,
 			trusted_decision_signers: BTreeMap::new(),
@@ -1012,6 +1019,17 @@ pub struct WendelonNode {
 
 /// Background task handles. Explicit shutdown aborts and joins these tasks;
 /// dropping a raw Tokio JoinHandle alone detaches its task.
+impl NodeBootstrapConfig {
+	/// Wendelon ADR 0115: the admission this node's control store is opened
+	/// with (always the default in production builds).
+	pub(crate) fn state_admission(&self) -> crate::consensus::raft_storage::StateAdmission {
+		crate::consensus::raft_storage::StateAdmission {
+			#[cfg(test)]
+			pd_drop: self.pd_drop_admitted_for_test,
+		}
+	}
+}
+
 impl NodeBootstrapConfig {
 	/// ADR 0700: selects the ParentDecisions authority for a fresh disposable
 	/// store, as `cluster.decision_authority = "parent-decisions"` does from a
@@ -2202,6 +2220,7 @@ impl WendelonNode {
 			retention.clone(),
 			owner.clone(),
 			cfg.decision_mode,
+			cfg.state_admission(),
 		)
 		.await?;
 		// Control replay is validated before it can authorize a missing-index rebuild.

@@ -77,6 +77,7 @@ impl ControlOnly {
 			retention.clone(),
 			owner.clone(),
 			cfg.decision_mode,
+			cfg.state_admission(),
 		)
 		.await
 		.unwrap();

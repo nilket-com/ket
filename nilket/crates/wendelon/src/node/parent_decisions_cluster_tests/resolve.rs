@@ -342,7 +342,7 @@ async fn a_resolve_survives_a_leader_change_and_a_restart_and_is_unavailable_wit
 }
 
 /// A second table, installed beside the fixture's.
-async fn second_table(cluster: &Cluster, leader: u32) -> TableSchemaDescriptor {
+pub(super) async fn second_table(cluster: &Cluster, leader: u32) -> TableSchemaDescriptor {
 	let other = TableSchemaDescriptor::new_with_layout(
 		TableObjectId::new([0x52; 16]),
 		SchemaGeneration::new(1).get(),

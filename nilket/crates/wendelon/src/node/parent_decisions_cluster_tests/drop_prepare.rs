@@ -1,11 +1,11 @@
 //! Wendelon ADR 0114 stage (a), the replicated control: the real
 //! `TableDropPrepare`, proposed on the leader of an in-process three-voter
-//! cluster whose every replica is admitted for the test
-//! (`admit_pd_drop_prepare_for_test`; off by default, no public route), fences
+//! cluster whose every replica is admitted from construction
+//! (`NodeBootstrapConfig::pd_drop_admitted_for_test`; off by default, no public route), fences
 //! the table and concludes a Reserved parent `Refused { TableDropped }` at the
-//! Prepare's own committed index, identically on a follower. The cluster is not
-//! restarted and installs no snapshot after admission (a machine rebuilt from
-//! its log starts unadmitted).
+//! Prepare's own committed index, identically on a follower. Admission is a
+//! construction-time input of each store, so a restart or snapshot install on
+//! the same configuration keeps it.
 
 use super::*;
 
@@ -13,14 +13,12 @@ use super::*;
 async fn a_replicated_drop_prepare_concludes_a_reserved_parent_on_every_replica() {
 	use crate::consensus::decisions::{ParentStatus, RefusalCause};
 	use crate::network::data_server::child_writes::PauseStage;
-	let (cluster, leader, descriptor) = ready().await;
-	for node in NODES {
-		cluster
-			.node(node)
-			.state_machine
-			.admit_pd_drop_prepare_for_test()
-			.await;
-	}
+	// Every replica's store is admitted from construction (wendelon ADR 0115).
+	let (cluster, leader, descriptor) = ready_with(Cluster::start_with(|_, cfg| {
+		cfg.pd_drop_admitted_for_test = true;
+		None
+	}))
+	.await;
 	// A parent kept Reserved: its coordinator pauses before Finalize.
 	let batch = named_rows(&descriptor, &[(72, "pending")]);
 	let coordinator = cluster

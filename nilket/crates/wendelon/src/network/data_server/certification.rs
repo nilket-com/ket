@@ -15,7 +15,7 @@ use crate::network::decision_proposals::MaintenanceProposals;
 use crate::storage::index::certified_base::{
 	ActivateRefusal, Activation, BaseEntry, StagedCandidate, chunk_sums,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// The pending target and the closed set's Accepted children, as recorded.
 struct Work {
@@ -480,6 +480,14 @@ impl StoreCertification<'_> {
 			.read_state(move |state| {
 				let decisions = state.decisions.as_ref()?;
 				let pending = decisions.generations().pending.clone()?;
+				// Wendelon ADR 0115: a target is reported only with the policy the
+				// outcomes at its cut require; unadmitted, an excluding target never is.
+				if pending.target.survivor_policy != state.survivor_policy_at(pending.target.t) {
+					return None;
+				}
+				let excluding = pending.target.survivor_policy
+					== crate::consensus::decisions::generations::SURVIVOR_POLICY_EXCLUDING;
+				let mut excluded: BTreeMap<(TenantId, TableObjectId), bool> = BTreeMap::new();
 				let mut children = Vec::new();
 				for body in decisions
 					.bodies()
@@ -491,6 +499,14 @@ impl StoreCertification<'_> {
 					}
 					let tenant = body.claim.key.tenant;
 					let table = super::child_writes::parent_table(body.claim.key.namespace);
+					// ADR 0115: an excluded table's children are skipped before any
+					// generation, descriptor or plan lookup (memoized per table).
+					if excluding
+						&& *excluded.entry((tenant, table)).or_insert_with(|| {
+							state.drop_excluded_at(tenant, table, pending.target.t)
+						}) {
+						continue;
+					}
 					let generation = if table == TableObjectId::DEFAULT_KV {
 						0
 					} else {
@@ -539,6 +555,9 @@ impl StoreCertification<'_> {
 		let Some(Work { pending, children }) = work else {
 			return Ok(None);
 		};
+		let exclusion = (pending.target.survivor_policy
+			== crate::consensus::decisions::generations::SURVIVOR_POLICY_EXCLUDING)
+			.then_some(pending.target.t);
 		let meta = index.base_meta().await?;
 		if meta.active_gid != pending.target.predecessor_gid {
 			return Ok(None);
@@ -553,7 +572,10 @@ impl StoreCertification<'_> {
 				// mismatch fails closed: nothing is overwritten and nothing is
 				// reported. This holds whether or not its report is recorded.
 				if built.load(std::sync::atomic::Ordering::Acquire) != gid {
-					let entries = match self.build_candidate(build, &index, &children).await {
+					let entries = match self
+						.build_candidate(build, &index, &children, exclusion)
+						.await
+					{
 						Ok(entries) => entries,
 						Err(refusal) => {
 							tracing::debug!(reason = %refusal.describe(), "a recovered candidate base is not proved");
@@ -572,7 +594,10 @@ impl StoreCertification<'_> {
 				}
 			}
 			_ => {
-				let entries = match self.build_candidate(build, &index, &children).await {
+				let entries = match self
+					.build_candidate(build, &index, &children, exclusion)
+					.await
+				{
 					Ok(entries) => entries,
 					Err(refusal) => {
 						tracing::debug!(reason = %refusal.describe(), "no candidate base for the pending generation");
@@ -668,16 +693,34 @@ impl StoreCertification<'_> {
 		build: &CandidateBuild<'_>,
 		index: &crate::storage::index::PersistentLocalIndex,
 		children: &[ClosedChild],
+		exclusion: Option<u64>,
 	) -> Result<Vec<BaseEntry>, BuildRefusal> {
 		type Slot = (TenantId, TableObjectId, [u8; 32]);
 		let storage = |error: std::io::Error| BuildRefusal::Storage(error.to_string());
 		let unproved =
 			|refusal: super::reader::ReadRefusal| BuildRefusal::Incomplete(format!("{refusal:?}"));
+		let mut inherited = index.base_entries(false).await.map_err(storage)?;
+		// Wendelon ADR 0115: an excluding target drops every inherited entry of a
+		// (tenant, table) whose drop was finalized at or before its cut: one keyed
+		// outcome lookup per distinct table in the base, never an enumeration.
+		if let Some(t) = exclusion {
+			let tables: BTreeSet<(TenantId, TableObjectId)> = inherited
+				.iter()
+				.map(|entry| (entry.tenant, entry.table))
+				.collect();
+			let excluded: BTreeSet<(TenantId, TableObjectId)> = self
+				.state_machine
+				.read_state(move |state| {
+					tables
+						.into_iter()
+						.filter(|(tenant, table)| state.drop_excluded_at(*tenant, *table, t))
+						.collect()
+				})
+				.await;
+			inherited.retain(|entry| !excluded.contains(&(entry.tenant, entry.table)));
+		}
 		// Per key: the entry, and the child it comes from (None: the base).
-		let mut winners: BTreeMap<Slot, (BaseEntry, Option<usize>)> = index
-			.base_entries(false)
-			.await
-			.map_err(storage)?
+		let mut winners: BTreeMap<Slot, (BaseEntry, Option<usize>)> = inherited
 			.into_iter()
 			.map(|entry| {
 				(

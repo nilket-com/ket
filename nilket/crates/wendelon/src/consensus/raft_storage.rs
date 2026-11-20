@@ -275,6 +275,9 @@ struct ControlArtifactPaths {
 struct WalOptions {
 	segment_bytes: u64,
 	decision_mode: DecisionMode,
+	/// Wendelon ADR 0115: the store's immutable admission, applied to and
+	/// validated on the loaded snapshot before any open-time effect.
+	admission: StateAdmission,
 }
 
 impl Default for WalOptions {
@@ -282,6 +285,7 @@ impl Default for WalOptions {
 		Self {
 			segment_bytes: DEFAULT_WAL_SEGMENT_BYTES,
 			decision_mode: DecisionMode::Today,
+			admission: StateAdmission::default(),
 		}
 	}
 }
@@ -558,6 +562,9 @@ struct TruncatePlan {
 #[derive(Clone)]
 pub struct WendelonLogStore {
 	decision_mode: DecisionMode,
+	/// Wendelon ADR 0115: the construction-time admission this store hands to the
+	/// state machine it builds (recovery, replay and snapshot install).
+	admission: StateAdmission,
 	inner: Arc<RwLock<LogStoreInner>>,
 	/// Serialises WAL submissions so append bodies and their
 	/// fsync barriers land in the intended order. `io_uring` CQE
@@ -625,6 +632,7 @@ impl WendelonLogStore {
 	pub fn in_memory() -> Self {
 		Self {
 			decision_mode: DecisionMode::Today,
+			admission: StateAdmission::default(),
 			inner: Arc::new(RwLock::new(LogStoreInner {
 				entries: BTreeMap::new(),
 				last_log_id: None,
@@ -747,6 +755,7 @@ impl WendelonLogStore {
 		retention: Arc<RetentionGuard>,
 		owner: DataDirectoryOwner,
 		decision_mode: DecisionMode,
+		admission: StateAdmission,
 	) -> std::io::Result<Self> {
 		let file_ops = Arc::new(IoUringFileOps::with_isolated_blocking(
 			io,
@@ -760,6 +769,7 @@ impl WendelonLogStore {
 			file_ops,
 			WalOptions {
 				decision_mode,
+				admission,
 				..WalOptions::default()
 			},
 			Some(retention),
@@ -872,8 +882,16 @@ impl WendelonLogStore {
 			)
 			.map_err(RetentionStartError::into_io)?;
 		}
-		let snapshot =
+		let mut snapshot =
 			load_snapshot_artifact(file_ops.as_ref(), snapshot_path, options.decision_mode).await?;
+		// Wendelon ADR 0115: the loaded snapshot is assembled with this store's
+		// admission and validated before it can authorize replay, a holder
+		// completion, a tail truncation or a deferred purge.
+		if let Some(loaded) = snapshot.as_mut() {
+			options.admission.apply_to(&mut loaded.state);
+			validate_assembled_state(&loaded.state)
+				.map_err(|why| Error::new(ErrorKind::InvalidData, why))?;
+		}
 		let replay = replay_wal(
 			file_ops.as_ref(),
 			wal_path,
@@ -1017,6 +1035,7 @@ impl WendelonLogStore {
 
 		let store = Self {
 			decision_mode: options.decision_mode,
+			admission: options.admission,
 			inner: Arc::new(RwLock::new(LogStoreInner {
 				entries: replay.entries,
 				entry_positions: replay.entry_positions,
@@ -1727,6 +1746,7 @@ impl WendelonLogStore {
 			let snapshot_runtime = match (&guard.file_ops, &guard.artifact_paths) {
 				(Some(file_ops), Some(paths)) => SnapshotRuntime {
 					decision_mode: self.decision_mode,
+					admission: self.admission,
 					..SnapshotRuntime::new(
 						file_ops.clone(),
 						SnapshotPaths::from_current(paths.snapshot.clone()),
@@ -3294,6 +3314,146 @@ pub struct SmState {
 	#[cfg(test)]
 	#[serde(skip)]
 	pub pd_drop_prepare_admitted: bool,
+	/// Test-only (wendelon ADR 0115): the finalize indices of ParentDecisions
+	/// drop outcomes, kept only on an admitted state. Derived: never serialized,
+	/// maintained at the one outcome insertion helper, rebuilt from the catalog.
+	#[cfg(test)]
+	#[serde(skip)]
+	pub pd_finalize_indices: BTreeSet<u64>,
+}
+
+impl SmState {
+	/// Wendelon ADR 0114/0115: whether this state admits the test-only
+	/// ParentDecisions drop semantics. Never in a production build.
+	pub(crate) fn pd_drop_admitted(&self) -> bool {
+		#[cfg(test)]
+		{
+			self.decisions.is_some() && self.pd_drop_prepare_admitted
+		}
+		#[cfg(not(test))]
+		{
+			false
+		}
+	}
+
+	/// Wendelon ADR 0115: whether a certified generation with cut `t` excludes
+	/// `(tenant, table)`: a keyed lookup of its permanent drop outcome.
+	pub(crate) fn drop_excluded_at(
+		&self,
+		tenant_id: crate::schema::TenantId,
+		table_object_id: crate::schema::TableObjectId,
+		t: u64,
+	) -> bool {
+		self.pd_drop_admitted()
+			&& self
+				.table_drop_outcomes
+				.get(tenant_id, table_object_id)
+				.is_some_and(|outcome| outcome.finalize_log_index <= t)
+	}
+
+	/// Wendelon ADR 0115: the survivor policy a target with cut `t` must carry:
+	/// the excluding policy iff some drop outcome was finalized at or before `t`.
+	/// Reads the admission flag and the derived index only (the index is filled
+	/// only on an admitted ParentDecisions state), so it holds while the reducer
+	/// has the decision state detached for a decision command.
+	pub(crate) fn survivor_policy_at(&self, t: u64) -> u8 {
+		#[cfg(test)]
+		if self.pd_drop_prepare_admitted && self.pd_finalize_indices.range(..=t).next().is_some() {
+			return crate::consensus::decisions::generations::SURVIVOR_POLICY_EXCLUDING;
+		}
+		let _ = t;
+		crate::consensus::decisions::generations::SURVIVOR_POLICY
+	}
+
+	/// Wendelon ADR 0115: whether a drop was finalized in `(after, through]`: the
+	/// idle trigger's existence query.
+	pub(crate) fn finalized_drop_in(&self, after: u64, through: u64) -> bool {
+		#[cfg(test)]
+		if self.pd_drop_prepare_admitted && after < through {
+			return self
+				.pd_finalize_indices
+				.range(after + 1..=through)
+				.next()
+				.is_some();
+		}
+		let _ = (after, through);
+		false
+	}
+
+	/// Wendelon ADR 0115 (test-only): the derived index rebuilt from the
+	/// permanent catalog by the same rule as its incremental maintenance.
+	#[cfg(test)]
+	pub(crate) fn derived_pd_finalize_indices(&self) -> BTreeSet<u64> {
+		if self.pd_drop_admitted() {
+			self.table_drop_outcomes
+				.iter()
+				.map(|outcome| outcome.finalize_log_index)
+				.collect()
+		} else {
+			BTreeSet::new()
+		}
+	}
+}
+
+/// Wendelon ADR 0115: the one outcome insertion boundary, used by both
+/// LogicalFinalize and the legacy Finalize. An admitted ParentDecisions state
+/// also notes the finalize index in its derived index.
+fn record_table_drop_outcome(state: &mut SmState, outcome: crate::schema::TableDropOutcome) {
+	state.table_drop_outcomes.insert_validated(outcome);
+	#[cfg(test)]
+	if state.pd_drop_admitted() {
+		state.pd_finalize_indices.insert(outcome.finalize_log_index);
+	}
+}
+
+/// Wendelon ADR 0115: a store's construction-time admission of the test-only
+/// ParentDecisions drop semantics. Zero-sized in production builds; a test sets
+/// it in a node's configuration, and the durable open receives it, so it holds
+/// from the snapshot load through replay, recovery and every later install.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct StateAdmission {
+	#[cfg(test)]
+	pub(crate) pd_drop: bool,
+}
+
+impl StateAdmission {
+	/// Applies this admission to a state before it is validated, replayed or
+	/// published, and rebuilds the admitted-only derived index.
+	pub(crate) fn apply_to(self, state: &mut SmState) {
+		#[cfg(test)]
+		{
+			state.pd_drop_prepare_admitted = self.pd_drop;
+			state.pd_finalize_indices = state.derived_pd_finalize_indices();
+		}
+		let _ = state;
+	}
+}
+
+/// Wendelon ADR 0115: validation of an assembled state (decision envelope and
+/// state machine together), with its admission applied, before it is replayed
+/// or published. A pending target must carry exactly the policy the outcomes at
+/// its cut require: the digest binds cut and policy, and the shared, immutable
+/// outcome history determines the excluded set. Unadmitted, any excluding target
+/// fails.
+pub(crate) fn validate_assembled_state(state: &SmState) -> Result<(), String> {
+	if let Some(pending) = state
+		.decisions
+		.as_ref()
+		.and_then(|decisions| decisions.generations().pending.as_ref())
+	{
+		let expected = state.survivor_policy_at(pending.target.t);
+		if pending.target.survivor_policy != expected {
+			return Err(format!(
+				"a pending generation carries survivor policy {} where its cut requires {expected}",
+				pending.target.survivor_policy
+			));
+		}
+	}
+	#[cfg(test)]
+	if state.pd_finalize_indices != state.derived_pd_finalize_indices() {
+		return Err("the finalized-drop index does not match the outcomes".into());
+	}
+	Ok(())
 }
 
 impl SmState {
@@ -3968,6 +4128,8 @@ impl SnapshotPaths {
 #[derive(Clone)]
 struct SnapshotRuntime {
 	decision_mode: DecisionMode,
+	/// Wendelon ADR 0115: this store's construction-time admission.
+	admission: StateAdmission,
 	file_ops: Arc<dyn AsyncFileOps>,
 	paths: SnapshotPaths,
 	/// The one authority over which artifact `current` names; shared with the log store.
@@ -3998,6 +4160,7 @@ impl SnapshotRuntime {
 	) -> Self {
 		Self {
 			decision_mode: DecisionMode::Today,
+			admission: StateAdmission::default(),
 			file_ops,
 			paths,
 			publication,
@@ -4462,6 +4625,7 @@ struct SmInner {
 /// refused: never a state with its base missing.
 fn recover_sm_inner(
 	decision_mode: DecisionMode,
+	admission: StateAdmission,
 	snapshot: Option<LoadedSnapshot>,
 	entries: Vec<Entry<WendelonTypeConfig>>,
 	checkpoint: Option<RecoveryCheckpoint>,
@@ -4516,6 +4680,11 @@ fn recover_sm_inner(
 		Exhausted,
 	}
 	let successor = |index: u64| index.checked_add(1).map_or(Next::Exhausted, Next::At);
+	// Wendelon ADR 0115: the store's admission reaches the recovered state, and
+	// the assembled state is validated, before the first replayed command.
+	admission.apply_to(&mut inner.state);
+	validate_assembled_state(&inner.state)
+		.map_err(|why| Error::new(ErrorKind::InvalidData, why))?;
 	let mut expected = snapshot_boundary.map_or(Next::Genesis, successor);
 	let mut last_replayed = snapshot_boundary;
 	for entry in entries {
@@ -4576,11 +4745,6 @@ struct ControlRestoreReplay {
 
 #[derive(Clone)]
 pub struct WendelonStateMachine {
-	/// Test-only (wendelon ADR 0114 stage (a)): this machine admits a
-	/// ParentDecisions drop Prepare. Configured per machine by a test, applied to
-	/// its current state and to any snapshot state it installs; off by default.
-	#[cfg(test)]
-	pd_drop_prepare_admitted: Arc<std::sync::atomic::AtomicBool>,
 	/// Bootstrap-only receipt minted after owner-bound input parsing and replay.
 	restore_replay: Option<ControlRestoreReplay>,
 	inner: Arc<RwLock<SmInner>>,
@@ -4620,6 +4784,15 @@ impl WendelonStateMachine {
 	#[cfg(test)]
 	pub(crate) async fn seed_complete_snapshot_state_for_test(&self, state: SmState) {
 		self.inner.write().await.state = state;
+	}
+
+	/// Test-only (wendelon ADR 0115): applies `admission` to this machine's
+	/// current state in place, under one write guard, so it is serialized with
+	/// apply; a member-side control uses it. The store's open-time admission
+	/// (its immutable configuration) is unchanged.
+	#[cfg(test)]
+	pub(crate) async fn apply_state_admission_for_test(&self, admission: StateAdmission) {
+		admission.apply_to(&mut self.inner.write().await.state);
 	}
 
 	/// Runs `hook` once on this state machine: right after its next installed
@@ -4668,8 +4841,6 @@ impl WendelonStateMachine {
 		let (finalization_events, _) = broadcast::channel(FINALIZATION_BROADCAST_CAPACITY);
 		Self {
 			inner: Arc::new(RwLock::new(SmInner::default())),
-			#[cfg(test)]
-			pd_drop_prepare_admitted: Default::default(),
 			mutation_drain: MutationDrainRegistry::fresh_reconciled(),
 			snapshot_runtime: SnapshotRuntime::ephemeral(),
 			admission_snapshot,
@@ -4715,6 +4886,7 @@ impl WendelonStateMachine {
 		let (finalization_events, _) = broadcast::channel(FINALIZATION_BROADCAST_CAPACITY);
 		let inner = recover_sm_inner(
 			snapshot_runtime.decision_mode,
+			snapshot_runtime.admission,
 			snapshot,
 			entries,
 			checkpoint,
@@ -4747,8 +4919,6 @@ impl WendelonStateMachine {
 		observability_metrics.set_drop_reclaim_debts(inner.state.table_drop_reclaim_debts.len());
 		Ok(Self {
 			inner: Arc::new(RwLock::new(inner)),
-			#[cfg(test)]
-			pd_drop_prepare_admitted: Default::default(),
 			mutation_drain,
 			snapshot_runtime,
 			admission_snapshot,
@@ -4816,17 +4986,6 @@ impl WendelonStateMachine {
 
 	/// Attaches the node's Control retention guard. Without one the state
 	/// machine and its snapshot builder behave as `Compacting`.
-	/// Test-only (wendelon ADR 0114 stage (a)): admits a ParentDecisions drop
-	/// Prepare on this machine, for its current state and any snapshot state it
-	/// installs. A test configures every replica of its cluster the same way
-	/// before proposing; a machine rebuilt from its log (a restart) starts off.
-	#[cfg(test)]
-	pub(crate) async fn admit_pd_drop_prepare_for_test(&self) {
-		self.pd_drop_prepare_admitted
-			.store(true, std::sync::atomic::Ordering::Release);
-		self.inner.write().await.state.pd_drop_prepare_admitted = true;
-	}
-
 	pub fn with_retention_guard(mut self, retention: Arc<RetentionGuard>) -> Self {
 		self.retention = Some(retention);
 		self
@@ -5558,6 +5717,12 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 		.map_err(|err| {
 			StorageIOError::read_snapshot(Some(meta.signature()), AnyError::new(&err))
 		})?;
+		// Wendelon ADR 0115: the machine's construction-time admission reaches the
+		// assembled state, which is validated here, before anything is published.
+		self.snapshot_runtime.admission.apply_to(&mut state);
+		validate_assembled_state(&state).map_err(|why| {
+			StorageIOError::read_snapshot(Some(meta.signature()), AnyError::error(why))
+		})?;
 		validate_snapshot_header_log_coordinates(&header, state.last_applied_log_id).map_err(
 			|err| {
 				StorageIOError::read_snapshot(
@@ -5652,14 +5817,6 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 		let pending_checkpoint = {
 			let mut guard = self.inner.write().await;
 			state.last_applied_log_id = meta.last_log_id;
-			// Wendelon ADR 0114 stage (a), test-only: this machine's admission is
-			// configured on the machine, not serialized, so an installed state takes it.
-			#[cfg(test)]
-			{
-				state.pd_drop_prepare_admitted = self
-					.pd_drop_prepare_admitted
-					.load(std::sync::atomic::Ordering::Acquire);
-			}
 			state.last_membership = meta.last_membership.clone();
 			let drained: Result<(), StorageError<u32>> = (|| {
 				for fence in state.table_drop_fences.iter() {
@@ -8512,7 +8669,7 @@ fn apply_table_drop_finalize(
 	// Every fallible check is complete. The remaining mutations cannot reject,
 	// so a failed finalize leaves the state byte-for-byte unchanged.
 	state.table_drop_fences.remove_validated(operation_id);
-	state.table_drop_outcomes.insert_validated(outcome);
+	record_table_drop_outcome(state, outcome);
 	state
 		.table_lifecycle
 		.remove(operation_id.tenant_id, operation_id.table_object_id);
@@ -8618,7 +8775,7 @@ fn apply_table_drop_logical_finalize(
 	state.table_drop_fences.remove_validated(operation_id);
 	state.table_drop_tombstones.insert_validated(tombstone);
 	state.table_drop_reclaim_debts.insert_validated(debt);
-	state.table_drop_outcomes.insert_validated(outcome);
+	record_table_drop_outcome(state, outcome);
 	state
 		.table_lifecycle
 		.remove(operation_id.tenant_id, operation_id.table_object_id);
@@ -10136,6 +10293,7 @@ fn replay_exported_control_state(wal: &[u8], snapshot_bytes: &[u8]) -> std::io::
 	resolve_recovered_committed(snapshot.as_ref(), &replay.entries, replay.checkpoint)?;
 	Ok(recover_sm_inner(
 		DecisionMode::Today,
+		StateAdmission::default(),
 		snapshot,
 		replay.entries.into_values().collect(),
 		replay.checkpoint,
@@ -16229,7 +16387,14 @@ mod recovery_tests {
 		use DecisionMode::Today;
 		let base = || Some(loaded_at(state_through_two(), Some(log_id(1, 2))));
 		let replay = |entries: Vec<Entry<WendelonTypeConfig>>, checkpoint, legacy| {
-			recover_sm_inner(Today, base(), entries, checkpoint, legacy)
+			recover_sm_inner(
+				Today,
+				StateAdmission::default(),
+				base(),
+				entries,
+				checkpoint,
+				legacy,
+			)
 		};
 		// A covered prefix is retained (indices 1, 2), the second one differing from what
 		// the snapshot holds: it must not be applied.
@@ -16286,8 +16451,16 @@ mod recovery_tests {
 				.map(|i| lease_entry(i, 10 * i, 10 * i + 9, 3))
 				.collect::<Vec<_>>()
 		};
-		let none =
-			|entries, legacy| recover_sm_inner(Today, None, entries, checkpoint_at(8), legacy);
+		let none = |entries, legacy| {
+			recover_sm_inner(
+				Today,
+				StateAdmission::default(),
+				None,
+				entries,
+				checkpoint_at(8),
+				legacy,
+			)
+		};
 		assert!(
 			none(from(7), false).is_err(),
 			"a mid-log start without a snapshot"
@@ -16299,6 +16472,7 @@ mod recovery_tests {
 		);
 		let genesis = recover_sm_inner(
 			Today,
+			StateAdmission::default(),
 			None,
 			(1..=3)
 				.map(|i| lease_entry(i, 10 * i, 10 * i + 9, 3))
@@ -16311,6 +16485,7 @@ mod recovery_tests {
 		// An empty-state artifact (Artifact(None)) is a base too: a tail from 1 replays.
 		let empty = recover_sm_inner(
 			Today,
+			StateAdmission::default(),
 			Some(loaded_at(SmState::default(), None)),
 			(1..=2)
 				.map(|i| lease_entry(i, 10 * i, 10 * i + 9, 3))
@@ -16337,6 +16512,7 @@ mod recovery_tests {
 		state.last_applied_log_id = Some(terminal);
 		let inner = recover_sm_inner(
 			Today,
+			StateAdmission::default(),
 			Some(loaded_at(state, Some(terminal))),
 			Vec::new(),
 			checkpoint_at(u64::MAX),
@@ -16346,6 +16522,7 @@ mod recovery_tests {
 		assert_eq!(inner.state.last_applied_log_id, Some(terminal));
 		let inner = recover_sm_inner(
 			Today,
+			StateAdmission::default(),
 			None,
 			vec![blank(u64::MAX)],
 			checkpoint_at(u64::MAX),
@@ -16355,6 +16532,7 @@ mod recovery_tests {
 		assert_eq!(inner.state.last_applied_log_id, Some(terminal));
 		let wrapped = recover_sm_inner(
 			Today,
+			StateAdmission::default(),
 			None,
 			vec![blank(u64::MAX), blank(0)],
 			checkpoint_at(u64::MAX),

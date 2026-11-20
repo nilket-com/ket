@@ -538,6 +538,11 @@ impl TableDropFenceCatalog {
 }
 
 impl TableDropOutcomeCatalog {
+	/// Every recorded outcome (wendelon ADR 0115 rebuilds its derived index).
+	pub fn iter(&self) -> impl Iterator<Item = &TableDropOutcome> {
+		self.by_id.values()
+	}
+
 	pub fn get(
 		&self,
 		tenant_id: TenantId,

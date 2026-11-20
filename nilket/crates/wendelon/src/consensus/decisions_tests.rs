@@ -6879,3 +6879,283 @@ fn a_replayed_drop_prepare_concludes_nothing_new() {
 	assert_eq!(status_of(&state, reservation), status);
 	assert_eq!(decisions(&state).live, live - 1, "decremented once");
 }
+
+// ============================================================
+//  WENDELON ADR 0115: A CERTIFIED GENERATION EXCLUDES A DROPPED TABLE
+// ============================================================
+
+/// Admits, prepares and logically finalizes the fixture table's drop; returns
+/// the finalize index F.
+fn finalize_fixture_drop(state: &mut SmState) -> u64 {
+	state.pd_drop_prepare_admitted = true;
+	let fence = peek_index();
+	let prepared = apply_next(state, drop_prepare_expecting(1));
+	assert!(
+		matches!(prepared, WendelonResponse::Success),
+		"{prepared:?}"
+	);
+	let finalize = peek_index();
+	let finalized = apply_next(
+		state,
+		WendelonRequest::TableDropLogicalFinalize(
+			crate::consensus::TableDropLogicalFinalizeRequest {
+				operation_id: crate::integration::compute::DropOperationId {
+					tenant_id: TENANT,
+					table_object_id: TABLE,
+					schema_generation: crate::integration::compute::SchemaGeneration::new(1),
+				},
+				fence_log_index: fence,
+			},
+		),
+	);
+	assert!(
+		matches!(finalized, WendelonResponse::Success),
+		"{finalized:?}"
+	);
+	finalize
+}
+
+/// The idle trigger: a finalized drop with nothing else to erase proposes an
+/// excluding target (policy 2) once an entry after F is applied, and the cut
+/// reaches F. RED on `ff9cdeb7f`: `next_target` is `None` forever.
+#[test]
+fn an_idle_finalized_drop_proposes_an_excluding_generation() {
+	let mut state = base(3);
+	grant_all(&mut state);
+	let finalize = finalize_fixture_drop(&mut state);
+	// Nothing applied after F yet: no cut can reach F.
+	assert_eq!(
+		generations::next_target(&state, finalize).map(|target| target.t),
+		None,
+		"no entry after F"
+	);
+	// The strictly advancing floor supplies the entry after F.
+	decide(
+		&mut state,
+		DecisionCommand::AdvanceFloor {
+			floor_ms: T0,
+			stamp_ms: T0 + DECISION_EXPIRY_MS,
+		},
+	);
+	let applied = peek_index() - 1;
+	let target = generations::next_target(&state, applied).expect("an excluding target");
+	assert!(target.t >= finalize, "t {} reaches F {finalize}", target.t);
+	assert_eq!(target.survivor_policy, 2, "the excluding policy");
+}
+
+/// Registers a second table `id` (generation 1) under `tenant`.
+fn register_table(
+	state: &mut SmState,
+	tenant: TenantId,
+	id: crate::schema::TableObjectId,
+	name: &str,
+) {
+	use arrow::datatypes::{DataType, Field, Schema};
+	let descriptor = crate::schema::TableSchemaDescriptor::new_with_layout(
+		id,
+		1,
+		"fixture",
+		name,
+		&Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("v", DataType::Utf8, true),
+		]),
+		crate::schema::RowIdentityPolicy::PrimaryKey(crate::schema::PrimaryKeyDescriptor::single(
+			"id",
+		)),
+		crate::schema::LocalityPolicy::IdentityProjection,
+		crate::schema::RecordLayoutPolicy::SingleRow,
+		crate::schema::SchemaEvolutionPolicy::AdditiveOnly,
+	)
+	.unwrap();
+	state.table_schemas.upsert(tenant, descriptor).unwrap();
+}
+
+/// Prepares and logically finalizes the drop of `table` (generation 1) under
+/// TENANT on an admitted state; returns its finalize index.
+pub(crate) fn finalize_drop_of(state: &mut SmState, table: crate::schema::TableObjectId) -> u64 {
+	state.pd_drop_prepare_admitted = true;
+	let id = crate::integration::compute::DropOperationId {
+		tenant_id: TENANT,
+		table_object_id: table,
+		schema_generation: crate::integration::compute::SchemaGeneration::new(1),
+	};
+	let fence = peek_index();
+	let prepared = apply_next(
+		state,
+		WendelonRequest::TableDropPrepare(crate::consensus::TableDropPrepareRequest::current(
+			id,
+			id.schema_generation,
+		)),
+	);
+	assert!(
+		matches!(prepared, WendelonResponse::Success),
+		"{prepared:?}"
+	);
+	let finalize = peek_index();
+	let finalized = apply_next(
+		state,
+		WendelonRequest::TableDropLogicalFinalize(
+			crate::consensus::TableDropLogicalFinalizeRequest {
+				operation_id: id,
+				fence_log_index: fence,
+			},
+		),
+	);
+	assert!(
+		matches!(finalized, WendelonResponse::Success),
+		"{finalized:?}"
+	);
+	finalize
+}
+
+/// The cumulative filter versus the trigger: with two drops F1 < F2, a cut
+/// between them excludes only the first (policy 2 already), even though both
+/// outcomes are applied; a cut at or past F2 excludes both. A fresh id and the
+/// same id under another tenant are never excluded.
+#[test]
+fn a_cut_between_two_drops_excludes_only_the_first() {
+	let mut state = base(3);
+	grant_all(&mut state);
+	let second = crate::schema::TableObjectId::new([0x6e; 16]);
+	register_table(&mut state, TENANT, second, "second");
+	let f1 = finalize_drop_of(&mut state, TABLE);
+	let f2 = finalize_drop_of(&mut state, second);
+	assert!(f1 < f2);
+	let between = f2 - 1;
+	assert!(state.drop_excluded_at(TENANT, TABLE, between));
+	assert!(
+		!state.drop_excluded_at(TENANT, second, between),
+		"F2 is past the cut"
+	);
+	assert_eq!(
+		state.survivor_policy_at(between),
+		2,
+		"policy 2 already, because of F1"
+	);
+	assert_eq!(state.survivor_policy_at(f1 - 1), 1, "before F1: policy 1");
+	assert!(state.drop_excluded_at(TENANT, second, f2));
+	// Never excluded: a fresh id, and the same id under another tenant.
+	assert!(!state.drop_excluded_at(TENANT, crate::schema::TableObjectId::new([0x7e; 16]), f2));
+	assert!(!state.drop_excluded_at(TenantId(8), TABLE, f2));
+	// The trigger is an existence query on (fr, t].
+	assert!(state.finalized_drop_in(0, f1));
+	assert!(!state.finalized_drop_in(f2, f2 + 10));
+}
+
+/// The derived index: kept only on an admitted state, by the one insertion
+/// boundary, equal to its rebuild from the catalog; unadmitted it is empty.
+#[test]
+fn the_finalized_drop_index_is_admitted_only_and_matches_its_rebuild() {
+	let mut state = base(3);
+	grant_all(&mut state);
+	let f = finalize_drop_of(&mut state, TABLE);
+	assert_eq!(
+		state.pd_finalize_indices,
+		std::collections::BTreeSet::from([f])
+	);
+	assert_eq!(
+		state.pd_finalize_indices,
+		state.derived_pd_finalize_indices()
+	);
+	crate::consensus::raft_storage::validate_assembled_state(&state).unwrap();
+	// Unadmitted, the same state holds no index and needs no work.
+	crate::consensus::raft_storage::StateAdmission::default().apply_to(&mut state);
+	assert!(state.pd_finalize_indices.is_empty());
+	assert_eq!(state.survivor_policy_at(f), 1);
+	assert!(!state.finalized_drop_in(0, f));
+}
+
+/// Unadmitted, a state holding a finalized drop outcome behaves as production:
+/// the trigger is quiet, policy 1 is required at every cut, and an excluding
+/// target is refused; the same target is accepted on the admitted state.
+#[test]
+fn an_unadmitted_state_refuses_an_excluding_target() {
+	let mut admitted = base(3);
+	grant_all(&mut admitted);
+	let f = finalize_fixture_drop(&mut admitted);
+	decide(
+		&mut admitted,
+		DecisionCommand::AdvanceFloor {
+			floor_ms: T0,
+			stamp_ms: T0 + DECISION_EXPIRY_MS,
+		},
+	);
+	let applied = peek_index() - 1;
+	let target = generations::next_target(&admitted, applied).unwrap();
+	assert_eq!(target.survivor_policy, 2);
+	assert!(target.t >= f);
+
+	let mut unadmitted = admitted.clone();
+	crate::consensus::raft_storage::StateAdmission::default().apply_to(&mut unadmitted);
+	assert!(
+		unadmitted.pd_finalize_indices.is_empty(),
+		"no index unadmitted"
+	);
+	assert_eq!(unadmitted.survivor_policy_at(target.t), 1);
+	assert_eq!(
+		generations::next_target(&unadmitted, applied),
+		None,
+		"quiet"
+	);
+	assert_eq!(
+		decide(
+			&mut unadmitted,
+			DecisionCommand::ProposeTarget {
+				target: target.clone()
+			}
+		),
+		refused(DecisionRefusal::StaleGeneration)
+	);
+	assert!(
+		unadmitted
+			.decisions
+			.as_ref()
+			.unwrap()
+			.generations()
+			.pending
+			.is_none()
+	);
+
+	decide(&mut admitted, DecisionCommand::ProposeTarget { target });
+	assert!(
+		admitted
+			.decisions
+			.as_ref()
+			.unwrap()
+			.generations()
+			.pending
+			.is_some()
+	);
+}
+
+/// A Today state (no decision envelope) holds no finalized-drop index even
+/// when its store is admitted: the admission is ParentDecisions-only.
+#[test]
+fn a_today_state_holds_no_finalized_drop_index() {
+	let mut state = base(3);
+	grant_all(&mut state);
+	let f = finalize_fixture_drop(&mut state);
+	state.decisions = None;
+	crate::consensus::raft_storage::StateAdmission { pd_drop: true }.apply_to(&mut state);
+	assert!(state.pd_finalize_indices.is_empty());
+	assert!(!state.pd_drop_admitted());
+	assert_eq!(state.survivor_policy_at(f), 1);
+	crate::consensus::raft_storage::validate_assembled_state(&state).unwrap();
+}
+
+/// Assembled-state validation fails closed when an admitted state's index
+/// disagrees with its outcome catalog, either way.
+#[test]
+fn validation_fails_closed_on_a_finalized_drop_index_that_disagrees() {
+	let mut state = base(3);
+	grant_all(&mut state);
+	let f = finalize_fixture_drop(&mut state);
+	crate::consensus::raft_storage::validate_assembled_state(&state).unwrap();
+	let mut missing = state.clone();
+	missing.pd_finalize_indices.clear();
+	assert!(crate::consensus::raft_storage::validate_assembled_state(&missing).is_err());
+	let mut extra = state;
+	extra.pd_finalize_indices.insert(f + 1);
+	assert!(crate::consensus::raft_storage::validate_assembled_state(&extra).is_err());
+}
