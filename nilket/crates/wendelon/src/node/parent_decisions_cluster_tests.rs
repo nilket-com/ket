@@ -6797,6 +6797,8 @@ mod raft_admission;
 #[path = "parent_decisions_cluster_tests/write_deadline.rs"]
 mod write_deadline;
 
+#[path = "parent_decisions_cluster_tests/append_only.rs"]
+mod append_only;
 #[path = "parent_decisions_cluster_tests/attempt_exhaustion.rs"]
 mod attempt_exhaustion;
 #[path = "parent_decisions_cluster_tests/crossgen.rs"]

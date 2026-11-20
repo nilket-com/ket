@@ -118,6 +118,34 @@ fn a_new_mode_snapshot_is_refused_by_today_before_its_body_is_trusted() {
 	assert!(error.contains("newer than this build accepts"), "{error}");
 }
 
+/// Wendelon ADR 0119 D6: a ParentDecisions build refuses a ParentDecisions
+/// snapshot of the previous format (31, ADR 0118's) and of a later one before
+/// its body is trusted; snapshot install decodes through this same reader
+/// (`decode_snapshot_file`), so an install of either is refused before anything
+/// is published.
+#[test]
+fn a_parent_decisions_snapshot_of_another_format_is_refused_before_its_body_is_trusted() {
+	let new = DecisionMode::ParentDecisions;
+	assert_eq!(new.snapshot_format(), 32);
+	let state = SmState {
+		decisions: Some(Default::default()),
+		..SmState::default()
+	};
+	let body = encode_state_body(new, &state).unwrap();
+	for format in [new.snapshot_format() - 1, new.snapshot_format() + 1] {
+		let header = SnapshotHeader {
+			state_sha256: control_artifact_digest_32(&body),
+			..snapshot_header_template_as(&state, format)
+		};
+		let mut bytes = bytemuck::bytes_of(&header).to_vec();
+		bytes.extend_from_slice(&body);
+		assert!(
+			decode_snapshot_reader_as(new, bytes.as_slice()).is_err(),
+			"format {format}"
+		);
+	}
+}
+
 #[tokio::test]
 async fn a_store_refuses_the_other_authority_and_is_left_unchanged() {
 	let today = DecisionMode::Today;
@@ -219,6 +247,10 @@ async fn a_new_mode_store_writes_its_own_format_and_reopens() {
 
 use crate::consensus::decisions::tests as fixture;
 
+const PARENT_DECISIONS_V32_MANIFEST: &str =
+	include_str!("../../../tests/fixtures/consensus_body/parent_decisions_v32.txt");
+/// Wendelon ADR 0118's format-31 bodies, retained. Wendelon ADR 0119 moved and
+/// added none.
 const PARENT_DECISIONS_V31_MANIFEST: &str =
 	include_str!("../../../tests/fixtures/consensus_body/parent_decisions_v31.txt");
 /// Wendelon ADR 0113 to ADR 0117's format-30 bodies, retained. Wendelon ADR 0118
@@ -298,7 +330,7 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 fn manifest() -> BTreeMap<String, String> {
-	parse(PARENT_DECISIONS_V31_MANIFEST)
+	parse(PARENT_DECISIONS_V32_MANIFEST)
 }
 
 /// ADR 0725: the three owner-signed operation kinds pinned in the format-18
@@ -467,7 +499,7 @@ fn entry(index: u64, request: WendelonRequest) -> Entry<WendelonTypeConfig> {
 }
 
 #[test]
-fn the_format_31_bodies_match_their_goldens_and_round_trip() {
+fn the_format_32_bodies_match_their_goldens_and_round_trip() {
 	let stored = manifest();
 	let state = golden_state();
 	let body = encode_state_body(DecisionMode::ParentDecisions, &state).unwrap();
@@ -705,7 +737,7 @@ fn the_format_31_bodies_match_their_goldens_and_round_trip() {
 		.collect();
 	assert!(
 		moved.is_empty(),
-		"format-31 bodies moved or are missing; expected lines:\n{}",
+		"format-32 bodies moved or are missing; expected lines:\n{}",
 		moved.join("\n")
 	);
 	assert_eq!(stored.len(), actual.len());
@@ -719,6 +751,8 @@ fn the_format_31_bodies_match_their_goldens_and_round_trip() {
 	// only the decision state differs from the format-16 corpus: by exactly the
 	// appended seal.
 	assert!(decisions.sealed().is_some());
+	// Wendelon ADR 0119: the format-31 corpus, byte for byte.
+	assert_eq!(stored, parse(PARENT_DECISIONS_V31_MANIFEST));
 	// Wendelon ADR 0118: against the format-30 corpus no body moved; a parent
 	// refused by its table's drop was added.
 	const ADDED_0118: [&str; 1] = ["parent_refused_table_dropped"];

@@ -10,7 +10,7 @@
 //! COMMITTED, and only a recorded Refused answers WRITE_REFUSED and
 //! KNOWN_NOT_COMMITTED (ADR 0732): a refusal is never labelled success.
 
-use super::child_writes::{ChildWriteMeta, child_request_meta, child_versions};
+use super::child_writes::{ChildWriteMeta, child_request_meta};
 use super::write_deadline::{
 	AttemptGate, EarlyAnswer, EarlyTableWriteAnswer, OwnedAttempt, answer_by_deadline,
 };
@@ -267,8 +267,14 @@ pub(super) fn build_claim(
 			commit_hlc,
 		)
 		.map_err(|_| Settled::Refused(WriteStatus::INTERNAL_ERROR))?;
-		let (_, manifest) = child_versions(&request, &sub, descriptor, commit_hlc)
-			.map_err(|_| Settled::Refused(WriteStatus::INTERNAL_ERROR))?;
+		let (_, manifest) = super::child_writes::child_versions_keyed(
+			&request,
+			&sub,
+			descriptor,
+			commit_hlc,
+			super::child_writes::RowKeys::of_request(descriptor, &rows),
+		)
+		.map_err(|_| Settled::Refused(WriteStatus::INTERNAL_ERROR))?;
 		if rows.contains(&0) {
 			coordinator = Some(children.len() as u16);
 		}
@@ -570,17 +576,23 @@ impl WendelonDataServer {
 		else {
 			return Settled::Refused(WriteStatus::INTERNAL_ERROR);
 		};
-		let Ok((_, manifest)) = child_versions(&probe, batch, &descriptor, meta.client_hlc) else {
-			return Settled::Refused(WriteStatus::INTERNAL_ERROR);
-		};
-		let digest = request_digest(tenant, &descriptor, &manifest);
-		let Ok(admission) = validate_table_write_request_batch(
+		// Wendelon ADR 0119: an append-only table's rows are keyed by their
+		// ordinals in this request.
+		let ordinals: Vec<u32> = (0..batch.num_rows()).map(|row| row as u32).collect();
+		let keys = super::child_writes::RowKeys::of_request(&descriptor, &ordinals);
+		let Ok((_, manifest)) = super::child_writes::child_versions_keyed(
 			&probe,
 			batch,
 			&descriptor,
-			super::child_writes::writer_of(meta.client_hlc),
 			meta.client_hlc,
+			keys,
 		) else {
+			return Settled::Refused(WriteStatus::INTERNAL_ERROR);
+		};
+		let digest = request_digest(tenant, &descriptor, &manifest);
+		let Ok(admission) =
+			super::child_writes::keyed_admission(&probe, batch, &descriptor, meta.client_hlc, keys)
+		else {
 			return Settled::Refused(WriteStatus::INTERNAL_ERROR);
 		};
 		let Ok(positions) = admission
@@ -733,6 +745,12 @@ impl WendelonDataServer {
 							return settled;
 						}
 					};
+					// Wendelon ADR 0119 D5: before any reservation, every child's
+					// sections fit their frame bound; an oversize write is refused
+					// whole, with nothing reserved.
+					if !child_sections_fit(&built, &descriptor, batch, positions) {
+						return Settled::Refused(WriteStatus::PAYLOAD_TOO_LARGE);
+					}
 					let reserve = ForwardedDecision::Reserve {
 						claim: crate::consensus::decisions::evidence::sign(
 							&signer.key,
@@ -861,13 +879,33 @@ impl WendelonDataServer {
 				claim_digest: digest,
 				schema_generation: descriptor.schema_generation,
 			};
+			// Wendelon ADR 0119 D5: an append-only write's child carries its rows'
+			// original ordinals, in the frame's trailing section; a delete child
+			// names its rows by identity and carries none.
+			let trailing = Arc::new(
+				if claim.operation == crate::consensus::decisions::Operation::Write
+					&& matches!(
+						descriptor.row_identity_policy,
+						crate::schema::RowIdentityPolicy::AppendOnly
+					) {
+					super::child_writes::encode_ordinals(rows)
+				} else {
+					Vec::new()
+				},
+			);
 			if child.holder.node == self.local_node.id {
 				acks.extend(
-					self.holder_write(self.local_node.id, meta, sub, Arc::new(rows_bytes))
-						.await,
+					self.holder_write(
+						self.local_node.id,
+						meta,
+						sub,
+						Arc::new(rows_bytes),
+						trailing,
+					)
+					.await,
 				);
 			} else if let Ok(meta_bytes) = postcard::to_stdvec(&meta) {
-				let response = super::child_writes::send_child_frame(
+				let response = super::child_writes::send_child_frame_with_trailing(
 					self.factory.clone(),
 					self.pool.clone(),
 					NodeId {
@@ -877,6 +915,7 @@ impl WendelonDataServer {
 					super::child_writes::ChildRpc::Write,
 					meta_bytes,
 					Arc::new(rows_bytes),
+					trailing,
 				)
 				.await;
 				match response {
@@ -1028,3 +1067,52 @@ impl WendelonDataServer {
 #[cfg(test)]
 #[path = "coordinator/tests.rs"]
 mod tests;
+
+/// Wendelon ADR 0119 D5: whether every child of an append-only write fits the
+/// frame's per-section bound ([`crate::network::core::MAX_SECTION_BYTES`]), on
+/// the write and on a repair answer, before the claim is reserved. The write
+/// frame carries the child's rows (encoded once here, as they will be sent) and
+/// its ordinals (4 bytes each). A repair answer carries the same rows, as the
+/// server concatenates them from storage, and their identities (32 bytes each);
+/// its rows are bounded by [`super::child_writes::repair_rows_bound`] (flat
+/// columns only, which `keyed_admission` requires). Any other table: `true`, its
+/// contract unchanged.
+pub(super) fn child_sections_fit(
+	claim: &Claim,
+	descriptor: &TableSchemaDescriptor,
+	batch: &RecordBatch,
+	positions: &[u64],
+) -> bool {
+	if !matches!(
+		descriptor.row_identity_policy,
+		crate::schema::RowIdentityPolicy::AppendOnly
+	) {
+		return true;
+	}
+	let bound = crate::network::core::MAX_SECTION_BYTES as usize;
+	let Some(child_rows) = rows_of_claim(claim, positions) else {
+		return false;
+	};
+	child_rows.iter().all(|rows| {
+		let Ok(sub) = arrow::compute::take_record_batch(
+			batch,
+			&arrow::array::UInt32Array::from(rows.clone()),
+		) else {
+			return false;
+		};
+		let Ok(encoded) = crate::storage::multirow::encode_batch(&sub) else {
+			return false;
+		};
+		let count = sub.num_rows();
+		// Wendelon ADR 0119 D5: the repair answer, bounded by the write's own
+		// encoding (flat columns only; `keyed_admission` refuses the rest).
+		let repair_rows =
+			super::child_writes::repair_rows_bound(encoded.len(), sub.num_columns(), count);
+		let ordinals = count.checked_mul(4);
+		let identities = count.checked_mul(32);
+		encoded.len() <= bound
+			&& ordinals.is_some_and(|bytes| bytes <= bound)
+			&& repair_rows.is_some_and(|bytes| bytes <= bound)
+			&& identities.is_some_and(|bytes| bytes <= bound)
+	})
+}

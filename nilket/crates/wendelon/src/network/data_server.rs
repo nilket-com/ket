@@ -7028,6 +7028,8 @@ impl DataRingServer for WendelonDataServer {
 			// ADR 0106 (wendelon): a recovering replacement's base page.
 			MsgType::TABLE_BASE_FETCH_REQ => {
 				let sender = context.require_authenticated_node("TABLE_BASE_FETCH_REQ")?;
+				// Wendelon ADR 0119 D6: the exact envelope version, before decoding.
+				crate::consensus::decision_mode::check_peer_exchange_version(frame.header.version)?;
 				self.handle_base_fetch(sender.id, frame).await.map(Some)
 			}
 			MsgType::TABLE_REPLICATE_REQ => {

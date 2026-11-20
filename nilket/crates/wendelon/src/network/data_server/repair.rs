@@ -12,7 +12,8 @@
 
 use super::child_writes::{
 	ChildAuthority, ChildRefusal, ChildRole, ChildWriteMeta, MAX_CHILD_META_BYTES,
-	MAX_CHILD_ROWS_BYTES, persist_locked, plan_child, stored_row_projected, verify_owned_rows,
+	MAX_CHILD_ROWS_BYTES, persist_locked, plan_child_keyed, stored_row_projected,
+	verify_owned_rows,
 };
 use super::*;
 use crate::consensus::decisions::{ParentStatus, Signer};
@@ -138,7 +139,7 @@ impl WendelonDataServer {
 			match postcard::from_bytes::<ChildFetchMeta>(frame.meta.as_ref()) {
 				Err(error) => (ChildFetchResponse::Refused(error.to_string()), None),
 				Ok(meta) => match self.serve_child_fetch(sender, meta).await {
-					Ok(rows) => (ChildFetchResponse::Rows, Some(rows)),
+					Ok(served) => (ChildFetchResponse::Rows, Some(served)),
 					Err(refusal) => (ChildFetchResponse::Refused(format!("{refusal:?}")), None),
 				},
 			}
@@ -146,17 +147,24 @@ impl WendelonDataServer {
 		let bytes = postcard::to_stdvec(&response).map_err(Error::other)?;
 		let mut meta = self.pool.acquire();
 		meta.as_mut_vec().extend_from_slice(&bytes);
+		// Wendelon ADR 0119 D5: an append-only child's rows travel with their
+		// identities in the trailing section.
+		let (rows, trailing) = match rows {
+			Some((rows, trailing)) => (Some(rows), (!trailing.is_empty()).then_some(trailing)),
+			None => (None, None),
+		};
 		let arrow_len = rows.as_ref().map_or(0, Vec::len) as u32;
+		let trailing_len = trailing.as_ref().map_or(0, Vec::len) as u32;
 		Ok(HrftFrame {
 			header: FrameHeader {
 				magic: HRFT_MAGIC,
-				version: 1,
+				version: crate::consensus::decision_mode::RAFT_FRAME_VERSION_PARENT_DECISIONS,
 				msg_type: MsgType::TABLE_CHILD_FETCH_RESP.0,
 				flags: 0,
 				stream_id: frame.header.stream_id,
 				meta_len: meta.len() as u32,
 				arrow_len,
-				trailing_len: 0,
+				trailing_len,
 			},
 			meta,
 			arrow_payload: rows.map(|rows| {
@@ -164,7 +172,11 @@ impl WendelonDataServer {
 				payload.as_mut_vec().extend_from_slice(&rows);
 				payload
 			}),
-			trailing: None,
+			trailing: trailing.map(|trailing| {
+				let mut payload = self.pool.acquire();
+				payload.as_mut_vec().extend_from_slice(&trailing);
+				payload
+			}),
 		})
 	}
 
@@ -174,7 +186,7 @@ impl WendelonDataServer {
 		&self,
 		requester: u32,
 		meta: ChildFetchMeta,
-	) -> Result<Vec<u8>, ChildRefusal> {
+	) -> Result<(Vec<u8>, Vec<u8>), ChildRefusal> {
 		if self.decision_mode != crate::consensus::decision_mode::DecisionMode::ParentDecisions {
 			return Err(ChildRefusal::ModeToday);
 		}
@@ -238,7 +250,10 @@ impl WendelonDataServer {
 					.map(|version| Identity::new(version.key_identity))
 					.collect();
 				let batch = super::deletes::row_id_batch(&rows).map_err(storage)?;
-				return crate::storage::multirow::encode_batch(&batch).map_err(storage);
+				return Ok((
+					crate::storage::multirow::encode_batch(&batch).map_err(storage)?,
+					Vec::new(),
+				));
 			}
 			let mut rows = Vec::with_capacity(intent.manifest.len());
 			for version in &intent.manifest {
@@ -268,12 +283,36 @@ impl WendelonDataServer {
 			#[cfg(test)]
 			let batch = if tamper { tampered(batch) } else { batch };
 			let bytes = crate::storage::multirow::encode_batch(&batch).map_err(storage)?;
+			#[cfg(test)]
+			if let Some(served) = SERVED_FETCH_ROW_BYTES
+				.lock()
+				.unwrap()
+				.get_mut(&(meta.claim_digest, meta.ordinal))
+			{
+				served.push(bytes.len());
+			}
 			if bytes.len() > MAX_CHILD_ROWS_BYTES {
 				return Err(ChildRefusal::Storage(
 					"child rows exceed their bound".into(),
 				));
 			}
-			Ok(bytes)
+			// Wendelon ADR 0119 D5: an append-only child's served rows carry their
+			// identities, in row order (the manifest's), for the requester to check
+			// against the signed content.
+			let trailing = if matches!(
+				descriptor.row_identity_policy,
+				crate::schema::RowIdentityPolicy::AppendOnly
+			) {
+				let identities: Vec<Identity> = intent
+					.manifest
+					.iter()
+					.map(|version| Identity::new(version.key_identity))
+					.collect();
+				super::child_writes::encode_identities(&identities)
+			} else {
+				Vec::new()
+			};
+			Ok((bytes, trailing))
 		});
 		work.await
 			.map_err(|error| ChildRefusal::Storage(error.to_string()))?
@@ -407,8 +446,8 @@ pub(crate) async fn repair_child_in(
 			fetch_child(ctx.connect.clone(), ctx.pool.clone(), source, &meta),
 		)
 		.await;
-		let batch = match fetched {
-			Ok(Ok(batch)) => batch,
+		let (batch, given) = match fetched {
+			Ok(Ok(fetched)) => fetched,
 			Ok(Err(refusal)) => {
 				last = refusal;
 				continue;
@@ -429,13 +468,14 @@ pub(crate) async fn repair_child_in(
 		// it before the next source is asked.
 		let plan =
 			super::child_writes::AdmittedPlan::admit(&ctx.slab, &ctx.state_machine, move |state| {
-				plan_child(
+				plan_child_keyed(
 					state,
 					local,
 					source,
 					ChildRole::Repair,
 					&write,
 					batch,
+					given,
 					|_, _| false,
 				)
 			})
@@ -476,7 +516,7 @@ async fn fetch_child(
 	pool: Arc<BufPool>,
 	source: u32,
 	meta: &ChildFetchMeta,
-) -> Result<RecordBatch, ChildRefusal> {
+) -> Result<(RecordBatch, super::child_writes::GivenKeys), ChildRefusal> {
 	let io = |error: std::io::Error| ChildRefusal::Storage(error.to_string());
 	let bytes =
 		postcard::to_stdvec(meta).map_err(|error| ChildRefusal::Storage(error.to_string()))?;
@@ -484,7 +524,7 @@ async fn fetch_child(
 	let mut stream = conn.open_bi().await.map_err(io)?;
 	let header = FrameHeader {
 		magic: HRFT_MAGIC,
-		version: 1,
+		version: crate::consensus::decision_mode::RAFT_FRAME_VERSION_PARENT_DECISIONS,
 		msg_type: MsgType::TABLE_CHILD_FETCH_REQ.0,
 		flags: 0,
 		stream_id: 0,
@@ -497,6 +537,8 @@ async fn fetch_child(
 		.map_err(io)?;
 	stream.finish().await.map_err(io)?;
 	let response = read_frame(&mut *stream, &pool).await.map_err(io)?;
+	crate::consensus::decision_mode::check_peer_exchange_version(response.header.version)
+		.map_err(io)?;
 	if response.header.msg_type != MsgType::TABLE_CHILD_FETCH_RESP.0
 		|| response.meta.len() > MAX_CHILD_META_BYTES
 	{
@@ -526,7 +568,16 @@ async fn fetch_child(
 					"fetched row count out of bounds".into(),
 				));
 			}
-			Ok(batch)
+			// Wendelon ADR 0119 D5: identities, when the source sent them, stay
+			// undecoded until the plan knows the table's policy and the child.
+			let given = super::child_writes::GivenKeys::of_section(&Arc::new(
+				response
+					.trailing
+					.as_ref()
+					.map(|bytes| bytes.as_ref().to_vec())
+					.unwrap_or_default(),
+			));
+			Ok((batch, given))
 		}
 	}
 }
@@ -553,4 +604,33 @@ fn tampered(batch: RecordBatch) -> RecordBatch {
 	.expect("a string column");
 	columns[last] = replacement;
 	RecordBatch::try_new(batch.schema(), columns).expect("the same schema")
+}
+
+/// Test-only: the encoded row bytes of each fetch answer served for an armed
+/// child, by its claim digest and ordinal (wendelon ADR 0119 D5's near-limit
+/// repair control). Nothing is recorded for a child no test armed; a test arms
+/// its own child and takes its record back, so no other test can satisfy or
+/// perturb it, and nothing outlives the test (Codex 01a1f9fb).
+#[cfg(test)]
+static SERVED_FETCH_ROW_BYTES: std::sync::Mutex<
+	std::collections::BTreeMap<([u8; 32], u16), Vec<usize>>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Test-only: records the fetch answers served for this child from now on.
+#[cfg(test)]
+pub(crate) fn arm_served_fetch(claim_digest: [u8; 32], ordinal: u16) {
+	SERVED_FETCH_ROW_BYTES
+		.lock()
+		.unwrap()
+		.insert((claim_digest, ordinal), Vec::new());
+}
+
+/// Test-only: this child's recorded answers, and its arming removed.
+#[cfg(test)]
+pub(crate) fn take_served_fetch(claim_digest: [u8; 32], ordinal: u16) -> Vec<usize> {
+	SERVED_FETCH_ROW_BYTES
+		.lock()
+		.unwrap()
+		.remove(&(claim_digest, ordinal))
+		.unwrap_or_default()
 }

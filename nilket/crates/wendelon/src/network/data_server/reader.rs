@@ -430,6 +430,19 @@ pub(super) fn version_locality(
 	stored: &RecordBatch,
 ) -> Result<Locality, ReadRefusal> {
 	let fail = |why: String| ReadRefusal::Final(format!("a selected version's locality: {why}"));
+	// Wendelon ADR 0119 D2: an AppendOnly row's identity is stored, never derived
+	// again from its values. The stored key must be the selected key; its
+	// locality is that identity's table spread.
+	if matches!(
+		descriptor.row_identity_policy,
+		crate::schema::RowIdentityPolicy::AppendOnly
+	) {
+		if stored_key_identity(stored) != Some(key) {
+			return Err(fail("the stored row is another key".into()));
+		}
+		return crate::consensus::decisions::delete_row_locality(tenant, descriptor, key)
+			.ok_or_else(|| fail("no locality".into()));
+	}
 	let row = stored_row_projected(descriptor, stored).map_err(fail)?;
 	let probe = crate::consensus::decisions::ParentKey {
 		tenant,
@@ -456,6 +469,20 @@ pub(super) fn version_locality(
 		.first()
 		.copied()
 		.ok_or_else(|| fail("no locality".into()))
+}
+
+/// The identity a stored row carries in its synthetic key-id column.
+fn stored_key_identity(stored: &RecordBatch) -> Option<Identity> {
+	let ids = stored
+		.column_by_name(crate::schema::table::STORAGE_ROW_KEY_ID_COLUMN)?
+		.as_any()
+		.downcast_ref::<arrow::array::FixedSizeBinaryArray>()?;
+	// Codex 01a1f9ca: a null has no identity, whatever its value buffer holds.
+	if ids.is_empty() || ids.is_null(0) {
+		return None;
+	}
+	let bytes: [u8; 32] = ids.value(0).try_into().ok()?;
+	Some(Identity::new(bytes))
 }
 
 /// A KV key's table identity and ring position, by the admission the KV write
@@ -1678,5 +1705,109 @@ impl WendelonDataServer {
 			.await
 			.unwrap();
 		(position, holder)
+	}
+}
+
+#[cfg(test)]
+mod append_only_locality_tests {
+	use super::*;
+
+	fn append_only() -> TableSchemaDescriptor {
+		TableSchemaDescriptor::new_with_layout(
+			crate::schema::TableObjectId::new([0xA0; 16]),
+			1,
+			"analytics",
+			"events_append",
+			&arrow::datatypes::Schema::new(vec![
+				arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+				arrow::datatypes::Field::new("v", arrow::datatypes::DataType::Utf8, true),
+			]),
+			crate::schema::RowIdentityPolicy::AppendOnly,
+			crate::schema::LocalityPolicy::default_table_spread(),
+			crate::schema::RecordLayoutPolicy::MultiRow(
+				crate::schema::MultiRowLayoutDescriptor::default(),
+			),
+			crate::schema::SchemaEvolutionPolicy::AdditiveOnly,
+		)
+		.unwrap()
+	}
+
+	/// A stored row whose `__row_key_id__` column is `key` (`None`: no such column).
+	fn stored(key: Option<[u8; 32]>) -> RecordBatch {
+		let mut fields = vec![
+			arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+			arrow::datatypes::Field::new("v", arrow::datatypes::DataType::Utf8, true),
+		];
+		let mut columns: Vec<arrow::array::ArrayRef> = vec![
+			Arc::new(arrow::array::Int64Array::from(vec![1])),
+			Arc::new(arrow::array::StringArray::from(vec!["same"])),
+		];
+		if let Some(key) = key {
+			fields.push(arrow::datatypes::Field::new(
+				crate::schema::table::STORAGE_ROW_KEY_ID_COLUMN,
+				arrow::datatypes::DataType::FixedSizeBinary(32),
+				false,
+			));
+			columns.push(Arc::new(
+				arrow::array::FixedSizeBinaryArray::try_from_iter(std::iter::once(key)).unwrap(),
+			));
+		}
+		RecordBatch::try_new(Arc::new(arrow::datatypes::Schema::new(fields)), columns).unwrap()
+	}
+
+	/// Wendelon ADR 0119 D2 (acceptance 8): an AppendOnly version is placed by its
+	/// stored identity only when that identity is the selected key; another key's
+	/// row, or a row without its stored key, is refused, whatever its values.
+	#[test]
+	fn an_append_only_version_is_placed_only_by_its_own_stored_key() {
+		let descriptor = append_only();
+		let tenant = TenantId::ZERO;
+		let hlc = HybridTimestamp {
+			physical_ms: 1,
+			logical: 0,
+			node_id: 1,
+		};
+		let key = Identity::new([7; 32]);
+		let placed = version_locality(tenant, &descriptor, key, hlc, &stored(Some([7; 32])))
+			.expect("its own stored key");
+		assert_eq!(
+			Some(placed),
+			crate::consensus::decisions::delete_row_locality(tenant, &descriptor, key)
+		);
+		assert!(matches!(
+			version_locality(tenant, &descriptor, key, hlc, &stored(Some([8; 32]))),
+			Err(ReadRefusal::Final(_))
+		));
+		assert!(matches!(
+			version_locality(tenant, &descriptor, key, hlc, &stored(None)),
+			Err(ReadRefusal::Final(_))
+		));
+		// A null stored key whose value buffer holds exactly the selected key's
+		// bytes has no identity (Codex 01a1f9ca).
+		let null_key = {
+			let ids = arrow::array::FixedSizeBinaryArray::new(
+				32,
+				arrow::buffer::Buffer::from(vec![7u8; 32]),
+				Some(arrow::buffer::NullBuffer::from(vec![false])),
+			);
+			assert!(ids.is_null(0));
+			assert_eq!(ids.value(0), &[7u8; 32]);
+			let stored = stored(Some([7; 32]));
+			let mut columns = stored.columns().to_vec();
+			*columns.last_mut().unwrap() = Arc::new(ids);
+			let schema = arrow::datatypes::Schema::new(
+				stored
+					.schema()
+					.fields()
+					.iter()
+					.map(|field| field.as_ref().clone().with_nullable(true))
+					.collect::<Vec<_>>(),
+			);
+			RecordBatch::try_new(Arc::new(schema), columns).unwrap()
+		};
+		assert!(matches!(
+			version_locality(tenant, &descriptor, key, hlc, &null_key),
+			Err(ReadRefusal::Final(_))
+		));
 	}
 }

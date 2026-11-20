@@ -871,6 +871,27 @@ pub fn validate_table_write_request_batch(
 	writer_node_id: WriterNodeId,
 	row_hlc: HybridTimestamp,
 ) -> Result<TableWriteAdmission, TableWriteValidationError> {
+	validate_table_write_shape(meta, batch, descriptor)?;
+
+	match &descriptor.row_identity_policy {
+		RowIdentityPolicy::PrimaryKey(_) => admit_primary_key_write(meta, batch, descriptor),
+		RowIdentityPolicy::AppendOnly => {
+			admit_append_only_write(meta, batch, descriptor, writer_node_id, row_hlc)
+		}
+		RowIdentityPolicy::AppendOnlyContentHash => {
+			crate::storage::content_hash::admit_content_hash_write(meta, batch, descriptor)
+		}
+	}
+}
+
+/// The shape every table write must have, whatever its identity policy: a valid
+/// descriptor of the request's table and generation, 1..=TABLE_WRITE_MAX_ROWS rows
+/// matching the declared count, and the descriptor's Arrow schema.
+fn validate_table_write_shape(
+	meta: &TableWriteRequestMeta,
+	batch: &RecordBatch,
+	descriptor: &TableSchemaDescriptor,
+) -> Result<(), TableWriteValidationError> {
 	descriptor.validate().map_err(|err| {
 		TableWriteValidationError::new(
 			PbcRejectCode::PBC_REJECT_SCHEMA_UNKNOWN,
@@ -925,16 +946,64 @@ pub fn validate_table_write_request_batch(
 			"table write Arrow schema does not match descriptor schema",
 		));
 	}
+	Ok(())
+}
 
-	match &descriptor.row_identity_policy {
-		RowIdentityPolicy::PrimaryKey(_) => admit_primary_key_write(meta, batch, descriptor),
-		RowIdentityPolicy::AppendOnly => {
-			admit_append_only_write(meta, batch, descriptor, writer_node_id, row_hlc)
-		}
-		RowIdentityPolicy::AppendOnlyContentHash => {
-			crate::storage::content_hash::admit_content_hash_write(meta, batch, descriptor)
-		}
+/// Wendelon ADR 0119 D3: admits a named AppendOnly table's rows under
+/// ParentDecisions with each row's identity given, index-aligned with the batch
+/// (derived from the write's key and each row's original ordinal, or checked
+/// against the signed content), after every check of the request's shape. Each
+/// row's locality is the table spread of its identity.
+pub fn admit_parent_decisions_append_only_rows(
+	meta: &TableWriteRequestMeta,
+	batch: &RecordBatch,
+	descriptor: &TableSchemaDescriptor,
+	identities: &[Identity],
+) -> Result<TableWriteAdmission, TableWriteValidationError> {
+	validate_table_write_shape(meta, batch, descriptor)?;
+	if !matches!(
+		descriptor.row_identity_policy,
+		RowIdentityPolicy::AppendOnly
+	) {
+		return Err(TableWriteValidationError::new(
+			PbcRejectCode::PBC_REJECT_SCHEMA_UNKNOWN,
+			"identified rows are admitted only for an append-only table",
+		));
 	}
+	let LocalityPolicy::TableSpreadProjection(spread) = descriptor.locality_policy else {
+		return Err(TableWriteValidationError::new(
+			PbcRejectCode::PBC_REJECT_LOCALITY_UNSUPPORTED,
+			"an append-only table under ParentDecisions needs the table spread",
+		));
+	};
+	if identities.len() != batch.num_rows() {
+		return Err(TableWriteValidationError::new(
+			PbcRejectCode::PBC_REJECT_BATCH_TOO_LARGE,
+			format!(
+				"identity count {} does not match row count {}",
+				identities.len(),
+				batch.num_rows()
+			),
+		));
+	}
+	let localities = identities
+		.iter()
+		.map(|identity| {
+			table_spread_locality(meta.tenant_id, meta.table_object_id, *identity, spread).map_err(
+				|err| {
+					TableWriteValidationError::new(
+						PbcRejectCode::PBC_REJECT_LOCALITY_UNSUPPORTED,
+						format!("table spread locality failed: {err}"),
+					)
+				},
+			)
+		})
+		.collect::<Result<Vec<_>, _>>()?;
+	Ok(TableWriteAdmission {
+		canonical_primary_keys: Vec::new(),
+		key_identities: identities.to_vec(),
+		localities,
+	})
 }
 
 fn admit_primary_key_write(
@@ -1443,6 +1512,27 @@ pub fn synthesize_append_only_row_id(
 	hasher.update(writer_node_id.as_bytes());
 	hasher.update(bytemuck::bytes_of(&row_hlc));
 	hasher.update(&intra_batch_index.to_be_bytes());
+	Identity::new(*hasher.finalize().as_bytes())
+}
+
+/// Wendelon ADR 0119 D1: the identity of a row of a named AppendOnly table under
+/// ParentDecisions, a function of its write operation and its position in the
+/// original request only: no HLC, no writer, no schema generation (those, and
+/// the row's contents, are bound by the request digest). A retry, a change of
+/// coordinator, a repair and a replacement all derive the same identity.
+pub fn parent_decisions_append_only_row_id(
+	tenant_id: TenantId,
+	table_object_id: TableObjectId,
+	client_uuid: [u8; 16],
+	sequence_no: u64,
+	ordinal: u32,
+) -> Identity {
+	let mut hasher = blake3::Hasher::new_derive_key("wendelon pd table append-only row v1");
+	hasher.update(&tenant_id.get().to_be_bytes());
+	hasher.update(table_object_id.as_bytes());
+	hasher.update(&client_uuid);
+	hasher.update(&sequence_no.to_be_bytes());
+	hasher.update(&ordinal.to_be_bytes());
 	Identity::new(*hasher.finalize().as_bytes())
 }
 
@@ -7039,6 +7129,39 @@ mod tests {
 			physical_ms: ms,
 			logical: 0,
 			node_id: 1,
+		}
+	}
+
+	/// Wendelon ADR 0119 D1: the pinned vector (tenant 1, table 0xA0 x16, uuid
+	/// 01..10, sequence 7, ordinal 2), and what the identity distinguishes.
+	#[test]
+	fn the_parent_decisions_append_only_identity_matches_its_pinned_vector() {
+		let table = TableObjectId::new([0xA0; 16]);
+		let uuid = [
+			0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+			0x0f, 0x10,
+		];
+		let identity = parent_decisions_append_only_row_id(TenantId(1), table, uuid, 7, 2);
+		let hex: String = identity
+			.as_bytes()
+			.iter()
+			.map(|byte| format!("{byte:02x}"))
+			.collect();
+		assert_eq!(
+			hex,
+			"a65089040c14263afc3ceaa9882e978ccb058eef2e28dec28d12241d82bc12e3"
+		);
+		let id = |tenant, table, uuid, sequence, ordinal| {
+			parent_decisions_append_only_row_id(TenantId(tenant), table, uuid, sequence, ordinal)
+		};
+		for other in [
+			id(1, table, uuid, 7, 3),
+			id(1, table, uuid, 8, 2),
+			id(1, table, [0x11; 16], 7, 2),
+			id(1, TableObjectId::new([0xA1; 16]), uuid, 7, 2),
+			id(2, table, uuid, 7, 2),
+		] {
+			assert_ne!(other, identity);
 		}
 	}
 

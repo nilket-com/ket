@@ -924,7 +924,12 @@ async fn exchange_with(
 	let mut stream = connection.open_bi().await?;
 	let header = crate::schema::FrameHeader {
 		magic: HRFT_MAGIC,
-		version: 1,
+		// Wendelon ADR 0119 D6: a peer exchange travels in the decision envelope.
+		version: if crate::consensus::decision_mode::is_peer_exchange_frame(msg_type.0) {
+			crate::consensus::decision_mode::RAFT_FRAME_VERSION_PARENT_DECISIONS
+		} else {
+			1
+		},
 		msg_type: msg_type.0,
 		flags: 0,
 		stream_id: stream.stream_id() as u32,
@@ -1235,6 +1240,7 @@ async fn a_promoted_replacement_stores_and_reopens_a_recovered_base() {
 		&descriptor,
 		&rows,
 		row_hlc,
+		&[],
 	)
 	.await
 	.unwrap();
@@ -1768,7 +1774,35 @@ async fn children_naming(cluster: &Cluster, slot: u32) -> Vec<(u64, u16, [u8; 32
 /// the record is repaired as delta. The member stays control-only throughout.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_promoted_replacement_recovers_its_slots_base_and_children() {
+	promoted_replacement_recovers(false).await;
+}
+
+/// Wendelon ADR 0119: the same recovery for a named AppendOnly table whose
+/// certified base holds a tombstone (one row deleted by its identity before the
+/// second generation): every recovered entry (identity, HLC, position, digest)
+/// is stored on the replacement, rows paired with their certified identities.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_promoted_replacement_recovers_an_append_only_base_with_a_tombstone() {
+	promoted_replacement_recovers(true).await;
+}
+
+async fn promoted_replacement_recovers(append_only: bool) {
 	let (mut cluster, leader, descriptor) = ready().await;
+	let descriptor = if append_only {
+		let descriptor = super::append_only::append_only_descriptor();
+		cluster
+			.node(leader)
+			.raft
+			.client_write(crate::consensus::WendelonRequest::SchemaUpdate(
+				schema_update(&descriptor),
+			))
+			.await
+			.unwrap();
+		until_settled(&cluster, &descriptor).await;
+		descriptor
+	} else {
+		descriptor
+	};
 	let lost = *NODES[1..].iter().find(|id| **id != leader).unwrap();
 	let now = std::time::SystemTime::now()
 		.duration_since(std::time::UNIX_EPOCH)
@@ -1781,19 +1815,35 @@ async fn a_promoted_replacement_recovers_its_slots_base_and_children() {
 		descriptor: &TableSchemaDescriptor,
 		at: u64,
 		rows: &[(i64, &str)],
-	) {
-		let meta = write_meta(descriptor, rows.len(), uuid_v7_at(at));
+	) -> TableWriteRequestMeta {
 		let leader = cluster.leader().await;
+		let meta = placed_below_the_wall(cluster, leader, descriptor, rows.len(), at).await;
 		assert_committed(
 			&write_through(cluster, leader, meta, named_rows(descriptor, rows)).await,
 			"a write",
 		);
+		meta
 	}
-	write(&cluster, &descriptor, now, &[(1, "a"), (2, "b")]).await;
+	let first_write = write(&cluster, &descriptor, now, &[(1, "a"), (2, "b")]).await;
 	let first = now + 60_000;
 	jump_floor(&cluster, first).await;
 	until_active(&cluster, 1).await;
 	write(&cluster, &descriptor, first + 1, &[(3, "c")]).await;
+	if append_only {
+		// A tombstone the second generation certifies: the first row, by its
+		// identity.
+		let mut delete = delete_meta(&descriptor);
+		delete.parent_write_id.client_uuid = uuid_v7_at(first + 2);
+		let leader = cluster.leader().await;
+		let deleted = delete_through(
+			&cluster,
+			leader,
+			delete,
+			vec![super::append_only::identity_of(&first_write, 0)],
+		)
+		.await;
+		assert_eq!(deleted.write.status, WriteStatus::OK, "{deleted:?}");
+	}
 	let second = now + 120_000;
 	jump_floor(&cluster, second).await;
 	until_active(&cluster, 2).await;
@@ -1953,22 +2003,28 @@ async fn a_promoted_replacement_recovers_its_slots_base_and_children() {
 				},
 				BaseFetchRefusal::Malformed,
 			),
-			// R1: a first row larger than the page's byte bound is refused, never
-			// sent over it.
-			(
-				lost,
-				BaseFetchRequest {
-					max_bytes: 1,
-					..good.clone()
-				},
-				BaseFetchRefusal::RowTooLarge,
-			),
 		] {
 			assert_eq!(
 				ask(from, request).await,
 				BaseFetchAnswer::Refused(refusal),
 				"from {from}"
 			);
+		}
+		// R1: a first row larger than the page's byte bound is refused, never
+		// sent over it. A tombstone carries no row bytes, so a page that begins
+		// with tombstones (an AppendOnly base with a deleted row, by the order of
+		// its identities) answers them and stops before the first row.
+		let tiny = BaseFetchRequest {
+			max_bytes: 1,
+			..good.clone()
+		};
+		match ask(lost, tiny).await {
+			BaseFetchAnswer::Refused(BaseFetchRefusal::RowTooLarge) => {}
+			BaseFetchAnswer::Page { ref entries, .. } => assert!(
+				!entries.is_empty() && entries.iter().all(|entry| entry.tombstone),
+				"a one-byte page carries tombstones only: {entries:?}"
+			),
+			other => panic!("a one-byte page: {other:?}"),
 		}
 	}
 
@@ -3024,4 +3080,60 @@ async fn an_installed_recovered_base_with_another_cut_does_not_record() {
 	for node in std::mem::take(&mut cluster.nodes) {
 		let _ = tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown()).await;
 	}
+}
+
+/// A write's meta issued at `at`. For an AppendOnly table (whose rows are placed
+/// by an identity of the operation) the sequence number is chosen so that every
+/// row lies in a lineage whose floor leads the wall clock by less than the
+/// commit lead (a fresh grant's floor is its clock plus that lead): `jump_floor`
+/// moves the ring clock about E ahead of the wall (ADR 0110, Context), so a
+/// lineage granted after a jump (the lost slot's ranges, taken over) has a floor
+/// about E ahead, and a write placed there is refused `CommitFromFuture` until
+/// real time catches up. A PrimaryKey row's place is its key's, fixed by the test.
+async fn placed_below_the_wall(
+	cluster: &Cluster,
+	leader: u32,
+	descriptor: &TableSchemaDescriptor,
+	rows: usize,
+	at: u64,
+) -> TableWriteRequestMeta {
+	let mut meta = write_meta(descriptor, rows, uuid_v7_at(at));
+	if !matches!(
+		descriptor.row_identity_policy,
+		crate::schema::RowIdentityPolicy::AppendOnly
+	) {
+		return meta;
+	}
+	let state = cluster.node(leader).state_machine.state_snapshot().await;
+	let decisions = state.decisions.as_ref().unwrap();
+	let wall = std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.unwrap()
+		.as_millis() as u64;
+	let below = |meta: &TableWriteRequestMeta| {
+		(0..rows as u32).all(|ordinal| {
+			let position = crate::consensus::decisions::delete_row_position(
+				meta.tenant_id,
+				descriptor,
+				super::append_only::identity_of(meta, ordinal),
+			)
+			.unwrap();
+			decisions
+				.lineages()
+				.range(..=position)
+				.next_back()
+				.is_some_and(|(_, lineage)| {
+					position <= lineage.range_end
+						&& lineage.floor_ms
+							< wall + crate::consensus::decisions::DECISION_COMMIT_HLC_LEAD_MS
+				})
+		})
+	};
+	for sequence_no in 1..=64 {
+		meta.parent_write_id.sequence_no = sequence_no;
+		if below(&meta) {
+			return meta;
+		}
+	}
+	panic!("no operation at {at} places its rows in a lineage the wall clock admits");
 }

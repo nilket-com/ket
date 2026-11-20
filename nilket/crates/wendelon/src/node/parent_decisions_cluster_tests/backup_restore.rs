@@ -61,6 +61,15 @@ fn storage_actor() -> ActorIdentity {
 
 /// A client on `cluster`'s network presenting `actor`.
 async fn client_as(cluster: &Cluster, actor: ActorIdentity) -> Arc<WendelonClient> {
+	client_advertised(cluster, actor, 0).await
+}
+
+/// `client_as`, its topology advertising `capability_bits` for every peer.
+async fn client_advertised(
+	cluster: &Cluster,
+	actor: ActorIdentity,
+	capability_bits: u8,
+) -> Arc<WendelonClient> {
 	let leader = cluster.leader().await;
 	let status = ClusterStatusWire {
 		epoch: cluster.node(leader).ring.current_epoch(),
@@ -76,7 +85,7 @@ async fn client_as(cluster: &Cluster, actor: ActorIdentity) -> Arc<WendelonClien
 					.with(NodeRole::Data)
 					.with(NodeRole::Control)
 					.as_u8(),
-				capability_bits: 0,
+				capability_bits,
 			})
 			.collect(),
 	};
@@ -121,6 +130,13 @@ async fn hold_of(cluster: &Cluster) -> Option<(u128, u64)> {
 /// A formed cluster with tenant 1 and its table, made through the public
 /// admin routes as an operator, applied on every node.
 async fn source_with_table() -> (Cluster, Clients, TableSchemaDescriptor) {
+	source_with(descriptor()).await
+}
+
+/// `source_with_table` for a given table.
+async fn source_with(
+	descriptor: TableSchemaDescriptor,
+) -> (Cluster, Clients, TableSchemaDescriptor) {
 	let cluster = Cluster::start().await;
 	until_ready(&cluster, None).await;
 	let clients = clients(&cluster).await;
@@ -133,7 +149,6 @@ async fn source_with_table() -> (Cluster, Clients, TableSchemaDescriptor) {
 		})
 		.await
 		.unwrap();
-	let descriptor = descriptor();
 	clients
 		.admin
 		.submit_schema_update_envelope(&SchemaUpdateEnvelope::compute_client_intent(
@@ -312,6 +327,271 @@ async fn a_backup_restores_into_a_fresh_cluster_that_then_takes_new_writes() {
 		restore::verify(&dir, PASSPHRASE),
 		Err(RestoreError::Refused(RestoreRefusal::Artifact { .. }))
 	));
+}
+
+/// Tenant 1's table as a sorted row multiset (duplicates kept).
+async fn read_multiset(
+	clients: &Clients,
+	descriptor: &TableSchemaDescriptor,
+) -> Vec<(i64, String)> {
+	let mut result = export::query_table(&clients.data[&TENANT], TENANT, descriptor)
+		.await
+		.unwrap();
+	let mut rows = Vec::new();
+	while let Some(batch) = result.next_batch().await.unwrap() {
+		let ids = batch
+			.column_by_name("id")
+			.and_then(|column| column.as_any().downcast_ref::<Int64Array>())
+			.unwrap();
+		let values = batch
+			.column_by_name("v")
+			.and_then(|column| column.as_any().downcast_ref::<StringArray>())
+			.unwrap();
+		for row in 0..batch.num_rows() {
+			rows.push((ids.value(row), values.value(row).to_owned()));
+		}
+	}
+	rows.sort();
+	rows
+}
+
+/// Wendelon ADR 0119 (acceptance 13): a named AppendOnly table holding
+/// duplicates (within one write and across two) is exported and restored into a
+/// fresh ParentDecisions cluster with its exact row multiset; the restore writes
+/// through fresh operations, so the restored rows carry the restore's own
+/// identities, and the restored table takes a new duplicate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn an_append_only_tables_duplicates_survive_a_backup_and_restore() {
+	let (_source, clients, descriptor) =
+		source_with(super::append_only::append_only_descriptor()).await;
+	write(
+		&clients,
+		&descriptor,
+		&[(1, "same"), (1, "same"), (2, "other")],
+	)
+	.await;
+	write(&clients, &descriptor, &[(1, "same")]).await;
+	let mut expected: Vec<(i64, String)> = [(1, "same"), (1, "same"), (1, "same"), (2, "other")]
+		.iter()
+		.map(|(id, v)| (*id, (*v).to_owned()))
+		.collect();
+	assert_eq!(read_multiset(&clients, &descriptor).await, expected);
+
+	let root = crate::test_support::TestDir::new("adr0119-artifact");
+	let dir = root.to_path_buf().join("backup");
+	let report = export::export(&clients, &dir, PASSPHRASE)
+		.await
+		.unwrap_or_else(|error| panic!("export: {error}"));
+	assert_eq!((report.tables, report.rows), (1, 4), "{report:?}");
+	let verified = restore::verify(&dir, PASSPHRASE).unwrap();
+	assert_eq!(verified.manifest.roster.tables[0].descriptor, descriptor);
+
+	let target = Cluster::start().await;
+	until_ready(&target, None).await;
+	let target_clients = self::clients(&target).await;
+	let restored = restore::restore(&target_clients, &dir, &verified)
+		.await
+		.unwrap_or_else(|error| panic!("restore: {error}"));
+	assert_eq!((restored.tables, restored.rows), (1, 4), "{restored:?}");
+	assert_eq!(read_multiset(&target_clients, &descriptor).await, expected);
+
+	write(&target_clients, &descriptor, &[(1, "same")]).await;
+	expected.insert(0, (1, "same".to_owned()));
+	assert_eq!(read_multiset(&target_clients, &descriptor).await, expected);
+}
+
+/// One AppendOnly write of `rows` through `client`; it must commit.
+async fn write_through_client(
+	client: &WendelonClient,
+	descriptor: &TableSchemaDescriptor,
+	meta: crate::schema::TableWriteRequestMeta,
+	rows: &[(i64, &str)],
+) {
+	let result = client
+		.table_write(TableWriteRequest {
+			meta,
+			descriptor: descriptor.clone(),
+			payload: named_rows(descriptor, rows),
+			deadline: Some(std::time::Instant::now() + std::time::Duration::from_secs(30)),
+		})
+		.await
+		.unwrap();
+	let write = result.response.write;
+	assert!(
+		matches!(
+			mutation_answer(write.status, write.mutation_commit_knowledge()),
+			MutationAnswer::Committed { .. }
+		),
+		"{write:?}"
+	);
+}
+
+/// Wendelon ADR 0119 D7 (acceptance 11): an AppendOnly write converges from
+/// either client preview. A client whose topology advertises no
+/// `ParentDecisions` bit keeps Today's request-level preview, which for some of
+/// these operations names another place than the ParentDecisions route (a
+/// premise checked here); one whose every peer advertises it previews the
+/// route. Every write through either commits within the client's own bounded
+/// retries (the server admits at the lineage holder of row 0's position or
+/// redirects there, hinted), and every row is read once. The number of
+/// redirects is not observed: the client has no counter of them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn an_append_only_write_converges_from_either_preview() {
+	use crate::network::transport::{NodeCapability, NodeCapabilitySet};
+	let (source, clients, descriptor) =
+		source_with(super::append_only::append_only_descriptor()).await;
+	let old = clients.data[&TENANT].clone();
+	let advertised = NodeCapabilitySet::empty()
+		.with(NodeCapability::ParentDecisions)
+		.with(NodeCapability::ParentDecisionsBatchedLeases)
+		.as_u8();
+	let routed = client_advertised(&source, storage_actor(), advertised).await;
+	let rows = [(1, "same"), (1, "same"), (2, "other")];
+	let mut crossed = 0;
+	let mut expected = Vec::new();
+	for _ in 0..12 {
+		for client in [&old, &routed] {
+			let mut meta = write_meta(&descriptor, rows.len(), uuid_v7());
+			meta.tenant_id = TENANT;
+			let today = crate::schema::table::validate_table_write_request_batch(
+				&meta,
+				&named_rows(&descriptor, &rows),
+				&descriptor,
+				crate::schema::WriterNodeId::ZERO,
+				meta.client_hlc,
+			)
+			.unwrap()
+			.localities[0];
+			// Both in position space: the partition each names.
+			let today = match crate::schema::table::partitioned_prefix_width(&descriptor) {
+				Some(bits) => crate::schema::Locality::new(
+					crate::schema::table::partition_for_locality(today, bits)
+						.unwrap()
+						.get(),
+				),
+				None => today,
+			};
+			let route = crate::client::core::parent_decisions_append_only_route(&meta, &descriptor)
+				.unwrap();
+			crossed += usize::from(today != route);
+			write_through_client(client, &descriptor, meta, &rows).await;
+			expected.extend(rows.iter().map(|(id, v)| (*id, (*v).to_owned())));
+		}
+	}
+	assert!(
+		crossed > 0,
+		"premise: Today's preview names another place for some operation"
+	);
+	expected.sort();
+	assert_eq!(read_multiset(&clients, &descriptor).await, expected);
+}
+
+/// The lineage holder of an AppendOnly write's row 0 (the coordinator the server
+/// admits at) and the nodes the client opened streams to while writing it, in
+/// order. The write must commit.
+async fn first_hops(
+	cluster: &Cluster,
+	client: &WendelonClient,
+	descriptor: &TableSchemaDescriptor,
+	rows: &[(i64, &str)],
+) -> (u32, Vec<u32>) {
+	let mut meta = write_meta(descriptor, rows.len(), uuid_v7());
+	meta.tenant_id = TENANT;
+	let position = crate::consensus::decisions::delete_row_position(
+		TENANT,
+		descriptor,
+		super::append_only::identity_of(&meta, 0),
+	)
+	.unwrap();
+	let leader = cluster.leader().await;
+	let holder = cluster
+		.node(leader)
+		.state_machine
+		.read_state(move |state| {
+			state
+				.decisions
+				.as_ref()
+				.unwrap()
+				.lineages()
+				.range(..=position)
+				.next_back()
+				.map(|(_, lineage)| lineage.holder.id)
+				.unwrap()
+		})
+		.await;
+	cluster.network.clear_events();
+	write_through_client(client, descriptor, meta, rows).await;
+	let hops = cluster
+		.network
+		.events()
+		.into_iter()
+		.filter(|event| {
+			event.source.map(|node| node.id) == Some(CLIENT_NODE)
+				&& event.kind == crate::simulator::network::SimulatedTransportEventKind::OpenBi
+		})
+		.filter_map(|event| event.target.map(|node| node.id))
+		.collect();
+	(holder, hops)
+}
+
+/// Wendelon ADR 0119 D7 (acceptance 11; Codex 01a1f9ca): the first responder
+/// and the lease holder, observed. The streams the client opens for each write
+/// are read from the simulated network. In a stable crossed case (Today's
+/// preview, no ParentDecisions bit advertised, its first stream to a node other
+/// than the holder) the write commits after the holder's hint is followed, its
+/// last stream to the holder, within the retry budget. In a direct case (the
+/// ParentDecisions route, its first stream to the holder) the write commits on
+/// that one stream, with no redirect.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn an_append_only_write_reaches_its_holder_directly_or_by_its_hint() {
+	use crate::network::transport::{NodeCapability, NodeCapabilitySet};
+	let (source, clients, descriptor) =
+		source_with(super::append_only::append_only_descriptor()).await;
+	let old = clients.data[&TENANT].clone();
+	let advertised = NodeCapabilitySet::empty()
+		.with(NodeCapability::ParentDecisions)
+		.with(NodeCapability::ParentDecisionsBatchedLeases)
+		.as_u8();
+	let routed = client_advertised(&source, storage_actor(), advertised).await;
+	let rows = [(1, "same"), (1, "same"), (2, "other")];
+	let mut crossed = None;
+	let mut direct = None;
+	for attempt in 0..48 {
+		if crossed.is_none() {
+			let (holder, hops) = first_hops(&source, &old, &descriptor, &rows).await;
+			eprintln!("old preview, operation {attempt}: holder {holder}, streams {hops:?}");
+			if hops.first().is_some_and(|first| *first != holder) {
+				crossed = Some((holder, hops));
+			}
+		}
+		if direct.is_none() {
+			let (holder, hops) = first_hops(&source, &routed, &descriptor, &rows).await;
+			eprintln!("PD route, operation {attempt}: holder {holder}, streams {hops:?}");
+			if hops.first() == Some(&holder) {
+				direct = Some((holder, hops));
+			}
+		}
+		if crossed.is_some() && direct.is_some() {
+			break;
+		}
+	}
+	let (holder, hops) = crossed.expect("a crossed case among 48 operations");
+	assert_ne!(hops[0], holder, "the first responder is not the holder");
+	assert_eq!(
+		hops.last(),
+		Some(&holder),
+		"the hint is followed to the holder"
+	);
+	assert!(
+		hops.len() <= crate::client::core::DATA_RETRY_BUDGET,
+		"within the budget: {hops:?}"
+	);
+	let (holder, hops) = direct.expect("a direct case among 48 operations");
+	assert_eq!(
+		hops,
+		vec![holder],
+		"the holder answers its one stream, no redirect"
+	);
 }
 
 // ============================================================

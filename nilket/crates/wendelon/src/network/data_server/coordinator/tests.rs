@@ -3,6 +3,7 @@
 use super::*;
 use crate::consensus::decisions::tests as fixture;
 use crate::integration::compute::SchemaGeneration;
+use crate::network::data_server::child_writes::child_versions;
 use crate::schema::{
 	MultiRowLayoutDescriptor, PrimaryKeyDescriptor, RecordLayoutPolicy, RowIdentityPolicy,
 	SchemaEvolutionPolicy, TableSpreadLocalityDescriptor,
@@ -383,4 +384,73 @@ fn a_reserved_parent_is_not_routed_to_a_coordinator_whose_lineage_closed() {
 		None,
 		"the Reserved parent is not"
 	);
+}
+
+/// Wendelon ADR 0119 D7: the client's ParentDecisions route for an append-only
+/// write's row 0 is exactly the position the coordinator places that row at
+/// (the masked partition the authority is chosen at), for many operations, so a
+/// correct preview reaches the replica set of the holder the server picks.
+#[test]
+fn the_client_route_of_an_append_only_write_is_its_coordinators_row_zero_position() {
+	let descriptor = crate::schema::TableSchemaDescriptor::new_with_layout(
+		crate::schema::TableObjectId::new([0xA0; 16]),
+		1,
+		"analytics",
+		"events_append",
+		&Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("v", DataType::Utf8, true),
+		]),
+		crate::schema::RowIdentityPolicy::AppendOnly,
+		crate::schema::LocalityPolicy::default_table_spread(),
+		crate::schema::RecordLayoutPolicy::MultiRow(
+			crate::schema::MultiRowLayoutDescriptor::default(),
+		),
+		crate::schema::SchemaEvolutionPolicy::AdditiveOnly,
+	)
+	.unwrap();
+	let batch = RecordBatch::try_new(
+		Arc::new(descriptor.arrow_schema().unwrap()),
+		vec![
+			Arc::new(Int64Array::from(vec![1, 1])),
+			Arc::new(StringArray::from(vec!["same", "same"])),
+		],
+	)
+	.unwrap();
+	let hlc = crate::schema::HybridTimestamp {
+		physical_ms: fixture::T0,
+		logical: 0,
+		node_id: 1,
+	};
+	for sequence in 0..64u64 {
+		let key = crate::consensus::decisions::ParentKey {
+			tenant: crate::schema::TenantId::ZERO,
+			namespace: crate::consensus::decisions::ParentNamespace::Table(
+				descriptor.table_object_id,
+			),
+			client_uuid: fixture::uuid_v7(fixture::T0, sequence as u8),
+			sequence_no: sequence,
+		};
+		let meta = child_request_meta(
+			&key,
+			descriptor.table_object_id,
+			descriptor.schema_generation,
+			batch.num_rows(),
+			hlc,
+		)
+		.unwrap();
+		let ordinals = [0u32, 1];
+		let admission = crate::network::data_server::child_writes::keyed_admission(
+			&meta,
+			&batch,
+			&descriptor,
+			hlc,
+			crate::network::data_server::child_writes::RowKeys::Ordinals(&ordinals),
+		)
+		.unwrap();
+		let coordinator = row_position(&descriptor, admission.localities[0]).unwrap();
+		let client =
+			crate::client::core::parent_decisions_append_only_route(&meta, &descriptor).unwrap();
+		assert_eq!(client.get(), coordinator, "operation {sequence}");
+	}
 }

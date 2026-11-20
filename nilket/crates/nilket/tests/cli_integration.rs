@@ -1088,6 +1088,71 @@ fn the_rendered_row_oracle_rejects_swapped_missing_extra_and_miscounted_rows() {
 	}
 }
 
+/// APPENDONLY-01, the public baseline: on a fresh ParentDecisions local profile, an
+/// ordinary table with no PRIMARY KEY (an AppendOnly table) is created, written
+/// with two identical-valued rows and a third row, and read: all three rows,
+/// the duplicate kept, also after a restart. Each statement's whole outcome is
+/// printed, so the first failing step is visible.
+#[test]
+#[ignore = "requires Linux io_uring and the fixed local-profile ports"]
+fn local_profile_parent_decisions_append_only_table_keeps_identical_rows() {
+	let _serial = LIVE_LOCAL_LOCK.lock().expect("live-profile test lock");
+	let harness = fresh_dir("local-profile-pd-append-only");
+	let profile = harness.join("profile");
+	let log = harness.join("local.stderr.log");
+	let init = nilket(&[
+		"local",
+		"init",
+		"--data-dir",
+		profile.to_str().expect("utf8 profile path"),
+		"--decision-authority",
+		"parent-decisions",
+	]);
+	assert!(init.status.success(), "{init:?}");
+	let step = |sql, statement: &str| {
+		let ran = run_live_sql(sql, statement);
+		eprintln!(
+			"APPENDONLY-01 baseline: {statement:?} -> exit={:?} stdout={:?} stderr={:?}",
+			ran.status.code(),
+			stdout(&ran),
+			String::from_utf8_lossy(&ran.stderr)
+		);
+		ran
+	};
+	let expected = RenderedRows::of(
+		&["id", "label"],
+		&[("1", "same"), ("1", "same"), ("2", "other")],
+	);
+	let first = LiveLocal::spawn(&profile, &log);
+	let sql = first.ready.sql_endpoint;
+	let created = step(
+		sql,
+		"CREATE TABLE pd_append (id BIGINT NOT NULL, label TEXT)",
+	);
+	let inserted = step(
+		sql,
+		"INSERT INTO pd_append (id, label) VALUES (1, 'same'), (1, 'same'), (2, 'other')",
+	);
+	let read = step(sql, "SELECT id, label FROM pd_append ORDER BY id");
+	first.stop_gracefully();
+	let second = LiveLocal::spawn(&profile, &log);
+	let reread = step(
+		second.ready.sql_endpoint,
+		"SELECT id, label FROM pd_append ORDER BY id",
+	);
+	second.stop_gracefully();
+	assert!(created.status.success(), "the CREATE: {created:?}");
+	assert!(
+		inserted.status.success() && stdout(&inserted) == "OK rows=3\n",
+		"the INSERT: {inserted:?}"
+	);
+	for (what, ran) in [("the read", &read), ("the read after a restart", &reread)] {
+		assert!(ran.status.success(), "{what}: {ran:?}");
+		assert_eq!(rendered_rows(&stdout(ran)), expected, "{what}");
+	}
+	std::fs::remove_dir_all(harness).expect("remove the fixture");
+}
+
 /// The normal public entry point creates a fresh single-node ParentDecisions
 /// profile on request: init, start, a committed primary-key write, an exact
 /// ordered read, a stop, a re-run of init that regenerates nothing and reissues

@@ -125,6 +125,9 @@ pub(crate) enum ManifestRefusal {
 	/// depend on the row's place in the original batch, and content-hash
 	/// identities are shared across parents.
 	UnsupportedTable,
+	/// Wendelon ADR 0119: the ordinals or identities given for the rows are
+	/// malformed: a count mismatch or a repeat.
+	RowKeys(&'static str),
 	/// The rows fail today's admission for this table.
 	Admission(String),
 	/// A row's canonical bytes cannot be formed.
@@ -148,7 +151,7 @@ pub(super) fn row_digest(
 }
 
 /// A child's content commitment: its manifest, as the claim binds it.
-pub(super) fn manifest_content(manifest: &[OwnedVersion]) -> [u8; 32] {
+pub(crate) fn manifest_content(manifest: &[OwnedVersion]) -> [u8; 32] {
 	let bytes = postcard::to_stdvec(manifest).expect("a manifest encodes");
 	let mut hasher = blake3::Hasher::new_derive_key("wendelon parent child manifest v1");
 	hasher.update(&bytes);
@@ -156,7 +159,7 @@ pub(super) fn manifest_content(manifest: &[OwnedVersion]) -> [u8; 32] {
 }
 
 /// The request meta a receiver rebuilds from the claim, for today's admission.
-pub(super) fn child_request_meta(
+pub(crate) fn child_request_meta(
 	key: &crate::consensus::decisions::ParentKey,
 	table_object_id: TableObjectId,
 	schema_generation: u64,
@@ -186,29 +189,121 @@ pub(super) fn writer_of(commit_hlc: HybridTimestamp) -> WriterNodeId {
 	})
 }
 
-/// The manifest of a child's rows: one version per row, sorted, no repeats.
-/// ADR 0106 (wendelon): each row's version, in the batch's row order (no
-/// sorting, no duplicate check): what a caller pairing rows with entries needs.
-pub(crate) fn row_versions_in_order(
+/// Wendelon ADR 0119: where a child's row identities come from. A PrimaryKey
+/// table's are derived from each row's key value. A named AppendOnly table's are
+/// given: by each row's original ordinal in the request (a write, a replica), or
+/// as identities checked against the signed content (a repair answer, a
+/// recovered page).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum RowKeys<'a> {
+	Values,
+	Ordinals(&'a [u32]),
+	Identities(&'a [crate::schema::Identity]),
+}
+
+impl<'a> RowKeys<'a> {
+	/// The keys of a request's rows at `ordinals`: those ordinals for an
+	/// append-only table, the rows' own values otherwise.
+	pub(crate) fn of_request(descriptor: &TableSchemaDescriptor, ordinals: &'a [u32]) -> Self {
+		if matches!(
+			descriptor.row_identity_policy,
+			crate::schema::RowIdentityPolicy::AppendOnly
+		) {
+			Self::Ordinals(ordinals)
+		} else {
+			Self::Values
+		}
+	}
+}
+
+/// Wendelon ADR 0119 D1/D4: the identities of a write's rows at `ordinals`:
+/// one per row, distinct, each derived from the write's key and its ordinal.
+fn append_only_identities(
+	meta: &TableWriteRequestMeta,
+	ordinals: &[u32],
+	rows: usize,
+) -> Result<Vec<crate::schema::Identity>, ManifestRefusal> {
+	if ordinals.len() != rows {
+		return Err(ManifestRefusal::RowKeys("one ordinal per row"));
+	}
+	let mut sorted = ordinals.to_vec();
+	sorted.sort_unstable();
+	if sorted.windows(2).any(|pair| pair[0] == pair[1]) {
+		return Err(ManifestRefusal::RowKeys("ordinals repeat"));
+	}
+	Ok(ordinals
+		.iter()
+		.map(|ordinal| {
+			crate::schema::table::parent_decisions_append_only_row_id(
+				meta.tenant_id,
+				meta.table_object_id,
+				meta.parent_write_id.client_uuid,
+				meta.parent_write_id.sequence_no,
+				*ordinal,
+			)
+		})
+		.collect())
+}
+
+/// The admission of a child's rows with identities from `keys` (wendelon ADR
+/// 0119): each row's identity and locality, index-aligned with the batch.
+pub(crate) fn keyed_admission(
 	meta: &TableWriteRequestMeta,
 	batch: &RecordBatch,
 	descriptor: &TableSchemaDescriptor,
 	commit_hlc: HybridTimestamp,
-) -> Result<Vec<OwnedVersion>, ManifestRefusal> {
-	if !matches!(
+	keys: RowKeys<'_>,
+) -> Result<crate::schema::TableWriteAdmission, ManifestRefusal> {
+	use crate::schema::RowIdentityPolicy;
+	// Wendelon ADR 0119 D5 (Codex 01a1f9ca, 01a1fa16): a named AppendOnly table is
+	// written under ParentDecisions only when every column is of the ADR's
+	// declared types (`parent_decisions_append_only_schema`), checked here before
+	// any identity is derived; others stay refused, as before.
+	if matches!(
 		descriptor.row_identity_policy,
-		crate::schema::RowIdentityPolicy::PrimaryKey(_)
-	) {
+		RowIdentityPolicy::AppendOnly
+	) && !parent_decisions_append_only_schema(descriptor)
+	{
 		return Err(ManifestRefusal::UnsupportedTable);
 	}
-	let admission = validate_table_write_request_batch(
-		meta,
-		batch,
-		descriptor,
-		writer_of(commit_hlc),
-		commit_hlc,
-	)
-	.map_err(|error| ManifestRefusal::Admission(error.to_string()))?;
+	let admitted = match (&descriptor.row_identity_policy, keys) {
+		(RowIdentityPolicy::PrimaryKey(_), RowKeys::Values) => validate_table_write_request_batch(
+			meta,
+			batch,
+			descriptor,
+			writer_of(commit_hlc),
+			commit_hlc,
+		),
+		(RowIdentityPolicy::AppendOnly, RowKeys::Ordinals(ordinals)) => {
+			let identities = append_only_identities(meta, ordinals, batch.num_rows())?;
+			crate::schema::table::admit_parent_decisions_append_only_rows(
+				meta,
+				batch,
+				descriptor,
+				&identities,
+			)
+		}
+		(RowIdentityPolicy::AppendOnly, RowKeys::Identities(identities)) => {
+			crate::schema::table::admit_parent_decisions_append_only_rows(
+				meta, batch, descriptor, identities,
+			)
+		}
+		_ => return Err(ManifestRefusal::UnsupportedTable),
+	};
+	admitted.map_err(|error| ManifestRefusal::Admission(error.to_string()))
+}
+
+/// Each row's version, in the batch's row order, with identities from `keys`
+/// (wendelon ADR 0119). PrimaryKey derives them from values; a named AppendOnly
+/// table takes them given. Every other combination is refused.
+pub(crate) fn row_versions_keyed(
+	meta: &TableWriteRequestMeta,
+	batch: &RecordBatch,
+	descriptor: &TableSchemaDescriptor,
+	commit_hlc: HybridTimestamp,
+	keys: RowKeys<'_>,
+) -> Result<Vec<OwnedVersion>, ManifestRefusal> {
+	let admission = keyed_admission(meta, batch, descriptor, commit_hlc, keys)?;
 	let mut manifest = Vec::with_capacity(admission.key_identities.len());
 	for (row, key_identity) in admission.key_identities.iter().enumerate() {
 		let canonical = crate::storage::content_hash::encode_row_canonical(descriptor, batch, row)
@@ -227,13 +322,20 @@ pub(crate) fn row_versions_in_order(
 	Ok(manifest)
 }
 
+/// The manifest of a child's rows: one version per row, sorted, no repeats. A
+/// PrimaryKey table's rows only.
 pub(crate) fn child_manifest(
 	meta: &TableWriteRequestMeta,
 	batch: &RecordBatch,
 	descriptor: &TableSchemaDescriptor,
 	commit_hlc: HybridTimestamp,
 ) -> Result<Vec<OwnedVersion>, ManifestRefusal> {
-	let mut manifest = row_versions_in_order(meta, batch, descriptor, commit_hlc)?;
+	Ok(child_versions_keyed(meta, batch, descriptor, commit_hlc, RowKeys::Values)?.1)
+}
+
+/// The sorted manifest of `in_order`, refused if a version repeats.
+fn sorted_manifest(in_order: &[OwnedVersion]) -> Result<Vec<OwnedVersion>, ManifestRefusal> {
+	let mut manifest = in_order.to_vec();
 	manifest.sort();
 	if manifest.windows(2).any(|pair| {
 		(pair[0].table, pair[0].key_identity, pair[0].hlc)
@@ -365,38 +467,35 @@ impl AdmittedPlan {
 }
 
 /// The manifest of a child's rows: one version per row in batch order, and
-/// the sorted manifest the claim commits to.
+/// the sorted manifest the claim commits to. A PrimaryKey table's rows only.
 pub(super) fn child_versions(
 	meta: &TableWriteRequestMeta,
 	batch: &RecordBatch,
 	descriptor: &TableSchemaDescriptor,
 	commit_hlc: HybridTimestamp,
 ) -> Result<(Vec<OwnedVersion>, Vec<OwnedVersion>), ManifestRefusal> {
-	let manifest = child_manifest(meta, batch, descriptor, commit_hlc)?;
-	let admission = validate_table_write_request_batch(
-		meta,
-		batch,
-		descriptor,
-		writer_of(commit_hlc),
-		commit_hlc,
-	)
-	.map_err(|error| ManifestRefusal::Admission(error.to_string()))?;
-	let in_order = admission
-		.key_identities
-		.iter()
-		.map(|key| {
-			*manifest
-				.iter()
-				.find(|version| version.key_identity == *key.as_bytes())
-				.expect("every admitted row has a manifest entry")
-		})
-		.collect();
+	child_versions_keyed(meta, batch, descriptor, commit_hlc, RowKeys::Values)
+}
+
+/// `child_versions`, with identities from `keys` (wendelon ADR 0119): the
+/// batch-order versions come from one admission, index-aligned, and the sorted
+/// manifest is their sorted copy. No per-row search.
+pub(crate) fn child_versions_keyed(
+	meta: &TableWriteRequestMeta,
+	batch: &RecordBatch,
+	descriptor: &TableSchemaDescriptor,
+	commit_hlc: HybridTimestamp,
+	keys: RowKeys<'_>,
+) -> Result<(Vec<OwnedVersion>, Vec<OwnedVersion>), ManifestRefusal> {
+	let in_order = row_versions_keyed(meta, batch, descriptor, commit_hlc, keys)?;
+	let manifest = sorted_manifest(&in_order)?;
 	Ok((in_order, manifest))
 }
 
 /// Checks a child write against the applied state, independently of whoever
 /// sent it: the reservation and claim, the sender's recorded role, this store's
 /// place in the plan, the holder's lineage and lease, and the rows themselves.
+#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn plan_child(
 	state: &SmState,
@@ -405,6 +504,33 @@ pub(crate) fn plan_child(
 	role: ChildRole,
 	meta: &ChildWriteMeta,
 	batch: RecordBatch,
+	lease_covers: impl Fn(u64, u64) -> bool,
+) -> Result<ChildPlan, ChildRefusal> {
+	plan_child_keyed(
+		state,
+		local,
+		sender,
+		role,
+		meta,
+		batch,
+		GivenKeys::None,
+		lease_covers,
+	)
+}
+
+/// `plan_child`, with the row keys the frame carried (wendelon ADR 0119): none
+/// for a PrimaryKey or delete child, a named AppendOnly child's original
+/// ordinals on a write or replicate, its identities on a repair answer. Any
+/// other combination refuses.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn plan_child_keyed(
+	state: &SmState,
+	local: crate::consensus::decisions::Signer,
+	sender: u32,
+	role: ChildRole,
+	meta: &ChildWriteMeta,
+	batch: RecordBatch,
+	given: GivenKeys,
 	lease_covers: impl Fn(u64, u64) -> bool,
 ) -> Result<ChildPlan, ChildRefusal> {
 	use crate::consensus::decisions::{ChildAckBody, lineage_is_open};
@@ -489,6 +615,11 @@ pub(crate) fn plan_child(
 			{
 				return Err(ChildRefusal::ContentMismatch);
 			}
+			if given != GivenKeys::None {
+				return Err(ChildRefusal::Rows(ManifestRefusal::RowKeys(
+					"a delete child carries no row keys",
+				)));
+			}
 			let manifest = super::deletes::child_manifest(request, &rows, claim.commit_hlc);
 			let targets = rows.iter().map(|row| request.target(*row)).collect();
 			(manifest.clone(), manifest, Some(targets))
@@ -501,8 +632,53 @@ pub(crate) fn plan_child(
 				claim.commit_hlc,
 			)
 			.map_err(|_| ChildRefusal::Rows(ManifestRefusal::Admission("row count".into())))?;
+			let append_only = matches!(
+				descriptor.row_identity_policy,
+				crate::schema::RowIdentityPolicy::AppendOnly
+			);
+			// Wendelon ADR 0119 D4/D5: the section is decoded only here, once the
+			// operation (a write), the policy and the role fix what it holds, and
+			// only after the rows are bounded: the batch has exactly this child's
+			// count, and the write's N (the checked sum of the claim's child
+			// counts) is within the AppendOnly write bound.
+			let section = match &given {
+				GivenKeys::None => None,
+				GivenKeys::Section(bytes) => Some(bytes.as_slice()),
+			};
+			let refused = |why: &'static str| ChildRefusal::Rows(ManifestRefusal::RowKeys(why));
+			let ordinals: Vec<u32>;
+			let identities: Vec<crate::schema::Identity>;
+			let keys = match (append_only, section) {
+				(false, None) => RowKeys::Values,
+				(true, Some(bytes)) => {
+					let rows = claim_rows(claim).ok_or(ChildRefusal::ClaimMismatch)?;
+					if rows > crate::schema::table::TABLE_WRITE_MAX_ROWS as u64 {
+						return Err(refused("the write exceeds its row bound"));
+					}
+					if batch.num_rows() != child.rows as usize {
+						return Err(ChildRefusal::ContentMismatch);
+					}
+					match role {
+						ChildRole::Holder | ChildRole::Replica => {
+							ordinals = decode_ordinals(bytes, batch.num_rows())
+								.map_err(|_| refused("the ordinals do not match the rows"))?;
+							// D4: each ordinal lies inside the write of N rows.
+							if ordinals.iter().any(|ordinal| u64::from(*ordinal) >= rows) {
+								return Err(refused("an ordinal lies outside the write"));
+							}
+							RowKeys::Ordinals(&ordinals)
+						}
+						ChildRole::Repair => {
+							identities = decode_identities(bytes, batch.num_rows())
+								.map_err(|_| refused("the identities do not match the rows"))?;
+							RowKeys::Identities(&identities)
+						}
+					}
+				}
+				_ => return Err(refused("the row keys do not match the table and role")),
+			};
 			let (row_versions, manifest) =
-				child_versions(&request, &batch, &descriptor, claim.commit_hlc)
+				child_versions_keyed(&request, &batch, &descriptor, claim.commit_hlc, keys)
 					.map_err(ChildRefusal::Rows)?;
 			(row_versions, manifest, None)
 		};
@@ -611,10 +787,15 @@ fn to_replica_children(bifurcated: &BifurcatedTableWrite) -> Vec<TableReplicaChi
 		.collect()
 }
 
+/// `rows` are the indices in `plan.batch` of `batch`'s rows, in order (all of
+/// them, or the missing subset). Wendelon ADR 0119 D3: a named AppendOnly
+/// table's rows keep the identities the plan checked, taken at the same indices,
+/// so a sparse subset is never re-indexed.
 fn bifurcate_child(
 	slab: &SlabManager,
 	plan: &ChildPlan,
 	batch: &RecordBatch,
+	rows: &[u32],
 ) -> Result<BifurcatedTableWrite, ChildRefusal> {
 	let hlc = plan.ack_hlc();
 	let request = child_request_meta(
@@ -625,9 +806,31 @@ fn bifurcate_child(
 		hlc,
 	)
 	.map_err(|error| ChildRefusal::Storage(error.to_string()))?;
-	let admission =
+	let admission = if matches!(
+		plan.descriptor.row_identity_policy,
+		crate::schema::RowIdentityPolicy::AppendOnly
+	) {
+		let identities = rows
+			.iter()
+			.map(|row| {
+				plan.row_versions
+					.get(*row as usize)
+					.map(|version| crate::schema::Identity::new(version.key_identity))
+					.ok_or(ChildRefusal::Rows(ManifestRefusal::RowKeys(
+						"a row outside the plan",
+					)))
+			})
+			.collect::<Result<Vec<_>, _>>()?;
+		crate::schema::table::admit_parent_decisions_append_only_rows(
+			&request,
+			batch,
+			&plan.descriptor,
+			&identities,
+		)
+	} else {
 		validate_table_write_request_batch(&request, batch, &plan.descriptor, writer_of(hlc), hlc)
-			.map_err(|error| ChildRefusal::Rows(ManifestRefusal::Admission(error.to_string())))?;
+	}
+	.map_err(|error| ChildRefusal::Rows(ManifestRefusal::Admission(error.to_string())))?;
 	bifurcate_table_write_with_admission_and_row_group_encoding_and_chunk_layout_config(
 		&request,
 		batch,
@@ -651,6 +854,7 @@ pub(crate) async fn ingest_recovered_rows(
 	descriptor: &TableSchemaDescriptor,
 	batch: &RecordBatch,
 	hlc: HybridTimestamp,
+	identities: &[crate::schema::Identity],
 ) -> std::io::Result<()> {
 	let mut request: TableWriteRequestMeta = bytemuck::Zeroable::zeroed();
 	request.client_hlc = hlc;
@@ -659,9 +863,19 @@ pub(crate) async fn ingest_recovered_rows(
 	request.schema_generation = descriptor.schema_generation;
 	request.row_count = crate::schema::table::encode_table_write_row_count(batch.num_rows())?;
 	let invalid = |error: String| std::io::Error::new(std::io::ErrorKind::InvalidData, error);
-	let admission =
+	// Wendelon ADR 0119 D3: an append-only table's rows keep the identities of
+	// their certified entries, index-aligned with `batch`.
+	let admission = if matches!(
+		descriptor.row_identity_policy,
+		crate::schema::RowIdentityPolicy::AppendOnly
+	) {
+		crate::schema::table::admit_parent_decisions_append_only_rows(
+			&request, batch, descriptor, identities,
+		)
+	} else {
 		validate_table_write_request_batch(&request, batch, descriptor, writer_of(hlc), hlc)
-			.map_err(|error| invalid(error.to_string()))?;
+	}
+	.map_err(|error| invalid(error.to_string()))?;
 	let full = bifurcate_table_write_with_admission_and_row_group_encoding_and_chunk_layout_config(
 		&request,
 		batch,
@@ -992,7 +1206,8 @@ pub(super) async fn persist_locked(
 					return Err(ChildRefusal::OutOfRange);
 				}
 			} else {
-				let full = bifurcate_child(&slab, &plan, &plan.batch)?;
+				let all: Vec<u32> = (0..plan.batch.num_rows() as u32).collect();
+				let full = bifurcate_child(&slab, &plan, &plan.batch, &all)?;
 				if full.children.iter().any(|record| {
 					let position = record_position(record);
 					position < plan.intent.range_start || position > plan.intent.range_end
@@ -1064,10 +1279,10 @@ pub(super) async fn persist_locked(
 			if !missing.is_empty() {
 				let rows = arrow::compute::take_record_batch(
 					&plan.batch,
-					&arrow::array::UInt32Array::from(missing),
+					&arrow::array::UInt32Array::from(missing.clone()),
 				)
 				.map_err(|error| ChildRefusal::Storage(error.to_string()))?;
-				let bifurcated = bifurcate_child(&slab, &plan, &rows)?;
+				let bifurcated = bifurcate_child(&slab, &plan, &rows, &missing)?;
 				append_table_children_durable(
 					&slab,
 					plan.intent.tenant,
@@ -1567,14 +1782,16 @@ impl WendelonDataServer {
 		meta: ChildWriteMeta,
 		batch: RecordBatch,
 		rows: Arc<Vec<u8>>,
+		trailing: Arc<Vec<u8>>,
 	) -> Vec<crate::consensus::decisions::Signed<crate::consensus::decisions::ChildAckBody>> {
+		let given = GivenKeys::of_section(&trailing);
 		match self
-			.child_write(sender, ChildRole::Holder, meta.clone(), batch)
+			.child_write_keyed(sender, ChildRole::Holder, meta.clone(), batch, given)
 			.await
 		{
 			Ok(own) => {
 				let mut acks = vec![own];
-				acks.extend(self.fan_out_child(&meta, rows).await);
+				acks.extend(self.fan_out_child(&meta, rows, trailing).await);
 				acks
 			}
 			Err(_refusal) => {
@@ -1706,6 +1923,8 @@ impl WendelonDataServer {
 		context: &RequestContext,
 		frame: HrftFrame,
 	) -> std::io::Result<HrftFrame> {
+		// Wendelon ADR 0119 D6: the exact envelope version, before any decoding.
+		crate::consensus::decision_mode::check_peer_exchange_version(frame.header.version)?;
 		if frame.header.msg_type == MsgType::TABLE_CHILD_FETCH_REQ.0 {
 			let sender = context.require_authenticated_node("TABLE_CHILD_FETCH_REQ")?;
 			return self.handle_child_fetch(sender.id, frame).await;
@@ -1771,12 +1990,14 @@ impl WendelonDataServer {
 
 	/// One child write at this store: checked against applied state, persisted
 	/// under the parent's lock, and acknowledged with this store's signature.
-	pub(crate) async fn child_write(
+	/// A child write with the row keys its frame carried (wendelon ADR 0119).
+	pub(crate) async fn child_write_keyed(
 		&self,
 		sender: u32,
 		role: ChildRole,
 		meta: ChildWriteMeta,
 		batch: RecordBatch,
+		given: GivenKeys,
 	) -> Result<
 		crate::consensus::decisions::Signed<crate::consensus::decisions::ChildAckBody>,
 		ChildRefusal,
@@ -1806,11 +2027,20 @@ impl WendelonDataServer {
 				.epoch_history
 				.last_key_value()
 				.map(|(_, config)| config.epoch);
-			plan_child(state, local, sender, role, &meta, batch, |start, end| {
-				leases.iter().any(|(low, high, lease_epoch)| {
-					Some(*lease_epoch) == epoch && *low <= start && end <= *high
-				})
-			})
+			plan_child_keyed(
+				state,
+				local,
+				sender,
+				role,
+				&meta,
+				batch,
+				given,
+				|start, end| {
+					leases.iter().any(|(low, high, lease_epoch)| {
+						Some(*lease_epoch) == epoch && *low <= start && end <= *high
+					})
+				},
+			)
 		})
 		.await?;
 		persist_child(
@@ -1836,6 +2066,7 @@ impl WendelonDataServer {
 		&self,
 		meta: &ChildWriteMeta,
 		rows: Arc<Vec<u8>>,
+		trailing: Arc<Vec<u8>>,
 	) -> Vec<crate::consensus::decisions::Signed<crate::consensus::decisions::ChildAckBody>> {
 		let local = self.local_node.id;
 		let rsv = meta.rsv;
@@ -1859,7 +2090,7 @@ impl WendelonDataServer {
 		// dropping the set (this future cancelled) aborts the rest.
 		let mut sends = tokio::task::JoinSet::new();
 		for member in members.into_iter().filter(|member| *member != local) {
-			sends.spawn(send_child_frame(
+			sends.spawn(send_child_frame_with_trailing(
 				self.factory.clone(),
 				self.pool.clone(),
 				NodeId {
@@ -1869,6 +2100,7 @@ impl WendelonDataServer {
 				ChildRpc::Replicate,
 				meta_bytes.clone(),
 				rows.clone(),
+				trailing.clone(),
 			));
 		}
 		let mut acks = Vec::new();
@@ -1888,6 +2120,14 @@ impl WendelonDataServer {
 		frame: HrftFrame,
 	) -> std::io::Result<HrftFrame> {
 		let rows: Option<&[u8]> = frame.arrow_payload.as_ref().map(|bytes| bytes.as_ref());
+		// Wendelon ADR 0119 D5: the trailing section is kept undecoded here.
+		let trailing = Arc::new(
+			frame
+				.trailing
+				.as_ref()
+				.map(|bytes| bytes.as_ref().to_vec())
+				.unwrap_or_default(),
+		);
 		let decoded = decode_child_frame(frame.meta.as_ref(), rows);
 		#[cfg(test)]
 		if let Ok((meta, _)) = &decoded {
@@ -1897,14 +2137,17 @@ impl WendelonDataServer {
 			Err(reason) => ChildWriteResponse::Refused(reason),
 			Ok((meta, batch)) if role == ChildRole::Holder => {
 				let rows = Arc::new(rows.unwrap_or_default().to_vec());
-				let acks = self.holder_write(sender, meta, batch, rows).await;
+				let acks = self.holder_write(sender, meta, batch, rows, trailing).await;
 				if acks.is_empty() {
 					ChildWriteResponse::Refused("the holder could not write its child".into())
 				} else {
 					ChildWriteResponse::Acked(acks)
 				}
 			}
-			Ok((meta, batch)) => match self.child_write(sender, role, meta, batch).await {
+			Ok((meta, batch)) => match self
+				.child_write_keyed(sender, role, meta, batch, GivenKeys::of_section(&trailing))
+				.await
+			{
 				Err(refusal) => ChildWriteResponse::Refused(format!("{refusal:?}")),
 				Ok(own) => ChildWriteResponse::Acked(vec![own]),
 			},
@@ -1920,7 +2163,7 @@ impl WendelonDataServer {
 		Ok(HrftFrame {
 			header: FrameHeader {
 				magic: HRFT_MAGIC,
-				version: 1,
+				version: crate::consensus::decision_mode::RAFT_FRAME_VERSION_PARENT_DECISIONS,
 				msg_type: msg_type.0,
 				flags: 0,
 				stream_id: frame.header.stream_id,
@@ -2004,26 +2247,50 @@ pub(crate) async fn send_child_frame(
 	meta: Vec<u8>,
 	rows: Arc<Vec<u8>>,
 ) -> std::io::Result<ChildWriteResponse> {
+	send_child_frame_with_trailing(factory, pool, target, rpc, meta, rows, Arc::new(Vec::new()))
+		.await
+}
+
+/// `send_child_frame`, with `trailing` (a named AppendOnly child's ordinals,
+/// wendelon ADR 0119 D5) as the frame's trailing section when non-empty.
+pub(crate) async fn send_child_frame_with_trailing(
+	factory: Arc<TransportProviderFactory>,
+	pool: Arc<BufPool>,
+	target: NodeId,
+	rpc: ChildRpc,
+	meta: Vec<u8>,
+	rows: Arc<Vec<u8>>,
+	trailing: Arc<Vec<u8>>,
+) -> std::io::Result<ChildWriteResponse> {
 	let deadline = tokio::time::Instant::now() + rpc.budget();
 	let attempt = async {
 		let conn = factory.get_connection(target).await?;
 		let mut stream = conn.open_bi().await?;
 		let header = FrameHeader {
 			magic: HRFT_MAGIC,
-			version: 1,
+			version: crate::consensus::decision_mode::RAFT_FRAME_VERSION_PARENT_DECISIONS,
 			msg_type: rpc.request().0,
 			flags: 0,
 			stream_id: 0,
 			meta_len: meta.len() as u32,
 			arrow_len: rows.len() as u32,
-			trailing_len: 0,
+			trailing_len: trailing.len() as u32,
 		};
-		write_frame(&mut *stream, &header, &meta, Some(rows.as_slice()), None).await?;
+		let trailing_section = (!trailing.is_empty()).then_some(trailing.as_slice());
+		write_frame(
+			&mut *stream,
+			&header,
+			&meta,
+			Some(rows.as_slice()),
+			trailing_section,
+		)
+		.await?;
 		stream
 			.finish()
 			.await
 			.map_err(|error| Error::new(ErrorKind::BrokenPipe, error))?;
 		let response = read_frame(&mut *stream, &pool).await?;
+		crate::consensus::decision_mode::check_peer_exchange_version(response.header.version)?;
 		if response.header.msg_type != rpc.response().0 {
 			return Err(Error::new(
 				ErrorKind::InvalidData,
@@ -2300,4 +2567,209 @@ pub(crate) mod registry_probe {
 			}
 		}
 	}
+}
+
+/// Wendelon ADR 0119 D5: the row keys a child frame carries in its trailing
+/// section, still undecoded: none, or the section's raw bytes. What they are (a
+/// named AppendOnly write or replicate's original ordinals, a repair answer's
+/// identities) and how long they must be are known only once the claim, its
+/// operation, the table's policy and the receiver's role are; `plan_child_keyed`
+/// decodes them only then, after the row bounds (Codex 01a1f9ca).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum GivenKeys {
+	None,
+	Section(Arc<Vec<u8>>),
+}
+
+impl GivenKeys {
+	/// A frame's trailing section: absent or empty, none.
+	pub(crate) fn of_section(section: &Arc<Vec<u8>>) -> Self {
+		if section.is_empty() {
+			Self::None
+		} else {
+			Self::Section(section.clone())
+		}
+	}
+}
+
+/// Wendelon ADR 0119 D4: N, the rows of a claim's write: the checked sum of its
+/// children's counts.
+pub(crate) fn claim_rows(claim: &crate::consensus::decisions::Claim) -> Option<u64> {
+	claim
+		.children
+		.iter()
+		.try_fold(0u64, |sum, child| sum.checked_add(u64::from(child.rows)))
+}
+
+#[cfg(test)]
+thread_local! {
+	/// Test-only: how many key sections this thread decoded into a vector (Codex
+	/// 01a1f9ca, 01a1f9f6: a section of the wrong kind is refused before any is
+	/// built; scoped to the thread, so only the calling test's own plans count).
+	pub(crate) static KEY_SECTION_DECODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Wendelon ADR 0119 D5: ordinals as the trailing section carries them: u32
+/// big-endian, in batch order.
+pub(crate) fn encode_ordinals(ordinals: &[u32]) -> Vec<u8> {
+	ordinals
+		.iter()
+		.flat_map(|ordinal| ordinal.to_be_bytes())
+		.collect()
+}
+
+/// Decodes `rows` ordinals from a trailing section, its exact length checked
+/// (with checked arithmetic) before any vector is built.
+pub(crate) fn decode_ordinals(bytes: &[u8], rows: usize) -> Result<Vec<u32>, String> {
+	let expected = rows.checked_mul(4).ok_or("the ordinal section overflows")?;
+	if bytes.len() != expected {
+		return Err("the ordinals do not match the rows".into());
+	}
+	#[cfg(test)]
+	KEY_SECTION_DECODES.with(|count| count.set(count.get() + 1));
+	Ok(bytes
+		.chunks_exact(4)
+		.map(|chunk| u32::from_be_bytes(chunk.try_into().expect("four bytes")))
+		.collect())
+}
+
+/// Wendelon ADR 0119 D5: identities as a repair answer's trailing section carries
+/// them: 32 bytes each, in row order.
+pub(crate) fn encode_identities(identities: &[crate::schema::Identity]) -> Vec<u8> {
+	identities
+		.iter()
+		.flat_map(|identity| *identity.as_bytes())
+		.collect()
+}
+
+/// Decodes `rows` identities from a trailing section, its exact length checked
+/// before any vector is built.
+pub(crate) fn decode_identities(
+	bytes: &[u8],
+	rows: usize,
+) -> Result<Vec<crate::schema::Identity>, String> {
+	let expected = rows
+		.checked_mul(32)
+		.ok_or("the identity section overflows")?;
+	if bytes.len() != expected {
+		return Err("the identities do not match the rows".into());
+	}
+	#[cfg(test)]
+	KEY_SECTION_DECODES.with(|count| count.set(count.get() + 1));
+	Ok(bytes
+		.chunks_exact(32)
+		.map(|chunk| crate::schema::Identity::new(chunk.try_into().expect("32 bytes")))
+		.collect())
+}
+
+/// Wendelon ADR 0119 D5 (Codex 01a1f9ca): the column representations whose
+/// repair answer is bounded by its write. A flat column's values and offsets
+/// are the same bytes however its rows were assembled: `take` of the write's
+/// rows and the server's concatenation of individually stored rows produce
+/// equal value and offset buffers, and differ at most by one validity bitmap.
+/// Dictionary, view, nested and union columns are not flat (their concatenation
+/// can merge or repeat dictionaries and views). This is a necessary condition
+/// only, wider than what a table admits: admission enforces the ADR's declared
+/// set, [`parent_decisions_append_only_column`], which is a subset of it.
+pub(crate) fn repair_bounded_column(data_type: &arrow::datatypes::DataType) -> bool {
+	use arrow::datatypes::DataType as T;
+	matches!(
+		data_type,
+		T::Null
+			| T::Boolean
+			| T::Int8 | T::Int16
+			| T::Int32
+			| T::Int64
+			| T::UInt8
+			| T::UInt16
+			| T::UInt32
+			| T::UInt64
+			| T::Float16
+			| T::Float32
+			| T::Float64
+			| T::Decimal32(..)
+			| T::Decimal64(..)
+			| T::Decimal128(..)
+			| T::Decimal256(..)
+			| T::Date32
+			| T::Date64
+			| T::Time32(_)
+			| T::Time64(_)
+			| T::Timestamp(..)
+			| T::Duration(_)
+			| T::Interval(_)
+			| T::Binary
+			| T::LargeBinary
+			| T::Utf8 | T::LargeUtf8
+			| T::FixedSizeBinary(_)
+	)
+}
+
+/// The IPC body alignment of `encode_batch` (`IpcWriteOptions::default()`).
+pub(crate) const IPC_BUFFER_ALIGNMENT: usize = 64;
+
+/// Wendelon ADR 0119 D5 (Codex 01a1f9ca): the largest encoded repair answer for
+/// a child whose write sub-batch (`take` of its rows) encodes to `write_bytes`,
+/// over `columns` flat columns and `rows` rows. The answer is the server's
+/// concatenation of the stored rows, encoded uncompressed under the same schema:
+/// - every value and offset buffer has exactly the write's length (flat columns);
+/// - its stream holds the same messages, with the same field nodes and buffer
+///   entries (fixed-size records), so its metadata is the write's size;
+/// - a column's validity buffer is at most one bitmap of `rows` bits, which the
+///   write may lack: at most `ceil(rows / 8)` bytes, padded to the alignment.
+///
+/// So `answer <= write_bytes + columns * pad(ceil(rows / 8))`. `None` on overflow.
+pub(crate) fn repair_rows_bound(write_bytes: usize, columns: usize, rows: usize) -> Option<usize> {
+	let bitmap = rows
+		.div_ceil(8)
+		.checked_next_multiple_of(IPC_BUFFER_ALIGNMENT)?;
+	columns.checked_mul(bitmap)?.checked_add(write_bytes)
+}
+
+/// Wendelon ADR 0119 D5 (Codex 01a1fa16): the column types a named
+/// ParentDecisions AppendOnly table admits, the ADR's declared set. Each is
+/// flat ([`repair_bounded_column`], so its repair answer is bounded) and has a
+/// canonical row encoding (`storage::content_hash`). `Null`, `Float16` and
+/// `FixedSizeBinary` are flat but have none; the canonical encoding skips a null
+/// cell before its type check, so they are refused here, by the schema, before
+/// any identity, whatever the payload.
+pub(crate) fn parent_decisions_append_only_column(data_type: &arrow::datatypes::DataType) -> bool {
+	use arrow::datatypes::DataType as T;
+	matches!(
+		data_type,
+		T::Boolean
+			| T::Int8 | T::Int16
+			| T::Int32
+			| T::Int64
+			| T::UInt8
+			| T::UInt16
+			| T::UInt32
+			| T::UInt64
+			| T::Float32
+			| T::Float64
+			| T::Decimal32(..)
+			| T::Decimal64(..)
+			| T::Decimal128(..)
+			| T::Decimal256(..)
+			| T::Date32
+			| T::Date64
+			| T::Time32(_)
+			| T::Time64(_)
+			| T::Timestamp(..)
+			| T::Duration(_)
+			| T::Interval(_)
+			| T::Utf8 | T::LargeUtf8
+			| T::Binary
+			| T::LargeBinary
+	) && repair_bounded_column(data_type)
+}
+
+/// Every user column of `descriptor` is [`parent_decisions_append_only_column`].
+pub(crate) fn parent_decisions_append_only_schema(descriptor: &TableSchemaDescriptor) -> bool {
+	descriptor.arrow_schema().is_ok_and(|schema| {
+		schema
+			.fields()
+			.iter()
+			.all(|field| parent_decisions_append_only_column(field.data_type()))
+	})
 }

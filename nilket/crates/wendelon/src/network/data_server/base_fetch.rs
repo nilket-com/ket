@@ -133,7 +133,7 @@ impl WendelonDataServer {
 		Ok(HrftFrame {
 			header: FrameHeader {
 				magic: HRFT_MAGIC,
-				version: 1,
+				version: crate::consensus::decision_mode::RAFT_FRAME_VERSION_PARENT_DECISIONS,
 				msg_type: MsgType::TABLE_BASE_FETCH_RESP.0,
 				flags: 0,
 				stream_id: frame.header.stream_id,
@@ -425,7 +425,21 @@ pub(crate) fn check_page(
 	// Row i must be entry i: the rows are paired with their entries by position,
 	// and each entry's HLC is assigned to its own row at ingestion. A permutation
 	// is refused here, before anything is stored.
-	let versions = super::child_writes::row_versions_in_order(&meta, rows, descriptor, hlc)
+	// Wendelon ADR 0119 D3: an append-only table's rows are paired with their
+	// verified entries' identities; their payload digests are checked below.
+	let identities: Vec<Identity> = wanted
+		.iter()
+		.map(|entry| Identity::new(entry.key_identity))
+		.collect();
+	let keys = if matches!(
+		descriptor.row_identity_policy,
+		crate::schema::RowIdentityPolicy::AppendOnly
+	) {
+		super::child_writes::RowKeys::Identities(&identities)
+	} else {
+		super::child_writes::RowKeys::Values
+	};
+	let versions = super::child_writes::row_versions_keyed(&meta, rows, descriptor, hlc, keys)
 		.map_err(|error| PageRefusal::RowsMismatch(format!("{error:?}")))?;
 	for (version, entry) in versions.iter().zip(wanted) {
 		if (version.key_identity, version.row_digest) != (entry.key_identity, entry.row_digest) {

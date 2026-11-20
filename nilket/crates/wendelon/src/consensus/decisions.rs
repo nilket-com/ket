@@ -426,7 +426,9 @@ pub fn delete_request_digest(tenant: TenantId, request: &DeleteRequest) -> [u8; 
 }
 
 /// The routing locality of a row id, for a PrimaryKey table whose locality is
-/// a function of the id alone; `None` for any other table.
+/// a function of the id alone, and (wendelon ADR 0119 D2) a named AppendOnly
+/// table under ParentDecisions, whose rows are placed by their identity's table
+/// spread; `None` for any other table.
 pub fn delete_row_locality(
 	tenant: TenantId,
 	descriptor: &crate::schema::TableSchemaDescriptor,
@@ -435,7 +437,7 @@ pub fn delete_row_locality(
 	use crate::schema::{LocalityPolicy, RowIdentityPolicy};
 	if !matches!(
 		descriptor.row_identity_policy,
-		RowIdentityPolicy::PrimaryKey(_)
+		RowIdentityPolicy::PrimaryKey(_) | RowIdentityPolicy::AppendOnly
 	) {
 		return None;
 	}
@@ -3041,6 +3043,29 @@ fn validate_claim(
 					.is_none() || state.table_drop_blocks_admission(claim.key.tenant, table)
 			{
 				return Err(TableUnavailable);
+			}
+			// Wendelon ADR 0119 D4: an append-only table's write holds N rows, N
+			// the checked sum of its children's counts, at most the public input
+			// limit; every receiver checks each ordinal is below N.
+			if claim.operation == Operation::Write
+				&& state
+					.table_schemas
+					.latest_by_id(claim.key.tenant, table)
+					.is_some_and(|descriptor| {
+						matches!(
+							descriptor.row_identity_policy,
+							crate::schema::RowIdentityPolicy::AppendOnly
+						)
+					}) {
+				let rows = claim
+					.children
+					.iter()
+					.try_fold(0u64, |sum, child| sum.checked_add(u64::from(child.rows)));
+				if !rows
+					.is_some_and(|rows| rows <= crate::schema::table::TABLE_WRITE_MAX_ROWS as u64)
+				{
+					return Err(MalformedClaim);
+				}
 			}
 		}
 		// ADR 0699 S4b: a KV parent writes one key: one child of one row at one

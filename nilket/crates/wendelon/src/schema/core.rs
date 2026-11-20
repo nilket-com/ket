@@ -2623,7 +2623,10 @@ pub const SNAPSHOT_FORMAT_VERSION: u8 = 21;
 ///
 /// Wendelon ADR 0118: 31, whose ParentDecisions table drop is one replicated rule
 /// (30 was wendelon ADR 0113 to ADR 0117's, under test admission only).
-pub const SNAPSHOT_FORMAT_VERSION_PARENT_DECISIONS: u8 = 31;
+///
+/// Wendelon ADR 0119: 32, whose named AppendOnly tables are written with row
+/// identities by operation and position (31 was wendelon ADR 0118's).
+pub const SNAPSHOT_FORMAT_VERSION_PARENT_DECISIONS: u8 = 32;
 
 /// Shape of the Control Ring WAL record bodies this build writes, including the
 /// `postcard(Entry<..>)` payload of a log record. ADR 0697 version 6 carries
@@ -2681,7 +2684,11 @@ pub const WAL_FORMAT_VERSION: u8 = 21;
 /// Wendelon ADR 0118: 31. A ParentDecisions table drop Prepare applies as one
 /// replicated rule; an earlier log is refused whole (30 was wendelon ADR 0113 to
 /// ADR 0117's).
-pub const WAL_FORMAT_VERSION_PARENT_DECISIONS: u8 = 31;
+///
+/// Wendelon ADR 0119: 32. A claim on a named AppendOnly table applies (its rows
+/// bounded, their identities by operation and position); an earlier log is
+/// refused whole (31 was wendelon ADR 0118's).
+pub const WAL_FORMAT_VERSION_PARENT_DECISIONS: u8 = 32;
 
 // Static assertions to ensure all our size calculations remain exactly correct
 const _: () = assert!(std::mem::size_of::<HybridTimestamp>() == 16);

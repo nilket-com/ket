@@ -152,7 +152,13 @@ impl NotServing {
 		HrftFrame {
 			header: FrameHeader {
 				magic: HRFT_MAGIC,
-				version: 1,
+				// Wendelon ADR 0119 D6: a peer exchange answer travels in the
+				// decision envelope, as its request did.
+				version: if crate::consensus::decision_mode::is_peer_exchange_frame(msg_type.0) {
+					crate::consensus::decision_mode::RAFT_FRAME_VERSION_PARENT_DECISIONS
+				} else {
+					1
+				},
 				msg_type: msg_type.0,
 				flags,
 				stream_id,

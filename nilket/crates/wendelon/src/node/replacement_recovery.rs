@@ -927,8 +927,13 @@ impl RecoveryDriver {
 		rows: Option<&RecordBatch>,
 	) -> std::io::Result<()> {
 		let mut row = 0_u32;
-		let mut by_hlc: std::collections::BTreeMap<crate::schema::HybridTimestamp, Vec<u32>> =
-			std::collections::BTreeMap::new();
+		// Each HLC group's row indices and, index-aligned, their entries'
+		// identities (wendelon ADR 0119 D3: an append-only row keeps its certified
+		// identity, never one derived from its place in the group).
+		let mut by_hlc: std::collections::BTreeMap<
+			crate::schema::HybridTimestamp,
+			(Vec<u32>, Vec<crate::schema::Identity>),
+		> = std::collections::BTreeMap::new();
 		for entry in entries {
 			if entry.tombstone {
 				let delete = crate::consensus::decisions::TombstoneTarget {
@@ -946,20 +951,29 @@ impl RecoveryDriver {
 				)
 				.await?;
 			} else {
-				by_hlc.entry(entry.hlc).or_default().push(row);
+				let group = by_hlc.entry(entry.hlc).or_default();
+				group.0.push(row);
+				group
+					.1
+					.push(crate::schema::Identity::new(entry.key_identity));
 				row += 1;
 			}
 		}
 		if let Some(rows) = rows {
 			let tenant = entries[0].tenant;
-			for (hlc, indices) in by_hlc {
+			for (hlc, (indices, identities)) in by_hlc {
 				let batch = arrow::compute::take_record_batch(
 					rows,
 					&arrow::array::UInt32Array::from(indices),
 				)
 				.map_err(Error::other)?;
 				crate::network::data_server::child_writes::ingest_recovered_rows(
-					&self.slab, tenant, descriptor, &batch, hlc,
+					&self.slab,
+					tenant,
+					descriptor,
+					&batch,
+					hlc,
+					&identities,
 				)
 				.await?;
 			}
@@ -1097,7 +1111,7 @@ async fn fetch_page(
 		let mut stream = connection.open_bi().await?;
 		let header = FrameHeader {
 			magic: HRFT_MAGIC,
-			version: 1,
+			version: crate::consensus::decision_mode::RAFT_FRAME_VERSION_PARENT_DECISIONS,
 			msg_type: MsgType::TABLE_BASE_FETCH_REQ.0,
 			flags: 0,
 			stream_id: 0,
@@ -1110,6 +1124,8 @@ async fn fetch_page(
 		// The answer's size is checked from its header before its body is read:
 		// meta plus Arrow payload within the request's byte bound.
 		let header = crate::network::core::read_frame_header(&mut *stream).await?;
+		// Wendelon ADR 0119 D6: the exact envelope version, before the body.
+		crate::consensus::decision_mode::check_peer_exchange_version(header.version)?;
 		let size = u64::from(header.meta_len)
 			+ u64::from(header.arrow_len)
 			+ u64::from(header.trailing_len);

@@ -5766,6 +5766,38 @@ async fn an_old_binarys_export_restores_verified_on_the_new_binary() {
 	for id in NODES {
 		target.daemons.stop(id, deadline);
 	}
+	// Wendelon ADR 0119 D6, the other direction: the PREVIOUS binary's ordinary
+	// startup on a disposable copy of a genuine new node directory refuses, and
+	// leaves every durable byte as it was.
+	let original = target.members[0]
+		.config
+		.parent()
+		.expect("a node directory")
+		.to_path_buf();
+	let copy = target.root.join("new-store-copy");
+	copy_tree(&original, &copy);
+	let config = copy.join(target.members[0].config.file_name().unwrap());
+	let before = durable_bytes(&copy.join("data"));
+	assert!(!before.is_empty(), "premise: the new store holds files");
+	let started = bounded_run(
+		&PathBuf::from(required("WENDELON_SMOKE_NILKET_OLD_BIN")),
+		&["wendelon".into(), config.into()],
+		Instant::now() + Duration::from_secs(120),
+	);
+	eprintln!(
+		"ADR 0119 D6: the previous binary on a new store: {}",
+		started.text()
+	);
+	assert!(
+		started.within && !started.timed_out && !started.succeeded(),
+		"the previous binary refuses the new store: {}",
+		started.text()
+	);
+	assert_eq!(
+		durable_bytes(&copy.join("data")),
+		before,
+		"no durable byte of the new store changed"
+	);
 	assert!(Instant::now() < deadline, "the test overran its bound");
 	std::fs::remove_dir_all(&source.root).unwrap();
 	std::fs::remove_dir_all(&target.root).unwrap();

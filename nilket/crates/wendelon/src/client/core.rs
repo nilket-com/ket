@@ -867,6 +867,9 @@ impl WendelonClient {
 				"TABLE_WRITE_REQ must contain at least one row",
 			));
 		};
+		let key_locality = self
+			.parent_decisions_append_only_preview(&request)
+			.unwrap_or(key_locality);
 		// ADR 0729: one caller deadline over the whole call, a finite budget for
 		// each node's connect, and a per-call list of nodes that gave no stream.
 		// See `MutationRoute`.
@@ -3383,6 +3386,38 @@ impl WendelonClient {
 	/// membership snapshot. Returns false for peers absent from the
 	/// snapshot, which means the dispatcher silently skips the
 	/// optional path rather than racing against a stale view.
+	/// Wendelon ADR 0119 D7: a routing hint only, the server still deciding. When
+	/// every known peer advertises ParentDecisions and the table is append-only,
+	/// row 0's placement follows its ParentDecisions identity (the operation and
+	/// ordinal 0), and the route is the masked partition position the authority
+	/// is chosen at, not the raw locality (a ring boundary may lie between them).
+	/// Missing, partial or inconsistent bits, or any other table: `None`, and the
+	/// preview stays Today's.
+	fn parent_decisions_append_only_preview(
+		&self,
+		request: &TableWriteRequest,
+	) -> Option<Locality> {
+		let descriptor = &request.descriptor;
+		if !matches!(
+			descriptor.row_identity_policy,
+			crate::schema::RowIdentityPolicy::AppendOnly
+		) {
+			return None;
+		}
+		let all_parent_decisions = {
+			let topology = self.topology_tx.borrow();
+			!topology.peers.is_empty()
+				&& topology
+					.peers
+					.values()
+					.all(|peer| peer.capabilities.contains(NodeCapability::ParentDecisions))
+		};
+		if !all_parent_decisions {
+			return None;
+		}
+		parent_decisions_append_only_route(&request.meta, descriptor)
+	}
+
 	fn peer_advertises(&self, target: NodeId, capability: NodeCapability) -> bool {
 		self.topology_tx
 			.borrow()
@@ -6417,5 +6452,40 @@ mod tenant_admin_outcome_tests {
 		);
 		// Accepted without GRANTED is not a success.
 		assert!(tenant_admin_outcome(response(true, CONTROL_REASON_INVALID_CONFIG, None)).is_err());
+	}
+}
+
+/// Wendelon ADR 0119 D7: the route of an append-only write's row 0 under
+/// ParentDecisions: its identity (the operation and ordinal 0), that identity's
+/// table spread, then the masked partition position the authority is chosen at
+/// (the raw locality when the table is unpartitioned). `None` when the table has
+/// no table spread.
+pub(crate) fn parent_decisions_append_only_route(
+	meta: &crate::schema::TableWriteRequestMeta,
+	descriptor: &crate::schema::TableSchemaDescriptor,
+) -> Option<Locality> {
+	let crate::schema::LocalityPolicy::TableSpreadProjection(spread) = descriptor.locality_policy
+	else {
+		return None;
+	};
+	let identity = crate::schema::table::parent_decisions_append_only_row_id(
+		meta.tenant_id,
+		meta.table_object_id,
+		meta.parent_write_id.client_uuid,
+		meta.parent_write_id.sequence_no,
+		0,
+	);
+	let raw = crate::schema::table::table_spread_locality(
+		meta.tenant_id,
+		meta.table_object_id,
+		identity,
+		spread,
+	)
+	.ok()?;
+	match crate::schema::table::partitioned_prefix_width(descriptor) {
+		Some(bits) => crate::schema::table::partition_for_locality(raw, bits)
+			.ok()
+			.map(|partition| Locality::new(partition.get())),
+		None => Some(raw),
 	}
 }
