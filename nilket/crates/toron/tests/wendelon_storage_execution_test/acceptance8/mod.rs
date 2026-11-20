@@ -471,6 +471,7 @@ async fn acc8_persistent_postappend_hold_has_frozen_outcome() {
 			.await
 	});
 	let entered = ops.wait_entered().await;
+	let writes_at_entry = ops.writes.load(Ordering::SeqCst);
 	let observed = tokio::time::timeout_at(
 		tokio::time::Instant::from_std(entered + Duration::from_secs(35)),
 		&mut write,
@@ -481,7 +482,31 @@ async fn acc8_persistent_postappend_hold_has_frozen_outcome() {
 		Err(_) => None,
 	};
 	let pending = !write.is_finished();
+	// The retries replayed the recorded stall: one gated append, no new write.
+	let gated = ops.events.lock().unwrap().clone();
+	assert_eq!(gated.len(), 1, "one gated append: {gated:?}");
+	assert_eq!(
+		ops.writes.load(Ordering::SeqCst),
+		writes_at_entry,
+		"no write after the gate"
+	);
 	expectation::persistent(&outcome, pending);
+	// While the gate still holds: the server's record for this identity is the
+	// stall itself, bounded on its own.
+	let Some(Err(wendelon_client::ClientError::MutationStopped { operation_id, .. })) = &outcome
+	else {
+		unreachable!("checked above")
+	};
+	let resolved = tokio::time::timeout(
+		Duration::from_secs(5),
+		fixture
+			.client
+			.resolve_table_mutation(LIVE_TENANT, *operation_id),
+	)
+	.await
+	.expect("the resolve answers within 5s")
+	.expect("the resolve");
+	expectation::persisted_stall(&resolved, *operation_id);
 	eprintln!(
 		"ACC8 persistent elapsed_ms={} gate={:?}",
 		entered.elapsed().as_millis(),
