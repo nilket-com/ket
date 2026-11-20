@@ -31,7 +31,7 @@ const MODE_MARKER_BYTES: &[u8] = b"parent-decisions-v20\n";
 /// S1's development marker. Its stores hold format-9 records, whose bodies were
 /// today's; no conversion exists, so both authorities refuse it as malformed.
 #[cfg(test)]
-const RETIRED_MARKER_BYTES_V1: &[u8] = b"parent-decisions-v1\n";
+const RETIRED_MARKER_BYTES_S1: &[u8] = b"parent-decisions-v1\n";
 /// S2's marker, for stores holding format-10 records (no signer registry,
 /// stand-in signatures). Refused like S1's.
 #[cfg(test)]
@@ -787,7 +787,7 @@ mod tests {
 			match make {
 				0 => fs::write(&marker, b"").unwrap(),
 				1 => fs::write(&marker, b"parent-decisions-v21\n").unwrap(),
-				4 => fs::write(&marker, RETIRED_MARKER_BYTES_V1).unwrap(),
+				4 => fs::write(&marker, RETIRED_MARKER_BYTES_S1).unwrap(),
 				5 => fs::write(&marker, RETIRED_MARKER_BYTES_V2).unwrap(),
 				6 => fs::write(&marker, RETIRED_MARKER_BYTES_V3).unwrap(),
 				7 => fs::write(&marker, RETIRED_MARKER_BYTES_V4).unwrap(),

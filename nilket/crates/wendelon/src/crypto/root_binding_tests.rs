@@ -93,10 +93,7 @@ fn cached_tenant_keks(manager: &CryptoManager) -> usize {
 
 #[test]
 fn the_root_check_encoding_is_pinned() {
-	assert_eq!(
-		&ROOT_CHECK_PLAINTEXT_V1,
-		b"wendelon root check plaintext v1"
-	);
+	assert_eq!(&ROOT_CHECK_PLAINTEXT, b"wendelon root check plaintext v1");
 	assert_eq!(ROOT_CHECK_VERSION, 1);
 	let manager = unverified();
 	let check = manager.candidate_root_check().unwrap();
@@ -114,7 +111,7 @@ fn the_root_check_encoding_is_pinned() {
 	assert_ne!(unverified().candidate_root_check().unwrap(), check);
 	// The plaintext is the prescribed constant.
 	let unwrapped = manager.provider.unwrap_tenant_kek(&check.wrapped).unwrap();
-	assert_eq!(unwrapped.as_ref(), &ROOT_CHECK_PLAINTEXT_V1);
+	assert_eq!(unwrapped.as_ref(), &ROOT_CHECK_PLAINTEXT);
 }
 
 #[test]

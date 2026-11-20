@@ -958,7 +958,7 @@ pub const ROOT_CHECK_VERSION: u16 = 1;
 /// AES-KWP output length for the 32-byte check plaintext.
 pub const ROOT_CHECK_WRAPPED_BYTES: usize = 40;
 /// The fixed public plaintext every root wraps to produce its check value.
-const ROOT_CHECK_PLAINTEXT_V1: [u8; 32] = *b"wendelon root check plaintext v1";
+const ROOT_CHECK_PLAINTEXT: [u8; 32] = *b"wendelon root check plaintext v1";
 
 /// First 16 bytes of SHA-256 over the big-endian version and the wrapped bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -1075,7 +1075,7 @@ pub(crate) fn is_root_kek_artifact_dir(path: &Path) -> std::io::Result<bool> {
 
 fn compute_root_check(provider: &dyn RootKekProvider) -> std::io::Result<RootCheck> {
 	let plaintext =
-		KeyMaterialBytes::copy_from_slice(&ROOT_CHECK_PLAINTEXT_V1, "root check plaintext")?;
+		KeyMaterialBytes::copy_from_slice(&ROOT_CHECK_PLAINTEXT, "root check plaintext")?;
 	let check = RootCheck {
 		version: ROOT_CHECK_VERSION,
 		wrapped: provider.wrap_tenant_kek(&plaintext)?,
@@ -1096,7 +1096,7 @@ fn verify_root_check(provider: &dyn RootKekProvider, check: &RootCheck) -> std::
 		return Ok(false);
 	}
 	match provider.unwrap_tenant_kek(&check.wrapped) {
-		Ok(plaintext) => Ok(plaintext.as_ref() == ROOT_CHECK_PLAINTEXT_V1),
+		Ok(plaintext) => Ok(plaintext.as_ref() == ROOT_CHECK_PLAINTEXT),
 		Err(_) => Ok(false),
 	}
 }
