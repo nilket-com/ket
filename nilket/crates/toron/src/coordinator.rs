@@ -3064,6 +3064,24 @@ async fn drop_ctas_object_storage(
 	}
 }
 
+/// DC-277: discards the losing provisional object of a proven publication
+/// conflict, by its captured identity. Wendelon's DROP lookup hides a provisional
+/// descriptor, so it answers TableMissing (here `StorageTableMissing`): this call
+/// then drops nothing. That answer says nothing about committed row bytes.
+/// `RecordPublicationConflict` applies its own owner, phase and unbound-object
+/// checks next. Only this caller takes the missing-table answer: SQL DROP and the
+/// OR REPLACE retirement keep the strict mapping.
+async fn discard_losing_provisional_storage(
+	admin: &dyn StorageAdmin,
+	context: &ExecutionContext,
+	binding: &crate::catalog::TableBinding,
+) -> Result<(), QueryError> {
+	match drop_ctas_object_storage(admin, context, binding).await {
+		Err(QueryError::Storage(StorageError::StorageTableMissing { .. })) => Ok(()),
+		other => other,
+	}
+}
+
 async fn ctas_publication_conflict_is_proven(
 	catalog: &dyn Catalog,
 	entry: &wendelon_client::CtasSagaEntry,
@@ -3252,7 +3270,7 @@ async fn finish_ctas_after_rows_committed(
 					let provisional = catalog
 						.resolve_ctas_object(entry.descriptor.table_object_id)
 						.await?;
-					drop_ctas_object_storage(admin, context, &provisional).await?;
+					discard_losing_provisional_storage(admin, context, &provisional).await?;
 					entry = catalog
 						.mutate_ctas_saga(
 							wendelon_client::CtasSagaMutation::RecordPublicationConflict {

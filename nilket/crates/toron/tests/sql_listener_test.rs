@@ -1717,6 +1717,322 @@ async fn adr0118_a_table_storage_does_not_hold_is_never_dropped_or_evicted() {
 	fixture.shutdown();
 }
 
+/// DC-277: a CTAS whose publication is lost to a concurrent binding of its name,
+/// on the real catalog and storage adapters against a live Wendelon (Today). The
+/// competing table is created just before Publish, with the CTAS rows committed.
+/// The losing provisional object is discarded by its captured identity (Wendelon's
+/// drop lookup hides a provisional descriptor and answers TableMissing), and the
+/// saga records the conflict: Conflict, cause PublicationConflict, on the same
+/// operation. The winner's binding and its (empty) data are intact.
+#[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dc277_a_lost_ctas_publication_is_recorded_as_a_conflict_on_live_wendelon() {
+	use toron::catalog::{Catalog, TableRef, WendelonCatalog, WendelonDescriptorRegistry};
+	use toron::storage::{WendelonStorageAdmin, WendelonStorageScan, WendelonStorageWrite};
+	let fixture = LiveWendelonFixture::start(1620).await;
+	let source = descriptor_with_object_id([0xBA; 16]);
+	install_schema(&fixture.node, LIVE_TENANT, &source).await;
+	write_rows(&fixture.client, LIVE_TENANT, &source, batch()).await;
+
+	let tenant = ToronTenantId(LIVE_TENANT.get());
+	let registry = Arc::new(
+		WendelonDescriptorRegistry::from_descriptors_for_tenant(tenant, [])
+			.expect("an empty registry"),
+	);
+	let base = Arc::new(WendelonCatalog::with_client_and_registry(
+		Arc::clone(&fixture.client),
+		tenant,
+		Arc::clone(&registry),
+	));
+	let source_binding = base
+		.resolve_table(&TableRef::with_schema("bench", "storage_execution"))
+		.await
+		.expect("the source resolves from Wendelon");
+	let target = TableRef::new("dc277_raced_copy");
+	assert_eq!(
+		source_binding.schema.fields().len(),
+		4,
+		"premise: the source schema"
+	);
+	let racing = Arc::new(PublicationRace {
+		inner: Arc::clone(&base),
+		raft: fixture.node.raft.clone(),
+		raced: std::sync::atomic::AtomicBool::new(false),
+	});
+	let coordinator = toron::coordinator::QueryCoordinator::with_writer(
+		racing.clone(),
+		toron::exec::Executor::with_context(
+			Arc::new(WendelonStorageScan::with_descriptor_registry(
+				Arc::clone(&fixture.client),
+				Arc::clone(&registry),
+			)),
+			toron::exec::ExecutionContext::new(
+				toron::ir::SessionId(1),
+				QueryId::from_u128(1620),
+				tenant,
+				toron::storage::HlcBound(u64::MAX),
+			),
+		),
+		toron::binder::PlannerConfig::default(),
+		Arc::new(WendelonStorageWrite::with_descriptor_registry(
+			Arc::clone(&fixture.client),
+			Arc::clone(&registry),
+		)),
+	)
+	.with_storage_admin(Arc::new(WendelonStorageAdmin::new(
+		Arc::clone(&fixture.client),
+		Arc::clone(&registry),
+	)));
+	let plan = toron::sql_planner::SqlPlanner::new()
+		.plan(
+			"CREATE TABLE dc277_raced_copy AS SELECT id, amount, region, ts FROM bench.storage_execution",
+		)
+		.expect("plan CTAS");
+	assert_eq!(
+		execute_sql_on(&coordinator, "SELECT id FROM bench.storage_execution").await,
+		4,
+		"premise: the source rows"
+	);
+	let query_id = QueryId::new();
+	let error = coordinator
+		.execute_mutation_with_query_id(&plan, query_id)
+		.await
+		.expect_err("the concurrent winner wins publication");
+	eprintln!("DC-277 CTAS answer: {error} / {error:?}");
+	assert!(
+		racing.raced.load(std::sync::atomic::Ordering::SeqCst),
+		"premise: the race reached Publish with the rows committed"
+	);
+
+	let saga = base
+		.resolve_ctas_saga(wendelon_client::CtasOperationId::new(
+			*query_id.get().as_bytes(),
+		))
+		.await
+		.expect("resolve the saga")
+		.expect("the saga is attributable");
+	eprintln!("DC-277 saga: {:?} {:?}", saga.phase, saga.terminal_cause);
+	assert_eq!(
+		saga.phase,
+		wendelon_client::CtasSagaPhase::Conflict,
+		"error={error}"
+	);
+	assert_eq!(
+		saga.terminal_cause,
+		Some(wendelon_client::CtasTerminalCause::PublicationConflict)
+	);
+	assert!(error.to_string().contains("binding_changed"), "{error}");
+	let winner = base
+		.resolve_table(&target)
+		.await
+		.expect("the winner stays bound");
+	assert_ne!(
+		winner.table, saga.descriptor.table_object_id,
+		"the winner, not the provisional object"
+	);
+	let read = execute_sql_on(&coordinator, "SELECT id FROM dc277_raced_copy").await;
+	assert_eq!(read, 0, "the winner's data is intact (empty)");
+	fixture.shutdown();
+}
+
+/// Rows a coordinator query returns.
+async fn execute_sql_on(coordinator: &toron::coordinator::QueryCoordinator, sql: &str) -> usize {
+	let plan = toron::sql_planner::SqlPlanner::new()
+		.plan(sql)
+		.expect("plan query");
+	coordinator
+		.execute_query(&plan, None)
+		.await
+		.expect("query")
+		.iter()
+		.map(|batch| batch.num_rows())
+		.sum()
+}
+
+/// The real catalog, except that a competing table is created under the CTAS
+/// target's name just before its Publish (rows committed, pins released).
+struct PublicationRace {
+	inner: Arc<toron::catalog::WendelonCatalog>,
+	raft: wendelon::consensus::WendelonRaft,
+	raced: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl toron::catalog::Catalog for PublicationRace {
+	fn scoped(self: Arc<Self>, _tenant_id: ToronTenantId) -> Arc<dyn toron::catalog::Catalog> {
+		self
+	}
+
+	fn descriptor_refresh_metrics(&self) -> Arc<toron::catalog::DescriptorRefreshMetrics> {
+		self.inner.descriptor_refresh_metrics()
+	}
+
+	async fn resolve_table(
+		&self,
+		table: &toron::catalog::TableRef,
+	) -> Result<toron::catalog::TableBinding, toron::error::CatalogError> {
+		self.inner.resolve_table(table).await
+	}
+
+	async fn resolve_table_local(
+		&self,
+		table: &toron::catalog::TableRef,
+	) -> Result<toron::catalog::TableBinding, toron::error::CatalogError> {
+		self.inner.resolve_table_local(table).await
+	}
+
+	async fn resolve_table_id(
+		&self,
+		table: toron::ir::TableId,
+	) -> Result<toron::catalog::TableBinding, toron::error::CatalogError> {
+		self.inner.resolve_table_id(table).await
+	}
+
+	async fn resolve_durable_logical_type_by_name(
+		&self,
+		name: &str,
+	) -> Result<toron::ir::LogicalTypeSpec, toron::error::CatalogError> {
+		self.inner.resolve_durable_logical_type_by_name(name).await
+	}
+
+	async fn invalidate_table_descriptor(
+		&self,
+		table: toron::ir::TableId,
+	) -> Result<Option<toron::catalog::InvalidatedDescriptor>, toron::error::CatalogError> {
+		self.inner.invalidate_table_descriptor(table).await
+	}
+
+	async fn create_table_with_outcome(
+		&self,
+		name: &toron::catalog::TableRef,
+		schema: arrow::datatypes::SchemaRef,
+		row_identity: toron::ir::CreateTableRowIdentity,
+		if_not_exists: bool,
+	) -> Result<toron::catalog::CreateTableOutcome, toron::error::CatalogError> {
+		self.inner
+			.create_table_with_outcome(name, schema, row_identity, if_not_exists)
+			.await
+	}
+
+	async fn provision_ctas(
+		&self,
+		request: toron::catalog::CtasProvisionRequest,
+	) -> Result<toron::catalog::CtasProvisionOutcome, toron::error::CatalogError> {
+		self.inner.provision_ctas(request).await
+	}
+
+	async fn mutate_ctas_saga(
+		&self,
+		mutation: wendelon_client::CtasSagaMutation,
+	) -> Result<wendelon_client::CtasSagaEntry, toron::error::CatalogError> {
+		if let wendelon_client::CtasSagaMutation::Publish { operation_id, .. } = &mutation
+			&& !self.raced.load(std::sync::atomic::Ordering::SeqCst)
+		{
+			let entry = self
+				.inner
+				.resolve_ctas_saga(*operation_id)
+				.await?
+				.expect("the publication candidate saga exists");
+			assert!(matches!(
+				entry.phase,
+				wendelon_client::CtasSagaPhase::RowsCommitted { .. }
+			));
+			assert!(entry.chain_pins_released);
+			self.raced.store(true, std::sync::atomic::Ordering::SeqCst);
+			// The competing binding: a table created under the same name, installed
+			// directly through the control ring.
+			let competitor = TableSchemaDescriptor::new(
+				TableObjectId::new([0xBB; 16]),
+				1,
+				"default",
+				"dc277_raced_copy",
+				&schema(),
+				RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
+				LocalityPolicy::IdentityProjection,
+				SchemaEvolutionPolicy::AdditiveOnly,
+			)
+			.expect("competitor descriptor");
+			let mut envelope = schema_update_envelope(LIVE_TENANT, &competitor);
+			envelope.intent_id = SchemaIntentId::new([0xBB; 16]);
+			let installed = self
+				.raft
+				.client_write(WendelonRequest::SchemaUpdate(
+					encode_schema_update_envelope_v1(&envelope).expect("encode"),
+				))
+				.await
+				.expect("install the competitor");
+			eprintln!("DC-277 trace: competitor installed -> {:?}", installed.data);
+			// This Toron observes the competitor (a full resolve fetches it from
+			// Wendelon into the local registry), as after any refresh.
+			let observed = self
+				.inner
+				.resolve_table(&toron::catalog::TableRef::new("dc277_raced_copy"))
+				.await;
+			eprintln!(
+				"DC-277 trace: competitor observed -> {:?}",
+				observed.as_ref().map(|binding| binding.table)
+			);
+		}
+		let name = mutation.variant_name();
+		let answer = self.inner.mutate_ctas_saga(mutation).await;
+		eprintln!(
+			"DC-277 trace: saga {name} -> {:?}",
+			answer
+				.as_ref()
+				.map(|entry| (&entry.phase, entry.terminal_cause))
+		);
+		answer
+	}
+
+	async fn resolve_ctas_saga(
+		&self,
+		operation_id: wendelon_client::CtasOperationId,
+	) -> Result<Option<wendelon_client::CtasSagaEntry>, toron::error::CatalogError> {
+		let answer = self.inner.resolve_ctas_saga(operation_id).await;
+		eprintln!(
+			"DC-277 trace: resolve_ctas_saga -> {:?}",
+			answer
+				.as_ref()
+				.map(|entry| entry.as_ref().map(|entry| &entry.phase))
+		);
+		answer
+	}
+
+	async fn resolve_ctas_object(
+		&self,
+		table_object_id: wendelon_client::TableObjectId,
+	) -> Result<toron::catalog::TableBinding, toron::error::CatalogError> {
+		let answer = self.inner.resolve_ctas_object(table_object_id).await;
+		eprintln!(
+			"DC-277 trace: resolve_ctas_object -> {:?}",
+			answer.as_ref().map(|binding| binding.table)
+		);
+		answer
+	}
+
+	fn descriptor_for_ctas_binding(
+		&self,
+		binding: &toron::catalog::TableBinding,
+	) -> Result<wendelon_client::TableSchemaDescriptor, toron::error::CatalogError> {
+		self.inner.descriptor_for_ctas_binding(binding)
+	}
+
+	async fn drop_table(
+		&self,
+		name: &toron::catalog::TableRef,
+		if_exists: bool,
+	) -> Result<Option<toron::catalog::TableBinding>, toron::error::CatalogError> {
+		self.inner.drop_table(name, if_exists).await
+	}
+
+	async fn complete_table_drop(
+		&self,
+		binding: &toron::catalog::TableBinding,
+	) -> Result<(), toron::error::CatalogError> {
+		self.inner.complete_table_drop(binding).await
+	}
+}
+
 #[cfg(feature = "test-support")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn adr0093_pre_recovery_materialization_is_readable_after_registry_rebuild() {
@@ -2632,6 +2948,30 @@ async fn install_schema(
 		)))
 		.await
 		.expect("install schema");
+}
+
+/// The schema-update envelope `schema_update` encodes.
+fn schema_update_envelope(
+	tenant: WendelonTenantId,
+	descriptor: &TableSchemaDescriptor,
+) -> SchemaUpdateEnvelope {
+	let payload = encode_table_schema_descriptor_v1(descriptor).expect("encode descriptor");
+	let intent_byte = tenant.get() as u8;
+	SchemaUpdateEnvelope {
+		contract_version: COMPUTE_STORAGE_CONTRACT_VERSION,
+		origin: SchemaIntentOrigin::ComputeClient,
+		tenant_id: tenant,
+		object: SchemaObjectRef {
+			kind: SchemaObjectKind::Table,
+			namespace: descriptor.namespace.clone(),
+			name: descriptor.table_name.clone(),
+		},
+		expected_generation: SchemaGeneration::ZERO,
+		requested_generation: SchemaGeneration::new(descriptor.schema_generation),
+		intent_id: SchemaIntentId::new([intent_byte; 16]),
+		mutation: SchemaMutationKind::Create,
+		payload,
+	}
 }
 
 fn schema_update(tenant: WendelonTenantId, descriptor: &TableSchemaDescriptor) -> Vec<u8> {
