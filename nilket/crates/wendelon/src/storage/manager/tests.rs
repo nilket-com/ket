@@ -14609,6 +14609,11 @@ impl SlabManager {
 		let sealed_id = sealed.slab_id();
 		let sealed_size = sealed.write_cursor();
 		let next_id = state.next_slab_id;
+		// Like every product allocation, the next id is covered by the durable
+		// high-water before its file exists (DC-276 C1 met an uncovered one).
+		self.cover_slab_ids_through(&mut state, next_id)
+			.await
+			.expect("force_seal_active_for_test should cover the next slab id");
 		let next = Arc::new(
 			LocalSlabStore::open(
 				slab_path(&self.config.dir, next_id),
@@ -70182,5 +70187,102 @@ async fn an_unreadable_op_index_defers_sealed_maintenance_admission() {
 	assert!(
 		mgr.lookup(tenant(), id(0x7101)).unwrap().is_some(),
 		"nothing was retired"
+	);
+}
+
+/// DC-276, the deferred-recovery control: while this open's deferred work is
+/// unfinished (before deferred loading starts, and while it is held mid-way),
+/// the debt-absence authority is refused; it is granted once that work finishes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_debt_absence_authority_waits_for_a_deferred_open_to_finish() {
+	let reopened = reopen_install_at(lsm_driver::ControlLsmInstallCut::AfterPublication).await;
+	assert!(
+		reopened
+			.mgr
+			.tier_authority
+			.deferred_open
+			.load(Ordering::Acquire),
+		"premise: this open is deferred"
+	);
+	assert!(
+		reopened.mgr.try_debt_absence_authority().is_none(),
+		"refused before deferred loading starts"
+	);
+	let entered = Arc::new(tokio::sync::Semaphore::new(0));
+	let release = Arc::new(tokio::sync::Semaphore::new(0));
+	*reopened
+		.mgr
+		.continuity_test_holds
+		.deferred_open_hold
+		.lock()
+		.unwrap() = Some((entered.clone(), release.clone()));
+	let driver = Arc::new(op_driver(
+		&reopened.cluster,
+		&reopened.mgr,
+		reopened.plain.clone(),
+	));
+	let pass = {
+		let driver = driver.clone();
+		tokio::spawn(async move { driver.drive_once().await })
+	};
+	tokio::time::timeout(Duration::from_secs(30), entered.acquire())
+		.await
+		.unwrap()
+		.unwrap()
+		.forget();
+	assert!(
+		reopened.mgr.try_debt_absence_authority().is_none(),
+		"refused while deferred loading is held"
+	);
+	release.add_permits(8);
+	pass.await.unwrap().unwrap();
+	assert!(
+		!reopened
+			.mgr
+			.tier_authority
+			.deferred_open
+			.load(Ordering::Acquire),
+		"premise: the deferred work finished"
+	);
+	assert!(
+		reopened.mgr.try_debt_absence_authority().is_some(),
+		"granted once it finished"
+	);
+}
+
+/// DC-276, C4: one orphaned publication refuses the debt-absence authority for
+/// the whole store (every debt, related or not) until the store reopens, and the
+/// reopen grants it again.
+#[tokio::test]
+async fn an_orphaned_publication_refuses_the_debt_absence_authority_until_reopen() {
+	let (dir, manager) = fresh_manager().await;
+	assert!(
+		manager.try_debt_absence_authority().is_some(),
+		"premise: granted on a healthy store"
+	);
+	manager
+		.persistent_index
+		.as_ref()
+		.unwrap()
+		.fail_next_delta
+		.store(true, Ordering::Release);
+	assert!(
+		manager
+			.append(tenant(), id(0xd276), hlc(1), b"orphaned")
+			.await
+			.is_err(),
+		"premise: the publication failed"
+	);
+	assert!(
+		manager.try_debt_absence_authority().is_none(),
+		"refused store-wide under an orphaned publication"
+	);
+	let io = manager.config.io.clone();
+	let crypto = manager.config.crypto.clone();
+	drop(manager);
+	let reopened = open_manager_at_dir(dir.to_path_buf(), io, crypto).await;
+	assert!(
+		reopened.try_debt_absence_authority().is_some(),
+		"granted again after the reopen"
 	);
 }

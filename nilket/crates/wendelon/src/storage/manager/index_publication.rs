@@ -70,6 +70,40 @@ impl SlabManager {
 		self.orphaned_index_publications.load(Ordering::Acquire) != 0
 	}
 
+	/// DC-276: whether `(tenant, key, hlc)` has any location in this store's
+	/// in-memory index. Passive: it reads only `key_index` (no readiness, tier
+	/// scope or authority). A prefix match is enough to keep debt.
+	pub(crate) fn version_in_memory_index(
+		&self,
+		tenant_id: TenantId,
+		key_identity: Identity,
+		hlc: HybridTimestamp,
+	) -> bool {
+		self.key_index
+			.get(&(tenant_id, key_identity))
+			.is_some_and(|locations| locations.iter().any(|location| location.hlc == hlc))
+	}
+
+	/// DC-276: the authority under which "no indexed copy" may retire cleanup
+	/// debt, or `None`. The maintenance publication gate is read-held without
+	/// waiting (a contended writer means skip, never wait), and under it this
+	/// open's recovery must be complete (no deferred open, unresolved LSM
+	/// install, awaited cluster or unavailable index authority) with no
+	/// orphaned publication since the open. Every state read is passive.
+	pub(crate) fn try_debt_absence_authority(&self) -> Option<DebtAbsenceAuthority> {
+		let gate = self
+			.maintenance_publication_gate
+			.clone()
+			.try_read_owned()
+			.ok()?;
+		let complete = !self.has_orphaned_index_publications()
+			&& !self.tier_authority.deferred_open.load(Ordering::Acquire)
+			&& self.lsm_install_unresolved.is_empty()
+			&& !self.awaiting_cluster.load(Ordering::Acquire)
+			&& !self.index_authority_unavailable.load(Ordering::Acquire);
+		complete.then_some(DebtAbsenceAuthority { _gate: gate })
+	}
+
 	pub(super) async fn begin_index_publication(
 		&self,
 		slabs: Vec<SlabId>,
@@ -717,4 +751,12 @@ impl SlabManager {
 		}
 		Ok(Some(publication))
 	}
+}
+
+/// DC-276: held while an absence of indexed copies retires cleanup debt (see
+/// [`SlabManager::try_debt_absence_authority`]). It owns a read guard on the
+/// maintenance publication gate, so publications that run under that gate's
+/// write guard cannot interleave; it is moved into the retirement's database job.
+pub(crate) struct DebtAbsenceAuthority {
+	_gate: OwnedRwLockReadGuard<()>,
 }

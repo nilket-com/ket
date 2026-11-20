@@ -1452,9 +1452,22 @@ impl PersistentLocalIndex {
 		key: VersionKey,
 		expected: DebtRecord,
 	) -> std::io::Result<bool> {
+		self.retire_debt_holding(key, expected, ()).await
+	}
+
+	/// DC-276: [`Self::retire_debt`], with `held` (the guards its caller's
+	/// absence check relies on) moved into the database job, so they last until
+	/// the job commits or aborts even if the awaiting future is cancelled.
+	pub(crate) async fn retire_debt_holding<G: Send + 'static>(
+		&self,
+		key: VersionKey,
+		expected: DebtRecord,
+		held: G,
+	) -> std::io::Result<bool> {
 		let _guard = self.write_lock.lock().await;
 		self.db
 			.run(move |db| {
+				let _held = held;
 				let tx = db.begin_write().map_err(redb_to_io)?;
 				let retired = {
 					let mut debt = tx.open_table(CLEANUP_DEBT_TABLE).map_err(redb_to_io)?;

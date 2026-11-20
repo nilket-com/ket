@@ -406,6 +406,10 @@ pub struct NodeBootstrapConfig {
 	/// snapshot install). Default off; production has no such field.
 	#[cfg(test)]
 	pub(crate) pd_drop_admitted_for_test: bool,
+	/// Test-only (DC-276 controls): this node starts with certified cleanup and
+	/// the debt sweep held (`pause_cleanup`), before its first maintenance pass.
+	#[cfg(test)]
+	pub(crate) hold_cleanup_at_start_for_test: bool,
 	#[cfg(test)]
 	pub(crate) startup_probe: Option<startup_ownership_tests::StartupProbe>,
 	#[cfg(test)]
@@ -618,6 +622,8 @@ impl NodeBootstrapConfig {
 			consensus_timing: Default::default(),
 			#[cfg(test)]
 			pd_drop_admitted_for_test: false,
+			#[cfg(test)]
+			hold_cleanup_at_start_for_test: false,
 			decision_mode: Default::default(),
 			decision_signing_secret: None,
 			trusted_decision_signers: BTreeMap::new(),
@@ -2805,6 +2811,14 @@ impl WendelonNode {
 		if let Some(proposals) = decision_proposals {
 			let incarnation = slab.owner_ref()?.incarnation();
 			let data_server = data_server.clone();
+			// Test-only (DC-276 controls): cleanup and the debt sweep held from start.
+			#[cfg(test)]
+			if cfg.hold_cleanup_at_start_for_test {
+				data_server
+					.decision_peer_for_test()
+					.pause_cleanup
+					.store(true, std::sync::atomic::Ordering::Release);
+			}
 			let decision_lease_ttl = cfg.data_ring_lease_ttl;
 			let mut stop = data_server.decision_maintenance_stop();
 			scope

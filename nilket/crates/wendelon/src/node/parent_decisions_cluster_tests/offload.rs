@@ -680,3 +680,243 @@ async fn a_member_with_another_root_keeps_its_vote_and_does_no_key_work() {
 	all.extend(more);
 	expect_everywhere(&cluster, &descriptor, &all, "with a mismatching member").await;
 }
+
+/// DC-276 control C3 (Codex 01a1f7b7), test-only, the pre-fix observation: a
+/// missed durable rebuild on a healthy tiered store. Store S holds a verified
+/// tiered slab, so its open skips the durable index rebuild (`open.rs:1241`,
+/// pending tier verification), and the Ready publication later clears that
+/// pending set without a rebuild (`tier_authority.rs:1609`). A refused version
+/// v's child publication failed on S's local active slab, so v's bytes are
+/// durable with no record row, and v has exact `RetiredIntent` debt. The sweep is
+/// held across the restart (`hold_cleanup_at_start_for_test`). After the reopen
+/// and tier verification: no durable record of v, and v's recovered local row,
+/// with its manifest digest, in memory. The sweep is then released. The intended
+/// invariant: v's exact debt is not retired while its copy is indexed in memory.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn dc276_a_tiered_stores_skipped_rebuild_keeps_the_debt_of_a_copy_only_in_memory() {
+	use crate::network::data_server::child_writes::persist_pause;
+	use crate::storage::index::certified_base::{DebtSource, VersionKey};
+	use std::sync::atomic::Ordering::Release;
+	let (mut cluster, leader, descriptor, _root) = offload_cluster("dc276").await;
+	let now = std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.unwrap()
+		.as_millis() as u64;
+	let tenant = TenantId::ZERO;
+	let batch = named_rows(&descriptor, &[(81, "refused")]);
+	let store = cluster
+		.node(leader)
+		.data_server
+		.primary_for_test(tenant, &descriptor, &batch)
+		.await
+		.unwrap();
+	let wait = |what: &'static str| {
+		let deadline = tokio::time::Instant::now() + BOUND;
+		move || assert!(tokio::time::Instant::now() < deadline, "never: {what}")
+	};
+
+	// A row of the table, certified and tiered on S: a verified tiered slab.
+	write_rows(&cluster, leader, &descriptor, &[(1, "a")]).await;
+	jump_floor(&cluster, now + 60_000).await;
+	let index = cluster.node(store).slab.persistent_index().unwrap();
+	let check = wait("S activated generation 1");
+	while index.base_meta().await.unwrap().active_gid < 1 {
+		check();
+		tokio::time::sleep(TICK).await;
+	}
+	let tiered = cluster.node(store).slab.force_seal_active_for_test().await;
+	until_offloaded(&cluster, store, tiered, "S's tiered slab").await;
+
+	// The DC-276 failure schedule for v on S's local active slab.
+	let slab = cluster.node(store).slab.clone();
+	let server = cluster.node(store).data_server.clone();
+	let incarnation = index.store_incarnation();
+	let after = persist_pause::arm_after_begin(&slab, descriptor.table_object_id);
+	let meta = write_meta(&descriptor, 1, uuid_v7_at(now + 60_001));
+	let writer = server.clone();
+	let writing = tokio::spawn(async move { writer.table_write_for_test(meta, batch).await });
+	tokio::time::timeout(BOUND, after.reached.notified())
+		.await
+		.expect("premise: the worker began its intent");
+	let record = record_of(&cluster, key_of(&descriptor, &meta))
+		.await
+		.expect("premise: the parent is reserved");
+	let rsv = record.rsv;
+	let version = after.manifest()[0];
+	let version_key = VersionKey {
+		tenant,
+		table: version.table,
+		key_identity: version.key_identity,
+		hlc: version.hlc,
+	};
+	abort(&cluster, &record).await;
+	server
+		.decision_peer_for_test()
+		.pause_cleanup
+		.store(true, Release);
+	index.fail_next_delta.store(true, Release);
+	after.release.notify_one();
+	tokio::time::timeout(BOUND, after.ended.notified())
+		.await
+		.expect("premise: the worker's append block ended");
+	let _ = tokio::time::timeout(BOUND, writing)
+		.await
+		.expect("the write ends");
+	assert_eq!(
+		slab.tier_authority_readiness_reason().as_deref(),
+		Some("TierAuthorityPublicationPending(RestartRequired)"),
+		"premise: the fault hit this child's row publication"
+	);
+	jump_floor(&cluster, now + 120_000).await;
+	let check = wait("S activated a generation covering the reservation");
+	while index.base_meta().await.unwrap().active_gid < 2 {
+		check();
+		tokio::time::sleep(TICK).await;
+	}
+	let exact_debt = |index: Arc<crate::storage::index::PersistentLocalIndex>| async move {
+		index
+			.debt_page(None, 1 << 20)
+			.await
+			.unwrap()
+			.into_iter()
+			.filter(|(key, record)| *key == version_key && record.row_digest == version.row_digest)
+			.collect::<Vec<_>>()
+	};
+	let debt = exact_debt(index.clone()).await;
+	assert_eq!(debt.len(), 1, "premise: v's exact debt");
+	assert_eq!(
+		debt[0].1.source,
+		DebtSource::RetiredIntent { rsv, ordinal: 0 }
+	);
+	drop((index, slab, server));
+
+	// The restart, with the sweep held from start.
+	cluster
+		.configs
+		.get_mut(&store)
+		.unwrap()
+		.hold_cleanup_at_start_for_test = true;
+	cluster.stop(store, false).await;
+	cluster.reopen(store).await;
+	let slab = cluster.node(store).slab.clone();
+	let index = slab.persistent_index().unwrap();
+	assert_eq!(
+		index.store_incarnation(),
+		incarnation,
+		"premise: the same store"
+	);
+	assert!(
+		slab.tier_pointer(tiered).await.is_some(),
+		"premise: S holds a tiered slab"
+	);
+	assert_eq!(
+		exact_debt(index.clone()).await.len(),
+		1,
+		"premise: the debt survived the restart"
+	);
+	until_ready(&cluster, store, "S's tier verification").await;
+
+	// After verification: no durable record of v; v's recovered row in memory.
+	let durable = index
+		.owned_version_copies(tenant, vec![version])
+		.await
+		.unwrap();
+	let identity = crate::schema::Identity::new(version.key_identity);
+	let locations = slab
+		.version_locations(tenant, identity, version.hlc)
+		.unwrap();
+	let rows = slab
+		.stored_rows_at_version(tenant, identity, version.hlc, None)
+		.await
+		.unwrap();
+	let digests: Vec<_> = rows
+		.iter()
+		.map(|row| crate::network::data_server::child_writes::stored_row_digest(&descriptor, row))
+		.collect();
+	eprintln!(
+		"DC-276 C3 after verification: durable_prefix_records={durable:?} in_memory={locations:?} digests={digests:?} tiered_slab={tiered:?}"
+	);
+	assert_eq!(
+		durable,
+		vec![0],
+		"premise: no RECORDS_TABLE row for v (rebuild skipped)"
+	);
+	assert!(
+		locations.iter().all(|location| location.slab_id != tiered),
+		"premise: v's copy is on a local slab"
+	);
+	assert!(
+		digests.iter().any(|digest| digest
+			.as_ref()
+			.is_ok_and(|digest| *digest == version.row_digest)),
+		"premise: v's recovered row, with its manifest digest, is in memory"
+	);
+
+	// The ordinary sweep, released.
+	let server = cluster.node(store).data_server.clone();
+	// The sweep acts only once the base is validated (`may_clean`); wait for it so
+	// a skipped sweep is not mistaken for a kept debt.
+	let validated = server.base_validated_for_test();
+	let check = wait("S's base validated after the reopen");
+	while !validated.load(std::sync::atomic::Ordering::Acquire) {
+		check();
+		tokio::time::sleep(TICK).await;
+	}
+	// Only the sweep is released: local certified cleanup stays held until the
+	// sweep's outcome is observed with the copy still present.
+	server
+		.decision_peer_for_test()
+		.pause_local_cleanup
+		.store(true, Release);
+	server
+		.decision_peer_for_test()
+		.pause_cleanup
+		.store(false, Release);
+	let swept = server
+		.debt_sweep_step()
+		.await
+		.expect("the sweep pass completes");
+	let debt_after = exact_debt(index.clone()).await;
+	let in_memory_after = slab
+		.version_locations(tenant, identity, version.hlc)
+		.unwrap();
+	eprintln!(
+		"DC-276 C3 sweep pass: retired={swept} exact_debt={debt_after:?} in_memory={in_memory_after:?}"
+	);
+	assert_eq!(
+		in_memory_after.len(),
+		1,
+		"premise: v's copy is still indexed in memory"
+	);
+	assert_eq!(
+		debt_after.len(),
+		1,
+		"v's exact debt is kept while its copy is indexed in memory"
+	);
+	server
+		.decision_peer_for_test()
+		.pause_local_cleanup
+		.store(false, Release);
+
+	// Eventual: ordinary certified cleanup erases the local copy, then the sweep
+	// retires the debt.
+	slab.force_seal_active_for_test().await;
+	let check = wait("cleanup erased v's local copy, then its debt retired");
+	loop {
+		let _ = server.debt_sweep_step().await;
+		let copy = slab
+			.version_locations(tenant, identity, version.hlc)
+			.unwrap();
+		let durable = index
+			.owned_version_copies(tenant, vec![version])
+			.await
+			.unwrap();
+		let debt = exact_debt(index.clone()).await;
+		if copy.is_empty() && durable == vec![0] && debt.is_empty() {
+			break;
+		}
+		check();
+		tokio::time::sleep(TICK).await;
+	}
+	eprintln!("DC-276 C3 eventual: the copy was erased and the debt retired");
+}

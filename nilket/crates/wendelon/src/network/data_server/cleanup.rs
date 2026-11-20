@@ -273,7 +273,24 @@ impl WendelonDataServer {
 				},
 				crate::storage::index::certified_base::DebtSource::DisplacedBase { .. } => None,
 			};
-			if index.retire_debt(*key, record.clone()).await? {
+			// DC-276: zero `RECORDS_TABLE` copies is an absence only while this
+			// open's recovery is complete and no publication is uncertain (the
+			// authority), and no copy is in the in-memory index. The guards move
+			// into the retirement's database job, through its commit.
+			let Some(authority) = self.slab.try_debt_absence_authority() else {
+				continue;
+			};
+			if self.slab.version_in_memory_index(
+				key.tenant,
+				Identity::new(key.key_identity),
+				key.hlc,
+			) {
+				continue;
+			}
+			if index
+				.retire_debt_holding(*key, record.clone(), (_producer, authority))
+				.await?
+			{
 				retired += 1;
 			}
 		}
