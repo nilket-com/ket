@@ -564,7 +564,7 @@ pub(crate) fn adr060_client_hook_exposes_attempt_without_retry_duplication() {
 	assert!(core.contains("pub struct TableQueryAttempt"));
 	assert!(core.contains("attempt_request.meta.request_id = TableQueryRequestId::random();"));
 	assert!(core.contains("hook(TableQueryAttempt"));
-	assert!(core.contains("table_query_once(target, &attempt_request, attempt_guard)"));
+	assert!(core.contains("table_query_once(target, &attempt_request, attempt_guard, deadline)"));
 	assert!(
 		!std::fs::read_to_string(manifest_dir().join("src/storage.rs"))
 			.unwrap()
@@ -660,7 +660,7 @@ pub(crate) fn adr060_attempt_registers_before_table_query_write() {
 			.expect("read wendelon client core");
 	let hook_pos = core.find("hook(TableQueryAttempt").expect("hook call");
 	let request_pos = core
-		.find("table_query_once(target, &attempt_request, attempt_guard)")
+		.find("table_query_once(target, &attempt_request, attempt_guard, deadline)")
 		.expect("table query once call");
 	let table_query_once = brace_blocks_after_marker(&core, "async fn table_query_once")
 		.into_iter()

@@ -392,6 +392,10 @@ pub struct WendelonClient {
 	/// retry loop (before connection setup).
 	#[cfg(test)]
 	skip_counter_send_recheck: std::sync::atomic::AtomicBool,
+	/// Test-only (DC-281): a synchronous delay in a table query's attempt after its
+	/// payload is prepared and before its frame is stamped and written.
+	#[cfg(test)]
+	pre_send_delay_for_test: std::sync::Mutex<Option<Duration>>,
 }
 
 impl WendelonClient {
@@ -433,7 +437,16 @@ impl WendelonClient {
 			epoch: RwLock::new(epoch),
 			#[cfg(test)]
 			skip_counter_send_recheck: std::sync::atomic::AtomicBool::new(false),
+			#[cfg(test)]
+			pre_send_delay_for_test: std::sync::Mutex::new(None),
 		})
+	}
+
+	/// Test-only (DC-281): every table-query attempt spends `delay` synchronously
+	/// after preparing its payload and before stamping and writing its frame.
+	#[cfg(test)]
+	pub(crate) fn delay_query_send_for_test(&self, delay: Duration) {
+		*self.pre_send_delay_for_test.lock().unwrap() = Some(delay);
 	}
 
 	/// Pull a fresh snapshot from the topology source and swap it
@@ -1253,6 +1266,15 @@ impl WendelonClient {
 		request: TableQueryRequest,
 		mut hook: Option<&mut TableQueryAttemptHook<'_>>,
 	) -> std::io::Result<StreamingQueryResult> {
+		// DC-281 (Codex 01a1fced R2, 01a1fd19, 01a1fd66): a finite caller deadline is one
+		// budget across the whole call, from its entry: local preparation, every attempt
+		// (connect, stream open, send and first response) and every retry preparation
+		// run inside it; each attempt's frame carries what remains, stamped once its
+		// payload is ready, and none is sent once it is spent. Zero means no caller
+		// deadline; a large value is clamped, not added.
+		let deadline = crate::network::data_server::caller_deadline_from_remaining_millis(
+			request.meta.deadline_remaining_millis,
+		);
 		let mut validation_request = request.clone();
 		if validation_request.meta.request_id.is_zero() {
 			validation_request.meta.request_id = TableQueryRequestId::random();
@@ -1262,8 +1284,16 @@ impl WendelonClient {
 			table_query_route_locality(request.meta.tenant_id, &request.descriptor)?;
 		let requested_stats_pruning =
 			request.meta._pad[0] & QUERY_REQUEST_FLAG_DISABLE_STATS_PRUNING == 0;
+		let expired = || {
+			Error::other(QueryStatusError {
+				status: ReadStatus::QUERY_DEADLINE_EXCEEDED,
+			})
+		};
 		let mut preferred_target = None;
 		for attempt in 0..DATA_RETRY_BUDGET {
+			if deadline_passed(deadline) {
+				return Err(expired());
+			}
 			let target = preferred_target.unwrap_or(self.target_for_locality(route_locality)?);
 			let effective_stats_pruning =
 				self.slab_stats_pruning_for_target(target, requested_stats_pruning);
@@ -1284,16 +1314,28 @@ impl WendelonClient {
 				})?),
 				None => None,
 			};
-			match self
-				.table_query_once(target, &attempt_request, attempt_guard)
-				.await?
-			{
+			// The attempt, through its stream handoff, inside the deadline; on expiry
+			// it is dropped where it stands, its guard with it.
+			let attempted = bounded(
+				deadline,
+				None,
+				self.table_query_once(target, &attempt_request, attempt_guard, deadline),
+			)
+			.await
+			.map_err(|_| expired())?;
+			match attempted? {
 				QueryOutcome::Ok(result) => return Ok(result),
 				QueryOutcome::Redirect(retry) => {
 					if attempt + 1 == DATA_RETRY_BUDGET {
 						return Err(retry.exhausted_query_error());
 					}
-					self.prepare_retry(Some(route_locality), retry).await?;
+					bounded(
+						deadline,
+						None,
+						self.prepare_retry(Some(route_locality), retry),
+					)
+					.await
+					.map_err(|_| expired())??;
 					preferred_target = retry.preferred_target;
 				}
 			}
@@ -2834,7 +2876,7 @@ impl WendelonClient {
 			request.meta.request_id = TableQueryRequestId::random();
 		}
 		validate_table_query_request(&request)?;
-		match self.table_query_once(target, &request, None).await? {
+		match self.table_query_once(target, &request, None, None).await? {
 			QueryOutcome::Ok(_) => Ok(true),
 			QueryOutcome::Redirect(_) => Ok(false),
 		}
@@ -2854,7 +2896,7 @@ impl WendelonClient {
 			request.meta.request_id = TableQueryRequestId::random();
 		}
 		validate_table_query_request(&request)?;
-		match self.table_query_once(target, &request, None).await? {
+		match self.table_query_once(target, &request, None, None).await? {
 			QueryOutcome::Ok(mut result) => {
 				let mut batches = Vec::new();
 				while let Some(batch) = result.next_batch().await? {
@@ -2871,11 +2913,11 @@ impl WendelonClient {
 		target: NodeId,
 		request: &TableQueryRequest,
 		attempt_guard: Option<TableQueryAttemptGuard>,
+		deadline: Option<Instant>,
 	) -> std::io::Result<QueryOutcome> {
 		let conn = self.factory.get_connection(target).await?;
 		let mut stream = conn.open_bi().await?;
 
-		let meta_bytes = bytemuck::bytes_of(&request.meta);
 		let runtime_filter_bytes = request
 			.runtime_filter
 			.as_ref()
@@ -2908,10 +2950,29 @@ impl WendelonClient {
 			msg_type: MsgType::TABLE_QUERY_REQ.0,
 			flags: 0,
 			stream_id: 0,
-			meta_len: meta_bytes.len() as u32,
+			meta_len: std::mem::size_of::<crate::schema::TableQueryRequestMeta>() as u32,
 			arrow_len: 0,
 			trailing_len: trailing.map(|t| t.len() as u32).unwrap_or(0),
 		};
+		// Test-only (DC-281): synchronous preparation that takes time in this same
+		// poll, as serializing a large payload would.
+		#[cfg(test)]
+		if let Some(delay) = *self.pre_send_delay_for_test.lock().unwrap() {
+			std::thread::sleep(delay);
+		}
+		// DC-281: the remaining caller budget, stamped on the outgoing frame once its
+		// payload is ready, immediately before it is written; nothing is sent once it is
+		// spent.
+		let mut meta = request.meta;
+		if deadline.is_some() {
+			if deadline_passed(deadline) {
+				return Err(Error::other(QueryStatusError {
+					status: ReadStatus::QUERY_DEADLINE_EXCEEDED,
+				}));
+			}
+			meta.deadline_remaining_millis = remaining_duration_millis(deadline);
+		}
+		let meta_bytes = bytemuck::bytes_of(&meta);
 		write_frame(&mut *stream, &header, meta_bytes, None, trailing).await?;
 		stream
 			.finish()

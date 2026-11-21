@@ -233,9 +233,9 @@ mod descriptor_migration;
 pub(crate) mod not_serving;
 mod query_clocks;
 pub use query_clocks::QueryStallBound;
-use query_clocks::{
-	QueryClocks, caller_deadline_from_budget_millis, caller_deadline_from_remaining_millis,
-};
+/// DC-281: the public client derives a query's caller deadline by the same rule.
+pub(crate) use query_clocks::caller_deadline_from_remaining_millis;
+use query_clocks::{QueryClocks, caller_deadline_from_budget_millis};
 mod query_encode;
 use query_encode::encode_query_stream_batches_with_deadline;
 mod write_clocks;

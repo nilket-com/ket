@@ -221,7 +221,7 @@ impl WendelonDataServer {
 	/// active yet. A missing or mismatched candidate is behind the boundary.
 	async fn activate_committed(&self) -> std::io::Result<()> {
 		let progress = self.certification_progress();
-		StoreCertification {
+		let activated = StoreCertification {
 			slab: &self.slab,
 			state_machine: &self.state_machine,
 			progress: &progress,
@@ -234,7 +234,12 @@ impl WendelonDataServer {
 				.load(std::sync::atomic::Ordering::Acquire),
 		}
 		.activate_committed()
-		.await
+		.await;
+		// DC-281: whatever it did, a read waiting on this store's activation rechecks.
+		self.decisions
+			.activations
+			.send_modify(|attempts| *attempts = attempts.wrapping_add(1));
+		activated
 	}
 
 	/// Builds, stages and reports the pending target's candidate. Only a

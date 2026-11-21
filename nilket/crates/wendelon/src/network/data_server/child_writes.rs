@@ -1460,6 +1460,10 @@ pub(crate) struct DecisionPeer {
 	/// ADR 0699 S5a: the certified base validated since this start. Reads
 	/// refuse until it is.
 	pub(crate) base_validated: Arc<std::sync::atomic::AtomicBool>,
+	/// DC-281: bumped after every local activation attempt. A read whose authority
+	/// meets this store's own lag in activating the committed generation waits on
+	/// it, then rechecks its whole authority.
+	pub(crate) activations: tokio::sync::watch::Sender<u64>,
 	/// Test-only: how many more read-authority checks pass before every
 	/// later one fails.
 	#[cfg(test)]
@@ -1476,6 +1480,22 @@ pub(crate) struct DecisionPeer {
 	/// Commit applied and local activation.
 	#[cfg(test)]
 	pub(crate) hold_activation: Arc<std::sync::atomic::AtomicBool>,
+	/// Test-only (DC-281): every read-authority check waits while set.
+	#[cfg(test)]
+	pub(crate) hold_read_checks: Arc<std::sync::atomic::AtomicBool>,
+	/// Test-only (DC-281): how many checks reached the hold above.
+	#[cfg(test)]
+	pub(crate) held_read_checks_reached: Arc<std::sync::atomic::AtomicUsize>,
+	/// Test-only (DC-281): admissions here are recorded only while set (the
+	/// fixture that observes them sets it).
+	#[cfg(test)]
+	pub(crate) observe_activation_waits: Arc<std::sync::atomic::AtomicBool>,
+	/// Test-only (DC-281): what table-query admissions observed while waiting for
+	/// this store's activation, and a wakeup per event.
+	#[cfg(test)]
+	pub(crate) activation_waits: Arc<std::sync::Mutex<Vec<super::reader::ActivationWaitEvent>>>,
+	#[cfg(test)]
+	pub(crate) activation_wait_seen: Arc<tokio::sync::Notify>,
 	/// Test-only (DC-271): debts the sweep left because their producer's
 	/// reservation stripe was busy.
 	#[cfg(test)]
@@ -1594,6 +1614,23 @@ pub(crate) enum HeldStepOutcome {
 	Lsm(Result<Option<crate::storage::CompactionOutcome>, String>),
 }
 
+/// Test-only (DC-281).
+#[cfg(test)]
+impl DecisionPeer {
+	/// Records what a table-query admission observed while waiting for this store's
+	/// activation, and wakes a test waiting on it.
+	pub(crate) fn record_activation_wait(&self, event: super::reader::ActivationWaitEvent) {
+		if !self
+			.observe_activation_waits
+			.load(std::sync::atomic::Ordering::Acquire)
+		{
+			return;
+		}
+		self.activation_waits.lock().unwrap().push(event);
+		self.activation_wait_seen.notify_one();
+	}
+}
+
 #[cfg(test)]
 impl DecisionPeer {
 	/// Pauses here if the next queued pause is for this stage; whether it
@@ -1658,6 +1695,7 @@ impl Default for DecisionPeer {
 			child_hold: Default::default(),
 			behind_boundary: Default::default(),
 			base_validated: Default::default(),
+			activations: tokio::sync::watch::channel(0).0,
 			#[cfg(test)]
 			read_checks_left: Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX)),
 			#[cfg(test)]
@@ -1668,6 +1706,16 @@ impl Default for DecisionPeer {
 			tamper_fetches: Default::default(),
 			#[cfg(test)]
 			hold_activation: Default::default(),
+			#[cfg(test)]
+			hold_read_checks: Default::default(),
+			#[cfg(test)]
+			held_read_checks_reached: Default::default(),
+			#[cfg(test)]
+			observe_activation_waits: Default::default(),
+			#[cfg(test)]
+			activation_waits: Default::default(),
+			#[cfg(test)]
+			activation_wait_seen: Default::default(),
 			#[cfg(test)]
 			debt_busy_skips: Default::default(),
 			#[cfg(test)]

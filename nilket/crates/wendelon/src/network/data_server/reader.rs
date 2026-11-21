@@ -136,32 +136,200 @@ pub(super) struct ReadAuthority {
 	validated: Arc<std::sync::atomic::AtomicBool>,
 	#[cfg(test)]
 	checks_left: Arc<std::sync::atomic::AtomicUsize>,
+	#[cfg(test)]
+	hold_checks: Arc<std::sync::atomic::AtomicBool>,
+	#[cfg(test)]
+	hold_reached: Arc<std::sync::atomic::AtomicUsize>,
 }
+
+/// DC-281: why a statement's read authority does not hold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AuthorityRefusal {
+	/// This store's own base has not yet activated the committed generation: the
+	/// committed generation was read first, the locally active one after, and the
+	/// active one is behind it. Generations only advance, so the store lagged when
+	/// the second value was read. The one refusal a statement may wait out.
+	ActivationLag { committed: u64, active: u64 },
+	/// Anything else, including an active generation past the committed one read
+	/// before it (a stale observation) and a storage error. Never waited out.
+	Refused(String),
+}
+
+impl std::fmt::Display for AuthorityRefusal {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			Self::ActivationLag { committed, active } => write!(
+				f,
+				"the committed generation {committed} is not active here (active {active})"
+			),
+			Self::Refused(reason) => f.write_str(reason),
+		}
+	}
+}
+
+/// DC-281: the generation half of a read authority, from the committed generation
+/// read first and the locally active one read after it.
+pub(crate) fn generation_authority(committed: u64, active: u64) -> Result<(), AuthorityRefusal> {
+	match active.cmp(&committed) {
+		std::cmp::Ordering::Equal => Ok(()),
+		std::cmp::Ordering::Less => Err(AuthorityRefusal::ActivationLag { committed, active }),
+		std::cmp::Ordering::Greater => Err(AuthorityRefusal::Refused(format!(
+			"a stale observation: generation {active} active here, past the committed \
+			 {committed} read before it"
+		))),
+	}
+}
+
+/// Test-only (DC-281): what a table-query admission observed while waiting for
+/// this store's activation, by request (attempt) id and cut.
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ActivationWaitEvent {
+	Lag {
+		request_id: crate::schema::TableQueryRequestId,
+		k: u64,
+		committed: u64,
+		active: u64,
+	},
+	Admitted {
+		request_id: crate::schema::TableQueryRequestId,
+		k: u64,
+	},
+}
+
+/// DC-281: how long a statement's first authority check waits out this store's own
+/// activation lag, within the statement's deadline and cancellation.
+const ACTIVATION_WAIT_BOUND: Duration = CUT_BOUND;
+/// DC-281: the waiting check also rechecks this often, should an activation path
+/// not signal.
+const ACTIVATION_RECHECK: Duration = Duration::from_millis(100);
 
 impl ReadAuthority {
 	pub(super) async fn check(&self) -> Result<(), String> {
+		self.check_typed()
+			.await
+			.map_err(|refusal| refusal.to_string())
+	}
+
+	/// DC-281: a streamed table query's admission check. Only this store's own lag
+	/// in activating the committed generation is waited out; every wake rechecks
+	/// the whole authority (incarnation, membership, applied cut, K_min, boundary,
+	/// validation and generation). The whole admission, each check included, runs
+	/// inside the statement's cancellation and deadline and one local absolute
+	/// limit, [`ACTIVATION_WAIT_BOUND`], in that precedence: an answer that arrives
+	/// with any of them is never taken. The caller holds nothing activation takes.
+	async fn check_awaiting_activation(
+		&self,
+		bound: &StatementBound<'_>,
+		peer: &super::child_writes::DecisionPeer,
+		request_id: crate::schema::TableQueryRequestId,
+	) -> Result<(), ReadRefusal> {
+		#[cfg(not(test))]
+		let _ = request_id;
+		let until = tokio::time::Instant::now() + ACTIVATION_WAIT_BOUND;
+		let mut signal = peer.activations.subscribe();
+		let mut last_lag = None;
+		let admission = async {
+			loop {
+				// Seen before the check: an activation after it wakes the wait below.
+				signal.borrow_and_update();
+				match self.check_typed().await {
+					Ok(()) => {
+						// Test-only: every admission, a first check's included.
+						#[cfg(test)]
+						{
+							peer.record_activation_wait(ActivationWaitEvent::Admitted {
+								request_id,
+								k: self.k,
+							});
+						}
+						return Ok(());
+					}
+					Err(AuthorityRefusal::Refused(reason)) => {
+						return Err(ReadRefusal::Transient(reason));
+					}
+					Err(lag @ AuthorityRefusal::ActivationLag { committed, active }) => {
+						#[cfg(test)]
+						{
+							peer.record_activation_wait(ActivationWaitEvent::Lag {
+								request_id,
+								k: self.k,
+								committed,
+								active,
+							});
+						}
+						#[cfg(not(test))]
+						let _ = (committed, active);
+						last_lag = Some(lag);
+						let _ = tokio::time::timeout(ACTIVATION_RECHECK, async {
+							if signal.changed().await.is_err() {
+								std::future::pending::<()>().await;
+							}
+						})
+						.await;
+					}
+				}
+			}
+		};
+		let limited = async {
+			tokio::select! {
+				biased;
+				_ = tokio::time::sleep_until(until) => None,
+				admitted = admission => Some(admitted),
+			}
+		};
+		// Cancellation, then the deadline, then the local limit, then the answer.
+		let outcome = bound.run(limited).await;
+		match outcome? {
+			Some(admitted) => admitted,
+			None => Err(ReadRefusal::Transient(match last_lag {
+				Some(lag) => format!("{lag} within {ACTIVATION_WAIT_BOUND:?}"),
+				None => {
+					format!("the read authority did not answer within {ACTIVATION_WAIT_BOUND:?}")
+				}
+			})),
+		}
+	}
+
+	/// The whole read authority, as sequential checks: local distrust, tier
+	/// readiness, admitted incarnation, serving membership, the applied cut, K_min,
+	/// the certified boundary, validation, then the generation (committed read in
+	/// the state above, the locally active one after it).
+	async fn check_typed(&self) -> Result<(), AuthorityRefusal> {
+		use std::sync::atomic::Ordering::Acquire;
+		// Test-only (DC-281): a held check stalls here, as a slow state or base read.
+		#[cfg(test)]
+		if self.hold_checks.load(Acquire) {
+			self.hold_reached
+				.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+			while self.hold_checks.load(Acquire) {
+				tokio::time::sleep(Duration::from_millis(5)).await;
+			}
+		}
 		#[cfg(test)]
 		if self
 			.checks_left
-			.fetch_update(
-				std::sync::atomic::Ordering::AcqRel,
-				std::sync::atomic::Ordering::Acquire,
-				|left| left.checked_sub(1),
-			)
+			.fetch_update(std::sync::atomic::Ordering::AcqRel, Acquire, |left| {
+				left.checked_sub(1)
+			})
 			.is_err()
 		{
-			return Err("test: read authority withdrawn".into());
+			return Err(AuthorityRefusal::Refused(
+				"test: read authority withdrawn".into(),
+			));
 		}
+		let refused = AuthorityRefusal::Refused;
 		if let Some(reason) =
 			recover_rwlock_read(&self.distrust, "local_persistence_distrust_reason").clone()
 		{
-			return Err(reason);
+			return Err(refused(reason));
 		}
 		if let Some(reason) = self.slab.tier_authority_readiness_reason() {
-			return Err(reason);
+			return Err(refused(reason));
 		}
 		let (signer, k) = (self.signer, self.k);
-		self.state_machine
+		let committed = self
+			.state_machine
 			.read_state(move |state| {
 				let current = state
 					.incarnations
@@ -196,28 +364,27 @@ impl ReadAuthority {
 				Ok(generations.current_gid())
 			})
 			.await
-			.and_then(|current_gid| {
-				if self.behind.load(std::sync::atomic::Ordering::Acquire) {
-					return Err("this store is behind the certified boundary".into());
-				}
-				if !self.validated.load(std::sync::atomic::Ordering::Acquire) {
-					return Err("the certified base is not validated since this start".into());
-				}
-				Ok(current_gid)
-			})
-			.map(|current_gid| (current_gid, self.index.clone()))
-			.map(|(current_gid, index)| async move {
-				// The local base must be the committed generation's.
-				match index {
-					None => Ok(()),
-					Some(index) => match index.base_meta().await {
-						Ok(meta) if meta.active_gid == current_gid => Ok(()),
-						Ok(_) => Err("the committed generation is not active here".to_string()),
-						Err(error) => Err(error.to_string()),
-					},
-				}
-			})?
+			.map_err(refused)?;
+		if self.behind.load(Acquire) {
+			return Err(refused(
+				"this store is behind the certified boundary".into(),
+			));
+		}
+		if !self.validated.load(Acquire) {
+			return Err(refused(
+				"the certified base is not validated since this start".into(),
+			));
+		}
+		// The local base must be the committed generation's.
+		let Some(index) = self.index.as_ref() else {
+			return Ok(());
+		};
+		let active = index
+			.base_meta()
 			.await
+			.map_err(|error| refused(error.to_string()))?
+			.active_gid;
+		generation_authority(committed, active)
 	}
 
 	/// The writer's per-batch hook for this authority.
@@ -315,6 +482,10 @@ impl WendelonDataServer {
 				validated: self.decisions.base_validated.clone(),
 				#[cfg(test)]
 				checks_left: self.decisions.read_checks_left.clone(),
+				#[cfg(test)]
+				hold_checks: self.decisions.hold_read_checks.clone(),
+				#[cfg(test)]
+				hold_reached: self.decisions.held_read_checks_reached.clone(),
 			},
 			proposals,
 		})
@@ -940,12 +1111,21 @@ impl WendelonDataServer {
 			validated: self.decisions.base_validated.clone(),
 			#[cfg(test)]
 			checks_left: self.decisions.read_checks_left.clone(),
+			#[cfg(test)]
+			hold_checks: self.decisions.hold_read_checks.clone(),
+			#[cfg(test)]
+			hold_reached: self.decisions.held_read_checks_reached.clone(),
 		};
 		if let Err(refusal) = bound.check() {
 			return refusal.plan(&range_meta, local);
 		}
-		if let Err(reason) = authority.check().await {
-			return ReadRefusal::Transient(reason).plan(&range_meta, local);
+		// DC-281: this store's own lag in activating the committed generation is
+		// waited out here, before the statement holds anything activation takes.
+		if let Err(refusal) = authority
+			.check_awaiting_activation(&bound, &self.decisions, meta.request_id)
+			.await
+		{
+			return refusal.plan(&range_meta, local);
 		}
 
 		// The request against the state at K.
@@ -1185,6 +1365,10 @@ impl WendelonDataServer {
 			validated: self.decisions.base_validated.clone(),
 			#[cfg(test)]
 			checks_left: self.decisions.read_checks_left.clone(),
+			#[cfg(test)]
+			hold_checks: self.decisions.hold_read_checks.clone(),
+			#[cfg(test)]
+			hold_reached: self.decisions.held_read_checks_reached.clone(),
 		};
 		authority.check().await.map_err(ReadRefusal::Transient)?;
 		let (table, local) = (descriptor.table_object_id, signer.signer);
@@ -1385,6 +1569,10 @@ impl WendelonDataServer {
 			validated: self.decisions.base_validated.clone(),
 			#[cfg(test)]
 			checks_left: self.decisions.read_checks_left.clone(),
+			#[cfg(test)]
+			hold_checks: self.decisions.hold_read_checks.clone(),
+			#[cfg(test)]
+			hold_reached: self.decisions.held_read_checks_reached.clone(),
 		};
 		if authority.check().await.is_err() {
 			return respond(ReadStatus::BACKPRESSURED);

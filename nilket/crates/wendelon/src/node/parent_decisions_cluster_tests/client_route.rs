@@ -68,6 +68,9 @@ struct Scripted {
 	fail_status: std::sync::atomic::AtomicBool,
 	/// Wendelon ADR 0113: mutation-outcome resolves received, each withheld.
 	resolve_requests: AtomicUsize,
+	/// DC-281: each table query received, its `deadline_remaining_millis`; each
+	/// is withheld (no first response).
+	query_deadlines: std::sync::Mutex<Vec<u64>>,
 }
 
 impl Scripted {
@@ -80,6 +83,7 @@ impl Scripted {
 			status_requests: AtomicUsize::new(0),
 			fail_status: Default::default(),
 			resolve_requests: AtomicUsize::new(0),
+			query_deadlines: Default::default(),
 		})
 	}
 
@@ -119,6 +123,17 @@ impl HrftService for Scripted {
 				MsgType::STATUS_RESP,
 				crate::network::wire::encode(&status_of(self.leader))?,
 			)));
+		}
+		if frame.header.msg_type == MsgType::TABLE_QUERY_REQ.0 {
+			// DC-281: a node that receives a query and never sends its first frame.
+			let request: crate::schema::TableQueryRequestMeta = *bytemuck::from_bytes(
+				&frame.meta[..std::mem::size_of::<crate::schema::TableQueryRequestMeta>()],
+			);
+			self.query_deadlines
+				.lock()
+				.unwrap()
+				.push(request.deadline_remaining_millis);
+			std::future::pending::<()>().await;
 		}
 		if frame.header.msg_type == MsgType::MUTATION_OUTCOME_REQ.0 {
 			// Wendelon ADR 0113: a node that receives a resolve and never answers.
@@ -166,7 +181,12 @@ struct PendingAt {
 	inner: SimulatedTransportProvider,
 	pending: std::sync::atomic::AtomicU32,
 	dials: AtomicUsize,
+	/// DC-281: a connect to this node completes, after [`SLOW_CONNECT`].
+	slow: std::sync::atomic::AtomicU32,
 }
+
+/// DC-281: how long a connect to the slow node takes.
+const SLOW_CONNECT: Duration = Duration::from_millis(200);
 
 #[async_trait::async_trait]
 impl TransportProvider for PendingAt {
@@ -178,6 +198,9 @@ impl TransportProvider for PendingAt {
 		if target.id == self.pending.load(Ordering::SeqCst) {
 			self.dials.fetch_add(1, Ordering::SeqCst);
 			std::future::pending::<()>().await;
+		}
+		if target.id == self.slow.load(Ordering::SeqCst) {
+			tokio::time::sleep(SLOW_CONNECT).await;
 		}
 		self.inner.connect(target, address).await
 	}
@@ -229,6 +252,7 @@ fn fixture(script: &[Answer], pending: u32) -> Fixture {
 		),
 		pending: std::sync::atomic::AtomicU32::new(pending),
 		dials: AtomicUsize::new(0),
+		slow: std::sync::atomic::AtomicU32::new(u32::MAX),
 	});
 	Fixture {
 		entry,
@@ -419,6 +443,7 @@ async fn a_hinted_node_that_fails_a_status_request_is_still_asked_for_the_write(
 			// No node's connect is held.
 			pending: std::sync::atomic::AtomicU32::new(0),
 			dials: AtomicUsize::new(0),
+			slow: std::sync::atomic::AtomicU32::new(u32::MAX),
 		}),
 		network,
 	};
@@ -879,6 +904,7 @@ async fn a_bounded_refresh_never_asks_an_excluded_node_even_from_its_bootstrap_p
 			),
 			pending: std::sync::atomic::AtomicU32::new(PENDING),
 			dials: AtomicUsize::new(0),
+			slow: std::sync::atomic::AtomicU32::new(u32::MAX),
 		}),
 		network,
 	};
@@ -1013,5 +1039,206 @@ async fn a_withheld_resolve_answer_ends_the_public_call_at_its_budget_with_no_ou
 	assert!(
 		fixture.entry.resolve_requests.load(Ordering::SeqCst) >= 1,
 		"a node received the resolve and withheld its answer"
+	);
+}
+
+/// DC-281: `node_id` alone, as the cluster's status: every call goes there.
+fn status_only(node_id: u32) -> ClusterStatusWire {
+	ClusterStatusWire {
+		epoch: 1,
+		leader: Some(node_id),
+		replication_factor: 1,
+		peers: vec![ClusterPeerWire {
+			node_id,
+			address: address(node_id),
+			tier_bits: TransportTierSet::empty().with(TIER).as_u8(),
+			role_bits: NodeRoleSet::empty().with(NodeRole::Data).as_u8(),
+			capability_bits: 0,
+		}],
+	}
+}
+
+fn client_to_only(fixture: &Fixture, node_id: u32) -> Arc<WendelonClient> {
+	let provider: Arc<dyn TransportProvider> = fixture.provider.clone();
+	WendelonClient::new(WendelonClientConfig {
+		local_tiers: TransportTierSet::empty().with(TIER),
+		providers: [(TIER, provider)].into(),
+		bootstrap: status_only(node_id),
+		topology: Arc::new(StaticTopologySource::new(status_only(node_id))),
+		pool_max_retained: 64,
+		pool_max_cap_bytes: 1024 * 1024,
+	})
+}
+
+/// An attempt guard that marks its drop.
+struct DropMark(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for DropMark {
+	fn drop(&mut self) {
+		self.0.store(true, Ordering::SeqCst);
+	}
+}
+
+/// A public table query with `deadline_ms` (0: no caller deadline); each attempt's
+/// guard marks `dropped` when it is dropped.
+async fn query_with(
+	client: &WendelonClient,
+	deadline_ms: u64,
+	dropped: Arc<std::sync::atomic::AtomicBool>,
+) -> std::io::Result<()> {
+	let descriptor = descriptor();
+	let mut meta: crate::schema::TableQueryRequestMeta = bytemuck::Zeroable::zeroed();
+	meta.expected_epoch = client.epoch();
+	meta.tenant_id = TenantId::ZERO;
+	meta.table_object_id = descriptor.table_object_id;
+	meta.schema_generation = descriptor.schema_generation;
+	meta.physical_descriptor_fingerprint = *descriptor.physical_descriptor_fingerprint.as_bytes();
+	meta.consistency = crate::schema::Consistency::LINEARIZABLE;
+	meta.row_identity_projection = crate::client::core::RowIdentityProjection::None.as_u8();
+	meta.request_id = crate::schema::TableQueryRequestId::random();
+	meta.deadline_remaining_millis = deadline_ms;
+	client
+		.table_query_with_attempt_hook(
+			crate::client::core::TableQueryRequest {
+				meta,
+				descriptor,
+				pbc: Vec::new(),
+				runtime_filter: None,
+				row_identity: crate::client::core::RowIdentityProjection::None,
+			},
+			move |_| {
+				Ok(Box::new(DropMark(dropped.clone()))
+					as crate::client::core::TableQueryAttemptGuard)
+			},
+		)
+		.await
+		.map(|_| ())
+}
+
+/// DC-281 (Codex 01a1fd19): a node reached through a slow connect (200 ms) that
+/// receives the query and withholds its first response cannot hold the public call
+/// past the caller's 500 ms deadline. The call ends at it with the typed deadline
+/// error, the attempt's guard dropped, and the one frame sent carried the remainder
+/// computed just before it was sent (after the slow connect), not the original.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_withheld_first_query_response_ends_the_public_call_at_its_deadline() {
+	let fixture = fixture(&[], u32::MAX);
+	fixture.provider.slow.store(ENTER, Ordering::SeqCst);
+	let client = client_to_only(&fixture, ENTER);
+	let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+	let started = tokio::time::Instant::now();
+	let error = query_with(&client, 500, dropped.clone())
+		.await
+		.expect_err("no response, no result");
+	let elapsed = started.elapsed();
+	assert!(
+		error.to_string().contains("query_deadline_exceeded"),
+		"{error}"
+	);
+	assert!(
+		elapsed >= Duration::from_millis(500) && elapsed < Duration::from_millis(1_500),
+		"at the deadline: {elapsed:?}"
+	);
+	assert!(
+		dropped.load(Ordering::SeqCst),
+		"the attempt's guard was dropped"
+	);
+	let sent = fixture.entry.query_deadlines.lock().unwrap().clone();
+	assert_eq!(sent.len(), 1, "one frame: {sent:?}");
+	assert!(
+		sent[0] > 0 && sent[0] <= 500 - SLOW_CONNECT.as_millis() as u64 + 20,
+		"the remainder computed just before the send: {sent:?}"
+	);
+}
+
+/// DC-281 (Codex 01a1fd19): a connect that does not complete by the caller's
+/// deadline ends the public call at it, and nothing is sent afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_query_connect_held_past_the_deadline_sends_nothing_late() {
+	let fixture = fixture(&[], PENDING);
+	let client = client_to_only(&fixture, PENDING);
+	let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+	let started = tokio::time::Instant::now();
+	let error = query_with(&client, 300, dropped.clone())
+		.await
+		.expect_err("no connection, no result");
+	let elapsed = started.elapsed();
+	assert!(
+		error.to_string().contains("query_deadline_exceeded"),
+		"{error}"
+	);
+	assert!(
+		elapsed < Duration::from_millis(1_300),
+		"at the deadline: {elapsed:?}"
+	);
+	assert!(
+		dropped.load(Ordering::SeqCst),
+		"the attempt's guard was dropped"
+	);
+	assert!(
+		fixture.provider.dials.load(Ordering::SeqCst) >= 1,
+		"it dialled"
+	);
+	tokio::time::sleep(Duration::from_millis(1_000)).await;
+	assert!(
+		fixture.entry.query_deadlines.lock().unwrap().is_empty(),
+		"nothing sent, then or later"
+	);
+}
+
+/// DC-281 (Codex 01a1fd19): zero is no caller deadline (the call stays with the
+/// withholding node; the frame carries zero), and the largest finite input is
+/// clamped (no overflow; the frame carries a large finite remainder).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn zero_is_no_query_deadline_and_the_largest_is_clamped() {
+	for (input, what) in [(0_u64, "zero"), (u64::MAX, "the largest")] {
+		let fixture = fixture(&[], u32::MAX);
+		let client = client_to_only(&fixture, ENTER);
+		let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+		let pending = tokio::time::timeout(
+			Duration::from_millis(1_500),
+			query_with(&client, input, dropped.clone()),
+		)
+		.await;
+		assert!(pending.is_err(), "{what}: no deadline ends the call early");
+		let sent = fixture.entry.query_deadlines.lock().unwrap().clone();
+		assert_eq!(sent.len(), 1, "{what}: {sent:?}");
+		if input == 0 {
+			assert_eq!(sent[0], 0, "zero stays no caller deadline");
+		} else {
+			assert!(
+				sent[0] > 3_600_000 && sent[0] < u64::MAX,
+				"the largest input, clamped: {sent:?}"
+			);
+		}
+	}
+}
+
+/// DC-281 (Codex 01a1fd66): the budget is charged to the attempt's own preparation.
+/// With a 100 ms deadline and 300 ms of synchronous work after the payload is ready
+/// (in the same poll, as serializing a large payload would take), the deadline has
+/// passed when the frame would be stamped: the call ends with the typed deadline
+/// error and no frame is written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_query_expired_during_its_send_preparation_writes_no_frame() {
+	let fixture = fixture(&[], u32::MAX);
+	let client = client_to_only(&fixture, ENTER);
+	client.delay_query_send_for_test(Duration::from_millis(300));
+	let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+	let error = query_with(&client, 100, dropped.clone())
+		.await
+		.expect_err("expired before its frame");
+	assert!(
+		error.to_string().contains("query_deadline_exceeded"),
+		"{error}"
+	);
+	assert!(
+		dropped.load(Ordering::SeqCst),
+		"the attempt's guard was dropped"
+	);
+	tokio::time::sleep(Duration::from_millis(500)).await;
+	assert!(
+		fixture.entry.query_deadlines.lock().unwrap().is_empty(),
+		"no frame written"
 	);
 }
