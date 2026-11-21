@@ -7471,3 +7471,94 @@ mod tests {
 		.expect("append-only admission must not require a PK column");
 	}
 }
+
+/// Wendelon ADR 0119 D5 (Codex 01a1f9ca): the column representations whose
+/// repair answer is bounded by its write. A flat column's values and offsets
+/// are the same bytes however its rows were assembled: `take` of the write's
+/// rows and the server's concatenation of individually stored rows produce
+/// equal value and offset buffers, and differ at most by one validity bitmap.
+/// Dictionary, view, nested and union columns are not flat (their concatenation
+/// can merge or repeat dictionaries and views). This is a necessary condition
+/// only, wider than what a table admits: admission enforces the ADR's declared
+/// set, [`parent_decisions_append_only_column`], which is a subset of it.
+pub(crate) fn repair_bounded_column(data_type: &arrow::datatypes::DataType) -> bool {
+	use arrow::datatypes::DataType as T;
+	matches!(
+		data_type,
+		T::Null
+			| T::Boolean
+			| T::Int8 | T::Int16
+			| T::Int32
+			| T::Int64
+			| T::UInt8
+			| T::UInt16
+			| T::UInt32
+			| T::UInt64
+			| T::Float16
+			| T::Float32
+			| T::Float64
+			| T::Decimal32(..)
+			| T::Decimal64(..)
+			| T::Decimal128(..)
+			| T::Decimal256(..)
+			| T::Date32
+			| T::Date64
+			| T::Time32(_)
+			| T::Time64(_)
+			| T::Timestamp(..)
+			| T::Duration(_)
+			| T::Interval(_)
+			| T::Binary
+			| T::LargeBinary
+			| T::Utf8 | T::LargeUtf8
+			| T::FixedSizeBinary(_)
+	)
+}
+
+/// Wendelon ADR 0119 D5 (Codex 01a1fa16): the column types a named
+/// ParentDecisions AppendOnly table admits, the ADR's declared set. Each is
+/// flat ([`repair_bounded_column`], so its repair answer is bounded) and has a
+/// canonical row encoding (`storage::content_hash`). `Null`, `Float16` and
+/// `FixedSizeBinary` are flat but have none; the canonical encoding skips a null
+/// cell before its type check, so they are refused here, by the schema, before
+/// any identity, whatever the payload.
+pub(crate) fn parent_decisions_append_only_column(data_type: &arrow::datatypes::DataType) -> bool {
+	use arrow::datatypes::DataType as T;
+	matches!(
+		data_type,
+		T::Boolean
+			| T::Int8 | T::Int16
+			| T::Int32
+			| T::Int64
+			| T::UInt8
+			| T::UInt16
+			| T::UInt32
+			| T::UInt64
+			| T::Float32
+			| T::Float64
+			| T::Decimal32(..)
+			| T::Decimal64(..)
+			| T::Decimal128(..)
+			| T::Decimal256(..)
+			| T::Date32
+			| T::Date64
+			| T::Time32(_)
+			| T::Time64(_)
+			| T::Timestamp(..)
+			| T::Duration(_)
+			| T::Interval(_)
+			| T::Utf8 | T::LargeUtf8
+			| T::Binary
+			| T::LargeBinary
+	) && repair_bounded_column(data_type)
+}
+
+/// Every user column of `descriptor` is [`parent_decisions_append_only_column`].
+pub(crate) fn parent_decisions_append_only_schema(descriptor: &TableSchemaDescriptor) -> bool {
+	descriptor.arrow_schema().is_ok_and(|schema| {
+		schema
+			.fields()
+			.iter()
+			.all(|field| parent_decisions_append_only_column(field.data_type()))
+	})
+}

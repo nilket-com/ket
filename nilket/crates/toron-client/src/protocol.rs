@@ -141,6 +141,10 @@ pub enum SqlMessage {
 	CtasOutcome(CtasOutcomeResponse),
 	// Append-only ADR 574 materialization receipt.
 	MaterializeOutcome(MaterializeOutcomeResponse),
+	// Append-only Wendelon ADR 0120: a ParentDecisions CTAS operation's outcome, read
+	// from its decision chain. A decoder built before this variant rejects the frame
+	// (an unknown discriminant); it is never read as another message.
+	PdCtasOutcome(PdCtasOutcomeResponse),
 }
 
 /// ADR 574: routine status for a successful `materialize`. Every field is
@@ -408,10 +412,61 @@ pub struct CtasOutcomeResponse {
 	pub retry_debt: u32,
 }
 
+/// Wendelon ADR 0120: a ParentDecisions CTAS operation, read from its decision chain.
+/// Publication is its own question. The counts say exactly which declared chunks the
+/// decisions accepted or refused; a chunk never reserved counts toward `declared_*`
+/// only. Nothing here claims that an abandoned object's copies were reclaimed (that is
+/// certified cleanup's debt), and a ParentDecisions CTAS has no old binding to retire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PdCtasOutcomeResponse {
+	pub operation_query_id: QueryId,
+	/// The chain's object: the table once published.
+	pub table_object_id: [u8; 16],
+	/// The chain's epoch: 1 under its owner, raised by recovery.
+	pub epoch: u64,
+	pub state: PdCtasState,
+	/// 0 for an empty declaration (an empty SELECT).
+	pub declared_chunks: u32,
+	pub declared_rows: u64,
+	pub accepted_chunks: u32,
+	/// The declared rows of the accepted chunks: each accepted chunk committed exactly
+	/// its declared rows.
+	pub accepted_rows: u64,
+	pub refused_chunks: u32,
+	/// `Committed` once published; `KnownNotCommitted` after a conflict or an
+	/// abandonment; `Unspecified` while pending.
+	pub publication_commit_knowledge: MutationCommitKnowledge,
+	pub publication_cause: Option<CtasPublicationCause>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PdCtasState {
+	/// Dispatching under its owner or recovering: nothing is final yet.
+	Pending,
+	Published,
+	/// Every declared chunk was accepted, and the name was bound meanwhile.
+	Conflict,
+	Abandoned(PdCtasAbandonCause),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PdCtasAbandonCause {
+	/// The owner found a chunk inadmissible before its Reserve.
+	ChunkInadmissible,
+	/// The owner's deadline passed.
+	Deadline,
+	/// A declared chunk was refused.
+	ChunkRefused,
+	/// Recovery found a declared chunk never reserved.
+	SourceBytesLost,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResolvedOperationOutcome {
 	Mutation(MutationOutcomeResponse),
 	Ctas(CtasOutcomeResponse),
+	/// Wendelon ADR 0120: a ParentDecisions CTAS operation.
+	PdCtas(PdCtasOutcomeResponse),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -646,4 +701,197 @@ mod tests {
 			response
 		);
 	}
+}
+
+/// Wendelon ADR 0120 (Codex 01a1fc48): the decoder boundary of the appended
+/// `SqlMessage::PdCtasOutcome`. Every earlier variant keeps its discriminant and its
+/// bytes; the new one takes the next index; a decoder frozen at the enum as it stood
+/// before refuses the new message (an unknown discriminant), never reads it as
+/// another. That refusal establishes the boundary only: it is not support for the
+/// variant in older clients (pre-release: there are none to serve).
+#[cfg(test)]
+mod pd_ctas_outcome_boundary_tests {
+	use super::*;
+
+	/// `SqlMessage` before Wendelon ADR 0120, frozen.
+	#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+	enum SqlMessageBefore0120 {
+		Execute(ExecuteRequest),
+		Cancel(CancelRequest),
+		ResultBatch(ResultBatch),
+		Complete(Complete),
+		Error(SqlError),
+		Health(HealthRequest),
+		Healthy(HealthyResponse),
+		ExecuteRune(ExecuteRuneRequest),
+		RuneError(RuneFailure),
+		ResolveMutation(ResolveMutationRequest),
+		MutationOutcome(MutationOutcomeResponse),
+		CtasOutcome(CtasOutcomeResponse),
+		MaterializeOutcome(MaterializeOutcomeResponse),
+	}
+
+	fn id() -> QueryId {
+		QueryId::from_u128(0x0120_0000_0000_7000_8000_0000_0000_0001)
+	}
+
+	/// One sample of every variant, current and frozen, in declaration order.
+	fn samples() -> Vec<(SqlMessage, SqlMessageBefore0120)> {
+		let execute = match SqlFrame::execute(id(), "SELECT 1".to_owned(), Some(5)).message {
+			SqlMessage::Execute(request) => request,
+			other => panic!("{other:?}"),
+		};
+		let rune = match SqlFrame::execute_rune(id(), "1".to_owned(), None).message {
+			SqlMessage::ExecuteRune(request) => request,
+			other => panic!("{other:?}"),
+		};
+		let batch = ResultBatch {
+			batch_index: 3,
+			arrow_ipc_bytes: ByteBuf::from(vec![1, 2, 3]),
+		};
+		let error = SqlError {
+			code: SqlErrorCode::CatalogError,
+			message: "m".to_owned(),
+		};
+		let failure = RuneFailure {
+			kind: RuneFailureKind::Runtime,
+			message: "r".to_owned(),
+			span: None,
+		};
+		let mutation = MutationOutcomeResponse {
+			operation_query_id: id(),
+			resolution: MutationResolution::Expired,
+			write_status: 4,
+			stop_reason: MutationStopReason::Deadline,
+			commit_knowledge: MutationCommitKnowledge::Indeterminate,
+			delete_counts: Some([1, 2, 3]),
+		};
+		let ctas = CtasOutcomeResponse {
+			operation_query_id: id(),
+			phase: CtasCompositePhase::Complete,
+			provisional_table_object_id: [7; 16],
+			prior_binding: None,
+			row_count: Some(9),
+			terminal_cause: None,
+			catalog_commit_knowledge: MutationCommitKnowledge::Committed,
+			catalog_cause: None,
+			row_commit_knowledge: MutationCommitKnowledge::Committed,
+			row_cause: None,
+			publication_commit_knowledge: MutationCommitKnowledge::Committed,
+			publication_cause: None,
+			retirement_commit_knowledge: MutationCommitKnowledge::Committed,
+			retirement_cause: None,
+			owner_epoch: 1,
+			retry_debt: 0,
+		};
+		let materialize = MaterializeOutcomeResponse {
+			namespace: "n".to_owned(),
+			table_name: "t".to_owned(),
+			certificate_format_version: 1,
+			rows_written: 2,
+		};
+		use SqlMessageBefore0120 as Old;
+		vec![
+			(SqlMessage::Execute(execute.clone()), Old::Execute(execute)),
+			(
+				SqlMessage::Cancel(CancelRequest { query_id: id() }),
+				Old::Cancel(CancelRequest { query_id: id() }),
+			),
+			(
+				SqlMessage::ResultBatch(batch.clone()),
+				Old::ResultBatch(batch),
+			),
+			(
+				SqlMessage::Complete(Complete { row_count: 5 }),
+				Old::Complete(Complete { row_count: 5 }),
+			),
+			(SqlMessage::Error(error.clone()), Old::Error(error)),
+			(
+				SqlMessage::Health(HealthRequest),
+				Old::Health(HealthRequest),
+			),
+			(
+				SqlMessage::Healthy(HealthyResponse),
+				Old::Healthy(HealthyResponse),
+			),
+			(
+				SqlMessage::ExecuteRune(rune.clone()),
+				Old::ExecuteRune(rune),
+			),
+			(
+				SqlMessage::RuneError(failure.clone()),
+				Old::RuneError(failure),
+			),
+			(
+				SqlMessage::ResolveMutation(ResolveMutationRequest {
+					operation_query_id: id(),
+				}),
+				Old::ResolveMutation(ResolveMutationRequest {
+					operation_query_id: id(),
+				}),
+			),
+			(
+				SqlMessage::MutationOutcome(mutation),
+				Old::MutationOutcome(mutation),
+			),
+			(SqlMessage::CtasOutcome(ctas), Old::CtasOutcome(ctas)),
+			(
+				SqlMessage::MaterializeOutcome(materialize.clone()),
+				Old::MaterializeOutcome(materialize),
+			),
+		]
+	}
+
+	fn pd_outcome() -> PdCtasOutcomeResponse {
+		PdCtasOutcomeResponse {
+			operation_query_id: id(),
+			table_object_id: [0xC7; 16],
+			epoch: 2,
+			state: PdCtasState::Abandoned(PdCtasAbandonCause::ChunkRefused),
+			declared_chunks: 3,
+			declared_rows: 10,
+			accepted_chunks: 1,
+			accepted_rows: 3,
+			refused_chunks: 1,
+			publication_commit_knowledge: MutationCommitKnowledge::KnownNotCommitted,
+			publication_cause: None,
+		}
+	}
+
+	#[test]
+	fn every_earlier_message_keeps_its_discriminant_and_bytes() {
+		let samples = samples();
+		assert_eq!(samples.len(), 13, "every variant before 0120");
+		for (index, (current, frozen)) in samples.into_iter().enumerate() {
+			let bytes = postcard::to_stdvec(&current).unwrap();
+			assert_eq!(bytes[0] as usize, index, "{current:?}");
+			assert_eq!(bytes, postcard::to_stdvec(&frozen).unwrap(), "{current:?}");
+			assert_eq!(
+				postcard::from_bytes::<SqlMessageBefore0120>(&bytes).unwrap(),
+				frozen
+			);
+		}
+	}
+
+	#[test]
+	fn the_parent_decisions_outcome_is_appended_and_a_frozen_decoder_refuses_it() {
+		let message = SqlMessage::PdCtasOutcome(pd_outcome());
+		let bytes = postcard::to_stdvec(&message).unwrap();
+		assert_eq!(bytes[0], 13, "the next index");
+		assert_eq!(
+			postcard::from_bytes::<SqlMessage>(&bytes).unwrap(),
+			message,
+			"a current decoder round-trips it"
+		);
+		assert!(
+			postcard::from_bytes::<SqlMessageBefore0120>(&bytes).is_err(),
+			"a decoder frozen before 0120 refuses it, never misreads it"
+		);
+		// Its bytes, pinned.
+		let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+		assert_eq!(hex, PD_OUTCOME_GOLDEN, "the encoding of {message:?}");
+	}
+
+	const PD_OUTCOME_GOLDEN: &str =
+		"0d1001200000000070008000000000000001c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7020302030a0103010200";
 }

@@ -19,6 +19,14 @@ use wendelon::client::{
 	TableQueryRequest, TableWriteRequest, WendelonClient as InnerClient, WendelonClientConfig,
 	WriteRequest,
 };
+/// Wendelon ADR 0120: the ParentDecisions CTAS decision chain's types.
+pub use wendelon::client::{CtasChunkCredential, ctas_chunk_request_digest};
+pub use wendelon::consensus::decisions::ctas::{
+	ChunkDecl, CtasAbandonCause, CtasChain, CtasDeclarationBytes, CtasPhase, CtasRefusal,
+	ctas_owner_commitment, encode_declaration,
+};
+pub use wendelon::consensus::decisions::{DecisionRefusal, DecisionResult};
+pub use wendelon::network::control_server::CtasDecisionResponseWire;
 use wendelon::network::control_server::{
 	CONTROL_REASON_NOT_LEADER, CtasSagaRequestWire, CtasSagaResponseWire, SchemaUpdateResponseWire,
 	TableSchemaDropResponseWire,
@@ -30,6 +38,9 @@ pub use wendelon::network::control_server::{
 	MaintenanceRequeueOutcomeWire, MaintenanceRequeueRequestWire, MaintenanceRequeueResponseWire,
 };
 use wendelon::network::core::{HRFT_MAGIC, read_frame, write_frame};
+pub use wendelon::network::decision_proposals::{
+	CtasBeginRequest, CtasProposal, ProposalOutcome, ProposalRefusal, ProposalResponse,
+};
 use wendelon::network::factory::TransportProviderFactory;
 use wendelon::network::pool::BufPool;
 use wendelon::network::quic_transport::{
@@ -1057,6 +1068,86 @@ impl Client {
 			.await
 	}
 
+	/// Wendelon ADR 0120 D6: one CTAS command for the ParentDecisions leader, on
+	/// the authenticated, tenant-bound route. Follows the leader hint; a Today
+	/// authority answers `Refused(ModeToday)` before any proposal.
+	pub async fn ctas_decision(
+		&self,
+		proposal: &CtasProposal,
+	) -> Result<ProposalResponse, ClientError> {
+		let payload = wire::encode(proposal)?;
+		let mut preferred_target = self.inner.leader();
+		for attempt in 0..DATA_RETRY_BUDGET {
+			let target = if let Some(target) = preferred_target {
+				target
+			} else {
+				self.inner.refresh_topology().await?;
+				self.inner.leader().ok_or_else(|| {
+					std::io::Error::new(
+						std::io::ErrorKind::NotConnected,
+						"a CTAS decision requires a known control-ring leader",
+					)
+				})?
+			};
+			let response = self.submit_ctas_decision_once(target, &payload).await?;
+			if let ProposalResponse::NotLeader {
+				leader_hint: Some(hint),
+			} = response && hint != target.id
+				&& attempt + 1 < DATA_RETRY_BUDGET
+			{
+				preferred_target = Some(NodeId {
+					id: hint,
+					_reserved: 0,
+				});
+				self.inner.refresh_topology().await?;
+				continue;
+			}
+			return Ok(response);
+		}
+		Err(ClientError::Admin(WendelonAdminError::Transport {
+			message: "CTAS decision retry budget exhausted".to_owned(),
+		}))
+	}
+
+	async fn submit_ctas_decision_once(
+		&self,
+		target: NodeId,
+		payload: &[u8],
+	) -> Result<ProposalResponse, ClientError> {
+		let conn = self.inner.factory().get_connection(target).await?;
+		let mut stream = conn.open_bi().await?;
+		let header = FrameHeader {
+			magic: HRFT_MAGIC,
+			version: 1,
+			msg_type: MsgType::CTAS_DECISION_REQ.0,
+			flags: 0,
+			stream_id: 0,
+			meta_len: payload.len() as u32,
+			arrow_len: 0,
+			trailing_len: 0,
+		};
+		write_frame(&mut *stream, &header, payload, None, None).await?;
+		stream
+			.finish()
+			.await
+			.map_err(|error| std::io::Error::new(std::io::ErrorKind::BrokenPipe, error))?;
+		let frame = read_frame(&mut *stream, self.inner.pool()).await?;
+		if frame.header.msg_type != MsgType::CTAS_DECISION_RESP.0
+			|| frame.arrow_payload.is_some()
+			|| frame.trailing.is_some()
+		{
+			return Err(std::io::Error::new(
+				std::io::ErrorKind::InvalidData,
+				format!(
+					"expected a bare CTAS_DECISION_RESP, got msg_type=0x{:02x}",
+					frame.header.msg_type
+				),
+			)
+			.into());
+		}
+		Ok(wire::decode::<CtasDecisionResponseWire>(&frame.meta)?.response)
+	}
+
 	/// Resolve the durable ADR 548 composite state without replaying a phase.
 	pub async fn resolve_ctas_saga(
 		&self,
@@ -1666,6 +1757,33 @@ impl Client {
 		payload: RecordBatch,
 		options: WriteOptions,
 	) -> Result<TableWriteReceipt, ClientError> {
+		self.table_write_with(tenant_id, descriptor, payload, options, None)
+			.await
+	}
+
+	/// Wendelon ADR 0120 D6: one CTAS chunk of a begun decision chain, under
+	/// `options.operation_id` (the operation id and the chunk's declared sequence),
+	/// with the owner's credential. Answered and retried as a table write.
+	pub async fn ctas_chunk_write(
+		&self,
+		tenant_id: TenantId,
+		descriptor: &TableSchemaDescriptor,
+		payload: RecordBatch,
+		options: WriteOptions,
+		credential: CtasChunkCredential,
+	) -> Result<TableWriteReceipt, ClientError> {
+		self.table_write_with(tenant_id, descriptor, payload, options, Some(credential))
+			.await
+	}
+
+	async fn table_write_with(
+		&self,
+		tenant_id: TenantId,
+		descriptor: &TableSchemaDescriptor,
+		payload: RecordBatch,
+		options: WriteOptions,
+		credential: Option<CtasChunkCredential>,
+	) -> Result<TableWriteReceipt, ClientError> {
 		let rows = payload.num_rows();
 		let parent_write_id = match options.operation_id {
 			Some(operation_id) => {
@@ -1695,7 +1813,10 @@ impl Client {
 			payload,
 			deadline: options.deadline,
 		};
-		let result = self.inner.table_write(request).await?;
+		let result = match credential {
+			None => self.inner.table_write(request).await?,
+			Some(credential) => self.inner.ctas_chunk_write(request, credential).await?,
+		};
 		if result.response.reject_code != PbcRejectCode::NONE.0 {
 			return Err(ClientError::TableWriteRejected {
 				reject_code: PbcRejectCode(result.response.reject_code),

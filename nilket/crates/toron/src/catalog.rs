@@ -1119,6 +1119,33 @@ pub struct CreateTableOutcome {
 }
 
 #[derive(Clone)]
+/// Wendelon ADR 0120: a ParentDecisions CTAS over its materialized, non-empty
+/// chunks (an empty result has none).
+pub struct PdCtasRequest {
+	pub op: [u8; 16],
+	pub fingerprint: [u8; 32],
+	pub name: TableRef,
+	pub schema: SchemaRef,
+	pub chunks: Vec<arrow::record_batch::RecordBatch>,
+	/// The originating caller's absolute deadline: every fresh effect is checked
+	/// against it, and chunk writes carry it.
+	pub deadline: Option<std::time::Instant>,
+	/// How often the owner renews its lease while it dispatches.
+	pub renew_every: std::time::Duration,
+}
+
+/// Wendelon ADR 0120: how a ParentDecisions CTAS ended without an error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PdCtasOutcome {
+	/// This statement published its rows.
+	Published,
+	/// Another client holding this operation won its Begin; its publication is
+	/// adopted, and this statement dispatched nothing.
+	AdoptedPublished,
+	/// The target name was bound first (at Begin, or at Publish as a conflict).
+	NameBound,
+}
+
 pub struct CtasProvisionRequest {
 	pub operation_id: CtasOperationId,
 	pub intent_fingerprint: CtasIntentFingerprint,
@@ -1203,6 +1230,25 @@ pub trait Catalog: Send + Sync {
 		_operation_id: CtasOperationId,
 	) -> Result<Option<CtasSagaEntry>, CatalogError> {
 		Ok(None)
+	}
+
+	/// Wendelon ADR 0120: the ParentDecisions chain of CTAS operation `op` in this
+	/// catalog's tenant, read at the leader after a linearizable barrier.
+	async fn resolve_pd_ctas(
+		&self,
+		_op: [u8; 16],
+	) -> Result<Option<wendelon_client::CtasChain>, CatalogError> {
+		Err(CatalogError::AdminFailed {
+			message: "a ParentDecisions CTAS requires a Wendelon catalog".to_string(),
+		})
+	}
+
+	/// Wendelon ADR 0120: runs a ParentDecisions CTAS over its materialized
+	/// chunks: Begin, the owner's chunk writes, then Publish (or Abandon).
+	async fn run_pd_ctas(&self, _request: PdCtasRequest) -> Result<PdCtasOutcome, CatalogError> {
+		Err(CatalogError::AdminFailed {
+			message: "a ParentDecisions CTAS requires a Wendelon catalog".to_string(),
+		})
 	}
 
 	/// Resolve a saga-owned object by durable identity, including provisional or
@@ -1291,6 +1337,32 @@ trait SchemaUpdateClient: Send + Sync {
 			"schema client does not implement CTAS saga resolution",
 		)))
 	}
+
+	async fn ctas_decision(
+		&self,
+		proposal: &wendelon_client::CtasProposal,
+	) -> Result<wendelon_client::ProposalResponse, ClientError> {
+		let _ = proposal;
+		Err(ClientError::Io(std::io::Error::new(
+			std::io::ErrorKind::Unsupported,
+			"schema client does not implement ParentDecisions CTAS",
+		)))
+	}
+
+	async fn ctas_chunk_write(
+		&self,
+		tenant_id: WendelonTenantId,
+		descriptor: &TableSchemaDescriptor,
+		payload: arrow::record_batch::RecordBatch,
+		options: wendelon_client::WriteOptions,
+		credential: wendelon_client::CtasChunkCredential,
+	) -> Result<wendelon_client::TableWriteReceipt, ClientError> {
+		let _ = (tenant_id, descriptor, payload, options, credential);
+		Err(ClientError::Io(std::io::Error::new(
+			std::io::ErrorKind::Unsupported,
+			"schema client does not implement ParentDecisions CTAS chunks",
+		)))
+	}
 }
 
 #[async_trait::async_trait]
@@ -1315,6 +1387,24 @@ impl SchemaUpdateClient for Client {
 		operation_id: CtasOperationId,
 	) -> Result<CtasSagaResponse, ClientError> {
 		Client::resolve_ctas_saga(self, tenant_id, operation_id).await
+	}
+
+	async fn ctas_decision(
+		&self,
+		proposal: &wendelon_client::CtasProposal,
+	) -> Result<wendelon_client::ProposalResponse, ClientError> {
+		Client::ctas_decision(self, proposal).await
+	}
+
+	async fn ctas_chunk_write(
+		&self,
+		tenant_id: WendelonTenantId,
+		descriptor: &TableSchemaDescriptor,
+		payload: arrow::record_batch::RecordBatch,
+		options: wendelon_client::WriteOptions,
+		credential: wendelon_client::CtasChunkCredential,
+	) -> Result<wendelon_client::TableWriteReceipt, ClientError> {
+		Client::ctas_chunk_write(self, tenant_id, descriptor, payload, options, credential).await
 	}
 }
 
@@ -3732,6 +3822,244 @@ impl Catalog for WendelonCatalog {
 		Ok(invalidated)
 	}
 
+	async fn resolve_pd_ctas(
+		&self,
+		op: [u8; 16],
+	) -> Result<Option<wendelon_client::CtasChain>, CatalogError> {
+		let client = self.pd_ctas_client()?;
+		pd_resolve(client.as_ref(), wendelon_tenant_id(self.tenant_id), op).await
+	}
+
+	async fn run_pd_ctas(&self, request: PdCtasRequest) -> Result<PdCtasOutcome, CatalogError> {
+		let client = self.pd_ctas_client()?;
+		let client = client.as_ref();
+		let tenant = wendelon_tenant_id(self.tenant_id);
+		let (op, deadline) = (request.op, request.deadline);
+		let row_identity_policy = create_table_row_identity_policy(
+			&request.name,
+			request.schema.as_ref(),
+			&CreateTableRowIdentity::AppendOnly,
+		)?;
+		let descriptor = TableSchemaDescriptor::new_with_layout(
+			TableObjectId::new(*Uuid::new_v4().as_bytes()),
+			1,
+			request.name.schema.as_deref().unwrap_or("default"),
+			&request.name.table,
+			request.schema.as_ref(),
+			row_identity_policy,
+			LocalityPolicy::default_table_spread(),
+			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
+			SchemaEvolutionPolicy::AdditiveOnly,
+		)
+		.map_err(|error| CatalogError::FingerprintResolution {
+			message: error.to_string(),
+		})?;
+		// The declaration commits to every chunk's canonical rows before Begin.
+		let mut declared = Vec::with_capacity(request.chunks.len());
+		for (at, chunk) in request.chunks.iter().enumerate() {
+			let sequence_no = PD_CTAS_SEQUENCE_BASE + at as u64;
+			declared.push(wendelon_client::ChunkDecl {
+				sequence_no,
+				rows: u32::try_from(chunk.num_rows()).map_err(|_| {
+					CatalogError::ResourceExhausted {
+						message: "a CTAS chunk exceeds u32 rows".to_string(),
+					}
+				})?,
+				request_digest: wendelon_client::ctas_chunk_request_digest(
+					tenant,
+					&descriptor,
+					op,
+					sequence_no,
+					chunk,
+				)
+				.map_err(|error| CatalogError::AdminFailed {
+					message: format!("a CTAS chunk's digest: {error}"),
+				})?,
+			});
+		}
+		let declaration = wendelon_client::encode_declaration(&declared).map_err(|error| {
+			CatalogError::ResourceExhausted {
+				message: format!(
+					"a ParentDecisions CTAS declares at most {} chunks: {error:?}",
+					wendelon::consensus::decisions::ctas::CTAS_MAX_CHUNKS
+				),
+			}
+		})?;
+		tracing::info!(
+			chunks = declared.len(),
+			rows = declared
+				.iter()
+				.map(|chunk| u64::from(chunk.rows))
+				.sum::<u64>(),
+			"ParentDecisions CTAS declared"
+		);
+		// The owner's secret: drawn here, never logged, never in a command.
+		let mut secret = [0u8; 32];
+		aws_lc_rs::rand::fill(&mut secret).map_err(|_| CatalogError::AdminFailed {
+			message: "no randomness for a CTAS owner secret".to_string(),
+		})?;
+		let commitment = wendelon_client::ctas_owner_commitment(&secret);
+		// Every fresh effect is checked against the caller's deadline first;
+		// an effect already sent when the deadline passes stays for recovery.
+		let begun = pd_bounded(
+			deadline,
+			"Begin",
+			pd_decide(
+				client,
+				wendelon_client::CtasProposal::Begin(wendelon_client::CtasBeginRequest {
+					tenant,
+					op,
+					fingerprint: request.fingerprint,
+					descriptor: descriptor.clone(),
+					declaration,
+					dispatch_hash: commitment,
+				}),
+			),
+		)
+		.await?;
+		match begun {
+			wendelon_client::DecisionResult::CtasBegun {
+				replayed: false, ..
+			} => {}
+			// A replay: ours (a lost acknowledgement) or another client's winning
+			// Begin under the same operation, whose status this one adopts.
+			wendelon_client::DecisionResult::CtasBegun { replayed: true, .. } => {
+				match pd_adopt(client, tenant, op, commitment, deadline).await? {
+					PdAdopted::Own => {}
+					PdAdopted::Outcome(outcome) => return Ok(outcome),
+				}
+			}
+			wendelon_client::DecisionResult::Refused(wendelon_client::DecisionRefusal::Ctas(
+				wendelon_client::CtasRefusal::NameBound,
+			)) => return Ok(PdCtasOutcome::NameBound),
+			other => {
+				return Err(CatalogError::AdminFailed {
+					message: format!("ParentDecisions CTAS Begin: {other:?}"),
+				});
+			}
+		}
+		let credential = wendelon_client::CtasChunkCredential { op, secret };
+		let renew = || async {
+			let renewal = pd_bounded(
+				deadline,
+				"renewal",
+				pd_decide(
+					client,
+					wendelon_client::CtasProposal::Renew {
+						tenant,
+						op,
+						epoch: 1,
+						secret,
+					},
+				),
+			)
+			.await?;
+			match renewal {
+				wendelon_client::DecisionResult::CtasRenewed { .. } => Ok(()),
+				other => Err(CatalogError::AdminFailed {
+					message: format!(
+						"ParentDecisions CTAS ownership lost ({other:?}); the operation stays for \
+						 recovery"
+					),
+				}),
+			}
+		};
+		// The owner renews on a fixed period for as long as it dispatches, also
+		// while one chunk is in flight.
+		let mut next_renewal = tokio::time::Instant::now() + request.renew_every;
+		for (chunk, decl) in request.chunks.into_iter().zip(&declared) {
+			pd_before_effect(deadline, "chunk dispatch")?;
+			let options = wendelon_client::WriteOptions {
+				await_finalization: true,
+				deadline,
+				operation_id: Some(wendelon::schema::ClientWriteId {
+					client_uuid: op,
+					sequence_no: decl.sequence_no,
+					idempotency_ttl_ms: 300_000,
+					_pad: 0,
+				}),
+				..wendelon_client::WriteOptions::default()
+			};
+			let write = client.ctas_chunk_write(tenant, &descriptor, chunk, options, credential);
+			tokio::pin!(write);
+			let written = loop {
+				tokio::select! {
+					written = &mut write => break written,
+					_ = tokio::time::sleep_until(next_renewal) => {
+						renew().await?;
+						next_renewal = tokio::time::Instant::now() + request.renew_every;
+					}
+				}
+			};
+			match written {
+				Ok(_) => {}
+				Err(error) if pd_chunk_refused(&error) => {
+					// Abandonment is claimed only on its authoritative decision: a
+					// takeover may already have made the chain terminal.
+					let abandoned = pd_bounded(
+						deadline,
+						"Abandon",
+						pd_decide(
+							client,
+							wendelon_client::CtasProposal::Abandon {
+								tenant,
+								op,
+								epoch: 1,
+								secret,
+								cause: wendelon_client::CtasAbandonCause::ChunkInadmissible,
+							},
+						),
+					)
+					.await;
+					return Err(CatalogError::AdminFailed {
+						message: match abandoned {
+							Err(abandon) => format!(
+								"a CTAS chunk was refused ({error}); no abandonment is claimed: {abandon}"
+							),
+							Ok(wendelon_client::DecisionResult::CtasAbandoned { .. }) => format!(
+								"a CTAS chunk was refused ({error}); the statement was abandoned \
+								 unpublished"
+							),
+							Ok(other) => format!(
+								"a CTAS chunk was refused ({error}); its Abandon was not applied \
+								 ({other:?}): the operation's outcome is its recorded chain's"
+							),
+						},
+					});
+				}
+				Err(error) => {
+					return Err(CatalogError::AdminFailed {
+						message: format!(
+							"a CTAS chunk's outcome is unknown ({error}); the operation stays for \
+							 recovery"
+						),
+					});
+				}
+			}
+		}
+		match pd_bounded(
+			deadline,
+			"Publish",
+			pd_decide(
+				client,
+				wendelon_client::CtasProposal::Publish {
+					tenant,
+					op,
+					epoch: 1,
+					secret,
+				},
+			),
+		)
+		.await?
+		{
+			wendelon_client::DecisionResult::CtasPublished { .. } => Ok(PdCtasOutcome::Published),
+			wendelon_client::DecisionResult::CtasConflict { .. } => Ok(PdCtasOutcome::NameBound),
+			other => Err(CatalogError::AdminFailed {
+				message: format!("ParentDecisions CTAS Publish: {other:?}"),
+			}),
+		}
+	}
+
 	async fn provision_ctas(
 		&self,
 		request: CtasProvisionRequest,
@@ -3868,6 +4196,11 @@ impl Catalog for WendelonCatalog {
 			CtasSagaResponse::Applied(entry) => entry,
 			CtasSagaResponse::Rejected(wendelon_client::CtasSagaReject::NotFound) => {
 				return Ok(None);
+			}
+			// Wendelon ADR 0120: definitive and before any proposal; the only
+			// answer that sends the statement to the decision chain.
+			CtasSagaResponse::Rejected(wendelon_client::CtasSagaReject::WrongDecisionMode) => {
+				return Err(CatalogError::CtasUnderParentDecisions);
 			}
 			CtasSagaResponse::Rejected(reject) => {
 				return Err(CatalogError::AdminFailed {
@@ -4116,6 +4449,175 @@ fn canonical_table_ref(table: &TableRef) -> TableRef {
 fn descriptor_sync_resource_exhausted() -> CatalogError {
 	CatalogError::ResourceExhausted {
 		message: "tenant descriptor sync limit exhausted".to_string(),
+	}
+}
+
+/// Wendelon ADR 0120: the first of a ParentDecisions CTAS's consecutive chunk
+/// sequences (the Today chain's base, so ids stay recognizable).
+const PD_CTAS_SEQUENCE_BASE: u64 = 0x4354_4153_0000_0001;
+/// How often the owner renews its 60 s lease while it dispatches.
+pub const PD_CTAS_RENEW_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
+/// How long a client that lost Begin waits for the winner's terminal status,
+/// at most (the caller's deadline may bound it further).
+const PD_CTAS_ADOPT_BOUND: std::time::Duration = std::time::Duration::from_secs(150);
+
+impl WendelonCatalog {
+	fn pd_ctas_client(&self) -> Result<&Arc<dyn SchemaUpdateClient>, CatalogError> {
+		self.client
+			.as_ref()
+			.ok_or_else(|| CatalogError::AdminFailed {
+				message:
+					"a ParentDecisions CTAS requires a configured Wendelon catalog admin client"
+						.to_string(),
+			})
+	}
+}
+
+fn pd_deadline_error(what: &str) -> CatalogError {
+	CatalogError::AdminFailed {
+		message: format!("CTAS deadline elapsed before {what}"),
+	}
+}
+
+/// Refuses a fresh effect once the caller's deadline has passed.
+fn pd_before_effect(deadline: Option<std::time::Instant>, what: &str) -> Result<(), CatalogError> {
+	if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+		return Err(pd_deadline_error(what));
+	}
+	Ok(())
+}
+
+/// A command under the caller's deadline: never sent once it has passed (the
+/// operation stays for recovery), and its wait bounded by it (one cut off after
+/// it was sent has an unknown outcome). `work` is lazy: unpolled, it sends nothing.
+async fn pd_bounded<T>(
+	deadline: Option<std::time::Instant>,
+	what: &str,
+	work: impl std::future::Future<Output = Result<T, CatalogError>>,
+) -> Result<T, CatalogError> {
+	pd_before_effect(deadline, what)?;
+	let Some(deadline) = deadline else {
+		return work.await;
+	};
+	tokio::time::timeout_at(deadline.into(), work)
+		.await
+		.unwrap_or_else(|_| {
+			Err(CatalogError::AdminFailed {
+				message: format!(
+					"CTAS deadline elapsed during {what}; its outcome is unknown and the operation \
+					 stays for recovery"
+				),
+			})
+		})
+}
+
+/// One CTAS command at the leader; its decision, or a typed failure.
+async fn pd_decide(
+	client: &dyn SchemaUpdateClient,
+	proposal: wendelon_client::CtasProposal,
+) -> Result<wendelon_client::DecisionResult, CatalogError> {
+	match client
+		.ctas_decision(&proposal)
+		.await
+		.map_err(|error| CatalogError::AdminFailed {
+			message: format!("ParentDecisions CTAS command: {error}"),
+		})? {
+		wendelon_client::ProposalResponse::Applied {
+			outcome: wendelon_client::ProposalOutcome::Decision(result),
+			..
+		} => Ok(result),
+		other => Err(CatalogError::AdminFailed {
+			message: format!("ParentDecisions CTAS command answered {other:?}"),
+		}),
+	}
+}
+
+/// The operation's chain at the leader, or none.
+async fn pd_resolve(
+	client: &dyn SchemaUpdateClient,
+	tenant: WendelonTenantId,
+	op: [u8; 16],
+) -> Result<Option<wendelon_client::CtasChain>, CatalogError> {
+	match client
+		.ctas_decision(&wendelon_client::CtasProposal::Resolve { tenant, op })
+		.await
+		.map_err(|error| CatalogError::AdminFailed {
+			message: format!("resolve ParentDecisions CTAS: {error}"),
+		})? {
+		wendelon_client::ProposalResponse::CtasResolved { chain, .. } => {
+			Ok(chain.map(|chain| *chain))
+		}
+		other => Err(CatalogError::AdminFailed {
+			message: format!("resolve ParentDecisions CTAS answered {other:?}"),
+		}),
+	}
+}
+
+/// What a replayed Begin turned out to be.
+enum PdAdopted {
+	/// This client's own chain (its Begin's acknowledgement was lost).
+	Own,
+	/// Another client won Begin: its terminal status, adopted.
+	Outcome(PdCtasOutcome),
+}
+
+/// After a replayed Begin: this client's own chain, or another client's, whose
+/// terminal status this one adopts without dispatching anything. The whole
+/// wait, every pending read included, is bounded by the adoption bound and the
+/// caller's deadline.
+async fn pd_adopt(
+	client: &dyn SchemaUpdateClient,
+	tenant: WendelonTenantId,
+	op: [u8; 16],
+	commitment: [u8; 32],
+	deadline: Option<std::time::Instant>,
+) -> Result<PdAdopted, CatalogError> {
+	let bound = std::time::Instant::now() + PD_CTAS_ADOPT_BOUND;
+	let until = deadline.map_or(bound, |deadline| deadline.min(bound));
+	let waiting = async {
+		loop {
+			let chain = pd_resolve(client, tenant, op).await?;
+			if chain.as_ref().map(|chain| chain.dispatch_hash) == Some(commitment) {
+				return Ok(PdAdopted::Own);
+			}
+			match chain.map(|chain| chain.phase) {
+				Some(wendelon_client::CtasPhase::Published { .. }) => {
+					return Ok(PdAdopted::Outcome(PdCtasOutcome::AdoptedPublished));
+				}
+				Some(wendelon_client::CtasPhase::Conflict { .. }) => {
+					return Ok(PdAdopted::Outcome(PdCtasOutcome::NameBound));
+				}
+				Some(wendelon_client::CtasPhase::Abandoned { .. }) => {
+					return Err(CatalogError::AdminFailed {
+						message: "the winning attempt of this CTAS was abandoned unpublished"
+							.to_string(),
+					});
+				}
+				_ => tokio::time::sleep(std::time::Duration::from_millis(250)).await,
+			}
+		}
+	};
+	tokio::time::timeout_at(until.into(), waiting)
+		.await
+		.unwrap_or_else(|_| {
+			Err(CatalogError::AdminFailed {
+				message: "the winning attempt of this CTAS did not finish within the caller's \
+				          bound"
+					.to_string(),
+			})
+		})
+}
+
+/// A chunk refused for good: inadmissible, the statement is abandoned.
+fn pd_chunk_refused(error: &ClientError) -> bool {
+	match error {
+		ClientError::MutationStopped { knowledge, .. } => {
+			*knowledge == wendelon::schema::MutationCommitKnowledge::KNOWN_NOT_COMMITTED
+		}
+		ClientError::WriteFailed { status } => {
+			*status == wendelon::schema::WriteStatus::WRITE_KEY_CONFLICT
+		}
+		_ => false,
 	}
 }
 
@@ -4565,6 +5067,428 @@ mod tests {
 				.await
 				.pop_front()
 				.expect("fake schema update response")
+		}
+	}
+
+	/// Wendelon ADR 0120: a scripted ParentDecisions authority for the CTAS
+	/// driver. Every command and chunk write is counted.
+	struct ScriptedPdClient {
+		/// `Some(winner)`: Begin replays another client's chain with the owner
+		/// commitment `winner`; `None`: Begin is fresh.
+		winner: Option<[u8; 32]>,
+		/// The phases successive resolves answer (the last repeats).
+		phases: std::sync::Mutex<VecDeque<wendelon_client::CtasPhase>>,
+		/// How long each resolve takes.
+		resolve_delay: Duration,
+		/// How long each chunk write takes, and whether it is refused for good.
+		chunk_delay: Duration,
+		chunk_refused: bool,
+		/// The answer to Abandon.
+		abandon: wendelon_client::DecisionResult,
+		/// How long Abandon's reply is held.
+		abandon_delay: Duration,
+		begins: AtomicU64,
+		renewals: AtomicU64,
+		abandons: AtomicU64,
+		chunk_writes: AtomicU64,
+		/// The deadline the last chunk write carried.
+		chunk_deadline: std::sync::Mutex<Option<std::time::Instant>>,
+	}
+
+	impl ScriptedPdClient {
+		fn new() -> Self {
+			Self {
+				winner: None,
+				phases: std::sync::Mutex::new(VecDeque::from([
+					wendelon_client::CtasPhase::Dispatching,
+				])),
+				resolve_delay: Duration::ZERO,
+				chunk_delay: Duration::ZERO,
+				chunk_refused: false,
+				abandon: wendelon_client::DecisionResult::CtasAbandoned {
+					cause: wendelon_client::CtasAbandonCause::ChunkInadmissible,
+					at: 10,
+					replayed: false,
+				},
+				abandon_delay: Duration::ZERO,
+				begins: AtomicU64::new(0),
+				renewals: AtomicU64::new(0),
+				abandons: AtomicU64::new(0),
+				chunk_writes: AtomicU64::new(0),
+				chunk_deadline: std::sync::Mutex::new(None),
+			}
+		}
+	}
+
+	fn decided(result: wendelon_client::DecisionResult) -> wendelon_client::ProposalResponse {
+		wendelon_client::ProposalResponse::Applied {
+			outcome: wendelon_client::ProposalOutcome::Decision(result),
+			log_index: 9,
+		}
+	}
+
+	#[async_trait::async_trait]
+	impl SchemaUpdateClient for ScriptedPdClient {
+		async fn submit_table_schema_update(
+			&self,
+			_request: TableSchemaUpdateRequest,
+		) -> Result<SchemaUpdateReceipt, ClientError> {
+			unreachable!("no schema update")
+		}
+
+		async fn ctas_decision(
+			&self,
+			proposal: &wendelon_client::CtasProposal,
+		) -> Result<wendelon_client::ProposalResponse, ClientError> {
+			let tenant = proposal.tenant();
+			Ok(match proposal {
+				wendelon_client::CtasProposal::Begin(begin) => {
+					self.begins.fetch_add(1, Ordering::SeqCst);
+					if let Some(winner) = self.winner {
+						assert_ne!(begin.dispatch_hash, winner, "a fresh secret");
+					}
+					decided(wendelon_client::DecisionResult::CtasBegun {
+						tenant,
+						object: wendelon_client::TableObjectId::new([3; 16]),
+						replayed: self.winner.is_some(),
+					})
+				}
+				wendelon_client::CtasProposal::Resolve { .. } => {
+					sleep(self.resolve_delay).await;
+					let phase = {
+						let mut phases = self.phases.lock().unwrap();
+						if phases.len() > 1 {
+							phases.pop_front().unwrap()
+						} else {
+							phases.front().cloned().unwrap()
+						}
+					};
+					wendelon_client::ProposalResponse::CtasResolved {
+						chain: Some(Box::new(wendelon_client::CtasChain {
+							object: wendelon_client::TableObjectId::new([3; 16]),
+							fingerprint: [1; 32],
+							chunks: Vec::new(),
+							row_count: 0,
+							dispatch_hash: self.winner.unwrap_or([0; 32]),
+							epoch: 1,
+							lease_until_ms: 0,
+							terminal_at_ms: 0,
+							phase,
+							accepted: 0,
+							refused: 0,
+							retained_bytes: 0,
+						})),
+						visible_from: None,
+						log_index: 9,
+					}
+				}
+				wendelon_client::CtasProposal::Renew { .. } => {
+					self.renewals.fetch_add(1, Ordering::SeqCst);
+					decided(wendelon_client::DecisionResult::CtasRenewed {
+						lease_until_ms: 60_000,
+					})
+				}
+				wendelon_client::CtasProposal::Abandon { .. } => {
+					self.abandons.fetch_add(1, Ordering::SeqCst);
+					sleep(self.abandon_delay).await;
+					decided(self.abandon.clone())
+				}
+				wendelon_client::CtasProposal::Publish { .. } => {
+					decided(wendelon_client::DecisionResult::CtasPublished {
+						tenant,
+						object: wendelon_client::TableObjectId::new([3; 16]),
+						visible_from: 11,
+						replayed: false,
+					})
+				}
+				other => panic!("unexpected {other:?}"),
+			})
+		}
+
+		async fn ctas_chunk_write(
+			&self,
+			_tenant_id: WendelonTenantId,
+			_descriptor: &TableSchemaDescriptor,
+			payload: arrow::record_batch::RecordBatch,
+			options: wendelon_client::WriteOptions,
+			_credential: wendelon_client::CtasChunkCredential,
+		) -> Result<wendelon_client::TableWriteReceipt, ClientError> {
+			self.chunk_writes.fetch_add(1, Ordering::SeqCst);
+			*self.chunk_deadline.lock().unwrap() = options.deadline;
+			sleep(self.chunk_delay).await;
+			let operation_id = options.operation_id.expect("a chunk names its key");
+			if self.chunk_refused {
+				return Err(ClientError::MutationStopped {
+					operation_id,
+					status: wendelon::schema::WriteStatus::WRITE_REFUSED,
+					reason: wendelon::schema::MutationStopReason::NONE,
+					knowledge: wendelon::schema::MutationCommitKnowledge::KNOWN_NOT_COMMITTED,
+				});
+			}
+			Ok(wendelon_client::TableWriteReceipt {
+				table_object_id: wendelon_client::TableObjectId::new([3; 16]),
+				schema_generation: 1,
+				rows: payload.num_rows(),
+				duplicate: false,
+				requested_durability: options.durability,
+				log_index: 10,
+				term: 1,
+				epoch: 1,
+				commit_hlc: wendelon::schema::HybridTimestamp {
+					physical_ms: 1,
+					logical: 0,
+					node_id: 1,
+				},
+				finalization: None,
+			})
+		}
+	}
+
+	fn scripted_catalog(client: Arc<ScriptedPdClient>) -> WendelonCatalog {
+		WendelonCatalog {
+			client: Some(client),
+			descriptor_sync_client: None,
+			descriptor_sync_flights: None,
+			descriptor_sync_metrics: Arc::new(DescriptorSyncMetrics::default()),
+			descriptor_refresh_metrics: Arc::new(DescriptorRefreshMetrics::default()),
+			tenant_id: TenantId(7),
+			registry: Arc::new(WendelonDescriptorRegistry::default()),
+		}
+	}
+
+	fn pd_request(
+		chunks: usize,
+		deadline: Option<std::time::Instant>,
+		renew_every: Duration,
+	) -> PdCtasRequest {
+		let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+		let chunk = arrow::record_batch::RecordBatch::try_new(
+			schema.clone(),
+			vec![Arc::new(arrow::array::Int64Array::from(vec![1, 1, 2]))],
+		)
+		.unwrap();
+		PdCtasRequest {
+			op: *uuid::Uuid::now_v7().as_bytes(),
+			fingerprint: [1; 32],
+			name: TableRef::new("copy"),
+			schema,
+			chunks: vec![chunk; chunks],
+			deadline,
+			renew_every,
+		}
+	}
+
+	/// Wendelon ADR 0120 (Codex 01a1fb24): a client that lost Begin (its Begin
+	/// replays a chain whose owner commitment is not its own) dispatches nothing
+	/// (neither its declaration nor its secret) and adopts the winner's status:
+	/// it waits through `Dispatching` and answers the winner's publication.
+	#[tokio::test]
+	async fn a_client_that_lost_begin_adopts_the_winner_and_dispatches_nothing() {
+		let client = Arc::new(ScriptedPdClient {
+			winner: Some([0xEE; 32]),
+			phases: std::sync::Mutex::new(VecDeque::from([
+				wendelon_client::CtasPhase::Dispatching,
+				wendelon_client::CtasPhase::Dispatching,
+				wendelon_client::CtasPhase::Published { at: 12 },
+			])),
+			..ScriptedPdClient::new()
+		});
+		let outcome = scripted_catalog(client.clone())
+			.run_pd_ctas(pd_request(1, None, PD_CTAS_RENEW_EVERY))
+			.await
+			.expect("the loser adopts");
+		assert_eq!(outcome, PdCtasOutcome::AdoptedPublished);
+		assert_eq!(client.begins.load(Ordering::SeqCst), 1);
+		assert_eq!(
+			client.chunk_writes.load(Ordering::SeqCst),
+			0,
+			"nothing dispatched"
+		);
+	}
+
+	/// Codex 01a1fb6a §2: the loser's whole wait is bounded by the caller's
+	/// deadline, a pending (stalled) resolve included: it returns on time with
+	/// nothing dispatched.
+	#[tokio::test]
+	async fn a_stalled_adoption_read_returns_by_the_callers_deadline() {
+		let client = Arc::new(ScriptedPdClient {
+			winner: Some([0xEE; 32]),
+			resolve_delay: Duration::from_secs(600),
+			..ScriptedPdClient::new()
+		});
+		let started = std::time::Instant::now();
+		let deadline = started + Duration::from_millis(300);
+		let error = scripted_catalog(client.clone())
+			.run_pd_ctas(pd_request(1, Some(deadline), PD_CTAS_RENEW_EVERY))
+			.await
+			.expect_err("the stalled read is cut off");
+		let elapsed = started.elapsed();
+		assert!(
+			elapsed < Duration::from_secs(5),
+			"returned after {elapsed:?}: {error}"
+		);
+		assert!(
+			error.to_string().contains("within the caller's bound"),
+			"{error}"
+		);
+		assert_eq!(client.chunk_writes.load(Ordering::SeqCst), 0);
+	}
+
+	/// Codex 01a1fb6a §2: a deadline already passed begins nothing; a live one
+	/// reaches every chunk write.
+	#[tokio::test]
+	async fn the_callers_deadline_bounds_begin_and_reaches_each_chunk() {
+		let client = Arc::new(ScriptedPdClient::new());
+		let error = scripted_catalog(client.clone())
+			.run_pd_ctas(pd_request(
+				1,
+				Some(std::time::Instant::now()),
+				PD_CTAS_RENEW_EVERY,
+			))
+			.await
+			.expect_err("a passed deadline");
+		assert!(error.to_string().contains("before Begin"), "{error}");
+		assert_eq!(client.begins.load(Ordering::SeqCst), 0, "no Begin");
+
+		let client = Arc::new(ScriptedPdClient::new());
+		let deadline = std::time::Instant::now() + Duration::from_secs(60);
+		let outcome = scripted_catalog(client.clone())
+			.run_pd_ctas(pd_request(2, Some(deadline), PD_CTAS_RENEW_EVERY))
+			.await
+			.expect("published");
+		assert_eq!(outcome, PdCtasOutcome::Published);
+		assert_eq!(client.chunk_writes.load(Ordering::SeqCst), 2);
+		assert_eq!(*client.chunk_deadline.lock().unwrap(), Some(deadline));
+	}
+
+	/// Codex 01a1fb90: every owner command passes one pre-send expiry check and a
+	/// bounded wait. A chunk refused for good after the caller's deadline sends no
+	/// Abandon (the operation stays for recovery), with no terminal claim.
+	#[tokio::test]
+	async fn a_chunk_refused_after_the_deadline_sends_no_abandon() {
+		let client = Arc::new(ScriptedPdClient {
+			chunk_delay: Duration::from_millis(400),
+			chunk_refused: true,
+			..ScriptedPdClient::new()
+		});
+		let deadline = std::time::Instant::now() + Duration::from_millis(200);
+		let error = scripted_catalog(client.clone())
+			.run_pd_ctas(pd_request(1, Some(deadline), PD_CTAS_RENEW_EVERY))
+			.await
+			.expect_err("a refused chunk after the deadline");
+		assert_eq!(client.abandons.load(Ordering::SeqCst), 0, "no Abandon sent");
+		assert!(error.to_string().contains("before Abandon"), "{error}");
+		assert!(
+			!error.to_string().contains("was abandoned unpublished"),
+			"{error}"
+		);
+	}
+
+	/// Codex 01a1fb90: an Abandon sent within the deadline whose reply is held
+	/// returns at the caller's bound, with one Abandon and no terminal claim.
+	#[tokio::test]
+	async fn an_abandon_whose_reply_is_held_returns_at_the_callers_bound() {
+		let client = Arc::new(ScriptedPdClient {
+			chunk_refused: true,
+			abandon_delay: Duration::from_secs(600),
+			..ScriptedPdClient::new()
+		});
+		let started = std::time::Instant::now();
+		let deadline = started + Duration::from_millis(300);
+		let error = scripted_catalog(client.clone())
+			.run_pd_ctas(pd_request(1, Some(deadline), PD_CTAS_RENEW_EVERY))
+			.await
+			.expect_err("a held Abandon");
+		let elapsed = started.elapsed();
+		assert!(
+			elapsed < Duration::from_secs(5),
+			"returned after {elapsed:?}: {error}"
+		);
+		assert_eq!(
+			client.abandons.load(Ordering::SeqCst),
+			1,
+			"one Abandon sent"
+		);
+		assert!(error.to_string().contains("outcome is unknown"), "{error}");
+		assert!(
+			!error.to_string().contains("was abandoned unpublished"),
+			"{error}"
+		);
+	}
+
+	/// Codex 01a1fb90: a renewal due after the caller's deadline is not sent; the
+	/// in-flight chunk is left and the operation stays for recovery.
+	#[tokio::test]
+	async fn a_renewal_due_after_the_deadline_is_not_sent() {
+		let client = Arc::new(ScriptedPdClient {
+			chunk_delay: Duration::from_millis(800),
+			..ScriptedPdClient::new()
+		});
+		let deadline = std::time::Instant::now() + Duration::from_millis(200);
+		let error = scripted_catalog(client.clone())
+			.run_pd_ctas(pd_request(1, Some(deadline), Duration::from_millis(400)))
+			.await
+			.expect_err("a renewal after the deadline");
+		assert_eq!(client.renewals.load(Ordering::SeqCst), 0, "no renewal sent");
+		assert!(error.to_string().contains("before renewal"), "{error}");
+	}
+
+	/// Codex 01a1fb6a §3: the owner renews on its period while one chunk is in
+	/// flight, not only between chunks.
+	#[tokio::test]
+	async fn the_owner_renews_while_one_chunk_is_in_flight() {
+		let client = Arc::new(ScriptedPdClient {
+			chunk_delay: Duration::from_millis(500),
+			..ScriptedPdClient::new()
+		});
+		scripted_catalog(client.clone())
+			.run_pd_ctas(pd_request(1, None, Duration::from_millis(100)))
+			.await
+			.expect("published");
+		assert!(
+			client.renewals.load(Ordering::SeqCst) >= 3,
+			"renewals during one 500 ms chunk: {}",
+			client.renewals.load(Ordering::SeqCst)
+		);
+	}
+
+	/// Codex 01a1fb6a §3: after an inadmissible chunk, abandonment is claimed only
+	/// on its applied decision. A takeover made the chain terminal first, so the
+	/// Abandon is refused (`WrongPhase`): the statement fails without claiming
+	/// it abandoned anything.
+	#[tokio::test]
+	async fn abandonment_is_claimed_only_on_its_applied_decision() {
+		for (abandon, claims) in [
+			(
+				wendelon_client::DecisionResult::CtasAbandoned {
+					cause: wendelon_client::CtasAbandonCause::ChunkInadmissible,
+					at: 10,
+					replayed: false,
+				},
+				true,
+			),
+			(
+				wendelon_client::DecisionResult::Refused(wendelon_client::DecisionRefusal::Ctas(
+					wendelon_client::CtasRefusal::WrongPhase,
+				)),
+				false,
+			),
+		] {
+			let client = Arc::new(ScriptedPdClient {
+				chunk_refused: true,
+				abandon,
+				..ScriptedPdClient::new()
+			});
+			let error = scripted_catalog(client.clone())
+				.run_pd_ctas(pd_request(1, None, PD_CTAS_RENEW_EVERY))
+				.await
+				.expect_err("an inadmissible chunk");
+			assert_eq!(client.abandons.load(Ordering::SeqCst), 1);
+			assert_eq!(
+				error.to_string().contains("was abandoned unpublished"),
+				claims,
+				"{error}"
+			);
 		}
 	}
 

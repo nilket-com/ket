@@ -610,6 +610,25 @@ pub struct TableWriteRequest {
 	pub deadline: Option<std::time::Instant>,
 }
 
+pub use crate::network::data_server::coordinator::ctas_chunk_request_digest;
+
+/// Wendelon ADR 0120 D6: a CTAS chunk's dispatch credential, the operation and
+/// its owner's secret. Its `Debug` never prints the secret.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct CtasChunkCredential {
+	pub op: [u8; 16],
+	pub secret: [u8; 32],
+}
+
+impl std::fmt::Debug for CtasChunkCredential {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("CtasChunkCredential")
+			.field("op", &self.op)
+			.field("secret", &"<redacted>")
+			.finish()
+	}
+}
+
 /// Result of a typed table write.
 #[derive(Clone, Debug)]
 pub struct TableWriteResult {
@@ -838,7 +857,25 @@ impl WendelonClient {
 	/// preserving one parent finalization for the logical write.
 	pub async fn table_write(
 		&self,
+		request: TableWriteRequest,
+	) -> std::io::Result<TableWriteResult> {
+		self.table_write_with(request, None).await
+	}
+
+	/// Wendelon ADR 0120 D6: one CTAS chunk, as `TABLE_CTAS_CHUNK_WRITE_REQ` with
+	/// its operation's credential, routed and retried as a table write.
+	pub async fn ctas_chunk_write(
+		&self,
+		request: TableWriteRequest,
+		credential: CtasChunkCredential,
+	) -> std::io::Result<TableWriteResult> {
+		self.table_write_with(request, Some(credential)).await
+	}
+
+	async fn table_write_with(
+		&self,
 		mut request: TableWriteRequest,
+		credential: Option<CtasChunkCredential>,
 	) -> std::io::Result<TableWriteResult> {
 		// Client-side preview admission: used to pick a routing
 		// target via the first row's locality. Pass `client_hlc` as
@@ -914,11 +951,16 @@ impl WendelonClient {
 			};
 			// From here this attempt may have been submitted: a local deadline
 			// says nothing about its outcome.
-			let mut result =
-				match bounded(deadline, None, self.table_write_send(stream, &request)).await {
-					Ok(result) => result?,
-					Err(_) => return Ok(stopped(route.deadline_stop(write_id, true))),
-				};
+			let mut result = match bounded(
+				deadline,
+				None,
+				self.table_write_send(stream, &request, credential.as_ref()),
+			)
+			.await
+			{
+				Ok(result) => result?,
+				Err(_) => return Ok(stopped(route.deadline_stop(write_id, true))),
+			};
 			self.observe_write_response(&result.response.write);
 			if result.response.reject_code != PbcRejectCode::NONE.0 {
 				return Ok(result);
@@ -2239,27 +2281,30 @@ impl WendelonClient {
 		&self,
 		mut stream: Box<dyn TransportStream>,
 		request: &TableWriteRequest,
+		credential: Option<&CtasChunkCredential>,
 	) -> std::io::Result<TableWriteResult> {
 		let arrow =
 			encode_table_write_arrow_section(&request.payload).map_err(std::io::Error::from)?;
+		let mut meta = bytemuck::bytes_of(&request.meta).to_vec();
+		let msg_type = match credential {
+			None => MsgType::TABLE_WRITE_REQ,
+			Some(credential) => {
+				meta.extend_from_slice(&credential.op);
+				meta.extend_from_slice(&credential.secret);
+				MsgType::TABLE_CTAS_CHUNK_WRITE_REQ
+			}
+		};
 		let header = FrameHeader {
 			magic: HRFT_MAGIC,
 			version: 1,
-			msg_type: MsgType::TABLE_WRITE_REQ.0,
+			msg_type: msg_type.0,
 			flags: 0,
 			stream_id: 0,
-			meta_len: std::mem::size_of::<TableWriteRequestMeta>() as u32,
+			meta_len: meta.len() as u32,
 			arrow_len: arrow.len() as u32,
 			trailing_len: 0,
 		};
-		write_frame(
-			&mut *stream,
-			&header,
-			bytemuck::bytes_of(&request.meta),
-			Some(&arrow),
-			None,
-		)
-		.await?;
+		write_frame(&mut *stream, &header, &meta, Some(&arrow), None).await?;
 		stream
 			.finish()
 			.await

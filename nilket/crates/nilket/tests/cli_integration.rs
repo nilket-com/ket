@@ -1153,6 +1153,245 @@ fn local_profile_parent_decisions_append_only_table_keeps_identical_rows() {
 	std::fs::remove_dir_all(harness).expect("remove the fixture");
 }
 
+/// Wendelon ADR 0120 S3, the public controls on a fresh ParentDecisions local
+/// profile, over a named AppendOnly source holding duplicates. A plain CTAS, an
+/// empty one and IF NOT EXISTS on a fresh name publish exactly the source's
+/// multiset; IF NOT EXISTS over a bound same-schema name succeeds with no
+/// effect; a plain CTAS over a bound name and OR REPLACE are refused, the bound
+/// table unchanged. Every target reads the same after a restart. (Several chunks:
+/// `local_profile_parent_decisions_create_table_as_select_spans_several_chunks`.)
+#[test]
+#[ignore = "requires Linux io_uring and the fixed local-profile ports"]
+fn local_profile_parent_decisions_create_table_as_select_publishes_exact_rows() {
+	let _serial = LIVE_LOCAL_LOCK.lock().expect("live-profile test lock");
+	let harness = fresh_dir("local-profile-pd-ctas");
+	let profile = harness.join("profile");
+	let log = harness.join("local.stderr.log");
+	let init = nilket(&[
+		"local",
+		"init",
+		"--data-dir",
+		profile.to_str().expect("utf8 profile path"),
+		"--decision-authority",
+		"parent-decisions",
+	]);
+	assert!(init.status.success(), "{init:?}");
+	let step = |sql, statement: &str| {
+		let ran = run_live_sql(sql, statement);
+		eprintln!(
+			"ADR0120-S3: {statement:?} -> exit={:?} stdout={:?} stderr={:?}",
+			ran.status.code(),
+			stdout(&ran),
+			String::from_utf8_lossy(&ran.stderr)
+		);
+		ran
+	};
+	let ok = |what: &str, ran: &std::process::Output| {
+		assert!(ran.status.success(), "{what}: {ran:?}");
+	};
+	let refused = |what: &str, ran: &std::process::Output| {
+		assert!(!ran.status.success(), "{what} must be refused: {ran:?}");
+	};
+	let source = RenderedRows::of(
+		&["id", "label"],
+		&[("1", "same"), ("1", "same"), ("2", "other")],
+	);
+	let first = LiveLocal::spawn(&profile, &log);
+	let sql = first.ready.sql_endpoint;
+	ok(
+		"the source",
+		&step(sql, "CREATE TABLE src (id BIGINT NOT NULL, label TEXT)"),
+	);
+	ok(
+		"its rows",
+		&step(
+			sql,
+			"INSERT INTO src (id, label) VALUES (1, 'same'), (1, 'same'), (2, 'other')",
+		),
+	);
+	ok(
+		"the bound target",
+		&step(sql, "CREATE TABLE taken (id BIGINT NOT NULL, label TEXT)"),
+	);
+	ok(
+		"plain",
+		&step(sql, "CREATE TABLE t_plain AS SELECT id, label FROM src"),
+	);
+	ok(
+		"empty",
+		&step(
+			sql,
+			"CREATE TABLE t_empty AS SELECT id, label FROM src WHERE id < 0",
+		),
+	);
+	ok(
+		"IF NOT EXISTS, fresh",
+		&step(
+			sql,
+			"CREATE TABLE IF NOT EXISTS t_ine AS SELECT id, label FROM src",
+		),
+	);
+	ok(
+		"IF NOT EXISTS, bound",
+		&step(
+			sql,
+			"CREATE TABLE IF NOT EXISTS taken AS SELECT id, label FROM src",
+		),
+	);
+	refused(
+		"a plain CTAS over a bound name",
+		&step(sql, "CREATE TABLE taken AS SELECT id, label FROM src"),
+	);
+	refused(
+		"OR REPLACE",
+		&step(
+			sql,
+			"CREATE OR REPLACE TABLE taken AS SELECT id, label FROM src",
+		),
+	);
+	let reads = |sql| {
+		let read = |statement: &str| {
+			let ran = step(sql, statement);
+			assert!(ran.status.success(), "{statement}: {ran:?}");
+			rendered_rows(&stdout(&ran))
+		};
+		assert_eq!(
+			read("SELECT id, label FROM t_plain ORDER BY id"),
+			source,
+			"t_plain"
+		);
+		assert_eq!(
+			read("SELECT id, label FROM t_ine ORDER BY id"),
+			source,
+			"t_ine"
+		);
+		// An empty result renders as a bare OK; a missing table is an error.
+		for (statement, what) in [
+			("SELECT id, label FROM t_empty", "t_empty"),
+			("SELECT id, label FROM taken", "taken, unchanged"),
+		] {
+			let ran = step(sql, statement);
+			assert!(
+				ran.status.success() && stdout(&ran) == "OK\n",
+				"{what}: {ran:?}"
+			);
+		}
+	};
+	reads(sql);
+	first.stop_gracefully();
+	let second = LiveLocal::spawn(&profile, &log);
+	reads(second.ready.sql_endpoint);
+	second.stop_gracefully();
+	std::fs::remove_dir_all(harness).expect("remove the fixture");
+}
+
+/// Wendelon ADR 0120 S3 r2 (Codex 01a1fb6a §4): a public CTAS whose result spans
+/// several chunks. 90 rows of about 100 KB of pseudo-random text each (each
+/// INSERT within one command-line argument) exceed one table-write section
+/// (5 MiB) even compressed, so the production planner splits the result by
+/// encoded bytes. The declared chunk count is read from the profile's log;
+/// the copy reads exactly its source, before and after a restart.
+#[test]
+#[ignore = "requires Linux io_uring and the fixed local-profile ports"]
+fn local_profile_parent_decisions_create_table_as_select_spans_several_chunks() {
+	const ROWS: u64 = 90;
+	const WIDTH: usize = 100_000;
+	let _serial = LIVE_LOCAL_LOCK.lock().expect("live-profile test lock");
+	let harness = fresh_dir("local-profile-pd-ctas-chunks");
+	let profile = harness.join("profile");
+	let log = harness.join("local.stderr.log");
+	let init = nilket(&[
+		"local",
+		"init",
+		"--data-dir",
+		profile.to_str().expect("utf8 profile path"),
+		"--decision-authority",
+		"parent-decisions",
+	]);
+	assert!(init.status.success(), "{init:?}");
+	let first = LiveLocal::spawn(&profile, &log);
+	let sql = first.ready.sql_endpoint;
+	let run = |sql, statement: &str| {
+		let ran = run_live_sql(sql, statement);
+		assert!(
+			ran.status.success(),
+			"{}: {ran:?}",
+			&statement[..statement.len().min(120)]
+		);
+		ran
+	};
+	run(sql, "CREATE TABLE wide (id BIGINT NOT NULL, payload TEXT)");
+	const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+	for id in 0..ROWS {
+		let mut state = id.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+		let payload: String = (0..WIDTH)
+			.map(|_| {
+				state ^= state << 13;
+				state ^= state >> 7;
+				state ^= state << 17;
+				char::from(ALPHABET[(state % ALPHABET.len() as u64) as usize])
+			})
+			.collect();
+		let ran = run(
+			sql,
+			&format!("INSERT INTO wide (id, payload) VALUES ({id}, '{payload}')"),
+		);
+		assert_eq!(stdout(&ran), "OK rows=1\n");
+	}
+	let copied = run(
+		sql,
+		"CREATE TABLE wide_copy AS SELECT id, payload FROM wide",
+	);
+	eprintln!("ADR0120-S3r2 wide CTAS: stdout={:?}", stdout(&copied));
+	let declared: Vec<u64> = std::fs::read_to_string(&log)
+		.expect("the profile's log")
+		.lines()
+		.filter(|line| line.contains("ParentDecisions CTAS declared"))
+		.filter_map(|line| {
+			// The log is colored: drop ANSI escape sequences first.
+			let mut plain = String::new();
+			let mut chars = line.chars();
+			while let Some(c) = chars.next() {
+				if c == '\u{1b}' {
+					for c in chars.by_ref() {
+						if c.is_ascii_alphabetic() {
+							break;
+						}
+					}
+				} else {
+					plain.push(c);
+				}
+			}
+			let at = plain.find("chunks=")?;
+			plain[at..]
+				.chars()
+				.skip_while(|c| !c.is_ascii_digit())
+				.take_while(char::is_ascii_digit)
+				.collect::<String>()
+				.parse()
+				.ok()
+		})
+		.collect();
+	eprintln!("ADR0120-S3r2 declared chunk counts: {declared:?}");
+	assert!(
+		declared.iter().any(|chunks| *chunks >= 2),
+		"the wide CTAS declared several chunks: {declared:?}"
+	);
+	let compare = |sql| {
+		let source = stdout(&run(sql, "SELECT id, payload FROM wide ORDER BY id"));
+		let copy = stdout(&run(sql, "SELECT id, payload FROM wide_copy ORDER BY id"));
+		assert!(copy == source, "the copy reads exactly its source");
+		let counted = rendered_rows(&stdout(&run(sql, "SELECT count(*) AS n FROM wide_copy")));
+		assert_eq!(counted.rows, vec![vec![ROWS.to_string()]], "every row");
+	};
+	compare(sql);
+	first.stop_gracefully();
+	let second = LiveLocal::spawn(&profile, &log);
+	compare(second.ready.sql_endpoint);
+	second.stop_gracefully();
+	std::fs::remove_dir_all(harness).expect("remove the fixture");
+}
+
 /// The normal public entry point creates a fresh single-node ParentDecisions
 /// profile on request: init, start, a committed primary-key write, an exact
 /// ordered read, a stop, a re-run of init that regenerates nothing and reissues

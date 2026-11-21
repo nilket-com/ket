@@ -1045,6 +1045,7 @@ fn catalog_error_class(error: &CatalogError) -> &'static str {
 		CatalogError::AdminFailed { .. } => "admin_failed",
 		CatalogError::ResourceExhausted { .. } => "resource_exhausted",
 		CatalogError::FingerprintResolution { .. } => "fingerprint_resolution",
+		CatalogError::CtasUnderParentDecisions => "ctas_under_parent_decisions",
 		CatalogError::Storage(error) => storage_error_class(error),
 	}
 }

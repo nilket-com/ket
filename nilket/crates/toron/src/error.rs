@@ -271,6 +271,11 @@ pub enum CatalogError {
 	ResourceExhausted { message: String },
 	#[error("fingerprint resolution failed: {message}")]
 	FingerprintResolution { message: String },
+	/// Wendelon ADR 0120: the storage authority runs ParentDecisions and refused
+	/// the Today CTAS saga, typed and before any proposal: the statement takes the
+	/// decision chain. The only answer that selects that path.
+	#[error("the storage authority runs ParentDecisions; CTAS uses its decision chain")]
+	CtasUnderParentDecisions,
 	#[error(transparent)]
 	Storage(#[from] StorageError),
 }

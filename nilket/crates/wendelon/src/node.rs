@@ -2861,6 +2861,8 @@ impl WendelonNode {
 						let _ = maintenance
 							.resolve_closed_once(DECISION_RESOLVE_BATCH)
 							.await;
+						// Wendelon ADR 0120 D9: CTAS recovery, conclusion and prune.
+						let _ = maintenance.ctas_step(DECISION_RESOLVE_BATCH).await;
 						let _ = data_server.sweep_refused_intents().await;
 						// ADR 0699 S5a: certified generations; reads wait for the
 						// base to validate after each start.

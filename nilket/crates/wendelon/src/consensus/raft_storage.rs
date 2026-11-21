@@ -3337,6 +3337,44 @@ impl SmState {
 		}
 	}
 
+	/// Wendelon ADR 0120 D9: [`Self::drop_excluded_at`], or a CTAS object retired
+	/// (abandoned or conflicted) at or before `t`: its rows leave the generation.
+	pub(crate) fn pd_excluded_at(
+		&self,
+		tenant_id: crate::schema::TenantId,
+		table_object_id: crate::schema::TableObjectId,
+		t: u64,
+	) -> bool {
+		self.drop_excluded_at(tenant_id, table_object_id, t)
+			|| self
+				.decisions
+				.as_ref()
+				.is_some_and(|decisions| decisions.ctas().excludes(tenant_id, table_object_id, t))
+	}
+
+	/// Wendelon ADR 0120 D9: the survivor policy a target with cut `t` must carry:
+	/// excluding iff a drop was finalized, or a CTAS object retired, at or before
+	/// `t`. `ctas` is given explicitly: the reducer detaches the decision state.
+	pub(crate) fn survivor_policy_with(
+		&self,
+		ctas: &crate::consensus::decisions::ctas::CtasState,
+		t: u64,
+	) -> u8 {
+		if ctas.retired_at_or_before(t) {
+			crate::consensus::decisions::generations::SURVIVOR_POLICY_EXCLUDING
+		} else {
+			self.survivor_policy_at(t)
+		}
+	}
+
+	/// [`Self::survivor_policy_with`] on an attached decision state.
+	pub(crate) fn pd_survivor_policy_at(&self, t: u64) -> u8 {
+		match self.decisions.as_ref() {
+			Some(decisions) => self.survivor_policy_with(decisions.ctas(), t),
+			None => self.survivor_policy_at(t),
+		}
+	}
+
 	/// Wendelon ADR 0115: whether a drop was finalized in `(after, through]`: the
 	/// idle trigger's existence query.
 	pub(crate) fn finalized_drop_in(&self, after: u64, through: u64) -> bool {
@@ -3377,6 +3415,8 @@ fn record_table_drop_outcome(state: &mut SmState, outcome: crate::schema::TableD
 /// Wendelon ADR 0118 D3: a ParentDecisions Create of a dropped table's id.
 pub(crate) const PD_DROPPED_TABLE_ID_REUSE_REFUSED: &str =
 	"table schema create cannot reuse a dropped table_object_id under ParentDecisions";
+/// Wendelon ADR 0120 D3: a CTAS chain's provisional or retired object id.
+pub(crate) const PD_CTAS_TABLE_ID_REUSE_REFUSED: &str = "table schema create cannot reuse a CTAS-owned or abandoned table_object_id under ParentDecisions";
 pub(crate) const PD_DROP_SETTLEMENT_REFUSED: &str =
 	"table drop settlement is refused under ParentDecisions until a settlement authority exists";
 /// Wendelon ADR 0116: the legacy reclaim completion and finalize's refusal under
@@ -3402,7 +3442,7 @@ pub(crate) fn validate_assembled_state(state: &SmState) -> Result<(), String> {
 		.as_ref()
 		.and_then(|decisions| decisions.generations().pending.as_ref())
 	{
-		let expected = state.survivor_policy_at(pending.target.t);
+		let expected = state.pd_survivor_policy_at(pending.target.t);
 		if pending.target.survivor_policy != expected {
 			return Err(format!(
 				"a pending generation carries survivor policy {} where its cut requires {expected}",
@@ -7440,8 +7480,14 @@ fn apply_request_at_log_index(
 		WendelonRequest::CtasSaga(_) | WendelonRequest::ReplayLegacyCtasRowDispatched(_)
 			if state.decisions.is_some() =>
 		{
+			// Wendelon ADR 0120: typed, so the caller falls back to the decision
+			// chain; the receiving authority refuses the same before proposal.
 			(
-				WendelonResponse::Error("CTAS is refused under ParentDecisions".into()),
+				WendelonResponse::Error(format!(
+					"{}{}",
+					crate::schema::CTAS_SAGA_REJECT_PREFIX,
+					CtasSagaReject::WrongDecisionMode.code()
+				)),
 				None,
 			)
 		}
@@ -7964,6 +8010,16 @@ fn apply_table_schema_update(
 					.is_some()
 			{
 				return Err(PD_DROPPED_TABLE_ID_REUSE_REFUSED.to_owned());
+			}
+			// Wendelon ADR 0120 D3: nor is an id a CTAS chain owns provisionally or
+			// retired unpublished.
+			if envelope.mutation == SchemaMutationKind::Create
+				&& state.decisions.as_ref().is_some_and(|decisions| {
+					decisions
+						.ctas()
+						.claims_object(envelope.tenant_id, descriptor.table_object_id)
+				}) {
+				return Err(PD_CTAS_TABLE_ID_REUSE_REFUSED.to_owned());
 			}
 			if envelope.mutation == SchemaMutationKind::Alter && current_generation == 0 {
 				return Err("table schema alter requires an existing table".to_owned());

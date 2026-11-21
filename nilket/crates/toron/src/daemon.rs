@@ -980,10 +980,46 @@ async fn handle_sql_connection(
 			stream.finish().await?;
 		}
 		SqlMessage::ResolveMutation(request) => {
-			if let Some(entry) = coordinator
-				.resolve_ctas_outcome(tenant_id, request.operation_query_id)
-				.await
-				.map_err(|error| std::io::Error::other(error.to_string()))?
+			// Every lookup fails or times out into a correlated SQL error: nothing that
+			// failed is read as absence, and no failure drops the stream.
+			let entry = match resolve_operation_outcome(
+				coordinator.as_ref(),
+				tenant_id,
+				request.operation_query_id,
+				RESOLVE_OUTCOME_BOUND,
+			)
+			.await
+			{
+				Err(error) => {
+					return write_sql_error(&mut stream, frame.query_id, error.code, error.message)
+						.await;
+				}
+				Ok(OperationAnswer::PdChain(chain)) => {
+					let response = SqlFrame::response(
+						frame.query_id,
+						SqlMessage::PdCtasOutcome(pd_ctas_outcome(
+							request.operation_query_id,
+							&chain,
+						)),
+					);
+					write_sql_frame(&mut stream, &response).await?;
+					stream.finish().await?;
+					return Ok(());
+				}
+				Ok(OperationAnswer::Mutation(outcome)) => {
+					let response = SqlFrame::response(
+						frame.query_id,
+						SqlMessage::MutationOutcome(public_mutation_outcome(
+							request.operation_query_id,
+							&outcome,
+						)),
+					);
+					write_sql_frame(&mut stream, &response).await?;
+					stream.finish().await?;
+					return Ok(());
+				}
+				Ok(OperationAnswer::Saga(entry)) => entry,
+			};
 			{
 				let (phase, row_count) = match entry.phase {
 					wendelon_client::CtasSagaPhase::Provisioned => {
@@ -1116,40 +1152,7 @@ async fn handle_sql_connection(
 				);
 				write_sql_frame(&mut stream, &response).await?;
 				stream.finish().await?;
-				return Ok(());
 			}
-			let outcome = match coordinator
-				.resolve_mutation_outcome(tenant_id, request.operation_query_id)
-				.await
-			{
-				Ok(outcome) => outcome,
-				Err(error) => {
-					return write_sql_error(
-						&mut stream,
-						frame.query_id,
-						SqlErrorCode::StorageError,
-						error.to_string(),
-					)
-					.await;
-				}
-			};
-			let response = SqlFrame::response(
-				frame.query_id,
-				SqlMessage::MutationOutcome(MutationOutcomeResponse {
-					operation_query_id: request.operation_query_id,
-					resolution: match outcome.resolution {
-						crate::storage::MutationResolution::Present => MutationResolution::Present,
-						crate::storage::MutationResolution::Expired => MutationResolution::Expired,
-						crate::storage::MutationResolution::Unknown => MutationResolution::Unknown,
-					},
-					write_status: outcome.write_status,
-					stop_reason: public_mutation_stop_reason(outcome.stop_reason),
-					commit_knowledge: public_mutation_commit_knowledge(outcome.commit_knowledge),
-					delete_counts: outcome.delete_counts,
-				}),
-			);
-			write_sql_frame(&mut stream, &response).await?;
-			stream.finish().await?;
 		}
 		SqlMessage::Execute(request) => {
 			let query_started = std::time::Instant::now();
@@ -1919,7 +1922,8 @@ async fn handle_sql_connection(
 		| SqlMessage::Healthy(_)
 		| SqlMessage::MutationOutcome(_)
 		| SqlMessage::CtasOutcome(_)
-		| SqlMessage::MaterializeOutcome(_) => {
+		| SqlMessage::MaterializeOutcome(_)
+		| SqlMessage::PdCtasOutcome(_) => {
 			if !record_sql_audit_required_or_error(
 				&audit,
 				ToronAuditEvent::edge_denial(
@@ -1952,6 +1956,214 @@ async fn handle_sql_connection(
 enum RuneExecutionOutput {
 	Batches(Vec<RecordBatch>),
 	Materialized(crate::coordinator::MaterializationReceipt),
+}
+
+/// The bound on one public operation-outcome resolution: every lookup it makes
+/// (the CTAS saga, a ParentDecisions chain, the mutation outcome) together.
+const RESOLVE_OUTCOME_BOUND: Duration = Duration::from_secs(30);
+
+/// The reads one public operation-outcome resolution may make. Each is a read:
+/// none proposes, recovers or concludes anything.
+#[async_trait::async_trait]
+trait OutcomeReads: Send + Sync {
+	async fn ctas_saga(
+		&self,
+		tenant_id: TenantId,
+		operation_query_id: toron_client::QueryId,
+	) -> Result<Option<wendelon_client::CtasSagaEntry>, QueryError>;
+	async fn pd_ctas_chain(
+		&self,
+		tenant_id: TenantId,
+		operation_query_id: toron_client::QueryId,
+	) -> Result<Option<wendelon_client::CtasChain>, QueryError>;
+	async fn mutation(
+		&self,
+		tenant_id: TenantId,
+		operation_query_id: toron_client::QueryId,
+	) -> Result<crate::storage::ResolvedMutationOutcome, QueryError>;
+}
+
+#[async_trait::async_trait]
+impl OutcomeReads for DistributedQueryCoordinator<StaticWorkerRegistry, QuicTransport> {
+	async fn ctas_saga(
+		&self,
+		tenant_id: TenantId,
+		operation_query_id: toron_client::QueryId,
+	) -> Result<Option<wendelon_client::CtasSagaEntry>, QueryError> {
+		self.resolve_ctas_outcome(tenant_id, operation_query_id)
+			.await
+	}
+
+	async fn pd_ctas_chain(
+		&self,
+		tenant_id: TenantId,
+		operation_query_id: toron_client::QueryId,
+	) -> Result<Option<wendelon_client::CtasChain>, QueryError> {
+		self.resolve_pd_ctas_outcome(tenant_id, operation_query_id)
+			.await
+	}
+
+	async fn mutation(
+		&self,
+		tenant_id: TenantId,
+		operation_query_id: toron_client::QueryId,
+	) -> Result<crate::storage::ResolvedMutationOutcome, QueryError> {
+		self.resolve_mutation_outcome(tenant_id, operation_query_id)
+			.await
+	}
+}
+
+/// What a public operation id resolved to.
+#[derive(Debug)]
+enum OperationAnswer {
+	/// A Today CTAS saga entry.
+	Saga(wendelon_client::CtasSagaEntry),
+	/// Wendelon ADR 0120: a ParentDecisions CTAS chain.
+	PdChain(wendelon_client::CtasChain),
+	/// An ordinary operation (absent from both CTAS records).
+	Mutation(crate::storage::ResolvedMutationOutcome),
+}
+
+/// A lookup that did not answer: its SQL error.
+#[derive(Debug, PartialEq, Eq)]
+struct OutcomeLookupFailed {
+	code: SqlErrorCode,
+	message: String,
+}
+
+/// One public operation-outcome resolution, all within `bound`:
+/// 1. the Today CTAS saga;
+/// 2. only on a ParentDecisions authority's typed answer
+///    (`CatalogError::CtasUnderParentDecisions`), the operation's decision chain in
+///    the same tenant;
+/// 3. on authoritative absence from the record consulted, the ordinary mutation
+///    outcome under the original identity.
+///
+/// A failed or timed-out lookup is a [`OutcomeLookupFailed`], never absence.
+async fn resolve_operation_outcome(
+	reads: &dyn OutcomeReads,
+	tenant_id: TenantId,
+	operation_query_id: toron_client::QueryId,
+	bound: Duration,
+) -> Result<OperationAnswer, OutcomeLookupFailed> {
+	let deadline = tokio::time::Instant::now() + bound;
+	let out_of_time = |what: &str| OutcomeLookupFailed {
+		code: SqlErrorCode::StatementTimeout,
+		message: format!(
+			"resolving the operation's {what} exceeded its {} ms bound",
+			bound.as_millis()
+		),
+	};
+	let failed = |code: SqlErrorCode, error: QueryError| OutcomeLookupFailed {
+		code,
+		message: error.to_string(),
+	};
+	match tokio::time::timeout_at(deadline, reads.ctas_saga(tenant_id, operation_query_id)).await {
+		Err(_) => return Err(out_of_time("CTAS saga")),
+		Ok(Ok(Some(entry))) => return Ok(OperationAnswer::Saga(entry)),
+		Ok(Ok(None)) => {}
+		Ok(Err(QueryError::Catalog(CatalogError::CtasUnderParentDecisions))) => {
+			match tokio::time::timeout_at(
+				deadline,
+				reads.pd_ctas_chain(tenant_id, operation_query_id),
+			)
+			.await
+			{
+				Err(_) => return Err(out_of_time("ParentDecisions CTAS chain")),
+				Ok(Ok(Some(chain))) => return Ok(OperationAnswer::PdChain(chain)),
+				Ok(Ok(None)) => {}
+				Ok(Err(error)) => return Err(failed(SqlErrorCode::CatalogError, error)),
+			}
+		}
+		Ok(Err(error)) => return Err(failed(SqlErrorCode::CatalogError, error)),
+	}
+	match tokio::time::timeout_at(deadline, reads.mutation(tenant_id, operation_query_id)).await {
+		Err(_) => Err(out_of_time("mutation outcome")),
+		Ok(Ok(outcome)) => Ok(OperationAnswer::Mutation(outcome)),
+		Ok(Err(error)) => Err(failed(SqlErrorCode::StorageError, error)),
+	}
+}
+
+/// An ordinary operation's public outcome.
+fn public_mutation_outcome(
+	operation_query_id: toron_client::QueryId,
+	outcome: &crate::storage::ResolvedMutationOutcome,
+) -> MutationOutcomeResponse {
+	MutationOutcomeResponse {
+		operation_query_id,
+		resolution: match outcome.resolution {
+			crate::storage::MutationResolution::Present => MutationResolution::Present,
+			crate::storage::MutationResolution::Expired => MutationResolution::Expired,
+			crate::storage::MutationResolution::Unknown => MutationResolution::Unknown,
+		},
+		write_status: outcome.write_status,
+		stop_reason: public_mutation_stop_reason(outcome.stop_reason),
+		commit_knowledge: public_mutation_commit_knowledge(outcome.commit_knowledge),
+		delete_counts: outcome.delete_counts,
+	}
+}
+
+/// Wendelon ADR 0120: a ParentDecisions CTAS operation's public outcome, from its
+/// chain. Publication answers its own question; the counts come from the decisions'
+/// per-chunk evidence alone. Only accepted chunks add rows, and a chunk never
+/// reserved adds to the declaration only, abandoned or not.
+fn pd_ctas_outcome(
+	operation_query_id: toron_client::QueryId,
+	chain: &wendelon_client::CtasChain,
+) -> crate::sql_wire::PdCtasOutcomeResponse {
+	use crate::sql_wire::{CtasPublicationCause, PdCtasAbandonCause, PdCtasState};
+	use wendelon_client::{CtasAbandonCause, CtasPhase};
+	let (mut accepted_chunks, mut accepted_rows, mut refused_chunks) = (0u32, 0u64, 0u32);
+	for (at, chunk) in chain.chunks.iter().enumerate() {
+		let bit = 1u128 << at;
+		if chain.accepted & bit != 0 {
+			accepted_chunks += 1;
+			accepted_rows += u64::from(chunk.rows);
+		}
+		if chain.refused & bit != 0 {
+			refused_chunks += 1;
+		}
+	}
+	let (state, publication_commit_knowledge, publication_cause) = match chain.phase {
+		CtasPhase::Dispatching | CtasPhase::Recovering => (
+			PdCtasState::Pending,
+			MutationCommitKnowledge::Unspecified,
+			None,
+		),
+		CtasPhase::Published { .. } => (
+			PdCtasState::Published,
+			MutationCommitKnowledge::Committed,
+			None,
+		),
+		CtasPhase::Conflict { .. } => (
+			PdCtasState::Conflict,
+			MutationCommitKnowledge::KnownNotCommitted,
+			Some(CtasPublicationCause::BindingConflict),
+		),
+		CtasPhase::Abandoned { cause, .. } => (
+			PdCtasState::Abandoned(match cause {
+				CtasAbandonCause::ChunkInadmissible => PdCtasAbandonCause::ChunkInadmissible,
+				CtasAbandonCause::Deadline => PdCtasAbandonCause::Deadline,
+				CtasAbandonCause::ChunkRefused => PdCtasAbandonCause::ChunkRefused,
+				CtasAbandonCause::SourceBytesLost => PdCtasAbandonCause::SourceBytesLost,
+			}),
+			MutationCommitKnowledge::KnownNotCommitted,
+			None,
+		),
+	};
+	crate::sql_wire::PdCtasOutcomeResponse {
+		operation_query_id,
+		table_object_id: *chain.object.as_bytes(),
+		epoch: chain.epoch,
+		state,
+		declared_chunks: u32::try_from(chain.chunks.len()).expect("at most 128 chunks"),
+		declared_rows: chain.chunks.iter().map(|chunk| u64::from(chunk.rows)).sum(),
+		accepted_chunks,
+		accepted_rows,
+		refused_chunks,
+		publication_commit_knowledge,
+		publication_cause,
+	}
 }
 
 fn public_mutation_stop_reason(value: u8) -> MutationStopReason {
@@ -3078,5 +3290,355 @@ mod tests {
 		assert_eq!(kind(&result), Some(std::io::ErrorKind::AddrInUse));
 		assert_eq!(seen.len(), 1, "one attempt for an explicit port");
 		assert_eq!(seen[0].port(), port, "never an alternate port");
+	}
+}
+
+/// Wendelon ADR 0120 (Codex 01a1fc44, 01a1fc48): the public operation-outcome
+/// resolution's lookup sequence and the ParentDecisions outcome's mapping.
+#[cfg(test)]
+mod resolve_outcome_tests {
+	use super::*;
+	use crate::sql_wire::{CtasPublicationCause, PdCtasAbandonCause, PdCtasState};
+	use std::sync::Mutex;
+	use wendelon_client::{ChunkDecl, CtasAbandonCause, CtasChain, CtasPhase};
+
+	type Answer<T> = Option<Result<T, QueryError>>;
+
+	/// Scripted reads: `None` stalls for good; every call is recorded.
+	struct Scripted {
+		saga: Box<dyn Fn() -> Answer<Option<wendelon_client::CtasSagaEntry>> + Send + Sync>,
+		pd: Box<dyn Fn() -> Answer<Option<CtasChain>> + Send + Sync>,
+		mutation: Box<dyn Fn() -> Answer<crate::storage::ResolvedMutationOutcome> + Send + Sync>,
+		calls: Mutex<Vec<(&'static str, TenantId, toron_client::QueryId)>>,
+	}
+
+	async fn answer<T>(answer: Answer<T>) -> Result<T, QueryError> {
+		match answer {
+			Some(answer) => answer,
+			None => std::future::pending().await,
+		}
+	}
+
+	#[async_trait::async_trait]
+	impl OutcomeReads for Scripted {
+		async fn ctas_saga(
+			&self,
+			tenant_id: TenantId,
+			id: toron_client::QueryId,
+		) -> Result<Option<wendelon_client::CtasSagaEntry>, QueryError> {
+			self.calls.lock().unwrap().push(("saga", tenant_id, id));
+			answer((self.saga)()).await
+		}
+
+		async fn pd_ctas_chain(
+			&self,
+			tenant_id: TenantId,
+			id: toron_client::QueryId,
+		) -> Result<Option<CtasChain>, QueryError> {
+			self.calls.lock().unwrap().push(("pd", tenant_id, id));
+			answer((self.pd)()).await
+		}
+
+		async fn mutation(
+			&self,
+			tenant_id: TenantId,
+			id: toron_client::QueryId,
+		) -> Result<crate::storage::ResolvedMutationOutcome, QueryError> {
+			self.calls.lock().unwrap().push(("mutation", tenant_id, id));
+			answer((self.mutation)()).await
+		}
+	}
+
+	fn under_pd() -> Answer<Option<wendelon_client::CtasSagaEntry>> {
+		Some(Err(QueryError::Catalog(
+			CatalogError::CtasUnderParentDecisions,
+		)))
+	}
+
+	fn failure(what: &str) -> QueryError {
+		QueryError::Catalog(CatalogError::AdminFailed {
+			message: format!("{what} failed"),
+		})
+	}
+
+	fn expired() -> crate::storage::ResolvedMutationOutcome {
+		crate::storage::ResolvedMutationOutcome {
+			resolution: crate::storage::MutationResolution::Expired,
+			write_status: 0,
+			stop_reason: 0,
+			commit_knowledge: 0,
+			delete_counts: None,
+		}
+	}
+
+	/// Rows per declared chunk (unequal), with accepted and refused bit sets.
+	fn chain(rows: &[u32], accepted: u128, refused: u128, phase: CtasPhase) -> CtasChain {
+		CtasChain {
+			object: wendelon_client::TableObjectId::new([0xC7; 16]),
+			fingerprint: [1; 32],
+			chunks: rows
+				.iter()
+				.enumerate()
+				.map(|(at, rows)| ChunkDecl {
+					sequence_no: at as u64 + 1,
+					rows: *rows,
+					request_digest: [at as u8; 32],
+				})
+				.collect(),
+			row_count: rows.iter().map(|rows| u64::from(*rows)).sum(),
+			dispatch_hash: [2; 32],
+			epoch: 2,
+			lease_until_ms: 0,
+			terminal_at_ms: 0,
+			phase,
+			accepted,
+			refused,
+			retained_bytes: 0,
+		}
+	}
+
+	fn scripted(
+		saga: impl Fn() -> Answer<Option<wendelon_client::CtasSagaEntry>> + Send + Sync + 'static,
+		pd: impl Fn() -> Answer<Option<CtasChain>> + Send + Sync + 'static,
+		mutation: impl Fn() -> Answer<crate::storage::ResolvedMutationOutcome> + Send + Sync + 'static,
+	) -> Scripted {
+		Scripted {
+			saga: Box::new(saga),
+			pd: Box::new(pd),
+			mutation: Box::new(mutation),
+			calls: Mutex::new(Vec::new()),
+		}
+	}
+
+	fn calls(reads: &Scripted) -> Vec<&'static str> {
+		reads
+			.calls
+			.lock()
+			.unwrap()
+			.iter()
+			.map(|(what, _, _)| *what)
+			.collect()
+	}
+
+	const TENANT: TenantId = TenantId(7);
+
+	/// Only a ParentDecisions authority's typed answer reads the chain, in the same
+	/// tenant under the same id; its absence, like the saga's, resolves the ordinary
+	/// mutation outcome under the original identity. Nothing else is called.
+	#[tokio::test]
+	async fn only_the_parent_decisions_answer_reads_the_chain_and_absence_is_ordinary() {
+		let id = toron_client::QueryId::new();
+		let present = chain(&[3], 1, 0, CtasPhase::Published { at: 9 });
+		let reads = scripted(under_pd, move || Some(Ok(Some(present.clone()))), || None);
+		let answer = resolve_operation_outcome(&reads, TENANT, id, Duration::from_secs(5))
+			.await
+			.unwrap();
+		assert!(matches!(answer, OperationAnswer::PdChain(_)), "{answer:?}");
+		assert_eq!(calls(&reads), ["saga", "pd"]);
+
+		let reads = scripted(under_pd, || Some(Ok(None)), || Some(Ok(expired())));
+		let answer = resolve_operation_outcome(&reads, TENANT, id, Duration::from_secs(5))
+			.await
+			.unwrap();
+		assert!(
+			matches!(answer, OperationAnswer::Mutation(outcome) if outcome == expired()),
+			"{answer:?}"
+		);
+		assert_eq!(calls(&reads), ["saga", "pd", "mutation"]);
+		assert!(
+			reads
+				.calls
+				.lock()
+				.unwrap()
+				.iter()
+				.all(|(_, tenant, called)| *tenant == TENANT && *called == id),
+			"one tenant, the original identity"
+		);
+
+		// A Today authority's absence never reads a chain.
+		let reads = scripted(|| Some(Ok(None)), || None, || Some(Ok(expired())));
+		let answer = resolve_operation_outcome(&reads, TENANT, id, Duration::from_secs(5))
+			.await
+			.unwrap();
+		assert!(matches!(answer, OperationAnswer::Mutation(_)), "{answer:?}");
+		assert_eq!(calls(&reads), ["saga", "mutation"]);
+	}
+
+	/// A lookup that fails or does not answer within the bound is a typed SQL
+	/// error, never absence: no later lookup runs.
+	#[tokio::test]
+	async fn a_failed_or_stalled_lookup_is_a_typed_error_never_absence() {
+		let id = toron_client::QueryId::new();
+		let bound = Duration::from_millis(200);
+		let cases: Vec<(Scripted, SqlErrorCode, Vec<&'static str>)> = vec![
+			(
+				scripted(|| Some(Err(failure("the saga read"))), || None, || None),
+				SqlErrorCode::CatalogError,
+				vec!["saga"],
+			),
+			(
+				scripted(|| None, || None, || None),
+				SqlErrorCode::StatementTimeout,
+				vec!["saga"],
+			),
+			(
+				scripted(under_pd, || Some(Err(failure("the chain read"))), || None),
+				SqlErrorCode::CatalogError,
+				vec!["saga", "pd"],
+			),
+			(
+				scripted(under_pd, || None, || Some(Ok(expired()))),
+				SqlErrorCode::StatementTimeout,
+				vec!["saga", "pd"],
+			),
+			(
+				scripted(
+					under_pd,
+					|| Some(Ok(None)),
+					|| Some(Err(failure("the outcome read"))),
+				),
+				SqlErrorCode::StorageError,
+				vec!["saga", "pd", "mutation"],
+			),
+			(
+				scripted(under_pd, || Some(Ok(None)), || None),
+				SqlErrorCode::StatementTimeout,
+				vec!["saga", "pd", "mutation"],
+			),
+		];
+		for (reads, code, expected_calls) in cases {
+			let started = tokio::time::Instant::now();
+			let error = resolve_operation_outcome(&reads, TENANT, id, bound)
+				.await
+				.expect_err("a typed failure");
+			assert_eq!(error.code, code, "{error:?}");
+			assert_eq!(calls(&reads), expected_calls);
+			assert!(
+				started.elapsed() < Duration::from_secs(5),
+				"within the bound"
+			);
+		}
+	}
+
+	/// The ParentDecisions outcome: publication answers its own question; rows come
+	/// from the per-chunk evidence only (unequal chunk sizes); a never-reserved chunk
+	/// adds to the declaration only.
+	#[test]
+	fn the_parent_decisions_outcome_reports_exactly_the_decisions_evidence() {
+		let id = toron_client::QueryId::new();
+		// Abandoned, mixed: chunk 0 (3 rows) accepted, chunk 1 (5 rows) refused, chunk
+		// 2 (2 rows) never reserved.
+		let mixed = pd_ctas_outcome(
+			id,
+			&chain(
+				&[3, 5, 2],
+				0b001,
+				0b010,
+				CtasPhase::Abandoned {
+					cause: CtasAbandonCause::ChunkRefused,
+					at: 9,
+				},
+			),
+		);
+		assert_eq!(mixed.operation_query_id, id);
+		assert_eq!(mixed.table_object_id, [0xC7; 16]);
+		assert_eq!(mixed.epoch, 2);
+		assert_eq!(
+			mixed.state,
+			PdCtasState::Abandoned(PdCtasAbandonCause::ChunkRefused)
+		);
+		assert_eq!(
+			(mixed.declared_chunks, mixed.declared_rows),
+			(3, 10),
+			"the declaration"
+		);
+		assert_eq!(
+			(
+				mixed.accepted_chunks,
+				mixed.accepted_rows,
+				mixed.refused_chunks
+			),
+			(1, 3, 1),
+			"exactly the evidence: neither all failed nor the declared total"
+		);
+		assert_eq!(
+			mixed.publication_commit_knowledge,
+			MutationCommitKnowledge::KnownNotCommitted
+		);
+		assert_eq!(mixed.publication_cause, None);
+
+		// Abandoned with none accepted (the owner's deadline before any chunk).
+		let none = pd_ctas_outcome(
+			id,
+			&chain(
+				&[4, 1],
+				0,
+				0,
+				CtasPhase::Abandoned {
+					cause: CtasAbandonCause::Deadline,
+					at: 9,
+				},
+			),
+		);
+		assert_eq!(
+			(none.accepted_chunks, none.accepted_rows, none.declared_rows),
+			(0, 0, 5)
+		);
+
+		// Published, unequal chunks: the exact total.
+		let published = pd_ctas_outcome(
+			id,
+			&chain(&[3, 5, 2], 0b111, 0, CtasPhase::Published { at: 9 }),
+		);
+		assert_eq!(published.state, PdCtasState::Published);
+		assert_eq!(
+			published.publication_commit_knowledge,
+			MutationCommitKnowledge::Committed
+		);
+		assert_eq!(
+			(published.accepted_chunks, published.accepted_rows),
+			(3, 10)
+		);
+
+		// Published from an empty declaration.
+		let empty = pd_ctas_outcome(id, &chain(&[], 0, 0, CtasPhase::Published { at: 9 }));
+		assert_eq!(
+			(
+				empty.declared_chunks,
+				empty.declared_rows,
+				empty.accepted_rows
+			),
+			(0, 0, 0)
+		);
+		assert_eq!(
+			empty.publication_commit_knowledge,
+			MutationCommitKnowledge::Committed
+		);
+
+		// Conflict: every chunk accepted, publication known not committed.
+		let conflict = pd_ctas_outcome(id, &chain(&[3, 5], 0b11, 0, CtasPhase::Conflict { at: 9 }));
+		assert_eq!(conflict.state, PdCtasState::Conflict);
+		assert_eq!(conflict.accepted_rows, 8);
+		assert_eq!(
+			(
+				conflict.publication_commit_knowledge,
+				conflict.publication_cause
+			),
+			(
+				MutationCommitKnowledge::KnownNotCommitted,
+				Some(CtasPublicationCause::BindingConflict)
+			)
+		);
+
+		// Pending, partway: the evidence so far, publication unspecified.
+		for phase in [CtasPhase::Dispatching, CtasPhase::Recovering] {
+			let pending = pd_ctas_outcome(id, &chain(&[3, 5], 0b01, 0, phase));
+			assert_eq!(pending.state, PdCtasState::Pending);
+			assert_eq!((pending.accepted_chunks, pending.accepted_rows), (1, 3));
+			assert_eq!(
+				pending.publication_commit_knowledge,
+				MutationCommitKnowledge::Unspecified
+			);
+		}
 	}
 }

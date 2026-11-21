@@ -315,6 +315,14 @@ pub struct CtasSagaResponseWire {
 	pub leader_hint: Option<u32>,
 }
 
+/// Wendelon ADR 0120 D6: the leader's answer to a CTAS command. A Today authority
+/// answers `Refused(ModeToday)`, typed, before any proposal; a follower answers
+/// `NotLeader` with its hint.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CtasDecisionResponseWire {
+	pub response: crate::network::decision_proposals::ProposalResponse,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SecondaryIndexStatusResponseWire {
 	pub accepted: bool,
@@ -1261,6 +1269,87 @@ impl WendelonControlServer {
 		})
 	}
 
+	fn build_ctas_decision_frame(
+		&self,
+		stream_id: u32,
+		response: &CtasDecisionResponseWire,
+	) -> std::io::Result<HrftFrame> {
+		let meta = wire::encode_into(&self.pool, response)?;
+		Ok(HrftFrame {
+			header: FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: MsgType::CTAS_DECISION_RESP.0,
+				flags: 0,
+				stream_id,
+				meta_len: meta.len() as u32,
+				arrow_len: 0,
+				trailing_len: 0,
+			},
+			meta,
+			arrow_payload: None,
+			trailing: None,
+		})
+	}
+
+	/// The CTAS routes' caller check: Toron's node-to-node catalog adapter, or an
+	/// administrative client with the tenant mutation role, bound to `tenant`.
+	fn authorize_ctas_caller(
+		&self,
+		context: &RequestContext,
+		tenant: TenantId,
+	) -> std::io::Result<()> {
+		if context.actor.role == ActorRole::DataNode {
+			authorize_actor(&context.actor, ActorPermission::InterNodeTransport)?;
+		} else {
+			authorize_actor(&context.actor, ActorPermission::TenantAdminMutation)?;
+		}
+		if let Some(claimed_tenant) = context.actor.claimed_tenant_id()?
+			&& claimed_tenant != tenant
+		{
+			return Err(Error::new(
+				ErrorKind::PermissionDenied,
+				format!(
+					"actor tenant {} cannot access CTAS for tenant {}",
+					claimed_tenant.get(),
+					tenant.get()
+				),
+			));
+		}
+		Ok(())
+	}
+
+	/// Wendelon ADR 0120 D6: a CTAS command, through the authenticated,
+	/// tenant-bound route, to the leader's typed admission (which checks an owner
+	/// command's secret against the applied chain and takes the gated stamp).
+	/// Not forwarded: a follower answers with its hint.
+	async fn handle_ctas_decision(
+		&self,
+		context: &RequestContext,
+		frame: HrftFrame,
+	) -> std::io::Result<HrftFrame> {
+		if frame.arrow_payload.is_some() || frame.trailing.is_some() {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"CTAS_DECISION_REQ must not carry Arrow or trailing payloads",
+			));
+		}
+		let proposal: crate::network::decision_proposals::CtasProposal = wire::decode(&frame.meta)?;
+		self.authorize_ctas_caller(context, proposal.tenant())?;
+		let response = match (&self.decision_proposals, self.decision_mode) {
+			(Some(proposals), crate::consensus::decision_mode::DecisionMode::ParentDecisions) => {
+				proposals.propose_ctas(proposal).await
+			}
+			_ => crate::network::decision_proposals::ProposalResponse::Refused(
+				crate::network::decision_proposals::ProposalRefusal::ModeToday,
+			),
+		};
+		self.build_ctas_decision_frame(
+			frame.header.stream_id,
+			&CtasDecisionResponseWire { response },
+		)
+	}
+
 	async fn handle_ctas_saga(
 		&self,
 		context: &RequestContext,
@@ -1293,6 +1382,18 @@ impl WendelonControlServer {
 					request.tenant_id().get()
 				),
 			));
+		}
+		// Wendelon ADR 0120: under ParentDecisions a CTAS is a decision chain. Typed,
+		// before any proposal (whatever the caller's stale view of the mode), so the
+		// caller falls back to CTAS_DECISION_REQ; nothing is appended.
+		if self.decision_mode == crate::consensus::decision_mode::DecisionMode::ParentDecisions {
+			return self.build_ctas_saga_frame(
+				frame.header.stream_id,
+				&CtasSagaResponseWire {
+					response: CtasSagaResponse::Rejected(CtasSagaReject::WrongDecisionMode),
+					leader_hint: None,
+				},
+			);
 		}
 		if !self.is_leader().await {
 			return self.build_ctas_saga_frame(
@@ -6329,6 +6430,7 @@ impl ControlRingServer for WendelonControlServer {
 			}
 			MsgType::SCHEMA_UPDATE_REQ => self.handle_schema_update(&context, frame).await?,
 			MsgType::CTAS_SAGA_REQ => self.handle_ctas_saga(&context, frame).await?,
+			MsgType::CTAS_DECISION_REQ => self.handle_ctas_decision(&context, frame).await?,
 			MsgType::SCHEMA_DROP_REQ => {
 				if context.actor.role == ActorRole::DataNode {
 					authorize_actor(&context.actor, ActorPermission::InterNodeTransport)?;

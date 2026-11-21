@@ -118,15 +118,15 @@ fn a_new_mode_snapshot_is_refused_by_today_before_its_body_is_trusted() {
 	assert!(error.contains("newer than this build accepts"), "{error}");
 }
 
-/// Wendelon ADR 0119 D6: a ParentDecisions build refuses a ParentDecisions
-/// snapshot of the previous format (31, ADR 0118's) and of a later one before
+/// Wendelon ADR 0119 D6, then ADR 0120 D9: a ParentDecisions build refuses a
+/// ParentDecisions snapshot of the previous format (32, ADR 0119's) and of a later one before
 /// its body is trusted; snapshot install decodes through this same reader
 /// (`decode_snapshot_file`), so an install of either is refused before anything
 /// is published.
 #[test]
 fn a_parent_decisions_snapshot_of_another_format_is_refused_before_its_body_is_trusted() {
 	let new = DecisionMode::ParentDecisions;
-	assert_eq!(new.snapshot_format(), 32);
+	assert_eq!(new.snapshot_format(), 33);
 	let state = SmState {
 		decisions: Some(Default::default()),
 		..SmState::default()
@@ -247,6 +247,10 @@ async fn a_new_mode_store_writes_its_own_format_and_reopens() {
 
 use crate::consensus::decisions::tests as fixture;
 
+const PARENT_DECISIONS_V33_MANIFEST: &str =
+	include_str!("../../../tests/fixtures/consensus_body/parent_decisions_v33.txt");
+/// Wendelon ADR 0119's format-32 bodies, retained. Wendelon ADR 0120 moved only
+/// the decision state (its CTAS part, appended) and added the CTAS commands.
 const PARENT_DECISIONS_V32_MANIFEST: &str =
 	include_str!("../../../tests/fixtures/consensus_body/parent_decisions_v32.txt");
 /// Wendelon ADR 0118's format-31 bodies, retained. Wendelon ADR 0119 moved and
@@ -330,7 +334,7 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 fn manifest() -> BTreeMap<String, String> {
-	parse(PARENT_DECISIONS_V32_MANIFEST)
+	parse(PARENT_DECISIONS_V33_MANIFEST)
 }
 
 /// ADR 0725: the three owner-signed operation kinds pinned in the format-18
@@ -499,7 +503,7 @@ fn entry(index: u64, request: WendelonRequest) -> Entry<WendelonTypeConfig> {
 }
 
 #[test]
-fn the_format_32_bodies_match_their_goldens_and_round_trip() {
+fn the_format_33_bodies_match_their_goldens_and_round_trip() {
 	let stored = manifest();
 	let state = golden_state();
 	let body = encode_state_body(DecisionMode::ParentDecisions, &state).unwrap();
@@ -730,6 +734,24 @@ fn the_format_32_bodies_match_their_goldens_and_round_trip() {
 			.unwrap(),
 		),
 	));
+	// Wendelon ADR 0120: the CTAS chain commands, and a chunk concluded by its
+	// chain's abandonment.
+	for (name, command) in golden_ctas_commands() {
+		actual.push((
+			name.to_owned(),
+			hex(&postcard::to_stdvec(&WendelonRequest::Decision(command)).unwrap()),
+		));
+	}
+	actual.push((
+		"parent_refused_ctas_abandoned".to_owned(),
+		hex(
+			&postcard::to_stdvec(&crate::consensus::decisions::ParentStatus::Refused {
+				cause: crate::consensus::decisions::RefusalCause::CtasAbandoned,
+				dec: 120,
+			})
+			.unwrap(),
+		),
+	));
 	let moved: Vec<String> = actual
 		.iter()
 		.filter(|(name, hex)| stored.get(name) != Some(hex))
@@ -737,7 +759,7 @@ fn the_format_32_bodies_match_their_goldens_and_round_trip() {
 		.collect();
 	assert!(
 		moved.is_empty(),
-		"format-32 bodies moved or are missing; expected lines:\n{}",
+		"format-33 bodies moved or are missing; expected lines:\n{}",
 		moved.join("\n")
 	);
 	assert_eq!(stored.len(), actual.len());
@@ -751,18 +773,47 @@ fn the_format_32_bodies_match_their_goldens_and_round_trip() {
 	// only the decision state differs from the format-16 corpus: by exactly the
 	// appended seal.
 	assert!(decisions.sealed().is_some());
-	// Wendelon ADR 0119: the format-31 corpus, byte for byte.
-	assert_eq!(stored, parse(PARENT_DECISIONS_V31_MANIFEST));
+	// Wendelon ADR 0120: against the format-32 corpus only the decision state
+	// moved, by exactly its appended empty CTAS part (four empty maps and two zero
+	// counters); the CTAS commands and a chunk refused by abandonment were added.
+	const ADDED_0120: [&str; 8] = [
+		"ctas_begin",
+		"ctas_renew",
+		"ctas_recover",
+		"ctas_publish",
+		"ctas_conclude",
+		"ctas_abandon",
+		"ctas_prune",
+		"parent_refused_ctas_abandoned",
+	];
+	let retained_v32 = parse(PARENT_DECISIONS_V32_MANIFEST);
+	assert_eq!(stored.len(), retained_v32.len() + ADDED_0120.len());
+	for (name, hex) in &retained_v32 {
+		if name == "decisions_golden_history" {
+			assert_eq!(
+				stored.get(name),
+				Some(&format!("{hex}000000000000")),
+				"{name}"
+			);
+		} else {
+			assert_eq!(stored.get(name), Some(hex), "{name}");
+		}
+	}
+	for name in ADDED_0120 {
+		assert!(stored.contains_key(name), "{name}");
+	}
+	// Wendelon ADR 0119: the format-32 corpus is the format-31 corpus, byte for byte.
+	assert_eq!(retained_v32, parse(PARENT_DECISIONS_V31_MANIFEST));
 	// Wendelon ADR 0118: against the format-30 corpus no body moved; a parent
 	// refused by its table's drop was added.
 	const ADDED_0118: [&str; 1] = ["parent_refused_table_dropped"];
 	let retained_v30 = parse(PARENT_DECISIONS_V30_MANIFEST);
-	assert_eq!(stored.len(), retained_v30.len() + ADDED_0118.len());
+	assert_eq!(retained_v32.len(), retained_v30.len() + ADDED_0118.len());
 	for (name, hex) in &retained_v30 {
-		assert_eq!(stored.get(name), Some(hex), "{name}");
+		assert_eq!(retained_v32.get(name), Some(hex), "{name}");
 	}
 	for name in ADDED_0118 {
-		assert!(stored.contains_key(name), "{name}");
+		assert!(retained_v32.contains_key(name), "{name}");
 	}
 	// Wendelon ADR 0113: the format-30 corpus is the format-29 corpus, byte for
 	// byte.
@@ -1268,9 +1319,24 @@ fn table_retention_is_frozen_under_parent_decisions() {
 		4,
 		0,
 	);
+	// Wendelon ADR 0120: typed, so a caller falls back to the decision chain.
+	assert_eq!(
+		response,
+		WendelonResponse::Error(format!(
+			"{}{}",
+			crate::schema::CTAS_SAGA_REJECT_PREFIX,
+			crate::schema::CtasSagaReject::WrongDecisionMode.code()
+		))
+	);
 	assert!(
-		matches!(&response, WendelonResponse::Error(why) if why.contains("CTAS is refused")),
-		"{response:?}"
+		state
+			.ctas_sagas
+			.get(
+				fixture::TENANT,
+				crate::schema::CtasOperationId::new(operation)
+			)
+			.is_none(),
+		"a saga was recorded"
 	);
 }
 
@@ -2590,4 +2656,85 @@ fn a_create_of_a_dropped_table_id_is_refused_under_parent_decisions() {
 		Some(PD_DROPPED_TABLE_ID_REUSE_REFUSED),
 		"another tenant's same id is not refused as a dropped id: {other:?}"
 	);
+}
+
+/// Wendelon ADR 0120: one of each CTAS chain command, pinned.
+fn golden_ctas_commands() -> Vec<(&'static str, crate::consensus::decisions::DecisionCommand)> {
+	use crate::consensus::decisions::DecisionCommand;
+	use crate::consensus::decisions::ctas::{
+		ChunkDecl, CtasAbandonCause, CtasBegin, encode_declaration,
+	};
+	let tenant = crate::schema::TenantId::new(120);
+	let op = [0x20; 16];
+	vec![
+		(
+			"ctas_begin",
+			DecisionCommand::CtasBegin {
+				begin: CtasBegin {
+					tenant,
+					op,
+					fingerprint: [0x21; 32],
+					descriptor: fixture::fixture_table(),
+					declaration: encode_declaration(&[ChunkDecl {
+						sequence_no: 0x4354_4153_0000_0001,
+						rows: 3,
+						request_digest: [0x22; 32],
+					}])
+					.unwrap(),
+					dispatch_hash: [0x23; 32],
+					stamp_ms: 120,
+				},
+			},
+		),
+		(
+			"ctas_renew",
+			DecisionCommand::CtasRenew {
+				tenant,
+				op,
+				epoch: 1,
+				owner: [0x24; 32],
+				stamp_ms: 121,
+			},
+		),
+		(
+			"ctas_recover",
+			DecisionCommand::CtasRecover {
+				tenant,
+				op,
+				new_epoch: 2,
+				stamp_ms: 122,
+			},
+		),
+		(
+			"ctas_publish",
+			DecisionCommand::CtasPublish {
+				tenant,
+				op,
+				epoch: 1,
+				owner: [0x24; 32],
+				stamp_ms: 123,
+			},
+		),
+		(
+			"ctas_conclude",
+			DecisionCommand::CtasConclude {
+				tenant,
+				op,
+				epoch: 2,
+				stamp_ms: 124,
+			},
+		),
+		(
+			"ctas_abandon",
+			DecisionCommand::CtasAbandon {
+				tenant,
+				op,
+				epoch: 1,
+				owner: [0x24; 32],
+				cause: CtasAbandonCause::SourceBytesLost,
+				stamp_ms: 125,
+			},
+		),
+		("ctas_prune", DecisionCommand::CtasPrune { tenant, op }),
+	]
 }

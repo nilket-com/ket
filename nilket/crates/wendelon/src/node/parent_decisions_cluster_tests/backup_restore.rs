@@ -65,7 +65,7 @@ async fn client_as(cluster: &Cluster, actor: ActorIdentity) -> Arc<WendelonClien
 }
 
 /// `client_as`, its topology advertising `capability_bits` for every peer.
-async fn client_advertised(
+pub(super) async fn client_advertised(
 	cluster: &Cluster,
 	actor: ActorIdentity,
 	capability_bits: u8,
@@ -1927,4 +1927,247 @@ async fn a_backup_completes_while_a_replacement_is_control_only() {
 	for node in std::mem::take(&mut source.nodes) {
 		let _ = tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown()).await;
 	}
+}
+
+/// One CTAS chunk of operation `op` at `sequence_no`, written by tenant 1's
+/// storage client with the owner's credential (Toron's path); it must commit.
+async fn ctas_chunk(
+	clients: &Clients,
+	descriptor: &TableSchemaDescriptor,
+	op: [u8; 16],
+	sequence_no: u64,
+	rows: &[(i64, &str)],
+) {
+	let mut meta = super::ctas::chunk_meta_at(descriptor, op, sequence_no);
+	meta.tenant_id = TENANT;
+	meta.row_count = encode_table_write_row_count(rows.len()).unwrap();
+	let result = clients.data[&TENANT]
+		.ctas_chunk_write(
+			TableWriteRequest {
+				meta,
+				descriptor: descriptor.clone(),
+				payload: named_rows(descriptor, rows),
+				deadline: Some(std::time::Instant::now() + std::time::Duration::from_secs(30)),
+			},
+			crate::client::core::CtasChunkCredential {
+				op,
+				secret: super::ctas::SECRET,
+			},
+		)
+		.await
+		.unwrap();
+	let write = result.response.write;
+	assert!(
+		matches!(
+			mutation_answer(write.status, write.mutation_commit_knowledge()),
+			MutationAnswer::Committed { .. }
+		),
+		"{write:?}"
+	);
+}
+
+/// Tenant 1's CTAS operation declaring `chunks`, begun at the leader. Its id.
+async fn ctas_begun(
+	cluster: &Cluster,
+	descriptor: &TableSchemaDescriptor,
+	chunks: &[&[(i64, &str)]],
+) -> [u8; 16] {
+	use crate::consensus::decisions::DecisionResult;
+	let op = uuid_v7();
+	let leader = cluster.leader().await;
+	let begin = super::ctas::begin_chunks_in(TENANT, descriptor, op, chunks);
+	assert!(matches!(
+		super::ctas::decided(
+			super::ctas::ctas_command(cluster, leader, &begin).await,
+			"Begin"
+		),
+		DecisionResult::CtasBegun { .. }
+	));
+	op
+}
+
+/// Tenant 1's chain `op` on the leader, by `phase`.
+async fn ctas_phase(
+	cluster: &Cluster,
+	op: [u8; 16],
+) -> Option<(crate::consensus::decisions::ctas::CtasPhase, u128)> {
+	let leader = cluster.leader().await;
+	cluster
+		.node(leader)
+		.state_machine
+		.read_state(move |state| {
+			let chain = state.decisions.as_ref()?.ctas().chain(TENANT, op)?;
+			Some((chain.phase, chain.accepted))
+		})
+		.await
+}
+
+/// Wendelon ADR 0120 S4 (Codex 01a1fbf1): CTAS through a real export and
+/// restore, as tenant 1 with the deployment's credentials. On the source:
+/// P is published by its owner (duplicates within and across its two chunks);
+/// Q's owner stops after its one chunk commits, and A's after the first of its
+/// two. With no client traffic, once the committed clock passes their leases,
+/// maintenance publishes Q and abandons A (its accepted rows never visible). The
+/// backup holds the ordinary table, P and Q with their exact multisets and not
+/// A; restored into a fresh cluster, P and Q read exactly with the target's
+/// storage credential, A has no table there, and P takes an ordinary AppendOnly
+/// append.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_published_ctas_round_trips_and_an_abandoned_ones_rows_never_do() {
+	use super::ctas::ROWS;
+	use crate::consensus::decisions::DecisionResult;
+	use crate::consensus::decisions::ctas::{CtasAbandonCause, CtasPhase};
+	use crate::network::decision_proposals::CtasProposal;
+	const MORE: [(i64, &str); 2] = [(1, "same"), (4, "late")];
+	let sorted = |parts: &[&[(i64, &str)]]| {
+		let mut rows: Vec<(i64, String)> = parts
+			.iter()
+			.flat_map(|part| part.iter().map(|(id, v)| (*id, (*v).to_owned())))
+			.collect();
+		rows.sort();
+		rows
+	};
+	let (source, clients, ordinary) = source_with_table().await;
+	write(&clients, &ordinary, &[(1, "a")]).await;
+
+	let p = super::ctas::target(0xE1, "ctas_published");
+	let op_p = ctas_begun(&source, &p, &[&ROWS, &MORE]).await;
+	ctas_chunk(&clients, &p, op_p, 1, &ROWS).await;
+	ctas_chunk(&clients, &p, op_p, 2, &MORE).await;
+	let leader = source.leader().await;
+	let publish = CtasProposal::Publish {
+		tenant: TENANT,
+		op: op_p,
+		epoch: 1,
+		secret: super::ctas::SECRET,
+	};
+	assert_eq!(ctas_phase(&source, op_p).await.map(|(_, a)| a), Some(0b11));
+	assert!(matches!(
+		super::ctas::decided(
+			super::ctas::ctas_command(&source, leader, &publish).await,
+			"Publish"
+		),
+		DecisionResult::CtasPublished { .. }
+	));
+	let q = super::ctas::target(0xE2, "ctas_recovered");
+	let op_q = ctas_begun(&source, &q, &[&ROWS]).await;
+	ctas_chunk(&clients, &q, op_q, 1, &ROWS).await;
+	let a = super::ctas::target(0xE3, "ctas_abandoned");
+	let op_a = ctas_begun(&source, &a, &[&ROWS, &MORE]).await;
+	ctas_chunk(&clients, &a, op_a, 1, &ROWS).await;
+
+	// The owners of Q and A stop. No client traffic: the committed clock passes
+	// their leases and maintenance settles both.
+	let now = std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.unwrap()
+		.as_millis() as u64;
+	jump_floor(&source, now + 60_000).await;
+	source
+		.until("maintenance settled Q and A", move |state| {
+			let Some(decisions) = state.decisions.as_ref() else {
+				return false;
+			};
+			let ctas = decisions.ctas();
+			matches!(
+				ctas.chain(TENANT, op_q).map(|chain| chain.phase),
+				Some(CtasPhase::Published { .. })
+			) && matches!(
+				ctas.chain(TENANT, op_a).map(|chain| chain.phase),
+				Some(CtasPhase::Abandoned {
+					cause: CtasAbandonCause::SourceBytesLost,
+					..
+				})
+			)
+		})
+		.await;
+	assert_eq!(
+		ctas_phase(&source, op_a)
+			.await
+			.map(|(_, accepted)| accepted),
+		Some(0b01),
+		"A had accepted rows"
+	);
+	let expected_p = sorted(&[&ROWS, &MORE]);
+	let expected_q = sorted(&[&ROWS]);
+	// DC-281, the captured failure: a node activated the newly committed
+	// generation (here the one A's retirement triggers) some 50-100 ms after the
+	// others, and a read it received meanwhile was refused on each of the
+	// client's three attempts (two 20 ms backoffs; the refusal hints the same
+	// node). Its fix is a separate follow-up; this control reads once every node
+	// serves the committed generation.
+	let committed = source
+		.node(leader)
+		.state_machine
+		.read_state(|state| {
+			state
+				.decisions
+				.as_ref()
+				.unwrap()
+				.generations()
+				.current_gid()
+		})
+		.await;
+	until_active(&source, committed).await;
+	assert_eq!(read_multiset(&clients, &p).await, expected_p);
+	assert_eq!(read_multiset(&clients, &q).await, expected_q);
+
+	let root = crate::test_support::TestDir::new("adr0120-artifact");
+	let dir = root.to_path_buf().join("backup");
+	let report = export::export(&clients, &dir, PASSPHRASE)
+		.await
+		.unwrap_or_else(|error| panic!("export: {error}"));
+	assert_eq!((report.tables, report.rows), (3, 1 + 5 + 3), "{report:?}");
+	let verified = restore::verify(&dir, PASSPHRASE).unwrap();
+	let in_backup = |object: TableObjectId| {
+		verified
+			.manifest
+			.roster
+			.tables
+			.iter()
+			.find(|table| table.descriptor.table_object_id == object)
+			.map(|table| table.descriptor.clone())
+	};
+	let (Some(backup_p), Some(backup_q)) =
+		(in_backup(p.table_object_id), in_backup(q.table_object_id))
+	else {
+		panic!(
+			"the backup lists P and Q: {:?}",
+			verified.manifest.roster.tables
+		);
+	};
+	assert!(in_backup(ordinary.table_object_id).is_some());
+	assert_eq!(in_backup(a.table_object_id), None, "the abandoned object");
+	assert_eq!(backup_p.table_name, "ctas_published");
+
+	let target = Cluster::start().await;
+	until_ready(&target, None).await;
+	let target_clients = self::clients(&target).await;
+	let restored = restore::restore(&target_clients, &dir, &verified)
+		.await
+		.unwrap_or_else(|error| panic!("restore: {error}"));
+	assert_eq!((restored.tables, restored.rows), (3, 9), "{restored:?}");
+	assert_eq!(read_multiset(&target_clients, &backup_p).await, expected_p);
+	assert_eq!(read_multiset(&target_clients, &backup_q).await, expected_q);
+	assert_eq!(
+		read(&target_clients, &ordinary).await,
+		Expected::from([(1, "a".to_owned())])
+	);
+	let a_object = a.table_object_id;
+	for id in NODES {
+		assert!(
+			target
+				.node(id)
+				.state_machine
+				.read_state(move |state| state.table_schemas.get(TENANT, a_object, 1).is_none())
+				.await,
+			"node {id}: no table for the abandoned object"
+		);
+	}
+
+	write(&target_clients, &backup_p, &[(1, "same")]).await;
+	let mut appended = expected_p.clone();
+	appended.push((1, "same".to_owned()));
+	appended.sort();
+	assert_eq!(read_multiset(&target_clients, &backup_p).await, appended);
 }

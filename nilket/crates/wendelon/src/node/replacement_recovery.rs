@@ -779,18 +779,11 @@ impl RecoveryDriver {
 	) -> Option<crate::schema::TableSchemaDescriptor> {
 		self.state_machine
 			.read_state(move |state| {
-				crate::network::data_server::child_writes::table_descriptor(
+				crate::network::data_server::child_writes::recorded_latest_table_descriptor(
 					state,
 					entry.tenant,
 					entry.table,
-					0,
 				)
-				.or_else(|| {
-					state
-						.table_schemas
-						.latest_by_id(entry.tenant, entry.table)
-						.cloned()
-				})
 			})
 			.await
 	}
@@ -1049,10 +1042,9 @@ impl RecoveryDriver {
 			let descriptor = self
 				.state_machine
 				.read_state(move |state| {
-					crate::network::data_server::child_writes::table_descriptor(
-						state, tenant, table, 0,
+					crate::network::data_server::child_writes::recorded_latest_table_descriptor(
+						state, tenant, table,
 					)
-					.or_else(|| state.table_schemas.latest_by_id(tenant, table).cloned())
 				})
 				.await
 				.ok_or_else(|| Error::other("an owed child's table is unknown"))?;
@@ -1241,10 +1233,12 @@ pub(crate) fn owed_children(
 		let generation = if table == crate::schema::TableObjectId::DEFAULT_KV {
 			0
 		} else {
-			state
-				.table_schemas
-				.latest_by_id(tenant, table)
-				.map_or(u64::MAX, |descriptor| descriptor.schema_generation)
+			// Wendelon ADR 0120 D4: an owed CTAS chunk (provisional or retained)
+			// has its real generation from the private lookup.
+			crate::network::data_server::child_writes::recorded_latest_table_descriptor(
+				state, tenant, table,
+			)
+			.map_or(u64::MAX, |descriptor| descriptor.schema_generation)
 		};
 		for (ordinal, child) in body.claim.children.iter().enumerate() {
 			let names = child.plan.iter().any(|member| {

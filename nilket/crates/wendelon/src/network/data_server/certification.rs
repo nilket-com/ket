@@ -492,7 +492,7 @@ impl StoreCertification<'_> {
 				let pending = decisions.generations().pending.clone()?;
 				// Wendelon ADR 0115: a target is reported only with the policy the
 				// outcomes at its cut require; unadmitted, an excluding target never is.
-				if pending.target.survivor_policy != state.survivor_policy_at(pending.target.t) {
+				if pending.target.survivor_policy != state.pd_survivor_policy_at(pending.target.t) {
 					return None;
 				}
 				let excluding = pending.target.survivor_policy
@@ -513,16 +513,14 @@ impl StoreCertification<'_> {
 					// generation, descriptor or plan lookup (memoized per table).
 					if excluding
 						&& *excluded.entry((tenant, table)).or_insert_with(|| {
-							state.drop_excluded_at(tenant, table, pending.target.t)
+							state.pd_excluded_at(tenant, table, pending.target.t)
 						}) {
 						continue;
 					}
 					let generation = if table == TableObjectId::DEFAULT_KV {
 						0
 					} else {
-						state
-							.table_schemas
-							.latest_by_id(tenant, table)
+						super::child_writes::recorded_latest_table_descriptor(state, tenant, table)
 							.map_or(u64::MAX, |descriptor| descriptor.schema_generation)
 					};
 					for (ordinal, child) in body.claim.children.iter().enumerate() {
@@ -723,7 +721,7 @@ impl StoreCertification<'_> {
 				.read_state(move |state| {
 					tables
 						.into_iter()
-						.filter(|(tenant, table)| state.drop_excluded_at(*tenant, *table, t))
+						.filter(|(tenant, table)| state.pd_excluded_at(*tenant, *table, t))
 						.collect()
 				})
 				.await;
@@ -745,7 +743,7 @@ impl StoreCertification<'_> {
 			let descriptor = self
 				.state_machine
 				.read_state(move |state| {
-					super::child_writes::table_descriptor(state, tenant, table, generation)
+					super::child_writes::recorded_table_descriptor(state, tenant, table, generation)
 				})
 				.await
 				.ok_or(BuildRefusal::NotInPlan)?;
@@ -883,8 +881,7 @@ pub(crate) async fn entry_is_stored(
 	let (tenant, table) = (entry.tenant, entry.table);
 	let descriptor = state_machine
 		.read_state(move |state| {
-			super::child_writes::table_descriptor(state, tenant, table, 0)
-				.or_else(|| state.table_schemas.latest_by_id(tenant, table).cloned())
+			super::child_writes::recorded_latest_table_descriptor(state, tenant, table)
 		})
 		.await
 		.ok_or("a certified entry's table is unknown")?;

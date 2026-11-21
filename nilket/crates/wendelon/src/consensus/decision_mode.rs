@@ -27,7 +27,7 @@ use crate::schema::{
 /// older binaries do not read it, and for them that record is the boundary.
 const MODE_MARKER: &str = "PARENT_DECISIONS";
 const MODE_MARKER_TMP: &str = ".PARENT_DECISIONS.tmp";
-const MODE_MARKER_BYTES: &[u8] = b"parent-decisions-v22\n";
+const MODE_MARKER_BYTES: &[u8] = b"parent-decisions-v23\n";
 /// S1's development marker. Its stores hold format-9 records, whose bodies were
 /// today's; no conversion exists, so both authorities refuse it as malformed.
 #[cfg(test)]
@@ -132,6 +132,11 @@ const RETIRED_MARKER_BYTES_V20: &[u8] = b"parent-decisions-v20\n";
 /// readable by its own binary.
 #[cfg(test)]
 const RETIRED_MARKER_BYTES_V21: &[u8] = b"parent-decisions-v21\n";
+/// Wendelon ADR 0119's marker, for stores holding format-32 records, whose
+/// ParentDecisions decision state has no CTAS chains (wendelon ADR 0120 adds
+/// them). Refused whole; readable by its own binary.
+#[cfg(test)]
+const RETIRED_MARKER_BYTES_V22: &[u8] = b"parent-decisions-v22\n";
 
 /// The envelope version of Raft frames between Today nodes. ADR 0726: 13, its
 /// own, because tenant creation and tenant KEK install carry a root check id
@@ -198,7 +203,10 @@ pub(crate) const RAFT_FRAME_VERSION_TODAY: u8 = 15;
 /// Wendelon ADR 0119: 25. A named AppendOnly table's rows carry identities by
 /// operation and position, and the child, repair and base-fetch frames travel in
 /// this envelope.
-pub(crate) const RAFT_FRAME_VERSION_PARENT_DECISIONS: u8 = 25;
+///
+/// Wendelon ADR 0120: 26. Decision commands, results and refusals carry CTAS
+/// chains (Begin, Renew, Recover, Publish, Conclude, Abandon).
+pub(crate) const RAFT_FRAME_VERSION_PARENT_DECISIONS: u8 = 26;
 
 /// ADR 0721: the frames that may carry the `ParentDecisions` envelope: the Raft
 /// frames and a forwarded decision proposal with its answer. This classifies an
@@ -571,16 +579,16 @@ mod tests {
 		assert!(mode.wal_format() > WAL_FORMAT_VERSION);
 		assert_eq!(
 			(mode.wal_format(), mode.snapshot_format()),
-			(32, 32),
+			(33, 33),
 			"S1's 9, S2's 10, S3's 11, S4b's 12, S5a to ADR 0700's 13, ADR 0701 to ADR \
 			 0703's 14, ADR 0704 to ADR 0719's 16, ADR 0720 to ADR 0724's 17 and ADR \
 			 0725's 18 and ADR 0726 to ADR 0727's 20, ADR 0728's 22, ADR 0729 to \
 			 ADR 0735's 23, ADR 0736 to wendelon ADR 0103's 24, wendelon ADR 0104's 25, \
 			 wendelon ADR 0105's 26, wendelon ADR 0106's 27 and wendelon ADR 0108 to ADR \
-			 0111's 28 and wendelon ADR 0112's 29 and wendelon ADR 0113 to ADR 0117's 30 and wendelon ADR 0118's 31 are retired; 15 and 19 \
+			 0111's 28 and wendelon ADR 0112's 29 and wendelon ADR 0113 to ADR 0117's 30 and wendelon ADR 0118's 31 and wendelon ADR 0119's 32 are retired; 15 and 19 \
 			 were Today's and 21 is"
 		);
-		assert_eq!(mode.raft_frame_version(), 25);
+		assert_eq!(mode.raft_frame_version(), 26);
 		assert!(mode.snapshot_format() > SNAPSHOT_FORMAT_VERSION);
 		assert_ne!(mode.raft_frame_version(), 1);
 		assert!(mode.refuses_service());
@@ -590,9 +598,9 @@ mod tests {
 	fn a_frame_or_joiner_from_the_other_authority_is_refused_both_ways() {
 		let (today, new) = (DecisionMode::Today, DecisionMode::ParentDecisions);
 		today.check_raft_frame(15).unwrap();
-		new.check_raft_frame(25).unwrap();
-		// Wendelon ADR 0119: a version-24 peer's frames are refused before decode.
-		assert!(new.check_raft_frame(24).is_err());
+		new.check_raft_frame(26).unwrap();
+		// Wendelon ADR 0120: a version-25 peer's frames are refused before decode.
+		assert!(new.check_raft_frame(25).is_err());
 		// Wendelon ADR 0112: a version-21 peer's frames are refused before decode.
 		assert!(new.check_raft_frame(21).is_err());
 		// Wendelon ADR 0108: a version-20 peer's frames are refused before decode.
@@ -607,7 +615,7 @@ mod tests {
 		assert!(new.check_raft_frame(16).is_err());
 		// ADR 0729: an ADR 0728 peer's version-14 frames are refused before decode.
 		assert!(new.check_raft_frame(14).is_err());
-		assert!(today.check_raft_frame(25).is_err());
+		assert!(today.check_raft_frame(26).is_err());
 		// ADR 0728: an ADR 0726 to ADR 0727 peer of either mode decides a tier
 		// publication naming an absent tenant KEK differently; its frames are
 		// refused before decode.
@@ -639,11 +647,11 @@ mod tests {
 				"S1's and S2's envelopes"
 			);
 		}
-		for other in (1..=25).filter(|other| *other != 15) {
+		for other in (1..=26).filter(|other| *other != 15) {
 			assert!(today.check_raft_frame(other).is_err(), "{other}");
 		}
 		assert_eq!(
-			today.check_raft_frame(25).unwrap_err().kind(),
+			today.check_raft_frame(26).unwrap_err().kind(),
 			ErrorKind::PermissionDenied
 		);
 		assert_eq!(
@@ -698,24 +706,24 @@ mod tests {
 		] {
 			assert!(validate_frame_version(15, other.0).is_err());
 		}
-		validate_frame_version(25, MsgType::VOTE_REQ.0).unwrap();
-		validate_frame_version(25, MsgType::APPEND_ENTRIES_RESP.0).unwrap();
+		validate_frame_version(26, MsgType::VOTE_REQ.0).unwrap();
+		validate_frame_version(26, MsgType::APPEND_ENTRIES_RESP.0).unwrap();
 		// ADR 0721: a forwarded decision proposal and its answer carry it too.
-		validate_frame_version(25, MsgType::DECISION_PROPOSE_REQ.0).unwrap();
-		validate_frame_version(25, MsgType::DECISION_PROPOSE_RESP.0).unwrap();
-		assert!(validate_frame_version(25, MsgType::READ_RESP.0).is_err());
-		assert!(validate_frame_version(25, MsgType::TABLE_WRITE_REQ.0).is_err());
+		validate_frame_version(26, MsgType::DECISION_PROPOSE_REQ.0).unwrap();
+		validate_frame_version(26, MsgType::DECISION_PROPOSE_RESP.0).unwrap();
+		assert!(validate_frame_version(26, MsgType::READ_RESP.0).is_err());
+		assert!(validate_frame_version(26, MsgType::TABLE_WRITE_REQ.0).is_err());
 		// ADR 0729: the lease batch travels in this envelope, both ways; the
 		// generic reader also admits envelope 1 for it, which its handlers refuse.
-		validate_frame_version(25, MsgType::LEASES_REQ.0).unwrap();
-		validate_frame_version(25, MsgType::LEASES_RESP.0).unwrap();
+		validate_frame_version(26, MsgType::LEASES_REQ.0).unwrap();
+		validate_frame_version(26, MsgType::LEASES_RESP.0).unwrap();
 		validate_frame_version(1, MsgType::LEASES_REQ.0).unwrap();
 		assert!(carries_decision_envelope(MsgType::LEASES_REQ.0));
 		assert!(carries_decision_envelope(MsgType::LEASES_RESP.0));
-		assert!(validate_frame_version(25, MsgType::DECISION_LOOKUP_REQ.0).is_err());
-		assert!(validate_frame_version(25, MsgType::DECISION_CUT_REQ.0).is_err());
+		assert!(validate_frame_version(26, MsgType::DECISION_LOOKUP_REQ.0).is_err());
+		assert!(validate_frame_version(26, MsgType::DECISION_CUT_REQ.0).is_err());
 		for retired in [
-			2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+			2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
 		] {
 			assert!(
 				validate_frame_version(retired, MsgType::DECISION_PROPOSE_REQ.0).is_err(),
@@ -726,7 +734,7 @@ mod tests {
 				"retired envelope {retired}"
 			);
 		}
-		assert!(validate_frame_version(26, MsgType::VOTE_REQ.0).is_err());
+		assert!(validate_frame_version(27, MsgType::VOTE_REQ.0).is_err());
 		// The classifier is an envelope family, not Raft dispatch.
 		assert!(!is_raft_frame(MsgType::DECISION_PROPOSE_REQ.0));
 		assert!(carries_decision_envelope(MsgType::DECISION_PROPOSE_REQ.0));
@@ -742,8 +750,8 @@ mod tests {
 		assert!(today.check_raft_response(1, vote, vote).is_err());
 		assert!(today.check_raft_response(13, vote, vote).is_err());
 		assert!(new.check_raft_response(15, vote, vote).is_err());
-		new.check_raft_response(25, vote, vote).unwrap();
-		assert!(new.check_raft_response(24, vote, vote).is_err());
+		new.check_raft_response(26, vote, vote).unwrap();
+		assert!(new.check_raft_response(25, vote, vote).is_err());
 		assert!(new.check_raft_response(21, vote, vote).is_err());
 		assert!(new.check_raft_response(20, vote, vote).is_err());
 		assert!(new.check_raft_response(18, vote, vote).is_err());
@@ -762,7 +770,7 @@ mod tests {
 			assert!(new.check_raft_response(retired, vote, vote).is_err());
 		}
 		assert!(
-			new.check_raft_response(25, MsgType::APPEND_ENTRIES_RESP.0, vote)
+			new.check_raft_response(26, MsgType::APPEND_ENTRIES_RESP.0, vote)
 				.is_err()
 		);
 	}
@@ -845,6 +853,7 @@ mod tests {
 			("wendelon0112-v19", 22),
 			("wendelon0117-v20", 23),
 			("wendelon0118-v21", 24),
+			("wendelon0119-v22", 25),
 			("directory", 2),
 			("symlink", 3),
 		] {
@@ -852,7 +861,7 @@ mod tests {
 			let marker = dir.join(MODE_MARKER);
 			match make {
 				0 => fs::write(&marker, b"").unwrap(),
-				1 => fs::write(&marker, b"parent-decisions-v23\n").unwrap(),
+				1 => fs::write(&marker, b"parent-decisions-v24\n").unwrap(),
 				4 => fs::write(&marker, RETIRED_MARKER_BYTES_S1).unwrap(),
 				5 => fs::write(&marker, RETIRED_MARKER_BYTES_V2).unwrap(),
 				6 => fs::write(&marker, RETIRED_MARKER_BYTES_V3).unwrap(),
@@ -874,6 +883,7 @@ mod tests {
 				22 => fs::write(&marker, RETIRED_MARKER_BYTES_V19).unwrap(),
 				23 => fs::write(&marker, RETIRED_MARKER_BYTES_V20).unwrap(),
 				24 => fs::write(&marker, RETIRED_MARKER_BYTES_V21).unwrap(),
+				25 => fs::write(&marker, RETIRED_MARKER_BYTES_V22).unwrap(),
 				2 => fs::create_dir(&marker).unwrap(),
 				_ => {
 					fs::write(dir.join("target"), MODE_MARKER_BYTES).unwrap();
@@ -895,13 +905,14 @@ mod tests {
 		}
 	}
 
-	/// Wendelon ADR 0118 D2, then wendelon ADR 0119 D6: a store of the previous
-	/// ParentDecisions format (the v21 marker, with control-log bytes beside it) is refused by both modes, and
+	/// Wendelon ADR 0118 D2, then wendelon ADR 0119 D6 and ADR 0120 D9: a store of
+	/// the previous ParentDecisions format (the v22 marker, with control-log bytes
+	/// beside it) is refused by both modes, and
 	/// every byte under its directory is unchanged by the refused open.
 	#[test]
 	fn a_previous_format_parent_decisions_store_refuses_without_mutation() {
 		let dir = fresh_dir("adr0118-previous-format");
-		fs::write(dir.join(MODE_MARKER), RETIRED_MARKER_BYTES_V21).unwrap();
+		fs::write(dir.join(MODE_MARKER), RETIRED_MARKER_BYTES_V22).unwrap();
 		fs::write(
 			dir.join("control.wal.00000000000000000000.seg"),
 			[0x5a_u8; 4096],
@@ -922,7 +933,7 @@ mod tests {
 		for mode in [DecisionMode::Today, DecisionMode::ParentDecisions] {
 			assert!(
 				mode.admit_store(&dir).is_err(),
-				"{mode:?} refuses the v21 store"
+				"{mode:?} refuses the v22 store"
 			);
 			// Today's bind is a no-op by design; its admission is the refusal.
 			assert!(
@@ -933,35 +944,35 @@ mod tests {
 		assert_eq!(snapshot(), before, "no byte changed");
 	}
 
-	/// Wendelon ADR 0118 D2, then wendelon ADR 0119 D6, the reverse direction, BY
+	/// Wendelon ADR 0118 D2, then wendelon ADR 0119 D6 and ADR 0120 D9, the reverse direction, BY
 	/// SOURCE INFERENCE (not an execution of the old binary): the previous build
-	/// (bfebc3bc8) checks a received frame with this same `check_frame_version`, at
-	/// its constant 24. With that constant, a version-25 frame of this build is
-	/// refused, and its own 24 is accepted.
+	/// (cbdf7ae24) checks a received frame with this same `check_frame_version`, at
+	/// its constant 25. With that constant, a version-26 frame of this build is
+	/// refused, and its own 25 is accepted.
 	#[test]
 	fn the_previous_builds_receiver_rule_refuses_this_builds_frames() {
-		const PREVIOUS: u8 = 24;
+		const PREVIOUS: u8 = 25;
 		assert!(check_frame_version(PREVIOUS, RAFT_FRAME_VERSION_PARENT_DECISIONS).is_err());
 		assert!(check_frame_version(PREVIOUS, PREVIOUS).is_ok());
-		assert_eq!(RAFT_FRAME_VERSION_PARENT_DECISIONS, 25);
+		assert_eq!(RAFT_FRAME_VERSION_PARENT_DECISIONS, 26);
 	}
 
 	/// Wendelon ADR 0118 D2, then wendelon ADR 0119 D6: across the version fence,
 	/// every frame on the ParentDecisions envelope (Raft append, vote and
 	/// install-snapshot, a forwarded decision proposal with its answer) is refused
-	/// before decode at the previous version 24 and at 26, and accepted at 25. The
-	/// rule is equality, so a version-24 node refuses version-25 frames by the same
+	/// before decode at the previous version 25 and at 27, and accepted at 26. The
+	/// rule is equality, so a version-25 node refuses version-26 frames by the same
 	/// check.
 	#[test]
 	fn every_parent_decisions_frame_is_refused_across_the_version_fence() {
 		use crate::network::wire::validate_frame_version;
 		use crate::schema::MsgType;
 		let mode = DecisionMode::ParentDecisions;
-		assert_eq!(mode.raft_frame_version(), 25);
-		for version in [24_u8, 26] {
+		assert_eq!(mode.raft_frame_version(), 26);
+		for version in [25_u8, 27] {
 			assert!(mode.check_raft_frame(version).is_err(), "version {version}");
 		}
-		mode.check_raft_frame(25).unwrap();
+		mode.check_raft_frame(26).unwrap();
 		for frame in [
 			MsgType::APPEND_ENTRIES_REQ,
 			MsgType::APPEND_ENTRIES_RESP,
@@ -972,10 +983,10 @@ mod tests {
 			MsgType::DECISION_PROPOSE_REQ,
 			MsgType::DECISION_PROPOSE_RESP,
 		] {
-			validate_frame_version(25, frame.0).unwrap();
+			validate_frame_version(26, frame.0).unwrap();
 			assert!(
-				validate_frame_version(26, frame.0).is_err(),
-				"{frame:?} at 26"
+				validate_frame_version(27, frame.0).is_err(),
+				"{frame:?} at 27"
 			);
 		}
 		// Today's Raft version is unchanged.
@@ -985,7 +996,7 @@ mod tests {
 	/// Wendelon ADR 0119 D6: every peer exchange (child write, replicate and
 	/// fetch, base fetch; request and response) travels in the decision envelope,
 	/// and each boundary admits exactly this build's version: not the previous
-	/// build's 24, not 26, and not the v1 the generic reader admits.
+	/// build's 25, not 27, and not the v1 the generic reader admits.
 	#[test]
 	fn every_peer_exchange_is_fenced_at_its_exact_envelope_version() {
 		use crate::network::wire::validate_frame_version;
@@ -1002,10 +1013,10 @@ mod tests {
 		] {
 			assert!(is_peer_exchange_frame(frame.0), "{frame:?}");
 			assert!(carries_decision_envelope(frame.0), "{frame:?}");
-			validate_frame_version(25, frame.0).unwrap();
+			validate_frame_version(26, frame.0).unwrap();
 		}
-		check_peer_exchange_version(25).unwrap();
-		for version in [1_u8, 24, 26] {
+		check_peer_exchange_version(26).unwrap();
+		for version in [1_u8, 25, 27] {
 			assert!(
 				check_peer_exchange_version(version).is_err(),
 				"version {version}"

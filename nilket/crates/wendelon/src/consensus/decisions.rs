@@ -636,6 +636,62 @@ pub enum DecisionCommand {
 	IndexReceipt {
 		proof: Signed<IndexReceiptBody>,
 	},
+	/// Wendelon ADR 0120 D3: a CTAS statement's chain begins (appended, so every
+	/// earlier tag is unchanged).
+	CtasBegin {
+		begin: ctas::CtasBegin,
+	},
+	/// Wendelon ADR 0120 D6, D7: the owner extends its lease. Every owner command
+	/// names the winning owner's commitment (`BLAKE3(secret)`), never the secret:
+	/// the secret is checked at authenticated admission, and apply binds the
+	/// command to the chain's immutable commitment and epoch.
+	CtasRenew {
+		tenant: TenantId,
+		op: [u8; 16],
+		epoch: u64,
+		owner: [u8; 32],
+		stamp_ms: u64,
+	},
+	/// Wendelon ADR 0120 D7: takeover after the lease lapsed (one way).
+	CtasRecover {
+		tenant: TenantId,
+		op: [u8; 16],
+		new_epoch: u64,
+		stamp_ms: u64,
+	},
+	/// Wendelon ADR 0120 D7: the owner publishes a fully accepted chain.
+	CtasPublish {
+		tenant: TenantId,
+		op: [u8; 16],
+		epoch: u64,
+		owner: [u8; 32],
+		/// The gated leader stamp: the terminal time is the committed clock with it.
+		stamp_ms: u64,
+	},
+	/// Wendelon ADR 0120 D7: recovery publishes or abandons from the evidence.
+	CtasConclude {
+		tenant: TenantId,
+		op: [u8; 16],
+		epoch: u64,
+		stamp_ms: u64,
+	},
+	/// Wendelon ADR 0120 D7: the owner abandons its chain.
+	CtasAbandon {
+		tenant: TenantId,
+		op: [u8; 16],
+		epoch: u64,
+		owner: [u8; 32],
+		cause: ctas::CtasAbandonCause,
+		stamp_ms: u64,
+	},
+	/// Wendelon ADR 0120 D9: removes a terminal chain's record once its retention
+	/// lapsed on the committed clock and every key its operation names is at or
+	/// below the retirement floor. Its object's retirement, visibility index and
+	/// any retained descriptor stay. Appended.
+	CtasPrune {
+		tenant: TenantId,
+		op: [u8; 16],
+	},
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -646,6 +702,9 @@ pub enum RefusalCause {
 	/// still Reserved. Production from format 31 (wendelon ADR 0118 D2 is its
 	/// compatibility fence); appended, so every earlier tag is unchanged.
 	TableDropped,
+	/// Wendelon ADR 0120 D7: a CTAS chunk concluded by its chain's abandonment
+	/// (or publication conflict) while still Reserved. Appended.
+	CtasAbandoned,
 }
 
 /// A parent's status. A terminal status carries `dec`, the Raft log index of
@@ -808,6 +867,8 @@ pub enum DecisionRefusal {
 	/// ADR 0108 (wendelon): a voter of the applied membership maps to no slot,
 	/// so whether every slot's current store reported cannot be proved.
 	IndexReceiptMembershipUnknown,
+	/// Wendelon ADR 0120: a CTAS command changed nothing. Appended.
+	Ctas(ctas::CtasRefusal),
 }
 
 /// ADR 0721: how the key a store signs with stands against the replicated
@@ -1033,6 +1094,39 @@ pub enum DecisionResult {
 		through: u64,
 		certified: u64,
 	},
+	/// Wendelon ADR 0120: a chain began (or this statement's did already).
+	CtasBegun {
+		tenant: TenantId,
+		object: crate::schema::TableObjectId,
+		replayed: bool,
+	},
+	CtasRenewed {
+		lease_until_ms: u64,
+	},
+	CtasRecovering {
+		epoch: u64,
+	},
+	/// The chain is published: its table is visible from `visible_from`.
+	CtasPublished {
+		tenant: TenantId,
+		object: crate::schema::TableObjectId,
+		visible_from: u64,
+		replayed: bool,
+	},
+	CtasAbandoned {
+		cause: ctas::CtasAbandonCause,
+		at: u64,
+		replayed: bool,
+	},
+	CtasConflict {
+		at: u64,
+		replayed: bool,
+	},
+	/// Wendelon ADR 0120 D9: the chain's record was pruned.
+	CtasPruned {
+		tenant: TenantId,
+		op: [u8; 16],
+	},
 }
 
 /// What a retry of `key` with `request_digest` learns. Pure over state.
@@ -1120,6 +1214,9 @@ pub struct DecisionState {
 	/// ADR 0108 (wendelon): secondary-index receipts by (tenant, index), per
 	/// phase, keyed by the reporting store.
 	index_receipts: BTreeMap<(TenantId, crate::schema::IndexObjectId), IndexReceipts>,
+	/// Wendelon ADR 0120: CREATE TABLE AS SELECT chains, retired object ids and
+	/// publication boundaries.
+	ctas: ctas::CtasState,
 	/// Wendelon ADR 0113: the table each retained TABLE key's operation identity
 	/// (tenant, client UUID, sequence) is recorded under. A table operation identity
 	/// is tenant-wide across tables. Derived from `keys`: never serialized, rebuilt
@@ -1153,6 +1250,7 @@ impl Default for DecisionState {
 			hold: None,
 			instances: instances::InstanceState::default(),
 			index_receipts: BTreeMap::new(),
+			ctas: ctas::CtasState::default(),
 			table_operations: BTreeMap::new(),
 			live_by_table: BTreeMap::new(),
 		}
@@ -1160,6 +1258,11 @@ impl Default for DecisionState {
 }
 
 impl DecisionState {
+	/// Wendelon ADR 0120: the CTAS chains.
+	pub fn ctas(&self) -> &ctas::CtasState {
+		&self.ctas
+	}
+
 	/// ADR 0736: the backup hold's token, if one is held.
 	pub fn backup_hold(&self) -> Option<(u128, u64)> {
 		self.hold
@@ -2557,7 +2660,44 @@ pub(crate) fn apply(
 	let Some(mut decisions) = state.decisions.take() else {
 		return DecisionResult::Refused(DecisionRefusal::ModeToday);
 	};
-	let result = reduce(state, &mut decisions, command, log_index);
+	// Wendelon ADR 0120: Begin, Publish and Conclude change the catalog too; they
+	// run with the whole state, their fallible catalog step before any decision
+	// change, so a refusal changes nothing.
+	let result = match command {
+		DecisionCommand::CtasBegin { begin } => ctas::apply_begin(state, &mut decisions, &begin),
+		DecisionCommand::CtasPublish {
+			tenant,
+			op,
+			epoch,
+			owner,
+			stamp_ms,
+		} => ctas::apply_publish(
+			state,
+			&mut decisions,
+			tenant,
+			op,
+			epoch,
+			&owner,
+			stamp_ms,
+			log_index,
+		),
+		DecisionCommand::CtasConclude {
+			tenant,
+			op,
+			epoch,
+			stamp_ms,
+		} => ctas::apply_conclude(
+			state,
+			&mut decisions,
+			tenant,
+			op,
+			epoch,
+			stamp_ms,
+			log_index,
+		),
+		command => Ok(reduce(state, &mut decisions, command, log_index)),
+	}
+	.unwrap_or_else(DecisionResult::Refused);
 	state.decisions = Some(decisions);
 	// ADR 0729: the old holder's applied lease goes with its generation.
 	if let DecisionResult::TookOver { range_start, .. } = result {
@@ -2635,6 +2775,37 @@ fn reduce(
 			record_activation(state, decisions, &proof, log_index)
 		}
 		DecisionCommand::IndexReceipt { proof } => record_index_receipt(state, decisions, &proof),
+		// Wendelon ADR 0120: these change the catalog too, so `apply` runs them
+		// with the whole state; they never reach here.
+		DecisionCommand::CtasBegin { .. }
+		| DecisionCommand::CtasPublish { .. }
+		| DecisionCommand::CtasConclude { .. } => {
+			Err(DecisionRefusal::Ctas(ctas::CtasRefusal::WrongPhase))
+		}
+		DecisionCommand::CtasRenew {
+			tenant,
+			op,
+			epoch,
+			owner,
+			stamp_ms,
+		} => ctas::renew(decisions, tenant, op, epoch, &owner, stamp_ms),
+		DecisionCommand::CtasRecover {
+			tenant,
+			op,
+			new_epoch,
+			stamp_ms,
+		} => ctas::recover(decisions, tenant, op, new_epoch, stamp_ms),
+		DecisionCommand::CtasAbandon {
+			tenant,
+			op,
+			epoch,
+			owner,
+			cause,
+			stamp_ms,
+		} => ctas::abandon(
+			decisions, tenant, op, epoch, &owner, cause, stamp_ms, log_index,
+		),
+		DecisionCommand::CtasPrune { tenant, op } => ctas::prune(decisions, tenant, op),
 	};
 	outcome.unwrap_or_else(DecisionResult::Refused)
 }
@@ -3035,6 +3206,12 @@ fn validate_claim(
 		return Err(TenantNotWritable);
 	}
 	match claim.key.namespace {
+		// Wendelon ADR 0120 D4: a CTAS chain's provisional object admits only its
+		// declared chunks, while the chain dispatches; a key a CTAS operation names
+		// is that operation's chunk in every phase, never an ordinary write.
+		ParentNamespace::Table(table) if ctas::is_chunk(decisions, claim, table) => {
+			ctas::admit_first_reserve(decisions, claim, table)?;
+		}
 		ParentNamespace::Table(table) => {
 			if table == crate::schema::TableObjectId::DEFAULT_KV
 				|| state
@@ -3219,6 +3396,17 @@ fn conclude(
 	debug_assert!(!body.status.is_terminal());
 	body.status = status;
 	decisions.live -= 1;
+	// Wendelon ADR 0120 D5: a CTAS chunk's decision is its chain's evidence,
+	// recorded in this same transition.
+	let (key, digest) = {
+		let body = &decisions.bodies[&reservation];
+		(body.claim.key, body.claim.request_digest)
+	};
+	decisions.ctas.note_terminal(
+		&key,
+		digest,
+		matches!(status, ParentStatus::Accepted { .. }),
+	);
 	Ok(DecisionResult::Terminal {
 		reservation,
 		status,
@@ -3554,6 +3742,7 @@ pub(crate) struct DecisionSnapshot {
 #[path = "decisions_tests.rs"]
 pub(crate) mod tests;
 
+pub mod ctas;
 pub mod generations;
 pub mod instances;
 pub use generations::{Certificate, ChunkSum, Generations, ReportBody, Target};

@@ -216,7 +216,7 @@ use table_query::{
 	QueryProjectedExecution, RowGroupFetchAuditCounters, TableQueryResponseStreamWriter,
 };
 pub(crate) mod child_writes;
-mod coordinator;
+pub(crate) mod coordinator;
 mod observation;
 mod write_replication;
 #[cfg(test)]
@@ -7789,6 +7789,9 @@ impl DataRingServer for WendelonDataServer {
 				// hold the whole table-write future by value.
 				Box::pin(self.serve_table_write_stream(&context, frame, stream)).await
 			}
+			MsgType::TABLE_CTAS_CHUNK_WRITE_REQ => {
+				Box::pin(self.serve_ctas_chunk_write_stream(&context, frame, stream)).await
+			}
 			other => Err(Error::new(
 				ErrorKind::Unsupported,
 				format!(
@@ -9318,7 +9321,7 @@ impl WendelonDataServer {
 			metrics().data_ring_write_requests_total.inc();
 			if self.decision_mode != crate::consensus::decision_mode::DecisionMode::Today {
 				// ADR 0727: on the heap, inside the same observed work.
-				return Box::pin(self.coordinate_table_write(meta, payload, early)).await;
+				return Box::pin(self.coordinate_table_write(meta, payload, early, None)).await;
 			}
 			if meta.proxy_hop >= 2 {
 				return Ok((

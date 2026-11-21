@@ -201,6 +201,73 @@ impl WendelonDataServer {
 		Box::pin(self.handle_table_write(&context.actor, frame, early)).await
 	}
 
+	/// Wendelon ADR 0120 D6: an authenticated CTAS chunk write: a table write's
+	/// meta, then the operation (16 bytes) and the owner's secret (32 bytes). The
+	/// same tenant authorization and admission as a table write; the coordinator
+	/// checks the credential against the applied chain before any digest work.
+	/// Its answer is a table write's. The secret is never logged.
+	pub(super) async fn serve_ctas_chunk_write(
+		&self,
+		context: &RequestContext,
+		frame: HrftFrame,
+		early: Option<EarlyAnswer>,
+	) -> std::io::Result<HrftFrame> {
+		const META: usize = std::mem::size_of::<TableWriteRequestMeta>();
+		if frame.meta.len() != META + 16 + 32 {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"TABLE_CTAS_CHUNK_WRITE_REQ meta has the wrong length",
+			));
+		}
+		let meta: TableWriteRequestMeta = bytemuck::pod_read_unaligned(&frame.meta[..META]);
+		let (op, secret) = frame.meta[META..].split_at(16);
+		let dispatch = super::coordinator::CtasDispatch {
+			op: op
+				.try_into()
+				.map_err(|_| Error::from(ErrorKind::InvalidData))?,
+			secret: secret
+				.try_into()
+				.map_err(|_| Error::from(ErrorKind::InvalidData))?,
+		};
+		if self
+			.authorize_actor_for_data(&context.actor, Some(meta.tenant_id), DataOperation::Write)
+			.is_err()
+		{
+			let resp = self.table_write_error_response(
+				&meta,
+				WriteStatus::AUTHORIZATION_FAILED,
+				PbcRejectCode::NONE,
+			);
+			return Ok(self.build_table_write_response_frame(frame.header.stream_id, resp, None));
+		}
+		let _admission =
+			match self.try_admit_table_write_request(&context.actor, Some(meta.tenant_id))? {
+				Ok(admission) => admission,
+				Err(_) => {
+					let resp = self.table_write_error_response(
+						&meta,
+						WriteStatus::BACKPRESSURED,
+						PbcRejectCode::NONE,
+					);
+					return Ok(self.build_table_write_response_frame(
+						frame.header.stream_id,
+						resp,
+						None,
+					));
+				}
+			};
+		let payload_bytes = frame.arrow_payload.as_ref().ok_or_else(|| {
+			Error::new(
+				ErrorKind::InvalidData,
+				"TABLE_CTAS_CHUNK_WRITE_REQ missing Arrow payload",
+			)
+		})?;
+		let payload = crate::network::ipc::wire_decode_batch(payload_bytes)?;
+		let resp = Box::pin(self.ctas_chunk_write(meta, payload, &dispatch, early)).await?;
+		let resp = self.finalize_table_write_attempt(meta, resp).await?;
+		Ok(self.build_table_write_response_frame(frame.header.stream_id, resp, None))
+	}
+
 	/// A table write on its own stream. The response is written, and the
 	/// stream finished, as soon as the write has an answer. An answer given
 	/// before the write's work has ended (a coordinated write's deadline) does
@@ -215,14 +282,45 @@ impl WendelonDataServer {
 		&self,
 		context: &RequestContext,
 		frame: HrftFrame,
-		mut stream: Box<dyn TransportStream>,
+		stream: Box<dyn TransportStream>,
 	) -> std::io::Result<()> {
 		let stream_id = frame.header.stream_id;
+		self.answer_on_stream(stream_id, stream, |early| {
+			self.serve_table_write(context, frame, Some(early))
+		})
+		.await
+	}
+
+	/// Wendelon ADR 0120 D6: a CTAS chunk write on its own stream, with the same
+	/// bounded early answer and the same draining as a table write.
+	pub(super) async fn serve_ctas_chunk_write_stream(
+		&self,
+		context: &RequestContext,
+		frame: HrftFrame,
+		stream: Box<dyn TransportStream>,
+	) -> std::io::Result<()> {
+		let stream_id = frame.header.stream_id;
+		self.answer_on_stream(stream_id, stream, |early| {
+			self.serve_ctas_chunk_write(context, frame, Some(early))
+		})
+		.await
+	}
+
+	/// A write served by `serve` on its own stream (see `serve_table_write_stream`).
+	async fn answer_on_stream<'a, W>(
+		&'a self,
+		stream_id: u32,
+		mut stream: Box<dyn TransportStream>,
+		serve: impl FnOnce(EarlyAnswer) -> W,
+	) -> std::io::Result<()>
+	where
+		W: std::future::Future<Output = std::io::Result<HrftFrame>> + 'a,
+	{
 		let (early, mut given) = EarlyAnswer::channel();
 		// ADR 0727: pinned on the heap rather than in this frame. The same
 		// future is still polled to its end by this call, joined with the
 		// response and never detached.
-		let mut write = Box::pin(self.serve_table_write(context, frame, Some(early)));
+		let mut write = Box::pin(serve(early));
 		let answer = tokio::select! {
 			biased;
 			// The write ended with its answer: the only response.

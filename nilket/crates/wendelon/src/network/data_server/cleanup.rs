@@ -164,8 +164,7 @@ impl WendelonDataServer {
 			let Some(descriptor) = self
 				.state_machine
 				.read_state(move |state| {
-					super::child_writes::table_descriptor(state, tenant, table, 0)
-						.or_else(|| state.table_schemas.latest_by_id(tenant, table).cloned())
+					super::child_writes::recorded_latest_table_descriptor(state, tenant, table)
 				})
 				.await
 			else {

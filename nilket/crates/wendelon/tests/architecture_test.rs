@@ -12452,7 +12452,13 @@ fn parent_decisions_have_no_producer_and_one_codec() {
 			// proposal the administrative route hands the leader.
 			// Wendelon ADR 0104: the leader's instance grant, the replacement
 			// it opens for the administrative route, and its controller's Done.
-			("decision_proposals.rs", 8),
+			// Wendelon ADR 0120: every CTAS command from the typed proposal the
+			// authenticated route hands the leader is stamped through `stamp`
+			// (S4 r2: Publish, Abandon and Conclude carry the gated stamp too), so
+			// none adds a site here.
+			// Wendelon ADR 0120 D9: the leader's CTAS maintenance (Recover, Conclude
+			// and Prune, stamped from the gated clock in `ctas_step`).
+			("decision_proposals.rs", 9),
 			("raft_storage.rs", 2),
 		]),
 		"decisions are matched in apply and built only by the leader's proposal path"

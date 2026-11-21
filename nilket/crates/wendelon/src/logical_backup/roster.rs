@@ -151,6 +151,15 @@ pub(crate) fn roster_at(
 			what: "a create-table-as-select operation is recorded".into(),
 		});
 	}
+	// Wendelon ADR 0120 D9: a ParentDecisions CTAS still dispatching or recovering
+	// settles only through a binding the hold blocks: refused now. Abandoned and
+	// conflicted objects are retired and never exported; published ones are
+	// ordinary tables.
+	if decisions.ctas().unsettled() {
+		return Err(RosterRefusal::LifecycleNotSettled {
+			what: "a ParentDecisions create-table-as-select is not settled".into(),
+		});
+	}
 
 	// Tables: every live descriptor is the latest one bound to its name.
 	let mut logical_types = Vec::new();

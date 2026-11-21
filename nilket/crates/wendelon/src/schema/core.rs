@@ -955,6 +955,14 @@ impl MsgType {
 	/// of the certified base.
 	pub const TABLE_BASE_FETCH_REQ: Self = Self(0x6E);
 	pub const TABLE_BASE_FETCH_RESP: Self = Self(0x6F);
+	/// Wendelon ADR 0120 D6: an authenticated CTAS chunk write (node-only): a table
+	/// write's meta, then the operation and the owner's secret. Answered with
+	/// `TABLE_WRITE_RESP`.
+	pub const TABLE_CTAS_CHUNK_WRITE_REQ: Self = Self(0x70);
+	/// Wendelon ADR 0120 D6: a CTAS command for the ParentDecisions leader, on the
+	/// authenticated, tenant-bound administrative route.
+	pub const CTAS_DECISION_REQ: Self = Self(0x71);
+	pub const CTAS_DECISION_RESP: Self = Self(0x72);
 
 	// raft internal (openraft RaftNetwork)
 	pub const APPEND_ENTRIES_REQ: Self = Self(0x20);
@@ -1074,6 +1082,9 @@ impl MsgType {
 		Self::INSTANCE_GRANT_RESP,
 		Self::TABLE_BASE_FETCH_REQ,
 		Self::TABLE_BASE_FETCH_RESP,
+		Self::TABLE_CTAS_CHUNK_WRITE_REQ,
+		Self::CTAS_DECISION_REQ,
+		Self::CTAS_DECISION_RESP,
 		Self::APPEND_ENTRIES_REQ,
 		Self::APPEND_ENTRIES_RESP,
 		Self::INSTALL_SNAPSHOT_REQ,
@@ -2626,7 +2637,10 @@ pub const SNAPSHOT_FORMAT_VERSION: u8 = 21;
 ///
 /// Wendelon ADR 0119: 32, whose named AppendOnly tables are written with row
 /// identities by operation and position (31 was wendelon ADR 0118's).
-pub const SNAPSHOT_FORMAT_VERSION_PARENT_DECISIONS: u8 = 32;
+///
+/// Wendelon ADR 0120: 33, whose decision state holds CTAS chains, retired
+/// object ids and publication boundaries (32 was wendelon ADR 0119's).
+pub const SNAPSHOT_FORMAT_VERSION_PARENT_DECISIONS: u8 = 33;
 
 /// Shape of the Control Ring WAL record bodies this build writes, including the
 /// `postcard(Entry<..>)` payload of a log record. ADR 0697 version 6 carries
@@ -2688,7 +2702,10 @@ pub const WAL_FORMAT_VERSION: u8 = 21;
 /// Wendelon ADR 0119: 32. A claim on a named AppendOnly table applies (its rows
 /// bounded, their identities by operation and position); an earlier log is
 /// refused whole (31 was wendelon ADR 0118's).
-pub const WAL_FORMAT_VERSION_PARENT_DECISIONS: u8 = 32;
+///
+/// Wendelon ADR 0120: 33. CTAS chain commands apply; an earlier log is refused
+/// whole (32 was wendelon ADR 0119's).
+pub const WAL_FORMAT_VERSION_PARENT_DECISIONS: u8 = 33;
 
 // Static assertions to ensure all our size calculations remain exactly correct
 const _: () = assert!(std::mem::size_of::<HybridTimestamp>() == 16);

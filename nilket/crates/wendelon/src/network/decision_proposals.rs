@@ -126,6 +126,41 @@ pub(crate) enum Unstamped {
 	TakeOverLineage {
 		takeover: Signed<crate::consensus::decisions::TakeOverBody>,
 	},
+	/// Wendelon ADR 0120: a Begin, a Renew and a Recover take the gated stamp.
+	CtasBegin {
+		begin: CtasBeginRequest,
+	},
+	CtasRenew {
+		tenant: crate::schema::TenantId,
+		op: [u8; 16],
+		epoch: u64,
+		owner: [u8; 32],
+	},
+	CtasRecover {
+		tenant: crate::schema::TenantId,
+		op: [u8; 16],
+		new_epoch: u64,
+	},
+	/// Wendelon ADR 0120 D9: the terminal commands take the gated stamp too: the
+	/// terminal time is the committed clock with it.
+	CtasPublish {
+		tenant: crate::schema::TenantId,
+		op: [u8; 16],
+		epoch: u64,
+		owner: [u8; 32],
+	},
+	CtasAbandon {
+		tenant: crate::schema::TenantId,
+		op: [u8; 16],
+		epoch: u64,
+		owner: [u8; 32],
+		cause: crate::consensus::decisions::ctas::CtasAbandonCause,
+	},
+	CtasConclude {
+		tenant: crate::schema::TenantId,
+		op: [u8; 16],
+		epoch: u64,
+	},
 }
 
 impl Unstamped {
@@ -136,6 +171,71 @@ impl Unstamped {
 			Self::TakeOverLineage { takeover } => {
 				DecisionCommand::TakeOverLineage { takeover, stamp_ms }
 			}
+			Self::CtasBegin { begin } => DecisionCommand::CtasBegin {
+				begin: crate::consensus::decisions::ctas::CtasBegin {
+					tenant: begin.tenant,
+					op: begin.op,
+					fingerprint: begin.fingerprint,
+					descriptor: begin.descriptor,
+					declaration: begin.declaration,
+					dispatch_hash: begin.dispatch_hash,
+					stamp_ms,
+				},
+			},
+			Self::CtasRenew {
+				tenant,
+				op,
+				epoch,
+				owner,
+			} => DecisionCommand::CtasRenew {
+				tenant,
+				op,
+				epoch,
+				owner,
+				stamp_ms,
+			},
+			Self::CtasRecover {
+				tenant,
+				op,
+				new_epoch,
+			} => DecisionCommand::CtasRecover {
+				tenant,
+				op,
+				new_epoch,
+				stamp_ms,
+			},
+			Self::CtasPublish {
+				tenant,
+				op,
+				epoch,
+				owner,
+			} => DecisionCommand::CtasPublish {
+				tenant,
+				op,
+				epoch,
+				owner,
+				stamp_ms,
+			},
+			Self::CtasAbandon {
+				tenant,
+				op,
+				epoch,
+				owner,
+				cause,
+			} => DecisionCommand::CtasAbandon {
+				tenant,
+				op,
+				epoch,
+				owner,
+				cause,
+				stamp_ms,
+			},
+			Self::CtasConclude { tenant, op, epoch } => DecisionCommand::CtasConclude {
+				tenant,
+				op,
+				epoch,
+				stamp_ms,
+			},
 		})
 	}
 }
@@ -176,6 +276,9 @@ pub enum ProposalRefusal {
 	/// ADR 0104 (wendelon): the slot to replace is the leader's own; a lost
 	/// voter is replaced from another member.
 	ReplacesLeader,
+	/// Wendelon ADR 0120 D6: the caller's secret is not the CTAS operation's
+	/// owner's (or no chain exists). Appended.
+	CtasNotOwner,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -205,6 +308,13 @@ pub enum ProposalResponse {
 	Refused(ProposalRefusal),
 	/// The proposal may or may not have committed; ask again.
 	Indeterminate(String),
+	/// Wendelon ADR 0120: a CTAS operation's chain at the leader's read index
+	/// `log_index`, or none, with its object's publication index if published.
+	CtasResolved {
+		chain: Option<Box<crate::consensus::decisions::ctas::CtasChain>>,
+		visible_from: Option<u64>,
+		log_index: u64,
+	},
 	/// ADR 0725: an owner operation committed and applied at `log_index`, with
 	/// the state machine's own answer.
 	OwnerApplied {
@@ -628,6 +738,99 @@ pub(crate) enum BackupHoldProposal {
 	Release { id: u128, entered_at: u64 },
 }
 
+/// Wendelon ADR 0120 D6: a Begin before its stamp: the statement's chosen
+/// declaration, object and owner commitment.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CtasBeginRequest {
+	pub tenant: crate::schema::TenantId,
+	pub op: [u8; 16],
+	pub fingerprint: [u8; 32],
+	pub descriptor: crate::schema::TableSchemaDescriptor,
+	pub declaration: crate::consensus::decisions::ctas::CtasDeclarationBytes,
+	pub dispatch_hash: [u8; 32],
+}
+
+/// Wendelon ADR 0120 D6: a CTAS command as its statement's caller asks for it,
+/// through the authenticated administrative route (which checked the caller's
+/// tenant). An owner command carries the owner's secret; the leader checks it
+/// against the applied chain and proposes a command naming only the commitment.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CtasProposal {
+	Begin(CtasBeginRequest),
+	Renew {
+		tenant: crate::schema::TenantId,
+		op: [u8; 16],
+		epoch: u64,
+		secret: [u8; 32],
+	},
+	Publish {
+		tenant: crate::schema::TenantId,
+		op: [u8; 16],
+		epoch: u64,
+		secret: [u8; 32],
+	},
+	Abandon {
+		tenant: crate::schema::TenantId,
+		op: [u8; 16],
+		epoch: u64,
+		secret: [u8; 32],
+		cause: crate::consensus::decisions::ctas::CtasAbandonCause,
+	},
+	Recover {
+		tenant: crate::schema::TenantId,
+		op: [u8; 16],
+		new_epoch: u64,
+	},
+	Conclude {
+		tenant: crate::schema::TenantId,
+		op: [u8; 16],
+		epoch: u64,
+	},
+	/// The operation's chain, read at the leader after a linearizable read
+	/// barrier: how a statement learns, before running its SELECT, whether its
+	/// operation id is already declared and by which statement and owner.
+	/// Proposes nothing.
+	Resolve {
+		tenant: crate::schema::TenantId,
+		op: [u8; 16],
+	},
+}
+
+impl CtasProposal {
+	/// The tenant the request names; the route checks the caller's against it.
+	pub fn tenant(&self) -> crate::schema::TenantId {
+		match self {
+			Self::Begin(begin) => begin.tenant,
+			Self::Renew { tenant, .. }
+			| Self::Publish { tenant, .. }
+			| Self::Abandon { tenant, .. }
+			| Self::Recover { tenant, .. }
+			| Self::Conclude { tenant, .. }
+			| Self::Resolve { tenant, .. } => *tenant,
+		}
+	}
+}
+
+/// The secret never appears in a log line or a panic message.
+impl std::fmt::Debug for CtasProposal {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		let kind = match self {
+			Self::Begin(_) => "Begin",
+			Self::Renew { .. } => "Renew",
+			Self::Publish { .. } => "Publish",
+			Self::Abandon { .. } => "Abandon",
+			Self::Recover { .. } => "Recover",
+			Self::Conclude { .. } => "Conclude",
+			Self::Resolve { .. } => "Resolve",
+		};
+		f.debug_struct("CtasProposal")
+			.field("kind", &kind)
+			.field("tenant", &self.tenant())
+			.field("secret", &"<redacted>")
+			.finish()
+	}
+}
+
 /// One node's view of the proposal path: the leader side for forwarded
 /// requests, the sender side for its own, and the leader's floor task.
 pub struct DecisionProposals {
@@ -647,6 +850,10 @@ pub struct DecisionProposals {
 	/// held before it is admitted.
 	#[cfg(test)]
 	forwarded_hold: std::sync::Mutex<Option<ForwardedHold>>,
+	/// Test-only (wendelon ADR 0120): pauses the leader's CTAS maintenance, so a
+	/// control can drive Recover, Conclude and the owner's own Publish itself.
+	#[cfg(test)]
+	pub(crate) ctas_maintenance_paused: std::sync::atomic::AtomicBool,
 }
 
 /// Test-only (ADR 0707): holds the leader's handling of the next forwarded
@@ -724,6 +931,8 @@ impl DecisionProposals {
 			last_sent: std::sync::Mutex::new(None),
 			#[cfg(test)]
 			forwarded_hold: std::sync::Mutex::new(None),
+			#[cfg(test)]
+			ctas_maintenance_paused: std::sync::atomic::AtomicBool::new(false),
 		}
 	}
 
@@ -1081,6 +1290,165 @@ impl DecisionProposals {
 		self.commit(WendelonRequest::Decision(command)).await
 	}
 
+	/// Wendelon ADR 0120 D6, leader side: a CTAS command. Not forwarded: the
+	/// caller's request reaches the leader through the authenticated
+	/// administrative route, which checked its tenant; a follower answers with the
+	/// leader hint. An owner command's secret is checked here, against the applied
+	/// chain's commitment, and never enters the command. Begin, Renew and Recover
+	/// take the gated leader clock. The reducer decides everything else.
+	pub(crate) async fn propose_ctas(&self, proposal: CtasProposal) -> ProposalResponse {
+		if self.mode != DecisionMode::ParentDecisions {
+			return ProposalResponse::Refused(ProposalRefusal::ModeToday);
+		}
+		let leader = self.leader_slot().await;
+		if leader != Some(self.local.id) {
+			return ProposalResponse::NotLeader {
+				leader_hint: leader,
+			};
+		}
+		let owner_of = |tenant, op| async move {
+			self.state_machine
+				.read_state(move |state| {
+					state
+						.decisions
+						.as_ref()
+						.and_then(|decisions| decisions.ctas().chain(tenant, op))
+						.map(|chain| chain.dispatch_hash)
+				})
+				.await
+		};
+		let proves = |secret: &[u8; 32], owner: Option<[u8; 32]>| {
+			owner.filter(|owner| *blake3::hash(secret).as_bytes() == *owner)
+		};
+		if let CtasProposal::Resolve { tenant, op } = proposal {
+			return self.resolve_ctas(tenant, op).await;
+		}
+		let admitted = match proposal {
+			CtasProposal::Begin(begin) => Admitted::Unstamped(Unstamped::CtasBegin { begin }),
+			CtasProposal::Renew {
+				tenant,
+				op,
+				epoch,
+				secret,
+			} => match proves(&secret, owner_of(tenant, op).await) {
+				Some(owner) => Admitted::Unstamped(Unstamped::CtasRenew {
+					tenant,
+					op,
+					epoch,
+					owner,
+				}),
+				None => return ProposalResponse::Refused(ProposalRefusal::CtasNotOwner),
+			},
+			CtasProposal::Publish {
+				tenant,
+				op,
+				epoch,
+				secret,
+			} => match proves(&secret, owner_of(tenant, op).await) {
+				Some(owner) => Admitted::Unstamped(Unstamped::CtasPublish {
+					tenant,
+					op,
+					epoch,
+					owner,
+				}),
+				None => return ProposalResponse::Refused(ProposalRefusal::CtasNotOwner),
+			},
+			CtasProposal::Abandon {
+				tenant,
+				op,
+				epoch,
+				secret,
+				cause,
+			} => match proves(&secret, owner_of(tenant, op).await) {
+				Some(owner) => Admitted::Unstamped(Unstamped::CtasAbandon {
+					tenant,
+					op,
+					epoch,
+					owner,
+					cause,
+				}),
+				None => return ProposalResponse::Refused(ProposalRefusal::CtasNotOwner),
+			},
+			CtasProposal::Recover {
+				tenant,
+				op,
+				new_epoch,
+			} => Admitted::Unstamped(Unstamped::CtasRecover {
+				tenant,
+				op,
+				new_epoch,
+			}),
+			CtasProposal::Conclude { tenant, op, epoch } => {
+				Admitted::Unstamped(Unstamped::CtasConclude { tenant, op, epoch })
+			}
+			CtasProposal::Resolve { .. } => unreachable!("answered above"),
+		};
+		let command = match admitted {
+			Admitted::Ready(command) => command,
+			Admitted::Unstamped(unstamped) => {
+				let deadline = tokio::time::Instant::now() + CLOCK_ADMISSION_WAIT;
+				match wait_for_decision_clock(
+					&self.clock_samples.arrived,
+					deadline,
+					|| self.decision_clock_now(),
+					|| async { self.leader_slot().await == Some(self.local.id) },
+				)
+				.await
+				{
+					ClockWait::Stamp(stamp_ms) => unstamped.stamp(stamp_ms),
+					ClockWait::Refused(refusal) => return ProposalResponse::Refused(refusal),
+					ClockWait::NotLeader => {
+						return ProposalResponse::NotLeader {
+							leader_hint: self.leader_slot().await,
+						};
+					}
+				}
+			}
+		};
+		self.commit(command).await
+	}
+
+	/// Wendelon ADR 0120: [`CtasProposal::Resolve`] at the leader: a
+	/// linearizable read barrier, its application here, then the chain.
+	async fn resolve_ctas(
+		&self,
+		tenant: crate::schema::TenantId,
+		op: [u8; 16],
+	) -> ProposalResponse {
+		let index = match self.cut_as_leader().await {
+			CutResponse::Cut(index) => index,
+			CutResponse::NotLeader { leader_hint } => {
+				return ProposalResponse::NotLeader { leader_hint };
+			}
+			CutResponse::Refused(refusal) => return ProposalResponse::Refused(refusal),
+			CutResponse::Indeterminate(why) => return ProposalResponse::Indeterminate(why),
+		};
+		if let Err(error) = self
+			.wait_applied(index, std::time::Duration::from_secs(5))
+			.await
+		{
+			return ProposalResponse::Indeterminate(error.to_string());
+		}
+		let (chain, visible_from) = self
+			.state_machine
+			.read_state(move |state| {
+				let Some(decisions) = state.decisions.as_ref() else {
+					return (None, None);
+				};
+				let chain = decisions.ctas().chain(tenant, op).cloned();
+				let visible_from = chain
+					.as_ref()
+					.and_then(|chain| decisions.ctas().visible_from(tenant, chain.object));
+				(chain.map(Box::new), visible_from)
+			})
+			.await;
+		ProposalResponse::CtasResolved {
+			chain,
+			visible_from,
+			log_index: index,
+		}
+	}
+
 	/// Leader side of a cut: a linearizable read barrier, then its read index.
 	pub(crate) async fn cut_as_leader(&self) -> CutResponse {
 		if self.mode != DecisionMode::ParentDecisions {
@@ -1339,6 +1707,52 @@ impl<'a> MaintenanceProposals<'a> {
 		// a higher floor stays valid, its floor being its own stamp minus the
 		// expiry.
 		Some(self.commit(command).await)
+	}
+
+	/// Wendelon ADR 0120 D9: leader maintenance of CTAS chains (Recover after a
+	/// lapsed owner lease, Conclude while recovering, Prune after retention), at
+	/// the gated clock, with no client traffic. Bounded per call; the reducer
+	/// decides. The number applied without a refusal.
+	pub(crate) async fn ctas_step(&self, limit: usize) -> usize {
+		let proposals = self.proposals;
+		#[cfg(test)]
+		if proposals
+			.ctas_maintenance_paused
+			.load(std::sync::atomic::Ordering::Acquire)
+		{
+			return 0;
+		}
+		if proposals.mode != DecisionMode::ParentDecisions
+			|| proposals.leader_slot().await != Some(proposals.local.id)
+		{
+			return 0;
+		}
+		let Ok(now) = proposals.decision_clock_now().await else {
+			return 0;
+		};
+		let due = proposals
+			.state_machine
+			.read_state(move |state| {
+				state.decisions.as_ref().map_or_else(Vec::new, |decisions| {
+					crate::consensus::decisions::ctas::maintenance_due(decisions, now, limit)
+				})
+			})
+			.await;
+		let mut applied = 0;
+		for command in due {
+			// Replay basis: Recover is answered Recovering or the terminal
+			// answer once applied, Conclude the terminal answer, Prune Unknown;
+			// none changes state twice.
+			match self.commit(WendelonRequest::Decision(command)).await {
+				MaintenanceProposalResult::Stopped => break,
+				MaintenanceProposalResult::Response(ProposalResponse::Applied {
+					outcome: ProposalOutcome::Decision(result),
+					..
+				}) if !matches!(result, DecisionResult::Refused(_)) => applied += 1,
+				MaintenanceProposalResult::Response(_) => {}
+			}
+		}
+		applied
 	}
 
 	/// Proposes Resolve for the reserved parents this node should drive: a bound

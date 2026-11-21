@@ -532,8 +532,9 @@ pub(crate) fn adr542_mutation_producer_census_keeps_ctas_visibly_excluded() {
 	);
 	assert_eq!(
 		rail.matches("deadline: context.deadline").count(),
-		5,
-		"INSERT, INSERT SELECT, UPDATE, CTAS row dispatch and DELETE carry the original deadline"
+		6,
+		"INSERT, INSERT SELECT, UPDATE, CTAS row dispatch, DELETE and the ParentDecisions CTAS \
+		 (wendelon ADR 0120) carry the original deadline"
 	);
 	let ctas_start = rail
 		.find("ExecutionPlan::CreateTableAsSelect")
@@ -569,9 +570,33 @@ pub(crate) fn adr542_resolution_is_a_tenant_scoped_id_lookup_not_statement_repla
 		.map(|offset| arm_start + offset)
 		.expect("execute arm after mutation resolution");
 	let arm = &daemon[arm_start..arm_end];
-	assert!(arm.contains("resolve_mutation_outcome(tenant_id, request.operation_query_id)"));
-	assert!(!arm.contains("SqlPlanner"));
-	assert!(!arm.contains("execute_query"));
+	// Wendelon ADR 0120 (Codex 01a1fc44): the arm resolves through one bounded lookup
+	// sequence, whose reads the coordinator implements; each is an id lookup under
+	// the request's own identity, and none of the three plans or executes a statement.
+	assert!(arm.contains("resolve_operation_outcome("));
+	assert!(arm.contains("request.operation_query_id"));
+	let sequence_start = daemon
+		.find("async fn resolve_operation_outcome(")
+		.expect("the lookup sequence");
+	let sequence_end = daemon[sequence_start..]
+		.find("\n}\n")
+		.map(|offset| sequence_start + offset)
+		.expect("end of the lookup sequence");
+	let sequence = &daemon[sequence_start..sequence_end];
+	assert!(sequence.contains("reads.mutation(tenant_id, operation_query_id)"));
+	let reads_start = daemon
+		.find("impl OutcomeReads for DistributedQueryCoordinator")
+		.expect("the coordinator's reads");
+	let reads_end = daemon[reads_start..]
+		.find("\n}\n")
+		.map(|offset| reads_start + offset)
+		.expect("end of the coordinator's reads");
+	let reads = &daemon[reads_start..reads_end];
+	assert!(reads.contains("self.resolve_mutation_outcome(tenant_id, operation_query_id)"));
+	for part in [arm, sequence, reads] {
+		assert!(!part.contains("SqlPlanner"));
+		assert!(!part.contains("execute_query"));
+	}
 
 	let coordinator =
 		std::fs::read_to_string(manifest_dir().join("src/coordinator.rs")).expect("coordinator");
@@ -610,11 +635,24 @@ pub(crate) fn adr0574_receipt_variant_is_appended_and_carries_its_version_bump()
 		.map(str::trim)
 		.filter(|line| !line.is_empty() && !line.starts_with("//"))
 		.collect();
+	// ADR 574's variant was appended at index 12 and stays there. Wendelon ADR 0120
+	// appends `PdCtasOutcome` after it (Codex 01a1fc48): a ParentDecisions CTAS's
+	// resolution, which a decoder built before it refuses as an unknown discriminant
+	// (pinned in toron-client's boundary tests); `ResolveMutation` has no version axis
+	// to bump, and ADR 574's Rune bump below is unchanged.
+	assert_eq!(
+		declared
+			.iter()
+			.position(|line| *line == "MaterializeOutcome(MaterializeOutcomeResponse),"),
+		Some(12),
+		"ADR 574's variant keeps its appended position"
+	);
 	assert_eq!(
 		declared.last().copied(),
-		Some("MaterializeOutcome(MaterializeOutcomeResponse),"),
-		"ADR 574's variant must be appended at the tail, not inserted"
+		Some("PdCtasOutcome(PdCtasOutcomeResponse),"),
+		"the latest variant is appended at the tail, not inserted"
 	);
+	assert_eq!(declared.len(), 14, "one variant appended since ADR 574");
 	assert_eq!(
 		declared[0], "Execute(ExecuteRequest),",
 		"the first variant's position is what every older peer's decode depends on"

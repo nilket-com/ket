@@ -1774,7 +1774,7 @@ async fn children_naming(cluster: &Cluster, slot: u32) -> Vec<(u64, u16, [u8; 32
 /// the record is repaired as delta. The member stays control-only throughout.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_promoted_replacement_recovers_its_slots_base_and_children() {
-	promoted_replacement_recovers(false).await;
+	promoted_replacement_recovers(false, false).await;
 }
 
 /// Wendelon ADR 0119: the same recovery for a named AppendOnly table whose
@@ -1783,10 +1783,21 @@ async fn a_promoted_replacement_recovers_its_slots_base_and_children() {
 /// is stored on the replacement, rows paired with their certified identities.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_promoted_replacement_recovers_an_append_only_base_with_a_tombstone() {
-	promoted_replacement_recovers(true).await;
+	promoted_replacement_recovers(true, false).await;
 }
 
-async fn promoted_replacement_recovers(append_only: bool) {
+/// Wendelon ADR 0120: the same recovery when the certified base also holds an
+/// abandoned CTAS chain's committed chunk: its object is retired, its
+/// descriptor retained privately; the survivors serve its pages, and the
+/// replacement checks and stores its entries through the private lookup.
+/// It also owes an uncertified, still-dispatching CTAS chunk (begun after the
+/// floor jumps), which it repairs at its real generation (Codex 01a1fad7 §2).
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_promoted_replacement_recovers_a_retained_ctas_chunk_in_its_base() {
+	promoted_replacement_recovers(true, true).await;
+}
+
+async fn promoted_replacement_recovers(append_only: bool, retained_ctas: bool) {
 	let (mut cluster, leader, descriptor) = ready().await;
 	let descriptor = if append_only {
 		let descriptor = super::append_only::append_only_descriptor();
@@ -1825,6 +1836,18 @@ async fn promoted_replacement_recovers(append_only: bool) {
 		meta
 	}
 	let first_write = write(&cluster, &descriptor, now, &[(1, "a"), (2, "b")]).await;
+	// Wendelon ADR 0120: a still-dispatching chunk (private, certifiable) and an
+	// abandoned one (retired, so excluded from the next generation). The
+	// statements' owners drive their chains; maintenance would recover them.
+	let retained = if retained_ctas {
+		super::ctas::pause_ctas_maintenance(&cluster);
+		Some((
+			super::ctas::dispatching_chunk(&cluster).await,
+			super::ctas::retained_chunk(&cluster).await,
+		))
+	} else {
+		None
+	};
 	let first = now + 60_000;
 	jump_floor(&cluster, first).await;
 	until_active(&cluster, 1).await;
@@ -1849,6 +1872,13 @@ async fn promoted_replacement_recovers(append_only: bool) {
 	until_active(&cluster, 2).await;
 	// A write the current certificate does not cover.
 	write(&cluster, &descriptor, second + 1, &[(4, "d")]).await;
+	// Wendelon ADR 0120 (Codex 01a1fad7 §2): an owed private CTAS chunk the
+	// current certificate does not cover.
+	let owed_ctas = if retained_ctas {
+		Some(super::ctas::owed_chunk(&cluster).await)
+	} else {
+		None
+	};
 	let certificate = {
 		let state = cluster.node(leader).state_machine.state_snapshot().await;
 		state
@@ -2039,6 +2069,16 @@ async fn promoted_replacement_recovers(append_only: bool) {
 	);
 	let entries = index.base_entries(false).await.unwrap();
 	assert!(!entries.is_empty(), "the certified base has entries");
+	if let Some((dispatching, abandoned)) = retained {
+		assert!(
+			entries.iter().any(|entry| entry.table == dispatching),
+			"the dispatching CTAS chunk is in the recovered base"
+		);
+		assert!(
+			!entries.iter().any(|entry| entry.table == abandoned),
+			"the abandoned CTAS chunk was excluded from the base"
+		);
+	}
 	for entry in &entries {
 		crate::network::data_server::certification::entry_is_stored(
 			&slab,
@@ -2078,6 +2118,42 @@ async fn promoted_replacement_recovers(append_only: bool) {
 				== crate::storage::index::parent_intents::ParentIntentState::Complete
 				&& intent.content == *content),
 			"child ({rsv}, {ordinal}) held"
+		);
+	}
+	if let Some(key) = owed_ctas {
+		// The owed CTAS chunk's children naming the slot: held on an eligible
+		// survivor, and repaired here (this store's disk was lost) at the
+		// chunk's real generation through the private lookups, Complete.
+		let record = record_of(&cluster, key)
+			.await
+			.expect("the owed chunk's record");
+		assert!(
+			matches!(
+				record.status,
+				crate::consensus::decisions::ParentStatus::Accepted { .. }
+			),
+			"{record:?}"
+		);
+		let ctas_owed: Vec<_> = owed
+			.iter()
+			.filter(|(rsv, _, _)| *rsv == record.rsv)
+			.collect();
+		assert!(!ctas_owed.is_empty(), "the owed CTAS chunk names the slot");
+		let survivor = *NODES.iter().find(|id| **id != lost).unwrap();
+		let peer = cluster.node(survivor).slab.persistent_index().unwrap();
+		for (rsv, ordinal, content) in &ctas_owed {
+			let held = peer.parent_intent(*rsv, *ordinal).await.unwrap();
+			assert!(
+				held.is_some_and(|intent| intent.state
+					== crate::storage::index::parent_intents::ParentIntentState::Complete
+					&& intent.content == *content),
+				"CTAS child ({rsv}, {ordinal}) on survivor {survivor}"
+			);
+		}
+		eprintln!(
+			"ADR0120-S2r2 owed CTAS chunk rsv {} : {} children repaired on the replacement",
+			record.rsv,
+			ctas_owed.len()
 		);
 	}
 

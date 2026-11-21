@@ -957,6 +957,18 @@ impl WendelonDataServer {
 				if state.table_drop_blocks_admission(tenant, table) {
 					return Err(ReadStatus::QUERY_INVALID_PROGRAM);
 				}
+				// Wendelon ADR 0120 D8: a CTAS-published table exists only from its
+				// Publish's log index. Every chunk's Finalize precedes it, so a cut at or
+				// after it proves every row, and an earlier cut sees no table (as for a
+				// provisional id), never a prefix.
+				if state
+					.decisions
+					.as_ref()
+					.and_then(|decisions| decisions.ctas().visible_from(tenant, table))
+					.is_some_and(|from| from > k)
+				{
+					return Err(ReadStatus::QUERY_INVALID_PROGRAM);
+				}
 				let latest = state
 					.table_schemas
 					.latest_by_id(tenant, table)

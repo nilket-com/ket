@@ -524,6 +524,9 @@ where
 		SqlMessage::CtasOutcome(outcome) if outcome.operation_query_id == operation_query_id => {
 			Ok(ResolvedOperationOutcome::Ctas(outcome))
 		}
+		SqlMessage::PdCtasOutcome(outcome) if outcome.operation_query_id == operation_query_id => {
+			Ok(ResolvedOperationOutcome::PdCtas(outcome))
+		}
 		SqlMessage::MutationOutcome(outcome) => Err(ClientError::Protocol(format!(
 			"mutation outcome id {} did not match requested operation {}",
 			outcome.operation_query_id.get(),
@@ -531,6 +534,11 @@ where
 		))),
 		SqlMessage::CtasOutcome(outcome) => Err(ClientError::Protocol(format!(
 			"CTAS outcome id {} did not match requested operation {}",
+			outcome.operation_query_id.get(),
+			operation_query_id.get()
+		))),
+		SqlMessage::PdCtasOutcome(outcome) => Err(ClientError::Protocol(format!(
+			"ParentDecisions CTAS outcome id {} did not match requested operation {}",
 			outcome.operation_query_id.get(),
 			operation_query_id.get()
 		))),
@@ -815,6 +823,65 @@ mod tests {
 		assert_eq!(
 			collect_mutation_outcome(&mut reader, request_id, operation_id).await,
 			Ok(ResolvedOperationOutcome::Ctas(outcome))
+		);
+	}
+
+	/// Wendelon ADR 0120 (Codex 01a1fc48): a ParentDecisions CTAS outcome is accepted
+	/// only on the request's frame and naming the requested operation.
+	#[tokio::test]
+	async fn the_parent_decisions_outcome_checks_both_frame_and_operation_ids() {
+		let request_id = QueryId::from_u128(15);
+		let operation_id = QueryId::from_u128(16);
+		let outcome = crate::protocol::PdCtasOutcomeResponse {
+			operation_query_id: operation_id,
+			table_object_id: [0xC7; 16],
+			epoch: 1,
+			state: crate::protocol::PdCtasState::Published,
+			declared_chunks: 2,
+			declared_rows: 8,
+			accepted_chunks: 2,
+			accepted_rows: 8,
+			refused_chunks: 0,
+			publication_commit_knowledge: MutationCommitKnowledge::Committed,
+			publication_cause: None,
+		};
+		let mut reader = framed_bytes(&[SqlFrame::response(
+			request_id,
+			SqlMessage::PdCtasOutcome(outcome),
+		)])
+		.await;
+		assert_eq!(
+			collect_mutation_outcome(&mut reader, request_id, operation_id).await,
+			Ok(ResolvedOperationOutcome::PdCtas(outcome))
+		);
+
+		let mut other_operation = framed_bytes(&[SqlFrame::response(
+			request_id,
+			SqlMessage::PdCtasOutcome(crate::protocol::PdCtasOutcomeResponse {
+				operation_query_id: QueryId::from_u128(17),
+				..outcome
+			}),
+		)])
+		.await;
+		assert!(
+			collect_mutation_outcome(&mut other_operation, request_id, operation_id)
+				.await
+				.unwrap_err()
+				.to_string()
+				.contains("did not match requested operation")
+		);
+
+		let mut other_frame = framed_bytes(&[SqlFrame::response(
+			QueryId::from_u128(18),
+			SqlMessage::PdCtasOutcome(outcome),
+		)])
+		.await;
+		assert!(
+			collect_mutation_outcome(&mut other_frame, request_id, operation_id)
+				.await
+				.unwrap_err()
+				.to_string()
+				.contains("did not match request")
 		);
 	}
 

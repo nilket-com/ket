@@ -100,6 +100,21 @@ async fn send_request(client: &mut PipeStream, meta: &TableWriteRequestMeta, bat
 	client.shutdown().await.unwrap();
 }
 
+/// Wendelon ADR 0120: the client's and the server's ends of an in-memory stream.
+pub(super) fn pipe_pair() -> (PipeStream, PipeStream) {
+	let (client, server) = tokio::io::duplex(64 * 1024);
+	(
+		PipeStream {
+			inner: client,
+			writes_fail: false,
+		},
+		PipeStream {
+			inner: server,
+			writes_fail: false,
+		},
+	)
+}
+
 /// The two ends of a request stream: the client's, with the request already
 /// written and finished, and the server's.
 async fn request_stream(

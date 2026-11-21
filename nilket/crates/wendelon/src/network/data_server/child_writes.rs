@@ -593,8 +593,9 @@ pub(crate) fn plan_child_keyed(
 			return Err(ChildRefusal::LeaseMissing);
 		}
 	}
-	let descriptor = table_descriptor(state, claim.key.tenant, table, meta.schema_generation)
-		.ok_or(ChildRefusal::SchemaUnknown)?;
+	let descriptor =
+		recorded_table_descriptor(state, claim.key.tenant, table, meta.schema_generation)
+			.ok_or(ChildRefusal::SchemaUnknown)?;
 	// ADR 0699 S4b, wendelon ADR 0112: a delete child's versions are derived from
 	// the recorded claim; its payload only names its rows, which must be exactly
 	// the claim's matched rows in this child's range, in identity order.
@@ -749,6 +750,85 @@ pub(crate) fn table_descriptor(
 			.and_then(Result::ok);
 	}
 	state.table_schemas.get(tenant, table, generation).cloned()
+}
+
+/// Wendelon ADR 0120 D4: the descriptor a recorded claim, a stored or certified
+/// version, or a replacement's page names. The public lookup or, only for an
+/// object a CTAS chain routes or retired, its provisional (retained) descriptor,
+/// whatever the chain's phase. New traffic's admission, reads and export use the
+/// public lookup, which hides provisional ids.
+pub(crate) fn recorded_table_descriptor(
+	state: &SmState,
+	tenant: TenantId,
+	table: TableObjectId,
+	generation: u64,
+) -> Option<TableSchemaDescriptor> {
+	table_descriptor(state, tenant, table, generation).or_else(|| {
+		ctas_private(state, tenant, table)
+			.then(|| {
+				state
+					.table_schemas
+					.get_including_provisional(tenant, table, generation)
+					.cloned()
+			})
+			.flatten()
+	})
+}
+
+/// [`recorded_table_descriptor`] at the table's latest generation.
+pub(crate) fn recorded_latest_table_descriptor(
+	state: &SmState,
+	tenant: TenantId,
+	table: TableObjectId,
+) -> Option<TableSchemaDescriptor> {
+	table_descriptor(state, tenant, table, 0)
+		.or_else(|| state.table_schemas.latest_by_id(tenant, table).cloned())
+		.or_else(|| {
+			ctas_private(state, tenant, table)
+				.then(|| {
+					state
+						.table_schemas
+						.latest_by_id_including_provisional(tenant, table)
+						.cloned()
+				})
+				.flatten()
+		})
+}
+
+/// Wendelon ADR 0120 D6: an authenticated CTAS chunk dispatch's descriptor and its
+/// chain's immutable declaration: only when the operation's chain is over
+/// `table`, the key's client id is the operation, and the credential's
+/// commitment is the winning owner's. In any phase: a recorded chunk's lost
+/// acknowledgement replays after Publish or Abandon; a new chunk is refused
+/// outside `Dispatching` by the coordinator and the reducer.
+pub(crate) fn ctas_dispatch_descriptor(
+	state: &SmState,
+	tenant: TenantId,
+	table: TableObjectId,
+	generation: u64,
+	op: [u8; 16],
+	key_uuid: [u8; 16],
+	owner: [u8; 32],
+) -> Option<(
+	TableSchemaDescriptor,
+	Vec<crate::consensus::decisions::ctas::ChunkDecl>,
+)> {
+	let chain = state.decisions.as_ref()?.ctas().chain(tenant, op)?;
+	let authorized = chain.object == table && key_uuid == op && chain.dispatch_hash == owner;
+	if !authorized {
+		return None;
+	}
+	let declared = chain.chunks.clone();
+	recorded_table_descriptor(state, tenant, table, generation)
+		.map(|descriptor| (descriptor, declared))
+}
+
+/// An object a CTAS chain routes or retired: its descriptor is private.
+fn ctas_private(state: &SmState, tenant: TenantId, table: TableObjectId) -> bool {
+	state
+		.decisions
+		.as_ref()
+		.is_some_and(|decisions| decisions.ctas().claims_object(tenant, table))
 }
 
 /// The recorded status of reservation `rsv`, read from the applied state.
@@ -1476,6 +1556,9 @@ pub(crate) struct ChildHold {
 pub(crate) enum PauseStage {
 	/// After the lookup found the key absent and eligible.
 	AfterAbsent,
+	/// Wendelon ADR 0120: a CTAS chunk after its coordinator saw the chain
+	/// dispatching and built its claim, before its Reserve.
+	AfterCtasPhase,
 	/// After a Reserve answer, before the record is read again.
 	AfterReserve,
 	/// After the children are written, before Finalize.
@@ -1621,7 +1704,7 @@ impl DecisionPeer {
 	/// answers a typed unsupported. The cancellation of an in-flight table query is
 	/// served by its existing authorized handler and registry.
 	pub(crate) fn opens(&self, msg_type: u8) -> bool {
-		const SERVED: [MsgType; 12] = [
+		const SERVED: [MsgType; 13] = [
 			MsgType::TABLE_QUERY_CANCEL_REQ,
 			MsgType::MUTATION_OUTCOME_REQ,
 			MsgType::MUTATION_OUTCOME_PIN_REQ,
@@ -1634,6 +1717,8 @@ impl DecisionPeer {
 			MsgType::WRITE_REQ,
 			MsgType::READ_REQ,
 			MsgType::TABLE_DELETE_REQ,
+			// Wendelon ADR 0120 D6.
+			MsgType::TABLE_CTAS_CHUNK_WRITE_REQ,
 		];
 		SERVED.iter().any(|served| served.0 == msg_type)
 	}
@@ -1737,11 +1822,28 @@ impl WendelonDataServer {
 		&self.decisions
 	}
 
+	/// Test-only (wendelon ADR 0120): pauses or resumes this node's CTAS
+	/// maintenance.
+	#[cfg(test)]
+	pub(crate) fn pause_ctas_maintenance_for_test(&self, paused: bool) {
+		if let Some(proposals) = &self.decisions.proposals {
+			proposals
+				.ctas_maintenance_paused
+				.store(paused, std::sync::atomic::Ordering::Release);
+		}
+	}
+
 	/// Test-only: the lease ranges this node holds now, as a holder sees them
 	/// (`(low, high, epoch)`).
 	#[cfg(test)]
 	pub(crate) async fn held_leases_for_test(&self) -> Vec<(u64, u64, u64)> {
 		self.lease_source()().await
+	}
+
+	/// Test-only: drops every pause queued at this node, reached or not.
+	#[cfg(test)]
+	pub(crate) fn clear_pauses_for_test(&self) {
+		self.decisions.pauses.lock().unwrap().clear();
 	}
 
 	/// Test-only: queue a pause in this node's coordinator.
@@ -2662,48 +2764,11 @@ pub(crate) fn decode_identities(
 		.collect())
 }
 
-/// Wendelon ADR 0119 D5 (Codex 01a1f9ca): the column representations whose
-/// repair answer is bounded by its write. A flat column's values and offsets
-/// are the same bytes however its rows were assembled: `take` of the write's
-/// rows and the server's concatenation of individually stored rows produce
-/// equal value and offset buffers, and differ at most by one validity bitmap.
-/// Dictionary, view, nested and union columns are not flat (their concatenation
-/// can merge or repeat dictionaries and views). This is a necessary condition
-/// only, wider than what a table admits: admission enforces the ADR's declared
-/// set, [`parent_decisions_append_only_column`], which is a subset of it.
-pub(crate) fn repair_bounded_column(data_type: &arrow::datatypes::DataType) -> bool {
-	use arrow::datatypes::DataType as T;
-	matches!(
-		data_type,
-		T::Null
-			| T::Boolean
-			| T::Int8 | T::Int16
-			| T::Int32
-			| T::Int64
-			| T::UInt8
-			| T::UInt16
-			| T::UInt32
-			| T::UInt64
-			| T::Float16
-			| T::Float32
-			| T::Float64
-			| T::Decimal32(..)
-			| T::Decimal64(..)
-			| T::Decimal128(..)
-			| T::Decimal256(..)
-			| T::Date32
-			| T::Date64
-			| T::Time32(_)
-			| T::Time64(_)
-			| T::Timestamp(..)
-			| T::Duration(_)
-			| T::Interval(_)
-			| T::Binary
-			| T::LargeBinary
-			| T::Utf8 | T::LargeUtf8
-			| T::FixedSizeBinary(_)
-	)
-}
+/// Wendelon ADR 0119 D5 / ADR 0120 D3: the declared-type predicates live with
+/// the schema (Begin checks them at apply); re-exported for the write paths.
+pub(crate) use crate::schema::table::parent_decisions_append_only_schema;
+#[cfg(test)]
+pub(crate) use crate::schema::table::repair_bounded_column;
 
 /// The IPC body alignment of `encode_batch` (`IpcWriteOptions::default()`).
 pub(crate) const IPC_BUFFER_ALIGNMENT: usize = 64;
@@ -2724,52 +2789,4 @@ pub(crate) fn repair_rows_bound(write_bytes: usize, columns: usize, rows: usize)
 		.div_ceil(8)
 		.checked_next_multiple_of(IPC_BUFFER_ALIGNMENT)?;
 	columns.checked_mul(bitmap)?.checked_add(write_bytes)
-}
-
-/// Wendelon ADR 0119 D5 (Codex 01a1fa16): the column types a named
-/// ParentDecisions AppendOnly table admits, the ADR's declared set. Each is
-/// flat ([`repair_bounded_column`], so its repair answer is bounded) and has a
-/// canonical row encoding (`storage::content_hash`). `Null`, `Float16` and
-/// `FixedSizeBinary` are flat but have none; the canonical encoding skips a null
-/// cell before its type check, so they are refused here, by the schema, before
-/// any identity, whatever the payload.
-pub(crate) fn parent_decisions_append_only_column(data_type: &arrow::datatypes::DataType) -> bool {
-	use arrow::datatypes::DataType as T;
-	matches!(
-		data_type,
-		T::Boolean
-			| T::Int8 | T::Int16
-			| T::Int32
-			| T::Int64
-			| T::UInt8
-			| T::UInt16
-			| T::UInt32
-			| T::UInt64
-			| T::Float32
-			| T::Float64
-			| T::Decimal32(..)
-			| T::Decimal64(..)
-			| T::Decimal128(..)
-			| T::Decimal256(..)
-			| T::Date32
-			| T::Date64
-			| T::Time32(_)
-			| T::Time64(_)
-			| T::Timestamp(..)
-			| T::Duration(_)
-			| T::Interval(_)
-			| T::Utf8 | T::LargeUtf8
-			| T::Binary
-			| T::LargeBinary
-	) && repair_bounded_column(data_type)
-}
-
-/// Every user column of `descriptor` is [`parent_decisions_append_only_column`].
-pub(crate) fn parent_decisions_append_only_schema(descriptor: &TableSchemaDescriptor) -> bool {
-	descriptor.arrow_schema().is_ok_and(|schema| {
-		schema
-			.fields()
-			.iter()
-			.all(|field| parent_decisions_append_only_column(field.data_type()))
-	})
 }

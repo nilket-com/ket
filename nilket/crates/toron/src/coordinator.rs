@@ -883,6 +883,22 @@ where
 			.map_err(QueryError::Catalog)
 	}
 
+	/// Wendelon ADR 0120: the ParentDecisions chain of CTAS operation
+	/// `operation_query_id` in `tenant_id`, read at the leader after a linearizable
+	/// barrier (a read: no proposal, no recovery), or none.
+	pub async fn resolve_pd_ctas_outcome(
+		&self,
+		tenant_id: TenantId,
+		operation_query_id: QueryId,
+	) -> Result<Option<wendelon_client::CtasChain>, QueryError> {
+		self.catalog
+			.clone()
+			.scoped(tenant_id)
+			.resolve_pd_ctas(*operation_query_id.get().as_bytes())
+			.await
+			.map_err(QueryError::Catalog)
+	}
+
 	pub async fn execute_query_with_context_and_config(
 		&self,
 		plan: &LogicalPlan,
@@ -3697,7 +3713,29 @@ async fn execute_write_plan_with_source(
 				});
 			}
 			let composite_id = wendelon_client::CtasOperationId::new(operation_id.client_uuid);
-			if let Some(existing_saga) = catalog.resolve_ctas_saga(composite_id).await? {
+			// Wendelon ADR 0120: the authority's definitive, pre-proposal
+			// wrong-mode answer, and only it, selects the decision chain.
+			let existing = match catalog.resolve_ctas_saga(composite_id).await {
+				Err(CatalogError::CtasUnderParentDecisions) => {
+					return Box::pin(execute_pd_ctas(PdCtasStatement {
+						catalog,
+						source_executor,
+						logical_types: &logical_types,
+						table,
+						schema,
+						fingerprint: intent_fingerprint.into_bytes(),
+						if_not_exists: *if_not_exists,
+						or_replace: *or_replace,
+						materialize: materialization_certificate.is_some(),
+						source,
+						op: operation_id.client_uuid,
+						deadline: context.deadline,
+					}))
+					.await;
+				}
+				resolved => resolved?,
+			};
+			if let Some(existing_saga) = existing {
 				if existing_saga.intent_fingerprint != *intent_fingerprint {
 					return Err(QueryError::Internal {
 						message: "query id was reused for a different CTAS intent".to_string(),
@@ -4068,6 +4106,174 @@ async fn execute_write_plan_with_source(
 			message: format!("execute_write_plan called with non-DML plan: {other:?}"),
 		}),
 	}
+}
+
+/// Wendelon ADR 0120: one CTAS statement under ParentDecisions.
+struct PdCtasStatement<'a> {
+	catalog: &'a dyn Catalog,
+	source_executor: &'a dyn MutationSourceExecutor,
+	logical_types: &'a crate::ir::LogicalTypeRegistry,
+	table: &'a crate::catalog::TableRef,
+	schema: &'a arrow::datatypes::SchemaRef,
+	fingerprint: [u8; 32],
+	if_not_exists: bool,
+	or_replace: bool,
+	materialize: bool,
+	source: &'a ExecutionPlan,
+	op: [u8; 16],
+	/// The originating caller's absolute deadline.
+	deadline: Option<std::time::Instant>,
+}
+
+/// Wendelon ADR 0120: a CTAS under ParentDecisions. OR REPLACE and MATERIALIZE
+/// are refused before any effect. The operation's chain is resolved before the
+/// SELECT runs: an operation already declared is never re-run (a changed source
+/// cannot redeclare it); the same statement adopts its status, another statement
+/// is refused. Then the bound-name checks, the SELECT, and the decision chain.
+async fn execute_pd_ctas(statement: PdCtasStatement<'_>) -> Result<Vec<RecordBatch>, QueryError> {
+	let PdCtasStatement {
+		catalog,
+		source_executor,
+		logical_types,
+		table,
+		schema,
+		fingerprint,
+		if_not_exists,
+		or_replace,
+		materialize,
+		source,
+		op,
+		deadline,
+	} = statement;
+	if or_replace || materialize {
+		return Err(QueryError::Internal {
+			message: "CREATE OR REPLACE TABLE AS SELECT and MATERIALIZE are refused under \
+			          ParentDecisions"
+				.to_string(),
+		});
+	}
+	if let Some(chain) = catalog.resolve_pd_ctas(op).await? {
+		return pd_ctas_adopt(catalog, chain, fingerprint, table, schema, if_not_exists).await;
+	}
+	match catalog.resolve_table(table).await {
+		// The binding may be this operation's own publication, by a concurrent run
+		// of the same statement under the same id after the resolve above: the
+		// operation is resolved again, authoritatively, before the binding answers.
+		// Absent then, the binding is independent and is judged as captured.
+		Ok(existing) => {
+			if let Some(chain) = catalog.resolve_pd_ctas(op).await? {
+				return pd_ctas_adopt(catalog, chain, fingerprint, table, schema, if_not_exists)
+					.await;
+			}
+			return pd_ctas_judge_binding(&existing, table, schema, if_not_exists);
+		}
+		Err(CatalogError::TableNotFound { .. }) => {}
+		Err(error) => return Err(error.into()),
+	}
+	let source_batches = source_executor.execute_read_plan(source).await?;
+	let target_columns = (0..schema.fields().len())
+		.map(|index| ColumnOrdinal(u32::try_from(index).expect("column ordinal overflow")))
+		.collect::<Vec<_>>();
+	let payload =
+		match write::materialize_ctas_select_batch(schema, &target_columns, &source_batches)? {
+			Some(payload) => payload,
+			None => write::materialize_empty_record_batch(schema)?,
+		};
+	write::validate_refined_logical_columns("CTAS", logical_types, &payload)?;
+	// An empty result declares no chunk.
+	let chunks = write::plan_materialization_write_chunks(&payload)?
+		.into_iter()
+		.filter(|chunk| chunk.num_rows() > 0)
+		.collect();
+	// The caller's deadline, checked after the SELECT and before any Begin.
+	if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+		return Err(QueryError::Internal {
+			message: "CTAS deadline elapsed before Begin".to_string(),
+		});
+	}
+	match catalog
+		.run_pd_ctas(crate::catalog::PdCtasRequest {
+			op,
+			fingerprint,
+			name: table.clone(),
+			schema: schema.clone(),
+			chunks,
+			deadline,
+			renew_every: crate::catalog::PD_CTAS_RENEW_EVERY,
+		})
+		.await?
+	{
+		crate::catalog::PdCtasOutcome::Published
+		| crate::catalog::PdCtasOutcome::AdoptedPublished => Ok(Vec::new()),
+		crate::catalog::PdCtasOutcome::NameBound => {
+			pd_ctas_name_bound(catalog, table, schema, if_not_exists).await
+		}
+	}
+}
+
+/// The operation is declared: the same statement adopts its status (it never
+/// runs again); another statement under the id is refused.
+async fn pd_ctas_adopt(
+	catalog: &dyn Catalog,
+	chain: wendelon_client::CtasChain,
+	fingerprint: [u8; 32],
+	table: &crate::catalog::TableRef,
+	schema: &arrow::datatypes::SchemaRef,
+	if_not_exists: bool,
+) -> Result<Vec<RecordBatch>, QueryError> {
+	if chain.fingerprint != fingerprint {
+		return Err(QueryError::Internal {
+			message: "query id was reused for a different CTAS intent".to_string(),
+		});
+	}
+	match chain.phase {
+		wendelon_client::CtasPhase::Published { .. } => Ok(Vec::new()),
+		wendelon_client::CtasPhase::Conflict { .. } => {
+			pd_ctas_name_bound(catalog, table, schema, if_not_exists).await
+		}
+		wendelon_client::CtasPhase::Abandoned { .. } => Err(QueryError::Internal {
+			message: "this CTAS operation was abandoned unpublished; run it as a new statement"
+				.to_string(),
+		}),
+		_ => Err(QueryError::Internal {
+			message: "this CTAS operation is still in progress".to_string(),
+		}),
+	}
+}
+
+/// The target name was bound by another statement (at Begin, or as a conflict at
+/// Publish): judged on its binding now.
+async fn pd_ctas_name_bound(
+	catalog: &dyn Catalog,
+	table: &crate::catalog::TableRef,
+	schema: &arrow::datatypes::SchemaRef,
+	if_not_exists: bool,
+) -> Result<Vec<RecordBatch>, QueryError> {
+	let existing = catalog.resolve_table(table).await?;
+	pd_ctas_judge_binding(&existing, table, schema, if_not_exists)
+}
+
+/// An independent binding: IF NOT EXISTS succeeds on the same schema; otherwise
+/// refused.
+fn pd_ctas_judge_binding(
+	existing: &crate::catalog::TableBinding,
+	table: &crate::catalog::TableRef,
+	schema: &arrow::datatypes::SchemaRef,
+	if_not_exists: bool,
+) -> Result<Vec<RecordBatch>, QueryError> {
+	if !if_not_exists {
+		return Err(CatalogError::TableAlreadyExists {
+			table: query_table_name(table),
+		}
+		.into());
+	}
+	if existing.schema.as_ref() == schema.as_ref() {
+		return Ok(Vec::new());
+	}
+	Err(CatalogError::SchemaMismatch {
+		table: query_table_name(table),
+	}
+	.into())
 }
 
 fn mutation_operation_id(

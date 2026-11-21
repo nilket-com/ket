@@ -113,7 +113,7 @@ fn fetch_source_check(
 	if current(local.node) != Some(local.incarnation) || !named {
 		return Err(ChildRefusal::NotInPlan);
 	}
-	let descriptor = super::child_writes::table_descriptor(
+	let descriptor = super::child_writes::recorded_table_descriptor(
 		state,
 		body.claim.key.tenant,
 		table,

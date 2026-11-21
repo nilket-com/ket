@@ -333,6 +333,10 @@ pub enum CtasSagaReject {
 	/// [`MATERIALIZATION_CERTIFICATE_MAX_BYTES`]; the materialization refuses
 	/// whole, before any row is dispatched.
 	CertificateTooLarge,
+	/// Wendelon ADR 0120: the receiving authority runs ParentDecisions, where a
+	/// CTAS is a decision chain (`CTAS_DECISION_REQ`). Refused before proposal and
+	/// at apply; nothing is recorded. Appended.
+	WrongDecisionMode,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -368,6 +372,7 @@ impl CtasSagaReject {
 			Self::OwnerLeaseStillLive => "owner_lease_still_live",
 			Self::InvalidTransition => "invalid_transition",
 			Self::CertificateTooLarge => "certificate_too_large",
+			Self::WrongDecisionMode => "wrong_decision_mode",
 		}
 	}
 
@@ -385,6 +390,7 @@ impl CtasSagaReject {
 			"owner_lease_still_live" => Self::OwnerLeaseStillLive,
 			"invalid_transition" => Self::InvalidTransition,
 			"certificate_too_large" => Self::CertificateTooLarge,
+			"wrong_decision_mode" => Self::WrongDecisionMode,
 			_ => return None,
 		})
 	}

@@ -20,7 +20,8 @@ use crate::consensus::decisions::{
 	ParentNamespace, ParentStatus, Signed, Signer,
 };
 use crate::network::decision_proposals::{
-	ForwardedDecision, LookupRequest, LookupResponse, ProposalOutcome, ProposalResponse,
+	CutResponse, ForwardedDecision, LookupRequest, LookupResponse, ProposalOutcome,
+	ProposalResponse,
 };
 use std::collections::BTreeMap;
 
@@ -451,6 +452,7 @@ impl WendelonDataServer {
 		meta: TableWriteRequestMeta,
 		batch: RecordBatch,
 		early: Option<EarlyAnswer>,
+		dispatch: Option<&CtasDispatch>,
 	) -> std::io::Result<(TableWriteResponseMeta, Option<FinalizationMarker>)> {
 		let namespace = ParentNamespace::Table(meta.table_object_id);
 		if meta.table_object_id == crate::schema::TableObjectId::DEFAULT_KV {
@@ -464,7 +466,7 @@ impl WendelonDataServer {
 		let settled = answer_by_deadline(
 			&gate,
 			// ADR 0727: on the heap; the deadline wrapper polls the same future.
-			Box::pin(self.coordinate(namespace, &meta, &batch, &gate)),
+			Box::pin(self.coordinate(namespace, &meta, &batch, &gate, dispatch)),
 			|| {
 				let response = self.settled_response(&meta, Settled::Deadline);
 				if let Some(early) = early {
@@ -528,6 +530,7 @@ impl WendelonDataServer {
 				&table_meta,
 				&payload,
 				&AttemptGate::unbounded(),
+				None,
 			)
 			.await;
 		self.settled_response(&table_meta, settled).write
@@ -545,6 +548,7 @@ impl WendelonDataServer {
 		meta: &TableWriteRequestMeta,
 		batch: &RecordBatch,
 		gate: &AttemptGate,
+		dispatch: Option<&CtasDispatch>,
 	) -> Settled {
 		let stalled = Settled::Indeterminate(WriteStatus::WRITE_STALLED);
 		let (Some(proposals), Some(signer)) = (
@@ -555,14 +559,46 @@ impl WendelonDataServer {
 		};
 		let (tenant, table, generation) =
 			(meta.tenant_id, meta.table_object_id, meta.schema_generation);
-		let Some(descriptor) = self
-			.state_machine
-			.read_state(move |state| {
-				super::child_writes::table_descriptor(state, tenant, table, generation)
-			})
-			.await
-		else {
-			return Settled::Refused(WriteStatus::INTERNAL_ERROR);
+		// Wendelon ADR 0120 D6: an authenticated CTAS chunk dispatch may use its
+		// chain's private descriptor, and only after the applied chain proves the
+		// credential; every other write sees the public lookup, which hides
+		// provisional ids.
+		let credential =
+			dispatch.map(|dispatch| (dispatch.op, *blake3::hash(&dispatch.secret).as_bytes()));
+		let key_uuid = meta.parent_write_id.client_uuid;
+		let lookup = || {
+			self.state_machine
+				.read_state(move |state| match credential {
+					None => super::child_writes::table_descriptor(state, tenant, table, generation)
+						.map(|descriptor| (descriptor, None)),
+					Some((op, owner)) => super::child_writes::ctas_dispatch_descriptor(
+						state, tenant, table, generation, op, key_uuid, owner,
+					)
+					.map(|(descriptor, declared)| (descriptor, Some(declared))),
+				})
+		};
+		let mut found = lookup().await;
+		if found.is_none() && credential.is_some() {
+			// This coordinator may not yet have applied the Begin the leader
+			// answered: a linearizable cut, its application here, and a second
+			// look. Absent after that is absent; a cut that fails is no answer.
+			let CutResponse::Cut(k) = proposals.cut().await else {
+				return stalled;
+			};
+			if proposals.wait_applied(k, CTAS_CATCH_UP).await.is_err() {
+				return stalled;
+			}
+			found = lookup().await;
+		}
+		let Some((descriptor, declared)) = found else {
+			// A chunk whose credential does not prove the owner of a chain over
+			// this table and key, at a cut after its caller's Begin, is not the
+			// owner's; nothing is reserved.
+			return Settled::Refused(if credential.is_some() {
+				WriteStatus::AUTHORIZATION_FAILED
+			} else {
+				WriteStatus::INTERNAL_ERROR
+			});
 		};
 		let key = ParentKey {
 			tenant,
@@ -590,6 +626,24 @@ impl WendelonDataServer {
 			return Settled::Refused(WriteStatus::INTERNAL_ERROR);
 		};
 		let digest = request_digest(tenant, &descriptor, &manifest);
+		// Wendelon ADR 0120 D4: a chunk is bound to its immutable declaration
+		// before any Reserve. An undeclared sequence can never be admitted; a
+		// declared one with other rows conflicts with the key's declared content.
+		if let Some(declared) = &declared {
+			match declared
+				.iter()
+				.find(|chunk| chunk.sequence_no == key.sequence_no)
+			{
+				None => return Settled::KnownNotCommitted,
+				Some(chunk)
+					if chunk.request_digest != digest
+						|| chunk.rows as usize != batch.num_rows() =>
+				{
+					return Settled::Refused(WriteStatus::WRITE_KEY_CONFLICT);
+				}
+				Some(_) => {}
+			}
+		}
 		let Ok(admission) =
 			super::child_writes::keyed_admission(&probe, batch, &descriptor, meta.client_hlc, keys)
 		else {
@@ -607,6 +661,9 @@ impl WendelonDataServer {
 		// authority before it; after any Reserve answer, look up again and act
 		// only on the recorded claim, never on a locally built one.
 		let mut reserved_once = false;
+		// Wendelon ADR 0120: a CTAS chunk saw its chain leave Dispatching after an
+		// absent lookup; its key is then looked up once more (below).
+		let mut phase_closed = false;
 		// This attempt's claim of its gate, once it has one.
 		let mut owned: Option<OwnedAttempt> = None;
 		let positions = &positions;
@@ -685,6 +742,36 @@ impl WendelonDataServer {
 					self.decisions
 						.pause_at(super::child_writes::PauseStage::AfterAbsent)
 						.await;
+					// Wendelon ADR 0120 D7: a chain that left Dispatching admits no new
+					// chunk (the reducer refuses it too); recorded chunks replay above.
+					if let Some((op, _)) = credential {
+						let dispatching = self
+							.state_machine
+							.read_state(move |state| {
+								state
+									.decisions
+									.as_ref()
+									.and_then(|decisions| decisions.ctas().chain(tenant, op))
+									.is_some_and(|chain| {
+										chain.phase
+											== crate::consensus::decisions::ctas::CtasPhase::Dispatching
+									})
+							})
+							.await;
+						if !dispatching {
+							// The absent lookup and this phase read are two
+							// observations: the key may have been decided between
+							// them (another dispatch of it, then Publish). One
+							// leader lookup ordered after this read resolves it
+							// through the arms above. Absent again, after the one-way
+							// fence, is a definitive refusal: nothing is proposed.
+							if phase_closed {
+								return Settled::KnownNotCommitted;
+							}
+							phase_closed = true;
+							continue;
+						}
+					}
 					// ADR 0729: above the floor of every lineage the claim binds, so
 					// its versions order after everything reserved before those
 					// generations began. Read from applied state before stamping.
@@ -748,6 +835,14 @@ impl WendelonDataServer {
 					// Wendelon ADR 0119 D5: before any reservation, every child's
 					// sections fit their frame bound; an oversize write is refused
 					// whole, with nothing reserved.
+					// Test-only: a CTAS chunk held after its phase check and its built
+					// claim, before its Reserve (nothing remains but the proposal).
+					#[cfg(test)]
+					if credential.is_some() {
+						self.decisions
+							.pause_at(super::child_writes::PauseStage::AfterCtasPhase)
+							.await;
+					}
 					if !child_sections_fit(&built, &descriptor, batch, positions) {
 						return Settled::Refused(WriteStatus::PAYLOAD_TOO_LARGE);
 					}
@@ -781,6 +876,20 @@ impl WendelonDataServer {
 								.pause_at(super::child_writes::PauseStage::AfterReserve)
 								.await;
 							reserved_once = true;
+						}
+						// Wendelon ADR 0120 D4: a CTAS chunk outside its chain's
+						// declaration or phase is refused for good (the declaration
+						// never changes, and a chain leaves Dispatching once); nothing
+						// was reserved.
+						ProposalResponse::Applied {
+							outcome:
+								ProposalOutcome::Decision(DecisionResult::Refused(
+									crate::consensus::decisions::DecisionRefusal::Ctas(refusal),
+								)),
+							..
+						} => {
+							diag!("reserve: CTAS refusal {refusal:?}");
+							return Settled::KnownNotCommitted;
 						}
 						other => {
 							diag!("reserve: {other:?}");
@@ -928,6 +1037,27 @@ impl WendelonDataServer {
 		}
 		acks
 	}
+
+	/// Wendelon ADR 0120 D6: an authenticated CTAS chunk write. The credential is
+	/// checked against the applied chain before any digest work; the claim's
+	/// digest is then checked against the declaration at Reserve.
+	pub(super) async fn ctas_chunk_write(
+		&self,
+		meta: TableWriteRequestMeta,
+		batch: RecordBatch,
+		dispatch: &CtasDispatch,
+		early: Option<EarlyAnswer>,
+	) -> std::io::Result<TableWriteResponseMeta> {
+		if self.decision_mode != crate::consensus::decision_mode::DecisionMode::ParentDecisions {
+			return Err(std::io::Error::new(
+				std::io::ErrorKind::Unsupported,
+				"a CTAS chunk write needs the ParentDecisions authority",
+			));
+		}
+		self.coordinate_table_write(meta, batch, early, Some(dispatch))
+			.await
+			.map(|(response, _)| response)
+	}
 }
 
 #[cfg(test)]
@@ -1049,6 +1179,7 @@ impl WendelonDataServer {
 				&meta,
 				&batch,
 				&AttemptGate::until(Some(deadline)),
+				None,
 			)
 			.await;
 		self.settled_response(&meta, settled)
@@ -1115,4 +1246,75 @@ pub(super) fn child_sections_fit(
 			&& repair_rows.is_some_and(|bytes| bytes <= bound)
 			&& identities.is_some_and(|bytes| bytes <= bound)
 	})
+}
+
+/// Wendelon ADR 0120 D6: how long a chunk's coordinator waits to apply a cut
+/// before it judges a credential whose chain it has not seen.
+const CTAS_CATCH_UP: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Wendelon ADR 0120 D6: a CTAS chunk dispatch's credential: the operation and
+/// the owner's secret. Its `Debug` never prints the secret.
+#[derive(Clone)]
+pub(crate) struct CtasDispatch {
+	pub op: [u8; 16],
+	pub secret: [u8; 32],
+}
+
+impl std::fmt::Debug for CtasDispatch {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("CtasDispatch")
+			.field("op", &self.op)
+			.field("secret", &"<redacted>")
+			.finish()
+	}
+}
+
+/// Wendelon ADR 0120 D2: the request digest a CTAS chunk's declaration names for
+/// the chunk at `sequence_no` of operation `op` with rows `batch`: the digest the
+/// coordinator computes for the same write (ADR 0119's canonical identities
+/// and content, independent of the HLC and of row order within a stable batch).
+pub fn ctas_chunk_request_digest(
+	tenant: TenantId,
+	descriptor: &TableSchemaDescriptor,
+	op: [u8; 16],
+	sequence_no: u64,
+	batch: &RecordBatch,
+) -> std::io::Result<[u8; 32]> {
+	let key = ParentKey {
+		tenant,
+		namespace: ParentNamespace::Table(descriptor.table_object_id),
+		client_uuid: op,
+		sequence_no,
+	};
+	let hlc: crate::schema::HybridTimestamp = bytemuck::Zeroable::zeroed();
+	let probe = child_request_meta(
+		&key,
+		descriptor.table_object_id,
+		descriptor.schema_generation,
+		batch.num_rows(),
+		hlc,
+	)?;
+	let ordinals: Vec<u32> = (0..batch.num_rows() as u32).collect();
+	let keys = super::child_writes::RowKeys::of_request(descriptor, &ordinals);
+	let (_, manifest) = super::child_writes::child_versions_keyed(
+		&probe, batch, descriptor, hlc, keys,
+	)
+	.map_err(|refusal| {
+		std::io::Error::new(
+			std::io::ErrorKind::InvalidInput,
+			format!("a CTAS chunk's rows are not admissible: {refusal:?}"),
+		)
+	})?;
+	Ok(request_digest(tenant, descriptor, &manifest))
+}
+
+/// [`ctas_chunk_request_digest`] for a key, in controls.
+#[cfg(test)]
+pub(crate) fn chunk_request_digest(
+	tenant: TenantId,
+	descriptor: &TableSchemaDescriptor,
+	key: &ParentKey,
+	batch: &RecordBatch,
+) -> [u8; 32] {
+	ctas_chunk_request_digest(tenant, descriptor, key.client_uuid, key.sequence_no, batch).unwrap()
 }

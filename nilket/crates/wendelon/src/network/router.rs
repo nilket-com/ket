@@ -190,7 +190,8 @@ impl HrftService for MsgRouter {
 				|| x == MsgType::TABLE_CHILD_FETCH_REQ.0
 				|| x == MsgType::TABLE_CHILD_FETCH_RESP.0
 				|| x == MsgType::TABLE_BASE_FETCH_REQ.0
-				|| x == MsgType::TABLE_BASE_FETCH_RESP.0 =>
+				|| x == MsgType::TABLE_BASE_FETCH_RESP.0
+				|| x == MsgType::TABLE_CTAS_CHUNK_WRITE_REQ.0 =>
 			{
 				match &self.data {
 					Some(h) => h.handle_data_frame(context, frame).await,
@@ -239,6 +240,8 @@ impl HrftService for MsgRouter {
 			// A table write owns its stream so that its handler can write the
 			// response while it goes on polling the same write to its end.
 			|| header.msg_type == MsgType::TABLE_WRITE_REQ.0
+			// Wendelon ADR 0120: so does a CTAS chunk write.
+			|| header.msg_type == MsgType::TABLE_CTAS_CHUNK_WRITE_REQ.0
 		{
 			return match &self.data {
 				Some(h) => h.handle_data_stream(context, header, stream, pool).await,
@@ -301,6 +304,8 @@ fn is_control_extension_request(msg_type: u8) -> bool {
 		MsgType::LEASES_REQ,
 		// ADR 0104 (wendelon). Node-required: a fresh store's first identity.
 		MsgType::INSTANCE_GRANT_REQ,
+		// Wendelon ADR 0120. Actor-authorized, like CTAS_SAGA_REQ.
+		MsgType::CTAS_DECISION_REQ,
 	]
 	.iter()
 	.any(|candidate| candidate.0 == msg_type)
@@ -325,6 +330,7 @@ fn is_extension_response(msg_type: u8) -> bool {
 		MsgType::DECISION_CUT_RESP,
 		MsgType::LEASES_RESP,
 		MsgType::INSTANCE_GRANT_RESP,
+		MsgType::CTAS_DECISION_RESP,
 	]
 	.iter()
 	.any(|candidate| candidate.0 == msg_type)
@@ -357,6 +363,7 @@ const ACTOR_AUTHORIZED_CONTROL_REQUESTS: &[MsgType] = &[
 	MsgType::CTAS_SAGA_REQ,
 	MsgType::MAINTENANCE_REPORT_REQ,
 	MsgType::MAINTENANCE_REQUEUE_REQ,
+	MsgType::CTAS_DECISION_REQ,
 ];
 
 fn ingress_requirement(msg_type: MsgType) -> Option<IngressRequirement> {

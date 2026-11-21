@@ -173,7 +173,7 @@ pub(super) fn propose_target(
 		|| target.t >= log_index
 		|| target.t <= generations.fr()
 		|| target.chunk_bits != CHUNK_BITS
-		|| target.survivor_policy != state.survivor_policy_at(target.t)
+		|| target.survivor_policy != state.survivor_policy_with(&decisions.ctas, target.t)
 		|| current_members(state).as_ref() != Some(&target.members)
 	{
 		return Err(StaleGeneration);
@@ -356,10 +356,12 @@ pub(crate) fn next_target(state: &SmState, applied: u64) -> Option<Target> {
 			Some(point) => t = point.checked_sub(1)?,
 		}
 	}
-	// Something to erase, or (ADR 0115) a finalized drop no certificate excludes yet.
+	// Something to erase, or (ADR 0115) a finalized drop no certificate excludes yet. (Wendelon ADR
+	// 0120: or a retired CTAS object.)
 	if decisions.bodies.range(..=t).next().is_none()
 		&& decisions.noops.range(..=t).next().is_none()
 		&& !state.finalized_drop_in(generations.fr(), t)
+		&& !decisions.ctas.retired_in(generations.fr(), t)
 	{
 		return None;
 	}
@@ -369,7 +371,7 @@ pub(crate) fn next_target(state: &SmState, applied: u64) -> Option<Target> {
 		predecessor_gid: generations.current_gid(),
 		members: current_members(state)?,
 		chunk_bits: CHUNK_BITS,
-		survivor_policy: state.survivor_policy_at(t),
+		survivor_policy: state.survivor_policy_with(&decisions.ctas, t),
 	})
 }
 

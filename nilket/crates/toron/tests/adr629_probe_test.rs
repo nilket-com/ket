@@ -182,7 +182,7 @@ pub(crate) async fn run_spec(bytes: &[u8]) -> Result<(), Box<dyn std::error::Err
 						"stop_reason":stop_raw(r.stop_reason), "commit_knowledge":knowledge_raw(r.commit_knowledge),
 						"delete_counts":r.delete_counts})
 					}
-					Ok(ResolvedOperationOutcome::Ctas(_)) => {
+					Ok(ResolvedOperationOutcome::Ctas(_) | ResolvedOperationOutcome::PdCtas(_)) => {
 						json!({"kind":"protocol_error", "error":"CTAS resolution outside frozen store workload"})
 					}
 					Err(e) => {
