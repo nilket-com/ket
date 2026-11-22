@@ -442,6 +442,9 @@ pub(crate) enum CertifiedTierCut {
 	AfterAcceptance,
 	/// Wendelon ADR 0124: the count is entered and has observed nothing yet. A hold only.
 	BeforeCreditEntry,
+	/// Wendelon ADR 0125: the slab's exclusive claim is held; its object is not read yet. A
+	/// hold only.
+	AfterClaim,
 	/// Wendelon ADR 0124: the count has sampled the local view once and has not read the lease.
 	/// A hold only (a cut here would end a delivered op).
 	BeforeCreditDecision,
@@ -754,12 +757,70 @@ impl SlabManager {
 	/// ADR 0704: one certified tier job, if one is admissible: pick, claim,
 	/// decide once, rewrite, propose. Refused, typed, outside ParentDecisions
 	/// mode, on a fenced store, off the leader, and with no canonical state.
+	/// Wendelon ADR 0125: this store's certified tier observer.
+	pub(crate) fn certified_tier_observer(
+		&self,
+	) -> &super::certified_observer::CertifiedTierObserver {
+		&self.certified_observer
+	}
+
+	/// Test-only (wendelon ADR 0125): one step that begins its own observation, for the storage
+	/// tests that drive a step without a data server; production steps begin theirs in
+	/// `WendelonDataServer::certified_tier_step_unpaused` before their admitted work.
+	#[cfg(test)]
 	pub(crate) async fn run_certified_tier_step(
 		&self,
 		committer: &dyn TierCommitter,
 		decider: &dyn CertifiedTierDecider,
 		table_schemas: &TableSchemaCatalog,
 	) -> std::io::Result<CertifiedTierStep> {
+		let step = self.certified_observer.begin_step();
+		self.run_certified_tier_step_observed(committer, decider, table_schemas, step)
+			.await
+	}
+
+	/// Wendelon ADR 0125: one step, observed under `step` (begun by the caller before its own
+	/// admitted work), recorded by how it ended.
+	pub(crate) async fn run_certified_tier_step_observed(
+		&self,
+		committer: &dyn TierCommitter,
+		decider: &dyn CertifiedTierDecider,
+		table_schemas: &TableSchemaCatalog,
+		step: Option<super::certified_observer::StepToken>,
+	) -> std::io::Result<CertifiedTierStep> {
+		use super::certified_observer::TierStepOutcome as Outcome;
+		let mut idle = Outcome::NoDebt;
+		let result = self
+			.certified_tier_step_body(committer, decider, table_schemas, &mut idle, step)
+			.await;
+		let outcome = match &result {
+			Ok(CertifiedTierStep::Idle) => idle,
+			Ok(CertifiedTierStep::NothingSelected(_)) => Outcome::NothingSelected,
+			Ok(CertifiedTierStep::GenerationMoved { .. }) => Outcome::GenerationMoved,
+			Ok(CertifiedTierStep::Rewritten { .. }) => Outcome::Rewritten,
+			Ok(CertifiedTierStep::Retired { .. }) => Outcome::Retired,
+			Err(error) => match certified_tier_refusal(error) {
+				Some(CertifiedTierRefusal::NotInMode) => Outcome::NotInMode,
+				Some(CertifiedTierRefusal::Fenced(_)) => Outcome::Fenced,
+				Some(CertifiedTierRefusal::NotLeader) => Outcome::NotLeader,
+				Some(CertifiedTierRefusal::NoCanonicalSource) => Outcome::NoCanonicalSource,
+				_ => Outcome::Failed,
+			},
+		};
+		// Counted always; when `step` is the observed one it becomes the last step.
+		self.certified_observer.end_step(step, outcome);
+		result
+	}
+
+	async fn certified_tier_step_body(
+		&self,
+		committer: &dyn TierCommitter,
+		decider: &dyn CertifiedTierDecider,
+		table_schemas: &TableSchemaCatalog,
+		idle: &mut super::certified_observer::TierStepOutcome,
+		step: Option<super::certified_observer::StepToken>,
+	) -> std::io::Result<CertifiedTierStep> {
+		use super::certified_observer::{TierJobStage, TierStepOutcome as Outcome};
 		if !self.versions_contained() {
 			return Err(refused(CertifiedTierRefusal::NotInMode));
 		}
@@ -778,16 +839,27 @@ impl SlabManager {
 		let index = self.require_op_index()?;
 		// No debt at all: no version anywhere can be selected.
 		if index.debt_page(None, 1).await?.is_empty() {
+			*idle = Outcome::NoDebt;
 			return Ok(CertifiedTierStep::Idle);
 		}
 		let Some(slab_id) = self.next_certified_tier_slab().await? else {
+			*idle = Outcome::NoEligibleSlab;
 			return Ok(CertifiedTierStep::Idle);
 		};
-		let Some(job) = self.claim_tiered_for_certified_cleanup(slab_id).await? else {
+		// The claim is a wait: the job is visible from here.
+		self.certified_observer.claim_waiting(step, slab_id.get());
+		let Some(job) = self
+			.claim_tiered_for_certified_cleanup(slab_id, step)
+			.await?
+		else {
+			*idle = Outcome::ClaimLost;
 			return Ok(CertifiedTierStep::Idle);
 		};
+		self.certified_observer.enter(step, TierJobStage::Deciding);
 		let selection = decider.decide(&job).await?;
-		self.finish_certified_tier(job, selection, committer, table_schemas)
+		self.certified_observer
+			.note_active_gid(step, selection.active_gid());
+		self.finish_certified_tier(job, selection, committer, table_schemas, step)
 			.await
 	}
 
@@ -868,9 +940,15 @@ impl SlabManager {
 	pub(crate) async fn claim_tiered_for_certified_cleanup(
 		&self,
 		slab_id: SlabId,
+		step: Option<super::certified_observer::StepToken>,
 	) -> std::io::Result<Option<TierCertifiedJob>> {
 		self.require_tier_authority_ready()?;
 		let claim = self.acquire_slab_rewrite_exclusive_claim(slab_id).await;
+		// Wendelon ADR 0125: the claim is held; the published object is read and decoded under it.
+		self.certified_observer
+			.enter(step, super::certified_observer::TierJobStage::Reading);
+		#[cfg(test)]
+		self.certified_tier_hold(CertifiedTierCut::AfterClaim).await;
 		let Some(source) = self.certified_tier_source(slab_id).await? else {
 			return Ok(None);
 		};
@@ -981,6 +1059,7 @@ impl SlabManager {
 		selection: CertifiedSelection,
 		committer: &dyn TierCommitter,
 		table_schemas: &TableSchemaCatalog,
+		step: Option<super::certified_observer::StepToken>,
 	) -> std::io::Result<CertifiedTierStep> {
 		if selection.job_fingerprint() != job.fingerprint
 			|| selection.input_rows_digest() != job.source_rows_digest
@@ -1031,11 +1110,19 @@ impl SlabManager {
 		};
 		if records.iter().all(|record| record.reclaim) {
 			return self
-				.propose_certified_retirement(&job, evidence, committer, aged)
+				.propose_certified_retirement(&job, evidence, committer, aged, step)
 				.await;
 		}
-		self.propose_certified_rewrite(&job, &records, evidence, committer, table_schemas, aged)
-			.await
+		self.propose_certified_rewrite(
+			&job,
+			&records,
+			evidence,
+			committer,
+			table_schemas,
+			aged,
+			step,
+		)
+		.await
 	}
 
 	/// No record survives: one certified `Retire` of the source generation,
@@ -1046,12 +1133,17 @@ impl SlabManager {
 		evidence: TierSelectionEvidence,
 		committer: &dyn TierCommitter,
 		aged: AgedRows,
+		step: Option<super::certified_observer::StepToken>,
 	) -> std::io::Result<CertifiedTierStep> {
 		let slab_id = job.slab_id();
+		self.certified_observer
+			.enter(step, super::certified_observer::TierJobStage::Preparing);
 		committer.preflight(job.slab.owner()).await?;
 		self.require_op_index()?.ensure_op_room(1).await?;
 		self.stage_table_drop_l2_cleanup(slab_id, &job.source.l2_uri, Some(job.source_bytes), None)
 			.await?;
+		self.certified_observer
+			.enter(step, super::certified_observer::TierJobStage::Allocating);
 		let observed_epoch = self.capture_snapshot_epoch();
 		let ticket = match self
 			.allocate_certified_tier_op(CertifiedTierWork::Retire { slab: job.slab }, evidence)
@@ -1067,11 +1159,14 @@ impl SlabManager {
 		};
 		let op = ticket.key();
 		let scope = CreditScope::of_ticket(&ticket);
+		self.certified_observer.submitting(step, op.op_seq);
 		#[cfg(test)]
 		self.certified_tier_cut(CertifiedTierCut::BeforeSubmit)?;
 		let handoff =
 			crate::storage::sweeper::submit_tier_retirement_handed_off(self, committer, &ticket)
 				.await?;
+		self.certified_observer
+			.enter(step, super::certified_observer::TierJobStage::Delivering);
 		#[cfg(test)]
 		self.certified_tier_cut(CertifiedTierCut::AfterAcceptance)?;
 		#[cfg(test)]
@@ -1079,6 +1174,8 @@ impl SlabManager {
 			.await;
 		self.retire_tiered_slab_at_snapshot_epoch(slab_id, observed_epoch)
 			.await?;
+		self.certified_observer
+			.enter(step, super::certified_observer::TierJobStage::Crediting);
 		// Wendelon ADR 0124: counted once, here, from this op's own credit (retired here or by
 		// the observer first). A refused credit records nothing and changes no result.
 		if let Some(credit) = scope.and_then(|scope| {
@@ -1086,6 +1183,8 @@ impl SlabManager {
 		}) {
 			self.record_aged_l2(credit).await;
 		}
+		self.certified_observer
+			.enter(step, super::certified_observer::TierJobStage::Finishing);
 		#[cfg(test)]
 		self.note_certified_retained_object(&job.source.l2_uri, job.source_bytes);
 		if Self::retain_superseded_l2_object(slab_id, &job.source.l2_uri, "superseded tier object")
@@ -1107,9 +1206,12 @@ impl SlabManager {
 		committer: &dyn TierCommitter,
 		table_schemas: &TableSchemaCatalog,
 		aged: AgedRows,
+		step: Option<super::certified_observer::StepToken>,
 	) -> std::io::Result<CertifiedTierStep> {
 		let slab_id = job.slab_id();
 		let owner = job.slab.owner();
+		self.certified_observer
+			.enter(step, super::certified_observer::TierJobStage::Preparing);
 		let l2 = self
 			.config
 			.l2
@@ -1205,6 +1307,8 @@ impl SlabManager {
 		self.prepare_tier_candidate_proposal(slab_id, &new_uri)
 			.await?;
 		let submitted = async {
+			self.certified_observer
+				.enter(step, super::certified_observer::TierJobStage::Allocating);
 			committer.preflight(owner).await?;
 			let proposal = self
 				.reserve_tier_history(tier.clone())
@@ -1231,6 +1335,7 @@ impl SlabManager {
 				CertifiedTierAllocation::GenerationMoved => Ok(None),
 				CertifiedTierAllocation::Allocated(allocation) => {
 					let op = allocation.first.key();
+					self.certified_observer.submitting(step, op.op_seq);
 					let scope = CreditScope::of_ticket(&allocation.first);
 					#[cfg(test)]
 					self.certified_tier_cut(CertifiedTierCut::BeforeSubmit)?;
@@ -1266,6 +1371,8 @@ impl SlabManager {
 				return Err(error);
 			}
 		};
+		self.certified_observer
+			.enter(step, super::certified_observer::TierJobStage::Delivering);
 		#[cfg(test)]
 		self.certified_tier_cut(CertifiedTierCut::AfterAcceptance)?;
 		#[cfg(test)]
@@ -1278,6 +1385,8 @@ impl SlabManager {
 			self.apply_tier_slab_at_snapshot_epoch(pointer, observed_epoch)
 				.await?;
 		}
+		self.certified_observer
+			.enter(step, super::certified_observer::TierJobStage::Crediting);
 		// Wendelon ADR 0124: counted once, here, from this op's own credit (installed here or by
 		// the observer first); superseded or unresolved, nothing. A refused credit records
 		// nothing and changes no result.
@@ -1286,6 +1395,8 @@ impl SlabManager {
 		}) {
 			self.record_aged_l2(credit).await;
 		}
+		self.certified_observer
+			.enter(step, super::certified_observer::TierJobStage::Finishing);
 		self.record_cleanup_replacement_published(slab_id, &job.source.l2_uri, &new_uri)
 			.await?;
 		#[cfg(test)]

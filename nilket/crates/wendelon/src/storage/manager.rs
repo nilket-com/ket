@@ -270,6 +270,7 @@ pub(crate) use tiered_io::TieredPlaintext;
 pub(crate) mod certified_cleanup;
 pub(crate) mod certified_delivery;
 pub(crate) mod certified_lsm;
+pub(crate) mod certified_observer;
 pub(crate) mod certified_tier;
 mod compaction;
 use compaction::{
@@ -831,6 +832,8 @@ pub struct SlabManager {
 	certified_tier_fence: Option<certified_tier::CertifiedTierFence>,
 	/// The last tiered slab a certified tier step visited (a pass cursor).
 	certified_tier_cursor: std::sync::atomic::AtomicU64,
+	/// Wendelon ADR 0125: where this store's certified tier work stands (diagnostic, fixed size).
+	certified_observer: certified_observer::CertifiedTierObserver,
 	/// Tiered slabs not yet verified against their objects since open.
 	unverified_tier_slabs: DashSet<SlabId>,
 	tier_authority: Arc<tier_authority::TierAuthority>,

@@ -490,6 +490,113 @@ impl GenerationTargetReasonCounters {
 	}
 }
 
+/// Wendelon ADR 0125: where this node's certified tier work stands (DC-289): steps by outcome
+/// (counters), and one coherent snapshot of the observed step and the last observed step, set
+/// and rendered whole (a short lock around a copy; formatting outside it).
+#[derive(Default)]
+struct CertifiedTierObserverSeries {
+	steps: [Counter; 13],
+	snapshot: std::sync::Mutex<crate::storage::manager::certified_observer::TierStepSnapshot>,
+}
+
+impl CertifiedTierObserverSeries {
+	fn outcomes() -> [&'static str; 13] {
+		crate::storage::manager::certified_observer::TierStepOutcome::ALL.map(|o| o.label())
+	}
+
+	fn render(&self, out: &mut String) {
+		let steps = "wendelon_certified_tier_steps_total";
+		render_counter_family_header(
+			out,
+			steps,
+			"Certified tier steps this node ran, by how each ended.",
+		);
+		for (label, counter) in Self::outcomes().iter().zip(&self.steps) {
+			render_counter_with_labels(out, steps, &[("outcome", label)], counter.get());
+		}
+		let snapshot = *self.snapshot.lock().unwrap_or_else(|e| e.into_inner());
+		render_certified_tier_snapshot(out, &snapshot);
+	}
+}
+
+/// Wendelon ADR 0125: renders one snapshot of the observed certified tier step: the one-hot
+/// stage (`idle` when none), the step's fields, and the last observed step's one-hot outcome
+/// (all 0 before any) and fields. 0 means unknown.
+fn render_certified_tier_snapshot(
+	out: &mut String,
+	snapshot: &crate::storage::manager::certified_observer::TierStepSnapshot,
+) {
+	use crate::storage::manager::certified_observer::TierJobStage;
+	let stage = "wendelon_certified_tier_job_stage";
+	render_gauge_family_header(
+		out,
+		stage,
+		"The stage of the observed certified tier step (one-hot; idle when none).",
+	);
+	for each in TierJobStage::ALL {
+		render_gauge_with_labels(
+			out,
+			stage,
+			&[("stage", each.label())],
+			u64::from(each == snapshot.stage),
+		);
+	}
+	let job = "wendelon_certified_tier_job";
+	render_gauge_family_header(
+		out,
+		job,
+		"The observed certified tier step: stage entry and start (unix ms), slab, op, generation; 0 where unknown.",
+	);
+	for (field, value) in [
+		("stage_entered_unix_ms", snapshot.stage_entered_unix_ms),
+		("started_unix_ms", snapshot.started_unix_ms),
+		("slab", snapshot.slab),
+		("op_seq", snapshot.op_seq),
+		("active_gid", snapshot.active_gid),
+	] {
+		render_gauge_with_labels(out, job, &[("field", field)], value);
+	}
+	let outcome = "wendelon_certified_tier_last_job_outcome";
+	render_gauge_family_header(
+		out,
+		outcome,
+		"How the last observed certified tier step ended (one-hot; all 0 before any).",
+	);
+	for label in CertifiedTierObserverSeries::outcomes() {
+		let value = snapshot
+			.last
+			.is_some_and(|last| last.outcome.label() == label);
+		render_gauge_with_labels(out, outcome, &[("outcome", label)], u64::from(value));
+	}
+	let last = "wendelon_certified_tier_last_job";
+	render_gauge_family_header(
+		out,
+		last,
+		"The last observed certified tier step: slab, op, generation, duration, finish (unix ms); 0 where unknown.",
+	);
+	let fields = snapshot.last.map_or([0; 5], |last| {
+		[
+			last.slab,
+			last.op_seq,
+			last.active_gid,
+			last.duration_ms,
+			last.finished_unix_ms,
+		]
+	});
+	for (field, value) in [
+		"slab",
+		"op_seq",
+		"active_gid",
+		"duration_ms",
+		"finished_unix_ms",
+	]
+	.iter()
+	.zip(fields)
+	{
+		render_gauge_with_labels(out, last, &[("field", field)], value);
+	}
+}
+
 #[derive(Default)]
 struct TableRetentionActiveTableGauges {
 	inherit: Gauge,
@@ -3073,6 +3180,7 @@ pub struct MetricsRegistry {
 	pub storage_table_retention_l1_bytes_reclaimed_total: Counter,
 	storage_table_retention_l2_rows_pruned: TableRetentionRowKindCounters,
 	decision_generation_targets_proposed: GenerationTargetReasonCounters,
+	certified_tier_observer: CertifiedTierObserverSeries,
 	pub storage_table_retention_l2_bytes_reclaimed_total: Counter,
 	pub storage_l2_superseded_objects_retained_total: Counter,
 	pub storage_supersession_metadata_degraded_total: Counter,
@@ -3432,6 +3540,7 @@ impl Default for MetricsRegistry {
 			storage_table_retention_l1_bytes_reclaimed_total: Counter::default(),
 			storage_table_retention_l2_rows_pruned: TableRetentionRowKindCounters::default(),
 			decision_generation_targets_proposed: GenerationTargetReasonCounters::default(),
+			certified_tier_observer: CertifiedTierObserverSeries::default(),
 			storage_table_retention_l2_bytes_reclaimed_total: Counter::default(),
 			storage_l2_superseded_objects_retained_total: Counter::default(),
 			storage_supersession_metadata_degraded_total: Counter::default(),
@@ -4195,6 +4304,28 @@ impl MetricsRegistry {
 	/// active L2 inventory, on the delivery of its own Applied op. Row counters only.
 	/// Wendelon ADR 0123 D7: one generation target proposal attempted for `reason`
 	/// (`structure`, `age`, `pressure`, `settlement` or `retired_key`).
+	/// Wendelon ADR 0125: one certified tier step ended with `outcome`.
+	pub fn observe_certified_tier_step(&self, outcome: &str) {
+		if let Some(at) = CertifiedTierObserverSeries::outcomes()
+			.iter()
+			.position(|label| *label == outcome)
+		{
+			self.certified_tier_observer.steps[at].inc();
+		}
+	}
+
+	/// Wendelon ADR 0125: the observed certified tier step's snapshot, set whole.
+	pub(crate) fn set_certified_tier_snapshot(
+		&self,
+		snapshot: crate::storage::manager::certified_observer::TierStepSnapshot,
+	) {
+		*self
+			.certified_tier_observer
+			.snapshot
+			.lock()
+			.unwrap_or_else(|e| e.into_inner()) = snapshot;
+	}
+
 	pub fn observe_decision_generation_target_proposed(&self, reason: &str) {
 		if let Some(counter) = self.decision_generation_targets_proposed.counter(reason) {
 			counter.add(1);
@@ -6268,6 +6399,7 @@ impl MetricsRegistry {
 			"wendelon_storage_table_retention_l2_rows_pruned_total",
 			"Logical row versions pruned by table-aware L2 retention rewrites.",
 		);
+		self.certified_tier_observer.render(&mut out);
 		self.decision_generation_targets_proposed.render(
 			&mut out,
 			"wendelon_decision_generation_targets_proposed_total",

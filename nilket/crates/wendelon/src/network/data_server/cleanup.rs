@@ -406,12 +406,20 @@ impl WendelonDataServer {
 		&self,
 		committer: &dyn crate::storage::TierCommitter,
 	) -> std::io::Result<crate::storage::manager::certified_tier::CertifiedTierStep> {
+		use crate::storage::manager::certified_observer::TierStepOutcome;
 		use crate::storage::manager::certified_tier::CertifiedTierStep;
+		// Wendelon ADR 0125: a tick the data server does not admit is recorded as such.
 		if !self.parent_decisions() || !self.may_clean() {
+			self.slab
+				.certified_tier_observer()
+				.count(TierStepOutcome::NotAdmitted);
 			return Ok(CertifiedTierStep::Idle);
 		}
 		#[cfg(test)]
 		if self.cleanup_paused_for_test() {
+			self.slab
+				.certified_tier_observer()
+				.count(TierStepOutcome::NotAdmitted);
 			return Ok(CertifiedTierStep::Idle);
 		}
 		self.certified_tier_step_unpaused(committer).await
@@ -425,12 +433,18 @@ impl WendelonDataServer {
 	) -> std::io::Result<crate::storage::manager::certified_tier::CertifiedTierStep> {
 		use crate::storage::manager::certified_tier::CertifiedTierStep;
 		if !self.parent_decisions() || !self.may_clean() {
+			self.slab
+				.certified_tier_observer()
+				.count(crate::storage::manager::certified_observer::TierStepOutcome::NotAdmitted);
 			return Ok(CertifiedTierStep::Idle);
 		}
 		let permit = match self.slab.directory_owner() {
 			Some(owner) => Some(owner.lifecycle_permit()?),
 			None => None,
 		};
+		// Wendelon ADR 0125: admitted work is observed from here, before the state snapshot,
+		// the debt check and slab selection (`selecting`).
+		let step = self.slab.certified_tier_observer().begin_step();
 		#[cfg(test)]
 		let held = self
 			.decisions
@@ -439,7 +453,7 @@ impl WendelonDataServer {
 		let state = self.state_machine.state_snapshot().await;
 		let result = self
 			.slab
-			.run_certified_tier_step(committer, self, &state.table_schemas)
+			.run_certified_tier_step_observed(committer, self, &state.table_schemas, step)
 			.await;
 		if let Some(permit) = permit {
 			permit.complete();

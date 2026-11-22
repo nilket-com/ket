@@ -9741,6 +9741,8 @@ fn adr078_manager_source_concatenates_submodules() {
 			"certified_delivery.rs",
 			// ADR 0703: LSM compaction that elides one certified selection.
 			"certified_lsm.rs",
+			// Wendelon ADR 0125: where a certified tier job stands (diagnostic).
+			"certified_observer.rs",
 			// ADR 0704: the admission and open-time fence of certified tiered cleanup.
 			"certified_tier.rs",
 			"compaction.rs",

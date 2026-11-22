@@ -1148,6 +1148,7 @@ impl SlabManager {
 			certified_lsm_fenced: AtomicBool::new(!orphan_lsm_certificates.is_empty()),
 			certified_tier_fence,
 			certified_tier_cursor: std::sync::atomic::AtomicU64::new(0),
+			certified_observer: Default::default(),
 			unverified_tier_slabs: DashSet::new(),
 			tier_authority: tier_authority::TierAuthority::new(),
 			installed_snapshot_index: std::sync::RwLock::new(None),

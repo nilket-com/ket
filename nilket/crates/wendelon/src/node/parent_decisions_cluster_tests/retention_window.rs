@@ -2011,6 +2011,346 @@ async fn a_fence_active_at_entry_and_released_before_the_decision_earns_nothing(
 	shut_down(fx.cluster, &fx.time).await;
 }
 
+// --- Wendelon ADR 0125: the certified tier observer ----------------------------------------------
+
+use crate::storage::manager::certified_observer::{TierJobStage, TierStepOutcome};
+
+impl AgedL2 {
+	/// This store's count of certified tier steps that ended with `outcome`.
+	fn steps(&self, outcome: TierStepOutcome) -> u64 {
+		self.slab().certified_tier_observer().outcomes_for_test()[outcome as usize]
+	}
+
+	/// This store's observer snapshot, rendered by the exported series' own formatter, as
+	/// `series{labels}` -> value.
+	fn rendered(&self) -> BTreeMap<String, u64> {
+		self.slab()
+			.certified_tier_observer()
+			.render_for_test()
+			.lines()
+			.filter(|line| !line.starts_with('#'))
+			.filter_map(|line| {
+				let (series, value) = line.rsplit_once(' ')?;
+				Some((series.to_owned(), value.parse().ok()?))
+			})
+			.collect()
+	}
+
+	/// Asserts the rendered snapshot: exactly `stage` is 1 among the stages, and the observed
+	/// step's slab, op and generation are exactly these.
+	fn assert_rendered(&self, stage: TierJobStage, slab: u64, op_seq: u64, active_gid: u64) {
+		let rendered = self.rendered();
+		for each in TierJobStage::ALL {
+			let series = format!(
+				"wendelon_certified_tier_job_stage{{stage=\"{}\"}}",
+				each.label()
+			);
+			assert_eq!(
+				rendered.get(&series),
+				Some(&u64::from(each == stage)),
+				"{series} at {stage:?}"
+			);
+		}
+		for (field, value) in [
+			("slab", slab),
+			("op_seq", op_seq),
+			("active_gid", active_gid),
+		] {
+			let series = format!("wendelon_certified_tier_job{{field=\"{field}\"}}");
+			assert_eq!(rendered.get(&series), Some(&value), "{series} at {stage:?}");
+		}
+	}
+
+	/// Waits (bounded) until the observed step is at `stage` on `slab`; on timeout, names what
+	/// the observer saw instead.
+	async fn until_stage(&self, stage: TierJobStage, slab: u64) {
+		let store = self.slab();
+		let observer = store.certified_tier_observer();
+		let deadline = tokio::time::Instant::now() + BOUND;
+		loop {
+			let snapshot = observer.snapshot();
+			if snapshot.stage == stage && snapshot.slab == slab {
+				return;
+			}
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"never at {stage:?} on slab {slab}: {snapshot:?}; outcomes {:?}",
+				TierStepOutcome::ALL
+					.iter()
+					.zip(observer.outcomes_for_test())
+					.filter(|(_, count)| *count > 0)
+					.collect::<Vec<_>>(),
+			);
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+	}
+}
+
+/// Wendelon ADR 0125 (idle): while cleanup is paused, the store's own worker ticks are counted
+/// `not_admitted`, and no step is observed. Once S2 is retired and S1 rewritten, a further step
+/// records exactly one stop, once: `no_debt` with no debt visible in the op index, otherwise
+/// `no_eligible_slab` or `nothing_selected`; its counter advances and the rendered stage returns
+/// to `idle`, while the rendered last step is still S1's rewrite (outcome, slab, op, generation):
+/// an op-less step never replaces the last step that obtained an op.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn an_idle_step_records_why_it_stopped() {
+	let fx = aged_l2().await;
+	fx.until("the paused worker's ticks are counted", async || {
+		fx.steps(TierStepOutcome::NotAdmitted) > 0
+	})
+	.await;
+	fx.assert_rendered(TierJobStage::Idle, 0, 0, 0);
+	match fx.step().await {
+		Ok(CertifiedTierStep::Retired { slab, .. }) if slab == fx.s2 => {}
+		other => panic!("S2's retirement: {other:?}"),
+	}
+	let op = match fx.step().await {
+		Ok(CertifiedTierStep::Rewritten { slab, op, .. }) if slab == fx.s1 => op,
+		other => panic!("S1's rewrite: {other:?}"),
+	};
+	let kept = fx
+		.slab()
+		.certified_tier_observer()
+		.snapshot()
+		.last
+		.expect("S1's rewrite is the last step");
+	assert_eq!(
+		(kept.outcome, kept.slab, kept.op_seq),
+		(TierStepOutcome::Rewritten, fx.s1.get(), op.op_seq)
+	);
+	assert!(kept.active_gid > 0, "{kept:?}");
+	assert!(fx.retired().await && fx.rewritten().await.is_some());
+	let debt_visible = !fx
+		.slab()
+		.persistent_index()
+		.unwrap()
+		.debt_page(None, 1)
+		.await
+		.unwrap()
+		.is_empty();
+	let stops = [
+		TierStepOutcome::NoDebt,
+		TierStepOutcome::NoEligibleSlab,
+		TierStepOutcome::NothingSelected,
+	];
+	let before = stops.map(|outcome| fx.steps(outcome));
+	fx.nothing_left().await;
+	let moved: Vec<_> = stops
+		.iter()
+		.zip(before)
+		.filter(|(outcome, was)| fx.steps(**outcome) != *was)
+		.map(|(outcome, was)| (*outcome, fx.steps(*outcome) - was))
+		.collect();
+	eprintln!("ADR 0125 idle: debt visible {debt_visible}, recorded {moved:?}");
+	assert_eq!(moved.len(), 1, "exactly one stop recorded: {moved:?}");
+	assert_eq!(moved[0].1, 1, "once: {moved:?}");
+	if !debt_visible {
+		assert_eq!(moved[0].0, TierStepOutcome::NoDebt, "no debt visible");
+	} else {
+		assert_ne!(moved[0].0, TierStepOutcome::NoDebt, "debt is visible");
+	}
+	let snapshot = fx.slab().certified_tier_observer().snapshot();
+	assert_eq!(snapshot.stage, TierJobStage::Idle);
+	assert_eq!(
+		snapshot.last,
+		Some(kept),
+		"the op-less step left the last step"
+	);
+	fx.assert_rendered(TierJobStage::Idle, 0, 0, 0);
+	let rendered = fx.rendered();
+	for (series, value) in [
+		(
+			"wendelon_certified_tier_last_job_outcome{outcome=\"rewritten\"}".to_owned(),
+			1,
+		),
+		(
+			format!(
+				"wendelon_certified_tier_last_job_outcome{{outcome=\"{}\"}}",
+				moved[0].0.label()
+			),
+			0,
+		),
+		(
+			"wendelon_certified_tier_last_job{field=\"slab\"}".to_owned(),
+			fx.s1.get(),
+		),
+		(
+			"wendelon_certified_tier_last_job{field=\"op_seq\"}".to_owned(),
+			op.op_seq,
+		),
+		(
+			"wendelon_certified_tier_last_job{field=\"active_gid\"}".to_owned(),
+			kept.active_gid,
+		),
+	] {
+		assert_eq!(rendered.get(&series), Some(&value), "{series}");
+	}
+	shut_down(fx.cluster, &fx.time).await;
+}
+
+/// Wendelon ADR 0125 (the boundaries before a step chooses its slab, and either side of its
+/// claim): an admitted step held at its pause before the state snapshot renders `selecting` with
+/// no slab; with S1's claim held by the test it renders `claim_waiting` on S1, unfinished; once
+/// it holds the claim (held there) it renders `reading` on S1. Released, it delivers and becomes
+/// the last step with S1, its op and generation, and a duration covering the waits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_step_is_visible_before_selection_and_either_side_of_its_claim() {
+	use crate::network::data_server::child_writes::PauseStage;
+	let fx = aged_l2().await;
+	let slab = fx.slab();
+	let server = fx.cluster.node(fx.leader).data_server.clone();
+	match fx.step().await {
+		Ok(CertifiedTierStep::Retired { slab, .. }) if slab == fx.s2 => {}
+		other => panic!("S2's retirement: {other:?}"),
+	}
+	let rewritten = fx.steps(TierStepOutcome::Rewritten);
+	let s1 = fx.s1.get();
+	let (paused, unpause) = server.pause_coordinator_for_test(PauseStage::CertifiedTierStep);
+	let claim = slab.acquire_slab_rewrite_exclusive_claim(fx.s1).await;
+	let (claimed, release_claimed) =
+		slab.hold_next_certified_tier_step(CertifiedTierCut::AfterClaim);
+	slab.restart_certified_tier_cursor_for_test();
+	let worker = tokio::spawn(tier_step(server.clone(), fx.committer()));
+	// Preselection: admitted, before the state snapshot, the debt check and slab selection.
+	tokio::time::timeout(BOUND, paused.notified())
+		.await
+		.expect("the step reaches its pause before selection");
+	let snapshot = slab.certified_tier_observer().snapshot();
+	assert_eq!(snapshot.stage, TierJobStage::Selecting);
+	assert!(snapshot.started_unix_ms > 0 && snapshot.stage_entered_unix_ms > 0);
+	fx.assert_rendered(TierJobStage::Selecting, 0, 0, 0);
+	unpause.notify_one();
+	// Before acquisition: waiting for S1's claim, which the test holds.
+	fx.until_stage(TierJobStage::ClaimWaiting, s1).await;
+	tokio::time::sleep(Duration::from_millis(300)).await;
+	fx.assert_rendered(TierJobStage::ClaimWaiting, s1, 0, 0);
+	assert!(!worker.is_finished(), "unfinished");
+	assert_eq!(fx.steps(TierStepOutcome::Rewritten), rewritten);
+	drop(claim);
+	// After acquisition: the claim is the job's; its object is not read yet.
+	tokio::time::timeout(BOUND, claimed.acquire())
+		.await
+		.expect("the job holds S1's claim")
+		.unwrap()
+		.forget();
+	fx.assert_rendered(TierJobStage::Reading, s1, 0, 0);
+	release_claimed.add_permits(1);
+	let op = match tokio::time::timeout(BOUND, worker)
+		.await
+		.expect("the released worker completes")
+		.unwrap()
+	{
+		Ok(CertifiedTierStep::Rewritten { slab, op, .. }) if slab == fx.s1 => op,
+		other => panic!("the worker's step: {other:?}"),
+	};
+	assert_eq!(fx.steps(TierStepOutcome::Rewritten), rewritten + 1);
+	let last = slab
+		.certified_tier_observer()
+		.snapshot()
+		.last
+		.expect("a last step");
+	assert_eq!(
+		(last.outcome, last.slab, last.op_seq),
+		(TierStepOutcome::Rewritten, s1, op.op_seq)
+	);
+	assert!(last.active_gid > 0, "{last:?}");
+	assert!(last.duration_ms >= 300, "covers the waits: {last:?}");
+	fx.assert_rendered(TierJobStage::Idle, 0, 0, 0);
+	fx.s1_holds_only_n().await;
+	shut_down(fx.cluster, &fx.time).await;
+}
+
+/// Wendelon ADR 0125 (successful delivery): S2's retirement is `retired`. S1's rewrite, held
+/// right after acceptance, renders `delivering` with exactly S1, the committed provenance's op
+/// and its generation, with `rewritten` not yet counted; released, it is `rewritten` once and
+/// the rendered last step carries that identity, the stage back at `idle`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_delivery_is_visible_by_stage_op_and_generation() {
+	let fx = aged_l2().await;
+	let slab = fx.slab();
+	let retired = fx.steps(TierStepOutcome::Retired);
+	match fx.step().await {
+		Ok(CertifiedTierStep::Retired { slab, .. }) if slab == fx.s2 => {}
+		other => panic!("S2's retirement: {other:?}"),
+	}
+	assert_eq!(fx.steps(TierStepOutcome::Retired), retired + 1);
+	let rewritten = fx.steps(TierStepOutcome::Rewritten);
+	let (reached, release) = slab.hold_next_certified_tier_step(CertifiedTierCut::AfterAcceptance);
+	slab.restart_certified_tier_cursor_for_test();
+	let worker = tokio::spawn(tier_step(
+		fx.cluster.node(fx.leader).data_server.clone(),
+		fx.committer(),
+	));
+	tokio::time::timeout(BOUND, reached.acquire())
+		.await
+		.expect("S1's step reaches acceptance")
+		.unwrap()
+		.forget();
+	let owner = slab.owner_ref().unwrap();
+	let op = fx
+		.cluster
+		.node(fx.leader)
+		.state_machine
+		.tiered_slab(owner.slab(fx.s1))
+		.await
+		.and_then(|tier| tier.certified)
+		.expect("the committed generation is certified")
+		.op;
+	let snapshot = slab.certified_tier_observer().snapshot();
+	assert!(snapshot.active_gid > 0, "{snapshot:?}");
+	fx.assert_rendered(
+		TierJobStage::Delivering,
+		fx.s1.get(),
+		op.op_seq,
+		snapshot.active_gid,
+	);
+	assert_eq!(
+		fx.steps(TierStepOutcome::Rewritten),
+		rewritten,
+		"not yet finished"
+	);
+	release.add_permits(1);
+	match tokio::time::timeout(BOUND, worker)
+		.await
+		.expect("the released worker completes")
+		.unwrap()
+	{
+		Ok(CertifiedTierStep::Rewritten { slab, op: done, .. }) if slab == fx.s1 => {
+			assert_eq!(done, op)
+		}
+		other => panic!("the worker's step: {other:?}"),
+	}
+	assert_eq!(fx.steps(TierStepOutcome::Rewritten), rewritten + 1);
+	fx.assert_rendered(TierJobStage::Idle, 0, 0, 0);
+	let rendered = fx.rendered();
+	for (series, value) in [
+		(
+			"wendelon_certified_tier_last_job_outcome{outcome=\"rewritten\"}",
+			1,
+		),
+		(
+			"wendelon_certified_tier_last_job_outcome{outcome=\"retired\"}",
+			0,
+		),
+		(
+			"wendelon_certified_tier_last_job{field=\"slab\"}",
+			fx.s1.get(),
+		),
+		(
+			"wendelon_certified_tier_last_job{field=\"op_seq\"}",
+			op.op_seq,
+		),
+		(
+			"wendelon_certified_tier_last_job{field=\"active_gid\"}",
+			snapshot.active_gid,
+		),
+	] {
+		assert_eq!(rendered.get(series), Some(&value), "{series}");
+	}
+	fx.s1_holds_only_n().await;
+	shut_down(fx.cluster, &fx.time).await;
+}
+
 /// Steps the leader's certified tier work until `done`: later steps recover what an unfinished
 /// worker left (or find the observer already did).
 async fn steps_until(fx: &AgedL2, what: &str, done: impl AsyncFn() -> bool) {
