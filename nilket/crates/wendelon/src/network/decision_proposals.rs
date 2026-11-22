@@ -1323,6 +1323,8 @@ impl DecisionProposals {
 
 	/// Wendelon ADR 0123 D7: the recent proposals (gid, target digest, reason), oldest
 	/// first, so a control can attribute a committed certificate by its target digest.
+	/// Read only by tests (DC-286).
+	#[cfg(test)]
 	pub(crate) fn proposed_trace(
 		&self,
 	) -> Vec<(
@@ -1340,12 +1342,16 @@ impl DecisionProposals {
 	}
 
 	/// Wendelon ADR 0123 D7: this node's proposals as leader, by reason.
+	/// Read only by tests (DC-286).
+	#[cfg(test)]
 	pub(crate) fn proposed_counts(&self) -> BTreeMap<&'static str, u64> {
 		self.proposed_reasons.lock().unwrap().counts.clone()
 	}
 
 	/// Wendelon ADR 0123 D7: the reason this node proposed target `gid` with, if it
 	/// was among the recent proposals here.
+	/// Read only by tests (DC-286).
+	#[cfg(test)]
 	pub(crate) fn proposed_reason(
 		&self,
 		gid: u64,

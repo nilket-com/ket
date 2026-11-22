@@ -347,6 +347,8 @@ impl CertificationWork {
 	}
 
 	/// (builds, base entries loaded, staged rows, activations, activation rows).
+	/// Read only by tests (DC-286).
+	#[cfg(test)]
 	pub(crate) fn snapshot(&self) -> [u64; 5] {
 		use std::sync::atomic::Ordering::Relaxed;
 		[

@@ -599,6 +599,8 @@ fn age_due(decisions: &DecisionState, now_ms: u64) -> bool {
 /// report never counts as agreement. `now_ms` is the leader's gated decision
 /// clock, or `None` when it has no fresh sample: an ordinary target never
 /// needs one.
+/// Compiled for tests only (DC-286): production proposes through [`next_target_with_reason`].
+#[cfg(test)]
 pub(crate) fn next_target(state: &SmState, applied: u64, now_ms: Option<u64>) -> Option<Target> {
 	next_target_with_reason(state, applied, now_ms).map(|(target, _)| target)
 }
@@ -645,6 +647,8 @@ pub(crate) const PRESSURE_RELEASE_BYTES: u64 = super::MAX_RETAINED_CLAIM_BYTES /
 /// the mark and the cut would release at least the least release; a tiny
 /// releasable prefix never proposes, so pressure held by records no generation
 /// can release is left to admission's `RetainedFull`.
+/// Compiled for tests only (DC-286): the proposer checks the same condition inline, mark first.
+#[cfg(test)]
 pub(crate) fn pressure_due(retained: u64, releasable: u64) -> bool {
 	retained >= PRESSURE_MARK_BYTES && releasable >= PRESSURE_RELEASE_BYTES
 }
