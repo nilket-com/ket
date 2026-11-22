@@ -289,6 +289,10 @@ pub struct StagedCandidate {
 	pub target_digest: [u8; 32],
 	pub predecessor_gid: u64,
 	pub chunks: Vec<ChunkSum>,
+	/// Wendelon ADR 0121 D3: the least HLC of the candidate's governed, live
+	/// entries at or above its target's floor, staged with the chunks so a
+	/// reopened member reports the same value.
+	pub oldest_visible: Option<crate::schema::HybridTimestamp>,
 }
 
 /// The base's durable metadata.
@@ -1580,6 +1584,32 @@ impl PersistentLocalIndex {
 			})
 			.await
 	}
+
+	/// Test-only (wendelon ADR 0121 R2): rewrites only the staged candidate's
+	/// least visible row, offline, leaving its rows, chunks and digests.
+	pub(crate) async fn set_staged_oldest_for_test(
+		&self,
+		oldest_visible: Option<crate::schema::HybridTimestamp>,
+	) -> std::io::Result<()> {
+		self.db
+			.run(move |db| {
+				let tx = db.begin_write().map_err(redb_to_io)?;
+				{
+					let mut table = tx.open_table(BASE_META_TABLE).map_err(redb_to_io)?;
+					let mut meta = read_meta(&table)?;
+					let staged = meta
+						.staged
+						.as_mut()
+						.ok_or_else(|| Error::other("no staged candidate"))?;
+					staged.oldest_visible = oldest_visible;
+					table
+						.insert(BASE_META_KEY, encode(&meta)?.as_slice())
+						.map_err(redb_to_io)?;
+				}
+				tx.commit().map_err(redb_to_io)
+			})
+			.await
+	}
 }
 
 #[cfg(test)]
@@ -1608,6 +1638,7 @@ mod tests {
 
 	fn candidate(gid: u64, predecessor_gid: u64, entries: &[BaseEntry]) -> StagedCandidate {
 		StagedCandidate {
+			oldest_visible: None,
 			gid,
 			target_digest: [gid as u8; 32],
 			predecessor_gid,

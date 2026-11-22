@@ -161,7 +161,8 @@ async fn committed_cut(cluster: &Cluster) -> (u64, bool) {
 			let applied = state.last_applied_log_id.map_or(0, |id| id.index);
 			(
 				t,
-				crate::consensus::decisions::generations::next_target(state, applied).is_none(),
+				crate::consensus::decisions::generations::next_target(state, applied, None)
+					.is_none(),
 			)
 		})
 		.await

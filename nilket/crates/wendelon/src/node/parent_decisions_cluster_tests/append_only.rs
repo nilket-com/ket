@@ -55,7 +55,9 @@ async fn an_append_only_write_keeps_identical_rows() {
 }
 
 /// An answer's rows as a sorted multiset: an AppendOnly table keeps equal rows.
-fn multiset(answer: &crate::network::data_server::reader::TestQueryAnswer) -> Vec<(i64, String)> {
+pub(super) fn multiset(
+	answer: &crate::network::data_server::reader::TestQueryAnswer,
+) -> Vec<(i64, String)> {
 	let mut rows = Vec::new();
 	for batch in &answer.batches {
 		let ids = batch

@@ -138,6 +138,8 @@ pub(crate) struct RecoveryDriver {
 	pub(crate) progress: crate::network::data_server::certification::CertificationProgress,
 	/// The configured cluster retention policy (the frozen-policy check).
 	pub(crate) retention: crate::storage::retention::MvccRetentionPolicy,
+	/// Wendelon ADR 0121 D1: the configured ParentDecisions window (ms).
+	pub(crate) retention_window_ms: u64,
 	/// The node's wall clock (`SystemClock` in production; the cluster's in a test).
 	pub(crate) clock: Arc<dyn crate::consensus::monitor::PhysicalClock>,
 }
@@ -412,6 +414,7 @@ impl RecoveryDriver {
 				repair: &repair,
 				retention: self.retention,
 				now_ms: self.clock.now_ms(),
+				configured_window_ms: self.retention_window_ms,
 				// C5: prove inherited winners from this store's own data before
 				// signing for them.
 				reprove_inherited: true,
@@ -685,6 +688,7 @@ impl RecoveryDriver {
 			target_digest: certificate.target_digest,
 			predecessor_gid: certificate.predecessor_gid,
 			chunks: certificate.chunks.clone(),
+			oldest_visible: certificate.oldest_visible,
 		};
 		// Phase 1.
 		if !index.recovered_staging_matches(candidate.clone()).await? {

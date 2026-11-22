@@ -734,6 +734,9 @@ pub enum TenantAdminRequestWire {
 	GetReplacement {
 		token: u128,
 	},
+	/// Wendelon ADR 0121 D4: the store's bound ParentDecisions retention window,
+	/// read linearizably. Appended.
+	GetRetentionBinding,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -801,6 +804,16 @@ pub struct ReplacementAdminExtensionWire {
 	pub replacement: Option<ReplacementReportWire>,
 }
 
+/// Wendelon ADR 0121 D4: appended after the [`TenantAdminResponseWire`] of an
+/// answer to `GetRetentionBinding`, and only there; decoded with
+/// [`decode_retention_admin_answer`].
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetentionAdminExtensionWire {
+	/// The bound window in milliseconds; `None` when none is bound or the store
+	/// runs today's authority.
+	pub window_ms: Option<u64>,
+}
+
 /// ADR 0104 (wendelon): a replacement as the cluster recorded it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplacementReportWire {
@@ -834,6 +847,13 @@ pub fn decode_tenant_admin_answer(
 pub fn decode_replacement_admin_answer(
 	bytes: &[u8],
 ) -> std::io::Result<(TenantAdminResponseWire, ReplacementAdminExtensionWire)> {
+	decode_extended_admin_answer(bytes)
+}
+
+/// Wendelon ADR 0121 D4: decodes an answer to `GetRetentionBinding`.
+pub fn decode_retention_admin_answer(
+	bytes: &[u8],
+) -> std::io::Result<(TenantAdminResponseWire, RetentionAdminExtensionWire)> {
 	decode_extended_admin_answer(bytes)
 }
 
@@ -4479,6 +4499,49 @@ impl WendelonControlServer {
 						message: None,
 					},
 					&ReplacementAdminExtensionWire { replacement },
+				)
+			}
+			TenantAdminRequestWire::GetRetentionBinding => {
+				if let Err(error) =
+					require_administrative_action(&context.actor, AdministrativeAction::BackupHold)
+				{
+					return self.tenant_admin_rejection(
+						&frame,
+						CONTROL_REASON_AUTHORIZATION_FAILED,
+						error.to_string(),
+						None,
+					);
+				}
+				// A linearizable read, so a bind just applied is seen.
+				if let Err(error) = self.raft.ensure_linearizable().await {
+					return self.tenant_admin_rejection(
+						&frame,
+						Self::tenant_admin_error_reason(&error.to_string()),
+						error.to_string(),
+						None,
+					);
+				}
+				let window_ms = self
+					.state_machine
+					.read_state(|state| {
+						state
+							.decisions
+							.as_ref()
+							.and_then(|decisions| decisions.retention())
+							.map(|binding| binding.window_ms)
+					})
+					.await;
+				self.build_backup_admin_frame(
+					frame.header.stream_id,
+					&TenantAdminResponseWire {
+						accepted: true,
+						reason_code: CONTROL_REASON_GRANTED,
+						leader_hint: Some(self.local_node.id),
+						tenant: None,
+						tenants: Vec::new(),
+						message: None,
+					},
+					&RetentionAdminExtensionWire { window_ms },
 				)
 			}
 			TenantAdminRequestWire::GetBackupHold => {

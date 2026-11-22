@@ -842,6 +842,9 @@ pub struct DecisionProposals {
 	clock: Arc<dyn PhysicalClock>,
 	factory: Arc<TransportProviderFactory>,
 	pool: Arc<BufPool>,
+	/// Wendelon ADR 0121 D1: the window this node's configuration binds when it
+	/// leads a store that has none bound (ms; 0 is the Disabled binding).
+	retention_window_ms: u64,
 	/// ADR 0700: peer clock samples for the decision clock gate.
 	clock_samples: DecisionClockSamples,
 	/// ADR 0700: the leader this node last sent a request to, and when.
@@ -927,6 +930,7 @@ impl DecisionProposals {
 			clock,
 			factory,
 			pool,
+			retention_window_ms: 0,
 			clock_samples: DecisionClockSamples::default(),
 			last_sent: std::sync::Mutex::new(None),
 			#[cfg(test)]
@@ -934,6 +938,13 @@ impl DecisionProposals {
 			#[cfg(test)]
 			ctas_maintenance_paused: std::sync::atomic::AtomicBool::new(false),
 		}
+	}
+
+	/// Wendelon ADR 0121 D1: the window this node binds when it leads an unbound
+	/// store.
+	pub(crate) fn with_retention_window_ms(mut self, window_ms: u64) -> Self {
+		self.retention_window_ms = window_ms;
+		self
 	}
 
 	/// ADR 0104 (wendelon): the current leader as a dialable slot; this node's
@@ -1659,6 +1670,38 @@ impl<'a> MaintenanceProposals<'a> {
 
 	/// ADR 0699 S5a, leader only: commits the pending generation once every
 	/// member reported, or proposes the next target. The reducer decides.
+	/// Wendelon ADR 0121 D1, leader only: binds this node's configured window
+	/// while the store has none. Derived only while unbound; a second copy
+	/// returns RetentionBound and changes nothing, and another leader's
+	/// different window is refused RetentionRebind (`consensus/decisions.rs`
+	/// `bind_retention`).
+	pub(crate) async fn ensure_retention_once(&self) -> Option<MaintenanceProposalResult> {
+		let proposals = self.proposals;
+		if proposals.mode != DecisionMode::ParentDecisions
+			|| proposals.leader_slot().await != Some(proposals.local.id)
+		{
+			return None;
+		}
+		let unbound = proposals
+			.state_machine
+			.read_state(|state| {
+				state
+					.decisions
+					.as_ref()
+					.is_some_and(|decisions| decisions.retention().is_none())
+			})
+			.await;
+		if !unbound {
+			return None;
+		}
+		Some(
+			self.commit(WendelonRequest::Decision(DecisionCommand::BindRetention {
+				window_ms: proposals.retention_window_ms,
+			}))
+			.await,
+		)
+	}
+
 	pub(crate) async fn generation_step(&self) -> Option<MaintenanceProposalResult> {
 		let proposals = self.proposals;
 		if proposals.mode != DecisionMode::ParentDecisions
@@ -1666,14 +1709,17 @@ impl<'a> MaintenanceProposals<'a> {
 		{
 			return None;
 		}
+		// Wendelon ADR 0121 D3: the gated decision clock, the age trigger's only
+		// input; without a fresh sample, ordinary targets still progress.
+		let now_ms = proposals.decision_clock_now().await.ok();
 		let command = proposals
 			.state_machine
-			.read_state(|state| {
+			.read_state(move |state| {
 				if let Some(gid) = crate::consensus::decisions::generations::ready_commit(state) {
 					return Some(DecisionCommand::CommitGeneration { gid });
 				}
 				let applied = state.last_applied_log_id.map_or(0, |id| id.index);
-				crate::consensus::decisions::generations::next_target(state, applied)
+				crate::consensus::decisions::generations::next_target(state, applied, now_ms)
 					.map(|target| DecisionCommand::ProposeTarget { target })
 			})
 			.await?;

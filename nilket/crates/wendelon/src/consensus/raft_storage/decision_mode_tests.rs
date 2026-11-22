@@ -118,15 +118,15 @@ fn a_new_mode_snapshot_is_refused_by_today_before_its_body_is_trusted() {
 	assert!(error.contains("newer than this build accepts"), "{error}");
 }
 
-/// Wendelon ADR 0119 D6, then ADR 0120 D9: a ParentDecisions build refuses a
-/// ParentDecisions snapshot of the previous format (32, ADR 0119's) and of a later one before
+/// Wendelon ADR 0119 D6, then ADR 0120 D9 and ADR 0121 D1: a ParentDecisions build
+/// refuses a ParentDecisions snapshot of the previous format (33, ADR 0120's) and of a later one before
 /// its body is trusted; snapshot install decodes through this same reader
 /// (`decode_snapshot_file`), so an install of either is refused before anything
 /// is published.
 #[test]
 fn a_parent_decisions_snapshot_of_another_format_is_refused_before_its_body_is_trusted() {
 	let new = DecisionMode::ParentDecisions;
-	assert_eq!(new.snapshot_format(), 33);
+	assert_eq!(new.snapshot_format(), 34);
 	let state = SmState {
 		decisions: Some(Default::default()),
 		..SmState::default()
@@ -247,6 +247,11 @@ async fn a_new_mode_store_writes_its_own_format_and_reopens() {
 
 use crate::consensus::decisions::tests as fixture;
 
+const PARENT_DECISIONS_V34_MANIFEST: &str =
+	include_str!("../../../tests/fixtures/consensus_body/parent_decisions_v34.txt");
+/// Wendelon ADR 0120's format-33 bodies, retained. Wendelon ADR 0121 moved only
+/// the decision state (its retention binding, appended) and added the bind
+/// command and the retention cut's shapes.
 const PARENT_DECISIONS_V33_MANIFEST: &str =
 	include_str!("../../../tests/fixtures/consensus_body/parent_decisions_v33.txt");
 /// Wendelon ADR 0119's format-32 bodies, retained. Wendelon ADR 0120 moved only
@@ -334,7 +339,7 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 fn manifest() -> BTreeMap<String, String> {
-	parse(PARENT_DECISIONS_V33_MANIFEST)
+	parse(PARENT_DECISIONS_V34_MANIFEST)
 }
 
 /// ADR 0725: the three owner-signed operation kinds pinned in the format-18
@@ -503,7 +508,7 @@ fn entry(index: u64, request: WendelonRequest) -> Entry<WendelonTypeConfig> {
 }
 
 #[test]
-fn the_format_33_bodies_match_their_goldens_and_round_trip() {
+fn the_format_34_bodies_match_their_goldens_and_round_trip() {
 	let stored = manifest();
 	let state = golden_state();
 	let body = encode_state_body(DecisionMode::ParentDecisions, &state).unwrap();
@@ -752,6 +757,11 @@ fn the_format_33_bodies_match_their_goldens_and_round_trip() {
 			.unwrap(),
 		),
 	));
+	// Wendelon ADR 0121: the bind command, and a target, report and certificate
+	// carrying a retention cut.
+	for (name, bytes) in golden_retention_shapes() {
+		actual.push((name.to_owned(), hex(&bytes)));
+	}
 	let moved: Vec<String> = actual
 		.iter()
 		.filter(|(name, hex)| stored.get(name) != Some(hex))
@@ -759,7 +769,7 @@ fn the_format_33_bodies_match_their_goldens_and_round_trip() {
 		.collect();
 	assert!(
 		moved.is_empty(),
-		"format-33 bodies moved or are missing; expected lines:\n{}",
+		"format-34 bodies moved or are missing; expected lines:\n{}",
 		moved.join("\n")
 	);
 	assert_eq!(stored.len(), actual.len());
@@ -773,6 +783,31 @@ fn the_format_33_bodies_match_their_goldens_and_round_trip() {
 	// only the decision state differs from the format-16 corpus: by exactly the
 	// appended seal.
 	assert!(decisions.sealed().is_some());
+	// Wendelon ADR 0121: against the format-33 corpus only the decision state moved,
+	// by exactly its appended retention binding (the golden history binds the
+	// Disabled window: `Some(0)`); the bind command and the cut's shapes were added.
+	assert_eq!(
+		decisions.retention(),
+		Some(crate::consensus::decisions::RetentionBinding { window_ms: 0 })
+	);
+	const ADDED_0121: [&str; 4] = [
+		"bind_retention",
+		"propose_target_retention",
+		"report_retention",
+		"certificate_retention",
+	];
+	let retained_v33 = parse(PARENT_DECISIONS_V33_MANIFEST);
+	assert_eq!(stored.len(), retained_v33.len() + ADDED_0121.len());
+	for (name, hex) in &retained_v33 {
+		if name == "decisions_golden_history" {
+			assert_eq!(stored.get(name), Some(&format!("{hex}0100")), "{name}");
+		} else {
+			assert_eq!(stored.get(name), Some(hex), "{name}");
+		}
+	}
+	for name in ADDED_0121 {
+		assert!(stored.contains_key(name), "{name}");
+	}
 	// Wendelon ADR 0120: against the format-32 corpus only the decision state
 	// moved, by exactly its appended empty CTAS part (four empty maps and two zero
 	// counters); the CTAS commands and a chunk refused by abandonment were added.
@@ -787,20 +822,20 @@ fn the_format_33_bodies_match_their_goldens_and_round_trip() {
 		"parent_refused_ctas_abandoned",
 	];
 	let retained_v32 = parse(PARENT_DECISIONS_V32_MANIFEST);
-	assert_eq!(stored.len(), retained_v32.len() + ADDED_0120.len());
+	assert_eq!(retained_v33.len(), retained_v32.len() + ADDED_0120.len());
 	for (name, hex) in &retained_v32 {
 		if name == "decisions_golden_history" {
 			assert_eq!(
-				stored.get(name),
+				retained_v33.get(name),
 				Some(&format!("{hex}000000000000")),
 				"{name}"
 			);
 		} else {
-			assert_eq!(stored.get(name), Some(hex), "{name}");
+			assert_eq!(retained_v33.get(name), Some(hex), "{name}");
 		}
 	}
 	for name in ADDED_0120 {
-		assert!(stored.contains_key(name), "{name}");
+		assert!(retained_v33.contains_key(name), "{name}");
 	}
 	// Wendelon ADR 0119: the format-32 corpus is the format-31 corpus, byte for byte.
 	assert_eq!(retained_v32, parse(PARENT_DECISIONS_V31_MANIFEST));
@@ -1253,6 +1288,187 @@ fn a_schema_cannot_take_the_reserved_kv_table_id_under_parent_decisions() {
 	let error = apply_schema_update(&mut state, &bytes).unwrap_err();
 	assert!(error.contains("reserved KV table id"), "{error}");
 	assert_eq!(state.table_schemas, before);
+}
+
+/// Wendelon ADR 0121 S1 baseline: the frozen Section 8 driver restates
+/// `InheritCluster` at generation ZERO (`toron-tpch` `s7_measure/drive.rs`).
+/// Under ParentDecisions that restatement keeps the ordinary contract: the first
+/// one succeeds and advances the policy generation exactly as outside the mode
+/// (`TableLifecycleCatalog::set_next_generation`), a stale repeat is refused and
+/// changes nothing, and any other policy stays frozen.
+#[test]
+fn an_inherit_cluster_restatement_keeps_the_ordinary_contract_under_parent_decisions() {
+	use crate::consensus::SetTableRetentionPolicy;
+	use crate::schema::{PolicyGeneration, TableRetentionPolicy};
+	let restate = |expected, new_policy| {
+		WendelonRequest::SetTableRetentionPolicy(SetTableRetentionPolicy {
+			tenant_id: fixture::TENANT,
+			table_object_id: fixture::TABLE,
+			expected_policy_generation: expected,
+			new_policy,
+			updated_at_hlc: crate::schema::HybridTimestamp {
+				physical_ms: 42,
+				logical: 1,
+				node_id: 1,
+			},
+		})
+	};
+	// The same command outside the mode: the contract the mode must keep.
+	let mut today = fixture::base(3);
+	today.decisions = None;
+	let (response, _) = apply_request_at_log_index(
+		&mut today,
+		restate(PolicyGeneration::ZERO, TableRetentionPolicy::InheritCluster),
+		1,
+		0,
+	);
+	assert!(
+		matches!(response, WendelonResponse::Success),
+		"{response:?}"
+	);
+	let generation = today
+		.table_lifecycle
+		.current_generation(fixture::TENANT, fixture::TABLE);
+	assert_eq!(generation, PolicyGeneration::ZERO.next());
+
+	let mut state = fixture::base(3);
+	let (response, _) = apply_request_at_log_index(
+		&mut state,
+		restate(PolicyGeneration::ZERO, TableRetentionPolicy::InheritCluster),
+		1,
+		0,
+	);
+	assert!(
+		matches!(response, WendelonResponse::Success),
+		"the first InheritCluster restatement at ZERO is accepted under ParentDecisions: {response:?}"
+	);
+	assert_eq!(state.table_lifecycle, today.table_lifecycle);
+	// A stale repeat is refused and changes nothing.
+	let before = state.table_lifecycle.clone();
+	let (response, _) = apply_request_at_log_index(
+		&mut state,
+		restate(PolicyGeneration::ZERO, TableRetentionPolicy::InheritCluster),
+		2,
+		0,
+	);
+	assert!(
+		matches!(&response, WendelonResponse::Error(why) if why.contains("generation")),
+		"{response:?}"
+	);
+	assert_eq!(state.table_lifecycle, before);
+	// Any other policy stays frozen in S1.
+	let (response, _) = apply_request_at_log_index(
+		&mut state,
+		restate(generation, TableRetentionPolicy::Disabled),
+		3,
+		0,
+	);
+	assert!(
+		matches!(&response, WendelonResponse::Error(why) if why.contains("frozen")),
+		"{response:?}"
+	);
+	assert_eq!(state.table_lifecycle, before);
+}
+
+/// Wendelon ADR 0121 R3: at the real snapshot boundary (the body a snapshot file
+/// and an install decode through), a state is refused when a retention field
+/// contradicts its binding or its applied clock, and accepted when consistent;
+/// unbound genesis stays legal. Each refused state differs from a valid one in
+/// its retention fields only.
+#[test]
+fn a_snapshot_whose_retention_cut_contradicts_its_binding_or_clock_is_refused() {
+	use crate::consensus::decisions::generations::RetentionCut;
+	let mode = DecisionMode::ParentDecisions;
+	let cut = |window_ms, stamp_ms, floor_ms| RetentionCut {
+		window_ms,
+		stamp_ms,
+		floor_ms,
+	};
+	let hlc = |physical_ms| crate::schema::HybridTimestamp {
+		physical_ms,
+		logical: 1,
+		node_id: 1,
+	};
+	let round = |state: &SmState| decode_state_body(mode, &encode_state_body(mode, state).unwrap());
+	let (w, clock) = (15_000, 1_000_000);
+	let good = cut(w, clock, clock - w);
+	assert!(
+		round(&fixture::retention_state(None, 0, None, None, None)).is_ok(),
+		"unbound genesis"
+	);
+	let valid =
+		fixture::retention_state(Some(w), clock, Some(good), Some(hlc(clock - w)), Some(good));
+	assert_eq!(
+		round(&valid).unwrap().decisions,
+		valid.decisions,
+		"a consistent store"
+	);
+	let disabled = fixture::retention_state(
+		Some(0),
+		clock,
+		Some(cut(0, 0, 0)),
+		None,
+		Some(cut(0, clock, 0)),
+	);
+	assert!(round(&disabled).is_ok(), "the Disabled binding");
+	for (what, state) in [
+		(
+			"a certificate under an unbound store",
+			fixture::retention_state(None, clock, Some(cut(0, 0, 0)), None, None),
+		),
+		(
+			"a certificate of another window",
+			fixture::retention_state(Some(w), clock, Some(cut(0, 0, 0)), None, None),
+		),
+		(
+			"a floor above clock - window",
+			fixture::retention_state(
+				Some(w),
+				clock,
+				Some(cut(w, clock, clock - w + 1)),
+				None,
+				None,
+			),
+		),
+		(
+			"a stamp beyond the applied clock",
+			fixture::retention_state(
+				Some(w),
+				clock,
+				Some(cut(w, clock + 1, clock - w)),
+				None,
+				None,
+			),
+		),
+		(
+			"a floor under the Disabled binding",
+			fixture::retention_state(Some(0), clock, Some(cut(0, 0, 1)), None, None),
+		),
+		(
+			"a least visible row below the certified floor",
+			fixture::retention_state(Some(w), clock, Some(good), Some(hlc(clock - w - 1)), None),
+		),
+		(
+			"a pending target of another window",
+			fixture::retention_state(Some(w), clock, Some(good), None, Some(cut(0, 0, 0))),
+		),
+		(
+			"a pending floor below the certificate's",
+			fixture::retention_state(
+				Some(w),
+				clock,
+				Some(good),
+				None,
+				Some(cut(w, clock, clock - w - 1)),
+			),
+		),
+	] {
+		let error = round(&state).expect_err(what);
+		assert!(
+			error.contains("retention") || error.contains("decisions"),
+			"{what}: {error}"
+		);
+	}
 }
 
 /// ADR 0699 S5a: the survivor and read policy is frozen in mode. A retention
@@ -1955,7 +2171,8 @@ fn policy_two_pending_state() -> (SmState, u64) {
 		},
 	);
 	let applied = fixture::peek_index() - 1;
-	let target = crate::consensus::decisions::generations::next_target(&state, applied).unwrap();
+	let target =
+		crate::consensus::decisions::generations::next_target(&state, applied, None).unwrap();
 	assert_eq!(target.survivor_policy, 2);
 	fixture::decide(&mut state, DecisionCommand::ProposeTarget { target });
 	let last = fixture::peek_index() - 1;
@@ -2080,7 +2297,8 @@ fn a_suffix_introducing_policy_two_replays_alike() {
 		}),
 	);
 	let applied = fixture::peek_index() - 1;
-	let target = crate::consensus::decisions::generations::next_target(&live, applied).unwrap();
+	let target =
+		crate::consensus::decisions::generations::next_target(&live, applied, None).unwrap();
 	assert_eq!(target.survivor_policy, 2, "the suffix introduces policy 2");
 	apply(
 		&mut live,
@@ -2659,6 +2877,83 @@ fn a_create_of_a_dropped_table_id_is_refused_under_parent_decisions() {
 }
 
 /// Wendelon ADR 0120: one of each CTAS chain command, pinned.
+/// Wendelon ADR 0121: the bind command (as a Raft request), a target, a member's
+/// report and a certificate carrying a retention cut, each with every field set.
+fn golden_retention_shapes() -> Vec<(&'static str, Vec<u8>)> {
+	use crate::consensus::decisions::DecisionCommand;
+	use crate::consensus::decisions::generations::{
+		Certificate, ChunkSum, GENERATION_CHUNKS, ReportBody, RetentionCut, Target,
+	};
+	let retention = RetentionCut {
+		window_ms: 15_000,
+		stamp_ms: 0x0121_0121,
+		floor_ms: 0x0121_0121 - 15_000,
+	};
+	let oldest = crate::schema::HybridTimestamp {
+		physical_ms: 0x0121_0000,
+		logical: 7,
+		node_id: 2,
+	};
+	let target = Target {
+		gid: 121,
+		t: 1_210,
+		predecessor_gid: 120,
+		members: vec![fixture::signer(1), fixture::signer(2), fixture::signer(3)],
+		chunk_bits: crate::consensus::decisions::generations::CHUNK_BITS,
+		survivor_policy: crate::consensus::decisions::generations::SURVIVOR_POLICY,
+		retention,
+	};
+	let digest = crate::consensus::decisions::generations::target_digest(&target);
+	let chunks = vec![
+		ChunkSum {
+			count: 1,
+			root: [0x21; 32],
+		};
+		GENERATION_CHUNKS
+	];
+	vec![
+		(
+			"bind_retention",
+			postcard::to_stdvec(&WendelonRequest::Decision(DecisionCommand::BindRetention {
+				window_ms: 15_000,
+			}))
+			.unwrap(),
+		),
+		(
+			"propose_target_retention",
+			postcard::to_stdvec(&WendelonRequest::Decision(DecisionCommand::ProposeTarget {
+				target: target.clone(),
+			}))
+			.unwrap(),
+		),
+		(
+			"report_retention",
+			postcard::to_stdvec(&ReportBody {
+				gid: 121,
+				target_digest: digest,
+				reporter: fixture::signer(1),
+				chunks: chunks.clone(),
+				oldest_visible: Some(oldest),
+			})
+			.unwrap(),
+		),
+		(
+			"certificate_retention",
+			postcard::to_stdvec(&Certificate {
+				gid: 121,
+				target_digest: digest,
+				t: 1_210,
+				predecessor_gid: 120,
+				chunks,
+				committed_at: 1_211,
+				retention,
+				oldest_visible: Some(oldest),
+			})
+			.unwrap(),
+		),
+	]
+}
+
 fn golden_ctas_commands() -> Vec<(&'static str, crate::consensus::decisions::DecisionCommand)> {
 	use crate::consensus::decisions::DecisionCommand;
 	use crate::consensus::decisions::ctas::{

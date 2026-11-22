@@ -435,6 +435,11 @@ pub enum CtasRefusal {
 	/// Prune before the chain's retention lapsed on the committed clock, or before
 	/// every key its operation names is at or below the retirement floor.
 	PruneEarly,
+	/// Wendelon ADR 0121 D4: the store binds a positive retention window. A floor
+	/// could fall between a result's chunk HLCs before its first visible read,
+	/// so a fresh Begin is refused until that interaction has its own decision.
+	/// Appended.
+	RetentionWindowBound,
 }
 
 impl From<CtasRefusal> for DecisionRefusal {
@@ -515,6 +520,15 @@ pub(super) fn apply_begin(
 	}
 	if decisions.hold.is_some() {
 		return Err(DecisionRefusal::BackupHold);
+	}
+	// Wendelon ADR 0121 D4, R1: a fresh Begin needs the explicit Disabled binding.
+	// Unbound is not Disabled: like a Reserve, nothing begins before the window is
+	// bound (a chain begun then would survive a later positive bind). A replay of
+	// an existing chain answered above.
+	match decisions.retention {
+		Some(binding) if binding.window_ms == 0 => {}
+		Some(_) => return Err(CtasRefusal::RetentionWindowBound.into()),
+		None => return Err(DecisionRefusal::FormationIncomplete),
 	}
 	if !state
 		.tenants

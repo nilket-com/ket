@@ -2568,6 +2568,22 @@ impl WendelonClient {
 		.await
 	}
 
+	/// Wendelon ADR 0121 D4: `GetRetentionBinding`, whose answer carries the
+	/// retention extension.
+	pub async fn retention_admin(
+		&self,
+		request: &TenantAdminRequestWire,
+	) -> std::io::Result<(
+		TenantAdminResponseWire,
+		crate::network::control_server::RetentionAdminExtensionWire,
+	)> {
+		self.extended_admin_exchange(
+			request,
+			crate::network::control_server::decode_retention_admin_answer,
+		)
+		.await
+	}
+
 	async fn tenant_admin_exchange(
 		&self,
 		request: &TenantAdminRequestWire,

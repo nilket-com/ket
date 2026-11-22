@@ -975,6 +975,11 @@ struct RawClusterConfig {
 	/// ADR 0721: which write-decision authority a fresh store is created under.
 	#[serde(default)]
 	decision_authority: RawDecisionAuthority,
+	/// Wendelon ADR 0121 D1: the ParentDecisions cluster retention window in
+	/// seconds; 0 (the default) is none. Only for `decision_authority =
+	/// "parent-decisions"`.
+	#[serde(default)]
+	parent_decisions_retention_window_secs: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
@@ -1011,6 +1016,7 @@ impl Default for RawClusterConfig {
 			mode: RawClusterMode::Bootstrap,
 			seed_nodes: Vec::new(),
 			decision_authority: RawDecisionAuthority::Today,
+			parent_decisions_retention_window_secs: 0,
 		}
 	}
 }
@@ -1479,6 +1485,9 @@ impl RawConfig {
 				0 => MvccRetentionPolicy::Disabled,
 				secs => MvccRetentionPolicy::FixedWindow(Duration::from_secs(secs)),
 			},
+			parent_decisions_retention_window: Duration::from_secs(
+				self.cluster.parent_decisions_retention_window_secs,
+			),
 			counter_retention: self.counter.into_retention()?,
 			observability,
 			audit,

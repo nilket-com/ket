@@ -140,6 +140,9 @@ pub(crate) fn base(rf: u32) -> SmState {
 		decisions: Some(DecisionState::default()),
 		..SmState::default()
 	};
+	// Wendelon ADR 0121 D1: a formed store binds its window before any write; the
+	// fixture binds the Disabled window, today's behaviour.
+	state.decisions.as_mut().unwrap().retention = Some(RetentionBinding { window_ms: 0 });
 	state.epoch_history.insert(EPOCH, epoch_config(EPOCH));
 	// ADR 0720: a formed cluster: the voters are the epoch's peers.
 	state.last_membership = formed_membership(&[1, 2, 3]);
@@ -2408,6 +2411,7 @@ fn target(state: &SmState, gid: u64, t: u64, predecessor_gid: u64) -> generation
 		members: generations::current_members(state).unwrap(),
 		chunk_bits: generations::CHUNK_BITS,
 		survivor_policy: generations::SURVIVOR_POLICY,
+		retention: Default::default(),
 	}
 }
 
@@ -2419,6 +2423,7 @@ fn propose(state: &mut SmState, gid: u64, t: u64, predecessor_gid: u64) -> Decis
 fn report_of(state: &SmState, member: Signer, chunk: u8) -> DecisionCommand {
 	let pending = decisions(state).generations.pending.clone().unwrap();
 	let body = generations::ReportBody {
+		oldest_visible: None,
 		gid: pending.target.gid,
 		target_digest: pending.digest,
 		reporter: member,
@@ -2433,6 +2438,385 @@ fn report_of(state: &SmState, member: Signer, chunk: u8) -> DecisionCommand {
 	DecisionCommand::Report {
 		report: sign_for_test(body, member),
 	}
+}
+
+// ============================================================
+//  WENDELON ADR 0121: THE RETENTION WINDOW AND ITS CERTIFIED CUT
+// ============================================================
+
+/// The frozen Section 8 window.
+const WINDOW_MS: u64 = 15_000;
+
+fn bind_window(state: &mut SmState, window_ms: u64) {
+	state.decisions.as_mut().unwrap().retention = Some(RetentionBinding { window_ms });
+}
+
+fn cut(window_ms: u64, stamp_ms: u64, floor_ms: u64) -> generations::RetentionCut {
+	generations::RetentionCut {
+		window_ms,
+		stamp_ms,
+		floor_ms,
+	}
+}
+
+fn propose_cut(
+	state: &mut SmState,
+	gid: u64,
+	t: u64,
+	predecessor_gid: u64,
+	retention: generations::RetentionCut,
+) -> DecisionResult {
+	let target = generations::Target {
+		retention,
+		..target(state, gid, t, predecessor_gid)
+	};
+	decide(state, DecisionCommand::ProposeTarget { target })
+}
+
+fn report_oldest(
+	state: &SmState,
+	member: Signer,
+	oldest_visible: Option<crate::schema::HybridTimestamp>,
+) -> DecisionCommand {
+	let DecisionCommand::Report { report } = report_of(state, member, 3) else {
+		unreachable!()
+	};
+	let body = generations::ReportBody {
+		oldest_visible,
+		..report.body
+	};
+	DecisionCommand::Report {
+		report: sign_for_test(body, member),
+	}
+}
+
+/// Every member reports `oldest_visible`, and the pending generation commits.
+fn commit_with(state: &mut SmState, oldest_visible: Option<crate::schema::HybridTimestamp>) {
+	let pending = decisions(state).generations.pending.clone().unwrap();
+	for member in &pending.target.members {
+		let report = report_oldest(state, *member, oldest_visible);
+		assert!(matches!(
+			decide(state, report),
+			DecisionResult::ReportRecorded { .. }
+		));
+	}
+	assert_eq!(
+		decide(
+			state,
+			DecisionCommand::CommitGeneration {
+				gid: pending.target.gid
+			}
+		),
+		DecisionResult::GenerationCommitted {
+			gid: pending.target.gid
+		}
+	);
+}
+
+fn hlc_at(physical_ms: u64) -> crate::schema::HybridTimestamp {
+	crate::schema::HybridTimestamp {
+		physical_ms,
+		logical: 1,
+		node_id: 1,
+	}
+}
+
+/// D1: the window binds once. No write is admitted before it; the same window
+/// again is a no-op; another window is refused and changes nothing.
+#[test]
+fn the_retention_window_binds_once_before_the_first_write() {
+	let mut state = base(3);
+	grant_all(&mut state);
+	state.decisions.as_mut().unwrap().retention = None;
+	let claim = claim(key(T0, 1), children(&state, 2), 0);
+	assert_eq!(
+		reserve(&mut state, &claim, T0),
+		refused(DecisionRefusal::FormationIncomplete),
+		"no write before the window is bound"
+	);
+	assert!(decisions(&state).sealed().is_none(), "nothing sealed");
+	assert_eq!(
+		decide(
+			&mut state,
+			DecisionCommand::BindRetention {
+				window_ms: WINDOW_MS
+			}
+		),
+		DecisionResult::RetentionBound {
+			window_ms: WINDOW_MS
+		}
+	);
+	assert_eq!(
+		decide(
+			&mut state,
+			DecisionCommand::BindRetention {
+				window_ms: WINDOW_MS
+			}
+		),
+		DecisionResult::RetentionBound {
+			window_ms: WINDOW_MS
+		},
+		"a replay binds nothing new"
+	);
+	let before = state.decisions.clone();
+	assert_eq!(
+		decide(&mut state, DecisionCommand::BindRetention { window_ms: 0 }),
+		refused(DecisionRefusal::RetentionRebind)
+	);
+	assert_eq!(state.decisions, before, "a rebind changes nothing");
+	assert!(matches!(
+		reserve(&mut state, &claim, T0),
+		DecisionResult::Reserved { .. }
+	));
+	assert_eq!(
+		crate::consensus::decisions::retention_gate(&state, WINDOW_MS),
+		Ok(())
+	);
+	assert_eq!(
+		crate::consensus::decisions::retention_gate(&state, 0),
+		Err("RetentionWindowMismatch")
+	);
+}
+
+/// D2: a target's cut is admitted only on the committed clock with its own
+/// stamp, for the bound window; a refused cut leaves the clock unchanged.
+#[test]
+fn a_retention_cut_is_admitted_only_on_the_committed_clock() {
+	let (mut state, _rsv, dec) = accepted_retired();
+	bind_window(&mut state, WINDOW_MS);
+	let clock = decisions(&state).clock_ms();
+	let refused_cut = |state: &mut SmState, retention| {
+		let before = state.decisions.clone();
+		assert_eq!(
+			propose_cut(state, 1, dec, 0, retention),
+			refused(DecisionRefusal::RetentionCutInadmissible),
+			"{retention:?}"
+		);
+		assert_eq!(state.decisions, before, "{retention:?} changed nothing");
+	};
+	// Another window than the binding.
+	refused_cut(&mut state, cut(0, 0, 0));
+	// A floor above the committed clock minus the window, with no stamp.
+	refused_cut(&mut state, cut(WINDOW_MS, 0, clock - WINDOW_MS + 1));
+	// A stamp raises the clock the floor is judged on, never past itself.
+	refused_cut(
+		&mut state,
+		cut(WINDOW_MS, clock + 5_000, clock + 5_000 - WINDOW_MS + 1),
+	);
+	assert_eq!(
+		propose_cut(
+			&mut state,
+			1,
+			dec,
+			0,
+			cut(WINDOW_MS, clock + 5_000, clock + 5_000 - WINDOW_MS)
+		),
+		DecisionResult::TargetRecorded { gid: 1 }
+	);
+	assert_eq!(decisions(&state).clock_ms(), clock + 5_000);
+	commit_with(&mut state, None);
+	let cert = decisions(&state).generations.current.clone().unwrap();
+	assert_eq!(
+		cert.retention,
+		cut(WINDOW_MS, clock + 5_000, clock + 5_000 - WINDOW_MS),
+		"the certificate freezes the target's cut"
+	);
+	assert_eq!(
+		decisions(&state).generations.retention_floor(),
+		Some(crate::schema::HybridTimestamp {
+			physical_ms: clock + 5_000 - WINDOW_MS,
+			logical: 0,
+			node_id: 0,
+		})
+	);
+	// A later tick moves only the clock; the certified floor is unchanged.
+	assert!(matches!(
+		floor(
+			&mut state,
+			clock + 60_000,
+			clock + 60_000 + DECISION_EXPIRY_MS + 10
+		),
+		DecisionResult::FloorAdvanced { .. }
+	));
+	assert_eq!(decisions(&state).generations.current, Some(cert));
+}
+
+/// D3: the age trigger. A committed base whose least visible governed row aged
+/// past the window, with nothing else to erase, gets an age-only target whose
+/// floor hides it; the trigger needs the leader's clock sample and a step, an
+/// age-only floor must hide an agreed row, and once none is visible nothing
+/// more is proposed.
+#[test]
+fn an_idle_base_older_than_the_window_gets_a_next_target() {
+	let (mut state, rsv, dec) = accepted_retired();
+	bind_window(&mut state, WINDOW_MS);
+	assert_eq!(
+		propose_cut(&mut state, 1, dec, 0, cut(WINDOW_MS, 0, 0)),
+		DecisionResult::TargetRecorded { gid: 1 },
+		"an ordinary target needs no clock sample"
+	);
+	let row = hlc_at(decisions(&state).clock_ms());
+	commit_with(&mut state, Some(row));
+	assert!(
+		decisions(&state).body(rsv).is_none(),
+		"the base holds it now"
+	);
+	let step = generations::retention_step_ms(WINDOW_MS);
+	// Nothing else to erase: no clock sample, or a row not yet older than the
+	// window plus a step, proposes nothing.
+	assert_eq!(generations::next_target(&state, peek_index(), None), None);
+	assert_eq!(
+		generations::next_target(&state, peek_index(), Some(row.physical_ms + WINDOW_MS)),
+		None
+	);
+	// An age-only floor that hides no agreed visible row is refused.
+	let clock = decisions(&state).clock_ms();
+	assert_eq!(
+		propose_cut(
+			&mut state,
+			2,
+			peek_index() - 1,
+			1,
+			cut(WINDOW_MS, row.physical_ms + WINDOW_MS, row.physical_ms)
+		),
+		refused(DecisionRefusal::RetentionCutInadmissible)
+	);
+	assert_eq!(decisions(&state).clock_ms(), clock, "unchanged");
+	// Aged by the window and a step: an age-only target hides the row.
+	let now = row.physical_ms + WINDOW_MS + step;
+	let target = generations::next_target(&state, peek_index(), Some(now))
+		.expect("an aged base with nothing else to erase gets a next target");
+	assert_eq!(target.retention, cut(WINDOW_MS, now, now - WINDOW_MS));
+	assert!(target.retention.floor_ms > row.physical_ms);
+	assert_eq!(
+		decide(&mut state, DecisionCommand::ProposeTarget { target }),
+		DecisionResult::TargetRecorded { gid: 2 }
+	);
+	assert_eq!(decisions(&state).clock_ms(), clock.max(now));
+	// A row exactly at the floor stays visible: it is the new least visible row.
+	let floor2 = now - WINDOW_MS;
+	commit_with(&mut state, Some(hlc_at(floor2)));
+	assert_eq!(decisions(&state).generations.floor_ms(), floor2);
+	// The next floor is spaced by a step from the certificate's, however old the row.
+	assert_eq!(
+		generations::next_target(&state, peek_index(), Some(now + step - 1)),
+		None,
+		"below one step"
+	);
+	let later = now + step;
+	let target =
+		generations::next_target(&state, peek_index(), Some(later)).expect("one step later");
+	assert_eq!(target.retention, cut(WINDOW_MS, later, floor2 + step));
+	assert_eq!(
+		decide(&mut state, DecisionCommand::ProposeTarget { target }),
+		DecisionResult::TargetRecorded { gid: 3 }
+	);
+	commit_with(&mut state, None);
+	let now = later;
+	// No visible governed row: however far the clock goes, nothing is proposed.
+	assert_eq!(
+		generations::next_target(&state, peek_index(), Some(now + 100 * WINDOW_MS)),
+		None
+	);
+	// The floor never falls below the certificate's.
+	let applied = peek_index() - 1;
+	assert_eq!(
+		propose_cut(
+			&mut state,
+			4,
+			applied,
+			3,
+			cut(WINDOW_MS, 0, now - WINDOW_MS - 1)
+		),
+		refused(DecisionRefusal::RetentionCutInadmissible)
+	);
+}
+
+/// D3: a target that erases something raises the floor when the leader's sample lets it advance
+/// by a whole step, and otherwise keeps the certificate's floor and carries no stamp.
+#[test]
+fn an_erasing_target_raises_the_floor_only_by_a_whole_step() {
+	let (mut state, _rsv, _dec) = accepted_retired();
+	bind_window(&mut state, WINDOW_MS);
+	let step = generations::retention_step_ms(WINDOW_MS);
+	let unsampled = generations::next_target(&state, peek_index(), None).expect("it erases");
+	assert_eq!(unsampled.retention, cut(WINDOW_MS, 0, 0));
+	let below = generations::next_target(&state, peek_index(), Some(WINDOW_MS + step - 1))
+		.expect("it erases");
+	assert_eq!(below.retention, cut(WINDOW_MS, 0, 0), "below a step");
+	let now = decisions(&state).clock_ms();
+	let raised = generations::next_target(&state, peek_index(), Some(now)).expect("it erases");
+	assert_eq!(raised.retention, cut(WINDOW_MS, now, now - WINDOW_MS));
+	assert_eq!(
+		decide(
+			&mut state,
+			DecisionCommand::ProposeTarget { target: raised }
+		),
+		DecisionResult::TargetRecorded { gid: 1 }
+	);
+}
+
+/// D3: the least visible row is agreed like a chunk: reports that differ only
+/// in it do not commit.
+#[test]
+fn reports_that_differ_in_their_least_visible_row_do_not_commit() {
+	let (mut state, rsv, dec) = accepted_retired();
+	bind_window(&mut state, WINDOW_MS);
+	assert_eq!(
+		propose_cut(&mut state, 1, dec, 0, cut(WINDOW_MS, 0, 0)),
+		DecisionResult::TargetRecorded { gid: 1 }
+	);
+	let members = decisions(&state)
+		.generations
+		.pending
+		.clone()
+		.unwrap()
+		.target
+		.members;
+	for (at, member) in members.iter().enumerate() {
+		let oldest = Some(hlc_at(T0 + if at == 2 { 1 } else { 0 }));
+		let report = report_oldest(&state, *member, oldest);
+		assert!(matches!(
+			decide(&mut state, report),
+			DecisionResult::ReportRecorded { .. }
+		));
+	}
+	assert_eq!(
+		decide(&mut state, DecisionCommand::CommitGeneration { gid: 1 }),
+		refused(DecisionRefusal::ReportMismatch)
+	);
+	assert!(decisions(&state).body(rsv).is_some(), "nothing erased");
+}
+
+/// D1, D2: the Disabled binding is today's semantics: ordinary targets carry
+/// no stamp and no floor, need no clock sample, and the trigger has no age
+/// input however old the base is.
+#[test]
+fn a_disabled_window_progresses_as_today_without_a_clock_sample() {
+	let (mut state, _rsv, dec) = accepted_retired();
+	assert_eq!(
+		decisions(&state).retention(),
+		Some(RetentionBinding { window_ms: 0 })
+	);
+	let target = generations::next_target(&state, peek_index(), None)
+		.expect("an ordinary target with no clock sample");
+	assert_eq!(target.retention, cut(0, 0, 0));
+	assert!(target.t >= dec);
+	assert_eq!(
+		decide(&mut state, DecisionCommand::ProposeTarget { target }),
+		DecisionResult::TargetRecorded { gid: 1 }
+	);
+	commit_with(&mut state, None);
+	assert_eq!(decisions(&state).generations.retention_floor(), None);
+	assert_eq!(
+		generations::next_target(&state, peek_index(), Some(T0 + 1_000 * WINDOW_MS)),
+		None
+	);
+	assert_eq!(
+		propose_cut(&mut state, 2, peek_index() - 1, 1, cut(0, T0, 1)),
+		refused(DecisionRefusal::RetentionCutInadmissible),
+		"no floor without a window"
+	);
 }
 
 /// CODEX-3 R1: a member restarting while a target is pending, after every
@@ -2458,7 +2842,7 @@ fn a_member_restart_replaces_its_pending_target_rather_than_stalling() {
 	// The driver runs on applied state: the next entry's index bounds T.
 	let applied = |_: &SmState| peek_index();
 	assert_eq!(
-		generations::next_target(&state, applied(&state)),
+		generations::next_target(&state, applied(&state), None),
 		None,
 		"a current pending target is not replaced"
 	);
@@ -2483,7 +2867,8 @@ fn a_member_restart_replaces_its_pending_target_rather_than_stalling() {
 	assert!(decisions(&state).body(rsv).is_some(), "nothing erased");
 
 	// The driver replaces it: same predecessor, fresh gid, current members.
-	let replacement = generations::next_target(&state, applied(&state)).expect("a replacement");
+	let replacement =
+		generations::next_target(&state, applied(&state), None).expect("a replacement");
 	assert_eq!((replacement.gid, replacement.predecessor_gid), (2, 0));
 	assert!(replacement.members.contains(&Signer {
 		node: 3,
@@ -2500,6 +2885,7 @@ fn a_member_restart_replaces_its_pending_target_rather_than_stalling() {
 	);
 	// A late report for the replaced target is refused.
 	let late = generations::ReportBody {
+		oldest_visible: None,
 		gid: 1,
 		target_digest: old.digest,
 		reporter: replacement.members[0],
@@ -2585,6 +2971,7 @@ fn a_generation_commits_only_on_every_members_agreeing_report_and_erases_its_cut
 	let mut wrong = decisions(&state).generations.pending.clone().unwrap();
 	wrong.digest = [1; 32];
 	let stale = generations::ReportBody {
+		oldest_visible: None,
 		gid: 1,
 		target_digest: wrong.digest,
 		reporter: members[0],
@@ -2657,6 +3044,7 @@ fn a_generation_commits_only_on_every_members_agreeing_report_and_erases_its_cut
 	);
 	// A late report for the abandoned target is refused.
 	let late = generations::ReportBody {
+		oldest_visible: None,
 		gid: 1,
 		target_digest: [0; 32],
 		reporter: members[0],
@@ -5368,6 +5756,56 @@ fn prove(state: &mut SmState, body: RecoveryBody) -> DecisionResult {
 	)
 }
 
+/// Wendelon ADR 0121 R3: the fixture's state with `binding` (none: unbound) at
+/// `clock_ms`, a current certificate (gid 1) carrying `cut` and `oldest`, and a
+/// pending target (gid 2) carrying `pending`, each digest and gid consistent, so
+/// only the retention fields can contradict.
+pub(crate) fn retention_state(
+	binding: Option<u64>,
+	clock_ms: u64,
+	cut: Option<generations::RetentionCut>,
+	oldest: Option<crate::schema::HybridTimestamp>,
+	pending: Option<generations::RetentionCut>,
+) -> SmState {
+	let mut state = base(3);
+	let members = generations::current_members(&state).unwrap();
+	let decisions = state.decisions.as_mut().unwrap();
+	decisions.retention = binding.map(|window_ms| RetentionBinding { window_ms });
+	decisions.clock_ms = clock_ms;
+	if let Some(retention) = cut {
+		decisions.generations.current = Some(generations::Certificate {
+			gid: 1,
+			target_digest: [0x21; 32],
+			t: 1,
+			predecessor_gid: 0,
+			chunks: crate::storage::index::certified_base::chunk_sums(std::iter::empty()),
+			committed_at: 2,
+			retention,
+			oldest_visible: oldest,
+		});
+		decisions.generations.next_gid = 2;
+	}
+	if let Some(retention) = pending {
+		let target = generations::Target {
+			gid: decisions.generations.next_gid,
+			t: 2,
+			predecessor_gid: decisions.generations.current_gid(),
+			members,
+			chunk_bits: generations::CHUNK_BITS,
+			survivor_policy: generations::SURVIVOR_POLICY,
+			retention,
+		};
+		decisions.generations.next_gid += 1;
+		decisions.generations.pending = Some(generations::Pending {
+			digest: generations::target_digest(&target),
+			target,
+			recorded_at: 3,
+			reports: BTreeMap::new(),
+		});
+	}
+	state
+}
+
 fn certify(state: &mut SmState, gid: u64, digest: [u8; 32]) {
 	state.decisions.as_mut().unwrap().generations.current = Some(generations::Certificate {
 		gid,
@@ -5376,6 +5814,8 @@ fn certify(state: &mut SmState, gid: u64, digest: [u8; 32]) {
 		predecessor_gid: gid - 1,
 		chunks: crate::storage::index::certified_base::chunk_sums(std::iter::empty()),
 		committed_at: 1,
+		retention: Default::default(),
+		oldest_visible: None,
 	});
 }
 
@@ -7365,7 +7805,7 @@ fn an_idle_finalized_drop_proposes_an_excluding_generation() {
 	let finalize = finalize_fixture_drop(&mut state);
 	// Nothing applied after F yet: no cut can reach F.
 	assert_eq!(
-		generations::next_target(&state, finalize).map(|target| target.t),
+		generations::next_target(&state, finalize, None).map(|target| target.t),
 		None,
 		"no entry after F"
 	);
@@ -7378,7 +7818,7 @@ fn an_idle_finalized_drop_proposes_an_excluding_generation() {
 		},
 	);
 	let applied = peek_index() - 1;
-	let target = generations::next_target(&state, applied).expect("an excluding target");
+	let target = generations::next_target(&state, applied, None).expect("an excluding target");
 	assert!(target.t >= finalize, "t {} reaches F {finalize}", target.t);
 	assert_eq!(target.survivor_policy, 2, "the excluding policy");
 }
@@ -7529,7 +7969,7 @@ fn a_state_without_its_rebuilt_index_refuses_an_excluding_target() {
 		},
 	);
 	let applied = peek_index() - 1;
-	let target = generations::next_target(&admitted, applied).unwrap();
+	let target = generations::next_target(&admitted, applied, None).unwrap();
 	assert_eq!(target.survivor_policy, 2);
 	assert!(target.t >= f);
 
@@ -7541,7 +7981,7 @@ fn a_state_without_its_rebuilt_index_refuses_an_excluding_target() {
 	);
 	assert_eq!(unadmitted.survivor_policy_at(target.t), 1);
 	assert_eq!(
-		generations::next_target(&unadmitted, applied),
+		generations::next_target(&unadmitted, applied, None),
 		None,
 		"quiet"
 	);

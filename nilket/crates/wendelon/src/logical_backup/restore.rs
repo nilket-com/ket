@@ -78,6 +78,21 @@ pub enum RestoreRefusal {
 		table_object_id: TableObjectId,
 		why: String,
 	},
+	/// Wendelon ADR 0121 D4: the target binds a positive retention window and the
+	/// backup holds a table it would govern; nothing was established or imported.
+	/// Appended.
+	RetentionWindowBound {
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+		window_ms: u64,
+	},
+	/// Wendelon ADR 0121 R1: the backup holds a table a positive window would
+	/// govern and the target gave no explicit Disabled binding (unbound, or an
+	/// answer without one); nothing was established or imported. Appended.
+	RetentionBindingUnknown {
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+	},
 }
 
 #[derive(Debug)]
@@ -292,6 +307,9 @@ pub async fn restore_bounded(
 		Ok(target)
 	})
 	.await?;
+	// Wendelon ADR 0121 D4: before anything is established or imported, the
+	// incoming roster against the target's authoritative window binding.
+	check_retention(client, roster, bounds).await?;
 	establish(client, roster, &target).await?;
 	for table in &verified.manifest.tables {
 		let rostered = roster
@@ -375,6 +393,81 @@ async fn target_roster(
 		}
 		Err(ExportError::Io(error)) => Err(RestoreError::Io(error)),
 		Err(other) => Err(RestoreError::Io(Error::other(other.to_string()))),
+	}
+}
+
+/// Wendelon ADR 0121 D4, R1: a target store that binds a positive ParentDecisions window
+/// would govern (hide by age) every AppendOnly table restored with the cluster's window, so
+/// such a backup is refused there before anything is established or imported. Only an
+/// explicit Disabled binding (`Some(0)`) is evidence to proceed: an unbound store, or an
+/// answer carrying no binding (a bare reply decodes to `None`), is refused too. A backup
+/// with no such table never asks.
+async fn check_retention(
+	client: &WendelonClient,
+	roster: &BackupRoster,
+	bounds: Bounds,
+) -> Result<(), RestoreError> {
+	let Some(table) = governed_incoming(roster) else {
+		return Ok(());
+	};
+	let answer = tokio::time::timeout(
+		bounds.call,
+		client.retention_admin(&TenantAdminRequestWire::GetRetentionBinding),
+	)
+	.await
+	.map_err(|_| {
+		RestoreError::Io(Error::new(
+			ErrorKind::TimedOut,
+			format!(
+				"no retention binding answer within {} s",
+				bounds.call.as_secs()
+			),
+		))
+	})??;
+	retention_admission((table.tenant_id, table.descriptor.table_object_id), answer)
+}
+
+/// The first incoming table a positive window would govern: AppendOnly, inheriting the
+/// cluster's window.
+fn governed_incoming(roster: &BackupRoster) -> Option<&super::roster::RosterTable> {
+	roster.tables.iter().find(|table| {
+		matches!(
+			table.descriptor.row_identity_policy,
+			crate::schema::RowIdentityPolicy::AppendOnly
+		) && table.retention == crate::schema::TableRetentionPolicy::InheritCluster
+	})
+}
+
+/// Whether a restore of `table` may proceed on the target's answer to
+/// `GetRetentionBinding`: only an accepted answer naming the Disabled binding.
+fn retention_admission(
+	(tenant_id, table_object_id): (TenantId, TableObjectId),
+	(response, extension): (
+		crate::network::control_server::TenantAdminResponseWire,
+		crate::network::control_server::RetentionAdminExtensionWire,
+	),
+) -> Result<(), RestoreError> {
+	if !response.accepted {
+		return Err(RestoreError::Io(Error::other(format!(
+			"the target refused the retention binding read: {:?}",
+			response.message
+		))));
+	}
+	match extension.window_ms {
+		Some(0) => Ok(()),
+		Some(window_ms) => Err(RestoreError::Refused(
+			RestoreRefusal::RetentionWindowBound {
+				tenant_id,
+				table_object_id,
+				window_ms,
+			},
+		)),
+		None => Err(RestoreError::Refused(
+			RestoreRefusal::RetentionBindingUnknown {
+				tenant_id,
+				table_object_id,
+			},
+		)),
 	}
 }
 
@@ -669,4 +762,109 @@ fn uuid_v7_now() -> std::io::Result<[u8; 16]> {
 	bytes[6] = 0x70 | (bytes[6] & 0x0F);
 	bytes[8] = 0x80 | (bytes[8] & 0x3F);
 	Ok(bytes)
+}
+
+#[cfg(test)]
+mod retention_admission_tests {
+	use super::*;
+	use crate::network::control_server::{
+		RetentionAdminExtensionWire, TenantAdminResponseWire, decode_retention_admin_answer,
+	};
+
+	const TABLE: (TenantId, TableObjectId) = (TenantId::new(1), TableObjectId::new([0xA0; 16]));
+
+	fn response(accepted: bool) -> TenantAdminResponseWire {
+		TenantAdminResponseWire {
+			accepted,
+			reason_code: 0,
+			leader_hint: Some(1),
+			tenant: None,
+			tenants: Vec::new(),
+			message: None,
+		}
+	}
+
+	fn table(policy: crate::schema::RowIdentityPolicy) -> super::super::roster::RosterTable {
+		use arrow::datatypes::{DataType, Field, Schema};
+		super::super::roster::RosterTable {
+			tenant_id: TABLE.0,
+			descriptor: TableSchemaDescriptor::new_with_layout(
+				TABLE.1,
+				1,
+				"analytics",
+				"events_append",
+				&Schema::new(vec![Field::new("id", DataType::Int64, false)]),
+				policy,
+				crate::schema::LocalityPolicy::default_table_spread(),
+				crate::schema::RecordLayoutPolicy::MultiRow(
+					crate::schema::MultiRowLayoutDescriptor::default(),
+				),
+				crate::schema::SchemaEvolutionPolicy::AdditiveOnly,
+			)
+			.unwrap(),
+			retention: crate::schema::TableRetentionPolicy::InheritCluster,
+		}
+	}
+
+	/// Wendelon ADR 0121 R1: only an accepted answer naming the Disabled binding lets a
+	/// governed restore proceed; a positive window, an explicit `None` and a bare reply (no
+	/// extension, decoded to `None`) are refused, typed; a rejected answer stays an error.
+	#[test]
+	fn a_governed_restore_proceeds_only_on_an_explicit_disabled_binding() {
+		let answer = |window_ms| (response(true), RetentionAdminExtensionWire { window_ms });
+		assert!(retention_admission(TABLE, answer(Some(0))).is_ok());
+		assert!(matches!(
+			retention_admission(TABLE, answer(Some(15_000))),
+			Err(RestoreError::Refused(
+				RestoreRefusal::RetentionWindowBound {
+					window_ms: 15_000,
+					..
+				}
+			))
+		));
+		assert!(matches!(
+			retention_admission(TABLE, answer(None)),
+			Err(RestoreError::Refused(
+				RestoreRefusal::RetentionBindingUnknown { .. }
+			))
+		));
+		let bare = crate::network::wire::encode(&response(true)).unwrap();
+		let decoded = decode_retention_admin_answer(&bare).unwrap();
+		assert_eq!(decoded.1, RetentionAdminExtensionWire { window_ms: None });
+		assert!(matches!(
+			retention_admission(TABLE, decoded),
+			Err(RestoreError::Refused(
+				RestoreRefusal::RetentionBindingUnknown { .. }
+			))
+		));
+		assert!(matches!(
+			retention_admission(
+				TABLE,
+				(
+					response(false),
+					RetentionAdminExtensionWire { window_ms: Some(0) }
+				)
+			),
+			Err(RestoreError::Io(_))
+		));
+	}
+
+	/// Only an incoming AppendOnly table that inherits the cluster's window is governed; a
+	/// backup without one never asks.
+	#[test]
+	fn only_an_inheriting_append_only_table_is_governed_on_restore() {
+		let mut roster = BackupRoster {
+			hold: (1, 1),
+			cut: 1,
+			tenants: Vec::new(),
+			logical_types: Vec::new(),
+			tables: vec![table(crate::schema::RowIdentityPolicy::AppendOnly)],
+			indexes: Vec::new(),
+		};
+		assert!(governed_incoming(&roster).is_some());
+		roster.tables[0].retention = crate::schema::TableRetentionPolicy::Disabled;
+		assert!(governed_incoming(&roster).is_none());
+		roster.tables.clear();
+		assert!(governed_incoming(&roster).is_none());
+	}
 }

@@ -310,6 +310,80 @@ fn the_first_begin_owns_the_operation_and_a_retry_replays_it() {
 	assert_eq!(chain(&state), first);
 }
 
+/// Wendelon ADR 0121 D4: on a store that binds a positive retention window, a
+/// certified floor could fall between a result's chunk HLCs before its first
+/// visible read, so a fresh Begin is refused and nothing becomes durable. On the
+/// Disabled window (the fixture's) Begin is unchanged.
+#[test]
+fn a_positive_retention_window_refuses_a_fresh_begin() {
+	let mut state = granted();
+	state.decisions.as_mut().unwrap().retention =
+		Some(crate::consensus::decisions::RetentionBinding { window_ms: 15_000 });
+	let before = state.clone();
+	assert_eq!(
+		fixture::decide(&mut state, begin(op(1), object(1), &[D0])),
+		refused(CtasRefusal::RetentionWindowBound)
+	);
+	assert_eq!(state.decisions, before.decisions, "no chain");
+	assert!(!state.table_schemas.is_provisional(TENANT, object(1)));
+	assert_eq!(state.table_schemas, before.table_schemas);
+	// The same Begin on the Disabled window begins its chain.
+	let mut disabled = granted();
+	assert!(matches!(
+		fixture::decide(&mut disabled, begin(op(1), object(1), &[D0])),
+		DecisionResult::CtasBegun {
+			replayed: false,
+			..
+		}
+	));
+}
+
+/// Wendelon ADR 0121 R1: unbound is not Disabled. A fresh Begin before the window
+/// is bound is refused like a Reserve and records nothing (no owner, no
+/// provisional descriptor); after a positive bind its retry is refused for the
+/// window; a chain begun under the explicit Disabled binding still replays.
+#[test]
+fn a_fresh_begin_needs_the_explicit_disabled_binding() {
+	let mut state = granted();
+	state.decisions.as_mut().unwrap().retention = None;
+	let before = state.clone();
+	assert_eq!(
+		fixture::decide(&mut state, begin(op(1), object(1), &[D0])),
+		DecisionResult::Refused(crate::consensus::decisions::DecisionRefusal::FormationIncomplete)
+	);
+	assert_eq!(
+		state.decisions, before.decisions,
+		"no chain before the bind"
+	);
+	assert_eq!(
+		state.table_schemas, before.table_schemas,
+		"no provisional descriptor"
+	);
+	assert!(matches!(
+		fixture::decide(
+			&mut state,
+			DecisionCommand::BindRetention { window_ms: 15_000 }
+		),
+		DecisionResult::RetentionBound { window_ms: 15_000 }
+	));
+	assert_eq!(
+		fixture::decide(&mut state, begin(op(1), object(1), &[D0])),
+		refused(CtasRefusal::RetentionWindowBound),
+		"the retry after a positive bind"
+	);
+	assert!(!state.table_schemas.is_provisional(TENANT, object(1)));
+	// Under the explicit Disabled binding (the fixture's), a chain begins and replays.
+	let mut disabled = begun(&[D0]);
+	assert_eq!(
+		fixture::decide(&mut disabled, begin(op(1), object(1), &[D0])),
+		DecisionResult::CtasBegun {
+			tenant: TENANT,
+			object: object(1),
+			replayed: true
+		}
+	);
+}
+
 /// ADR 0120 D3: Begin proves exclusive ownership of its object: not a live
 /// table, not another chain's (even with the identical descriptor), not an
 /// abandoned id; and ordinary Create refuses a chain's ids too.

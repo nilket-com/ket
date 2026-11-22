@@ -3375,6 +3375,48 @@ impl SmState {
 		}
 	}
 
+	/// Wendelon ADR 0121: whether the bound retention window governs a table's
+	/// served rows: a positive window, an AppendOnly table (ADR 0119's only
+	/// admitted AppendOnly kind), and the table inheriting the cluster's window.
+	/// PK tables are never governed.
+	pub(crate) fn retention_governed(
+		&self,
+		tenant: crate::schema::TenantId,
+		table: crate::schema::TableObjectId,
+	) -> bool {
+		self.decisions
+			.as_ref()
+			.is_some_and(|decisions| decisions.retention_window_ms() > 0)
+			&& self
+				.table_schemas
+				.latest_by_id(tenant, table)
+				.is_some_and(|descriptor| {
+					matches!(
+						descriptor.row_identity_policy,
+						RowIdentityPolicy::AppendOnly
+					)
+				}) && matches!(
+			self.table_lifecycle.retention_policy(tenant, table),
+			None | Some(TableRetentionPolicy::InheritCluster)
+		)
+	}
+
+	/// Wendelon ADR 0121 D2: the floor a statement validated at the current
+	/// certificate hides strictly below, for this table; `None` if the table is
+	/// not governed or no floor is certified.
+	pub(crate) fn retention_floor_for(
+		&self,
+		tenant: crate::schema::TenantId,
+		table: crate::schema::TableObjectId,
+	) -> Option<HybridTimestamp> {
+		if !self.retention_governed(tenant, table) {
+			return None;
+		}
+		self.decisions
+			.as_ref()
+			.and_then(|decisions| decisions.generations().retention_floor())
+	}
+
 	/// Wendelon ADR 0115: whether a drop was finalized in `(after, through]`: the
 	/// idle trigger's existence query.
 	pub(crate) fn finalized_drop_in(&self, after: u64, through: u64) -> bool {
@@ -7707,11 +7749,17 @@ fn apply_request_at_log_index(
 		WendelonRequest::RevokeActorKey(revocation) => {
 			(apply_revoke_actor_key(state, revocation), None)
 		}
-		// ADR 0699 S5a: the read and survivor policy is frozen in mode.
-		WendelonRequest::SetTableRetentionPolicy(_) if state.decisions.is_some() => (
-			WendelonResponse::Error("table retention is frozen under ParentDecisions".into()),
-			None,
-		),
+		// ADR 0699 S5a: the read and survivor policy is frozen in mode. Wendelon ADR 0121 D5:
+		// except the InheritCluster restatement, which takes the ordinary apply and contract.
+		WendelonRequest::SetTableRetentionPolicy(update)
+			if state.decisions.is_some()
+				&& update.new_policy != crate::schema::TableRetentionPolicy::InheritCluster =>
+		{
+			(
+				WendelonResponse::Error("table retention is frozen under ParentDecisions".into()),
+				None,
+			)
+		}
 		WendelonRequest::SetTableRetentionPolicy(update) => {
 			(apply_set_table_retention_policy(state, update), None)
 		}

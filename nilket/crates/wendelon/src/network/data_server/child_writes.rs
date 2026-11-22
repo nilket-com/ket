@@ -1464,6 +1464,9 @@ pub(crate) struct DecisionPeer {
 	/// meets this store's own lag in activating the committed generation waits on
 	/// it, then rechecks its whole authority.
 	pub(crate) activations: tokio::sync::watch::Sender<u64>,
+	/// Wendelon ADR 0121 D1: this store's configured retention window (ms; 0 is
+	/// none). It serves and signs only while it equals the replicated binding.
+	pub(crate) retention_window_ms: u64,
 	/// Test-only: how many more read-authority checks pass before every
 	/// later one fails.
 	#[cfg(test)]
@@ -1696,6 +1699,7 @@ impl Default for DecisionPeer {
 			behind_boundary: Default::default(),
 			base_validated: Default::default(),
 			activations: tokio::sync::watch::channel(0).0,
+			retention_window_ms: 0,
 			#[cfg(test)]
 			read_checks_left: Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX)),
 			#[cfg(test)]
@@ -1829,6 +1833,12 @@ impl WendelonDataServer {
 
 	pub(crate) fn with_decision_signer(mut self, signer: Option<Arc<DecisionSigner>>) -> Self {
 		self.decisions.signer = signer;
+		self
+	}
+
+	/// Wendelon ADR 0121 D1: the configured ParentDecisions retention window.
+	pub(crate) fn with_retention_window_ms(mut self, window_ms: u64) -> Self {
+		self.decisions.retention_window_ms = window_ms;
 		self
 	}
 
@@ -1984,12 +1994,20 @@ impl WendelonDataServer {
 			return Some("DecisionSignerMissing".into());
 		};
 		let leases = self.lease_source()().await;
+		let configured_window = self.decisions.retention_window_ms;
 		self.state_machine
 			.read_state(move |state| {
 				use crate::consensus::decisions::LocalSignerBinding;
 				let Some(decisions) = state.decisions.as_ref() else {
 					return Some("DecisionStateMissing".to_string());
 				};
+				// Wendelon ADR 0121 D1: unbound, or bound to another window than
+				// this store's configuration.
+				if let Err(reason) =
+					crate::consensus::decisions::retention_gate(state, configured_window)
+				{
+					return Some(reason.into());
+				}
 				// ADR 0721: a bound key that is not the one this store signs
 				// with is its own reason. This is a diagnosis, not the fence:
 				// evidence signed with another key is refused where it is
@@ -2172,7 +2190,15 @@ impl WendelonDataServer {
 		self.await_applied(meta.rsv).await?;
 		let leases = (self.lease_source())().await;
 		let local = signer.signer;
+		let configured_window = self.decisions.retention_window_ms;
 		let plan = AdmittedPlan::admit(&self.slab, &self.state_machine, move |state| {
+			// Wendelon ADR 0121 D1: a store whose configured window is not the bound
+			// one acknowledges nothing.
+			if let Err(reason) =
+				crate::consensus::decisions::retention_gate(state, configured_window)
+			{
+				return Err(ChildRefusal::Storage(format!("retention: {reason}")));
+			}
 			let epoch = state
 				.epoch_history
 				.last_key_value()

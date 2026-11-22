@@ -1095,6 +1095,7 @@ mod controls {
 			members: vec![other, replacement],
 			chunk_bits: 0,
 			survivor_policy: 0,
+			retention: Default::default(),
 		};
 		let digest = crate::consensus::decisions::generations::target_digest(&target);
 		let certificate = Certificate {
@@ -1104,6 +1105,8 @@ mod controls {
 			predecessor_gid: 1,
 			chunks: Vec::new(),
 			committed_at: 700,
+			retention: Default::default(),
+			oldest_visible: None,
 		};
 		let report = |index, reporter: Signer, digest| GenerationEvent::Report {
 			index,
@@ -1208,6 +1211,7 @@ mod controls {
 			members: vec![other, replacement],
 			chunk_bits: 0,
 			survivor_policy: 0,
+			retention: Default::default(),
 		};
 		let certificate = |target: &Target, committed_at| Certificate {
 			gid: target.gid,
@@ -1216,6 +1220,8 @@ mod controls {
 			predecessor_gid: target.predecessor_gid,
 			chunks: Vec::new(),
 			committed_at,
+			retention: Default::default(),
+			oldest_visible: None,
 		};
 		let designated = [450];
 		// Generation 2 is valid but its cut (400) does not cover reservation 450.

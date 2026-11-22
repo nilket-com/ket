@@ -253,6 +253,7 @@ impl Preparation {
 			key: ed25519_dalek::SigningKey::from_bytes(&self.secret),
 			progress: Default::default(),
 			retention: self.cfg.mvcc_retention_policy,
+			retention_window_ms: self.cfg.parent_decisions_retention_window_ms(),
 		};
 		#[cfg(test)]
 		crate::network::data_server::child_writes::registry_probe::note(

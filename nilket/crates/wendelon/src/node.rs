@@ -544,6 +544,11 @@ pub struct NodeBootstrapConfig {
 	pub drift_max_offset_ms: u64,
 	/// ADR 013 MVCC history retention policy.
 	pub mvcc_retention_policy: MvccRetentionPolicy,
+	/// Wendelon ADR 0121 D1: the ParentDecisions cluster retention window (zero
+	/// is none). Mode-only: a Today node refuses a nonzero window. The first
+	/// leader binds it into replicated state before the first admitted write;
+	/// a store serves only while its window equals that binding.
+	pub parent_decisions_retention_window: Duration,
 	/// Counter dedup horizon: attempt horizon `H`, clock-skew allowance `S`
 	/// (operators keep NTP within it) and expiry `E >= L_sdk + H + S`.
 	pub counter_retention: crate::storage::counter::CounterRetentionConfig,
@@ -646,6 +651,7 @@ impl NodeBootstrapConfig {
 			// so keep retention disabled unless a caller opts in
 			// explicitly.
 			mvcc_retention_policy: MvccRetentionPolicy::Disabled,
+			parent_decisions_retention_window: Duration::ZERO,
 			counter_retention: crate::storage::counter::CounterRetentionConfig::default(),
 			observability: None,
 			audit: AuditSinksConfig::default(),
@@ -795,6 +801,16 @@ impl NodeBootstrapConfig {
 				ErrorKind::InvalidInput,
 				"ParentDecisions mode refuses a node MVCC retention window: set \
 				 time.mvcc_retention_window_secs = 0",
+			));
+		}
+		// Wendelon ADR 0121 D1: the ParentDecisions window exists only in that mode.
+		if self.decision_mode != crate::consensus::decision_mode::DecisionMode::ParentDecisions
+			&& !self.parent_decisions_retention_window.is_zero()
+		{
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				"cluster.parent_decisions_retention_window_secs is only for \
+				 cluster.decision_authority = \"parent-decisions\"",
 			));
 		}
 		self.counter_retention.validate()?;
@@ -1032,6 +1048,12 @@ impl NodeBootstrapConfig {
 	/// bootstrap accepts only under `allow_dev_keys`. Bootstrap refuses an
 	/// existing store of the other mode, and a store keeps the mode it was
 	/// created with. The default stays today's authority.
+	/// Wendelon ADR 0121 D1: the configured ParentDecisions window in
+	/// milliseconds (0 is none).
+	pub fn parent_decisions_retention_window_ms(&self) -> u64 {
+		u64::try_from(self.parent_decisions_retention_window.as_millis()).unwrap_or(u64::MAX)
+	}
+
 	pub fn with_parent_decisions_for_disposable_store(mut self) -> Self {
 		self.decision_mode = crate::consensus::decision_mode::DecisionMode::ParentDecisions;
 		self
@@ -2695,7 +2717,8 @@ impl WendelonNode {
 					clock.clone(),
 					factory.clone(),
 					pool.clone(),
-				),
+				)
+				.with_retention_window_ms(cfg.parent_decisions_retention_window_ms()),
 			))
 		} else {
 			None
@@ -2760,6 +2783,7 @@ impl WendelonNode {
 			.with_decision_mode(cfg.decision_mode)
 			.with_decision_signer(decision_signer.clone())
 			.with_decision_proposals(decision_proposals.clone())
+			.with_retention_window_ms(cfg.parent_decisions_retention_window_ms())
 			.with_directory_owner(owner.clone()),
 		);
 		let raft_server = Arc::new(
@@ -2852,6 +2876,8 @@ impl WendelonNode {
 						// the leader, whatever its readiness or the gate says.
 						proposals.clock_probe_step(&mut probe).await;
 						let _ = maintenance.ensure_signer_once(incarnation).await;
+						// Wendelon ADR 0121 D1: bind the window before any write.
+						let _ = maintenance.ensure_retention_once().await;
 						let _ = maintenance.advance_floor_once().await;
 						// ADR 0729: take the ranges of a holder that stopped
 						// renewing, then resolve what it left reserved.
@@ -5138,6 +5164,34 @@ mod tests {
 				.get_ref()
 				.is_some_and(|inner| inner.is::<crate::storage::ownership::ShutdownIncomplete>()),
 			"expected ShutdownIncomplete, got {error}"
+		);
+	}
+
+	/// Wendelon ADR 0121 D1: the ParentDecisions retention window is a setting of
+	/// that mode only: a Today node refuses it before anything starts, and a
+	/// ParentDecisions node accepts it while its node MVCC policy stays refused.
+	#[test]
+	fn the_parent_decisions_retention_window_is_that_modes_setting_alone() {
+		use crate::consensus::decision_mode::DecisionMode;
+		use crate::storage::retention::MvccRetentionPolicy;
+		let dir = tempdir("node-parent-decisions-window");
+		let mut cfg = NodeBootstrapConfig::dev(7006, dir.to_path_buf(), "127.0.0.1:0".into());
+		cfg.parent_decisions_retention_window = Duration::from_secs(15);
+		let error = cfg.validate().expect_err("refused under Today");
+		assert_eq!(error.kind(), ErrorKind::InvalidInput);
+		assert!(
+			error
+				.to_string()
+				.contains("parent_decisions_retention_window_secs"),
+			"{error}"
+		);
+		cfg.decision_mode = DecisionMode::ParentDecisions;
+		cfg.validate().expect("accepted in the mode");
+		assert_eq!(cfg.parent_decisions_retention_window_ms(), 15_000);
+		cfg.mvcc_retention_policy = MvccRetentionPolicy::FixedWindow(Duration::from_secs(15));
+		assert!(
+			cfg.validate().is_err(),
+			"the node MVCC policy stays refused"
 		);
 	}
 

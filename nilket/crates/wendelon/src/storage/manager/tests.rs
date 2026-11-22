@@ -20647,6 +20647,7 @@ async fn certified_cleanup_reclaims_only_planned_debt_under_its_generation() {
 			let index = index.clone();
 			async move {
 				let candidate = StagedCandidate {
+					oldest_visible: None,
 					gid,
 					target_digest: [gid as u8; 32],
 					predecessor_gid: gid - 1,
@@ -20869,6 +20870,7 @@ async fn cleanup_fixture(tag: &str) -> (CleanupFixture, Arc<SlabManager>) {
 		position: 0,
 	};
 	let candidate = StagedCandidate {
+		oldest_visible: None,
 		gid: 1,
 		target_digest: [1; 32],
 		predecessor_gid: 0,
@@ -65057,6 +65059,7 @@ async fn certified_lsm_activate(
 		position: 0,
 	};
 	let candidate = StagedCandidate {
+		oldest_visible: None,
 		gid,
 		target_digest: [gid as u8; 32],
 		predecessor_gid: gid - 1,

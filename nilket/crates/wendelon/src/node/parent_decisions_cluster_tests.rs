@@ -6823,6 +6823,8 @@ mod one_voter;
 mod query_cancel;
 #[path = "parent_decisions_cluster_tests/resolve.rs"]
 mod resolve;
+#[path = "parent_decisions_cluster_tests/retention_window.rs"]
+mod retention_window;
 
 #[path = "parent_decisions_cluster_tests/offload.rs"]
 mod offload;

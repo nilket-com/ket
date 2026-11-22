@@ -12458,7 +12458,11 @@ fn parent_decisions_have_no_producer_and_one_codec() {
 			// none adds a site here.
 			// Wendelon ADR 0120 D9: the leader's CTAS maintenance (Recover, Conclude
 			// and Prune, stamped from the gated clock in `ctas_step`).
-			("decision_proposals.rs", 9),
+			// Wendelon ADR 0121 D1: the leader's retention bind, from its own
+			// configuration while none is bound (a window, not a time). Its
+			// generation targets keep their one site; a target's retention stamp is
+			// the gated clock `generation_step` reads.
+			("decision_proposals.rs", 10),
 			("raft_storage.rs", 2),
 		]),
 		"decisions are matched in apply and built only by the leader's proposal path"

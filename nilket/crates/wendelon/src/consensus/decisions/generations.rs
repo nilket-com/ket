@@ -27,6 +27,37 @@ pub const SURVIVOR_POLICY: u8 = 1;
 pub const SURVIVOR_POLICY_EXCLUDING: u8 = 2;
 pub const CHUNK_BITS: u8 = 8;
 
+/// Wendelon ADR 0121 D3: the least advance of a retention floor that an
+/// age-only target may propose: `max(1 s, window / 4)`.
+pub fn retention_step_ms(window_ms: u64) -> u64 {
+	(window_ms / 4).max(1_000)
+}
+
+/// Wendelon ADR 0121 D2: the retention cut a target freezes. `floor_ms` bounds
+/// which served row versions of a governed table are visible under the
+/// generation: a version whose HLC is strictly below
+/// `HybridTimestamp { physical_ms: floor_ms, logical: 0, node_id: 0 }` is
+/// hidden. It is never recomputed from a clock after the target's apply.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetentionCut {
+	/// The store's bound window.
+	pub window_ms: u64,
+	/// The leader's gated stamp; 0 for a target that needs no clock sample.
+	pub stamp_ms: u64,
+	pub floor_ms: u64,
+}
+
+impl RetentionCut {
+	/// The floor as an HLC bound: hidden iff strictly below it.
+	pub fn floor_hlc(&self) -> Option<crate::schema::HybridTimestamp> {
+		(self.floor_ms > 0).then_some(crate::schema::HybridTimestamp {
+			physical_ms: self.floor_ms,
+			logical: 0,
+			node_id: 0,
+		})
+	}
+}
+
 /// A proposed generation, frozen when recorded.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Target {
@@ -37,11 +68,13 @@ pub struct Target {
 	pub members: Vec<Signer>,
 	pub chunk_bits: u8,
 	pub survivor_policy: u8,
+	/// Wendelon ADR 0121 D2.
+	pub retention: RetentionCut,
 }
 
 pub fn target_digest(target: &Target) -> [u8; 32] {
 	let bytes = postcard::to_stdvec(target).expect("a target encodes");
-	let mut hasher = blake3::Hasher::new_derive_key("wendelon generation target v1");
+	let mut hasher = blake3::Hasher::new_derive_key("wendelon generation target v2");
 	hasher.update(&bytes);
 	*hasher.finalize().as_bytes()
 }
@@ -61,6 +94,10 @@ pub struct ReportBody {
 	pub reporter: Signer,
 	/// Exactly [`GENERATION_CHUNKS`] entries, empty chunks included.
 	pub chunks: Vec<ChunkSum>,
+	/// Wendelon ADR 0121 D3: the least HLC of the staged candidate's governed,
+	/// live base entries at or above the target's floor; `None` when there is
+	/// none. Computed while staging and stored with the staged candidate.
+	pub oldest_visible: Option<crate::schema::HybridTimestamp>,
 }
 
 /// The current generation's certificate.
@@ -73,6 +110,10 @@ pub struct Certificate {
 	pub chunks: Vec<ChunkSum>,
 	/// The Commit's log index: `K_min`.
 	pub committed_at: u64,
+	/// Wendelon ADR 0121 D2: the target's retention cut, frozen.
+	pub retention: RetentionCut,
+	/// Wendelon ADR 0121 D3: the agreed least visible governed HLC.
+	pub oldest_visible: Option<crate::schema::HybridTimestamp>,
 }
 
 /// The pending target and the reports recorded for it.
@@ -115,6 +156,20 @@ impl Generations {
 	/// Every body reserved at or before this was erased.
 	pub fn fr(&self) -> u64 {
 		self.current.as_ref().map_or(0, |cert| cert.t)
+	}
+	/// Wendelon ADR 0121: the current certificate's retention floor (ms); 0
+	/// before the first commit or with no window.
+	pub fn floor_ms(&self) -> u64 {
+		self.current
+			.as_ref()
+			.map_or(0, |cert| cert.retention.floor_ms)
+	}
+	/// Wendelon ADR 0121 D2: the floor a statement validated against this
+	/// generation state hides strictly below.
+	pub fn retention_floor(&self) -> Option<crate::schema::HybridTimestamp> {
+		self.current
+			.as_ref()
+			.and_then(|cert| cert.retention.floor_hlc())
 	}
 }
 
@@ -181,8 +236,15 @@ pub(super) fn propose_target(
 	if covered(decisions, target.t).is_none() {
 		return Err(TargetNotAdmissible);
 	}
+	// Wendelon ADR 0121 D2: the retention cut, judged on the committed clock
+	// with the target's own stamp; nothing changes unless every check passes.
+	let clock = decisions.clock_ms.max(target.retention.stamp_ms);
+	if !retention_cut_admissible(state, decisions, &target, clock) {
+		return Err(RetentionCutInadmissible);
+	}
 	let digest = target_digest(&target);
 	let gid = target.gid;
+	decisions.clock_ms = clock;
 	// A new target supersedes an uncommitted one; its reports are refused hereafter.
 	decisions.generations.pending = Some(Pending {
 		target,
@@ -261,9 +323,11 @@ pub(super) fn commit_generation(
 		return Err(BarrierIncomplete);
 	};
 	let chunks = first.chunks.clone();
+	// Wendelon ADR 0121 D3: the least visible governed row is agreed like a chunk.
+	let oldest_visible = first.oldest_visible;
 	for report in reports {
 		match report {
-			Some(report) if report.chunks == chunks => {}
+			Some(report) if report.chunks == chunks && report.oldest_visible == oldest_visible => {}
 			Some(_) => return Err(ReportMismatch),
 			None => return Err(BarrierIncomplete),
 		}
@@ -280,6 +344,8 @@ pub(super) fn commit_generation(
 		predecessor_gid: pending.target.predecessor_gid,
 		chunks,
 		committed_at: log_index,
+		retention: pending.target.retention,
+		oldest_visible,
 	};
 	// The bytes the cut frees, summed and subtracted with checks before anything
 	// is removed, so this refusal, like every other, leaves the state unchanged.
@@ -330,13 +396,121 @@ fn pending_is_current(state: &SmState, pending: &Pending) -> bool {
 	current_members(state).as_ref() == Some(&pending.target.members)
 }
 
+/// Whether a generation at cut `t` erases something: a covered body or noop,
+/// (ADR 0115) a finalized drop no certificate excludes yet, or (wendelon ADR
+/// 0120) a retired CTAS object.
+fn erases_something(state: &SmState, decisions: &DecisionState, t: u64) -> bool {
+	let generations = &decisions.generations;
+	decisions.bodies.range(..=t).next().is_some()
+		|| decisions.noops.range(..=t).next().is_some()
+		|| state.finalized_drop_in(generations.fr(), t)
+		|| decisions.ctas.retired_in(generations.fr(), t)
+}
+
+/// Wendelon ADR 0121 D2, D3: whether `target`'s retention cut may be recorded
+/// on the committed clock `clock` (the applied clock raised by the target's
+/// own stamp). The window must be the store's binding; the floor never falls
+/// below the current certificate's nor rises above `clock - window`; with no
+/// window it is 0. A target that erases nothing and raises the floor is an
+/// age-only target: it must hide at least the agreed least visible row.
+fn retention_cut_admissible(
+	state: &SmState,
+	decisions: &DecisionState,
+	target: &Target,
+	clock: u64,
+) -> bool {
+	let cut = target.retention;
+	let Some(binding) = decisions.retention else {
+		return false;
+	};
+	if cut.window_ms != binding.window_ms {
+		return false;
+	}
+	if binding.window_ms == 0 {
+		return cut.floor_ms == 0;
+	}
+	let current = decisions.generations.floor_ms();
+	if cut.floor_ms < current || cut.floor_ms > clock.saturating_sub(binding.window_ms) {
+		return false;
+	}
+	if cut.floor_ms > current && !erases_something(state, decisions, target.t) {
+		let oldest = decisions
+			.generations
+			.current
+			.as_ref()
+			.and_then(|cert| cert.oldest_visible);
+		return oldest.is_some_and(|oldest| cut.floor_ms > oldest.physical_ms);
+	}
+	true
+}
+
+/// Wendelon ADR 0121 D2: the cut a leader puts on a target. `now_ms`, the
+/// leader's gated decision clock, is used only to raise the floor; a target
+/// without it needs no clock sample and keeps the certificate's floor.
+fn retention_cut_for(decisions: &DecisionState, now_ms: Option<u64>) -> Option<RetentionCut> {
+	let window_ms = decisions.retention?.window_ms;
+	let current = decisions.generations.floor_ms();
+	Some(match now_ms {
+		Some(now) if window_ms > 0 => RetentionCut {
+			window_ms,
+			stamp_ms: now,
+			floor_ms: current.max(now.saturating_sub(window_ms)),
+		},
+		_ => RetentionCut {
+			window_ms,
+			stamp_ms: 0,
+			floor_ms: current,
+		},
+	})
+}
+
+/// Wendelon ADR 0121 D3: whether `now_ms` lets a positive window's floor advance by at least a
+/// step past the certificate's.
+fn step_reached(decisions: &DecisionState, now_ms: u64) -> bool {
+	let window_ms = decisions.retention_window_ms();
+	window_ms > 0
+		&& now_ms.saturating_sub(window_ms)
+			>= decisions
+				.generations
+				.floor_ms()
+				.saturating_add(retention_step_ms(window_ms))
+}
+
+/// Wendelon ADR 0121 D3: whether an age-only target is due at `now_ms`: a
+/// positive window, an agreed least visible governed row older than the
+/// window, and a floor advance of at least one step.
+fn age_due(decisions: &DecisionState, now_ms: u64) -> bool {
+	let Some(binding) = decisions.retention else {
+		return false;
+	};
+	if binding.window_ms == 0 {
+		return false;
+	}
+	let Some(cert) = decisions.generations.current.as_ref() else {
+		return false;
+	};
+	let Some(oldest) = cert.oldest_visible else {
+		return false;
+	};
+	let candidate = now_ms.saturating_sub(binding.window_ms);
+	oldest.physical_ms < candidate
+		&& candidate
+			>= cert
+				.retention
+				.floor_ms
+				.saturating_add(retention_step_ms(binding.window_ms))
+}
+
 /// The leader's next target: the highest closed cut below the applied index,
-/// above the current certificate, that erases something. `None` while a
-/// current target is pending or nothing is eligible. A pending target whose
-/// members are no longer current is replaced by a fresh one from the same
-/// predecessor, at a fresh gid, with the current members; no voter is ever
-/// dropped and a missing report never counts as agreement.
-pub(crate) fn next_target(state: &SmState, applied: u64) -> Option<Target> {
+/// above the current certificate, that erases something or (wendelon ADR 0121
+/// D3) whose floor is due by age at `now_ms`. `None` while a current target is
+/// pending or nothing is eligible. A pending target whose members are no
+/// longer current is replaced by a fresh one from the same predecessor, at a
+/// fresh gid, with the current members; no voter is ever dropped and a missing
+/// report never counts as agreement. `now_ms` is the leader's gated decision
+/// clock, or `None` when it has no fresh sample: an ordinary target never
+/// needs one.
+pub(crate) fn next_target(state: &SmState, applied: u64, now_ms: Option<u64>) -> Option<Target> {
 	let decisions = state.decisions.as_ref()?;
 	let generations = &decisions.generations;
 	if generations
@@ -357,14 +531,18 @@ pub(crate) fn next_target(state: &SmState, applied: u64) -> Option<Target> {
 		}
 	}
 	// Something to erase, or (ADR 0115) a finalized drop no certificate excludes yet. (Wendelon ADR
-	// 0120: or a retired CTAS object.)
-	if decisions.bodies.range(..=t).next().is_none()
-		&& decisions.noops.range(..=t).next().is_none()
-		&& !state.finalized_drop_in(generations.fr(), t)
-		&& !decisions.ctas.retired_in(generations.fr(), t)
-	{
+	// 0120: or a retired CTAS object.) Wendelon ADR 0121 D3: or a floor due by age, which the
+	// target's own stamp advances, so an idle store needs no write.
+	let erases = erases_something(state, decisions, t);
+	let due = now_ms.is_some_and(|now| age_due(decisions, now));
+	if !erases && !due {
 		return None;
 	}
+	// A target that erases something raises the floor too whenever a sample lets it advance by
+	// a step: it commits anyway, so visibility follows the window at no extra generation. With
+	// no sample it keeps the certificate's floor and carries no stamp.
+	let raise = due || (erases && now_ms.is_some_and(|now| step_reached(decisions, now)));
+	let retention = retention_cut_for(decisions, if raise { now_ms } else { None })?;
 	Some(Target {
 		gid: generations.next_gid,
 		t,
@@ -372,6 +550,7 @@ pub(crate) fn next_target(state: &SmState, applied: u64) -> Option<Target> {
 		members: current_members(state)?,
 		chunk_bits: CHUNK_BITS,
 		survivor_policy: state.survivor_policy_with(&decisions.ctas, t),
+		retention,
 	})
 }
 

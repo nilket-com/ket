@@ -259,6 +259,7 @@ impl WendelonDataServer {
 				repair: &repair,
 				retention: self.mvcc_retention_policy,
 				now_ms: self.clock.now_ms(),
+				configured_window_ms: self.decisions.retention_window_ms,
 				// The data server relies on this start's base validation for
 				// the winners it inherits (ADR 0107 C5 keeps that unchanged).
 				reprove_inherited: false,
@@ -330,6 +331,10 @@ pub(crate) struct CandidateBuild<'a> {
 	pub(crate) repair: &'a super::repair::RepairContext,
 	pub(crate) retention: crate::storage::retention::MvccRetentionPolicy,
 	pub(crate) now_ms: u64,
+	/// Wendelon ADR 0121 D1: the store's configured ParentDecisions window. A
+	/// store signs a report only under the bound window it is configured with,
+	/// for a target carrying that window.
+	pub(crate) configured_window_ms: u64,
 	/// Prove the winners inherited from the active base too, once per new
 	/// candidate (a recovered replacement, ADR 0107 C5).
 	pub(crate) reprove_inherited: bool,
@@ -490,11 +495,19 @@ impl StoreCertification<'_> {
 		};
 		let signer = build.repair.signer.clone();
 		let local = signer.signer;
+		let configured_window = build.configured_window_ms;
 		let work = self
 			.state_machine
 			.read_state(move |state| {
 				let decisions = state.decisions.as_ref()?;
 				let pending = decisions.generations().pending.clone()?;
+				// Wendelon ADR 0121 D1: a store whose configured window is not the
+				// bound one signs for no generation, and no target of another window.
+				if crate::consensus::decisions::retention_gate(state, configured_window).is_err()
+					|| pending.target.retention.window_ms != configured_window
+				{
+					return None;
+				}
 				// Wendelon ADR 0115: a target is reported only with the policy the
 				// outcomes at its cut require; unadmitted, an excluding target never is.
 				if pending.target.survivor_policy != state.pd_survivor_policy_at(pending.target.t) {
@@ -595,6 +608,21 @@ impl StoreCertification<'_> {
 							return Ok(None);
 						}
 					};
+					// Wendelon ADR 0121 R2: the staged least visible row is signed
+					// evidence too; rebuilt under the frozen target, it must reproduce
+					// it, or nothing is restaged, reported or overwritten.
+					let oldest_visible = self
+						.oldest_visible(&pending.target.retention, &entries)
+						.await;
+					if oldest_visible != staged.oldest_visible {
+						tracing::warn!(
+							gid,
+							staged = ?staged.oldest_visible,
+							rebuilt = ?oldest_visible,
+							"a recovered candidate's least visible row does not match its staged evidence"
+						);
+						return Ok(None);
+					}
 					if let Err(refusal) = index.restage_base(staged.clone(), entries).await? {
 						tracing::warn!(
 							?refusal,
@@ -617,11 +645,15 @@ impl StoreCertification<'_> {
 						return Ok(None);
 					}
 				};
+				let oldest_visible = self
+					.oldest_visible(&pending.target.retention, &entries)
+					.await;
 				let candidate = StagedCandidate {
 					gid,
 					target_digest: pending.digest,
 					predecessor_gid: meta.active_gid,
 					chunks: chunk_sums(&entries),
+					oldest_visible,
 				};
 				if index.stage_base(candidate, entries).await?.is_err() {
 					return Ok(None);
@@ -646,6 +678,7 @@ impl StoreCertification<'_> {
 				target_digest: staged.target_digest,
 				reporter: local,
 				chunks: staged.chunks,
+				oldest_visible: staged.oldest_visible,
 			},
 			local,
 		)))
@@ -687,6 +720,42 @@ impl StoreCertification<'_> {
 				child.rsv, child.ordinal
 			))),
 		}
+	}
+
+	/// Wendelon ADR 0121 D3: the least HLC of `entries`' governed, live
+	/// versions at or above `cut`'s floor; PK tables and tombstones never count.
+	/// Membership is unchanged by age (D4): this only summarizes it.
+	async fn oldest_visible(
+		&self,
+		cut: &crate::consensus::decisions::generations::RetentionCut,
+		entries: &[BaseEntry],
+	) -> Option<crate::schema::HybridTimestamp> {
+		if cut.window_ms == 0 {
+			return None;
+		}
+		let floor = cut.floor_hlc();
+		let tables: BTreeSet<(TenantId, TableObjectId)> = entries
+			.iter()
+			.map(|entry| (entry.tenant, entry.table))
+			.collect();
+		let governed: BTreeSet<(TenantId, TableObjectId)> = self
+			.state_machine
+			.read_state(move |state| {
+				tables
+					.into_iter()
+					.filter(|(tenant, table)| state.retention_governed(*tenant, *table))
+					.collect()
+			})
+			.await;
+		entries
+			.iter()
+			.filter(|entry| {
+				!entry.tombstone
+					&& governed.contains(&(entry.tenant, entry.table))
+					&& floor.is_none_or(|floor| entry.hlc >= floor)
+			})
+			.map(|entry| entry.hlc)
+			.min()
 	}
 
 	/// The candidate base: the active base, superseded per key by the newest

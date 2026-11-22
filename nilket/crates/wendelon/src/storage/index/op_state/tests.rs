@@ -1177,6 +1177,7 @@ async fn a_certified_tier_allocation_under_a_moved_generation_writes_nothing() {
 		position: 0,
 	};
 	let candidate = StagedCandidate {
+		oldest_visible: None,
 		gid: 1,
 		target_digest: [1; 32],
 		predecessor_gid: 0,

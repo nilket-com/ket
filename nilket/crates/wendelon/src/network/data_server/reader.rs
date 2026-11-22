@@ -134,6 +134,8 @@ pub(super) struct ReadAuthority {
 	index: Option<Arc<crate::storage::index::PersistentLocalIndex>>,
 	behind: Arc<std::sync::atomic::AtomicBool>,
 	validated: Arc<std::sync::atomic::AtomicBool>,
+	/// Wendelon ADR 0121 D1: this store's configured retention window.
+	retention_window_ms: u64,
 	#[cfg(test)]
 	checks_left: Arc<std::sync::atomic::AtomicUsize>,
 	#[cfg(test)]
@@ -327,10 +329,17 @@ impl ReadAuthority {
 		if let Some(reason) = self.slab.tier_authority_readiness_reason() {
 			return Err(refused(reason));
 		}
-		let (signer, k) = (self.signer, self.k);
+		let (signer, k, configured_window) = (self.signer, self.k, self.retention_window_ms);
 		let committed = self
 			.state_machine
 			.read_state(move |state| {
+				// Wendelon ADR 0121 D1: serve only under the bound window this store
+				// is configured with.
+				if let Err(reason) =
+					crate::consensus::decisions::retention_gate(state, configured_window)
+				{
+					return Err(format!("retention: {reason}"));
+				}
 				let current = state
 					.incarnations
 					.get(&signer.node)
@@ -480,6 +489,7 @@ impl WendelonDataServer {
 				index: self.slab.persistent_index(),
 				behind: self.decisions.behind_boundary.clone(),
 				validated: self.decisions.base_validated.clone(),
+				retention_window_ms: self.decisions.retention_window_ms,
 				#[cfg(test)]
 				checks_left: self.decisions.read_checks_left.clone(),
 				#[cfg(test)]
@@ -1109,6 +1119,7 @@ impl WendelonDataServer {
 			index: self.slab.persistent_index(),
 			behind: self.decisions.behind_boundary.clone(),
 			validated: self.decisions.base_validated.clone(),
+			retention_window_ms: self.decisions.retention_window_ms,
 			#[cfg(test)]
 			checks_left: self.decisions.read_checks_left.clone(),
 			#[cfg(test)]
@@ -1184,16 +1195,18 @@ impl WendelonDataServer {
 				local,
 			));
 		}
-		let effective_retention = self.table_effective_retention_from_state(
-			&self.state_machine.state_snapshot().await,
-			tenant,
-			table,
-		);
-		// ADR 0699 S5a: the certified survivor rule keeps every winning version;
-		// a retention floor would hide some. Frozen as none in this mode.
+		let state = self.state_machine.state_snapshot().await;
+		let effective_retention = self.table_effective_retention_from_state(&state, tenant, table);
+		// ADR 0699 S5a: no node or table window is served in this mode (both are
+		// fenced). Wendelon ADR 0121 D4: the only floor is the certified one, for a
+		// governed table: the current certificate's, which is the one at this
+		// statement's cut while K >= K_min holds (every later authority check
+		// refuses a statement a newer certificate passed).
 		if effective_retention.floor.is_some() {
 			return refuse("a retention floor is not served under ParentDecisions");
 		}
+		let certified_floor = state.retention_floor_for(tenant, table);
+		drop(state);
 		let Ok(program) = pbc::Program::compile(bytecode) else {
 			return Ok(query_plan_error(
 				&range_meta,
@@ -1283,7 +1296,7 @@ impl WendelonDataServer {
 			Some(&descriptor),
 			projected_execution,
 			row_identity_projection,
-			effective_retention.floor,
+			certified_floor,
 			Some(cancellation_token),
 			Some(writer),
 			ScanSource::Proved(&rows, &tails),
@@ -1363,6 +1376,7 @@ impl WendelonDataServer {
 			index: self.slab.persistent_index(),
 			behind: self.decisions.behind_boundary.clone(),
 			validated: self.decisions.base_validated.clone(),
+			retention_window_ms: self.decisions.retention_window_ms,
 			#[cfg(test)]
 			checks_left: self.decisions.read_checks_left.clone(),
 			#[cfg(test)]
@@ -1431,6 +1445,16 @@ impl WendelonDataServer {
 			return Err(ReadRefusal::Final(
 				"two parents hold the row at an equal full HLC".into(),
 			));
+		}
+		// Wendelon ADR 0121 D4: a governed winner strictly below the certified
+		// floor is not served, so a delete evaluates it as the read does.
+		let floor = self
+			.state_machine
+			.read_state(move |state| state.retention_floor_for(tenant, table))
+			.await;
+		if floor.is_some_and(|floor| winner.hlc < floor) {
+			authority.check().await.map_err(ReadRefusal::Transient)?;
+			return Ok(DeleteOutcome::NotFound);
 		}
 		let child = winner.child.map(|at| &children[at]);
 		let typed_tombstone = super::deletes::is_tombstone_version(
@@ -1567,6 +1591,7 @@ impl WendelonDataServer {
 			index: self.slab.persistent_index(),
 			behind: self.decisions.behind_boundary.clone(),
 			validated: self.decisions.base_validated.clone(),
+			retention_window_ms: self.decisions.retention_window_ms,
 			#[cfg(test)]
 			checks_left: self.decisions.read_checks_left.clone(),
 			#[cfg(test)]

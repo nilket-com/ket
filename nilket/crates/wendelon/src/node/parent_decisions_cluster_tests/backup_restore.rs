@@ -400,6 +400,67 @@ async fn an_append_only_tables_duplicates_survive_a_backup_and_restore() {
 	assert_eq!(read_multiset(&target_clients, &descriptor).await, expected);
 }
 
+/// Wendelon ADR 0121 D4: a fresh target whose store binds a positive retention window would hide
+/// a restored AppendOnly table's rows by age, so restore checks the incoming roster against the
+/// target's authoritative binding before it establishes or imports anything: the backup is
+/// refused there, typed, with no tenant, descriptor or row imported and no hold left.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn an_append_only_backup_is_refused_by_a_windowed_target_before_any_import() {
+	let (_source, clients, descriptor) =
+		source_with(super::append_only::append_only_descriptor()).await;
+	write(&clients, &descriptor, &[(1, "a"), (2, "b")]).await;
+	let root = crate::test_support::TestDir::new("adr0121-artifact");
+	let dir = root.to_path_buf().join("backup");
+	export::export(&clients, &dir, PASSPHRASE)
+		.await
+		.unwrap_or_else(|error| panic!("export: {error}"));
+	let verified = restore::verify(&dir, PASSPHRASE).unwrap();
+
+	let windowed = Cluster::start_with(|_, cfg| {
+		cfg.parent_decisions_retention_window = std::time::Duration::from_secs(15);
+		None
+	})
+	.await;
+	until_ready(&windowed, None).await;
+	windowed
+		.until("the window bound", |state| {
+			state
+				.decisions
+				.as_ref()
+				.is_some_and(|decisions| decisions.retention().is_some())
+		})
+		.await;
+	let windowed_clients = self::clients(&windowed).await;
+	let refused = restore::restore(&windowed_clients, &dir, &verified).await;
+	assert!(
+		matches!(
+			&refused,
+			Err(RestoreError::Refused(RestoreRefusal::RetentionWindowBound {
+				tenant_id,
+				table_object_id,
+				window_ms: 15_000,
+			})) if *tenant_id == TENANT && *table_object_id == descriptor.table_object_id
+		),
+		"{refused:?}"
+	);
+	let leader = windowed.leader().await;
+	let table = descriptor.table_object_id;
+	let imported = windowed
+		.node(leader)
+		.state_machine
+		.read_state(move |state| {
+			(
+				state.tenants.contains_key(&TENANT),
+				state.table_schemas.latest_by_id(TENANT, table).is_some(),
+			)
+		})
+		.await;
+	assert_eq!(imported, (false, false), "nothing established or imported");
+	assert_eq!(hold_of(&windowed).await, None, "no hold left");
+	// A fresh Disabled target restores an AppendOnly backup and verifies it:
+	// `an_append_only_tables_duplicates_survive_a_backup_and_restore`.
+}
+
 /// One AppendOnly write of `rows` through `client`; it must commit.
 async fn write_through_client(
 	client: &WendelonClient,

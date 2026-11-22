@@ -200,6 +200,14 @@ pub(crate) fn roster_at(
 					what: "a provisional table exists".into(),
 				});
 			}
+			// Wendelon ADR 0121 D4: a governed table hides rows it still stores; an
+			// export would carry them to a restore that serves them.
+			if state.retention_governed(tenant_id, table_object_id) {
+				return Err(RosterRefusal::RetentionActive {
+					tenant_id,
+					table_object_id,
+				});
+			}
 			let retention = match state
 				.table_lifecycle
 				.retention_policy(tenant_id, table_object_id)

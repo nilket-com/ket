@@ -692,6 +692,12 @@ pub enum DecisionCommand {
 		tenant: TenantId,
 		op: [u8; 16],
 	},
+	/// Wendelon ADR 0121 D1: binds the store's retention window, immutably. The
+	/// leader proposes it from its own configuration while none is bound; a
+	/// window of 0 is the Disabled binding. Appended.
+	BindRetention {
+		window_ms: u64,
+	},
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -869,6 +875,30 @@ pub enum DecisionRefusal {
 	IndexReceiptMembershipUnknown,
 	/// Wendelon ADR 0120: a CTAS command changed nothing. Appended.
 	Ctas(ctas::CtasRefusal),
+	/// Wendelon ADR 0121 D1: the store's retention window is bound to another
+	/// value; the binding is immutable. Appended.
+	RetentionRebind,
+	/// Wendelon ADR 0121 D2: a target's retention cut is not admissible on the
+	/// committed clock: another window, a floor below the certificate's or above
+	/// `clock - window`, or an age-only floor that hides no agreed visible row.
+	/// Appended.
+	RetentionCutInadmissible,
+}
+
+/// Wendelon ADR 0121 D1: whether a store configured with `configured_ms` may
+/// serve and sign under applied `state`. Today's authority passes; in mode the
+/// window must be bound and equal to the configuration. A refusal names its
+/// readiness reason. Read at every serving decision, so a bind applied while
+/// the store is open closes it at once.
+pub(crate) fn retention_gate(state: &SmState, configured_ms: u64) -> Result<(), &'static str> {
+	let Some(decisions) = state.decisions.as_ref() else {
+		return Ok(());
+	};
+	match decisions.retention {
+		None => Err("RetentionUnbound"),
+		Some(bound) if bound.window_ms == configured_ms => Ok(()),
+		Some(_) => Err("RetentionWindowMismatch"),
+	}
 }
 
 /// ADR 0721: how the key a store signs with stands against the replicated
@@ -1127,6 +1157,18 @@ pub enum DecisionResult {
 		tenant: TenantId,
 		op: [u8; 16],
 	},
+	/// Wendelon ADR 0121 D1: the store's retention window is bound to
+	/// `window_ms` (now or earlier). Appended.
+	RetentionBound {
+		window_ms: u64,
+	},
+}
+
+/// Wendelon ADR 0121 D1: the store's retention window, bound once by
+/// [`DecisionCommand::BindRetention`] and never changed or cleared.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetentionBinding {
+	pub window_ms: u64,
 }
 
 /// What a retry of `key` with `request_digest` learns. Pure over state.
@@ -1217,6 +1259,9 @@ pub struct DecisionState {
 	/// Wendelon ADR 0120: CREATE TABLE AS SELECT chains, retired object ids and
 	/// publication boundaries.
 	ctas: ctas::CtasState,
+	/// Wendelon ADR 0121 D1: the bound retention window; required before the
+	/// first admitted Reserve, never cleared.
+	retention: Option<RetentionBinding>,
 	/// Wendelon ADR 0113: the table each retained TABLE key's operation identity
 	/// (tenant, client UUID, sequence) is recorded under. A table operation identity
 	/// is tenant-wide across tables. Derived from `keys`: never serialized, rebuilt
@@ -1251,6 +1296,7 @@ impl Default for DecisionState {
 			instances: instances::InstanceState::default(),
 			index_receipts: BTreeMap::new(),
 			ctas: ctas::CtasState::default(),
+			retention: None,
 			table_operations: BTreeMap::new(),
 			live_by_table: BTreeMap::new(),
 		}
@@ -1261,6 +1307,17 @@ impl DecisionState {
 	/// Wendelon ADR 0120: the CTAS chains.
 	pub fn ctas(&self) -> &ctas::CtasState {
 		&self.ctas
+	}
+
+	/// Wendelon ADR 0121 D1: the bound retention window, if bound.
+	pub fn retention(&self) -> Option<RetentionBinding> {
+		self.retention
+	}
+
+	/// Wendelon ADR 0121: the bound window in milliseconds, 0 when unbound or
+	/// Disabled.
+	pub fn retention_window_ms(&self) -> u64 {
+		self.retention.map_or(0, |binding| binding.window_ms)
 	}
 
 	/// ADR 0736: the backup hold's token, if one is held.
@@ -1446,6 +1503,59 @@ impl DecisionState {
 			.copied()
 	}
 
+	/// Wendelon ADR 0121 R3: the retention invariants of the committed and pending
+	/// generations that a decoded state (a snapshot, an installed one included) can be
+	/// checked against locally. An unbound store has neither (legal genesis). With a
+	/// binding, each cut carries the bound window, a zero window carries no floor, no
+	/// stamp or floor is beyond the applied clock (`floor <= clock - window`), a
+	/// pending floor never falls below the certificate's, and a certified least visible
+	/// row is at or above the certified floor.
+	fn validate_retention(&self) -> Result<(), String> {
+		let generations = &self.generations;
+		let cuts = generations.current.iter().map(|cert| cert.retention).chain(
+			generations
+				.pending
+				.iter()
+				.map(|pending| pending.target.retention),
+		);
+		let Some(binding) = self.retention else {
+			return if generations.current.is_some() || generations.pending.is_some() {
+				Err("decisions: a generation exists and no retention window is bound".into())
+			} else {
+				Ok(())
+			};
+		};
+		for cut in cuts {
+			let admissible = cut.window_ms == binding.window_ms
+				&& cut.stamp_ms <= self.clock_ms
+				&& if binding.window_ms == 0 {
+					cut.floor_ms == 0
+				} else {
+					cut.floor_ms <= self.clock_ms.saturating_sub(binding.window_ms)
+				};
+			if !admissible {
+				return Err(format!(
+					"decisions: a retention cut {cut:?} contradicts the binding {binding:?} or the clock {}",
+					self.clock_ms
+				));
+			}
+		}
+		if let (Some(cert), Some(pending)) = (&generations.current, &generations.pending)
+			&& pending.target.retention.floor_ms < cert.retention.floor_ms
+		{
+			return Err("decisions: a pending retention floor below the certificate's".into());
+		}
+		if let Some(cert) = &generations.current
+			&& let (Some(oldest), Some(floor)) = (cert.oldest_visible, cert.retention.floor_hlc())
+			&& oldest < floor
+		{
+			return Err(
+				"decisions: a certified least visible row below the certified floor".into(),
+			);
+		}
+		Ok(())
+	}
+
 	pub(crate) fn validate(&self) -> Result<(), String> {
 		self.instances
 			.validate()
@@ -1466,6 +1576,10 @@ impl DecisionState {
 				}
 			}
 			None => {}
+		}
+		// Wendelon ADR 0121 D1: an admitted write follows a bound window.
+		if self.sealed.is_some() && self.retention.is_none() {
+			return Err("decisions: writes were admitted and no retention window is bound".into());
 		}
 		let mut seen_keys = std::collections::BTreeMap::new();
 		for ((node, _), key) in &self.signers {
@@ -1583,6 +1697,7 @@ impl DecisionState {
 			}) {
 			return Err("decisions: generation state is inconsistent".into());
 		}
+		self.validate_retention()?;
 		for lineage in self.lineages.values() {
 			if lineage.generation >= self.next_generation {
 				return Err("decisions: a lineage at or above next_generation".into());
@@ -2806,6 +2921,7 @@ fn reduce(
 			decisions, tenant, op, epoch, &owner, cause, stamp_ms, log_index,
 		),
 		DecisionCommand::CtasPrune { tenant, op } => ctas::prune(decisions, tenant, op),
+		DecisionCommand::BindRetention { window_ms } => bind_retention(decisions, window_ms),
 	};
 	outcome.unwrap_or_else(DecisionResult::Refused)
 }
@@ -2961,6 +3077,11 @@ fn reserve(
 	let reservation = log_index;
 	if decisions.bodies.contains_key(&reservation) {
 		return Err(DecisionRefusal::LogIndexOutOfOrder);
+	}
+	// Wendelon ADR 0121 D1: no write is admitted before the store's retention
+	// window is bound, so every admitted write follows one bound window.
+	if decisions.retention.is_none() {
+		return Err(DecisionRefusal::FormationIncomplete);
 	}
 	// ADR 0720: the last check, so a claim refused for any other reason never
 	// seals. The first admitted write fixes the membership it was admitted
@@ -3544,6 +3665,20 @@ fn abort_parent(
 		RefusalCause::Aborted
 	};
 	conclude(decisions, entry.reservation, Some(cause), log_index)
+}
+
+/// Wendelon ADR 0121 D1: binds the store's retention window once. The same
+/// window again is a no-op success; another is refused and changes nothing.
+fn bind_retention(
+	decisions: &mut DecisionState,
+	window_ms: u64,
+) -> Result<DecisionResult, DecisionRefusal> {
+	match decisions.retention {
+		Some(bound) if bound.window_ms == window_ms => {}
+		Some(_) => return Err(DecisionRefusal::RetentionRebind),
+		None => decisions.retention = Some(RetentionBinding { window_ms }),
+	}
+	Ok(DecisionResult::RetentionBound { window_ms })
 }
 
 /// Binds an incarnation to its key. Idempotent for the same key; a different
