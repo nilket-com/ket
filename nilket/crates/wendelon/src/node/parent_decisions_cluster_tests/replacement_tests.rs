@@ -2993,6 +2993,469 @@ async fn a_generation_committed_during_a_recovery_step_is_activated_and_recovery
 	}
 }
 
+/// The shared setup of the across-restart controls: a recorded replacement holds
+/// its children; a follower survivor's report for generation 2 is held after
+/// staging; the replacement's own report for it is RECORDED; then the
+/// replacement restarts as itself (same store, same incarnation), so its
+/// in-process `validated` flag starts false, and its next step validates again.
+/// Returns the replacement's owed reservation that generation 2 erases (row 3's
+/// parent, decided at or below the recorded k) and the held report's release.
+struct ReportedThenRestarted {
+	cluster: Cluster,
+	descriptor: TableSchemaDescriptor,
+	cfg: NodeBootstrapConfig,
+	recorded: crate::consensus::decisions::instances::Recovery,
+	pending_gid: u64,
+	held_release: Arc<tokio::sync::Notify>,
+	/// Every row written, as (id, name): 1, 2 and 3 before the loss, then d.
+	written: Vec<(i64, String)>,
+}
+
+async fn reported_then_restarted(
+	damage_base_entry: bool,
+	arm: Option<crate::node::replacement_recovery::ValidatePause>,
+) -> (ReportedThenRestarted, ControlOnlyNode) {
+	let (
+		Replaced {
+			cluster,
+			descriptor,
+			lost,
+			cfg,
+			now,
+		},
+		control,
+	) = replaced_after_gid_one(false).await;
+	let recorded = until_recorded(&cluster, &control).await;
+	assert_eq!(recorded.gid, 1);
+	let slab = control.recovery_storage().await.unwrap();
+	until_children_held(&cluster, &slab, lost).await;
+	let leader = cluster.leader().await;
+	let held = *NODES
+		.iter()
+		.find(|id| **id != lost && **id != leader)
+		.unwrap();
+	let (held_reached, held_release) = cluster.node(held).data_server.pause_coordinator_for_test(
+		crate::network::data_server::child_writes::PauseStage::CertificationBeforeReport,
+	);
+	let mut written: Vec<(i64, String)> = [(1, "a"), (2, "b"), (3, "c")]
+		.into_iter()
+		.map(|(id, name)| (id, name.to_owned()))
+		.collect();
+	written.push(write_current(&cluster, &descriptor, now + 60_002, 100, "d").await);
+	until_children_held(&cluster, &slab, lost).await;
+	jump_floor(&cluster, now + 75_000).await;
+	tokio::time::timeout(BOUND, held_reached.notified())
+		.await
+		.expect("the follower survivor's report is held after staging");
+	let deadline = tokio::time::Instant::now() + BOUND;
+	let pending_gid = loop {
+		if let Some((gid, reporters)) = pending_reports(&cluster).await
+			&& reporters.contains(&lost)
+		{
+			break gid;
+		}
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"the replacement's report was never recorded: {:?}",
+			pending_reports(&cluster).await
+		);
+		tokio::time::sleep(TICK).await;
+	};
+	assert_eq!(current_certificate(&cluster).await.unwrap().gid, 1);
+	if damage_base_entry {
+		damage_a_base_entry(&slab).await;
+	}
+	drop(slab);
+	control.shutdown().await.unwrap();
+	if let Some(pause) = arm {
+		crate::node::replacement_recovery::PAUSE_IN_VALIDATE
+			.lock()
+			.unwrap()
+			.insert(cfg.data_dir.clone(), pause);
+	}
+	let control = ControlOnlyNode::bootstrap_with_provider(cfg.clone(), provider(&cluster, lost))
+		.await
+		.unwrap();
+	(
+		ReportedThenRestarted {
+			cluster,
+			descriptor,
+			cfg,
+			recorded,
+			pending_gid,
+			held_release,
+			written,
+		},
+		control,
+	)
+}
+
+/// Why the replacement's recovery stopped, if it did (the test-only record).
+fn stop_reason(cfg: &NodeBootstrapConfig) -> Option<String> {
+	crate::node::replacement_preparation::STOP_REASONS
+		.lock()
+		.unwrap()
+		.get(&cfg.data_dir)
+		.cloned()
+}
+
+/// Damages one stored base entry of the replacement (its row digest), as physical
+/// damage to the base would; the store still opens, and its validation's base check
+/// is what finds it.
+async fn damage_a_base_entry(slab: &SlabManager) {
+	slab.persistent_index()
+		.unwrap()
+		.tamper_base_entry_for_test()
+		.await
+		.unwrap();
+}
+
+/// Flips one byte in the middle of the stored row of the replacement's first
+/// inherited base entry, as physical damage would, while the store is open (its
+/// open scan would refuse it after a restart). Returns that entry.
+async fn damage_first_inherited_row(
+	slab: &SlabManager,
+) -> crate::storage::index::certified_base::BaseEntry {
+	let entry = slab
+		.persistent_index()
+		.unwrap()
+		.base_entries(false)
+		.await
+		.unwrap()[0];
+	let location = slab
+		.version_locations(
+			entry.tenant,
+			crate::schema::Identity::new(entry.key_identity),
+			entry.hlc,
+		)
+		.unwrap()[0];
+	use std::io::{Read, Seek, SeekFrom, Write};
+	let path = slab
+		.data_dir()
+		.join(format!("slab_{:016x}.wnd", location.slab_id));
+	let mut file = std::fs::OpenOptions::new()
+		.read(true)
+		.write(true)
+		.open(&path)
+		.unwrap();
+	let at = location.offset + u64::from(location.length) / 2;
+	let mut byte = [0_u8];
+	file.seek(SeekFrom::Start(at)).unwrap();
+	file.read_exact(&mut byte).unwrap();
+	file.seek(SeekFrom::Start(at)).unwrap();
+	file.write_all(&[byte[0] ^ 0xFF]).unwrap();
+	file.sync_all().unwrap();
+	entry
+}
+
+/// The post-record validations recorded for this store, in order.
+fn validations(
+	cfg: &NodeBootstrapConfig,
+) -> Vec<crate::node::replacement_recovery::ValidationRecord> {
+	crate::node::replacement_recovery::VALIDATIONS
+		.lock()
+		.unwrap()
+		.get(&cfg.data_dir)
+		.cloned()
+		.unwrap_or_default()
+}
+
+/// The across-restart interleaving, up to the moment validation resumes: with the
+/// replacement's report for generation 2 already recorded, its restarted process
+/// validates at gid 1 and pauses holding an owed child (row 3's parent, still
+/// retained). The held survivor then reports; generation 2 commits on the
+/// replacement's recorded report and erases that parent, and the replacement's
+/// own state applies it. `between` runs while validation is still paused, after
+/// the commit is applied. Returns the fixture, the replacement, the restarted
+/// recovery's storage, generation 2's certificate and `between`'s result; the
+/// validation is resumed on return.
+async fn commit_during_restarted_validation<T>(
+	between: impl AsyncFnOnce(&SlabManager) -> T,
+) -> (
+	ReportedThenRestarted,
+	ControlOnlyNode,
+	Arc<SlabManager>,
+	crate::consensus::decisions::generations::Certificate,
+	T,
+) {
+	let pause = crate::node::replacement_recovery::ValidatePause {
+		reached: Arc::new(tokio::sync::Notify::new()),
+		release: Arc::new(tokio::sync::Notify::new()),
+		owed: Arc::new(std::sync::Mutex::new(Vec::new())),
+	};
+	let (reached, release, owed) = (
+		pause.reached.clone(),
+		pause.release.clone(),
+		pause.owed.clone(),
+	);
+	let (fixture, control) = reported_then_restarted(false, Some(pause)).await;
+	tokio::time::timeout(BOUND, reached.notified())
+		.await
+		.expect("the restarted replacement validates again");
+	let owed = owed.lock().unwrap().clone();
+	eprintln!(
+		"restarted validation: recorded gid {} k {}, pending gid {}, owed {owed:?}",
+		fixture.recorded.gid, fixture.recorded.k, fixture.pending_gid
+	);
+	assert!(!owed.is_empty(), "premise: the validation owes a child");
+	let retained = |rsvs: Vec<u64>| async {
+		control
+			.state_machine
+			.read_state(move |state| {
+				let decisions = state.decisions.as_ref().unwrap();
+				rsvs.iter()
+					.filter(|rsv| decisions.body(**rsv).is_some())
+					.copied()
+					.collect::<Vec<_>>()
+			})
+			.await
+	};
+	assert_eq!(
+		retained(owed.clone()).await,
+		owed,
+		"premise: every owed parent is retained when validation reads it"
+	);
+	let slab = control.recovery_storage().await.unwrap();
+	fixture.held_release.notify_one();
+	let second = until_certified_past(&fixture.cluster, 1, &control).await;
+	assert_eq!(second.gid, fixture.pending_gid);
+	let deadline = tokio::time::Instant::now() + BOUND;
+	while control
+		.state_machine
+		.read_state(|state| {
+			state
+				.decisions
+				.as_ref()
+				.unwrap()
+				.generations()
+				.current_gid()
+		})
+		.await < second.gid
+	{
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"the replacement never applied the commit"
+		);
+		tokio::time::sleep(TICK).await;
+	}
+	assert!(
+		retained(owed.clone()).await.len() < owed.len(),
+		"premise: the commit erased an owed parent while validation was paused"
+	);
+	let between = between(&slab).await;
+	release.notify_one();
+	(fixture, control, slab, second, between)
+}
+
+/// A commit during a restarted replacement's validation (its report for that
+/// generation already recorded) is not a recovery failure: the validation at the
+/// superseded gid 1 ends Moved, nothing is published, and the store activates
+/// generation 2 and validates again there, in full. Recovery continues, and the
+/// rows it holds are exact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_commit_during_validation_after_a_restart_revalidates_at_the_new_generation() {
+	use crate::node::replacement_recovery::Validation;
+	let (
+		ReportedThenRestarted {
+			mut cluster,
+			descriptor,
+			cfg,
+			written,
+			..
+		},
+		control,
+		slab,
+		second,
+		(),
+	) = commit_during_restarted_validation(async |_| ()).await;
+	// Full revalidation at generation 2 finished: its outcome is recorded.
+	let deadline = tokio::time::Instant::now() + BOUND;
+	loop {
+		assert!(
+			!control.preparation_ended(),
+			"a generation committed during an across-restart validation stopped a healthy recovery: {:?}",
+			stop_reason(&cfg)
+		);
+		if validations(&cfg).contains(&(second.gid, Ok(Validation::Valid))) {
+			break;
+		}
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"no full validation at gid {}: {:?}",
+			second.gid,
+			validations(&cfg)
+		);
+		tokio::time::sleep(TICK).await;
+	}
+	assert_eq!(
+		validations(&cfg),
+		vec![
+			(1, Ok(Validation::Moved { to: second.gid })),
+			(second.gid, Ok(Validation::Valid))
+		],
+		"gid 1 ended Moved, then gid {} was validated in full",
+		second.gid
+	);
+	until_replacement_active(&slab, &second).await;
+	tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+	assert!(!control.preparation_ended(), "{:?}", stop_reason(&cfg));
+	drop(slab);
+	control.shutdown().await.unwrap();
+	let found = crate::node::recovered_rows_in(&cfg, &descriptor)
+		.await
+		.unwrap();
+	assert!(found.unverified.is_empty(), "{:?}", found.unverified);
+	assert_eq!(found.active_gid, second.gid);
+	let mut held_rows = Vec::new();
+	for batch in &found.rows {
+		let ids = batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.unwrap();
+		let names = batch
+			.column(1)
+			.as_any()
+			.downcast_ref::<StringArray>()
+			.unwrap();
+		for row in 0..batch.num_rows() {
+			held_rows.push((ids.value(row), names.value(row).to_owned()));
+		}
+	}
+	held_rows.sort();
+	let mut written = written;
+	written.sort();
+	assert_eq!(held_rows, written, "the recovered rows are exact");
+	for node in std::mem::take(&mut cluster.nodes) {
+		let _ = tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown()).await;
+	}
+}
+
+/// The moved generation keeps the damage check: in the same interleaving, while
+/// validation at gid 1 is paused, a stored row of an inherited entry that
+/// generation 2's base still holds is damaged. The validation at gid 1 ends
+/// Moved; activation of generation 2 succeeds; the full validation at gid 2
+/// finds the damage and stops recovery for good, and nothing at gid 2 is
+/// published as valid.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_moved_validation_still_stops_on_damaged_data_at_the_new_generation() {
+	use crate::node::replacement_recovery::Validation;
+	let (
+		ReportedThenRestarted {
+			mut cluster, cfg, ..
+		},
+		control,
+		slab,
+		second,
+		damaged,
+	) = commit_during_restarted_validation(async |slab| damage_first_inherited_row(slab).await).await;
+	let deadline = tokio::time::Instant::now() + BOUND;
+	while !control.preparation_ended() {
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"the validation at gid {} did not stop on damaged data: {:?}",
+			second.gid,
+			validations(&cfg)
+		);
+		tokio::time::sleep(TICK).await;
+	}
+	let reason = stop_reason(&cfg);
+	eprintln!(
+		"moved validation stopped: {reason:?}; validations {:?}",
+		validations(&cfg)
+	);
+	let reason = reason.expect("a recorded stop");
+	// The stop is gid 2's own full validation failing: its recorded error is
+	// exactly the stop, after gid 1 ended Moved; nothing was published valid.
+	assert_eq!(
+		validations(&cfg),
+		vec![
+			(1, Ok(Validation::Moved { to: second.gid })),
+			(second.gid, Err(reason.clone()))
+		],
+		"gid 1 ended Moved, then gid {}'s validation failed with the stop",
+		second.gid
+	);
+	assert!(
+		reason.contains("checksum mismatch") || reason.starts_with("a certified entry"),
+		"the gid {} data check names the damage: {reason:?}",
+		second.gid
+	);
+	let index = slab.persistent_index().unwrap();
+	assert_eq!(
+		index.base_meta().await.unwrap().active_gid,
+		second.gid,
+		"activation of gid {} succeeded",
+		second.gid
+	);
+	assert!(
+		index
+			.base_entries(false)
+			.await
+			.unwrap()
+			.iter()
+			.any(|entry| entry.key() == damaged.key()),
+		"premise: gid {}'s base still holds the damaged entry",
+		second.gid
+	);
+	drop(index);
+	drop(slab);
+	control.shutdown().await.unwrap();
+	for node in std::mem::take(&mut cluster.nodes) {
+		let _ = tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown()).await;
+	}
+}
+
+/// The companion control: the same restart with the report recorded, but the
+/// certificate does NOT move, and an inherited row of the replacement's base is
+/// genuinely damaged (a stored entry's digest) before the restart. The restarted validation must stop
+/// recovery for good, and the store stays active at gid 1.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_restarted_validation_at_an_unchanged_certificate_stops_on_damaged_data() {
+	let (
+		ReportedThenRestarted {
+			mut cluster,
+			descriptor,
+			cfg,
+			recorded: _,
+			pending_gid: _,
+			held_release: _held,
+			written: _,
+		},
+		control,
+	) = reported_then_restarted(true, None).await;
+	let deadline = tokio::time::Instant::now() + BOUND;
+	while !control.preparation_ended() {
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"the restarted validation did not stop on damaged data"
+		);
+		tokio::time::sleep(TICK).await;
+	}
+	let reason = stop_reason(&cfg);
+	eprintln!("restarted validation stopped: {reason:?}");
+	assert!(
+		reason
+			.as_deref()
+			.is_some_and(|reason| reason.contains("RecoveryDamaged")
+				|| reason.starts_with("a certified entry")),
+		"the restarted validation's base check names the damage: {reason:?}"
+	);
+	assert_eq!(
+		current_certificate(&cluster).await.unwrap().gid,
+		1,
+		"premise: the certificate did not move"
+	);
+	control.shutdown().await.unwrap();
+	let found = crate::node::recovered_rows_in(&cfg, &descriptor)
+		.await
+		.unwrap();
+	assert_eq!(found.active_gid, 1, "the store stays active at gid 1");
+	for node in std::mem::take(&mut cluster.nodes) {
+		let _ = tokio::time::timeout(std::time::Duration::from_secs(30), node.shutdown()).await;
+	}
+}
+
 #[path = "replacement_activation_tests.rs"]
 mod activation;
 

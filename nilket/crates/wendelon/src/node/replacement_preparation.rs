@@ -101,6 +101,12 @@ pub(crate) static PAUSE_BEFORE_ACTIVATION: std::sync::Mutex<
 
 /// Test-only (ADR 0107): how many more of a node's report answers are lost
 /// after the report was sent, by data directory, as a dropped reply would.
+/// Test-only: why a store's recovery stopped, by data directory (the error its
+/// final step returned).
+#[cfg(test)]
+pub(crate) static STOP_REASONS: std::sync::Mutex<std::collections::BTreeMap<PathBuf, String>> =
+	std::sync::Mutex::new(std::collections::BTreeMap::new());
+
 #[cfg(test)]
 pub(crate) static LOSE_REPORT_ANSWERS: std::sync::Mutex<std::collections::BTreeMap<PathBuf, u32>> =
 	std::sync::Mutex::new(std::collections::BTreeMap::new());
@@ -186,6 +192,7 @@ impl Preparation {
 				}
 				Ok(false) => {}
 				Err(error) => {
+					self.note_stop(format!("preparation: {error}"));
 					tracing::error!(
 						slot = self.slot,
 						instance = self.instance,
@@ -200,6 +207,16 @@ impl Preparation {
 				_ = self.stop.notified() => {}
 			}
 		}
+	}
+
+	/// Test-only: records why this task stopped ([`STOP_REASONS`]).
+	#[allow(unused_variables)]
+	fn note_stop(&self, why: String) {
+		#[cfg(test)]
+		STOP_REASONS
+			.lock()
+			.unwrap()
+			.insert(self.data_dir.clone(), why);
 	}
 
 	/// ADR 0108 (wendelon): becomes true once this store's activation is in
@@ -234,6 +251,7 @@ impl Preparation {
 					tracing::warn!(slot = self.slot, %error, "recovery waits for the cluster's root");
 				}
 				Err(error) => {
+					self.note_stop(format!("storage did not open: {error}"));
 					tracing::error!(slot = self.slot, %error, "recovery stopped: its storage did not open");
 					return;
 				}
@@ -288,6 +306,7 @@ impl Preparation {
 							}
 						}
 						if let Disposition::Stop(why) = disposition(&self.forward(&request).await) {
+							self.note_stop(format!("statement refused: {why}"));
 							tracing::error!(slot = self.slot, %why, "recovery stopped: its statement was refused");
 							return;
 						}
@@ -339,6 +358,7 @@ impl Preparation {
 						tracing::debug!(slot = self.slot, ?answer, "report forwarded");
 					}
 					Err(error) => {
+						self.note_stop(error.to_string());
 						tracing::error!(slot = self.slot, %error, "recovery stopped");
 						return;
 					}

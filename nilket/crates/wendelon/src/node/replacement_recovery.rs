@@ -95,12 +95,54 @@ pub(crate) static PAUSE_AFTER_VIEW: std::sync::Mutex<
 	std::collections::BTreeMap<PathBuf, (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
 > = std::sync::Mutex::new(std::collections::BTreeMap::new());
 
+/// Test-only: one `validate` of the store in this directory pauses after it read
+/// its owed children and before it reads any child's parent: the owed
+/// reservations are published, `reached` is notified, then it waits for
+/// `release`. One-shot.
+#[cfg(test)]
+pub(crate) struct ValidatePause {
+	pub(crate) reached: Arc<tokio::sync::Notify>,
+	pub(crate) release: Arc<tokio::sync::Notify>,
+	pub(crate) owed: Arc<std::sync::Mutex<Vec<u64>>>,
+}
+
+#[cfg(test)]
+pub(crate) static PAUSE_IN_VALIDATE: std::sync::Mutex<
+	std::collections::BTreeMap<PathBuf, ValidatePause>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
 /// ADR 0108 (wendelon) test seam: an in-process replacement activates only
 /// where its test enables it (by store directory), so the ADR 0104 to 0107
 /// controls keep their ControlOnly member; the product always activates.
 #[cfg(test)]
 pub(crate) static ACTIVATION_ENABLED: std::sync::Mutex<std::collections::BTreeSet<PathBuf>> =
 	std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// Test-only: each post-record validation's generation and outcome (its error
+/// as text), by data directory, in order.
+#[cfg(test)]
+pub(crate) type ValidationRecord = (u64, Result<Validation, String>);
+
+#[cfg(test)]
+pub(crate) static VALIDATIONS: std::sync::Mutex<
+	std::collections::BTreeMap<PathBuf, Vec<ValidationRecord>>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// What one validation established. `Moved`: a strictly newer generation was
+/// committed while it ran, so nothing it read is published.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Validation {
+	/// The store's data is proved at the validated generation.
+	Valid,
+	/// The committed generation moved to `to`; validate again there.
+	Moved { to: u64 },
+}
+
+/// One lookup read together with the committed generation.
+enum Found<T> {
+	Here(T),
+	Moved(u64),
+}
 
 /// ADR 0106 (wendelon): what one recovery step found.
 #[derive(Debug, PartialEq, Eq)]
@@ -306,8 +348,16 @@ impl RecoveryDriver {
 		if let Progress::Pending(why) = self.repair_owed(&view, 0, k).await? {
 			return Ok(Progress::Pending(why));
 		}
-		self.validate(&index, gid, view.certificate.as_ref(), k)
-			.await?;
+		// Before the record the certificate is held fixed (no report from this
+		// store exists, so no commit can land): a moved one stays a hard error.
+		if let Validation::Moved { to } = self
+			.validate(&index, gid, view.certificate.as_ref(), k)
+			.await?
+		{
+			return Err(Error::other(format!(
+				"RecoveryStale: the certificate moved to gid {to} before any record"
+			)));
+		}
 		self.progress
 			.validated
 			.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -465,8 +515,28 @@ impl RecoveryDriver {
 			if let Progress::Pending(why) = self.repair_owed(view, 0, recorded.k).await? {
 				return Ok(Progress::Pending(why));
 			}
-			self.validate(index, current, certificate.as_ref(), recorded.k)
-				.await?;
+			// A generation committed during this validation (a report already
+			// recorded, then a restart, lets one commit here): nothing is
+			// published; the next step activates it and validates there.
+			let validation = self
+				.validate(index, current, certificate.as_ref(), recorded.k)
+				.await;
+			#[cfg(test)]
+			VALIDATIONS
+				.lock()
+				.unwrap()
+				.entry(self.slab.data_dir().to_path_buf())
+				.or_default()
+				.push((
+					current,
+					validation.as_ref().map(|v| *v).map_err(ToString::to_string),
+				));
+			let validation = validation?;
+			if let Validation::Moved { to } = validation {
+				return Ok(Progress::Pending(format!(
+					"the certificate moved to gid {to} during validation at gid {current}"
+				)));
+			}
 			self.progress.validated.store(true, Ordering::SeqCst);
 		}
 		if let Progress::Pending(why) = self.repair_owed(view, recorded.k, u64::MAX).await? {
@@ -989,7 +1059,7 @@ impl RecoveryDriver {
 		gid: u64,
 		certificate: Option<&crate::consensus::decisions::generations::Certificate>,
 		k: u64,
-	) -> std::io::Result<()> {
+	) -> std::io::Result<Validation> {
 		let meta = index.base_meta().await?;
 		if meta.active_gid != gid {
 			return Err(Error::other(format!(
@@ -1028,7 +1098,20 @@ impl RecoveryDriver {
 				"RecoveryDamaged: the base stored here does not hash to gid {gid}'s certificate"
 			)));
 		}
-		for child in self.owed(0, k).await {
+		let owed = self.owed(0, k).await;
+		#[cfg(test)]
+		{
+			let paused = PAUSE_IN_VALIDATE
+				.lock()
+				.unwrap()
+				.remove(self.slab.data_dir());
+			if let Some(pause) = paused {
+				*pause.owed.lock().unwrap() = owed.iter().map(|child| child.rsv).collect();
+				pause.reached.notify_one();
+				pause.release.notified().await;
+			}
+		}
+		for child in owed {
 			let intent = index
 				.parent_intent(child.rsv, child.ordinal)
 				.await?
@@ -1038,21 +1121,39 @@ impl RecoveryDriver {
 						&& intent.content == child.content
 				})
 				.ok_or_else(|| Error::other("an owed child is not held here"))?;
+			let rsv = child.rsv;
+			let namespace = match self
+				.at_generation(
+					gid,
+					"an owed child's parent is no longer retained",
+					move |state| {
+						state
+							.decisions
+							.as_ref()?
+							.body(rsv)
+							.map(|body| body.claim.key.namespace)
+					},
+				)
+				.await?
+			{
+				Found::Here(namespace) => namespace,
+				Found::Moved(to) => return Ok(Validation::Moved { to }),
+			};
 			let (tenant, table) = (
 				intent.tenant,
-				crate::network::data_server::child_writes::parent_table(
-					self.namespace_of(child.rsv).await?,
-				),
+				crate::network::data_server::child_writes::parent_table(namespace),
 			);
-			let descriptor = self
-				.state_machine
-				.read_state(move |state| {
+			let descriptor = match self
+				.at_generation(gid, "an owed child's table is unknown", move |state| {
 					crate::network::data_server::child_writes::recorded_latest_table_descriptor(
 						state, tenant, table,
 					)
 				})
-				.await
-				.ok_or_else(|| Error::other("an owed child's table is unknown"))?;
+				.await?
+			{
+				Found::Here(descriptor) => descriptor,
+				Found::Moved(to) => return Ok(Validation::Moved { to }),
+			};
 			crate::network::data_server::child_writes::verify_owned_rows(
 				&self.slab,
 				&index,
@@ -1062,23 +1163,65 @@ impl RecoveryDriver {
 			.await
 			.map_err(|refusal| Error::other(format!("{refusal:?}")))?;
 		}
-		Ok(())
+		// The success path checks the generation too: a commit after the last
+		// lookup makes this a validation of a superseded generation, which is
+		// not published. (One applied after this read is fenced by activation:
+		// it installs a candidate this run did not build, and that clears
+		// `validated`, `certification.rs` `activate_committed`.)
+		self.still_at(gid).await
 	}
 
-	async fn namespace_of(
+	/// Reads `lookup` and the committed generation in ONE state read. Found, at
+	/// `gid` or a newer generation: `Here` (the record itself is read; the
+	/// success path's own check decides what a moved generation means). Absent
+	/// while a STRICTLY newer generation is committed: `Moved` (that commit
+	/// erased what it named; the store validates again at that generation).
+	/// Absent at `gid` itself, a committed generation behind `gid`, or no
+	/// decision state: a hard error (`missing` for the first), as before.
+	async fn at_generation<T: Send + 'static>(
 		&self,
-		rsv: u64,
-	) -> std::io::Result<crate::consensus::decisions::ParentNamespace> {
-		self.state_machine
+		gid: u64,
+		missing: &'static str,
+		lookup: impl FnOnce(&crate::consensus::raft_storage::SmState) -> Option<T> + Send + 'static,
+	) -> std::io::Result<Found<T>> {
+		let (current, value) = self
+			.state_machine
 			.read_state(move |state| {
+				let current = state.decisions.as_ref()?.generations().current_gid();
+				Some((current, lookup(state)))
+			})
+			.await
+			.ok_or_else(|| Error::other("the decision state is unavailable"))?;
+		match (current.cmp(&gid), value) {
+			(std::cmp::Ordering::Less, _) => Err(Error::other(format!(
+				"the committed generation {current} is behind the validated {gid}"
+			))),
+			(_, Some(value)) => Ok(Found::Here(value)),
+			(std::cmp::Ordering::Greater, None) => Ok(Found::Moved(current)),
+			(std::cmp::Ordering::Equal, None) => Err(Error::other(missing)),
+		}
+	}
+
+	/// The generation check that ends a successful validation: published only
+	/// while `gid` is still the committed generation.
+	async fn still_at(&self, gid: u64) -> std::io::Result<Validation> {
+		let current = self
+			.state_machine
+			.read_state(|state| {
 				state
 					.decisions
 					.as_ref()
-					.and_then(|decisions| decisions.body(rsv))
-					.map(|body| body.claim.key.namespace)
+					.map(|decisions| decisions.generations().current_gid())
 			})
 			.await
-			.ok_or_else(|| Error::other("an owed child's parent is no longer retained"))
+			.ok_or_else(|| Error::other("the decision state is unavailable"))?;
+		match current.cmp(&gid) {
+			std::cmp::Ordering::Equal => Ok(Validation::Valid),
+			std::cmp::Ordering::Greater => Ok(Validation::Moved { to: current }),
+			std::cmp::Ordering::Less => Err(Error::other(format!(
+				"the committed generation {current} is behind the validated {gid}"
+			))),
+		}
 	}
 }
 
