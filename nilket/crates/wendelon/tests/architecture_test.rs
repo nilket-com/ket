@@ -12964,3 +12964,82 @@ fn a_mutation_receipt_is_built_only_from_a_committed_answer() {
 		"the counter add answer's frame builder"
 	);
 }
+
+/// Wendelon ADR 0124 D3: the sites that write a slab's committed tier record or its owner's
+/// terminal (removed) set, as (file, enclosing function), outside test modules. Ring apply is
+/// the only production writer; the two `*_for_test` state seeds are compiled only under test.
+/// A certified Retire's credit relies on this: removal is permanent and one Retire per (owner,
+/// slab) can ever be Applied. A new writer fails here until it is reviewed against ADR 0124.
+const COMMITTED_TIER_WRITERS: &[(&str, &str)] = &[
+	(
+		"consensus/raft_storage/slab_op_apply.rs",
+		"apply_valid_command",
+	),
+	("consensus/raft_storage/slab_op_apply.rs", "mark_removed"),
+	("consensus/raft_storage.rs", "seed_tiered_slab_for_test"),
+	("consensus/raft_storage.rs", "remove_tiered_slab_for_test"),
+];
+
+fn committed_tier_writer_sites(file: &str, source: &str) -> Vec<(String, String)> {
+	let production = production_part(source);
+	let mut sites = Vec::new();
+	for needle in [
+		".tiered_slabs.insert(",
+		".tiered_slabs.remove(",
+		".slab_terminal.entry(",
+		".slab_terminal.insert(",
+		"terminal.removed.insert(",
+	] {
+		for (offset, _) in production.match_indices(needle) {
+			let line = production[..offset].rfind('\n').map_or(0, |at| at + 1);
+			if production[line..offset].trim_start().starts_with("//") {
+				continue;
+			}
+			let head = &production[..offset];
+			let function = head
+				.rfind("fn ")
+				.map(|at| {
+					head[at + 3..]
+						.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+						.next()
+						.unwrap_or_default()
+						.to_owned()
+				})
+				.unwrap_or_default();
+			sites.push((file.to_owned(), function));
+		}
+	}
+	sites
+}
+
+#[test]
+fn only_ring_apply_writes_a_committed_tier_or_terminal_set() {
+	let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let mut sites = Vec::new();
+	walk_dir(&src, &mut |path| {
+		let name = path.file_name().unwrap().to_string_lossy().into_owned();
+		if path.extension().is_none_or(|ext| ext != "rs") || name.ends_with("tests.rs") {
+			return;
+		}
+		let file = path
+			.strip_prefix(&src)
+			.unwrap()
+			.to_string_lossy()
+			.into_owned();
+		sites.extend(committed_tier_writer_sites(
+			&file,
+			&fs::read_to_string(path).unwrap(),
+		));
+	});
+	sites.sort();
+	sites.dedup();
+	let mut expected: Vec<(String, String)> = COMMITTED_TIER_WRITERS
+		.iter()
+		.map(|(file, function)| (file.to_string(), function.to_string()))
+		.collect();
+	expected.sort();
+	assert_eq!(
+		sites, expected,
+		"the writers of a committed tier record or terminal set"
+	);
+}

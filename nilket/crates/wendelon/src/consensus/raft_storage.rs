@@ -3867,6 +3867,11 @@ impl TierSnapshotLease {
 			.map(|entry| entry.digest)
 	}
 
+	/// Wendelon ADR 0124: the last log index this state has applied.
+	pub(crate) fn applied_index(&self) -> Option<u64> {
+		self.0.state.last_applied_log_id.map(|id| id.index)
+	}
+
 	/// ADR 0704: whether `owner` is its node's current incarnation in this state.
 	pub(crate) fn owner_is_current(&self, owner: OwnerRef) -> bool {
 		self.0

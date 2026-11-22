@@ -1502,6 +1502,230 @@ async fn an_observer_first_delivery_is_counted_once_by_its_own_worker() {
 	shut_down(fx.cluster, &fx.time).await;
 }
 
+// --- Wendelon ADR 0124 baselines: a held worker's own outcome acknowledged, or retained ---------
+
+impl AgedL2 {
+	/// The op sequences whose outcomes the ring retains for this store's owner: exactly what
+	/// `op_applied_for_current_owner` reads.
+	async fn ring_outcomes(&self) -> Vec<u64> {
+		let owner = self.slab().owner_ref().unwrap();
+		self.cluster
+			.node(self.leader)
+			.state_machine
+			.read_state(move |state| {
+				state
+					.op_tables
+					.get(&owner)
+					.map(|table| table.outcomes.keys().copied().collect())
+					.unwrap_or_default()
+			})
+			.await
+	}
+
+	/// The op of the Applied certified retirement of `slab` the ring retains, if any.
+	async fn retained_retirement_op(&self, slab: crate::schema::SlabId) -> Option<u64> {
+		let owner = self.slab().owner_ref().unwrap();
+		let slab = owner.slab(slab);
+		self.cluster
+			.node(self.leader)
+			.state_machine
+			.read_state(move |state| {
+				state.op_tables.get(&owner).and_then(|table| {
+					table.outcomes.iter().find_map(|(op_seq, entry)| {
+						entry
+							.retirement
+							.as_ref()
+							.filter(|retirement| retirement.slab == slab)
+							.map(|_| *op_seq)
+					})
+				})
+			})
+			.await
+	}
+
+	/// Acknowledges, through the production committer, every ack-pending op of this store up
+	/// to and including `through` (the ring prunes outcomes by the acknowledged prefix), then
+	/// marks them acked here as the op driver would. Every one must be accepted.
+	async fn ack_through(&self, through: u64) {
+		use crate::storage::sweeper::TierCommitter as _;
+		let slab = self.slab();
+		let owner = slab.owner_ref().unwrap();
+		let index = slab.require_op_index().unwrap();
+		let seqs: Vec<u64> = index
+			.load_ack_pending()
+			.await
+			.unwrap()
+			.into_iter()
+			.filter(|(seq, acked)| !acked && *seq <= through)
+			.map(|(seq, _)| seq)
+			.collect();
+		assert!(
+			seqs.contains(&through),
+			"op {through} is ack-pending: {seqs:?}"
+		);
+		let receipt = self
+			.committer()
+			.ack_outcomes(owner, seqs.clone())
+			.await
+			.unwrap();
+		assert_eq!(
+			receipt.accepted, seqs,
+			"every acknowledgement accepted: {receipt:?}"
+		);
+		index.mark_ops_acked(receipt.accepted).await.unwrap();
+	}
+}
+
+/// Wendelon ADR 0124 C1/C2: S1's certified rewrite held right after the ring
+/// accepts it, with the op driver's acknowledgements held. The op is identified by the
+/// committed generation's certified provenance. With `ack`, exactly the ops through it are
+/// acknowledged by the production committer and its outcome is gone from the ring before
+/// release; without, it is retained through the count. Returns the tally the worker left.
+async fn held_rewrite_with_outcome(ack: bool) -> AgedRows {
+	let fx = aged_l2().await;
+	let slab = fx.slab();
+	slab.hold_acks_for_test(true);
+	match fx.step().await {
+		Ok(CertifiedTierStep::Retired { slab, .. }) if slab == fx.s2 => {}
+		other => panic!("S2's retirement: {other:?}"),
+	}
+	assert_eq!(fx.tally(), aged_data(2), "the control: S2's two aged rows");
+	let (reached, release) = slab.hold_next_certified_tier_step(CertifiedTierCut::AfterAcceptance);
+	slab.restart_certified_tier_cursor_for_test();
+	let worker = tokio::spawn(tier_step(
+		fx.cluster.node(fx.leader).data_server.clone(),
+		fx.committer(),
+	));
+	tokio::time::timeout(BOUND, reached.acquire())
+		.await
+		.expect("S1's step reaches acceptance")
+		.unwrap()
+		.forget();
+	let owner = slab.owner_ref().unwrap();
+	let op = fx
+		.cluster
+		.node(fx.leader)
+		.state_machine
+		.tiered_slab(owner.slab(fx.s1))
+		.await
+		.and_then(|tier| tier.certified)
+		.expect("the committed generation is certified")
+		.op;
+	assert!(
+		fx.ring_outcomes().await.contains(&op.op_seq),
+		"retained at the hold"
+	);
+	if ack {
+		fx.ack_through(op.op_seq).await;
+		assert!(
+			!fx.ring_outcomes().await.contains(&op.op_seq),
+			"the outcome is gone from the ring before release"
+		);
+	}
+	release.add_permits(1);
+	match tokio::time::timeout(BOUND, worker)
+		.await
+		.expect("the released worker completes")
+		.unwrap()
+	{
+		Ok(CertifiedTierStep::Rewritten { slab, op: done, .. }) if slab == fx.s1 => {
+			assert_eq!(done, op, "the worker delivered the identified op")
+		}
+		other => panic!("the held worker's step: {other:?}"),
+	}
+	if !ack {
+		assert!(
+			fx.ring_outcomes().await.contains(&op.op_seq),
+			"retained through the count"
+		);
+	}
+	let tally = fx.tally();
+	fx.s1_holds_only_n().await;
+	append_rows_everywhere(&fx.cluster, &fx.append, &[(4, "n")], "the survivor").await;
+	slab.hold_acks_for_test(false);
+	shut_down(fx.cluster, &fx.time).await;
+	tally
+}
+
+/// Wendelon ADR 0124 C3/C4: S2's certified retirement held right after acceptance,
+/// acknowledgements held; the op identified by the ring's retained certified retirement of S2.
+/// With `ack` its outcome is gone before release. Returns the tally the worker left.
+async fn held_retirement_with_outcome(ack: bool) -> AgedRows {
+	let fx = aged_l2().await;
+	let slab = fx.slab();
+	slab.hold_acks_for_test(true);
+	let (reached, release) = slab.hold_next_certified_tier_step(CertifiedTierCut::AfterAcceptance);
+	slab.restart_certified_tier_cursor_for_test();
+	let worker = tokio::spawn(tier_step(
+		fx.cluster.node(fx.leader).data_server.clone(),
+		fx.committer(),
+	));
+	tokio::time::timeout(BOUND, reached.acquire())
+		.await
+		.expect("S2's retirement reaches acceptance")
+		.unwrap()
+		.forget();
+	let op_seq = fx
+		.retained_retirement_op(fx.s2)
+		.await
+		.expect("the ring retains S2's certified retirement");
+	if ack {
+		fx.ack_through(op_seq).await;
+		assert!(
+			!fx.ring_outcomes().await.contains(&op_seq),
+			"the outcome is gone from the ring before release"
+		);
+	}
+	release.add_permits(1);
+	match tokio::time::timeout(BOUND, worker)
+		.await
+		.expect("the released worker completes")
+		.unwrap()
+	{
+		Ok(CertifiedTierStep::Retired { slab, op }) if slab == fx.s2 => {
+			assert_eq!(op.op_seq, op_seq, "the worker delivered the identified op")
+		}
+		other => panic!("the held worker's step: {other:?}"),
+	}
+	if !ack {
+		assert!(
+			fx.ring_outcomes().await.contains(&op_seq),
+			"retained through the count"
+		);
+	}
+	let tally = fx.tally();
+	assert!(fx.retired().await, "S2 retired, locally and committed");
+	slab.hold_acks_for_test(false);
+	shut_down(fx.cluster, &fx.time).await;
+	tally
+}
+
+/// ADR 0124 C1: an acknowledged outcome still credits its live
+/// worker's own rewrite, once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn an_acknowledged_rewrite_still_credits_its_worker_once() {
+	assert_eq!(held_rewrite_with_outcome(true).await, aged_data(3));
+}
+
+/// ADR 0124 C2: a retained outcome credits the worker's rewrite once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_retained_rewrite_outcome_credits_its_worker_once() {
+	assert_eq!(held_rewrite_with_outcome(false).await, aged_data(3));
+}
+
+/// ADR 0124 C3: an acknowledged outcome still credits its live
+/// worker's own retirement, once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn an_acknowledged_retirement_still_credits_its_worker_once() {
+	assert_eq!(held_retirement_with_outcome(true).await, aged_data(2));
+}
+
+/// ADR 0124 C4: a retained outcome credits the worker's retirement once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_retained_retirement_outcome_credits_its_worker_once() {
+	assert_eq!(held_retirement_with_outcome(false).await, aged_data(2));
+}
+
 /// Wendelon ADR 0122 D4, R2 (Codex 01a20151): an unsubmitted retirement earns nothing. S2's
 /// retirement is cut after its intent and certificate are durable and before submission: nothing
 /// is earned and nothing changes (S2 stays tiered, locally and committed). That intent is open's
@@ -1532,15 +1756,38 @@ async fn an_unsubmitted_retirement_earns_nothing() {
 	shut_down(fx.cluster, &fx.time).await;
 }
 
-/// Wendelon ADR 0122 D4 (Codex 01a201b7): only the worker's own Applied op earns its count. With
-/// each exact effect installed (S2 retired, S1's replacement published, locally and committed),
-/// the production counting entry is called with the worker's real op key but a mismatched digest,
-/// and with a key whose outcome is missing: it answers false and the store's tally is unchanged.
-/// The same call with the op's real digest answers true and adds its rows, so only the op proof
-/// made the difference.
+/// A credit for `op`'s effect on `slab_id`, minted as the live worker's would be (wendelon ADR
+/// 0124), with a test handoff at `index`.
+fn test_credit(
+	owner: crate::consensus::OwnerRef,
+	op: crate::consensus::slab_ops::OpKey,
+	slab_id: crate::schema::SlabId,
+	kind: crate::storage::manager::certified_tier::CreditKind,
+	candidate: Option<&str>,
+	index: u64,
+	rows: AgedRows,
+) -> crate::storage::manager::certified_tier::CertifiedAgedCredit {
+	use crate::storage::manager::certified_tier::{CertifiedAgedCredit, CreditScope};
+	let slab = owner.slab(slab_id);
+	CertifiedAgedCredit::mint(
+		CreditScope::for_test(op, [1; 32], slab, kind, op, candidate),
+		crate::storage::sweeper::AppliedHandoff::for_test(op, [1; 32], index),
+		slab,
+		kind,
+		rows,
+	)
+	.expect("a matching credit mints")
+}
+
+/// Wendelon ADR 0124 C5 on a real store (supersedes ADR 0122's op-proof control, Codex
+/// 01a201b7): with S2 retired and S1 rewritten, locally and committed, the production count
+/// credits nothing for a Retire credit for S1 (the same owner's other slab, still tiered), a Tier
+/// credit for an op the committed provenance does not name (superseded), a Tier credit for
+/// another candidate, an entry this store has not applied, or a Tier credit for retired S2. Each
+/// op's own credit then earns exactly its rows, once each.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn only_its_own_applied_op_earns_a_count() {
-	use crate::storage::manager::certified_tier::AgedL2Effect;
+async fn only_its_own_effect_earns_a_count() {
+	use crate::storage::manager::certified_tier::CreditKind::{Retire, Tier};
 	let fx = aged_l2().await;
 	let slab = fx.slab();
 	let retire_op = match fx.step().await {
@@ -1558,47 +1805,209 @@ async fn only_its_own_applied_op_earns_a_count() {
 	assert_eq!(fx.tally(), aged_data(3));
 	assert!(fx.retired().await);
 	fx.s1_holds_only_n().await;
-	let tier = AgedL2Effect::Tier(candidate);
-	for (slab_id, op, effect, rows) in [
-		(fx.s1, tier_op, &tier, aged_data(1)),
-		(fx.s2, retire_op, &AgedL2Effect::Retire, aged_data(2)),
+	let owner = slab.owner_ref().unwrap();
+	let other_op = crate::consensus::slab_ops::OpKey {
+		op_seq: tier_op.op_seq + 1_000_000,
+		..tier_op
+	};
+	let c = candidate.as_str();
+	for (what, credit) in [
+		(
+			"a Retire credit for S1, the same owner's other slab, still tiered",
+			test_credit(owner, retire_op, fx.s1, Retire, None, 0, aged_data(2)),
+		),
+		(
+			"a Tier credit for an op the committed provenance does not name",
+			test_credit(owner, other_op, fx.s1, Tier, Some(c), 0, aged_data(1)),
+		),
+		(
+			"a Tier credit for another candidate",
+			test_credit(
+				owner,
+				tier_op,
+				fx.s1,
+				Tier,
+				Some("file:///elsewhere"),
+				0,
+				aged_data(1),
+			),
+		),
+		(
+			"an entry this store has not applied",
+			test_credit(owner, tier_op, fx.s1, Tier, Some(c), u64::MAX, aged_data(1)),
+		),
+		(
+			"a Tier credit for S2, retired",
+			test_credit(owner, tier_op, fx.s2, Tier, Some(c), 0, aged_data(1)),
+		),
 	] {
-		let digest = slab
-			.applied_op_digest_for_test(op)
-			.await
-			.expect("the op's Applied outcome is retained");
-		let mut wrong = digest;
-		wrong[0] ^= 0xFF;
-		let missing = crate::consensus::slab_ops::OpKey {
-			op_seq: op.op_seq + 1_000_000,
-			..op
-		};
-		let before = fx.tally();
-		for (key, claimed, what) in [
-			(op, wrong, "a mismatched digest"),
-			(missing, digest, "a missing outcome"),
-		] {
-			assert!(
-				!slab
-					.record_aged_l2_if_applied(slab_id, key, claimed, effect, rows)
-					.await,
-				"{what} earns nothing for {effect:?}"
-			);
-			assert_eq!(fx.tally(), before, "{what}: the tally is unchanged");
-		}
-		assert!(
-			slab.record_aged_l2_if_applied(slab_id, op, digest, effect, rows)
-				.await,
-			"the real op earns it ({effect:?})"
-		);
-		assert_eq!(
-			fx.tally(),
-			AgedRows {
-				data: before.data + rows.data,
-				tombstone: before.tombstone
-			}
-		);
+		assert!(!slab.record_aged_l2(credit).await, "{what} earns nothing");
+		assert_eq!(fx.tally(), aged_data(3), "{what}: the tally is unchanged");
 	}
+	assert!(
+		slab.record_aged_l2(test_credit(
+			owner,
+			tier_op,
+			fx.s1,
+			Tier,
+			Some(c),
+			0,
+			aged_data(1)
+		))
+		.await
+	);
+	assert_eq!(fx.tally(), aged_data(4), "S1's own credit, once");
+	assert!(
+		slab.record_aged_l2(test_credit(
+			owner,
+			retire_op,
+			fx.s2,
+			Retire,
+			None,
+			0,
+			aged_data(2)
+		))
+		.await
+	);
+	assert_eq!(fx.tally(), aged_data(6), "S2's own credit, once");
+	shut_down(fx.cluster, &fx.time).await;
+}
+
+/// Wendelon ADR 0124 C5 at the decision point: S1's rewrite is delivered and its count held after
+/// its first local sample. There the snapshot epoch advances, or a snapshot install fence is
+/// raised: the replacement stays visible, locally and committed, yet the count earns nothing, and
+/// the delivery's result is unchanged.
+async fn a_count_across_a_snapshot_change(advance_epoch: bool) {
+	let fx = aged_l2().await;
+	let slab = fx.slab();
+	match fx.step().await {
+		Ok(CertifiedTierStep::Retired { slab, .. }) if slab == fx.s2 => {}
+		other => panic!("S2's retirement: {other:?}"),
+	}
+	assert_eq!(fx.tally(), aged_data(2));
+	let (reached, release) =
+		slab.hold_next_certified_tier_step(CertifiedTierCut::BeforeCreditDecision);
+	slab.restart_certified_tier_cursor_for_test();
+	let worker = tokio::spawn(tier_step(
+		fx.cluster.node(fx.leader).data_server.clone(),
+		fx.committer(),
+	));
+	tokio::time::timeout(BOUND, reached.acquire())
+		.await
+		.expect("S1's count reaches its decision")
+		.unwrap()
+		.forget();
+	assert!(
+		fx.rewritten().await.is_some(),
+		"the replacement is visible here"
+	);
+	if advance_epoch {
+		slab.advance_snapshot_epoch_for_test();
+	} else {
+		slab.snapshot_fence_for_test(true);
+	}
+	release.add_permits(1);
+	let step = tokio::time::timeout(BOUND, worker)
+		.await
+		.expect("the released worker completes")
+		.unwrap();
+	if !advance_epoch {
+		slab.snapshot_fence_for_test(false);
+	}
+	match step {
+		Ok(CertifiedTierStep::Rewritten { slab, .. }) if slab == fx.s1 => {}
+		other => panic!("the worker's step: {other:?}"),
+	}
+	assert_eq!(
+		fx.tally(),
+		aged_data(2),
+		"no credit across the snapshot change"
+	);
+	fx.s1_holds_only_n().await;
+	append_rows_everywhere(&fx.cluster, &fx.append, &[(4, "n")], "the survivor").await;
+	shut_down(fx.cluster, &fx.time).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_changed_snapshot_epoch_at_the_decision_earns_nothing() {
+	a_count_across_a_snapshot_change(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn an_active_snapshot_fence_at_the_decision_earns_nothing() {
+	a_count_across_a_snapshot_change(false).await;
+}
+
+/// Wendelon ADR 0124 D2 (Codex 01a204d8): a snapshot install fence already active when the count
+/// is entered, and released before its decision with no second epoch advance. The same
+/// candidate stays visible throughout and the final decision would see an unchanged epoch with
+/// no fence, yet the count earns nothing: its starting observation was inside the install. The
+/// worker completes as before and the survivor reads back. Bounded either way: an early refusal
+/// never reaches the decision hold, so the worker's completion is awaited beside it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_fence_active_at_entry_and_released_before_the_decision_earns_nothing() {
+	let fx = aged_l2().await;
+	let slab = fx.slab();
+	match fx.step().await {
+		Ok(CertifiedTierStep::Retired { slab, .. }) if slab == fx.s2 => {}
+		other => panic!("S2's retirement: {other:?}"),
+	}
+	assert_eq!(fx.tally(), aged_data(2));
+	let (entered, release_entry) =
+		slab.hold_next_certified_tier_step(CertifiedTierCut::BeforeCreditEntry);
+	slab.restart_certified_tier_cursor_for_test();
+	let mut worker = tokio::spawn(tier_step(
+		fx.cluster.node(fx.leader).data_server.clone(),
+		fx.committer(),
+	));
+	tokio::time::timeout(BOUND, entered.acquire())
+		.await
+		.expect("S1's count is entered")
+		.unwrap()
+		.forget();
+	assert!(
+		fx.rewritten().await.is_some(),
+		"the candidate is visible at entry"
+	);
+	let epoch = slab.capture_snapshot_epoch();
+	slab.snapshot_fence_for_test(true);
+	let (decided, release_decision) =
+		slab.hold_next_certified_tier_step(CertifiedTierCut::BeforeCreditDecision);
+	release_entry.add_permits(1);
+	let step = tokio::time::timeout(BOUND, async {
+		tokio::select! {
+			permit = decided.acquire() => {
+				permit.unwrap().forget();
+				// Released before the decision, with no epoch advance.
+				slab.snapshot_fence_for_test(false);
+				release_decision.add_permits(1);
+				(&mut worker).await
+			}
+			done = &mut worker => done,
+		}
+	})
+	.await
+	.expect("the worker completes")
+	.unwrap();
+	slab.snapshot_fence_for_test(false);
+	// A decision hold the count never reached must not catch a later count.
+	release_decision.add_permits(1);
+	assert_eq!(
+		slab.capture_snapshot_epoch(),
+		epoch,
+		"no second epoch advance"
+	);
+	match step {
+		Ok(CertifiedTierStep::Rewritten { slab, .. }) if slab == fx.s1 => {}
+		other => panic!("the worker's step: {other:?}"),
+	}
+	assert_eq!(
+		fx.tally(),
+		aged_data(2),
+		"no credit from a first observation inside an install"
+	);
+	fx.s1_holds_only_n().await;
+	append_rows_everywhere(&fx.cluster, &fx.append, &[(4, "n")], "the survivor").await;
 	shut_down(fx.cluster, &fx.time).await;
 }
 

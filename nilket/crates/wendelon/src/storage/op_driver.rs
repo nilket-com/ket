@@ -119,6 +119,13 @@ impl OpDriver {
 			.map(|(seq, _)| *seq)
 			.take(OPS_WINDOW_W as usize)
 			.collect();
+		// Wendelon ADR 0124 controls: a test holds every acknowledgement while armed.
+		#[cfg(test)]
+		let unacked = if self.slab.acks_held_for_test() {
+			Vec::new()
+		} else {
+			unacked
+		};
 		if !unacked.is_empty() {
 			let receipt = self.committer.ack_outcomes(owner, unacked.clone()).await?;
 			if !crate::storage::sweeper::ack_receipt_answers(&receipt, owner, &unacked) {

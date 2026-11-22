@@ -707,6 +707,8 @@ pub(super) struct TestHolds {
 	>,
 	/// Wendelon ADR 0122 (Codex 01a20151 R3): the aged rows this store recorded, by level.
 	pub(super) aged_pruned: std::sync::Mutex<[super::certified_tier::AgedRows; 2]>,
+	/// Wendelon ADR 0124 controls: while set, the op driver acknowledges nothing.
+	pub(super) acks_held: std::sync::atomic::AtomicBool,
 	/// ADR 0704 §5: the source objects (URI, bytes) the certified path retained.
 	pub(super) certified_retained: std::sync::Mutex<Vec<(String, u64)>>,
 	pub(super) append_refusal_after: std::sync::atomic::AtomicU64,
@@ -991,6 +993,21 @@ impl SlabManager {
 
 #[cfg(test)]
 impl SlabManager {
+	/// Wendelon ADR 0124 controls: hold (or release) every acknowledgement the op driver
+	/// would send for this store, so a control decides when an outcome leaves the ring.
+	pub(crate) fn hold_acks_for_test(&self, held: bool) {
+		self.continuity_test_holds
+			.acks_held
+			.store(held, std::sync::atomic::Ordering::SeqCst);
+	}
+
+	/// Wendelon ADR 0124 controls: whether acknowledgements are held.
+	pub(crate) fn acks_held_for_test(&self) -> bool {
+		self.continuity_test_holds
+			.acks_held
+			.load(std::sync::atomic::Ordering::SeqCst)
+	}
+
 	/// ADR 0704: the next on-demand preparation's parking and injected failure, if armed.
 	pub(super) async fn tier_prepare_fail_hold_for_test(&self) -> Option<Error> {
 		let hold = self

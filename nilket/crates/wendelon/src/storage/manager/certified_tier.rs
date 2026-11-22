@@ -23,14 +23,173 @@ use crate::storage::manager::certified_lsm::{
 	CertifiedSelection, DropSummary, FrameTable, canonical_drop, frame_tables_of,
 };
 
-/// Wendelon ADR 0122 D4: the effect a certified tier job's own operation makes, which its
-/// count must find in force.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum AgedL2Effect {
-	/// A certified `Tier`: the fresh candidate object it publishes.
-	Tier(String),
+/// Wendelon ADR 0124 D1: which certified effect a job's op makes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CreditKind {
+	/// A certified `Tier`: the job's fresh candidate replaces the source.
+	Tier,
 	/// A certified `Retire` of the slab.
 	Retire,
+}
+
+/// Wendelon ADR 0124 D1: what a certified op's own command names, read from the ticket that is
+/// submitted: its key and digest, the slab, the kind, the certified provenance's op and, for a
+/// `Tier`, the candidate (as a 32-byte digest of its URI: nothing owned on the heap).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CreditScope {
+	key: OpKey,
+	digest: [u8; 32],
+	slab: crate::consensus::SlabRef,
+	kind: CreditKind,
+	provenance_op: OpKey,
+	candidate: Option<[u8; 32]>,
+}
+
+fn uri_digest(uri: &str) -> [u8; 32] {
+	*blake3::hash(uri.as_bytes()).as_bytes()
+}
+
+impl CreditScope {
+	/// The scope of `ticket`'s own command, if it is a certified `Tier` or `Retire`.
+	fn of_ticket(ticket: &crate::storage::index::OpTicket) -> Option<Self> {
+		use crate::consensus::slab_ops::{RetireOp, SlabCommand, TierOp};
+		let (slab, kind, provenance_op, candidate) = match ticket.command() {
+			SlabCommand::Tier(TierOp { tier, .. }) => (
+				tier.slab,
+				CreditKind::Tier,
+				tier.certified.as_ref()?.op,
+				Some(uri_digest(&tier.l2_uri)),
+			),
+			SlabCommand::Retire(RetireOp {
+				slab, certified, ..
+			}) => (*slab, CreditKind::Retire, certified.as_ref()?.op, None),
+			_ => return None,
+		};
+		Some(Self {
+			key: ticket.key(),
+			digest: ticket.digest(),
+			slab,
+			kind,
+			provenance_op,
+			candidate,
+		})
+	}
+
+	/// Test-only (wendelon ADR 0124 C5/C6): a scope as a certified command would give it.
+	#[cfg(test)]
+	pub(crate) fn for_test(
+		key: OpKey,
+		digest: [u8; 32],
+		slab: crate::consensus::SlabRef,
+		kind: CreditKind,
+		provenance_op: OpKey,
+		candidate: Option<&str>,
+	) -> Self {
+		Self {
+			key,
+			digest,
+			slab,
+			kind,
+			provenance_op,
+			candidate: candidate.map(uri_digest),
+		}
+	}
+}
+
+/// Wendelon ADR 0124 D1: the live certified worker's credit for its own op's aged rows: the
+/// op's verified Applied handoff, the scope its own command names, and the job's own aged rows.
+/// Minted only by [`CertifiedAgedCredit::mint`], which refuses any mismatch; consumed by value by
+/// the one count. Not `Clone` or `Copy`.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct CertifiedAgedCredit {
+	scope: CreditScope,
+	applied_index: u64,
+	rows: AgedRows,
+}
+
+impl CertifiedAgedCredit {
+	/// Wendelon ADR 0124 D1: a credit when, and only when, the handoff is the scope's own op
+	/// (key and digest), the scope's command is certified by that very op, and it names the job's
+	/// own slab and kind under that slab's owner. `None` otherwise: no credit, never an error.
+	pub(crate) fn mint(
+		scope: CreditScope,
+		handoff: crate::storage::sweeper::AppliedHandoff,
+		job_slab: crate::consensus::SlabRef,
+		job_kind: CreditKind,
+		rows: AgedRows,
+	) -> Option<Self> {
+		let matched = handoff.key() == scope.key
+			&& handoff.digest() == scope.digest
+			&& scope.provenance_op == scope.key
+			&& scope.slab == job_slab
+			&& scope.kind == job_kind
+			&& scope.key.owner == job_slab.owner()
+			&& (scope.kind == CreditKind::Tier) == scope.candidate.is_some();
+		(matched && !rows.is_empty()).then_some(Self {
+			scope,
+			applied_index: handoff.index(),
+			rows,
+		})
+	}
+}
+
+/// Wendelon ADR 0124 D2: this store's local view of a credit's slab, sampled under the job's
+/// slab claim with nothing else held.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LocalCreditFacts {
+	/// The digest of the local tier pointer's URI, if any.
+	pub(crate) pointer: Option<[u8; 32]>,
+	/// Whether the slab is retired here.
+	pub(crate) retired_here: bool,
+}
+
+/// Wendelon ADR 0124 D2: one canonical lease's facts about a credit's slab and owner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CanonicalCreditFacts {
+	/// This store's owner (`None` without one).
+	pub(crate) store_owner: Option<crate::consensus::OwnerRef>,
+	/// Whether the credit's owner is its node's current incarnation.
+	pub(crate) owner_current: bool,
+	/// The lease state's last applied index.
+	pub(crate) applied_index: Option<u64>,
+	/// The committed tier of the slab: its URI digest and its certified provenance's op.
+	pub(crate) committed: Option<([u8; 32], Option<OpKey>)>,
+	/// Whether the slab's retirement is in force.
+	pub(crate) retirement_in_force: bool,
+}
+
+/// Wendelon ADR 0124 D2: the decision, over the local view before the lease, the lease's facts,
+/// the local view after it, and whether the snapshot epoch captured before the first local
+/// sample is still current with no snapshot install in flight. A conservative observation:
+/// every fact must hold at its sample; it does not claim to see every transient transition.
+pub(crate) fn credit_earned(
+	credit: &CertifiedAgedCredit,
+	before: LocalCreditFacts,
+	canonical: CanonicalCreditFacts,
+	after: LocalCreditFacts,
+	epoch_current: bool,
+) -> bool {
+	let scope = &credit.scope;
+	let installed = |local: LocalCreditFacts| match scope.kind {
+		CreditKind::Tier => local.pointer.is_some() && local.pointer == scope.candidate,
+		CreditKind::Retire => local.pointer.is_none() && local.retired_here,
+	};
+	let in_force = match scope.kind {
+		CreditKind::Tier => canonical.committed.is_some_and(|(uri, provenance)| {
+			Some(uri) == scope.candidate && provenance == Some(scope.key)
+		}),
+		CreditKind::Retire => canonical.committed.is_none() && canonical.retirement_in_force,
+	};
+	epoch_current
+		&& installed(before)
+		&& installed(after)
+		&& before == after
+		&& canonical.store_owner == Some(scope.key.owner)
+		&& canonical.owner_current
+		&& canonical
+			.applied_index
+			.is_some_and(|applied| applied >= credit.applied_index)
+		&& in_force
 }
 
 /// Wendelon ADR 0122 D4: aged occurrences, by kind.
@@ -53,61 +212,74 @@ impl AgedRows {
 }
 
 impl SlabManager {
-	/// Wendelon ADR 0122 D4 (r2): the worker that submitted `op` records its aged rows once, at
-	/// the end of its own successful delivery, only when one coherent read of the canonical lease
-	/// shows `op` decided Applied under `digest` for its current owner and its own effect still in
-	/// force, and this store has installed it:
-	/// - `Tier`: the slab's committed pointer is exactly its fresh candidate, and so is the local
-	///   one;
-	/// - `Retire`: the retirement is in force and the slab is retired here.
-	/// An observer may have installed it first; the worker still counts it, once. Nothing is held
-	/// between calls: an error, a cancellation, a crash, a superseded or unresolved effect, or an
-	/// outcome no longer retained records nothing (an undercount, never an inflation). Returns
-	/// whether it recorded.
-	pub(crate) async fn record_aged_l2_if_applied(
-		&self,
-		slab_id: SlabId,
-		op: crate::consensus::slab_ops::OpKey,
-		digest: [u8; 32],
-		effect: &AgedL2Effect,
-		rows: AgedRows,
-	) -> bool {
-		if rows.is_empty() {
-			return false;
-		}
-		// This store's facts first (each under its own lock, released here), so the lease
-		// below is held for nothing but the canonical verdict (Codex 01a201b7).
-		let installed_here = match effect {
-			AgedL2Effect::Tier(uri) => self
-				.tier_pointer(slab_id)
-				.await
-				.is_some_and(|pointer| pointer.l2_uri == *uri),
-			AgedL2Effect::Retire => {
-				self.tier_pointer(slab_id).await.is_none()
-					&& self.retired_tier_slabs.contains(&slab_id)
-			}
-		};
-		let Ok(owner) = self.owner_ref() else {
+	/// Wendelon ADR 0124 D2/D5: the live worker that submitted its op records the job's aged rows
+	/// once, from its own credit, at the end of its own successful delivery. In this order, with no
+	/// local lock held across the lease: at entry, an unfenced snapshot epoch is observed under
+	/// the epoch gate (inside an install, nothing is credited); this store's local view of the
+	/// slab is sampled (the job still holds its slab claim); one canonical lease shows this store
+	/// is the op's owner, the owner current, the op's entry applied, and the op's own effect in
+	/// force (a `Tier`'s committed generation is its candidate with its own certified provenance;
+	/// a `Retire`'s slab retired); the local view is sampled again; at the decision the entry
+	/// epoch must still be current with no snapshot install in flight. Any failure records nothing (an
+	/// undercount, never an inflation). The op's retained outcome is not consulted: its
+	/// acknowledgement has no effect. Returns whether it recorded.
+	pub(crate) async fn record_aged_l2(&self, credit: CertifiedAgedCredit) -> bool {
+		#[cfg(test)]
+		self.certified_tier_hold(CertifiedTierCut::BeforeCreditEntry)
+			.await;
+		// The starting observation: an epoch with no install in flight, read under the gate an
+		// install holds while it advances the epoch and raises its fence. Inside an install,
+		// nothing is credited (a later release of that fence leaves the epoch unchanged).
+		let Some(epoch) = self.unfenced_snapshot_epoch() else {
 			return false;
 		};
-		let slab = owner.slab(slab_id);
+		let slab_id = credit.scope.slab.local_id();
+		let before = self.local_credit_facts(slab_id).await;
+		#[cfg(test)]
+		self.certified_tier_hold(CertifiedTierCut::BeforeCreditDecision)
+			.await;
 		let canonical = {
 			let Ok(Some(lease)) = self.canonical_tier_lease().await else {
 				return false;
 			};
-			lease.op_applied_for_current_owner(op, digest)
-				&& match effect {
-					AgedL2Effect::Tier(uri) => lease
-						.committed_tier(slab)
-						.is_some_and(|tier| tier.l2_uri == *uri),
-					AgedL2Effect::Retire => lease.retirement_in_force(slab),
-				}
+			let slab = credit.scope.slab;
+			CanonicalCreditFacts {
+				store_owner: self.owner_ref().ok(),
+				owner_current: lease.owner_is_current(credit.scope.key.owner),
+				applied_index: lease.applied_index(),
+				committed: lease.committed_tier(slab).map(|tier| {
+					(
+						uri_digest(&tier.l2_uri),
+						tier.certified.as_ref().map(|provenance| provenance.op),
+					)
+				}),
+				retirement_in_force: lease.retirement_in_force(slab),
+			}
 		};
-		let earned = canonical && installed_here;
+		let after = self.local_credit_facts(slab_id).await;
+		let earned = credit_earned(
+			&credit,
+			before,
+			canonical,
+			after,
+			self.snapshot_epoch_is_current(epoch),
+		);
 		if earned {
-			self.observe_aged_rows_pruned(AgedLevel::L2, rows);
+			self.observe_aged_rows_pruned(AgedLevel::L2, credit.rows);
 		}
 		earned
+	}
+
+	/// Wendelon ADR 0124 D2: this store's local view of `slab_id`, each fact under its own lock,
+	/// released before return.
+	async fn local_credit_facts(&self, slab_id: SlabId) -> LocalCreditFacts {
+		LocalCreditFacts {
+			pointer: self
+				.tier_pointer(slab_id)
+				.await
+				.map(|pointer| uri_digest(&pointer.l2_uri)),
+			retired_here: self.retired_tier_slabs.contains(&slab_id),
+		}
 	}
 
 	/// The one place an aged removal is recorded: the exported Section 8 series and, under
@@ -268,6 +440,11 @@ pub(crate) enum CertifiedTierCut {
 	BeforeSubmit,
 	/// The ring decided it Applied; this store has not delivered it locally.
 	AfterAcceptance,
+	/// Wendelon ADR 0124: the count is entered and has observed nothing yet. A hold only.
+	BeforeCreditEntry,
+	/// Wendelon ADR 0124: the count has sampled the local view once and has not read the lease.
+	/// A hold only (a cut here would end a delivered op).
+	BeforeCreditDecision,
 }
 
 #[cfg(test)]
@@ -888,10 +1065,13 @@ impl SlabManager {
 			}
 			CertifiedTierAllocation::Allocated(allocation) => allocation.first,
 		};
-		let (op, digest) = (ticket.key(), ticket.digest());
+		let op = ticket.key();
+		let scope = CreditScope::of_ticket(&ticket);
 		#[cfg(test)]
 		self.certified_tier_cut(CertifiedTierCut::BeforeSubmit)?;
-		crate::storage::sweeper::submit_tier_retirement(self, committer, &ticket).await?;
+		let handoff =
+			crate::storage::sweeper::submit_tier_retirement_handed_off(self, committer, &ticket)
+				.await?;
 		#[cfg(test)]
 		self.certified_tier_cut(CertifiedTierCut::AfterAcceptance)?;
 		#[cfg(test)]
@@ -899,10 +1079,13 @@ impl SlabManager {
 			.await;
 		self.retire_tiered_slab_at_snapshot_epoch(slab_id, observed_epoch)
 			.await?;
-		// Wendelon ADR 0122 D4: counted once, here, from this op's own verified effect
-		// (retired here or by the observer first).
-		self.record_aged_l2_if_applied(slab_id, op, digest, &AgedL2Effect::Retire, aged)
-			.await;
+		// Wendelon ADR 0124: counted once, here, from this op's own credit (retired here or by
+		// the observer first). A refused credit records nothing and changes no result.
+		if let Some(credit) = scope.and_then(|scope| {
+			CertifiedAgedCredit::mint(scope, handoff, job.slab, CreditKind::Retire, aged)
+		}) {
+			self.record_aged_l2(credit).await;
+		}
 		#[cfg(test)]
 		self.note_certified_retained_object(&job.source.l2_uri, job.source_bytes);
 		if Self::retain_superseded_l2_object(slab_id, &job.source.l2_uri, "superseded tier object")
@@ -1047,22 +1230,23 @@ impl SlabManager {
 				// The reservation is released with its proposal.
 				CertifiedTierAllocation::GenerationMoved => Ok(None),
 				CertifiedTierAllocation::Allocated(allocation) => {
-					let (op, digest) = (allocation.first.key(), allocation.first.digest());
+					let op = allocation.first.key();
+					let scope = CreditScope::of_ticket(&allocation.first);
 					#[cfg(test)]
 					self.certified_tier_cut(CertifiedTierCut::BeforeSubmit)?;
-					crate::storage::sweeper::submit_tier_proposal(
+					let handoff = crate::storage::sweeper::submit_tier_proposal_handed_off(
 						self,
 						committer,
 						proposal,
 						allocation.first,
 					)
 					.await?;
-					Ok(Some((op, digest)))
+					Ok(Some((op, scope, handoff)))
 				}
 			}
 		}
 		.await;
-		let (op, digest) = match submitted {
+		let (op, scope, handoff) = match submitted {
 			Ok(Some(applied)) => applied,
 			Ok(None) => {
 				self.record_tier_candidate_not_submitted(slab_id, &new_uri, length)
@@ -1094,16 +1278,14 @@ impl SlabManager {
 			self.apply_tier_slab_at_snapshot_epoch(pointer, observed_epoch)
 				.await?;
 		}
-		// Wendelon ADR 0122 D4: counted once, here, from this op's own verified effect
-		// (installed here or by the observer first); superseded or unresolved, nothing.
-		self.record_aged_l2_if_applied(
-			slab_id,
-			op,
-			digest,
-			&AgedL2Effect::Tier(new_uri.clone()),
-			aged,
-		)
-		.await;
+		// Wendelon ADR 0124: counted once, here, from this op's own credit (installed here or by
+		// the observer first); superseded or unresolved, nothing. A refused credit records
+		// nothing and changes no result.
+		if let Some(credit) = scope.and_then(|scope| {
+			CertifiedAgedCredit::mint(scope, handoff, job.slab, CreditKind::Tier, aged)
+		}) {
+			self.record_aged_l2(credit).await;
+		}
 		self.record_cleanup_replacement_published(slab_id, &job.source.l2_uri, &new_uri)
 			.await?;
 		#[cfg(test)]
@@ -1240,5 +1422,317 @@ mod tests {
 			&attributed,
 			&selection
 		)));
+	}
+}
+
+/// Wendelon ADR 0124 C5/C6 and D6: the credit's mint and decision, over constructed facts.
+#[cfg(test)]
+mod credit_tests {
+	use super::*;
+	use crate::consensus::{OwnerRef, StoreIncarnation};
+	use crate::storage::sweeper::AppliedHandoff;
+
+	const CANDIDATE: &str = "file:///l2/certified/x/slab_1.wnd";
+
+	struct Fx {
+		owner: OwnerRef,
+		a: crate::consensus::SlabRef,
+		b: crate::consensus::SlabRef,
+		key: OpKey,
+		digest: [u8; 32],
+	}
+
+	fn fx() -> Fx {
+		let owner = OwnerRef::new(41, StoreIncarnation::fresh());
+		Fx {
+			owner,
+			a: owner.slab(SlabId::new(1)),
+			b: owner.slab(SlabId::new(2)),
+			key: OpKey { owner, op_seq: 4 },
+			digest: [7; 32],
+		}
+	}
+
+	fn rows() -> AgedRows {
+		AgedRows {
+			data: 1,
+			tombstone: 2,
+		}
+	}
+
+	fn scope(fx: &Fx, slab: crate::consensus::SlabRef, kind: CreditKind) -> CreditScope {
+		let candidate = (kind == CreditKind::Tier).then_some(CANDIDATE);
+		CreditScope::for_test(fx.key, fx.digest, slab, kind, fx.key, candidate)
+	}
+
+	fn handoff(fx: &Fx) -> AppliedHandoff {
+		AppliedHandoff::for_test(fx.key, fx.digest, 10)
+	}
+
+	fn credit(fx: &Fx, slab: crate::consensus::SlabRef, kind: CreditKind) -> CertifiedAgedCredit {
+		CertifiedAgedCredit::mint(scope(fx, slab, kind), handoff(fx), slab, kind, rows())
+			.expect("a matching credit mints")
+	}
+
+	/// The facts under which `slab`'s `kind` effect is in force and installed here.
+	fn holding(
+		fx: &Fx,
+		kind: CreditKind,
+	) -> (LocalCreditFacts, CanonicalCreditFacts, LocalCreditFacts) {
+		let local = match kind {
+			CreditKind::Tier => LocalCreditFacts {
+				pointer: Some(uri_digest(CANDIDATE)),
+				retired_here: false,
+			},
+			CreditKind::Retire => LocalCreditFacts {
+				pointer: None,
+				retired_here: true,
+			},
+		};
+		let canonical = CanonicalCreditFacts {
+			store_owner: Some(fx.owner),
+			owner_current: true,
+			applied_index: Some(10),
+			committed: (kind == CreditKind::Tier).then(|| (uri_digest(CANDIDATE), Some(fx.key))),
+			retirement_in_force: kind == CreditKind::Retire,
+		};
+		(local, canonical, local)
+	}
+
+	/// C6: minting refuses every mismatch between the handoff, the command's scope and the job.
+	#[test]
+	fn a_credit_mints_only_for_its_own_op_slab_and_kind() {
+		let fx = fx();
+		for kind in [CreditKind::Tier, CreditKind::Retire] {
+			assert!(
+				CertifiedAgedCredit::mint(scope(&fx, fx.a, kind), handoff(&fx), fx.a, kind, rows())
+					.is_some()
+			);
+		}
+		let other = OpKey {
+			op_seq: 5,
+			..fx.key
+		};
+		let stranger = OwnerRef::new(41, StoreIncarnation::fresh());
+		let cases: Vec<(&str, Option<CertifiedAgedCredit>)> = vec![
+			(
+				"a handoff of another op",
+				CertifiedAgedCredit::mint(
+					scope(&fx, fx.a, CreditKind::Tier),
+					AppliedHandoff::for_test(other, fx.digest, 10),
+					fx.a,
+					CreditKind::Tier,
+					rows(),
+				),
+			),
+			(
+				"a handoff under another digest",
+				CertifiedAgedCredit::mint(
+					scope(&fx, fx.a, CreditKind::Tier),
+					AppliedHandoff::for_test(fx.key, [8; 32], 10),
+					fx.a,
+					CreditKind::Tier,
+					rows(),
+				),
+			),
+			(
+				"a command certified by another op",
+				CertifiedAgedCredit::mint(
+					CreditScope::for_test(
+						fx.key,
+						fx.digest,
+						fx.a,
+						CreditKind::Tier,
+						other,
+						Some(CANDIDATE),
+					),
+					handoff(&fx),
+					fx.a,
+					CreditKind::Tier,
+					rows(),
+				),
+			),
+			(
+				"a command for another slab than the job's",
+				CertifiedAgedCredit::mint(
+					scope(&fx, fx.b, CreditKind::Retire),
+					handoff(&fx),
+					fx.a,
+					CreditKind::Retire,
+					rows(),
+				),
+			),
+			(
+				"a Retire command for a Tier job",
+				CertifiedAgedCredit::mint(
+					scope(&fx, fx.a, CreditKind::Retire),
+					handoff(&fx),
+					fx.a,
+					CreditKind::Tier,
+					rows(),
+				),
+			),
+			(
+				"a Tier command for a Retire job",
+				CertifiedAgedCredit::mint(
+					scope(&fx, fx.a, CreditKind::Tier),
+					handoff(&fx),
+					fx.a,
+					CreditKind::Retire,
+					rows(),
+				),
+			),
+			(
+				"a job slab of another owner",
+				CertifiedAgedCredit::mint(
+					scope(&fx, stranger.slab(SlabId::new(1)), CreditKind::Retire),
+					handoff(&fx),
+					stranger.slab(SlabId::new(1)),
+					CreditKind::Retire,
+					rows(),
+				),
+			),
+			(
+				"a Tier without a candidate",
+				CertifiedAgedCredit::mint(
+					CreditScope::for_test(fx.key, fx.digest, fx.a, CreditKind::Tier, fx.key, None),
+					handoff(&fx),
+					fx.a,
+					CreditKind::Tier,
+					rows(),
+				),
+			),
+			(
+				"no aged rows",
+				CertifiedAgedCredit::mint(
+					scope(&fx, fx.a, CreditKind::Tier),
+					handoff(&fx),
+					fx.a,
+					CreditKind::Tier,
+					AgedRows::default(),
+				),
+			),
+		];
+		for (what, minted) in cases {
+			assert!(minted.is_none(), "{what} mints no credit");
+		}
+	}
+
+	/// C5: the decision credits exactly the op's own installed effect, and refuses each failure,
+	/// including the same visible pointer or retirement across a changed epoch or an active fence.
+	#[test]
+	fn the_decision_credits_only_the_ops_own_installed_effect() {
+		let fx = fx();
+		for kind in [CreditKind::Tier, CreditKind::Retire] {
+			let credit = credit(&fx, fx.a, kind);
+			let (before, canonical, after) = holding(&fx, kind);
+			assert!(
+				credit_earned(&credit, before, canonical, after, true),
+				"{kind:?} earns"
+			);
+			assert!(
+				!credit_earned(&credit, before, canonical, after, false),
+				"{kind:?}: the same visible effect across a changed epoch or an active fence earns nothing"
+			);
+			type Break = (&'static str, fn(&Fx, &mut CanonicalCreditFacts));
+			let breaks: [Break; 5] = [
+				("this store is not the owner", |_, c| {
+					c.store_owner = Some(OwnerRef::new(41, StoreIncarnation::fresh()))
+				}),
+				("the owner is not current", |_, c| c.owner_current = false),
+				("the op's entry is not applied here", |_, c| {
+					c.applied_index = Some(9)
+				}),
+				("no applied index", |_, c| c.applied_index = None),
+				("no store owner", |_, c| c.store_owner = None),
+			];
+			for (what, edit) in breaks {
+				let mut broken = canonical;
+				edit(&fx, &mut broken);
+				assert!(
+					!credit_earned(&credit, before, broken, after, true),
+					"{kind:?}: {what}"
+				);
+			}
+			let other_local = match kind {
+				CreditKind::Tier => LocalCreditFacts {
+					pointer: Some(uri_digest("file:///other")),
+					retired_here: false,
+				},
+				CreditKind::Retire => LocalCreditFacts {
+					pointer: Some(uri_digest(CANDIDATE)),
+					retired_here: false,
+				},
+			};
+			assert!(
+				!credit_earned(&credit, other_local, canonical, after, true),
+				"{kind:?}: not installed before"
+			);
+			assert!(
+				!credit_earned(&credit, before, canonical, other_local, true),
+				"{kind:?}: not installed after"
+			);
+		}
+		// Tier: superseded (another op's provenance), another candidate, retired, uncertified.
+		let tier = credit(&fx, fx.a, CreditKind::Tier);
+		let (before, canonical, after) = holding(&fx, CreditKind::Tier);
+		let other_op = OpKey {
+			op_seq: 9,
+			..fx.key
+		};
+		for (what, committed) in [
+			(
+				"a later op's generation",
+				Some((uri_digest(CANDIDATE), Some(other_op))),
+			),
+			(
+				"another candidate",
+				Some((uri_digest("file:///other"), Some(fx.key))),
+			),
+			(
+				"an uncertified generation",
+				Some((uri_digest(CANDIDATE), None)),
+			),
+			("no committed tier (retired)", None),
+		] {
+			let broken = CanonicalCreditFacts {
+				committed,
+				retirement_in_force: committed.is_none(),
+				..canonical
+			};
+			assert!(
+				!credit_earned(&tier, before, broken, after, true),
+				"Tier: {what}"
+			);
+		}
+		// Retire: the slab still tiered, or not retired.
+		let retire = credit(&fx, fx.a, CreditKind::Retire);
+		let (before, canonical, after) = holding(&fx, CreditKind::Retire);
+		for (what, committed, in_force) in [
+			(
+				"still tiered",
+				Some((uri_digest(CANDIDATE), Some(fx.key))),
+				false,
+			),
+			("not retired", None, false),
+		] {
+			let broken = CanonicalCreditFacts {
+				committed,
+				retirement_in_force: in_force,
+				..canonical
+			};
+			assert!(
+				!credit_earned(&retire, before, broken, after, true),
+				"Retire: {what}"
+			);
+		}
+	}
+
+	/// D6: the credit is a constant inline value with no heap storage (the candidate is a digest).
+	#[test]
+	fn a_credit_is_a_constant_inline_value() {
+		let size = std::mem::size_of::<CertifiedAgedCredit>();
+		eprintln!("ADR 0124 D6: size_of::<CertifiedAgedCredit>() = {size} bytes, no heap");
+		assert!(size <= 256, "{size}");
 	}
 }

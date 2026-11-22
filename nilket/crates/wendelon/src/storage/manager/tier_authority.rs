@@ -2731,6 +2731,37 @@ impl SlabManager {
 		self.snapshot_epoch.load(Ordering::Acquire)
 	}
 
+	/// Wendelon ADR 0124 D2: the snapshot epoch, observed with no install in flight, or `None`
+	/// while one is. Read under the snapshot epoch gate, which an install holds while it advances
+	/// the epoch and raises its fence, so the pair is one observation. The gate is released before
+	/// return (never held across an await).
+	pub(super) fn unfenced_snapshot_epoch(&self) -> Option<u64> {
+		let _gate = self
+			.snapshot_epoch_gate
+			.read()
+			.unwrap_or_else(|e| e.into_inner());
+		(!self.snapshot_install_in_flight()).then(|| self.snapshot_epoch.load(Ordering::Acquire))
+	}
+
+	/// Test-only (wendelon ADR 0124 C5): advances the snapshot epoch as an install would, with
+	/// nothing else changed.
+	#[cfg(test)]
+	pub(crate) fn advance_snapshot_epoch_for_test(&self) {
+		self.snapshot_epoch.fetch_add(1, Ordering::AcqRel);
+	}
+
+	/// Test-only (wendelon ADR 0124 C5): raises (or lowers) a snapshot install fence under an
+	/// epoch no install uses.
+	#[cfg(test)]
+	pub(crate) fn snapshot_fence_for_test(&self, raised: bool) {
+		const EPOCH: u64 = u64::MAX - 124;
+		if raised {
+			self.tier_authority.snapshot_fences.insert(EPOCH);
+		} else {
+			self.tier_authority.snapshot_fences.release(EPOCH);
+		}
+	}
+
 	pub(super) fn snapshot_epoch_is_current(&self, epoch: u64) -> bool {
 		!self.snapshot_install_in_flight() && self.snapshot_epoch.load(Ordering::Acquire) == epoch
 	}

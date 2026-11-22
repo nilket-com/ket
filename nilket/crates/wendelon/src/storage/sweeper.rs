@@ -563,6 +563,45 @@ pub(crate) async fn propose_tier_slab(
 	submit_tier_proposal(slab, committer, proposal, allocation.first).await
 }
 
+/// Wendelon ADR 0124: an operation's own verified `Applied` receipt, after the handoff that
+/// followed it succeeded: the submitted ticket's key and digest, and the index the ring decided
+/// it at. Built only by the shared submit paths below, from [`verify_receipt`]'s answer to that
+/// ticket; ordinary callers drop it. Not `Clone`: one handoff, one value.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct AppliedHandoff {
+	key: crate::consensus::slab_ops::OpKey,
+	digest: [u8; 32],
+	index: u64,
+}
+
+impl AppliedHandoff {
+	pub(crate) fn key(&self) -> crate::consensus::slab_ops::OpKey {
+		self.key
+	}
+	pub(crate) fn digest(&self) -> [u8; 32] {
+		self.digest
+	}
+	pub(crate) fn index(&self) -> u64 {
+		self.index
+	}
+	fn of(ticket: &OpTicket, index: u64) -> Self {
+		Self {
+			key: ticket.key(),
+			digest: ticket.digest(),
+			index,
+		}
+	}
+	/// Test-only (wendelon ADR 0124 C5/C6): a handoff as a verified receipt would give it.
+	#[cfg(test)]
+	pub(crate) fn for_test(
+		key: crate::consensus::slab_ops::OpKey,
+		digest: [u8; 32],
+		index: u64,
+	) -> Self {
+		Self { key, digest, index }
+	}
+}
+
 /// Submit an allocated tier operation under its reservation. An unknown outcome
 /// drops the submission unresolved, which keeps the reservation.
 pub(crate) async fn submit_tier_proposal(
@@ -571,6 +610,19 @@ pub(crate) async fn submit_tier_proposal(
 	proposal: TierProposal,
 	ticket: OpTicket,
 ) -> std::io::Result<()> {
+	submit_tier_proposal_handed_off(slab, committer, proposal, ticket)
+		.await
+		.map(drop)
+}
+
+/// [`submit_tier_proposal`], returning the Applied handoff (wendelon ADR 0124); every other
+/// result is exactly its.
+pub(crate) async fn submit_tier_proposal_handed_off(
+	slab: &SlabManager,
+	committer: &dyn TierCommitter,
+	proposal: TierProposal,
+	ticket: OpTicket,
+) -> std::io::Result<AppliedHandoff> {
 	let submission = proposal.begin_submission().map_err(|refusal| {
 		std::io::Error::new(
 			refusal.kind(),
@@ -578,9 +630,10 @@ pub(crate) async fn submit_tier_proposal(
 		)
 	})?;
 	match committer.submit_op(&ticket).await? {
-		VerifiedReceipt::Applied { .. } => {
+		VerifiedReceipt::Applied { index } => {
 			submission.applied();
-			slab.hand_off_op_if_complete(&ticket).await
+			slab.hand_off_op_if_complete(&ticket).await?;
+			Ok(AppliedHandoff::of(&ticket, index))
 		}
 		VerifiedReceipt::Rejected { reason, .. } => {
 			// The candidate's identity becomes durable in the handoff itself, before
@@ -657,8 +710,23 @@ pub(crate) async fn submit_tier_retirement(
 	committer: &dyn TierCommitter,
 	ticket: &OpTicket,
 ) -> std::io::Result<()> {
+	submit_tier_retirement_handed_off(slab, committer, ticket)
+		.await
+		.map(drop)
+}
+
+/// [`submit_tier_retirement`], returning the Applied handoff (wendelon ADR 0124); every other
+/// result is exactly its.
+pub(crate) async fn submit_tier_retirement_handed_off(
+	slab: &SlabManager,
+	committer: &dyn TierCommitter,
+	ticket: &OpTicket,
+) -> std::io::Result<AppliedHandoff> {
 	match committer.submit_op(ticket).await? {
-		VerifiedReceipt::Applied { .. } => slab.hand_off_op_if_complete(ticket).await,
+		VerifiedReceipt::Applied { index } => {
+			slab.hand_off_op_if_complete(ticket).await?;
+			Ok(AppliedHandoff::of(ticket, index))
+		}
 		VerifiedReceipt::Rejected { reason, .. } => {
 			slab.require_op_index()?
 				.hand_off_op(ticket.key(), ticket.digest(), None)
