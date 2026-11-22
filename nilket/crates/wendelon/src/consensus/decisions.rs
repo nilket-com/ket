@@ -3640,6 +3640,12 @@ fn abort_parent(
 	let Some(entry) = decisions.keys.get(&signed.body.key).copied() else {
 		return Err(unrecorded(decisions, &signed.body.key));
 	};
+	// DC-284: the record kind first, before any body is read. A Noop names no parent claim,
+	// so there is nothing to abort: the key names a different request, refused with no effect.
+	if entry.record != RecordKind::Body {
+		return Err(DecisionRefusal::Conflict);
+	}
+	// A Body key names its body (`DecisionState::validate`).
 	let body = &decisions.bodies[&entry.reservation];
 	if body.claim_digest != signed.body.claim_digest {
 		return Err(DecisionRefusal::Conflict);

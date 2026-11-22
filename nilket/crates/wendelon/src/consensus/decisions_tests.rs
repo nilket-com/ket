@@ -8268,3 +8268,47 @@ fn legacy_reclaim_completion_and_finalize_are_refused_after_a_parent_decisions_p
 	assert!(state.table_drop_reclaim_debts.get(TENANT, TABLE).is_some());
 	assert!(state.table_drop_outcomes.get(TENANT, TABLE).is_some());
 }
+
+/// DC-284: an Abort naming a key whose record is a Noop is refused, typed (`Conflict`: a Noop
+/// names no abortable parent claim), before any body is read, with no effect on the decision
+/// state; the noop's key still answers as before, and later valid work applies: a fresh parent
+/// reserves and its coordinator's Abort concludes it, terminally, as the Body path always has.
+#[test]
+fn an_abort_naming_a_noop_key_is_refused_with_no_effect() {
+	let mut state = base(3);
+	grant_all(&mut state);
+	let body = noop_body(&state, 9, 1);
+	let noop_key = body.key;
+	let recorded = record_noop(&mut state, body);
+	assert!(
+		!matches!(recorded, DecisionResult::Refused(_)),
+		"{recorded:?}"
+	);
+	let on_noop = claim(noop_key, children(&state, 2), 0);
+	let before = state.decisions.clone();
+	assert_eq!(
+		abort(&mut state, &on_noop, 1),
+		refused(DecisionRefusal::Conflict)
+	);
+	assert_eq!(state.decisions, before, "no effect");
+	assert!(
+		decisions(&state).validate().is_ok(),
+		"the state still validates"
+	);
+	// The same refusal at a forged reservation and on a replay of the same command.
+	assert_eq!(
+		abort(&mut state, &on_noop, 7),
+		refused(DecisionRefusal::Conflict)
+	);
+	assert_eq!(state.decisions, before);
+	// Later valid work applies.
+	let fresh = claim(key(T0, 10), children(&state, 2), 0);
+	let DecisionResult::Reserved { reservation } = reserve(&mut state, &fresh, T0) else {
+		panic!("a fresh parent reserves after the refusal");
+	};
+	assert!(matches!(
+		abort(&mut state, &fresh, reservation),
+		DecisionResult::Terminal { .. }
+	));
+	assert!(decisions(&state).validate().is_ok());
+}
